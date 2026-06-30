@@ -436,8 +436,20 @@ int ssa_opt_replace_all_uses(IRSSAOptCtx *ctx, int32_t old_vr, int32_t new_vr)
 
 int ssa_opt_resolve_lea_stackloc(IRSSAOptCtx *ctx, int32_t vr)
 {
+  return ssa_opt_resolve_lea_stackloc_ex(ctx, vr, NULL);
+}
+
+/* The address-source operand at a resolution terminal carries the location's
+ * identity in its vreg: irop_get_vreg(src) is -1 for a real direct stack slot
+ * (vreg_type == 0, offset authoritative) and the VAR/PARAM vreg for a `&VAR`
+ * spill-encoded address (offset is a shared placeholder).  Report it so callers
+ * can tell distinct address-taken locals apart at SSA time. */
+int ssa_opt_resolve_lea_stackloc_ex(IRSSAOptCtx *ctx, int32_t vr, int32_t *out_base_var)
+{
   TCCIRState *ir = ctx->ir;
   int acc = 0;
+  if (out_base_var)
+    *out_base_var = -1;
   /* Bound on chain length; chains longer than this (e.g. degenerate va_arg
    * pointer arithmetic) bail to INT_MIN.  Without a cap the recursive form
    * blew the host stack on pathological inputs. */
@@ -451,15 +463,21 @@ int ssa_opt_resolve_lea_stackloc(IRSSAOptCtx *ctx, int32_t vr)
 
     if (dq->op == TCCIR_OP_LEA) {
       IROperand src = tcc_ir_op_get_src1(ir, dq);
-      if (src.tag == IROP_TAG_STACKOFF || src.is_local)
+      if (src.tag == IROP_TAG_STACKOFF || src.is_local) {
+        if (out_base_var)
+          *out_base_var = irop_get_vreg(src);
         return irop_get_stack_offset(src) + acc;
+      }
       return INT_MIN;
     }
 
     if (dq->op == TCCIR_OP_ASSIGN) {
       IROperand src = tcc_ir_op_get_src1(ir, dq);
-      if (src.tag == IROP_TAG_STACKOFF && !src.is_lval)
+      if (src.tag == IROP_TAG_STACKOFF && !src.is_lval) {
+        if (out_base_var)
+          *out_base_var = irop_get_vreg(src);
         return irop_get_stack_offset(src) + acc;
+      }
       int32_t sv = irop_get_vreg(src);
       if (sv >= 0 && !src.is_lval) {
         vr = sv;
@@ -475,8 +493,11 @@ int ssa_opt_resolve_lea_stackloc(IRSSAOptCtx *ctx, int32_t vr)
       IROperand dest = tcc_ir_op_get_dest(ir, dq);
       if (!dest.is_lval) {
         IROperand src = tcc_ir_op_get_src1(ir, dq);
-        if (src.tag == IROP_TAG_STACKOFF && !src.is_lval)
+        if (src.tag == IROP_TAG_STACKOFF && !src.is_lval) {
+          if (out_base_var)
+            *out_base_var = irop_get_vreg(src);
           return irop_get_stack_offset(src) + acc;
+        }
         int32_t sv = irop_get_vreg(src);
         if (sv >= 0 && !src.is_lval) {
           vr = sv;
@@ -597,11 +618,20 @@ int ssa_opt_resolve_temp_to_base_off(IRSSAOptCtx *ctx, int32_t vr,
 
 int ssa_opt_indirect_stack_offset(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side)
 {
+  return ssa_opt_indirect_stack_offset_ex(ctx, q, side, NULL);
+}
+
+int ssa_opt_indirect_stack_offset_ex(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side,
+                                     int32_t *out_base_var)
+{
   TCCIRState *ir = ctx->ir;
   IROperand base;
   int has_index = 0;
   int require_lval = 0;
   IROperand idx = IROP_NONE, scale = IROP_NONE;
+
+  if (out_base_var)
+    *out_base_var = -1;
 
   if (side == SSA_OPT_INDIRECT_DEST) {
     base = tcc_ir_op_get_dest(ir, q);
@@ -634,9 +664,12 @@ int ssa_opt_indirect_stack_offset(IRSSAOptCtx *ctx, const IRQuadCompact *q, int 
   int32_t bvr = irop_get_vreg(base);
   if (bvr < 0 || TCCIR_DECODE_VREG_TYPE(bvr) != TCCIR_VREG_TYPE_TEMP)
     return INT_MIN;
-  int base_off = ssa_opt_resolve_lea_stackloc(ctx, bvr);
-  if (base_off == INT_MIN)
+  int base_off = ssa_opt_resolve_lea_stackloc_ex(ctx, bvr, out_base_var);
+  if (base_off == INT_MIN) {
+    if (out_base_var)
+      *out_base_var = -1;
     return INT_MIN;
+  }
   if (!has_index)
     return base_off;
   if (!irop_is_immediate(idx) || !irop_is_immediate(scale))

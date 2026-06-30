@@ -2166,3 +2166,31 @@ IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg)
   }
   return NULL; /* unreachable, silences -Werror with old compiler */
 }
+
+/* Non-fatal sibling of tcc_ir_get_live_interval(): returns NULL instead of
+ * aborting the process when vreg is negative, carries an unknown type, or
+ * addresses a position past the allocated interval array.  Use this from
+ * callers that must tolerate an unmapped vreg (e.g. tcc_ir_stack_reg_get). */
+IRLiveInterval *tcc_ir_try_get_live_interval(TCCIRState *ir, int vreg)
+{
+  if (!ir || vreg < 0)
+    return NULL;
+  int decoded_vreg_position = TCCIR_DECODE_VREG_POSITION(vreg);
+  switch (TCCIR_DECODE_VREG_TYPE(vreg))
+  {
+  case TCCIR_VREG_TYPE_VAR:
+    if (decoded_vreg_position >= ir->variables_live_intervals_size)
+      return NULL;
+    return &ir->variables_live_intervals[decoded_vreg_position];
+  case TCCIR_VREG_TYPE_TEMP:
+    if (decoded_vreg_position >= ir->temporary_variables_live_intervals_size)
+      return NULL;
+    return &ir->temporary_variables_live_intervals[decoded_vreg_position];
+  case TCCIR_VREG_TYPE_PARAM:
+    if (decoded_vreg_position >= ir->parameters_live_intervals_size)
+      return NULL;
+    return &ir->parameters_live_intervals[decoded_vreg_position];
+  default:
+    return NULL;
+  }
+}

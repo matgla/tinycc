@@ -376,7 +376,7 @@ void tcc_ir_stack_reg_assign(TCCIRState *ir, int vreg, int offset, int r0, int r
 
 void tcc_ir_stack_reg_get(TCCIRState *ir, int vreg, int *r0, int *r1)
 {
-  IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+  IRLiveInterval *interval = tcc_ir_try_get_live_interval(ir, vreg);
   if (!interval)
   {
     if (r0)

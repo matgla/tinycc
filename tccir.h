@@ -682,6 +682,7 @@ void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name);
 void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
 
 IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg);
+IRLiveInterval *tcc_ir_try_get_live_interval(TCCIRState *ir, int vreg);
 void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address);
 void tcc_ir_backpatch_to_here(TCCIRState *ir, int t);
 void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address);

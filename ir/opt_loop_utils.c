@@ -2991,16 +2991,38 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
    * can include post-loop instructions that must not be touched. */
   int loop_end = loop->end_idx;
 
+  /* The loop is removed by NOPing the whole region (including its exit
+   * JUMPIF) and writing the unrolled body in place; control then leaves the
+   * region by fall-through to loop_end+1.  That only reaches the loop's exit
+   * target when exit_target IS the physical successor.  For a loop nested in a
+   * branch (or an inner loop whose exit is the outer latch) the exit target
+   * sits past intervening code, and the original exit was taken ONLY via the
+   * now-NOP'd JUMPIF — never by fall-through.  Detect that and reserve a slot
+   * for an explicit exit JUMP (mirrors need_exit_jump in try_rotate_loop). */
+  int need_exit_jump = 0;
+  {
+    int n2 = ir->next_instruction_index;
+    int ft = loop_end + 1;
+    while (ft < n2 && ir->compact_instructions[ft].op == TCCIR_OP_NOP)
+      ft++;
+    int et = exit_target;
+    while (et < n2 && ir->compact_instructions[et].op == TCCIR_OP_NOP)
+      et++;
+    if (ft != et)
+      need_exit_jump = 1;
+  }
+
   /* The unrolled body needs trip_count*body_count slots plus 1 optional slot
-   * for the IV final value (if used after the loop).  When the original loop
-   * region is too small, insert NOPs immediately after loop_end and extend
-   * loop_end to cover them.  insert_instr_at shifts subsequent instructions
-   * and patches all jump targets that point at or past the insertion site.
-   * Indices inside [start_idx..loop_end] (body_indices, cmp_idx, jmpif_idx,
-   * iv->def_idx, iv->init_idx) are unchanged; exit_target sits after the loop
-   * and must be shifted manually. */
+   * for the IV final value (if used after the loop) and 1 more for the exit
+   * JUMP (if needed).  When the original loop region is too small, insert NOPs
+   * immediately after loop_end and extend loop_end to cover them.
+   * insert_instr_at shifts subsequent instructions and patches all jump
+   * targets that point at or past the insertion site.  Indices inside
+   * [start_idx..loop_end] (body_indices, cmp_idx, jmpif_idx, iv->def_idx,
+   * iv->init_idx) are unchanged; exit_target sits after the loop and must be
+   * shifted manually. */
   int avail_slots = loop_end - loop->start_idx + 1;
-  int needed_slots = total_insns + 1; /* +1 reserved for IV final assignment */
+  int needed_slots = total_insns + 1 + need_exit_jump; /* +1 IV final, +1 exit JUMP */
   /* Only grow the IR (and ripple-update sibling loop records) when this is
    * the sole loop being processed.  In multi-loop functions the cross-loop
    * book-keeping is fragile — even with body_instrs/start/end fix-up some
@@ -3289,8 +3311,29 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
         if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
         {
           write_instr_at_nop(ir, i, TCCIR_OP_ASSIGN, iv_dest, iv_val_op, (IROperand){0});
+          write_pos = i + 1;
           break;
         }
+      }
+    }
+  }
+
+  /* Emit the loop's exit branch when fall-through does not reach exit_target.
+   * The original exit JUMPIF was NOP'd with the rest of the loop; without this
+   * the unrolled body falls through into whatever code physically follows the
+   * loop (e.g. the else block of an enclosing if, or an outer loop's body).
+   * Must come after the IV-final assignment so that value is still computed. */
+  if (need_exit_jump)
+  {
+    for (int i = write_pos; i <= loop_end; i++)
+    {
+      if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
+      {
+        IROperand exit_dest = irop_make_imm32(-1, exit_target, IROP_BTYPE_INT32);
+        write_instr_at_nop(ir, i, TCCIR_OP_JUMP, exit_dest, (IROperand){0}, (IROperand){0});
+        if (exit_target >= 0 && exit_target < ir->next_instruction_index)
+          ir->compact_instructions[exit_target].is_jump_target = 1;
+        break;
       }
     }
   }

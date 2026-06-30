@@ -3754,6 +3754,14 @@ ST_FUNC int tcc_gen_machine_try_strd_imm_spill(int64_t val1, int64_t val2,
     return 0;
 
   MachineCodegenContext ctx = {0};
+  /* Materializing the immediates may PUSH the scratch register(s) when FP is
+   * omitted and no scratch-save area is reserved, lowering SP by 4 per push.
+   * The STRD destination is SP-relative, so an uncompensated offset would write
+   * the pair 4*pushes bytes below the intended slot — the array/struct
+   * initializer then lands at the wrong offset and later reads return stale
+   * data (fuzz seed 12057).  Snapshot the push stack so we can measure the SP
+   * shift after acquiring the registers and fold it into the offset. */
+  int spc_before = scratch_push_count;
   MachineOperand op1 = {.kind = MACH_OP_IMM, .u.imm.val = val1};
   int r1 = mach_ensure_in_reg(&ctx, &op1, 0);
   int r2;
@@ -3766,6 +3774,25 @@ ST_FUNC int tcc_gen_machine_try_strd_imm_spill(int64_t val1, int64_t val2,
   if (r1 == R_SP || r2 == R_SP) {
     mach_release_all(&ctx);
     return 0;
+  }
+  /* Account for any real SP-lowering pushes (type 1) done above.  Saves routed
+   * to a reserved scratch area (type 2) keep SP stable and need no adjustment.
+   * The shift only affects an SP-relative base; an FP base is unperturbed. */
+  if (base_reg == R_SP) {
+    int sp_shift = 0;
+    for (int s = spc_before; s < scratch_push_count && s < 128; s++)
+      if (scratch_push_type[s] == 1)
+        sp_shift += 4;
+    if (sp_shift) {
+      /* Only the positive (above-SP) local case is safe to compensate by simple
+       * addition; a negative (below-SP) offset combined with the shift is rare
+       * and not worth special-casing — fall back to per-element stores. */
+      if (sign || abs_off + sp_shift > 1020) {
+        mach_release_all(&ctx);
+        return 0;
+      }
+      abs_off += sp_shift;
+    }
   }
   const uint32_t puw = sign ? 4u : 6u;
   ot_check(th_strd_imm((uint32_t)r1, (uint32_t)r2, (uint32_t)base_reg, abs_off, puw));

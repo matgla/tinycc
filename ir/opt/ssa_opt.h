@@ -146,6 +146,19 @@ void ssa_drop_phi_edge(IRSSAOptCtx *ctx, int dead_pred_block, int target_block_i
  * if the chain doesn't resolve to a stack address.  Multi-def TEMPs bail. */
 int ssa_opt_resolve_lea_stackloc(IRSSAOptCtx *ctx, int32_t vr);
 
+/* Like ssa_opt_resolve_lea_stackloc, but also reports the *identity* of the
+ * resolved address through *out_base_var:
+ *   -1  -> a real direct stack slot (vreg_type == 0); the returned offset is
+ *          authoritative and uniquely names the slot.
+ *   >=0 -> the address is `&VAR` (a scalar local addressed via its VAR/PARAM
+ *          spill encoding).  At SSA time such locals have no assigned slot, so
+ *          the returned offset is a placeholder (typically 0) SHARED by every
+ *          distinct VAR — callers MUST disambiguate by *out_base_var, not by
+ *          the offset alone, or they alias unrelated locals (ptr fuzz seed 67:
+ *          &u2 and &u3 both -> offset 0).
+ * out_base_var may be NULL.  It is set to -1 on an INT_MIN (unresolved) return. */
+int ssa_opt_resolve_lea_stackloc_ex(IRSSAOptCtx *ctx, int32_t vr, int32_t *out_base_var);
+
 /* Resolve a vreg backward to its canonical (base_vr, offset) form.  Chases
  * single-def ASSIGN copies and `T = base ADD #imm` chains until it lands
  * on a VAR/PARAM root (or a TEMP whose definition isn't a recognized copy
@@ -163,6 +176,10 @@ int ssa_opt_resolve_temp_to_base_off(IRSSAOptCtx *ctx, int32_t vr,
  * dest is not TEMP-DEREF or the LEA chain does not resolve, or the index
  * is not a constant with scale 0. */
 int ssa_opt_indirect_stack_offset(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side);
+/* Variant that also reports the resolved address identity via *out_base_var
+ * (see ssa_opt_resolve_lea_stackloc_ex for the -1 / >=0 contract). */
+int ssa_opt_indirect_stack_offset_ex(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side,
+                                     int32_t *out_base_var);
 #define SSA_OPT_INDIRECT_DEST 0  /* STORE / STORE_INDEXED dest base */
 #define SSA_OPT_INDIRECT_SRC1 1  /* LOAD / LOAD_INDEXED source base */
 

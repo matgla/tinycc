@@ -2995,6 +2995,25 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         st_src = tcc_ir_op_get_src1(ir, sq);
         if (irop_get_tag(st_dest) == IROP_TAG_STACKOFF && st_dest.is_local && st_dest.is_lval)
         {
+          /* A STORE whose STACKOFF dest also carries a *named* local (VAR /
+           * PARAM) vreg identity cannot be relocated by stack offset alone: the
+           * backend keys the store off that vreg, so the rewritten copy would
+           * still target the original (source) local, leaving the memcpy
+           * destination unwritten.  This shows up after the small-function
+           * inliner expands `T f(T x){ T u; memcpy(&u,&x,sizeof u); return u; }`
+           * — the param/result become named VARs and the fold dropped the
+           * copy entirely (fuzz float_seed*).  Bail; anonymous stack temps
+           * (vreg == -1) relocate cleanly and are unaffected. */
+          int32_t dvr = irop_get_vreg(st_dest);
+          if (dvr >= 0)
+          {
+            int vt = TCCIR_DECODE_VREG_TYPE(dvr);
+            if (vt == TCCIR_VREG_TYPE_VAR || vt == TCCIR_VREG_TYPE_PARAM)
+            {
+              aborted = 1;
+              break;
+            }
+          }
           st_off = (int)irop_get_imm64_ex(ir, st_dest);
           st_off_found = 1;
           st_size = ir_opt_store_btype_size_bytes(irop_get_btype(st_dest));

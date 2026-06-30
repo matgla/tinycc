@@ -1756,7 +1756,22 @@ static inline MopArgs ir_decode_cached(int is_dry_run, int use_mop_cache, MopArg
 {
   /* Real-run cache hit: scale/accum not needed, cache is valid. */
   if (!is_dry_run && use_mop_cache && !spec.scale && !spec.accum)
-    return mop_cache[i];
+  {
+    MopArgs cached = mop_cache[i];
+    /* A peephole that skips an instruction (i = next_i; break) can fire in the
+     * dry-run but not the real-run when its decision depends on pass-varying
+     * state.  The STRD-spill fusion is one such case: it keys on the
+     * SP-relative offset via fp_adjust_local_offset(), whose allocated_stack_size
+     * term is 0 during the dry-run (the prologue that sets it runs only before
+     * the real pass) but final during the real-run.  A large frame can therefore
+     * make the dry-run fuse-and-skip instruction i while the real-run does not,
+     * leaving mop_cache[i] never written (zero-initialised → all MACH_OP_NONE).
+     * A genuinely decoded store/load always materialises dest or src1, so an
+     * all-NONE pair marks an unpopulated slot: re-decode instead of returning
+     * the stale sentinel (which would trip the MACH_OP_NONE codegen assert). */
+    if (cached.dest.kind != MACH_OP_NONE || cached.src1.kind != MACH_OP_NONE)
+      return cached;
+  }
 
   MopArgs a = decode_mop_args(ir, cq, src1_ir, src2_ir, dest_ir, i, spec);
 
@@ -2286,8 +2301,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
    * ============================================================================ */
   /* Option B: allocate per-instruction MopArgs cache for the dry-run.
    * Not used when the dry-run is skipped (can_skip_dry_run). */
+  /* Zero-initialised: an unwritten slot reads back as all-MACH_OP_NONE, which
+   * ir_decode_cached() treats as "not populated in the dry-run" and re-decodes
+   * (see the cache-hit path there). */
   MopArgs *mop_cache = (!can_skip_dry_run && ir->next_instruction_index > 0)
-                           ? tcc_malloc(ir->next_instruction_index * sizeof(MopArgs))
+                           ? tcc_mallocz(ir->next_instruction_index * sizeof(MopArgs))
                            : NULL;
   ir->codegen_mop_cache = mop_cache;
   int use_mop_cache = 0;

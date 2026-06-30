@@ -54,6 +54,12 @@ typedef struct {
   int btype;
   int32_t stored_vr;    /* TEMP vreg, or -1 if immediate */
   IROperand stored_imm; /* valid when stored_vr == -1 */
+  /* Identity of the stored-to location: -1 for a real direct stack slot (the
+   * offset uniquely names it), or the VAR/PARAM base vreg for a `&VAR` address
+   * whose offset is a placeholder shared by every distinct local.  A load only
+   * forwards from this entry when its own resolved base matches (ptr fuzz seed
+   * 67: `&u2` and `&u3` both resolve to offset 0 but must not alias). */
+  int32_t base_var;
 } SStoreEntry;
 
 typedef struct {
@@ -173,13 +179,15 @@ static void sstore_invalidate_overlap(GLoadState *st, int offset, int btype)
   }
 }
 
-static void sstore_track_vr(GLoadState *st, int offset, int btype, int32_t stored_vr)
+static void sstore_track_vr(GLoadState *st, int offset, int btype, int32_t stored_vr,
+                            int32_t base_var)
 {
   sstore_invalidate_overlap(st, offset, btype);
   int k = sstore_find(st, offset);
   if (k >= 0) {
     st->sstores[k].btype = btype;
     st->sstores[k].stored_vr = stored_vr;
+    st->sstores[k].base_var = base_var;
     return;
   }
   if (st->scount >= SSTORE_MAX)
@@ -188,9 +196,11 @@ static void sstore_track_vr(GLoadState *st, int offset, int btype, int32_t store
   e->stack_offset = offset;
   e->btype = btype;
   e->stored_vr = stored_vr;
+  e->base_var = base_var;
 }
 
-static void sstore_track_imm(GLoadState *st, int offset, int btype, IROperand imm)
+static void sstore_track_imm(GLoadState *st, int offset, int btype, IROperand imm,
+                             int32_t base_var)
 {
   sstore_invalidate_overlap(st, offset, btype);
   int k = sstore_find(st, offset);
@@ -198,6 +208,7 @@ static void sstore_track_imm(GLoadState *st, int offset, int btype, IROperand im
     st->sstores[k].btype = btype;
     st->sstores[k].stored_vr = -1;
     st->sstores[k].stored_imm = imm;
+    st->sstores[k].base_var = base_var;
     return;
   }
   if (st->scount >= SSTORE_MAX)
@@ -207,6 +218,7 @@ static void sstore_track_imm(GLoadState *st, int offset, int btype, IROperand im
   e->btype = btype;
   e->stored_vr = -1;
   e->stored_imm = imm;
+  e->base_var = base_var;
 }
 
 static void sstore_remove_vr(GLoadState *st, int32_t vr)
@@ -653,17 +665,19 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
         if (src.is_lval && !src.is_sym && !irop_is_immediate(src)) {
           int load_off = INT_MIN;
           int load_btype = irop_get_btype(src);
+          int32_t load_base = -1;
           if (src.tag == IROP_TAG_STACKOFF) {
             int32_t svr = irop_get_vreg(src);
             if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
               load_off = irop_get_stack_offset(src);
           } else if (src.tag == IROP_TAG_VREG && !src.is_local) {
             int32_t pvr = irop_get_vreg(src);
-            load_off = resolve_lea_stackloc(ctx, pvr);
+            load_off = ssa_opt_resolve_lea_stackloc_ex(ctx, pvr, &load_base);
           }
           if (load_off != INT_MIN) {
             int sk = sstore_find(st, load_off);
-            if (sk >= 0 && st->sstores[sk].btype == load_btype) {
+            if (sk >= 0 && st->sstores[sk].btype == load_btype &&
+                st->sstores[sk].base_var == load_base) {
               SStoreEntry *se = &st->sstores[sk];
               if (se->stored_vr < 0) {
                 tcc_ir_set_src1(ir, i, se->stored_imm);
@@ -685,10 +699,14 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
          * STACKOFF operands are stack addresses, not memory writes. */
         if (!ctx->no_stack_fwd && dest.is_local && dest.is_lval && !dest.is_llocal) {
           int store_btype = irop_get_btype(dest);
+          /* irop_get_vreg(dest) is -1 for a real stack slot (offset is the
+           * identity) or the VAR vreg for a named local addressed by its slot
+           * encoding (offset is a placeholder; the vreg is the identity). */
+          int32_t dest_base = irop_get_vreg(dest);
           if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
-            sstore_track_vr(st, irop_get_stack_offset(dest), store_btype, svr);
+            sstore_track_vr(st, irop_get_stack_offset(dest), store_btype, svr, dest_base);
           else if (irop_is_immediate(src))
-            sstore_track_imm(st, irop_get_stack_offset(dest), store_btype, src);
+            sstore_track_imm(st, irop_get_stack_offset(dest), store_btype, src, dest_base);
         } else if (q->op == TCCIR_OP_STORE_INDEXED) {
           /* Indexed write through a stack base address (Addr[StackLoc[B]] +
            * idx*scale).  The base-offset-only removal in the plain branch below
@@ -730,16 +748,17 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
            ((q->op == TCCIR_OP_STORE && dest.is_lval) ||
             q->op == TCCIR_OP_STORE_INDEXED));
       if (store_dest_is_temp_indir) {
-        int eff_off = ssa_opt_indirect_stack_offset(ctx, q, SSA_OPT_INDIRECT_DEST);
+        int32_t store_base = -1;
+        int eff_off = ssa_opt_indirect_stack_offset_ex(ctx, q, SSA_OPT_INDIRECT_DEST, &store_base);
         if (eff_off != INT_MIN) {
           if (!ctx->no_stack_fwd) {
             IROperand src = tcc_ir_op_get_src1(ir, q);
             int store_btype = irop_get_btype(dest);
             int32_t svr = irop_get_vreg(src);
             if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
-              sstore_track_vr(st, eff_off, store_btype, svr);
+              sstore_track_vr(st, eff_off, store_btype, svr, store_base);
             else if (irop_is_immediate(src))
-              sstore_track_imm(st, eff_off, store_btype, src);
+              sstore_track_imm(st, eff_off, store_btype, src, store_base);
             else
               sstore_remove_offset(st, eff_off);
           }
@@ -978,10 +997,12 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
        * tracked stack store at that offset.  ssa_opt_indirect_stack_offset
        * already enforces scale==0 and constant idx. */
       if (!ctx->no_stack_fwd) {
-        int eff_off = ssa_opt_indirect_stack_offset(ctx, q, SSA_OPT_INDIRECT_SRC1);
+        int32_t load_base = -1;
+        int eff_off = ssa_opt_indirect_stack_offset_ex(ctx, q, SSA_OPT_INDIRECT_SRC1, &load_base);
         if (eff_off != INT_MIN) {
           int sk = sstore_find(st, eff_off);
-          if (sk >= 0 && st->sstores[sk].btype == il_btype) {
+          if (sk >= 0 && st->sstores[sk].btype == il_btype &&
+              st->sstores[sk].base_var == load_base) {
             SStoreEntry *se = &st->sstores[sk];
             IROperand new_src;
             if (se->stored_vr >= 0) {
@@ -1134,6 +1155,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
     /* Stack store-load forwarding */
     if (src1.is_lval && !src1.is_sym) {
       int stack_off = INT_MIN;
+      int32_t load_base = -1;
 
       /* Direct StackLoc load: T <-- StackLoc[N] [LOAD].
        * Skip if the operand carries a VAR vreg — that's a load from a
@@ -1148,7 +1170,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
       /* LEA+DEREF load: T <-- *Addr[StackLoc[N]] [LOAD] */
       if (stack_off == INT_MIN) {
         int32_t ptr_vr = irop_get_vreg(src1);
-        stack_off = resolve_lea_stackloc(ctx, ptr_vr);
+        stack_off = ssa_opt_resolve_lea_stackloc_ex(ctx, ptr_vr, &load_base);
       }
 
       if (stack_off != INT_MIN) {
@@ -1156,6 +1178,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
         if (sk >= 0) {
           SStoreEntry *se = &st->sstores[sk];
           if (se->btype != dest_btype)
+            continue;
+          /* Only forward when the store and this load name the same location:
+           * for `&VAR` addresses the offset is a shared placeholder, so the
+           * canonical base must match (ptr fuzz seed 67). */
+          if (se->base_var != load_base)
             continue;
           IROperand new_src;
           if (se->stored_vr >= 0) {

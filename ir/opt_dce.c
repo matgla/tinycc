@@ -455,6 +455,22 @@ static int ir_opt_direct_auto_vreg_store_is_local(IROperand op)
   return 0;
 }
 
+static int ir_dce_addrof_var_pos(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (q->op != TCCIR_OP_LEA && q->op != TCCIR_OP_ASSIGN)
+    return -1;
+  if (!irop_config[q->op].has_src1)
+    return -1;
+
+  IROperand s = tcc_ir_op_get_src1(ir, q);
+  int32_t vr = irop_get_vreg(s);
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
+    return -1;
+  if (q->op == TCCIR_OP_ASSIGN && !(s.is_local && !s.is_lval))
+    return -1;
+  return TCCIR_DECODE_VREG_POSITION(vr);
+}
+
 static int ir_opt_op_is_essential(TCCIRState *ir, IRQuadCompact *q, int idx,
                                   const uint8_t *pure_call_ids, int pure_call_id_bytes)
 {
@@ -4332,18 +4348,10 @@ int tcc_ir_opt_dead_var_store_elim(TCCIRState *ir)
       continue;
     if (q->op == TCCIR_OP_SET_CHAIN || q->op == TCCIR_OP_INIT_CHAIN_SLOT)
       has_set_chain = 1;
-    /* Track LEA instructions that take the address of a VAR */
-    if (q->op == TCCIR_OP_LEA)
-    {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(src1);
-      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
-      {
-        int pos = TCCIR_DECODE_VREG_POSITION(vr);
-        if (pos <= max_var)
-          var_has_lea[pos / 8] |= (1 << (pos % 8));
-      }
-    }
+    /* Track visible address-of instructions that take the address of a VAR. */
+    int addrof_pos = ir_dce_addrof_var_pos(ir, q);
+    if (addrof_pos >= 0 && addrof_pos <= max_var)
+      var_has_lea[addrof_pos / 8] |= (1 << (addrof_pos % 8));
     if (irop_config[q->op].has_src1)
     {
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
@@ -5169,6 +5177,17 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
   for (int v = 0; v <= max_var; v++)
     pending[v] = -1;
 
+  uint8_t *var_addr_taken = tcc_mallocz((max_var + 8) / 8);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    int pos = ir_dce_addrof_var_pos(ir, q);
+    if (pos >= 0 && pos <= max_var)
+      var_addr_taken[pos / 8] |= (1 << (pos % 8));
+  }
+
   int changes = 0;
   for (int i = 0; i < n; i++)
   {
@@ -5254,6 +5273,11 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos <= max_var)
         {
+          if (var_addr_taken[pos / 8] & (1 << (pos % 8)))
+          {
+            pending[pos] = -1;
+            continue;
+          }
           if (pending[pos] >= 0)
           {
             /* Previous assign to this VAR is dead — overwritten before read */
@@ -5268,6 +5292,7 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
 
   LOG_IR_GEN("=== REDUNDANT VAR ASSIGN: eliminated %d dead assigns ===", changes);
 
+  tcc_free(var_addr_taken);
   tcc_free(pending);
   tcc_free(is_target);
   return changes;

@@ -293,6 +293,17 @@ static int ra_fold_const_branches(TCCIRState *ir)
       if (pop == TCCIR_OP_CMP) { cmp_idx = j; break; }
       /* Other flag-setting ops invalidate the CMP we'd want to read. */
       if (pop == TCCIR_OP_TEST_ZERO || pop == TCCIR_OP_FCMP) break;
+      /* A call clobbers CPSR (AAPCS: flags are caller-saved), so a CMP before
+       * it cannot be the JUMPIF's flag source.  Critically, the soft-float
+       * compare helpers (__aeabi_cfcmple / cdcmple, ...) are FUNCCALLVOID
+       * flag-setters: they ARE the branch's real flag source, and striding
+       * past them would mis-attribute the branch to an earlier integer CMP and
+       * wrongly NOP it (orphaning a SELECT that consumes it — fuzz seed 2049). */
+      if (pop == TCCIR_OP_FUNCCALLVAL || pop == TCCIR_OP_FUNCCALLVOID) break;
+      /* A flag-consumer between the CMP and this JUMPIF means the CMP has
+       * another reader; folding the branch would still NOP the CMP and break
+       * that consumer, so bail. */
+      if (pop == TCCIR_OP_SETIF || pop == TCCIR_OP_SELECT) break;
       /* BB boundary. */
       if (pop == TCCIR_OP_JUMP || pop == TCCIR_OP_JUMPIF ||
           pop == TCCIR_OP_IJUMP || pop == TCCIR_OP_SWITCH_TABLE ||

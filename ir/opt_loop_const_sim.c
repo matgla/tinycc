@@ -495,6 +495,40 @@ static int lcs_eval_softcall(int kind, int is_double, LcsState *st,
   return 1;
 }
 
+/* Evaluate a comparison whose operands are soft-float bit patterns (set by a
+ * cfcmp / cdcmp flag-setter).  b1/b2 are the raw 32- or 64-bit FP bits; tok is
+ * the same relational token evaluate_compare_condition uses.  Returns 1
+ * (taken), 0 (not taken), or -1 (unsupported token -> caller bails).
+ * Unordered (NaN) operands make every relation false except "!=", matching C
+ * and the ARM flag semantics the lowered branch tests. */
+static int lcs_evaluate_fp_compare(int64_t b1, int64_t b2, int tok, int is_double)
+{
+  double a, b;
+  if (is_double)
+  {
+    union { double d; uint64_t u; } x, y;
+    x.u = (uint64_t)b1; y.u = (uint64_t)b2;
+    a = x.d; b = y.d;
+  }
+  else
+  {
+    union { float f; uint32_t u; } x, y;
+    x.u = (uint32_t)b1; y.u = (uint32_t)b2;
+    a = (double)x.f; b = (double)y.f;
+  }
+  int unordered = (a != a) || (b != b);
+  switch (tok)
+  {
+  case 0x94: /* TOK_EQ  */ return !unordered && (a == b);
+  case 0x95: /* TOK_NE  */ return unordered || (a != b);
+  case 0x9c: /* TOK_LT  */ return !unordered && (a < b);
+  case 0x9d: /* TOK_GE  */ return !unordered && (a >= b);
+  case 0x9e: /* TOK_LE  */ return !unordered && (a <= b);
+  case 0x9f: /* TOK_GT  */ return !unordered && (a > b);
+  default:                 return -1; /* unsigned/unknown token: bail */
+  }
+}
+
 static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
                         int start_idx, int end_idx, int cmp_idx, int jmpif_idx,
                         int exit_target)
@@ -762,7 +796,13 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
       return r;
     }
     int tok = (int)irop_get_imm64_ex(ir, src1);
-    int taken = evaluate_compare_condition(st->cmp_v1, st->cmp_v2, tok);
+    /* A compare flagged by a soft-float helper (cfcmp / cdcmp) holds raw FP
+     * bit patterns in cmp_v1/cmp_v2; evaluating them as integers is wrong for
+     * any operand whose sign bit is set (a negative float bit pattern reads as
+     * a huge unsigned int).  Reinterpret and compare as float/double. */
+    int taken = st->cmp_is_fp
+                    ? lcs_evaluate_fp_compare(st->cmp_v1, st->cmp_v2, tok, st->cmp_is_double)
+                    : evaluate_compare_condition(st->cmp_v1, st->cmp_v2, tok);
     if (taken < 0)
     {
       r.action = 0;
@@ -1210,6 +1250,56 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
       }
       continue;
     }
+    /* Indirect STORE through a known stack-address temp/var:
+     *   T <- Addr[StackLoc[off]] ; T***DEREF*** <- value
+     * The body simulator resolves exactly this form (see the TCCIR_OP_STORE
+     * case in lcs_step), so the pre-loop scan must too: otherwise a pre-loop
+     * write through an address alias is dropped, leaving the slot's initial
+     * value stale and mis-seeding the simulation (bitfield seed 5 -- a packed
+     * RMW of b1 via Addr[bf], then a loop RMW of b2 in the same word; the
+     * missed b1 store made the residual store clobber b1 back to 0). */
+    if (q->op == TCCIR_OP_STORE && d.is_lval)
+    {
+      int32_t avr = irop_get_vreg(d);
+      if (avr >= 0)
+      {
+        int atype = TCCIR_DECODE_VREG_TYPE(avr);
+        int apos  = TCCIR_DECODE_VREG_POSITION(avr);
+        const LcsSlot *aslot = NULL;
+        if (atype == TCCIR_VREG_TYPE_VAR && apos < st->n_vars)
+          aslot = &st->vars[apos];
+        else if (atype == TCCIR_VREG_TYPE_TEMP && apos < st->n_tmps)
+          aslot = &st->tmps[apos];
+        if (aslot && aslot->known && aslot->is_addr)
+        {
+          int32_t off = (int32_t)aslot->value;
+          LcsMemSlot *ms = lcs_mem_get(st, off);
+          if (ms)
+          {
+            int mem_idx = (int)(ms - st->mem);
+            if (!mem_flow_unsafe[mem_idx])
+            {
+              IROperand s1 = tcc_ir_op_get_src1(ir, q);
+              if (irop_is_immediate(s1))
+              {
+                ms->value = irop_get_imm64_ex(ir, s1);
+                ms->btype = irop_get_btype(d);
+                ms->known = 1;
+                ms->initial_value = ms->value;
+                ms->initial_known = 1;
+                mem_has_def[mem_idx] = 1;
+              }
+              else
+              {
+                ms->known = 0;
+                ms->initial_known = 0;
+              }
+            }
+          }
+          continue;
+        }
+      }
+    }
     if (d.is_local && !d.is_lval) continue;
     int32_t vr = irop_get_vreg(d);
     if (vr < 0) continue;
@@ -1343,6 +1433,16 @@ static int lcs_var_used_after(TCCIRState *ir, int var_pos, int from_idx)
 {
   int n = ir->next_instruction_index;
   int32_t target_vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, var_pos);
+  /* This is a linear scan over instruction *indices*, which only reflects
+   * control flow while the path stays straight-line.  A redefinition therefore
+   * kills the loop's value only in the straight-line prefix from the loop exit:
+   * once we pass any branch, a later redefinition may sit in a sibling
+   * (not-taken) branch while the real use is reached via another path.  That is
+   * exactly fuzz seed 8985 — the loop is in an `if` branch, the value is read
+   * after the merge, and the `else` branch redefines the same VAR at a lower
+   * index than that read.  Honouring the kill there wrongly dropped the loop's
+   * residual store, leaving the variable at its pre-loop value. */
+  int saw_branch = 0;
   for (int i = from_idx; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -1357,12 +1457,16 @@ static int lcs_var_used_after(TCCIRState *ir, int var_pos, int from_idx)
       IROperand s = tcc_ir_op_get_src2(ir, q);
       if (irop_get_vreg(s) == target_vr) return 1;
     }
-    /* A redefinition kills any need to preserve the loop's value */
-    if (irop_config[q->op].has_dest)
+    /* A redefinition kills the loop's value only when it is unconditionally
+     * reached from the loop exit (no branch in between). */
+    if (!saw_branch && irop_config[q->op].has_dest)
     {
       IROperand d = tcc_ir_op_get_dest(ir, q);
       if (!d.is_lval && irop_get_vreg(d) == target_vr) return 0;
     }
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP ||
+        q->op == TCCIR_OP_SWITCH_TABLE)
+      saw_branch = 1;
   }
   return 0;
 }

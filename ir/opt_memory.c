@@ -520,6 +520,14 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
    * entry-BB runtime-store invalidation below (seed 294). */
   int64_t *rt_base = tcc_mallocz(sizeof(int64_t) * (max_tmp + 1));
   uint8_t *rt_valid = tcc_mallocz(max_tmp + 1);
+  /* VAR analogue of rt_base: a `&arr[RUNTIME_index]` pointer materialised into
+   * a VAR local (e.g. `unsigned *p = &arr9[u6&7];`).  The runtime store through
+   * such a VAR pointer must invalidate the whole array's entry initializers,
+   * but the TEMP-only rt_base map loses the base when the address lands in /
+   * is copied through a VAR.  Tracking it here lets Phase 2.6 fire (ptr fuzz
+   * seed 3343: `*p11` with p11=&arr9[u6&7] left arr9[2]'s init forwardable). */
+  int64_t *var_rt_base = tcc_mallocz(sizeof(int64_t) * (max_var + 1));
+  uint8_t *var_rt_valid = tcc_mallocz(max_var + 1);
 
   for (int i = 0; i < n; i++)
   {
@@ -542,6 +550,19 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
             lea_map[p].valid = 1;
           }
         }
+        /* Same address landing directly in a VAR (e.g. an alias pointer
+         * `unsigned *q = &local;`): record it so a later store through q (or a
+         * TEMP copied from q) invalidates the matching entry-store (fuzz ptr
+         * seeds 206/368/394 — symmetric with the VAR-dest ADD case below). */
+        else if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+        {
+          int p = TCCIR_DECODE_VREG_POSITION(vr);
+          if (p <= max_var)
+          {
+            var_lea_map[p].offset = irop_get_stack_offset(src1);
+            var_lea_map[p].valid = 1;
+          }
+        }
       }
     }
 
@@ -562,6 +583,12 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
           var_lea_map[dp].offset = lea_map[sp].offset;
           var_lea_map[dp].valid = 1;
         }
+        /* Carry a runtime array base into the VAR alias pointer too. */
+        else if (sp <= max_tmp && rt_valid[sp] && dp <= max_var)
+        {
+          var_rt_base[dp] = rt_base[sp];
+          var_rt_valid[dp] = 1;
+        }
       }
     }
 
@@ -581,6 +608,13 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         {
           lea_map[dp].offset = var_lea_map[sp].offset;
           lea_map[dp].valid = 1;
+        }
+        /* A TEMP copied from a VAR runtime array pointer (`T = p11`) carries the
+         * runtime base, so a store `*T = ...` invalidates the array (seed 3343). */
+        else if (sp <= max_var && var_rt_valid[sp] && dp <= max_tmp)
+        {
+          rt_base[dp] = var_rt_base[sp];
+          rt_valid[dp] = 1;
         }
       }
     }
@@ -631,6 +665,58 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
               have = 1;
             }
             if (have) { rt_base[dp] = base; rt_valid[dp] = 1; }
+          }
+        }
+      }
+      /* VAR-dest of `Addr[StackLoc] + const` or `LEA_temp + const` (an alias
+       * pointer materialized into a VAR, e.g. `V = &arr[1]`): record the
+       * constant offset so a store through it (directly, or via a TEMP copied
+       * from it) invalidates the matching entry-store instead of forwarding the
+       * stale initializer (fuzz ptr seeds 206/368/394). */
+      else if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int dp = TCCIR_DECODE_VREG_POSITION(d_vr);
+        if (dp <= max_var)
+        {
+          IROperand s1 = tcc_ir_op_get_src1(ir, q);
+          IROperand s2 = tcc_ir_op_get_src2(ir, q);
+          int32_t s1_vr = irop_get_vreg(s1);
+          if (s1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_TEMP &&
+              irop_is_immediate(s2) && !s2.is_sym)
+          {
+            int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
+            if (sp <= max_tmp && lea_map[sp].valid)
+            {
+              var_lea_map[dp].offset = lea_map[sp].offset + irop_get_imm64_ex(ir, s2);
+              var_lea_map[dp].valid = 1;
+            }
+          }
+          else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF &&
+                   irop_is_immediate(s2) && !s2.is_sym)
+          {
+            var_lea_map[dp].offset = irop_get_stack_offset(s1) + irop_get_imm64_ex(ir, s2);
+            var_lea_map[dp].valid = 1;
+          }
+          /* `V = base + RUNTIME index` (an alias pointer into a stack array
+           * stored in a VAR).  Record the array base so a later store through
+           * V — or a TEMP copied from V — is recognised as a runtime array
+           * write and invalidates the array's entry initializers (seed 3343). */
+          else if (!irop_is_immediate(s2))
+          {
+            int64_t base;
+            int have = 0;
+            if (s1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_TEMP)
+            {
+              int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
+              if (sp <= max_tmp && lea_map[sp].valid) { base = lea_map[sp].offset; have = 1; }
+              else if (sp <= max_tmp && rt_valid[sp]) { base = rt_base[sp]; have = 1; }
+            }
+            else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF)
+            {
+              base = irop_get_stack_offset(s1);
+              have = 1;
+            }
+            if (have) { var_rt_base[dp] = base; var_rt_valid[dp] = 1; }
           }
         }
       }
@@ -708,6 +794,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     tcc_free(var_lea_map);
     tcc_free(rt_base);
     tcc_free(rt_valid);
+    tcc_free(var_rt_base);
+    tcc_free(var_rt_valid);
     return 0;
   }
 
@@ -842,12 +930,20 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
           else if (dp <= max_tmp && rt_valid[dp]) base = rt_base[dp];
         }
       }
-      else /* plain STORE / STORE_POSTINC through a TEMP deref */
+      else /* plain STORE / STORE_POSTINC through a TEMP / VAR deref */
       {
         if (sd.is_local) continue; /* direct stores handled by Phase 1 */
-        if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP) continue;
+        if (dv < 0) continue;
         int dp = TCCIR_DECODE_VREG_POSITION(dv);
-        if (dp <= max_tmp && rt_valid[dp]) base = rt_base[dp];
+        if (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP)
+        {
+          if (dp <= max_tmp && rt_valid[dp]) base = rt_base[dp];
+        }
+        else if (TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR)
+        {
+          /* `*p = ...` directly through a VAR runtime array pointer. */
+          if (dp <= max_var && var_rt_valid[dp]) base = var_rt_base[dp];
+        }
       }
       if (base == 0x7FFFFFFFLL)
         continue;
@@ -1019,6 +1115,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   tcc_free(var_lea_map);
   tcc_free(rt_base);
   tcc_free(rt_valid);
+  tcc_free(var_rt_base);
+  tcc_free(var_rt_valid);
 
   return changes;
 }
@@ -4745,6 +4843,35 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
     if (irop_config[q->op].has_src2)
       RSE_FLUSH_RUNTIME_DEREF(tcc_ir_op_get_src2(ir, q));
 #undef RSE_FLUSH_RUNTIME_DEREF
+
+    /* A DEREF read whose pointer resolves to NEITHER an exact (sym,off)
+     * [RSE_EVICT_FOR_SRC] NOR an array base+runtime-index [RSE_FLUSH_RUNTIME_DEREF]
+     * may read ANY tracked slot.  The canonical miss is a read through a
+     * VAR-materialized pointer — `V = &arr[k]; T = V; x = *T` — where the
+     * single-def chain runs through a VAR, so rse_resolve_temp_addr bails on the
+     * non-TEMP link and rse_resolve_runtime_base finds no runtime addend.  Such a
+     * read was silently treated as "no read", letting a later store to the same
+     * slot wrongly eliminate the value this read still needs (fuzz ptr seed 323).
+     * Be conservative: flush all pending stores (same as the CALL flush). */
+#define RSE_FLUSH_UNRESOLVED_DEREF(SRC_OP)                                                                                \
+  do                                                                                                                     \
+  {                                                                                                                      \
+    IROperand _src = (SRC_OP);                                                                                           \
+    if (_src.is_lval && irop_get_tag(_src) == IROP_TAG_VREG)                                                             \
+    {                                                                                                                    \
+      const Sym *_us;                                                                                                    \
+      int64_t _uo;                                                                                                       \
+      int32_t _uv = irop_get_vreg(_src);                                                                                 \
+      if (!rse_resolve_temp_addr(ir, _uv, &_us, &_uo) &&                                                                 \
+          !rse_resolve_runtime_base(ir, _uv, &_us, &_uo, 4))                                                             \
+        active_count = 0;                                                                                                \
+    }                                                                                                                    \
+  } while (0)
+    if (irop_config[q->op].has_src1)
+      RSE_FLUSH_UNRESOLVED_DEREF(tcc_ir_op_get_src1(ir, q));
+    if (irop_config[q->op].has_src2)
+      RSE_FLUSH_UNRESOLVED_DEREF(tcc_ir_op_get_src2(ir, q));
+#undef RSE_FLUSH_UNRESOLVED_DEREF
 
     /* LOAD_INDEXED with a runtime index reads an unknown element of its
      * base array.  Any active store whose offset falls within the array's
@@ -10728,8 +10855,32 @@ int tcc_ir_opt_ptr_load_cse(TCCIRState *ir)
                 }
               }
             }
-            q->op = TCCIR_OP_NOP;
-            changes++;
+            /* The redirection above stops at the basic-block boundary (it breaks
+             * at a jump target / branch) and never rewrites an MLA accumulator,
+             * so a use of dest_vr in a LATER block — e.g. a deref-STORE address
+             * `T***DEREF*** <- v` reached through a branch — is NOT redirected.
+             * NOPing the copy there leaves that store reading an undefined
+             * address (fuzz ptr seed 291).  Only drop the copy when no use of
+             * dest_vr survives; DCE removes it later if it becomes truly dead. */
+            {
+              int dv_live = 0;
+              for (int m = i + 1; m < n && !dv_live; m++)
+              {
+                IRQuadCompact *mq = &ir->compact_instructions[m];
+                if (mq->op == TCCIR_OP_NOP)
+                  continue;
+                if ((irop_config[mq->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, mq)) == dest_vr) ||
+                    (irop_config[mq->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, mq)) == dest_vr) ||
+                    (irop_config[mq->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, mq)) == dest_vr) ||
+                    (mq->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, mq)) == dest_vr))
+                  dv_live = 1;
+              }
+              if (!dv_live)
+              {
+                q->op = TCCIR_OP_NOP;
+                changes++;
+              }
+            }
             goto plcse_next;
           }
         }

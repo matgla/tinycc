@@ -29,6 +29,22 @@ UT_COV_CFLAGS := --coverage
 UT_COV_LDFLAGS := --coverage
 endif
 
+# Coverage-mode stamp. The object rules below track only source timestamps, so
+# without this they happily reuse objects compiled in the *other* coverage mode:
+# after `make ut-coverage` the build/ tree holds --coverage objects, and a plain
+# `make`/`make run` (COVERAGE=0) would relink them un-instrumented, leaving
+# gcov's _sub_I_*/__gcov_init ctors unresolved (and vice-versa). Naming the stamp
+# after the active mode means switching modes references an absent stamp; the
+# rule then drops the sibling stamp and touches the new one, whose fresh mtime
+# forces every object to recompile. Mirrors the top-level config.mak dependency
+# that guards the cross build against ASan toggles.
+COV_STAMP := $(BUILD_DIR)/.coverage-$(COVERAGE)
+
+$(COV_STAMP):
+	@mkdir -p $(dir $@)
+	@rm -f $(BUILD_DIR)/.coverage-*
+	@touch $@
+
 # Mirror the armv8m target defines so tcc.h parses identically to the
 # compiler build. Unit tests never codegen, so these only drive the
 # preprocessor.
@@ -267,37 +283,37 @@ $(UT_BIN): $(UT_OBJS)
 	$(HOSTCC) -Wl,--gc-sections $(UT_COV_LDFLAGS) -o $@ $^
 
 # Local source files → build/*.o
-$(BUILD_DIR)/%.o: %.c $(UT_ROOT)/ut.h Makefile
+$(BUILD_DIR)/%.o: %.c $(UT_ROOT)/ut.h Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 # ir/pool.o etc — build from the tinycc source tree, preserve layout under build/.
-$(BUILD_DIR)/ir/%.o: $(TOP)/ir/%.c Makefile
+$(BUILD_DIR)/ir/%.o: $(TOP)/ir/%.c Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 # libtcc.o — build from the tinycc source tree.
-$(BUILD_DIR)/libtcc.o: $(TOP)/libtcc.c Makefile
+$(BUILD_DIR)/libtcc.o: $(TOP)/libtcc.c Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 # tccir_operand.o — top-level source (pool getters for the opt-pass suites).
-$(BUILD_DIR)/tccir_operand.o: $(TOP)/tccir_operand.c Makefile
+$(BUILD_DIR)/tccir_operand.o: $(TOP)/tccir_operand.c Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 # Other top-level tinycc sources (e.g. svalue.c) compiled straight to build/*.o.
-$(BUILD_DIR)/%.o: $(TOP)/%.c Makefile
+$(BUILD_DIR)/%.o: $(TOP)/%.c Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 # arch/arm/arm.o — build from the tinycc source tree.
-$(BUILD_DIR)/arch/arm/%.o: $(TOP)/arch/arm/%.c Makefile
+$(BUILD_DIR)/arch/arm/%.o: $(TOP)/arch/arm/%.c Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 # arch/arm/thumb/thumb.o and thop_adr.o — build from the tinycc source tree.
-$(BUILD_DIR)/arch/arm/thumb/%.o: $(TOP)/arch/arm/thumb/%.c Makefile
+$(BUILD_DIR)/arch/arm/thumb/%.o: $(TOP)/arch/arm/thumb/%.c Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 

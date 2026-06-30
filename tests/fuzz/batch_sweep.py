@@ -49,6 +49,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]          # libs/tinycc
@@ -70,11 +72,28 @@ CF_COMMON = ["-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
 
 _SIG_RE = re.compile(r"checksum=([0-9a-f]+)|HardFault|Lockup")
 _ENV = {**os.environ, "ASAN_OPTIONS": "detect_leaks=0:abort_on_error=0"}
+_PROGRESS_LOCK = threading.Lock()
 
 
 def _run(cmd, **kw):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, env=_ENV, **kw)
+
+
+def _elapsed(start: float) -> str:
+    secs = int(time.monotonic() - start)
+    mins, secs = divmod(secs, 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f"{hours:d}h{mins:02d}m{secs:02d}s"
+    if mins:
+        return f"{mins:d}m{secs:02d}s"
+    return f"{secs:d}s"
+
+
+def progress(msg: str) -> None:
+    with _PROGRESS_LOCK:
+        print(msg, file=sys.stderr, flush=True)
 
 
 def discover_toolchain() -> dict:
@@ -136,7 +155,14 @@ def link_cmd(objs, out_elf, tc) -> list:
 # ---------------------------------------------------------------------------
 # Generator feature profile (Axis 2 of docs/plan_fuzz_reach_expansion.md); set
 # from --profile / FUZZ_PROFILE.  "int" (default) = historical byte-identical stream.
-GEN_PROFILE = os.environ.get("FUZZ_PROFILE", "int")
+_PROFILE_ALIASES = {"integer": "int"}
+
+
+def normalize_profile(profile: str) -> str:
+    return _PROFILE_ALIASES.get(profile, profile)
+
+
+GEN_PROFILE = normalize_profile(os.environ.get("FUZZ_PROFILE", "int"))
 
 
 def gen_seed(seed: int, wd: Path) -> Path | None:
@@ -207,9 +233,16 @@ def run_elf(elf: Path, timeout: float) -> tuple[str, bool]:
     timeout is preserved by capturing to a file."""
     out = elf.with_suffix(".out")
     with open(out, "w") as fh:
+        # stdin MUST be detached from the controlling tty: `-nographic` muxes the
+        # serial+monitor onto stdio and puts a tty stdin into RAW mode (echo off).
+        # On the timeout path below we SIGKILL qemu, so it never restores termios
+        # — that leaves the user's terminal silent/broken (and with parallel
+        # workers it's near-certain on any slow seed).  /dev/null is not a tty, so
+        # qemu leaves the terminal alone.  The guest never reads stdin anyway.
         p = subprocess.Popen(
             ["qemu-system-arm", "-machine", "mps2-an505", "-nographic",
              "-semihosting", "-kernel", str(elf)],
+            stdin=subprocess.DEVNULL,
             stdout=fh, stderr=subprocess.STDOUT, env=_ENV)
         try:
             p.wait(timeout=timeout)
@@ -249,7 +282,7 @@ def parse_batch(text: str, timed_out: bool) -> tuple[dict, int | None, str | Non
 
 
 def sweep_olevel(seeds: list[int], olevel: str, objs: dict, wd: Path, tc,
-                 batch: int, timeout_base: float) -> dict:
+                 batch: int, timeout_base: float, progress_every: int = 0) -> dict:
     """Run every seed at one O-level using batched ELFs; return seed->signature.
 
     `objs` maps seed -> compiled .o for THIS olevel (missing => COMPILE_FAIL,
@@ -264,6 +297,23 @@ def sweep_olevel(seeds: list[int], olevel: str, objs: dict, wd: Path, tc,
     results: dict[int, str] = {}
     avail = [s for s in seeds if s in objs]
     chunks = deque(avail[i:i + batch] for i in range(0, len(avail), batch))
+    started = time.monotonic()
+    last_report = -1
+
+    def report(force: bool = False) -> None:
+        nonlocal last_report
+        done = len(results)
+        if force and done == last_report:
+            return
+        if not force and progress_every and done - last_report < progress_every:
+            return
+        if not force and not progress_every:
+            return
+        last_report = done
+        progress(f"  run {olevel}: {done}/{len(avail)} seeds "
+                 f"({len(chunks)} batch(es) queued, {_elapsed(started)})")
+
+    report(force=True)
     while chunks:
         chunk = chunks.popleft()
         runner = build_runner_obj(chunk, olevel, wd, tc)
@@ -276,6 +326,7 @@ def sweep_olevel(seeds: list[int], olevel: str, objs: dict, wd: Path, tc,
                 chunks.appendleft(chunk[:mid])
             else:                                    # a single seed that won't link
                 results[chunk[0]] = classify_one(chunk[0], olevel, wd, tc, timeout_base)
+                report()
             continue
         # runtime grows with batch size; give each program ~80ms headroom.
         text, timed_out = run_elf(elf, timeout_base + 0.08 * len(chunk))
@@ -292,6 +343,8 @@ def sweep_olevel(seeds: list[int], olevel: str, objs: dict, wd: Path, tc,
             for s in chunk:
                 if s not in results:
                     results[s] = classify_one(s, olevel, wd, tc, timeout_base)
+        report()
+    report(force=True)
     return results
 
 
@@ -328,11 +381,13 @@ def main(argv=None) -> int:
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--olevels", default="-O0,-O1,-O2,-Os")
     ap.add_argument("--timeout", type=float, default=20.0, help="base qemu timeout (s)")
+    ap.add_argument("--progress-every", type=int, default=500,
+                    help="print progress every N completed items/seeds (0 disables)")
     ap.add_argument("--keep", action="store_true", help="keep the work dir")
     ap.add_argument("--profile", default=GEN_PROFILE,
-                    help="generator feature profile (int|float|...); default $FUZZ_PROFILE or int")
+                    help="generator feature profile (int/integer|float|...); default $FUZZ_PROFILE or int")
     args = ap.parse_args(argv)
-    GEN_PROFILE = args.profile
+    GEN_PROFILE = normalize_profile(args.profile)
 
     if not TCC.exists():
         sys.exit(f"no {TCC} — run 'make cross'")
@@ -348,22 +403,30 @@ def main(argv=None) -> int:
     tc = discover_toolchain()
     wd = Path(tempfile.mkdtemp(prefix="batchsweep_"))
     compile_boot(wd, tc)
-    print(f"batch sweep: {len(seeds)} seeds x {len(olevels)} O-levels, "
-          f"batch={args.batch}, jobs={args.jobs}\n  workdir {wd}", file=sys.stderr)
+    progress(f"batch sweep: {len(seeds)} seeds x {len(olevels)} O-levels, "
+             f"batch={args.batch}, jobs={args.jobs}\n  workdir {wd}")
 
     # signatures[seed][olevel] = '<hex>'|HardFault|Lockup|COMPILE_FAIL
     signatures: dict[int, dict[str, str]] = {s: {} for s in seeds}
 
     # 1) generate sources (parallel).
     srcs: dict[int, Path] = {}
+    started = time.monotonic()
+    done_g = 0
     with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        for s, src in zip(seeds, ex.map(lambda s: gen_seed(s, wd), seeds)):
+        futs = {ex.submit(gen_seed, s, wd): s for s in seeds}
+        for fut in cf.as_completed(futs):
+            s = futs[fut]
+            src = fut.result()
+            done_g += 1
             if src is None:
                 for o in olevels:
                     signatures[s][o] = "COMPILE_FAIL"
             else:
                 srcs[s] = src
-    print(f"  generated {len(srcs)}/{len(seeds)} sources", file=sys.stderr)
+            if (args.progress_every and done_g % args.progress_every == 0) or done_g == len(seeds):
+                progress(f"  generated {done_g}/{len(seeds)} seeds "
+                         f"({len(srcs)} sources ok, {_elapsed(started)})")
 
     # 2) compile every (seed, O-level) object (parallel).  COMPILE_FAIL recorded.
     objs: dict[str, dict[int, Path]] = {o: {} for o in olevels}
@@ -375,26 +438,28 @@ def main(argv=None) -> int:
         return s, o, obj, err
 
     done_c = 0
+    started = time.monotonic()
     with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        for s, o, obj, err in ex.map(_compile, work):
+        futs = {ex.submit(_compile, item): item for item in work}
+        for fut in cf.as_completed(futs):
+            s, o, obj, err = fut.result()
             done_c += 1
             if obj is not None:
                 objs[o][s] = obj
             else:
                 signatures[s][o] = err
-            if done_c % 500 == 0 or done_c == len(work):
-                print(f"\r  compiled {done_c}/{len(work)}   ", end="", file=sys.stderr)
-    print(file=sys.stderr)
+            if (args.progress_every and done_c % args.progress_every == 0) or done_c == len(work):
+                progress(f"  compiled {done_c}/{len(work)} objects ({_elapsed(started)})")
 
     # 3) batched run per O-level (the O-levels run concurrently).
     with cf.ThreadPoolExecutor(max_workers=len(olevels)) as ex:
         futs = {ex.submit(sweep_olevel, seeds, o, objs[o], wd, tc,
-                          args.batch, args.timeout): o for o in olevels}
+                          args.batch, args.timeout, args.progress_every): o for o in olevels}
         for fut in cf.as_completed(futs):
             o = futs[fut]
             for s, sig in fut.result().items():
                 signatures[s][o] = sig
-            print(f"  {o} done", file=sys.stderr)
+            progress(f"  {o} done")
 
     # 4) classify divergences: a seed is divergent if its O-level signatures
     #    are not all identical (matches the old sweep's val()-equality test).
@@ -404,7 +469,7 @@ def main(argv=None) -> int:
         if len(set(vals)) > 1:
             divergent.append(s)
 
-    print(f"\nswept {len(seeds)} seeds — {len(divergent)} divergent", file=sys.stderr)
+    progress(f"\nswept {len(seeds)} seeds — {len(divergent)} divergent")
     for s in divergent:
         print(s)
 

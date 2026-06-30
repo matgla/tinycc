@@ -58,8 +58,23 @@ int ssa_opt_phi_simplify(IRSSAOptCtx *ctx)
           continue;
         }
 
-        /* Replace all uses of phi->dest_vreg with unique */
+        /* Replace all uses of phi->dest_vreg with unique.  The replacement
+         * can bail and rewrite NOTHING when a use must keep dest's exact vreg
+         * identity — e.g. an ARM barrel-shift src2 whose implicit shift is
+         * keyed on the operand's vreg (ssa_opt_use_is_barrel_shift_src2).
+         * Dropping the phi while such uses remain leaves them referencing an
+         * undefined value: the def vanishes but the use does not.  (fuzz seed
+         * 19826: a loop-invariant local read after the loop as `x >> n` then
+         * read 0, because its loop-closing phi was simplified away while the
+         * barrel-shifted use kept the phi-dest vreg.)  Only drop the phi once
+         * dest_vreg is genuinely use-free; otherwise keep it so phi resolution
+         * still materializes it. */
         ssa_opt_replace_all_uses(ctx, phi->dest_vreg, unique);
+        IRSSAVregInfo *dvi = ssa_opt_vinfo(ctx, phi->dest_vreg);
+        if (dvi && dvi->use_count > 0) {
+          pp = &(*pp)->next;
+          continue;
+        }
 
         /* Remove phi from the list */
         *pp = phi->next;
