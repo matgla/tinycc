@@ -444,6 +444,8 @@ TEST_FILES = [
     ("230_fuzz_entry_store_var_runtime_array_ptr.c", 0),
     ("231_fuzz_loop_const_sim_bf_rmw_addrof_alias.c", 0),
     ("232_fuzz_bitfield_store_indexed_width.c", 0),
+    ("233_fuzz_knownbits_subword_store_slot_overlap.c", 0),
+    ("234_fuzz_switch_table_r12_clobber.c", 0),
 
     # Promoted from orphan triage: builtins, _Complex, aggregate init,
     # 64-bit ops, cast/bitfield, and previously-fixed bug regressions.

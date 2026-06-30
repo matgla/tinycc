@@ -108,6 +108,43 @@ static int ra_has_call_in_range(const int *prefix, int start, int end, int n)
   return (prefix[end] - prefix[start + 1]) != 0;
 }
 
+/* Prefix sum of SWITCH_TABLE / SWITCH_LOAD dispatches.  The Thumb lowering of
+ * both ops (tcc_gen_machine_switch_table_mop / _switch_load_mop in
+ * arm-thumb-gen.c) uses R_IP (R12) as a fixed scratch for the jump-table base
+ * and clobbers it.  R12 is caller-saved, so a value that is merely live across
+ * the dispatch is not otherwise forced off it — see ra_has_switch_in_range. */
+static int *ra_build_switch_prefix(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n <= 0)
+    return NULL;
+  int *prefix = tcc_malloc(sizeof(int) * (n + 1));
+  prefix[0] = 0;
+  for (int i = 0; i < n; i++) {
+    TccIrOp op = ir->compact_instructions[i].op;
+    int is_switch = (op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD);
+    prefix[i + 1] = prefix[i] + is_switch;
+  }
+  return prefix;
+}
+
+/* True if a SWITCH_TABLE/SWITCH_LOAD dispatch sits at any position k with
+ * start < k <= end, i.e. the interval [start,end] is live across the dispatch.
+ * `end` is inclusive (unlike ra_has_call_in_range): a value whose only use is
+ * a *backward* switch target has its last use laid out before the dispatch in
+ * IR order, with its interval extended forward by the back-edge pass to exactly
+ * the dispatch position — so end == k must still count.  Such a value would be
+ * read at a switch target *after* the R12 clobber, so it must avoid R12. */
+static int ra_has_switch_in_range(const int *prefix, int start, int end, int n)
+{
+  if (!prefix || n <= 0)
+    return 0;
+  if (start < -1) start = -1;
+  if (end > n - 1) end = n - 1;
+  if (end < start + 1) return 0;
+  return (prefix[end + 1] - prefix[start + 1]) != 0;
+}
+
 static const char *ra_vreg_type_char(int type)
 {
   switch (type) {
@@ -658,6 +695,10 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   int max_vreg_pos = local_count;
   if (temp_count > max_vreg_pos) max_vreg_pos = temp_count;
   if (param_count > max_vreg_pos) max_vreg_pos = param_count;
+
+  /* SWITCH_TABLE/SWITCH_LOAD dispatch clobbers R_IP (R12); see
+   * ra_has_switch_in_range below. */
+  int *switch_prefix = ra_build_switch_prefix(ir);
 
   /* Allocate per-vreg start/end tracking indexed by encoded vreg.
    * Use flat arrays indexed by (type * max_pos + position). */
@@ -1321,6 +1362,16 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
         }
       }
 
+      /* Switch crossing: a SWITCH_TABLE/SWITCH_LOAD dispatch clobbers R_IP
+       * (R12) as its jump-table scratch (tcc_gen_machine_switch_table_mop).
+       * A value live across the dispatch must therefore not occupy R12.  R12
+       * is caller-saved, so reuse crosses_call to force the value into a
+       * callee-saved register — exactly what the -O1 allocator already does.
+       * (fuzz seed 102: at -O2 the loop-carried checksum `cs` was placed in
+       * R12 and clobbered by the switch dispatch, corrupting the result.) */
+      if (!iv->crosses_call)
+        iv->crosses_call = ra_has_switch_in_range(switch_prefix, iv->start, iv->end, n);
+
       /* Params: start at 0, precolor if in register.
        * Do NOT bump end past its last actual use — the pref_reg boundary
        * eviction (a->end == cur->start) relies on the param expiring at
@@ -1366,6 +1417,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   *out_count = wi;
   if (out_max_vreg_pos)
     *out_max_vreg_pos = max_vreg_pos;
+  if (switch_prefix) tcc_free(switch_prefix);
   #undef VREG_IDX
 }
 
