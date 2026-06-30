@@ -29419,6 +29419,13 @@ static void gen_function(Sym *sym)
 #endif
 
 
+  /* Carry narrow plain-STORE access widths onto their value operands before any
+   * pass converts a plain STORE (width from dest) into a STORE_INDEXED (width
+   * from the value operand) — so a char/short store is not widened to a word.
+   * Run again before regalloc to catch widths lost to later value forwarding. */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_narrow_store_value_btype(ir);
+
   /* Block copy init: replace memset(0) + consecutive stores with BLOCK_COPY
    * from a pre-built rodata block.  Run once before the iterative loop. */
   { void dbg_scan_overlap(TCCIRState*,const char*); dbg_scan_overlap(ir,"pre-block_copy_init"); }
@@ -30961,6 +30968,12 @@ static void gen_function(Sym *sym)
    * Keyed by orig_index like barrel_shifts; consumed in codegen. */
   if (tcc_state->optimize > 0)
     tcc_ir_opt_shift64_dead_half(ir);
+
+  /* Carry narrow plain-STORE access widths onto their value operands so the
+   * later STORE_INDEXED conversions (which take the store width from the value
+   * operand, not the dest) do not widen a char/short store to a word. */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_narrow_store_value_btype(ir);
 
   /* Register allocation (SSA-based linear scan) */
   {

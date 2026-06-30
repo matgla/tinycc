@@ -287,6 +287,11 @@ int tcc_ir_opt_cmp_narrow_64(struct TCCIRState *ir);
  * or high word is provably unread, so codegen skips the dead half-write. */
 int tcc_ir_opt_shift64_dead_half(struct TCCIRState *ir);
 
+/* Clamp a narrow plain STORE's value-operand btype to its access width so a
+ * later STORE_INDEXED conversion (which takes width from the value) does not
+ * widen a char/short store to a word and clobber adjacent memory. */
+int tcc_ir_opt_narrow_store_value_btype(struct TCCIRState *ir);
+
 /* Global LOAD value CSE - deduplicate loads from the same global within a BB */
 int tcc_ir_opt_cse_global_load(struct TCCIRState *ir);
 

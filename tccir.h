@@ -863,6 +863,17 @@ static inline void tcc_ir_set_src1(TCCIRState *ir, int index, IROperand irop)
   if (!irop_config[q->op].has_src1)
     return;
   int off = irop_config[q->op].has_dest;
+  /* A STORE_INDEXED / STORE_POSTINC derives its store width from the VALUE
+   * (src1) operand's btype.  A value rewrite (e.g. copy-propagation forwarding
+   * a wider temp into a char/short bitfield store) must not widen it — that
+   * would turn a byte/half store into a word store and clobber adjacent memory.
+   * Preserve the existing narrow access width. */
+  if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC) {
+    uint8_t old_bt = ir->iroperand_pool[q->operand_base + off].btype;
+    if ((old_bt == IROP_BTYPE_INT8 || old_bt == IROP_BTYPE_INT16) &&
+        irop.btype == IROP_BTYPE_INT32)
+      irop.btype = old_bt;
+  }
   ir->iroperand_pool[q->operand_base + off] = irop;
 }
 
