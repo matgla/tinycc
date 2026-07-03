@@ -1,6 +1,6 @@
 services:
   grafana:
-    image: grafana/grafana:latest
+    image: docker.io/grafana/grafana:latest
     restart: unless-stopped
     environment:
       GF_INSTALL_PLUGINS: frser-sqlite-datasource
