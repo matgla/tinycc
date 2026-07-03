@@ -221,6 +221,24 @@ UT_TEST(test_section_prealloc_reserves_capacity_without_moving_offset)
   return 0;
 }
 
+UT_TEST(test_section_add_updates_sh_addralign)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *sec = new_section(tcc_state, ".align", SHT_PROGBITS, SHF_ALLOC);
+  UT_ASSERT_EQ(sec->sh_addralign, 8);
+
+  section_add(sec, 4, 16);
+  UT_ASSERT_EQ(sec->sh_addralign, 16);
+
+  section_add(sec, 4, 4);
+  UT_ASSERT_EQ(sec->sh_addralign, 16); /* larger value is kept */
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
 /* ============================================================================
  * String tables
  * ============================================================================ */
@@ -523,6 +541,22 @@ UT_TEST(test_put_elf_reloca_rejects_nonzero_addend_on_rel_arch)
   return 0;
 }
 
+UT_TEST(test_put_elf_reloca_skips_invalid_symbol_index)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  section_ptr_add(data_section, 4);
+  /* Symbol index 9999 is way past the end of the symbol table. */
+  put_elf_reloca(symtab_section, data_section, 0, R_DATA_PTR, 9999, 0);
+
+  /* The relocation is silently skipped. */
+  UT_ASSERT(data_section->reloc == NULL);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
 /* ============================================================================
  * Per-file symbol/reloc lifecycle
  * ============================================================================ */
@@ -586,6 +620,31 @@ UT_TEST(test_tccelf_end_file_updates_relocations_after_symbol_rebuild)
   int new_sym = ELFW(R_SYM)(rel->r_info);
   ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
   UT_ASSERT_EQ(syms[new_sym].st_value, 0x10);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_tccelf_end_file_sets_undef_func_to_notype_for_obj_output)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+  tccelf_begin_file(tcc_state);
+
+  tcc_state->output_type = TCC_OUTPUT_OBJ;
+
+  put_elf_sym(symtab_section, 0, 0,
+              ELFW(ST_INFO)(STB_LOCAL, STT_FUNC),
+              0, SHN_UNDEF, "local_undef_func");
+
+  tccelf_end_file(tcc_state);
+
+  int new_idx = find_elf_sym(symtab_section, "local_undef_func");
+  UT_ASSERT(new_idx != 0);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(ELFW(ST_BIND)(syms[new_idx].st_info), STB_GLOBAL);
+  UT_ASSERT_EQ(ELFW(ST_TYPE)(syms[new_idx].st_info), STT_NOTYPE);
 
   tccelf_delete(tcc_state);
   return 0;
@@ -816,6 +875,519 @@ UT_TEST(test_tccelf_delete_leaves_sym_attrs_stale)
   return 0;
 }
 
+/* ============================================================================
+ * tccelf_new optional branches
+ * ============================================================================ */
+
+UT_TEST(test_tccelf_new_creates_bounds_sections_when_enabled)
+{
+  ut_elf_reset_state();
+  tcc_state->do_bounds_check = 1;
+  tccelf_new(tcc_state);
+
+  UT_ASSERT(bounds_section != NULL);
+  UT_ASSERT(lbounds_section != NULL);
+  UT_ASSERT_STREQ(bounds_section->name, ".bounds");
+  UT_ASSERT_STREQ(lbounds_section->name, ".lbounds");
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_tccelf_new_calls_debug_new_when_enabled)
+{
+  ut_elf_reset_state();
+  tcc_state->do_debug = 1;
+  tccelf_new(tcc_state);
+  /* tcc_debug_new is a stub in this binary; just verify no crash. */
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * Section type-specific alignment
+ * ============================================================================ */
+
+UT_TEST(test_new_section_sets_sh_addralign_by_type)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *strtab = new_section(tcc_state, ".strtab", SHT_STRTAB, SHF_PRIVATE);
+  Section *hash = new_section(tcc_state, ".hashtab", SHT_HASH, SHF_PRIVATE);
+  Section *gnu_hash = new_section(tcc_state, ".gnu.hash", SHT_GNU_HASH, SHF_ALLOC);
+  Section *versym = new_section(tcc_state, ".gnu.version", SHT_GNU_versym, SHF_ALLOC);
+
+  UT_ASSERT_EQ(strtab->sh_addralign, 1);
+  UT_ASSERT_EQ(hash->sh_addralign, 8);
+  UT_ASSERT_EQ(gnu_hash->sh_addralign, 8);
+  UT_ASSERT_EQ(versym->sh_addralign, 2);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * String tables
+ * ============================================================================ */
+
+UT_TEST(test_put_elf_str_appends_duplicates)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *strtab = new_section(tcc_state, ".strtab", SHT_STRTAB, SHF_PRIVATE);
+  int off1 = put_elf_str(strtab, "duplicate");
+  int off2 = put_elf_str(strtab, "duplicate");
+
+  /* put_elf_str does not deduplicate. */
+  UT_ASSERT_EQ(off1, 0);
+  UT_ASSERT_EQ(off2, 10);
+  UT_ASSERT_STREQ((char *)strtab->data + off1, "duplicate");
+  UT_ASSERT_STREQ((char *)strtab->data + off2, "duplicate");
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * Symbol tables and ELF hashing
+ * ============================================================================ */
+
+UT_TEST(test_put_elf_sym_rejects_invalid_first_byte)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *symtab = new_symtab(tcc_state, ".symtab", SHT_SYMTAB, 0,
+                               ".strtab", ".hashtab", SHF_PRIVATE);
+
+  const char ctrl[] = {0x01, 'c', 't', 'r', 'l', 0};
+  const char cont[] = {0x80, 'c', 'o', 'n', 't', 0};
+  const char too_high[] = {0xff, 'h', 'i', 'g', 'h', 0};
+  const char valid_utf8[] = {0xc2, 0xa0, 'v', 'a', 'l', 'i', 'd', 0};
+
+  int i_ctrl = put_elf_sym(symtab, 0, 1,
+                           ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), 0, 1, ctrl);
+  int i_cont = put_elf_sym(symtab, 0, 1,
+                           ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), 0, 1, cont);
+  int i_high = put_elf_sym(symtab, 0, 1,
+                           ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), 0, 1, too_high);
+  int i_valid = put_elf_sym(symtab, 0, 1,
+                            ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), 0, 1, valid_utf8);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab->data;
+  UT_ASSERT_EQ(syms[i_ctrl].st_name, 0);
+  UT_ASSERT_EQ(syms[i_cont].st_name, 0);
+  UT_ASSERT_EQ(syms[i_high].st_name, 0);
+  UT_ASSERT(syms[i_valid].st_name != 0);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_put_elf_sym_hash_table_rebuilds_after_many_globals)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *symtab = new_symtab(tcc_state, ".symtab", SHT_SYMTAB, 0,
+                               ".strtab", ".hashtab", SHF_PRIVATE);
+
+  char name[32];
+  int i;
+  for (i = 0; i < 1100; i++)
+  {
+    snprintf(name, sizeof(name), "sym_%04d", i);
+    put_elf_sym(symtab, i, 1, ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), 0, 1, name);
+  }
+
+  /* Hash should have been resized from 512 buckets to at least 1024. */
+  int *hash = (int *)symtab->hash->data;
+  UT_ASSERT(hash[0] >= 1024);
+
+  /* Every symbol must still be findable. */
+  for (i = 0; i < 1100; i++)
+  {
+    snprintf(name, sizeof(name), "sym_%04d", i);
+    int idx = find_elf_sym(symtab, name);
+    UT_ASSERT(idx != 0);
+    ElfW(Sym) *syms = (ElfW(Sym) *)symtab->data;
+    UT_ASSERT_EQ(syms[idx].st_value, (addr_t)i);
+  }
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_put_elf_sym_tracks_undefined_globals)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  UT_ASSERT_EQ(tcc_state->nb_undef_syms, 0);
+  put_elf_sym(symtab_section, 0, 0,
+              ELFW(ST_INFO)(STB_GLOBAL, STT_FUNC), 0, SHN_UNDEF, "undef1");
+  UT_ASSERT_EQ(tcc_state->nb_undef_syms, 1);
+  put_elf_sym(symtab_section, 0, 0,
+              ELFW(ST_INFO)(STB_LOCAL, STT_FUNC), 0, SHN_UNDEF, "undef_local");
+  UT_ASSERT_EQ(tcc_state->nb_undef_syms, 1); /* locals not tracked */
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * set_elf_sym duplicate-definition policy branches
+ * ============================================================================ */
+
+UT_TEST(test_set_elf_sym_identical_redefinition_returns_same_index)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx1 = set_elf_sym(symtab_section, 0x100, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_DEFAULT, text_section->sh_num, "same");
+  int idx2 = set_elf_sym(symtab_section, 0x100, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_DEFAULT, text_section->sh_num, "same");
+  UT_ASSERT_EQ(idx1, idx2);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_elf_sym_global_overrides_weak)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx_weak = set_elf_sym(symtab_section, 0x100, 4,
+                             ELFW(ST_INFO)(STB_WEAK, STT_OBJECT),
+                             STV_DEFAULT, text_section->sh_num, "weakglobal");
+  int idx_global = set_elf_sym(symtab_section, 0x200, 8,
+                               ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                               STV_DEFAULT, text_section->sh_num, "weakglobal");
+  UT_ASSERT_EQ(idx_weak, idx_global);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx_global].st_value, 0x200);
+  UT_ASSERT_EQ(syms[idx_global].st_size, 8);
+  UT_ASSERT_EQ(ELFW(ST_BIND)(syms[idx_global].st_info), STB_GLOBAL);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_elf_sym_weak_ignored_when_global_exists)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx_global = set_elf_sym(symtab_section, 0x300, 4,
+                               ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                               STV_DEFAULT, text_section->sh_num, "globalweak");
+  int idx_weak = set_elf_sym(symtab_section, 0x400, 8,
+                             ELFW(ST_INFO)(STB_WEAK, STT_OBJECT),
+                             STV_DEFAULT, text_section->sh_num, "globalweak");
+  UT_ASSERT_EQ(idx_global, idx_weak);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx_global].st_value, 0x300);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_elf_sym_first_weak_kept)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx1 = set_elf_sym(symtab_section, 0x500, 4,
+                         ELFW(ST_INFO)(STB_WEAK, STT_OBJECT),
+                         STV_DEFAULT, text_section->sh_num, "weakweak");
+  int idx2 = set_elf_sym(symtab_section, 0x600, 4,
+                         ELFW(ST_INFO)(STB_WEAK, STT_OBJECT),
+                         STV_DEFAULT, text_section->sh_num, "weakweak");
+  UT_ASSERT_EQ(idx1, idx2);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx1].st_value, 0x500);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_elf_sym_hidden_ignored_after_defined)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx1 = set_elf_sym(symtab_section, 0x700, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_DEFAULT, text_section->sh_num, "hideme");
+  int idx2 = set_elf_sym(symtab_section, 0x800, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_HIDDEN, text_section->sh_num, "hideme");
+  UT_ASSERT_EQ(idx1, idx2);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx1].st_value, 0x700);
+  /* Visibility is still propagated to the most constraining value. */
+  UT_ASSERT_EQ(ELFW(ST_VISIBILITY)(syms[idx1].st_other), STV_HIDDEN);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_elf_sym_data_takes_precedence_over_bss)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx1 = set_elf_sym(symtab_section, 0, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_DEFAULT, bss_section->sh_num, "databss");
+  int idx2 = set_elf_sym(symtab_section, 0x900, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_DEFAULT, data_section->sh_num, "databss");
+  UT_ASSERT_EQ(idx1, idx2);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx1].st_value, 0x900);
+  UT_ASSERT_EQ(syms[idx1].st_shndx, data_section->sh_num);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_elf_sym_data_keeps_precedence_over_common)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx1 = set_elf_sym(symtab_section, 0xa00, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_DEFAULT, data_section->sh_num, "datacommon");
+  int idx2 = set_elf_sym(symtab_section, 0, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_DEFAULT, SHN_COMMON, "datacommon");
+  UT_ASSERT_EQ(idx1, idx2);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx1].st_value, 0xa00);
+  UT_ASSERT_EQ(syms[idx1].st_shndx, data_section->sh_num);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_elf_sym_common_to_data_takes_precedence)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx1 = set_elf_sym(symtab_section, 0, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_DEFAULT, SHN_COMMON, "commontodata");
+  int idx2 = set_elf_sym(symtab_section, 0xb00, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_DEFAULT, data_section->sh_num, "commontodata");
+  UT_ASSERT_EQ(idx1, idx2);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx1].st_value, 0xb00);
+  UT_ASSERT_EQ(syms[idx1].st_shndx, data_section->sh_num);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_elf_sym_visibility_propagation_weak_to_global)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx_weak = set_elf_sym(symtab_section, 0xc00, 4,
+                             ELFW(ST_INFO)(STB_WEAK, STT_OBJECT),
+                             STV_DEFAULT, text_section->sh_num, "visprop");
+  int idx_global = set_elf_sym(symtab_section, 0xd00, 4,
+                               ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                               STV_PROTECTED, text_section->sh_num, "visprop");
+  UT_ASSERT_EQ(idx_weak, idx_global);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx_global].st_value, 0xd00);
+  UT_ASSERT_EQ(ELFW(ST_VISIBILITY)(syms[idx_global].st_other), STV_PROTECTED);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_elf_sym_visibility_default_after_nondefault)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx_weak = set_elf_sym(symtab_section, 0xc10, 4,
+                             ELFW(ST_INFO)(STB_WEAK, STT_OBJECT),
+                             STV_PROTECTED, text_section->sh_num, "visprop2");
+  int idx_global = set_elf_sym(symtab_section, 0xd10, 4,
+                               ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                               STV_DEFAULT, text_section->sh_num, "visprop2");
+  UT_ASSERT_EQ(idx_weak, idx_global);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx_global].st_value, 0xd10);
+  UT_ASSERT_EQ(ELFW(ST_VISIBILITY)(syms[idx_global].st_other), STV_PROTECTED);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_elf_sym_visibility_both_nondefault)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx_weak = set_elf_sym(symtab_section, 0xc20, 4,
+                             ELFW(ST_INFO)(STB_WEAK, STT_OBJECT),
+                             STV_PROTECTED, text_section->sh_num, "visprop3");
+  int idx_global = set_elf_sym(symtab_section, 0xd20, 4,
+                               ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                               STV_HIDDEN, text_section->sh_num, "visprop3");
+  UT_ASSERT_EQ(idx_weak, idx_global);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx_global].st_value, 0xd20);
+  UT_ASSERT_EQ(ELFW(ST_VISIBILITY)(syms[idx_global].st_other), STV_HIDDEN);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_elf_sym_asm_set_overridden)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx1 = set_elf_sym(symtab_section, 0xe00, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_DEFAULT | ST_ASM_SET, text_section->sh_num, "asmset");
+  int idx2 = set_elf_sym(symtab_section, 0xf00, 4,
+                         ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                         STV_DEFAULT, text_section->sh_num, "asmset");
+  UT_ASSERT_EQ(idx1, idx2);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx1].st_value, 0xf00);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * Symbol resolution helpers
+ * ============================================================================ */
+
+UT_TEST(test_get_sym_addr_err_reports_undefined)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  addr_t addr = get_sym_addr(tcc_state, "no_such_symbol", 1, 0);
+  UT_ASSERT(addr == (addr_t)-1);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_get_sym_addr_with_leading_underscore)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+  tcc_state->leading_underscore = 1;
+
+  set_elf_sym(symtab_section, 0x12345678, 4,
+              ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+              0, text_section->sh_num, "_underscored");
+
+  addr_t addr = get_sym_addr(tcc_state, "underscored", 0, 1);
+  UT_ASSERT_EQ(addr, 0x12345678);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_tcc_list_symbols_wrapper_lists_symbols)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  set_elf_sym(symtab_section, 0x777, 1,
+              ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+              0, text_section->sh_num, "wrapper_sym");
+
+  ut_list_cb_count = 0;
+  ut_list_cb_last_name = NULL;
+  tcc_list_symbols(tcc_state, NULL, ut_list_cb);
+  UT_ASSERT_EQ(ut_list_cb_count, 1);
+  UT_ASSERT_STREQ(ut_list_cb_last_name, "wrapper_sym");
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_set_global_sym_null_name_creates_local_absolute)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx = set_global_sym(tcc_state, NULL, NULL, 0xabc);
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(ELFW(ST_BIND)(syms[idx].st_info), STB_LOCAL);
+  UT_ASSERT_EQ(syms[idx].st_shndx, SHN_ABS);
+  UT_ASSERT_EQ(syms[idx].st_value, 0xabc);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * Bound checking helper
+ * ============================================================================ */
+
+UT_TEST(test_tcc_add_bcheck_noop_when_bounds_disabled)
+{
+  ut_elf_reset_state();
+  tcc_state->do_bounds_check = 0;
+  tccelf_new(tcc_state);
+
+  /* With bounds checking disabled, .bounds is not created; the helper
+   * simply returns.  Just verify it does not crash or touch state. */
+  tcc_add_bcheck(tcc_state);
+  UT_ASSERT(bounds_section == NULL);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_tcc_add_bcheck_adds_when_bounds_enabled)
+{
+  ut_elf_reset_state();
+  tcc_state->do_bounds_check = 1;
+  tccelf_new(tcc_state);
+
+  size_t before = bounds_section->data_offset;
+  tcc_add_bcheck(tcc_state);
+  UT_ASSERT_EQ(bounds_section->data_offset, before + sizeof(addr_t));
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(tccelf)
@@ -832,6 +1404,7 @@ UT_SUITE(tccelf)
   UT_RUN(test_section_ptr_add_returns_writable_pointer);
   UT_RUN(test_section_realloc_rounds_up_to_power_of_two);
   UT_RUN(test_section_prealloc_reserves_capacity_without_moving_offset);
+  UT_RUN(test_section_add_updates_sh_addralign);
 
   /* String tables */
   UT_RUN(test_put_elf_str_appends_and_returns_offsets);
@@ -853,11 +1426,13 @@ UT_SUITE(tccelf)
   /* Relocations */
   UT_RUN(test_put_elf_reloc_creates_relocation_section);
   UT_RUN(test_put_elf_reloca_rejects_nonzero_addend_on_rel_arch);
+  UT_RUN(test_put_elf_reloca_skips_invalid_symbol_index);
 
   /* Per-file symbol/reloc lifecycle */
   UT_RUN(test_tccelf_begin_file_saves_offsets_and_disables_hash);
   UT_RUN(test_tccelf_end_file_converts_local_undef_to_global);
   UT_RUN(test_tccelf_end_file_updates_relocations_after_symbol_rebuild);
+  UT_RUN(test_tccelf_end_file_sets_undef_func_to_notype_for_obj_output);
 
   /* Symbol resolution helpers */
   UT_RUN(test_get_sym_addr_returns_defined_value);
@@ -878,4 +1453,43 @@ UT_SUITE(tccelf)
   UT_RUN(test_tccelf_new_creates_standard_sections);
   UT_RUN(test_tccelf_delete_frees_all_sections);
   UT_RUN(test_tccelf_delete_leaves_sym_attrs_stale);
+
+  /* tccelf_new optional branches */
+  UT_RUN(test_tccelf_new_creates_bounds_sections_when_enabled);
+  UT_RUN(test_tccelf_new_calls_debug_new_when_enabled);
+
+  /* Section type-specific alignment */
+  UT_RUN(test_new_section_sets_sh_addralign_by_type);
+
+  /* String tables */
+  UT_RUN(test_put_elf_str_appends_duplicates);
+
+  /* Symbol tables and ELF hashing */
+  UT_RUN(test_put_elf_sym_rejects_invalid_first_byte);
+  UT_RUN(test_put_elf_sym_hash_table_rebuilds_after_many_globals);
+  UT_RUN(test_put_elf_sym_tracks_undefined_globals);
+
+  /* set_elf_sym duplicate-definition policy branches */
+  UT_RUN(test_set_elf_sym_identical_redefinition_returns_same_index);
+  UT_RUN(test_set_elf_sym_global_overrides_weak);
+  UT_RUN(test_set_elf_sym_weak_ignored_when_global_exists);
+  UT_RUN(test_set_elf_sym_first_weak_kept);
+  UT_RUN(test_set_elf_sym_hidden_ignored_after_defined);
+  UT_RUN(test_set_elf_sym_data_takes_precedence_over_bss);
+  UT_RUN(test_set_elf_sym_data_keeps_precedence_over_common);
+  UT_RUN(test_set_elf_sym_common_to_data_takes_precedence);
+  UT_RUN(test_set_elf_sym_visibility_propagation_weak_to_global);
+  UT_RUN(test_set_elf_sym_visibility_default_after_nondefault);
+  UT_RUN(test_set_elf_sym_visibility_both_nondefault);
+  UT_RUN(test_set_elf_sym_asm_set_overridden);
+
+  /* Symbol resolution helpers */
+  UT_RUN(test_get_sym_addr_err_reports_undefined);
+  UT_RUN(test_get_sym_addr_with_leading_underscore);
+  UT_RUN(test_tcc_list_symbols_wrapper_lists_symbols);
+  UT_RUN(test_set_global_sym_null_name_creates_local_absolute);
+
+  /* Bound checking helper */
+  UT_RUN(test_tcc_add_bcheck_noop_when_bounds_disabled);
+  UT_RUN(test_tcc_add_bcheck_adds_when_bounds_enabled);
 }

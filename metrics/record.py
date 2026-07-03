@@ -61,14 +61,33 @@ def info(msg: str) -> None:
     print(f"[metrics] {msg}", file=sys.stderr, flush=True)
 
 
+def die(msg: str) -> None:
+    print(f"[metrics] FATAL: {msg}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
 # --------------------------------------------------------------------------- git
+
+def _run_git(args: list[str]) -> str:
+    """Run a git command in REPO_ROOT, surfacing stderr on failure.
+
+    subprocess.CalledProcessError's default str() only includes the exit
+    code, not stderr -- that swallowed the actual git error the last time
+    this failed in CI (dubious-ownership in a container job), leaving just
+    an unhelpful "returned non-zero exit status 128" traceback.
+    """
+    proc = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), *args], capture_output=True, text=True)
+    if proc.returncode != 0:
+        die(f"git {' '.join(args)} failed (exit {proc.returncode}): "
+            f"{proc.stderr.strip()}")
+    return proc.stdout
+
 
 def git_meta(rev: str) -> dict:
     """Resolve `rev` to full commit metadata via one `git show -s`."""
     fmt = "%H%n%P%n%an%n%ae%n%ct%n%s"
-    out = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "show", "-s", f"--format={fmt}", rev],
-        capture_output=True, text=True, check=True).stdout.splitlines()
+    out = _run_git(["show", "-s", f"--format={fmt}", rev]).splitlines()
     sha, parents, author, email, cts, subject = (out + [""] * 6)[:6]
     return {
         "commit_sha": sha,
@@ -82,11 +101,8 @@ def git_meta(rev: str) -> dict:
 
 def rev_list(n: int) -> list[str]:
     """First-parent commit shas, newest first, capped at n."""
-    out = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "rev-list", "--first-parent",
-         f"--max-count={n}", "mob"],
-        capture_output=True, text=True, check=True).stdout.split()
-    return out
+    return _run_git(
+        ["rev-list", "--first-parent", f"--max-count={n}", "mob"]).split()
 
 
 # ------------------------------------------------------------------------- db

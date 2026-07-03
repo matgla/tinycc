@@ -36,6 +36,49 @@ static int token_for_name(const char *name)
   return tok_alloc_const(name);
 }
 
+/* ------------------------------------------------------------------ stubs */
+/* The main UT binary does not link tccgen.c/tccpp.c, so define the few
+ * production helpers the assembler expression / symbol helpers need. */
+
+/* Token globals consumed by asm_expr_* / asm_int_expr. */
+int tok;
+CValue tokc;
+
+/* tccgen.c: push a new global identifier.  Tests treat the result as opaque
+ * and only inspect the fields touched by tccasm.c. */
+Sym *global_identifier_push(int v, int t, int c)
+{
+  Sym *sym = tcc_mallocz(sizeof(Sym));
+  sym->v = v;
+  sym->type.t = t;
+  sym->c = c;
+  sym->prev = global_stack;
+  global_stack = sym;
+  return sym;
+}
+
+/* tccpp.c: advance the lexer.  Tests preset the next token with
+ * ut_set_next_token(); without that the stream ends immediately. */
+static int ut_next_token = TOK_EOF;
+
+static void ut_set_next_token(int t)
+{
+  ut_next_token = t;
+}
+
+void next(void)
+{
+  tok = ut_next_token;
+  ut_next_token = TOK_EOF;
+}
+
+/* tccpp.c: consume an expected token.  Tests never feed mismatched input. */
+void skip(int c)
+{
+  (void)c;
+  next();
+}
+
 /* ------------------------------------------------------------------ tests */
 
 UT_TEST(test_local_label_name_uses_gas_local_prefix)
@@ -246,6 +289,272 @@ UT_TEST(test_push_section_and_pop_section_roundtrip)
   return 0;
 }
 
+UT_TEST(test_asm_label_find_returns_null_for_missing_name)
+{
+  int name = token_for_name("missing_label");
+  tcc_state->leading_underscore = 0;
+
+  UT_ASSERT(asm_label_find(name) == NULL);
+  return 0;
+}
+
+UT_TEST(test_asm_label_push_creates_asm_symbol)
+{
+  int name = token_for_name("asm_sym");
+  Sym *sym;
+  tcc_state->leading_underscore = 0;
+
+  sym = asm_label_push(name);
+
+  UT_ASSERT(sym != NULL);
+  UT_ASSERT((sym->type.t & VT_ASM) != 0);
+  UT_ASSERT((sym->type.t & VT_EXTERN) != 0);
+  UT_ASSERT((sym->type.t & VT_STATIC) != 0);
+  UT_ASSERT_EQ(sym->v, name);
+
+  global_stack = sym->prev;
+  tcc_free(sym);
+  return 0;
+}
+
+UT_TEST(test_asm_label_push_records_original_label_for_dotted_cname)
+{
+  int name = token_for_name("plain");
+  Sym *sym;
+  tcc_state->leading_underscore = 1;
+
+  sym = asm_label_push(name);
+
+  UT_ASSERT(sym != NULL);
+  UT_ASSERT(strcmp(get_tok_str(sym->v, NULL), ".plain") == 0);
+  UT_ASSERT_EQ(sym->asm_label, name);
+
+  global_stack = sym->prev;
+  tcc_free(sym);
+  return 0;
+}
+
+UT_TEST(test_get_asm_sym_creates_new_symbol)
+{
+  int name = token_for_name("newsym");
+  Sym *sym;
+  tcc_state->leading_underscore = 0;
+
+  sym = tccasm_ut_get_asm_sym(name, NULL);
+
+  UT_ASSERT(sym != NULL);
+  UT_ASSERT((sym->type.t & VT_ASM) != 0);
+
+  global_stack = sym->prev;
+  tcc_free(sym);
+  return 0;
+}
+
+UT_TEST(test_get_asm_sym_copies_csym_c_field)
+{
+  int name = token_for_name("copied");
+  Sym csym = {0};
+  Sym *sym;
+  tcc_state->leading_underscore = 0;
+  csym.c = 0x1234;
+
+  sym = tccasm_ut_get_asm_sym(name, &csym);
+
+  UT_ASSERT(sym != NULL);
+  UT_ASSERT_EQ(sym->c, 0x1234);
+
+  global_stack = sym->prev;
+  tcc_free(sym);
+  return 0;
+}
+
+UT_TEST(test_asm_int_expr_parses_ppnum_constant)
+{
+  int v;
+  tok = TOK_PPNUM;
+  tokc.str.data = "42";
+  tokc.str.size = 3;
+
+  v = tccasm_ut_asm_int_expr(tcc_state);
+
+  UT_ASSERT_EQ(v, 42);
+  return 0;
+}
+
+UT_TEST(test_asm_expr_unary_parses_char_constant)
+{
+  ExprValue e;
+  tok = TOK_CCHAR;
+  tokc.i = 'Z';
+
+  asm_expr_unary(tcc_state, &e);
+
+  UT_ASSERT_EQ(e.v, 'Z');
+  UT_ASSERT(e.sym == NULL);
+  UT_ASSERT_EQ(e.pcrel, 0);
+  return 0;
+}
+
+UT_TEST(test_asm_expr_unary_parses_identifier_as_symbol_reference)
+{
+  int name = token_for_name("symref");
+  ExprValue e;
+  tcc_state->leading_underscore = 0;
+  tok = name;
+
+  asm_expr_unary(tcc_state, &e);
+
+  UT_ASSERT(e.sym != NULL);
+  UT_ASSERT_EQ(e.v, 0);
+  UT_ASSERT_EQ(e.pcrel, 0);
+
+  global_stack = e.sym->prev;
+  tcc_free(e.sym);
+  return 0;
+}
+
+UT_TEST(test_asm_expr_unary_parses_ppnum_constant)
+{
+  ExprValue e;
+  tok = TOK_PPNUM;
+  tokc.str.data = "42";
+  tokc.str.size = 3;
+
+  asm_expr_unary(tcc_state, &e);
+
+  UT_ASSERT_EQ(e.v, 42);
+  UT_ASSERT(e.sym == NULL);
+  UT_ASSERT_EQ(e.pcrel, 0);
+  return 0;
+}
+
+UT_TEST(test_asm_expr_unary_parses_hex_and_octal_constants)
+{
+  ExprValue e;
+
+  tok = TOK_PPNUM;
+  tokc.str.data = "0x1f";
+  tokc.str.size = 5;
+  asm_expr_unary(tcc_state, &e);
+  UT_ASSERT_EQ(e.v, 31);
+
+  tok = TOK_PPNUM;
+  tokc.str.data = "010";
+  tokc.str.size = 4;
+  asm_expr_unary(tcc_state, &e);
+  UT_ASSERT_EQ(e.v, 8);
+  return 0;
+}
+
+UT_TEST(test_asm_expr_unary_negates_constant)
+{
+  ExprValue e;
+  tok = '-';
+  ut_set_next_token(TOK_PPNUM);
+  tokc.str.data = "7";
+  tokc.str.size = 2;
+
+  asm_expr_unary(tcc_state, &e);
+
+  UT_ASSERT_EQ(e.v, -7);
+  UT_ASSERT(e.sym == NULL);
+  return 0;
+}
+
+UT_TEST(test_asm_expr_unary_bitwise_not_constant)
+{
+  ExprValue e;
+  tok = '~';
+  ut_set_next_token(TOK_PPNUM);
+  tokc.str.data = "0";
+  tokc.str.size = 2;
+
+  asm_expr_unary(tcc_state, &e);
+
+  UT_ASSERT_EQ((int64_t)e.v, ~0);
+  UT_ASSERT(e.sym == NULL);
+  return 0;
+}
+
+UT_TEST(test_asm_expr_unary_no_op_plus_constant)
+{
+  ExprValue e;
+  tok = '+';
+  ut_set_next_token(TOK_PPNUM);
+  tokc.str.data = "9";
+  tokc.str.size = 2;
+
+  asm_expr_unary(tcc_state, &e);
+
+  UT_ASSERT_EQ(e.v, 9);
+  UT_ASSERT(e.sym == NULL);
+  return 0;
+}
+
+UT_TEST(test_asm_expr_unary_no_op_equals_constant)
+{
+  ExprValue e;
+  tok = '=';
+  ut_set_next_token(TOK_PPNUM);
+  tokc.str.data = "3";
+  tokc.str.size = 2;
+
+  asm_expr_unary(tcc_state, &e);
+
+  UT_ASSERT_EQ(e.v, 3);
+  UT_ASSERT(e.sym == NULL);
+  return 0;
+}
+
+UT_TEST(test_asm_expr_unary_parses_wide_char_constant)
+{
+  ExprValue e;
+  tok = TOK_LCHAR;
+  tokc.i = 'W';
+
+  asm_expr_unary(tcc_state, &e);
+
+  UT_ASSERT_EQ(e.v, 'W');
+  UT_ASSERT(e.sym == NULL);
+  return 0;
+}
+
+UT_TEST(test_find_constraint_malformed_bracket_returns_minus_one)
+{
+  ASMOperand operands[3] = {0};
+  const char *tail = NULL;
+
+  /* Without a closing ']' find_constraint returns -1 and leaves *tail
+   * pointing at the text after the opening bracket. */
+  UT_ASSERT_EQ(tccasm_ut_find_constraint(operands, 3, "[dst", &tail), -1);
+  UT_ASSERT(tail != NULL);
+  UT_ASSERT(strcmp(tail, "dst") == 0);
+  return 0;
+}
+
+UT_TEST(test_find_constraint_accepts_null_tail_pointer)
+{
+  ASMOperand operands[3] = {0};
+
+  UT_ASSERT_EQ(tccasm_ut_find_constraint(operands, 3, "1:x", NULL), 1);
+  return 0;
+}
+
+UT_TEST(test_asm_macros_free_releases_body_and_clears_list)
+{
+  AsmMacro *m = tcc_mallocz(sizeof(AsmMacro));
+  TokenString *body = tcc_mallocz(sizeof(TokenString));
+
+  m->name = token_for_name("with_body");
+  m->body = body;
+  asm_macros = m;
+
+  asm_macros_free();
+
+  UT_ASSERT(asm_macros == NULL);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(tccasm)
@@ -264,4 +573,22 @@ UT_SUITE(tccasm)
   UT_RUN(test_use_section1_saves_and_restores_data_offset);
   UT_RUN(test_use_section_switches_to_find_section_result);
   UT_RUN(test_push_section_and_pop_section_roundtrip);
+  UT_RUN(test_asm_label_find_returns_null_for_missing_name);
+  UT_RUN(test_asm_label_push_creates_asm_symbol);
+  UT_RUN(test_asm_label_push_records_original_label_for_dotted_cname);
+  UT_RUN(test_get_asm_sym_creates_new_symbol);
+  UT_RUN(test_get_asm_sym_copies_csym_c_field);
+  UT_RUN(test_asm_int_expr_parses_ppnum_constant);
+  UT_RUN(test_asm_expr_unary_parses_char_constant);
+  UT_RUN(test_asm_expr_unary_parses_identifier_as_symbol_reference);
+  UT_RUN(test_asm_expr_unary_parses_ppnum_constant);
+  UT_RUN(test_asm_expr_unary_parses_hex_and_octal_constants);
+  UT_RUN(test_asm_expr_unary_negates_constant);
+  UT_RUN(test_asm_expr_unary_bitwise_not_constant);
+  UT_RUN(test_asm_expr_unary_no_op_plus_constant);
+  UT_RUN(test_asm_expr_unary_no_op_equals_constant);
+  UT_RUN(test_asm_expr_unary_parses_wide_char_constant);
+  UT_RUN(test_find_constraint_malformed_bracket_returns_minus_one);
+  UT_RUN(test_find_constraint_accepts_null_tail_pointer);
+  UT_RUN(test_asm_macros_free_releases_body_and_clears_list);
 }

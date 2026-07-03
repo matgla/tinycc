@@ -13,6 +13,8 @@
 #include <setjmp.h>
 #include <string.h>
 
+ST_FUNC void cstr_u8cat(CString *cstr, int ch);
+
 static void ut_tccpp_setup(void)
 {
   tccpp_new(tcc_state);
@@ -551,6 +553,352 @@ UT_TEST(test_pp_apply_pack_replay_push_full_stack_errors)
   return 0;
 }
 
+/* ============================================================================
+ * Helpers for tests that need a minimal input file
+ * ============================================================================ */
+
+static struct BufferedFile ut_input_bf;
+static unsigned char ut_input_buf[512];
+
+static int ut_open_input(const char *s)
+{
+  size_t n = strlen(s);
+  UT_ASSERT(n + 3 <= sizeof(ut_input_buf));
+  ut_input_buf[0] = ' '; /* dummy byte so buf_ptr-1 stays in range */
+  memcpy(ut_input_buf + 1, s, n);
+  ut_input_buf[1 + n] = CH_EOB;
+  memset(&ut_input_bf, 0, sizeof(ut_input_bf));
+  ut_input_bf.buf_ptr = ut_input_buf + 1;
+  ut_input_bf.buf_end = ut_input_buf + 1 + n;
+  ut_input_bf.fd = -1;
+  ut_input_bf.line_num = 1;
+  ut_input_bf.line_ref = 1;
+  ut_input_bf.true_filename = ut_input_bf.filename;
+  ut_input_bf.filename[0] = '\0';
+  ut_input_bf.ifdef_stack_ptr = tcc_state->ifdef_stack;
+  file = &ut_input_bf;
+  tok_flags = TOK_FLAG_BOL;
+  return 0;
+}
+
+/* ============================================================================
+ * Additional CString helper tests
+ * ============================================================================ */
+
+UT_TEST(test_cstr_u8cat_encodes_unicode)
+{
+  CString cstr;
+  cstr_new(&cstr);
+  cstr_u8cat(&cstr, 'A');
+  cstr_u8cat(&cstr, 0xE9);
+  cstr_u8cat(&cstr, 0x20AC);
+  cstr_u8cat(&cstr, 0x4F60);
+  UT_ASSERT_EQ(cstr.size, 9);
+  const unsigned char *p = (const unsigned char *)cstr.data;
+  UT_ASSERT_EQ(p[0], 'A');
+  UT_ASSERT_EQ(p[1], 0xC3);
+  UT_ASSERT_EQ(p[2], 0xA9);
+  UT_ASSERT_EQ(p[3], 0xE2);
+  UT_ASSERT_EQ(p[4], 0x82);
+  UT_ASSERT_EQ(p[5], 0xAC);
+  UT_ASSERT_EQ(p[6], 0xE4);
+  UT_ASSERT_EQ(p[7], 0xBD);
+  UT_ASSERT_EQ(p[8], 0xA0);
+  cstr_free(&cstr);
+  return 0;
+}
+
+UT_TEST(test_cstr_u8cat_rejects_surrogate)
+{
+  CString cstr;
+  cstr_new(&cstr);
+  tcc_state->error_set_jmp_enabled = 1;
+  if (setjmp(tcc_state->error_jmp_buf) == 0)
+  {
+    cstr_u8cat(&cstr, 0xD800);
+    tcc_state->error_set_jmp_enabled = 0;
+    cstr_free(&cstr);
+    return -1;
+  }
+  tcc_state->error_set_jmp_enabled = 0;
+  cstr_free(&cstr);
+  return 0;
+}
+
+UT_TEST(test_cstr_printf_reallocs_for_long_format)
+{
+  CString cstr;
+  cstr_new(&cstr);
+  char payload[200];
+  memset(payload, 'x', sizeof(payload) - 1);
+  payload[sizeof(payload) - 1] = '\0';
+  int n = cstr_printf(&cstr, "prefix %s suffix", payload);
+  UT_ASSERT_EQ(n, 14 + (int)sizeof(payload) - 1);
+  UT_ASSERT_EQ(cstr.size, n);
+  UT_ASSERT(cstr.size_allocated >= n + 1);
+  UT_ASSERT(strncmp(cstr.data, "prefix ", 7) == 0);
+  UT_ASSERT(strstr(cstr.data, payload) != NULL);
+  UT_ASSERT_EQ(cstr.data[n], '\0');
+  cstr_free(&cstr);
+  return 0;
+}
+
+UT_TEST(test_cstr_cat_len_minus_one_on_empty_string)
+{
+  CString cstr;
+  cstr_new(&cstr);
+  cstr_cat(&cstr, "", -1);
+  UT_ASSERT_EQ(cstr.size, 0);
+  cstr_cat(&cstr, "x", -1);
+  UT_ASSERT_EQ(cstr.size, 1);
+  cstr_free(&cstr);
+  return 0;
+}
+
+/* ============================================================================
+ * Additional get_tok_str tests
+ * ============================================================================ */
+
+UT_TEST(test_get_tok_str_float_and_special_tokens)
+{
+  CValue cv;
+  memset(&cv, 0, sizeof(cv));
+  UT_ASSERT_STREQ(get_tok_str(TOK_CFLOAT, &cv), "<float>");
+  UT_ASSERT_STREQ(get_tok_str(TOK_CDOUBLE, &cv), "<double>");
+  UT_ASSERT_STREQ(get_tok_str(TOK_CLDOUBLE, &cv), "<long double>");
+  UT_ASSERT_STREQ(get_tok_str(TOK_CFLOAT_I, &cv), "<imaginary float>");
+  UT_ASSERT_STREQ(get_tok_str(TOK_CDOUBLE_I, &cv), "<imaginary double>");
+  UT_ASSERT_STREQ(get_tok_str(TOK_CLDOUBLE_I, &cv), "<imaginary long double>");
+  UT_ASSERT_STREQ(get_tok_str(TOK_CINT_I, &cv), "<imaginary int>");
+  UT_ASSERT_STREQ(get_tok_str(TOK_LINENUM, &cv), "<linenumber>");
+  UT_ASSERT_STREQ(get_tok_str(TOK_PACK_REPLAY, &cv), "<pack-replay>");
+  return 0;
+}
+
+UT_TEST(test_get_tok_str_pp_tokens)
+{
+  CValue cv;
+  static char num[] = "123";
+  cv.str.data = num;
+  cv.str.size = sizeof(num);
+  UT_ASSERT_STREQ(get_tok_str(TOK_PPNUM, &cv), "123");
+  UT_ASSERT_STREQ(get_tok_str(TOK_PPSTR, &cv), "123");
+  return 0;
+}
+
+UT_TEST(test_get_tok_str_wide_char_and_string)
+{
+  CValue cv;
+  cv.i = 'A';
+  UT_ASSERT_STREQ(get_tok_str(TOK_LCHAR, &cv), "L'A'");
+  static nwchar_t whello[] = L"hello";
+  cv.str.data = (char *)whello;
+  cv.str.size = sizeof(whello);
+  UT_ASSERT_STREQ(get_tok_str(TOK_LSTR, &cv), "L\"hello\"");
+  return 0;
+}
+
+UT_TEST(test_get_tok_str_anonymous_and_nameless)
+{
+  UT_ASSERT_STREQ(get_tok_str(SYM_FIRST_ANOM + 3, NULL), "L.3");
+  UT_ASSERT_STREQ(get_tok_str(0, NULL), "<no name>");
+  return 0;
+}
+
+UT_TEST(test_get_tok_str_invalid_control_char)
+{
+  UT_ASSERT_STREQ(get_tok_str(1, NULL), "<\\x01>");
+  UT_ASSERT_STREQ(get_tok_str(127, NULL), "<\\x7f>");
+  return 0;
+}
+
+/* ============================================================================
+ * Additional TokenString / tok_get tests
+ * ============================================================================ */
+
+UT_TEST(test_tok_str_add2_string_round_trip)
+{
+  TokenString str;
+  tok_str_new(&str);
+  static char hello[] = "hello";
+  CValue cv;
+  cv.str.data = hello;
+  cv.str.size = sizeof(hello);
+  tok_str_add2(&str, TOK_STR, &cv);
+  const int *p = tok_str_buf(&str);
+  CValue cv_out;
+  int t;
+  tok_get(&t, &p, &cv_out);
+  UT_ASSERT_EQ(t, TOK_STR);
+  UT_ASSERT_EQ(cv_out.str.size, (int)sizeof(hello));
+  UT_ASSERT_STREQ(cv_out.str.data, "hello");
+  tok_str_free_str(tok_str_ensure_heap(&str));
+  return 0;
+}
+
+UT_TEST(test_tok_get_unsigned_and_double)
+{
+  TokenString str;
+  tok_str_new(&str);
+  CValue cv;
+  cv.i = 0xFFFFFFFFULL;
+  tok_str_add2(&str, TOK_CUINT, &cv);
+  cv.d = 2.5;
+  tok_str_add2(&str, TOK_CDOUBLE, &cv);
+  const int *p = tok_str_buf(&str);
+  CValue cv_out;
+  int t;
+  tok_get(&t, &p, &cv_out);
+  UT_ASSERT_EQ(t, TOK_CUINT);
+  UT_ASSERT_EQ((unsigned)cv_out.i, 0xFFFFFFFFU);
+  tok_get(&t, &p, &cv_out);
+  UT_ASSERT_EQ(t, TOK_CDOUBLE);
+  UT_ASSERT(cv_out.d == 2.5);
+  tok_str_free_str(tok_str_ensure_heap(&str));
+  return 0;
+}
+
+UT_TEST(test_tok_get_line_and_pack_replay)
+{
+  TokenString str;
+  tok_str_new(&str);
+  CValue cv;
+  cv.i = 42;
+  tok_str_add2(&str, TOK_LINENUM, &cv);
+  cv.i = (TCC_PCH_REPLAY_PACK_SET << 16) | 4;
+  tok_str_add2(&str, TOK_PACK_REPLAY, &cv);
+  const int *p = tok_str_buf(&str);
+  CValue cv_out;
+  int t;
+  tok_get(&t, &p, &cv_out);
+  UT_ASSERT_EQ(t, TOK_LINENUM);
+  UT_ASSERT_EQ(cv_out.i, 42);
+  tok_get(&t, &p, &cv_out);
+  UT_ASSERT_EQ(t, TOK_PACK_REPLAY);
+  UT_ASSERT_EQ(cv_out.i, (TCC_PCH_REPLAY_PACK_SET << 16) | 4);
+  tok_str_free_str(tok_str_ensure_heap(&str));
+  return 0;
+}
+
+/* ============================================================================
+ * define_push / define_find / macro_is_equal tests
+ * ============================================================================ */
+
+UT_TEST(test_define_push_and_find_object_macro)
+{
+  TokenSym *ts = tok_alloc("objmac", 6);
+  TokenString str;
+  tok_str_new(&str);
+  CValue cv;
+  cv.i = 123;
+  tok_str_add2(&str, TOK_CINT, &cv);
+  tok_str_add(&str, 0);
+  int *body = tok_str_ensure_heap(&str);
+  Sym *boundary = define_stack;
+  define_push(ts->tok, MACRO_OBJ, body, NULL);
+  Sym *s = define_find(ts->tok);
+  UT_ASSERT(s != NULL);
+  UT_ASSERT_EQ(s->v, ts->tok);
+  UT_ASSERT_EQ(s->type.t & MACRO_FUNC, 0);
+  UT_ASSERT_EQ(s->d[0], TOK_CINT);
+  UT_ASSERT_EQ(s->d[1], 123);
+  free_defines(boundary);
+  return 0;
+}
+
+UT_TEST(test_define_push_redefinition_checks_equality)
+{
+  TokenSym *ts = tok_alloc("redef", 5);
+  TokenString str1, str2;
+  tok_str_new(&str1);
+  tok_str_new(&str2);
+  CValue cv;
+  cv.i = 1;
+  tok_str_add2(&str1, TOK_CINT, &cv);
+  tok_str_add(&str1, 0);
+  cv.i = 2;
+  tok_str_add2(&str2, TOK_CINT, &cv);
+  tok_str_add(&str2, 0);
+  int *d1 = tok_str_ensure_heap(&str1);
+  int *d2 = tok_str_ensure_heap(&str2);
+  Sym *boundary = define_stack;
+  define_push(ts->tok, MACRO_OBJ, d1, NULL);
+  define_push(ts->tok, MACRO_OBJ, d2, NULL);
+  Sym *s = define_find(ts->tok);
+  UT_ASSERT(s != NULL);
+  UT_ASSERT_EQ(s->d[1], 2);
+  free_defines(boundary);
+  return 0;
+}
+
+UT_TEST(test_define_push_function_macro_with_args)
+{
+  TokenSym *ts = tok_alloc("addfn", 5);
+  int xtok = tok_alloc("x", 1)->tok;
+  int ytok = tok_alloc("y", 1)->tok;
+  Sym *boundary = define_stack;
+  sym_push2(&define_stack, xtok | SYM_FIELD, 0, 0);
+  Sym *first = define_stack;
+  sym_push2(&define_stack, ytok | SYM_FIELD, 0, 0);
+  TokenString str;
+  tok_str_new(&str);
+  tok_str_add(&str, '(');
+  tok_str_add(&str, xtok);
+  tok_str_add(&str, '+');
+  tok_str_add(&str, ytok);
+  tok_str_add(&str, ')');
+  tok_str_add(&str, 0);
+  int *body = tok_str_ensure_heap(&str);
+  define_push(ts->tok, MACRO_FUNC, body, first);
+  Sym *s = define_find(ts->tok);
+  UT_ASSERT(s != NULL);
+  UT_ASSERT(s->type.t & MACRO_FUNC);
+  UT_ASSERT(s->next == first);
+  free_defines(boundary);
+  return 0;
+}
+
+/* ============================================================================
+ * Misc accessible frontend helpers
+ * ============================================================================ */
+
+UT_TEST(test_skip_to_eol_skips_logical_line)
+{
+  UT_ASSERT(ut_open_input("hello world") == 0);
+  tok = '+';
+  skip_to_eol(0);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+  UT_ASSERT(file->buf_ptr == file->buf_end);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_expect_raises_error)
+{
+  tcc_state->error_set_jmp_enabled = 1;
+  if (setjmp(tcc_state->error_jmp_buf) == 0)
+  {
+    expect("some token");
+    tcc_state->error_set_jmp_enabled = 0;
+    return -1;
+  }
+  tcc_state->error_set_jmp_enabled = 0;
+  return 0;
+}
+
+UT_TEST(test_unget_tok_pushes_token_back)
+{
+  UT_ASSERT(ut_open_input("") == 0);
+  tok = '+';
+  unget_tok('*');
+  UT_ASSERT_EQ(tok, '*');
+  UT_ASSERT(macro_ptr != NULL);
+  end_macro();
+  UT_ASSERT(macro_ptr == NULL);
+  file = NULL;
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(tccpp)
@@ -565,6 +913,10 @@ UT_SUITE(tccpp)
   UT_RUN(test_cstr_printf_formats_into_buffer);
   UT_RUN(test_cstr_free_on_zeroed_cstring_is_safe);
   UT_RUN(test_cstr_wccat_appends_wide_chars);
+  UT_RUN(test_cstr_u8cat_encodes_unicode);
+  UT_RUN(test_cstr_u8cat_rejects_surrogate);
+  UT_RUN(test_cstr_printf_reallocs_for_long_format);
+  UT_RUN(test_cstr_cat_len_minus_one_on_empty_string);
 
   /* Token interning */
   UT_RUN(test_tok_alloc_returns_same_token_for_same_string);
@@ -580,6 +932,11 @@ UT_SUITE(tccpp)
   UT_RUN(test_get_tok_str_integer_constant);
   UT_RUN(test_get_tok_str_character_constant);
   UT_RUN(test_get_tok_str_string_literal);
+  UT_RUN(test_get_tok_str_float_and_special_tokens);
+  UT_RUN(test_get_tok_str_pp_tokens);
+  UT_RUN(test_get_tok_str_wide_char_and_string);
+  UT_RUN(test_get_tok_str_anonymous_and_nameless);
+  UT_RUN(test_get_tok_str_invalid_control_char);
 
   /* TokenString */
   UT_RUN(test_tok_str_alloc_initializes_empty);
@@ -591,6 +948,9 @@ UT_SUITE(tccpp)
 
   /* tok_get round-trip */
   UT_RUN(test_tok_get_round_trip_int_string_eof);
+  UT_RUN(test_tok_str_add2_string_round_trip);
+  UT_RUN(test_tok_get_unsigned_and_double);
+  UT_RUN(test_tok_get_line_and_pack_replay);
 
   /* Misc public helpers */
   UT_RUN(test_set_idnum_changes_character_class);
@@ -599,6 +959,12 @@ UT_SUITE(tccpp)
   UT_RUN(test_end_macro_to_unwinds_to_target);
   UT_RUN(test_define_undef_clears_sym_define);
   UT_RUN(test_free_defines_pops_to_boundary);
+  UT_RUN(test_define_push_and_find_object_macro);
+  UT_RUN(test_define_push_redefinition_checks_equality);
+  UT_RUN(test_define_push_function_macro_with_args);
+  UT_RUN(test_skip_to_eol_skips_logical_line);
+  UT_RUN(test_expect_raises_error);
+  UT_RUN(test_unget_tok_pushes_token_back);
 
   /* #pragma pack replay */
   UT_RUN(test_pp_apply_pack_replay_set_push_pop);

@@ -5,8 +5,53 @@ on:
     branches: [mob]
   pull_request:
     branches: [mob]
+  workflow_dispatch:
+
+env:
+  # Stable synthetic key both metrics jobs record under (metrics.db keys runs
+  # by commit_sha+host) -- decoupled from the Pi's actual hostname so the
+  # cloud-recorded codesize/compile-time rows and the Pi-recorded perf rows
+  # land on the SAME run instead of two separate per-host rows.
+  METRICS_HOST: armv8m-metrics
 
 jobs:
+  # Builds the cross compiler once and shares it (via artifact) with
+  # build-and-measure and rp2350-perf below, so metrics never repeats this
+  # build. build-and-test does NOT consume this artifact: `make test` has
+  # `cross` as a prerequisite that reaches through object files and
+  # checksum/fp-libs/PCH stamp files (Makefile:206-234), not just the final
+  # binary, so dropping in a pre-built armv8m-tcc wouldn't save it a
+  # recompile -- make would just rebuild the missing intermediates anyway.
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    container:
+      image: ghcr.io/matgla/tinycc-armv8m:latest
+      options: --user root
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Build cross compiler
+        run: ./configure --enable-cross --enable-O2 --debug && make cross -j$(nproc)
+
+      - name: Upload tcc build
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcc-cross-build-${{ github.sha }}
+          path: |
+            armv8m-tcc
+            armv8m-libtcc1.a
+          retention-days: 1
+
   build-and-test:
     runs-on: ubuntu-latest
     permissions:
@@ -63,3 +108,100 @@ jobs:
           path: ci-failure-artifacts.tar.gz
           retention-days: 14
           if-no-files-found: warn
+
+  # Code size + compile time: no RP2350 board needed, so this reuses the
+  # `build` job's artifact on a regular (fast) GitHub-hosted runner instead
+  # of rebuilding (as it used to) or running on the shared Pi.
+  build-and-measure:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    container:
+      image: ghcr.io/matgla/tinycc-armv8m:latest
+      options: --user root
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Mark workspace as a safe git directory
+        # actions/checkout runs on the runner host and configures safe.directory
+        # there, but `run:` steps in a container job execute as a different
+        # user/HOME inside the container -- that config never reaches it, so any
+        # git command run from a `run:` step (e.g. metrics/record.py) fails with
+        # "detected dubious ownership" on the bind-mounted repo.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Download tcc build
+        uses: actions/download-artifact@v4
+        with:
+          name: tcc-cross-build-${{ github.sha }}
+
+      - name: Make tcc executable
+        run: chmod +x armv8m-tcc
+
+      - name: Record codesize + compile time
+        run: |
+          python3 metrics/record.py --db /tmp/metrics-scratch.db --rev HEAD \
+              --no-correctness --jobs "$(nproc)" --host "$METRICS_HOST" \
+              --trigger "${{ github.event_name }}"
+
+      - name: Upload metrics scratch db
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-scratch-${{ github.sha }}
+          path: /tmp/metrics-scratch.db
+          retention-days: 1
+
+  # RP2350 hardware perf: the only part of this workflow that actually needs
+  # the board, so it's the only part still pinned to the self-hosted Pi.
+  rp2350-perf:
+    needs: build-and-measure
+    runs-on: [self-hosted, rpi5, pimoroni_pico_plus2]
+    timeout-minutes: 90
+    concurrency:
+      group: metrics-rpi5
+      cancel-in-progress: false
+    env:
+      METRICS_DB: /var/lib/tcc-metrics/metrics.db
+      PERF_HOST: 127.0.0.1
+      PERF_IDENTITY: /home/runner/.ssh/id_rp
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Download tcc build
+        uses: actions/download-artifact@v4
+        with:
+          name: tcc-cross-build-${{ github.sha }}
+
+      - name: Download metrics scratch db
+        uses: actions/download-artifact@v4
+        with:
+          name: metrics-scratch-${{ github.sha }}
+          path: /tmp/downloaded-metrics
+
+      - name: Make tcc executable
+        run: chmod +x armv8m-tcc
+
+      - name: Record perf (import codesize/compile time from the cloud build)
+        run: |
+          python3 metrics/record.py --db "$METRICS_DB" --rev HEAD --no-correctness \
+              --import-codesize-from /tmp/downloaded-metrics/metrics-scratch.db \
+              --jobs "$(nproc)" --host "$METRICS_HOST" --trigger "${{ github.event_name }}" \
+              --perf-host "$PERF_HOST" --perf-identity "$PERF_IDENTITY"
+
+      - name: Gate
+        if: ${{ vars.METRICS_GATE_ENABLED == 'true' }}
+        run: python3 metrics/gate.py --db "$METRICS_DB" --rev HEAD --host "$METRICS_HOST" --strict

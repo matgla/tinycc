@@ -42,6 +42,15 @@ void ut_tccdbg_debug_bincl(TCCState *s1);
 void ut_tccdbg_debug_funcend(TCCState *s1, int size);
 #include "tccdbg.c"
 
+/* tccdbg.c #undef's its USING_GLOBALS helper macros at EOF.  The tests below
+ * need the same shorthand, so restore the ones they touch. */
+#define s1->dState->last_line_num       s1->dState->last_line_num
+#define debug_hash          s1->dState->debug_hash
+#define s1->dState->n_debug_hash        s1->dState->n_debug_hash
+#define s1->dState->n_debug_anon_hash   s1->dState->n_debug_anon_hash
+#define dwarf_line          s1->dState->dwarf_line
+#define dwarf_info          s1->dState->dwarf_info
+
 void *section_ptr_add(Section *sec, addr_t size)
 {
   unsigned long offset = sec->data_offset;
@@ -481,6 +490,520 @@ UT_TEST(test_dwarf_emit_reg_op_negative_reg_encodes_as_regx)
   return 0;
 }
 
+UT_TEST(test_dwarf_file_tracks_paths)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  BufferedFile bf = {0};
+  char name1[] = "/a/b.c";
+  char name2[] = "/a/c.c";
+  char name3[] = "d.c";
+  char cmd[] = "<command line>";
+
+  file = &bf;
+  s1->dwarf = 4;
+
+  strcpy(bf.filename, name1);
+  dwarf_file(s1);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.cur_file, 1);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.filename_size, 1);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.dir_size, 1);
+  UT_ASSERT_STREQ(s1->dState->dwarf_line.filename_table[0].name, "b.c");
+  UT_ASSERT_EQ(s1->dState->dwarf_line.filename_table[0].dir_entry, 1);
+
+  /* Cached lookup for the same path. */
+  dwarf_file(s1);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.cur_file, 1);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.filename_size, 1);
+
+  /* Same directory, new basename. */
+  strcpy(bf.filename, name2);
+  dwarf_file(s1);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.cur_file, 2);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.filename_size, 2);
+
+  /* Baseline file with no directory. */
+  strcpy(bf.filename, name3);
+  dwarf_file(s1);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.cur_file, 3);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.filename_table[2].dir_entry, 0);
+
+  /* Special <command line> short-circuit. */
+  strcpy(bf.filename, cmd);
+  dwarf_file(s1);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.cur_file, 1);
+
+  file = NULL;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_dwarf_file_dwarf5_index_offset)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  BufferedFile bf = {0};
+  char name[] = "x.c";
+
+  file = &bf;
+  s1->dwarf = 5;
+  strcpy(bf.filename, name);
+  dwarf_file(s1);
+
+  /* With no prior entries and index_offset == 0, the first entry is 0. */
+  UT_ASSERT_EQ(s1->dState->dwarf_line.cur_file, 0);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.filename_size, 1);
+
+  file = NULL;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_dwarf_strp_appends_string_with_relocation_skipped)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  Section sec, str_sec, symtab;
+  unsigned char sec_data[16], str_data[32], symtab_data[16];
+  TCCState *old_tcc = tcc_state;
+
+  test_section_reset(&sec, sec_data, sizeof(sec_data));
+  test_section_reset(&str_sec, str_data, sizeof(str_data));
+  test_section_reset(&symtab, symtab_data, sizeof(symtab_data));
+  sec.s1 = s1;
+  tcc_state = s1;
+  dwarf_str_section = &str_sec;
+  /* data_offset == 0 makes put_elf_reloca skip the relocation. */
+  symtab_section = &symtab;
+  s1->dState->dwarf_sym.str = 0;
+
+  dwarf_strp(&sec, "hello");
+
+  UT_ASSERT_EQ(str_sec.data_offset, 6);
+  UT_ASSERT_STREQ((char *)str_data, "hello");
+  UT_ASSERT_EQ(sec.data_offset, 4);
+  UT_ASSERT_EQ(read32le(sec_data), 0);
+
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_dwarf_line_strp_appends_string)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  Section sec, str_sec, symtab;
+  unsigned char sec_data[16], str_data[32], symtab_data[16];
+  TCCState *old_tcc = tcc_state;
+
+  test_section_reset(&sec, sec_data, sizeof(sec_data));
+  test_section_reset(&str_sec, str_data, sizeof(str_data));
+  test_section_reset(&symtab, symtab_data, sizeof(symtab_data));
+  sec.s1 = s1;
+  tcc_state = s1;
+  dwarf_line_str_section = &str_sec;
+  symtab_section = &symtab;
+  s1->dState->dwarf_sym.line_str = 0;
+
+  dwarf_line_strp(&sec, "world");
+
+  UT_ASSERT_STREQ((char *)str_data, "world");
+  UT_ASSERT_EQ(sec.data_offset, 4);
+
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_dwarf_reloc_skips_invalid_symbol_index)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  Section sec, symtab;
+  unsigned char sec_data[16], symtab_data[16];
+  TCCState *old_tcc = tcc_state;
+
+  test_section_reset(&sec, sec_data, sizeof(sec_data));
+  test_section_reset(&symtab, symtab_data, sizeof(symtab_data));
+  sec.s1 = s1;
+  tcc_state = s1;
+  symtab_section = &symtab;
+
+  dwarf_reloc(&sec, 0, R_DATA_32DW);
+
+  UT_ASSERT_EQ(sec.data_offset, 0);
+  UT_ASSERT_EQ(sec.reloc, NULL);
+
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_put_stabs_variants_are_no_ops)
+{
+  TCCState *s1 = ut_dbg_make_state();
+
+  put_stabs(s1, "x", N_LSYM, 0, 0, 0);
+  put_stabs_r(s1, "x", N_LSYM, 0, 0, 0, (Section *)1, 1);
+  put_stabn(s1, N_LSYM, 0, 0, 0);
+
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_dwarf_emit_set_address_encodes_extended_opcode)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  Section text;
+  unsigned char text_data[16];
+  unsigned char line_data[32];
+
+  test_section_reset(&text, text_data, sizeof(text_data));
+  text.s1 = s1;
+  text.sh_num = 3;
+  text.sh_flags = SHF_EXECINSTR;
+
+  s1->dState->dwarf_line.line_data = (unsigned char *)tcc_malloc(sizeof(line_data));
+  s1->dState->dwarf_line.line_max_size = sizeof(line_data);
+  s1->dState->dwarf_line.line_size = 0;
+  s1->dState->dwarf_line.cur_section = NULL;
+
+  dwarf_emit_set_address(s1, &text, 0x1234);
+
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_size, 1 + 1 + 1 + PTR_SIZE);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_data[0], 0);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_data[1], 1 + PTR_SIZE);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_data[2], DW_LNE_set_address);
+  /* ARM uses REL, so the addend is stored in the section data. */
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_data[3], 0x34);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_data[4], 0x12);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.cur_section, &text);
+  UT_ASSERT_EQ(n_dwarf_line_relocs, 1);
+  UT_ASSERT_EQ(dwarf_line_relocs[0].line_data_offset, 3);
+
+  tcc_free(s1->dState->dwarf_line.line_data);
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_line_emits_dwarf_special_opcode)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  Section text;
+  unsigned char text_data[16];
+  unsigned char line_data[64];
+  BufferedFile bf = {0};
+  TCCState *old_tcc = tcc_state;
+  int idx;
+
+  test_section_reset(&text, text_data, sizeof(text_data));
+  text.sh_flags = SHF_EXECINSTR;
+  tcc_state = s1;
+  cur_text_section = &text;
+  s1->dwarf = 4;
+  s1->do_debug = 1;
+  s1->ir = 0;
+
+  file = &bf;
+  strcpy(bf.filename, "test.c");
+  bf.line_num = 10;
+  ind = 2;
+  func_ind = -1;
+  nocode_wanted = 0;
+  s1->dState->last_line_num = 1;
+
+  s1->dState->dwarf_line.line_data = (unsigned char *)tcc_malloc(sizeof(line_data));
+  s1->dState->dwarf_line.line_max_size = sizeof(line_data);
+  s1->dState->dwarf_line.line_size = 0;
+  s1->dState->dwarf_line.cur_section = NULL;
+  s1->dState->dwarf_line.last_file = 0;
+  s1->dState->dwarf_line.last_line = 1;
+  s1->dState->dwarf_line.last_pc = 0;
+
+  tcc_debug_line(s1);
+
+  UT_ASSERT(s1->dState->dwarf_line.line_size > 0);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_data[2], DW_LNE_set_address);
+  idx = 3 + PTR_SIZE;
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_data[idx], DW_LNS_set_file);
+  /* cur_file == 1, so the uleb128 size is one byte. */
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_data[idx + 1], 1);
+  /* Special opcode: 1*14 + (10-1) + 13 - (-5) == 41. */
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_data[idx + 2], 41);
+
+  tcc_free(s1->dState->dwarf_line.line_data);
+  tcc_state = old_tcc;
+  file = NULL;
+  ind = 0;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_line_skips_non_executable_section)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  Section text;
+  unsigned char text_data[16];
+  unsigned char line_data[16];
+  BufferedFile bf = {0};
+  TCCState *old_tcc = tcc_state;
+
+  test_section_reset(&text, text_data, sizeof(text_data));
+  text.sh_flags = 0;
+  tcc_state = s1;
+  cur_text_section = &text;
+  s1->dwarf = 4;
+  s1->do_debug = 1;
+
+  file = &bf;
+  strcpy(bf.filename, "t.c");
+  bf.line_num = 5;
+  ind = 2;
+  s1->dState->last_line_num = 0;
+
+  s1->dState->dwarf_line.line_data = (unsigned char *)tcc_malloc(sizeof(line_data));
+  s1->dState->dwarf_line.line_max_size = sizeof(line_data);
+  s1->dState->dwarf_line.line_size = 0;
+  s1->dState->dwarf_line.cur_section = NULL;
+
+  tcc_debug_line(s1);
+
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_size, 0);
+
+  tcc_free(s1->dState->dwarf_line.line_data);
+  tcc_state = old_tcc;
+  file = NULL;
+  ind = 0;
+  s1->dState->last_line_num = 0;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_line_num_emits_and_dedupes)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  Section text;
+  unsigned char text_data[16];
+  unsigned char line_data[64];
+  BufferedFile bf = {0};
+  TCCState *old_tcc = tcc_state;
+  int size_after_first;
+
+  test_section_reset(&text, text_data, sizeof(text_data));
+  text.sh_flags = SHF_EXECINSTR;
+  tcc_state = s1;
+  cur_text_section = &text;
+  s1->dwarf = 4;
+  s1->do_debug = 1;
+  s1->ir = 0;
+
+  file = &bf;
+  strcpy(bf.filename, "t.c");
+  bf.line_num = 1;
+  ind = 2;
+  func_ind = -1;
+  nocode_wanted = 0;
+  s1->dState->last_line_num = 0;
+
+  s1->dState->dwarf_line.line_data = (unsigned char *)tcc_malloc(sizeof(line_data));
+  s1->dState->dwarf_line.line_max_size = sizeof(line_data);
+  s1->dState->dwarf_line.line_size = 0;
+  s1->dState->dwarf_line.cur_section = NULL;
+  s1->dState->dwarf_line.last_file = 0;
+  s1->dState->dwarf_line.last_line = 0;
+  s1->dState->dwarf_line.last_pc = 0;
+
+  tcc_debug_line_num(s1, 0);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_size, 0);
+
+  tcc_debug_line_num(s1, 5);
+  UT_ASSERT(s1->dState->dwarf_line.line_size > 0);
+  size_after_first = s1->dState->dwarf_line.line_size;
+
+  tcc_debug_line_num(s1, 5);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_size, size_after_first);
+
+  tcc_free(s1->dState->dwarf_line.line_data);
+  tcc_state = old_tcc;
+  file = NULL;
+  ind = 0;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_newfile_bincl_eincl)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  BufferedFile bf = {0};
+  char name[] = "inc.h";
+
+  file = &bf;
+  strcpy(bf.filename, name);
+  bf.line_num = 1;
+  s1->do_debug = 1;
+  s1->dwarf = 4;
+  s1->dState->new_file = 0;
+
+  tcc_debug_newfile(s1);
+  UT_ASSERT_EQ(s1->dState->new_file, 1);
+
+  tcc_debug_bincl(s1);
+  UT_ASSERT_EQ(s1->dState->new_file, 1);
+
+  tcc_debug_eincl(s1);
+  UT_ASSERT_EQ(s1->dState->new_file, 1);
+
+  /* Non-DWARF path uses the no-op stab helpers. */
+  s1->dwarf = 0;
+  tcc_debug_newfile(s1);
+  tcc_debug_bincl(s1);
+  tcc_debug_eincl(s1);
+
+  file = NULL;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_prolog_epilog_emits_flags)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  unsigned char line_data[32];
+
+  s1->do_debug = 1;
+  s1->dwarf = 4;
+  ind = 4;
+  s1->dState->dwarf_line.last_pc = 0;
+  s1->dState->dwarf_line.line_data = (unsigned char *)tcc_malloc(sizeof(line_data));
+  s1->dState->dwarf_line.line_max_size = sizeof(line_data);
+  s1->dState->dwarf_line.line_size = 0;
+
+  tcc_debug_prolog_epilog(s1, 0);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_data[0], DW_LNS_set_prologue_end);
+  /* advance_pc (1 byte) + uleb128(2) + copy (1 byte) after the flag. */
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_size, 4);
+
+  s1->dState->dwarf_line.line_size = 0;
+  tcc_debug_prolog_epilog(s1, 1);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_data[0], DW_LNS_set_epilogue_begin);
+  UT_ASSERT_EQ(s1->dState->dwarf_line.line_size, 1);
+
+  tcc_free(s1->dState->dwarf_line.line_data);
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_find_returns_zero_for_existing_anon)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  Sym anon = {0};
+
+  anon.type.t = VT_STRUCT;
+  anon.c = -1;
+
+  UT_ASSERT_EQ(tcc_debug_find(s1, &anon, 1), 0);
+  UT_ASSERT_EQ(tcc_debug_find(s1, &anon, 1), 0);
+  UT_ASSERT_EQ(s1->dState->n_debug_anon_hash, 1);
+
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_remove_shifts_remaining_entries)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  Sym a = {0}, b = {0}, c = {0};
+
+  (void)tcc_debug_add(s1, &a, 0);
+  (void)tcc_debug_add(s1, &b, 0);
+  (void)tcc_debug_add(s1, &c, 0);
+  UT_ASSERT_EQ(s1->dState->n_debug_hash, 3);
+
+  tcc_debug_remove(s1, &b);
+  UT_ASSERT_EQ(s1->dState->n_debug_hash, 2);
+  UT_ASSERT_EQ(s1->dState->debug_hash[0].type, &a);
+  UT_ASSERT_EQ(s1->dState->debug_hash[1].type, &c);
+
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_funcstart_and_funcend_dwarf)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Section info_sec, str_sec, text_sec, symtab;
+  unsigned char info_data[1024];
+  unsigned char str_data[256];
+  unsigned char text_data[16];
+  unsigned char symtab_data[16];
+  Sym func_sym = {0};
+  Sym ret_sym = {0};
+  BufferedFile bf = {0};
+
+  test_section_reset(&info_sec, info_data, sizeof(info_data));
+  test_section_reset(&str_sec, str_data, sizeof(str_data));
+  test_section_reset(&text_sec, text_data, sizeof(text_data));
+  test_section_reset(&symtab, symtab_data, sizeof(symtab_data));
+  info_sec.s1 = s1;
+  str_sec.s1 = s1;
+  text_sec.s1 = s1;
+  text_sec.sh_flags = SHF_EXECINSTR;
+  text_sec.sh_num = 1;
+
+  tcc_state = s1;
+  dwarf_info_section = &info_sec;
+  dwarf_str_section = &str_sec;
+  cur_text_section = &text_sec;
+  text_section = &text_sec;
+  symtab_section = &symtab;
+
+  s1->do_debug = 1;
+  s1->dwarf = 4;
+  s1->ir = 0;
+  s1->do_backtrace = 0;
+
+  funcname = "test_fn";
+  file = &bf;
+  strcpy(bf.filename, "test.c");
+  bf.line_num = 1;
+
+  ind = 2;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+
+  s1->dState->dwarf_info.start = 0;
+  s1->dState->dwarf_sym.str = 0;
+  s1->dState->dwarf_sym.line_str = 0;
+  s1->dState->dwarf_line.cur_section = NULL;
+  s1->dState->dwarf_line.last_file = 0;
+  s1->dState->dwarf_line.last_line = 0;
+  s1->dState->dwarf_line.last_pc = 0;
+  s1->dState->dwarf_line.line_data = (unsigned char *)tcc_malloc(256);
+  s1->dState->dwarf_line.line_max_size = 256;
+  s1->dState->dwarf_line.line_size = 0;
+
+  func_sym.type.t = VT_FUNC;
+  func_sym.type.ref = &ret_sym;
+  ret_sym.type.t = VT_INT;
+
+  tcc_debug_funcstart(s1, &func_sym);
+  UT_ASSERT(s1->dState->debug_info != NULL);
+  UT_ASSERT(s1->dState->debug_info_root != NULL);
+
+  tcc_debug_funcend(s1, 10);
+  UT_ASSERT(s1->dState->debug_info_root == NULL);
+  UT_ASSERT(info_sec.data_offset > 0);
+
+  tcc_free(s1->dState->dwarf_line.line_data);
+  tcc_state = old_tcc;
+  file = NULL;
+  ind = 0;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
 UT_SUITE(tccdbg)
 {
   UT_RUN(test_dwarf_uleb128_size_boundaries);
@@ -505,4 +1028,19 @@ UT_SUITE(tccdbg)
   UT_RUN(test_tcc_debug_save_restore_state);
   UT_RUN(test_dwarf_loc_reg_op_len_edge_cases);
   UT_RUN(test_dwarf_emit_reg_op_negative_reg_encodes_as_regx);
+  UT_RUN(test_dwarf_file_tracks_paths);
+  UT_RUN(test_dwarf_file_dwarf5_index_offset);
+  UT_RUN(test_dwarf_strp_appends_string_with_relocation_skipped);
+  UT_RUN(test_dwarf_line_strp_appends_string);
+  UT_RUN(test_dwarf_reloc_skips_invalid_symbol_index);
+  UT_RUN(test_put_stabs_variants_are_no_ops);
+  UT_RUN(test_dwarf_emit_set_address_encodes_extended_opcode);
+  UT_RUN(test_tcc_debug_line_emits_dwarf_special_opcode);
+  UT_RUN(test_tcc_debug_line_skips_non_executable_section);
+  UT_RUN(test_tcc_debug_line_num_emits_and_dedupes);
+  UT_RUN(test_tcc_debug_newfile_bincl_eincl);
+  UT_RUN(test_tcc_debug_prolog_epilog_emits_flags);
+  UT_RUN(test_tcc_debug_find_returns_zero_for_existing_anon);
+  UT_RUN(test_tcc_debug_remove_shifts_remaining_entries);
+  UT_RUN(test_tcc_debug_funcstart_and_funcend_dwarf);
 }

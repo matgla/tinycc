@@ -19,7 +19,7 @@ metrics/
     provisioning/datasources/sqlite.yml
     provisioning/dashboards/dashboards.yml
     dashboards/optimizer_regressions.json
-.github/workflows/metrics.yml
+.github/workflows/ci.yml   -- build, build-and-test, build-and-measure, rp2350-perf
 ```
 
 `record.py` reuses existing tooling rather than reimplementing it:
@@ -48,29 +48,33 @@ register. Two things to check:
 1. The tinycc repo has access to that runner's runner group (org Settings ->
    Actions -> Runner groups).
 2. The runner carries the `rpi5`/`pimoroni_pico_plus2` labels
-   (`.github/workflows/metrics.yml`'s `rp2350-perf` job targets
+   (`.github/workflows/ci.yml`'s `rp2350-perf` job targets
    `runs-on: [self-hosted, rpi5, pimoroni_pico_plus2]`). Add them via the
    runner's `config.sh --labels rpi5,pimoroni_pico_plus2` (or editing labels
    via the GitHub UI) and restarting the runner service.
 
-Building the cross compiler and measuring code size/compile time happens
-first, in a separate `build-and-measure` job on a regular GitHub-hosted
-runner (`runs-on: ubuntu-latest`, same container image `ci.yml` builds
-with) — compiling on the Pi is much slower than a cloud runner, and neither
-step touches the board. `build-and-measure` uploads the built
-`armv8m-tcc`/`armv8m-libtcc1.a` and a scratch metrics db (codesize +
-compile-time rows only, for the commit being built) as GitHub Actions
-artifacts. `rp2350-perf` (`needs: build-and-measure`) downloads both, so it
-never rebuilds tcc and never re-measures code size — it only does what
-actually needs the board (running benchmarks over SSH), then imports the
-cloud job's numbers into the persistent db via
+`ci.yml` builds the cross compiler exactly once, in a dedicated `build` job
+on a regular GitHub-hosted runner (`runs-on: ubuntu-latest`, same container
+image `build-and-test` uses) — compiling on the Pi is much slower than a
+cloud runner. `build` uploads `armv8m-tcc`/`armv8m-libtcc1.a` as a GitHub
+Actions artifact; `build-and-measure` (`needs: build`) downloads it to
+measure code size/compile time (no board needed) and uploads a scratch
+metrics db of its own; `rp2350-perf` (`needs: build-and-measure`) downloads
+both artifacts, so it never rebuilds tcc and never re-measures code size —
+it only does what actually needs the board (running benchmarks over SSH),
+then imports the earlier job's numbers into the persistent db via
 `record.py --import-codesize-from` (see "What CI does" below).
+`build-and-test` (the actual test suite) does **not** consume the `build`
+artifact — `make test` depends on `cross`, which reaches through object
+files and checksum/fp-libs/PCH stamp files, not just the final binary, so a
+pre-built `armv8m-tcc` wouldn't save it a recompile; it stays fully
+self-contained and runs in parallel with `build`.
 
 A self-hosted runner executes one job at a time, so `rp2350-perf` still
 queues behind (or blocks) other repos' jobs on the same box while it runs,
 and vice versa — that's why its `concurrency: group: metrics-rpi5` is scoped
-to just that job; the cloud `build-and-measure` job doesn't need to queue
-behind Pi-bound work.
+to just that job; the cloud `build`/`build-and-measure` jobs don't need to
+queue behind Pi-bound work.
 
 Runner dependencies (installed once on the Pi, not per-run):
 - Python 3 + `pip install paramiko` — required, for the RP2350 perf step.
@@ -85,7 +89,7 @@ Runner dependencies (installed once on the Pi, not per-run):
 
 ### Security note
 
-`.github/workflows/metrics.yml` triggers on `pull_request`. Combined with a
+`ci.yml`'s `rp2350-perf` job triggers on `pull_request`. Combined with a
 self-hosted runner, that means PR code executes with access to this machine
 and the attached hardware. Only safe as long as untrusted forks can't open
 PRs against this repo. If that ever changes, either drop the `pull_request`
@@ -94,30 +98,36 @@ trigger or require maintainer approval for external-contributor workflow runs
 
 ## What CI does
 
-On every push and PR to `mob`, two jobs run in sequence (no schedule/cron,
-no fuzz sweep in either):
+On every push and PR to `mob`, `ci.yml` runs four jobs (no schedule/cron, no
+fuzz sweep in any of them):
 
-1. `build-and-measure` (cloud runner) builds `armv8m-tcc`, then runs
-   `metrics/record.py --no-correctness` against a throwaway scratch db to
-   measure code size (via `regression_disasm.py`) and compile time (the
-   code-size corpus's wall time). It uploads the tcc build and the scratch
-   db as artifacts.
-2. `rp2350-perf` (self-hosted Pi, `needs: build-and-measure`) downloads both
-   artifacts, imports the scratch db's codesize/compile-time rows into the
-   persistent `/var/lib/tcc-metrics/metrics.db` via
+1. `build` (cloud runner) builds `armv8m-tcc`/`armv8m-libtcc1.a` once and
+   uploads them as an artifact.
+2. `build-and-test` (cloud runner, runs in parallel with `build` -- does
+   its own independent build, see the "Runner" section above for why it
+   can't reuse `build`'s artifact) runs the full test suite.
+3. `build-and-measure` (cloud runner, `needs: build`) downloads the tcc
+   build, then runs `metrics/record.py --no-correctness` against a
+   throwaway scratch db to measure code size (via `regression_disasm.py`)
+   and compile time (the code-size corpus's wall time). It uploads the
+   scratch db as an artifact.
+4. `rp2350-perf` (self-hosted Pi, `needs: build-and-measure`) downloads the
+   tcc build and the scratch db, imports the scratch db's
+   codesize/compile-time rows into the persistent
+   `/var/lib/tcc-metrics/metrics.db` via
    `record.py --import-codesize-from <scratch db>`, and measures RP2350
    perf if the board answers.
 
-Both jobs record under the same synthetic host key (`METRICS_HOST:
-armv8m-metrics`, set at the workflow level) so they land on **one** run row
-per commit instead of two — the db keys `runs` by `(commit_sha, host)`, and
-both `gate.py` and the Grafana dashboard assume one host owns every metric
-for a commit. `--import-codesize-from` is what makes that work: it copies
-`codesize_rollup`/`codesize_func`/`compile_time` rows for the matching
-commit from another metrics db instead of recomputing them, so the second
-job's `upsert_run` (which always clears a run's child tables before
-re-populating them) doesn't need to redo the cloud job's measurement to fill
-them back in.
+`build-and-measure` and `rp2350-perf` record under the same synthetic host
+key (`METRICS_HOST: armv8m-metrics`, set at the workflow level) so they land
+on **one** run row per commit instead of two — the db keys `runs` by
+`(commit_sha, host)`, and both `gate.py` and the Grafana dashboard assume
+one host owns every metric for a commit. `--import-codesize-from` is what
+makes that work: it copies `codesize_rollup`/`codesize_func`/`compile_time`
+rows for the matching commit from another metrics db instead of
+recomputing them, so the `rp2350-perf` job's `upsert_run` (which always
+clears a run's child tables before re-populating them) doesn't need to redo
+`build-and-measure`'s measurement to fill them back in.
 
 The gate step is present but a no-op until the `METRICS_GATE_ENABLED` repo
 variable is set to `true` (Settings -> Actions -> Variables) — see "Gate

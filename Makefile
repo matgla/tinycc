@@ -735,9 +735,9 @@ test-selfhost: cross
 test-ir: cross test-venv test-prepare download-gcc-tests
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -v $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -s $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s -v $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
 	fi
 
 # container target: runs the full test suite (all test-* targets below)
