@@ -299,3 +299,45 @@ def run_with_gcc(source: Path, opt_level: str, out_dir: Path) -> RunResult:
     if elf is None:
         return RunResult(label, False, "", None, error=err)
     return _run_elf(elf, label)
+
+
+def gcc_trusted_reference(
+    source: Path, out_dir: Path,
+    oracle_opt: str = "-O2", crosscheck_opt: str = "-O0",
+) -> tuple[RunResult, bool, str]:
+    """Run gcc at two optimization levels and report whether it is a trustworthy
+    oracle for ``source``.
+
+    The vs-gcc differential treats gcc as the gold standard, but gcc is not
+    infallible: it miscompiles some UB-free programs at -O2 (confirmed: bitfield
+    seed 1486, where gcc -O2 alone disagrees with gcc -O0/-O1, clang, tcc, and an
+    exact 32-bit reference model).  A single gcc level cannot distinguish "tcc is
+    wrong" from "gcc is wrong".  Building gcc at BOTH ``oracle_opt`` and
+    ``crosscheck_opt`` and requiring they AGREE turns gcc self-inconsistency (the
+    program has UB the generator missed, or a gcc codegen bug) into an explicit
+    "untrusted oracle" signal the caller can skip on — instead of a bogus
+    tcc-divergence report.
+
+    Returns ``(ref, trusted, reason)``:
+      ref      -- the RunResult at ``oracle_opt`` (the reference for comparison).
+      trusted  -- True iff BOTH gcc levels built, ran, and produced the SAME
+                  (stdout, exit) signature.  False if the oracle build/run failed,
+                  the cross-check build/run failed (can't verify -> don't trust),
+                  or the two levels disagree.
+      reason   -- "" when trusted; otherwise why gcc is not a usable oracle here.
+    """
+    ref = run_with_gcc(source, oracle_opt, out_dir)
+    if not ref.ok:
+        return ref, False, (f"gcc{oracle_opt} reference build/run failed: "
+                            f"{ref.error.strip().splitlines()[0] if ref.error.strip() else '?'}")
+    cross = run_with_gcc(source, crosscheck_opt, out_dir)
+    if not cross.ok:
+        return ref, False, (f"gcc{crosscheck_opt} cross-check build/run failed "
+                            f"(cannot verify oracle self-consistency)")
+    if ref.signature != cross.signature:
+        return ref, False, (
+            f"gcc oracle self-inconsistent: gcc{oracle_opt}="
+            f"{ref.stdout.strip()!r}/exit{ref.exit_code} vs gcc{crosscheck_opt}="
+            f"{cross.stdout.strip()!r}/exit{cross.exit_code} — program likely has UB "
+            f"or gcc miscompiles it; cannot use gcc as oracle")
+    return ref, True, ""

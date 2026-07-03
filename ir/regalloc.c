@@ -89,9 +89,18 @@ static int *ra_build_call_prefix(TCCIRState *ir)
   int *prefix = tcc_malloc(sizeof(int) * (n + 1));
   prefix[0] = 0;
   for (int i = 0; i < n; i++) {
-    TccIrOp op = ir->compact_instructions[i].op;
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    TccIrOp op = q->op;
     int is_call = (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL ||
                    op == TCCIR_OP_BUILTIN_APPLY || ir_op_is_implicit_call_ra(op));
+    /* A large BLOCK_COPY lowers to a memcpy() call in the backend, clobbering
+     * the caller-saved registers.  The inline (small) lowering saves/restores
+     * everything it touches, so only the memcpy-sized copies count as calls. */
+    if (!is_call && op == TCCIR_OP_BLOCK_COPY) {
+      int bc_size = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      if (bc_size >= TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES)
+        is_call = 1;
+    }
     prefix[i + 1] = prefix[i] + is_call;
   }
   return prefix;
@@ -1854,6 +1863,22 @@ static int ra_safe_loop_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterv
     IRQuadCompact *q = &ir->compact_instructions[j];
     if (q->op == TCCIR_OP_NOP) continue;
 
+    /* cur must be defined only at def_pos.  The override's correctness rests on
+     * "after def_pos the register holds cur's value and the back-edge copy is
+     * mov R,R"; a *second* def of cur before the back-edge breaks that — the
+     * register then carries an intermediate value while partner is still
+     * (textually) live, and coalescing conflates two distinct values.  This
+     * happens when def_pos is a copy `cur <- partner` at the top of an OUTER
+     * loop body and cur is then re-assigned inside a nested (rotated) inner
+     * loop before the outer back-edge copy `partner <- cur` (longlong seed 218:
+     * g12-carried hash T160<-T161, re-defined inside the rotated g16 loop). The
+     * linear scan cannot model the inner back-edge, so reject conservatively. */
+    if (irop_config[q->op].has_dest) {
+      IROperand cd = tcc_ir_op_get_dest(ir, q);
+      if (irop_has_vreg(cd) && irop_get_vreg(cd) == cur_vreg)
+        return 0;
+    }
+
     int uses_partner_as_src = 0;
     if (irop_config[q->op].has_src1) {
       IROperand s = tcc_ir_op_get_src1(ir, q);
@@ -2121,13 +2146,6 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   uint64_t dirty_int = 0;
   uint64_t dirty_fp = 0;
 
-  /* DEBUG: trace the linear-scan allocation decisions for the 90_struct
-   * miscompile (why R8 gets assigned to the printf-arg LEA temp on device but
-   * spilled on QEMU). RA90 lines: per-interval state + int_free + branch taken. */
-  int dbg90 = funcname && !strcmp((const char *)funcname, "test_init_struct_from_struct");
-  if (dbg90)
-    fprintf(stderr, "RA90 start count=%d int_allowed=0x%x\n", count, (unsigned)int_allowed);
-
   /* Active set sorted by end point */
   SSAInterval **active = tcc_malloc(sizeof(SSAInterval *) * count);
   int active_count = 0;
@@ -2151,11 +2169,6 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   for (int i = 0; i < count; i++) {
     SSAInterval *cur = &intervals[i];
 
-    if (dbg90)
-      fprintf(stderr, "RA90 i=%d vr=0x%x [%u,%u] xcall=%d prec=%d rt=%d addr=%d coal=%d r0in=%d int_free=0x%x\n", i,
-              (unsigned)cur->vreg, cur->start, cur->end, cur->crosses_call, cur->precolored, cur->reg_type,
-              cur->addrtaken, cur->coalesce_to, cur->r0, (unsigned)int_free);
-
     /* Graph coalescing: non-representative members are merged into their
      * representative's interval and inherit its register after the scan.  Skip
      * them so they neither consume a register nor enter the active set. */
@@ -2178,9 +2191,6 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
           } else {
             int_free |= (1ull << a->r0);
             if (a->r1 >= 0) int_free |= (1ull << a->r1);
-            if (dbg90)
-              fprintf(stderr, "RA90  expire vr=0x%x end=%u < curstart=%u -> free R%d (int_free=0x%x)\n",
-                      (unsigned)a->vreg, a->end, cur->start, a->r0, (unsigned)int_free);
           }
         }
       } else {
@@ -2619,12 +2629,14 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                 int conflict = 0;
                 for (int p = (int)cur->start; p <= (int)cur->end && !conflict; p++) {
                   IRQuadCompact *pq = &ir->compact_instructions[p];
-                  IROperand s1 = tcc_ir_op_get_src1(ir, pq);
-                  IROperand s2 = tcc_ir_op_get_src2(ir, pq);
-                  if (irop_has_vreg(s1) && !irop_is_immediate(s1) &&
-                      irop_get_vreg(s1) == a->vreg) { conflict = 1; break; }
-                  if (irop_has_vreg(s2) && !irop_is_immediate(s2) &&
-                      irop_get_vreg(s2) == a->vreg) { conflict = 1; break; }
+                  /* Any operand reference to the partner clobbers the share:
+                   * cur's def at cur->start overwrites hr, so partner must not be
+                   * needed anywhere in the range.  Use ra_instr_touches_vreg so a
+                   * STORE-class op's dest (its base *pointer*, which the store
+                   * READS) and an MLA accumulator count — a naive src1/src2 scan
+                   * missed a partner used as a store base and shared hr anyway,
+                   * emitting `str rX, [rX]` (value written through itself). */
+                  if (ra_instr_touches_vreg(ir, pq, a->vreg)) { conflict = 1; break; }
                 }
                 if (!conflict) {
                   cur->r0 = hr;
@@ -2656,10 +2668,6 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
         if (int_free & (1ull << r)) { reg = r; break; }
       }
     }
-
-    if (dbg90)
-      fprintf(stderr, "RA90  DECIDE vr=0x%x -> reg=%d (int_free=0x%x xcall=%d) %s\n", (unsigned)cur->vreg, reg,
-              (unsigned)int_free, cur->crosses_call, reg >= 0 ? "ASSIGN" : "SPILL");
 
     if (cur->reg_shared) {
       /* Return-block share: cur->r0 was set in the pref_reg path.
@@ -4391,6 +4399,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   tcc_ir_cfg_compute_dom_frontiers(cfg);
 
   ra_promote_multidef_temps_to_vars(ir, cfg);
+  tcc_ir_dump_after_pass(ir, "ssa_promote");
 
   /* Construct SSA */
   IRSSAState *ssa = tcc_ir_ssa_construct(ir, cfg);
@@ -4404,6 +4413,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   } else {
     tcc_ir_ssa_rename(ir, ssa);
   }
+  tcc_ir_dump_after_pass(ir, "ssa_rename");
   dbg_scan_imm_dest(ir, "ssa_rename"); dbg_scan_overlap(ir, "ssa_rename");
 
   /* SSA optimization passes.
@@ -4816,9 +4826,15 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
         dst_iv->r0 = src_reg;
         for (int k = (int)dst_iv->start; k <= (int)dst_iv->end && k < tbl_size; ++k)
         {
-          ls->live_regs_by_instruction[k] &= ~(1u << old_reg);
+          /* old_reg's bit may be shared with another interval that coalesced
+           * onto it earlier (in-place two-address ops overlap on purpose) —
+           * only clear positions where no other claimant is still live. */
+          if (!tcc_ls_reg_held_by_other(ls, old_reg, k, dst_iv))
+            ls->live_regs_by_instruction[k] &= ~(1u << old_reg);
           ls->live_regs_by_instruction[k] |= (1u << src_reg);
         }
+        RA_DBG("move_coalesce fwd @%d: T%d R%d->R%d [%u,%u]", i,
+               (int)(dv & 0xffffff), old_reg, src_reg, dst_iv->start, dst_iv->end);
         coalesced++;
         continue;
       }
@@ -4874,6 +4890,42 @@ try_reverse:;
     }
     if (conflict) goto rev_check_done;
 
+    /* Symmetric guard (dest side): after this copy src and dest share
+     * dest_reg holding the same value.  If dest is given a NEW, independent
+     * value while src is still live, that write clobbers dest_reg and src's
+     * remaining uses read the wrong value.  The loop-carried phi copy this
+     * pass targets has src dying at the copy (src_iv->end == i), so the range
+     * below is empty and legitimate coalescing is unaffected; the guard only
+     * fires when src OUTLIVES the copy and dest is re-defined underneath it
+     * (bitfield 40979: `u4 = u3` copy, then `u4 = const` clobbers the shared
+     * register while `u3` is still read).  A redefinition at exactly src's
+     * last use that also reads src is the two-address read-before-write case
+     * and stays safe. */
+    for (int k = i + 1; k <= (int)src_iv->end && k < n; ++k)
+    {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op == TCCIR_OP_NOP) continue;
+      if (!irop_config[qk->op].has_dest) continue;
+      IROperand dk = tcc_ir_op_get_dest(ir, qk);
+      int is_mem_store = (qk->op == TCCIR_OP_STORE || qk->op == TCCIR_OP_STORE_INDEXED ||
+                          qk->op == TCCIR_OP_STORE_POSTINC) && dk.is_lval;
+      if (is_mem_store) continue;
+      if (irop_get_vreg(dk) != dv) continue;
+      if (k == (int)src_iv->end) {
+        int reads_src = 0;
+        if (irop_config[qk->op].has_src1 &&
+            irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == sv) reads_src = 1;
+        if (!reads_src && irop_config[qk->op].has_src2 &&
+            irop_get_vreg(tcc_ir_op_get_src2(ir, qk)) == sv) reads_src = 1;
+        if (!reads_src && qk->op == TCCIR_OP_MLA &&
+            irop_get_vreg(tcc_ir_op_get_accum(ir, qk)) == sv) reads_src = 1;
+        if (reads_src) continue;
+      }
+      conflict = 1;
+      break;
+    }
+    if (conflict) goto rev_check_done;
+
     /* Check dest not used between src's def and the ASSIGN.
      * src's def overwrites dest_reg; any intervening use of dest
      * would read the wrong value. */
@@ -4918,11 +4970,16 @@ try_reverse:;
 rev_check_done:
     if (conflict) continue;
 
-    /* Check dest_reg not occupied by other intervals during src's range */
+    /* Check dest_reg not occupied by other intervals during src's range.
+     * Identity-based: earlier coalesces may have moved a third interval onto
+     * dest_reg inside dst_iv's range, so "position within dst_iv's range" is
+     * not proof the claim is dst_iv's own. */
     for (int k = (int)src_iv->start; k <= (int)src_iv->end && k < tbl_size; ++k)
     {
       if (ls->live_regs_by_instruction[k] & (1u << dest_reg))
       {
+        if (tcc_ls_reg_held_by_other(ls, dest_reg, k, dst_iv))
+        { conflict = 1; break; }
         /* dest_reg is live here — only OK if it's from dest_iv itself */
         if (k < (int)dst_iv->start || k > (int)dst_iv->end)
         { conflict = 1; break; }
@@ -4934,9 +4991,16 @@ rev_check_done:
     src_iv->r0 = dest_reg;
     for (int k = (int)src_iv->start; k <= (int)src_iv->end && k < tbl_size; ++k)
     {
-      ls->live_regs_by_instruction[k] &= ~(1u << old_reg);
+      /* old_reg's bit may be shared with another interval that coalesced
+       * onto it earlier — only clear positions with no other live claimant
+       * (volatile 36818: T175 leaving R5 wiped T212's in-place-XOR claim,
+       * and the phase-3 scratch fixup then put the outer loop counter there). */
+      if (!tcc_ls_reg_held_by_other(ls, old_reg, k, src_iv))
+        ls->live_regs_by_instruction[k] &= ~(1u << old_reg);
       ls->live_regs_by_instruction[k] |= (1u << dest_reg);
     }
+    RA_DBG("move_coalesce rev @%d: T%d R%d->R%d [%u,%u]", i,
+           (int)(sv & 0xffffff), old_reg, dest_reg, src_iv->start, src_iv->end);
     /* Record this src vreg as reverse-coalesced */
     rev_done = tcc_realloc(rev_done, sizeof(uint32_t) * (rev_done_size + 1));
     rev_done[rev_done_size++] = (uint32_t)sv;

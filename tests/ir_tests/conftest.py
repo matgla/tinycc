@@ -14,6 +14,19 @@ def pytest_addoption(parser):
         default=False,
         help="Fail instead of skipping when -dump-ir-passes support is unavailable",
     )
+    # --compiler is normally provided by the parent tests/conftest.py, but that
+    # conftest is not loaded when pytest is invoked from inside tests/ir_tests/
+    # (as `make test-golden-ir` does). Register it here too, tolerating the
+    # duplicate when both conftests are active (running from tests/).
+    try:
+        parser.addoption(
+            "--compiler",
+            action="store",
+            default=None,
+            help="Path to the armv8m-tcc cross compiler",
+        )
+    except ValueError:
+        pass
 
 
 def pytest_configure(config):

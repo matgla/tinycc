@@ -14,6 +14,7 @@
 #include "ir/codegen.h"
 #include "ir/machine_op.h"
 #include "arch/arm/arm_regalloc.h"
+#include "codegen_mop_stubs.h"
 #include "ut.h"
 
 static SValue sv_var(int vreg, int vt)
@@ -215,6 +216,106 @@ UT_TEST(test_complex_float_pair)
   return 0;
 }
 
+/* ============================================================================
+ * Dispatch-level tests (tcc_ir_codegen_generate)
+ *
+ * See test_codegen_arith.c's dispatch-level section header for the overall
+ * rationale. FADD/FSUB/FMUL/FDIV/CVT_FTOF/CVT_ITOF/CVT_FTOI all share one
+ * case label in ir/codegen.c (~2999-3007), ending in exactly one
+ * tcc_gen_machine_fp_mop() call per instruction. As test_fp_op_construction
+ * above notes, tcc_ir_put() can't build these (it consults
+ * architecture_config.fpu, uninitialized here) -- built manually via
+ * tcc_ir_pool_add, same as that test, but followed through real regalloc +
+ * codegen so the dispatch loop actually runs.
+ * ============================================================================ */
+
+/* Builds `dest <op> src1, src2` (or `dest <op> src1` with src2 = IROP_NONE
+ * for the CVT_* unary conversions) with the given per-operand float-ness,
+ * then runs regalloc + tcc_ir_codegen_generate(). Caller must cgstub_reset()
+ * first and tcc_ir_free(ir) after. */
+static TCCIRState *build_fp_op(TccIrOp op, int dest_is_fp, int src1_is_fp, int src2_is_fp)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  setup_tcc_state();
+
+  int dest = tcc_ir_vreg_alloc_temp(ir);
+  int src1 = tcc_ir_vreg_alloc_temp(ir);
+  if (dest_is_fp)
+    tcc_ir_vreg_type_set_fp(ir, dest, 1, 0);
+  if (src1_is_fp)
+    tcc_ir_vreg_type_set_fp(ir, src1, 1, 0);
+
+  int pool_base = ir->iroperand_pool_count;
+  tcc_ir_pool_add(ir, irop_make_vreg(dest, dest_is_fp ? IROP_BTYPE_FLOAT32 : IROP_BTYPE_INT32));
+  tcc_ir_pool_add(ir, irop_make_vreg(src1, src1_is_fp ? IROP_BTYPE_FLOAT32 : IROP_BTYPE_INT32));
+  if (src2_is_fp >= 0)
+  {
+    int src2 = tcc_ir_vreg_alloc_temp(ir);
+    if (src2_is_fp)
+      tcc_ir_vreg_type_set_fp(ir, src2, 1, 0);
+    tcc_ir_pool_add(ir, irop_make_vreg(src2, src2_is_fp ? IROP_BTYPE_FLOAT32 : IROP_BTYPE_INT32));
+  }
+  else
+  {
+    tcc_ir_pool_add(ir, IROP_NONE);
+  }
+
+  int idx = ir->next_instruction_index;
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  q->op = op;
+  q->operand_base = pool_base;
+  ir->next_instruction_index++;
+
+  tcc_ir_ssa_regalloc(ir, arm_get_regalloc_target(), 0);
+  ir->leaffunc = 1;
+  return ir;
+}
+
+UT_TEST(test_dispatch_fp_binops_route_to_fp_mop)
+{
+  static const TccIrOp ops[] = {
+      TCCIR_OP_FADD,
+      TCCIR_OP_FSUB,
+      TCCIR_OP_FMUL,
+      TCCIR_OP_FDIV,
+  };
+
+  for (size_t k = 0; k < sizeof(ops) / sizeof(ops[0]); k++)
+  {
+    cgstub_reset();
+    TCCIRState *ir = build_fp_op(ops[k], /*dest*/ 1, /*src1*/ 1, /*src2*/ 1);
+    tcc_ir_codegen_generate(ir);
+
+    UT_ASSERT_EQ(cgstub_call_count("fp_mop"), 1);
+    const CgStubCall *c = cgstub_nth_call("fp_mop", 0);
+    UT_ASSERT(c != NULL);
+    UT_ASSERT_EQ(c->ir_op, ops[k]);
+    UT_ASSERT_EQ(c->aux0, 0); /* is_complex: plain (non-complex) float operands */
+
+    tcc_ir_free(ir);
+  }
+  return 0;
+}
+
+UT_TEST(test_dispatch_cvt_itof_and_ftoi_route_to_fp_mop)
+{
+  cgstub_reset();
+  TCCIRState *ir_itof = build_fp_op(TCCIR_OP_CVT_ITOF, /*dest*/ 1, /*src1*/ 0, /*src2*/ -1);
+  tcc_ir_codegen_generate(ir_itof);
+  UT_ASSERT_EQ(cgstub_call_count("fp_mop"), 1);
+  UT_ASSERT_EQ(cgstub_nth_call("fp_mop", 0)->ir_op, TCCIR_OP_CVT_ITOF);
+  tcc_ir_free(ir_itof);
+
+  cgstub_reset();
+  TCCIRState *ir_ftoi = build_fp_op(TCCIR_OP_CVT_FTOI, /*dest*/ 0, /*src1*/ 1, /*src2*/ -1);
+  tcc_ir_codegen_generate(ir_ftoi);
+  UT_ASSERT_EQ(cgstub_call_count("fp_mop"), 1);
+  UT_ASSERT_EQ(cgstub_nth_call("fp_mop", 0)->ir_op, TCCIR_OP_CVT_FTOI);
+  tcc_ir_free(ir_ftoi);
+
+  return 0;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Suite                                                                      */
 /* -------------------------------------------------------------------------- */
@@ -226,4 +327,6 @@ UT_SUITE(codegen_fp)
   UT_RUN(test_fp_double_pair);
   UT_RUN(test_fp_op_construction);
   UT_RUN(test_complex_float_pair);
+  UT_RUN(test_dispatch_fp_binops_route_to_fp_mop);
+  UT_RUN(test_dispatch_cvt_itof_and_ftoi_route_to_fp_mop);
 }

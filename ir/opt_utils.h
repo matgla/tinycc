@@ -113,6 +113,7 @@ const char *ir_opt_get_constant_string_from_symref(struct TCCIRState *ir,
                                                    IROperand op);
 
 int tcc_ir_vreg_has_single_def(struct TCCIRState *ir, int32_t vreg);
+int tcc_ir_vreg_has_multi_def(struct TCCIRState *ir, int32_t vreg);
 
 /* ============================================================================
  * Callee symbol replacement helpers

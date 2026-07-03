@@ -100,11 +100,18 @@ def test_tcc_matches_gcc(seed, tmp_path):
     src = tmp_path / f"fuzz_{seed}.c"
     src.write_text(generate_program(seed, PROFILE))
 
-    ref = H.run_with_gcc(src, GCC_OPT, tmp_path)
+    # gcc is the oracle, but it is not infallible: it miscompiles some UB-free
+    # programs at -O2 (confirmed: bitfield seed 1486).  Cross-check gcc against
+    # itself at -O0; only trust it as a gold reference when the two agree.  A
+    # self-inconsistent gcc means the program has UB the generator missed or gcc
+    # has a codegen bug — either way it's not a tcc divergence, so skip.
+    ref, trusted, reason = H.gcc_trusted_reference(src, tmp_path, GCC_OPT)
     if not ref.ok:
         # A broken gcc reference build is an environment problem, not a tcc bug.
         pytest.skip(f"gcc reference build/run failed: "
                     f"{ref.error.strip().splitlines()[0] if ref.error.strip() else '?'}")
+    if not trusted:
+        pytest.skip(f"gcc oracle unreliable for seed {seed}: {reason}")
 
     tcc_results = [H.run_with_tcc(src, o, tmp_path) for o in TCC_OPT_LEVELS]
     mismatched = [r for r in tcc_results if not (r.ok and r.signature == ref.signature)]

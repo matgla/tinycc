@@ -1,0 +1,6 @@
+int e1 = 5;
+int e2 = 5;
+int e3 = ;
+int e4 [][x];
+int v = 1;
+v += 3;

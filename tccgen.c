@@ -30198,6 +30198,9 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_iv_strength_reduction(ir);
   }
   tcc_ir_free_loops(licm_loops);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ_iv_strength_red");
+#endif
 
   /* Local ALU CSE: dedupe pure arithmetic ops within a basic block.
    * Catches `arr[i].x` + `arr[i].y` patterns where the same `i*stride+base`
@@ -30229,6 +30232,10 @@ static void gen_function(Sym *sym)
     if (getenv("TCC_DBG_CSE"))
       fprintf(stderr, "[local_alu_cse] %d changes in %d iterations\n", total_changes, loops);
   }
+
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_alu_cse");
+#endif
 
   /* Phase 6b: Pointer store-to-load forwarding — after local_alu_cse has
    * CSE'd identical address computations (e.g. 5x `T = hstent + 12` collapsed
@@ -30311,6 +30318,10 @@ static void gen_function(Sym *sym)
     }
   }
 
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_psl_fwd");
+#endif
+
   if (tcc_state->opt_redundant_store)
   {
     if (tcc_ir_opt_rmw_byte_clear(ir) > 0)
@@ -30325,6 +30336,9 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_strength_red)
   dbg_scan_overlap(ir,"Q3-before-strength_reduction");
     tcc_ir_opt_strength_reduction(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_strength_red");
+#endif
 
   /* Late copy propagation + dead store elimination.
    * Late passes (IV strength reduction, loop rotation) may introduce
@@ -30336,6 +30350,9 @@ static void gen_function(Sym *sym)
     if (late_cp > 0 && tcc_state->opt_dead_store)
       tcc_ir_opt_dse(ir);
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_late_cp");
+#endif
 
   if (tcc_state->opt_const_prop)
   {
@@ -30351,6 +30368,9 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_compact_nops(ir);
     }
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_sas");
+#endif
 
   /* Late memmove→indexed-stores: earlier calls miss patterns where the
    * destination address is computed through inline-parameter VAR chains
@@ -30393,6 +30413,9 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_dce)
       tcc_ir_opt_dce(ir);
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_shl32");
+#endif
 
   /* OR-bool-diamond — fold `acc |= (cond ? 1 : 0)` materialization. */
   if (tcc_state->opt_const_prop)
@@ -30402,6 +30425,9 @@ static void gen_function(Sym *sym)
    * their defining deref expressions, creating STORE+CMP deref pairs. */
   if (tcc_state->opt_const_prop)
     tcc_ir_opt_deref_fwd(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_deref_fwd");
+#endif
 
   /* Late VAR→TMP forwarding is deferred to after final compact_nops +
    * eliminate_fallthrough (below), because the forward scan needs clean
@@ -30421,6 +30447,9 @@ static void gen_function(Sym *sym)
    * does not run again after this point. */
   if (tcc_state->opt_copy_prop)
     tcc_ir_opt_postinc_assign_fold(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_paf");
+#endif
 
   /* Combine `V = V ± C1; V = V ± C2; ...` chains into a single update.
    * Produced by loop unrolling of pointer-increment loops once
@@ -30442,6 +30471,9 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_compact_nops(ir);
     }
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_csaf");
+#endif
 
   /* Loop-aware post-increment fusion — fuse embedded deref in loop body with
    * latch pointer increment into LOAD_POSTINC.  Must run after IV strength
@@ -30460,6 +30492,9 @@ static void gen_function(Sym *sym)
   dbg_scan_overlap(ir,"Q4-before-decrement_to_zero");
   tcc_ir_opt_decrement_to_zero(ir);
   dbg_scan_overlap(ir,"Q4b-after-decrement_to_zero");
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_dtz");
+#endif
 
   /* Redundant Init Elimination - remove function-entry VAR inits that are
    * always killed before use. Must run after decrement-to-zero (which NOPs
@@ -30484,6 +30519,9 @@ static void gen_function(Sym *sym)
     }
   }
 
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_dle1");
+#endif
   tcc_ir_opt_dce(ir); /* Final pass to mark unreachable code as NOP */
 
   /* Re-run dead loop elimination after final DCE: earlier loops may now have
@@ -30535,6 +30573,9 @@ static void gen_function(Sym *sym)
         tcc_ir_opt_dse(ir);
     }
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_vtf");
+#endif
 
   /* PACK64 tautology — collapse PACK64(low(X), X>>32) into ASSIGN X.
    * Must run AFTER late var_tmp_fwd + copy_prop: those passes resolve the
@@ -30555,6 +30596,9 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_dce)
       tcc_ir_opt_dce(ir);
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_p64t");
+#endif
 
   /* ADD-immediate + DEREF fold into LOAD_INDEXED — DISABLED.
    * The fold moves the memory load from the DEREF use site to the ADD
@@ -30586,6 +30630,9 @@ static void gen_function(Sym *sym)
         tcc_ir_opt_eliminate_fallthrough(ir);
     }
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_lr");
+#endif
 
   /* Redundant zero-trip entry-guard elimination.  Sequential counted loops
    * sharing a counter (memclr's 3 loops over i) keep a pre-loop guard on the
@@ -30612,6 +30659,9 @@ static void gen_function(Sym *sym)
    * half setup and compare. */
   dbg_scan_overlap(ir,"P3-before-cmp_narrow_64");
   dbg_scan_overlap(ir,"R4-just-before-cmp_narrow");
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_lge");
+#endif
   tcc_ir_opt_cmp_narrow_64(ir);
 
   /* ASSIGN fusion — fold `T_new = X OP Y; T_final = T_new ASSIGN` into a
@@ -30621,6 +30671,9 @@ static void gen_function(Sym *sym)
   dbg_scan_overlap(ir,"P4-before-assign_fuse");
   tcc_ir_opt_assign_fuse(ir);
   dbg_scan_overlap(ir,"P4b-after-assign_fuse");
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_af");
+#endif
 
   /* Phase 8: Conditional Select - replace if/else diamonds with SELECT.
    * Must run late, after all other optimizations have simplified the IR,
@@ -30633,6 +30686,9 @@ static void gen_function(Sym *sym)
    * SELECT's flag-setting CMP is not deleted by a downstream orphan-CMP pass. */
   if (tcc_state->optimize > 0)
     tcc_ir_opt_setif_neg_to_select(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_sel");
+#endif
 
   /* Recompute leafness after IR optimizations.
    * IR construction marks the function non-leaf as soon as a call op is

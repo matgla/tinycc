@@ -223,6 +223,14 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
       return 0;
   }
 
+  /* The MLA lands at the MUL's position, hoisting the ADD's accumulator
+   * read up to it.  A memory-read accumulator (fused lvalue load) must not
+   * skip stores between the MUL and the ADD (mirror of the SSA-side
+   * mul-operand sink guard; volatile fuzz seed 5053 family). */
+  if (ir_xform_operand_reads_memory(accum_op) &&
+      (q->is_jump_target || !ir_xform_range_preserves_memory(ir, mul_idx, i)))
+    return 0;
+
   IROperand final_dest = add_dest;
   int store_idx = -1;
   if (long_mla && irop_has_vreg(add_dest) && ir_opt_du_uses(du, irop_get_vreg(add_dest)) == 1) {

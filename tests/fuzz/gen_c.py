@@ -97,6 +97,22 @@ PROFILES = {
     "struct_byval": frozenset({"struct_byval"}),  # adds by-value struct/union pass+return
     "varargs":  frozenset({"varargs"}),   # adds a variadic vsum(n, ...) + call sites
     "ptr":      frozenset({"ptr"}),       # adds restricted single-level deref + aliasing
+    # --- wave 2 (docs/plan_fuzz_wave2.md) -------------------------------------
+    "longlong": frozenset({"i64"}),       # adds unsigned long long arithmetic (register-pair codegen)
+    "signed":   frozenset({"signed"}),    # adds bounded SIGNED int arithmetic (SDIV/ASR/magic-number)
+    # "combo": cross-feature interaction seams; costs nothing beyond a frozenset
+    # per the "profile == a set of flags" mechanism (wave2 plan §4.1).
+    "combo":     frozenset({"ptr", "switch", "bitfield", "struct_byval"}),
+    "combo_num": frozenset({"i64", "float", "signed"}),
+    # "fp_deep" deepens the existing "float" seam with EXACT (both-oracle-safe)
+    # int<->fp conversions / a*b+c / loop-carried accumulation (wave2 plan §4.4).
+    "fp_deep":  frozenset({"float", "fp_deep"}),
+    # "fp_round" additionally allows full-mantissa (non-exact) FP literals/ops to
+    # stress GRS rounding paths.  olevels-ONLY — never sweep this against vs-gcc
+    # (see the _fconst_round() docstring and wave2 plan §4.4).
+    "fp_round": frozenset({"float", "fp_round"}),
+    "volatile": frozenset({"volatile"}),  # adds volatile accesses (DSE/load-CSE over-elimination probe)
+    "agg_deep": frozenset({"agg_deep"}),  # adds nested structs, 2-D arrays, 2-level pointers
 }
 DEFAULT_PROFILE = "int"
 
@@ -142,6 +158,37 @@ SB_SHAPES = [
     ("SB8", [("a", "unsigned"), ("b", "unsigned")]),        # 8 bytes -> sret + even-reg rule
 ]
 SB_FIELDS = {name: fields for name, fields in SB_SHAPES}
+
+# --- "longlong" profile tunables ("i64" flag) ---------------------------------
+# Purely unsigned 64-bit arithmetic (wrap mod 2**64 is defined).  Locals are
+# ALWAYS seeded from two existing 32-bit uvars (hi<<32 | lo) so the high word is
+# never all-zero -- a register-pair codegen bug that only corrupts the high word
+# would otherwise be invisible.
+MAX_I64_VARS = 4
+
+# --- "signed" profile tunables --------------------------------------------
+# Operands bounded to [-2**15, 2**15) so +,-,* cannot overflow int (product
+# magnitude <= 2**30) and INT_MIN is never reachable, keeping / % (guarded
+# nonzero) and unary uses fully defined.
+MAX_SIGNED_VARS = 4
+SIGNED_BOUND = 1 << 15
+
+# --- "fp_deep"/"fp_round" profile tunables ---------------------------------
+# fp_deep reuses the "float" profile's fvars/_fleaf/_fconst machinery and adds
+# EXACT-preserving deepening only (both oracles stay sound).  fp_round further
+# allows full-mantissa (non-exact) literals -- olevels-ONLY, see _fconst_round().
+FP_DEEP_LOOP_TRIP = 8      # bounded so the loop-carried sum stays tiny/exact
+FP_DEEP_STEP_MAX = 50      # trip * step << 2**24 -> always exact
+
+# --- "volatile" profile tunables -------------------------------------------
+MAX_VOLATILE_VARS = 3
+
+# --- "agg_deep" profile tunables --------------------------------------------
+# Nested struct (struct N2 { struct N n; unsigned t; }), a 2-D array (both dims
+# power-of-two, in-bounds masked indices), and a 2-level pointer chain into an
+# existing uvar (never a fresh escaping object).
+AGG2D_DIM = 4              # must be a power of two (index masking relies on it)
+assert AGG2D_DIM & (AGG2D_DIM - 1) == 0, "AGG2D_DIM must be a power of two"
 
 
 def _sb_field_mask(ctype: str) -> str:
@@ -214,6 +261,15 @@ class Gen:
         self._icall_depth = 0
         self._label = 0          # forward-goto label bookkeeping ("switch" profile)
         self._counter = 0
+        # --- wave 2 state (docs/plan_fuzz_wave2.md) ---
+        self.qvars: list[str] = []       # "longlong" profile: unsigned long long locals
+        self.sivars: list[str] = []      # "signed" profile: bounded (+-2**15) signed int locals
+        self.vvars: list[str] = []       # "volatile" profile: volatile unsigned locals
+        # "agg_deep" profile: nested-struct instances, 2-D array names, and
+        # (ptr1, ptr2, target_uvar) 2-level pointer chains.
+        self.structs2: list[str] = []
+        self.arr2d: list[str] = []
+        self.pp2: "list[tuple[str, str, str]]" = []
 
     def fresh(self, prefix: str) -> str:
         self._counter += 1
@@ -335,6 +391,14 @@ class Gen:
         # and bounds the number of indirect calls).
         if self.has("fnptr") and self.dtab_name and self._icall_depth == 0:
             choices.append("icall")
+        # "agg_deep" profile: nested-struct field, 2-D array element, and
+        # double-deref reads are all plain `unsigned` values -> valid leaves.
+        if self.has("agg_deep") and self.structs2:
+            choices.append("struct2")
+        if self.has("agg_deep") and self.arr2d:
+            choices.append("arr2d")
+        if self.has("agg_deep") and self.pp2:
+            choices.append("pp2")
         kind = self.rng.choice(choices)
         if kind == "const":
             return self.rconst()
@@ -369,6 +433,18 @@ class Gen:
             b = self.expr(1)
             self._icall_depth -= 1
             return f"{self.dtab_name}[{idx}]((unsigned)({a}), (unsigned)({b}))"
+        if kind == "struct2":
+            name = self.rng.choice(self.structs2)
+            field = self.rng.choice(("n.a", "n.b", "t"))
+            return f"{name}.{field}"
+        if kind == "arr2d":
+            name = self.rng.choice(self.arr2d)
+            i = self._index_expr_n(AGG2D_DIM)
+            j = self._index_expr_n(AGG2D_DIM)
+            return f"{name}[{i}][{j}]"
+        if kind == "pp2":
+            _p1, p2, _t = self.rng.choice(self.pp2)
+            return f"(**{p2})"
         raise AssertionError(kind)
 
     def _index_expr(self) -> str:
@@ -465,6 +541,71 @@ class Gen:
         return (f"{pad}{name} = ({name} < -{big} || {name} > {big}) "
                 f"? ({ctype})1 : {name};")
 
+    def _small_fp_lit(self, ctype: str, v: int) -> str:
+        """An exact small-nonnegative-integer FP literal (fp_deep a*b+c shapes)."""
+        return f"{v}.0f" if ctype == "float" else f"{v}.0"
+
+    def _fconst_round(self, ctype: str) -> str:
+        """A finite, normal, FULL-MANTISSA FP literal ("fp_round" profile only).
+
+        Unlike ``_fconst`` (mantissa < 2**24, exact in both float and double),
+        this fills the target type's own full mantissa width, so parsing is
+        exact for ``ctype`` but arithmetic on it generally needs real rounding
+        (GRS logic in the soft-float add/mul/div routines) -- the actual
+        rounding-stress the "float" profile's exact-literal design deliberately
+        avoids.  olevels-ONLY: tcc's soft-float (lib/fp/soft/) and gcc's libgcc
+        soft-float are independent implementations; if either takes a shortcut
+        on division/GRS rounding a last-bit disagreement would be a LEGAL
+        divergence, not a bug.  Never sweep this against vs-gcc (see
+        docs/plan_fuzz_wave2.md SS4.4).  Basic add/mul are far safer than
+        divide, but the profile is kept olevels-only across the board out of
+        caution until empirically proven otherwise.
+        """
+        mant_bits = 23 if ctype == "float" else 52
+        m = self.rng.randint(0, (1 << mant_bits) - 1)
+        e = self.rng.randint(-20, 20)
+        sign = self.rng.choice((1.0, -1.0))
+        val = sign * (1.0 + m / float(1 << mant_bits)) * (2.0 ** e)
+        lit = val.hex()
+        return f"{lit}f" if ctype == "float" else lit
+
+    # ----- 64-bit generation ("longlong" profile only) -------------------------
+
+    def _qleaf(self) -> str:
+        """An ``unsigned long long`` operand: a constant, an existing qvar, or a
+        zero-extending cast of a fresh 32-bit expression."""
+        choices = ["qconst", "qconst"]
+        if self.qvars:
+            choices += ["qvar", "qvar"]
+        if self.uvars:
+            choices.append("qcast")
+        kind = self.rng.choice(choices)
+        if kind == "qconst":
+            return f"{self.rng.randint(0, 0xFFFFFFFFFFFFFFFF)}ull"
+        if kind == "qvar":
+            return self.rng.choice(self.qvars)
+        return f"((unsigned long long)(unsigned)({self.expr(2)}))"
+
+    # ----- bounded-signed generation ("signed" profile only) --------------------
+
+    def _sileaf(self) -> str:
+        """A signed ``int`` operand bounded to [-SIGNED_BOUND, SIGNED_BOUND)."""
+        choices = ["siconst", "siconst"]
+        if self.sivars:
+            choices += ["sivar", "sivar"]
+        if self.uvars:
+            choices.append("sicast")
+        kind = self.rng.choice(choices)
+        if kind == "siconst":
+            return str(self.rng.randint(-SIGNED_BOUND, SIGNED_BOUND - 1))
+        if kind == "sivar":
+            return self.rng.choice(self.sivars)
+        # Narrow a runtime unsigned value into the bounded range.  The
+        # unsigned->short->int chain is implementation-defined (not UB) for
+        # out-of-range values per C11 6.3.1.3p3, and both tcc and gcc agree on
+        # this target's two's-complement narrowing, so it stays oracle-safe.
+        return f"((int)(short)({self.rng.choice(self.uvars)}))"
+
     # ----- statement generation ------------------------------------------------
 
     def block(self, depth: int, indent: int) -> list[str]:
@@ -519,6 +660,30 @@ class Gen:
         # "ptr" profile: deref store (+read-back) and an alias store-one/load-other.
         if self.has("ptr") and self.pvars:
             opts += ["ptrstore", "aliasrw"]
+        # "longlong" profile: 64-bit arithmetic, cross-width fold, 64-bit compare.
+        if self.has("i64") and self.qvars:
+            opts += ["qassign", "qassign", "qcs", "qcmp"]
+        # "signed" profile: bounded signed arithmetic, compare, narrow round-trip.
+        if self.has("signed") and self.sivars:
+            opts += ["siassign", "siassign", "sicmp", "sinarrow"]
+        # "fp_deep" profile: EXACT int<->fp round trip, a*b+c, loop-carried sum.
+        if self.has("fp_deep"):
+            opts.append("fpconv")
+        if self.has("fp_deep") and self.fvars:
+            opts += ["fmuladd", "floopfp"]
+        # "fp_round" profile: full-mantissa (non-exact) FP op; olevels-ONLY.
+        if self.has("fp_round") and self.fvars:
+            opts += ["fground", "fground"]
+        # "volatile" profile: a volatile store and a volatile load folded into cs.
+        if self.has("volatile") and self.vvars:
+            opts += ["vstore", "vstore", "vload_cs"]
+        # "agg_deep" profile: nested-struct field, 2-D array element, 2-level ptr.
+        if self.has("agg_deep") and self.structs2:
+            opts.append("structstore2")
+        if self.has("agg_deep") and self.arr2d:
+            opts += ["arr2dstore", "arr2dstore"]
+        if self.has("agg_deep") and self.pp2:
+            opts.append("pp2store")
         kind = self.rng.choice(opts)
 
         if kind == "assign":
@@ -736,6 +901,169 @@ class Gen:
                       f"{pad}  cs = csmix(cs, {self.small_const()}u); }}"]
             return lines
 
+        if kind == "qassign":
+            # Exact ops (+ - * & | ^) are unguarded (defined mod 2**64); / % are
+            # guarded nonzero (OR 1); shift counts masked to [0,63].  The `qcast`
+            # branch inside _qleaf() supplies the zero-extend cross-width shape.
+            name = self.rng.choice(self.qvars)
+            op = self.rng.choice(["+", "-", "*", "&", "|", "^", "/", "%", "<<", ">>"])
+            a = self._qleaf()
+            if op in ("<<", ">>"):
+                s = self.expr(1)
+                rhs = f"({a}) {op} ((unsigned)({s}) & 63u)"
+            elif op == "/":
+                b = self._qleaf()
+                rhs = f"({a}) / (({b}) | 1ull)"
+            elif op == "%":
+                b = self._qleaf()
+                rhs = f"({a}) % (({b}) | 1ull)"
+            else:
+                b = self._qleaf()
+                rhs = f"({a}) {op} ({b})"
+            return [f"{pad}{name} = {rhs};"]
+
+        if kind == "qcs":
+            # Fold BOTH halves of a qvar into cs -- a high-word-only (register-
+            # pair) bug would be invisible if only the low 32 bits were folded.
+            name = self.rng.choice(self.qvars)
+            return [f"{pad}cs = csmix(cs, (unsigned)({name}) ^ (unsigned)({name} >> 32));"]
+
+        if kind == "qcmp":
+            # Compare two qvars DIRECTLY (never a raw qconst()/qcast() operand):
+            # both are opaque, full-64-bit-range runtime values, so gcc's range
+            # analysis can never prove the outcome statically.  A qcast operand
+            # (zero-extended from 32 bits) compared against a full-range 64-bit
+            # literal WOULD be provably decidable (-Wtype-limits) since its top
+            # 32 bits are known-zero -- that combination is deliberately avoided.
+            a = self.rng.choice(self.qvars)
+            b = self.rng.choice(self.qvars)
+            if b == a:
+                b = f"(({b}) ^ (unsigned long long)({self.cmp_nonce}))"
+            cop = self.rng.choice(["<", ">", "<=", ">=", "==", "!="])
+            return [f"{pad}cs = csmix(cs, (({a}) {cop} ({b})) ? 1u : 0u);"]
+
+        if kind == "siassign":
+            # +,-,* on bounded operands cannot overflow int; /,% guarded nonzero
+            # via OR (defined for two's-complement, no UB, see _sileaf docstring);
+            # shr is the implementation-defined (not UB) arithmetic-shift path;
+            # shl masks its LHS non-negative to stay inside <<'s defined range;
+            # divk/modk drive constant-divisor magic-number strength reduction.
+            name = self.rng.choice(self.sivars)
+            op = self.rng.choice(["+", "-", "*", "div", "mod", "shr", "shl", "divk", "modk"])
+            a = self._sileaf()
+            if op in ("+", "-", "*"):
+                b = self._sileaf()
+                rhs = f"({a}) {op} ({b})"
+            elif op == "div":
+                b = self._sileaf()
+                rhs = f"({a}) / (({b}) | 1)"
+            elif op == "mod":
+                b = self._sileaf()
+                rhs = f"({a}) % (({b}) | 1)"
+            elif op == "shr":
+                s = self.expr(1)
+                rhs = f"({a}) >> ((unsigned)({s}) & 31u)"
+            elif op == "shl":
+                s = self.expr(1)
+                rhs = f"(({a}) & 0x7fff) << ((unsigned)({s}) & 15u)"
+            elif op == "divk":
+                k = self.rng.choice((2, 3, 5, 7, 9, 16, 100))
+                rhs = f"({a}) / {k}"
+            else:  # modk
+                k = self.rng.choice((2, 3, 5, 7, 9, 16, 100))
+                rhs = f"({a}) % {k}"
+            return [f"{pad}{name} = {rhs};"]
+
+        if kind == "sicmp":
+            a, b = self._sileaf(), self._sileaf()
+            if b == a:
+                b = f"(({b}) ^ (int)({self.cmp_nonce}))"
+            cop = self.rng.choice(["<", ">", "<=", ">=", "==", "!="])
+            return [f"{pad}cs = csmix(cs, (unsigned)((({a}) {cop} ({b})) ? 1 : 0));"]
+
+        if kind == "sinarrow":
+            # (int)(signed char)(...) round trip -> SXTB codegen; result always
+            # lands in [-128,127], well inside SIGNED_BOUND for later reads.
+            name = self.rng.choice(self.sivars)
+            src = self._sileaf()
+            return [f"{pad}{name} = (int)(signed char)({src});"]
+
+        if kind == "fpconv":
+            # unsigned -> fp -> unsigned round trip on a value MASKED < 2**24 so
+            # it is exactly representable (and exactly recoverable) in EITHER
+            # float or double -> the round trip is a provable identity; any
+            # divergence from the original masked value is a real conversion bug.
+            src = self.rng.choice(self.uvars)
+            dst = self.rng.choice(self.uvars)
+            ctype = self.rng.choice(FP_TYPES)
+            return [f"{pad}{dst} = (unsigned)(({ctype})((unsigned)({src}) & 0xffffffu));"]
+
+        if kind == "fmuladd":
+            # a*b+c on small nonnegative INTEGERS (a*b <= 200*200 = 40000, +c <=
+            # 40200, far under 2**24) -> every intermediate is exact regardless of
+            # rounding/contraction order, so the FP result must equal the exact
+            # integer answer on any conforming implementation.
+            name, ctype = self.rng.choice(self.fvars)
+            a_lit = self._small_fp_lit(ctype, self.rng.randint(0, 200))
+            b_lit = self._small_fp_lit(ctype, self.rng.randint(0, 200))
+            c_lit = self._small_fp_lit(ctype, self.rng.randint(0, 200))
+            rhs = f"(({ctype})({a_lit}) * ({ctype})({b_lit}) + ({ctype})({c_lit}))"
+            return [f"{pad}{name} = {rhs};", self._fclamp(pad, name, ctype)]
+
+        if kind == "floopfp":
+            # Loop-carried FP accumulation kept in the exact envelope (trip *
+            # step << 2**24) -> the final sum is exactly the integer trip*step.
+            name, ctype = self.rng.choice(self.fvars)
+            it = self.fresh("fi")
+            trip = self.rng.randint(1, FP_DEEP_LOOP_TRIP)
+            step = self.rng.randint(1, FP_DEEP_STEP_MAX)
+            lines = [f"{pad}{name} = {self._small_fp_lit(ctype, 0)};",
+                     f"{pad}for (unsigned {it} = 0u; {it} < {trip}u; {it}++) {{",
+                     f"{pad}  {name} = {name} + {self._small_fp_lit(ctype, step)};",
+                     f"{pad}}}",
+                     f"{pad}cs = csmix(cs, (unsigned)({name}));"]
+            return lines
+
+        if kind == "fground":
+            # Full-mantissa (non-exact) literal arithmetic -- see _fconst_round().
+            name, ctype = self.rng.choice(self.fvars)
+            op = self.rng.choice(["+", "-", "*", "/"])
+            a, b = self._fconst_round(ctype), self._fconst_round(ctype)
+            if op == "/":
+                rhs = f"({a}) / ((({b}) == ({ctype})0) ? ({ctype})1 : ({b}))"
+            else:
+                rhs = f"({a}) {op} ({b})"
+            return [f"{pad}{name} = {rhs};", self._fclamp(pad, name, ctype)]
+
+        if kind == "vstore":
+            name = self.rng.choice(self.vvars)
+            return [f"{pad}{name} = (unsigned)({self.expr(MAX_EXPR_DEPTH)});"]
+
+        if kind == "vload_cs":
+            name = self.rng.choice(self.vvars)
+            return [f"{pad}cs = csmix(cs, {name});"]
+
+        if kind == "structstore2":
+            name = self.rng.choice(self.structs2)
+            field = self.rng.choice(("n.a", "n.b", "t"))
+            return [f"{pad}{name}.{field} = (unsigned)({self.expr(MAX_EXPR_DEPTH)});"]
+
+        if kind == "arr2dstore":
+            # Store via [i][j], read back via row-decay pointer arithmetic
+            # *(&arr[i][0] + j) -- in-bounds (j masked < AGG2D_DIM, stays inside
+            # row i) so this is well-defined pointer arithmetic, not UB.
+            name = self.rng.choice(self.arr2d)
+            i = self._index_expr_n(AGG2D_DIM)
+            j = self._index_expr_n(AGG2D_DIM)
+            return [f"{pad}{name}[{i}][{j}] = (unsigned)({self.expr(MAX_EXPR_DEPTH)});",
+                    f"{pad}cs = csmix(cs, *(&{name}[{i}][0] + {j}));"]
+
+        if kind == "pp2store":
+            p1, p2, _t = self.rng.choice(self.pp2)
+            return [f"{pad}**{p2} = (unsigned)({self.expr(MAX_EXPR_DEPTH)});",
+                    f"{pad}cs = csmix(cs, **{p2});",
+                    f"{pad}cs = csmix(cs, *{p1});"]
+
         raise AssertionError(kind)
 
 
@@ -923,6 +1251,11 @@ def generate_program(seed: int, profile: str = DEFAULT_PROFILE) -> str:
     struct_fields = "\n".join(f"  unsigned f{i};" for i in range(STRUCT_FIELDS))
     out.append(f"struct S {{\n{struct_fields}\n}};")
 
+    # --- nested struct type ("agg_deep" profile) ---
+    if g.has("agg_deep"):
+        out.append("struct N { unsigned a; unsigned b; };")
+        out.append("struct N2 { struct N n; unsigned t; };")
+
     # --- bitfield struct types ("bitfield" profile) ---
     # A non-packed type (natural alignment -> aligned insert/extract path) and a
     # packed variant (#pragma pack(1) + __attribute__((packed)) -> some fields
@@ -970,6 +1303,36 @@ def generate_program(seed: int, profile: str = DEFAULT_PROFILE) -> str:
         main.append(f"  unsigned {name}[{ARRAY_SIZE}] = {{ {inits} }};")
         g.arrays.append(name)
 
+    # 64-bit locals ("longlong" profile).  ALWAYS seed the high word from a
+    # SECOND uvar (hi<<32 | lo) -- a register-pair bug that only corrupts the
+    # high 32 bits would otherwise hide behind an all-zero high word.
+    if g.has("i64"):
+        n_q = g.rng.randint(2, MAX_I64_VARS)
+        for _ in range(n_q):
+            name = g.fresh("q")
+            hi, lo = g.rng.sample(g.uvars, 2)
+            main.append(f"  unsigned long long {name} = "
+                        f"(((unsigned long long)({hi})) << 32) | (unsigned long long)({lo});")
+            g.qvars.append(name)
+
+    # Bounded signed locals ("signed" profile): each in [-SIGNED_BOUND, SIGNED_BOUND).
+    if g.has("signed"):
+        n_si = g.rng.randint(2, MAX_SIGNED_VARS)
+        for _ in range(n_si):
+            name = g.fresh("si")
+            v = g.rng.randint(-SIGNED_BOUND, SIGNED_BOUND - 1)
+            main.append(f"  int {name} = {v};")
+            g.sivars.append(name)
+
+    # Volatile locals ("volatile" profile): every access is a real load/store
+    # that the optimizer must never eliminate or reorder across another.
+    if g.has("volatile"):
+        n_v = g.rng.randint(2, MAX_VOLATILE_VARS)
+        for _ in range(n_v):
+            name = g.fresh("vv")
+            main.append(f"  volatile unsigned {name} = {g.rconst()};")
+            g.vvars.append(name)
+
     # Pointers ("ptr" profile): declared AFTER all unsigned scalars/arrays are
     # initialised (I7), as function-lifetime locals (I3), each a single-level
     # `unsigned *` at an `unsigned` pointee (I1/I5).  Array targets use a fixed
@@ -1004,6 +1367,30 @@ def generate_program(seed: int, profile: str = DEFAULT_PROFILE) -> str:
         inits = ", ".join(g.rconst() for _ in range(STRUCT_FIELDS))
         main.append(f"  struct S {name} = {{ {inits} }};")
         g.structs.append(name)
+
+    # Nested struct, 2-D array, and 2-level pointer chain ("agg_deep" profile).
+    # The pointer chain targets an EXISTING uvar (never a fresh escaping object,
+    # mirroring the "ptr" profile's I2/I3 discipline).
+    if g.has("agg_deep"):
+        name = g.fresh("n2")
+        a0, b0, t0 = g.rconst(), g.rconst(), g.rconst()
+        main.append(f"  struct N2 {name} = {{ {{ {a0}, {b0} }}, {t0} }};")
+        g.structs2.append(name)
+
+        arrname = g.fresh("m2")
+        rows = ", ".join(
+            "{ " + ", ".join(g.rconst() for _ in range(AGG2D_DIM)) + " }"
+            for _ in range(AGG2D_DIM)
+        )
+        main.append(f"  unsigned {arrname}[{AGG2D_DIM}][{AGG2D_DIM}] = {{ {rows} }};")
+        g.arr2d.append(arrname)
+
+        tname = g.rng.choice(g.uvars)
+        p1 = g.fresh("pa2")
+        p2 = g.fresh("ppa2")
+        main.append(f"  unsigned *{p1} = &{tname};")
+        main.append(f"  unsigned **{p2} = &{p1};")
+        g.pp2.append((p1, p2, tname))
 
     # Bitfield struct instances ("bitfield" profile): every field brace-init to 0u
     # (no uninitialised field/padding is ever read).
@@ -1050,6 +1437,17 @@ def generate_program(seed: int, profile: str = DEFAULT_PROFILE) -> str:
     # sensitive to the final state of everything we computed.
     for v in g.uvars:
         main.append(f"  cs = csmix(cs, {v});")
+    # Fold BOTH halves of every 64-bit local ("longlong" profile) -- a high-word
+    # -only corruption would be invisible if only the low 32 bits were folded.
+    for name in g.qvars:
+        main.append(f"  cs = csmix(cs, (unsigned)({name}) ^ (unsigned)({name} >> 32));")
+    # Fold every bounded signed local ("signed" profile); the unsigned cast of a
+    # negative int is the standard defined two's-complement bit-pattern reinterpret.
+    for name in g.sivars:
+        main.append(f"  cs = csmix(cs, (unsigned)({name}));")
+    # Fold every volatile local's final value ("volatile" profile).
+    for name in g.vvars:
+        main.append(f"  cs = csmix(cs, {name});")
     # Call every helper at least once with deterministic args so no helper is
     # unused (-Wunused-function) and the result depends on helper codegen too.
     for i, name in enumerate(g.helpers):
@@ -1070,6 +1468,18 @@ def generate_program(seed: int, profile: str = DEFAULT_PROFILE) -> str:
     for name in g.structs:
         for i in range(STRUCT_FIELDS):
             main.append(f"  cs = csmix(cs, {name}.f{i});")
+    # Fold each nested-struct field, 2-D array element, and 2-level pointer's
+    # final pointee value ("agg_deep" profile).
+    for name in g.structs2:
+        for field in ("n.a", "n.b", "t"):
+            main.append(f"  cs = csmix(cs, {name}.{field});")
+    for name in g.arr2d:
+        main.append(f"  for (unsigned ii = 0u; ii < {AGG2D_DIM}u; ii++) "
+                    f"for (unsigned jj = 0u; jj < {AGG2D_DIM}u; jj++) "
+                    f"cs = csmix(cs, {name}[ii][jj]);")
+    for p1, p2, _t in g.pp2:
+        main.append(f"  cs = csmix(cs, **{p2});")
+        main.append(f"  cs = csmix(cs, *{p1});")
     # Fold each NAMED bitfield member into cs (NEVER raw bytes -- inter-field and
     # packed-pad bits are indeterminate and would be a false positive).
     for name, _ty, fields in g.bfvars:

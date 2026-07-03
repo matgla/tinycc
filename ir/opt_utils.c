@@ -495,6 +495,23 @@ uint8_t *ir_opt_build_merge_bitmap(TCCIRState *ir, int n)
           is_merge[target / 8] |= (1 << (target % 8));
       }
     }
+    else if (q->op == TCCIR_OP_SWITCH_TABLE)
+    {
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      if (table_id >= 0 && table_id < ir->num_switch_tables)
+      {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int j = 0; j < table->num_entries; j++)
+        {
+          int target = table->targets[j];
+          if (target >= 0 && target < n)
+            pred_count[target]++;
+        }
+        if (table->default_target >= 0 && table->default_target < n)
+          pred_count[table->default_target]++;
+      }
+    }
     /* NOP is NOT a terminator — it falls through.  Counting its fall-through
      * edge is required so a merge whose preceding block ends in DCE-left NOP
      * padding is still detected (pred_count >= 2).  Omitting it leaves stale
@@ -530,6 +547,23 @@ void ir_opt_mark_block_starts(TCCIRState *ir, int *block_start_seen, int gen, in
       if (tgt >= 0 && tgt < n)
         block_start_seen[tgt] = gen;
     }
+    else if (q->op == TCCIR_OP_SWITCH_TABLE)
+    {
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      if (table_id >= 0 && table_id < ir->num_switch_tables)
+      {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int j = 0; j < table->num_entries; j++)
+        {
+          int tgt = table->targets[j];
+          if (tgt >= 0 && tgt < n)
+            block_start_seen[tgt] = gen;
+        }
+        if (table->default_target >= 0 && table->default_target < n)
+          block_start_seen[table->default_target] = gen;
+      }
+    }
   }
 }
 
@@ -548,6 +582,23 @@ uint8_t *ir_opt_build_block_starts_bitmap(TCCIRState *ir, int n)
         bs[tgt / 8] |= (1 << (tgt % 8));
       if (i + 1 < n)
         bs[(i + 1) / 8] |= (1 << ((i + 1) % 8));
+    }
+    else if (q->op == TCCIR_OP_SWITCH_TABLE)
+    {
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      if (table_id >= 0 && table_id < ir->num_switch_tables)
+      {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int j = 0; j < table->num_entries; j++)
+        {
+          int tgt = table->targets[j];
+          if (tgt >= 0 && tgt < n)
+            bs[tgt / 8] |= (1 << (tgt % 8));
+        }
+        if (table->default_target >= 0 && table->default_target < n)
+          bs[table->default_target / 8] |= (1 << (table->default_target % 8));
+      }
     }
   }
   return bs;
@@ -787,25 +838,86 @@ static int ir_opt_setif_cmp_operand_equal(TCCIRState *ir, IROperand a, IROperand
   return 0;
 }
 
+/* Append to `ids` the vreg identities of `q`'s variable reads: lval sources
+ * whose vreg names a VAR/PARAM.  Whether such a read is spill-encoded as a
+ * STACKOFF slot or a direct VREG lval, it observes the variable's *current*
+ * value — so a redefinition of that vreg between two compared sites changes
+ * what the read returns even when no explicit STORE op is involved.
+ * Returns the new element count. */
+static int ir_opt_collect_var_read_ids(TCCIRState *ir, IRQuadCompact *q, int32_t *ids, int count)
+{
+  IROperand srcs[3];
+  int nsrc = 0;
+  if (irop_config[q->op].has_src1)
+    srcs[nsrc++] = tcc_ir_op_get_src1(ir, q);
+  if (irop_config[q->op].has_src2)
+    srcs[nsrc++] = tcc_ir_op_get_src2(ir, q);
+  if (q->op == TCCIR_OP_MLA)
+    srcs[nsrc++] = tcc_ir_op_get_accum(ir, q);
+  for (int s = 0; s < nsrc; s++)
+  {
+    int32_t vr = irop_get_vreg(srcs[s]);
+    int type;
+    if (!srcs[s].is_lval || vr < 0)
+      continue;
+    type = TCCIR_DECODE_VREG_TYPE(vr);
+    if (type == TCCIR_VREG_TYPE_VAR || type == TCCIR_VREG_TYPE_PARAM)
+      ids[count++] = vr;
+  }
+  return count;
+}
+
 /* When a def reads memory (`Sym***DEREF***` or `T_vreg***DEREF***` source), the
  * value at that address must be the same at both `a_def_idx` and `b_def_idx`
  * for the defs to be value-equivalent.  Conservatively require no aliasing
  * store, call, inline-asm, or branch target between the two defs.  Pure ALU
- * ops (and loads — they only read) are safe to skip. */
+ * ops (and loads — they only read) are safe to skip — unless their *dest*
+ * writes memory (lval / stack-slot destination), or redefines a VAR/PARAM
+ * that one of the endpoint instructions reads (switch fuzz seed 8261:
+ * `T127 <- V6 AND #1; ...; V6 <- V5 XOR #k; T130 <- V6 AND #1` — the XOR is
+ * a plain vreg def, but the two AND sources are spill-encoded STACKOFF reads
+ * of V6, so their values differ). */
 static int ir_opt_pure_def_memory_stable(TCCIRState *ir, int a_def_idx, int b_def_idx)
 {
   int lo = a_def_idx < b_def_idx ? a_def_idx : b_def_idx;
   int hi = a_def_idx < b_def_idx ? b_def_idx : a_def_idx;
+  int32_t read_ids[6];
+  int nids = 0;
+  nids = ir_opt_collect_var_read_ids(ir, &ir->compact_instructions[a_def_idx], read_ids, nids);
+  nids = ir_opt_collect_var_read_ids(ir, &ir->compact_instructions[b_def_idx], read_ids, nids);
   for (int k = lo + 1; k < hi; k++)
   {
-    int kop = ir->compact_instructions[k].op;
-    if (kop == TCCIR_OP_STORE || kop == TCCIR_OP_STORE_INDEXED ||
-        kop == TCCIR_OP_STORE_POSTINC || kop == TCCIR_OP_BLOCK_COPY ||
-        kop == TCCIR_OP_FUNCCALLVOID || kop == TCCIR_OP_FUNCCALLVAL ||
-        kop == TCCIR_OP_INLINE_ASM || kop == TCCIR_OP_VLA_ALLOC)
+    IRQuadCompact *kq = &ir->compact_instructions[k];
+    int kop = kq->op;
+    if (kop == TCCIR_OP_FUNCCALLVOID || kop == TCCIR_OP_FUNCCALLVAL)
+    {
+      /* Pure helpers (isnan, __aeabi_f2d, ...) touch no memory: they may
+       * sit between two compared sites without invalidating stability
+       * (compare-fp-3's isunordered||!isunordered fold depends on this).
+       * Their result def is still subject to the dest checks below. */
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, kq));
+      const char *name = callee ? get_tok_str(callee->v, NULL) : NULL;
+      if (!ir_opt_is_pure_helper_name(name))
+        return 0;
+    }
+    else if (kop == TCCIR_OP_STORE || kop == TCCIR_OP_STORE_INDEXED ||
+             kop == TCCIR_OP_STORE_POSTINC || kop == TCCIR_OP_BLOCK_COPY ||
+             kop == TCCIR_OP_INLINE_ASM || kop == TCCIR_OP_VLA_ALLOC)
       return 0;
-    if (ir->compact_instructions[k].is_jump_target)
+    if (kq->is_jump_target)
       return 0;
+    if (irop_config[kop].has_dest)
+    {
+      IROperand kd = tcc_ir_op_get_dest(ir, kq);
+      int32_t kd_vr = irop_get_vreg(kd);
+      /* A destination that itself names memory mutates it like a STORE. */
+      if (kd.is_lval || irop_get_tag(kd) == IROP_TAG_STACKOFF)
+        return 0;
+      /* A plain redefinition of a VAR/PARAM the endpoints read. */
+      for (int s = 0; s < nids; s++)
+        if (kd_vr == read_ids[s])
+          return 0;
+    }
   }
   return 1;
 }
@@ -817,6 +929,8 @@ static int ir_opt_pure_def_has_memory_read(TCCIRState *ir, IRQuadCompact *q)
   if (irop_config[q->op].has_src1 && tcc_ir_op_get_src1(ir, q).is_lval)
     return 1;
   if (irop_config[q->op].has_src2 && tcc_ir_op_get_src2(ir, q).is_lval)
+    return 1;
+  if (q->op == TCCIR_OP_MLA && tcc_ir_op_get_accum(ir, q).is_lval)
     return 1;
   return 0;
 }
@@ -983,19 +1097,11 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
     if (cmp_a->op != TCCIR_OP_CMP || cmp_b->op != TCCIR_OP_CMP)
       return 0;
 
-    int lo = cmp_a_idx < cmp_b_idx ? cmp_a_idx : cmp_b_idx;
-    int hi = cmp_a_idx < cmp_b_idx ? cmp_b_idx : cmp_a_idx;
-    for (int k = lo + 1; k < hi; k++)
-    {
-      int kop = ir->compact_instructions[k].op;
-      if (kop == TCCIR_OP_STORE || kop == TCCIR_OP_STORE_INDEXED ||
-          kop == TCCIR_OP_BLOCK_COPY || kop == TCCIR_OP_FUNCCALLVOID ||
-          kop == TCCIR_OP_FUNCCALLVAL || kop == TCCIR_OP_INLINE_ASM ||
-          kop == TCCIR_OP_VLA_ALLOC)
-        return 0;
-      if (ir->compact_instructions[k].is_jump_target)
-        return 0;
-    }
+    /* Memory (and any VAR/PARAM the two CMPs read) must be unchanged
+     * between the CMP sites — the operand comparison below treats
+     * structurally-identical slot reads as equal on that premise. */
+    if (!ir_opt_pure_def_memory_stable(ir, cmp_a_idx, cmp_b_idx))
+      return 0;
 
     IROperand a1 = tcc_ir_op_get_src1(ir, cmp_a);
     IROperand a2 = tcc_ir_op_get_src2(ir, cmp_a);
@@ -1032,7 +1138,17 @@ static int ir_opt_pure_expr_equal_impl(TCCIRState *ir, IROperand a, int a_use_id
   a_tag = irop_get_tag(a);
   b_tag = irop_get_tag(b);
   if (a_tag != IROP_TAG_VREG || b_tag != IROP_TAG_VREG)
-    return ir_opt_nonvreg_expr_equal(ir, a, b);
+  {
+    if (!ir_opt_nonvreg_expr_equal(ir, a, b))
+      return 0;
+    /* Structurally-identical memory reads (spill-encoded VAR/PARAM slots,
+     * global lvals) only yield the same value when neither memory nor the
+     * named variable changed between the two use sites. */
+    if (a.is_lval && a_use_idx >= 0 && b_use_idx >= 0 && a_use_idx != b_use_idx &&
+        !ir_opt_pure_def_memory_stable(ir, a_use_idx, b_use_idx))
+      return 0;
+    return 1;
+  }
 
   /* A dereferenced operand `*(V)` (is_lval) and a plain address operand `V`
    * (not is_lval) are different values — one loads from memory, the other is
@@ -1374,4 +1490,34 @@ int tcc_ir_vreg_has_single_def(TCCIRState *ir, int32_t vreg)
     }
   }
   return def_count == 1;
+}
+
+/* True iff `vreg` is written by two or more instructions.  Unlike
+ * tcc_ir_vreg_has_single_def, a vreg with ZERO defs (e.g. an incoming
+ * parameter never re-assigned in this function) counts as safe here: with
+ * no def anywhere, there is no instruction a back-edge could route through
+ * to change its value, so it is exactly as trustworthy as a genuine
+ * single-def vreg for reasoning that a linearly-scanned value stays
+ * constant between two program points. */
+int tcc_ir_vreg_has_multi_def(TCCIRState *ir, int32_t vreg)
+{
+  int def_count = 0;
+  int n = ir->next_instruction_index;
+
+  for (int i = 0; i < n; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (!irop_config[q->op].has_dest)
+      continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_vreg(dest) == vreg)
+    {
+      def_count++;
+      if (def_count > 1)
+        return 1;
+    }
+  }
+  return 0;
 }

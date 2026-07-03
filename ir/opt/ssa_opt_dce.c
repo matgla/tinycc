@@ -13,6 +13,8 @@
 #include "ssa_opt.h"
 #include <limits.h>
 
+extern int tcc_ir_opt_pass_disabled(const char *name);
+
 static int dce_temp_worklist(IRSSAOptCtx *ctx)
 {
   int cap = ctx->vinfo_cap;
@@ -604,6 +606,29 @@ static int dce_dead_stackloc_stores(IRSSAOptCtx *ctx)
 #undef SL_SET
 #undef SL_TEST
 
+static int ssa_dce_block_in_backedge_region(IRCFG *cfg, int block)
+{
+  if (!cfg || block < 0 || block >= cfg->num_blocks)
+    return 0;
+
+  IRBasicBlock *bb = &cfg->blocks[block];
+  for (int h = 0; h < cfg->num_blocks; h++) {
+    IRBasicBlock *header = &cfg->blocks[h];
+    for (int i = 0; i < header->num_preds; i++) {
+      int pred = header->preds[i];
+      if (pred < 0 || pred >= cfg->num_blocks)
+        continue;
+      IRBasicBlock *latch = &cfg->blocks[pred];
+      if (pred != h && latch->start_idx < header->start_idx)
+        continue;
+      if (bb->start_idx >= header->start_idx &&
+          bb->start_idx <= latch->start_idx)
+        return 1;
+    }
+  }
+  return 0;
+}
+
 /* Aggressive dead phi cycle elimination.
  *
  * Standard DCE cannot break cycles of phi nodes and ASSIGN copies where each
@@ -716,6 +741,7 @@ static int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
   /* Phase 3: remove phi nodes whose dest TEMP is not live. */
   int changes = 0;
   for (int b = 0; b < cfg->num_blocks; b++) {
+    int in_backedge_region = ssa_dce_block_in_backedge_region(cfg, b);
     IRPhiNode **pp = &ssa->block_phis[b];
     while (*pp) {
       IRPhiNode *phi = *pp;
@@ -723,6 +749,21 @@ static int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
       if (dv >= 0 && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP) {
         int dp = TCCIR_DECODE_VREG_POSITION(dv);
         if (dp < cap && !BM_TEST(dp)) {
+          /* Phis in a natural back-edge region are not just value uses: phi
+           * resolution needs them to carry state through loop iterations.
+           * Removing such a phi can make out-of-SSA conflate a loop-carried
+           * value with its source even when the visible ASSIGN/phi graph
+           * looks dead (fp_round seed 18960). */
+          if (in_backedge_region) {
+            pp = &phi->next;
+            continue;
+          }
+          if (getenv("TCC_DBG_PHI_CYCLES")) {
+            fprintf(stderr, "[phi_cycles] remove phi block=%d dest=T%d ops:", b, dp);
+            for (int pi = 0; pi < phi->num_operands; pi++)
+              fprintf(stderr, " %d", phi->operands[pi].vreg);
+            fprintf(stderr, "\n");
+          }
           for (int pi = 0; pi < phi->num_operands; pi++) {
             IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, phi->operands[pi].vreg);
             if (vi && vi->use_count > 0)
@@ -741,8 +782,33 @@ static int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
     }
   }
 
-  if (changes)
+  if (changes) {
+    /* Rebuild the FULL use lists before cascading: the per-operand
+     * use_count-- above operates on counts that may already be stale
+     * (same desync family as ptr seed 7226 — count-only updates let a
+     * live use fall off the tracked list), so the worklist could delete
+     * a def still feeding a LIVE phi (fp_round seed 18960: a loop-carried
+     * copy's def died and out-of-SSA conflated it with its multi-def
+     * source).  Mirrors the rebuild done by the ssa_opt_dce driver. */
+    for (int p = 0; p < ctx->vinfo_cap; p++)
+      ctx->vinfo[p].use_count = 0;
+    for (int i = 0; i < ir->next_instruction_index; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      ssa_opt_scan_instr_uses(ctx, i, q);
+    }
+    for (int b = 0; b < cfg->num_blocks; b++) {
+      for (IRPhiNode *phi = ssa->block_phis[b]; phi; phi = phi->next) {
+        for (int pi = 0; pi < phi->num_operands; pi++) {
+          IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, phi->operands[pi].vreg);
+          if (vi)
+            ssa_opt_add_use_phi(vi, b, pi);
+        }
+      }
+    }
     changes += dce_temp_worklist(ctx);
+  }
 
 #undef BM_SET
 #undef BM_TEST
@@ -1119,53 +1185,37 @@ int ssa_opt_dce(IRSSAOptCtx *ctx)
     changes += dce_dead_overwrite_stores(ctx);
     changes += dce_dead_stackloc_stores(ctx);
     if (changes) {
-      /* Repair stale TEMP use counts: some passes NOP instructions
-       * without fully updating the use-def chains.  Rebuild accurate
-       * counts in O(n) so the final temp worklist can cascade. */
+      /* Repair stale TEMP use chains: some passes NOP or rewrite
+       * instructions without fully updating the use-def chains.  Rebuild
+       * the FULL use lists in O(n), not just the counts — truncating
+       * use_count while keeping the old uses[] entries desynchronizes the
+       * two, so the surviving prefix can hold a stale entry while a live
+       * use falls off the end.  A later replace_all_uses then walks the
+       * wrong list, leaves the live use un-rewritten, and this DCE deletes
+       * a def that is still referenced (ptr fuzz seed 7226: *p9's pointer
+       * temp lost its deref use and the deref read an undefined vreg). */
       for (int p = 0; p < ctx->vinfo_cap; p++)
         ctx->vinfo[p].use_count = 0;
       for (int i = 0; i < ctx->ir->next_instruction_index; i++) {
         IRQuadCompact *q = &ctx->ir->compact_instructions[i];
         if (q->op == TCCIR_OP_NOP)
           continue;
-        if (irop_config[q->op].has_src1) {
-          IRSSAVregInfo *vi = ssa_opt_vinfo(ctx,
-              irop_get_vreg(tcc_ir_op_get_src1(ctx->ir, q)));
-          if (vi) vi->use_count++;
-        }
-        if (irop_config[q->op].has_src2) {
-          IRSSAVregInfo *vi = ssa_opt_vinfo(ctx,
-              irop_get_vreg(tcc_ir_op_get_src2(ctx->ir, q)));
-          if (vi) vi->use_count++;
-        }
-        if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
-            q->op == TCCIR_OP_STORE_POSTINC) {
-          IROperand d = tcc_ir_op_get_dest(ctx->ir, q);
-          /* STORE with non-lval VREG dest is a value def, not a memory
-           * write — dest is not a use.  See ssa_opt_scan_instr_uses. */
-          if (q->op != TCCIR_OP_STORE || d.is_lval) {
-            IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(d));
-            if (vi) vi->use_count++;
-          }
-        }
-        if (q->op == TCCIR_OP_MLA) {
-          IRSSAVregInfo *vi = ssa_opt_vinfo(ctx,
-              irop_get_vreg(tcc_ir_op_get_accum(ctx->ir, q)));
-          if (vi) vi->use_count++;
-        }
+        ssa_opt_scan_instr_uses(ctx, i, q);
       }
-      /* Count phi operand uses */
+      /* Rebuild phi operand uses */
       for (int b = 0; b < ctx->cfg->num_blocks; b++) {
         for (IRPhiNode *phi = ctx->ssa->block_phis[b]; phi; phi = phi->next) {
           for (int pi = 0; pi < phi->num_operands; pi++) {
             IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, phi->operands[pi].vreg);
-            if (vi) vi->use_count++;
+            if (vi)
+              ssa_opt_add_use_phi(vi, b, pi);
           }
         }
       }
       changes += dce_temp_worklist(ctx);
     }
-    changes += dce_dead_phi_cycles(ctx);
+    if (!tcc_ir_opt_pass_disabled("ssa:dce:phi_cycles"))
+      changes += dce_dead_phi_cycles(ctx);
   }
 
   return changes;

@@ -6,13 +6,13 @@
 
 | Layer | Count | Fraction |
 |---|---|---|
-| Covered by unit suite | 56 | 40.3% |
+| Covered by unit suite | 68 | 48.9% |
 | Covered by backend unit suite | 3 | 2.2% |
 | Covered by linker pytest harness | 3 | 2.2% |
 | Covered by debug-info pytest harness | 2 | 1.4% |
 | Runtime library (exercised by compiled programs) | 23 | 16.5% |
 | Covered by runtime-library unit suite | 14 | 10.1% |
-| Covered by self-host bootstrap gate | 38 | 27.3% |
+| Covered by self-host bootstrap gate | 26 | 18.7% |
 | **Total tracked files** | **139** | **100%** |
 
 ## Covered by unit suite
@@ -51,18 +51,30 @@
 | `ir/core.c` | tests/unit/arm/armv8m/test_ir_core.c | — |
 | `ir/dump.c` | tests/unit/arm/armv8m/test_ir_dump.c | — |
 | `ir/licm.c` | tests/unit/arm/armv8m/test_opt_licm.c | — |
+| `ir/opt_alias.c` | tests/unit/arm/armv8m/test_opt_alias.c | — |
 | `ir/opt_bitfield.c` | tests/unit/arm/armv8m/test_opt_bitfield.c | — |
+| `ir/opt_branch.c` | tests/unit/arm/armv8m/test_opt_branch_fold.c, tests/unit/arm/armv8m/test_opt_branch_cascade.c | — |
 | `ir/opt_cmp_fuse.c` | tests/unit/arm/armv8m/test_opt_cmp_fuse.c | — |
 | `ir/opt_const_aggregate.c` | tests/unit/arm/armv8m/test_opt_const_aggregate.c | — |
 | `ir/opt_constfold.c` | tests/unit/arm/armv8m/test_opt_constfold.c | — |
 | `ir/opt_constprop.c` | tests/unit/arm/armv8m/test_opt_constprop.c | — |
 | `ir/opt_copyprop.c` | tests/unit/arm/armv8m/test_opt_copyprop.c | — |
+| `ir/opt_dce.c` | tests/unit/arm/armv8m/test_opt_dce.c | — |
 | `ir/opt_dead_lea_store.c` | tests/unit/arm/armv8m/test_opt_dead_lea_store.c | — |
 | `ir/opt_dead_vla.c` | tests/unit/arm/armv8m/test_opt_dead_vla.c | — |
+| `ir/opt_du.c` | tests/unit/arm/armv8m/test_opt_du.c | — |
+| `ir/opt_fusion.c` | tests/unit/arm/armv8m/test_opt_fusion.c | — |
+| `ir/opt_gens_bool.c` | tests/unit/arm/armv8m/test_opt_fusion.c | — |
+| `ir/opt_gens_branch.c` | tests/unit/arm/armv8m/test_opt_branch_cascade.c | — |
+| `ir/opt_gens_fusion.c` | tests/unit/arm/armv8m/test_opt_fusion.c | — |
 | `ir/opt_jump_thread.c` | tests/unit/arm/armv8m/test_opt_jump_thread.c | — |
 | `ir/opt_knownbits.c` | tests/unit/arm/armv8m/test_opt_knownbits.c | — |
 | `ir/opt_loop_dead.c` | tests/unit/arm/armv8m/test_opt_loop_dead.c | — |
+| `ir/opt_loop_utils.c` | tests/unit/arm/armv8m/test_opt_loop_utils.c | — |
+| `ir/opt_memory.c` | tests/unit/arm/armv8m/test_opt_memory.c | — |
 | `ir/opt_neg_chain.c` | tests/unit/arm/armv8m/test_opt_neg_chain.c | — |
+| `ir/opt_pipeline.c` | tests/unit/arm/armv8m/test_opt_fusion.c, tests/unit/arm/armv8m/test_opt_pipeline_orchestration.c | gens_*_ex adapter wrappers (test_opt_fusion.c) plus the orchestration driver itself -- tcc_ir_opt_run_group/run_pipeline/get_pipeline/run_default/gen_pass_adapter, exercised via locally-defined IRPassGroup/IROptPass tables in test_opt_pipeline_orchestration.c since the real propagation_passes[]/memory_passes[]/etc. arrays are file-static; the 5 static compound-cascade wrappers (esp_cleanup, branch_fold_2x, const_cascade, kb_cascade, branch_cleanup) remain golden-IR-only (tests/ir_tests/golden/), not unit-testable |
+| `ir/opt_promote.c` | tests/unit/arm/armv8m/test_opt_branch_cascade.c, tests/unit/arm/armv8m/test_opt_var_to_tmp.c, tests/unit/arm/armv8m/test_opt_promote_extra.c | var_tmp_fwd is covered by test_opt_branch_cascade.c, var_to_tmp by test_opt_var_to_tmp.c; redundant_loop_check/setif_neg_to_select/select/postinc_assign_fold/returnvalue_merge/backedge_phi_hoist/post_ra_forward_diamond/abort_tail_merge are covered by test_opt_promote_extra.c |
 | `ir/opt_reroll.c` | tests/unit/arm/armv8m/test_opt_reroll.c | — |
 | `ir/opt_setif_or_taut.c` | tests/unit/arm/armv8m/test_opt_setif_or_taut.c | — |
 | `ir/opt_xform.c` | tests/unit/arm/armv8m/test_opt_xform.c | — |
@@ -161,24 +173,12 @@
 | `arm-thumb-scratch.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
 | `ir/cfg.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
 | `ir/opt.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_alias.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_branch.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_dce.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_du.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
 | `ir/opt_engine.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_fusion.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_gens_bool.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_gens_branch.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
 | `ir/opt_gens_call_result.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_gens_fusion.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
 | `ir/opt_hash.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
 | `ir/opt_loop.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
 | `ir/opt_loop_const_sim.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_loop_utils.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_memory.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
 | `ir/opt_pack64.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_pipeline.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
-| `ir/opt_promote.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
 | `ir/opt_switch_data.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
 | `ir/opt_utils.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |
 | `libtcc.c` | tests/selfhost/test_selfhost_compile.py | compile-only self-host smoke gate |

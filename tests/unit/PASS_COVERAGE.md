@@ -523,3 +523,201 @@ and assert the correct fold; `make ut` green. Finding **#15** (7 `-O1`/`-O2` ran
   (`tcc_ir_opt_ctx_init`/`_free` + a way to invoke a single `IROptGen` over hand-built IR). Phase F follow-up.
 - **Legacy↔SSA equivalence harness**: run the old legacy optimizer path and the new SSA path over a `.c` corpus
   and diff results — a pytest/QEMU integration-level effort, not a host IR-builder unit test.
+
+
+<!-- BEGIN AUTO PASS COVERAGE -->
+## propagation passes (26 registered)
+
+| Pass | Covered by | Status |
+|---|---|---|
+| `add_reassoc` | unit: test_metamorphic.c | ✅ covered |
+| `branch_fold` | unit: test_opt_branch_fold.c | ✅ covered |
+| `cmp_expr_fold` | unit: test_opt_cmpfold.c | ✅ covered |
+| `cmp_offset_fold` | unit: test_opt_cmpfold.c | ✅ covered |
+| `const_agg_fold` | unit: test_opt_const_aggregate.c | ✅ covered |
+| `const_prop` | unit: test_metamorphic.c, test_opt_constprop.c | ✅ covered |
+| `const_prop_tmp` | unit: test_metamorphic.c, test_opt_constprop.c | ✅ covered |
+| `const_var_prop` | unit: test_metamorphic.c, test_opt_constprop.c | ✅ covered |
+| `deref_fwd` | unit: test_opt_deref_fwd.c | ✅ covered |
+| `float_branch` | unit: test_opt_float_branch.c | ✅ covered |
+| `float_narrow` | unit: test_opt_constfold.c | ✅ covered |
+| `global_init` | unit: test_opt_constprop.c | ✅ covered |
+| `global_sl_fwd` | unit: test_opt_global_sl_fwd.c | ✅ covered |
+| `known_bits` | unit: test_metamorphic.c, test_opt_knownbits.c | ✅ covered |
+| `neg_chain_cse` | unit: test_metamorphic.c, test_opt_neg_chain.c | ✅ covered |
+| `self_arith` | unit: test_metamorphic.c | ✅ covered |
+| `self_copy_elim` | unit: test_opt_constfold.c | ✅ covered |
+| `single_val_tmp` | unit: test_metamorphic.c | ✅ covered |
+| `string_calls` | unit: test_opt_constfold.c | ✅ covered |
+| `switch_collapse` | unit: test_opt_switch_collapse.c | ✅ covered |
+| `symref_prop` | unit: test_opt_constprop.c | ✅ covered |
+| `uninit_dom_ret` | unit: test_opt_uninit.c | ✅ covered |
+| `uninit_ub` | unit: test_opt_uninit.c | ✅ covered |
+| `value_tracking` | unit: test_opt_constprop.c | ✅ covered |
+| `var_to_tmp` | unit: test_opt_var_to_tmp.c | ✅ covered |
+| `vrp` | unit: test_opt_vrp.c | ✅ covered |
+
+## fusion passes (8 registered)
+
+| Pass | Covered by | Status |
+|---|---|---|
+| `bool_simplify` | unit: test_opt_fusion.c | ✅ covered |
+| `chain_fold` | unit: test_opt_fusion.c | ✅ covered |
+| `copy_prop` | unit: test_metamorphic.c, test_opt_copyprop.c | ✅ covered |
+| `deref_indexed` | unit: test_opt_fusion.c | ✅ covered |
+| `disp_fusion` | unit: test_opt_fusion.c | ✅ covered |
+| `fusion_mla` | unit: test_opt_fusion.c | ✅ covered |
+| `pair_reorder` | unit: test_opt_fusion.c | ✅ covered |
+| `postinc` | unit: test_opt_fusion.c | ✅ covered |
+
+## memory passes (15 registered)
+
+| Pass | Covered by | Status |
+|---|---|---|
+| `bf_insert_extract` | unit: test_opt_bitfield.c | ✅ covered |
+| `branch_fold_2x` | golden: double_constant_diamond.c, double_constant_diamond.expected | ✅ covered |
+| `cmp_field_fuse` | unit: test_opt_cmp_fuse.c | ✅ covered |
+| `const_cascade` | golden: post_forward_arith_chain.c, post_forward_arith_chain.expected | ✅ covered |
+| `dce` | unit: test_opt_dce.c | ✅ covered |
+| `elim_fallthru` | unit: test_opt_jump_thread.c | ✅ covered |
+| `jump_thread` | unit: test_opt_jump_thread.c | ✅ covered |
+| `kb_cascade` | golden: mask_shift_branch_fold.c, mask_shift_branch_fold.expected | ✅ covered |
+| `or_bool` | unit: test_opt_branch_cascade.c | ✅ covered |
+| `setif_fuse` | unit: test_opt_branch_cascade.c | ✅ covered |
+| `setif_or_taut` | unit: test_opt_setif_or_taut.c | ✅ covered |
+| `sl_forward` | unit: test_opt_memory.c | ✅ covered |
+| `stack_bool` | unit: test_opt_branch_cascade.c | ✅ covered |
+| `stack_nonnull` | unit: test_opt_branch_cascade.c | ✅ covered |
+| `var_tmp_fwd` | unit: test_opt_branch_cascade.c | ✅ covered |
+
+## late_cleanup passes (23 registered)
+
+| Pass | Covered by | Status |
+|---|---|---|
+| `alloca_load_fwd` | unit: test_opt_dead_vla.c | ✅ covered |
+| `branch_cleanup` | golden: dead_ternary_diamond.c, dead_ternary_diamond.expected | ✅ covered |
+| `byte_store_merge` | unit: test_opt_store_fwd.c | ✅ covered |
+| `dead_addrvar` | unit: test_opt_dead_store.c | ✅ covered |
+| `dead_alloca_vreg` | unit: test_opt_dead_vla.c | ✅ covered |
+| `dead_lea_store` | unit: test_opt_dead_lea_store.c | ✅ covered |
+| `dead_local_slot` | unit: test_opt_store_fwd.c | ✅ covered |
+| `dead_pre_inf` | unit: test_opt_dead_store.c | ✅ covered |
+| `dead_static_store` | unit: test_opt_store_fwd.c | ✅ covered |
+| `dead_temp_local` | unit: test_opt_store_fwd.c | ✅ covered |
+| `dead_trail_addrvar` | unit: test_opt_dead_store.c | ✅ covered |
+| `dead_var_store` | unit: test_opt_dead_store.c | ✅ covered |
+| `dead_vla_struct` | unit: test_opt_dead_vla.c | ✅ covered |
+| `dse` | unit: test_opt_dead_store.c | ✅ covered |
+| `global_base_share` | unit: test_opt_store_fwd.c | ✅ covered |
+| `inf_loop_simpl` | unit: test_opt_dead_store.c | ✅ covered |
+| `inplace_arith` | unit: test_opt_xform.c | ✅ covered |
+| `nonneg_fold` | unit: test_opt_nonneg_fold.c | ✅ covered |
+| `orphan_cmp` | unit: test_opt_orphan_cmp.c | ✅ covered |
+| `redundant_assign` | unit: test_opt_redundant_assign.c | ✅ covered |
+| `return_reuse` | unit: test_opt_return_reuse.c | ✅ covered |
+| `store_redundant` | unit: test_opt_store_fwd.c | ✅ covered |
+| `zero_vla` | unit: test_opt_dead_store.c | ✅ covered |
+
+## entry_store passes (2 registered)
+
+| Pass | Covered by | Status |
+|---|---|---|
+| `entry_store` | unit: test_opt_store_fwd.c | ✅ covered |
+| `esp_cleanup` | golden: inlined_struct_field_check.c, inlined_struct_field_check.expected | ✅ covered |
+
+## ssa passes (15 registered)
+
+| Pass | Covered by | Status |
+|---|---|---|
+| `ssa:branch` | golden: branch_fold.c, branch_fold.expected | ✅ covered |
+| `ssa:cmp_eq_prop` | golden: simple.c, simple.expected | ✅ covered |
+| `ssa:cprop` | golden: copy_chain.c, copy_chain.expected | ✅ covered |
+| `ssa:dce` | golden: simple.c, simple.expected | ✅ covered |
+| `ssa:dead_loop` | golden: simple.c, simple.expected | ✅ covered |
+| `ssa:fold` | golden: fold_add.c, fold_add.expected | ✅ covered |
+| `ssa:gvn` | golden: common_expr.c, common_expr.expected | ✅ covered |
+| `ssa:load_cse` | golden: repeated_load.c, repeated_load.expected | ✅ covered |
+| `ssa:narrow` | golden: narrow_add.c, narrow_add.expected | ✅ covered |
+| `ssa:phi_simplify` | golden: simple.c, simple.expected | ✅ covered |
+| `ssa:reassoc` | golden: simple.c, simple.expected | ✅ covered |
+| `ssa:sccp` | golden: sccp_loop.c, sccp_loop.expected | ✅ covered |
+| `ssa:strength` | golden: simple.c, simple.expected | ✅ covered |
+| `ssa:var_const_fold` | golden: simple.c, simple.expected | ✅ covered |
+| `ssa:var_to_param_forward` | golden: simple.c, simple.expected | ✅ covered |
+
+**Total:** 89/89 registered passes covered (100.0%).
+
+## Alias-normalized coverage markers
+
+The following marker names do not match a registered pass name exactly;
+they were mapped to registered names via the alias table. Consider aligning
+the UT_COVERS markers to the registered names over time.
+
+| Marker | Resolved to |
+|---|---|
+| `bitfield_insert_extract` | `bf_insert_extract` |
+| `bitfield_insert_to_bfi` | `bf_insert_extract` |
+| `bool_cse` | `copy_prop` |
+| `cmp_fold` | `cmp_expr_fold`, `cmp_offset_fold` |
+| `complex_const_param_fold` | `const_prop` |
+| `const_aggregate_fold` | `const_agg_fold` |
+| `const_call_replace` | `string_calls` |
+| `const_string_calls` | `string_calls` |
+| `cse_global_load` | `copy_prop` |
+| `cse_param_add` | `copy_prop` |
+| `dead_alloca_vreg_elim` | `dead_alloca_vreg` |
+| `dead_lea_store_elim` | `dead_lea_store` |
+| `dead_vla_struct_elim` | `dead_vla_struct` |
+| `eliminate_fallthrough` | `elim_fallthru` |
+| `float_narrowing` | `float_narrow` |
+| `global_init_prop` | `global_init` |
+| `globalsym_cse` | `copy_prop` |
+| `jump_threading` | `jump_thread` |
+| `local_addrof_const_fold` | `string_calls` |
+| `local_alu_cse` | `copy_prop` |
+| `local_load_cse` | `copy_prop` |
+| `param_addrof_const_fold` | `string_calls` |
+| `self_arith_fold` | `self_arith` |
+| `setif_or_tautology` | `setif_or_taut` |
+| `single_value_tmp` | `single_val_tmp` |
+| `store_inplace_arith` | `inplace_arith` |
+| `switch_call_replace` | `string_calls` |
+| `symref_const_prop` | `symref_prop` |
+
+## Orphaned coverage markers
+
+These markers do not match any registered pass name or known alias;
+they may cover internal helpers or be stale.
+
+- `bool_norm_elim` in test_opt_bool_norm.c
+- `cmp_setif_cse` in test_opt_cmp_cse.c
+- `compute_func_write_summary` in test_opt_dead_init_call.c
+- `compute_trip_count` in test_opt_loop_utils.c
+- `dead_init_via_call` in test_opt_dead_init_call.c
+- `find_defining_instruction` in test_opt_helpers.c
+- `find_deref_use_operand` in test_opt_alias.c
+- `find_induction_vars_ex` in test_opt_loop_utils.c
+- `find_loop_exit_condition` in test_opt_loop_utils.c
+- `ir_opt_build_def_count` in test_opt_du.c
+- `ir_opt_du_build_mode` in test_opt_du.c
+- `ir_opt_du_idx` in test_opt_du.c
+- `ir_opt_stack_slot_range_for_offset` in test_opt_alias.c
+- `ir_opt_store_btype_size_bytes` in test_opt_alias.c
+- `is_stack_address_operand` in test_opt_alias.c
+- `licm` in test_opt_licm.c
+- `loop_dead_first_iter` in test_opt_loop_dead.c
+- `memmove_to_indexed_stores` in test_opt_memmove.c
+- `operand_references_slot` in test_opt_alias.c
+- `reroll` in test_opt_reroll.c
+- `signed_to_unsigned_cond` in test_opt_loop_utils.c
+- `small_global_memset_to_store` in test_opt_memset_fold.c
+- `small_memset_to_store` in test_opt_memset_fold.c
+- `stack_addr_cse` in test_opt_stack_addr_cse.c
+- `stackoff_same_slot` in test_opt_alias.c
+- `tcc_ir_stack_frame_size` in test_ir_stack_extra.c
+- `tcc_ir_stack_reg_assign` in test_ir_stack_extra.c
+- `try_unroll_loop_ex` in test_opt_loop_utils.c
+- `vreg_has_single_use` in test_opt_helpers.c
+- `block_copy_init` golden dir with 2 case(s)
+
+<!-- END AUTO PASS COVERAGE -->

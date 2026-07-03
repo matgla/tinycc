@@ -1425,6 +1425,15 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
       if (amount < 0 || amount > 31)
         continue;
 
+      /* A zero-amount right shift/rotate is an identity in the IR (x >> 0 == x),
+       * but ARM's barrel shifter encodes an immediate field of 0 for LSR/ASR as
+       * shift-by-32 (yielding 0 / sign-extend) and for ROR as RRX — NOT the
+       * shift-by-0 we mean.  Only LSL #0 (stype 1) is a true no-op operand, so
+       * refuse to fuse `x SHR/SAR/ROR #0`; leave the standalone shift for the
+       * backend's shift-by-0 identity fold (arm-thumb-gen.c) to lower as MOV. */
+      if (amount == 0 && stype != 1)
+        continue;
+
       IROperand shift_src1 = tcc_ir_op_get_src1(ir, sq);
       if (!irop_has_vreg(shift_src1))
         continue;

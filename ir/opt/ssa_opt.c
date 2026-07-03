@@ -79,7 +79,7 @@ static void ssa_opt_record_use(IRSSAOptCtx *ctx, int32_t vreg, int instr_idx)
     ssa_opt_add_use_instr(vi, instr_idx);
 }
 
-static void ssa_opt_scan_instr_uses(IRSSAOptCtx *ctx, int i, IRQuadCompact *q)
+void ssa_opt_scan_instr_uses(IRSSAOptCtx *ctx, int i, IRQuadCompact *q)
 {
   TCCIRState *ir = ctx->ir;
 

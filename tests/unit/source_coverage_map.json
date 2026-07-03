@@ -338,10 +338,11 @@
     ]
   },
   "ir/opt_branch.c": {
-    "kind": "selfhost",
-    "note": "compile-only self-host smoke gate",
+    "kind": "unit",
+    "note": "",
     "via": [
-      "tests/selfhost/test_selfhost_compile.py"
+      "tests/unit/arm/armv8m/test_opt_branch_fold.c",
+      "tests/unit/arm/armv8m/test_opt_branch_cascade.c"
     ]
   },
   "ir/opt_cmp_fuse.c": {
@@ -422,17 +423,17 @@
     ]
   },
   "ir/opt_gens_bool.c": {
-    "kind": "selfhost",
-    "note": "compile-only self-host smoke gate",
+    "kind": "unit",
+    "note": "",
     "via": [
-      "tests/selfhost/test_selfhost_compile.py"
+      "tests/unit/arm/armv8m/test_opt_fusion.c"
     ]
   },
   "ir/opt_gens_branch.c": {
-    "kind": "selfhost",
-    "note": "compile-only self-host smoke gate",
+    "kind": "unit",
+    "note": "",
     "via": [
-      "tests/selfhost/test_selfhost_compile.py"
+      "tests/unit/arm/armv8m/test_opt_branch_cascade.c"
     ]
   },
   "ir/opt_gens_call_result.c": {
@@ -443,10 +444,10 @@
     ]
   },
   "ir/opt_gens_fusion.c": {
-    "kind": "selfhost",
-    "note": "compile-only self-host smoke gate",
+    "kind": "unit",
+    "note": "",
     "via": [
-      "tests/selfhost/test_selfhost_compile.py"
+      "tests/unit/arm/armv8m/test_opt_fusion.c"
     ]
   },
   "ir/opt_hash.c": {
@@ -520,17 +521,20 @@
     ]
   },
   "ir/opt_pipeline.c": {
-    "kind": "selfhost",
-    "note": "compile-only self-host smoke gate",
+    "kind": "unit",
+    "note": "gens_*_ex adapter wrappers (test_opt_fusion.c) plus the orchestration driver itself -- tcc_ir_opt_run_group/run_pipeline/get_pipeline/run_default/gen_pass_adapter, exercised via locally-defined IRPassGroup/IROptPass tables in test_opt_pipeline_orchestration.c since the real propagation_passes[]/memory_passes[]/etc. arrays are file-static; the 5 static compound-cascade wrappers (esp_cleanup, branch_fold_2x, const_cascade, kb_cascade, branch_cleanup) remain golden-IR-only (tests/ir_tests/golden/), not unit-testable",
     "via": [
-      "tests/selfhost/test_selfhost_compile.py"
+      "tests/unit/arm/armv8m/test_opt_fusion.c",
+      "tests/unit/arm/armv8m/test_opt_pipeline_orchestration.c"
     ]
   },
   "ir/opt_promote.c": {
-    "kind": "selfhost",
-    "note": "compile-only self-host smoke gate",
+    "kind": "unit",
+    "note": "var_tmp_fwd is covered by test_opt_branch_cascade.c, var_to_tmp by test_opt_var_to_tmp.c; redundant_loop_check/setif_neg_to_select/select/postinc_assign_fold/returnvalue_merge/backedge_phi_hoist/post_ra_forward_diamond/abort_tail_merge are covered by test_opt_promote_extra.c",
     "via": [
-      "tests/selfhost/test_selfhost_compile.py"
+      "tests/unit/arm/armv8m/test_opt_branch_cascade.c",
+      "tests/unit/arm/armv8m/test_opt_var_to_tmp.c",
+      "tests/unit/arm/armv8m/test_opt_promote_extra.c"
     ]
   },
   "ir/opt_reroll.c": {
@@ -886,23 +890,26 @@
     ]
   },
   "tcc.c": {
-    "kind": "selfhost",
-    "note": "compile-only self-host smoke gate",
+    "kind": "unit",
+    "note": "isolated driver helpers via #include in tests/unit/arm/armv8m/test_tcc.c",
     "via": [
+      "tests/unit/arm/armv8m/test_tcc.c",
       "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "tccasm.c": {
-    "kind": "selfhost",
-    "note": "compile-only self-host smoke gate",
+    "kind": "unit",
+    "note": "isolated assembler helpers via #include in tests/unit/arm/armv8m/test_tccasm.c",
     "via": [
+      "tests/unit/arm/armv8m/test_tccasm.c",
       "tests/selfhost/test_selfhost_compile.py"
     ]
   },
   "tccdbg.c": {
-    "kind": "debug",
-    "note": "",
+    "kind": "unit",
+    "note": "isolated DWARF helper routines via #include in tests/unit/arm/armv8m/test_tccdbg.c; debug-output tests remain in tests/debug/test_debug.py",
     "via": [
+      "tests/unit/arm/armv8m/test_tccdbg.c",
       "tests/debug/test_debug.py"
     ]
   },
@@ -914,9 +921,10 @@
     ]
   },
   "tccelf.c": {
-    "kind": "linker",
-    "note": "",
+    "kind": "unit",
+    "note": "isolated ELF/Section helpers in build_tccelf/run_unit_tests_tccelf; linker tests remain in tests/linker/test_linker.py",
     "via": [
+      "tests/unit/arm/armv8m/test_tccelf.c",
       "tests/linker/test_linker.py"
     ]
   },
@@ -963,9 +971,10 @@
     ]
   },
   "tccpp.c": {
-    "kind": "selfhost",
-    "note": "compile-only self-host smoke gate",
+    "kind": "unit",
+    "note": "isolated preprocessor/CString helpers in build_tccpp/run_unit_tests_tccpp",
     "via": [
+      "tests/unit/arm/armv8m/test_tccpp.c",
       "tests/selfhost/test_selfhost_compile.py"
     ]
   },
@@ -977,9 +986,10 @@
     ]
   },
   "tccyaff.c": {
-    "kind": "linker",
-    "note": "YAFF output only enabled for TCC_TARGET_YASOS builds; host cross compiler skips YAFF case",
+    "kind": "unit",
+    "note": "isolated YAFF helpers in build_tccyaff/run_unit_tests_tccyaff; YAFF output is only enabled for TCC_TARGET_YASOS builds",
     "via": [
+      "tests/unit/arm/armv8m/test_tccyaff.c",
       "tests/linker/test_linker.py"
     ]
   }

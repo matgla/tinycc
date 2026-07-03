@@ -246,6 +246,16 @@ static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int
     if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
 
+    /* Do not value-number 64-bit results.  Replacing a 64-bit computation with
+     * an ASSIGN copy of a congruent earlier one is value-correct, but the extra
+     * register-pair copy is mishandled downstream — the copied high word is
+     * dropped, so a later `>> 32` reads 0 (longlong seed 686: loop-unroll makes
+     * the 5 copies of `q11 = q12 | const` congruent; GVN turns them into copies
+     * of one T86 and the SHR#32 that extracts q11's high word then yields 0).
+     * 64-bit CSE is rare; decline it rather than emit a truncating copy. */
+    if (irop_is_64bit(dest))
+      continue;
+
     IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, dest_vr);
     if (vi && vi->def_count > 1)
       continue;

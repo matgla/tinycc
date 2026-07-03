@@ -1,0 +1,41 @@
+name: metrics
+
+on:
+  push:
+    branches: [mob]
+  pull_request:
+    branches: [mob]
+  workflow_dispatch:
+
+concurrency:
+  group: metrics-rpi5
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: [self-hosted, rpi5, pimoroni_pico_plus2]
+    timeout-minutes: 90
+    env:
+      METRICS_DB: /var/lib/tcc-metrics/metrics.db
+      PERF_HOST: 127.0.0.1
+      PERF_IDENTITY: /home/runner/.ssh/id_rp
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Build tcc in place
+        run: ./configure --enable-cross --enable-O2 --debug && make cross -j$(nproc)
+
+      - name: Record metrics
+        run: |
+          python3 metrics/record.py --db "$METRICS_DB" --rev HEAD --no-correctness \
+              --jobs "$(nproc)" --trigger "${{ github.event_name }}" \
+              --perf-host "$PERF_HOST" --perf-identity "$PERF_IDENTITY"
+
+      - name: Gate
+        if: ${{ vars.METRICS_GATE_ENABLED == 'true' }}
+        run: python3 metrics/gate.py --db "$METRICS_DB" --rev HEAD --strict

@@ -1120,12 +1120,16 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
    *    and tcc_ls_find_free_scratch_reg). */
   ls_iv->r0 = (int16_t)new_r;
 
-  /* 3. Patch live_regs_by_instruction for the interval's full range. */
+  /* 3. Patch live_regs_by_instruction for the interval's full range.
+   * r's bit may be shared with another interval that move-coalescing put on
+   * the same register (in-place two-address ops) — only clear positions
+   * where no other claimant is still live. */
   if (ls->live_regs_by_instruction)
   {
     for (int j = (int)ls_iv->start; j <= (int)ls_iv->end && j < ls->live_regs_by_instruction_size; j++)
     {
-      ls->live_regs_by_instruction[j] &= ~(1u << r);
+      if (!tcc_ls_reg_held_by_other(ls, r, j, ls_iv))
+        ls->live_regs_by_instruction[j] &= ~(1u << r);
       ls->live_regs_by_instruction[j] |= (1u << new_r);
     }
   }
@@ -1601,6 +1605,34 @@ static inline void ir_codegen_track_scratch(int is_dry_run, int i, TccIrOp op, i
     ir_codegen_check_scratch(i, op, dry_insn_scratch, dry_insn_saves);
 }
 
+/* Find the next non-NOP instruction after `i`, for peepholes that fuse `i` with
+ * a later partner (STRD/LDRD spill pairs, MLAL, spill block copy) and advance
+ * the loop counter past the gap.  Returns -1 when there is none, OR when a
+ * skipped NOP between `i` and the partner is a branch target: fusing `i` and
+ * the partner into a single instruction is illegal if a branch can land on that
+ * NOP, because the partner would then be reachable without executing `i` (and
+ * vice-versa).  This is the ternary-merge case where both arms store to
+ * adjacent spill slots — the merge NOP sits between the true-arm store and the
+ * post-merge store (signed fuzz seed 2987, O0 HardFault: the fused STRD landed
+ * on the true-arm path only, so the false arm both mis-stored and left the
+ * merge label with no code address -> `b.w 0`).  branch_target_reset[] catches
+ * targets that the is_jump_target bit misses at -O0. */
+static int ir_codegen_next_nonnop_no_label(TCCIRState *ir, const uint8_t *branch_target_reset, int i)
+{
+  for (int j = i + 1; j < ir->next_instruction_index; j++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op == TCCIR_OP_NOP)
+    {
+      if (q->is_jump_target || (branch_target_reset && branch_target_reset[j]))
+        return -1;
+      continue;
+    }
+    return j;
+  }
+  return -1;
+}
+
 static int ir_codegen_count_vreg_uses(TCCIRState *ir, int32_t vreg)
 {
   if (vreg < 0)
@@ -1754,8 +1786,18 @@ static inline MopArgs ir_decode_cached(int is_dry_run, int use_mop_cache, MopArg
                                        IRQuadCompact *cq, const IROperand *src1_ir, const IROperand *src2_ir,
                                        const IROperand *dest_ir, MopSpec spec)
 {
-  /* Real-run cache hit: scale/accum not needed, cache is valid. */
-  if (!is_dry_run && use_mop_cache && !spec.scale && !spec.accum)
+  /* Real-run cache hit: replay the dry-run decode.  This must cover ALL
+   * specs, including scale/accum (LOAD_INDEXED/STORE_INDEXED/MLA): the
+   * decode-time peepholes (ir_codegen_before_ret_peephole) PATCH interval
+   * allocations, and those patches persist from the dry-run into the
+   * real-run.  A fresh real-run decode can therefore make a peephole
+   * decision the dry-run did not — e.g. a LOAD_INDEXED whose following
+   * ASSIGN's dest was only retargeted to a register later in the dry-run
+   * fires the coalesce peephole in the real-run only, retargeting the load
+   * while every cached consumer still reads the source's pre-patch register
+   * (ptr fuzz seed 30436: `ldr r8, [...]` immediately clobbered by the
+   * stale-cache copy `mov r8, ip`). */
+  if (!is_dry_run && use_mop_cache)
   {
     MopArgs cached = mop_cache[i];
     /* A peephole that skips an instruction (i = next_i; break) can fire in the
@@ -1775,9 +1817,8 @@ static inline MopArgs ir_decode_cached(int is_dry_run, int use_mop_cache, MopArg
 
   MopArgs a = decode_mop_args(ir, cq, src1_ir, src2_ir, dest_ir, i, spec);
 
-  /* Dry-run: store decoded dest/src1/src2 for reuse, unless scale/accum are
-   * involved (those instructions re-decode cheaply in the real-run). */
-  if (is_dry_run && mop_cache && !spec.scale && !spec.accum)
+  /* Dry-run: store the decoded operands for real-run replay. */
+  if (is_dry_run && mop_cache)
     mop_cache[i] = a;
 
   return a;
@@ -1825,38 +1866,6 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   int *return_jump_addrs = tcc_malloc(sizeof(int) * ir->next_instruction_index);
   ir->codegen_return_jump_addrs = return_jump_addrs;
   int num_return_jumps = 0;
-
-  /* --- DEBUG: catch codegen-time corruption of a spilled temp's allocation.r0.
-   * The HW-only 90_struct c[1].y=5 bug: a temp that regalloc spilled
-   * (allocation.r0 == 0x3f) is overwritten to a register number during codegen,
-   * so machine_op_from_ir later reads it as "lives in R8". Snapshot now
-   * (post-regalloc) and report the first instruction at which any spilled temp
-   * flips to a register. --- */
-  static uint8_t *dbg_alloc_snap = NULL;
-  static int dbg_alloc_snap_n = 0;
-  static int dbg_alloc_active = 0;
-  static int dbg_alloc_reported = 0;
-  dbg_alloc_active = 0;
-  if (funcname && !strcmp((const char *)funcname, "test_init_struct_from_struct"))
-  {
-    dbg_alloc_snap_n = ir->temporary_variables_live_intervals_size;
-    dbg_alloc_snap = tcc_realloc(dbg_alloc_snap, (size_t)dbg_alloc_snap_n + 1);
-    for (int p = 0; p < dbg_alloc_snap_n; p++)
-      dbg_alloc_snap[p] = (uint8_t)ir->temporary_variables_live_intervals[p].allocation.r0;
-    dbg_alloc_active = 1;
-    dbg_alloc_reported = 0;
-    fprintf(stderr, "ALLOCSNAP n=%d\n", dbg_alloc_snap_n);
-    /* Snapshot the liveness bitmap at the printf-arg LEA indices at codegen
-     * START. Compare with the FSR trace (printed at the find_free call): if
-     * these are correct here but wrong at find_free, the bitmap is corrupted
-     * during codegen; if already wrong here, ra_build_live_regs_bitmap
-     * miscomputed it. */
-    uint32_t *lrb = ir->ls.live_regs_by_instruction;
-    int lrbn = ir->ls.live_regs_by_instruction_size;
-    fprintf(stderr, "LRBSNAP arr=%p sz=%d [70]=0x%x [72]=0x%x [75]=0x%x [80]=0x%x\n", (void *)lrb, lrbn,
-            (lrb && 70 < lrbn) ? lrb[70] : 0xDEADu, (lrb && 72 < lrbn) ? lrb[72] : 0xDEADu,
-            (lrb && 75 < lrbn) ? lrb[75] : 0xDEADu, (lrb && 80 < lrbn) ? lrb[80] : 0xDEADu);
-  }
 
   /* Clear spill cache at function start */
   tcc_ir_spill_cache_clear(&ir->spill_cache);
@@ -2430,27 +2439,6 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       /* Track current instruction for scratch register allocation */
       ir->codegen_instruction_idx = i;
 
-      /* DEBUG: report the first spilled temp whose allocation.r0 was overwritten
-       * to a register since codegen start (corruption happened at instr <= i-1,
-       * or in the dry-run pass if i is 0). */
-      if (dbg_alloc_active && !dbg_alloc_reported)
-      {
-        int lim = ir->temporary_variables_live_intervals_size;
-        if (lim > dbg_alloc_snap_n)
-          lim = dbg_alloc_snap_n;
-        for (int p = 0; p < lim; p++)
-        {
-          uint8_t now = (uint8_t)ir->temporary_variables_live_intervals[p].allocation.r0;
-          if (dbg_alloc_snap[p] == 0x3f && now != 0x3f)
-          {
-            fprintf(stderr, "ALLOCCORRUPT T%d r0 0x3f->0x%x by codegen idx<=%d (this op=%d)\n",
-                    p, now, i, (int)cq->op);
-            dbg_alloc_reported = 1;
-            break;
-          }
-        }
-      }
-
       /* Debug tracking: update current op for ot_check failure reporting */
       g_debug_current_op = (int)cq->op;
 
@@ -2545,11 +2533,16 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           }
           if (imm_op)
           {
-            int next_j = i + 1;
-            while (next_j < ir->next_instruction_index && ir->compact_instructions[next_j].op == TCCIR_OP_NOP)
-              next_j++;
-            if (next_j < ir->next_instruction_index && ir->compact_instructions[next_j].op == TCCIR_OP_ADD &&
-                !ir->compact_instructions[next_j].is_jump_target)
+            int next_j = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
+            /* The ADD may carry a barrel-shift side-table annotation
+             * (ir->barrel_shifts[orig_index], set by tcc_ir_barrel_shift_fusion):
+             * its src2 is then a value that must still be shifted when the ADD
+             * executes.  The fused emission below bypasses the annotated path
+             * entirely, silently dropping that shift, so skip the fusion. */
+            if (next_j >= 0 && ir->compact_instructions[next_j].op == TCCIR_OP_ADD &&
+                !ir->compact_instructions[next_j].is_jump_target &&
+                !(ir->barrel_shifts && ir->compact_instructions[next_j].orig_index >= 0 &&
+                  ir->barrel_shifts[ir->compact_instructions[next_j].orig_index]))
             {
               IRQuadCompact *nq = &ir->compact_instructions[next_j];
               IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
@@ -2694,10 +2687,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
          * accumulator pair maps directly to (S/U)MLAL. */
         if (a.dest.vreg >= 0 && ir_codegen_count_vreg_uses(ir, a.dest.vreg) == 1)
         {
-          int next_j = i + 1;
-          while (next_j < ir->next_instruction_index && ir->compact_instructions[next_j].op == TCCIR_OP_NOP)
-            next_j++;
-          if (next_j < ir->next_instruction_index && ir->compact_instructions[next_j].op == TCCIR_OP_ADD &&
+          int next_j = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
+          if (next_j >= 0 && ir->compact_instructions[next_j].op == TCCIR_OP_ADD &&
               !ir->compact_instructions[next_j].is_jump_target)
           {
             IRQuadCompact *nq = &ir->compact_instructions[next_j];
@@ -2727,10 +2718,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
             if (accum && accum->is_64bit && irop_get_vreg(n_dest_ir) >= 0)
             {
-              int store_j = next_j + 1;
-              while (store_j < ir->next_instruction_index && ir->compact_instructions[store_j].op == TCCIR_OP_NOP)
-                store_j++;
-              if (store_j < ir->next_instruction_index && ir->compact_instructions[store_j].op == TCCIR_OP_STORE &&
+              int store_j = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, next_j);
+              if (store_j >= 0 && ir->compact_instructions[store_j].op == TCCIR_OP_STORE &&
                   !ir->compact_instructions[store_j].is_jump_target)
               {
                 IRQuadCompact *sq = &ir->compact_instructions[store_j];
@@ -3028,15 +3017,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             (a.src1.u.spill.offset & 3) == 0)
         {
           int first_load_reg = a.dest.u.reg.r0;
-          int store_i = -1;
-          for (int j = i + 1; j < ir->next_instruction_index; j++)
-          {
-            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-            {
-              store_i = j;
-              break;
-            }
-          }
+          int store_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
           if (store_i >= 0 && ir->compact_instructions[store_i].op == TCCIR_OP_STORE &&
               !ir->compact_instructions[store_i].is_jump_target)
           {
@@ -3060,15 +3041,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
               while (count < 32)
               {
-                int next_load_i = -1;
-                for (int j = last_i + 1; j < ir->next_instruction_index; j++)
-                {
-                  if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-                  {
-                    next_load_i = j;
-                    break;
-                  }
-                }
+                int next_load_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, last_i);
                 if (next_load_i < 0 || ir->compact_instructions[next_load_i].op != TCCIR_OP_LOAD ||
                     ir->compact_instructions[next_load_i].is_jump_target)
                   break;
@@ -3089,15 +3062,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 if (la.dest.kind != MACH_OP_REG || la.dest.u.reg.r0 != first_load_reg)
                   break;
 
-                int next_store_i = -1;
-                for (int j = next_load_i + 1; j < ir->next_instruction_index; j++)
-                {
-                  if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-                  {
-                    next_store_i = j;
-                    break;
-                  }
-                }
+                int next_store_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, next_load_i);
                 if (next_store_i < 0 || ir->compact_instructions[next_store_i].op != TCCIR_OP_STORE ||
                     ir->compact_instructions[next_store_i].is_jump_target)
                   break;
@@ -3142,24 +3107,26 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
         /* STRD peephole: if this is a 32-bit store to a spill slot and the
          * very next non-NOP instruction is also a 32-bit store to an adjacent
-         * (+4) spill slot, emit STRD for both and skip the second. */
+         * (+4) spill slot, emit STRD for both and skip the second.
+         *
+         * The value operand (src1) must NOT be a deref: STORE's src1 can carry
+         * needs_deref, meaning "dereference this pointer register to obtain the
+         * value to store" (slot = *ptr).  Pairing such a store into STRD would
+         * feed the address register straight to try_strd_spill as if it were
+         * the value, silently dropping the required load. */
         if (a.dest.kind == MACH_OP_SPILL && !a.dest.needs_deref &&
-            a.src1.kind == MACH_OP_REG && !a.src1.is_64bit &&
+            a.src1.kind == MACH_OP_REG && !a.src1.is_64bit && !a.src1.needs_deref &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32) &&
             (a.dest.u.spill.offset & 3) == 0)
         {
           /* Find next non-NOP instruction */
-          int next_i = -1;
-          for (int j = i + 1; j < ir->next_instruction_index; j++)
-          {
-            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-            {
-              next_i = j;
-              break;
-            }
-          }
+          int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
+          /* is_jump_target misses some branch targets (see branch_target_reset);
+           * consuming a branch-target store removes the label's only emission
+           * point, so branches to it backpatch against code address 0. */
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE &&
-              !ir->compact_instructions[next_i].is_jump_target)
+              !ir->compact_instructions[next_i].is_jump_target &&
+              !(branch_target_reset && branch_target_reset[next_i]))
           {
             /* Decode the next store's operands */
             IRQuadCompact *nq = &ir->compact_instructions[next_i];
@@ -3171,7 +3138,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                                          (MopSpec){.dest = 1, .src1 = 2});
 
             if (b.dest.kind == MACH_OP_SPILL && !b.dest.needs_deref &&
-                b.src1.kind == MACH_OP_REG && !b.src1.is_64bit &&
+                b.src1.kind == MACH_OP_REG && !b.src1.is_64bit && !b.src1.needs_deref &&
                 (b.dest.btype == IROP_BTYPE_INT32 || b.dest.btype == IROP_BTYPE_FLOAT32) &&
                 (b.dest.u.spill.offset & 3) == 0)
             {
@@ -3180,18 +3147,18 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               int reg1 = a.src1.u.reg.r0;
               int reg2 = b.src1.u.reg.r0;
 
-              if (off1 + 4 == off2)
+              if (reg1 != reg2 && off1 + 4 == off2)
               {
-                if (tcc_gen_machine_try_strd_spill(reg1, reg2, off1, off2))
+                if (tcc_gen_machine_try_strd_spill(reg1, off1, reg2, off2))
                 {
                   /* Skip the next store — advance i past NOPs and the paired store */
                   i = next_i;
                   break;
                 }
               }
-              else if (off2 + 4 == off1)
+              else if (reg1 != reg2 && off2 + 4 == off1)
               {
-                if (tcc_gen_machine_try_strd_spill(reg2, reg1, off2, off1))
+                if (tcc_gen_machine_try_strd_spill(reg2, off2, reg1, off1))
                 {
                   i = next_i;
                   break;
@@ -3209,15 +3176,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32) &&
             (a.dest.u.spill.offset & 3) == 0)
         {
-          int next_i = -1;
-          for (int j = i + 1; j < ir->next_instruction_index; j++)
-          {
-            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-            {
-              next_i = j;
-              break;
-            }
-          }
+          int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE &&
               !ir->compact_instructions[next_i].is_jump_target)
           {
@@ -3265,18 +3224,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
          * STORE_INDEXED, but the off=0 store stays plain STORE — so the
          * existing STORE_INDEXED-only peephole misses the pair. */
         if (a.dest.kind == MACH_OP_REG && a.dest.needs_deref &&
-            a.src1.kind == MACH_OP_REG && !a.src1.is_64bit &&
+            a.src1.kind == MACH_OP_REG && !a.src1.is_64bit && !a.src1.needs_deref &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
-          int next_i = -1;
-          for (int j = i + 1; j < ir->next_instruction_index; j++)
-          {
-            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-            {
-              next_i = j;
-              break;
-            }
-          }
+          int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
           /* is_jump_target misses some branch targets (see branch_target_reset);
            * consuming a branch-target store removes the label's only emission
            * point, so branches to it backpatch against code address 0. */
@@ -3291,7 +3242,9 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, nq, &n_src1_ir, &n_src2_ir, &n_dest_ir,
                                          (MopSpec){.dest = 1, .src1 = 1, .src2 = 1, .scale = 1});
 
-            if (!b.src1.is_64bit && b.src1.kind == MACH_OP_REG &&
+            /* src1 is the value being stored; a deref there (value = *ptr) would
+             * feed the pointer register to try_strd_base as the value. */
+            if (!b.src1.is_64bit && b.src1.kind == MACH_OP_REG && !b.src1.needs_deref &&
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
@@ -3325,15 +3278,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.src1.kind == MACH_OP_IMM && !a.src1.is_64bit &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
-          int next_i = -1;
-          for (int j = i + 1; j < ir->next_instruction_index; j++)
-          {
-            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-            {
-              next_i = j;
-              break;
-            }
-          }
+          int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
           /* is_jump_target misses some branch targets (see branch_target_reset);
            * consuming a branch-target store removes the label's only emission
            * point, so branches to it backpatch against code address 0. */
@@ -3376,15 +3321,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.src1.kind == MACH_OP_REG && !a.src1.is_64bit &&
             (a.dest.u.spill.offset & 3) == 0)
         {
-          int next_i = -1;
-          for (int j = i + 1; j < ir->next_instruction_index; j++)
-          {
-            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-            {
-              next_i = j;
-              break;
-            }
-          }
+          int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_LOAD &&
               !ir->compact_instructions[next_i].is_jump_target)
           {
@@ -3427,15 +3364,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.src1.kind == MACH_OP_REG && !a.src1.needs_deref &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
-          int next_i = -1;
-          for (int j = i + 1; j < ir->next_instruction_index; j++)
-          {
-            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-            {
-              next_i = j;
-              break;
-            }
-          }
+          int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_LOAD_INDEXED &&
               !ir->compact_instructions[next_i].is_jump_target)
           {
@@ -3496,7 +3425,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
          * Only for REG sources — IMM STRD through generic base registers is
          * unsafe because STRD requires 4-byte aligned addresses while
          * individual STR tolerates unaligned access on ARMv8-M. */
-        if (!a.src1.is_64bit && a.src1.kind == MACH_OP_REG &&
+        if (!a.src1.is_64bit && a.src1.kind == MACH_OP_REG && !a.src1.needs_deref &&
             a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
             a.src2.kind == MACH_OP_IMM &&
             a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
@@ -3506,6 +3435,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           for (int j = i + 1; j < ir->next_instruction_index; j++)
           {
             int jop = ir->compact_instructions[j].op;
+            /* A branch target between the two STORE_INDEXEDs — even a code-less
+             * NOP or identity move — means a jump can land between them, so they
+             * cannot share one STRD.  Bail rather than fuse across the label. */
+            if (ir->compact_instructions[j].is_jump_target ||
+                (branch_target_reset && branch_target_reset[j]))
+              break;
             if (jop == TCCIR_OP_NOP)
               continue;
             /* An ASSIGN or pure-vreg LOAD whose src and dst materialise to
@@ -3548,7 +3483,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             MopArgs b = ir_decode_cached(is_dry_run, 0, NULL, next_i, ir, nq, &n_src1_ir, &n_src2_ir, &n_dest_ir,
                                          (MopSpec){.dest = 1, .src1 = 1, .src2 = 1, .scale = 1});
 
-            if (!b.src1.is_64bit && b.src1.kind == MACH_OP_REG &&
+            if (!b.src1.is_64bit && b.src1.kind == MACH_OP_REG && !b.src1.needs_deref &&
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
@@ -3591,15 +3526,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
             (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32))
         {
-          int next_i = -1;
-          for (int j = i + 1; j < ir->next_instruction_index; j++)
-          {
-            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-            {
-              next_i = j;
-              break;
-            }
-          }
+          int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
           /* is_jump_target misses some branch targets (see branch_target_reset);
            * consuming a branch-target store removes the label's only emission
            * point, so branches to it backpatch against code address 0. */
@@ -3664,15 +3591,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
           for (int k = 1; k <= 3; k++)
           {
-            int next_i = -1;
-            for (int j = last_i + 1; j < ir->next_instruction_index; j++)
-            {
-              if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-              {
-                next_i = j;
-                break;
-              }
-            }
+            int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, last_i);
             if (next_i < 0 ||
                 ir->compact_instructions[next_i].op != TCCIR_OP_STORE_INDEXED ||
                 ir->compact_instructions[next_i].is_jump_target)
@@ -3859,15 +3778,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32) &&
             (a.src1.u.spill.offset & 3) == 0)
         {
-          int next_i = -1;
-          for (int j = i + 1; j < ir->next_instruction_index; j++)
-          {
-            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-            {
-              next_i = j;
-              break;
-            }
-          }
+          int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_ASSIGN &&
               !ir->compact_instructions[next_i].is_jump_target)
           {
@@ -3916,15 +3827,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32) &&
             (a.dest.u.spill.offset & 3) == 0)
         {
-          int next_i = -1;
-          for (int j = i + 1; j < ir->next_instruction_index; j++)
-          {
-            if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
-            {
-              next_i = j;
-              break;
-            }
-          }
+          int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_ASSIGN &&
               !ir->compact_instructions[next_i].is_jump_target)
           {

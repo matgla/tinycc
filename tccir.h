@@ -229,6 +229,16 @@ typedef enum TccIrOp
   TCCIR_OP_SMULL,
 } TccIrOp;
 
+/* Size (in bytes) at or above which the backend lowers a TCCIR_OP_BLOCK_COPY to
+ * a real memcpy() call instead of an inline LDM/STM sequence (see
+ * tcc_gen_machine_block_copy_mop in arm-thumb-gen.c).  A memcpy call clobbers
+ * the caller-saved registers, so register allocation must treat a block copy of
+ * at least this size as a call site (ra_build_call_prefix in ir/regalloc.c) and
+ * force any value live across it off r0-r3/r12.  The inline path below this size
+ * preserves everything it touches via scratch save/restore, so it is not a call.
+ * The two sites must agree on this threshold; keep them in sync via this macro. */
+#define TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES 64
+
 /* FUNCPARAMVAL encoding helpers:
  * src2.c.i encodes both parameter index (lower 16 bits) and call_id (upper 16 bits)
  * This keeps call/param binding explicit and makes the IR more compact.

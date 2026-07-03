@@ -617,6 +617,27 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
           rt_valid[dp] = 1;
         }
       }
+      /* ASSIGN: TEMP <-- TEMP → a plain pointer copy carries the resolved
+       * stack offset (agg_deep seed 12085: `T12 = Addr[StackLoc[-100]] + 48;
+       * T15 = T12; *T15 = x` — without this, the store through T15 never
+       * invalidates the BLOCK_COPY initializer at offset -52 and Phase 3
+       * forwards the stale constant). */
+      else if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP && s1_vr >= 0 &&
+               TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_TEMP && !s1.is_lval)
+      {
+        int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
+        int dp = TCCIR_DECODE_VREG_POSITION(d_vr);
+        if (sp <= max_tmp && lea_map[sp].valid && dp <= max_tmp)
+        {
+          lea_map[dp].offset = lea_map[sp].offset;
+          lea_map[dp].valid = 1;
+        }
+        else if (sp <= max_tmp && rt_valid[sp] && dp <= max_tmp)
+        {
+          rt_base[dp] = rt_base[sp];
+          rt_valid[dp] = 1;
+        }
+      }
     }
 
     /* ADD: LEA_temp + constant or Addr[StackLoc] + constant → propagate in LEA map */
@@ -640,6 +661,19 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
             {
               lea_map[dp].offset = lea_map[sp].offset + irop_get_imm64_ex(ir, s2);
               lea_map[dp].valid = 1;
+            }
+            else if (sp <= max_tmp && rt_valid[sp])
+            {
+              /* `T = <runtime array pointer> + const`: adding an immediate
+               * (column / field displacement) to a runtime-indexed array base
+               * keeps the result a runtime pointer into the SAME array — carry
+               * the base forward so a store through it still invalidates the
+               * array's entry initializers.  Without this, Phase 2.6 loses the
+               * base at `T44 = T43 + #8` (T43 = &m + (row<<4)) and the stale
+               * 2-D-array initializer is forwarded past the loop store
+               * (agg_deep seed 781). */
+              rt_base[dp] = rt_base[sp];
+              rt_valid[dp] = 1;
             }
           }
           else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF && irop_is_immediate(s2) &&
@@ -689,6 +723,13 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
             {
               var_lea_map[dp].offset = lea_map[sp].offset + irop_get_imm64_ex(ir, s2);
               var_lea_map[dp].valid = 1;
+            }
+            else if (sp <= max_tmp && rt_valid[sp])
+            {
+              /* VAR analogue of the TEMP case above: `V = <runtime array
+               * pointer> + const` stays a runtime pointer into the same array. */
+              var_rt_base[dp] = rt_base[sp];
+              var_rt_valid[dp] = 1;
             }
           }
           else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF &&
@@ -917,17 +958,37 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       int32_t dv = irop_get_vreg(sd);
       if (eq->op == TCCIR_OP_STORE_INDEXED)
       {
-        /* base resolves directly or via lea_map; runtime index = non-immediate src2 */
+        /* A STORE_INDEXED writes at base + (index << scale).  It aliases an
+         * array element at an unknown (runtime) offset when EITHER the index is
+         * runtime OR the base pointer is itself a runtime array pointer
+         * (`arr + (i<<scale)`, recorded in rt_base).  A constant base + constant
+         * index resolves to one exact slot and is invalidated precisely by
+         * Phase 2.5, so skip only that fully-constant case here — NOT a runtime
+         * base with an immediate index, which Phase 2.5 cannot resolve (it only
+         * knows lea_map's constant offsets) and which would otherwise leave the
+         * array's other elements' entry initializers stale (agg_deep seed 70:
+         * `m28[u4&3][3] = ...` with u4 address-taken keeps u4&3 a runtime row
+         * index, so the store base is `&m28 + (u4&3)*16` (rt_base) and only the
+         * column #12 is immediate). */
         IROperand s2 = tcc_ir_op_get_src2(ir, eq);
-        if (irop_is_immediate(s2) && !s2.is_sym)
-          continue; /* constant index handled elsewhere */
+        int imm_index = irop_is_immediate(s2) && !s2.is_sym;
         if (sd.is_local && irop_get_tag(sd) == IROP_TAG_STACKOFF)
+        {
+          if (imm_index)
+            continue; /* fully constant address — Phase 2.5 handles it precisely */
           base = irop_get_stack_offset(sd);
+        }
         else if (dv >= 0 && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP)
         {
           int dp = TCCIR_DECODE_VREG_POSITION(dv);
-          if (dp <= max_tmp && lea_map[dp].valid) base = lea_map[dp].offset;
-          else if (dp <= max_tmp && rt_valid[dp]) base = rt_base[dp];
+          if (dp <= max_tmp && lea_map[dp].valid)
+          {
+            if (imm_index)
+              continue; /* constant base + constant index — Phase 2.5 handles it */
+            base = lea_map[dp].offset;
+          }
+          else if (dp <= max_tmp && rt_valid[dp])
+            base = rt_base[dp]; /* runtime base: address is runtime even if index is immediate */
         }
       }
       else /* plain STORE / STORE_POSTINC through a TEMP / VAR deref */
@@ -2967,7 +3028,11 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             }
             if (stale)
               continue;
-            uint32_t full = (uint32_t)prev_e->stored_value.u.imm32;
+            /* Read via irop_get_imm64_ex: for I64/F64-tagged immediates
+             * u.imm32 holds a POOL INDEX, not the value (an unsigned 32-bit
+             * constant > INT32_MAX is I64-encoded — bitfield seed 12264
+             * forwarded pool index 0 as the byte value). */
+            uint32_t full = (uint32_t)irop_get_imm64_ex(ir, prev_e->stored_value);
             uint32_t bit_shift = (uint32_t)delta * 8;
             uint32_t byte_mask = (load_bytes == 1) ? 0xFFu : 0xFFFFu;
             int32_t narrow = (int32_t)((full >> bit_shift) & byte_mask);
@@ -2978,8 +3043,10 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
               narrow = narrow >> shift;
             }
             LOG_SL_FWD("LOAD@i=%d FORWARD-SUBBYTE: store@i=%d delta=%d entry_bytes=%d "
-                       "load_bytes=%d full=0x%x narrow=%d",
-                       i, prev_e->instruction_idx, delta, entry_bytes, load_bytes, full, narrow);
+                       "load_bytes=%d full=0x%x narrow=%d sv_tag=%d sv_islval=%d sv_islocal=%d",
+                       i, prev_e->instruction_idx, delta, entry_bytes, load_bytes, full, narrow,
+                       (int)irop_get_tag(prev_e->stored_value), (int)prev_e->stored_value.is_lval,
+                       (int)prev_e->stored_value.is_local);
             if (q->op != TCCIR_OP_FUNCPARAMVAL)
               q->op = TCCIR_OP_ASSIGN;
             int pool_off = q->operand_base + irop_config[q->op].has_dest;
@@ -3457,6 +3524,44 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                 store_btype != IROP_BTYPE_FLOAT32 && store_btype != IROP_BTYPE_FLOAT64)
               store_btype = IROP_BTYPE_INT32;
 
+            /* Overlap invalidation — mirror the plain-STORE path.  A narrow
+             * indexed store overlaps any WIDER entry at a lower offset (a
+             * packed-bitfield byte write must kill the enclosing word's
+             * tracked constant, or a later word RMW load forwards the stale
+             * init and the rebuilt store wipes this byte — bitfield seed
+             * 11840); a wide store overlaps narrower entries above it.
+             * Conservative: invalidate (no cross-merge on this path). */
+            {
+              int si_bytes = ir_opt_store_btype_size_bytes(store_btype);
+              if (si_bytes <= 0)
+                si_bytes = 4;
+              for (int delta = 1; delta <= 7; delta++)
+              {
+                int64_t lo_off = si_off - delta;
+                uint32_t loh = ((uintptr_t)si_sym * 31 + (uint32_t)lo_off * 17) % 128;
+                for (StoreEntry *sie = hash_table[loh]; sie != NULL; sie = sie->next)
+                {
+                  if (!sie->valid || sie->local_sym != si_sym || sie->local_offset != lo_off)
+                    continue;
+                  int eb = ir_opt_store_btype_size_bytes(sie->store_btype);
+                  if (eb <= 0)
+                    eb = 4;
+                  if (eb > delta)
+                    sie->valid = 0;
+                }
+              }
+              for (int fwd = 1; fwd < si_bytes; fwd++)
+              {
+                int64_t hi_off = si_off + fwd;
+                uint32_t hih = ((uintptr_t)si_sym * 31 + (uint32_t)hi_off * 17) % 128;
+                for (StoreEntry *sie = hash_table[hih]; sie != NULL; sie = sie->next)
+                {
+                  if (sie->valid && sie->local_sym == si_sym && sie->local_offset == hi_off)
+                    sie->valid = 0;
+                }
+              }
+            }
+
             /* Record the store. */
             StoreEntry *sne = &entries[entry_count++];
             sne->valid = 1;
@@ -3790,18 +3895,24 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             }
             if (entry_bytes <= delta)
               continue;
-            /* Try to merge the narrow store's bytes into the wider entry. */
+            /* Try to merge the narrow store's bytes into the wider entry.
+             * Values are read via irop_get_imm64_ex and the merged operand is
+             * rebuilt as a plain IMM32: I64/F64-tagged immediates keep a POOL
+             * INDEX in u.imm32, so touching that field raw would merge into /
+             * corrupt the index instead of the value (bitfield seed 12264). */
             int ce_is_imm = irop_is_immediate(ce->stored_value);
             if (new_src_is_imm && ce_is_imm && new_bytes > 0 && entry_bytes <= 4 &&
                 delta + new_bytes <= entry_bytes)
             {
-              int32_t old_v = ce->stored_value.u.imm32;
-              int32_t new_v = new_src1.u.imm32;
+              int32_t old_v = (int32_t)irop_get_imm64_ex(ir, ce->stored_value);
+              int32_t new_v = (int32_t)irop_get_imm64_ex(ir, new_src1);
               uint32_t byte_mask = (new_bytes == 4) ? 0xFFFFFFFFu : ((1u << (new_bytes * 8)) - 1);
               uint32_t pos_mask = byte_mask << (delta * 8);
               uint32_t value_in_pos = ((uint32_t)new_v & byte_mask) << (delta * 8);
               int32_t merged = (int32_t)(((uint32_t)old_v & ~pos_mask) | value_in_pos);
-              ce->stored_value.u.imm32 = merged;
+              ce->stored_value = irop_make_imm32(-1, merged, irop_get_btype(ce->stored_value) == IROP_BTYPE_INT64
+                                                                 ? IROP_BTYPE_INT32
+                                                                 : irop_get_btype(ce->stored_value));
               ce->instruction_idx = i;
               LOG_SL_FWD("STORE@i=%d CROSS-MERGE into store@i=? at off=%lld delta=%d: "
                          "new_bytes=%d entry_bytes=%d old_v=%d new_v=%d merged=%d",
@@ -4178,7 +4289,23 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
    * For each forwarded store, scan all remaining (non-NOP) instructions to
    * check if any src operand still references the same local offset.
    * Only anonymous stores (vreg < 0) are candidates — already filtered above. */
-  for (int fi = 0; fi < fwd_store_count; fi++)
+  int skip_fwd_store_dse = 0;
+  for (int sj = 0; sj < n; sj++)
+  {
+    IRQuadCompact *sq = &ir->compact_instructions[sj];
+    if (sq->op != TCCIR_OP_STORE_INDEXED && sq->op != TCCIR_OP_LOAD_INDEXED)
+      continue;
+    IROperand idx = tcc_ir_op_get_src2(ir, sq);
+    /* The read scan below tracks fixed local offsets.  Runtime indexed stack
+     * array accesses can still depend on forwarded stores even when no exact
+     * offset operand remains, so keep the stores in those functions. */
+    if (!irop_is_immediate(idx) || idx.is_sym)
+    {
+      skip_fwd_store_dse = 1;
+      break;
+    }
+  }
+  for (int fi = 0; !skip_fwd_store_dse && fi < fwd_store_count; fi++)
   {
     int store_idx = fwd_stores[fi].store_idx;
     int64_t off = fwd_stores[fi].offset;
@@ -4811,6 +4938,11 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
       RSE_EVICT_FOR_SRC(tcc_ir_op_get_src1(ir, q));
     if (irop_config[q->op].has_src2)
       RSE_EVICT_FOR_SRC(tcc_ir_op_get_src2(ir, q));
+    /* MLA's accumulator (4th operand) is a read not surfaced by src1/src2
+     * (bitfield seed 17717: `T <-- Ta MLA Tb + T3***DEREF***` read a packed
+     * field's init store, which then looked overwritten-without-read). */
+    if (q->op == TCCIR_OP_MLA)
+      RSE_EVICT_FOR_SRC(tcc_ir_op_get_accum(ir, q));
 
     /* A plain DEREF read through a TEMP holding `array_base + RUNTIME_index`
      * (e.g. `T = &arr[0] + (i<<2); x = *T`) reads an unknown element of that
@@ -4842,6 +4974,8 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
       RSE_FLUSH_RUNTIME_DEREF(tcc_ir_op_get_src1(ir, q));
     if (irop_config[q->op].has_src2)
       RSE_FLUSH_RUNTIME_DEREF(tcc_ir_op_get_src2(ir, q));
+    if (q->op == TCCIR_OP_MLA)
+      RSE_FLUSH_RUNTIME_DEREF(tcc_ir_op_get_accum(ir, q));
 #undef RSE_FLUSH_RUNTIME_DEREF
 
     /* A DEREF read whose pointer resolves to NEITHER an exact (sym,off)
@@ -4871,6 +5005,8 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
       RSE_FLUSH_UNRESOLVED_DEREF(tcc_ir_op_get_src1(ir, q));
     if (irop_config[q->op].has_src2)
       RSE_FLUSH_UNRESOLVED_DEREF(tcc_ir_op_get_src2(ir, q));
+    if (q->op == TCCIR_OP_MLA)
+      RSE_FLUSH_UNRESOLVED_DEREF(tcc_ir_op_get_accum(ir, q));
 #undef RSE_FLUSH_UNRESOLVED_DEREF
 
     /* LOAD_INDEXED with a runtime index reads an unknown element of its
@@ -4940,6 +5076,30 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
               active[k] = active[--active_count];
             else
               k++;
+          }
+        }
+        else if (irop_get_tag(li_s1) == IROP_TAG_VREG)
+        {
+          /* A constant index does NOT imply a constant address: the base can be
+           * a runtime array pointer `arr + (row << k)` for which the exact
+           * resolver above bailed on the non-constant addend.  Such a load reads
+           * an unknown element of that array, so flush the whole array range —
+           * mirroring the runtime-index branch (agg_deep seed 36641: a
+           * `m[row][C]` store was wrongly killed by a later `m[C2][C]` store to
+           * the same slot because the intervening `m[row2][C]` read carried a
+           * runtime base with a constant column index). */
+          const Sym *rb_sym;
+          int64_t rb_off;
+          if (rse_resolve_runtime_base(ir, irop_get_vreg(li_s1), &rb_sym, &rb_off, 4))
+          {
+            for (int k = 0; k < active_count;)
+            {
+              if (active[k].sym == rb_sym && active[k].offset >= rb_off &&
+                  (active[k].offset - rb_off) < 1024)
+                active[k] = active[--active_count];
+              else
+                k++;
+            }
           }
         }
       }
@@ -5646,8 +5806,18 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
      *   (b) an operand carrying a vreg whose vreg_slot[] is set.
      *
      * For each such address-of-local use, classify the containing op.
-     * Mark the relevant slot(s) non-tame if the use isn't recognized. */
-    for (int k = 0; k < 3; k++)
+     * Mark the relevant slot(s) non-tame if the use isn't recognized.
+     *
+     * k==3 is the MLA accumulator (pool[base+3]).  It must be scanned here
+     * for the same reason the live-collection loop below scans it: when a
+     * slot-pointer vreg is dereferenced *only* as an MLA addend
+     * (`T <- Addr[StackLoc[X]]; MLA ... + T***DEREF***`), missing it here
+     * leaves the slot looking tame with no recorded read, so its defining
+     * store is wrongly eliminated.  Critically, the live-collection loop
+     * only records that deref precisely when `dls_precise_ok`; when the
+     * function has an indexed/postinc op (or a back-edge) that path is
+     * gated off, and this poison is the *only* thing that keeps the store. */
+    for (int k = 0; k < 4; k++)
     {
       IROperand op;
       int has;
@@ -5663,11 +5833,17 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         if (has)
           op = tcc_ir_op_get_src1(ir, q);
       }
-      else
+      else if (k == 2)
       {
         has = irop_config[q->op].has_src2;
         if (has)
           op = tcc_ir_op_get_src2(ir, q);
+      }
+      else
+      {
+        has = (q->op == TCCIR_OP_MLA);
+        if (has)
+          op = tcc_ir_op_get_accum(ir, q);
       }
       if (!has)
         continue;
@@ -6166,10 +6342,14 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     if (dest.is_complex)
       width *= 2;
     /* Position-aware liveness: only reads at positions AFTER this STORE
-     * make it live.  Earlier reads were satisfied by an earlier definition. */
+     * make it live.  Earlier reads were satisfied by an earlier definition.
+     * Only sound in forward-only control flow: with a back edge, a read at
+     * an earlier position can execute AFTER this store (loop-carried value,
+     * float fuzz seed 6632: in-loop `st.f0 = ...` read at the loop top), so
+     * any overlapping read keeps the store. */
     int alive = 0;
     for (int k = 0; k < live_count; k++)
-      if (live[k].pos > i &&
+      if ((dls_has_backedge || live[k].pos > i) &&
           off < live[k].off + live[k].width && off + width > live[k].off)
       {
         alive = 1;
@@ -6267,10 +6447,12 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     /* No non-tame deref through a different slot may reach into S's bytes. */
     if (DLS_NONTAME_RANGE_OVERLAPS(slot, slot_end - slot))
       continue;
-    /* Whole-slot liveness: any later read in [slot, slot_end)? */
+    /* Whole-slot liveness: any later read in [slot, slot_end)?  (Position
+     * filter is void under back edges — see the direct-StackLoc loop.) */
     int alive = 0;
     for (int k = 0; k < live_count; k++)
-      if (live[k].pos > i && live[k].off < slot_end && live[k].off + live[k].width > slot)
+      if ((dls_has_backedge || live[k].pos > i) &&
+          live[k].off < slot_end && live[k].off + live[k].width > slot)
       {
         alive = 1;
         break;
@@ -6308,7 +6490,8 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       continue;
     int alive = 0;
     for (int k = 0; k < live_count; k++)
-      if (live[k].pos > i && base < live[k].off + live[k].width && base + width > live[k].off)
+      if ((dls_has_backedge || live[k].pos > i) &&
+          base < live[k].off + live[k].width && base + width > live[k].off)
       {
         alive = 1;
         break;
@@ -6349,10 +6532,11 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       if (sz <= 0)
         continue;
       /* Position-aware: a read AT or BEFORE this call was satisfied by an
-       * earlier write; only later reads keep the call alive. */
+       * earlier write; only later reads keep the call alive.  (Position
+       * filter is void under back edges — see the direct-StackLoc loop.) */
       int alive = 0;
       for (int k = 0; k < live_count; k++)
-        if (live[k].pos > i &&
+        if ((dls_has_backedge || live[k].pos > i) &&
             base < live[k].off + live[k].width && base + sz > live[k].off)
         {
           alive = 1;
@@ -6418,10 +6602,11 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
        * read AFTER this call?  (Earlier reads were satisfied upstream.)
        * Wide live[] entries (e.g. memcpy-source bounded reads of N bytes)
        * may start below `slot` and extend across it — check that the
-       * range's end exceeds `slot`, not just its base. */
+       * range's end exceeds `slot`, not just its base.  (Position filter
+       * is void under back edges — see the direct-StackLoc loop.) */
       int alive = 0;
       for (int k = 0; k < live_count; k++)
-        if (live[k].pos > i && live[k].off + live[k].width > slot)
+        if ((dls_has_backedge || live[k].pos > i) && live[k].off + live[k].width > slot)
         {
           alive = 1;
           break;
@@ -10900,6 +11085,14 @@ int tcc_ir_opt_ptr_load_cse(TCCIRState *ir)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int32_t dest_vr = irop_get_vreg(dest);
+      if (dest_vr >= 0 && !dest.is_lval &&
+          TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_VAR) {
+        IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, dest_vr);
+        if (li && li->addrtaken) {
+          cache_count = 0;
+          continue;
+        }
+      }
       if (dest_vr >= 0 && !dest.is_lval)
       {
         int w = 0;

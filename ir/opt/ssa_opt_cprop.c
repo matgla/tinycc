@@ -241,8 +241,25 @@ static int ssa_gen_cprop_load_redundant(IRSSAOptCtx *ctx, int idx)
     if (irop_config[pq->op].has_dest &&
         pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID) {
       IROperand pd = tcc_ir_op_get_dest(ir, pq);
-      if (irop_get_vreg(pd) == src_vr)
+      int32_t pd_vr = irop_get_vreg(pd);
+      if (pd_vr == src_vr)
         return 0;
+      /* A deref-style LOAD reads memory through a register pointer.  Besides
+       * STOREs (handled above), a plain ALU/ASSIGN def of an address-taken
+       * VAR/PARAM also writes that memory — the value lives in the vreg's
+       * stack slot and the pointer may hold its address (fuzz ptr seed 6734:
+       * `p = &u; ... = *p; u = expr; ... = *p` — the second read must not
+       * reuse the first across u's update). */
+      if (src.is_lval && !src.is_local && pd_vr >= 0 &&
+          TCCIR_DECODE_VREG_TYPE(pd_vr) != TCCIR_VREG_TYPE_TEMP) {
+        IRLiveInterval *pdi =
+            (TCCIR_DECODE_VREG_TYPE(pd_vr) == TCCIR_VREG_TYPE_VAR ||
+             TCCIR_DECODE_VREG_TYPE(pd_vr) == TCCIR_VREG_TYPE_PARAM)
+                ? tcc_ir_vreg_live_interval(ir, pd_vr)
+                : NULL;
+        if (!pdi || pdi->addrtaken)
+          return 0;
+      }
     }
 
     /* Match the prior LOAD: same op, same source flags+vreg, TEMP dest. */
@@ -1139,6 +1156,20 @@ int ssa_opt_var_to_param_forward(IRSSAOptCtx *ctx)
       if (!touches)
         continue;
 
+      /* ARM barrel-shift fusion records a hidden shift on this use's src2
+       * (ir->barrel_shifts[orig_index], set just before regalloc).  Substituting
+       * the stored value here rewrites the operand fusion pinned — an immediate
+       * cannot be barrel-shifted, so codegen would silently drop the shift
+       * (volatile fuzz seed 16558: `(u6<<7)|x` folded to `u6|x`).  One blocked
+       * use blocks the whole VAR: forwarding the others would NOP the def this
+       * use still reads. */
+      if (ir->barrel_shifts && uq->orig_index >= 0 &&
+          uq->orig_index <= ir->max_orig_index &&
+          ir->barrel_shifts[uq->orig_index]) {
+        safe = 0;
+        break;
+      }
+
       if (!v2v_dominates(cfg, def_blk, cfg->instr_to_block[j])) {
         safe = 0;
         break;
@@ -1536,12 +1567,38 @@ static int ssa_var_const_fold_one(IRSSAOptCtx *ctx, int idx)
     return 0;
   }
 
+  /* The self-update always folds safely to the constant (Vx's value at `idx`
+   * is `prior_val` — the backward scan proved no write to Vx lies between).
+   * But the prior `Vx <- #const` def may still be read by an instruction
+   * *between* it and the self-update: e.g.
+   *     si11 = -2992;          // V2 <- #-2992      (prior_idx)
+   *     si12 = si11 - si10;    // V3 <- V2 SUB V1   (reads the prior def!)
+   *     si11 = si11 & 0x7fff;  // V2 <- V2 AND ...  (idx, self-update)
+   * NOPing the prior def then leaves that intervening use reading an
+   * undefined Vx.  Only drop the prior def when nothing in (prior_idx, idx)
+   * reads Vx.  Stores/calls in that range already aborted the fold above, so
+   * every intervening read lives in a src1/src2 slot (incl. FUNCPARAMVAL,
+   * whose value is src1). */
+  int prior_used = 0;
+  for (int k = prior_idx + 1; k < idx; k++) {
+    IRQuadCompact *uq = &ir->compact_instructions[k];
+    if (uq->op == TCCIR_OP_NOP)
+      continue;
+    IROperand us1 = tcc_ir_op_get_src1(ir, uq);
+    IROperand us2 = tcc_ir_op_get_src2(ir, uq);
+    if (irop_get_vreg(us1) == dest_vr || irop_get_vreg(us2) == dest_vr) {
+      prior_used = 1;
+      break;
+    }
+  }
+
   IROperand imm = irop_make_imm32(0, (int32_t)result, dest.btype);
   q->op = TCCIR_OP_ASSIGN;
   tcc_ir_op_set_src1(ir, q, imm);
   tcc_ir_op_set_src2(ir, q, IROP_NONE);
 
-  ir->compact_instructions[prior_idx].op = TCCIR_OP_NOP;
+  if (!prior_used)
+    ir->compact_instructions[prior_idx].op = TCCIR_OP_NOP;
   return 1;
 }
 

@@ -396,8 +396,10 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
     }
 
     /* Walk operands; record reads of known slots and bail on any non-tame
-     * use of a known-address vreg. */
-    for (int k = 0; k < 3; k++)
+     * use of a known-address vreg.  k==3 is MLA's accumulator (4th operand):
+     * `T <-- Ta MLA Tb + Tacc***DEREF***` reads the slot through Tacc, a use
+     * src1/src2 never surface (struct_byval seed 11651). */
+    for (int k = 0; k < 4; k++)
     {
       IROperand op;
       int has;
@@ -405,8 +407,10 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
                     if (has) op = tcc_ir_op_get_dest(ir, q); }
       else if (k == 1) { has = irop_config[q->op].has_src1;
                          if (has) op = tcc_ir_op_get_src1(ir, q); }
-      else { has = irop_config[q->op].has_src2;
+      else if (k == 2) { has = irop_config[q->op].has_src2;
              if (has) op = tcc_ir_op_get_src2(ir, q); }
+      else { has = (q->op == TCCIR_OP_MLA);
+             if (has) op = tcc_ir_op_get_accum(ir, q); }
       if (!has)
         continue;
       /* Lval reference: it's a read of the slot.  We treat any lval-src use

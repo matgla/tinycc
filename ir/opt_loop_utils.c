@@ -804,6 +804,17 @@ int insert_instr_at(TCCIRState *ir, int pos, TccIrOp op, IROperand dest, IROpera
       }
     }
   }
+  for (int ti = 0; ti < ir->num_switch_tables; ti++)
+  {
+    TCCIRSwitchTable *table = &ir->switch_tables[ti];
+    if (table->default_target >= pos)
+      table->default_target++;
+    for (int tj = 0; tj < table->num_entries; tj++)
+    {
+      if (table->targets[tj] >= pos)
+        table->targets[tj]++;
+    }
+  }
 
   /* Create the new instruction using operand pool */
   IRQuadCompact *new_q = &ir->compact_instructions[pos];
@@ -837,37 +848,122 @@ int insert_instr_at(TCCIRState *ir, int pos, TccIrOp op, IROperand dest, IROpera
  * only rewrites use_idx in place to ASSIGN dest, shared_ptr.
  */
 
-/* True if vreg `v` is the DIV-pointer `ud_vr` itself, or is defined inside the
- * loop by an ADD/SUB/LEA that has `ud_vr` as one operand — i.e. `v = ud_vr +
- * offset`, a field address derived from the strength-reduction pointer.  A
- * struct-field load `arr[i].f` lowers to `t = (base + iv*stride); a = t + foff;
- * LOAD [a]`, so the memory access dereferences `a` (= ud_vr + foff), NOT ud_vr
- * directly.  The direct is_lval scan therefore misses it; this follows one
- * level of offset arithmetic so such DIVs are correctly treated as feeding a
- * memory access. */
-static int sr_vreg_is_ud_or_offset(TCCIRState *ir, IRLoop *loop, int32_t v, int32_t ud_vr)
+/* Escape analysis for the derived-IV address value (docs/bugs.md #2).
+ *
+ * Taint-tracks every vreg that may (transitively) carry the DIV's computed
+ * address within [lo..hi] and verifies the value never leaves the plain
+ * register domain: the ONLY allowed consumers are ASSIGN / ADD / SUB copies
+ * and arithmetic (which propagate the taint to their dest) and CMP.  Any
+ * other use disqualifies the DIV:
+ *   - a dereference (any lval-marked operand holding a tainted vreg),
+ *   - STORE / STORE_INDEXED / STORE_POSTINC / LOAD / LOAD_INDEXED touching
+ *     a tainted vreg in any slot (address OR stored value),
+ *   - FUNCPARAMVAL (the address escapes into a call),
+ *   - anything else (RETURNVALUE, IJUMP, MLA, ...).
+ *
+ * This replaces the earlier one-level `ud_vr + offset` scan, which missed
+ * multi-hop flows (va-arg-24: the ADD's dest reached the loop store through
+ * a chain the scan could not correlate).  Flow-insensitive: a stale taint
+ * after redefinition only over-approximates, i.e. skips more DIVs — safe.
+ * Returns 1 when the value provably stays in registers, 0 otherwise
+ * (including scan-capacity overflow). */
+#define SR_TAINT_MAX 64
+static int sr_div_value_stays_in_regs(TCCIRState *ir, int lo, int hi, int32_t seed_vr)
 {
-  if (v < 0)
-    return 0;
-  if (v == ud_vr)
-    return 1;
-  int lo = loop->start_idx >= 0 ? loop->start_idx : 0;
-  int hi = loop->end_idx < ir->next_instruction_index ? loop->end_idx : ir->next_instruction_index - 1;
-  for (int i = lo; i <= hi; i++)
+  int32_t taint[SR_TAINT_MAX];
+  int nt = 0;
+  taint[nt++] = seed_vr;
+
+  int changed = 1;
+  while (changed)
   {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB && q->op != TCCIR_OP_LEA)
-      continue;
-    if (!irop_config[q->op].has_dest)
-      continue;
-    if (irop_get_vreg(tcc_ir_op_get_dest(ir, q)) != v)
-      continue;
-    int32_t a = irop_config[q->op].has_src1 ? irop_get_vreg(tcc_ir_op_get_src1(ir, q)) : -1;
-    int32_t b = irop_config[q->op].has_src2 ? irop_get_vreg(tcc_ir_op_get_src2(ir, q)) : -1;
-    if (a == ud_vr || b == ud_vr)
-      return 1;
+    changed = 0;
+    for (int j = lo; j <= hi; j++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[j];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+
+      /* Gather all operand slots this instruction READS.  For STORE-style
+       * ops the dest slot holds the write address — a read of the pointer.
+       * MLA's accumulator lives at pool slot +3, invisible to src1/src2
+       * accessors (the ptr-6869 blind spot) — gather it explicitly. */
+      IROperand reads[4];
+      int nreads = 0;
+      int dest_is_read = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+                          q->op == TCCIR_OP_STORE_POSTINC || q->op == TCCIR_OP_FUNCPARAMVAL);
+      if (irop_config[q->op].has_src1)
+        reads[nreads++] = tcc_ir_op_get_src1(ir, q);
+      if (irop_config[q->op].has_src2)
+        reads[nreads++] = tcc_ir_op_get_src2(ir, q);
+      if (dest_is_read && irop_config[q->op].has_dest)
+        reads[nreads++] = tcc_ir_op_get_dest(ir, q);
+      if (q->op == TCCIR_OP_MLA)
+        reads[nreads++] = tcc_ir_op_get_accum(ir, q);
+
+      int reads_taint = 0;
+      for (int r = 0; r < nreads; r++)
+      {
+        int32_t rv = irop_get_vreg(reads[r]);
+        if (rv < 0)
+          continue;
+        int t = 0;
+        for (int k = 0; k < nt; k++)
+        {
+          if (taint[k] == rv)
+          {
+            t = 1;
+            break;
+          }
+        }
+        if (!t)
+          continue;
+        /* An lval-marked read is a memory dereference of the tainted value —
+         * EXCEPT the IR's plain "fetch variable" form: a VAR-typed vreg with
+         * is_lval+is_local reads the variable's own value, not memory through
+         * it (see opt_dead_vla.c CLASSIFY / opt_loop_const_sim.c notes). */
+        if (reads[r].is_lval &&
+            !(TCCIR_DECODE_VREG_TYPE(rv) == TCCIR_VREG_TYPE_VAR && reads[r].is_local))
+          return 0;
+        reads_taint = 1;
+      }
+      if (!reads_taint)
+        continue;
+
+      /* Tainted value consumed here — allow only plain ALU/copy/compare. */
+      if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB &&
+          q->op != TCCIR_OP_CMP)
+        return 0;
+
+      if (irop_config[q->op].has_dest)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        if (d.is_lval)
+          return 0; /* store through an lval dest — memory write */
+        int32_t dv = irop_get_vreg(d);
+        if (dv >= 0)
+        {
+          int already = 0;
+          for (int k = 0; k < nt; k++)
+          {
+            if (taint[k] == dv)
+            {
+              already = 1;
+              break;
+            }
+          }
+          if (!already)
+          {
+            if (nt >= SR_TAINT_MAX)
+              return 0; /* capacity — be conservative */
+            taint[nt++] = dv;
+            changed = 1;
+          }
+        }
+      }
+    }
   }
-  return 0;
+  return 1;
 }
 
 int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, DerivedIV *div, int *out_ptr_vreg,
@@ -882,78 +978,36 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
   if (out_stride_pos)
     *out_stride_pos = -1;
 
-  /* DIAGNOSTIC: temporarily disable all derived-IV strength reduction to test
-   * whether it is the source of the linker heap corruption. REMOVE after test.
-   * (Plain early return rather than a `(void*)1` sentinel: the sentinel made
-   * GCC's VRP assume out_ptr_vreg == (void*)1 past the check, so the later
-   * `*out_ptr_vreg = ...` writes tripped -Werror=array-bounds.) */
-  return 0;
+  /* Kill-switch for bisection: TCC_DISABLE_PASS=derived_iv (docs/bugs.md #2). */
+  if (tcc_ir_opt_pass_disabled("derived_iv"))
+    return 0;
 
-  /* Shared-pointer fast path: rewrite the use site to ASSIGN of the existing
-   * primary's strength-reduced pointer.  No insertions — just rewrites.
-   * Returns 1 to signal success without triggering the caller's index-shift
-   * bookkeeping (no instructions inserted). */
-  if (shared_ptr_vreg >= 0)
+  /* Never rewrite a derived IV whose use site is itself an indexed memory
+   * access (STORE_INDEXED / LOAD_INDEXED).  The escape scan below also
+   * rejects these, but keep the explicit guard as a backstop for direct
+   * callers: the backend already forms efficient indexed addressing for
+   * array element accesses, so nothing is lost by skipping. */
+  if (div->use_idx >= 0 && div->use_idx < ir->next_instruction_index)
   {
-    if (div->use_idx < 0 || div->use_idx >= ir->next_instruction_index)
+    int uop = ir->compact_instructions[div->use_idx].op;
+    if (uop == TCCIR_OP_STORE_INDEXED || uop == TCCIR_OP_LOAD_INDEXED)
       return 0;
-    IRQuadCompact *use_q = &ir->compact_instructions[div->use_idx];
-    IROperand ptr_op = irop_make_vreg(shared_ptr_vreg, IROP_BTYPE_INT32);
-    IROperand null_op = {0};
-
-    /* INDEXED-DIV use site: rewrite LOAD_INDEXED→LOAD or STORE_INDEXED→STORE
-     * pointing at the shared primary's pointer.  The trailing index/scale
-     * slots are left orphaned in the pool (harmless — plain LOAD/STORE never
-     * reads them). */
-    if (use_q->op == TCCIR_OP_LOAD_INDEXED)
-    {
-      IROperand ptr_lval = ptr_op;
-      ptr_lval.is_lval = 1;
-      use_q->op = TCCIR_OP_LOAD;
-      tcc_ir_op_set_src1(ir, use_q, ptr_lval);
-      LOG_IV_SR("IV_SR: shared INDEXED-DIV at idx=%d rewritten to LOAD <- TMP%d", div->use_idx,
-                TCCIR_DECODE_VREG_POSITION(shared_ptr_vreg));
-      if (out_ptr_vreg)
-        *out_ptr_vreg = shared_ptr_vreg;
-      return 1;
-    }
-    if (use_q->op == TCCIR_OP_STORE_INDEXED)
-    {
-      IROperand ptr_lval = ptr_op;
-      ptr_lval.is_lval = 1;
-      use_q->op = TCCIR_OP_STORE;
-      tcc_ir_op_set_dest(ir, use_q, ptr_lval);
-      LOG_IV_SR("IV_SR: shared INDEXED-DIV at idx=%d rewritten to STORE -> TMP%d", div->use_idx,
-                TCCIR_DECODE_VREG_POSITION(shared_ptr_vreg));
-      if (out_ptr_vreg)
-        *out_ptr_vreg = shared_ptr_vreg;
-      return 1;
-    }
-
-    use_q->op = TCCIR_OP_ASSIGN;
-    tcc_ir_op_set_src1(ir, use_q, ptr_op);
-    tcc_ir_op_set_src2(ir, use_q, null_op);
-    /* If this DIV had a separate SHL/MUL feeding into it (shl_idx >= 0),
-     * NOP it — its result is now dead because the consuming ADD just became
-     * an ASSIGN.  Leaving a dead SHL/MUL in place would let later passes
-     * (e.g. local_alu_cse) treat its output as a live equivalent expression
-     * and CSE other matching ADDs into stale values, miscompiling the loop.
-     * For MLA-fused DIVs (shl_idx == -1) there is no separate instruction. */
-    if (div->shl_idx >= 0 && div->shl_idx < ir->next_instruction_index)
-    {
-      IRQuadCompact *shl_q = &ir->compact_instructions[div->shl_idx];
-      shl_q->op = TCCIR_OP_NOP;
-    }
-    /* Note: MLA's accum operand at +3 is now orphaned in the pool, harmless. */
-    if (out_ptr_vreg)
-      *out_ptr_vreg = shared_ptr_vreg;
-    LOG_IV_SR("IV_SR: shared-DIV at idx=%d rewritten to ASSIGN <- TMP%d (NOPed shl_idx=%d)", div->use_idx,
-              TCCIR_DECODE_VREG_POSITION(shared_ptr_vreg), div->shl_idx);
-    return 1;
   }
 
-  /* Bail out for a derived IV whose computed address feeds a MEMORY ACCESS
-   * (a load or store through that address).
+  /* Shared-pointer rewrites (share_with groups reusing a primary's pointer)
+   * are NOT supported: the rewrite ran no escape analysis and could not
+   * prove the shared use executes before the primary's `ptr += stride` bump
+   * within an iteration — reading a post-increment pointer value for a
+   * pre-increment address (docs/bugs.md #2).  The caller's one-transform-
+   * per-invocation policy makes this path unreachable anyway (a duplicate is
+   * only visited when its primary FAILED); duplicates are instead re-detected
+   * as independent primaries by the driver's re-detection loop and validated
+   * on their own. */
+  if (shared_ptr_vreg >= 0)
+    return 0;
+
+  /* Bail out for a derived IV whose computed address value can reach a MEMORY
+   * ACCESS or otherwise escape the register domain inside the loop.
    *
    * For such a DIV (address temp = base + iv*stride, then `*addr` is read or
    * written), rewriting the address computation to the strength-reduced pointer
@@ -968,8 +1022,14 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
    * Skipping these keeps strength reduction correct; the backend already forms
    * efficient indexed (LDR/STR rN,[rb,rm,LSL#k]) and post-increment addressing
    * for array element accesses, so little is lost.  A genuine non-memory
-   * derived IV (address used only in further pointer arithmetic) is still
-   * reduced. */
+   * derived IV (address used only in further register arithmetic/compares) is
+   * still reduced.
+   *
+   * The scan must cover the FULL loop body: for an unrotated top-tested loop
+   * the body proper is a detached range AFTER the back-edge ([start..end] only
+   * covers test+latch), reached via a forward jump — exactly how va-arg-24's
+   * store escaped the earlier [start_idx..end_idx] scan.  body_instrs[] holds
+   * the extended contiguous range computed by tcc_ir_detect_loops. */
   if (div->use_idx >= 0 && div->use_idx < ir->next_instruction_index)
   {
     int uop = ir->compact_instructions[div->use_idx].op;
@@ -978,29 +1038,23 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
     {
       IROperand ud = tcc_ir_op_get_dest(ir, &ir->compact_instructions[div->use_idx]);
       int32_t ud_vr = irop_get_vreg(ud);
-      int lo = loop->start_idx >= 0 ? loop->start_idx : 0;
-      int hi = loop->end_idx < ir->next_instruction_index ? loop->end_idx : ir->next_instruction_index - 1;
       if (ud_vr >= 0)
       {
-        for (int si = lo; si <= hi && !feeds_mem; si++)
+        int lo = loop->start_idx >= 0 ? loop->start_idx : 0;
+        int hi = loop->end_idx;
+        if (loop->num_body_instrs > 0)
         {
-          IRQuadCompact *sq = &ir->compact_instructions[si];
-          /* STORE-like: the address is the (lval) destination.  The base may be
-           * ud_vr itself or `ud_vr + field_offset` (see sr_vreg_is_ud_or_offset). */
-          if ((sq->op == TCCIR_OP_STORE || sq->op == TCCIR_OP_STORE_INDEXED || sq->op == TCCIR_OP_STORE_POSTINC))
-          {
-            IROperand sd = tcc_ir_op_get_dest(ir, sq);
-            if (sd.is_lval && sr_vreg_is_ud_or_offset(ir, loop, irop_get_vreg(sd), ud_vr))
-              feeds_mem = 1;
-          }
-          /* LOAD-like / any deref: the address is an lval source operand. */
-          if (!feeds_mem && irop_config[sq->op].has_src1)
-          {
-            IROperand s1 = tcc_ir_op_get_src1(ir, sq);
-            if (s1.is_lval && sr_vreg_is_ud_or_offset(ir, loop, irop_get_vreg(s1), ud_vr))
-              feeds_mem = 1;
-          }
+          int b_first = loop->body_instrs[0];
+          int b_last = loop->body_instrs[loop->num_body_instrs - 1];
+          if (b_first >= 0 && b_first < lo)
+            lo = b_first;
+          if (b_last > hi)
+            hi = b_last;
         }
+        if (hi >= ir->next_instruction_index)
+          hi = ir->next_instruction_index - 1;
+        feeds_mem = !sr_div_value_stays_in_regs(ir, lo, hi, ud_vr);
+        LOG_IV_SR("IV_SR: escape scan [%d..%d] for DIV at use_idx=%d: feeds_mem=%d", lo, hi, div->use_idx, feeds_mem);
       }
     }
     if (feeds_mem)
@@ -1840,12 +1894,11 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
     LOG_IV_SR("IV_SR: Found %d DIV(s) in loop %d", num_divs, li);
 
     /* Deduplicate DIVs that compute identical (iv, stride, base) recurrences.
-     * Without this, N identical MLAs (e.g. arr[i].a, arr[i].b, arr[i].c each
-     * computing the same &arr[i]) would each get its own strength-reduced
-     * pointer, requiring N pointer bumps in the latch — strictly worse than
-     * the original.  Mark each duplicate's share_with field with the index of
-     * the earliest equivalent DIV, so the transform can rewrite them to
-     * ASSIGN dest, primary_ptr instead of allocating fresh pointers. */
+     * A duplicate (share_with >= 0) is only attempted when its primary FAILED
+     * to transform, and transform_derived_iv refuses shared rewrites outright
+     * (no escape analysis ran for the duplicate's use site — docs/bugs.md #2),
+     * so marking a duplicate effectively defers it: the driver's re-detection
+     * loop revisits it as an independent primary with exact indices. */
     for (int dj = 1; dj < num_divs; dj++)
     {
       for (int dk = 0; dk < dj; dk++)
@@ -3668,6 +3721,83 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   if (body_count > 128)
     return 0;
 
+  /* A VAR lval marked local is the IR's ordinary "read/write this local
+   * variable" spelling.  Other lval operands dereference an address carried in
+   * a vreg (for example T123***DEREF***).  Keep those loops top-tested: the
+   * rotated bottom-tested shape exposes the deref to later forwarding/threading
+   * passes in forms they do not fully model yet. */
+#define ROT_LVAL_IS_INDIRECT(op_)                                                                               \
+  ((op_).is_lval && irop_get_vreg(op_) >= 0 &&                                                                  \
+   !(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op_)) == TCCIR_VREG_TYPE_VAR && (op_).is_local))
+
+  {
+    int32_t iv_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, cmp_q));
+    int32_t seen_reads[32];
+    int nseen_reads = 0;
+    int32_t carried_defs[8];
+    int ncarried_defs = 0;
+
+#define ROT_NOTE_READ(op_)                                                                                       \
+    do {                                                                                                         \
+      int32_t _vr = irop_get_vreg(op_);                                                                          \
+      if (_vr >= 0 && _vr != iv_vr && TCCIR_DECODE_VREG_TYPE(_vr) == TCCIR_VREG_TYPE_VAR) {                     \
+        int _seen = 0;                                                                                           \
+        for (int _k = 0; _k < nseen_reads; _k++)                                                                 \
+          if (seen_reads[_k] == _vr) {                                                                           \
+            _seen = 1;                                                                                           \
+            break;                                                                                               \
+          }                                                                                                      \
+        if (!_seen && nseen_reads < (int)(sizeof(seen_reads) / sizeof(seen_reads[0])))                           \
+          seen_reads[nseen_reads++] = _vr;                                                                       \
+      }                                                                                                          \
+    } while (0)
+
+#define ROT_NOTE_DEF(op_)                                                                                        \
+    do {                                                                                                         \
+      int32_t _vr = irop_get_vreg(op_);                                                                          \
+      if (_vr >= 0 && _vr != iv_vr && TCCIR_DECODE_VREG_TYPE(_vr) == TCCIR_VREG_TYPE_VAR) {                     \
+        int _read = 0;                                                                                           \
+        for (int _k = 0; _k < nseen_reads; _k++)                                                                 \
+          if (seen_reads[_k] == _vr) {                                                                           \
+            _read = 1;                                                                                           \
+            break;                                                                                               \
+          }                                                                                                      \
+        if (_read) {                                                                                             \
+          int _carried = 0;                                                                                      \
+          for (int _k = 0; _k < ncarried_defs; _k++)                                                             \
+            if (carried_defs[_k] == _vr) {                                                                       \
+              _carried = 1;                                                                                      \
+              break;                                                                                             \
+            }                                                                                                    \
+          if (!_carried && ncarried_defs < (int)(sizeof(carried_defs) / sizeof(carried_defs[0])))                \
+            carried_defs[ncarried_defs++] = _vr;                                                                 \
+        }                                                                                                        \
+      }                                                                                                          \
+    } while (0)
+
+    for (int i = body_start; i <= body_end; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int op = q->op;
+      if (irop_config[op].has_src1)
+        ROT_NOTE_READ(tcc_ir_op_get_src1(ir, q));
+      if (irop_config[op].has_src2)
+        ROT_NOTE_READ(tcc_ir_op_get_src2(ir, q));
+      if (op == TCCIR_OP_MLA)
+        ROT_NOTE_READ(tcc_ir_op_get_accum(ir, q));
+      if (irop_config[op].has_dest)
+        ROT_NOTE_DEF(tcc_ir_op_get_dest(ir, q));
+    }
+    if (ncarried_defs > 1)
+    {
+      LOG_LOOP_OPT("Rotation: reject — body carries %d non-IV VARs", ncarried_defs);
+      return 0;
+    }
+
+#undef ROT_NOTE_READ
+#undef ROT_NOTE_DEF
+  }
+
   /* Calls inside the rotated body make the carried live ranges cross a
    * different control-flow shape after rotation.  Later forwarding/coalescing
    * can then observe the preheader/body copies as interchangeable when the
@@ -3676,6 +3806,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   for (int i = body_start; i <= body_end; i++)
   {
     int op = ir->compact_instructions[i].op;
+    IRQuadCompact *q = &ir->compact_instructions[i];
     if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
     {
       LOG_LOOP_OPT("Rotation: reject — body has call at %d", i);
@@ -3686,7 +3817,17 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
       LOG_LOOP_OPT("Rotation: reject — body has indexed memory op at %d", i);
       return 0;
     }
+    if ((irop_config[op].has_src1 && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_src1(ir, q))) ||
+        (irop_config[op].has_src2 && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_src2(ir, q))) ||
+        (op == TCCIR_OP_MLA && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_accum(ir, q))) ||
+        ((op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_POSTINC) &&
+         irop_config[op].has_dest && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_dest(ir, q))))
+    {
+      LOG_LOOP_OPT("Rotation: reject — body has indirect lvalue operand at %d", i);
+      return 0;
+    }
   }
+#undef ROT_LVAL_IS_INDIRECT
 
   /* --- Step 4a2: Reject if body has a fall-through exit --- */
   /* When body_end_is_implicit, the body may end with trailing NOPs (from

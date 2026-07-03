@@ -410,6 +410,24 @@ static void iload_remove_vr(GLoadState *st, int32_t vr)
   }
 }
 
+/* A direct def of an address-taken VAR/PARAM (`V <-- T SUB #imm`, plain ALU
+ * or ASSIGN — not a STORE op) still writes V's stack slot, memory that the
+ * TEMP-pointer-keyed trackers (iloads, tvstores) may name through a `&V`
+ * pointer.  Keying by vreg ID can't see that aliasing, so drop both trackers
+ * (fuzz ptr seed 6734: `p = &u; ..= *p; u = expr; ..= *p` — the second read
+ * CSE'd to the first across u's update). */
+static void ptr_state_kill_for_addrtaken_def(TCCIRState *ir, GLoadState *st, int32_t dvr)
+{
+  int type = TCCIR_DECODE_VREG_TYPE(dvr);
+  if (type != TCCIR_VREG_TYPE_VAR && type != TCCIR_VREG_TYPE_PARAM)
+    return;
+  IRLiveInterval *vi = tcc_ir_vreg_live_interval(ir, dvr);
+  if (vi && !vi->addrtaken)
+    return;
+  st->ilcount = 0;
+  st->tvcount = 0;
+}
+
 /* Kill iload entries that may alias a store at byte range [store_lo, store_hi)
  * through base store_base_vr.  Entries with a different base_vr are killed
  * conservatively (different TEMP vregs may still alias the same memory). */
@@ -680,10 +698,20 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
                 st->sstores[sk].base_var == load_base) {
               SStoreEntry *se = &st->sstores[sk];
               if (se->stored_vr < 0) {
+                /* The deref source is replaced by the forwarded immediate,
+                 * so the pointer vreg is no longer referenced here — drop
+                 * its use record, like every sibling forwarding path.  A
+                 * stale entry corrupts the pointer's use list (ptr fuzz
+                 * seed 7226: a later swap-remove + count-only rebuild left
+                 * the wrong entry, a live deref use vanished, and cprop/DCE
+                 * deleted the pointer's def while a deref still read it). */
+                if (src.tag == IROP_TAG_VREG) {
+                  IRSSAVregInfo *pvi = ssa_opt_vinfo(ctx, irop_get_vreg(src));
+                  if (pvi)
+                    ssa_opt_remove_use_instr(pvi, i);
+                }
                 tcc_ir_set_src1(ir, i, se->stored_imm);
                 changes++;
-                /* Refresh dest after rewrite (no-op for STORE; just use
-                 * existing local to keep flow consistent). */
               }
             }
           }
@@ -693,6 +721,14 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
       /* Track StackLoc stores for stack forwarding.  Record the stored
        * slot width so narrower subfield loads do not reuse wider values. */
       if (dest.tag == IROP_TAG_STACKOFF) {
+        /* A real stack memory write may alias any TVStore pointer: a
+         * tvstore is only tracked when its pointer did NOT resolve to a
+         * stack slot, so nothing proves it doesn't point right here (ptr
+         * fuzz seed 8507: `*T = const` with T = Addr[StackLoc[-32]]+4
+         * survived the direct store `StackLoc[-28] <- u2` to the same
+         * address and forwarded the stale constant into a later deref). */
+        if (dest.is_lval || q->op == TCCIR_OP_STORE_INDEXED)
+          st->tvcount = 0;
         IROperand src = tcc_ir_op_get_src1(ir, q);
         int32_t svr = irop_get_vreg(src);
         /* Direct stack stores are encoded as StackLoc lvalues.  Non-lvalue
@@ -707,6 +743,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
             sstore_track_vr(st, irop_get_stack_offset(dest), store_btype, svr, dest_base);
           else if (irop_is_immediate(src))
             sstore_track_imm(st, irop_get_stack_offset(dest), store_btype, src, dest_base);
+          else {
+            int off = irop_get_stack_offset(dest);
+            sstore_invalidate_overlap(st, off, store_btype);
+            sstore_remove_offset(st, off);
+          }
         } else if (q->op == TCCIR_OP_STORE_INDEXED) {
           /* Indexed write through a stack base address (Addr[StackLoc[B]] +
            * idx*scale).  The base-offset-only removal in the plain branch below
@@ -857,12 +898,18 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
             gstore_remove_vr(st, dvr);
             tvstore_remove_vr(st, dvr);
             iload_remove_vr(st, dvr);
+            ptr_state_kill_for_addrtaken_def(ir, st, dvr);
           }
           continue;
         }
       }
 
       if (dest.is_sym && dest.is_lval) {
+        /* Same aliasing gap as stack stores: an unresolved TVStore pointer
+         * may name this very global (`&sym + off` LEAs that never became
+         * SymRef operands are exactly what tvstores track), so a direct
+         * sym store must drop them. */
+        st->tvcount = 0;
         IRPoolSymref *sref = irop_get_symref_ex(ir, dest);
         if (sref && sref->sym) {
           for (int k = 0; k < st->count; k++) {
@@ -936,6 +983,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
         gstore_remove_vr(st, qdvr);
         tvstore_remove_vr(st, qdvr);
         iload_remove_vr(st, qdvr);
+        ptr_state_kill_for_addrtaken_def(ir, st, qdvr);
       }
     }
 

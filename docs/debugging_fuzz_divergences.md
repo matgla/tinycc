@@ -18,7 +18,40 @@ cd libs/tinycc
 make cross -j$(nproc)          # armv8m-tcc must be current after every edit
 ```
 
-## 1. Reproduce + confirm the divergence
+## 1. Recollect everything for one sweep-report seed (start here)
+
+The sweep reports (`fuzz_triage_*.md`) list seeds **per suite/profile**:
+`ptr 5759` means seed 5759 of gen_c.py's `ptr` profile — NOT the program
+`diff_olevels.py --seed 5759` (default profile) would generate.
+`scripts/triage_seed.py` owns that mapping and collects the whole
+investigation starting kit in one command:
+
+```bash
+python3 scripts/triage_seed.py --suite longlong --seed 3161
+# or, for an existing repro file:
+python3 scripts/triage_seed.py --file repro.c
+```
+
+It writes to `tests/fuzz/results/triage/<suite>_<seed>/`:
+
+- `seed.c` — the generated program
+- `outputs.txt` — tcc signatures at `-O0/-O1/-O2/-Os` with FULL output, so a
+  HardFault keeps its `PC=/CFSR=/BFAR=` register dump
+- `gcc_reference.txt` — `arm-none-eabi-gcc -O2` ground truth (must equal
+  tcc `-O0`; a mismatch is loudly flagged — suspect a gcc-bad quarantine case)
+- `crash_disasm.txt` — (crash signatures only) force-thumb disassembly window
+  around the faulting PC of the divergent ELF
+- `reduced.c` — line-granularity reduction preserving the divergence
+- `bisect.txt` — `bisect_opt.py` Phase A/B/C output on the reduced repro
+- `SUMMARY.md` — one-page digest (signatures, divergent level, culprit knobs)
+
+`--skip-reduce` / `--skip-bisect` skip the slow steps; `--olevels` narrows the
+level list. Exit code: 0 consistent, 1 divergence collected, 2 infra error.
+
+Steps 2–3 below describe what the collector runs under the hood (and how to
+re-run each piece by hand when iterating on a fix).
+
+### Manual reproduce + confirm
 
 ```bash
 # one seed, all O-levels self-consistency:
@@ -180,6 +213,17 @@ ones are expected — compare against `fuzz_triage_0_5000.md`).
 - **`-O0` is the oracle, but `char`/`long` ABI matters.** Always compare against
   `gcc -m32 -funsigned-char`; plain `gcc` (signed char) makes correct ARM code
   look wrong.
+- **HardFault + MANY unrelated "fixing" knobs = backend layout bug, not an IR
+  misfold.** When Phase A reports half the knob list (each just shifts code
+  layout) and the signature is a wild `PC`/`BFAR`, stop reading IR and read the
+  disassembly around the stacked PC first (`crash_disasm.txt` from
+  `triage_seed.py`, or `arm-none-eabi-objdump -d -M force-thumb`). A PC that
+  lands in objdump "garbage" is execution falling into data. ptr seed 5759: a
+  literal-pool flush landed INSIDE an ITE block — the pool's B.W skip-branch
+  occupied the else-arm slot, so the then-path fell through into pool data
+  (fix: IT-window guard in `ot()`, test 254). Same family as seed 2987 (STRD
+  fuse across a jump target, test 251): the IR is fine; the emitted layout
+  isn't.
 - **Size-sensitive tests.** A codegen-layout change can break tests like
   `96_nodata_wanted` (labels-as-values / literal pools). If a "fix" breaks an
   unrelated test, suspect literal-pool or branch-range regressions, not the test.

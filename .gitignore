@@ -73,6 +73,14 @@ tests/hello
 tests/tests2/fred.txt
 libtcc.dylib
 build/
+build_backend/
+build_libtcc_api/
+build_tccgen/
+build_tccopt/
+build_tccelf/
+build_tccpp/
+build_tcctools/
+build_tccyaff/
 rootfs/
 __pycache__/
 tests/ir_tests/qemu/mps2-an505/newlib_build/
@@ -111,3 +119,6 @@ __pycache__/
 *.pyc
 tests/fuzz/results/*
 tests/fuzz/fuzz_triage_repros/
+/tests/fuzz/.sweep_cache/
+tests/unit/arm/armv8m/build*
+

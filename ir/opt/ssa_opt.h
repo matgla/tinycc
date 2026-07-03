@@ -101,6 +101,9 @@ int ssa_opt_run_gens(IRSSAOptCtx *ctx, const IRSSAOptGen *gens, int count);
 IRSSAVregInfo *ssa_opt_vinfo(IRSSAOptCtx *ctx, int32_t vreg);
 void ssa_opt_add_use_instr(IRSSAVregInfo *vi, int instr_idx);
 void ssa_opt_add_use_phi(IRSSAVregInfo *vi, int block, int slot);
+/* Append use-list entries for every vreg `q` (at index i) reads — same rules
+ * as the init-time scan (src1/src2, MLA accum, memory-write STORE dest). */
+void ssa_opt_scan_instr_uses(IRSSAOptCtx *ctx, int i, IRQuadCompact *q);
 void ssa_opt_remove_use_instr(IRSSAVregInfo *vi, int instr_idx);
 void ssa_opt_nop_instr(IRSSAOptCtx *ctx, int idx);
 int ssa_opt_replace_all_uses(IRSSAOptCtx *ctx, int32_t old_vr, int32_t new_vr);

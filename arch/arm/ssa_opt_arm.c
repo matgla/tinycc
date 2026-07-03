@@ -10,6 +10,7 @@
 
 #define USING_GLOBALS
 #include "ir.h"
+#include "opt_xform.h"
 #include "ssa_opt.h"
 #include "ssa_opt_arm.h"
 
@@ -89,12 +90,20 @@ int ssa_gen_arm_fuse_mul_add_to_mla(IRSSAOptCtx *ctx, int instr_idx)
     return 0;
 
   /* Place the MLA at the ADD's position. By SSA dominance, MUL's inputs and
-   * the accumulator are all defined before the ADD, so this is always valid.
-   * Placing the MLA at the MUL's position would require the accumulator to
-   * dominate the MUL — that's the rarer case. */
+   * the accumulator are all defined before the ADD, so this is always valid
+   * for register operands.  Placing the MLA at the MUL's position would
+   * require the accumulator to dominate the MUL — that's the rarer case. */
   IROperand add_dest = tcc_ir_op_get_dest(ir, add_q);
   IROperand mul_src1 = tcc_ir_op_get_src1(ir, mul_q);
   IROperand mul_src2 = tcc_ir_op_get_src2(ir, mul_q);
+
+  /* A MUL source that reads memory would be re-read at the ADD's site;
+   * any store to that location in between changes the loaded value
+   * (volatile fuzz seed 5053: `vv11 = st.f0 * u5` before a loop that
+   * updates st.f0, product consumed after the loop). */
+  if ((ir_xform_operand_reads_memory(mul_src1) || ir_xform_operand_reads_memory(mul_src2)) &&
+      (add_q->is_jump_target || !ir_xform_range_preserves_memory(ir, instr_idx, add_idx)))
+    return 0;
 
   /* Allocate fresh pool space for the MLA's 4 operands (dest, src1, src2,
    * accum). Reusing the ADD's operand_base would clobber the next

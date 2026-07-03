@@ -225,6 +225,11 @@ int vararg_push_size = 0;       /* bytes pushed for variadic r0-r3 save (16 or 0
  * (right below pushed regs), so locals are addressed relative to
  * allocated_stack_size (without pad):
  * FP + frame_offset = SP + allocated_stack_size + frame_offset. */
+/* Bytes the real run's scratch PUSHes have currently moved SP below its
+ * steady-state position (see get_scratch_reg_with_save).  Defined after the
+ * scratch bookkeeping state below. */
+static int scratch_push_sp_bias(void);
+
 static inline int fp_adjust_local_offset(int frame_offset, int is_param)
 {
   if (is_param)
@@ -233,8 +238,12 @@ static inline int fp_adjust_local_offset(int frame_offset, int is_param)
   if (!tcc_state->need_frame_pointer && frame_offset <= 0)
   {
     /* Convert FP-relative (negative) to SP-relative (positive).
-     * FP + frame_offset = SP + allocated_stack_size + frame_offset. */
-    return allocated_stack_size + frame_offset;
+     * FP + frame_offset = SP + allocated_stack_size + frame_offset.
+     * A scratch PUSH inside the current instruction has moved SP down;
+     * without the bias every access in the push window reads/writes 4
+     * bytes low per active push (struct_byval fuzz seed 6105: LDR of a
+     * by-value field between push {r0} and pop {r0}). */
+    return allocated_stack_size + scratch_push_sp_bias() + frame_offset;
   }
 
   if (frame_offset < 0 && callee_push_size > 0)
@@ -851,6 +860,21 @@ typedef struct CodeGenDryRunState
 } CodeGenDryRunState;
 
 static CodeGenDryRunState dry_run_state;
+
+/* Bytes the real run's scratch PUSHes have currently moved SP below its
+ * steady-state position.  Derived from the push bookkeeping so it can never
+ * drift from the actual PUSH/POP pairing (including deferred pops).  The dry
+ * run never emits pushes, so its bias is always 0. */
+static int scratch_push_sp_bias(void)
+{
+  if (dry_run_state.active)
+    return 0;
+  int bias = 0;
+  for (int i = 0; i < scratch_push_count; i++)
+    if (scratch_push_type[i] == 1)
+      bias += 4;
+  return bias;
+}
 
 /* Separate literal pool for dry-run mode to avoid modifying the real pool.
  * This allows accurate code size tracking without affecting the real pass. */
@@ -1532,7 +1556,7 @@ no_free_reg:
       scratch_save_slot < (ir->scratch_save_size / 4))
   {
     int frame_offset = ir->scratch_save_base + (scratch_save_slot * 4);
-    int sp_offset = allocated_stack_size + frame_offset;
+    int sp_offset = allocated_stack_size + scratch_push_sp_bias() + frame_offset;
     if (!store_word_to_base(reg_to_save, R_SP, sp_offset, 0))
       tcc_error("compiler_error: scratch save STR failed (offset %d)", sp_offset);
     result.reg = reg_to_save;
@@ -1601,7 +1625,7 @@ static void restore_scratch_reg(ScratchRegAlloc *alloc)
     if (scratch_save_slot > 0)
       scratch_save_slot--;
     int frame_offset = ir->scratch_save_base + (scratch_save_slot * 4);
-    int sp_offset = allocated_stack_size + frame_offset;
+    int sp_offset = allocated_stack_size + scratch_push_sp_bias() + frame_offset;
     if (!load_word_from_base(alloc->reg, R_SP, sp_offset, 0))
       tcc_error("compiler_error: scratch restore LDR failed (offset %d)", sp_offset);
     alloc->saved = 0;
@@ -1661,19 +1685,23 @@ static void restore_all_pushed_scratch_regs(void)
     return;
   }
 
-  /* Restore in reverse order */
+  /* Restore in reverse order.  scratch_push_count is trimmed as each entry
+   * is restored so scratch_push_sp_bias() sees only the still-active pushes
+   * while emitting the LDRs below. */
   for (int i = scratch_push_count - 1; i >= 0; i--)
   {
     int reg = scratch_push_stack[i];
-    LOG_SCRATCH("auto-restoring r%d (push order %d, type %d)", reg, i, scratch_push_type[i]);
-    if (scratch_push_type[i] == 2)
+    int type = scratch_push_type[i];
+    LOG_SCRATCH("auto-restoring r%d (push order %d, type %d)", reg, i, type);
+    scratch_push_count = i;
+    if (type == 2)
     {
       /* Saved to scratch area: restore via LDR */
       TCCIRState *ir = tcc_state->ir;
       if (scratch_save_slot > 0)
         scratch_save_slot--;
       int frame_offset = ir->scratch_save_base + (scratch_save_slot * 4);
-      int sp_offset = allocated_stack_size + frame_offset;
+      int sp_offset = allocated_stack_size + scratch_push_sp_bias() + frame_offset;
       if (!load_word_from_base(reg, R_SP, sp_offset, 0))
         tcc_error("compiler_error: scratch auto-restore LDR failed (offset %d)", sp_offset);
     }
@@ -2743,6 +2771,16 @@ static int th_literal_pool_would_flush_for(int upcoming_bytes)
   return thumb_gen_state.code_size + pool_count * 4 + upcoming_bytes >= 1020;
 }
 
+/* Count of conditioned instructions still pending inside an IT/ITE/... block,
+ * tracked by ot() purely for literal-pool flush suppression.  Kept separate
+ * from mov_equiv_it_pending, which mov_equiv_reset_all() may zero mid-block.
+ * While this is non-zero a pool flush would land INSIDE the IT block: the
+ * flush emits its pool + B.W skip-branch BEFORE the bytes of the op being
+ * emitted, so the branch would occupy a conditioned slot, inherit the IT
+ * condition, and the opposite arm would fall through into pool data and
+ * execute it (fuzz ptr seed 5759: O2 HardFault). */
+static int pool_flush_it_pending;
+
 int is_valid_opcode(thumb_opcode op)
 {
   return (op.size == 2 || op.size == 4);
@@ -2914,15 +2952,6 @@ int ot(thumb_opcode op)
   if (op.size == 0)
     return op.size;
 
-  /* DEBUG: emit-stream trace for the 90_struct miscompile. Same compiler +
-   * identical stable allocation ⇒ device and QEMU emit identical opcode streams
-   * up to the silicon-divergent branch; diffing this trace pinpoints the first
-   * differing emitted instruction (and its IR index). Real-run only. */
-  if (!dry_run_state.active && funcname &&
-      !strcmp((const char *)funcname, "test_init_struct_from_struct") && tcc_state && tcc_state->ir)
-    fprintf(stderr, "EMIT i=%d ind=0x%x op=0x%x sz=%d\n", tcc_state->ir->codegen_instruction_idx, (unsigned)ind,
-            (unsigned)op.opcode, op.size);
-
   /* Detect instructions that write to R9 when it's reserved for GOT pointer.
    * Exclude push/pop/stmdb/ldmia which legitimately save/restore R9. */
   if (text_and_data_separation && !allow_r9_write)
@@ -3078,6 +3107,36 @@ int ot(thumb_opcode op)
     imm_cache_reset_all();
   }
 
+  /* Literal-pool flush safety around IT blocks.  Call-site reservations
+   * (th_literal_pool_reserve_upcoming_bytes) cover the block's CODE bytes,
+   * but a conditioned arm that materializes a large constant
+   * (load_full_const) grows the pool AFTER the reservation was checked, so
+   * the threshold can still trip mid-block.  Track the architectural IT
+   * window here and (a) never flush while an op is conditioned, (b) flush
+   * BEFORE the IT opcode itself if the worst-case block — 4 code bytes plus
+   * an 8-byte pool entry per conditioned instruction — could hit the
+   * threshold, so the deferred flush of (a) never overshoots the LDR-literal
+   * range.  Runs in both passes so dry-run and real layouts stay identical. */
+  int op_in_it_block = 0;
+  if (thumb_gen_state.generating_function)
+  {
+    if (pool_flush_it_pending > 0)
+    {
+      op_in_it_block = 1;
+      pool_flush_it_pending--;
+    }
+    else
+    {
+      int it_len = mov_equiv_it_block_length(op);
+      if (it_len > 0)
+      {
+        if (thumb_gen_state.code_size + op.size + thumb_gen_state.literal_pool_count * 4 + 12 * it_len >= 1020)
+          th_literal_pool_generate();
+        pool_flush_it_pending = it_len;
+      }
+    }
+  }
+
   /* Dry run: don't emit actual opcodes, but still track code size and
    * handle literal pool generation to ensure code addresses match real pass. */
   if (dry_run_state.active)
@@ -3090,7 +3149,7 @@ int ot(thumb_opcode op)
        * code size including the literal pool, so that ind matches
        * between dry-run and real pass. */
       const int max_offset = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4;
-      if (max_offset >= 1020)
+      if (max_offset >= 1020 && !op_in_it_block)
       {
         th_literal_pool_generate();
       }
@@ -3105,7 +3164,7 @@ int ot(thumb_opcode op)
     thumb_gen_state.code_size += op.size;
     // 16-bit encoding for ldr should be efficient
     const int max_offset = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4;
-    if (max_offset >= 1020)
+    if (max_offset >= 1020 && !op_in_it_block)
     {
       th_literal_pool_generate();
     }
@@ -6650,18 +6709,23 @@ ST_FUNC void tcc_gen_machine_mla_mop(MachineOperand src1, MachineOperand src2, M
 
   /* Pre-exclude registers directly referenced by REG operands so that scratch
    * allocations for other operands (e.g. immediates) cannot clobber them.
+   * A dereferenced operand's r0 is its POINTER register — it must survive
+   * until that operand's load is emitted, so it is excluded exactly like a
+   * plain value register (ptr fuzz seed 59549: src2's spill reload picked the
+   * deref-accumulator's pointer register as scratch, and the accumulator then
+   * dereferenced the just-loaded multiplicand value → wild-address fault).
    * The pre-allocated DEST register must be excluded too: if a source load
    * grabs it as a saved scratch (push/pop), the restoring pop after the MLA
    * overwrites the just-computed result. */
   uint32_t live_regs = 0;
-  if (src1.kind == MACH_OP_REG && !src1.needs_deref)
+  if (src1.kind == MACH_OP_REG && src1.u.reg.r0 >= 0 && src1.u.reg.r0 < 16)
     live_regs |= (1u << (uint32_t)src1.u.reg.r0);
-  if (src2.kind == MACH_OP_REG && !src2.needs_deref)
+  if (src2.kind == MACH_OP_REG && src2.u.reg.r0 >= 0 && src2.u.reg.r0 < 16)
     live_regs |= (1u << (uint32_t)src2.u.reg.r0);
-  if (accum.kind == MACH_OP_REG && !accum.needs_deref)
+  if (accum.kind == MACH_OP_REG && accum.u.reg.r0 >= 0 && accum.u.reg.r0 < 16)
     live_regs |= (1u << (uint32_t)accum.u.reg.r0);
-  if (dest.kind == MACH_OP_REG && !dest.needs_deref &&
-      dest.u.reg.r0 != (int)PREG_REG_NONE)
+  if (dest.kind == MACH_OP_REG &&
+      dest.u.reg.r0 != (int)PREG_REG_NONE && dest.u.reg.r0 >= 0 && dest.u.reg.r0 < 16)
     live_regs |= (1u << (uint32_t)dest.u.reg.r0);
 
   int src1_reg = mach_ensure_in_reg(&ctx, &src1, live_regs);
@@ -6827,6 +6891,13 @@ ST_FUNC int tcc_gen_machine_mlal_accum_mop(MachineOperand src1, MachineOperand s
   s2.is_64bit = false;
 
   uint32_t excl = (1u << (uint32_t)rd_lo) | (1u << (uint32_t)rd_hi);
+  /* Pre-exclude both sources' registers (a deref operand's r0 is its pointer
+   * register) so ensuring one source cannot grab the other's register as a
+   * spill-reload scratch — same clobber class as tcc_gen_machine_mla_mop. */
+  if (s1.kind == MACH_OP_REG && s1.u.reg.r0 >= 0 && s1.u.reg.r0 < 16)
+    excl |= (1u << (uint32_t)s1.u.reg.r0);
+  if (s2.kind == MACH_OP_REG && s2.u.reg.r0 >= 0 && s2.u.reg.r0 < 16)
+    excl |= (1u << (uint32_t)s2.u.reg.r0);
   int rn = mach_ensure_in_reg(&ctx, &s1, excl);
   if (thumb_is_hw_reg(rn))
     excl |= (1u << (uint32_t)rn);
@@ -9487,6 +9558,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   /* MOV-coalescing cache is per-function: register live ranges don't
    * cross function boundaries. */
   mov_equiv_reset_all();
+  pool_flush_it_pending = 0;
   TCCIRState *ir = tcc_state->ir;
 
   /* Determine if LR needs saving */
@@ -12485,7 +12557,7 @@ ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROp
    * Compute dest address into r0 BEFORE pushing lr, since the address is
    * sp-relative and pushing changes sp.  The BL to memcpy clobbers lr,
    * so we must save/restore it for leaf functions whose prologue didn't. */
-  if (size >= 64)
+  if (size >= TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES)
   {
     tcc_machine_addr_of_stack_slot(R0, frame_offset, 0 /* not param */);
     tcc_machine_load_constant(R1, PREG_REG_NONE, symref->addend, 0, sym);

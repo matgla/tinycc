@@ -3360,6 +3360,20 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
               var_used[pos / 8] |= (1 << (pos % 8));
           }
         }
+
+        /* MLA accumulator (4th operand) is a use not covered by src1/src2
+         * (ptr seed 6869: a VAR read only as an MLA addend looked dead). */
+        if (q->op == TCCIR_OP_MLA)
+        {
+          const IROperand acc = tcc_ir_op_get_accum(ir, q);
+          int32_t vr = irop_get_vreg(acc);
+          if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+          {
+            int pos = TCCIR_DECODE_VREG_POSITION(vr);
+            if (pos <= max_var_pos)
+              var_used[pos / 8] |= (1 << (pos % 8));
+          }
+        }
       }
 
       /* NOP ASSIGN/STORE to unused VARs (skip address-taken) */
@@ -3704,6 +3718,26 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
             if (origin != -1)
             {
               LOG_IR_GEN("DSE-SL: Phase3 MARK READ origin=%d at i=%d op=%d src2", origin, i, q->op);
+              MARK_ORIGIN_READ(origin);
+            }
+          }
+        }
+
+        /* MLA accumulator (4th operand) is a use not surfaced by src1/src2
+         * (struct_byval seed 11651): `T <-- Ta MLA Tb + Tacc***DEREF***`
+         * reads memory through an addr-prop TMP, and a non-deref accumulator
+         * lets the pointer value escape the tracker via the MLA dest.
+         * Conservatively mark the origin read either way. */
+        if (q->op == TCCIR_OP_MLA)
+        {
+          IROperand s = tcc_ir_op_get_accum(ir, q);
+          int32_t vr = irop_get_vreg(s);
+          if (vr >= 0)
+          {
+            int origin = GET_ORIGIN(vr);
+            if (origin != -1)
+            {
+              LOG_IR_GEN("DSE-SL: Phase3 MARK READ origin=%d at i=%d op=%d accum", origin, i, q->op);
               MARK_ORIGIN_READ(origin);
             }
           }
@@ -5241,6 +5275,21 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
     {
       IROperand src2 = tcc_ir_op_get_src2(ir, q);
       int32_t vr = irop_get_vreg(src2);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos <= max_var)
+          pending[pos] = -1;
+      }
+    }
+
+    /* MLA accumulator (4th operand) is a read not surfaced by src1/src2
+     * (ptr 6869 family): a VAR read only as an MLA addend must clear its
+     * pending assign, or the assign gets NOP'd as "overwritten unread". */
+    if (q->op == TCCIR_OP_MLA)
+    {
+      IROperand acc = tcc_ir_op_get_accum(ir, q);
+      int32_t vr = irop_get_vreg(acc);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);

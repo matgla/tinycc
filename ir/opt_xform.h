@@ -32,4 +32,20 @@ int tcc_ir_opt_store_inplace_arith(TCCIRState *ir);
 struct IROptCtx;
 int tcc_ir_opt_store_inplace_arith_ex(struct IROptCtx *ctx);
 
+/* An operand with is_lval (or is_llocal) is a fused memory read — a stack
+ * slot, a deref through a pointer, or a global — evaluated when the
+ * instruction executes, not when the operand's vreg was defined. */
+static inline int ir_xform_operand_reads_memory(IROperand op)
+{
+  return op.is_lval || op.is_llocal;
+}
+
+/* Moving an instruction's memory-read operand to a different program point
+ * changes which value the load observes if any store to that location can
+ * execute in between.  Return 1 when every instruction strictly between lo
+ * and hi is straight-line (no control flow in or out, no jump targets) and
+ * cannot write memory, so a memory read may be moved between lo and hi
+ * safely. */
+int ir_xform_range_preserves_memory(TCCIRState *ir, int lo, int hi);
+
 #endif /* TCC_IR_OPT_XFORM_H */

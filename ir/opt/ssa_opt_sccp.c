@@ -491,6 +491,17 @@ static int sccp_resolved_stack_write_between(SCCPState *s, int store_idx, int lo
         if (extent_hi > load_lo && load_hi > extent_lo)
           return 1; /* the array's plausible extent covers the load slot */
       }
+      /* A plain STORE through a pointer that doesn't resolve to a concrete
+       * stack slot (e.g. the pointer lives in a named VAR) can write any
+       * address-taken frame slot — including our load's.  The entry-block
+       * exemption must not skip it (ptr fuzz seed 58108: a conditional
+       * `*p10 = v` between arr8's initializer and an arr8[5] load was
+       * ignored, folding the load back to the initializer).  VAR-slot
+       * writes and address-materialisation pseudo-stores stay permissive,
+       * as do calls (handled by the caller's dominator-path checks). */
+      else if (q->op == TCCIR_OP_STORE && sccp_store_may_escape(s->ctx, q)) {
+        return 1;
+      }
       continue;
     }
     int store_lo = target;

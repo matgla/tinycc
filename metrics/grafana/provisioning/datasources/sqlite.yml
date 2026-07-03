@@ -1,0 +1,9 @@
+apiVersion: 1
+
+datasources:
+  - name: TCC Metrics
+    type: frser-sqlite-datasource
+    uid: tcc-metrics-sqlite
+    isDefault: true
+    jsonData:
+      path: /data/metrics.db

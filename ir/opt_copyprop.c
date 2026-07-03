@@ -1138,8 +1138,17 @@ int tcc_ir_opt_cse_param_add(TCCIRState *ir)
           int wt = TCCIR_DECODE_VREG_TYPE(wvr);
           if (wt == TCCIR_VREG_TYPE_VAR || wt == TCCIR_VREG_TYPE_PARAM)
           {
+            /* The same local can be CSE-keyed either by its raw VAR/PARAM
+             * vreg (register form) or by the STACKOFF synthetic key
+             * (0x70000000|pos, the memory form used when it's read as a
+             * stack lvalue).  A register-form write changes the value a
+             * later stack-slot read of the same slot would observe, so it
+             * must invalidate BOTH keys — otherwise a `V - #c` computed
+             * after the write gets CSE'd to one computed before it, across
+             * the redefinition (int fuzz seed 41379). */
+            int32_t syn_key = (int32_t)(0x70000000 | ((uint32_t)wvr & 0x0FFFFFFF));
             for (int e = 0; e < entry_count; e++)
-              if (entries[e].valid && entries[e].src_vr == wvr)
+              if (entries[e].valid && (entries[e].src_vr == wvr || entries[e].src_vr == syn_key))
                 entries[e].valid = 0;
           }
         }
@@ -1149,9 +1158,12 @@ int tcc_ir_opt_cse_param_add(TCCIRState *ir)
         int32_t w_vr = irop_get_vreg(wd);
         if (tcc_ir_vreg_is_valid(ir, w_vr))
         {
+          /* Symmetric to the register-form case above: a memory-form store
+           * to the slot must also kill any raw-vreg-keyed entry for the
+           * same local. */
           int32_t syn_key = (int32_t)(0x70000000 | ((uint32_t)w_vr & 0x0FFFFFFF));
           for (int e = 0; e < entry_count; e++)
-            if (entries[e].valid && entries[e].src_vr == syn_key)
+            if (entries[e].valid && (entries[e].src_vr == syn_key || entries[e].src_vr == w_vr))
               entries[e].valid = 0;
         }
       }

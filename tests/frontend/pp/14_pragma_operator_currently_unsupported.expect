@@ -1,0 +1,2 @@
+_Pragma("message \"hi\"")
+int x = 1;

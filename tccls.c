@@ -266,6 +266,31 @@ uint32_t tcc_ls_compute_live_regs(LSLiveIntervalState *ls, int instruction_idx)
   return live_regs;
 }
 
+/* True when physical register `reg` is claimed at instruction `pos` by any
+ * live interval other than `skip`.  Post-RA register rewriters (move
+ * coalescing, the phase-3 scratch-conflict fixup) deliberately make two
+ * overlapping intervals share one register (in-place two-address ops), so a
+ * single live_regs_by_instruction bit can carry two claims.  When a rewrite
+ * moves one claimant away it must leave the bit set wherever another claimant
+ * is still live, or the bitmap under-reports and a later rewrite allocates
+ * the register on top of a live value. */
+int tcc_ls_reg_held_by_other(const LSLiveIntervalState *ls, int reg, int pos, const LSLiveInterval *skip)
+{
+  for (int i = 0; i < ls->next_interval_index; ++i)
+  {
+    const LSLiveInterval *iv = &ls->intervals[i];
+    if (iv == skip)
+      continue;
+    if (iv->stack_location != 0)
+      continue;
+    if (iv->r0 != reg && iv->r1 != reg)
+      continue;
+    if (iv->start <= (uint32_t)pos && iv->end >= (uint32_t)pos)
+      return 1;
+  }
+  return 0;
+}
+
 int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, uint32_t exclude_regs, int is_leaf)
 {
   uint32_t live_regs = exclude_regs;
@@ -306,18 +331,6 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
     live_regs |= computed;
   }
   LS_DBG("    Liveness (bitmap ∪ interval-scan): 0x%x", live_regs);
-
-  /* DEBUG: 90_struct scratch-divergence. At idx 70/75/80 (printf-arg LEAs) the
-   * device returns PREG_NONE (R0-R3 all live) but QEMU returns R0 — diff the
-   * raw liveness to see if live_regs_by_instruction[idx] differs. */
-  if (funcname && !strcmp((const char *)funcname, "test_init_struct_from_struct") &&
-      (instruction_idx == 70 || instruction_idx == 72 || instruction_idx == 75 || instruction_idx == 80))
-    fprintf(stderr, "FSR idx=%d excl=0x%x live=0x%x arr=%p sz=%d raw[idx]=0x%x avail_low=0x%x\n", instruction_idx,
-            exclude_regs, live_regs, (void *)ls->live_regs_by_instruction, ls->live_regs_by_instruction_size,
-            (ls->live_regs_by_instruction && instruction_idx < ls->live_regs_by_instruction_size)
-                ? ls->live_regs_by_instruction[instruction_idx]
-                : 0xDEADu,
-            (~live_regs) & 0xFu);
 
   {
     const uint32_t avail_low = (~live_regs) & 0xFu;

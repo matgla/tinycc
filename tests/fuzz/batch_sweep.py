@@ -32,9 +32,50 @@ are detected at compile time and excluded from their batch.
    dead-store, loop-unroll, jump-threading, COMPILE_CRASH) ARE caught.
    => Use for rapid iteration; run the full sweep before certifying a range clean.
 
+GCC REFERENCE LEVEL — pass a level like ``gcc-O2`` in ``--olevels`` (e.g.
+``--olevels -O0,-O1,-O2,-Os,gcc-O2``) to compile that seed with
+``arm-none-eabi-gcc`` instead of ``armv8m-tcc`` and link its object into the
+SAME batched runner ELF, at no extra qemu-boot cost.  A seed then counts as
+divergent either because the tcc O-levels disagree with each other
+(self-consistency) OR because they all agree with each other but disagree with
+the gcc reference (the O0-WRONG class self-consistency alone can't see) — one
+merged pass finds both, replacing a separate per-seed vs-gcc differential.
+When a gcc-* level is requested, divergent seeds print as tagged lines
+(``OLEVELS <seeds...>`` / ``VSGCC <seeds...>`` / ``GCCBAD <seeds...>``) instead
+of the plain one-per-line list — the plain list stays the contract when no gcc-*
+level is present, so existing callers (triage_olevels.sh's FAST_SWEEP) are
+unaffected.
+The same recall caveat above applies to the gcc side too: a batched run misses
+context-sensitive divergences a standalone crt0-entry run would catch.
+
+ORACLE SELF-CONSISTENCY — gcc is not infallible: it miscompiles some UB-free
+programs at -O2 (bitfield seed 1486 is a confirmed case — gcc -O2 alone disagrees
+with gcc -O0/-O1, clang, tcc, and an exact reference model).  Pass TWO gcc levels
+(``gcc-O0,gcc-O2``) and a seed where they DISAGREE WITH EACH OTHER is reported as
+``GCCBAD`` (oracle-unreliable, quarantined) rather than blamed on tcc; only when
+the gcc levels agree can gcc-vs-tcc count as ``VSGCC``.  With a single gcc level
+there is nothing to cross-check, so this guard is inert (back-compatible).
+
+SPEED — with the run phase batched, the wall clock is dominated by process
+spawning and the compile phase, so both are batched too:
+  * generation uses gen_c.py's --count/--out-dir mode (one interpreter per
+    shard, not one ~50ms python startup per seed);
+  * compiles+objcopy run as per-chunk shell scripts (~100 per `sh`) — the exact
+    same per-file command lines (objects stay byte-identical to a standalone
+    build), but ~2 orders of magnitude fewer processes spawned from Python,
+    which serializes spawns on the GIL at ~550/s no matter how many --jobs;
+  * generated sources and gcc-* reference objects are cached persistently in
+    tests/fuzz/.sweep_cache/, keyed on (gen_c.py content hash, profile, gcc
+    version) — a re-sweep after a tcc fix regenerates nothing and recompiles
+    only the tcc levels.  `--no-cache` bypasses it; `rm -rf` the directory to
+    reclaim space (it is safe to delete at any time).  NOTE the key does NOT
+    cover the libc headers in tests/ir_tests/libc_includes — wipe the cache if
+    you change those.
+
 Usage:
     batch_sweep.py [LO] [HI] [--batch B] [--jobs J] [--olevels -O0,-O1,-O2,-Os]
     batch_sweep.py --seeds 588,860,1005          # explicit list
+    batch_sweep.py 0 4999 --olevels=-O0,-O1,-O2,-Os,gcc-O0,gcc-O2  # + gcc reference w/ self-consistency (note the `=`: a leading `-O0` after a bare space looks like a new option to argparse)
 
 Prints the divergent seeds (one per line) on stdout — drop-in for the seed
 enumeration in triage_olevels.sh.  Progress/stats go to stderr.
@@ -43,8 +84,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import hashlib
+import itertools
 import os
+import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -166,13 +211,94 @@ GEN_PROFILE = normalize_profile(os.environ.get("FUZZ_PROFILE", "int"))
 
 
 def gen_seed(seed: int, wd: Path) -> Path | None:
-    src = wd / f"seed{seed}.c"
+    """Per-seed fallback path (and straggler retry for the batched generator)."""
+    src = wd / f"fuzz_{seed}.c"
     rc = _run(["python3", str(GENC), "--seed", str(seed),
                "--profile", GEN_PROFILE, "-o", str(src)])
     return src if rc.returncode == 0 and src.exists() else None
 
 
+def _contiguous_runs(seeds: list[int]) -> list[tuple[int, int]]:
+    """Collapse a sorted seed list into (start, count) runs so gen_c.py --count
+    (which only takes contiguous ranges) can cover an arbitrary --seeds list."""
+    runs: list[tuple[int, int]] = []
+    for s in seeds:
+        if runs and s == runs[-1][0] + runs[-1][1]:
+            runs[-1] = (runs[-1][0], runs[-1][1] + 1)
+        else:
+            runs.append((s, 1))
+    return runs
+
+
+def _cache_fetch(cache: Path | None, name: str, dst: Path) -> bool:
+    if cache is None or not (cache / name).exists():
+        return False
+    shutil.copyfile(cache / name, dst)
+    return True
+
+
+def _cache_store(cache: Path | None, src: Path) -> None:
+    """Publish `src` into the cache atomically (concurrent sweeps may race)."""
+    if cache is None or (cache / src.name).exists():
+        return
+    tmp = cache / f"{src.name}.tmp{os.getpid()}"
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, cache / src.name)
+
+
+def generate_sources(seeds: list[int], wd: Path, jobs: int,
+                     progress_every: int, src_cache: Path | None) -> dict[int, Path]:
+    """Generate every seed's source as wd/fuzz_<S>.c, batched: one gen_c.py
+    --count call per shard instead of one interpreter start per seed (the
+    ~50ms python startup dominates the ~10ms generation itself).  Seeds found
+    in `src_cache` are copied in and skipped; fresh ones are published back.
+    Returns {seed: src_path}; a seed missing from the map failed to generate."""
+    started = time.monotonic()
+    srcs: dict[int, Path] = {}
+    todo: list[int] = []
+    for s in seeds:
+        dst = wd / f"fuzz_{s}.c"
+        if _cache_fetch(src_cache, dst.name, dst):
+            srcs[s] = dst
+        else:
+            todo.append(s)
+    if srcs:
+        progress(f"  generated {len(srcs)}/{len(seeds)} seeds from cache ({_elapsed(started)})")
+    shard = max(1, min(500, -(-len(todo) // max(1, jobs))))
+    calls: list[tuple[int, int]] = []
+    for start, count in _contiguous_runs(todo):
+        for off in range(0, count, shard):
+            calls.append((start + off, min(shard, count - off)))
+
+    def _gen(call: tuple[int, int]) -> int:
+        start, count = call
+        _run(["python3", str(GENC), "--seed", str(start), "--count", str(count),
+              "--profile", GEN_PROFILE, "--out-dir", str(wd)])
+        return count
+
+    done = len(srcs)
+    last = done
+    with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+        for count in ex.map(_gen, calls):
+            done += count
+            if (progress_every and done - last >= progress_every) or done == len(seeds):
+                last = done
+                progress(f"  generated {done}/{len(seeds)} seeds ({_elapsed(started)})")
+    for s in todo:
+        src = wd / f"fuzz_{s}.c"
+        if not src.exists() and gen_seed(s, wd) is None:   # straggler retry
+            continue
+        srcs[s] = src
+        _cache_store(src_cache, src)
+    return srcs
+
+
 OBJCOPY = "arm-none-eabi-objcopy"
+GCC_BIN = "arm-none-eabi-gcc"
+
+
+def is_gcc_level(olevel: str) -> bool:
+    return olevel.startswith("gcc-")
 
 
 def compile_seed(seed: int, src: Path, olevel: str, wd: Path):
@@ -183,11 +309,20 @@ def compile_seed(seed: int, src: Path, olevel: str, wd: Path):
     optimizer, and we must not perturb codegen.  The symbol is renamed only
     afterwards, in the object file, so the runner can call it.
 
+    A `gcc-<flag>` olevel (e.g. `gcc-O2`) compiles with `arm-none-eabi-gcc
+    <flag>` instead of `armv8m-tcc <olevel>` -- the SAME CF_COMMON/INC flags
+    apply, since gcc and tcc target the same AAPCS ABI.  The resulting object
+    links into the same batched runner ELF as any tcc-compiled level (the tcc
+    link driver already links gcc-toolchain objects -- crti/crtn/libgcc/newlib
+    -- for every run, so this is not a new capability).
+
     Returns (obj_path, None) on success, or (None, "COMPILE_FAIL") on a real
-    tcc error.  Transient infra errors are retried.
+    compiler error.  Transient infra errors are retried.
     """
     obj = wd / f"seed{seed}{olevel}.o"
-    cmd = [str(TCC), *CF_COMMON, olevel, *INC, "-c", str(src), "-o", str(obj)]
+    compiler = GCC_BIN if is_gcc_level(olevel) else str(TCC)
+    opt = olevel[len("gcc"):] if is_gcc_level(olevel) else olevel
+    cmd = [compiler, *CF_COMMON, opt, *INC, "-c", str(src), "-o", str(obj)]
     for _ in range(3):
         rc = _run(cmd)
         if obj.exists():
@@ -202,15 +337,108 @@ def compile_seed(seed: int, src: Path, olevel: str, wd: Path):
     return None, "COMPILE_FAIL"
 
 
+COMPILE_CHUNK = 100          # compile+objcopy pairs per spawned shell
+
+
+def compile_objects(seeds: list[int], srcs: dict[int, Path], olevels: list[str],
+                    wd: Path, jobs: int, progress_every: int,
+                    gcc_cache: Path | None) -> tuple[dict, dict]:
+    """Compile every (seed, O-level) object, chunked: ~COMPILE_CHUNK
+    compile-and-rename pairs run inside ONE spawned `sh` script per work item.
+    The per-file command lines are IDENTICAL to compile_seed's (same absolute
+    src path, same -o), so the objects are byte-for-byte what the per-seed path
+    produces — only the process count changes (Python serializes subprocess
+    spawns on the GIL at ~550/s, which throttled the old one-spawn-per-object
+    pool far below --jobs).  Each pair compiles to a .tmp, renames main inside
+    it, and only then mv's to the final name, so "final .o exists" is a
+    trustworthy per-seed success test; missing ones fall back to compile_seed
+    (which retries transients and classifies COMPILE_FAIL).
+
+    gcc-* objects found in `gcc_cache` (already main-renamed) are copied in and
+    skipped; freshly built ones are published back — gcc never changes when tcc
+    is being fixed, so re-sweeps skip 2 of the 6 levels entirely.
+
+    Returns (objs, fails): objs maps olevel -> {seed: obj_path}; fails maps
+    (seed, olevel) -> "COMPILE_FAIL"."""
+    objs: dict[str, dict[int, Path]] = {o: {} for o in olevels}
+    fails: dict[tuple[int, str], str] = {}
+    started = time.monotonic()
+    n_total = 0
+    n_cached = 0
+    chunks: list[tuple[str, list[int]]] = []
+    for o in olevels:
+        todo: list[int] = []
+        for s in seeds:
+            if s not in srcs:
+                continue
+            n_total += 1
+            obj = wd / f"seed{s}{o}.o"
+            if is_gcc_level(o) and _cache_fetch(gcc_cache, obj.name, obj):
+                objs[o][s] = obj
+                n_cached += 1
+                continue
+            todo.append(s)
+        for i in range(0, len(todo), COMPILE_CHUNK):
+            chunks.append((o, todo[i:i + COMPILE_CHUNK]))
+    # gcc chunks are ~5x slower per file than tcc ones — schedule them first so
+    # the slow tail doesn't run alone at the end.
+    chunks.sort(key=lambda c: not is_gcc_level(c[0]))
+    if n_cached:
+        progress(f"  compiled {n_cached}/{n_total} objects from cache ({_elapsed(started)})")
+
+    def _compile_chunk(item: tuple[int, tuple[str, list[int]]]) -> tuple[str, list[int]]:
+        idx, (o, chunk) = item
+        compiler = GCC_BIN if is_gcc_level(o) else str(TCC)
+        opt = o[len("gcc"):] if is_gcc_level(o) else o
+        lines = []
+        for s in chunk:
+            obj = wd / f"seed{s}{o}.o"
+            tmp = wd / f"seed{s}{o}.o.tmp"
+            lines.append(
+                shlex.join([compiler, *CF_COMMON, opt, *INC, "-c", str(srcs[s]), "-o", str(tmp)])
+                + " && "
+                + shlex.join([OBJCOPY, "--redefine-sym", f"main=seed_{s}", str(tmp)])
+                + " && " + shlex.join(["mv", str(tmp), str(obj)]))
+        script = wd / f"cc_{o}_{idx}.sh"
+        script.write_text("\n".join(lines) + "\nexit 0\n")
+        _run(["sh", str(script)])
+        return o, chunk
+
+    done = n_cached
+    last = done
+    with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+        for o, chunk in ex.map(_compile_chunk, enumerate(chunks)):
+            for s in chunk:
+                obj = wd / f"seed{s}{o}.o"
+                if not obj.exists():                 # per-seed fallback / classify
+                    obj, err = compile_seed(s, srcs[s], o, wd)
+                if obj is not None:
+                    objs[o][s] = obj
+                    if is_gcc_level(o):
+                        _cache_store(gcc_cache, obj)
+                else:
+                    fails[(s, o)] = err
+            done += len(chunk)
+            if (progress_every and done - last >= progress_every) or done == n_total:
+                last = done
+                progress(f"  compiled {done}/{n_total} objects ({_elapsed(started)})")
+    return objs, fails
+
+
 # ---------------------------------------------------------------------------
 # batching: build a runner over a list of seeds, link, run, parse
 # ---------------------------------------------------------------------------
-def build_runner_obj(seeds: list[int], olevel: str, wd: Path, tc) -> Path:
-    """A runner whose main calls each seed_<S> in order, bracketed by markers."""
+def build_runner_obj(seeds: list[int], olevel: str, wd: Path, tc, uid) -> Path:
+    """A runner whose main calls each seed_<S> in order, bracketed by markers.
+
+    ``uid`` makes the emitted .c/.o names unique per work item — required now
+    that batches run concurrently across --jobs workers (a chunk that overflows
+    FLASH splits into halves that keep the same first-seed, so first-seed+len is
+    no longer a collision-free key)."""
     decls = "".join(f"extern int seed_{s}(void);\n" for s in seeds)
     calls = "".join(
         f'  printf("S{s}\\n"); seed_{s}();\n' for s in seeds)
-    runner_c = wd / f"runner_{olevel}_{seeds[0]}_{len(seeds)}.c"
+    runner_c = wd / f"runner_{olevel}_{uid}.c"
     runner_c.write_text(
         "#include <stdio.h>\n"
         f"{decls}"
@@ -281,70 +509,110 @@ def parse_batch(text: str, timed_out: bool) -> tuple[dict, int | None, str | Non
     return results, crashed, kind
 
 
-def sweep_olevel(seeds: list[int], olevel: str, objs: dict, wd: Path, tc,
-                 batch: int, timeout_base: float, progress_every: int = 0) -> dict:
-    """Run every seed at one O-level using batched ELFs; return seed->signature.
+def _process_chunk(olevel: str, chunk: list[int], objs: dict, wd: Path, tc,
+                   timeout_base: float, uid) -> tuple[dict, list]:
+    """Build, link, and run ONE batched ELF for `chunk` at `olevel`.
 
-    `objs` maps seed -> compiled .o for THIS olevel (missing => COMPILE_FAIL,
-    already recorded by the caller and excluded here).
+    `objs` maps olevel -> {seed: compiled .o}.  Returns (results, requeue):
+    `results` maps the seeds this batch resolved to their signatures; `requeue`
+    is a list of (olevel, subchunk) work items to push back — the two halves of
+    a chunk that overflowed FLASH (the mps2 image budget is 512K, so batch size
+    self-tunes to whatever fits), or the tail of a chunk cut short by a crash."""
+    runner = build_runner_obj(chunk, olevel, wd, tc, uid)
+    elf = wd / f"batch_{olevel}_{uid}.elf"
+    _run(link_cmd([objs[olevel][s] for s in chunk] + [runner], elf, tc))
+    if not elf.exists():
+        if len(chunk) > 1:                       # likely FLASH overflow -> split
+            mid = len(chunk) // 2
+            return {}, [(olevel, chunk[:mid]), (olevel, chunk[mid:])]
+        # a single seed that won't link
+        return {chunk[0]: classify_one(chunk[0], olevel, wd, tc, timeout_base)}, []
+    # runtime grows with batch size; give each program ~80ms headroom.
+    text, timed_out = run_elf(elf, timeout_base + 0.08 * len(chunk))
+    res, crashed, kind = parse_batch(text, timed_out)
+    results = dict(res)
+    if crashed is not None:
+        results[crashed] = kind or classify_one(crashed, olevel, wd, tc, timeout_base)
+        done = set(res) | {crashed}
+        tail = [s for s in chunk if s not in done]   # post-crash tail
+        return results, ([(olevel, tail)] if tail else [])
+    # clean DONE (or a cut we couldn't attribute) — classify any stragglers
+    for s in chunk:
+        if s not in results:
+            results[s] = classify_one(s, olevel, wd, tc, timeout_base)
+    return results, []
 
-    Work is a deque of chunks.  A chunk that fails to LINK is almost always a
-    FLASH overflow (the mps2 image budget is 512K) — split it in half and retry
-    as smaller batches, so batch size self-tunes to whatever fits; only a lone
-    seed that won't link is recorded individually.  A chunk cut by a crash
-    re-queues its post-crash tail."""
-    from collections import deque
-    results: dict[int, str] = {}
-    avail = [s for s in seeds if s in objs]
-    chunks = deque(avail[i:i + batch] for i in range(0, len(avail), batch))
+
+def run_batches(seeds: list[int], olevels: list[str], objs: dict, wd: Path, tc,
+                batch: int, timeout_base: float, jobs: int,
+                progress_every: int = 0) -> dict:
+    """Run every (seed, O-level) via batched ELFs across `jobs` qemu workers.
+
+    All O-levels share ONE pool of `jobs` workers.  (Previously each O-level got
+    its own thread and processed its chunks serially, so qemu concurrency was
+    hard-capped at len(olevels) — usually 4 — no matter how large --jobs was;
+    this makes the run phase scale with --jobs like generate/compile do.)
+
+    Work items are (olevel, chunk) pairs on a shared queue; `_process_chunk` may
+    push more items back (FLASH-overflow split halves, post-crash tail), so the
+    queue grows dynamically.  Returns {olevel: {seed: signature}}."""
+    results: dict[str, dict[int, str]] = {o: {} for o in olevels}
+    q: queue.Queue = queue.Queue()
+    n_expected = 0
+    for o in olevels:
+        avail = [s for s in seeds if s in objs[o]]
+        n_expected += len(avail)
+        for i in range(0, len(avail), batch):
+            q.put((o, avail[i:i + batch]))
+
+    lock = threading.Lock()
+    uids = itertools.count()                     # next() is atomic under the GIL
     started = time.monotonic()
-    last_report = -1
+    state = {"done": 0, "last": -1}
 
-    def report(force: bool = False) -> None:
-        nonlocal last_report
-        done = len(results)
-        if force and done == last_report:
+    def maybe_report(force: bool = False) -> None:
+        # caller holds `lock`
+        done = state["done"]
+        if force and done == state["last"]:
             return
-        if not force and progress_every and done - last_report < progress_every:
+        if not force and (not progress_every or done - state["last"] < progress_every):
             return
-        if not force and not progress_every:
-            return
-        last_report = done
-        progress(f"  run {olevel}: {done}/{len(avail)} seeds "
-                 f"({len(chunks)} batch(es) queued, {_elapsed(started)})")
+        state["last"] = done
+        progress(f"  run: {done}/{n_expected} seeds "
+                 f"({q.qsize()} batch(es) queued, {_elapsed(started)})")
 
-    report(force=True)
-    while chunks:
-        chunk = chunks.popleft()
-        runner = build_runner_obj(chunk, olevel, wd, tc)
-        elf = wd / f"batch_{olevel}_{chunk[0]}_{len(chunk)}.elf"
-        _run(link_cmd([objs[s] for s in chunk] + [runner], elf, tc))
-        if not elf.exists():
-            if len(chunk) > 1:                       # likely FLASH overflow -> split
-                mid = len(chunk) // 2
-                chunks.appendleft(chunk[mid:])
-                chunks.appendleft(chunk[:mid])
-            else:                                    # a single seed that won't link
-                results[chunk[0]] = classify_one(chunk[0], olevel, wd, tc, timeout_base)
-                report()
-            continue
-        # runtime grows with batch size; give each program ~80ms headroom.
-        text, timed_out = run_elf(elf, timeout_base + 0.08 * len(chunk))
-        res, crashed, kind = parse_batch(text, timed_out)
-        results.update(res)
-        if crashed is not None:
-            results[crashed] = kind or classify_one(crashed, olevel, wd, tc, timeout_base)
-            done = set(res) | {crashed}
-            tail = [s for s in chunk if s not in done]   # post-crash tail
-            if tail:
-                chunks.appendleft(tail)
-        else:
-            # clean DONE (or a cut we couldn't attribute) — classify any stragglers
-            for s in chunk:
-                if s not in results:
-                    results[s] = classify_one(s, olevel, wd, tc, timeout_base)
-        report()
-    report(force=True)
+    def worker() -> None:
+        while True:
+            item = q.get()
+            if item is None:                     # sentinel: no more work
+                q.task_done()
+                return
+            olevel, chunk = item
+            try:
+                res, requeue = _process_chunk(olevel, chunk, objs, wd, tc,
+                                              timeout_base, next(uids))
+                for it in requeue:               # push before task_done so q.join
+                    q.put(it)                    # can't see the queue as drained
+                with lock:
+                    results[olevel].update(res)
+                    state["done"] += len(res)
+                    maybe_report()
+            finally:
+                q.task_done()
+
+    with lock:
+        maybe_report(force=True)
+    threads = [threading.Thread(target=worker, daemon=True)
+               for _ in range(max(1, jobs))]
+    for t in threads:
+        t.start()
+    q.join()                                     # all real (non-sentinel) work done
+    for _ in threads:
+        q.put(None)
+    for t in threads:
+        t.join()
+    with lock:
+        maybe_report(force=True)
     return results
 
 
@@ -353,7 +621,7 @@ def classify_one(seed: int, olevel: str, wd: Path, tc, timeout_base: float) -> s
     obj = wd / f"seed{seed}{olevel}.o"
     if not obj.exists():
         return "COMPILE_FAIL"
-    runner = build_runner_obj([seed], olevel, wd, tc)
+    runner = build_runner_obj([seed], olevel, wd, tc, f"solo{seed}")
     elf = wd / f"solo_{olevel}_{seed}.elf"
     if not _run(link_cmd([obj, runner], elf, tc)) or not elf.exists():
         return "COMPILE_FAIL"
@@ -379,11 +647,17 @@ def main(argv=None) -> int:
     ap.add_argument("--batch", type=int, default=200,
                     help="seeds per ELF (default 200; auto-halves on FLASH overflow)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) - 2))
-    ap.add_argument("--olevels", default="-O0,-O1,-O2,-Os")
+    ap.add_argument("--olevels", default="-O0,-O1,-O2,-Os",
+                    help="comma list of tcc -O flags; a `gcc-<flag>` entry "
+                         "(e.g. gcc-O2) compiles that level with "
+                         "arm-none-eabi-gcc instead, as a reference")
     ap.add_argument("--timeout", type=float, default=20.0, help="base qemu timeout (s)")
     ap.add_argument("--progress-every", type=int, default=500,
                     help="print progress every N completed items/seeds (0 disables)")
     ap.add_argument("--keep", action="store_true", help="keep the work dir")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="bypass the persistent source/gcc-object cache "
+                         "(tests/fuzz/.sweep_cache)")
     ap.add_argument("--profile", default=GEN_PROFILE,
                     help="generator feature profile (int/integer|float|...); default $FUZZ_PROFILE or int")
     args = ap.parse_args(argv)
@@ -395,6 +669,8 @@ def main(argv=None) -> int:
         sys.exit("qemu-system-arm not on PATH")
 
     olevels = [o.strip() for o in args.olevels.replace(",", " ").split()]
+    if any(is_gcc_level(o) for o in olevels) and shutil.which(GCC_BIN) is None:
+        sys.exit(f"{GCC_BIN} not on PATH (required for a gcc-* reference level)")
     if args.seeds:
         seeds = sorted({int(x) for x in args.seeds.replace(",", " ").split()})
     else:
@@ -403,75 +679,97 @@ def main(argv=None) -> int:
     tc = discover_toolchain()
     wd = Path(tempfile.mkdtemp(prefix="batchsweep_"))
     compile_boot(wd, tc)
+
+    # Persistent cache: sources depend only on (gen_c.py, profile, seed); gcc-*
+    # reference objects additionally on the gcc version — none of which change
+    # while tcc is being fixed, so re-sweeps of a band skip both entirely.
+    src_cache = gcc_cache = None
+    if not args.no_cache:
+        gen_key = hashlib.sha256(GENC.read_bytes()).hexdigest()[:16]
+        base = ROOT / "tests" / "fuzz" / ".sweep_cache"
+        src_cache = base / f"src-{gen_key}-{GEN_PROFILE}"
+        src_cache.mkdir(parents=True, exist_ok=True)
+        if any(is_gcc_level(o) for o in olevels):
+            gcc_ver = _run([GCC_BIN, "--version"]).stdout.splitlines()[0]
+            gcc_key = hashlib.sha256(f"{gen_key} {gcc_ver}".encode()).hexdigest()[:16]
+            gcc_cache = base / f"gccobj-{gcc_key}-{GEN_PROFILE}"
+            gcc_cache.mkdir(parents=True, exist_ok=True)
+
     progress(f"batch sweep: {len(seeds)} seeds x {len(olevels)} O-levels, "
-             f"batch={args.batch}, jobs={args.jobs}\n  workdir {wd}")
+             f"batch={args.batch}, jobs={args.jobs}"
+             f"{', cache off' if args.no_cache else ''}\n  workdir {wd}")
 
     # signatures[seed][olevel] = '<hex>'|HardFault|Lockup|COMPILE_FAIL
     signatures: dict[int, dict[str, str]] = {s: {} for s in seeds}
 
-    # 1) generate sources (parallel).
-    srcs: dict[int, Path] = {}
-    started = time.monotonic()
-    done_g = 0
-    with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        futs = {ex.submit(gen_seed, s, wd): s for s in seeds}
-        for fut in cf.as_completed(futs):
-            s = futs[fut]
-            src = fut.result()
-            done_g += 1
-            if src is None:
-                for o in olevels:
-                    signatures[s][o] = "COMPILE_FAIL"
-            else:
-                srcs[s] = src
-            if (args.progress_every and done_g % args.progress_every == 0) or done_g == len(seeds):
-                progress(f"  generated {done_g}/{len(seeds)} seeds "
-                         f"({len(srcs)} sources ok, {_elapsed(started)})")
-
-    # 2) compile every (seed, O-level) object (parallel).  COMPILE_FAIL recorded.
-    objs: dict[str, dict[int, Path]] = {o: {} for o in olevels}
-    work = [(s, o) for o in olevels for s in srcs]
-
-    def _compile(item):
-        s, o = item
-        obj, err = compile_seed(s, srcs[s], o, wd)
-        return s, o, obj, err
-
-    done_c = 0
-    started = time.monotonic()
-    with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        futs = {ex.submit(_compile, item): item for item in work}
-        for fut in cf.as_completed(futs):
-            s, o, obj, err = fut.result()
-            done_c += 1
-            if obj is not None:
-                objs[o][s] = obj
-            else:
-                signatures[s][o] = err
-            if (args.progress_every and done_c % args.progress_every == 0) or done_c == len(work):
-                progress(f"  compiled {done_c}/{len(work)} objects ({_elapsed(started)})")
-
-    # 3) batched run per O-level (the O-levels run concurrently).
-    with cf.ThreadPoolExecutor(max_workers=len(olevels)) as ex:
-        futs = {ex.submit(sweep_olevel, seeds, o, objs[o], wd, tc,
-                          args.batch, args.timeout, args.progress_every): o for o in olevels}
-        for fut in cf.as_completed(futs):
-            o = futs[fut]
-            for s, sig in fut.result().items():
-                signatures[s][o] = sig
-            progress(f"  {o} done")
-
-    # 4) classify divergences: a seed is divergent if its O-level signatures
-    #    are not all identical (matches the old sweep's val()-equality test).
-    divergent = []
+    # 1) generate sources (batched gen_c.py --count shards + cache).
+    srcs = generate_sources(seeds, wd, args.jobs, args.progress_every, src_cache)
     for s in seeds:
-        vals = [signatures[s].get(o, "?") for o in olevels]
-        if len(set(vals)) > 1:
-            divergent.append(s)
+        if s not in srcs:
+            for o in olevels:
+                signatures[s][o] = "COMPILE_FAIL"
 
-    progress(f"\nswept {len(seeds)} seeds — {len(divergent)} divergent")
-    for s in divergent:
-        print(s)
+    # 2) compile every (seed, O-level) object (chunked shells + gcc cache).
+    objs, comp_fails = compile_objects(seeds, srcs, olevels, wd,
+                                       args.jobs, args.progress_every, gcc_cache)
+    for (s, o), err in comp_fails.items():
+        signatures[s][o] = err
+
+    # 3) batched run across ALL (O-level, batch) pairs over `jobs` qemu workers.
+    #    (Was one thread per O-level, so qemu concurrency capped at len(olevels);
+    #    now the run phase scales with --jobs like generate/compile above.)
+    run_results = run_batches(seeds, olevels, objs, wd, tc,
+                              args.batch, args.timeout, args.jobs, args.progress_every)
+    for o in olevels:
+        for s, sig in run_results[o].items():
+            signatures[s][o] = sig
+        progress(f"  {o} done")
+
+    # 4) classify divergences.  With no gcc-* level requested this reproduces the
+    #    old olevels-only self-consistency test: any two tcc O-levels disagreeing
+    #    (matches the old sweep's val()-equality test).  With a gcc-* level
+    #    present, a seed additionally counts as vs-gcc-divergent if all tcc
+    #    O-levels agree WITH EACH OTHER but not with the gcc reference -- the
+    #    O0-WRONG class self-consistency alone can't see -- so one merged batch
+    #    can replace a separate per-seed vs-gcc differential for the caller.
+    #
+    #    ORACLE SELF-CONSISTENCY: gcc is not an infallible oracle -- it miscompiles
+    #    some UB-free programs at -O2 (e.g. bitfield seed 1486: gcc -O2 alone
+    #    disagrees with gcc -O0/-O1, clang, tcc, and an exact reference model).  A
+    #    single gcc level can't tell "tcc is wrong" from "gcc is wrong", so pass
+    #    TWO gcc levels (e.g. gcc-O0,gcc-O2): if they disagree WITH EACH OTHER the
+    #    seed is oracle-unreliable and quarantined (GCCBAD) instead of being blamed
+    #    on tcc; only when the gcc levels agree does gcc-vs-tcc count as vsgcc.
+    tcc_levels = [o for o in olevels if not is_gcc_level(o)]
+    gcc_levels = [o for o in olevels if is_gcc_level(o)]
+
+    olevels_bad, vsgcc_bad, gcc_inconsistent = [], [], []
+    for s in seeds:
+        tvals = [signatures[s].get(o, "?") for o in tcc_levels]
+        if len(set(tvals)) > 1:
+            olevels_bad.append(s)
+        elif gcc_levels:
+            # Distinct gcc outputs that actually built ("?" = gcc failed for this
+            # seed at that level -- an infra/build gap, not an oracle signal).
+            gvals = {signatures[s].get(o, "?") for o in gcc_levels} - {"?"}
+            if len(gvals) > 1:
+                gcc_inconsistent.append(s)      # gcc disagrees with itself -> quarantine
+            elif len(gvals) == 1 and gvals - set(tvals):
+                vsgcc_bad.append(s)             # gcc self-consistent AND != tcc -> real
+            # len(gvals) == 0: gcc built for no level -> nothing to compare, skip.
+    divergent = sorted(set(olevels_bad) | set(vsgcc_bad))
+
+    if gcc_levels:
+        progress(f"\nswept {len(seeds)} seeds — {len(divergent)} divergent "
+                 f"(olevels={len(olevels_bad)}, vsgcc-only={len(vsgcc_bad)}, "
+                 f"gcc-inconsistent/quarantined={len(gcc_inconsistent)})")
+        print("OLEVELS", *olevels_bad)
+        print("VSGCC", *vsgcc_bad)
+        print("GCCBAD", *gcc_inconsistent)
+    else:
+        progress(f"\nswept {len(seeds)} seeds — {len(divergent)} divergent")
+        for s in divergent:
+            print(s)
 
     if not args.keep:
         shutil.rmtree(wd, ignore_errors=True)

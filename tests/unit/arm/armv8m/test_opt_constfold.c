@@ -44,6 +44,7 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir);
  * float_narrowing from completing its callee swap in isolation. */
 
 #define I32 IROP_BTYPE_INT32
+#define I64 IROP_BTYPE_INT64
 #define F32 IROP_BTYPE_FLOAT32
 #define F64 IROP_BTYPE_FLOAT64
 
@@ -1491,6 +1492,776 @@ UT_TEST(test_local_addrof_pre_modify_read_no_fold)
   return 0;
 }
 
+/* ============================================================================
+ *  tcc_ir_detect_switch_func / tcc_ir_simulate_switch_func_ex /
+ *  tcc_ir_opt_switch_call_replace — deeper coverage of the switch-value
+ *  function snapshot/simulator (branchy bodies, global load/store replay,
+ *  and the detector's rejection gates).
+ * ============================================================================ */
+
+/* Comparison condition tokens (see evaluate_compare_condition in opt_utils.c;
+ * mirrors the values test_opt_cmpfold.c uses). */
+#define SF_TOK_EQ  0x94 /* ==          */
+#define SF_TOK_NE  0x95 /* !=          */
+#define SF_TOK_LT  0x9c /* signed <    */
+#define SF_TOK_LE  0x9e /* signed <=   */
+#define SF_TOK_GT  0x9f /* signed >    */
+#define SF_TOK_GE  0x9d /* signed >=   */
+#define SF_TOK_ULT 0x92 /* unsigned <  */
+#define SF_TOK_UGE 0x93 /* unsigned >= */
+
+/* Build a one-param branchy "switch function" IR:
+ *   i0: CMP    P0, #0
+ *   i1: JUMPIF <4> if (P0 SF_TOK_LT 0)     -> else branch at i4
+ *   i2: ASSIGN T0 = #1
+ *   i3: RETURNVALUE T0
+ *   i4: ASSIGN T0 = #-1     (jump target)
+ *   i5: RETURNVALUE T0
+ * i.e. `int f(int x) { return (x < 0) ? -1 : 1; }`.  Returns 1 on successful
+ * detect + cache, 0 otherwise. */
+static int utb_cache_branchy_switch_func(int func_tok)
+{
+  TCCIRState *cir = utb_new();
+  cir->parameters_count = 1;
+  cir->next_parameter = 1;
+  utb_alloc_param_intervals(cir, 1);
+
+  utb_emit(cir, TCCIR_OP_CMP, UTB_NONE, utb_param(0, I32), utb_imm(0, I32));
+  utb_emit(cir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(SF_TOK_LT, I32), UTB_NONE);
+  utb_emit(cir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(cir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+  int i_target = utb_emit(cir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(-1, I32), UTB_NONE);
+  cir->compact_instructions[i_target].is_jump_target = 1;
+  utb_emit(cir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+
+  TCCFuncSwitchSnapshot *snap = NULL;
+  int ok = tcc_ir_detect_switch_func(cir, &snap);
+  if (ok)
+    tcc_ir_cache_switch_func(tcc_state, func_tok, snap);
+
+  utb_free(cir);
+  return ok;
+}
+
+/* POSITIVE: the detector accepts a CMP/JUMPIF-branchy function and the
+ * simulator picks the correct arm for both a negative and a non-negative
+ * constant argument.  Oracle: f(x) = (x<0) ? -1 : 1. */
+UT_TEST(test_switch_func_detect_branchy_positive)
+{
+  const int func_tok = 100;
+  UT_ASSERT_EQ(utb_cache_branchy_switch_func(func_tok), 1);
+
+  const TCCFuncSwitchSnapshot *snap = tcc_ir_lookup_switch_func(tcc_state, func_tok);
+  UT_ASSERT(snap != NULL);
+
+  int64_t out_value;
+  int out_btype;
+  UT_ASSERT_EQ(tcc_ir_simulate_switch_func(snap, -5, &out_value, &out_btype), 1);
+  UT_ASSERT_EQ((int)out_value, -1);
+
+  UT_ASSERT_EQ(tcc_ir_simulate_switch_func(snap, 5, &out_value, &out_btype), 1);
+  UT_ASSERT_EQ((int)out_value, 1);
+
+  UT_ASSERT_EQ(tcc_ir_simulate_switch_func(snap, 0, &out_value, &out_btype), 1);
+  UT_ASSERT_EQ((int)out_value, 1);
+
+  utb_reset_ipc_caches();
+  return 0;
+}
+
+/* POSITIVE (end-to-end via the caller-side pass): a call to the branchy
+ * switch function with a constant negative argument folds to ASSIGN #-1. */
+UT_TEST(test_switch_call_replace_branchy_positive)
+{
+  utb_reset_ipc_caches();
+
+  const int func_tok = 101;
+  UT_ASSERT_EQ(utb_cache_branchy_switch_func(func_tok), 1);
+
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+
+  static Sym callee_sym;
+  IROperand callee = utb_callee_named(ir, &callee_sym, func_tok);
+
+  const int call_id = 1;
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(-7, I32),
+           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
+  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
+                        utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 1), I32));
+
+  int changes = tcc_ir_opt_switch_call_replace(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_ASSIGN);
+  UT_ASSERT(irop_is_immediate(utb_src1(ir, i_call)));
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, i_call)), -1);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_reset_ipc_caches();
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: the detector rejects a two-parameter function (only single-scalar-
+ * param functions are modeled). */
+UT_TEST(test_switch_func_detect_two_params_rejected)
+{
+  TCCIRState *cir = utb_new();
+  cir->parameters_count = 2;
+  cir->next_parameter = 2;
+  utb_alloc_param_intervals(cir, 2);
+
+  utb_emit(cir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_param(0, I32), UTB_NONE);
+
+  TCCFuncSwitchSnapshot *snap = NULL;
+  int ok = tcc_ir_detect_switch_func(cir, &snap);
+
+  UT_ASSERT_EQ(ok, 0);
+
+  utb_free(cir);
+  return 0;
+}
+
+/* GUARD: the detector rejects a function whose single param is a long long
+ * (the simulator only reasons about <=32-bit scalars). */
+UT_TEST(test_switch_func_detect_llong_param_rejected)
+{
+  TCCIRState *cir = utb_new();
+  cir->parameters_count = 1;
+  cir->next_parameter = 1;
+  utb_alloc_param_intervals(cir, 1);
+  cir->parameters_live_intervals[0].is_llong = 1;
+
+  utb_emit(cir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_param(0, I32), UTB_NONE);
+
+  TCCFuncSwitchSnapshot *snap = NULL;
+  int ok = tcc_ir_detect_switch_func(cir, &snap);
+
+  UT_ASSERT_EQ(ok, 0);
+
+  utb_free(cir);
+  return 0;
+}
+
+/* GUARD: the detector rejects a function whose param address is taken
+ * (aliasing could observe values the simulator doesn't model). */
+UT_TEST(test_switch_func_detect_addrtaken_param_rejected)
+{
+  TCCIRState *cir = utb_new();
+  cir->parameters_count = 1;
+  cir->next_parameter = 1;
+  utb_alloc_param_intervals(cir, 1);
+  cir->parameters_live_intervals[0].addrtaken = 1;
+
+  utb_emit(cir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_param(0, I32), UTB_NONE);
+
+  TCCFuncSwitchSnapshot *snap = NULL;
+  int ok = tcc_ir_detect_switch_func(cir, &snap);
+
+  UT_ASSERT_EQ(ok, 0);
+
+  utb_free(cir);
+  return 0;
+}
+
+/* GUARD: a body containing an unsupported op (e.g. MUL) makes the detector
+ * bail (`goto fail`), freeing its partial snapshot and returning 0. */
+UT_TEST(test_switch_func_detect_unsupported_op_rejected)
+{
+  TCCIRState *cir = utb_new();
+  cir->parameters_count = 1;
+  cir->next_parameter = 1;
+  utb_alloc_param_intervals(cir, 1);
+
+  utb_emit(cir, TCCIR_OP_MUL, utb_temp(0, I32), utb_param(0, I32), utb_imm(2, I32));
+  utb_emit(cir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+
+  TCCFuncSwitchSnapshot *snap = NULL;
+  int ok = tcc_ir_detect_switch_func(cir, &snap);
+
+  UT_ASSERT_EQ(ok, 0);
+
+  utb_free(cir);
+  return 0;
+}
+
+/* GUARD: a body with no RETURNVALUE at all is rejected (`has_return` stays 0). */
+UT_TEST(test_switch_func_detect_no_return_rejected)
+{
+  TCCIRState *cir = utb_new();
+  cir->parameters_count = 1;
+  cir->next_parameter = 1;
+  utb_alloc_param_intervals(cir, 1);
+
+  utb_emit(cir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_param(0, I32), UTB_NONE);
+
+  TCCFuncSwitchSnapshot *snap = NULL;
+  int ok = tcc_ir_detect_switch_func(cir, &snap);
+
+  UT_ASSERT_EQ(ok, 0);
+
+  utb_free(cir);
+  return 0;
+}
+
+/* GUARD: a RETURNVALUE of an INT64 immediate is rejected.  Note this is
+ * actually caught by switch_func_decode_operand's operand-btype gate (INT64
+ * is not in {INT8,INT16,INT32}), not by the later switch_func_is_supported_btype
+ * check on `return_btype` -- decode_operand's accepted set and
+ * switch_func_is_supported_btype's accepted set happen to be identical, so
+ * the latter is currently unreachable via any RETURNVALUE whose operand
+ * decoded successfully.  This test pins the observable (correct) end result
+ * -- 64-bit returns are rejected -- regardless of which gate does the work. */
+UT_TEST(test_switch_func_detect_unsupported_return_btype_rejected)
+{
+  TCCIRState *cir = utb_new();
+  cir->parameters_count = 1;
+  cir->next_parameter = 1;
+  utb_alloc_param_intervals(cir, 1);
+
+  utb_emit(cir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(7, I64), UTB_NONE);
+
+  TCCFuncSwitchSnapshot *snap = NULL;
+  int ok = tcc_ir_detect_switch_func(cir, &snap);
+
+  UT_ASSERT_EQ(ok, 0);
+
+  utb_free(cir);
+  return 0;
+}
+
+/* POSITIVE: a function that loads a global (ASSIGN-from-lval-symref) and adds
+ * the param to it, then returns.  Because the loaded value is
+ * tracked-unknown, the caller-side pass must build a full pure-fold ONLY
+ * whose replay list is non-empty and rejected in the no-replay simulate
+ * wrapper (tcc_ir_simulate_switch_func passes replay_indices=NULL).  This
+ * pins the "replay required -> pure-fold wrapper declines" contract. */
+UT_TEST(test_switch_func_simulate_pure_wrapper_declines_when_replay_needed)
+{
+  TCCIRState *cir = utb_new();
+  utb_pools_init(cir);
+  cir->parameters_count = 1;
+  cir->next_parameter = 1;
+  utb_alloc_param_intervals(cir, 1);
+
+  static Sym g_sym;
+  IROperand g = utb_symref(cir, &g_sym, 1 /* is_lval */, 0, 0, I32);
+
+  /* T0 = *g ; T1 = P0 + T0 ; return T1 */
+  utb_emit(cir, TCCIR_OP_ASSIGN, utb_temp(0, I32), g, UTB_NONE);
+  utb_emit(cir, TCCIR_OP_ADD, utb_temp(1, I32), utb_param(0, I32), utb_temp(0, I32));
+  utb_emit(cir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+
+  TCCFuncSwitchSnapshot *snap = NULL;
+  int ok = tcc_ir_detect_switch_func(cir, &snap);
+  UT_ASSERT_EQ(ok, 1);
+
+  int64_t out_value;
+  int out_btype;
+  /* No-replay wrapper must decline: the return value is not a concrete
+   * constant without replaying the global load. */
+  UT_ASSERT_EQ(tcc_ir_simulate_switch_func(snap, 3, &out_value, &out_btype), 0);
+
+  /* The _ex form with a replay buffer succeeds and reports the load as a
+   * replay op, but the *return value itself* still cannot be concrete (T1
+   * depends on the unknown load), so it also declines -- there is nothing to
+   * fold to a constant. This documents that "replay" only helps when the
+   * *side effects* (stores), not the *return value*, depend on the unknown. */
+  int replay_indices[8];
+  int replay_count = -1;
+  int ex_ok = tcc_ir_simulate_switch_func_ex(snap, 3, &out_value, &out_btype, replay_indices, &replay_count);
+  UT_ASSERT_EQ(ex_ok, 0);
+
+  tcc_ir_switch_func_snapshot_free(snap);
+  utb_free(cir);
+  return 0;
+}
+
+/* POSITIVE: a function that unconditionally stores a constant to a global
+ * then returns the (constant) param unchanged:
+ *   STORE *g <- #99 ; RETURNVALUE P0
+ * The return value is concrete without needing the store, but the store is a
+ * side effect that must be replayed at the call site for correctness.
+ * tcc_ir_simulate_switch_func_ex must report exactly one replay op (the
+ * STORE) and the correct return value; the plain (no-replay) wrapper must
+ * decline since replay_indices=NULL there. */
+UT_TEST(test_switch_func_simulate_store_replay_positive)
+{
+  TCCIRState *cir = utb_new();
+  utb_pools_init(cir);
+  cir->parameters_count = 1;
+  cir->next_parameter = 1;
+  utb_alloc_param_intervals(cir, 1);
+
+  static Sym g_sym;
+  IROperand g = utb_symref(cir, &g_sym, 1 /* is_lval */, 0, 0, I32);
+
+  int i_store = utb_emit(cir, TCCIR_OP_STORE, g, utb_imm(99, I32), UTB_NONE);
+  utb_emit(cir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_param(0, I32), UTB_NONE);
+
+  TCCFuncSwitchSnapshot *snap = NULL;
+  int ok = tcc_ir_detect_switch_func(cir, &snap);
+  UT_ASSERT_EQ(ok, 1);
+
+  int64_t out_value;
+  int out_btype;
+  UT_ASSERT_EQ(tcc_ir_simulate_switch_func(snap, 42, &out_value, &out_btype), 0);
+
+  int replay_indices[8];
+  int replay_count = -1;
+  int ex_ok = tcc_ir_simulate_switch_func_ex(snap, 42, &out_value, &out_btype, replay_indices, &replay_count);
+  UT_ASSERT_EQ(ex_ok, 1);
+  UT_ASSERT_EQ((int)out_value, 42);
+  UT_ASSERT_EQ(replay_count, 1);
+  UT_ASSERT_EQ(replay_indices[0], i_store);
+
+  tcc_ir_switch_func_snapshot_free(snap);
+  utb_free(cir);
+  return 0;
+}
+
+/* GUARD: tcc_ir_opt_switch_call_replace skips a call whose argument is not a
+ * compile-time-immediate FUNCPARAMVAL value even when it targets a cached
+ * branchy switch function (covers the `!irop_is_immediate(arg_val)` guard
+ * on the caller side, distinct from the argc/no-cache guards already
+ * covered). */
+UT_TEST(test_switch_call_replace_branchy_nonconst_arg_no_fold)
+{
+  utb_reset_ipc_caches();
+
+  const int func_tok = 102;
+  UT_ASSERT_EQ(utb_cache_branchy_switch_func(func_tok), 1);
+
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+
+  static Sym callee_sym;
+  IROperand callee = utb_callee_named(ir, &callee_sym, func_tok);
+
+  const int call_id = 1;
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(3, I32),
+           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
+  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
+                        utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 1), I32));
+
+  int changes = tcc_ir_opt_switch_call_replace(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_FUNCCALLVAL);
+
+  utb_reset_ipc_caches();
+  utb_free(ir);
+  return 0;
+}
+
+/* ============================================================================
+ *  tcc_ir_detect_const_result / cache round trip — currently exercised only
+ *  indirectly (existing tests call tcc_ir_cache_const_result directly);
+ *  these drive the detector itself.
+ * ============================================================================ */
+
+/* POSITIVE: a pure `return <imm>;` body is detected as constant. */
+UT_TEST(test_detect_const_result_immediate_return_positive)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 0;
+  ir->parameters_count = 0;
+
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(42, I32), UTB_NONE);
+
+  int64_t value = -1;
+  int btype = -1;
+  int ok = tcc_ir_detect_const_result(ir, &value, &btype);
+
+  UT_ASSERT_EQ(ok, 1);
+  UT_ASSERT_EQ((int)value, 42);
+  UT_ASSERT_EQ(btype, I32);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: `T = <imm>; return T;` is also detected (one indirection through
+ * a single ASSIGN immediately preceding the RETURNVALUE). */
+UT_TEST(test_detect_const_result_assign_then_return_positive)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 0;
+  ir->parameters_count = 0;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(7, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+
+  int64_t value = -1;
+  int btype = -1;
+  int ok = tcc_ir_detect_const_result(ir, &value, &btype);
+
+  UT_ASSERT_EQ(ok, 1);
+  UT_ASSERT_EQ((int)value, 7);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: a function that takes parameters is never treated as a
+ * (zero-arg) constant-result function. */
+UT_TEST(test_detect_const_result_has_params_rejected)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 1;
+  ir->parameters_count = 1;
+
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
+
+  int64_t value;
+  int btype;
+  UT_ASSERT_EQ(tcc_ir_detect_const_result(ir, &value, &btype), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: any op besides ASSIGN/RETURNVALUE (e.g. ADD) in the body disqualifies
+ * the function, even if the final value is still technically constant. */
+UT_TEST(test_detect_const_result_other_op_rejected)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 0;
+  ir->parameters_count = 0;
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+
+  int64_t value;
+  int btype;
+  UT_ASSERT_EQ(tcc_ir_detect_const_result(ir, &value, &btype), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: more than 4 non-NOP instructions disqualifies even an otherwise
+ * pure ASSIGN/RETURNVALUE-only body (non_nop_count > 4 gate). */
+UT_TEST(test_detect_const_result_too_many_instructions_rejected)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 0;
+  ir->parameters_count = 0;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(2, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(3, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(3, I32), utb_imm(4, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32), UTB_NONE);
+
+  int64_t value;
+  int btype;
+  UT_ASSERT_EQ(tcc_ir_detect_const_result(ir, &value, &btype), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: the returned vreg's preceding ASSIGN writes a non-immediate (another
+ * vreg) -> not detected as constant. */
+UT_TEST(test_detect_const_result_non_immediate_source_rejected)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 0;
+  ir->parameters_count = 0;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_temp(9, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+
+  int64_t value;
+  int btype;
+  UT_ASSERT_EQ(tcc_ir_detect_const_result(ir, &value, &btype), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Cache round trip: cache_const_result / lookup_const_result together, plus
+ * the "already cached -> no-op" and "cache full -> silently drop" guards. */
+UT_TEST(test_const_result_cache_round_trip_and_duplicate_guard)
+{
+  utb_reset_ipc_caches();
+
+  tcc_ir_cache_const_result(tcc_state, 200, 123, VT_INT);
+
+  int64_t value = -1;
+  int btype = -1;
+  UT_ASSERT_EQ(tcc_ir_lookup_const_result(tcc_state, 200, &value, &btype), 1);
+  UT_ASSERT_EQ((int)value, 123);
+
+  /* Re-caching the same token with a different value is a silent no-op
+   * (first-wins): the lookup must still report the original value. */
+  tcc_ir_cache_const_result(tcc_state, 200, 999, VT_INT);
+  UT_ASSERT_EQ(tcc_ir_lookup_const_result(tcc_state, 200, &value, &btype), 1);
+  UT_ASSERT_EQ((int)value, 123);
+
+  /* Unknown token -> not found. */
+  UT_ASSERT_EQ(tcc_ir_lookup_const_result(tcc_state, 201, &value, &btype), 0);
+
+  utb_reset_ipc_caches();
+  return 0;
+}
+
+/* ============================================================================
+ *  param_addrof_const_fold / local_addrof_const_fold — deeper coverage of the
+ *  TEMP->VAR->IMM chain look-through and multi-LEA disqualification gates.
+ * ============================================================================ */
+
+/* POSITIVE (param, chain look-through): the stored value reaches the modify
+ * STORE through one level of TEMP=VAR indirection where the VAR was itself
+ * assigned a constant earlier (`T1 = V0; STORE *T0 <- T1` where V0 was
+ * previously set to a constant).  This exercises the "second hop" TEMP->VAR
+ * ->IMM look-through in Phase 2 of tcc_ir_opt_param_addrof_const_fold.
+ *
+ *   STORE V0 <- #77          ; single def of V0
+ *   LEA   T0  = &P0
+ *   T1 = V0                  ; ASSIGN T1 <- V0 (single def of T1)
+ *   STORE *T0 = T1           ; modify through pointer, value is indirected #77
+ *   ADD   T2 = P0 + #1       ; read of P0 past the modify -> 77 + 1
+ *   RETURNVALUE T2 */
+UT_TEST(test_param_addrof_chain_lookthrough_var_imm_positive)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 1;
+  ir->next_temporary_variable = 3;
+  ir->next_local_variable = 1;
+  utb_alloc_param_intervals(ir, 1);
+  utb_alloc_var_intervals(ir, 1);
+
+  utb_emit(ir, TCCIR_OP_STORE, utb_var(0, I32), utb_imm(77, I32), UTB_NONE);
+  int i_lea = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_local_vreg(VR_PARAM(0), I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_var(0, I32), UTB_NONE);
+  int i_store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_temp(1, I32), UTB_NONE);
+  int i_add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), irop_make_vreg(VR_PARAM(0), I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_param_addrof_const_fold(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, i_lea), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, i_store), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, i_add), TCCIR_OP_ADD);
+  UT_ASSERT(irop_is_immediate(utb_src1(ir, i_add)));
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, i_add)), 77);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (param, multi-LEA disqualification): P0's address is taken twice
+ * (two distinct LEA T=&P0), which must disqualify P0 entirely even though
+ * the first LEA/STORE pair alone would otherwise be a valid fold pattern. */
+UT_TEST(test_param_addrof_multi_lea_same_param_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 1;
+  ir->next_temporary_variable = 2;
+  ir->next_local_variable = 0;
+  utb_alloc_param_intervals(ir, 1);
+
+  int i_lea1 = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_local_vreg(VR_PARAM(0), I32), UTB_NONE);
+  int i_lea2 = utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), utb_local_vreg(VR_PARAM(0), I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(5, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), irop_make_vreg(VR_PARAM(0), I32), utb_imm(3, I32));
+
+  int changes = tcc_ir_opt_param_addrof_const_fold(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, i_lea1), TCCIR_OP_LEA);
+  UT_ASSERT_EQ(utb_op(ir, i_lea2), TCCIR_OP_LEA);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (local, SYMREF store value): the modify STORE's value is a
+ * link-time constant address (SYMREF) rather than an IMM32 -- covers the
+ * `sv_tag == IROP_TAG_SYMREF` accept path distinct from every existing
+ * IMM32-only local/param positive test. */
+UT_TEST(test_local_addrof_symref_store_value_positive)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 0;
+  ir->next_temporary_variable = 2;
+  ir->next_local_variable = 1;
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 1);
+
+  static Sym target_sym;
+  IROperand sym_addr = utb_symref(ir, &target_sym, 0 /* not lval: address value */, 0, 0, I32);
+
+  int i_init = utb_emit(ir, TCCIR_OP_STORE, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);
+  int i_lea = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_local_vreg(VR_VAR(0), I32), UTB_NONE);
+  int i_store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), sym_addr, UTB_NONE);
+  int i_add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), irop_make_vreg(VR_VAR(0), I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_local_addrof_const_fold(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, i_init), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, i_lea), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, i_store), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, i_add), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(irop_get_tag(utb_src1(ir, i_add)), IROP_TAG_SYMREF);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (local, disqualified by 64-bit store value): a modify STORE whose
+ * value is a 64-bit immediate must NOT be folded (the pass explicitly
+ * excludes 64-bit operand rewriting: `!irop_is_64bit(effective_val)`). */
+UT_TEST(test_local_addrof_64bit_store_value_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 0;
+  ir->next_temporary_variable = 2;
+  ir->next_local_variable = 1;
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 1);
+
+  uint32_t pool_idx = tcc_ir_pool_add_i64(ir, 0x1FFFFFFFFLL);
+  IROperand imm64 = irop_make_i64(0, pool_idx, I64);
+
+  int i_init = utb_emit(ir, TCCIR_OP_STORE, utb_var(0, I64), utb_imm(0, I32), UTB_NONE);
+  int i_lea = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_local_vreg(VR_VAR(0), I64), UTB_NONE);
+  int i_store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), imm64, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), irop_make_vreg(VR_VAR(0), I64), utb_imm(0, I32));
+
+  int changes = tcc_ir_opt_local_addrof_const_fold(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, i_init), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, i_lea), TCCIR_OP_LEA);
+  UT_ASSERT_EQ(utb_op(ir, i_store), TCCIR_OP_STORE);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* ============================================================================
+ *  const_string_calls — stack-strlen path (ir_opt_eval_stack_strlen), which
+ *  needs no ELF section data: it tracks byte-exact STORE sequences into a
+ *  stack buffer and memcpy-like calls copying a (separately) const string in.
+ * ============================================================================ */
+
+/* POSITIVE: byte-by-byte STOREs build "hi\0" on the stack; strlen() of that
+ * buffer's address folds to #2 via the stack-strlen scan (no ELF data
+ * needed -- distinct from the .rodata-backed strlen path). */
+UT_TEST(test_const_string_calls_strlen_stack_bytes_positive)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+
+  static Sym callee_sym;
+  IROperand callee = utb_callee_named(ir, &callee_sym, 90);
+  utb_set_tok_str(90, "strlen");
+
+  /* Stack buffer at STACKOFF 0: 'h','i','\0' as three INT8 stores. */
+  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(0, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('h', IROP_BTYPE_INT8), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(1, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('i', IROP_BTYPE_INT8), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(2, 1, 0, 0, IROP_BTYPE_INT8), utb_imm(0, IROP_BTYPE_INT8), UTB_NONE);
+
+  /* strlen(&buf) -- arg is the bare stack address (STACKOFF, vreg=-1, not
+   * lval, is_local=1), matching ir_opt_stack_addr_offset's expected shape. */
+  IROperand buf_addr = irop_make_stackoff(-1, 0, 0 /* not lval */, 0, 0, I32);
+  buf_addr.is_local = 1;
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf_addr, utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
+  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
+                        utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
+
+  int changes = tcc_ir_opt_const_string_calls(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_ASSIGN);
+  UT_ASSERT(irop_is_immediate(utb_src1(ir, i_call)));
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, i_call)), 2);
+
+  utb_set_tok_str(90, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: the same stack buffer but missing the NUL terminator byte (only 2 of
+ * 3 bytes known) -> ir_opt_eval_stack_strlen's final scan finds `known[i]==0`
+ * before any zero byte and fails, so strlen falls through to the
+ * __tcc_strlen redirect instead of a direct fold. */
+UT_TEST(test_const_string_calls_strlen_stack_no_nul_no_direct_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+
+  static Sym callee_sym;
+  IROperand callee = utb_callee_named(ir, &callee_sym, 91);
+  utb_set_tok_str(91, "strlen");
+
+  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(0, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('h', IROP_BTYPE_INT8), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(1, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('i', IROP_BTYPE_INT8), UTB_NONE);
+  /* no NUL store */
+
+  IROperand buf_addr = irop_make_stackoff(-1, 0, 0, 0, 0, I32);
+  buf_addr.is_local = 1;
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf_addr, utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
+  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
+                        utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
+
+  int changes = tcc_ir_opt_const_string_calls(ir);
+
+  /* Falls through to the __tcc_strlen redirect (a change of a different kind:
+   * change_callee_sym returns 0 here because external_global_sym is stubbed
+   * to NULL, so ultimately changes==0 and the call is left as FUNCCALLVAL). */
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_FUNCCALLVAL);
+
+  utb_set_tok_str(91, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: a JUMP between the stack stores and the strlen call invalidates the
+ * pre-call scan (ir_opt_eval_stack_strlen bails on any jump/jump-target in
+ * range), so the direct fold does not fire. */
+UT_TEST(test_const_string_calls_strlen_stack_jump_boundary_no_direct_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+
+  static Sym callee_sym;
+  IROperand callee = utb_callee_named(ir, &callee_sym, 92);
+  utb_set_tok_str(92, "strlen");
+
+  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(0, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('h', IROP_BTYPE_INT8), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(1, 1, 0, 0, IROP_BTYPE_INT8), utb_imm(0, IROP_BTYPE_INT8), UTB_NONE);
+  /* An unconditional JUMP to the very next instruction -- still a JUMP in the
+   * pre-call scan range, which unconditionally bails the stack-strlen scan. */
+  int i_jump = utb_emit(ir, TCCIR_OP_JUMP, utb_imm(3, I32), UTB_NONE, UTB_NONE);
+
+  IROperand buf_addr = irop_make_stackoff(-1, 0, 0, 0, 0, I32);
+  buf_addr.is_local = 1;
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf_addr, utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
+  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
+                        utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
+
+  int changes = tcc_ir_opt_const_string_calls(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_FUNCCALLVAL);
+  UT_ASSERT_EQ(utb_op(ir, i_jump), TCCIR_OP_JUMP);
+
+  utb_set_tok_str(92, NULL);
+  utb_free(ir);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(opt_constfold)
@@ -1550,4 +2321,33 @@ UT_SUITE(opt_constfold)
   UT_RUN(test_local_addrof_const_fold_positive);
   UT_RUN(test_local_addrof_missing_init_no_fold);
   UT_RUN(test_local_addrof_pre_modify_read_no_fold);
+
+  UT_RUN(test_switch_func_detect_branchy_positive);
+  UT_RUN(test_switch_call_replace_branchy_positive);
+  UT_RUN(test_switch_func_detect_two_params_rejected);
+  UT_RUN(test_switch_func_detect_llong_param_rejected);
+  UT_RUN(test_switch_func_detect_addrtaken_param_rejected);
+  UT_RUN(test_switch_func_detect_unsupported_op_rejected);
+  UT_RUN(test_switch_func_detect_no_return_rejected);
+  UT_RUN(test_switch_func_detect_unsupported_return_btype_rejected);
+  UT_RUN(test_switch_func_simulate_pure_wrapper_declines_when_replay_needed);
+  UT_RUN(test_switch_func_simulate_store_replay_positive);
+  UT_RUN(test_switch_call_replace_branchy_nonconst_arg_no_fold);
+
+  UT_RUN(test_detect_const_result_immediate_return_positive);
+  UT_RUN(test_detect_const_result_assign_then_return_positive);
+  UT_RUN(test_detect_const_result_has_params_rejected);
+  UT_RUN(test_detect_const_result_other_op_rejected);
+  UT_RUN(test_detect_const_result_too_many_instructions_rejected);
+  UT_RUN(test_detect_const_result_non_immediate_source_rejected);
+  UT_RUN(test_const_result_cache_round_trip_and_duplicate_guard);
+
+  UT_RUN(test_param_addrof_chain_lookthrough_var_imm_positive);
+  UT_RUN(test_param_addrof_multi_lea_same_param_no_fold);
+  UT_RUN(test_local_addrof_symref_store_value_positive);
+  UT_RUN(test_local_addrof_64bit_store_value_no_fold);
+
+  UT_RUN(test_const_string_calls_strlen_stack_bytes_positive);
+  UT_RUN(test_const_string_calls_strlen_stack_no_nul_no_direct_fold);
+  UT_RUN(test_const_string_calls_strlen_stack_jump_boundary_no_direct_fold);
 }

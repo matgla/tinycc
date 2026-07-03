@@ -17,21 +17,27 @@
 /* From tccgen.c - used only for debug/dump messages. */
 const char *funcname = "unit_test";
 
-/* Debug scanners declared in ir/regalloc.c / ir/opt_pipeline.c. */
-void dbg_scan_overlap(struct TCCIRState *ir, const char *pass)
-{
-  (void)ir;
-  (void)pass;
-}
-
-void dbg_scan_imm_dest(struct TCCIRState *ir, const char *pass)
-{
-  (void)ir;
-  (void)pass;
-}
+/* dbg_scan_overlap / dbg_scan_imm_dest used to be stubbed here too, but
+ * ir/opt_pipeline.c (linked for tests/unit/arm/armv8m/test_opt_fusion.c's
+ * gens_*_ex adapters) now provides the real, non-static definitions --
+ * duplicating them here would be a link error (multiple definition). */
 
 /* SSA optimizer driver - enough to satisfy tcc_ir_ssa_regalloc's call sites
- * without running any real optimization passes. */
+ * without running any real optimization passes.
+ *
+ * ctx->vinfo IS real (allocated/zeroed here, indexed by TEMP vreg position),
+ * unlike earlier versions of this stub which left it NULL. Every ARM
+ * target-specific SSA generator (arch/arm/ssa_opt_arm.c, exercised directly
+ * by test_ssa_opt_arm.c) starts with a `ssa_opt_vinfo(ctx, vr)` lookup and
+ * bails out immediately if it returns NULL -- so a NULL-returning stub made
+ * ssa_opt_arm.c's fusion logic completely untestable (0% coverage) even
+ * though the .o links fine. tcc_ir_ssa_opt_run/_run_target and all the
+ * individual ssa_opt_<pass> functions below remain no-op stubs (regalloc.c's
+ * only other caller doesn't need real pass behavior here), so this change is
+ * purely additive: it does not alter tcc_ir_ssa_regalloc's observable
+ * behavior (no pass ever populates or consults vinfo), it only makes the
+ * struct usable by tests that build vinfo by hand and call an ARM ssa_gen_*
+ * function directly. */
 void tcc_ir_ssa_opt_init(IRSSAOptCtx *ctx, struct TCCIRState *ir,
                          struct IRSSAState *ssa, struct IRCFG *cfg)
 {
@@ -39,6 +45,10 @@ void tcc_ir_ssa_opt_init(IRSSAOptCtx *ctx, struct TCCIRState *ir,
   ctx->ir = ir;
   ctx->ssa = ssa;
   ctx->cfg = cfg;
+  ctx->vinfo_cap = ir ? ir->next_temporary_variable : 0;
+  if (ctx->vinfo_cap <= 0)
+    ctx->vinfo_cap = 1;
+  ctx->vinfo = tcc_mallocz(ctx->vinfo_cap * sizeof(struct IRSSAVregInfo));
 }
 
 void tcc_ir_ssa_opt_rebuild(IRSSAOptCtx *ctx)
@@ -50,6 +60,13 @@ void tcc_ir_ssa_opt_free(IRSSAOptCtx *ctx)
 {
   if (!ctx)
     return;
+  if (ctx->vinfo) {
+    for (int i = 0; i < ctx->vinfo_cap; i++)
+      tcc_free(ctx->vinfo[i].uses);
+    tcc_free(ctx->vinfo);
+  }
+  ctx->vinfo = NULL;
+  ctx->vinfo_cap = 0;
   ctx->ir = NULL;
   ctx->ssa = NULL;
   ctx->cfg = NULL;
@@ -92,37 +109,92 @@ int ssa_opt_var_to_param_forward(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_var_const_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_dead_loop(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 
-/* Use-def helpers - stubs; passes are no-ops so chains are unused. */
+/* Use-def helpers - real implementations (mirrors ir/opt/ssa_opt.c, which is
+ * not linked into this harness). The individual ssa_opt_<pass> functions
+ * above are no-ops so *they* never build/consult chains via these helpers,
+ * but arch/arm/ssa_opt_arm.c's target-specific generators call these
+ * directly and need real def/use-chain semantics to be exercisable at all
+ * (see tcc_ir_ssa_opt_init's comment). */
 struct IRSSAVregInfo *ssa_opt_vinfo(IRSSAOptCtx *ctx, int32_t vreg)
 {
-  (void)ctx;
-  (void)vreg;
-  return NULL;
+  if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) != TCCIR_VREG_TYPE_TEMP)
+    return NULL;
+  int pos = TCCIR_DECODE_VREG_POSITION(vreg);
+  if (pos >= ctx->vinfo_cap)
+    return NULL;
+  return &ctx->vinfo[pos];
 }
 
 void ssa_opt_add_use_instr(struct IRSSAVregInfo *vi, int instr_idx)
 {
-  (void)vi;
-  (void)instr_idx;
+  if (vi->use_count >= vi->use_cap) {
+    int nc = vi->use_cap ? vi->use_cap * 2 : 4;
+    vi->uses = tcc_realloc(vi->uses, nc * sizeof(*vi->uses));
+    vi->use_cap = nc;
+  }
+  vi->uses[vi->use_count].idx = instr_idx;
+  vi->uses[vi->use_count].slot = 0;
+  vi->uses[vi->use_count].kind = SSA_USE_INSTR;
+  vi->use_count++;
 }
 
 void ssa_opt_add_use_phi(struct IRSSAVregInfo *vi, int block, int slot)
 {
-  (void)vi;
-  (void)block;
-  (void)slot;
+  if (vi->use_count >= vi->use_cap) {
+    int nc = vi->use_cap ? vi->use_cap * 2 : 4;
+    vi->uses = tcc_realloc(vi->uses, nc * sizeof(*vi->uses));
+    vi->use_cap = nc;
+  }
+  vi->uses[vi->use_count].idx = block;
+  vi->uses[vi->use_count].slot = slot;
+  vi->uses[vi->use_count].kind = SSA_USE_PHI;
+  vi->use_count++;
 }
 
 void ssa_opt_remove_use_instr(struct IRSSAVregInfo *vi, int instr_idx)
 {
-  (void)vi;
-  (void)instr_idx;
+  for (int i = 0; i < vi->use_count; i++) {
+    if (vi->uses[i].kind == SSA_USE_INSTR && vi->uses[i].idx == instr_idx) {
+      vi->uses[i] = vi->uses[--vi->use_count];
+      return;
+    }
+  }
 }
 
 void ssa_opt_nop_instr(IRSSAOptCtx *ctx, int idx)
 {
-  (void)ctx;
-  (void)idx;
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  if (q->op == TCCIR_OP_NOP)
+    return;
+
+  if (irop_config[q->op].has_src1) {
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    struct IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(s));
+    if (vi)
+      ssa_opt_remove_use_instr(vi, idx);
+  }
+  if (irop_config[q->op].has_src2) {
+    IROperand s = tcc_ir_op_get_src2(ir, q);
+    struct IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(s));
+    if (vi)
+      ssa_opt_remove_use_instr(vi, idx);
+  }
+  if (q->op == TCCIR_OP_MLA) {
+    IROperand a = tcc_ir_op_get_accum(ir, q);
+    struct IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(a));
+    if (vi)
+      ssa_opt_remove_use_instr(vi, idx);
+  }
+  if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+      q->op == TCCIR_OP_STORE_POSTINC) {
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    struct IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(d));
+    if (vi)
+      ssa_opt_remove_use_instr(vi, idx);
+  }
+
+  q->op = TCCIR_OP_NOP;
 }
 
 int ssa_opt_replace_all_uses(IRSSAOptCtx *ctx, int32_t old_vr, int32_t new_vr)
@@ -164,11 +236,4 @@ int ssa_opt_indirect_stack_offset(IRSSAOptCtx *ctx, const struct IRQuadCompact *
   (void)q;
   (void)side;
   return INT_MIN;
-}
-
-/* Legacy optimization passes referenced from the allocator pipeline. */
-int tcc_ir_opt_switch_to_data(struct TCCIRState *ir)
-{
-  (void)ir;
-  return 0;
 }

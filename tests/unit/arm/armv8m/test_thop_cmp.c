@@ -201,6 +201,34 @@ UT_TEST(test_th_tst_imm_t32_exact)
   return 0;
 }
 
+UT_TEST(test_th_teq_imm_t32_exact)
+{
+  setup_armv7m();
+
+  /* TEQ R1, #1 => 0xF0910F01 (only TEQ_IMM has just one T32 variant, no T16 form) */
+  thumb_opcode op = th_teq_imm(R1, 0x01, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xF0910F01);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ generic handler-table adapter */
+
+UT_TEST(test_th_cmp_imm_handler_ignores_rd_and_matches_th_cmp_imm)
+{
+  setup_armv7m();
+
+  /* th_cmp_imm_handler matches thumb_imm_handler_t's (rd, rn, imm, flags, enc)
+   * signature for generic dispatch tables; rd is unused (CMP hard-codes Rd=0xF). */
+  thumb_opcode direct = th_cmp_imm(R1, 0xFF000000, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
+  thumb_opcode via_handler = th_cmp_imm_handler(R7, R1, 0xFF000000, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(via_handler.size, direct.size);
+  UT_ASSERT_EQ(via_handler.opcode, direct.opcode);
+
+  return 0;
+}
+
 /* ------------------------------------------------------------------ TEQ register T32 - additional variants */
 
 UT_TEST(test_th_teq_reg_t32_no_shift)
@@ -233,4 +261,6 @@ UT_SUITE(thop_cmp)
   UT_RUN(test_th_tst_reg_t32);
   UT_RUN(test_th_cmn_imm_t32);
   UT_RUN(test_th_tst_imm_t32_exact);
+  UT_RUN(test_th_teq_imm_t32_exact);
+  UT_RUN(test_th_cmp_imm_handler_ignores_rd_and_matches_th_cmp_imm);
 }

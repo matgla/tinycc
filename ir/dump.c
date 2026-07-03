@@ -431,9 +431,9 @@ void tcc_dump_quadruple_to(FILE *out, const TACQuadruple *q, int pc)
     fprintf(out, "JMP to %d ", (int)q->dest.c.i);
     break;
   case TCCIR_OP_IJUMP:
+    /* Mnemonic only; the generic has_src1 block below prints src1 once.
+       See docs/bugs.md #5 (matching the fix in tcc_print_quadruple_irop). */
     fprintf(out, "IJMP ");
-    tcc_dump_svalue_short_to(out, &q->src1);
-    fprintf(out, " ");
     break;
   default:
     tcc_dump_svalue_short_to(out, &q->dest);
@@ -658,6 +658,16 @@ void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name)
   tcc_ir_dump_set_show_physical_regs(0);
   printf("=== AFTER %s ===\n", pass_name);
   tcc_ir_show(ir);
+  /* Switch side tables are absolute-index consumers that renumbering passes
+   * must keep in sync — print them so a stale target is visible in the dump. */
+  for (int t = 0; t < ir->num_switch_tables; t++) {
+    TCCIRSwitchTable *tbl = &ir->switch_tables[t];
+    printf("SWTAB %d: min=%lld max=%lld default=%d targets=[", t,
+           (long long)tbl->min_val, (long long)tbl->max_val, tbl->default_target);
+    for (int j = 0; j < tbl->num_entries; j++)
+      printf("%s%d", j ? "," : "", tbl->targets[j]);
+    printf("]\n");
+  }
   printf("=== END AFTER %s ===\n", pass_name);
 #else
   (void)ir;
@@ -995,9 +1005,11 @@ void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc)
     printf("JMP to %ld ", (long)irop_get_imm64_ex(ir, dest));
     break;
   case TCCIR_OP_IJUMP:
+    /* Only print the mnemonic here; the generic has_src1 block below prints
+       src1 (the target register) exactly once.  Printing it here too produced
+       a double "IJMP T4 T4" (docs/bugs.md #5).  Unlike JUMPIF/MLA, IJUMP is
+       not excluded from that block, so this case must not print src1 itself. */
     printf("IJMP ");
-    print_iroperand_short(ir, src1);
-    printf(" ");
     break;
   case TCCIR_OP_MLA:
     /* MLA has 4 operands: dest = src1 * src2 + accum */

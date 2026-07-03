@@ -2891,13 +2891,13 @@ uint32_t thumb_parse_special_register(int token)
   {
     return 0x10;
   }
-  else if (strstr(buffer, "basepri") != NULL)
-  {
-    return 0x11;
-  }
   else if (strstr(buffer, "basepri_max") != NULL)
   {
     return 0x12;
+  }
+  else if (strstr(buffer, "basepri") != NULL)
+  {
+    return 0x11;
   }
   else if (strstr(buffer, "faultmask") != NULL)
   {

@@ -91,8 +91,9 @@ def _normalize_predefined_macros(output):
     These predefined macros are non-deterministic across runs, so we
     normalize them to keep golden preprocessor output stable.
     """
-    # "Mmm dd yyyy"
-    output = re.sub(r'"[A-Z][a-z]{2} \d{1,2} \d{4}"', '"<DATE>"', output)
+    # "Mmm dd yyyy" (day is space-padded to width 2, so single-digit days
+    # yield two spaces, e.g. "Jul  1 2026")
+    output = re.sub(r'"[A-Z][a-z]{2}\s+\d{1,2} \d{4}"', '"<DATE>"', output)
     # "hh:mm:ss"
     output = re.sub(r'"\d{2}:\d{2}:\d{2}"', '"<TIME>"', output)
     return output
@@ -116,6 +117,11 @@ def _run_compiler(compiler, cflags, c_file, tmp_path, output_object=True):
     For preprocessor-only mode the object output is omitted so that the
     preprocessed source is emitted on stdout (matching the legacy tests/pp
     behaviour).
+
+    stdout and stderr are captured separately: golden comparisons (pp/ and
+    types/ IR dumps) read deterministic stdout only, so debug builds with
+    TCC_LOG_* scopes enabled (which log to stderr) don't pollute them, while
+    diagnostics tests read stderr.
     """
     cmd = [str(compiler), *cflags, str(c_file)]
     if output_object:
@@ -124,7 +130,7 @@ def _run_compiler(compiler, cflags, c_file, tmp_path, output_object=True):
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         text=True,
     )
     return result, cmd
@@ -164,7 +170,8 @@ def test_pp(name, c_file, golden, frontend_compiler, tmp_path, request):
         raise AssertionError(
             f"Preprocessing failed for pp/{name}\n"
             f"Command: {' '.join(cmd)}\n"
-            f"Output:\n{result.stdout}"
+            f"Output:\n{result.stdout}\n"
+            f"Stderr:\n{result.stderr}"
         )
 
     actual = _normalize_predefined_macros(_strip_builtin_preamble(result.stdout))
@@ -210,7 +217,8 @@ def test_types(name, c_file, golden, debug_compiler, tmp_path, request):
         raise AssertionError(
             f"Compilation failed for types/{name}\n"
             f"Command: {' '.join(cmd)}\n"
-            f"Output:\n{result.stdout}"
+            f"Output:\n{result.stdout}\n"
+            f"Stderr:\n{result.stderr}"
         )
 
     actual = result.stdout
@@ -262,7 +270,7 @@ def test_diagnostics(
             f"Command: {' '.join(cmd)}"
         )
 
-    actual = result.stdout
+    actual = result.stderr
 
     if updating:
         golden.write_text(actual)

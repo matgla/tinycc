@@ -2010,6 +2010,24 @@ int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir)
     if (!safe)
       continue;
 
+    /* Pin both sides of every eliminated no-op copy to their shared physical
+     * register.  Without this, a later codegen scratch-conflict fixup
+     * (try_reassign_scratch_conflict) can independently move just the dest
+     * vreg's interval to a different register — the two vregs stop sharing a
+     * register even though the copy that would keep them in sync no longer
+     * exists in the IR, so the fall-through edge silently reads a register
+     * that was never written on that path.  phi_pinned is the same guard
+     * ra_phi_copy_needed() sets for the identical post-RA-identity case. */
+    for (int j = 0; j < num_assigns; j++) {
+      IRQuadCompact *aq = &ir->compact_instructions[i + 1 + j];
+      int32_t adst_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, aq));
+      int32_t asrc_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, aq));
+      IRLiveInterval *dli = tcc_ir_vreg_live_interval(ir, adst_vr);
+      IRLiveInterval *sli = tcc_ir_vreg_live_interval(ir, asrc_vr);
+      if (dli) dli->phi_pinned = 1;
+      if (sli) sli->phi_pinned = 1;
+    }
+
     int inv_cond = invert_condition(cond);
     if (inv_cond < 0)
       continue;

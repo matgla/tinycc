@@ -446,6 +446,224 @@ TEST_FILES = [
     ("232_fuzz_bitfield_store_indexed_width.c", 0),
     ("233_fuzz_knownbits_subword_store_slot_overlap.c", 0),
     ("234_fuzz_switch_table_r12_clobber.c", 0),
+    ("235_fuzz_retval_reg_share_store_ptr.c", 0),
+    ("236_fuzz_post_ra_fwd_diamond_scratch_reassign.c", 0),
+    # NOT a tcc bug: pins tcc's CORRECT output for a program the gcc oracle
+    # miscompiles at -O2 (bitfield seed 1486); guards against a future regression.
+    ("237_fuzz_bitfield_gcc_o2_miscompile.c", 0),
+    ("238_fuzz_loop_const_sim_unsigned_char_residual.c", 0),
+    ("239_fuzz_pack64_stack_slot_alias.c", 0),
+    ("240_fuzz_block_copy_call_clobber.c", 0),
+    ("241_fuzz_loop_const_sim_indexed_store.c", 0),
+    ("242_fuzz_entry_store_runtime_base_indexed.c", 0),
+    ("243_fuzz_value_track_uldivmod_stale_fwd.c", 0),
+    ("244_fuzz_entry_store_rt_base_plus_imm.c", 0),
+    ("245_fuzz_loop_const_sim_addr_plus_imm.c", 0),
+    ("246_fuzz_loop_phi_coalesce_rotated_redef.c", 0),
+    ("247_fuzz_gvn_64bit_truncating_copy.c", 0),
+    ("248_fuzz_value_track_llsl_stale_fwd.c", 0),
+    ("249_fuzz_loop_const_sim_else_arm_absorbed.c", 0),
+    ("250_fuzz_var_const_fold_intervening_use.c", 0),
+    ("251_fuzz_strd_pair_fuse_across_jump_target.c", 0),
+    ("252_fuzz_knownbits_imm_subword_sext.c", 0),
+    ("253_fuzz_ptr_load_cse_addrtaken_alias.c", 0),
+    ("254_fuzz_it_block_literal_pool_flush.c", 0),
+    ("255_fuzz_ssa_fold_64bit_shr_imm32.c", 0),
+    ("256_fuzz_ptr_cprop_load_cse_pointee_def.c", 0),
+    ("257_fuzz_ptr_mla_accum_dead_def.c", 0),
+    # bug #2 re-enable: derived-IV strength reduction (va-arg-24 reduction +
+    # register-only DIV positive case + single-trip CMP ptr,end soundness).
+    ("258_derived_iv_strength_reduction.c", 0),
+    # bug #7 sixth defect (ptr seeds 500/517): pure-call hoisting must not
+    # treat an address-taken argument (mutated through pointers in-loop)
+    # as loop-invariant.
+    ("259_pure_call_hoist_addr_taken_arg.c", 0),
+    # volatile seed 5053: MLA fusion sank a MUL's fused stack-slot read past
+    # a loop store to the same slot by placing the MLA at the ADD's site.
+    ("260_fuzz_mla_fusion_sinks_mem_read.c", 0),
+    # ptr seed 7226: SSA use-list/count desync (load_cse fold left a stale
+    # use record; DCE's count-only rebuild dropped a live deref use) made
+    # DCE delete a pointer def that *p9 still dereferenced.
+    ("261_fuzz_dce_use_list_count_desync.c", 0),
+    # float seed 6632: dead_local_slot position-only liveness ignored loop
+    # back-edges, killing a loop-carried store read at the loop top.
+    ("262_fuzz_dead_local_slot_backedge.c", 0),
+    # struct_byval seed 6105: real-run scratch PUSH in an FP-omitted frame
+    # skewed SP-relative loads inside the push window by 4 bytes.
+    ("263_fuzz_scratch_push_sp_offset.c", 0),
+    # ptr seed 8507: ssa:load_cse's TVStore (store through an unresolved
+    # TEMP pointer) survived a direct StackLoc store to the same address,
+    # forwarding a stale constant into a later deref of that pointer.
+    ("264_fuzz_load_cse_tvstore_stack_alias.c", 0),
+    # switch seed 8261: float_branch's repeated zero-test fold NOP'd the
+    # second `u8 & 1` test although u8 was redefined between the tests —
+    # the spill-encoded STACKOFF reads compared structurally equal and the
+    # plain-vreg XOR redefinition wasn't modeled as a memory mutation.
+    ("265_fuzz_zero_test_refold_var_redef.c", 0),
+
+    # volatile seed 8310: const_prop_tmp tracked a TEMP's folded constant but
+    # never invalidated it on a non-constant redefinition of the same TEMP
+    # position — loop unrolling's 16-temp rename cap leaves the 17th+ body
+    # temp multi-def across unrolled copies, so iterations 1/2 read
+    # iteration 0's stale constant.
+    ("266_fuzz_const_prop_tmp_temp_redef.c", 0),
+
+    # struct_byval seed 9494: value_tracking's generic source-read marking
+    # only consumed src1/src2, so an MLA with a StackLoc src2 (no fold
+    # pattern matched) never marked its accumulator VAR as read — a later
+    # constant redef of the same VAR NOP'd the accumulator's def, leaving
+    # `mla rd, rn, rm, ra` reading the caller's stale register.  Only
+    # reproduces one call frame deep (main printf()s before the payload).
+    ("267_fuzz_value_track_mla_accum_def.c", 0),
+
+    # docs/bugs.md #7 (resolved), ninth defect; combo fuzz seeds
+    # 52/80/187/311/333/392/460: pure-call hoisting's
+    # insert_instruction_before patched JUMP/JUMPIF targets but not the
+    # SWITCH_TABLE side table, leaving every case target stale by the
+    # insertion count (infinite loops / wrong checksums / "missing
+    # FUNCPARAMVAL" compile errors).
+    ("268_pure_call_hoist_switch_table_targets.c", 0),
+
+    # switch fuzz seed 10003 / ptr seed 19825 (O1/O2): redundant_var_assign
+    # only saw src1/src2 reads, so a VAR read as an MLA accumulator looked
+    # unread and its live defining load was NOP'd.
+    ("269_fuzz_redundant_assign_mla_accum.c", 0),
+
+    # struct_byval/combo fuzz seed 11651 (O1/O2): dse's write-only addr-TMP
+    # scan and dead_lea_store's operand walk both missed the MLA accumulator
+    # deref, deleting a by-value struct's spill stores that the MLA still read.
+    ("270_fuzz_dse_mla_accum_deref.c", 0),
+
+    # agg_deep fuzz seed 12085 (O1/O2): entry_store_prop's LEA map lost the
+    # stack address at a TEMP<-TEMP ASSIGN copy, so a store through the copied
+    # pointer never invalidated a BLOCK_COPY initializer and a stale constant
+    # was forwarded.
+    ("271_fuzz_entry_store_tmp_copy_alias.c", 0),
+
+    # bitfield fuzz seed 12264 (O1/O2): sl_forward FORWARD-SUBBYTE/CROSS-MERGE
+    # read stored_value.u.imm32 raw — for I64 pool immediates that's the pool
+    # INDEX, so a packed-bitfield byte read forwarded garbage.
+    ("272_fuzz_slfwd_subbyte_pool_imm.c", 0),
+
+    # switch fuzz seed 18613 (O2): tcc_ir_build_cfg didn't mark SWITCH_TABLE
+    # case/default targets as block leaders, so fall-through case entries
+    # didn't split blocks and SCCP folded the checksum along the wrong case.
+    ("273_fuzz_cfg_switch_target_leaders.c", 0),
+
+    # bitfield fuzz seed 17717 (O1/O2): store_redundant's read scan missed the
+    # MLA accumulator deref, killing a packed-struct field init store.
+    ("274_fuzz_store_redundant_mla_accum.c", 0),
+
+    # bitfield fuzz seeds 11840/11743/15654 (O2): loop_const_sim's memory map
+    # had no width/overlap awareness — a packed-bitfield byte store left the
+    # enclosing word slot's stale constant, and the collapsed RMW loop's
+    # residual word store wiped the byte back to 0.
+    ("275_fuzz_loop_const_sim_subword_overlap.c", 0),
+
+    # switch fuzz seed 14009 (O2): sl_forward's post-forward store cleanup
+    # missed live stores around runtime-indexed stack-array accesses.
+    ("276_fuzz_entry_store_direct_index_loop.c", 0),
+
+    # switch fuzz seed 17829 (O1): known_bits didn't mark SWITCH_TABLE
+    # case/default targets as block starts, so a stack-slot fact from case 2
+    # was reused on a direct jump to fall-through case 4.
+    ("277_fuzz_known_bits_switch_target_merge.c", 0),
+
+    # switch fuzz seed 18613 (O1/O2): full unroll grew case 0's counted loop
+    # without shifting later SWITCH_TABLE case/default targets, so selector 3
+    # entered the wrong point in the fall-through case chain.
+    ("278_fuzz_unroll_switch_dispatch_loop.c", 0),
+
+    # fp_round fuzz seed 18960 (O1): ssa:dce:phi_cycles removed loop-region
+    # phis still needed by out-of-SSA phi resolution.
+    ("279_fuzz_ssa_dce_phi_cycle_loop.c", 0),
+
+    # volatile fuzz seed 16558 (O1/O2): ssa:var_to_param_forward substituted a
+    # constant into a barrel-shift-annotated src2, silently dropping the LSL.
+    ("280_fuzz_barrel_shift_var_fwd_imm.c", 0),
+
+    # ptr fuzz seed 23598 (O1/O2): codegen MUL+ADD fusion bypassed the
+    # consumer ADD's barrel-shift annotation, dropping a hidden LSR #18.
+    ("281_fuzz_mul_add_fuse_barrel_annot.c", 0),
+
+    # ptr fuzz seed 35289 (O1/O2): vrp compared sign-extended range endpoints
+    # against a zero-extended pool-I64 CMP immediate, misfolding unsigned `<`.
+    ("282_fuzz_vrp_unsigned_cmp_pool_imm.c", 0),
+
+    # ptr fuzz seed 30436 (O1): scale-spec decodes bypassed the two-pass mop
+    # cache; a dry-run allocation patch flipped the real-run's LOAD_INDEXED
+    # coalesce decision, leaving a stale-cache copy that clobbered the load.
+    ("283_fuzz_mop_cache_scale_desync.c", 0),
+
+    # ptr fuzz seed 58108 (O1): SCCP's permissive entry-block store-forward
+    # scan skipped a conditional *p store through a VAR-held pointer, folding
+    # an array-element load back to its initializer.
+    ("284_fuzz_sccp_entry_exempt_var_ptr_store.c", 0),
+
+    # ptr fuzz seed 59549 (O2 HardFault): the MLA emitter didn't pre-exclude
+    # deref operands' pointer registers; src2's spill reload clobbered the
+    # deref-accumulator's pointer -> wild load (BFAR=0x8A4CB157).
+    ("285_fuzz_mla_deref_accum_ptr_clobber.c", 0),
+
+    # struct_byval/combo fuzz seed 26687 (O1/O2): dead_local_slot_elim's
+    # tameness loop scanned only dest/src1/src2, never the MLA accumulator, so
+    # a by-value struct field read through `MLA x*0 + Addr[StackLoc]***DEREF***`
+    # let the field's home store be deleted (the STORE_INDEXED r.b write gated
+    # off the mirrored precise-read path) -> MLA read an uninitialized slot.
+    ("286_fuzz_mla_accum_deref_dead_slot.c", 0),
+
+    # int fuzz seed 24769 (O1/O2/Os): guards the baseline integer stream case
+    # from fuzz_triage_all_23000_31000.md.
+    ("287_fuzz_int_24769.c", 0),
+
+    # struct_byval/combo fuzz seed 34487 (O1/O2): ssa:load_cse did not
+    # invalidate a tracked StackLoc store when a later PARAM store wrote the
+    # same slot, so an sret field copy forwarded the stale initializer.
+    ("288_fuzz_ssa_load_cse_param_store.c", 0),
+
+    # varargs fuzz seed 31282 (O1/O2): const_var_prop exposed a variadic call
+    # with stack-passed anonymous args to an ABI-sensitive backend miscompile.
+    ("289_fuzz_varargs_const_var_prop_stack_call.c", 0),
+
+    # varargs fuzz seed 36881 (O1/O2): barrel-shift fusion folded a const-prop'd
+    # `x SHR #0` (identity) into a consuming OR as `orr ..., lsr #0`, which ARM
+    # encodes as lsr #32 == 0; only LSL #0 is a true no-op barrel operand.
+    ("290_fuzz_barrel_shift_zero_amount.c", 0),
+
+    # agg_deep fuzz seed 36641 (O1/O2): redundant-store-elim killed a store to a
+    # 2-D array slot that an intervening LOAD_INDEXED with a runtime base and a
+    # constant column index could still read; the const-index branch never
+    # flushed the array range for a runtime base.
+    ("291_fuzz_rse_load_indexed_runtime_base.c", 0),
+
+    # volatile fuzz seed 36818 (O2): post-RA move coalescing cleared a shared
+    # register's live_regs_by_instruction bits when moving one of two
+    # deliberately-overlapping claimants away; the phase-3 scratch-conflict
+    # fixup then moved the outer loop counter onto the still-claimed register
+    # and the inner loop's in-place XOR clobbered it (outer loop ran 1x not 4x).
+    ("292_fuzz_move_coalesce_shared_reg_bitmap.c", 0),
+
+    # bitfield fuzz seed 40979 (O1/O2): post-RA reverse move coalescing merged
+    # a `u4 = u3` copy onto the source's register but only guarded against the
+    # SRC being redefined while dest is live -- not the symmetric case where
+    # DEST is redefined (`u4 = const`) while SRC (u3) is still read, clobbering
+    # the shared register. Added a dest-redefinition guard to the reverse path.
+    ("293_fuzz_move_coalesce_dest_redef.c", 0),
+
+    # int fuzz seed 41379 (O1/O2): the narrow ADD/SUB CSE cse_param_add keyed a
+    # stack local's lvalue read by a synthetic STACKOFF key, but a register-form
+    # write to the same local (`u4 = <compare>`) only invalidated raw-vreg keys.
+    # Two `u4 - #c` computations straddling the redefinition were wrongly CSE'd,
+    # so the later one read the stale pre-assignment value. Fixed by having a
+    # register-form write invalidate both the raw and STACKOFF synthetic key.
+    ("294_fuzz_cse_param_add_stackoff_redef.c", 0),
+
+    # signed fuzz seed 50156 (O1/O2): cmp_const_offset_fold proved `si7 = si6 -
+    # 9033` from the outer-loop def and folded `si7 <= si6` to a constant, blind
+    # to the inner back-edge redef `si7 = 659161088` that also reaches the CMP.
+    # tcc_ir_find_defining_instruction is a linear scan; fixed by requiring both
+    # CMP operands to be single-def before trusting the offset relationship.
+    ("295_fuzz_cmp_offset_fold_backedge_redef.c", 0),
 
     # Promoted from orphan triage: builtins, _Complex, aggregate init,
     # 64-bit ops, cast/bitfield, and previously-fixed bug regressions.

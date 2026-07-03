@@ -10,6 +10,7 @@
  */
 
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,21 @@ void tcc_free(void *ptr)
   free(ptr);
 }
 
+/* libtcc.c's libc_free() (declared in tcc.h) is the established escape hatch
+ * for releasing memory that came from a real libc allocator (e.g. realpath(),
+ * or here open_memstream() in test_ir_dump.c) rather than tcc's own
+ * allocator -- tcc.h #defines plain `free` to an intentionally-undefined
+ * `use_tcc_free` to catch accidental raw frees of tcc_malloc'd memory. The
+ * real definition lives in libtcc.c, which is deliberately not linked into
+ * this UT binary (see UT_COVERAGE_ONLY_SRCS in Makefile: linking it would
+ * collide with this file's tcc_malloc/tcc_free/etc. stubs). Provide the
+ * same minimal passthrough here so callers that need to free libc-allocated
+ * buffers have a symbol to link against. */
+void libc_free(void *ptr)
+{
+  free(ptr);
+}
+
 char *tcc_strdup(const char *str)
 {
   size_t n = strlen(str) + 1;
@@ -81,9 +97,50 @@ void _tcc_warning(const char *fmt, ...)
   va_end(ap);
 }
 
+/* expect() is declared `ST_FUNC NORETURN void expect(const char *msg)` in
+ * tcc.h (tccpp.c: `tcc_error("%s expected", msg)`). It's referenced by a
+ * handful of operand-validation error paths in arm-thumb-asm.c (e.g.
+ * thumb_generate_opcode_for_data_processing's clz/bfc operand checks) that
+ * survive --gc-sections once test_arm_thumb_asm.c calls into those
+ * dispatchers directly (bypassing the full lexer-driven asm_opcode() entry
+ * point tccpp.c/tccasm.c would normally reach it through). Every unit test
+ * that exercises this file sticks to well-formed operands, so this path is
+ * unreachable at runtime; abort loudly (matching _tcc_error above) if that
+ * ever changes. */
+void expect(const char *msg)
+{
+  fprintf(stderr, "[test stub] expect: '%s' expected\n", msg);
+  abort();
+}
+
 /* `ind` is declared ST_DATA int rsym, anon_sym, ind, loc; in tcc.h.
  * In unit-test builds ST_DATA=extern, so we provide the definition. */
 int ind;
+
+/* find_section() is referenced by tccasm.c's section-stack helpers when unit
+ * tests exercise use_section/push_section/pop_section.  The main UT binary does
+ * not link tccelf.c, so provide a minimal allocator that returns a zeroed
+ * Section-sized block.  Tests treat the result as opaque and only read/write
+ * the data_offset/prev fields they set up themselves. */
+struct Section;
+struct TCCState;
+struct Section *find_section(struct TCCState *s1, const char *name)
+{
+  struct Section *sec;
+  (void)s1;
+  (void)name;
+  sec = (struct Section *)tcc_mallocz(1024);
+  return sec;
+}
+
+/* tok_str_free() is referenced by tccasm.c's asm_macros_free.  The main UT
+ * binary does not link tccpp.c; unit tests only hand asm_macros_free simple
+ * malloc'd TokenString shells, so a plain wrapper is enough. */
+struct TokenString;
+void tok_str_free(struct TokenString *s)
+{
+  tcc_free(s);
+}
 
 /* set_elf_sym is declared in tcc.h; thumb.c uses it for symbol table entries.
  * Unit tests don't emit ELF, so return 0 (always succeeds). */
@@ -102,14 +159,35 @@ int set_elf_sym(struct Section *s, addr_t value, unsigned long size, int info, i
   return 0;
 }
 
+/* put_elf_sym is declared in tcc.h; tccdbg.c uses it for DWARF section symbols.
+ * Unit tests don't emit ELF, so return a deterministic symbol index derived
+ * from the section number. */
+int put_elf_sym(struct Section *s, addr_t value, unsigned long size, int info, int other, int shndx, const char *name)
+{
+  (void)value;
+  (void)size;
+  (void)info;
+  (void)other;
+  (void)name;
+  /* Keep the Section pointer alive for the caller so it can verify the right
+   * section was passed; the return value is arbitrary but deterministic. */
+  (void)s;
+  return shndx + 1;
+}
+
 /* get_tok_str is declared `const char *get_tok_str(int, CValue*)` in tcc.h and
  * used by name-gated optimizer passes (e.g. self_copy_elim, float_narrowing).
  * The unit-test harness lets individual tests populate a token→name table so
  * those passes can reach their positive folds.  CValue is opaque here (no tcc.h),
  * hence the void* parameter — the linker resolves by name regardless. */
 
-#define UTB_MAX_TOK 256
+/* Must be large enough to hold TOK_IDENT-relative tokens used by tests
+ * (e.g. TOK_IDENT + 101 in test_opt_licm.c); TOK_IDENT itself is 256, so
+ * 256 alone truncated every "TOK_IDENT + N" test token to out-of-range. */
+#define UTB_TOKEN_BASE 256
+#define UTB_MAX_TOK 1024
 static const char *utb_tok_names[UTB_MAX_TOK];
+static int utb_next_tok = 512;
 
 void utb_set_tok_str(int tok, const char *name)
 {
@@ -150,11 +228,11 @@ int nocode_wanted = 0;
 struct BufferedFile *file = NULL;
 CType func_old_type;
 
-/* From arm-thumb-gen.c — allocator init/shutdown. */
-int tcc_gen_machine_number_of_registers(void)
-{
-  return 16;
-}
+/* From arm-thumb-gen.c: tcc_gen_machine_number_of_registers,
+ * tcc_get_abi_softcall_name. Split into stubs_gen_machine_fallback.c (linked
+ * here, but NOT into the backend/ binary, which links the real
+ * arm-thumb-gen.c and would otherwise get a multiple-definition error for
+ * both) -- see that file. */
 
 /* From tccelf.c — symbol registration; unit tests don't emit ELF. */
 typedef unsigned long addr_t;
@@ -168,15 +246,7 @@ int put_extern_sym2(struct Sym *sym, addr_t value, unsigned long size,
   return 0;
 }
 
-/* From arm-thumb-gen.c — soft-float helper names; unit tests don't lower calls. */
 struct SValue;
-
-const char *tcc_get_abi_softcall_name(struct SValue *src1, struct SValue *src2,
-                                       struct SValue *dest, int op)
-{
-  (void)src1; (void)src2; (void)dest; (void)op;
-  return NULL;
-}
 
 /* From tcc.c — operand width helper. */
 int tcc_is_64bit_operand(struct SValue *sv)
@@ -217,6 +287,12 @@ void tcc_opt_fp_mat_cache_free(struct TCCIRState *ir)
 
 struct Sym *global_stack = NULL;
 
+/* opt_dce.c's volatile-vreg checks (ir_opt_param_vreg_is_volatile,
+ * ir_opt_vreg_sym_is_volatile) walk local_stack when tcc_state->ir is unset.
+ * Hand-built IR has no frontend symbol table, so an empty list is correct:
+ * the walk finds nothing and the vreg is reported non-volatile. */
+struct Sym *local_stack = NULL;
+
 struct Sym *sym_push2(struct Sym **ps, int v, int t, int c)
 {
   (void)ps; (void)v; (void)t; (void)c;
@@ -241,8 +317,47 @@ struct Sym *sym_find(int v)
 
 int tok_alloc_const(const char *str)
 {
-  (void)str;
-  return 0;
+  int i;
+  for (i = UTB_TOKEN_BASE; i < UTB_MAX_TOK; i++)
+  {
+    if (utb_tok_names[i] && strcmp(utb_tok_names[i], str) == 0)
+      return i;
+  }
+  if (utb_next_tok >= UTB_MAX_TOK)
+    return 0;
+  utb_tok_names[utb_next_tok] = tcc_strdup(str);
+  return utb_next_tok++;
+}
+
+typedef struct UtbTokenSym
+{
+  struct UtbTokenSym *hash_next;
+  void *sym_define;
+  void *sym_label;
+  void *sym_struct;
+  void *sym_identifier;
+  int tok;
+  int len;
+  char str[1];
+} UtbTokenSym;
+
+void *tok_alloc(const char *str, int len)
+{
+  int tok;
+  UtbTokenSym *ts;
+  char buf[128];
+  if (len < 0)
+    len = (int)strlen(str);
+  if ((unsigned)len >= sizeof(buf))
+    len = (int)sizeof(buf) - 1;
+  memcpy(buf, str, len);
+  buf[len] = '\0';
+  tok = tok_alloc_const(buf);
+  ts = (UtbTokenSym *)tcc_mallocz(sizeof(*ts) + (unsigned)len);
+  ts->tok = tok;
+  ts->len = len;
+  memcpy(ts->str, buf, (unsigned)len + 1);
+  return ts;
 }
 
 /* opt_dce.c (pulled in by the cmpfold suite) calls elfsym() on callee symbols.
@@ -251,4 +366,31 @@ void *elfsym(void *s)
 {
   (void)s;
   return 0;
+}
+
+/* opt_memory.c's entry_store_prop calls read32le() on rodata bytes when
+ * expanding a BLOCK_COPY's constant source; hand-built IR tests don't exercise
+ * that path but the linker still needs the symbol (--gc-sections keeps it
+ * reachable from the pass entry point). Same little-endian semantics as the
+ * real tcctools.c definition. */
+uint32_t read32le(unsigned char *p)
+{
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* ir/codegen.c's tcc_ir_codegen_test_gen() calls gv(RC_INT) on the
+ * VT_BITFIELD-typed-vtop path (extracting a bit-field before testing it for
+ * zero). That branch is unreachable for every test in this harness --
+ * svalue_init() zero-inits SValue.type.t and no test constructs a
+ * VT_BITFIELD-typed vtop entry -- but the call site is compiled
+ * unconditionally, so the linker still needs the symbol. Trap loudly (like
+ * _tcc_error above) rather than silently faking a register: if this is ever
+ * actually invoked it means a test exercises a path this stub layer doesn't
+ * support, and a silent wrong-value return would be worse than a crash. */
+int gv(int rc)
+{
+  (void)rc;
+  fprintf(stderr, "[test stub] gv: unexpectedly called (VT_BITFIELD test-gen "
+                   "path is not supported by this harness)\n");
+  abort();
 }

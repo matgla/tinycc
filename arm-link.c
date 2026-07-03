@@ -496,10 +496,13 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     imm12 = val & 0xfff;
     imm4 = (val >> 12) & 0xf;
     x = (imm4 << 16) | imm12;
-    if (type == R_ARM_THM_MOVT_ABS)
-      write32le(ptr, read32le(ptr) | x);
-    else
-      add32le(ptr, x);
+    /* The Thumb variants are handled by the separate R_ARM_THM_MOVT_ABS /
+       R_ARM_THM_MOVW_ABS_NC case below, so `type` here is always one of the
+       two ARM (A32) relocations -- never R_ARM_THM_MOVT_ABS.  A stray
+       `if (type == R_ARM_THM_MOVT_ABS)` check used to guard this add and was
+       therefore dead code (see docs/bugs.md #10).  add32le matches upstream
+       tinycc's handling of these relocations. */
+    add32le(ptr, x);
   }
     return;
   case R_ARM_MOVT_PREL:

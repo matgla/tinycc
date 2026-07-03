@@ -165,6 +165,87 @@ UT_TEST(test_constvarprop_addrtaken_var_not_propagated)
   return 0;
 }
 
+/* POSITIVE (stale address-taken): if the only LEA of V0 writes to a dead TMP,
+ * refresh_stale_var_addrtaken() clears interval->addrtaken and lets the
+ * constant propagate in the same pass.
+ *
+ *   V0 <- #5
+ *   T9 = &V0          [dead address value]
+ *   T0 = V0 ADD #1    -> src1 rewritten to #5 */
+UT_TEST(test_constvarprop_dead_lea_clears_addrtaken)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 4);
+  ir->variables_live_intervals[0].addrtaken = 1;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(5, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(9, I32), utb_var(0, I32), UTB_NONE);
+  int iuse = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(1, I32));
+
+  int changes = tcc_ir_opt_const_var_prop(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(ir->variables_live_intervals[0].addrtaken, 0);
+  IROperand s1 = utb_src1(ir, iuse);
+  UT_ASSERT_EQ(irop_is_immediate(s1), 1);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, s1), 5);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: if a LEA writes &V0 into V1 and V1's own address is taken, &V0 has
+ * escaped through an address-taken destination even when V1 is not value-read.
+ * V0 must keep addrtaken and remain unpropagated. */
+UT_TEST(test_constvarprop_lea_dest_addrtaken_keeps_source_addrtaken)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 4);
+  ir->variables_live_intervals[0].addrtaken = 1;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(5, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_var(1, I32), utb_var(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(9, I32), utb_var(1, I32), UTB_NONE);
+  int iuse = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(9, I32));
+
+  int changes = tcc_ir_opt_const_var_prop(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(ir->variables_live_intervals[0].addrtaken, 1);
+  IROperand s1 = utb_src1(ir, iuse);
+  UT_ASSERT_EQ(irop_is_immediate(s1), 0);
+  UT_ASSERT_EQ(utb_vreg(s1), VR_VAR(0));
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: STORE through an lval TMP destination reads the pointer value.  A LEA
+ * feeding that TMP is therefore live, so V0 remains address-taken and is not
+ * propagated. */
+UT_TEST(test_constvarprop_store_lval_dest_keeps_lea_live)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 4);
+  ir->variables_live_intervals[0].addrtaken = 1;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(5, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), utb_var(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(1, I32)), utb_imm(99, I32), UTB_NONE);
+  int iuse = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(9, I32));
+
+  int changes = tcc_ir_opt_const_var_prop(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(ir->variables_live_intervals[0].addrtaken, 1);
+  IROperand s1 = utb_src1(ir, iuse);
+  UT_ASSERT_EQ(irop_is_immediate(s1), 0);
+  UT_ASSERT_EQ(utb_vreg(s1), VR_VAR(0));
+
+  utb_free(ir);
+  return 0;
+}
+
 /* NEGATIVE (multiply defined): a VAR assigned an immediate twice is not a single
  * constant (def_count > 1 -> is_constant cleared), so it is not propagated.
  *   V0 <- #5
@@ -944,6 +1025,120 @@ UT_TEST(test_constprop_cmp_setif_fold_gt)
   return 0;
 }
 
+/* POSITIVE: CMP #imm, Vreg is rewritten to CMP Vreg, #imm and the consuming
+ * condition is swapped so the backend can use its register-immediate compare
+ * encodings without changing semantics. */
+UT_TEST(test_constprop_cmp_imm_left_swaps_condition)
+{
+  TCCIRState *ir = utb_new();
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_imm(3, I32), utb_temp(0, I32));
+  int iset = utb_emit(ir, TCCIR_OP_SETIF, utb_temp(1, I32), utb_imm(TOK_LT, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_prop(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, icmp)), VR_TMP(0));
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src2(ir, icmp)), 3);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iset)), TOK_GT);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: signed-looking comparison tokens are evaluated as unsigned when
+ * either integer operand is marked unsigned.  Without the unsigned conversion,
+ * (-1 < 1) would fold true; with uint32 semantics it folds false. */
+UT_TEST(test_constprop_unsigned_operand_cmp_uses_unsigned_order)
+{
+  TCCIRState *ir = utb_new();
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_unsigned(utb_imm(-1, I32)), utb_imm(1, I32));
+  int iset = utb_emit(ir, TCCIR_OP_SETIF, utb_temp(0, I32), utb_imm(TOK_LT, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_prop(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, iset), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iset)), 0);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: CMP of the same vreg followed by JUMPIF EQ is always taken. */
+UT_TEST(test_constprop_cmp_same_vreg_jumpif_always_taken)
+{
+  TCCIRState *ir = utb_new();
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_temp(0, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(2, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_const_prop(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_dest(ir, ijmp)), 2);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: CMP of the same vreg followed by JUMPIF NE is never taken. */
+UT_TEST(test_constprop_cmp_same_vreg_jumpif_never_taken)
+{
+  TCCIRState *ir = utb_new();
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_temp(0, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(2, I32), utb_imm(TOK_NE, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_const_prop(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: same vreg with mismatched lval-ness is not value-identical. */
+UT_TEST(test_constprop_cmp_same_vreg_lval_mismatch_not_identity)
+{
+  TCCIRState *ir = utb_new();
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_lval(utb_temp(0, I32)), utb_temp(0, I32));
+  int iset = utb_emit(ir, TCCIR_OP_SETIF, utb_temp(1, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_prop(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, iset), TCCIR_OP_SETIF);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: a single-def TMP assigned from an unmodified PARAM is value-identical
+ * to that PARAM, so CMP copy,param folds. */
+UT_TEST(test_constprop_cmp_copy_of_param_setif_folds)
+{
+  TCCIRState *ir = utb_new();
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_param(0, I32), UTB_NONE);
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_param(0, I32));
+  int iset = utb_emit(ir, TCCIR_OP_SETIF, utb_temp(1, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_prop(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, iset), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iset)), 1);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
+  utb_free(ir);
+  return 0;
+}
+
 /* GUARD: a 64-bit immediate assigned into a 32-bit temp must be tracked as the
  * truncated 32-bit value.  This mirrors `(int)(long long)(V2SI){2,2}` after
  * known_bits folds the 64-bit stack load to `0x0000000200000002`: the following
@@ -970,6 +1165,89 @@ UT_TEST(test_constproptmp_i64_to_i32_assign_truncates_fact)
   return 0;
 }
 
+/* GUARD: TMP constants are not propagated into IJUMP.  The target address must
+ * remain a register operand for the backend. */
+UT_TEST(test_constproptmp_ijump_keeps_register_operand)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(123, I32), UTB_NONE);
+  int ijump = utb_emit(ir, TCCIR_OP_IJUMP, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_prop_tmp(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, ijump)), VR_TMP(1));
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: SWITCH_TABLE with a known TMP index becomes a direct JUMP to the
+ * selected case target. */
+UT_TEST(test_constproptmp_switch_table_const_index_to_case_jump)
+{
+  TCCIRState *ir = utb_new();
+  TCCIRSwitchTable *tables = tcc_mallocz(sizeof(*tables));
+  int *targets = tcc_mallocz(sizeof(int) * 3);
+  targets[0] = 10;
+  targets[1] = 20;
+  targets[2] = 30;
+  tables[0].default_target = 99;
+  tables[0].targets = targets;
+  tables[0].num_entries = 3;
+  ir->switch_tables = tables;
+  ir->num_switch_tables = 1;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(2, I32), UTB_NONE);
+  int isw = utb_emit(ir, TCCIR_OP_SWITCH_TABLE, UTB_NONE, utb_temp(1, I32), utb_imm(0, I32));
+
+  int changes = tcc_ir_opt_const_prop_tmp(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, isw), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_dest(ir, isw)), 30);
+
+  tcc_free(targets);
+  tcc_free(tables);
+  ir->switch_tables = NULL;
+  ir->num_switch_tables = 0;
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: out-of-range constant SWITCH_TABLE indices jump to the default
+ * target rather than indexing the case array. */
+UT_TEST(test_constproptmp_switch_table_const_index_to_default_jump)
+{
+  TCCIRState *ir = utb_new();
+  TCCIRSwitchTable *tables = tcc_mallocz(sizeof(*tables));
+  int *targets = tcc_mallocz(sizeof(int) * 2);
+  targets[0] = 10;
+  targets[1] = 20;
+  tables[0].default_target = 77;
+  tables[0].targets = targets;
+  tables[0].num_entries = 2;
+  ir->switch_tables = tables;
+  ir->num_switch_tables = 1;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(5, I32), UTB_NONE);
+  int isw = utb_emit(ir, TCCIR_OP_SWITCH_TABLE, UTB_NONE, utb_temp(1, I32), utb_imm(0, I32));
+
+  int changes = tcc_ir_opt_const_prop_tmp(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, isw), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_dest(ir, isw)), 77);
+
+  tcc_free(targets);
+  tcc_free(tables);
+  ir->switch_tables = NULL;
+  ir->num_switch_tables = 0;
+  utb_free(ir);
+  return 0;
+}
+
 /* GUARD: BOOL_OR with only one constant operand is left untouched because the
  * backend cannot materialise mixed const/reg boolean ops. */
 UT_TEST(test_constprop_bool_or_one_const_no_fold)
@@ -981,6 +1259,27 @@ UT_TEST(test_constprop_bool_or_one_const_no_fold)
   int changes = tcc_ir_opt_const_prop(ir);
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, ior), TCCIR_OP_BOOL_OR);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: BOOL_OR is folded when both operands are known constants, so the
+ * mixed const/register backend restriction does not apply. */
+UT_TEST(test_constprop_bool_or_two_const_vars_folds)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(42, I32), UTB_NONE);
+  int ior = utb_emit(ir, TCCIR_OP_BOOL_OR, utb_temp(0, I32), utb_var(0, I32), utb_var(1, I32));
+
+  int changes = tcc_ir_opt_const_prop(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, ior), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, ior)), 1);
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
   utb_free(ir);
   return 0;
@@ -1868,6 +2167,9 @@ UT_SUITE(opt_constprop)
   UT_RUN(test_constvarprop_imm_var_folds_into_use);
   UT_RUN(test_constvarprop_load_of_const_var_becomes_assign);
   UT_RUN(test_constvarprop_addrtaken_var_not_propagated);
+  UT_RUN(test_constvarprop_dead_lea_clears_addrtaken);
+  UT_RUN(test_constvarprop_lea_dest_addrtaken_keeps_source_addrtaken);
+  UT_RUN(test_constvarprop_store_lval_dest_keeps_lea_live);
   UT_RUN(test_constvarprop_multiply_defined_not_propagated);
   UT_RUN(test_constvarprop_nonconst_source_not_propagated);
   UT_RUN(test_constvarprop_idempotent);
@@ -1916,8 +2218,18 @@ UT_SUITE(opt_constprop)
   UT_RUN(test_constprop_shr_and_to_ubfx);
   UT_RUN(test_constprop_xor_cancellation);
   UT_RUN(test_constprop_cmp_setif_fold_gt);
+  UT_RUN(test_constprop_cmp_imm_left_swaps_condition);
+  UT_RUN(test_constprop_unsigned_operand_cmp_uses_unsigned_order);
+  UT_RUN(test_constprop_cmp_same_vreg_jumpif_always_taken);
+  UT_RUN(test_constprop_cmp_same_vreg_jumpif_never_taken);
+  UT_RUN(test_constprop_cmp_same_vreg_lval_mismatch_not_identity);
+  UT_RUN(test_constprop_cmp_copy_of_param_setif_folds);
   UT_RUN(test_constproptmp_i64_to_i32_assign_truncates_fact);
+  UT_RUN(test_constproptmp_ijump_keeps_register_operand);
+  UT_RUN(test_constproptmp_switch_table_const_index_to_case_jump);
+  UT_RUN(test_constproptmp_switch_table_const_index_to_default_jump);
   UT_RUN(test_constprop_bool_or_one_const_no_fold);
+  UT_RUN(test_constprop_bool_or_two_const_vars_folds);
 
   /* global_init_prop */
   UT_RUN(test_globalinitprop_null_ir);

@@ -34,6 +34,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "linker: linker coverage test")
     config.addinivalue_line("markers", "linker_reloc: relocation test")
     config.addinivalue_line("markers", "linker_section: section layout test")
+    config.addinivalue_line("markers", "linker_symbol: symbol table test")
     config.addinivalue_line("markers", "linker_yaff: YAFF output test")
 
 

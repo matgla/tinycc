@@ -33,7 +33,7 @@ jobs:
         run: python3 tests/unit/gen_source_coverage.py --check
 
       - name: Pass coverage ledger reports no unexpected regressions
-        run: python3 tests/unit/check_pass_coverage.py
+        run: python3 tests/unit/check_pass_coverage.py --strict
 
       - name: Build and test
         shell: bash

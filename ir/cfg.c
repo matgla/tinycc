@@ -57,6 +57,26 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
         is_leader[target] = 1;
       }
     }
+    /* SWITCH_TABLE case/default targets are jump targets too.  A case body
+     * reached by fall-through from the previous case is NOT otherwise a
+     * leader; without splitting there, instr_to_block[] maps the case entry
+     * to the middle of the merged block and every switch edge lands at that
+     * block's START — SCCP then const-folds values along the wrong case
+     * chain (switch fuzz seed 18613: selector 6 folded via case 3's body). */
+    if (q->op == TCCIR_OP_SWITCH_TABLE) {
+      IROperand src2 = tcc_ir_op_get_src2(ir, q);
+      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      if (table_id >= 0 && table_id < ir->num_switch_tables) {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int ti = 0; ti < table->num_entries; ti++) {
+          int target = table->targets[ti];
+          if (target >= 0 && target < n)
+            is_leader[target] = 1;
+        }
+        if (table->default_target >= 0 && table->default_target < n)
+          is_leader[table->default_target] = 1;
+      }
+    }
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF ||
         q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
         q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE) {

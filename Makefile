@@ -46,9 +46,15 @@ CFLAGS += $(CPPFLAGS) -std=c11 -Wunused-function -Wno-declaration-after-statemen
 VPATH = $(TOPSRC) $(TOPSRC)/arch
 -LTCC = $(TOP)/$(LIBTCC)
 
-# Enable extra runtime-debug features (not for release builds).
-# This is intentionally controlled by configure's --debug (CONFIG_debug=yes).
-ifeq ($(CONFIG_debug),yes)
+# Dump-IR support: the -dump-ir / -dump-ir-passes options and the per-pass IR
+# dumps they drive (all guarded by CONFIG_TCC_DEBUG, which in this fork gates
+# nothing but the IR-dump feature).  Enabled by default so IR tooling and the
+# frontend golden-IR tests work with a plain `make cross`.  The dump calls are
+# no-ops unless -dump-ir is passed, so this has no effect on generated code.
+#
+# For a smaller "minimal" release binary without the dump-IR machinery, build
+# with CONFIG_minimal=yes (e.g. `make cross CONFIG_minimal=yes`).
+ifneq ($(CONFIG_minimal),yes)
  CFLAGS += -DCONFIG_TCC_DEBUG
 endif
 
@@ -725,14 +731,19 @@ test-selfhost: cross
 	fi
 
 # run IR tests via pytest (preferred)
-.NOTPARALLEL: test test-full test-all
-test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut test-frontend test-linker test-debug test-runtime test-selfhost
+.PHONY: test-ir
+test-ir: cross test-venv test-prepare download-gcc-tests
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
 		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
 	else \
 		cd $(IRTESTS_DIR) && $(PYTEST) -s $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
 	fi
+
+# container target: runs the full test suite (all test-* targets below)
+.NOTPARALLEL: test test-full test-all
+test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut test-frontend test-linker test-debug test-runtime test-selfhost test-ir
+	@echo "------------ test suite complete ------------"
 
 # Fully sequential test run: disables pytest-xdist too, for the cleanest logs.
 .PHONY: test-sequential
@@ -861,10 +872,10 @@ ut:
 
 # pipeline pass coverage ledger: compares PASS/PASS_GATED names in
 # ir/opt_pipeline.c + SSA_RUN names against UT_COVERS markers and golden-IR
-# directories.  Reports gaps but exits 0 so the CI gate stays soft while
-# coverage is still being fanned out.
+# directories.  89/89 (100%) reached 2026-07-01 (see docs/plan_ut_next_steps.md);
+# --strict now hard-fails on any regression.
 check-pass-coverage:
-	@python3 tests/unit/check_pass_coverage.py
+	@python3 tests/unit/check_pass_coverage.py --strict
 
 # gcov line/branch coverage report for the unit tests (requires gcovr).
 # Renders HTML + text under tests/unit/<target>/build/coverage/.
@@ -874,7 +885,7 @@ ut-coverage:
 ut-clean:
 	$(MAKE) -C tests/unit clean
 
-.PHONY: all cross fp-libs clean test test-sequential test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all test-frontend test-linker test-debug test-runtime test-selfhost test-golden-ir rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-coverage ut-clean check-pass-coverage FORCE
+.PHONY: all cross fp-libs clean test test-ir test-sequential test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all test-frontend test-linker test-debug test-runtime test-selfhost test-golden-ir rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-coverage ut-clean check-pass-coverage FORCE
 
 # Container image settings (auto-detect docker or podman)
 DOCKER_REGISTRY ?= ghcr.io
@@ -935,6 +946,8 @@ help:
 	@echo "   $(wordlist 1,8,$(TCC_X))"
 	@echo "   $(wordlist 9,99,$(TCC_X))"
 	@echo "make test"
+	@echo "   run the full test suite (test-ir + test-asm + warn-check + ut + ...)"
+	@echo "make test-ir"
 	@echo "   rebuild + initialize GCC testsuite + run pytest in tests/ir_tests"
 	@echo "make test-sequential"
 	@echo "   same as make test, but runs pytest sequentially for clean logs"

@@ -20,8 +20,14 @@ int tcc_ir_pool_add(TCCIRState *ir, IROperand irop)
 {
   if (ir->iroperand_pool_count >= ir->iroperand_pool_capacity)
   {
-    ir->iroperand_pool_capacity *= 2;
-    ir->iroperand_pool = (IROperand *)tcc_realloc(ir->iroperand_pool, 
+    /* Guard against a zero (or negative) capacity: `0 * 2 == 0` would never
+       grow the pool, and the subsequent write would overflow a zero-size
+       buffer. Seed to 1 so the doubling below makes progress. */
+    if (ir->iroperand_pool_capacity <= 0)
+      ir->iroperand_pool_capacity = 1;
+    else
+      ir->iroperand_pool_capacity *= 2;
+    ir->iroperand_pool = (IROperand *)tcc_realloc(ir->iroperand_pool,
                                                     sizeof(IROperand) * ir->iroperand_pool_capacity);
     if (!ir->iroperand_pool)
     {
@@ -58,6 +64,10 @@ void tcc_ir_pool_ensure(TCCIRState *ir, int n)
   int needed = ir->iroperand_pool_count + n;
   if (needed > ir->iroperand_pool_capacity)
   {
+    /* Guard against a zero (or negative) capacity: `0 * 2 == 0` forever, so
+       the doubling loop below would never terminate. Seed to 1 first. */
+    if (ir->iroperand_pool_capacity <= 0)
+      ir->iroperand_pool_capacity = 1;
     while (ir->iroperand_pool_capacity < needed)
       ir->iroperand_pool_capacity *= 2;
     ir->iroperand_pool = (IROperand *)tcc_realloc(ir->iroperand_pool,

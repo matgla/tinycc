@@ -383,7 +383,13 @@ static int kb_operand_const_u64(const TCCIRState *ir, const IROperand *op,
     if (btype == IROP_BTYPE_FLOAT32 || btype == IROP_BTYPE_FLOAT64 ||
         btype == IROP_BTYPE_STRUCT)
       return 0;
-    *out = kb_apply_const_width((uint64_t)irop_get_imm64_ex(ir, *op), btype, op->is_unsigned);
+    /* An immediate already stores its actual signed/unsigned VALUE in u.imm32
+     * (a signed char -56 holds -56; an unsigned char 208 holds 208).  Applying
+     * sub-word width extension would re-interpret the low byte as a bit pattern
+     * and sign-extend it — corrupting an `unsigned char` 208 (0xd0) to -48 when
+     * the immediate's is_unsigned flag was dropped upstream (combo seed 1053).
+     * Read immediates raw; only memory loads model sub-word extension. */
+    *out = (uint64_t)irop_get_imm64_ex(ir, *op);
     return 1;
   }
 

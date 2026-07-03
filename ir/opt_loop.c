@@ -937,6 +937,17 @@ int tcc_ir_opt_decrement_to_zero(TCCIRState *ir)
         IRQuadCompact *q = &ir->compact_instructions[i];
         if (q->op != TCCIR_OP_CMP)
           continue;
+        /* A bottom-tested / rotated loop with no pre-test guard distinct from
+         * its own back-edge CMP/JUMPIF exposes the back-edge test itself inside
+         * this header-window scan.  Never accept it as the "pre-test guard":
+         * the apply step below rewrites be_cmp_idx/be_jmpif_idx (CMP #0, != 0)
+         * and then unconditionally NOPs hdr_cmp_idx/hdr_jmpif_idx.  If those
+         * coincide, step 5 would delete the loop's only remaining back-edge
+         * test, degenerating the loop to a single iteration.  Skipping it here
+         * leaves hdr_cmp_idx == -1, so the transform bails at the guard below.
+         * See docs/bugs.md #12. */
+        if (i == be_cmp_idx)
+          continue;
         IROperand s1 = tcc_ir_op_get_src1(ir, q);
         if (irop_get_vreg(s1) != iv_vr)
           continue;
@@ -947,6 +958,8 @@ int tcc_ir_opt_decrement_to_zero(TCCIRState *ir)
           jq_idx++;
         if (jq_idx < n && ir->compact_instructions[jq_idx].op == TCCIR_OP_JUMPIF)
         {
+          if (jq_idx == be_jmpif_idx)
+            continue; /* same guard-coincidence hazard as above */
           hdr_cmp_idx = i;
           hdr_jmpif_idx = jq_idx;
           break;

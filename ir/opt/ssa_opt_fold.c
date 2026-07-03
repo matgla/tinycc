@@ -120,7 +120,75 @@ static int fold_binary(IRSSAOptCtx *ctx, int idx)
 
   /* Both operands immediate: full constant fold */
   if (src1_is_imm && src2_is_imm) {
+    /* An IMM32 operand of a 64-bit op is a sign-extended 64-bit constant
+     * (irop_get_int64 semantics); evaluating it with 32-bit arithmetic
+     * loses the high word (fuzz longlong seed 3161: `#imm SHR #32` folded
+     * to 0 instead of the sign-bits 0xFFFFFFFF). */
+    int is_64 = irop_is_64bit(dest);
+    if (!is_64 && (irop_is_64bit(src1) || irop_is_64bit(src2)))
+      return 0;
     int64_t result;
+    if (is_64) {
+      int64_t v1 = (int64_t)val1;
+      int64_t v2 = (int64_t)val2;
+      switch (q->op) {
+      case TCCIR_OP_ADD: result = (int64_t)((uint64_t)v1 + (uint64_t)v2); break;
+      case TCCIR_OP_SUB: result = (int64_t)((uint64_t)v1 - (uint64_t)v2); break;
+      case TCCIR_OP_MUL: result = (int64_t)((uint64_t)v1 * (uint64_t)v2); break;
+      case TCCIR_OP_AND: result = v1 & v2; break;
+      case TCCIR_OP_OR:  result = v1 | v2; break;
+      case TCCIR_OP_XOR: result = v1 ^ v2; break;
+      case TCCIR_OP_SHL:
+        if ((uint64_t)v2 >= 64) result = 0;
+        else result = (int64_t)((uint64_t)v1 << v2);
+        break;
+      case TCCIR_OP_SHR:
+        if ((uint64_t)v2 >= 64) result = 0;
+        else result = (int64_t)((uint64_t)v1 >> v2);
+        break;
+      case TCCIR_OP_SAR:
+        if ((uint64_t)v2 >= 64) result = v1 >> 63;
+        else result = v1 >> v2;
+        break;
+      case TCCIR_OP_DIV:
+        if (v2 == 0) return 0;
+        if (v2 == -1 && v1 == INT64_MIN) return 0;
+        result = v1 / v2;
+        break;
+      case TCCIR_OP_UDIV:
+        if (v2 == 0) return 0;
+        result = (int64_t)((uint64_t)v1 / (uint64_t)v2);
+        break;
+      case TCCIR_OP_IMOD:
+        if (v2 == 0) return 0;
+        if (v2 == -1 && v1 == INT64_MIN) return 0;
+        result = v1 % v2;
+        break;
+      case TCCIR_OP_UMOD:
+        if (v2 == 0) return 0;
+        result = (int64_t)((uint64_t)v1 % (uint64_t)v2);
+        break;
+      default:
+        /* ROR has no 64-bit form */
+        return 0;
+      }
+
+      IROperand imm;
+      if (result == (int64_t)(int32_t)result)
+        imm = irop_make_imm32(0, (int32_t)result, dest.btype);
+      else
+        imm = irop_make_i64(0, tcc_ir_pool_add_i64(ir, result), dest.btype);
+      q->op = TCCIR_OP_ASSIGN;
+      tcc_ir_op_set_src1(ir, q, imm);
+      tcc_ir_op_set_src2(ir, q, IROP_NONE);
+
+      IRSSAVregInfo *vi;
+      vi = ssa_opt_vinfo(ctx, irop_get_vreg(src1));
+      if (vi) ssa_opt_remove_use_instr(vi, idx);
+      vi = ssa_opt_vinfo(ctx, irop_get_vreg(src2));
+      if (vi) ssa_opt_remove_use_instr(vi, idx);
+      return 1;
+    }
     switch (q->op) {
     case TCCIR_OP_ADD: result = (int64_t)((uint64_t)(uint32_t)val1 + (uint64_t)(uint32_t)val2); break;
     case TCCIR_OP_SUB: result = (int64_t)((uint64_t)(uint32_t)val1 - (uint64_t)(uint32_t)val2); break;

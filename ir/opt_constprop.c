@@ -345,6 +345,18 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
   return cleared;
 }
 
+/* MLA carries a 4th (accumulator) operand at pool[operand_base+3] that is a
+ * real USE of its vreg but is invisible to the has_src1/has_src2 operand
+ * config.  Every use-scan that decides whether a def is dead must include
+ * it, or a value consumed only as an MLA accumulator is treated as unread
+ * and its def deleted (ptr seed 6869).  Returns -1 when there is none. */
+static int32_t ir_opt_mla_accum_vreg(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (q->op != TCCIR_OP_MLA)
+    return -1;
+  return irop_get_vreg(tcc_ir_op_get_accum(ir, q));
+}
+
 static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir);
 int tcc_ir_opt_const_var_prop(TCCIRState *ir)
 {
@@ -356,6 +368,28 @@ int tcc_ir_opt_const_var_prop(TCCIRState *ir)
   tcc_pass_timing_add("const_var_prop", tcc_pass_clk_us() - _t);
   return _r;
 }
+
+static int ir_has_variadic_stack_arg_call(TCCIRState *ir)
+{
+  int n = ir ? ir->next_instruction_index : 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+      continue;
+
+    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    if (!callee || !callee->type.ref || callee->type.ref->f.func_type != FUNC_ELLIPSIS)
+      continue;
+
+    IROperand meta = tcc_ir_op_get_src2(ir, q);
+    int argc = TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, meta));
+    if (argc > 4)
+      return 1;
+  }
+  return 0;
+}
+
 static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -371,6 +405,14 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
    *   int *p = &g; int **dead = &p; ... use p ...
    * where `dead` got eliminated as unread. */
   refresh_stale_var_addrtaken(ir);
+
+  /* ARM variadic calls with anonymous arguments beyond r0-r3 use the caller's
+   * outgoing stack area.  varargs seed 31282 exposed a backend/register-
+   * allocation miscompile only after this whole-function constant propagator
+   * aggressively simplified such call regions; keep the IR shape conservative
+   * until that lower-level ABI bug is fixed directly. */
+  if (ir_has_variadic_stack_arg_call(ir))
+    return 0;
 
   /* Phase 1: Find constant VAR vregs (assigned exactly once with immediate
    * or symref).  For symrefs we also remember is_lval/is_local/is_const so
@@ -501,6 +543,13 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
       if (pos > max_var_pos)
         continue;
       if (var_info[pos].use_count < 255)
+        var_info[pos].use_count++;
+    }
+    int32_t acc_vr = ir_opt_mla_accum_vreg(ir, q);
+    if (acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(acc_vr) == TCCIR_VREG_TYPE_VAR)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(acc_vr);
+      if (pos <= max_var_pos && var_info[pos].use_count < 255)
         var_info[pos].use_count++;
     }
   }
@@ -643,6 +692,13 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
           if (pos <= max_var_pos)
             has_use[pos / 8] |= (1 << (pos % 8));
         }
+      }
+      int32_t acc_vr = ir_opt_mla_accum_vreg(ir, q);
+      if (acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(acc_vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(acc_vr);
+        if (pos <= max_var_pos)
+          has_use[pos / 8] |= (1 << (pos % 8));
       }
     }
 
@@ -1451,7 +1507,8 @@ static int ir_opt_vreg_use_count(TCCIRState *ir, int32_t vreg)
     if (q->op == TCCIR_OP_NOP)
       continue;
     if (irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg ||
-        irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vreg)
+        irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vreg ||
+        ir_opt_mla_accum_vreg(ir, q) == vreg)
       count++;
   }
   return count;
@@ -2020,6 +2077,13 @@ static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
         if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR) continue;
         if (op.is_local && !op.is_lval) continue; /* address-of, not value */
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos <= max_var_pos && var_info[pos].use_count < 255)
+          var_info[pos].use_count++;
+      }
+      int32_t acc_vr = ir_opt_mla_accum_vreg(ir, uq);
+      if (acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(acc_vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(acc_vr);
         if (pos <= max_var_pos && var_info[pos].use_count < 255)
           var_info[pos].use_count++;
       }
@@ -3168,6 +3232,11 @@ static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
             break;
           }
         }
+        if (ir_opt_mla_accum_vreg(ir, jq) == vr)
+        {
+          still_used = 1;
+          break;
+        }
       }
 
       if (!still_used)
@@ -3851,6 +3920,15 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
         {
           if (src1_pos >= 0 && src1_pos <= max_vreg)
             VT_CLEAR_DEF(state, src1_pos);
+          /* The surviving MLA still reads its accumulator — mark that def
+           * live too, or a later redef of the same VAR would NOP it. */
+          int32_t live_acc_vr = irop_get_vreg(accum);
+          if (live_acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(live_acc_vr) == TCCIR_VREG_TYPE_VAR)
+          {
+            int live_acc_pos = TCCIR_DECODE_VREG_POSITION(live_acc_vr);
+            if (live_acc_pos <= max_vreg)
+              VT_CLEAR_DEF(state, live_acc_pos);
+          }
           if (dest_pos >= 0 && dest_pos <= max_vreg)
             VT_INVALIDATE(state, dest_pos);
           continue;
@@ -3897,6 +3975,14 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
         /* src1 is read but not folded — mark its def as live */
         if (src1_pos >= 0 && src1_pos <= max_vreg)
           VT_CLEAR_DEF(state, src1_pos);
+        /* Same for the accumulator read of a surviving MLA. */
+        int32_t live_acc_vr = irop_get_vreg(accum);
+        if (live_acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(live_acc_vr) == TCCIR_VREG_TYPE_VAR)
+        {
+          int live_acc_pos = TCCIR_DECODE_VREG_POSITION(live_acc_vr);
+          if (live_acc_pos <= max_vreg)
+            VT_CLEAR_DEF(state, live_acc_pos);
+        }
         /* Destination no longer has known constant value */
         if (dest_pos >= 0 && dest_pos <= max_vreg)
           VT_INVALIDATE(state, dest_pos);
@@ -4250,6 +4336,16 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
         if (s2_pos >= 0 && s2_pos <= max_vreg)
           VT_CLEAR_DEF(state, s2_pos);
       }
+      /* An MLA that reaches here (src2 not immediate, so Pattern 2 didn't
+       * consume it) still reads its accumulator; without this a later redef
+       * of the same VAR NOPs the def it reads (struct_byval seed 9494). */
+      int32_t acc_vr = ir_opt_mla_accum_vreg(ir, q);
+      if (acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(acc_vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int acc_pos = TCCIR_DECODE_VREG_POSITION(acc_vr);
+        if (acc_pos >= 0 && acc_pos <= max_vreg)
+          VT_CLEAR_DEF(state, acc_pos);
+      }
     }
 
     /* Constant-fold __aeabi_lcmp/__aeabi_ulcmp calls when both arguments are
@@ -4439,6 +4535,17 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
                 LOG_IR_GEN("VALUE_TRACK: %s(%lld, %lld) = %lld at i=%d -> folded", fname, (long long)val0,
                            (long long)val1, (long long)result, i);
                 changes++;
+                /* This CALL now defines the dest VAR with the folded quotient.
+                 * The `continue` skips the general VAR-def state-invalidation at
+                 * the loop tail, so the value-tracking map would still hold the
+                 * VAR's STALE pre-call constant and forward it to a later use
+                 * (combo_num seed 58: after loop-unroll collapses the prefix to a
+                 * single block, q10's pre-division init `(u5<<32)|u6` leaked past
+                 * this folded __aeabi_uldivmod into `q10 ^ q10>>32`).  Invalidate
+                 * the dest here so it is not forwarded; the rewritten `V <- #q`
+                 * assignment still carries the correct value for later passes. */
+                if (dest_pos >= 0 && dest_pos <= max_vreg)
+                  VT_INVALIDATE(state, dest_pos);
                 continue;
               }
             }
@@ -4793,6 +4900,14 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
                 tcc_ir_set_src2(ir, i, irop_make_imm32(-1, (int32_t)(val1 & 63), IROP_BTYPE_INT32));
                 LOG_IR_GEN("VALUE_TRACK: %s(vreg, %lld) at i=%d -> lowered to IR shift", fname, (long long)val1, i);
                 changes++;
+                /* This CALL now redefines the dest VAR with a runtime (non-constant)
+                 * shift result.  Without invalidating here, `state` would still hold
+                 * the VAR's STALE pre-call constant and forward it to a later read
+                 * in this same forward scan (longlong seed 2057: q13's pre-shift init
+                 * `(u10<<32)|u11` leaked past this lowered __aeabi_llsl into
+                 * `q13 ^ q13>>32`).  Mirrors the uldivmod fix above. */
+                if (dest_pos >= 0 && dest_pos <= max_vreg)
+                  VT_INVALIDATE(state, dest_pos);
                 continue;
               }
             }
@@ -6070,18 +6185,34 @@ static int tcc_ir_opt_const_prop_tmp__timed(TCCIRState *ir)
       continue;
     }
 
-    /* Track TMP <- constant assignments (re-fetch src1 since fold may have changed it) */
+    /* Track TMP <- constant assignments (re-fetch src1 since fold may have
+     * changed it).  A TEMP redefined with a non-constant value must drop its
+     * entry: TEMPs are single-def by construction, but loop unrolling renames
+     * at most UNROLL_MAX_RENAME body-local temps per copy, so leftover temps
+     * are multi-def straight-line code and a stale constant from one copy
+     * would leak into the next (volatile fuzz seed 8310).  STORE/STORE_INDEXED
+     * lvalue dests (deref addresses) and FUNCPARAM dests (the passed value)
+     * are uses, not defs, and leave the entry alone; STORE_POSTINC updates
+     * its address register, so it falls through to the invalidation. */
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     int32_t dest_vr = irop_get_vreg(dest);
     if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_TEMP &&
-        (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_CVT_FTOF))
+        q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID &&
+        !((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) && dest.is_lval))
     {
       const int pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
-      IROperand cur_src1 = tcc_ir_op_get_src1(ir, q);
-      if (pos <= max_tmp_pos && irop_is_immediate(cur_src1))
+      if (pos <= max_tmp_pos)
       {
-        tmp_info[pos].gen = current_gen;
-        tmp_info[pos].value = ir_opt_fit_const_to_operand(irop_get_imm64_ex(ir, cur_src1), dest);
+        IROperand cur_src1 = tcc_ir_op_get_src1(ir, q);
+        if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_CVT_FTOF) && irop_is_immediate(cur_src1))
+        {
+          tmp_info[pos].gen = current_gen;
+          tmp_info[pos].value = ir_opt_fit_const_to_operand(irop_get_imm64_ex(ir, cur_src1), dest);
+        }
+        else
+        {
+          tmp_info[pos].gen = 0;
+        }
       }
     }
 
@@ -6803,6 +6934,14 @@ int tcc_ir_opt_cmp_const_offset_fold(TCCIRState *ir)
       int def_a = tcc_ir_find_defining_instruction(ir, a, i);
       if (def_a < 0)
         continue;
+      /* `a = b +/- K` must hold at the CMP.  tcc_ir_find_defining_instruction
+       * is a linear backward scan blind to a back-edge redefinition of a
+       * multi-def vreg: a loop-carried `a` reset inside the loop reaches the
+       * CMP again with a different value, so the offset from the preceding def
+       * is invalid on the back-edge path.  Only trust it when `a` is single-def
+       * (mirrors the guard in ir_opt_eval_const_u64). */
+      if (!tcc_ir_vreg_has_single_def(ir, a))
+        continue;
       IRQuadCompact *dq = &ir->compact_instructions[def_a];
       if (dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_SUB)
         continue;
@@ -6835,7 +6974,16 @@ int tcc_ir_opt_cmp_const_offset_fold(TCCIRState *ir)
       if (k > (int64_t)INT32_MAX || k < (int64_t)INT32_MIN)
         continue;
 
-      /* B must hold the same value at the CMP as at def_a. */
+      /* B must hold the same value at the CMP as at def_a.  Reject multi-def
+       * for the same back-edge reason as `a`: the linear def lookups below
+       * cannot see a loop redefinition of a multi-def `b` reaching the CMP with
+       * a value different from the one at def_a, which would break the delta.
+       * Unlike `a` (guaranteed >=1 def since def_a was just found), `b` may
+       * legitimately have zero defs (e.g. an incoming parameter) — that is
+       * exactly as safe as single-def, so use the multi-def check, not
+       * single-def, to avoid rejecting the common zero-def case. */
+      if (tcc_ir_vreg_has_multi_def(ir, b))
+        continue;
       int b_def_at_use = tcc_ir_find_defining_instruction(ir, b, i);
       int b_def_at_def = tcc_ir_find_defining_instruction(ir, b, def_a);
       if (b_def_at_use != b_def_at_def)
@@ -7111,7 +7259,12 @@ static int ir_has_backward_control_flow(TCCIRState *ir)
  * Returns 1 and writes *out_off on success, 0 otherwise.
  *
  * Conservative: stops at any other def of V or at any jump_target between
- * the def and `at_idx` (don't cross BB boundaries / merge points). */
+ * the def and `at_idx` (don't cross BB boundaries / merge points).  A vreg
+ * operand read at an instruction that is ITSELF a jump target is never
+ * resolved: its value depends on which edge entered (docs/bugs.md #2 — a
+ * loop-exit `CMP ptr,end` at a back-edge target resolved ptr through the
+ * preheader init only, missing the in-loop `ptr += stride` redefinition,
+ * and the fold deleted the loop's only exit test). */
 static int ir_resolve_stack_addr_value(TCCIRState *ir, IROperand op, int at_idx, int *out_off)
 {
   StackAddrValue value;
@@ -7217,31 +7370,42 @@ static int ir_resolve_stack_addr_value_ex(TCCIRState *ir, IROperand op, int at_i
   if (sav_vreg_has_no_def(vr))
     return 0;
 
-  int saw_merge_at = at_idx;
+  /* A vreg read at a merge point (jump target) has an edge-dependent value:
+   * a def found by the linear backward walk holds only for the fall-through
+   * path, not for the jumped-in edge(s).  This check also covers recursive
+   * calls: resolving a def instruction's own operands uses at_idx = def_j,
+   * so a def sitting at a merge point refuses to resolve its inputs. */
+  if (at_idx >= 0 && at_idx < ir->next_instruction_index &&
+      ir->compact_instructions[at_idx].is_jump_target)
+    return 0;
+
   for (int j = at_idx - 1; j >= 0; j--)
   {
     IRQuadCompact *q = &ir->compact_instructions[j];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    /* Conservative: stop crossing merges (instruction with is_jump_target set).
-     * We allow the very first step (j == at_idx-1) to look back across our
-     * own CMP/BB head, but no further. */
-    if (q->is_jump_target && j != saw_merge_at - 1)
-      return 0;
-    saw_merge_at = j;
 
-    if (!irop_config[q->op].has_dest)
+    /* Determine whether this instruction is a real def of vr.  STORE-style
+     * ops carry an address-of-write in dest (a use, not a def); FUNCPARAMVAL
+     * dest carries the param value (also a use). */
+    int is_def_of_vr = 0;
+    if (q->op != TCCIR_OP_NOP && irop_config[q->op].has_dest && sav_is_def_op(q->op))
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      if (irop_get_vreg(dest) == vr)
+        is_def_of_vr = 1;
+    }
+
+    /* Never cross a merge point (instruction with is_jump_target set, NOPs
+     * included — a NOPed jump target still merges control flow): a value
+     * flowing in over the jumped-in edge may differ from the fall-through
+     * value.  The found def itself being a jump target is fine — its RESULT
+     * dominates the straight-line range down to at_idx (no entries between);
+     * its own operands are guarded by the at_idx check in the recursion. */
+    if (!is_def_of_vr)
+    {
+      if (q->is_jump_target)
+        return 0;
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(dest) != vr)
-      continue;
-    /* STORE-style ops carry an address-of-write in dest, not a def. */
-    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
-        q->op == TCCIR_OP_STORE_POSTINC)
-      continue;
-    /* FUNCPARAMVAL dest carries the param value (a use, not a def). */
-    if (q->op == TCCIR_OP_FUNCPARAMVAL)
-      continue;
+    }
 
     if (q->op == TCCIR_OP_ASSIGN)
     {

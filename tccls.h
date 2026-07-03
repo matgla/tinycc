@@ -87,6 +87,8 @@ void tcc_ls_reset_scratch_cache(LSLiveIntervalState *ls);
 
 uint32_t tcc_ls_compute_live_regs(LSLiveIntervalState *ls, int instruction_idx);
 
+int tcc_ls_reg_held_by_other(const LSLiveIntervalState *ls, int reg, int pos, const LSLiveInterval *skip);
+
 int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, uint32_t exclude_regs, int is_leaf);
 
 void tcc_ls_recompute_dirty_registers(LSLiveIntervalState *ls);
