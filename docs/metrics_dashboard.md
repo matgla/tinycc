@@ -15,6 +15,7 @@ metrics/
   gate.py                   -- compares a run against its parent; --strict to fail the build
   grafana/
     docker-compose.yml
+    tcc-metrics-grafana.service  -- systemd unit, wraps docker compose up/down
     provisioning/datasources/sqlite.yml
     provisioning/dashboards/dashboards.yml
     dashboards/optimizer_regressions.json
@@ -126,9 +127,30 @@ Once a `--strict` run comes back clean, flip the CI gate on by setting the
 
 ## Grafana
 
+Grafana runs as a systemd-managed `docker compose` stack, so it comes back on
+its own after a reboot or crash instead of needing someone to SSH in and
+re-run `docker compose up -d`.
+
+Grafana's compose file (`metrics/grafana/docker-compose.yml`) reads
+`/var/lib/tcc-metrics/metrics.db` and needs to live somewhere stable — clone
+the repo to a persistent path on the Pi (e.g. `/opt/tcc-metrics/tinycc`), not
+the ephemeral `actions/checkout` workspace the CI job uses.
+
 ```bash
-cd metrics/grafana
-docker compose up -d
+sudo git clone <this-repo-url> /opt/tcc-metrics/tinycc   # one-time, or pull to update
+sudo cp /opt/tcc-metrics/tinycc/metrics/grafana/tcc-metrics-grafana.service \
+    /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tcc-metrics-grafana.service
+```
+
+Edit the unit's `WorkingDirectory` first if the clone isn't at
+`/opt/tcc-metrics/tinycc`. Manage it like any other service:
+
+```bash
+systemctl status tcc-metrics-grafana   # is it up?
+journalctl -u tcc-metrics-grafana      # compose up/down output
+sudo systemctl restart tcc-metrics-grafana  # e.g. after editing docker-compose.yml
 ```
 
 Opens on `http://<pi>:3000`. The SQLite datasource and the
