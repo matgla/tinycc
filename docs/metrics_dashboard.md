@@ -15,7 +15,7 @@ metrics/
   gate.py                   -- compares a run against its parent; --strict to fail the build
   grafana/
     docker-compose.yml
-    tcc-metrics-grafana.service  -- systemd unit, wraps docker compose up/down
+    tcc-metrics-grafana.service  -- systemd unit, wraps podman-compose up/down
     provisioning/datasources/sqlite.yml
     provisioning/dashboards/dashboards.yml
     dashboards/optimizer_regressions.json
@@ -127,9 +127,11 @@ Once a `--strict` run comes back clean, flip the CI gate on by setting the
 
 ## Grafana
 
-Grafana runs as a systemd-managed `docker compose` stack, so it comes back on
+Grafana runs as a systemd-managed `podman-compose` stack, so it comes back on
 its own after a reboot or crash instead of needing someone to SSH in and
-re-run `docker compose up -d`.
+re-run `podman-compose up -d`. Rootless Podman has no persistent daemon
+equivalent to `dockerd` — `podman-compose` just shells out to `podman` — so
+the unit only waits on the network, not a container-runtime service.
 
 Grafana's compose file (`metrics/grafana/docker-compose.yml`) reads
 `/var/lib/tcc-metrics/metrics.db` and needs to live somewhere stable — clone
