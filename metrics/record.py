@@ -236,6 +236,43 @@ def record_compile_time(conn, run_id, corpus_secs, n_units) -> None:
         (run_id, "codesize_corpus_o2", corpus_secs, n_units))
 
 
+def import_codesize(conn, run_id, src_db_path, commit_sha) -> bool:
+    """Copy codesize_rollup/codesize_func/compile_time rows recorded for
+    `commit_sha` in another metrics db (e.g. a cloud-runner scratch db from a
+    faster build host) into `run_id`, instead of recomputing them locally."""
+    conn.execute("ATTACH DATABASE ? AS src", (src_db_path,))
+    try:
+        src_run = conn.execute(
+            "SELECT run_id FROM src.runs WHERE commit_sha=? ORDER BY run_ts DESC LIMIT 1",
+            (commit_sha,)).fetchone()
+        found = src_run is not None
+        if found:
+            src_run_id = src_run[0]
+            conn.execute(
+                """INSERT OR REPLACE INTO codesize_rollup
+                   SELECT ?, suite, func_count, tcc_o2, gcc_o2, ratio
+                   FROM src.codesize_rollup WHERE run_id=?""", (run_id, src_run_id))
+            conn.execute(
+                """INSERT OR REPLACE INTO codesize_func
+                   SELECT ?, suite, test, function, tcc_o2, gcc_o2, ratio
+                   FROM src.codesize_func WHERE run_id=?""", (run_id, src_run_id))
+            conn.execute(
+                """INSERT OR REPLACE INTO compile_time
+                   SELECT ?, scope, seconds, n_units
+                   FROM src.compile_time WHERE run_id=?""", (run_id, src_run_id))
+        else:
+            warn(f"no codesize data for {commit_sha[:12]} in {src_db_path} -- skipping import")
+        conn.commit()   # DETACH requires no pending transaction on `conn`, success or not
+        if not found:
+            return False
+        n = conn.execute(
+            "SELECT COUNT(*) FROM codesize_rollup WHERE run_id=?", (run_id,)).fetchone()[0]
+        info(f"imported codesize/compile_time from {src_db_path} ({n} codesize rows)")
+        return n > 0
+    finally:
+        conn.execute("DETACH DATABASE src")
+
+
 # ------------------------------------------------------------------------ perf
 
 def record_perf(conn, run_id, perf_host, perf_identity, scratch: Path) -> None:
@@ -278,11 +315,14 @@ def record_one(conn, meta, host, branch, trigger, args, tcc_override=None,
                         args.seed_lo, args.seed_hi, args.mode)
     if do_correctness:
         record_correctness(conn, run_id, args.seed_lo, args.seed_hi, args.mode, args.jobs)
-    corpus_secs = record_codesize(conn, run_id, args.jobs, args.codesize_detail, tcc_override)
-    n_units = conn.execute(
-        "SELECT func_count FROM codesize_rollup WHERE run_id=? AND suite='<total>'",
-        (run_id,)).fetchone()
-    record_compile_time(conn, run_id, corpus_secs, n_units[0] if n_units else None)
+    if args.import_codesize_from:
+        import_codesize(conn, run_id, args.import_codesize_from, meta["commit_sha"])
+    else:
+        corpus_secs = record_codesize(conn, run_id, args.jobs, args.codesize_detail, tcc_override)
+        n_units = conn.execute(
+            "SELECT func_count FROM codesize_rollup WHERE run_id=? AND suite='<total>'",
+            (run_id,)).fetchone()
+        record_compile_time(conn, run_id, corpus_secs, n_units[0] if n_units else None)
     if do_perf and args.perf_host:
         record_perf(conn, run_id, args.perf_host, args.perf_identity,
                     Path(args.scratch or "."))
@@ -343,6 +383,10 @@ def main(argv=None) -> int:
                    help="record codesize+compile-time for the last N first-parent commits")
     p.add_argument("--no-correctness", action="store_true",
                    help="skip the fuzz sweep (codesize/compile-time only)")
+    p.add_argument("--import-codesize-from", metavar="DB_PATH",
+                   help="skip local codesize/compile-time measurement; copy those rows "
+                        "from another metrics.db recorded for the same commit (e.g. a "
+                        "cloud-runner scratch db)")
     args = p.parse_args(argv)
 
     conn = connect(args.db)

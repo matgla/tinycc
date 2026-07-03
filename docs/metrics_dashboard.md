@@ -41,30 +41,47 @@ touches it.
 
 ### Runner
 
-This reuses the org-scoped self-hosted runner already registered for other
-projects — no new runner to register. Two things to check:
+Only the `rp2350-perf` job needs the Pi — it reuses the org-scoped
+self-hosted runner already registered for other projects, no new runner to
+register. Two things to check:
 
 1. The tinycc repo has access to that runner's runner group (org Settings ->
    Actions -> Runner groups).
-2. The runner carries the `armv8m-rpi5` label (`.github/workflows/metrics.yml`
-   targets `runs-on: [self-hosted, armv8m-rpi5]`). Add it by re-running the
-   runner's `config.sh --labels armv8m-rpi5` (or editing labels via the GitHub
-   UI) and restarting the runner service.
+2. The runner carries the `rpi5`/`pimoroni_pico_plus2` labels
+   (`.github/workflows/metrics.yml`'s `rp2350-perf` job targets
+   `runs-on: [self-hosted, rpi5, pimoroni_pico_plus2]`). Add them via the
+   runner's `config.sh --labels rpi5,pimoroni_pico_plus2` (or editing labels
+   via the GitHub UI) and restarting the runner service.
 
-A self-hosted runner executes one job at a time, so this workflow queues
-behind (or blocks) other repos' jobs on the same box while it runs, and vice
-versa. That's accepted here since the job is bounded (codesize + compile-time
-+ perf, no fuzz sweep) — see "What CI does" below.
+Building the cross compiler and measuring code size/compile time happens
+first, in a separate `build-and-measure` job on a regular GitHub-hosted
+runner (`runs-on: ubuntu-latest`, same container image `ci.yml` builds
+with) — compiling on the Pi is much slower than a cloud runner, and neither
+step touches the board. `build-and-measure` uploads the built
+`armv8m-tcc`/`armv8m-libtcc1.a` and a scratch metrics db (codesize +
+compile-time rows only, for the commit being built) as GitHub Actions
+artifacts. `rp2350-perf` (`needs: build-and-measure`) downloads both, so it
+never rebuilds tcc and never re-measures code size — it only does what
+actually needs the board (running benchmarks over SSH), then imports the
+cloud job's numbers into the persistent db via
+`record.py --import-codesize-from` (see "What CI does" below).
+
+A self-hosted runner executes one job at a time, so `rp2350-perf` still
+queues behind (or blocks) other repos' jobs on the same box while it runs,
+and vice versa — that's why its `concurrency: group: metrics-rpi5` is scoped
+to just that job; the cloud `build-and-measure` job doesn't need to queue
+behind Pi-bound work.
 
 Runner dependencies (installed once on the Pi, not per-run):
-- `arm-none-eabi-gcc`/`objdump`/`nm` — required, for code size.
 - Python 3 + `pip install paramiko` — required, for the RP2350 perf step.
 - The RP2350 board wired to the Pi over USB, reachable via `127.0.0.1` SSH
   (`PERF_HOST`/`PERF_IDENTITY` in the workflow). If it's ever unplugged,
   `record.py` skips perf for that commit rather than failing.
-- `qemu-system-arm` (mps2-an505) + the built newlib under
-  `tests/ir_tests/qemu/mps2-an505` — **only** needed if you run the manual
-  correctness sweep (below) on this same machine.
+- `arm-none-eabi-gcc`/`objdump`/`nm` and `qemu-system-arm` (mps2-an505) +
+  the built newlib under `tests/ir_tests/qemu/mps2-an505` — **only** needed
+  if you run a manual full sweep (below) directly on the Pi; the automatic
+  CI path no longer measures code size there, so these aren't required for
+  `rp2350-perf` itself.
 
 ### Security note
 
@@ -77,10 +94,30 @@ trigger or require maintainer approval for external-contributor workflow runs
 
 ## What CI does
 
-On every push and PR to `mob`: builds `armv8m-tcc`, then runs
-`metrics/record.py --no-correctness` — code size (via `regression_disasm.py`),
-compile time (the code-size corpus's wall time), and RP2350 perf if the board
-answers. No fuzz sweep, no schedule/cron.
+On every push and PR to `mob`, two jobs run in sequence (no schedule/cron,
+no fuzz sweep in either):
+
+1. `build-and-measure` (cloud runner) builds `armv8m-tcc`, then runs
+   `metrics/record.py --no-correctness` against a throwaway scratch db to
+   measure code size (via `regression_disasm.py`) and compile time (the
+   code-size corpus's wall time). It uploads the tcc build and the scratch
+   db as artifacts.
+2. `rp2350-perf` (self-hosted Pi, `needs: build-and-measure`) downloads both
+   artifacts, imports the scratch db's codesize/compile-time rows into the
+   persistent `/var/lib/tcc-metrics/metrics.db` via
+   `record.py --import-codesize-from <scratch db>`, and measures RP2350
+   perf if the board answers.
+
+Both jobs record under the same synthetic host key (`METRICS_HOST:
+armv8m-metrics`, set at the workflow level) so they land on **one** run row
+per commit instead of two — the db keys `runs` by `(commit_sha, host)`, and
+both `gate.py` and the Grafana dashboard assume one host owns every metric
+for a commit. `--import-codesize-from` is what makes that work: it copies
+`codesize_rollup`/`codesize_func`/`compile_time` rows for the matching
+commit from another metrics db instead of recomputing them, so the second
+job's `upsert_run` (which always clears a run's child tables before
+re-populating them) doesn't need to redo the cloud job's measurement to fill
+them back in.
 
 The gate step is present but a no-op until the `METRICS_GATE_ENABLED` repo
 variable is set to `true` (Settings -> Actions -> Variables) — see "Gate

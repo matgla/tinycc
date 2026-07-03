@@ -1643,7 +1643,7 @@ int tcc_ir_simulate_switch_func_ex(const TCCFuncSwitchSnapshot *snap, int64_t ar
     case TCCIR_OP_ADD:
     case TCCIR_OP_SUB:
     {
-      int64_t l, r1;
+      int64_t l = 0, r1 = 0;
       int rl = switch_sim_read_src(&env, o, 1, &l);
       int rr = switch_sim_read_src(&env, o, 2, &r1);
       if (rl == 0 || rr == 0)

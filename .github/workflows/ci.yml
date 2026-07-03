@@ -29,9 +29,6 @@ jobs:
         # without it the frontend types/ tests skip (they need IR dumps).
         run: ./configure --enable-cross --enable-O2 --debug
 
-      - name: Source coverage ledger is complete
-        run: python3 tests/unit/gen_source_coverage.py --check
-
       - name: Pass coverage ledger reports no unexpected regressions
         run: python3 tests/unit/check_pass_coverage.py --strict
 

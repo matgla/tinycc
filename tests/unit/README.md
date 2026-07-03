@@ -334,9 +334,9 @@ The top-level `Makefile` also references `tests/unit/README` in the `ut` target 
 ## Code Coverage (gcov)
 
 `make ut-coverage` (or `make -C tests/unit coverage`) measures **line/branch/function
-coverage** of the tinycc modules under test. It complements `PASS_COVERAGE.md` /
-`SOURCE_COVERAGE.md`, which track *which files have a suite*; this tracks *which lines
-within them the suites actually exercise*.
+coverage** of the tinycc modules under test. It complements `PASS_COVERAGE.md`, which
+tracks *which optimization passes have a suite*; this tracks *which lines within the
+modules under test the suites actually exercise*.
 
 Mechanics: the `coverage` target does a clean instrumented build
 (`COVERAGE=1` → `--coverage` on every TU, emitting `build/**/*.gcno` at compile time
