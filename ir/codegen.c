@@ -3821,9 +3821,18 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         }
 
         /* STRD peephole: two adjacent 32-bit assigns storing registers to
-         * adjacent spill slots → single STRD instruction. */
+         * adjacent spill slots → single STRD instruction.
+         *
+         * needs_deref on a REG src means the assign is really a LOAD
+         * (`T <- *reg`), not a plain reg→spill store: fusing it into an STRD
+         * would spill the *pointer* raw instead of the dereferenced value,
+         * dropping a level of indirection (agg_deep seeds 52367/53515: a
+         * `T46 <- *ppa` def stored ppa itself, so a later `*T46 = x` corrupted
+         * the pointer and the next `**ppa` read faulted). Require plain-value
+         * sources on both halves — the STORE_INDEXED STRD peephole above guards
+         * this the same way. */
         if (a.dest.kind == MACH_OP_SPILL && !a.dest.needs_deref &&
-            a.src1.kind == MACH_OP_REG && !a.src1.is_64bit &&
+            a.src1.kind == MACH_OP_REG && !a.src1.is_64bit && !a.src1.needs_deref &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32) &&
             (a.dest.u.spill.offset & 3) == 0)
         {
@@ -3840,7 +3849,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                                          (MopSpec){.dest = 2, .src1 = 1});
 
             if (b.dest.kind == MACH_OP_SPILL && !b.dest.needs_deref &&
-                b.src1.kind == MACH_OP_REG && !b.src1.is_64bit &&
+                b.src1.kind == MACH_OP_REG && !b.src1.is_64bit && !b.src1.needs_deref &&
                 (b.dest.btype == IROP_BTYPE_INT32 || b.dest.btype == IROP_BTYPE_FLOAT32) &&
                 (b.dest.u.spill.offset & 3) == 0)
             {

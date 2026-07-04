@@ -1,0 +1,912 @@
+        -:    0:Source:/home/mateusz/repos/tinycc/tccir.h
+        -:    0:Graph:build/ir/opt_dce.gcno
+        -:    0:Data:build/ir/opt_dce.gcda
+        -:    0:Runs:1
+        -:    1:/*
+        -:    2: *  TCC - Tiny C Compiler
+        -:    3: *
+        -:    4: *  Copyright (c) 2025 Mateusz Stadnik
+        -:    5: *
+        -:    6: * This library is free software; you can redistribute it and/or
+        -:    7: * modify it under the terms of the GNU Lesser General Public
+        -:    8: * License as published by the Free Software Foundation; either
+        -:    9: * version 2 of the License, or (at your option) any later version.
+        -:   10: *
+        -:   11: * This library is distributed in the hope that it will be useful,
+        -:   12: * but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   13: * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+        -:   14: * Lesser General Public License for more details.
+        -:   15: *
+        -:   16: * You should have received a copy of the GNU Lesser General Public
+        -:   17: * License along with this library; if not, write to the Free Software
+        -:   18: * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+        -:   19: */
+        -:   20:
+        -:   21:#pragma once
+        -:   22:
+        -:   23:#include <stdint.h>
+        -:   24:
+        -:   25:#include "tccir_operand.h"
+        -:   26:#include "tccls.h"
+        -:   27:
+        -:   28:#define PREG_SPILLED 0x20
+        -:   29:#define PREG_NONE 0x1F     /* pr0/pr1 not allocated - just the register bits */
+        -:   30:#define PREG_REG_NONE 0x1F /* pr0_reg/pr1_reg not allocated (5-bit field: 31) */
+        -:   31:
+        -:   32:typedef enum TccIrOp
+        -:   33:{
+        -:   34:  TCCIR_OP_ADD,
+        -:   35:  TCCIR_OP_ADC_USE,
+        -:   36:  TCCIR_OP_ADC_GEN,
+        -:   37:  TCCIR_OP_SUB,
+        -:   38:  TCCIR_OP_SUBC_USE,
+        -:   39:  TCCIR_OP_SUBC_GEN,
+        -:   40:  TCCIR_OP_MUL,
+        -:   41:  TCCIR_OP_MLA, /* Multiply-Accumulate: dest = src1 * src2 + accum */
+        -:   42:  TCCIR_OP_UMULL,
+        -:   43:  TCCIR_OP_DIV,
+        -:   44:  TCCIR_OP_UMOD,
+        -:   45:  TCCIR_OP_IMOD,
+        -:   46:  TCCIR_OP_AND,
+        -:   47:  TCCIR_OP_OR,
+        -:   48:  TCCIR_OP_XOR,
+        -:   49:  TCCIR_OP_SHL,
+        -:   50:  TCCIR_OP_SAR,
+        -:   51:  TCCIR_OP_SHR,
+        -:   52:  TCCIR_OP_PDIV,
+        -:   53:  TCCIR_OP_UDIV,
+        -:   54:  TCCIR_OP_CMP,
+        -:   55:  TCCIR_OP_RETURNVOID,
+        -:   56:  TCCIR_OP_RETURNVALUE,
+        -:   57:  TCCIR_OP_SET_CHAIN, /* Set static chain register before nested function call */
+        -:   58:  TCCIR_OP_JUMP,
+        -:   59:  TCCIR_OP_JUMPIF,
+        -:   60:  /* Indirect jump (computed goto): target in src1 */
+        -:   61:  TCCIR_OP_IJUMP,
+        -:   62:  TCCIR_OP_SETIF,
+        -:   63:  TCCIR_OP_TEST_ZERO,
+        -:   64:  TCCIR_OP_FUNCPARAMVOID,
+        -:   65:  TCCIR_OP_FUNCPARAMVAL,
+        -:   66:  TCCIR_OP_FUNCCALLVOID,
+        -:   67:  TCCIR_OP_FUNCCALLVAL,
+        -:   68:  TCCIR_OP_LOAD,
+        -:   69:  TCCIR_OP_STORE,
+        -:   70:  TCCIR_OP_ASSIGN,
+        -:   71:  TCCIR_OP_LEA, /* Load Effective Address: dest = &src1 (compute address without loading) */
+        -:   72:
+        -:   73:  /* Indexed memory operations for array access optimization */
+        -:   74:  TCCIR_OP_LOAD_INDEXED,  /* dest = *(base + (index << scale)) - ARM LDR rd,[rn,rm,LSL #scale] */
+        -:   75:  TCCIR_OP_STORE_INDEXED, /* *(base + (index << scale)) = src - ARM STR rd,[rn,rm,LSL #scale] */
+        -:   76:
+        -:   77:  /* Post-increment memory operations for sequential access optimization
+        -:   78:   * These combine a load/store with pointer increment: */
+        -:   79:  TCCIR_OP_LOAD_POSTINC,  /* dest = *ptr; ptr += offset - ARM LDR rd,[rn],#imm */
+        -:   80:  TCCIR_OP_STORE_POSTINC, /* *ptr = src; ptr += offset - ARM STR rd,[rn],#imm */
+        -:   81:
+        -:   82:  /* Unsigned bitfield extract: dest = (src1 >> lsb) & ((1<<width)-1)
+        -:   83:   * src2 encodes lsb (bits 0-4) and width (bits 5-9): src2 = lsb | (width << 5)
+        -:   84:   * ARM: UBFX Rd, Rn, #lsb, #width */
+        -:   85:  TCCIR_OP_UBFX,
+        -:   86:
+        -:   87:  /* Bitfield insert: dest = (src1 with bits [lsb..lsb+width-1] replaced by the
+        -:   88:   * low `width` bits of src2).  Algebraically == (src1 & ~field) | (src2 << lsb)
+        -:   89:   * for field = ((1<<width)-1)<<lsb when src2 < 2^width.  lsb/width are carried
+        -:   90:   * in ir->bfi_params[orig_index], not the operands (src1=host word, src2=value).
+        -:   91:   * ARM: BFI Rd, Rn, #lsb, #width (Rd preset to the host word). */
+        -:   92:  TCCIR_OP_BFI,
+        -:   93:
+        -:   94:  /* Floating point operations */
+        -:   95:  TCCIR_OP_FADD, /* float/double addition */
+        -:   96:  TCCIR_OP_FSUB, /* float/double subtraction */
+        -:   97:  TCCIR_OP_FMUL, /* float/double multiplication */
+        -:   98:  TCCIR_OP_FDIV, /* float/double division */
+        -:   99:  TCCIR_OP_FNEG, /* float/double negation */
+        -:  100:  TCCIR_OP_FCMP, /* float/double comparison */
+        -:  101:  /* Floating point conversion operations */
+        -:  102:  TCCIR_OP_CVT_FTOF, /* float to double or double to float */
+        -:  103:  TCCIR_OP_CVT_ITOF, /* int to float/double */
+        -:  104:  TCCIR_OP_CVT_FTOI, /* float/double to int */
+        -:  105:  /* Integer zero-extension: dest = (u_dest_width) src. Always zero-extends
+        -:  106:   * regardless of source signedness — distinguished from ASSIGN/OR so the
+        -:  107:   * optimizer never sign-extends the source value when folding. */
+        -:  108:  TCCIR_OP_ZEXT,
+        -:  109:  /* Pack two u32 values into a u64: dest_lo = src1, dest_hi = src2.
+        -:  110:   * Emitted by a peephole that detects `((u64)hi << 32) | (u64)lo` chains
+        -:  111:   * (ZEXT + SHL #32 + ZEXT + OR) and collapses them.  Backend lowers to
+        -:  112:   * two 32-bit register moves; regalloc can often eliminate them. */
+        -:  113:  TCCIR_OP_PACK64,
+        -:  114:  /* Logical boolean operations - produce 0/1 result */
+        -:  115:  TCCIR_OP_BOOL_OR,  /* (src1 != 0) || (src2 != 0) -> 0/1 */
+        -:  116:  TCCIR_OP_BOOL_AND, /* (src1 != 0) && (src2 != 0) -> 0/1 */
+        -:  117:
+        -:  118:  /* Variable-length array (VLA) / dynamic stack allocation */
+        -:  119:  TCCIR_OP_VLA_ALLOC,      /* adjust SP by runtime size, with alignment */
+        -:  120:  TCCIR_OP_VLA_SP_SAVE,    /* save current SP to a fixed stack slot */
+        -:  121:  TCCIR_OP_VLA_SP_RESTORE, /* restore SP from a fixed stack slot */
+        -:  122:
+        -:  123:  /* Inline asm support (IR-only):
+        -:  124:   * - ASM_INPUT: marks vreg uses feeding the asm block
+        -:  125:   * - INLINE_ASM: barrier/call-like instruction carrying asm payload id
+        -:  126:   * - ASM_OUTPUT: marks vreg defs produced by the asm block
+        -:  127:   */
+        -:  128:  TCCIR_OP_ASM_INPUT,
+        -:  129:  TCCIR_OP_INLINE_ASM,
+        -:  130:  TCCIR_OP_ASM_OUTPUT,
+        -:  131:
+        -:  132:  /* Explicit call sequence lowering (Option A scaffold).
+        -:  133:   * These ops allow the IR to represent the ABI-mandated call argument
+        -:  134:   * placement explicitly, so backends can become mostly "dumb emitters".
+        -:  135:   *
+        -:  136:   * Semantics (initially ARM/AAPCS-focused, but encoded generically):
+        -:  137:   * - CALLSEQ_BEGIN: reserve outgoing argument stack area (and optional pad)
+        -:  138:   * - CALLARG_REG:   place an argument value into a numbered ABI arg register
+        -:  139:   * - CALLARG_STACK: place an argument value at outgoing stack offset
+        -:  140:   * - CALLSEQ_END:   release outgoing argument stack area (and optional pad)
+        -:  141:   */
+        -:  142:  TCCIR_OP_CALLSEQ_BEGIN,
+        -:  143:  TCCIR_OP_CALLARG_REG,
+        -:  144:  TCCIR_OP_CALLARG_STACK,
+        -:  145:  TCCIR_OP_CALLSEQ_END,
+        -:  146:
+        -:  147:  /* Store parent FP (R7) into chain slot for nested function trampoline.
+        -:  148:   * src1.c.i = ELF symbol index of the chain slot in .data */
+        -:  149:  TCCIR_OP_INIT_CHAIN_SLOT,
+        -:  150:
+        -:  151:  /* No-operation placeholder for dead instructions */
+        -:  152:  TCCIR_OP_NOP,
+        -:  153:
+        -:  154:  /* Prefetch data cache hint (PLD/PLI on ARM) - __builtin_prefetch */
+        -:  155:  TCCIR_OP_PREFETCH,
+        -:  156:
+        -:  157:  /* Generate a trap instruction (e.g., UDF on ARM) */
+        -:  158:  TCCIR_OP_TRAP,
+        -:  159:
+        -:  160:  /* Setjmp/longjmp for non-local exits:
+        -:  161:   * SETJMP: src1 = jump buffer pointer, dest = return value (0 on first call, 1 on longjmp)
+        -:  162:   * LONGJMP: src1 = jump buffer pointer, src2.c.i = return value (forced to 1)
+        -:  163:   */
+        -:  164:  TCCIR_OP_SETJMP,
+        -:  165:  TCCIR_OP_LONGJMP,
+        -:  166:
+        -:  167:  /* Non-local goto setjmp/longjmp: saves/restores ALL callee-saved registers
+        -:  168:   * (r4-r11) plus SP and resume address in a 40-byte buffer.
+        -:  169:   * Used for nested function non-local goto (__label__ + goto from nested func).
+        -:  170:   * NL_SETJMP: src1 = jump buffer pointer (40 bytes), dest = return value
+        -:  171:   * NL_LONGJMP: src1 = jump buffer pointer (40 bytes)
+        -:  172:   */
+        -:  173:  TCCIR_OP_NL_SETJMP,
+        -:  174:  TCCIR_OP_NL_LONGJMP,
+        -:  175:
+        -:  176:  /* __builtin_apply_args / __builtin_apply / __builtin_return support:
+        -:  177:   * BUILTIN_APPLY_ARGS: dest = pointer to saved incoming arg registers (r0-r3)
+        -:  178:   * BUILTIN_APPLY: dest = pointer to return-value block;
+        -:  179:   *                src1 = function pointer, src2 = args block (from apply_args)
+        -:  180:   * BUILTIN_RETURN: src1 = pointer to return-value block (from apply)
+        -:  181:   */
+        -:  182:  TCCIR_OP_BUILTIN_APPLY_ARGS,
+        -:  183:  TCCIR_OP_BUILTIN_APPLY,
+        -:  184:  TCCIR_OP_BUILTIN_RETURN,
+        -:  185:
+        -:  186:  /* Jump table switch for dense case statements:
+        -:  187:   * src1 = index vreg (already adjusted: value - min_case)
+        -:  188:   * src2.c.i = table_id (references switch table data)
+        -:  189:   * no dest - this instruction branches directly
+        -:  190:   */
+        -:  191:  TCCIR_OP_SWITCH_TABLE,
+        -:  192:
+        -:  193:  /* Block copy from const data section to stack:
+        -:  194:   * dest = STACKOFF destination (local stack offset, is_local=1)
+        -:  195:   * src1 = SYMREF source (anonymous symbol in rodata section)
+        -:  196:   * src2 = IMM32 size in bytes
+        -:  197:   * No vreg uses/defs - operates on fixed stack locations and symbols.
+        -:  198:   * Backend should generate LDM/STM for optimal ARM Thumb-2 code.
+        -:  199:   */
+        -:  200:  TCCIR_OP_BLOCK_COPY,
+        -:  201:
+        -:  202:  /* Conditional select (if-then-else without branches):
+        -:  203:   * dest = (condition) ? src1 : src2
+        -:  204:   * dest = result vreg
+        -:  205:   * src1 = "then" value (vreg, IMM32, or SYMREF)
+        -:  206:   * src2 = "else" value (vreg, IMM32, or SYMREF)
+        -:  207:   * pool[operand_base+3] = IMM32 condition code (ARM cond nibble 0-0xD)
+        -:  208:   * Must be preceded by a CMP that sets condition flags.
+        -:  209:   * Backend emits ITE cond; MOV/LDR dest, src1; MOV/LDR dest, src2.
+        -:  210:   */
+        -:  211:  TCCIR_OP_SELECT,
+        -:  212:  TCCIR_OP_ROR,
+        -:  213:
+        -:  214:  /* Data-table switch dispatch:
+        -:  215:   * dest = vreg receiving the loaded value
+        -:  216:   * src1 = index vreg (already adjusted: value - min_case, range-checked)
+        -:  217:   * src2.c.i = switch_value_table_id
+        -:  218:   * Loads values[src1] from the inline data table at codegen. Falls through
+        -:  219:   * to the next instruction (typically a JMP to the merge block). The caller
+        -:  220:   * is responsible for emitting a preceding range check that branches to a
+        -:  221:   * separate block when the index is out of range; that block must load the
+        -:  222:   * default_val from the value table (we keep range-check + default outside
+        -:  223:   * SWITCH_LOAD itself to leverage existing CMP/JUMPIF/ASSIGN lowering).
+        -:  224:   */
+        -:  225:  TCCIR_OP_SWITCH_LOAD,
+        -:  226:  /* Signed 32x32 -> 64 multiply: {dest_hi:dest_lo} = (int32)src1 * (int32)src2.
+        -:  227:   * Placed at the end of the enum to avoid shifting other op values, which
+        -:  228:   * could break ranges or generated tables that depend on absolute positions. */
+        -:  229:  TCCIR_OP_SMULL,
+        -:  230:} TccIrOp;
+        -:  231:
+        -:  232:/* Size (in bytes) at or above which the backend lowers a TCCIR_OP_BLOCK_COPY to
+        -:  233: * a real memcpy() call instead of an inline LDM/STM sequence (see
+        -:  234: * tcc_gen_machine_block_copy_mop in arm-thumb-gen.c).  A memcpy call clobbers
+        -:  235: * the caller-saved registers, so register allocation must treat a block copy of
+        -:  236: * at least this size as a call site (ra_build_call_prefix in ir/regalloc.c) and
+        -:  237: * force any value live across it off r0-r3/r12.  The inline path below this size
+        -:  238: * preserves everything it touches via scratch save/restore, so it is not a call.
+        -:  239: * The two sites must agree on this threshold; keep them in sync via this macro. */
+        -:  240:#define TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES 64
+        -:  241:
+        -:  242:/* FUNCPARAMVAL encoding helpers:
+        -:  243: * src2.c.i encodes both parameter index (lower 16 bits) and call_id (upper 16 bits)
+        -:  244: * This keeps call/param binding explicit and makes the IR more compact.
+        -:  245: */
+        -:  246:#define TCCIR_ENCODE_PARAM(call_id, param_idx)                                                                         \
+        -:  247:  ((int64_t)(int32_t)(((uint32_t)(call_id) << 16) | ((uint32_t)(param_idx) & 0xFFFFu)))
+        -:  248:#define TCCIR_DECODE_CALL_ID(encoded) ((int)(((uint32_t)(encoded)) >> 16))
+        -:  249:#define TCCIR_DECODE_PARAM_IDX(encoded) ((int)(((uint32_t)(encoded)) & 0xFFFF))
+        -:  250:
+        -:  251:/* FUNCCALL encoding helpers:
+        -:  252: * For FUNCCALLVOID/FUNCCALLVAL, src2.c.i encodes call_id (bits 16-31) and argc (bits 0-15).
+        -:  253: * This allows the backend to know how many arguments to expect without scanning.
+        -:  254: */
+        -:  255:#define TCCIR_ENCODE_CALL(call_id, argc)                                                                               \
+        -:  256:  ((int64_t)(int32_t)(((uint32_t)(call_id) << 16) | ((uint32_t)(argc) & 0xFFFFu)))
+        -:  257:#define TCCIR_DECODE_CALL_ARGC(encoded) ((int)(((uint32_t)(encoded)) & 0xFFFF))
+        -:  258:
+        -:  259:typedef struct CType CType;
+        -:  260:typedef struct SValue SValue;
+        -:  261:typedef struct NestedFunc NestedFunc;
+        -:  262:typedef struct AttributeDef AttributeDef;
+        -:  263:
+        -:  264:#ifdef CONFIG_TCC_ASM
+        -:  265:typedef struct ASMOperand ASMOperand;
+        -:  266:typedef struct TCCIRInlineAsm
+        -:  267:{
+        -:  268:  char *asm_str;
+        -:  269:  int asm_len;
+        -:  270:  int must_subst;
+        -:  271:  int nb_operands;
+        -:  272:  int nb_outputs;
+        -:  273:  int nb_labels;
+        -:  274:  uint8_t clobber_regs[NB_ASM_REGS];
+        -:  275:  ASMOperand *operands; /* length (nb_operands + nb_labels) */
+        -:  276:  SValue *values;       /* length nb_operands; operands[i].vt points into this */
+        -:  277:} TCCIRInlineAsm;
+        -:  278:#endif
+        -:  279:
+        -:  280:/* TACQuadruple: Expanded instruction form for migration compatibility.
+        -:  281: * Used by tcc_ir_expand_quad() / tcc_ir_writeback_quad() during the transition
+        -:  282: * from embedded SValues to pool-based storage.
+        -:  283: */
+        -:  284:typedef struct TACQuadruple
+        -:  285:{
+        -:  286:  int orig_index; /* Original IR index (stable across DCE) */
+        -:  287:  TccIrOp op;     /* Operation code */
+        -:  288:  SValue dest;    /* Destination operand */
+        -:  289:  SValue src1;    /* First source operand */
+        -:  290:  SValue src2;    /* Second source operand */
+        -:  291:  int line_num;   /* Source line for debug info */
+        -:  292:} TACQuadruple;
+        -:  293:
+        -:  294:typedef struct Sym Sym;
+        -:  295:
+        -:  296:/* Sentinel value indicating an interval hasn't started yet.
+        -:  297: * Using 0xFFFFFFFF since instruction indices are non-negative. */
+        -:  298:#define INTERVAL_NOT_STARTED 0xFFFFFFFF
+        -:  299:
+        -:  300:typedef struct IRVregReplacement
+        -:  301:{
+        -:  302:  uint16_t r0; // first physical register
+        -:  303:  uint16_t r1; // second physical register (for long long)
+        -:  304:  int offset;  // stack offset if spilled
+        -:  305:} IRVregReplacement;
+        -:  306:
+        -:  307:typedef struct IRLiveInterval
+        -:  308:{
+        -:  309:  uint8_t start_within_if : 1; // whether the interval starts within an if block
+        -:  310:  uint8_t addrtaken : 1;       // whether the variable's address is taken
+        -:  311:  uint8_t is_float : 1;        // whether this is a float/double variable
+        -:  312:  uint8_t is_double : 1;       // whether this is a double (vs float)
+        -:  313:  uint8_t is_llong : 1;        // whether this is a long long (64-bit int)
+        -:  314:  uint8_t is_complex : 1;      // Phase 3: whether this is a complex type
+        -:  315:  uint8_t use_vfp : 1;         // whether to use VFP registers (hard float)
+        -:  316:  uint8_t is_lvalue : 1;
+        -:  317:  uint8_t is_volatile : 1;  // whether the source object has volatile-qualified type
+        -:  318:  uint8_t crosses_call : 1; // whether interval spans a function call
+        -:  319:  uint8_t phi_pinned : 1;   // register relied upon by identity phi — do not reassign
+        -:  320:  uint32_t start;           // start instruction index
+        -:  321:  uint32_t end;             // end instruction index
+        -:  322:  IRVregReplacement allocation;
+        -:  323:  int8_t incoming_reg0;    // for params: which register arg arrives in (-1 if stack)
+        -:  324:  int8_t incoming_reg1;    // for doubles: second register (-1 if not double or stack)
+        -:  325:  int32_t original_offset; // for params: original offset from function entry point
+        -:  326:  int stack_slot_index;    // index into stack layout (-1 if not stack-backed)
+        -:  327:} IRLiveInterval;
+        -:  328:
+        -:  329:typedef struct IRCallArgument
+        -:  330:{
+        -:  331:  SValue value;    /* argument value as emitted in FUNCPARAMVAL */
+        -:  332:  int instr_index; /* original FUNCPARAMVAL instruction index (for diagnostics) */
+        -:  333:} IRCallArgument;
+        -:  334:
+        -:  335:/* SpillCache: Track which registers hold which stack slot values.
+        -:  336: * Used to avoid redundant loads when value is already in a register after storeback.
+        -:  337: * Invalidated by: function calls, branches, stores to different offsets with same register.
+        -:  338: */
+        -:  339:#define SPILL_CACHE_SIZE 8
+        -:  340:typedef struct SpillCacheEntry
+        -:  341:{
+        -:  342:  int8_t valid;   // Whether this entry is valid
+        -:  343:  int8_t reg;     // Register containing the value
+        -:  344:  int32_t offset; // Stack offset (FP-relative)
+        -:  345:} SpillCacheEntry;
+        -:  346:
+        -:  347:typedef struct SpillCache
+        -:  348:{
+        -:  349:  SpillCacheEntry entries[SPILL_CACHE_SIZE];
+        -:  350:  /* Tracks the most recently emitted spill helper to elide a redundant
+        -:  351:   * LDR that immediately follows a STR (or LDR) to/from the same slot.
+        -:  352:   * Only valid when ind == last_emit_ind (no intervening emission). */
+        -:  353:  int last_emit_ind;
+        -:  354:  int8_t last_emit_kind; /* 0=none, 1=STR, 2=LDR */
+        -:  355:  int8_t last_emit_reg;
+        -:  356:  int32_t last_emit_offset;
+        -:  357:} SpillCache;
+        -:  358:
+        -:  359:typedef enum TCCStackSlotKind
+        -:  360:{
+        -:  361:  TCC_STACK_SLOT_SPILL = 1,
+        -:  362:  TCC_STACK_SLOT_PARAM_SPILL,
+        -:  363:  TCC_STACK_SLOT_LOCAL,
+        -:  364:  TCC_STACK_SLOT_VLA_SAVE,
+        -:  365:} TCCStackSlotKind;
+        -:  366:
+        -:  367:typedef struct TCCStackSlot
+        -:  368:{
+        -:  369:  TCCStackSlotKind kind;
+        -:  370:  int vreg;      // primary owner vreg (or -1 for shared/fixed slots)
+        -:  371:  int offset;    // frame-pointer relative offset (bytes)
+        -:  372:  int size;      // slot size in bytes
+        -:  373:  int alignment; // required alignment in bytes (power of two)
+        -:  374:} TCCStackSlot;
+        -:  375:
+        -:  376:typedef struct TCCStackLayout
+        -:  377:{
+        -:  378:  TCCStackSlot *slots;
+        -:  379:  int slot_count;
+        -:  380:  int slot_capacity;
+        -:  381:
+        -:  382:  /* Optional fast index: frame offset -> slot index.
+        -:  383:   * Uses open addressing with linear probing.
+        -:  384:   * Empty keys are marked with INT32_MIN (see tccir.c implementation).
+        -:  385:   */
+        -:  386:  int *offset_hash_keys;
+        -:  387:  int *offset_hash_values;
+        -:  388:  int offset_hash_size; /* 0 if disabled, otherwise power-of-two */
+        -:  389:} TCCStackLayout;
+        -:  390:
+        -:  391:/* Switch table metadata for jump table generation */
+        -:  392:typedef struct TCCIRSwitchTable
+        -:  393:{
+        -:  394:  int64_t min_val;     /* Minimum case value */
+        -:  395:  int64_t max_val;     /* Maximum case value */
+        -:  396:  int default_target;  /* IR index for default case */
+        -:  397:  int *targets;        /* Array of IR indices [max-min+1] */
+        -:  398:  int num_entries;     /* Size of targets array */
+        -:  399:  int table_code_addr; /* Code address of start of table data (set during codegen) */
+        -:  400:} TCCIRSwitchTable;
+        -:  401:
+        -:  402:/* Switch value table: emitted when SWITCH_TABLE is rewritten to a data-table
+        -:  403: * load (TCCIR_OP_SWITCH_LOAD). Each case slot holds a value (IMM32 or SYMREF
+        -:  404: * address) that gets loaded into the destination vreg instead of dispatching
+        -:  405: * to a case body. SYMREF entries emit R_ARM_ABS32 relocations at the table's
+        -:  406: * rodata offset so the linker fills in the symbol's runtime address.
+        -:  407: *
+        -:  408: * The table itself lives in .rodata; rodata_sym is an anonymous symbol
+        -:  409: * pointing to the table's base.  The dispatch code loads rodata_sym into a
+        -:  410: * scratch register and uses an indexed shifted LDR to read values[index]. */
+        -:  411:typedef struct TCCIRSwitchValueTable
+        -:  412:{
+        -:  413:  int num_entries;       /* Size of values[] (= num cases) */
+        -:  414:  IROperand *values;     /* Per-case values (IMM32, SYMREF, etc.) */
+        -:  415:  IROperand default_val; /* Out-of-range fallback value */
+        -:  416:  Sym *rodata_sym;       /* Symbol pointing to table base in .rodata */
+        -:  417:} TCCIRSwitchValueTable;
+        -:  418:
+        -:  419:typedef struct TCCMachineScratchRegs
+        -:  420:{
+        -:  421:  unsigned char reg_count;
+        -:  422:  unsigned char saved_mask;
+        -:  423:  int regs[2];
+        -:  424:} TCCMachineScratchRegs;
+        -:  425:
+        -:  426:#define TCC_MACHINE_SCRATCH_NEEDS_PAIR (1u << 0)
+        -:  427:#define TCC_MACHINE_SCRATCH_PREFERS_FLOAT (1u << 1)
+        -:  428:#define TCC_MACHINE_SCRATCH_ALLOW_REUSE (1u << 2)
+        -:  429:/* Exclude ABI arg registers (e.g. R0-R3 on ARM) from scratch allocation. */
+        -:  430:#define TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS (1u << 3)
+        -:  431:/* Exclude "permanent scratch" regs (e.g. R11/R12 on ARM) from scratch allocation. */
+        -:  432:#define TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH (1u << 4)
+        -:  433:
+        -:  434:/* Compact IR instruction - stores operand indices instead of full SValues */
+        -:  435:typedef struct IRQuadCompact
+        -:  436:{
+        -:  437:  int orig_index;               /* Original IR index (stable across DCE) */
+        -:  438:  TccIrOp op;                   /* Operation code */
+        -:  439:  uint32_t operand_base;        /* Index into svalue_pool */
+        -:  440:  uint32_t line_num : 30;       /* Source line for debug info (non-negative, 30 bits = up to 1B lines) */
+        -:  441:  uint32_t is_jump_target : 1;  /* Set when at least one JUMP/JUMPIF targets this instruction */
+        -:  442:  uint32_t no_unroll : 1;       /* Set on rerolled back-edges to prevent re-unrolling */
+        -:  443:} IRQuadCompact;
+        -:  444:
+        -:  445:/* Per-operation operand configuration (defined in tccir.c) */
+        -:  446:typedef struct IRRegistersConfig
+        -:  447:{
+        -:  448:  uint8_t has_dest : 1;
+        -:  449:  uint8_t has_src1 : 1;
+        -:  450:  uint8_t has_src2 : 1;
+        -:  451:} IRRegistersConfig;
+        -:  452:
+        -:  453:extern const IRRegistersConfig irop_config[];
+        -:  454:
+        -:  455:/* Forward declaration for FP materialization cache */
+        -:  456:typedef struct TCCFPMatCache TCCFPMatCache;
+        -:  457:
+        -:  458:typedef struct TCCIRState
+        -:  459:{
+        -:  460:  // number of function parameters
+        -:  461:  int8_t parameters_count;
+        -:  462:  /* Named-argument usage for variadic prolog (AAPCS). */
+        -:  463:  int named_arg_reg_bytes;
+        -:  464:  int named_arg_stack_bytes;
+        -:  465:
+        -:  466:  uint8_t leaffunc : 1;
+        -:  467:  uint8_t tail_call_only : 1;
+        -:  468:  uint8_t naked : 1;
+        -:  469:  /* Set by noreturn_collapse when the body has been replaced with `b .`:
+        -:  470:   * control never reaches the epilogue, so suppress emitting it (saves the
+        -:  471:   * unreachable `bx lr` after the self-jump). Unlike `naked`, this does
+        -:  472:   * NOT suppress the prologue or debug info — the collapsed function is
+        -:  473:   * still a normal callee from the linker's perspective. */
+        -:  474:  uint8_t noreturn : 1;
+        -:  475:  uint8_t processing_if : 1;
+        -:  476:  uint8_t check_for_backwards_jumps : 1;
+        -:  477:  uint8_t basic_block_start : 1;
+        -:  478:  uint8_t prevent_coalescing;
+        -:  479:  uint8_t has_static_chain : 1;      /* function uses static chain for nested func */
+        -:  480:  uint8_t needs_chain_save : 1;      /* must save chain at FP-4 for multi-hop child access */
+        -:  481:  int32_t static_chain_vreg;         /* vreg holding static chain pointer (parent FP) */
+        -:  482:  int32_t captured_offsets_list[32]; /* offsets of captured vars (for chain-relative access) */
+        -:  483:  int32_t captured_chain_depths[32]; /* 1 = direct R10, 2+ = multi-hop */
+        -:  484:  int32_t captured_count;            /* number of captured variables */
+        -:  485:  int32_t loc;
+        -:  486:  int32_t parent_loc; /* parent's loc value (for nested function offset validation) */
+        -:  487:
+        -:  488:  /* Nested function tracking (for parent functions that contain nested functions) */
+        -:  489:  NestedFunc **nested_funcs;     /* array of pointers to nested function descriptors */
+        -:  490:  int32_t nb_nested_funcs;       /* count of nested functions */
+        -:  491:  int32_t nested_funcs_capacity; /* allocated capacity of nested_funcs array */
+        -:  492:
+        -:  493:  /* Optimization module data - opaque pointer to keep IR arch-independent */
+        -:  494:  TCCFPMatCache *opt_fp_mat_cache;
+        -:  495:
+        -:  496:  /* IROperand separate pools for cache efficiency */
+        -:  497:  int64_t *pool_i64; /* 64-bit integer constants */
+        -:  498:  int pool_i64_count;
+        -:  499:  int pool_i64_capacity;
+        -:  500:
+        -:  501:  uint64_t *pool_f64; /* 64-bit double bits */
+        -:  502:  int pool_f64_count;
+        -:  503:  int pool_f64_capacity;
+        -:  504:
+        -:  505:  IRPoolSymref *pool_symref; /* symbol references */
+        -:  506:  int pool_symref_count;
+        -:  507:  int pool_symref_capacity;
+        -:  508:
+        -:  509:  CType *pool_ctype; /* CType storage for struct/array operands */
+        -:  510:  int pool_ctype_count;
+        -:  511:  int pool_ctype_capacity;
+        -:  512:
+        -:  513:  /* IROperand pool - stores compact 8-byte operands for all instruction operands.
+        -:  514:   * Operand layout: dest (if present), src1 (if present), src2 (if present).
+        -:  515:   * IRQuadCompact.operand_base indexes into this pool. */
+        -:  516:  IROperand *iroperand_pool;
+        -:  517:  int iroperand_pool_count;
+        -:  518:  int iroperand_pool_capacity;
+        -:  519:
+        -:  520:  /* Compact instruction array - parallel to instructions[] for now */
+        -:  521:  IRQuadCompact *compact_instructions;
+        -:  522:  int compact_instructions_size;
+        -:  523:
+        -:  524:  IRLiveInterval **active_set;
+        -:  525:
+        -:  526:  IRLiveInterval *variables_live_intervals;
+        -:  527:  int variables_live_intervals_size;
+        -:  528:  int next_local_variable;
+        -:  529:
+        -:  530:  IRLiveInterval *temporary_variables_live_intervals;
+        -:  531:  int temporary_variables_live_intervals_size;
+        -:  532:  int next_temporary_variable;
+        -:  533:
+        -:  534:  IRLiveInterval *parameters_live_intervals;
+        -:  535:  int parameters_live_intervals_size;
+        -:  536:  int next_parameter;
+        -:  537:
+        -:  538:  int next_live_interval_index;
+        -:  539:  int instructions_size;
+        -:  540:  int next_instruction_index;
+        -:  541:  int max_orig_index;           /* Highest orig_index ever assigned; updated in tcc_ir_put */
+        -:  542:  int next_insn_is_jump_target; /* Pending flag: next tcc_ir_put must set is_jump_target=1 */
+        -:  543:
+        -:  544:  /* Monotonic ID for binding FUNCPARAM* instructions to their owning FUNCCALL*.
+        -:  545:   * Encoded in instruction operands for those ops.
+        -:  546:   * 0 means "legacy/unknown" and falls back to nested-scan binding.
+        -:  547:   */
+        -:  548:  int next_call_id;
+        -:  549:
+        -:  550:  /* Current instruction index during code generation - used for scratch register allocation */
+        -:  551:  int codegen_instruction_idx;
+        -:  552:
+        -:  553:  /* Outgoing call argument area reserved in the function frame (FP-relative).
+        -:  554:   * If non-zero, stack args are stored at [FP + call_outgoing_base + stack_off].
+        -:  555:   */
+        -:  556:  int call_outgoing_base; /* frame offset (typically negative) */
+        -:  557:  int call_outgoing_size; /* bytes reserved (may include alignment padding) */
+        -:  558:
+        -:  559:  /* Nested-call register save area: reserved in the frame for saving R0-R3
+        -:  560:   * (and R9/R12 for alignment) across nested function calls without PUSH/POP.
+        -:  561:   * Sits above the outgoing area in the frame layout. */
+        -:  562:  int call_nested_save_base; /* frame offset (typically negative) */
+        -:  563:  int call_nested_save_size; /* bytes reserved (0 if no nested calls possible) */
+        -:  564:
+        -:  565:  /* Scratch register save area: reserved when FP is omitted so that
+        -:  566:   * get_scratch_reg_with_save() can use STR/LDR instead of PUSH/POP.
+        -:  567:   * This prevents SP movement that would break SP-relative addressing. */
+        -:  568:  int scratch_save_base; /* frame offset (typically negative) */
+        -:  569:  int scratch_save_size; /* bytes reserved (0 when FP is used) */
+        -:  570:
+        -:  571:  uint32_t *ignored_vregs;
+        -:  572:  int ignored_vregs_size;
+        -:  573:
+        -:  574:  SpillCache spill_cache; // Cache for tracking register-stack mappings during codegen
+        -:  575:  TCCStackLayout stack_layout;
+        -:  576:
+        -:  577:#ifdef CONFIG_TCC_ASM
+        -:  578:  /* Inline asm blocks recorded during IR building, lowered during codegen. */
+        -:  579:  TCCIRInlineAsm *inline_asms;
+        -:  580:  int inline_asm_count;
+        -:  581:  int inline_asm_capacity;
+        -:  582:#endif
+        -:  583:
+        -:  584:  /* Mapping from IR instruction index to generated machine code offset (section-relative).
+        -:  585:   * Size is (next_instruction_index + 1) to include the epilogue mapping.
+        -:  586:   * This is populated during tcc_ir_codegen_generate() and is used after codegen
+        -:  587:   * for features like GCC's labels-as-values (&&label). */
+        -:  588:  uint32_t *ir_to_code_mapping;
+        -:  589:  int ir_to_code_mapping_size;
+        -:  590:
+        -:  591:  /* Mapping from ORIGINAL IR instruction index (pre-DCE/compaction) to generated
+        -:  592:   * machine code offset. Label positions (s->jind) are recorded before DCE, so
+        -:  593:   * this mapping is the correct one to use for &&label materialization.
+        -:  594:   */
+        -:  595:  uint32_t *orig_ir_to_code_mapping;
+        -:  596:  int orig_ir_to_code_mapping_size;
+        -:  597:
+        -:  598:  /* Mirror of tccgen's func_has_label_addr for the current function: set when the
+        -:  599:   * body takes a label address (GCC labels-as-values, `&&label`).  Kept on the IR
+        -:  600:   * state so the IR layer (regalloc) can consult it without referencing a tccgen
+        -:  601:   * global (which the standalone unit-test link does not provide). */
+        -:  602:  int func_has_label_addr;
+        -:  603:
+        -:  604:  LSLiveIntervalState ls;
+        -:  605:
+        -:  606:  /* Extra scratch allocation flags to apply during materialization for the current IR instruction. */
+        -:  607:  unsigned codegen_materialize_scratch_flags;
+        -:  608:
+        -:  609:  /* Set between CMP and JUMPIF emission so the backend uses flag-preserving encodings. */
+        -:  610:  int codegen_flags_live;
+        -:  611:
+        -:  612:  /* Switch tables for jump table generation */
+        -:  613:  TCCIRSwitchTable *switch_tables;
+        -:  614:  int num_switch_tables;
+        -:  615:  int switch_tables_capacity;
+        -:  616:
+        -:  617:  /* Switch value tables for SWITCH_LOAD (constant-table dispatch). */
+        -:  618:  TCCIRSwitchValueTable *switch_value_tables;
+        -:  619:  int num_switch_value_tables;
+        -:  620:  int switch_value_tables_capacity;
+        -:  621:
+        -:  622:  /* Barrel shift annotations: populated just before codegen, freed after.
+        -:  623:   * barrel_shifts[i] encodes an optional barrel shift on src2 of instruction i:
+        -:  624:   * 0 = none, else (type<<5)|amount. type: 1=SHL, 2=SHR, 3=SAR, 4=ROR. */
+        -:  625:  uint8_t *barrel_shifts;
+        -:  626:
+        -:  627:  /* Dead-half annotations for 64-bit shift ops, keyed by orig_index.
+        -:  628:   * Populated just before codegen, freed after.  bit0 = the result's low
+        -:  629:   * word is dead (no consumer reads it); bit1 = the result's high word is
+        -:  630:   * dead.  Lets thumb_emit_shift64_mop skip the dead half-write in the
+        -:  631:   * 64-bit bitfield-extract idiom (SHL #a; SHR #b, b>=32). */
+        -:  632:  uint8_t *shift64_dead_half;
+        -:  633:
+        -:  634:  /* BFI insert parameters, keyed by orig_index.  Populated by
+        -:  635:   * tcc_ir_opt_bitfield_insert_to_bfi just before codegen, freed after.
+        -:  636:   * Entry = lsb (bits 0-7) | (width << 8); width >= 1 so a real BFI entry is
+        -:  637:   * never 0.  Consumed by tcc_gen_machine_bfi_mop. */
+        -:  638:  uint16_t *bfi_params;
+        -:  639:
+        -:  640:  /* Codegen temporaries owned by tcc_ir_codegen_generate while it is running.
+        -:  641:   * They are normally freed before return; tcc_ir_free also releases them when
+        -:  642:   * a compile error longjmps out of codegen. */
+        -:  643:  int *codegen_return_jump_addrs;
+        -:  644:  int *codegen_dry_insn_scratch;
+        -:  645:  uint16_t *codegen_dry_insn_saves;
+        -:  646:  void *codegen_mop_cache;
+        -:  647:  uint32_t *codegen_cbz_dry_mapping;
+        -:  648:  uint8_t *codegen_branch_target_reset;
+        -:  649:} TCCIRState;
+        -:  650:
+        -:  651:TCCIRState *tcc_ir_allocate_block();
+        -:  652:
+        -:  653:/* If the value is an lvalue (memory reference), emit an IR load so the
+        -:  654: * SValue becomes a plain value suitable for arithmetic/indirect calls. */
+        -:  655:
+        -:  656:int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest);
+        -:  657:
+        -:  658:#ifdef CONFIG_TCC_ASM
+        -:  659:int tcc_ir_add_inline_asm(TCCIRState *ir, const char *asm_str, int asm_len, int must_subst, ASMOperand *operands,
+        -:  660:                          int nb_operands, int nb_outputs, int nb_labels, const uint8_t *clobber_regs);
+        -:  661:void tcc_ir_put_inline_asm(TCCIRState *ir, int inline_asm_id);
+        -:  662:#endif
+        -:  663:
+        -:  664:int tcc_ir_get_vreg_temp(TCCIRState *ir);
+        -:  665:int tcc_ir_get_vreg_var(TCCIRState *ir);
+        -:  666:int tcc_ir_get_vreg_param(TCCIRState *ir);
+        -:  667:/* Allocate static chain vreg for nested functions (live-in at R10) */
+        -:  668:int tcc_ir_get_vreg_static_chain(TCCIRState *ir);
+        -:  669:
+        -:  670:void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double);
+        -:  671:void tcc_ir_set_llong_type(TCCIRState *ir, int vreg);
+        -:  672:void tcc_ir_set_original_offset(TCCIRState *ir, int vreg, int offset);
+        -:  673:int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
+        -:  674:
+        -:  675:void tcc_ir_register_allocation_params(TCCIRState *ir);
+        -:  676:/* For parameters that arrive on the caller stack (beyond r0-r3 per AAPCS),
+        -:  677: * do not allocate separate local spill slots. They already have a stable
+        -:  678: * incoming stack home for the duration of the call. */
+        -:  679:void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir);
+        -:  680:void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir);
+        -:  681:void tcc_ir_build_stack_layout(TCCIRState *ir);
+        -:  682:const TCCStackSlot *tcc_ir_stack_slot_by_vreg(const TCCIRState *ir, int vreg);
+        -:  683:const TCCStackSlot *tcc_ir_stack_slot_by_offset(const TCCIRState *ir, int frame_offset);
+        -:  684:void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r0, int r1);
+        -:  685:const char *tcc_ir_get_op_name(TccIrOp op);
+        -:  686:void tcc_ir_show(TCCIRState *ir);
+        -:  687:void tcc_ir_dump_set_show_physical_regs(int show);
+        -:  688:/* -dump-ir-passes= helpers (shared by the legacy optimize loop in tccgen.c and
+        -:  689: * the SSA optimizer driver in ir/opt/ssa_opt.c). */
+        -:  690:int tcc_ir_dump_passes_match(TCCState *s, const char *pass_name);
+        -:  691:void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name);
+        -:  692:void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
+        -:  693:
+        -:  694:IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg);
+        -:  695:IRLiveInterval *tcc_ir_try_get_live_interval(TCCIRState *ir, int vreg);
+        -:  696:void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address);
+        -:  697:void tcc_ir_backpatch_to_here(TCCIRState *ir, int t);
+        -:  698:void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address);
+        -:  699:int tcc_ir_gjmp_append(TCCIRState *ir, int n, int t);
+        -:  700:void tcc_ir_print_vreg(int vreg);
+        -:  701:void print_iroperand_short(TCCIRState *ir, IROperand op);
+        -:  702:void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc);
+        -:  703:
+        -:  704:/* Machine-independent spill helpers (defined in tccir.c) */
+        -:  705:int tcc_ir_is_spilled(SValue *sv);
+        -:  706:int tcc_ir_is_64bit(int t);
+        -:  707:
+        -:  708:/* Machine-dependent spill handling (defined in machine-specific code, e.g., arm-thumb-gen.c) */
+        -:  709:
+        -:  710:/* Spill cache management for avoiding redundant loads */
+        -:  711:void tcc_ir_spill_cache_clear(SpillCache *cache);
+        -:  712:void tcc_ir_spill_cache_record(SpillCache *cache, int reg, int offset);
+        -:  713:int tcc_ir_spill_cache_lookup(SpillCache *cache, int offset);
+        -:  714:void tcc_ir_spill_cache_invalidate_reg(SpillCache *cache, int reg);
+        -:  715:void tcc_ir_spill_cache_invalidate_offset(SpillCache *cache, int offset);
+        -:  716:
+        -:  717:/* Check if FPU supports double precision (defined in arm-thumb-gen.c) */
+        -:  718:int arm_fpu_supports_double(int fpu_type);
+        -:  719:
+        -:  720:/* SValue pool accessor functions for compact IR storage.
+        -:  721: * Operand layout in pool: dest (if present), src1 (if present), src2 (if present).
+        -:  722: * Returns NULL if the operand is not used by this operation. */
+        -:  723:
+        -:  724:static inline int ir_op_slot_count(TccIrOp op)
+        -:  725:{
+        -:  726:  return irop_config[op].has_dest + irop_config[op].has_src1 + irop_config[op].has_src2;
+        -:  727:}
+        -:  728:
+        -:  729:/* ============================================================================
+        -:  730: * IROperand pool accessor functions - compact 8-byte operand access
+        -:  731: * ============================================================================
+        -:  732: * Operand layout: dest (if present), src1 (if present), src2 (if present).
+        -:  733: * Returns IROP_NONE if the operand is not used by this operation.
+        -:  734: */
+        -:  735:
+      398:  736:static inline IROperand tcc_ir_op_get_dest(const TCCIRState *ir, const IRQuadCompact *q)
+        -:  737:{
+      398:  738:  if (!irop_config[q->op].has_dest)
+      140:  739:    return IROP_NONE;
+      258:  740:  if (q->operand_base >= (uint32_t)ir->iroperand_pool_count)
+    #####:  741:    return IROP_NONE;
+      258:  742:  return ir->iroperand_pool[q->operand_base];
+        -:  743:}
+        -:  744:
+        -:  745:static inline IROperand tcc_ir_get_dest(const TCCIRState *ir, int index)
+        -:  746:{
+        -:  747:  IRQuadCompact *q = &ir->compact_instructions[index];
+        -:  748:  if (!irop_config[q->op].has_dest)
+        -:  749:    return IROP_NONE;
+        -:  750:  if (q->operand_base >= (uint32_t)ir->iroperand_pool_count)
+        -:  751:    return IROP_NONE;
+        -:  752:  return ir->iroperand_pool[q->operand_base];
+        -:  753:}
+        -:  754:
+      234:  755:static inline IROperand tcc_ir_op_get_src1(const TCCIRState *ir, const IRQuadCompact *q)
+        -:  756:{
+      234:  757:  if (!irop_config[q->op].has_src1)
+        2:  758:    return IROP_NONE;
+      232:  759:  int off = irop_config[q->op].has_dest;
+      232:  760:  if (q->operand_base + off >= (uint32_t)ir->iroperand_pool_count)
+    #####:  761:    return IROP_NONE;
+      232:  762:  return ir->iroperand_pool[q->operand_base + off];
+        -:  763:}
+        -:  764:
+        -:  765:static inline IROperand tcc_ir_get_src1(const TCCIRState *ir, int index)
+        -:  766:{
+        -:  767:  IRQuadCompact *q = &ir->compact_instructions[index];
+        -:  768:  if (!irop_config[q->op].has_src1)
+        -:  769:    return IROP_NONE;
+        -:  770:  int off = irop_config[q->op].has_dest;
+        -:  771:  if (q->operand_base + off >= (uint32_t)ir->iroperand_pool_count)
+        -:  772:    return IROP_NONE;
+        -:  773:  return ir->iroperand_pool[q->operand_base + off];
+        -:  774:}
+        -:  775:
+       80:  776:static inline IROperand tcc_ir_op_get_src2(const TCCIRState *ir, const IRQuadCompact *q)
+        -:  777:{
+       80:  778:  if (!irop_config[q->op].has_src2)
+       42:  779:    return IROP_NONE;
+       38:  780:  int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+       38:  781:  if (q->operand_base + off >= (uint32_t)ir->iroperand_pool_count)
+    #####:  782:    return IROP_NONE;
+       38:  783:  return ir->iroperand_pool[q->operand_base + off];
+        -:  784:}
+        -:  785:
+        -:  786:static inline IROperand tcc_ir_get_src2(const TCCIRState *ir, int index)
+        -:  787:{
+        -:  788:  IRQuadCompact *q = &ir->compact_instructions[index];
+        -:  789:  if (!irop_config[q->op].has_src2)
+        -:  790:    return IROP_NONE;
+        -:  791:  int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+        -:  792:  if (q->operand_base + off >= (uint32_t)ir->iroperand_pool_count)
+        -:  793:    return IROP_NONE;
+        -:  794:  return ir->iroperand_pool[q->operand_base + off];
+        -:  795:}
+        -:  796:
+        -:  797:/* Get the 4th operand (scale) for indexed memory operations.
+        -:  798: * This is stored at operand_base + 3 for LOAD_INDEXED/STORE_INDEXED.
+        -:  799: */
+        -:  800:static inline IROperand tcc_ir_op_get_scale(const TCCIRState *ir, const IRQuadCompact *q)
+        -:  801:{
+        -:  802:  /* Scale is at operand_base + 3 (after dest, base/src1, index/src2) */
+        -:  803:  int scale_idx = q->operand_base + 3;
+        -:  804:  if (scale_idx >= 0 && scale_idx < ir->iroperand_pool_count)
+        -:  805:    return ir->iroperand_pool[scale_idx];
+        -:  806:  return IROP_NONE;
+        -:  807:}
+        -:  808:
+        -:  809:/* Get the 4th operand (accumulator) for MLA (Multiply-Accumulate) operations.
+        -:  810: * MLA: dest = src1 * src2 + accum
+        -:  811: * This is stored at operand_base + 3 for MLA.
+        -:  812: */
+    #####:  813:static inline IROperand tcc_ir_op_get_accum(const TCCIRState *ir, const IRQuadCompact *q)
+        -:  814:{
+        -:  815:  /* Accumulator is at operand_base + 3 (after dest, src1, src2) */
+    #####:  816:  int accum_idx = q->operand_base + 3;
+    #####:  817:  if (accum_idx >= 0 && accum_idx < ir->iroperand_pool_count)
+    #####:  818:    return ir->iroperand_pool[accum_idx];
+    #####:  819:  return IROP_NONE;
+        -:  820:}
+        -:  821:
+        -:  822:static inline void tcc_ir_op_set_accum(TCCIRState *ir, IRQuadCompact *q, IROperand op)
+        -:  823:{
+        -:  824:  int accum_idx = q->operand_base + 3;
+        -:  825:  if (accum_idx >= 0 && accum_idx < ir->iroperand_pool_count)
+        -:  826:    ir->iroperand_pool[accum_idx] = op;
+        -:  827:}
+        -:  828:
+        -:  829:/* Get the 4th operand (condition code) for SELECT operations.
+        -:  830: * SELECT: dest = (cond) ? src1 : src2
+        -:  831: * Condition is stored at operand_base + 3 as IMM32 (ARM cond nibble).
+        -:  832: */
+        -:  833:static inline IROperand tcc_ir_op_get_cond(const TCCIRState *ir, const IRQuadCompact *q)
+        -:  834:{
+        -:  835:  int cond_idx = q->operand_base + 3;
+        -:  836:  if (cond_idx >= 0 && cond_idx < ir->iroperand_pool_count)
+        -:  837:    return ir->iroperand_pool[cond_idx];
+        -:  838:  return IROP_NONE;
+        -:  839:}
+        -:  840:
+        -:  841:/* ============================================================================
+        -:  842: * IROperand pool setter functions
+        -:  843: * ============================================================================
+        -:  844: * Direct operand pool manipulation - used by optimization passes.
+        -:  845: */
+        -:  846:
+        4:  847:static inline void tcc_ir_op_set_dest(TCCIRState *ir, const IRQuadCompact *q, IROperand irop)
+        -:  848:{
+        4:  849:  if (!irop_config[q->op].has_dest)
+    #####:  850:    return;
+        4:  851:  ir->iroperand_pool[q->operand_base] = irop;
+        -:  852:}
+        -:  853:
+        6:  854:static inline void tcc_ir_set_dest(TCCIRState *ir, int index, IROperand irop)
+        -:  855:{
+        6:  856:  IRQuadCompact *q = &ir->compact_instructions[index];
+        6:  857:  if (!irop_config[q->op].has_dest)
+    #####:  858:    return;
+        6:  859:  ir->iroperand_pool[q->operand_base] = irop;
+        -:  860:}
+        -:  861:
+        -:  862:static inline void tcc_ir_op_set_src1(TCCIRState *ir, const IRQuadCompact *q, IROperand irop)
+        -:  863:{
+        -:  864:  if (!irop_config[q->op].has_src1)
+        -:  865:    return;
+        -:  866:  int off = irop_config[q->op].has_dest;
+        -:  867:  ir->iroperand_pool[q->operand_base + off] = irop;
+        -:  868:}
+        -:  869:
+       10:  870:static inline void tcc_ir_set_src1(TCCIRState *ir, int index, IROperand irop)
+        -:  871:{
+       10:  872:  IRQuadCompact *q = &ir->compact_instructions[index];
+       10:  873:  if (!irop_config[q->op].has_src1)
+        6:  874:    return;
+        4:  875:  int off = irop_config[q->op].has_dest;
+        -:  876:  /* A STORE_INDEXED / STORE_POSTINC derives its store width from the VALUE
+        -:  877:   * (src1) operand's btype.  A value rewrite (e.g. copy-propagation forwarding
+        -:  878:   * a wider temp into a char/short bitfield store) must not widen it — that
+        -:  879:   * would turn a byte/half store into a word store and clobber adjacent memory.
+        -:  880:   * Preserve the existing narrow access width. */
+        4:  881:  if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC) {
+    #####:  882:    uint8_t old_bt = ir->iroperand_pool[q->operand_base + off].btype;
+    #####:  883:    if ((old_bt == IROP_BTYPE_INT8 || old_bt == IROP_BTYPE_INT16) &&
+    #####:  884:        irop.btype == IROP_BTYPE_INT32)
+    #####:  885:      irop.btype = old_bt;
+        -:  886:  }
+        4:  887:  ir->iroperand_pool[q->operand_base + off] = irop;
+        -:  888:}
+        -:  889:
+        -:  890:static inline void tcc_ir_op_set_src2(TCCIRState *ir, const IRQuadCompact *q, IROperand irop)
+        -:  891:{
+        -:  892:  if (!irop_config[q->op].has_src2)
+        -:  893:    return;
+        -:  894:  int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+        -:  895:  ir->iroperand_pool[q->operand_base + off] = irop;
+        -:  896:}
+        -:  897:
+        6:  898:static inline void tcc_ir_set_src2(TCCIRState *ir, int index, IROperand irop)
+        -:  899:{
+        6:  900:  IRQuadCompact *q = &ir->compact_instructions[index];
+        6:  901:  if (!irop_config[q->op].has_src2)
+        6:  902:    return;
+    #####:  903:  int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+    #####:  904:  ir->iroperand_pool[q->operand_base + off] = irop;
+        -:  905:}
+        -:  906:
+        -:  907:/* Pool management functions */
+        -:  908:int tcc_ir_iroperand_pool_add(TCCIRState *ir, IROperand irop);

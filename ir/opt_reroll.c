@@ -276,7 +276,17 @@ static int block_matches(TCCIRState *ir, int base, int P, int k,
     IRQuadCompact *qa = &ir->compact_instructions[base + i];
     IRQuadCompact *qb = &ir->compact_instructions[base + k * P + i];
     if (qa->op != qb->op) return 0;
-    if (i > 0 && qb->is_jump_target) return 0;
+    /* No instruction inside a repeated iteration may be a branch target.
+     * body_is_safe already vets the canonical body's interior; here qb belongs
+     * to iteration k>=1, so its FIRST instruction (i==0, at base+k*P) is an
+     * iteration boundary.  A branch target there is an external edge landing in
+     * the middle of the run — the single-entry rerolled loop cannot represent
+     * it, and the rewrite would remap that edge onto the counter machinery.
+     * volatile seed 110274: `if(c){f();f();} f(); f();` puts the if-false merge
+     * on the 3rd f() (an iteration boundary); rerolling all four into one loop
+     * remapped that edge onto the counter-increment, so the cond-false path ran
+     * the loop with an uninitialised counter -> hang.  Reject i==0 too. */
+    if (qb->is_jump_target) return 0;
     if (!operand_equiv(ir, tcc_ir_op_get_dest(ir, qa), tcc_ir_op_get_dest(ir, qb), map, internal_defs)) return 0;
     if (!operand_equiv(ir, tcc_ir_op_get_src1(ir, qa), tcc_ir_op_get_src1(ir, qb), map, internal_defs)) return 0;
 
@@ -308,8 +318,52 @@ static void collect_body_defs(TCCIRState *ir, int base, int P, VregSet *defs)
   }
 }
 
+/* True if the canonical body [base, base+P) keeps every call group whole:
+ * each FUNCCALLVAL's FUNCPARAMVAL markers lie in the same body, before it,
+ * and no FUNCPARAMVAL is left dangling with its CALL outside the body.
+ *
+ * The reroll matcher compares blocks purely by opcode/operand shape, so a
+ * run like `... CALL; PARAM0; PARAM1; CALL; PARAM0; PARAM1; ...` matches
+ * equally well when the period boundary is placed at the CALL (splitting a
+ * call from its own params) as when it is placed at the PARAMs.  Rerolling
+ * the phase-shifted window NOPs the params of the last, unmatched call while
+ * leaving its CALL standing just past the run -- the backend callsite scan
+ * then aborts with "missing FUNCPARAMVAL for call_id=N".  Requiring the
+ * body to be call-balanced forces the boundary onto a real group edge, so
+ * the matcher falls through to the correctly-aligned window instead. */
+static int body_calls_balanced(TCCIRState *ir, int base, int P)
+{
+  /* call_ids whose FUNCPARAMVAL markers have been seen but not yet closed
+   * by their FUNCCALLVAL.  At most P distinct groups fit in a P-length body. */
+  int open_ids[REROLL_MAX_PERIOD];
+  int n_open = 0;
+  for (int i = 0; i < P; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[base + i];
+    if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID) {
+      IROperand s2 = tcc_ir_op_get_src2(ir, q);
+      if (irop_get_tag(s2) != IROP_TAG_IMM32) return 0; /* can't verify -> reject */
+      int cid = TCCIR_DECODE_CALL_ID((uint32_t)s2.u.imm32);
+      int found = 0;
+      for (int j = 0; j < n_open; j++) if (open_ids[j] == cid) { found = 1; break; }
+      if (!found) open_ids[n_open++] = cid;
+    } else if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID) {
+      IROperand s2 = tcc_ir_op_get_src2(ir, q);
+      if (irop_is_none(s2)) continue; /* untracked call (no id) -- backend won't scan it */
+      if (irop_get_tag(s2) != IROP_TAG_IMM32) return 0;
+      if (TCCIR_DECODE_CALL_ARGC((uint32_t)s2.u.imm32) == 0) continue; /* zero-arg: self-contained */
+      int cid = TCCIR_DECODE_CALL_ID((uint32_t)s2.u.imm32);
+      int idx = -1;
+      for (int j = 0; j < n_open; j++) if (open_ids[j] == cid) { idx = j; break; }
+      if (idx < 0) return 0; /* CALL whose params are outside the body -> split */
+      open_ids[idx] = open_ids[--n_open]; /* close the group */
+    }
+  }
+  return n_open == 0; /* any group left open ends past the body boundary -> split */
+}
+
 /* True if the canonical body [base, base+P) is well-formed: no unsafe
- * opcodes, no internal jump targets after instruction 0. */
+ * opcodes, no internal jump targets after instruction 0, and no call group
+ * split across the period boundary. */
 static int body_is_safe(TCCIRState *ir, int base, int P)
 {
   for (int i = 0; i < P; i++) {
@@ -317,7 +371,7 @@ static int body_is_safe(TCCIRState *ir, int base, int P)
     if (op_is_unsafe_for_reroll(q->op)) return 0;
     if (i > 0 && q->is_jump_target) return 0;
   }
-  return 1;
+  return body_calls_balanced(ir, base, P);
 }
 
 /* Count how many times the P-period block at `base` repeats consecutively

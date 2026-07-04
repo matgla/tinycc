@@ -162,6 +162,24 @@ typedef struct Operand
  * (Operand is private to arm-thumb-asm.c), so forward-declare it here. */
 thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift shift, Operand *ops);
 
+/* thumb_process_generic_data_op() is the helper shared by many data-processing
+ * switch cases in arm-thumb-asm.c; expose it directly to test the width/encoding
+ * and flags branches without going through the full dispatcher. */
+typedef thumb_opcode (*thumb_generate_generic_imm_opcode)(uint32_t rd, uint32_t rn, uint32_t imm,
+                                                          thumb_flags_behaviour flags, thumb_enforce_encoding encoding);
+typedef thumb_opcode (*thumb_generate_generic_reg_opcode)(uint32_t rd, uint32_t rn, uint32_t rm,
+                                                          thumb_flags_behaviour flags, thumb_shift shift,
+                                                          thumb_enforce_encoding encoding);
+typedef struct th_generic_op_data
+{
+  thumb_generate_generic_imm_opcode generate_imm_opcode;
+  thumb_generate_generic_reg_opcode generate_reg_opcode;
+  int regular_variant_token;
+  int flags_variant_token;
+} th_generic_op_data;
+
+thumb_opcode thumb_process_generic_data_op(th_generic_op_data data, int token, thumb_shift shift, Operand *ops);
+
 /* Other arm-thumb-asm.c helpers that are public (ST_FUNC) but have no
  * externally visible header; exercise them directly below. */
 ST_FUNC void tcc_asm_set_fpu(const char *name);
@@ -1079,6 +1097,10 @@ UT_TEST(test_fpu_enable_fpv5_d16)
 UT_TEST(test_clobber_register_sets_bit)
 {
   uint8_t regs[NB_ASM_REGS] = {0};
+  /* asm_clobber() resolves the register name through tok_alloc(); seed the
+     token table so "r3" maps back to the register token asm_parse_regvar()
+     recognizes. */
+  utb_set_tok_str(TOK_ASM_r3, "r3");
   asm_clobber(regs, "r3");
   UT_ASSERT_EQ(regs[3], 1);
   return 0;
@@ -1087,6 +1109,8 @@ UT_TEST(test_clobber_register_sets_bit)
 UT_TEST(test_clobber_alias_lr)
 {
   uint8_t regs[NB_ASM_REGS] = {0};
+  /* Make sure the string "lr" resolves to the lr alias token. */
+  utb_set_tok_str(TOK_ASM_lr, "lr");
   asm_clobber(regs, "lr");
   UT_ASSERT_EQ(regs[14], 1);
   return 0;
@@ -1135,12 +1159,16 @@ UT_TEST(test_constraints_single_input_register)
 
 UT_TEST(test_constraints_output_then_input_pair)
 {
+  /* Without an earlyclobber modifier, output and input "r" constraints may
+     share a register (input only checks REG_IN_MASK). Use '&' to force the
+     output to be allocated in a different register from inputs, and verify
+     the solver skips the occupied register for the input. */
   ASMOperand ops[2];
   SValue svs[2];
   uint8_t clobber[NB_ASM_REGS] = {0};
   uint8_t reserved[NB_ASM_REGS] = {0};
   int out_reg = -1;
-  make_asm_operand(&ops[0], &svs[0], "r", 0);
+  make_asm_operand(&ops[0], &svs[0], "&r", 0);
   make_asm_operand(&ops[1], &svs[1], "r", 0);
   asm_compute_constraints(ops, 2, 1, clobber, reserved, &out_reg);
   UT_ASSERT_EQ(ops[0].reg, 0);
@@ -1223,7 +1251,11 @@ UT_TEST(test_constraints_reserved_regs_skipped)
 
 UT_TEST(test_token_suffix_narrow_qualifier)
 {
-  int add_tok = set_special_reg_tok("add");
+  /* Use tok_alloc() to obtain the canonical token for the base mnemonic:
+     earlier tests may have already registered "add" under a different id,
+     and thumb_parse_token_suffix() resolves the stripped base via the same
+     tok_alloc() lookup. */
+  int add_tok = tok_alloc("add", 3)->tok;
   int add_n_tok = set_special_reg_tok("add.n");
   int base_token = -1;
   int cond = thumb_parse_token_suffix(add_n_tok, &base_token);
@@ -1249,7 +1281,9 @@ UT_TEST(test_token_suffix_condition_aliases_cs_cc)
 
 UT_TEST(test_token_suffix_one_char_base_with_condition)
 {
-  int b_tok = set_special_reg_tok("b");
+  /* Resolve the canonical token for "b" via tok_alloc(), matching how
+     thumb_parse_token_suffix() looks up the stripped base mnemonic. */
+  int b_tok = tok_alloc("b", 1)->tok;
   int beq_tok = set_special_reg_tok("beq");
   int base_token = -1;
   int cond = thumb_parse_token_suffix(beq_tok, &base_token);
@@ -1387,6 +1421,616 @@ UT_TEST(test_dispatch_sbcs_sets_flags)
   return 0;
 }
 
+/* ============================================================ */
+/*  thumb_process_generic_data_op() direct                        */
+/* ============================================================ */
+
+static th_generic_op_data and_op_data(void)
+{
+  return (th_generic_op_data){
+      .generate_imm_opcode = th_and_imm,
+      .generate_reg_opcode = th_and_reg,
+      .regular_variant_token = TOK_ASM_and,
+      .flags_variant_token = TOK_ASM_ands,
+  };
+}
+
+UT_TEST(test_process_generic_data_op_reg_forces_32bit_outside_it)
+{
+  setup_armv8m_main();
+  Operand ops[3];
+  /* rd==rn with low registers is encodable as T16, so the unconditional
+     32-bit force for the regular variant is observable. */
+  ops_reg_reg_reg(ops, 0, 0, 1);
+  thumb_opcode got = thumb_process_generic_data_op(and_op_data(), TOK_ASM_and, THUMB_SHIFT_DEFAULT, ops);
+  thumb_opcode want = th_and_reg(0, 0, 1, FLAGS_BEHAVIOUR_BLOCK, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_32BIT);
+  UT_ASSERT(opcode_eq(got, want));
+  return 0;
+}
+
+UT_TEST(test_process_generic_data_op_ands_sets_flags_no_force)
+{
+  setup_armv8m_main();
+  Operand ops[3];
+  ops_reg_reg_reg(ops, 0, 0, 1);
+  thumb_opcode got = thumb_process_generic_data_op(and_op_data(), TOK_ASM_ands, THUMB_SHIFT_DEFAULT, ops);
+  thumb_opcode want = th_and_reg(0, 0, 1, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE);
+  UT_ASSERT(opcode_eq(got, want));
+  return 0;
+}
+
+UT_TEST(test_process_generic_data_op_wide_qualifier_forces_32bit)
+{
+  setup_armv8m_main();
+  int base;
+  int and_w_tok = set_special_reg_tok("and.w");
+  thumb_parse_token_suffix(and_w_tok, &base);
+
+  Operand ops[3];
+  ops_reg_reg_reg(ops, 0, 0, 1);
+  thumb_opcode got = thumb_process_generic_data_op(and_op_data(), TOK_ASM_and, THUMB_SHIFT_DEFAULT, ops);
+  thumb_opcode want = th_and_reg(0, 0, 1, FLAGS_BEHAVIOUR_BLOCK, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_32BIT);
+  UT_ASSERT(opcode_eq(got, want));
+  return 0;
+}
+
+UT_TEST(test_process_generic_data_op_imm_path)
+{
+  setup_armv8m_main();
+  Operand ops[3];
+  ops_reg_reg_imm(ops, 0, 1, 0x55);
+  thumb_opcode got = thumb_process_generic_data_op(and_op_data(), TOK_ASM_and, THUMB_SHIFT_DEFAULT, ops);
+  thumb_opcode want = th_and_imm(0, 1, 0x55, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE);
+  UT_ASSERT(opcode_eq(got, want));
+  return 0;
+}
+
+/* ============================================================ */
+/*  asm_compute_constraints() -- additional branches               */
+/* ============================================================ */
+
+UT_TEST(test_constraints_priority_specific_register_before_general)
+{
+  /* The specific-register path has priority 1, lower than general 'r' (3), so
+     the solver allocates it first even when it appears later in operand order. */
+  ASMOperand ops[2];
+  SValue svs[2];
+  Sym sym;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&ops[0], &svs[0], "r", VT_LOCAL);
+  make_asm_operand_with_local_sym(&ops[1], &svs[1], &sym, "r", 0);
+  asm_compute_constraints(ops, 2, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(ops[0].reg, 1);
+  UT_ASSERT_EQ(ops[1].reg, 0);
+  return 0;
+}
+
+UT_TEST(test_constraints_clobber_prevents_allocation)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  clobber[0] = 1;
+  make_asm_operand(&op, &sv, "r", VT_LOCAL);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, 1);
+  return 0;
+}
+
+UT_TEST(test_constraints_alternative_immediate_chosen)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "i,r", VT_CONST);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, -1);
+  return 0;
+}
+
+UT_TEST(test_constraints_alternative_register_fallback)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "i,r", VT_LOCAL);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, 0);
+  return 0;
+}
+
+UT_TEST(test_constraints_I_immediate_no_register)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "I", VT_CONST);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, -1);
+  return 0;
+}
+
+UT_TEST(test_constraints_M_immediate_no_register)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "M", VT_CONST);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, -1);
+  return 0;
+}
+
+UT_TEST(test_constraints_memory_output_llocal)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "m", VT_LLOCAL);
+  asm_compute_constraints(&op, 1, 1, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.is_memory, 1);
+  UT_ASSERT_EQ(op.reg, 0);
+  return 0;
+}
+
+UT_TEST(test_constraints_out_reg_for_llocal_output)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "r", VT_LLOCAL);
+  asm_compute_constraints(&op, 1, 1, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, 0);
+  UT_ASSERT_EQ(out_reg, 1);
+  return 0;
+}
+
+/* ============================================================ */
+/*  thumb_parse_token_suffix() -- additional branches              */
+/* ============================================================ */
+
+UT_TEST(test_token_suffix_uppercase_width)
+{
+  int add_tok = tok_alloc("add", 3)->tok;
+  int add_W_tok = set_special_reg_tok("add.W");
+  int base_token = -1;
+  int cond = thumb_parse_token_suffix(add_W_tok, &base_token);
+  UT_ASSERT_EQ(cond, 14);
+  UT_ASSERT_EQ(base_token, add_tok);
+  return 0;
+}
+
+UT_TEST(test_token_suffix_three_char_base_with_condition)
+{
+  int blx_tok = tok_alloc("blx", 3)->tok;
+  int blxeq_tok = set_special_reg_tok("blxeq");
+  int base_token = -1;
+  int cond = thumb_parse_token_suffix(blxeq_tok, &base_token);
+  UT_ASSERT_EQ(cond, 0); /* eq -> 0 */
+  UT_ASSERT_EQ(base_token, blx_tok);
+  return 0;
+}
+
+UT_TEST(test_token_suffix_width_only_on_two_char_base)
+{
+  int bx_tok = tok_alloc("bx", 2)->tok;
+  int bx_w_tok = set_special_reg_tok("bx.w");
+  int base_token = -1;
+  int cond = thumb_parse_token_suffix(bx_w_tok, &base_token);
+  UT_ASSERT_EQ(cond, 14);
+  UT_ASSERT_EQ(base_token, bx_tok);
+  return 0;
+}
+
+UT_TEST(test_token_suffix_remaining_condition_codes)
+{
+  int base_token = -1;
+  UT_ASSERT_EQ(thumb_parse_token_suffix(set_special_reg_tok("movmi"), &base_token), 4);
+  UT_ASSERT_EQ(thumb_parse_token_suffix(set_special_reg_tok("movpl"), &base_token), 5);
+  UT_ASSERT_EQ(thumb_parse_token_suffix(set_special_reg_tok("movvs"), &base_token), 6);
+  UT_ASSERT_EQ(thumb_parse_token_suffix(set_special_reg_tok("movvc"), &base_token), 7);
+  UT_ASSERT_EQ(thumb_parse_token_suffix(set_special_reg_tok("movhi"), &base_token), 8);
+  UT_ASSERT_EQ(thumb_parse_token_suffix(set_special_reg_tok("movls"), &base_token), 9);
+  UT_ASSERT_EQ(thumb_parse_token_suffix(set_special_reg_tok("movge"), &base_token), 10);
+  UT_ASSERT_EQ(thumb_parse_token_suffix(set_special_reg_tok("movlt"), &base_token), 11);
+  UT_ASSERT_EQ(thumb_parse_token_suffix(set_special_reg_tok("movle"), &base_token), 13);
+  return 0;
+}
+
+/* ============================================================ */
+/*  tcc_asm_set_fpu() -- remaining names                         */
+/* ============================================================ */
+
+UT_TEST(test_fpu_enable_fpv5_sp_d16)
+{
+  setup_armv8m_main();
+  tcc_asm_set_fpu("fpv5-sp-d16");
+  UT_ASSERT_EQ(arm_target_dependent.feat.vfp_sp, 1);
+  UT_ASSERT_EQ(arm_target_dependent.feat.vfp_dp, 0);
+  return 0;
+}
+
+UT_TEST(test_fpu_enable_fpv5_d32)
+{
+  setup_armv8m_main();
+  tcc_asm_set_fpu("fpv5-d32");
+  UT_ASSERT_EQ(arm_target_dependent.feat.vfp_sp, 1);
+  UT_ASSERT_EQ(arm_target_dependent.feat.vfp_dp, 1);
+  return 0;
+}
+
+UT_TEST(test_fpu_enable_fp_armv8_full)
+{
+  setup_armv8m_main();
+  tcc_asm_set_fpu("fp-armv8-full");
+  UT_ASSERT_EQ(arm_target_dependent.feat.vfp_sp, 1);
+  UT_ASSERT_EQ(arm_target_dependent.feat.vfp_dp, 1);
+  UT_ASSERT_EQ(arm_target_dependent.feat.fp_armv8, 1);
+  return 0;
+}
+
+UT_TEST(test_fpu_none_is_noop)
+{
+  setup_armv8m_main();
+  int t32_before = arm_target_dependent.feat.t32;
+  tcc_asm_set_fpu("none");
+  UT_ASSERT_EQ(arm_target_dependent.feat.vfp_sp, 0);
+  UT_ASSERT_EQ(arm_target_dependent.feat.t32, t32_before);
+  return 0;
+}
+
+/* ============================================================ */
+/*  asm_compute_constraints() -- additional reachable branches     */
+/* ============================================================ */
+
+UT_TEST(test_constraints_output_equals_modifier)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "=r", 0);
+  asm_compute_constraints(&op, 1, 1, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, 0);
+  return 0;
+}
+
+UT_TEST(test_constraints_m_input_local_no_memory_flag)
+{
+  /* "m" on an input operand that is VT_LOCAL (not VT_LLOCAL) does not
+     allocate a register or set is_memory. */
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "m", VT_LOCAL);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, -1);
+  UT_ASSERT_EQ(op.is_memory, 0);
+  return 0;
+}
+
+UT_TEST(test_constraints_g_input_no_register)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "g", VT_LOCAL);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, -1);
+  return 0;
+}
+
+UT_TEST(test_constraints_X_input_no_register)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "X", VT_LOCAL);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, -1);
+  return 0;
+}
+
+UT_TEST(test_constraints_Q_input_no_register)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "Q", VT_LOCAL);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, -1);
+  return 0;
+}
+
+/* ============================================================ */
+/*  thumb_generate_opcode_for_data_processing() -- wide qualifier  */
+/* ============================================================ */
+
+UT_TEST(test_dispatch_mov_wide_qualifier_forces_32bit)
+{
+  setup_armv8m_main();
+  int base;
+  int mov_w_tok = set_special_reg_tok("mov.w");
+  thumb_parse_token_suffix(mov_w_tok, &base); /* sets WIDTH_WIDE */
+  Operand ops[3];
+  ops_reg_reg_reg(ops, 0, 0, 3);
+  thumb_opcode got = thumb_generate_opcode_for_data_processing(TOK_ASM_mov, THUMB_SHIFT_DEFAULT, ops);
+  thumb_opcode want =
+      th_mov_reg(0, 3, FLAGS_BEHAVIOUR_BLOCK, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_32BIT, /*in_it=*/false);
+  UT_ASSERT(opcode_eq(got, want));
+  return 0;
+}
+
+UT_TEST(test_dispatch_and_wide_qualifier_forces_32bit)
+{
+  setup_armv8m_main();
+  int base;
+  int and_w_tok = set_special_reg_tok("and.w");
+  thumb_parse_token_suffix(and_w_tok, &base); /* sets WIDTH_WIDE */
+  Operand ops[3];
+  ops_reg_reg_reg(ops, 0, 1, 2);
+  thumb_opcode got = thumb_generate_opcode_for_data_processing(TOK_ASM_and, THUMB_SHIFT_DEFAULT, ops);
+  thumb_opcode want = th_and_reg(0, 1, 2, FLAGS_BEHAVIOUR_BLOCK, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_32BIT);
+  UT_ASSERT(opcode_eq(got, want));
+  return 0;
+}
+
+/* ============================================================ */
+/*  subst_asm_operand()                                            */
+/* ============================================================ */
+
+static void seed_subst_reg_names(void)
+{
+  utb_set_tok_str(TOK_ASM_r0, "r0");
+  utb_set_tok_str(TOK_ASM_r1, "r1");
+  utb_set_tok_str(TOK_ASM_r2, "r2");
+  utb_set_tok_str(TOK_ASM_r3, "r3");
+  utb_set_tok_str(TOK_ASM_r4, "r4");
+  utb_set_tok_str(TOK_ASM_r5, "r5");
+  utb_set_tok_str(TOK_ASM_r6, "r6");
+  utb_set_tok_str(TOK_ASM_r7, "r7");
+  utb_set_tok_str(TOK_ASM_r8, "r8");
+  utb_set_tok_str(TOK_ASM_r9, "r9");
+  utb_set_tok_str(TOK_ASM_r10, "r10");
+  utb_set_tok_str(TOK_ASM_r11, "r11");
+  utb_set_tok_str(TOK_ASM_r12, "r12");
+  utb_set_tok_str(TOK_ASM_r13, "r13");
+  utb_set_tok_str(TOK_ASM_r14, "r14");
+  utb_set_tok_str(TOK_ASM_r15, "r15");
+}
+
+static const char *subst_operand_to_string(SValue *sv, int modifier)
+{
+  static CString cs;
+  cstr_free(&cs);
+  cstr_new(&cs);
+  subst_asm_operand(&cs, sv, modifier);
+  cstr_ccat(&cs, '\0');
+  return cs.data;
+}
+
+static void make_sv_const(SValue *sv, int32_t value)
+{
+  memset(sv, 0, sizeof(*sv));
+  sv->r = VT_CONST;
+  sv->c.i = value;
+}
+
+static void make_sv_const_sym(SValue *sv, Sym *sym, int32_t offset)
+{
+  memset(sv, 0, sizeof(*sv));
+  sv->r = VT_CONST | VT_SYM;
+  sv->sym = sym;
+  sv->c.i = offset;
+}
+
+static void make_sv_local(SValue *sv, int32_t offset)
+{
+  memset(sv, 0, sizeof(*sv));
+  sv->r = VT_LOCAL;
+  sv->c.i = offset;
+}
+
+static void make_sv_lval_reg(SValue *sv, int reg)
+{
+  memset(sv, 0, sizeof(*sv));
+  sv->r = VT_LVAL | reg;
+}
+
+static void make_sv_reg(SValue *sv, int reg, int type)
+{
+  memset(sv, 0, sizeof(*sv));
+  sv->r = reg;
+  sv->type.t = type;
+}
+
+UT_TEST(test_subst_const_default)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_const(&sv, 42);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "#42");
+  return 0;
+}
+
+UT_TEST(test_subst_const_c_modifier)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_const(&sv, 42);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 'c'), "42");
+  return 0;
+}
+
+UT_TEST(test_subst_const_P_modifier)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_const(&sv, 42);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 'P'), "42");
+  return 0;
+}
+
+UT_TEST(test_subst_const_n_modifier_known_bug)
+{
+  /* Known bug: modifier 'n' should print a negated immediate (e.g. #-42),
+     but the implementation both omits the leading '#' (because the guard
+     `modifier != 'n'` suppresses it) and fails to use the negated `val` it
+     computed, printing sv->c.i unchanged. Current output is therefore the
+     bare positive number. Flip the assertion to "#-42" once fixed. */
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_const(&sv, 42);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 'n'), "42");
+  return 0;
+}
+
+UT_TEST(test_subst_const_lval_no_hash)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  memset(&sv, 0, sizeof(sv));
+  sv.r = VT_CONST | VT_LVAL;
+  sv.c.i = 42;
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "42");
+  return 0;
+}
+
+UT_TEST(test_subst_const_sym_zero_offset)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  Sym sym;
+  memset(&sym, 0, sizeof(sym));
+  sym.v = set_special_reg_tok("myvar");
+  make_sv_const_sym(&sv, &sym, 0);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "#myvar");
+  return 0;
+}
+
+UT_TEST(test_subst_const_sym_nonzero_offset)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  Sym sym;
+  memset(&sym, 0, sizeof(sym));
+  sym.v = set_special_reg_tok("myvar");
+  make_sv_const_sym(&sv, &sym, 8);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "#myvar+8");
+  return 0;
+}
+
+UT_TEST(test_subst_const_sym_leading_underscore)
+{
+  seed_subst_reg_names();
+  tcc_state->leading_underscore = 1;
+  SValue sv;
+  Sym sym;
+  memset(&sym, 0, sizeof(sym));
+  sym.v = set_special_reg_tok("myvar");
+  make_sv_const_sym(&sv, &sym, 0);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "#_myvar");
+  tcc_state->leading_underscore = 0;
+  return 0;
+}
+
+UT_TEST(test_subst_local)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_local(&sv, -16);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "[fp,#-16]");
+  return 0;
+}
+
+UT_TEST(test_subst_lval_reg)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_lval_reg(&sv, 3);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "[r3]");
+  return 0;
+}
+
+UT_TEST(test_subst_reg_default)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_reg(&sv, 5, VT_INT);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "r5");
+  return 0;
+}
+
+UT_TEST(test_subst_reg_byte_type)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_reg(&sv, 2, VT_BYTE);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "r2");
+  return 0;
+}
+
+UT_TEST(test_subst_reg_short_type)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_reg(&sv, 2, VT_SHORT);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "r2");
+  return 0;
+}
+
+UT_TEST(test_subst_reg_b_modifier)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_reg(&sv, 2, VT_INT);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 'b'), "r2");
+  return 0;
+}
+
+UT_TEST(test_subst_reg_w_modifier)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_reg(&sv, 2, VT_INT);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 'w'), "r2");
+  return 0;
+}
+
+UT_TEST(test_subst_reg_k_modifier)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_reg(&sv, 2, VT_INT);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 'k'), "r2");
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(arm_thumb_asm)
@@ -1419,10 +2063,18 @@ UT_SUITE(arm_thumb_asm)
   UT_RUN(test_token_suffix_condition_aliases_cs_cc);
   UT_RUN(test_token_suffix_one_char_base_with_condition);
   UT_RUN(test_token_suffix_unknown_suffix_returns_al);
+  UT_RUN(test_token_suffix_uppercase_width);
+  UT_RUN(test_token_suffix_three_char_base_with_condition);
+  UT_RUN(test_token_suffix_width_only_on_two_char_base);
+  UT_RUN(test_token_suffix_remaining_condition_codes);
 
   /* tcc_asm_set_fpu */
   UT_RUN(test_fpu_enable_vfpv4_sp_d16);
   UT_RUN(test_fpu_enable_fpv5_d16);
+  UT_RUN(test_fpu_enable_fpv5_sp_d16);
+  UT_RUN(test_fpu_enable_fpv5_d32);
+  UT_RUN(test_fpu_enable_fp_armv8_full);
+  UT_RUN(test_fpu_none_is_noop);
 
   /* asm_clobber */
   UT_RUN(test_clobber_register_sets_bit);
@@ -1438,6 +2090,19 @@ UT_SUITE(arm_thumb_asm)
   UT_RUN(test_constraints_immediate_operand_no_register);
   UT_RUN(test_constraints_specific_register_via_local_sym);
   UT_RUN(test_constraints_reserved_regs_skipped);
+  UT_RUN(test_constraints_priority_specific_register_before_general);
+  UT_RUN(test_constraints_clobber_prevents_allocation);
+  UT_RUN(test_constraints_alternative_immediate_chosen);
+  UT_RUN(test_constraints_alternative_register_fallback);
+  UT_RUN(test_constraints_I_immediate_no_register);
+  UT_RUN(test_constraints_M_immediate_no_register);
+  UT_RUN(test_constraints_memory_output_llocal);
+  UT_RUN(test_constraints_out_reg_for_llocal_output);
+  UT_RUN(test_constraints_output_equals_modifier);
+  UT_RUN(test_constraints_m_input_local_no_memory_flag);
+  UT_RUN(test_constraints_g_input_no_register);
+  UT_RUN(test_constraints_X_input_no_register);
+  UT_RUN(test_constraints_Q_input_no_register);
 
   /* thumb_generate_opcode_for_data_processing (direct switch cases) */
   UT_RUN(test_dispatch_adds_imm_sets_flags);
@@ -1454,6 +2119,8 @@ UT_SUITE(arm_thumb_asm)
   UT_RUN(test_dispatch_movs_imm_sets_flags);
   UT_RUN(test_dispatch_movw_imm_forces_32bit);
   UT_RUN(test_dispatch_mov_reg);
+  UT_RUN(test_dispatch_mov_wide_qualifier_forces_32bit);
+  UT_RUN(test_dispatch_and_wide_qualifier_forces_32bit);
   UT_RUN(test_dispatch_cmp_imm_always_sets_flags);
   UT_RUN(test_dispatch_cmp_reg);
   UT_RUN(test_dispatch_cmn_imm);
@@ -1494,4 +2161,28 @@ UT_SUITE(arm_thumb_asm)
   UT_RUN(test_dispatch_rsbs_sets_flags);
   UT_RUN(test_dispatch_sbcs_sets_flags);
   UT_RUN(test_dispatch_generic_op_returns_zero_when_operand_neither_imm_nor_reg);
+
+  /* thumb_process_generic_data_op() direct */
+  UT_RUN(test_process_generic_data_op_reg_forces_32bit_outside_it);
+  UT_RUN(test_process_generic_data_op_ands_sets_flags_no_force);
+  UT_RUN(test_process_generic_data_op_wide_qualifier_forces_32bit);
+  UT_RUN(test_process_generic_data_op_imm_path);
+
+  /* subst_asm_operand */
+  UT_RUN(test_subst_const_default);
+  UT_RUN(test_subst_const_c_modifier);
+  UT_RUN(test_subst_const_P_modifier);
+  UT_RUN(test_subst_const_n_modifier_known_bug);
+  UT_RUN(test_subst_const_lval_no_hash);
+  UT_RUN(test_subst_const_sym_zero_offset);
+  UT_RUN(test_subst_const_sym_nonzero_offset);
+  UT_RUN(test_subst_const_sym_leading_underscore);
+  UT_RUN(test_subst_local);
+  UT_RUN(test_subst_lval_reg);
+  UT_RUN(test_subst_reg_default);
+  UT_RUN(test_subst_reg_byte_type);
+  UT_RUN(test_subst_reg_short_type);
+  UT_RUN(test_subst_reg_b_modifier);
+  UT_RUN(test_subst_reg_w_modifier);
+  UT_RUN(test_subst_reg_k_modifier);
 }

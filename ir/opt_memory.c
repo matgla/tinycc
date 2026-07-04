@@ -2031,7 +2031,12 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
     }
     /* Non-constant or unsupported definition — don't track */
   }
-  tcc_free(fwd_tmp_defs);
+  /* Keep fwd_tmp_defs live for the whole pass: the main loop below re-marks
+   * fwd_tmp_valid[t]=1 whenever it forwards a LOAD into temp t, which can
+   * resurrect a multiply-defined temp the pre-scan invalidated (a `?:` merge
+   * temp whose else-arm def was itself a forwarded LOAD).  Every site that
+   * *consumes* fwd_tmp_val re-checks fwd_tmp_defs[t] < 2 so a temp defined on
+   * more than one path never has one arm's value substituted for the merge. */
 
   /* Cross-BB state preservation: when a JUMP/JUMPIF's target has exactly
    * one predecessor, we snapshot the current state to saved_entries[t] so
@@ -2808,7 +2813,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                 if (fwd_sv_vr >= 0 && TCCIR_DECODE_VREG_TYPE(fwd_sv_vr) == TCCIR_VREG_TYPE_TEMP && !fwd_sv.is_lval)
                 {
                   int fwd_sv_pos = TCCIR_DECODE_VREG_POSITION(fwd_sv_vr);
-                  if (fwd_sv_pos <= max_tmp && fwd_tmp_valid[fwd_sv_pos])
+                  if (fwd_sv_pos <= max_tmp && fwd_tmp_valid[fwd_sv_pos] && fwd_tmp_defs[fwd_sv_pos] < 2)
                     fwd_sv = fwd_tmp_val[fwd_sv_pos];
                 }
                 fwd_tmp_val[fwd_pos] = fwd_sv;
@@ -3973,7 +3978,10 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         if (sv_vr >= 0 && TCCIR_DECODE_VREG_TYPE(sv_vr) == TCCIR_VREG_TYPE_TEMP && !sv.is_lval)
         {
           int sv_pos = TCCIR_DECODE_VREG_POSITION(sv_vr);
-          if (sv_pos <= max_tmp && fwd_tmp_valid[sv_pos])
+          /* fwd_tmp_defs guard: a multiply-defined temp (e.g. a `?:` merge)
+           * has no single reaching value, so resolving the store through its
+           * tracked value would substitute one arm for the merge (seed 72674). */
+          if (sv_pos <= max_tmp && fwd_tmp_valid[sv_pos] && fwd_tmp_defs[sv_pos] < 2)
           {
             new_entry->stored_value = fwd_tmp_val[sv_pos];
           }
@@ -4099,7 +4107,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
               if (rv_vr >= 0 && TCCIR_DECODE_VREG_TYPE(rv_vr) == TCCIR_VREG_TYPE_TEMP && !resolved_val.is_lval)
               {
                 int rv_pos = TCCIR_DECODE_VREG_POSITION(rv_vr);
-                if (rv_pos <= max_tmp && fwd_tmp_valid[rv_pos])
+                if (rv_pos <= max_tmp && fwd_tmp_valid[rv_pos] && fwd_tmp_defs[rv_pos] < 2)
                   resolved_val = fwd_tmp_val[rv_pos];
               }
             }
@@ -4430,6 +4438,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
   tcc_free(active_call_ids);
   tcc_free(fwd_tmp_val);
   tcc_free(fwd_tmp_valid);
+  tcc_free(fwd_tmp_defs);
   for (i = 0; i < n; i++)
     tcc_free(saved_entries[i]);
   tcc_free(saved_entries);
@@ -11085,8 +11094,15 @@ int tcc_ir_opt_ptr_load_cse(TCCIRState *ir)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int32_t dest_vr = irop_get_vreg(dest);
-      if (dest_vr >= 0 && !dest.is_lval &&
-          TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_VAR) {
+      /* A write to an address-taken local VAR aliases any pointer deref of it,
+       * so the whole deref cache is stale.  This must fire for BOTH forms the
+       * frontend emits for such a write: the register form `V <-- x` (is_lval=0,
+       * still updates the memory-resident slot) AND the memory form `V <-- x`
+       * with is_lval=1 (an ASSIGN op — not a STORE, so the STORE flush above
+       * misses it).  Gating on `!dest.is_lval` dropped the is_lval case, so a
+       * `*pa` read taken after `u4 = ...` (pa == &u4) re-CSE'd to the pre-store
+       * value (agg_deep O1 wrong-code). */
+      if (dest_vr >= 0 && TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_VAR) {
         IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, dest_vr);
         if (li && li->addrtaken) {
           cache_count = 0;
@@ -11222,6 +11238,23 @@ int tcc_ir_opt_ptr_store_load_fwd(TCCIRState *ir)
 
     if (cache_count == 0)
       continue;
+
+    /* A LOAD_INDEXED reads base + (index << scale) — an element of its base
+     * array.  Its base is an address rvalue (not a cached store's addr_vr), so
+     * the src1.is_lval forwarding below never registers it as a read of any
+     * pending store.  A pending store whose slot this load can reach is NOT
+     * redundant even if a later store overwrites the same addr_vr, so mark all
+     * pending stores as loaded to suppress the redundant-store elimination
+     * above.  (ptr fuzz seed 80958: two stores to arr[1] straddle an
+     * `arr[i&7]` runtime-index read that feeds the second store's value when
+     * i&7==1; local_alu_cse coalesced both store addresses to one temp, so the
+     * first store was wrongly dropped as redundant.  Same class as the RSE
+     * runtime-base fix, agg_deep seed 36641.) */
+    if (q->op == TCCIR_OP_LOAD_INDEXED)
+    {
+      for (int c = 0; c < cache_count; c++)
+        cache[c].was_loaded = 1;
+    }
 
     if (irop_config[q->op].has_dest)
     {

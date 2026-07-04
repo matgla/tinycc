@@ -12,6 +12,9 @@
 
 #include "ut.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 /* These constants are private to tccelf.c; mirror them here for the tests. */
 #ifndef SHF_PRIVATE
 #define SHF_PRIVATE 0x80000000
@@ -19,6 +22,18 @@
 #ifndef SYMTAB_INITIAL_HASH_BUCKETS
 #define SYMTAB_INITIAL_HASH_BUCKETS 512
 #endif
+
+/* These ST_FUNC helpers are defined in tccelf.c but not exposed in tcc.h. */
+ST_FUNC void section_ensure_loaded(TCCState *s1, Section *sec);
+ST_FUNC void fill_got_entry(TCCState *s1, ElfW_Rel *rel);
+ST_FUNC void ld_export_standard_symbols(TCCState *s1);
+ST_FUNC ssize_t full_read(int fd, void *buf, size_t count);
+ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) *h);
+ST_FUNC void relocate_syms(TCCState *s1, Section *symtab, int do_resolve);
+ST_FUNC int tcc_load_object_file_lazy(TCCState *s1, int fd, unsigned long file_offset);
+ST_FUNC void tcc_free_lazy_objfiles(TCCState *s1);
+ST_FUNC void tcc_gc_mark_phase(TCCState *s1);
+ST_FUNC void tcc_load_referenced_sections(TCCState *s1);
 
 static void ut_elf_reset_state(void)
 {
@@ -29,6 +44,27 @@ static void ut_elf_init_minimal(void)
 {
   /* tccelf.c assumes sections[0] is a NULL dummy. */
   dynarray_add(&tcc_state->sections, &tcc_state->nb_sections, NULL);
+}
+
+/* Create a temporary file in the current directory containing `len` bytes from
+ * `data`.  The generated path (including the caller-supplied prefix) is written
+ * to `path_out`.  Returns 0 on success, -1 on failure. */
+static int ut_make_temp_file(const char *prefix, const unsigned char *data, size_t len, char *path_out,
+                             size_t path_size)
+{
+  int fd;
+  snprintf(path_out, path_size, "%sXXXXXX", prefix);
+  fd = mkstemp(path_out);
+  if (fd < 0)
+    return -1;
+  if (len > 0 && (size_t)write(fd, data, len) != len)
+  {
+    close(fd);
+    unlink(path_out);
+    return -1;
+  }
+  close(fd);
+  return 0;
 }
 
 /* ============================================================================
@@ -1388,10 +1424,988 @@ UT_TEST(test_tcc_add_bcheck_adds_when_bounds_enabled)
   return 0;
 }
 
+/* ============================================================================
+ * Lazy section materialization
+ * ============================================================================ */
+
+UT_TEST(test_section_materialize_loads_deferred_chunk)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *sec = new_section(tcc_state, ".lazysec", SHT_PROGBITS, SHF_ALLOC);
+  unsigned char payload[] = {0x11, 0x22, 0x33, 0x44};
+  char path[64];
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_mat_", payload, sizeof(payload), path, sizeof(path)) == 0);
+
+  DeferredChunk *chunk = (DeferredChunk *)tcc_mallocz(sizeof(DeferredChunk));
+  chunk->source_path = tcc_strdup(path);
+  chunk->file_offset = 0;
+  chunk->size = sizeof(payload);
+  chunk->dest_offset = 0;
+  sec->deferred_head = chunk;
+  sec->deferred_tail = chunk;
+  sec->lazy = 1;
+  sec->has_deferred_chunks = 1;
+  sec->data_offset = sizeof(payload);
+
+  section_materialize(tcc_state, sec);
+
+  UT_ASSERT(sec->materialized);
+  UT_ASSERT(!sec->lazy);
+  UT_ASSERT(memcmp(sec->data, payload, sizeof(payload)) == 0);
+
+  unlink(path);
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_section_ensure_loaded_frees_discarded_chunks)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *sec = new_section(tcc_state, ".discarded", SHT_PROGBITS, SHF_ALLOC);
+  unsigned char dummy = 0;
+  char path[64];
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_disc_", &dummy, 1, path, sizeof(path)) == 0);
+
+  DeferredChunk *chunk = (DeferredChunk *)tcc_mallocz(sizeof(DeferredChunk));
+  chunk->source_path = tcc_strdup(path);
+  chunk->size = 1;
+  sec->deferred_head = chunk;
+  sec->deferred_tail = chunk;
+  sec->lazy = 1;
+  sec->has_deferred_chunks = 1;
+  sec->data_offset = 0; /* GC'd section */
+
+  section_ensure_loaded(tcc_state, sec);
+
+  UT_ASSERT(!sec->lazy);
+  UT_ASSERT(!sec->has_deferred_chunks);
+  UT_ASSERT(sec->deferred_head == NULL);
+
+  unlink(path);
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_apply_reloc_patches_during_materialize)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *sec = new_section(tcc_state, ".patched", SHT_PROGBITS, SHF_ALLOC);
+  unsigned char zeros[8] = {0};
+  char path[64];
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_patch_", zeros, sizeof(zeros), path, sizeof(path)) == 0);
+
+  sec->data_offset = sizeof(zeros);
+  section_realloc(sec, sec->data_offset);
+
+  uint32_t *offsets = (uint32_t *)tcc_malloc(2 * sizeof(uint32_t));
+  uint32_t *values = (uint32_t *)tcc_malloc(2 * sizeof(uint32_t));
+  offsets[0] = 0;
+  values[0] = 0x12345678;
+  offsets[1] = 4;
+  values[1] = 0xaabbccdd;
+  sec->reloc_patch_offsets = offsets;
+  sec->reloc_patch_values = values;
+  sec->nb_reloc_patches = 2;
+  sec->alloc_reloc_patches = 2;
+
+  DeferredChunk *chunk = (DeferredChunk *)tcc_mallocz(sizeof(DeferredChunk));
+  chunk->source_path = tcc_strdup(path);
+  chunk->size = sizeof(zeros);
+  sec->deferred_head = chunk;
+  sec->deferred_tail = chunk;
+  sec->lazy = 1;
+  sec->has_deferred_chunks = 1;
+
+  section_materialize(tcc_state, sec);
+
+  UT_ASSERT_EQ(read32le(sec->data + 0), 0x12345678u);
+  UT_ASSERT_EQ(read32le(sec->data + 4), 0xaabbccddu);
+
+  unlink(path);
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * Symbol relocation
+ * ============================================================================ */
+
+UT_TEST(test_relocate_syms_adds_section_base)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  text_section->sh_addr = 0x1000;
+
+  int idx = set_elf_sym(symtab_section, 0x10, 4,
+                        ELFW(ST_INFO)(STB_GLOBAL, STT_FUNC),
+                        0, text_section->sh_num, "relocated_fn");
+
+  relocate_syms(tcc_state, symtab_section, 0);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx].st_value, (addr_t)0x1010);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_relocate_syms_undefined_weak_zeroes)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx = set_elf_sym(symtab_section, 0, 0,
+                        ELFW(ST_INFO)(STB_WEAK, STT_FUNC),
+                        0, SHN_UNDEF, "weak_undef");
+
+  relocate_syms(tcc_state, symtab_section, 0);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx].st_value, (addr_t)0);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_resolve_common_syms_allocates_in_bss)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx = set_elf_sym(symtab_section, 8, 16,
+                        ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                        0, SHN_COMMON, "common_var");
+
+  resolve_common_syms(tcc_state);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  UT_ASSERT_EQ(syms[idx].st_shndx, bss_section->sh_num);
+  UT_ASSERT_EQ(syms[idx].st_value, (addr_t)0);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * GOT filling
+ * ============================================================================ */
+
+UT_TEST(test_fill_got_entry_writes_symbol_value)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  Section *got = new_section(tcc_state, ".got", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
+  tcc_state->got = got;
+
+  int idx = set_elf_sym(symtab_section, 0xdeadbeef, 4,
+                        ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                        0, text_section->sh_num, "got_var");
+
+  struct sym_attr *attr = get_sym_attr(tcc_state, idx, 1);
+  attr->got_offset = 4;
+
+  ElfW_Rel rel;
+  rel.r_offset = 0;
+  rel.r_info = ELFW(R_INFO)(idx, R_DATA_PTR);
+
+  fill_got_entry(tcc_state, &rel);
+
+  UT_ASSERT_EQ(read32le(got->data + 4), 0xdeadbeefu);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * ELF object type detection
+ * ============================================================================ */
+
+UT_TEST(test_tcc_object_type_detects_rel_elf)
+{
+  unsigned char ehdr[52] = {0};
+  ElfW(Ehdr) h;
+  char path[64];
+  int fd, type;
+
+  ehdr[0] = ELFMAG0;
+  ehdr[1] = ELFMAG1;
+  ehdr[2] = ELFMAG2;
+  ehdr[3] = ELFMAG3;
+  ehdr[4] = ELFCLASS32;
+  ehdr[5] = ELFDATA2LSB;
+  ehdr[6] = EV_CURRENT;
+  ehdr[16] = ET_REL & 0xff;
+  ehdr[17] = (ET_REL >> 8) & 0xff;
+  ehdr[18] = EM_ARM & 0xff;
+  ehdr[19] = (EM_ARM >> 8) & 0xff;
+  ehdr[20] = EV_CURRENT & 0xff;
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_obj_", ehdr, sizeof(ehdr), path, sizeof(path)) == 0);
+
+  fd = open(path, O_RDONLY | O_BINARY);
+  UT_ASSERT(fd >= 0);
+  type = tcc_object_type(fd, &h);
+  close(fd);
+  unlink(path);
+
+  UT_ASSERT_EQ(type, AFF_BINTYPE_REL);
+  UT_ASSERT_EQ(h.e_type, ET_REL);
+
+  return 0;
+}
+
+UT_TEST(test_tcc_object_type_unrecognized_returns_zero)
+{
+  unsigned char garbage[] = "not an elf or archive";
+  char path[64];
+  int fd, type;
+  ElfW(Ehdr) h;
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_bad_", garbage, sizeof(garbage), path, sizeof(path)) == 0);
+
+  fd = open(path, O_RDONLY | O_BINARY);
+  UT_ASSERT(fd >= 0);
+  type = tcc_object_type(fd, &h);
+  close(fd);
+  unlink(path);
+
+  UT_ASSERT_EQ(type, 0);
+
+  return 0;
+}
+
+UT_TEST(test_full_read_loads_exact_bytes)
+{
+  unsigned char data[] = "hello";
+  char path[64];
+  int fd;
+  char buf[8] = {0};
+  ssize_t n;
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_full_", data, sizeof(data), path, sizeof(path)) == 0);
+
+  fd = open(path, O_RDONLY | O_BINARY);
+  UT_ASSERT(fd >= 0);
+  n = full_read(fd, buf, sizeof(data));
+  close(fd);
+  unlink(path);
+
+  UT_ASSERT_EQ(n, (ssize_t)sizeof(data));
+  UT_ASSERT_STREQ(buf, "hello");
+
+  return 0;
+}
+
+UT_TEST(test_load_data_reads_from_offset)
+{
+  unsigned char data[] = "hello world";
+  char path[64];
+  int fd;
+  unsigned char *p;
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_ld_", data, sizeof(data), path, sizeof(path)) == 0);
+
+  fd = open(path, O_RDONLY | O_BINARY);
+  UT_ASSERT(fd >= 0);
+  p = (unsigned char *)load_data(fd, 6, 5);
+  close(fd);
+  unlink(path);
+
+  UT_ASSERT(memcmp(p, "world", 5) == 0);
+  tcc_free(p);
+
+  return 0;
+}
+
+/* ============================================================================
+ * Standard linker symbols
+ * ============================================================================ */
+
+UT_TEST(test_ld_export_standard_symbols_exports_section_boundaries)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  text_section->sh_addr = 0x1000;
+  text_section->sh_size = 0x100;
+  data_section->sh_addr = 0x2000;
+  data_section->sh_size = 0x80;
+  bss_section->sh_addr = 0x3000;
+  bss_section->sh_size = 0x40;
+
+  ld_export_standard_symbols(tcc_state);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  int idx_text_start = find_elf_sym(symtab_section, "__text_start__");
+  int idx_text_end = find_elf_sym(symtab_section, "__text_end__");
+  int idx_data_start = find_elf_sym(symtab_section, "__data_start__");
+  int idx_edata = find_elf_sym(symtab_section, "_edata");
+  int idx_bss_start = find_elf_sym(symtab_section, "__bss_start__");
+  int idx_bss_end = find_elf_sym(symtab_section, "__bss_end__");
+  int idx_end = find_elf_sym(symtab_section, "_end");
+
+  UT_ASSERT(idx_text_start != 0);
+  UT_ASSERT(idx_text_end != 0);
+  UT_ASSERT(idx_data_start != 0);
+  UT_ASSERT(idx_edata != 0);
+  UT_ASSERT(idx_bss_start != 0);
+  UT_ASSERT(idx_bss_end != 0);
+  UT_ASSERT(idx_end != 0);
+
+  UT_ASSERT_EQ(syms[idx_text_start].st_value, (addr_t)0x1000);
+  UT_ASSERT_EQ(syms[idx_text_end].st_value, (addr_t)0x1100);
+  UT_ASSERT_EQ(syms[idx_data_start].st_value, (addr_t)0x2000);
+  UT_ASSERT_EQ(syms[idx_edata].st_value, (addr_t)0x2080);
+  UT_ASSERT_EQ(syms[idx_bss_start].st_value, (addr_t)0x3000);
+  UT_ASSERT_EQ(syms[idx_bss_end].st_value, (addr_t)0x3040);
+  UT_ASSERT_EQ(syms[idx_end].st_value, (addr_t)0x3040);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * File helpers
+ * ============================================================================ */
+
+UT_TEST(test_full_read_returns_error_on_bad_fd)
+{
+  char buf[4];
+  ssize_t n = full_read(-1, buf, sizeof(buf));
+  UT_ASSERT(n < 0);
+  return 0;
+}
+
+/* ============================================================================
+ * ELF object type detection (remaining branches)
+ * ============================================================================ */
+
+UT_TEST(test_tcc_object_type_detects_dyn_elf)
+{
+  unsigned char ehdr[52] = {0};
+  ElfW(Ehdr) h;
+  char path[64];
+  int fd, type;
+
+  ehdr[0] = ELFMAG0;
+  ehdr[1] = ELFMAG1;
+  ehdr[2] = ELFMAG2;
+  ehdr[3] = ELFMAG3;
+  ehdr[4] = ELFCLASS32;
+  ehdr[5] = ELFDATA2LSB;
+  ehdr[6] = EV_CURRENT;
+  ehdr[16] = ET_DYN & 0xff;
+  ehdr[17] = (ET_DYN >> 8) & 0xff;
+  ehdr[18] = EM_ARM & 0xff;
+  ehdr[19] = (EM_ARM >> 8) & 0xff;
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_dyn_", ehdr, sizeof(ehdr), path, sizeof(path)) == 0);
+  fd = open(path, O_RDONLY | O_BINARY);
+  UT_ASSERT(fd >= 0);
+  type = tcc_object_type(fd, &h);
+  close(fd);
+  unlink(path);
+
+  UT_ASSERT_EQ(type, AFF_BINTYPE_DYN);
+  UT_ASSERT_EQ(h.e_type, ET_DYN);
+  return 0;
+}
+
+UT_TEST(test_tcc_object_type_detects_archive)
+{
+  unsigned char ar[] = "!<arch>\nrest...";
+  ElfW(Ehdr) h;
+  char path[64];
+  int fd, type;
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_ar_", ar, sizeof(ar), path, sizeof(path)) == 0);
+  fd = open(path, O_RDONLY | O_BINARY);
+  UT_ASSERT(fd >= 0);
+  type = tcc_object_type(fd, &h);
+  close(fd);
+  unlink(path);
+
+  UT_ASSERT_EQ(type, AFF_BINTYPE_AR);
+  return 0;
+}
+
+UT_TEST(test_tcc_object_type_detects_yaff)
+{
+  unsigned char yaff[] = "YAFFpayload";
+  ElfW(Ehdr) h;
+  char path[64];
+  int fd, type;
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_yaff_", yaff, sizeof(yaff), path, sizeof(path)) == 0);
+  fd = open(path, O_RDONLY | O_BINARY);
+  UT_ASSERT(fd >= 0);
+  type = tcc_object_type(fd, &h);
+  close(fd);
+  unlink(path);
+
+  UT_ASSERT_EQ(type, AFF_BINTYPE_YAFF);
+  return 0;
+}
+
+/* ============================================================================
+ * Symbol relocation (remaining branches)
+ * ============================================================================ */
+
+UT_TEST(test_relocate_syms_skips_undef_when_resolving_dynsym)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  set_elf_sym(symtab_section, 0, 0,
+              ELFW(ST_INFO)(STB_GLOBAL, STT_FUNC),
+              0, SHN_UNDEF, "dynskip");
+
+  /* do_resolve == 2 is used for dynsym relocation: undefined symbols are
+   * left untouched rather than reported. */
+  relocate_syms(tcc_state, symtab_section, 2);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  int idx = find_elf_sym(symtab_section, "dynskip");
+  UT_ASSERT(idx != 0);
+  UT_ASSERT_EQ(syms[idx].st_shndx, SHN_UNDEF);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_relocate_syms_rejects_invalid_st_name)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  int idx = put_elf_sym(symtab_section, 0, 0,
+                        ELFW(ST_INFO)(STB_GLOBAL, STT_FUNC),
+                        0, SHN_UNDEF, "badname");
+  /* Corrupt the string-table offset so the name validation fires. */
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  syms[idx].st_name = (unsigned)-1;
+
+  /* Should report an internal error and continue without crashing. */
+  relocate_syms(tcc_state, symtab_section, 0);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_relocate_syms_accepts_fp_hw_undefined)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  set_elf_sym(symtab_section, 0, 0,
+              ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+              0, SHN_UNDEF, "_fp_hw");
+
+  /* _fp_hw is accepted as undefined by ABI convention without error. */
+  relocate_syms(tcc_state, symtab_section, 0);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  int idx = find_elf_sym(symtab_section, "_fp_hw");
+  UT_ASSERT(idx != 0);
+  UT_ASSERT_EQ(syms[idx].st_shndx, SHN_UNDEF);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_relocate_syms_reports_undefined_non_weak)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  set_elf_sym(symtab_section, 0, 0,
+              ELFW(ST_INFO)(STB_GLOBAL, STT_FUNC),
+              0, SHN_UNDEF, "missing_fn");
+
+  /* Non-weak undefined symbols are reported via tcc_error_noabort. */
+  relocate_syms(tcc_state, symtab_section, 0);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * Lazy section materialization (remaining branches)
+ * ============================================================================ */
+
+UT_TEST(test_section_ensure_loaded_materializes_lazy_section)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *sec = new_section(tcc_state, ".lazyload", SHT_PROGBITS, SHF_ALLOC);
+  unsigned char payload[] = {0x55, 0x66, 0x77, 0x88};
+  char path[64];
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_ensure_", payload, sizeof(payload), path, sizeof(path)) == 0);
+
+  DeferredChunk *chunk = (DeferredChunk *)tcc_mallocz(sizeof(DeferredChunk));
+  chunk->source_path = tcc_strdup(path);
+  chunk->size = sizeof(payload);
+  sec->deferred_head = chunk;
+  sec->deferred_tail = chunk;
+  sec->lazy = 1;
+  sec->has_deferred_chunks = 1;
+  sec->data_offset = sizeof(payload);
+
+  section_ensure_loaded(tcc_state, sec);
+
+  UT_ASSERT(sec->materialized);
+  UT_ASSERT(!sec->lazy);
+  UT_ASSERT(memcmp(sec->data, payload, sizeof(payload)) == 0);
+
+  unlink(path);
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_section_materialize_skips_already_materialized)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *sec = new_section(tcc_state, ".mat2", SHT_PROGBITS, SHF_ALLOC);
+  unsigned char payload[] = {0x11, 0x22, 0x33, 0x44};
+  char path[64];
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_mat2_", payload, sizeof(payload), path, sizeof(path)) == 0);
+
+  DeferredChunk *chunk = (DeferredChunk *)tcc_mallocz(sizeof(DeferredChunk));
+  chunk->source_path = tcc_strdup(path);
+  chunk->size = sizeof(payload);
+  sec->deferred_head = chunk;
+  sec->deferred_tail = chunk;
+  sec->lazy = 1;
+  sec->has_deferred_chunks = 1;
+  sec->data_offset = sizeof(payload);
+
+  section_materialize(tcc_state, sec);
+  UT_ASSERT(sec->materialized);
+
+  /* Second call should be a no-op and not re-read or crash. */
+  section_materialize(tcc_state, sec);
+  UT_ASSERT(sec->materialized);
+  UT_ASSERT(memcmp(sec->data, payload, sizeof(payload)) == 0);
+
+  unlink(path);
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_section_materialize_skips_materialized_chunk)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *sec = new_section(tcc_state, ".mat3", SHT_PROGBITS, SHF_ALLOC);
+  unsigned char payload[] = {0x11};
+  char path[64];
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_mat3_", payload, sizeof(payload), path, sizeof(path)) == 0);
+
+  DeferredChunk *chunk = (DeferredChunk *)tcc_mallocz(sizeof(DeferredChunk));
+  chunk->source_path = tcc_strdup(path);
+  chunk->size = sizeof(payload);
+  chunk->materialized = 1;
+  sec->deferred_head = chunk;
+  sec->deferred_tail = chunk;
+  sec->lazy = 1;
+  sec->has_deferred_chunks = 1;
+  sec->data_offset = sizeof(payload);
+
+  section_materialize(tcc_state, sec);
+
+  UT_ASSERT(sec->materialized);
+
+  unlink(path);
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_section_materialize_handles_open_failure)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *sec = new_section(tcc_state, ".badpath", SHT_PROGBITS, SHF_ALLOC);
+
+  DeferredChunk *chunk = (DeferredChunk *)tcc_mallocz(sizeof(DeferredChunk));
+  chunk->source_path = tcc_strdup("/nonexistent/tccelf_ut_path");
+  chunk->size = 4;
+  sec->deferred_head = chunk;
+  sec->deferred_tail = chunk;
+  sec->lazy = 1;
+  sec->has_deferred_chunks = 1;
+  sec->data_offset = 4;
+
+  /* Should report the error and still mark the section materialized. */
+  section_materialize(tcc_state, sec);
+  UT_ASSERT(sec->materialized);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_section_materialize_handles_short_read)
+{
+  ut_elf_reset_state();
+  ut_elf_init_minimal();
+
+  Section *sec = new_section(tcc_state, ".shortread", SHT_PROGBITS, SHF_ALLOC);
+  unsigned char one = 0xab;
+  char path[64];
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_short_", &one, 1, path, sizeof(path)) == 0);
+
+  DeferredChunk *chunk = (DeferredChunk *)tcc_mallocz(sizeof(DeferredChunk));
+  chunk->source_path = tcc_strdup(path);
+  chunk->size = 4; /* larger than the 1-byte file */
+  sec->deferred_head = chunk;
+  sec->deferred_tail = chunk;
+  sec->lazy = 1;
+  sec->has_deferred_chunks = 1;
+  sec->data_offset = 4;
+
+  /* Should report the short read and still finish materialization. */
+  section_materialize(tcc_state, sec);
+  UT_ASSERT(sec->materialized);
+
+  unlink(path);
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * Section lifecycle
+ * ============================================================================ */
+
+UT_TEST(test_free_section_null_is_safe)
+{
+  free_section(NULL);
+  return 0;
+}
+
+/* ============================================================================
+ * Linker symbols and common-symbol resolution
+ * ============================================================================ */
+
+UT_TEST(test_ld_export_standard_symbols_updates_existing)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  text_section->sh_addr = 0x1000;
+  text_section->sh_size = 0x100;
+  data_section->sh_addr = 0x2000;
+  data_section->sh_size = 0x80;
+  bss_section->sh_addr = 0x3000;
+  bss_section->sh_size = 0x40;
+
+  /* First call creates the standard symbols. */
+  ld_export_standard_symbols(tcc_state);
+
+  /* Mutate addresses and call again; set_or_update_global_sym should update
+   * the existing defined symbols instead of trying to redefine them. */
+  text_section->sh_addr = 0x4000;
+  text_section->sh_size = 0x200;
+  data_section->sh_addr = 0x5000;
+  data_section->sh_size = 0x100;
+  bss_section->sh_addr = 0x6000;
+  bss_section->sh_size = 0x80;
+
+  ld_export_standard_symbols(tcc_state);
+
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  int idx_text_end = find_elf_sym(symtab_section, "__text_end__");
+  int idx_data_end = find_elf_sym(symtab_section, "_edata");
+  int idx_bss_end = find_elf_sym(symtab_section, "__bss_end__");
+
+  UT_ASSERT_EQ(syms[idx_text_end].st_value, (addr_t)0x4200);
+  UT_ASSERT_EQ(syms[idx_data_end].st_value, (addr_t)0x5100);
+  UT_ASSERT_EQ(syms[idx_bss_end].st_value, (addr_t)0x6080);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_resolve_common_syms_with_init_array_section)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  Section *init = new_section(tcc_state, ".init_array", SHT_PROGBITS, SHF_ALLOC);
+  section_ptr_add(init, 8);
+
+  set_elf_sym(symtab_section, 4, 16,
+              ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+              0, SHN_COMMON, "common_var");
+
+  resolve_common_syms(tcc_state);
+
+  /* add_init_array_defines should use the real section and its data_offset. */
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+  int idx_start = find_elf_sym(symtab_section, "__init_array_start");
+  int idx_end = find_elf_sym(symtab_section, "__init_array_end");
+
+  UT_ASSERT(idx_start != 0);
+  UT_ASSERT(idx_end != 0);
+  UT_ASSERT_EQ(syms[idx_end].st_value, (addr_t)8);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_tcc_add_linker_symbols_skips_non_c_id_sections)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  /* .text.foo has a dot inside the name (after the leading dot), so it is not
+   * a valid C identifier and tcc_add_linker_symbols must skip it. */
+  Section *s = new_section(tcc_state, ".text.foo", SHT_PROGBITS, SHF_ALLOC);
+  section_ptr_add(s, 4);
+
+  resolve_common_syms(tcc_state);
+
+  int idx_start = find_elf_sym(symtab_section, "__start_text_foo");
+  int idx_stop = find_elf_sym(symtab_section, "__stop_text_foo");
+
+  UT_ASSERT_EQ(idx_start, 0);
+  UT_ASSERT_EQ(idx_stop, 0);
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_rebuild_hash_handles_local_symbols)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  /* Add one local symbol before the global flood so rebuild_hash has to
+   * process a local entry in the chain table. */
+  put_elf_sym(symtab_section, 0, 1,
+              ELFW(ST_INFO)(STB_LOCAL, STT_OBJECT),
+              0, text_section->sh_num, "local_first");
+
+  char name[32];
+  for (int i = 0; i < 1100; i++)
+  {
+    snprintf(name, sizeof(name), "rebuild_global_%04d", i);
+    put_elf_sym(symtab_section, i, 1,
+                ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT),
+                0, text_section->sh_num, name);
+  }
+
+  /* Every global must still be findable. */
+  for (int i = 0; i < 1100; i++)
+  {
+    snprintf(name, sizeof(name), "rebuild_global_%04d", i);
+    int idx = find_elf_sym(symtab_section, name);
+    UT_ASSERT(idx != 0);
+  }
+
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+/* ============================================================================
+ * Lazy object-file loading and GC
+ * ============================================================================ */
+
+/* Build a tiny little-endian ARM ELF relocatable object with one allocated
+ * PROGBITS section (.text) and one STB_GLOBAL symbol named `sym_name` bound
+ * to it.  The file is written to `path_out` and its file descriptor is
+ * returned open for reading. */
+static int ut_make_minimal_elf_o(const char *sym_name, char *path_out, size_t path_size)
+{
+  unsigned char ehdr[52] = {0};
+  unsigned char shdr[40 * 4] = {0}; /* 4 sections */
+  unsigned char strtab[64] = {0};
+  unsigned char symtab[2 * 16] = {0}; /* null + one symbol */
+  unsigned char text[4] = {0x00, 0x00, 0x00, 0x00};
+  int fd;
+
+  ehdr[0] = ELFMAG0;
+  ehdr[1] = ELFMAG1;
+  ehdr[2] = ELFMAG2;
+  ehdr[3] = ELFMAG3;
+  ehdr[4] = ELFCLASS32;
+  ehdr[5] = ELFDATA2LSB;
+  ehdr[6] = EV_CURRENT;
+  ehdr[16] = ET_REL & 0xff;
+  ehdr[17] = (ET_REL >> 8) & 0xff;
+  ehdr[18] = EM_ARM & 0xff;
+  ehdr[19] = (EM_ARM >> 8) & 0xff;
+  ehdr[20] = EV_CURRENT & 0xff;
+  ehdr[32] = 52 & 0xff;        /* e_shoff */
+  ehdr[33] = (52 >> 8) & 0xff;
+  ehdr[34] = (52 >> 16) & 0xff;
+  ehdr[35] = (52 >> 24) & 0xff;
+  ehdr[40] = 52 & 0xff;        /* e_ehsize */
+  ehdr[41] = (52 >> 8) & 0xff;
+  /* ELF32 field offsets: e_shentsize=46, e_shnum=48, e_shstrndx=50
+     (42/44 are e_phentsize/e_phnum, which stay zero). */
+  ehdr[46] = 40 & 0xff;        /* e_shentsize */
+  ehdr[47] = (40 >> 8) & 0xff;
+  ehdr[48] = 4 & 0xff;         /* e_shnum */
+  ehdr[49] = (4 >> 8) & 0xff;
+  ehdr[50] = 3 & 0xff;         /* e_shstrndx */
+  ehdr[51] = (3 >> 8) & 0xff;
+
+  /* Section header 0 is null. */
+
+  /* .text section header (index 1) */
+  shdr[1 * 40 + 0] = 11;              /* sh_name offset in strtab */
+  shdr[1 * 40 + 4] = SHT_PROGBITS;    /* sh_type */
+  shdr[1 * 40 + 8] = SHF_ALLOC | SHF_EXECINSTR; /* sh_flags */
+  shdr[1 * 40 + 16] = 52 + 40 * 4;    /* sh_offset */
+  shdr[1 * 40 + 20] = sizeof(text);   /* sh_size */
+  shdr[1 * 40 + 32] = 1;              /* sh_addralign */
+
+  /* .symtab section header (index 2) */
+  shdr[2 * 40 + 0] = 1;               /* sh_name offset in strtab (".symtab") */
+  shdr[2 * 40 + 4] = SHT_SYMTAB;      /* sh_type */
+  shdr[2 * 40 + 16] = 52 + 40 * 4 + sizeof(text); /* sh_offset */
+  shdr[2 * 40 + 20] = sizeof(symtab); /* sh_size */
+  shdr[2 * 40 + 24] = 3;              /* sh_link -> strtab */
+  shdr[2 * 40 + 36] = 16;             /* sh_entsize */
+
+  /* .shstrtab section header (index 3) */
+  shdr[3 * 40 + 0] = 17;              /* sh_name offset */
+  shdr[3 * 40 + 4] = SHT_STRTAB;      /* sh_type */
+  shdr[3 * 40 + 16] = 52 + 40 * 4 + sizeof(text) + sizeof(symtab);
+  shdr[3 * 40 + 20] = sizeof(strtab);
+
+  /* String table: 0="", 1=".symtab", 9=".text", 17=".shstrtab", 28=sym_name */
+  memcpy(strtab + 1, ".symtab", 8);
+  memcpy(strtab + 9, ".text", 6);
+  memcpy(strtab + 17, ".shstrtab", 10);
+  memcpy(strtab + 28, sym_name, strlen(sym_name) + 1);
+
+  /* Symbol table: null symbol + global defined symbol in .text */
+  /* Symbol 1 at offset 16 */
+  symtab[16 + 0] = 28 & 0xff;         /* st_name */
+  symtab[16 + 1] = (28 >> 8) & 0xff;
+  symtab[16 + 4] = 0;                 /* st_value */
+  symtab[16 + 8] = sizeof(text) & 0xff; /* st_size */
+  symtab[16 + 12] = ELFW(ST_INFO)(STB_GLOBAL, STT_FUNC); /* st_info */
+  symtab[16 + 14] = 1 & 0xff;         /* st_shndx */
+  symtab[16 + 15] = (1 >> 8) & 0xff;
+
+  /* Assemble the full file so the ehdr is not overwritten by later writes. */
+  unsigned char file[512] = {0};
+  size_t off = 0;
+  memcpy(file + off, ehdr, sizeof(ehdr));
+  off += sizeof(ehdr);
+  memcpy(file + off, shdr, sizeof(shdr));
+  off += sizeof(shdr);
+  memcpy(file + off, text, sizeof(text));
+  off += sizeof(text);
+  memcpy(file + off, symtab, sizeof(symtab));
+  off += sizeof(symtab);
+  memcpy(file + off, strtab, sizeof(strtab));
+  off += sizeof(strtab);
+
+  UT_ASSERT(ut_make_temp_file("tccelf_ut_elfo_", file, off, path_out, path_size) == 0);
+  fd = open(path_out, O_RDONLY | O_BINARY);
+  UT_ASSERT(fd >= 0);
+  return fd;
+}
+
+UT_TEST(test_tcc_load_object_file_lazy_loads_symbols)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  char path[64];
+  int fd = ut_make_minimal_elf_o("lazy_sym", path, sizeof(path));
+
+  int rc = tcc_load_object_file_lazy(tcc_state, fd, 0);
+  close(fd);
+  unlink(path);
+
+  UT_ASSERT_EQ(rc, 0);
+  UT_ASSERT_EQ(tcc_state->nb_lazy_objfiles, 1);
+
+  int idx = find_elf_sym(symtab_section, "lazy_sym");
+  UT_ASSERT(idx != 0);
+
+  tcc_free_lazy_objfiles(tcc_state);
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_tcc_gc_mark_and_load_referenced_sections)
+{
+  ut_elf_reset_state();
+  tccelf_new(tcc_state);
+
+  char path[64];
+  int fd = ut_make_minimal_elf_o("main", path, sizeof(path));
+
+  int rc = tcc_load_object_file_lazy(tcc_state, fd, 0);
+  close(fd);
+  unlink(path);
+
+  UT_ASSERT_EQ(rc, 0);
+
+  tcc_state->gc_sections_aggressive = 1;
+  tcc_gc_mark_phase(tcc_state);
+  tcc_load_referenced_sections(tcc_state);
+
+  LazyObjectFile *obj = tcc_state->lazy_objfiles[0];
+  UT_ASSERT(obj->sections[1].referenced);
+  UT_ASSERT(obj->sections[1].section != NULL);
+  UT_ASSERT_EQ(obj->sections[1].section->data_offset, 4);
+
+  tcc_free_lazy_objfiles(tcc_state);
+  tccelf_delete(tcc_state);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(tccelf)
 {
+  /* Lazy section materialization */
+  UT_RUN(test_section_materialize_loads_deferred_chunk);
+  UT_RUN(test_section_ensure_loaded_frees_discarded_chunks);
+  UT_RUN(test_apply_reloc_patches_during_materialize);
+
+  /* Symbol relocation */
+  UT_RUN(test_relocate_syms_adds_section_base);
+  UT_RUN(test_relocate_syms_undefined_weak_zeroes);
+  UT_RUN(test_resolve_common_syms_allocates_in_bss);
+
+  /* GOT filling */
+  UT_RUN(test_fill_got_entry_writes_symbol_value);
+
+  /* ELF object type detection */
+  UT_RUN(test_tcc_object_type_detects_rel_elf);
+  UT_RUN(test_tcc_object_type_unrecognized_returns_zero);
+  UT_RUN(test_full_read_loads_exact_bytes);
+  UT_RUN(test_load_data_reads_from_offset);
+
+  /* Standard linker symbols */
+  UT_RUN(test_ld_export_standard_symbols_exports_section_boundaries);
+
   /* Section creation and lookup */
   UT_RUN(test_new_section_creates_named_typed_section);
   UT_RUN(test_new_section_private_goes_to_priv_sections);
@@ -1492,4 +2506,38 @@ UT_SUITE(tccelf)
   /* Bound checking helper */
   UT_RUN(test_tcc_add_bcheck_noop_when_bounds_disabled);
   UT_RUN(test_tcc_add_bcheck_adds_when_bounds_enabled);
+
+  /* File helpers */
+  UT_RUN(test_full_read_returns_error_on_bad_fd);
+
+  /* ELF object type detection (remaining branches) */
+  UT_RUN(test_tcc_object_type_detects_dyn_elf);
+  UT_RUN(test_tcc_object_type_detects_archive);
+  UT_RUN(test_tcc_object_type_detects_yaff);
+
+  /* Symbol relocation (remaining branches) */
+  UT_RUN(test_relocate_syms_skips_undef_when_resolving_dynsym);
+  UT_RUN(test_relocate_syms_rejects_invalid_st_name);
+  UT_RUN(test_relocate_syms_accepts_fp_hw_undefined);
+  UT_RUN(test_relocate_syms_reports_undefined_non_weak);
+
+  /* Lazy section materialization (remaining branches) */
+  UT_RUN(test_section_ensure_loaded_materializes_lazy_section);
+  UT_RUN(test_section_materialize_skips_already_materialized);
+  UT_RUN(test_section_materialize_skips_materialized_chunk);
+  UT_RUN(test_section_materialize_handles_open_failure);
+  UT_RUN(test_section_materialize_handles_short_read);
+
+  /* Section lifecycle */
+  UT_RUN(test_free_section_null_is_safe);
+
+  /* Linker symbols and common-symbol resolution */
+  UT_RUN(test_ld_export_standard_symbols_updates_existing);
+  UT_RUN(test_resolve_common_syms_with_init_array_section);
+  UT_RUN(test_tcc_add_linker_symbols_skips_non_c_id_sections);
+  UT_RUN(test_rebuild_hash_handles_local_symbols);
+
+  /* Lazy object-file loading and GC */
+  UT_RUN(test_tcc_load_object_file_lazy_loads_symbols);
+  UT_RUN(test_tcc_gc_mark_and_load_referenced_sections);
 }

@@ -2404,6 +2404,15 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
             if (a->reg_type != LS_REG_TYPE_INT) continue;
             if (a->end <= cur->end) continue;
             if (a->r0 < 0 || a->stack_location != 0) continue;
+            /* Never evict a loop-phi-locked interval: it holds a loop-carried
+             * value whose register is SHARED with a coalesce partner that stays
+             * live (see the loop-phi coalescing above and the identical guard in
+             * the single-register spill victim scan below).  Spilling it here
+             * frees a register the partner still occupies, so a later pair
+             * allocation would double-book it and clobber the loop-carried value
+             * (combo_num seed 84127: the g16 loop counter lost to a 64-bit OR's
+             * high half). */
+            if (a->loop_phi_locked) continue;
             int is_callee = 0;
             for (int ci = 0; ci < target->int_class.num_callee_saved; ci++) {
               if (target->int_class.callee_saved[ci] == a->r0) { is_callee = 1; break; }

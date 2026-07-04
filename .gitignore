@@ -119,6 +119,6 @@ __pycache__/
 *.pyc
 tests/fuzz/results/*
 tests/fuzz/fuzz_triage_repros/
-/tests/fuzz/.sweep_cache/
+tests/fuzz/.sweep_cache/
 tests/unit/arm/armv8m/build*
 

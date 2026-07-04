@@ -483,6 +483,16 @@ static int ssa_gen_cprop_copy_param(IRSSAOptCtx *ctx, int idx)
   if (copy_blk < 0 || copy_blk >= cfg->num_blocks)
     return 0;
 
+  /* When src is an address-taken VAR/PARAM its storage is aliasable: a store
+   * through a pointer that holds its address can rewrite its value without
+   * naming src_vr as a def (the redef scan below only catches direct writes
+   * to src_vr).  Forwarding src across such a store re-reads the clobbered
+   * memory at the use site — e.g. `T = u; *p = k; use(T)` with `p == &u`
+   * must not become `T = u; *p = k; use(u)` (combo seed 74935).  Flag it so
+   * the scan can bail on any intervening memory store. */
+  IRLiveInterval *src_li = tcc_ir_vreg_live_interval(ir, src_vr);
+  int src_addrtaken = (src_li && src_li->addrtaken);
+
   /* All uses must be in the same block as the copy, and after the copy. */
   int max_use_idx = idx;
   for (int u = 0; u < dvi->use_count; u++) {
@@ -517,6 +527,21 @@ static int ssa_gen_cprop_copy_param(IRSSAOptCtx *ctx, int idx)
     case TCCIR_OP_NL_SETJMP:
     case TCCIR_OP_NL_LONGJMP:
       return 0;
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+      /* A memory store through a pointer/deref (dest is_lval) or an indexed
+       * store can alias an address-taken src's storage — we have no alias
+       * analysis, so be conservative.  A plain `V <-- x [STORE]` to a vreg
+       * slot (is_lval=0) targets that variable's own slot, unreachable
+       * without a pointer, so it can't clobber a different src. */
+      if (src_addrtaken) {
+        IROperand kd = tcc_ir_op_get_dest(ir, kq);
+        if (kd.is_lval || kq->op == TCCIR_OP_STORE_INDEXED ||
+            kq->op == TCCIR_OP_STORE_POSTINC)
+          return 0;
+      }
+      break;
     default:
       break;
     }
@@ -688,6 +713,16 @@ static int ssa_gen_cprop_copy_var_stackoff(IRSSAOptCtx *ctx, int idx)
     }
   }
 
+  /* When V is address-taken its stack slot is aliasable: a store through a
+   * pointer holding &V rewrites V's value without naming src_vr as a def, so
+   * the redef scan below (which only catches direct writes to src_vr) misses
+   * it.  Forwarding V past such a store re-reads the clobbered slot at the use
+   * site — e.g. `T = u; *p = k; use(T)` with `p == &u` must not become
+   * `T = u; *p = k; use(u)` (combo seed 74935).  Flag it so the scan bails on
+   * any intervening memory store we cannot disambiguate. */
+  IRLiveInterval *src_li = tcc_ir_vreg_live_interval(ir, src_vr);
+  int src_addrtaken = (src_li && src_li->addrtaken);
+
   /* Bail on barriers (calls, asm, VLA, setjmp/longjmp) and on any
    * STORE/ASSIGN that writes V's slot between the copy and last use. */
   for (int k = idx + 1; k <= max_use_idx; k++) {
@@ -707,6 +742,20 @@ static int ssa_gen_cprop_copy_var_stackoff(IRSSAOptCtx *ctx, int idx)
     case TCCIR_OP_NL_SETJMP:
     case TCCIR_OP_NL_LONGJMP:
       return 0;
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+      /* A memory store through a pointer/deref (dest is_lval) or an indexed
+       * store can alias an address-taken V's slot; a plain `V2 <-- x [STORE]`
+       * to a vreg slot (is_lval=0) targets that variable's own slot, which is
+       * unreachable without a pointer and cannot clobber a different V. */
+      if (src_addrtaken) {
+        IROperand kd = tcc_ir_op_get_dest(ir, kq);
+        if (kd.is_lval || kq->op == TCCIR_OP_STORE_INDEXED ||
+            kq->op == TCCIR_OP_STORE_POSTINC)
+          return 0;
+      }
+      break;
     default:
       break;
     }

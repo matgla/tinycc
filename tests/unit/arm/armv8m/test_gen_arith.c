@@ -20,6 +20,13 @@
 #include "ir.h"
 #include "arch/arm/arm.h"
 #include "arch/arm/thumb/thumb.h"
+#include "arch/arm/thumb/thop_alu_reg.h"
+#include "arch/arm/thumb/thop_alu_imm.h"
+#include "arch/arm/thumb/thop_shift_reg.h"
+#include "arch/arm/thumb/thop_shift_imm.h"
+#include "arch/arm/thumb/thop_cmp.h"
+#include "arch/arm/thumb/thop_mov.h"
+#include "arch/arm/thumb/thop_mul.h"
 #include "ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
@@ -69,10 +76,35 @@ static MachineOperand mop_imm(int64_t val, int btype)
   return m;
 }
 
+static MachineOperand mop_none(void)
+{
+  MachineOperand m;
+  memset(&m, 0, sizeof(m));
+  m.kind = MACH_OP_NONE;
+  return m;
+}
+
 static uint16_t read_le16(const unsigned char *p)
 {
   return (uint16_t)(p[0] | (p[1] << 8));
 }
+
+/* Compare N bytes at offset off in cur_text_section against a single
+ * real-encoder opcode (2 or 4 bytes, little-endian halfword order). */
+static int bytes_match_opcode_at(int off, int n, thumb_opcode op)
+{
+  if (n != op.size)
+    return 0;
+  const unsigned char *d = cur_text_section->data + off;
+  if (op.size == 2)
+    return d[0] == (op.opcode & 0xff) && d[1] == ((op.opcode >> 8) & 0xff);
+  uint16_t hw0 = (uint16_t)(op.opcode >> 16);
+  uint16_t hw1 = (uint16_t)(op.opcode & 0xffff);
+  return d[0] == (hw0 & 0xff) && d[1] == ((hw0 >> 8) & 0xff) && d[2] == (hw1 & 0xff) &&
+         d[3] == ((hw1 >> 8) & 0xff);
+}
+
+#define bytes_match_opcode(n, op) bytes_match_opcode_at(0, n, op)
 
 /* ------------------------------------------------------------ data_processing_mop */
 
@@ -203,6 +235,91 @@ UT_TEST(test_dp_add_reg_imm_encoding_path)
 
   UT_ASSERT_EQ(ind, 2);
   UT_ASSERT_EQ(read_le16(cur_text_section->data), 0x1D48);
+
+  return 0;
+}
+
+UT_TEST(test_dp_ror_reg_reg_reg_t32)
+{
+  setup_gen();
+
+  /* ROR r0, r1, r2 -- T16 ROR-by-register requires rd==rn; rd(0)!=rn(1) so
+   * this falls to the T3 form. Cross-checked against th_ror_reg(0,1,2,...). */
+  tcc_gen_machine_data_processing_mop(mop_reg(R1, IROP_BTYPE_INT32), mop_reg(R2, IROP_BTYPE_INT32),
+                                      mop_reg(R0, IROP_BTYPE_INT32), TCCIR_OP_ROR, 0);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_ror_reg(R0, R1, R2, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                               THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_dp_ror_reg_reg_imm)
+{
+  setup_gen();
+
+  /* ROR r0, r1, #3 -- T16 only allows r0-r7 and imm==0 is RRX; here rd(0) is
+   * low but rn(1)!=rd, so the T1 form's constraint fails and it falls to T3. */
+  tcc_gen_machine_data_processing_mop(mop_reg(R1, IROP_BTYPE_INT32), mop_imm(3, IROP_BTYPE_INT32),
+                                      mop_reg(R0, IROP_BTYPE_INT32), TCCIR_OP_ROR, 0);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_ror_imm(R0, R1, 3, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                               ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_dp_adc_reg_reg_reg_t32)
+{
+  setup_gen();
+
+  /* ADC r0, r1, r2 -- T16 ADC requires rd==rn; rd(0)!=rn(1) falls to T3. */
+  tcc_gen_machine_data_processing_mop(mop_reg(R1, IROP_BTYPE_INT32), mop_reg(R2, IROP_BTYPE_INT32),
+                                      mop_reg(R0, IROP_BTYPE_INT32), TCCIR_OP_ADC_USE, 0);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_adc_reg(R0, R1, R2, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                               THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_dp_adc_reg_reg_imm)
+{
+  setup_gen();
+
+  /* ADC r0, r1, #7 -- falls to the T3 immediate ADC form. */
+  tcc_gen_machine_data_processing_mop(mop_reg(R1, IROP_BTYPE_INT32), mop_imm(7, IROP_BTYPE_INT32),
+                                      mop_reg(R0, IROP_BTYPE_INT32), TCCIR_OP_ADC_USE, 0);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_adc_imm(R0, R1, 7, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                               ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_dp_cmp_reg_reg_t16)
+{
+  setup_gen();
+
+  /* CMP r1, r2 -- CMP always sets flags; T1 CMP-reg works for low regs. */
+  tcc_gen_machine_data_processing_mop(mop_reg(R1, IROP_BTYPE_INT32), mop_reg(R2, IROP_BTYPE_INT32),
+                                      mop_none(), TCCIR_OP_CMP, 0);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_cmp_reg(R1, R1, R2, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                                               ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_dp_cmp_reg_imm_t16)
+{
+  setup_gen();
+
+  /* CMP r1, #5 -- T1 CMP-imm works for low regs and small imms. */
+  tcc_gen_machine_data_processing_mop(mop_reg(R1, IROP_BTYPE_INT32), mop_imm(5, IROP_BTYPE_INT32),
+                                      mop_none(), TCCIR_OP_CMP, 0);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_cmp_imm(R1, 5, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)));
 
   return 0;
 }
@@ -435,6 +552,190 @@ UT_TEST(test_cmp_eq64_reg_pairs)
   return 0;
 }
 
+/* ------------------------------------------------------------- subs_eq_select_01 */
+
+UT_TEST(test_subs_eq_select_01_emits_subs_it_movne)
+{
+  setup_gen();
+
+  /* SUBS-EQ-SELECT peephole: SUBS dest, src1, #K; IT NE; MOVNE dest, #1.
+   * Condition: src2 is a small inlineable immediate and SUBS encodes. */
+  int ok = tcc_gen_machine_subs_eq_select_01(mop_reg(R1, IROP_BTYPE_INT32), mop_imm(5, IROP_BTYPE_INT32),
+                                             mop_reg(R0, IROP_BTYPE_INT32));
+
+  UT_ASSERT_EQ(ok, 1);
+  UT_ASSERT_EQ(ind, 6);
+  /* SUBS r0, r1, #5 */
+  UT_ASSERT(bytes_match_opcode(2, th_sub_imm(R0, R1, 5, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)));
+  /* IT NE: cond=NE(1), mask=0x8 => 0xbf18 */
+  UT_ASSERT_EQ(read_le16(cur_text_section->data + 2), 0xbf18);
+  /* MOVNE r0, #1 (inside IT block, encoded as unconditional MOVS r0,#1) */
+  UT_ASSERT_EQ(read_le16(cur_text_section->data + 4), 0x2001);
+
+  return 0;
+}
+
+UT_TEST(test_subs_eq_select_01_rejects_non_imm)
+{
+  setup_gen();
+
+  int ok = tcc_gen_machine_subs_eq_select_01(mop_reg(R1, IROP_BTYPE_INT32), mop_reg(R2, IROP_BTYPE_INT32),
+                                             mop_reg(R0, IROP_BTYPE_INT32));
+
+  UT_ASSERT_EQ(ok, 0);
+  UT_ASSERT_EQ(ind, 0);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ mlal_accum_mop */
+
+UT_TEST(test_mlal_accum_signed_inplace_pair)
+{
+  setup_gen();
+
+  /* SMLAL {r1:r0}, r2, r3: dest==accum and both are 64-bit register pairs. */
+  MachineOperand src1 = mop_reg(R2, IROP_BTYPE_INT32);
+  MachineOperand src2 = mop_reg(R3, IROP_BTYPE_INT32);
+  MachineOperand accum = mop_reg64(R0, R1, IROP_BTYPE_INT32);
+  MachineOperand dest = mop_reg64(R0, R1, IROP_BTYPE_INT32);
+
+  int ok = tcc_gen_machine_mlal_accum_mop(src1, src2, accum, dest, /*is_signed=*/1);
+
+  UT_ASSERT_EQ(ok, 1);
+  UT_ASSERT(bytes_match_opcode(ind, th_smlal(R0, R1, R2, R3)));
+
+  return 0;
+}
+
+UT_TEST(test_mlal_accum_unsigned_inplace_pair)
+{
+  setup_gen();
+
+  /* UMLAL {r1:r0}, r2, r3. */
+  MachineOperand src1 = mop_reg(R2, IROP_BTYPE_INT32);
+  MachineOperand src2 = mop_reg(R3, IROP_BTYPE_INT32);
+  MachineOperand accum = mop_reg64(R0, R1, IROP_BTYPE_INT32);
+  MachineOperand dest = mop_reg64(R0, R1, IROP_BTYPE_INT32);
+
+  int ok = tcc_gen_machine_mlal_accum_mop(src1, src2, accum, dest, /*is_signed=*/0);
+
+  UT_ASSERT_EQ(ok, 1);
+  UT_ASSERT(bytes_match_opcode(ind, th_umlal(R0, R1, R2, R3)));
+
+  return 0;
+}
+
+UT_TEST(test_mlal_accum_rejects_mismatched_pair)
+{
+  setup_gen();
+
+  MachineOperand src1 = mop_reg(R2, IROP_BTYPE_INT32);
+  MachineOperand src2 = mop_reg(R3, IROP_BTYPE_INT32);
+  MachineOperand accum = mop_reg64(R0, R1, IROP_BTYPE_INT32);
+  MachineOperand dest = mop_reg64(R2, R3, IROP_BTYPE_INT32);
+
+  int ok = tcc_gen_machine_mlal_accum_mop(src1, src2, accum, dest, /*is_signed=*/1);
+
+  UT_ASSERT_EQ(ok, 0);
+  UT_ASSERT_EQ(ind, 0);
+
+  return 0;
+}
+
+/* ---------------------------------------------------------- mul_const_add_fused_mop */
+
+UT_TEST(test_mul_const_add_fused_pow2)
+{
+  setup_gen();
+
+  /* dest(r0) = base(r3) + var(r1) * 4  =>  ADD r0, r3, r1 LSL #2. */
+  int ok = tcc_gen_machine_mul_const_add_fused_mop(mop_reg(R1, IROP_BTYPE_INT32), 4,
+                                                   mop_none(), mop_reg(R3, IROP_BTYPE_INT32),
+                                                   mop_reg(R0, IROP_BTYPE_INT32));
+
+  UT_ASSERT_EQ(ok, 1);
+  UT_ASSERT_EQ(ind, 4);
+  thumb_shift lsl2 = {THUMB_SHIFT_LSL, 2, THUMB_SHIFT_IMMEDIATE};
+  UT_ASSERT(bytes_match_opcode(ind, th_add_reg(R0, R3, R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, lsl2,
+                                               ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_mul_const_add_fused_two_n_plus_1_shift)
+{
+  setup_gen();
+
+  /* 12 = (2^1+1)*2^2.
+   *   ADD tmp(r2), var(r1), var(r1) LSL #1
+   *   ADD dest(r0), base(r3), tmp(r2) LSL #2 */
+  int ok = tcc_gen_machine_mul_const_add_fused_mop(mop_reg(R1, IROP_BTYPE_INT32), 12,
+                                                   mop_none(), mop_reg(R3, IROP_BTYPE_INT32),
+                                                   mop_reg(R0, IROP_BTYPE_INT32));
+
+  UT_ASSERT_EQ(ok, 1);
+  UT_ASSERT_EQ(ind, 8);
+
+  /* mach_get_dest_reg(MACH_OP_NONE) returns R0 regardless of the exclusion
+   * mask, so the intermediate temp is R0 (same as the final destination). */
+  thumb_shift lsl1 = {THUMB_SHIFT_LSL, 1, THUMB_SHIFT_IMMEDIATE};
+  UT_ASSERT(bytes_match_opcode_at(0, 4, th_add_reg(R0, R1, R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, lsl1,
+                                                   ENFORCE_ENCODING_NONE)));
+
+  thumb_shift lsl2 = {THUMB_SHIFT_LSL, 2, THUMB_SHIFT_IMMEDIATE};
+  UT_ASSERT(bytes_match_opcode_at(4, 4, th_add_reg(R0, R3, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, lsl2,
+                                                   ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_mul_const_add_fused_two_n_minus_1_shift)
+{
+  setup_gen();
+
+  /* 28 = (2^3-1)*2^2.
+   *   LSL tmp(r2), var(r1), #3
+   *   SUB tmp(r2), tmp(r2), var(r1)
+   *   ADD dest(r0), base(r3), tmp(r2) LSL #2 */
+  int ok = tcc_gen_machine_mul_const_add_fused_mop(mop_reg(R1, IROP_BTYPE_INT32), 28,
+                                                   mop_none(), mop_reg(R3, IROP_BTYPE_INT32),
+                                                   mop_reg(R0, IROP_BTYPE_INT32));
+
+  UT_ASSERT_EQ(ok, 1);
+  UT_ASSERT_EQ(ind, 8);
+
+  /* Temp is R0 (see note above). SUB (register) with rd==rn and low regs
+   * encodes as a 16-bit T1 instruction. */
+  UT_ASSERT(bytes_match_opcode_at(0, 2, th_lsl_imm(R0, R1, 3, FLAGS_BEHAVIOUR_NOT_IMPORTANT,
+                                                   ENFORCE_ENCODING_NONE)));
+
+  thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
+  UT_ASSERT(bytes_match_opcode_at(2, 2, th_sub_reg(R0, R0, R1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift,
+                                                   ENFORCE_ENCODING_NONE)));
+
+  thumb_shift lsl2 = {THUMB_SHIFT_LSL, 2, THUMB_SHIFT_IMMEDIATE};
+  UT_ASSERT(bytes_match_opcode_at(4, 4, th_add_reg(R0, R3, R0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, lsl2,
+                                                   ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_mul_const_add_fused_non_fallthrough_const)
+{
+  setup_gen();
+
+  /* 7 is not a supported pattern, so the helper returns 0 and emits nothing. */
+  int ok = tcc_gen_machine_mul_const_add_fused_mop(mop_reg(R1, IROP_BTYPE_INT32), 7,
+                                                   mop_none(), mop_reg(R3, IROP_BTYPE_INT32),
+                                                   mop_reg(R0, IROP_BTYPE_INT32));
+
+  UT_ASSERT_EQ(ok, 0);
+  UT_ASSERT_EQ(ind, 0);
+
+  return 0;
+}
+
 /* ------------------------------------------------------------------------ suite */
 
 UT_SUITE(gen_arith)
@@ -448,6 +749,12 @@ UT_SUITE(gen_arith)
   UT_RUN(test_dp_sar_reg_reg_reg_t32);
   UT_RUN(test_dp_shr_reg_reg_reg_t32);
   UT_RUN(test_dp_add_reg_imm_encoding_path);
+  UT_RUN(test_dp_ror_reg_reg_reg_t32);
+  UT_RUN(test_dp_ror_reg_reg_imm);
+  UT_RUN(test_dp_adc_reg_reg_reg_t32);
+  UT_RUN(test_dp_adc_reg_reg_imm);
+  UT_RUN(test_dp_cmp_reg_reg_t16);
+  UT_RUN(test_dp_cmp_reg_imm_t16);
 
   /* data_processing_mop_flags */
   UT_RUN(test_dp_flags_ands_reg_reg_reg);
@@ -476,4 +783,19 @@ UT_SUITE(gen_arith)
 
   /* cmp_eq64_mop */
   UT_RUN(test_cmp_eq64_reg_pairs);
+
+  /* subs_eq_select_01 */
+  UT_RUN(test_subs_eq_select_01_emits_subs_it_movne);
+  UT_RUN(test_subs_eq_select_01_rejects_non_imm);
+
+  /* mlal_accum_mop */
+  UT_RUN(test_mlal_accum_signed_inplace_pair);
+  UT_RUN(test_mlal_accum_unsigned_inplace_pair);
+  UT_RUN(test_mlal_accum_rejects_mismatched_pair);
+
+  /* mul_const_add_fused_mop */
+  UT_RUN(test_mul_const_add_fused_pow2);
+  UT_RUN(test_mul_const_add_fused_two_n_plus_1_shift);
+  UT_RUN(test_mul_const_add_fused_two_n_minus_1_shift);
+  UT_RUN(test_mul_const_add_fused_non_fallthrough_const);
 }

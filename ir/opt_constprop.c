@@ -6260,6 +6260,26 @@ static int tcc_ir_opt_const_prop_tmp__timed(TCCIRState *ir)
 #undef TMP_CONST_STACK_N
 }
 
+/* True if `vreg` is a local VAR whose address is taken anywhere (it appears as
+ * a LEA src1).  Such a VAR is memory-resident and can be mutated behind the
+ * compiler's back by a store through an aliasing pointer, so its value at an
+ * arithmetic def does not necessarily still hold at a later use. */
+static int ir_reassoc_var_addr_taken(TCCIRState *ir, int32_t vreg)
+{
+  if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) != TCCIR_VREG_TYPE_VAR)
+    return 0;
+  int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_LEA)
+      continue;
+    if (irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg)
+      return 1;
+  }
+  return 0;
+}
+
 /* ADD/SUB Constant Reassociation
  *
  * Normalizes ADD/SUB chains with constant operands so that cascaded
@@ -6439,6 +6459,41 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
         }
       }
       if (redefined)
+        continue;
+    }
+
+    /* The linear def lookup that found def_idx only sees *explicit* defs of
+     * src1_vr; it is blind to a redefinition of an address-taken local's memory
+     * through an aliasing pointer store.  If src1_vr (whose def `src1_vr =
+     * def_src1 + eff_c1` we are about to forward) — or def_src1 itself — is such
+     * an address-taken VAR, an intervening STORE/CALL between def_idx and the
+     * use i may have silently changed it, so the `src1_vr == def_src1 + eff_c1`
+     * relation no longer holds and folding to `def_src1 + combined` would read a
+     * stale value.  (ptr fuzz seed 85636: `u4 = u3 + C; *p = ...; x = u4 + C2`
+     * with p == &u4 — the store redefines u4.)  Bail when a memory-clobbering op
+     * sits in the gap and either base is an aliasable address-taken VAR. */
+    {
+      int gap_clobbers_memory = 0;
+      for (int j = def_idx + 1; j < i && !gap_clobbers_memory; j++)
+      {
+        switch (ir->compact_instructions[j].op)
+        {
+        case TCCIR_OP_STORE:
+        case TCCIR_OP_STORE_INDEXED:
+        case TCCIR_OP_STORE_POSTINC:
+        case TCCIR_OP_BLOCK_COPY:
+        case TCCIR_OP_FUNCCALLVAL:
+        case TCCIR_OP_FUNCCALLVOID:
+        case TCCIR_OP_INLINE_ASM:
+          gap_clobbers_memory = 1;
+          break;
+        default:
+          break;
+        }
+      }
+      if (gap_clobbers_memory &&
+          (ir_reassoc_var_addr_taken(ir, src1_vr) ||
+           (inner_vr >= 0 && ir_reassoc_var_addr_taken(ir, inner_vr))))
         continue;
     }
 

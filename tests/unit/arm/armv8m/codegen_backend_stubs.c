@@ -27,19 +27,16 @@ Sym *sym_push(int v, CType *type, int r, int c)
   return NULL;
 }
 
-/* From tccgen.c. gsym() is only reached from
- * tcc_machine_load_jmp_result (a legacy VT_JMP helper with zero callers
- * anywhere in the product tree, confirmed by whole-tree grep) and vpop() only
- * from gen_vla_alloc()'s frontend-only VLA decl path (tccgen.c, never from
- * ir/codegen.c or any tcc_gen_machine_*_mop). Both are provably unreachable
- * from this harness; trap loudly rather than silently faking behavior, same
- * discipline as stubs.c's gv(). */
+/* From tccgen.c.  gsym() is reached from tcc_machine_load_jmp_result (a legacy
+ * VT_JMP helper with zero product callers, exercised by
+ * test_load_jmp_result_*).  Mirror the real tccgen.c gsym() exactly: t <= 0 is
+ * "no chain" and a no-op (the -1 = no chain / 0 = offset-0 sentinels), while a
+ * real chain (t > 0) backpatches via arm-thumb-gen.c's gsym_addr(), which is
+ * linked into this binary.  The test passes t == 0, so the no-op path runs. */
 void gsym(int t)
 {
-  (void)t;
-  fprintf(stderr, "[test stub] gsym: unexpectedly called (legacy VT_JMP path "
-                   "is not supported by this harness)\n");
-  abort();
+  if (t > 0)
+    gsym_addr(t, ind);
 }
 
 void vpop(void)

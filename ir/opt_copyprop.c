@@ -1567,10 +1567,25 @@ int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
     int is_store_like = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
                          q->op == TCCIR_OP_STORE_POSTINC);
     int32_t dest_vr_kill = -1;
+    int dest_aliases_mem = 0;
     if (irop_config[q->op].has_dest)
     {
       IROperand dest_op = tcc_ir_op_get_dest(ir, q);
       dest_vr_kill = irop_get_vreg(dest_op);
+      /* Writing an address-taken local VAR aliases any pointer deref of it:
+       * a cached `*p AND k` read (p == &var) taken *before* this write is now
+       * stale.  The dest_vr_kill match below only catches entries that name the
+       * VAR vreg directly, never a memory deref (`T***DEREF***`) that points at
+       * it, so an ASSIGN like `V3 <-- ...` (u4, whose &u4 escaped into a pointer)
+       * fails to invalidate a cached `*pa AND 31`.  Treat it as a memory write
+       * and flush lval-src entries, exactly as a STORE does (agg_deep O1
+       * wrong-code: the second `**ppa & 31` re-CSE'd to the pre-store value). */
+      if (dest_vr_kill >= 0)
+      {
+        IRLiveInterval *dintv = tcc_ir_vreg_live_interval(ir, dest_vr_kill);
+        if (dintv && dintv->addrtaken)
+          dest_aliases_mem = 1;
+      }
     }
     if (is_store_like || dest_vr_kill >= 0)
     {
@@ -1578,7 +1593,7 @@ int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
       for (int c = 0; c < cache_count; c++)
       {
         int kills = 0;
-        if (is_store_like && (cache[c].s1_lval || cache[c].s2_lval || cache[c].s3_lval))
+        if ((is_store_like || dest_aliases_mem) && (cache[c].s1_lval || cache[c].s2_lval || cache[c].s3_lval))
           kills = 1;
         if (dest_vr_kill >= 0)
         {

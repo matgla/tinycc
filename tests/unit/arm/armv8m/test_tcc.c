@@ -36,6 +36,8 @@ extern int tcc_add_file(TCCState *s, const char *filename);
 extern int tcc_group_has_satisfiable_undefs(TCCState *s1);
 extern int tcc_output_file(TCCState *s, const char *filename);
 
+
+
 /* Rename main() so the test harness keeps its own entry point. */
 #define main tcc_ut_main
 #include "tcc.c"
@@ -159,6 +161,34 @@ static int main_stub_allocated_state_nb_errors = 0;
 static struct filespec *main_stub_allocated_state_filespec = NULL;
 static int main_stub_allocated_state_output_type = 0;
 
+static int main_stub_allocated_state_just_deps = 0;
+static int main_stub_allocated_state_option_r = 0;
+static unsigned char main_stub_allocated_state_dflag = 0;
+static unsigned char main_stub_allocated_state_do_bench = 0;
+static int main_stub_allocated_state_run_test = 0;
+static char *main_stub_allocated_state_outfile = NULL;
+static char *main_stub_allocated_state_tcc_lib_path = NULL;
+static char **main_stub_allocated_state_sysinclude_paths = NULL;
+static int main_stub_allocated_state_nb_sysinclude_paths = 0;
+static char **main_stub_allocated_state_library_paths = NULL;
+static int main_stub_allocated_state_nb_library_paths = 0;
+static char **main_stub_allocated_state_crt_paths = NULL;
+static int main_stub_allocated_state_nb_crt_paths = 0;
+static struct filespec **main_stub_allocated_state_files = NULL;
+
+/* Controls for dependency-generation paths. */
+static unsigned char main_stub_allocated_state_gen_deps = 0;
+static unsigned char main_stub_allocated_state_gen_phony_deps = 0;
+static char **main_stub_allocated_state_target_deps = NULL;
+static int main_stub_allocated_state_nb_target_deps = 0;
+static char *main_stub_allocated_state_deps_outfile = NULL;
+
+/* Controls for group-rescan behaviour. */
+static int main_stub_group_has_satisfiable_undefs_ret = 0;
+static int main_stub_add_library_set_new_undef = 0;
+static int main_stub_add_library_set_group_rescan_loaded = 0;
+static int main_stub_add_library_call_count = 0;
+
 void tcc_set_realloc(void *(*my_realloc)(void *, unsigned long))
 {
   (void)my_realloc;
@@ -173,8 +203,28 @@ TCCState *tcc_new(void)
     s->nb_files = main_stub_allocated_state_nb_files;
     s->nb_libraries = main_stub_allocated_state_nb_libraries;
     s->nb_errors = main_stub_allocated_state_nb_errors;
-    s->files = &main_stub_allocated_state_filespec;
+    s->files = main_stub_allocated_state_files
+                   ? main_stub_allocated_state_files
+                   : &main_stub_allocated_state_filespec;
     s->output_type = main_stub_allocated_state_output_type;
+    s->outfile = main_stub_allocated_state_outfile;
+    s->dflag = main_stub_allocated_state_dflag;
+    s->do_bench = main_stub_allocated_state_do_bench;
+    s->run_test = main_stub_allocated_state_run_test;
+    s->just_deps = main_stub_allocated_state_just_deps;
+    s->option_r = main_stub_allocated_state_option_r;
+    s->sysinclude_paths = main_stub_allocated_state_sysinclude_paths;
+    s->nb_sysinclude_paths = main_stub_allocated_state_nb_sysinclude_paths;
+    s->library_paths = main_stub_allocated_state_library_paths;
+    s->nb_library_paths = main_stub_allocated_state_nb_library_paths;
+    s->crt_paths = main_stub_allocated_state_crt_paths;
+    s->nb_crt_paths = main_stub_allocated_state_nb_crt_paths;
+    s->tcc_lib_path = main_stub_allocated_state_tcc_lib_path;
+    s->gen_deps = main_stub_allocated_state_gen_deps;
+    s->gen_phony_deps = main_stub_allocated_state_gen_phony_deps;
+    s->target_deps = main_stub_allocated_state_target_deps;
+    s->nb_target_deps = main_stub_allocated_state_nb_target_deps;
+    s->deps_outfile = main_stub_allocated_state_deps_outfile;
   }
   return s;
 }
@@ -202,8 +252,12 @@ int tcc_set_output_type(TCCState *s, int output_type)
 
 int tcc_add_library(TCCState *s, const char *libraryname)
 {
-  (void)s;
   (void)libraryname;
+  main_stub_add_library_call_count++;
+  if (main_stub_add_library_set_new_undef && main_stub_add_library_call_count == 1)
+    s->new_undef_sym = 1;
+  if (main_stub_add_library_set_group_rescan_loaded && main_stub_add_library_call_count == 2)
+    s->group_rescan_loaded = 1;
   return 0;
 }
 
@@ -217,7 +271,7 @@ int tcc_add_file(TCCState *s, const char *filename)
 int tcc_group_has_satisfiable_undefs(TCCState *s1)
 {
   (void)s1;
-  return 0;
+  return main_stub_group_has_satisfiable_undefs_ret;
 }
 
 int tcc_output_file(TCCState *s, const char *filename)
@@ -225,6 +279,15 @@ int tcc_output_file(TCCState *s, const char *filename)
   (void)s;
   (void)filename;
   return 0;
+}
+
+static struct filespec *make_filespec(const char *name, int type)
+{
+  size_t n = strlen(name);
+  struct filespec *f = (struct filespec *)tcc_mallocz(sizeof(struct filespec) + n + 1);
+  f->type = type;
+  memcpy(f->name, name, n + 1);
+  return f;
 }
 
 /* ========================================================================
@@ -717,6 +780,654 @@ UT_TEST(test_default_outputfile_exe_overwrites_extension_with_a_out)
   return 0;
 }
 
+/* ========================================================================
+ * default_outputfile (additional branches)
+ * ======================================================================== */
+
+UT_TEST(test_default_outputfile_just_deps_changes_ext_to_o)
+{
+  TCCState s;
+  memset(&s, 0, sizeof(s));
+  s.output_type = TCC_OUTPUT_EXE;
+  s.just_deps = 1;
+
+  char *out = default_outputfile(&s, "source.c");
+  UT_ASSERT_STREQ(out, "source.o");
+  tcc_free(out);
+  return 0;
+}
+
+UT_TEST(test_default_outputfile_option_r_falls_back_to_a_out)
+{
+  TCCState s;
+  memset(&s, 0, sizeof(s));
+  s.output_type = TCC_OUTPUT_OBJ;
+  s.option_r = 1;
+
+  char *out = default_outputfile(&s, "source.c");
+  UT_ASSERT_STREQ(out, "a.out");
+  tcc_free(out);
+  return 0;
+}
+
+UT_TEST(test_default_outputfile_no_extension_falls_back_to_a_out)
+{
+  TCCState s;
+  memset(&s, 0, sizeof(s));
+  s.output_type = TCC_OUTPUT_OBJ;
+
+  char *out = default_outputfile(&s, "source");
+  UT_ASSERT_STREQ(out, "a.out");
+  tcc_free(out);
+  return 0;
+}
+
+UT_TEST(test_default_outputfile_stdin_input_falls_back_to_a_out)
+{
+  TCCState s;
+  memset(&s, 0, sizeof(s));
+  s.output_type = TCC_OUTPUT_OBJ;
+
+  char *out = default_outputfile(&s, "-");
+  UT_ASSERT_STREQ(out, "a.out");
+  tcc_free(out);
+  return 0;
+}
+
+/* ========================================================================
+ * tcc_is_64bit_operand (additional branch)
+ * ======================================================================== */
+
+UT_TEST(test_is_64bit_operand_float_is_false)
+{
+  SValue sv;
+  memset(&sv, 0, sizeof(sv));
+  sv.type.t = VT_FLOAT;
+  UT_ASSERT_EQ(tcc_is_64bit_operand(&sv), 0);
+  return 0;
+}
+
+/* ========================================================================
+ * main() additional early-exit and file-processing paths
+ * ======================================================================== */
+
+UT_TEST(test_main_help2_returns_zero)
+{
+  char *argv[] = {"tcc", "-hh", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {2, argv};
+
+  main_stub_parse_args_ret = OPT_HELP2;
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT(strstr(cap.data, "More Options") != NULL);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+  free_captured_stdout(&cap);
+  return 0;
+}
+
+UT_TEST(test_main_print_search_dirs_returns_zero)
+{
+  char *argv[] = {"tcc", "-print-search-dirs", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {2, argv};
+  char tcc_lib_path[] = "/opt/tcc";
+  char inc1[] = "/usr/include";
+  char *sysincludes[] = {inc1};
+  char lib1[] = "/usr/lib";
+  char *libraries[] = {lib1};
+  char crt1[] = "/usr/lib/crt1.o";
+  char *crts[] = {crt1};
+
+  main_stub_parse_args_ret = OPT_PRINT_DIRS;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_tcc_lib_path = tcc_lib_path;
+  main_stub_allocated_state_sysinclude_paths = sysincludes;
+  main_stub_allocated_state_nb_sysinclude_paths = 1;
+  main_stub_allocated_state_library_paths = libraries;
+  main_stub_allocated_state_nb_library_paths = 1;
+  main_stub_allocated_state_crt_paths = crts;
+  main_stub_allocated_state_nb_crt_paths = 1;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT(strstr(cap.data, "install: /opt/tcc") != NULL);
+  UT_ASSERT(strstr(cap.data, "include:\n  /usr/include") != NULL);
+  UT_ASSERT(strstr(cap.data, "libraries:\n  /usr/lib") != NULL);
+  UT_ASSERT(strstr(cap.data, "crt:\n  /usr/lib/crt1.o") != NULL);
+  UT_ASSERT(strstr(cap.data, "elfinterp:\n  /lib/ld-linux-armhf.so.3") != NULL);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_tcc_lib_path = NULL;
+  main_stub_allocated_state_sysinclude_paths = NULL;
+  main_stub_allocated_state_library_paths = NULL;
+  main_stub_allocated_state_crt_paths = NULL;
+  return 0;
+}
+
+UT_TEST(test_main_preprocess_with_outfile_dash_uses_stdout)
+{
+  char *argv[] = {"tcc", "-E", "-", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {3, argv};
+  struct filespec *f;
+
+  f = make_filespec("-", 0);
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 1;
+  main_stub_allocated_state_filespec = f;
+  main_stub_allocated_state_outfile = "-";
+  main_stub_allocated_state_output_type = TCC_OUTPUT_PREPROCESS;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_filespec = NULL;
+  main_stub_allocated_state_outfile = NULL;
+  main_stub_allocated_state_output_type = 0;
+  tcc_free(f);
+  return 0;
+}
+
+UT_TEST(test_main_preprocess_with_outfile_opens_file)
+{
+  char *argv[] = {"tcc", "-E", "test.c", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {3, argv};
+  struct filespec *f;
+  char path[] = "/tmp/tcc_ut_ppoutXXXXXX";
+  int fd;
+  FILE *fp;
+
+  fd = mkstemp(path);
+  UT_ASSERT_EQ(fd >= 0, 1);
+  close(fd);
+  unlink(path);
+
+  f = make_filespec("test.c", 0);
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 1;
+  main_stub_allocated_state_filespec = f;
+  main_stub_allocated_state_outfile = path;
+  main_stub_allocated_state_output_type = TCC_OUTPUT_PREPROCESS;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  fp = fopen(path, "rb");
+  UT_ASSERT(fp != NULL);
+  if (fp)
+    fclose(fp);
+  unlink(path);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_filespec = NULL;
+  main_stub_allocated_state_outfile = NULL;
+  main_stub_allocated_state_output_type = 0;
+  tcc_free(f);
+  return 0;
+}
+
+UT_TEST(test_main_obj_many_files_with_outfile_returns_error)
+{
+  char *argv[] = {"tcc", "-c", "a.c", "b.c", "-o", "out.o", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {6, argv};
+  struct filespec *fa = make_filespec("a.c", 0);
+  struct filespec *fb = make_filespec("b.c", 0);
+  struct filespec *files_arr[] = {fa, fb};
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 2;
+  main_stub_allocated_state_files = files_arr;
+  main_stub_allocated_state_outfile = "out.o";
+  main_stub_allocated_state_output_type = TCC_OUTPUT_OBJ;
+  main_stub_allocated_state_nb_errors = 1;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 1);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_files = NULL;
+  main_stub_allocated_state_outfile = NULL;
+  main_stub_allocated_state_output_type = 0;
+  main_stub_allocated_state_nb_errors = 0;
+  tcc_free(fa);
+  tcc_free(fb);
+  return 0;
+}
+
+UT_TEST(test_main_group_start_end_processes_files)
+{
+  char *argv[] = {"tcc", "--start-group", "mid.c", "--end-group", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {4, argv};
+  struct filespec *f_start = make_filespec("", AFF_GROUP_START);
+  struct filespec *f_mid = make_filespec("mid.c", 0);
+  struct filespec *f_end = make_filespec("", AFF_GROUP_END);
+  struct filespec *files_arr[] = {f_start, f_mid, f_end};
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 3;
+  main_stub_allocated_state_files = files_arr;
+  main_stub_allocated_state_outfile = "a.out";
+  main_stub_allocated_state_output_type = TCC_OUTPUT_EXE;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_files = NULL;
+  main_stub_allocated_state_outfile = NULL;
+  main_stub_allocated_state_output_type = 0;
+  tcc_free(f_start);
+  tcc_free(f_mid);
+  tcc_free(f_end);
+  return 0;
+}
+
+UT_TEST(test_main_unmatched_end_group_returns_error)
+{
+  char *argv[] = {"tcc", "--end-group", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {2, argv};
+  struct filespec *f_end = make_filespec("", AFF_GROUP_END);
+  struct filespec *files_arr[] = {f_end};
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 1;
+  main_stub_allocated_state_files = files_arr;
+  main_stub_allocated_state_output_type = TCC_OUTPUT_EXE;
+  main_stub_allocated_state_nb_errors = 1;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 1);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_files = NULL;
+  main_stub_allocated_state_output_type = 0;
+  main_stub_allocated_state_nb_errors = 0;
+  tcc_free(f_end);
+  return 0;
+}
+
+UT_TEST(test_main_missing_end_group_returns_error)
+{
+  char *argv[] = {"tcc", "--start-group", "mid.c", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {3, argv};
+  struct filespec *f_start = make_filespec("", AFF_GROUP_START);
+  struct filespec *f_mid = make_filespec("mid.c", 0);
+  struct filespec *files_arr[] = {f_start, f_mid};
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 2;
+  main_stub_allocated_state_files = files_arr;
+  main_stub_allocated_state_output_type = TCC_OUTPUT_EXE;
+  main_stub_allocated_state_nb_errors = 1;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 1);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_files = NULL;
+  main_stub_allocated_state_output_type = 0;
+  main_stub_allocated_state_nb_errors = 0;
+  tcc_free(f_start);
+  tcc_free(f_mid);
+  return 0;
+}
+
+UT_TEST(test_main_run_test_dt_path_returns_zero)
+{
+  char *argv[] = {"tcc", "-dt", "-run", "test.c", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {4, argv};
+  struct filespec *f = make_filespec("test.c", 0);
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 1;
+  main_stub_allocated_state_filespec = f;
+  main_stub_allocated_state_outfile = "a.out";
+  main_stub_allocated_state_output_type = TCC_OUTPUT_MEMORY;
+  main_stub_allocated_state_dflag = 16;
+  main_stub_allocated_state_run_test = 1;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_filespec = NULL;
+  main_stub_allocated_state_outfile = NULL;
+  main_stub_allocated_state_output_type = 0;
+  main_stub_allocated_state_dflag = 0;
+  main_stub_allocated_state_run_test = 0;
+  tcc_free(f);
+  return 0;
+}
+
+UT_TEST(test_main_do_bench_path_returns_zero)
+{
+  char *argv[] = {"tcc", "-bench", "test.c", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {3, argv};
+  struct filespec *f = make_filespec("test.c", 0);
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 1;
+  main_stub_allocated_state_filespec = f;
+  main_stub_allocated_state_outfile = "a.out";
+  main_stub_allocated_state_output_type = TCC_OUTPUT_EXE;
+  main_stub_allocated_state_do_bench = 1;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_filespec = NULL;
+  main_stub_allocated_state_outfile = NULL;
+  main_stub_allocated_state_output_type = 0;
+  main_stub_allocated_state_do_bench = 0;
+  tcc_free(f);
+  return 0;
+}
+
+/* ========================================================================
+ * main() additional file-processing and output-type paths
+ * ======================================================================== */
+
+UT_TEST(test_main_memory_output_no_dt_returns_zero)
+{
+  char *argv[] = {"tcc", "-run", "test.c", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {3, argv};
+  struct filespec *f = make_filespec("test.c", 0);
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 1;
+  main_stub_allocated_state_filespec = f;
+  main_stub_allocated_state_outfile = "a.out";
+  main_stub_allocated_state_output_type = TCC_OUTPUT_MEMORY;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_filespec = NULL;
+  main_stub_allocated_state_outfile = NULL;
+  main_stub_allocated_state_output_type = 0;
+  tcc_free(f);
+  return 0;
+}
+
+UT_TEST(test_main_library_file_returns_zero)
+{
+  char *argv[] = {"tcc", "-lfoo", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {2, argv};
+  struct filespec *f = make_filespec("foo", AFF_TYPE_LIB);
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 1;
+  main_stub_allocated_state_filespec = f;
+  main_stub_allocated_state_output_type = TCC_OUTPUT_EXE;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_filespec = NULL;
+  main_stub_allocated_state_output_type = 0;
+  tcc_free(f);
+  return 0;
+}
+
+UT_TEST(test_main_verbose_prints_processed_file)
+{
+  char *argv[] = {"tcc", "-v", "test.c", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {3, argv};
+  struct filespec *f = make_filespec("test.c", 0);
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 1;
+  main_stub_allocated_state_filespec = f;
+  main_stub_allocated_state_output_type = TCC_OUTPUT_EXE;
+  main_stub_allocated_state_verbose = 1;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT(strstr(cap.data, "-> test.c") != NULL);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_filespec = NULL;
+  main_stub_allocated_state_output_type = 0;
+  main_stub_allocated_state_verbose = 0;
+  tcc_free(f);
+  return 0;
+}
+
+UT_TEST(test_main_gen_deps_writes_dependency_file)
+{
+  char *argv[] = {"tcc", "-MD", "test.c", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {3, argv};
+  struct filespec *f = make_filespec("test.c", 0);
+  char dep_path[] = "/tmp/tcc_ut_depsXXXXXX";
+  char *deps[] = {"test.c", "test.h"};
+  int fd;
+  FILE *fp;
+  char buf[256];
+
+  fd = mkstemp(dep_path);
+  UT_ASSERT_EQ(fd >= 0, 1);
+  close(fd);
+  unlink(dep_path);
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 1;
+  main_stub_allocated_state_filespec = f;
+  main_stub_allocated_state_output_type = TCC_OUTPUT_EXE;
+  main_stub_allocated_state_outfile = "test.out";
+  main_stub_allocated_state_gen_deps = 1;
+  main_stub_allocated_state_target_deps = deps;
+  main_stub_allocated_state_nb_target_deps = 2;
+  main_stub_allocated_state_deps_outfile = dep_path;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  fp = fopen(dep_path, "rb");
+  UT_ASSERT(fp != NULL);
+  if (fp)
+  {
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    UT_ASSERT(strstr(buf, "test.out:") != NULL);
+    UT_ASSERT(strstr(buf, "test.c") != NULL);
+    UT_ASSERT(strstr(buf, "test.h") != NULL);
+  }
+  unlink(dep_path);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_filespec = NULL;
+  main_stub_allocated_state_output_type = 0;
+  main_stub_allocated_state_outfile = NULL;
+  main_stub_allocated_state_gen_deps = 0;
+  main_stub_allocated_state_target_deps = NULL;
+  main_stub_allocated_state_nb_target_deps = 0;
+  main_stub_allocated_state_deps_outfile = NULL;
+  tcc_free(f);
+  return 0;
+}
+
+UT_TEST(test_main_c_multiple_files_without_option_r_redoes)
+{
+  char *argv[] = {"tcc", "-c", "a.c", "b.c", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {4, argv};
+  struct filespec *fa = make_filespec("a.c", 0);
+  struct filespec *fb = make_filespec("b.c", 0);
+  struct filespec *files_arr[] = {fa, fb};
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 2;
+  main_stub_allocated_state_files = files_arr;
+  main_stub_allocated_state_output_type = TCC_OUTPUT_OBJ;
+  /* option_r stays 0, so each file is compiled in a separate redo pass. */
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_files = NULL;
+  main_stub_allocated_state_output_type = 0;
+  tcc_free(fa);
+  tcc_free(fb);
+  return 0;
+}
+
+UT_TEST(test_main_group_with_library_returns_zero)
+{
+  char *argv[] = {"tcc", "--start-group", "-lfoo", "--end-group", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {4, argv};
+  struct filespec *f_start = make_filespec("", AFF_GROUP_START);
+  struct filespec *f_lib = make_filespec("foo", AFF_TYPE_LIB);
+  struct filespec *f_end = make_filespec("", AFF_GROUP_END);
+  struct filespec *files_arr[] = {f_start, f_lib, f_end};
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 3;
+  main_stub_allocated_state_files = files_arr;
+  main_stub_allocated_state_output_type = TCC_OUTPUT_EXE;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_files = NULL;
+  main_stub_allocated_state_output_type = 0;
+  tcc_free(f_start);
+  tcc_free(f_lib);
+  tcc_free(f_end);
+  return 0;
+}
+
+UT_TEST(test_main_group_rescan_loaded)
+{
+  char *argv[] = {"tcc", "--start-group", "-lfoo", "--end-group", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {4, argv};
+  struct filespec *f_start = make_filespec("", AFF_GROUP_START);
+  struct filespec *f_lib = make_filespec("foo", AFF_TYPE_LIB);
+  struct filespec *f_end = make_filespec("", AFF_GROUP_END);
+  struct filespec *files_arr[] = {f_start, f_lib, f_end};
+
+  main_stub_parse_args_ret = 0;
+  main_stub_allocated_state_setup = 1;
+  main_stub_allocated_state_nb_files = 3;
+  main_stub_allocated_state_files = files_arr;
+  main_stub_allocated_state_output_type = TCC_OUTPUT_EXE;
+  /* First pass adds an undef; rescan is deemed satisfiable and loads a member. */
+  main_stub_add_library_call_count = 0;
+  main_stub_add_library_set_new_undef = 1;
+  main_stub_group_has_satisfiable_undefs_ret = 1;
+  main_stub_add_library_set_group_rescan_loaded = 1;
+
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  main_stub_allocated_state_setup = 0;
+  main_stub_allocated_state_files = NULL;
+  main_stub_allocated_state_output_type = 0;
+  main_stub_add_library_set_new_undef = 0;
+  main_stub_group_has_satisfiable_undefs_ret = 0;
+  main_stub_add_library_set_group_rescan_loaded = 0;
+  main_stub_add_library_call_count = 0;
+  tcc_free(f_start);
+  tcc_free(f_lib);
+  tcc_free(f_end);
+  return 0;
+}
+
+/* ========================================================================
+ * main() tool early-exit paths
+ * ======================================================================== */
+
+UT_TEST(test_main_opt_ar_empty_archive_returns_zero)
+{
+  char ar_path[] = "/tmp/tcc_ut_arXXXXXX";
+  int fd;
+  char *argv[5];
+  struct captured_stdout cap = {0};
+  struct main_args args;
+
+  fd = mkstemp(ar_path);
+  UT_ASSERT_EQ(fd >= 0, 1);
+  close(fd);
+  unlink(ar_path);
+
+  argv[0] = "tcc";
+  argv[1] = "-cr";
+  argv[2] = ar_path;
+  argv[3] = NULL;
+  args.argc = 3;
+  args.argv = argv;
+
+  main_stub_parse_args_ret = OPT_AR;
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 0);
+
+  free_captured_stdout(&cap);
+  unlink(ar_path);
+  return 0;
+}
+
+UT_TEST(test_main_opt_m32_returns_one)
+{
+  char *argv[] = {"tcc", "-m32", "test.c", NULL};
+  struct captured_stdout cap = {0};
+  struct main_args args = {3, argv};
+
+  main_stub_parse_args_ret = OPT_M32;
+  UT_ASSERT_EQ(capture_stdout(&cap, call_tcc_ut_main, &args), 0);
+  UT_ASSERT_EQ(main_stub_last_return, 1);
+  free_captured_stdout(&cap);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(tcc)
@@ -734,19 +1445,43 @@ UT_SUITE(tcc)
   UT_RUN(test_main_parse_failure_returns_one);
   UT_RUN(test_main_verbose_version_prints_version);
   UT_RUN(test_main_verbose_help_prints_both_helps);
+  UT_RUN(test_main_help2_returns_zero);
+  UT_RUN(test_main_print_search_dirs_returns_zero);
   UT_RUN(test_main_compiles_single_file_to_exe);
   UT_RUN(test_main_no_input_files_returns_error);
   UT_RUN(test_main_obj_with_libraries_returns_error);
+  UT_RUN(test_main_obj_many_files_with_outfile_returns_error);
+  UT_RUN(test_main_preprocess_with_outfile_dash_uses_stdout);
+  UT_RUN(test_main_preprocess_with_outfile_opens_file);
+  UT_RUN(test_main_group_start_end_processes_files);
+  UT_RUN(test_main_unmatched_end_group_returns_error);
+  UT_RUN(test_main_missing_end_group_returns_error);
+  UT_RUN(test_main_run_test_dt_path_returns_zero);
+  UT_RUN(test_main_do_bench_path_returns_zero);
+  UT_RUN(test_main_memory_output_no_dt_returns_zero);
+  UT_RUN(test_main_library_file_returns_zero);
+  UT_RUN(test_main_verbose_prints_processed_file);
+  UT_RUN(test_main_gen_deps_writes_dependency_file);
+  UT_RUN(test_main_c_multiple_files_without_option_r_redoes);
+  UT_RUN(test_main_group_with_library_returns_zero);
+  UT_RUN(test_main_group_rescan_loaded);
+  UT_RUN(test_main_opt_ar_empty_archive_returns_zero);
+  UT_RUN(test_main_opt_m32_returns_one);
 
   UT_RUN(test_is_64bit_operand_null_is_false);
   UT_RUN(test_is_64bit_operand_int_is_false);
   UT_RUN(test_is_64bit_operand_llong_is_true);
   UT_RUN(test_is_64bit_operand_double_is_true);
   UT_RUN(test_is_64bit_operand_long_double_is_true);
+  UT_RUN(test_is_64bit_operand_float_is_false);
   UT_RUN(test_is_64bit_operand_ignores_non_btype_bits);
 
   UT_RUN(test_default_outputfile_falls_back_to_a_out);
   UT_RUN(test_default_outputfile_uses_basename_for_obj);
   UT_RUN(test_default_outputfile_preserves_leading_underscore_for_obj);
   UT_RUN(test_default_outputfile_exe_overwrites_extension_with_a_out);
+  UT_RUN(test_default_outputfile_just_deps_changes_ext_to_o);
+  UT_RUN(test_default_outputfile_option_r_falls_back_to_a_out);
+  UT_RUN(test_default_outputfile_no_extension_falls_back_to_a_out);
+  UT_RUN(test_default_outputfile_stdin_input_falls_back_to_a_out);
 }

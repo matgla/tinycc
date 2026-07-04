@@ -85,7 +85,7 @@ jobs:
           source .venv/bin/activate
           # `shell: bash` runs with -eo pipefail, so a failing make still fails
           # the step even though its output is teed to a log we upload on failure.
-          make test -j$(nproc) 2>&1 | tee /tmp/make-test.log
+          make test CI=1 -j$(nproc) 2>&1 | tee /tmp/make-test.log
 
       - name: Collect failure artifacts
         if: failure()

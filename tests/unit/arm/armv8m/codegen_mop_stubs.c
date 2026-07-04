@@ -888,3 +888,47 @@ void tcc_opt_fp_mat_cache_clear(TCCIRState *ir)
 {
   (void)ir;
 }
+
+/* From tccgen.c -- ir/core.c:tcc_ir_local_add() calls sym_push() to build a
+ * local-stack symbol.  This binary links ir/core.c but not tccgen.c, so a NULL
+ * returning stub satisfies the linker for hand-built IR tests (no real
+ * frontend symbol table is present). */
+Sym *sym_push(int v, CType *type, int r, int c)
+{
+  (void)v; (void)type; (void)r; (void)c;
+  return NULL;
+}
+
+/* ELF section/relocation emitters reached only from the real arm-thumb-asm.c
+ * (g()/gen_le32()/gen_expr32(), pulled in by test_tccasm.c's tccasm.c include)
+ * and tccdbg.c's DWARF writer (test_tccdbg.c).  tccelf.c is not linked into
+ * this binary, so provide them here.  section_realloc is a verbatim copy of
+ * tccelf.c's bump reallocator (so it works if code is actually emitted);
+ * greloca is a no-op — no test in this binary inspects emitted relocations.
+ *
+ * NB: this is a main-binary-only stub file.  The backend binary already gets
+ * these from codegen_backend_stubs.c and the switch-data path from
+ * elfsec_stubs.c, so keeping them out of those shared files avoids a
+ * multiple-definition clash. */
+void section_realloc(Section *sec, unsigned long new_size)
+{
+  unsigned long size = sec->data_allocated;
+  unsigned char *data;
+  if (size == 0)
+    size = 256;
+  while (size < new_size)
+    size *= 2;
+  data = (unsigned char *)tcc_realloc(sec->data, size);
+  memset(data + sec->data_allocated, 0, size - sec->data_allocated);
+  sec->data = data;
+  sec->data_allocated = size;
+}
+
+void greloca(Section *s, Sym *sym, unsigned long offset, int type, addr_t addend)
+{
+  (void)s;
+  (void)sym;
+  (void)offset;
+  (void)type;
+  (void)addend;
+}

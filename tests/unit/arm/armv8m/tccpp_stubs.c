@@ -30,6 +30,15 @@
 /* define_stack is defined in tccgen.c, which we do not link. */
 Sym *define_stack;
 
+/* tccpp.c's preprocess_start() references the target machine predefs blob that
+ * normally lives in the backend (arm-thumb-gen.c).  Supply a minimal ARMv8-M
+ * string so the lifecycle tests can call preprocess_start() without pulling in
+ * the code generator. */
+const char *const target_machine_defs =
+    "__arm__\0"
+    "__arm\0"
+    "__ARM_ARCH_8M__\0";
+
 void *tcc_malloc(unsigned long size)
 {
   void *p = malloc(size);
@@ -124,4 +133,123 @@ void _tcc_error(const char *fmt, ...)
 void _tcc_warning(const char *fmt, ...)
 {
   (void)fmt;
+}
+
+/* -------------------------------------------------------------------------
+ * Additional stubs needed once tests exercise next()/skip()/preprocess().
+ * These are normally provided by libtcc.c/tccgen.c/tccdebug.c, which the
+ * isolated tccpp binary intentionally does not link.
+ * ------------------------------------------------------------------------- */
+
+char *pstrcpy(char *buf, size_t buf_size, const char *s)
+{
+  char *q, *end;
+
+  if (buf_size > 0)
+  {
+    q = buf;
+    end = buf + buf_size - 1;
+    while (*s != '\0' && q < end)
+      *q++ = *s++;
+    *q = '\0';
+  }
+  return buf;
+}
+
+char *pstrcat(char *buf, size_t buf_size, const char *s)
+{
+  size_t len;
+  len = strlen(buf);
+  if (len < buf_size)
+    pstrcpy(buf + len, buf_size - len, s);
+  return buf;
+}
+
+char *pstrncpy(char *out, const char *in, size_t num)
+{
+  memcpy(out, in, num);
+  out[num] = '\0';
+  return out;
+}
+
+char *tcc_strdup(const char *str)
+{
+  size_t n = strlen(str) + 1;
+  char *p = tcc_malloc(n);
+  memcpy(p, str, n);
+  return p;
+}
+
+char *tcc_basename(const char *name)
+{
+  char *p = (char *)name + strlen(name);
+  while (p > name && p[-1] != '/' && p[-1] != '\\')
+    --p;
+  return p;
+}
+
+void dynarray_add(void *ptab, int *nb_ptr, void *elem)
+{
+  void ***ptab_p = (void ***)ptab;
+  int nb = *nb_ptr + 1;
+  void **tab = tcc_realloc(*ptab_p, nb * sizeof(void *));
+  tab[nb - 1] = elem;
+  *ptab_p = tab;
+  *nb_ptr = nb;
+}
+
+/* No-op file/debug helpers.  Real paths are not exercised by the focused
+   lexer/preprocessor smoke tests; they are present only to satisfy the
+   linker for functions transitively referenced by tccpp.c. */
+void tcc_close(void) {}
+void tcc_debug_bincl(TCCState *s1) { (void)s1; }
+void tcc_debug_eincl(TCCState *s1) { (void)s1; }
+void tcc_debug_newfile(TCCState *s1) { (void)s1; }
+int tcc_set_options(TCCState *s, const char *r) { (void)s; (void)r; return -1; }
+
+int tcc_open(TCCState *s1, const char *filename)
+{
+  (void)s1;
+  (void)filename;
+  return -1;
+}
+
+void tcc_open_bf(TCCState *s1, const char *filename, int initlen)
+{
+  BufferedFile *bf = tcc_mallocz(sizeof(BufferedFile) + initlen);
+  pstrcpy(bf->filename, sizeof(bf->filename), filename);
+  bf->true_filename = bf->filename;
+  bf->buf_ptr = bf->buffer;
+  bf->buf_end = bf->buffer + initlen;
+  *bf->buf_end = CH_EOB;
+  bf->fd = -1;
+  bf->line_num = 1;
+  bf->line_ref = 1;
+  bf->ifdef_stack_ptr = s1->ifdef_stack_ptr;
+  file = bf;
+}
+
+/* Expression evaluation is only reached by #if/#elif.  The real evaluator
+   lives in tccgen.c and is not linked here.  Consume the preprocessed
+   expression tokens so that expr_preprocess() sees TOK_EOF and returns a
+   non-zero value, allowing the conditional-directive control flow to be
+   exercised without crashing on the "..." error path. */
+int64_t expr_const64(void)
+{
+  while (tok != TOK_EOF)
+    next();
+  return 1;
+}
+
+/* Symbol lookup used during macro expansion; not exercised by the tests. */
+Sym *sym_find2(Sym *sym, int v)
+{
+  (void)sym;
+  (void)v;
+  return NULL;
+}
+
+int normalized_PATHCMP(const char *a, const char *b)
+{
+  return strcmp(a, b);
 }

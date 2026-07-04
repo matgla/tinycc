@@ -22,24 +22,35 @@ Processing strategy (the defaults encode it)
    struct_byval, then the historically-clean fnptr, the certified-baseline int,
    and varargs) so a time-boxed run hits the rich seams early.
 3. TWO PHASE.  `--mode prescan` (default) runs the fast batch_sweep pre-scan
-   (~200 seeds/qemu-boot, ~80% recall) to FIND candidates.  For profiles with a
-   vs-gcc oracle (below), batch_sweep links per-seed `arm-none-eabi-gcc -O0` AND
-   `-O2` objects into the SAME batched ELF (`--olevels ...,gcc-O0,gcc-O2`), so ONE
-   pass finds olevels self-consistency AND vs-gcc candidates AND cross-checks gcc
-   against itself (a seed where gcc -O0 != gcc -O2 is oracle-unreliable — gcc
-   miscompiles some UB-free programs at -O2, e.g. bitfield seed 1486 — so it is
-   quarantined, NOT reported as a tcc bug) — no separate per-seed pytest pass in
-   this mode.  `--mode triage` does NOT use batch_sweep at all:
+   (~200 seeds/qemu-boot, ~80% recall) to FIND candidates.  It sweeps tcc
+   -O0/-O1/-O2 only (no -Os — the -Os-exclusive miscompile class is vanishingly
+   rare and gcc, not the extra tcc level, is the expensive part of a sweep).  For
+   profiles with a vs-gcc oracle (below), batch_sweep links a per-seed
+   `arm-none-eabi-gcc -O0` object into the SAME batched ELF
+   (`--olevels -O0,-O1,-O2,gcc-O0`), so ONE pass finds olevels self-consistency
+   AND vs-gcc candidates at no extra qemu-boot cost.  gcc-O0 is the reference
+   (not gcc-O2): it is both cheaper to compile and the more trustworthy oracle —
+   the known gcc wrong-code bugs are all at -O2 (e.g. bitfield seed 1486).  This
+   halves the gcc compile cost (>half of a cold sweep) vs the old two-gcc-level
+   pass; the trade is that a single gcc level has no automated self-consistency
+   quarantine, so a (near-nonexistent) gcc-O0 miscompile would surface as a
+   vs-gcc candidate that the triage/bisect step dismisses by hand — no separate
+   per-seed pytest pass in this mode.  `--mode triage` does NOT use batch_sweep at all:
    it runs triage_olevels.sh's exhaustive per-seed sweep over the WHOLE band
    (full recall, no batch) and culprit-bisects every divergent seed in the same
    pass (this is what CERTIFIES a band); the vs-gcc side still runs the
    exhaustive per-seed pytest pass here (full recall matters more than speed
    when certifying), and only the vs-gcc-only seeds (the O0-WRONG/ABI class the
    olevels sweep can't see) get triaged.
-4. RIGHT ORACLE.  olevels self-consistency for every profile; PLUS vs-gcc for the
-   ABI/value-shaped ones (float/bitfield/struct_byval/fnptr/varargs) — the only
-   oracle that sees the O0-WRONG class (all tcc levels agree but are wrong).  int
-   and the no-ABI switch/ptr run olevels-only by default.
+4. RIGHT ORACLE.  olevels (-O1/-O2) self-consistency PLUS a gcc-O0 reference for
+   EVERY profile except fp_round — the gcc reference is the only oracle that sees
+   the O0-WRONG class (all tcc levels agree but are wrong), and it doubles as the
+   correctness reference that lets us drop tcc -O0 from the prescan.  fp_round is
+   the sole olevels-only profile (gcc's compile-time FP rounding differs from
+   tcc's runtime softfloat, so it would false-positive); it keeps tcc -O0.  The
+   gcc-O0 reference objects are cached persistently (tests/fuzz/.sweep_cache,
+   keyed on gen_c.py + gcc version, NOT tcc), so they are compiled once and
+   reused across every re-sweep.
 5. RECALL CAVEAT.  batch_sweep under-recalls the context-sensitive uninit/alias
    class that ptr & struct_byval target, so a "0 divergent" pre-scan for those is
    NOT a clean certificate — use `--mode triage` (or triage_olevels.sh directly).
@@ -96,17 +107,22 @@ TRIAGE_SH = THIS_DIR / "triage_olevels.sh"
 VSGCC_TEST = THIS_DIR / "test_random_c_vs_gcc.py"
 
 # Profiles in DESCENDING historical yield, each tagged with the oracle(s) that see
-# its bug class.  "olevels" = O0/O1/O2/Os self-consistency (batch_sweep).
-# "vsgcc"   = arm-none-eabi-gcc -O2 gold (catches O0-WRONG / ABI).  "both" = run each.
+# its bug class.  "olevels" = O0/O1/O2 self-consistency only (batch_sweep).
+# "both" = ALSO run a per-seed arm-none-eabi-gcc-O0 reference (catches O0-WRONG /
+# ABI).  gcc-O0 is a valid value oracle for every UB-free generator EXCEPT
+# fp_round (gcc constant-folds FP with different last-bit rounding than tcc's
+# runtime softfloat -> false positives), so fp_round is the sole "olevels" entry;
+# it keeps tcc -O0 as its correctness reference.  Every "both" profile drops tcc
+# -O0 from the prescan (gcc-O0 is the reference; triage re-adds -O0 to classify).
 PROFILES = [
-    ("ptr",          "olevels", "densest alias/deref seam (DSE/load-CSE/store-fwd)"),
+    ("ptr",          "both",    "densest alias/deref seam (DSE/load-CSE/store-fwd)"),
     ("bitfield",     "both",    "bitfield RMW insert/extract + packed access"),
     ("float",        "both",    "softfloat arith + FP compare (open backlog)"),
-    ("switch",       "olevels", "jump-table vs if-chain dispatch"),
+    ("switch",       "both",    "jump-table vs if-chain dispatch"),
     ("struct_byval", "both",    "AAPCS struct passing + sret (crash class)"),
-    ("fnptr",        "vsgcc",   "indirect-call ABI / sret-through-fnptr"),
-    ("int",          "olevels", "baseline integer stream (regression gate; certified 0-9999)"),
-    ("varargs",      "vsgcc",   "stdarg frame layout / r0-r3 spill"),
+    ("fnptr",        "both",    "indirect-call ABI / sret-through-fnptr"),
+    ("int",          "both",    "baseline integer stream (regression gate; certified 0-9999)"),
+    ("varargs",      "both",    "stdarg frame layout / r0-r3 spill"),
     # --- wave 2 (docs/plan_fuzz_wave2.md); unswept as of landing, ranked by the
     # plan's a-priori density estimate rather than measured yield ---
     ("longlong",     "both",    "64-bit register-pair codegen + aeabi div/mod/shift/cmp libcalls"),
@@ -114,13 +130,14 @@ PROFILES = [
     ("combo",        "both",    "cross-feature seams: ptr+switch+bitfield+struct_byval"),
     ("combo_num",    "both",    "cross-feature seams: longlong+float+signed"),
     ("fp_deep",      "both",    "EXACT int<->fp round trip, integer-exact a*b+c, loop-carried FP"),
-    # olevels-ONLY: full-mantissa (non-exact) FP ops; a correctly-rounded but
-    # DIFFERENT soft-float library could legally disagree with tcc in the last
-    # bit -- never promote this to "vsgcc"/"both" (see gen_c.py _fconst_round()
-    # and docs/plan_fuzz_wave2.md SS4.4).
+    # olevels-ONLY (the ONE exception to the gcc-for-all rule): full-mantissa
+    # (non-exact) FP ops; a correctly-rounded but DIFFERENT soft-float library
+    # could legally disagree with tcc in the last bit -- never promote this to
+    # "both" (see gen_c.py _fconst_round() and docs/plan_fuzz_wave2.md SS4.4).
+    # Keeps tcc -O0 (its only correctness reference, since gcc can't serve here).
     ("fp_round",     "olevels", "full-mantissa FP rounding stress (GRS logic); olevels-only by design"),
     ("volatile",     "both",    "volatile access ordering vs DSE/load-CSE over-elimination"),
-    ("agg_deep",     "olevels", "nested structs, 2-D arrays, 2-level pointers -- deeper GEP/offset"),
+    ("agg_deep",     "both",    "nested structs, 2-D arrays, 2-level pointers -- deeper GEP/offset"),
 ]
 # batch_sweep's ~80% recall under-reports exactly these profiles' bug class.
 LOW_RECALL_ON_PRESCAN = {"ptr", "struct_byval"}
@@ -199,7 +216,8 @@ def run_olevels_prescan(profile: str, lo: int, hi: int, jobs: int, emit) -> tupl
     promptly.
     """
     cmd = [sys.executable, "-u", str(BATCH_SWEEP), str(lo), str(hi),
-           "--profile", profile, "--jobs", str(jobs)]
+           "--profile", profile, "--jobs", str(jobs),
+           "--olevels=-O0,-O1,-O2"]     # drop -Os: the -Os-exclusive class is rare
     rc, out = _stream_child(cmd, _CHILD_ENV, emit)
     if rc is None:
         return [], f"batch_sweep failed to launch: {out}"
@@ -210,24 +228,33 @@ def run_olevels_prescan(profile: str, lo: int, hi: int, jobs: int, emit) -> tupl
 
 
 def run_olevels_prescan_with_gcc(profile: str, lo: int, hi: int, jobs: int, emit) -> tuple[list[int], list[int], list[int], str]:
-    """Merged batch_sweep pre-scan: links per-seed `arm-none-eabi-gcc -O0` AND
-    `-O2` objects into the SAME batched ELF as the tcc -O0/-O1/-O2/-Os objects, so
-    ONE qemu-boot-per-batch pass yields the olevels self-consistency verdict, the
-    vs-gcc (O0-WRONG class) verdict, AND a gcc oracle self-consistency check —
-    replacing a separate per-seed pytest vs-gcc pass for prescan mode.
+    """Merged batch_sweep pre-scan: links a per-seed `arm-none-eabi-gcc -O0`
+    object into the SAME batched ELF as the tcc -O0/-O1/-O2 objects, so ONE
+    qemu-boot-per-batch pass yields BOTH the olevels self-consistency verdict and
+    the vs-gcc (O0-WRONG class) verdict — replacing a separate per-seed pytest
+    vs-gcc pass for prescan mode.
 
-    The two gcc levels are the guard against gcc's own miscompiles (gcc is not an
-    infallible oracle — bitfield seed 1486 is a confirmed gcc -O2 wrong-code on a
-    UB-free program).  A seed where gcc -O0 and gcc -O2 DISAGREE is oracle-
-    unreliable: it is returned in ``gccbad_seeds`` (quarantined) and NOT counted as
-    a tcc divergence.  Returns (olevels_seeds, vsgcc_seeds, gccbad_seeds,
-    error_or_empty).  Same ~80% recall caveat as run_olevels_prescan applies to
-    the vs-gcc side too — this is a fast candidate-finder, not a certifying
-    sweep (use --mode triage for that).
+    gcc-O0 is the reference (not gcc-O2): it is both cheaper to compile and the
+    more trustworthy oracle — the known gcc wrong-code bugs are all at -O2
+    (bitfield seed 1486 is a confirmed gcc -O2 miscompile of a UB-free program).
+    With a single gcc level there is no automated self-consistency cross-check, so
+    ``gccbad_seeds`` is always empty here (kept in the return signature for
+    back-compat); a rare gcc-O0 miscompile would appear as a vs-gcc candidate and
+    be dismissed in the triage/bisect step.  Returns (olevels_seeds, vsgcc_seeds,
+    gccbad_seeds, error_or_empty).  Same ~80% recall caveat as run_olevels_prescan
+    applies to the vs-gcc side too — this is a fast candidate-finder, not a
+    certifying sweep (use --mode triage for that).
     """
+    # No tcc -O0 here: for a gcc-oracle profile, gcc-O0 is the correctness
+    # reference, so tcc -O0's only role (being the "known-good" level) is covered
+    # — and gcc-O0 additionally backstops the class where tcc -O1 AND -O2 are both
+    # wrong the SAME way (they'd agree with each other, but disagree with gcc ->
+    # VSGCC).  We test both opt levels (-O1,-O2) against that reference; the
+    # codegen-vs-optimization split that needs -O0 happens at triage time, which
+    # re-runs full -O0/-O1/-O2/-Os on the few flagged seeds.
     cmd = [sys.executable, "-u", str(BATCH_SWEEP), str(lo), str(hi),
            "--profile", profile, "--jobs", str(jobs),
-           "--olevels=-O0,-O1,-O2,-Os,gcc-O0,gcc-O2"]
+           "--olevels=-O1,-O2,gcc-O0"]
     rc, out = _stream_child(cmd, _CHILD_ENV, emit)
     if rc is None:
         return [], [], [], f"batch_sweep failed to launch: {out}"
@@ -340,13 +367,14 @@ def run_profile(idx: int, n_profiles: int, name: str, oracle: str, blurb: str,
                  and oracle in ("vsgcc", "both"))
 
     if merge_gcc:
-        # Single batched pass: link per-seed arm-none-eabi-gcc -O0 AND -O2
-        # objects into the SAME runner ELF as the tcc -O0/-O1/-O2/-Os objects,
-        # so one qemu-boot-per-batch yields the olevels self-consistency
-        # verdict, the vs-gcc (O0-WRONG class) verdict, AND a gcc oracle
-        # self-consistency check — no separate per-seed pytest pass needed in
-        # prescan mode.  Seeds where gcc -O0 != gcc -O2 are quarantined
-        # (gcc_bad), not blamed on tcc (gcc miscompiles some UB-free programs).
+        # Single batched pass: link a per-seed arm-none-eabi-gcc -O0 object into
+        # the SAME runner ELF as the tcc -O0/-O1/-O2 objects, so one
+        # qemu-boot-per-batch yields BOTH the olevels self-consistency verdict
+        # and the vs-gcc (O0-WRONG class) verdict — no separate per-seed pytest
+        # pass needed in prescan mode.  gcc-O0 is the reference (cheaper, and the
+        # known gcc wrong-code bugs are all -O2); with one gcc level there is no
+        # automated quarantine, so gcc_bad stays empty (a rare gcc-O0 miscompile
+        # is dismissed by hand in triage).
         emit(f"olevels+gcc merged pre-scan [{args.lo}..{args.hi}] (one batch, both oracles) ...")
         ol_seeds, vg_seeds, gcc_bad, ol_err = run_olevels_prescan_with_gcc(
             name, args.lo, args.hi, jobs, emit)

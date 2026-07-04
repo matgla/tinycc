@@ -3,8 +3,8 @@
  *  (build_tccpp/run_unit_tests_tccpp)
  *
  *  Focuses on the helpers that can be exercised without invoking the full
- *  lexer/preprocessor: CString, token interning, token-string buffers, and
- *  the pragma-pack replay handler.
+ *  compiler pipeline: CString, token interning, token-string buffers,
+ *  pragma-pack replay, and preprocessor directive / lexer smoke tests.
  */
 
 #include "tcc.h"
@@ -14,6 +14,14 @@
 #include <string.h>
 
 ST_FUNC void cstr_u8cat(CString *cstr, int ch);
+ST_FUNC int cstr_vprintf(CString *cstr, const char *fmt, va_list ap);
+ST_FUNC int *tok_str_realloc(TokenString *s, int new_size);
+ST_FUNC void pp_error(CString *cs);
+ST_FUNC void parse_define(void);
+ST_FUNC void tccpp_putfile(const char *filename);
+ST_FUNC void preprocess_start(TCCState *s1, int filetype);
+ST_FUNC void preprocess_end(TCCState *s1);
+ST_FUNC int tcc_preprocess(TCCState *s1);
 
 static void ut_tccpp_setup(void)
 {
@@ -581,6 +589,23 @@ static int ut_open_input(const char *s)
   return 0;
 }
 
+static void ut_reset_pp_state(void)
+{
+  tcc_state->include_stack_ptr = tcc_state->include_stack;
+  tcc_state->ifdef_stack_ptr = tcc_state->ifdef_stack;
+}
+
+static int call_cstr_vprintf(CString *cstr, const char *fmt, ...)
+{
+  va_list ap;
+  int n;
+
+  va_start(ap, fmt);
+  n = cstr_vprintf(cstr, fmt, ap);
+  va_end(ap);
+  return n;
+}
+
 /* ============================================================================
  * Additional CString helper tests
  * ============================================================================ */
@@ -780,6 +805,34 @@ UT_TEST(test_tok_get_line_and_pack_replay)
   return 0;
 }
 
+UT_TEST(test_tok_get_ppnum_ppstr_round_trip)
+{
+  TokenString str;
+  tok_str_new(&str);
+  static char ppn[] = "123abc";
+  CValue cv;
+  cv.str.data = ppn;
+  cv.str.size = sizeof(ppn);
+  tok_str_add2(&str, TOK_PPNUM, &cv);
+  static char pps[] = "\"hi\"";
+  cv.str.data = pps;
+  cv.str.size = sizeof(pps);
+  tok_str_add2(&str, TOK_PPSTR, &cv);
+  const int *p = tok_str_buf(&str);
+  CValue cv_out;
+  int t;
+  tok_get(&t, &p, &cv_out);
+  UT_ASSERT_EQ(t, TOK_PPNUM);
+  UT_ASSERT_EQ(cv_out.str.size, (int)sizeof(ppn));
+  UT_ASSERT_STREQ(cv_out.str.data, ppn);
+  tok_get(&t, &p, &cv_out);
+  UT_ASSERT_EQ(t, TOK_PPSTR);
+  UT_ASSERT_EQ(cv_out.str.size, (int)sizeof(pps));
+  UT_ASSERT_STREQ(cv_out.str.data, pps);
+  tok_str_free_str(tok_str_ensure_heap(&str));
+  return 0;
+}
+
 /* ============================================================================
  * define_push / define_find / macro_is_equal tests
  * ============================================================================ */
@@ -858,6 +911,30 @@ UT_TEST(test_define_push_function_macro_with_args)
   return 0;
 }
 
+UT_TEST(test_define_push_equal_body_no_warning)
+{
+  TokenSym *ts = tok_alloc("samebody", 8);
+  TokenString str1, str2;
+  tok_str_new(&str1);
+  tok_str_new(&str2);
+  CValue cv;
+  cv.i = 7;
+  tok_str_add2(&str1, TOK_CINT, &cv);
+  tok_str_add(&str1, 0);
+  tok_str_add2(&str2, TOK_CINT, &cv);
+  tok_str_add(&str2, 0);
+  int *d1 = tok_str_ensure_heap(&str1);
+  int *d2 = tok_str_ensure_heap(&str2);
+  Sym *boundary = define_stack;
+  define_push(ts->tok, MACRO_OBJ, d1, NULL);
+  define_push(ts->tok, MACRO_OBJ, d2, NULL);
+  Sym *s = define_find(ts->tok);
+  UT_ASSERT(s != NULL);
+  UT_ASSERT_EQ(s->d[1], 7);
+  free_defines(boundary);
+  return 0;
+}
+
 /* ============================================================================
  * Misc accessible frontend helpers
  * ============================================================================ */
@@ -869,6 +946,27 @@ UT_TEST(test_skip_to_eol_skips_logical_line)
   skip_to_eol(0);
   UT_ASSERT_EQ(tok, TOK_LINEFEED);
   UT_ASSERT(file->buf_ptr == file->buf_end);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_skip_to_eol_warns_on_extra_tokens)
+{
+  UT_ASSERT(ut_open_input("extra") == 0);
+  tok = '+';
+  skip_to_eol(1);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_skip_to_eol_returns_on_linefeed)
+{
+  UT_ASSERT(ut_open_input("") == 0);
+  tok = TOK_LINEFEED;
+  skip_to_eol(0);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+  UT_ASSERT(file->buf_ptr == ut_input_buf + 1);
   file = NULL;
   return 0;
 }
@@ -899,6 +997,744 @@ UT_TEST(test_unget_tok_pushes_token_back)
   return 0;
 }
 
+UT_TEST(test_unget_tok_allocates_second_buffer)
+{
+  UT_ASSERT(ut_open_input("") == 0);
+  tok = '+';
+  unget_tok('*');
+  unget_tok('/');
+  UT_ASSERT_EQ(tok, '/');
+  UT_ASSERT(macro_ptr != NULL);
+  end_macro();
+  end_macro();
+  UT_ASSERT(macro_ptr == NULL);
+  file = NULL;
+  return 0;
+}
+
+/* ============================================================================
+ * Additional coverage for CString / TokenString internals
+ * ============================================================================ */
+
+UT_TEST(test_cstr_vprintf_formats_va_list)
+{
+  CString cstr;
+  cstr_new(&cstr);
+  int n = call_cstr_vprintf(&cstr, "v=%d s=%s", 7, "bar");
+  UT_ASSERT_EQ(n, 9);
+  UT_ASSERT_STREQ(cstr.data, "v=7 s=bar");
+  cstr_free(&cstr);
+  return 0;
+}
+
+UT_TEST(test_tok_str_realloc_inline_to_heap)
+{
+  TokenString str;
+  tok_str_new(&str);
+  int *heap = tok_str_realloc(&str, TOKSTR_SMALL_BUFSIZE + 1);
+  UT_ASSERT(heap != NULL);
+  UT_ASSERT(str.allocated_len > 0);
+  UT_ASSERT(heap == str.data.str);
+  UT_ASSERT(heap != str.data.small_buf);
+  tok_str_free_str(heap);
+  return 0;
+}
+
+UT_TEST(test_tok_str_realloc_heap_grows)
+{
+  TokenString str;
+  tok_str_new(&str);
+  int *buf1 = tok_str_realloc(&str, 8);
+  int alloc1 = str.allocated_len;
+  int *buf2 = tok_str_realloc(&str, 200);
+  UT_ASSERT(buf1 != NULL);
+  UT_ASSERT(str.allocated_len >= 200);
+  UT_ASSERT(str.allocated_len > alloc1);
+  UT_ASSERT(buf2 == str.data.str);
+  tok_str_free_str(buf2);
+  return 0;
+}
+
+UT_TEST(test_tok_get_long_long_round_trip)
+{
+  TokenString str;
+  tok_str_new(&str);
+  CValue cv;
+  cv.i = 0x123456789ABCDEF0ULL;
+  tok_str_add2(&str, TOK_CLLONG, &cv);
+  cv.i = 0xFEDCBA9876543210ULL;
+  tok_str_add2(&str, TOK_CULLONG, &cv);
+
+  const int *p = tok_str_buf(&str);
+  CValue out;
+  int t;
+  tok_get(&t, &p, &out);
+  UT_ASSERT_EQ(t, TOK_CLLONG);
+  UT_ASSERT_EQ(out.i, 0x123456789ABCDEF0ULL);
+  tok_get(&t, &p, &out);
+  UT_ASSERT_EQ(t, TOK_CULLONG);
+  UT_ASSERT_EQ((unsigned long long)out.i, 0xFEDCBA9876543210ULL);
+  tok_str_free_str(tok_str_ensure_heap(&str));
+  return 0;
+}
+
+UT_TEST(test_tok_get_float_double_round_trip)
+{
+  TokenString str;
+  tok_str_new(&str);
+  CValue cv;
+  cv.f = 1.5f;
+  tok_str_add2(&str, TOK_CFLOAT, &cv);
+  cv.d = 2.25;
+  tok_str_add2(&str, TOK_CDOUBLE, &cv);
+
+  const int *p = tok_str_buf(&str);
+  CValue out;
+  int t;
+  tok_get(&t, &p, &out);
+  UT_ASSERT_EQ(t, TOK_CFLOAT);
+  UT_ASSERT(out.f == 1.5f);
+  tok_get(&t, &p, &out);
+  UT_ASSERT_EQ(t, TOK_CDOUBLE);
+  UT_ASSERT(out.d == 2.25);
+  tok_str_free_str(tok_str_ensure_heap(&str));
+  return 0;
+}
+
+UT_TEST(test_get_tok_str_long_long_constants)
+{
+  CValue cv;
+  cv.i = 123456789012345ULL;
+  UT_ASSERT_STREQ(get_tok_str(TOK_CLLONG, &cv), "123456789012345");
+  cv.i = 0xFFFFFFFFFFFFFFFFULL;
+  UT_ASSERT_STREQ(get_tok_str(TOK_CULLONG, &cv), "18446744073709551615");
+  cv.i = 0x80000000U;
+  UT_ASSERT_STREQ(get_tok_str(TOK_CULONG, &cv), "2147483648");
+  return 0;
+}
+
+UT_TEST(test_get_tok_str_more_two_char_tokens)
+{
+  UT_ASSERT_STREQ(get_tok_str(TOK_LT, NULL), "<");
+  UT_ASSERT_STREQ(get_tok_str(TOK_GT, NULL), ">");
+  UT_ASSERT_STREQ(get_tok_str(TOK_LE, NULL), "<=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_GE, NULL), ">=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_NE, NULL), "!=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_LAND, NULL), "&&");
+  UT_ASSERT_STREQ(get_tok_str(TOK_LOR, NULL), "||");
+  UT_ASSERT_STREQ(get_tok_str(TOK_INC, NULL), "++");
+  UT_ASSERT_STREQ(get_tok_str(TOK_DEC, NULL), "--");
+  UT_ASSERT_STREQ(get_tok_str(TOK_SHL, NULL), "<<");
+  UT_ASSERT_STREQ(get_tok_str(TOK_SAR, NULL), ">>");
+  UT_ASSERT_STREQ(get_tok_str(TOK_A_ADD, NULL), "+=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_A_SUB, NULL), "-=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_A_MUL, NULL), "*=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_A_DIV, NULL), "/=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_A_MOD, NULL), "%=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_A_AND, NULL), "&=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_A_XOR, NULL), "^=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_A_OR, NULL), "|=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_ARROW, NULL), "->");
+  UT_ASSERT_STREQ(get_tok_str(TOK_TWODOTS, NULL), "..");
+  UT_ASSERT_STREQ(get_tok_str(TOK_TWOSHARPS, NULL), "##");
+  UT_ASSERT_STREQ(get_tok_str(TOK_A_SHL, NULL), "<<=");
+  UT_ASSERT_STREQ(get_tok_str(TOK_A_SAR, NULL), ">>=");
+  return 0;
+}
+
+UT_TEST(test_define_find_returns_null_for_undefined)
+{
+  TokenSym *ts = tok_alloc("undef_xxx", 9);
+  UT_ASSERT(define_find(ts->tok) == NULL);
+  return 0;
+}
+
+/* ============================================================================
+ * next() / skip() / preprocess() smoke tests
+ * ============================================================================ */
+
+UT_TEST(test_next_lexes_identifier)
+{
+  UT_ASSERT(ut_open_input("foo") == 0);
+  ut_reset_pp_state();
+  next();
+  int foo_tok = tok_alloc("foo", 3)->tok;
+  UT_ASSERT_EQ(tok, foo_tok);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_next_lexes_number_with_tok_num)
+{
+  UT_ASSERT(ut_open_input("42") == 0);
+  ut_reset_pp_state();
+  parse_flags |= PARSE_FLAG_TOK_NUM;
+  next();
+  UT_ASSERT_EQ(tok, TOK_CINT);
+  UT_ASSERT_EQ(tokc.i, 42);
+  parse_flags = 0;
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_next_lexes_string_with_tok_str)
+{
+  UT_ASSERT(ut_open_input("\"hello\"") == 0);
+  ut_reset_pp_state();
+  parse_flags |= PARSE_FLAG_TOK_STR;
+  next();
+  UT_ASSERT_EQ(tok, TOK_STR);
+  UT_ASSERT_EQ(tokc.str.size, 6);
+  UT_ASSERT_STREQ(tokc.str.data, "hello");
+  parse_flags = 0;
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_next_lexes_increment_operator)
+{
+  UT_ASSERT(ut_open_input("++") == 0);
+  ut_reset_pp_state();
+  next();
+  UT_ASSERT_EQ(tok, TOK_INC);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_next_skips_c_comment)
+{
+  UT_ASSERT(ut_open_input("/* skipped */ x") == 0);
+  ut_reset_pp_state();
+  next();
+  int x_tok = tok_alloc("x", 1)->tok;
+  UT_ASSERT_EQ(tok, x_tok);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_skip_advances_when_token_matches)
+{
+  UT_ASSERT(ut_open_input("(") == 0);
+  ut_reset_pp_state();
+  next();
+  UT_ASSERT_EQ(tok, '(');
+  skip('(');
+  UT_ASSERT_EQ(tok, TOK_EOF);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_skip_errors_when_token_mismatches)
+{
+  UT_ASSERT(ut_open_input("x") == 0);
+  ut_reset_pp_state();
+  next();
+  tcc_state->error_set_jmp_enabled = 1;
+  if (setjmp(tcc_state->error_jmp_buf) == 0)
+  {
+    skip('(');
+    tcc_state->error_set_jmp_enabled = 0;
+    file = NULL;
+    return -1;
+  }
+  tcc_state->error_set_jmp_enabled = 0;
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_define_object_macro)
+{
+  Sym *boundary = define_stack;
+
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#define X 123\n") == 0);
+  preprocess(1);
+
+  int xtok = tok_alloc("X", 1)->tok;
+  Sym *s = define_find(xtok);
+  UT_ASSERT(s != NULL);
+  UT_ASSERT_EQ(s->v, xtok);
+
+  const int *p = s->d;
+  CValue cv;
+  int t;
+  tok_get(&t, &p, &cv);
+  UT_ASSERT_EQ(t, TOK_PPNUM);
+  UT_ASSERT_STREQ(cv.str.data, "123");
+
+  free_defines(boundary);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_undef_removes_macro)
+{
+  Sym *boundary = define_stack;
+  int xtok = tok_alloc("Y", 1)->tok;
+  define_push(xtok, MACRO_OBJ, NULL, NULL);
+  UT_ASSERT(define_find(xtok) != NULL);
+
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#undef Y\n") == 0);
+  preprocess(1);
+
+  UT_ASSERT(define_find(xtok) == NULL);
+  free_defines(boundary);
+  file = NULL;
+  return 0;
+}
+
+/* ============================================================================
+ * Additional preprocessor / lexer coverage
+ * ============================================================================ */
+
+UT_TEST(test_tok_str_free_str_null_is_safe)
+{
+  tok_str_free_str(NULL);
+  return 0;
+}
+
+UT_TEST(test_begin_macro_static_buffer_end_macro_resets)
+{
+  static struct BufferedFile bf;
+  memset(&bf, 0, sizeof(bf));
+  bf.line_num = 1;
+  file = &bf;
+
+  TokenString str;
+  tok_str_new(&str);
+  tok_str_add(&str, TOK_IF);
+  tok_str_add(&str, 0);
+
+  int len_before = str.len;
+  begin_macro(&str, 0);
+  UT_ASSERT(macro_ptr == tok_str_buf(&str));
+  end_macro();
+  UT_ASSERT_EQ(str.len, 0);
+  UT_ASSERT_EQ(str.need_spc, 0);
+
+  file = NULL;
+  (void)len_before;
+  return 0;
+}
+
+UT_TEST(test_next_lexes_string_with_escapes)
+{
+  UT_ASSERT(ut_open_input("\"a\\nb\\\\c\"") == 0);
+  ut_reset_pp_state();
+  parse_flags |= PARSE_FLAG_TOK_STR;
+  next();
+  UT_ASSERT_EQ(tok, TOK_STR);
+  UT_ASSERT_EQ(tokc.str.size, 6);
+  UT_ASSERT_EQ(tokc.str.data[0], 'a');
+  UT_ASSERT_EQ(tokc.str.data[1], '\n');
+  UT_ASSERT_EQ(tokc.str.data[2], 'b');
+  UT_ASSERT_EQ(tokc.str.data[3], '\\');
+  UT_ASSERT_EQ(tokc.str.data[4], 'c');
+  parse_flags = 0;
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_next_lexes_hex_number)
+{
+  UT_ASSERT(ut_open_input("0xff") == 0);
+  ut_reset_pp_state();
+  parse_flags |= PARSE_FLAG_TOK_NUM;
+  next();
+  UT_ASSERT_EQ(tok, TOK_CINT);
+  UT_ASSERT_EQ(tokc.i, 255);
+  parse_flags = 0;
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_next_with_macro_substitution)
+{
+  Sym *boundary = define_stack;
+  int xtok = tok_alloc("X", 1)->tok;
+  TokenString str;
+  tok_str_new(&str);
+  CValue cv;
+  cv.i = 1;
+  tok_str_add2(&str, TOK_CINT, &cv);
+  tok_str_add(&str, 0);
+  int *body = tok_str_ensure_heap(&str);
+  define_push(xtok, MACRO_OBJ, body, NULL);
+
+  UT_ASSERT(ut_open_input("X") == 0);
+  ut_reset_pp_state();
+  parse_flags |= PARSE_FLAG_PREPROCESS;
+  next();
+  UT_ASSERT_EQ(tok, TOK_CINT);
+  UT_ASSERT_EQ(tokc.i, 1);
+  parse_flags = 0;
+
+  free_defines(boundary);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_tccpp_putfile_relative_path)
+{
+  static struct BufferedFile bf;
+  memset(&bf, 0, sizeof(bf));
+  strcpy(bf.filename, "/tmp/original.c");
+  bf.true_filename = bf.filename;
+  file = &bf;
+
+  tccpp_putfile("other.c");
+  UT_ASSERT_STREQ(bf.filename, "/tmp/other.c");
+  UT_ASSERT(bf.true_filename != bf.filename);
+  tcc_free(bf.true_filename);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_tccpp_putfile_absolute_path)
+{
+  static struct BufferedFile bf;
+  memset(&bf, 0, sizeof(bf));
+  strcpy(bf.filename, "/tmp/original.c");
+  bf.true_filename = bf.filename;
+  file = &bf;
+
+  tccpp_putfile("/other/path.c");
+  UT_ASSERT_STREQ(bf.filename, "/other/path.c");
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_start_end_lifecycle)
+{
+  BufferedFile *orig_bf;
+  BufferedFile *cmd_bf;
+
+  tccpp_delete(tcc_state);
+  tcc_open_bf(tcc_state, "test.c", 0);
+  orig_bf = file;
+  tcc_state->include_stack_ptr = tcc_state->include_stack;
+  tcc_state->ifdef_stack_ptr = tcc_state->ifdef_stack;
+
+  preprocess_start(tcc_state, AFF_TYPE_C);
+  UT_ASSERT(file != NULL);
+  UT_ASSERT(file != orig_bf);
+  UT_ASSERT_EQ(tcc_state->pack_stack_ptr, tcc_state->pack_stack);
+  UT_ASSERT_EQ(parse_flags, 0);
+  UT_ASSERT(tcc_state->include_stack_ptr == tcc_state->include_stack + 1);
+
+  cmd_bf = file;
+  file = NULL;
+  tcc_free(cmd_bf);
+  tcc_free(orig_bf);
+  preprocess_end(tcc_state);
+  tccpp_new(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_preprocess_start_asm_file)
+{
+  BufferedFile *orig_bf;
+
+  tccpp_delete(tcc_state);
+  tcc_open_bf(tcc_state, "test.S", 0);
+  orig_bf = file;
+  preprocess_start(tcc_state, AFF_TYPE_ASM);
+  UT_ASSERT(file == orig_bf);
+  UT_ASSERT(parse_flags & PARSE_FLAG_ASM_FILE);
+  UT_ASSERT_EQ(set_idnum('.', 0), IS_ID);
+
+  file = NULL;
+  tcc_free(orig_bf);
+  preprocess_end(tcc_state);
+  tccpp_new(tcc_state);
+  return 0;
+}
+
+UT_TEST(test_tcc_preprocess_simple)
+{
+  FILE *fp = tmpfile();
+  Sym *boundary = define_stack;
+  int xtok = tok_alloc("X", 1)->tok;
+  TokenString str;
+  BufferedFile *bf;
+  CValue cv;
+  char buf[256];
+  size_t n;
+
+  UT_ASSERT(fp != NULL);
+  tcc_state->ppfp = fp;
+  tcc_state->Pflag = LINE_MACRO_OUTPUT_FORMAT_NONE;
+
+  tok_str_new(&str);
+  cv.i = 1;
+  tok_str_add2(&str, TOK_CINT, &cv);
+  tok_str_add(&str, 0);
+  define_push(xtok, MACRO_OBJ, tok_str_ensure_heap(&str), NULL);
+
+  tcc_open_bf(tcc_state, "test.c", 2);
+  memcpy(file->buffer, "X\n", 2);
+
+  UT_ASSERT_EQ(tcc_preprocess(tcc_state), 0);
+
+  rewind(fp);
+  n = fread(buf, 1, sizeof(buf) - 1, fp);
+  buf[n] = '\0';
+  UT_ASSERT(strstr(buf, "1") != NULL);
+
+  fclose(fp);
+  tcc_state->ppfp = NULL;
+  bf = file;
+  file = NULL;
+  tcc_free(bf);
+  free_defines(boundary);
+  return 0;
+}
+
+UT_TEST(test_parse_define_function_macro_direct)
+{
+  Sym *boundary = define_stack;
+  int addtok = tok_alloc("add", 3)->tok;
+
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("(x,y) (x+y)\n") == 0);
+  tok = addtok;
+  parse_define();
+
+  Sym *s = define_find(addtok);
+  UT_ASSERT(s != NULL);
+  UT_ASSERT(s->type.t & MACRO_FUNC);
+  UT_ASSERT(s->next != NULL);
+
+  free_defines(boundary);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_parse_define_variadic_direct)
+{
+  Sym *boundary = define_stack;
+  int logtok = tok_alloc("logfn", 5)->tok;
+
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("(...) __VA_ARGS__\n") == 0);
+  tok = logtok;
+  parse_define();
+
+  Sym *s = define_find(logtok);
+  UT_ASSERT(s != NULL);
+  UT_ASSERT(s->type.t & MACRO_FUNC);
+
+  free_defines(boundary);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_pp_error_dumps_macro_context)
+{
+  TokenString str;
+  CString cs;
+
+  UT_ASSERT(ut_open_input("") == 0);
+
+  tok_str_new(&str);
+  tok_str_add(&str, TOK_IF);
+  tok_str_add(&str, 0);
+  begin_macro(&str, 0);
+
+  cstr_new(&cs);
+  pp_expr = TOK_IF;
+  pp_error(&cs);
+
+  UT_ASSERT(strstr(cs.data, "bad preprocessor expression") != NULL);
+  UT_ASSERT(strstr(cs.data, "if") != NULL);
+
+  cstr_free(&cs);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_define_undef_unmaterialized_builtin)
+{
+  Sym *s = tcc_mallocz(sizeof(Sym));
+  /* Use a builtin token that is unlikely to have been materialized yet. */
+  s->v = TOK___HAS_INCLUDE;
+  define_undef(s);
+  tcc_free(s);
+  return 0;
+}
+
+UT_TEST(test_preprocess_ifdef_endif)
+{
+  Sym *boundary = define_stack;
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#ifdef UNDEF\nx\n#endif\n") == 0);
+  preprocess(1);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+  free_defines(boundary);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_ifdef_defined)
+{
+  Sym *boundary = define_stack;
+  int xtok = tok_alloc("X", 1)->tok;
+  define_push(xtok, MACRO_OBJ, NULL, NULL);
+
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#ifdef X\ny\n#endif\n") == 0);
+  preprocess(1);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+
+  free_defines(boundary);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_ifndef_bof)
+{
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#ifndef FOO\n#endif\n") == 0);
+  preprocess(1);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+  UT_ASSERT_EQ(file->ifndef_macro, 0);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_if_elif_else)
+{
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#if 1\na\n#elif 1\nb\n#else\nc\n#endif\n") == 0);
+  preprocess(1);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_defined_operator)
+{
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#if defined(UNKNOWN)\n#endif\n") == 0);
+  preprocess(1);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_line_directive)
+{
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#line 42 \"new.c\"\n") == 0);
+  file->line_num = 10;
+  file->line_ref = 10;
+  strcpy(file->filename, "orig.c");
+  file->true_filename = file->filename;
+  preprocess(1);
+  /* #line N means the *following* line is line N, so the directive itself
+     is recorded as line N-1. */
+  UT_ASSERT_EQ(file->line_num, 41);
+  UT_ASSERT_STREQ(file->filename, "new.c");
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_warning)
+{
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#warning hello\n") == 0);
+  preprocess(1);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_error)
+{
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#error boom\n") == 0);
+  tcc_state->error_set_jmp_enabled = 1;
+  if (setjmp(tcc_state->error_jmp_buf) == 0)
+  {
+    preprocess(1);
+    tcc_state->error_set_jmp_enabled = 0;
+    file = NULL;
+    return -1;
+  }
+  tcc_state->error_set_jmp_enabled = 0;
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_include_errors)
+{
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#include \"missing.h\"\n") == 0);
+  tcc_state->error_set_jmp_enabled = 1;
+  if (setjmp(tcc_state->error_jmp_buf) == 0)
+  {
+    preprocess(1);
+    tcc_state->error_set_jmp_enabled = 0;
+    file = NULL;
+    return -1;
+  }
+  tcc_state->error_set_jmp_enabled = 0;
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_pragma_pack)
+{
+  tcc_state->pack_stack_ptr = tcc_state->pack_stack;
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#pragma pack(2)\n") == 0);
+  preprocess(1);
+  UT_ASSERT_EQ(*tcc_state->pack_stack_ptr, 2);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_pragma_once)
+{
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#pragma once\n") == 0);
+  strcpy(file->filename, "test.h");
+  file->true_filename = file->filename;
+  preprocess(1);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_unknown_pragma)
+{
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#pragma unknown_stuff\n") == 0);
+  preprocess(1);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+  file = NULL;
+  return 0;
+}
+
+UT_TEST(test_preprocess_pragma_push_pop_macro)
+{
+  Sym *boundary = define_stack;
+  int xtok = tok_alloc("X", 1)->tok;
+  define_push(xtok, MACRO_OBJ, NULL, NULL);
+
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("#pragma push_macro(\"X\")\n#pragma pop_macro(\"X\")\n") == 0);
+  preprocess(1);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+  preprocess(1);
+  UT_ASSERT_EQ(tok, TOK_LINEFEED);
+
+  free_defines(boundary);
+  file = NULL;
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(tccpp)
@@ -917,6 +1753,7 @@ UT_SUITE(tccpp)
   UT_RUN(test_cstr_u8cat_rejects_surrogate);
   UT_RUN(test_cstr_printf_reallocs_for_long_format);
   UT_RUN(test_cstr_cat_len_minus_one_on_empty_string);
+  UT_RUN(test_cstr_vprintf_formats_va_list);
 
   /* Token interning */
   UT_RUN(test_tok_alloc_returns_same_token_for_same_string);
@@ -937,6 +1774,8 @@ UT_SUITE(tccpp)
   UT_RUN(test_get_tok_str_wide_char_and_string);
   UT_RUN(test_get_tok_str_anonymous_and_nameless);
   UT_RUN(test_get_tok_str_invalid_control_char);
+  UT_RUN(test_get_tok_str_long_long_constants);
+  UT_RUN(test_get_tok_str_more_two_char_tokens);
 
   /* TokenString */
   UT_RUN(test_tok_str_alloc_initializes_empty);
@@ -945,12 +1784,20 @@ UT_SUITE(tccpp)
   UT_RUN(test_tok_str_ensure_heap_empty_returns_null);
   UT_RUN(test_tok_str_ensure_heap_converts_inline_to_heap);
   UT_RUN(test_tok_str_free_releases_heap_and_struct);
+  UT_RUN(test_tok_str_free_str_null_is_safe);
+  UT_RUN(test_begin_macro_static_buffer_end_macro_resets);
 
   /* tok_get round-trip */
   UT_RUN(test_tok_get_round_trip_int_string_eof);
   UT_RUN(test_tok_str_add2_string_round_trip);
   UT_RUN(test_tok_get_unsigned_and_double);
   UT_RUN(test_tok_get_line_and_pack_replay);
+  UT_RUN(test_tok_get_ppnum_ppstr_round_trip);
+  UT_RUN(test_tok_str_realloc_inline_to_heap);
+  UT_RUN(test_tok_str_realloc_heap_grows);
+  UT_RUN(test_tok_get_long_long_round_trip);
+  UT_RUN(test_tok_get_float_double_round_trip);
+  UT_RUN(test_define_find_returns_null_for_undefined);
 
   /* Misc public helpers */
   UT_RUN(test_set_idnum_changes_character_class);
@@ -962,9 +1809,47 @@ UT_SUITE(tccpp)
   UT_RUN(test_define_push_and_find_object_macro);
   UT_RUN(test_define_push_redefinition_checks_equality);
   UT_RUN(test_define_push_function_macro_with_args);
+  UT_RUN(test_define_push_equal_body_no_warning);
   UT_RUN(test_skip_to_eol_skips_logical_line);
+  UT_RUN(test_skip_to_eol_warns_on_extra_tokens);
+  UT_RUN(test_skip_to_eol_returns_on_linefeed);
   UT_RUN(test_expect_raises_error);
   UT_RUN(test_unget_tok_pushes_token_back);
+  UT_RUN(test_unget_tok_allocates_second_buffer);
+  UT_RUN(test_next_lexes_identifier);
+  UT_RUN(test_next_lexes_number_with_tok_num);
+  UT_RUN(test_next_lexes_string_with_tok_str);
+  UT_RUN(test_next_lexes_string_with_escapes);
+  UT_RUN(test_next_lexes_hex_number);
+  UT_RUN(test_next_lexes_increment_operator);
+  UT_RUN(test_next_skips_c_comment);
+  UT_RUN(test_next_with_macro_substitution);
+  UT_RUN(test_skip_advances_when_token_matches);
+  UT_RUN(test_skip_errors_when_token_mismatches);
+  UT_RUN(test_tccpp_putfile_relative_path);
+  UT_RUN(test_tccpp_putfile_absolute_path);
+  UT_RUN(test_preprocess_start_end_lifecycle);
+  UT_RUN(test_preprocess_start_asm_file);
+  UT_RUN(test_tcc_preprocess_simple);
+  UT_RUN(test_parse_define_function_macro_direct);
+  UT_RUN(test_parse_define_variadic_direct);
+  UT_RUN(test_pp_error_dumps_macro_context);
+  UT_RUN(test_define_undef_unmaterialized_builtin);
+  UT_RUN(test_preprocess_define_object_macro);
+  UT_RUN(test_preprocess_undef_removes_macro);
+  UT_RUN(test_preprocess_ifdef_endif);
+  UT_RUN(test_preprocess_ifdef_defined);
+  UT_RUN(test_preprocess_ifndef_bof);
+  UT_RUN(test_preprocess_if_elif_else);
+  UT_RUN(test_preprocess_defined_operator);
+  UT_RUN(test_preprocess_line_directive);
+  UT_RUN(test_preprocess_warning);
+  UT_RUN(test_preprocess_error);
+  UT_RUN(test_preprocess_include_errors);
+  UT_RUN(test_preprocess_pragma_pack);
+  UT_RUN(test_preprocess_pragma_once);
+  UT_RUN(test_preprocess_unknown_pragma);
+  UT_RUN(test_preprocess_pragma_push_pop_macro);
 
   /* #pragma pack replay */
   UT_RUN(test_pp_apply_pack_replay_set_push_pop);

@@ -83,6 +83,7 @@ enumeration in triage_olevels.sh.  Progress/stats go to stderr.
 from __future__ import annotations
 
 import argparse
+import atexit
 import concurrent.futures as cf
 import hashlib
 import itertools
@@ -91,6 +92,7 @@ import queue
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -678,6 +680,15 @@ def main(argv=None) -> int:
 
     tc = discover_toolchain()
     wd = Path(tempfile.mkdtemp(prefix="batchsweep_"))
+    # Clean up the (often ~500MB) workdir on ANY exit, not just a normal return.
+    # sweep_all.py drives us as a subprocess, so an interrupted band (Ctrl-C ->
+    # SIGINT, or a SIGTERM from the parent) used to skip the tail rmtree and leak
+    # the whole dir into /tmp -- enough interrupted bands filled tmpfs.  atexit
+    # fires on normal exit, unhandled exceptions and sys.exit; the SIGTERM handler
+    # routes that signal through sys.exit so cleanup fires for it too.
+    if not args.keep:
+        atexit.register(shutil.rmtree, wd, ignore_errors=True)
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
     compile_boot(wd, tc)
 
     # Persistent cache: sources depend only on (gen_c.py, profile, seed); gcc-*
@@ -771,9 +782,7 @@ def main(argv=None) -> int:
         for s in divergent:
             print(s)
 
-    if not args.keep:
-        shutil.rmtree(wd, ignore_errors=True)
-    return 0
+    return 0  # workdir cleanup is handled by the atexit hook registered above
 
 
 if __name__ == "__main__":

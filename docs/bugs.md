@@ -199,3 +199,88 @@ Regression pin: `tests/unit/arm/armv8m/test_tccdbg.c`,
 `test_dwarf_emit_reg_op_negative_reg_encodes_as_regx` and
 `test_dwarf_loc_reg_op_len_edge_cases`. Not yet fixed.
 
+
+## Bug: `exact_log2p1()` mis-handles `0x80000000` due to signed `int` parameter
+
+`tccgen.c`: `exact_log2p1()` (`tccgen.c:12596`)
+
+The function takes an `int` parameter and loops while `i >= 256`, shifting right.
+For the input `0x80000000` the argument becomes `INT_MIN`; the signed comparison
+`i >= 256` is false and the loop exits immediately, so the function returns `1`
+instead of `32`.  Any power-of-two value whose highest set bit is the sign bit
+is affected.
+
+Regression pin: `tests/unit/arm/armv8m/test_tccgen.c`,
+`test_exact_log2p1_int_min_power_of_two` (currently documents the buggy
+return value). Not yet fixed.
+
+## Bug: `subst_asm_operand()` modifier `'n'` neither prefixes `#` nor negates the value
+
+`arm-thumb-asm.c`: `subst_asm_operand()` (`arm-thumb-asm.c:223-226`)
+
+GCC's `'n'` asm operand modifier means "immediate integer operand with a
+known numeric value, negated".  The implementation in
+`subst_asm_operand()` does compute `val = -val` when `modifier == 'n'`,
+but then:
+
+1. The leading `'#'` guard (`modifier != 'n'`) suppresses the `#` prefix
+   for `'n'`, so the output is a bare number instead of an immediate.
+2. The formatted output uses `sv->c.i` directly instead of the negated
+   `val`, so the number is not negated either.
+
+Result: for an input constant `42`, modifier `'n'` currently produces
+`"42"` instead of the expected `"#-42"`.  Both the prefix and the sign
+are wrong.
+
+Regression pin: `tests/unit/arm/armv8m/test_arm_thumb_asm.c`,
+`test_subst_const_n_modifier_known_bug`. Not yet fixed.
+
+## Bug: `COND_NAMES_COUNT` is too small for the `cond_names[]` table
+
+`arm-thumb-defs.h`: `#define COND_NAMES_COUNT 16` (`arm-thumb-defs.h:297`)
+`arm-thumb-asm.c`: `cond_names[]` (`arm-thumb-asm.c:985-1004`)
+
+The table contains 18 entries: 16 ordinary condition names (`eq` through
+`al`), a `{NULL, 14}` terminator used as the default/unconditional case,
+and one alias (`hs`/`cs` or `lo`/`cc` depending on ordering).  Because the
+three loops over `cond_names` in `arm-thumb-asm.c` stop at
+`COND_NAMES_COUNT` (16), the `"al"` entry and everything after it are never
+consulted.  An explicit `addal`-style suffix therefore fails to match the
+condition code and is not stripped from the mnemonic, even though the
+assembler clearly intends `al` to be recognized (it is present in the
+array and has a dedicated `COND_AL` code).
+
+The mismatch also means the `{NULL, 14}` terminator is not reached by the
+loops, so the documented default-to-`AL` behavior only happens because the
+caller initializes `condition = COND_AL` before the loop, not because the
+terminator matched.
+
+Likely fix: set `COND_NAMES_COUNT` to the actual number of non-sentinel
+entries (or derive it with `ARRAY_SIZE(cond_names)`), and ensure the loops
+still stop before the `NULL` sentinel if the sentinel is meant to be a
+default rather than a searchable name.
+
+Not yet fixed.
+
+## Bug: `tcc_tcov_end()` allocates terminator bytes but does not initialize them
+
+`tccdbg.c`: `tcc_tcov_end()` (`tccdbg.c:3206-3214`)
+
+When test-coverage output is enabled, `tcc_tcov_end()` appends one byte to
+`tcov_section` for the last function name and one byte for the last file
+name.  Those bytes are intended as terminators for the preceding
+null-terminated strings, but `section_ptr_add()` only reserves the space;
+it does not write a value to it.  The bytes therefore contain whatever was
+already in the freshly allocated section memory, which is usually zero from
+`section_realloc()` but is not guaranteed.  If the bytes are ever non-zero,
+consumers that treat the coverage section as a sequence of
+null-terminated strings will read past the intended end.
+
+Likely fix: write `0` to the newly allocated byte(s), e.g.
+`((char *)tcov_section->data)[tcov_section->data_offset - 1] = '\0';`
+after each `section_ptr_add()`.
+
+Regression pin: `tests/unit/arm/armv8m/test_tccdbg.c`,
+`test_tcc_tcov_end_appends_terminators` (currently asserts only that the
+section offset advanced; it does not assert the byte is zero). Not yet
+fixed.

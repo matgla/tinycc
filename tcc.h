@@ -2161,6 +2161,7 @@ ST_FUNC Sym *global_identifier_push(int v, int t, int c);
 ST_FUNC Sym *external_global_sym(int v, CType *type);
 ST_FUNC Sym *external_helper_sym(int v);
 ST_FUNC void vpush_helper_func(int v);
+ST_FUNC void vpush_typed_helper_func(int v, CType *type);
 ST_FUNC void vset(CType *type, int r, int v);
 ST_FUNC void vset_VT_CMP(int op);
 ST_FUNC void vpushi(int v);

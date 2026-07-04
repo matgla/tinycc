@@ -517,6 +517,15 @@ ifeq ($(J),1)
 PYTEST_XDIST =
 endif
 
+# Verbose pytest output (per-test names) only in CI; keep local runs terse.
+# Usage: make test CI=1
+CI ?= 0
+ifeq ($(CI),1)
+PYTEST_VERBOSE := -v
+else
+PYTEST_VERBOSE :=
+endif
+
 # Cross compiler used by pytest test suites.
 CROSS_COMPILER = $(CURDIR)/armv8m-tcc
 
@@ -735,9 +744,9 @@ test-selfhost: cross
 test-ir: cross test-venv test-prepare download-gcc-tests
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -v $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s $(PYTEST_VERBOSE) $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -s -v $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s $(PYTEST_VERBOSE) $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
 	fi
 
 # container target: runs the full test suite (all test-* targets below)

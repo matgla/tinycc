@@ -93,11 +93,11 @@ static uint16_t read_le16(const unsigned char *p)
   return (uint16_t)(p[0] | (p[1] << 8));
 }
 
-static int bytes_match_opcode(int n, thumb_opcode op)
+static int bytes_match_opcode_at(int off, int n, thumb_opcode op)
 {
   if (n != op.size)
     return 0;
-  const unsigned char *d = cur_text_section->data;
+  const unsigned char *d = cur_text_section->data + off;
   if (op.size == 2)
     return d[0] == (op.opcode & 0xff) && d[1] == ((op.opcode >> 8) & 0xff);
   uint16_t hw0 = (uint16_t)(op.opcode >> 16);
@@ -105,6 +105,8 @@ static int bytes_match_opcode(int n, thumb_opcode op)
   return d[0] == (hw0 & 0xff) && d[1] == ((hw0 >> 8) & 0xff) && d[2] == (hw1 & 0xff) &&
          d[3] == ((hw1 >> 8) & 0xff);
 }
+
+#define bytes_match_opcode(n, op) bytes_match_opcode_at(0, n, op)
 
 /* ------------------------------------------------------------------ arith */
 
@@ -443,6 +445,439 @@ UT_TEST(test_dispatch_func_parameter_void_creates_empty_site)
   return 0;
 }
 
+/* ------------------------------------------------------------------ ABI hook */
+
+UT_TEST(test_abi_assign_call_args_rejects_null_layout)
+{
+  setup_gen();
+
+  TCCAbiArgDesc arg = {TCC_ABI_ARG_SCALAR32, 4, 4};
+  UT_ASSERT_EQ(tcc_gen_machine_abi_assign_call_args(&arg, 1, NULL), -1);
+
+  return 0;
+}
+
+UT_TEST(test_abi_assign_call_args_rejects_null_args_when_nonzero)
+{
+  setup_gen();
+
+  TCCAbiArgLoc locs[1];
+  memset(locs, 0, sizeof(locs));
+  TCCAbiCallLayout layout;
+  memset(&layout, 0, sizeof(layout));
+  layout.locs = locs;
+  layout.capacity = 1;
+
+  UT_ASSERT_EQ(tcc_gen_machine_abi_assign_call_args(NULL, 1, &layout), -1);
+
+  return 0;
+}
+
+UT_TEST(test_abi_assign_call_args_scalar32_to_r0)
+{
+  setup_gen();
+
+  TCCAbiArgLoc locs[2];
+  memset(locs, 0, sizeof(locs));
+  TCCAbiCallLayout layout;
+  memset(&layout, 0, sizeof(layout));
+  layout.locs = locs;
+  layout.capacity = 2;
+  TCCAbiArgDesc arg = {TCC_ABI_ARG_SCALAR32, 4, 4};
+
+  UT_ASSERT_EQ(tcc_gen_machine_abi_assign_call_args(&arg, 1, &layout), 0);
+  UT_ASSERT_EQ(layout.argc, 1);
+  UT_ASSERT_EQ(layout.locs[0].kind, TCC_ABI_LOC_REG);
+  UT_ASSERT_EQ(layout.locs[0].reg_base, 0);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ branch optimization state */
+
+UT_TEST(test_branch_opt_default_encoding_is_32)
+{
+  setup_gen();
+
+  tcc_gen_machine_branch_opt_init();
+  UT_ASSERT_EQ(tcc_gen_machine_branch_opt_get_encoding(0), 32);
+  UT_ASSERT_EQ(tcc_gen_machine_branch_opt_get_encoding(999), 32);
+
+  return 0;
+}
+
+UT_TEST(test_branch_opt_analyze_empty_mapping_no_crash)
+{
+  setup_gen();
+
+  tcc_gen_machine_branch_opt_init();
+  uint32_t mapping[4] = {0, 10, 20, 30};
+  tcc_gen_machine_branch_opt_analyze(mapping, 4);
+  /* With no recorded branches the conservative fallback remains. */
+  UT_ASSERT_EQ(tcc_gen_machine_branch_opt_get_encoding(0), 32);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ dry-run state */
+
+UT_TEST(test_dry_run_lifecycle)
+{
+  setup_gen();
+
+  tcc_gen_machine_dry_run_init();
+  UT_ASSERT_EQ(tcc_gen_machine_dry_run_is_active(), 0);
+
+  tcc_gen_machine_dry_run_start();
+  UT_ASSERT_EQ(tcc_gen_machine_dry_run_is_active(), 1);
+
+  tcc_gen_machine_dry_run_end();
+  UT_ASSERT_EQ(tcc_gen_machine_dry_run_is_active(), 0);
+
+  return 0;
+}
+
+UT_TEST(test_dry_run_counters_initially_zero)
+{
+  setup_gen();
+
+  tcc_gen_machine_dry_run_init();
+  tcc_gen_machine_dry_run_start();
+  UT_ASSERT_EQ(tcc_gen_machine_dry_run_get_lr_push_count(), 0);
+  UT_ASSERT_EQ(tcc_gen_machine_dry_run_get_scratch_regs_pushed(), 0u);
+
+  tcc_gen_machine_dry_run_end();
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ scratch tracking */
+
+UT_TEST(test_insn_scratch_reset_count_saves_mask)
+{
+  setup_gen();
+
+  tcc_gen_machine_insn_scratch_reset();
+  UT_ASSERT_EQ(tcc_gen_machine_insn_scratch_count(), 0);
+  UT_ASSERT_EQ(tcc_gen_machine_insn_scratch_saves_mask(), 0);
+
+  return 0;
+}
+
+UT_TEST(test_reset_scratch_state_no_crash)
+{
+  setup_gen();
+
+  tcc_gen_machine_reset_scratch_state();
+  UT_ASSERT_EQ(tcc_gen_machine_real_run_had_scratch_push(), 0);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ cache resets */
+
+UT_TEST(test_mov_coalesce_reset_no_crash)
+{
+  setup_gen();
+
+  tcc_gen_machine_mov_coalesce_reset();
+  UT_ASSERT(1);
+
+  return 0;
+}
+
+UT_TEST(test_mov_equiv_reset_no_crash)
+{
+  setup_gen();
+
+  tcc_gen_machine_mov_equiv_reset();
+  UT_ASSERT(1);
+
+  return 0;
+}
+
+UT_TEST(test_imm_cache_reset_and_invalidate_live_no_crash)
+{
+  setup_gen();
+
+  tcc_gen_machine_imm_cache_reset();
+  tcc_gen_machine_imm_cache_invalidate_live(0x000f);
+  tcc_gen_machine_imm_cache_invalidate_live(0);
+  UT_ASSERT(1);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ fill nops */
+
+UT_TEST(test_gen_fill_nops_emits_two_nops_per_four_bytes)
+{
+  setup_gen();
+
+  gen_fill_nops(4);
+
+  UT_ASSERT_EQ(ind, 4);
+  UT_ASSERT(bytes_match_opcode(2, th_nop(ENFORCE_ENCODING_16BIT)));
+  UT_ASSERT(bytes_match_opcode(2, th_nop(ENFORCE_ENCODING_16BIT)));
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ scratch acquire/release */
+
+UT_TEST(test_scratch_acquire_single_returns_reg_and_pushes_if_needed)
+{
+  setup_gen();
+
+  TCCMachineScratchRegs scratch = {0};
+  tcc_machine_acquire_scratch(&scratch, 0);
+
+  UT_ASSERT_EQ(scratch.reg_count, 1);
+  UT_ASSERT(scratch.regs[0] >= 0);
+
+  tcc_machine_release_scratch(&scratch);
+
+  return 0;
+}
+
+UT_TEST(test_scratch_acquire_pair_with_avoid_arg_regs)
+{
+  setup_gen();
+
+  TCCMachineScratchRegs scratch = {0};
+  tcc_machine_acquire_scratch(&scratch, TCC_MACHINE_SCRATCH_NEEDS_PAIR |
+                                             TCC_MACHINE_SCRATCH_AVOID_CALL_ARG_REGS);
+
+  UT_ASSERT_EQ(scratch.reg_count, 2);
+  UT_ASSERT(scratch.regs[0] != R0 && scratch.regs[0] != R1 && scratch.regs[0] != R2 &&
+             scratch.regs[0] != R3);
+  UT_ASSERT(scratch.regs[1] != R0 && scratch.regs[1] != R1 && scratch.regs[1] != R2 &&
+             scratch.regs[1] != R3);
+
+  tcc_machine_release_scratch(&scratch);
+
+  return 0;
+}
+
+UT_TEST(test_scratch_acquire_avoid_perm_scratch)
+{
+  setup_gen();
+
+  TCCMachineScratchRegs scratch = {0};
+  tcc_machine_acquire_scratch(&scratch, TCC_MACHINE_SCRATCH_AVOID_PERM_SCRATCH);
+
+  UT_ASSERT_EQ(scratch.reg_count, 1);
+  UT_ASSERT(scratch.regs[0] != R11 && scratch.regs[0] != R12);
+
+  tcc_machine_release_scratch(&scratch);
+
+  return 0;
+}
+
+UT_TEST(test_scratch_release_null_is_noop)
+{
+  setup_gen();
+
+  tcc_machine_release_scratch(NULL);
+  UT_ASSERT(1);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ CBZ/CBNZ */
+
+UT_TEST(test_cbz_jump_mop_emits_cbz)
+{
+  setup_gen();
+
+  int size = tcc_gen_machine_cbz_jump_mop(R1, /*nonzero=*/0, /*target_ir=*/1, /*ir_idx=*/0);
+
+  UT_ASSERT_EQ(size, 2);
+  UT_ASSERT_EQ(ind, 2);
+  UT_ASSERT(bytes_match_opcode(ind, th_cbz(R1, 0, 0)));
+
+  return 0;
+}
+
+UT_TEST(test_cbnz_jump_mop_emits_cbnz)
+{
+  setup_gen();
+
+  tcc_gen_machine_cbz_jump_mop(R2, /*nonzero=*/1, /*target_ir=*/1, /*ir_idx=*/0);
+
+  UT_ASSERT_EQ(ind, 2);
+  UT_ASSERT(bytes_match_opcode(ind, th_cbz(R2, 0, 1)));
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ chain helpers */
+
+UT_TEST(test_restore_chain_loads_from_chain_slot)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  tcc_gen_machine_restore_chain();
+
+  /* The static chain register is R10 (a high register), so the LDR from
+   * [FP, #-4] uses the 32-bit T3 encoding (4 bytes). */
+  UT_ASSERT_EQ(ind, 4);
+  UT_ASSERT(bytes_match_opcode(ind, th_ldr_imm(R10, R_FP, 4, 4 /* subtract */, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ end instruction */
+
+UT_TEST(test_end_instruction_restores_pushed_scratch_regs)
+{
+  setup_gen();
+
+  /* Acquire and release a scratch register through the public helpers so
+   * end_instruction has something to restore. */
+  TCCMachineScratchRegs scratch = {0};
+  tcc_machine_acquire_scratch(&scratch, 0);
+  tcc_gen_machine_end_instruction();
+
+  UT_ASSERT(1);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ stack-offset encoding */
+
+UT_TEST(test_can_encode_stack_offset_for_reg_fp_small_offset)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  UT_ASSERT_EQ(tcc_machine_can_encode_stack_offset_for_reg(-8, R2), 1);
+
+  return 0;
+}
+
+UT_TEST(test_can_encode_stack_offset_with_param_adj)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+  offset_to_args = 16;
+
+  UT_ASSERT_EQ(tcc_machine_can_encode_stack_offset_with_param_adj(8, 1, R2), 1);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ load constant / cmp / jmp result */
+
+UT_TEST(test_load_constant_32bit_imm_emits_mov)
+{
+  setup_gen();
+
+  tcc_machine_load_constant(R2, PREG_REG_NONE, 42, 0, NULL);
+
+  UT_ASSERT_EQ(ind, 2);
+  UT_ASSERT(bytes_match_opcode(ind, th_mov_imm(R2, 42, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_load_constant_64bit_imm_emits_two_movs)
+{
+  setup_gen();
+
+  /* Each 32-bit half (0x1234, 0x5678) is a 16-bit value that encodes as a
+   * single 4-byte MOVW, so load_constant emits two MOVWs (8 bytes) rather than
+   * falling back to the 64-bit literal pool.  A half > 0xFFFF that is not a
+   * modified-immediate would need MOVW+MOVT and take the pool path instead. */
+  tcc_machine_load_constant(R2, R3, 0x0000567800001234LL, 1, NULL);
+
+  UT_ASSERT_EQ(ind, 8);
+
+  return 0;
+}
+
+UT_TEST(test_load_cmp_result_eq_emits_ite_movs)
+{
+  setup_gen();
+
+  tcc_machine_load_cmp_result(R0, TOK_EQ);
+
+  UT_ASSERT_EQ(ind, 6);
+  /* ITE EQ: cond=EQ(0), mask=0xC => 0xbf0c */
+  UT_ASSERT_EQ(read_le16(cur_text_section->data), 0xbf0c);
+  UT_ASSERT(bytes_match_opcode_at(2, 2, th_mov_imm(R0, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)));
+  UT_ASSERT(bytes_match_opcode_at(4, 2, th_mov_imm(R0, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_load_jmp_result_non_invert_emits_mov_branch_mov)
+{
+  setup_gen();
+
+  /* jmp_addr == 0 is gsym()'s "no chain" sentinel (a no-op), so
+   * tcc_machine_load_jmp_result emits exactly: MOV R0,#1 ; B.W +2 ; MOV R0,#0
+   * (2 + 4 + 2 = 8 bytes).  The two MOVs are 16-bit MOVS (flags-not-important,
+   * imm fits in 8 bits); the branch over the "false" value is a 32-bit B.W. */
+  tcc_machine_load_jmp_result(R0, 0, 0);
+
+  UT_ASSERT_EQ(ind, 8);
+  UT_ASSERT(bytes_match_opcode_at(0, 2, th_mov_imm(R0, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)));
+  UT_ASSERT(bytes_match_opcode_at(2, 4, th_b_t4(2)));
+  UT_ASSERT(bytes_match_opcode_at(6, 2, th_mov_imm(R0, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ literal pool reservation */
+
+UT_TEST(test_reserve_pool_bytes_tracks_pending_bytes)
+{
+  setup_gen();
+
+  int before = tcc_gen_machine_pending_pool_size();
+  tcc_gen_machine_reserve_pool_bytes(8);
+  int after = tcc_gen_machine_pending_pool_size();
+
+  UT_ASSERT_EQ(before, 0);
+  UT_ASSERT(after >= before);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ misc state helpers */
+
+UT_TEST(test_number_of_registers_returns_11)
+{
+  setup_gen();
+
+  UT_ASSERT_EQ(tcc_gen_machine_number_of_registers(), 11);
+
+  return 0;
+}
+
+UT_TEST(test_pending_pool_size_empty_returns_zero)
+{
+  setup_gen();
+
+  UT_ASSERT_EQ(tcc_gen_machine_pending_pool_size(), 0);
+
+  return 0;
+}
+
+UT_TEST(test_set_chain_emits_mov_r10_fp)
+{
+  setup_gen();
+
+  tcc_gen_machine_set_chain();
+  UT_ASSERT_EQ(ind, 2);
+  UT_ASSERT(bytes_match_opcode(ind, th_mov_reg(R10, R_FP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                               ENFORCE_ENCODING_NONE, false)));
+
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(gen_dispatch_smoke)
@@ -470,4 +905,45 @@ UT_SUITE(gen_dispatch_smoke)
   UT_RUN(test_dispatch_return_value_imm_emits_mov_r0);
   UT_RUN(test_dispatch_lea_param_stack_emits_add);
   UT_RUN(test_dispatch_func_parameter_void_creates_empty_site);
+
+  UT_RUN(test_abi_assign_call_args_rejects_null_layout);
+  UT_RUN(test_abi_assign_call_args_rejects_null_args_when_nonzero);
+  UT_RUN(test_abi_assign_call_args_scalar32_to_r0);
+  UT_RUN(test_branch_opt_default_encoding_is_32);
+  UT_RUN(test_branch_opt_analyze_empty_mapping_no_crash);
+  UT_RUN(test_dry_run_lifecycle);
+  UT_RUN(test_dry_run_counters_initially_zero);
+  UT_RUN(test_insn_scratch_reset_count_saves_mask);
+  UT_RUN(test_reset_scratch_state_no_crash);
+  UT_RUN(test_mov_coalesce_reset_no_crash);
+  UT_RUN(test_mov_equiv_reset_no_crash);
+  UT_RUN(test_imm_cache_reset_and_invalidate_live_no_crash);
+
+  UT_RUN(test_gen_fill_nops_emits_two_nops_per_four_bytes);
+
+  UT_RUN(test_scratch_acquire_single_returns_reg_and_pushes_if_needed);
+  UT_RUN(test_scratch_acquire_pair_with_avoid_arg_regs);
+  UT_RUN(test_scratch_acquire_avoid_perm_scratch);
+  UT_RUN(test_scratch_release_null_is_noop);
+
+  UT_RUN(test_cbz_jump_mop_emits_cbz);
+  UT_RUN(test_cbnz_jump_mop_emits_cbnz);
+
+  UT_RUN(test_restore_chain_loads_from_chain_slot);
+
+  UT_RUN(test_end_instruction_restores_pushed_scratch_regs);
+
+  UT_RUN(test_can_encode_stack_offset_for_reg_fp_small_offset);
+  UT_RUN(test_can_encode_stack_offset_with_param_adj);
+
+  UT_RUN(test_load_constant_32bit_imm_emits_mov);
+  UT_RUN(test_load_constant_64bit_imm_emits_two_movs);
+  UT_RUN(test_load_cmp_result_eq_emits_ite_movs);
+  UT_RUN(test_load_jmp_result_non_invert_emits_mov_branch_mov);
+
+  UT_RUN(test_reserve_pool_bytes_tracks_pending_bytes);
+
+  UT_RUN(test_number_of_registers_returns_11);
+  UT_RUN(test_pending_pool_size_empty_returns_zero);
+  UT_RUN(test_set_chain_emits_mov_r10_fp);
 }

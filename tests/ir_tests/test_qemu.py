@@ -665,6 +665,90 @@ TEST_FILES = [
     # CMP operands to be single-def before trusting the offset relationship.
     ("295_fuzz_cmp_offset_fold_backedge_redef.c", 0),
 
+    # agg_deep fuzz seeds 52367/53515 (O2 HardFault): the codegen ASSIGN-lowering
+    # STRD peephole fused a `T <- *ppa` def (an ASSIGN whose REG src has
+    # needs_deref) into a plain reg->spill STRD, spilling the pointer raw and
+    # dropping a level of indirection; the later `*T = x` corrupted the pointer
+    # and the next `**ppa` read faulted. Fixed by mirroring the !src1.needs_deref
+    # guard the STORE/STORE_INDEXED STRD peepholes already use.
+    ("296_fuzz_assign_strd_deref_src.c", 0),
+
+    # ptr fuzz seed 72674 (O2): sl_forward re-validated a multiply-defined merge
+    # temp (a ?: diamond result) after forwarding its else-arm LOAD, so the merge
+    # store resolved through the stale else-arm value and the following load
+    # forwarded the wrong arm. Fixed by rejecting multi-def temps when consuming
+    # the fwd_tmp_val tracking table.
+    ("297_fuzz_slfwd_multidef_merge_temp.c", 0),
+
+    # struct_byval fuzz seed 60351 (O2): same sl_forward multiply-defined ?:
+    # merge-temp root cause as seed 72674, reached from the struct-by-value
+    # profile -- the ternary result is stored into a by-value struct argument
+    # slot before being read back, so the wrong ?: arm was forwarded through the
+    # struct store. Fixed by the same fwd_tmp_defs < 2 consume-site guards.
+    ("298_fuzz_slfwd_struct_merge.c", 0),
+
+    # volatile fuzz seed 64026 (O1 internal compiler error): the identical-block
+    # loop re-roller (ir/opt_reroll.c) matched a phase-shifted window over a run
+    # of `PARAM0; PARAM1; CALL` call groups, placing the period boundary between
+    # a call's params and its own CALL. Re-rolling the shifted window NOP'd the
+    # last call's FUNCPARAMVAL markers while leaving its FUNCCALLVAL standing, so
+    # the backend callsite scan aborted with "missing FUNCPARAMVAL for call_id=N".
+    # Fixed by requiring the canonical body to be call-balanced so the boundary
+    # lands on a real call-group edge (natural alignment).
+    ("299_fuzz_reroll_call_phase_split.c", 0),
+
+    # combo fuzz seed 74935 (O2): SSA copy-propagation (ssa_opt_cprop's
+    # ssa_gen_cprop_copy_var_stackoff) forwarded an address-taken local
+    # `u10` across an aliasing store `*p11 = k` (p11 == &u10) into the uses
+    # of a `u9 = u10 ^ 0` copy temp. The barrier scan only bailed on a direct
+    # redef of u10's vreg, missing the deref store (whose dest is the pointer,
+    # not u10), so the forwarded read saw the clobbered slot. Fixed by bailing
+    # on any intervening memory store when the STACKOFF source is address-taken;
+    # the sibling ssa_gen_cprop_copy_param got the same guard.
+    ("300_fuzz_cprop_var_stackoff_alias_store.c", 0),
+
+    # combo_num seed 84127 (O1) / ptr seed 80958 (O2): the 64-bit register-pair
+    # call-crossing eviction fallback in ra_linear_scan spilled a
+    # loop_phi_locked single-INT victim (a loop counter sharing its register
+    # with a live coalesce partner) to free a pair, double-booking the register
+    # with a 64-bit value's high half -> clobbered loop counter.  Fixed by
+    # skipping loop_phi_locked victims, as the single-register spill path does.
+    ("301_fuzz_llong_pair_evict_loop_phi.c", 0),
+
+    # agg_deep seed 86393 (O1): tcc_ir_opt_ptr_load_cse forwarded a pointer
+    # deref (`**ppa212` == u4's slot; u4 is address-taken) across an aliasing
+    # store to u4.  The pass flushed its deref cache on a register-form write to
+    # an address-taken VAR but not on the is_lval ASSIGN form the frontend emits
+    # when the VAR is materialized to memory (it is read via a pointer after),
+    # and that ASSIGN is not a STORE op, so the cache was never invalidated and
+    # the second `(**ppa212) & 31` re-used the stale pre-store value.  Fixed by
+    # flushing on ANY write to an address-taken VAR; the sibling local ALU-CSE
+    # pass got the same treatment for cached deref (lval-src) entries.
+    ("302_fuzz_ptr_load_cse_addrtaken_lval_store.c", 0),
+
+    # ptr seed 80958 (O2): ptr_store_load_fwd (Phase 6b) NOP'd a live store as
+    # redundant because an intervening runtime-index LOAD_INDEXED that reads it
+    # was not registered as a read.  Two stores to arr[1] straddle an
+    # `arr[i&7]` read; after const_prop_tmp folded both offsets to `+4`,
+    # local_alu_cse coalesced their addresses to one vreg, so the second store
+    # killed the first — but when i&7==1 the load reads arr[1], feeding the
+    # second store, so the first is live.  Fixed by marking pending stores as
+    # loaded on any LOAD_INDEXED (RSE runtime-base class, agg_deep seed 36641).
+    ("303_fuzz_pslfwd_indexed_read_alias.c", 0),
+
+    # ptr seed 85636 (O1): add_reassoc forwarded an address-taken local's
+    # arithmetic def (`u4 = u3 + C1`) across an aliasing pointer store `*p7=...`
+    # (p7==&u4) that redefined u4, then folded `u4 + C2` into `u3 + (C1+C2)`
+    # off u4's stale pre-store value.  The linear def lookup is blind to the
+    # store; fixed by bailing when the forwarded base or its inner var is an
+    # address-taken VAR and a memory-clobbering STORE/CALL sits in the gap.
+    ("304_fuzz_add_reassoc_addrtaken_alias.c", 0),
+
+    # longlong seed 111125 (vs-gcc): opt_bitfield's masked-extract fold used
+    # tcc_ir_find_defining_instruction on a TEMP with multiple reaching defs,
+    # saw only a zero-valued arm, and folded `(T | C) & 1` to `T`.
+    ("306_fuzz_bitfield_multidef_masked_extract.c", 0),
+
     # Promoted from orphan triage: builtins, _Complex, aggregate init,
     # 64-bit ops, cast/bitfield, and previously-fixed bug regressions.
     # Verified against the gcc -m32 -funsigned-char oracle.

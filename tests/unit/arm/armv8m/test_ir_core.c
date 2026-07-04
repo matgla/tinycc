@@ -10,6 +10,9 @@
 
 #include "ut.h"
 
+extern IRLiveInterval *tcc_ir_try_get_live_interval(TCCIRState *ir, int vreg);
+extern IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg);
+
 static SValue sv_var(int vreg)
 {
   SValue sv;
@@ -59,6 +62,45 @@ static SValue sv_var_llong(int vreg)
   svalue_init(&sv);
   sv.vr = vreg;
   sv.type.t = VT_LLONG;
+  return sv;
+}
+
+static SValue sv_float_var(int vreg)
+{
+  SValue sv;
+  svalue_init(&sv);
+  sv.vr = vreg;
+  sv.type.t = VT_FLOAT;
+  return sv;
+}
+
+static SValue sv_complex_var(int vreg)
+{
+  SValue sv;
+  svalue_init(&sv);
+  sv.vr = vreg;
+  sv.type.t = VT_FLOAT | VT_COMPLEX;
+  return sv;
+}
+
+static SValue sv_untyped(int vreg)
+{
+  SValue sv;
+  svalue_init(&sv);
+  sv.vr = vreg;
+  sv.type.t = 0;
+  return sv;
+}
+
+static SValue sv_anon_sym(Sym *sym)
+{
+  SValue sv;
+  svalue_init(&sv);
+  sv.r = VT_CONST | VT_SYM;
+  sv.sym = sym;
+  sv.c.i = 0;
+  sv.type.t = VT_INT;
+  sv.vr = -1;
   return sv;
 }
 
@@ -975,6 +1017,387 @@ UT_TEST(test_irop_config_shapes)
 }
 
 /* -------------------------------------------------------------------------- */
+/* Live interval access (non-fatal and fatal wrappers)                        */
+/* -------------------------------------------------------------------------- */
+
+UT_TEST(test_try_get_live_interval_null_and_invalid)
+{
+  UT_ASSERT(tcc_ir_try_get_live_interval(NULL, 0) == NULL);
+
+  TCCIRState *ir = tcc_ir_alloc();
+  int t0 = tcc_ir_vreg_alloc_temp(ir);
+
+  UT_ASSERT(tcc_ir_try_get_live_interval(ir, -1) == NULL);
+  UT_ASSERT(tcc_ir_try_get_live_interval(ir, TCCIR_ENCODE_VREG(4, 0)) == NULL);
+  UT_ASSERT(tcc_ir_try_get_live_interval(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 1000000)) == NULL);
+  UT_ASSERT(tcc_ir_try_get_live_interval(ir, t0) == tcc_ir_vreg_live_interval(ir, t0));
+
+  tcc_ir_free(ir);
+  return 0;
+}
+
+UT_TEST(test_get_live_interval_matches_vreg_live_interval)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  int v0 = tcc_ir_vreg_alloc_var(ir);
+  UT_ASSERT(tcc_ir_get_live_interval(ir, v0) == tcc_ir_vreg_live_interval(ir, v0));
+  tcc_ir_free(ir);
+  return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Function setup helpers                                                     */
+/* -------------------------------------------------------------------------- */
+
+UT_TEST(test_local_add_computes_stack_address)
+{
+  int saved_loc = loc;
+  loc = 0;
+
+  TCCIRState *ir = tcc_ir_alloc();
+  Sym sym;
+  memset(&sym, 0, sizeof(sym));
+  sym.v = 0x123;
+  sym.type.t = VT_INT;
+  sym.type.ref = NULL;
+
+  int addr = tcc_ir_local_add(ir, &sym, 0);
+  UT_ASSERT_EQ(addr, -4);
+  UT_ASSERT_EQ(loc, -4);
+
+  tcc_ir_free(ir);
+  loc = saved_loc;
+  return 0;
+}
+
+UT_TEST(test_params_update_tracking)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+
+  /* NULL ir must be a no-op. */
+  TCCAbiArgLoc loc1 = { TCC_ABI_LOC_REG, 0, 2, 0, 8, 0 };
+  TCCAbiCallLayout layout = { 0 };
+  layout.next_reg = 2;
+  tcc_ir_params_update_tracking(NULL, loc1, &layout);
+
+  /* Register argument: track max of actual reg bytes and layout-consumed bytes. */
+  tcc_ir_params_update_tracking(ir, loc1, &layout);
+  UT_ASSERT_EQ(ir->named_arg_reg_bytes, 8);
+  UT_ASSERT_EQ(ir->named_arg_stack_bytes, 0);
+
+  /* Split register/stack argument. */
+  TCCAbiArgLoc loc2 = { TCC_ABI_LOC_REG_STACK, 1, 2, 8, 16, 8 };
+  layout.next_reg = 4;
+  tcc_ir_params_update_tracking(ir, loc2, &layout);
+  UT_ASSERT_EQ(ir->named_arg_reg_bytes, 16);
+  UT_ASSERT_EQ(ir->named_arg_stack_bytes, 16);
+
+  /* Pure stack argument with no layout pointer. */
+  TCCAbiArgLoc loc3 = { TCC_ABI_LOC_STACK, 0, 0, 4, 8, 0 };
+  tcc_ir_params_update_tracking(ir, loc3, NULL);
+  UT_ASSERT_EQ(ir->named_arg_reg_bytes, 16);
+  UT_ASSERT_EQ(ir->named_arg_stack_bytes, 16);
+
+  tcc_ir_free(ir);
+  return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Jump-chain backpatching edge cases                                         */
+/* -------------------------------------------------------------------------- */
+
+UT_TEST(test_backpatch_sets_pending_jump_target_flag)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  SValue target = sv_jump_target(-1);
+  int head = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &target);
+
+  tcc_ir_backpatch(ir, head, ir->next_instruction_index);
+
+  UT_ASSERT(ir->next_insn_is_jump_target);
+
+  tcc_ir_put_no_op(ir, TCCIR_OP_NOP);
+
+  UT_ASSERT(ir->compact_instructions[head + 1].is_jump_target);
+
+  tcc_ir_free(ir);
+  return 0;
+}
+
+UT_TEST(test_backpatch_stops_when_next_already_target)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  SValue t1 = sv_jump_target(1);
+  int j0 = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &t1);
+  SValue t2 = sv_jump_target(2);
+  int j1 = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &t2);
+  SValue t3 = sv_jump_target(3);
+  int j2 = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &t3);
+
+  tcc_ir_backpatch(ir, j0, 3);
+
+  UT_ASSERT_EQ(irop_get_imm32(tcc_ir_op_get_dest(ir, &ir->compact_instructions[j0])), 3);
+  UT_ASSERT_EQ(irop_get_imm32(tcc_ir_op_get_dest(ir, &ir->compact_instructions[j1])), 3);
+  UT_ASSERT_EQ(irop_get_imm32(tcc_ir_op_get_dest(ir, &ir->compact_instructions[j2])), 3);
+
+  tcc_ir_free(ir);
+  return 0;
+}
+
+UT_TEST(test_backpatch_first_stops_at_out_of_range)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  SValue t1 = sv_jump_target(1);
+  int j0 = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &t1);
+  SValue bad = sv_jump_target(99);
+  int j1 = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &bad);
+
+  tcc_ir_backpatch_first(ir, j0, 42);
+
+  IROperand d0 = tcc_ir_op_get_dest(ir, &ir->compact_instructions[j0]);
+  IROperand d1 = tcc_ir_op_get_dest(ir, &ir->compact_instructions[j1]);
+  UT_ASSERT_EQ(irop_get_imm32(d0), 1);
+  UT_ASSERT_EQ(irop_get_imm32(d1), 42);
+
+  tcc_ir_free(ir);
+  return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Instruction array growth and jump-target flag plumbing                     */
+/* -------------------------------------------------------------------------- */
+
+UT_TEST(test_put_grows_compact_instructions_past_initial_capacity)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  for (int i = 0; i < 130; ++i)
+  {
+    int idx = tcc_ir_put_no_op(ir, TCCIR_OP_NOP);
+    UT_ASSERT_EQ(idx, i);
+  }
+  UT_ASSERT_EQ(tcc_ir_count(ir), 130);
+  UT_ASSERT(ir->compact_instructions_size >= 130);
+
+  tcc_ir_free(ir);
+  return 0;
+}
+
+UT_TEST(test_put_honors_next_insn_is_jump_target)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  ir->next_insn_is_jump_target = 1;
+  int idx = tcc_ir_put_no_op(ir, TCCIR_OP_NOP);
+  UT_ASSERT(ir->compact_instructions[idx].is_jump_target);
+  UT_ASSERT(!ir->next_insn_is_jump_target);
+  tcc_ir_free(ir);
+  return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* tcc_ir_put destination-type inference corner cases                         */
+/* -------------------------------------------------------------------------- */
+
+UT_TEST(test_put_dest_type_inference_corner_cases)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  int v0 = tcc_ir_vreg_alloc_var(ir);
+  int t0 = tcc_ir_vreg_alloc_temp(ir);
+  int t1 = tcc_ir_vreg_alloc_temp(ir);
+  int t2 = tcc_ir_vreg_alloc_temp(ir);
+  int t3 = tcc_ir_vreg_alloc_temp(ir);
+
+  /* Untyped dest inherits float type from src1 and marks the vreg as float. */
+  SValue src_float = sv_float_var(v0);
+  SValue dest_float = sv_untyped(t0);
+  tcc_ir_put(ir, TCCIR_OP_ASSIGN, &src_float, NULL, &dest_float);
+  IRLiveInterval *iv_float = tcc_ir_vreg_live_interval(ir, t0);
+  UT_ASSERT_EQ(dest_float.type.t & VT_BTYPE, VT_FLOAT);
+  UT_ASSERT(iv_float->is_float);
+  UT_ASSERT(!iv_float->is_double);
+
+  /* Shift with a 64-bit src1 promotes the dest type. */
+  SValue src64 = sv_var_llong(v0);
+  SValue dest_shift = sv_untyped(t1);
+  tcc_ir_put(ir, TCCIR_OP_SHL, &src64, &src64, &dest_shift);
+  IRLiveInterval *iv_shift = tcc_ir_vreg_live_interval(ir, t1);
+  UT_ASSERT(iv_shift->is_llong);
+
+  /* STORE dest is an address: it must not adopt the stored value's float type. */
+  SValue src_val = sv_float_var(v0);
+  SValue dest_store = sv_float_var(t2);
+  tcc_ir_put(ir, TCCIR_OP_STORE, &src_val, NULL, &dest_store);
+  IRLiveInterval *iv_store = tcc_ir_vreg_live_interval(ir, t2);
+  UT_ASSERT(!iv_store->is_float);
+  UT_ASSERT(!iv_store->is_llong);
+  UT_ASSERT(!iv_store->is_complex);
+
+  /* Complex src1 promotes the dest vreg to complex. */
+  SValue src_complex = sv_complex_var(v0);
+  SValue dest_complex = sv_untyped(t3);
+  tcc_ir_put(ir, TCCIR_OP_ASSIGN, &src_complex, NULL, &dest_complex);
+  IRLiveInterval *iv_complex = tcc_ir_vreg_live_interval(ir, t3);
+  UT_ASSERT(iv_complex->is_complex);
+  UT_ASSERT(iv_complex->is_float);
+
+  tcc_ir_free(ir);
+  return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Integer IR generation through tcc_ir_gen_i                                 */
+/* -------------------------------------------------------------------------- */
+
+static void setup_two_vtop_values(SValue *vals, int v0, int v1)
+{
+  svalue_init(&vals[0]);
+  svalue_init(&vals[1]);
+  vals[0].r = 0;
+  vals[0].vr = v0;
+  vals[0].type.t = VT_INT;
+  vals[1].r = 0;
+  vals[1].vr = v1;
+  vals[1].type.t = VT_INT;
+}
+
+UT_TEST(test_gen_i_add_emits_instruction_and_rewrites_vtop)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  int v0 = tcc_ir_vreg_alloc_var(ir);
+  int v1 = tcc_ir_vreg_alloc_var(ir);
+
+  SValue vals[2];
+  setup_two_vtop_values(vals, v0, v1);
+
+  SValue *saved_vtop = vtop;
+  vtop = &vals[1];
+
+  tcc_ir_gen_add(ir);
+
+  UT_ASSERT_EQ(tcc_ir_count(ir), 1);
+  UT_ASSERT_EQ(ir->compact_instructions[0].op, TCCIR_OP_ADD);
+  UT_ASSERT_EQ(vals[0].r, 0);
+  UT_ASSERT_EQ(vals[0].type.t, VT_INT);
+  UT_ASSERT_EQ(irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[0])), vals[0].vr);
+
+  vtop = saved_vtop;
+  tcc_ir_free(ir);
+  return 0;
+}
+
+UT_TEST(test_gen_i_umull_promotes_result_to_llong)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  int v0 = tcc_ir_vreg_alloc_var(ir);
+  int v1 = tcc_ir_vreg_alloc_var(ir);
+
+  SValue vals[2];
+  setup_two_vtop_values(vals, v0, v1);
+
+  SValue *saved_vtop = vtop;
+  vtop = &vals[1];
+
+  tcc_ir_gen_i(ir, TOK_UMULL);
+
+  UT_ASSERT_EQ(tcc_ir_count(ir), 1);
+  UT_ASSERT_EQ(ir->compact_instructions[0].op, TCCIR_OP_UMULL);
+  UT_ASSERT_EQ(vals[0].type.t & VT_BTYPE, VT_LLONG);
+  UT_ASSERT(vals[0].type.t & VT_UNSIGNED);
+
+  vtop = saved_vtop;
+  tcc_ir_free(ir);
+  return 0;
+}
+
+UT_TEST(test_gen_i_cmp_emits_cmp_and_sets_vtop_condition)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  int v0 = tcc_ir_vreg_alloc_var(ir);
+  int v1 = tcc_ir_vreg_alloc_var(ir);
+
+  SValue vals[2];
+  setup_two_vtop_values(vals, v0, v1);
+
+  SValue *saved_vtop = vtop;
+  vtop = &vals[1];
+
+  tcc_ir_gen_i(ir, TOK_EQ);
+
+  UT_ASSERT_EQ(tcc_ir_count(ir), 1);
+  UT_ASSERT_EQ(ir->compact_instructions[0].op, TCCIR_OP_CMP);
+  UT_ASSERT_EQ(vals[0].r, VT_CMP);
+  UT_ASSERT_EQ(vals[0].cmp_op, TOK_EQ);
+  UT_ASSERT_EQ(vals[0].jfalse, -1);
+  UT_ASSERT_EQ(vals[0].jtrue, -1);
+
+  vtop = saved_vtop;
+  tcc_ir_free(ir);
+  return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Anonymous symbol registration                                              */
+/* -------------------------------------------------------------------------- */
+
+UT_TEST(test_ensure_sym_registered_for_anonymous_symbol)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  int t0 = tcc_ir_vreg_alloc_temp(ir);
+
+  Sym anon;
+  memset(&anon, 0, sizeof(anon));
+  anon.v = SYM_FIRST_ANOM;
+  anon.c = 0;
+
+  SValue src = sv_anon_sym(&anon);
+  SValue dest = sv_var(t0);
+  tcc_ir_put(ir, TCCIR_OP_ASSIGN, &src, NULL, &dest);
+
+  UT_ASSERT_EQ(tcc_ir_count(ir), 1);
+  IRQuadCompact *q = &ir->compact_instructions[0];
+  IROperand s1 = tcc_ir_op_get_src1(ir, q);
+  UT_ASSERT_EQ(irop_get_tag(s1), IROP_TAG_SYMREF);
+  UT_ASSERT_EQ(irop_get_sym_ex(ir, s1), &anon);
+
+  tcc_ir_free(ir);
+  return 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Inline assembly bookkeeping                                                */
+/* -------------------------------------------------------------------------- */
+
+#ifdef CONFIG_TCC_ASM
+UT_TEST(test_asm_add_copies_clobber_regs_and_grows_capacity)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+
+  uint8_t clobber[NB_ASM_REGS];
+  for (int i = 0; i < NB_ASM_REGS; ++i)
+    clobber[i] = (uint8_t)(i + 1);
+
+  int id = tcc_ir_asm_add(ir, "nop", 3, 0, NULL, 0, 0, 0, clobber);
+  UT_ASSERT_EQ(id, 0);
+  for (int i = 0; i < NB_ASM_REGS; ++i)
+  {
+    UT_ASSERT_EQ(ir->inline_asms[0].clobber_regs[i], clobber[i]);
+  }
+
+  /* Grow past the initial capacity of 8. */
+  for (int i = 0; i < 8; ++i)
+  {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "nop%d", i);
+    tcc_ir_asm_add(ir, buf, (int)strlen(buf), 0, NULL, 0, 0, 0, NULL);
+  }
+  UT_ASSERT_EQ(ir->inline_asm_count, 9);
+  UT_ASSERT(ir->inline_asm_capacity >= 9);
+
+  tcc_ir_free(ir);
+  return 0;
+}
+#endif /* CONFIG_TCC_ASM */
+
+/* -------------------------------------------------------------------------- */
 /* Suite                                                                      */
 /* -------------------------------------------------------------------------- */
 
@@ -1023,4 +1446,21 @@ UT_SUITE(ir_core)
   UT_RUN(test_asm_put_emits_inline_asm_instruction);
 #endif
   UT_RUN(test_irop_config_shapes);
+  UT_RUN(test_try_get_live_interval_null_and_invalid);
+  UT_RUN(test_get_live_interval_matches_vreg_live_interval);
+  UT_RUN(test_local_add_computes_stack_address);
+  UT_RUN(test_params_update_tracking);
+  UT_RUN(test_backpatch_sets_pending_jump_target_flag);
+  UT_RUN(test_backpatch_stops_when_next_already_target);
+  UT_RUN(test_backpatch_first_stops_at_out_of_range);
+  UT_RUN(test_put_grows_compact_instructions_past_initial_capacity);
+  UT_RUN(test_put_honors_next_insn_is_jump_target);
+  UT_RUN(test_put_dest_type_inference_corner_cases);
+  UT_RUN(test_gen_i_add_emits_instruction_and_rewrites_vtop);
+  UT_RUN(test_gen_i_umull_promotes_result_to_llong);
+  UT_RUN(test_gen_i_cmp_emits_cmp_and_sets_vtop_condition);
+  UT_RUN(test_ensure_sym_registered_for_anonymous_symbol);
+#ifdef CONFIG_TCC_ASM
+  UT_RUN(test_asm_add_copies_clobber_regs_and_grows_capacity);
+#endif
 }

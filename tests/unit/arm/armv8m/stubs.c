@@ -113,6 +113,119 @@ void expect(const char *msg)
   abort();
 }
 
+/* ───── CString helpers for arm-thumb-asm.c's subst_asm_operand() ─────
+ *
+ * tccpp.c (not linked into the main UT binary) owns the real cstr_* family.
+ * subst_asm_operand() is reachable from this harness once these minimal
+ * implementations are provided.  They deliberately avoid libc malloc/free
+ * (tcc.h redefines them when included) and use the tcc_realloc/tcc_free
+ * stubs defined above.
+ *
+ * The layout below must match tcc.h's `typedef struct CString` exactly.
+ */
+
+typedef struct CString
+{
+  int size;
+  int size_allocated;
+  char *data;
+} CString;
+
+static void cstr_realloc(CString *cstr, int new_size)
+{
+  int size = cstr->size_allocated;
+  if (size < 8)
+    size = 8;
+  while (size < new_size)
+    size = size * 2;
+  cstr->data = (char *)tcc_realloc(cstr->data, size);
+  cstr->size_allocated = size;
+}
+
+/* Weak: test_tccdbg.c provides its own (non-stub) implementations when both are
+ * linked into the main unit-test binary; in other binaries that link stubs.c but
+ * not test_tccdbg.c, these weak symbols still satisfy the linker. */
+__attribute__((weak)) void cstr_new(CString *cstr)
+{
+  memset(cstr, 0, sizeof(CString));
+}
+
+__attribute__((weak)) void cstr_free(CString *cstr)
+{
+  tcc_free(cstr->data);
+}
+
+void cstr_reset(CString *cstr)
+{
+  cstr->size = 0;
+}
+
+void cstr_ccat(CString *cstr, int ch)
+{
+  int size = cstr->size + 1;
+  if (size > cstr->size_allocated)
+    cstr_realloc(cstr, size);
+  cstr->data[size - 1] = (char)ch;
+  cstr->size = size;
+}
+
+void cstr_cat(CString *cstr, const char *str, int len)
+{
+  int size;
+  if (len <= 0)
+    len = (int)strlen(str) + 1 + len;
+  size = cstr->size + len;
+  if (size > cstr->size_allocated)
+    cstr_realloc(cstr, size);
+  memmove(cstr->data + cstr->size, str, len);
+  cstr->size = size;
+}
+
+int cstr_vprintf(CString *cstr, const char *fmt, va_list ap)
+{
+  va_list v;
+  int len, size = 80;
+  for (;;)
+  {
+    size += cstr->size;
+    if (size > cstr->size_allocated)
+      cstr_realloc(cstr, size);
+    size = cstr->size_allocated - cstr->size;
+    va_copy(v, ap);
+    len = vsnprintf(cstr->data + cstr->size, size, fmt, v);
+    va_end(v);
+    if (len < 0)
+      return -1;
+    if (len < size)
+      break;
+  }
+  cstr->size += len;
+  return len;
+}
+
+__attribute__((weak)) int cstr_printf(CString *cstr, const char *fmt, ...)
+{
+  va_list ap;
+  int len;
+  va_start(ap, fmt);
+  len = cstr_vprintf(cstr, fmt, ap);
+  va_end(ap);
+  return len;
+}
+
+/* `get_asm_sym()` is referenced by subst_asm_operand()'s anonymous-symbol
+ * branch (even though our tests avoid that branch, the function body still
+ * needs the symbol at link time).  Returning NULL is sufficient: the caller
+ * ignores the return value and only needs the symbol table side effect, which
+ * is irrelevant in this harness. */
+struct Sym;
+struct Sym *get_asm_sym(int name, struct Sym *csym)
+{
+  (void)name;
+  (void)csym;
+  return NULL;
+}
+
 /* `ind` is declared ST_DATA int rsym, anon_sym, ind, loc; in tcc.h.
  * In unit-test builds ST_DATA=extern, so we provide the definition. */
 int ind;
