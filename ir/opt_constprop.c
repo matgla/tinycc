@@ -46,6 +46,113 @@ static int nan_compare_branch_result(int cond_token)
   }
 }
 
+static int cmp_operand_is_unsigned_int(IROperand op)
+{
+  int btype = irop_get_btype(op);
+  return op.is_unsigned &&
+         (btype == IROP_BTYPE_INT8 || btype == IROP_BTYPE_INT16 ||
+          btype == IROP_BTYPE_INT32 || btype == IROP_BTYPE_INT64);
+}
+
+static int cmp_operands_unsigned_width(IROperand src1, IROperand src2)
+{
+  return (irop_get_btype(src1) == IROP_BTYPE_INT64 ||
+          irop_get_btype(src2) == IROP_BTYPE_INT64)
+             ? 64
+             : 32;
+}
+
+static int unsigned_cond_for_cmp_operands(int cond, IROperand src1, IROperand src2)
+{
+  if (!cmp_operand_is_unsigned_int(src1) && !cmp_operand_is_unsigned_int(src2))
+    return cond;
+
+  switch (cond)
+  {
+  case TOK_LT:
+    return TOK_ULT;
+  case TOK_GE:
+    return TOK_UGE;
+  case TOK_LE:
+    return TOK_ULE;
+  case TOK_GT:
+    return TOK_UGT;
+  default:
+    return cond;
+  }
+}
+
+static int evaluate_compare_condition_cmp_operands(int64_t val1, int64_t val2, int cond,
+                                                   IROperand src1, IROperand src2)
+{
+  cond = unsigned_cond_for_cmp_operands(cond, src1, src2);
+  if (cmp_operands_unsigned_width(src1, src2) != 64)
+  {
+    int32_t s1 = (int32_t)(uint32_t)val1;
+    int32_t s2 = (int32_t)(uint32_t)val2;
+    switch (cond)
+    {
+    case TOK_EQ:
+      return (uint32_t)val1 == (uint32_t)val2;
+    case TOK_NE:
+      return (uint32_t)val1 != (uint32_t)val2;
+    case TOK_LT:
+      return s1 < s2;
+    case TOK_GE:
+      return s1 >= s2;
+    case TOK_LE:
+      return s1 <= s2;
+    case TOK_GT:
+      return s1 > s2;
+    default:
+      break;
+    }
+  }
+  switch (cond)
+  {
+  case TOK_ULT:
+  case TOK_UGE:
+  case TOK_ULE:
+  case TOK_UGT:
+  {
+    if (cmp_operands_unsigned_width(src1, src2) == 64)
+      return evaluate_compare_condition(val1, val2, cond);
+    uint32_t u1 = (uint32_t)val1;
+    uint32_t u2 = (uint32_t)val2;
+    switch (cond)
+    {
+    case TOK_ULT:
+      return u1 < u2;
+    case TOK_UGE:
+      return u1 >= u2;
+    case TOK_ULE:
+      return u1 <= u2;
+    case TOK_UGT:
+      return u1 > u2;
+    default:
+      break;
+    }
+  }
+  default:
+    return evaluate_compare_condition(val1, val2, cond);
+  }
+}
+
+static int64_t ir_opt_fit_const_to_operand(int64_t val, IROperand op)
+{
+  switch (irop_get_btype(op))
+  {
+  case IROP_BTYPE_INT8:
+    return op.is_unsigned ? (int64_t)(uint8_t)val : (int64_t)(int8_t)val;
+  case IROP_BTYPE_INT16:
+    return op.is_unsigned ? (int64_t)(uint16_t)val : (int64_t)(int16_t)val;
+  case IROP_BTYPE_INT32:
+    return op.is_unsigned ? (int64_t)(uint32_t)val : (int64_t)(int32_t)val;
+  default:
+    return val;
+  }
+}
+
 /* Refresh stale `interval->addrtaken` flags.  The flag is set by the
  * frontend when source code takes a variable's address, but earlier
  * optimizer passes may have eliminated the producing LEA (e.g. a dead
@@ -238,9 +345,22 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
   return cleared;
 }
 
+/* MLA carries a 4th (accumulator) operand at pool[operand_base+3] that is a
+ * real USE of its vreg but is invisible to the has_src1/has_src2 operand
+ * config.  Every use-scan that decides whether a def is dead must include
+ * it, or a value consumed only as an MLA accumulator is treated as unread
+ * and its def deleted (ptr seed 6869).  Returns -1 when there is none. */
+static int32_t ir_opt_mla_accum_vreg(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (q->op != TCCIR_OP_MLA)
+    return -1;
+  return irop_get_vreg(tcc_ir_op_get_accum(ir, q));
+}
+
 static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir);
 int tcc_ir_opt_const_var_prop(TCCIRState *ir)
 {
+  if (tcc_ir_opt_pass_disabled("const_var_prop")) return 0;
   tcc_pass_timing_init();
   if (!tcc_pass_timing_on) return tcc_ir_opt_const_var_prop__timed(ir);
   unsigned long _t = tcc_pass_clk_us();
@@ -248,6 +368,28 @@ int tcc_ir_opt_const_var_prop(TCCIRState *ir)
   tcc_pass_timing_add("const_var_prop", tcc_pass_clk_us() - _t);
   return _r;
 }
+
+static int ir_has_variadic_stack_arg_call(TCCIRState *ir)
+{
+  int n = ir ? ir->next_instruction_index : 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+      continue;
+
+    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    if (!callee || !callee->type.ref || callee->type.ref->f.func_type != FUNC_ELLIPSIS)
+      continue;
+
+    IROperand meta = tcc_ir_op_get_src2(ir, q);
+    int argc = TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, meta));
+    if (argc > 4)
+      return 1;
+  }
+  return 0;
+}
+
 static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -263,6 +405,14 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
    *   int *p = &g; int **dead = &p; ... use p ...
    * where `dead` got eliminated as unread. */
   refresh_stale_var_addrtaken(ir);
+
+  /* ARM variadic calls with anonymous arguments beyond r0-r3 use the caller's
+   * outgoing stack area.  varargs seed 31282 exposed a backend/register-
+   * allocation miscompile only after this whole-function constant propagator
+   * aggressively simplified such call regions; keep the IR shape conservative
+   * until that lower-level ABI bug is fixed directly. */
+  if (ir_has_variadic_stack_arg_call(ir))
+    return 0;
 
   /* Phase 1: Find constant VAR vregs (assigned exactly once with immediate
    * or symref).  For symrefs we also remember is_lval/is_local/is_const so
@@ -393,6 +543,13 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
       if (pos > max_var_pos)
         continue;
       if (var_info[pos].use_count < 255)
+        var_info[pos].use_count++;
+    }
+    int32_t acc_vr = ir_opt_mla_accum_vreg(ir, q);
+    if (acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(acc_vr) == TCCIR_VREG_TYPE_VAR)
+    {
+      int pos = TCCIR_DECODE_VREG_POSITION(acc_vr);
+      if (pos <= max_var_pos && var_info[pos].use_count < 255)
         var_info[pos].use_count++;
     }
   }
@@ -535,6 +692,13 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
           if (pos <= max_var_pos)
             has_use[pos / 8] |= (1 << (pos % 8));
         }
+      }
+      int32_t acc_vr = ir_opt_mla_accum_vreg(ir, q);
+      if (acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(acc_vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(acc_vr);
+        if (pos <= max_var_pos)
+          has_use[pos / 8] |= (1 << (pos % 8));
       }
     }
 
@@ -1092,18 +1256,24 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
       changes++;
     }
 
-    /* Record new ASSIGN(symref) definitions for downstream substitution. */
-    if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_dest)
+    /* Record new ASSIGN(symref) definitions for downstream substitution, and
+     * invalidate any tracked tmp redefined by a write that does NOT record a
+     * fresh copy.  Both cases share the dest-decode prologue, so they live in
+     * one branch: an ASSIGN whose source is not a non-lval symref must still
+     * fall through to invalidation (it redefines the tmp), which an
+     * `if/else if` split would have skipped. */
+    if (irop_config[q->op].has_dest)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int32_t dvr = irop_get_vreg(dest);
       if (TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
       {
-        IROperand src1 = tcc_ir_op_get_src1(ir, q);
-        if (src1.is_sym && !src1.is_lval)
+        int pos = TCCIR_DECODE_VREG_POSITION(dvr);
+        int recorded = 0;
+        if (q->op == TCCIR_OP_ASSIGN)
         {
-          int pos = TCCIR_DECODE_VREG_POSITION(dvr);
-          if (pos <= max_tmp_pos)
+          IROperand src1 = tcc_ir_op_get_src1(ir, q);
+          if (src1.is_sym && !src1.is_lval && pos <= max_tmp_pos)
           {
             map[pos].gen = current_gen;
             map[pos].pool_idx = (uint32_t)src1.u.pool_idx;
@@ -1111,19 +1281,11 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
             map[pos].is_local = src1.is_local;
             map[pos].is_const = src1.is_const;
             map[pos].is_unsigned = src1.is_unsigned;
+            recorded = 1;
           }
         }
-      }
-    }
-    /* Any other write that targets a tracked tmp invalidates it. */
-    else if (irop_config[q->op].has_dest)
-    {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(dest);
-      if (TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
-      {
-        int pos = TCCIR_DECODE_VREG_POSITION(dvr);
-        if (pos <= max_tmp_pos && map[pos].gen == current_gen)
+        /* Not a fresh copy record → this write kills any tracked symref. */
+        if (!recorded && pos <= max_tmp_pos && map[pos].gen == current_gen)
           map[pos].gen = 0;
       }
     }
@@ -1345,7 +1507,8 @@ static int ir_opt_vreg_use_count(TCCIRState *ir, int32_t vreg)
     if (q->op == TCCIR_OP_NOP)
       continue;
     if (irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg ||
-        irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vreg)
+        irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vreg ||
+        ir_opt_mla_accum_vreg(ir, q) == vreg)
       count++;
   }
   return count;
@@ -1473,6 +1636,7 @@ static int eval_cmp_operand_const(TCCIRState *ir, IROperand op, int use_idx, uin
 
     int64_t target_off = irop_get_stack_offset(op);
     int op_btype = irop_get_btype(op);
+    int32_t target_vr = irop_get_vreg(op);
 
     for (int j = use_idx - 1; j >= 0; j--)
     {
@@ -1497,6 +1661,8 @@ static int eval_cmp_operand_const(TCCIRState *ir, IROperand op, int use_idx, uin
       int64_t soff = irop_get_stack_offset(sdest);
       if (soff != target_off)
         continue;
+      if (target_vr >= 0 && irop_get_vreg(sdest) != target_vr)
+        return 0;
       if (irop_get_btype(sdest) != op_btype)
         return 0;
 
@@ -1514,6 +1680,7 @@ static int eval_cmp_operand_const(TCCIRState *ir, IROperand op, int use_idx, uin
 static int tcc_ir_opt_const_prop__timed(TCCIRState *ir);
 int tcc_ir_opt_const_prop(TCCIRState *ir)
 {
+  if (tcc_ir_opt_pass_disabled("const_prop")) return 0;
   tcc_pass_timing_init();
   if (!tcc_pass_timing_on) return tcc_ir_opt_const_prop__timed(ir);
   unsigned long _t = tcc_pass_clk_us();
@@ -1913,6 +2080,13 @@ static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
         if (pos <= max_var_pos && var_info[pos].use_count < 255)
           var_info[pos].use_count++;
       }
+      int32_t acc_vr = ir_opt_mla_accum_vreg(ir, uq);
+      if (acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(acc_vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(acc_vr);
+        if (pos <= max_var_pos && var_info[pos].use_count < 255)
+          var_info[pos].use_count++;
+      }
     }
 
   /* Second pass: propagate constants and apply algebraic simplifications */
@@ -1979,6 +2153,27 @@ static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
          * multiple uses — keep the VAR alive so a single load suffices. */
         if (var_info[pos].use_count > 1 && VAR_CONST_NEEDS_POOL_LOAD(val))
           continue;
+        /* CMP computes src1 - src2; moving a constant into src1 inverts the
+         * subtraction and reverses ordered conditions (LT/GT/LE/GE) read by
+         * the following JUMPIF/SETIF.  Only propagate when src2 is also a
+         * compile-time constant, so the whole CMP folds.  (See the matching
+         * guard in tcc_ir_opt_const_prop_tmp__timed.) */
+        if (q->op == TCCIR_OP_CMP)
+        {
+          IROperand cmp_s2 = tcc_ir_op_get_src2(ir, q);
+          int s2_const = irop_is_immediate(cmp_s2);
+          if (!s2_const)
+          {
+            int32_t s2_vr = irop_get_vreg(cmp_s2);
+            if (s2_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s2_vr) == TCCIR_VREG_TYPE_VAR)
+            {
+              int sp = TCCIR_DECODE_VREG_POSITION(s2_vr);
+              s2_const = (sp <= max_var_pos && var_info[sp].is_constant);
+            }
+          }
+          if (!s2_const)
+            continue;
+        }
         IROperand new_src1;
         int btype = irop_get_btype(src1);
         if (val == (int32_t)val)
@@ -2134,23 +2329,35 @@ static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
         result = (val1 != 0) || (val2 != 0) ? 1 : 0;
         break;
       case TCCIR_OP_IMOD:
-        if (val2 != 0)
+        if (val2 == 0)
+        {
+          can_fold = 0; /* Division by zero - don't fold */
+        }
+        else if (val2 == -1 &&
+                 ((btype == IROP_BTYPE_INT64 && val1 == INT64_MIN) ||
+                  (btype != IROP_BTYPE_INT64 && (int32_t)val1 == INT32_MIN)))
+        {
+          can_fold = 0; /* INT_MIN % -1 overflows in two's complement - bail */
+        }
+        else
         {
           result = val1 % val2;
         }
-        else
-        {
-          can_fold = 0; /* Division by zero - don't fold */
-        }
         break;
       case TCCIR_OP_DIV:
-        if (val2 != 0)
+        if (val2 == 0)
         {
-          result = val1 / val2;
+          can_fold = 0; /* Division by zero - don't fold */
+        }
+        else if (val2 == -1 &&
+                 ((btype == IROP_BTYPE_INT64 && val1 == INT64_MIN) ||
+                  (btype != IROP_BTYPE_INT64 && (int32_t)val1 == INT32_MIN)))
+        {
+          can_fold = 0; /* INT_MIN / -1 overflows in two's complement - bail */
         }
         else
         {
-          can_fold = 0; /* Division by zero - don't fold */
+          result = val1 / val2;
         }
         break;
       case TCCIR_OP_UDIV:
@@ -2423,10 +2630,12 @@ static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
     }
   }
 
-  /* Byte-cast folding: SHL #N → SHR #N → AND #mask.
-   * TCC emits (byte)x as SHL #24, SHR #24 (shift up then unsigned shift down).
-   * Fold to AND #0xFF which the backend can emit as UXTB or UBFX.
-   * Also fold SHL #16, SHR #16 → AND #0xFFFF (halfword cast). */
+  /* Bitfield-extract folding: SHL #N → SHR #M → (x >> (M-N)) & mask.
+   * TCC emits (byte)x as SHL #24, SHR #24 (equal shifts), but bitfield reads
+   * use unequal amounts such as SHL #18, SHR #25.  When 0 < N <= M < 32,
+   * (x << N) >> M is equivalent to (x >> (M-N)) & ((1 << (32-M)) - 1).
+   * The resulting SHR+AND pair is then eligible for the UBFX fusion below.
+   * Signed extracts (SAR) are not handled here; they are left for known-bits. */
   for (i = 0; i < n - 1; i++)
   {
     IRQuadCompact *shl_q = &ir->compact_instructions[i];
@@ -2439,32 +2648,52 @@ static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
       continue;
     int64_t shl_amt = irop_get_imm64_ex(ir, shl_src2);
     int64_t shr_amt = irop_get_imm64_ex(ir, shr_src2);
-    if (shl_amt != shr_amt || shl_amt <= 0 || shl_amt >= 32)
+    if (shl_amt <= 0 || shl_amt >= 32 || shr_amt <= 0 || shr_amt >= 32 || shl_amt > shr_amt)
       continue;
     /* Verify the SHR reads the SHL's dest */
     IROperand shl_dest = tcc_ir_op_get_dest(ir, shl_q);
     IROperand shr_src1 = tcc_ir_op_get_src1(ir, shr_q);
     if (irop_get_vreg(shl_dest) != irop_get_vreg(shr_src1))
       continue;
-    /* Skip 64-bit types: the mask computation assumes 32-bit width.
-     * For INT64, SHL #16 → SHR #16 masks 48 bits, not 16.  Also check dest
-     * btypes since src1 btype may have been weakened during forwarding. */
+    /* The transformation rewrites the SHL instruction itself.  It is only safe
+     * if the SHL result is used exclusively by the SHR; other consumers (e.g.
+     * a rotate idiom that also shifts the value left) would see the wrong
+     * value after the SHL is turned into a SHR (gcc.c-torture/20180112-1). */
+    if (!tcc_ir_vreg_has_single_use(ir, irop_get_vreg(shl_dest), i))
+      continue;
+    /* Skip 64-bit types: the mask computation assumes 32-bit width. */
     IROperand shl_orig_src1_chk = tcc_ir_op_get_src1(ir, shl_q);
     IROperand shr_dest_chk = tcc_ir_op_get_dest(ir, shr_q);
     if (shl_orig_src1_chk.btype == IROP_BTYPE_INT64 || shl_orig_src1_chk.btype == IROP_BTYPE_FLOAT64 ||
         shl_dest.btype == IROP_BTYPE_INT64 || shl_dest.btype == IROP_BTYPE_FLOAT64 ||
         shr_dest_chk.btype == IROP_BTYPE_INT64 || shr_dest_chk.btype == IROP_BTYPE_FLOAT64)
       continue;
-    /* SHL #N then SHR #N = AND with mask of (32-N) low bits */
-    uint32_t mask = (shl_amt == 32) ? 0 : ((1u << (32 - shl_amt)) - 1);
-    /* Replace SHL with AND, NOP the SHR */
     IROperand shl_orig_src1 = tcc_ir_op_get_src1(ir, shl_q);
     IROperand shr_dest = tcc_ir_op_get_dest(ir, shr_q);
-    shr_q->op = TCCIR_OP_AND;
-    tcc_ir_set_dest(ir, i + 1, shr_dest);
-    tcc_ir_set_src1(ir, i + 1, shl_orig_src1);
-    tcc_ir_set_src2(ir, i + 1, irop_make_imm32(-1, (int32_t)mask, IROP_BTYPE_INT32));
-    shl_q->op = TCCIR_OP_NOP;
+    if (shl_amt == shr_amt)
+    {
+      /* SHL #N then SHR #N = AND with mask of (32-N) low bits */
+      uint32_t mask = (shl_amt == 32) ? 0 : ((1u << (32 - shl_amt)) - 1);
+      shr_q->op = TCCIR_OP_AND;
+      tcc_ir_set_dest(ir, i + 1, shr_dest);
+      tcc_ir_set_src1(ir, i + 1, shl_orig_src1);
+      tcc_ir_set_src2(ir, i + 1, irop_make_imm32(-1, (int32_t)mask, IROP_BTYPE_INT32));
+      shl_q->op = TCCIR_OP_NOP;
+    }
+    else
+    {
+      /* SHL #N then SHR #M = (x >> (M-N)) & ((1 << (32-M)) - 1) */
+      uint32_t rshift = (uint32_t)(shr_amt - shl_amt);
+      uint32_t mask = (1u << (32 - shr_amt)) - 1;
+      shl_q->op = TCCIR_OP_SHR;
+      tcc_ir_set_dest(ir, i, shl_dest);
+      tcc_ir_set_src1(ir, i, shl_orig_src1);
+      tcc_ir_set_src2(ir, i, irop_make_imm32(-1, (int32_t)rshift, IROP_BTYPE_INT32));
+      shr_q->op = TCCIR_OP_AND;
+      tcc_ir_set_dest(ir, i + 1, shr_dest);
+      tcc_ir_set_src1(ir, i + 1, shl_dest);
+      tcc_ir_set_src2(ir, i + 1, irop_make_imm32(-1, (int32_t)mask, IROP_BTYPE_INT32));
+    }
     changes++;
   }
 
@@ -2485,6 +2714,12 @@ static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
     IROperand xor1_dest = tcc_ir_op_get_dest(ir, xor1_q);
     IROperand xor2_src1 = tcc_ir_op_get_src1(ir, xor2_q);
     if (irop_get_vreg(xor1_dest) != irop_get_vreg(xor2_src1))
+      continue;
+    /* The rewrite deletes the first XOR.  That is only safe when the
+     * intermediate value feeds this second XOR alone; otherwise sibling
+     * consumers would observe the pre-cancel value, and non-SSA updates like
+     * `V = V ^ C; T = V ^ C` would lose the updated V. */
+    if (!tcc_ir_vreg_has_single_use(ir, irop_get_vreg(xor1_dest), i))
       continue;
     LOG_IR_GEN("OPTIMIZE: XOR cancel (x ^ %lld) ^ %lld = x at i=%d,%d", (long long)irop_get_imm64_ex(ir, xor1_src2),
                (long long)irop_get_imm64_ex(ir, xor2_src2), i, i + 1);
@@ -2936,44 +3171,9 @@ static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
     IROperand setif_src1 = tcc_ir_op_get_src1(ir, setif_q);
     cond = (int)irop_get_imm64_ex(ir, setif_src1); /* Condition code stored as immediate (TCC token) */
 
-    /* Evaluate the comparison based on TCC token values */
-    result = 0;
-    switch (cond)
-    {
-    case 0x94: /* TOK_EQ */
-      result = (val1 == val2) ? 1 : 0;
-      break;
-    case 0x95: /* TOK_NE */
-      result = (val1 != val2) ? 1 : 0;
-      break;
-    case 0x9c: /* TOK_LT */
-      result = (val1 < val2) ? 1 : 0;
-      break;
-    case 0x9d: /* TOK_GE */
-      result = (val1 >= val2) ? 1 : 0;
-      break;
-    case 0x9e: /* TOK_LE */
-      result = (val1 <= val2) ? 1 : 0;
-      break;
-    case 0x9f: /* TOK_GT */
-      result = (val1 > val2) ? 1 : 0;
-      break;
-    case 0x92: /* TOK_ULT (unsigned <) */
-      result = ((uint64_t)val1 < (uint64_t)val2) ? 1 : 0;
-      break;
-    case 0x93: /* TOK_UGE (unsigned >=) */
-      result = ((uint64_t)val1 >= (uint64_t)val2) ? 1 : 0;
-      break;
-    case 0x96: /* TOK_ULE (unsigned <=) */
-      result = ((uint64_t)val1 <= (uint64_t)val2) ? 1 : 0;
-      break;
-    case 0x97: /* TOK_UGT (unsigned >) */
-      result = ((uint64_t)val1 > (uint64_t)val2) ? 1 : 0;
-      break;
-    default:
-      /* Unknown condition, don't fold */
+    result = evaluate_compare_condition_cmp_operands(val1, val2, cond, src1, src2);
+    if (result < 0)
       continue;
-    }
 
     LOG_IR_GEN("OPTIMIZE: Fold CMP+SETIF const (%lld cmp %lld, cond=0x%x) = %d at i=%d", (long long)val1,
                (long long)val2, cond, result, i);
@@ -3031,6 +3231,11 @@ static int tcc_ir_opt_const_prop__timed(TCCIRState *ir)
             still_used = 1;
             break;
           }
+        }
+        if (ir_opt_mla_accum_vreg(ir, jq) == vr)
+        {
+          still_used = 1;
+          break;
         }
       }
 
@@ -3127,6 +3332,7 @@ typedef struct
 static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir);
 int tcc_ir_opt_value_tracking(TCCIRState *ir)
 {
+  if (tcc_ir_opt_pass_disabled("value_tracking")) return 0;
   tcc_pass_timing_init();
   if (!tcc_pass_timing_on) return tcc_ir_opt_value_tracking__timed(ir);
   unsigned long _t = tcc_pass_clk_us();
@@ -3148,6 +3354,7 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
    * Merges 3 separate O(n) scans into 1. */
   uint8_t *is_merge = tcc_mallocz((n + 7) / 8);
   int *pred_count = tcc_mallocz(n * sizeof(int));
+  int has_control_flow = 0;
 
   for (int i = 0; i < n; i++)
   {
@@ -3178,6 +3385,7 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
     /* Build pred_count and is_merge */
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
+      has_control_flow = 1;
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int target = (int)dest.u.imm32;
       if (target >= 0 && target < n)
@@ -3191,6 +3399,7 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
     /* SWITCH_TABLE: all case targets are merge points */
     if (q->op == TCCIR_OP_SWITCH_TABLE)
     {
+      has_control_flow = 1;
       IROperand src2 = tcc_ir_op_get_src2(ir, q);
       int table_id = (int)irop_get_imm64_ex(ir, src2);
       if (table_id >= 0 && table_id < ir->num_switch_tables)
@@ -3219,6 +3428,8 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
     {
       pred_count[i + 1]++;
     }
+    if (q->op == TCCIR_OP_IJUMP)
+      has_control_flow = 1;
   }
   /* Mark instructions with multiple predecessors as merge points */
   for (int i = 0; i < n; i++)
@@ -3227,6 +3438,21 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
       is_merge[i / 8] |= (1 << (i % 8));
   }
   tcc_free(pred_count);
+
+  uint8_t *var_def_count = tcc_mallocz(max_vreg + 1);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *dq = &ir->compact_instructions[i];
+    if (dq->op == TCCIR_OP_NOP || !irop_config[dq->op].has_dest)
+      continue;
+    IROperand ddest = tcc_ir_op_get_dest(ir, dq);
+    int32_t dvr = irop_get_vreg(ddest);
+    if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_VAR)
+      continue;
+    int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
+    if (dpos >= 0 && dpos <= max_vreg && var_def_count[dpos] < 2)
+      var_def_count[dpos]++;
+  }
 
   /* Detect VLA — SHL folding is unsafe in functions with VLA because
    * it can disrupt VLA stack save/restore patterns in nested scopes. */
@@ -3570,6 +3796,10 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
         {
           VT_INVALIDATE(state, dest_pos);
         }
+        else if (has_control_flow && var_def_count[dest_pos] > 1)
+        {
+          VT_INVALIDATE(state, dest_pos);
+        }
         else
         {
           /* Previous unread constant def is dead — NOP it */
@@ -3690,6 +3920,15 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
         {
           if (src1_pos >= 0 && src1_pos <= max_vreg)
             VT_CLEAR_DEF(state, src1_pos);
+          /* The surviving MLA still reads its accumulator — mark that def
+           * live too, or a later redef of the same VAR would NOP it. */
+          int32_t live_acc_vr = irop_get_vreg(accum);
+          if (live_acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(live_acc_vr) == TCCIR_VREG_TYPE_VAR)
+          {
+            int live_acc_pos = TCCIR_DECODE_VREG_POSITION(live_acc_vr);
+            if (live_acc_pos <= max_vreg)
+              VT_CLEAR_DEF(state, live_acc_pos);
+          }
           if (dest_pos >= 0 && dest_pos <= max_vreg)
             VT_INVALIDATE(state, dest_pos);
           continue;
@@ -3736,6 +3975,14 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
         /* src1 is read but not folded — mark its def as live */
         if (src1_pos >= 0 && src1_pos <= max_vreg)
           VT_CLEAR_DEF(state, src1_pos);
+        /* Same for the accumulator read of a surviving MLA. */
+        int32_t live_acc_vr = irop_get_vreg(accum);
+        if (live_acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(live_acc_vr) == TCCIR_VREG_TYPE_VAR)
+        {
+          int live_acc_pos = TCCIR_DECODE_VREG_POSITION(live_acc_vr);
+          if (live_acc_pos <= max_vreg)
+            VT_CLEAR_DEF(state, live_acc_pos);
+        }
         /* Destination no longer has known constant value */
         if (dest_pos >= 0 && dest_pos <= max_vreg)
           VT_INVALIDATE(state, dest_pos);
@@ -3987,7 +4234,7 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
       if (jump_q->op == TCCIR_OP_JUMPIF)
       {
         int32_t src1_vr = irop_get_vreg(src1);
-        int src1_pos = (src1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_VAR)
+        int src1_pos = (!src1.is_lval && src1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_VAR)
                            ? TCCIR_DECODE_VREG_POSITION(src1_vr)
                            : -1;
 
@@ -4003,7 +4250,7 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
           IROperand cond = tcc_ir_op_get_src1(ir, jump_q);
           int tok = (int)irop_get_imm64_ex(ir, cond);
 
-          int result = evaluate_compare_condition(val1, val2, tok);
+          int result = evaluate_compare_condition_cmp_operands(val1, val2, tok, src1, src2);
 
           if (result >= 0)
           {
@@ -4031,7 +4278,7 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
       else if (jump_q->op == TCCIR_OP_SETIF)
       {
         int32_t src1_vr = irop_get_vreg(src1);
-        int src1_pos = (src1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_VAR)
+        int src1_pos = (!src1.is_lval && src1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_VAR)
                            ? TCCIR_DECODE_VREG_POSITION(src1_vr)
                            : -1;
 
@@ -4045,7 +4292,7 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
 
           IROperand setif_src1 = tcc_ir_op_get_src1(ir, jump_q);
           int cond = (int)irop_get_imm64_ex(ir, setif_src1);
-          int result = evaluate_compare_condition(val1, val2, cond);
+          int result = evaluate_compare_condition_cmp_operands(val1, val2, cond, src1, src2);
 
           if (result >= 0)
           {
@@ -4088,6 +4335,16 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
         int s2_pos = TCCIR_DECODE_VREG_POSITION(s2_vr);
         if (s2_pos >= 0 && s2_pos <= max_vreg)
           VT_CLEAR_DEF(state, s2_pos);
+      }
+      /* An MLA that reaches here (src2 not immediate, so Pattern 2 didn't
+       * consume it) still reads its accumulator; without this a later redef
+       * of the same VAR NOPs the def it reads (struct_byval seed 9494). */
+      int32_t acc_vr = ir_opt_mla_accum_vreg(ir, q);
+      if (acc_vr >= 0 && TCCIR_DECODE_VREG_TYPE(acc_vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int acc_pos = TCCIR_DECODE_VREG_POSITION(acc_vr);
+        if (acc_pos >= 0 && acc_pos <= max_vreg)
+          VT_CLEAR_DEF(state, acc_pos);
       }
     }
 
@@ -4278,6 +4535,17 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
                 LOG_IR_GEN("VALUE_TRACK: %s(%lld, %lld) = %lld at i=%d -> folded", fname, (long long)val0,
                            (long long)val1, (long long)result, i);
                 changes++;
+                /* This CALL now defines the dest VAR with the folded quotient.
+                 * The `continue` skips the general VAR-def state-invalidation at
+                 * the loop tail, so the value-tracking map would still hold the
+                 * VAR's STALE pre-call constant and forward it to a later use
+                 * (combo_num seed 58: after loop-unroll collapses the prefix to a
+                 * single block, q10's pre-division init `(u5<<32)|u6` leaked past
+                 * this folded __aeabi_uldivmod into `q10 ^ q10>>32`).  Invalidate
+                 * the dest here so it is not forwarded; the rewritten `V <- #q`
+                 * assignment still carries the correct value for later passes. */
+                if (dest_pos >= 0 && dest_pos <= max_vreg)
+                  VT_INVALIDATE(state, dest_pos);
                 continue;
               }
             }
@@ -4632,6 +4900,14 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
                 tcc_ir_set_src2(ir, i, irop_make_imm32(-1, (int32_t)(val1 & 63), IROP_BTYPE_INT32));
                 LOG_IR_GEN("VALUE_TRACK: %s(vreg, %lld) at i=%d -> lowered to IR shift", fname, (long long)val1, i);
                 changes++;
+                /* This CALL now redefines the dest VAR with a runtime (non-constant)
+                 * shift result.  Without invalidating here, `state` would still hold
+                 * the VAR's STALE pre-call constant and forward it to a later read
+                 * in this same forward scan (longlong seed 2057: q13's pre-shift init
+                 * `(u10<<32)|u11` leaked past this lowered __aeabi_llsl into
+                 * `q13 ^ q13>>32`).  Mirrors the uldivmod fix above. */
+                if (dest_pos >= 0 && dest_pos <= max_vreg)
+                  VT_INVALIDATE(state, dest_pos);
                 continue;
               }
             }
@@ -5262,6 +5538,7 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
   tcc_free(lea_var_map);
   tcc_free(lea_map);
   tcc_free(state);
+  tcc_free(var_def_count);
   tcc_free(is_merge);
 
   /* Run DCE to remove code after eliminated branches */
@@ -5306,6 +5583,7 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
 static int tcc_ir_opt_const_prop_tmp__timed(TCCIRState *ir);
 int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
 {
+  if (tcc_ir_opt_pass_disabled("const_prop_tmp")) return 0;
   tcc_pass_timing_init();
   if (!tcc_pass_timing_on) return tcc_ir_opt_const_prop_tmp__timed(ir);
   unsigned long _t = tcc_pass_clk_us();
@@ -5487,8 +5765,45 @@ static int tcc_ir_opt_const_prop_tmp__timed(TCCIRState *ir)
       }
       if (do_prop)
       {
+        /* CMP computes src1 - src2 and sets flags read by a following
+         * JUMPIF/SETIF whose condition token was emitted for this operand
+         * order.  Replacing src1 with a constant inverts the subtraction
+         * (const - src2 instead of src1 - src2), reversing every signed/
+         * unsigned ordered condition (LT/GT/LE/GE).  Only propagate when
+         * src2 is also a known constant so the whole CMP folds to a
+         * compile-time value (where operand order is irrelevant).  EQ/NE
+         * are order-independent, but the following consumer's condition
+         * token is not inspected here, so apply the rule uniformly. */
+        if (q->op == TCCIR_OP_CMP)
+        {
+          IROperand cmp_s2 = tcc_ir_op_get_src2(ir, q);
+          int s2_const = irop_is_immediate(cmp_s2);
+          if (!s2_const)
+          {
+            int32_t s2_vr = irop_get_vreg(cmp_s2);
+            if (s2_vr >= 0)
+            {
+              if (TCCIR_DECODE_VREG_TYPE(s2_vr) == TCCIR_VREG_TYPE_TEMP)
+              {
+                int p = TCCIR_DECODE_VREG_POSITION(s2_vr);
+                s2_const = (p <= max_tmp_pos && tmp_info[p].gen == current_gen);
+              }
+              else if (max_var_pos >= 0 && TCCIR_DECODE_VREG_TYPE(s2_vr) == TCCIR_VREG_TYPE_VAR)
+              {
+                int p = TCCIR_DECODE_VREG_POSITION(s2_vr);
+                s2_const = (p <= max_var_pos && var_info[p].gen == current_gen);
+              }
+            }
+          }
+          if (!s2_const)
+            do_prop = 0;
+        }
+      }
+      if (do_prop)
+      {
         int btype = irop_get_btype(src1);
         IROperand new_src1;
+        prop_val = ir_opt_fit_const_to_operand(prop_val, src1);
         if (prop_val == (int32_t)prop_val)
         {
           new_src1 = irop_make_imm32(-1, (int32_t)prop_val, btype);
@@ -5537,7 +5852,7 @@ static int tcc_ir_opt_const_prop_tmp__timed(TCCIRState *ir)
       {
         LOG_IR_GEN("OPTIMIZE: const propagate vreg %d = %lld to src2 at i=%d", src2_vr, (long long)prop_val, i);
         int btype = irop_get_btype(src2);
-        int64_t val = prop_val;
+        int64_t val = ir_opt_fit_const_to_operand(prop_val, src2);
         /* When propagating a narrow constant into a wider bitwise op,
          * widen it to INT64 with zero-extension so the code generator
          * doesn't sign-extend the immediate into the upper register. */
@@ -5742,7 +6057,7 @@ static int tcc_ir_opt_const_prop_tmp__timed(TCCIRState *ir)
           int64_t cv2 = irop_get_imm64_ex(ir, cs2);
           IROperand setif_src1 = tcc_ir_op_get_src1(ir, next_q);
           int cond = (int)irop_get_imm64_ex(ir, setif_src1);
-          int result = evaluate_compare_condition(cv1, cv2, cond);
+          int result = evaluate_compare_condition_cmp_operands(cv1, cv2, cond, cs1, cs2);
           if (result >= 0)
           {
             q->op = TCCIR_OP_NOP;
@@ -5870,18 +6185,34 @@ static int tcc_ir_opt_const_prop_tmp__timed(TCCIRState *ir)
       continue;
     }
 
-    /* Track TMP <- constant assignments (re-fetch src1 since fold may have changed it) */
+    /* Track TMP <- constant assignments (re-fetch src1 since fold may have
+     * changed it).  A TEMP redefined with a non-constant value must drop its
+     * entry: TEMPs are single-def by construction, but loop unrolling renames
+     * at most UNROLL_MAX_RENAME body-local temps per copy, so leftover temps
+     * are multi-def straight-line code and a stale constant from one copy
+     * would leak into the next (volatile fuzz seed 8310).  STORE/STORE_INDEXED
+     * lvalue dests (deref addresses) and FUNCPARAM dests (the passed value)
+     * are uses, not defs, and leave the entry alone; STORE_POSTINC updates
+     * its address register, so it falls through to the invalidation. */
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     int32_t dest_vr = irop_get_vreg(dest);
     if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_TEMP &&
-        (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_CVT_FTOF))
+        q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID &&
+        !((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) && dest.is_lval))
     {
       const int pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
-      IROperand cur_src1 = tcc_ir_op_get_src1(ir, q);
-      if (pos <= max_tmp_pos && irop_is_immediate(cur_src1))
+      if (pos <= max_tmp_pos)
       {
-        tmp_info[pos].gen = current_gen;
-        tmp_info[pos].value = irop_get_imm64_ex(ir, cur_src1);
+        IROperand cur_src1 = tcc_ir_op_get_src1(ir, q);
+        if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_CVT_FTOF) && irop_is_immediate(cur_src1))
+        {
+          tmp_info[pos].gen = current_gen;
+          tmp_info[pos].value = ir_opt_fit_const_to_operand(irop_get_imm64_ex(ir, cur_src1), dest);
+        }
+        else
+        {
+          tmp_info[pos].gen = 0;
+        }
       }
     }
 
@@ -5901,7 +6232,7 @@ static int tcc_ir_opt_const_prop_tmp__timed(TCCIRState *ir)
           if (irop_is_immediate(cur_src1) && !cur_src1.is_sym)
           {
             var_info[pos].gen = current_gen;
-            var_info[pos].value = irop_get_imm64_ex(ir, cur_src1);
+            var_info[pos].value = ir_opt_fit_const_to_operand(irop_get_imm64_ex(ir, cur_src1), dest);
           }
           else
           {
@@ -5927,6 +6258,26 @@ static int tcc_ir_opt_const_prop_tmp__timed(TCCIRState *ir)
   return changes;
 #undef TMP_CONST_STACK_SIZE
 #undef TMP_CONST_STACK_N
+}
+
+/* True if `vreg` is a local VAR whose address is taken anywhere (it appears as
+ * a LEA src1).  Such a VAR is memory-resident and can be mutated behind the
+ * compiler's back by a store through an aliasing pointer, so its value at an
+ * arithmetic def does not necessarily still hold at a later use. */
+static int ir_reassoc_var_addr_taken(TCCIRState *ir, int32_t vreg)
+{
+  if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) != TCCIR_VREG_TYPE_VAR)
+    return 0;
+  int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_LEA)
+      continue;
+    if (irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg)
+      return 1;
+  }
+  return 0;
 }
 
 /* ADD/SUB Constant Reassociation
@@ -6111,6 +6462,50 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
         continue;
     }
 
+    /* The linear def lookup that found def_idx only sees *explicit* defs of
+     * src1_vr; it is blind to a redefinition of an address-taken local's memory
+     * through an aliasing pointer store.  If src1_vr (whose def `src1_vr =
+     * def_src1 + eff_c1` we are about to forward) — or def_src1 itself — is such
+     * an address-taken VAR, an intervening STORE/CALL between def_idx and the
+     * use i may have silently changed it, so the `src1_vr == def_src1 + eff_c1`
+     * relation no longer holds and folding to `def_src1 + combined` would read a
+     * stale value.  (ptr fuzz seed 85636: `u4 = u3 + C; *p = ...; x = u4 + C2`
+     * with p == &u4 — the store redefines u4.)  Bail when a memory-clobbering op
+     * sits in the gap and either base is an aliasable address-taken VAR.
+     *
+     * The same hazard applies when def_src1 is a *direct stack-slot load*
+     * (is_lval && is_local with no backing vreg, inner_vr < 0): the guard at the
+     * top only rejected non-local derefs, and the address-taken-VAR check below
+     * never fires for a raw StackLoc (it has no vreg).  Yet an aliasing pointer
+     * store in the gap — e.g. `u4 = arr[7] + C; *p = ...; x = u4 + C2` with
+     * p == &arr[7] — overwrites the slot, so forwarding `arr[7] + combined` reads
+     * the post-store value (ptr fuzz seed 409667).  Reject that too. */
+    {
+      int gap_clobbers_memory = 0;
+      for (int j = def_idx + 1; j < i && !gap_clobbers_memory; j++)
+      {
+        switch (ir->compact_instructions[j].op)
+        {
+        case TCCIR_OP_STORE:
+        case TCCIR_OP_STORE_INDEXED:
+        case TCCIR_OP_STORE_POSTINC:
+        case TCCIR_OP_BLOCK_COPY:
+        case TCCIR_OP_FUNCCALLVAL:
+        case TCCIR_OP_FUNCCALLVOID:
+        case TCCIR_OP_INLINE_ASM:
+          gap_clobbers_memory = 1;
+          break;
+        default:
+          break;
+        }
+      }
+      if (gap_clobbers_memory &&
+          (ir_reassoc_var_addr_taken(ir, src1_vr) ||
+           (inner_vr >= 0 && ir_reassoc_var_addr_taken(ir, inner_vr)) ||
+           (inner_vr < 0 && def_src1.is_lval)))
+        continue;
+    }
+
     int64_t c2 = irop_get_imm64_ex(ir, src2);
     int64_t eff_c2 = (q->op == TCCIR_OP_SUB) ? -c2 : c2;
     int64_t combined = eff_c1 + eff_c2;
@@ -6200,6 +6595,16 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
        * const-var-prop may leave behind `CMP symref(X), symref(X)` that the
        * vreg-based path below would skip because vr1 == vr2 == -1. */
       is_equal = ir_opt_nonvreg_expr_equal(ir, src1, src2);
+      /* Two integer immediates compare equal by value (e.g. `CMP #7, #7`).
+       * Scoped to the CMP-operand site (mirroring the asymmetric branch's
+       * manual check) rather than broadening the shared
+       * `ir_opt_nonvreg_expr_equal` helper, which would perturb its ADD/SUB
+       * base-equality callers.  Floats excluded (NaN != NaN). */
+      if (!is_equal && irop_is_immediate(src1) && irop_is_immediate(src2) &&
+          !src1.is_sym && !src2.is_sym &&
+          irop_get_btype(src1) != IROP_BTYPE_FLOAT32 && irop_get_btype(src1) != IROP_BTYPE_FLOAT64 &&
+          irop_get_btype(src2) != IROP_BTYPE_FLOAT32 && irop_get_btype(src2) != IROP_BTYPE_FLOAT64)
+        is_equal = irop_get_imm64_ex(ir, src1) == irop_get_imm64_ex(ir, src2);
       /* Fallback for symref-vs-symref: the strict check requires every flag
        * to match, but the two operands at a CMP can carry different
        * unsigned/is_lval encodings from how the frontend lowered each side
@@ -6290,7 +6695,7 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
     }
     else
     {
-      if (vr1 < 0 || vr2 < 0 || vr1 == vr2)
+      if (vr1 < 0 || vr2 < 0)
         continue;
 
       /* Operand value-identity requires matching lval-ness: `*(p)` (a load
@@ -6300,15 +6705,33 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
       if (src1.is_lval != src2.is_lval)
         continue;
 
-      /* Both operands must have a single reaching definition */
-      def1 = tcc_ir_find_defining_instruction(ir, vr1, i);
-      def2 = tcc_ir_find_defining_instruction(ir, vr2, i);
-      if (def1 < 0 || def2 < 0 || def1 == def2)
-        continue;
+      if (vr1 == vr2)
+      {
+        /* x OP x: a value compared against itself.  CMP is an integer compare
+         * (floats lower to FCMP), so a plain register value is always
+         * determinate — evaluate_compare_condition(0,0,tok) gives the result.
+         * Require matching width and signedness: `CMP x:I8, x:I32` compares a
+         * truncation against the full value and is NOT always equal.  A
+         * dereference *(V) OP *(V) could read a volatile location twice, so
+         * only fold the non-lval (register-value) form. */
+        if (src1.is_lval ||
+            irop_get_btype(src1) != irop_get_btype(src2) ||
+            src1.is_unsigned != src2.is_unsigned)
+          continue;
+        is_equal = 1;
+      }
+      else
+      {
+        /* Both operands must have a single reaching definition */
+        def1 = tcc_ir_find_defining_instruction(ir, vr1, i);
+        def2 = tcc_ir_find_defining_instruction(ir, vr2, i);
+        if (def1 < 0 || def2 < 0 || def1 == def2)
+          continue;
 
-      /* Try standard def equality (works for single-def vregs) */
-      if (DC_IS_SINGLE_DEF(dc, dc_stride, vr1) && DC_IS_SINGLE_DEF(dc, dc_stride, vr2))
-        is_equal = ir_opt_pure_def_equal(ir, def1, def2, 0);
+        /* Try standard def equality (works for single-def vregs) */
+        if (DC_IS_SINGLE_DEF(dc, dc_stride, vr1) && DC_IS_SINGLE_DEF(dc, dc_stride, vr2))
+          is_equal = ir_opt_pure_def_equal(ir, def1, def2, 0);
+      }
     }
 
     /* Pattern match: both defs are ADD/SUB with the same immediate, and
@@ -6330,7 +6753,12 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
           int32_t bvr1 = irop_get_vreg(base1);
           int32_t bvr2 = irop_get_vreg(base2);
 
-          if (bvr1 >= 0 && bvr2 >= 0)
+          /* A dereferenced base `*(V)` (is_lval) and a plain address base `V`
+           * are different values even when V resolves to the same definition.
+           * Without this, `*(p) + K` (loaded value + K) is equated with
+           * `p + K` (an address), mis-folding `(c->field0 + K) > c->fieldK`
+           * (K == field offset) to a constant. */
+          if (base1.is_lval == base2.is_lval && bvr1 >= 0 && bvr2 >= 0)
           {
             /* Same base vreg → equal */
             if (bvr1 == bvr2)
@@ -6570,6 +6998,14 @@ int tcc_ir_opt_cmp_const_offset_fold(TCCIRState *ir)
       int def_a = tcc_ir_find_defining_instruction(ir, a, i);
       if (def_a < 0)
         continue;
+      /* `a = b +/- K` must hold at the CMP.  tcc_ir_find_defining_instruction
+       * is a linear backward scan blind to a back-edge redefinition of a
+       * multi-def vreg: a loop-carried `a` reset inside the loop reaches the
+       * CMP again with a different value, so the offset from the preceding def
+       * is invalid on the back-edge path.  Only trust it when `a` is single-def
+       * (mirrors the guard in ir_opt_eval_const_u64). */
+      if (!tcc_ir_vreg_has_single_def(ir, a))
+        continue;
       IRQuadCompact *dq = &ir->compact_instructions[def_a];
       if (dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_SUB)
         continue;
@@ -6577,11 +7013,18 @@ int tcc_ir_opt_cmp_const_offset_fold(TCCIRState *ir)
       IROperand ds1 = tcc_ir_op_get_src1(ir, dq);
       IROperand ds2 = tcc_ir_op_get_src2(ir, dq);
 
+      /* The CMP operand standing in for `b`.  The ADD base must match it in
+       * lval-ness too: `*(V)` (loaded value) and `V` (address) share a vreg
+       * but are different values, so `a = *(V) + K` does not make `a == V + K`
+       * provable from `b == V`. */
+      IROperand b_op = swap ? src1 : src2;
+
       /* Match `a = b + K` (or `a = K + b`, commutative ADD). */
       int64_t k = 0;
-      if (irop_get_vreg(ds1) == b && irop_is_immediate(ds2))
+      if (irop_get_vreg(ds1) == b && ds1.is_lval == b_op.is_lval && irop_is_immediate(ds2))
         k = irop_get_imm64_ex(ir, ds2);
-      else if (dq->op == TCCIR_OP_ADD && irop_get_vreg(ds2) == b && irop_is_immediate(ds1))
+      else if (dq->op == TCCIR_OP_ADD && irop_get_vreg(ds2) == b && ds2.is_lval == b_op.is_lval &&
+               irop_is_immediate(ds1))
         k = irop_get_imm64_ex(ir, ds1);
       else
         continue;
@@ -6595,7 +7038,16 @@ int tcc_ir_opt_cmp_const_offset_fold(TCCIRState *ir)
       if (k > (int64_t)INT32_MAX || k < (int64_t)INT32_MIN)
         continue;
 
-      /* B must hold the same value at the CMP as at def_a. */
+      /* B must hold the same value at the CMP as at def_a.  Reject multi-def
+       * for the same back-edge reason as `a`: the linear def lookups below
+       * cannot see a loop redefinition of a multi-def `b` reaching the CMP with
+       * a value different from the one at def_a, which would break the delta.
+       * Unlike `a` (guaranteed >=1 def since def_a was just found), `b` may
+       * legitimately have zero defs (e.g. an incoming parameter) — that is
+       * exactly as safe as single-def, so use the multi-def check, not
+       * single-def, to avoid rejecting the common zero-def case. */
+      if (tcc_ir_vreg_has_multi_def(ir, b))
+        continue;
       int b_def_at_use = tcc_ir_find_defining_instruction(ir, b, i);
       int b_def_at_def = tcc_ir_find_defining_instruction(ir, b, def_a);
       if (b_def_at_use != b_def_at_def)
@@ -6871,7 +7323,12 @@ static int ir_has_backward_control_flow(TCCIRState *ir)
  * Returns 1 and writes *out_off on success, 0 otherwise.
  *
  * Conservative: stops at any other def of V or at any jump_target between
- * the def and `at_idx` (don't cross BB boundaries / merge points). */
+ * the def and `at_idx` (don't cross BB boundaries / merge points).  A vreg
+ * operand read at an instruction that is ITSELF a jump target is never
+ * resolved: its value depends on which edge entered (docs/bugs.md #2 — a
+ * loop-exit `CMP ptr,end` at a back-edge target resolved ptr through the
+ * preheader init only, missing the in-loop `ptr += stride` redefinition,
+ * and the fold deleted the loop's only exit test). */
 static int ir_resolve_stack_addr_value(TCCIRState *ir, IROperand op, int at_idx, int *out_off)
 {
   StackAddrValue value;
@@ -6977,31 +7434,42 @@ static int ir_resolve_stack_addr_value_ex(TCCIRState *ir, IROperand op, int at_i
   if (sav_vreg_has_no_def(vr))
     return 0;
 
-  int saw_merge_at = at_idx;
+  /* A vreg read at a merge point (jump target) has an edge-dependent value:
+   * a def found by the linear backward walk holds only for the fall-through
+   * path, not for the jumped-in edge(s).  This check also covers recursive
+   * calls: resolving a def instruction's own operands uses at_idx = def_j,
+   * so a def sitting at a merge point refuses to resolve its inputs. */
+  if (at_idx >= 0 && at_idx < ir->next_instruction_index &&
+      ir->compact_instructions[at_idx].is_jump_target)
+    return 0;
+
   for (int j = at_idx - 1; j >= 0; j--)
   {
     IRQuadCompact *q = &ir->compact_instructions[j];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    /* Conservative: stop crossing merges (instruction with is_jump_target set).
-     * We allow the very first step (j == at_idx-1) to look back across our
-     * own CMP/BB head, but no further. */
-    if (q->is_jump_target && j != saw_merge_at - 1)
-      return 0;
-    saw_merge_at = j;
 
-    if (!irop_config[q->op].has_dest)
+    /* Determine whether this instruction is a real def of vr.  STORE-style
+     * ops carry an address-of-write in dest (a use, not a def); FUNCPARAMVAL
+     * dest carries the param value (also a use). */
+    int is_def_of_vr = 0;
+    if (q->op != TCCIR_OP_NOP && irop_config[q->op].has_dest && sav_is_def_op(q->op))
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      if (irop_get_vreg(dest) == vr)
+        is_def_of_vr = 1;
+    }
+
+    /* Never cross a merge point (instruction with is_jump_target set, NOPs
+     * included — a NOPed jump target still merges control flow): a value
+     * flowing in over the jumped-in edge may differ from the fall-through
+     * value.  The found def itself being a jump target is fine — its RESULT
+     * dominates the straight-line range down to at_idx (no entries between);
+     * its own operands are guarded by the at_idx check in the recursion. */
+    if (!is_def_of_vr)
+    {
+      if (q->is_jump_target)
+        return 0;
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(dest) != vr)
-      continue;
-    /* STORE-style ops carry an address-of-write in dest, not a def. */
-    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
-        q->op == TCCIR_OP_STORE_POSTINC)
-      continue;
-    /* FUNCPARAMVAL dest carries the param value (a use, not a def). */
-    if (q->op == TCCIR_OP_FUNCPARAMVAL)
-      continue;
+    }
 
     if (q->op == TCCIR_OP_ASSIGN)
     {
@@ -7307,22 +7775,13 @@ int tcc_ir_opt_single_value_tmp(TCCIRState *ir)
   }
 
   if (changes) {
-    for (int i = 0; i < n; i++) {
-      IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
-        continue;
-      if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD)
-        continue;
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(d);
-      if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP)
-        continue;
-      int pos = TCCIR_DECODE_VREG_POSITION(dvr);
-      if (pos < count && state[pos] == 1) {
-        q->op = TCCIR_OP_NOP;
-        changes++;
-      }
-    }
+    /* Let DCE reclaim the now-dead constant defs.  Do NOT NOP them directly by
+     * state[pos] == 1: a single-value temp may still have uses OTHER than the
+     * RETURNVALUE we just folded (e.g. `OR T, #const` in a bitfield store),
+     * because Phase 2 only propagates into RETURNVALUE operands.  Blindly
+     * removing such a def leaves a dangling use → a use-before-def miscompile.
+     * DCE removes a def only when it has no remaining uses, which is exactly
+     * the condition we need. */
     changes += tcc_ir_opt_dce(ir);
   }
 

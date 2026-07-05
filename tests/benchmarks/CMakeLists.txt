@@ -51,11 +51,16 @@ else()
     message(STATUS "MiBench benchmarks: DISABLED")
 endif()
 
-# Common flags for benchmark library
+# Common flags for benchmark library.
+# NOTE: this include set is for the GCC path only (the TCC path hardcodes its
+# own -I flags below). It must NOT contain tcc's own include/ directory: those
+# are tcc compiler-intrinsic headers (its stddef.h deliberately omits the
+# __need_wint_t -> wint_t typedef), and putting them ahead of arm-none-eabi-gcc's
+# own stddef.h makes newlib's <sys/_types.h> fail with "unknown type name
+# 'wint_t'". GCC uses its own toolchain headers plus the shared libc_includes.
 set(BENCH_ARCH_FLAGS "-mcpu=cortex-m33" "-mthumb" "-mfloat-abi=soft")
 set(BENCH_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
     ${CMAKE_CURRENT_SOURCE_DIR}/../ir_tests/libc_includes
 )
 
@@ -93,6 +98,18 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
         set(TCC_FP_LIB "")
     endif()
 
+    # TCC has no bundled cross libc headers, so it must be pointed at the
+    # newlib headers used by the IR test suite. Without these it would fall
+    # back to the host's glibc /usr/include (bits/libc-header-start.h,
+    # gnu/stubs-32.h, ...) which is wrong for a cortex-m33 target and breaks
+    # the build on Ubuntu/Fedora hosts alike. Order mirrors the IR harness
+    # (profile_suite.py / test_gcc_torture_ir.py).
+    set(TCC_LIBC_INCLUDE_FLAGS
+        -I${CMAKE_CURRENT_SOURCE_DIR}/../ir_tests/libc_includes
+        -I${CMAKE_CURRENT_SOURCE_DIR}/../ir_tests/libc_imports
+        -I${CMAKE_CURRENT_SOURCE_DIR}/../ir_tests/libc_includes/newlib
+    )
+
     # Define source files and their object file mappings
     set(TCC_OBJECTS "")
     set(TCC_COMPILE_COMMANDS "")
@@ -109,6 +126,7 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
                 -DBENCHMARK_OPT_LEVEL=${BENCHMARK_OPT_LEVEL}
                 -I${CMAKE_CURRENT_SOURCE_DIR}
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../../include
+                ${TCC_LIBC_INCLUDE_FLAGS}
                 ${src} -o ${obj}
             DEPENDS ${src}
             COMMENT "Compiling ${name}.c with TCC -O${BENCHMARK_OPT_LEVEL}"
@@ -167,6 +185,14 @@ add_executable(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}
     cycle_counter.c
     hardfault_handler.c
 )
+
+# For the TCC path the benchmark library is produced by a custom command and
+# linked by file path, so CMake does not infer a target dependency on it.
+# Make it explicit, otherwise a parallel `make -j` (as run_benchmark.py uses)
+# can start the executable link before libbenchmark_tcc.a exists.
+if(BENCHMARK_COMPILER STREQUAL "TCC")
+    add_dependencies(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX} benchmark_lib_tcc)
+endif()
 
 # Link to Pico SDK libraries
 # Note: We intentionally don't use pico_float here to compare compiler's built-in soft-float

@@ -1,0 +1,12 @@
+0000: StackLoc[-8] <-- #0 [STORE]
+0001: StackLoc[-4] <-- #0 [STORE]
+0002: StackLoc[-4] <-- #5 [STORE]
+0003: T0 <-- Addr[StackLoc[-8]]
+0004: V0 <-- T0 [STORE]
+0005: T1 <-- V0 [ASSIGN]
+0006: T2 <-- V0 [ASSIGN]
+0007: T3 <-- T2 ADD #4
+0008: T4 <-- #1 [ASSIGN]
+0009: JMP to 10
+0010: T5 <-- T4 [ASSIGN]
+0011: RETURNVALUE T5

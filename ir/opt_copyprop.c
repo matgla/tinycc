@@ -219,6 +219,13 @@ static int tcc_ir_opt_copy_prop__timed(TCCIRState *ir)
           LOG_COPY_PROP("Propagate src1 TMP:%d -> vreg:%d (lval=%d) at i=%d", pos,
                         TCCIR_DECODE_VREG_POSITION(copy_info[pos].source_vr), src1.is_lval, i);
           tcc_ir_set_src1(ir, i, replacement);
+          /* Keep the local in sync so the copy-recording step below sees the
+           * propagated source, not the stale original.  Otherwise an
+           * ASSIGN T2<-T1 rewritten to T2<-V0 is still recorded as T2<-V0's
+           * source = T1, leaving a T1 use that only collapses on a second pass
+           * (non-convergence). */
+          src1 = replacement;
+          src1_vr = irop_get_vreg(replacement);
           changes++;
         }
         else
@@ -256,6 +263,8 @@ static int tcc_ir_opt_copy_prop__timed(TCCIRState *ir)
           LOG_COPY_PROP("Propagate src2 TMP:%d -> vreg:%d (lval=%d) at i=%d", pos,
                         TCCIR_DECODE_VREG_POSITION(copy_info[pos].source_vr), src2.is_lval, i);
           tcc_ir_set_src2(ir, i, replacement);
+          src2 = replacement;
+          src2_vr = irop_get_vreg(replacement);
           changes++;
         }
       }
@@ -381,7 +390,7 @@ static int tcc_ir_opt_copy_prop__timed(TCCIRState *ir)
               (db != IROP_BTYPE_INT64 && db != IROP_BTYPE_FLOAT32 && db != IROP_BTYPE_FLOAT64 &&
                sb != IROP_BTYPE_INT64 && sb != IROP_BTYPE_FLOAT32 && sb != IROP_BTYPE_FLOAT64 &&
                db != IROP_BTYPE_INT8 && db != IROP_BTYPE_INT16 && sb != IROP_BTYPE_INT8 && sb != IROP_BTYPE_INT16);
-          if (!src_is_const && src1_vr >= 0 && !src1.is_lval && btype_compat &&
+          if (!src_is_const && src1_vr >= 0 && src1_vr != dest_vr && !src1.is_lval && btype_compat &&
               (src_vreg_type == TCCIR_VREG_TYPE_VAR || src_vreg_type == TCCIR_VREG_TYPE_PARAM ||
                src_vreg_type == TCCIR_VREG_TYPE_TEMP))
           {
@@ -1129,8 +1138,17 @@ int tcc_ir_opt_cse_param_add(TCCIRState *ir)
           int wt = TCCIR_DECODE_VREG_TYPE(wvr);
           if (wt == TCCIR_VREG_TYPE_VAR || wt == TCCIR_VREG_TYPE_PARAM)
           {
+            /* The same local can be CSE-keyed either by its raw VAR/PARAM
+             * vreg (register form) or by the STACKOFF synthetic key
+             * (0x70000000|pos, the memory form used when it's read as a
+             * stack lvalue).  A register-form write changes the value a
+             * later stack-slot read of the same slot would observe, so it
+             * must invalidate BOTH keys — otherwise a `V - #c` computed
+             * after the write gets CSE'd to one computed before it, across
+             * the redefinition (int fuzz seed 41379). */
+            int32_t syn_key = (int32_t)(0x70000000 | ((uint32_t)wvr & 0x0FFFFFFF));
             for (int e = 0; e < entry_count; e++)
-              if (entries[e].valid && entries[e].src_vr == wvr)
+              if (entries[e].valid && (entries[e].src_vr == wvr || entries[e].src_vr == syn_key))
                 entries[e].valid = 0;
           }
         }
@@ -1140,9 +1158,12 @@ int tcc_ir_opt_cse_param_add(TCCIRState *ir)
         int32_t w_vr = irop_get_vreg(wd);
         if (tcc_ir_vreg_is_valid(ir, w_vr))
         {
+          /* Symmetric to the register-form case above: a memory-form store
+           * to the slot must also kill any raw-vreg-keyed entry for the
+           * same local. */
           int32_t syn_key = (int32_t)(0x70000000 | ((uint32_t)w_vr & 0x0FFFFFFF));
           for (int e = 0; e < entry_count; e++)
-            if (entries[e].valid && entries[e].src_vr == syn_key)
+            if (entries[e].valid && (entries[e].src_vr == syn_key || entries[e].src_vr == w_vr))
               entries[e].valid = 0;
         }
       }
@@ -1546,10 +1567,25 @@ int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
     int is_store_like = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
                          q->op == TCCIR_OP_STORE_POSTINC);
     int32_t dest_vr_kill = -1;
+    int dest_aliases_mem = 0;
     if (irop_config[q->op].has_dest)
     {
       IROperand dest_op = tcc_ir_op_get_dest(ir, q);
       dest_vr_kill = irop_get_vreg(dest_op);
+      /* Writing an address-taken local VAR aliases any pointer deref of it:
+       * a cached `*p AND k` read (p == &var) taken *before* this write is now
+       * stale.  The dest_vr_kill match below only catches entries that name the
+       * VAR vreg directly, never a memory deref (`T***DEREF***`) that points at
+       * it, so an ASSIGN like `V3 <-- ...` (u4, whose &u4 escaped into a pointer)
+       * fails to invalidate a cached `*pa AND 31`.  Treat it as a memory write
+       * and flush lval-src entries, exactly as a STORE does (agg_deep O1
+       * wrong-code: the second `**ppa & 31` re-CSE'd to the pre-store value). */
+      if (dest_vr_kill >= 0)
+      {
+        IRLiveInterval *dintv = tcc_ir_vreg_live_interval(ir, dest_vr_kill);
+        if (dintv && dintv->addrtaken)
+          dest_aliases_mem = 1;
+      }
     }
     if (is_store_like || dest_vr_kill >= 0)
     {
@@ -1557,18 +1593,29 @@ int tcc_ir_opt_local_alu_cse(TCCIRState *ir)
       for (int c = 0; c < cache_count; c++)
       {
         int kills = 0;
-        if (is_store_like && (cache[c].s1_lval || cache[c].s2_lval || cache[c].s3_lval))
+        if ((is_store_like || dest_aliases_mem) && (cache[c].s1_lval || cache[c].s2_lval || cache[c].s3_lval))
           kills = 1;
         if (dest_vr_kill >= 0)
         {
-          if (cache[c].s1_tag == IROP_TAG_VREG && cache[c].s1_vr == dest_vr_kill)
+          /* A cached source operand reads the just-redefined value if it carries
+           * dest_vr_kill's vreg — whether encoded as a plain VREG or as a
+           * STACKOFF-lval VAR read (a local variable read).  The original guard
+           * only matched IROP_TAG_VREG, so a re-assignment of a local VAR
+           * (`lr = ...`, dest encoded STACKOFF-lval, dest_vr_kill = the VAR vreg)
+           * failed to invalidate a cached `pb XOR lr` keyed on the old lr, and the
+           * stale value was commutatively re-CSE'd into a later `lr XOR pb`
+           * (random-C O1 wrong-code, seeds 202/251). */
+          #define ALU_CSE_KILLS_VR(tg, lv, vr) \
+            (((tg) == IROP_TAG_VREG || ((tg) == IROP_TAG_STACKOFF && (lv))) && (vr) == dest_vr_kill)
+          if (ALU_CSE_KILLS_VR(cache[c].s1_tag, cache[c].s1_lval, cache[c].s1_vr))
             kills = 1;
-          else if (cache[c].s2_tag == IROP_TAG_VREG && cache[c].s2_vr == dest_vr_kill)
+          else if (ALU_CSE_KILLS_VR(cache[c].s2_tag, cache[c].s2_lval, cache[c].s2_vr))
             kills = 1;
-          else if (cache[c].s3_tag == IROP_TAG_VREG && cache[c].s3_vr == dest_vr_kill)
+          else if (ALU_CSE_KILLS_VR(cache[c].s3_tag, cache[c].s3_lval, cache[c].s3_vr))
             kills = 1;
           else if (cache[c].dest_vr == dest_vr_kill)
             kills = 1; /* this op redefines a previously-cached dest — drop entry */
+          #undef ALU_CSE_KILLS_VR
         }
         if (!kills)
           cache[w++] = cache[c];

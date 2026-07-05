@@ -265,7 +265,7 @@ void tcc_debug_print_svalue(const SValue *sv)
   if (vt & VT_LONG)
     fprintf(stderr, "long ");
   fprintf(stderr, "%s", tcc_debug_btype_name(bt));
-  if (vt & VT_PTR)
+  if (bt == VT_PTR)
     fprintf(stderr, "*");
   if (vt & VT_ARRAY)
     fprintf(stderr, "[]");

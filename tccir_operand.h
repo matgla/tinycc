@@ -52,7 +52,18 @@ typedef enum TCCIR_VREG_TYPE
 #define IROP_TAG_NONE 0     /* sentinel for unused operand */
 #define IROP_TAG_VREG 1     /* pure vreg with no additional data */
 #define IROP_TAG_IMM32 2    /* payload.imm32: signed 32-bit immediate */
-#define IROP_TAG_STACKOFF 3 /* payload.imm32: signed 32-bit FP-relative offset */
+#define IROP_TAG_STACKOFF 3 /* payload.imm32: signed 32-bit FP-relative offset
+                               *
+                               * IMPORTANT: not every STACKOFF operand is a real
+                               * stack slot reference.  A *direct* stack location
+                               * has tag == STACKOFF, is_local == 1, is_lval == 1
+                               * AND vreg_type == 0.  When a VAR or PARAM is
+                               * referenced via its potential spill encoding,
+                               * vreg_type is non-zero and the offset field is
+                               * only metadata about where it *would* spill; the
+                               * program reads from the vreg, not from that slot.
+                               * New passes that inspect stack operands MUST
+                               * check vreg_type == 0 to avoid miscompiles. */
 #define IROP_TAG_F32 4      /* payload.f32_bits: 32-bit float bits (inline) */
 #define IROP_TAG_I64 5      /* payload.pool_idx: index into pool_i64[] */
 #define IROP_TAG_F64 6      /* payload.pool_idx: index into pool_f64[] */
@@ -97,7 +108,10 @@ typedef struct __attribute__((packed)) IROperand
       uint32_t is_local : 1;   /* VT_LOCAL: stack-relative (23) */
       uint32_t is_const : 1;   /* VT_CONST: constant value (24) */
       uint32_t btype : 3;      /* IROP_BTYPE_* (25-27) */
-      uint32_t vreg_type : 4;  /* TCCIR_VREG_TYPE_* (28-31) */
+      uint32_t vreg_type : 4;  /* TCCIR_VREG_TYPE_* (28-31).
+                                  For IROP_TAG_STACKOFF: zero means a real
+                                  direct StackLoc reference; non-zero means a
+                                  vreg-backed spill encoding (see above). */
     };
   };
   union
@@ -179,6 +193,9 @@ int irop_compare_svalue(const struct TCCIRState *ir, const struct SValue *sv, IR
 /* Position sentinel value: max 17-bit value means "no position" */
 #define IROP_POSITION_NONE 0x1FFFF
 
+/* Forward declaration: defined below after all helpers it needs. */
+static inline int32_t irop_get_vreg(const IROperand op);
+
 /* Check if operand encodes a negative vreg (sentinel pattern).
  * Excludes IROP_NONE (vr == -1) which also matches the sentinel bit pattern. */
 static inline int irop_is_neg_vreg(const IROperand op)
@@ -191,8 +208,7 @@ static inline int irop_is_neg_vreg(const IROperand op)
 /* Check if operand has no associated vreg */
 static inline int irop_has_no_vreg(const IROperand op)
 {
-  /* Either negative vreg sentinel OR the old vr < 0 check for IROP_NONE */
-  return irop_is_neg_vreg(op) || (op.position == IROP_POSITION_NONE && op.vreg_type == 0);
+  return irop_get_vreg(op) == -1;
 }
 
 /* Extract tag from operand (using bitfield) */
@@ -543,7 +559,7 @@ static inline uint32_t irop_get_pool_idx(const IROperand op)
 /* Check if operand is an lvalue (needs dereference) - uses bitfield */
 static inline int irop_op_is_lval(const IROperand op)
 {
-  if (op.vr < 0)
+  if (irop_get_tag(op) == IROP_TAG_NONE)
     return 0;
   return op.is_lval;
 }
@@ -551,7 +567,7 @@ static inline int irop_op_is_lval(const IROperand op)
 /* Check if operand has VT_LOCAL semantics - uses bitfield */
 static inline int irop_op_is_local(const IROperand op)
 {
-  if (op.vr < 0)
+  if (irop_get_tag(op) == IROP_TAG_NONE)
     return 0;
   return op.is_local;
 }
@@ -559,7 +575,7 @@ static inline int irop_op_is_local(const IROperand op)
 /* Check if operand has VT_LLOCAL semantics (double indirection) - uses bitfield */
 static inline int irop_op_is_llocal(const IROperand op)
 {
-  if (op.vr < 0)
+  if (irop_get_tag(op) == IROP_TAG_NONE)
     return 0;
   return op.is_llocal;
 }
@@ -567,7 +583,7 @@ static inline int irop_op_is_llocal(const IROperand op)
 /* Check if operand is constant - uses bitfield */
 static inline int irop_op_is_const(const IROperand op)
 {
-  if (op.vr < 0)
+  if (irop_get_tag(op) == IROP_TAG_NONE)
     return 0;
   return op.is_const;
 }

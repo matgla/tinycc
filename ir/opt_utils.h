@@ -31,6 +31,12 @@ int evaluate_compare_condition(int64_t val1, int64_t val2, int cond_token);
 int is_power_of_2(int64_t n);
 
 /* ============================================================================
+ * Pass-disable helper (for debugging / bisection)
+ * ============================================================================ */
+
+int tcc_ir_opt_pass_disabled(const char *name);
+
+/* ============================================================================
  * Condition token helpers
  * ============================================================================ */
 
@@ -86,6 +92,12 @@ int ir_opt_pure_expr_equal(struct TCCIRState *ir, IROperand a, int a_use_idx,
 
 int ir_opt_get_call_param_operand(struct TCCIRState *ir, int call_idx,
                                   int param_idx, IROperand *out);
+/* Instruction index of the FUNCPARAMVAL/FUNCPARAMVOID marshalling `param_idx`
+ * for the call at `call_idx`, or -1.  Use this as the reaching-def use-site for
+ * a param's source: the call index is wrong because the source may be redefined
+ * between param marshalling and the call. */
+int ir_opt_get_call_param_index(struct TCCIRState *ir, int call_idx,
+                                int param_idx);
 void ir_opt_nop_call_params(struct TCCIRState *ir, int call_idx);
 void ir_opt_nop_call_param(struct TCCIRState *ir, int call_idx, int param_idx);
 void ir_opt_change_call_argc(struct TCCIRState *ir, int call_idx, int argc);
@@ -101,6 +113,7 @@ const char *ir_opt_get_constant_string_from_symref(struct TCCIRState *ir,
                                                    IROperand op);
 
 int tcc_ir_vreg_has_single_def(struct TCCIRState *ir, int32_t vreg);
+int tcc_ir_vreg_has_multi_def(struct TCCIRState *ir, int32_t vreg);
 
 /* ============================================================================
  * Callee symbol replacement helpers

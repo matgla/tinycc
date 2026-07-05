@@ -1,0 +1,978 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tinycc — source restructure architecture</title>
+</head>
+<body>
+<style>
+  :root{
+    --ground:#F6F8F6; --card:#FFFFFF; --line:#DCE2DC; --line-soft:#E8ECE8;
+    --ink:#16211B; --muted:#5C685F; --faint:#8A948C;
+    --arch:#0E7B5B; --arch-soft:#E3F1EB;
+    --seam:#A8672A; --seam-soft:#F6EBDD;
+    --fe:#2C5E8F;   --fe-soft:#E4EDF5;
+    --ir:#6B4E9E;   --ir-soft:#ECE7F4;
+    --obj:#A34D5E;  --obj-soft:#F5E6E9;
+    --drv:#4A5568;  --drv-soft:#E8EBEF;
+    --sup:#5C685F;  --sup-soft:#EAEDEA;
+    --bad:#B3402E;  --bad-soft:#F8E7E3;
+    --mono:ui-monospace,"JetBrains Mono","SF Mono","Cascadia Code",Consolas,"Liberation Mono",monospace;
+    --sans:system-ui,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+       font-size:16px;line-height:1.62;-webkit-font-smoothing:antialiased}
+  a{color:var(--arch);text-decoration:none;border-bottom:1px solid transparent}
+  a:hover,a:focus-visible{border-bottom-color:var(--arch)}
+  a:focus-visible{outline:2px solid var(--arch);outline-offset:2px;border-radius:2px}
+  code{font-family:var(--mono);font-size:.85em;background:var(--sup-soft);
+       padding:.08em .35em;border-radius:3px;white-space:nowrap}
+  strong{font-weight:650}
+
+  .wrap{display:grid;grid-template-columns:230px minmax(0,880px);gap:56px;
+        max-width:1220px;margin:0 auto;padding:0 28px 120px}
+  @media (max-width:1119px){.wrap{grid-template-columns:minmax(0,1fr)}
+    nav.toc{display:none}}
+
+  nav.toc{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+          padding:96px 0 40px;font-family:var(--mono);font-size:12.5px}
+  nav.toc ol{list-style:none;margin:0;padding:0;border-left:2px solid var(--line)}
+  nav.toc li a{display:block;padding:5px 0 5px 14px;color:var(--muted);border-bottom:none;
+               border-left:2px solid transparent;margin-left:-2px;line-height:1.4}
+  nav.toc li a:hover{color:var(--ink);border-left-color:var(--arch)}
+  nav.toc .toc-title{color:var(--faint);letter-spacing:.14em;text-transform:uppercase;
+                     font-size:10.5px;margin:0 0 12px 14px}
+
+  header.masthead{padding:88px 0 20px;border-bottom:2px solid var(--ink);margin-bottom:8px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.18em;
+           text-transform:uppercase;color:var(--arch);margin:0 0 14px}
+  h1{font-family:var(--mono);font-size:clamp(26px,4vw,38px);font-weight:600;
+     line-height:1.18;margin:0 0 14px;letter-spacing:-.01em;text-wrap:balance}
+  .lede{font-size:18px;color:var(--muted);max-width:64ch;margin:0 0 22px}
+  .factrow{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 26px;padding:0;list-style:none}
+  .factrow li{font-family:var(--mono);font-size:12px;color:var(--muted);
+              background:var(--card);border:1px solid var(--line);border-radius:4px;
+              padding:5px 10px}
+  .factrow li b{color:var(--ink);font-weight:600}
+
+  section{margin-top:64px;scroll-margin-top:24px}
+  h2{font-family:var(--mono);font-size:20px;font-weight:600;margin:0 0 6px;
+     letter-spacing:-.005em}
+  h2 .no{color:var(--arch);margin-right:10px}
+  h3{font-family:var(--mono);font-size:15px;font-weight:600;margin:30px 0 8px}
+  .kicker{font-family:var(--mono);font-size:12px;color:var(--faint);margin:0 0 18px;
+          letter-spacing:.04em}
+  p{max-width:70ch;margin:0 0 14px}
+  ul.prose{max-width:70ch;margin:0 0 14px;padding-left:22px}
+  ul.prose li{margin-bottom:6px}
+  ol.prose{max-width:70ch;margin:0 0 14px;padding-left:22px}
+  ol.prose li{margin-bottom:6px}
+
+  .scroll{overflow-x:auto;margin:18px 0}
+  table{border-collapse:collapse;width:100%;font-size:14px;background:var(--card);
+        border:1px solid var(--line)}
+  th{font-family:var(--mono);font-size:11.5px;text-transform:uppercase;
+     letter-spacing:.08em;color:var(--muted);text-align:left;font-weight:600;
+     padding:9px 12px;border-bottom:2px solid var(--line);background:var(--ground)}
+  td{padding:9px 12px;border-bottom:1px solid var(--line-soft);vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+  td .path{font-family:var(--mono);font-size:12.8px;white-space:nowrap}
+  td small{color:var(--muted)}
+
+  .chip{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:600;
+        padding:2px 8px;border-radius:3px;letter-spacing:.03em;white-space:nowrap}
+  .c-fe{background:var(--fe-soft);color:var(--fe)}
+  .c-ir{background:var(--ir-soft);color:var(--ir)}
+  .c-seam{background:var(--seam-soft);color:var(--seam)}
+  .c-arch{background:var(--arch-soft);color:var(--arch)}
+  .c-obj{background:var(--obj-soft);color:var(--obj)}
+  .c-drv{background:var(--drv-soft);color:var(--drv)}
+  .c-sup{background:var(--sup-soft);color:var(--sup)}
+  .c-bad{background:var(--bad-soft);color:var(--bad)}
+
+  pre.tree{font-family:var(--mono);font-size:13px;line-height:1.58;background:var(--card);
+           border:1px solid var(--line);border-radius:4px;padding:20px 24px;margin:18px 0;
+           overflow-x:auto;color:var(--ink)}
+  pre.tree .dir{font-weight:650}
+  pre.tree .d-fe{color:var(--fe)} pre.tree .d-ir{color:var(--ir)}
+  pre.tree .d-seam{color:var(--seam)} pre.tree .d-arch{color:var(--arch)}
+  pre.tree .d-obj{color:var(--obj)} pre.tree .d-drv{color:var(--drv)}
+  pre.tree .d-sup{color:var(--sup)}
+  pre.tree .cm{color:var(--faint)}
+  pre.tree .was{color:var(--faint);font-style:italic}
+  pre.tree .ghost{color:var(--faint)}
+
+  figure{margin:22px 0}
+  figure svg{width:100%;height:auto;display:block}
+  figcaption{font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:10px;
+             max-width:78ch}
+
+  .callout{border:1px solid var(--line);border-left:4px solid var(--arch);
+           background:var(--card);padding:14px 18px;border-radius:0 4px 4px 0;
+           margin:18px 0;max-width:74ch}
+  .callout.warn{border-left-color:var(--bad)}
+  .callout.seam{border-left-color:var(--seam)}
+  .callout p{margin:0 0 8px}.callout p:last-child{margin:0}
+  .callout .tag{font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+                text-transform:uppercase;color:var(--muted);display:block;margin-bottom:6px}
+
+  .phases{display:grid;gap:14px;margin:20px 0}
+  .phase{background:var(--card);border:1px solid var(--line);border-radius:4px;
+         padding:16px 20px;display:grid;grid-template-columns:52px minmax(0,1fr);gap:16px}
+  .phase .pn{font-family:var(--mono);font-size:22px;font-weight:600;color:var(--arch);
+             line-height:1.1}
+  .phase .pn small{display:block;font-size:10px;color:var(--faint);letter-spacing:.08em;
+                   text-transform:uppercase;margin-top:4px;font-weight:600}
+  .phase h4{font-family:var(--mono);font-size:14.5px;margin:0 0 6px;font-weight:650}
+  .phase p{font-size:14.5px;margin:0 0 6px;max-width:none}
+  .phase .gate{font-family:var(--mono);font-size:12px;color:var(--arch);
+               border-top:1px dashed var(--line);padding-top:8px;margin-top:4px}
+  .phase .gate::before{content:"gate ▸ ";color:var(--faint)}
+
+  .legend{display:flex;flex-wrap:wrap;gap:14px;font-family:var(--mono);font-size:12px;
+          color:var(--muted);margin:8px 0 0}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .sw{width:11px;height:11px;border-radius:2px;display:inline-block}
+
+  .decide{background:var(--card);border:1px solid var(--line);border-radius:4px;
+          padding:16px 20px;margin:16px 0;max-width:78ch}
+  .decide .q{font-family:var(--mono);font-weight:650;font-size:14px;margin-bottom:6px}
+  .decide .rec{color:var(--arch);font-family:var(--mono);font-size:12px;
+               letter-spacing:.06em;text-transform:uppercase}
+  .decide p{font-size:14.5px}
+  footer{margin-top:80px;padding-top:18px;border-top:1px solid var(--line);
+         font-family:var(--mono);font-size:12px;color:var(--faint)}
+</style>
+
+<div class="wrap">
+<nav class="toc" aria-label="Contents">
+  <p class="toc-title">Contents</p>
+  <ol>
+    <li><a href="#goals">§1 Goals &amp; ground rules</a></li>
+    <li><a href="#current">§2 Where the code is today</a></li>
+    <li><a href="#tree">§3 Target source tree</a></li>
+    <li><a href="#layers">§4 Layered architecture</a></li>
+    <li><a href="#contract">§5 The backend contract</a></li>
+    <li><a href="#tccgen">§6 Splitting tccgen.c</a></li>
+    <li><a href="#armgen">§7 Splitting arm-thumb-gen.c</a></li>
+    <li><a href="#headers">§8 Header topology</a></li>
+    <li><a href="#tests">§9 Target test tree</a></li>
+    <li><a href="#plan">§10 Migration plan</a></li>
+    <li><a href="#newarch">§11 Adding an architecture</a></li>
+    <li><a href="#risks">§12 Risks &amp; decisions</a></li>
+  </ol>
+</nav>
+
+<main>
+<header class="masthead">
+  <p class="eyebrow">tinycc · armv8-m fork · architecture proposal</p>
+  <h1>Restructuring the source tree for multi-architecture support</h1>
+  <p class="lede">A <code>source/</code> root with generic compiler layers, one machine
+  contract, and self-contained backends under <code>source/arch/</code> — plus a test tree
+  that mirrors it. Designed so the next architecture is a directory, not a rewrite.</p>
+  <ul class="factrow">
+    <li><b>91k</b> lines top-level C</li>
+    <li><b>97k</b> lines in ir/</li>
+    <li>tccgen.c <b>33,407</b> lines</li>
+    <li>arm-thumb-gen.c <b>13,534</b> lines</li>
+    <li>tcc.h <b>2,892</b> lines, included everywhere</li>
+    <li>seam already <b>~80%</b> in place</li>
+  </ul>
+</header>
+
+<section id="goals">
+  <h2><span class="no">§1</span>Goals &amp; ground rules</h2>
+  <p class="kicker">what this restructure must achieve — and what it must not break</p>
+  <ul class="prose">
+    <li><strong>Physical layout matches logical layers.</strong> Everything moves under
+      <code>source/</code>; architecture-specific code lives only in
+      <code>source/arch/&lt;name&gt;/</code>; generic code never includes an arch header.</li>
+    <li><strong>Huge files become functional blocks.</strong> <code>tccgen.c</code> (33k)
+      splits into ~10 files, <code>arm-thumb-gen.c</code> (13.5k) into ~13, along the block
+      boundaries mapped in §6–§7.</li>
+    <li><strong>A second architecture drops in.</strong> One written contract (§5) is the
+      complete list of what a backend implements. Register facts, ABI classification, and
+      relocations all flow through it.</li>
+    <li><strong>Every phase keeps <code>make test</code> green.</strong> The plan (§10) is a
+      sequence of mechanical, individually verifiable steps — no big-bang branch.</li>
+    <li><strong>History survives.</strong> Moves are pure <code>git mv</code> commits,
+      separate from content edits, so <code>git blame -C</code> stays useful.</li>
+  </ul>
+  <div class="callout">
+    <span class="tag">good news first</span>
+    <p>This is not a greenfield redesign. The amalgamation build is already gone (every
+    <code>.c</code> compiles separately; only <code>tcc.c</code> includes
+    <code>tcctools.c</code>). <code>arch/arm/</code> already exists with clean pieces —
+    AAPCS classification, a <code>RegAllocTarget</code> descriptor, 29 Thumb-2 encoder
+    modules — and the build system already documents how to add an architecture. The IR
+    operand seam (<code>MachineOperand</code>, <code>machine_op_from_ir</code>) is fully
+    target-neutral. What remains is finishing a boundary that is ~80% built.</p>
+  </div>
+</section>
+
+<section id="current">
+  <h2><span class="no">§2</span>Where the code is today</h2>
+  <p class="kicker">two half-finished abstraction layers, six hard leaks, one god-header</p>
+  <p>The load-bearing backend interface today is a flat set of <strong>~90
+  <code>tcc_gen_machine_*</code> / <code>tcc_machine_*</code> symbols</strong> declared in
+  <code>tcc.h:2576–2726</code> and resolved at link time. A second, aspirational vtable
+  (<code>TCCMachineInterface</code> in <code>tccmachine.h/.c</code>) exists but is dead:
+  <code>tcc_machine_register()</code> is never called. Meanwhile the largest ARM files
+  still sit at the repo root, outside <code>arch/</code>.</p>
+
+  <figure>
+  <svg viewBox="0 0 960 500" role="img" aria-label="Current top-level layout with leak points">
+    <defs>
+      <marker id="mred" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#B3402E"/>
+      </marker>
+    </defs>
+    <style>
+      .bx{fill:#FFFFFF;stroke:#DCE2DC;stroke-width:1.2;rx:4}
+      .bt{font:600 13px ui-monospace,Consolas,monospace;fill:#16211B}
+      .bs{font:12px ui-monospace,Consolas,monospace;fill:#5C685F}
+      .bn{font:600 11px ui-monospace,Consolas,monospace;fill:#8A948C}
+      .leak{stroke:#B3402E;stroke-width:1.6;stroke-dasharray:5 4;fill:none}
+      .lno{font:700 12px ui-monospace,Consolas,monospace;fill:#B3402E}
+    </style>
+    <!-- tcc.h god header -->
+    <rect x="318" y="16" width="324" height="58" class="bx" style="stroke:#B3402E;stroke-width:1.6"/>
+    <text x="334" y="40" class="bt">tcc.h — 2,892-line god-header</text>
+    <text x="334" y="60" class="bs">included by every TU · pulls arm-thumb-defs.h</text>
+
+    <!-- left column: frontend files -->
+    <rect x="24" y="110" width="272" height="104" class="bx"/>
+    <text x="40" y="136" class="bt">tccgen.c</text>
+    <text x="40" y="156" class="bs">parser + sema + IR emission</text>
+    <text x="40" y="176" class="bs">5 functions &gt; 1,000 lines each</text>
+    <text x="216" y="136" class="bn">33,407 ln</text>
+
+    <rect x="24" y="238" width="272" height="118" class="bx"/>
+    <text x="40" y="264" class="bt">generic core</text>
+    <text x="40" y="286" class="bs">tccpp.c · tccelf.c · tccld.c</text>
+    <text x="40" y="304" class="bs">tccdbg.c · tccasm.c · libtcc.c</text>
+    <text x="40" y="322" class="bs">tccyaff.c · tcc.c · tccls.c …</text>
+    <text x="40" y="344" class="bs">mostly clean; islands of #ifdef ARM</text>
+
+    <rect x="24" y="380" width="272" height="96" class="bx" style="stroke-dasharray:6 4"/>
+    <text x="40" y="406" class="bt" style="fill:#8A948C">tccmachine.c — dead vtable</text>
+    <text x="40" y="426" class="bs">TCCMachineInterface never registered;</text>
+    <text x="40" y="444" class="bs">real dispatch = ~90 link-time symbols</text>
+    <text x="40" y="462" class="bs">declared in tcc.h:2576–2726</text>
+
+    <!-- middle: ir -->
+    <rect x="344" y="110" width="272" height="246" class="bx" style="stroke:#6B4E9E"/>
+    <text x="360" y="136" class="bt" style="fill:#6B4E9E">ir/ — 70 files</text>
+    <text x="536" y="136" class="bn">97k ln</text>
+    <text x="360" y="160" class="bs">core · cfg · ssa · dump · vreg</text>
+    <text x="360" y="178" class="bs">opt_*.c + opt/ssa_opt_*.c passes</text>
+    <text x="360" y="196" class="bs">regalloc.c (RegAllocTarget ✓)</text>
+    <text x="360" y="214" class="bs">machine_op.c (MachineOperand ✓)</text>
+    <text x="360" y="238" class="bt" style="font-size:12.5px">codegen.c — two-pass dispatch</text>
+    <text x="360" y="258" class="bs">109 direct tcc_gen_machine_* calls</text>
+    <text x="360" y="282" class="bs">already target-neutral except one</text>
+    <text x="360" y="300" class="bs">direct call into ARM call-site code</text>
+
+    <!-- right column: ARM at root -->
+    <rect x="664" y="110" width="272" height="88" class="bx" style="stroke:#0E7B5B"/>
+    <text x="680" y="136" class="bt" style="fill:#0E7B5B">ARM files still at repo root</text>
+    <text x="680" y="158" class="bs">arm-thumb-gen.c (13,534 ln)</text>
+    <text x="680" y="176" class="bs">arm-thumb-asm.c · arm-link.c</text>
+    <text x="680" y="192" class="bs">callsite.c · defs.h · thumb-tok.h</text>
+
+    <rect x="664" y="222" width="272" height="70" class="bx" style="stroke-dasharray:6 4"/>
+    <text x="680" y="248" class="bt" style="fill:#8A948C">arm-thumb-scratch.c</text>
+    <text x="680" y="268" class="bs">orphaned — in no Makefile, included</text>
+    <text x="680" y="284" class="bs">by nothing. Delete.</text>
+
+    <rect x="664" y="316" width="272" height="102" class="bx" style="stroke:#0E7B5B"/>
+    <text x="680" y="342" class="bt" style="fill:#0E7B5B">arch/arm/ — already exists</text>
+    <text x="864" y="342" class="bn">7.6k ln</text>
+    <text x="680" y="364" class="bs">arm.c · arm_aapcs.c · arm_regalloc.c</text>
+    <text x="680" y="382" class="bs">ssa_opt_arm.c · thumb/thop_*.c ×29</text>
+    <text x="680" y="402" class="bs">arch/fpu/arm: present but unbuilt</text>
+
+    <!-- leak arrows -->
+    <path d="M642,45 L800,45 L800,106" class="leak" marker-end="url(#mred)"/>
+    <text x="806" y="72" class="lno">①</text>
+    <path d="M296,150 C560,178 700,240 796,312" class="leak" marker-end="url(#mred)"/>
+    <text x="560" y="204" class="lno">②</text>
+    <path d="M616,262 L660,230" class="leak" marker-end="url(#mred)"/>
+    <text x="622" y="242" class="lno">③</text>
+    <text x="226" y="336" class="lno">④⑤⑥</text>
+  </svg>
+  <figcaption>Fig. 1 — Today's top level. Red dashed arrows are the hard couplings that
+  break the generic/arch boundary; numbers key into the table below. Grey dashed boxes are
+  dead code.</figcaption>
+  </figure>
+
+  <h3>The six hard leaks (generic → ARM)</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>#</th><th>Where</th><th>Leak</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td>①</td><td class="path">tcc.h:358</td>
+        <td>Unconditionally includes <span class="path">arm-thumb-defs.h</span> — every
+        generic TU compiles against <code>NB_REGS</code>, <code>TREG_*</code>,
+        <code>RC_*</code>, ARM reloc aliases.</td>
+        <td>Backend defs come in via the machine contract header only.</td></tr>
+      <tr><td>②</td><td class="path">tccgen.c:38, 1028, 30983</td>
+        <td>Includes <span class="path">arch/arm/arm_regalloc.h</span>; calls
+        <code>arm_init()</code> and <code>arm_get_regalloc_target()</code> directly.</td>
+        <td>Generic <code>tcc_backend_init()</code> +
+        <code>tcc_backend_regalloc_target()</code> hooks.</td></tr>
+      <tr><td>③</td><td class="path">ir/codegen.c:1915</td>
+        <td>Generic dispatcher calls <code>thumb_build_call_layout_from_ir()</code>
+        by name.</td>
+        <td>Add call-layout entry point to the contract.</td></tr>
+      <tr><td>④</td><td class="path">tccls.c:125–320</td>
+        <td>Hardcodes SP=R13 mask, R12 special case, "scratch from R0–R3", 16-register
+        bounds in nominally generic linear-scan code.</td>
+        <td>Read all register facts from <code>RegAllocTarget</code>.</td></tr>
+      <tr><td>⑤</td><td class="path">tccgen.c:30891</td>
+        <td><code>registers_for_allocator = 12</code> hardcoded (backend sets 13
+        elsewhere — duplicated magic).</td>
+        <td>Single source of truth in <code>RegAllocTarget</code>.</td></tr>
+      <tr><td>⑥</td><td class="path">tccir.h:718</td>
+        <td>Generic IR header declares <code>arm_fpu_supports_double()</code>.</td>
+        <td>Replace with <code>tcc_target_has()</code> capability query
+        (already exists in tcc_target.h).</td></tr>
+    </tbody>
+  </table></div>
+  <p>Beyond these, <code>#ifdef TCC_TARGET_ARM_THUMB</code> appears at only ~17 sites in
+  generic code — mostly benign option-parsing and section-name islands in
+  <code>libtcc.c</code>, <code>tccelf.c</code>, <code>tccdbg.c</code> that can migrate to
+  contract hooks gradually. The relocation engine is already split correctly:
+  <code>tccelf.c</code> drives, <code>arm-link.c</code> implements
+  <code>relocate</code>/<code>code_reloc</code>/<code>gotplt_entry_type</code>.</p>
+</section>
+
+<section id="tree">
+  <h2><span class="no">§3</span>Target source tree</h2>
+  <p class="kicker">source/ as root · arch/ for backends · generic layers in the rest</p>
+  <p>File basenames keep their identity where the file moves unchanged
+  (<span class="was">← annotations</span> show origin); new names appear only where a
+  file is split. Repo root keeps <code>include/</code> (headers shipped to compiled
+  programs), <code>lib/</code> (runtime library), <code>tests/</code>, <code>scripts/</code>,
+  <code>docs/</code>.</p>
+
+<pre class="tree">
+<span class="dir">source/</span>
+├── <span class="dir d-drv">driver/</span>                        <span class="cm"># entry points &amp; public API</span>
+│   ├── tcc.c                      <span class="cm"># CLI main + tool dispatch</span>
+│   ├── tcctools.c                 <span class="cm"># ar / cross-prefix tools</span>
+│   └── libtcc.c                   <span class="cm"># TCCState lifecycle, options, compile/link driver</span>
+├── <span class="dir d-fe">frontend/</span>                      <span class="cm"># C language → IR</span>
+│   ├── tccpp.c                    <span class="cm"># preprocessor + tokenizer</span>
+│   ├── tccasm.c                   <span class="cm"># GAS-style asm frontend (arch-neutral core)</span>
+│   ├── tcctok.h · tccdefs.h
+│   └── <span class="dir d-fe">gen/</span>                       <span class="cm"># tccgen.c split — see §6</span>
+│       ├── gen_priv.h             <span class="cm"># shared vstack/scope/switch state (the linchpin)</span>
+│       ├── gen_core.c  gen_sym.c  gen_vstack.c  gen_ops.c  gen_types.c
+│       ├── gen_expr.c  gen_builtins.c  gen_stmt.c  gen_init.c
+│       └── gen_decl.c             <span class="cm"># decl, nested fns, gen_function IR-pipeline driver</span>
+├── <span class="dir d-ir">ir/</span>                            <span class="cm"># target-independent IR — moves largely as-is</span>
+│   ├── core.c  cfg.c  ssa.c  dump.c  vreg.c  stack.c  live.c  licm.c
+│   ├── operand.c                  <span class="was">← tccir_operand.c (SValue ↔ IROperand)</span>
+│   ├── passes.c                   <span class="was">← tccopt.c (pass registry)</span>
+│   ├── <span class="dir d-ir">opt/</span>                       <span class="cm"># all opt_*.c + ssa_opt_*.c consolidated</span>
+│   ├── regalloc.c                 <span class="cm"># SSA regalloc — parameterized by RegAllocTarget ✓</span>
+│   └── codegen.c                  <span class="cm"># two-pass dry-run/real-run dispatch loop</span>
+├── <span class="dir d-seam">machine/</span>                       <span class="cm"># THE seam — generic side of the backend boundary</span>
+│   ├── machine.h                  <span class="cm"># the written contract: every symbol a backend implements (§5)</span>
+│   ├── machine_op.c/.h            <span class="was">← ir/machine_op.* (MachineOperand — already clean)</span>
+│   ├── target.h                   <span class="was">← tcc_target.h (ArchitectureConfig, capabilities)</span>
+│   ├── abi.h                      <span class="was">← tccabi.h (TCCAbiArgDesc / CallLayout)</span>
+│   └── ls.c                       <span class="was">← tccls.c, de-ARM'd (leak ④)</span>
+├── <span class="dir d-obj">obj/</span>                           <span class="cm"># object containers, linking, debug info</span>
+│   ├── elf.c                      <span class="was">← tccelf.c (ARM islands → reloc hooks)</span>
+│   ├── ld.c                       <span class="was">← tccld.c (linker scripts — already 100% generic)</span>
+│   ├── yaff.c                     <span class="was">← tccyaff.c (R_ARM_* enums → contract reloc kinds)</span>
+│   ├── dwarf.c                    <span class="was">← tccdbg.c (DWARF/stabs)</span>
+│   └── elf.h · dwarf.h · stab.h
+├── <span class="dir d-sup">support/</span>
+│   ├── log.h  tcc-chained-hash.h
+│   └── tccdebug.c                 <span class="cm"># SValue/Sym pretty-printers</span>
+└── <span class="dir d-arch">arch/</span>
+    ├── <span class="dir d-arch">arm/</span>
+    │   ├── arm.c  arm.h           <span class="cm"># target init: ArchitectureConfig, capabilities</span>
+    │   ├── defs.h                 <span class="was">← arm-thumb-defs.h (NB_REGS, TREG_*, RC_*)</span>
+    │   ├── aapcs.c                <span class="was">← arm_aapcs.c (ABI classification)</span>
+    │   ├── regalloc.c             <span class="was">← arm_regalloc.c (RegAllocTarget tables)</span>
+    │   ├── ssa_opt.c              <span class="was">← ssa_opt_arm.c (MLA fusion, shl+add→indexed, …)</span>
+    │   ├── <span class="dir d-arch">gen/</span>                   <span class="cm"># arm-thumb-gen.c split — see §7</span>
+    │   ├── <span class="dir d-arch">thumb/</span>                 <span class="cm"># thop_*.c encoders ×29 — unchanged</span>
+    │   ├── asm.c                  <span class="was">← arm-thumb-asm.c (mnemonic parser → thop_*)</span>
+    │   ├── tok.h                  <span class="was">← thumb-tok.h</span>
+    │   ├── link.c                 <span class="was">← arm-link.c (R_ARM_* relocations)</span>
+    │   └── <span class="dir d-arch">fpu/</span>                   <span class="was">← arch/fpu/arm — finally wired into arm_resolve_fpu()</span>
+    └── <span class="ghost">riscv/                     # future — implements machine/machine.h, nothing else</span>
+</pre>
+
+  <div class="callout warn">
+    <span class="tag">deletions, not moves</span>
+    <p><code>arm-thumb-scratch.c</code> is orphaned (built by nothing, included by nothing —
+    the live scratch logic is inside <code>arm-thumb-gen.c</code>): delete it. The dead
+    <code>TCCMachineInterface</code> vtable in <code>tccmachine.h/.c</code> is superseded by
+    the contract header (§5 decision): delete it too. Legacy upstream test drivers
+    (<code>tcctest.c</code>, <code>abitest.c</code>, <code>tests/Makefile</code> suite)
+    quarantine under <code>tests/legacy/</code>.</p>
+  </div>
+</section>
+
+<section id="layers">
+  <h2><span class="no">§4</span>Layered architecture</h2>
+  <p class="kicker">dependency rules the directory layout enforces</p>
+
+  <figure>
+  <svg viewBox="0 0 960 640" role="img" aria-label="Target layered architecture">
+    <defs>
+      <marker id="mink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#5C685F"/>
+      </marker>
+      <marker id="mgrn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#0E7B5B"/>
+      </marker>
+    </defs>
+    <style>
+      .lt{font:600 14px ui-monospace,Consolas,monospace}
+      .ls{font:12.5px ui-monospace,Consolas,monospace;fill:#5C685F}
+      .lann{font:11.5px ui-monospace,Consolas,monospace;fill:#8A948C}
+      .flow{stroke:#5C685F;stroke-width:1.6;fill:none}
+      .impl{stroke:#0E7B5B;stroke-width:1.6;stroke-dasharray:5 4;fill:none}
+    </style>
+
+    <!-- driver -->
+    <rect x="30" y="18" width="560" height="66" rx="4" fill="#E8EBEF" stroke="#4A5568" stroke-width="1.4"/>
+    <text x="48" y="44" class="lt" fill="#4A5568">driver/</text>
+    <text x="48" y="66" class="ls">tcc.c (CLI) · libtcc.c (API, options, compile/link orchestration)</text>
+
+    <!-- obj column -->
+    <rect x="640" y="18" width="290" height="424" rx="4" fill="#F5E6E9" stroke="#A34D5E" stroke-width="1.4"/>
+    <text x="658" y="44" class="lt" fill="#A34D5E">obj/</text>
+    <text x="658" y="68" class="ls">elf.c — sections, symbols,</text>
+    <text x="658" y="86" class="ls">GOT/PLT, output writer</text>
+    <text x="658" y="110" class="ls">ld.c — linker scripts, regions</text>
+    <text x="658" y="134" class="ls">yaff.c — YAFF object format</text>
+    <text x="658" y="158" class="ls">dwarf.c — debug info</text>
+    <text x="658" y="196" class="lann">calls the reloc contract:</text>
+    <text x="658" y="214" class="lann">relocate() · code_reloc()</text>
+    <text x="658" y="232" class="lann">gotplt_entry_type()</text>
+    <text x="658" y="250" class="lann">— implemented by arch/*/link.c</text>
+
+    <!-- frontend -->
+    <rect x="30" y="118" width="560" height="88" rx="4" fill="#E4EDF5" stroke="#2C5E8F" stroke-width="1.4"/>
+    <text x="48" y="144" class="lt" fill="#2C5E8F">frontend/</text>
+    <text x="48" y="166" class="ls">tccpp.c → gen/* (parse · types · sema · vstack → IR emission)</text>
+    <text x="48" y="186" class="ls">tccasm.c (inline-asm frontend → arch asm parser)</text>
+
+    <!-- ir -->
+    <rect x="30" y="240" width="560" height="98" rx="4" fill="#ECE7F4" stroke="#6B4E9E" stroke-width="1.4"/>
+    <text x="48" y="266" class="lt" fill="#6B4E9E">ir/</text>
+    <text x="48" y="288" class="ls">core · cfg · ssa · opt pipeline · licm — target-independent</text>
+    <text x="48" y="308" class="ls">regalloc.c ⟵ RegAllocTarget      codegen.c: two-pass dispatch</text>
+    <text x="48" y="326" class="ls">machine_op_from_ir(): IROperand → MachineOperand</text>
+
+    <!-- machine seam -->
+    <rect x="30" y="372" width="560" height="78" rx="4" fill="#F6EBDD" stroke="#A8672A" stroke-width="1.8"/>
+    <text x="48" y="398" class="lt" fill="#A8672A">machine/ — the contract</text>
+    <text x="48" y="420" class="ls">machine.h (~90 entry points, §5) · machine_op · target.h</text>
+    <text x="48" y="438" class="ls">abi.h · ls.c — the only headers arch code and generic code share</text>
+
+    <!-- arch -->
+    <rect x="30" y="484" width="340" height="128" rx="4" fill="#E3F1EB" stroke="#0E7B5B" stroke-width="1.4"/>
+    <text x="48" y="510" class="lt" fill="#0E7B5B">arch/arm/</text>
+    <text x="48" y="532" class="ls">gen/ (mop handlers) · thumb/ (encoders)</text>
+    <text x="48" y="550" class="ls">link.c · asm.c · aapcs.c · regalloc.c</text>
+    <text x="48" y="568" class="ls">ssa_opt.c · fpu/ · defs.h</text>
+    <text x="48" y="592" class="lann">sees: machine/ + ir headers it needs</text>
+
+    <rect x="400" y="484" width="190" height="128" rx="4" fill="none" stroke="#8A948C" stroke-width="1.4" stroke-dasharray="7 5"/>
+    <text x="418" y="510" class="lt" fill="#8A948C">arch/riscv/</text>
+    <text x="418" y="532" class="lann">future backend:</text>
+    <text x="418" y="550" class="lann">implement machine.h,</text>
+    <text x="418" y="568" class="lann">add Makefile stanza,</text>
+    <text x="418" y="586" class="lann">nothing else changes</text>
+
+    <!-- flows -->
+    <path d="M310,84 L310,114" class="flow" marker-end="url(#mink)"/>
+    <path d="M310,206 L310,236" class="flow" marker-end="url(#mink)"/>
+    <path d="M310,338 L310,368" class="flow" marker-end="url(#mink)"/>
+    <text x="322" y="360" class="lann">mop dispatch (per IR op)</text>
+    <path d="M590,51 L636,51" class="flow" marker-end="url(#mink)"/>
+    <path d="M590,162 L636,162" class="flow" marker-end="url(#mink)"/>
+    <text x="596" y="148" class="lann">syms/relocs</text>
+    <path d="M640,300 L610,300 L610,368" class="flow" marker-end="url(#mink)"/>
+    <!-- implements arrows -->
+    <path d="M200,484 L200,454" class="impl" marker-end="url(#mgrn)"/>
+    <path d="M495,484 L495,454" class="impl" marker-end="url(#mgrn)"/>
+    <text x="212" y="472" class="lann" fill="#0E7B5B">implements</text>
+  </svg>
+  <figcaption>Fig. 2 — Target layers. Solid arrows are calls (always downward or into
+  obj/); the dashed green arrows are backends implementing the machine contract. The copper
+  band is the only crossing point between generic and architecture-specific code.</figcaption>
+  </figure>
+
+  <h3>Dependency rules (CI-enforceable)</h3>
+  <ul class="prose">
+    <li><code>driver/ → frontend/, ir/, obj/, machine/</code> — orchestration only.</li>
+    <li><code>frontend/ → ir/, machine/</code> (emission primitives, ABI queries);
+      <code>frontend/ → obj/</code> only for symbol/section glue
+      (<code>put_extern_sym</code>, relocations on initializers).</li>
+    <li><code>ir/ → machine/</code> — the dispatch loop and regalloc consume only
+      contract types.</li>
+    <li><code>obj/ → machine/</code> — reloc/attribute hooks; never
+      <code>R_ARM_*</code> by name.</li>
+    <li><code>arch/&lt;t&gt;/ → machine/, ir/ headers, support/</code> — a backend may see
+      generic types, never frontend internals.</li>
+    <li><strong>Nothing outside <code>arch/</code> includes anything inside
+      <code>arch/</code>.</strong> One grep in CI keeps this true forever:
+      <code>grep -rn '#include "arch/' source/ --exclude-dir=arch</code> must return
+      empty.</li>
+  </ul>
+</section>
+
+<section id="contract">
+  <h2><span class="no">§5</span>The backend contract — <code>machine/machine.h</code></h2>
+  <p class="kicker">one header that is the complete definition of "a backend"</p>
+  <p>The interface already exists in practice — it is just scattered and unwritten. The
+  contract header collects the ~90 entry points, grouped and documented, so "port tinycc"
+  becomes "implement this file". Group sizes below are from the live
+  <code>tcc.h:2576–2726</code> surface plus the reloc backend.</p>
+
+  <div class="scroll"><table>
+    <thead><tr><th>Group</th><th>≈</th><th>Entry points (representative)</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><span class="chip c-seam">materialization</span></td><td class="num">10</td>
+        <td class="path">acquire/release_scratch · load/store_spill_slot ·
+        load_constant · addr_of_stack_slot · can_encode_stack_offset</td>
+        <td>Integer-arg primitives used by ir/mat + regalloc.</td></tr>
+      <tr><td><span class="chip c-seam">mop handlers</span></td><td class="num">~45</td>
+        <td class="path">data_processing_mop · load/store[_indexed|_postinc]_mop ·
+        muldiv_mop · mla/umull/smull_mop · fp_mop · func_call_mop · select_mop ·
+        block_copy_mop · vla_mop · setjmp/trap/prefetch…</td>
+        <td>One per IR op family; all take <code>MachineOperand</code>.</td></tr>
+      <tr><td><span class="chip c-seam">frame</span></td><td class="num">8</td>
+        <td class="path">prolog · epilog · finish_noreturn · store_to_stack/sp ·
+        number_of_registers · gfunc_sret · nested-fn trampoline</td>
+        <td>Frame layout + return-value classification.</td></tr>
+      <tr><td><span class="chip c-seam">branches</span></td><td class="num">8</td>
+        <td class="path">jump_mop · conditional_jump_mop · cbz_jump_mop ·
+        backpatch_jump · switch_table/load_mop · *_dry_run_size</td>
+        <td>Relaxation policy stays in the backend.</td></tr>
+      <tr><td><span class="chip c-seam">two-pass hooks</span></td><td class="num">~15</td>
+        <td class="path">dry_run_init/start/end · insn_scratch_reset/count/saves_mask ·
+        branch_opt_init/analyze · *_cache_reset · pending_pool_size ·
+        reserve_pool_bytes · end_instruction</td>
+        <td>Driven by ir/codegen.c's dry-run/real-run loop.</td></tr>
+      <tr><td><span class="chip c-seam">ABI</span></td><td class="num">5</td>
+        <td class="path">abi_classify_argument · abi_assign_call_args ·
+        build_call_layout (fixes leak ③) · abi_softcall_name</td>
+        <td>Types in machine/abi.h.</td></tr>
+      <tr><td><span class="chip c-seam">target</span></td><td class="num">5</td>
+        <td class="path">backend_init/deinit (fixes leak ②) · regalloc_target() ·
+        target_has(cap) · resolve_fpu()</td>
+        <td>Fills ArchitectureConfig + RegAllocTarget.</td></tr>
+      <tr><td><span class="chip c-seam">relocations</span></td><td class="num">4</td>
+        <td class="path">relocate · relocate_plt · code_reloc · gotplt_entry_type</td>
+        <td>Already the upstream xxx-link.c shape; obj/elf.c is the driver.</td></tr>
+      <tr><td><span class="chip c-seam">asm (optional)</span></td><td class="num">2</td>
+        <td class="path">asm_opcode parser hook · asm token table</td>
+        <td>Backends without inline-asm support stub these.</td></tr>
+    </tbody>
+  </table></div>
+
+  <div class="decide">
+    <p class="q">Decision: link-time binding, not a vtable</p>
+    <p class="rec">recommended — matches how the fork already works</p>
+    <p>Each target is a separate cross-compiler binary (<code>armv8m-tcc</code>), exactly
+    one backend linked in — so link-time symbol resolution is a zero-cost dispatch that the
+    hot two-pass codegen loop already relies on (109 call sites in
+    <code>ir/codegen.c</code>). Formalize the symbol set in <code>machine/machine.h</code>
+    and <strong>delete the dead <code>TCCMachineInterface</code> vtable</strong> rather than
+    reviving it. If a multi-target single binary is ever wanted, the contract header is
+    precisely the struct definition a vtable would need — nothing is lost by waiting.</p>
+  </div>
+
+  <div class="callout seam">
+    <span class="tag">generic logic to hoist out of the backend — later, §10 phase 6</span>
+    <p>Five pieces of genuinely generic machinery currently live inside
+    <code>arm-thumb-gen.c</code> and would otherwise be rewritten by every new backend:
+    the dry-run scratch-discovery state machine, 64-bit-as-register-pair lowering, the
+    parallel-move solver for call arguments, mul-by-constant strength reduction, and the
+    peephole cache frameworks (MOV-equivalence, immediate reuse, STR→LDR forwarding).
+    Hoist them into <code>machine/</code> as shared engines parameterized by backend
+    callbacks — but only when the second architecture arrives and proves the
+    parameterization, not speculatively.</p>
+  </div>
+</section>
+
+<section id="tccgen">
+  <h2><span class="no">§6</span>Splitting tccgen.c — 33,407 lines → 10 files</h2>
+  <p class="kicker">frontend/gen/ · shared state declared once in gen_priv.h</p>
+  <p>The file's ~35 internal blocks condense into ten modules. The entangling state is
+  well-understood: <code>vtop</code>/<code>_vstack</code> (2,160 refs), <code>tok</code>
+  (322), <code>loc</code>, <code>nocode_wanted</code>, scope/switch stacks.
+  <code>gen_priv.h</code> declares all of it (definitions live in
+  <code>gen_core.c</code>), plus the current forward-decl list — the file's own lines
+  746–789 are the seed set.</p>
+
+  <div class="scroll"><table>
+    <thead><tr><th>File</th><th>≈ lines</th><th>Contents (today's blocks)</th><th>Coupling</th></tr></thead>
+    <tbody>
+      <tr><td class="path">gen_core.c</td><td class="num">1,200</td>
+        <td>Global state definitions, lifecycle (<code>tccgen_init/compile/finish</code>),
+        type predicates, code-suppression (<code>nocode_wanted</code>)</td>
+        <td><span class="chip c-arch">owns state</span></td></tr>
+      <tr><td class="path">gen_sym.c</td><td class="num">1,100</td>
+        <td>Symbol table, labels, ELF symbol glue (<code>put_extern_sym</code>,
+        <code>greloc</code>), attribute merge/patch, aliases</td>
+        <td><span class="chip c-arch">clean — move first</span></td></tr>
+      <tr><td class="path">gen_vstack.c</td><td class="num">1,700</td>
+        <td>Value-stack ops, <code>gv/gv2</code>, long-long expand, addressing,
+        bitfields, bounds</td>
+        <td><span class="chip c-bad">vstack core</span></td></tr>
+      <tr><td class="path">gen_ops.c</td><td class="num">2,300</td>
+        <td><code>gen_opl/opic/opif</code>, <code>gen_op</code>, complex arithmetic,
+        vector extensions</td>
+        <td><span class="chip c-bad">heavy vtop</span></td></tr>
+      <tr><td class="path">gen_types.c</td><td class="num">2,900</td>
+        <td>Type compare/compat, casts, <code>type_size</code>, struct layout +
+        declaration, <code>parse_btype</code>, declarators</td>
+        <td><span class="chip c-seam">AAPCS alignment here</span></td></tr>
+      <tr><td class="path">gen_expr.c</td><td class="num">6,500</td>
+        <td>Unary/primary/postfix, <code>unary_funcall</code>, binary precedence,
+        ternary, <code>gexpr</code>, const-expr</td>
+        <td><span class="chip c-bad">vtop + tok</span></td></tr>
+      <tr><td class="path">gen_builtins.c</td><td class="num">3,800</td>
+        <td><code>unary_builtin_*</code>, string-builtin folding, auto-inline
+        heuristics, <code>try_inline_const_eval</code></td>
+        <td><span class="chip c-arch">clean — move early</span></td></tr>
+      <tr><td class="path">gen_stmt.c</td><td class="num">1,900</td>
+        <td><code>block/block_1</code>, switch codegen, return, scopes/cleanups, VLA
+        scope handling</td>
+        <td><span class="chip c-seam">tok + vtop</span></td></tr>
+      <tr><td class="path">gen_init.c</td><td class="num">3,200</td>
+        <td><code>vstore</code>, <code>inc</code>, initializers, designators,
+        <code>decl_initializer_alloc</code></td>
+        <td><span class="chip c-seam">vtop</span></td></tr>
+      <tr><td class="path">gen_decl.c</td><td class="num">5,300</td>
+        <td><code>decl</code>, nested functions/trampolines,
+        <code>gen_function</code> (the IR-pipeline driver: SSA, opt passes, regalloc,
+        codegen), inline stash, late reopt</td>
+        <td><span class="chip c-ir">IR-facing — owns ir/ includes</span></td></tr>
+    </tbody>
+  </table></div>
+  <ul class="prose">
+    <li><strong>Extraction order:</strong> <code>gen_sym</code> → <code>gen_builtins</code>
+      → <code>gen_decl</code> (only 7 vtop refs in the <code>gen_function</code> region) →
+      <code>gen_types</code> → <code>gen_stmt</code> → <code>gen_init</code> →
+      <code>gen_ops</code> → <code>gen_expr</code> → what remains is
+      <code>gen_core</code> + <code>gen_vstack</code>.</li>
+    <li><strong>Watch one handshake:</strong> the AAPCS invisible-copy state
+      (<code>aapcs_last_const_init</code>, set during parameter typing, consumed in
+      <code>unary_funcall</code>) crosses the types/expr boundary — promote it to an
+      explicit field in <code>gen_priv.h</code>, not a bare static.</li>
+    <li>After the split, <code>gen_decl.c</code> is the only frontend file that sees the
+      IR optimization pipeline; the rest use emission primitives from
+      <code>tccir.h</code> only.</li>
+  </ul>
+</section>
+
+<section id="armgen">
+  <h2><span class="no">§7</span>Splitting arm-thumb-gen.c — 13,534 lines → 13 files</h2>
+  <p class="kicker">arch/arm/gen/ · split by mop family, matching the contract groups</p>
+  <div class="scroll"><table>
+    <thead><tr><th>File</th><th>≈ lines</th><th>Contents (today's line ranges)</th></tr></thead>
+    <tbody>
+      <tr><td class="path">state.c</td><td class="num">600</td>
+        <td>ThumbGeneratorState, reg classes, frame-offset helpers, MachineCodegenContext
+        allocators <small>(54–740)</small></td></tr>
+      <tr><td class="path">scratch.c</td><td class="num">900</td>
+        <td>Scratch acquire/release/spill, push-window bias, dry-run scratch discovery
+        hooks <small>(1419–1794 + snapshot state)</small></td></tr>
+      <tr><td class="path">caches.c</td><td class="num">700</td>
+        <td>mov_equiv, imm_cache, strldr_cache, spill cache — peephole trackers
+        <small>(1812–2287)</small></td></tr>
+      <tr><td class="path">litpool.c</td><td class="num">700</td>
+        <td>Literal pools: init/reserve/flush/find, IT-window guard
+        <small>(2345–2782, 4112–4200)</small></td></tr>
+      <tr><td class="path">emit.c</td><td class="num">900</td>
+        <td><code>o()/ot()</code>, opcode validation, branch patching/relaxation
+        (<code>decbranch</code>, <code>th_patch_call</code>), dry-run/branch-opt state
+        machine <small>(853–1272, 2509–3402)</small></td></tr>
+      <tr><td class="path">alu.c</td><td class="num">1,000</td>
+        <td>Data-processing mops 32/64-bit, shifts, ubfx/bfi
+        <small>(4993–5950)</small></td></tr>
+      <tr><td class="path">muldiv.c</td><td class="num">1,050</td>
+        <td>mul/div/MLA/UMULL/SMULL/MLAL, mul-by-const strength reduction, pack64,
+        cmp_eq64 <small>(5952–6921)</small></td></tr>
+      <tr><td class="path">mem.c</td><td class="num">1,500</td>
+        <td>load/store/indexed/postinc mops, spill slots, strd/ldrd pairing, assign,
+        setif/bool <small>(3647–4530, 6987–8463)</small></td></tr>
+      <tr><td class="path">fp.c</td><td class="num">1,000</td>
+        <td>VFP + soft-float dispatch (<code>get_softfp_func_name</code>), complex
+        lowering <small>(8463–9476)</small></td></tr>
+      <tr><td class="path">frame.c</td><td class="num">900</td>
+        <td>prolog/epilog, noreturn finish, VLA alloc, <code>gfunc_sret</code>, LEA,
+        stack stores <small>(3564–3646, 9476–10347)</small></td></tr>
+      <tr><td class="path">call.c</td><td class="num">2,100</td>
+        <td>Call generation, AAPCS arg placement, ThumbArgMove parallel-move solver;
+        absorb <span class="path">arm-thumb-callsite.c</span>
+        <small>(10348–12120)</small></td></tr>
+      <tr><td class="path">branch.c</td><td class="num">500</td>
+        <td>jump/conditional/cbz mops, chain slots, switch tables, indirect jump
+        <small>(3413–3555, 12120–12280)</small></td></tr>
+      <tr><td class="path">intrin.c</td><td class="num">700</td>
+        <td>select/block-copy mops, trap/prefetch/setjmp/longjmp, builtin_apply,
+        trampolines <small>(12281–13534)</small></td></tr>
+    </tbody>
+  </table></div>
+  <p>The cut lines are unusually clean because handlers already communicate through
+  <code>MachineOperand</code> and the shared generator state — the split is mostly moving
+  functions plus one <code>gen_priv.h</code>-style internal header
+  (<code>arch/arm/gen/gen.h</code>) for the state struct and cross-file statics.</p>
+</section>
+
+<section id="headers">
+  <h2><span class="no">§8</span>Header topology — dismantling tcc.h</h2>
+  <p class="kicker">the 2,892-line god-header already contains its own split map</p>
+  <p>Lines 1870–2532 of <code>tcc.h</code> are per-module prototype banners
+  (<code>/* ---- tccpp.c ---- */</code> …) — each becomes that module's own header. What
+  remains is a small set of genuinely shared headers:</p>
+  <div class="scroll"><table>
+    <thead><tr><th>New header</th><th>From tcc.h</th><th>Contents</th></tr></thead>
+    <tbody>
+      <tr><td class="path">source/config.h</td><td class="num">:26–243</td>
+        <td>Platform shims, target-select ladder, threading</td></tr>
+      <tr><td class="path">source/core_types.h</td><td class="num">:384–914</td>
+        <td>The shared data model: <code>CType</code>, <code>CValue</code>,
+        <code>SValue</code>, <code>Sym</code>, <code>Section</code>, TokenString —
+        needed by every layer</td></tr>
+      <tr><td class="path">source/state.h</td><td class="num">:915–1524</td>
+        <td><code>TCCState</code> + extended symbol attributes</td></tr>
+      <tr><td class="path">frontend/tokens.h</td><td class="num">:1636–1869</td>
+        <td>Token constants (wraps <code>tcctok.h</code>)</td></tr>
+      <tr><td class="path">per-module headers</td><td class="num">:1870–2532</td>
+        <td><code>pp.h</code>, <code>gen.h</code>, <code>elf.h</code>, <code>asm.h</code>,
+        <code>dwarf.h</code>, <code>yaff.h</code>… — each owns its banner</td></tr>
+      <tr><td class="path">machine/machine.h</td><td class="num">:2576–2726</td>
+        <td>The backend contract (§5); replaces the <code>xxx-gen.c</code> banner</td></tr>
+      <tr><td class="path">arch/arm/defs.h</td><td class="num">:358 include</td>
+        <td><code>NB_REGS</code>, <code>TREG_*</code>, <code>RC_*</code>,
+        <code>PTR_SIZE</code>, float-ABI enums — <strong>no longer included by generic
+        code</strong>; generic layers read register facts from
+        <code>RegAllocTarget</code>/<code>ArchitectureConfig</code> at runtime</td></tr>
+    </tbody>
+  </table></div>
+  <p>A transitional <code>tcc.h</code> that includes the new pieces keeps every TU
+  compiling during the split; it shrinks to a compatibility shim and is deleted at the
+  end. The one behavioral constant to preserve: <code>PTR_SIZE</code> and
+  <code>LDOUBLE_SIZE</code> are compile-time constants per target binary — they stay
+  macros, provided by the per-arch defs through the build system's
+  <code>-DTCC_TARGET_*</code> defines, not through a generic include of an arch
+  header.</p>
+</section>
+
+<section id="tests">
+  <h2><span class="no">§9</span>Target test tree — mirroring source/</h2>
+  <p class="kicker">generic = host-runnable with plain gcc · arch = needs the cross toolchain/QEMU</p>
+
+<pre class="tree">
+<span class="dir">tests/</span>
+├── <span class="dir d-sup">generic/</span>                       <span class="cm"># zero QEMU/newlib dependency — runs anywhere</span>
+│   ├── frontend/                  <span class="was">← tests/frontend (diagnostics · pp · types)</span>
+│   ├── ir/                        <span class="cm"># unit tests for ir/ passes (from tests/unit split)</span>
+│   ├── golden_ir/                 <span class="was">← tests/ir_tests/golden — pass-level IR snapshots</span>
+│   ├── linker/                    <span class="was">← tests/linker (readelf/objdump goldens)</span>
+│   └── debug/                     <span class="was">← tests/debug (DWARF/STAB goldens)</span>
+├── <span class="dir d-arch">arch/</span>
+│   └── <span class="dir d-arch">arm/</span>
+│       ├── unit/                  <span class="cm"># thop_*, aapcs, arm_link, backend gen_* byte-exact tests</span>
+│       ├── asm/                   <span class="was">← tests/thumb/armv8m (encode vs arm-none-eabi-gcc)</span>
+│       ├── qemu/                  <span class="was">← tests/ir_tests execution suite + mps2-an505 board + newlib</span>
+│       ├── runtime/               <span class="was">← tests/runtime/cross (aeabi, soft-fp)</span>
+│       ├── gcc_torture/           <span class="was">← ir_tests/test_gcc_torture_ir.py</span>
+│       └── selfhost/              <span class="cm"># compiles the compiler with armv8m-tcc</span>
+├── fuzz/                          <span class="cm"># differential fuzzer — stays, opt-in as today</span>
+├── host/                          <span class="cm"># native aeabi/soft-fp checks (test-aeabi-host)</span>
+├── support/ut.h                   <span class="cm"># shared unit harness + coverage scripts</span>
+├── externals/ · benchmarks/       <span class="cm"># opt-in corpora, unchanged</span>
+└── legacy/                        <span class="cm"># quarantined upstream suite (tcctest.c, abitest…)</span>
+</pre>
+
+  <ul class="prose">
+    <li><strong>The one real complication:</strong> today's single
+      <code>tests/unit/arm/armv8m</code> build links generic IR-pass tests and ARM encoder
+      tests into one binary. Split it along the existing <code>UT_MODULE_SRCS</code>
+      boundary: <code>tests/generic/ir/</code> links only <code>source/ir/</code> (+
+      operand/svalue) with stubs; <code>tests/arch/arm/unit/</code> links
+      <code>arch/arm/**</code> + the backend. <code>source_coverage_map.json</code>
+      already keys every test by source path — it is the machine-readable migration
+      map.</li>
+    <li><strong>Axis chosen deliberately:</strong> the tree mirrors <em>source layout</em>
+      (the stated goal). Note the imperfect overlap with runnability — linker/debug
+      goldens contain ARM ELF yet run host-side; they stay in <code>generic/</code>
+      because they test generic drivers (<code>obj/elf.c</code>, <code>obj/dwarf.c</code>)
+      whose goldens are per-target files.</li>
+    <li><strong>Wiring to update in lockstep</strong> (all grep-able single points):
+      top-level Makefile suite dirs + <code>NEWLIB_*</code> paths,
+      <code>tests/run_tests.py</code>, per-suite <code>conftest.py</code>,
+      <code>gen_source_coverage.py</code>, <code>.gitignore</code>, and the fuzz infra's
+      cached paths (<code>.sweep_cache</code> keys miss header moves — clear it).</li>
+    <li><strong>Keep the gates:</strong> <code>make check-pass-coverage</code> (pass ↔
+      test ledger) and the selfhost suite (sole coverage for
+      <code>arch/arm/arm.c</code>/<code>aapcs.c</code>) survive the move unchanged.</li>
+  </ul>
+</section>
+
+<section id="plan">
+  <h2><span class="no">§10</span>Migration plan — seven phases, each shippable</h2>
+  <p class="kicker">every phase ends with make test green on a clean branch off mob</p>
+  <div class="phases">
+    <div class="phase"><div class="pn">0<small>moves</small></div><div>
+      <h4>Pure git-mv restructure + dead-code deletion</h4>
+      <p>Create <code>source/</code>; move files with names unchanged; move the six
+      root-level ARM files into <code>arch/arm/</code>; delete
+      <code>arm-thumb-scratch.c</code>; quarantine <code>tests/legacy/</code>. Update
+      Makefile path lists (<code>CORE_FILES</code>, <code>armv8m_FILES</code>,
+      <code>-I</code> paths, the <code>LIBTCC_INC</code> rebuild wart) and include paths —
+      zero code changes otherwise.</p>
+      <div class="gate">make test green · git blame -C intact · one commit = moves only</div>
+    </div></div>
+    <div class="phase"><div class="pn">1<small>headers</small></div><div>
+      <h4>Split tcc.h; stop leaking arm-thumb-defs.h</h4>
+      <p>Extract <code>config.h</code>, <code>core_types.h</code>, <code>state.h</code>,
+      per-module headers from the prototype banners (§8). Generic TUs stop including
+      <code>arch/arm/defs.h</code>; register facts flow through
+      <code>RegAllocTarget</code>/<code>ArchitectureConfig</code>.</p>
+      <div class="gate">CI grep: no '#include "arch/' outside source/arch/</div>
+    </div></div>
+    <div class="phase"><div class="pn">2<small>seam</small></div><div>
+      <h4>Seal the contract</h4>
+      <p>Write <code>machine/machine.h</code> (§5); fix leaks ②③④⑤⑥; delete the dead
+      vtable; wire <code>arch/fpu/arm</code> into <code>arm_resolve_fpu()</code>; de-ARM
+      <code>machine/ls.c</code>; single-source <code>registers_for_allocator</code>.</p>
+      <div class="gate">make test green · unit suites for regalloc/ls pass unmodified</div>
+    </div></div>
+    <div class="phase"><div class="pn">3<small>tccgen</small></div><div>
+      <h4>Split tccgen.c → frontend/gen/ (10 files)</h4>
+      <p>Create <code>gen_priv.h</code>; extract in dependency order
+      (<code>sym → builtins → decl → types → stmt → init → ops → expr</code>), one file
+      per commit, running the frontend + IR suites each step.</p>
+      <div class="gate">make test after every extraction · no new ST_DATA globals</div>
+    </div></div>
+    <div class="phase"><div class="pn">4<small>arm gen</small></div><div>
+      <h4>Split arm-thumb-gen.c → arch/arm/gen/ (13 files)</h4>
+      <p>Same discipline; the byte-exact backend unit tests
+      (<code>test_gen_*</code>) pin emitted Thumb-2 encodings across the split.</p>
+      <div class="gate">test-asm + backend unit suite byte-identical output</div>
+    </div></div>
+    <div class="phase"><div class="pn">5<small>tests</small></div><div>
+      <h4>Restructure tests/ to mirror source/</h4>
+      <p>Move suites per §9; split the unit binary generic-vs-arch; update Makefile,
+      run_tests.py, coverage generator; regenerate
+      <code>source_coverage_map.json</code>.</p>
+      <div class="gate">make test green · check-pass-coverage --strict passes · fuzz smoke (batch_sweep) clean</div>
+    </div></div>
+    <div class="phase"><div class="pn">6<small>hoist</small></div><div>
+      <h4>Hoist generic engines out of the backend (deferred)</h4>
+      <p>Parallel-move solver, 64-bit pair lowering, dry-run scratch protocol, peephole
+      cache frameworks → <code>machine/</code>. Do this when the second backend starts,
+      so real requirements drive the parameterization.</p>
+      <div class="gate">triggered by arch #2 — not before</div>
+    </div></div>
+  </div>
+  <div class="callout warn">
+    <span class="tag">sequencing constraints</span>
+    <p>Start from a clean tree — the current branch (<code>heapOverflowBug</code>) carries
+    a large in-flight diff; land or stash it first. Never run fuzz sweeps or bisects while
+    the tree is mid-restructure (the sweep cache keys miss header moves, and
+    reducers/sweeps racing a rebuild report phantom divergences). Phases 3 and 4 are
+    independent and can interleave with normal bug-fix work — each extraction commit is
+    small and revertible.</p>
+  </div>
+</section>
+
+<section id="newarch">
+  <h2><span class="no">§11</span>Adding an architecture — the checklist</h2>
+  <p class="kicker">what arch/&lt;name&gt;/ must provide once the restructure lands</p>
+  <ol class="prose">
+    <li><strong><code>defs.h</code></strong> — register names/counts, <code>PTR_SIZE</code>,
+      float-ABI constants (seen only by this backend and the build defines).</li>
+    <li><strong><code>&lt;name&gt;.c</code></strong> — <code>backend_init()</code>: fill
+      <code>ArchitectureConfig</code> (capabilities, FP feature bits via
+      <code>fpu/</code> tables).</li>
+    <li><strong><code>regalloc.c</code></strong> — a <code>RegAllocTarget</code>: int/FP
+      register classes, caller/callee-saved sets, param regs, static-chain reg.</li>
+    <li><strong><code>abi.c</code></strong> — <code>abi_classify_argument()</code> +
+      call-layout builder for the target's calling convention.</li>
+    <li><strong><code>gen/</code></strong> — the ~90 contract entry points (§5). Start
+      with the ~25 that the two-pass loop requires to emit straight-line code (mop
+      handlers for ALU/load/store/call/branch + frame + materialization); the rest —
+      peephole hooks, dry-run size estimators — have safe conservative defaults.</li>
+    <li><strong><code>link.c</code></strong> — <code>relocate</code>,
+      <code>code_reloc</code>, <code>gotplt_entry_type</code> for the target's reloc
+      types.</li>
+    <li><strong>Optional:</strong> <code>asm.c</code> + token table (inline assembly),
+      <code>ssa_opt.c</code> (target peephole generators registered into the SSA
+      pipeline), <code>fpu/</code> feature tables.</li>
+    <li><strong>Build:</strong> one Makefile stanza (<code>&lt;target&gt;_FILES</code>,
+      <code>DEF-&lt;target&gt;</code>, <code>&lt;target&gt;_ARCH</code>) — the
+      <code>arch/Makefile</code> dispatcher already documents this.</li>
+    <li><strong>Tests:</strong> <code>tests/arch/&lt;name&gt;/</code> — unit encoders
+      first, then an execution board under <code>qemu/</code> mirroring
+      <code>mps2-an505</code>.</li>
+  </ol>
+</section>
+
+<section id="risks">
+  <h2><span class="no">§12</span>Risks &amp; open decisions</h2>
+  <p class="kicker">what could bite, and the calls already made</p>
+  <div class="scroll"><table>
+    <thead><tr><th>Risk / decision</th><th>Position</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Golden churn.</strong> IR goldens, byte-exact backend tests, and
+        objdump goldens are path- and layout-sensitive.</td>
+        <td>Phases 0–2 change no codegen output by construction; goldens act as the
+        regression oracle, never regenerate during a move phase.</td></tr>
+      <tr><td><strong>Fuzz infrastructure paths.</strong> Sweep caches, triage scripts,
+        bisect_opt.py reference file paths.</td>
+        <td>Clear <code>.sweep_cache</code> after each phase; run a 500-seed
+        batch_sweep smoke across profiles as the phase-5 gate.</td></tr>
+      <tr><td><strong>Where does tccasm.c sit?</strong> The GAS frontend is generic but
+        exists to feed arch mnemonic parsers.</td>
+        <td>Frontend, with the mnemonic parser behind the contract's optional asm hooks
+        (matches today's tccasm.c → arm-thumb-asm.c split).</td></tr>
+      <tr><td><strong>YAFF reloc coupling.</strong> <code>obj/yaff.c</code> hardcodes
+        <code>R_ARM_*</code> enums.</td>
+        <td>Phase 2 introduces contract reloc-kind mapping; until then YAFF is de-facto
+        ARM-only (as today).</td></tr>
+      <tr><td><strong>Dispatch mechanism.</strong> Vtable vs link-time symbols.</td>
+        <td>Link-time (§5) — one backend per binary, zero-cost, delete the dead
+        vtable.</td></tr>
+      <tr><td><strong>Naming.</strong> Keep <code>tcc*</code> basenames or re-name on
+        move?</td>
+        <td>Phase 0 keeps basenames (pure moves); renames happen only where files split
+        anyway (§6–§7). Directory names carry the taxonomy.</td></tr>
+      <tr><td><strong>PTR_SIZE as a macro.</strong> Generic code has 43
+        <code>#if PTR_SIZE</code> sites.</td>
+        <td>Acceptable: it's a per-binary constant delivered by build defines. Do not
+        convert to runtime queries — codegen constant-folds on it.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<footer>
+  tinycc armv8-m fork · restructure architecture · 2026-07-03 · figures &amp; counts from
+  source survey of the working tree (branch heapOverflowBug) · markdown source:
+  <a href="restructure_architecture.md">restructure_architecture.md</a>
+</footer>
+</main>
+</div>
+</body>
+</html>

@@ -60,6 +60,20 @@ static int ssa_gen_cprop_assign(IRSSAOptCtx *ctx, int idx)
   if (vi && vi->def_count > 1)
     return 0;
 
+  /* Do not propagate a copy whose dest feeds a phi operand.  Such a copy
+   * `T_dest <- T_src` often resolves a phi (e.g. a loop back-edge value):
+   * folding T_dest away and naming T_src directly in the phi reintroduces the
+   * lost-copy problem at out-of-SSA phi resolution, since T_src stays live past
+   * the phi edge and its slot can be overwritten before the parallel copy runs
+   * (fuzz seed 2698: the loop-carried `cs` back-edge copy was dropped, yielding
+   * a wrong checksum).  Leaving the copy in place keeps phi resolution correct;
+   * DCE still removes genuinely dead copies. */
+  if (vi) {
+    for (int u = 0; u < vi->use_count; u++)
+      if (vi->uses[u].kind == SSA_USE_PHI)
+        return 0;
+  }
+
   int replaced = ssa_opt_replace_all_uses(ctx, dest_vr, src_vr);
   return replaced > 0 ? 1 : 0;
 }
@@ -227,8 +241,25 @@ static int ssa_gen_cprop_load_redundant(IRSSAOptCtx *ctx, int idx)
     if (irop_config[pq->op].has_dest &&
         pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID) {
       IROperand pd = tcc_ir_op_get_dest(ir, pq);
-      if (irop_get_vreg(pd) == src_vr)
+      int32_t pd_vr = irop_get_vreg(pd);
+      if (pd_vr == src_vr)
         return 0;
+      /* A deref-style LOAD reads memory through a register pointer.  Besides
+       * STOREs (handled above), a plain ALU/ASSIGN def of an address-taken
+       * VAR/PARAM also writes that memory — the value lives in the vreg's
+       * stack slot and the pointer may hold its address (fuzz ptr seed 6734:
+       * `p = &u; ... = *p; u = expr; ... = *p` — the second read must not
+       * reuse the first across u's update). */
+      if (src.is_lval && !src.is_local && pd_vr >= 0 &&
+          TCCIR_DECODE_VREG_TYPE(pd_vr) != TCCIR_VREG_TYPE_TEMP) {
+        IRLiveInterval *pdi =
+            (TCCIR_DECODE_VREG_TYPE(pd_vr) == TCCIR_VREG_TYPE_VAR ||
+             TCCIR_DECODE_VREG_TYPE(pd_vr) == TCCIR_VREG_TYPE_PARAM)
+                ? tcc_ir_vreg_live_interval(ir, pd_vr)
+                : NULL;
+        if (!pdi || pdi->addrtaken)
+          return 0;
+      }
     }
 
     /* Match the prior LOAD: same op, same source flags+vreg, TEMP dest. */
@@ -452,6 +483,16 @@ static int ssa_gen_cprop_copy_param(IRSSAOptCtx *ctx, int idx)
   if (copy_blk < 0 || copy_blk >= cfg->num_blocks)
     return 0;
 
+  /* When src is an address-taken VAR/PARAM its storage is aliasable: a store
+   * through a pointer that holds its address can rewrite its value without
+   * naming src_vr as a def (the redef scan below only catches direct writes
+   * to src_vr).  Forwarding src across such a store re-reads the clobbered
+   * memory at the use site — e.g. `T = u; *p = k; use(T)` with `p == &u`
+   * must not become `T = u; *p = k; use(u)` (combo seed 74935).  Flag it so
+   * the scan can bail on any intervening memory store. */
+  IRLiveInterval *src_li = tcc_ir_vreg_live_interval(ir, src_vr);
+  int src_addrtaken = (src_li && src_li->addrtaken);
+
   /* All uses must be in the same block as the copy, and after the copy. */
   int max_use_idx = idx;
   for (int u = 0; u < dvi->use_count; u++) {
@@ -486,6 +527,21 @@ static int ssa_gen_cprop_copy_param(IRSSAOptCtx *ctx, int idx)
     case TCCIR_OP_NL_SETJMP:
     case TCCIR_OP_NL_LONGJMP:
       return 0;
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+      /* A memory store through a pointer/deref (dest is_lval) or an indexed
+       * store can alias an address-taken src's storage — we have no alias
+       * analysis, so be conservative.  A plain `V <-- x [STORE]` to a vreg
+       * slot (is_lval=0) targets that variable's own slot, unreachable
+       * without a pointer, so it can't clobber a different src. */
+      if (src_addrtaken) {
+        IROperand kd = tcc_ir_op_get_dest(ir, kq);
+        if (kd.is_lval || kq->op == TCCIR_OP_STORE_INDEXED ||
+            kq->op == TCCIR_OP_STORE_POSTINC)
+          return 0;
+      }
+      break;
     default:
       break;
     }
@@ -657,6 +713,16 @@ static int ssa_gen_cprop_copy_var_stackoff(IRSSAOptCtx *ctx, int idx)
     }
   }
 
+  /* When V is address-taken its stack slot is aliasable: a store through a
+   * pointer holding &V rewrites V's value without naming src_vr as a def, so
+   * the redef scan below (which only catches direct writes to src_vr) misses
+   * it.  Forwarding V past such a store re-reads the clobbered slot at the use
+   * site — e.g. `T = u; *p = k; use(T)` with `p == &u` must not become
+   * `T = u; *p = k; use(u)` (combo seed 74935).  Flag it so the scan bails on
+   * any intervening memory store we cannot disambiguate. */
+  IRLiveInterval *src_li = tcc_ir_vreg_live_interval(ir, src_vr);
+  int src_addrtaken = (src_li && src_li->addrtaken);
+
   /* Bail on barriers (calls, asm, VLA, setjmp/longjmp) and on any
    * STORE/ASSIGN that writes V's slot between the copy and last use. */
   for (int k = idx + 1; k <= max_use_idx; k++) {
@@ -676,6 +742,20 @@ static int ssa_gen_cprop_copy_var_stackoff(IRSSAOptCtx *ctx, int idx)
     case TCCIR_OP_NL_SETJMP:
     case TCCIR_OP_NL_LONGJMP:
       return 0;
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+      /* A memory store through a pointer/deref (dest is_lval) or an indexed
+       * store can alias an address-taken V's slot; a plain `V2 <-- x [STORE]`
+       * to a vreg slot (is_lval=0) targets that variable's own slot, which is
+       * unreachable without a pointer and cannot clobber a different V. */
+      if (src_addrtaken) {
+        IROperand kd = tcc_ir_op_get_dest(ir, kq);
+        if (kd.is_lval || kq->op == TCCIR_OP_STORE_INDEXED ||
+            kq->op == TCCIR_OP_STORE_POSTINC)
+          return 0;
+      }
+      break;
     default:
       break;
     }
@@ -1125,6 +1205,20 @@ int ssa_opt_var_to_param_forward(IRSSAOptCtx *ctx)
       if (!touches)
         continue;
 
+      /* ARM barrel-shift fusion records a hidden shift on this use's src2
+       * (ir->barrel_shifts[orig_index], set just before regalloc).  Substituting
+       * the stored value here rewrites the operand fusion pinned — an immediate
+       * cannot be barrel-shifted, so codegen would silently drop the shift
+       * (volatile fuzz seed 16558: `(u6<<7)|x` folded to `u6|x`).  One blocked
+       * use blocks the whole VAR: forwarding the others would NOP the def this
+       * use still reads. */
+      if (ir->barrel_shifts && uq->orig_index >= 0 &&
+          uq->orig_index <= ir->max_orig_index &&
+          ir->barrel_shifts[uq->orig_index]) {
+        safe = 0;
+        break;
+      }
+
       if (!v2v_dominates(cfg, def_blk, cfg->instr_to_block[j])) {
         safe = 0;
         break;
@@ -1186,7 +1280,17 @@ int ssa_opt_var_to_param_forward(IRSSAOptCtx *ctx)
       if (irop_config[uq->op].has_src1) {
         IROperand s = tcc_ir_op_get_src1(ir, uq);
         if (irop_get_vreg(s) == target_vr) {
-          tcc_ir_set_src1(ir, j, stored_val);
+          IROperand ns = stored_val;
+          /* STORE_INDEXED derives its store width from the value operand's
+           * btype — the dest is a bare register base carrying no type.  The
+           * VAR we're replacing holds the correct access width; stored_val
+           * may be narrower (e.g. a `short` constant folded into a `unsigned`
+           * slot, seed struct_byval 182993), which would silently shrink the
+           * store (strh vs str) and drop the high bytes.  Preserve the
+           * original operand's btype so the store keeps its width. */
+          if (uq->op == TCCIR_OP_STORE_INDEXED)
+            ns.btype = s.btype;
+          tcc_ir_set_src1(ir, j, ns);
           touched = 1;
         }
       }
@@ -1522,12 +1626,38 @@ static int ssa_var_const_fold_one(IRSSAOptCtx *ctx, int idx)
     return 0;
   }
 
+  /* The self-update always folds safely to the constant (Vx's value at `idx`
+   * is `prior_val` — the backward scan proved no write to Vx lies between).
+   * But the prior `Vx <- #const` def may still be read by an instruction
+   * *between* it and the self-update: e.g.
+   *     si11 = -2992;          // V2 <- #-2992      (prior_idx)
+   *     si12 = si11 - si10;    // V3 <- V2 SUB V1   (reads the prior def!)
+   *     si11 = si11 & 0x7fff;  // V2 <- V2 AND ...  (idx, self-update)
+   * NOPing the prior def then leaves that intervening use reading an
+   * undefined Vx.  Only drop the prior def when nothing in (prior_idx, idx)
+   * reads Vx.  Stores/calls in that range already aborted the fold above, so
+   * every intervening read lives in a src1/src2 slot (incl. FUNCPARAMVAL,
+   * whose value is src1). */
+  int prior_used = 0;
+  for (int k = prior_idx + 1; k < idx; k++) {
+    IRQuadCompact *uq = &ir->compact_instructions[k];
+    if (uq->op == TCCIR_OP_NOP)
+      continue;
+    IROperand us1 = tcc_ir_op_get_src1(ir, uq);
+    IROperand us2 = tcc_ir_op_get_src2(ir, uq);
+    if (irop_get_vreg(us1) == dest_vr || irop_get_vreg(us2) == dest_vr) {
+      prior_used = 1;
+      break;
+    }
+  }
+
   IROperand imm = irop_make_imm32(0, (int32_t)result, dest.btype);
   q->op = TCCIR_OP_ASSIGN;
   tcc_ir_op_set_src1(ir, q, imm);
   tcc_ir_op_set_src2(ir, q, IROP_NONE);
 
-  ir->compact_instructions[prior_idx].op = TCCIR_OP_NOP;
+  if (!prior_used)
+    ir->compact_instructions[prior_idx].op = TCCIR_OP_NOP;
   return 1;
 }
 

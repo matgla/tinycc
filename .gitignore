@@ -39,6 +39,12 @@ tcc.1
 tcc-doc.html
 tcc-doc.info
 
+# gcov/lcov coverage artifacts (make coverage-tccgen)
+coverage-tccgen/
+*.gcda
+*.gcno
+*.info
+
 win32/doc
 win32/examples/libtcc_test.c
 win32/libtcc
@@ -73,6 +79,14 @@ tests/hello
 tests/tests2/fred.txt
 libtcc.dylib
 build/
+build_backend/
+build_libtcc_api/
+build_tccgen/
+build_tccopt/
+build_tccelf/
+build_tccpp/
+build_tcctools/
+build_tccyaff/
 rootfs/
 __pycache__/
 tests/ir_tests/qemu/mps2-an505/newlib_build/
@@ -97,8 +111,20 @@ tests/ir_tests/dump_ir.txt
 tests/ir_tests/dump.txt
 tests/ir_tests/dump_fine.txt
 tests/ir_tests/dump_ir_fine.txt
+tests/ir_tests/build/
+armv8m-tcc.debug
 .aider*
 .claude
 .cache
 scripts/.disasm_cache.json
 scripts/.disasm_cache.pending.json
+
+# Python test artifacts
+__pycache__/
+.pytest_cache/
+*.pyc
+tests/fuzz/results/*
+tests/fuzz/fuzz_triage_repros/
+tests/fuzz/.sweep_cache/
+tests/unit/arm/armv8m/build*
+

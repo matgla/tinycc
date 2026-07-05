@@ -116,6 +116,16 @@ static void ld_skip_whitespace(LDParser *p)
   }
 }
 
+static int ld_is_name_start(int c)
+{
+  return isalpha(c) || c == '_' || c == '$';
+}
+
+static int ld_is_name_char(int c)
+{
+  return isalnum(c) || c == '_' || c == '.' || c == '*' || c == '$' || c == '-';
+}
+
 static int ld_next_token(LDParser *p)
 {
   int c;
@@ -199,14 +209,54 @@ static int ld_next_token(LDParser *p)
     return LDTOK_NUM;
   }
 
+  if (c == '.' || c == '*')
+  {
+    int c2 = ld_getc(p);
+    int starts_name;
+    if (c == '.')
+      starts_name = ld_is_name_char(c2);
+    else
+      starts_name = (c2 == '.' || c2 == '_' || c2 == '$' || c2 == '-' || c2 == '*' || isalpha(c2));
+
+    if (!starts_name)
+    {
+      ld_ungetc(p, c2);
+      p->tok = c;
+      p->tok_buf[0] = c;
+      p->tok_buf[1] = '\0';
+      return c;
+    }
+
+    q = p->tok_buf;
+    *q++ = c;
+    if (c2 != EOF)
+      *q++ = c2;
+    while ((c = ld_getc(p)) != EOF)
+    {
+      if (ld_is_name_char(c))
+      {
+        if (q - p->tok_buf < (int)sizeof(p->tok_buf) - 1)
+          *q++ = c;
+      }
+      else
+      {
+        break;
+      }
+    }
+    ld_ungetc(p, c);
+    *q = '\0';
+    p->tok = LDTOK_NAME;
+    return LDTOK_NAME;
+  }
+
   /* Identifier or keyword */
-  if (isalpha(c) || c == '_' || c == '.' || c == '*' || c == '$')
+  if (ld_is_name_start(c))
   {
     q = p->tok_buf;
     *q++ = c;
     while ((c = ld_getc(p)) != EOF)
     {
-      if (isalnum(c) || c == '_' || c == '.' || c == '*' || c == '$' || c == '-')
+      if (ld_is_name_char(c))
       {
         if (q - p->tok_buf < (int)sizeof(p->tok_buf) - 1)
           *q++ = c;
@@ -260,9 +310,17 @@ static int ld_expect(LDParser *p, int tok)
   if (p->tok != tok)
   {
     if (tok < 256)
-      return tcc_error_noabort("linker script: expected '%c'", tok);
+    {
+      int ret = tcc_error_noabort("linker script: expected '%c'", tok);
+      ld_next_token(p);
+      return ret;
+    }
     else
-      return tcc_error_noabort("linker script: unexpected token");
+    {
+      int ret = tcc_error_noabort("linker script: unexpected token");
+      ld_next_token(p);
+      return ret;
+    }
   }
   ld_next_token(p);
   return 0;
@@ -536,38 +594,52 @@ static addr_t ld_parse_expr(LDParser *p)
 static int ld_parse_memory_attributes(LDParser *p)
 {
   int attrs = 0;
+  int invert = 0;
   if (p->tok != '(')
     return 0;
   ld_next_token(p);
-  while (p->tok == LDTOK_NAME && p->tok != ')')
+  while (p->tok != ')' && p->tok != LDTOK_EOF)
   {
-    for (const char *s = p->tok_buf; *s; s++)
+    if (p->tok == '!')
     {
-      switch (*s)
+      invert = 1;
+      ld_next_token(p);
+      continue;
+    }
+
+    if (p->tok == LDTOK_NAME)
+    {
+      for (const char *s = p->tok_buf; *s; s++)
       {
-      case 'r':
-      case 'R':
-        attrs |= LD_MEM_READ;
-        break;
-      case 'w':
-      case 'W':
-        attrs |= LD_MEM_WRITE;
-        break;
-      case 'x':
-      case 'X':
-        attrs |= LD_MEM_EXEC;
-        break;
-      case 'a':
-      case 'A':
-        attrs |= LD_MEM_ALLOC;
-        break;
-      case '!':
-        break; /* invert - not fully supported */
+        switch (*s)
+        {
+        case 'r':
+        case 'R':
+          attrs |= LD_MEM_READ;
+          break;
+        case 'w':
+        case 'W':
+          attrs |= LD_MEM_WRITE;
+          break;
+        case 'x':
+        case 'X':
+          attrs |= LD_MEM_EXEC;
+          break;
+        case 'a':
+        case 'A':
+          attrs |= LD_MEM_ALLOC;
+          break;
+        case '!':
+          invert = 1;
+          break;
+        }
       }
     }
     ld_next_token(p);
   }
   ld_expect(p, ')');
+  if (invert)
+    attrs = (LD_MEM_READ | LD_MEM_WRITE | LD_MEM_EXEC | LD_MEM_ALLOC) & ~attrs;
   return attrs;
 }
 
@@ -699,13 +771,11 @@ static int ld_parse_phdrs(LDParser *p)
 static int ld_parse_section_pattern(LDParser *p, LDOutputSection *os, int keep)
 {
   LDSectionPattern *pat;
-  
-  /* Allocate initial pattern */
-  pat = ld_add_pattern(os, keep);
-  if (!pat)
-    return -1;
 
-  /* Parse file pattern (e.g., * or *.o) */
+  /* Parse file pattern (e.g., * or *.o).  We intentionally do NOT allocate a
+     pattern entry for it here: the file pattern is currently skipped, and
+     pre-allocating left a permanent bogus entry (pattern=="") ahead of every
+     real section glob, doubling nb_patterns. */
   if (p->tok == LDTOK_NAME || p->tok == '*')
   {
     /* Skip file pattern for now, just look for section pattern */
@@ -931,48 +1001,53 @@ static int ld_parse_sections(LDParser *p)
         ld_expect(p, '}');
       }
 
-      /* Memory region: > region */
-      if (p->tok == '>')
+      /* Suffix clauses -- memory region (> R), load region (AT > R), and
+         program header (:PHDR) -- may appear in any order.  GNU-ld scripts
+         conventionally write "> R AT > LMA :PHDR" (AT before the phdr tag),
+         so parse them in a loop instead of once each in a fixed order, which
+         silently dropped a :PHDR that followed AT. */
+      for (;;)
       {
-        ld_next_token(p);
-        if (p->tok == LDTOK_NAME)
-        {
-          os->memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
-          ld_next_token(p);
-        }
-      }
-
-      /* Program header: :phdr */
-      if (p->tok == ':')
-      {
-        ld_next_token(p);
-        if (p->tok == LDTOK_NAME)
-        {
-          for (int i = 0; i < p->ld->nb_phdrs; i++)
-          {
-            if (!strcmp(p->ld->phdrs[i].name, p->tok_buf))
-            {
-              os->phdr_idx = i;
-              break;
-            }
-          }
-          ld_next_token(p);
-        }
-      }
-
-      /* Load memory region: AT > region */
-      if (p->tok == LDTOK_NAME && !strcmp(p->tok_buf, "AT"))
-      {
-        ld_next_token(p);
         if (p->tok == '>')
         {
           ld_next_token(p);
           if (p->tok == LDTOK_NAME)
           {
-            os->load_memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
+            os->memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
             ld_next_token(p);
           }
         }
+        else if (p->tok == ':')
+        {
+          ld_next_token(p);
+          if (p->tok == LDTOK_NAME)
+          {
+            for (int i = 0; i < p->ld->nb_phdrs; i++)
+            {
+              if (!strcmp(p->ld->phdrs[i].name, p->tok_buf))
+              {
+                os->phdr_idx = i;
+                break;
+              }
+            }
+            ld_next_token(p);
+          }
+        }
+        else if (p->tok == LDTOK_NAME && !strcmp(p->tok_buf, "AT"))
+        {
+          ld_next_token(p);
+          if (p->tok == '>')
+          {
+            ld_next_token(p);
+            if (p->tok == LDTOK_NAME)
+            {
+              os->load_memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
+              ld_next_token(p);
+            }
+          }
+        }
+        else
+          break;
       }
 
       p->ld->nb_output_sections++;
@@ -1047,48 +1122,50 @@ static int ld_parse_sections(LDParser *p)
           ld_expect(p, '}');
         }
 
-        /* Memory region */
-        if (p->tok == '>')
+        /* Suffix clauses (> region, AT > load region, :phdr) in any order --
+           see the matching loop in the dotted-section branch above. */
+        for (;;)
         {
-          ld_next_token(p);
-          if (p->tok == LDTOK_NAME)
-          {
-            os->memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
-            ld_next_token(p);
-          }
-        }
-
-        /* Program header */
-        if (p->tok == ':')
-        {
-          ld_next_token(p);
-          if (p->tok == LDTOK_NAME)
-          {
-            for (int i = 0; i < p->ld->nb_phdrs; i++)
-            {
-              if (!strcmp(p->ld->phdrs[i].name, p->tok_buf))
-              {
-                os->phdr_idx = i;
-                break;
-              }
-            }
-            ld_next_token(p);
-          }
-        }
-
-        /* Load memory region: AT > region */
-        if (p->tok == LDTOK_NAME && !strcmp(p->tok_buf, "AT"))
-        {
-          ld_next_token(p);
           if (p->tok == '>')
           {
             ld_next_token(p);
             if (p->tok == LDTOK_NAME)
             {
-              os->load_memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
+              os->memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
               ld_next_token(p);
             }
           }
+          else if (p->tok == ':')
+          {
+            ld_next_token(p);
+            if (p->tok == LDTOK_NAME)
+            {
+              for (int i = 0; i < p->ld->nb_phdrs; i++)
+              {
+                if (!strcmp(p->ld->phdrs[i].name, p->tok_buf))
+                {
+                  os->phdr_idx = i;
+                  break;
+                }
+              }
+              ld_next_token(p);
+            }
+          }
+          else if (p->tok == LDTOK_NAME && !strcmp(p->tok_buf, "AT"))
+          {
+            ld_next_token(p);
+            if (p->tok == '>')
+            {
+              ld_next_token(p);
+              if (p->tok == LDTOK_NAME)
+              {
+                os->load_memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
+                ld_next_token(p);
+              }
+            }
+          }
+          else
+            break;
         }
 
         p->ld->nb_output_sections++;

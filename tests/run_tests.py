@@ -6,6 +6,11 @@ This script runs test suites:
 - gcctestsuite/ - GCC torture tests (default)
 - ir_tests/ - IR-level tests (via --ir flag)
 - tests2/ - C compliance tests (via --tests2 flag, not all executable!)
+- frontend/ - Frontend tests (via --frontend flag)
+- linker/ - Object/linker golden tests (via --linker flag)
+- debug/ - Debug-info tests (via --debug flag)
+- runtime/ - Runtime-library tests (via --runtime flag)
+- selfhost/ - Self-host bootstrap gate (via --selfhost flag)
 
 Note: tests2 tests are normally executed via ir_tests/test_qemu.py which runs
 a curated subset. Using --tests2 runs ALL tests2 tests, some may fail.
@@ -15,6 +20,11 @@ Usage:
     python run_tests.py --gcc                # Run only GCC torture tests
     python run_tests.py --ir                 # Run only IR tests
     python run_tests.py --tests2             # Run tests2 (not all executable!)
+    python run_tests.py --frontend           # Run frontend tests
+    python run_tests.py --linker             # Run linker tests
+    python run_tests.py --debug              # Run debug-info tests
+    python run_tests.py --runtime            # Run runtime-library tests
+    python run_tests.py --selfhost           # Run self-host bootstrap gate
     python run_tests.py --download-gcc       # Download GCC tests first
     python run_tests.py -v -x                # Verbose, stop on first failure
 
@@ -35,11 +45,18 @@ TESTS_DIR = Path(__file__).parent
 TESTS2_DIR = TESTS_DIR / "tests2"
 GCC_DIR = TESTS_DIR / "gcctestsuite"
 IR_DIR = TESTS_DIR / "ir_tests"
+FRONTEND_DIR = TESTS_DIR / "frontend"
+LINKER_DIR = TESTS_DIR / "linker"
+DEBUG_DIR = TESTS_DIR / "debug"
+RUNTIME_DIR = TESTS_DIR / "runtime"
+SELFHOST_DIR = TESTS_DIR / "selfhost"
 
 
 def run_pytest(test_dir: Path, markers: str = None, args: list = None, env: dict = None, verbose: bool = False) -> int:
     """Run pytest on a test directory."""
-    cmd = ["python", "-m", "pytest", str(test_dir)]
+    # Use the same python interpreter that is running run_tests.py so that
+    # an activated virtualenv (or any python with pytest installed) is reused.
+    cmd = [sys.executable, "-m", "pytest", str(test_dir)]
     if verbose:
         cmd.append("-v")
 
@@ -82,6 +99,11 @@ Examples:
   python run_tests.py --gcc --compile-only # GCC compile tests only
   python run_tests.py --ir -n auto         # IR tests with parallel execution
   python run_tests.py --tests2             # Run tests2 (WARNING: not all executable!)
+  python run_tests.py --frontend           # Run frontend tests
+  python run_tests.py --linker             # Run linker tests
+  python run_tests.py --debug              # Run debug-info tests
+  python run_tests.py --runtime            # Run runtime-library tests
+  python run_tests.py --selfhost           # Run self-host bootstrap gate
         """
     )
 
@@ -92,6 +114,16 @@ Examples:
                         help="Run GCC torture tests")
     parser.add_argument("--ir", action="store_true",
                         help="Run IR tests")
+    parser.add_argument("--frontend", action="store_true",
+                        help="Run frontend tests")
+    parser.add_argument("--linker", action="store_true",
+                        help="Run linker tests")
+    parser.add_argument("--debug", action="store_true",
+                        help="Run debug-info tests")
+    parser.add_argument("--runtime", action="store_true",
+                        help="Run runtime-library tests")
+    parser.add_argument("--selfhost", action="store_true",
+                        help="Run self-host bootstrap gate")
     parser.add_argument("--download-gcc", action="store_true",
                         help="Download GCC torture tests first")
 
@@ -119,7 +151,7 @@ Examples:
 
     # If no specific test suite selected, run GCC torture tests only
     # Note: tests2 tests are executed via ir_tests, not directly
-    run_default = not (args.tests2 or args.gcc or args.ir)
+    run_default = not (args.tests2 or args.gcc or args.ir or args.frontend or args.linker or args.debug or args.runtime or args.selfhost)
 
     # Download GCC tests if requested
     if args.download_gcc:
@@ -197,6 +229,41 @@ Examples:
         if args.numprocesses and "-n" not in ir_args:
             ir_args.extend(["-n", args.numprocesses])
         code = run_pytest(IR_DIR, marker_expr, ir_args, verbose=args.verbose)
+        exit_codes.append(code)
+
+    if args.frontend:
+        print("\n" + "="*60)
+        print("Running frontend tests")
+        print("="*60)
+        code = run_pytest(FRONTEND_DIR, marker_expr, pytest_args, verbose=args.verbose)
+        exit_codes.append(code)
+
+    if args.linker:
+        print("\n" + "="*60)
+        print("Running linker tests")
+        print("="*60)
+        code = run_pytest(LINKER_DIR, marker_expr, pytest_args, verbose=args.verbose)
+        exit_codes.append(code)
+
+    if args.debug:
+        print("\n" + "="*60)
+        print("Running debug-info tests")
+        print("="*60)
+        code = run_pytest(DEBUG_DIR, marker_expr, pytest_args, verbose=args.verbose)
+        exit_codes.append(code)
+
+    if args.runtime:
+        print("\n" + "="*60)
+        print("Running runtime-library tests")
+        print("="*60)
+        code = run_pytest(RUNTIME_DIR, marker_expr, pytest_args, verbose=args.verbose)
+        exit_codes.append(code)
+
+    if args.selfhost:
+        print("\n" + "="*60)
+        print("Running self-host bootstrap gate")
+        print("="*60)
+        code = run_pytest(SELFHOST_DIR, marker_expr, pytest_args, verbose=args.verbose)
         exit_codes.append(code)
 
     # Summary

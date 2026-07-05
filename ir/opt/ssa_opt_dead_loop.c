@@ -83,10 +83,70 @@ static int loop_max_idx(IRLoop *loop)
   return m;
 }
 
+/* The forward-jump body-extension heuristic in tcc_ir_detect_loops also follows
+ * the loop's own exit branch (the header's conditional `jumpif <cond> exit`):
+ * structurally that exit is a forward jump past the back-edge, so body_instrs[]
+ * (and hence loop_max_idx) can reach the exit target and the post-loop
+ * instructions beyond it.  The dead-loop transforms must NOT treat those as loop
+ * body — otherwise try_kill_loop_body believes a post-loop use of the induction
+ * variable is in-loop, kills the loop, and deletes the trailing compare, leaving
+ * a flag-less conditional branch (a miscompile).
+ *
+ * Clamp the body upper bound to just before the forward exit target.  A natural
+ * loop never exits into the middle of its own body, so every real body
+ * instruction — including a body reached by a forward jump past the back-edge —
+ * sits strictly before the exit target.  Clamping hides no real body work; it
+ * only drops the spuriously-included post-loop tail.  When the header doesn't
+ * open with a CMP+JUMPIF (no identifiable forward exit) the bound is left as-is. */
+static int dead_loop_body_hi(TCCIRState *ir, IRLoop *loop)
+{
+  int hi = loop_max_idx(loop);
+
+  int cmp_idx = -1;
+  for (int j = loop->header_idx; j <= hi && j < ir->next_instruction_index; j++) {
+    int op = ir->compact_instructions[j].op;
+    if (op == TCCIR_OP_NOP)
+      continue;
+    if (op == TCCIR_OP_CMP) {
+      cmp_idx = j;
+      break;
+    }
+    break; /* header doesn't open with a compare — leave the bound as-is */
+  }
+  if (cmp_idx < 0)
+    return hi;
+
+  int jpf_idx = cmp_idx + 1;
+  while (jpf_idx <= hi && ir->compact_instructions[jpf_idx].op == TCCIR_OP_NOP)
+    jpf_idx++;
+  if (jpf_idx > hi || ir->compact_instructions[jpf_idx].op != TCCIR_OP_JUMPIF)
+    return hi;
+
+  IROperand exit_dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[jpf_idx]);
+  int exit_target = (int)irop_get_imm64_ex(ir, exit_dest);
+
+  /* A natural loop never exits into the middle of its own body, so the body is
+   * exactly [header_idx, exit_target): exit_target-1 is the authoritative upper
+   * bound.  loop_max_idx() can OVER-count (a spuriously-included post-loop tail)
+   * OR UNDER-count: when the body sits past a split/rotated back-edge the loop
+   * detector's end_idx stops at the back-edge, leaving the real body (the
+   * straight-line region between the back-edge and the exit target) outside
+   * loop_max_idx.  Under-counting was a wrong-code bug: loop_body_has_side_effects
+   * and rewrite_loop_exit_phis' in-loop-use guard then missed the body's CALLs and
+   * in-loop phi uses, so a loop-carried header phi got folded to its latch constant
+   * and corrupted the first-iteration read (random-C O1/O2 wrong-code, seeds
+   * 51/52/132/281).  Take exit_target-1 as the bound in both directions. */
+  if (exit_target > loop->header_idx)
+    hi = exit_target - 1;
+  if (hi >= ir->next_instruction_index)
+    hi = ir->next_instruction_index - 1;
+  return hi;
+}
+
 static int loop_body_has_side_effects(IRSSAOptCtx *ctx, IRLoop *loop)
 {
   TCCIRState *ir = ctx->ir;
-  int hi = loop_max_idx(loop);
+  int hi = dead_loop_body_hi(ir, loop);
   for (int idx = loop->start_idx; idx <= hi && idx < ir->next_instruction_index; idx++) {
     IRQuadCompact *q = &ir->compact_instructions[idx];
     if (q->op == TCCIR_OP_NOP)
@@ -150,7 +210,7 @@ typedef struct LoopEntryInfo {
 static int analyze_loop_entry(IRSSAOptCtx *ctx, IRLoop *loop, LoopEntryInfo *out)
 {
   TCCIRState *ir = ctx->ir;
-  int hi = loop_max_idx(loop);
+  int hi = dead_loop_body_hi(ir, loop);
   memset(out, 0, sizeof(*out));
 
   /* Walk the header forward to find the controlling CMP. */
@@ -306,7 +366,7 @@ static int rewrite_loop_exit_phis(IRSSAOptCtx *ctx, IRLoop *loop)
   if (header_block < 0)
     return 0;
   int latch_block = cfg->instr_to_block[loop->end_idx];
-  int hi = loop_max_idx(loop);
+  int hi = dead_loop_body_hi(ir, loop);
 
   int changes = 0;
 
@@ -417,7 +477,7 @@ static int try_kill_loop_body(IRSSAOptCtx *ctx, IRLoop *loop)
   IRSSAState *ssa = ctx->ssa;
   IRCFG *cfg = ctx->cfg;
 
-  int hi = loop_max_idx(loop);
+  int hi = dead_loop_body_hi(ir, loop);
 
   /* Re-locate the header CMP+JUMPIF; the IR may have been modified above. */
   int cmp_idx = -1;
@@ -554,7 +614,7 @@ static int rewrite_loop_exit_phis_guarded(IRSSAOptCtx *ctx, IRLoop *loop, LoopEn
   if (!ssa || !ssa->block_phis || !cfg)
     return 0;
 
-  int hi = loop_max_idx(loop);
+  int hi = dead_loop_body_hi(ir, loop);
 
   /* Collect qualifying value phis. */
   enum { MAX_CANDS = 4 };

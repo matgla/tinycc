@@ -218,6 +218,13 @@ IRLiveInterval *tcc_ir_vreg_live_interval(TCCIRState *ir, int vreg)
   {
   case TCCIR_VREG_TYPE_VAR:
   {
+    /* Interval array not allocated yet — this happens only for hand-built IR
+       in unit tests that skip liveness setup; a real compile always has these
+       sized before any query.  Report "no interval" (NULL) rather than abort,
+       so callers that merely probe a property (e.g. addrtaken) degrade
+       gracefully. */
+    if (!ir->variables_live_intervals)
+      return NULL;
     if (decoded_vreg_position >= ir->variables_live_intervals_size)
     {
       fprintf(stderr, "Getting out of bounds live interval for vreg %d\n", vreg);
@@ -227,6 +234,8 @@ IRLiveInterval *tcc_ir_vreg_live_interval(TCCIRState *ir, int vreg)
   }
   case TCCIR_VREG_TYPE_TEMP:
   {
+    if (!ir->temporary_variables_live_intervals)
+      return NULL;
     if (decoded_vreg_position >= ir->temporary_variables_live_intervals_size)
     {
       fprintf(stderr, "Getting out of bounds live interval for vreg %d\n", vreg);
@@ -236,6 +245,8 @@ IRLiveInterval *tcc_ir_vreg_live_interval(TCCIRState *ir, int vreg)
   }
   case TCCIR_VREG_TYPE_PARAM:
   {
+    if (!ir->parameters_live_intervals)
+      return NULL;
     if (decoded_vreg_position >= ir->parameters_live_intervals_size)
     {
       fprintf(stderr, "Getting out of bounds live interval for vreg %d\n", vreg);

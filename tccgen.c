@@ -67,6 +67,56 @@ static int local_scope;
 static int func_param_decl_depth;
 ST_DATA char debug_modes;
 
+typedef struct FuncallScratch
+{
+  SValue *saved_args;
+  unsigned char **saved_args_cid;
+  int *saved_args_cid_size;
+  int saved_arg_count;
+  struct FuncallScratch *next;
+} FuncallScratch;
+
+static FuncallScratch *funcall_scratch_stack;
+
+static void funcall_scratch_free(FuncallScratch *fs)
+{
+  int i;
+
+  if (!fs)
+    return;
+  tcc_free(fs->saved_args);
+  for (i = 0; i < fs->saved_arg_count; i++)
+    tcc_free(fs->saved_args_cid[i]);
+  tcc_free(fs->saved_args_cid);
+  tcc_free(fs->saved_args_cid_size);
+  tcc_free(fs);
+}
+
+static void funcall_scratch_pop_free(FuncallScratch *fs)
+{
+  FuncallScratch **p;
+
+  for (p = &funcall_scratch_stack; *p; p = &(*p)->next)
+  {
+    if (*p == fs)
+    {
+      *p = fs->next;
+      break;
+    }
+  }
+  funcall_scratch_free(fs);
+}
+
+static void funcall_scratch_free_all(void)
+{
+  while (funcall_scratch_stack)
+  {
+    FuncallScratch *next = funcall_scratch_stack->next;
+    funcall_scratch_free(funcall_scratch_stack);
+    funcall_scratch_stack = next;
+  }
+}
+
 typedef struct PendingAliasDef
 {
   Sym *alias_sym;
@@ -255,7 +305,7 @@ static int svalue_get_conservative_max_u64(SValue *sv, unsigned long long *out_m
   {
     unsigned long long value = (unsigned long long)sv->c.i;
 
-    if (!(sv->type.t & VT_UNSIGNED) && (sv->type.t & VT_BTYPE) != VT_PTR && sv->c.i < 0)
+    if (!(sv->type.t & VT_UNSIGNED) && (sv->type.t & VT_BTYPE) != VT_PTR && (int64_t)sv->c.i < 0)
       return 0;
     *out_max = value;
     return 1;
@@ -1084,10 +1134,44 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   tcc_ir_func_write_summary_clear_all();
   /* Same for the TU-wide read/call summary used by dead-static-store elim. */
   tcc_ir_tu_func_summary_clear_all();
+  funcall_scratch_free_all();
 
   tcc_free(pending_aliases);
   pending_aliases = NULL;
   nb_pending_aliases = 0;
+
+  /* Reclaim inner VLA dimension token streams that were never materialized
+     (abstract / function-pointer declarators, e.g. `typedef void(*)(int[][n()])`).
+     Consumed ones were already freed and NULLed in func_vla_arg_code. */
+  if (s1->vla_inner_exprs)
+  {
+    for (int i = 0; i < s1->nb_vla_inner_exprs; i++)
+      tcc_free(s1->vla_inner_exprs[i]);
+    tcc_free(s1->vla_inner_exprs);
+    s1->vla_inner_exprs = NULL;
+    s1->nb_vla_inner_exprs = 0;
+  }
+
+  /* Free any label-difference fixups left over from a symbol/label diff
+     (e.g. `int z = &"s"[1] - &"s"[0];`) that appeared in a GLOBAL initializer
+     with no enclosing function: gen_function's resolver only runs per function
+     body, so a global-only translation unit would leak the fixup node.  We only
+     RECLAIM them here, deliberately not re-applying the st_value-difference
+     patch: the slot already holds the addend difference written by init_putv,
+     and re-resolving at global scope changes that emitted value (the existing
+     resolver is meant for in-function computed-goto label diffs).  Leaving the
+     value untouched keeps codegen identical to before — this is purely a leak
+     fix. */
+  {
+    LabelDiffFixup *f = s1->label_diff_fixups;
+    while (f)
+    {
+      LabelDiffFixup *next = f->next;
+      tcc_free(f);
+      f = next;
+    }
+    s1->label_diff_fixups = NULL;
+  }
 
   /* If compilation aborted while generating a function, the per-function IR
      block allocated in gen_function() may not have been released (because we
@@ -1630,6 +1714,11 @@ ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep)
       else
         ps = &ts->sym_identifier;
       *ps = s->prev_tok;
+    }
+    if (!keep && s->const_init_data)
+    {
+      tcc_free(s->const_init_data);
+      s->const_init_data = NULL;
     }
     /* Don't free symbols that have been exported to ELF (sym->c != 0)
        as they may still be referenced by IR instructions */
@@ -4065,6 +4154,29 @@ static void gen_opl(int op)
     /* FALLTHROUGH */
   case '*':
     t = vtop->type.t; /* Save type for lbuild at end */
+    /* Speculative / code-suppressed contexts (try_inline_const_eval, if(0)
+     * dead branches, constant-expression and data-only evaluation) run with
+     * nocode_wanted set, where tcc_ir_put is a no-op (see ir/core.c) and gv()
+     * is suppressed.  The generic 64x64 lexpand/lbuild expansion below assumes
+     * real register codegen and walks vtop off the vstack into the heap in
+     * that state.  No code is emitted here, so just collapse the two operands
+     * into a single 64-bit result, mirroring the +/-/&/|/^ IR paths above.
+     * (CODE_OFF_BIT-only dead code after return still needs real IR for
+     * backpatching, so exclude it — same predicate tcc_ir_put uses.) */
+    if (nocode_wanted & ~CODE_OFF_BIT)
+    {
+      vtop--;
+      vtop->type.t = VT_LLONG | (t & VT_UNSIGNED);
+      vtop->r = 0;
+      if (tcc_state->ir)
+      {
+        vtop->vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        tcc_ir_set_llong_type(tcc_state->ir, vtop->vr);
+      }
+      else
+        vtop->vr = -1;
+      break;
+    }
     /* Widening-multiply peephole: when both 64-bit operands are 32->64
      * extensions (zero or sign), emit a single 32x32->64 UMULL/SMULL
      * instead of the generic 64x64 expansion. */
@@ -4920,16 +5032,30 @@ static void gen_opif(int op)
       if (!is_cmp)
         goto general_case;
     }
+    /* Fold VT_DOUBLE operands in double precision (and VT_FLOAT in float),
+       not through the shared 80-bit long double f1/f2.  Rounding the
+       long-double result down to double at the store below would round a
+       SECOND time (double-rounding), so `d / d` folded here could differ by
+       1 ULP from both gcc and tcc's own (correct) runtime softfloat routine.
+       Computing in the operand's native precision and widening back is exact,
+       so the later `v1->c.d = f1` is an identity round-trip.  (fuzz float
+       206597/268558) */
     switch (op)
     {
     case '+':
-      f1 += f2;
+      if (bt == VT_DOUBLE)      { double d = (double)f1 + (double)f2; f1 = d; }
+      else if (bt == VT_FLOAT)  { float s = (float)f1 + (float)f2; f1 = s; }
+      else f1 += f2;
       break;
     case '-':
-      f1 -= f2;
+      if (bt == VT_DOUBLE)      { double d = (double)f1 - (double)f2; f1 = d; }
+      else if (bt == VT_FLOAT)  { float s = (float)f1 - (float)f2; f1 = s; }
+      else f1 -= f2;
       break;
     case '*':
-      f1 *= f2;
+      if (bt == VT_DOUBLE)      { double d = (double)f1 * (double)f2; f1 = d; }
+      else if (bt == VT_FLOAT)  { float s = (float)f1 * (float)f2; f1 = s; }
+      else f1 *= f2;
       break;
     case '/':
       if (f2 == 0.0)
@@ -4954,7 +5080,9 @@ static void gen_opif(int op)
         f1 = y.f;
         break;
       }
-      f1 /= f2;
+      if (bt == VT_DOUBLE)      { double d = (double)f1 / (double)f2; f1 = d; }
+      else if (bt == VT_FLOAT)  { float s = (float)f1 / (float)f2; f1 = s; }
+      else f1 /= f2;
       break;
     case TOK_NEG:
       f1 = -f1;
@@ -12480,8 +12608,10 @@ ST_FUNC CString *parse_mult_str(const char *msg)
 }
 
 /* If I is >= 1 and a power of two, returns log2(i)+1.
-   If I is 0 returns 0.  */
-ST_FUNC int exact_log2p1(int i)
+   If I is 0 returns 0.  The parameter is unsigned so that a value whose
+   highest set bit is the sign bit (e.g. 0x80000000) is shifted and
+   compared without the signed loop condition terminating early. */
+ST_FUNC int exact_log2p1(unsigned int i)
 {
   int ret;
   if (!i)
@@ -14221,7 +14351,20 @@ static int post_type(CType *type, AttributeDef *ad, int storage, int td)
     {
       /* for function args, the top dimension is converted to pointer */
       if ((t1 & VT_VLA) && ((td & TYPE_NEST) || (func_param_decl_depth && !(td & TYPE_PARAM))))
+      {
         s->vla_array_str = vla_array_str;
+        /* Track for end-of-TU reclamation.  func_vla_arg_code frees this at a
+           function definition's entry (and drops it from the list there), but
+           an inner VLA dimension inside an abstract / function-pointer
+           declarator is never materialized and would otherwise leak. */
+        if (vla_array_str_on_heap)
+        {
+          int vi = tcc_state->nb_vla_inner_exprs++;
+          tcc_state->vla_inner_exprs = tcc_realloc(tcc_state->vla_inner_exprs,
+                                                   tcc_state->nb_vla_inner_exprs * sizeof(*tcc_state->vla_inner_exprs));
+          tcc_state->vla_inner_exprs[vi] = vla_array_str;
+        }
+      }
       else if ((t1 & VT_VLA) && (td & TYPE_PARAM))
       {
         /* Outermost VLA dimension of a function param: save the token string
@@ -15699,9 +15842,15 @@ static void unary_funcall(void)
     if (pc > saved_args_cap)
       saved_args_cap = pc;
   }
-  SValue *saved_args = tcc_mallocz(saved_args_cap * sizeof(SValue));
-  unsigned char **saved_args_cid = tcc_mallocz(saved_args_cap * sizeof(unsigned char *));
-  int *saved_args_cid_size = tcc_mallocz(saved_args_cap * sizeof(int));
+  FuncallScratch *saved_scratch = tcc_mallocz(sizeof(*saved_scratch));
+  saved_scratch->saved_args = tcc_mallocz(saved_args_cap * sizeof(SValue));
+  saved_scratch->saved_args_cid = tcc_mallocz(saved_args_cap * sizeof(unsigned char *));
+  saved_scratch->saved_args_cid_size = tcc_mallocz(saved_args_cap * sizeof(int));
+  saved_scratch->next = funcall_scratch_stack;
+  funcall_scratch_stack = saved_scratch;
+  SValue *saved_args = saved_scratch->saved_args;
+  unsigned char **saved_args_cid = saved_scratch->saved_args_cid;
+  int *saved_args_cid_size = saved_scratch->saved_args_cid_size;
   int saved_arg_count = 0;
   int can_try_fold = 0;
   int can_inline_builtin = 0;
@@ -16171,6 +16320,7 @@ va_arg_pack_done:
             aapcs_last_const_init = NULL;
           }
           saved_arg_count++;
+          saved_scratch->saved_arg_count = saved_arg_count;
         }
         else
         {
@@ -16289,7 +16439,10 @@ va_arg_pack_done:
       {
         saved_args[nb_args - 1 - n] = *vtop;
         if (n == 0)
+        {
           saved_arg_count = nb_args;
+          saved_scratch->saved_arg_count = saved_arg_count;
+        }
       }
 
       /* We evaluate right-to-left; assign 0-based parameter indices
@@ -17483,11 +17636,8 @@ va_arg_pack_done:
       }
     }
   } /* end of else block for non-folded function calls */
-  tcc_free(saved_args);
-  for (int ci = 0; ci < saved_arg_count; ci++)
-    tcc_free(saved_args_cid[ci]);
-  tcc_free(saved_args_cid);
-  tcc_free(saved_args_cid_size);
+  saved_scratch->saved_arg_count = saved_arg_count;
+  funcall_scratch_pop_free(saved_scratch);
   if (s->f.func_noreturn)
   {
     if (debug_modes)
@@ -17772,19 +17922,12 @@ static void __attribute__((noinline)) unary_builtin_fp(void)
       vset(&uint_type, VT_LOCAL | VT_LVAL, tmp_loc + high_word_offset);
       vtop->vr = vr_tmp;
 
-      if (fp_size == 4)
-      {
-        /* Match GCC __builtin_signbitf runtime behavior: return the raw
-         * sign mask (0x80000000) for negative float values. */
-        vpushi(0x80000000u);
-        gen_op('&');
-      }
-      else
-      {
-        /* Runtime double stays normalized to 0/1. */
-        vpushi(31);
-        gen_op(TOK_SHR);
-      }
+      /* Match arm-none-eabi-gcc runtime behaviour: it emits
+       * `and r0, <high_word>, #0x80000000` for both signbitf and signbit,
+       * returning the raw sign mask (0x80000000 = -2147483648 as signed int)
+       * for negative values and 0 otherwise. */
+      vpushi(0x80000000u);
+      gen_op('&');
     }
     break;
   }
@@ -22964,6 +23107,8 @@ tok_next:
     if (s->c <= 0)
       s->c = -3; /* LABEL_ADDR_TAKEN marker */
     func_has_label_addr = 1;
+    if (tcc_state->ir)
+      tcc_state->ir->func_has_label_addr = 1; /* mirror for the IR layer (regalloc) */
     if ((s->type.t & VT_BTYPE) != VT_PTR)
     {
       s->type.t = VT_VOID;
@@ -27042,6 +27187,7 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
         tcc_error("unhandled string literal merging");
       while (tok == TOK_STR || tok == TOK_LSTR)
       {
+        int tok_width = (tok == TOK_STR) ? 1 : (int)sizeof(nwchar_t);
         if (initstr.size)
           initstr.size -= size1;
         if (tok == TOK_STR)
@@ -27049,7 +27195,25 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
         else
           len += tokc.str.size / sizeof(nwchar_t);
         len--;
-        cstr_cat(&initstr, tokc.str.data, tokc.str.size);
+        if (tok_width == size1)
+        {
+          cstr_cat(&initstr, tokc.str.data, tokc.str.size);
+        }
+        else if (size1 == (int)sizeof(nwchar_t) && tok == TOK_STR)
+        {
+          /* Mixing a narrow piece into a wide initializer (C permits e.g.
+           * `L"a" "b"`): widen each byte to an nwchar_t element instead of
+           * byte-copying it, which would otherwise be read back at the wider
+           * element stride below and over-read initstr. */
+          const unsigned char *np = (const unsigned char *)tokc.str.data;
+          for (int z = 0; z < tokc.str.size; z++)
+            cstr_wccat(&initstr, np[z]);
+        }
+        else
+        {
+          /* A wide piece in a narrow (char) array is not representable. */
+          tcc_error("unhandled string literal merging");
+        }
         next();
       }
       if (tok != ')' && tok != '}' && tok != ',' && tok != ';' && tok != TOK_EOF)
@@ -27996,7 +28160,7 @@ no_alloc:
   /* restore parse state if needed */
   if (init_str)
   {
-    end_macro();
+    end_macro_to(init_str);
     next();
   }
 
@@ -28033,7 +28197,14 @@ static void func_vla_arg_code(Sym *arg)
     vswap();
     vstore();
     vpop();
-    /* Free the VLA expression token buffer now that it's been evaluated */
+    /* Free the VLA expression token buffer now that it's been evaluated, and
+       drop it from the end-of-TU reclamation list so it is not double-freed. */
+    for (int i = 0; i < tcc_state->nb_vla_inner_exprs; i++)
+      if (tcc_state->vla_inner_exprs[i] == arg->type.ref->vla_array_str)
+      {
+        tcc_state->vla_inner_exprs[i] = NULL;
+        break;
+      }
     tcc_free(arg->type.ref->vla_array_str);
     arg->type.ref->vla_array_str = NULL;
   }
@@ -28977,41 +29148,14 @@ static void gen_instrument_call(Sym *cur_func_sym, const char *hook_name)
 }
 
 #ifdef CONFIG_TCC_DEBUG
-/* Returns 1 if `pass_name` matches the comma-separated list in
- * s->dump_ir_passes (or the list contains the special token "all").
- * Used by DUMP_AFTER_PASS to gate per-pass IR dumps. */
-static int dump_ir_passes_match(TCCState *s, const char *pass_name)
-{
-  if (!s->dump_ir_passes || !pass_name)
-    return 0;
-  const char *p = s->dump_ir_passes;
-  size_t name_len = strlen(pass_name);
-  while (*p)
-  {
-    const char *comma = strchr(p, ',');
-    size_t tok_len = comma ? (size_t)(comma - p) : strlen(p);
-    if (tok_len == 3 && !memcmp(p, "all", 3))
-      return 1;
-    if (tok_len == name_len && !memcmp(p, pass_name, name_len))
-      return 1;
-    if (!comma)
-      break;
-    p = comma + 1;
-  }
-  return 0;
-}
-
 /* If pass_name matches -dump-ir-passes selection, dump the IR labeled with
  * the pass name.  Intended to be called immediately after a
- * tcc_ir_opt_<name>() call to bisect which pass corrupts the IR. */
+ * tcc_ir_opt_<name>() call to bisect which pass corrupts the IR.  Thin wrapper
+ * over the shared implementation in ir/dump.c (also used by the SSA driver). */
 static void dump_ir_after_pass(TCCState *s, TCCIRState *ir, const char *pass_name)
 {
-  if (!dump_ir_passes_match(s, pass_name))
-    return;
-  tcc_ir_dump_set_show_physical_regs(0);
-  printf("=== AFTER %s ===\n", pass_name);
-  tcc_ir_show(ir);
-  printf("=== END AFTER %s ===\n", pass_name);
+  (void)s;
+  tcc_ir_dump_after_pass(ir, pass_name);
 }
 
 /* Run a pass call and dump if selected.  `expr` is the call, `name` is a
@@ -29082,6 +29226,7 @@ static void gen_function(Sym *sym)
   ir = tcc_ir_alloc();
   tcc_state->ir = ir;
   ir->naked = sym->a.naked;
+  ir->is_variadic = func_var;
 
   /* Check if we're compiling a nested function with captured variables */
   if (tcc_state->current_nested_func && tcc_state->current_nested_func->nb_captured > 0)
@@ -29292,6 +29437,13 @@ static void gen_function(Sym *sym)
   }
 #endif
 
+
+  /* Carry narrow plain-STORE access widths onto their value operands before any
+   * pass converts a plain STORE (width from dest) into a STORE_INDEXED (width
+   * from the value operand) — so a char/short store is not widened to a word.
+   * Run again before regalloc to catch widths lost to later value forwarding. */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_narrow_store_value_btype(ir);
 
   /* Block copy init: replace memset(0) + consecutive stores with BLOCK_COPY
    * from a pre-built rodata block.  Run once before the iterative loop. */
@@ -29614,7 +29766,6 @@ static void gen_function(Sym *sym)
         break;
     }
   }
-
   /* Post-SL_FWD cleanup: the SL_FWD loop's DCE may have killed dead branches
    * that were the only remaining defs of a VAR (e.g. `fail = 1` in a dead
    * printf path).  Re-run const_prop + branch_folding + DCE so the now-
@@ -29640,16 +29791,31 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
   {
     int padrof_changed = tcc_ir_opt_param_addrof_const_fold(ir) > 0;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_padrof");
+#endif
     int ladrof_changed = tcc_ir_opt_local_addrof_const_fold(ir) > 0;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_ladrof");
+#endif
     int aofvar_changed = 0;
     int gslfwd_changed = 0;
     int iglh_changed = 0;
     if (tcc_state->opt_const_prop)
       aofvar_changed = tcc_ir_opt_addrof_var_fwd(ir) > 0;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_aofvar");
+#endif
     if (tcc_state->opt_store_load_fwd)
       gslfwd_changed = tcc_ir_opt_global_sl_fwd(ir) > 0;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_gslfwd");
+#endif
     if (tcc_state->opt_store_load_fwd)
       iglh_changed = tcc_ir_opt_invariant_global_load_hoist(ir) > 0;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_iglh");
+#endif
     if (padrof_changed || ladrof_changed || aofvar_changed || gslfwd_changed || iglh_changed)
     {
       if (tcc_state->opt_const_prop)
@@ -29731,6 +29897,9 @@ static void gen_function(Sym *sym)
    * overwritten by a subsequent CALL, using the callee's write summary. */
   if (tcc_state->opt_dead_store)
     tcc_ir_opt_dead_init_via_call(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ_dead_init_via_call");
+#endif
 
   /* Late cleanup: store elimination, dead var/addrvar elimination, redundant assign.
    * Run with max_iterations=2 so dead_addrvar_elim → DSE cascade works.
@@ -29753,6 +29922,9 @@ static void gen_function(Sym *sym)
     tcc_ir_opt_ctx_init(&cleanup_ctx, ir);
     tcc_ir_opt_run_group(&cleanup_ctx, cleanup_group);
     tcc_ir_opt_ctx_free(&cleanup_ctx);
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_late_cleanup_1");
+#endif
 
     if (tcc_state->opt_dead_store) {
       for (int iter = 0; iter < 4; iter++) {
@@ -29791,6 +29963,9 @@ static void gen_function(Sym *sym)
    * and before IV strength reduction which benefits from rotated layout. */
   if (tcc_state->opt_loop_rotation)
     tcc_ir_opt_loop_rotation(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ_loop_rotation");
+#endif
 
   /* Phase 4c.5: First-iteration-exit peeling.  Rewrites a loop's exit
    * JUMPIF to unconditional JUMP when the header test is provably true
@@ -29916,6 +30091,9 @@ static void gen_function(Sym *sym)
   {
     if (tcc_ir_opt_diamond_store_fwd(ir) > 0)
     {
+#ifdef CONFIG_TCC_DEBUG
+      dump_ir_after_pass(tcc_state, ir, "ZZ_diamond_store_fwd");
+#endif
       for (int dsf_iter = 0; dsf_iter < 6; dsf_iter++)
       {
         int dsf_ch = 0;
@@ -29967,6 +30145,9 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_compact_nops(ir);
     }
     (void)total_lcs_changes;
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_loop_const_sim");
+#endif
   }
 
   /* Phase 5a: Loop Unrolling - fully unroll small constant-trip-count loops.
@@ -30008,6 +30189,9 @@ static void gen_function(Sym *sym)
           ch2 += tcc_ir_opt_value_tracking(ir);
       } while (ch2 > 0 && ++iter2 < 10);
     }
+#ifdef CONFIG_TCC_DEBUG
+    dump_ir_after_pass(tcc_state, ir, "ZZ_loop_unroll");
+#endif
   }
   /* Phase 5: Loop-Invariant Code Motion - DISABLED
    * The LICM pass has a bug in hoist_const_exprs_from_loop(): instruction
@@ -30033,6 +30217,9 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_iv_strength_reduction(ir);
   }
   tcc_ir_free_loops(licm_loops);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ_iv_strength_red");
+#endif
 
   /* Local ALU CSE: dedupe pure arithmetic ops within a basic block.
    * Catches `arr[i].x` + `arr[i].y` patterns where the same `i*stride+base`
@@ -30064,6 +30251,10 @@ static void gen_function(Sym *sym)
     if (getenv("TCC_DBG_CSE"))
       fprintf(stderr, "[local_alu_cse] %d changes in %d iterations\n", total_changes, loops);
   }
+
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_alu_cse");
+#endif
 
   /* Phase 6b: Pointer store-to-load forwarding — after local_alu_cse has
    * CSE'd identical address computations (e.g. 5x `T = hstent + 12` collapsed
@@ -30146,6 +30337,10 @@ static void gen_function(Sym *sym)
     }
   }
 
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_psl_fwd");
+#endif
+
   if (tcc_state->opt_redundant_store)
   {
     if (tcc_ir_opt_rmw_byte_clear(ir) > 0)
@@ -30160,6 +30355,9 @@ static void gen_function(Sym *sym)
   if (tcc_state->opt_strength_red)
   dbg_scan_overlap(ir,"Q3-before-strength_reduction");
     tcc_ir_opt_strength_reduction(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_strength_red");
+#endif
 
   /* Late copy propagation + dead store elimination.
    * Late passes (IV strength reduction, loop rotation) may introduce
@@ -30171,6 +30369,9 @@ static void gen_function(Sym *sym)
     if (late_cp > 0 && tcc_state->opt_dead_store)
       tcc_ir_opt_dse(ir);
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_late_cp");
+#endif
 
   if (tcc_state->opt_const_prop)
   {
@@ -30186,6 +30387,9 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_compact_nops(ir);
     }
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_sas");
+#endif
 
   /* Late memmove→indexed-stores: earlier calls miss patterns where the
    * destination address is computed through inline-parameter VAR chains
@@ -30228,6 +30432,9 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_dce)
       tcc_ir_opt_dce(ir);
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_shl32");
+#endif
 
   /* OR-bool-diamond — fold `acc |= (cond ? 1 : 0)` materialization. */
   if (tcc_state->opt_const_prop)
@@ -30237,6 +30444,9 @@ static void gen_function(Sym *sym)
    * their defining deref expressions, creating STORE+CMP deref pairs. */
   if (tcc_state->opt_const_prop)
     tcc_ir_opt_deref_fwd(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_deref_fwd");
+#endif
 
   /* Late VAR→TMP forwarding is deferred to after final compact_nops +
    * eliminate_fallthrough (below), because the forward scan needs clean
@@ -30256,6 +30466,9 @@ static void gen_function(Sym *sym)
    * does not run again after this point. */
   if (tcc_state->opt_copy_prop)
     tcc_ir_opt_postinc_assign_fold(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_paf");
+#endif
 
   /* Combine `V = V ± C1; V = V ± C2; ...` chains into a single update.
    * Produced by loop unrolling of pointer-increment loops once
@@ -30277,6 +30490,9 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_compact_nops(ir);
     }
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_csaf");
+#endif
 
   /* Loop-aware post-increment fusion — fuse embedded deref in loop body with
    * latch pointer increment into LOAD_POSTINC.  Must run after IV strength
@@ -30295,6 +30511,9 @@ static void gen_function(Sym *sym)
   dbg_scan_overlap(ir,"Q4-before-decrement_to_zero");
   tcc_ir_opt_decrement_to_zero(ir);
   dbg_scan_overlap(ir,"Q4b-after-decrement_to_zero");
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_dtz");
+#endif
 
   /* Redundant Init Elimination - remove function-entry VAR inits that are
    * always killed before use. Must run after decrement-to-zero (which NOPs
@@ -30319,6 +30538,9 @@ static void gen_function(Sym *sym)
     }
   }
 
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_dle1");
+#endif
   tcc_ir_opt_dce(ir); /* Final pass to mark unreachable code as NOP */
 
   /* Re-run dead loop elimination after final DCE: earlier loops may now have
@@ -30370,6 +30592,9 @@ static void gen_function(Sym *sym)
         tcc_ir_opt_dse(ir);
     }
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_vtf");
+#endif
 
   /* PACK64 tautology — collapse PACK64(low(X), X>>32) into ASSIGN X.
    * Must run AFTER late var_tmp_fwd + copy_prop: those passes resolve the
@@ -30390,6 +30615,9 @@ static void gen_function(Sym *sym)
     if (tcc_state->opt_dce)
       tcc_ir_opt_dce(ir);
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_p64t");
+#endif
 
   /* ADD-immediate + DEREF fold into LOAD_INDEXED — DISABLED.
    * The fold moves the memory load from the DEREF use site to the ADD
@@ -30421,6 +30649,9 @@ static void gen_function(Sym *sym)
         tcc_ir_opt_eliminate_fallthrough(ir);
     }
   }
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_lr");
+#endif
 
   /* Redundant zero-trip entry-guard elimination.  Sequential counted loops
    * sharing a counter (memclr's 3 loops over i) keep a pre-loop guard on the
@@ -30447,6 +30678,9 @@ static void gen_function(Sym *sym)
    * half setup and compare. */
   dbg_scan_overlap(ir,"P3-before-cmp_narrow_64");
   dbg_scan_overlap(ir,"R4-just-before-cmp_narrow");
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_lge");
+#endif
   tcc_ir_opt_cmp_narrow_64(ir);
 
   /* ASSIGN fusion — fold `T_new = X OP Y; T_final = T_new ASSIGN` into a
@@ -30456,6 +30690,9 @@ static void gen_function(Sym *sym)
   dbg_scan_overlap(ir,"P4-before-assign_fuse");
   tcc_ir_opt_assign_fuse(ir);
   dbg_scan_overlap(ir,"P4b-after-assign_fuse");
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_af");
+#endif
 
   /* Phase 8: Conditional Select - replace if/else diamonds with SELECT.
    * Must run late, after all other optimizations have simplified the IR,
@@ -30468,6 +30705,9 @@ static void gen_function(Sym *sym)
    * SELECT's flag-setting CMP is not deleted by a downstream orphan-CMP pass. */
   if (tcc_state->optimize > 0)
     tcc_ir_opt_setif_neg_to_select(ir);
+#ifdef CONFIG_TCC_DEBUG
+  dump_ir_after_pass(tcc_state, ir, "ZZ2_sel");
+#endif
 
   /* Recompute leafness after IR optimizations.
    * IR construction marks the function non-leaf as soon as a call op is
@@ -30803,6 +31043,12 @@ static void gen_function(Sym *sym)
    * Keyed by orig_index like barrel_shifts; consumed in codegen. */
   if (tcc_state->optimize > 0)
     tcc_ir_opt_shift64_dead_half(ir);
+
+  /* Carry narrow plain-STORE access widths onto their value operands so the
+   * later STORE_INDEXED conversions (which take the store width from the value
+   * operand, not the dest) do not widen a char/short store to a word. */
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_narrow_store_value_btype(ir);
 
   /* Register allocation (SSA-based linear scan) */
   {
@@ -31902,12 +32148,25 @@ static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t siz
   if (start + size > sec->data_offset)
     return;
 
-  /* Shift the section's tail data down. */
+  /* Thumb literal pools embedded in the trailing functions are addressed by
+   * PC-relative LDR (literal), which aligns PC down to 4 bytes.  The tail must
+   * therefore keep its 4-byte alignment: shifting it by a non-multiple-of-4
+   * amount would move each such pool 2 bytes off from where its LDR reads,
+   * loading the wrong word (fuzz-exposed HardFault in gcc.c-torture 20180921-1
+   * at -O1: a re-emitted function's odd-halfword size shifted `at()` and
+   * misaligned its `&al` pool entry).  Function code is halfword-granular, so
+   * `size` is even but may be 2 (mod 4); reclaim only a multiple-of-4 span and
+   * leave up to 2 dead filler bytes so the tail's alignment is preserved. */
+  addr_t shift = size & ~(addr_t)3;
+  if (shift == 0)
+    return;
+
+  /* Shift the section's tail data down (by `shift`, not `size`). */
   size_t tail_offset = (size_t)(start + size);
   size_t tail_len = sec->data_offset - tail_offset;
   if (tail_len > 0)
-    memmove(sec->data + start, sec->data + tail_offset, tail_len);
-  sec->data_offset -= size;
+    memmove(sec->data + (tail_offset - shift), sec->data + tail_offset, tail_len);
+  sec->data_offset -= shift;
 
   /* Adjust symbols that point into this section. */
   Section *symtab = s->symtab; /* union alias of symtab_section */
@@ -31924,7 +32183,7 @@ static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t siz
       addr_t sv = syms[i].st_value & ~(addr_t)1;
       if (sv >= start + size)
       {
-        syms[i].st_value -= size;
+        syms[i].st_value -= shift;
       }
       else if (sv >= start)
       {
@@ -31955,7 +32214,7 @@ static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t siz
       if (off >= start + size)
       {
         rels[dst] = rels[i];
-        rels[dst].r_offset = off - size;
+        rels[dst].r_offset = off - shift;
         dst++;
       }
       else if (off < start)

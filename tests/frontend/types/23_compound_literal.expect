@@ -1,0 +1,45 @@
+=== IR BEFORE OPTIMIZATIONS ===
+0000: StackLoc[-16] <-- #0 [STORE]
+0001: StackLoc[-12] <-- #0 [STORE]
+0002: StackLoc[-16] <-- #1 [STORE]
+0003: StackLoc[-12] <-- #2 [STORE]
+0004: T0 <-- StackLoc[-16] [LOAD]
+0005: StackLoc[-8] <-- T0 [STORE]
+0006: T1 <-- StackLoc[-12] [LOAD]
+0007: StackLoc[-4] <-- T1 [STORE]
+0008: T2 <-- Addr[StackLoc[-8]]
+0009: T3 <-- Addr[StackLoc[-8]]
+0010: T4 <-- T3 ADD #4
+0011: T5 <-- T2***DEREF*** ADD T4***DEREF***
+0012: RETURNVALUE T5
+=== END IR BEFORE OPTIMIZATIONS ===
+=== IR AFTER LOOP ROTATION ===
+0000: StackLoc[-16] <-- #0 [STORE]
+0001: StackLoc[-12] <-- #0 [STORE]
+0002: StackLoc[-16] <-- #1 [STORE]
+0003: StackLoc[-12] <-- #2 [STORE]
+0004: T0 <-- StackLoc[-16] [LOAD]
+0005: StackLoc[-8] <-- T0 [STORE]
+0006: T1 <-- StackLoc[-12] [LOAD]
+0007: StackLoc[-4] <-- T1 [STORE]
+0008: T2 <-- Addr[StackLoc[-8]]
+0009: T3 <-- Addr[StackLoc[-8]]
+0010: T4 <-- T3 ADD #4
+0011: T5 <-- T2***DEREF*** ADD T4***DEREF***
+0012: RETURNVALUE T5
+=== END IR AFTER LOOP ROTATION ===
+=== IR AFTER OPTIMIZATIONS ===
+0000: StackLoc[-16] <-- #0 [STORE]
+0001: StackLoc[-12] <-- #0 [STORE]
+0002: StackLoc[-16] <-- #1 [STORE]
+0003: StackLoc[-12] <-- #2 [STORE]
+0004: R0(T0) <-- StackLoc[-16] [LOAD]
+0005: StackLoc[-8] <-- R0(T0) [STORE]
+0006: R0(T1) <-- StackLoc[-12] [LOAD]
+0007: StackLoc[-4] <-- R0(T1) [STORE]
+0008: R0(T2) <-- Addr[StackLoc[-8]]
+0009: R1(T3) <-- Addr[StackLoc[-8]]
+0010: R2(T4) <-- R1(T3) ADD #4
+0011: R1(T5) <-- R0(T2)***DEREF*** ADD R2(T4)***DEREF***
+0012: RETURNVALUE R1(T5)
+=== END IR AFTER OPTIMIZATIONS ===

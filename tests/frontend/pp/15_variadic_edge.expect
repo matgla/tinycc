@@ -1,0 +1,5 @@
+printf("no args");
+printf("one arg: %d",7);
+int n1 = 1;
+int n2 = 3;
+int arr[] = { 1, 2, 3, };

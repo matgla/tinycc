@@ -154,7 +154,11 @@ int tcc_ir_opt_neg_chain_cse(TCCIRState *ir)
     {
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
       int32_t src_vr = irop_get_vreg(src1);
-      if (!src1.is_lval && src_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src_vr) == TCCIR_VREG_TYPE_TEMP)
+      /* Width must match for the copy to be value-preserving — an ASSIGN that
+       * narrows/widens (e.g. T_b:I8 <- T_a:I32) does not carry T_a's full value,
+       * so it must anchor to itself rather than join T_a's canonical chain. */
+      if (!src1.is_lval && src_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src_vr) == TCCIR_VREG_TYPE_TEMP &&
+          irop_get_btype(dest) == irop_get_btype(src1))
       {
         int src_pos = TCCIR_DECODE_VREG_POSITION(src_vr);
         if (src_pos <= max_tmp && canon[src_pos].valid)
@@ -173,8 +177,19 @@ int tcc_ir_opt_neg_chain_cse(TCCIRState *ir)
     {
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
       IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      /* Match the negation idiom: T_b = #0 SUB T_a. */
-      if (irop_is_immediate(src1) && irop_get_imm64_ex(ir, src1) == 0)
+      int dest_btype = irop_get_btype(dest);
+      int src_btype = irop_get_btype(src2);
+      /* Match the negation idiom: T_b = #0 SUB T_a.
+       *
+       * Width must match — a width-changing negation (e.g. T_b:I8 = -T_a:I32)
+       * truncates, so it is NOT value-preserving and must NOT join T_a's
+       * canonical chain.  Were it recorded as "T_b = -base" against the wider
+       * base, a later same-width negation could be folded straight back to the
+       * wide base, dropping the truncation and miscompiling.  When the widths
+       * differ the dest anchors to itself (base = dest, sign = +) via the
+       * defaults above, keeping first_pos/first_neg homogeneous per base. */
+      if (irop_is_immediate(src1) && irop_get_imm64_ex(ir, src1) == 0 &&
+          dest_btype == src_btype)
       {
         int32_t src_vr = irop_get_vreg(src2);
         if (!src2.is_lval && src_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src_vr) == TCCIR_VREG_TYPE_TEMP)
@@ -191,27 +206,20 @@ int tcc_ir_opt_neg_chain_cse(TCCIRState *ir)
             sign = 1;
           }
 
-          /* Width must match — otherwise an ASSIGN of a different-width TEMP
-           * could drop or extend bits the SUB wouldn't have. */
-          int dest_btype = irop_get_btype(dest);
-          int src_btype = irop_get_btype(src2);
-          if (dest_btype == src_btype)
+          int base_pos = TCCIR_DECODE_VREG_POSITION(base_vr);
+          int32_t existing = (sign == 1) ? first_neg[base_pos] : first_pos[base_pos];
+          if (existing >= 0 && existing != dest_vr)
           {
-            int base_pos = TCCIR_DECODE_VREG_POSITION(base_vr);
-            int32_t existing = (sign == 1) ? first_neg[base_pos] : first_pos[base_pos];
-            if (existing >= 0 && existing != dest_vr)
-            {
-              IROperand new_src = irop_make_vreg(existing, dest_btype);
-              q->op = TCCIR_OP_ASSIGN;
-              tcc_ir_set_src1(ir, i, new_src);
-              tcc_ir_set_src2(ir, i, IROP_NONE);
-              LOG_NEG_CHAIN("@%d: T%d = -T%d folded to T%d = T%d (base=T%d sign=%d)",
-                            i, dest_pos, TCCIR_DECODE_VREG_POSITION(src_vr),
-                            dest_pos, TCCIR_DECODE_VREG_POSITION(existing),
-                            base_pos, sign);
-              changes++;
-              did_replace = 1;
-            }
+            IROperand new_src = irop_make_vreg(existing, dest_btype);
+            q->op = TCCIR_OP_ASSIGN;
+            tcc_ir_set_src1(ir, i, new_src);
+            tcc_ir_set_src2(ir, i, IROP_NONE);
+            LOG_NEG_CHAIN("@%d: T%d = -T%d folded to T%d = T%d (base=T%d sign=%d)",
+                          i, dest_pos, TCCIR_DECODE_VREG_POSITION(src_vr),
+                          dest_pos, TCCIR_DECODE_VREG_POSITION(existing),
+                          base_pos, sign);
+            changes++;
+            did_replace = 1;
           }
         }
       }

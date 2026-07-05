@@ -4798,12 +4798,127 @@ static int macro_subst(TokenString *tok_str, Sym **nested_list, const int *macro
   return nosubst;
 }
 
+/* Lex the raw text 'text' (len bytes, no trailing NUL required) into the token
+   stream 'out', preserving interior whitespace so the reconstructed directive
+   keeps its original spacing.  Used to expand a destringized _Pragma operand
+   into printable tokens for the -E rewrite.  A private input buffer is pushed
+   and popped, leaving the surrounding lexer state untouched. */
+static void pp_lex_into(TCCState *s1, TokenString *out, const char *text, int len)
+{
+  int saved_parse_flags = parse_flags;
+
+  if (len <= 0)
+    return;
+  parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_SPACES;
+  tcc_open_bf(s1, ":pragma:", len + 1);
+  memcpy(file->buffer, text, len);
+  file->buffer[len] = 0;
+  tok_flags = 0; /* don't interpret a leading '#' as a directive */
+  for (;;)
+  {
+    next_nomacro();
+    if (tok == TOK_EOF)
+      break;
+    tok_str_add2(out, tok, &tokc);
+    if (*file->buf_ptr == 0)
+      break;
+  }
+  tcc_close(); /* also restores tok_flags */
+  parse_flags = saved_parse_flags;
+}
+
+/* Handle the C11 6.10.9 _Pragma operator.  On entry the current token is
+   TOK__Pragma (which may itself have been produced by macro expansion, e.g.
+   the common `#define DO_PRAGMA(x) _Pragma(#x)' idiom).  Parse the
+   `( string-literal )' operand, destringize it, and act exactly as if the
+   resulting text had appeared as a `#pragma' directive at this point: under
+   -E rewrite it to `#pragma <text>' on its own line, otherwise run the real
+   #pragma machinery so pack()/message/push_macro/... take effect. */
+static void handle_pragma_operator(TCCState *s1)
+{
+  int saved_parse_flags = parse_flags;
+  CString text;
+  int len;
+
+  /* Read the operand with next() so a macro-produced _Pragma consumes its
+     parenthesized string from the same (macro) token stream it arrived on.
+     Force TOK_STR conversion so the operand is decoded even under -E (which
+     otherwise leaves strings as TOK_PPSTR); that decoding already collapses
+     \" to " and \\ to \, i.e. exactly the destringizing the standard wants. */
+  parse_flags = (parse_flags & ~PARSE_FLAG_ASM_FILE) | PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_STR | PARSE_FLAG_TOK_NUM;
+  next();
+  if (tok != '(')
+    goto err;
+  next();
+  if (tok != TOK_STR)
+    goto err;
+  /* Keep a private copy: reading ')' below reuses the shared token buffers. */
+  cstr_new(&text);
+  cstr_cat(&text, (char *)tokc.str.data, tokc.str.size - 1);
+  len = text.size;
+  cstr_ccat(&text, '\0');
+  next();
+  if (tok != ')')
+  {
+    cstr_free(&text);
+    goto err;
+  }
+  parse_flags = saved_parse_flags;
+
+  if (s1->output_type == TCC_OUTPUT_PREPROCESS)
+  {
+    /* -E: rewrite to `#pragma <text>' on its own line for the tcc_preprocess()
+       output loop.  Inject the directive as a throwaway macro string; the
+       leading/trailing linefeeds keep it on a line of its own, mirroring the
+       passthrough that pragma_parse() performs for real #pragma lines. */
+    TokenString *inj = tok_str_alloc();
+    tok_str_add(inj, TOK_LINEFEED);
+    tok_str_add(inj, '#');
+    tok_str_add(inj, TOK_PRAGMA);
+    tok_str_add(inj, ' ');
+    pp_lex_into(s1, inj, text.data, len);
+    tok_str_add(inj, TOK_LINEFEED);
+    tok_str_add(inj, 0);
+    begin_macro(inj, 1);
+    cstr_free(&text);
+    return;
+  }
+
+  /* Real compile: feed `<text>\n' through the existing #pragma parser.  Push it
+     as its own input buffer and isolate any active macro expansion so the
+     directive body is read purely from that buffer, then restore. */
+  {
+    const int *saved_macro_ptr = macro_ptr;
+    TokenString *saved_macro_stack = macro_stack;
+
+    macro_ptr = NULL;
+    macro_stack = NULL;
+    parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR | PARSE_FLAG_LINEFEED;
+    tcc_open_bf(s1, ":pragma:", len + 1);
+    memcpy(file->buffer, text.data, len);
+    file->buffer[len] = '\n';
+    tok_flags = 0;
+    pragma_parse(s1);
+    tcc_close(); /* also restores tok_flags */
+    macro_ptr = saved_macro_ptr;
+    macro_stack = saved_macro_stack;
+    parse_flags = saved_parse_flags;
+  }
+  cstr_free(&text);
+  return;
+
+err:
+  parse_flags = saved_parse_flags;
+  tcc_error("_Pragma takes a parenthesized string literal");
+}
+
 /* return next token with macro substitution */
 ST_FUNC HOT void next(void)
 {
   int t;
   TCCState *s1 = tcc_state;
 
+restart:
   while (macro_ptr)
   {
   redo:
@@ -4846,7 +4961,7 @@ ST_FUNC HOT void next(void)
       }
     }
     tok = t;
-    return;
+    goto check_pragma;
   }
 
   next_nomacro();
@@ -4863,8 +4978,19 @@ ST_FUNC HOT void next(void)
       begin_macro(&tokstr_buf, 0);
       goto redo;
     }
-    return;
+    goto check_pragma;
   }
+  goto convert;
+
+check_pragma:
+  /* The C11 _Pragma operator is recognized here, after macro expansion, so
+     that it also works when produced by a macro (e.g. DO_PRAGMA(x)). */
+  if (tok == TOK__Pragma && (parse_flags & PARSE_FLAG_PREPROCESS))
+  {
+    handle_pragma_operator(s1);
+    goto restart; /* fetch the token after the (now-processed) _Pragma */
+  }
+  return;
 
 convert:
   /* convert preprocessor tokens into C tokens */

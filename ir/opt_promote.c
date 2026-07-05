@@ -337,21 +337,14 @@ int tcc_ir_opt_var_tmp_fwd(TCCIRState *ir)
     if (TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
 
-    /* DEREF source guard: forwarding V → *T duplicates the load at every
-     * use site.  Only beneficial when V has exactly one use (which we're
-     * about to rewrite), making V dead and DCE'ing the STORE.  Multiple
-     * uses → substituting one reintroduces the load there without removing
-     * the STORE the other uses still need.  Pattern from inlined check1:
-     *   V <- *T [STORE]        \
-     *   CMP got, V              -- if both rewritten, V dies. But if
-     *   PARAM3 V (outside BB)  /   PARAM3 stays, the substitution at CMP
-     *                              adds a redundant ldr without payoff. */
-    if (src1.is_lval && var_use_count)
-    {
-      int dpos = TCCIR_DECODE_VREG_POSITION(dest_vr);
-      if (dpos >= 0 && dpos < max_var_for_use && var_use_count[dpos] > 1)
-        continue;
-    }
+    /* DEREF source guard: forwarding V ← *T turns a VAR load into a raw
+     * memory dereference at every use site.  Even with a single use this is
+     * unsafe: downstream passes treat a direct StackLoc/address deref as an
+     * unaliased load and may fold it to the initializer, ignoring loop-carried
+     * or indexed writes that alias the same slot (seed 588).  Only forward
+     * non-lval (register-held) TEMP sources. */
+    if (src1.is_lval)
+      continue;
 
     /* Don't forward TEMPs that hold a computed stack/symbol ADDRESS (from
      * LEA / Addr[...]).  Even when V is single-use, removing the VAR that
@@ -364,6 +357,14 @@ int tcc_ir_opt_var_tmp_fwd(TCCIRState *ir)
     {
       int t_def = tcc_ir_find_defining_instruction(ir, src_vr, i);
       if (t_def >= 0 && ir->compact_instructions[t_def].op == TCCIR_OP_LEA)
+        continue;
+      /* Keep this forwarding local to the producer.  Extending a TEMP across
+       * intervening stores can perturb the store-heavy csmix shape enough for
+       * later cleanup/codegen to miscompile seed 814. */
+      int prev = i - 1;
+      while (prev >= 0 && ir->compact_instructions[prev].op == TCCIR_OP_NOP)
+        prev--;
+      if (t_def != prev)
         continue;
     }
 
@@ -2008,6 +2009,24 @@ int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir)
     }
     if (!safe)
       continue;
+
+    /* Pin both sides of every eliminated no-op copy to their shared physical
+     * register.  Without this, a later codegen scratch-conflict fixup
+     * (try_reassign_scratch_conflict) can independently move just the dest
+     * vreg's interval to a different register — the two vregs stop sharing a
+     * register even though the copy that would keep them in sync no longer
+     * exists in the IR, so the fall-through edge silently reads a register
+     * that was never written on that path.  phi_pinned is the same guard
+     * ra_phi_copy_needed() sets for the identical post-RA-identity case. */
+    for (int j = 0; j < num_assigns; j++) {
+      IRQuadCompact *aq = &ir->compact_instructions[i + 1 + j];
+      int32_t adst_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, aq));
+      int32_t asrc_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, aq));
+      IRLiveInterval *dli = tcc_ir_vreg_live_interval(ir, adst_vr);
+      IRLiveInterval *sli = tcc_ir_vreg_live_interval(ir, asrc_vr);
+      if (dli) dli->phi_pinned = 1;
+      if (sli) sli->phi_pinned = 1;
+    }
 
     int inv_cond = invert_condition(cond);
     if (inv_cond < 0)

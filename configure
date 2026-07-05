@@ -172,6 +172,8 @@ for opt do
   ;;
   --enable-asan) confvars_set asan
   ;;
+  --disable-asan) asan_disabled=yes
+  ;;
   --enable-ubsan) confvars_set ubsan
   ;;
   --enable-lsan) confvars_set lsan
@@ -194,6 +196,12 @@ for opt do
   ;;
   esac
 done
+
+# AddressSanitizer is enabled by default for this fork; opt out with
+# --disable-asan (e.g. for fast production / firmware builds).
+if test "$asan_disabled" != "yes"; then
+  confvars_has asan || confvars_set asan
+fi
 
 show_help() {
 cat << EOF
@@ -223,7 +231,8 @@ Advanced options (experts only):
   --extra-ldflags=         specify linker options [$LDFLAGS]
 
   --debug                  include debug info with resulting binaries
-  --enable-asan            enable AddressSanitizer (ASan)
+  --enable-asan            enable AddressSanitizer (ASan) [default]
+  --disable-asan           disable AddressSanitizer (ASan)
   --enable-ubsan           enable UndefinedBehaviorSanitizer (UBSan)
   --enable-lsan            enable LeakSanitizer (LSan)
   --enable-O0              disable optimizations (GCC -O0)

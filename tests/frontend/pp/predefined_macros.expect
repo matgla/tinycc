@@ -1,0 +1,3 @@
+int line = 1;
+const char *date = "<DATE>";
+const char *time = "<TIME>";

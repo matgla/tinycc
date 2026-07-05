@@ -1,0 +1,3 @@
+#pragma message "from macro"
+#pragma GCC diagnostic ignored "-Wunused"
+int a = 1;

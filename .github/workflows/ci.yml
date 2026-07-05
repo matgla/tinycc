@@ -5,6 +5,13 @@ on:
     branches: [mob]
   pull_request:
     branches: [mob]
+  workflow_dispatch:
+
+env:
+  # Stable synthetic key the metrics job records under (metrics.db keys runs by
+  # commit_sha+host) -- decoupled from the Pi's actual hostname so dashboard
+  # rows stay under one stable host even if the runner hostname changes.
+  METRICS_HOST: armv8m-metrics
 
 jobs:
   build-and-test:
@@ -25,11 +32,104 @@ jobs:
           submodules: recursive
 
       - name: Configure
-        run: ./configure --enable-cross --enable-O2 
+        # --debug enables CONFIG_TCC_DEBUG so the compiler supports -dump-ir;
+        # without it the frontend types/ tests skip (they need IR dumps).
+        run: ./configure --enable-cross --enable-O2 --debug
 
       - name: Build and test
         shell: bash
+        env:
+          # Write a JUnit report from every pytest run (the final ir_tests run
+          # overwrites it last) so the failure collector knows which tests failed.
+          PYTEST_ADDOPTS: "--junitxml=/tmp/ci-junit.xml"
         run: |
           virtualenv .venv
           source .venv/bin/activate
-          make test -j$(nproc)
+          # `shell: bash` runs with -eo pipefail, so a failing make still fails
+          # the step even though its output is teed to a log we upload on failure.
+          make test CI=1 -j$(nproc) 2>&1 | tee /tmp/make-test.log
+
+      - name: Golden IR snapshot tests
+        # Snapshot the per-pass IR against checked-in .expected files. Kept a
+        # separate step (and a separate `make` target) from `make test`: it
+        # needs -dump-ir-passes, a debug/diagnostic interface, which the
+        # --debug build above provides. Runs after `make test` so the cross
+        # compiler and venv it depends on already exist.
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          make test-golden-ir
+
+      - name: Collect failure artifacts
+        if: failure()
+        shell: bash
+        env:
+          MAKE_TEST_LOG: /tmp/make-test.log
+          PYTEST_JUNIT_XML: /tmp/ci-junit.xml
+        run: |
+          source .venv/bin/activate 2>/dev/null || true
+          bash scripts/collect_ci_failure_artifacts.sh "$PWD/ci-failure-artifacts"
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: make-test-failure-artifacts
+          path: ci-failure-artifacts.tar.gz
+          retention-days: 14
+          if-no-files-found: warn
+
+  # Metrics: code size (tcc-vs-gcc disasm comparison) + compile time + RP2350
+  # hardware perf, all on the self-hosted Pi in one job. Merged from the old
+  # split build-and-measure (cloud codesize) + rp2350-perf (board perf): the
+  # cross compiler is host-native, so it can't be handed to the aarch64 Pi as
+  # an artifact anyway -- and the Pi already has the arm-none-eabi toolchain
+  # the disasm comparison needs, so there's nothing to offload to the cloud.
+  # One record.py call measures codesize and perf locally against the same
+  # freshly built tcc, so no scratch-db round-trip / --import-codesize-from.
+  metrics:
+    runs-on: [self-hosted, rpi5, pimoroni_pico_plus2]
+    timeout-minutes: 120
+    concurrency:
+      group: metrics-rpi5
+      cancel-in-progress: false
+    env:
+      METRICS_DB: /var/lib/tcc-metrics/metrics.db
+      PERF_HOST: 127.0.0.1
+      PERF_IDENTITY: /home/runner/.ssh/id_rp
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # depth 1 is enough: `make cross` stamps a version string via git
+          # rev-parse/log -1/diff (no history walk) and record.py runs
+          # `git show -s HEAD`.
+          fetch-depth: 1
+
+      - name: Build cross compiler
+        # armv8m-tcc is a *cross* compiler: it targets ARMv8-M but the binary
+        # itself is host-native, so it must be built on this aarch64 Pi rather
+        # than shared from an x86_64 runner (an x86_64 build can't exec here --
+        # the shell would fall back to interpreting it: "Syntax error: )
+        # unexpected"). --enable-O2/--debug only affect tcc's own binary, not
+        # the code it emits, so codesize/perf are unaffected by this config.
+        run: ./configure --enable-cross --enable-O2 --debug && make cross -j$(nproc)
+
+      - name: Record codesize + compile time + perf
+        # --codesize-detail runs the tcc-vs-gcc disasm comparison over the
+        # corpus (fills codesize_rollup + the per-function codesize_func table
+        # for Grafana's drill-down); --perf-host runs the RP2350 board
+        # benchmark. Both land in the real metrics.db under the same run.
+        # --keep 20 prunes older runs to bound DB growth from --codesize-detail.
+        run: |
+          python3 metrics/record.py --db "$METRICS_DB" --rev HEAD --no-correctness \
+              --codesize-detail --jobs "$(nproc)" \
+              --host "$METRICS_HOST" --trigger "${{ github.event_name }}" \
+              --perf-host "$PERF_HOST" --perf-identity "$PERF_IDENTITY" --perf-strict \
+              --branch mob --keep 20
+
+      - name: Gate
+        if: ${{ vars.METRICS_GATE_ENABLED == 'true' }}
+        run: python3 metrics/gate.py --db "$METRICS_DB" --rev HEAD --host "$METRICS_HOST" --strict

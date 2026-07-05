@@ -33,6 +33,13 @@
  * so we don't increase register pressure.
  * ============================================================================ */
 
+static int has_barrel_shift_annotation(TCCIRState *ir, const IRQuadCompact *q)
+{
+  return ir->barrel_shifts && q->orig_index >= 0 &&
+         q->orig_index <= ir->max_orig_index &&
+         ir->barrel_shifts[q->orig_index] != 0;
+}
+
 static int reassoc_binary(IRSSAOptCtx *ctx, int idx)
 {
   TCCIRState *ir = ctx->ir;
@@ -44,6 +51,13 @@ static int reassoc_binary(IRSSAOptCtx *ctx, int idx)
 
   /* Outer op must have immediate src2 */
   if (src2.tag != IROP_TAG_IMM32 || src2.is_lval)
+    return 0;
+
+  /* The ARM barrel-shift fusion pass records a hidden shift on an ALU op's
+   * src2 in ir->barrel_shifts[orig_index].  Later SSA folds can still make
+   * that visible src2 look like a plain immediate, but reassociating through
+   * it would combine constants as if the shift did not exist. */
+  if (has_barrel_shift_annotation(ir, q))
     return 0;
 
   /* src1 must be a single-use TEMP vreg */
@@ -58,6 +72,8 @@ static int reassoc_binary(IRSSAOptCtx *ctx, int idx)
     return 0;
 
   IRQuadCompact *inner = &ir->compact_instructions[vi->def_instr];
+  if (has_barrel_shift_annotation(ir, inner))
+    return 0;
 
   /* Inner op must also have an immediate in src2 */
   IROperand inner_src1 = tcc_ir_op_get_src1(ir, inner);
@@ -195,6 +211,10 @@ static int reassoc_add_cancel_const(IRSSAOptCtx *ctx, int idx)
 
   IRQuadCompact *d1 = &ir->compact_instructions[vi1->def_instr];
   IRQuadCompact *d2 = &ir->compact_instructions[vi2->def_instr];
+  if (has_barrel_shift_annotation(ir, q) ||
+      has_barrel_shift_annotation(ir, d1) ||
+      has_barrel_shift_annotation(ir, d2))
+    return 0;
 
   /* Match (a OP1 c) and (a OP2 c) where OP1/OP2 are {ADD, SUB} and the
    * constants cancel (same value with opposite signs in the combined sum). */

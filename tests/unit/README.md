@@ -1,5 +1,10 @@
 # TinyCC Unit-Test Framework Guide
 
+> **Process & conventions live in [`docs/writing_unit_tests.md`](../../docs/writing_unit_tests.md)** —
+> read it first. In particular: never modify production source while writing tests
+> (it breaks parallel tasks), and report every suspected bug in `docs/bugs.md`.
+> This README documents the same framework from the build-mechanics angle.
+
 ## Overview
 
 The `tests/unit/` directory contains **host-native C unit tests** for tinycc internal modules. The goal is to test data structures, algorithms, and utility functions in isolation — without pulling in the full compiler, backend code generators, or QEMU.
@@ -321,11 +326,50 @@ static void ut_init_intervals(IRLiveInterval **arr, int *size, int *next)
 | Command | What it does |
 |---------|--------------|
 | `make ut` | Build and run all unit tests. |
+| `make ut-coverage` | Build instrumented, run, render a gcov coverage report. |
 | `make ut-clean` | Remove all build artifacts. |
 | `make -C tests/unit/arm/armv8m run` | Run tests for a specific target directly. |
+| `make -C tests/unit/arm/armv8m coverage` | Coverage report for a specific target. |
 | `make -C tests/unit/arm/armv8m clean` | Clean a specific target. |
 
 The top-level `Makefile` also references `tests/unit/README` in the `ut` target comment; keep this document in sync if the build mechanics change.
+
+---
+
+## Code Coverage (gcov)
+
+`make ut-coverage` (or `make -C tests/unit coverage`) measures **line/branch/function
+coverage** of the tinycc modules under test. It complements `PASS_COVERAGE.md`, which
+tracks *which optimization passes have a suite*; this tracks *which lines within the
+modules under test the suites actually exercise*.
+
+Mechanics: the `coverage` target does a clean instrumented build
+(`COVERAGE=1` → `--coverage` on every TU, emitting `build/**/*.gcno` at compile time
+and `build/**/*.gcda` when the binary runs), then renders a report with
+[`gcovr`](https://gcovr.com):
+
+- **Terminal**: a `lines / functions / branches` summary is printed.
+- **`build/coverage/coverage.txt`**: per-file table, sorted worst-covered first, with
+  the exact uncovered line numbers.
+- **`build/coverage/index.html`**: browsable, line-annotated HTML.
+
+The report is **filtered to the modules genuinely under test** — `ir/`, `arch/arm/`,
+and `tccir_operand.c` — so the test harness itself (`test_*.c`, `stubs.c`) is excluded
+(see `GCOVR_FILTERS` in `arm/armv8m/Makefile`).
+
+Reading the numbers:
+- The top-line aggregate is **low by construction**: `ir/core.c` is linked only for its
+  `irop_config[]` table (the rest is `--gc-sections`-stripped at link, so it reports ~1%).
+  Look at **per-file** numbers, not the aggregate.
+- Passes with focused isolated suites read high (`opt_neg_chain` ~93%, `opt_setif_or_taut`
+  ~92%, the `thop_*` encoders 75–100%). The constfold/constprop/copyprop files read low
+  because many of their passes are name-gated / pull frontend symbols the isolated harness
+  can't yet reach — exactly the Phase F gap tracked in `PASS_COVERAGE.md`.
+
+Requires `gcovr` (and a matching `gcov`, shipped with gcc). The instrumented build is kept
+separate from the normal one — `make ut` never builds with coverage, and the `coverage`
+target always cleans first so instrumented and plain objects never mix. All artifacts land
+under the git-ignored `build/` tree.
 
 ---
 

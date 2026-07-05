@@ -1,0 +1,3 @@
+0000: StackLoc[-16] <-- #5 [STORE]
+0001: T3 <-- #100 [ASSIGN]
+0002: RETURNVALUE #100

@@ -225,6 +225,11 @@ int vararg_push_size = 0;       /* bytes pushed for variadic r0-r3 save (16 or 0
  * (right below pushed regs), so locals are addressed relative to
  * allocated_stack_size (without pad):
  * FP + frame_offset = SP + allocated_stack_size + frame_offset. */
+/* Bytes the real run's scratch PUSHes have currently moved SP below its
+ * steady-state position (see get_scratch_reg_with_save).  Defined after the
+ * scratch bookkeeping state below. */
+static int scratch_push_sp_bias(void);
+
 static inline int fp_adjust_local_offset(int frame_offset, int is_param)
 {
   if (is_param)
@@ -233,8 +238,12 @@ static inline int fp_adjust_local_offset(int frame_offset, int is_param)
   if (!tcc_state->need_frame_pointer && frame_offset <= 0)
   {
     /* Convert FP-relative (negative) to SP-relative (positive).
-     * FP + frame_offset = SP + allocated_stack_size + frame_offset. */
-    return allocated_stack_size + frame_offset;
+     * FP + frame_offset = SP + allocated_stack_size + frame_offset.
+     * A scratch PUSH inside the current instruction has moved SP down;
+     * without the bias every access in the push window reads/writes 4
+     * bytes low per active push (struct_byval fuzz seed 6105: LDR of a
+     * by-value field between push {r0} and pop {r0}). */
+    return allocated_stack_size + scratch_push_sp_bias() + frame_offset;
   }
 
   if (frame_offset < 0 && callee_push_size > 0)
@@ -851,6 +860,21 @@ typedef struct CodeGenDryRunState
 } CodeGenDryRunState;
 
 static CodeGenDryRunState dry_run_state;
+
+/* Bytes the real run's scratch PUSHes have currently moved SP below its
+ * steady-state position.  Derived from the push bookkeeping so it can never
+ * drift from the actual PUSH/POP pairing (including deferred pops).  The dry
+ * run never emits pushes, so its bias is always 0. */
+static int scratch_push_sp_bias(void)
+{
+  if (dry_run_state.active)
+    return 0;
+  int bias = 0;
+  for (int i = 0; i < scratch_push_count; i++)
+    if (scratch_push_type[i] == 1)
+      bias += 4;
+  return bias;
+}
 
 /* Separate literal pool for dry-run mode to avoid modifying the real pool.
  * This allows accurate code size tracking without affecting the real pass. */
@@ -1532,7 +1556,7 @@ no_free_reg:
       scratch_save_slot < (ir->scratch_save_size / 4))
   {
     int frame_offset = ir->scratch_save_base + (scratch_save_slot * 4);
-    int sp_offset = allocated_stack_size + frame_offset;
+    int sp_offset = allocated_stack_size + scratch_push_sp_bias() + frame_offset;
     if (!store_word_to_base(reg_to_save, R_SP, sp_offset, 0))
       tcc_error("compiler_error: scratch save STR failed (offset %d)", sp_offset);
     result.reg = reg_to_save;
@@ -1601,7 +1625,7 @@ static void restore_scratch_reg(ScratchRegAlloc *alloc)
     if (scratch_save_slot > 0)
       scratch_save_slot--;
     int frame_offset = ir->scratch_save_base + (scratch_save_slot * 4);
-    int sp_offset = allocated_stack_size + frame_offset;
+    int sp_offset = allocated_stack_size + scratch_push_sp_bias() + frame_offset;
     if (!load_word_from_base(alloc->reg, R_SP, sp_offset, 0))
       tcc_error("compiler_error: scratch restore LDR failed (offset %d)", sp_offset);
     alloc->saved = 0;
@@ -1661,19 +1685,23 @@ static void restore_all_pushed_scratch_regs(void)
     return;
   }
 
-  /* Restore in reverse order */
+  /* Restore in reverse order.  scratch_push_count is trimmed as each entry
+   * is restored so scratch_push_sp_bias() sees only the still-active pushes
+   * while emitting the LDRs below. */
   for (int i = scratch_push_count - 1; i >= 0; i--)
   {
     int reg = scratch_push_stack[i];
-    LOG_SCRATCH("auto-restoring r%d (push order %d, type %d)", reg, i, scratch_push_type[i]);
-    if (scratch_push_type[i] == 2)
+    int type = scratch_push_type[i];
+    LOG_SCRATCH("auto-restoring r%d (push order %d, type %d)", reg, i, type);
+    scratch_push_count = i;
+    if (type == 2)
     {
       /* Saved to scratch area: restore via LDR */
       TCCIRState *ir = tcc_state->ir;
       if (scratch_save_slot > 0)
         scratch_save_slot--;
       int frame_offset = ir->scratch_save_base + (scratch_save_slot * 4);
-      int sp_offset = allocated_stack_size + frame_offset;
+      int sp_offset = allocated_stack_size + scratch_push_sp_bias() + frame_offset;
       if (!load_word_from_base(reg, R_SP, sp_offset, 0))
         tcc_error("compiler_error: scratch auto-restore LDR failed (offset %d)", sp_offset);
     }
@@ -2733,6 +2761,26 @@ static void th_literal_pool_reserve_upcoming_bytes(int upcoming_bytes)
     th_literal_pool_generate();
 }
 
+static int th_literal_pool_would_flush_for(int upcoming_bytes)
+{
+  int pool_count = dry_run_state.active ? dry_run_literal_pool_count : thumb_gen_state.literal_pool_count;
+
+  if (!thumb_gen_state.generating_function || pool_count == 0)
+    return 0;
+
+  return thumb_gen_state.code_size + pool_count * 4 + upcoming_bytes >= 1020;
+}
+
+/* Count of conditioned instructions still pending inside an IT/ITE/... block,
+ * tracked by ot() purely for literal-pool flush suppression.  Kept separate
+ * from mov_equiv_it_pending, which mov_equiv_reset_all() may zero mid-block.
+ * While this is non-zero a pool flush would land INSIDE the IT block: the
+ * flush emits its pool + B.W skip-branch BEFORE the bytes of the op being
+ * emitted, so the branch would occupy a conditioned slot, inherit the IT
+ * condition, and the opposite arm would fall through into pool data and
+ * execute it (fuzz ptr seed 5759: O2 HardFault). */
+static int pool_flush_it_pending;
+
 int is_valid_opcode(thumb_opcode op)
 {
   return (op.size == 2 || op.size == 4);
@@ -2904,15 +2952,6 @@ int ot(thumb_opcode op)
   if (op.size == 0)
     return op.size;
 
-  /* DEBUG: emit-stream trace for the 90_struct miscompile. Same compiler +
-   * identical stable allocation ⇒ device and QEMU emit identical opcode streams
-   * up to the silicon-divergent branch; diffing this trace pinpoints the first
-   * differing emitted instruction (and its IR index). Real-run only. */
-  if (!dry_run_state.active && funcname &&
-      !strcmp((const char *)funcname, "test_init_struct_from_struct") && tcc_state && tcc_state->ir)
-    fprintf(stderr, "EMIT i=%d ind=0x%x op=0x%x sz=%d\n", tcc_state->ir->codegen_instruction_idx, (unsigned)ind,
-            (unsigned)op.opcode, op.size);
-
   /* Detect instructions that write to R9 when it's reserved for GOT pointer.
    * Exclude push/pop/stmdb/ldmia which legitimately save/restore R9. */
   if (text_and_data_separation && !allow_r9_write)
@@ -3068,6 +3107,36 @@ int ot(thumb_opcode op)
     imm_cache_reset_all();
   }
 
+  /* Literal-pool flush safety around IT blocks.  Call-site reservations
+   * (th_literal_pool_reserve_upcoming_bytes) cover the block's CODE bytes,
+   * but a conditioned arm that materializes a large constant
+   * (load_full_const) grows the pool AFTER the reservation was checked, so
+   * the threshold can still trip mid-block.  Track the architectural IT
+   * window here and (a) never flush while an op is conditioned, (b) flush
+   * BEFORE the IT opcode itself if the worst-case block — 4 code bytes plus
+   * an 8-byte pool entry per conditioned instruction — could hit the
+   * threshold, so the deferred flush of (a) never overshoots the LDR-literal
+   * range.  Runs in both passes so dry-run and real layouts stay identical. */
+  int op_in_it_block = 0;
+  if (thumb_gen_state.generating_function)
+  {
+    if (pool_flush_it_pending > 0)
+    {
+      op_in_it_block = 1;
+      pool_flush_it_pending--;
+    }
+    else
+    {
+      int it_len = mov_equiv_it_block_length(op);
+      if (it_len > 0)
+      {
+        if (thumb_gen_state.code_size + op.size + thumb_gen_state.literal_pool_count * 4 + 12 * it_len >= 1020)
+          th_literal_pool_generate();
+        pool_flush_it_pending = it_len;
+      }
+    }
+  }
+
   /* Dry run: don't emit actual opcodes, but still track code size and
    * handle literal pool generation to ensure code addresses match real pass. */
   if (dry_run_state.active)
@@ -3080,7 +3149,7 @@ int ot(thumb_opcode op)
        * code size including the literal pool, so that ind matches
        * between dry-run and real pass. */
       const int max_offset = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4;
-      if (max_offset >= 1020)
+      if (max_offset >= 1020 && !op_in_it_block)
       {
         th_literal_pool_generate();
       }
@@ -3095,7 +3164,7 @@ int ot(thumb_opcode op)
     thumb_gen_state.code_size += op.size;
     // 16-bit encoding for ldr should be efficient
     const int max_offset = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4;
-    if (max_offset >= 1020)
+    if (max_offset >= 1020 && !op_in_it_block)
     {
       th_literal_pool_generate();
     }
@@ -3744,6 +3813,14 @@ ST_FUNC int tcc_gen_machine_try_strd_imm_spill(int64_t val1, int64_t val2,
     return 0;
 
   MachineCodegenContext ctx = {0};
+  /* Materializing the immediates may PUSH the scratch register(s) when FP is
+   * omitted and no scratch-save area is reserved, lowering SP by 4 per push.
+   * The STRD destination is SP-relative, so an uncompensated offset would write
+   * the pair 4*pushes bytes below the intended slot — the array/struct
+   * initializer then lands at the wrong offset and later reads return stale
+   * data (fuzz seed 12057).  Snapshot the push stack so we can measure the SP
+   * shift after acquiring the registers and fold it into the offset. */
+  int spc_before = scratch_push_count;
   MachineOperand op1 = {.kind = MACH_OP_IMM, .u.imm.val = val1};
   int r1 = mach_ensure_in_reg(&ctx, &op1, 0);
   int r2;
@@ -3756,6 +3833,25 @@ ST_FUNC int tcc_gen_machine_try_strd_imm_spill(int64_t val1, int64_t val2,
   if (r1 == R_SP || r2 == R_SP) {
     mach_release_all(&ctx);
     return 0;
+  }
+  /* Account for any real SP-lowering pushes (type 1) done above.  Saves routed
+   * to a reserved scratch area (type 2) keep SP stable and need no adjustment.
+   * The shift only affects an SP-relative base; an FP base is unperturbed. */
+  if (base_reg == R_SP) {
+    int sp_shift = 0;
+    for (int s = spc_before; s < scratch_push_count && s < 128; s++)
+      if (scratch_push_type[s] == 1)
+        sp_shift += 4;
+    if (sp_shift) {
+      /* Only the positive (above-SP) local case is safe to compensate by simple
+       * addition; a negative (below-SP) offset combined with the shift is rare
+       * and not worth special-casing — fall back to per-element stores. */
+      if (sign || abs_off + sp_shift > 1020) {
+        mach_release_all(&ctx);
+        return 0;
+      }
+      abs_off += sp_shift;
+    }
   }
   const uint32_t puw = sign ? 4u : 6u;
   ot_check(th_strd_imm((uint32_t)r1, (uint32_t)r2, (uint32_t)base_reg, abs_off, puw));
@@ -5505,6 +5601,31 @@ static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const M
     }
   }
 
+  /* Shift-by-0 identity: on ARM, LSR/ASR with immediate field 0 means
+   * shift-by-32 (yielding 0 / sign-extend), NOT shift-by-0.  Fold x >> 0
+   * to a plain MOV Rd, Rm so the semantics are correct regardless of
+   * whether the optimizer managed to simplify the IR. */
+  if (!dest_sets_flags && barrel_shift == 0 &&
+      (op == TCCIR_OP_SHR || op == TCCIR_OP_SAR || op == TCCIR_OP_ROR) &&
+      src2->kind == MACH_OP_IMM && !src2->needs_deref && !src2->is_64bit &&
+      (uint32_t)src2->u.imm.val == 0)
+  {
+    int dest_reg = mach_get_dest_reg(&mctx, dest, 0);
+    uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+    int src1_reg = mach_ensure_in_reg(&mctx, src1, excl);
+    ot_check_mov_reg((uint32_t)dest_reg, (uint32_t)src1_reg, flags,
+                     THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    if (dest->kind != MACH_OP_NONE)
+    {
+      const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
+                            (dest->kind == MACH_OP_REG && (dest->needs_deref || dest->u.reg.r0 == (int)PREG_REG_NONE));
+      if (needs_wb)
+        mach_writeback_dest(dest, dest_reg);
+    }
+    mach_release_all(&mctx);
+    return;
+  }
+
   /* UXTB/UXTH fast path: AND with #0xFF or #0xFFFF → UXTB/UXTH.
    * 16-bit encoding (2 bytes) vs 32-bit AND immediate (4 bytes). */
   if (op == TCCIR_OP_AND && !dest_sets_flags && barrel_shift == 0 &&
@@ -5836,8 +5957,14 @@ static void mach_regonly_binop_mop(MachineCodegenContext *ctx, const MachineOper
   uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
 
   /* Pre-exclude src2's physical register so that loading src1 (which may
-   * need a scratch for deref) does not clobber src2's value. */
-  if (src2->kind == MACH_OP_REG && !src2->needs_deref && thumb_is_hw_reg(src2->u.reg.r0))
+   * need a scratch for deref) does not clobber src2's value.  This must apply
+   * even when src2 is a DEREF operand: its register holds the pointer, and the
+   * step-3 load reads through that same register, so it has to survive src1's
+   * materialization.  Omitting the deref case let src1's scratch land on the
+   * pointer register at high pressure -> `u6 * arr10[3]` dereferenced u6 as a
+   * pointer -> bus fault (fuzz switch 219754). Matches the data-processing
+   * guard in thumb_emit_data_processing_mop32. */
+  if (src2->kind == MACH_OP_REG && thumb_is_hw_reg(src2->u.reg.r0))
     excl |= (1u << (uint32_t)src2->u.reg.r0);
 
   /* 2. Ensure src1 in a register; extend exclusion mask. */
@@ -5862,6 +5989,16 @@ static void mach_mod_mop(MachineCodegenContext *ctx, const MachineOperand *src1,
   /* 1. Get dest register. */
   int dest_reg = mach_get_dest_reg(ctx, dest, 0);
   uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+
+  /* Pre-exclude src2's physical register so that materializing src1 (which may
+   * need a scratch when it is an immediate or a deref) does not clobber src2's
+   * value before the divide reads it — same guard as mach_regonly_binop_mop.
+   * Without it an immediate dividend's scratch load could land on the divisor's
+   * register (random-C O1 wrong-code, seed 151: `K % (lr|1)` divisor clobbered).
+   * Applies to the deref case too (pointer register must survive src1's
+   * materialization, same as mach_regonly_binop_mop / fuzz switch 219754). */
+  if (src2->kind == MACH_OP_REG && thumb_is_hw_reg(src2->u.reg.r0))
+    excl |= (1u << (uint32_t)src2->u.reg.r0);
 
   /* 2. Ensure src1 in a register. */
   int src1_reg = mach_ensure_in_reg(ctx, src1, excl);
@@ -6580,18 +6717,23 @@ ST_FUNC void tcc_gen_machine_mla_mop(MachineOperand src1, MachineOperand src2, M
 
   /* Pre-exclude registers directly referenced by REG operands so that scratch
    * allocations for other operands (e.g. immediates) cannot clobber them.
+   * A dereferenced operand's r0 is its POINTER register — it must survive
+   * until that operand's load is emitted, so it is excluded exactly like a
+   * plain value register (ptr fuzz seed 59549: src2's spill reload picked the
+   * deref-accumulator's pointer register as scratch, and the accumulator then
+   * dereferenced the just-loaded multiplicand value → wild-address fault).
    * The pre-allocated DEST register must be excluded too: if a source load
    * grabs it as a saved scratch (push/pop), the restoring pop after the MLA
    * overwrites the just-computed result. */
   uint32_t live_regs = 0;
-  if (src1.kind == MACH_OP_REG && !src1.needs_deref)
+  if (src1.kind == MACH_OP_REG && src1.u.reg.r0 >= 0 && src1.u.reg.r0 < 16)
     live_regs |= (1u << (uint32_t)src1.u.reg.r0);
-  if (src2.kind == MACH_OP_REG && !src2.needs_deref)
+  if (src2.kind == MACH_OP_REG && src2.u.reg.r0 >= 0 && src2.u.reg.r0 < 16)
     live_regs |= (1u << (uint32_t)src2.u.reg.r0);
-  if (accum.kind == MACH_OP_REG && !accum.needs_deref)
+  if (accum.kind == MACH_OP_REG && accum.u.reg.r0 >= 0 && accum.u.reg.r0 < 16)
     live_regs |= (1u << (uint32_t)accum.u.reg.r0);
-  if (dest.kind == MACH_OP_REG && !dest.needs_deref &&
-      dest.u.reg.r0 != (int)PREG_REG_NONE)
+  if (dest.kind == MACH_OP_REG &&
+      dest.u.reg.r0 != (int)PREG_REG_NONE && dest.u.reg.r0 >= 0 && dest.u.reg.r0 < 16)
     live_regs |= (1u << (uint32_t)dest.u.reg.r0);
 
   int src1_reg = mach_ensure_in_reg(&ctx, &src1, live_regs);
@@ -6757,6 +6899,13 @@ ST_FUNC int tcc_gen_machine_mlal_accum_mop(MachineOperand src1, MachineOperand s
   s2.is_64bit = false;
 
   uint32_t excl = (1u << (uint32_t)rd_lo) | (1u << (uint32_t)rd_hi);
+  /* Pre-exclude both sources' registers (a deref operand's r0 is its pointer
+   * register) so ensuring one source cannot grab the other's register as a
+   * spill-reload scratch — same clobber class as tcc_gen_machine_mla_mop. */
+  if (s1.kind == MACH_OP_REG && s1.u.reg.r0 >= 0 && s1.u.reg.r0 < 16)
+    excl |= (1u << (uint32_t)s1.u.reg.r0);
+  if (s2.kind == MACH_OP_REG && s2.u.reg.r0 >= 0 && s2.u.reg.r0 < 16)
+    excl |= (1u << (uint32_t)s2.u.reg.r0);
   int rn = mach_ensure_in_reg(&ctx, &s1, excl);
   if (thumb_is_hw_reg(rn))
     excl |= (1u << (uint32_t)rn);
@@ -7088,8 +7237,13 @@ ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, 
     uint32_t excl = thumb_is_hw_reg(lo_reg) ? (1u << (uint32_t)lo_reg) : 0u;
     int hi_reg = mach_get_dest_reg(&mctx, &dst_hi, excl);
 
-    /* Emit ITE sequence for lo word. */
-    th_literal_pool_reserve_upcoming_bytes(6);
+    /* Emit ITE sequence for lo word.  Reserve the WHOLE atomic ITE+movs block so
+     * a literal-pool flush never lands between the IT and its conditioned movs.
+     * A high register (R8-R12) dest forces the 4-byte mov.w (T2) encoding, so the
+     * worst case is ITE(2) + 3*mov.w(4) = 14 bytes — NOT 6 (which only covers the
+     * 2-byte movs of a low-reg dest).  Under-reserving split the ITE and ran the
+     * fall-through into the literal pool (seed 89 O1 HardFault). */
+    th_literal_pool_reserve_upcoming_bytes(14);
     ot_check(th_it(cond, ite_mask)); /* ITE <cond> — two conditioned instructions */
     ot_check(th_mov_imm(lo_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     ot_check(th_mov_imm(lo_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
@@ -7103,7 +7257,11 @@ ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, 
   {
     int dest_reg = mach_get_dest_reg(&mctx, &dest, 0);
 
-    th_literal_pool_reserve_upcoming_bytes(6);
+    /* Reserve the whole ITE+2-movs block: a high-register dest (R8-R12) uses the
+     * 4-byte mov.w (T2) encoding, so the worst case is ITE(2) + 2*mov.w(4) = 10
+     * bytes, not 6.  Under-reserving let a literal-pool flush split the ITE and
+     * run the fall-through into the pool (seed 89 O1 HardFault). */
+    th_literal_pool_reserve_upcoming_bytes(10);
     ot_check(th_it(cond, ite_mask)); /* ITE <cond> — two conditioned instructions */
     ot_check(th_mov_imm(dest_reg, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
     ot_check(th_mov_imm(dest_reg, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE));
@@ -9408,6 +9566,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   /* MOV-coalescing cache is per-function: register live ranges don't
    * cross function boundaries. */
   mov_equiv_reset_all();
+  pool_flush_it_pending = 0;
   TCCIRState *ir = tcc_state->ir;
 
   /* Determine if LR needs saving */
@@ -12000,6 +12159,13 @@ static int can_narrow_backward_branch(int32_t target_ir, int is_conditional, int
   if (offset >= 0)
     return 0;
 
+  /* If emitting the narrow branch would first flush a pending literal pool,
+   * the branch source moves forward after this range check.  A borderline
+   * T1/T2 branch can become out of range by the time backpatching runs, and
+   * th_patch_call() cannot widen an already-emitted 16-bit branch in place. */
+  if (th_literal_pool_would_flush_for(2))
+    return 0;
+
   return is_conditional ? branch_fits_t1(offset) : branch_fits_t2(offset);
 }
 
@@ -12399,7 +12565,7 @@ ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROp
    * Compute dest address into r0 BEFORE pushing lr, since the address is
    * sp-relative and pushing changes sp.  The BL to memcpy clobbers lr,
    * so we must save/restore it for leaf functions whose prologue didn't. */
-  if (size >= 64)
+  if (size >= TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES)
   {
     tcc_machine_addr_of_stack_slot(R0, frame_offset, 0 /* not param */);
     tcc_machine_load_constant(R1, PREG_REG_NONE, symref->addend, 0, sym);

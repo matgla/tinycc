@@ -957,6 +957,8 @@ ST_FUNC void tccelf_delete(TCCState *s1)
   dynarray_reset(&s1->priv_sections, &s1->nb_priv_sections);
 
   tcc_free(s1->sym_attrs);
+  s1->sym_attrs = NULL;
+  s1->nb_sym_attrs = 0;
   symtab_section = NULL; /* for tccrun.c:rt_printline() */
 }
 
@@ -5036,7 +5038,8 @@ typedef struct SectionMergeInfo
 ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) * h)
 {
   int size = full_read(fd, h, sizeof *h);
-  if (size == sizeof *h && 0 == memcmp(h, ELFMAG, 4))
+  if (size == sizeof *h && 0 == memcmp(h, ELFMAG, 4) &&
+      h->e_ident[EI_CLASS] == ELFCLASSW)
   {
     if (h->e_type == ET_REL)
       return AFF_BINTYPE_REL;

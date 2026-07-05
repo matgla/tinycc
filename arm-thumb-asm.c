@@ -199,7 +199,7 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
   r = sv->r;
   if ((r & VT_VALMASK) == VT_CONST)
   {
-    if (!(r & VT_LVAL) && modifier != 'c' && modifier != 'n' && modifier != 'P')
+    if (!(r & VT_LVAL) && modifier != 'c' && modifier != 'P')
       cstr_ccat(add_str, '#');
     if (r & VT_SYM)
     {
@@ -218,12 +218,16 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
       cstr_cat(add_str, name, -1);
       if ((uint32_t)sv->c.i == 0)
         goto no_offset;
-      cstr_ccat(add_str, '+');
     }
     val = sv->c.i;
     if (modifier == 'n')
       val = -val;
-    cstr_printf(add_str, "%d", (int)sv->c.i);
+    /* Separate a symbol from a positive offset with '+'; a negative offset
+       already carries its own '-' from the %d formatting, so emitting '+'
+       unconditionally would wrongly produce "sym+-5". */
+    if ((r & VT_SYM) && val >= 0)
+      cstr_ccat(add_str, '+');
+    cstr_printf(add_str, "%d", val);
   no_offset:;
   }
   else if ((r & VT_VALMASK) == VT_LOCAL)
@@ -962,7 +966,7 @@ static uint8_t thumb_build_it_mask(const char *pattern, uint16_t condition)
       return mask;
     }
 
-    if (tolower(pattern[i] == 't'))
+    if (tolower(pattern[i]) == 't')
     {
       mask |= (condition << (5 - i));
     }
@@ -1173,6 +1177,23 @@ static int __attribute__((unused)) get_base_instruction_name(const char *token_s
 }
 
 /* ========================================================================
+ * Return 1 if `token` is one of the predefined ARM Thumb instruction mnemonic
+ * tokens (allocated by the DEF_ASM_BASE macros in thumb-tok.h at init time).
+ *
+ * The thumb mnemonic tokens are the last block of builtin token ids: they run
+ * contiguously from TOK_ASM_nop (the first DEF_ASM_BASE) up to the sentinel
+ * TOK_BUILTIN_END, so a simple range test identifies them and is robust to
+ * appending new mnemonics at the end of thumb-tok.h. Written-out conditional
+ * forms like "addal" are never predefined -- they are freshly tok_alloc'd
+ * identifiers with ids at/above TOK_BUILTIN_END -- so they fall outside this
+ * range and still get their condition suffix stripped by the caller.
+ * ======================================================================== */
+static int thumb_token_is_known_mnemonic(int token)
+{
+  return token >= TOK_ASM_nop && token < TOK_BUILTIN_END;
+}
+
+/* ========================================================================
  * Parse assembly instruction token to extract base token and condition code
  * Input:  token - the token ID to parse
  * Output: base_token - receives the base instruction token ID (e.g., TOK_ASM_add)
@@ -1180,13 +1201,24 @@ static int __attribute__((unused)) get_base_instruction_name(const char *token_s
  * ======================================================================== */
 ST_FUNC int thumb_parse_token_suffix(int token, int *base_token)
 {
-  const char *token_str = get_tok_str(token, NULL);
   char base_buf[32];
   int base_len;
   int condition = COND_AL; /* Default: always (no suffix) */
 
   /* Reset width qualifier */
   current_asm_suffix.width = WIDTH_NONE;
+
+  /* Table-aware condition stripping: if the token is itself a predefined
+     mnemonic, never strip a trailing "al"/other condition code from it.
+     Otherwise real bases like smlal/umlal would be mis-split into sml/uml
+     once COND_NAMES_COUNT is large enough to search the "al" entry. */
+  if (thumb_token_is_known_mnemonic(token))
+  {
+    *base_token = token;
+    return COND_AL;
+  }
+
+  const char *token_str = get_tok_str(token, NULL);
 
   if (!token_str)
   {
@@ -2891,13 +2923,13 @@ uint32_t thumb_parse_special_register(int token)
   {
     return 0x10;
   }
-  else if (strstr(buffer, "basepri") != NULL)
-  {
-    return 0x11;
-  }
   else if (strstr(buffer, "basepri_max") != NULL)
   {
     return 0x12;
+  }
+  else if (strstr(buffer, "basepri") != NULL)
+  {
+    return 0x11;
   }
   else if (strstr(buffer, "faultmask") != NULL)
   {

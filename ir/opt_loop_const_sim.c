@@ -31,6 +31,7 @@
 #include "ir.h"
 #include "opt.h"
 #include "opt_engine.h"
+#include "opt_alias.h"
 #include "opt_loop_const_sim.h"
 #include "opt_loop_utils.h"
 #include "opt_utils.h"
@@ -49,6 +50,8 @@ typedef struct LcsSlot
   int     known;
   int64_t value;
   int     btype;    /* IROP_BTYPE_INT32 / INT64 / FLOAT32 / FLOAT64 */
+  int     is_unsigned; /* sign of a narrow (INT8/INT16) value — needed so the
+                          residual is zero- vs sign-extended correctly */
   int     is_addr;  /* value is a stack offset (Addr[StackLoc[value]]) */
 } LcsSlot;
 
@@ -67,6 +70,7 @@ typedef struct LcsMemSlot
   int32_t offset;          /* stack offset (negative = local) */
   int64_t value;
   int     btype;
+  int     is_unsigned;     /* sign of a narrow store — see LcsSlot.is_unsigned */
   int     known;           /* current value is known */
   int     written;         /* sim wrote to this slot at least once */
   int64_t initial_value;   /* value before the loop (if initial_known) */
@@ -106,11 +110,37 @@ static LcsMemSlot *lcs_mem_get(LcsState *st, int32_t offset)
   s->offset = offset;
   s->value = 0;
   s->btype = IROP_BTYPE_INT32;
+  s->is_unsigned = 0;
   s->known = 0;
   s->written = 0;
   s->initial_value = 0;
   s->initial_known = 0;
   return s;
+}
+
+/* A store of `width` bytes at `offset` also clobbers any OTHER tracked slot
+ * whose byte range overlaps it.  Slots are keyed by exact offset with no
+ * width awareness, so a packed-bitfield byte store at word_off+3 must mark
+ * the word's slot unknown (and vice versa) — otherwise the simulator folds
+ * a later RMW from the stale full-word value (bitfield seed 11840: byte-3
+ * b3 store ignored, the collapsed loop store wiped it back to 0). */
+static void lcs_mem_clobber_overlaps(LcsState *st, int32_t offset, int width,
+                                     const LcsMemSlot *keep)
+{
+  for (int i = 0; i < st->n_mem; i++)
+  {
+    LcsMemSlot *m = &st->mem[i];
+    if (m == keep)
+      continue;
+    int mw = ir_opt_store_btype_size_bytes(m->btype);
+    if (mw <= 0)
+      mw = 4;
+    if (m->offset < offset + width && m->offset + mw > offset)
+    {
+      m->known = 0;
+      m->initial_known = 0;
+    }
+  }
 }
 
 /* Resolve an operand to a stack offset when it is either:
@@ -326,6 +356,7 @@ static int lcs_write_operand(LcsState *st, IROperand op, int64_t value, int btyp
     st->vars[pos].known = 1;
     st->vars[pos].value = value;
     st->vars[pos].btype = btype;
+    st->vars[pos].is_unsigned = op.is_unsigned;
     st->vars[pos].is_addr = 0;
     return 1;
   }
@@ -336,6 +367,7 @@ static int lcs_write_operand(LcsState *st, IROperand op, int64_t value, int btyp
     st->tmps[pos].known = 1;
     st->tmps[pos].value = value;
     st->tmps[pos].btype = btype;
+    st->tmps[pos].is_unsigned = op.is_unsigned;
     st->tmps[pos].is_addr = 0;
     return 1;
   }
@@ -365,6 +397,7 @@ static int lcs_write_addr_operand(LcsState *st, IROperand op, int32_t stack_offs
   slot->known = 1;
   slot->value = stack_offset;
   slot->btype = IROP_BTYPE_INT32;
+  slot->is_unsigned = 0;
   slot->is_addr = 1;
   return 1;
 }
@@ -495,6 +528,40 @@ static int lcs_eval_softcall(int kind, int is_double, LcsState *st,
   return 1;
 }
 
+/* Evaluate a comparison whose operands are soft-float bit patterns (set by a
+ * cfcmp / cdcmp flag-setter).  b1/b2 are the raw 32- or 64-bit FP bits; tok is
+ * the same relational token evaluate_compare_condition uses.  Returns 1
+ * (taken), 0 (not taken), or -1 (unsupported token -> caller bails).
+ * Unordered (NaN) operands make every relation false except "!=", matching C
+ * and the ARM flag semantics the lowered branch tests. */
+static int lcs_evaluate_fp_compare(int64_t b1, int64_t b2, int tok, int is_double)
+{
+  double a, b;
+  if (is_double)
+  {
+    union { double d; uint64_t u; } x, y;
+    x.u = (uint64_t)b1; y.u = (uint64_t)b2;
+    a = x.d; b = y.d;
+  }
+  else
+  {
+    union { float f; uint32_t u; } x, y;
+    x.u = (uint32_t)b1; y.u = (uint32_t)b2;
+    a = (double)x.f; b = (double)y.f;
+  }
+  int unordered = (a != a) || (b != b);
+  switch (tok)
+  {
+  case 0x94: /* TOK_EQ  */ return !unordered && (a == b);
+  case 0x95: /* TOK_NE  */ return unordered || (a != b);
+  case 0x9c: /* TOK_LT  */ return !unordered && (a < b);
+  case 0x9d: /* TOK_GE  */ return !unordered && (a >= b);
+  case 0x9e: /* TOK_LE  */ return !unordered && (a <= b);
+  case 0x9f: /* TOK_GT  */ return !unordered && (a > b);
+  default:                 return -1; /* unsigned/unknown token: bail */
+  }
+}
+
 static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
                         int start_idx, int end_idx, int cmp_idx, int jmpif_idx,
                         int exit_target)
@@ -549,6 +616,7 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
         st->vars[dpos].known = 1;
         st->vars[dpos].value = store_val;
         st->vars[dpos].btype = dbt;
+        st->vars[dpos].is_unsigned = dest.is_unsigned;
         st->vars[dpos].is_addr = 0;
         recorded_in_var = 1;
       }
@@ -595,8 +663,15 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
     if (!ms) { r.action = 0; return r; }
     ms->value = store_val;
     ms->btype = dbt;
+    ms->is_unsigned = dest.is_unsigned;
     ms->known = 1;
     ms->written = 1;
+    {
+      int sw = ir_opt_store_btype_size_bytes(dbt);
+      if (sw <= 0)
+        sw = 4;
+      lcs_mem_clobber_overlaps(st, off, sw, ms);
+    }
     return r;
   }
 
@@ -762,7 +837,13 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
       return r;
     }
     int tok = (int)irop_get_imm64_ex(ir, src1);
-    int taken = evaluate_compare_condition(st->cmp_v1, st->cmp_v2, tok);
+    /* A compare flagged by a soft-float helper (cfcmp / cdcmp) holds raw FP
+     * bit patterns in cmp_v1/cmp_v2; evaluating them as integers is wrong for
+     * any operand whose sign bit is set (a negative float bit pattern reads as
+     * a huge unsigned int).  Reinterpret and compare as float/double. */
+    int taken = st->cmp_is_fp
+                    ? lcs_evaluate_fp_compare(st->cmp_v1, st->cmp_v2, tok, st->cmp_is_double)
+                    : evaluate_compare_condition(st->cmp_v1, st->cmp_v2, tok);
     if (taken < 0)
     {
       r.action = 0;
@@ -1145,6 +1226,23 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
         q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
         q->op == TCCIR_OP_TRAP)
       continue;
+    /* A pre-loop write through a computed/indexed address (STORE_INDEXED,
+     * STORE_POSTINC) or a bulk copy (BLOCK_COPY) can land on ANY stack slot:
+     * the direct- and known-address STORE seeding below cannot resolve its
+     * target offset, so without this an overwritten slot would keep the stale
+     * value of an EARLIER direct store.  Conservatively demote every tracked
+     * memory slot to flow-unsafe so the simulator never trusts a stale initial
+     * value.  (agg_deep seed 47: `st12.f2 = st12.f0 ^ *p` lowers to a
+     * `STORE_INDEXED #4` off `&st12`, overwriting the slot the loop body then
+     * copies into `st12.f0`; missing that store folded the copy to f2's stale
+     * initializer constant.)  The base/pointer vreg is still demoted by the
+     * generic dest handling below, so we do not skip the rest of the loop. */
+    if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC ||
+        q->op == TCCIR_OP_BLOCK_COPY)
+    {
+      for (int m = 0; m < st->n_mem; m++)
+        mem_flow_unsafe[m] = 1;
+    }
     if (!irop_config[q->op].has_dest) continue;
     IROperand d = tcc_ir_op_get_dest(ir, q);
     if (d.is_llocal || d.is_sym) continue;
@@ -1160,6 +1258,14 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
       LcsMemSlot *ms = lcs_mem_get(st, off);
       if (!ms) continue;
       int mem_idx = (int)(ms - st->mem);
+      /* A pre-loop store also clobbers overlapping slots tracked at OTHER
+       * offsets (packed sub-word accesses of the same word). */
+      {
+        int sw = ir_opt_store_btype_size_bytes(irop_get_btype(d));
+        if (sw <= 0)
+          sw = 4;
+        lcs_mem_clobber_overlaps(st, off, sw, ms);
+      }
       if (mem_flow_unsafe[mem_idx])
         continue;
       if (irop_is_immediate(s1))
@@ -1210,6 +1316,62 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
       }
       continue;
     }
+    /* Indirect STORE through a known stack-address temp/var:
+     *   T <- Addr[StackLoc[off]] ; T***DEREF*** <- value
+     * The body simulator resolves exactly this form (see the TCCIR_OP_STORE
+     * case in lcs_step), so the pre-loop scan must too: otherwise a pre-loop
+     * write through an address alias is dropped, leaving the slot's initial
+     * value stale and mis-seeding the simulation (bitfield seed 5 -- a packed
+     * RMW of b1 via Addr[bf], then a loop RMW of b2 in the same word; the
+     * missed b1 store made the residual store clobber b1 back to 0). */
+    if (q->op == TCCIR_OP_STORE && d.is_lval)
+    {
+      int32_t avr = irop_get_vreg(d);
+      if (avr >= 0)
+      {
+        int atype = TCCIR_DECODE_VREG_TYPE(avr);
+        int apos  = TCCIR_DECODE_VREG_POSITION(avr);
+        const LcsSlot *aslot = NULL;
+        if (atype == TCCIR_VREG_TYPE_VAR && apos < st->n_vars)
+          aslot = &st->vars[apos];
+        else if (atype == TCCIR_VREG_TYPE_TEMP && apos < st->n_tmps)
+          aslot = &st->tmps[apos];
+        if (aslot && aslot->known && aslot->is_addr)
+        {
+          int32_t off = (int32_t)aslot->value;
+          LcsMemSlot *ms = lcs_mem_get(st, off);
+          if (ms)
+          {
+            int mem_idx = (int)(ms - st->mem);
+            {
+              int sw = ir_opt_store_btype_size_bytes(irop_get_btype(d));
+              if (sw <= 0)
+                sw = 4;
+              lcs_mem_clobber_overlaps(st, off, sw, ms);
+            }
+            if (!mem_flow_unsafe[mem_idx])
+            {
+              IROperand s1 = tcc_ir_op_get_src1(ir, q);
+              if (irop_is_immediate(s1))
+              {
+                ms->value = irop_get_imm64_ex(ir, s1);
+                ms->btype = irop_get_btype(d);
+                ms->known = 1;
+                ms->initial_value = ms->value;
+                ms->initial_known = 1;
+                mem_has_def[mem_idx] = 1;
+              }
+              else
+              {
+                ms->known = 0;
+                ms->initial_known = 0;
+              }
+            }
+          }
+          continue;
+        }
+      }
+    }
     if (d.is_local && !d.is_lval) continue;
     int32_t vr = irop_get_vreg(d);
     if (vr < 0) continue;
@@ -1255,6 +1417,47 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
       else
       {
         /* Non-constant assignment overwrites the slot.  Demote. */
+        slot->known = 0;
+        *has_def = 0;
+      }
+    }
+    else if (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
+    {
+      /* Address arithmetic: `T = <stack address> +/- immediate` produces
+       * another stack address.  lcs_step models this (see the ADD/SUB case),
+       * so the pre-loop scan must too — otherwise a later indirect store
+       * through the result (`T = &arr + 4; *T = v`) can't resolve its target
+       * slot and leaves that slot's stale initializer in the memory map
+       * (combo_num seed 872: `arr12[u11&7] = ...` lowers to
+       * `T = Addr[StackLoc] ADD #4; *T = <runtime>`, and missing it let the
+       * unrolled/simulated loop read arr12[1]'s .data initializer instead). */
+      IROperand s1 = tcc_ir_op_get_src1(ir, q);
+      IROperand s2 = tcc_ir_op_get_src2(ir, q);
+      int32_t base_off;
+      if (lcs_resolve_stack_addr(st, s1, &base_off) && (!s1.is_lval || s1.is_local) &&
+          irop_is_immediate(s2) && !s2.is_sym)
+      {
+        int64_t imm = irop_get_imm64_ex(ir, s2);
+        slot->known = 1;
+        slot->value = (q->op == TCCIR_OP_ADD) ? (base_off + imm) : (base_off - imm);
+        slot->btype = IROP_BTYPE_INT32;
+        slot->is_addr = 1;
+        *has_def = 1;
+      }
+      else if (q->op == TCCIR_OP_ADD &&
+               lcs_resolve_stack_addr(st, s2, &base_off) && (!s2.is_lval || s2.is_local) &&
+               irop_is_immediate(s1) && !s1.is_sym)
+      {
+        int64_t imm = irop_get_imm64_ex(ir, s1);
+        slot->known = 1;
+        slot->value = base_off + imm;
+        slot->btype = IROP_BTYPE_INT32;
+        slot->is_addr = 1;
+        *has_def = 1;
+      }
+      else
+      {
+        /* addr - addr, addr +/- runtime, etc.: not a resolvable address. */
         slot->known = 0;
         *has_def = 0;
       }
@@ -1343,6 +1546,16 @@ static int lcs_var_used_after(TCCIRState *ir, int var_pos, int from_idx)
 {
   int n = ir->next_instruction_index;
   int32_t target_vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, var_pos);
+  /* This is a linear scan over instruction *indices*, which only reflects
+   * control flow while the path stays straight-line.  A redefinition therefore
+   * kills the loop's value only in the straight-line prefix from the loop exit:
+   * once we pass any branch, a later redefinition may sit in a sibling
+   * (not-taken) branch while the real use is reached via another path.  That is
+   * exactly fuzz seed 8985 — the loop is in an `if` branch, the value is read
+   * after the merge, and the `else` branch redefines the same VAR at a lower
+   * index than that read.  Honouring the kill there wrongly dropped the loop's
+   * residual store, leaving the variable at its pre-loop value. */
+  int saw_branch = 0;
   for (int i = from_idx; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -1357,12 +1570,16 @@ static int lcs_var_used_after(TCCIRState *ir, int var_pos, int from_idx)
       IROperand s = tcc_ir_op_get_src2(ir, q);
       if (irop_get_vreg(s) == target_vr) return 1;
     }
-    /* A redefinition kills any need to preserve the loop's value */
-    if (irop_config[q->op].has_dest)
+    /* A redefinition kills the loop's value only when it is unconditionally
+     * reached from the loop exit (no branch in between). */
+    if (!saw_branch && irop_config[q->op].has_dest)
     {
       IROperand d = tcc_ir_op_get_dest(ir, q);
       if (!d.is_lval && irop_get_vreg(d) == target_vr) return 0;
     }
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP ||
+        q->op == TCCIR_OP_SWITCH_TABLE)
+      saw_branch = 1;
   }
   return 0;
 }
@@ -1565,7 +1782,28 @@ static int lcs_try_fold(TCCIRState *ir, IRLoop *loop)
   if (have_iv_trip && exit_target > eff_end + 1) {
     if (exit_target - eff_start > 512)
       return 0;
+    int orig_end = eff_end;
     eff_end = exit_target - 1;
+    /* The extension assumes [orig_end+1 .. eff_end] is rotated loop body,
+     * reachable only through the loop's own control flow.  If an instruction
+     * OUTSIDE the loop jumps INTO this absorbed region, it is not loop body
+     * at all but a separate block that merely sits between the back-edge and
+     * the exit target — e.g. the ELSE arm of a guard whose THEN arm holds the
+     * loop: the guard's false-branch JUMP lands on the else block, which lies
+     * before the join.  Folding it into the loop would NOP the else block and
+     * misroute the guard jump to the exit, dropping the else body entirely
+     * (longlong seed 2426).  The caller's ext_entry check only covered the
+     * pre-extension range, so re-check the newly-absorbed tail here. */
+    int nn = ir->next_instruction_index;
+    for (int j = 0; j < nn; j++)
+    {
+      if (j >= eff_start && j <= eff_end) continue;
+      IRQuadCompact *jq = &ir->compact_instructions[j];
+      if (jq->op != TCCIR_OP_JUMP && jq->op != TCCIR_OP_JUMPIF) continue;
+      int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq));
+      if (jt > orig_end && jt <= eff_end)
+        return 0;
+    }
   }
 
   if (!have_iv_trip)
@@ -1652,6 +1890,7 @@ static int lcs_try_fold(TCCIRState *ir, IRLoop *loop)
         st.vars[pos].known = 1;
         st.vars[pos].value = iv->init_val;
         st.vars[pos].btype = IROP_BTYPE_INT32;
+        st.vars[pos].is_unsigned = 0;
         st.vars[pos].is_addr = 0;
       }
     }
@@ -1819,6 +2058,12 @@ static int lcs_try_fold(TCCIRState *ir, IRLoop *loop)
     int btype = st.vars[p].btype ? st.vars[p].btype : IROP_BTYPE_INT32;
     int32_t vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, p);
     IROperand d = irop_make_vreg(vr, btype);
+    /* Preserve the sign of a narrow (INT8/INT16) VAR.  st.vars[p].value holds
+     * the un-narrowed simulated value; downstream const-prop narrows it to the
+     * residual's width via ir_opt_fit_const_to_operand, which sign- vs
+     * zero-extends based on is_unsigned.  Dropping this flag would sign-extend
+     * an unsigned char (e.g. 254 -> -2) and miscompile. */
+    d.is_unsigned = st.vars[p].is_unsigned;
     int64_t val = st.vars[p].value;
     IROperand s;
     if (btype == IROP_BTYPE_FLOAT64)
@@ -1857,6 +2102,7 @@ static int lcs_try_fold(TCCIRState *ir, IRLoop *loop)
     int btype = ms->btype ? ms->btype : IROP_BTYPE_INT32;
     IROperand d = irop_make_stackoff(-1, ms->offset, /*is_lval*/ 1,
                                      /*is_llocal*/ 0, /*is_param*/ 0, btype);
+    d.is_unsigned = ms->is_unsigned;
     int64_t val = ms->value;
     IROperand s;
     if (btype == IROP_BTYPE_FLOAT64)
@@ -1972,6 +2218,80 @@ int tcc_ir_opt_loop_const_sim(TCCIRState *ir)
     if (loop->depth > 1) continue;
     /* Skip very large loop ranges to keep cost bounded */
     if (loop->end_idx - loop->start_idx > 256) continue;
+
+    /* Skip loops that have external entries into the body (not to the
+     * header) — same guard as try_unroll_loop_ex/opt_loop.c.
+     * tcc_ir_detect_loops flags ANY JUMP/JUMPIF whose numeric target is
+     * lower than its own index as a loop back edge, with no dominance
+     * check.  A switch's case-body-before-dispatch layout (the dispatch
+     * jumps forward in control flow to a case handler that was laid out
+     * earlier in instruction order) satisfies that test without being a
+     * loop at all: the dispatch's own entry jump lands inside the "body"
+     * but not at the "header", which a real loop never does.  Simulating
+     * such a false loop executes switch-case code as if it were a
+     * repeating body, corrupting the result (seed 589, switch profile). */
+    int ext_entry = 0;
+    for (int j = 0; j < ir->next_instruction_index && !ext_entry; j++)
+    {
+      if (j >= loop->start_idx && j <= loop->end_idx)
+        continue; /* skip instructions inside the loop itself */
+      IRQuadCompact *jq = &ir->compact_instructions[j];
+      if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF)
+      {
+        IROperand jdest = tcc_ir_op_get_dest(ir, jq);
+        int jtarget = (int)irop_get_imm64_ex(ir, jdest);
+        if (jtarget > loop->start_idx && jtarget <= loop->end_idx)
+        {
+          LOG_IR_GEN("[LOOP-CONST-SIM] loop header=%d: external entry from [%d] to [%d], skipping",
+                     loop->header_idx, j, jtarget);
+          ext_entry = 1;
+        }
+      }
+    }
+    if (ext_entry)
+      continue;
+
+    /* LCS is only sound for register-only arithmetic.  The implementation has
+     * partial stack-memory modeling, but recent fuzz cases show stale aggregate
+     * values still escaping through indexed stores and packed RMW chains after
+     * simulation.  Keep memory-carrying loops for the normal IR pipeline. */
+    int has_memory = 0;
+    for (int bi = 0; bi < loop->num_body_instrs && !has_memory; bi++)
+    {
+      int idx = loop->body_instrs[bi];
+      if (idx < loop->start_idx || idx > loop->end_idx)
+        continue;
+      IRQuadCompact *mq = &ir->compact_instructions[idx];
+      if (mq->op == TCCIR_OP_LOAD || mq->op == TCCIR_OP_STORE ||
+          mq->op == TCCIR_OP_LOAD_INDEXED || mq->op == TCCIR_OP_STORE_INDEXED ||
+          mq->op == TCCIR_OP_LOAD_POSTINC || mq->op == TCCIR_OP_STORE_POSTINC ||
+          mq->op == TCCIR_OP_BLOCK_COPY)
+      {
+        has_memory = 1;
+        break;
+      }
+      if (irop_config[mq->op].has_src1)
+      {
+        IROperand s1 = tcc_ir_op_get_src1(ir, mq);
+        if (s1.is_lval)
+          has_memory = 1;
+      }
+      if (!has_memory && irop_config[mq->op].has_src2)
+      {
+        IROperand s2 = tcc_ir_op_get_src2(ir, mq);
+        if (s2.is_lval)
+          has_memory = 1;
+      }
+      if (!has_memory && mq->op == TCCIR_OP_MLA)
+      {
+        IROperand acc = tcc_ir_op_get_accum(ir, mq);
+        if (acc.is_lval)
+          has_memory = 1;
+      }
+    }
+    if (has_memory)
+      continue;
+
     changes += lcs_try_fold(ir, loop);
   }
 

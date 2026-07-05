@@ -1,0 +1,17 @@
+[Unit]
+Description=TinyCC metrics Grafana dashboard (podman compose)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Point this at a persistent clone of the repo on the Pi -- not the ephemeral
+# actions/checkout workspace the CI job uses. Edit before installing.
+WorkingDirectory=/opt/tcc-metrics/tinycc/metrics/grafana
+ExecStart=/usr/bin/podman-compose up -d
+ExecStop=/usr/bin/podman-compose down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

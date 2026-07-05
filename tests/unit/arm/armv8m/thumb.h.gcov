@@ -1,0 +1,789 @@
+        -:    0:Source:/home/mateusz/repos/tinycc/arch/arm/thumb/thumb.h
+        -:    0:Graph:build/arm-thumb-asm.gcno
+        -:    0:Data:build/arm-thumb-asm.gcda
+        -:    0:Runs:1
+        -:    1:/*
+        -:    2: *  TCC - Tiny C Compiler
+        -:    3: *
+        -:    4: *  Copyright (c) 2026 Mateusz Stadnik
+        -:    5: *
+        -:    6: * This library is free software; you can redistribute it and/or
+        -:    7: * modify it under the terms of the GNU Lesser General Public
+        -:    8: * License as published by the Free Software Foundation; either
+        -:    9: * version 2 of the License, or (at your option) any later version.
+        -:   10: *
+        -:   11: * This library is distributed in the hope that it will be useful,
+        -:   12: * but WITHOUT ANY WARRANTY; without even the implied warranty of
+        -:   13: * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+        -:   14: * Lesser General Public License for more details.
+        -:   15: *
+        -:   16: * You should have received a copy of the GNU Lesser General Public
+        -:   17: * License along with this library; if not, write to the Free Software
+        -:   18: * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+        -:   19: */
+        -:   20:
+        -:   21:#pragma once
+        -:   22:
+        -:   23:#include <stdbool.h>
+        -:   24:#include <stdint.h>
+        -:   25:#include <string.h>
+        -:   26:
+        -:   27:#include "log.h"
+        -:   28:
+        -:   29:static inline const char *th_reg_name(uint32_t r)
+        -:   30:{
+        -:   31:  static const char *names[] = {
+        -:   32:      "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "sp", "lr", "pc",
+        -:   33:  };
+        -:   34:  static char buf[16];
+        -:   35:  if (r < 16)
+        -:   36:    return names[r];
+        -:   37:  snprintf(buf, sizeof buf, "r%u", r);
+        -:   38:  return buf;
+        -:   39:}
+        -:   40:
+        -:   41:static inline const char *th_shift_name(int type)
+        -:   42:{
+        -:   43:  switch (type)
+        -:   44:  {
+        -:   45:  case 0:
+        -:   46:    return "none";
+        -:   47:  case 1:
+        -:   48:    return "rrx";
+        -:   49:  case 2:
+        -:   50:    return "lsl";
+        -:   51:  case 3:
+        -:   52:    return "lsr";
+        -:   53:  case 4:
+        -:   54:    return "asr";
+        -:   55:  case 5:
+        -:   56:    return "ror";
+        -:   57:  default:
+        -:   58:    return "?shift";
+        -:   59:  }
+        -:   60:}
+        -:   61:
+        -:   62:#if TCC_LOG_THOP
+        -:   63:#define THOP_TRACE(...) fprintf(stderr, __VA_ARGS__)
+        -:   64:#else
+        -:   65:#define THOP_TRACE(...)                                                                                                \
+        -:   66:  do                                                                                                                   \
+        -:   67:  {                                                                                                                    \
+        -:   68:  } while (0)
+        -:   69:#endif
+        -:   70:
+        -:   71:#if TCC_LOG_THUMB
+        -:   72:#define LOG(...) LOG_THUMB(__VA_ARGS__)
+        -:   73:#define TRACE(...) LOG_THUMB(__VA_ARGS__)
+        -:   74:#else
+        -:   75:#define LOG(...)                                                                                                       \
+        -:   76:  do                                                                                                                   \
+        -:   77:  {                                                                                                                    \
+        -:   78:  } while (0)
+        -:   79:#define TRACE(...)                                                                                                     \
+        -:   80:  do                                                                                                                   \
+        -:   81:  {                                                                                                                    \
+        -:   82:  } while (0)
+        -:   83:#endif
+        -:   84:
+        -:   85:#define ceil_div(x, d) ((x + (d - 1)) / d)
+        -:   86:
+        -:   87:#define R0 0
+        -:   88:#define R1 1
+        -:   89:#define R2 2
+        -:   90:#define R3 3
+        -:   91:#define R4 4
+        -:   92:#define R5 5
+        -:   93:#define R6 6
+        -:   94:#define R7 7
+        -:   95:#define R8 8
+        -:   96:#define R9 9
+        -:   97:#define R10 10
+        -:   98:#define R11 11
+        -:   99:#define R12 12
+        -:  100:#define R_IP R12
+        -:  101:#define R_SP 13
+        -:  102:#define R_LR 14
+        -:  103:#define R_PC 15
+        -:  104:
+        -:  105:#define R_FP R7
+        -:  106:
+        -:  107:typedef enum
+        -:  108:{
+        -:  109:  FLAGS_BEHAVIOUR_NOT_IMPORTANT = 0,
+        -:  110:  FLAGS_BEHAVIOUR_SET = 1,
+        -:  111:  FLAGS_BEHAVIOUR_BLOCK = 2,
+        -:  112:} thumb_flags_behaviour;
+        -:  113:
+        -:  114:typedef enum
+        -:  115:{
+        -:  116:  ENFORCE_ENCODING_NONE = 0,
+        -:  117:  ENFORCE_ENCODING_16BIT = 1,
+        -:  118:  ENFORCE_ENCODING_32BIT = 2,
+        -:  119:} thumb_enforce_encoding;
+        -:  120:
+        -:  121:typedef struct thumb_opcode
+        -:  122:{
+        -:  123:  uint8_t size;
+        -:  124:  uint32_t opcode;
+        -:  125:} thumb_opcode;
+        -:  126:
+        -:  127:typedef enum thumb_shift_type
+        -:  128:{
+        -:  129:  THUMB_SHIFT_NONE,
+        -:  130:  THUMB_SHIFT_RRX,
+        -:  131:  THUMB_SHIFT_LSL,
+        -:  132:  THUMB_SHIFT_LSR,
+        -:  133:  THUMB_SHIFT_ASR,
+        -:  134:  THUMB_SHIFT_ROR,
+        -:  135:} thumb_shift_type;
+        -:  136:
+        -:  137:typedef enum thumb_shift_mode
+        -:  138:{
+        -:  139:  THUMB_SHIFT_IMMEDIATE,
+        -:  140:  THUMB_SHIFT_REGISTER,
+        -:  141:} thumb_shift_mode;
+        -:  142:
+        -:  143:typedef struct thumb_shift
+        -:  144:{
+        -:  145:  thumb_shift_type type;
+        -:  146:  uint32_t value;
+        -:  147:  thumb_shift_mode mode;
+        -:  148:} thumb_shift;
+        -:  149:
+        -:  150:static const thumb_shift _thumb_shift_default_val = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
+        -:  151:#define THUMB_SHIFT_DEFAULT _thumb_shift_default_val
+        -:  152:
+        -:  153:typedef struct
+        -:  154:{
+        -:  155:  /* ───── implemented now (bits 0-15) ───── */
+        -:  156:  uint64_t t16 : 1;       /* 16-bit Thumb-1 (all profiles)      */
+        -:  157:  uint64_t t32 : 1;       /* 32-bit Thumb-2 wide encodings      */
+        -:  158:  uint64_t it : 1;        /* IT blocks                          */
+        -:  159:  uint64_t mod_imm : 1;   /* th_pack_const modified imm         */
+        -:  160:  uint64_t movw_movt : 1; /* movw/movt 16-bit imm moves         */
+        -:  161:  uint64_t dsp : 1;       /* sel, uadd8, usub8, pkhbt, qadd, …  */
+        -:  162:  uint64_t sat : 1;       /* ssat/usat                          */
+        -:  163:  uint64_t div : 1;       /* udiv/sdiv                          */
+        -:  164:  uint64_t bfx : 1;       /* bfi, bfc, sbfx, ubfx               */
+        -:  165:  uint64_t clz_rbit : 1;  /* clz, rbit                          */
+        -:  166:  uint64_t ldaex : 1;     /* lda/stl acquire/release (v8)       */
+        -:  167:  uint64_t vfp_sp : 1;    /* single-precision FP                */
+        -:  168:  uint64_t vfp_dp : 1;    /* double-precision FP                */
+        -:  169:  uint64_t tbb_tbh : 1;   /* tbb/tbh table branches             */
+        -:  170:  uint64_t cbz : 1;       /* cbz/cbnz                           */
+        -:  171:  uint64_t hwdiv_t16 : 1; /* reserved for narrow div forms      */
+        -:  172:
+        -:  173:  /* ───── reserved / future enablers (bits 16-31) ───── */
+        -:  174:  uint64_t sec : 1;         /* sg, bxns, blxns                    */
+        -:  175:  uint64_t sec_tt : 1;      /* tt, ttt, tta, ttat                 */
+        -:  176:  uint64_t lob : 1;         /* low-overhead-branch: wls, dls, le… */
+        -:  177:  uint64_t pacbti : 1;      /* pac, aut, pacg, autg, bti          */
+        -:  178:  uint64_t cde : 1;         /* custom datapath: cx{1,2,3}, vcx…   */
+        -:  179:  uint64_t ras : 1;         /* reliability / esb                  */
+        -:  180:  uint64_t fp16 : 1;        /* half-precision FP                  */
+        -:  181:  uint64_t fp_armv8 : 1;    /* vrint*, vsel, vmaxnm, vminnm       */
+        -:  182:  uint64_t fp_dp_d32 : 1;   /* 32 double registers (d16..d31)     */
+        -:  183:  uint64_t mve_int : 1;     /* integer MVE                        */
+        -:  184:  uint64_t mve_fp : 1;      /* FP MVE                             */
+        -:  185:  uint64_t cache_maint : 1; /* dc, ic cache maintenance forms     */
+        -:  186:  uint64_t debug : 1;       /* bkpt variants, hlt, dbg imm        */
+        -:  187:  uint64_t coproc : 1;      /* mcr/mrc/mcrr/mrrc/cdp              */
+        -:  188:  uint64_t lrcpc : 1;       /* load-acquire RCpc forms            */
+        -:  189:  uint64_t unpriv_ls : 1;   /* ldrt/strt family                   */
+        -:  190:
+        -:  191:  /* bits 32-47: architect's playground — reserved without commitment */
+        -:  192:  uint64_t reserved_arch : 16;
+        -:  193:  /* bits 48-63: vendor / compiler-specific feature flags  */
+        -:  194:  uint64_t reserved_vendor : 16;
+        -:  195:} thop_feat;
+        -:  196:
+        -:  197:_Static_assert(sizeof(thop_feat) == sizeof(uint64_t), "thop_feat must pack into 64 bits");
+        -:  198:
+        -:  199:typedef struct
+        -:  200:{
+        -:  201:  uint32_t t16 : 1;
+        -:  202:  uint32_t t32 : 1;
+        -:  203:  uint32_t it : 1;
+        -:  204:  uint32_t mod_imm : 1;
+        -:  205:  uint32_t movw_movt : 1;
+        -:  206:  uint32_t dsp : 1;
+        -:  207:  uint32_t sat : 1;
+        -:  208:  uint32_t div : 1;
+        -:  209:  uint32_t bfx : 1;
+        -:  210:  uint32_t clz_rbit : 1;
+        -:  211:  uint32_t ldaex : 1;
+        -:  212:  uint32_t vfp_sp : 1;
+        -:  213:  uint32_t vfp_dp : 1;
+        -:  214:  uint32_t tbb_tbh : 1;
+        -:  215:  uint32_t cbz : 1;
+        -:  216:  uint32_t hwdiv_t16 : 1;
+        -:  217:  uint32_t sec : 1;
+        -:  218:  uint32_t sec_tt : 1;
+        -:  219:  uint32_t lob : 1;
+        -:  220:  uint32_t pacbti : 1;
+        -:  221:  uint32_t cde : 1;
+        -:  222:  uint32_t ras : 1;
+        -:  223:  uint32_t fp16 : 1;
+        -:  224:  uint32_t fp_armv8 : 1;
+        -:  225:  uint32_t fp_dp_d32 : 1;
+        -:  226:  uint32_t mve_int : 1;
+        -:  227:  uint32_t mve_fp : 1;
+        -:  228:  uint32_t cache_maint : 1;
+        -:  229:  uint32_t debug : 1;
+        -:  230:  uint32_t coproc : 1;
+        -:  231:  uint32_t lrcpc : 1;
+        -:  232:  uint32_t unpriv_ls : 1;
+        -:  233:} thop_feat32;
+        -:  234:
+        -:  235:_Static_assert(sizeof(thop_feat32) == sizeof(uint32_t), "thop_feat32 must pack into 32 bits");
+        -:  236:
+        -:  237:static inline uint32_t thop_feat32_bits(thop_feat32 f)
+        -:  238:{
+        -:  239:  uint32_t b;
+        -:  240:  memcpy(&b, &f, sizeof b);
+        -:  241:  return b;
+        -:  242:}
+        -:  243:
+        -:  244:thop_feat thumb_resolve_features(const char *march, const char *mfpu, uint64_t extra_feat_bits);
+        -:  245:
+        -:  246:/* Resolve only the FP-unit feature bits for a -mfpu / .fpu name (no core
+        -:  247:   features). Used by the `.fpu` assembler directive. */
+        -:  248:thop_feat thumb_resolve_fpu(const char *mfpu);
+        -:  249:
+        -:  250:/* ───── Backend-owned target-dependent config ─────
+        -:  251: *
+        -:  252: * Forward-declared as `struct target_dependent_config` in tcc.h; generic
+        -:  253: * code sees only the pointer.  The full shape (feature mask, TrustZone
+        -:  254: * flag, -mcpu= name) is ARM-private and lives here. */
+        -:  255:
+        -:  256:struct target_dependent_config
+        -:  257:{
+        -:  258:  const char *mcpu_name;
+        -:  259:  thop_feat feat;
+        -:  260:  bool is_secure_tz;
+        -:  261:};
+        -:  262:
+        -:  263:extern struct target_dependent_config arm_target_dependent;
+        -:  264:
+        -:  265:typedef enum
+        -:  266:{
+        -:  267:  IMM_NONE,
+        -:  268:  IMM_RAW,          /* plain N-bit value, optional scale */
+        -:  269:  IMM_PACK_CONST,   /* ARMv7-M modified-immediate (th_pack_const) */
+        -:  270:  IMM_PACK_3_8_1,   /* scattered 12-bit (movw/adr)               */
+        -:  271:  IMM_PACK_10_11_0, /* branch encoding                            */
+        -:  272:  IMM_SIGNED_PUW,   /* load/store with P/U/W bits                 */
+        -:  273:} imm_kind;
+        -:  274:
+        -:  275:typedef struct
+        -:  276:{
+        -:  277:  uint16_t kind : 3;       /* imm_kind (6 values)            */
+        -:  278:  uint16_t width : 4;      /* max bits of the *user* value   */
+        -:  279:  uint16_t scale_log2 : 2; /* 0=byte, 1=half, 2=word         */
+        -:  280:  uint16_t is_signed : 1;
+        -:  281:} imm_spec;
+        -:  282:
+        -:  283:_Static_assert(sizeof(imm_spec) == 2, "imm_spec must pack into 16 bits");
+        -:  284:
+        -:  285:typedef enum
+        -:  286:{
+        -:  287:  REG_ANY = 0,
+        -:  288:  REG_LOW_ONLY = 1 << 0, /* R0..R7 */
+        -:  289:  REG_NOT_SP = 1 << 1,
+        -:  290:  REG_NOT_PC = 1 << 2,
+        -:  291:  REG_NOT_LR = 1 << 3,
+        -:  292:  REG_EQ_RN = 1 << 4,   /* rd must equal rn (e.g. T1 add_imm) */
+        -:  293:  REG_EQ_RM = 1 << 5,   /* rd must equal rm (e.g. T1 add_sp_reg) */
+        -:  294:  REG_SP_ONLY = 1 << 6, /* must be SP (r13) */
+        -:  295:  REG_PC_ONLY = 1 << 7, /* must be PC (r15) */
+        -:  296:  /* ── bitmask-field constraints (applied to rm when used as reglist) ── */
+        -:  297:  REG_LOW_REGSET = 1 << 8,         /* only bits [7:0] may be set in rm */
+        -:  298:  REG_RM_BIT_NOT_SP = 1 << 9,      /* bit 13 of rm must NOT be set */
+        -:  299:  REG_RM_BITS_NOT_LR_PC = 1 << 10, /* bits 14,15 of rm must NOT be set */
+        -:  300:} reg_mask;
+        -:  301:
+        -:  302:/* Where an operand lands in the final 16/32-bit word */
+        -:  303:typedef struct
+        -:  304:{
+        -:  305:  uint8_t shift; /* LSB position */
+        -:  306:  uint8_t width; /* bit width; 0 = field unused */
+        -:  307:} bitfield;
+        -:  308:
+        -:  309:typedef enum thop_variant_size
+        -:  310:{
+        -:  311:  THOP_VARIANT_NONE = 0,
+        -:  312:  THOP_VARIANT_T16 = 2,
+        -:  313:  THOP_VARIANT_T32 = 4,
+        -:  314:} thop_variant_size;
+        -:  315:
+        -:  316:typedef struct
+        -:  317:{
+        -:  318:  thop_feat32 feat;
+        -:  319:
+        -:  320:  imm_spec imm;
+        -:  321:  bitfield rd_place, rn_place, rm_place, ra_place;
+        -:  322:  bitfield imm_place;
+        -:  323:  bitfield shift_type_bits; /* e.g. [5:4] in T3 */
+        -:  324:  bitfield shift_imm2_bits; /* [7:6]  */
+        -:  325:  bitfield shift_imm3_bits; /* [14:12] */
+        -:  326:  bitfield imm2_place;
+        -:  327:  bitfield split_imm2_place; /* places (a.imm >> 0) & 0x3 */
+        -:  328:  bitfield split_imm3_place; /* places (a.imm >> 2) & 0x7 */
+        -:  329:  bitfield puw_bits;
+        -:  330:  bitfield rm_raw_place; /* place raw rm value at this position (not ARM-encoded) */
+        -:  331:  bitfield dn_rd_split;  /* DN:Rd split (T1 high-register MOV) — Rd low bits at shift/width, D computed from rd>>3 */
+        -:  332:
+        -:  333:    uint16_t rd_con, rn_con, rm_con, ra_con;
+        -:  334:
+        -:  335:  uint16_t size : 3;          /* thop_variant_size (0, 2, 4) */
+        -:  336:  uint16_t shift_allowed : 6; /* bitmask of THUMB_SHIFT_* */
+        -:  337:  uint16_t puw_fixed : 3;     /* when puw_bits.width==0, match only this */
+        -:  338:  uint16_t has_s_bit : 1;     /* s_bit always at position 20 when set */
+        -:  339:  uint16_t implicit_s : 1;    /* T16 always sets flags */
+        -:  340:  uint16_t forbid_s_in_it : 1;
+        -:  341:  uint16_t has_rd_hi : 1; /* rd_hi_place always {7, 1} when set */
+        -:  342:} thop_variant_shape;
+        -:  343:
+        -:  344:_Static_assert(sizeof(thop_variant_shape) == 44, "thop_variant_shape");
+        -:  345:
+        -:  346:typedef struct thop_args thop_args;
+        -:  347:typedef thumb_opcode (*thop_custom_emit)(uint32_t base, const thop_args *a);
+        -:  348:
+        -:  349:typedef struct
+        -:  350:{
+        -:  351:  const thop_variant_shape *shape;
+        -:  352:  uint32_t base;
+        -:  353:  thop_custom_emit custom;
+        -:  354:} thop_variant;
+        -:  355:
+        -:  356:typedef struct thop_table
+        -:  357:{
+        -:  358:  const char *name;
+        -:  359:  const thop_variant *variants;
+        -:  360:  size_t variant_count;
+        -:  361:} thop_table;
+        -:  362:
+        -:  363:#define TH_TABLE(id, mnemonic, ...)                                                                                    \
+        -:  364:  static const thop_variant id##_VARIANTS[] = {__VA_ARGS__};                                                           \
+        -:  365:  static const thop_table id = {                                                                                       \
+        -:  366:      .name = mnemonic,                                                                                                \
+        -:  367:      .variants = id##_VARIANTS,                                                                                       \
+        -:  368:      .variant_count = sizeof(id##_VARIANTS) / sizeof(id##_VARIANTS[0]),                                               \
+        -:  369:  }
+        -:  370:
+        -:  371:/* ───── Emit engine ───── */
+        -:  372:
+        -:  373:struct thop_args
+        -:  374:{
+        -:  375:  uint32_t rd, rn, rm, ra;
+        -:  376:  uint32_t imm;
+        -:  377:  uint32_t imm2;
+        -:  378:  thumb_shift shift;
+        -:  379:  thumb_flags_behaviour flags;
+        -:  380:  thumb_enforce_encoding enc;
+        -:  381:  bool in_it_block;
+        -:  382:  uint8_t puw;
+        -:  383:  uint8_t exclude_bit; /* clear this bit from rm before rm_raw_place placement */
+        -:  384:};
+        -:  385:
+        -:  386:/* ───── Utility declarations (defined in thumb.c) ───── */
+        -:  387:
+        -:  388:uint32_t th_packimm_10_11_0(uint32_t imm);
+        -:  389:uint32_t th_packimm_3_8_1(uint32_t imm);
+        -:  390:
+        -:  391:uint32_t th_pack_const(uint32_t imm);
+        -:  392:uint32_t th_encbranch_b_t3(uint32_t imm);
+        -:  393:
+        -:  394:uint32_t th_encbranch(int pos, int addr);
+        -:  395:uint32_t th_encbranch_8(int pos, int addr);
+        -:  396:uint32_t th_encbranch_11(int pos, int addr);
+        -:  397:uint32_t th_encbranch_20(int pos, int addr);
+        -:  398:
+        -:  399:void th_sym_t();
+        -:  400:void th_sym_d();
+        -:  401:
+        -:  402:void th_trace_regset(uint16_t regs);
+        -:  403:void th_trace_shift_suffix(thumb_shift shift);
+        -:  404:
+        -:  405:uint32_t th_shift_type_to_op(thumb_shift shift);
+        -:  406:uint32_t th_shift_value_to_sr_type(thumb_shift shift);
+        -:  407:
+        -:  408:thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd, uint32_t rn, uint32_t rm,
+        -:  409:                                                 thumb_flags_behaviour setflags, thumb_shift shift);
+        -:  410:
+        -:  411:thumb_opcode thop_emit_error(const char *name, const thop_variant *table, size_t n, thop_args a);
+        -:  412:
+        -:  413:/* Bulk helpers — type-pun through memcpy (defined behaviour, the
+        -:  414:   compiler folds it away). Used for profile composition and the
+        -:  415:   engine's subset test; single-capability checks use named fields. */
+       12:  416:static inline uint64_t thop_feat_bits(thop_feat f)
+        -:  417:{
+        -:  418:  uint64_t b;
+       12:  419:  memcpy(&b, &f, sizeof b);
+       12:  420:  return b;
+        -:  421:}
+        -:  422:
+        6:  423:static inline thop_feat thop_feat_from_bits(uint64_t b)
+        -:  424:{
+        -:  425:  thop_feat f;
+        6:  426:  memcpy(&f, &b, sizeof f);
+        6:  427:  return f;
+        -:  428:}
+        -:  429:
+        6:  430:static inline thop_feat thop_feat_or(thop_feat a, thop_feat b)
+        -:  431:{
+        6:  432:  return thop_feat_from_bits(thop_feat_bits(a) | thop_feat_bits(b));
+        -:  433:}
+        -:  434:
+        -:  435:static inline bool thop_feat_subset(thop_feat sub, thop_feat sup)
+        -:  436:{
+        -:  437:  uint64_t s = thop_feat_bits(sub);
+        -:  438:  return (s & thop_feat_bits(sup)) == s;
+        -:  439:}
+        -:  440:
+        -:  441:static inline thop_feat thop_feat32_widen(thop_feat32 f32)
+        -:  442:{
+        -:  443:  return thop_feat_from_bits((uint64_t)thop_feat32_bits(f32));
+        -:  444:}
+        -:  445:
+        -:  446:static inline bool thop_feat32_subset(thop_feat32 sub, thop_feat sup)
+        -:  447:{
+        -:  448:  uint32_t s = thop_feat32_bits(sub);
+        -:  449:  return (s & (uint32_t)thop_feat_bits(sup)) == s;
+        -:  450:}
+        -:  451:
+        -:  452:static inline const char *thop_feat_bit_name(int bit)
+        -:  453:{
+        -:  454:  static const char *names[] = {
+        -:  455:      [0] = "t16",        [1] = "t32",        [2] = "it",           [3] = "mod_imm",   [4] = "movw_movt",
+        -:  456:      [5] = "dsp",        [6] = "sat",        [7] = "div",          [8] = "bfx",       [9] = "clz_rbit",
+        -:  457:      [10] = "ldaex",     [11] = "vfp_sp",    [12] = "vfp_dp",      [13] = "tbb_tbh",  [14] = "cbz",
+        -:  458:      [15] = "hwdiv_t16", [16] = "sec",       [17] = "sec_tt",      [18] = "lob",      [19] = "pacbti",
+        -:  459:      [20] = "cde",       [21] = "ras",       [22] = "fp16",        [23] = "fp_armv8", [24] = "fp_dp_d32",
+        -:  460:      [25] = "mve_int",   [26] = "mve_fp",    [27] = "cache_maint", [28] = "debug",    [29] = "coproc",
+        -:  461:      [30] = "lrcpc",     [31] = "unpriv_ls",
+        -:  462:  };
+        -:  463:  if (bit >= 0 && bit < (int)(sizeof(names) / sizeof(names[0])) && names[bit])
+        -:  464:    return names[bit];
+        -:  465:  return "?";
+        -:  466:}
+        -:  467:
+        -:  468:static inline const char *thop_feat_hint(int bit)
+        -:  469:{
+        -:  470:  switch (bit)
+        -:  471:  {
+        -:  472:  case 11:
+        -:  473:    return "enable with -mfpu=fpv4-sp-d16 or -mfpu=fpv5-sp-d16";
+        -:  474:  case 12:
+        -:  475:    return "enable with -mfpu=fpv5-d16";
+        -:  476:  case 22:
+        -:  477:    return "enable with -mfpu that supports fp16";
+        -:  478:  case 23:
+        -:  479:    return "requires ARMv8-M FP extensions";
+        -:  480:  default:
+        -:  481:    return NULL;
+        -:  482:  }
+        -:  483:}
+        -:  484:
+        -:  485:static inline void thop_feat_describe_missing(thop_feat need, thop_feat have, char *buf, size_t bufsz)
+        -:  486:{
+        -:  487:  uint64_t missing = thop_feat_bits(need) & ~thop_feat_bits(have);
+        -:  488:  size_t pos = 0;
+        -:  489:  for (int i = 0; i < 64 && missing && pos < bufsz - 1; i++)
+        -:  490:  {
+        -:  491:    if (!(missing & (1ull << i)))
+        -:  492:      continue;
+        -:  493:    missing &= ~(1ull << i);
+        -:  494:    const char *name = thop_feat_bit_name(i);
+        -:  495:    const char *hint = thop_feat_hint(i);
+        -:  496:    int n;
+        -:  497:    if (hint)
+        -:  498:      n = snprintf(buf + pos, bufsz - pos, "%s%s (%s)", pos ? ", " : "", name, hint);
+        -:  499:    else
+        -:  500:      n = snprintf(buf + pos, bufsz - pos, "%s%s", pos ? ", " : "", name);
+        -:  501:    if (n > 0)
+        -:  502:      pos += (size_t)n;
+        -:  503:  }
+        -:  504:  if (pos == 0 && bufsz > 0)
+        -:  505:    buf[0] = '\0';
+        -:  506:}
+        -:  507:
+        -:  508:static inline __attribute__((always_inline)) bool thop_reg_ok(uint32_t reg, reg_mask con)
+        -:  509:{
+        -:  510:  if ((con & REG_LOW_ONLY) && reg > 7)
+        -:  511:    return false;
+        -:  512:  if ((con & REG_NOT_SP) && reg == 13)
+        -:  513:    return false;
+        -:  514:  if ((con & REG_NOT_PC) && reg == 15)
+        -:  515:    return false;
+        -:  516:  if ((con & REG_NOT_LR) && reg == 14)
+        -:  517:    return false;
+        -:  518:  if ((con & REG_SP_ONLY) && reg != 13)
+        -:  519:    return false;
+        -:  520:  if ((con & REG_PC_ONLY) && reg != 15)
+        -:  521:    return false;
+        -:  522:  return true;
+        -:  523:}
+        -:  524:
+        -:  525:static inline __attribute__((always_inline)) uint32_t thop_place(uint32_t val, bitfield bf)
+        -:  526:{
+        -:  527:  if (bf.width == 0)
+        -:  528:    return 0;
+        -:  529:  return (val & ((1u << bf.width) - 1)) << bf.shift;
+        -:  530:}
+        -:  531:
+        -:  532:static inline __attribute__((always_inline)) bool thop_try_imm(const thop_variant_shape *s, uint32_t imm,
+        -:  533:                                                               uint32_t *out_bits)
+        -:  534:{
+        -:  535:  const imm_spec *spec = &s->imm;
+        -:  536:  *out_bits = 0;
+        -:  537:
+        -:  538:  if (spec->kind == IMM_NONE)
+        -:  539:    return imm == 0;
+        -:  540:
+        -:  541:  uint32_t scaled = imm;
+        -:  542:
+        -:  543:  if (spec->is_signed)
+        -:  544:  {
+        -:  545:    int32_t simm = (int32_t)scaled;
+        -:  546:    if (simm >= 0)
+        -:  547:      return false;
+        -:  548:    scaled = (uint32_t)(-simm);
+        -:  549:  }
+        -:  550:
+        -:  551:  if (spec->scale_log2 > 0)
+        -:  552:  {
+        -:  553:    uint32_t mask = (1u << spec->scale_log2) - 1;
+        -:  554:    if (scaled & mask)
+        -:  555:      return false;
+        -:  556:    scaled >>= spec->scale_log2;
+        -:  557:  }
+        -:  558:
+        -:  559:  switch (spec->kind)
+        -:  560:  {
+        -:  561:  case IMM_RAW:
+        -:  562:    if (scaled >= (1u << spec->width))
+        -:  563:      return false;
+        -:  564:    *out_bits = thop_place(scaled, s->imm_place);
+        -:  565:    return true;
+        -:  566:
+        -:  567:  case IMM_PACK_CONST:
+        -:  568:  {
+        -:  569:    uint32_t packed = th_pack_const(imm);
+        -:  570:    if (!packed && imm != 0)
+        -:  571:      return false;
+        -:  572:    *out_bits = packed;
+        -:  573:    return true;
+        -:  574:  }
+        -:  575:
+        -:  576:  case IMM_PACK_3_8_1:
+        -:  577:    if (spec->width ? (scaled >= (1u << spec->width)) : (scaled > 0xFFFF))
+        -:  578:      return false;
+        -:  579:    *out_bits = th_packimm_3_8_1(scaled);
+        -:  580:    return true;
+        -:  581:
+        -:  582:  case IMM_PACK_10_11_0:
+        -:  583:    *out_bits = th_packimm_10_11_0(imm);
+        -:  584:    return true;
+        -:  585:
+        -:  586:  default:
+        -:  587:    return false;
+        -:  588:  }
+        -:  589:}
+        -:  590:
+        -:  591:static inline __attribute__((always_inline)) thumb_opcode thop_emit(const char *name, const thop_variant *table, size_t n, thop_args a)
+        -:  592:{
+        -:  593:  const thop_feat target_feat = arm_target_dependent.feat;
+        -:  594:
+        -:  595:  for (size_t i = 0; i < n; i++)
+        -:  596:  {
+        -:  597:    const thop_variant *v = &table[i];
+        -:  598:    const thop_variant_shape *s = v->shape;
+        -:  599:
+        -:  600:    if (!thop_feat32_subset(s->feat, target_feat))
+        -:  601:    {
+        -:  602:      THOP_TRACE("%s: variant %zu skipped (feature mismatch)\n", name ? name : "?unknown?", i);
+        -:  603:      continue;
+        -:  604:    }
+        -:  605:
+        -:  606:    if (a.enc == ENFORCE_ENCODING_16BIT && s->size != THOP_VARIANT_T16)
+        -:  607:    {
+        -:  608:      THOP_TRACE("%s: variant %zu skipped (encoding T%d, requested T16)\n", name ? name : "?unknown?", i, (int)s->size);
+        -:  609:      continue;
+        -:  610:    }
+        -:  611:    if (a.enc == ENFORCE_ENCODING_32BIT && s->size != THOP_VARIANT_T32)
+        -:  612:    {
+        -:  613:      THOP_TRACE("%s: variant %zu skipped (encoding T%d, requested T32)\n", name ? name : "?unknown?", i, (int)s->size);
+        -:  614:      continue;
+        -:  615:    }
+        -:  616:
+        -:  617:    if ((s->rd_place.width || s->rd_con) && !thop_reg_ok(a.rd, s->rd_con))
+        -:  618:    {
+        -:  619:      THOP_TRACE("%s: variant %zu skipped (rd=%u constraint failed)\n", name ? name : "?unknown?", i, a.rd);
+        -:  620:      continue;
+        -:  621:    }
+        -:  622:    if ((s->rn_place.width || s->rn_con) && !thop_reg_ok(a.rn, s->rn_con))
+        -:  623:    {
+        -:  624:      THOP_TRACE("%s: variant %zu skipped (rn=%u constraint failed)\n", name ? name : "?unknown?", i, a.rn);
+        -:  625:      continue;
+        -:  626:    }
+        -:  627:    if ((s->rm_place.width || s->rm_con) && !thop_reg_ok(a.rm, s->rm_con))
+        -:  628:    {
+        -:  629:      THOP_TRACE("%s: variant %zu skipped (rm=%u constraint failed)\n", name ? name : "?unknown?", i, a.rm);
+        -:  630:      continue;
+        -:  631:    }
+        -:  632:    if ((s->ra_place.width || s->ra_con) && !thop_reg_ok(a.ra, s->ra_con))
+        -:  633:    {
+        -:  634:      THOP_TRACE("%s: variant %zu skipped (ra=%u constraint failed)\n", name ? name : "?unknown?", i, a.ra);
+        -:  635:      continue;
+        -:  636:    }
+        -:  637:
+        -:  638:    if ((s->rd_con & REG_EQ_RN) && a.rd != a.rn)
+        -:  639:    {
+        -:  640:      THOP_TRACE("%s: variant %zu skipped (rd==rn required, got rd=%u rn=%u)\n", name ? name : "?unknown?", i, a.rd, a.rn);
+        -:  641:      continue;
+        -:  642:    }
+        -:  643:    if ((s->rd_con & REG_EQ_RM) && a.rd != a.rm)
+        -:  644:    {
+        -:  645:      THOP_TRACE("%s: variant %zu skipped (rd==rm required, got rd=%u rm=%u)\n", name ? name : "?unknown?", i, a.rd, a.rm);
+        -:  646:      continue;
+        -:  647:    }
+        -:  648:
+        -:  649:    if (a.flags == FLAGS_BEHAVIOUR_SET && !s->has_s_bit && !s->implicit_s)
+        -:  650:    {
+        -:  651:      THOP_TRACE("%s: variant %zu skipped (flags SET but no s-bit)\n", name ? name : "?unknown?", i);
+        -:  652:      continue;
+        -:  653:    }
+        -:  654:    if (a.flags == FLAGS_BEHAVIOUR_BLOCK && s->implicit_s)
+        -:  655:    {
+        -:  656:      THOP_TRACE("%s: variant %zu skipped (implicit S-bit conflicts with BLOCK)\n", name ? name : "?unknown?", i);
+        -:  657:      continue;
+        -:  658:    }
+        -:  659:    if (s->forbid_s_in_it && a.in_it_block && a.flags == FLAGS_BEHAVIOUR_SET)
+        -:  660:    {
+        -:  661:      THOP_TRACE("%s: variant %zu skipped (S-bit forbidden in IT block)\n", name ? name : "?unknown?", i);
+        -:  662:      continue;
+        -:  663:    }
+        -:  664:    if (s->implicit_s && a.in_it_block)
+        -:  665:    {
+        -:  666:      THOP_TRACE("%s: variant %zu skipped (implicit S-bit not allowed in IT block)\n", name ? name : "?unknown?", i);
+        -:  667:      continue;
+        -:  668:    }
+        -:  669:
+        -:  670:    if (a.shift.type != THUMB_SHIFT_NONE)
+        -:  671:    {
+        -:  672:      bool has_shift_fields = s->shift_type_bits.width || s->shift_imm2_bits.width || s->shift_imm3_bits.width;
+        -:  673:      if (!has_shift_fields && s->shift_allowed == 0)
+        -:  674:      {
+        -:  675:        THOP_TRACE("%s: variant %zu skipped (no shift support, type=%u)\n", name ? name : "?unknown?", i, a.shift.type);
+        -:  676:        continue;
+        -:  677:      }
+        -:  678:      if (s->shift_allowed != 0 && !(s->shift_allowed & (1u << a.shift.type)))
+        -:  679:      {
+        -:  680:        THOP_TRACE("%s: variant %zu skipped (shift type %u not allowed)\n", name ? name : "?unknown?", i, a.shift.type);
+        -:  681:        continue;
+        -:  682:      }
+        -:  683:    }
+        -:  684:
+        -:  685:    if (s->puw_bits.width == 0 && s->puw_fixed != 0 && a.puw != s->puw_fixed)
+        -:  686:    {
+        -:  687:      THOP_TRACE("%s: variant %zu skipped (puw=%u, expected fixed=%u)\n", name ? name : "?unknown?", i, a.puw, s->puw_fixed);
+        -:  688:      continue;
+        -:  689:    }
+        -:  690:
+        -:  691:    uint32_t imm_bits = 0;
+        -:  692:    if (s->imm.kind != IMM_NONE)
+        -:  693:    {
+        -:  694:      if (!thop_try_imm(s, a.imm, &imm_bits))
+        -:  695:      {
+        -:  696:        THOP_TRACE("%s: variant %zu skipped (immediate %u invalid for this encoding)\n", name ? name : "?unknown?", i, a.imm);
+        -:  697:        continue;
+        -:  698:      }
+        -:  699:    }
+        -:  700:
+        -:  701:    /* ── bitmask-field pre-processing ── */
+        -:  702:    if ((s->rm_con & REG_LOW_REGSET) && (a.rm & ~0xff))
+        -:  703:    {
+        -:  704:      THOP_TRACE("%s: variant %zu skipped (regset bits [15:8] set, got 0x%x)\n", name ? name : "?unknown?", i, a.rm);
+        -:  705:      continue;
+        -:  706:    }
+        -:  707:    if ((s->rm_con & REG_RM_BIT_NOT_SP) && (a.rm & (1u << 13)))
+        -:  708:    {
+        -:  709:      THOP_TRACE("%s: variant %zu skipped (SP not allowed in reglist)\n", name ? name : "?unknown?", i);
+        -:  710:      continue;
+        -:  711:    }
+        -:  712:    if ((s->rm_con & REG_RM_BITS_NOT_LR_PC) && (a.rm & ((1u << 14) | (1u << 15))))
+        -:  713:    {
+        -:  714:      THOP_TRACE("%s: variant %zu skipped (LR/PC not allowed in reglist)\n", name ? name : "?unknown?", i);
+        -:  715:      continue;
+        -:  716:    }
+        -:  717:
+        -:  718:    /* exclude_bit: clear specified bit from rm before raw placement */
+        -:  719:    uint32_t rm_for_place = a.rm;
+        -:  720:    if (s->rm_raw_place.width && a.exclude_bit)
+        -:  721:      rm_for_place &= ~(1u << a.exclude_bit);
+        -:  722:
+        -:  723:    if (v->custom)
+        -:  724:    {
+        -:  725:      thumb_opcode r = v->custom(v->base, &a);
+        -:  726:      if (r.size)
+        -:  727:      {
+        -:  728:        THOP_TRACE("%s: custom T%d base=0x%x → 0x%x\n", name ? name : "?unknown?", (int)i + 1, v->base, r.opcode);
+        -:  729:        return r;
+        -:  730:      }
+        -:  731:      continue;
+        -:  732:    }
+        -:  733:
+        -:  734:    uint32_t op = v->base;
+        -:  735:    op |= thop_place(a.rd, s->rd_place);
+        -:  736:    if (s->has_rd_hi)
+        -:  737:      op |= thop_place(a.rd >> s->rd_place.width, (bitfield){7, 1});
+        -:  738:    op |= thop_place(a.rn, s->rn_place);
+        -:  739:    op |= thop_place(a.rm, s->rm_place);
+        -:  740:    op |= thop_place(a.ra, s->ra_place);
+        -:  741:    op |= imm_bits;
+        -:  742:
+        -:  743:    /* ── DN:Rd split (T1 high-register MOV) ── */
+        -:  744:    if (s->dn_rd_split.width)
+        -:  745:    {
+        -:  746:      uint32_t dn = (a.rd >> 3) & 1;
+        -:  747:      op |= thop_place(dn, (bitfield){7, 1});
+        -:  748:      op |= thop_place(a.rd & ((1u << s->dn_rd_split.width) - 1), s->dn_rd_split);
+        -:  749:    }
+        -:  750:
+        -:  751:    if (s->has_s_bit && a.flags == FLAGS_BEHAVIOUR_SET)
+        -:  752:      op |= (1u << 20);
+        -:  753:
+        -:  754:    if (s->shift_type_bits.width)
+        -:  755:    {
+        -:  756:      uint32_t sr = th_shift_value_to_sr_type(a.shift);
+        -:  757:      op |= thop_place(sr, s->shift_type_bits);
+        -:  758:    }
+        -:  759:    if (s->shift_imm2_bits.width)
+        -:  760:      op |= thop_place(a.shift.value & 0x3, s->shift_imm2_bits);
+        -:  761:    if (s->shift_imm3_bits.width)
+        -:  762:      op |= thop_place((a.shift.value >> 2) & 0x7, s->shift_imm3_bits);
+        -:  763:
+        -:  764:    if (s->imm2_place.width)
+        -:  765:      op |= thop_place(a.imm2, s->imm2_place);
+        -:  766:    if (s->split_imm2_place.width)
+        -:  767:      op |= thop_place(a.imm & 0x3, s->split_imm2_place);
+        -:  768:    if (s->split_imm3_place.width)
+        -:  769:      op |= thop_place((a.imm >> 2) & 0x7, s->split_imm3_place);
+        -:  770:
+        -:  771:    if (s->puw_bits.width)
+        -:  772:      op |= thop_place(a.puw & 0x7, s->puw_bits);
+        -:  773:
+        -:  774:    /* ── raw register list placement ── */
+        -:  775:    if (s->rm_raw_place.width)
+        -:  776:      op |= thop_place(rm_for_place, s->rm_raw_place);
+        -:  777:
+        -:  778:    THOP_TRACE("%s: matched T%d base=0x%x → 0x%x\n", name ? name : "?unknown?", (int)i + 1, v->base, op);
+        -:  779:
+        -:  780:    return (thumb_opcode){.size = s->size, .opcode = op};
+        -:  781:  }
+        -:  782:
+        -:  783:  THOP_TRACE("%s: ERROR no variant matched! (tried %zu variants)\n", name ? name : "?unknown?", n);
+        -:  784:  return thop_emit_error(name, table, n, a);
+        -:  785:}

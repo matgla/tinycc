@@ -10,7 +10,7 @@ This is a specialized fork of **TinyCC (Tiny C Compiler)** targeting **ARMv8-M**
 
 ```bash
 # One-time setup
-./configure
+./configure              # AddressSanitizer is ON by default; ./configure --disable-asan for fast/production builds
 make download-gcc-tests  # optional: sparse-fetch GCC torture tests (~16 MB, not the full gcc repo)
 
 # Build ARMv8-M cross compiler
@@ -139,6 +139,13 @@ void function_name(int arg)
 Build uses `-std=c11 -Wunused-function -Werror`.
 
 ## Debug Logging
+
+For debugging **optimizer miscompilations** found by the differential fuzzer
+(tcc -O0 correct, -O1/-O2 wrong), see
+[`docs/debugging_fuzz_divergences.md`](docs/debugging_fuzz_divergences.md) — the
+end-to-end workflow built around `scripts/bisect_opt.py` (QEMU-confirmed culprit
+knob + the exact IR line where a memory read is misfolded to a constant).
+`docs/fuzz_triage_guide.md` covers the sweep/triage infrastructure.
 
 Unified logging system defined in `log.h`. Each scope is a compile-time switch:
 

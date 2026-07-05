@@ -9,7 +9,7 @@
 
 UT_TARGETS := arm/armv8m
 
-.PHONY: all run clean $(UT_TARGETS)
+.PHONY: all run clean coverage $(UT_TARGETS)
 
 all: $(UT_TARGETS)
 
@@ -20,6 +20,15 @@ run:
 	@set -e; for t in $(UT_TARGETS); do \
 	    echo "==> $$t"; \
 	    $(MAKE) --no-print-directory -C $$t run; \
+	done
+
+# gcov line/branch coverage of the tinycc modules under test. Does a clean
+# instrumented build, runs each suite, and renders an HTML + text report under
+# <target>/build/coverage/. Requires gcovr.
+coverage:
+	@set -e; for t in $(UT_TARGETS); do \
+	    echo "==> $$t"; \
+	    $(MAKE) --no-print-directory -C $$t coverage; \
 	done
 
 clean:

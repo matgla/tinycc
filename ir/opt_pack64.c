@@ -146,6 +146,17 @@ int tcc_ir_opt_pack64_from_stack_stores(TCCIRState *ir)
      * a vreg / sym).  Bail if the operand has any kind of indirection. */
     if (src.is_llocal || src.is_sym)
       continue;
+    /* CRITICAL: a STACKOFF operand is only a *direct* stack-slot read when it
+     * has no associated vreg (vreg_type == 0, i.e. irop_get_vreg == -1).  A VAR
+     * or PARAM referenced through its potential spill encoding also has
+     * tag==STACKOFF/is_local/is_lval, but its offset is mere "where it would
+     * spill" metadata — the value is actually read from the vreg, not that slot
+     * (see the IROP_TAG_STACKOFF note in tccir_operand.h).  Matching STOREs by
+     * that phantom offset can grab an unrelated variable's stores when the slot
+     * was reused (longlong fuzz seed 7: a u64 local whose spill home aliased an
+     * array's live slot got folded to PACK64 of the array's elements). */
+    if (irop_get_vreg(src) != -1)
+      continue;
 
     int64_t addr_lo = irop_get_imm64_ex(ir, src);
     int64_t addr_hi = addr_lo + 4;
@@ -179,7 +190,7 @@ int tcc_ir_opt_pack64_from_stack_stores(TCCIRState *ir)
       {
         IROperand jdst = tcc_ir_op_get_dest(ir, jq);
         if (jq->op == TCCIR_OP_STORE && jdst.tag == IROP_TAG_STACKOFF && jdst.is_local && jdst.is_lval &&
-            !jdst.is_llocal && !jdst.is_sym && irop_get_btype(jdst) == IROP_BTYPE_INT32)
+            !jdst.is_llocal && !jdst.is_sym && irop_get_vreg(jdst) == -1 && irop_get_btype(jdst) == IROP_BTYPE_INT32)
         {
           int64_t joff = irop_get_imm64_ex(ir, jdst);
           IROperand jsrc = tcc_ir_op_get_src1(ir, jq);
@@ -1019,7 +1030,12 @@ int tcc_ir_opt_shl32_or_chain(TCCIRState *ir)
       int64_t imm = irop_get_imm64_ex(ir, q_src2);
       if (q->op == TCCIR_OP_SHL && imm == 32)
         is_shl32 = 1;
-      else if (q->op == TCCIR_OP_AND && (uint64_t)imm == 0xFFFFFFFFULL)
+      else if (q->op == TCCIR_OP_AND && (uint32_t)imm == 0xFFFFFFFFu)
+        /* Compare the low 32 bits only: irop_get_imm64_ex sign-extends a
+           32-bit immediate, so the natural 0xFFFFFFFF low-word mask arrives
+           here as int64_t -1 (0xFFFF...FFFF), which would never equal a
+           0x00000000FFFFFFFF test. A full 64-bit IROP_TAG_I64 constant of
+           0xFFFFFFFF (not sign-extended) also matches, as intended. */
         is_and_low = 1;
       else
         continue;

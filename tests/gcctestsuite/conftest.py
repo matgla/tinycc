@@ -309,6 +309,12 @@ def should_skip_gcc_test(test_path: Path) -> Optional[str]:
     import re as _re
     skip_patterns = {
         "mipscop",
+        # __builtin_issignaling is not implemented by this tcc, so the gcc
+        # *-builtin-issignaling-1 torture family (plain plus the _Float16/
+        # _Float32/_Float64/_Float128/__bf16 variants, which also need those
+        # types) fails to compile with "implicit declaration". Skip on the
+        # feature token so future variants are covered automatically.
+        "__builtin_issignaling",
     }
     name = test_path.name.lower()
 

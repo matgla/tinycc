@@ -1,1 +1,3 @@
-{}
+{
+    "cmake.sourceDirectory": "/home/mateusz/repos/tinycc/tests/benchmarks/libs/pico-sdk"
+}

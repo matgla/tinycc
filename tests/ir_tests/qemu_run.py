@@ -115,6 +115,10 @@ class SubprocessSUT:
             m = regex.search(self._buffer)
             if m is not None:
                 self.match = m
+                # Consume up to and including the match (pexpect semantics):
+                # otherwise a subsequent expect() re-matches stale buffer
+                # content, which false-fails structured multi-line output.
+                self._buffer = self._buffer[m.end():]
                 return m
 
             # If process exited and no more output is coming, bail out.
@@ -131,6 +135,7 @@ class SubprocessSUT:
                 m = regex.search(self._buffer)
                 if m is not None:
                     self.match = m
+                    self._buffer = self._buffer[m.end():]
                     return m
                 raise TimeoutError(f"Pattern not found before process exit: {pattern!r}")
 

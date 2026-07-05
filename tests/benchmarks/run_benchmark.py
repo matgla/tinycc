@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import os
+import socket
 import subprocess
 import sys
 import re
@@ -19,11 +20,34 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional, Dict, List, Tuple
 
-try:
-    import paramiko
-except ImportError:
-    print("Error: paramiko not installed. Run: pip install paramiko")
-    sys.exit(1)
+
+def _import_paramiko():
+    """Import paramiko lazily -- only remote (SSH) runs need it.  When the board
+    is on the same node (a loopback host), we never touch it, so a missing
+    paramiko must not abort the run."""
+    try:
+        import paramiko
+        return paramiko
+    except ImportError:
+        print("Error: paramiko not installed (needed only for remote SSH runs). "
+              "Run: pip install paramiko")
+        sys.exit(1)
+
+
+def is_local_host(host: str) -> bool:
+    """True when `host` refers to this machine, so the benchmark script can run
+    directly via subprocess instead of SSHing to ourselves."""
+    if not host:
+        return False
+    host = host.split("@", 1)[-1]  # strip any user@ prefix
+    if host in ("127.0.0.1", "::1", "localhost", "local"):
+        return True
+    try:
+        if host in (socket.gethostname(), socket.getfqdn()):
+            return True
+    except OSError:
+        pass
+    return False
 
 
 @dataclass
@@ -367,60 +391,15 @@ def _print_hardfault_details(serial_output: str):
                 break
 
 
-def upload_and_run(elf_path: Path, host: str, port: int = 22,
-                   username: str = "mateusz", identity: Optional[str] = None,
-                   password: Optional[str] = None) -> Tuple[bool, str, str]:
-    """Upload and run ELF on target via SSH using OpenOCD."""
-
-    print(f"\nConnecting to {username}@{host}...")
-
-    # Connect via SSH
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    connect_kwargs = {"hostname": host, "port": port, "username": username}
-    if identity:
-        connect_kwargs["key_filename"] = identity
-    elif password:
-        connect_kwargs["password"] = password
-
-    try:
-        ssh.connect(**connect_kwargs)
-        print(f"✓ Connected")
-    except Exception as e:
-        print(f"✗ Connection failed: {e}")
-        return False, ""
-
-    sftp = ssh.open_sftp()
-
-    # Upload ELF file (OpenOCD supports ELF directly)
-    remote_elf = f"/tmp/{elf_path.name}"
-    print(f"Uploading {elf_path.name} to {remote_elf}...")
-    sftp.put(str(elf_path), remote_elf)
-
-    # Probe serial port up front for logging, but let the remote script
-    # detect it again at runtime so we don't bake in stale paths.
-    detect_serial_cmd = r'''
-for dev in /dev/serial/by-id/* /dev/serial/by-path/* /dev/ttyACM* /dev/ttyUSB*; do
-    if [ -e "$dev" ]; then
-        printf "%s\n" "$dev"
-        exit 0
-    fi
-done
-exit 1
-'''
-    stdin, stdout, stderr = ssh.exec_command(detect_serial_cmd)
-    serial_port = stdout.read().decode().strip()
-    if serial_port:
-        print(f"Using serial port: {serial_port}")
-    else:
-        print("Warning: no serial port detected before launch; remote script will probe again")
-
-    # Create run script - now waits for "benchmark stopped" signal
-    combined_script = f'''#!/bin/bash
+def _build_run_script(elf: str, serial_port: str = "") -> str:
+    """Return the bash script that flashes `elf` via OpenOCD and captures the
+    board's serial output.  Shared by the local and remote runners; `elf` is a
+    path valid on whichever host actually executes the script."""
+    return f'''#!/bin/bash
 set -e
 
     SERIAL="{serial_port}"
-    ELF="{remote_elf}"
+    ELF="{elf}"
 
 detect_serial_port() {{
     if [ -n "$SERIAL" ] && [ -e "$SERIAL" ]; then
@@ -564,7 +543,7 @@ while [ $ELAPSED -lt $TIMEOUT ]; do
         COMPLETED=1
         break
     fi
-    if grep -q "HARDFAULT\|BENCHMARK TIMEOUT" /tmp/serial_raw.txt 2>/dev/null; then
+    if grep -q "HARDFAULT\\|BENCHMARK TIMEOUT" /tmp/serial_raw.txt 2>/dev/null; then
         echo "✗ HARDFAULT or TIMEOUT detected on target!"
         COMPLETED=1
         break
@@ -615,17 +594,12 @@ echo "===SERIAL_RAW_OUTPUT_START==="
 cat /tmp/serial_raw.txt 2>/dev/null
 echo "===SERIAL_RAW_OUTPUT_END==="
 '''
-    remote_combined = "/tmp/run_test.sh"
-    sftp.putfo(__import__("io").BytesIO(combined_script.encode()), remote_combined)
-    ssh.exec_command(f"chmod +x {remote_combined}")
 
-    print("Running benchmark on target...")
-    stdin, stdout, stderr = ssh.exec_command(remote_combined, timeout=300)
-    # Use errors='replace' to handle garbage bytes in serial output
-    output = stdout.read().decode(errors='replace')
-    errors = stderr.read().decode(errors='replace')
 
-    # Split output
+def _parse_run_output(output: str, errors: str) -> Tuple[bool, str, str]:
+    """Split the run-script stdout into OpenOCD log / clean serial / raw serial,
+    flag known failure signatures, and return (success, serial, raw_serial).
+    Shared by the local and remote runners."""
     if "===SERIAL_OUTPUT_START===" in output:
         parts = output.split("===SERIAL_OUTPUT_START===")
         ocd_output = parts[0]
@@ -661,14 +635,116 @@ echo "===SERIAL_RAW_OUTPUT_END==="
         _print_hardfault_details(serial_part)
         success = False
 
-    # Cleanup
-    sftp.close()
-    ssh.close()
-
     if serial_part:
         return success, serial_part, raw_serial_part
     else:
         return False, ocd_output + "\n" + errors, raw_serial_part
+
+
+def run_local(elf_path: Path) -> Tuple[bool, str, str]:
+    """Flash and run the ELF on a board attached to THIS machine -- no SSH.
+    Mirrors run_remote() but executes the flash/capture script as a local
+    subprocess, so paramiko is never needed when the board is on this node."""
+    print(f"\nRunning benchmark locally (board on this node)...")
+
+    # The script self-detects the serial port at runtime, so no pre-probe needed.
+    script = _build_run_script(str(elf_path))
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as fh:
+        fh.write(script)
+        script_path = fh.name
+
+    print("Running benchmark on target...")
+    try:
+        proc = subprocess.run(["bash", script_path], capture_output=True,
+                              text=True, errors="replace", timeout=600)
+        output, errors = proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as e:
+        # text=True -> stdout is str at runtime; coerce defensively for typing.
+        out = e.stdout or ""
+        output = out.decode(errors="replace") if isinstance(out, (bytes, bytearray)) else str(out)
+        errors = "local benchmark script timed out after 600s"
+    finally:
+        os.unlink(script_path)
+
+    return _parse_run_output(output, errors)
+
+
+def run_remote(elf_path: Path, host: str, port: int = 22,
+               username: str = "mateusz", identity: Optional[str] = None,
+               password: Optional[str] = None) -> Tuple[bool, str, str]:
+    """Upload and run ELF on a remote target via SSH using OpenOCD."""
+    paramiko = _import_paramiko()
+
+    print(f"\nConnecting to {username}@{host}...")
+
+    # Connect via SSH
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    connect_kwargs = {"hostname": host, "port": port, "username": username}
+    if identity:
+        connect_kwargs["key_filename"] = identity
+    elif password:
+        connect_kwargs["password"] = password
+
+    try:
+        ssh.connect(**connect_kwargs)
+        print(f"✓ Connected")
+    except Exception as e:
+        print(f"✗ Connection failed: {e}")
+        return False, f"Connection failed: {e}", ""
+
+    sftp = ssh.open_sftp()
+
+    # Upload ELF file (OpenOCD supports ELF directly)
+    remote_elf = f"/tmp/{elf_path.name}"
+    print(f"Uploading {elf_path.name} to {remote_elf}...")
+    sftp.put(str(elf_path), remote_elf)
+
+    # Probe serial port up front for logging, but let the remote script
+    # detect it again at runtime so we don't bake in stale paths.
+    detect_serial_cmd = r'''
+for dev in /dev/serial/by-id/* /dev/serial/by-path/* /dev/ttyACM* /dev/ttyUSB*; do
+    if [ -e "$dev" ]; then
+        printf "%s\n" "$dev"
+        exit 0
+    fi
+done
+exit 1
+'''
+    stdin, stdout, stderr = ssh.exec_command(detect_serial_cmd)
+    serial_port = stdout.read().decode().strip()
+    if serial_port:
+        print(f"Using serial port: {serial_port}")
+    else:
+        print("Warning: no serial port detected before launch; remote script will probe again")
+
+    combined_script = _build_run_script(remote_elf, serial_port)
+    remote_combined = "/tmp/run_test.sh"
+    sftp.putfo(__import__("io").BytesIO(combined_script.encode()), remote_combined)
+    ssh.exec_command(f"chmod +x {remote_combined}")
+
+    print("Running benchmark on target...")
+    stdin, stdout, stderr = ssh.exec_command(remote_combined, timeout=300)
+    # Use errors='replace' to handle garbage bytes in serial output
+    output = stdout.read().decode(errors='replace')
+    errors = stderr.read().decode(errors='replace')
+
+    # Cleanup
+    sftp.close()
+    ssh.close()
+
+    return _parse_run_output(output, errors)
+
+
+def upload_and_run(elf_path: Path, host: str, port: int = 22,
+                   username: str = "mateusz", identity: Optional[str] = None,
+                   password: Optional[str] = None) -> Tuple[bool, str, str]:
+    """Run the benchmark ELF on the target board.  Dispatches to a direct local
+    run when the board is on this node (host is loopback / this machine), and
+    only falls back to SSH (paramiko) for a genuinely remote target."""
+    if is_local_host(host):
+        return run_local(elf_path)
+    return run_remote(elf_path, host, port, username, identity, password)
 
 
 def save_serial_log(path: str, args_opt_level: str, results: Dict[str, Optional[CompilerResult]]):
@@ -1252,6 +1328,32 @@ def print_comparison(tcc_result: CompilerResult, gcc_result: CompilerResult):
     print("="*80)
 
 
+def detect_perf_failure(results: Dict[str, Optional['CompilerResult']],
+                        expected_keys: List[str]) -> List[str]:
+    """Return human-readable reasons this benchmark run failed *operationally*
+    (build/flash/run failed, produced no data, HARDFAULT/timeout, or an
+    on-hardware verify FAIL).  Empty list == clean run.
+
+    This is deliberately distinct from a perf *regression* (slower cycles):
+    regressions are noisy and visibility-only (metrics/gate.py), whereas an
+    operational failure means the benchmark did not run and pass, so its
+    numbers are absent or untrustworthy and CI must not stay green on it."""
+    reasons = []
+    for key in expected_keys:
+        res = results.get(key)
+        if res is None:
+            reasons.append(f"{key}: build/flash produced no result")
+            continue
+        if not res.build_success:
+            reasons.append(f"{key}: run failed (build/flash/HARDFAULT/timeout/no data)")
+        elif not res.benchmarks:
+            reasons.append(f"{key}: no benchmark rows parsed")
+        failed = [b.name for b in res.benchmarks if b.verify == "FAIL"]
+        if failed:
+            reasons.append(f"{key}: on-hardware verify FAIL: {', '.join(failed)}")
+    return reasons
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build, run and compare TCC vs GCC benchmarks on RP2350"
@@ -1433,6 +1535,11 @@ def main():
     print(f"Target: {username}@{hostname}:{args.port}")
     print("")
 
+    # Pre-init every result slot so the failure sweep below can reference them
+    # regardless of which opt-level branch ran (unassigned locals would NameError).
+    tcc_o0 = tcc_o1 = tcc_o2 = gcc_o0 = gcc_o1 = gcc_o2 = None
+    tcc_result = gcc_result = None
+
     # Run based on optimization level selection
     if args.opt_level == "all":
         # Run -O0, -O1, -O2 for both compilers = 6 hardware flashes
@@ -1475,6 +1582,22 @@ def main():
         # Print comparison if both results available
         if tcc_result and gcc_result and tcc_result.build_success and gcc_result.build_success:
             print_comparison(tcc_result, gcc_result)
+
+    # Collect every produced result under its canonical key (tcc_o0..gcc_o2) so
+    # the exit-code sweep and --save-data agree on what ran.  Single-opt runs
+    # land in tcc_result/gcc_result; map them onto the same key scheme.
+    all_results = {
+        'tcc_o0': tcc_o0, 'tcc_o1': tcc_o1, 'tcc_o2': tcc_o2,
+        'gcc_o0': gcc_o0, 'gcc_o1': gcc_o1, 'gcc_o2': gcc_o2,
+    }
+    if args.opt_level not in ("all", "both"):
+        all_results[f'tcc_o{args.opt_level}'] = tcc_result
+        all_results[f'gcc_o{args.opt_level}'] = gcc_result
+
+    _levels = {"0": ["0"], "1": ["1"], "2": ["2"],
+               "both": ["0", "1"], "all": ["0", "1", "2"]}[args.opt_level]
+    _comps = [args.only] if args.only else ["tcc", "gcc"]
+    expected_keys = [f"{c}_o{l}" for c in _comps for l in _levels]
 
     # Save to file if requested
     if args.output:
@@ -1550,6 +1673,20 @@ def main():
         save_results_json(args.save_data, save_dict)
 
     print("\nDone!")
+
+    # Truthful exit code: a benchmark that built, flashed, ran and verified
+    # cleanly exits 0; any operational failure exits 1 so callers (CI /
+    # metrics/record.py) don't mistake a broken run for a clean one.  Perf
+    # *regressions* (slower cycles) are NOT failures here -- those are the
+    # gate's job.  --save-data above already wrote whatever partial data we got.
+    reasons = detect_perf_failure(all_results, expected_keys)
+    if reasons:
+        print("\n" + "=" * 80)
+        print("BENCHMARK RUN FAILED (operational failure, not a perf regression):")
+        for r in reasons:
+            print(f"  - {r}")
+        print("=" * 80)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

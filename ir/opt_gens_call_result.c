@@ -61,6 +61,13 @@ static int ir_gen_dead_call_result(IROptCtx *ctx, int i)
         if (irop_get_vreg(po) == dest_vr)
           return 0;
       }
+      /* MLA has a 4th accumulator operand that the three-slot scan above
+       * misses; a call result consumed only as an accumulator is not dead. */
+      if (p->op == TCCIR_OP_MLA) {
+        IROperand accum = tcc_ir_op_get_accum(ir, p);
+        if (irop_get_vreg(accum) == dest_vr)
+          return 0;
+      }
     }
   }
 

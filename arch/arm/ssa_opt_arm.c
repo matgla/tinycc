@@ -10,6 +10,7 @@
 
 #define USING_GLOBALS
 #include "ir.h"
+#include "opt_xform.h"
 #include "ssa_opt.h"
 #include "ssa_opt_arm.h"
 
@@ -89,12 +90,20 @@ int ssa_gen_arm_fuse_mul_add_to_mla(IRSSAOptCtx *ctx, int instr_idx)
     return 0;
 
   /* Place the MLA at the ADD's position. By SSA dominance, MUL's inputs and
-   * the accumulator are all defined before the ADD, so this is always valid.
-   * Placing the MLA at the MUL's position would require the accumulator to
-   * dominate the MUL — that's the rarer case. */
+   * the accumulator are all defined before the ADD, so this is always valid
+   * for register operands.  Placing the MLA at the MUL's position would
+   * require the accumulator to dominate the MUL — that's the rarer case. */
   IROperand add_dest = tcc_ir_op_get_dest(ir, add_q);
   IROperand mul_src1 = tcc_ir_op_get_src1(ir, mul_q);
   IROperand mul_src2 = tcc_ir_op_get_src2(ir, mul_q);
+
+  /* A MUL source that reads memory would be re-read at the ADD's site;
+   * any store to that location in between changes the loaded value
+   * (volatile fuzz seed 5053: `vv11 = st.f0 * u5` before a loop that
+   * updates st.f0, product consumed after the loop). */
+  if ((ir_xform_operand_reads_memory(mul_src1) || ir_xform_operand_reads_memory(mul_src2)) &&
+      (add_q->is_jump_target || !ir_xform_range_preserves_memory(ir, instr_idx, add_idx)))
+    return 0;
 
   /* Allocate fresh pool space for the MLA's 4 operands (dest, src1, src2,
    * accum). Reusing the ADD's operand_base would clobber the next
@@ -856,6 +865,46 @@ int ssa_gen_arm_fuse_store_src_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
   int abs_imm = imm < 0 ? -imm : imm;
   if (abs_imm > 4095)
     return 0;
+
+  /* Unlike the LOAD variant (which rewrites the load op in place), this fuses
+   * the deref *source* of a STORE by turning the address-computing ADD into the
+   * LOAD_INDEXED — i.e. the load is RELOCATED upward from this STORE to the
+   * ADD's definition site.  That hoist is only sound when nothing between the
+   * two positions can write the loaded memory or divert control flow.  GVN can
+   * CSE the address so the defining ADD sits before a later store to the same
+   * slot (fuzz seed 2137: `arr[i]` read, `arr[i]=v`, then an unrolled re-read of
+   * arr[i] whose address was CSE'd back to the first read's LEA) — the hoisted
+   * load would then read the pre-store value.  Bail on any intervening memory
+   * clobber or control-flow op (the latter also restricts the hoist to a single
+   * straight-line basic block). */
+  {
+    int didx = vi->def_instr;
+    if (didx >= instr_idx)
+      return 0;
+    for (int j = didx + 1; j < instr_idx; j++) {
+      switch (ir->compact_instructions[j].op) {
+      case TCCIR_OP_STORE:
+      case TCCIR_OP_STORE_INDEXED:
+      case TCCIR_OP_STORE_POSTINC:
+      case TCCIR_OP_FUNCCALLVAL:
+      case TCCIR_OP_FUNCCALLVOID:
+      case TCCIR_OP_BLOCK_COPY:
+      case TCCIR_OP_INLINE_ASM:
+      case TCCIR_OP_VLA_ALLOC:
+      case TCCIR_OP_SETJMP:
+      case TCCIR_OP_LONGJMP:
+      case TCCIR_OP_NL_SETJMP:
+      case TCCIR_OP_NL_LONGJMP:
+      case TCCIR_OP_JUMP:
+      case TCCIR_OP_JUMPIF:
+      case TCCIR_OP_IJUMP:
+      case TCCIR_OP_SWITCH_TABLE:
+        return 0;
+      default:
+        break;
+      }
+    }
+  }
 
   IROperand lea_dest = tcc_ir_op_get_dest(ir, dq);
   /* Update btype to match the loaded value (the LEA dest was a pointer-typed

@@ -54,6 +54,12 @@ typedef struct {
   int btype;
   int32_t stored_vr;    /* TEMP vreg, or -1 if immediate */
   IROperand stored_imm; /* valid when stored_vr == -1 */
+  /* Identity of the stored-to location: -1 for a real direct stack slot (the
+   * offset uniquely names it), or the VAR/PARAM base vreg for a `&VAR` address
+   * whose offset is a placeholder shared by every distinct local.  A load only
+   * forwards from this entry when its own resolved base matches (ptr fuzz seed
+   * 67: `&u2` and `&u3` both resolve to offset 0 but must not alias). */
+  int32_t base_var;
 } SStoreEntry;
 
 typedef struct {
@@ -173,13 +179,15 @@ static void sstore_invalidate_overlap(GLoadState *st, int offset, int btype)
   }
 }
 
-static void sstore_track_vr(GLoadState *st, int offset, int btype, int32_t stored_vr)
+static void sstore_track_vr(GLoadState *st, int offset, int btype, int32_t stored_vr,
+                            int32_t base_var)
 {
   sstore_invalidate_overlap(st, offset, btype);
   int k = sstore_find(st, offset);
   if (k >= 0) {
     st->sstores[k].btype = btype;
     st->sstores[k].stored_vr = stored_vr;
+    st->sstores[k].base_var = base_var;
     return;
   }
   if (st->scount >= SSTORE_MAX)
@@ -188,9 +196,11 @@ static void sstore_track_vr(GLoadState *st, int offset, int btype, int32_t store
   e->stack_offset = offset;
   e->btype = btype;
   e->stored_vr = stored_vr;
+  e->base_var = base_var;
 }
 
-static void sstore_track_imm(GLoadState *st, int offset, int btype, IROperand imm)
+static void sstore_track_imm(GLoadState *st, int offset, int btype, IROperand imm,
+                             int32_t base_var)
 {
   sstore_invalidate_overlap(st, offset, btype);
   int k = sstore_find(st, offset);
@@ -198,6 +208,7 @@ static void sstore_track_imm(GLoadState *st, int offset, int btype, IROperand im
     st->sstores[k].btype = btype;
     st->sstores[k].stored_vr = -1;
     st->sstores[k].stored_imm = imm;
+    st->sstores[k].base_var = base_var;
     return;
   }
   if (st->scount >= SSTORE_MAX)
@@ -207,6 +218,7 @@ static void sstore_track_imm(GLoadState *st, int offset, int btype, IROperand im
   e->btype = btype;
   e->stored_vr = -1;
   e->stored_imm = imm;
+  e->base_var = base_var;
 }
 
 static void sstore_remove_vr(GLoadState *st, int32_t vr)
@@ -398,6 +410,24 @@ static void iload_remove_vr(GLoadState *st, int32_t vr)
   }
 }
 
+/* A direct def of an address-taken VAR/PARAM (`V <-- T SUB #imm`, plain ALU
+ * or ASSIGN — not a STORE op) still writes V's stack slot, memory that the
+ * TEMP-pointer-keyed trackers (iloads, tvstores) may name through a `&V`
+ * pointer.  Keying by vreg ID can't see that aliasing, so drop both trackers
+ * (fuzz ptr seed 6734: `p = &u; ..= *p; u = expr; ..= *p` — the second read
+ * CSE'd to the first across u's update). */
+static void ptr_state_kill_for_addrtaken_def(TCCIRState *ir, GLoadState *st, int32_t dvr)
+{
+  int type = TCCIR_DECODE_VREG_TYPE(dvr);
+  if (type != TCCIR_VREG_TYPE_VAR && type != TCCIR_VREG_TYPE_PARAM)
+    return;
+  IRLiveInterval *vi = tcc_ir_vreg_live_interval(ir, dvr);
+  if (vi && !vi->addrtaken)
+    return;
+  st->ilcount = 0;
+  st->tvcount = 0;
+}
+
 /* Kill iload entries that may alias a store at byte range [store_lo, store_hi)
  * through base store_base_vr.  Entries with a different base_vr are killed
  * conservatively (different TEMP vregs may still alias the same memory). */
@@ -452,6 +482,59 @@ static void iload_kill_for_stack_store(IRSSAOptCtx *ctx, GLoadState *st, int32_t
        * pointer.  Won't alias a fresh local-stack store unless the address
        * escaped, but the SSA load-CSE only tracks LOADs of such bases when
        * they look pointer-like.  Skip kill. */
+    }
+    if (kill) {
+      st->iloads[k] = st->iloads[--st->ilcount];
+      k--;
+    }
+  }
+}
+
+/* Kill iload entries a *direct* stack store (`StackLoc[off] <- val`) may alias.
+ *
+ * The main STORE handler treats STACKOFF-dest stores as unable to alias the
+ * iload tracker (store_aliases_globals=0) — a shortcut that was only sound when
+ * iload held global-array LOAD_INDEXED entries.  The canonical TEMP-DEREF LOAD
+ * CSE now also tracks entries whose base is a VAR pointer holding the address of
+ * a *local* array (`p = &arr[i]`; ptr fuzz seed 380495: `*p5` CSE'd across the
+ * direct stack store `arr4[1] = ...` that is the very slot `*p5` names).  Such
+ * entries must be invalidated by a stack store.
+ *
+ * Precise for TEMP bases that resolve to a stack offset (when store_off_exact,
+ * i.e. the store names a real slot rather than a placeholder-offset named
+ * local); conservative for VAR bases (a possibly-multi-def named pointer that
+ * may point into the frame).  PARAM bases and TEMP bases resolving to non-stack
+ * (global/heap) memory cannot alias a fresh local slot, so they are preserved. */
+static void iload_kill_for_direct_stack_store(IRSSAOptCtx *ctx, GLoadState *st,
+                                              int store_off, int store_size,
+                                              int store_off_exact)
+{
+  int store_lo = store_off, store_hi = store_off + store_size;
+  for (int k = 0; k < st->ilcount; k++) {
+    const ILoadEntry *e = &st->iloads[k];
+    int kill = 0;
+    int etype = TCCIR_DECODE_VREG_TYPE(e->base_vr);
+    if (etype == TCCIR_VREG_TYPE_TEMP) {
+      int base_off = ssa_opt_resolve_lea_stackloc(ctx, e->base_vr);
+      if (base_off != INT_MIN) {
+        if (!store_off_exact) {
+          /* Store offset is a placeholder (named-local slot form); we can't
+           * compare byte ranges, so any stack-resolving base may alias. */
+          kill = 1;
+        } else {
+          int elo = base_off + (int)e->idx_imm * (1 << e->scale);
+          int ehi = elo + slot_btype_bytes(e->btype);
+          if (elo < store_hi && ehi > store_lo)
+            kill = 1;
+        }
+      }
+      /* TEMP base that does not resolve to the stack names global/heap
+       * memory — a local stack store cannot reach it. */
+    } else if (etype == TCCIR_VREG_TYPE_VAR) {
+      /* A VAR pointer may hold `&localarray[i]`; a direct stack store can
+       * alias its pointee and we cannot cheaply resolve a (possibly
+       * multi-def) VAR's stack offset.  Invalidate conservatively. */
+      kill = 1;
     }
     if (kill) {
       st->iloads[k] = st->iloads[--st->ilcount];
@@ -653,23 +736,35 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
         if (src.is_lval && !src.is_sym && !irop_is_immediate(src)) {
           int load_off = INT_MIN;
           int load_btype = irop_get_btype(src);
+          int32_t load_base = -1;
           if (src.tag == IROP_TAG_STACKOFF) {
             int32_t svr = irop_get_vreg(src);
             if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
               load_off = irop_get_stack_offset(src);
           } else if (src.tag == IROP_TAG_VREG && !src.is_local) {
             int32_t pvr = irop_get_vreg(src);
-            load_off = resolve_lea_stackloc(ctx, pvr);
+            load_off = ssa_opt_resolve_lea_stackloc_ex(ctx, pvr, &load_base);
           }
           if (load_off != INT_MIN) {
             int sk = sstore_find(st, load_off);
-            if (sk >= 0 && st->sstores[sk].btype == load_btype) {
+            if (sk >= 0 && st->sstores[sk].btype == load_btype &&
+                st->sstores[sk].base_var == load_base) {
               SStoreEntry *se = &st->sstores[sk];
               if (se->stored_vr < 0) {
+                /* The deref source is replaced by the forwarded immediate,
+                 * so the pointer vreg is no longer referenced here — drop
+                 * its use record, like every sibling forwarding path.  A
+                 * stale entry corrupts the pointer's use list (ptr fuzz
+                 * seed 7226: a later swap-remove + count-only rebuild left
+                 * the wrong entry, a live deref use vanished, and cprop/DCE
+                 * deleted the pointer's def while a deref still read it). */
+                if (src.tag == IROP_TAG_VREG) {
+                  IRSSAVregInfo *pvi = ssa_opt_vinfo(ctx, irop_get_vreg(src));
+                  if (pvi)
+                    ssa_opt_remove_use_instr(pvi, i);
+                }
                 tcc_ir_set_src1(ir, i, se->stored_imm);
                 changes++;
-                /* Refresh dest after rewrite (no-op for STORE; just use
-                 * existing local to keep flow consistent). */
               }
             }
           }
@@ -679,16 +774,69 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
       /* Track StackLoc stores for stack forwarding.  Record the stored
        * slot width so narrower subfield loads do not reuse wider values. */
       if (dest.tag == IROP_TAG_STACKOFF) {
+        /* A real stack memory write may alias any TVStore pointer: a
+         * tvstore is only tracked when its pointer did NOT resolve to a
+         * stack slot, so nothing proves it doesn't point right here (ptr
+         * fuzz seed 8507: `*T = const` with T = Addr[StackLoc[-32]]+4
+         * survived the direct store `StackLoc[-28] <- u2` to the same
+         * address and forwarded the stale constant into a later deref). */
+        if (dest.is_lval || q->op == TCCIR_OP_STORE_INDEXED)
+          st->tvcount = 0;
+        /* A direct stack write (`StackLoc[off] <- val`) can alias iload
+         * entries whose base points into the local frame (a VAR pointer
+         * `&arr[i]`, or a TEMP resolving to an overlapping stack slot).  The
+         * store_aliases_globals shortcut above skipped iload handling for
+         * STACKOFF dests, so invalidate those entries here.  Runs before the
+         * no_stack_fwd gate below — correctness, not forwarding. */
+        if (st->ilcount > 0 && dest.is_lval && dest.is_local &&
+            q->op == TCCIR_OP_STORE) {
+          /* A real stack slot encodes its identity in the offset (vreg -1); a
+           * named local carries the VAR vreg and a placeholder offset. */
+          int off_exact = (irop_get_vreg(dest) < 0);
+          iload_kill_for_direct_stack_store(ctx, st, irop_get_stack_offset(dest),
+                                            slot_btype_bytes(irop_get_btype(dest)),
+                                            off_exact);
+        }
         IROperand src = tcc_ir_op_get_src1(ir, q);
         int32_t svr = irop_get_vreg(src);
         /* Direct stack stores are encoded as StackLoc lvalues.  Non-lvalue
          * STACKOFF operands are stack addresses, not memory writes. */
         if (!ctx->no_stack_fwd && dest.is_local && dest.is_lval && !dest.is_llocal) {
           int store_btype = irop_get_btype(dest);
+          /* irop_get_vreg(dest) is -1 for a real stack slot (offset is the
+           * identity) or the VAR vreg for a named local addressed by its slot
+           * encoding (offset is a placeholder; the vreg is the identity). */
+          int32_t dest_base = irop_get_vreg(dest);
           if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
-            sstore_track_vr(st, irop_get_stack_offset(dest), store_btype, svr);
+            sstore_track_vr(st, irop_get_stack_offset(dest), store_btype, svr, dest_base);
           else if (irop_is_immediate(src))
-            sstore_track_imm(st, irop_get_stack_offset(dest), store_btype, src);
+            sstore_track_imm(st, irop_get_stack_offset(dest), store_btype, src, dest_base);
+          else {
+            int off = irop_get_stack_offset(dest);
+            sstore_invalidate_overlap(st, off, store_btype);
+            sstore_remove_offset(st, off);
+          }
+        } else if (q->op == TCCIR_OP_STORE_INDEXED) {
+          /* Indexed write through a stack base address (Addr[StackLoc[B]] +
+           * idx*scale).  The base-offset-only removal in the plain branch below
+           * dropped just the B slot, leaving the sibling slots forwardable even
+           * though a runtime index can land on any of them (fuzz seed 2657:
+           * `arr[i]=v` with runtime i, then a fully-unrolled `for k arr[k]` whose
+           * reads wrongly forwarded the initializer values for k != B).  With a
+           * constant index invalidate just the exact slot; with a runtime index
+           * conservatively drop all stack-store and indexed-load forwarding. */
+          IROperand idx = tcc_ir_op_get_src2(ir, q);
+          IROperand sc = tcc_ir_op_get_scale(ir, q);
+          if (irop_is_immediate(idx) && irop_is_immediate(sc)) {
+            int off = irop_get_stack_offset(dest) +
+                      (int)irop_get_imm32(idx) * (1 << irop_get_imm32(sc));
+            sstore_invalidate_overlap(st, off, irop_get_btype(dest));
+            sstore_remove_offset(st, off);
+            st->ilcount = 0;
+          } else {
+            st->scount = 0;
+            st->ilcount = 0;
+          }
         } else {
           /* A non-direct STACKOFF write may expose the address. */
           int off = irop_get_stack_offset(dest);
@@ -709,16 +857,17 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
            ((q->op == TCCIR_OP_STORE && dest.is_lval) ||
             q->op == TCCIR_OP_STORE_INDEXED));
       if (store_dest_is_temp_indir) {
-        int eff_off = ssa_opt_indirect_stack_offset(ctx, q, SSA_OPT_INDIRECT_DEST);
+        int32_t store_base = -1;
+        int eff_off = ssa_opt_indirect_stack_offset_ex(ctx, q, SSA_OPT_INDIRECT_DEST, &store_base);
         if (eff_off != INT_MIN) {
           if (!ctx->no_stack_fwd) {
             IROperand src = tcc_ir_op_get_src1(ir, q);
             int store_btype = irop_get_btype(dest);
             int32_t svr = irop_get_vreg(src);
             if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
-              sstore_track_vr(st, eff_off, store_btype, svr);
+              sstore_track_vr(st, eff_off, store_btype, svr, store_base);
             else if (irop_is_immediate(src))
-              sstore_track_imm(st, eff_off, store_btype, src);
+              sstore_track_imm(st, eff_off, store_btype, src, store_base);
             else
               sstore_remove_offset(st, eff_off);
           }
@@ -817,12 +966,18 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
             gstore_remove_vr(st, dvr);
             tvstore_remove_vr(st, dvr);
             iload_remove_vr(st, dvr);
+            ptr_state_kill_for_addrtaken_def(ir, st, dvr);
           }
           continue;
         }
       }
 
       if (dest.is_sym && dest.is_lval) {
+        /* Same aliasing gap as stack stores: an unresolved TVStore pointer
+         * may name this very global (`&sym + off` LEAs that never became
+         * SymRef operands are exactly what tvstores track), so a direct
+         * sym store must drop them. */
+        st->tvcount = 0;
         IRPoolSymref *sref = irop_get_symref_ex(ir, dest);
         if (sref && sref->sym) {
           for (int k = 0; k < st->count; k++) {
@@ -896,6 +1051,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
         gstore_remove_vr(st, qdvr);
         tvstore_remove_vr(st, qdvr);
         iload_remove_vr(st, qdvr);
+        ptr_state_kill_for_addrtaken_def(ir, st, qdvr);
       }
     }
 
@@ -957,10 +1113,12 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
        * tracked stack store at that offset.  ssa_opt_indirect_stack_offset
        * already enforces scale==0 and constant idx. */
       if (!ctx->no_stack_fwd) {
-        int eff_off = ssa_opt_indirect_stack_offset(ctx, q, SSA_OPT_INDIRECT_SRC1);
+        int32_t load_base = -1;
+        int eff_off = ssa_opt_indirect_stack_offset_ex(ctx, q, SSA_OPT_INDIRECT_SRC1, &load_base);
         if (eff_off != INT_MIN) {
           int sk = sstore_find(st, eff_off);
-          if (sk >= 0 && st->sstores[sk].btype == il_btype) {
+          if (sk >= 0 && st->sstores[sk].btype == il_btype &&
+              st->sstores[sk].base_var == load_base) {
             SStoreEntry *se = &st->sstores[sk];
             IROperand new_src;
             if (se->stored_vr >= 0) {
@@ -1113,6 +1271,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
     /* Stack store-load forwarding */
     if (src1.is_lval && !src1.is_sym) {
       int stack_off = INT_MIN;
+      int32_t load_base = -1;
 
       /* Direct StackLoc load: T <-- StackLoc[N] [LOAD].
        * Skip if the operand carries a VAR vreg — that's a load from a
@@ -1127,7 +1286,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
       /* LEA+DEREF load: T <-- *Addr[StackLoc[N]] [LOAD] */
       if (stack_off == INT_MIN) {
         int32_t ptr_vr = irop_get_vreg(src1);
-        stack_off = resolve_lea_stackloc(ctx, ptr_vr);
+        stack_off = ssa_opt_resolve_lea_stackloc_ex(ctx, ptr_vr, &load_base);
       }
 
       if (stack_off != INT_MIN) {
@@ -1135,6 +1294,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
         if (sk >= 0) {
           SStoreEntry *se = &st->sstores[sk];
           if (se->btype != dest_btype)
+            continue;
+          /* Only forward when the store and this load name the same location:
+           * for `&VAR` addresses the offset is a shared placeholder, so the
+           * canonical base must match (ptr fuzz seed 67). */
+          if (se->base_var != load_base)
             continue;
           IROperand new_src;
           if (se->stored_vr >= 0) {

@@ -1305,8 +1305,12 @@ static int link_option(const char *str, const char *val, const char **ptr)
       return 0;
     p++;
   }
-  else if (*p)
+  else if (*p && *p != ',')
   {
+    /* A bare boolean flag (no '=') may still be followed by a ',' when it
+       precedes another suboption in the same -Wl, comma chain.  Leave *ptr
+       pointing at that comma so tcc_set_linker()'s skip_linker_arg() advances
+       to the next suboption instead of rejecting the whole chain. */
     return 0;
   }
   *ptr = p;

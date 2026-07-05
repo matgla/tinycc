@@ -111,6 +111,42 @@ UT_TEST(test_pool_add_grows_capacity)
   return 0;
 }
 
+/* Regression lock for bugs.md #3 (fixed): a zero-capacity pool must grow
+ * instead of hanging (tcc_ir_pool_ensure's `capacity *= 2` loop is `0*2==0`
+ * forever) or overflowing a zero-size buffer (tcc_ir_pool_add's single
+ * `*= 2`). Both now seed capacity to 1 before doubling. */
+UT_TEST(test_pool_add_from_zero_capacity_grows)
+{
+  TCCIRState *ir = (TCCIRState *)tcc_mallocz(sizeof(*ir));
+  ir->iroperand_pool_capacity = 0;
+  ir->iroperand_pool_count = 0;
+  ir->iroperand_pool = NULL;
+
+  int idx = tcc_ir_pool_add(ir, ut_irop_with_imm(42));
+  UT_ASSERT_EQ(idx, 0);
+  UT_ASSERT(ir->iroperand_pool_capacity >= 1);
+  UT_ASSERT_EQ(tcc_ir_pool_get(ir, 0).u.imm32, 42);
+
+  tcc_free(ir->iroperand_pool);
+  tcc_free(ir);
+  return 0;
+}
+
+UT_TEST(test_pool_ensure_from_zero_capacity_terminates)
+{
+  TCCIRState *ir = (TCCIRState *)tcc_mallocz(sizeof(*ir));
+  ir->iroperand_pool_capacity = 0;
+  ir->iroperand_pool_count = 0;
+  ir->iroperand_pool = NULL;
+
+  tcc_ir_pool_ensure(ir, 5); /* would spin forever (0*2==0) before the fix */
+  UT_ASSERT(ir->iroperand_pool_capacity >= 5);
+
+  tcc_free(ir->iroperand_pool);
+  tcc_free(ir);
+  return 0;
+}
+
 UT_SUITE(ir_pool)
 {
   UT_RUN(test_pool_add_returns_sequential_indices);
@@ -118,4 +154,6 @@ UT_SUITE(ir_pool)
   UT_RUN(test_pool_get_out_of_range_returns_zero);
   UT_RUN(test_pool_set_overwrites_entry);
   UT_RUN(test_pool_add_grows_capacity);
+  UT_RUN(test_pool_add_from_zero_capacity_grows);
+  UT_RUN(test_pool_ensure_from_zero_capacity_terminates);
 }

@@ -46,9 +46,15 @@ CFLAGS += $(CPPFLAGS) -std=c11 -Wunused-function -Wno-declaration-after-statemen
 VPATH = $(TOPSRC) $(TOPSRC)/arch
 -LTCC = $(TOP)/$(LIBTCC)
 
-# Enable extra runtime-debug features (not for release builds).
-# This is intentionally controlled by configure's --debug (CONFIG_debug=yes).
-ifeq ($(CONFIG_debug),yes)
+# Dump-IR support: the -dump-ir / -dump-ir-passes options and the per-pass IR
+# dumps they drive (all guarded by CONFIG_TCC_DEBUG, which in this fork gates
+# nothing but the IR-dump feature).  Enabled by default so IR tooling and the
+# frontend golden-IR tests work with a plain `make cross`.  The dump calls are
+# no-ops unless -dump-ir is passed, so this has no effect on generated code.
+#
+# For a smaller "minimal" release binary without the dump-IR machinery, build
+# with CONFIG_minimal=yes (e.g. `make cross CONFIG_minimal=yes`).
+ifneq ($(CONFIG_minimal),yes)
  CFLAGS += -DCONFIG_TCC_DEBUG
 endif
 
@@ -164,6 +170,15 @@ CHECKSUM_CMD = $(shell command -v sha256sum 2>/dev/null || command -v md5sum 2>/
 # proceed while still keeping ASan instrumentation.
 ifeq ($(CONFIG_asan),yes)
 SAN_ENV = LSAN_OPTIONS=detect_leaks=0 ASAN_OPTIONS=detect_leaks=0
+# Leak detection (LSan) is enabled by default for `make test`: every compiler
+# invocation runs the at-exit leak check, so any leak in tcc surfaces as a
+# non-zero exit.  Note tcc (like most compilers) intentionally does not free
+# everything on exit, so known pre-existing leaks will fail here too; override
+# by exporting your own [AL]SAN_OPTIONS (e.g. detect_leaks=0) to opt out.
+# The nested fp-libs build (SAN_ENV above) keeps leak detection off so the
+# build can still complete.
+export LSAN_OPTIONS ?= detect_leaks=1
+export ASAN_OPTIONS ?= detect_leaks=1
 endif
 
 
@@ -338,18 +353,26 @@ endif
 	gcc -DC2STR $(filter %.c,$^) -o c2str.exe && ./c2str.exe $< $@
 
 # target specific object rules
-$(X)%.o : %.c $(LIBTCC_INC)
+# (depend on config.mak so toggling build flags — e.g. ASan via
+# ./configure [--disable-asan] — forces a recompile instead of silently
+# relinking stale, differently-instrumented objects)
+$(X)%.o : %.c $(LIBTCC_INC) config.mak
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
 # Architecture library — built by nested Makefile
 TARGET_ARCH_NAME = $($T_ARCH)
 $(ARCH_LIB): FORCE
 	@mkdir -p $(dir $(ARCH_LIB))
+	@# Build flags changed (e.g. ASan toggled via configure)?  Drop stale objects
+	@# since the nested arch Makefile only tracks source timestamps, not flags.
+	@if [ -f "$(ARCH_LIB)" ] && [ config.mak -nt "$(ARCH_LIB)" ]; then \
+		rm -f $(dir $(ARCH_LIB))*.o "$(ARCH_LIB)"; \
+	fi
 	$S$(MAKE) --no-print-directory -C arch ARCH=$(TARGET_ARCH_NAME) \
 		TOP=$(CURDIR) BUILD_DIR=$(CURDIR)/$(dir $(ARCH_LIB)) \
 		CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" DEFINES="$(DEFINES)"
 
-$(X)ir/%.o : ir/%.c $(LIBTCC_INC)
+$(X)ir/%.o : ir/%.c $(LIBTCC_INC) config.mak
 	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
@@ -486,8 +509,25 @@ config.mak:
 PYTHON ?= python3
 PYTEST ?= pytest
 
-# Pytest parallel workers: make test J=16 → pytest -n 16 (default: auto)
+# Pytest parallel workers: make test J=16 → pytest -n 16 (default: auto).
+# J=1 disables xdist entirely so logs are sequential.
 J ?= auto
+PYTEST_XDIST ?= -n $(J)
+ifeq ($(J),1)
+PYTEST_XDIST =
+endif
+
+# Verbose pytest output (per-test names) only in CI; keep local runs terse.
+# Usage: make test CI=1
+CI ?= 0
+ifeq ($(CI),1)
+PYTEST_VERBOSE := -v
+else
+PYTEST_VERBOSE :=
+endif
+
+# Cross compiler used by pytest test suites.
+CROSS_COMPILER = $(CURDIR)/armv8m-tcc
 
 # If set to 1, wrap compiler invocations with valgrind to detect memory errors.
 # Usage: make test VALGRIND=1
@@ -509,6 +549,7 @@ IRTESTS_REQUIREMENTS := $(IRTESTS_DIR)/requirements.txt
 IRTESTS_VENV_STAMP := $(VENV_DIR)/.irtests-requirements.stamp
 PCH_BENCHMARK_SCRIPT := $(IRTESTS_DIR)/benchmark_pch.py
 PCH_PREPARE_SCRIPT := $(IRTESTS_DIR)/prepare_pch.py
+GOLDEN_IR_COMPILER ?= $(TOP)/armv8m-tcc.debug
 
 NEWLIB_DIR := $(IRTESTS_DIR)/qemu/mps2-an505/newlib_build/arm-none-eabi/newlib
 NEWLIB_LIBC_A := $(NEWLIB_DIR)/libc.a
@@ -606,9 +647,9 @@ test-asm: cross test-venv
 		TEST_OBJCOPY="arm-none-eabi-objcopy"; \
 		export TEST_CC TEST_COMPARE_CC TEST_OBJDUMP TEST_OBJCOPY; \
 		if [ "$(USE_VENV)" = "1" ]; then \
-			"$(VENV_PY)" -m pytest --tb=short -q -n $(J) .; \
+			"$(VENV_PY)" -m pytest --tb=short -q $(PYTEST_XDIST) .; \
 		else \
-			$(PYTEST) --tb=short -q -n $(J) .; \
+			$(PYTEST) --tb=short -q $(PYTEST_XDIST) .; \
 		fi
 
 # Check that cross-compilation produces no unexpected warnings or errors.
@@ -648,13 +689,90 @@ warn-check: armv8m-tcc$(EXESUF) patch-newlib
 	if [ "$$fail" -ne 0 ]; then exit 1; fi
 	@echo "------------ warn-check: passed ------------"
 
+# run frontend coverage tests
+# Fast, QEMU-free preprocessor / type-system / diagnostic golden tests.
+test-frontend: cross
+	@echo "------------ frontend tests ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests/frontend && "$(VENV_PY)" -m pytest -q --compiler=$(CROSS_COMPILER); \
+	else \
+		cd $(TOP)/tests/frontend && $(PYTEST) -q --compiler=$(CROSS_COMPILER); \
+	fi
+
+# run linker/object coverage tests
+# Fast, QEMU-free readelf/objdump golden tests.
+test-linker: cross
+	@echo "------------ linker tests ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests/linker && "$(VENV_PY)" -m pytest -q; \
+	else \
+		cd $(TOP)/tests/linker && $(PYTEST) -q; \
+	fi
+
+# run debug-info coverage tests
+# Fast, QEMU-free DWARF/STAB readelf tests.
+test-debug: cross
+	@echo "------------ debug-info tests ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests/debug && "$(VENV_PY)" -m pytest -q; \
+	else \
+		cd $(TOP)/tests/debug && $(PYTEST) -q; \
+	fi
+
+# run runtime-library coverage tests
+# Host-native soft-FP tests plus cross-compiled runtime-helper reference tests.
+test-runtime: cross
+	@echo "------------ runtime-library tests ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests/runtime && "$(VENV_PY)" -m pytest -q --compiler=$(CROSS_COMPILER); \
+	else \
+		cd $(TOP)/tests/runtime && $(PYTEST) -q --compiler=$(CROSS_COMPILER); \
+	fi
+
+# run self-host bootstrap gate
+# Compile-only smoke test always runs; FAT-drive round-trip skips if YasOS env is missing.
+test-selfhost: cross
+	@echo "------------ self-host bootstrap gate ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(TOP)/tests/selfhost && "$(VENV_PY)" -m pytest -q --compiler=$(CROSS_COMPILER); \
+	else \
+		cd $(TOP)/tests/selfhost && $(PYTEST) -q --compiler=$(CROSS_COMPILER); \
+	fi
+
 # run IR tests via pytest (preferred)
-test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut
+.PHONY: test-ir
+test-ir: cross test-venv test-prepare download-gcc-tests
 	@echo "------------ ir_tests (pytest) ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s -n $(J) --durations=10; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s $(PYTEST_VERBOSE) $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -s -n $(J) --durations=10; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s $(PYTEST_VERBOSE) $(PYTEST_XDIST) -m "not golden_ir" --durations=10; \
+	fi
+
+# container target: runs the full test suite (all test-* targets below)
+.NOTPARALLEL: test test-full test-all
+test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut test-frontend test-linker test-debug test-runtime test-selfhost test-ir
+	@echo "------------ test suite complete ------------"
+
+# Fully sequential test run: disables pytest-xdist too, for the cleanest logs.
+.PHONY: test-sequential
+test-sequential:
+	@+$(MAKE) --no-print-directory test J=1
+
+# run golden IR snapshot tests explicitly.
+# These require a compiler built with CONFIG_TCC_DEBUG because -dump-ir-passes
+# is intentionally a debug/diagnostic interface.  Set GOLDEN_IR_COMPILER to a
+# specific debug binary, or leave it unset to use the runner's fallback search.
+test-golden-ir: test-venv
+	@echo "------------ golden IR snapshot tests ------------"
+	@compiler_arg=""; \
+	if [ -x "$(GOLDEN_IR_COMPILER)" ]; then \
+		compiler_arg="--compiler $(GOLDEN_IR_COMPILER)"; \
+	fi; \
+	if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s $(PYTEST_XDIST) -m "golden_ir" --require-dump-ir $$compiler_arg test_golden_ir.py; \
+	else \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s $(PYTEST_XDIST) -m "golden_ir" --require-dump-ir $$compiler_arg test_golden_ir.py; \
 	fi
 
 # legacy tests (kept for reference)
@@ -672,6 +790,15 @@ tcov-tes% : tcc_c$(EXESUF)
 	@$(MAKE) --no-print-directory TCC_LOCAL=$(CURDIR)/$< tes$*
 tcc_c$(EXESUF): $($T_FILES)
 	$S$(TCC) tcc.c -o $@ -ftest-coverage $(DEFINES) $(LIBS)
+
+# Merged line-coverage report for tccgen.c: the real cross compiler (tccgen.c
+# instrumented) run over the whole compile-test corpus, unioned with the
+# isolated tccgen unit tests.  Restores the normal build on exit.  Requires
+# lcov/genhtml.  Tunables: COV_JOBS, COV_OLEVELS, COV_OUT, COV_NO_TORTURE=1.
+# Output: coverage-tccgen/index.html + coverage-tccgen/tccgen.info
+.PHONY: coverage-tccgen
+coverage-tccgen:
+	@$(TOPSRC)/scripts/coverage_tccgen.sh
 # test the installed tcc instead
 test-install: $(TCCDEFS_H)
 	@$(MAKE) -C tests TESTINSTALL=yes #_all
@@ -692,9 +819,9 @@ distclean: clean
 test-tests2: cross test-venv
 	@echo "------------ tests2 test suite ------------"
 	@if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --tests2 -v -n $(J); \
+		cd $(TOP)/tests && "$(VENV_PY)" run_tests.py --tests2 -v $(PYTEST_XDIST); \
 	else \
-		cd $(TOP)/tests && $(PYTEST) -v -m tests2 --tb=short -n $(J) tests/tests2/; \
+		cd $(TOP)/tests && $(PYTEST) -v -m tests2 --tb=short $(PYTEST_XDIST) tests/tests2/; \
 	fi
 
 # download GCC torture tests
@@ -711,9 +838,9 @@ test-gcc-torture-compile: cross test-venv test-prepare download-gcc-tests
 		PYTEST_TIMEOUT=""; \
 	fi; \
 	if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_compile" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_compile" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_compile" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_compile" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	fi
 
 # run GCC torture execute tests only (via ir_tests framework)
@@ -725,9 +852,9 @@ test-gcc-torture-execute: cross test-venv test-prepare download-gcc-tests
 		PYTEST_TIMEOUT=""; \
 	fi; \
 	if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_execute" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_execute" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_execute" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_execute" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	fi
 
 # run full GCC torture tests (compile + execute via ir_tests framework)
@@ -739,9 +866,9 @@ test-gcc-torture: cross test-venv test-prepare download-gcc-tests
 		PYTEST_TIMEOUT=""; \
 	fi; \
 	if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_torture" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -m "gcc_torture" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_torture" --tb=short -n $(J) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -m "gcc_torture" --tb=short $(PYTEST_XDIST) $$PYTEST_TIMEOUT test_gcc_torture_ir.py; \
 	fi
 
 # run full test suite (IR + GCC torture compile-only)
@@ -761,10 +888,22 @@ test-valgrind:
 ut:
 	$(MAKE) -C tests/unit run
 
+# pipeline pass coverage ledger: compares PASS/PASS_GATED names in
+# ir/opt_pipeline.c + SSA_RUN names against UT_COVERS markers and golden-IR
+# directories.  89/89 (100%) reached 2026-07-01 (see docs/plan_ut_next_steps.md);
+# --strict now hard-fails on any regression.
+check-pass-coverage:
+	@python3 tests/unit/check_pass_coverage.py --strict
+
+# gcov line/branch coverage report for the unit tests (requires gcovr).
+# Renders HTML + text under tests/unit/<target>/build/coverage/.
+ut-coverage:
+	$(MAKE) -C tests/unit coverage
+
 ut-clean:
 	$(MAKE) -C tests/unit clean
 
-.PHONY: all cross fp-libs clean test test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-clean FORCE
+.PHONY: all cross fp-libs clean test test-ir test-sequential test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all test-frontend test-linker test-debug test-runtime test-selfhost test-golden-ir rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-coverage ut-clean check-pass-coverage FORCE
 
 # Container image settings (auto-detect docker or podman)
 DOCKER_REGISTRY ?= ghcr.io
@@ -825,7 +964,11 @@ help:
 	@echo "   $(wordlist 1,8,$(TCC_X))"
 	@echo "   $(wordlist 9,99,$(TCC_X))"
 	@echo "make test"
+	@echo "   run the full test suite (test-ir + test-asm + warn-check + ut + ...)"
+	@echo "make test-ir"
 	@echo "   rebuild + initialize GCC testsuite + run pytest in tests/ir_tests"
+	@echo "make test-sequential"
+	@echo "   same as make test, but runs pytest sequentially for clean logs"
 	@echo "make rebuild-newlib"
 	@echo "   wipe and rebuild newlib used by ir_tests/qemu (mps2-an505)"
 	@echo "make test-legacy"

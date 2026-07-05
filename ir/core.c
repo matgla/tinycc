@@ -86,6 +86,7 @@ TCCIRState *tcc_ir_alloc(void)
   block->processing_if = 0;
   block->basic_block_start = 1;
   block->prevent_coalescing = 0;
+  block->func_has_label_addr = 0;
 
   /* Nested function / static chain fields */
   block->has_static_chain = 0;
@@ -206,6 +207,35 @@ void tcc_ir_free(TCCIRState *ir)
   {
     tcc_free(ir->parameters_live_intervals);
   }
+
+  if (ir->barrel_shifts)
+  {
+    tcc_free(ir->barrel_shifts);
+    ir->barrel_shifts = NULL;
+  }
+  if (ir->shift64_dead_half)
+  {
+    tcc_free(ir->shift64_dead_half);
+    ir->shift64_dead_half = NULL;
+  }
+  if (ir->bfi_params)
+  {
+    tcc_free(ir->bfi_params);
+    ir->bfi_params = NULL;
+  }
+
+  tcc_free(ir->codegen_return_jump_addrs);
+  ir->codegen_return_jump_addrs = NULL;
+  tcc_free(ir->codegen_dry_insn_scratch);
+  ir->codegen_dry_insn_scratch = NULL;
+  tcc_free(ir->codegen_dry_insn_saves);
+  ir->codegen_dry_insn_saves = NULL;
+  tcc_free(ir->codegen_mop_cache);
+  ir->codegen_mop_cache = NULL;
+  tcc_free(ir->codegen_cbz_dry_mapping);
+  ir->codegen_cbz_dry_mapping = NULL;
+  tcc_free(ir->codegen_branch_target_reset);
+  ir->codegen_branch_target_reset = NULL;
 
   if (ir->stack_layout.slots != NULL)
   {
@@ -2135,4 +2165,32 @@ IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg)
     exit(1);
   }
   return NULL; /* unreachable, silences -Werror with old compiler */
+}
+
+/* Non-fatal sibling of tcc_ir_get_live_interval(): returns NULL instead of
+ * aborting the process when vreg is negative, carries an unknown type, or
+ * addresses a position past the allocated interval array.  Use this from
+ * callers that must tolerate an unmapped vreg (e.g. tcc_ir_stack_reg_get). */
+IRLiveInterval *tcc_ir_try_get_live_interval(TCCIRState *ir, int vreg)
+{
+  if (!ir || vreg < 0)
+    return NULL;
+  int decoded_vreg_position = TCCIR_DECODE_VREG_POSITION(vreg);
+  switch (TCCIR_DECODE_VREG_TYPE(vreg))
+  {
+  case TCCIR_VREG_TYPE_VAR:
+    if (decoded_vreg_position >= ir->variables_live_intervals_size)
+      return NULL;
+    return &ir->variables_live_intervals[decoded_vreg_position];
+  case TCCIR_VREG_TYPE_TEMP:
+    if (decoded_vreg_position >= ir->temporary_variables_live_intervals_size)
+      return NULL;
+    return &ir->temporary_variables_live_intervals[decoded_vreg_position];
+  case TCCIR_VREG_TYPE_PARAM:
+    if (decoded_vreg_position >= ir->parameters_live_intervals_size)
+      return NULL;
+    return &ir->parameters_live_intervals[decoded_vreg_position];
+  default:
+    return NULL;
+  }
 }

@@ -21,6 +21,7 @@ TESTS = \
  llong_test-run \
  tests2-dir \
  pp-dir \
+ frontend-dir \
  memtest \
  dlltest \
  cross-test
@@ -373,4 +374,6 @@ clean:
 	rm -f ex? tcc_g weaktest.*.txt *.def *.pdb *.obj libtcc_test_mt
 	@$(MAKE) -C tests2 $@
 	@$(MAKE) -C pp $@
+	@$(MAKE) -C frontend $@
+	@rm -rf linker/build debug/build runtime/build
 

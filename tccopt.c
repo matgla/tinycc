@@ -414,11 +414,14 @@ const TCCOptPass *tcc_opt_get_passes(int *count)
 
 int tcc_opt_get_level(void)
 {
-  /* Get optimization level from TCCState */
+  /* Map TCC's optimization settings (the -O<n> level stored in
+     s->optimize) to our internal levels (0, 1, 2).  -O3 and above clamp
+     to 2, matching tcc_optimize_ir()'s level->flag mapping. */
   if (tcc_state)
   {
-    /* Map TCC's optimization settings to our levels */
-    if (tcc_state->opt_fp_offset_cache)
+    if (tcc_state->optimize >= 2)
+      return 2;
+    if (tcc_state->optimize >= 1)
       return 1;
   }
   return 0;

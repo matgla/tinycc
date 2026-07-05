@@ -1,0 +1,17 @@
+services:
+  grafana:
+    image: docker.io/grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      GF_INSTALL_PLUGINS: frser-sqlite-datasource
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - /var/lib/tcc-metrics/metrics.db:/data/metrics.db:ro,Z
+      - ./provisioning:/etc/grafana/provisioning:Z
+      - ./dashboards:/etc/grafana/dashboards:Z
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+
+volumes:
+  grafana-data:

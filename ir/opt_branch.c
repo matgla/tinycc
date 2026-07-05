@@ -44,12 +44,35 @@ static int vrp_get_slot(int vr_type, int pos)
   return -1;
 }
 
+/* VRP models 32-bit values as sign-extended int32 (the IMM32 operand
+ * encoding, which the range table and its ADD/SUB arithmetic use).  A 32-bit
+ * unsigned constant can instead arrive as a pool-stored I64 holding the
+ * ZERO-extended value (e.g. #3435266601, printed as #-859700695), and mixing
+ * the two encodings in one int64 comparison flips unsigned compares (ptr
+ * fuzz seed 35289: `T <u #c` folded to 0 when the true answer is 1).  Read
+ * every constant through this helper: it normalizes 32-bit-typed operands
+ * into the sign-extended domain and rejects genuinely 64-bit-typed ones,
+ * which this domain cannot represent. */
+static int vrp_read_const32(const TCCIRState *ir, IROperand op, int64_t *out)
+{
+  if (op.btype == IROP_BTYPE_INT64)
+    return 0;
+  *out = (int64_t)(int32_t)irop_get_imm64_ex(ir, op);
+  return 1;
+}
+
 /* Check whether a comparison yields a constant result over [rmin, rmax].
  * Returns 1 if always taken, 0 if never taken, -1 if undetermined.
  * For unsigned comparisons, only safe when both endpoints have the same sign
  * (both >= 0 or both < 0 as int64), so the uint32 ordering is monotone. */
 static int vrp_fold_cmp(int64_t rmin, int64_t rmax, int64_t cmp_val, int tok)
 {
+  /* Enforce the precondition above instead of trusting every caller: a
+   * mixed-sign range covers both halves of the uint32 space, so endpoint
+   * checks say nothing about the values in between. */
+  if ((tok == 0x92 || tok == 0x93 || tok == 0x96 || tok == 0x97) &&
+      (rmin < 0) != (rmax < 0))
+    return -1;
   int res_min = evaluate_compare_condition(rmin, cmp_val, tok);
   int res_max = evaluate_compare_condition(rmax, cmp_val, tok);
   if (res_min < 0 || res_max < 0 || res_min != res_max)
@@ -490,20 +513,27 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
       {
         int src_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(src1_vr), TCCIR_DECODE_VREG_POSITION(src1_vr));
         int dst_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(dest_vr), TCCIR_DECODE_VREG_POSITION(dest_vr));
-        if (src_slot >= 0 && ranges[src_slot].valid && dst_slot >= 0)
+        int64_t imm;
+        if (src_slot >= 0 && ranges[src_slot].valid && dst_slot >= 0 &&
+            vrp_read_const32(ir, src2, &imm))
         {
-          int64_t imm = irop_get_imm64_ex(ir, src2);
           int64_t new_min = (q->op == TCCIR_OP_ADD) ? ranges[src_slot].min_val + imm : ranges[src_slot].min_val - imm;
           int64_t new_max = (q->op == TCCIR_OP_ADD) ? ranges[src_slot].max_val + imm : ranges[src_slot].max_val - imm;
-          /* Clamp to int32 range to stay within 32-bit value semantics */
-          if (new_min < (int64_t)INT32_MIN)
-            new_min = INT32_MIN;
-          if (new_max > (int64_t)INT32_MAX)
-            new_max = INT32_MAX;
-          ranges[dst_slot].valid = 1;
-          ranges[dst_slot].min_val = new_min;
-          ranges[dst_slot].max_val = new_max;
-          ranges_dirty = 1;
+          /* A result outside int32 wraps in 32-bit arithmetic and the wrapped
+           * value set is not an interval in this domain, so drop the range
+           * rather than clamp (a clamped endpoint asserts a value the program
+           * never actually takes). */
+          if (new_min < (int64_t)INT32_MIN || new_max > (int64_t)INT32_MAX)
+          {
+            ranges[dst_slot].valid = 0;
+          }
+          else
+          {
+            ranges[dst_slot].valid = 1;
+            ranges[dst_slot].min_val = new_min;
+            ranges[dst_slot].max_val = new_max;
+            ranges_dirty = 1;
+          }
         }
         else if (dst_slot >= 0)
         {
@@ -525,6 +555,39 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
     {
       int32_t s1_vr = irop_get_vreg(src1);
       int32_t d_vr = irop_get_vreg(dest);
+
+      /* Seed a singleton range from a plain immediate assignment: T = #imm
+       * gives the destination the range [imm, imm].  Without this, the very
+       * first range in an "assign a constant, then compare it" chain is never
+       * established -- every other range source (fall-through constraints from
+       * a prior CMP, ADD/SUB propagation, and vreg-to-vreg copy propagation
+       * below) can only forward a range that already exists, none can create
+       * one from a bare immediate -- so `T = #5; CMP T,#20; JUMPIF LT` never
+       * folds.  See docs/bugs.md #6.  Constants are normalized to the pass's
+       * sign-extended-int32 domain by vrp_read_const32 (64-bit-typed values
+       * are rejected); a non-vreg or lval/sym destination is not a plain
+       * value definition and is left to the generic invalidation. */
+      if (irop_is_immediate(src1) && d_vr >= 0 && !dest.is_lval && !dest.is_sym)
+      {
+        int d_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(d_vr), TCCIR_DECODE_VREG_POSITION(d_vr));
+        if (d_slot >= 0)
+        {
+          int64_t imm;
+          if (vrp_read_const32(ir, src1, &imm))
+          {
+            ranges[d_slot].valid = 1;
+            ranges[d_slot].min_val = imm;
+            ranges[d_slot].max_val = imm;
+            ranges_dirty = 1;
+          }
+          else
+          {
+            ranges[d_slot].valid = 0;
+          }
+          continue;
+        }
+      }
+
       int src_type = (s1_vr >= 0) ? TCCIR_DECODE_VREG_TYPE(s1_vr) : -1;
       int src_forwards_value =
           s1_vr >= 0 &&
@@ -557,15 +620,17 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
         if (src1_vr >= 0)
         {
           int src_slot = vrp_get_slot(TCCIR_DECODE_VREG_TYPE(src1_vr), TCCIR_DECODE_VREG_POSITION(src1_vr));
-          int64_t cmp_val = irop_get_imm64_ex(ir, src2);
+          int64_t cmp_val = 0;
+          int cmp_val_ok = vrp_read_const32(ir, src2, &cmp_val);
           IROperand cond_op = tcc_ir_op_get_src1(ir, jump_q);
           int tok = (int)irop_get_imm64_ex(ir, cond_op);
           IROperand jmp_dest = tcc_ir_op_get_dest(ir, jump_q);
 
           /* Tautology fold: unsigned compare against zero is always-true
            * (>=U 0) or always-false (<U 0) regardless of the operand's value.
-           * No range info required. */
-          if (cmp_val == 0)
+           * No range info required (zero is zero in any width, so the raw
+           * immediate is checked without the const32 normalization). */
+          if (irop_get_imm64_ex(ir, src2) == 0)
           {
             int fold_taut = -1;
             if (tok == 0x93) /* TOK_UGE */
@@ -590,7 +655,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
           }
 
           /* Try to fold using known range */
-          if (src_slot >= 0 && ranges[src_slot].valid)
+          if (src_slot >= 0 && ranges[src_slot].valid && cmp_val_ok)
           {
             int64_t rmin = ranges[src_slot].min_val;
             int64_t rmax = ranges[src_slot].max_val;
@@ -656,7 +721,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
           }
 
           /* Set pending fall-through constraint: NOT(cond) holds after JUMPIF not-taken */
-          if (src_slot >= 0 && i + 2 < n)
+          if (src_slot >= 0 && i + 2 < n && cmp_val_ok)
           {
             int64_t new_min = INT32_MIN;
             int64_t new_max = INT32_MAX;
@@ -746,7 +811,8 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
                     IROperand bs = tcc_ir_op_get_src1(ir, bq);
                     if ((bq->op == TCCIR_OP_ASSIGN || bq->op == TCCIR_OP_LOAD) &&
                         irop_is_immediate(bs)) {
-                      if (irop_get_imm64_ex(ir, bs) == new_min)
+                      int64_t bs_val;
+                      if (!vrp_read_const32(ir, bs, &bs_val) || bs_val == new_min)
                         bp_safe = 0;
                       continue;
                     }
@@ -857,9 +923,10 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
            * the constrained PARAM; any other def shape is unknown.
            * Skip when the CMP dereferences its source (is_lval) — the
            * constraint tracks the scalar value, not the pointed-to. */
+          int64_t sf_cmp_val;
           if (!have_range && !src1.is_lval && eq_scope_src_slot >= 0 &&
-              i < eq_scope_end && cmp_slot >= 0) {
-            int64_t sf_cmp_val = irop_get_imm64_ex(ir, src2);
+              i < eq_scope_end && cmp_slot >= 0 &&
+              vrp_read_const32(ir, src2, &sf_cmp_val)) {
             IROperand sf_cond_op = tcc_ir_op_get_src1(ir, jump_q);
             int sf_tok = (int)irop_get_imm64_ex(ir, sf_cond_op);
             int sf_unified = -2;
@@ -875,7 +942,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
               IROperand bs = tcc_ir_op_get_src1(ir, bq);
               if ((bq->op == TCCIR_OP_ASSIGN || bq->op == TCCIR_OP_LOAD) &&
                   irop_is_immediate(bs)) {
-                def_val = irop_get_imm64_ex(ir, bs);
+                if (!vrp_read_const32(ir, bs, &def_val)) { sf_safe = 0; continue; }
               } else if (bq->op == TCCIR_OP_ASSIGN || bq->op == TCCIR_OP_LOAD) {
                 int32_t bsv = irop_get_vreg(bs);
                 if (bsv >= 0 && !bs.is_lval) {
@@ -899,9 +966,9 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
               have_range = 1;
             }
           }
-          if (have_range)
+          int64_t cmp_val;
+          if (have_range && vrp_read_const32(ir, src2, &cmp_val))
           {
-            int64_t cmp_val = irop_get_imm64_ex(ir, src2);
             int64_t rmin = ranges[cmp_slot].min_val;
             int64_t rmax = ranges[cmp_slot].max_val;
             IROperand set_src1_op = tcc_ir_op_get_src1(ir, jump_q);
@@ -1441,6 +1508,7 @@ int tcc_ir_opt_nonneg_branch_fold(TCCIRState *ir)
 
 int tcc_ir_opt_branch_folding(TCCIRState *ir)
 {
+  if (tcc_ir_opt_pass_disabled("branch_fold")) return 0;
   if (ir->next_instruction_index < 2)
     return 0;
   IROptCtx ctx;

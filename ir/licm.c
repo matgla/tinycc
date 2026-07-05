@@ -10,6 +10,7 @@
 
 #include "licm.h"
 #include "opt.h"
+#include "opt_utils.h"
 #include "cfg.h"
 #include "core.h"
 #include "pool.h"
@@ -177,8 +178,11 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int target = (int)irop_get_imm64_ex(ir, dest);
 
-      /* Check if this is a backward jump (loop back edge) */
-      if (target < i)
+      /* Check if this is a backward jump (loop back edge).  The target must be
+       * a valid non-negative instruction index: an unresolved/sentinel dest can
+       * decode negative, which would make the loop body range [target, i] index
+       * before compact_instructions. */
+      if (target >= 0 && target < i)
       {
         /* Found a loop */
         if (loops->num_loops >= loops->capacity)
@@ -510,6 +514,28 @@ static int insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompa
     }
   }
 
+  /* SWITCH_TABLE case targets live in a side table independent of the IR
+   * array; without this they silently desynchronize on every insertion
+   * (docs/bugs.md #7, combo fuzz seeds 52/80/187/311/333/392/460: hoisting a
+   * pure call out of a loop containing a switch left every case target stale
+   * by the insertion count — downstream reachability-based passes then
+   * deleted live FUNCPARAMVALs, and at runtime the dispatch jumped into the
+   * middle of the wrong case).  Mirrors gsym_cse_insert_before. */
+  for (int t = 0; t < ir->num_switch_tables; t++)
+  {
+    TCCIRSwitchTable *table = &ir->switch_tables[t];
+    if (table->default_target >= before_idx)
+      table->default_target += 1;
+    if (table->targets)
+    {
+      for (int j = 0; j < table->num_entries; j++)
+      {
+        if (table->targets[j] >= before_idx)
+          table->targets[j] += 1;
+      }
+    }
+  }
+
   return before_idx;
 }
 
@@ -598,7 +624,7 @@ typedef struct
   int hoisted;          /* Whether we've created the ASSIGN yet */
 } HoistedStackAddr;
 
-static int hoist_from_loop(TCCIRState *ir, IRLoop *loop)
+__attribute__((unused)) static int hoist_from_loop(TCCIRState *ir, IRLoop *loop)
 {
   if (!ir || !loop || loop->preheader_idx < 0)
     return 0;
@@ -1064,59 +1090,6 @@ static int hoist_const_exprs_from_loop(TCCIRState *ir, IRLoop *loop)
   return total_inserted;
 }
 
-int tcc_ir_hoist_loop_invariants(TCCIRState *ir, IRLoops *loops)
-{
-  if (!ir || !loops)
-    return 0;
-
-  /* Hoisting is now done by the dominance-based LICM in tcc_ir_opt_licm_ex. */
-  return 0;
-
-  /* Old implementation below (unreachable but compiles): */
-  if (!ir || !loops)
-    return 0;
-
-  int total_hoisted = 0;
-
-  for (int i = 0; i < loops->num_loops; i++)
-  {
-    IRLoop *loop = &loops->loops[i];
-    int hoisted = hoist_from_loop(ir, loop);
-    total_hoisted += hoisted;
-
-    /* If we hoisted any instructions, update indices for all subsequent loops */
-    if (hoisted > 0)
-    {
-      LOG_LICM("Loop %d hoisted %d instrs, loop[%d].preheader=%d, updating later loops", i, hoisted, i,
-             loop->preheader_idx);
-      /* Indices of subsequent loops need to be shifted by number of inserted instructions */
-      for (int j = i + 1; j < loops->num_loops; j++)
-      {
-        IRLoop *later_loop = &loops->loops[j];
-
-        /* Update loop boundary indices if they are after the insertion point */
-        if (later_loop->header_idx >= loop->preheader_idx)
-          later_loop->header_idx += hoisted;
-        if (later_loop->start_idx >= loop->preheader_idx)
-          later_loop->start_idx += hoisted;
-        if (later_loop->end_idx >= loop->preheader_idx)
-          later_loop->end_idx += hoisted;
-        if (later_loop->preheader_idx >= loop->preheader_idx)
-          later_loop->preheader_idx += hoisted;
-
-        /* Update body instruction indices */
-        for (int k = 0; k < later_loop->num_body_instrs; k++)
-        {
-          if (later_loop->body_instrs[k] >= loop->preheader_idx)
-            later_loop->body_instrs[k] += hoisted;
-        }
-      }
-    }
-  }
-
-  return total_hoisted;
-}
-
 /* ============================================================================
  * Pure Function Detection and LICM for Function Calls (Phase 1)
  * ============================================================================ */
@@ -1429,8 +1402,12 @@ int tcc_ir_get_func_purity(TCCIRState *ir, Sym *sym)
   if (!sym)
     return TCC_FUNC_PURITY_UNKNOWN;
 
-  /* Check if this is a function */
-  if (!(sym->type.t & VT_FUNC))
+  /* Check if this is a function. Must mask VT_BTYPE first: VT_FUNC (6) shares
+   * bits with other basic types (e.g. VT_INT==3, 3 & 6 == 2 != 0), so a bare
+   * `sym->type.t & VT_FUNC` wrongly passes non-function symbols through to the
+   * purity lookup. This matches the `(t & VT_BTYPE) == VT_FUNC` idiom used
+   * everywhere else in the codebase (tccgen.c, tccdbg.c, ir/opt.c). */
+  if ((sym->type.t & VT_BTYPE) != VT_FUNC)
     return TCC_FUNC_PURITY_IMPURE; /* Not a function = not pure */
 
   /* Get function name from symbol */
@@ -1514,6 +1491,40 @@ int tcc_ir_get_func_purity(TCCIRState *ir, Sym *sym)
  * The hoisted_vregs array contains vregs that were hoisted in previous iterations.
  * These are considered loop-invariant even if they have an ASSIGN in the loop body.
  */
+/* True if the address of `vreg`'s stack slot is taken anywhere in the
+ * function: a SOURCE operand carrying this vreg with STACKOFF tag and
+ * is_lval == 0 (the IR's `&V` form — see the dump printer).  Once the
+ * address escapes, any store through any pointer may mutate the variable,
+ * so a "no direct def in the loop" scan is not sufficient for invariance
+ * (docs/bugs.md #7: ptr fuzz seeds 500/517 — helper3(#imm, V7) hoisted out
+ * of a loop that mutated V7 through the pointers p14 and p15). */
+static int vreg_addr_taken_anywhere(TCCIRState *ir, int32_t vreg)
+{
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    IROperand srcs[3];
+    int nsrcs = 0;
+    if (irop_config[q->op].has_src1)
+      srcs[nsrcs++] = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2)
+      srcs[nsrcs++] = tcc_ir_op_get_src2(ir, q);
+    if (q->op == TCCIR_OP_MLA)
+      srcs[nsrcs++] = tcc_ir_op_get_accum(ir, q);
+    for (int s = 0; s < nsrcs; s++)
+    {
+      if (irop_get_tag(srcs[s]) == IROP_TAG_STACKOFF && !srcs[s].is_lval &&
+          irop_get_vreg(srcs[s]) == vreg)
+        return 1;
+    }
+  }
+  return 0;
+}
+
+static int loop_body_may_clobber_memory(TCCIRState *ir, IRLoop *loop);
+
 static int is_operand_loop_invariant_ex(TCCIRState *ir, IROperand op, IRLoop *loop, int32_t *hoisted_vregs,
                                         int num_hoisted_vregs)
 {
@@ -1593,6 +1604,15 @@ static int is_operand_loop_invariant_ex(TCCIRState *ir, IROperand op, IRLoop *lo
     }
   }
 
+  /* No direct def in the loop.  The value can STILL change across iterations
+   * if the variable's address has been taken: any store through a pointer or
+   * any non-CONST call inside the loop may then mutate its stack slot without
+   * a visible def of the vreg (docs/bugs.md #7, ptr seeds 500/517).  Only
+   * accept an address-taken variable when the loop provably cannot write
+   * memory at all. */
+  if (vreg_addr_taken_anywhere(ir, vreg) && loop_body_may_clobber_memory(ir, loop))
+    return 0;
+
   /* Vreg not defined in loop - it's loop-invariant */
   return 1;
 }
@@ -1603,10 +1623,54 @@ __attribute__((unused)) static int is_operand_loop_invariant(TCCIRState *ir, IRO
   return is_operand_loop_invariant_ex(ir, op, loop, NULL, 0);
 }
 
+/* Does the loop body contain anything that could modify memory a PURE function
+ * might read?  PR20100: a PURE function (as opposed to CONST) reads global/heap
+ * memory, so its result is only loop-invariant if that memory is unchanged
+ * across iterations.  Any store, or any call that is not itself CONST (an
+ * IMPURE/UNKNOWN callee — or an indirect call — may write memory), can change
+ * what a PURE callee observes, so hoisting it would be a miscompile.  CONST
+ * callees read no memory and are unaffected by this. */
+static int loop_body_may_clobber_memory(TCCIRState *ir, IRLoop *loop)
+{
+  for (int i = 0; i < loop->num_body_instrs; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[loop->body_instrs[i]];
+    switch (q->op)
+    {
+    case TCCIR_OP_NOP:
+      continue;
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+    case TCCIR_OP_BLOCK_COPY:
+      return 1;
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_OUTPUT:
+      return 1; /* inline asm may write arbitrary memory */
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+    {
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      if (!callee || tcc_ir_get_func_purity(ir, callee) < TCC_FUNC_PURITY_CONST)
+        return 1; /* indirect / impure / merely-pure call may write memory */
+      continue;
+    }
+    default:
+      /* A memory store through a non-STORE op shows up as an lval destination. */
+      if (irop_config[q->op].has_dest && tcc_ir_op_get_dest(ir, q).is_lval)
+        return 1;
+      continue;
+    }
+  }
+  return 0;
+}
+
 /* Check if a function call instruction can be hoisted
  * Requirements:
  * 1. Function is pure or const
  * 2. All arguments are loop-invariant (considering already-hoisted vregs)
+ * 3. If the function is PURE (reads memory) rather than CONST, the loop must
+ *    not modify any memory it could read (PR20100)
  */
 static int tcc_ir_is_hoistable_call_ex(TCCIRState *ir, int instr_idx, IRLoop *loop, int32_t *hoisted_vregs,
                                        int num_hoisted_vregs)
@@ -1647,6 +1711,15 @@ static int tcc_ir_is_hoistable_call_ex(TCCIRState *ir, int instr_idx, IRLoop *lo
   if (purity < TCC_FUNC_PURITY_PURE)
   {
     /* Function has side effects or is unknown - can't hoist */
+    return 0;
+  }
+
+  /* A merely-PURE function reads memory; hoisting it is only safe if the loop
+   * cannot change what it reads.  A CONST function reads nothing and is always
+   * safe (PR20100 / docs/bugs.md #7). */
+  if (purity < TCC_FUNC_PURITY_CONST && loop_body_may_clobber_memory(ir, loop))
+  {
+    LOG_LICM("Call at %d: PURE (not CONST) and loop clobbers memory — not hoistable", instr_idx);
     return 0;
   }
 
@@ -1697,7 +1770,12 @@ typedef struct
   int is_hoisted;
 } HoistableCallInfo;
 
-/* Collect all FUNCPARAMVAL instructions belonging to a call */
+/* Collect all param markers belonging to a call.  BOTH FUNCPARAMVAL (a value
+ * argument) and FUNCPARAMVOID (the marker a zero-argument or void call still
+ * carries, and which the backend pairs with the CALL by call_id) must be
+ * collected — otherwise hoisting the CALL but leaving its FUNCPARAMVOID behind
+ * orphans the marker ("no call site found for call_id=N") and the hoisted call
+ * loses its marker ("missing FUNCPARAMVAL").  See docs/bugs.md #7. */
 static int collect_call_params(TCCIRState *ir, int call_idx, int *param_indices, int max_params)
 {
   IRQuadCompact *call_q = &ir->compact_instructions[call_idx];
@@ -1705,11 +1783,11 @@ static int collect_call_params(TCCIRState *ir, int call_idx, int *param_indices,
   int call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, call_src2));
   int num_params = 0;
 
-  /* Scan all instructions for params with matching call_id */
+  /* Scan all instructions for params/markers with matching call_id */
   for (int i = 0; i < ir->next_instruction_index && num_params < max_params; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_FUNCPARAMVAL)
+    if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
     {
       IROperand src2 = tcc_ir_op_get_src2(ir, q);
       int param_call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, src2));
@@ -1731,11 +1809,27 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
   if (!ir || !loops)
     return 0;
 
+  /* Re-enabled 2026-07-02 after the ninth (and final) defect fix: the
+   * combo-profile residue (seeds 52/80/187/311/333/392/460) was
+   * insert_instruction_before desynchronizing SWITCH_TABLE side-table
+   * targets — not the linear-index call bookkeeping suspected earlier.
+   * Full history in docs/bugs.md #7 (resolved). */
+
+  /* Kill-switch for bisection: TCC_DISABLE_PASS=pure_call_hoist. */
+  if (tcc_ir_opt_pass_disabled("pure_call_hoist"))
+    return 0;
+
   int total_hoisted = 0;
 
   for (int loop_idx = 0; loop_idx < loops->num_loops; loop_idx++)
   {
     IRLoop *loop = &loops->loops[loop_idx];
+
+    /* total_hoisted accumulates across ALL loops; the post-loop index fix-up
+     * below must shift by only THIS loop's insertions, otherwise a later loop
+     * (already shifted by an earlier loop's insertions) is over-shifted.
+     * Snapshot the running total to recover the per-loop delta. */
+    int total_hoisted_at_loop_start = total_hoisted;
 
     if (loop->preheader_idx < 0)
       continue; /* No preheader - can't hoist */
@@ -1772,6 +1866,82 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
     if (preheader_in_other_loop)
       continue;
 
+    /* The hoist inserts at preheader_idx+1 and relies on control FALLING
+     * THROUGH from the preheader into the loop header.  tcc_ir_detect_loops'
+     * preheader walk skips backward over JUMP/JUMPIF, so preheader_idx may
+     * belong to a block that never reaches this loop.  docs/bugs.md #7,
+     * combo fuzz seed 18: the hoisted call landed on a bypass path just
+     * ahead of an unconditional JMP while the loop itself was entered by a
+     * jump straight to the header — the loop then read the hoisted result
+     * vreg UNDEFINED (wrong checksum; an undefined loop bound turns into an
+     * infinite loop).  Two requirements make the insertion point sound:
+     *   1. the preheader is the header's immediate predecessor (nothing was
+     *      skipped — control genuinely falls from it into the header), and
+     *   2. no jump from OUTSIDE the loop targets the header (such an entry
+     *      edge would bypass the inserted preheader code).  Back-edges and
+     *      `continue`-style jumps from inside are fine: on any path that
+     *      reaches them, the hoisted call has already executed. */
+    if (loop->preheader_idx != loop->header_idx - 1)
+    {
+      LOG_LICM("Skipping loop %d: preheader %d is not the header %d's immediate predecessor", loop_idx,
+               loop->preheader_idx, loop->header_idx);
+      continue;
+    }
+    {
+      /* Reject any entry edge from outside the loop's linear range into ANY
+       * instruction of [header, end] — not just the header.  An edge into
+       * the header bypasses the inserted preheader code (docs/bugs.md #7,
+       * combo seed 18); an edge into the middle of the range would break the
+       * header's dominance over the call sites we rewrite (the hoisted
+       * result vreg could be read on a path that never ran the preheader).
+       * Note this also skips increment-trampoline rotated loops, whose
+       * physical body jumps back into [header, end] from linearly outside —
+       * their linear range holds only guard/increment code, so nothing
+       * hoistable is lost. */
+      int external_entry = 0;
+      for (int j = 0; j < ir->next_instruction_index && !external_entry; j++)
+      {
+        if (j >= loop->start_idx && j <= loop->end_idx)
+          continue; /* jumps from inside the loop are fine */
+        IRQuadCompact *jq = &ir->compact_instructions[j];
+        if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF)
+        {
+          int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq));
+          if (jt >= loop->header_idx && jt <= loop->end_idx)
+            external_entry = 1;
+        }
+        else if (jq->op == TCCIR_OP_SWITCH_TABLE)
+        {
+          /* A switch outside the loop with a case/default target in the
+           * range is an entry edge, same as a plain JUMP. */
+          int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, jq));
+          if (table_id >= 0 && table_id < ir->num_switch_tables)
+          {
+            TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+            if (table->default_target >= loop->header_idx && table->default_target <= loop->end_idx)
+              external_entry = 1;
+            for (int ti = 0; table->targets && ti < table->num_entries && !external_entry; ti++)
+            {
+              if (table->targets[ti] >= loop->header_idx && table->targets[ti] <= loop->end_idx)
+                external_entry = 1;
+            }
+          }
+        }
+        else if (jq->op == TCCIR_OP_IJUMP)
+        {
+          /* Indirect jump: target unknowable — conservatively treat it as a
+           * possible entry edge into the loop. */
+          external_entry = 1;
+        }
+      }
+      if (external_entry)
+      {
+        LOG_LICM("Skipping loop %d: header %d is entered by a jump from outside the loop", loop_idx,
+                 loop->header_idx);
+        continue;
+      }
+    }
+
     /* Skip loops containing VLA allocations.
      * VLAs have special stack semantics - the size is computed at runtime
      * and SP is adjusted dynamically. Hoisting a pure function call that
@@ -1805,6 +1975,23 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
     for (int i = 0; i < loop->num_body_instrs && num_all_calls < MAX_HOISTABLE_CALLS; i++)
     {
       int instr_idx = loop->body_instrs[i];
+
+      /* body_instrs is an OVER-approximation: tcc_ir_detect_loops' forward-
+       * jump "extension" (any jump out of [start,end] whose target is within
+       * +50 of the header extends the body, with no path-back-to-header
+       * check) can swallow post-loop code.  volatile fuzz seeds 3583/6116: a
+       * rotated for-loop's exit jump pulled the else arm of the enclosing
+       * if/else into body_instrs, and the two else-arm calls were "hoisted"
+       * above the loop — onto the then-path — while the else path entered at
+       * its own label and read both result vregs UNDEFINED.  The over-
+       * approximation is conservative (correct) for the clobber/invariance
+       * scans, but calls may only be hoisted from the certain linear range:
+       * with the preheader fall-through + no-external-entry guards above,
+       * every instruction in [start,end] is dominated by the header, so the
+       * preheader insertion point dominates the rewritten call site. */
+      if (instr_idx < loop->start_idx || instr_idx > loop->end_idx)
+        continue;
+
       IRQuadCompact *q = &ir->compact_instructions[instr_idx];
 
       if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
@@ -1943,18 +2130,29 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
         int64_t new_call_encoded = TCCIR_ENCODE_CALL(new_call_id, argc);
         IROperand new_call_src2 = irop_make_imm32(-1, (int32_t)new_call_encoded, IROP_BTYPE_INT32);
 
-        /* Reallocate operand pool for call copy with updated call_id */
-        IROperand call_dest = tcc_ir_op_get_dest(ir, &call_copy);
+        /* Reallocate operand pool for the call copy with the updated call_id.
+         * The operand layout is [dest?, src1, src2] where the dest slot exists
+         * ONLY when irop_config[op].has_dest is set (FUNCCALLVAL).  A
+         * FUNCCALLVOID has no dest, so it must be laid out as [src1, src2];
+         * emitting a spurious dest operand for it shifts src1/src2 down by one
+         * and makes the accessors read the call_id/argc encoding out of the
+         * callee-symref slot instead (decoding to a bogus argc -> the backend
+         * then reports "missing FUNCPARAMVAL for call_id=N").  See bugs.md #7. */
         IROperand call_src1 = tcc_ir_op_get_src1(ir, &call_copy);
+        int call_has_dest = irop_config[call_copy.op].has_dest;
 
-        if (hoistable[i].hoisted_vreg >= 0)
+        if (call_has_dest)
         {
-          /* Update destination to use hoisted vreg */
-          call_dest = irop_make_vreg(hoistable[i].hoisted_vreg, IROP_BTYPE_INT32);
+          IROperand call_dest = tcc_ir_op_get_dest(ir, &call_copy);
+          if (hoistable[i].hoisted_vreg >= 0)
+            call_dest = irop_make_vreg(hoistable[i].hoisted_vreg, IROP_BTYPE_INT32);
+          call_copy.operand_base = tcc_ir_pool_add(ir, call_dest);
+          tcc_ir_pool_add(ir, call_src1);
         }
-
-        call_copy.operand_base = tcc_ir_pool_add(ir, call_dest);
-        tcc_ir_pool_add(ir, call_src1);
+        else
+        {
+          call_copy.operand_base = tcc_ir_pool_add(ir, call_src1);
+        }
         tcc_ir_pool_add(ir, new_call_src2);
 
         insert_instruction_before(ir, loop->preheader_idx + 1, &call_copy);
@@ -1973,11 +2171,21 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
           int64_t new_param_encoded = TCCIR_ENCODE_PARAM(new_call_id, param_idx);
           IROperand new_param_src2 = irop_make_imm32(-1, (int32_t)new_param_encoded, IROP_BTYPE_INT32);
 
-          /* Allocate operands in pool according to irop_config for FUNCPARAMVAL:
-           * has_dest=0, has_src1=1, has_src2=1
-           * So operands are: src1 at base+0, src2 at base+1 (NO dest!) */
-          int new_operand_base = tcc_ir_pool_add(ir, tcc_ir_op_get_src1(ir, &param_copies[p]));
-          tcc_ir_pool_add(ir, new_param_src2);
+          /* Allocate operands per the marker's own irop_config (both have
+           * has_dest=0, has_src2=1).  FUNCPARAMVAL has has_src1=1 (the value):
+           * layout [src1, src2].  FUNCPARAMVOID has has_src1=0: layout [src2]
+           * only — writing a spurious src1 for it would push src2 down a slot
+           * and misdecode the call_id (docs/bugs.md #7). */
+          int new_operand_base;
+          if (irop_config[param_copies[p].op].has_src1)
+          {
+            new_operand_base = tcc_ir_pool_add(ir, tcc_ir_op_get_src1(ir, &param_copies[p]));
+            tcc_ir_pool_add(ir, new_param_src2);
+          }
+          else
+          {
+            new_operand_base = tcc_ir_pool_add(ir, new_param_src2);
+          }
           param_copies[p].operand_base = new_operand_base;
 
           insert_instruction_before(ir, loop->preheader_idx + 1, &param_copies[p]);
@@ -2049,33 +2257,49 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
         }
       }
 
-    } while (hoisted_this_iteration > 0);
+      /* Single pass only: transitive-invariance chaining (hoisting a call
+       * whose argument is the RESULT of another call just hoisted in this same
+       * loop) is deliberately NOT performed.  That path required rewriting the
+       * copied FUNCPARAMVAL's operand from the loop-body result vreg to the
+       * hoisted temp AND inserting the dependent call after its producer;
+       * the copy-verbatim / insert-at-preheader+1 logic below does neither, so
+       * a second iteration produced a preheader call reading an undefined vreg
+       * (or one defined by a later-in-preheader call), corrupting argument
+       * linkage (docs/bugs.md #7).  A single pass with num_hoisted_vregs left
+       * at 0 during the hoistability checks only hoists calls whose arguments
+       * are loop-invariant in the strict sense, which is correct by
+       * construction.  (void)hoisted_this_iteration keeps the counter live for
+       * the trace logging above without re-looping.) */
+    } while (0);
+    (void)hoisted_this_iteration;
 
-    /* Update loop indices for subsequent loops */
-    if (total_hoisted > 0)
+    /* Update loop indices for subsequent loops, shifting by ONLY the number of
+     * instructions inserted while processing THIS loop (see snapshot above). */
+    int hoisted_this_loop = total_hoisted - total_hoisted_at_loop_start;
+    if (hoisted_this_loop > 0)
     {
       for (int j = loop_idx + 1; j < loops->num_loops; j++)
       {
         IRLoop *later_loop = &loops->loops[j];
         if (later_loop->start_idx >= loop->preheader_idx)
-          later_loop->start_idx += total_hoisted;
+          later_loop->start_idx += hoisted_this_loop;
         if (later_loop->end_idx >= loop->preheader_idx)
-          later_loop->end_idx += total_hoisted;
+          later_loop->end_idx += hoisted_this_loop;
         if (later_loop->preheader_idx >= loop->preheader_idx)
-          later_loop->preheader_idx += total_hoisted;
+          later_loop->preheader_idx += hoisted_this_loop;
         for (int k = 0; k < later_loop->num_body_instrs; k++)
         {
           if (later_loop->body_instrs[k] >= loop->preheader_idx)
-            later_loop->body_instrs[k] += total_hoisted;
+            later_loop->body_instrs[k] += hoisted_this_loop;
         }
       }
 
       /* Update this loop's indices too */
-      loop->header_idx += total_hoisted;
-      loop->start_idx += total_hoisted;
+      loop->header_idx += hoisted_this_loop;
+      loop->start_idx += hoisted_this_loop;
       for (int k = 0; k < loop->num_body_instrs; k++)
       {
-        loop->body_instrs[k] += total_hoisted;
+        loop->body_instrs[k] += hoisted_this_loop;
       }
     }
   }
@@ -2131,10 +2355,24 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
    * because VLAs have special stack semantics - the size computation must
    * happen at the VLA allocation point, not in the preheader.
    */
-  /* Pure call hoisting disabled for now — the call_id renumbering
-   * corrupts argument linkage in chained-call patterns.
-   * TODO: fix tcc_ir_hoist_pure_calls index tracking and re-enable. */
-  int hoisted_calls = 0;
+  /* Pure/const call hoisting — RE-ENABLED (docs/bugs.md #7, fixed 2026-07-02).
+   * Four defects were fixed to make this safe:
+   *   1. Multi-loop index fix-up now shifts later loops by per-loop insertion
+   *      counts, not the cumulative total (which over-shifted a 3rd+ loop).
+   *   2. Transitive-invariance CHAINING (a call whose arg is another just-
+   *      hoisted call's result) is not attempted — a single non-chaining pass;
+   *      that path copied a FUNCPARAMVAL referencing a body-only vreg and
+   *      ordered the dependent call before its producer.
+   *   3. The copied CALL / param markers are laid out per each op's irop_config
+   *      (FUNCCALLVOID has no dest; FUNCPARAMVOID has no src1) — the old code
+   *      always emitted a dest+src1, misdecoding a void call's call_id.
+   *   4. collect_call_params gathers FUNCPARAMVOID markers too, so a call's
+   *      end-of-args marker travels with it.
+   *   5. A merely-PURE (memory-reading) call is hoisted only when the loop
+   *      cannot modify the memory it reads (PR20100); CONST calls always may.
+   * Change is signalled to the pipeline via num_loops > 0 (see tcc_ir_opt_licm),
+   * same as the dominance-based LICM below. */
+  int hoisted_calls = tcc_ir_hoist_pure_calls(ir, loops);
   int hoisted = 0;
   (void)hoisted_calls;
 

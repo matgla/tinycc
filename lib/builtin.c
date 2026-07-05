@@ -12,6 +12,16 @@ unsigned long __tcc_strlen(const char *s);
 char *__tcc_strcpy(char *d, const char *s);
 #endif
 
+#if !defined(__arm__)
+/* Host-fallback string helpers use word-at-a-time null-byte detection.
+ * The magic constants must match sizeof(unsigned long), otherwise on a 64-bit
+ * host only the low 32 bits of each word are checked and the scan overruns
+ * the string terminator. */
+#define __TCC_WORD_ONES ((unsigned long)-1 / 0xFF)
+#define __TCC_WORD_HIGHS (__TCC_WORD_ONES << 7)
+#define __TCC_HAS_NULL_BYTE(w) (((w) - __TCC_WORD_ONES) & ~(w) & __TCC_WORD_HIGHS)
+#endif
+
 /* ---------------------------------------------- */
 /* This file implements:
  * __builtin_ffs
@@ -629,11 +639,11 @@ int __tcc_strcmp(const char *s1, const char *s2)
         a = w1[0];
         b = w2[0];
         /* Single branch: words differ OR null byte present */
-        if (a != b || ((a - 0x01010101UL) & ~a & 0x80808080UL))
+        if (a != b || __TCC_HAS_NULL_BYTE(a))
           break;
         a = w1[1];
         b = w2[1];
-        if (a != b || ((a - 0x01010101UL) & ~a & 0x80808080UL))
+        if (a != b || __TCC_HAS_NULL_BYTE(a))
         {
           w1++;
           w2++;
@@ -683,7 +693,7 @@ unsigned long __tcc_strlen(const char *s)
     for (;;)
     {
       w = *wp;
-      if ((w - 0x01010101UL) & ~w & 0x80808080UL)
+      if (__TCC_HAS_NULL_BYTE(w))
         break;
       wp++;
     }
@@ -863,11 +873,11 @@ char *__tcc_strcpy(char *d, const char *s)
       for (;;)
       {
         w0 = ws[0];
-        if ((w0 - 0x01010101UL) & ~w0 & 0x80808080UL)
+        if (__TCC_HAS_NULL_BYTE(w0))
           break;
         w1 = ws[1];
         wd[0] = w0;
-        if ((w1 - 0x01010101UL) & ~w1 & 0x80808080UL)
+        if (__TCC_HAS_NULL_BYTE(w1))
         {
           wd++;
           ws++;

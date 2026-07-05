@@ -431,9 +431,9 @@ void tcc_dump_quadruple_to(FILE *out, const TACQuadruple *q, int pc)
     fprintf(out, "JMP to %d ", (int)q->dest.c.i);
     break;
   case TCCIR_OP_IJUMP:
+    /* Mnemonic only; the generic has_src1 block below prints src1 once.
+       See docs/bugs.md #5 (matching the fix in tcc_print_quadruple_irop). */
     fprintf(out, "IJMP ");
-    tcc_dump_svalue_short_to(out, &q->src1);
-    fprintf(out, " ");
     break;
   default:
     tcc_dump_svalue_short_to(out, &q->dest);
@@ -620,6 +620,59 @@ static int show_physical_regs = 0;
 void tcc_ir_dump_set_show_physical_regs(int show)
 {
   show_physical_regs = show;
+}
+
+/* Returns 1 if `pass_name` is selected by the comma-separated -dump-ir-passes=
+ * list in s->dump_ir_passes (or the list contains the special token "all"). */
+int tcc_ir_dump_passes_match(TCCState *s, const char *pass_name)
+{
+  if (!s || !s->dump_ir_passes || !pass_name)
+    return 0;
+  const char *p = s->dump_ir_passes;
+  size_t name_len = strlen(pass_name);
+  while (*p)
+  {
+    const char *comma = strchr(p, ',');
+    size_t tok_len = comma ? (size_t)(comma - p) : strlen(p);
+    if (tok_len == 3 && !memcmp(p, "all", 3))
+      return 1;
+    if (tok_len == name_len && !memcmp(p, pass_name, name_len))
+      return 1;
+    if (!comma)
+      break;
+    p = comma + 1;
+  }
+  return 0;
+}
+
+/* If pass_name is selected by -dump-ir-passes=, print the IR labeled with the
+ * pass name as "=== AFTER <name> ===" ... "=== END AFTER <name> ===".  Shared by
+ * the legacy optimize loop (tccgen.c RUN_PASS / dump_ir_after_pass) and the SSA
+ * optimizer driver (ir/opt/ssa_opt.c) so every pass is observable the same way.
+ * A no-op unless built with CONFIG_TCC_DEBUG. */
+void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name)
+{
+#ifdef CONFIG_TCC_DEBUG
+  if (!tcc_ir_dump_passes_match(tcc_state, pass_name))
+    return;
+  tcc_ir_dump_set_show_physical_regs(0);
+  printf("=== AFTER %s ===\n", pass_name);
+  tcc_ir_show(ir);
+  /* Switch side tables are absolute-index consumers that renumbering passes
+   * must keep in sync — print them so a stale target is visible in the dump. */
+  for (int t = 0; t < ir->num_switch_tables; t++) {
+    TCCIRSwitchTable *tbl = &ir->switch_tables[t];
+    printf("SWTAB %d: min=%lld max=%lld default=%d targets=[", t,
+           (long long)tbl->min_val, (long long)tbl->max_val, tbl->default_target);
+    for (int j = 0; j < tbl->num_entries; j++)
+      printf("%s%d", j ? "," : "", tbl->targets[j]);
+    printf("]\n");
+  }
+  printf("=== END AFTER %s ===\n", pass_name);
+#else
+  (void)ir;
+  (void)pass_name;
+#endif
 }
 
 /* Get the short prefix for a vreg type: V, T, or P */
@@ -952,9 +1005,11 @@ void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc)
     printf("JMP to %ld ", (long)irop_get_imm64_ex(ir, dest));
     break;
   case TCCIR_OP_IJUMP:
+    /* Only print the mnemonic here; the generic has_src1 block below prints
+       src1 (the target register) exactly once.  Printing it here too produced
+       a double "IJMP T4 T4" (docs/bugs.md #5).  Unlike JUMPIF/MLA, IJUMP is
+       not excluded from that block, so this case must not print src1 itself. */
     printf("IJMP ");
-    print_iroperand_short(ir, src1);
-    printf(" ");
     break;
   case TCCIR_OP_MLA:
     /* MLA has 4 operands: dest = src1 * src2 + accum */

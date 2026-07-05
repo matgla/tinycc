@@ -105,7 +105,9 @@ void ssa_drop_phi_edge(IRSSAOptCtx *ctx, int dead_pred_block,
 static int ssa_block_for_instr(IRCFG *cfg, int instr_idx)
 {
   if (!cfg || !cfg->instr_to_block) return -1;
-  if (instr_idx < 0) return -1;
+  /* instr_to_block is sized to num_instrs at CFG-build time; instructions
+   * appended by later passes index past it, so bound-check both ends. */
+  if (instr_idx < 0 || instr_idx >= cfg->num_instrs) return -1;
   return cfg->instr_to_block[instr_idx];
 }
 

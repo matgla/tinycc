@@ -67,6 +67,16 @@ static int bf_possible_bits(TCCIRState *ir, IROperand op, int before_idx, uint32
   int32_t vr = irop_get_vreg(op);
   if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
+  /* This pass runs pre-SSA, so a TEMP can be written on several paths (e.g. an
+   * un-lowered `?:` whose arms assign different values).  tcc_ir_find_defining_
+   * instruction returns only the nearest preceding def, silently ignoring the
+   * other reaching definitions; reasoning from one arm under-reports the bits.
+   * longlong seed 111125 / volatile seed 112075: a TEMP was `T<-0` on one arm
+   * and a non-zero value on another, and bounding it from the zero arm alone let
+   * `(T | C) & 1` fold to `T`.  Only trust a def-derived bound for single-def
+   * TEMP values. */
+  if (!tcc_ir_vreg_has_single_def(ir, vr))
+    return 0;
   int d = tcc_ir_find_defining_instruction(ir, vr, before_idx);
   if (d < 0)
     return 0;

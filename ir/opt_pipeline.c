@@ -10,14 +10,16 @@
 
 #define USING_GLOBALS
 
+#include <ctype.h>
+
 #include "ir.h"
 #include "opt_pipeline.h"
 #include "opt.h"
+#include "opt_utils.h"
 #include "opt_gens_fusion.h"
 #include "opt_gens_bool.h"
 #include "opt_gens_call_result.h"
 #include "opt_gens_branch.h"
-#include "opt_utils.h"
 #include "opt_xform.h"
 
 #define FLAG(f) (uint16_t)offsetof(TCCState, f)
@@ -107,6 +109,12 @@ void dbg_scan_imm_dest(TCCIRState *ir, const char *pass)
   }
 }
 
+/* Every pass this loop runs is made observable via tcc_ir_dump_after_pass(),
+ * the same -dump-ir-passes=<name> hook ir/regalloc.c's RUN_SSA wires up for
+ * the SSA driver — otherwise group-registered passes (including compound
+ * cascade wrappers like "esp_cleanup"/"kb_cascade" that have no other call
+ * site) are invisible to the golden-IR snapshot harness. No-op outside
+ * CONFIG_TCC_DEBUG builds. */
 int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
 {
   int total_changes = 0;
@@ -125,6 +133,8 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
       const IROptPass *trigger = &group->passes[group->trigger_idx];
       if (trigger->flag_offset && !*((unsigned char *)tcc_state + trigger->flag_offset))
         break;
+      if (tcc_ir_opt_pass_disabled(trigger->name))
+        break;
       if (tcc_pass_timing_on > 0) {
         unsigned long _rt = tcc_pass_clk_us();
         pipeline_ensure_requirements(ctx, trigger->requires);
@@ -137,7 +147,15 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
         tcc_pass_timing_add(trigger->name ? trigger->name : "P:trigger", tcc_pass_clk_us() - _tt);
       dbg_scan_imm_dest(ctx->ir, trigger->name);
       dbg_scan_overlap(ctx->ir, trigger->name);
+      tcc_ir_dump_after_pass(ctx->ir, trigger->name);
       pipeline_trace_pass(group, trigger, iter, tch);
+      /* Exiting on an idle trigger can stall a cascade: non-trigger passes
+       * from the previous round may have created new work the trigger would
+       * only find next round.  Groups sidestep this with internal fixpoint
+       * wrappers (kb_cascade, branch_cleanup).  The general alternative —
+       * re-iterate while round_changes > 0 and use the trigger only as a
+       * first-round gate — changes semantics for every triggered group and
+       * needs a full fuzz-sweep validation before switching. */
       if (tch <= 0)
         break;
       round_changes += tch;
@@ -151,6 +169,8 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
       if (!pass->run)
         continue;
       if (pass->flag_offset && !*((unsigned char *)tcc_state + pass->flag_offset))
+        continue;
+      if (tcc_ir_opt_pass_disabled(pass->name))
         continue;
 
       if (tcc_pass_timing_on > 0) {
@@ -166,6 +186,7 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
         tcc_pass_timing_add(pass->name ? pass->name : "P:pass", tcc_pass_clk_us() - _pt);
       dbg_scan_imm_dest(ctx->ir, pass->name);
       dbg_scan_overlap(ctx->ir, pass->name);
+      tcc_ir_dump_after_pass(ctx->ir, pass->name);
       if (changes > 0) {
         round_changes += changes;
         pipeline_apply_invalidations(ctx, pass->invalidates);
@@ -180,7 +201,13 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
       tcc_ir_opt_ctx_invalidate(ctx);
     }
 
-    if (round_changes == 0 && group->trigger_idx < 0)
+    /* Fixpoint termination: stop once a round produces no changes.  The old
+       `&& group->trigger_idx < 0` clause was redundant (docs/bugs.md #4): a
+       trigger-bearing group that reaches here already had tch > 0 (otherwise
+       it broke at the `tch <= 0` check above), so round_changes >= tch > 0 and
+       this condition is never true for it anyway -- its termination is driven
+       solely by the trigger.  Dropping the clause changes no behavior. */
+    if (round_changes == 0)
       break;
   }
 

@@ -396,8 +396,10 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
     }
 
     /* Walk operands; record reads of known slots and bail on any non-tame
-     * use of a known-address vreg. */
-    for (int k = 0; k < 3; k++)
+     * use of a known-address vreg.  k==3 is MLA's accumulator (4th operand):
+     * `T <-- Ta MLA Tb + Tacc***DEREF***` reads the slot through Tacc, a use
+     * src1/src2 never surface (struct_byval seed 11651). */
+    for (int k = 0; k < 4; k++)
     {
       IROperand op;
       int has;
@@ -405,8 +407,10 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
                     if (has) op = tcc_ir_op_get_dest(ir, q); }
       else if (k == 1) { has = irop_config[q->op].has_src1;
                          if (has) op = tcc_ir_op_get_src1(ir, q); }
-      else { has = irop_config[q->op].has_src2;
+      else if (k == 2) { has = irop_config[q->op].has_src2;
              if (has) op = tcc_ir_op_get_src2(ir, q); }
+      else { has = (q->op == TCCIR_OP_MLA);
+             if (has) op = tcc_ir_op_get_accum(ir, q); }
       if (!has)
         continue;
       /* Lval reference: it's a read of the slot.  We treat any lval-src use
@@ -526,6 +530,69 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
     if (dest.is_complex)
       dest_w *= 2;
     int store_off = slot_off;
+
+    /* Write-after-write: if a later store in the same straight-line run fully
+     * overwrites this store's byte range with no read of those bytes in
+     * between, S1's value is never observed — eliminate it even though the slot
+     * is read further on (that read sees the overwriting store's value).
+     * Restricting to a straight-line run (break at any control-flow op or jump
+     * target) keeps the proof sound: the covering store unconditionally runs
+     * after S1 before any branch could route to a read.  Intermediate stores
+     * never *read* R1 (their value operands were escape-checked in Pass 2), so
+     * they cannot keep S1 alive — only a recorded read can. */
+    int waw_dead = 0;
+    for (int j = i + 1; j < n; j++)
+    {
+      IRQuadCompact *qj = &ir->compact_instructions[j];
+      if (qj->op == TCCIR_OP_NOP)
+        continue;
+      if (qj->is_jump_target)
+        break; /* control-flow merge — straight-line run ends */
+      if (qj->op == TCCIR_OP_JUMP || qj->op == TCCIR_OP_JUMPIF ||
+          qj->op == TCCIR_OP_IJUMP || qj->op == TCCIR_OP_SWITCH_TABLE ||
+          qj->op == TCCIR_OP_RETURNVALUE || qj->op == TCCIR_OP_RETURNVOID ||
+          qj->op == TCCIR_OP_FUNCCALLVAL || qj->op == TCCIR_OP_FUNCCALLVOID)
+        break; /* leaves the straight-line run */
+      if (qj->op != TCCIR_OP_STORE)
+        continue;
+      IROperand d2 = tcc_ir_op_get_dest(ir, qj);
+      if (!RESOLVE_LVAL_SLOT(d2))
+        continue; /* writes a non-tracked location (no escapes survived Pass 2) */
+      int off2 = slot_off;
+      int w2 = ir_opt_store_btype_size_bytes(irop_get_btype(d2));
+      if (w2 <= 0)
+        w2 = irop_is_64bit(d2) ? 8 : 4;
+      if (d2.is_complex)
+        w2 *= 2;
+      if (off2 <= store_off && store_off + dest_w <= off2 + w2)
+      {
+        /* Full cover: S1 is dead unless its bytes are read before j. */
+        int read_between = 0;
+        for (int r = 0; r < reads_n; r++)
+          if (store_off < reads[r].off + reads[r].width &&
+              reads[r].off < store_off + dest_w &&
+              reads[r].pos > i && reads[r].pos < j)
+          {
+            read_between = 1;
+            break;
+          }
+        if (!read_between)
+          waw_dead = 1;
+        break;
+      }
+      if (store_off < off2 + w2 && off2 < store_off + dest_w)
+        break; /* partial overlap — cannot prove S1 fully dead */
+      /* disjoint slot — keep scanning for a covering store */
+    }
+    if (waw_dead)
+    {
+      LOG_IR_GEN("DEAD LEA-STORE (WAW): nop STORE to StackLoc[%d] at i=%d w=%d",
+                 store_off, i, dest_w);
+      q->op = TCCIR_OP_NOP;
+      changes++;
+      continue;
+    }
+
     int alive = 0;
     for (int r = 0; r < reads_n; r++)
     {

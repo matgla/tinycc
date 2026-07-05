@@ -95,10 +95,6 @@ void tcc_ir_free_loops(IRLoops *loops);
 /* Check if an instruction index is inside a loop */
 int tcc_ir_is_in_loop(IRLoop *loop, int instr_idx);
 
-/* Identify and hoist loop-invariant stack address computations
- * Returns number of instructions hoisted */
-int tcc_ir_hoist_loop_invariants(TCCIRState *ir, IRLoops *loops);
-
 /* Estimate how many values can be safely hoisted out of a loop without
  * starving the loop body of registers. Scans the loop body to estimate
  * register pressure and returns the number of registers available for

@@ -229,6 +229,16 @@ typedef enum TccIrOp
   TCCIR_OP_SMULL,
 } TccIrOp;
 
+/* Size (in bytes) at or above which the backend lowers a TCCIR_OP_BLOCK_COPY to
+ * a real memcpy() call instead of an inline LDM/STM sequence (see
+ * tcc_gen_machine_block_copy_mop in arm-thumb-gen.c).  A memcpy call clobbers
+ * the caller-saved registers, so register allocation must treat a block copy of
+ * at least this size as a call site (ra_build_call_prefix in ir/regalloc.c) and
+ * force any value live across it off r0-r3/r12.  The inline path below this size
+ * preserves everything it touches via scratch save/restore, so it is not a call.
+ * The two sites must agree on this threshold; keep them in sync via this macro. */
+#define TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES 64
+
 /* FUNCPARAMVAL encoding helpers:
  * src2.c.i encodes both parameter index (lower 16 bits) and call_id (upper 16 bits)
  * This keeps call/param binding explicit and makes the IR more compact.
@@ -453,6 +463,7 @@ typedef struct TCCIRState
   int named_arg_reg_bytes;
   int named_arg_stack_bytes;
 
+  uint8_t is_variadic : 1;
   uint8_t leaffunc : 1;
   uint8_t tail_call_only : 1;
   uint8_t naked : 1;
@@ -585,6 +596,12 @@ typedef struct TCCIRState
   uint32_t *orig_ir_to_code_mapping;
   int orig_ir_to_code_mapping_size;
 
+  /* Mirror of tccgen's func_has_label_addr for the current function: set when the
+   * body takes a label address (GCC labels-as-values, `&&label`).  Kept on the IR
+   * state so the IR layer (regalloc) can consult it without referencing a tccgen
+   * global (which the standalone unit-test link does not provide). */
+  int func_has_label_addr;
+
   LSLiveIntervalState ls;
 
   /* Extra scratch allocation flags to apply during materialization for the current IR instruction. */
@@ -620,6 +637,16 @@ typedef struct TCCIRState
    * Entry = lsb (bits 0-7) | (width << 8); width >= 1 so a real BFI entry is
    * never 0.  Consumed by tcc_gen_machine_bfi_mop. */
   uint16_t *bfi_params;
+
+  /* Codegen temporaries owned by tcc_ir_codegen_generate while it is running.
+   * They are normally freed before return; tcc_ir_free also releases them when
+   * a compile error longjmps out of codegen. */
+  int *codegen_return_jump_addrs;
+  int *codegen_dry_insn_scratch;
+  uint16_t *codegen_dry_insn_saves;
+  void *codegen_mop_cache;
+  uint32_t *codegen_cbz_dry_mapping;
+  uint8_t *codegen_branch_target_reset;
 } TCCIRState;
 
 TCCIRState *tcc_ir_allocate_block();
@@ -659,9 +686,14 @@ void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r
 const char *tcc_ir_get_op_name(TccIrOp op);
 void tcc_ir_show(TCCIRState *ir);
 void tcc_ir_dump_set_show_physical_regs(int show);
+/* -dump-ir-passes= helpers (shared by the legacy optimize loop in tccgen.c and
+ * the SSA optimizer driver in ir/opt/ssa_opt.c). */
+int tcc_ir_dump_passes_match(TCCState *s, const char *pass_name);
+void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name);
 void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
 
 IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg);
+IRLiveInterval *tcc_ir_try_get_live_interval(TCCIRState *ir, int vreg);
 void tcc_ir_backpatch(TCCIRState *ir, int t, int target_address);
 void tcc_ir_backpatch_to_here(TCCIRState *ir, int t);
 void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address);
@@ -842,6 +874,17 @@ static inline void tcc_ir_set_src1(TCCIRState *ir, int index, IROperand irop)
   if (!irop_config[q->op].has_src1)
     return;
   int off = irop_config[q->op].has_dest;
+  /* A STORE_INDEXED / STORE_POSTINC derives its store width from the VALUE
+   * (src1) operand's btype.  A value rewrite (e.g. copy-propagation forwarding
+   * a wider temp into a char/short bitfield store) must not widen it — that
+   * would turn a byte/half store into a word store and clobber adjacent memory.
+   * Preserve the existing narrow access width. */
+  if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC) {
+    uint8_t old_bt = ir->iroperand_pool[q->operand_base + off].btype;
+    if ((old_bt == IROP_BTYPE_INT8 || old_bt == IROP_BTYPE_INT16) &&
+        irop.btype == IROP_BTYPE_INT32)
+      irop.btype = old_bt;
+  }
   ir->iroperand_pool[q->operand_base + off] = irop;
 }
 

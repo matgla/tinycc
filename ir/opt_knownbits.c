@@ -33,6 +33,7 @@
 
 #include "ir.h"
 #include "opt.h"
+#include "opt_alias.h"
 #include "opt_engine.h"
 #include "opt_utils.h"
 
@@ -172,6 +173,23 @@ static int kb_lval_stack_off(const TCCIRState *ir, IROperand op,
                             current_gen, out_off);
   }
   return 0;
+}
+
+/* Resolve a base pointer operand (e.g. STORE_INDEXED base) to a concrete
+ * stack-frame offset when it is a direct Addr[StackLoc] or a single-def
+ * TEMP/VAR holding such an address. */
+static int kb_base_stack_off(const TCCIRState *ir, IROperand base,
+                             const TmpKB *tmp_kb, int max_tmp_pos,
+                             const VregAddrKB *var_addr, int max_var_pos,
+                             int current_gen, int32_t *out_off)
+{
+  if (kb_is_direct_stackoff(base, 0))
+  {
+    *out_off = (int32_t)irop_get_imm64_ex(ir, base);
+    return 1;
+  }
+  return vreg_addr_lookup(irop_get_vreg(base), tmp_kb, max_tmp_pos, var_addr,
+                          max_var_pos, current_gen, out_off);
 }
 
 static int kb_value_is_stack_addr(const TCCIRState *ir, IROperand op,
@@ -365,7 +383,13 @@ static int kb_operand_const_u64(const TCCIRState *ir, const IROperand *op,
     if (btype == IROP_BTYPE_FLOAT32 || btype == IROP_BTYPE_FLOAT64 ||
         btype == IROP_BTYPE_STRUCT)
       return 0;
-    *out = kb_apply_const_width((uint64_t)irop_get_imm64_ex(ir, *op), btype, op->is_unsigned);
+    /* An immediate already stores its actual signed/unsigned VALUE in u.imm32
+     * (a signed char -56 holds -56; an unsigned char 208 holds 208).  Applying
+     * sub-word width extension would re-interpret the low byte as a bit pattern
+     * and sign-extend it — corrupting an `unsigned char` 208 (0xd0) to -48 when
+     * the immediate's is_unsigned flag was dropped upstream (combo seed 1053).
+     * Read immediates raw; only memory loads model sub-word extension. */
+    *out = (uint64_t)irop_get_imm64_ex(ir, *op);
     return 1;
   }
 
@@ -424,7 +448,7 @@ static IROperand kb_make_const_operand(TCCIRState *ir, uint64_t val, int btype)
   return irop_make_i64(-1, pool_idx, btype);
 }
 
-static int kb_const_compute(TccIrOp op, int dest_btype,
+static int kb_const_compute(TccIrOp op, int dest_btype, int src1_btype,
                             uint64_t a, uint64_t b, uint64_t *out)
 {
   int width = (dest_btype == IROP_BTYPE_INT64) ? 64 : 32;
@@ -434,9 +458,24 @@ static int kb_const_compute(TccIrOp op, int dest_btype,
   {
   case TCCIR_OP_ASSIGN:
   case TCCIR_OP_LOAD:
-  case TCCIR_OP_ZEXT:
     *out = a;
     break;
+  case TCCIR_OP_ZEXT:
+  {
+    /* Zero-extend from the SOURCE width. kb_operand_const_u64 sign-extends a
+     * signed source to 64 bits, so a verbatim copy would poison the high half
+     * (e.g. ZEXT(#-326:I32) must give 0x00000000FFFFFEBA, not ...FFFFFEBA). */
+    uint64_t src_mask;
+    switch (src1_btype)
+    {
+    case IROP_BTYPE_INT8:  src_mask = 0xFFULL;       break;
+    case IROP_BTYPE_INT16: src_mask = 0xFFFFULL;     break;
+    case IROP_BTYPE_INT32: src_mask = 0xFFFFFFFFULL; break;
+    default:               src_mask = ~0ULL;         break;
+    }
+    *out = a & src_mask;
+    break;
+  }
   case TCCIR_OP_ADD:
     *out = a + b;
     break;
@@ -460,7 +499,9 @@ static int kb_const_compute(TccIrOp op, int dest_btype,
   case TCCIR_OP_SHR:
     if (b >= (uint64_t)width)
       return 0;
-    *out = a >> b;
+    /* Logical shift: mask the source to the operation width first so the
+     * sign-extended high bits (for a 32-bit op) are not shifted in. */
+    *out = (a & mask) >> b;
     break;
   case TCCIR_OP_SAR:
     if (b >= (uint64_t)width)
@@ -721,6 +762,7 @@ static int kb_compute(TccIrOp op, uint32_t a_kz, uint32_t a_ko,
 static int tcc_ir_opt_known_bits__timed(TCCIRState *ir);
 int tcc_ir_opt_known_bits(TCCIRState *ir)
 {
+  if (tcc_ir_opt_pass_disabled("known_bits")) return 0;
   tcc_pass_timing_init();
   if (!tcc_pass_timing_on) return tcc_ir_opt_known_bits__timed(ir);
   unsigned long _t = tcc_pass_clk_us();
@@ -848,6 +890,23 @@ static int tcc_ir_opt_known_bits__timed(TCCIRState *ir)
 
       if (have_off)
       {
+        /* A narrow store at stack_off also overwrites bytes belonging to any
+         * OTHER tracked slot whose range overlaps [stack_off, stack_off+width)
+         * — e.g. a sub-word bitfield write (INT16 at offset N) clobbers the
+         * high half of the enclosing word slot at N-2.  stack_kb_set only
+         * touches the exact-offset slot, so without invalidating the
+         * overlapping aliases a later wide load of one of them would fold to a
+         * stale value (the bitfield write silently lost).  Mirrors the overlap
+         * invalidation already done by the STORE_INDEXED and wide-store paths. */
+        int width = ir_opt_store_btype_size_bytes(dest_btype);
+        if (width <= 0)
+          width = 4;
+        for (int s = 0; s < n_stack_slots; s++)
+          if (stack_slots[s].off != stack_off &&
+              stack_slots[s].off < stack_off + width &&
+              stack_slots[s].off + 4 > stack_off)
+            stack_slots[s].gen = 0;
+
         uint32_t kz, ko;
         if (kb_operand(ir, src1, tmp_kb, max_tmp_pos, current_gen,
                        var_addr, max_var_pos,
@@ -870,6 +929,43 @@ static int tcc_ir_opt_known_bits__timed(TCCIRState *ir)
         /* STORE through unknown pointer: conservatively invalidate all slots. */
         stack_kb_invalidate_all(stack_slots, n_stack_slots);
       }
+      goto post_op;
+    }
+
+    /* STORE_INDEXED / STORE_POSTINC: *(base + (idx << scale)) = src.
+     * If the base resolves to a known stack address and the index/scale are
+     * constant, invalidate the touched slot(s).  Otherwise be conservative:
+     * a variable-indexed or unknown-base indexed store may alias any slot.
+     * Without this, kb can fold a later direct StackLoc load to a stale value
+     * because it never saw the indexed write clobber the slot. */
+    if (op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_STORE_POSTINC)
+    {
+      IROperand base = tcc_ir_op_get_dest(ir, q);
+      IROperand idx  = tcc_ir_op_get_src2(ir, q);
+      IROperand sc   = tcc_ir_op_get_scale(ir, q);
+      int32_t base_off;
+
+      if (kb_base_stack_off(ir, base, tmp_kb, max_tmp_pos, var_addr,
+                            max_var_pos, current_gen, &base_off) &&
+          irop_is_immediate(idx) && !idx.is_sym &&
+          irop_is_immediate(sc) && !sc.is_sym)
+      {
+        int shift = (int)irop_get_imm64_ex(ir, sc) & 3;
+        int32_t off = base_off + ((int32_t)irop_get_imm64_ex(ir, idx) << shift);
+        IROperand val = tcc_ir_op_get_src1(ir, q);
+        int width = ir_opt_store_btype_size_bytes(irop_get_btype(val));
+        if (width <= 0)
+          width = 4;
+        for (int s = 0; s < n_stack_slots; s++)
+          if (stack_slots[s].off < off + width &&
+              stack_slots[s].off + 4 > off)
+            stack_slots[s].gen = 0;
+      }
+      else
+      {
+        stack_kb_invalidate_all(stack_slots, n_stack_slots);
+      }
+      stack_dirty_since_split = 1;
       goto post_op;
     }
 
@@ -906,9 +1002,6 @@ static int tcc_ir_opt_known_bits__timed(TCCIRState *ir)
       stack_kb_invalidate_all(stack_slots, n_stack_slots);
       stack_dirty_since_split = 1;
     }
-
-    if (op == TCCIR_OP_JUMPIF)
-      stack_dirty_since_split = 0;
 
     /* TEST_ZERO + JUMPIF EQ/NE folding using known-bits.  When kb proves
      * src1 has any known-one bit (ko != 0), the value is provably non-zero
@@ -1224,7 +1317,7 @@ static int tcc_ir_opt_known_bits__timed(TCCIRState *ir)
                                   var_addr, max_var_pos,
                                   stack_slots, n_stack_slots, &cv2);
       if (h1 && (!irop_config[op].has_src2 || h2) &&
-          kb_const_compute(op, dest_btype, cv1, cv2, &cres))
+          kb_const_compute(op, dest_btype, s1_btype, cv1, cv2, &cres))
       {
         IROperand imm = kb_make_const_operand(ir, cres, dest_btype);
         imm.is_unsigned = dest.is_unsigned;
@@ -1241,6 +1334,24 @@ static int tcc_ir_opt_known_bits__timed(TCCIRState *ir)
           if (low_mask && ((uint32_t)cres & low_mask) == low_mask)
             suppress_rewrite = 1;
         }
+        /* ASSIGN is already the canonical constant form for plain immediates,
+         * while ASSIGN with a load-shaped source must preserve that operand's
+         * dereference tags.  Record the known bits, but do not rewrite it in
+         * this fast path. */
+        if (op == TCCIR_OP_ASSIGN)
+          suppress_rewrite = 1;
+        /* If a source is an lvalue, the fully-known result depends on a memory
+         * read.  Keep the instruction shape so later codegen still performs
+         * that read; only record the known-bits fact for local consumers.
+         * LOAD is the exception: its src1 is the address being loaded, and
+         * folding a load from a known stack slot into an immediate ASSIGN is
+         * exactly what this pass is supposed to do.  Use irop_op_is_lval so
+         * that a missing src2 (IROP_NONE, whose packed vr field has all bits
+         * set) does not accidentally look like an lvalue. */
+        if (op != TCCIR_OP_LOAD &&
+            ((irop_config[op].has_src1 && irop_op_is_lval(s1)) ||
+             (irop_config[op].has_src2 && irop_op_is_lval(s2))))
+          suppress_rewrite = 1;
         if (!already_folded && !suppress_rewrite)
         {
           q->op = TCCIR_OP_ASSIGN;
@@ -1551,12 +1662,12 @@ recheck_wide:;
           LOG_IR_GEN(
               "OPTIMIZE: knownbits fold TMP:%d = #%d at i=%d (kz=%08x ko=%08x)",
               dpos, val, i, dkz, dko);
+          changes++;
           tmp_kb[dpos].gen = current_gen;
           tmp_kb[dpos].kz = ~(uint32_t)val;
           tmp_kb[dpos].ko = (uint32_t)val;
           tmp_kb[dpos].const_val = (uint32_t)val;
           tmp_kb[dpos].has_const = 1;
-          changes++;
           continue;
         }
         tmp_kb[dpos].gen = current_gen;
