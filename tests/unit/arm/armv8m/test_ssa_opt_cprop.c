@@ -624,6 +624,484 @@ UT_TEST(test_var_const_fold_intervening_store)
 }
 
 /* ========================================================================
+ * ssa_opt_symref_operand_cse: rewrite *sym to *Tn when Tn = sym exists
+ * ======================================================================== */
+
+UT_TEST(test_symref_operand_cse_basic)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  utb_pools_init(c.ir);
+  static Sym g;
+  memset(&g, 0, sizeof(g));
+  g.v = 1;
+
+  /* t0 = &g; t1 = *g [LOAD] */
+  int addr_i = ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32),
+                             utb_symref(c.ir, &g, 0, 0, 0, I32));
+  int load_i = ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(1, I32),
+                             utb_symref(c.ir, &g, 1, 0, 0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_cprop(c.ctx);
+  /* The deref SYMREF should be replaced by a deref through t0. */
+  UT_ASSERT(changed >= 1);
+  IROperand src = utb_src1(c.ir, load_i);
+  UT_ASSERT_EQ(irop_get_tag(src), IROP_TAG_VREG);
+  UT_ASSERT_EQ(irop_get_vreg(src), irop_get_vreg(utb_dest(c.ir, addr_i)));
+  UT_ASSERT(src.is_lval);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_opt_symref_operand_cse: barrier between materialization and deref
+ * ======================================================================== */
+
+UT_TEST(test_symref_operand_cse_call_barrier_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  utb_pools_init(c.ir);
+  static Sym g;
+  memset(&g, 0, sizeof(g));
+  g.v = 2;
+
+  /* t0 = &g; call(); t1 = *g */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  ssa_add_instr(&c, TCCIR_OP_FUNCCALLVOID, UTB_NONE, UTB_NONE);
+  int load_i = ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(1, I32),
+                             utb_symref(c.ir, &g, 1, 0, 0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_cprop(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(irop_get_tag(utb_src1(c.ir, load_i)), IROP_TAG_SYMREF);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_opt_var_to_param_forward: single-def VAR value forwarded across blocks
+ * ======================================================================== */
+
+UT_TEST(test_var_to_param_forward_basic)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  c.ir->next_local_variable = 1;
+
+  /* Block 0: V0 = #5; JUMP Block 1
+   * Block 1: t0 = V0 [LOAD] -> t0 = #5 [ASSIGN] */
+  IROperand v0 = utb_var(0, I32);
+  int store_i = ssa_add_instr(&c, TCCIR_OP_STORE, v0, utb_imm(5, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE);
+  int load_i = ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(0, I32), v0);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_var_to_param_forward(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, load_i), TCCIR_OP_ASSIGN);
+  IROperand src = utb_src1(c.ir, load_i);
+  UT_ASSERT_EQ(src.tag, IROP_TAG_IMM32);
+  UT_ASSERT_EQ(src.u.imm32, 5);
+  UT_ASSERT_EQ(utb_op(c.ir, store_i), TCCIR_OP_NOP);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_opt_var_to_param_forward: address-taken VAR cannot be forwarded
+ * ======================================================================== */
+
+UT_TEST(test_var_to_param_forward_addrtaken_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  c.ir->next_local_variable = 1;
+
+  /* V0 = #5; t0 = &V0; t1 = V0 [LOAD] */
+  IROperand v0 = utb_var(0, I32);
+  ssa_add_instr(&c, TCCIR_OP_STORE, v0, utb_imm(5, I32));
+  IROperand v0_addr = irop_make_stackoff(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 0),
+                                          0, /*is_lval=*/0, /*is_llocal=*/0,
+                                          /*is_param=*/0, I32);
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32), v0_addr);
+  int load_i = ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(1, I32), v0);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_var_to_param_forward(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, load_i), TCCIR_OP_LOAD);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_opt_var_to_param_forward: unsafe stored value (stack address) no fold
+ * ======================================================================== */
+
+UT_TEST(test_var_to_param_forward_stackaddr_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  c.ir->next_local_variable = 1;
+
+  /* V0 = &loc; t0 = V0 [LOAD] */
+  IROperand v0 = utb_var(0, I32);
+  IROperand loc = irop_make_stackoff(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 1),
+                                      0, /*is_lval=*/0, /*is_llocal=*/0,
+                                      /*is_param=*/0, I32);
+  ssa_add_instr(&c, TCCIR_OP_STORE, v0, loc);
+  int load_i = ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(0, I32), v0);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_var_to_param_forward(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, load_i), TCCIR_OP_LOAD);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_opt_var_forward: single-def VAR value forwarded in same block
+ * ======================================================================== */
+
+UT_TEST(test_var_forward_basic)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  c.ir->next_local_variable = 1;
+
+  /* V0 = #5 [STORE]; t0 = V0 [LOAD] -> t0 = #5 [ASSIGN] */
+  IROperand v0 = utb_var(0, I32);
+  ssa_add_instr(&c, TCCIR_OP_STORE, v0, utb_imm(5, I32));
+  int load_i = ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(0, I32), v0);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_var_forward(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, load_i), TCCIR_OP_ASSIGN);
+  IROperand src = utb_src1(c.ir, load_i);
+  UT_ASSERT_EQ(src.tag, IROP_TAG_IMM32);
+  UT_ASSERT_EQ(src.u.imm32, 5);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_opt_var_forward: call between def and use blocks forwarding
+ * ======================================================================== */
+
+UT_TEST(test_var_forward_call_barrier_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  c.ir->next_local_variable = 1;
+
+  /* V0 = #5; JUMP; call(); t0 = V0 */
+  IROperand v0 = utb_var(0, I32);
+  ssa_add_instr(&c, TCCIR_OP_STORE, v0, utb_imm(5, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE);
+  ssa_add_instr(&c, TCCIR_OP_FUNCCALLVOID, UTB_NONE, UTB_NONE);
+  int load_i = ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(0, I32), v0);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_var_forward(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, load_i), TCCIR_OP_LOAD);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_gen_cprop_copy_param: src/dest btype mismatch -> no fold
+ * ======================================================================== */
+
+UT_TEST(test_cprop_copy_param_btype_mismatch_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  /* t0 = P0 [LOAD I32->I64]; t1 = t0 + #1 (use directly) */
+  ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(0, I64),
+                utb_param(0, I32));
+  int use_i = ssa_add_instr(&c, TCCIR_OP_ADD, utb_temp(1, I64),
+                            utb_temp(0, I64));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_cprop(c.ctx);
+  /* LOAD btype mismatch -> P0 is not forwarded into t0's use. */
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, use_i)), IROP_VR(utb_temp(0, I64)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_gen_cprop_copy_param: src/dest unsigned mismatch -> no fold
+ * ======================================================================== */
+
+UT_TEST(test_cprop_copy_param_unsigned_mismatch_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  /* t0 = P0 [LOAD unsigned]; t1 = t0 + #1 (use directly) */
+  ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(0, I32),
+                utb_unsigned(utb_param(0, I32)));
+  int use_i = ssa_add_instr(&c, TCCIR_OP_ADD, utb_temp(1, I32),
+                            utb_temp(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_cprop(c.ctx);
+  /* LOAD unsigned mismatch -> P0 is not forwarded into t0's use. */
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, use_i)), IROP_VR(utb_temp(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_gen_cprop_copy_var_stackoff: unsigned mismatch -> no fold
+ * ======================================================================== */
+
+UT_TEST(test_cprop_copy_var_stackoff_unsigned_mismatch_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  IROperand v0_stackoff =
+      irop_make_stackoff(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 0), 0,
+                         /*is_lval=*/1, /*is_llocal=*/0, /*is_param=*/0, I32);
+  v0_stackoff.is_unsigned = 1;
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), v0_stackoff);
+  int use_i = ssa_add_instr(&c, TCCIR_OP_ADD, utb_temp(1, I32),
+                            utb_temp(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_cprop(c.ctx);
+  /* STACKOFF unsigned mismatch -> V0 is not forwarded into t0's use. */
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, use_i)), IROP_VR(utb_temp(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_gen_cprop_copy_var_stackoff: btype mismatch (INT8 vs INT32) -> no fold
+ * ======================================================================== */
+
+UT_TEST(test_cprop_copy_var_stackoff_btype_mismatch_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  IROperand v0_stackoff =
+      irop_make_stackoff(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 0), 0,
+                         /*is_lval=*/1, /*is_llocal=*/0, /*is_param=*/0,
+                         IROP_BTYPE_INT8);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), v0_stackoff);
+  int use_i = ssa_add_instr(&c, TCCIR_OP_ADD, utb_temp(1, I32),
+                            utb_temp(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_cprop(c.ctx);
+  /* STACKOFF btype mismatch -> V0 is not forwarded into t0's use. */
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, use_i)), IROP_VR(utb_temp(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_gen_cprop_copy_var_stackoff: V holds stack addr + deref use -> no fold
+ * ======================================================================== */
+
+UT_TEST(test_cprop_copy_var_stackoff_deref_stackaddr_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/6);
+  c.ir->next_local_variable = 2;
+
+  /* V0 = &loc [STORE]; t0 = V0 [ASSIGN]; *t0 = #7 [STORE] */
+  IROperand v0 = utb_var(0, I32);
+  IROperand loc = irop_make_stackoff(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 1),
+                                      0, /*is_lval=*/0, /*is_llocal=*/0,
+                                      /*is_param=*/0, I32);
+  ssa_add_instr(&c, TCCIR_OP_STORE, v0, loc);
+  int copy_i = ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32),
+                             irop_make_stackoff(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 0),
+                                                 0, /*is_lval=*/1, /*is_llocal=*/0,
+                                                 /*is_param=*/0, I32));
+  ssa_add_instr(&c, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)),
+                utb_imm(7, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_cprop(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_NE(utb_op(c.ir, copy_i), TCCIR_OP_NOP);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_gen_cprop_load_redundant: call barrier between loads -> no fold
+ * ======================================================================== */
+
+UT_TEST(test_cprop_load_redundant_call_barrier_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
+  /* r0 = #ptr; t0 = *r0; call; t1 = *r0 */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(0x1000, I32));
+  ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(1, I32), utb_temp(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_FUNCCALLVOID, UTB_NONE, UTB_NONE);
+  int load2_i = ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(2, I32),
+                              utb_temp(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_cprop(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, load2_i), TCCIR_OP_LOAD);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_gen_cprop_load_redundant: address-taken non-src def with lval src
+ * ======================================================================== */
+
+UT_TEST(test_cprop_load_redundant_addrtaken_def_lval_src_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/6);
+  c.ir->parameters_live_intervals_size = 2;
+  c.ir->parameters_live_intervals = tcc_mallocz(2 * sizeof(IRLiveInterval));
+  c.ir->parameters_live_intervals[1].addrtaken = 1;
+
+  /* t0 = *P0 [LOAD lval]; P1 = #5; t1 = *P0 [LOAD lval] */
+  ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(1, I32),
+                utb_lval(utb_param(0, I32)));
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_param(1, I32), utb_imm(5, I32));
+  int load2_i = ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(2, I32),
+                              utb_lval(utb_param(0, I32)));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_cprop(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, load2_i), TCCIR_OP_LOAD);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ssa_opt_var_const_fold: remaining operators
+ * ======================================================================== */
+
+static int var_const_fold_op(TccIrOp op, int32_t prior, int32_t imm,
+                              int32_t expect)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/3);
+  IROperand v0 = utb_var(0, I32);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, v0, utb_imm(prior, I32));
+  int self_upd_i = ssa_add_instr3(&c, op, v0, v0, utb_imm(imm, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_var_const_fold(c.ctx);
+  int ok = (changed >= 1 &&
+            utb_op(c.ir, self_upd_i) == TCCIR_OP_ASSIGN &&
+            utb_src1(c.ir, self_upd_i).tag == IROP_TAG_IMM32 &&
+            utb_src1(c.ir, self_upd_i).u.imm32 == expect);
+  ssa_ctx_free(&c);
+  return ok;
+}
+
+UT_TEST(test_var_const_fold_sub)
+{
+  UT_ASSERT(var_const_fold_op(TCCIR_OP_SUB, 10, 3, 7));
+  return 0;
+}
+
+UT_TEST(test_var_const_fold_mul)
+{
+  UT_ASSERT(var_const_fold_op(TCCIR_OP_MUL, 6, 7, 42));
+  return 0;
+}
+
+UT_TEST(test_var_const_fold_or)
+{
+  UT_ASSERT(var_const_fold_op(TCCIR_OP_OR, 0xF0, 0x0F, 0xFF));
+  return 0;
+}
+
+UT_TEST(test_var_const_fold_xor)
+{
+  UT_ASSERT(var_const_fold_op(TCCIR_OP_XOR, 0xFF, 0x0F, 0xF0));
+  return 0;
+}
+
+UT_TEST(test_var_const_fold_shl)
+{
+  UT_ASSERT(var_const_fold_op(TCCIR_OP_SHL, 1, 4, 16));
+  return 0;
+}
+
+UT_TEST(test_var_const_fold_shr)
+{
+  UT_ASSERT(var_const_fold_op(TCCIR_OP_SHR, 0x80000000U, 4, 0x08000000U));
+  return 0;
+}
+
+UT_TEST(test_var_const_fold_sar)
+{
+  UT_ASSERT(var_const_fold_op(TCCIR_OP_SAR, 0x80000000U, 4, 0xF8000000U));
+  return 0;
+}
+
+/* ========================================================================
  * Suite registration
  * ======================================================================== */
 
@@ -650,4 +1128,25 @@ UT_SUITE(ssa_opt_cprop)
   UT_RUN(test_var_const_fold_intervening_use);
   UT_RUN(test_var_const_fold_no_prior_const);
   UT_RUN(test_var_const_fold_intervening_store);
+  UT_RUN(test_symref_operand_cse_basic);
+  UT_RUN(test_symref_operand_cse_call_barrier_no_fold);
+  UT_RUN(test_var_to_param_forward_basic);
+  UT_RUN(test_var_to_param_forward_addrtaken_no_fold);
+  UT_RUN(test_var_to_param_forward_stackaddr_no_fold);
+  UT_RUN(test_var_forward_basic);
+  UT_RUN(test_var_forward_call_barrier_no_fold);
+  UT_RUN(test_cprop_copy_param_btype_mismatch_no_fold);
+  UT_RUN(test_cprop_copy_param_unsigned_mismatch_no_fold);
+  UT_RUN(test_cprop_copy_var_stackoff_unsigned_mismatch_no_fold);
+  UT_RUN(test_cprop_copy_var_stackoff_btype_mismatch_no_fold);
+  UT_RUN(test_cprop_copy_var_stackoff_deref_stackaddr_no_fold);
+  UT_RUN(test_cprop_load_redundant_call_barrier_no_fold);
+  UT_RUN(test_cprop_load_redundant_addrtaken_def_lval_src_no_fold);
+  UT_RUN(test_var_const_fold_sub);
+  UT_RUN(test_var_const_fold_mul);
+  UT_RUN(test_var_const_fold_or);
+  UT_RUN(test_var_const_fold_xor);
+  UT_RUN(test_var_const_fold_shl);
+  UT_RUN(test_var_const_fold_shr);
+  UT_RUN(test_var_const_fold_sar);
 }

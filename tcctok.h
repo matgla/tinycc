@@ -97,6 +97,7 @@ DEF(TOK_ERROR, "error")
 DEF(TOK_WARNING, "warning")
 DEF(TOK_LINE, "line")
 DEF(TOK_PRAGMA, "pragma")
+DEF(TOK__Pragma, "_Pragma") /* C11 6.10.9 _Pragma operator */
 DEF(TOK___LINE__, "__LINE__")
 DEF(TOK___FILE__, "__FILE__")
 DEF(TOK___DATE__, "__DATE__")

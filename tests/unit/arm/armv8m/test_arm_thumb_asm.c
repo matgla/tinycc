@@ -2419,22 +2419,42 @@ UT_TEST(test_token_suffix_condition_aliases_hs_lo)
 
 UT_TEST(test_token_suffix_explicit_al_condition)
 {
-  /* Documents the COND_NAMES_COUNT bug (bugs.md): "al" is at index 16 in
-     cond_names[], but COND_NAMES_COUNT is 16, so get_base_instruction_name()
-     never considers it a stripable suffix. "addal" therefore keeps its
-     suffix and base_token resolves back to the original "addal" token,
-     while the condition still defaults to COND_AL (14).
+  /* Fixed (bugs.md "COND_NAMES_COUNT too small"): COND_NAMES_COUNT is now 17
+     so the "al" entry (index 16) is searched, and an explicit "addal" suffix
+     is stripped to the "add" base with condition COND_AL (14).
 
-     NOTE: this is deliberately left unfixed -- naively bumping
-     COND_NAMES_COUNT to 17 makes "al" strippable, which then wrongly strips
-     the trailing "al" from real base mnemonics like "smlal"/"umlal"
-     (-> "sml"/"uml"), breaking their assembly.  A correct fix needs
-     instruction-table-aware condition stripping. See docs/bugs.md. */
+     The naive-bump regression (mis-splitting smlal/umlal into sml/uml) is
+     prevented by the table-aware guard in thumb_parse_token_suffix(): a token
+     that is itself a predefined mnemonic is returned verbatim and never
+     stripped -- see test_token_suffix_smlal_not_split / _umlal_not_split. */
+  int add_tok = tok_alloc("add", 3)->tok;
   int addal_tok = set_special_reg_tok("addal");
   int base_token = -1;
   int cond = thumb_parse_token_suffix(addal_tok, &base_token);
   UT_ASSERT_EQ(cond, 14);
-  UT_ASSERT_EQ(base_token, addal_tok);
+  UT_ASSERT_EQ(base_token, add_tok);
+  return 0;
+}
+
+UT_TEST(test_token_suffix_smlal_not_split)
+{
+  /* Regression guard for the naive COND_NAMES_COUNT bump: smlal ends in "al"
+     but is a real mnemonic, so it must NOT be split into "sml" + al. The
+     predefined TOK_ASM_smlal token is returned verbatim with COND_AL (14). */
+  int base_token = -1;
+  int cond = thumb_parse_token_suffix(TOK_ASM_smlal, &base_token);
+  UT_ASSERT_EQ(cond, 14);
+  UT_ASSERT_EQ(base_token, TOK_ASM_smlal);
+  return 0;
+}
+
+UT_TEST(test_token_suffix_umlal_not_split)
+{
+  /* As above for umlal -- another real mnemonic ending in "al". */
+  int base_token = -1;
+  int cond = thumb_parse_token_suffix(TOK_ASM_umlal, &base_token);
+  UT_ASSERT_EQ(cond, 14);
+  UT_ASSERT_EQ(base_token, TOK_ASM_umlal);
   return 0;
 }
 
@@ -2903,6 +2923,8 @@ UT_SUITE(arm_thumb_asm)
   UT_RUN(test_token_suffix_two_char_base_invalid_condition);
   UT_RUN(test_token_suffix_condition_aliases_hs_lo);
   UT_RUN(test_token_suffix_explicit_al_condition);
+  UT_RUN(test_token_suffix_smlal_not_split);
+  UT_RUN(test_token_suffix_umlal_not_split);
 
   /* tcc_asm_set_fpu */
   UT_RUN(test_fpu_enable_vfpv4_sp_d16);

@@ -87,6 +87,17 @@ jobs:
           # the step even though its output is teed to a log we upload on failure.
           make test CI=1 -j$(nproc) 2>&1 | tee /tmp/make-test.log
 
+      - name: Golden IR snapshot tests
+        # Snapshot the per-pass IR against checked-in .expected files. Kept a
+        # separate step (and a separate `make` target) from `make test`: it
+        # needs -dump-ir-passes, a debug/diagnostic interface, which the
+        # --debug build above provides. Runs after `make test` so the cross
+        # compiler and venv it depends on already exist.
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          make test-golden-ir
+
       - name: Collect failure artifacts
         if: failure()
         shell: bash

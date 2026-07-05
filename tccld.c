@@ -116,6 +116,16 @@ static void ld_skip_whitespace(LDParser *p)
   }
 }
 
+static int ld_is_name_start(int c)
+{
+  return isalpha(c) || c == '_' || c == '$';
+}
+
+static int ld_is_name_char(int c)
+{
+  return isalnum(c) || c == '_' || c == '.' || c == '*' || c == '$' || c == '-';
+}
+
 static int ld_next_token(LDParser *p)
 {
   int c;
@@ -199,14 +209,54 @@ static int ld_next_token(LDParser *p)
     return LDTOK_NUM;
   }
 
+  if (c == '.' || c == '*')
+  {
+    int c2 = ld_getc(p);
+    int starts_name;
+    if (c == '.')
+      starts_name = ld_is_name_char(c2);
+    else
+      starts_name = (c2 == '.' || c2 == '_' || c2 == '$' || c2 == '-' || c2 == '*' || isalpha(c2));
+
+    if (!starts_name)
+    {
+      ld_ungetc(p, c2);
+      p->tok = c;
+      p->tok_buf[0] = c;
+      p->tok_buf[1] = '\0';
+      return c;
+    }
+
+    q = p->tok_buf;
+    *q++ = c;
+    if (c2 != EOF)
+      *q++ = c2;
+    while ((c = ld_getc(p)) != EOF)
+    {
+      if (ld_is_name_char(c))
+      {
+        if (q - p->tok_buf < (int)sizeof(p->tok_buf) - 1)
+          *q++ = c;
+      }
+      else
+      {
+        break;
+      }
+    }
+    ld_ungetc(p, c);
+    *q = '\0';
+    p->tok = LDTOK_NAME;
+    return LDTOK_NAME;
+  }
+
   /* Identifier or keyword */
-  if (isalpha(c) || c == '_' || c == '.' || c == '*' || c == '$')
+  if (ld_is_name_start(c))
   {
     q = p->tok_buf;
     *q++ = c;
     while ((c = ld_getc(p)) != EOF)
     {
-      if (isalnum(c) || c == '_' || c == '.' || c == '*' || c == '$' || c == '-')
+      if (ld_is_name_char(c))
       {
         if (q - p->tok_buf < (int)sizeof(p->tok_buf) - 1)
           *q++ = c;
@@ -260,9 +310,17 @@ static int ld_expect(LDParser *p, int tok)
   if (p->tok != tok)
   {
     if (tok < 256)
-      return tcc_error_noabort("linker script: expected '%c'", tok);
+    {
+      int ret = tcc_error_noabort("linker script: expected '%c'", tok);
+      ld_next_token(p);
+      return ret;
+    }
     else
-      return tcc_error_noabort("linker script: unexpected token");
+    {
+      int ret = tcc_error_noabort("linker script: unexpected token");
+      ld_next_token(p);
+      return ret;
+    }
   }
   ld_next_token(p);
   return 0;
@@ -536,38 +594,52 @@ static addr_t ld_parse_expr(LDParser *p)
 static int ld_parse_memory_attributes(LDParser *p)
 {
   int attrs = 0;
+  int invert = 0;
   if (p->tok != '(')
     return 0;
   ld_next_token(p);
-  while (p->tok == LDTOK_NAME && p->tok != ')')
+  while (p->tok != ')' && p->tok != LDTOK_EOF)
   {
-    for (const char *s = p->tok_buf; *s; s++)
+    if (p->tok == '!')
     {
-      switch (*s)
+      invert = 1;
+      ld_next_token(p);
+      continue;
+    }
+
+    if (p->tok == LDTOK_NAME)
+    {
+      for (const char *s = p->tok_buf; *s; s++)
       {
-      case 'r':
-      case 'R':
-        attrs |= LD_MEM_READ;
-        break;
-      case 'w':
-      case 'W':
-        attrs |= LD_MEM_WRITE;
-        break;
-      case 'x':
-      case 'X':
-        attrs |= LD_MEM_EXEC;
-        break;
-      case 'a':
-      case 'A':
-        attrs |= LD_MEM_ALLOC;
-        break;
-      case '!':
-        break; /* invert - not fully supported */
+        switch (*s)
+        {
+        case 'r':
+        case 'R':
+          attrs |= LD_MEM_READ;
+          break;
+        case 'w':
+        case 'W':
+          attrs |= LD_MEM_WRITE;
+          break;
+        case 'x':
+        case 'X':
+          attrs |= LD_MEM_EXEC;
+          break;
+        case 'a':
+        case 'A':
+          attrs |= LD_MEM_ALLOC;
+          break;
+        case '!':
+          invert = 1;
+          break;
+        }
       }
     }
     ld_next_token(p);
   }
   ld_expect(p, ')');
+  if (invert)
+    attrs = (LD_MEM_READ | LD_MEM_WRITE | LD_MEM_EXEC | LD_MEM_ALLOC) & ~attrs;
   return attrs;
 }
 

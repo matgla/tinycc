@@ -50,6 +50,29 @@ surface it** rather than editing product source. In almost every case the
 existing patterns below (include-the-`.c`, a new stub, a new isolated binary)
 already solve it without touching product code.
 
+### Rule 3 — Use timeouts and run only unit tests
+
+When running unit tests, **always use a timeout of less than 15 seconds** and **run only the unit test target** — never `make cross` or `make test`:
+
+```bash
+timeout 15 ./build_ssaopt/run_unit_tests_ssaopt   # ✅ correct
+timeout 15 make -C tests/unit/arm/armv8m run      # ✅ correct (builds and runs in one step)
+make cross                                        # ❌ never during test writing
+timeout 300 make test                             # ❌ never during test writing
+```
+
+**Why this matters.** The full compiler build (`make cross`) takes minutes and can
+interfere with other tasks running in parallel. The full test suite (`make test`)
+includes QEMU-based cross-tests that take even longer and can hang on buggy code.
+Unit tests should complete in under 10 seconds — if they don't, something is wrong
+(an infinite loop, a hang, a memory corruption) and the timeout protects you from
+waiting indefinitely.
+
+**What to do if a test hangs.** If `timeout 15` kills your test binary, investigate
+the root cause: check for infinite loops in the pass under test, missing
+initialization, or memory corruption. Do **not** increase the timeout to "fix" the
+hang — that just hides the problem.
+
 ### Rule 2 — Report every suspected bug in `docs/bugs.md`
 
 If a test reveals that production code is wrong (a miscompile, an out-of-range
@@ -462,6 +485,18 @@ tree with uncommitted product changes, a clean rebuild is what makes the run
 trustworthy (see `docs/plan_optimizer_test_coverage.md`, "rebuild before
 triaging").
 
+**Run with a timeout.** Always wrap test runs with `timeout 15` (or less) to catch
+hangs and infinite loops:
+
+```bash
+timeout 15 make -C tests/unit/arm/armv8m run
+# or for a specific binary:
+timeout 15 ./build_ssaopt/run_unit_tests_ssaopt
+```
+
+Unit tests should complete in under 10 seconds. If a timeout kills the binary,
+investigate the hang — don't increase the timeout.
+
 ---
 
 ## 11. Gotchas (learned the hard way)
@@ -494,8 +529,11 @@ triaging").
       `tests/unit/` (Rule 1).
 - [ ] Every suspected bug is pinned as a characterization test **and** written up
       in `docs/bugs.md` (Rule 2).
+- [ ] Tests run with `timeout 15` (or less) and complete in under 10 seconds (Rule 3).
+- [ ] Only the unit test target was run — never `make cross` or `make test` during
+      test writing (Rule 3).
 - [ ] Tests are deterministic, self-contained, and free all allocations.
-- [ ] `make -C tests/unit/arm/armv8m clean && ... run` passes with `0 failed`
+- [ ] `make -C tests/unit/arm/armv8m clean && timeout 15 ... run` passes with `0 failed`
       (and the relevant opt-in `run-*` target if you added to one).
 - [ ] ASan run is clean (it's on by default).
 ```

@@ -850,6 +850,9 @@ TEST_FILES = [
     ("bug_sl_fwd_wrong_addr.c", 0),
     ("bug_switch_in_loop.c", 0),
     ("bug_union_field_read.c", 0),
+
+    # C11 _Pragma operator: pack layout via literal + DO_PRAGMA macro idiom.
+    ("343_pragma_operator.c", 5),
 ]
 
 # Per-test compiler defines (e.g. for missing platform macros)

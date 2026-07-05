@@ -1605,6 +1605,11 @@ static int sccp_apply(SCCPState *s)
         }
       }
 
+      int32_t src_vr = irop_get_vreg(src);
+      int src_is_direct_var = (src.tag == IROP_TAG_VREG && !src.is_lval &&
+                               src_vr >= 0 &&
+                               TCCIR_DECODE_VREG_TYPE(src_vr) == TCCIR_VREG_TYPE_VAR);
+
       /* Case B: direct StackLoc-lvalue (not a VAR). */
       if (!got && src.tag == IROP_TAG_STACKOFF && src.is_lval &&
           src.is_local && !src.is_llocal) {
@@ -1616,12 +1621,22 @@ static int sccp_apply(SCCPState *s)
                                             &dep_pos);
           if (st == SCCP_CONST)
             got = 1;
-        } else if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR) {
-          /* Case C: VAR operand.  Walk back in the same block looking
-           * for the most recent def of this VAR, requiring it to be a
-           * direct ASSIGN or STORE-to-VAR with an immediate src.  Bail
-           * on any potentially-aliasing intervening write. */
-          int var_pos = TCCIR_DECODE_VREG_POSITION(svr);
+        }
+      }
+
+      /* Case C: VAR operand.  It can appear either as a stack-backed lvalue
+       * operand from production IR or as a direct VAR vreg in hand-built unit
+       * fixtures.  Walk back in the same block looking for the most recent def
+       * of this VAR, requiring it to be a direct ASSIGN or STORE-to-VAR with an
+       * immediate src.  Bail on any potentially-aliasing intervening write. */
+      if (!got) {
+        int32_t svr = src_vr;
+        int src_is_stack_var = (src.tag == IROP_TAG_STACKOFF && src.is_lval &&
+                                src.is_local && !src.is_llocal &&
+                                svr >= 0 &&
+                                TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR);
+        if (src_is_direct_var || src_is_stack_var) {
+          int var_pos = TCCIR_DECODE_VREG_POSITION(src_vr);
           for (int k = i - 1; k >= bb->start_idx; k--) {
             IRQuadCompact *kq = &ir->compact_instructions[k];
             if (kq->op == TCCIR_OP_NOP) continue;

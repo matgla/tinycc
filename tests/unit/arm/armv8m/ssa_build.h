@@ -69,6 +69,21 @@ static inline ssa_ctx ssa_ctx_new(int blocks, int temps)
   c.ir->iroperand_pool_capacity = UTB_MAX_OPERANDS;
   c.ir->next_temporary_variable = temps;
   c.ir->max_orig_index = UTB_MAX_INSTR - 1;
+
+  /* Initialize the scalar pools so passes can emit I64/F64/SYMREF/CTYPE
+   * constants.  utb_new() leaves these zeroed; SCCP folding a 64-bit value
+   * into the I64 pool would otherwise see capacity 0 and abort.  Keep the
+   * hand-built iroperand_pool at UTB_MAX_OPERANDS rather than using the
+   * smaller IRPOOL_INIT_SIZE from tcc_ir_pools_init(). */
+  c.ir->pool_i64_capacity = 64;
+  c.ir->pool_i64 = (int64_t *)tcc_mallocz(sizeof(int64_t) * c.ir->pool_i64_capacity);
+  c.ir->pool_f64_capacity = 64;
+  c.ir->pool_f64 = (uint64_t *)tcc_mallocz(sizeof(uint64_t) * c.ir->pool_f64_capacity);
+  c.ir->pool_symref_capacity = 64;
+  c.ir->pool_symref = (IRPoolSymref *)tcc_mallocz(sizeof(IRPoolSymref) * c.ir->pool_symref_capacity);
+  c.ir->pool_ctype_capacity = 64;
+  c.ir->pool_ctype = (CType *)tcc_mallocz(sizeof(CType) * c.ir->pool_ctype_capacity);
+
   c.num_temps = temps;
   c.num_blocks = blocks;
   return c;

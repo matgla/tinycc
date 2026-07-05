@@ -2065,14 +2065,32 @@ static void tcc_debug_stabs(TCCState *s1, const char *str, int type, unsigned lo
 
 static int dwarf_loc_reg_op_len(int regno)
 {
-  if (regno >= 0 && regno <= 31)
+  /* Negative register numbers are invalid in DWARF.  Treat them as
+     contributing no bytes so the length stays consistent with what
+     dwarf_emit_reg_op() actually emits for the same input (nothing). */
+  if (regno < 0)
+  {
+#ifdef TCC_DWARF_STRICT
+    tcc_error_noabort("invalid DWARF register %d", regno);
+#endif
+    return 0;
+  }
+  if (regno <= 31)
     return 1;
   return 1 + dwarf_uleb128_size((unsigned long long)regno);
 }
 
 static void dwarf_emit_reg_op(Section *sec, int regno)
 {
-  if (regno >= 0 && regno <= 31)
+  /* Emit nothing for an invalid (negative) register; see the length helper. */
+  if (regno < 0)
+  {
+#ifdef TCC_DWARF_STRICT
+    tcc_error_noabort("invalid DWARF register %d", regno);
+#endif
+    return;
+  }
+  if (regno <= 31)
   {
     dwarf_data1(sec, DW_OP_reg0 + regno);
     return;

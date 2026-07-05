@@ -1,2 +1,1 @@
-error:
-assignment makes integer from pointer
+/home/mateusz/repos/tinycc/tests/frontend/diagnostics/03_incompatible_types.c:2: error: assignment makes integer from pointer without a cast

@@ -651,7 +651,7 @@ UT_TEST(test_tcc_debug_save_restore_state)
 
 UT_TEST(test_dwarf_loc_reg_op_len_edge_cases)
 {
-  UT_ASSERT_EQ(dwarf_loc_reg_op_len(-1), 11);
+  UT_ASSERT_EQ(dwarf_loc_reg_op_len(-1), 0); /* invalid regno: no bytes */
   UT_ASSERT_EQ(dwarf_loc_reg_op_len(0), 1);
   UT_ASSERT_EQ(dwarf_loc_reg_op_len(31), 1);
   UT_ASSERT_EQ(dwarf_loc_reg_op_len(32), 2);
@@ -660,15 +660,14 @@ UT_TEST(test_dwarf_loc_reg_op_len_edge_cases)
   return 0;
 }
 
-UT_TEST(test_dwarf_emit_reg_op_negative_reg_encodes_as_regx)
+UT_TEST(test_dwarf_emit_reg_op_negative_reg_emits_nothing)
 {
   Section sec;
   unsigned char data[32];
 
   test_section_reset(&sec, data, sizeof(data));
   dwarf_emit_reg_op(&sec, -1);
-  UT_ASSERT_EQ(sec.data[0], DW_OP_regx);
-  UT_ASSERT_EQ(sec.data_offset, 11); /* DW_OP_regx + 10-byte uleb128 */
+  UT_ASSERT_EQ(sec.data_offset, 0); /* invalid regno: emit nothing */
 
   return 0;
 }
@@ -3063,7 +3062,7 @@ UT_SUITE(tccdbg)
   UT_RUN(test_tcc_debug_stabn_builds_scope_tree);
   UT_RUN(test_tcc_debug_save_restore_state);
   UT_RUN(test_dwarf_loc_reg_op_len_edge_cases);
-  UT_RUN(test_dwarf_emit_reg_op_negative_reg_encodes_as_regx);
+  UT_RUN(test_dwarf_emit_reg_op_negative_reg_emits_nothing);
   UT_RUN(test_dwarf_file_tracks_paths);
   UT_RUN(test_dwarf_file_dwarf5_index_offset);
   UT_RUN(test_dwarf_strp_appends_string_with_relocation_skipped);

@@ -1735,6 +1735,150 @@ UT_TEST(test_preprocess_pragma_push_pop_macro)
   return 0;
 }
 
+/* ============================================================================
+ * C11 6.10.9 _Pragma operator (handled in next(), delegating to pragma_parse)
+ * ============================================================================ */
+
+/* The lexer must intern `_Pragma' to the dedicated TOK__Pragma id so next()
+   can treat it as a preprocessor operator rather than a plain identifier. */
+UT_TEST(test_pragma_operator_token_recognized)
+{
+  UT_ASSERT_EQ(tok_alloc("_Pragma", 7)->tok, TOK__Pragma);
+  UT_ASSERT_STREQ(get_tok_str(TOK__Pragma, NULL), "_Pragma");
+  return 0;
+}
+
+/* A literal `_Pragma("pack(N)")' must be consumed by next() and take effect
+   exactly like `#pragma pack(N)', leaving the following token (`x') intact. */
+UT_TEST(test_pragma_operator_applies_pack_literal)
+{
+  int saved_output = tcc_state->output_type;
+  int xtok = tok_alloc("x", 1)->tok;
+
+  tcc_state->output_type = TCC_OUTPUT_OBJ; /* real compile, not -E */
+  tcc_state->pack_stack_ptr = tcc_state->pack_stack;
+  *tcc_state->pack_stack_ptr = 0;
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("_Pragma(\"pack(2)\") x") == 0);
+  parse_flags |= PARSE_FLAG_PREPROCESS;
+  next();
+  UT_ASSERT_EQ(*tcc_state->pack_stack_ptr, 2); /* pack applied */
+  UT_ASSERT_EQ(tok, xtok);                     /* operator disappeared */
+
+  parse_flags = 0;
+  tcc_state->pack_stack_ptr = tcc_state->pack_stack;
+  *tcc_state->pack_stack_ptr = 0;
+  tcc_state->output_type = saved_output;
+  file = NULL;
+  return 0;
+}
+
+/* The whole point of the operator: `_Pragma' produced by macro expansion (the
+   DO_PRAGMA idiom).  Recognition lives in next(), *after* substitution, so a
+   macro whose body is `_Pragma ( "pack(2)" )' must still apply the pack. */
+UT_TEST(test_pragma_operator_applies_pack_from_macro)
+{
+  Sym *boundary = define_stack;
+  int saved_output = tcc_state->output_type;
+  int mtok = tok_alloc("DOPACK", 6)->tok;
+  int ytok = tok_alloc("y", 1)->tok;
+  TokenString body;
+  CValue cv;
+
+  /* macro body:  _Pragma ( "pack(2)" ) */
+  tok_str_new(&body);
+  tok_str_add(&body, TOK__Pragma);
+  tok_str_add(&body, '(');
+  cv.str.data = "pack(2)";
+  cv.str.size = 8; /* 7 chars + NUL */
+  tok_str_add2(&body, TOK_STR, &cv);
+  tok_str_add(&body, ')');
+  tok_str_add(&body, 0);
+  define_push(mtok, MACRO_OBJ, tok_str_ensure_heap(&body), NULL);
+
+  tcc_state->output_type = TCC_OUTPUT_OBJ;
+  tcc_state->pack_stack_ptr = tcc_state->pack_stack;
+  *tcc_state->pack_stack_ptr = 0;
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("DOPACK y") == 0);
+  parse_flags |= PARSE_FLAG_PREPROCESS;
+  next();
+  UT_ASSERT_EQ(*tcc_state->pack_stack_ptr, 2); /* pack applied */
+  UT_ASSERT_EQ(tok, ytok);                     /* token after the macro */
+
+  parse_flags = 0;
+  tcc_state->pack_stack_ptr = tcc_state->pack_stack;
+  *tcc_state->pack_stack_ptr = 0;
+  tcc_state->output_type = saved_output;
+  free_defines(boundary);
+  file = NULL;
+  return 0;
+}
+
+/* Under -E the operator is rewritten to a `#pragma ...' line, and the
+   destringized `\"' turns back into `"'.  Exercises the tcc_preprocess()
+   output path end-to-end. */
+UT_TEST(test_pragma_operator_rewrites_under_dash_E)
+{
+  static const char src[] = "_Pragma(\"message \\\"x\\\"\")\n";
+  FILE *fp = tmpfile();
+  BufferedFile *bf;
+  int saved_output = tcc_state->output_type;
+  int len = (int)sizeof(src) - 1;
+  char buf[256];
+  size_t n;
+
+  UT_ASSERT(fp != NULL);
+  tcc_state->ppfp = fp;
+  tcc_state->Pflag = LINE_MACRO_OUTPUT_FORMAT_NONE;
+  tcc_state->output_type = TCC_OUTPUT_PREPROCESS;
+
+  tcc_open_bf(tcc_state, "test.c", len);
+  memcpy(file->buffer, src, len);
+
+  UT_ASSERT_EQ(tcc_preprocess(tcc_state), 0);
+
+  rewind(fp);
+  n = fread(buf, 1, sizeof(buf) - 1, fp);
+  buf[n] = '\0';
+  UT_ASSERT(strstr(buf, "#pragma message \"x\"") != NULL);
+
+  fclose(fp);
+  tcc_state->ppfp = NULL;
+  tcc_state->output_type = saved_output;
+  bf = file;
+  file = NULL;
+  tcc_free(bf);
+  return 0;
+}
+
+/* A non-string operand must raise a hard error rather than be mis-parsed. */
+UT_TEST(test_pragma_operator_rejects_non_string_operand)
+{
+  int saved_output = tcc_state->output_type;
+  int result;
+
+  tcc_state->output_type = TCC_OUTPUT_OBJ;
+  ut_reset_pp_state();
+  UT_ASSERT(ut_open_input("_Pragma(123)") == 0);
+  parse_flags |= PARSE_FLAG_PREPROCESS;
+  tcc_state->error_set_jmp_enabled = 1;
+  if (setjmp(tcc_state->error_jmp_buf) == 0)
+  {
+    next();
+    result = -1; /* expected a longjmp out of next() */
+  }
+  else
+  {
+    result = 0; /* error correctly raised */
+  }
+  tcc_state->error_set_jmp_enabled = 0;
+  parse_flags = 0;
+  tcc_state->output_type = saved_output;
+  file = NULL;
+  return result;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(tccpp)
@@ -1850,6 +1994,13 @@ UT_SUITE(tccpp)
   UT_RUN(test_preprocess_pragma_once);
   UT_RUN(test_preprocess_unknown_pragma);
   UT_RUN(test_preprocess_pragma_push_pop_macro);
+
+  /* C11 _Pragma operator */
+  UT_RUN(test_pragma_operator_token_recognized);
+  UT_RUN(test_pragma_operator_applies_pack_literal);
+  UT_RUN(test_pragma_operator_applies_pack_from_macro);
+  UT_RUN(test_pragma_operator_rewrites_under_dash_E);
+  UT_RUN(test_pragma_operator_rejects_non_string_operand);
 
   /* #pragma pack replay */
   UT_RUN(test_pp_apply_pack_replay_set_push_pop);

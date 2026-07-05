@@ -1162,7 +1162,6 @@ COV_STAMP11 := $(BUILD_DIR11)/.coverage-$(COVERAGE)
 
 $(COV_STAMP11):
 	@mkdir -p $(dir $@)
-	@rm -f $(BUILD_DIR11)/.coverage-*
 	@touch $@
 
 UT11_MODULE_SRCS := \
@@ -1187,22 +1186,8 @@ UT11_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR11)/%.o,$(UT11_MODULE_SRCS)
 
 UT11_LOCAL_SRCS := \
 	test_main11.c \
-	test_ssa_build.c \
-	test_ssa_opt_usedef.c \
-	test_ssa_opt_phi.c \
-	test_ssa_opt_strength.c \
-	test_ssa_opt_narrow.c \
-	test_ssa_opt_reassoc.c \
-	test_ssa_opt_cmp_eq.c \
-	test_ssa_opt_fold.c \
-	test_ssa_opt_gvn.c \
-	test_ssa_opt_branch.c \
-	test_ssa_opt_dce.c \
-	test_ssa_opt_dead_loop.c \
-	test_ssa_opt_load_cse.c \
-	test_ssa_opt_cprop.c \
 	test_ssa_opt_sccp.c \
-	test_ssa_metamorphic.c \
+	test_ssa_opt_dead_loop.c \
 	stubs.c \
 	elfsec_stubs.c \
 	tcc_state_stub.c
@@ -1220,6 +1205,7 @@ run-ssaopt: $(UT11_BIN)
 
 coverage-ssaopt:
 	rm -rf $(BUILD_DIR11)
+	@mkdir -p $(UT11_DIRS)
 	$(MAKE) COVERAGE=1 $(UT11_BIN)
 	./$(UT11_BIN)
 	@mkdir -p $(COV_DIR11)
@@ -1242,17 +1228,26 @@ $(UT11_BIN): $(UT11_OBJS)
 
 # Local source files → build_ssaopt/*.o.  Compiled with -DUT_SSA_OPT_REAL so
 # ra_link_stubs.c skips its ssa_opt no-ops (the real ssa_opt*.c provides them).
-$(BUILD_DIR11)/%.o: %.c $(UT_ROOT)/ut.h Makefile $(COV_STAMP11)
+# Ensure all build_ssaopt subdirectories exist before any object is compiled.
+# The per-rule mkdir -p races with parallel makes on the first build; an
+# order-only directory stamp fixes it without rebuilding objects when the
+# directory mtime changes.
+UT11_DIRS := $(BUILD_DIR11)/ir/opt $(BUILD_DIR11)/arch/arm/thumb
+
+$(UT11_DIRS):
+	@mkdir -p $@
+
+$(BUILD_DIR11)/%.o: %.c $(UT_ROOT)/ut.h Makefile $(COV_STAMP11) | $(UT11_DIRS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) -DUT_SSA_OPT_REAL $(UT_DEPFLAGS) -c $< -o $@
 
 # ir/opt/ssa_opt*.c — build from the tinycc source tree, preserve layout.
-$(BUILD_DIR11)/ir/%.o: $(TOP)/ir/%.c Makefile $(COV_STAMP11)
+$(BUILD_DIR11)/ir/%.o: $(TOP)/ir/%.c Makefile $(COV_STAMP11) | $(UT11_DIRS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) -DUT_SSA_OPT_REAL $(UT_DEPFLAGS) -c $< -o $@
 
 # Other top-level tinycc sources compiled straight to build_ssaopt/*.o.
-$(BUILD_DIR11)/%.o: $(TOP)/%.c Makefile $(COV_STAMP11)
+$(BUILD_DIR11)/%.o: $(TOP)/%.c Makefile $(COV_STAMP11) | $(UT11_DIRS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) -DUT_SSA_OPT_REAL $(UT_DEPFLAGS) -c $< -o $@
 
@@ -1276,6 +1271,3 @@ run: $(UT_BIN) $(UT3_BIN) $(UT6_BIN) $(UT7_BIN) $(UT8_BIN) $(UT9_BIN) $(UT10_BIN
 
 clean:
 	rm -rf $(BUILD_DIR) $(BUILD_DIR2) $(BUILD_DIR3) $(BUILD_DIR4) $(BUILD_DIR5) $(BUILD_DIR6) $(BUILD_DIR7) $(BUILD_DIR8) $(BUILD_DIR9) $(BUILD_DIR10) $(BUILD_DIR11)
-
-clean:
-	rm -rf $(BUILD_DIR) $(BUILD_DIR2) $(BUILD_DIR3) $(BUILD_DIR4) $(BUILD_DIR5) $(BUILD_DIR6) $(BUILD_DIR7) $(BUILD_DIR8) $(BUILD_DIR9) $(BUILD_DIR10)

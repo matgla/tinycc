@@ -198,10 +198,6 @@ void dynarray_add(void *ptab, int *nb_ptr, void *elem)
   *nb_ptr = nb;
 }
 
-/* No-op file/debug helpers.  Real paths are not exercised by the focused
-   lexer/preprocessor smoke tests; they are present only to satisfy the
-   linker for functions transitively referenced by tccpp.c. */
-void tcc_close(void) {}
 void tcc_debug_bincl(TCCState *s1) { (void)s1; }
 void tcc_debug_eincl(TCCState *s1) { (void)s1; }
 void tcc_debug_newfile(TCCState *s1) { (void)s1; }
@@ -214,6 +210,11 @@ int tcc_open(TCCState *s1, const char *filename)
   return -1;
 }
 
+/* Faithful push/pop of the BufferedFile stack, mirroring the real libtcc.c
+   (which is not linked here).  Real semantics matter: helpers such as the
+   _Pragma operator push a synthetic ":pragma:" buffer, parse it, then pop
+   back to the original input, so tcc_open_bf must chain `prev' and tcc_close
+   must restore it (fd is always -1 for these in-memory buffers). */
 void tcc_open_bf(TCCState *s1, const char *filename, int initlen)
 {
   BufferedFile *bf = tcc_mallocz(sizeof(BufferedFile) + initlen);
@@ -226,7 +227,22 @@ void tcc_open_bf(TCCState *s1, const char *filename, int initlen)
   bf->line_num = 1;
   bf->line_ref = 1;
   bf->ifdef_stack_ptr = s1->ifdef_stack_ptr;
+  bf->prev = file;
+  bf->prev_tok_flags = tok_flags;
   file = bf;
+  tok_flags = TOK_FLAG_BOL | TOK_FLAG_BOF;
+}
+
+void tcc_close(void)
+{
+  BufferedFile *bf = file;
+  if (bf == NULL)
+    return;
+  if (bf->true_filename != bf->filename)
+    tcc_free(bf->true_filename);
+  file = bf->prev;
+  tok_flags = bf->prev_tok_flags;
+  tcc_free(bf);
 }
 
 /* Expression evaluation is only reached by #if/#elif.  The real evaluator

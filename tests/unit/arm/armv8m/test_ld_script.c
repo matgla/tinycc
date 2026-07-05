@@ -34,33 +34,16 @@
  *    - ld_script_dump() smoke test (just confirms it doesn't crash).
  *
  *  GENUINE DEFECTS FOUND (see docs/bugs.md write-ups drafted in the task
- *  report -- NOT fixed here per task instructions; each is pinned below as
- *  a regression test documenting the CURRENT, buggy behavior):
+ *  report; fixed bugs are kept below as regression tests):
  *
- *    BUG A (test_bug_location_counter_dot_is_treated_as_phantom_symbol):
- *      ld_next_token()'s identifier scanner lists '.' as a valid
- *      identifier-*start* character (`isalpha(c) || c=='_' || c=='.' ...`),
- *      so a bare "." in the source is ALWAYS lexed as an LDTOK_NAME token
- *      with tok_buf == ".", never as the raw punctuation value '.' (46).
- *      Every `if (p->tok == '.')` check in tccld.c (ld_parse_primary's
- *      location-counter read, ld_parse_sections' and
- *      ld_parse_output_section_contents' location-counter *assignment*
- *      handling) is therefore unreachable dead code. In practice ". = expr;"
- *      falls through to the generic "symbol assignment" path and silently
- *      creates/updates a symbol literally named "." instead of updating
- *      LDScript.location_counter -- which never advances from its initial
- *      value via script content at all. This breaks the location-counter
- *      feature that's central to real linker scripts (address assignment,
- *      "_end = .;"-style epilogue symbols, ALIGN-relative-to-"." idioms).
+ *    (FIXED) test_bug_location_counter_dot_is_treated_as_phantom_symbol:
+ *      A bare "." is now lexed as punctuation, so ". = expr;" updates
+ *      LDScript.location_counter and "foo = .;" reads that counter instead
+ *      of fabricating a symbol literally named ".".
  *
- *    BUG A-mul (test_bug_expr_multiplication_operator_never_applies): the
- *      exact same root cause (the identifier-start character class in
- *      ld_next_token() is too permissive) also swallows a standalone '*'
- *      operator into an LDTOK_NAME token instead of the raw punctuation
- *      value '*' (42). ld_parse_mul()'s `while (p->tok == '*' ...)` check
- *      can therefore never fire: "X * Y" always silently evaluates to just
- *      X, and the unconsumed "*" (and whatever follows it) gets picked up
- *      one level out and misparsed as a new top-level SECTIONS item.
+ *    (FIXED) test_bug_expr_multiplication_operator_never_applies:
+ *      A standalone '*' is now lexed as punctuation, so ld_parse_mul()
+ *      handles multiplication while linker-script file globs still parse.
  *
 
  *    (FIXED) test_sections_output_section_dotted_with_patterns_and_keep:
@@ -69,22 +52,10 @@
  *      "*(...)"/"KEEP(...)" group now contributes exactly the section
  *      name(s) parsed from inside its parens.
  *
- *    BUG C (test_bug_memory_invert_attribute_causes_phantom_regions):
- *      ld_expect() does not advance the token position when it reports a
- *      mismatch, and essentially every caller in tccld.c discards its
- *      return value. So once a MEMORY {} region's attribute string uses the
- *      (explicitly scaffolded-for, per the '!' case comment in
- *      ld_parse_memory_attributes) "!rwx"-style invert prefix -- which
- *      cannot lex as part of an identifier token at all, since '!' is
- *      absent from both the identifier-start and identifier-continuation
- *      character sets -- the parser gets stuck re-reporting the same
- *      mismatch and falls into the generic "unrecognized token, skip one
- *      and keep looping" fallback in ld_parse_memory's outer loop, which
- *      then misinterprets the leftover stray tokens ("rx", "ORIGIN",
- *      "LENGTH", ...) as brand-new memory-region names. The net result is
- *      silent data corruption (phantom regions with all-zero fields) with
- *      an overall ld_script_parse_string() return code of 0 (success) --
- *      not a crash, and not a reported error either.
+ *    (FIXED) test_bug_memory_invert_attribute_causes_phantom_regions:
+ *      '!' now lexes as punctuation and ld_parse_memory_attributes consumes
+ *      it as an invert prefix, so "!rx" produces one region with the
+ *      complementary attribute mask instead of phantom MEMORY entries.
  *
  *    (FIXED) test_sections_standard_region_at_phdr_order:
  *      ld_parse_sections()'s per-output-section suffix clauses ('>' memory
@@ -292,7 +263,7 @@ UT_TEST(test_memory_too_many_regions_reports_error)
   return 0;
 }
 
-/* BUG C regression pin -- see file header. */
+/* BUG C regression -- see file header. */
 UT_TEST(test_bug_memory_invert_attribute_causes_phantom_regions)
 {
   TCCState s1;
@@ -303,18 +274,12 @@ UT_TEST(test_bug_memory_invert_attribute_causes_phantom_regions)
   int ret = ld_script_parse_string(&s1, &ld,
       "MEMORY { FLASH (!rx) : ORIGIN = 0x0, LENGTH = 1K }\n");
 
-  /* Currently reports success (0) despite the attribute string never having
-   * been parsed correctly and the MEMORY table being corrupted below. A
-   * correct implementation should either support '!' or report an error;
-   * it should not silently fabricate three extra bogus regions. */
   UT_ASSERT_EQ(ret, 0);
-  UT_ASSERT_EQ(ld.nb_memory_regions, 4);
+  UT_ASSERT_EQ(ld.nb_memory_regions, 1);
   UT_ASSERT_STREQ(ld.memory_regions[0].name, "FLASH");
-  UT_ASSERT_EQ(ld.memory_regions[0].attributes, 0);
+  UT_ASSERT_EQ(ld.memory_regions[0].attributes, LD_MEM_WRITE | LD_MEM_ALLOC);
   UT_ASSERT_EQ(ld.memory_regions[0].origin, 0u);
-  UT_ASSERT_STREQ(ld.memory_regions[1].name, "rx");
-  UT_ASSERT_STREQ(ld.memory_regions[2].name, "ORIGIN");
-  UT_ASSERT_STREQ(ld.memory_regions[3].name, "LENGTH");
+  UT_ASSERT_EQ(ld.memory_regions[0].length, 1024u);
 
   ld_script_cleanup(&ld);
   return 0;
@@ -437,8 +402,7 @@ UT_TEST(test_expr_add_sub_precedence)
   ld_script_init(&ld);
 
   /* '+'/'-' are same-precedence, left-associative in ld_parse_add(); parens
-   * override that grouping. (Multiplication is deliberately NOT exercised
-   * here -- see BUG A-mul / test_bug_expr_multiplication_operator_never_applies.) */
+   * override that grouping. */
   int ret = ld_script_parse_string(&s1, &ld,
       "SECTIONS { a = 10 - 2 - 3; b = 10 - (2 - 3); }\n");
 
@@ -469,22 +433,7 @@ UT_TEST(test_expr_shift_and_bitwise_precedence)
   return 0;
 }
 
-/* BUG A-mul regression pin (same root cause as BUG A -- see file header,
- * which documents this alongside the '.' phantom-symbol case): '*' is
- * listed in ld_next_token()'s identifier-start character class, so a
- * standalone '*' operator (surrounded by whitespace, as in ordinary
- * arithmetic) is ALWAYS lexed as an LDTOK_NAME token with tok_buf=="*",
- * never as the raw punctuation value '*' (42). ld_parse_mul()'s
- * `while (p->tok == '*' || ...)` therefore never fires for a standalone
- * '*': multiplication silently never applies, `ld_parse_mul()` returns
- * just its left operand, and the cursor is left sitting on the
- * unconsumed "*" token. That leftover token then gets picked up one
- * level further out as if it started a brand-new top-level SECTIONS
- * item: ld_parse_sections' bare-LDTOK_NAME branch treats it as a
- * (bogus) output-section name "*", and the number that followed the
- * '*' in the original expression ("3" in "2 * 3") gets consumed as
- * that bogus section's address. All of this happens silently, with
- * ld_script_parse_string() still reporting success (0). */
+/* BUG A-mul regression -- see file header. */
 UT_TEST(test_bug_expr_multiplication_operator_never_applies)
 {
   TCCState s1;
@@ -495,13 +444,8 @@ UT_TEST(test_bug_expr_multiplication_operator_never_applies)
   int ret = ld_script_parse_string(&s1, &ld, "SECTIONS { a = 2 * 3; }\n");
 
   UT_ASSERT_EQ(ret, 0);
-  UT_ASSERT_EQ(ut_ld_sym_value(&ld, "a"), 2); /* not 2*3 == 6 */
-  /* Side effect: the leftover "*" token got misparsed as a bogus output
-   * section, and "3" as its address. */
-  UT_ASSERT_EQ(ld.nb_output_sections, 1);
-  UT_ASSERT_STREQ(ld.output_sections[0].name, "*");
-  UT_ASSERT_EQ(ld.output_sections[0].has_address, 1);
-  UT_ASSERT_EQ(ld.output_sections[0].address, 3u);
+  UT_ASSERT_EQ(ut_ld_sym_value(&ld, "a"), 6);
+  UT_ASSERT_EQ(ld.nb_output_sections, 0);
 
   ld_script_cleanup(&ld);
   return 0;
@@ -571,8 +515,8 @@ UT_TEST(test_expr_align_builtin_uses_location_counter)
   LDScript ld;
   memset(&s1, 0, sizeof(s1));
   ld_script_init(&ld);
-  /* Poke location_counter directly (public LDScript field) since the
-   * script-level ". = expr;" assignment doesn't reach it -- see BUG A. */
+  /* Poke location_counter directly (public LDScript field) so this test is
+   * scoped to ALIGN() itself rather than script-level counter assignment. */
   ld.location_counter = 0x1001;
 
   int ret = ld_script_parse_string(&s1, &ld, "SECTIONS { a = ALIGN(4); }\n");
@@ -698,11 +642,7 @@ UT_TEST(test_sections_output_section_bare_name_form)
   ld_script_init(&ld);
 
   /* Output-section names without a leading '.' take a separate code path
-   * (ld_parse_sections' bare-LDTOK_NAME branch) from the "dotted" one, but
-   * -- see BUG A's header comment -- a leading-dot name like ".text" is
-   * ALSO lexed as a single LDTOK_NAME token (the identifier scanner treats
-   * '.' as a valid identifier-start character), so in practice *both*
-   * forms are handled by this same bare-name branch. */
+   * from the dotted-name form. */
   int ret = ld_script_parse_string(&s1, &ld, "SECTIONS { my_data : { *(.data) } }\n");
 
   UT_ASSERT_EQ(ret, 0);
@@ -756,9 +696,8 @@ UT_TEST(test_sections_symbol_assignment_via_expression)
   return 0;
 }
 
-/* BUG A regression pin -- see file header. Exercises both the top-level
- * SECTIONS {} form and the nested-inside-an-output-section-body form; both
- * take the same "generic symbol assignment" fallback path. */
+/* BUG A regression -- see file header. Exercises both the top-level
+ * SECTIONS {} form and the nested-inside-an-output-section-body form. */
 UT_TEST(test_bug_location_counter_dot_is_treated_as_phantom_symbol)
 {
   TCCState s1;
@@ -766,29 +705,23 @@ UT_TEST(test_bug_location_counter_dot_is_treated_as_phantom_symbol)
   memset(&s1, 0, sizeof(s1));
   ld_script_init(&ld);
 
-  int ret = ld_script_parse_string(&s1, &ld, "SECTIONS { . = 0x1000; foo = .; }\n");
+  int ret = ld_script_parse_string(&s1, &ld,
+      "SECTIONS { . = 0x1003; . = ALIGN(4); _end = .; }\n");
 
   UT_ASSERT_EQ(ret, 0);
-  /* The real location counter never moves... */
-  UT_ASSERT_EQ(ld.location_counter, 0);
-  /* ...because ". = 0x1000;" instead created/updated a symbol literally
-   * named ".", and "foo = .;" read that phantom symbol's value back. */
-  int dot_idx = ld_script_find_or_create_symbol(&ld, ".");
-  UT_ASSERT(dot_idx >= 0);
-  UT_ASSERT_EQ(ld.symbols[dot_idx].value, 0x1000u);
-  UT_ASSERT_EQ(ld.symbols[dot_idx].defined, 1);
-  UT_ASSERT_EQ(ut_ld_sym_value(&ld, "foo"), 0x1000u);
+  UT_ASSERT_EQ(ld.location_counter, 0x1004u);
+  UT_ASSERT_EQ(ut_ld_sym_value(&ld, "_end"), 0x1004u);
 
   ld_script_cleanup(&ld);
 
-  /* Same phantom-symbol mechanism inside a nested output-section body. */
   memset(&s1, 0, sizeof(s1));
   ld_script_init(&ld);
   ret = ld_script_parse_string(&s1, &ld, "SECTIONS { .data : { . = 0x2000; bar = .; } }\n");
 
   UT_ASSERT_EQ(ret, 0);
-  UT_ASSERT_EQ(ld.location_counter, 0);
+  UT_ASSERT_EQ(ld.location_counter, 0x2000u);
   UT_ASSERT_EQ(ut_ld_sym_value(&ld, "bar"), 0x2000u);
+  UT_ASSERT_EQ(ld.output_sections[0].current_offset, 0x2000u);
 
   ld_script_cleanup(&ld);
   return 0;

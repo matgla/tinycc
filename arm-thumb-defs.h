@@ -294,6 +294,12 @@ extern const cond_name_entry_t cond_names[];
  */
 ST_FUNC int thumb_parse_token_suffix(int token, int *base_token);
 
-#define COND_NAMES_COUNT 16
+/* 17 entries: eq..al are searched; the {NULL,14} terminator at index 17 is
+   intentionally left out of the loops (they use i < COND_NAMES_COUNT). Making
+   "al" (index 16) searchable is only safe because thumb_parse_token_suffix()
+   first bails out for tokens that are themselves predefined mnemonics
+   (thumb_token_is_known_mnemonic), so real bases ending in "al" like
+   smlal/umlal are never mis-split into sml/uml. */
+#define COND_NAMES_COUNT 17
 
 #endif /* ARM_THUMB_DEFS_H */

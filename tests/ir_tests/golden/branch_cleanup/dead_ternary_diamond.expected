@@ -1,7 +1,7 @@
 0000: CMP P0,P1
 0001: JMP to 5  if ">=S"
 0002: PARAM0[call_0] P0
-0003: CALL GlobalSym(1187) --> T0
+0003: CALL GlobalSym(1188) --> T0
 0004: JMP to 7
 0005: T1 <-- #0 [ASSIGN]
 0006: JMP to 8
