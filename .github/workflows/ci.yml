@@ -38,7 +38,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
+          # depth 1 is enough: the build only stamps a version string with
+          # git rev-parse/log -1/diff (Makefile:338-341), no history walk.
+          fetch-depth: 1
 
       - name: Build cross compiler
         run: ./configure --enable-cross --enable-O2 --debug && make cross -j$(nproc)
@@ -137,7 +139,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
+          # depth 1 is enough: record.py only runs `git show -s HEAD`
+          # (record.py:90) on the normal --rev HEAD path; the first-parent
+          # history walk is --backfill only, which CI never invokes.
+          fetch-depth: 1
 
       - name: Mark workspace as a safe git directory
         # actions/checkout runs on the runner host and configures safe.directory
@@ -187,7 +192,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
+          # depth 1 is enough: this job only downloads the prebuilt tcc and
+          # runs record.py's `git show -s HEAD` -- no history walk.
+          fetch-depth: 1
 
       - name: Download tcc build
         uses: actions/download-artifact@v4

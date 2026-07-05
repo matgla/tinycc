@@ -298,10 +298,15 @@ def record_perf(conn, run_id, perf_host, perf_identity, scratch: Path) -> None:
     if not perf_host:
         return
     json_out = scratch / "perf.json"
-    cmd = [sys.executable, str(REPO_ROOT / "tests" / "benchmarks" / "run_benchmark.py"),
+    # -u so the child's progress (Building.../cmake/make/flash/serial) streams to
+    # the CI log in real time.  Without it the child's stdout is a pipe, CPython
+    # block-buffers its print()s, and the whole perf phase looks hung for minutes.
+    cmd = [sys.executable, "-u",
+           str(REPO_ROOT / "tests" / "benchmarks" / "run_benchmark.py"),
            perf_host, "--opt-level", "all", "--save-data", str(json_out)]
     if perf_identity:
         cmd += ["--identity", perf_identity]
+    info(f"perf: launching RP2350 benchmark on {perf_host} (6 builds; may take several minutes) ...")
     rc = subprocess.run(cmd, cwd=str(REPO_ROOT)).returncode
     if rc != 0 or not json_out.exists():
         warn("perf skipped: RP2350 benchmark did not produce data")
