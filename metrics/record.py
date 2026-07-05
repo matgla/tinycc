@@ -383,6 +383,37 @@ def do_backfill(conn, host, branch, args) -> None:
             shutil.rmtree(build_dir, ignore_errors=True)
 
 
+# --------------------------------------------------------------------- retention
+
+def prune_old_runs(conn, branch, host, keep) -> None:
+    """Retention: keep only the newest `keep` runs for (branch, host), ranked by
+    commit_ts, and delete the rest.  Child rows (correctness/codesize_*/perf/...)
+    are removed by ON DELETE CASCADE, so one DELETE per run cleans everything.
+
+    The DB file itself does not shrink -- SQLite reuses the freed pages for
+    future inserts, so with a fixed `keep` the file size plateaus at roughly the
+    high-water mark rather than growing unbounded (which is the whole point of
+    turning on --codesize-detail, the one large per-run table).  No VACUUM in the
+    hot path: it would rewrite the whole file on every CI run for no net win.
+    """
+    if keep < 1:
+        die(f"--keep must be >= 1 (got {keep}); refusing to delete every run")
+    victims = conn.execute(
+        """SELECT run_id FROM runs WHERE branch=? AND host=?
+           ORDER BY commit_ts DESC, run_ts DESC
+           LIMIT -1 OFFSET ?""",
+        (branch, host, keep)).fetchall()
+    if not victims:
+        info(f"retention: nothing to prune (<= {keep} runs for "
+             f"branch={branch} host={host})")
+        return
+    conn.executemany("DELETE FROM runs WHERE run_id=?",
+                     [(v[0],) for v in victims])
+    conn.commit()
+    info(f"retention: pruned {len(victims)} run(s) beyond newest {keep} "
+         f"for branch={branch} host={host}")
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -408,6 +439,11 @@ def main(argv=None) -> int:
                    help="skip local codesize/compile-time measurement; copy those rows "
                         "from another metrics.db recorded for the same commit (e.g. a "
                         "cloud-runner scratch db)")
+    p.add_argument("--keep", type=int, metavar="N",
+                   help="retention: after recording, keep only the newest N runs for "
+                        "this --branch/--host (by commit_ts) and delete older ones "
+                        "(child rows cascade). Bounds metrics.db growth from "
+                        "--codesize-detail.")
     args = p.parse_args(argv)
 
     conn = connect(args.db)
@@ -418,6 +454,8 @@ def main(argv=None) -> int:
             meta = git_meta(args.rev)
             record_one(conn, meta, args.host, args.branch, args.trigger, args,
                        do_correctness=not args.no_correctness)
+        if args.keep is not None:
+            prune_old_runs(conn, args.branch, args.host, args.keep)
     finally:
         conn.close()
     return 0
