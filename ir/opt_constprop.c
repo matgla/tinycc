@@ -6471,7 +6471,15 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
      * relation no longer holds and folding to `def_src1 + combined` would read a
      * stale value.  (ptr fuzz seed 85636: `u4 = u3 + C; *p = ...; x = u4 + C2`
      * with p == &u4 — the store redefines u4.)  Bail when a memory-clobbering op
-     * sits in the gap and either base is an aliasable address-taken VAR. */
+     * sits in the gap and either base is an aliasable address-taken VAR.
+     *
+     * The same hazard applies when def_src1 is a *direct stack-slot load*
+     * (is_lval && is_local with no backing vreg, inner_vr < 0): the guard at the
+     * top only rejected non-local derefs, and the address-taken-VAR check below
+     * never fires for a raw StackLoc (it has no vreg).  Yet an aliasing pointer
+     * store in the gap — e.g. `u4 = arr[7] + C; *p = ...; x = u4 + C2` with
+     * p == &arr[7] — overwrites the slot, so forwarding `arr[7] + combined` reads
+     * the post-store value (ptr fuzz seed 409667).  Reject that too. */
     {
       int gap_clobbers_memory = 0;
       for (int j = def_idx + 1; j < i && !gap_clobbers_memory; j++)
@@ -6493,7 +6501,8 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
       }
       if (gap_clobbers_memory &&
           (ir_reassoc_var_addr_taken(ir, src1_vr) ||
-           (inner_vr >= 0 && ir_reassoc_var_addr_taken(ir, inner_vr))))
+           (inner_vr >= 0 && ir_reassoc_var_addr_taken(ir, inner_vr)) ||
+           (inner_vr < 0 && def_src1.is_lval)))
         continue;
     }
 

@@ -427,20 +427,20 @@ static int emit_unrollable_loop(TCCIRState *ir, int init, int limit, int step, I
   return 6;
 }
 
-/* Count STOREs into stackoff(100) whose src1 is an immediate; fill vals[].
- * Returns the count.  Used to verify per-iteration IV substitution. */
-static int collect_store_iv_values(TCCIRState *ir, int *vals, int max)
+/* Count ADDs "V1 = V1 + #imm" whose src2 is an immediate; fill vals[].
+ * Returns the count.  Used to verify per-iteration IV substitution in a
+ * register-only unrolled body. */
+static int collect_add_iv_values(TCCIRState *ir, int *vals, int max)
 {
   int n = 0;
   for (int i = 0; i < ir->next_instruction_index && n < max; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_STORE)
+    if (q->op != TCCIR_OP_ADD)
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_tag(d) != IROP_TAG_STACKOFF || (int)irop_get_imm64_ex(ir, d) != 100)
+    if (utb_vreg(tcc_ir_op_get_dest(ir, q)) != VR_VAR(1))
       continue;
-    IROperand s = tcc_ir_op_get_src1(ir, q);
+    IROperand s = tcc_ir_op_get_src2(ir, q);
     if (!irop_is_immediate(s))
       continue;
     vals[n++] = (int)irop_get_imm64_ex(ir, s);
@@ -448,28 +448,34 @@ static int collect_store_iv_values(TCCIRState *ir, int *vals, int max)
   return n;
 }
 
-UT_TEST(test_unroll_three_iters_iv_substituted)
+/* Happy path: a register-only body is still unrolled.  The memory guard added
+ * to collect_body_instructions rejects only memory-carrying bodies, so a purely
+ * arithmetic accumulator loop -- for(V0=0; V0<3; V0++) V1 += V0 -- unrolls into
+ * three copies of "V1 = V1 + #k" with the IV substituted per iteration. */
+UT_TEST(test_unroll_register_body_three_iters)
 {
-  /* for(V0=0; V0<3; V0++) STORE [100] = V0  ->  three stores with #0,#1,#2. */
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
-  emit_unrollable_loop(ir, 0, 3, 1, utb_var(0, I32));
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);     /* 0 i=0 (preheader) */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(3, I32));        /* 1 header/start */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(6, I32), utb_imm(UT_GE, I32), UTB_NONE); /* 2 exit=6 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_var(0, I32)); /* 3 acc += i (body) */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32)); /* 4 i++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);              /* 5 back-edge/end */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);               /* 6 exit target */
   IRLoop L = utb_loop(1, 1, 5, 0);
 
   int ret = try_unroll_loop_ex(ir, &L, NULL, 0);
-
   UT_ASSERT_EQ(ret, 1);
 
-  /* IV init, the IV increment, and the back-edge are NOP'd (not replicated).
-   * The original CMP/JUMPIF/body slots at @1/@2/@3 are reused to write the
-   * unrolled body copies (verified below via collect_store_iv_values). */
+  /* IV init, the IV increment, and the back-edge are NOP'd (not replicated). */
   UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_NOP); /* init  */
   UT_ASSERT_EQ(utb_op(ir, 4), TCCIR_OP_NOP); /* iv inc */
   UT_ASSERT_EQ(utb_op(ir, 5), TCCIR_OP_NOP); /* back-edge */
 
-  /* Three stores with IV values 0, 1, 2 (the per-iteration substitution). */
+  /* Three body copies "V1 = V1 + #k" with IV substituted to 0, 1, 2. */
   int vals[8];
-  int n = collect_store_iv_values(ir, vals, 8);
+  int n = collect_add_iv_values(ir, vals, 8);
   UT_ASSERT_EQ(n, 3);
   UT_ASSERT_EQ(vals[0], 0);
   UT_ASSERT_EQ(vals[1], 1);
@@ -478,9 +484,32 @@ UT_TEST(test_unroll_three_iters_iv_substituted)
   return 0;
 }
 
-UT_TEST(test_unroll_iv_used_after_loop_writes_final_value)
+/* A memory-carrying body (STORE [100]=V0) is no longer unrolled: cloning
+ * stack/aggregate accesses could expose stale initializer values through the
+ * later forwarding passes (bitfield packed-RMW fuzz class, seed 163176), so
+ * collect_body_instructions rejects any memory op and the loop is left intact. */
+UT_TEST(test_unroll_store_body_blocks_unroll)
 {
-  /* A reader of V0 after the loop forces a final-value ASSIGN V0=#3. */
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  emit_unrollable_loop(ir, 0, 3, 1, utb_var(0, I32));
+  IRLoop L = utb_loop(1, 1, 5, 0);
+
+  UT_ASSERT_EQ(try_unroll_loop_ex(ir, &L, NULL, 0), 0);
+
+  /* Loop control and the store body are untouched (no clones written). */
+  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_ASSIGN); /* IV init */
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, 5), TCCIR_OP_JUMP);   /* back-edge intact */
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_unroll_store_body_used_after_blocks_unroll)
+{
+  /* Even with a post-loop reader of V0, the memory body blocks the unroll --
+   * no clones, and no synthesized final-value ASSIGN V0=#3. */
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
   emit_unrollable_loop(ir, 0, 3, 1, utb_var(0, I32));
@@ -488,10 +517,10 @@ UT_TEST(test_unroll_iv_used_after_loop_writes_final_value)
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE); /* 7 reads V0 */
   IRLoop L = utb_loop(1, 1, 5, 0);
 
-  int ret = try_unroll_loop_ex(ir, &L, NULL, 0);
+  UT_ASSERT_EQ(try_unroll_loop_ex(ir, &L, NULL, 0), 0);
 
-  UT_ASSERT_EQ(ret, 1);
-  /* Find the ASSIGN V0 = #3 (iv_final = 0 + 3*1). */
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
   int found_final = 0;
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
@@ -503,23 +532,22 @@ UT_TEST(test_unroll_iv_used_after_loop_writes_final_value)
         (int)irop_get_imm64_ex(ir, utb_src1(ir, i)) == 3)
       found_final = 1;
   }
-  UT_ASSERT(found_final);
+  UT_ASSERT(!found_final);
   utb_free(ir);
   return 0;
 }
 
-UT_TEST(test_unroll_single_iteration)
+UT_TEST(test_unroll_store_body_single_iter_blocks_unroll)
 {
-  /* trip_count = 1: body copied exactly once with init value. */
+  /* trip_count = 1 is irrelevant once the body carries memory -- still blocked. */
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
   emit_unrollable_loop(ir, 7, 8, 1, utb_var(0, I32)); /* init=7, limit=8 -> 1 trip */
   IRLoop L = utb_loop(1, 1, 5, 0);
 
-  UT_ASSERT_EQ(try_unroll_loop_ex(ir, &L, NULL, 0), 1);
-  int vals[8];
-  UT_ASSERT_EQ(collect_store_iv_values(ir, vals, 8), 1);
-  UT_ASSERT_EQ(vals[0], 7);
+  UT_ASSERT_EQ(try_unroll_loop_ex(ir, &L, NULL, 0), 0);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
   utb_free(ir);
   return 0;
 }
@@ -1801,9 +1829,10 @@ UT_SUITE(opt_loop_utils)
   UT_RUN(test_find_exit_cmp_not_on_iv_not_found);
   UT_RUN(test_find_exit_no_jumpif_after_cmp_not_found);
   UT_RUN(test_loop_iv_and_exit_yield_trip_count);
-  UT_RUN(test_unroll_three_iters_iv_substituted);
-  UT_RUN(test_unroll_iv_used_after_loop_writes_final_value);
-  UT_RUN(test_unroll_single_iteration);
+  UT_RUN(test_unroll_register_body_three_iters);
+  UT_RUN(test_unroll_store_body_blocks_unroll);
+  UT_RUN(test_unroll_store_body_used_after_blocks_unroll);
+  UT_RUN(test_unroll_store_body_single_iter_blocks_unroll);
   UT_RUN(test_unroll_trip_over_max_skips);
   UT_RUN(test_unroll_trip_zero_skips);
   UT_RUN(test_unroll_no_unroll_flag_skips);

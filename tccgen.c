@@ -305,7 +305,7 @@ static int svalue_get_conservative_max_u64(SValue *sv, unsigned long long *out_m
   {
     unsigned long long value = (unsigned long long)sv->c.i;
 
-    if (!(sv->type.t & VT_UNSIGNED) && (sv->type.t & VT_BTYPE) != VT_PTR && sv->c.i < 0)
+    if (!(sv->type.t & VT_UNSIGNED) && (sv->type.t & VT_BTYPE) != VT_PTR && (int64_t)sv->c.i < 0)
       return 0;
     *out_max = value;
     return 1;
@@ -5032,16 +5032,30 @@ static void gen_opif(int op)
       if (!is_cmp)
         goto general_case;
     }
+    /* Fold VT_DOUBLE operands in double precision (and VT_FLOAT in float),
+       not through the shared 80-bit long double f1/f2.  Rounding the
+       long-double result down to double at the store below would round a
+       SECOND time (double-rounding), so `d / d` folded here could differ by
+       1 ULP from both gcc and tcc's own (correct) runtime softfloat routine.
+       Computing in the operand's native precision and widening back is exact,
+       so the later `v1->c.d = f1` is an identity round-trip.  (fuzz float
+       206597/268558) */
     switch (op)
     {
     case '+':
-      f1 += f2;
+      if (bt == VT_DOUBLE)      { double d = (double)f1 + (double)f2; f1 = d; }
+      else if (bt == VT_FLOAT)  { float s = (float)f1 + (float)f2; f1 = s; }
+      else f1 += f2;
       break;
     case '-':
-      f1 -= f2;
+      if (bt == VT_DOUBLE)      { double d = (double)f1 - (double)f2; f1 = d; }
+      else if (bt == VT_FLOAT)  { float s = (float)f1 - (float)f2; f1 = s; }
+      else f1 -= f2;
       break;
     case '*':
-      f1 *= f2;
+      if (bt == VT_DOUBLE)      { double d = (double)f1 * (double)f2; f1 = d; }
+      else if (bt == VT_FLOAT)  { float s = (float)f1 * (float)f2; f1 = s; }
+      else f1 *= f2;
       break;
     case '/':
       if (f2 == 0.0)
@@ -5066,7 +5080,9 @@ static void gen_opif(int op)
         f1 = y.f;
         break;
       }
-      f1 /= f2;
+      if (bt == VT_DOUBLE)      { double d = (double)f1 / (double)f2; f1 = d; }
+      else if (bt == VT_FLOAT)  { float s = (float)f1 / (float)f2; f1 = s; }
+      else f1 /= f2;
       break;
     case TOK_NEG:
       f1 = -f1;
@@ -12592,8 +12608,10 @@ ST_FUNC CString *parse_mult_str(const char *msg)
 }
 
 /* If I is >= 1 and a power of two, returns log2(i)+1.
-   If I is 0 returns 0.  */
-ST_FUNC int exact_log2p1(int i)
+   If I is 0 returns 0.  The parameter is unsigned so that a value whose
+   highest set bit is the sign bit (e.g. 0x80000000) is shifted and
+   compared without the signed loop condition terminating early. */
+ST_FUNC int exact_log2p1(unsigned int i)
 {
   int ret;
   if (!i)
@@ -29208,6 +29226,7 @@ static void gen_function(Sym *sym)
   ir = tcc_ir_alloc();
   tcc_state->ir = ir;
   ir->naked = sym->a.naked;
+  ir->is_variadic = func_var;
 
   /* Check if we're compiling a nested function with captured variables */
   if (tcc_state->current_nested_func && tcc_state->current_nested_func->nb_captured > 0)
@@ -32129,12 +32148,25 @@ static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t siz
   if (start + size > sec->data_offset)
     return;
 
-  /* Shift the section's tail data down. */
+  /* Thumb literal pools embedded in the trailing functions are addressed by
+   * PC-relative LDR (literal), which aligns PC down to 4 bytes.  The tail must
+   * therefore keep its 4-byte alignment: shifting it by a non-multiple-of-4
+   * amount would move each such pool 2 bytes off from where its LDR reads,
+   * loading the wrong word (fuzz-exposed HardFault in gcc.c-torture 20180921-1
+   * at -O1: a re-emitted function's odd-halfword size shifted `at()` and
+   * misaligned its `&al` pool entry).  Function code is halfword-granular, so
+   * `size` is even but may be 2 (mod 4); reclaim only a multiple-of-4 span and
+   * leave up to 2 dead filler bytes so the tail's alignment is preserved. */
+  addr_t shift = size & ~(addr_t)3;
+  if (shift == 0)
+    return;
+
+  /* Shift the section's tail data down (by `shift`, not `size`). */
   size_t tail_offset = (size_t)(start + size);
   size_t tail_len = sec->data_offset - tail_offset;
   if (tail_len > 0)
-    memmove(sec->data + start, sec->data + tail_offset, tail_len);
-  sec->data_offset -= size;
+    memmove(sec->data + (tail_offset - shift), sec->data + tail_offset, tail_len);
+  sec->data_offset -= shift;
 
   /* Adjust symbols that point into this section. */
   Section *symtab = s->symtab; /* union alias of symtab_section */
@@ -32151,7 +32183,7 @@ static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t siz
       addr_t sv = syms[i].st_value & ~(addr_t)1;
       if (sv >= start + size)
       {
-        syms[i].st_value -= size;
+        syms[i].st_value -= shift;
       }
       else if (sv >= start)
       {
@@ -32182,7 +32214,7 @@ static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t siz
       if (off >= start + size)
       {
         rels[dst] = rels[i];
-        rels[dst].r_offset = off - size;
+        rels[dst].r_offset = off - shift;
         dst++;
       }
       else if (off < start)

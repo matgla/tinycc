@@ -13,6 +13,7 @@
 
 #include "ir_build.h"
 
+#include "opt_engine.h"
 #include "ut.h"
 
 /* Pass entry points (defined in ir/opt_dce.c; forward-declared here to avoid
@@ -24,8 +25,20 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir);
 int tcc_ir_opt_zero_vla_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir);
 int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir);
+int tcc_ir_opt_dead_loop_elim(TCCIRState *ir);
+
+/* IROptCtx wrapper entry points. */
+int tcc_ir_opt_dse_ex(IROptCtx *ctx);
+int tcc_ir_opt_dead_var_store_elim_ex(IROptCtx *ctx);
+int tcc_ir_opt_dead_addrvar_elim_ex(IROptCtx *ctx);
+int tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(IROptCtx *ctx);
+int tcc_ir_opt_zero_vla_elim_ex(IROptCtx *ctx);
+int tcc_ir_opt_dead_before_infinite_loop_ex(IROptCtx *ctx);
+int tcc_ir_opt_infinite_loop_simplify_ex(IROptCtx *ctx);
+int tcc_ir_opt_dead_loop_elim_ex(IROptCtx *ctx);
 
 #define I32 IROP_BTYPE_INT32
+#define TOK_NE 0x95
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -479,6 +492,199 @@ UT_TEST(test_infinite_loop_simplify_indexed_store_blocks_collapse)
   return 0;
 }
 
+/* ================================================================== dead_loop_elim */
+
+/* POSITIVE: a side-effect-free loop whose body only assigns a constant to a VAR
+ * and increments a TEMP counter is dead.  The loop body is NOPed and the
+ * constant assignment is hoisted to the header/preheader.
+ *   0: V1 <- #5            [header; kept/hoisted]
+ *   1: T0 <- T0 + #1
+ *   2: CMP T0, #10
+ *   3: JUMPIF NE -> 0
+ *   4: RETURNVOID */
+UT_TEST(test_dead_loop_elim_const_assign_loop_removed)
+{
+  TCCIRState *ir = utb_loop_new();
+
+  int header = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(5, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_temp(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_imm(10, I32));
+  int back = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(0, I32), utb_imm(TOK_NE, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_dead_loop_elim(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, header), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_vreg(utb_dest(ir, header)), TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 1));
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, header)), 5);
+  UT_ASSERT_EQ(utb_op(ir, back), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* ================================================================== IROptCtx wrappers */
+
+/* Helper: zero an IROptCtx and point it at `ir`. */
+static IROptCtx utb_ctx(TCCIRState *ir)
+{
+  IROptCtx ctx = {0};
+  ctx.ir = ir;
+  return ctx;
+}
+
+UT_TEST(test_dse_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  int dead = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
+  int live = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_imm(5, I32), utb_imm(6, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_dse_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, live), TCCIR_OP_ADD);
+
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_dead_var_store_elim_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 2);
+  int dead = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(5, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(9, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_var(1, I32), UTB_NONE);
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_dead_var_store_elim_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
+
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_dead_addrvar_elim_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  int lea = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  int store = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(42, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_var(1, I32), UTB_NONE);
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_dead_addrvar_elim_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 2);
+  UT_ASSERT_EQ(utb_op(ir, lea), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_NOP);
+
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_dead_trailing_addrvar_store_elim_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  int kept = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE);
+  int dead = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(2, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, kept), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
+
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_zero_vla_elim_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  int alloc = utb_emit(ir, TCCIR_OP_VLA_ALLOC, UTB_NONE, utb_imm(0, I32), utb_imm(8, I32));
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_zero_vla_elim_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, alloc), TCCIR_OP_NOP);
+
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_dead_before_infinite_loop_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  tcc_state->optimize = 2;
+
+  int dead = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
+  emit_jump(ir, 1);
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_dead_before_infinite_loop_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
+
+  tcc_state->optimize = 0;
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_infinite_loop_simplify_ex_forwards)
+{
+  TCCIRState *ir = utb_loop_new();
+  tcc_state->optimize = 2;
+  utb_pools_init(ir);
+
+  Sym sym_x;
+  memset(&sym_x, 0, sizeof(sym_x));
+  IROperand gx = utb_symref(ir, &sym_x, /*is_lval*/ 1, /*is_local*/ 0, /*is_const*/ 0, I32);
+
+  int header = utb_emit(ir, TCCIR_OP_STORE, gx, utb_imm(5, I32), UTB_NONE);
+  int back_edge = emit_jump(ir, 0);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_infinite_loop_simplify_ex(&ctx);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, header), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_dest(ir, header)), 0);
+  UT_ASSERT_EQ(utb_op(ir, back_edge), TCCIR_OP_NOP);
+
+  tcc_state->optimize = 0;
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_dead_loop_elim_ex_empty)
+{
+  TCCIRState *ir = utb_new();
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_dead_loop_elim_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 0);
+
+  utb_free(ir);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(opt_dead_store)
@@ -490,6 +696,7 @@ UT_SUITE(opt_dead_store)
   UT_COVERS("zero_vla");
   UT_COVERS("dead_pre_inf");
   UT_COVERS("inf_loop_simpl");
+  UT_COVERS("dead_loop_elim");
 
   UT_RUN(test_dse_dead_temp_removed);
   UT_RUN(test_dse_used_temp_kept);
@@ -514,4 +721,15 @@ UT_SUITE(opt_dead_store)
 
   UT_RUN(test_infinite_loop_simplify_dead_global_store_collapses_to_selfjump);
   UT_RUN(test_infinite_loop_simplify_indexed_store_blocks_collapse);
+
+  UT_RUN(test_dead_loop_elim_const_assign_loop_removed);
+
+  UT_RUN(test_dse_ex_forwards);
+  UT_RUN(test_dead_var_store_elim_ex_forwards);
+  UT_RUN(test_dead_addrvar_elim_ex_forwards);
+  UT_RUN(test_dead_trailing_addrvar_store_elim_ex_forwards);
+  UT_RUN(test_zero_vla_elim_ex_forwards);
+  UT_RUN(test_dead_before_infinite_loop_ex_forwards);
+  UT_RUN(test_infinite_loop_simplify_ex_forwards);
+  UT_RUN(test_dead_loop_elim_ex_empty);
 }

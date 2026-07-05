@@ -389,7 +389,11 @@ static int emit_unrollable_loop_top(TCCIRState *ir, int init, int limit, int ste
   return 6;
 }
 
-UT_TEST(test_loop_unroll_top_level_three_iters)
+/* A store-body counting loop is no longer folded by the top-level driver: both
+ * try_eliminate_loop and try_unroll_loop_ex now defer memory-carrying loops to
+ * the normal IR pipeline (the memory guards that fix the packed-RMW / indexed-
+ * store fuzz classes).  The loop must be reported unchanged and left intact. */
+UT_TEST(test_loop_unroll_top_level_store_body_blocks_fold)
 {
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
@@ -399,28 +403,24 @@ UT_TEST(test_loop_unroll_top_level_three_iters)
   UT_ASSERT_EQ(exit_t, 6);
 
   int changes = tcc_ir_opt_loop_unroll(ir);
-  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(changes, 0);
 
-  /* Three stores with IV values 0,1,2 replicated into the (now NOP-freed)
-   * slots the way try_unroll_loop_ex is proven to behave in
-   * test_opt_loop_utils.c. */
-  int vals[8], n = 0;
-  for (int i = 0; i < ir->next_instruction_index && n < 8; i++)
+  /* Loop control and the store body are untouched; no immediate-valued clones
+   * were written into the slot. */
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
+  int store_imms = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++)
   {
     if (utb_op(ir, i) != TCCIR_OP_STORE)
       continue;
     IROperand d = utb_dest(ir, i);
     if (irop_get_tag(d) != IROP_TAG_STACKOFF || (int)irop_get_imm64_ex(ir, d) != 100)
       continue;
-    IROperand s = utb_src1(ir, i);
-    if (!irop_is_immediate(s))
-      continue;
-    vals[n++] = (int)irop_get_imm64_ex(ir, s);
+    if (irop_is_immediate(utb_src1(ir, i)))
+      store_imms++;
   }
-  UT_ASSERT_EQ(n, 3);
-  UT_ASSERT_EQ(vals[0], 0);
-  UT_ASSERT_EQ(vals[1], 1);
-  UT_ASSERT_EQ(vals[2], 2);
+  UT_ASSERT_EQ(store_imms, 0);
   utb_free(ir);
   return 0;
 }
@@ -875,7 +875,7 @@ UT_SUITE(opt_loop)
   UT_RUN(test_loop_bound_remat_no_calls_in_loop_no_change);
   UT_RUN(test_loop_bound_remat_hoisted_end_ptr_with_call_rematerializes);
   UT_RUN(test_loop_bound_remat_value_load_not_rematerialized);
-  UT_RUN(test_loop_unroll_top_level_three_iters);
+  UT_RUN(test_loop_unroll_top_level_store_body_blocks_fold);
   UT_RUN(test_loop_unroll_top_level_no_loop_returns_zero);
   UT_RUN(test_loop_unroll_top_level_pure_counters_eliminated_not_unrolled);
   UT_RUN(test_loop_rotation_top_level_basic);

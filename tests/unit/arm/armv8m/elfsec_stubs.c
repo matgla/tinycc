@@ -1,4 +1,22 @@
 /*
+ *  elfsec_stubs.c - shared UT stub, dual-build split.
+ *
+ *  This file is linked into several unit-test binaries with different needs:
+ *    - The main (run_unit_tests), backend (UT2) and other binaries do NOT
+ *      link libtcc.c, so they need the full stub layer below (allocators,
+ *      the tcc_state global, ELF/section fakes, etc.).
+ *    - build_ssaopt (UT11) links the REAL libtcc.c + ir/opt/ssa_opt*.c, which
+ *      already own those symbols; it compiles every TU with -DUT_SSA_OPT_REAL
+ *      (see the build_ssaopt rules in the Makefile), so the shared stubs must
+ *      be skipped there to avoid multiple-definition clashes.
+ *
+ *  Same guard idiom as ra_link_stubs.c. Keep the two branches in sync when a
+ *  new shared symbol is genuinely needed by BOTH builds (define it outside
+ *  the guard in that case).
+ */
+#ifndef UT_SSA_OPT_REAL
+/* ===== shared builds (main / backend / tccpp / ... ): full stub layer ===== */
+/*
  *  elfsec_stubs.c - minimal ELF/section stub layer for ir/opt_switch_data.c
  *
  *  See elfsec_stubs.h. section_add()/section_realloc() are verbatim (minus
@@ -131,3 +149,29 @@ void greloc(Section *s, Sym *sym, unsigned long offset, int type)
     c->type = type;
   }
 }
+
+#else /* UT_SSA_OPT_REAL — build_ssaopt (UT11) ===================== */
+/*
+ *  elfsec_stubs.c - stubs for ELF section handling
+ *
+ *  Provides stubs for ELF section functions that are not needed in the
+ *  isolated unit test environment.
+ */
+
+#define USING_GLOBALS
+#include "tcc.h"
+
+/* Stub: tcc ELF section functions. */
+void tcc_elf_add_sec(void *s, const char *name, unsigned long addr,
+                     unsigned long size, unsigned long flags)
+{
+  /* Do nothing. */
+}
+
+void tcc_elf_add_sec_idx(void *s, const char *name, unsigned long addr,
+                         unsigned long size, unsigned long flags,
+                         unsigned long idx)
+{
+  /* Do nothing. */
+}
+#endif /* UT_SSA_OPT_REAL */

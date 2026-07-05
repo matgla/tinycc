@@ -217,6 +217,14 @@ struct DLLReference;
 struct Sym;
 struct CString;
 
+void tcc_bench_log(struct TCCState *s1, const char *operation, const char *name, unsigned elapsed_ms)
+{
+  (void)s1;
+  (void)operation;
+  (void)name;
+  (void)elapsed_ms;
+}
+
 void tcc_debug_new(struct TCCState *s1)
 {
   (void)s1;

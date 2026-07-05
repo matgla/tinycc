@@ -5957,8 +5957,14 @@ static void mach_regonly_binop_mop(MachineCodegenContext *ctx, const MachineOper
   uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
 
   /* Pre-exclude src2's physical register so that loading src1 (which may
-   * need a scratch for deref) does not clobber src2's value. */
-  if (src2->kind == MACH_OP_REG && !src2->needs_deref && thumb_is_hw_reg(src2->u.reg.r0))
+   * need a scratch for deref) does not clobber src2's value.  This must apply
+   * even when src2 is a DEREF operand: its register holds the pointer, and the
+   * step-3 load reads through that same register, so it has to survive src1's
+   * materialization.  Omitting the deref case let src1's scratch land on the
+   * pointer register at high pressure -> `u6 * arr10[3]` dereferenced u6 as a
+   * pointer -> bus fault (fuzz switch 219754). Matches the data-processing
+   * guard in thumb_emit_data_processing_mop32. */
+  if (src2->kind == MACH_OP_REG && thumb_is_hw_reg(src2->u.reg.r0))
     excl |= (1u << (uint32_t)src2->u.reg.r0);
 
   /* 2. Ensure src1 in a register; extend exclusion mask. */
@@ -5988,8 +5994,10 @@ static void mach_mod_mop(MachineCodegenContext *ctx, const MachineOperand *src1,
    * need a scratch when it is an immediate or a deref) does not clobber src2's
    * value before the divide reads it — same guard as mach_regonly_binop_mop.
    * Without it an immediate dividend's scratch load could land on the divisor's
-   * register (random-C O1 wrong-code, seed 151: `K % (lr|1)` divisor clobbered). */
-  if (src2->kind == MACH_OP_REG && !src2->needs_deref && thumb_is_hw_reg(src2->u.reg.r0))
+   * register (random-C O1 wrong-code, seed 151: `K % (lr|1)` divisor clobbered).
+   * Applies to the deref case too (pointer register must survive src1's
+   * materialization, same as mach_regonly_binop_mop / fuzz switch 219754). */
+  if (src2->kind == MACH_OP_REG && thumb_is_hw_reg(src2->u.reg.r0))
     excl |= (1u << (uint32_t)src2->u.reg.r0);
 
   /* 2. Ensure src1 in a register. */

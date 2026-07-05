@@ -39,6 +39,12 @@ tcc.1
 tcc-doc.html
 tcc-doc.info
 
+# gcov/lcov coverage artifacts (make coverage-tccgen)
+coverage-tccgen/
+*.gcda
+*.gcno
+*.info
+
 win32/doc
 win32/examples/libtcc_test.c
 win32/libtcc

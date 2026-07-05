@@ -24,6 +24,7 @@ UT_DECLARE_SUITE(gen_call);
 UT_DECLARE_SUITE(gen_callsite);
 UT_DECLARE_SUITE(gen_prolog);
 UT_DECLARE_SUITE(gen_setjmp);
+UT_DECLARE_SUITE(gen_mach_operand);
 
 int main(void)
 {
@@ -38,5 +39,6 @@ int main(void)
   UT_RUN_SUITE(gen_callsite);
   UT_RUN_SUITE(gen_prolog);
   UT_RUN_SUITE(gen_setjmp);
+  UT_RUN_SUITE(gen_mach_operand);
   UT_REPORT_AND_EXIT();
 }

@@ -132,6 +132,40 @@ static int ir_gen_operand_aliases_accum_low(IROptCtx *ctx, IROperand op, IROpera
   return ir_gen_operand_aliases_accum_low(ctx, tcc_ir_op_get_src1(ir, dq), accum_op, def_idx, depth + 1);
 }
 
+static int ir_gen_operand_derived_from_memory(IROptCtx *ctx, IROperand op, int use_idx, int depth)
+{
+  TCCIRState *ir = ctx->ir;
+  const IROptDU *du = &ctx->du;
+
+  if (depth > 8)
+    return 1;
+  if (ir_xform_operand_reads_memory(op))
+    return 1;
+  if (!irop_has_vreg(op))
+    return 0;
+
+  int def_idx = ir_opt_du_def(du, irop_get_vreg(op), use_idx);
+  if (def_idx < 0)
+    return 0;
+
+  IRQuadCompact *dq = &ir->compact_instructions[def_idx];
+  if (dq->op == TCCIR_OP_LOAD || dq->op == TCCIR_OP_LOAD_INDEXED ||
+      dq->op == TCCIR_OP_LOAD_POSTINC)
+    return 1;
+
+  if (irop_config[dq->op].has_src1 &&
+      ir_gen_operand_derived_from_memory(ctx, tcc_ir_op_get_src1(ir, dq), def_idx, depth + 1))
+    return 1;
+  if (irop_config[dq->op].has_src2 &&
+      ir_gen_operand_derived_from_memory(ctx, tcc_ir_op_get_src2(ir, dq), def_idx, depth + 1))
+    return 1;
+  if (dq->op == TCCIR_OP_MLA &&
+      ir_gen_operand_derived_from_memory(ctx, tcc_ir_op_get_accum(ir, dq), def_idx, depth + 1))
+    return 1;
+
+  return 0;
+}
+
 static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
 {
   TCCIRState *ir = ctx->ir;
@@ -214,6 +248,17 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
     return 0;
 
   if (!ir_xform_same_block(ir, mul_idx, i))
+    return 0;
+
+  /* Fusion moves the ADD's accumulator into the earlier MUL slot and hides the
+   * three-source expression behind one MLA.  Several downstream passes and RA
+   * helpers now understand the explicit accumulator, but memory-derived inputs
+   * still create stale-value paths after copy/const propagation on aggregate
+   * fuzz cases.  Leave those as separate MUL+ADD until the full pipeline can
+   * model the hidden data dependency as precisely as normal src1/src2 uses. */
+  if (ir_gen_operand_derived_from_memory(ctx, ms1, mul_idx, 0) ||
+      ir_gen_operand_derived_from_memory(ctx, ms2, mul_idx, 0) ||
+      ir_gen_operand_derived_from_memory(ctx, accum_op, i, 0))
     return 0;
 
   int32_t accum_vr = irop_get_vreg(accum_op);

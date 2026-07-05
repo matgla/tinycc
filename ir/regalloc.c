@@ -1523,6 +1523,14 @@ static void ra_build_assign_hints(SSAInterval *intervals, int count,
     int32_t dest_vr = irop_get_vreg(d);
     int32_t src_vr = irop_get_vreg(s);
     if (dest_vr < 0 || src_vr < 0) continue;
+    /* A deref ASSIGN (`dest = *src` load, or `*dest = src` store) is NOT a
+     * register copy: dest and src hold different values (the pointer vs the
+     * loaded/stored word), so they must never be hinted onto the same register.
+     * Hinting `T15 = *T2` onto T2's register let T15's def clobber the pointer
+     * T2, which a deferred `PARAM *T2` deref at the following variadic call
+     * still needed -> the arg register held the value, not the address, and the
+     * call read through a garbage pointer (fuzz varargs 293237). */
+    if (d.is_lval || s.is_lval) continue;
     /* Width gate: a `dest = src` ASSIGN whose dest and src differ in width is
      * NOT a pure register copy — it is an extension (i32->i64 zeroes/sign-fills
      * the high word) or a truncation.  Coalescing the two vregs into one
@@ -2175,7 +2183,31 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
     if (cur->coalesce_to >= 0)
       continue;
 
-    /* Expire old intervals */
+    /* Expire old intervals.
+     *
+     * First compute which hard registers the SURVIVING (still-live) intervals
+     * still occupy.  A register may be held by two active intervals at once
+     * when a phi/merge copy coalesced them onto the same register: e.g. an
+     * if/else merge temp for a variable inherits the register from one arm
+     * (via its single hint_vreg) while the other arm's interval is still live
+     * and also holds that register.  If the shorter of the two expires first,
+     * returning its register to the free pool would let a later allocation
+     * (a loop-body temp, say) clobber the value the longer, still-live
+     * interval needs after the loop.  Only free a register when no surviving
+     * interval still holds it. */
+    uint64_t survivor_int = 0, survivor_fp = 0;
+    for (int j = 0; j < active_count; j++) {
+      SSAInterval *a = active[j];
+      if (a->end >= cur->start && a->r0 >= 0 && a->stack_location == 0) {
+        if (a->reg_type == LS_REG_TYPE_FLOAT || a->reg_type == LS_REG_TYPE_DOUBLE) {
+          survivor_fp |= (1ull << a->r0);
+          if (a->r1 >= 0) survivor_fp |= (1ull << a->r1);
+        } else {
+          survivor_int |= (1ull << a->r0);
+          if (a->r1 >= 0) survivor_int |= (1ull << a->r1);
+        }
+      }
+    }
     int w = 0;
     for (int j = 0; j < active_count; j++) {
       SSAInterval *a = active[j];
@@ -2183,14 +2215,15 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
         /* Free register — but not if cur shared hr with another active
          * interval (reg_shared): the partner still logically owns hr,
          * so freeing it here would let a later allocation clobber the
-         * loop body's view of partner. */
+         * loop body's view of partner.  Likewise skip any register a
+         * surviving active interval still holds (coalesced sharing). */
         if (a->r0 >= 0 && a->stack_location == 0 && !a->reg_shared) {
           if (a->reg_type == LS_REG_TYPE_FLOAT || a->reg_type == LS_REG_TYPE_DOUBLE) {
-            fp_free |= (1ull << a->r0);
-            if (a->r1 >= 0) fp_free |= (1ull << a->r1);
+            if (!(survivor_fp & (1ull << a->r0))) fp_free |= (1ull << a->r0);
+            if (a->r1 >= 0 && !(survivor_fp & (1ull << a->r1))) fp_free |= (1ull << a->r1);
           } else {
-            int_free |= (1ull << a->r0);
-            if (a->r1 >= 0) int_free |= (1ull << a->r1);
+            if (!(survivor_int & (1ull << a->r0))) int_free |= (1ull << a->r0);
+            if (a->r1 >= 0 && !(survivor_int & (1ull << a->r1))) int_free |= (1ull << a->r1);
           }
         }
       } else {
@@ -2856,6 +2889,108 @@ static int ra_interval_locations_overlap(IRLiveInterval *a, IRLiveInterval *b)
  * reasoning. */
 static int ra_phi_resolve_pre_ra_mode = 0;
 
+/* Post-allocation dead register-copy elimination.
+ *
+ * Phi resolution (ra_resolve_phis) emits an ASSIGN copy for every phi operand,
+ * including phi destinations that are never read.  Such a copy is dead code —
+ * but because its destination has no uses (an empty live range), the linear
+ * scan freely gives it a register that simultaneously holds a DIFFERENT value
+ * which is live across the merge (the two do not interfere).  The dead copy
+ * then overwrites that register, destroying the live value.
+ *   switch fuzz seed 198468 -O1: at a loop-exit merge the dead exit-phi copy
+ *   `R6(T121) <- T130` clobbered R6, which still held the live u6 read one
+ *   instruction later by `T106 <- R6(T104)`, so u6 read back as 0.
+ *
+ * These copies must NOT be suppressed before allocation: removing them changes
+ * register pressure and perturbs every allocation decision, regressing
+ * unrelated code by shifting the scan onto latent bugs.  They are NOP'd here,
+ * after allocation AND after every liveness / scratch bitmap has been built, so
+ * the allocation is byte-identical to before and only the emitted code changes.
+ *
+ * A copy is removable when its destination is an SSA TEMP — never
+ * address-taken, so every read is an explicit operand — that appears as a read
+ * operand nowhere.  Reads are enumerated exactly as ra_build_intervals counts
+ * uses: src1, src2, the MLA accumulator, and the address of a STORE-class op.
+ * Iterate to a fixed point so a chain of dead copies (each read only by the
+ * next) collapses completely. */
+static void ra_eliminate_dead_reg_copies(TCCIRState *ir)
+{
+  int max_pos = ir->next_local_variable;
+  if (ir->next_temporary_variable > max_pos) max_pos = ir->next_temporary_variable;
+  if (ir->next_parameter > max_pos) max_pos = ir->next_parameter;
+  if (max_pos <= 0)
+    return;
+  size_t map_size = (size_t)4 * max_pos;
+  uint8_t *read_map = tcc_malloc(map_size);
+  int n = ir->next_instruction_index;
+
+  #define RA_DEADCOPY_IDX(vr) \
+      (TCCIR_DECODE_VREG_TYPE(vr) * max_pos + TCCIR_DECODE_VREG_POSITION(vr))
+  #define RA_DEADCOPY_MARK(vr) do { \
+      int32_t _v = (vr); \
+      if (_v >= 0) { \
+        long _i = RA_DEADCOPY_IDX(_v); \
+        if (_i >= 0 && (size_t)_i < map_size) read_map[_i] = 1; \
+      } \
+    } while (0)
+
+  for (;;) {
+    memset(read_map, 0, map_size);
+
+    for (int i = 0; i < n; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (irop_config[q->op].has_src1) {
+        IROperand s = tcc_ir_op_get_src1(ir, q);
+        if (irop_has_vreg(s)) RA_DEADCOPY_MARK(irop_get_vreg(s));
+      }
+      if (irop_config[q->op].has_src2) {
+        IROperand s = tcc_ir_op_get_src2(ir, q);
+        if (irop_has_vreg(s)) RA_DEADCOPY_MARK(irop_get_vreg(s));
+      }
+      if (q->op == TCCIR_OP_MLA) {
+        IROperand s = tcc_ir_op_get_accum(ir, q);
+        if (irop_has_vreg(s)) RA_DEADCOPY_MARK(irop_get_vreg(s));
+      }
+      /* STORE-class ops read their "dest" operand (the memory address). */
+      if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+          q->op == TCCIR_OP_STORE_POSTINC) {
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        if (irop_has_vreg(d)) RA_DEADCOPY_MARK(irop_get_vreg(d));
+      }
+    }
+
+    int changed = 0;
+    for (int i = 0; i < n; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_ASSIGN)
+        continue;
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      if (!irop_has_vreg(d))
+        continue;
+      int32_t dv = irop_get_vreg(d);
+      if (TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
+        continue;
+      long idx = RA_DEADCOPY_IDX(dv);
+      if (idx < 0 || (size_t)idx >= map_size || read_map[idx])
+        continue;   /* destination is read somewhere — live copy, keep */
+      /* Dead copy into a never-read temp: NOP it.  The slot (and any
+       * is_jump_target flag on it) is preserved so branch targets still
+       * resolve to a valid index; codegen skips NOPs. */
+      q->op = TCCIR_OP_NOP;
+      changed = 1;
+    }
+
+    if (!changed)
+      break;
+  }
+
+  #undef RA_DEADCOPY_MARK
+  #undef RA_DEADCOPY_IDX
+  tcc_free(read_map);
+}
+
 static int ra_phi_copy_is_identity(IRLiveInterval *dest_li, IRLiveInterval *src_li)
 {
   if (!dest_li || !src_li)
@@ -2927,7 +3062,10 @@ static int ra_phi_copy_needed(TCCIRState *ir, IRPhiNode *phi, int operand_idx)
   if (!dest_li)
     return 0;
   /* Pre-RA: emit a copy for every operand. Post-RA coalescing will drop
-   * any that turn out to land in the same physical register. */
+   * any that turn out to land in the same physical register.  Copies into a
+   * phi destination that is never read are NOT suppressed here: doing so
+   * pre-RA changes register pressure and perturbs the whole allocation.  They
+   * are stripped after allocation instead — see ra_eliminate_dead_reg_copies. */
   if (ra_phi_resolve_pre_ra_mode) {
     if (!tcc_ir_vreg_is_valid(ir, phi->operands[operand_idx].vreg))
       return 0;
@@ -4662,6 +4800,13 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * intervals the linear scan produced. */
   ra_build_live_regs_bitmap(ir);
   ra_refine_live_regs_accurate(ir);
+
+  /* Strip dead phi copies now that allocation and every liveness/scratch
+   * bitmap are final.  A phi copy into a never-read temp is dead code whose
+   * register the scan may have reused for a value live across the merge; left
+   * in, it clobbers that value (seed 198468).  Running it here — after the
+   * bitmaps — keeps the allocation identical and only drops dead instructions. */
+  ra_eliminate_dead_reg_copies(ir);
 
   /* Cleanup */
   tcc_free(intervals);

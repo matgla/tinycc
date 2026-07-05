@@ -2360,6 +2360,24 @@ int collect_body_instructions(TCCIRState *ir, IRLoop *loop, int iv_vreg, int cmp
       return -1;
     }
 
+    /* Full unroll clones the loop body and then lets later forwarding/constant
+     * passes simplify the straight-line result.  Those later passes are still
+     * not robust for memory-carrying loops: cloned stack/aggregate accesses can
+     * make an indexed store look independent of a later constant-index load and
+     * expose stale initializer values.  Keep unrolling to register-only loops
+     * until memory aliasing through cloned bodies is modeled end-to-end. */
+    if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_STORE ||
+        q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC ||
+        q->op == TCCIR_OP_BLOCK_COPY ||
+        (irop_config[q->op].has_src1 && ir_xform_operand_reads_memory(tcc_ir_op_get_src1(ir, q))) ||
+        (irop_config[q->op].has_src2 && ir_xform_operand_reads_memory(tcc_ir_op_get_src2(ir, q))) ||
+        (q->op == TCCIR_OP_MLA && ir_xform_operand_reads_memory(tcc_ir_op_get_accum(ir, q))))
+    {
+      LOG_LOOP_OPT("collect_body: REJECTED at [%d] memory access op=%d", i, q->op);
+      return -1;
+    }
+
     /* Reject ops that store a 4th operand at pool[base+3]. write_instr_at_nop
      * only copies dest/src1/src2 (3 slots), so an unrolled copy of these ops
      * loses the 4th slot (scale, accumulator, condition, post-inc offset) and
@@ -2941,6 +2959,40 @@ int try_eliminate_loop(TCCIRState *ir, IRLoop *loop)
             }
           }
         }
+      }
+    }
+  }
+
+  /* When fall-through after the NOP'd loop does not physically reach
+   * exit_target, restore the exit edge with an explicit JUMP.  The loop's own
+   * exit JUMPIF was NOP'd above; if the loop was the then-arm of an if (its
+   * exit jumped forward, past the else block) simply removing it drops control
+   * into that following code — an empty `if(c){while(..){}}else{...}` executed
+   * the else arm unconditionally (switch fuzz O1 wrong-code, seed 198468).
+   * Mirrors need_exit_jump in try_unroll_loop_ex / try_rotate_loop. */
+  int need_exit_jump = 0;
+  {
+    int n2 = ir->next_instruction_index;
+    int ft = loop->end_idx + 1;
+    while (ft < n2 && ir->compact_instructions[ft].op == TCCIR_OP_NOP)
+      ft++;
+    int et = exit_target;
+    while (et < n2 && ir->compact_instructions[et].op == TCCIR_OP_NOP)
+      et++;
+    if (ft != et)
+      need_exit_jump = 1;
+  }
+  if (need_exit_jump)
+  {
+    for (int i = write_pos; i <= loop->end_idx; i++)
+    {
+      if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
+      {
+        IROperand exit_dest = irop_make_imm32(-1, exit_target, IROP_BTYPE_INT32);
+        write_instr_at_nop(ir, i, TCCIR_OP_JUMP, exit_dest, (IROperand){0}, (IROperand){0});
+        if (exit_target >= 0 && exit_target < ir->next_instruction_index)
+          ir->compact_instructions[exit_target].is_jump_target = 1;
+        break;
       }
     }
   }

@@ -76,6 +76,7 @@ UT_DECLARE_SUITE(opt_float_branch);
 UT_DECLARE_SUITE(opt_redundant_assign);
 UT_DECLARE_SUITE(opt_nonneg_fold);
 UT_DECLARE_SUITE(opt_return_reuse);
+UT_DECLARE_SUITE(opt_uninit);
 UT_DECLARE_SUITE(opt_dead_vla);
 UT_DECLARE_SUITE(opt_xform);
 UT_DECLARE_SUITE(opt_switch_collapse);
@@ -196,6 +197,7 @@ int main(void)
   UT_RUN_SUITE(opt_redundant_assign);
   UT_RUN_SUITE(opt_nonneg_fold);
   UT_RUN_SUITE(opt_return_reuse);
+  UT_RUN_SUITE(opt_uninit);
   UT_RUN_SUITE(opt_dead_vla);
   UT_RUN_SUITE(opt_xform);
   UT_RUN_SUITE(opt_switch_collapse);
@@ -214,6 +216,11 @@ int main(void)
   UT_RUN_SUITE(tcc_driver);
   UT_RUN_SUITE(tccasm);
   UT_RUN_SUITE(tccdbg);
+#ifdef UT_COVERAGE_EARLY_EXIT
+  extern void __gcov_dump(void);
+  __gcov_dump();
+  return 0;
+#endif
   UT_RUN_SUITE(tccdebug);
   UT_RUN_SUITE(thop_adr);
   UT_RUN_SUITE(thop_alu_reg);

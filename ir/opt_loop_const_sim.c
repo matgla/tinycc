@@ -2251,6 +2251,47 @@ int tcc_ir_opt_loop_const_sim(TCCIRState *ir)
     if (ext_entry)
       continue;
 
+    /* LCS is only sound for register-only arithmetic.  The implementation has
+     * partial stack-memory modeling, but recent fuzz cases show stale aggregate
+     * values still escaping through indexed stores and packed RMW chains after
+     * simulation.  Keep memory-carrying loops for the normal IR pipeline. */
+    int has_memory = 0;
+    for (int bi = 0; bi < loop->num_body_instrs && !has_memory; bi++)
+    {
+      int idx = loop->body_instrs[bi];
+      if (idx < loop->start_idx || idx > loop->end_idx)
+        continue;
+      IRQuadCompact *mq = &ir->compact_instructions[idx];
+      if (mq->op == TCCIR_OP_LOAD || mq->op == TCCIR_OP_STORE ||
+          mq->op == TCCIR_OP_LOAD_INDEXED || mq->op == TCCIR_OP_STORE_INDEXED ||
+          mq->op == TCCIR_OP_LOAD_POSTINC || mq->op == TCCIR_OP_STORE_POSTINC ||
+          mq->op == TCCIR_OP_BLOCK_COPY)
+      {
+        has_memory = 1;
+        break;
+      }
+      if (irop_config[mq->op].has_src1)
+      {
+        IROperand s1 = tcc_ir_op_get_src1(ir, mq);
+        if (s1.is_lval)
+          has_memory = 1;
+      }
+      if (!has_memory && irop_config[mq->op].has_src2)
+      {
+        IROperand s2 = tcc_ir_op_get_src2(ir, mq);
+        if (s2.is_lval)
+          has_memory = 1;
+      }
+      if (!has_memory && mq->op == TCCIR_OP_MLA)
+      {
+        IROperand acc = tcc_ir_op_get_accum(ir, mq);
+        if (acc.is_lval)
+          has_memory = 1;
+      }
+    }
+    if (has_memory)
+      continue;
+
     changes += lcs_try_fold(ir, loop);
   }
 

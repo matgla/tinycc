@@ -10,6 +10,8 @@
  * higher-level helpers are exercised.  The real definitions live in modules
  * (tccelf.c, tccpp.c, tccgen.c) that are not linked into the main unit-test
  * binary, so provide minimal stand-ins here for the functions under test. */
+void utb_set_tok_str(int tok, const char *name);
+
 ST_DATA int func_ind;
 
 ST_FUNC void put_elf_reloca(Section *symtab, Section *s, unsigned long offset,
@@ -113,6 +115,39 @@ void put_extern_sym(Sym *sym, Section *section, addr_t value, unsigned long size
 void gen_increment_tcov(SValue *sv)
 {
   (void)sv;
+}
+
+/* Stubs for the ARM EH frame helpers referenced by tccdbg.c's
+ * tcc_debug_frame_end when TCC_EH_FRAME is enabled. */
+uint32_t pushed_registers;
+int allocated_stack_size;
+
+void *section_ptr_add(Section *sec, addr_t size);
+#define dwarf_data1(s, data) (*(uint8_t *)section_ptr_add((s), 1) = (data))
+
+int dwarf_arm_thumb_count_bits(uint32_t mask)
+{
+  int count = 0;
+  while (mask)
+  {
+    count += mask & 1;
+    mask >>= 1;
+  }
+  return count;
+}
+
+void dwarf_arm_thumb_emit_offsets(Section *sec, uint32_t mask)
+{
+  int reg;
+  (void)sec;
+  for (reg = 0; reg < 16; reg++)
+    if (mask & (1u << reg))
+      dwarf_data1(sec, DW_CFA_offset + reg);
+}
+
+void arm_ehabi_emit_function_entry(TCCState *s1)
+{
+  (void)s1;
 }
 
 char *pstrcat(char *buf, size_t buf_size, const char *s)
@@ -1203,10 +1238,9 @@ UT_TEST(test_tcc_tcov_end_appends_terminators)
 
   size_t before = tcov_section->data_offset;
   tcc_tcov_end(s1);
-  /* tcc_tcov_end allocates a terminator byte for the active file name but
-   * does not initialize it (current production behavior).  Just verify the
-   * offset advanced by one. */
+  /* tcc_tcov_end appends one NUL terminator byte for the active file name. */
   UT_ASSERT_EQ(tcov_section->data_offset, before + 1);
+  UT_ASSERT_EQ(((unsigned char *)tcov_section->data)[before], 0);
 
   ut_dbg_reset_tcov(s1);
   tcc_state = old_tcc;
@@ -1705,6 +1739,1307 @@ UT_TEST(test_tcc_debug_line_num_non_dwarf)
   return 0;
 }
 
+UT_TEST(test_tcc_debug_new_enables_backtrace_for_memory_output)
+{
+  TCCState *s1 = ut_dbg_make_state();
+
+  s1->do_debug = 1;
+  s1->output_type = TCC_OUTPUT_MEMORY;
+  s1->dwarf = 0;
+  tcc_debug_new(s1);
+
+  UT_ASSERT_EQ(s1->do_backtrace, 1);
+
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_start_non_dwarf_emits_stabs)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+
+  tcc_state = s1;
+  text_section = new_section(s1, ".text", SHT_PROGBITS, SHF_EXECINSTR);
+  symtab_section = new_section(s1, ".symtab", SHT_SYMTAB, 0);
+  file = &bf;
+  strcpy(bf.filename, "/a/b.c");
+  bf.line_num = 1;
+  s1->do_debug = 1;
+  s1->dwarf = 0;
+  s1->nb_sections = 0;
+
+  tcc_debug_new(s1);
+  s1->dwarf = 0;
+  tcc_debug_start(s1);
+
+  UT_ASSERT(s1->dState != NULL);
+  UT_ASSERT_EQ(s1->dState->section_sym, text_section->sh_num + 1);
+
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_end_returns_when_debug_next_type_zero)
+{
+  TCCState *s1 = ut_dbg_make_state();
+
+  s1->do_debug = 1;
+  s1->dState->debug_next_type = 0;
+  tcc_debug_end(s1);
+
+  /* Reaching here without crashing is the test; no output is produced. */
+  UT_ASSERT_EQ(s1->dState->debug_next_type, 0);
+
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_stabn_creates_nested_scope)
+{
+  TCCState *s1 = ut_dbg_make_state();
+
+  s1->do_debug = 1;
+  tcc_debug_stabn(s1, N_LBRAC, 10);
+  UT_ASSERT(s1->dState->debug_info != NULL);
+  UT_ASSERT(s1->dState->debug_info_root != NULL);
+
+  tcc_debug_stabn(s1, N_LBRAC, 20);
+  UT_ASSERT(s1->dState->debug_info->parent == s1->dState->debug_info_root);
+
+  tcc_debug_stabn(s1, N_RBRAC, 30);
+  tcc_debug_stabn(s1, N_RBRAC, 40);
+
+  UT_ASSERT(s1->dState->debug_info == NULL);
+  UT_ASSERT(s1->dState->debug_info_root != NULL);
+  UT_ASSERT_EQ(s1->dState->debug_info_root->end, 40);
+
+  tcc_free(s1->dState->debug_info_root);
+  s1->dState->debug_info_root = NULL;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_line_advance_pc_and_line)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Section text;
+  unsigned char text_data[16];
+  unsigned char line_data[64];
+  BufferedFile bf = {0};
+  int size_before;
+
+  tcc_state = s1;
+  test_section_reset(&text, text_data, sizeof(text_data));
+  text.s1 = s1;
+  text.sh_flags = SHF_EXECINSTR;
+  cur_text_section = &text;
+  text_section = &text;
+  symtab_section = new_section(s1, ".symtab", SHT_SYMTAB, 0);
+
+  file = &bf;
+  strcpy(bf.filename, "t.c");
+  bf.line_num = 20;
+  ind = 4;
+  func_ind = -1;
+  nocode_wanted = 0;
+  s1->do_debug = 1;
+  s1->dwarf = 4;
+  s1->ir = 0;
+  s1->dState->last_line_num = 0;
+
+  s1->dState->dwarf_line.line_data = (unsigned char *)tcc_malloc(sizeof(line_data));
+  s1->dState->dwarf_line.line_max_size = sizeof(line_data);
+  s1->dState->dwarf_line.line_size = 0;
+  s1->dState->dwarf_line.cur_section = &text;
+  s1->dState->dwarf_line.last_file = 1;
+  s1->dState->dwarf_line.last_line = 1;
+  s1->dState->dwarf_line.last_pc = 0;
+
+  size_before = s1->dState->dwarf_line.line_size;
+  tcc_debug_line(s1);
+  UT_ASSERT(s1->dState->dwarf_line.line_size > size_before);
+
+  file = NULL;
+  ind = 0;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_line_num_special_opcode)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Section text;
+  unsigned char text_data[16];
+  unsigned char line_data[64];
+  int size_before;
+
+  tcc_state = s1;
+  test_section_reset(&text, text_data, sizeof(text_data));
+  text.s1 = s1;
+  text.sh_flags = SHF_EXECINSTR;
+  cur_text_section = &text;
+  text_section = &text;
+  symtab_section = new_section(s1, ".symtab", SHT_SYMTAB, 0);
+
+  file = NULL;
+  ind = 4;
+  func_ind = -1;
+  nocode_wanted = 0;
+  s1->do_debug = 1;
+  s1->dwarf = 4;
+  s1->ir = 0;
+  s1->dState->last_line_num = 0;
+
+  s1->dState->dwarf_line.line_data = (unsigned char *)tcc_malloc(sizeof(line_data));
+  s1->dState->dwarf_line.line_max_size = sizeof(line_data);
+  s1->dState->dwarf_line.line_size = 0;
+  s1->dState->dwarf_line.cur_section = &text;
+  s1->dState->dwarf_line.last_file = 1;
+  s1->dState->dwarf_line.last_line = 1;
+  s1->dState->dwarf_line.last_pc = 0;
+
+  size_before = s1->dState->dwarf_line.line_size;
+  tcc_debug_line_num(s1, 5);
+  UT_ASSERT(s1->dState->dwarf_line.line_size > size_before);
+  UT_ASSERT_EQ(s1->dState->last_line_num, 5);
+
+  ind = 0;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_line_num_non_dwarf_func_ind)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Section text;
+  unsigned char text_data[16];
+  BufferedFile bf = {0};
+
+  tcc_state = s1;
+  test_section_reset(&text, text_data, sizeof(text_data));
+  text.s1 = s1;
+  text.sh_flags = SHF_EXECINSTR;
+  cur_text_section = &text;
+  text_section = &text;
+  symtab_section = new_section(s1, ".symtab", SHT_SYMTAB, 0);
+
+  file = &bf;
+  strcpy(bf.filename, "t.c");
+  bf.line_num = 11;
+  ind = 6;
+  func_ind = 2;
+  s1->do_debug = 1;
+  s1->dwarf = 0;
+  s1->ir = 0;
+  nocode_wanted = 0;
+  s1->dState->last_line_num = 0;
+
+  tcc_debug_line_num(s1, 11);
+  UT_ASSERT_EQ(s1->dState->last_line_num, 11);
+
+  file = NULL;
+  ind = 0;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_funcend_non_dwarf)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Section text;
+  unsigned char text_data[16];
+  BufferedFile bf = {0};
+  Sym func_sym = {0};
+  Sym ret_sym = {0};
+
+  tcc_state = s1;
+  test_section_reset(&text, text_data, sizeof(text_data));
+  text.s1 = s1;
+  text.sh_flags = SHF_EXECINSTR;
+  text.sh_num = 1;
+  cur_text_section = &text;
+  text_section = &text;
+  symtab_section = new_section(s1, ".symtab", SHT_SYMTAB, 0);
+
+  file = &bf;
+  strcpy(bf.filename, "t.c");
+  bf.line_num = 1;
+  funcname = "nf";
+  ind = 2;
+  func_ind = 0;
+  s1->do_debug = 1;
+  s1->dwarf = 0;
+  s1->ir = 0;
+
+  func_sym.type.t = VT_FUNC;
+  func_sym.type.ref = &ret_sym;
+  ret_sym.type.t = VT_INT;
+
+  tcc_debug_funcstart(s1, &func_sym);
+  UT_ASSERT(s1->dState->debug_info != NULL);
+
+  tcc_debug_funcend(s1, 10);
+  UT_ASSERT(s1->dState->debug_info == NULL);
+
+  file = NULL;
+  funcname = NULL;
+  ind = 0;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_extern_sym_dwarf)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym sym = {0};
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 4;
+  s1->do_debug = 3;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  sym.v = 100;
+  sym.type.t = VT_INT;
+  tcc_state = s1;
+  utb_set_tok_str(100, "x");
+
+  tcc_debug_extern_sym(s1, &sym, 0, STB_GLOBAL, STT_OBJECT);
+
+  UT_ASSERT(dwarf_info_section->data_offset > 0);
+
+  utb_set_tok_str(100, NULL);
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_extern_sym_stabs)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym sym = {0};
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 0;
+  s1->do_debug = 3;
+  tcc_debug_new(s1);
+  s1->dwarf = 0;
+  tcc_debug_start(s1);
+
+  common_section = new_section(s1, ".common", SHT_NOBITS, SHF_ALLOC);
+
+  sym.v = 101;
+  sym.type.t = VT_INT;
+  tcc_state = s1;
+  utb_set_tok_str(101, "y");
+
+  tcc_debug_extern_sym(s1, &sym, SHN_COMMON, STB_LOCAL, STT_OBJECT);
+
+  common_section = NULL;
+  utb_set_tok_str(101, NULL);
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_typedef_dwarf)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym sym = {0};
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 4;
+  s1->do_debug = 3;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  sym.v = 102;
+  sym.type.t = VT_INT;
+  tcc_state = s1;
+  utb_set_tok_str(102, "myint");
+
+  tcc_debug_typedef(s1, &sym);
+
+  UT_ASSERT(dwarf_info_section->data_offset > 0);
+
+  utb_set_tok_str(102, NULL);
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_typedef_stabs)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym sym = {0};
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 0;
+  s1->do_debug = 3;
+  tcc_debug_new(s1);
+  s1->dwarf = 0;
+  tcc_debug_start(s1);
+
+  sym.v = 103;
+  sym.type.t = VT_INT;
+  tcc_state = s1;
+  utb_set_tok_str(103, "yourint");
+
+  tcc_debug_typedef(s1, &sym);
+
+  utb_set_tok_str(103, NULL);
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_debug_info_stabs_pointer)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Sym base = {0};
+  Sym ptr = {0};
+  CString result;
+
+  tcc_state = s1;
+  s1->dwarf = 0;
+  base.type.t = VT_INT;
+  ptr.type.t = VT_PTR;
+  ptr.type.ref = &base;
+
+  cstr_new(&result);
+  tcc_get_debug_info(s1, &ptr, &result);
+  UT_ASSERT(result.size > 0);
+
+  cstr_free(&result);
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_debug_info_stabs_struct)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Sym struct_def = {0};
+  Sym field = {0};
+  Sym s = {0};
+  CString result;
+
+  tcc_state = s1;
+  struct_def.type.t = VT_STRUCT;
+  struct_def.c = 4;
+  struct_def.v = 200;
+  field.type.t = VT_INT;
+  field.v = 201;
+  field.c = 0;
+  struct_def.next = &field;
+
+  s.type.t = VT_STRUCT;
+  s.type.ref = &struct_def;
+
+  utb_set_tok_str(200, "S");
+  utb_set_tok_str(201, "f");
+
+  s1->dwarf = 0;
+  cstr_new(&result);
+  tcc_get_debug_info(s1, &s, &result);
+  UT_ASSERT(result.size > 0);
+
+  cstr_free(&result);
+  utb_set_tok_str(200, NULL);
+  utb_set_tok_str(201, NULL);
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_dwarf_info_base_type)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym sym = {0};
+  int type;
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 4;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  sym.type.t = VT_INT;
+  tcc_state = s1;
+
+  type = tcc_get_dwarf_info(s1, &sym);
+  UT_ASSERT(type > 0);
+  UT_ASSERT(dwarf_info_section->data_offset > 0);
+
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_dwarf_info_struct)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym struct_def = {0};
+  Sym field = {0};
+  Sym s = {0};
+  int type;
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 4;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  struct_def.type.t = VT_STRUCT;
+  struct_def.c = 4;
+  struct_def.v = 300;
+  field.type.t = VT_INT;
+  field.v = 301;
+  field.c = 0;
+  struct_def.next = &field;
+
+  s.type.t = VT_STRUCT;
+  s.type.ref = &struct_def;
+
+  tcc_state = s1;
+  utb_set_tok_str(300, "S2");
+  utb_set_tok_str(301, "f2");
+
+  type = tcc_get_dwarf_info(s1, &s);
+  UT_ASSERT(type > 0);
+  UT_ASSERT(dwarf_info_section->data_offset > 0);
+
+  utb_set_tok_str(300, NULL);
+  utb_set_tok_str(301, NULL);
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_dwarf_info_enum)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym enum_def = {0};
+  Sym member = {0};
+  Sym s = {0};
+  int type;
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 4;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  enum_def.type.t = VT_ENUM;
+  enum_def.v = 400;
+  member.type.t = VT_INT | VT_ENUM_VAL;
+  member.v = 401;
+  member.enum_val = 1;
+  enum_def.next = &member;
+
+  s.type.t = VT_ENUM;
+  s.type.ref = &enum_def;
+
+  tcc_state = s1;
+  utb_set_tok_str(400, "E");
+  utb_set_tok_str(401, "M");
+
+  type = tcc_get_dwarf_info(s1, &s);
+  UT_ASSERT(type > 0);
+  UT_ASSERT(dwarf_info_section->data_offset > 0);
+
+  utb_set_tok_str(400, NULL);
+  utb_set_tok_str(401, NULL);
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_dwarf_info_pointer)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym base = {0};
+  Sym ptr = {0};
+  int type;
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 4;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  base.type.t = VT_INT;
+  ptr.type.t = VT_PTR;
+  ptr.type.ref = &base;
+
+  tcc_state = s1;
+  type = tcc_get_dwarf_info(s1, &ptr);
+  UT_ASSERT(type > 0);
+  UT_ASSERT(dwarf_info_section->data_offset > 0);
+
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_dwarf_info_array)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym base = {0};
+  Sym arr = {0};
+  int type;
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 4;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  base.type.t = VT_INT;
+  base.c = 10;
+  arr.type.t = VT_PTR | VT_ARRAY;
+  arr.type.ref = &base;
+
+  tcc_state = s1;
+  type = tcc_get_dwarf_info(s1, &arr);
+  UT_ASSERT(type > 0);
+  UT_ASSERT(dwarf_info_section->data_offset > 0);
+
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_dwarf_info_func)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym ret = {0};
+  Sym func = {0};
+  Sym param = {0};
+  Sym s = {0};
+  int type;
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 4;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  ret.type.t = VT_INT;
+  func.type.t = VT_FUNC;
+  func.type.ref = &ret;
+  func.next = &param;
+  param.type.t = VT_INT;
+  param.v = 500;
+
+  s.type.t = VT_FUNC;
+  s.type.ref = &func;
+
+  tcc_state = s1;
+  utb_set_tok_str(500, "p");
+
+  type = tcc_get_dwarf_info(s1, &s);
+  UT_ASSERT(type > 0);
+  UT_ASSERT(dwarf_info_section->data_offset > 0);
+
+  utb_set_tok_str(500, NULL);
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_fix_anon)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym anon = {0};
+  Sym field = {0};
+  CType t;
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->do_debug = 2;
+  s1->dwarf = 4;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  /* Create an anonymous struct entry in the anon hash. */
+  anon.type.t = VT_STRUCT;
+  anon.c = -1;
+  tcc_debug_find(s1, &anon, 1);
+
+  /* Record a reference to the anon struct from a field. */
+  field.type.t = VT_STRUCT;
+  field.type.ref = &anon;
+  tcc_debug_check_anon(s1, &field, dwarf_info_section->data_offset);
+
+  /* Simulate the struct becoming fully defined (size known). */
+  anon.c = 4;
+
+  /* Now fix the anon struct. */
+  t.t = VT_STRUCT;
+  t.ref = &anon;
+
+  tcc_state = s1;
+  tcc_debug_fix_anon(s1, &t);
+
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_end_anon_hash_fixes_refs)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym anon = {0};
+  Sym field = {0};
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->do_debug = 2;
+  s1->dwarf = 4;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  /* Create an anonymous struct entry in the anon hash. */
+  anon.type.t = VT_STRUCT;
+  anon.c = -1;
+  tcc_debug_find(s1, &anon, 1);
+
+  /* Record a reference to the anon struct from a field. */
+  field.type.t = VT_STRUCT;
+  field.type.ref = &anon;
+  tcc_debug_check_anon(s1, &field, dwarf_info_section->data_offset);
+
+  /* Simulate the struct becoming fully defined. */
+  anon.c = 4;
+
+  tcc_state = s1;
+  ut_dbg_debug_end(s1);
+
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_end_function_sections_with_text)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Section *text;
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 5;
+  s1->function_sections = 1;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  text = new_section(s1, ".text.func", SHT_PROGBITS, SHF_EXECINSTR);
+  text->data_offset = 8;
+  text_section->data_offset = 4;
+
+  tcc_state = s1;
+  dwarf_register_text_section(s1, text);
+
+  ut_dbg_debug_end(s1);
+
+  UT_ASSERT(dwarf_ranges_section->data_offset > 0);
+  UT_ASSERT(dwarf_aranges_section->data_offset > 0);
+
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_finish_non_dwarf_with_symbols)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Section text;
+  unsigned char text_data[16];
+  BufferedFile bf = {0};
+  Sym func_sym = {0};
+  Sym ret_sym = {0};
+
+  tcc_state = s1;
+  test_section_reset(&text, text_data, sizeof(text_data));
+  text.s1 = s1;
+  text.sh_flags = SHF_EXECINSTR;
+  text.sh_num = 1;
+  cur_text_section = &text;
+  text_section = &text;
+  symtab_section = new_section(s1, ".symtab", SHT_SYMTAB, 0);
+
+  file = &bf;
+  strcpy(bf.filename, "t.c");
+  bf.line_num = 1;
+  funcname = "nf";
+  ind = 2;
+  func_ind = 0;
+  s1->do_debug = 3;
+  s1->dwarf = 0;
+  s1->ir = 0;
+
+  func_sym.type.t = VT_FUNC;
+  func_sym.type.ref = &ret_sym;
+  ret_sym.type.t = VT_INT;
+
+  tcc_debug_funcstart(s1, &func_sym);
+  /* Add a symbol to the current scope so tcc_debug_finish has work. */
+  tcc_debug_stabs(s1, "local_var", N_LSYM, 4, NULL, 0, 0, -1, 0);
+
+  tcc_debug_funcend(s1, 10);
+  UT_ASSERT(s1->dState->debug_info == NULL);
+
+  file = NULL;
+  funcname = NULL;
+  ind = 0;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_funcstart_do_backtrace)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Section info_sec, str_sec, text_sec, symtab;
+  unsigned char info_data[1024];
+  unsigned char str_data[256];
+  unsigned char text_data[16];
+  unsigned char symtab_data[16];
+  Sym func_sym = {0};
+  Sym ret_sym = {0};
+  BufferedFile bf = {0};
+
+  test_section_reset(&info_sec, info_data, sizeof(info_data));
+  test_section_reset(&str_sec, str_data, sizeof(str_data));
+  test_section_reset(&text_sec, text_data, sizeof(text_data));
+  test_section_reset(&symtab, symtab_data, sizeof(symtab_data));
+  info_sec.s1 = s1;
+  str_sec.s1 = s1;
+  text_sec.s1 = s1;
+  text_sec.sh_flags = SHF_EXECINSTR;
+  text_sec.sh_num = 1;
+
+  tcc_state = s1;
+  dwarf_info_section = &info_sec;
+  dwarf_str_section = &str_sec;
+  cur_text_section = &text_sec;
+  text_section = &text_sec;
+  symtab_section = &symtab;
+
+  s1->do_debug = 1;
+  s1->dwarf = 4;
+  s1->ir = 0;
+  s1->do_backtrace = 1;
+
+  funcname = "bt_fn";
+  file = &bf;
+  strcpy(bf.filename, "bt.c");
+  bf.line_num = 1;
+
+  ind = 2;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  s1->dState->dwarf_line.cur_section = NULL;
+  s1->dState->dwarf_line.last_file = 0;
+  s1->dState->dwarf_line.last_line = 0;
+  s1->dState->dwarf_line.last_pc = 0;
+  s1->dState->dwarf_line.line_data = (unsigned char *)tcc_malloc(256);
+  s1->dState->dwarf_line.line_max_size = 256;
+  s1->dState->dwarf_line.line_size = 0;
+
+  func_sym.type.t = VT_FUNC;
+  func_sym.type.ref = &ret_sym;
+  ret_sym.type.t = VT_INT;
+
+  tcc_debug_funcstart(s1, &func_sym);
+  UT_ASSERT(s1->dState->dwarf_line.line_size > 0);
+
+  tcc_state = old_tcc;
+  file = NULL;
+  ind = 0;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_save_restore_state_null_dstate)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  void *saved_info = (void *)1;
+  void *saved_root = (void *)2;
+
+  tcc_free(s1->dState);
+  s1->dState = NULL;
+
+  tcc_debug_save_state(s1, &saved_info, &saved_root);
+  UT_ASSERT_EQ(saved_info, (void *)NULL);
+  UT_ASSERT_EQ(saved_root, (void *)NULL);
+
+  tcc_debug_restore_state(s1, (void *)3, (void *)4);
+  /* No crash is the success criterion. */
+
+  /* Re-create dState so ut_dbg_free_state can clean up. */
+  s1->dState = (struct _tccdbg *)tcc_mallocz(sizeof(*s1->dState));
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_debug_info_enum_stabs)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Sym enum_def = {0};
+  Sym member = {0};
+  Sym s = {0};
+  CString result;
+
+  tcc_state = s1;
+  enum_def.type.t = VT_ENUM;
+  enum_def.v = 300;
+  member.type.t = VT_INT | VT_ENUM_VAL;
+  member.v = 301;
+  member.enum_val = 42;
+  enum_def.next = &member;
+
+  s.type.t = VT_ENUM;
+  s.type.ref = &enum_def;
+
+  utb_set_tok_str(300, "Color");
+  utb_set_tok_str(301, "Red");
+
+  cstr_new(&result);
+  tcc_get_debug_info(s1, &s, &result);
+  UT_ASSERT(result.size > 0);
+
+  cstr_free(&result);
+  utb_set_tok_str(300, NULL);
+  utb_set_tok_str(301, NULL);
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_debug_info_array_stabs)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Sym base = {0};
+  Sym arr = {0};
+  CString result;
+
+  tcc_state = s1;
+  base.type.t = VT_INT;
+  base.c = 10;
+  arr.type.t = VT_PTR | VT_ARRAY;
+  arr.type.ref = &base;
+
+  cstr_new(&result);
+  tcc_get_debug_info(s1, &arr, &result);
+  UT_ASSERT(result.size > 0);
+
+  cstr_free(&result);
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_debug_info_func_stabs)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Sym ret = {0};
+  Sym func = {0};
+  Sym s = {0};
+  CString result;
+
+  tcc_state = s1;
+  ret.type.t = VT_INT;
+  func.type.t = VT_FUNC;
+  func.type.ref = &ret;
+
+  s.type.t = VT_FUNC;
+  s.type.ref = &func;
+
+  cstr_new(&result);
+  tcc_get_debug_info(s1, &s, &result);
+  UT_ASSERT(result.size > 0);
+
+  cstr_free(&result);
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_end_non_dwarf_closes_so)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  unsigned char text_data[16];
+
+  tcc_state = s1;
+  text_section = new_section(s1, ".text", SHT_PROGBITS, SHF_EXECINSTR);
+  symtab_section = new_section(s1, ".symtab", SHT_SYMTAB, 0);
+  text_section->data = text_data;
+  text_section->data_allocated = sizeof(text_data);
+  text_section->data_offset = 4;
+
+  file = &bf;
+  strcpy(bf.filename, "/a/b.c");
+  bf.line_num = 1;
+  s1->do_debug = 1;
+  s1->dwarf = 0;
+
+  tcc_debug_new(s1);
+  s1->dwarf = 0;
+  tcc_debug_start(s1);
+  ut_dbg_debug_end(s1);
+
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_start_dwarf3_form_conversion)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 3;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  UT_ASSERT(dwarf_info_section->data_offset > 0);
+  UT_ASSERT(dwarf_abbrev_section->data_offset > 0);
+
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_dwarf_info_struct_with_bitfield)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym struct_def = {0};
+  Sym field = {0};
+  Sym s = {0};
+  int type;
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 4;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  struct_def.type.t = VT_STRUCT;
+  struct_def.c = 4;
+  struct_def.v = 500;
+  field.type.t = VT_INT | VT_BITFIELD;
+  field.type.t |= (3 << VT_STRUCT_SHIFT) | (1 << VT_STRUCT_SHIFT);
+  field.v = 501;
+  field.c = 0;
+  struct_def.next = &field;
+
+  s.type.t = VT_STRUCT;
+  s.type.ref = &struct_def;
+
+  tcc_state = s1;
+  utb_set_tok_str(500, "S");
+  utb_set_tok_str(501, "f");
+
+  type = tcc_get_dwarf_info(s1, &s);
+  UT_ASSERT(type > 0);
+
+  utb_set_tok_str(500, NULL);
+  utb_set_tok_str(501, NULL);
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_debug_info_stabs_struct_with_bitfield)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Sym struct_def = {0};
+  Sym field = {0};
+  Sym s = {0};
+  CString result;
+
+  tcc_state = s1;
+  s1->dwarf = 0;
+  struct_def.type.t = VT_STRUCT;
+  struct_def.c = 4;
+  struct_def.v = 510;
+  field.type.t = VT_INT | VT_BITFIELD;
+  field.type.t |= (3 << VT_STRUCT_SHIFT) | (1 << VT_STRUCT_SHIFT);
+  field.v = 511;
+  field.c = 0;
+  struct_def.next = &field;
+
+  s.type.t = VT_STRUCT;
+  s.type.ref = &struct_def;
+
+  utb_set_tok_str(510, "SB");
+  utb_set_tok_str(511, "bf");
+
+  cstr_new(&result);
+  tcc_get_debug_info(s1, &s, &result);
+  UT_ASSERT(result.size > 0);
+
+  cstr_free(&result);
+  utb_set_tok_str(510, NULL);
+  utb_set_tok_str(511, NULL);
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_get_dwarf_info_pointer_to_pointer)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym base = {0};
+  Sym inner = {0};
+  Sym outer = {0};
+  int type;
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 4;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  base.type.t = VT_INT;
+  inner.type.t = VT_PTR;
+  inner.type.ref = &base;
+  outer.type.t = VT_PTR;
+  outer.type.ref = &inner;
+
+  tcc_state = s1;
+  type = tcc_get_dwarf_info(s1, &outer);
+  UT_ASSERT(type > 0);
+  UT_ASSERT(dwarf_info_section->data_offset > 0);
+
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_debug_funcend_dwarf_with_local)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  Section info_sec, str_sec, text_sec, symtab;
+  unsigned char info_data[1024];
+  unsigned char str_data[256];
+  unsigned char text_data[16];
+  unsigned char symtab_data[16];
+  Sym func_sym = {0};
+  Sym ret_sym = {0};
+  BufferedFile bf = {0};
+
+  test_section_reset(&info_sec, info_data, sizeof(info_data));
+  test_section_reset(&str_sec, str_data, sizeof(str_data));
+  test_section_reset(&text_sec, text_data, sizeof(text_data));
+  test_section_reset(&symtab, symtab_data, sizeof(symtab_data));
+  info_sec.s1 = s1;
+  str_sec.s1 = s1;
+  text_sec.s1 = s1;
+  text_sec.sh_flags = SHF_EXECINSTR;
+  text_sec.sh_num = 1;
+
+  tcc_state = s1;
+  dwarf_info_section = &info_sec;
+  dwarf_str_section = &str_sec;
+  cur_text_section = &text_sec;
+  text_section = &text_sec;
+  symtab_section = &symtab;
+
+  s1->do_debug = 1;
+  s1->dwarf = 4;
+  s1->ir = 0;
+
+  funcname = "df";
+  file = &bf;
+  strcpy(bf.filename, "df.c");
+  bf.line_num = 1;
+
+  ind = 2;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  s1->dState->dwarf_info.start = 0;
+  s1->dState->dwarf_sym.str = 0;
+  s1->dState->dwarf_sym.line_str = 0;
+  s1->dState->dwarf_line.cur_section = NULL;
+  s1->dState->dwarf_line.last_file = 0;
+  s1->dState->dwarf_line.last_line = 0;
+  s1->dState->dwarf_line.last_pc = 0;
+  s1->dState->dwarf_line.line_data = (unsigned char *)tcc_malloc(256);
+  s1->dState->dwarf_line.line_max_size = 256;
+  s1->dState->dwarf_line.line_size = 0;
+
+  func_sym.type.t = VT_FUNC;
+  func_sym.type.ref = &ret_sym;
+  ret_sym.type.t = VT_INT;
+
+  tcc_debug_funcstart(s1, &func_sym);
+  tcc_debug_stabs(s1, "lv", N_LSYM, 4, NULL, 0, 0, -1, 0);
+  tcc_debug_funcend(s1, 10);
+
+  tcc_state = old_tcc;
+  file = NULL;
+  ind = 0;
+  func_ind = 0;
+  s1->dState->last_line_num = 0;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_add_debug_info_dwarf)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym a = {0};
+  Sym b = {0};
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 4;
+  s1->do_debug = 3;
+  tcc_debug_new(s1);
+  tcc_debug_start(s1);
+
+  a.v = 600;
+  a.type.t = VT_INT;
+  a.c = 0;
+  a.r = VT_LOCAL;
+  a.prev = &b;
+  b.v = 601;
+  b.type.t = VT_INT;
+  b.c = 4;
+  b.r = VT_LOCAL;
+  b.prev = NULL;
+
+  tcc_state = s1;
+  utb_set_tok_str(600, "a");
+  utb_set_tok_str(601, "b");
+
+  tcc_add_debug_info(s1, 0, &a, NULL);
+  UT_ASSERT(dwarf_info_section->data_offset > 0);
+
+  utb_set_tok_str(600, NULL);
+  utb_set_tok_str(601, NULL);
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
+UT_TEST(test_tcc_add_debug_info_stabs)
+{
+  TCCState *s1 = ut_dbg_make_state();
+  TCCState *old_tcc = tcc_state;
+  BufferedFile bf = {0};
+  Sym a = {0};
+  Sym b = {0};
+
+  ut_dbg_setup_start_state(s1, &bf, "/a/b.c");
+  s1->dwarf = 0;
+  s1->do_debug = 3;
+  tcc_debug_new(s1);
+  s1->dwarf = 0;
+  tcc_debug_start(s1);
+
+  a.v = 602;
+  a.type.t = VT_INT;
+  a.c = 0;
+  a.r = VT_LOCAL;
+  a.prev = &b;
+  b.v = 603;
+  b.type.t = VT_INT;
+  b.c = 4;
+  b.r = VT_LOCAL;
+  b.prev = NULL;
+
+  tcc_state = s1;
+  utb_set_tok_str(602, "x");
+  utb_set_tok_str(603, "y");
+
+  tcc_add_debug_info(s1, 0, &a, NULL);
+
+  utb_set_tok_str(602, NULL);
+  utb_set_tok_str(603, NULL);
+  file = NULL;
+  tcc_state = old_tcc;
+  ut_dbg_free_state(s1);
+  return 0;
+}
+
 UT_SUITE(tccdbg)
 {
   UT_RUN(test_dwarf_uleb128_size_boundaries);
@@ -1762,4 +3097,41 @@ UT_SUITE(tccdbg)
   UT_RUN(test_put_new_file_variants);
   UT_RUN(test_tcc_debug_line_non_dwarf_func_ind_minus1);
   UT_RUN(test_tcc_debug_line_num_non_dwarf);
+  UT_RUN(test_tcc_debug_new_enables_backtrace_for_memory_output);
+  UT_RUN(test_tcc_debug_start_non_dwarf_emits_stabs);
+  UT_RUN(test_tcc_debug_end_returns_when_debug_next_type_zero);
+  UT_RUN(test_tcc_debug_stabn_creates_nested_scope);
+  UT_RUN(test_tcc_debug_line_advance_pc_and_line);
+  UT_RUN(test_tcc_debug_line_num_special_opcode);
+  UT_RUN(test_tcc_debug_line_num_non_dwarf_func_ind);
+  UT_RUN(test_tcc_debug_funcend_non_dwarf);
+  UT_RUN(test_tcc_debug_extern_sym_dwarf);
+  UT_RUN(test_tcc_debug_extern_sym_stabs);
+  UT_RUN(test_tcc_debug_typedef_dwarf);
+  UT_RUN(test_tcc_debug_typedef_stabs);
+  UT_RUN(test_tcc_get_debug_info_stabs_pointer);
+  UT_RUN(test_tcc_get_debug_info_stabs_struct);
+  UT_RUN(test_tcc_get_dwarf_info_base_type);
+  UT_RUN(test_tcc_get_dwarf_info_struct);
+  UT_RUN(test_tcc_get_dwarf_info_enum);
+  UT_RUN(test_tcc_get_dwarf_info_pointer);
+  UT_RUN(test_tcc_get_dwarf_info_array);
+  UT_RUN(test_tcc_get_dwarf_info_func);
+  UT_RUN(test_tcc_debug_fix_anon);
+  UT_RUN(test_tcc_debug_end_anon_hash_fixes_refs);
+  UT_RUN(test_tcc_debug_end_function_sections_with_text);
+  UT_RUN(test_tcc_debug_finish_non_dwarf_with_symbols);
+  UT_RUN(test_tcc_debug_funcstart_do_backtrace);
+  UT_RUN(test_tcc_debug_save_restore_state_null_dstate);
+  UT_RUN(test_tcc_get_debug_info_enum_stabs);
+  UT_RUN(test_tcc_get_debug_info_array_stabs);
+  UT_RUN(test_tcc_get_debug_info_func_stabs);
+  UT_RUN(test_tcc_debug_end_non_dwarf_closes_so);
+  UT_RUN(test_tcc_debug_start_dwarf3_form_conversion);
+  UT_RUN(test_tcc_get_dwarf_info_struct_with_bitfield);
+  UT_RUN(test_tcc_get_debug_info_stabs_struct_with_bitfield);
+  UT_RUN(test_tcc_get_dwarf_info_pointer_to_pointer);
+  UT_RUN(test_tcc_debug_funcend_dwarf_with_local);
+  UT_RUN(test_tcc_add_debug_info_dwarf);
+  UT_RUN(test_tcc_add_debug_info_stabs);
 }

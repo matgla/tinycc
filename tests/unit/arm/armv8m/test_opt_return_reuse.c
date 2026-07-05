@@ -12,11 +12,13 @@
 
 #include "ir_build.h"
 
+#include "opt_engine.h"
 #include "ut.h"
 
 /* Pass entry point (declared in ir/opt.h; forward-declared to avoid pulling in
  * the optimizer engine headers). */
 int tcc_ir_opt_return_const_reuse(TCCIRState *ir);
+int tcc_ir_opt_return_const_reuse_ex(IROptCtx *ctx);
 
 #define I32 IROP_BTYPE_INT32
 
@@ -294,6 +296,31 @@ UT_TEST(test_return_reuse_empty_and_tiny)
   return 0;
 }
 
+/* WRAPPER: the IROptCtx entry point forwards to the bare TCCIRState* pass. */
+UT_TEST(test_return_reuse_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  setup_optimize_for_return_reuse();
+
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_param(0, I32), utb_imm(7, I32));
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
+  int ret = utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(7, I32), UTB_NONE);
+
+  IROptCtx ctx = {0};
+  ctx.ir = ir;
+  int changes = tcc_ir_opt_return_const_reuse_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT(!irop_is_immediate(utb_src1(ir, ret)));
+  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, ret)), TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, 0));
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
+
+  utb_free(ir);
+  reset_optimize();
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(opt_return_reuse)
@@ -310,4 +337,5 @@ UT_SUITE(opt_return_reuse)
   UT_RUN(test_return_reuse_optimize_gate);
   UT_RUN(test_return_reuse_idempotent);
   UT_RUN(test_return_reuse_empty_and_tiny);
+  UT_RUN(test_return_reuse_ex_forwards);
 }

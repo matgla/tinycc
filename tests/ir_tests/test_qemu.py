@@ -748,6 +748,74 @@ TEST_FILES = [
     # tcc_ir_find_defining_instruction on a TEMP with multiple reaching defs,
     # saw only a zero-valued arm, and folded `(T | C) & 1` to `T`.
     ("306_fuzz_bitfield_multidef_masked_extract.c", 0),
+    ("307_fuzz_bitfield_slfwd_packed_rmw.c", 0),
+    ("308_fuzz_unroll_indexed_store_alias.c", 0),
+    ("309_fuzz_lea_rse_struct_byval.c", 0),
+    ("310_fuzz_dse_longlong_loop_store.c", 0),
+    ("311_fuzz_mla_fusion_agg_alias.c", 0),
+    ("312_fuzz_slfwd_indexed_agg_store.c", 0),
+    ("313_fuzz_varargs_slforward_va_list.c", 0),
+    ("314_fuzz_varargs_slforward_call_site.c", 0),
+    ("315_fuzz_var_to_param_fwd_store_indexed_width.c", 0),
+    ("316_fuzz_ptr_load_cse_var_redef.c", 0),
+    ("317_fuzz_loop_elim_missing_exit_jump.c", 0),
+    ("318_fuzz_dead_loop_elim_missing_exit_jump.c", 0),
+
+    # SSA optimizer regression tests (ir/opt/ssa_opt*.c)
+    ("319_ssa_branch_unsigned_cmp.c", 0),
+    ("320_ssa_branch_reflexive.c", 0),
+    ("321_ssa_cmp_eq_dom_facts.c", 0),
+    ("322_ssa_cprop_copy_chain.c", 0),
+    ("323_ssa_cprop_var_forward.c", 0),
+    ("324_ssa_cprop_var_const_fold_intervening.c", 0),
+    ("325_ssa_dce_dead_phi_cycle.c", 0),
+    ("326_ssa_dce_unreachable.c", 0),
+    ("327_ssa_dead_loop_const_bound.c", 0),
+    ("328_ssa_dead_loop_runtime_bound.c", 0),
+    ("329_ssa_fold_identities.c", 0),
+    ("330_ssa_fold_64bit_const.c", 0),
+    ("331_ssa_opt_phi_two_phis_same_incoming.c", 0),
+    ("332_ssa_opt_addrtaken_locals.c", 0),
+
+    # Fuzz regression tests: MUL/DIV/MOD src2-deref clobber (switch 219754,
+    # ptr 291660), sl_forward LEA-map deref-value offset (ptr 260222),
+    # ra_build_assign_hints deref-load coalesce (varargs 293237), and gen_opif
+    # double-precision constant-fold double-rounding (float 206597/268558).
+    ("333_fuzz_mul_deref_src2_clobber.c", 0),
+    ("334_fuzz_mul_deref_ptr_profile.c", 0),
+    ("335_fuzz_slfwd_lea_deref_offset.c", 0),
+    ("336_fuzz_varargs_ra_hint_deref.c", 0),
+    ("337_fuzz_genopif_double_round.c", 0),
+    ("338_fuzz_genopif_double_round2.c", 0),
+    # combined-sweep seed 320164 (O2): sl_forward's STORE->STORE forward recorded
+    # a VAR-vreg-dest store for dead-store elim without the anonymous-slot guard;
+    # the post-pass still-read scan (is_local operands only) missed the VAR's
+    # direct-vreg arithmetic readers and deleted a live store.  Diverged in every
+    # generator profile at this seed -- a single root cause.
+    ("339_fuzz_slfwd_dse_var_store_vreg_read.c", 0),
+
+    # ptr fuzz seed 380495 (O1/O2 wrong): ssa:load_cse skipped iload invalidation
+    # for STACKOFF-dest stores, but the canonical TEMP-DEREF LOAD CSE now tracks
+    # VAR-pointer bases that point into the local frame (p5 = &arr4[i]).  A direct
+    # stack store `arr4[1]=...` (== *p5) failed to kill the cached *p5 load.
+    ("340_fuzz_load_cse_stack_store_var_ptr.c", 0),
+
+    # ptr fuzz seed 409667 (O1/O2 wrong): add_reassoc folded `x = u4 + C2` into
+    # `x = base + (C1+C2)` via `u4 = base + C1` where base == StackLoc[-4] (arr6[7]),
+    # a raw stack slot with no backing vreg.  The seed-85636 aliasing guard only
+    # rejected address-taken VAR bases, so an intervening `*p7 = ...` store
+    # (p7 == &arr6[7]) that clobbered the slot slipped through and the fold reused
+    # the post-store value.  Now bails on a direct memory-slot base (is_lval,
+    # inner_vr < 0) across a gap memory clobber.
+    ("341_fuzz_add_reassoc_stack_slot_alias.c", 0),
+
+    # switch fuzz seed 457962 (O2 wrong): linear-scan RA expire loop returned a
+    # hard register to the free pool when the shorter of two coalesced intervals
+    # sharing it expired, while the longer merge-temp interval (u6, live across a
+    # trailing loop) still held it.  A loop-body temp (u5 = st9.f2 | 146) then
+    # reused R6, so the post-loop `csmix(cs, u6)` read u5 instead of u6.  Fixed by
+    # never freeing a register a surviving active interval still occupies.
+    ("342_fuzz_ra_expire_coalesced_reg_share.c", 0),
 
     # Promoted from orphan triage: builtins, _Complex, aggregate init,
     # 64-bit ops, cast/bitfield, and previously-fixed bug regressions.

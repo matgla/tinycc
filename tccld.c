@@ -699,13 +699,11 @@ static int ld_parse_phdrs(LDParser *p)
 static int ld_parse_section_pattern(LDParser *p, LDOutputSection *os, int keep)
 {
   LDSectionPattern *pat;
-  
-  /* Allocate initial pattern */
-  pat = ld_add_pattern(os, keep);
-  if (!pat)
-    return -1;
 
-  /* Parse file pattern (e.g., * or *.o) */
+  /* Parse file pattern (e.g., * or *.o).  We intentionally do NOT allocate a
+     pattern entry for it here: the file pattern is currently skipped, and
+     pre-allocating left a permanent bogus entry (pattern=="") ahead of every
+     real section glob, doubling nb_patterns. */
   if (p->tok == LDTOK_NAME || p->tok == '*')
   {
     /* Skip file pattern for now, just look for section pattern */
@@ -931,48 +929,53 @@ static int ld_parse_sections(LDParser *p)
         ld_expect(p, '}');
       }
 
-      /* Memory region: > region */
-      if (p->tok == '>')
+      /* Suffix clauses -- memory region (> R), load region (AT > R), and
+         program header (:PHDR) -- may appear in any order.  GNU-ld scripts
+         conventionally write "> R AT > LMA :PHDR" (AT before the phdr tag),
+         so parse them in a loop instead of once each in a fixed order, which
+         silently dropped a :PHDR that followed AT. */
+      for (;;)
       {
-        ld_next_token(p);
-        if (p->tok == LDTOK_NAME)
-        {
-          os->memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
-          ld_next_token(p);
-        }
-      }
-
-      /* Program header: :phdr */
-      if (p->tok == ':')
-      {
-        ld_next_token(p);
-        if (p->tok == LDTOK_NAME)
-        {
-          for (int i = 0; i < p->ld->nb_phdrs; i++)
-          {
-            if (!strcmp(p->ld->phdrs[i].name, p->tok_buf))
-            {
-              os->phdr_idx = i;
-              break;
-            }
-          }
-          ld_next_token(p);
-        }
-      }
-
-      /* Load memory region: AT > region */
-      if (p->tok == LDTOK_NAME && !strcmp(p->tok_buf, "AT"))
-      {
-        ld_next_token(p);
         if (p->tok == '>')
         {
           ld_next_token(p);
           if (p->tok == LDTOK_NAME)
           {
-            os->load_memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
+            os->memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
             ld_next_token(p);
           }
         }
+        else if (p->tok == ':')
+        {
+          ld_next_token(p);
+          if (p->tok == LDTOK_NAME)
+          {
+            for (int i = 0; i < p->ld->nb_phdrs; i++)
+            {
+              if (!strcmp(p->ld->phdrs[i].name, p->tok_buf))
+              {
+                os->phdr_idx = i;
+                break;
+              }
+            }
+            ld_next_token(p);
+          }
+        }
+        else if (p->tok == LDTOK_NAME && !strcmp(p->tok_buf, "AT"))
+        {
+          ld_next_token(p);
+          if (p->tok == '>')
+          {
+            ld_next_token(p);
+            if (p->tok == LDTOK_NAME)
+            {
+              os->load_memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
+              ld_next_token(p);
+            }
+          }
+        }
+        else
+          break;
       }
 
       p->ld->nb_output_sections++;
@@ -1047,48 +1050,50 @@ static int ld_parse_sections(LDParser *p)
           ld_expect(p, '}');
         }
 
-        /* Memory region */
-        if (p->tok == '>')
+        /* Suffix clauses (> region, AT > load region, :phdr) in any order --
+           see the matching loop in the dotted-section branch above. */
+        for (;;)
         {
-          ld_next_token(p);
-          if (p->tok == LDTOK_NAME)
-          {
-            os->memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
-            ld_next_token(p);
-          }
-        }
-
-        /* Program header */
-        if (p->tok == ':')
-        {
-          ld_next_token(p);
-          if (p->tok == LDTOK_NAME)
-          {
-            for (int i = 0; i < p->ld->nb_phdrs; i++)
-            {
-              if (!strcmp(p->ld->phdrs[i].name, p->tok_buf))
-              {
-                os->phdr_idx = i;
-                break;
-              }
-            }
-            ld_next_token(p);
-          }
-        }
-
-        /* Load memory region: AT > region */
-        if (p->tok == LDTOK_NAME && !strcmp(p->tok_buf, "AT"))
-        {
-          ld_next_token(p);
           if (p->tok == '>')
           {
             ld_next_token(p);
             if (p->tok == LDTOK_NAME)
             {
-              os->load_memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
+              os->memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
               ld_next_token(p);
             }
           }
+          else if (p->tok == ':')
+          {
+            ld_next_token(p);
+            if (p->tok == LDTOK_NAME)
+            {
+              for (int i = 0; i < p->ld->nb_phdrs; i++)
+              {
+                if (!strcmp(p->ld->phdrs[i].name, p->tok_buf))
+                {
+                  os->phdr_idx = i;
+                  break;
+                }
+              }
+              ld_next_token(p);
+            }
+          }
+          else if (p->tok == LDTOK_NAME && !strcmp(p->tok_buf, "AT"))
+          {
+            ld_next_token(p);
+            if (p->tok == '>')
+            {
+              ld_next_token(p);
+              if (p->tok == LDTOK_NAME)
+              {
+                os->load_memory_region_idx = ld_script_find_memory_region(p->ld, p->tok_buf);
+                ld_next_token(p);
+              }
+            }
+          }
+          else
+            break;
         }
 
         p->ld->nb_output_sections++;

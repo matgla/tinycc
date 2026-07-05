@@ -699,20 +699,6 @@ UT_TEST(test_pass_registry_optimize_ir_dispatches_by_level_flags)
   return 0;
 }
 
-UT_TEST(test_opt_get_level_reflects_fp_offset_cache_state)
-{
-  unsigned char saved = tcc_state->opt_fp_offset_cache;
-
-  tcc_state->opt_fp_offset_cache = 0;
-  UT_ASSERT_EQ(tcc_opt_get_level(), 0);
-
-  tcc_state->opt_fp_offset_cache = 1;
-  UT_ASSERT_EQ(tcc_opt_get_level(), 1);
-
-  tcc_state->opt_fp_offset_cache = saved;
-  return 0;
-}
-
 UT_TEST(test_opt_get_level_null_tcc_state_returns_zero)
 {
   TCCState *saved = tcc_state;
@@ -722,21 +708,25 @@ UT_TEST(test_opt_get_level_null_tcc_state_returns_zero)
   return 0;
 }
 
-UT_TEST(test_opt_get_level_bug_comment_claims_map_but_only_reads_fp_cache)
+UT_TEST(test_opt_get_level_maps_optimize_flag)
 {
-  unsigned char saved = tcc_state->opt_fp_offset_cache;
+  unsigned char saved = tcc_state->optimize;
 
-  /* Regression lock: tcc_opt_get_level() only inspects opt_fp_offset_cache,
-   * so it can only return 0 or 1. The function comment says it maps TCC's
-   * optimization settings to levels, but no code path returns 2 for -O2/-O3/-Os.
-   * Flip this test once the driver is wired to the real -O flags. */
-  tcc_state->opt_fp_offset_cache = 0;
+  /* tcc_opt_get_level() maps the -O<n> level in s->optimize to our internal
+   * levels (0, 1, 2), with -O3+ clamped to 2. */
+  tcc_state->optimize = 0;
   UT_ASSERT_EQ(tcc_opt_get_level(), 0);
 
-  tcc_state->opt_fp_offset_cache = 1;
+  tcc_state->optimize = 1;
   UT_ASSERT_EQ(tcc_opt_get_level(), 1);
 
-  tcc_state->opt_fp_offset_cache = saved;
+  tcc_state->optimize = 2;
+  UT_ASSERT_EQ(tcc_opt_get_level(), 2);
+
+  tcc_state->optimize = 3;
+  UT_ASSERT_EQ(tcc_opt_get_level(), 2);
+
+  tcc_state->optimize = saved;
   return 0;
 }
 
@@ -901,9 +891,8 @@ UT_SUITE(tccopt)
   UT_RUN(test_pass_registry_optimize_ir_level_three_maps_to_o2);
   UT_RUN(test_pass_registry_optimize_ir_level_above_three_falls_back_to_o1);
   UT_RUN(test_pass_registry_get_passes_null_count_returns_pointer);
-  UT_RUN(test_opt_get_level_reflects_fp_offset_cache_state);
   UT_RUN(test_opt_get_level_null_tcc_state_returns_zero);
-  UT_RUN(test_opt_get_level_bug_comment_claims_map_but_only_reads_fp_cache);
+  UT_RUN(test_opt_get_level_maps_optimize_flag);
 
   /* --- Built-in placeholder pass no-op contracts --- */
   UT_RUN(test_pass_fp_offset_caching_initializes_cache);

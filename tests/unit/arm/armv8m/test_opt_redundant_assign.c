@@ -11,10 +11,12 @@
  */
 
 #include "ir_build.h"
+#include "opt_engine.h"
 #include "ut.h"
 
 /* Pass entry point (declared in ir/opt.h). */
 int tcc_ir_opt_redundant_var_assign(TCCIRState *ir);
+int tcc_ir_opt_redundant_var_assign_ex(IROptCtx *ctx);
 
 #define I32 IROP_BTYPE_INT32
 
@@ -171,6 +173,27 @@ UT_TEST(test_redundant_var_assign_empty)
   return 0;
 }
 
+/* WRAPPER: the IROptCtx entry point forwards to the bare TCCIRState* pass. */
+UT_TEST(test_redundant_var_assign_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+
+  int i0 = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(1, I32), UTB_NONE);
+  int i1 = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(2, I32), UTB_NONE);
+
+  IROptCtx ctx = {0};
+  ctx.ir = ir;
+  int changes = tcc_ir_opt_redundant_var_assign_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, i0), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, i1), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, UTB_VREG_BOUND), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(opt_redundant_assign)
@@ -182,4 +205,5 @@ UT_SUITE(opt_redundant_assign)
   UT_RUN(test_redundant_var_assign_idempotent);
   UT_RUN(test_redundant_var_assign_var0_skipped);
   UT_RUN(test_redundant_var_assign_empty);
+  UT_RUN(test_redundant_var_assign_ex_forwards);
 }

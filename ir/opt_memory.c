@@ -777,6 +777,26 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       if (eq->op != TCCIR_OP_STORE && eq->op != TCCIR_OP_STORE_INDEXED && eq->op != TCCIR_OP_STORE_POSTINC)
         continue;
       IROperand sd = tcc_ir_op_get_dest(ir, eq);
+      if (eq->op == TCCIR_OP_STORE_INDEXED && sd.is_local && !sd.is_lval && !sd.is_llocal &&
+          irop_get_tag(sd) == IROP_TAG_STACKOFF)
+      {
+        IROperand s2 = tcc_ir_op_get_src2(ir, eq);
+        if (!irop_is_immediate(s2) || s2.is_sym)
+          continue;
+        IROperand scale_op = ir->iroperand_pool[eq->operand_base + 3];
+        int scale = (int)irop_get_imm64_ex(ir, scale_op);
+        int64_t soff = irop_get_stack_offset(sd) + (irop_get_imm64_ex(ir, s2) << scale);
+        for (int k = 0; k < estore_count; k++)
+        {
+          if (j > estores[k].idx && estores[k].offset == soff)
+          {
+            LOG_IR_GEN("ENTRY_STORE_PROP: invalidated off=%lld (direct indexed store at i=%d)",
+                       (long long)soff, j);
+            estores[k].offset = 0x7FFFFFFFLL;
+          }
+        }
+        continue;
+      }
       if (sd.is_local)
         continue;
       /* STORE_INDEXED / STORE_POSTINC always write through their base pointer.
@@ -1364,6 +1384,34 @@ static int sl_fwd_narrow_demand_only(TCCIRState *ir, int32_t target_vr, int star
  *   - Clear all pointer-based stores at unknown stores
  *   - Clear all stores at basic block boundaries and function calls
  */
+/* Store-load forwarding is unsound in the presence of a variadic call that
+ * spills arguments to the stack.  Such a call materialises outgoing arguments
+ * into the stack argument area (AAPCS: everything past the first four words in
+ * r0-r3), and the number of stack words a variadic callee actually consumes is
+ * not known at the call site, so this pass's stack-slot reasoning can forward a
+ * value across that region incorrectly (fuzz varargs seed 142915).  A
+ * register-only variadic call (e.g. printf("%x", x), argc<=4) writes no stack
+ * arguments and is safe -- disabling forwarding for it would needlessly expose
+ * unrelated latent folds (fuzz float seed 12646).  Bail only when a variadic
+ * callee is invoked with argc>4. */
+static int ir_has_stack_arg_variadic_call(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *cq = &ir->compact_instructions[i];
+    if (cq->op != TCCIR_OP_FUNCCALLVOID && cq->op != TCCIR_OP_FUNCCALLVAL)
+      continue;
+    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, cq));
+    if (!callee || !callee->type.ref || callee->type.ref->f.func_type != FUNC_ELLIPSIS)
+      continue;
+    int argc = TCCIR_DECODE_CALL_ARGC((int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, cq)));
+    if (argc > 4)
+      return 1;
+  }
+  return 0;
+}
+
 static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir);
 int tcc_ir_opt_sl_forward(TCCIRState *ir)
 {
@@ -1420,6 +1468,12 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
   int fwd_store_count = 0;
 
   if (n == 0)
+    return 0;
+  /* Bail for a variadic function body (unmodeled va_list cursor updates from
+   * va_start/va_arg) and for any function that makes a stack-argument variadic
+   * call (see ir_has_stack_arg_variadic_call).  A plain caller of a
+   * register-only variadic function (e.g. printf) keeps forwarding. */
+  if (ir->is_variadic || ir_has_stack_arg_variadic_call(ir))
     return 0;
 
   /* Pre-pass: recompute is_jump_target flags from actual jump instructions.
@@ -1706,11 +1760,19 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         int dest_pos = TCCIR_DECODE_VREG_POSITION(d_vr);
         if (dest_pos <= max_tmp)
         {
-          /* Check: LEA_temp + constant */
+          /* Check: LEA_temp + constant.
+           * NB: require !lsrc1.is_lval — a DEREF source (`*T + c`) is a loaded
+           * VALUE, not the address T, so T's LEA offset must NOT propagate.
+           * Without this guard a hash-mix like `T115 = *T114 + #-835743076`
+           * inherited T114's stack offset (-32), yielding the garbage
+           * forwardable address -835743108, and sl_forward then aliased an
+           * unrelated scalar load onto a runtime-indexed array store
+           * (fuzz ptr 260222).  The LEA and StackAddr cases already guard
+           * !is_lval; these ADD-propagation cases were the gap. */
           int32_t s1_vr = irop_get_vreg(lsrc1);
           int32_t s2_vr = irop_get_vreg(lsrc2);
-          if (s1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_TEMP && irop_is_immediate(lsrc2) &&
-              !lsrc2.is_sym)
+          if (s1_vr >= 0 && !lsrc1.is_lval && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_TEMP &&
+              irop_is_immediate(lsrc2) && !lsrc2.is_sym)
           {
             int s1_pos = TCCIR_DECODE_VREG_POSITION(s1_vr);
             if (s1_pos <= max_tmp && lea_map[s1_pos].valid)
@@ -1722,8 +1784,8 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
             }
           }
           /* Check: constant + LEA_temp (ADD is commutative) */
-          else if (s2_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s2_vr) == TCCIR_VREG_TYPE_TEMP && irop_is_immediate(lsrc1) &&
-                   !lsrc1.is_sym)
+          else if (s2_vr >= 0 && !lsrc2.is_lval && TCCIR_DECODE_VREG_TYPE(s2_vr) == TCCIR_VREG_TYPE_TEMP &&
+                   irop_is_immediate(lsrc1) && !lsrc1.is_sym)
           {
             int s2_pos = TCCIR_DECODE_VREG_POSITION(s2_vr);
             if (s2_pos <= max_tmp && lea_map[s2_pos].valid)
@@ -3676,7 +3738,15 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                 int pool_off = q->operand_base + irop_config[TCCIR_OP_STORE].has_dest;
                 ir->iroperand_pool[pool_off] = se->stored_value;
               }
-              if (fwd_store_count < SL_FWD_MAX_DEAD_STORES && !se->addr_addrtaken)
+              /* Only anonymous stack-slot stores (dest vreg < 0) may enter the
+               * post-pass dead-store scan: that scan detects remaining readers
+               * only through is_local memory operands.  A VAR-vreg-dest store
+               * (e.g. `V7 <- V0`) can also be read as a plain vreg operand
+               * (`T <- V7 MUL #3`), which the scan cannot see — recording it
+               * would let the DSE post-pass delete a still-live store.  Match
+               * the guard the LOAD-forward recording sites use. */
+              if (fwd_store_count < SL_FWD_MAX_DEAD_STORES && !se->addr_addrtaken &&
+                  irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[se->instruction_idx])) < 0)
               {
                 fwd_stores[fwd_store_count].store_idx = se->instruction_idx;
                 fwd_stores[fwd_store_count].offset = se->local_offset;
@@ -4154,7 +4224,15 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
           IROperand as2 = tcc_ir_op_get_src2(ir, q);
           int32_t s1v = irop_get_vreg(as1);
           int32_t s2v = irop_get_vreg(as2);
-          if (s1v >= 0 && TCCIR_DECODE_VREG_TYPE(s1v) == TCCIR_VREG_TYPE_TEMP && irop_is_immediate(as2) && !as2.is_sym)
+          /* NB: require !as{1,2}.is_lval on the LEA-carrying operand — a DEREF
+           * source (`*T + c`) is a loaded VALUE, not the address T, so T's LEA
+           * stack offset must NOT propagate to the sum.  Without this guard
+           * `T115 = *T114 + #-835743076` inherited T114's stack offset (-32),
+           * yielding the garbage forwardable address -835743108, which then
+           * aliased an array store (*p7) onto an unrelated scalar load (*p9 =
+           * &u5) — fuzz ptr 260222.  Mirrors the pre-scan ADD-map guard above. */
+          if (s1v >= 0 && !as1.is_lval && TCCIR_DECODE_VREG_TYPE(s1v) == TCCIR_VREG_TYPE_TEMP &&
+              irop_is_immediate(as2) && !as2.is_sym)
           {
             int s1p = TCCIR_DECODE_VREG_POSITION(s1v);
             if (s1p <= max_tmp && lea_map[s1p].valid)
@@ -4164,8 +4242,8 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
               lea_map[adp].valid = 1;
             }
           }
-          else if (s2v >= 0 && TCCIR_DECODE_VREG_TYPE(s2v) == TCCIR_VREG_TYPE_TEMP && irop_is_immediate(as1) &&
-                   !as1.is_sym)
+          else if (s2v >= 0 && !as2.is_lval && TCCIR_DECODE_VREG_TYPE(s2v) == TCCIR_VREG_TYPE_TEMP &&
+                   irop_is_immediate(as1) && !as1.is_sym)
           {
             int s2p = TCCIR_DECODE_VREG_POSITION(s2v);
             if (s2p <= max_tmp && lea_map[s2p].valid)
@@ -4808,6 +4886,13 @@ int tcc_ir_opt_store_redundant(TCCIRState *ir)
 
   if (n == 0)
     return 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    TccIrOp op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_BLOCK_COPY || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
+      return 0;
+  }
 
   LOG_IR_GEN("=== REDUNDANT STORE ELIMINATION START ===");
 
@@ -7174,6 +7259,9 @@ static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
   int changes = 0;
 
   if (n < 2)
+    return 0;
+  /* Same rationale as tcc_ir_opt_sl_forward. */
+  if (ir->is_variadic || ir_has_stack_arg_variadic_call(ir))
     return 0;
 
 
@@ -11094,6 +11182,7 @@ int tcc_ir_opt_ptr_load_cse(TCCIRState *ir)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int32_t dest_vr = irop_get_vreg(dest);
+      int dest_is_var = (dest_vr >= 0 && TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_VAR);
       /* A write to an address-taken local VAR aliases any pointer deref of it,
        * so the whole deref cache is stale.  This must fire for BOTH forms the
        * frontend emits for such a write: the register form `V <-- x` (is_lval=0,
@@ -11102,14 +11191,22 @@ int tcc_ir_opt_ptr_load_cse(TCCIRState *ir)
        * misses it).  Gating on `!dest.is_lval` dropped the is_lval case, so a
        * `*pa` read taken after `u4 = ...` (pa == &u4) re-CSE'd to the pre-store
        * value (agg_deep O1 wrong-code). */
-      if (dest_vr >= 0 && TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_VAR) {
+      if (dest_is_var) {
         IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, dest_vr);
         if (li && li->addrtaken) {
           cache_count = 0;
           continue;
         }
       }
-      if (dest_vr >= 0 && !dest.is_lval)
+      /* Invalidate cached copies keyed on dest_vr for any write to it: the
+       * register form (is_lval=0) AND the memory form `V <-- x` (is_lval=1) that
+       * re-writes a local VAR's own stack slot.  The memory form is an ASSIGN,
+       * not a STORE, so it slips past the STORE flush above, yet it changes the
+       * VAR's value — any cached `T <- V` copy is now stale.  Missing this let a
+       * `V0 = const` reassignment after a dead loop-carried multiply have its
+       * const read re-CSE'd back to the loop-header value (longlong fuzz O1
+       * wrong-code, seed 188167). */
+      if (dest_vr >= 0 && (!dest.is_lval || dest_is_var))
       {
         int w = 0;
         for (int c = 0; c < cache_count; c++)

@@ -490,6 +490,59 @@ static void iload_kill_for_stack_store(IRSSAOptCtx *ctx, GLoadState *st, int32_t
   }
 }
 
+/* Kill iload entries a *direct* stack store (`StackLoc[off] <- val`) may alias.
+ *
+ * The main STORE handler treats STACKOFF-dest stores as unable to alias the
+ * iload tracker (store_aliases_globals=0) — a shortcut that was only sound when
+ * iload held global-array LOAD_INDEXED entries.  The canonical TEMP-DEREF LOAD
+ * CSE now also tracks entries whose base is a VAR pointer holding the address of
+ * a *local* array (`p = &arr[i]`; ptr fuzz seed 380495: `*p5` CSE'd across the
+ * direct stack store `arr4[1] = ...` that is the very slot `*p5` names).  Such
+ * entries must be invalidated by a stack store.
+ *
+ * Precise for TEMP bases that resolve to a stack offset (when store_off_exact,
+ * i.e. the store names a real slot rather than a placeholder-offset named
+ * local); conservative for VAR bases (a possibly-multi-def named pointer that
+ * may point into the frame).  PARAM bases and TEMP bases resolving to non-stack
+ * (global/heap) memory cannot alias a fresh local slot, so they are preserved. */
+static void iload_kill_for_direct_stack_store(IRSSAOptCtx *ctx, GLoadState *st,
+                                              int store_off, int store_size,
+                                              int store_off_exact)
+{
+  int store_lo = store_off, store_hi = store_off + store_size;
+  for (int k = 0; k < st->ilcount; k++) {
+    const ILoadEntry *e = &st->iloads[k];
+    int kill = 0;
+    int etype = TCCIR_DECODE_VREG_TYPE(e->base_vr);
+    if (etype == TCCIR_VREG_TYPE_TEMP) {
+      int base_off = ssa_opt_resolve_lea_stackloc(ctx, e->base_vr);
+      if (base_off != INT_MIN) {
+        if (!store_off_exact) {
+          /* Store offset is a placeholder (named-local slot form); we can't
+           * compare byte ranges, so any stack-resolving base may alias. */
+          kill = 1;
+        } else {
+          int elo = base_off + (int)e->idx_imm * (1 << e->scale);
+          int ehi = elo + slot_btype_bytes(e->btype);
+          if (elo < store_hi && ehi > store_lo)
+            kill = 1;
+        }
+      }
+      /* TEMP base that does not resolve to the stack names global/heap
+       * memory — a local stack store cannot reach it. */
+    } else if (etype == TCCIR_VREG_TYPE_VAR) {
+      /* A VAR pointer may hold `&localarray[i]`; a direct stack store can
+       * alias its pointee and we cannot cheaply resolve a (possibly
+       * multi-def) VAR's stack offset.  Invalidate conservatively. */
+      kill = 1;
+    }
+    if (kill) {
+      st->iloads[k] = st->iloads[--st->ilcount];
+      k--;
+    }
+  }
+}
+
 /* resolve_lea_stackloc moved to ssa_opt.c as ssa_opt_resolve_lea_stackloc. */
 #define resolve_lea_stackloc ssa_opt_resolve_lea_stackloc
 
@@ -729,6 +782,21 @@ static int gload_process_block(IRSSAOptCtx *ctx, GLoadState *st_init, int b_init
          * address and forwarded the stale constant into a later deref). */
         if (dest.is_lval || q->op == TCCIR_OP_STORE_INDEXED)
           st->tvcount = 0;
+        /* A direct stack write (`StackLoc[off] <- val`) can alias iload
+         * entries whose base points into the local frame (a VAR pointer
+         * `&arr[i]`, or a TEMP resolving to an overlapping stack slot).  The
+         * store_aliases_globals shortcut above skipped iload handling for
+         * STACKOFF dests, so invalidate those entries here.  Runs before the
+         * no_stack_fwd gate below — correctness, not forwarding. */
+        if (st->ilcount > 0 && dest.is_lval && dest.is_local &&
+            q->op == TCCIR_OP_STORE) {
+          /* A real stack slot encodes its identity in the offset (vreg -1); a
+           * named local carries the VAR vreg and a placeholder offset. */
+          int off_exact = (irop_get_vreg(dest) < 0);
+          iload_kill_for_direct_stack_store(ctx, st, irop_get_stack_offset(dest),
+                                            slot_btype_bytes(irop_get_btype(dest)),
+                                            off_exact);
+        }
         IROperand src = tcc_ir_op_get_src1(ir, q);
         int32_t svr = irop_get_vreg(src);
         /* Direct stack stores are encoded as StackLoc lvalues.  Non-lvalue

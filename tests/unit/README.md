@@ -1,5 +1,10 @@
 # TinyCC Unit-Test Framework Guide
 
+> **Process & conventions live in [`docs/writing_unit_tests.md`](../../docs/writing_unit_tests.md)** —
+> read it first. In particular: never modify production source while writing tests
+> (it breaks parallel tasks), and report every suspected bug in `docs/bugs.md`.
+> This README documents the same framework from the build-mechanics angle.
+
 ## Overview
 
 The `tests/unit/` directory contains **host-native C unit tests** for tinycc internal modules. The goal is to test data structures, algorithms, and utility functions in isolation — without pulling in the full compiler, backend code generators, or QEMU.

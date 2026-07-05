@@ -92,6 +92,20 @@ static MachineOperand mop_spill(int32_t offset, int btype)
   return m;
 }
 
+static MachineOperand mop_spill_u(int32_t offset, int btype)
+{
+  MachineOperand m = mop_spill(offset, btype);
+  m.is_unsigned = 1;
+  return m;
+}
+
+static MachineOperand mop_spill_s(int32_t offset, int btype)
+{
+  MachineOperand m = mop_spill(offset, btype);
+  m.is_unsigned = 0;
+  return m;
+}
+
 static MachineOperand mop_frame_addr(int32_t offset, int btype)
 {
   MachineOperand m;
@@ -384,6 +398,80 @@ UT_TEST(test_block_copy_small_fixed_size_emits_ldm_stm_pair)
   return 0;
 }
 
+/* ------------------------------------------------------------------ sub-word loads/stores */
+
+UT_TEST(test_load_mop_spill_signed_byte_emits_ldrsb)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  tcc_gen_machine_load_mop(mop_spill_s(-8, IROP_BTYPE_INT8), mop_reg(R2, IROP_BTYPE_INT32), TCCIR_OP_LOAD);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_ldrsb_imm(R2, R_FP, 8, 4 /* subtract */, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_load_mop_spill_unsigned_byte_emits_ldrb)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  tcc_gen_machine_load_mop(mop_spill_u(-8, IROP_BTYPE_INT8), mop_reg(R2, IROP_BTYPE_INT32), TCCIR_OP_LOAD);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_ldrb_imm(R2, R_FP, 8, 4 /* subtract */, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_load_mop_spill_signed_halfword_emits_ldrsh)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  tcc_gen_machine_load_mop(mop_spill_s(-8, IROP_BTYPE_INT16), mop_reg(R2, IROP_BTYPE_INT32), TCCIR_OP_LOAD);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_ldrsh_imm(R2, R_FP, 8, 4 /* subtract */, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_load_mop_spill_unsigned_halfword_emits_ldrh)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  tcc_gen_machine_load_mop(mop_spill_u(-8, IROP_BTYPE_INT16), mop_reg(R2, IROP_BTYPE_INT32), TCCIR_OP_LOAD);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_ldrh_imm(R2, R_FP, 8, 4 /* subtract */, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_store_mop_spill_byte_emits_strb)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  tcc_gen_machine_store_mop(mop_spill_u(-8, IROP_BTYPE_INT8), mop_reg(R2, IROP_BTYPE_INT32), TCCIR_OP_STORE);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_strb_imm(R2, R_FP, 8, 4 /* subtract */, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_store_mop_spill_halfword_emits_strh)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  tcc_gen_machine_store_mop(mop_spill_u(-8, IROP_BTYPE_INT16), mop_reg(R2, IROP_BTYPE_INT32), TCCIR_OP_STORE);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_strh_imm(R2, R_FP, 8, 4 /* subtract */, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(gen_mem)
@@ -397,4 +485,10 @@ UT_SUITE(gen_mem)
   UT_RUN(test_store_indexed_reg_base_reg_index_emits_register_offset_str);
   UT_RUN(test_lea_frame_addr_emits_stack_address_computation);
   UT_RUN(test_block_copy_small_fixed_size_emits_ldm_stm_pair);
+  UT_RUN(test_load_mop_spill_signed_byte_emits_ldrsb);
+  UT_RUN(test_load_mop_spill_unsigned_byte_emits_ldrb);
+  UT_RUN(test_load_mop_spill_signed_halfword_emits_ldrsh);
+  UT_RUN(test_load_mop_spill_unsigned_halfword_emits_ldrh);
+  UT_RUN(test_store_mop_spill_byte_emits_strb);
+  UT_RUN(test_store_mop_spill_halfword_emits_strh);
 }

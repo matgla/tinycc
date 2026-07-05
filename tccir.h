@@ -463,6 +463,7 @@ typedef struct TCCIRState
   int named_arg_reg_bytes;
   int named_arg_stack_bytes;
 
+  uint8_t is_variadic : 1;
   uint8_t leaffunc : 1;
   uint8_t tail_call_only : 1;
   uint8_t naked : 1;

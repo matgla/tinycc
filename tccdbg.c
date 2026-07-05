@@ -3208,9 +3208,18 @@ ST_FUNC void tcc_tcov_end(TCCState *s1)
   if (s1->test_coverage == 0)
     return;
   if (tcov_data.last_func_name)
+  {
     section_ptr_add(tcov_section, 1);
+    /* NUL-terminate the preceding function name.  section_ptr_add() only
+       reserves the byte; it does not initialize it. */
+    ((char *)tcov_section->data)[tcov_section->data_offset - 1] = '\0';
+  }
   if (tcov_data.last_file_name)
+  {
     section_ptr_add(tcov_section, 1);
+    /* NUL-terminate the preceding file name. */
+    ((char *)tcov_section->data)[tcov_section->data_offset - 1] = '\0';
+  }
 }
 
 ST_FUNC void tcc_tcov_reset_ind(TCCState *s1)

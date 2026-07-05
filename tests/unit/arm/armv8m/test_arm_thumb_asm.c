@@ -26,10 +26,9 @@
  *    - thumb_generate_opcode_for_data_processing() /
  *      thumb_process_generic_data_op(): the per-mnemonic ALU dispatch table.
  *      These two take a pre-parsed `Operand ops[3]` array and an opcode
- *      token — no lexer needed. `Operand` has no header (it is a private
- *      type defined inside arm-thumb-asm.c), so this file mirrors its exact
- *      layout (enum + struct) to stay ABI-compatible; a mismatch here would
- *      fail loudly (wrong register/immediate decoded) rather than silently.
+ *      token — no lexer needed. `Operand` is a private type defined inside
+ *      arm-thumb-asm.c; since this file now #include's that .c directly (see
+ *      below), the real `Operand`/`th_generic_op_data` types are used as-is.
  *      Oracle: for each dispatch case we independently call the same
  *      th_<mnemonic>_* encoder this dispatcher is documented (by the
  *      switch's own case body) to route to, and assert the two
@@ -62,10 +61,16 @@
  *      side of the branch, so merely calling g() from this TU drags in
  *      symbols this harness doesn't provide.
  *    - thumb_parse_condition_str()/thumb_build_it_mask()/thumb_conditional_opcode()
- *      and the width/condition-suffix helpers (parse_asm_suffix(),
- *      get_base_instruction_name()) are all `static` -- not linkable from
- *      another TU, and thumb_conditional_opcode (the only public-ish path to
- *      thumb_parse_condition_str) itself needs next()/tok.
+ *      and thumb_conditional_opcode() itself needs next()/tok and so
+ *      remains out of reach.
+ *
+ *  NOW COVERED VIA #include (see the include note below): the pure, lexer-free
+ *  `static` helpers -- thumb_build_it_mask(), thumb_parse_condition_str(),
+ *  thumb_operand_is_immediate/register/registerset(), parse_asm_suffix() (dead
+ *  code, characterized), and get_base_instruction_name() -- are now called
+ *  directly. thumb_build_it_mask() correctly handles uppercase IT qualifiers
+ *  (tolower is applied per-char before the 't' comparison); see
+ *  test_it_mask_uppercase_T_matches_lowercase.
  *
  *  One small stub was added to fix a link error surfaced by exercising
  *  thumb_generate_opcode_for_data_processing()'s clz/bfc operand-validation
@@ -86,6 +91,20 @@
 #include "arch/arm/thumb/thop_system.h"
 #include "arch/arm/thumb/thumb.h"
 #include "tcc.h"
+
+/* Include the module under test directly (guide §7 "reaching file-local
+ * static helpers"). arm-thumb-asm.c was moved from UT_MODULE_SRCS (linked)
+ * to UT_COVERAGE_ONLY_SRCS (compiled but not linked) in the Makefile, so no
+ * separate arm-thumb-asm.o is linked into this binary -- this TU provides
+ * every one of its symbols. Bringing the source in-line makes the pure
+ * `static` helpers (thumb_build_it_mask, thumb_parse_condition_str,
+ * thumb_operand_is_*, parse_asm_suffix, get_base_instruction_name) reachable
+ * for direct testing; the previously-covered ST_FUNC/non-static entry points
+ * are unaffected. The main binary's existing stub layer still resolves every
+ * external symbol arm-thumb-asm.c references (it was already linked there),
+ * and --gc-sections drops the tokenizer-driven mnemonic handlers this suite
+ * never calls. */
+#include "arm-thumb-asm.c"
 
 #include "ut.h"
 
@@ -132,61 +151,13 @@ static void setup_armv8m_main(void)
   thumb_parse_token_suffix(399, &reset_base_token);
 }
 
-/* Private Operand type mirror -- see file-header comment. Layout copied
- * verbatim from arm-thumb-asm.c (enum OPT_* + #define OP_* + struct Operand). */
-enum
-{
-  UT_OPT_REG32,
-  UT_OPT_REGSET32,
-  UT_OPT_IM8,
-  UT_OPT_IM8N,
-  UT_OPT_IM32,
-  UT_OPT_VREG32,
-  UT_OPT_VREG64,
-};
-#define UT_OP_REG32 (1 << UT_OPT_REG32)
-#define UT_OP_IM32 (1 << UT_OPT_IM32)
-
-typedef struct Operand
-{
-  uint32_t type;
-  union
-  {
-    uint8_t reg;
-    uint32_t regset;
-    ExprValue e;
-  };
-} Operand;
-
-/* thumb_generate_opcode_for_data_processing() has no header declaration
- * (Operand is private to arm-thumb-asm.c), so forward-declare it here. */
-thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift shift, Operand *ops);
-
-/* thumb_process_generic_data_op() is the helper shared by many data-processing
- * switch cases in arm-thumb-asm.c; expose it directly to test the width/encoding
- * and flags branches without going through the full dispatcher. */
-typedef thumb_opcode (*thumb_generate_generic_imm_opcode)(uint32_t rd, uint32_t rn, uint32_t imm,
-                                                          thumb_flags_behaviour flags, thumb_enforce_encoding encoding);
-typedef thumb_opcode (*thumb_generate_generic_reg_opcode)(uint32_t rd, uint32_t rn, uint32_t rm,
-                                                          thumb_flags_behaviour flags, thumb_shift shift,
-                                                          thumb_enforce_encoding encoding);
-typedef struct th_generic_op_data
-{
-  thumb_generate_generic_imm_opcode generate_imm_opcode;
-  thumb_generate_generic_reg_opcode generate_reg_opcode;
-  int regular_variant_token;
-  int flags_variant_token;
-} th_generic_op_data;
-
-thumb_opcode thumb_process_generic_data_op(th_generic_op_data data, int token, thumb_shift shift, Operand *ops);
-
-/* Other arm-thumb-asm.c helpers that are public (ST_FUNC) but have no
- * externally visible header; exercise them directly below. */
-ST_FUNC void tcc_asm_set_fpu(const char *name);
-ST_FUNC void asm_clobber(uint8_t *clobber_regs, const char *str);
-ST_FUNC void asm_compute_constraints(ASMOperand *operands, int nb_operands, int nb_outputs,
-                                     const uint8_t *clobber_regs, const uint8_t *reserved_regs,
-                                     int *pout_reg);
+/* The `Operand` type, the `th_generic_op_data` dispatch descriptor, the two
+ * generic-op function-pointer typedefs and all of arm-thumb-asm.c's ST_FUNC
+ * entry points now come directly from the `#include "arm-thumb-asm.c"` above.
+ * Only the UT_OP_* aliases below (numerically identical to the module's own
+ * OP_* macros) are kept, so the operand-builder helpers read clearly. */
+#define UT_OP_REG32 OP_REG32
+#define UT_OP_IM32 OP_IM32
 
 /* arm-thumb-asm.c's asm_compute_constraints() references find_constraint() from
  * tccasm.c, which is not linked into the main unit-test binary. Provide a weak
@@ -201,6 +172,23 @@ __attribute__((weak)) int find_constraint(ASMOperand *operands, int nb_operands,
   (void)name;
   (void)pp;
   return -1;
+}
+
+/* arm-thumb-asm.c's asm_gen_code() calls tcc_gen_mach_load_to_reg() /
+ * tcc_gen_mach_store_from_reg() from arm-thumb-gen.c, which is not linked into
+ * the main unit-test binary. Provide weak stubs so asm_gen_code() can be
+ * exercised for its clobber save/restore paths (which do not reach these
+ * helpers); any test that deliberately supplies register operands must provide
+ * a real TCCIRState or expect the no-op stub. */
+__attribute__((weak)) void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op)
+{
+  (void)dest_reg;
+  (void)op;
+}
+__attribute__((weak)) void tcc_gen_mach_store_from_reg(int src_reg, const MachineOperand *op)
+{
+  (void)src_reg;
+  (void)op;
 }
 
 /* Build a 3-way (rd, rn, imm) operand array the way thumb_data_processing_opcode()
@@ -274,6 +262,16 @@ static void make_asm_operand_with_local_sym(ASMOperand *op, SValue *sv, Sym *sym
   sv->r = VT_LOCAL;
   sv->sym = sym;
   sym->r = (unsigned short)forced_reg;
+}
+
+/* Minimal in-memory section setup for g()/gen_le*() tests. */
+static void ut_setup_asm_section(Section *sec, unsigned char *buf, size_t size)
+{
+  memset(sec, 0, sizeof(*sec));
+  sec->data = buf;
+  sec->data_allocated = size;
+  sec->sh_type = SHT_PROGBITS;
+  sec->sh_addralign = 1;
 }
 
 /* ============================================================ */
@@ -1869,6 +1867,13 @@ static void make_sv_reg(SValue *sv, int reg, int type)
   sv->type.t = type;
 }
 
+static void make_sv_reg_bool(SValue *sv, int reg)
+{
+  memset(sv, 0, sizeof(*sv));
+  sv->r = reg;
+  sv->type.t = VT_BOOL;
+}
+
 UT_TEST(test_subst_const_default)
 {
   seed_subst_reg_names();
@@ -1896,17 +1901,15 @@ UT_TEST(test_subst_const_P_modifier)
   return 0;
 }
 
-UT_TEST(test_subst_const_n_modifier_known_bug)
+UT_TEST(test_subst_const_n_modifier)
 {
-  /* Known bug: modifier 'n' should print a negated immediate (e.g. #-42),
-     but the implementation both omits the leading '#' (because the guard
-     `modifier != 'n'` suppresses it) and fails to use the negated `val` it
-     computed, printing sv->c.i unchanged. Current output is therefore the
-     bare positive number. Flip the assertion to "#-42" once fixed. */
+  /* GCC's 'n' asm operand modifier prints a negated immediate: for 42 the
+     expected output is "#-42" -- the leading '#' is emitted (it is only
+     suppressed for 'c'/'P') and the value is the negated `val`. */
   seed_subst_reg_names();
   SValue sv;
   make_sv_const(&sv, 42);
-  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 'n'), "42");
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 'n'), "#-42");
   return 0;
 }
 
@@ -2031,6 +2034,834 @@ UT_TEST(test_subst_reg_k_modifier)
   return 0;
 }
 
+UT_TEST(test_subst_reg_bool_type)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_reg_bool(&sv, 2);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "r2");
+  return 0;
+}
+
+UT_TEST(test_subst_local_positive_offset)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_local(&sv, 24);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "[fp,#24]");
+  return 0;
+}
+
+UT_TEST(test_subst_const_negative)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_const(&sv, -42);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "#-42");
+  return 0;
+}
+
+UT_TEST(test_subst_reg_high)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_reg(&sv, 15, VT_INT);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "r15");
+  return 0;
+}
+
+UT_TEST(test_subst_lval_reg_high)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_lval_reg(&sv, 15);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "[r15]");
+  return 0;
+}
+
+UT_TEST(test_subst_const_sym_negative_offset)
+{
+  /* A symbol reference with a negative offset renders as "#name-N": the '+'
+   * separator is emitted only for a non-negative offset, since a negative
+   * offset already carries its own '-' from the %d formatting. */
+  seed_subst_reg_names();
+  SValue sv;
+  Sym sym;
+  memset(&sym, 0, sizeof(sym));
+  sym.v = set_special_reg_tok("myvar");
+  make_sv_const_sym(&sv, &sym, -5);
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "#myvar-5");
+  return 0;
+}
+
+/* ============================================================ */
+/*  g() / gen_le16() / gen_le32() / gen_expr32()                  */
+/* ============================================================ */
+
+UT_TEST(test_g_emits_byte)
+{
+  Section sec;
+  unsigned char buf[64];
+  Section *saved_sec = cur_text_section;
+  int saved_ind = ind;
+  int saved_nocode = nocode_wanted;
+
+  ut_setup_asm_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+  nocode_wanted = 0;
+  memset(buf, 0, sizeof(buf));
+
+  g(0xab);
+  UT_ASSERT_EQ(buf[0], 0xab);
+  UT_ASSERT_EQ(ind, 1);
+
+  cur_text_section = saved_sec;
+  ind = saved_ind;
+  nocode_wanted = saved_nocode;
+  return 0;
+}
+
+UT_TEST(test_g_nocode_wanted_is_noop)
+{
+  Section sec;
+  unsigned char buf[64];
+  Section *saved_sec = cur_text_section;
+  int saved_ind = ind;
+  int saved_nocode = nocode_wanted;
+
+  ut_setup_asm_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+  nocode_wanted = 1;
+  buf[0] = 0x55;
+
+  g(0xab);
+  UT_ASSERT_EQ(buf[0], 0x55);
+  UT_ASSERT_EQ(ind, 0);
+
+  cur_text_section = saved_sec;
+  ind = saved_ind;
+  nocode_wanted = saved_nocode;
+  return 0;
+}
+
+UT_TEST(test_gen_le16_and_gen_le32)
+{
+  Section sec;
+  unsigned char buf[64];
+  Section *saved_sec = cur_text_section;
+  int saved_ind = ind;
+  int saved_nocode = nocode_wanted;
+
+  ut_setup_asm_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+  nocode_wanted = 0;
+  memset(buf, 0, sizeof(buf));
+
+  gen_le16(0x1234);
+  UT_ASSERT_EQ(buf[0], 0x34);
+  UT_ASSERT_EQ(buf[1], 0x12);
+  UT_ASSERT_EQ(ind, 2);
+
+  gen_le32(0x78563412);
+  UT_ASSERT_EQ(buf[2], 0x12);
+  UT_ASSERT_EQ(buf[3], 0x34);
+  UT_ASSERT_EQ(buf[4], 0x56);
+  UT_ASSERT_EQ(buf[5], 0x78);
+  UT_ASSERT_EQ(ind, 6);
+
+  cur_text_section = saved_sec;
+  ind = saved_ind;
+  nocode_wanted = saved_nocode;
+  return 0;
+}
+
+UT_TEST(test_gen_expr32_plain_and_symbolic)
+{
+  Section sec;
+  unsigned char buf[64];
+  Section *saved_sec = cur_text_section;
+  int saved_ind = ind;
+  int saved_nocode = nocode_wanted;
+  Sym sym;
+
+  ut_setup_asm_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+  nocode_wanted = 0;
+  memset(buf, 0, sizeof(buf));
+
+  ExprValue plain = {.v = 0xaabbccdd, .sym = NULL};
+  gen_expr32(&plain);
+  UT_ASSERT_EQ(buf[0], 0xdd);
+  UT_ASSERT_EQ(buf[1], 0xcc);
+  UT_ASSERT_EQ(buf[2], 0xbb);
+  UT_ASSERT_EQ(buf[3], 0xaa);
+  UT_ASSERT_EQ(ind, 4);
+
+  memset(&sym, 0, sizeof(sym));
+  ExprValue symref = {.v = 0, .sym = &sym};
+  gen_expr32(&symref);
+  /* greloca is a no-op stub in this harness; the placeholder is 0. */
+  UT_ASSERT_EQ(buf[4], 0);
+  UT_ASSERT_EQ(buf[5], 0);
+  UT_ASSERT_EQ(buf[6], 0);
+  UT_ASSERT_EQ(buf[7], 0);
+  UT_ASSERT_EQ(ind, 8);
+
+  cur_text_section = saved_sec;
+  ind = saved_ind;
+  nocode_wanted = saved_nocode;
+  return 0;
+}
+
+/* ============================================================ */
+/*  asm_gen_code()                                               */
+/* ============================================================ */
+
+UT_TEST(test_asm_gen_code_prolog_saves_clobbered_callee_regs)
+{
+  Section sec;
+  unsigned char buf[64];
+  Section *saved_sec = cur_text_section;
+  int saved_ind = ind;
+  int saved_nocode = nocode_wanted;
+
+  ut_setup_asm_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+  nocode_wanted = 0;
+  memset(buf, 0, sizeof(buf));
+
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  clobber[4] = 1;
+  clobber[5] = 1;
+  asm_gen_code(NULL, 0, 0, 0, clobber, -1);
+
+  /* STMDB SP!, {r4-r5} -> 0xe92d 0x0030 (little-endian) */
+  UT_ASSERT_EQ(buf[0], 0x2d);
+  UT_ASSERT_EQ(buf[1], 0xe9);
+  UT_ASSERT_EQ(buf[2], 0x30);
+  UT_ASSERT_EQ(buf[3], 0x00);
+  UT_ASSERT_EQ(ind, 4);
+
+  cur_text_section = saved_sec;
+  ind = saved_ind;
+  nocode_wanted = saved_nocode;
+  return 0;
+}
+
+UT_TEST(test_asm_gen_code_epilog_restores_clobbered_callee_regs)
+{
+  Section sec;
+  unsigned char buf[64];
+  Section *saved_sec = cur_text_section;
+  int saved_ind = ind;
+  int saved_nocode = nocode_wanted;
+
+  ut_setup_asm_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+  nocode_wanted = 0;
+  memset(buf, 0, sizeof(buf));
+
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  clobber[6] = 1;
+  clobber[7] = 1;
+  asm_gen_code(NULL, 0, 0, 1, clobber, -1);
+
+  /* LDMIA SP!, {r6-r7} -> 0xe8bd 0x00c0 (little-endian) */
+  UT_ASSERT_EQ(buf[0], 0xbd);
+  UT_ASSERT_EQ(buf[1], 0xe8);
+  UT_ASSERT_EQ(buf[2], 0xc0);
+  UT_ASSERT_EQ(buf[3], 0x00);
+  UT_ASSERT_EQ(ind, 4);
+
+  cur_text_section = saved_sec;
+  ind = saved_ind;
+  nocode_wanted = saved_nocode;
+  return 0;
+}
+
+UT_TEST(test_asm_gen_code_clobber_non_callee_saved_emits_nothing)
+{
+  Section sec;
+  unsigned char buf[64];
+  Section *saved_sec = cur_text_section;
+  int saved_ind = ind;
+  int saved_nocode = nocode_wanted;
+
+  ut_setup_asm_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+  nocode_wanted = 0;
+  memset(buf, 0xab, sizeof(buf));
+
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  clobber[0] = 1;
+  clobber[3] = 1;
+  clobber[12] = 1;
+  asm_gen_code(NULL, 0, 0, 0, clobber, -1);
+
+  /* r0, r3 and r12 are not in reg_saved[], so no save code is emitted. */
+  UT_ASSERT_EQ(ind, 0);
+  UT_ASSERT_EQ(buf[0], 0xab);
+
+  cur_text_section = saved_sec;
+  ind = saved_ind;
+  nocode_wanted = saved_nocode;
+  return 0;
+}
+
+UT_TEST(test_asm_gen_code_prolog_mixed_clobber_only_saves_callee)
+{
+  Section sec;
+  unsigned char buf[64];
+  Section *saved_sec = cur_text_section;
+  int saved_ind = ind;
+  int saved_nocode = nocode_wanted;
+
+  ut_setup_asm_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+  nocode_wanted = 0;
+  memset(buf, 0, sizeof(buf));
+
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  clobber[0] = 1;  /* not callee-saved */
+  clobber[4] = 1;  /* callee-saved */
+  clobber[12] = 1; /* not callee-saved */
+  asm_gen_code(NULL, 0, 0, 0, clobber, -1);
+
+  /* STMDB SP!, {r4} -> 0xe92d 0x0010 (little-endian) */
+  UT_ASSERT_EQ(buf[0], 0x2d);
+  UT_ASSERT_EQ(buf[1], 0xe9);
+  UT_ASSERT_EQ(buf[2], 0x10);
+  UT_ASSERT_EQ(buf[3], 0x00);
+  UT_ASSERT_EQ(ind, 4);
+
+  cur_text_section = saved_sec;
+  ind = saved_ind;
+  nocode_wanted = saved_nocode;
+  return 0;
+}
+
+/* ============================================================ */
+/*  asm_clobber() -- VFP registers                               */
+/* ============================================================ */
+
+UT_TEST(test_clobber_vfp_single_register)
+{
+  uint8_t regs[NB_ASM_REGS] = {0};
+  utb_set_tok_str(TOK_ASM_s12, "s12");
+  asm_clobber(regs, "s12");
+  UT_ASSERT_EQ(regs[12], 1);
+  return 0;
+}
+
+UT_TEST(test_clobber_vfp_double_register)
+{
+  uint8_t regs[NB_ASM_REGS] = {0};
+  utb_set_tok_str(TOK_ASM_d7, "d7");
+  asm_clobber(regs, "d7");
+  UT_ASSERT_EQ(regs[7], 1);
+  return 0;
+}
+
+/* ============================================================ */
+/*  thumb_parse_token_suffix() -- base-name edge cases            */
+/* ============================================================ */
+
+UT_TEST(test_token_suffix_nonexistent_token_returns_al_and_rebases_to_token)
+{
+  /* get_tok_str() only returns NULL in a "should never happen" internal
+   * range, so the null-token branch is not reachable from this harness.
+   * Passing an out-of-range token still yields COND_AL and base_token is
+   * rebuilt from whatever string get_tok_str() produces. */
+  int base_token = -1;
+  int cond = thumb_parse_token_suffix(-1, &base_token);
+  UT_ASSERT_EQ(cond, 14);
+  UT_ASSERT(base_token != -1);
+  return 0;
+}
+
+UT_TEST(test_token_suffix_one_char_base_invalid_condition)
+{
+  int xeq_tok = set_special_reg_tok("xeq");
+  int base_token = -1;
+  int cond = thumb_parse_token_suffix(xeq_tok, &base_token);
+  /* 'x' is not the valid 1-char base ("b"), so the condition is not stripped. */
+  UT_ASSERT_EQ(cond, 14);
+  UT_ASSERT_EQ(base_token, xeq_tok);
+  return 0;
+}
+
+UT_TEST(test_token_suffix_two_char_base_invalid_condition)
+{
+  int abeq_tok = set_special_reg_tok("abeq");
+  int base_token = -1;
+  int cond = thumb_parse_token_suffix(abeq_tok, &base_token);
+  /* "ab" is not a known valid 2-char base, so the suffix is not stripped. */
+  UT_ASSERT_EQ(cond, 14);
+  UT_ASSERT_EQ(base_token, abeq_tok);
+  return 0;
+}
+
+UT_TEST(test_token_suffix_condition_aliases_hs_lo)
+{
+  int base_token = -1;
+  UT_ASSERT_EQ(thumb_parse_token_suffix(set_special_reg_tok("bhs"), &base_token), 2);
+  UT_ASSERT_EQ(thumb_parse_token_suffix(set_special_reg_tok("blo"), &base_token), 3);
+  return 0;
+}
+
+UT_TEST(test_token_suffix_explicit_al_condition)
+{
+  /* Documents the COND_NAMES_COUNT bug (bugs.md): "al" is at index 16 in
+     cond_names[], but COND_NAMES_COUNT is 16, so get_base_instruction_name()
+     never considers it a stripable suffix. "addal" therefore keeps its
+     suffix and base_token resolves back to the original "addal" token,
+     while the condition still defaults to COND_AL (14).
+
+     NOTE: this is deliberately left unfixed -- naively bumping
+     COND_NAMES_COUNT to 17 makes "al" strippable, which then wrongly strips
+     the trailing "al" from real base mnemonics like "smlal"/"umlal"
+     (-> "sml"/"uml"), breaking their assembly.  A correct fix needs
+     instruction-table-aware condition stripping. See docs/bugs.md. */
+  int addal_tok = set_special_reg_tok("addal");
+  int base_token = -1;
+  int cond = thumb_parse_token_suffix(addal_tok, &base_token);
+  UT_ASSERT_EQ(cond, 14);
+  UT_ASSERT_EQ(base_token, addal_tok);
+  return 0;
+}
+
+/* ============================================================ */
+/*  asm_compute_constraints() -- remaining constraint letters      */
+/* ============================================================ */
+
+UT_TEST(test_constraints_p_address_register)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "p", VT_LOCAL);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, 0);
+  return 0;
+}
+
+UT_TEST(test_constraints_l_alias)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "l", VT_LOCAL);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, 0);
+  return 0;
+}
+
+UT_TEST(test_constraints_remaining_immediate_letters)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+
+  make_asm_operand(&op, &sv, "J", VT_CONST);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, -1);
+
+  /* 'K' and 'L' are handled in asm_compute_constraints()'s switch but are
+   * missing from constraint_priority(), so any operand using them aborts
+   * before the main switch.  Documented production bug; do not test here. */
+
+  make_asm_operand(&op, &sv, "n", VT_CONST);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, -1);
+
+  make_asm_operand(&op, &sv, "s", VT_CONST);
+  asm_compute_constraints(&op, 1, 0, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.reg, -1);
+  return 0;
+}
+
+UT_TEST(test_constraints_Q_output_llocal_uses_register)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "Q", VT_LLOCAL);
+  asm_compute_constraints(&op, 1, 1, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.is_memory, 1);
+  UT_ASSERT_EQ(op.reg, 0);
+  return 0;
+}
+
+UT_TEST(test_constraints_g_output_llocal_uses_register)
+{
+  ASMOperand op;
+  SValue sv;
+  uint8_t clobber[NB_ASM_REGS] = {0};
+  uint8_t reserved[NB_ASM_REGS] = {0};
+  int out_reg = -1;
+  make_asm_operand(&op, &sv, "g", VT_LLOCAL);
+  asm_compute_constraints(&op, 1, 1, clobber, reserved, &out_reg);
+  UT_ASSERT_EQ(op.is_memory, 1);
+  UT_ASSERT_EQ(op.reg, 0);
+  return 0;
+}
+
+/* ============================================================ */
+/*  thumb_generate_opcode_for_data_processing() -- remaining paths */
+/* ============================================================ */
+
+UT_TEST(test_dispatch_sub_imm_sp_base)
+{
+  setup_armv8m_main();
+  Operand ops[3];
+  ops_reg_reg_imm(ops, 0, R_SP, 16);
+  thumb_opcode got = thumb_generate_opcode_for_data_processing(TOK_ASM_sub, THUMB_SHIFT_DEFAULT, ops);
+  thumb_opcode want = th_sub_imm(0, R_SP, 16, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_32BIT);
+  UT_ASSERT(opcode_eq(got, want));
+  return 0;
+}
+
+UT_TEST(test_dispatch_subw_imm_sp_base)
+{
+  setup_armv8m_main();
+  Operand ops[3];
+  ops_reg_reg_imm(ops, 0, R_SP, 16);
+  thumb_opcode got = thumb_generate_opcode_for_data_processing(TOK_ASM_subw, THUMB_SHIFT_DEFAULT, ops);
+  thumb_opcode want = th_subw(0, R_SP, 16);
+  UT_ASSERT(opcode_eq(got, want));
+  return 0;
+}
+
+UT_TEST(test_dispatch_sub_reg_non_sp)
+{
+  setup_armv8m_main();
+  Operand ops[3];
+  ops_reg_reg_reg(ops, 0, 1, 2);
+  thumb_opcode got = thumb_generate_opcode_for_data_processing(TOK_ASM_sub, THUMB_SHIFT_DEFAULT, ops);
+  thumb_opcode want = th_sub_reg(0, 1, 2, FLAGS_BEHAVIOUR_BLOCK, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_32BIT);
+  UT_ASSERT(opcode_eq(got, want));
+  return 0;
+}
+
+UT_TEST(test_dispatch_add_reg_with_shift)
+{
+  setup_armv8m_main();
+  Operand ops[3];
+  ops_reg_reg_reg(ops, 0, 1, 2);
+  thumb_shift shift = {.type = THUMB_SHIFT_LSL, .mode = THUMB_SHIFT_IMMEDIATE, .value = 3};
+  thumb_opcode got = thumb_generate_opcode_for_data_processing(TOK_ASM_add, shift, ops);
+  thumb_opcode want = th_add_reg(0, 1, 2, FLAGS_BEHAVIOUR_BLOCK, shift, ENFORCE_ENCODING_32BIT);
+  UT_ASSERT(opcode_eq(got, want));
+  return 0;
+}
+
+UT_TEST(test_dispatch_and_reg_with_shift)
+{
+  setup_armv8m_main();
+  Operand ops[3];
+  ops_reg_reg_reg(ops, 0, 1, 2);
+  thumb_shift shift = {.type = THUMB_SHIFT_LSR, .mode = THUMB_SHIFT_IMMEDIATE, .value = 2};
+  thumb_opcode got = thumb_generate_opcode_for_data_processing(TOK_ASM_and, shift, ops);
+  thumb_opcode want = th_and_reg(0, 1, 2, FLAGS_BEHAVIOUR_BLOCK, shift, ENFORCE_ENCODING_32BIT);
+  UT_ASSERT(opcode_eq(got, want));
+  return 0;
+}
+
+/* ============================================================ */
+/*  thumb_operand_is_immediate/register/registerset()            */
+/*                                                               */
+/*  Pure predicates over an Operand `type` bitmask. Reached      */
+/*  directly now that arm-thumb-asm.c is #include'd (they are    */
+/*  file-local `static`). OP_* macros come from the include.     */
+/* ============================================================ */
+
+UT_TEST(test_operand_is_immediate_true_for_all_imm_kinds)
+{
+  UT_ASSERT(thumb_operand_is_immediate(OP_IM32));
+  UT_ASSERT(thumb_operand_is_immediate(OP_IM8));
+  UT_ASSERT(thumb_operand_is_immediate(OP_IM8N));
+  return 0;
+}
+
+UT_TEST(test_operand_is_immediate_false_for_reg_and_regset)
+{
+  UT_ASSERT(!thumb_operand_is_immediate(OP_REG32));
+  UT_ASSERT(!thumb_operand_is_immediate(OP_VREG32));
+  UT_ASSERT(!thumb_operand_is_immediate(OP_REGSET32));
+  UT_ASSERT(!thumb_operand_is_immediate(0));
+  return 0;
+}
+
+UT_TEST(test_operand_is_register_true_for_reg32_and_combined_mask)
+{
+  UT_ASSERT(thumb_operand_is_register(OP_REG32));
+  /* OP_REG is the combined REG32|VREG32|VREG64 mask; the predicate compares
+     for exact equality (`type != OP_REG`), so the combined value also reads
+     as a register. */
+  UT_ASSERT(thumb_operand_is_register(OP_REG));
+  return 0;
+}
+
+UT_TEST(test_operand_is_register_false_for_vfp_and_imm)
+{
+  /* Characterization: the predicate is an *equality* test against OP_REG32
+     and the combined OP_REG mask, NOT a bitwise `type & OP_REG`. A lone VFP
+     single/double operand type (OP_VREG32 / OP_VREG64) is therefore NOT
+     treated as a register here. That is benign for its only callers (core
+     data-processing dispatch, which never sees a VFP operand), but the test
+     pins the exact-equality semantics so a future refactor to a bitmask test
+     is a visible change. */
+  UT_ASSERT(!thumb_operand_is_register(OP_VREG32));
+  UT_ASSERT(!thumb_operand_is_register(OP_VREG64));
+  UT_ASSERT(!thumb_operand_is_register(OP_IM32));
+  UT_ASSERT(!thumb_operand_is_register(OP_REGSET32));
+  UT_ASSERT(!thumb_operand_is_register(0));
+  return 0;
+}
+
+UT_TEST(test_operand_is_registerset_only_true_for_regset32)
+{
+  UT_ASSERT(thumb_operand_is_registerset(OP_REGSET32));
+  UT_ASSERT(!thumb_operand_is_registerset(OP_REG32));
+  UT_ASSERT(!thumb_operand_is_registerset(OP_IM32));
+  UT_ASSERT(!thumb_operand_is_registerset(OP_VREGSETS32)); /* combined VREG32|REGSET32 */
+  UT_ASSERT(!thumb_operand_is_registerset(0));
+  return 0;
+}
+
+/* ============================================================ */
+/*  thumb_parse_condition_str()                                  */
+/*                                                               */
+/*  Static string->condition-code helper used by the IT-block    */
+/*  path. strncmp(str, "xx", 2) so any longer suffix still       */
+/*  matches on its first two chars.                              */
+/* ============================================================ */
+
+UT_TEST(test_parse_condition_str_all_known_codes)
+{
+  UT_ASSERT_EQ(thumb_parse_condition_str("eq"), 0);
+  UT_ASSERT_EQ(thumb_parse_condition_str("ne"), 1);
+  UT_ASSERT_EQ(thumb_parse_condition_str("cs"), 2);
+  UT_ASSERT_EQ(thumb_parse_condition_str("cc"), 3);
+  UT_ASSERT_EQ(thumb_parse_condition_str("mi"), 4);
+  UT_ASSERT_EQ(thumb_parse_condition_str("pl"), 5);
+  UT_ASSERT_EQ(thumb_parse_condition_str("vs"), 6);
+  UT_ASSERT_EQ(thumb_parse_condition_str("vc"), 7);
+  UT_ASSERT_EQ(thumb_parse_condition_str("hi"), 8);
+  UT_ASSERT_EQ(thumb_parse_condition_str("ls"), 9);
+  UT_ASSERT_EQ(thumb_parse_condition_str("ge"), 0xa);
+  UT_ASSERT_EQ(thumb_parse_condition_str("lt"), 0xb);
+  UT_ASSERT_EQ(thumb_parse_condition_str("gt"), 0xc);
+  UT_ASSERT_EQ(thumb_parse_condition_str("le"), 0xd);
+  return 0;
+}
+
+UT_TEST(test_parse_condition_str_prefix_match)
+{
+  /* Only the first two characters are compared, so a trailing width/garbage
+     suffix does not change the decoded condition. */
+  UT_ASSERT_EQ(thumb_parse_condition_str("eq.w"), 0);
+  UT_ASSERT_EQ(thumb_parse_condition_str("gtfoo"), 0xc);
+  return 0;
+}
+
+UT_TEST(test_parse_condition_str_unknown_and_aliases_default_to_al)
+{
+  /* "al" and the carry aliases hs/lo are NOT special-cased here (unlike
+     cond_names[] used by thumb_parse_token_suffix); they fall through to the
+     default 0xe (COND_AL). */
+  UT_ASSERT_EQ(thumb_parse_condition_str("al"), 0xe);
+  UT_ASSERT_EQ(thumb_parse_condition_str("hs"), 0xe);
+  UT_ASSERT_EQ(thumb_parse_condition_str("lo"), 0xe);
+  UT_ASSERT_EQ(thumb_parse_condition_str("zz"), 0xe);
+  return 0;
+}
+
+/* ============================================================ */
+/*  thumb_build_it_mask()                                        */
+/*                                                               */
+/*  Builds the 4-bit IT firstcond/mask from an "it{t,e}..."      */
+/*  pattern string. pattern[0..1] == "it" is skipped; indices    */
+/*  2..5 are the T/E qualifiers.                                 */
+/* ============================================================ */
+
+UT_TEST(test_it_mask_plain_it_is_condition_independent)
+{
+  /* "it": index 2 is the NUL terminator, so only the trailing "1" bit is set:
+     mask = 1 << (5-2) = 0x08, regardless of the condition LSB. */
+  UT_ASSERT_EQ(thumb_build_it_mask("it", 0), 0x08);
+  UT_ASSERT_EQ(thumb_build_it_mask("it", 1), 0x08);
+  return 0;
+}
+
+UT_TEST(test_it_mask_itt_lowercase)
+{
+  /* "itt": index2='t' -> cond<<3, index3=NUL -> 1<<2.
+     cond=1 -> 0x08|0x04 = 0x0c ; cond=0 -> 0x04. */
+  UT_ASSERT_EQ(thumb_build_it_mask("itt", 1), 0x0c);
+  UT_ASSERT_EQ(thumb_build_it_mask("itt", 0), 0x04);
+  return 0;
+}
+
+UT_TEST(test_it_mask_ite_lowercase)
+{
+  /* "ite" = {i,t,e,NUL}: the qualifier scan starts at index 2 ('e'), then
+     index 3 is the NUL terminator.
+       idx2 'e' -> not 't' -> (!cond)<<(5-2)=(!cond)<<3
+       idx3 NUL -> 1<<(5-3)=1<<2 = 0x04
+     cond=1 -> 0 | 0x04 = 0x04 ; cond=0 -> 0x08 | 0x04 = 0x0c. */
+  UT_ASSERT_EQ(thumb_build_it_mask("ite", 1), 0x04);
+  UT_ASSERT_EQ(thumb_build_it_mask("ite", 0), 0x0c);
+  return 0;
+}
+
+UT_TEST(test_it_mask_uppercase_T_matches_lowercase)
+{
+  /* thumb_build_it_mask() uses `tolower(pattern[i]) == 't'`, so an uppercase
+     'T' qualifier encodes identically to lowercase 't'.  "ITT" and "itt" both
+     yield 0x0c for cond=1. */
+  UT_ASSERT_EQ(thumb_build_it_mask("ITT", 1), 0x0c);
+  UT_ASSERT_EQ(thumb_build_it_mask("itt", 1), 0x0c);
+  return 0;
+}
+
+/* ============================================================ */
+/*  get_base_instruction_name()                                  */
+/*                                                               */
+/*  Static helper: strips a trailing condition code and/or       */
+/*  .w/.n width qualifier from a mnemonic token string, honoring  */
+/*  the "valid base length" rules (1-char only "b", 2-char only   */
+/*  "bx"/"bl", 3+ always valid).                                  */
+/* ============================================================ */
+
+static const char *base_name_of(const char *token_str)
+{
+  static char buf[32];
+  memset(buf, 0, sizeof(buf));
+  get_base_instruction_name(token_str, buf, sizeof(buf));
+  return buf;
+}
+
+UT_TEST(test_base_name_plain_mnemonic)
+{
+  UT_ASSERT_STREQ(base_name_of("add"), "add");
+  UT_ASSERT_STREQ(base_name_of("mov"), "mov");
+  return 0;
+}
+
+UT_TEST(test_base_name_strips_condition)
+{
+  UT_ASSERT_STREQ(base_name_of("addeq"), "add");
+  UT_ASSERT_STREQ(base_name_of("movne"), "mov");
+  return 0;
+}
+
+UT_TEST(test_base_name_strips_condition_and_width)
+{
+  UT_ASSERT_STREQ(base_name_of("addeq.w"), "add");
+  UT_ASSERT_STREQ(base_name_of("sub.n"), "sub");
+  return 0;
+}
+
+UT_TEST(test_base_name_one_char_base_b)
+{
+  /* candidate_len==1 is only accepted when the char is 'b'. */
+  UT_ASSERT_STREQ(base_name_of("beq"), "b");
+  return 0;
+}
+
+UT_TEST(test_base_name_two_char_base_bx_bl)
+{
+  /* candidate_len==2 is accepted only for the known 2-char bases bx/bl. */
+  UT_ASSERT_STREQ(base_name_of("bxeq"), "bx");
+  UT_ASSERT_STREQ(base_name_of("bleq"), "bl");
+  return 0;
+}
+
+UT_TEST(test_base_name_invalid_one_char_base_not_stripped)
+{
+  /* "xeq": stripping "eq" would leave a 1-char base "x" which is not the
+     allowed "b", so the condition is NOT stripped -- the whole token is the
+     base. */
+  UT_ASSERT_STREQ(base_name_of("xeq"), "xeq");
+  return 0;
+}
+
+UT_TEST(test_base_name_invalid_two_char_base_not_stripped)
+{
+  /* "abeq": candidate base "ab" is not in valid_2char_bases -> not stripped. */
+  UT_ASSERT_STREQ(base_name_of("abeq"), "abeq");
+  return 0;
+}
+
+UT_TEST(test_base_name_width_only_no_condition)
+{
+  /* A width qualifier with no condition code: base is everything before '.'. */
+  UT_ASSERT_STREQ(base_name_of("add.w"), "add");
+  return 0;
+}
+
+/* ============================================================ */
+/*  parse_asm_suffix()  -- dead helper, characterized for record */
+/*                                                               */
+/*  parse_asm_suffix() has no caller in arm-thumb-asm.c (it is    */
+/*  superseded by thumb_parse_token_suffix()). These tests pin    */
+/*  its actual behavior: it skips ALL leading alphabetic chars    */
+/*  as the "base", so a condition code that is not preceded by a  */
+/*  non-alpha separator is consumed as part of the base and never */
+/*  detected -- exactly why it was retired.                       */
+/* ============================================================ */
+
+UT_TEST(test_parse_asm_suffix_all_alpha_returns_zero)
+{
+  thumb_asm_suffix s;
+  /* "addeq" is all letters -> base scan reaches the NUL, function returns 0
+     with no suffix and condition left at the COND_AL default. */
+  int n = parse_asm_suffix("addeq", &s);
+  UT_ASSERT_EQ(n, 0);
+  UT_ASSERT_EQ(s.condition, COND_AL);
+  UT_ASSERT_EQ(s.has_suffix, 0);
+  return 0;
+}
+
+UT_TEST(test_parse_asm_suffix_width_wide)
+{
+  thumb_asm_suffix s;
+  /* "add.w": base "add", then the '.' path sets a WIDE width qualifier. The
+     condition is not present, so it stays COND_AL. Returned length counts the
+     '.' and the 'w' (2). */
+  int n = parse_asm_suffix("add.w", &s);
+  UT_ASSERT_EQ(n, 2);
+  UT_ASSERT_EQ(s.width, WIDTH_WIDE);
+  UT_ASSERT_EQ(s.has_suffix, 1);
+  return 0;
+}
+
+UT_TEST(test_parse_asm_suffix_width_narrow)
+{
+  thumb_asm_suffix s;
+  int n = parse_asm_suffix("sub.n", &s);
+  UT_ASSERT_EQ(n, 2);
+  UT_ASSERT_EQ(s.width, WIDTH_NARROW);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(arm_thumb_asm)
@@ -2067,6 +2898,11 @@ UT_SUITE(arm_thumb_asm)
   UT_RUN(test_token_suffix_three_char_base_with_condition);
   UT_RUN(test_token_suffix_width_only_on_two_char_base);
   UT_RUN(test_token_suffix_remaining_condition_codes);
+  UT_RUN(test_token_suffix_nonexistent_token_returns_al_and_rebases_to_token);
+  UT_RUN(test_token_suffix_one_char_base_invalid_condition);
+  UT_RUN(test_token_suffix_two_char_base_invalid_condition);
+  UT_RUN(test_token_suffix_condition_aliases_hs_lo);
+  UT_RUN(test_token_suffix_explicit_al_condition);
 
   /* tcc_asm_set_fpu */
   UT_RUN(test_fpu_enable_vfpv4_sp_d16);
@@ -2080,6 +2916,14 @@ UT_SUITE(arm_thumb_asm)
   UT_RUN(test_clobber_register_sets_bit);
   UT_RUN(test_clobber_alias_lr);
   UT_RUN(test_clobber_memory_cc_flags_are_noops);
+  UT_RUN(test_clobber_vfp_single_register);
+  UT_RUN(test_clobber_vfp_double_register);
+
+  /* asm_gen_code */
+  UT_RUN(test_asm_gen_code_prolog_saves_clobbered_callee_regs);
+  UT_RUN(test_asm_gen_code_epilog_restores_clobbered_callee_regs);
+  UT_RUN(test_asm_gen_code_clobber_non_callee_saved_emits_nothing);
+  UT_RUN(test_asm_gen_code_prolog_mixed_clobber_only_saves_callee);
 
   /* asm_compute_constraints */
   UT_RUN(test_constraints_single_output_register);
@@ -2103,6 +2947,11 @@ UT_SUITE(arm_thumb_asm)
   UT_RUN(test_constraints_g_input_no_register);
   UT_RUN(test_constraints_X_input_no_register);
   UT_RUN(test_constraints_Q_input_no_register);
+  UT_RUN(test_constraints_p_address_register);
+  UT_RUN(test_constraints_l_alias);
+  UT_RUN(test_constraints_remaining_immediate_letters);
+  UT_RUN(test_constraints_Q_output_llocal_uses_register);
+  UT_RUN(test_constraints_g_output_llocal_uses_register);
 
   /* thumb_generate_opcode_for_data_processing (direct switch cases) */
   UT_RUN(test_dispatch_adds_imm_sets_flags);
@@ -2115,6 +2964,11 @@ UT_SUITE(arm_thumb_asm)
   UT_RUN(test_dispatch_sub_reg_sp_base);
   UT_RUN(test_dispatch_subw_imm);
   UT_RUN(test_dispatch_sub_imm_unconditional_forces_32bit);
+  UT_RUN(test_dispatch_sub_imm_sp_base);
+  UT_RUN(test_dispatch_subw_imm_sp_base);
+  UT_RUN(test_dispatch_sub_reg_non_sp);
+  UT_RUN(test_dispatch_add_reg_with_shift);
+  UT_RUN(test_dispatch_and_reg_with_shift);
   UT_RUN(test_dispatch_mov_imm_block_flags);
   UT_RUN(test_dispatch_movs_imm_sets_flags);
   UT_RUN(test_dispatch_movw_imm_forces_32bit);
@@ -2172,7 +3026,7 @@ UT_SUITE(arm_thumb_asm)
   UT_RUN(test_subst_const_default);
   UT_RUN(test_subst_const_c_modifier);
   UT_RUN(test_subst_const_P_modifier);
-  UT_RUN(test_subst_const_n_modifier_known_bug);
+  UT_RUN(test_subst_const_n_modifier);
   UT_RUN(test_subst_const_lval_no_hash);
   UT_RUN(test_subst_const_sym_zero_offset);
   UT_RUN(test_subst_const_sym_nonzero_offset);
@@ -2185,4 +3039,49 @@ UT_SUITE(arm_thumb_asm)
   UT_RUN(test_subst_reg_b_modifier);
   UT_RUN(test_subst_reg_w_modifier);
   UT_RUN(test_subst_reg_k_modifier);
+  UT_RUN(test_subst_reg_bool_type);
+  UT_RUN(test_subst_local_positive_offset);
+  UT_RUN(test_subst_const_negative);
+  UT_RUN(test_subst_reg_high);
+  UT_RUN(test_subst_lval_reg_high);
+  UT_RUN(test_subst_const_sym_negative_offset);
+
+  /* g() / gen_le16() / gen_le32() / gen_expr32() */
+  UT_RUN(test_g_emits_byte);
+  UT_RUN(test_g_nocode_wanted_is_noop);
+  UT_RUN(test_gen_le16_and_gen_le32);
+  UT_RUN(test_gen_expr32_plain_and_symbolic);
+
+  /* thumb_operand_is_immediate/register/registerset (static predicates) */
+  UT_RUN(test_operand_is_immediate_true_for_all_imm_kinds);
+  UT_RUN(test_operand_is_immediate_false_for_reg_and_regset);
+  UT_RUN(test_operand_is_register_true_for_reg32_and_combined_mask);
+  UT_RUN(test_operand_is_register_false_for_vfp_and_imm);
+  UT_RUN(test_operand_is_registerset_only_true_for_regset32);
+
+  /* thumb_parse_condition_str (static) */
+  UT_RUN(test_parse_condition_str_all_known_codes);
+  UT_RUN(test_parse_condition_str_prefix_match);
+  UT_RUN(test_parse_condition_str_unknown_and_aliases_default_to_al);
+
+  /* thumb_build_it_mask (static; uppercase-qualifier bug pinned) */
+  UT_RUN(test_it_mask_plain_it_is_condition_independent);
+  UT_RUN(test_it_mask_itt_lowercase);
+  UT_RUN(test_it_mask_ite_lowercase);
+  UT_RUN(test_it_mask_uppercase_T_matches_lowercase);
+
+  /* get_base_instruction_name (static) */
+  UT_RUN(test_base_name_plain_mnemonic);
+  UT_RUN(test_base_name_strips_condition);
+  UT_RUN(test_base_name_strips_condition_and_width);
+  UT_RUN(test_base_name_one_char_base_b);
+  UT_RUN(test_base_name_two_char_base_bx_bl);
+  UT_RUN(test_base_name_invalid_one_char_base_not_stripped);
+  UT_RUN(test_base_name_invalid_two_char_base_not_stripped);
+  UT_RUN(test_base_name_width_only_no_condition);
+
+  /* parse_asm_suffix (static, dead helper -- characterized) */
+  UT_RUN(test_parse_asm_suffix_all_alpha_returns_zero);
+  UT_RUN(test_parse_asm_suffix_width_wide);
+  UT_RUN(test_parse_asm_suffix_width_narrow);
 }

@@ -73,6 +73,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/ir/dump.c \
 	$(TOP)/ir/stack.c \
 	$(TOP)/ir/ssa.c \
+	$(TOP)/ir/opt/ssa_opt_gvn.c \
 	$(TOP)/svalue.c \
 	$(TOP)/arch/arm/arm.c \
 	$(TOP)/arch/arm/thumb/thumb.c \
@@ -158,7 +159,16 @@ UT_MODULE_SRCS := \
 		$(TOP)/tccyaff.c \
 		$(TOP)/ir/opt_switch_data.c
 
-UT_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR)/%.o,$(UT_MODULE_SRCS))
+# arm-thumb-asm.c stays in UT_MODULE_SRCS because the backend (UT2) and ssaopt
+# (UT11) binaries link it for real (their test_gen_*/ssa suites need g()/
+# gen_le16()/... ). But the MAIN binary's test_arm_thumb_asm.c #include's
+# arm-thumb-asm.c directly (to reach its file-local `static` helpers), so its
+# object must NOT also be linked into the main binary -- that would be a
+# multiple-definition error for every ST_FUNC it exports. Filter it out of the
+# main link only; UT2/UT11 re-pattern UT_MODULE_SRCS into their own build dirs
+# and are unaffected.
+UT_MODULE_OBJS := $(filter-out $(BUILD_DIR)/arm-thumb-asm.o,\
+	$(patsubst $(TOP)/%.c,$(BUILD_DIR)/%.o,$(UT_MODULE_SRCS)))
 
 # Product sources that are never *linked* into the UT binary: each one's
 # functions duplicate a name already provided by the stub layer below
@@ -179,9 +189,20 @@ UT_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR)/%.o,$(UT_MODULE_SRCS))
 UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/arm-thumb-gen.c \
 	$(TOP)/arm-thumb-callsite.c \
+	$(TOP)/ir/opt/ssa_opt.c \
+	$(TOP)/ir/opt/ssa_opt_branch.c \
+	$(TOP)/ir/opt/ssa_opt_cmp_eq.c \
+	$(TOP)/ir/opt/ssa_opt_cprop.c \
+	$(TOP)/ir/opt/ssa_opt_dce.c \
+	$(TOP)/ir/opt/ssa_opt_dead_loop.c \
+	$(TOP)/ir/opt/ssa_opt_fold.c \
+	$(TOP)/ir/opt/ssa_opt_load_cse.c \
+	$(TOP)/ir/opt/ssa_opt_narrow.c \
+	$(TOP)/ir/opt/ssa_opt_phi.c \
+	$(TOP)/ir/opt/ssa_opt_reassoc.c \
+	$(TOP)/ir/opt/ssa_opt_sccp.c \
+	$(TOP)/ir/opt/ssa_opt_strength.c \
 	$(TOP)/tccgen.c \
-	$(TOP)/tccpp.c \
-	$(TOP)/tccelf.c \
 	$(TOP)/tccdbg.c \
 	$(TOP)/tccasm.c \
 	$(TOP)/tccopt.c \
@@ -268,6 +289,7 @@ UT_LOCAL_SRCS := \
 	test_opt_redundant_assign.c \
 	test_opt_nonneg_fold.c \
 	test_opt_return_reuse.c \
+	test_opt_uninit.c \
 	test_opt_dead_vla.c \
 	test_opt_xform.c \
 	test_opt_switch_collapse.c \
@@ -367,6 +389,7 @@ coverage:
 	$(MAKE) COVERAGE=1 $(UT8_BIN)
 	$(MAKE) COVERAGE=1 $(UT9_BIN)
 	$(MAKE) COVERAGE=1 $(UT10_BIN)
+	$(MAKE) COVERAGE=1 $(UT11_BIN)
 	./$(UT_BIN)
 	./$(UT2_BIN)
 	./$(UT3_BIN)
@@ -377,6 +400,7 @@ coverage:
 	./$(UT8_BIN)
 	./$(UT9_BIN)
 	./$(UT10_BIN)
+	./$(UT11_BIN)
 	@mkdir -p $(COV_DIR)
 	gcovr --root $(TOP) \
 		$(CURDIR)/$(BUILD_DIR) \
@@ -389,6 +413,7 @@ coverage:
 		$(CURDIR)/$(BUILD_DIR8) \
 		$(CURDIR)/$(BUILD_DIR9) \
 		$(CURDIR)/$(BUILD_DIR10) \
+		$(CURDIR)/$(BUILD_DIR11) \
 		$(GCOVR_FILTERS) \
 		--exclude-unreachable-branches \
 		--exclude-throw-branches \
@@ -495,6 +520,7 @@ UT2_LOCAL_SRCS := \
 	test_gen_callsite.c \
 	test_gen_prolog.c \
 	test_gen_setjmp.c \
+	test_gen_mach_operand.c \
 	codegen_backend_stubs.c \
 	elfsec_stubs.c \
 	ra_link_stubs.c \
@@ -571,9 +597,13 @@ $(COV_STAMP3):
 	@rm -f $(BUILD_DIR3)/.coverage-*
 	@touch $@
 
-UT3_MODULE_SRCS := \
-	$(TOP)/tccgen.c
-UT3_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR3)/%.o,$(UT3_MODULE_SRCS))
+# tccgen.c is NOT linked as a separate object here: test_tccgen.c #includes it
+# directly (the test_tccdbg.c/test_tccasm.c pattern) so the suite can exercise
+# tccgen.c's file-local `static` helpers, not just its ST_FUNC surface. Linking
+# tccgen.o too would be a multiple-definition error. Its coverage is attributed
+# to the test_tccgen.o TU (gcov tracks the #included source file).
+UT3_MODULE_SRCS :=
+UT3_MODULE_OBJS :=
 
 UT3_LOCAL_SRCS := \
 	test_main3.c \
@@ -1121,12 +1151,120 @@ $(BUILD_DIR10)/%.o: $(TOP)/%.c Makefile $(COV_STAMP10)
 -include $(UT10_DEPS)
 
 # ---------------------------------------------------------------------------
+# UT11 — SSA optimizer family. Links the REAL ir/opt/ssa_opt*.c on top of the
+# shared IR module set, so the passes run against real SSA/CFG/vinfo built by
+# ir/ssa.c + ir/cfg.c (already in UT_MODULE_SRCS).
+# ---------------------------------------------------------------------------
+
+BUILD_DIR11 := build_ssaopt
+
+COV_STAMP11 := $(BUILD_DIR11)/.coverage-$(COVERAGE)
+
+$(COV_STAMP11):
+	@mkdir -p $(dir $@)
+	@rm -f $(BUILD_DIR11)/.coverage-*
+	@touch $@
+
+UT11_MODULE_SRCS := \
+	$(UT_MODULE_SRCS) \
+	$(TOP)/libtcc.c \
+	$(TOP)/ir/opt/ssa_opt.c \
+	$(TOP)/ir/opt/ssa_opt_cprop.c \
+	$(TOP)/ir/opt/ssa_opt_dce.c \
+	$(TOP)/ir/opt/ssa_opt_fold.c \
+	$(TOP)/ir/opt/ssa_opt_sccp.c \
+	$(TOP)/ir/opt/ssa_opt_load_cse.c \
+	$(TOP)/ir/opt/ssa_opt_branch.c \
+	$(TOP)/ir/opt/ssa_opt_cmp_eq.c \
+	$(TOP)/ir/opt/ssa_opt_reassoc.c \
+	$(TOP)/ir/opt/ssa_opt_narrow.c \
+	$(TOP)/ir/opt/ssa_opt_phi.c \
+	$(TOP)/ir/opt/ssa_opt_strength.c \
+	$(TOP)/ir/opt/ssa_opt_dead_loop.c
+	# ssa_opt_gvn.c already in UT_MODULE_SRCS
+
+UT11_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR11)/%.o,$(UT11_MODULE_SRCS))
+
+UT11_LOCAL_SRCS := \
+	test_main11.c \
+	test_ssa_build.c \
+	test_ssa_opt_usedef.c \
+	test_ssa_opt_phi.c \
+	test_ssa_opt_strength.c \
+	test_ssa_opt_narrow.c \
+	test_ssa_opt_reassoc.c \
+	test_ssa_opt_cmp_eq.c \
+	test_ssa_opt_fold.c \
+	test_ssa_opt_gvn.c \
+	test_ssa_opt_branch.c \
+	test_ssa_opt_dce.c \
+	test_ssa_opt_dead_loop.c \
+	test_ssa_opt_load_cse.c \
+	test_ssa_opt_cprop.c \
+	test_ssa_opt_sccp.c \
+	test_ssa_metamorphic.c \
+	stubs.c \
+	elfsec_stubs.c \
+	tcc_state_stub.c
+UT11_LOCAL_OBJS := $(patsubst %.c,$(BUILD_DIR11)/%.o,$(UT11_LOCAL_SRCS))
+
+UT11_OBJS := $(UT11_LOCAL_OBJS) $(UT11_MODULE_OBJS)
+UT11_DEPS := $(UT11_OBJS:.o=.d)
+UT11_BIN := $(BUILD_DIR11)/run_unit_tests_ssaopt
+
+COV_DIR11 := $(BUILD_DIR11)/coverage
+
+.PHONY: run-ssaopt coverage-ssaopt
+run-ssaopt: $(UT11_BIN)
+	./$(UT11_BIN)
+
+coverage-ssaopt:
+	rm -rf $(BUILD_DIR11)
+	$(MAKE) COVERAGE=1 $(UT11_BIN)
+	./$(UT11_BIN)
+	@mkdir -p $(COV_DIR11)
+	gcovr --root $(TOP) $(CURDIR)/$(BUILD_DIR11) \
+		$(GCOVR_FILTERS) \
+		--exclude-unreachable-branches \
+		--exclude-throw-branches \
+		--sort uncovered-percent \
+		--txt $(COV_DIR11)/coverage.txt \
+		--html-details $(COV_DIR11)/index.html \
+		--print-summary
+	@echo ""
+	@echo "SSA optimizer coverage report:"
+	@echo "  text: $(CURDIR)/$(COV_DIR11)/coverage.txt"
+	@echo "  html: $(CURDIR)/$(COV_DIR11)/index.html"
+
+$(UT11_BIN): $(UT11_OBJS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -Wl,--gc-sections $(UT_COV_LDFLAGS) -o $@ $^
+
+# Local source files → build_ssaopt/*.o.  Compiled with -DUT_SSA_OPT_REAL so
+# ra_link_stubs.c skips its ssa_opt no-ops (the real ssa_opt*.c provides them).
+$(BUILD_DIR11)/%.o: %.c $(UT_ROOT)/ut.h Makefile $(COV_STAMP11)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(UT_CFLAGS) -DUT_SSA_OPT_REAL $(UT_DEPFLAGS) -c $< -o $@
+
+# ir/opt/ssa_opt*.c — build from the tinycc source tree, preserve layout.
+$(BUILD_DIR11)/ir/%.o: $(TOP)/ir/%.c Makefile $(COV_STAMP11)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(UT_CFLAGS) -DUT_SSA_OPT_REAL $(UT_DEPFLAGS) -c $< -o $@
+
+# Other top-level tinycc sources compiled straight to build_ssaopt/*.o.
+$(BUILD_DIR11)/%.o: $(TOP)/%.c Makefile $(COV_STAMP11)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(UT_CFLAGS) -DUT_SSA_OPT_REAL $(UT_DEPFLAGS) -c $< -o $@
+
+-include $(UT11_DEPS)
+
+# ---------------------------------------------------------------------------
 # Aggregate targets (defined here so all UT*_BIN variables are in scope).
 # ---------------------------------------------------------------------------
 
-all: $(UT_BIN) $(UT3_BIN) $(UT6_BIN) $(UT7_BIN) $(UT8_BIN) $(UT9_BIN) $(UT10_BIN)
+all: $(UT_BIN) $(UT3_BIN) $(UT6_BIN) $(UT7_BIN) $(UT8_BIN) $(UT9_BIN) $(UT10_BIN) $(UT11_BIN)
 
-run: $(UT_BIN) $(UT3_BIN) $(UT6_BIN) $(UT7_BIN) $(UT8_BIN) $(UT9_BIN) $(UT10_BIN)
+run: $(UT_BIN) $(UT3_BIN) $(UT6_BIN) $(UT7_BIN) $(UT8_BIN) $(UT9_BIN) $(UT10_BIN) $(UT11_BIN)
 	./$(UT_BIN)
 	./$(UT3_BIN)
 	./$(UT6_BIN)
@@ -1134,6 +1272,10 @@ run: $(UT_BIN) $(UT3_BIN) $(UT6_BIN) $(UT7_BIN) $(UT8_BIN) $(UT9_BIN) $(UT10_BIN
 	./$(UT8_BIN)
 	./$(UT9_BIN)
 	./$(UT10_BIN)
+	./$(UT11_BIN)
+
+clean:
+	rm -rf $(BUILD_DIR) $(BUILD_DIR2) $(BUILD_DIR3) $(BUILD_DIR4) $(BUILD_DIR5) $(BUILD_DIR6) $(BUILD_DIR7) $(BUILD_DIR8) $(BUILD_DIR9) $(BUILD_DIR10) $(BUILD_DIR11)
 
 clean:
 	rm -rf $(BUILD_DIR) $(BUILD_DIR2) $(BUILD_DIR3) $(BUILD_DIR4) $(BUILD_DIR5) $(BUILD_DIR6) $(BUILD_DIR7) $(BUILD_DIR8) $(BUILD_DIR9) $(BUILD_DIR10)

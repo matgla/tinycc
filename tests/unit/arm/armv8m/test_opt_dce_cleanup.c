@@ -21,6 +21,7 @@
 
 #include "ir_build.h"
 
+#include "opt_engine.h"
 #include "ut.h"
 
 /* Pass entry points (defined in ir/opt_dce.c; forward-declared here to avoid
@@ -32,6 +33,20 @@ int tcc_ir_opt_infinite_self_recursion(TCCIRState *ir, Sym *func_sym);
 int tcc_ir_opt_noreturn_call_epilogue_suppress(TCCIRState *ir);
 int tcc_ir_opt_compact_nops(TCCIRState *ir);
 int tcc_ir_opt_redundant_init_elim(TCCIRState *ir);
+
+/* IROptCtx wrapper entry points and additional whole-function elision passes. */
+int tcc_ir_opt_useless_function_body_ex(IROptCtx *ctx);
+int tcc_ir_opt_noreturn_collapse_ex(IROptCtx *ctx);
+int tcc_ir_opt_trap_only_body_suppress_ex(IROptCtx *ctx);
+int tcc_ir_opt_compact_nops_ex(IROptCtx *ctx);
+int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir);
+int tcc_ir_opt_ub_only_body_elide_ex(IROptCtx *ctx);
+int tcc_ir_opt_local_only_body_elide(TCCIRState *ir);
+int tcc_ir_opt_local_only_body_elide_ex(IROptCtx *ctx);
+int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir);
+int tcc_ir_opt_const_return_uninit_elide_ex(IROptCtx *ctx);
+int tcc_ir_opt_null_store_dom_return(TCCIRState *ir);
+int tcc_ir_opt_null_store_dom_return_ex(IROptCtx *ctx);
 
 #define I32 IROP_BTYPE_INT32
 
@@ -46,6 +61,12 @@ static void reset_state(void)
   tcc_state->need_frame_pointer = 0;
   tcc_state->force_frame_pointer = 0;
   tcc_state->ir_late_reopt_phase = 0;
+}
+
+/* Emit an unconditional JUMP to target index `tgt`. */
+static int emit_jump(TCCIRState *ir, int tgt)
+{
+  return utb_emit(ir, TCCIR_OP_JUMP, utb_imm(tgt, I32), UTB_NONE, UTB_NONE);
 }
 
 /* A SYMREF operand referencing `sym` as a callee (mirrors
@@ -713,6 +734,168 @@ UT_TEST(test_redundant_init_elim_addrtaken_var_kept)
   return 0;
 }
 
+/* ================================================================== IROptCtx wrappers and additional whole-body elision passes */
+
+static IROptCtx utb_ctx(TCCIRState *ir)
+{
+  IROptCtx ctx = {0};
+  ctx.ir = ir;
+  return ctx;
+}
+
+UT_TEST(test_useless_function_body_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  int ret = utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_useless_function_body_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, ret), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(ir->leaffunc, 1);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+UT_TEST(test_noreturn_collapse_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  emit_jump(ir, 0);
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_noreturn_collapse_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(ir->next_instruction_index, 1);
+  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_JUMP);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+UT_TEST(test_trap_only_body_suppress_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+  tcc_state->need_frame_pointer = 1;
+  tcc_state->force_frame_pointer = 1;
+
+  int trap = utb_emit(ir, TCCIR_OP_TRAP, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_trap_only_body_suppress_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, trap), TCCIR_OP_TRAP);
+  UT_ASSERT_EQ(ir->leaffunc, 1);
+  UT_ASSERT_EQ(ir->noreturn, 1);
+  UT_ASSERT_EQ(tcc_state->need_frame_pointer, 0);
+  UT_ASSERT_EQ(tcc_state->force_frame_pointer, 0);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+UT_TEST(test_compact_nops_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  emit_jump(ir, 3);
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
+
+  IROptCtx ctx = utb_ctx(ir);
+  int removed = tcc_ir_opt_compact_nops_ex(&ctx);
+
+  UT_ASSERT_EQ(removed, 1);
+  UT_ASSERT_EQ(ir->next_instruction_index, 3);
+  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_dest(ir, 0)), 2);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Empty-IR guards for additional whole-function elision passes that live in
+ * ir/opt_dce.c but have no dedicated suite yet.  These exercise the wrapper
+ * line and the n==0 / optimize-gate early returns. */
+
+UT_TEST(test_ub_only_body_elide_empty)
+{
+  TCCIRState *ir = utb_new();
+  UT_ASSERT_EQ(tcc_ir_opt_ub_only_body_elide(ir), 0);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_ub_only_body_elide_ex_empty)
+{
+  TCCIRState *ir = utb_new();
+  IROptCtx ctx = utb_ctx(ir);
+  UT_ASSERT_EQ(tcc_ir_opt_ub_only_body_elide_ex(&ctx), 0);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_local_only_body_elide_empty)
+{
+  TCCIRState *ir = utb_new();
+  UT_ASSERT_EQ(tcc_ir_opt_local_only_body_elide(ir), 0);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_local_only_body_elide_ex_empty)
+{
+  TCCIRState *ir = utb_new();
+  IROptCtx ctx = utb_ctx(ir);
+  UT_ASSERT_EQ(tcc_ir_opt_local_only_body_elide_ex(&ctx), 0);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_const_return_uninit_elide_empty)
+{
+  TCCIRState *ir = utb_new();
+  UT_ASSERT_EQ(tcc_ir_opt_const_return_uninit_elide(ir), 0);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_const_return_uninit_elide_ex_empty)
+{
+  TCCIRState *ir = utb_new();
+  IROptCtx ctx = utb_ctx(ir);
+  UT_ASSERT_EQ(tcc_ir_opt_const_return_uninit_elide_ex(&ctx), 0);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_null_store_dom_return_empty)
+{
+  TCCIRState *ir = utb_new();
+  UT_ASSERT_EQ(tcc_ir_opt_null_store_dom_return(ir), 0);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_null_store_dom_return_ex_empty)
+{
+  TCCIRState *ir = utb_new();
+  IROptCtx ctx = utb_ctx(ir);
+  UT_ASSERT_EQ(tcc_ir_opt_null_store_dom_return_ex(&ctx), 0);
+  utb_free(ir);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(opt_dce_cleanup)
@@ -724,6 +907,10 @@ UT_SUITE(opt_dce_cleanup)
   UT_COVERS("noreturn_call_epilogue_suppress");
   UT_COVERS("compact_nops");
   UT_COVERS("redundant_init_elim");
+  UT_COVERS("ub_only_body_elide");
+  UT_COVERS("local_only_body_elide");
+  UT_COVERS("const_return_uninit_elide");
+  UT_COVERS("null_store_dom_return");
 
   UT_RUN(test_useless_body_returnvoid_only_collapses);
   UT_RUN(test_useless_body_returnvalue_keeps_body);
@@ -754,4 +941,18 @@ UT_SUITE(opt_dce_cleanup)
   UT_RUN(test_redundant_init_elim_read_before_kill_kept);
   UT_RUN(test_redundant_init_elim_switch_table_bails_out);
   UT_RUN(test_redundant_init_elim_addrtaken_var_kept);
+
+  UT_RUN(test_useless_function_body_ex_forwards);
+  UT_RUN(test_noreturn_collapse_ex_forwards);
+  UT_RUN(test_trap_only_body_suppress_ex_forwards);
+  UT_RUN(test_compact_nops_ex_forwards);
+
+  UT_RUN(test_ub_only_body_elide_empty);
+  UT_RUN(test_ub_only_body_elide_ex_empty);
+  UT_RUN(test_local_only_body_elide_empty);
+  UT_RUN(test_local_only_body_elide_ex_empty);
+  UT_RUN(test_const_return_uninit_elide_empty);
+  UT_RUN(test_const_return_uninit_elide_ex_empty);
+  UT_RUN(test_null_store_dom_return_empty);
+  UT_RUN(test_null_store_dom_return_ex_empty);
 }

@@ -109,11 +109,10 @@ UT_TEST(test_wl_combined_suboptions_all_land)
   UT_ASSERT(s->rpath == NULL);
   UT_ASSERT(s->soname == NULL);
 
-  /* NOTE: order matters here -- see docs/bugs.md ("boolean linker suboption
-   * must be last in a comma chain"). A value-taking suboption ("name=...")
-   * consumes only up to the next comma and correctly advances the parser to
-   * the next suboption, but a bare boolean flag (no '=') only matches when
-   * it is the *entire* remaining string, so it must be placed last. */
+  /* Suboption order is now irrelevant: both value-taking ("name=...") and
+   * bare boolean ("-Bsymbolic") suboptions advance the parser to the next
+   * comma-separated suboption.  See test_wl_boolean_flag_before_value_suboption
+   * for the boolean-flag-first ordering. */
   int ret = tcc_set_options(s, "-Wl,-rpath=/opt/mylibs,-soname=libfoo.so.1,-Bsymbolic");
   UT_ASSERT_EQ(ret, 0);
 
@@ -143,29 +142,24 @@ UT_TEST(test_wl_unrecognized_suboption_returns_error)
   return 0;
 }
 
-/* Regression pin for a real parser defect (see bugs_found in the harness
- * report / docs/bugs.md): a bare boolean-flag suboption (no '=', e.g.
- * "-Bsymbolic") only matches tcc_set_linker's link_option() when it is the
- * *entire* remaining string, so placing it before a value-taking suboption
- * in the same comma chain makes the whole "-Wl,..." argument fail --
- * even though the flag alone, or the same flag placed last, works fine
- * (see test_wl_bsymbolic_sets_symbolic_flag and
- * test_wl_combined_suboptions_all_land above). This test documents the
- * CURRENT (buggy) behavior so a fix will be noticed here. */
-UT_TEST(test_wl_boolean_flag_before_value_suboption_currently_fails)
+/* A bare boolean-flag suboption (no '=', e.g. "-Bsymbolic") followed by more
+ * suboptions in the same "-Wl," comma chain is now accepted: link_option()
+ * tolerates a trailing ',' after the flag and leaves the parser positioned to
+ * advance to the next suboption. Every suboption lands regardless of order. */
+UT_TEST(test_wl_boolean_flag_before_value_suboption)
 {
   TCCState *s = tcc_new();
   UT_ASSERT(s != NULL);
   linker_test_reset_capture(s);
 
   int ret = tcc_set_options(s, "-Wl,-Bsymbolic,-rpath=/opt/mylibs,-soname=libfoo.so.1");
-  UT_ASSERT_EQ(ret, -1);
-  /* Nothing lands -- the whole comma chain is rejected as one unit. */
-  UT_ASSERT_EQ(s->symbolic, 0);
-  UT_ASSERT(s->rpath == NULL);
-  UT_ASSERT(s->soname == NULL);
-  UT_ASSERT_EQ(linker_test_error_count, 1);
-  UT_ASSERT(strstr(linker_test_errbuf, "unsupported linker option") != NULL);
+  UT_ASSERT_EQ(ret, 0);
+  UT_ASSERT_EQ(s->symbolic, 1);
+  UT_ASSERT(s->rpath != NULL);
+  UT_ASSERT_STREQ(s->rpath, "/opt/mylibs");
+  UT_ASSERT(s->soname != NULL);
+  UT_ASSERT_STREQ(s->soname, "libfoo.so.1");
+  UT_ASSERT_EQ(linker_test_error_count, 0);
 
   tcc_delete(s);
   return 0;
@@ -180,6 +174,6 @@ UT_SUITE(libtcc_options_linker)
   UT_RUN(test_wl_soname_sets_soname_field);
   UT_RUN(test_wl_gc_sections_sets_flag);
   UT_RUN(test_wl_combined_suboptions_all_land);
-  UT_RUN(test_wl_boolean_flag_before_value_suboption_currently_fails);
+  UT_RUN(test_wl_boolean_flag_before_value_suboption);
   UT_RUN(test_wl_unrecognized_suboption_returns_error);
 }

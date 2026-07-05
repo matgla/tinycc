@@ -21,12 +21,15 @@
 
 #include "ir_build.h"
 
+#include "opt_engine.h"
 #include "ut.h"
 
 /* Pass entry points (declared in ir/opt.h; forward-declared to avoid pulling in
  * the optimizer engine headers). */
 int tcc_ir_opt_uninit_local_ub(TCCIRState *ir);
 int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir);
+int tcc_ir_opt_uninit_local_ub_ex(IROptCtx *ctx);
+int tcc_ir_opt_uninit_dominates_return_ex(IROptCtx *ctx);
 
 #define I32 IROP_BTYPE_INT32
 
@@ -339,6 +342,55 @@ UT_TEST(test_uninit_dom_ret_no_returns_no_change)
   return 0;
 }
 
+/* WRAPPER: IROptCtx entry points forward to the bare TCCIRState* passes. */
+
+static IROptCtx utb_ctx(TCCIRState *ir)
+{
+  IROptCtx ctx = {0};
+  ctx.ir = ir;
+  return ctx;
+}
+
+UT_TEST(test_uninit_local_ub_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  setup_optimize();
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(1, I32));
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_uninit_local_ub_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  reset_optimize();
+  return 0;
+}
+
+UT_TEST(test_uninit_dominates_return_ex_forwards)
+{
+  TCCIRState *ir = utb_new();
+  setup_optimize();
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
+
+  IROptCtx ctx = utb_ctx(ir);
+  int changes = tcc_ir_opt_uninit_dominates_return_ex(&ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  reset_optimize();
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(opt_uninit)
@@ -358,4 +410,7 @@ UT_SUITE(opt_uninit)
   UT_RUN(test_uninit_dom_ret_return_not_dominated_no_change);
   UT_RUN(test_uninit_dom_ret_side_effects_no_change);
   UT_RUN(test_uninit_dom_ret_no_returns_no_change);
+
+  UT_RUN(test_uninit_local_ub_ex_forwards);
+  UT_RUN(test_uninit_dominates_return_ex_forwards);
 }

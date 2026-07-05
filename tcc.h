@@ -2134,7 +2134,7 @@ ST_FUNC void check_vstack(void);
 
 ST_INLN int is_float(int t);
 ST_FUNC int ieee_finite(double d);
-ST_FUNC int exact_log2p1(int i);
+ST_FUNC int exact_log2p1(unsigned int i);
 ST_FUNC void test_lvalue(void);
 
 ST_FUNC ElfSym *elfsym(Sym *);

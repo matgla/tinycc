@@ -73,6 +73,24 @@ void ut_record_failure(const char *file, int line, const char *fmt, ...);
     }                                                                          \
   } while (0)
 
+#define UT_ASSERT_NE(a, b)                                                     \
+  do                                                                           \
+  {                                                                            \
+    ut_run_count++;                                                            \
+    long long _ut_a = (long long)(a);                                          \
+    long long _ut_b = (long long)(b);                                          \
+    if (_ut_a == _ut_b)                                                        \
+    {                                                                          \
+      ut_record_failure(__FILE__, __LINE__,                                    \
+                        "%s (%lld) == %s (%lld)", #a, _ut_a, #b, _ut_b);      \
+      fprintf(stderr,                                                          \
+              "    FAIL %s:%d: %s (%lld) == %s (%lld) (in %s)\n",              \
+              __FILE__, __LINE__, #a, _ut_a, #b, _ut_b, ut_current_test);      \
+      ut_fail_count++;                                                         \
+      return -1;                                                               \
+    }                                                                          \
+  } while (0)
+
 #define UT_ASSERT_STREQ(a, b)                                                  \
   do                                                                           \
   {                                                                            \

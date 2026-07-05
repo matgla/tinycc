@@ -63,16 +63,11 @@
  *      one level out and misparsed as a new top-level SECTIONS item.
  *
 
- *    BUG B (test_sections_output_section_dotted_with_patterns_and_keep):
- *      ld_parse_section_pattern() unconditionally calls ld_add_pattern()
- *      once *before* parsing the actual glob names inside the parens
- *      (apparently meant to eventually capture the leading file-pattern,
- *      e.g. the "*" in "*(.text*)"), but never writes anything into that
- *      pattern's `.pattern` field. Every single "*(...)"/"NAME(...)"/
- *      "KEEP(...)" occurrence in a SECTIONS output-section body therefore
- *      leaves one permanent bogus LDSectionPattern entry with pattern=="",
- *      type==LD_PAT_GLOB, and keep set to whatever the call passed in --
- *      inflating nb_patterns and polluting ld_script_dump() output.
+ *    (FIXED) test_sections_output_section_dotted_with_patterns_and_keep:
+ *      ld_parse_section_pattern() no longer pre-allocates a bogus leading
+ *      LDSectionPattern for the (currently-skipped) file pattern.  Each
+ *      "*(...)"/"KEEP(...)" group now contributes exactly the section
+ *      name(s) parsed from inside its parens.
  *
  *    BUG C (test_bug_memory_invert_attribute_causes_phantom_regions):
  *      ld_expect() does not advance the token position when it reports a
@@ -91,17 +86,12 @@
  *      an overall ld_script_parse_string() return code of 0 (success) --
  *      not a crash, and not a reported error either.
  *
- *    BUG D (test_bug_sections_standard_region_at_phdr_order_drops_phdr):
- *      ld_parse_sections()'s per-output-section suffix-clause parsing
- *      checks '>' (memory region), then ':' (phdr), then "AT" (load
- *      region) -- in that fixed order, exactly once each. Real-world/GNU-ld
- *      scripts conventionally write "> REGION AT > LMA_REGION :PHDR" (AT
- *      *before* the phdr tag); with that ordering this parser's ':' check
- *      has already run (and found "AT", not ':', so it does nothing) by the
- *      time "AT > LMA_REGION" is consumed, and the trailing ":PHDR" is
- *      never looked at again -- os->phdr_idx silently stays -1, no error
- *      reported. Only the non-standard "> REGION :PHDR AT > LMA_REGION"
- *      order (phdr tag before AT) is actually recognized.
+ *    (FIXED) test_sections_standard_region_at_phdr_order:
+ *      ld_parse_sections()'s per-output-section suffix clauses ('>' memory
+ *      region, "AT >" load region, ':' phdr) are now parsed in a loop, so
+ *      they are accepted in any order.  The conventional GNU-ld ordering
+ *      "> REGION AT > LMA_REGION :PHDR" (AT before the phdr tag) no longer
+ *      silently drops the phdr association.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -680,24 +670,16 @@ UT_TEST(test_sections_output_section_dotted_with_patterns_and_keep)
   UT_ASSERT_STREQ(os->name, ".text");
   UT_ASSERT_EQ(os->memory_region_idx, 0);
 
-  /* BUG B: every "*(...)" group -- with or without KEEP() -- leaves one
-   * extra bogus pattern[] entry with an empty pattern string ahead of the
-   * real name(s) parsed from inside the parens. Real content: ".text*"
-   * (plain, not kept) and ".init" (kept). Actual: 4 entries, 2 of them
-   * blank placeholders. */
-  UT_ASSERT_EQ(os->nb_patterns, 4);
-  UT_ASSERT_STREQ(os->patterns[0].pattern, "");
+  /* Each "*(...)" group contributes exactly the section name(s) inside its
+   * parens -- no bogus empty leading entry.  Real content: ".text*" (plain,
+   * not kept) and ".init" (kept). */
+  UT_ASSERT_EQ(os->nb_patterns, 2);
+  UT_ASSERT_STREQ(os->patterns[0].pattern, ".text*");
   UT_ASSERT_EQ(os->patterns[0].type, LD_PAT_GLOB);
   UT_ASSERT_EQ(os->patterns[0].keep, 0);
-  UT_ASSERT_STREQ(os->patterns[1].pattern, ".text*");
-  UT_ASSERT_EQ(os->patterns[1].type, LD_PAT_GLOB);
-  UT_ASSERT_EQ(os->patterns[1].keep, 0);
-  UT_ASSERT_STREQ(os->patterns[2].pattern, "");
-  UT_ASSERT_EQ(os->patterns[2].type, LD_PAT_GLOB);
-  UT_ASSERT_EQ(os->patterns[2].keep, 1);
-  UT_ASSERT_STREQ(os->patterns[3].pattern, ".init");
-  UT_ASSERT_EQ(os->patterns[3].type, LD_PAT_EXACT);
-  UT_ASSERT_EQ(os->patterns[3].keep, 1);
+  UT_ASSERT_STREQ(os->patterns[1].pattern, ".init");
+  UT_ASSERT_EQ(os->patterns[1].type, LD_PAT_EXACT);
+  UT_ASSERT_EQ(os->patterns[1].keep, 1);
 
   /* The real-world-relevant surface (should_keep()) is unaffected: the
    * bogus empty pattern can never match a real (non-empty) section name. */
@@ -819,8 +801,9 @@ UT_TEST(test_sections_region_at_and_phdr_supported_order)
   memset(&s1, 0, sizeof(s1));
   ld_script_init(&ld);
 
-  /* This parser only recognizes "> REGION :PHDR AT > LMA_REGION" (phdr tag
-   * *before* AT) -- see BUG D. */
+  /* The "> REGION :PHDR AT > LMA_REGION" order (phdr tag before AT) is
+   * accepted, as is the conventional AT-before-phdr order
+   * (test_sections_standard_region_at_phdr_order). */
   int ret = ld_script_parse_string(&s1, &ld,
       "MEMORY { FLASH (rx) : ORIGIN = 0x0, LENGTH = 1K  RAM (rwx) : ORIGIN = 0x1000, LENGTH = 1K }\n"
       "PHDRS { text_seg PT_LOAD; }\n"
@@ -837,8 +820,8 @@ UT_TEST(test_sections_region_at_and_phdr_supported_order)
   return 0;
 }
 
-/* BUG D regression pin -- see file header. */
-UT_TEST(test_bug_sections_standard_region_at_phdr_order_drops_phdr)
+/* The suffix clauses are now parsed order-independently -- see file header. */
+UT_TEST(test_sections_standard_region_at_phdr_order)
 {
   TCCState s1;
   LDScript ld;
@@ -851,12 +834,12 @@ UT_TEST(test_bug_sections_standard_region_at_phdr_order_drops_phdr)
       "PHDRS { text_seg PT_LOAD; }\n"
       "SECTIONS { .data : { *(.data) } > RAM AT > FLASH :text_seg }\n");
 
-  UT_ASSERT_EQ(ret, 0); /* no error reported */
+  UT_ASSERT_EQ(ret, 0);
   UT_ASSERT_EQ(ld.nb_output_sections, 1);
   LDOutputSection *os = &ld.output_sections[0];
   UT_ASSERT_EQ(os->memory_region_idx, 1);
   UT_ASSERT_EQ(os->load_memory_region_idx, 0);
-  UT_ASSERT_EQ(os->phdr_idx, -1); /* silently dropped */
+  UT_ASSERT_EQ(os->phdr_idx, 0); /* :text_seg after AT is now honored */
 
   ld_script_cleanup(&ld);
   return 0;
@@ -1122,7 +1105,7 @@ UT_SUITE(ld_script)
   UT_RUN(test_sections_symbol_assignment_via_expression);
   UT_RUN(test_bug_location_counter_dot_is_treated_as_phantom_symbol);
   UT_RUN(test_sections_region_at_and_phdr_supported_order);
-  UT_RUN(test_bug_sections_standard_region_at_phdr_order_drops_phdr);
+  UT_RUN(test_sections_standard_region_at_phdr_order);
   UT_RUN(test_find_output_section_found_and_not_found);
 
   UT_RUN(test_pattern_exact_and_question_mark_match);

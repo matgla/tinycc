@@ -150,7 +150,13 @@ static int emit_counting_store_loop(TCCIRState *ir, int init, int limit, int ste
   return 8;
 }
 
-UT_TEST(test_lcs_counting_loop_folds_store_to_final_iv_value)
+/* A counting loop whose body writes memory (STORE [100]=V0) is now left intact
+ * for the normal IR pipeline.  LCS bails on any memory-carrying loop: its
+ * partial stack-memory modeling let stale aggregate values escape through
+ * indexed stores / packed RMW chains, so the has_memory guard in
+ * tcc_ir_opt_loop_const_sim skips such loops.  The loop must be reported
+ * unchanged (changes == 0), with its control flow and store untouched. */
+UT_TEST(test_lcs_counting_store_in_body_blocks_fold)
 {
   TCCIRState *ir = utb_loop_new();
   utb_alloc_var_intervals(ir, 4);
@@ -159,23 +165,15 @@ UT_TEST(test_lcs_counting_loop_folds_store_to_final_iv_value)
 
   int changes = tcc_ir_opt_loop_const_sim(ir);
 
-  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(changes, 0);
 
-  /* Loop control folded away: the CMP header is no longer live (it may be
-   * NOPed outright, or its slot reused to host a residual instruction -- the
-   * pass writes residuals into the folded range's NOP slots in whatever
-   * order it likes, so pin behavior via structural search, not a hardcoded
-   * slot index). Either way the original CMP opcode must be gone. */
-  UT_ASSERT(utb_op(ir, 1) != TCCIR_OP_CMP);
-
-  /* Residual STORE [100] = #4 (last value stored to the slot -- the sim
-   * writes the slot each iteration; V0 == 4 on the final (5th) iteration
-   * before exiting, since the loop runs V0=0,1,2,3,4 then exits at V0==5). */
+  /* Loop control and the memory body are untouched (deferred to the pipeline). */
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
+  /* The store still holds the runtime IV, not a folded immediate. */
   int s = find_store_to_offset(ir, 100);
   UT_ASSERT(s >= 0);
-  IROperand src = utb_src1(ir, s);
-  UT_ASSERT_EQ(irop_is_immediate(src), 1);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, src), 4);
+  UT_ASSERT_EQ(irop_is_immediate(utb_src1(ir, s)), 0);
 
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
 
@@ -183,9 +181,10 @@ UT_TEST(test_lcs_counting_loop_folds_store_to_final_iv_value)
   return 0;
 }
 
-/* V0 is read after the loop (via a TEMP copy) -> a residual ASSIGN V0=#5
- * (final IV value) must also be emitted, in addition to the STORE. */
-UT_TEST(test_lcs_counting_loop_emits_final_iv_when_used_after)
+/* Same store loop with a post-loop reader of V0.  Still blocked by the memory
+ * guard: no residual fold and no synthesized final-IV ASSIGN -- the only ASSIGN
+ * to V0 remains the preheader init (#0). */
+UT_TEST(test_lcs_counting_store_used_after_blocks_fold)
 {
   TCCIRState *ir = utb_loop_new();
   utb_alloc_var_intervals(ir, 4);
@@ -195,23 +194,24 @@ UT_TEST(test_lcs_counting_loop_emits_final_iv_when_used_after)
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE); /* 8 */
 
   int changes = tcc_ir_opt_loop_const_sim(ir);
-  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(changes, 0);
 
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
+  /* No folded final-value ASSIGN V0=#5 appended: the last (and only) ASSIGN to
+   * V0 is still the preheader init carrying #0. */
   int a = find_assign_to_var(ir, 0);
   UT_ASSERT(a >= 0);
-  IROperand src = utb_src1(ir, a);
-  UT_ASSERT_EQ(irop_is_immediate(src), 1);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, src), 5); /* init(0) + trip(5)*step(1) */
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, a)), 0);
 
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
   utb_free(ir);
   return 0;
 }
 
-/* Non-unit step, non-zero init: for (V0=2; V0<11; V0+=3) -> trips at
- * V0 = 2,5,8 (3 trips; V0=11 exits). Final IV = 2+3*3=11. Independent oracle
- * computed by hand to cross-check compute_trip_count's ceil-div formula. */
-UT_TEST(test_lcs_counting_loop_nonunit_step_and_init)
+/* Non-unit step, non-zero init: for (V0=2; V0<11; V0+=3).  The memory guard
+ * blocks the fold regardless of step/init shape -- the loop is left intact. */
+UT_TEST(test_lcs_counting_store_nonunit_step_blocks_fold)
 {
   TCCIRState *ir = utb_loop_new();
   utb_alloc_var_intervals(ir, 4);
@@ -219,19 +219,15 @@ UT_TEST(test_lcs_counting_loop_nonunit_step_and_init)
   emit_counting_store_loop(ir, 2, 11, 3, 200, I32);
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE); /* 8: read V0 after */
 
-  /* Independent oracle: trips = ceil((11-2)/3) = 3; iterations at 2,5,8. */
-  UT_ASSERT_EQ((11 - 2 + 3 - 1) / 3, 3);
-
   int changes = tcc_ir_opt_loop_const_sim(ir);
-  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(changes, 0);
 
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
+  /* Stored value is still the runtime IV, not a folded immediate. */
   int s = find_store_to_offset(ir, 200);
   UT_ASSERT(s >= 0);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, s)), 8); /* last stored IV */
-
-  int a = find_assign_to_var(ir, 0);
-  UT_ASSERT(a >= 0);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, a)), 11); /* 2 + 3*3 */
+  UT_ASSERT_EQ(irop_is_immediate(utb_src1(ir, s)), 0);
 
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
   utb_free(ir);
@@ -674,11 +670,11 @@ UT_TEST(test_lcs_no_loop_no_fire)
 }
 
 /* ======================================================================
- * Idempotence: applying the pass a second time after a successful fold
- * finds no remaining loop (back-edge NOPed) and reports 0 further changes.
+ * Idempotence: a memory-carrying loop is skipped by the guard, so the pass is
+ * a no-op from the very first application and stays at a fixpoint (0 changes).
  * ====================================================================== */
 
-UT_TEST(test_lcs_idempotent)
+UT_TEST(test_lcs_memory_loop_idempotent_noop)
 {
   TCCIRState *ir = utb_loop_new();
   utb_alloc_var_intervals(ir, 4);
@@ -686,8 +682,10 @@ UT_TEST(test_lcs_idempotent)
   emit_counting_store_loop(ir, 0, 5, 1, 100, I32);
 
   int total = utb_run_to_fixpoint(ir, tcc_ir_opt_loop_const_sim, 10);
-  UT_ASSERT_EQ(total, 1);
+  UT_ASSERT_EQ(total, 0);
   UT_ASSERT_EQ(tcc_ir_opt_loop_const_sim(ir), 0);
+  /* Loop left intact for the normal pipeline. */
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
 
   utb_free(ir);
@@ -697,14 +695,13 @@ UT_TEST(test_lcs_idempotent)
 /* ======================================================================
  * Pointer/address-of-local pattern: `T0 = &V0; *T0 = V0_value` inside the
  * loop is the LEA + indirect-STORE path (lcs_write_addr_operand /
- * lcs_resolve_stack_addr).  V0 here is a plain (not addrtaken-flagged, since
- * the frontend would normally set that -- we're testing the simulator's own
- * address tracking, independent of the addrtaken guard) stack-resident local
- * whose address is taken *by the loop itself* and stored through each
- * iteration; the loop increments a stack slot via the pointer.
+ * lcs_resolve_stack_addr).  This address-tracking fold was the source of the
+ * combo_num-872 miscompile class, so the memory guard now blocks it: a loop
+ * carrying an indirect store is left for the normal pipeline rather than
+ * simulated here.
  * ====================================================================== */
 
-UT_TEST(test_lcs_lea_and_indirect_store_folds)
+UT_TEST(test_lcs_lea_indirect_store_blocks_fold)
 {
   TCCIRState *ir = utb_loop_new();
   utb_alloc_var_intervals(ir, 4);
@@ -723,12 +720,15 @@ UT_TEST(test_lcs_lea_and_indirect_store_folds)
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);            /* 8 exit target */
 
   int changes = tcc_ir_opt_loop_const_sim(ir);
-  UT_ASSERT_EQ(changes, 1);
+  /* The indirect STORE makes this a memory-carrying loop -- the address-tracking
+   * fold path (the source of the combo_num-872 miscompile class) is deferred to
+   * the normal pipeline. */
+  UT_ASSERT_EQ(changes, 0);
 
-  /* Residual STORE [64] = #2 (last stored i value: 0,1,2 then exit at i==3). */
-  int s = find_store_to_offset(ir, 64);
-  UT_ASSERT(s >= 0);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, s)), 2);
+  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 4), TCCIR_OP_STORE);
+  /* The indirect store still holds the runtime IV, not a folded immediate. */
+  UT_ASSERT_EQ(irop_is_immediate(utb_src1(ir, 4)), 0);
 
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
   utb_free(ir);
@@ -736,18 +736,13 @@ UT_TEST(test_lcs_lea_and_indirect_store_folds)
 }
 
 /* ======================================================================
- * Zero-trip loop: init already satisfies the exit condition (0 >= 0), so the
- * IV-trip fast path computes trip_count == 0. lcs_try_fold's trip-count guard
- * is `trip_count > 0 && trip_count <= LCS_MAX_TRIP_COUNT`, so trip==0 fails
- * `> 0` and have_iv_trip stays 0 -- falling through to the generic bounded
- * simulator, which for THIS shape (single exit target, all-local/immediate
- * state) still succeeds: the sim runs 0 iterations (the very first pc lands
- * on the exit-taking JUMPIF) and folds to an empty loop (no residual writes
- * needed since nothing was ever stored). Pinning this documents that
- * "trip_count==0" is not a distinct bail path from the pass's outside view --
- * it still reports changes==1 (the dead CMP/JUMPIF/body/back-edge get NOPed)
- * even though semantically nothing needed folding. */
-UT_TEST(test_lcs_zero_trip_loop_still_folds_via_generic_path)
+ * Zero-trip loop (init already satisfies the exit condition, 0 >= 0): even
+ * though the body never executes at runtime, the loop still *carries* a STORE,
+ * so the memory guard bails before analyzing the trip count.  The loop is left
+ * intact for the normal pipeline (which can prove the zero-trip statically).
+ * This pins that the guard is a purely structural memory check -- it does not
+ * peek at trip counts to make an exception for provably-dead bodies. */
+UT_TEST(test_lcs_zero_trip_store_loop_blocks_fold)
 {
   TCCIRState *ir = utb_loop_new();
   utb_alloc_var_intervals(ir, 4);
@@ -756,10 +751,10 @@ UT_TEST(test_lcs_zero_trip_loop_still_folds_via_generic_path)
 
   int changes = tcc_ir_opt_loop_const_sim(ir);
 
-  UT_ASSERT_EQ(changes, 1);
-  /* No residual STORE was ever written (the body never executed). */
-  UT_ASSERT_EQ(find_store_to_offset(ir, 400), -1);
-  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(changes, 0);
+  /* Loop control and the store body are untouched. */
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
 
   utb_free(ir);
@@ -771,9 +766,9 @@ UT_TEST(test_lcs_zero_trip_loop_still_folds_via_generic_path)
 UT_SUITE(opt_loop_const_sim)
 {
   UT_COVERS("loop_const_sim");
-  UT_RUN(test_lcs_counting_loop_folds_store_to_final_iv_value);
-  UT_RUN(test_lcs_counting_loop_emits_final_iv_when_used_after);
-  UT_RUN(test_lcs_counting_loop_nonunit_step_and_init);
+  UT_RUN(test_lcs_counting_store_in_body_blocks_fold);
+  UT_RUN(test_lcs_counting_store_used_after_blocks_fold);
+  UT_RUN(test_lcs_counting_store_nonunit_step_blocks_fold);
   UT_RUN(test_lcs_accumulator_var_folds_to_final_value);
   UT_RUN(test_lcs_narrow_unsigned_var_residual_preserves_is_unsigned);
   UT_RUN(test_lcs_narrow_signed_var_residual_is_unsigned_zero);
@@ -786,7 +781,7 @@ UT_SUITE(opt_loop_const_sim)
   UT_RUN(test_lcs_addrtaken_var_blocks_fold);
   UT_RUN(test_lcs_internal_branch_to_third_target_blocks_fold);
   UT_RUN(test_lcs_no_loop_no_fire);
-  UT_RUN(test_lcs_idempotent);
-  UT_RUN(test_lcs_lea_and_indirect_store_folds);
-  UT_RUN(test_lcs_zero_trip_loop_still_folds_via_generic_path);
+  UT_RUN(test_lcs_memory_loop_idempotent_noop);
+  UT_RUN(test_lcs_lea_indirect_store_blocks_fold);
+  UT_RUN(test_lcs_zero_trip_store_loop_blocks_fold);
 }

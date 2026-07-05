@@ -1280,7 +1280,17 @@ int ssa_opt_var_to_param_forward(IRSSAOptCtx *ctx)
       if (irop_config[uq->op].has_src1) {
         IROperand s = tcc_ir_op_get_src1(ir, uq);
         if (irop_get_vreg(s) == target_vr) {
-          tcc_ir_set_src1(ir, j, stored_val);
+          IROperand ns = stored_val;
+          /* STORE_INDEXED derives its store width from the value operand's
+           * btype — the dest is a bare register base carrying no type.  The
+           * VAR we're replacing holds the correct access width; stored_val
+           * may be narrower (e.g. a `short` constant folded into a `unsigned`
+           * slot, seed struct_byval 182993), which would silently shrink the
+           * store (strh vs str) and drop the high bytes.  Preserve the
+           * original operand's btype so the store keeps its width. */
+          if (uq->op == TCCIR_OP_STORE_INDEXED)
+            ns.btype = s.btype;
+          tcc_ir_set_src1(ir, j, ns);
           touched = 1;
         }
       }

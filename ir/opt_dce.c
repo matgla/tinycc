@@ -2816,11 +2816,32 @@ int tcc_ir_opt_dse(TCCIRState *ir)
   tcc_pass_timing_add("dse", tcc_pass_clk_us() - _t);
   return _r;
 }
+
+static int dse_operand_is_wide(IROperand op)
+{
+  return op.btype == IROP_BTYPE_INT64 || op.btype == IROP_BTYPE_FLOAT64;
+}
+
 static int tcc_ir_opt_dse__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   if (n == 0)
     return 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (irop_config[q->op].has_dest && dse_operand_is_wide(tcc_ir_op_get_dest(ir, q)))
+      return 0;
+    if (irop_config[q->op].has_src1 && dse_operand_is_wide(tcc_ir_op_get_src1(ir, q)))
+      return 0;
+    if (irop_config[q->op].has_src2 && dse_operand_is_wide(tcc_ir_op_get_src2(ir, q)))
+      return 0;
+    if (q->op == TCCIR_OP_MLA && dse_operand_is_wide(tcc_ir_op_get_accum(ir, q)))
+      return 0;
+  }
 
   /* Orphaned PARAM elimination: NOP FUNCPARAMVAL/FUNCPARAMVOID instructions
    * whose call_id has no matching FUNCCALLVAL/FUNCCALLVOID.
@@ -5889,6 +5910,39 @@ static int tcc_ir_opt_dead_loop_elim__timed(TCCIRState *ir)
      * any constant assignments in the preheader. */
     LOG_IR_GEN("OPTIMIZE: Dead loop elimination at header=%d (%d const vars)", loop->header_idx, num_const_vars);
 
+    /* Locate the loop's forward exit branch (the single trip-test JUMPIF whose
+     * target lies outside the body) before NOPing it.  If, after removal, plain
+     * fall-through would NOT reach that exit target — because the exit branch
+     * used to jump *over* code physically following the loop, e.g. the else-arm
+     * of an `if` whose then-arm is this loop — an explicit JUMP must replace the
+     * loop; otherwise control drops into that code (an `if(c){while(..){}}
+     * else{...}` runs the else arm unconditionally: switch fuzz O1 wrong-code,
+     * seed 198468).  Mirrors need_exit_jump in try_eliminate_loop. */
+    int exit_target = -1;
+    for (int idx = loop->start_idx; idx <= loop->end_idx && idx < n; idx++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[idx];
+      if (q->op == TCCIR_OP_JUMPIF)
+      {
+        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+        if (t < loop->start_idx || t > loop->end_idx)
+          exit_target = t; /* forward exit (not a back-edge to the header) */
+        break;
+      }
+    }
+    int need_exit_jump = 0;
+    if (exit_target >= 0)
+    {
+      int ft = loop->end_idx + 1;
+      while (ft < n && ir->compact_instructions[ft].op == TCCIR_OP_NOP)
+        ft++;
+      int et = exit_target;
+      while (et < n && ir->compact_instructions[et].op == TCCIR_OP_NOP)
+        et++;
+      if (ft != et)
+        need_exit_jump = 1;
+    }
+
     /* NOP loop body instructions within [start_idx, end_idx] only.
      * Instructions outside this range (exit targets, returns) must not be touched. */
     for (int idx = loop->start_idx; idx <= loop->end_idx && idx < n; idx++)
@@ -5938,6 +5992,25 @@ static int tcc_ir_opt_dead_loop_elim__timed(TCCIRState *ir)
       tcc_ir_iroperand_pool_add(ir, src1_op);
       ir->compact_instructions[slot].op = TCCIR_OP_ASSIGN;
       ir->compact_instructions[slot].operand_base = new_base;
+    }
+
+    /* Restore the exit edge with an explicit JUMP when fall-through would not
+     * reach exit_target (see comment above the exit-branch scan).  Placed after
+     * the const assignments so their values are still computed on the way out;
+     * the first free NOP slot in the (now emptied) body sits after them. */
+    if (need_exit_jump)
+    {
+      for (int j = loop->start_idx; j <= loop->end_idx && j < n; j++)
+      {
+        if (ir->compact_instructions[j].op == TCCIR_OP_NOP)
+        {
+          IROperand exit_dest = irop_make_imm32(-1, exit_target, IROP_BTYPE_INT32);
+          write_instr_at_nop(ir, j, TCCIR_OP_JUMP, exit_dest, (IROperand){0}, (IROperand){0});
+          if (exit_target >= 0 && exit_target < n)
+            ir->compact_instructions[exit_target].is_jump_target = 1;
+          break;
+        }
+      }
     }
 
     changes++;

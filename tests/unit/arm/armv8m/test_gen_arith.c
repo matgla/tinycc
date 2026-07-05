@@ -24,9 +24,11 @@
 #include "arch/arm/thumb/thop_alu_imm.h"
 #include "arch/arm/thumb/thop_shift_reg.h"
 #include "arch/arm/thumb/thop_shift_imm.h"
+#include "arch/arm/thumb/thop_branch.h"
 #include "arch/arm/thumb/thop_cmp.h"
 #include "arch/arm/thumb/thop_mov.h"
 #include "arch/arm/thumb/thop_mul.h"
+#include "arch/arm/thumb/thop_system.h"
 #include "ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
@@ -395,6 +397,34 @@ UT_TEST(test_muldiv_udiv_reg_reg_reg)
   return 0;
 }
 
+UT_TEST(test_muldiv_test_zero_32bit)
+{
+  setup_gen();
+
+  /* TEST_ZERO 32-bit: CMP src, #0. */
+  tcc_gen_machine_muldiv_mop(mop_reg(R1, IROP_BTYPE_INT32), mop_none(), mop_none(), TCCIR_OP_TEST_ZERO);
+
+  UT_ASSERT_EQ(ind, 2);
+  UT_ASSERT(bytes_match_opcode(ind, th_cmp_imm(R1, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_muldiv_test_zero_64bit)
+{
+  setup_gen();
+
+  /* TEST_ZERO 64-bit: CMP lo,#0; IT EQ; CMP hi,#0. */
+  tcc_gen_machine_muldiv_mop(mop_reg64(R2, R3, IROP_BTYPE_INT32), mop_none(), mop_none(), TCCIR_OP_TEST_ZERO);
+
+  UT_ASSERT_EQ(ind, 6);
+  UT_ASSERT(bytes_match_opcode_at(0, 2, th_cmp_imm(R2, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)));
+  UT_ASSERT(bytes_match_opcode_at(2, 2, th_it(0, 0x8)));
+  UT_ASSERT(bytes_match_opcode_at(4, 2, th_cmp_imm(R3, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
 /* ----------------------------------------------------------------------- mla_mop */
 
 UT_TEST(test_mla_dest_eq_src1_mul_src2_plus_accum)
@@ -736,6 +766,142 @@ UT_TEST(test_mul_const_add_fused_non_fallthrough_const)
   return 0;
 }
 
+/* -------------------------------------------------------- 64-bit data_processing_mop */
+
+UT_TEST(test_dp_add64_reg_reg_reg)
+{
+  setup_gen();
+
+  /* ADD {r0:r1}, {r2:r3}, {r4:r5} -> low half ADDS (T1), high half ADC (T3). */
+  tcc_gen_machine_data_processing_mop(mop_reg64(R2, R3, IROP_BTYPE_INT32), mop_reg64(R4, R5, IROP_BTYPE_INT32),
+                                      mop_reg64(R0, R1, IROP_BTYPE_INT32), TCCIR_OP_ADD, 0);
+
+  UT_ASSERT_EQ(ind, 6);
+  UT_ASSERT(bytes_match_opcode_at(0, 2, th_add_reg(R0, R2, R4, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE)));
+  UT_ASSERT(bytes_match_opcode_at(2, 4, th_adc_reg(R1, R3, R5, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_dp_sub64_reg_reg_reg)
+{
+  setup_gen();
+
+  /* SUB {r0:r1}, {r2:r3}, {r4:r5} -> low half SUBS (T1), high half SBC (T3). */
+  tcc_gen_machine_data_processing_mop(mop_reg64(R2, R3, IROP_BTYPE_INT32), mop_reg64(R4, R5, IROP_BTYPE_INT32),
+                                      mop_reg64(R0, R1, IROP_BTYPE_INT32), TCCIR_OP_SUB, 0);
+
+  UT_ASSERT_EQ(ind, 6);
+  UT_ASSERT(bytes_match_opcode_at(0, 2, th_sub_reg(R0, R2, R4, FLAGS_BEHAVIOUR_SET, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE)));
+  UT_ASSERT(bytes_match_opcode_at(2, 4, th_sbc_reg(R1, R3, R5, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_dp_or64_reg_reg_reg)
+{
+  setup_gen();
+
+  /* ORR {r0:r1}, {r2:r3}, {r4:r5}: rd!=rn for both halves -> T3. */
+  tcc_gen_machine_data_processing_mop(mop_reg64(R2, R3, IROP_BTYPE_INT32), mop_reg64(R4, R5, IROP_BTYPE_INT32),
+                                      mop_reg64(R0, R1, IROP_BTYPE_INT32), TCCIR_OP_OR, 0);
+
+  UT_ASSERT_EQ(ind, 8);
+  UT_ASSERT(bytes_match_opcode_at(0, 4, th_orr_reg(R0, R2, R4, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE)));
+  UT_ASSERT(bytes_match_opcode_at(4, 4, th_orr_reg(R1, R3, R5, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_dp_xor64_reg_reg_reg)
+{
+  setup_gen();
+
+  tcc_gen_machine_data_processing_mop(mop_reg64(R2, R3, IROP_BTYPE_INT32), mop_reg64(R4, R5, IROP_BTYPE_INT32),
+                                      mop_reg64(R0, R1, IROP_BTYPE_INT32), TCCIR_OP_XOR, 0);
+
+  UT_ASSERT_EQ(ind, 8);
+  UT_ASSERT(bytes_match_opcode_at(0, 4, th_eor_reg(R0, R2, R4, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE)));
+  UT_ASSERT(bytes_match_opcode_at(4, 4, th_eor_reg(R1, R3, R5, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_dp_and64_reg_reg_reg)
+{
+  setup_gen();
+
+  tcc_gen_machine_data_processing_mop(mop_reg64(R2, R3, IROP_BTYPE_INT32), mop_reg64(R4, R5, IROP_BTYPE_INT32),
+                                      mop_reg64(R0, R1, IROP_BTYPE_INT32), TCCIR_OP_AND, 0);
+
+  UT_ASSERT_EQ(ind, 8);
+  UT_ASSERT(bytes_match_opcode_at(0, 4, th_and_reg(R0, R2, R4, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE)));
+  UT_ASSERT(bytes_match_opcode_at(4, 4, th_and_reg(R1, R3, R5, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+/* -------------------------------------------------------- 64-bit shift (_mop path) */
+
+UT_TEST(test_dp_shl64_imm32)
+{
+  setup_gen();
+
+  /* SHL {r0:r1}, {r2:r3}, #32 -> hi = src_lo, lo = 0. Both emitted
+   * instructions are 16-bit (T1 MOV / T1 MOVS), so total size is 4. */
+  tcc_gen_machine_data_processing_mop(mop_reg64(R2, R3, IROP_BTYPE_INT32), mop_imm(32, IROP_BTYPE_INT32),
+                                      mop_reg64(R0, R1, IROP_BTYPE_INT32), TCCIR_OP_SHL, 0);
+
+  UT_ASSERT_EQ(ind, 4);
+  UT_ASSERT(bytes_match_opcode_at(0, 2, th_mov_reg(R1, R2, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE, false)));
+  UT_ASSERT(bytes_match_opcode_at(2, 2, th_mov_imm(R0, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_dp_shr64_imm32)
+{
+  setup_gen();
+
+  /* SHR {r0:r1}, {r2:r3}, #32 -> lo = src_hi, hi = 0. */
+  tcc_gen_machine_data_processing_mop(mop_reg64(R2, R3, IROP_BTYPE_INT32), mop_imm(32, IROP_BTYPE_INT32),
+                                      mop_reg64(R0, R1, IROP_BTYPE_INT32), TCCIR_OP_SHR, 0);
+
+  UT_ASSERT_EQ(ind, 4);
+  UT_ASSERT(bytes_match_opcode_at(0, 2, th_mov_reg(R0, R3, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE, false)));
+  UT_ASSERT(bytes_match_opcode_at(2, 2, th_mov_imm(R1, 0, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_dp_sar64_imm32)
+{
+  setup_gen();
+
+  /* SAR {r0:r1}, {r2:r3}, #32 -> lo = src_hi, hi = sign-of-src_hi. */
+  tcc_gen_machine_data_processing_mop(mop_reg64(R2, R3, IROP_BTYPE_INT32), mop_imm(32, IROP_BTYPE_INT32),
+                                      mop_reg64(R0, R1, IROP_BTYPE_INT32), TCCIR_OP_SAR, 0);
+
+  UT_ASSERT_EQ(ind, 4);
+  UT_ASSERT(bytes_match_opcode_at(0, 2, th_mov_reg(R0, R3, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                                   ENFORCE_ENCODING_NONE, false)));
+  UT_ASSERT(bytes_match_opcode_at(2, 2, th_asr_imm(R1, R3, 31, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
 /* ------------------------------------------------------------------------ suite */
 
 UT_SUITE(gen_arith)
@@ -759,10 +925,22 @@ UT_SUITE(gen_arith)
   /* data_processing_mop_flags */
   UT_RUN(test_dp_flags_ands_reg_reg_reg);
 
+  /* 64-bit data_processing_mop */
+  UT_RUN(test_dp_add64_reg_reg_reg);
+  UT_RUN(test_dp_sub64_reg_reg_reg);
+  UT_RUN(test_dp_or64_reg_reg_reg);
+  UT_RUN(test_dp_xor64_reg_reg_reg);
+  UT_RUN(test_dp_and64_reg_reg_reg);
+  UT_RUN(test_dp_shl64_imm32);
+  UT_RUN(test_dp_shr64_imm32);
+  UT_RUN(test_dp_sar64_imm32);
+
   /* muldiv_mop */
   UT_RUN(test_muldiv_mul_reg_reg_reg);
   UT_RUN(test_muldiv_sdiv_reg_reg_reg);
   UT_RUN(test_muldiv_udiv_reg_reg_reg);
+  UT_RUN(test_muldiv_test_zero_32bit);
+  UT_RUN(test_muldiv_test_zero_64bit);
 
   /* mla_mop */
   UT_RUN(test_mla_dest_eq_src1_mul_src2_plus_accum);

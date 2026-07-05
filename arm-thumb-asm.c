@@ -199,7 +199,7 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
   r = sv->r;
   if ((r & VT_VALMASK) == VT_CONST)
   {
-    if (!(r & VT_LVAL) && modifier != 'c' && modifier != 'n' && modifier != 'P')
+    if (!(r & VT_LVAL) && modifier != 'c' && modifier != 'P')
       cstr_ccat(add_str, '#');
     if (r & VT_SYM)
     {
@@ -218,12 +218,16 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
       cstr_cat(add_str, name, -1);
       if ((uint32_t)sv->c.i == 0)
         goto no_offset;
-      cstr_ccat(add_str, '+');
     }
     val = sv->c.i;
     if (modifier == 'n')
       val = -val;
-    cstr_printf(add_str, "%d", (int)sv->c.i);
+    /* Separate a symbol from a positive offset with '+'; a negative offset
+       already carries its own '-' from the %d formatting, so emitting '+'
+       unconditionally would wrongly produce "sym+-5". */
+    if ((r & VT_SYM) && val >= 0)
+      cstr_ccat(add_str, '+');
+    cstr_printf(add_str, "%d", val);
   no_offset:;
   }
   else if ((r & VT_VALMASK) == VT_LOCAL)
@@ -962,7 +966,7 @@ static uint8_t thumb_build_it_mask(const char *pattern, uint16_t condition)
       return mask;
     }
 
-    if (tolower(pattern[i] == 't'))
+    if (tolower(pattern[i]) == 't')
     {
       mask |= (condition << (5 - i));
     }

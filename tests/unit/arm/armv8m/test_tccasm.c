@@ -122,6 +122,18 @@ static void utb_queue_str(const char *s)
   }
 }
 
+static void utb_queue_ppstr(const char *s)
+{
+  if (utb_token_q_len < UTB_TOKEN_Q_SIZE)
+  {
+    UtbQueuedToken *slot = &utb_token_q[utb_token_q_len++];
+    slot->tok = TOK_PPSTR;
+    slot->val.str.data = (char *)s;
+    slot->val.str.size = (int)strlen(s) + 1;
+    slot->has_val = 1;
+  }
+}
+
 static void ut_set_next_token(int t)
 {
   utb_clear_token_q();
@@ -1418,6 +1430,335 @@ UT_TEST(test_asm_parse_directive_file_and_ident)
   return 0;
 }
 
+UT_TEST(test_asm_parse_directive_set_feature)
+{
+  tok = TOK_ASMDIR_set;
+  utb_clear_token_q();
+  utb_queue_token(token_for_name("mips16"));
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+  return 0;
+}
+
+UT_TEST(test_asm_parse_directive_asciz)
+{
+  Section sec;
+  unsigned char buf[64];
+
+  ut_setup_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+
+  tok = TOK_ASMDIR_asciz;
+  utb_clear_token_q();
+  utb_queue_str("ab");
+  asm_parse_directive(tcc_state, 1);
+
+  UT_ASSERT_EQ(ind, 3);
+  UT_ASSERT_EQ(buf[0], 'a');
+  UT_ASSERT_EQ(buf[1], 'b');
+  UT_ASSERT_EQ(buf[2], '\0');
+  return 0;
+}
+
+UT_TEST(test_asm_parse_directive_global_and_hidden)
+{
+  int name = token_for_name("ghsym");
+  Sym *gsym;
+  Sym *hsym;
+
+  tcc_state->leading_underscore = 0;
+
+  tok = TOK_ASMDIR_global;
+  utb_clear_token_q();
+  utb_queue_token(name);
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+
+  gsym = global_stack;
+  UT_ASSERT(gsym != NULL);
+  UT_ASSERT((gsym->type.t & VT_STATIC) == 0);
+
+  tok = TOK_ASMDIR_hidden;
+  utb_clear_token_q();
+  utb_queue_token(name);
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+
+  hsym = global_stack;
+  UT_ASSERT(hsym != gsym);
+  UT_ASSERT_EQ(hsym->a.visibility, STV_HIDDEN);
+
+  global_stack = hsym->prev;
+  tcc_free(hsym);
+  global_stack = gsym->prev;
+  tcc_free(gsym);
+  return 0;
+}
+
+UT_TEST(test_asm_parse_directive_type_object_and_unknown)
+{
+  int name = token_for_name("objsym");
+  Sym *sym;
+
+  tcc_state->leading_underscore = 0;
+
+  tok = TOK_ASMDIR_type;
+  utb_clear_token_q();
+  utb_queue_token(name);
+  utb_queue_token(',');
+  utb_queue_str("object");
+  asm_parse_directive(tcc_state, 1);
+
+  sym = global_stack;
+  UT_ASSERT(sym != NULL);
+  UT_ASSERT((sym->type.t & VT_ASM) != 0);
+
+  global_stack = sym->prev;
+  tcc_free(sym);
+
+  name = token_for_name("weirdsym");
+  tok = TOK_ASMDIR_type;
+  utb_clear_token_q();
+  utb_queue_token(name);
+  utb_queue_token(',');
+  utb_queue_str("weird");
+  asm_parse_directive(tcc_state, 1);
+
+  sym = global_stack;
+  UT_ASSERT(sym != NULL);
+  global_stack = sym->prev;
+  tcc_free(sym);
+  return 0;
+}
+
+UT_TEST(test_asm_parse_directive_section_with_options)
+{
+  Section sec_old;
+  unsigned char buf[64];
+  Section *new_sec;
+
+  ut_setup_section(&sec_old, buf, sizeof(buf));
+  cur_text_section = &sec_old;
+  ind = 0;
+
+  tok = TOK_ASMDIR_section;
+  utb_clear_token_q();
+  utb_queue_token(token_for_name("mysec"));
+  utb_queue_token(',');
+  utb_queue_str("wx");
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+
+  new_sec = cur_text_section;
+  UT_ASSERT(new_sec != &sec_old);
+  tcc_free(new_sec);
+  return 0;
+}
+
+UT_TEST(test_asm_parse_directive_push_and_popsection)
+{
+  Section sec_old;
+  unsigned char buf[64];
+  Section *pushed;
+
+  ut_setup_section(&sec_old, buf, sizeof(buf));
+  cur_text_section = &sec_old;
+  ind = 7;
+
+  tok = TOK_ASMDIR_pushsection;
+  utb_clear_token_q();
+  utb_queue_token(token_for_name("pushed"));
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+
+  pushed = cur_text_section;
+  UT_ASSERT(pushed != &sec_old);
+  UT_ASSERT_EQ(sec_old.data_offset, 7);
+  UT_ASSERT(pushed->prev == &sec_old);
+
+  tok = TOK_ASMDIR_popsection;
+  utb_clear_token_q();
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+
+  UT_ASSERT(cur_text_section == &sec_old);
+  UT_ASSERT_EQ(ind, 7);
+  UT_ASSERT(pushed->prev == NULL);
+
+  tcc_free(pushed);
+  return 0;
+}
+
+UT_TEST(test_asm_parse_directive_ident_with_identifier)
+{
+  tok = TOK_ASMDIR_ident;
+  utb_clear_token_q();
+  utb_queue_token(token_for_name("version_id"));
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+  return 0;
+}
+
+UT_TEST(test_asm_parse_directive_file_with_ppstr_and_identifier)
+{
+  char filename[] = "\"foo.c\"";
+
+  tok = TOK_ASMDIR_file;
+  utb_clear_token_q();
+  utb_queue_ppnum("1");
+  utb_queue_ppstr(filename);
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+
+  tok = TOK_ASMDIR_file;
+  utb_clear_token_q();
+  utb_queue_ppnum("2");
+  utb_queue_token(token_for_name("bar"));
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+  return 0;
+}
+
+UT_TEST(test_asm_parse_directive_syntax_thumb_symver)
+{
+  tok = TOK_ASMDIR_syntax;
+  utb_clear_token_q();
+  utb_queue_token(token_for_name("unified"));
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+
+  tok = TOK_ASMDIR_thumb;
+  utb_clear_token_q();
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+
+  tok = TOK_ASMDIR_symver;
+  utb_clear_token_q();
+  utb_queue_token(token_for_name("name"));
+  utb_queue_token(',');
+  utb_queue_token('@');
+  utb_queue_token(token_for_name("ver"));
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+  return 0;
+}
+
+UT_TEST(test_asm_parse_directive_rept_nonzero)
+{
+  Section sec;
+  unsigned char buf[64];
+
+  ut_setup_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+
+  tok = TOK_ASMDIR_rept;
+  utb_clear_token_q();
+  utb_queue_ppnum("2");
+  utb_queue_token(TOK_LINEFEED);
+  utb_queue_token(TOK_ASMDIR_thumb);
+  utb_queue_token(TOK_LINEFEED);
+  utb_queue_token(TOK_ASMDIR_endr);
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+
+  return 0;
+}
+
+UT_TEST(test_asm_parse_directive_macro_with_args)
+{
+  int name = token_for_name("add_two");
+  int arg1 = token_for_name("a");
+  int arg2 = token_for_name("b");
+
+  tok = TOK_ASMDIR_macro;
+  utb_clear_token_q();
+  utb_queue_token(name);
+  utb_queue_token(arg1);
+  utb_queue_token(',');
+  utb_queue_token(arg2);
+  utb_queue_token(TOK_LINEFEED);
+  utb_queue_token(TOK_ASMDIR_thumb);
+  utb_queue_token(TOK_LINEFEED);
+  utb_queue_token(TOK_ASMDIR_endm);
+  utb_queue_token(TOK_LINEFEED);
+  asm_parse_directive(tcc_state, 1);
+
+  UT_ASSERT(asm_macro_find(name) != NULL);
+  UT_ASSERT_EQ(asm_macro_find(name)->nb_args, 2);
+  asm_macros_free();
+  return 0;
+}
+
+UT_TEST(test_tcc_assemble_internal_comment_and_instruction)
+{
+  Section sec;
+  unsigned char buf[64];
+  int opcode = token_for_name("nop");
+
+  ut_setup_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+
+  utb_clear_token_q();
+  utb_queue_token('#');
+  utb_queue_token(token_for_name("comment"));
+  utb_queue_token(TOK_LINEFEED);
+  utb_queue_token(opcode);
+  utb_queue_token(TOK_LINEFEED);
+  utb_queue_token(TOK_EOF);
+
+  tcc_assemble_internal(tcc_state, 0, 1);
+  return 0;
+}
+
+UT_TEST(test_tcc_assemble_internal_directive)
+{
+  Section sec;
+  unsigned char buf[64];
+
+  ut_setup_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+
+  utb_clear_token_q();
+  utb_queue_token(TOK_ASMDIR_syntax);
+  utb_queue_token(token_for_name("unified"));
+  utb_queue_token(TOK_LINEFEED);
+  utb_queue_token(TOK_EOF);
+
+  tcc_assemble_internal(tcc_state, 0, 1);
+  return 0;
+}
+
+UT_TEST(test_tcc_assemble_internal_macro_invocation)
+{
+  Section sec;
+  unsigned char buf[64];
+  int mname = token_for_name("mymacro");
+  int arg = token_for_name("x");
+
+  ut_setup_section(&sec, buf, sizeof(buf));
+  cur_text_section = &sec;
+  ind = 0;
+
+  utb_clear_token_q();
+  utb_queue_token(TOK_ASMDIR_macro);
+  utb_queue_token(mname);
+  utb_queue_token(arg);
+  utb_queue_token(TOK_LINEFEED);
+  utb_queue_token(TOK_ASMDIR_endm);
+  utb_queue_token(TOK_LINEFEED);
+  utb_queue_token(mname);
+  utb_queue_ppnum("42");
+  utb_queue_token(TOK_LINEFEED);
+  utb_queue_token(TOK_EOF);
+
+  tcc_assemble_internal(tcc_state, 0, 1);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(tccasm)
@@ -1482,4 +1823,18 @@ UT_SUITE(tccasm)
   UT_RUN(test_asm_parse_directive_macro_and_endm);
   UT_RUN(test_asm_parse_directive_rept_zero);
   UT_RUN(test_asm_parse_directive_file_and_ident);
+  UT_RUN(test_asm_parse_directive_set_feature);
+  UT_RUN(test_asm_parse_directive_asciz);
+  UT_RUN(test_asm_parse_directive_global_and_hidden);
+  UT_RUN(test_asm_parse_directive_type_object_and_unknown);
+  UT_RUN(test_asm_parse_directive_section_with_options);
+  UT_RUN(test_asm_parse_directive_push_and_popsection);
+  UT_RUN(test_asm_parse_directive_ident_with_identifier);
+  UT_RUN(test_asm_parse_directive_file_with_ppstr_and_identifier);
+  UT_RUN(test_asm_parse_directive_syntax_thumb_symver);
+  UT_RUN(test_asm_parse_directive_rept_nonzero);
+  UT_RUN(test_asm_parse_directive_macro_with_args);
+  UT_RUN(test_tcc_assemble_internal_comment_and_instruction);
+  UT_RUN(test_tcc_assemble_internal_directive);
+  UT_RUN(test_tcc_assemble_internal_macro_invocation);
 }

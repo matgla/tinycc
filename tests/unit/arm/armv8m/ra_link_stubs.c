@@ -22,22 +22,12 @@ const char *funcname = "unit_test";
  * gens_*_ex adapters) now provides the real, non-static definitions --
  * duplicating them here would be a link error (multiple definition). */
 
-/* SSA optimizer driver - enough to satisfy tcc_ir_ssa_regalloc's call sites
- * without running any real optimization passes.
- *
- * ctx->vinfo IS real (allocated/zeroed here, indexed by TEMP vreg position),
- * unlike earlier versions of this stub which left it NULL. Every ARM
- * target-specific SSA generator (arch/arm/ssa_opt_arm.c, exercised directly
- * by test_ssa_opt_arm.c) starts with a `ssa_opt_vinfo(ctx, vr)` lookup and
- * bails out immediately if it returns NULL -- so a NULL-returning stub made
- * ssa_opt_arm.c's fusion logic completely untestable (0% coverage) even
- * though the .o links fine. tcc_ir_ssa_opt_run/_run_target and all the
- * individual ssa_opt_<pass> functions below remain no-op stubs (regalloc.c's
- * only other caller doesn't need real pass behavior here), so this change is
- * purely additive: it does not alter tcc_ir_ssa_regalloc's observable
- * behavior (no pass ever populates or consults vinfo), it only makes the
- * struct usable by tests that build vinfo by hand and call an ARM ssa_gen_*
- * function directly. */
+/* SSA optimizer driver - guarded by UT_SSA_OPT_REAL so build_ssaopt can
+ * link the real ssa_opt*.c files without multiple-definition clashes.
+ * When UT_SSA_OPT_REAL is defined, this block is skipped and the real
+ * ssa_opt*.c files are linked instead (see the build_ssaopt target). */
+#ifndef UT_SSA_OPT_REAL
+/* Individual SSA optimization passes - all no-ops for RA isolation. */
 void tcc_ir_ssa_opt_init(IRSSAOptCtx *ctx, struct TCCIRState *ir,
                          struct IRSSAState *ssa, struct IRCFG *cfg)
 {
@@ -97,7 +87,6 @@ int ssa_opt_cprop(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_phi_simplify(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_strength(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
-int ssa_opt_gvn(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_reassoc(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_narrow(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_branch(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
@@ -237,3 +226,6 @@ int ssa_opt_indirect_stack_offset(IRSSAOptCtx *ctx, const struct IRQuadCompact *
   (void)side;
   return INT_MIN;
 }
+
+/* Guard end - see comment at top of file. */
+#endif /* UT_SSA_OPT_REAL */

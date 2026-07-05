@@ -1,4 +1,22 @@
 /*
+ *  stubs.c - shared UT stub, dual-build split.
+ *
+ *  This file is linked into several unit-test binaries with different needs:
+ *    - The main (run_unit_tests), backend (UT2) and other binaries do NOT
+ *      link libtcc.c, so they need the full stub layer below (allocators,
+ *      the tcc_state global, ELF/section fakes, etc.).
+ *    - build_ssaopt (UT11) links the REAL libtcc.c + ir/opt/ssa_opt*.c, which
+ *      already own those symbols; it compiles every TU with -DUT_SSA_OPT_REAL
+ *      (see the build_ssaopt rules in the Makefile), so the shared stubs must
+ *      be skipped there to avoid multiple-definition clashes.
+ *
+ *  Same guard idiom as ra_link_stubs.c. Keep the two branches in sync when a
+ *  new shared symbol is genuinely needed by BOTH builds (define it outside
+ *  the guard in that case).
+ */
+#ifndef UT_SSA_OPT_REAL
+/* ===== shared builds (main / backend / tccpp / ... ): full stub layer ===== */
+/*
  *  stubs.c - libtcc memory stubs for unit tests (no tcc.h)
  *
  *  Unit tests link only the modules under test, not the full libtcc.
@@ -507,3 +525,18 @@ int gv(int rc)
                    "path is not supported by this harness)\n");
   abort();
 }
+
+#else /* UT_SSA_OPT_REAL — build_ssaopt (UT11) ===================== */
+/*
+ *  stubs.c - stubs for the SSA optimizer test binary
+ *
+ *  Provides stubs for functions that are not needed in the isolated unit
+ *  test environment.
+ *
+ *  Note: tcc_malloc, tcc_free, tcc_realloc, tcc_strdup, _tcc_error,
+ *  _tcc_warning are all provided by libtcc.c which is linked into this
+ *  binary.
+ */
+
+/* Nothing to stub - all required functions are in libtcc.c. */
+#endif /* UT_SSA_OPT_REAL */

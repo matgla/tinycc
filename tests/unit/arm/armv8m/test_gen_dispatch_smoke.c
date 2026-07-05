@@ -28,6 +28,7 @@
 extern int offset_to_args;
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
+#include "ir_build.h"
 
 #include "ut.h"
 
@@ -878,6 +879,142 @@ UT_TEST(test_set_chain_emits_mov_r10_fp)
   return 0;
 }
 
+/* ------------------------------------------------------------------ store-to-stack helpers */
+
+UT_TEST(test_store_to_stack_fp_small_offset_emits_str)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  /* Negative FP-relative offset uses the subtract form -> 32-bit encoding. */
+  tcc_gen_machine_store_to_stack(R2, -8);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_str_imm(R2, R_FP, 8, 4 /* subtract */, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+UT_TEST(test_store_to_stack_ex_large_offset_uses_scratch)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  /* Offset -4092 is far outside the immediate range, so the helper falls back
+   * to materialising the offset in a scratch register and using STR (register). */
+  tcc_gen_machine_store_to_stack_ex(R2, -4092, 0);
+
+  UT_ASSERT(ind > 2);
+
+  return 0;
+}
+
+UT_TEST(test_store_to_sp_small_offset_emits_str)
+{
+  setup_gen();
+
+  /* SP-relative positive offset.  SP is a high register so the T1 form is
+   * unavailable; assert the emitted bytes match the oracle. */
+  tcc_gen_machine_store_to_sp(R2, 8);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_str_imm(R2, R_SP, 8, 6 /* add */, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ STRD immediate pairing */
+
+UT_TEST(test_try_strd_imm_spill_distinct_values_emits_strd)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  int ok = tcc_gen_machine_try_strd_imm_spill(1, 2, -8, -4);
+
+  UT_ASSERT_EQ(ok, 1);
+  UT_ASSERT(ind > 0);
+
+  return 0;
+}
+
+UT_TEST(test_try_strd_imm_spill_equal_values_reuses_reg)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  int ok = tcc_gen_machine_try_strd_imm_spill(5, 5, -8, -4);
+
+  UT_ASSERT_EQ(ok, 1);
+  UT_ASSERT(ind > 0);
+
+  return 0;
+}
+
+UT_TEST(test_try_strd_imm_spill_non_adjacent_offsets_returns_zero)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  int ok = tcc_gen_machine_try_strd_imm_spill(1, 2, -8, -12);
+
+  UT_ASSERT_EQ(ok, 0);
+  UT_ASSERT_EQ(ind, 0);
+
+  return 0;
+}
+
+UT_TEST(test_try_strd_imm_base_distinct_values_emits_strd)
+{
+  setup_gen();
+
+  int ok = tcc_gen_machine_try_strd_imm_base(1, 2, R4, 8);
+
+  UT_ASSERT_EQ(ok, 1);
+  UT_ASSERT(ind > 0);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ spill block copy */
+
+UT_TEST(test_spill_block_copy_two_words_emits_code)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  tcc_gen_machine_spill_block_copy(-16, -24, 2);
+
+  UT_ASSERT(ind > 0);
+
+  return 0;
+}
+
+/* ------------------------------------------------------------------ chain slot init */
+
+UT_TEST(test_init_chain_slot_emits_store_to_chain)
+{
+  setup_gen();
+  /* init_chain_slot uses the literal pool; arm_init() initializes it,
+   * whereas arm_target_init() (used by setup_gen) does not. */
+  arm_init(tcc_state);
+  tcc_state->need_frame_pointer = 1;
+
+  TCCIRState *ir = tcc_ir_alloc();
+  tcc_state->ir = ir;
+
+  Sym *chain_sym = get_sym_ref(NULL, cur_text_section, 0, 0);
+  UT_ASSERT(chain_sym != NULL);
+
+  IROperand src = utb_symref(ir, chain_sym, 0, 0, 0, IROP_BTYPE_INT32);
+  tcc_gen_machine_init_chain_slot(src);
+
+  UT_ASSERT(ind > 0);
+
+  tcc_state->ir = NULL;
+  tcc_ir_free(ir);
+
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(gen_dispatch_smoke)
@@ -946,4 +1083,17 @@ UT_SUITE(gen_dispatch_smoke)
   UT_RUN(test_number_of_registers_returns_11);
   UT_RUN(test_pending_pool_size_empty_returns_zero);
   UT_RUN(test_set_chain_emits_mov_r10_fp);
+
+  UT_RUN(test_store_to_stack_fp_small_offset_emits_str);
+  UT_RUN(test_store_to_stack_ex_large_offset_uses_scratch);
+  UT_RUN(test_store_to_sp_small_offset_emits_str);
+
+  UT_RUN(test_try_strd_imm_spill_distinct_values_emits_strd);
+  UT_RUN(test_try_strd_imm_spill_equal_values_reuses_reg);
+  UT_RUN(test_try_strd_imm_spill_non_adjacent_offsets_returns_zero);
+  UT_RUN(test_try_strd_imm_base_distinct_values_emits_strd);
+
+  UT_RUN(test_spill_block_copy_two_words_emits_code);
+
+  UT_RUN(test_init_chain_slot_emits_store_to_chain);
 }

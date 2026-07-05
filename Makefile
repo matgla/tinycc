@@ -790,6 +790,15 @@ tcov-tes% : tcc_c$(EXESUF)
 	@$(MAKE) --no-print-directory TCC_LOCAL=$(CURDIR)/$< tes$*
 tcc_c$(EXESUF): $($T_FILES)
 	$S$(TCC) tcc.c -o $@ -ftest-coverage $(DEFINES) $(LIBS)
+
+# Merged line-coverage report for tccgen.c: the real cross compiler (tccgen.c
+# instrumented) run over the whole compile-test corpus, unioned with the
+# isolated tccgen unit tests.  Restores the normal build on exit.  Requires
+# lcov/genhtml.  Tunables: COV_JOBS, COV_OLEVELS, COV_OUT, COV_NO_TORTURE=1.
+# Output: coverage-tccgen/index.html + coverage-tccgen/tccgen.info
+.PHONY: coverage-tccgen
+coverage-tccgen:
+	@$(TOPSRC)/scripts/coverage_tccgen.sh
 # test the installed tcc instead
 test-install: $(TCCDEFS_H)
 	@$(MAKE) -C tests TESTINSTALL=yes #_all
