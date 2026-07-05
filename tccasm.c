@@ -523,6 +523,18 @@ static Sym *asm_new_label1(TCCState *s1, int label, int is_local, int sh_num, in
     s1->thumb_func = 0;
     esym->st_value += 1;
   }
+#ifdef TCC_TARGET_ARM_THUMB
+  /* ARMv8-M is Thumb-only: a defined function symbol's value must carry
+     bit 0 (the Thumb bit). tcc's C backend already sets it; do the same for
+     hand-written asm that types a label with `.type X, %function` (e.g.
+     lib/arm_string.S and the lib/fp soft-float routines). Otherwise GNU ld -- which links the
+     tcc runtime archives into the pico-sdk benchmark -- reports "unknown
+     destination type (ARM/Thumb)", and Thumb function pointers to these
+     routines would drop into ARM mode. tcc's own linker drops bit 0 when it
+     encodes the branch offset, so setting it here is transparent there. */
+  else if (sh_num != SHN_UNDEF && ELFW(ST_TYPE)(esym->st_info) == STT_FUNC && (esym->st_value & 1) == 0)
+    esym->st_value += 1;
+#endif
   if (is_local != 2)
     sym->type.t &= ~VT_EXTERN;
   return sym;
@@ -1076,6 +1088,13 @@ static void asm_parse_directive(TCCState *s1, int global)
       {
         ElfSym *esym = elfsym(sym);
         esym->st_info = ELFW(ST_INFO)(ELFW(ST_BIND)(esym->st_info), st_type);
+#ifdef TCC_TARGET_ARM_THUMB
+        /* `.type X, %function` applied after X is already defined (GAS allows
+           either order): set the Thumb bit now too. See asm_new_label1. */
+        if (st_type == STT_FUNC && esym->st_shndx != SHN_UNDEF && esym->st_shndx < SHN_LORESERVE
+            && (esym->st_value & 1) == 0)
+          esym->st_value += 1;
+#endif
       }
     }
     else if (!strcmp(newtype, "object") || !strcmp(newtype, "STT_OBJECT"))
