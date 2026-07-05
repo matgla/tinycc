@@ -1328,6 +1328,32 @@ def print_comparison(tcc_result: CompilerResult, gcc_result: CompilerResult):
     print("="*80)
 
 
+def detect_perf_failure(results: Dict[str, Optional['CompilerResult']],
+                        expected_keys: List[str]) -> List[str]:
+    """Return human-readable reasons this benchmark run failed *operationally*
+    (build/flash/run failed, produced no data, HARDFAULT/timeout, or an
+    on-hardware verify FAIL).  Empty list == clean run.
+
+    This is deliberately distinct from a perf *regression* (slower cycles):
+    regressions are noisy and visibility-only (metrics/gate.py), whereas an
+    operational failure means the benchmark did not run and pass, so its
+    numbers are absent or untrustworthy and CI must not stay green on it."""
+    reasons = []
+    for key in expected_keys:
+        res = results.get(key)
+        if res is None:
+            reasons.append(f"{key}: build/flash produced no result")
+            continue
+        if not res.build_success:
+            reasons.append(f"{key}: run failed (build/flash/HARDFAULT/timeout/no data)")
+        elif not res.benchmarks:
+            reasons.append(f"{key}: no benchmark rows parsed")
+        failed = [b.name for b in res.benchmarks if b.verify == "FAIL"]
+        if failed:
+            reasons.append(f"{key}: on-hardware verify FAIL: {', '.join(failed)}")
+    return reasons
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Build, run and compare TCC vs GCC benchmarks on RP2350"
@@ -1509,6 +1535,11 @@ def main():
     print(f"Target: {username}@{hostname}:{args.port}")
     print("")
 
+    # Pre-init every result slot so the failure sweep below can reference them
+    # regardless of which opt-level branch ran (unassigned locals would NameError).
+    tcc_o0 = tcc_o1 = tcc_o2 = gcc_o0 = gcc_o1 = gcc_o2 = None
+    tcc_result = gcc_result = None
+
     # Run based on optimization level selection
     if args.opt_level == "all":
         # Run -O0, -O1, -O2 for both compilers = 6 hardware flashes
@@ -1551,6 +1582,22 @@ def main():
         # Print comparison if both results available
         if tcc_result and gcc_result and tcc_result.build_success and gcc_result.build_success:
             print_comparison(tcc_result, gcc_result)
+
+    # Collect every produced result under its canonical key (tcc_o0..gcc_o2) so
+    # the exit-code sweep and --save-data agree on what ran.  Single-opt runs
+    # land in tcc_result/gcc_result; map them onto the same key scheme.
+    all_results = {
+        'tcc_o0': tcc_o0, 'tcc_o1': tcc_o1, 'tcc_o2': tcc_o2,
+        'gcc_o0': gcc_o0, 'gcc_o1': gcc_o1, 'gcc_o2': gcc_o2,
+    }
+    if args.opt_level not in ("all", "both"):
+        all_results[f'tcc_o{args.opt_level}'] = tcc_result
+        all_results[f'gcc_o{args.opt_level}'] = gcc_result
+
+    _levels = {"0": ["0"], "1": ["1"], "2": ["2"],
+               "both": ["0", "1"], "all": ["0", "1", "2"]}[args.opt_level]
+    _comps = [args.only] if args.only else ["tcc", "gcc"]
+    expected_keys = [f"{c}_o{l}" for c in _comps for l in _levels]
 
     # Save to file if requested
     if args.output:
@@ -1626,6 +1673,20 @@ def main():
         save_results_json(args.save_data, save_dict)
 
     print("\nDone!")
+
+    # Truthful exit code: a benchmark that built, flashed, ran and verified
+    # cleanly exits 0; any operational failure exits 1 so callers (CI /
+    # metrics/record.py) don't mistake a broken run for a clean one.  Perf
+    # *regressions* (slower cycles) are NOT failures here -- those are the
+    # gate's job.  --save-data above already wrote whatever partial data we got.
+    reasons = detect_perf_failure(all_results, expected_keys)
+    if reasons:
+        print("\n" + "=" * 80)
+        print("BENCHMARK RUN FAILED (operational failure, not a perf regression):")
+        for r in reasons:
+            print(f"  - {r}")
+        print("=" * 80)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

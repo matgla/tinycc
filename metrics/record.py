@@ -291,10 +291,18 @@ def import_codesize(conn, run_id, src_db_path, commit_sha) -> bool:
 
 # ------------------------------------------------------------------------ perf
 
-def record_perf(conn, run_id, perf_host, perf_identity, scratch: Path) -> None:
-    """Run the RP2350 benchmark over SSH and store cycles/build-size.  Any
-    failure (no host, SSH down, no board) is non-fatal: perf is simply absent
-    for this commit and the dashboard shows a gap."""
+def record_perf(conn, run_id, perf_host, perf_identity, scratch: Path,
+                strict: bool = False) -> None:
+    """Run the RP2350 benchmark over SSH and store cycles/build-size.
+
+    By default any failure (no host, SSH down, no board) is non-fatal: perf is
+    simply absent for this commit and the dashboard shows a gap.
+
+    With strict=True (the CI perf job, which runs on the dedicated board host)
+    an operational benchmark failure -- run_benchmark.py exiting non-zero,
+    producing no data, or an on-hardware verify FAIL -- is fatal, so the job
+    goes red instead of silently green.  This does NOT gate on perf *numbers*
+    (slower cycles); regression gating is metrics/gate.py's job."""
     if not perf_host:
         return
     json_out = scratch / "perf.json"
@@ -309,10 +317,24 @@ def record_perf(conn, run_id, perf_host, perf_identity, scratch: Path) -> None:
     info(f"perf: launching RP2350 benchmark on {perf_host} (6 builds; may take several minutes) ...")
     rc = subprocess.run(cmd, cwd=str(REPO_ROOT)).returncode
     if rc != 0 or not json_out.exists():
-        warn("perf skipped: RP2350 benchmark did not produce data")
+        msg = (f"RP2350 benchmark failed (exit {rc}, data "
+               f"{'present' if json_out.exists() else 'missing'})")
+        if strict:
+            die(f"perf: {msg}")
+        warn(f"perf skipped: {msg}")
         return
     from run_benchmark import load_results_json
     results = load_results_json(str(json_out))
+    # Defense in depth: run_benchmark.py now exits non-zero on a verify FAIL, so
+    # the rc check above normally catches it; re-check the loaded data anyway so
+    # a future regression that swallows the exit code can't slip a bad row past
+    # strict mode.  (Dies before commit -> no perf rows this run, dashboard gap.)
+    if strict:
+        bad = [f"{key}:{b.name}" for key, res in results.items()
+               for b in res.benchmarks if b.verify == "FAIL"]
+        if not results or bad:
+            die("perf: on-hardware verify FAIL: "
+                + (", ".join(bad) or "no benchmark results produced"))
     n = 0
     for key, res in results.items():
         # key like 'tcc_o2' / 'gcc_o0'; res.compiler is 'TCC'/'GCC'
@@ -346,7 +368,7 @@ def record_one(conn, meta, host, branch, trigger, args, tcc_override=None,
         record_compile_time(conn, run_id, corpus_secs, n_units[0] if n_units else None)
     if do_perf and args.perf_host:
         record_perf(conn, run_id, args.perf_host, args.perf_identity,
-                    Path(args.scratch or "."))
+                    Path(args.scratch or "."), strict=args.perf_strict)
     conn.execute("UPDATE runs SET wall_seconds=? WHERE run_id=?",
                  (time.monotonic() - t0, run_id))
     conn.commit()
@@ -426,6 +448,12 @@ def main(argv=None) -> int:
                    help="also store per-function code size (large; nightly)")
     p.add_argument("--perf-host", help="SSH host for the RP2350 benchmark (omit to skip perf)")
     p.add_argument("--perf-identity", help="SSH identity file for --perf-host")
+    p.add_argument("--perf-strict", action="store_true",
+                   help="treat an operational perf-run failure (run_benchmark.py "
+                        "exiting non-zero / no data / on-hardware verify FAIL) as "
+                        "fatal so CI goes red. Default: perf failure is non-fatal "
+                        "(dashboard gap). Does not gate on perf numbers -- that is "
+                        "metrics/gate.py's job.")
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     p.add_argument("--host", default=os.environ.get("METRICS_HOST") or socket.gethostname())
     p.add_argument("--branch", default="mob")

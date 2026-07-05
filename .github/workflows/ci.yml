@@ -8,52 +8,12 @@ on:
   workflow_dispatch:
 
 env:
-  # Stable synthetic key both metrics jobs record under (metrics.db keys runs
-  # by commit_sha+host) -- decoupled from the Pi's actual hostname so the
-  # cloud-recorded codesize/compile-time rows and the Pi-recorded perf rows
-  # land on the SAME run instead of two separate per-host rows.
+  # Stable synthetic key the metrics job records under (metrics.db keys runs by
+  # commit_sha+host) -- decoupled from the Pi's actual hostname so dashboard
+  # rows stay under one stable host even if the runner hostname changes.
   METRICS_HOST: armv8m-metrics
 
 jobs:
-  # Builds the cross compiler once and shares it (via artifact) with
-  # build-and-measure and rp2350-perf below, so metrics never repeats this
-  # build. build-and-test does NOT consume this artifact: `make test` has
-  # `cross` as a prerequisite that reaches through object files and
-  # checksum/fp-libs/PCH stamp files (Makefile:206-234), not just the final
-  # binary, so dropping in a pre-built armv8m-tcc wouldn't save it a
-  # recompile -- make would just rebuild the missing intermediates anyway.
-  build:
-    runs-on: ubuntu-latest
-    permissions:
-      packages: read
-    container:
-      image: ghcr.io/matgla/tinycc-armv8m:latest
-      options: --user root
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          # depth 1 is enough: the build only stamps a version string with
-          # git rev-parse/log -1/diff (Makefile:338-341), no history walk.
-          fetch-depth: 1
-
-      - name: Build cross compiler
-        run: ./configure --enable-cross --enable-O2 --debug && make cross -j$(nproc)
-
-      - name: Upload tcc build
-        uses: actions/upload-artifact@v4
-        with:
-          name: tcc-cross-build-${{ github.sha }}
-          path: |
-            armv8m-tcc
-            armv8m-libtcc1.a
-          retention-days: 1
-
   build-and-test:
     runs-on: ubuntu-latest
     permissions:
@@ -119,69 +79,17 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
-  # Code size + compile time: no RP2350 board needed, so this reuses the
-  # `build` job's artifact on a regular (fast) GitHub-hosted runner instead
-  # of rebuilding (as it used to) or running on the shared Pi.
-  build-and-measure:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      packages: read
-    container:
-      image: ghcr.io/matgla/tinycc-armv8m:latest
-      options: --user root
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          # depth 1 is enough: record.py only runs `git show -s HEAD`
-          # (record.py:90) on the normal --rev HEAD path; the first-parent
-          # history walk is --backfill only, which CI never invokes.
-          fetch-depth: 1
-
-      - name: Mark workspace as a safe git directory
-        # actions/checkout runs on the runner host and configures safe.directory
-        # there, but `run:` steps in a container job execute as a different
-        # user/HOME inside the container -- that config never reaches it, so any
-        # git command run from a `run:` step (e.g. metrics/record.py) fails with
-        # "detected dubious ownership" on the bind-mounted repo.
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Download tcc build
-        uses: actions/download-artifact@v4
-        with:
-          name: tcc-cross-build-${{ github.sha }}
-
-      - name: Make tcc executable
-        run: chmod +x armv8m-tcc
-
-      - name: Record codesize + compile time
-        # --codesize-detail fills the per-function codesize_func table (the
-        # test-by-test drill-down in Grafana). Cheap here on the fast runner;
-        # the rows ride the scratch db over to the Pi via --import-codesize-from.
-        run: |
-          python3 metrics/record.py --db /tmp/metrics-scratch.db --rev HEAD \
-              --no-correctness --codesize-detail --jobs "$(nproc)" \
-              --host "$METRICS_HOST" --trigger "${{ github.event_name }}"
-
-      - name: Upload metrics scratch db
-        uses: actions/upload-artifact@v4
-        with:
-          name: metrics-scratch-${{ github.sha }}
-          path: /tmp/metrics-scratch.db
-          retention-days: 1
-
-  # RP2350 hardware perf: the only part of this workflow that actually needs
-  # the board, so it's the only part still pinned to the self-hosted Pi.
-  rp2350-perf:
-    needs: build-and-measure
+  # Metrics: code size (tcc-vs-gcc disasm comparison) + compile time + RP2350
+  # hardware perf, all on the self-hosted Pi in one job. Merged from the old
+  # split build-and-measure (cloud codesize) + rp2350-perf (board perf): the
+  # cross compiler is host-native, so it can't be handed to the aarch64 Pi as
+  # an artifact anyway -- and the Pi already has the arm-none-eabi toolchain
+  # the disasm comparison needs, so there's nothing to offload to the cloud.
+  # One record.py call measures codesize and perf locally against the same
+  # freshly built tcc, so no scratch-db round-trip / --import-codesize-from.
+  metrics:
     runs-on: [self-hosted, rpi5, pimoroni_pico_plus2]
-    timeout-minutes: 90
+    timeout-minutes: 120
     concurrency:
       group: metrics-rpi5
       cancel-in-progress: false
@@ -201,27 +109,25 @@ jobs:
           fetch-depth: 1
 
       - name: Build cross compiler
-        # The self-hosted runner is aarch64 (RPi5); the `build` job's
-        # tcc-cross-build artifact is an x86_64 binary and cannot exec here
-        # (the shell falls back to interpreting it: "Syntax error: )
-        # unexpected"). armv8m-tcc is a *cross* compiler -- it targets
-        # ARMv8-M but the binary itself is host-native, so it must be built
-        # on the runner that runs it. Same config as the `build` job so the
-        # codegen matches the cloud-recorded codesize rows imported below.
+        # armv8m-tcc is a *cross* compiler: it targets ARMv8-M but the binary
+        # itself is host-native, so it must be built on this aarch64 Pi rather
+        # than shared from an x86_64 runner (an x86_64 build can't exec here --
+        # the shell would fall back to interpreting it: "Syntax error: )
+        # unexpected"). --enable-O2/--debug only affect tcc's own binary, not
+        # the code it emits, so codesize/perf are unaffected by this config.
         run: ./configure --enable-cross --enable-O2 --debug && make cross -j$(nproc)
 
-      - name: Download metrics scratch db
-        uses: actions/download-artifact@v4
-        with:
-          name: metrics-scratch-${{ github.sha }}
-          path: /tmp/downloaded-metrics
-
-      - name: Record perf (import codesize/compile time from the cloud build)
+      - name: Record codesize + compile time + perf
+        # --codesize-detail runs the tcc-vs-gcc disasm comparison over the
+        # corpus (fills codesize_rollup + the per-function codesize_func table
+        # for Grafana's drill-down); --perf-host runs the RP2350 board
+        # benchmark. Both land in the real metrics.db under the same run.
+        # --keep 20 prunes older runs to bound DB growth from --codesize-detail.
         run: |
           python3 metrics/record.py --db "$METRICS_DB" --rev HEAD --no-correctness \
-              --import-codesize-from /tmp/downloaded-metrics/metrics-scratch.db \
-              --jobs "$(nproc)" --host "$METRICS_HOST" --trigger "${{ github.event_name }}" \
-              --perf-host "$PERF_HOST" --perf-identity "$PERF_IDENTITY" \
+              --codesize-detail --jobs "$(nproc)" \
+              --host "$METRICS_HOST" --trigger "${{ github.event_name }}" \
+              --perf-host "$PERF_HOST" --perf-identity "$PERF_IDENTITY" --perf-strict \
               --branch mob --keep 20
 
       - name: Gate
