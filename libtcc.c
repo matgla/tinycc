@@ -2271,7 +2271,12 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       break;
     case TCC_OPTION_O:
       s->optimize = atoi(optarg);
-      /* Enable all IR optimizations when -O1 or higher */
+      /* -O1: scalar cleanup, cheap ARM addressing-mode fusion, constant/range
+       * folding, loop rotation, and light inlining of explicitly-inline / tiny
+       * functions — the same class of work GCC does at -O1.  The heavy tier
+       * (loop unrolling / IV strength reduction / LICM, MUL+ADD→MLA fusion,
+       * interprocedural const-prop, re-rolling, and full small-function
+       * inlining) is gated to -O2. */
       if (s->optimize >= 1)
       {
         s->opt_dce = 1;
@@ -2295,28 +2300,32 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
                                     * (tcc froze in parse_number on every integer literal).
                                     * Without the fusion `*p++` lowers to an explicit
                                     * LOAD + ADD whose result is written back correctly. */
-        s->opt_mla_fusion = 1;     /* Fuse MUL+ADD into MLA */
-        /* fp-offset-cache disabled: miscompiles loops when combined with
-           iv-strength-red (e.g. SHA-1 sha_transform).  Can still be
-           enabled manually with -ffp-offset-cache for debugging. */
         s->opt_stack_addr_cse = 1;  /* Hoist repeated stack address computations */
-        s->opt_licm = 1;            /* Loop-invariant code motion */
-        s->opt_ipc = 1;             /* Interprocedural constant propagation */
-        s->opt_strength_red = 1;    /* Strength reduction for multiply */
-        s->opt_iv_strength_red = 1; /* IV strength reduction for array loops */
-        s->opt_loop_unroll = 1;    /* Full-unroll small constant-trip-count loops */
-        s->opt_loop_rotation = 1;  /* Rotate top-tested loops to bottom-tested */
-        s->opt_reroll = 1;          /* Re-roll runs of identical macro-unrolled blocks */
+        s->opt_strength_red = 1;    /* Strength reduction for multiply (peephole) */
         s->opt_nonneg_fold = 1;     /* Non-negative value branch folding */
         s->opt_vrp = 1;             /* Value range propagation branch folding */
         s->opt_float_narrow = 1;    /* Narrow double math to float when safe */
         s->opt_jump_threading = 1;  /* Jump threading optimization */
+        s->opt_loop_rotation = 1;   /* Rotate top-tested loops to bottom-tested */
         s->opt_inline_small = 1;    /* Inline tiny static/inline functions (≤30 words) */
         if (!s->opt_inline_limit)
           s->opt_inline_limit = 30;
       }
+      /* -O2: everything in -O1 plus the heavy tier — loop unrolling / IV
+       * strength reduction / LICM / re-rolling, MUL+ADD→MLA fusion,
+       * interprocedural constant propagation, and full small-function
+       * inlining. */
       if (s->optimize >= 2)
       {
+        s->opt_mla_fusion = 1;      /* Fuse MUL+ADD into MLA */
+        /* fp-offset-cache disabled: miscompiles loops when combined with
+           iv-strength-red (e.g. SHA-1 sha_transform).  Can still be
+           enabled manually with -ffp-offset-cache for debugging. */
+        s->opt_licm = 1;            /* Loop-invariant code motion */
+        s->opt_ipc = 1;             /* Interprocedural constant propagation */
+        s->opt_iv_strength_red = 1; /* IV strength reduction for array loops */
+        s->opt_loop_unroll = 1;     /* Full-unroll small constant-trip-count loops */
+        s->opt_reroll = 1;          /* Re-roll runs of identical macro-unrolled blocks */
         s->opt_inline_functions = 1; /* Inline small static/inline functions (≤100 words) */
         if (s->opt_inline_limit < 100)
           s->opt_inline_limit = 100;

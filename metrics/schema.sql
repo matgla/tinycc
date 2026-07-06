@@ -11,7 +11,12 @@
 --
 -- Apply with:  sqlite3 metrics.db < metrics/schema.sql   (safe to re-run).
 
-PRAGMA journal_mode = WAL;      -- Grafana reads never block the recorder's writes
+-- NOT WAL: Grafana bind-mounts this file read-only (docker-compose.yml `:ro`),
+-- and SQLite cannot open a WAL database read-only -- even a SELECT must write the
+-- -wal/-shm sidecars, which fails with "attempt to write a readonly database".
+-- Rollback-journal mode reads fine from read-only media; at a once-per-commit
+-- write cadence the recorder (busy timeout 60s) and the dashboard never contend.
+PRAGMA journal_mode = DELETE;
 PRAGMA foreign_keys = ON;
 
 -- One row per (commit, host).  parent_sha = first parent, used by the
