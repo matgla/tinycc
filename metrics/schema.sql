@@ -73,34 +73,39 @@ CREATE TABLE IF NOT EXISTS correctness_seed (
     PRIMARY KEY(run_id, profile, oracle, seed)
 );
 
--- (2a) code-size ROLLUP -- always written, small (one row per suite + a
--- '<total>' grand-total row).  ratio = tcc_o2 / gcc_o2.
+-- (2a) code-size ROLLUP -- always written, small (one row per (suite, opt) + a
+-- '<total>' grand-total row per opt).  ratio = tcc_size / gcc_size at that opt.
+-- opt is 'o0'|'o1'|'o2': TCC and GCC are both compiled at the SAME level, so
+-- each series compares like-for-like (tcc -O1 vs gcc -O1, etc.).
 CREATE TABLE IF NOT EXISTS codesize_rollup (
     run_id     INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     suite      TEXT    NOT NULL,      -- '<total>' for the grand total
+    opt        TEXT    NOT NULL,      -- 'o0' | 'o1' | 'o2'
     func_count INTEGER NOT NULL,
-    tcc_o2     INTEGER NOT NULL,
-    gcc_o2     INTEGER NOT NULL,
+    tcc_size   INTEGER NOT NULL,
+    gcc_size   INTEGER NOT NULL,
     ratio      REAL    NOT NULL,
-    PRIMARY KEY(run_id, suite)
+    PRIMARY KEY(run_id, suite, opt)
 );
 
--- (2b) code-size DETAIL -- per-function; large (~thousands of rows/run), so
--- written only when the recorder is invoked with --codesize-detail (nightly).
+-- (2b) code-size DETAIL -- per-function per opt; large (~thousands of rows/run
+-- x 3 opts), so written only when the recorder is invoked with
+-- --codesize-detail (nightly).
 CREATE TABLE IF NOT EXISTS codesize_func (
     run_id   INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     suite    TEXT    NOT NULL,
     test     TEXT    NOT NULL,
     function TEXT    NOT NULL,
-    tcc_o2   INTEGER NOT NULL,
-    gcc_o2   INTEGER NOT NULL,
+    opt      TEXT    NOT NULL,        -- 'o0' | 'o1' | 'o2'
+    tcc_size INTEGER NOT NULL,
+    gcc_size INTEGER NOT NULL,
     ratio    REAL    NOT NULL,
-    PRIMARY KEY(run_id, suite, test, function)
+    PRIMARY KEY(run_id, suite, test, function, opt)
 );
 
--- (3) compile time.  scope='codesize_corpus_o2' is the wall time of the code-size
--- corpus compile (deterministic, no hardware); n_units = function count for
--- throughput normalization.
+-- (3) compile time.  scope='codesize_corpus_o0'|'o1'|'o2' is the wall time of the
+-- code-size corpus compile at that TCC opt level (deterministic, no hardware);
+-- n_units = function count for throughput normalization.
 CREATE TABLE IF NOT EXISTS compile_time (
     run_id  INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     scope   TEXT    NOT NULL,

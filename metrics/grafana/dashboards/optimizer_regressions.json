@@ -5,7 +5,7 @@
   "tags": ["tinycc", "optimizer"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "editable": true,
   "time": { "from": "now-2y", "to": "now" },
   "refresh": "",
@@ -16,8 +16,8 @@
         "type": "query",
         "label": "Test (suite/file)",
         "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-        "definition": "SELECT DISTINCT suite || '/' || test FROM codesize_func ORDER BY 1",
-        "query": "SELECT DISTINCT suite || '/' || test FROM codesize_func ORDER BY 1",
+        "definition": "SELECT DISTINCT suite || '/' || test FROM codesize_func WHERE opt = 'o2' ORDER BY 1",
+        "query": "SELECT DISTINCT suite || '/' || test FROM codesize_func WHERE opt = 'o2' ORDER BY 1",
         "refresh": 2,
         "sort": 1,
         "includeAll": false,
@@ -25,6 +25,21 @@
         "hide": 0,
         "current": {},
         "options": []
+      },
+      {
+        "name": "opt",
+        "type": "custom",
+        "label": "Opt level (per-function panels)",
+        "query": "o0,o1,o2",
+        "current": { "text": "o2", "value": "o2" },
+        "options": [
+          { "text": "o0", "value": "o0", "selected": false },
+          { "text": "o1", "value": "o1", "selected": false },
+          { "text": "o2", "value": "o2", "selected": true }
+        ],
+        "includeAll": false,
+        "multi": false,
+        "hide": 0
       }
     ]
   },
@@ -64,33 +79,35 @@
     },
     {
       "id": 3,
-      "title": "Code size vs GCC (tcc_O2 / gcc_O2 ratio, <total>)",
+      "title": "Code size vs GCC (tcc/gcc ratio, <total>) by opt",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+      "description": "Total tcc/gcc instruction-count ratio over the whole corpus, one line per opt level (both compilers built at that level). Lower = closer to GCC.",
       "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true }, "unit": "none" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
           "format": "time_series",
-          "queryText": "SELECT r.commit_ts * 1000 AS time, cr.suite AS metric, cr.ratio AS value FROM codesize_rollup cr JOIN runs r USING(run_id) WHERE cr.suite = '<total>' ORDER BY time"
+          "queryText": "SELECT r.commit_ts * 1000 AS time, cr.opt AS metric, cr.ratio AS value FROM codesize_rollup cr JOIN runs r USING(run_id) WHERE cr.suite = '<total>' ORDER BY time"
         }
       ]
     },
     {
       "id": 4,
-      "title": "Compile time (code-size corpus, -O2)",
+      "title": "Compile time (code-size corpus) by opt",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+      "description": "Wall time to compile the code-size corpus at each TCC opt level.",
       "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true }, "unit": "s" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
           "format": "time_series",
-          "queryText": "SELECT r.commit_ts * 1000 AS time, ct.seconds AS value FROM compile_time ct JOIN runs r USING(run_id) WHERE ct.scope = 'codesize_corpus_o2' ORDER BY time"
+          "queryText": "SELECT r.commit_ts * 1000 AS time, replace(ct.scope, 'codesize_corpus_', '') AS metric, ct.seconds AS value FROM compile_time ct JOIN runs r USING(run_id) WHERE ct.scope LIKE 'codesize_corpus_o%' ORDER BY time"
         }
       ]
     },
@@ -127,52 +144,52 @@
     },
     {
       "id": 7,
-      "title": "Code-size delta vs parent — per function (latest commit)",
+      "title": "Code-size delta vs parent — per function (latest commit, $opt)",
       "type": "table",
       "gridPos": { "h": 9, "w": 24, "x": 0, "y": 24 },
       "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-      "description": "Per-function instruction-count change between the newest recorded commit and its first parent. Positive delta = grew (regression); ordered worst-first. Populated by record.py --codesize-detail.",
+      "description": "Per-function instruction-count change between the newest recorded commit and its first parent, at the $opt level. Positive delta = grew (regression); ordered worst-first. Populated by record.py --codesize-detail.",
       "fieldConfig": { "defaults": {}, "overrides": [] },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
           "format": "table",
-          "queryText": "SELECT cf.suite, cf.test, cf.function, cf.tcc_o2 AS now, pf.tcc_o2 AS parent, (cf.tcc_o2 - pf.tcc_o2) AS delta FROM codesize_func cf JOIN runs r USING(run_id) JOIN runs rp ON rp.commit_sha = r.parent_sha AND rp.host = r.host JOIN codesize_func pf ON pf.run_id = rp.run_id AND pf.suite = cf.suite AND pf.test = cf.test AND pf.function = cf.function WHERE r.run_id = (SELECT run_id FROM runs ORDER BY commit_ts DESC LIMIT 1) AND cf.tcc_o2 <> pf.tcc_o2 ORDER BY delta DESC"
+          "queryText": "SELECT cf.suite, cf.test, cf.function, cf.tcc_size AS now, pf.tcc_size AS parent, (cf.tcc_size - pf.tcc_size) AS delta FROM codesize_func cf JOIN runs r USING(run_id) JOIN runs rp ON rp.commit_sha = r.parent_sha AND rp.host = r.host JOIN codesize_func pf ON pf.run_id = rp.run_id AND pf.suite = cf.suite AND pf.test = cf.test AND pf.function = cf.function AND pf.opt = cf.opt WHERE r.run_id = (SELECT run_id FROM runs ORDER BY commit_ts DESC LIMIT 1) AND cf.opt = '${opt}' AND cf.tcc_size <> pf.tcc_size ORDER BY delta DESC"
         }
       ]
     },
     {
       "id": 8,
-      "title": "Worst tcc/gcc code-size ratio (latest commit, top 50)",
+      "title": "Worst tcc/gcc code-size ratio (latest commit, $opt, top 50)",
       "type": "table",
       "gridPos": { "h": 9, "w": 12, "x": 0, "y": 33 },
       "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-      "description": "Functions where TinyCC emits the most instructions relative to GCC -O2 in the newest recorded commit. The standing 'where are we worst' list, independent of any regression.",
+      "description": "Functions where TinyCC emits the most instructions relative to GCC at the $opt level in the newest recorded commit. The standing 'where are we worst' list, independent of any regression.",
       "fieldConfig": { "defaults": {}, "overrides": [] },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
           "format": "table",
-          "queryText": "SELECT cf.suite, cf.test, cf.function, cf.tcc_o2, cf.gcc_o2, cf.ratio FROM codesize_func cf WHERE cf.run_id = (SELECT run_id FROM runs ORDER BY commit_ts DESC LIMIT 1) AND cf.gcc_o2 > 0 ORDER BY cf.ratio DESC LIMIT 50"
+          "queryText": "SELECT cf.suite, cf.test, cf.function, cf.tcc_size, cf.gcc_size, cf.ratio FROM codesize_func cf WHERE cf.run_id = (SELECT run_id FROM runs ORDER BY commit_ts DESC LIMIT 1) AND cf.opt = '${opt}' AND cf.gcc_size > 0 ORDER BY cf.ratio DESC LIMIT 50"
         }
       ]
     },
     {
       "id": 9,
-      "title": "Code size over commits — $test (instructions, tcc vs gcc, -O2)",
+      "title": "Code size over commits — $test (instructions, tcc vs gcc, $opt)",
       "type": "timeseries",
       "gridPos": { "h": 9, "w": 12, "x": 12, "y": 33 },
       "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-      "description": "History of the selected test's total instruction count (summed over its functions), TinyCC vs GCC -O2. Pick a test in the '$test' dropdown at the top.",
+      "description": "History of the selected test's total instruction count (summed over its functions) at the $opt level, TinyCC vs GCC. Pick a test in the '$test' dropdown and an opt level in '$opt' at the top.",
       "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true }, "unit": "none" }, "overrides": [] },
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
           "format": "time_series",
-          "queryText": "SELECT r.commit_ts * 1000 AS time, 'tcc' AS metric, SUM(cf.tcc_o2) AS value FROM codesize_func cf JOIN runs r USING(run_id) WHERE cf.suite || '/' || cf.test = '${test}' GROUP BY r.run_id UNION ALL SELECT r.commit_ts * 1000 AS time, 'gcc' AS metric, SUM(cf.gcc_o2) AS value FROM codesize_func cf JOIN runs r USING(run_id) WHERE cf.suite || '/' || cf.test = '${test}' GROUP BY r.run_id ORDER BY time"
+          "queryText": "SELECT r.commit_ts * 1000 AS time, 'tcc' AS metric, SUM(cf.tcc_size) AS value FROM codesize_func cf JOIN runs r USING(run_id) WHERE cf.suite || '/' || cf.test = '${test}' AND cf.opt = '${opt}' GROUP BY r.run_id UNION ALL SELECT r.commit_ts * 1000 AS time, 'gcc' AS metric, SUM(cf.gcc_size) AS value FROM codesize_func cf JOIN runs r USING(run_id) WHERE cf.suite || '/' || cf.test = '${test}' AND cf.opt = '${opt}' GROUP BY r.run_id ORDER BY time"
         }
       ]
     }

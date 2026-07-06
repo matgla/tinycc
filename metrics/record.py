@@ -213,43 +213,93 @@ def _parse_codesize_csv(csv_text: str):
             continue
 
 
-def record_codesize(conn, run_id, jobs, detail: bool, tcc_override=None) -> float:
-    """Record code size (rollup + optional per-function detail) and return the
-    corpus compile wall-time (the coarse compile-time proxy)."""
+def ensure_codesize_corpus() -> None:
+    """Fetch the two submodule-backed inputs the code-size corpus compiles need,
+    before measuring -- both idempotent and fast when already satisfied.
+
+    The CI metrics job checks out with `submodules: recursive`, but that is not
+    enough for a full corpus:
+
+      * newlib -- `tests/ir_tests/libc_includes/newlib` is a committed symlink
+        into the newlib submodule's header dir. If that submodule is missing the
+        symlink dangles and EVERY corpus compile fails "stdio.h not found",
+        which (before run_csv_mode learned to check its child's exit code) was
+        silently recorded as "0 funcs" with exit 0 -- the DB and Grafana showed
+        zeros for every run. Recursive checkout normally provides it, but a
+        partial/ manual checkout may not, so init it on demand.
+
+      * GCC c-torture -- the gcctestsuite submodule is pinned `update = none`
+        (see .gitmodules), so recursive checkout SKIPS it and the corpus would
+        otherwise be just the small in-tree ir/float/bug suites. Sparse-fetch
+        the ~16 MB of torture tests so code size is measured over them too.
+    """
+    newlib_hdr = REPO_ROOT / "tests/ir_tests/libc_includes/newlib/stdio.h"
+    if not newlib_hdr.exists():
+        info("codesize prep: initializing newlib submodule (libc headers) ...")
+        rc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "submodule", "update", "--init",
+             "--depth", "1",
+             "tests/ir_tests/qemu/mps2-an505/libs/newlib"]).returncode
+        if rc != 0 or not newlib_hdr.exists():
+            die(f"codesize prep: newlib submodule init failed (exit {rc}); "
+                "corpus compiles would all fail 'stdio.h not found'")
+
+    info("codesize prep: fetching GCC c-torture tests (sparse; idempotent) ...")
+    rc = subprocess.run(
+        ["bash", str(REPO_ROOT / "tests/gcctestsuite/download_gcc_tests.sh")]).returncode
+    if rc != 0:
+        die(f"codesize prep: download_gcc_tests.sh failed (exit {rc})")
+
+
+# TCC (and GCC) optimization levels the code-size corpus is measured at. Both
+# compilers are run at the SAME level for each series, so the ratio compares
+# like-for-like. Keep 'o2' last so the info() summary / gate baseline reflect it.
+CODESIZE_OPTS = [("o0", "-O0"), ("o1", "-O1"), ("o2", "-O2")]
+
+
+def record_codesize(conn, run_id, jobs, detail: bool, tcc_override=None) -> dict:
+    """Record code size (rollup + optional per-function detail) at each opt level
+    and return {opt: corpus_compile_wall_seconds} (the coarse compile-time proxy,
+    one per level)."""
     from regression_disasm import run_csv_mode
-    t0 = time.monotonic()
-    csv_text = run_csv_mode("-O2", None, "all", jobs, tcc_override=tcc_override)
-    elapsed = time.monotonic() - t0
+    ensure_codesize_corpus()
+    elapsed = {}
+    for opt, flag in CODESIZE_OPTS:
+        t0 = time.monotonic()
+        # Compile BOTH tcc and gcc at this level (tcc_opt=flag, gcc_opt=flag).
+        csv_text = run_csv_mode(flag, None, "all", jobs,
+                                tcc_override=tcc_override, tcc_opt=flag)
+        elapsed[opt] = time.monotonic() - t0
 
-    rollup = {}   # suite -> [func_count, tcc, gcc]
-    tot = [0, 0, 0]
-    detail_rows = []
-    for suite, test, func, tcc_n, gcc_n in _parse_codesize_csv(csv_text):
-        r = rollup.setdefault(suite, [0, 0, 0])
-        r[0] += 1; r[1] += tcc_n; r[2] += gcc_n
-        tot[0] += 1; tot[1] += tcc_n; tot[2] += gcc_n
-        if detail:
+        rollup = {}   # suite -> [func_count, tcc, gcc]
+        tot = [0, 0, 0]
+        detail_rows = []
+        for suite, test, func, tcc_n, gcc_n in _parse_codesize_csv(csv_text):
+            r = rollup.setdefault(suite, [0, 0, 0])
+            r[0] += 1; r[1] += tcc_n; r[2] += gcc_n
+            tot[0] += 1; tot[1] += tcc_n; tot[2] += gcc_n
+            if detail:
+                ratio = (tcc_n / gcc_n) if gcc_n > 0 else 0.0
+                detail_rows.append((run_id, suite, test, func, opt, tcc_n, gcc_n, ratio))
+
+        for suite, (fc, tcc_n, gcc_n) in list(rollup.items()) + [("<total>", tot)]:
             ratio = (tcc_n / gcc_n) if gcc_n > 0 else 0.0
-            detail_rows.append((run_id, suite, test, func, tcc_n, gcc_n, ratio))
-
-    for suite, (fc, tcc_n, gcc_n) in list(rollup.items()) + [("<total>", tot)]:
-        ratio = (tcc_n / gcc_n) if gcc_n > 0 else 0.0
-        conn.execute(
-            "INSERT OR REPLACE INTO codesize_rollup VALUES(?,?,?,?,?,?)",
-            (run_id, suite, fc, tcc_n, gcc_n, ratio))
-    if detail_rows:
-        conn.executemany(
-            "INSERT OR REPLACE INTO codesize_func VALUES(?,?,?,?,?,?,?)", detail_rows)
-    info(f"codesize: {tot[0]} funcs, tcc={tot[1]} gcc={tot[2]} "
-         f"ratio={tot[1]/tot[2]:.3f} in {elapsed:.0f}s"
-         if tot[2] else f"codesize: {tot[0]} funcs")
+            conn.execute(
+                "INSERT OR REPLACE INTO codesize_rollup VALUES(?,?,?,?,?,?,?)",
+                (run_id, suite, opt, fc, tcc_n, gcc_n, ratio))
+        if detail_rows:
+            conn.executemany(
+                "INSERT OR REPLACE INTO codesize_func VALUES(?,?,?,?,?,?,?,?)", detail_rows)
+        info(f"codesize[{opt}]: {tot[0]} funcs, tcc={tot[1]} gcc={tot[2]} "
+             f"ratio={tot[1]/tot[2]:.3f} in {elapsed[opt]:.0f}s"
+             if tot[2] else f"codesize[{opt}]: {tot[0]} funcs in {elapsed[opt]:.0f}s")
     return elapsed
 
 
-def record_compile_time(conn, run_id, corpus_secs, n_units) -> None:
+def record_compile_time(conn, run_id, scope, corpus_secs, n_units) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO compile_time VALUES(?,?,?,?)",
-        (run_id, "codesize_corpus_o2", corpus_secs, n_units))
+        (run_id, scope, corpus_secs, n_units))
 
 
 def import_codesize(conn, run_id, src_db_path, commit_sha) -> bool:
@@ -266,11 +316,11 @@ def import_codesize(conn, run_id, src_db_path, commit_sha) -> bool:
             src_run_id = src_run[0]
             conn.execute(
                 """INSERT OR REPLACE INTO codesize_rollup
-                   SELECT ?, suite, func_count, tcc_o2, gcc_o2, ratio
+                   SELECT ?, suite, opt, func_count, tcc_size, gcc_size, ratio
                    FROM src.codesize_rollup WHERE run_id=?""", (run_id, src_run_id))
             conn.execute(
                 """INSERT OR REPLACE INTO codesize_func
-                   SELECT ?, suite, test, function, tcc_o2, gcc_o2, ratio
+                   SELECT ?, suite, test, function, opt, tcc_size, gcc_size, ratio
                    FROM src.codesize_func WHERE run_id=?""", (run_id, src_run_id))
             conn.execute(
                 """INSERT OR REPLACE INTO compile_time
@@ -362,10 +412,13 @@ def record_one(conn, meta, host, branch, trigger, args, tcc_override=None,
         import_codesize(conn, run_id, args.import_codesize_from, meta["commit_sha"])
     else:
         corpus_secs = record_codesize(conn, run_id, args.jobs, args.codesize_detail, tcc_override)
-        n_units = conn.execute(
-            "SELECT func_count FROM codesize_rollup WHERE run_id=? AND suite='<total>'",
-            (run_id,)).fetchone()
-        record_compile_time(conn, run_id, corpus_secs, n_units[0] if n_units else None)
+        for opt, secs in corpus_secs.items():
+            n_units = conn.execute(
+                "SELECT func_count FROM codesize_rollup "
+                "WHERE run_id=? AND suite='<total>' AND opt=?",
+                (run_id, opt)).fetchone()
+            record_compile_time(conn, run_id, f"codesize_corpus_{opt}", secs,
+                                 n_units[0] if n_units else None)
     if do_perf and args.perf_host:
         record_perf(conn, run_id, args.perf_host, args.perf_identity,
                     Path(args.scratch or "."), strict=args.perf_strict)

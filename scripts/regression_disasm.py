@@ -167,7 +167,7 @@ DISASM_SKIP_TESTS = {
 TRACE_TESTS = {"memcpy-a1", "memcpy-a2", "memcpy-a4", "memcpy-a8", "memclr"}
 
 
-def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_dir: str, gcc_opt: str, extra_flags: str = ""):
+def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_dir: str, gcc_opt: str, extra_flags: str = "", tcc_opt: str = "-O2"):
     src_path = Path(src)
     basename = src_path.stem
     key = f"{suite}/{basename}"
@@ -181,7 +181,7 @@ def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_d
     if trace:
         eprint(f"  TRACE {key}: starting tcc compile")
     try:
-        tcc_result = compile_tcc(src, tcc_obj, extra_flags=extra_flags or None)
+        tcc_result = compile_tcc(src, tcc_obj, opt=tcc_opt, extra_flags=extra_flags or None)
     except subprocess.TimeoutExpired:
         with PRINT_LOCK:
             eprint(f"[{idx}/{total}] {key} ... SKIP (tcc compile timed out)")
@@ -268,9 +268,9 @@ def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_d
     return {"type": "ok", "key": key, "funcs": funcs}
 
 
-def run_all(tests, jobs, gcc_opt, dump_dir, suite="all"):
+def run_all(tests, jobs, gcc_opt, dump_dir, suite="all", tcc_opt="-O2"):
     total = len(tests)
-    eprint(f"Compiling {total} tests (TCC -O2 vs GCC {gcc_opt}), jobs={jobs} ...")
+    eprint(f"Compiling {total} tests (TCC {tcc_opt} vs GCC {gcc_opt}), jobs={jobs} ...")
     eprint(f"Suites: {suite}")
     sys.stderr.flush()
     errors = []
@@ -280,7 +280,7 @@ def run_all(tests, jobs, gcc_opt, dump_dir, suite="all"):
         with ThreadPoolExecutor(max_workers=jobs) as ex:
             future_to_test = {}
             for i, (suite, src, flags) in enumerate(tests):
-                f = ex.submit(process_one, i + 1, total, suite, src, tmpdir, dump_dir, gcc_opt, flags)
+                f = ex.submit(process_one, i + 1, total, suite, src, tmpdir, dump_dir, gcc_opt, flags, tcc_opt)
                 future_to_test[f] = (suite, src)
             eprint(f"Submitted {len(future_to_test)} futures, waiting ...")
             sys.stderr.flush()
@@ -342,8 +342,9 @@ def collect_data(results):
     }
 
 
-def output_csv(data, gcc_opt):
-    print("suite,test,function,tcc_O2,gcc_{},ratio".format(gcc_opt))
+def output_csv(data, gcc_opt, tcc_opt="-O2"):
+    print("suite,test,function,tcc_{},gcc_{},ratio".format(
+        tcc_opt.lstrip("-"), gcc_opt.lstrip("-")))
     for key in sorted(data["all_entries"]):
         test_key, func_name = key.split("::", 1)
         suite = test_key.split("/", 1)[0]
@@ -649,14 +650,29 @@ def build_tcc_at_rev(rev: str, jobs: int):
     return str(build_dir / "armv8m-tcc"), build_dir
 
 
-def run_csv_mode(gcc_opt, dump_dir, suite, jobs, tcc_override=None):
+def run_csv_mode(gcc_opt, dump_dir, suite, jobs, tcc_override=None, tcc_opt="-O2"):
     env = dict(os.environ)
     if tcc_override:
         env["TCC_OVERRIDE"] = tcc_override
-    cmd = [sys.executable, __file__, "--csv", "--no-cache", "--suite", suite, "-j", str(jobs), gcc_opt]
+    # --tcc-opt uses the "=" form so its "-O1" value isn't swallowed by the
+    # bare-"-O" scan in parse_args (which routes any standalone -O<n> to gcc_opt).
+    cmd = [sys.executable, __file__, "--csv", "--no-cache", "--suite", suite,
+           "-j", str(jobs), f"--tcc-opt={tcc_opt}", gcc_opt]
     if dump_dir:
         cmd += ["--dump-dir", dump_dir]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    # stderr is left INHERITED (not captured) so the child's per-test progress
+    # ("[i/N] suite/test ... OK/SKIP") streams to the terminal / CI log in real
+    # time instead of appearing all at once when the multi-minute run finishes.
+    # Only stdout (the CSV) is captured.
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, env=env)
+    # A crashed child (e.g. the test-corpus import failing because pytest is not
+    # installed in the interpreter running this) writes no CSV to stdout. Without
+    # this check that silently became "0 funcs" recorded with exit 0 -- the DB
+    # (and Grafana) showed zeros for every run. Fail loudly instead.
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"regression_disasm.py --csv (suite={suite}) exited "
+            f"{proc.returncode}; no code-size data collected")
     lines = [line for line in proc.stdout.splitlines() if re.match(r"^(suite|ir|float|bug|func-sections|gnu89-inline|pic-tds|gcc-compile|gcc-execute),", line) or line.startswith("suite,")]
     return "\n".join(lines)
 
@@ -704,6 +720,11 @@ def parse_args():
                         help="promote the pending cache file to the main cache and exit without re-running")
     parser.add_argument("--discard-pending", action="store_true",
                         help="delete the pending cache file and exit")
+    parser.add_argument("--tcc-opt", default="-O2",
+                        help="TCC optimization level for the corpus compile "
+                             "(default -O2). The bare -O<n> on the command line "
+                             "still sets the GCC level; use --tcc-opt=-O1 to vary "
+                             "the TCC level independently.")
 
     raw = sys.argv[1:]
     gcc_opt = "-O2"
@@ -787,12 +808,12 @@ if __name__ == "__main__":
         eprint("ERROR: No tests discovered. Check Python imports.")
         sys.exit(1)
 
-    results, errors = run_all(tests, args.j, args.gcc_opt, args.dump_dir or "", args.suite)
+    results, errors = run_all(tests, args.j, args.gcc_opt, args.dump_dir or "", args.suite, args.tcc_opt)
     eprint("Collecting data ...")
     data = collect_data(results)
 
     if args.csv:
-        output_csv(data, args.gcc_opt)
+        output_csv(data, args.gcc_opt, args.tcc_opt)
     elif args.save:
         save_baseline(data, args.save, args.gcc_opt)
     elif args.diff:
