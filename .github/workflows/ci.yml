@@ -79,15 +79,80 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
-  # Metrics: code size (tcc-vs-gcc disasm comparison) + compile time + RP2350
-  # hardware perf, all on the self-hosted Pi in one job. Merged from the old
-  # split build-and-measure (cloud codesize) + rp2350-perf (board perf): the
-  # cross compiler is host-native, so it can't be handed to the aarch64 Pi as
-  # an artifact anyway -- and the Pi already has the arm-none-eabi toolchain
-  # the disasm comparison needs, so there's nothing to offload to the cloud.
-  # One record.py call measures codesize and perf locally against the same
-  # freshly built tcc, so no scratch-db round-trip / --import-codesize-from.
+  # Code size (tcc-vs-gcc disasm comparison at -O0/-O1/-O2) measured on the fast
+  # x86 cloud container and handed to the Pi as a scratch metrics.db artifact.
+  # The cross compiler is host-native, but the codesize *numbers* it produces are
+  # not -- armv8m-tcc emits identical ARM code regardless of build host -- so the
+  # Pi imports these rows via `record.py --import-codesize-from` (below) instead
+  # of recompiling the whole corpus 3x itself. That offload is the whole point:
+  # the corpus compile is CPU-heavy and slow on the Pi, and it does not need the
+  # board, so only the RP2350 perf benchmark stays on the Pi. The container ships
+  # the arm-none-eabi toolchain (gcc/objdump/nm) the disasm comparison needs.
+  codesize:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    container:
+      image: ghcr.io/matgla/tinycc-armv8m:latest
+      options: --user root
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        # submodules: recursive provides the newlib libc headers the corpus
+        # compiles need (compile-only -- no newlib build / QEMU here). record.py
+        # sparse-fetches the GCC c-torture tests itself (ensure_codesize_corpus).
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build cross compiler
+        # --enable-O2/--debug only affect tcc's own binary, not the code it
+        # emits, so the codesize numbers are unaffected by this config.
+        run: ./configure --enable-cross --enable-O2 --debug && make cross -j$(nproc)
+
+      - name: Set up test venv
+        # record.py's codesize child (regression_disasm.py --csv) imports the
+        # ir_tests test collector (test_qemu), which needs pytest & friends.
+        run: make test-venv
+
+      - name: Record code size (-O0/-O1/-O2) to scratch db
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          # No --perf-host (perf runs on the Pi) and no --keep (throwaway db).
+          # --codesize-detail fills the per-function table so the Pi's import
+          # gets Grafana's drill-down rows too. Tee all logs to an artifact.
+          python3 metrics/record.py --db "$RUNNER_TEMP/codesize.db" --rev HEAD \
+              --no-correctness --codesize-detail --jobs "$(nproc)" \
+              --host "$METRICS_HOST" --branch mob \
+              --trigger "${{ github.event_name }}" 2>&1 | tee "$RUNNER_TEMP/codesize.log"
+
+      - name: Upload scratch codesize db
+        uses: actions/upload-artifact@v4
+        with:
+          name: codesize-db
+          path: ${{ runner.temp }}/codesize.db
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload codesize log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codesize-log
+          path: ${{ runner.temp }}/codesize.log
+          if-no-files-found: warn
+
+  # RP2350 hardware perf on the self-hosted Pi -- the only part that needs the
+  # board. Code size comes from the cloud `codesize` job's artifact (imported
+  # via --import-codesize-from), so the Pi runs ONLY run_benchmark.py, not the
+  # slow corpus compile. Both jobs check out the same run SHA (github.sha), so
+  # the import matches by commit_sha.
   metrics:
+    needs: codesize
     runs-on: [self-hosted, rpi5, pimoroni_pico_plus2]
     timeout-minutes: 120
     concurrency:
@@ -113,19 +178,24 @@ jobs:
         # itself is host-native, so it must be built on this aarch64 Pi rather
         # than shared from an x86_64 runner (an x86_64 build can't exec here --
         # the shell would fall back to interpreting it: "Syntax error: )
-        # unexpected"). --enable-O2/--debug only affect tcc's own binary, not
-        # the code it emits, so codesize/perf are unaffected by this config.
+        # unexpected"). Needed here because run_benchmark.py builds the RP2350
+        # perf firmware with this freshly built armv8m-tcc.
         run: ./configure --enable-cross --enable-O2 --debug && make cross -j$(nproc)
 
-      - name: Record codesize + compile time + perf
-        # --codesize-detail runs the tcc-vs-gcc disasm comparison over the
-        # corpus (fills codesize_rollup + the per-function codesize_func table
-        # for Grafana's drill-down); --perf-host runs the RP2350 board
-        # benchmark. Both land in the real metrics.db under the same run.
-        # --keep 20 prunes older runs to bound DB growth from --codesize-detail.
+      - name: Download cloud codesize db
+        uses: actions/download-artifact@v4
+        with:
+          name: codesize-db
+          path: ${{ runner.temp }}/codesize
+
+      - name: Import codesize + record perf
+        # --import-codesize-from copies the cloud job's codesize/compile-time
+        # rows (measured at -O0/-O1/-O2) into this run instead of recomputing
+        # them locally; --perf-host runs the RP2350 board benchmark. Both land
+        # in the real metrics.db under the same run. --keep 20 bounds DB growth.
         run: |
           python3 metrics/record.py --db "$METRICS_DB" --rev HEAD --no-correctness \
-              --codesize-detail --jobs "$(nproc)" \
+              --import-codesize-from "$RUNNER_TEMP/codesize/codesize.db" \
               --host "$METRICS_HOST" --trigger "${{ github.event_name }}" \
               --perf-host "$PERF_HOST" --perf-identity "$PERF_IDENTITY" --perf-strict \
               --branch mob --keep 20
