@@ -45,6 +45,12 @@ CURRENT_DIR = Path(__file__).parent
 # not a pass.
 RUN_TIMEOUT = 5
 
+RUN_TIMEOUT_OVERRIDES = {
+    # printf-2 exercises semihosted stdio/file I/O and can exceed the default
+    # QEMU hang guard on slower container hosts.
+    "printf-2": 30,
+}
+
 # Tests too slow under instrumentation (ASan / valgrind) — skip to avoid timeouts.
 # Includes tests that trigger valgrind "uninitialised value" errors (false positives
 # from GCC torture edge cases) and tests that time out under instrumentation.
@@ -103,6 +109,10 @@ def _test_id(test_case, opt_level):
     except ValueError:
         pass
     return f"{test_case.source.stem}{opt_level}"
+
+
+def _run_timeout_for(test_case):
+    return RUN_TIMEOUT_OVERRIDES.get(test_case.source.stem, RUN_TIMEOUT)
 
 
 def _generate_execute_params():
@@ -173,9 +183,10 @@ def test_gcc_execute_ir(test_case, opt_level, tmp_path):
     # Wait for program to complete and check exit status
     # GCC torture tests should exit cleanly (exit code 0)
     # Poll until process exits (max RUN_TIMEOUT seconds)
+    run_timeout = _run_timeout_for(test_case)
     start = time.monotonic()
     exited = False
-    while time.monotonic() - start < RUN_TIMEOUT:
+    while time.monotonic() - start < run_timeout:
         if _sut_has_exited(sut):
             exited = True
             break
@@ -187,7 +198,7 @@ def test_gcc_execute_ir(test_case, opt_level, tmp_path):
         # mask the hang as a pass, so fail explicitly before closing.
         sut.close()
         pytest.fail(
-            f"Test did not exit within {RUN_TIMEOUT}s — likely an infinite loop "
+            f"Test did not exit within {run_timeout}s — likely an infinite loop "
             f"in generated code (hang)"
         )
 

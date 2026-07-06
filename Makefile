@@ -8,7 +8,14 @@ ifndef TOP
  INCLUDED = no
 endif
 
-ifeq ($(findstring $(MAKECMDGOALS),clean distclean),)
+NO_CONFIG_GOALS := clean distclean help \
+	run start_env build_container pull_container push_container \
+	container-build container-pull container-push \
+	docker-build docker-push docker-start
+
+ifeq ($(MAKECMDGOALS),)
+ include $(TOP)/config.mak
+else ifneq ($(filter-out $(NO_CONFIG_GOALS),$(MAKECMDGOALS)),)
  include $(TOP)/config.mak
 endif
 
@@ -903,54 +910,45 @@ ut-coverage:
 ut-clean:
 	$(MAKE) -C tests/unit clean
 
-.PHONY: all cross fp-libs clean test test-ir test-sequential test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all test-frontend test-linker test-debug test-runtime test-selfhost test-golden-ir rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-coverage ut-clean check-pass-coverage FORCE
+.PHONY: all cross fp-libs clean test test-ir test-sequential test-valgrind test-aeabi-host test-legacy test-tests2 test-gcc-torture test-gcc-torture-compile test-gcc-torture-execute test-full test-all test-frontend test-linker test-debug test-runtime test-selfhost test-golden-ir rebuild-newlib download-gcc-tests tar tags ETAGS doc distclean install uninstall ut ut-coverage ut-clean check-pass-coverage run start_env build_container pull_container push_container container-build container-pull container-push docker-build docker-push docker-start FORCE
 
-# Container image settings (auto-detect docker or podman)
-DOCKER_REGISTRY ?= ghcr.io
-DOCKER_IMAGE_NAME ?= matgla/tinycc-armv8m
-DOCKER_IMAGE_TAG ?= latest
-DOCKER_FULL_IMAGE = $(DOCKER_REGISTRY)/$(DOCKER_IMAGE_NAME):$(DOCKER_IMAGE_TAG)
+# Container image settings. Build/push uses a multi-arch Podman manifest,
+# matching the workflow in ../yasos.zig.
+CONTAINER_VERSION ?= 0.1.0
+CONTAINER_REGISTRY ?= ghcr.io
+CONTAINER_REPOSITORY ?= matgla/tinycc-armv8m
+CONTAINER_PLATFORMS ?= linux/amd64,linux/arm64
+CONTAINER_LOCAL_IMAGE = $(CONTAINER_REPOSITORY)
+CONTAINER_REMOTE_IMAGE = $(CONTAINER_REGISTRY)/$(CONTAINER_REPOSITORY)
+CONTAINER_LOCAL_VERSION_IMAGE = $(CONTAINER_LOCAL_IMAGE):$(CONTAINER_VERSION)
+CONTAINER_REMOTE_VERSION_IMAGE = $(CONTAINER_REMOTE_IMAGE):$(CONTAINER_VERSION)
+CONTAINER_REMOTE_LATEST_IMAGE = $(CONTAINER_REMOTE_IMAGE):latest
+RUN_CONTAINER ?= ./scripts/run_container.sh -v $(CONTAINER_VERSION)
 
-# Detect available container runtime (prefer podman, fallback to docker)
-# User can override with: make docker-start CONTAINER_RUNTIME=docker
-CONTAINER_RUNTIME := $(shell \
-  if command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then \
-    echo podman; \
-  elif command -v docker >/dev/null 2>&1; then \
-    echo docker; \
-  fi)
-# Note: Container runtime is only needed for container-* and docker-* targets
+build_container:
+	podman manifest rm $(CONTAINER_LOCAL_VERSION_IMAGE) >/dev/null 2>&1 || true
+	podman manifest create $(CONTAINER_LOCAL_VERSION_IMAGE)
+	podman build --platform $(CONTAINER_PLATFORMS) --manifest $(CONTAINER_LOCAL_VERSION_IMAGE) .
 
-container-build:
-ifeq ($(CONTAINER_RUNTIME),)
-	$(error No container runtime found. Please install docker or podman.)
-else
-	@echo "Building container image with $(CONTAINER_RUNTIME): $(DOCKER_FULL_IMAGE)"
-	$(CONTAINER_RUNTIME) build -t $(DOCKER_FULL_IMAGE) .
-endif
+pull_container:
+	podman pull $(CONTAINER_REMOTE_VERSION_IMAGE)
 
-container-push: container-build
-ifeq ($(CONTAINER_RUNTIME),)
-	$(error No container runtime found. Please install docker or podman.)
-else
-	@echo "Pushing container image with $(CONTAINER_RUNTIME): $(DOCKER_FULL_IMAGE)"
-	$(CONTAINER_RUNTIME) push $(DOCKER_FULL_IMAGE)
-endif
+push_container: build_container
+	podman manifest push --all $(CONTAINER_LOCAL_VERSION_IMAGE) docker://$(CONTAINER_REMOTE_VERSION_IMAGE)
+	podman manifest push --all $(CONTAINER_LOCAL_VERSION_IMAGE) docker://$(CONTAINER_REMOTE_LATEST_IMAGE)
 
-# Legacy aliases for backwards compatibility
-docker-build: container-build
-docker-push: container-push
+run: pull_container
+	$(RUN_CONTAINER) $(if $(CMD),-c "$(CMD)",-i)
 
-# Pull and start container interactively with current directory mounted
-docker-start:
-ifeq ($(CONTAINER_RUNTIME),)
-	$(error No container runtime found. Please install docker or podman.)
-else
-	@echo "Pulling container image with $(CONTAINER_RUNTIME): $(DOCKER_FULL_IMAGE)"
-	$(CONTAINER_RUNTIME) pull $(DOCKER_FULL_IMAGE)
-	@echo "Starting container with $(CONTAINER_RUNTIME)..."
-	$(CONTAINER_RUNTIME) run -it --rm -v $(CURDIR):/workspace $(DOCKER_FULL_IMAGE)
-endif
+start_env: run
+
+# Hyphenated and docker-* aliases for backwards compatibility.
+container-build: build_container
+container-pull: pull_container
+container-push: push_container
+docker-build: build_container
+docker-push: push_container
+docker-start: run
 
 help:
 	@echo "make"
@@ -983,14 +981,20 @@ help:
 	@echo "   run tests with the installed tcc"
 	@echo "Other supported make targets:"
 	@echo "   install install-strip uninstall doc [dist]clean tags ETAGS tar help"
-	@echo "   container-build"
-	@echo "      build container image (auto-detects docker/podman)"
-	@echo "   container-push"
-	@echo "      build and push container image to registry"
+	@echo "   build_container"
+	@echo "      build $(CONTAINER_PLATFORMS) manifest $(CONTAINER_LOCAL_VERSION_IMAGE)"
+	@echo "   pull_container"
+	@echo "      pull $(CONTAINER_REMOTE_VERSION_IMAGE)"
+	@echo "   push_container"
+	@echo "      build and push $(CONTAINER_REMOTE_VERSION_IMAGE) and $(CONTAINER_REMOTE_LATEST_IMAGE)"
+	@echo "   run"
+	@echo "      start container shell with repo and persistent history mounted"
+	@echo "   run CMD='make test'"
+	@echo "      run a command inside the container"
+	@echo "   container-build/container-pull/container-push (legacy aliases)"
 	@echo "   docker-build (legacy alias)"
 	@echo "   docker-push (legacy alias)"
-	@echo "   docker-start"
-	@echo "      pull and start container interactively (mounts current dir to /workspace)"
+	@echo "   docker-start/start_env (legacy aliases for run)"
 	@echo "Custom configuration:"
 	@echo "   The makefile includes a file 'config-extra.mak' if it is present."
 	@echo "   This file may contain some custom configuration.  For example to"

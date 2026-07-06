@@ -32,7 +32,10 @@ def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
 
-SUBPROCESS_TIMEOUT = 30
+# Per-compile/disasm subprocess timeout. CI hardware (aarch64 Pi) is far slower
+# than a dev laptop, so the default is generous and env-overridable: a heavy
+# torture test (e.g. tests2/101_cleanup at -O2) can take well over 30s there.
+SUBPROCESS_TIMEOUT = int(os.environ.get("DISASM_SUBPROCESS_TIMEOUT", "120"))
 
 
 def run(cmd, **kwargs):

@@ -665,15 +665,27 @@ def run_csv_mode(gcc_opt, dump_dir, suite, jobs, tcc_override=None, tcc_opt="-O2
     # time instead of appearing all at once when the multi-minute run finishes.
     # Only stdout (the CSV) is captured.
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, env=env)
-    # A crashed child (e.g. the test-corpus import failing because pytest is not
-    # installed in the interpreter running this) writes no CSV to stdout. Without
-    # this check that silently became "0 funcs" recorded with exit 0 -- the DB
-    # (and Grafana) showed zeros for every run. Fail loudly instead.
-    if proc.returncode != 0:
+    lines = [line for line in proc.stdout.splitlines() if re.match(r"^(suite|ir|float|bug|func-sections|gnu89-inline|pic-tds|gcc-compile|gcc-execute),", line) or line.startswith("suite,")]
+    # The child exits 1 in two very different situations, which we must NOT
+    # conflate:
+    #   (a) it crashed before emitting any CSV (e.g. the test-corpus import
+    #       failing because pytest is missing). Recording that silently became
+    #       "0 funcs" with exit 0 -- the DB (and Grafana) showed zeros for every
+    #       run. This must still fail loudly.
+    #   (b) it ran the full corpus and emitted a complete CSV, but a handful of
+    #       individual tests were skipped/failed/timed out (child exit 1 via its
+    #       FAILED-test gate). This is expected on the slow CI and must NOT abort
+    #       the whole codesize collection over a few tests out of thousands.
+    # Discriminate on whether any actual data rows (non-header) were produced.
+    data_rows = [line for line in lines if not line.startswith("suite,")]
+    if not data_rows:
         raise RuntimeError(
             f"regression_disasm.py --csv (suite={suite}) exited "
             f"{proc.returncode}; no code-size data collected")
-    lines = [line for line in proc.stdout.splitlines() if re.match(r"^(suite|ir|float|bug|func-sections|gnu89-inline|pic-tds|gcc-compile|gcc-execute),", line) or line.startswith("suite,")]
+    if proc.returncode != 0:
+        eprint(f"WARNING: regression_disasm.py --csv (suite={suite}) exited "
+               f"{proc.returncode} but produced {len(data_rows)} data rows; "
+               f"continuing with the code-size data that was collected")
     return "\n".join(lines)
 
 
