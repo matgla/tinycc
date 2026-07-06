@@ -91,13 +91,15 @@ def check_correctness(conn, run_id, parent_id) -> list:
 def check_codesize(conn, run_id, parent_id, tolerance_pct: float):
     """Return (cur_ratio, parent_ratio, pct_delta) if the total ratio grew by
     more than tolerance_pct, else None."""
+    # Gate on the -O2 series (TCC's production level); o0/o1 are tracked for
+    # visibility but do not gate.
     cur = conn.execute(
-        "SELECT ratio FROM codesize_rollup WHERE run_id=? AND suite='<total>'",
+        "SELECT ratio FROM codesize_rollup WHERE run_id=? AND suite='<total>' AND opt='o2'",
         (run_id,)).fetchone()
     if not cur or parent_id is None:
         return None
     parent = conn.execute(
-        "SELECT ratio FROM codesize_rollup WHERE run_id=? AND suite='<total>'",
+        "SELECT ratio FROM codesize_rollup WHERE run_id=? AND suite='<total>' AND opt='o2'",
         (parent_id,)).fetchone()
     if not parent or parent[0] <= 0:
         return None
