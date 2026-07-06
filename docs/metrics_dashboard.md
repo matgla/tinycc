@@ -42,6 +42,7 @@ high-cardinality per-function code-size rows live in a separate SQLite file
 sudo mkdir -p /var/lib/tcc-metrics
 sudo chown "$(whoami)" /var/lib/tcc-metrics
 sqlite3 /var/lib/tcc-metrics/metrics.db < metrics/schema.sql
+sqlite3 /var/lib/tcc-metrics/codesize-detail.db < metrics/schema.sql
 ```
 
 The DB lives outside the Actions workspace so `actions/checkout` never
@@ -216,8 +217,9 @@ sudo systemctl restart tcc-metrics-grafana  # e.g. after editing docker-compose.
 Opens on `http://<pi>:3000`. The SQLite datasource and the
 "TinyCC Optimizer Regressions" dashboard are provisioned automatically from
 `provisioning/` and `dashboards/`. Panels: per-profile divergence, total
-divergence, code-size ratio vs GCC, compile-time trend, RP2350 cycles,
-suite-level code-size summary, and a "regressed since parent" table — the last
+divergence, code-size ratio vs GCC, compile-time trend, RP2350 TCC/GCC
+cycle ratio by opt level, suite-level code-size summary, and a "regressed since
+parent" table — the last
 one is the accept/reject signal for each migration commit (see
 [docs/plan_opt_predicate_framework.md](plan_opt_predicate_framework.md) and
 the optimizer migration plan for how it's used).
@@ -235,7 +237,16 @@ python3 metrics/codesize_detail_server.py \
 It opens on `http://<pi>:8008`. The index lists recorded commits; each commit
 has a file-level comparison against its recorded parent, with links down to
 function-level deltas. It reads the detail DB read-only and uses only Python's
-standard library.
+standard library. File and function tables can be sorted by clicking column
+headers, and the `change` filter can restrict the view to regressions or
+improvements.
+
+If the page reports `detail database does not exist`, create the detail DB with
+the same owner that runs `metrics/record.py`:
+
+```bash
+sqlite3 /var/lib/tcc-metrics/codesize-detail.db < metrics/schema.sql
+```
 
 To run it as a service:
 

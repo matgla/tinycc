@@ -12,10 +12,16 @@ panel says code size moved.
 
 import argparse
 import html
+import os
 import sqlite3
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
+
+OPTS = {"o0", "o1", "o2"}
+CHANGE_FILTERS = {"all", "regressions", "improvements"}
+SORT_DIRS = {"asc", "desc"}
 
 
 def h(text) -> str:
@@ -30,8 +36,92 @@ def short_sha(sha: str) -> str:
     return sha[:12] if sha else "?"
 
 
+def query_one(query: dict, key: str, default: str) -> str:
+    return query.get(key, [default])[0]
+
+
+def sort_dir(query: dict) -> str:
+    value = query_one(query, "dir", "desc").lower()
+    if value not in SORT_DIRS:
+        raise ValueError("dir must be asc or desc")
+    return value
+
+
+def change_filter(query: dict) -> str:
+    value = query_one(query, "change", "all").lower()
+    if value not in CHANGE_FILTERS:
+        raise ValueError("change must be all, regressions, or improvements")
+    return value
+
+
+def order_clause(sort: str, direction: str, sort_map: dict,
+                 default_sort: str) -> str:
+    if sort not in sort_map:
+        raise ValueError("unknown sort column")
+    primary = sort_map[sort]
+    tie = sort_map[default_sort]
+    if sort == default_sort:
+        return f"{primary} {direction.upper()}, c.suite, c.test"
+    return f"{primary} {direction.upper()}, {tie} DESC, c.suite, c.test"
+
+
+def sort_link(label: str, path: str, params: dict, key: str,
+              current_sort: str, current_dir: str) -> str:
+    next_dir = "asc"
+    marker = ""
+    if current_sort == key:
+        next_dir = "desc" if current_dir == "asc" else "asc"
+        marker = " ^" if current_dir == "asc" else " v"
+    link_params = dict(params)
+    link_params["sort"] = key
+    link_params["dir"] = next_dir
+    return f"<a href=\"{h(path + '?' + qs(link_params))}\">{h(label + marker)}</a>"
+
+
+class DatabaseOpenError(sqlite3.Error):
+    pass
+
+
+def _display_path(db_path: str) -> Path:
+    path = Path(db_path).expanduser()
+    if not path.is_absolute():
+        path = path.resolve()
+    return path
+
+
+def _readonly_uri(path: Path) -> str:
+    return path.as_uri() + "?mode=ro"
+
+
 def connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    path = _display_path(db_path)
+    try:
+        path.stat()
+    except FileNotFoundError as e:
+        raise DatabaseOpenError(
+            f"detail database does not exist: {path}. Create it with "
+            f"`sqlite3 {path} < metrics/schema.sql` or populate it with "
+            f"`metrics/record.py --codesize-detail --detail-db {path}`."
+        ) from e
+    except OSError as e:
+        raise DatabaseOpenError(
+            f"cannot stat detail database {path}: {e}. Check parent directory "
+            "execute permissions and service user access."
+        ) from e
+    if not os.path.isfile(path):
+        raise DatabaseOpenError(f"detail database path is not a regular file: {path}")
+    if not os.access(path, os.R_OK):
+        raise DatabaseOpenError(
+            f"detail database is not readable: {path}. Check file ownership and "
+            "service user access."
+        )
+    try:
+        conn = sqlite3.connect(_readonly_uri(path), uri=True)
+    except sqlite3.Error as e:
+        raise DatabaseOpenError(
+            f"cannot open detail database {path}: {e}. Check that the file is a "
+            "valid SQLite database and that its directory is readable."
+        ) from e
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -150,11 +240,14 @@ class CodesizeHandler(BaseHTTPRequestHandler):
         return parent["run_id"] if parent else None
 
     def handle_compare(self, query: dict) -> None:
-        opt = query.get("opt", ["o2"])[0]
-        limit = int(query.get("limit", ["200"])[0])
-        search = query.get("q", [""])[0].strip()
+        opt = query_one(query, "opt", "o2")
+        limit = int(query_one(query, "limit", "200"))
+        search = query_one(query, "q", "").strip()
         run_arg = query.get("run", [None])[0]
-        if opt not in {"o0", "o1", "o2"}:
+        change = change_filter(query)
+        sort = query_one(query, "sort", "abs_delta")
+        direction = sort_dir(query)
+        if opt not in OPTS:
             raise ValueError("opt must be o0, o1, or o2")
         limit = max(1, min(limit, 1000))
 
@@ -162,13 +255,25 @@ class CodesizeHandler(BaseHTTPRequestHandler):
             run = self.selected_run(conn, run_arg)
             parent_id = self.parent_run_id(conn, run)
             params = [run["run_id"], opt]
-            where = ""
+            where_clauses = []
             if search:
-                where = "AND (c.suite LIKE ? OR c.test LIKE ?)"
+                where_clauses.append("(c.suite LIKE ? OR c.test LIKE ?)")
                 like = f"%{search}%"
                 params.extend([like, like])
             parent_join = ""
             parent_cols = "NULL AS parent_tcc, NULL AS parent_gcc, NULL AS delta"
+            delta_expr = "c.tcc_size"
+            compare_sort_map = {
+                "suite": "c.suite",
+                "file": "c.test",
+                "funcs": "c.funcs",
+                "tcc": "c.tcc_size",
+                "parent": "0",
+                "delta": "c.tcc_size",
+                "abs_delta": "c.tcc_size",
+                "gcc": "c.gcc_size",
+                "ratio": "ratio",
+            }
             if parent_id is not None:
                 parent_join = """
                    LEFT JOIN (
@@ -179,10 +284,24 @@ class CodesizeHandler(BaseHTTPRequestHandler):
                      GROUP BY suite, test
                    ) p ON p.suite = c.suite AND p.test = c.test"""
                 parent_cols = ("p.tcc_size AS parent_tcc, p.gcc_size AS parent_gcc, "
-                               "(c.tcc_size - p.tcc_size) AS delta")
+                               "(c.tcc_size - COALESCE(p.tcc_size, 0)) AS delta")
                 params = [run["run_id"], opt, parent_id, opt] + params[2:]
-            order_expr = ("ABS(COALESCE(c.tcc_size - p.tcc_size, c.tcc_size))"
-                          if parent_id is not None else "c.tcc_size")
+                delta_expr = "(c.tcc_size - COALESCE(p.tcc_size, 0))"
+                compare_sort_map.update({
+                    "parent": "p.tcc_size",
+                    "delta": delta_expr,
+                    "abs_delta": f"ABS({delta_expr})",
+                })
+                if change == "regressions":
+                    where_clauses.append(f"{delta_expr} > 0")
+                elif change == "improvements":
+                    where_clauses.append(f"{delta_expr} < 0")
+            elif change != "all":
+                where_clauses.append("0")
+            where = " AND ".join(where_clauses)
+            if where:
+                where = "AND " + where
+            order = order_clause(sort, direction, compare_sort_map, "abs_delta")
             rows = conn.execute(
                 f"""SELECT c.suite, c.test, c.funcs, c.tcc_size, c.gcc_size,
                            {parent_cols},
@@ -197,28 +316,56 @@ class CodesizeHandler(BaseHTTPRequestHandler):
                     ) c
                     {parent_join}
                     WHERE 1=1 {where}
-                    ORDER BY {order_expr} DESC, c.suite, c.test
+                    ORDER BY {order}
                     LIMIT ?""",
                 (*params, limit)).fetchall()
 
+        base_params = {
+            "run": run["run_id"],
+            "opt": opt,
+            "q": search,
+            "limit": limit,
+            "change": change,
+            "sort": sort,
+            "dir": direction,
+        }
         body = [
             f"<p><code>{h(short_sha(run['commit_sha']))}</code> {h(run['subject'])}</p>",
             "<form method=\"get\" action=\"/compare\">",
             f"<input type=\"hidden\" name=\"run\" value=\"{h(run['run_id'])}\">",
+            f"<input type=\"hidden\" name=\"sort\" value=\"{h(sort)}\">",
+            f"<input type=\"hidden\" name=\"dir\" value=\"{h(direction)}\">",
             "<label>opt <select name=\"opt\">"
             + "".join(f"<option value=\"{o}\"{' selected' if o == opt else ''}>{o}</option>"
                       for o in ("o0", "o1", "o2"))
+            + "</select></label>",
+            "<label>change <select name=\"change\">"
+            + "".join(
+                f"<option value=\"{value}\"{' selected' if value == change else ''}>{label}</option>"
+                for value, label in (
+                    ("all", "all"),
+                    ("regressions", "regressions"),
+                    ("improvements", "improvements"),
+                ))
             + "</select></label>",
             f"<label>filter <input name=\"q\" value=\"{h(search)}\" placeholder=\"suite or file\"></label>",
             f"<label>limit <input name=\"limit\" type=\"number\" min=\"1\" max=\"1000\" value=\"{limit}\"></label>",
             "<button>apply</button></form>",
         ]
         if parent_id is None:
-            body.append("<p class=\"muted\">Parent run is not present; showing current totals only.</p>")
-        body.append("<table><thead><tr><th>suite</th><th>file</th>"
-                    "<th class=\"num\">funcs</th><th class=\"num\">tcc</th>"
-                    "<th class=\"num\">parent</th><th class=\"num\">delta</th>"
-                    "<th class=\"num\">gcc</th><th class=\"num\">ratio</th>"
+            if change == "all":
+                body.append("<p class=\"muted\">Parent run is not present; showing current totals only.</p>")
+            else:
+                body.append("<p class=\"muted\">Parent run is not present; change filters cannot match.</p>")
+        body.append("<table><thead><tr>"
+                    f"<th>{sort_link('suite', '/compare', base_params, 'suite', sort, direction)}</th>"
+                    f"<th>{sort_link('file', '/compare', base_params, 'file', sort, direction)}</th>"
+                    f"<th class=\"num\">{sort_link('funcs', '/compare', base_params, 'funcs', sort, direction)}</th>"
+                    f"<th class=\"num\">{sort_link('tcc', '/compare', base_params, 'tcc', sort, direction)}</th>"
+                    f"<th class=\"num\">{sort_link('parent', '/compare', base_params, 'parent', sort, direction)}</th>"
+                    f"<th class=\"num\">{sort_link('delta', '/compare', base_params, 'delta', sort, direction)}</th>"
+                    f"<th class=\"num\">{sort_link('gcc', '/compare', base_params, 'gcc', sort, direction)}</th>"
+                    f"<th class=\"num\">{sort_link('ratio', '/compare', base_params, 'ratio', sort, direction)}</th>"
                     "<th>detail</th></tr></thead><tbody>")
         for row in rows:
             delta = row["delta"]
@@ -226,6 +373,7 @@ class CodesizeHandler(BaseHTTPRequestHandler):
             file_link = "/file?" + qs({
                 "run": run["run_id"], "opt": opt,
                 "suite": row["suite"], "test": row["test"],
+                "change": change,
             })
             body.append(
                 "<tr>"
@@ -242,45 +390,117 @@ class CodesizeHandler(BaseHTTPRequestHandler):
         self.send_html("File Comparison", "\n".join(body))
 
     def handle_file(self, query: dict) -> None:
-        opt = query.get("opt", ["o2"])[0]
+        opt = query_one(query, "opt", "o2")
         run_arg = query.get("run", [None])[0]
+        change = change_filter(query)
+        sort = query_one(query, "sort", "abs_delta")
+        direction = sort_dir(query)
         suite = unquote(query.get("suite", [""])[0])
         test = unquote(query.get("test", [""])[0])
         if not suite or not test:
             raise ValueError("suite and test are required")
+        if opt not in OPTS:
+            raise ValueError("opt must be o0, o1, or o2")
         with connect(self.db_path) as conn:
             run = self.selected_run(conn, run_arg)
             parent_id = self.parent_run_id(conn, run)
             params = [run["run_id"], opt, suite, test]
             parent_join = ""
             parent_cols = "NULL AS parent_tcc, NULL AS parent_gcc, NULL AS delta"
+            delta_expr = "c.tcc_size"
+            file_sort_map = {
+                "function": "c.function",
+                "tcc": "c.tcc_size",
+                "parent": "0",
+                "delta": "c.tcc_size",
+                "abs_delta": "c.tcc_size",
+                "gcc": "c.gcc_size",
+                "ratio": "c.ratio",
+            }
+            where_clauses = []
             if parent_id is not None:
                 parent_join = """
                   LEFT JOIN codesize_func p
                     ON p.run_id=? AND p.opt=c.opt AND p.suite=c.suite
                    AND p.test=c.test AND p.function=c.function"""
                 parent_cols = ("p.tcc_size AS parent_tcc, p.gcc_size AS parent_gcc, "
-                               "(c.tcc_size - p.tcc_size) AS delta")
+                               "(c.tcc_size - COALESCE(p.tcc_size, 0)) AS delta")
                 params = [parent_id, run["run_id"], opt, suite, test]
-            order_expr = ("ABS(COALESCE(c.tcc_size - p.tcc_size, c.tcc_size))"
-                          if parent_id is not None else "c.tcc_size")
+                delta_expr = "(c.tcc_size - COALESCE(p.tcc_size, 0))"
+                file_sort_map.update({
+                    "parent": "p.tcc_size",
+                    "delta": delta_expr,
+                    "abs_delta": f"ABS({delta_expr})",
+                })
+                if change == "regressions":
+                    where_clauses.append(f"{delta_expr} > 0")
+                elif change == "improvements":
+                    where_clauses.append(f"{delta_expr} < 0")
+            elif change != "all":
+                where_clauses.append("0")
+            if sort not in file_sort_map:
+                raise ValueError("unknown sort column")
+            where = " AND ".join(where_clauses)
+            if where:
+                where = "AND " + where
+            primary_order = file_sort_map[sort]
+            tie_order = file_sort_map["abs_delta"]
+            if sort == "abs_delta":
+                order = f"{primary_order} {direction.upper()}, c.function"
+            else:
+                order = f"{primary_order} {direction.upper()}, {tie_order} DESC, c.function"
             rows = conn.execute(
                 f"""SELECT c.function, c.tcc_size, c.gcc_size, c.ratio,
                            {parent_cols}
                     FROM codesize_func c
                     {parent_join}
-                    WHERE c.run_id=? AND c.opt=? AND c.suite=? AND c.test=?
-                    ORDER BY {order_expr} DESC, c.function""",
+                    WHERE c.run_id=? AND c.opt=? AND c.suite=? AND c.test=? {where}
+                    ORDER BY {order}""",
                 params).fetchall()
 
-        back = "/compare?" + qs({"run": run["run_id"], "opt": opt})
+        back = "/compare?" + qs({"run": run["run_id"], "opt": opt, "change": change})
+        base_params = {
+            "run": run["run_id"],
+            "opt": opt,
+            "suite": suite,
+            "test": test,
+            "change": change,
+            "sort": sort,
+            "dir": direction,
+        }
         body = [f"<p><a href=\"{h(back)}\">back to files</a></p>",
                 f"<p><code>{h(short_sha(run['commit_sha']))}</code> "
                 f"{h(suite)}/{h(test)} at {h(opt)}</p>",
-                "<table><thead><tr><th>function</th><th class=\"num\">tcc</th>"
-                "<th class=\"num\">parent</th><th class=\"num\">delta</th>"
-                "<th class=\"num\">gcc</th><th class=\"num\">ratio</th>"
-                "</tr></thead><tbody>"]
+                "<form method=\"get\" action=\"/file\">",
+                f"<input type=\"hidden\" name=\"run\" value=\"{h(run['run_id'])}\">",
+                f"<input type=\"hidden\" name=\"opt\" value=\"{h(opt)}\">",
+                f"<input type=\"hidden\" name=\"suite\" value=\"{h(suite)}\">",
+                f"<input type=\"hidden\" name=\"test\" value=\"{h(test)}\">",
+                f"<input type=\"hidden\" name=\"sort\" value=\"{h(sort)}\">",
+                f"<input type=\"hidden\" name=\"dir\" value=\"{h(direction)}\">",
+                "<label>change <select name=\"change\">"
+                + "".join(
+                    f"<option value=\"{value}\"{' selected' if value == change else ''}>{label}</option>"
+                    for value, label in (
+                        ("all", "all"),
+                        ("regressions", "regressions"),
+                        ("improvements", "improvements"),
+                    ))
+                + "</select></label>",
+                "<button>apply</button></form>"]
+        if parent_id is None:
+            if change == "all":
+                body.append("<p class=\"muted\">Parent run is not present; showing current totals only.</p>")
+            else:
+                body.append("<p class=\"muted\">Parent run is not present; change filters cannot match.</p>")
+        body.append("<table><thead><tr>"
+                    f"<th>{sort_link('function', '/file', base_params, 'function', sort, direction)}</th>"
+                    f"<th class=\"num\">{sort_link('tcc', '/file', base_params, 'tcc', sort, direction)}</th>"
+                    f"<th class=\"num\">{sort_link('parent', '/file', base_params, 'parent', sort, direction)}</th>"
+                    f"<th class=\"num\">{sort_link('delta', '/file', base_params, 'delta', sort, direction)}</th>"
+                    f"<th class=\"num\">{sort_link('gcc', '/file', base_params, 'gcc', sort, direction)}</th>"
+                    f"<th class=\"num\">{sort_link('ratio', '/file', base_params, 'ratio', sort, direction)}</th>"
+                    "</tr></thead><tbody>")
         for row in rows:
             delta = row["delta"]
             cls = "pos" if delta and delta > 0 else "neg" if delta and delta < 0 else ""

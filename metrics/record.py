@@ -488,13 +488,15 @@ def record_perf(conn, run_id, perf_host, perf_identity, scratch: Path,
                 + (", ".join(bad) or "no benchmark results produced"))
     n = 0
     for key, res in results.items():
-        # key like 'tcc_o2' / 'gcc_o0'; res.compiler is 'TCC'/'GCC'
+        # key like 'tcc_o2' / 'gcc_o0'; older benchmark JSON labels compiler
+        # as 'TCC-O2'/'GCC-O2', but the metrics schema stores opt separately.
         opt = key.split("_", 1)[1] if "_" in key else "o?"
+        compiler = (res.compiler or key).split("-", 1)[0].upper()
         bs = res.build_size or {}
         for b in res.benchmarks:
             conn.execute(
                 "INSERT OR REPLACE INTO perf VALUES(?,?,?,?,?,?,?,?,?)",
-                (run_id, b.name, res.compiler, opt, b.cycles_per_iter,
+                (run_id, b.name, compiler, opt, b.cycles_per_iter,
                  bs.get("text"), bs.get("data"), bs.get("bss"), b.verify))
             n += 1
     info(f"perf: {n} benchmark rows from {len(results)} builds")

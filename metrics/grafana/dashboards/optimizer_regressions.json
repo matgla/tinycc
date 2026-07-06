@@ -53,7 +53,12 @@
             "uid": "tcc-metrics-sqlite"
           },
           "format": "time_series",
-          "queryText": "SELECT r.commit_ts * 1000 AS time, c.profile AS metric, c.divergent_count AS value FROM correctness c JOIN runs r USING(run_id) WHERE c.oracle = 'olevels' ORDER BY time"
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "queryText": "SELECT r.commit_ts AS time, COALESCE(SUM(CASE WHEN c.profile = 'ptr' THEN c.divergent_count END), 0) AS ptr, COALESCE(SUM(CASE WHEN c.profile = 'bitfield' THEN c.divergent_count END), 0) AS bitfield, COALESCE(SUM(CASE WHEN c.profile = 'float' THEN c.divergent_count END), 0) AS float, COALESCE(SUM(CASE WHEN c.profile = 'switch' THEN c.divergent_count END), 0) AS switch, COALESCE(SUM(CASE WHEN c.profile = 'struct_byval' THEN c.divergent_count END), 0) AS struct_byval, COALESCE(SUM(CASE WHEN c.profile = 'fnptr' THEN c.divergent_count END), 0) AS fnptr, COALESCE(SUM(CASE WHEN c.profile = 'int' THEN c.divergent_count END), 0) AS int, COALESCE(SUM(CASE WHEN c.profile = 'varargs' THEN c.divergent_count END), 0) AS varargs, COALESCE(SUM(CASE WHEN c.profile = 'longlong' THEN c.divergent_count END), 0) AS longlong, COALESCE(SUM(CASE WHEN c.profile = 'signed' THEN c.divergent_count END), 0) AS signed, COALESCE(SUM(CASE WHEN c.profile = 'combo' THEN c.divergent_count END), 0) AS combo, COALESCE(SUM(CASE WHEN c.profile = 'combo_num' THEN c.divergent_count END), 0) AS combo_num, COALESCE(SUM(CASE WHEN c.profile = 'fp_deep' THEN c.divergent_count END), 0) AS fp_deep, COALESCE(SUM(CASE WHEN c.profile = 'fp_round' THEN c.divergent_count END), 0) AS fp_round, COALESCE(SUM(CASE WHEN c.profile = 'volatile' THEN c.divergent_count END), 0) AS volatile, COALESCE(SUM(CASE WHEN c.profile = 'agg_deep' THEN c.divergent_count END), 0) AS agg_deep FROM runs r LEFT JOIN correctness c ON c.run_id = r.run_id AND c.oracle = 'olevels' GROUP BY r.run_id ORDER BY time",
+          "rawQueryText": "SELECT r.commit_ts AS time, COALESCE(SUM(CASE WHEN c.profile = 'ptr' THEN c.divergent_count END), 0) AS ptr, COALESCE(SUM(CASE WHEN c.profile = 'bitfield' THEN c.divergent_count END), 0) AS bitfield, COALESCE(SUM(CASE WHEN c.profile = 'float' THEN c.divergent_count END), 0) AS float, COALESCE(SUM(CASE WHEN c.profile = 'switch' THEN c.divergent_count END), 0) AS switch, COALESCE(SUM(CASE WHEN c.profile = 'struct_byval' THEN c.divergent_count END), 0) AS struct_byval, COALESCE(SUM(CASE WHEN c.profile = 'fnptr' THEN c.divergent_count END), 0) AS fnptr, COALESCE(SUM(CASE WHEN c.profile = 'int' THEN c.divergent_count END), 0) AS int, COALESCE(SUM(CASE WHEN c.profile = 'varargs' THEN c.divergent_count END), 0) AS varargs, COALESCE(SUM(CASE WHEN c.profile = 'longlong' THEN c.divergent_count END), 0) AS longlong, COALESCE(SUM(CASE WHEN c.profile = 'signed' THEN c.divergent_count END), 0) AS signed, COALESCE(SUM(CASE WHEN c.profile = 'combo' THEN c.divergent_count END), 0) AS combo, COALESCE(SUM(CASE WHEN c.profile = 'combo_num' THEN c.divergent_count END), 0) AS combo_num, COALESCE(SUM(CASE WHEN c.profile = 'fp_deep' THEN c.divergent_count END), 0) AS fp_deep, COALESCE(SUM(CASE WHEN c.profile = 'fp_round' THEN c.divergent_count END), 0) AS fp_round, COALESCE(SUM(CASE WHEN c.profile = 'volatile' THEN c.divergent_count END), 0) AS volatile, COALESCE(SUM(CASE WHEN c.profile = 'agg_deep' THEN c.divergent_count END), 0) AS agg_deep FROM runs r LEFT JOIN correctness c ON c.run_id = r.run_id AND c.oracle = 'olevels' GROUP BY r.run_id ORDER BY time"
         }
       ]
     },
@@ -88,7 +93,12 @@
             "uid": "tcc-metrics-sqlite"
           },
           "format": "time_series",
-          "queryText": "SELECT r.commit_ts * 1000 AS time, SUM(c.divergent_count) AS value FROM correctness c JOIN runs r USING(run_id) GROUP BY r.run_id ORDER BY time"
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "queryText": "SELECT r.commit_ts AS time, COALESCE(SUM(c.divergent_count), 0) AS total FROM runs r LEFT JOIN correctness c ON c.run_id = r.run_id GROUP BY r.run_id ORDER BY time",
+          "rawQueryText": "SELECT r.commit_ts AS time, COALESCE(SUM(c.divergent_count), 0) AS total FROM runs r LEFT JOIN correctness c ON c.run_id = r.run_id GROUP BY r.run_id ORDER BY time"
         }
       ]
     },
@@ -125,7 +135,12 @@
             "uid": "tcc-metrics-sqlite"
           },
           "format": "time_series",
-          "queryText": "SELECT r.commit_ts * 1000 AS time, cr.opt AS metric, cr.ratio AS value FROM codesize_rollup cr JOIN runs r USING(run_id) WHERE cr.suite = '<total>' ORDER BY time"
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "queryText": "SELECT r.commit_ts AS time, MAX(CASE WHEN cr.opt = 'o0' THEN cr.ratio END) AS o0, MAX(CASE WHEN cr.opt = 'o1' THEN cr.ratio END) AS o1, MAX(CASE WHEN cr.opt = 'o2' THEN cr.ratio END) AS o2 FROM runs r LEFT JOIN codesize_rollup cr ON cr.run_id = r.run_id AND cr.suite = '<total>' GROUP BY r.run_id ORDER BY time",
+          "rawQueryText": "SELECT r.commit_ts AS time, MAX(CASE WHEN cr.opt = 'o0' THEN cr.ratio END) AS o0, MAX(CASE WHEN cr.opt = 'o1' THEN cr.ratio END) AS o1, MAX(CASE WHEN cr.opt = 'o2' THEN cr.ratio END) AS o2 FROM runs r LEFT JOIN codesize_rollup cr ON cr.run_id = r.run_id AND cr.suite = '<total>' GROUP BY r.run_id ORDER BY time"
         }
       ]
     },
@@ -162,13 +177,18 @@
             "uid": "tcc-metrics-sqlite"
           },
           "format": "time_series",
-          "queryText": "SELECT r.commit_ts * 1000 AS time, replace(ct.scope, 'codesize_corpus_', '') AS metric, ct.seconds AS value FROM compile_time ct JOIN runs r USING(run_id) WHERE ct.scope LIKE 'codesize_corpus_o%' ORDER BY time"
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "queryText": "SELECT r.commit_ts AS time, MAX(CASE WHEN ct.scope = 'codesize_corpus_o0' THEN ct.seconds END) AS o0, MAX(CASE WHEN ct.scope = 'codesize_corpus_o1' THEN ct.seconds END) AS o1, MAX(CASE WHEN ct.scope = 'codesize_corpus_o2' THEN ct.seconds END) AS o2 FROM runs r LEFT JOIN compile_time ct ON ct.run_id = r.run_id GROUP BY r.run_id ORDER BY time",
+          "rawQueryText": "SELECT r.commit_ts AS time, MAX(CASE WHEN ct.scope = 'codesize_corpus_o0' THEN ct.seconds END) AS o0, MAX(CASE WHEN ct.scope = 'codesize_corpus_o1' THEN ct.seconds END) AS o1, MAX(CASE WHEN ct.scope = 'codesize_corpus_o2' THEN ct.seconds END) AS o2 FROM runs r LEFT JOIN compile_time ct ON ct.run_id = r.run_id GROUP BY r.run_id ORDER BY time"
         }
       ]
     },
     {
       "id": 5,
-      "title": "RP2350 cycles/iter (-O2, TCC vs GCC)",
+      "title": "RP2350 cycles/iter ratio vs GCC by opt",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -180,12 +200,14 @@
         "type": "frser-sqlite-datasource",
         "uid": "tcc-metrics-sqlite"
       },
+      "description": "Average per-benchmark TCC/GCC cycles_per_iter ratio on RP2350, one line per opt level. Lower is better; 1.0 matches GCC.",
       "fieldConfig": {
         "defaults": {
           "custom": {
             "drawStyle": "line",
             "spanNulls": true
-          }
+          },
+          "unit": "none"
         },
         "overrides": []
       },
@@ -197,7 +219,12 @@
             "uid": "tcc-metrics-sqlite"
           },
           "format": "time_series",
-          "queryText": "SELECT r.commit_ts * 1000 AS time, p.benchmark || ' (' || p.compiler || ')' AS metric, p.cycles_per_iter AS value FROM perf p JOIN runs r USING(run_id) WHERE p.opt_level = 'o2' ORDER BY time"
+          "queryType": "time series",
+          "timeColumns": [
+            "time"
+          ],
+          "queryText": "SELECT r.commit_ts AS time, AVG(CASE WHEN t.opt_level = 'o0' THEN t.cycles_per_iter / NULLIF(g.cycles_per_iter, 0) END) AS o0, AVG(CASE WHEN t.opt_level = 'o1' THEN t.cycles_per_iter / NULLIF(g.cycles_per_iter, 0) END) AS o1, AVG(CASE WHEN t.opt_level = 'o2' THEN t.cycles_per_iter / NULLIF(g.cycles_per_iter, 0) END) AS o2 FROM runs r LEFT JOIN perf t ON t.run_id = r.run_id AND t.compiler IN ('TCC', 'TCC-O0', 'TCC-O1', 'TCC-O2') LEFT JOIN perf g ON g.run_id = t.run_id AND g.benchmark = t.benchmark AND g.opt_level = t.opt_level AND g.compiler IN ('GCC', 'GCC-O0', 'GCC-O1', 'GCC-O2') GROUP BY r.run_id ORDER BY time",
+          "rawQueryText": "SELECT r.commit_ts AS time, AVG(CASE WHEN t.opt_level = 'o0' THEN t.cycles_per_iter / NULLIF(g.cycles_per_iter, 0) END) AS o0, AVG(CASE WHEN t.opt_level = 'o1' THEN t.cycles_per_iter / NULLIF(g.cycles_per_iter, 0) END) AS o1, AVG(CASE WHEN t.opt_level = 'o2' THEN t.cycles_per_iter / NULLIF(g.cycles_per_iter, 0) END) AS o2 FROM runs r LEFT JOIN perf t ON t.run_id = r.run_id AND t.compiler IN ('TCC', 'TCC-O0', 'TCC-O1', 'TCC-O2') LEFT JOIN perf g ON g.run_id = t.run_id AND g.benchmark = t.benchmark AND g.opt_level = t.opt_level AND g.compiler IN ('GCC', 'GCC-O0', 'GCC-O1', 'GCC-O2') GROUP BY r.run_id ORDER BY time"
         }
       ]
     },
@@ -223,7 +250,8 @@
             "uid": "tcc-metrics-sqlite"
           },
           "format": "table",
-          "queryText": "SELECT r.commit_sha AS commit, r.subject AS subject, c.profile, c.oracle, c.divergent_count AS now, p.divergent_count AS parent, (c.divergent_count - p.divergent_count) AS delta FROM correctness c JOIN runs r USING(run_id) JOIN runs rp ON rp.commit_sha = r.parent_sha AND rp.host = r.host JOIN correctness p ON p.run_id = rp.run_id AND p.profile = c.profile AND p.oracle = c.oracle WHERE (c.divergent_count - p.divergent_count) > 0 ORDER BY delta DESC"
+          "queryText": "SELECT r.commit_sha AS commit, r.subject AS subject, c.profile, c.oracle, c.divergent_count AS now, p.divergent_count AS parent, (c.divergent_count - p.divergent_count) AS delta FROM correctness c JOIN runs r USING(run_id) JOIN runs rp ON rp.commit_sha = r.parent_sha AND rp.host = r.host JOIN correctness p ON p.run_id = rp.run_id AND p.profile = c.profile AND p.oracle = c.oracle WHERE (c.divergent_count - p.divergent_count) > 0 ORDER BY delta DESC",
+          "rawQueryText": "SELECT r.commit_sha AS commit, r.subject AS subject, c.profile, c.oracle, c.divergent_count AS now, p.divergent_count AS parent, (c.divergent_count - p.divergent_count) AS delta FROM correctness c JOIN runs r USING(run_id) JOIN runs rp ON rp.commit_sha = r.parent_sha AND rp.host = r.host JOIN correctness p ON p.run_id = rp.run_id AND p.profile = c.profile AND p.oracle = c.oracle WHERE (c.divergent_count - p.divergent_count) > 0 ORDER BY delta DESC"
         }
       ]
     },
@@ -254,7 +282,8 @@
             "uid": "tcc-metrics-sqlite"
           },
           "format": "table",
-          "queryText": "SELECT cr.suite, cr.func_count, cr.tcc_size, cr.gcc_size, cr.ratio FROM codesize_rollup cr WHERE cr.run_id = (SELECT run_id FROM runs ORDER BY commit_ts DESC LIMIT 1) AND cr.opt = 'o2' AND cr.suite <> '<total>' ORDER BY cr.ratio DESC"
+          "queryText": "SELECT cr.suite, cr.func_count, cr.tcc_size, cr.gcc_size, cr.ratio FROM codesize_rollup cr WHERE cr.run_id = (SELECT run_id FROM runs ORDER BY commit_ts DESC LIMIT 1) AND cr.opt = 'o2' AND cr.suite <> '<total>' ORDER BY cr.ratio DESC",
+          "rawQueryText": "SELECT cr.suite, cr.func_count, cr.tcc_size, cr.gcc_size, cr.ratio FROM codesize_rollup cr WHERE cr.run_id = (SELECT run_id FROM runs ORDER BY commit_ts DESC LIMIT 1) AND cr.opt = 'o2' AND cr.suite <> '<total>' ORDER BY cr.ratio DESC"
         }
       ]
     }
