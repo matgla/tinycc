@@ -13,6 +13,8 @@ metrics/
   schema.sql              -- SQLite DDL (runs, correctness, codesize, compile_time, perf, accepted_divergence)
   record.py                -- collects one commit's metrics, upserts into metrics.db
   gate.py                   -- compares a run against its parent; --strict to fail the build
+  codesize_detail_server.py -- simple file/function code-size comparison viewer
+  codesize-detail-server.service
   grafana/
     docker-compose.yml
     tcc-metrics-grafana.service  -- systemd unit, wraps podman-compose up/down
@@ -27,6 +29,12 @@ metrics/
 for code size, [tests/benchmarks/run_benchmark.py](../tests/benchmarks/run_benchmark.py)
 for RP2350 perf, and [tests/fuzz/sweep_all.py](../tests/fuzz/sweep_all.py) for
 the (manual) correctness sweep.
+
+Grafana intentionally shows only summaries: correctness counts, code-size
+rollups, compile time, RP2350 perf, and suite-level code-size tables. The
+high-cardinality per-function code-size rows live in a separate SQLite file
+(`/var/lib/tcc-metrics/codesize-detail.db`) served by
+`metrics/codesize_detail_server.py`.
 
 ## One-time Pi setup
 
@@ -62,8 +70,9 @@ measure code size/compile time (no board needed) and uploads a scratch
 metrics db of its own; `rp2350-perf` (`needs: build-and-measure`) downloads
 both artifacts, so it never rebuilds tcc and never re-measures code size —
 it only does what actually needs the board (running benchmarks over SSH),
-then imports the earlier job's numbers into the persistent db via
-`record.py --import-codesize-from` (see "What CI does" below).
+then imports the earlier job's summary numbers into the persistent Grafana db
+via `record.py --import-codesize-from` and copies per-function rows into the
+separate detail db via `--detail-db` (see "What CI does" below).
 `build-and-test` (the actual test suite) does **not** consume the `build`
 artifact — `make test` depends on `cross`, which reaches through object
 files and checksum/fp-libs/PCH stamp files, not just the final binary, so a
@@ -112,22 +121,24 @@ fuzz sweep in any of them):
    and compile time (the code-size corpus's wall time). It uploads the
    scratch db as an artifact.
 4. `rp2350-perf` (self-hosted Pi, `needs: build-and-measure`) downloads the
-   tcc build and the scratch db, imports the scratch db's
-   codesize/compile-time rows into the persistent
-   `/var/lib/tcc-metrics/metrics.db` via
-   `record.py --import-codesize-from <scratch db>`, and measures RP2350
-   perf if the board answers.
+   tcc build and the scratch db, imports the scratch db's code-size rollup and
+   compile-time rows into the persistent `/var/lib/tcc-metrics/metrics.db` via
+   `record.py --import-codesize-from <scratch db>`, copies the scratch db's
+   per-function rows into `/var/lib/tcc-metrics/codesize-detail.db` via
+   `--detail-db`, and measures RP2350 perf if the board answers.
 
 `build-and-measure` and `rp2350-perf` record under the same synthetic host
 key (`METRICS_HOST: armv8m-metrics`, set at the workflow level) so they land
 on **one** run row per commit instead of two — the db keys `runs` by
 `(commit_sha, host)`, and both `gate.py` and the Grafana dashboard assume
 one host owns every metric for a commit. `--import-codesize-from` is what
-makes that work: it copies `codesize_rollup`/`codesize_func`/`compile_time`
-rows for the matching commit from another metrics db instead of
-recomputing them, so the `rp2350-perf` job's `upsert_run` (which always
-clears a run's child tables before re-populating them) doesn't need to redo
-`build-and-measure`'s measurement to fill them back in.
+makes that work: it copies `codesize_rollup`/`compile_time` rows for the
+matching commit from another metrics db instead of recomputing them, so the
+`rp2350-perf` job's `upsert_run` (which always clears a run's child tables
+before re-populating them) doesn't need to redo `build-and-measure`'s
+measurement to fill them back in. Per-function `codesize_func` rows are not
+imported into Grafana's DB; `--detail-db` syncs them to the standalone detail
+DB instead.
 
 The gate step is present but a no-op until the `METRICS_GATE_ENABLED` repo
 variable is set to `true` (Settings -> Actions -> Variables) — see "Gate
@@ -205,11 +216,35 @@ sudo systemctl restart tcc-metrics-grafana  # e.g. after editing docker-compose.
 Opens on `http://<pi>:3000`. The SQLite datasource and the
 "TinyCC Optimizer Regressions" dashboard are provisioned automatically from
 `provisioning/` and `dashboards/`. Panels: per-profile divergence, total
-divergence, code-size ratio vs GCC, compile-time trend, RP2350 cycles, and a
-"regressed since parent" table — the last one is the accept/reject signal for
-each migration commit (see
+divergence, code-size ratio vs GCC, compile-time trend, RP2350 cycles,
+suite-level code-size summary, and a "regressed since parent" table — the last
+one is the accept/reject signal for each migration commit (see
 [docs/plan_opt_predicate_framework.md](plan_opt_predicate_framework.md) and
 the optimizer migration plan for how it's used).
+
+## Code-size detail viewer
+
+Per-file and per-function code-size comparison is served separately:
+
+```bash
+python3 metrics/codesize_detail_server.py \
+    --db /var/lib/tcc-metrics/codesize-detail.db \
+    --host 0.0.0.0 --port 8008
+```
+
+It opens on `http://<pi>:8008`. The index lists recorded commits; each commit
+has a file-level comparison against its recorded parent, with links down to
+function-level deltas. It reads the detail DB read-only and uses only Python's
+standard library.
+
+To run it as a service:
+
+```bash
+sudo cp /opt/tcc-metrics/tinycc/metrics/codesize-detail-server.service \
+    /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now codesize-detail-server.service
+```
 
 ## Backfilling history
 

@@ -89,8 +89,10 @@ CREATE TABLE IF NOT EXISTS codesize_rollup (
 );
 
 -- (2b) code-size DETAIL -- per-function per opt; large (~thousands of rows/run
--- x 3 opts), so written only when the recorder is invoked with
--- --codesize-detail (nightly).
+-- x 3 opts).  Grafana's persistent metrics.db should normally contain only
+-- rollups; CI writes this table in a scratch db and record.py --detail-db syncs
+-- it to /var/lib/tcc-metrics/codesize-detail.db for the standalone detail
+-- viewer.
 CREATE TABLE IF NOT EXISTS codesize_func (
     run_id   INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
     suite    TEXT    NOT NULL,

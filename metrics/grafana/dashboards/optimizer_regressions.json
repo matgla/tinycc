@@ -2,60 +2,56 @@
   "id": null,
   "uid": "tcc-optimizer-regressions",
   "title": "TinyCC Optimizer Regressions",
-  "tags": ["tinycc", "optimizer"],
+  "tags": [
+    "tinycc",
+    "optimizer"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 3,
+  "version": 4,
   "editable": true,
-  "time": { "from": "now-2y", "to": "now" },
+  "time": {
+    "from": "now-2y",
+    "to": "now"
+  },
   "refresh": "",
   "templating": {
-    "list": [
-      {
-        "name": "test",
-        "type": "query",
-        "label": "Test (suite/file)",
-        "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-        "definition": "SELECT DISTINCT suite || '/' || test FROM codesize_func WHERE opt = 'o2' ORDER BY 1",
-        "query": "SELECT DISTINCT suite || '/' || test FROM codesize_func WHERE opt = 'o2' ORDER BY 1",
-        "refresh": 2,
-        "sort": 1,
-        "includeAll": false,
-        "multi": false,
-        "hide": 0,
-        "current": {},
-        "options": []
-      },
-      {
-        "name": "opt",
-        "type": "custom",
-        "label": "Opt level (per-function panels)",
-        "query": "o0,o1,o2",
-        "current": { "text": "o2", "value": "o2" },
-        "options": [
-          { "text": "o0", "value": "o0", "selected": false },
-          { "text": "o1", "value": "o1", "selected": false },
-          { "text": "o2", "value": "o2", "selected": true }
-        ],
-        "includeAll": false,
-        "multi": false,
-        "hide": 0
-      }
-    ]
+    "list": []
   },
-  "annotations": { "list": [] },
+  "annotations": {
+    "list": []
+  },
   "panels": [
     {
       "id": 1,
       "title": "Divergent seeds per profile (olevels)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "tcc-metrics-sqlite"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "tcc-metrics-sqlite"
+          },
           "format": "time_series",
           "queryText": "SELECT r.commit_ts * 1000 AS time, c.profile AS metric, c.divergent_count AS value FROM correctness c JOIN runs r USING(run_id) WHERE c.oracle = 'olevels' ORDER BY time"
         }
@@ -65,13 +61,32 @@
       "id": 2,
       "title": "Total divergence (all profiles, all oracles)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "spanNulls": false } }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "tcc-metrics-sqlite"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "bars",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "tcc-metrics-sqlite"
+          },
           "format": "time_series",
           "queryText": "SELECT r.commit_ts * 1000 AS time, SUM(c.divergent_count) AS value FROM correctness c JOIN runs r USING(run_id) GROUP BY r.run_id ORDER BY time"
         }
@@ -81,14 +96,34 @@
       "id": 3,
       "title": "Code size vs GCC (tcc/gcc ratio, <total>) by opt",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "tcc-metrics-sqlite"
+      },
       "description": "Total tcc/gcc instruction-count ratio over the whole corpus, one line per opt level (both compilers built at that level). Lower = closer to GCC.",
-      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true }, "unit": "none" }, "overrides": [] },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "spanNulls": true
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "tcc-metrics-sqlite"
+          },
           "format": "time_series",
           "queryText": "SELECT r.commit_ts * 1000 AS time, cr.opt AS metric, cr.ratio AS value FROM codesize_rollup cr JOIN runs r USING(run_id) WHERE cr.suite = '<total>' ORDER BY time"
         }
@@ -98,14 +133,34 @@
       "id": 4,
       "title": "Compile time (code-size corpus) by opt",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "tcc-metrics-sqlite"
+      },
       "description": "Wall time to compile the code-size corpus at each TCC opt level.",
-      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true }, "unit": "s" }, "overrides": [] },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "spanNulls": true
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "tcc-metrics-sqlite"
+          },
           "format": "time_series",
           "queryText": "SELECT r.commit_ts * 1000 AS time, replace(ct.scope, 'codesize_corpus_', '') AS metric, ct.seconds AS value FROM compile_time ct JOIN runs r USING(run_id) WHERE ct.scope LIKE 'codesize_corpus_o%' ORDER BY time"
         }
@@ -115,13 +170,32 @@
       "id": 5,
       "title": "RP2350 cycles/iter (-O2, TCC vs GCC)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true } }, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "tcc-metrics-sqlite"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "tcc-metrics-sqlite"
+          },
           "format": "time_series",
           "queryText": "SELECT r.commit_ts * 1000 AS time, p.benchmark || ' (' || p.compiler || ')' AS metric, p.cycles_per_iter AS value FROM perf p JOIN runs r USING(run_id) WHERE p.opt_level = 'o2' ORDER BY time"
         }
@@ -131,12 +205,23 @@
       "id": 6,
       "title": "Regressed since parent commit",
       "type": "table",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "tcc-metrics-sqlite"
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "tcc-metrics-sqlite"
+          },
           "format": "table",
           "queryText": "SELECT r.commit_sha AS commit, r.subject AS subject, c.profile, c.oracle, c.divergent_count AS now, p.divergent_count AS parent, (c.divergent_count - p.divergent_count) AS delta FROM correctness c JOIN runs r USING(run_id) JOIN runs rp ON rp.commit_sha = r.parent_sha AND rp.host = r.host JOIN correctness p ON p.run_id = rp.run_id AND p.profile = c.profile AND p.oracle = c.oracle WHERE (c.divergent_count - p.divergent_count) > 0 ORDER BY delta DESC"
         }
@@ -144,52 +229,32 @@
     },
     {
       "id": 7,
-      "title": "Code-size delta vs parent — per function (latest commit, $opt)",
+      "title": "Code size by suite (latest commit, -O2)",
       "type": "table",
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 24 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-      "description": "Per-function instruction-count change between the newest recorded commit and its first parent, at the $opt level. Positive delta = grew (regression); ordered worst-first. Populated by record.py --codesize-detail.",
-      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "datasource": {
+        "type": "frser-sqlite-datasource",
+        "uid": "tcc-metrics-sqlite"
+      },
+      "description": "Suite-level summary only. File/function drilldown lives in the standalone codesize detail server.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
       "targets": [
         {
           "refId": "A",
-          "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
+          "datasource": {
+            "type": "frser-sqlite-datasource",
+            "uid": "tcc-metrics-sqlite"
+          },
           "format": "table",
-          "queryText": "SELECT cf.suite, cf.test, cf.function, cf.tcc_size AS now, pf.tcc_size AS parent, (cf.tcc_size - pf.tcc_size) AS delta FROM codesize_func cf JOIN runs r USING(run_id) JOIN runs rp ON rp.commit_sha = r.parent_sha AND rp.host = r.host JOIN codesize_func pf ON pf.run_id = rp.run_id AND pf.suite = cf.suite AND pf.test = cf.test AND pf.function = cf.function AND pf.opt = cf.opt WHERE r.run_id = (SELECT run_id FROM runs ORDER BY commit_ts DESC LIMIT 1) AND cf.opt = '${opt}' AND cf.tcc_size <> pf.tcc_size ORDER BY delta DESC"
-        }
-      ]
-    },
-    {
-      "id": 8,
-      "title": "Worst tcc/gcc code-size ratio (latest commit, $opt, top 50)",
-      "type": "table",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 33 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-      "description": "Functions where TinyCC emits the most instructions relative to GCC at the $opt level in the newest recorded commit. The standing 'where are we worst' list, independent of any regression.",
-      "fieldConfig": { "defaults": {}, "overrides": [] },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-          "format": "table",
-          "queryText": "SELECT cf.suite, cf.test, cf.function, cf.tcc_size, cf.gcc_size, cf.ratio FROM codesize_func cf WHERE cf.run_id = (SELECT run_id FROM runs ORDER BY commit_ts DESC LIMIT 1) AND cf.opt = '${opt}' AND cf.gcc_size > 0 ORDER BY cf.ratio DESC LIMIT 50"
-        }
-      ]
-    },
-    {
-      "id": 9,
-      "title": "Code size over commits — $test (instructions, tcc vs gcc, $opt)",
-      "type": "timeseries",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 33 },
-      "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-      "description": "History of the selected test's total instruction count (summed over its functions) at the $opt level, TinyCC vs GCC. Pick a test in the '$test' dropdown and an opt level in '$opt' at the top.",
-      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "spanNulls": true }, "unit": "none" }, "overrides": [] },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "frser-sqlite-datasource", "uid": "tcc-metrics-sqlite" },
-          "format": "time_series",
-          "queryText": "SELECT r.commit_ts * 1000 AS time, 'tcc' AS metric, SUM(cf.tcc_size) AS value FROM codesize_func cf JOIN runs r USING(run_id) WHERE cf.suite || '/' || cf.test = '${test}' AND cf.opt = '${opt}' GROUP BY r.run_id UNION ALL SELECT r.commit_ts * 1000 AS time, 'gcc' AS metric, SUM(cf.gcc_size) AS value FROM codesize_func cf JOIN runs r USING(run_id) WHERE cf.suite || '/' || cf.test = '${test}' AND cf.opt = '${opt}' GROUP BY r.run_id ORDER BY time"
+          "queryText": "SELECT cr.suite, cr.func_count, cr.tcc_size, cr.gcc_size, cr.ratio FROM codesize_rollup cr WHERE cr.run_id = (SELECT run_id FROM runs ORDER BY commit_ts DESC LIMIT 1) AND cr.opt = 'o2' AND cr.suite <> '<total>' ORDER BY cr.ratio DESC"
         }
       ]
     }

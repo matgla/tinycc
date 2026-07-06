@@ -136,8 +136,9 @@ jobs:
         run: |
           source .venv/bin/activate
           # No --perf-host (perf runs on the Pi) and no --keep (throwaway db).
-          # --codesize-detail fills the per-function table so the Pi's import
-          # gets Grafana's drill-down rows too. Tee all logs to an artifact.
+          # --codesize-detail fills the per-function table in the scratch DB.
+          # The Pi stores those rows in a separate detail DB for the standalone
+          # viewer; Grafana's DB imports only rollups.
           python3 metrics/record.py --db "$RUNNER_TEMP/codesize.db" --rev HEAD \
               --no-correctness --codesize-detail --jobs "$(nproc)" \
               --host "$METRICS_HOST" --branch mob \
@@ -173,6 +174,7 @@ jobs:
       cancel-in-progress: false
     env:
       METRICS_DB: /var/lib/tcc-metrics/metrics.db
+      CODESIZE_DETAIL_DB: /var/lib/tcc-metrics/codesize-detail.db
       PERF_HOST: 127.0.0.1
       PERF_IDENTITY: /home/runner/.ssh/id_rp
       # safe.directory=* comes from the workflow-level GIT_CONFIG_* env (see top).
@@ -203,13 +205,14 @@ jobs:
           path: ${{ runner.temp }}/codesize
 
       - name: Import codesize + record perf
-        # --import-codesize-from copies the cloud job's codesize/compile-time
-        # rows (measured at -O0/-O1/-O2) into this run instead of recomputing
-        # them locally; --perf-host runs the RP2350 board benchmark. Both land
-        # in the real metrics.db under the same run. --keep 20 bounds DB growth.
+        # --import-codesize-from copies only cloud job rollups/compile-time rows
+        # into Grafana's metrics.db. --detail-db copies the per-function rows to
+        # a separate DB for metrics/codesize_detail_server.py. --perf-host runs
+        # the RP2350 board benchmark. --keep/--detail-keep bound DB growth.
         run: |
           python3 metrics/record.py --db "$METRICS_DB" --rev HEAD --no-correctness \
               --import-codesize-from "$RUNNER_TEMP/codesize/codesize.db" \
+              --detail-db "$CODESIZE_DETAIL_DB" --detail-keep 20 \
               --host "$METRICS_HOST" --trigger "${{ github.event_name }}" \
               --perf-host "$PERF_HOST" --perf-identity "$PERF_IDENTITY" --perf-strict \
               --branch mob --keep 20

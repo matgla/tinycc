@@ -1,0 +1,14 @@
+[Unit]
+Description=TinyCC code-size detail viewer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tcc-metrics/tinycc
+ExecStart=/usr/bin/python3 /opt/tcc-metrics/tinycc/metrics/codesize_detail_server.py --db /var/lib/tcc-metrics/codesize-detail.db --host 0.0.0.0 --port 8008
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -25,6 +25,7 @@ Examples
   # nightly: full-recall triage band + per-function detail + RP2350 perf
   python3 metrics/record.py --db "$METRICS_DB" --rev HEAD \
       --seed-lo 0 --seed-hi 20000 --mode triage --codesize-detail \
+      --detail-db /var/lib/tcc-metrics/codesize-detail.db \
       --perf-host 127.0.0.1 --perf-identity ~/.ssh/id_rp
 
   # seed the code-size / compile-time graphs from history (slow, run once)
@@ -303,9 +304,15 @@ def record_compile_time(conn, run_id, scope, corpus_secs, n_units) -> None:
 
 
 def import_codesize(conn, run_id, src_db_path, commit_sha) -> bool:
-    """Copy codesize_rollup/codesize_func/compile_time rows recorded for
-    `commit_sha` in another metrics db (e.g. a cloud-runner scratch db from a
-    faster build host) into `run_id`, instead of recomputing them locally."""
+    """Copy summary codesize/compile_time rows recorded for `commit_sha` in
+    another metrics db (e.g. a cloud-runner scratch db from a faster build host)
+    into `run_id`, instead of recomputing them locally.
+
+    Deliberately do not import codesize_func into the Grafana-facing metrics DB:
+    that table is thousands of rows per run and makes dashboard variables/panels
+    unusably noisy.  Use --detail-db to store those rows in a separate database
+    for the standalone file-by-file viewer.
+    """
     conn.execute("ATTACH DATABASE ? AS src", (src_db_path,))
     try:
         src_run = conn.execute(
@@ -319,10 +326,6 @@ def import_codesize(conn, run_id, src_db_path, commit_sha) -> bool:
                    SELECT ?, suite, opt, func_count, tcc_size, gcc_size, ratio
                    FROM src.codesize_rollup WHERE run_id=?""", (run_id, src_run_id))
             conn.execute(
-                """INSERT OR REPLACE INTO codesize_func
-                   SELECT ?, suite, test, function, opt, tcc_size, gcc_size, ratio
-                   FROM src.codesize_func WHERE run_id=?""", (run_id, src_run_id))
-            conn.execute(
                 """INSERT OR REPLACE INTO compile_time
                    SELECT ?, scope, seconds, n_units
                    FROM src.compile_time WHERE run_id=?""", (run_id, src_run_id))
@@ -333,10 +336,108 @@ def import_codesize(conn, run_id, src_db_path, commit_sha) -> bool:
             return False
         n = conn.execute(
             "SELECT COUNT(*) FROM codesize_rollup WHERE run_id=?", (run_id,)).fetchone()[0]
-        info(f"imported codesize/compile_time from {src_db_path} ({n} codesize rows)")
+        info(f"imported codesize rollup/compile_time from {src_db_path} "
+             f"({n} codesize rows)")
         return n > 0
     finally:
         conn.execute("DETACH DATABASE src")
+
+
+def sync_codesize_detail(src_db_path: str, detail_db_path: str, commit_sha: str,
+                         host: str, branch: str, keep: int | None = None) -> bool:
+    """Copy per-function codesize rows into a separate detail database.
+
+    The detail DB uses the same schema as metrics.db but is not mounted by
+    Grafana.  It is intended for metrics/codesize_detail_server.py, where the
+    file/function cardinality is useful instead of toxic to dashboard UX.
+    """
+    conn = connect(detail_db_path)
+    conn.execute("ATTACH DATABASE ? AS src", (src_db_path,))
+    try:
+        cols = [
+            "commit_sha", "parent_sha", "author", "author_email", "subject",
+            "commit_ts", "run_ts", "tcc_build_ok", "wall_seconds", "seed_lo",
+            "seed_hi", "mode", "trigger", "notes",
+        ]
+        select_cols = ", ".join(cols)
+        src_run = conn.execute(
+            f"""SELECT run_id, {select_cols}, host, branch
+                FROM src.runs
+                WHERE commit_sha=? AND host=?
+                ORDER BY run_ts DESC LIMIT 1""",
+            (commit_sha, host)).fetchone()
+        if src_run is None:
+            src_run = conn.execute(
+                f"""SELECT run_id, {select_cols}, host, branch
+                    FROM src.runs
+                    WHERE commit_sha=?
+                    ORDER BY run_ts DESC LIMIT 1""",
+                (commit_sha,)).fetchone()
+        if src_run is None:
+            warn(f"no run metadata for {commit_sha[:12]} in {src_db_path} "
+                 f"-- skipping detail sync")
+            conn.commit()
+            return False
+
+        src_run_id = src_run[0]
+        values = dict(zip(cols, src_run[1:1 + len(cols)]))
+        values["host"] = host or src_run[1 + len(cols)]
+        values["branch"] = branch or src_run[2 + len(cols)]
+        conn.execute(
+            """INSERT INTO runs(commit_sha,parent_sha,branch,author,author_email,
+                                subject,commit_ts,run_ts,host,tcc_build_ok,
+                                wall_seconds,seed_lo,seed_hi,mode,trigger,notes)
+               VALUES(:commit_sha,:parent_sha,:branch,:author,:author_email,
+                      :subject,:commit_ts,:run_ts,:host,:tcc_build_ok,
+                      :wall_seconds,:seed_lo,:seed_hi,:mode,:trigger,:notes)
+               ON CONFLICT(commit_sha, host) DO UPDATE SET
+                    parent_sha=excluded.parent_sha,
+                    branch=excluded.branch,
+                    author=excluded.author,
+                    author_email=excluded.author_email,
+                    subject=excluded.subject,
+                    commit_ts=excluded.commit_ts,
+                    run_ts=excluded.run_ts,
+                    tcc_build_ok=excluded.tcc_build_ok,
+                    wall_seconds=excluded.wall_seconds,
+                    seed_lo=excluded.seed_lo,
+                    seed_hi=excluded.seed_hi,
+                    mode=excluded.mode,
+                    trigger=excluded.trigger,
+                    notes=excluded.notes""",
+            values)
+        detail_run_id = conn.execute(
+            "SELECT run_id FROM runs WHERE commit_sha=? AND host=?",
+            (values["commit_sha"], values["host"])).fetchone()[0]
+
+        for tbl in ("codesize_rollup", "codesize_func", "compile_time"):
+            conn.execute(f"DELETE FROM {tbl} WHERE run_id=?", (detail_run_id,))
+        conn.execute(
+            """INSERT OR REPLACE INTO codesize_rollup
+               SELECT ?, suite, opt, func_count, tcc_size, gcc_size, ratio
+               FROM src.codesize_rollup WHERE run_id=?""",
+            (detail_run_id, src_run_id))
+        conn.execute(
+            """INSERT OR REPLACE INTO codesize_func
+               SELECT ?, suite, test, function, opt, tcc_size, gcc_size, ratio
+               FROM src.codesize_func WHERE run_id=?""",
+            (detail_run_id, src_run_id))
+        conn.execute(
+            """INSERT OR REPLACE INTO compile_time
+               SELECT ?, scope, seconds, n_units
+               FROM src.compile_time WHERE run_id=?""",
+            (detail_run_id, src_run_id))
+        n = conn.execute(
+            "SELECT COUNT(*) FROM codesize_func WHERE run_id=?",
+            (detail_run_id,)).fetchone()[0]
+        conn.commit()
+        if keep is not None:
+            prune_old_runs(conn, values["branch"], values["host"], keep)
+        info(f"synced {n} per-function codesize rows to {detail_db_path}")
+        return n > 0
+    finally:
+        conn.execute("DETACH DATABASE src")
+        conn.close()
 
 
 # ------------------------------------------------------------------------ perf
@@ -410,6 +511,10 @@ def record_one(conn, meta, host, branch, trigger, args, tcc_override=None,
         record_correctness(conn, run_id, args.seed_lo, args.seed_hi, args.mode, args.jobs)
     if args.import_codesize_from:
         import_codesize(conn, run_id, args.import_codesize_from, meta["commit_sha"])
+        if args.detail_db:
+            sync_codesize_detail(args.import_codesize_from, args.detail_db,
+                                 meta["commit_sha"], host, branch,
+                                 args.detail_keep)
     else:
         corpus_secs = record_codesize(conn, run_id, args.jobs, args.codesize_detail, tcc_override)
         for opt, secs in corpus_secs.items():
@@ -419,6 +524,16 @@ def record_one(conn, meta, host, branch, trigger, args, tcc_override=None,
                 (run_id, opt)).fetchone()
             record_compile_time(conn, run_id, f"codesize_corpus_{opt}", secs,
                                  n_units[0] if n_units else None)
+        if args.detail_db:
+            if args.codesize_detail:
+                conn.commit()
+                sync_codesize_detail(args.db, args.detail_db, meta["commit_sha"],
+                                     host, branch, args.detail_keep)
+                conn.execute("DELETE FROM codesize_func WHERE run_id=?", (run_id,))
+                conn.commit()
+            else:
+                warn("--detail-db requested without --codesize-detail; no "
+                     "per-function rows were recorded to sync")
     if do_perf and args.perf_host:
         record_perf(conn, run_id, args.perf_host, args.perf_identity,
                     Path(args.scratch or "."), strict=args.perf_strict)
@@ -467,9 +582,8 @@ def prune_old_runs(conn, branch, host, keep) -> None:
 
     The DB file itself does not shrink -- SQLite reuses the freed pages for
     future inserts, so with a fixed `keep` the file size plateaus at roughly the
-    high-water mark rather than growing unbounded (which is the whole point of
-    turning on --codesize-detail, the one large per-run table).  No VACUUM in the
-    hot path: it would rewrite the whole file on every CI run for no net win.
+    high-water mark rather than growing unbounded.  No VACUUM in the hot path:
+    it would rewrite the whole file on every CI run for no net win.
     """
     if keep < 1:
         die(f"--keep must be >= 1 (got {keep}); refusing to delete every run")
@@ -520,11 +634,17 @@ def main(argv=None) -> int:
                    help="skip local codesize/compile-time measurement; copy those rows "
                         "from another metrics.db recorded for the same commit (e.g. a "
                         "cloud-runner scratch db)")
+    p.add_argument("--detail-db", metavar="DB_PATH",
+                   help="copy per-function codesize rows into this separate SQLite db "
+                        "for metrics/codesize_detail_server.py. Detail rows are not "
+                        "imported into the Grafana-facing --db.")
+    p.add_argument("--detail-keep", type=int, metavar="N",
+                   help="retention for --detail-db: keep only the newest N runs for "
+                        "this --branch/--host")
     p.add_argument("--keep", type=int, metavar="N",
                    help="retention: after recording, keep only the newest N runs for "
                         "this --branch/--host (by commit_ts) and delete older ones "
-                        "(child rows cascade). Bounds metrics.db growth from "
-                        "--codesize-detail.")
+                        "(child rows cascade). Bounds the Grafana metrics DB.")
     args = p.parse_args(argv)
 
     conn = connect(args.db)
