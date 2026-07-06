@@ -97,6 +97,19 @@ jobs:
       METRICS_DB: /var/lib/tcc-metrics/metrics.db
       PERF_HOST: 127.0.0.1
       PERF_IDENTITY: /home/runner/.ssh/id_rp
+      # The self-hosted runner is containerized: the workspace is bind-mounted
+      # at /__w with a UID that differs from the git process, so bare `git`
+      # calls refuse the repo with "detected dubious ownership". That silently
+      # degraded `make`'s version stamp (its git calls have `|| echo no`
+      # fallbacks) and hard-failed record.py's `git show -s HEAD`. Inject
+      # safe.directory=* via GIT_CONFIG_* env: this is the "command" config
+      # scope, which counts as protected configuration, so safe.directory is
+      # honored -- unlike a repo-scope setting. Env (vs a `git config --global`
+      # step) fixes every step's git without accumulating duplicate entries in
+      # the persistent runner's ~/.gitconfig on each run.
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: "*"
 
     steps:
       - name: Checkout repository
@@ -129,6 +142,33 @@ jobs:
               --host "$METRICS_HOST" --trigger "${{ github.event_name }}" \
               --perf-host "$PERF_HOST" --perf-identity "$PERF_IDENTITY" --perf-strict \
               --branch mob --keep 20
+
+      - name: Verify metrics.db is Grafana-readable
+        # A WAL-mode DB writes fine here (job stays green) but Grafana bind-mounts
+        # it read-only (:ro) and cannot open a WAL database read-only -- every
+        # SELECT tries to write the -wal/-shm sidecars and fails "attempt to write
+        # a readonly database", silently breaking the dashboard. Assert the
+        # journal mode is not WAL (the persistent header property that breaks the
+        # read-only open) and that the recorder actually wrote a row, so that
+        # regression turns the job red here instead of surfacing as a broken panel
+        # days later. journal_mode is asserted directly rather than via a chmod'd
+        # read-only-dir probe because the recorder may run as root, for whom chmod
+        # read-only does not block writes -- the probe would false-pass.
+        run: |
+          python3 - "$METRICS_DB" "$METRICS_HOST" <<'PY'
+          import sqlite3, sys
+          db, host = sys.argv[1], sys.argv[2]
+          conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)   # open like Grafana does
+          mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+          if mode.lower().startswith("wal"):
+              sys.exit(f"metrics.db journal_mode={mode!r}: Grafana bind-mounts it "
+                       f"read-only and cannot open a WAL database read-only. "
+                       f"Set PRAGMA journal_mode=DELETE in metrics/schema.sql.")
+          n = conn.execute("SELECT COUNT(*) FROM runs WHERE host=?", (host,)).fetchone()[0]
+          if n == 0:
+              sys.exit(f"metrics.db has no runs for host={host}: recorder wrote nothing")
+          print(f"grafana-readable OK: journal_mode={mode}, {n} run(s) for host={host}")
+          PY
 
       - name: Gate
         if: ${{ vars.METRICS_GATE_ENABLED == 'true' }}
