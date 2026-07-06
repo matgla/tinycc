@@ -30526,7 +30526,10 @@ static void gen_function(Sym *sym)
    * transformations and constant propagation have simplified loop bodies. */
   if (tcc_state->opt_dce)
   {
-    int dle_changes = tcc_ir_opt_dead_loop_elim(ir);
+    /* Dead-loop elimination collapses a side-effect-free loop into its final
+     * (constant) result.  Gate to -O2 so -O1 keeps the loop, matching GCC's
+     * -O1 (which also only elides such loops at -O2). */
+    int dle_changes = (tcc_state->optimize >= 2) ? tcc_ir_opt_dead_loop_elim(ir) : 0;
     if (dle_changes > 0)
     {
       tcc_ir_opt_value_tracking(ir);
@@ -30555,7 +30558,10 @@ static void gen_function(Sym *sym)
       tcc_ir_opt_dead_var_store_elim(ir);
       tcc_ir_opt_dse(ir);
     }
-    int dle_changes = tcc_ir_opt_dead_loop_elim(ir);
+    /* Dead-loop elimination collapses a side-effect-free loop into its final
+     * (constant) result.  Gate to -O2 so -O1 keeps the loop, matching GCC's
+     * -O1 (which also only elides such loops at -O2). */
+    int dle_changes = (tcc_state->optimize >= 2) ? tcc_ir_opt_dead_loop_elim(ir) : 0;
     if (dle_changes > 0)
     {
       tcc_ir_opt_branch_folding(ir);

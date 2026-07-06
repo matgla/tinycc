@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -219,12 +220,15 @@ def build_compiler(compiler: str, ssh_host: str, opt_level: str = "1") -> Tuple[
         if tcc_path:
             print(f"Using TCC: {tcc_path}")
             if check_compiler_changed(build_dir, compiler):
-                print(f"TCC compiler has been updated, forcing reconfiguration...")
+                print(f"TCC compiler has been updated, forcing a clean rebuild...")
                 force_reconfigure = True
-                # Remove CMake cache to force reconfiguration
-                cmake_cache = build_dir / "CMakeCache.txt"
-                if cmake_cache.exists():
-                    cmake_cache.unlink()
+                # The compiler binary changed but the .c sources did not, so CMake's
+                # incremental build would happily reuse objects compiled by the OLD
+                # compiler (make only tracks source mtimes, not the compiler's).  That
+                # silently benchmarks stale code.  Wipe the whole build tree so every
+                # object — benchmark and SDK — is recompiled with the new compiler.
+                shutil.rmtree(build_dir, ignore_errors=True)
+                build_dir.mkdir(parents=True, exist_ok=True)
 
     # Set environment with PICO_SDK_PATH
     env = os.environ.copy()

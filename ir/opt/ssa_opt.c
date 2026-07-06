@@ -750,7 +750,13 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     SSA_RUN("ssa:narrow", ssa_opt_narrow(ctx));
     SSA_RUN("ssa:gvn", ssa_opt_gvn(ctx));
     SSA_RUN("ssa:phi_simplify", ssa_opt_phi_simplify(ctx));
-    SSA_RUN("ssa:dead_loop", ssa_opt_dead_loop(ctx));
+    /* Dead-loop post-phi rewrite: collapse a side-effect-free counting loop
+     * whose result is a loop-invariant constant into a guarded constant
+     * (`(trip>0) ? body_const : init`).  This is an -O2 optimization — GCC
+     * likewise keeps the empty loop at -O1 and only elides it at -O2 — so
+     * gate it to keep -O1 a lighter tier. */
+    SSA_RUN("ssa:dead_loop",
+            (tcc_state && tcc_state->optimize >= 2) ? ssa_opt_dead_loop(ctx) : 0);
     SSA_RUN("ssa:dce", ssa_opt_dce(ctx));
 
     /* target-specific generators (registered by backend) */
