@@ -12,6 +12,19 @@ env:
   # commit_sha+host) -- decoupled from the Pi's actual hostname so dashboard
   # rows stay under one stable host even if the runner hostname changes.
   METRICS_HOST: armv8m-metrics
+  # Every job runs in a container (--user root) whose workspace is bind-mounted
+  # with a UID that differs from the git process, so bare `git` calls refuse the
+  # repo with "detected dubious ownership". That silently degraded `make`'s
+  # version stamp (its git calls have `|| echo no` fallbacks) and hard-failed
+  # record.py's `git show -s HEAD` in the codesize/metrics jobs. Inject
+  # safe.directory=* via GIT_CONFIG_* env: this is the "command" config scope,
+  # which counts as protected configuration, so safe.directory is honored --
+  # unlike a repo-scope setting. At workflow scope it covers every job/step's
+  # git (vs a `git config --global` step) without accumulating duplicate entries
+  # in the persistent runner's ~/.gitconfig on each run.
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: safe.directory
+  GIT_CONFIG_VALUE_0: "*"
 
 jobs:
   build-and-test:
@@ -162,19 +175,7 @@ jobs:
       METRICS_DB: /var/lib/tcc-metrics/metrics.db
       PERF_HOST: 127.0.0.1
       PERF_IDENTITY: /home/runner/.ssh/id_rp
-      # The self-hosted runner is containerized: the workspace is bind-mounted
-      # at /__w with a UID that differs from the git process, so bare `git`
-      # calls refuse the repo with "detected dubious ownership". That silently
-      # degraded `make`'s version stamp (its git calls have `|| echo no`
-      # fallbacks) and hard-failed record.py's `git show -s HEAD`. Inject
-      # safe.directory=* via GIT_CONFIG_* env: this is the "command" config
-      # scope, which counts as protected configuration, so safe.directory is
-      # honored -- unlike a repo-scope setting. Env (vs a `git config --global`
-      # step) fixes every step's git without accumulating duplicate entries in
-      # the persistent runner's ~/.gitconfig on each run.
-      GIT_CONFIG_COUNT: "1"
-      GIT_CONFIG_KEY_0: safe.directory
-      GIT_CONFIG_VALUE_0: "*"
+      # safe.directory=* comes from the workflow-level GIT_CONFIG_* env (see top).
 
     steps:
       - name: Checkout repository
