@@ -13,8 +13,6 @@
  *                                          SETIF+ASSIGN(0) collapse) plus the
  *                                          `JUMPIF C->A; JUMP->B` fallthrough
  *                                          normalization that feeds them.
- *    tcc_ir_opt_postinc_assign_fold     - `T<-V[lval]; V<-T op X` collapses
- *                                          the reload when T has no other use.
  *    tcc_ir_opt_returnvalue_merge       - later RETURNVALUE #same_const sites
  *                                          become JUMPs to the first site.
  *    tcc_ir_opt_backedge_phi_hoist      - CMP+JUMPIF+phi-ASSIGNs+backward JUMP
@@ -54,7 +52,6 @@
 int tcc_ir_opt_redundant_loop_check(TCCIRState *ir);
 int tcc_ir_opt_setif_neg_to_select(TCCIRState *ir);
 int tcc_ir_opt_select(TCCIRState *ir);
-int tcc_ir_opt_postinc_assign_fold(TCCIRState *ir);
 int tcc_ir_opt_returnvalue_merge(TCCIRState *ir);
 int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir);
 int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir);
@@ -637,52 +634,6 @@ UT_TEST(test_select_fallthrough_normalize_then_collapses)
   return 0;
 }
 
-/* ================================================================== postinc_assign_fold */
-
-/* POSITIVE: `T <- V[lval]; V <- T + #1` with T used nowhere else collapses
- * to `V <- V[lval] + #1`, NOPing the reload ASSIGN. */
-UT_TEST(test_postinc_assign_fold_collapses_reload)
-{
-  TCCIRState *ir = utb_new();
-
-  int reload = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_lval(utb_var(1, I32)), UTB_NONE);
-  int add = utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_temp(0, I32), utb_imm(1, I32));
-
-  int changes = tcc_ir_opt_postinc_assign_fold(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, reload), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_ADD);
-  IROperand new_src1 = utb_src1(ir, add);
-  UT_ASSERT_EQ(utb_vreg_pos(new_src1), 1);
-  UT_ASSERT(new_src1.is_lval);
-  UT_ASSERT_EQ(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(new_src1)), TCCIR_VREG_TYPE_VAR);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): T is used a second time (an extra STORE through it), so
- * tmp_use[T] != 2 -- the reload must be kept since T is not single-use. */
-UT_TEST(test_postinc_assign_fold_multi_use_temp_kept)
-{
-  TCCIRState *ir = utb_new();
-
-  int reload = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_lval(utb_var(1, I32)), UTB_NONE);
-  int add = utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_temp(0, I32), utb_imm(1, I32));
-  /* extra use of T0 as a STORE address (dest is a USE for STORE) */
-  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(99, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_postinc_assign_fold(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, reload), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, add)), 0);
-
-  utb_free(ir);
-  return 0;
-}
-
 /* ================================================================== returnvalue_merge */
 
 /* POSITIVE: three RETURNVALUE sites, two returning the same constant (#1) --
@@ -996,9 +947,6 @@ UT_SUITE(opt_promote_extra)
   UT_RUN(test_select_call_diamond_different_callee_kept);
 
   UT_RUN(test_select_fallthrough_normalize_then_collapses);
-
-  UT_RUN(test_postinc_assign_fold_collapses_reload);
-  UT_RUN(test_postinc_assign_fold_multi_use_temp_kept);
 
   UT_RUN(test_returnvalue_merge_duplicate_becomes_jump);
   UT_RUN(test_returnvalue_merge_int64_kept);

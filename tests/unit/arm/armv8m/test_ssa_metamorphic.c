@@ -19,6 +19,7 @@
 
 #include "ssa_build.h"
 #include "ir/opt/ssa_opt.h"
+#include "opt/ssa/strength.h"
 
 #include "ut.h"
 

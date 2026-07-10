@@ -177,20 +177,14 @@ int tcc_ir_opt_dce_ex(IROptCtx *ctx)
   return tcc_ir_opt_dce(ctx->ir);
 }
 
-/* Orphan CMP elimination - NOP CMP/TEST_ZERO (and FUNCCALLVOID to flag-setting
- * soft-float compare helpers __aeabi_cfcmple / __aeabi_cdcmple) whose flag
- * result is not consumed by a SETIF or JUMPIF before the next flag-clobbering
- * op or basic-block boundary.  Various folding passes can leave orphan flag
- * setters behind when their SETIF/JUMPIF consumers get folded into constants
- * or get NOPed by degenerate-branch elimination — the flag setter itself
- * looks "essential" to plain DCE (it sets flags as a side effect) but is
- * observably dead.
- *
- * Flag semantics on ARM (and modeled in this IR): JUMP does not clobber
- * flags; an unconditional JUMP after a CMP propagates the flags to the
- * target block, where they may be consumed by a SETIF.  We follow JUMPs
- * (with a visited bitmap to bound work) but stop at JUMPIF on the safe
- * side — it consumes our flags so the CMP is live anyway. */
+/* Orphan CMP elimination — NOP CMP/TEST_ZERO (and FUNCCALLVOID to flag-setting
+ * soft-float compare helpers) whose flag result is not consumed by a SETIF or
+ * JUMPIF before the next flag-clobbering op or basic-block boundary.  Post-RA
+ * cleanup (no SSA analog; out of scope for the flat->SSA retirement): SETIF/
+ * JUMPIF consumers folded away by earlier passes / out-of-SSA leave orphan flag
+ * setters that plain DCE keeps (they have no dest vreg).  Flags propagate across
+ * unconditional JUMPs, so we follow them (visited bitmap bounds the work) but
+ * stop at JUMPIF, which consumes our flags. */
 static int orphan_cmp_scan(TCCIRState *ir, int from_idx, uint8_t *visited)
 {
   int n = ir->next_instruction_index;
@@ -198,7 +192,7 @@ static int orphan_cmp_scan(TCCIRState *ir, int from_idx, uint8_t *visited)
   while (j < n)
   {
     if (visited[j / 8] & (1 << (j % 8)))
-      return 0; /* loop — conservatively LIVE */
+      return 0;
     visited[j / 8] |= (1 << (j % 8));
 
     IRQuadCompact *nq = &ir->compact_instructions[j];
@@ -207,30 +201,21 @@ static int orphan_cmp_scan(TCCIRState *ir, int from_idx, uint8_t *visited)
       j++;
       continue;
     }
-    /* A join point (jump_target) is reached by alternate predecessors that
-     * may not have executed our flag setter.  We still continue scanning:
-     * if no SETIF/JUMPIF consumer is found before the next flag clobber or
-     * function exit, our flag setter is observably dead.  (Finding a
-     * consumer downstream means our setter IS read on our path, regardless
-     * of what alternate predecessors did.) */
 
     switch (nq->op)
     {
     case TCCIR_OP_SETIF:
     case TCCIR_OP_JUMPIF:
     case TCCIR_OP_SELECT:
-      /* Consumer of our flags - CMP is live.  (SELECT reads the CMP flags via
-       * its ITE block, exactly like SETIF/JUMPIF.) */
       return 0;
     case TCCIR_OP_JUMP:
     {
-      /* Flags propagate across unconditional JUMPs.  Follow the target. */
       IROperand dest = tcc_ir_op_get_dest(ir, nq);
       int target = (int)dest.u.imm32;
       if (target < 0)
-        return 0; /* defensive: malformed JUMP — keep CMP */
+        return 0;
       if (target >= n)
-        return 1; /* JUMP past end (implicit return) — no consumer */
+        return 1;
       j = target;
       continue;
     }
@@ -243,14 +228,12 @@ static int orphan_cmp_scan(TCCIRState *ir, int from_idx, uint8_t *visited)
     case TCCIR_OP_SWITCH_TABLE:
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_FUNCCALLVOID:
-      /* Flag-clobbering or terminator before any consumer. */
       return 1;
     default:
       break;
     }
     j++;
   }
-  /* End of function with no consumer found. */
   return 1;
 }
 
@@ -295,11 +278,6 @@ int tcc_ir_opt_orphan_cmp_elim(TCCIRState *ir)
   }
   tcc_free(visited);
   return changes;
-}
-
-int tcc_ir_opt_orphan_cmp_elim_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_orphan_cmp_elim(ctx->ir);
 }
 
 /* ============================================================================
@@ -5227,10 +5205,11 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
     }
   }
 
-  /* pending[v] = instruction index of last unread ASSIGN to VAR v, or -1 */
+  /* pending[v] = last unread ASSIGN to VAR v, valid only while pending_epoch[v] == cur_epoch;
+   * flush-all is a single cur_epoch++ instead of an O(max_var) sweep per branch/call */
   int *pending = tcc_malloc(sizeof(int) * (max_var + 1));
-  for (int v = 0; v <= max_var; v++)
-    pending[v] = -1;
+  int *pending_epoch = tcc_mallocz(sizeof(int) * (max_var + 1));
+  int cur_epoch = 1;
 
   uint8_t *var_addr_taken = tcc_mallocz((max_var + 8) / 8);
   for (int i = 0; i < n; i++)
@@ -5252,31 +5231,14 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
 
     /* Flush at merge points (jump targets) */
     if (is_target[i / 8] & (1 << (i % 8)))
-    {
-      for (int v = 0; v <= max_var; v++)
-        pending[v] = -1;
-    }
+      cur_epoch++;
 
     /* Block boundary: flush all pending */
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_FUNCCALLVOID ||
         q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
         q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_SWITCH_TABLE)
     {
-      /* First process reads in this instruction (src1/src2) */
-      if (irop_config[q->op].has_src1)
-      {
-        IROperand src1 = tcc_ir_op_get_src1(ir, q);
-        int32_t vr = irop_get_vreg(src1);
-        if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
-        {
-          int pos = TCCIR_DECODE_VREG_POSITION(vr);
-          if (pos <= max_var)
-            pending[pos] = -1;
-        }
-      }
-      /* Flush all */
-      for (int v = 0; v <= max_var; v++)
-        pending[v] = -1;
+      cur_epoch++;
       continue;
     }
 
@@ -5289,7 +5251,7 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos <= max_var)
-          pending[pos] = -1;
+          pending_epoch[pos] = 0;
       }
     }
     if (irop_config[q->op].has_src2)
@@ -5300,7 +5262,7 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos <= max_var)
-          pending[pos] = -1;
+          pending_epoch[pos] = 0;
       }
     }
 
@@ -5315,7 +5277,7 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos <= max_var)
-          pending[pos] = -1;
+          pending_epoch[pos] = 0;
       }
     }
 
@@ -5328,7 +5290,7 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos <= max_var)
-          pending[pos] = -1;
+          pending_epoch[pos] = 0;
       }
       continue;
     }
@@ -5345,16 +5307,17 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
         {
           if (var_addr_taken[pos / 8] & (1 << (pos % 8)))
           {
-            pending[pos] = -1;
+            pending_epoch[pos] = 0;
             continue;
           }
-          if (pending[pos] >= 0)
+          if (pending_epoch[pos] == cur_epoch)
           {
             /* Previous assign to this VAR is dead — overwritten before read */
             ir->compact_instructions[pending[pos]].op = TCCIR_OP_NOP;
             changes++;
           }
           pending[pos] = i;
+          pending_epoch[pos] = cur_epoch;
         }
       }
     }
@@ -5363,664 +5326,12 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
   LOG_IR_GEN("=== REDUNDANT VAR ASSIGN: eliminated %d dead assigns ===", changes);
 
   tcc_free(var_addr_taken);
+  tcc_free(pending_epoch);
   tcc_free(pending);
   tcc_free(is_target);
   return changes;
 }
 
-/* vrp_swap_cmp_tok now in opt_utils.h */
-
-
-int tcc_ir_opt_redundant_init_elim(TCCIRState *ir)
-{
-  int n = ir->next_instruction_index;
-  int changes = 0;
-
-  if (n <= 1)
-    return 0;
-
-  /* Bail if the function has indirect jumps (setjmp/longjmp, computed goto) or a
-   * switch table.  Both introduce control flow the forward BFS below does not
-   * follow: it walks fallthrough/branch successors but never SWITCH_TABLE case
-   * targets, so a use of V reachable only through a switch case is invisible to
-   * it.  Without this bail an entry init `V = imm` whose only use lives in a
-   * switch case (e.g. `int dest_reg = -1;` used inside the operand-kind switch
-   * of tcc_gen_machine_lea_mop) is wrongly eliminated, leaving V uninitialized
-   * on the case path. */
-  for (int i = 0; i < n; i++)
-  {
-    int op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE)
-      return 0;
-  }
-
-  /* Find function-entry VAR inits: instructions before any jump target
-   * that assign a constant to a VAR. */
-  for (int init_idx = 0; init_idx < n; init_idx++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[init_idx];
-    if (q->is_jump_target)
-      break;
-    if (q->op != TCCIR_OP_ASSIGN)
-      continue;
-
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t vr = irop_get_vreg(dest);
-    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
-      continue;
-
-    IROperand src = tcc_ir_op_get_src1(ir, q);
-    if (!irop_is_immediate(src))
-      continue;
-
-    IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vr);
-    if (interval && interval->addrtaken)
-      continue;
-
-    /* Forward reachability: check if V is killed on all paths before use.
-     * State per instruction: 0=unvisited, 1=V-alive (init not yet killed),
-     * 2=V-killed (redef seen on this path). */
-    uint8_t *state = tcc_mallocz(n);
-    int found_use_before_kill = 0;
-
-    /* Worklist-based BFS from init_idx+1 */
-    int *worklist = tcc_malloc(n * sizeof(int));
-    int wl_head = 0, wl_tail = 0;
-    worklist[wl_tail++] = init_idx + 1;
-    state[init_idx] = 1;
-
-    while (wl_head < wl_tail && !found_use_before_kill)
-    {
-      int idx = worklist[wl_head++];
-      if (idx < 0 || idx >= n)
-        continue;
-      if (state[idx] == 2)
-        continue; /* already killed on this path */
-      if (state[idx] == 1)
-        continue;     /* already queued as alive */
-      state[idx] = 1; /* mark as V-alive */
-
-      IRQuadCompact *iq = &ir->compact_instructions[idx];
-      if (iq->op == TCCIR_OP_NOP)
-      {
-        if (idx + 1 < n)
-          worklist[wl_tail++] = idx + 1;
-        continue;
-      }
-
-      /* Check if this instruction USES V */
-      if (irop_config[iq->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, iq)) == vr)
-      {
-        found_use_before_kill = 1;
-        break;
-      }
-      if (irop_config[iq->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, iq)) == vr)
-      {
-        found_use_before_kill = 1;
-        break;
-      }
-      /* MLA accumulator (3rd source operand) is a use — not covered by the
-       * src1/src2 checks above (mirrors the same gap fixed in
-       * tcc_ir_opt_dead_var_store_elim). */
-      if (iq->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, iq)) == vr)
-      {
-        found_use_before_kill = 1;
-        break;
-      }
-      /* STORE/STORE_INDEXED/STORE_POSTINC/FUNCPARAMVAL dest is a use (the store
-       * address / passed value, not a definition of V). */
-      if ((iq->op == TCCIR_OP_STORE || iq->op == TCCIR_OP_STORE_INDEXED ||
-           iq->op == TCCIR_OP_STORE_POSTINC || iq->op == TCCIR_OP_FUNCPARAMVAL) &&
-          irop_get_vreg(tcc_ir_op_get_dest(ir, iq)) == vr)
-      {
-        found_use_before_kill = 1;
-        break;
-      }
-
-      /* Check if this instruction DEFINES (kills) V.
-       * Only treat as kill if the source is explicit (immediate or vreg).
-       * Bare defs like ASM outputs (V <-- with no visible source) may
-       * implicitly depend on V's prior value via register constraints. */
-      if (irop_config[iq->op].has_dest && iq->op != TCCIR_OP_STORE && iq->op != TCCIR_OP_STORE_INDEXED &&
-          iq->op != TCCIR_OP_FUNCPARAMVAL)
-      {
-        IROperand d = tcc_ir_op_get_dest(ir, iq);
-        if (irop_get_vreg(d) == vr)
-        {
-          int has_explicit_src = 0;
-          if (irop_config[iq->op].has_src1)
-          {
-            IROperand s = tcc_ir_op_get_src1(ir, iq);
-            if (irop_is_immediate(s) || irop_has_vreg(s))
-              has_explicit_src = 1;
-          }
-          if (has_explicit_src)
-          {
-            state[idx] = 2; /* killed */
-            continue;       /* don't follow successors — V is dead on this path */
-          }
-        }
-      }
-
-      /* Follow successors */
-      if (iq->op == TCCIR_OP_JUMP)
-      {
-        IROperand jd = tcc_ir_op_get_dest(ir, iq);
-        int target = (int)irop_get_imm64_ex(ir, jd);
-        if (target >= 0 && target < n && state[target] == 0)
-          worklist[wl_tail++] = target;
-      }
-      else if (iq->op == TCCIR_OP_JUMPIF)
-      {
-        IROperand jd = tcc_ir_op_get_dest(ir, iq);
-        int target = (int)irop_get_imm64_ex(ir, jd);
-        if (target >= 0 && target < n && state[target] == 0)
-          worklist[wl_tail++] = target;
-        if (idx + 1 < n && state[idx + 1] == 0)
-          worklist[wl_tail++] = idx + 1;
-      }
-      else if (iq->op == TCCIR_OP_RETURNVALUE)
-      {
-        /* Return with V alive but unused = V is dead (return doesn't use V
-         * as an argument here since we checked src1 above) */
-      }
-      else
-      {
-        if (idx + 1 < n && state[idx + 1] == 0)
-          worklist[wl_tail++] = idx + 1;
-      }
-    }
-
-    tcc_free(worklist);
-    tcc_free(state);
-
-    if (!found_use_before_kill)
-    {
-      q->op = TCCIR_OP_NOP;
-      changes++;
-    }
-  }
-
-  return changes;
-}
-
-
-static int tcc_ir_opt_dead_loop_elim__timed(TCCIRState *ir);
-int tcc_ir_opt_dead_loop_elim(TCCIRState *ir)
-{
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on) return tcc_ir_opt_dead_loop_elim__timed(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_dead_loop_elim__timed(ir);
-  tcc_pass_timing_add("dead_loop_elim", tcc_pass_clk_us() - _t);
-  return _r;
-}
-static int tcc_ir_opt_dead_loop_elim__timed(TCCIRState *ir)
-{
-  int n = ir->next_instruction_index;
-  int changes = 0;
-  if (n == 0)
-    return 0;
-
-  IRLoops *loops = tcc_ir_detect_loops(ir);
-  if (!loops || loops->num_loops == 0)
-  {
-    tcc_ir_free_loops(loops);
-    return 0;
-  }
-
-  for (int li = 0; li < loops->num_loops; li++)
-  {
-    IRLoop *loop = &loops->loops[li];
-    if (loop->num_body_instrs == 0)
-      continue;
-
-    int has_side_effects = 0;
-    int num_const_assigns = 0; (void)num_const_assigns;
-    int has_loop_counter = 0;
-    int has_self_stores = 0;
-
-    /* Track which VARs get constant assignments inside the loop body */
-    typedef struct
-    {
-      int var_pos;
-      int64_t value;
-      int btype;
-    } ConstVar;
-    ConstVar const_vars[8];
-    int num_const_vars = 0;
-
-    for (int idx = loop->start_idx; idx <= loop->end_idx && idx < n; idx++)
-    {
-      IRQuadCompact *q = &ir->compact_instructions[idx];
-
-      if (q->op == TCCIR_OP_NOP)
-        continue;
-      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
-        continue;
-      if (q->op == TCCIR_OP_CMP || q->op == TCCIR_OP_TEST_ZERO)
-        continue;
-
-      /* Calls are side effects */
-      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
-      {
-        has_side_effects = 1;
-        break;
-      }
-
-      /* Stores to memory are side effects, with one exception: a local stack
-       * STORE that copies a value back to the slot it was just loaded from
-       * (`T = *p; *p = T;`) is observably a no-op.  This pattern appears in
-       * inlined struct copies (e.g. CCID's `a = x` after CPOW's body has been
-       * DCE'd) — the alias-conservative DSE passes won't kill it on their
-       * own, so handle it here. */
-      if (q->op == TCCIR_OP_STORE)
-      {
-        IROperand sdest = tcc_ir_op_get_dest(ir, q);
-        IROperand ssrc = tcc_ir_op_get_src1(ir, q);
-        int is_self_store = 0;
-        if (sdest.is_local && sdest.is_lval && irop_get_tag(ssrc) == IROP_TAG_VREG && !ssrc.is_lval)
-        {
-          int32_t src_temp = irop_get_vreg(ssrc);
-          if (src_temp >= 0 && TCCIR_DECODE_VREG_TYPE(src_temp) == TCCIR_VREG_TYPE_TEMP)
-          {
-            int dest_off = (int)irop_get_imm64_ex(ir, sdest);
-            for (int j = idx - 1; j >= loop->start_idx; j--)
-            {
-              IRQuadCompact *p = &ir->compact_instructions[j];
-              if (p->op == TCCIR_OP_NOP)
-                continue;
-              if (p->op == TCCIR_OP_JUMP || p->op == TCCIR_OP_JUMPIF)
-                break;
-              if (p->op == TCCIR_OP_FUNCCALLVAL || p->op == TCCIR_OP_FUNCCALLVOID)
-                break;
-              if (p->op == TCCIR_OP_STORE || p->op == TCCIR_OP_STORE_INDEXED)
-              {
-                IROperand pd = tcc_ir_op_get_dest(ir, p);
-                if (!pd.is_local)
-                  break;
-                int po = (int)irop_get_imm64_ex(ir, pd);
-                if (po == dest_off)
-                  break;
-                continue;
-              }
-              if (p->op == TCCIR_OP_LOAD)
-              {
-                IROperand pd = tcc_ir_op_get_dest(ir, p);
-                IROperand ps = tcc_ir_op_get_src1(ir, p);
-                if (irop_get_vreg(pd) == src_temp && ps.is_local && ps.is_lval)
-                {
-                  int po = (int)irop_get_imm64_ex(ir, ps);
-                  if (po == dest_off)
-                  {
-                    is_self_store = 1;
-                    break;
-                  }
-                }
-              }
-            }
-          }
-        }
-        if (is_self_store)
-        {
-          has_self_stores = 1;
-          continue;
-        }
-        has_side_effects = 1;
-        break;
-      }
-      if (q->op == TCCIR_OP_STORE_INDEXED)
-      {
-        has_side_effects = 1;
-        break;
-      }
-
-      /* PARAM instructions (function call setup) */
-      if (q->op == TCCIR_OP_FUNCPARAMVOID || q->op == TCCIR_OP_FUNCPARAMVAL)
-        continue;
-
-      /* VAR <- immediate constant assignment: safe, track it */
-      if (q->op == TCCIR_OP_ASSIGN)
-      {
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        IROperand src1 = tcc_ir_op_get_src1(ir, q);
-        int32_t dest_vr = irop_get_vreg(dest);
-
-        if (TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_VAR && irop_is_immediate(src1))
-        {
-          int var_pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
-          int64_t val = irop_get_imm64_ex(ir, src1);
-          int btype = irop_get_btype(src1);
-
-          /* Check if we already track this VAR */
-          int found = 0;
-          for (int vi = 0; vi < num_const_vars; vi++)
-          {
-            if (const_vars[vi].var_pos == var_pos)
-            {
-              if (const_vars[vi].value != val)
-              {
-                has_side_effects = 1; /* Different values on different paths */
-              }
-              found = 1;
-              break;
-            }
-          }
-          if (has_side_effects)
-            break;
-          if (!found && num_const_vars < 8)
-          {
-            const_vars[num_const_vars].var_pos = var_pos;
-            const_vars[num_const_vars].value = val;
-            const_vars[num_const_vars].btype = btype;
-            num_const_vars++;
-          }
-          num_const_assigns++;
-          continue;
-        }
-
-        /* TMP <- anything (loop counter, etc): OK, no side effect */
-        if (TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_TEMP)
-          continue;
-      }
-
-      /* ADD/SUB on TMPs or dead VARs (loop counters): safe.
-       * A VAR modified by ADD/SUB is safe only if not used after the loop
-       * (just a dead counter). If used after the loop, it's meaningful
-       * accumulation (like sum += 1) and the loop is NOT dead. */
-      if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && irop_is_immediate(tcc_ir_op_get_src2(ir, q)))
-      {
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        int32_t dest_vr = irop_get_vreg(dest);
-        if (TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_TEMP)
-        {
-          has_loop_counter = 1;
-          continue;
-        }
-        if (TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_VAR)
-        {
-          int var_used_after = 0;
-          for (int post = loop->end_idx + 1; post < n; post++)
-          {
-            IRQuadCompact *pq = &ir->compact_instructions[post];
-            if (pq->op == TCCIR_OP_NOP)
-              continue;
-            if (irop_config[pq->op].has_src1)
-            {
-              int32_t s1 = irop_get_vreg(tcc_ir_op_get_src1(ir, pq));
-              if (s1 == dest_vr)
-              {
-                var_used_after = 1;
-                break;
-              }
-            }
-            if (irop_config[pq->op].has_src2)
-            {
-              int32_t s2 = irop_get_vreg(tcc_ir_op_get_src2(ir, pq));
-              if (s2 == dest_vr)
-              {
-                var_used_after = 1;
-                break;
-              }
-            }
-          }
-          if (var_used_after)
-          {
-            has_side_effects = 1;
-            break;
-          }
-          has_loop_counter = 1;
-          continue;
-        }
-      }
-
-      /* LOAD of a VAR (reading the result): safe */
-      if (q->op == TCCIR_OP_LOAD)
-      {
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        if (!dest.is_lval)
-          continue;
-      }
-
-      /* Anything else is a potential side effect */
-      has_side_effects = 1;
-      break;
-    }
-
-    /* Require either a constant VAR assignment in the body OR at least one
-     * self-store (load-then-store-back of the same slot, no observable effect).
-     * A bare loop with only a counter and forward jumps doesn't qualify — it
-     * may be a switch-bounds-check loop or other non-loop CFG quirk that
-     * happens to look like a back-edge to the loop detector. */
-    if (has_side_effects || !has_loop_counter)
-      continue;
-    if (num_const_vars == 0 && !has_self_stores)
-      continue;
-
-    /* Soundness vetoes — the back-edge detector can match non-loop CFG
-     * shapes.  A switch's jump-table dispatch is the canonical trap:
-     *   <default-case body>            ; textually BEFORE the check
-     *   T_idx = T_val SUB #case_min    ; "counter"
-     *   CMP T_idx, #range; JUMPIF >U <default>   ; backward branch = "latch"
-     *   SWITCH_TABLE T_idx
-     * The range [start_idx, end_idx] then contains the default body and the
-     * whole bounds check, with no real loop anywhere.  NOPing the range is
-     * only sound when it is a self-contained single-entry region:
-     * (1) no TEMP defined inside may be read outside (here T_idx feeds the
-     *     SWITCH_TABLE just after end_idx);
-     * (2) no jump from outside may target an instruction inside other than
-     *     the header (case stubs jump into the middle of the range). */
-    int leaks_value = 0;
-    for (int idx = loop->start_idx; idx <= loop->end_idx && idx < n && !leaks_value; idx++)
-    {
-      IRQuadCompact *q = &ir->compact_instructions[idx];
-      if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
-        continue;
-      /* STORE-style dests are reads of the vreg, not defs. */
-      if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_FUNCPARAMVAL)
-        continue;
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!irop_has_vreg(d))
-        continue;
-      int32_t dv = irop_get_vreg(d);
-      if (TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
-        continue; /* VARs are covered by const remat + var_used_after checks */
-      for (int j = 0; j < n && !leaks_value; j++)
-      {
-        if (j >= loop->start_idx && j <= loop->end_idx)
-          continue;
-        IRQuadCompact *u = &ir->compact_instructions[j];
-        if (u->op == TCCIR_OP_NOP)
-          continue;
-        if (irop_config[u->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, u)) == dv)
-          leaks_value = 1;
-        else if (irop_config[u->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, u)) == dv)
-          leaks_value = 1;
-        else if ((u->op == TCCIR_OP_STORE || u->op == TCCIR_OP_STORE_INDEXED || u->op == TCCIR_OP_FUNCPARAMVAL) &&
-                 irop_get_vreg(tcc_ir_op_get_dest(ir, u)) == dv)
-          leaks_value = 1;
-      }
-    }
-    if (leaks_value)
-      continue;
-
-    int side_entry = 0;
-    for (int j = 0; j < n && !side_entry; j++)
-    {
-      if (j >= loop->start_idx && j <= loop->end_idx)
-        continue;
-      IRQuadCompact *u = &ir->compact_instructions[j];
-      if (u->op == TCCIR_OP_JUMP || u->op == TCCIR_OP_JUMPIF)
-      {
-        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, u));
-        if (t >= loop->start_idx && t <= loop->end_idx && t != loop->header_idx)
-          side_entry = 1;
-      }
-      else if (u->op == TCCIR_OP_SWITCH_TABLE)
-      {
-        IROperand s2 = tcc_ir_op_get_src2(ir, u);
-        int table_id = (int)irop_get_imm64_ex(ir, s2);
-        if (table_id >= 0 && table_id < ir->num_switch_tables)
-        {
-          TCCIRSwitchTable *st = &ir->switch_tables[table_id];
-          for (int k = 0; k <= st->num_entries && !side_entry; k++)
-          {
-            int t = (k < st->num_entries) ? st->targets[k] : st->default_target;
-            if (t >= loop->start_idx && t <= loop->end_idx && t != loop->header_idx)
-              side_entry = 1;
-          }
-        }
-      }
-    }
-    if (side_entry)
-      continue;
-
-    /* Early-exit veto.  The body scan above ignores branches (JUMP/JUMPIF are
-     * skipped) and the elimination NOPs the ENTIRE body, so any data-dependent
-     * control flow beyond the loop's single trip-count test is silently
-     * dropped.  A decrement-and-branch helper inlined at a constant arg —
-     *   for (i=0;i<10;i++) if (--a==-1) return i;   (gcc.c-torture dbra-1)
-     * exits early carrying an iteration-dependent result (i); NOPing the body
-     * deletes that exit and the call wrongly folds to the fall-through value.
-     * A genuinely-dead loop has exactly one exit (its trip test = one JUMPIF
-     * targeting outside, or a bottom-test JUMPIF back to the header with a
-     * fall-through exit).  Bail when the body has a second conditional branch
-     * or an unconditional break/return out of the loop.  Keeping the loop is
-     * always sound; only an optimization is missed. */
-    {
-      int body_jumpif = 0, body_break = 0;
-      for (int idx = loop->start_idx; idx <= loop->end_idx && idx < n; idx++)
-      {
-        IRQuadCompact *q = &ir->compact_instructions[idx];
-        if (q->op == TCCIR_OP_JUMPIF)
-          body_jumpif++;
-        else if (q->op == TCCIR_OP_JUMP)
-        {
-          int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
-          if ((t < loop->start_idx || t > loop->end_idx) && t != loop->header_idx)
-            body_break++;
-        }
-      }
-      if (body_jumpif > 1 || body_break > 0)
-        continue;
-    }
-
-    /* The loop body only contains constant VAR assignments, counter updates,
-     * and/or self-stores (`*p = *p`).  NOP all body instructions and place
-     * any constant assignments in the preheader. */
-    LOG_IR_GEN("OPTIMIZE: Dead loop elimination at header=%d (%d const vars)", loop->header_idx, num_const_vars);
-
-    /* Locate the loop's forward exit branch (the single trip-test JUMPIF whose
-     * target lies outside the body) before NOPing it.  If, after removal, plain
-     * fall-through would NOT reach that exit target — because the exit branch
-     * used to jump *over* code physically following the loop, e.g. the else-arm
-     * of an `if` whose then-arm is this loop — an explicit JUMP must replace the
-     * loop; otherwise control drops into that code (an `if(c){while(..){}}
-     * else{...}` runs the else arm unconditionally: switch fuzz O1 wrong-code,
-     * seed 198468).  Mirrors need_exit_jump in try_eliminate_loop. */
-    int exit_target = -1;
-    for (int idx = loop->start_idx; idx <= loop->end_idx && idx < n; idx++)
-    {
-      IRQuadCompact *q = &ir->compact_instructions[idx];
-      if (q->op == TCCIR_OP_JUMPIF)
-      {
-        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
-        if (t < loop->start_idx || t > loop->end_idx)
-          exit_target = t; /* forward exit (not a back-edge to the header) */
-        break;
-      }
-    }
-    int need_exit_jump = 0;
-    if (exit_target >= 0)
-    {
-      int ft = loop->end_idx + 1;
-      while (ft < n && ir->compact_instructions[ft].op == TCCIR_OP_NOP)
-        ft++;
-      int et = exit_target;
-      while (et < n && ir->compact_instructions[et].op == TCCIR_OP_NOP)
-        et++;
-      if (ft != et)
-        need_exit_jump = 1;
-    }
-
-    /* NOP loop body instructions within [start_idx, end_idx] only.
-     * Instructions outside this range (exit targets, returns) must not be touched. */
-    for (int idx = loop->start_idx; idx <= loop->end_idx && idx < n; idx++)
-    {
-      ir->compact_instructions[idx].op = TCCIR_OP_NOP;
-    }
-
-    /* Place constant assignments in the preheader (or at loop header).
-     * Use the first available NOP slot at or before the header. */
-    int insert_at = loop->preheader_idx >= 0 ? loop->preheader_idx : loop->header_idx;
-    for (int vi = 0; vi < num_const_vars; vi++)
-    {
-      /* Find a NOP slot at or after insert_at */
-      int slot = -1;
-      for (int j = insert_at; j < n; j++)
-      {
-        if (ir->compact_instructions[j].op == TCCIR_OP_NOP)
-        {
-          slot = j;
-          break;
-        }
-      }
-      if (slot < 0)
-        continue;
-
-      int32_t dest_vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, const_vars[vi].var_pos);
-      IROperand dest_op = irop_make_vreg(dest_vr, const_vars[vi].btype);
-      IROperand src1_op;
-      if (const_vars[vi].value == (int32_t)const_vars[vi].value)
-        src1_op = irop_make_imm32(-1, (int32_t)const_vars[vi].value, const_vars[vi].btype);
-      else
-      {
-        uint32_t pool_idx = tcc_ir_pool_add_i64(ir, const_vars[vi].value);
-        src1_op = irop_make_i64(-1, pool_idx, const_vars[vi].btype);
-      }
-
-      /* Allocate fresh operand slots for the new ASSIGN instead of reusing the
-       * NOP slot's stale operand_base.  The instruction that was NOP'd here may
-       * have owned fewer than two operand pool slots (e.g. a JUMP, RETURNVALUE,
-       * or TEST_ZERO with a single operand).  Writing dest+src1 in place via
-       * its old operand_base would overflow into the *next* instruction's
-       * operand slots, corrupting an unrelated instruction (its dest could be
-       * clobbered into an immediate, later crashing codegen in
-       * mach_get_dest_reg).  Appending two fresh slots and repointing
-       * operand_base guarantees the ASSIGN owns a disjoint operand range. */
-      int new_base = tcc_ir_iroperand_pool_add(ir, dest_op);
-      tcc_ir_iroperand_pool_add(ir, src1_op);
-      ir->compact_instructions[slot].op = TCCIR_OP_ASSIGN;
-      ir->compact_instructions[slot].operand_base = new_base;
-    }
-
-    /* Restore the exit edge with an explicit JUMP when fall-through would not
-     * reach exit_target (see comment above the exit-branch scan).  Placed after
-     * the const assignments so their values are still computed on the way out;
-     * the first free NOP slot in the (now emptied) body sits after them. */
-    if (need_exit_jump)
-    {
-      for (int j = loop->start_idx; j <= loop->end_idx && j < n; j++)
-      {
-        if (ir->compact_instructions[j].op == TCCIR_OP_NOP)
-        {
-          IROperand exit_dest = irop_make_imm32(-1, exit_target, IROP_BTYPE_INT32);
-          write_instr_at_nop(ir, j, TCCIR_OP_JUMP, exit_dest, (IROperand){0}, (IROperand){0});
-          if (exit_target >= 0 && exit_target < n)
-            ir->compact_instructions[exit_target].is_jump_target = 1;
-          break;
-        }
-      }
-    }
-
-    changes++;
-  }
-
-  tcc_ir_free_loops(loops);
-  return changes;
-}
-
-int tcc_ir_opt_dead_loop_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_loop_elim(ctx->ir); }
 int tcc_ir_opt_redundant_var_assign_ex(IROptCtx *ctx) { return tcc_ir_opt_redundant_var_assign(ctx->ir); }
 int tcc_ir_opt_dead_var_store_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_var_store_elim(ctx->ir); }
 int tcc_ir_opt_dead_addrvar_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_addrvar_elim(ctx->ir); }

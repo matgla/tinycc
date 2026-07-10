@@ -40,33 +40,9 @@ static inline thumb_opcode th_cmp_imm_handler(uint32_t rd, uint32_t rn, uint32_t
 
 thumb_opcode th_cmn_imm(uint32_t rn, uint32_t imm, thumb_flags_behaviour flags, thumb_enforce_encoding encoding);
 
-/* Wrapper matching thumb_imm_handler_t for generic handler tables */
-static inline thumb_opcode th_cmn_imm_handler(uint32_t rd, uint32_t rn, uint32_t imm,
-                                              thumb_flags_behaviour flags, thumb_enforce_encoding enc)
-{
-    (void)rd;
-    return th_cmn_imm(rn, imm, flags, enc);
-}
-
 thumb_opcode th_tst_imm(uint32_t rn, uint32_t imm, thumb_flags_behaviour flags, thumb_enforce_encoding encoding);
 
-/* Wrapper matching thumb_imm_handler_t for generic handler tables */
-static inline thumb_opcode th_tst_imm_handler(uint32_t rd, uint32_t rn, uint32_t imm,
-                                              thumb_flags_behaviour flags, thumb_enforce_encoding enc)
-{
-    (void)rd;
-    return th_tst_imm(rn, imm, flags, enc);
-}
-
 thumb_opcode th_teq_imm(uint32_t rn, uint32_t imm, thumb_flags_behaviour flags, thumb_enforce_encoding encoding);
-
-/* Wrapper matching thumb_imm_handler_t for generic handler tables */
-static inline thumb_opcode th_teq_imm_handler(uint32_t rd, uint32_t rn, uint32_t imm,
-                                              thumb_flags_behaviour flags, thumb_enforce_encoding enc)
-{
-    (void)rd;
-    return th_teq_imm(rn, imm, flags, enc);
-}
 
 /* ───── Compare / Test register ───── */
 thumb_opcode th_cmp_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behaviour flags, thumb_shift shift,

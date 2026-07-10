@@ -255,7 +255,13 @@ static int tcc_ir_opt_known_bits_cascade_ex(IROptCtx *ctx)
     int ch = 0;
     ch += tcc_ir_opt_known_bits(ir);
     ch += tcc_ir_opt_const_prop_tmp(ir);
-    ch += tcc_ir_opt_branch_folding(ir);
+    /* ssa:branch runs after this whole flat phase — too late to unblock the cascade's DCE/forwarding behind a proven-dead guard */
+    {
+      IROptCtx bctx;
+      tcc_ir_opt_ctx_init(&bctx, ir);
+      ch += tcc_ir_opt_gens_branch_ex(&bctx);
+      tcc_ir_opt_ctx_free(&bctx);
+    }
     tcc_ir_opt_dce(ir);
     ch += tcc_ir_opt_eliminate_fallthrough(ir);
     tcc_ir_opt_compact_nops(ir);
@@ -279,7 +285,6 @@ static int tcc_ir_opt_const_prop_cascade_ex(IROptCtx *ctx)
   int total = 0;
   for (int i = 0; i < 4; i++) {
     int ch = 0;
-    ch += tcc_ir_opt_const_prop(ir);
     ch += tcc_ir_opt_const_prop_tmp(ir);
     ch += tcc_ir_opt_const_var_prop(ir);
     ch += tcc_ir_opt_value_tracking(ir);
@@ -291,35 +296,27 @@ static int tcc_ir_opt_const_prop_cascade_ex(IROptCtx *ctx)
   return total;
 }
 
-static int tcc_ir_opt_branch_folding_2x_ex(IROptCtx *ctx)
-{
-  int ch = tcc_ir_opt_branch_folding(ctx->ir);
-  ch += tcc_ir_opt_branch_folding(ctx->ir);
-  return ch;
-}
-
-/* Branch-cleanup cascade: jump_thread → elim_fallthru → orphan_cmp, looped to
- * a fixpoint.  jump_threading/elim_fallthrough otherwise only run inside the
- * memory group, which is skipped whenever its sl_forward trigger finds nothing
- * to forward.  A function with dead converging control flow but no store-load
- * patterns (e.g. an `a < b ? pure_call() : 0;` expression statement whose
- * result is discarded, after DCE removes the pure call) therefore kept its
- * now-pointless CMP + jump diamond.  Running the cascade here in late_cleanup,
- * which always executes, collapses such diamonds: jump_threading retargets each
- * arm to the common successor, elim_fallthrough drops the redundant
- * conditional, and orphan_cmp removes the flag-setter left without a consumer.
- * Internal compaction keeps jump targets consistent between iterations. */
+/* Branch-cleanup cascade: elim_fallthru looped to a fixpoint with DCE.
+ * elim_fallthrough otherwise only runs inside the memory group, which is
+ * skipped whenever its sl_forward trigger finds nothing to forward.  A function
+ * with dead converging control flow but no store-load patterns (e.g. an
+ * `a < b ? pure_call() : 0;` expression statement whose result is discarded,
+ * after DCE removes the pure call) therefore kept its now-pointless CMP + jump
+ * diamond.  Running the cascade here in late_cleanup, which always executes,
+ * collapses such diamonds: elim_fallthrough drops the redundant conditional and
+ * DCE removes the orphaned flag-setter.  Internal compaction keeps jump targets
+ * consistent between iterations.  (jump_threading and orphan_cmp_elim were
+ * retired — subsumed by ssa:branch + ssa:dce; see
+ * docs/plan_legacy_flat_ir_ssa_retire.md.) */
 static int tcc_ir_opt_branch_cleanup_cascade_ex(IROptCtx *ctx)
 {
   TCCIRState *ir = ctx->ir;
   int total = 0;
   for (int i = 0; i < 8; i++) {
     int ch = 0;
-    ch += tcc_ir_opt_jump_threading(ir);
     ch += tcc_ir_opt_eliminate_fallthrough(ir);
     if (ch)
       tcc_ir_opt_compact_nops(ir);
-    ch += tcc_ir_opt_orphan_cmp_elim(ir);
     ch += tcc_ir_opt_dce(ir);
     if (!ch)
       break;
@@ -341,7 +338,6 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("uninit_ub",        tcc_ir_opt_uninit_local_ub_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
   PASS_GATED("uninit_dom_ret",   tcc_ir_opt_uninit_dominates_return_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
   PASS_GATED("dce",              tcc_ir_opt_dce_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
-  PASS_GATED("const_prop",      tcc_ir_opt_const_prop_ex,       0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   /* const_var_prop: propagate single-def constant-immediate or constant-symref
    * VAR locals.  Includes a prologue that clears stale `addrtaken` flags on
    * VARs whose LEA was DCE-ed above — e.g. `int **dead = &p` whose `dead` was
@@ -368,16 +364,12 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("cmp_expr_fold",   tcc_ir_opt_cmp_expr_fold_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("self_arith",     tcc_ir_opt_self_arith_fold_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("cmp_offset_fold", tcc_ir_opt_cmp_const_offset_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("branch_fold",     tcc_ir_opt_branch_folding_ex,   0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("switch_collapse", tcc_ir_opt_switch_collapse_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("stack_nonnull",   tcc_ir_opt_stack_addr_nonnull_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("setif_fuse",      tcc_ir_opt_setif_branch_fuse_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("stack_bool",      tcc_ir_opt_stack_bool_diamond_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("or_bool",         tcc_ir_opt_or_bool_diamond_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("setif_or_taut",   tcc_ir_opt_setif_or_tautology_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("var_tmp_fwd",     tcc_ir_opt_var_tmp_fwd_ex,      0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("var_to_tmp",      tcc_ir_opt_var_to_tmp_ex,       0, IR_PASS_INVALIDATES_DU, FLAG(opt_copy_prop)),
-  PASS_GATED("nonneg_fold",     tcc_ir_opt_nonneg_branch_fold_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_nonneg_fold)),
   PASS_GATED("float_branch",    tcc_ir_opt_float_branch_fold_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_vrp)),
   PASS_GATED("vrp",             tcc_ir_opt_vrp_ex,              0, IR_PASS_INVALIDATES_ALL, FLAG(opt_vrp)),
   PASS_GATED("single_val_tmp",  tcc_ir_opt_single_value_tmp_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
@@ -389,16 +381,26 @@ static const IROptPass fusion_passes[] = {
   PASS("fusion_mla",    tcc_ir_opt_gens_fusion_ex,     IR_PASS_REQUIRES_DU, IR_PASS_INVALIDATES_DU),
   PASS_GATED("deref_indexed", tcc_ir_opt_gens_deref_indexed_ex, IR_PASS_REQUIRES_DU, IR_PASS_INVALIDATES_DU, FLAG(opt_indexed_memory)),
   PASS_GATED("disp_fusion",   tcc_ir_opt_gens_disp_ex,       IR_PASS_REQUIRES_DU, IR_PASS_INVALIDATES_DU, FLAG(opt_disp_fusion)),
-  PASS_GATED("copy_prop",     tcc_ir_opt_copy_prop_ex,       0, IR_PASS_INVALIDATES_DU, FLAG(opt_copy_prop)),
   PASS_GATED("dce",           tcc_ir_opt_dce_ex,             0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
   PASS_GATED("chain_fold",    tcc_ir_opt_gens_chain_ex,      IR_PASS_REQUIRES_DU, IR_PASS_INVALIDATES_DU, FLAG(opt_disp_fusion)),
   PASS_GATED("pair_reorder",  tcc_ir_opt_gens_pair_reorder_ex, IR_PASS_REQUIRES_DU, IR_PASS_INVALIDATES_DU, FLAG(opt_disp_fusion)),
-  PASS_GATED("postinc",       tcc_ir_opt_postinc_fusion_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_postinc_fusion)),
   PASS_GATED("bool_simplify", tcc_ir_opt_gens_bool_ex,       0, IR_PASS_INVALIDATES_DU, FLAG(opt_bool_idempotent)),
 };
 
+/* Memory-group trigger: eliminate_fallthrough first — the propagation group
+ * leaves fall-through jumps whose stale block boundaries stall sl_forward
+ * (the legacy tccgen Phase-2c enabler call was retired; the group cleans its
+ * own input instead and this dies with the group). */
+static int tcc_ir_opt_memory_trigger_ex(IROptCtx *ctx)
+{
+  if (tcc_state->opt_jump_threading &&
+      tcc_ir_opt_eliminate_fallthrough(ctx->ir))
+    tcc_ir_opt_compact_nops(ctx->ir);
+  return tcc_ir_opt_sl_forward_ex(ctx);
+}
+
 static const IROptPass memory_passes[] = {
-  PASS_GATED("sl_forward",      tcc_ir_opt_sl_forward_ex,        0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
+  PASS_GATED("sl_forward",      tcc_ir_opt_memory_trigger_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
   /* After sl_forward collapses a copied-then-poked local struct into register
    * OR/SHL/AND ops, fold the redundant bitfield insert+re-extract.  Runs here
    * (memory group) because the pattern only exists post-forwarding, and before
@@ -409,15 +411,12 @@ static const IROptPass memory_passes[] = {
    * group that folds a side's trailing shift into the CMP. */
   PASS_GATED("cmp_field_fuse",  tcc_ir_opt_cmp_field_fuse_ex,   0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("const_cascade",   tcc_ir_opt_const_prop_cascade_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("branch_fold_2x",  tcc_ir_opt_branch_folding_2x_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("stack_nonnull",   tcc_ir_opt_stack_addr_nonnull_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("setif_fuse",      tcc_ir_opt_setif_branch_fuse_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("stack_bool",      tcc_ir_opt_stack_bool_diamond_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("or_bool",         tcc_ir_opt_or_bool_diamond_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("setif_or_taut",   tcc_ir_opt_setif_or_tautology_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("var_tmp_fwd",     tcc_ir_opt_var_tmp_fwd_ex,       0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("dce",             tcc_ir_opt_dce_ex,               0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
-  PASS_GATED("jump_thread",     tcc_ir_opt_jump_threading_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
   PASS_GATED("elim_fallthru",   tcc_ir_opt_eliminate_fallthrough_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
   /* Internal-loop cascade: drives known_bits → const_prop → branch_fold →
    * dce → elim_fallthru → sl_forward to a fixpoint within one pipeline
@@ -427,12 +426,10 @@ static const IROptPass memory_passes[] = {
 };
 
 static const IROptPass late_cleanup_passes[] = {
-  /* branch_cleanup: collapse dead converging control flow (jump_thread +
-   * elim_fallthru + orphan_cmp) that the memory group skips when its
-   * sl_forward trigger is idle.  Runs first so the dead-store passes below
-   * see the simplified CFG. */
+  /* branch_cleanup: collapse dead converging control flow (elim_fallthru + DCE)
+   * that the memory group skips when its sl_forward trigger is idle.  Runs
+   * first so the dead-store passes below see the simplified CFG. */
   PASS_GATED("branch_cleanup",   tcc_ir_opt_branch_cleanup_cascade_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
-  PASS_GATED("nonneg_fold",     tcc_ir_opt_nonneg_branch_fold_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_nonneg_fold)),
   /* dead_vla_struct: NOP a VLA_ALLOC whose captured base-pointer slot only
    * feeds STORE destinations (no LOAD, no escape). Must precede zero_vla so
    * the orphaned outer SP_SAVE/RESTORE pair gets collapsed in the same round. */
@@ -445,9 +442,7 @@ static const IROptPass late_cleanup_passes[] = {
   /* zero_vla: turn VLA_ALLOC(size=0) into NOPs so dead_lea_store (which bails
    * on any VLA_ALLOC) can clean up the surrounding stack scaffolding. */
   PASS_GATED("zero_vla",         tcc_ir_opt_zero_vla_elim_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dead_store)),
-  // PASS_GATED("local_copy_prop", tcc_ir_opt_local_copy_prop_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
   PASS_GATED("byte_store_merge", tcc_ir_opt_byte_store_merge_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
-  PASS_GATED("store_redundant",  tcc_ir_opt_store_redundant_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
   PASS_GATED("dse",              tcc_ir_opt_dse_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   /* dead_static_store: end-of-TU pass — only fires when ir_late_reopt_phase is
    * set and the global has sym->a.tu_no_readers from the TU-wide analysis.
@@ -468,16 +463,12 @@ static const IROptPass late_cleanup_passes[] = {
   PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("inplace_arith",    tcc_ir_opt_store_inplace_arith_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
   PASS_GATED("global_base_share",tcc_ir_opt_global_base_share_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_indexed_memory)),
-  /* branch_cleanup: collapse dead converging control flow (jump_thread +
-   * elim_fallthru + orphan_cmp cascade).  These passes otherwise only run in
-   * the trigger-gated memory group, so functions with no store-load patterns
-   * never got their pointless CMP/jump diamonds cleaned. */
+  /* branch_cleanup: collapse dead converging control flow (elim_fallthru + DCE
+   * cascade).  These passes otherwise only run in the trigger-gated memory
+   * group, so functions with no store-load patterns never got their pointless
+   * CMP/jump diamonds cleaned.  (orphan_cmp retired — its flag-setters are now
+   * removed by ssa:dce; see docs/plan_legacy_flat_ir_ssa_retire.md.) */
   PASS_GATED("branch_cleanup",   tcc_ir_opt_branch_cleanup_cascade_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
-  /* orphan_cmp: NOP CMP/TEST_ZERO whose flag result has no consumer (SETIF/JUMPIF)
-   * before the next clobber or basic-block boundary. Runs inside the late_cleanup
-   * loop so dse / redundant_assign can react to the newly-NOPed CMPs in the next
-   * iteration. */
-  PASS_GATED("orphan_cmp",       tcc_ir_opt_orphan_cmp_elim_ex,     0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
   PASS_GATED("inf_loop_simpl",  tcc_ir_opt_infinite_loop_simplify_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
   /* dead_before_inf_loop: after inf_loop_simpl has collapsed a side-effect-free
    * infinite loop to a self-jump, NOP the now-unobservable stores / address-
@@ -495,21 +486,17 @@ static int tcc_ir_opt_entry_store_cleanup_ex(IROptCtx *ctx)
 {
   TCCIRState *ir = ctx->ir;
   int ch = 0;
-  ch += tcc_ir_opt_const_prop(ir);
   ch += tcc_ir_opt_const_prop_tmp(ir);
   ch += tcc_ir_opt_const_var_prop(ir);
-  ch += tcc_ir_opt_branch_folding(ir);
   ch += tcc_ir_opt_stack_addr_nonnull_fold(ir);
   ch += tcc_ir_opt_redundant_loop_check(ir);
   tcc_ir_opt_dce(ir);
   tcc_ir_opt_compact_nops(ir);
   ch += tcc_ir_opt_sl_forward(ir);
   ch += tcc_ir_opt_stack_addr_nonnull_fold(ir);
-  ch += tcc_ir_opt_branch_folding(ir);
   tcc_ir_opt_dce(ir);
   ch += tcc_ir_opt_dead_var_store_elim(ir);
   ch += tcc_ir_opt_const_var_prop(ir);
-  ch += tcc_ir_opt_branch_folding(ir);
   tcc_ir_opt_dce(ir);
   tcc_ir_opt_compact_nops(ir);
   return ch;

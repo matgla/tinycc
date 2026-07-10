@@ -23,7 +23,7 @@
 int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir);
 int tcc_ir_opt_setif_branch_fuse(TCCIRState *ir);
 int tcc_ir_opt_stack_bool_diamond(TCCIRState *ir);
-int tcc_ir_opt_or_bool_diamond(TCCIRState *ir);
+int ssa_opt_or_bool_diamond(TCCIRState *ir);
 int tcc_ir_opt_var_tmp_fwd(TCCIRState *ir);
 
 #define I32 IROP_BTYPE_INT32
@@ -255,7 +255,7 @@ UT_TEST(test_or_bool_diamond_collapses_to_direct_or)
   int i_or = utb_emit(ir, TCCIR_OP_OR, utb_temp(2, I32), utb_temp(1, I32), utb_slot_lval(-8, I32));
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
 
-  int changes = tcc_ir_opt_or_bool_diamond(ir);
+  int changes = ssa_opt_or_bool_diamond(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, i_jmpif), TCCIR_OP_JUMPIF); /* untouched */
@@ -282,7 +282,7 @@ UT_TEST(test_or_bool_diamond_extra_slot_use_kept)
   int extra = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(3, I32), utb_slot_lval(-8, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
 
-  int changes = tcc_ir_opt_or_bool_diamond(ir);
+  int changes = ssa_opt_or_bool_diamond(ir);
 
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, i_st_t), TCCIR_OP_STORE);
@@ -349,7 +349,7 @@ UT_SUITE(opt_branch_cascade)
   UT_COVERS("stack_nonnull");
   UT_COVERS("setif_fuse");
   UT_COVERS("stack_bool");
-  UT_COVERS("or_bool");
+  UT_COVERS("ssa:or_bool_diamond");
   UT_COVERS("var_tmp_fwd");
 
   UT_RUN(test_stack_nonnull_eq_zero_folds_to_nop);

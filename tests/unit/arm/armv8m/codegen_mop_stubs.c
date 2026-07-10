@@ -222,6 +222,11 @@ void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineO
   cgstub_record("ubfx_mop", (TccIrOp)-1, dest, src1, src2);
 }
 
+void tcc_gen_machine_sbfx_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest)
+{
+  cgstub_record("sbfx_mop", (TccIrOp)-1, dest, src1, src2);
+}
+
 void tcc_gen_machine_bfi_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, uint32_t params)
 {
   (void)params;
@@ -889,10 +894,10 @@ void tcc_opt_fp_mat_cache_clear(TCCIRState *ir)
   (void)ir;
 }
 
-/* From tccgen.c -- ir/core.c:tcc_ir_local_add() calls sym_push() to build a
- * local-stack symbol.  This binary links ir/core.c but not tccgen.c, so a NULL
- * returning stub satisfies the linker for hand-built IR tests (no real
- * frontend symbol table is present). */
+/* From tccgen.c -- ir/gen/params.c:tcc_ir_local_add() calls sym_push() to build
+ * a local-stack symbol.  This binary links the ir/gen sources but not tccgen.c,
+ * so a NULL returning stub satisfies the linker for hand-built IR tests (no
+ * real frontend symbol table is present). */
 Sym *sym_push(int v, CType *type, int r, int c)
 {
   (void)v; (void)type; (void)r; (void)c;

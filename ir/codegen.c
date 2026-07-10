@@ -23,16 +23,9 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   int old_r = sv->r;
   int old_v = old_r & VT_VALMASK;
 
-  /* VT_LOCAL/VT_LLOCAL operands can mean either:
-   * - a concrete stack slot (vr == -1), e.g. VLA save slots, or
-   * - a logical local tracked as a vreg by the IR (vr != -1).
-   *
-   * For concrete stack slots, do not rewrite them into registers here; doing
-   * so can create uninitialized register reads at runtime.
-   *
-   * For locals that do carry a vreg, they must participate in register
-   * allocation so that defs/uses stay consistent.
-   */
+  /* Concrete stack slots (vr == -1) must not be rewritten into registers;
+   * that would create uninitialized reads.  Locals with a vreg must
+   * participate in allocation so defs/uses stay consistent. */
   if ((old_v == VT_LOCAL || old_v == VT_LLOCAL) && sv->vr == -1)
   {
     sv->pr0_reg = PREG_REG_NONE;
@@ -45,14 +38,9 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   {
     IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, sv->vr);
 
-    /* Stack-passed parameters: if not allocated to a register, treat them as
-     * residing in the incoming argument area (VT_PARAM) rather than forcing a
-     * separate local spill slot.
-     *
-     * This is safe under AAPCS: the caller's argument stack area remains valid
-     * for the duration of the call, and it also provides a correct addressable
-     * home for '&param' semantics.
-     */
+    /* Stack-passed params (not allocated to a register) live in the caller's
+     * argument area (VT_PARAM).  AAPCS guarantees that area is valid for the
+     * call's duration and provides an addressable home for '&param'. */
     if (TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 < 0 &&
         interval->allocation.r0 == PREG_NONE && interval->allocation.offset == 0)
     {
@@ -70,11 +58,9 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
       return;
     }
 
-    /* Register-passed parameters: if allocated to a register (not spilled),
-     * clear VT_LVAL. The value is already in the register, no dereference needed.
-     * VT_LVAL is only used on parameters for address-of operations (&param) or
-     * when they're on the stack (VT_LOCAL).
-     */
+    /* Register-passed params already in a register need no VT_LVAL — the
+     * value is already there.  VT_LVAL is only needed for &param or stack
+     * params (VT_LOCAL). */
     int is_register_param =
         (TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 >= 0);
 
@@ -84,52 +70,33 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     sv->pr1_spilled = (interval->allocation.r1 & PREG_SPILLED) != 0;
     sv->c.i = interval->allocation.offset;
 
-    /* Determine if we should preserve VT_LVAL:
-     * - If old_r was VT_LOCAL|VT_LVAL (local variable on stack), and now
-     *   it's allocated to a register, we should NOT preserve VT_LVAL because
-     *   the value is already in the register, no load needed.
-     * - If old_r has VT_LVAL but (old_r & VT_VALMASK) < VT_CONST, it means
-     *   the vreg holds a pointer that needs dereferencing - preserve VT_LVAL.
-     * - Register parameters: do NOT preserve VT_LVAL when allocated to a register.
-     *   VT_LVAL on parameters is only needed for stack params (VT_LOCAL) or for
-     *   address-of operations.
-     * - If old_r does NOT have VT_LVAL, this is an address-of operation
-     *   (we want the address, not the value). Do NOT add VT_LVAL. */
+    /* Preserve VT_LVAL for pointer derefs and address-of ops; not for
+     * register-resident params (value already there) or address-of
+     * expressions (we want the address, not the value). */
     int preserve_flags = old_r & VT_PARAM; /* Always preserve VT_PARAM */
     if ((old_r & VT_LVAL) && old_v < VT_CONST && old_v != VT_LOCAL && old_v != VT_LLOCAL && !is_register_param)
     {
       /* The vreg holds a pointer that needs dereferencing.
-       * Note: VT_LOCAL/VT_LLOCAL use VT_LVAL to mean "load from stack slot".
-       * When such a local/param is promoted to a register, we must NOT
-       * preserve VT_LVAL, otherwise we turn a plain value into a pointer
-       * dereference (double-indirection bugs).
-       */
+       * Note: VT_LOCAL/VT_LLOCAL use VT_LVAL to mean "load from stack slot";
+       * promoting such a local/param to a register must NOT preserve VT_LVAL
+       * or we turn a plain value into a pointer dereference. */
       preserve_flags |= VT_LVAL;
     }
 
     if ((interval->allocation.r0 & PREG_SPILLED) || interval->allocation.offset != 0)
     {
-      /* Spilled to stack - treat as local.
-       * For computed values (old_r was 0 or a register), add VT_LVAL to load the value.
-       * For address-of expressions (old_r == VT_LOCAL without VT_LVAL), don't add VT_LVAL.
-       * If original had VT_LVAL (pointer dereference), preserve it.
+      /* Spilled to stack — treat as local.
+       * Computed values always need VT_LVAL to load from the spill slot.
+       * Locals preserve their existing VT_LVAL to distinguish load vs address-of.
        *
-       * DOUBLE INDIRECTION CASE: If old_r has VT_LVAL AND the original was NOT
-       * already a local variable (VT_LOCAL), then the code wants to DEREFERENCE
-       * the value held in this vreg. If that value is spilled:
-       *   - Spill slot contains a POINTER value (e.g., result of ADD on address)
-       *   - Need to: (1) load pointer from spill, (2) dereference it
-       * Use VT_LLOCAL to encode this double-indirection requirement.
+       * DOUBLE INDIRECTION: If old_r has VT_LVAL but the original was NOT
+       * VT_LOCAL/VT_LLOCAL, the code wants to DEREFERENCE the spilled value
+       * (load pointer, then deref).  Use VT_LLOCAL to encode this.
+       * VT_LOCAL/VT_LLOCAL's VT_LVAL means "access this stack slot", not
+       * "dereference pointer in vreg" — do NOT use VT_LLOCAL there.
        *
-       * But if old_v == VT_LOCAL, the VT_LVAL means "load/store from/to this stack slot"
-       * which is standard local variable access - do NOT use VT_LLOCAL.
-       *
-       * ADDRESS-OF CASE: If old_v == VT_LOCAL and old_r does NOT have VT_LVAL,
-       * this is an address-of operation (&var). We want the ADDRESS of the spill
-       * slot, not its contents. Do NOT add VT_LVAL in this case.
-       *
-       * COMPUTED VALUE CASE: If old_v was a register (computed value that got
-       * spilled), we ALWAYS need VT_LVAL to load the value from the spill slot. */
+       * ADDRESS-OF: If old_v == VT_LOCAL and old_r lacks VT_LVAL, this is
+       * &var — we want the spill-slot address, not its contents. */
       int need_lval;
       if (old_v == VT_LOCAL || old_v == VT_LLOCAL)
       {
@@ -151,11 +118,10 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
          * "access this stack slot" not "dereference pointer in vreg". */
         base_kind = VT_LLOCAL;
       }
-      /* Only preserve VT_PARAM for stack-passed parameters (incoming_reg0 < 0).
-       * Register-passed parameters that are spilled to local stack should NOT
-       * have VT_PARAM set, because VT_PARAM causes load_to_dest to add
-       * offset_to_args (for accessing caller's argument area), but spilled
-       * register params live in the callee's local stack area (negative FP offset). */
+      /* Only preserve VT_PARAM for stack-passed params (incoming_reg0 < 0).
+       * Spilled register params live in the callee's local stack area
+       * (negative FP offset), not the caller's argument area, so VT_PARAM
+       * would incorrectly add offset_to_args. */
       int spilled_param_flag = 0;
       if ((old_r & VT_PARAM) && interval->incoming_reg0 < 0)
       {
@@ -172,15 +138,15 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   else if ((sv->vr == -1 || sv->vr == 0 || TCCIR_DECODE_VREG_TYPE(sv->vr) == 0) &&
            (sv->r == -1 || sv->r == PREG_REG_NONE || (old_v >= VT_CONST)))
   {
-    /* No valid vreg and either invalid .r or a constant - preserve important flags.
-     * This handles global symbol references (VT_CONST | VT_SYM) and plain constants. */
+    /* No valid vreg and either invalid .r or a constant — preserve flags.
+     * Handles VT_CONST|VT_SYM (global symbols) and plain constants. */
     int flags = sv->r & (VT_LVAL | VT_SYM);
     sv->r = VT_CONST | flags;
   }
   else if (sv->vr == -1 && old_r == 0 && sv->sym)
   {
-    /* Special case: old_r=0 but has a symbol - this is a function symbol reference
-     * that wasn't marked as VT_CONST. Preserve the symbol. */
+    /* Special case: old_r=0 with a symbol — function symbol ref not marked
+     * VT_CONST. Preserve the symbol. */
     sv->r = VT_CONST | VT_SYM;
   }
 }
@@ -237,10 +203,9 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
         /* Parameter arrives in registers */
         interval->incoming_reg0 = argno;
         interval->incoming_reg1 = argno + 1;
-        /* NOTE: For leaf functions, the linear scanner has already assigned registers.
-         * Don't overwrite interval->allocation here - it would clobber the correct allocation
-         * with argno (parameter index), which is NOT the same as the physical register number.
-         * The prolog will use incoming_reg0/1 to know which registers the parameter arrives in. */
+        /* Don't overwrite interval->allocation here — it was set by the linear
+         * scanner and argno (param index) is NOT the physical register number.
+         * The prolog uses incoming_reg0/1 to know where the param arrives. */
       }
       else
       {
@@ -256,8 +221,7 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
          */
         if (interval->original_offset == 0)
           interval->original_offset = (argno - 4) * 4;
-        /* See 64-bit case above: do not overwrite allocator spill slots with
-         * caller-stack offsets.
+        /* Don't overwrite allocator spill slots with caller-stack offsets.
          */
         interval->allocation.r0 = PREG_NONE;
         interval->allocation.r1 = PREG_NONE;
@@ -283,8 +247,7 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
          */
         if (interval->original_offset == 0)
           interval->original_offset = (argno - 4) * 4;
-        /* See 64-bit case above: do not overwrite allocator spill slots with
-         * caller-stack offsets.
+        /* Don't overwrite allocator spill slots with caller-stack offsets.
          */
         interval->allocation.r0 = PREG_NONE;
         interval->allocation.r1 = PREG_NONE;
@@ -300,7 +263,7 @@ void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir)
   if (!ir)
     return;
 
-  /* Scan all instructions to find FUNCCALLVAL that produce return values */
+  /* Find FUNCCALLVAL instructions that produce return values */
   for (int i = 0; i < ir->next_instruction_index; ++i)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -324,9 +287,8 @@ void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir)
       interval->incoming_reg1 = -1;
   }
 
-  /* Mark the root source vreg of RETURNVALUE with incoming_reg0=0
-   * as a hint for the post-allocation swap pass. Only at -O1+ to
-   * avoid interfering with -O0 codegen paths that read incoming_reg0. */
+  /* Hint post-allocation swap pass: mark RETURNVALUE's source vreg with
+   * incoming_reg0=0.  Only at -O1+ to avoid interfering with -O0 paths. */
   if (tcc_state->optimize < 1)
     return;
 
@@ -418,11 +380,9 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
     argno += is_64bit ? 2 : 1;
   }
 
-  /* Rewrite linear-scan results: stack-passed params already have an incoming
-   * memory home (caller arg area), so if the allocator spilled them, drop the
-   * local spill slot. Also force address-taken stack params to remain in
-   * memory (we can use the incoming slot as their addressable home).
-   */
+  /* Rewrite linear-scan results: stack-passed params already have a memory
+   * home (caller arg area), so drop any local spill slot.  Also force
+   * address-taken stack params to remain in memory. */
   for (int i = 0; i < ir->ls.next_interval_index; ++i)
   {
     LSLiveInterval *ls = &ir->ls.intervals[i];
@@ -434,10 +394,9 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
     if (!is_stack_passed[pidx])
       continue;
 
-    /* Stack-passed params live in the caller's argument area. If linear-scan
-     * assigned them a register (without spilling), the prolog won't load them
-     * into that register, causing incorrect code. Always reset r0/r1 to force
-     * them to use the incoming stack location via VT_PARAM path. */
+    /* Stack-passed params live in the caller's argument area.  If linear-scan
+     * assigned them a register (without spilling), the prolog won't load
+     * them — always reset r0/r1 to force use of the incoming stack location. */
     ls->r0 = PREG_NONE;
     ls->r1 = PREG_NONE;
     ls->stack_location = 0;
@@ -517,7 +476,7 @@ void tcc_ir_codegen_cmp_jmp_set(TCCIRState *ir)
 {
   if (ir == NULL)
     return;
-  /* Guard against invalid vtop - can happen with empty structs */
+  /* Guard against invalid vtop (empty structs) */
   extern SValue _vstack[];
   if (vtop < _vstack + 1) /* vstack is defined as (_vstack + 1) */
     return;
@@ -538,7 +497,7 @@ void tcc_ir_codegen_cmp_jmp_set(TCCIRState *ir)
 
     if (jtrue >= 0 || jfalse >= 0)
     {
-      /* We have pending jump chains - need to merge them with the comparison */
+      /* Merge pending jump chains with the comparison */
       SValue jump_dest;
       svalue_init(&jump_dest);
       jump_dest.vr = -1;
@@ -672,22 +631,19 @@ int tcc_ir_codegen_test_gen(TCCIRState *ir, int invert, int test)
     svalue_init(&dest);
     src.vr = -1;
     src.r = VT_CONST;
-    /* Use cmp_op and invert if needed. In TCC, comparison tokens are designed
-     * so that XORing with 1 inverts them (e.g., TOK_EQ ^ 1 = TOK_NE) */
+    /* TCC comparison tokens: XORing with 1 inverts (e.g. TOK_EQ ^ 1 = TOK_NE) */
     int cond = vtop->cmp_op ^ invert;
-    /* Validate condition is a valid comparison token */
     src.c.i = cond;
     dest.vr = -1;
     dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
     dest.c.i = test;
     test = tcc_ir_put(ir, TCCIR_OP_JUMPIF, &src, NULL, &dest);
 
-    /* Handle pending jump chains - merge with the appropriate chain */
+    /* Handle pending jump chains */
     if (invert)
     {
-      /* inv=1: we want to jump when condition is false */
-      /* Merge any existing "jump-on-false" chain with the new jump.
-       * Patch the opposite chain (jump-on-true) to fall through here. */
+      /* inv=1: jump when condition is false — merge "jump-on-false" chain,
+       * patch "jump-on-true" to fall through. */
       if (jfalse >= 0)
       {
         tcc_ir_backpatch_first(ir, jfalse, test);
@@ -700,9 +656,8 @@ int tcc_ir_codegen_test_gen(TCCIRState *ir, int invert, int test)
     }
     else
     {
-      /* inv=0: we want to jump when condition is true */
-      /* Merge any existing "jump-on-true" chain with the new jump.
-       * Patch the opposite chain (jump-on-false) to fall through here. */
+      /* inv=0: jump when condition is true — merge "jump-on-true" chain,
+       * patch "jump-on-false" to fall through. */
       if (jtrue >= 0)
       {
         tcc_ir_backpatch_first(ir, jtrue, test);
@@ -870,13 +825,12 @@ static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
   uint8_t clobber_regs[NB_ASM_REGS];
   memcpy(clobber_regs, ia->clobber_regs, sizeof(clobber_regs));
 
-  /* Compute reserved_regs: physical registers of vregs that are live at this
-   * INLINE_ASM instruction but are NOT asm operands.  The constraint solver
-   * must avoid these registers when picking registers for "r" constraints,
-   * otherwise the operand load will clobber the live value.
+  /* Compute reserved_regs: physical registers of live vregs that are NOT
+   * asm operands.  The constraint solver must avoid these when picking "r"
+   * constraints, otherwise operand loads clobber live values.
    *
    * Unlike clobber_regs, reserved_regs only affect constraint allocation —
-   * they do NOT trigger save/restore in asm_gen_code prolog/epilog. */
+   * they don't trigger save/restore in asm prolog/epilog. */
   uint8_t reserved_regs[NB_ASM_REGS];
   memset(reserved_regs, 0, sizeof(reserved_regs));
   {
@@ -920,21 +874,16 @@ static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
       }
     }
 
-    /* Asm operands themselves are allowed to reuse their currently assigned
-     * physical registers.  Only non-operand live values need to remain
-     * reserved from the constraint solver.  Without this, an inline asm that
-     * already has several live register operands can spuriously run out of
-     * allocatable "r" registers in IR mode. */
+    /* Asm operands can reuse their assigned physical registers.  Only non-
+     * operand live values need to remain reserved — otherwise inline asm with
+     * several live register operands spuriously runs out of allocatable "r"
+     * registers. */
     for (int i = 0; i < nb_operands; ++i)
     {
-      /* For an lvalue operand such as "+r"(*p), pr0_reg holds the ADDRESS of
-       * the value (the pointer), not the value itself.  That pointer is read
-       * both by the prolog load (ldr op->reg,[ptr]) and the epilog store
-       * (str op->reg,[ptr]), so it must survive across the asm body.  If we
-       * un-reserved it, the constraint solver could pick the same register
-       * for op->reg, and the prolog load would clobber the pointer before the
-       * store ran.  Keep lvalue-operand registers reserved so the value gets a
-       * distinct register. */
+      /* For lvalue operands like "+r"(*p), pr0_reg holds the ADDRESS (pointer),
+       * not the value.  That pointer is read by both prolog load and epilog
+       * store, so it must survive across the asm body.  Keep lvalue-operand
+       * registers reserved so the value gets a distinct register. */
       if (vals[i].r & VT_LVAL)
         continue;
       if (!vals[i].pr0_spilled && vals[i].pr0_reg != PREG_REG_NONE && vals[i].pr0_reg < NB_ASM_REGS)
@@ -983,10 +932,9 @@ static void tcc_ir_codegen_backpatch_jumps(TCCIRState *ir, uint32_t *ir_to_code_
 
   /* Backpatch switch table entries.
    * Table entries are 32-bit signed PC-relative offsets with Thumb bit.
-   * The reference point is table_start, which is the PC value when
-   * the 16-bit ADD Rt, PC instruction at ind+10 reads PC (= ind+10+4 = ind+14 = table_start).
+   * Reference point is table_start (PC at the 16-bit ADD Rt,PC instruction).
    * Formula: table[i] = (target_addr | 1) - table_start
-   * This must happen after all code is generated so forward targets are mapped. */
+   * Must happen after all code is generated so forward targets are mapped. */
   for (int t = 0; t < ir->num_switch_tables; t++)
   {
     TCCIRSwitchTable *table = &ir->switch_tables[t];
@@ -1013,19 +961,14 @@ static void tcc_ir_codegen_backpatch_jumps(TCCIRState *ir, uint32_t *ir_to_code_
  * Phase-3 scratch conflict fixup
  * ============================================================================
  *
- * After the dry run has identified which instructions would push a register
- * to the stack (no free scratch register available), this function tries to
- * move the vreg currently occupying that register to a free callee-saved
- * register.  This eliminates the push/pop overhead for those instructions.
+ * After the dry run identifies instructions that would push a register
+ * (no free scratch available), this function tries to move the vreg
+ * currently occupying that register to a free callee-saved register.
+ * This eliminates the push/pop overhead.
  *
- * Parameters:
- *   ir     - current function IR state
- *   r      - physical register that would be pushed at instruction insn_i
- *   insn_i - the instruction index where the push was noted
- *
- * Returns the new physical register on success, -1 if no reassignment could
- * be made (e.g. all callee-saved registers are already occupied over the
- * vreg's live range, or the interval is complex / 64-bit / float).
+ * Returns the new physical register on success, -1 if no reassignment
+ * could be made (e.g. all callee-saved registers occupied over the vreg's
+ * live range, or the interval is complex / 64-bit / float).
  */
 static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
 {
@@ -1033,12 +976,9 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
 
   /* Callee-saved registers R4-R11 (bits 4..11 = 0x0FF0), minus reserved
    * special-purpose registers:
-   *   R7  = R_FP (= 7): always reserved as frame pointer by the ARM backend.
-   *     arm-thumb-gen.c: "Always reserve R7 (FP) and never allocate it as a
-   *     general register."  The linear-scan allocator never assigns vregs to R7,
-   *     so it never appears in live_regs_by_instruction.  We must exclude it
-   *     here as well, otherwise we would clobber the frame pointer.
+   *   R7  = R_FP (= 7): always reserved as frame pointer.
    *   R10 = static_chain_reg (= 10): reserved when function uses a static chain.
+   *   R9: reserved when text_and_data_separation (GOT base).
    */
   const uint32_t ALL_CALLEE_SAVED = 0x0FF0u;
   const uint32_t ARM_FP_REG = 7u;         /* R_FP = R7, defined in thumb.h */
@@ -1142,13 +1082,13 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
 
 /* ============================================================================
  * Helper: sub-component fixup for register-pair operands used as LOAD/STORE
- * sources.  When a local STACKOFF operand accesses a sub-component of a 64-bit
- * pair (e.g., __imag__ on _Complex float), the original operand's byte offset
- * differs from the interval's base offset.  In that case, rewrite the
- * MachineOperand to use r1 (second register of the pair) instead of r0.
+ * sources.  When a STACKOFF operand accesses a sub-component of a 64-bit
+ * pair (e.g., __imag__ on _Complex float), the byte offset differs from the
+ * interval's base offset.  Rewrite the MachineOperand to use r1 instead of
+ * r0.
  *
- * This MUST NOT be applied to DP/ASSIGN operands — a 64-bit pair allocated as
- * a register pair can also have a non-zero delta, but that is not a
+ * MUST NOT be applied to DP/ASSIGN operands — a 64-bit pair allocated as a
+ * register pair can also have a non-zero delta, but that is not a
  * sub-component access.
  * ============================================================================ */
 static void mop_fixup_subcomponent(MachineOperand *mop, const IROperand *op, TCCIRState *ir)
@@ -1171,8 +1111,8 @@ static void mop_fixup_subcomponent(MachineOperand *mop, const IROperand *op, TCC
 }
 
 /* Check whether any live interval (other than skip_vreg) is allocated to
- * physical register `reg` and overlaps the range [start, end].  Returns
- * true if a conflict exists, meaning we cannot reassign skip_vreg to `reg`. */
+ * physical register `reg` and overlaps [start, end].  Returns true if a
+ * conflict exists, meaning we cannot reassign skip_vreg to `reg`. */
 static bool ir_reg_conflict(const TCCIRState *ir, int reg, uint32_t start, uint32_t end, int skip_vreg)
 {
   const struct
@@ -1212,14 +1152,13 @@ static bool ir_reg_conflict(const TCCIRState *ir, int reg, uint32_t start, uint3
 /* ============================================================================
  * Pre-prologue FUNCPARAMVAL allocation patching
  *
- * When a LOAD/LOAD_INDEXED/LOAD_POSTINC/ASSIGN produces a value that is
- * immediately consumed by FUNCPARAMVAL (param 0..3), the codegen peephole
- * would load directly into the ABI register (R0-R3) instead of the
- * allocator-assigned register.  If the allocator assigned a callee-saved
- * register, it becomes a ghost save.
+ * When a LOAD/LOAD_INDEXED/LOAD_POSTINC/ASSIGN produces a value immediately
+ * consumed by FUNCPARAMVAL (param 0..3), the codegen peephole loads directly
+ * into the ABI register (R0-R3) instead of the allocator-assigned register.
+ * If the allocator assigned a callee-saved register, it becomes a ghost save.
  *
  * This pre-pass patches those allocations BEFORE prologue emission so that
- * dirty_registers can be recomputed accurately.  It mirrors the logic in
+ * dirty_registers can be recomputed accurately.  Mirrors the logic in
  * ir_codegen_before_ret_peephole's FUNCPARAMVAL branch, but only patches
  * allocations (no MachineOperand output needed).
  * ============================================================================ */
@@ -1310,7 +1249,7 @@ static void ir_codegen_pre_patch_funcparam_allocations(TCCIRState *ir)
  *
  * After peephole/pre-patch optimizations change IRLiveInterval.allocation,
  * the allocator's dirty_registers bitmap may contain callee-saved registers
- * that are no longer referenced by any interval.  Rebuild from ground truth.
+ * no longer referenced by any interval.  Rebuild from ground truth.
  * ============================================================================ */
 static void ir_codegen_recompute_dirty_from_allocations(TCCIRState *ir)
 {
@@ -1348,7 +1287,7 @@ static void ir_codegen_recompute_dirty_from_allocations(TCCIRState *ir)
  * Before-Return Peephole
  *
  * When a LOAD, LOAD_INDEXED, or ASSIGN is immediately followed by a
- * RETURNVALUE on the same vreg (with no intervening jump target), patch the
+ * RETURNVALUE on the same vreg (no intervening jump target), patch the
  * dest vreg's allocation to R0 (R0+R1 for 64-bit) and construct a synthetic
  * MACH_OP_REG MachineOperand.  This eliminates the extra move that
  * RETURNVALUE would otherwise emit.
@@ -1363,13 +1302,12 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
   if (dest_vr < 0)
     return false;
 
-  /* Find the next non-NOP instruction, skipping over dead code.
-   * NOPs are skipped regardless of is_jump_target — a branch landing on
-   * a NOP falls through without affecting register state, so the peephole
-   * assumption ("instruction i's result flows to j") remains valid.
-   * Only check is_jump_target on the actual consumer (non-NOP) — if a
-   * branch can reach it without executing instruction i, the peephole
-   * would produce wrong code. */
+  /* Find the next non-NOP instruction.  NOPs are skipped regardless of
+   * is_jump_target — a branch landing on a NOP falls through without
+   * affecting register state, so the peephole assumption ("instruction i's
+   * result flows to j") remains valid.  Only check is_jump_target on the
+   * actual consumer (non-NOP) — if a branch can reach it without executing
+   * instruction i, the peephole would produce wrong code. */
   int j = i + 1;
   while (j < ir->next_instruction_index)
   {
@@ -1414,9 +1352,9 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
     return true;
   }
 
-  /* Peephole: when the next instruction is an ASSIGN that just copies our dest
+  /* Peephole: when the next instruction is an ASSIGN copying our dest
    * vreg into another register, load directly into the ASSIGN's destination.
-   * This eliminates "ldr rT, [pc,#imm]; mov rD, rT" sequences.
+   * Eliminates "ldr rT, [pc,#imm]; mov rD, rT" sequences.
    *
    * Safety: the dest vreg must die at the ASSIGN (end == i+1), ensuring no
    * other instruction reads the old allocation. */
@@ -1480,7 +1418,7 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
 
   /* Peephole: when the next non-NOP instruction is FUNCPARAMVAL using our dest
    * vreg as a 32-bit scalar argument, load directly into the parameter register
-   * (R0+param_index).  This eliminates "ldr rT, ...; mov r0, rT" sequences
+   * (R0+param_index).  Eliminates "ldr rT, ...; mov r0, rT" sequences
    * generated when a SELECT/LOAD result feeds a function call parameter.
    *
    * Only applies to simple 32-bit scalar arguments (param_index 0..3). */
@@ -1611,12 +1549,8 @@ static inline void ir_codegen_track_scratch(int is_dry_run, int i, TccIrOp op, i
  * skipped NOP between `i` and the partner is a branch target: fusing `i` and
  * the partner into a single instruction is illegal if a branch can land on that
  * NOP, because the partner would then be reachable without executing `i` (and
- * vice-versa).  This is the ternary-merge case where both arms store to
- * adjacent spill slots — the merge NOP sits between the true-arm store and the
- * post-merge store (signed fuzz seed 2987, O0 HardFault: the fused STRD landed
- * on the true-arm path only, so the false arm both mis-stored and left the
- * merge label with no code address -> `b.w 0`).  branch_target_reset[] catches
- * targets that the is_jump_target bit misses at -O0. */
+ * vice-versa).  branch_target_reset[] catches targets that is_jump_target
+ * misses at -O0. */
 static int ir_codegen_next_nonnop_no_label(TCCIRState *ir, const uint8_t *branch_target_reset, int i)
 {
   for (int j = i + 1; j < ir->next_instruction_index; j++)
@@ -1631,6 +1565,31 @@ static int ir_codegen_next_nonnop_no_label(TCCIRState *ir, const uint8_t *branch
     return j;
   }
   return -1;
+}
+
+/* True if idx is an ASSIGN/LOAD copy that materialises to a physical self-move
+ * (src and dst the same hw register), which the assign/load codegen elides to
+ * no code — so it can be scanned over between a flag-setting op and its
+ * consuming branch without disturbing the flags.  Same identity-move idiom the
+ * STRD-fusion scan uses (ir/codegen.c). */
+static int ir_codegen_is_identity_move(TCCIRState *ir, int idx)
+{
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD)
+    return 0;
+  IROperand s = tcc_ir_op_get_src1(ir, q);
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  if (d.tag != IROP_TAG_VREG || d.is_lval)
+    return 0;
+  if (!(s.tag == IROP_TAG_VREG || (s.tag == IROP_TAG_STACKOFF && s.is_local)))
+    return 0;
+  if (s.is_llocal || s.is_sym)
+    return 0;
+  MachineOperand sm = machine_op_from_ir(ir, &s);
+  MachineOperand dm = machine_op_from_ir(ir, &d);
+  return sm.kind == MACH_OP_REG && dm.kind == MACH_OP_REG &&
+         !sm.needs_deref && !dm.needs_deref &&
+         sm.u.reg.r0 == dm.u.reg.r0 && sm.u.reg.r0 >= 0;
 }
 
 static int ir_codegen_count_vreg_uses(TCCIRState *ir, int32_t vreg)
@@ -1665,8 +1624,7 @@ static int ir_codegen_count_vreg_uses(TCCIRState *ir, int32_t vreg)
  * ALL operand slots including the (lval) dest of a STORE, because the
  * live-interval `end` can under-approximate cross-block / loop-back-edge uses
  * and let the fusion fire on a strided struct store (base+idx*odd instead of
- * base+idx*C) — a misaligned store that smashes the heap (00_assignment
- * auto-PCH fault; 02-08 self-host cfg->blocks smash). */
+ * base+idx*C) — a misaligned store that smashes the heap. */
 static int ir_codegen_vreg_used_elsewhere(TCCIRState *ir, int32_t vreg, int def_idx, int use_idx)
 {
   if (vreg < 0)
@@ -1716,7 +1674,7 @@ static void tcc_ir_debug_codegen_generate_entry(TCCIRState *ir)
  *
  * MopSpec encodes which MachineOperands to extract for a given IR instruction.
  * decode_mop_args() performs all machine_op_from_ir / peephole / fixup calls
- * once, returning a MopArgs struct.  Switch cases then just forward to the
+ * once, returning a MopArgs struct.  Switch cases then forward to the
  * appropriate backend function with the pre-decoded args.
  *
  * dest modes: 0 = none, 1 = normal, 2 = with before-return peephole
@@ -1795,8 +1753,7 @@ static inline MopArgs ir_decode_cached(int is_dry_run, int use_mop_cache, MopArg
    * ASSIGN's dest was only retargeted to a register later in the dry-run
    * fires the coalesce peephole in the real-run only, retargeting the load
    * while every cached consumer still reads the source's pre-patch register
-   * (ptr fuzz seed 30436: `ldr r8, [...]` immediately clobbered by the
-   * stale-cache copy `mov r8, ip`). */
+   * (ptr fuzz seed 30436: `ldr r8, [...]` clobbered by stale-cache `mov r8, ip`). */
   if (!is_dry_run && use_mop_cache)
   {
     MopArgs cached = mop_cache[i];
@@ -1874,8 +1831,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
    * PRE-SCAN: Compute maximum outgoing call stack argument size
    * ============================================================================
    * Scan all FUNCCALLVAL/FUNCCALLVOID instructions to find the maximum stack
-   * argument area needed across all calls.  This allows us to pre-reserve the
-   * area in the frame and avoid dynamic SP adjustments at each call site.
+   * argument area needed across all calls.  Pre-reserve the area in the
+   * frame to avoid dynamic SP adjustments at each call site.
    */
   {
     int max_outgoing = 0;
@@ -2541,8 +2498,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
              * entirely, silently dropping that shift, so skip the fusion. */
             if (next_j >= 0 && ir->compact_instructions[next_j].op == TCCIR_OP_ADD &&
                 !ir->compact_instructions[next_j].is_jump_target &&
-                !(ir->barrel_shifts && ir->compact_instructions[next_j].orig_index >= 0 &&
-                  ir->barrel_shifts[ir->compact_instructions[next_j].orig_index]))
+                !tcc_ir_barrel_shift_at(ir, &ir->compact_instructions[next_j]))
             {
               IRQuadCompact *nq = &ir->compact_instructions[next_j];
               IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
@@ -2765,10 +2721,14 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           {
             IROperand cmp_s1 = tcc_ir_op_get_src1(ir, nq);
             IROperand cmp_s2 = tcc_ir_op_get_src2(ir, nq);
-            /* Only safe for EQ/NE conditions (Z flag only). */
+            /* Only safe for EQ/NE conditions (Z flag only).  Scan over an
+             * out-of-SSA phi copy that materialised to a physical self-move
+             * (emits no code, preserves flags) so a rotated count-down latch
+             * `subs; cmp #0; <coalesced copy>; bne` still fuses. */
             int next_jmpif_idx = i + 2;
             while (next_jmpif_idx < ir->next_instruction_index &&
-                   ir->compact_instructions[next_jmpif_idx].op == TCCIR_OP_NOP)
+                   (ir->compact_instructions[next_jmpif_idx].op == TCCIR_OP_NOP ||
+                    ir_codegen_is_identity_move(ir, next_jmpif_idx)))
               next_jmpif_idx++;
             int cond_safe = 0;
             if (next_jmpif_idx < ir->next_instruction_index &&
@@ -2804,7 +2764,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           }
         }
         {
-          uint32_t bs = ir->barrel_shifts ? ir->barrel_shifts[cq->orig_index] : 0;
+          uint32_t bs = tcc_ir_barrel_shift_at(ir, cq);
           SCRATCH_WRAP(tcc_gen_machine_data_processing_mop(a.src1, a.src2, a.dest, cq->op, bs));
         }
         break;
@@ -2962,12 +2922,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
         {
-          uint32_t bs = ir->barrel_shifts ? ir->barrel_shifts[cq->orig_index] : 0;
+          uint32_t bs = tcc_ir_barrel_shift_at(ir, cq);
           /* For 64-bit shifts, pass dead-half annotations in bits 16-17 so the
            * emitter can skip the dead low/high word write. */
-          if ((cq->op == TCCIR_OP_SHL || cq->op == TCCIR_OP_SHR || cq->op == TCCIR_OP_SAR) &&
-              ir->shift64_dead_half)
-            bs |= (uint32_t)ir->shift64_dead_half[cq->orig_index] << 16;
+          if (cq->op == TCCIR_OP_SHL || cq->op == TCCIR_OP_SHR || cq->op == TCCIR_OP_SAR)
+            bs |= (uint32_t)tcc_ir_shift64_dead_half_at(ir, cq) << 16;
           SCRATCH_WRAP(tcc_gen_machine_data_processing_mop(a.src1, a.src2, a.dest, cq->op, bs));
         }
         break;
@@ -2978,10 +2937,16 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         SCRATCH_WRAP(tcc_gen_machine_ubfx_mop(a.src1, a.src2, a.dest));
         break;
       }
+      case TCCIR_OP_SBFX:
+      {
+        MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
+        SCRATCH_WRAP(tcc_gen_machine_sbfx_mop(a.src1, a.src2, a.dest));
+        break;
+      }
       case TCCIR_OP_BFI:
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
-        uint32_t params = ir->bfi_params ? ir->bfi_params[cq->orig_index] : 0;
+        uint32_t params = tcc_ir_bfi_params_at(ir, cq);
         SCRATCH_WRAP(tcc_gen_machine_bfi_mop(a.src1, a.src2, a.dest, params));
         break;
       }

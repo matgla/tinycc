@@ -17,7 +17,6 @@
  *      th_shift_type_to_op, th_shift_value_to_sr_type,
  *      th_generic_op_reg_shift_with_status.
  *    - th_sym_t/th_sym_d ELF `$t`/`$d` mapping-symbol emitters.
- *    - th_trace_regset/th_trace_shift_suffix debug-trace helpers.
  *
  *  Oracle values for th_pack_const/th_packimm_3_8_1 were cross-checked
  *  against `arm-none-eabi-as -march=armv8-m.main` disassembly of the
@@ -662,49 +661,6 @@ UT_TEST(test_generic_op_reg_shift_asr_shift_encodes_sr2)
   return 0;
 }
 
-/* ============================================================ */
-/*  th_trace_regset() / th_trace_shift_suffix()                   */
-/*  Trace helpers gated by THOP_TRACE (compiled to nothing unless */
-/*  TCC_LOG_THOP=1); calling them must never crash regardless.    */
-/* ============================================================ */
-
-UT_TEST(test_trace_regset_does_not_crash_empty_set)
-{
-  th_trace_regset(0);
-  return 0;
-}
-
-UT_TEST(test_trace_regset_does_not_crash_full_set)
-{
-  th_trace_regset(0xFFFF);
-  return 0;
-}
-
-UT_TEST(test_trace_shift_suffix_none_is_noop)
-{
-  th_trace_shift_suffix((thumb_shift){.type = THUMB_SHIFT_NONE});
-  return 0;
-}
-
-UT_TEST(test_trace_shift_suffix_rrx_does_not_crash)
-{
-  th_trace_shift_suffix((thumb_shift){.type = THUMB_SHIFT_RRX});
-  return 0;
-}
-
-UT_TEST(test_trace_shift_suffix_register_mode_does_not_crash)
-{
-  th_trace_shift_suffix((thumb_shift){
-      .type = THUMB_SHIFT_LSL, .value = 2, .mode = THUMB_SHIFT_REGISTER});
-  return 0;
-}
-
-UT_TEST(test_trace_shift_suffix_immediate_mode_does_not_crash)
-{
-  th_trace_shift_suffix((thumb_shift){
-      .type = THUMB_SHIFT_LSR, .value = 7, .mode = THUMB_SHIFT_IMMEDIATE});
-  return 0;
-}
 
 /* ============================================================ */
 /*  th_sym_t() / th_sym_d() -- ELF $t/$d mapping symbols          */
@@ -796,13 +752,6 @@ UT_SUITE(thumb_core)
   UT_RUN(test_generic_op_reg_shift_with_lsl_shift);
   UT_RUN(test_generic_op_reg_shift_sets_status_bit_20);
   UT_RUN(test_generic_op_reg_shift_asr_shift_encodes_sr2);
-
-  UT_RUN(test_trace_regset_does_not_crash_empty_set);
-  UT_RUN(test_trace_regset_does_not_crash_full_set);
-  UT_RUN(test_trace_shift_suffix_none_is_noop);
-  UT_RUN(test_trace_shift_suffix_rrx_does_not_crash);
-  UT_RUN(test_trace_shift_suffix_register_mode_does_not_crash);
-  UT_RUN(test_trace_shift_suffix_immediate_mode_does_not_crash);
 
   UT_RUN(test_sym_t_does_not_crash);
   UT_RUN(test_sym_d_does_not_crash);

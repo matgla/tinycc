@@ -12,9 +12,7 @@
 
 /* Pass entry points defined in ir/opt_dce.c. */
 int tcc_ir_opt_dce(TCCIRState *ir);
-int tcc_ir_opt_orphan_cmp_elim(TCCIRState *ir);
 int tcc_ir_opt_dce_ex(IROptCtx *ctx);
-int tcc_ir_opt_orphan_cmp_elim_ex(IROptCtx *ctx);
 int tcc_ir_opt_useless_function_body(TCCIRState *ir);
 int tcc_ir_opt_noreturn_collapse(TCCIRState *ir);
 int tcc_ir_opt_trap_only_body_suppress(TCCIRState *ir);
@@ -440,62 +438,6 @@ UT_TEST(test_callee_is_noreturn_by_name_exit)
   return 0;
 }
 
-/* --------------------------------------------------------- orphan cmp elim */
-
-UT_TEST(test_orphan_cmp_elim_simple)
-{
-  TCCIRState *ir = utb_new();
-  int cmp = emit_cmp(ir, utb_temp(0, I32), utb_imm(0, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_orphan_cmp_elim(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_free(ir);
-  return 0;
-}
-
-UT_TEST(test_orphan_cmp_elim_keeps_when_consumed)
-{
-  TCCIRState *ir = utb_new();
-  int cmp = emit_cmp(ir, utb_temp(0, I32), utb_imm(0, I32));
-  emit_setif(ir, 1, TOK_EQ);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_orphan_cmp_elim(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_CMP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_free(ir);
-  return 0;
-}
-
-UT_TEST(test_orphan_cmp_elim_flag_helper_call)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee;
-  memset(&callee, 0, sizeof(callee));
-  IROperand fn = utb_named_callee(ir, &callee, TOK_CFCMPL, "__aeabi_cfcmple");
-  int call = emit_call_void(ir, fn, 1, 0);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_orphan_cmp_elim(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, call), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_free(ir);
-  return 0;
-}
-
 /* --------------------------------------------------------- useless function body */
 
 UT_TEST(test_useless_body_elides_pure_call)
@@ -804,47 +746,6 @@ UT_TEST(test_noreturn_call_epilogue_suppress_with_return)
   return 0;
 }
 
-/* --------------------------------------------------- orphan cmp extra cases */
-
-/* A CMP whose only consumer would be reached through a JUMP cycle is kept
- * conservatively: the scan hits a visited instruction and declares the CMP
- * live. */
-UT_TEST(test_orphan_cmp_elim_jump_cycle_keeps_cmp)
-{
-  TCCIRState *ir = utb_new();
-  int cmp = emit_cmp(ir, utb_temp(0, I32), utb_imm(0, I32));
-  emit_jump(ir, 3);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-  emit_jump(ir, 1);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_orphan_cmp_elim(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_CMP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* A CMP followed immediately by a RETURN has no flag consumer before the end
- * of the function, so it is eliminated. */
-UT_TEST(test_orphan_cmp_elim_end_of_function)
-{
-  TCCIRState *ir = utb_new();
-  int cmp = emit_cmp(ir, utb_temp(0, I32), utb_imm(0, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_orphan_cmp_elim(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_free(ir);
-  return 0;
-}
 
 /* --------------------------------------------------- noreturn collapse gates */
 
@@ -944,22 +845,6 @@ UT_TEST(test_dce_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_orphan_cmp_elim_ex_forwards)
-{
-  TCCIRState *ir = utb_new();
-  int cmp = emit_cmp(ir, utb_temp(0, I32), utb_imm(0, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_orphan_cmp_elim_ex(&ctx);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_NOP);
-
-  utb_free(ir);
-  return 0;
-}
-
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(opt_dce)
@@ -980,9 +865,6 @@ UT_SUITE(opt_dce)
   UT_RUN(test_callee_is_noreturn_null);
   UT_RUN(test_callee_is_noreturn_attr);
   UT_RUN(test_callee_is_noreturn_by_name_exit);
-  UT_RUN(test_orphan_cmp_elim_simple);
-  UT_RUN(test_orphan_cmp_elim_keeps_when_consumed);
-  UT_RUN(test_orphan_cmp_elim_flag_helper_call);
   UT_RUN(test_useless_body_elides_pure_call);
   UT_RUN(test_useless_body_keeps_essential_return);
   UT_RUN(test_useless_body_empty_elides_all);
@@ -996,11 +878,8 @@ UT_SUITE(opt_dce)
   UT_RUN(test_infinite_self_recursion_return_before_call);
   UT_RUN(test_noreturn_call_epilogue_suppress);
   UT_RUN(test_noreturn_call_epilogue_suppress_with_return);
-  UT_RUN(test_orphan_cmp_elim_jump_cycle_keeps_cmp);
-  UT_RUN(test_orphan_cmp_elim_end_of_function);
   UT_RUN(test_noreturn_collapse_no_jump_returns_zero);
   UT_RUN(test_noreturn_collapse_implicit_return_returns_zero);
   UT_RUN(test_noreturn_collapse_conditional_exit_returns_zero);
   UT_RUN(test_dce_ex_forwards);
-  UT_RUN(test_orphan_cmp_elim_ex_forwards);
 }

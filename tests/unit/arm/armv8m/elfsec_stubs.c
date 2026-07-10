@@ -174,4 +174,21 @@ void tcc_elf_add_sec_idx(void *s, const char *name, unsigned long addr,
 {
   /* Do nothing. */
 }
+
+/* Pulled in transitively by ssa_opt_dce.c -> opt_dce.c
+ * (tcc_ir_callee_is_noreturn).  No ELF symbol table or token pool exists in
+ * this harness, so report "no ELF symbol" and an empty name — the DCE tests
+ * never depend on noreturn-callee classification. */
+ElfSym *elfsym(Sym *s)
+{
+  (void)s;
+  return NULL;
+}
+
+const char *get_tok_str(int v, CValue *cv)
+{
+  (void)v;
+  (void)cv;
+  return "";
+}
 #endif /* UT_SSA_OPT_REAL */

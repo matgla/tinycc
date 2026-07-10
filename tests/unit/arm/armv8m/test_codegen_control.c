@@ -957,7 +957,7 @@ UT_TEST(test_dispatch_switch_table_uses_distinct_mop_per_pass)
   UT_ASSERT_EQ(sz->aux0, 3); /* num_entries */
 
   /* tcc_ir_free() walks and tcc_free()s switch_tables[i].targets and
-   * switch_tables itself (see ir/core.c ~266) -- both point at this test's
+   * switch_tables itself (see ir/gen/state.c ~269) -- both point at this test's
    * stack/static arrays, not tcc_malloc'd memory. Detach before freeing,
    * same reason test_opt_switch_collapse.c uses the lighter utb_free(). */
   ir->switch_tables = NULL;

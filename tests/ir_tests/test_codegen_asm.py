@@ -297,6 +297,23 @@ def test_mem_load_store_addressing():
     assert _count_mnem_regex(lea, r"^add\s+r0, sp") >= 1, "lea_local missing add r0, sp"
 
 
+def test_rmw_partial_bitfield_clears_collapse_to_byte_store():
+    obj = _compile("rmw_byte_clear_run")
+    funcs = _disassemble(obj)
+    fn = funcs["clear_display"]
+
+    assert _count_mnem(fn, "strb") == 1, "multi-mask byte clear should lower to one strb"
+    assert _count_mnem(fn, "and") + _count_mnem(fn, "and.w") == 0, "byte clear left word RMW masks"
+
+
+def test_vector_xor_eq_self_avoids_long_cmp_forwarding():
+    obj = _compile("vector_xor_eq_self", extra_cflags=["-O2"])
+    funcs = _disassemble(obj)
+    fn = funcs["vector_xor_eq_self"]
+
+    assert len(fn) <= 100, f"vector_xor_eq_self regressed to {len(fn)} instructions"
+
+
 # -----------------------------------------------------------------------------
 # Control: switch table and branch narrowing
 # -----------------------------------------------------------------------------
@@ -343,8 +360,10 @@ def test_call_aapcs_register_args():
     assert _count_mnem(caller, "b.w") >= 1, "caller_int missing branch to callee"
     # Callee uses r0-r3 as its parameters.
     callee = funcs["callee_int"]
-    assert _count_mnem_regex(callee, r"^add\.w\s+ip, r0, r1") >= 1, "callee_int missing r0+r1 add"
-    assert _count_mnem_regex(callee, r"^add\.w\s+r0, ip, r2") >= 1, "callee_int missing ip+r2 add"
+    # narrow-preference regalloc keeps the a+b temp in a low reg (r4), so all
+    # three adds use the 16-bit ADDS encoding
+    assert _count_mnem_regex(callee, r"^adds\s+r4, r0, r1") >= 1, "callee_int missing r0+r1 add"
+    assert _count_mnem_regex(callee, r"^adds\s+r0, r4, r2") >= 1, "callee_int missing r4+r2 add"
     assert _count_mnem_regex(callee, r"^adds\s+r0, r0, r3") >= 1, "callee_int missing r0+r3 add"
 
 

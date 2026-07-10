@@ -1,0 +1,4 @@
+chase b=42 null_a=1
+sum=45
+tail b=8
+[returns 0]

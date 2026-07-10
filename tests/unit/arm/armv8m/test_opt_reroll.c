@@ -33,6 +33,9 @@
  * avoid pulling in the optimizer engine headers). */
 int tcc_ir_opt_reroll(TCCIRState *ir);
 
+/* ssa:reroll regalloc-time driver (declared in ir/opt/ssa_opt.h). */
+int ssa_opt_reroll(TCCIRState *ir);
+
 #define I32 IROP_BTYPE_INT32
 
 /* Pass constants (mirrored from ir/opt_reroll.c — kept in sync here so the
@@ -467,6 +470,35 @@ UT_TEST(test_reroll_empty_ir_no_change)
   return 0;
 }
 
+/* SSA DRIVER: ssa_opt_reroll() is the thin regalloc-time wrapper over the
+ * engine (docs/plan_legacy_loop_reroll_ssa.md).  It must produce the identical
+ * rewrite and count as the direct engine call, and be idempotent. */
+UT_TEST(test_ssa_reroll_driver_rerolls_and_is_idempotent)
+{
+  TCCIRState *ir = utb_reroll_new();
+
+  for (int k = 0; k < 4; k++)
+    emit_fresh_body3(ir, k * 3, 5);
+
+  int changes = ssa_opt_reroll(ir);
+  UT_ASSERT_EQ(changes, 1);
+
+  /* Same rewritten shape as the direct-engine test: counter=0 at [0], body at
+   * [1,4), 9 NOPs, ADD/CMP/JUMPIF tail. */
+  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(count_nops(ir), 9);
+  UT_ASSERT(find_op(ir, TCCIR_OP_CMP, 0) >= 0);
+  UT_ASSERT(find_op(ir, TCCIR_OP_JUMPIF, 0) >= 0);
+
+  /* Idempotent: the rerolled loop's JUMPIF back-edge is unsafe, so a second
+   * run finds nothing. */
+  UT_ASSERT_EQ(ssa_opt_reroll(ir), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(opt_reroll)
@@ -486,4 +518,5 @@ UT_SUITE(opt_reroll)
   UT_RUN(test_reroll_period_two_no_reroll);
   UT_RUN(test_reroll_idempotent);
   UT_RUN(test_reroll_empty_ir_no_change);
+  UT_RUN(test_ssa_reroll_driver_rerolls_and_is_idempotent);
 }

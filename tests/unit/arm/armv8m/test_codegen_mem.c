@@ -438,9 +438,9 @@ UT_TEST(test_codegen_backpatch_roundtrip)
  * 3415/3490 respectively), each ending in exactly one mop call for the shapes
  * built here. BLOCK_COPY (needs a real Sym* this bare harness can't build --
  * see stubs.c's always-NULL sym_push2/external_global_sym) and
- * LOAD_POSTINC/STORE_POSTINC (normally synthesized by the postinc-fusion
- * optimizer pass, not emitted directly by the frontend) are documented gaps,
- * left uncovered here -- see docs/plan_codegen_unit_tests.md.
+ * LOAD_POSTINC/STORE_POSTINC (post-increment opcodes still lowered by
+ * ir/codegen.c but no longer produced by any optimizer pass) are documented
+ * gaps, left uncovered here -- see docs/plan_codegen_unit_tests.md.
  * ============================================================================ */
 
 UT_TEST(test_dispatch_load_store_route_to_mops)

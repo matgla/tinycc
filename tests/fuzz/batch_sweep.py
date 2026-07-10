@@ -118,13 +118,12 @@ CF_COMMON = ["-nostdlib", "-fvisibility=hidden", "-mcpu=cortex-m33", "-mthumb",
              "-mfloat-abi=soft", "-ffunction-sections"]
 
 _SIG_RE = re.compile(r"checksum=([0-9a-f]+)|HardFault|Lockup")
-_ENV = {**os.environ, "ASAN_OPTIONS": "detect_leaks=0:abort_on_error=0"}
 _PROGRESS_LOCK = threading.Lock()
 
 
 def _run(cmd, **kw):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, env=_ENV, **kw)
+                          text=True, **kw)
 
 
 def _elapsed(start: float) -> str:
@@ -473,7 +472,7 @@ def run_elf(elf: Path, timeout: float) -> tuple[str, bool]:
             ["qemu-system-arm", "-machine", "mps2-an505", "-nographic",
              "-semihosting", "-kernel", str(elf)],
             stdin=subprocess.DEVNULL,
-            stdout=fh, stderr=subprocess.STDOUT, env=_ENV)
+            stdout=fh, stderr=subprocess.STDOUT)
         try:
             p.wait(timeout=timeout)
             timed_out = False

@@ -2413,7 +2413,7 @@ UT_TEST(test_find_nested_func_by_sym)
 
 /* ---------------------------------------------------------------------------
  * IR-emission surface: gind/gjmp_acs/vset_VT_JMP hand work to the IR layer
- * (ir/core.c, ir/codegen.c, svalue.c) that isn't linked here.  The capturing
+ * (ir/gen sources, ir/codegen.c, svalue.c) that isn't linked here.  The capturing
  * stubs below record what tccgen.c passed down so the tests can assert on it,
  * and a fake TCCIRState stands in for tcc_state->ir.
  * --------------------------------------------------------------------------- */
@@ -2433,6 +2433,37 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   if (dest)
     ut_last_ir_dest = *dest;
   return ut_ir_put_ret;
+}
+
+void tcc_ir_gen_return_value(TCCIRState *ir, SValue *val)
+{
+  (void)ir;
+  ut_last_ir_op = TCCIR_OP_RETURNVALUE;
+  if (val)
+    ut_last_ir_dest = *val;
+}
+
+void tcc_ir_gen_vla_alloc(TCCIRState *ir, SValue *size, int align)
+{
+  (void)ir;
+  (void)align;
+  ut_last_ir_op = TCCIR_OP_VLA_ALLOC;
+  if (size)
+    ut_last_ir_dest = *size;
+}
+
+void tcc_ir_gen_vla_sp_save(TCCIRState *ir, int slot)
+{
+  (void)ir;
+  ut_last_ir_op = TCCIR_OP_VLA_SP_SAVE;
+  ut_last_ir_dest.c.i = slot;
+}
+
+void tcc_ir_gen_vla_sp_restore(TCCIRState *ir, int slot)
+{
+  (void)ir;
+  ut_last_ir_op = TCCIR_OP_VLA_SP_RESTORE;
+  ut_last_ir_dest.c.i = slot;
 }
 
 void svalue_init(SValue *sv)

@@ -15,6 +15,7 @@ import html
 import os
 import sqlite3
 import sys
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -126,8 +127,37 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def snapshot_sqlite(path: Path) -> bytes:
+    """Return a consistent point-in-time copy of the SQLite db at `path`.
+
+    Uses the online backup API so a concurrent `metrics/record.py` write can't
+    hand out a torn read, and so it works regardless of the source journal mode
+    (the main metrics.db is journal_mode=DELETE, read-only mounted into Grafana).
+    The main metrics.db holds only rollups/perf/correctness (no per-function
+    detail), so it is small enough to buffer in memory for the response."""
+    src = sqlite3.connect(_readonly_uri(path), uri=True)
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        dst = sqlite3.connect(tmp_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+        return Path(tmp_path).read_bytes()
+    finally:
+        src.close()
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 class CodesizeHandler(BaseHTTPRequestHandler):
     db_path = ""
+    metrics_db_path = ""   # main metrics.db served for download at /metrics.db
 
     def log_message(self, fmt, *args):
         print(f"[codesize-detail] {self.address_string()} {fmt % args}",
@@ -175,6 +205,8 @@ class CodesizeHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/":
                 self.handle_index()
+            elif parsed.path == "/metrics.db":
+                self.handle_metrics_download()
             elif parsed.path == "/compare":
                 self.handle_compare(query)
             elif parsed.path == "/file":
@@ -185,6 +217,32 @@ class CodesizeHandler(BaseHTTPRequestHandler):
             self.send_html("SQLite error", f"<p><code>{h(e)}</code></p>", 500)
         except ValueError as e:
             self.send_html("Bad request", f"<p>{h(e)}</p>", 400)
+
+    def handle_metrics_download(self) -> None:
+        """Stream a consistent snapshot of the main metrics.db.
+
+        This is the baseline source for `metrics/compare_worktree.py`, which
+        measures a dirty working tree locally and diffs it against the server's
+        recorded run for the base commit. The detail viewer itself does not use
+        this DB; it is served here only so a developer can fetch the CI baseline
+        over HTTP without SSH access to the Pi."""
+        if not self.metrics_db_path:
+            self.send_html("Not found",
+                           "<p>No metrics.db configured (start the server with "
+                           "<code>--metrics-db</code>).</p>", 404)
+            return
+        path = _display_path(self.metrics_db_path)
+        if not path.is_file() or not os.access(path, os.R_OK):
+            self.send_html("Not found",
+                           f"<p>metrics.db not available: <code>{h(path)}</code></p>", 404)
+            return
+        data = snapshot_sqlite(path)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", 'attachment; filename="metrics.db"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def handle_index(self) -> None:
         with connect(self.db_path) as conn:
@@ -197,7 +255,11 @@ class CodesizeHandler(BaseHTTPRequestHandler):
                    GROUP BY r.run_id
                    ORDER BY r.commit_ts DESC, r.run_ts DESC
                    LIMIT 100""").fetchall()
-        body = ["<p class=\"muted\">Latest per-function code-size runs.</p>",
+        body = []
+        if self.metrics_db_path and _display_path(self.metrics_db_path).is_file():
+            body.append("<p class=\"muted\"><a href=\"/metrics.db\">download metrics.db</a>"
+                        " &mdash; baseline for <code>metrics/compare_worktree.py</code>.</p>")
+        body += ["<p class=\"muted\">Latest per-function code-size runs.</p>",
                 "<table><thead><tr><th>commit</th><th>subject</th>"
                 "<th>branch</th><th>host</th><th class=\"num\">rows</th>"
                 "<th>view</th></tr></thead><tbody>"]
@@ -520,13 +582,19 @@ class CodesizeHandler(BaseHTTPRequestHandler):
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--db", default="/var/lib/tcc-metrics/codesize-detail.db")
+    p.add_argument("--metrics-db", default="/var/lib/tcc-metrics/metrics.db",
+                   help="main metrics.db served for download at /metrics.db "
+                        "(baseline source for metrics/compare_worktree.py); "
+                        "pass '' to disable the route")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8008)
     args = p.parse_args(argv)
 
     CodesizeHandler.db_path = args.db
+    CodesizeHandler.metrics_db_path = args.metrics_db
     server = ThreadingHTTPServer((args.host, args.port), CodesizeHandler)
-    print(f"serving {args.db} on http://{args.host}:{args.port}",
+    print(f"serving {args.db} on http://{args.host}:{args.port}"
+          + (f" (+ {args.metrics_db} at /metrics.db)" if args.metrics_db else ""),
           file=sys.stderr)
     try:
         server.serve_forever()

@@ -1,30 +1,32 @@
 /*
- *  test_opt_loop_const_sim.c - suite for ir/opt_loop_const_sim.c
- *                               (loop constant simulation)
+ *  test_opt_loop_const_sim.c - suite for ssa_opt_loop_const_sim
+ *                               (ir/opt/ssa_opt_loop.c, loop constant simulation)
  *
- *  tcc_ir_opt_loop_const_sim (and its _ex sibling) symbolically executes a
- *  small-trip-count loop body at compile time when every address/value the
- *  body touches is statically derivable, then rewrites the whole loop range
- *  to NOPs plus a handful of residual ASSIGN/STORE instructions carrying the
- *  loop's final state. This file has a real bug history (see project memory:
- *  238_fuzz_loop_const_sim_unsigned_char_residual.c fixed a dropped
- *  is_unsigned flag on narrow VAR residuals; 241_fuzz_loop_const_sim_indexed_
- *  store.c fixed a pre-loop-scan STORE_INDEXED blind spot) — tests here are
- *  deliberately narrow/oracled and assert on CURRENT behavior only.
+ *  ssa_opt_loop_const_sim symbolically executes a small-trip-count loop body
+ *  at compile time when every address/value the body touches is statically
+ *  derivable, then rewrites the whole loop range to NOPs plus a handful of
+ *  residual ASSIGN/STORE instructions carrying the loop's final state.  It is
+ *  the SSA/CFG-era driver over the shared fold engine (lcs_fold_region in
+ *  ir/opt_loop_const_sim.c); the legacy pre-SSA driver tcc_ir_opt_loop_const_sim
+ *  this suite used to drive has been retired (see
+ *  docs/plan_legacy_loop_const_sim_ssa.md).  Real bug history (project memory):
+ *  238_fuzz_loop_const_sim_unsigned_char_residual.c fixed a dropped is_unsigned
+ *  flag on narrow VAR residuals; 241_fuzz_loop_const_sim_indexed_store.c fixed a
+ *  pre-loop-scan STORE_INDEXED blind spot.  Tests assert on CURRENT behavior.
  *
  *  These are isolated tests: a hand-built IR sequence is run through the bare
- *  pass entry point (tcc_ir_opt_loop_const_sim) and the resulting
- *  instructions are inspected directly, following the ir_build.h / utb_*
- *  pattern used by test_opt_loop_dead.c / test_opt_loop_utils.c.
+ *  pass entry point (ssa_opt_loop_const_sim) and the resulting instructions are
+ *  inspected directly, following the ir_build.h / utb_* pattern used by
+ *  test_opt_loop_dead.c / test_opt_loop_utils.c.
  */
 
 #include "ir_build.h"
 
 #include "ut.h"
 
-/* Pass entry points (declared in opt_loop_const_sim.h; forward-declared here
- * to avoid pulling in the optimizer engine headers). */
-int tcc_ir_opt_loop_const_sim(TCCIRState *ir);
+/* Pass entry point (declared in ir/opt/ssa_opt.h; forward-declared here to
+ * avoid pulling in the SSA optimizer engine headers). */
+int ssa_opt_loop_const_sim(TCCIRState *ir);
 
 #define I8  IROP_BTYPE_INT8
 #define I16 IROP_BTYPE_INT16
@@ -154,7 +156,7 @@ static int emit_counting_store_loop(TCCIRState *ir, int init, int limit, int ste
  * for the normal IR pipeline.  LCS bails on any memory-carrying loop: its
  * partial stack-memory modeling let stale aggregate values escape through
  * indexed stores / packed RMW chains, so the has_memory guard in
- * tcc_ir_opt_loop_const_sim skips such loops.  The loop must be reported
+ * ssa_opt_loop_const_sim skips such loops.  The loop must be reported
  * unchanged (changes == 0), with its control flow and store untouched. */
 UT_TEST(test_lcs_counting_store_in_body_blocks_fold)
 {
@@ -163,7 +165,7 @@ UT_TEST(test_lcs_counting_store_in_body_blocks_fold)
 
   emit_counting_store_loop(ir, 0, 5, 1, 100, I32);
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
 
   UT_ASSERT_EQ(changes, 0);
 
@@ -193,7 +195,7 @@ UT_TEST(test_lcs_counting_store_used_after_blocks_fold)
   /* Append a reader of V0 after the exit target. */
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE); /* 8 */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
   UT_ASSERT_EQ(changes, 0);
 
   UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
@@ -219,7 +221,7 @@ UT_TEST(test_lcs_counting_store_nonunit_step_blocks_fold)
   emit_counting_store_loop(ir, 2, 11, 3, 200, I32);
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE); /* 8: read V0 after */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
   UT_ASSERT_EQ(changes, 0);
 
   UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
@@ -253,7 +255,7 @@ UT_TEST(test_lcs_accumulator_var_folds_to_final_value)
   utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                       /* 8 exit target */
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I32), UTB_NONE);     /* 9 read acc */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
   UT_ASSERT_EQ(changes, 1);
 
   int a = find_assign_to_var(ir, 1);
@@ -293,7 +295,7 @@ UT_TEST(test_lcs_narrow_unsigned_var_residual_preserves_is_unsigned)
   utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                      /* 8 exit target */
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I8), UTB_NONE);     /* 9 read V1 after */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
   UT_ASSERT_EQ(changes, 1);
 
   int a = find_assign_to_var(ir, 1);
@@ -330,7 +332,7 @@ UT_TEST(test_lcs_narrow_signed_var_residual_is_unsigned_zero)
   utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                      /* 8 exit target */
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I8), UTB_NONE);     /* 9 */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
   UT_ASSERT_EQ(changes, 1);
 
   int a = find_assign_to_var(ir, 1);
@@ -370,7 +372,7 @@ UT_TEST(test_lcs_int32_overflow_wraps_in_residual)
   utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                          /* 8 exit target */
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I32), UTB_NONE);        /* 9 read acc */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
   UT_ASSERT_EQ(changes, 1);
 
   int a = find_assign_to_var(ir, 1);
@@ -415,7 +417,7 @@ UT_TEST(test_lcs_load_indexed_in_body_blocks_fold)
   utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                   /* 6 */
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);            /* 7 exit target */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
 
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
@@ -449,7 +451,7 @@ UT_TEST(test_lcs_runtime_param_value_blocks_fold)
   utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                      /* 7 */
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);               /* 8 exit target */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
 
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_CMP);
@@ -489,7 +491,7 @@ UT_TEST(test_lcs_unknown_call_blocks_fold)
   utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                   /* 6 */
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);            /* 7 exit target */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
 
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
@@ -517,7 +519,7 @@ UT_TEST(test_lcs_trip_over_max_blocks_both_paths)
 
   emit_counting_store_loop(ir, 0, 17, 1, 300, I32); /* trip_count = 17 > 16 */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
 
   /* Independent oracle: the have_iv_trip fast path requires
    * trip_count <= LCS_MAX_TRIP_COUNT(16), so 17 disqualifies it; the generic
@@ -564,7 +566,7 @@ UT_TEST(test_lcs_div_by_zero_in_body_blocks_fold)
   utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                   /* 6 */
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);            /* 7 exit target */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
 
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_DIV);
@@ -596,7 +598,7 @@ UT_TEST(test_lcs_addrtaken_var_blocks_fold)
   utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                   /* 7 */
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);            /* 8 exit target */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
 
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_CMP);
@@ -634,7 +636,7 @@ UT_TEST(test_lcs_internal_branch_to_third_target_blocks_fold)
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);            /* 8 exit_target */
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);            /* 9 third target */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
 
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
@@ -660,7 +662,7 @@ UT_TEST(test_lcs_no_loop_no_fire)
   utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
@@ -681,9 +683,9 @@ UT_TEST(test_lcs_memory_loop_idempotent_noop)
 
   emit_counting_store_loop(ir, 0, 5, 1, 100, I32);
 
-  int total = utb_run_to_fixpoint(ir, tcc_ir_opt_loop_const_sim, 10);
+  int total = utb_run_to_fixpoint(ir, ssa_opt_loop_const_sim, 10);
   UT_ASSERT_EQ(total, 0);
-  UT_ASSERT_EQ(tcc_ir_opt_loop_const_sim(ir), 0);
+  UT_ASSERT_EQ(ssa_opt_loop_const_sim(ir), 0);
   /* Loop left intact for the normal pipeline. */
   UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
@@ -719,7 +721,7 @@ UT_TEST(test_lcs_lea_indirect_store_blocks_fold)
   utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                   /* 7 */
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);            /* 8 exit target */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
   /* The indirect STORE makes this a memory-carrying loop -- the address-tracking
    * fold path (the source of the combo_num-872 miscompile class) is deferred to
    * the normal pipeline. */
@@ -749,12 +751,457 @@ UT_TEST(test_lcs_zero_trip_store_loop_blocks_fold)
 
   emit_counting_store_loop(ir, 0, 0, 1, 400, I32); /* init==limit -> 0 trips */
 
-  int changes = tcc_ir_opt_loop_const_sim(ir);
+  int changes = ssa_opt_loop_const_sim(ir);
 
   UT_ASSERT_EQ(changes, 0);
   /* Loop control and the store body are untouched. */
   UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
   UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* ======================================================================
+ * ssa_opt_loop_const_sim: the CFG/dominator-driven front-end for the shared
+ * engine (lcs_fold_region).  The engine is exercised above through the legacy
+ * entry; these tests drive the SSA driver, so they assert the *detection*
+ * facts (dominance-verified candidates, contiguity, single-entry, outermost)
+ * on top of the shared fold semantics.  Loops here must form a valid CFG:
+ * tcc_ir_cfg_build parses the flat jump targets into blocks.
+ * ====================================================================== */
+
+/* Top-tested accumulator loop folds via the SSA driver, identical to the
+ * legacy path: for(i=0;i<4;i++) acc+=10 -> residual acc=40. */
+UT_TEST(test_lcs_ssa_accumulator_top_tested_folds)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);   /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);   /* 1 acc=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(4, I32));      /* 2 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 3 exit=8 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(10, I32)); /* 4 acc+=10 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 5 i++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE);               /* 6 back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                       /* 7 */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                       /* 8 exit target */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I32), UTB_NONE);     /* 9 read acc */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 1);
+
+  /* Back-edge collapsed; residuals fill the freed slots (residual acc=40). */
+  UT_ASSERT_EQ(utb_op(ir, 6), TCCIR_OP_NOP);
+  int a = find_assign_to_var(ir, 1);
+  UT_ASSERT(a >= 0);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, a)), 40);
+  /* Non-member read of acc survives. */
+  UT_ASSERT_EQ(utb_op(ir, 9), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Bottom-tested (rotated) loop — the orientation the legacy tccgen driver
+ * currently never sees but the SSA pass will (it runs after ssa:loop_rotate).
+ * do { acc+=10; i++; } while(i<4) -> acc=40. */
+UT_TEST(test_lcs_ssa_bottom_tested_folds)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);   /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);   /* 1 acc=0 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(10, I32)); /* 2 header/body acc+=10 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 3 i++ */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(4, I32));      /* 4 bottom test */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(2, I32), utb_imm(TOK_LT, I32), UTB_NONE); /* 5 back-edge (i<4) */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                       /* 6 fall-through exit */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I32), UTB_NONE);     /* 7 read acc */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 1);
+
+  int a = find_assign_to_var(ir, 1);
+  UT_ASSERT(a >= 0);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, a)), 40);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* int32 wrap fold via the SSA driver: acc=0x7FFFFFFF, +1 once -> INT32_MIN. */
+UT_TEST(test_lcs_ssa_int32_overflow_wraps)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);          /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0x7FFFFFFF, I32), UTB_NONE); /* 1 acc */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(1, I32));             /* 2 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(TOK_GE, I32), UTB_NONE);     /* 3 exit=8 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(1, I32));      /* 4 acc+=1 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));      /* 5 i++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE);                   /* 6 */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                           /* 7 */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                           /* 8 exit target */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I32), UTB_NONE);         /* 9 read acc */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 1);
+
+  int a = find_assign_to_var(ir, 1);
+  UT_ASSERT(a >= 0);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, a)), (int)0x80000000);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* is_unsigned residual preservation via the SSA driver (seed-4791 class). */
+UT_TEST(test_lcs_ssa_narrow_unsigned_residual)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  IROperand v0_u8 = utb_unsigned(utb_var(0, I8));
+  utb_emit(ir, TCCIR_OP_ASSIGN, v0_u8, utb_imm(254, I8), UTB_NONE);            /* 0 V0=254 (u8) */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(2, I32), utb_imm(0, I32), UTB_NONE);   /* 1 i=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(2, I32), utb_imm(3, I32));      /* 2 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 3 exit=8 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_unsigned(utb_var(1, I8)), v0_u8, UTB_NONE); /* 4 V1=V0 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(2, I32), utb_var(2, I32), utb_imm(1, I32)); /* 5 i++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE);              /* 6 back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                      /* 7 */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                      /* 8 exit target */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I8), UTB_NONE);     /* 9 read V1 */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 1);
+
+  int a = find_assign_to_var(ir, 1);
+  UT_ASSERT(a >= 0);
+  UT_ASSERT_EQ(utb_dest(ir, a).is_unsigned, 1);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, a)), 254);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Register-only decline: a STORE in the body makes it memory-carrying, so the
+ * driver's has_memory scan over the member span declines (same narrowing as
+ * legacy). */
+UT_TEST(test_lcs_ssa_store_in_body_declines)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  emit_counting_store_loop(ir, 0, 5, 1, 100, I32);
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Address-taken VAR declines (engine's lcs_scan_body live-interval guard,
+ * reached through the SSA driver). */
+UT_TEST(test_lcs_ssa_addrtaken_var_declines)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+  ir->variables_live_intervals[1].addrtaken = 1;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);  /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);  /* 1 acc=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(3, I32));     /* 2 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 3 exit */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(1, I32)); /* 4 acc++ */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32)); /* 5 i++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE);           /* 6 back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                   /* 7 */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);            /* 8 exit target */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 4), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Trip count over LCS_MAX_TRIP_COUNT declines by both engine paths. */
+UT_TEST(test_lcs_ssa_trip_over_max_declines)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  /* Register-only counting loop trip=17 (store loop would decline on memory
+   * first; use a plain accumulator so the trip cap is what declines). */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);   /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);   /* 1 acc=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(17, I32));     /* 2 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 3 exit */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(1, I32)); /* 4 acc++ */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32)); /* 5 i++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE);              /* 6 back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                      /* 7 */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                      /* 8 exit target */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I32), UTB_NONE);    /* 9 read acc */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* seed-589 shape: a backward JUMP that is NOT a dominance-verified back-edge
+ * (a switch case body laid out before its dispatch; the dispatch jumps
+ * backward into the case, which does not dominate the dispatch).  The legacy
+ * range-scan detector flagged this as a loop; the SSA driver produces no
+ * dominance-verified candidate, so nothing is folded. */
+UT_TEST(test_lcs_ssa_seed589_switch_backjump_no_candidate)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);  /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(4, I32), UTB_NONE, UTB_NONE);           /* 1 skip to dispatch */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(100, I32), UTB_NONE); /* 2 case body */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(6, I32), UTB_NONE, UTB_NONE);           /* 3 case done */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(0, I32));     /* 4 dispatch */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(2, I32), utb_imm(TOK_EQ, I32), UTB_NONE); /* 5 back into case */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);            /* 6 */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 0);
+  /* Nothing NOPed: the case body and dispatch are untouched. */
+  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, 5), TCCIR_OP_JUMPIF);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* seed-2426 shape: a guard's else arm laid out between the header and the
+ * rotated body sits inside the flat member span but is not a member block.
+ * The legacy rotated-range extension absorbed and NOPed it; the SSA driver's
+ * contiguity fact declines the whole loop structurally. */
+UT_TEST(test_lcs_ssa_seed2426_nonmember_in_span_declines)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);   /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(4, I32));      /* 1 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 2 exit->else arm */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(6, I32), UTB_NONE, UTB_NONE);            /* 3 then -> body */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(99, I32), UTB_NONE);  /* 4 ELSE arm (non-member) */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(8, I32), UTB_NONE, UTB_NONE);            /* 5 else -> end */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32)); /* 6 body i++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);            /* 7 back-edge */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);             /* 8 end */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 0);
+  /* The else arm survives (not NOPed by an absorbed-tail extension). */
+  UT_ASSERT_EQ(utb_op(ir, 4), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 4)), 99);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Jump from outside into a non-header member block violates single-entry (the
+ * header no longer dominates the body) -> declines. */
+UT_TEST(test_lcs_ssa_side_entry_into_body_declines)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);   /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(5, I32), UTB_NONE, UTB_NONE);            /* 1 side-entry into body */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(4, I32));      /* 2 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 3 exit=8 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(10, I32)); /* 4 acc+=10 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 5 i++ (side-entry target) */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE);            /* 6 back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                    /* 7 */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);             /* 8 exit target */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 5), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Nested loop: the outer candidate simulates through the inner back-edge as
+ * internal control flow; the inner loop is not separately processed (outermost
+ * filter).  for(i=0;i<3;i++) for(j=0;j<2;j++) acc++ -> acc=6. */
+UT_TEST(test_lcs_ssa_nested_outer_folds_inner_not_separate)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);   /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);   /* 1 acc=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(3, I32));      /* 2 outer header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(13, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 3 outer exit=13 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(2, I32), utb_imm(0, I32), UTB_NONE);   /* 4 j=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(2, I32), utb_imm(2, I32));      /* 5 inner header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(10, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 6 inner exit=10 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(1, I32)); /* 7 acc++ */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(2, I32), utb_var(2, I32), utb_imm(1, I32)); /* 8 j++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(5, I32), UTB_NONE, UTB_NONE);            /* 9 inner back-edge */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32)); /* 10 i++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE);            /* 11 outer back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                    /* 12 */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                    /* 13 outer exit target */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I32), UTB_NONE);  /* 14 read acc */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 1);
+
+  int a = find_assign_to_var(ir, 1);
+  UT_ASSERT(a >= 0);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, a)), 6);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 24), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Two-loop cascade: loop B consumes loop A's residual across driver rounds
+ * with no interleaved cleanup.  A: acc=40; B seeds acc=40, adds 3*100 -> 340. */
+UT_TEST(test_lcs_ssa_cascade_two_loops)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);   /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);   /* 1 acc=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(4, I32));      /* 2 A header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 3 A exit=8 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(10, I32)); /* 4 acc+=10 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 5 i++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE);               /* 6 A back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                       /* 7 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(2, I32), utb_imm(0, I32), UTB_NONE);   /* 8 k=0 (A exit target) */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(2, I32), utb_imm(3, I32));      /* 9 B header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(15, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 10 B exit=15 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(100, I32)); /* 11 acc+=100 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(2, I32), utb_var(2, I32), utb_imm(1, I32));   /* 12 k++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(9, I32), UTB_NONE, UTB_NONE);               /* 13 B back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                       /* 14 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I32), UTB_NONE);     /* 15 read acc */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  /* One fold per round: A in round 1, B in round 2 -> 2 total. */
+  UT_ASSERT_EQ(changes, 2);
+
+  int a = find_assign_to_var(ir, 1);
+  UT_ASSERT(a >= 0);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, a)), 340);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 24), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Quality: three independent (disjoint) loops all fold in a single driver
+ * call.  Outermost natural loops have disjoint spans, so the driver folds every
+ * one per CFG build rather than one-per-round — no artificial cap on how many
+ * loops a function may collapse.  acc1=40, acc2=300, acc3=5. */
+UT_TEST(test_lcs_ssa_three_independent_loops_fold)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 8);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);   /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);   /* 1 acc1=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(4, I32));      /* 2 L1 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 3 exit=8 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(10, I32)); /* 4 acc1+=10 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 5 i++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE);               /* 6 L1 back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                       /* 7 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(2, I32), utb_imm(0, I32), UTB_NONE);   /* 8 j=0 (L1 exit) */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(3, I32), utb_imm(0, I32), UTB_NONE);   /* 9 acc2=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(2, I32), utb_imm(3, I32));      /* 10 L2 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(16, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 11 exit=16 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(3, I32), utb_var(3, I32), utb_imm(100, I32)); /* 12 acc2+=100 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(2, I32), utb_var(2, I32), utb_imm(1, I32));   /* 13 j++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(10, I32), UTB_NONE, UTB_NONE);              /* 14 L2 back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                       /* 15 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(4, I32), utb_imm(0, I32), UTB_NONE);   /* 16 k=0 (L2 exit) */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(5, I32), utb_imm(0, I32), UTB_NONE);   /* 17 acc3=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(4, I32), utb_imm(5, I32));      /* 18 L3 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(24, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 19 exit=24 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(5, I32), utb_var(5, I32), utb_imm(1, I32));  /* 20 acc3+=1 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(4, I32), utb_var(4, I32), utb_imm(1, I32));  /* 21 k++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(18, I32), UTB_NONE, UTB_NONE);              /* 22 L3 back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                       /* 23 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I32), UTB_NONE);  /* 24 read acc1 (L3 exit) */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_var(3, I32), UTB_NONE);  /* 25 read acc2 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_var(5, I32), UTB_NONE);  /* 26 read acc3 */
+
+  int changes = ssa_opt_loop_const_sim(ir);
+  UT_ASSERT_EQ(changes, 3);
+
+  int a1 = find_assign_to_var(ir, 1), a2 = find_assign_to_var(ir, 3),
+      a3 = find_assign_to_var(ir, 5);
+  UT_ASSERT(a1 >= 0 && a2 >= 0 && a3 >= 0);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, a1)), 40);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, a2)), 300);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, a3)), 5);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 24), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Idempotency: the driver's own output holds no back-edge, so a second run
+ * finds nothing. */
+UT_TEST(test_lcs_ssa_idempotent)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_alloc_var_intervals(ir, 4);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);   /* 0 i=0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);   /* 1 acc=0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(4, I32));      /* 2 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 3 exit */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(10, I32)); /* 4 acc+=10 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 5 i++ */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE);               /* 6 back-edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                       /* 7 */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                       /* 8 exit target */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(1, I32), UTB_NONE);     /* 9 read acc */
+
+  UT_ASSERT_EQ(ssa_opt_loop_const_sim(ir), 1);
+  UT_ASSERT_EQ(ssa_opt_loop_const_sim(ir), 0);
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
 
   utb_free(ir);
@@ -784,4 +1231,20 @@ UT_SUITE(opt_loop_const_sim)
   UT_RUN(test_lcs_memory_loop_idempotent_noop);
   UT_RUN(test_lcs_lea_indirect_store_blocks_fold);
   UT_RUN(test_lcs_zero_trip_store_loop_blocks_fold);
+
+  /* ssa_opt_loop_const_sim (CFG/dominator-driven driver) */
+  UT_RUN(test_lcs_ssa_accumulator_top_tested_folds);
+  UT_RUN(test_lcs_ssa_bottom_tested_folds);
+  UT_RUN(test_lcs_ssa_int32_overflow_wraps);
+  UT_RUN(test_lcs_ssa_narrow_unsigned_residual);
+  UT_RUN(test_lcs_ssa_store_in_body_declines);
+  UT_RUN(test_lcs_ssa_addrtaken_var_declines);
+  UT_RUN(test_lcs_ssa_trip_over_max_declines);
+  UT_RUN(test_lcs_ssa_seed589_switch_backjump_no_candidate);
+  UT_RUN(test_lcs_ssa_seed2426_nonmember_in_span_declines);
+  UT_RUN(test_lcs_ssa_side_entry_into_body_declines);
+  UT_RUN(test_lcs_ssa_nested_outer_folds_inner_not_separate);
+  UT_RUN(test_lcs_ssa_cascade_two_loops);
+  UT_RUN(test_lcs_ssa_three_independent_loops_fold);
+  UT_RUN(test_lcs_ssa_idempotent);
 }

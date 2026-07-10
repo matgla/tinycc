@@ -74,6 +74,13 @@ typedef struct {
   /* Loop info (lazily computed) for back-edge-aware stack-load resolution. */
   IRLoops *loops;
   int loops_done;
+  /* Escaped stack ranges (lazily computed): frame offsets whose address is
+   * passed to a call or stored as a value; a call can only write those. */
+  struct { int lo, hi; } *esc;
+  int esc_count;
+  int esc_cap;
+  int esc_done;
+  int esc_all;
 } SCCPState;
 
 static SCCPCell *sccp_cell(SCCPState *s, int32_t vreg)
@@ -299,6 +306,203 @@ static int sccp_store_may_escape(IRSSAOptCtx *ctx, IRQuadCompact *sq)
  * matches load_btype.  Returns SCCP_CONST with *out set, SCCP_BOTTOM if a
  * potentially-aliasing store was hit before finding a match, or SCCP_TOP
  * if the block was scanned to its start with no aliasing/matching store. */
+static void sccp_esc_add(SCCPState *s, int lo, int hi)
+{
+  if (s->esc_count >= s->esc_cap) {
+    s->esc_cap = s->esc_cap ? s->esc_cap * 2 : 8;
+    s->esc = tcc_realloc(s->esc, s->esc_cap * sizeof(*s->esc));
+  }
+  s->esc[s->esc_count].lo = lo;
+  s->esc[s->esc_count].hi = hi;
+  s->esc_count++;
+}
+
+enum { ESC_SAFE, ESC_ESCAPE, ESC_FLOOD };
+
+/* How instruction `op` treats an address VALUE sitting in operand `role`
+ * (0=src1, 1=src2/accum, 2=dest-as-base).  ESC_FLOOD: the address flows into
+ * the instruction's dest. */
+static int sccp_esc_classify(TccIrOp op, int role, int dest_is_lval)
+{
+  switch (op) {
+  case TCCIR_OP_FUNCPARAMVAL:
+  case TCCIR_OP_FUNCPARAMVOID:
+  case TCCIR_OP_RETURNVALUE:
+    return ESC_ESCAPE;
+  case TCCIR_OP_STORE:
+    if (role == 2)
+      return ESC_SAFE;
+    return dest_is_lval ? ESC_ESCAPE : ESC_FLOOD;
+  case TCCIR_OP_STORE_INDEXED:
+  case TCCIR_OP_STORE_POSTINC:
+    return role == 2 ? ESC_SAFE : ESC_ESCAPE;
+  case TCCIR_OP_LOAD_INDEXED:
+  case TCCIR_OP_LOAD_POSTINC:
+    return role == 0 ? ESC_SAFE : ESC_ESCAPE;
+  case TCCIR_OP_BLOCK_COPY:
+    return ESC_SAFE;
+  case TCCIR_OP_CMP:
+  case TCCIR_OP_TEST_ZERO:
+    return ESC_SAFE;
+  default:
+    return ESC_FLOOD;
+  }
+}
+
+/* Follow a frame address held in TEMP `vr` through its use chain; record
+ * [lo,hi) as escaped at any consumer a callee could obtain the pointer from.
+ * Anything untrackable (VAR/PARAM vreg, phi) poisons the whole frame. */
+static void sccp_esc_flood(SCCPState *s, int32_t vr, int lo, int hi,
+                           uint8_t *visited, int depth)
+{
+  TCCIRState *ir = s->ctx->ir;
+  if (depth > 128) {
+    s->esc_all = 1;
+    return;
+  }
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP) {
+    s->esc_all = 1;
+    return;
+  }
+  IRSSAVregInfo *vi = ssa_opt_vinfo(s->ctx, vr);
+  int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  if (!vi) {
+    s->esc_all = 1;
+    return;
+  }
+  if (visited[pos])
+    return;
+  visited[pos] = 1;
+  for (int u = 0; u < vi->use_count && !s->esc_all; u++) {
+    if (vi->uses[u].kind != SSA_USE_INSTR) {
+      sccp_esc_add(s, lo, hi);
+      continue;
+    }
+    IRQuadCompact *q = &ir->compact_instructions[vi->uses[u].idx];
+    TccIrOp op = q->op;
+    if (op == TCCIR_OP_NOP)
+      continue;
+    IROperand dest = irop_config[op].has_dest ? tcc_ir_op_get_dest(ir, q)
+                                              : IROP_NONE;
+    int roles[3] = { -1, -1, -1 };
+    int nroles = 0;
+    if (irop_config[op].has_src1) {
+      IROperand o = tcc_ir_op_get_src1(ir, q);
+      if (o.tag == IROP_TAG_VREG && !o.is_lval && irop_get_vreg(o) == vr)
+        roles[nroles++] = 0;
+    }
+    if (irop_config[op].has_src2) {
+      IROperand o = tcc_ir_op_get_src2(ir, q);
+      if (o.tag == IROP_TAG_VREG && !o.is_lval && irop_get_vreg(o) == vr)
+        roles[nroles++] = 1;
+    }
+    if (op == TCCIR_OP_MLA) {
+      IROperand o = tcc_ir_op_get_accum(ir, q);
+      if (o.tag == IROP_TAG_VREG && !o.is_lval && irop_get_vreg(o) == vr)
+        roles[nroles++] = 1;
+    }
+    if (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED ||
+        op == TCCIR_OP_STORE_POSTINC) {
+      if (dest.tag == IROP_TAG_VREG && irop_get_vreg(dest) == vr)
+        roles[nroles++] = 2;
+    }
+    for (int r = 0; r < nroles; r++) {
+      int act = sccp_esc_classify(op, roles[r], dest.is_lval);
+      if (act == ESC_ESCAPE) {
+        sccp_esc_add(s, lo, hi);
+      } else if (act == ESC_FLOOD) {
+        if (!irop_config[op].has_dest) {
+          sccp_esc_add(s, lo, hi);
+          continue;
+        }
+        sccp_esc_flood(s, irop_get_vreg(dest), lo, hi, visited, depth + 1);
+      }
+    }
+  }
+}
+
+/* Whether [load_lo, load_hi) lies in a frame range whose address escapes —
+ * i.e. a callee could hold a pointer to it.  Computed once per SCCP run by
+ * tainting every Addr[StackLoc] materialisation through its TEMP use chains.
+ * SCCP_OBJ_BOUND caps how far the containing object extends past the base. */
+static int sccp_slot_addr_escapes(SCCPState *s, int load_lo, int load_hi)
+{
+  enum { SCCP_OBJ_BOUND = 4096 };
+  TCCIRState *ir = s->ctx->ir;
+  if (!s->esc_done) {
+    s->esc_done = 1;
+    uint8_t *visited = tcc_mallocz(s->ctx->vinfo_cap ? s->ctx->vinfo_cap : 1);
+    for (int i = 0; i < ir->next_instruction_index && !s->esc_all; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      TccIrOp op = q->op;
+      if (op == TCCIR_OP_NOP)
+        continue;
+      if (op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_ASM_INPUT ||
+          op == TCCIR_OP_ASM_OUTPUT || op == TCCIR_OP_SETJMP ||
+          op == TCCIR_OP_NL_SETJMP || op == TCCIR_OP_VLA_ALLOC ||
+          op == TCCIR_OP_LEA) {
+        s->esc_all = 1;
+        break;
+      }
+      IROperand dest = irop_config[op].has_dest ? tcc_ir_op_get_dest(ir, q)
+                                                : IROP_NONE;
+      IROperand ops[3];
+      int roles[3];
+      int nops = 0;
+      if (irop_config[op].has_src1) {
+        ops[nops] = tcc_ir_op_get_src1(ir, q);
+        roles[nops++] = 0;
+      }
+      if (irop_config[op].has_src2) {
+        ops[nops] = tcc_ir_op_get_src2(ir, q);
+        roles[nops++] = 1;
+      }
+      if (op == TCCIR_OP_MLA) {
+        ops[nops] = tcc_ir_op_get_accum(ir, q);
+        roles[nops++] = 1;
+      }
+      for (int k = 0; k < nops && !s->esc_all; k++) {
+        IROperand o = ops[k];
+        if (o.is_lval || !o.is_local)
+          continue;
+        if (o.tag != IROP_TAG_STACKOFF || irop_get_vreg(o) != -1) {
+          /* spill-encoded &VAR or unknown local encoding — untrackable */
+          s->esc_all = 1;
+          break;
+        }
+        int lo = irop_get_stack_offset(o);
+        int hi = lo + SCCP_OBJ_BOUND;
+        int act = sccp_esc_classify(op, roles[k], dest.is_lval);
+        if (act == ESC_ESCAPE) {
+          sccp_esc_add(s, lo, hi);
+        } else if (act == ESC_FLOOD) {
+          if (!irop_config[op].has_dest) {
+            sccp_esc_add(s, lo, hi);
+          } else {
+            /* Fresh visited set per seed: a temp reachable from two seeds
+             * must record escapes for both ranges. */
+            memset(visited, 0, s->ctx->vinfo_cap ? s->ctx->vinfo_cap : 1);
+            sccp_esc_flood(s, irop_get_vreg(dest), lo, hi, visited, 0);
+          }
+        }
+      }
+      /* Direct Addr[StackLoc] as an indexed-store/postinc base (dest slot). */
+      if (!s->esc_all &&
+          (op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_STORE_POSTINC) &&
+          !dest.is_lval && dest.is_local &&
+          !(dest.tag == IROP_TAG_STACKOFF && irop_get_vreg(dest) == -1))
+        s->esc_all = 1;
+    }
+    tcc_free(visited);
+  }
+  if (s->esc_all)
+    return 1;
+  for (int e = 0; e < s->esc_count; e++)
+    if (s->esc[e].hi > load_lo && load_hi > s->esc[e].lo)
+      return 1;
+  return 0;
+}
+
 static int sccp_scan_block_for_stack_store(SCCPState *s, IRBasicBlock *bb,
                                            int start_idx, int soff,
                                            int load_btype, int64_t *out,
@@ -312,8 +516,12 @@ static int sccp_scan_block_for_stack_store(SCCPState *s, IRBasicBlock *bb,
     IRQuadCompact *sq = &ir->compact_instructions[si];
     if (sq->op == TCCIR_OP_NOP)
       continue;
-    if (sq->op == TCCIR_OP_FUNCCALLVOID || sq->op == TCCIR_OP_FUNCCALLVAL)
-      return SCCP_BOTTOM;
+    if (sq->op == TCCIR_OP_FUNCCALLVOID || sq->op == TCCIR_OP_FUNCCALLVAL) {
+      /* A call only clobbers slots whose address escaped to callees. */
+      if (sccp_slot_addr_escapes(s, load_lo, load_hi))
+        return SCCP_BOTTOM;
+      continue;
+    }
     if (sq->op == TCCIR_OP_STORE_POSTINC)
       return SCCP_BOTTOM;  /* writes to memory + updates pointer */
     if (sq->op == TCCIR_OP_STORE_INDEXED || sq->op == TCCIR_OP_STORE) {
@@ -394,8 +602,12 @@ static int sccp_no_aliasing_between(SCCPState *s, int store_idx, int load_idx,
     TccIrOp op = q->op;
     if (op == TCCIR_OP_NOP)
       continue;
-    if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL)
-      return 0;
+    if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL) {
+      /* A call only clobbers slots whose address escaped to callees. */
+      if (sccp_slot_addr_escapes(s, load_lo, load_hi))
+        return 0;
+      continue;
+    }
     if (op == TCCIR_OP_BLOCK_COPY)
       return 0;
     if (op != TCCIR_OP_STORE && op != TCCIR_OP_STORE_INDEXED &&
@@ -1196,9 +1408,7 @@ static void sccp_visit_instr(SCCPState *s, int idx)
      * constant (e.g. `x & (y<<7)` folded as `x & y`), so force it to BOTTOM — the
      * same guard GVN already uses (ssa_opt_gvn.c).  Random-C O1 wrong-code,
      * seed 215. */
-    if (ir->barrel_shifts && q->orig_index >= 0 &&
-        q->orig_index <= ir->max_orig_index &&
-        ir->barrel_shifts[q->orig_index]) {
+    if (tcc_ir_barrel_shift_at(ir, q)) {
       if (sccp_set_bottom(dest_cell))
         sccp_add_ssa(s, TCCIR_DECODE_VREG_POSITION(dest_vr));
       goto handle_control_flow;
@@ -1899,6 +2109,7 @@ int ssa_opt_sccp(IRSSAOptCtx *ctx)
   tcc_free(s.cfg_wl);
   tcc_free(s.ssa_wl);
   tcc_free(s.mem_deps);
+  tcc_free(s.esc);
   if (s.loops)
     tcc_ir_free_loops(s.loops);
 

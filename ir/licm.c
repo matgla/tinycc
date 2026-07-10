@@ -2319,6 +2319,16 @@ int tcc_ir_opt_licm(TCCIRState *ir)
   return hoisted;
 }
 
+/* ssa:licm regalloc-time driver: runs the proven LICM engine on flat IR in the
+ * ssa: region, before ssa:iv_strength_reduction (docs/plan_legacy_loop_licm_ssa.md). */
+int ssa_opt_licm(TCCIRState *ir)
+{
+  IRLoops *loops = tcc_ir_opt_licm_ex(ir);
+  int changed = loops != NULL;
+  tcc_ir_free_loops(loops);
+  return changed;
+}
+
 static IRLoops * tcc_ir_opt_licm_ex__timed(TCCIRState *ir);
 IRLoops * tcc_ir_opt_licm_ex(TCCIRState *ir)
 {
@@ -2655,6 +2665,38 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
             }
             if (has_switch) {
               LOG_LICM("dom-LICM: skipping — function has SWITCH_TABLE");
+              tcc_free(is_invariant);
+              tcc_free(is_exit);
+              tcc_free(def_count);
+              tcc_free(in_loop);
+              tcc_free(worklist);
+              continue;
+            }
+          }
+
+          /* When the preheader ends in a jump, insert_pos lands strictly BEFORE
+           * the header (in the preheader body).  A branch that targets that
+           * position bypasses the hoist: insert_instruction_before renumbers a
+           * jump whose target == insert_pos to insert_pos+1, so the edge skips
+           * the inserted instruction and enters the loop with the hoisted value
+           * undefined.  This arises when the preheader is a bare jump block a
+           * sibling branch jumps straight into (e.g. a switch-dispatch-at-bottom
+           * whose backward arm makes a spurious loop; jump_threading normally
+           * re-canonicalizes the CFG and hides it).  When insert_pos == header
+           * start there is no such hazard: the header's own back-edge targets it
+           * and is renumbered consistently, so the hoist still dominates the
+           * (shifted) header via preheader fall-through. */
+          if (insert_pos < cfg->blocks[h].start_idx) {
+            int insert_targeted = 0;
+            for (int j = 0; j < ir->next_instruction_index && !insert_targeted; j++) {
+              IRQuadCompact *jq = &ir->compact_instructions[j];
+              if (jq->op != TCCIR_OP_JUMP && jq->op != TCCIR_OP_JUMPIF)
+                continue;
+              if ((int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq)) == insert_pos)
+                insert_targeted = 1;
+            }
+            if (insert_targeted) {
+              LOG_LICM("dom-LICM: skipping — insert_pos %d is a branch target", insert_pos);
               tcc_free(is_invariant);
               tcc_free(is_exit);
               tcc_free(def_count);

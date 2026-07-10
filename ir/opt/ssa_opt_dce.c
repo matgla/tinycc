@@ -11,9 +11,11 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "ssa_opt.h"
+#include "opt_dsl_phi.h"
 #include <limits.h>
 
 extern int tcc_ir_opt_pass_disabled(const char *name);
+extern int tcc_ir_callee_is_noreturn(struct Sym *callee);
 
 static int dce_temp_worklist(IRSSAOptCtx *ctx)
 {
@@ -88,46 +90,86 @@ static int dce_temp_worklist(IRSSAOptCtx *ctx)
   return changes;
 }
 
+/* Transitive CFG reachability from entry: NOP any instruction unreachable
+ * through jumps/branches/switch targets/fall-through.  Runs at every -O level
+ * (GCC removes unreachable code even at -O0), so it must catch labeled blocks
+ * whose only predecessors are themselves unreachable — a linear post-terminator
+ * sweep can't.  Ported from the flat tcc_ir_opt_dce reachability walk. */
 static int dce_unreachable(IRSSAOptCtx *ctx)
 {
   TCCIRState *ir = ctx->ir;
   int n = ir->next_instruction_index;
-  int changes = 0;
-  int has_indirect = 0;
+  if (n == 0)
+    return 0;
 
-  uint8_t *is_target = tcc_mallocz((n + 7) / 8);
-  for (int i = 0; i < n; i++) {
+  /* IJUMP targets are runtime-computed; reachability can't be proven. */
+  for (int i = 0; i < n; i++)
+    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
+      return 0;
+
+  uint8_t *reach = tcc_mallocz((n + 7) / 8);
+  int *wl = tcc_malloc(n * sizeof(int));
+  int head = 0, tail = 0;
+#define DCE_MARK(idx)                                                                                                   \
+  do {                                                                                                                  \
+    int _i = (idx);                                                                                                     \
+    if (_i >= 0 && _i < n && !(reach[_i / 8] & (1 << (_i % 8)))) {                                                      \
+      reach[_i / 8] |= (1 << (_i % 8));                                                                                 \
+      wl[tail++] = _i;                                                                                                  \
+    }                                                                                                                   \
+  } while (0)
+
+  DCE_MARK(0);
+  while (head < tail) {
+    int i = wl[head++];
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE) {
-      has_indirect = 1;
+    switch (q->op) {
+    case TCCIR_OP_JUMP:
+      DCE_MARK((int)tcc_ir_op_get_dest(ir, q).u.imm32);
+      break;
+    case TCCIR_OP_JUMPIF:
+      DCE_MARK((int)tcc_ir_op_get_dest(ir, q).u.imm32);
+      DCE_MARK(i + 1);
+      break;
+    case TCCIR_OP_SWITCH_TABLE: {
+      int tid = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      if (tid >= 0 && tid < ir->num_switch_tables) {
+        TCCIRSwitchTable *t = &ir->switch_tables[tid];
+        for (int j = 0; j < t->num_entries; j++)
+          DCE_MARK(t->targets[j]);
+        DCE_MARK(t->default_target);
+      }
       break;
     }
-    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = dest.u.imm32;
-      if (target >= 0 && target < n)
-        is_target[target / 8] |= (1 << (target % 8));
+    case TCCIR_OP_RETURNVALUE:
+    case TCCIR_OP_RETURNVOID:
+    case TCCIR_OP_TRAP:
+      break;
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID: {
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      if (!tcc_ir_callee_is_noreturn(callee))
+        DCE_MARK(i + 1);
+      break;
+    }
+    default:
+      DCE_MARK(i + 1);
+      break;
     }
   }
-  if (!has_indirect) {
-    int dead = 0;
-    for (int i = 0; i < n; i++) {
-      if (is_target[i / 8] & (1 << (i % 8)))
-        dead = 0;
-      IRQuadCompact *q = &ir->compact_instructions[i];
-      if (dead && q->op != TCCIR_OP_NOP) {
-        ssa_opt_nop_instr(ctx, i);
-        changes++;
-        continue;
-      }
-      if (q->op == TCCIR_OP_NOP)
-        continue;
-      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_RETURNVALUE ||
-          q->op == TCCIR_OP_RETURNVOID)
-        dead = 1;
-    }
+#undef DCE_MARK
+
+  int changes = 0;
+  for (int i = 0; i < n; i++) {
+    if (reach[i / 8] & (1 << (i % 8)))
+      continue;
+    if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
+      continue;
+    ssa_opt_nop_instr(ctx, i);
+    changes++;
   }
-  tcc_free(is_target);
+  tcc_free(reach);
+  tcc_free(wl);
   return changes;
 }
 
@@ -453,7 +495,10 @@ static void sl_mark_op(TCCIRState *ir, uint8_t *bm, IROperand op,
   int64_t off;
   sl_get_offset(ir, op, &sym, &off);
   if (op.is_lval) {
-    int w = (irop_get_btype(op) == IROP_BTYPE_STRUCT) ? 0 : sl_access_width(op);
+    /* Complex lval reads cover real+imag, not just the component btype. */
+    int w = (irop_get_btype(op) == IROP_BTYPE_STRUCT || op.is_complex)
+                ? 0
+                : sl_access_width(op);
     if (w > 0)
       sl_mark_read(bm, sym, off, w);
     else
@@ -476,6 +521,60 @@ static int sl_temp_has_live_uses(IRSSAOptCtx *ctx, int32_t vreg)
       return 1;
   }
   return 0;
+}
+
+/* Orphaned FUNCPARAM elimination: NOP FUNCPARAMVAL/FUNCPARAMVOID whose call_id
+ * has no matching (live) FUNCCALLVAL/FUNCCALLVOID.  Left behind when a call is
+ * inlined away — the sret-buffer address param survives and range-marks the
+ * whole frame as escaped, blocking dead-stackloc-store elimination (torture
+ * 20020920-1: inlined f() leaves PARAM0 Addr[StackLoc], pinning 13 dead stores). */
+static int dce_orphan_params(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  int n = ir->next_instruction_index;
+  int max_cid = 0, saw_param = 0;
+  for (int i = 0; i < n; i++) {
+    int op = ir->compact_instructions[i].op;
+    if (op != TCCIR_OP_FUNCPARAMVAL && op != TCCIR_OP_FUNCPARAMVOID &&
+        op != TCCIR_OP_FUNCCALLVAL && op != TCCIR_OP_FUNCCALLVOID)
+      continue;
+    if (op == TCCIR_OP_FUNCPARAMVAL || op == TCCIR_OP_FUNCPARAMVOID)
+      saw_param = 1;
+    int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(
+        ir, tcc_ir_op_get_src2(ir, &ir->compact_instructions[i])));
+    if (cid > max_cid)
+      max_cid = cid;
+  }
+  if (!saw_param || max_cid <= 0)
+    return 0;
+
+  int nbytes = (max_cid / 8) + 1;
+  uint8_t *has_call = tcc_mallocz(nbytes);
+  for (int i = 0; i < n; i++) {
+    int op = ir->compact_instructions[i].op;
+    if (op != TCCIR_OP_FUNCCALLVAL && op != TCCIR_OP_FUNCCALLVOID)
+      continue;
+    int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(
+        ir, tcc_ir_op_get_src2(ir, &ir->compact_instructions[i])));
+    if (cid >= 0 && cid <= max_cid)
+      has_call[cid / 8] |= (uint8_t)(1 << (cid % 8));
+  }
+
+  int changes = 0;
+  for (int i = 0; i < n; i++) {
+    int op = ir->compact_instructions[i].op;
+    if (op != TCCIR_OP_FUNCPARAMVAL && op != TCCIR_OP_FUNCPARAMVOID)
+      continue;
+    int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(
+        ir, tcc_ir_op_get_src2(ir, &ir->compact_instructions[i])));
+    if (cid < 0 || cid > max_cid ||
+        !(has_call[cid / 8] & (1 << (cid % 8)))) {
+      ssa_opt_nop_instr(ctx, i);
+      changes++;
+    }
+  }
+  tcc_free(has_call);
+  return changes;
 }
 
 static int dce_dead_stackloc_stores(IRSSAOptCtx *ctx)
@@ -547,14 +646,8 @@ static int dce_dead_stackloc_stores(IRSSAOptCtx *ctx)
             goto skip_src1;
         }
       }
-      if (q->op == TCCIR_OP_FUNCPARAMVAL ||
-          q->op == TCCIR_OP_FUNCPARAMVOID) {
-        if (sl_is_anon_stackloc(s)) {
-          IROperand sr = s;
-          sr.is_lval = 0;
-          sl_mark_op(ir, sl_read, sr, min_off, max_off);
-        }
-      }
+      /* FUNCPARAM scalar lval src is a by-value slot read; sl_mark_op already
+       * range-escapes non-lval (address) and struct-typed param sources. */
       sl_mark_op(ir, sl_read, s, min_off, max_off);
     skip_src1:;
     }
@@ -605,6 +698,94 @@ static int dce_dead_stackloc_stores(IRSSAOptCtx *ctx)
 #undef SL_HASH
 #undef SL_SET
 #undef SL_TEST
+
+/* Operand is a read that can't touch frame memory: immediate, or a non-lval
+ * TEMP vreg.  VAR/PARAM vregs share storage with their home slot — for an
+ * address-taken one, a store through its address redefines the value the
+ * vreg read observes (pr85095 `__builtin_add_overflow(a, b, &a); return a+i`). */
+static int dce_ret_op_is_pure_read(TCCIRState *ir, IROperand op)
+{
+  (void)ir;
+  if (op.is_lval)
+    return 0;
+  if (op.tag != IROP_TAG_VREG)
+    return 1;
+  int32_t vr = irop_get_vreg(op);
+  return vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP;
+}
+
+/* Return-path frame-store DSE: a STORE to local frame memory (direct anon
+ * StackLoc, or *TEMP resolving to a frame slot) followed only by pure
+ * non-memory ops until RETURN is unobservable — the frame dies at return,
+ * so even an escaped address cannot legally read it afterwards.  Catches the
+ * bitfield write-back left dead once load_cse forwards its re-read
+ * (20040709-2 fn1* after ssa:struct_copy_roundtrip). */
+static int dce_ret_path_frame_store(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  /* Static chain: a nested function's "frame" store may resolve to the
+   * PARENT's live frame (pr22061-3 `N += 4` through sl) — skip entirely,
+   * like dce_dead_stackloc_stores. */
+  if (ir->has_static_chain)
+    return 0;
+  for (int i = 0; i < n; i++) {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT)
+      return 0;
+  }
+
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_STORE)
+      continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (!dest.is_lval || dest.is_llocal)
+      continue;
+    int frame_slot = 0;
+    if (dest.is_local && irop_get_vreg(dest) < 0) {
+      frame_slot = 1;
+    } else if (!dest.is_local && !dest.is_sym && dest.tag == IROP_TAG_VREG) {
+      int32_t pvr = irop_get_vreg(dest);
+      if (pvr >= 0 && TCCIR_DECODE_VREG_TYPE(pvr) == TCCIR_VREG_TYPE_TEMP &&
+          ssa_opt_resolve_lea_stackloc(ctx, pvr) != INT_MIN)
+        frame_slot = 1;
+    }
+    if (!frame_slot)
+      continue;
+
+    int dead = 0;
+    for (int j = i + 1; j < n; j++) {
+      IRQuadCompact *jq = &ir->compact_instructions[j];
+      if (jq->op == TCCIR_OP_NOP)
+        continue;
+      if (jq->op == TCCIR_OP_RETURNVOID) {
+        dead = 1;
+        break;
+      }
+      if (jq->op == TCCIR_OP_RETURNVALUE) {
+        dead = dce_ret_op_is_pure_read(ir, tcc_ir_op_get_src1(ir, jq));
+        break;
+      }
+      if (ssa_opt_has_side_effects(jq->op) || jq->op == TCCIR_OP_LOAD ||
+          jq->op == TCCIR_OP_LOAD_INDEXED || jq->op == TCCIR_OP_LOAD_POSTINC ||
+          jq->op == TCCIR_OP_SELECT)
+        break;
+      if ((irop_config[jq->op].has_src1 && !dce_ret_op_is_pure_read(ir, tcc_ir_op_get_src1(ir, jq))) ||
+          (irop_config[jq->op].has_src2 && !dce_ret_op_is_pure_read(ir, tcc_ir_op_get_src2(ir, jq))))
+        break;
+      if (jq->op == TCCIR_OP_MLA && !dce_ret_op_is_pure_read(ir, tcc_ir_op_get_accum(ir, jq)))
+        break;
+    }
+    if (dead) {
+      ssa_opt_nop_instr(ctx, i);
+      changes++;
+    }
+  }
+  return changes;
+}
 
 static int ssa_dce_block_in_backedge_region(IRCFG *cfg, int block)
 {
@@ -764,16 +945,10 @@ static int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
               fprintf(stderr, " %d", phi->operands[pi].vreg);
             fprintf(stderr, "\n");
           }
-          for (int pi = 0; pi < phi->num_operands; pi++) {
-            IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, phi->operands[pi].vreg);
-            if (vi && vi->use_count > 0)
-              vi->use_count--;
+          if (!opt_dsl_phi_remove(ctx, b, pp)) {
+            pp = &phi->next;
+            continue;
           }
-          *pp = phi->next;
-          /* Free the unlinked node — it is no longer reachable from block_phis,
-           * so tcc_ir_ssa_free would otherwise never reclaim it. */
-          tcc_free(phi->operands);
-          tcc_free(phi);
           changes++;
           continue;
         }
@@ -783,13 +958,7 @@ static int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
   }
 
   if (changes) {
-    /* Rebuild the FULL use lists before cascading: the per-operand
-     * use_count-- above operates on counts that may already be stale
-     * (same desync family as ptr seed 7226 — count-only updates let a
-     * live use fall off the tracked list), so the worklist could delete
-     * a def still feeding a LIVE phi (fp_round seed 18960: a loop-carried
-     * copy's def died and out-of-SSA conflated it with its multi-def
-     * source).  Mirrors the rebuild done by the ssa_opt_dce driver. */
+    /* Rebuild before cascading through dead TEMP definitions. */
     for (int p = 0; p < ctx->vinfo_cap; p++)
       ctx->vinfo[p].use_count = 0;
     for (int i = 0; i < ir->next_instruction_index; i++) {
@@ -850,16 +1019,25 @@ static int sl_store_byte_width(int btype)
  * direct STACKOFF with is_lval=1+is_local=1.
  * For STORE_INDEXED: dest is `T_base` (non-lval pointer), with constant
  * index + scale=0; combined via ssa_opt_indirect_stack_offset. */
+/* out_base names the memory object so distinct address-taken locals are not
+ * conflated: -1 = a real anonymous stack slot whose out_off is authoritative;
+ * >=0 = a `&VAR` address whose out_off is only a within-object field offset
+ * shared (placeholder 0) by every distinct VAR (see ssa_opt_resolve_lea_stackloc_ex).
+ * Two stores alias only when their (base, offset) ranges match — matching on
+ * offset alone would fold `*p1=1;*p2=2` (both &VAR at offset 0) into one. */
 static int sl_resolve_store_offset(IRSSAOptCtx *ctx, int instr_idx,
-                                   int *out_off, int *out_width, int *out_unknown)
+                                   int32_t *out_base, int *out_off, int *out_width,
+                                   int *out_unknown)
 {
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *q = &ir->compact_instructions[instr_idx];
   IROperand dest = tcc_ir_op_get_dest(ir, q);
   *out_unknown = 0;
+  *out_base = -1;
 
   if (q->op == TCCIR_OP_STORE_INDEXED) {
-    int eff = ssa_opt_indirect_stack_offset(ctx, q, SSA_OPT_INDIRECT_DEST);
+    int32_t bv = -1;
+    int eff = ssa_opt_indirect_stack_offset_ex(ctx, q, SSA_OPT_INDIRECT_DEST, &bv);
     if (eff == INT_MIN) {
       *out_unknown = 1;
       return 0;
@@ -873,6 +1051,7 @@ static int sl_resolve_store_offset(IRSSAOptCtx *ctx, int instr_idx,
       *out_unknown = 1;
       return 0;
     }
+    *out_base = bv;
     *out_off = eff;
     *out_width = w;
     return 1;
@@ -900,13 +1079,15 @@ static int sl_resolve_store_offset(IRSSAOptCtx *ctx, int instr_idx,
   if (dest.tag == IROP_TAG_VREG && dest.is_lval) {
     int32_t dv = irop_get_vreg(dest);
     if (dv >= 0 && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP) {
-      int eff = ssa_opt_resolve_lea_stackloc(ctx, dv);
+      int32_t bv = -1;
+      int eff = ssa_opt_resolve_lea_stackloc_ex(ctx, dv, &bv);
       if (eff != INT_MIN) {
         int w = sl_store_byte_width(irop_get_btype(dest));
         if (w == 0) {
           *out_unknown = 1;
           return 0;
         }
+        *out_base = bv;
         *out_off = eff;
         *out_width = w;
         return 1;
@@ -1001,7 +1182,7 @@ static int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
     return 0;
 
 #define DOS_PEND_MAX 32
-  typedef struct { int idx; int off; int width; } DosPending;
+  typedef struct { int idx; int32_t base; int off; int width; } DosPending;
 
   for (int b = 0; b < cfg->num_blocks; b++) {
     IRBasicBlock *bb = &cfg->blocks[b];
@@ -1030,6 +1211,10 @@ static int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
        * alias any tracked store — clear pending entirely. */
       int saw_unresolved_deref = 0;
       for (int side = 0; side < 2; side++) {
+        if (side == 0 && !irop_config[q->op].has_src1)
+          continue;
+        if (side == 1 && !irop_config[q->op].has_src2)
+          continue;
         IROperand s = side ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
         if (!s.is_lval)
           continue;
@@ -1089,8 +1274,9 @@ static int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
       /* STORE / STORE_INDEXED handling */
       if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) {
         int so = 0, sw = 0, su = 0;
+        int32_t sbase = -1;
         (void)su;
-        int resolved = sl_resolve_store_offset(ctx, i, &so, &sw, &su);
+        int resolved = sl_resolve_store_offset(ctx, i, &sbase, &so, &sw, &su);
         if (!resolved) {
           /* Unresolved STORE through an external/global pointer: cannot
            * reach our local-stack pending entries (only the caller's stack
@@ -1099,11 +1285,16 @@ static int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
           continue;
         }
 
-        /* Look for an exact same-offset same-width pending store: that one
-         * is dead (overwritten without intervening read).  Also evict any
-         * pending stores that overlap with the new write's range, since
-         * their tracked value is now partially clobbered. */
+        /* Look for an exact same-object same-offset same-width pending store:
+         * that one is dead (overwritten without intervening read).  Also evict
+         * any same-object pending stores that overlap the new write's range,
+         * since their tracked value is now partially clobbered.  Stores to a
+         * different object (base) never alias. */
         for (int k = 0; k < npending;) {
+          if (pending[k].base != sbase) {
+            k++;
+            continue;
+          }
           int po = pending[k].off, pw = pending[k].width;
           if (po == so && pw == sw) {
             /* Exact overwrite — older store is dead. */
@@ -1121,6 +1312,7 @@ static int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
         /* Track this store. */
         if (npending < DOS_PEND_MAX) {
           pending[npending].idx = i;
+          pending[npending].base = sbase;
           pending[npending].off = so;
           pending[npending].width = sw;
           npending++;
@@ -1140,6 +1332,10 @@ static int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
        * read (evict).  Common: BLOCK_COPY/memmove receives a stack address
        * to read from. */
       for (int side = 0; side < 2; side++) {
+        if (side == 0 && !irop_config[q->op].has_src1)
+          continue;
+        if (side == 1 && !irop_config[q->op].has_src2)
+          continue;
         IROperand s = side ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
         if (s.is_lval || s.tag != IROP_TAG_VREG)
           continue;
@@ -1167,6 +1363,591 @@ static int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
   return changes;
 }
 
+/* ============================================================================
+ * Dead-overwrite store elimination for GLOBAL memory (symref targets).
+ *
+ * Companion to dce_dead_overwrite_stores, which only tracks stack slots.  A
+ * `STORE g <- a; STORE g <- b` with no intervening read of `g` makes the
+ * first store dead.  Globals appear either as a direct
+ * `GlobalSym(S)***DEREF***` operand, or — after global_base_share rewrites a
+ * store cluster — as `STORE_INDEXED T,#idx` with `T = GlobalSym(S) (+ #k)`.
+ *
+ * The SSA analog of the legacy flat tcc_ir_opt_store_redundant global path.
+ * Kept as a separate, block-local pass so the validated stack DSE above is
+ * untouched.  Two globals with distinct Sym* never alias; a global never
+ * aliases the stack — so keying every pending entry on (sym, offset) isolates
+ * the classes.  Conservative flushes: any call / side-effecting op (callee may
+ * read globals), any read through an unresolved pointer, and any store through
+ * an unresolved pointer (may alias a tracked global).
+ * ============================================================================ */
+
+/* Resolve a TEMP holding a global address `GlobalSym(S) (+ #k)` — through
+ * single-def ASSIGN/LEA copies and ADD/SUB #imm — to (sym, addend).  Mirrors
+ * ssa_opt_resolve_lea_stackloc but terminates on a non-lval symref source. */
+static int gs_resolve_global_base(IRSSAOptCtx *ctx, int32_t vr,
+                                  const Sym **out_sym, int64_t *out_off)
+{
+  TCCIRState *ir = ctx->ir;
+  int64_t acc = 0;
+  for (int hop = 0; hop < 64; hop++) {
+    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      return 0;
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+    if (!vi || vi->def_instr < 0 || vi->def_count > 1)
+      return 0;
+    IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
+    if (dq->op == TCCIR_OP_LEA || dq->op == TCCIR_OP_ASSIGN ||
+        (dq->op == TCCIR_OP_STORE && !tcc_ir_op_get_dest(ir, dq).is_lval)) {
+      IROperand src = tcc_ir_op_get_src1(ir, dq);
+      if (src.is_sym && !src.is_lval) {
+        IRPoolSymref *sr = irop_get_symref_ex(ir, src);
+        if (!sr || !sr->sym)
+          return 0;
+        *out_sym = sr->sym;
+        *out_off = sr->addend + acc;
+        return 1;
+      }
+      int32_t sv = irop_get_vreg(src);
+      if (sv >= 0 && !src.is_lval && irop_get_tag(src) == IROP_TAG_VREG) {
+        vr = sv;
+        continue;
+      }
+      return 0;
+    }
+    if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB) {
+      IROperand s1 = tcc_ir_op_get_src1(ir, dq);
+      IROperand s2 = tcc_ir_op_get_src2(ir, dq);
+      if (!s1.is_lval && irop_is_immediate(s2)) {
+        int32_t s1vr = irop_get_vreg(s1);
+        if (s1vr >= 0) {
+          int d = irop_get_imm32(s2);
+          acc += (dq->op == TCCIR_OP_ADD) ? d : -d;
+          vr = s1vr;
+          continue;
+        }
+      }
+      return 0;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+typedef struct { const Sym *sym; int64_t off; int width; } GsRef;
+
+/* Classify a memory reference for the GLOBAL table:
+ *   2  -> exact global ref (GsRef fully populated)
+ *   1  -> whole-global range (sym known, offset runtime — GsRef.sym only)
+ *   0  -> not a global access (stack / value-def / immediate — no effect)
+ *  -1  -> unresolved pointer that may alias any global (flush the table)  */
+static int gs_classify_read_op(IRSSAOptCtx *ctx, IROperand s, GsRef *r)
+{
+  if (!s.is_lval)
+    return 0;
+  TCCIRState *ir = ctx->ir;
+  if (s.is_sym) {
+    IRPoolSymref *sr = irop_get_symref_ex(ir, s);
+    if (!sr || !sr->sym)
+      return -1;
+    int w = sl_store_byte_width(irop_get_btype(s));
+    if (w == 0)
+      return -1;
+    r->sym = sr->sym;
+    r->off = sr->addend;
+    r->width = w;
+    return 2;
+  }
+  if (irop_get_tag(s) == IROP_TAG_STACKOFF)
+    return 0;
+  if (irop_get_tag(s) == IROP_TAG_VREG) {
+    int32_t sv = irop_get_vreg(s);
+    if (sv >= 0 && TCCIR_DECODE_VREG_TYPE(sv) == TCCIR_VREG_TYPE_TEMP) {
+      if (ssa_opt_resolve_lea_stackloc(ctx, sv) != INT_MIN)
+        return 0;
+      const Sym *gs;
+      int64_t go;
+      if (gs_resolve_global_base(ctx, sv, &gs, &go)) {
+        int w = sl_store_byte_width(irop_get_btype(s));
+        if (w == 0)
+          return -1;
+        r->sym = gs;
+        r->off = go;
+        r->width = w;
+        return 2;
+      }
+    }
+    return -1;
+  }
+  return -1;
+}
+
+/* Classify the base+index address of a STORE_INDEXED (dest) or
+ * LOAD_INDEXED/LOAD_POSTINC (src1).  `width` is the access width. */
+static int gs_classify_indexed(IRSSAOptCtx *ctx, const IRQuadCompact *q,
+                               int side, int width, GsRef *r)
+{
+  TCCIRState *ir = ctx->ir;
+  if (ssa_opt_indirect_stack_offset(ctx, q, side) != INT_MIN)
+    return 0;
+  IROperand base = (side == SSA_OPT_INDIRECT_DEST) ? tcc_ir_op_get_dest(ir, q)
+                                                   : tcc_ir_op_get_src1(ir, q);
+  int32_t bvr = irop_get_vreg(base);
+  if (bvr < 0)
+    return -1;
+  if (ssa_opt_resolve_lea_stackloc(ctx, bvr) != INT_MIN)
+    return 0;
+  const Sym *gs;
+  int64_t go;
+  if (!gs_resolve_global_base(ctx, bvr, &gs, &go))
+    return -1;
+  IROperand idx = tcc_ir_op_get_src2(ir, q);
+  if (!irop_is_immediate(idx)) {
+    r->sym = gs;
+    return 1;
+  }
+  if (width == 0)
+    return -1;
+  int64_t sc = 0;
+  IROperand scop = tcc_ir_op_get_scale(ir, q);
+  if (irop_is_immediate(scop))
+    sc = irop_get_imm64_ex(ir, scop);
+  r->sym = gs;
+  r->off = go + (irop_get_imm64_ex(ir, idx) << sc);
+  r->width = width;
+  return 2;
+}
+
+static int gs_classify_store(IRSSAOptCtx *ctx, const IRQuadCompact *q, GsRef *r)
+{
+  TCCIRState *ir = ctx->ir;
+  if (q->op == TCCIR_OP_STORE_INDEXED) {
+    int w = sl_store_byte_width(irop_get_btype(tcc_ir_op_get_src1(ir, q)));
+    return gs_classify_indexed(ctx, q, SSA_OPT_INDIRECT_DEST, w, r);
+  }
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  if (!dest.is_lval)
+    return 0;
+  if (dest.is_sym) {
+    IRPoolSymref *sr = irop_get_symref_ex(ir, dest);
+    if (!sr || !sr->sym)
+      return -1;
+    int w = sl_store_byte_width(irop_get_btype(dest));
+    if (w == 0)
+      return -1;
+    r->sym = sr->sym;
+    r->off = sr->addend;
+    r->width = w;
+    return 2;
+  }
+  if (irop_get_tag(dest) == IROP_TAG_STACKOFF)
+    return 0;
+  if (irop_get_tag(dest) == IROP_TAG_VREG) {
+    int32_t dv = irop_get_vreg(dest);
+    if (dv >= 0 && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP) {
+      if (ssa_opt_resolve_lea_stackloc(ctx, dv) != INT_MIN)
+        return 0;
+      const Sym *gs;
+      int64_t go;
+      if (gs_resolve_global_base(ctx, dv, &gs, &go)) {
+        int w = sl_store_byte_width(irop_get_btype(dest));
+        if (w == 0)
+          return -1;
+        r->sym = gs;
+        r->off = go;
+        r->width = w;
+        return 2;
+      }
+    }
+    return -1;
+  }
+  return -1;
+}
+
+static int dce_dead_global_stores(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+  int changes = 0;
+
+  if (!cfg || cfg->num_blocks == 0)
+    return 0;
+
+#define GS_PEND_MAX 32
+  typedef struct { int idx; const Sym *sym; int64_t off; int width; } GsPending;
+
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    IRBasicBlock *bb = &cfg->blocks[b];
+    GsPending pending[GS_PEND_MAX];
+    int npending = 0;
+
+    for (int i = bb->start_idx; i < bb->end_idx; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+
+      int is_store = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED);
+      int flush = 0;
+
+      /* Reads: scan operands of any non-side-effecting op, plus STOREs
+       * (whose value operand may itself be a global deref). */
+      if (!ssa_opt_has_side_effects(q->op) || is_store) {
+        for (int side = 0; side < 3 && !flush; side++) {
+          IROperand s;
+          if (side == 0 && irop_config[q->op].has_src1)
+            s = tcc_ir_op_get_src1(ir, q);
+          else if (side == 1 && irop_config[q->op].has_src2)
+            s = tcc_ir_op_get_src2(ir, q);
+          else if (side == 2 && q->op == TCCIR_OP_MLA)
+            s = tcc_ir_op_get_accum(ir, q);
+          else
+            continue;
+          GsRef r;
+          int k = gs_classify_read_op(ctx, s, &r);
+          if (k == -1)
+            flush = 1;
+          else if (k == 1) {
+            for (int p = 0; p < npending;)
+              if (pending[p].sym == r.sym)
+                pending[p] = pending[--npending];
+              else
+                p++;
+          } else if (k == 2) {
+            for (int p = 0; p < npending;)
+              if (pending[p].sym == r.sym && r.off < pending[p].off + pending[p].width &&
+                  r.off + r.width > pending[p].off)
+                pending[p] = pending[--npending];
+              else
+                p++;
+          }
+        }
+        if (!flush &&
+            (q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_LOAD_POSTINC)) {
+          int w = sl_store_byte_width(irop_get_btype(tcc_ir_op_get_dest(ir, q)));
+          GsRef r;
+          int k = gs_classify_indexed(ctx, q, SSA_OPT_INDIRECT_SRC1, w, &r);
+          if (k == -1)
+            flush = 1;
+          else if (k == 1) {
+            for (int p = 0; p < npending;)
+              if (pending[p].sym == r.sym)
+                pending[p] = pending[--npending];
+              else
+                p++;
+          } else if (k == 2) {
+            for (int p = 0; p < npending;)
+              if (pending[p].sym == r.sym && r.off < pending[p].off + pending[p].width &&
+                  r.off + r.width > pending[p].off)
+                pending[p] = pending[--npending];
+              else
+                p++;
+          }
+        }
+      }
+
+      if (flush) {
+        npending = 0;
+        continue;
+      }
+
+      /* Any side-effecting op other than the stores we model (calls, asm,
+       * block copies, terminators, postinc, VLA, ...) may read or alias a
+       * global — flush conservatively. */
+      if (ssa_opt_has_side_effects(q->op) && !is_store) {
+        npending = 0;
+        continue;
+      }
+
+      if (!is_store)
+        continue;
+
+      GsRef r;
+      int k = gs_classify_store(ctx, q, &r);
+      if (k == 0 || k == 1)
+        continue; /* stack / value-def, or runtime-offset global store */
+      if (k == -1) {
+        npending = 0; /* store through unknown pointer — may alias any global */
+        continue;
+      }
+      /* k == 2: exact global store. */
+      for (int p = 0; p < npending;) {
+        if (pending[p].sym == r.sym && pending[p].off == r.off &&
+            pending[p].width == r.width) {
+          ssa_opt_nop_instr(ctx, pending[p].idx);
+          changes++;
+          pending[p] = pending[--npending];
+        } else if (pending[p].sym == r.sym && r.off < pending[p].off + pending[p].width &&
+                   r.off + r.width > pending[p].off) {
+          pending[p] = pending[--npending];
+        } else {
+          p++;
+        }
+      }
+      if (npending < GS_PEND_MAX) {
+        pending[npending].idx = i;
+        pending[npending].sym = r.sym;
+        pending[npending].off = r.off;
+        pending[npending].width = r.width;
+        npending++;
+      }
+    }
+  }
+
+#undef GS_PEND_MAX
+  return changes;
+}
+
+#define VL_BIT(bm, p) ((bm)[(p) >> 5] & (1u << ((p) & 31)))
+#define VL_SET(bm, p) ((bm)[(p) >> 5] |= (1u << ((p) & 31)))
+#define VL_CLR(bm, p) ((bm)[(p) >> 5] &= ~(1u << ((p) & 31)))
+
+static int vl_var_pos(IROperand op, int num_vars)
+{
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
+    return -1;
+  int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  return pos < num_vars ? pos : -1;
+}
+
+/* STORE dest that writes the VAR's own slot (value-def or direct local
+ * lval), as opposed to a write through a pointer held in the VAR. */
+static int vl_store_is_slot_def(IROperand d)
+{
+  if (d.is_sym)
+    return 0;
+  return !d.is_lval || (d.is_local && !d.is_llocal);
+}
+
+/* Full-slot definition of a non-excluded VAR: var position or -1.
+ * Side-effect ops never kill (except the STORE slot-def form), so every
+ * def this returns is also safe to NOP when dead. */
+static int vl_def_pos(TCCIRState *ir, IRQuadCompact *q, int num_vars)
+{
+  if (!irop_config[q->op].has_dest)
+    return -1;
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  if (ssa_opt_has_side_effects(q->op)) {
+    if (q->op != TCCIR_OP_STORE || !vl_store_is_slot_def(d))
+      return -1;
+  } else {
+    if (d.is_sym || (d.is_lval && (!d.is_local || d.is_llocal)))
+      return -1;
+  }
+  int p = vl_var_pos(d, num_vars);
+  if (p < 0)
+    return -1;
+  int bt = irop_get_btype(d);
+  if (bt == IROP_BTYPE_STRUCT)
+    return -1;
+  IRLiveInterval *iv =
+      tcc_ir_get_live_interval(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, p));
+  if (iv && (iv->is_llong || iv->is_double) &&
+      bt != IROP_BTYPE_INT64 && bt != IROP_BTYPE_FLOAT64)
+    return -1;
+  return p;
+}
+
+static void vl_mark_uses(TCCIRState *ir, IRQuadCompact *q, int num_vars,
+                         uint32_t *live)
+{
+  int p;
+  if (irop_config[q->op].has_src1 &&
+      (p = vl_var_pos(tcc_ir_op_get_src1(ir, q), num_vars)) >= 0)
+    VL_SET(live, p);
+  if (irop_config[q->op].has_src2 &&
+      (p = vl_var_pos(tcc_ir_op_get_src2(ir, q), num_vars)) >= 0)
+    VL_SET(live, p);
+  if (q->op == TCCIR_OP_MLA &&
+      (p = vl_var_pos(tcc_ir_op_get_accum(ir, q), num_vars)) >= 0)
+    VL_SET(live, p);
+  if (irop_config[q->op].has_dest &&
+      vl_def_pos(ir, q, num_vars) < 0 &&
+      (p = vl_var_pos(tcc_ir_op_get_dest(ir, q), num_vars)) >= 0)
+    VL_SET(live, p);
+}
+
+static int vl_removable(TCCIRState *ir, IRQuadCompact *q)
+{
+  for (int side = 0; side < 2; side++) {
+    IROperand s;
+    if (side == 0 && irop_config[q->op].has_src1)
+      s = tcc_ir_op_get_src1(ir, q);
+    else if (side == 1 && irop_config[q->op].has_src2)
+      s = tcc_ir_op_get_src2(ir, q);
+    else
+      continue;
+    int32_t vr = irop_get_vreg(s);
+    if (vr >= 0) {
+      IRLiveInterval *iv = tcc_ir_get_live_interval(ir, vr);
+      if (iv && iv->is_volatile)
+        return 0;
+    }
+  }
+  return 1;
+}
+
+/* CFG-wide backward liveness over local VAR slots: a full-slot def of a
+ * VAR that is dead at that point is NOPed.  Generalizes the legacy
+ * redundant_init_elim / redundant_var_assign passes to overwrites on any
+ * path, not just function-entry inits or straight-line code. */
+static int dce_var_liveness(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  int n = ir->next_instruction_index;
+  int num_vars = ir->next_local_variable;
+  int changes = 0;
+
+  if (num_vars <= 0 || n == 0 || ir->has_static_chain)
+    return 0;
+
+  for (int i = 0; i < n; i++) {
+    switch (ir->compact_instructions[i].op) {
+    case TCCIR_OP_IJUMP:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_LONGJMP:
+    case TCCIR_OP_NL_LONGJMP:
+    case TCCIR_OP_SET_CHAIN:
+    case TCCIR_OP_INIT_CHAIN_SLOT:
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+    case TCCIR_OP_BUILTIN_APPLY_ARGS:
+    case TCCIR_OP_BUILTIN_APPLY:
+    case TCCIR_OP_BUILTIN_RETURN:
+      return 0;
+    default:
+      break;
+    }
+  }
+
+  /* ctx->cfg may be stale after branch rewrites — build a fresh one */
+  IRCFG *cfg = tcc_ir_cfg_build(ir);
+  if (!cfg || cfg->num_blocks == 0) {
+    tcc_ir_cfg_free(cfg);
+    return 0;
+  }
+
+  int nb = cfg->num_blocks;
+  int nw = (num_vars + 31) / 32;
+  size_t bmsz = (size_t)nw * sizeof(uint32_t);
+  uint32_t *excl = tcc_mallocz(bmsz);
+  uint32_t *use = tcc_mallocz((size_t)nb * bmsz);
+  uint32_t *def = tcc_mallocz((size_t)nb * bmsz);
+  uint32_t *lin = tcc_mallocz((size_t)nb * bmsz);
+  uint32_t *live = tcc_mallocz(bmsz);
+
+  for (int p = 0; p < num_vars; p++) {
+    IRLiveInterval *iv =
+        tcc_ir_get_live_interval(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, p));
+    if (!iv || iv->addrtaken || iv->is_volatile)
+      VL_SET(excl, p);
+  }
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    for (int side = 0; side < 3; side++) {
+      IROperand s;
+      if (side == 0 && irop_config[q->op].has_src1)
+        s = tcc_ir_op_get_src1(ir, q);
+      else if (side == 1 && irop_config[q->op].has_src2)
+        s = tcc_ir_op_get_src2(ir, q);
+      else if (side == 2 && q->op == TCCIR_OP_MLA)
+        s = tcc_ir_op_get_accum(ir, q);
+      else
+        continue;
+      int p = vl_var_pos(s, num_vars);
+      if (p < 0)
+        continue;
+      /* Addr[V] escapes; any VAR feeding a LEA is address-taken */
+      if ((s.is_local && !s.is_lval) || q->op == TCCIR_OP_LEA)
+        VL_SET(excl, p);
+    }
+  }
+
+  for (int b = 0; b < nb; b++) {
+    uint32_t *ub = use + (size_t)b * nw;
+    uint32_t *db = def + (size_t)b * nw;
+    for (int i = cfg->blocks[b].start_idx; i < cfg->blocks[b].end_idx; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      memset(live, 0, bmsz);
+      vl_mark_uses(ir, q, num_vars, live);
+      for (int w = 0; w < nw; w++)
+        ub[w] |= live[w] & ~db[w];
+      int dp = vl_def_pos(ir, q, num_vars);
+      if (dp >= 0 && !VL_BIT(excl, dp))
+        VL_SET(db, dp);
+    }
+  }
+
+  int unstable = 1, rounds = 0;
+  while (unstable && rounds++ <= nb + 2) {
+    unstable = 0;
+    for (int b = nb - 1; b >= 0; b--) {
+      memset(live, 0, bmsz);
+      for (int s = 0; s < cfg->blocks[b].num_succs; s++) {
+        uint32_t *sin = lin + (size_t)cfg->blocks[b].succs[s] * nw;
+        for (int w = 0; w < nw; w++)
+          live[w] |= sin[w];
+      }
+      uint32_t *ub = use + (size_t)b * nw;
+      uint32_t *db = def + (size_t)b * nw;
+      uint32_t *ib = lin + (size_t)b * nw;
+      for (int w = 0; w < nw; w++) {
+        uint32_t v = ub[w] | (live[w] & ~db[w]);
+        if (v != ib[w]) {
+          ib[w] = v;
+          unstable = 1;
+        }
+      }
+    }
+  }
+
+  if (!unstable) {
+    for (int b = 0; b < nb; b++) {
+      memset(live, 0, bmsz);
+      for (int s = 0; s < cfg->blocks[b].num_succs; s++) {
+        uint32_t *sin = lin + (size_t)cfg->blocks[b].succs[s] * nw;
+        for (int w = 0; w < nw; w++)
+          live[w] |= sin[w];
+      }
+      for (int i = cfg->blocks[b].end_idx - 1; i >= cfg->blocks[b].start_idx; i--) {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        if (q->op == TCCIR_OP_NOP)
+          continue;
+        int dp = vl_def_pos(ir, q, num_vars);
+        if (dp >= 0 && !VL_BIT(excl, dp)) {
+          if (!VL_BIT(live, dp) && vl_removable(ir, q)) {
+            ssa_opt_nop_instr(ctx, i);
+            changes++;
+            continue;
+          }
+          VL_CLR(live, dp);
+        }
+        vl_mark_uses(ir, q, num_vars, live);
+      }
+    }
+  }
+
+  tcc_free(excl);
+  tcc_free(use);
+  tcc_free(def);
+  tcc_free(lin);
+  tcc_free(live);
+  tcc_ir_cfg_free(cfg);
+  return changes;
+}
+
+int ssa_opt_dce_light(IRSSAOptCtx *ctx)
+{
+  int changes = dce_unreachable(ctx);
+  changes += dce_temp_worklist(ctx);
+  return changes;
+}
+
 int ssa_opt_dce(IRSSAOptCtx *ctx)
 {
   int changes = 0;
@@ -1183,7 +1964,18 @@ int ssa_opt_dce(IRSSAOptCtx *ctx)
       changes += inner;
     } while (inner > 0);
     changes += dce_dead_overwrite_stores(ctx);
+    if (!tcc_ir_opt_pass_disabled("ssa:dce:global_store"))
+      changes += dce_dead_global_stores(ctx);
+    if (!tcc_ir_opt_pass_disabled("ssa:dce:orphan_params"))
+      changes += dce_orphan_params(ctx);
     changes += dce_dead_stackloc_stores(ctx);
+    if (!tcc_ir_opt_pass_disabled("ssa:dce:ret_store"))
+      changes += dce_ret_path_frame_store(ctx);
+    if (!tcc_ir_opt_pass_disabled("ssa:dce:var_live")) {
+      int vl = dce_var_liveness(ctx);
+      if (vl)
+        changes += vl + dce_temp_worklist(ctx);
+    }
     if (changes) {
       /* Repair stale TEMP use chains: some passes NOP or rewrite
        * instructions without fully updating the use-def chains.  Rebuild

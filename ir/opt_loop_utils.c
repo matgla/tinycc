@@ -1242,10 +1242,9 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
   }
 
   /* Step 2b (INDEXED-DIV only): synthesize a NOP slot immediately after the
-   * rewritten LOAD/STORE so the later tcc_ir_opt_loop_postinc_fusion pass has
-   * room to materialize the writeback-ASSIGN it needs.  Without this slot the
-   * fusion bails out (`assign_nop = -1`) and the loop body is left with a
-   * separate `ptr += stride` ADD that POSTINC would have absorbed.
+   * rewritten LOAD/STORE.  Vestigial since the post-increment fusion pass that
+   * consumed it was removed; retained to avoid perturbing the INDEXED-DIV
+   * APPLY_SHIFT index bookkeeping below.
    *
    * Communicates the NOP position back to the caller via out_postnop_origpos
    * (in pre-call original-index space, i.e., div->use_idx).  The caller folds
@@ -2046,9 +2045,9 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
          * lands a later DIV's use_idx on an unrelated instruction — e.g. a
          * FUNCPARAMVAL — which the next transform then rewrites/NOPs, corrupting
          * the call's parameter sequence ("missing FUNCPARAMVAL for call_id=N").
-         * The driver (tcc_ir_opt_iv_strength_reduction) re-detects loops and
-         * DIVs from scratch and calls us again, so the remaining DIVs are
-         * handled on later iterations with exact indices and no stale shifts. */
+         * The driver (ssa_opt_iv_strength_reduction) re-detects loops and DIVs
+         * from scratch and calls us again, so the remaining DIVs are handled on
+         * later iterations with exact indices and no stale shifts. */
         goto try_elim;
       }
     }
@@ -4039,6 +4038,15 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
       LOG_LOOP_OPT("Rotation: reject — latch has branch at i=%d (op=%d)", i, q->op);
       return 0;
     }
+    /* Latch save/restore below only keeps dest/src1/src2 — a 4-operand op
+     * (MLA/SELECT/indexed/post-inc) would lose its pool[base+3] slot. */
+    if (q->op == TCCIR_OP_MLA || q->op == TCCIR_OP_SELECT ||
+        q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC)
+    {
+      LOG_LOOP_OPT("Rotation: reject — latch has 4-operand op at i=%d (op=%d)", i, q->op);
+      return 0;
+    }
   }
 
   /* --- Step 6: Check size - rotated code must fit --- */
@@ -4163,7 +4171,11 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
      * &body_dests[b] is only byte-aligned for odd b, and the compiler lowers the
      * compound-literal zero store to an 8-byte STRD which faults (UNALIGNED) on
      * a non-4-aligned address.  Leave them at their pre-zeroed value. */
-    body_has_extra[b] = (op == TCCIR_OP_MLA || op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED);
+    /* Every op storing a 4th pool operand (accumulator/scale/cond/post-inc
+     * offset) — dropping it rebuilds e.g. a SELECT with cond=0 (EQ). */
+    body_has_extra[b] = (op == TCCIR_OP_MLA || op == TCCIR_OP_LOAD_INDEXED ||
+                         op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_SELECT ||
+                         op == TCCIR_OP_LOAD_POSTINC || op == TCCIR_OP_STORE_POSTINC);
     if (irop_config[op].has_dest)
       body_dests[b] = ir->iroperand_pool[bq->operand_base];
     if (irop_config[op].has_src1)
@@ -4207,7 +4219,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   {
     write_instr_at_nop(ir, wp, body_ops[b], body_dests[b], body_src1s[b], body_src2s[b]);
     if (body_has_extra[b])
-      tcc_ir_pool_add(ir, body_extras[b]); /* MLA accumulator at operand_base+3 */
+      tcc_ir_pool_add(ir, body_extras[b]); /* 4th operand at operand_base+3 */
     ir->compact_instructions[wp].line_num = body_lines[b];
     wp++;
   }
@@ -4319,4 +4331,272 @@ int loop_size_cmp(const void *a, const void *b)
   int sa = la->end_idx - la->start_idx;
   int sb = lb->end_idx - lb->start_idx;
   return sa - sb;
+}
+
+/* Decrement-to-zero region rewrite: a count-up pure-counter loop (init=0,
+ * step=+1, const limit>0, separate pre-test guard, back-edge <S) in [start,end]
+ * becomes count-down-to-zero (init=limit, step=-1, back-edge CMP #0, cond !=,
+ * guard NOPed) so the backend fuses the latch SUB+CMP#0 into a flag-setting
+ * SUBS.  In-place, no IR growth; returns 1 if rewritten.
+ * See docs/plan_legacy_loop_decrement_to_zero_ssa.md. */
+int dtz_try_region(TCCIRState *ir, int start, int end, int header_idx,
+                   int preheader_idx)
+{
+  int n = ir->next_instruction_index;
+
+  /* Find a simple count-up IV: V = V + 1 in the latch */
+  int iv_def_idx = -1;
+  int32_t iv_vr = -1;
+
+  for (int i = end; i >= start; i--)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_CMP || q->op == TCCIR_OP_JUMPIF)
+      continue;
+    if (q->op != TCCIR_OP_ADD)
+      break;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+
+    int d_vr = irop_get_vreg(dest);
+    int s1_vr = irop_get_vreg(src1);
+    if (d_vr >= 0 && d_vr == s1_vr && irop_is_immediate(src2) && irop_get_imm64_ex(ir, src2) == 1 &&
+        TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR)
+    {
+      iv_def_idx = i;
+      iv_vr = d_vr;
+      break;
+    }
+    break;
+  }
+
+  if (iv_def_idx < 0)
+    return 0;
+
+  /* Find the back-edge CMP: CMP V, #limit; JUMPIF <S body */
+  int be_cmp_idx = -1;
+  int be_jmpif_idx = -1;
+  int limit_val = 0;
+
+  for (int i = end; i >= end - 5 && i >= 0; i--)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_CMP)
+      continue;
+
+    IROperand s1 = tcc_ir_op_get_src1(ir, q);
+    IROperand s2 = tcc_ir_op_get_src2(ir, q);
+    if (irop_get_vreg(s1) != iv_vr || !irop_is_immediate(s2))
+      continue;
+
+    int jq_idx = i + 1;
+    while (jq_idx < n && ir->compact_instructions[jq_idx].op == TCCIR_OP_NOP)
+      jq_idx++;
+    if (jq_idx >= n || ir->compact_instructions[jq_idx].op != TCCIR_OP_JUMPIF)
+      continue;
+
+    IROperand cond = tcc_ir_op_get_src1(ir, &ir->compact_instructions[jq_idx]);
+    int cond_tok = (int)irop_get_imm64_ex(ir, cond);
+    if (cond_tok != 0x9c) /* TOK_LT (<S) */
+      continue;
+
+    limit_val = (int)irop_get_imm64_ex(ir, s2);
+    if (limit_val <= 0)
+      continue;
+
+    be_cmp_idx = i;
+    be_jmpif_idx = jq_idx;
+    break;
+  }
+
+  if (be_cmp_idx < 0)
+    return 0;
+
+  /* Find the IV init: V = #0 in the preheader */
+  int init_idx = -1;
+  for (int i = preheader_idx; i >= 0 && i >= preheader_idx - 5; i--)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op != TCCIR_OP_ASSIGN)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    if (irop_get_vreg(dest) == iv_vr && irop_is_immediate(src1) && irop_get_imm64_ex(ir, src1) == 0)
+    {
+      init_idx = i;
+      break;
+    }
+  }
+
+  if (init_idx < 0)
+    return 0;
+
+  /* Find pre-test guard: CMP V, #limit near header (NOPed since limit>0 means
+   * the loop always executes).  Skip any index coinciding with the back-edge
+   * CMP/JUMPIF: NOPing a coincident guard would delete the loop's only
+   * back-edge test and degenerate it to one iteration (docs/bugs.md #12). */
+  int hdr_cmp_idx = -1, hdr_jmpif_idx = -1;
+  {
+    int scan_start = preheader_idx;
+    if (scan_start < 0)
+      scan_start = 0;
+    for (int i = scan_start; i <= header_idx + 2 && i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_CMP)
+        continue;
+      if (i == be_cmp_idx)
+        continue;
+      IROperand s1 = tcc_ir_op_get_src1(ir, q);
+      if (irop_get_vreg(s1) != iv_vr)
+        continue;
+
+      int jq_idx = i + 1;
+      while (jq_idx < n && (ir->compact_instructions[jq_idx].op == TCCIR_OP_NOP ||
+                            ir->compact_instructions[jq_idx].op == TCCIR_OP_ASSIGN))
+        jq_idx++;
+      if (jq_idx < n && ir->compact_instructions[jq_idx].op == TCCIR_OP_JUMPIF)
+      {
+        if (jq_idx == be_jmpif_idx)
+          continue;
+        hdr_cmp_idx = i;
+        hdr_jmpif_idx = jq_idx;
+        break;
+      }
+    }
+  }
+
+  /* IV (and an optional copy-through temp T=V before V=T+step) must have no
+   * uses across the IV live range besides init/increment/the two CMPs. */
+  {
+    int other_uses = 0;
+    int copy_through_vr = -1;
+
+    for (int k = iv_def_idx - 1; k >= iv_def_idx - 3 && k >= 0; k--)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[k];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (q->op == TCCIR_OP_ASSIGN)
+      {
+        IROperand s = tcc_ir_op_get_src1(ir, q);
+        if (irop_get_vreg(s) == iv_vr)
+        {
+          IROperand d = tcc_ir_op_get_dest(ir, q);
+          copy_through_vr = irop_get_vreg(d);
+        }
+      }
+      break;
+    }
+
+    if (copy_through_vr >= 0)
+    {
+      for (int i = 0; i < n; i++)
+      {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        if (q->op == TCCIR_OP_NOP || i == iv_def_idx)
+          continue;
+        if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == copy_through_vr)
+        {
+          other_uses++;
+          break;
+        }
+        if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == copy_through_vr)
+        {
+          other_uses++;
+          break;
+        }
+      }
+    }
+
+    /* Live range: init_idx to the next post-loop redefinition of iv_vr
+     * (exclusive); uses after a redefinition belong to a different range. */
+    int live_end = n;
+    for (int i = end + 1; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (irop_config[q->op].has_dest)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        if (irop_get_vreg(d) == iv_vr && !irop_op_is_lval(d))
+        {
+          live_end = i;
+          break;
+        }
+      }
+    }
+
+    for (int i = 0; i < live_end && other_uses == 0; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (i == init_idx || i == iv_def_idx || i == be_cmp_idx || i == hdr_cmp_idx)
+        continue;
+
+      if (copy_through_vr >= 0 && q->op == TCCIR_OP_ASSIGN && i >= iv_def_idx - 3 && i < iv_def_idx)
+      {
+        IROperand s = tcc_ir_op_get_src1(ir, q);
+        if (irop_get_vreg(s) == iv_vr)
+          continue;
+      }
+
+      if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == iv_vr)
+        other_uses++;
+      if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == iv_vr)
+        other_uses++;
+    }
+
+    if (other_uses > 0)
+      return 0;
+  }
+
+  /* Must have found a separate pre-test guard: changing init to #limit without
+   * a patched/removed guard would skip the loop. */
+  if (hdr_cmp_idx < 0)
+    return 0;
+
+  /* === Apply transformation (in place) === */
+
+  /* 1. Init: V = #0  ->  V = #limit */
+  {
+    IRQuadCompact *q = &ir->compact_instructions[init_idx];
+    IROperand new_init = irop_make_imm32(-1, limit_val, IROP_BTYPE_INT32);
+    tcc_ir_op_set_src1(ir, q, new_init);
+  }
+
+  /* 2. Increment: V = V + 1  ->  V = V - 1 */
+  {
+    IRQuadCompact *q = &ir->compact_instructions[iv_def_idx];
+    q->op = TCCIR_OP_SUB;
+    IROperand new_step = irop_make_imm32(-1, 1, IROP_BTYPE_INT32);
+    tcc_ir_op_set_src2(ir, q, new_step);
+  }
+
+  /* 3. Back-edge: CMP V, #limit  ->  CMP V, #0 */
+  {
+    IRQuadCompact *q = &ir->compact_instructions[be_cmp_idx];
+    IROperand zero = irop_make_imm32(-1, 0, IROP_BTYPE_INT32);
+    tcc_ir_op_set_src2(ir, q, zero);
+  }
+
+  /* 4. Back-edge condition: <S  ->  != (SUB+CMP#0 peephole is Z-flag EQ/NE). */
+  {
+    IRQuadCompact *q = &ir->compact_instructions[be_jmpif_idx];
+    IROperand new_cond = irop_make_imm32(-1, 0x95, IROP_BTYPE_INT32); /* TOK_NE (!=) */
+    tcc_ir_op_set_src1(ir, q, new_cond);
+  }
+
+  /* 5. NOP the pre-test guard (always passes since limit > 0) */
+  ir->compact_instructions[hdr_cmp_idx].op = TCCIR_OP_NOP;
+  ir->compact_instructions[hdr_jmpif_idx].op = TCCIR_OP_NOP;
+
+  return 1;
 }

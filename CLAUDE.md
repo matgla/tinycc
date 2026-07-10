@@ -138,6 +138,22 @@ void function_name(int arg)
 
 Build uses `-std=c11 -Wunused-function -Werror`.
 
+**File headers:** Every new `.c` and `.h` file MUST start with the standard copyright/license block (an optional one-line description may precede the copyright line):
+
+```c
+/*
+ *  TCC <Component> - <Short description>
+ *
+ *  Copyright (c) 2025 Mateusz Stadnik
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation.
+ */
+```
+
+**Comments:** No comment blocks. At most a single-line comment, and only for a constraint the code can't express. Delete existing comments in any code you touch (or compress to one line if a real constraint remains). If something needs a longer explanation, put it in a `docs/` file and reference it with a one-line link — never inline the prose.
+
 ## Debug Logging
 
 For debugging **optimizer miscompilations** found by the differential fuzzer

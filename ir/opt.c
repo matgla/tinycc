@@ -716,6 +716,14 @@ static void tu_symset_add(TuSymSet *s, Sym *sym)
   s->items[s->count++] = sym;
 }
 
+static int tu_symset_contains(const TuSymSet *s, const Sym *sym)
+{
+  for (int i = 0; i < s->count; i++)
+    if (s->items[i] == sym)
+      return 1;
+  return 0;
+}
+
 static void tu_symset_free(TuSymSet *s)
 {
   if (s->items)
@@ -744,6 +752,15 @@ static TuFuncSummary *tu_summary_lookup(Sym *func_sym)
   return NULL;
 }
 
+/* Statics read anywhere in PRE-optimization IR.  Optimization can fold a
+ * reader's load away (store-forwarded constant), making the post-opt
+ * summaries claim "no readers" — but the late_reopt recompile does not
+ * reproduce those folds once dead_static_store removes the enabling stores
+ * (medce-1: main's inlined `ok = 1; if (!ok)` folded, then the reopt killed
+ * every `ok` store while re-introducing the read).  A static read in source
+ * is therefore never a tu_no_readers candidate. */
+static TuSymSet tu_source_reads = {0};
+
 void tcc_ir_tu_func_summary_clear_all(void)
 {
   while (tu_summary_head)
@@ -755,6 +772,7 @@ void tcc_ir_tu_func_summary_clear_all(void)
     tcc_free(tu_summary_head);
     tu_summary_head = n;
   }
+  tu_symset_free(&tu_source_reads);
 }
 
 /* Helper: extract Sym* from a SYMREF operand. */
@@ -836,6 +854,85 @@ static void tu_vreg_map_clear(TuVregSymEntry *map, int *count, int32_t vr)
     {
       map[i].sym = NULL;
       return;
+    }
+  }
+}
+
+/* medce-1 veto: any pre-opt value read (or unrecognized address use) of a static blocks tu_no_readers; store-address plumbing `T=&g+i; *T=v` does not (pr32988) */
+void tcc_ir_collect_tu_static_reads_preopt(TCCIRState *ir)
+{
+  TuVregSymEntry map[TU_VREG_MAP_MAX];
+  int mc = 0;
+  const int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    int is_store = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+                    q->op == TCCIR_OP_STORE_POSTINC);
+    int is_load = (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_LOAD_INDEXED ||
+                   q->op == TCCIR_OP_LOAD_POSTINC);
+    int is_addr_derive = (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_ADD ||
+                          q->op == TCCIR_OP_SUB || q->op == TCCIR_OP_LEA);
+
+    IROperand rops[3];
+    int nrops = 0;
+    if (irop_config[q->op].has_src1)
+      rops[nrops++] = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2)
+      rops[nrops++] = tcc_ir_op_get_src2(ir, q);
+    if (q->op == TCCIR_OP_MLA)
+      rops[nrops++] = tcc_ir_op_get_accum(ir, q);
+
+    for (int oi = 0; oi < nrops; oi++)
+    {
+      IROperand op = rops[oi];
+      Sym *sym = NULL;
+      if (op.is_sym)
+        sym = tu_extract_sym(ir, op);
+      else if (irop_get_vreg(op) >= 0)
+        sym = tu_vreg_map_lookup(map, mc, irop_get_vreg(op));
+      if (!sym || !tu_is_static_global_candidate(sym))
+        continue;
+      if (op.is_lval || is_load) {
+        tu_symset_add(&tu_source_reads, sym);
+        continue;
+      }
+      /* non-lval address: src1 of an address-derivation op continues the map below; anything else escapes -> read */
+      if (!(is_addr_derive && oi == 0) && !(q->op == TCCIR_OP_MLA && oi == 2))
+        tu_symset_add(&tu_source_reads, sym);
+    }
+
+    if (irop_config[q->op].has_dest && !is_store)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int32_t dvr = irop_get_vreg(dest);
+      if (dvr >= 0 && !dest.is_lval)
+      {
+        Sym *derived = NULL;
+        if (is_addr_derive && irop_config[q->op].has_src1)
+        {
+          IROperand s1 = tcc_ir_op_get_src1(ir, q);
+          if (s1.is_sym && !s1.is_lval)
+            derived = tu_extract_sym(ir, s1);
+          else if (!s1.is_sym && !s1.is_lval && irop_get_vreg(s1) >= 0)
+            derived = tu_vreg_map_lookup(map, mc, irop_get_vreg(s1));
+        }
+        if (!derived && q->op == TCCIR_OP_MLA)
+        {
+          IROperand acc = tcc_ir_op_get_accum(ir, q);
+          if (acc.is_sym && !acc.is_lval)
+            derived = tu_extract_sym(ir, acc);
+          else if (!acc.is_sym && !acc.is_lval && irop_get_vreg(acc) >= 0)
+            derived = tu_vreg_map_lookup(map, mc, irop_get_vreg(acc));
+        }
+        if (derived && tu_is_static_global_candidate(derived))
+          tu_vreg_map_set(map, &mc, dvr, derived);
+        else
+          tu_vreg_map_clear(map, &mc, dvr);
+      }
     }
   }
 }
@@ -1375,7 +1472,7 @@ void tcc_ir_tu_analyze_dead_statics(void)
       continue;
     if (g->a.addrtaken)
       continue; /* address escaped; cannot prove no readers */
-    int read_by_reachable = 0;
+    int read_by_reachable = tu_symset_contains(&tu_source_reads, g);
     for (TuFuncSummary *e = tu_summary_head; e && !read_by_reachable; e = e->next)
     {
       if (!e->func_sym || !e->func_sym->type.ref)
@@ -2326,257 +2423,15 @@ int tcc_ir_opt_small_global_memset_to_store(TCCIRState *ir)
   return changes;
 }
 
-/* Returns 1 if an instruction may clobber a value used by a CMP/SETIF
- * we want to CSE across.  Used by tcc_ir_opt_cmp_setif_cse to bail when
- * any intervening op could change the comparison's result. */
-static int cse_cmp_op_may_clobber(IRQuadCompact *q)
+int ssa_opt_mem_init(TCCIRState *ir)
 {
-  switch (q->op)
-  {
-  case TCCIR_OP_NOP:
-  case TCCIR_OP_PREFETCH:
-  case TCCIR_OP_RETURNVOID:
-  case TCCIR_OP_RETURNVALUE: /* terminates BB but doesn't reach CMP@j */
-    return 0;
-  /* Anything that writes memory or branches is a hard stop.  Calls
-   * may write through pointers; jumps cross basic-block boundaries. */
-  case TCCIR_OP_STORE:
-  case TCCIR_OP_STORE_INDEXED:
-  case TCCIR_OP_STORE_POSTINC:
-  case TCCIR_OP_BLOCK_COPY:
-  case TCCIR_OP_FUNCCALLVOID:
-  case TCCIR_OP_FUNCCALLVAL:
-  case TCCIR_OP_JUMP:
-  case TCCIR_OP_JUMPIF:
-  case TCCIR_OP_IJUMP:
-  case TCCIR_OP_SWITCH_TABLE:
-  case TCCIR_OP_SET_CHAIN:
-  case TCCIR_OP_TRAP:
-  case TCCIR_OP_SETJMP:
-  case TCCIR_OP_LONGJMP:
-  case TCCIR_OP_NL_SETJMP:
-  case TCCIR_OP_NL_LONGJMP:
-  case TCCIR_OP_VLA_ALLOC:
-  case TCCIR_OP_VLA_SP_SAVE:
-  case TCCIR_OP_VLA_SP_RESTORE:
-  case TCCIR_OP_INLINE_ASM:
-    return 1;
-  default:
-    return 0;
-  }
-}
-
-/* Returns 1 if a CMP operand depends on a memory location that any
- * STORE could alias.  STACKOFF lvals do; everything else is safe under
- * the caller's existing "no STOREs between" guard. */
-static int cse_cmp_operand_reads_memory(IROperand op)
-{
-  if (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval)
-    return 1;
-  if (op.is_lval && irop_get_tag(op) == IROP_TAG_VREG)
-    return 1;
-  if (op.is_lval && irop_get_tag(op) == IROP_TAG_SYMREF)
-    return 1;
-  return 0;
-}
-
-/* CMP+SETIF CSE pass.  Detects pattern:
- *   i:   CMP A, B
- *   i+1: V1 <-- (cond=C)             [SETIF]
- *   ...intervening ops with no clobber...
- *   j:   CMP A', B'   (structurally equal to A, B)
- *   j+1: V2 <-- (cond=C)             [SETIF]
- * And rewrites the second pair to:
- *   j:   NOP
- *   j+1: V2 <-- V1                   [ASSIGN]
- *
- * Subsequent copy-propagation eliminates V2 entirely.  Scoped to a single
- * basic block (no jump-target or terminator between i and j) and bails on
- * any intervening op that could clobber memory or vregs read by the CMPs. */
-int tcc_ir_opt_cmp_setif_cse(TCCIRState *ir)
-{
-  int n = ir->next_instruction_index;
   int changes = 0;
-  if (n < 4)
-    return 0;
-
-  for (int i = 0; i + 2 < n; i++)
-  {
-    IRQuadCompact *cmp1 = &ir->compact_instructions[i];
-    if (cmp1->op != TCCIR_OP_CMP)
-      continue;
-    IRQuadCompact *setif1 = &ir->compact_instructions[i + 1];
-    if (setif1->op != TCCIR_OP_SETIF)
-      continue;
-
-    IROperand setif1_dest = tcc_ir_op_get_dest(ir, setif1);
-    int32_t setif1_dest_vr = irop_get_vreg(setif1_dest);
-    if (setif1_dest_vr < 0 || setif1_dest.is_lval)
-      continue;
-    /* Require the SETIF result vreg to be single-def — otherwise later
-     * redefinitions could carry the wrong value past our CSE point. */
-    if (!tcc_ir_vreg_has_single_def(ir, setif1_dest_vr))
-      continue;
-
-    IROperand cmp1_s1 = tcc_ir_op_get_src1(ir, cmp1);
-    IROperand cmp1_s2 = tcc_ir_op_get_src2(ir, cmp1);
-    IROperand cond1_op = tcc_ir_op_get_src1(ir, setif1);
-    int cond1 = (int)irop_get_imm64_ex(ir, cond1_op);
-    int s1_btype = irop_get_btype(cmp1_s1);
-    int s2_btype = irop_get_btype(cmp1_s2);
-    int setif1_btype = irop_get_btype(setif1_dest);
-
-    /* Whether either CMP operand could be invalidated by an intervening
-     * STORE — if yes, we'd need stricter aliasing checks beyond the
-     * cse_cmp_op_may_clobber guard (which already bails on any STORE). */
-    (void)cse_cmp_operand_reads_memory;
-
-    /* Forward scan for a duplicate CMP+SETIF pair. */
-    for (int j = i + 2; j + 1 < n; j++)
-    {
-      IRQuadCompact *q = &ir->compact_instructions[j];
-      if (q->op == TCCIR_OP_NOP)
-        continue;
-      if (q->is_jump_target)
-        break; /* BB boundary */
-      if (cse_cmp_op_may_clobber(q))
-        break;
-
-      /* If this op writes a vreg used by cmp1, or overwrites setif1's
-       * result, bail. */
-      if (irop_config[q->op].has_dest)
-      {
-        IROperand d = tcc_ir_op_get_dest(ir, q);
-        if (!d.is_lval)
-        {
-          int32_t dvr = irop_get_vreg(d);
-          if (dvr >= 0)
-          {
-            if (dvr == setif1_dest_vr)
-              break;
-            if (irop_get_tag(cmp1_s1) == IROP_TAG_VREG && !cmp1_s1.is_lval &&
-                irop_get_vreg(cmp1_s1) == dvr)
-              break;
-            if (irop_get_tag(cmp1_s2) == IROP_TAG_VREG && !cmp1_s2.is_lval &&
-                irop_get_vreg(cmp1_s2) == dvr)
-              break;
-          }
-        }
-      }
-
-      if (q->op != TCCIR_OP_CMP)
-        continue;
-      IRQuadCompact *setif2 = &ir->compact_instructions[j + 1];
-      if (setif2->op != TCCIR_OP_SETIF)
-        continue;
-
-      IROperand cmp2_s1 = tcc_ir_op_get_src1(ir, q);
-      IROperand cmp2_s2 = tcc_ir_op_get_src2(ir, q);
-      IROperand cond2_op = tcc_ir_op_get_src1(ir, setif2);
-      int cond2 = (int)irop_get_imm64_ex(ir, cond2_op);
-
-      if (cond1 != cond2)
-        continue;
-      if (irop_get_btype(cmp2_s1) != s1_btype || irop_get_btype(cmp2_s2) != s2_btype)
-        continue;
-
-      /* Structural equality of operands.  Use the public helper that
-       * handles vregs, immediates, stack offsets, and symrefs. */
-      if (!ir_opt_pure_expr_equal(ir, cmp1_s1, i, cmp2_s1, j, 0))
-        continue;
-      if (!ir_opt_pure_expr_equal(ir, cmp1_s2, i, cmp2_s2, j, 0))
-        continue;
-
-      /* Rewrite: CMP@j becomes NOP, SETIF@j+1 becomes ASSIGN of setif1's
-       * vreg.  The destination vreg of SETIF@j+1 is preserved. */
-      q->op = TCCIR_OP_NOP;
-      setif2->op = TCCIR_OP_ASSIGN;
-      IROperand src_vreg = irop_make_vreg(setif1_dest_vr, setif1_btype);
-      tcc_ir_set_src1(ir, j + 1, src_vreg);
-      tcc_ir_set_src2(ir, j + 1, IROP_NONE);
-      changes++;
-      break;
-    }
-  }
-
-  return changes;
-}
-
-/* A vreg is provably in {0,1} when its single definition is a SETIF (which
- * always materialises 0 or 1), a boolean AND/OR (idempotent boolean ops), or
- * a prior boolean-normalisation ASSIGN of another such vreg.  Used to drop the
- * redundant `!!bool` that the frontend emits when a comparison result is
- * assigned to a `_Bool` (or otherwise re-normalised). */
-static int ir_vreg_is_bool01(TCCIRState *ir, int32_t vr, int before_idx)
-{
-  if (vr < 0)
-    return 0;
-  if (!tcc_ir_vreg_has_single_def(ir, vr))
-    return 0;
-  int d = tcc_ir_find_defining_instruction(ir, vr, before_idx);
-  if (d < 0)
-    return 0;
-  int op = ir->compact_instructions[d].op;
-  return op == TCCIR_OP_SETIF || op == TCCIR_OP_BOOL_AND ||
-         op == TCCIR_OP_BOOL_OR;
-}
-
-/* Redundant boolean-normalisation elimination.  Detects:
- *   i:   CMP X, #0
- *   i+1: V <-- (cond=NE)   [SETIF]
- * where X is a vreg already proven to be in {0,1}.  Then `(X != 0) == X`, so
- * the pair is rewritten to:
- *   i:   NOP
- *   i+1: V <-- X           [ASSIGN]
- * and copy-propagation/DCE clean up the rest.  This is the `!!bool` idiom the
- * frontend emits when a comparison is stored into a `_Bool` local and then
- * read back (see gcc.c-torture/execute/pr107881-1.c).  Scoped to the exact
- * adjacent CMP/SETIF pair so the CMP's flags have a single consumer. */
-int tcc_ir_opt_bool_norm_elim(TCCIRState *ir)
-{
-  int n = ir->next_instruction_index;
-  int changes = 0;
-  if (n < 2)
-    return 0;
-
-  for (int i = 0; i + 1 < n; i++)
-  {
-    IRQuadCompact *cmp = &ir->compact_instructions[i];
-    if (cmp->op != TCCIR_OP_CMP)
-      continue;
-    IRQuadCompact *setif = &ir->compact_instructions[i + 1];
-    if (setif->op != TCCIR_OP_SETIF)
-      continue;
-
-    /* SETIF cond must be NE (X != 0 == X). */
-    IROperand cond_op = tcc_ir_op_get_src1(ir, setif);
-    if ((int)irop_get_imm64_ex(ir, cond_op) != 0x95 /* TOK_NE */)
-      continue;
-
-    /* Second CMP operand must be immediate 0. */
-    IROperand cmp_s2 = tcc_ir_op_get_src2(ir, cmp);
-    if (!irop_is_immediate(cmp_s2) || cmp_s2.is_sym || cmp_s2.is_lval)
-      continue;
-    if (irop_get_imm64_ex(ir, cmp_s2) != 0)
-      continue;
-
-    /* First CMP operand must be a plain vreg proven to be a boolean. */
-    IROperand cmp_s1 = tcc_ir_op_get_src1(ir, cmp);
-    int32_t vr = irop_get_vreg(cmp_s1);
-    if (vr < 0 || cmp_s1.is_lval || cmp_s1.is_sym)
-      continue;
-    if (!ir_vreg_is_bool01(ir, vr, i))
-      continue;
-
-    /* Rewrite to NOP + ASSIGN. */
-    cmp->op = TCCIR_OP_NOP;
-    setif->op = TCCIR_OP_ASSIGN;
-    IROperand src_vreg = irop_make_vreg(vr, irop_get_btype(cmp_s1));
-    tcc_ir_set_src1(ir, i + 1, src_vreg);
-    tcc_ir_set_src2(ir, i + 1, IROP_NONE);
-    changes++;
-  }
-
+  changes += tcc_ir_opt_block_copy_init(ir);
+  tcc_ir_dump_after_pass(ir, "block_copy_init");
+  changes += tcc_ir_opt_small_memset_to_store(ir);
+  tcc_ir_dump_after_pass(ir, "small_memset_to_store");
+  changes += tcc_ir_opt_small_global_memset_to_store(ir);
+  tcc_ir_dump_after_pass(ir, "small_global_memset_to_store");
   return changes;
 }
 

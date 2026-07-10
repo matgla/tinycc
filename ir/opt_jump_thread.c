@@ -1,5 +1,5 @@
 /*
- *  TCC IR - Jump Threading Optimization
+ *  TCC IR - Fall-Through Jump Elimination
  *
  *  Copyright (c) 2025 Mateusz Stadnik
  *
@@ -13,28 +13,6 @@
 #include "opt.h"
 #include "opt_engine.h"
 #include "opt_utils.h"
-
-/* ============================================================================
- * Jump Threading Optimization (Phase 2c)
- * ============================================================================
- *
- * This pass optimizes control flow by:
- * 1. Forwarding jump targets through NOPs to the next real instruction
- * 2. Following chains of unconditional jumps
- * 3. Eliminating fall-through jumps (jumps to the next instruction)
- *
- * Example before:
- *   JMP to 5       ; jump to a NOP
- *   ...
- *   5: NOP
- *   6: ADD ...
- *
- * After:
- *   JMP to 6       ; jump directly to the real instruction
- *   ...
- *   5: NOP
- *   6: ADD ...
- */
 
 /* Find the first non-NOP instruction at or after the given index.
  * Returns the index of the first real instruction, or the original index
@@ -53,71 +31,52 @@ static int find_first_non_nop(TCCIRState *ir, int start_idx)
 
 /* Follow a chain of unconditional jumps to find the ultimate target.
  * Returns the final target index, or the original target if a cycle is detected
- * or the target has multiple predecessors.
- */
+ * or the target has multiple predecessors. */
 static int follow_jump_chain(TCCIRState *ir, int target_idx, uint8_t *visited)
 {
   int n = ir->next_instruction_index;
   int current = target_idx;
   int iterations = 0;
-  const int MAX_ITERATIONS = 100; /* Prevent infinite loops */
+  const int MAX_ITERATIONS = 100;
 
   while (current < n && iterations < MAX_ITERATIONS)
   {
-    /* Mark current as visited to detect cycles */
     if (visited[current])
       break;
     visited[current] = 1;
 
     IRQuadCompact *q = &ir->compact_instructions[current];
 
-    /* If it's a NOP, skip to next */
     if (q->op == TCCIR_OP_NOP)
     {
       current = find_first_non_nop(ir, current);
       continue;
     }
 
-    /* If it's an unconditional jump, follow it */
     if (q->op == TCCIR_OP_JUMP)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int next_target = (int)irop_get_imm64_ex(ir, dest);
-
-      /* Validate target.  target == n is the epilogue (one past the last
-       * instruction): a valid terminal, so follow the chain into it — this
-       * lets a conditional branch whose arms both reach the epilogue (e.g.
-       * `cond ? f() : 0;` with the result discarded) be threaded to a single
-       * common target and then collapsed. */
+      /* target == n is the epilogue (one past the last instruction): a valid
+       * terminal, so follow the chain into it. */
       if (next_target < 0 || next_target > n)
         break;
-
       current = next_target;
       iterations++;
       continue;
     }
-
-    /* Found a real instruction that's not a jump - this is our target */
     break;
   }
-
   return current;
 }
 
 /* ============================================================================
- * Jump Threading - Forward jump targets through NOPs and jump chains
+ * Jump Threading — post-RA control-flow cleanup (out of scope for the flat->SSA
+ * retirement; runs after regalloc/out-of-SSA where there are no phi nodes).
+ * Forwards each JUMP/JUMPIF target through NOP runs and unconditional-JUMP
+ * chains to the ultimate destination.  See docs/plan_legacy_flat_ir_ssa_retire.md.
  * ============================================================================ */
-static int tcc_ir_opt_jump_threading__timed(TCCIRState *ir);
 int tcc_ir_opt_jump_threading(TCCIRState *ir)
-{
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on) return tcc_ir_opt_jump_threading__timed(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_jump_threading__timed(ir);
-  tcc_pass_timing_add("jump_threading", tcc_pass_clk_us() - _t);
-  return _r;
-}
-static int tcc_ir_opt_jump_threading__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   int changes = 0;
@@ -125,9 +84,6 @@ static int tcc_ir_opt_jump_threading__timed(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-  LOG_IR_GEN("=== JUMP THREADING START ===");
-
-  /* Allocate visited array for cycle detection */
   uint8_t *visited = tcc_mallocz(n);
 
   for (int i = 0; i < n; i++)
@@ -137,36 +93,22 @@ static int tcc_ir_opt_jump_threading__timed(TCCIRState *ir)
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
 
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     int target = (int)irop_get_imm64_ex(ir, dest);
-
-    /* Validate target */
     if (target < 0 || target >= n)
       continue;
 
-    /* Clear visited array for this chain following */
     memset(visited, 0, n);
-
-    /* Find the ultimate target by following NOPs and jump chains */
     int new_target = follow_jump_chain(ir, target, visited);
-
-    /* Also skip NOPs at the new target itself */
     new_target = find_first_non_nop(ir, new_target);
 
     /* A CONDITIONAL branch (JUMPIF) must not have its taken edge retargeted
-     * BACKWARD by chain-following.  Although chasing an unconditional-JUMP
-     * chain is locally value-preserving, retargeting a conditional edge onto
-     * an EARLIER instruction lands it inside an enclosing loop body, where the
-     * not-taken (fall-through) edge also reaches it via the loop back-edge; the
-     * downstream branch-cleanup cascade then sees both arms "converge" and
-     * collapses what is actually a live loop-exit test.  That dropped the
-     * `i < cfg->num_blocks` guard of tcc_ir_opt_licm_ex's fixed-point loop,
-     * letting the index walk cfg->blocks[] out of bounds (the 02..08 self-host
-     * HardFault).  Forward conditional threading (real if/else diamonds) and
-     * all unconditional-JUMP threading stay enabled. */
+     * BACKWARD by chain-following — that would land it inside an enclosing loop
+     * body and let downstream cleanup collapse a live loop-exit test.  Forward
+     * conditional threading and all unconditional-JUMP threading stay enabled.
+     * (A "single-hop, fall-through-unreachable" relaxation was tried and broke
+     * test 295 / cmp_offset_fold back-edge shapes — do not re-relax without a
+     * fuzz sweep.) */
     if (q->op == TCCIR_OP_JUMPIF && new_target < target)
       new_target = target;
 
@@ -175,16 +117,11 @@ static int tcc_ir_opt_jump_threading__timed(TCCIRState *ir)
       IROperand new_dest = dest;
       new_dest.u.imm32 = new_target;
       tcc_ir_op_set_dest(ir, q, new_dest);
-
-      LOG_IR_GEN("JUMP_THREAD: %d -> %d (was %d)", i, new_target, target);
       changes++;
     }
   }
 
   tcc_free(visited);
-
-  LOG_IR_GEN("=== JUMP THREADING END: %d jumps threaded ===", changes);
-
   return changes;
 }
 
@@ -312,5 +249,86 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
   return changes;
 }
 
-int tcc_ir_opt_jump_threading_ex(IROptCtx *ctx) { return tcc_ir_opt_jump_threading(ctx->ir); }
 int tcc_ir_opt_eliminate_fallthrough_ex(IROptCtx *ctx) { return tcc_ir_opt_eliminate_fallthrough(ctx->ir); }
+
+/* JUMPIF inversion — `JUMPIF C -> A; JUMP -> B` where A is the first real
+ * instruction after the JUMP becomes `JUMPIF !C -> B` (JUMP NOPed), saving a
+ * branch.  opt_select normalizes this shape pre-RA, but the cfg_cleanup
+ * cascade re-creates it after opt_select already ran (a collapsed diamond
+ * leaves a conditional skip over a backward latch JUMP), so the cascade needs
+ * a standalone copy.  allow_backward=0 (pre-RA) skips backward B: inverting a
+ * body's `JUMPIF skip; JMP latch` destroys the unconditional body->latch JUMP
+ * try_rotate_loop pattern-matches, blocking rotation (pr112581-1). */
+int tcc_ir_opt_jumpif_invert(TCCIRState *ir, int allow_backward)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMPIF)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    int a = (int)irop_get_imm64_ex(ir, dest);
+    if (a < 0 || a > n)
+      continue;
+
+    int jmp_idx = i + 1;
+    while (jmp_idx < n && ir->compact_instructions[jmp_idx].op == TCCIR_OP_NOP)
+      jmp_idx++;
+    if (jmp_idx >= n)
+      continue;
+    IRQuadCompact *jq = &ir->compact_instructions[jmp_idx];
+    if (jq->op != TCCIR_OP_JUMP)
+      continue;
+
+    int after = jmp_idx + 1;
+    while (after < n && ir->compact_instructions[after].op == TCCIR_OP_NOP)
+      after++;
+    if (after != a)
+      continue;
+
+    if (!allow_backward &&
+        (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq)) < i)
+      continue;
+
+    int inv = invert_condition((int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, q)));
+    if (inv < 0)
+      continue;
+
+    /* No external edge may land on the JUMP or a NOP before it — NOPing the
+     * JUMP would silently reroute that edge onto A. */
+    int targeted = 0;
+    for (int j = 0; j < n && !targeted; j++)
+    {
+      IRQuadCompact *tq = &ir->compact_instructions[j];
+      if (j != i && (tq->op == TCCIR_OP_JUMP || tq->op == TCCIR_OP_JUMPIF))
+      {
+        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, tq));
+        if (t > i && t <= jmp_idx)
+          targeted = 1;
+      }
+    }
+    for (int t = 0; t < ir->num_switch_tables && !targeted; t++)
+    {
+      TCCIRSwitchTable *tbl = &ir->switch_tables[t];
+      if (tbl->default_target > i && tbl->default_target <= jmp_idx)
+        targeted = 1;
+      for (int j = 0; j < tbl->num_entries && !targeted; j++)
+        if (tbl->targets[j] > i && tbl->targets[j] <= jmp_idx)
+          targeted = 1;
+    }
+    if (targeted)
+      continue;
+
+    tcc_ir_op_set_dest(ir, q, tcc_ir_op_get_dest(ir, jq));
+    IROperand new_cond = irop_make_imm32(-1, inv, VT_INT);
+    tcc_ir_op_set_src1(ir, q, new_cond);
+    jq->op = TCCIR_OP_NOP;
+    changes++;
+  }
+
+  return changes;
+}

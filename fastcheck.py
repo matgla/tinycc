@@ -2,7 +2,6 @@
 """Fast O0-vs-O1 checker for a single C file via the QEMU harness."""
 import os, subprocess, sys
 from pathlib import Path
-os.environ["ASAN_OPTIONS"] = "detect_leaks=0"
 sys.path.insert(0, str(Path("tests/fuzz")))
 import fuzz_harness as H
 from pathlib import Path

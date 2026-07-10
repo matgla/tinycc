@@ -35,6 +35,12 @@ Ground truth oracle is `gcc -m32 -funsigned-char` (ARM ABI: unsigned char,
 
 ## Conventions for changes
 
+- **Keep comments short and to the point.** One-liners in code only. If an
+  explanation doesn't fit in a brief comment, write it in `docs/` instead.
+- **Every new `.c`/`.h` file starts with the standard copyright/license header**
+  (see the "File headers" block in `CLAUDE.md`): `Copyright (c) $(date +%Y) Mateusz
+  Stadnik` followed by the LGPL notice, optionally preceded by a one-line
+  description. Match the existing files in the same directory.
 - **Never commit without a regression test** for a bug fix — verbatim or reduced
   repro under `tests/ir_tests/`, expected output in a `.expect` file.
 - New IR opcode → lowering in `arm-thumb-gen.c` + test. New asm instruction →

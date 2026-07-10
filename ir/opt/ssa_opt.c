@@ -11,6 +11,11 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "ssa_opt.h"
+#include "opt/ssa/branch.h"
+#include "const_string_fold.h"
+#include "bitop_const_fold.h"
+#include "opt/ssa/strength.h"
+#include "opt/ssa/fold.h"
 #include <limits.h>
 
 extern int tcc_ir_opt_pass_disabled(const char *name);
@@ -367,10 +372,7 @@ static int ssa_opt_use_is_barrel_shift_src2(IRSSAOptCtx *ctx, IRSSAUse use,
 
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *q = &ir->compact_instructions[use.idx];
-  if (!ir->barrel_shifts || q->orig_index < 0 ||
-      q->orig_index > ir->max_orig_index ||
-      ir->barrel_shifts[q->orig_index] == 0 ||
-      !irop_config[q->op].has_src2)
+  if (tcc_ir_barrel_shift_at(ir, q) == 0 || !irop_config[q->op].has_src2)
     return 0;
 
   IROperand src2 = tcc_ir_op_get_src2(ir, q);
@@ -390,6 +392,19 @@ static void ssa_opt_rewrite_phi_operand(IRSSAOptCtx *ctx, int block,
   }
 }
 
+int ssa_opt_can_replace_all_uses(IRSSAOptCtx *ctx, int32_t old_vr)
+{
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, old_vr);
+  if (!vi)
+    return 0;
+
+  for (int i = 0; i < vi->use_count; i++) {
+    if (ssa_opt_use_is_barrel_shift_src2(ctx, vi->uses[i], old_vr))
+      return 0;
+  }
+  return 1;
+}
+
 int ssa_opt_replace_all_uses(IRSSAOptCtx *ctx, int32_t old_vr, int32_t new_vr)
 {
   if (old_vr == new_vr)
@@ -404,10 +419,8 @@ int ssa_opt_replace_all_uses(IRSSAOptCtx *ctx, int32_t old_vr, int32_t new_vr)
    * or an immediate drops the implicit "this operand must be shifted" value
    * identity from SSA's point of view.  Leave such defs in place so codegen
    * still materializes the shift source exactly as fusion recorded it. */
-  for (int i = 0; i < old_vi->use_count; i++) {
-    if (ssa_opt_use_is_barrel_shift_src2(ctx, old_vi->uses[i], old_vr))
-      return 0;
-  }
+  if (!ssa_opt_can_replace_all_uses(ctx, old_vr))
+    return 0;
 
   int count = 0;
   while (old_vi->use_count > 0) {
@@ -742,7 +755,13 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
      * the conditional branch even when only the FAIL path reads them. */
     SSA_RUN("ssa:var_to_param_forward", ssa_opt_var_to_param_forward(ctx));
     SSA_RUN("ssa:fold", ssa_opt_fold(ctx));
+    SSA_RUN("ssa:cprop", ssa_opt_cprop(ctx));
+    SSA_RUN("ssa:var_imm_prop", ssa_opt_var_imm_prop(ctx));
+    SSA_RUN("ssa:const_prop_tmp", ssa_opt_const_prop_tmp(ctx));
     SSA_RUN("ssa:load_cse", ssa_opt_load_cse(ctx));
+    SSA_RUN("ssa:const_string_fold", tcc_ir_ssa_opt_const_string_fold(ctx));
+    SSA_RUN("ssa:bitop_const_fold", tcc_ir_ssa_opt_bitop_const_fold(ctx));
+    SSA_RUN("ssa:ptr_store_dse", tcc_ir_ssa_opt_ptr_store_dse(ctx));
     SSA_RUN("ssa:branch", ssa_opt_branch(ctx));
     SSA_RUN("ssa:cmp_eq_prop", ssa_opt_cmp_eq_prop(ctx));
     SSA_RUN("ssa:reassoc", ssa_opt_reassoc(ctx));
@@ -767,6 +786,280 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
   } while (changes > 0 && iteration < max_iterations);
 #undef SSA_RUN
 
+  total += tcc_ir_ssa_opt_guard_collapse(ctx);
+
+  return total;
+}
+
+/* Straight-line overwritten-global-store elimination: a STORE to (sym,addend)
+ * with no possible read, call, control transfer, or live jump target between
+ * it and a later same-slot STORE is dead.  Jump targets are recomputed from
+ * live JUMP/JUMPIFs — the is_jump_target flags persist on folded guards'
+ * merge points and would reset tracking at every former section boundary. */
+typedef struct GSDPend { Sym *sym; int64_t addend; int idx; } GSDPend;
+
+/* Memory read via an lval operand: symref reads invalidate that symbol's
+ * pending stores only, stack reads alias no global, anything else (pointer
+ * deref) invalidates everything. */
+static void gsd_read_reset(TCCIRState *ir, IROperand op, GSDPend *pend, int *np)
+{
+  if (!op.is_lval)
+    return;
+  if (op.is_sym) {
+    IRPoolSymref *ref = irop_get_symref_ex(ir, op);
+    if (ref && ref->sym) {
+      for (int k = 0; k < *np;) {
+        if (pend[k].sym == ref->sym)
+          pend[k] = pend[--(*np)];
+        else
+          k++;
+      }
+      return;
+    }
+    *np = 0;
+    return;
+  }
+  if (op.tag == IROP_TAG_STACKOFF || op.is_local || op.is_llocal)
+    return;
+  *np = 0;
+}
+
+static int ssa_opt_global_store_dse(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  int n = ir->next_instruction_index;
+  if (n <= 0)
+    return 0;
+  enum { GSD_CAP = 16 };
+  GSDPend pend[GSD_CAP];
+  int np = 0;
+  int changes = 0;
+
+  uint8_t *is_target = tcc_mallocz((size_t)(n + 7) / 8);
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE ||
+        q->op == TCCIR_OP_INLINE_ASM) {
+      /* Targets we can't enumerate — a kill across one could be observed. */
+      tcc_free(is_target);
+      return 0;
+    }
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
+      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      if (t >= 0 && t < n)
+        is_target[t / 8] |= (uint8_t)(1 << (t % 8));
+    }
+  }
+
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (is_target[i / 8] & (1 << (i % 8)))
+      np = 0;
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    if (q->op == TCCIR_OP_STORE) {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      IROperand src = tcc_ir_op_get_src1(ir, q);
+      if (dest.is_sym && dest.is_lval && !src.is_lval &&
+          irop_get_btype(dest) == IROP_BTYPE_INT32) {
+        IRPoolSymref *ref = irop_get_symref_ex(ir, dest);
+        if (ref && ref->sym && !(ref->sym->type.t & VT_VOLATILE)) {
+          for (int k = 0; k < np; k++) {
+            if (pend[k].sym == ref->sym && pend[k].addend == ref->addend) {
+              ssa_opt_nop_instr(ctx, pend[k].idx);
+              changes++;
+              pend[k] = pend[--np];
+              break;
+            }
+          }
+          if (np < GSD_CAP) {
+            pend[np].sym = ref->sym;
+            pend[np].addend = ref->addend;
+            pend[np].idx = i;
+            np++;
+          }
+          continue;
+        }
+      }
+      np = 0;
+      continue;
+    }
+
+    switch (q->op) {
+    case TCCIR_OP_FUNCCALLVAL: case TCCIR_OP_FUNCCALLVOID:
+    case TCCIR_OP_IJUMP: case TCCIR_OP_SWITCH_TABLE:
+    case TCCIR_OP_BLOCK_COPY: case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_STORE_INDEXED: case TCCIR_OP_STORE_POSTINC:
+    case TCCIR_OP_LOAD_POSTINC:
+    case TCCIR_OP_JUMP: case TCCIR_OP_JUMPIF:
+    case TCCIR_OP_RETURNVALUE: case TCCIR_OP_RETURNVOID:
+    case TCCIR_OP_TRAP:
+      np = 0;
+      continue;
+    default:
+      break;
+    }
+    if (irop_config[q->op].has_src1)
+      gsd_read_reset(ir, tcc_ir_op_get_src1(ir, q), pend, &np);
+    if (irop_config[q->op].has_src2)
+      gsd_read_reset(ir, tcc_ir_op_get_src2(ir, q), pend, &np);
+    if (q->op == TCCIR_OP_MLA)
+      gsd_read_reset(ir, tcc_ir_op_get_accum(ir, q), pend, &np);
+  }
+  tcc_free(is_target);
+  return changes;
+}
+
+/* TEMP-deref store-store DSE: a full-width `*T <- a [STORE]` followed by
+ * another same-width `*T <- b [STORE]` with no possible memory read, call,
+ * opaque op, control transfer, or live jump target between them is dead.
+ * T is a single-def TEMP, so both derefs name the same address; intervening
+ * pure writes don't observe the pending value and don't reset tracking.
+ * Same model as the legacy flat ptr_store_load_fwd DSE it replaces. */
+typedef struct PSDPend { int32_t ptr_vr; int btype; int idx; } PSDPend;
+
+int tcc_ir_ssa_opt_ptr_store_dse(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  int n = ir->next_instruction_index;
+  if (n <= 0)
+    return 0;
+  enum { PSD_CAP = 8 };
+  PSDPend pend[PSD_CAP];
+  int np = 0;
+  int changes = 0;
+
+  uint8_t *is_target = tcc_mallocz((size_t)(n + 7) / 8);
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE ||
+        q->op == TCCIR_OP_INLINE_ASM) {
+      tcc_free(is_target);
+      return 0;
+    }
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
+      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      if (t >= 0 && t < n)
+        is_target[t / 8] |= (uint8_t)(1 << (t % 8));
+    }
+  }
+
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (is_target[i / 8] & (1 << (i % 8)))
+      np = 0;
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      IROperand src = tcc_ir_op_get_src1(ir, q);
+      if (src.is_lval) {
+        np = 0;
+        continue;
+      }
+      int32_t pvr = irop_get_vreg(dest);
+      int btype = irop_get_btype(dest);
+      if (q->op == TCCIR_OP_STORE && dest.is_lval && dest.tag == IROP_TAG_VREG &&
+          !dest.is_local && !dest.is_llocal && !dest.is_sym && pvr >= 0 &&
+          TCCIR_DECODE_VREG_TYPE(pvr) == TCCIR_VREG_TYPE_TEMP &&
+          (btype == IROP_BTYPE_INT32 || btype == IROP_BTYPE_FLOAT32)) {
+        IRSSAVregInfo *pvi = ssa_opt_vinfo(ctx, pvr);
+        if (pvi && pvi->def_count == 1) {
+          for (int k = 0; k < np; k++) {
+            if (pend[k].ptr_vr == pvr) {
+              if (pend[k].btype == btype) {
+                ssa_opt_nop_instr(ctx, pend[k].idx);
+                changes++;
+              }
+              pend[k] = pend[--np];
+              break;
+            }
+          }
+          if (np < PSD_CAP) {
+            pend[np].ptr_vr = pvr;
+            pend[np].btype = btype;
+            pend[np].idx = i;
+            np++;
+          }
+        }
+      }
+      continue;
+    }
+
+    switch (q->op) {
+    case TCCIR_OP_FUNCCALLVAL: case TCCIR_OP_FUNCCALLVOID:
+    case TCCIR_OP_BLOCK_COPY: case TCCIR_OP_STORE_POSTINC:
+    case TCCIR_OP_LOAD_POSTINC: case TCCIR_OP_LOAD:
+    case TCCIR_OP_LOAD_INDEXED: case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_JUMP: case TCCIR_OP_JUMPIF:
+    case TCCIR_OP_RETURNVALUE: case TCCIR_OP_RETURNVOID:
+    case TCCIR_OP_TRAP:
+      np = 0;
+      continue;
+    default:
+      break;
+    }
+    if ((irop_config[q->op].has_src1 && tcc_ir_op_get_src1(ir, q).is_lval) ||
+        (irop_config[q->op].has_src2 && tcc_ir_op_get_src2(ir, q).is_lval) ||
+        (q->op == TCCIR_OP_MLA && tcc_ir_op_get_accum(ir, q).is_lval))
+      np = 0;
+  }
+  tcc_free(is_target);
+  return changes;
+}
+
+/* Sequential const-guard chains (store; cmp; jumpif; call abort; load ...)
+ * fold at most one guard per pipeline round: the dead call must be removed
+ * before the next store→load forwards.  Loop the cheap linear subset until
+ * branch folding runs dry — bounded by the JUMPIF count since folded
+ * branches are never recreated.  Restores the legacy flat branch_fold
+ * fixpoint (gcc-torture 20040629-1 family). */
+int tcc_ir_ssa_opt_guard_collapse(IRSSAOptCtx *ctx)
+{
+  if (tcc_ir_opt_pass_disabled("ssa:guard_collapse"))
+    return 0;
+  int total = 0;
+  for (int guard = 0; guard < 4096; guard++) {
+    total += ssa_opt_load_cse(ctx);
+    total += ssa_opt_cprop(ctx);
+    total += ssa_opt_fold(ctx);
+    int br = ssa_opt_branch(ctx);
+    if (!br)
+      break;
+    total += br + ssa_opt_dce_light(ctx);
+  }
+  if (total) {
+    TCCIRState *ir = ctx->ir;
+    for (int round = 0; round < 8; round++) {
+      int c = 0;
+      /* Retarget jumps pointing at NOP'd instructions to the next live one —
+       * eliminate_fallthrough compares raw indices and would keep them. */
+      int n = ir->next_instruction_index;
+      for (int i = 0; i < n; i++) {
+        IRQuadCompact *q = &ir->compact_instructions[i];
+        if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+          continue;
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        int t = (int)irop_get_imm64_ex(ir, d);
+        int nt = t;
+        while (nt >= 0 && nt < n && ir->compact_instructions[nt].op == TCCIR_OP_NOP)
+          nt++;
+        if (nt != t && nt >= 0) {
+          tcc_ir_set_dest(ir, i, irop_make_imm32(0, nt, irop_get_btype(d)));
+          c++;
+        }
+      }
+      c += tcc_ir_opt_eliminate_fallthrough(ir);
+      c += ssa_opt_global_store_dse(ctx);
+      total += c;
+      if (!c)
+        break;
+    }
+    total += ssa_opt_dce(ctx);
+  }
+  tcc_ir_dump_after_pass(ctx->ir, "ssa:guard_collapse");
   return total;
 }
 

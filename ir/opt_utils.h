@@ -26,6 +26,22 @@ int ir_opt_eval_const_u64(struct TCCIRState *ir, IROperand op, int use_idx,
 int ir_opt_eval_const_string(struct TCCIRState *ir, IROperand op, int use_idx,
                              const char **out, int depth);
 
+/* Resolve op to the constant string it points at AND return the underlying
+ * symref operand (with the resolved addend) in *out — needed to rebuild a
+ * symref at a folded offset. */
+int ir_opt_eval_const_string_operand(struct TCCIRState *ir, IROperand op,
+                                     int use_idx, IROperand *out, int depth);
+
+/* strlen() of a string materialized byte-by-byte into a stack buffer before
+ * the call at call_idx.  Returns 1 and the length in *out_len on success. */
+int ir_opt_eval_stack_strlen(struct TCCIRState *ir, IROperand arg,
+                             int call_idx, int *out_len);
+
+/* Constant string-comparison folders (byte semantics). */
+int ir_opt_fold_strcmp_result(const char *s1, const char *s2);
+int ir_opt_fold_strncmp_result(const char *s1, const char *s2, uint64_t n);
+int ir_opt_fold_memcmp_result(const char *s1, const char *s2, uint64_t n);
+
 int evaluate_compare_condition(int64_t val1, int64_t val2, int cond_token);
 
 int is_power_of_2(int64_t n);

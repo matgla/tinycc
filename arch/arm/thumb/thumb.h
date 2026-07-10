@@ -399,9 +399,6 @@ uint32_t th_encbranch_20(int pos, int addr);
 void th_sym_t();
 void th_sym_d();
 
-void th_trace_regset(uint16_t regs);
-void th_trace_shift_suffix(thumb_shift shift);
-
 uint32_t th_shift_type_to_op(thumb_shift shift);
 uint32_t th_shift_value_to_sr_type(thumb_shift shift);
 
@@ -430,12 +427,6 @@ static inline thop_feat thop_feat_from_bits(uint64_t b)
 static inline thop_feat thop_feat_or(thop_feat a, thop_feat b)
 {
   return thop_feat_from_bits(thop_feat_bits(a) | thop_feat_bits(b));
-}
-
-static inline bool thop_feat_subset(thop_feat sub, thop_feat sup)
-{
-  uint64_t s = thop_feat_bits(sub);
-  return (s & thop_feat_bits(sup)) == s;
 }
 
 static inline thop_feat thop_feat32_widen(thop_feat32 f32)

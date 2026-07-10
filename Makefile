@@ -320,8 +320,13 @@ LIB-$(TR) ?= {B}:/usr/$(TRIPLET-$T)/lib:/usr/lib/$(MARCH-$T)
 INC-$(TR) ?= {B}/include:/usr/$(TRIPLET-$T)/include:/usr/include
 endif
 
-IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_du.c ir/opt_xform.c ir/opt_utils.c ir/opt_alias.c ir/opt_loop_utils.c ir/opt_engine.c ir/opt_pipeline.c ir/opt_hash.c ir/opt_gens_fusion.c ir/opt_gens_bool.c ir/opt_gens_call_result.c ir/opt_gens_branch.c ir/opt_loop.c ir/opt_loop_dead.c ir/opt_memory.c ir/opt_jump_thread.c ir/opt_pack64.c ir/opt_dce.c ir/opt_constfold.c ir/opt_branch.c ir/opt_copyprop.c ir/opt_fusion.c ir/opt_promote.c ir/opt_constprop.c ir/opt_knownbits.c ir/opt_dead_lea_store.c ir/opt_const_aggregate.c ir/opt_dead_vla.c ir/opt_loop_const_sim.c ir/opt_switch_data.c ir/opt_reroll.c ir/opt_neg_chain.c ir/opt_bitfield.c ir/opt_cmp_fuse.c ir/opt_setif_or_taut.c ir/licm.c ir/cfg.c ir/ssa.c ir/opt/ssa_opt.c ir/opt/ssa_opt_dce.c ir/opt/ssa_opt_cprop.c ir/opt/ssa_opt_fold.c ir/opt/ssa_opt_phi.c ir/opt/ssa_opt_strength.c ir/opt/ssa_opt_gvn.c ir/opt/ssa_opt_reassoc.c ir/opt/ssa_opt_narrow.c ir/opt/ssa_opt_branch.c ir/opt/ssa_opt_sccp.c ir/opt/ssa_opt_load_cse.c ir/opt/ssa_opt_dead_loop.c ir/opt/ssa_opt_cmp_eq.c ir/regalloc.c ir/core.c ir/machine_op.c
-CORE_FILES = tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c tccopt.c $(IR_FILES)
+include ir/gen/Makefile
+include source/opt/framework/Makefile
+include source/opt/Makefile
+include source/opt/ssa/Makefile
+include source/backend/generators/Makefile
+IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_du.c ir/opt_xform.c ir/opt_utils.c ir/opt_alias.c ir/opt_loop_utils.c ir/opt_engine.c ir/opt_pipeline.c ir/opt_gens_fusion.c ir/opt_gens_bool.c ir/opt_gens_call_result.c ir/opt_gens_branch.c ir/opt_loop.c ir/opt_memory.c ir/opt_jump_thread.c ir/opt_pack64.c ir/opt_dce.c ir/opt_constfold.c ir/opt_branch.c ir/opt_copyprop.c ir/opt_fusion.c ir/opt_promote.c ir/opt_constprop.c ir/opt_knownbits.c ir/opt_dead_lea_store.c ir/opt_const_aggregate.c ir/opt_dead_vla.c ir/opt_loop_const_sim.c ir/opt_switch_data.c ir/opt_reroll.c ir/opt_neg_chain.c ir/opt_bitfield.c ir/opt_cmp_fuse.c ir/opt_setif_or_taut.c ir/licm.c ir/cfg.c ir/ssa.c ir/opt/ssa_opt.c ir/opt/ssa_opt_dce.c ir/opt/ssa_opt_cprop.c ir/opt/ssa_opt_gvn.c ir/opt/ssa_opt_reassoc.c ir/opt/ssa_opt_sccp.c ir/opt/ssa_opt_load_cse.c ir/opt/ssa_opt_dead_loop.c ir/opt/ssa_opt_loop.c ir/opt/ssa_opt_cmp_eq.c ir/regalloc.c $(IR_GEN_FILES) ir/machine_op.c $(SSA_OPT_SRC)
+CORE_FILES = tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c tccopt.c source/opt/function_pipeline.c source/backend/generators/function.c source/backend/generators/regalloc.c $(IR_FILES)
 CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h tccir_operand.h tccld.h tccmachine.h tccopt.h log.h
 CORE_FILES += $(wildcard ir/*.h)
 armv8m_FILES = $(CORE_FILES) arm-thumb-gen.c arm-thumb-callsite.c arm-link.c arm-thumb-asm.c arm-thumb-defs.h thumb-tok.h arch/arm/thumb/thumb.h arch/arm/arm.h
@@ -340,7 +345,7 @@ ARCH_LIB = $($T_ARCH_LIB)
 TCC_FILES = $(X)tcc.o $(LIBTCC_OBJ) $(ARCH_LIB)
 $(X)tccpp.o : $(TCCDEFS_H)
 
-DEFINES += -I$(TOP) -I$(TOP)/ir -I$(TOP)/ir/opt
+DEFINES += -I$(TOP) -I$(TOP)/ir -I$(TOP)/ir/opt $(OPT_DSL_INC) $(SSA_OPT_INC)
 
 GITHASH:=$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo no)
 ifneq ($(GITHASH),no)
@@ -758,7 +763,7 @@ test-ir: cross test-venv test-prepare download-gcc-tests
 
 # container target: runs the full test suite (all test-* targets below)
 .NOTPARALLEL: test test-full test-all
-test: cross test-aeabi-host test-asm warn-check test-venv test-prepare download-gcc-tests ut test-frontend test-linker test-debug test-runtime test-selfhost test-ir
+test: cross test-aeabi-host test-asm warn-check opt-dsl-check test-venv test-prepare download-gcc-tests ut test-frontend test-linker test-debug test-runtime test-selfhost test-ir
 	@echo "------------ test suite complete ------------"
 
 # Fully sequential test run: disables pytest-xdist too, for the cleanest logs.
@@ -768,18 +773,24 @@ test-sequential:
 
 # run golden IR snapshot tests explicitly.
 # These require a compiler built with CONFIG_TCC_DEBUG because -dump-ir-passes
-# is intentionally a debug/diagnostic interface.  Set GOLDEN_IR_COMPILER to a
-# specific debug binary, or leave it unset to use the runner's fallback search.
-test-golden-ir: test-venv
+# is intentionally a debug/diagnostic interface (on by default, see CFLAGS
+# above).  `cross` builds that binary first so a plain `make test-golden-ir`
+# works from a clean tree; set GOLDEN_IR_COMPILER to point at a different debug
+# binary instead.  Filter cases with K=<expr> (passed to pytest -k).
+test-golden-ir: cross test-venv
 	@echo "------------ golden IR snapshot tests ------------"
 	@compiler_arg=""; \
 	if [ -x "$(GOLDEN_IR_COMPILER)" ]; then \
 		compiler_arg="--compiler $(GOLDEN_IR_COMPILER)"; \
 	fi; \
+	k_arg=""; \
+	if [ -n "$(K)" ]; then \
+		k_arg="-k $(K)"; \
+	fi; \
 	if [ "$(USE_VENV)" = "1" ]; then \
-		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s $(PYTEST_XDIST) -m "golden_ir" --require-dump-ir $$compiler_arg test_golden_ir.py; \
+		cd $(IRTESTS_DIR) && "$(VENV_PY)" -m pytest -s $(PYTEST_XDIST) -m "golden_ir" --require-dump-ir $$compiler_arg $$k_arg test_golden_ir.py; \
 	else \
-		cd $(IRTESTS_DIR) && $(PYTEST) -s $(PYTEST_XDIST) -m "golden_ir" --require-dump-ir $$compiler_arg test_golden_ir.py; \
+		cd $(IRTESTS_DIR) && $(PYTEST) -s $(PYTEST_XDIST) -m "golden_ir" --require-dump-ir $$compiler_arg $$k_arg test_golden_ir.py; \
 	fi
 
 # legacy tests (kept for reference)

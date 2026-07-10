@@ -1746,9 +1746,21 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
   return 1;
 }
 
-/* Try to fold a single loop.  Returns 1 if folded, 0 otherwise. */
-static int lcs_try_fold(TCCIRState *ir, IRLoop *loop)
+/* Shared fold engine over an explicit flat region.  Both the legacy
+ * detect-loops driver and the SSA/CFG driver build a region and call this.
+ * allow_extension enables the rotated-range tail extension (legacy detector
+ * reports tight ranges); SSA callers pass exact membership and disable it. */
+int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
+                    int header_idx, int preheader_idx, int allow_extension)
 {
+  IRLoop lp;
+  memset(&lp, 0, sizeof(lp));
+  lp.start_idx = start_idx;
+  lp.end_idx = end_idx;
+  lp.header_idx = header_idx;
+  lp.preheader_idx = preheader_idx;
+  IRLoop *loop = &lp;
+
   int have_iv_trip = 0;
   InductionVar ivs[MAX_IV];
   int num_ivs = find_induction_vars_ex(ir, loop, ivs, MAX_IV, 1);
@@ -1779,7 +1791,7 @@ static int lcs_try_fold(TCCIRState *ir, IRLoop *loop)
    * jumps within it stay inside or land exactly at exit_target. */
   int eff_start = loop->start_idx;
   int eff_end   = loop->end_idx;
-  if (have_iv_trip && exit_target > eff_end + 1) {
+  if (allow_extension && have_iv_trip && exit_target > eff_end + 1) {
     if (exit_target - eff_start > 512)
       return 0;
     int orig_end = eff_end;
@@ -2157,149 +2169,7 @@ static int lcs_try_fold(TCCIRState *ir, IRLoop *loop)
   return 1;
 }
 
-int tcc_ir_opt_loop_const_sim(TCCIRState *ir)
-{
-  if (!ir || ir->next_instruction_index == 0)
-    return 0;
-
-  IRLoops *loops = tcc_ir_detect_loops(ir);
-  if (!loops)
-    return 0;
-
-  /* Merge overlapping loops — same as the unroller does.  A C for-loop
-   * often produces two backward edges creating two detected loops that
-   * are really one.  Merge them so LCS sees the full loop body. */
-  for (int i = 0; i < loops->num_loops; i++)
-  {
-    if (loops->loops[i].start_idx < 0)
-      continue;
-    int merged;
-    do
-    {
-      merged = 0;
-      for (int j = 0; j < loops->num_loops; j++)
-      {
-        if (j == i || loops->loops[j].start_idx < 0)
-          continue;
-        IRLoop *a = &loops->loops[i];
-        IRLoop *b = &loops->loops[j];
-        if (a->start_idx <= b->end_idx && b->start_idx <= a->end_idx)
-        {
-          if (b->start_idx < a->start_idx)
-          {
-            a->header_idx = b->header_idx;
-            a->start_idx = b->start_idx;
-            a->preheader_idx = b->preheader_idx;
-          }
-          if (b->end_idx > a->end_idx)
-            a->end_idx = b->end_idx;
-          if (b->depth < a->depth)
-            a->depth = b->depth;
-          tcc_free(a->body_instrs);
-          int new_size = a->end_idx - a->start_idx + 1;
-          a->body_instrs = tcc_mallocz(sizeof(int) * new_size);
-          a->body_instrs_capacity = new_size;
-          a->num_body_instrs = 0;
-          for (int k = a->start_idx; k <= a->end_idx; k++)
-            a->body_instrs[a->num_body_instrs++] = k;
-          b->start_idx = -1;
-          merged = 1;
-        }
-      }
-    } while (merged);
-  }
-
-  int changes = 0;
-  for (int li = 0; li < loops->num_loops; li++)
-  {
-    IRLoop *loop = &loops->loops[li];
-    if (loop->start_idx < 0) continue;
-    /* Skip nested loops (depth > 1 — outermost loops have depth=1) */
-    if (loop->depth > 1) continue;
-    /* Skip very large loop ranges to keep cost bounded */
-    if (loop->end_idx - loop->start_idx > 256) continue;
-
-    /* Skip loops that have external entries into the body (not to the
-     * header) — same guard as try_unroll_loop_ex/opt_loop.c.
-     * tcc_ir_detect_loops flags ANY JUMP/JUMPIF whose numeric target is
-     * lower than its own index as a loop back edge, with no dominance
-     * check.  A switch's case-body-before-dispatch layout (the dispatch
-     * jumps forward in control flow to a case handler that was laid out
-     * earlier in instruction order) satisfies that test without being a
-     * loop at all: the dispatch's own entry jump lands inside the "body"
-     * but not at the "header", which a real loop never does.  Simulating
-     * such a false loop executes switch-case code as if it were a
-     * repeating body, corrupting the result (seed 589, switch profile). */
-    int ext_entry = 0;
-    for (int j = 0; j < ir->next_instruction_index && !ext_entry; j++)
-    {
-      if (j >= loop->start_idx && j <= loop->end_idx)
-        continue; /* skip instructions inside the loop itself */
-      IRQuadCompact *jq = &ir->compact_instructions[j];
-      if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF)
-      {
-        IROperand jdest = tcc_ir_op_get_dest(ir, jq);
-        int jtarget = (int)irop_get_imm64_ex(ir, jdest);
-        if (jtarget > loop->start_idx && jtarget <= loop->end_idx)
-        {
-          LOG_IR_GEN("[LOOP-CONST-SIM] loop header=%d: external entry from [%d] to [%d], skipping",
-                     loop->header_idx, j, jtarget);
-          ext_entry = 1;
-        }
-      }
-    }
-    if (ext_entry)
-      continue;
-
-    /* LCS is only sound for register-only arithmetic.  The implementation has
-     * partial stack-memory modeling, but recent fuzz cases show stale aggregate
-     * values still escaping through indexed stores and packed RMW chains after
-     * simulation.  Keep memory-carrying loops for the normal IR pipeline. */
-    int has_memory = 0;
-    for (int bi = 0; bi < loop->num_body_instrs && !has_memory; bi++)
-    {
-      int idx = loop->body_instrs[bi];
-      if (idx < loop->start_idx || idx > loop->end_idx)
-        continue;
-      IRQuadCompact *mq = &ir->compact_instructions[idx];
-      if (mq->op == TCCIR_OP_LOAD || mq->op == TCCIR_OP_STORE ||
-          mq->op == TCCIR_OP_LOAD_INDEXED || mq->op == TCCIR_OP_STORE_INDEXED ||
-          mq->op == TCCIR_OP_LOAD_POSTINC || mq->op == TCCIR_OP_STORE_POSTINC ||
-          mq->op == TCCIR_OP_BLOCK_COPY)
-      {
-        has_memory = 1;
-        break;
-      }
-      if (irop_config[mq->op].has_src1)
-      {
-        IROperand s1 = tcc_ir_op_get_src1(ir, mq);
-        if (s1.is_lval)
-          has_memory = 1;
-      }
-      if (!has_memory && irop_config[mq->op].has_src2)
-      {
-        IROperand s2 = tcc_ir_op_get_src2(ir, mq);
-        if (s2.is_lval)
-          has_memory = 1;
-      }
-      if (!has_memory && mq->op == TCCIR_OP_MLA)
-      {
-        IROperand acc = tcc_ir_op_get_accum(ir, mq);
-        if (acc.is_lval)
-          has_memory = 1;
-      }
-    }
-    if (has_memory)
-      continue;
-
-    changes += lcs_try_fold(ir, loop);
-  }
-
-  tcc_ir_free_loops(loops);
-  return changes;
-}
-
-int tcc_ir_opt_loop_const_sim_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_loop_const_sim(ctx->ir);
-}
+/* The legacy pre-SSA driver (tcc_ir_opt_loop_const_sim / _ex) has been retired;
+ * this file is now the shared fold engine (lcs_fold_region), driven by
+ * ssa_opt_loop_const_sim in ir/opt/ssa_opt_loop.c.  See
+ * docs/plan_legacy_loop_const_sim_ssa.md. */

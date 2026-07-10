@@ -1,6 +1,11 @@
 /* Regression: loop_bound_remat rematerialized a VALUE-LOAD of a local var.
  *
- * Pass:  tcc_ir_opt_loop_bound_remat (ir/opt_loop.c), gated by -fiv-strength-red.
+ * NOTE: loop_bound_remat was RETIRED 2026-07-07 (proven inert at its tccgen
+ * site; see docs/plan_legacy_loop_bound_remat_ssa.md).  This pin is retained as
+ * an anti-reintroduction guard — the checksum must stay correct at every -O
+ * level should a future pass re-attempt this rematerialization.
+ *
+ * Pass:  tcc_ir_opt_loop_bound_remat (ir/opt_loop.c, removed), gated by -fiv-strength-red.
  * Bug:   the pass recomputes SP-relative end-POINTERS (Addr[StackLoc], is_lval=0)
  *        just before a loop CMP to shrink their live range.  It also (wrongly)
  *        accepted a candidate whose STACKOFF source was a VALUE LOAD of a named

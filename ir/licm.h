@@ -86,6 +86,10 @@ int tcc_ir_opt_licm(TCCIRState *ir);
  * Returns NULL if no loops were found. */
 IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir);
 
+/* ssa:licm — regalloc-time driver over the retained LICM engine; runs on flat
+ * IR before ssa:iv_strength_reduction (docs/plan_legacy_loop_licm_ssa.md). */
+int ssa_opt_licm(TCCIRState *ir);
+
 /* Detect loops in the IR - simplified version for natural loops */
 IRLoops *tcc_ir_detect_loops(TCCIRState *ir);
 

@@ -36,6 +36,8 @@
 #include "ir/ssa.h"
 #include "tccir.h"
 #include "arch/arm/arm_regalloc.h"
+#include "source/opt/function_pipeline.h"
+#include "tcc_scope.h"
 
 #include <math.h>
 
@@ -62,8 +64,8 @@ static Sym *sym_free_first;
 static void **sym_pools;
 static int nb_sym_pools;
 
-static Sym *all_cleanups, *pending_gotos;
-static int local_scope;
+Sym *all_cleanups, *pending_gotos;
+int local_scope;
 static int func_param_decl_depth;
 ST_DATA char debug_modes;
 
@@ -648,7 +650,7 @@ static struct temp_local_variable
   short size;
   short align;
 } arr_temp_local_vars[MAX_TEMP_LOCAL_VARIABLE_NUMBER];
-static int nb_temp_local_vars;
+int nb_temp_local_vars;
 
 /* Reusable stack slots for by-value struct arguments passed to variadic
  * functions (the invisible-copy the AAPCS requires for structs > 16 bytes).
@@ -671,8 +673,8 @@ static struct arg_struct_temp
   int size;
   int align;
 } arg_struct_temps[MAX_ARG_STRUCT_TEMPS];
-static int nb_arg_struct_temps;
-static uint64_t arg_struct_temp_busy;
+int nb_arg_struct_temps;
+uint64_t arg_struct_temp_busy;
 
 static int get_arg_struct_temp(int size, int align)
 {
@@ -698,21 +700,9 @@ static int get_arg_struct_temp(int size, int align)
   return loc;
 }
 
-static struct scope
-{
-  struct scope *prev;
-  struct
-  {
-    int loc, locorig, num;
-  } vla;
-  struct
-  {
-    Sym *s;
-    int n;
-  } cl;
-  int *bsym, *csym;
-  Sym *lstk, *llstk;
-} *cur_scope, *loop_scope, *root_scope;
+#include "tcc_scope.h"
+
+struct scope *cur_scope, *loop_scope, *root_scope;
 
 typedef struct
 {
@@ -746,7 +736,7 @@ typedef struct
 static void init_prec(void);
 #endif
 
-static void block(int flags);
+void block(int flags);
 #define STMT_EXPR 1
 #define STMT_COMPOUND 2
 
@@ -767,7 +757,7 @@ static void decl_initializer(init_params *p, CType *type, unsigned long c, int f
 static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, int v, int scope);
 static int decl(int l);
 static void expr_eq(void);
-static void vpush_type_size(CType *type, int *a);
+void vpush_type_size(CType *type, int *a);
 static int is_compatible_unqualified_types(CType *type1, CType *type2);
 ST_FUNC int64_t expr_const64(void);
 static void vpush64(int ty, unsigned long long v);
@@ -775,8 +765,6 @@ static void vpush(CType *type);
 static void gen_inline_functions(TCCState *s);
 static void gen_late_reopt_functions(TCCState *s);
 static void free_inline_functions(TCCState *s);
-static int ir_inline_stash_eligible(Sym *sym, TCCIRState *ir);
-static void ir_inline_stash_add(TCCState *s1, Sym *sym, TCCIRState *ir);
 static void ir_inline_stash_flush(TCCState *s1);
 static void skip_or_save_block(TokenString **str);
 static void gv_dup(void);
@@ -1115,7 +1103,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   return 0;
 }
 
-static void tcc_bench_log_phase(TCCState *s1, const char *operation, const char *name, unsigned *total_time,
+void tcc_bench_log_phase(TCCState *s1, const char *operation, const char *name, unsigned *total_time,
                                 unsigned *count, unsigned elapsed)
 {
   if (!s1 || !s1->do_bench)
@@ -3125,7 +3113,7 @@ static void add_local_bounds(Sym *s, Sym *e)
 #endif
 
 /* Wrapper around sym_pop, that potentially also registers local bounds.  */
-static void pop_local_syms(Sym *b, int keep)
+void pop_local_syms(Sym *b, int keep)
 {
 #ifdef CONFIG_TCC_BCHECK
   if (tcc_state->do_bounds_check && !keep && (local_scope || !func_var))
@@ -8583,6 +8571,43 @@ static void inline_eval_suppress_error(void *opaque, const char *msg)
   (void)msg;
 }
 
+static void inline_eval_cast_arg_to_param(SValue *sv, const CType *param_type)
+{
+  int pbt;
+  int retag = 1;
+
+  if (!sv || !param_type)
+    return;
+
+  if ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST)
+    return;
+
+  pbt = param_type->t & VT_BTYPE;
+  switch (pbt)
+  {
+  case VT_BOOL:
+    sv->c.i = sv->c.i != 0;
+    break;
+  case VT_BYTE:
+    sv->c.i = (param_type->t & VT_UNSIGNED) ? (uint8_t)sv->c.i : (uint64_t)(int64_t)(int8_t)sv->c.i;
+    break;
+  case VT_SHORT:
+    sv->c.i = (param_type->t & VT_UNSIGNED) ? (uint16_t)sv->c.i : (uint64_t)(int64_t)(int16_t)sv->c.i;
+    break;
+  case VT_INT:
+    sv->c.i = (param_type->t & VT_UNSIGNED) ? (uint32_t)sv->c.i : (uint64_t)(int64_t)(int32_t)sv->c.i;
+    break;
+  case VT_LLONG:
+  case VT_PTR:
+    break;
+  default:
+    retag = 0;
+    break;
+  }
+  if (retag)
+    sv->type = *param_type;
+}
+
 /* Try to evaluate a small inline function at compile time with constant arguments.
  * Only handles trivial function bodies of the form: { return expr; }
  * This enables __builtin_constant_p to see through inlined calls, e.g.:
@@ -8835,6 +8860,7 @@ static int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
     {
       tcc_state->inline_eval_overlay_tok[oi] = p2->v & ~SYM_FIELD;
       tcc_state->inline_eval_overlay_sv[oi] = args[oi];
+      inline_eval_cast_arg_to_param(&tcc_state->inline_eval_overlay_sv[oi], &p2->type);
     }
     tcc_state->inline_eval_overlay_n = oi;
   }
@@ -8851,16 +8877,18 @@ static int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
   param = func_type_ref->next;
   for (i = 0; i < nb_args; i++, param = param->next)
   {
+    SValue param_arg = args[i];
     int btype = param->type.t & VT_BTYPE;
     Sym *s;
+    inline_eval_cast_arg_to_param(&param_arg, &param->type);
     if (btype == VT_LLONG)
     {
       CType et = param->type;
       et.t |= VT_ENUM_VAL;
       s = sym_push(param->v & ~SYM_FIELD, &et, VT_CONST, 0);
-      s->enum_val = args[i].c.i;
+      s->enum_val = param_arg.c.i;
     }
-    else if (args[i].r & VT_SYM)
+    else if (param_arg.r & VT_SYM)
     {
       /* Pointer-typed VT_SYM arg: push the param with VT_SYM set so any
        * identifier lookup produces a symbol-tagged SValue. If the body
@@ -8871,7 +8899,7 @@ static int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
     }
     else
     {
-      s = sym_push(param->v & ~SYM_FIELD, &param->type, VT_CONST, (int)args[i].c.i);
+      s = sym_push(param->v & ~SYM_FIELD, &param->type, VT_CONST, (int)param_arg.c.i);
     }
     s->vreg = -1;
   }
@@ -10939,7 +10967,7 @@ static int struct_is_single_1byte_scalar_member(const CType *type)
 
 /* push type size as known at runtime time on top of value stack. Put
    alignment at 'a' */
-static void vpush_type_size(CType *type, int *a)
+void vpush_type_size(CType *type, int *a)
 {
   if (type->t & VT_VLA)
   {
@@ -11206,6 +11234,15 @@ ST_FUNC void vstore(void)
   /* Eagerly snapshot source const_init_data before gaddrof in the memmove
    * path invalidates it.  Used at vstore_done to propagate through struct
    * copies. */
+  /* Snapshot storage is a fixed stack buffer, not a heap alloc: vstore has many
+   * early-return / branch exits (complex, bitfield, scalar, void) that bypass
+   * the vstore_done cleanup below, so a tcc_malloc'd snapshot leaked on every
+   * non-struct-copy path (LeakSanitizer, e.g. a 4-byte local-to-local scalar
+   * store).  The guard bounds the size to 256, and both consumers — the memcpy
+   * into dst_sym->const_init_data and attach_const_init_to_temp — copy the
+   * bytes rather than retain the pointer, so stack storage is safe and needs no
+   * free on any exit path. */
+  unsigned char vstore_src_cid_buf[256];
   unsigned char *vstore_src_cid = NULL;
   int vstore_src_cid_size = 0;
   if ((orig_src.r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_LOCAL | VT_LVAL) &&
@@ -11215,8 +11252,8 @@ ST_FUNC void vstore(void)
     unsigned char *sd = find_sv_const_init(&orig_src, src_size);
     if (sd && src_size > 0 && src_size <= 256)
     {
-      vstore_src_cid = tcc_malloc(src_size);
-      memcpy(vstore_src_cid, sd, src_size);
+      memcpy(vstore_src_cid_buf, sd, src_size);
+      vstore_src_cid = vstore_src_cid_buf;
       vstore_src_cid_size = src_size;
     }
   }
@@ -12236,7 +12273,7 @@ ST_FUNC void vstore(void)
       {
         attach_const_init_to_temp(dst_addr, vstore_src_cid_size, vstore_src_cid);
       }
-      tcc_free(vstore_src_cid);
+      /* vstore_src_cid points at the stack buffer above — no free needed. */
     }
     ;
   }
@@ -17251,6 +17288,8 @@ va_arg_pack_done:
         if (pv == 0)
           pv = anon_sym++;
         Sym *psym = sym_push(pv, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
+        SValue arg_val = saved_args[pi];
+        inline_eval_cast_arg_to_param(&arg_val, &param_sym->type);
 
         if (force_always_inline && inline_arg_is_constant_like(&saved_args[pi]) &&
             tcc_state->inline_const_arg_count < countof(tcc_state->inline_const_args))
@@ -17258,7 +17297,7 @@ va_arg_pack_done:
           int map_idx = tcc_state->inline_const_arg_count++;
           tcc_state->inline_const_args[map_idx].vreg = psym->vreg;
           tcc_state->inline_const_args[map_idx].stack_offset = loc;
-          tcc_state->inline_const_args[map_idx].value = saved_args[pi];
+          tcc_state->inline_const_args[map_idx].value = arg_val;
         }
 
         /* Store argument to local via IR.  If the argument is a 64-bit
@@ -17266,7 +17305,6 @@ va_arg_pack_done:
          * emit an explicit LOAD into a temp first.  The 64-bit STORE
          * backend cannot split a DEREF source via mach_make_hi_half
          * (it needs a register pair, not a pointer). */
-        SValue arg_val = saved_args[pi];
         if ((arg_val.r & VT_LVAL) && (arg_val.type.t & VT_BTYPE) == VT_LLONG)
         {
           SValue load_dst;
@@ -17673,25 +17711,13 @@ static void __attribute__((noinline)) unary_builtin_alloca(void)
 
       /* Emit VLA_ALLOC: adjusts SP down by size and aligns to 8 bytes. */
       SValue size_sv = *vtop;
-      SValue align_sv;
-      memset(&align_sv, 0, sizeof(align_sv));
-      align_sv.type.t = VT_INT;
-      align_sv.r = VT_CONST;
-      align_sv.c.i = 8; /* 8-byte alignment */
-      align_sv.vr = -1;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_ALLOC, &size_sv, &align_sv, NULL);
+      tcc_ir_gen_vla_alloc(tcc_state->ir, &size_sv, 8 /* 8-byte alignment */);
       vpop(); /* pop size */
 
       /* Allocate a local slot to capture the resulting SP (= alloca pointer). */
       loc -= PTR_SIZE;
       int alloca_slot = loc;
-      SValue dst;
-      memset(&dst, 0, sizeof(dst));
-      dst.type.t = VT_PTR;
-      dst.r = VT_LOCAL | VT_LVAL;
-      dst.c.i = alloca_slot;
-      dst.vr = -1;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+      tcc_ir_gen_vla_sp_save(tcc_state->ir, alloca_slot);
 
       /* Push the saved pointer as the return value (void *). */
       type.t = VT_VOID;
@@ -17796,7 +17822,7 @@ static void __attribute__((noinline)) unary_builtin_alloca(void)
       vtop->type.t = VT_INT;
       mk_pointer(&vtop->type);
       indir();
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
+      tcc_ir_gen_return_value(tcc_state->ir, vtop);
       vpop();
     }
     type.t = VT_VOID;
@@ -21701,6 +21727,10 @@ tok_next:
     type.t |= VT_ARRAY;
     memset(&ad, 0, sizeof(AttributeDef));
     ad.section = rodata_section;
+    /* Word-align string literals so word-granular consumers (the ssa:const_string
+     * fold's strcpy->BLOCK_COPY, which reads the literal with LDM) never hit an
+     * unaligned base.  aligned is log2+1, so 3 == 4-byte alignment. */
+    ad.a.aligned = 3;
     {
       /* Force DATA_ONLY_WANTED so the IR backend (which defers code generation)
        * can still allocate the string in rodata now, before the actual code
@@ -24770,7 +24800,7 @@ static void gfunc_return(CType *func_type)
          value into the return register (r0).  Without this the vreg
          produced by gv() is never connected to the physical return
          register and the caller receives garbage. */
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
+      tcc_ir_gen_return_value(tcc_state->ir, vtop);
     }
   }
   else
@@ -24791,7 +24821,7 @@ static void gfunc_return(CType *func_type)
       vtop->r = 0; /* no longer an lvalue */
     }
     tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURNVALUE, vtop, NULL, NULL);
+    tcc_ir_gen_return_value(tcc_state->ir, vtop);
   }
   vtop--; /* NOT vpop() because on x86 it would flush the fp stack */
   print_vstack("gfunc_return");
@@ -25392,13 +25422,7 @@ static void vla_restore(int loc)
 
   if (tcc_state->ir)
   {
-    SValue src;
-    memset(&src, 0, sizeof(src));
-    src.type.t = VT_PTR;
-    src.r = VT_LOCAL | VT_LVAL;
-    src.c.i = loc;
-    src.vr = -1;
-    tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_RESTORE, &src, NULL, NULL);
+    tcc_ir_gen_vla_sp_restore(tcc_state->ir, loc);
   }
   else
   {
@@ -25516,7 +25540,7 @@ static void block_1(int flags);
  * but a nested block() — e.g. a GNU statement-expression used as a call
  * argument — saves/restores the mask and so cannot recycle a slot the
  * enclosing call still has in flight. */
-static void block(int flags)
+void block(int flags)
 {
   uint64_t saved_arg_struct_busy = arg_struct_temp_busy;
   block_1(flags);
@@ -27876,13 +27900,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
         loc -= PTR_SIZE;
         if (tcc_state->ir)
         {
-          SValue dst;
-          memset(&dst, 0, sizeof(dst));
-          dst.type.t = VT_PTR;
-          dst.r = VT_LOCAL | VT_LVAL;
-          dst.c.i = loc;
-          dst.vr = -1;
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+          tcc_ir_gen_vla_sp_save(tcc_state->ir, loc);
         }
         else
         {
@@ -27898,15 +27916,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
       /* vtop holds the runtime allocation size (bytes). Emit an IR op that
        * adjusts SP and aligns it. */
       SValue size_sv = *vtop;
-
-      SValue align_sv;
-      memset(&align_sv, 0, sizeof(align_sv));
-      align_sv.type.t = VT_INT;
-      align_sv.r = VT_CONST;
-      align_sv.c.i = a;
-      align_sv.vr = -1;
-
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_ALLOC, &size_sv, &align_sv, NULL);
+      tcc_ir_gen_vla_alloc(tcc_state->ir, &size_sv, a);
       vpop();
     }
     else
@@ -27921,13 +27931,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
 
     if (tcc_state->ir)
     {
-      SValue dst;
-      memset(&dst, 0, sizeof(dst));
-      dst.type.t = VT_PTR;
-      dst.r = VT_LOCAL | VT_LVAL;
-      dst.c.i = addr;
-      dst.vr = -1;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+      tcc_ir_gen_vla_sp_save(tcc_state->ir, addr);
     }
     else
     {
@@ -27958,13 +27962,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
         loc -= PTR_SIZE;
         if (tcc_state->ir)
         {
-          SValue dst;
-          memset(&dst, 0, sizeof(dst));
-          dst.type.t = VT_PTR;
-          dst.r = VT_LOCAL | VT_LVAL;
-          dst.c.i = loc;
-          dst.vr = -1;
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+          tcc_ir_gen_vla_sp_save(tcc_state->ir, loc);
         }
         else
         {
@@ -27980,13 +27978,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
     if (tcc_state->ir)
     {
       SValue size_sv = *vtop;
-      SValue align_sv;
-      memset(&align_sv, 0, sizeof(align_sv));
-      align_sv.type.t = VT_INT;
-      align_sv.r = VT_CONST;
-      align_sv.c.i = a;
-      align_sv.vr = -1;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_ALLOC, &size_sv, &align_sv, NULL);
+      tcc_ir_gen_vla_alloc(tcc_state->ir, &size_sv, a);
       vpop();
     }
     else
@@ -27999,13 +27991,7 @@ static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has
        at declaration time (addr already points to a PTR_SIZE slot). */
     if (tcc_state->ir)
     {
-      SValue dst;
-      memset(&dst, 0, sizeof(dst));
-      dst.type.t = VT_PTR;
-      dst.r = VT_LOCAL | VT_LVAL;
-      dst.c.i = addr;
-      dst.vr = -1;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_VLA_SP_SAVE, NULL, NULL, &dst);
+      tcc_ir_gen_vla_sp_save(tcc_state->ir, addr);
     }
     else
     {
@@ -28167,94 +28153,10 @@ no_alloc:
   nocode_wanted = saved_nocode_wanted;
 }
 
-/* generate vla code saved in post_type() */
-static void func_vla_arg_code(Sym *arg)
-{
-  int align;
-  TokenString *vla_array_tok = NULL;
 
-  if (arg->type.ref)
-    func_vla_arg_code(arg->type.ref);
 
-  if ((arg->type.t & VT_VLA) && arg->type.ref->vla_array_str)
-  {
-    loc -= type_size(&int_type, &align);
-    loc &= -align;
-    arg->type.ref->c = loc;
-
-    unget_tok(0);
-    vla_array_tok = tok_str_alloc();
-    vla_array_tok->data.str = arg->type.ref->vla_array_str;
-    vla_array_tok->allocated_len = 1;
-    begin_macro(vla_array_tok, 2); /* alloc=2: don't free borrowed buffer */
-    next();
-    gexpr();
-    end_macro();
-    next();
-    vpush_type_size(&arg->type.ref->type, &align);
-    gen_op('*');
-    vset(&int_type, VT_LOCAL | VT_LVAL, arg->type.ref->c);
-    vswap();
-    vstore();
-    vpop();
-    /* Free the VLA expression token buffer now that it's been evaluated, and
-       drop it from the end-of-TU reclamation list so it is not double-freed. */
-    for (int i = 0; i < tcc_state->nb_vla_inner_exprs; i++)
-      if (tcc_state->vla_inner_exprs[i] == arg->type.ref->vla_array_str)
-      {
-        tcc_state->vla_inner_exprs[i] = NULL;
-        break;
-      }
-    tcc_free(arg->type.ref->vla_array_str);
-    arg->type.ref->vla_array_str = NULL;
-  }
-}
-
-static void func_vla_arg(Sym *sym)
-{
-  Sym *arg;
-
-  for (arg = sym->type.ref->next; arg; arg = arg->next)
-  {
-    if ((arg->type.t & VT_BTYPE) != VT_PTR)
-      continue;
-    /* Evaluate nested (inner) VLA dimension expressions */
-    if (arg->type.ref->type.t & VT_VLA)
-      func_vla_arg_code(arg->type.ref);
-    /* Evaluate outermost VLA dimension expressions for side effects.
-       These are stored in tcc_state->vla_param_exprs because the sym union
-       (vla_array_str/next) can't be used without corrupting the type chain. */
-    for (int i = 0; i < tcc_state->nb_vla_param_exprs; i++)
-    {
-      if (tcc_state->vla_param_exprs[i].param == arg->type.ref)
-      {
-        TokenString *vla_array_tok = tok_str_alloc();
-        vla_array_tok->data.str = tcc_state->vla_param_exprs[i].tokens;
-        vla_array_tok->allocated_len = 1;
-        unget_tok(0);
-        begin_macro(vla_array_tok, 2); /* alloc=2: don't free borrowed buffer */
-        next();
-        gexpr();
-        end_macro();
-        next();
-        vpop(); /* discard result, only side effects matter */
-        break;
-      }
-    }
-  }
-  /* Free the VLA param expression list for this function */
-  if (tcc_state->nb_vla_param_exprs)
-  {
-    for (int i = 0; i < tcc_state->nb_vla_param_exprs; i++)
-      tcc_free(tcc_state->vla_param_exprs[i].tokens);
-    tcc_free(tcc_state->vla_param_exprs);
-    tcc_state->vla_param_exprs = NULL;
-    tcc_state->nb_vla_param_exprs = 0;
-  }
-}
-
-/* Forward declaration for nested function compilation */
-static void gen_function(Sym *sym);
+/* gen_function lives in source/backend/generators/function.c */
+extern void gen_function(Sym *sym);
 
 /* Find NestedFunc by function symbol */
 static NestedFunc *find_nested_func_by_sym(Sym *sym)
@@ -28409,7 +28311,7 @@ typedef struct
 } ParentSavedState;
 
 /* Compile all nested functions defined inside a parent function */
-static void compile_nested_functions(Sym *parent_sym)
+void compile_nested_functions(Sym *parent_sym)
 {
   int nb_nested;
   ParentSavedState saved;
@@ -29102,3029 +29004,10 @@ static void prescan_vla_param_captured_vars(NestedFunc *nf, Sym *parent_local_st
   }
 }
 
-/* Emit a call to __cyg_profile_func_enter or __cyg_profile_func_exit.
- * Used for -finstrument-functions support.
- * Arguments: (void *this_fn, void *call_site) */
-static void gen_instrument_call(Sym *cur_func_sym, const char *hook_name)
-{
-  CType void_ptr_type;
-  void_ptr_type.t = VT_VOID;
-  void_ptr_type.ref = NULL;
-  mk_pointer(&void_ptr_type);
-
-  /* arg0: address of current function */
-  vpushsym(&void_ptr_type, cur_func_sym);
-
-  /* arg1: return address (call site) = __builtin_return_address(0)
-   * LR is saved at [FP + PTR_SIZE] in the standard frame record */
-  CType ptr_type;
-  ptr_type.t = VT_VOID;
-  ptr_type.ref = NULL;
-  mk_pointer(&ptr_type);
-  vset(&ptr_type, VT_LOCAL, 0); /* FP value */
-  vpushi(PTR_SIZE);
-  gen_op('+');
-  mk_pointer(&vtop->type);
-  indir();
-
-  /* Push the hook function */
-  vpush_helper_func(tok_alloc_const(hook_name));
-
-  /* Emit IR for 2-arg void call: hook(this_fn, call_site) */
-  const int call_id = tcc_state->ir->next_call_id++;
-  SValue param_num;
-  svalue_init(&param_num);
-  param_num.vr = -1;
-  param_num.r = VT_CONST;
-
-  param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
-  tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
-  param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
-  tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-1], &param_num, NULL);
-
-  SValue call_id_sv = tcc_ir_svalue_call_id_argc(call_id, 2);
-  tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
-  vtop -= 3; /* pop 2 args + func */
-}
-
-#ifdef CONFIG_TCC_DEBUG
-/* If pass_name matches -dump-ir-passes selection, dump the IR labeled with
- * the pass name.  Intended to be called immediately after a
- * tcc_ir_opt_<name>() call to bisect which pass corrupts the IR.  Thin wrapper
- * over the shared implementation in ir/dump.c (also used by the SSA driver). */
-static void dump_ir_after_pass(TCCState *s, TCCIRState *ir, const char *pass_name)
-{
-  (void)s;
-  tcc_ir_dump_after_pass(ir, pass_name);
-}
-
-/* Run a pass call and dump if selected.  `expr` is the call, `name` is a
- * string literal naming the pass. */
-#define RUN_PASS(name, expr)                                                                                           \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    (void)(expr);                                                                                                      \
-    dump_ir_after_pass(tcc_state, ir, name);                                                                           \
-  } while (0)
-#else
-#define RUN_PASS(name, expr) ((void)(expr))
-#endif
-
 /* parse a function defined by symbol 'sym' and generate its code in
    'cur_text_section' */
 void dbg_scan_imm_dest(TCCIRState *ir, const char *pass);
 void dbg_scan_overlap(TCCIRState *ir, const char *pass);
-static void gen_function(Sym *sym)
-{
-  struct scope f = {0};
-  TCCIRState *ir;
-  Sym *global_label_stack_start; /* save global label stack at function start */
-  unsigned phase_start = 0;
-  cur_scope = root_scope = &f;
-  nocode_wanted = 0;
-
-  ind = cur_text_section->data_offset;
-  /* Reset per-function flags */
-  tcc_state->force_frame_pointer = 0;
-  tcc_state->need_frame_pointer = 0;
-  tcc_state->func_dynamic_sp = 0;
-  tcc_state->force_lr_save = 0;
-  tcc_state->func_save_apply_args = 0;
-  tcc_state->apply_args_offset = 0;
-  tcc_state->ir_post_float_narrow = 0;
-
-  /* Save global label stack position so we only pop labels from this function */
-  global_label_stack_start = global_label_stack;
-
-  if (sym->a.aligned)
-  {
-    size_t newoff = section_add(cur_text_section, 0, 1 << (sym->a.aligned - 1));
-    gen_fill_nops(newoff - ind);
-  }
-
-  funcname = get_tok_str(sym->v, NULL);
-  func_ind = ind;
-  func_vt = sym->type.ref->type;
-  func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
-  func_has_label_addr = 0;
-  tcc_state->cur_func_sym = sym;
-
-  /* NOTE: we patch the symbol size later */
-  put_extern_sym(sym, cur_text_section, ind + 1, 0);
-
-  if (sym->type.ref->f.func_ctor)
-    add_array(tcc_state, ".init_array", sym->c);
-  if (sym->type.ref->f.func_dtor)
-    add_array(tcc_state, ".fini_array", sym->c);
-
-  /* put debug symbol */
-  tcc_debug_funcstart(tcc_state, sym);
-
-  /* push a dummy symbol to enable local sym storage */
-  sym_push2(&local_stack, SYM_FIELD, 0, 0);
-  LOG_IR_GEN("Generating IR for function %s", funcname);
-  ir = tcc_ir_alloc();
-  tcc_state->ir = ir;
-  ir->naked = sym->a.naked;
-  ir->is_variadic = func_var;
-
-  /* Check if we're compiling a nested function with captured variables */
-  if (tcc_state->current_nested_func && tcc_state->current_nested_func->nb_captured > 0)
-  {
-    NestedFunc *nf = tcc_state->current_nested_func;
-    /* Set up static chain for nested function */
-    ir->has_static_chain = 1;
-    /* Store captured variable offsets for chain-relative addressing */
-    ir->captured_count = nf->nb_captured;
-    for (int j = 0; j < nf->nb_captured && j < 32; j++)
-    {
-      ir->captured_offsets_list[j] = nf->captured_offsets[j];
-      ir->captured_chain_depths[j] = nf->captured_chain_depth[j];
-    }
-    /* Allocate a vreg for the static chain pointer (models R10 as parameter) */
-    ir->static_chain_vreg = tcc_ir_get_vreg_static_chain(ir);
-    /* Propagate needs_chain_save from NestedFunc to IR */
-    ir->needs_chain_save = nf->needs_chain_save;
-  }
-
-  /* Initialize FP offset cache for code generation optimization */
-  if (tcc_state->opt_fp_offset_cache)
-    tcc_ir_opt_fp_cache_init(ir);
-
-  local_scope = 1; /* for function parameters */
-  tcc_ir_params_add(ir, &sym->type);
-
-  /* Reserve chain save slot at FP-4 AFTER tcc_ir_params_add (which resets loc).
-   * This biases the global `loc` so that no local variable or spill slot
-   * occupies FP-4, which is used to save the incoming static chain (R10)
-   * for multi-level nested function access.
-   * We always reserve FP-4 when has_static_chain is set; the chain save
-   * instruction is only emitted during codegen if needs_chain_save is true.
-   * This is necessary because needs_chain_save may be discovered late (when
-   * inner nested functions are found during body parsing). */
-  if (ir->has_static_chain)
-    loc -= 4;
-  nb_temp_local_vars = 0;
-  nb_arg_struct_temps = 0;
-  arg_struct_temp_busy = 0;
-  if (!sym->a.naked)
-  {
-    // gfunc_prolog(sym);
-    // Note: tcc_debug_prolog_epilog(0) is now called from ir/codegen.c
-    // after tcc_gen_machine_prolog() so that the DWARF prologue_end
-    // marker is emitted at the correct PC (after the machine prolog).
-  }
-
-  local_scope = 0;
-  rsym = -1; /* Initialize return symbol chain with -1 sentinel */
-
-  /* -finstrument-functions: emit entry hook call before function body */
-  if (tcc_state->instrument_functions && !sym->type.ref->f.func_no_instrument)
-  {
-    tcc_state->force_frame_pointer = 1;
-    tcc_state->force_lr_save = 1;
-    gen_instrument_call(sym, "__cyg_profile_func_enter");
-  }
-
-  func_vla_arg(sym);
-  if (tcc_state->do_bench)
-    phase_start = tcc_getclock_ms();
-  block(0);
-  /* Backpatch all return jumps to point to the epilogue (past the end of IR) */
-  tcc_ir_backpatch_to_here(ir, rsym);
-
-  /* Clear addrtaken on captured variables for auto-inlined nested functions
-   * whose standalone copy has no callers (no sibling references, no trampoline).
-   * Must run after block(0) so all nested functions are registered. */
-  if (ir && tcc_state->nb_nested_funcs > 0) {
-    /* Fast path: if this function's IR ended up with zero chain-setup ops
-     * (every nested-function call was inlined) and no nested function is
-     * trampoline-required (no & taken), then nothing at runtime can read
-     * this function's locals through the static chain.  Clear addrtaken
-     * on every captured VAR — the per-VAR bit is what cprop/DCE consult
-     * later, and leaving it set blocks constant folding for what are now
-     * plain locals. */
-    int func_has_chain_op = 0;
-    int any_trampoline_needed = 0;
-    for (int i = 0; i < ir->next_instruction_index && !func_has_chain_op; i++) {
-      int op = ir->compact_instructions[i].op;
-      if (op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT)
-        func_has_chain_op = 1;
-    }
-    for (int ni = 0; ni < tcc_state->nb_nested_funcs && !any_trampoline_needed; ni++) {
-      if (tcc_state->nested_funcs[ni].trampoline_needed)
-        any_trampoline_needed = 1;
-    }
-    if (!func_has_chain_op && !any_trampoline_needed) {
-      for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++) {
-        NestedFunc *nf = &tcc_state->nested_funcs[ni];
-        for (int ci = 0; ci < nf->nb_captured; ci++) {
-          int vreg = nf->captured_vregs[ci];
-          if (vreg >= 0) {
-            IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
-            if (interval)
-              interval->addrtaken = 0;
-          }
-        }
-      }
-    }
-  }
-  if (ir && tcc_state->nb_nested_funcs > 0) {
-    for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++) {
-      NestedFunc *nf = &tcc_state->nested_funcs[ni];
-      if (!nf->sym || !nf->sym->type.ref || !nf->sym->type.ref->f.func_auto_inline)
-        continue;
-      if (nf->trampoline_needed || nf->nb_captured == 0)
-        continue;
-      int called_by_sibling = 0;
-      int func_tok = nf->sym->v & ~SYM_FIELD;
-      for (int si = 0; si < tcc_state->nb_nested_funcs && !called_by_sibling; si++) {
-        NestedFunc *sib = &tcc_state->nested_funcs[si];
-        if (sib == nf || !sib->func_str)
-          continue;
-        const int *tp = tok_str_buf(sib->func_str);
-        while (*tp) {
-          int tv;
-          CValue tcv;
-          tok_get(&tv, &tp, &tcv);
-          if (tv == TOK_EOF || tv == 0) break;
-          if (tv == func_tok) { called_by_sibling = 1; break; }
-        }
-      }
-      if (!called_by_sibling) {
-        for (int ci = 0; ci < nf->nb_captured; ci++) {
-          int vreg = nf->captured_vregs[ci];
-          if (vreg >= 0) {
-            int keep_addrtaken = 0;
-            for (int oi = 0; oi < tcc_state->nb_nested_funcs && !keep_addrtaken; oi++) {
-              NestedFunc *other = &tcc_state->nested_funcs[oi];
-              if (other == nf || other->nb_captured == 0)
-                continue;
-
-              int captures_vreg = 0;
-              for (int oc = 0; oc < other->nb_captured; oc++) {
-                if (other->captured_vregs[oc] == vreg) {
-                  captures_vreg = 1;
-                  break;
-                }
-              }
-              if (!captures_vreg)
-                continue;
-
-              if (!other->sym || !other->sym->type.ref || other->trampoline_needed ||
-                  !other->sym->type.ref->f.func_auto_inline) {
-                keep_addrtaken = 1;
-                break;
-              }
-
-              {
-                int other_called_by_sibling = 0;
-                int other_func_tok = other->sym->v & ~SYM_FIELD;
-                for (int si = 0; si < tcc_state->nb_nested_funcs && !other_called_by_sibling; si++) {
-                  NestedFunc *sib = &tcc_state->nested_funcs[si];
-                  if (sib == other || !sib->func_str)
-                    continue;
-                  const int *tp = tok_str_buf(sib->func_str);
-                  while (*tp) {
-                    int tv;
-                    CValue tcv;
-                    tok_get(&tv, &tp, &tcv);
-                    if (tv == TOK_EOF || tv == 0)
-                      break;
-                    if (tv == other_func_tok) {
-                      other_called_by_sibling = 1;
-                      break;
-                    }
-                  }
-                }
-                if (other_called_by_sibling)
-                  keep_addrtaken = 1;
-              }
-            }
-
-            if (!keep_addrtaken) {
-              IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
-              if (interval)
-                interval->addrtaken = 0;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  /* -finstrument-functions: emit exit hook call at the common return point */
-  if (tcc_state->instrument_functions && !sym->type.ref->f.func_no_instrument)
-  {
-    gen_instrument_call(sym, "__cyg_profile_func_exit");
-  }
-
-  if (tcc_state->do_bench)
-  {
-    unsigned now = tcc_getclock_ms();
-    tcc_bench_log_phase(tcc_state, "func-body", funcname, &tcc_state->bench_function_body_time,
-                        &tcc_state->bench_function_body_count, now - phase_start);
-    phase_start = now;
-  }
-
-#ifdef CONFIG_TCC_DEBUG
-  if (tcc_state->dump_ir)
-  {
-    tcc_ir_dump_set_show_physical_regs(0); /* Show only virtual registers */
-    printf("=== IR BEFORE OPTIMIZATIONS ===\n");
-    tcc_ir_show(ir);
-    printf("=== END IR BEFORE OPTIMIZATIONS ===\n");
-  }
-#endif
-
-
-  /* Carry narrow plain-STORE access widths onto their value operands before any
-   * pass converts a plain STORE (width from dest) into a STORE_INDEXED (width
-   * from the value operand) — so a char/short store is not widened to a word.
-   * Run again before regalloc to catch widths lost to later value forwarding. */
-  if (tcc_state->optimize > 0)
-    tcc_ir_opt_narrow_store_value_btype(ir);
-
-  /* Block copy init: replace memset(0) + consecutive stores with BLOCK_COPY
-   * from a pre-built rodata block.  Run once before the iterative loop. */
-  { void dbg_scan_overlap(TCCIRState*,const char*); dbg_scan_overlap(ir,"pre-block_copy_init"); }
-  tcc_ir_opt_block_copy_init(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "block_copy_init");
-#endif
-
-  /* Small zero-memset to direct STORE: for the leftover memset(stack, N<=8, 0)
-   * cases that block_copy_init didn't touch (no follow-up stores, or size
-   * not a multiple of 4).  Removes the runtime memset call for trivial
-   * zero-initialized locals so downstream store-load forwarding can fold
-   * subsequent reads to #0. */
-  tcc_ir_opt_small_memset_to_store(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "small_memset_to_store");
-#endif
-
-  /* Same idea for a global (static) destination: inline a small constant-size
-   * memset of a static as a single naturally-aligned direct store, the way GCC
-   * does.  Unblocked by the tu_static_writer late-reopt double-emit fix. */
-  tcc_ir_opt_small_global_memset_to_store(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "small_global_memset_to_store");
-#endif
-
-  /* Fold memmove(dst_ptr, &local_tmp, N) into direct STORE_INDEXED ops on
-   * dst_ptr when the temp is only used to feed this single memmove.  Cuts
-   * a function call (and its temp materialization) out of complex/struct
-   * assignments through a pointer destination. */
-  tcc_ir_opt_memmove_to_indexed_stores(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "memmove_to_indexed_stores");
-#endif
-
-  /* Identical-block loop re-rolling.  Runs BEFORE propagation so the
-   * per-iteration IR is in its raw, structurally-consistent form (the
-   * propagation passes can rewrite operand encodings in ways that vary
-   * across iterations and would defeat structural matching). */
-  if (tcc_state->opt_reroll) {
-    tcc_ir_opt_reroll(ir);
-    tcc_ir_opt_compact_nops(ir);
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "reroll");
-#endif
-  }
-
-  /* Interprocedural constant propagation: replace calls to functions known
-   * to return a constant with ASSIGN #const.  Runs before the iterative
-   * loop so existing passes cascade the constant through the caller. */
-  if (tcc_state->opt_ipc)
-  {
-    tcc_ir_opt_const_call_replace(ir);
-    /* Switch-value IPCP: fold calls to single-arg pure dispatchers whose arg
-     * is a constant (e.g. parse_btype-style `switch (tok) { case K: return C; }`).
-     * Runs alongside const_call_replace so the cascade picks up the constant. */
-    tcc_ir_opt_switch_call_replace(ir);
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "const_call_replace");
-#endif
-  }
-
-  /* Iterative optimization loop — propagation + simplification passes run
-   * until fixed-point (no changes) or max 10 iterations.  Managed by the
-   * pipeline runner with per-pass feature-flag gating. */
-  {
-    const IRPassGroup *groups;
-    int group_count;
-    tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
-    IROptCtx prop_ctx;
-    tcc_ir_opt_ctx_init(&prop_ctx, ir);
-    tcc_ir_opt_run_group(&prop_ctx, &groups[0]);
-    tcc_ir_opt_ctx_free(&prop_ctx);
-  }
-  dbg_scan_overlap(ir,"P1-after-prop-group");
-
-  tcc_state->ir_post_float_narrow = 1;
-
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "propagation_group");
-#endif
-
-  /* Narrow CSE: deduplicate PARAM/VAR + #constant expressions. */
-  if (tcc_state->optimize >= 1)
-    tcc_ir_opt_cse_param_add(ir);
-
-  /* Redundant boolean-normalisation: rewrite `CMP X,#0; SETIF NE` to a plain
-   * copy of X when X is already a {0,1} boolean (the `!!bool` idiom).  Runs
-   * before CMP+SETIF CSE so the freed copies expose duplicate compares. */
-  if (tcc_state->optimize >= 1)
-    tcc_ir_opt_bool_norm_elim(ir);
-
-  /* CMP+SETIF CSE: replace a second CMP+SETIF whose operands and cond
-   * match an earlier one in the same BB with ASSIGN-from-prior-vreg. */
-  if (tcc_state->optimize >= 1)
-    tcc_ir_opt_cmp_setif_cse(ir);
-
-  /* GlobalSym CSE: hoist repeated global symbol addresses to TEMPs.
-   * Must run before compact_nops since it reuses NOP slots. */
-  if (tcc_state->optimize >= 1)
-    tcc_ir_opt_globalsym_cse(ir);
-
-  /* Compact NOPs accumulated during the iterative loop.
-   * All subsequent passes benefit from a smaller instruction array. */
-  tcc_ir_opt_compact_nops(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "compact_nops_pre_jthread");
-#endif
-
-  /* Global CSE is handled by SSA GVN pass in regalloc. */
-
-  LOG_IR_GEN("OPTIMIZE: propagation group complete");
-
-  /* Phase 2c: Jump Threading - forward jump targets through NOPs and chains
-   * This eliminates unnecessary jumps and simplifies control flow.
-   */
-  if (tcc_state->opt_jump_threading)
-  {
-    int jump_changes = tcc_ir_opt_jump_threading(ir);
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "jump_threading");
-#endif
-    /* Always run fall-through elimination when jump threading is enabled.
-     * Fall-through jumps can appear even without threading changes, e.g.
-     * when DCE turns dead code into NOPs making a JMP target the next
-     * real instruction.  This is essential for dead-code suppression in
-     * tests like 96_nodata_wanted. */
-    jump_changes += tcc_ir_opt_eliminate_fallthrough(ir);
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "eliminate_fallthrough");
-#endif
-    if (jump_changes && tcc_state->opt_dce)
-    {
-      tcc_ir_opt_dce(ir); /* Clean up any newly unreachable code */
-#ifdef CONFIG_TCC_DEBUG
-      dump_ir_after_pass(tcc_state, ir, "dce_post_jthread");
-#endif
-    }
-  }
-
-  /* Phases 3b–4b: Fusion and boolean passes.
-   * None of these passes change control flow — they only NOP individual
-   * instructions via pattern matching.  A single DCE at the end (line below)
-   * is therefore sufficient; running DCE after each individual pass would be
-   * a no-op and wastes O(n) work per pass.
-   *
-   * Ordering constraints:
-   *   mla_fusion      should run before indexed/postinc (cleaner patterns)
-   *
-   * Uses a shared IROptCtx for all fusion/gen passes in this section,
-   * avoiding repeated alloc/free and enabling cross-pass DU cache reuse.
-   */
-  IROptCtx pipeline_ctx;
-  tcc_ir_opt_ctx_init(&pipeline_ctx, ir);
-
-  if (tcc_state->optimize > 0)
-    tcc_ir_opt_gens_fusion_ex(&pipeline_ctx);
-
-  if (tcc_state->opt_indexed_memory)
-    tcc_ir_opt_gens_deref_indexed_ex(&pipeline_ctx);
-
-  if (tcc_state->opt_disp_fusion)
-    tcc_ir_opt_gens_disp_ex(&pipeline_ctx);
-
-  /* ADD+deref fold - fuse ADD(base, #imm) where the result is used as an
-   * lval (implicit deref) in CMP/ADD/etc into LOAD_INDEXED + plain use.
-   * Catches patterns that disp_fusion misses (lval embedded in non-LOAD ops). */
-  if (tcc_state->opt_disp_fusion)
-    tcc_ir_opt_add_deref_fold(ir);
-
-  /* Re-run copy_prop + DCE after disp/add_deref fusion: those passes leave
-   * behind `T = P0 [ASSIGN]` copies whose only consumer is the new
-   * STORE_INDEXED/LOAD_INDEXED base operand.  Propagating P0 directly into
-   * the indexed op eliminates the copy and lets the regalloc avoid an
-   * extra MOV per folded access. */
-  if (tcc_state->opt_disp_fusion && tcc_state->opt_copy_prop)
-  {
-    tcc_ir_opt_copy_prop(ir);
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir);
-  }
-
-  /* Indexed-chain fold + pair reorder (invalidate ctx after intermediate passes) */
-  if (tcc_state->opt_disp_fusion) {
-    tcc_ir_opt_ctx_invalidate(&pipeline_ctx);
-    tcc_ir_opt_gens_chain_ex(&pipeline_ctx);
-    tcc_ir_opt_gens_pair_reorder_ex(&pipeline_ctx);
-  }
-
-  /* Call-chain result rename: rename `CALL → V; PARAMVAL[0] V; redef V`
-   * triples to fresh per-pair TEMPs so the regalloc keeps the value in r0
-   * across `f(g(h(x)))`-style call chains instead of moving it through a
-   * callee-saved reg.  Helps every benchmark with a function-call chain
-   * (bench_function_calls and many others). */
-  if (tcc_state->optimize >= 1)
-    tcc_ir_opt_call_chain_rename(ir);
-
-  /* Hoist literal Addr[StackLoc[X]] operands out of ADDs by CSE'ing them
-   * into a single TEMP per offset at function entry.  Helps `pool[i].field`
-   * patterns where a single base address is reused across many loop
-   * iterations with different runtime indices. */
-  if (tcc_state->optimize >= 1)
-    tcc_ir_opt_stackoff_addr_cse(ir);
-
-  /* LEA CSE — collapse repeated LEAs of the same vreg-backed stack address
-   * into one canonical LEA + ASSIGN copies.  Restricted to the vreg-backed
-   * STACKOFF case (anonymous temp locals) that lea_fold cannot fold because
-   * dropping every reference to the vreg would unanchor the stack-layout
-   * slot.  For non-vreg STACKOFFs (Addr[StackLoc[-N]]), lea_fold already
-   * folds each LEA into a direct stack access, and CSE'ing them here would
-   * give the canonical LEA multiple uses and disable lea_fold (which
-   * requires single-use). */
-  if (tcc_state->opt_lea_fold)
-  {
-    if (tcc_ir_opt_lea_cse(ir) > 0)
-    {
-      if (tcc_state->opt_copy_prop)
-        tcc_ir_opt_copy_prop(ir);
-    }
-  }
-
-  /* LEA+deref fold - collapse `LEA Addr[StackLoc[-N]] + [ADD #K] + deref-use`
-   * into a direct StackLoc access.  Runs after disp-fusion so any surviving
-   * LEA+ADD pairs still have a chance to be folded here. */
-  if (tcc_state->opt_lea_fold)
-    tcc_ir_opt_lea_fold(ir);
-
-  /* LEA read-modify-write fold — collapse a stack-slot LEA whose every use is
-   * a deref (load + store of `u.field++`) into direct StackLoc accesses, which
-   * lea_fold's single-use guard cannot do. */
-  if (tcc_state->opt_lea_fold)
-    tcc_ir_opt_lea_rmw_fold(ir);
-
-  /* Post-Increment Load/Store Fusion - fuse LOAD/STORE + ADD
-   * Pattern: *ptr++; -> ARM LDR/STR with post-increment */
-  if (tcc_state->opt_postinc_fusion)
-    tcc_ir_opt_postinc_fusion(ir);
-
-  /* Boolean idempotent simplification via shared pipeline context. */
-  if (tcc_state->opt_bool_idempotent) {
-    tcc_ir_opt_ctx_invalidate(&pipeline_ctx);
-    tcc_ir_opt_gens_bool_ex(&pipeline_ctx);
-  }
-  /* Boolean CSE (hash-table based, BB-scoped). */
-  if (tcc_state->opt_bool_cse)
-    tcc_ir_opt_bool_cse(ir);
-
-  /* Compact NOPs before the store-load forwarding loop (up to 12 iterations). */
-  tcc_ir_opt_compact_nops(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "compact_nops_pre_slfwd");
-#endif
-
-  /* Entry-block store propagation — trigger-based group (3 iterations).
-   * entry_store_prop is the trigger: if it returns 0, the group exits.
-   * Cleanup uses compound pass replicating original two-phase sequence. */
-  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
-  {
-    IROptCtx esp_ctx;
-    tcc_ir_opt_ctx_init(&esp_ctx, ir);
-    tcc_ir_opt_run_group(&esp_ctx, &entry_store_group);
-    tcc_ir_opt_ctx_free(&esp_ctx);
-  }
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "entry_store_group");
-#endif
-
-  /* Struct-copy round-trip elimination: drop the `memmove(B,A); memmove(A,B)`
-   * pair left by an inlined identity `y = retme(y)` struct-by-value helper, so
-   * the field poke/re-extract around it sits in one straight-line block and the
-   * memory group's sl_forward + bf_insert_extract cascade can collapse it. */
-  if (tcc_state->opt_redundant_store)
-  {
-    if (tcc_ir_opt_struct_copy_roundtrip_elim(ir) > 0)
-    {
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-    }
-  }
-
-
-  /* Phase 4: Store-Load Forwarding — trigger-based iterative group.
-   * sl_forward is the trigger (idx 0): if it returns 0, the group exits.
-   * Uses compound passes (const_prop_cascade, branch_folding_2x) to match
-   * the original nested sub-loop and double-call behavior. */
-  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
-  {
-    const IRPassGroup *groups;
-    int group_count;
-    tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
-    IROptCtx sl_ctx;
-    tcc_ir_opt_ctx_init(&sl_ctx, ir);
-    tcc_ir_opt_run_group(&sl_ctx, &groups[1]);
-    tcc_ir_opt_ctx_free(&sl_ctx);
-  }
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "memory_group");
-#endif
-
-  /* Unconditional known-bits cascade.  The memory group's trigger
-   * (sl_forward) can return 0 when the propagation phase folded away the
-   * patterns sl_forward looks for, which then skips the remaining cascade
-   * passes — including known_bits running over the lea-folded IR.  Run a
-   * short cascade unconditionally so direct-stack reads created by lea_fold
-   * get one more shot at folding. */
-  if (tcc_state->opt_const_prop)
-  {
-    for (int i = 0; i < 4; i++) {
-      int ch = 0;
-      ch += tcc_ir_opt_known_bits(ir);
-      ch += tcc_ir_opt_const_prop_tmp(ir);
-      ch += tcc_ir_opt_branch_folding(ir);
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      ch += tcc_ir_opt_eliminate_fallthrough(ir);
-      tcc_ir_opt_compact_nops(ir);
-      if (!ch)
-        break;
-    }
-  }
-  /* Post-SL_FWD cleanup: the SL_FWD loop's DCE may have killed dead branches
-   * that were the only remaining defs of a VAR (e.g. `fail = 1` in a dead
-   * printf path).  Re-run const_prop + branch_folding + DCE so the now-
-   * single-def VAR gets propagated into its uses and any resulting trivial
-   * branches (`CMP #0, #0; BNE`) fold away. */
-  if (tcc_state->opt_const_prop)
-  {
-    tcc_ir_opt_const_prop(ir);
-    tcc_ir_opt_const_prop_tmp(ir);
-    tcc_ir_opt_branch_folding(ir);
-    tcc_ir_opt_stack_addr_nonnull_fold(ir);
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir);
-  }
-
-  /* Param-addrof const-store fold: collapse `LEA &P; *T = #C; ... use(P) ...`
-   * into a direct constant.  Must run after SL-FWD has inlined helpers and
-   * exposed the bare LEA+STORE+RETURNVALUE shape.  The local-addrof variant
-   * handles the analogous pattern over a local VAR (callers that inline a
-   * `helper(&local)` body).  addrof_var_fwd handles the read-through
-   * analogue: `ASSIGN V=#C; LEA T=&V; ... *T ...` → ... #C ... (the
-   * __attribute__((cleanup)) pattern). */
-  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
-  {
-    int padrof_changed = tcc_ir_opt_param_addrof_const_fold(ir) > 0;
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "ZZ_padrof");
-#endif
-    int ladrof_changed = tcc_ir_opt_local_addrof_const_fold(ir) > 0;
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "ZZ_ladrof");
-#endif
-    int aofvar_changed = 0;
-    int gslfwd_changed = 0;
-    int iglh_changed = 0;
-    if (tcc_state->opt_const_prop)
-      aofvar_changed = tcc_ir_opt_addrof_var_fwd(ir) > 0;
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "ZZ_aofvar");
-#endif
-    if (tcc_state->opt_store_load_fwd)
-      gslfwd_changed = tcc_ir_opt_global_sl_fwd(ir) > 0;
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "ZZ_gslfwd");
-#endif
-    if (tcc_state->opt_store_load_fwd)
-      iglh_changed = tcc_ir_opt_invariant_global_load_hoist(ir) > 0;
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "ZZ_iglh");
-#endif
-    if (padrof_changed || ladrof_changed || aofvar_changed || gslfwd_changed || iglh_changed)
-    {
-      if (tcc_state->opt_const_prop)
-      {
-        tcc_ir_opt_const_prop(ir);
-        tcc_ir_opt_const_prop_tmp(ir);
-        /* gslfwd may have introduced `CMP #C, #C` patterns by substituting
-         * stored constants into reads.  Fold those conditional jumps so the
-         * downstream DCE can eliminate now-unreachable branches. */
-        tcc_ir_opt_branch_folding(ir);
-      }
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      /* Second wave: branch_folding+DCE may have killed the only other defs
-       * of a VAR (e.g. `pass = 0` writes on now-dead FAIL paths), leaving it
-       * single-def + constant.  Re-run const_var_prop so the surviving uses
-       * (`TEST_ZERO pass`) fold, then branch_folding+DCE again to clear the
-       * resulting trivial branches. */
-      if (tcc_state->opt_const_prop)
-      {
-        if (tcc_ir_opt_const_var_prop(ir) > 0)
-        {
-          tcc_ir_opt_branch_folding(ir);
-          if (tcc_state->opt_dce)
-            tcc_ir_opt_dce(ir);
-        }
-      }
-      tcc_ir_opt_compact_nops(ir);
-      /* After branch_folding/DCE, many unconditional JUMPs end up pointing at
-       * the very next non-NOP instruction.  Drop them so store_redundant (and
-       * later passes) see a clean straight-line BB across what used to be a
-       * jump-target boundary. */
-      tcc_ir_opt_eliminate_fallthrough(ir);
-      /* Once the cleanup cascade above has run, copy propagation has folded
-       * the `T_new = ASSIGN T_anchor` chains left by the global-load hoist
-       * into direct uses of T_anchor.  Now invariant_temp_deref_hoist can
-       * collapse the resulting repeated `CMP T_anchor***DEREF***, X` pattern
-       * into one explicit deref load + N register-only compares. */
-      if (tcc_state->opt_copy_prop)
-        tcc_ir_opt_copy_prop(ir);
-      if (tcc_state->opt_store_load_fwd && tcc_ir_opt_invariant_temp_deref_hoist(ir) > 0)
-      {
-        if (tcc_state->opt_copy_prop)
-          tcc_ir_opt_copy_prop(ir);
-        if (tcc_state->opt_dce)
-          tcc_ir_opt_dce(ir);
-        tcc_ir_opt_compact_nops(ir);
-      }
-      /* Redundant-store elimination: kill back-to-back stores to the same
-       * address with no intervening read (e.g. three resets of a global
-       * counter exposed by the prior switch-IPCP fold). */
-      if (tcc_state->opt_redundant_store)
-        tcc_ir_opt_store_redundant(ir);
-    }
-  }
-
-  /* Complex constant param folding: pack a _Complex float local that is
-   * initialized to constants and only used as a single FUNCPARAMVAL into a
-   * packed 64-bit immediate, eliminating the stack round-trip at the call. */
-  if (tcc_state->opt_const_prop)
-  {
-    if (tcc_ir_opt_complex_const_param_fold(ir))
-    {
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-    }
-  }
-
-  /* Call-result dead elimination via shared pipeline context. */
-  if (tcc_state->opt_dead_store) {
-    tcc_ir_opt_ctx_invalidate(&pipeline_ctx);
-    tcc_ir_opt_gens_call_result_ex(&pipeline_ctx);
-  }
-
-  tcc_ir_opt_ctx_free(&pipeline_ctx);
-  dbg_scan_overlap(ir,"P2-after-pipeline_ctx");
-
-  /* Dead-init-via-call: kill stack-slot stores whose bytes are fully
-   * overwritten by a subsequent CALL, using the callee's write summary. */
-  if (tcc_state->opt_dead_store)
-    tcc_ir_opt_dead_init_via_call(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ_dead_init_via_call");
-#endif
-
-  /* Late cleanup: store elimination, dead var/addrvar elimination, redundant assign.
-   * Run with max_iterations=2 so dead_addrvar_elim → DSE cascade works.
-   *
-   * Then iterate {call_result demotion → DCE → late_cleanup} to convergence.
-   * Rationale: the earlier dead_call_result above runs once, before
-   * late_cleanup's DSE has had a chance to kill `*p = call_result()`
-   * stores.  After those stores die, the FUNCCALLVAL result temp goes
-   * to zero uses but no one re-demotes the call to FUNCCALLVOID — so
-   * pure aeabi helpers (dmul/dadd/...) survive even when their result
-   * is provably dead.  Repeating the trio lets the cascade fire:
-   * demotion → DCE NOPs the pure call + its PARAMs → frees DEREF loads
-   * → late_cleanup picks up newly-dead stores/locals. */
-  {
-    const IRPassGroup *groups;
-    int group_count;
-    tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
-    const IRPassGroup *cleanup_group = &groups[group_count - 1];
-    IROptCtx cleanup_ctx;
-    tcc_ir_opt_ctx_init(&cleanup_ctx, ir);
-    tcc_ir_opt_run_group(&cleanup_ctx, cleanup_group);
-    tcc_ir_opt_ctx_free(&cleanup_ctx);
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "ZZ_late_cleanup_1");
-#endif
-
-    if (tcc_state->opt_dead_store) {
-      for (int iter = 0; iter < 4; iter++) {
-        IROptCtx ctx_cr;
-        tcc_ir_opt_ctx_init(&ctx_cr, ir);
-        int ch = tcc_ir_opt_gens_call_result_ex(&ctx_cr);
-        tcc_ir_opt_ctx_free(&ctx_cr);
-        if (tcc_state->opt_dce)
-          ch += tcc_ir_opt_dce(ir);
-        /* Drain dead writes to anonymous TEMP_LOCAL slots — chains feeding
-         * into a now-dead call-result slot become eligible once the call
-         * stops referencing them. */
-        ch += tcc_ir_opt_dead_temp_local_elim(ir);
-        if (ch == 0)
-          break;
-        IROptCtx ctx_lc;
-        tcc_ir_opt_ctx_init(&ctx_lc, ir);
-        tcc_ir_opt_run_group(&ctx_lc, cleanup_group);
-        tcc_ir_opt_ctx_free(&ctx_lc);
-      }
-    }
-  }
-
-  /* Re-run memmove→indexed-stores: the early call (pre-propagation) can
-   * miss patterns blocked by control-flow that propagation later folds
-   * away — e.g. assertion chains separating struct-init stores from the
-   * sret memmove (pr41919's foo).  After late_cleanup has fully NOPed
-   * the dead branches and DSE'd what it can, the stores and memmove sit
-   * in the same basic block and the pattern matches. */
-  tcc_ir_opt_memmove_to_indexed_stores(ir);
-  tcc_ir_opt_compact_nops(ir);
-
-  /* Phase 4c: Loop Rotation - convert top-tested (while) loops to
-   * bottom-tested (do-while) to eliminate 2 branches per iteration.
-   * Must run before loop unrolling so unrolling sees cleaner patterns,
-   * and before IV strength reduction which benefits from rotated layout. */
-  if (tcc_state->opt_loop_rotation)
-    tcc_ir_opt_loop_rotation(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ_loop_rotation");
-#endif
-
-  /* Phase 4c.5: First-iteration-exit peeling.  Rewrites a loop's exit
-   * JUMPIF to unconditional JUMP when the header test is provably true
-   * on first entry, leaning on later DCE to clear the unreachable body.
-   * Handles cases like `for (p = &s; *p; ...)` with s == 0 — a class
-   * of PR-tree-optimization torture tests no IV-based pass catches. */
-  if (tcc_state->opt_const_prop)
-  {
-    if (tcc_ir_opt_loop_dead_first_iter(ir) > 0)
-    {
-      tcc_ir_opt_branch_folding(ir);
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-      /* The eliminated loop may have masked stack-address propagation: with
-       * the loop gone, V0's slot now flows linearly from `*p = n` to the
-       * post-loop `if (!s)` check.  Re-run const_prop + stack_nonnull so
-       * the now-non-null V0 collapses its abort branch. */
-      tcc_ir_opt_const_prop(ir);
-      tcc_ir_opt_stack_addr_nonnull_fold(ir);
-      tcc_ir_opt_branch_folding(ir);
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-      /* With the abort branch now gone, the alloca + addr-taken writes that
-       * remain are all dead — but the pipeline's late_cleanup already ran
-       * before loop elimination, so dead_trail_addrvar/dead_alloca_vreg
-       * haven't seen this clean shape.  Drive them by hand here. */
-      if (tcc_state->opt_dead_store)
-      {
-        int progress = 1;
-        for (int i = 0; i < 4 && progress; i++)
-        {
-          progress = 0;
-          progress += tcc_ir_opt_dead_trailing_addrvar_store_elim(ir);
-          if (tcc_state->opt_dce)
-            tcc_ir_opt_dce(ir);
-          tcc_ir_opt_compact_nops(ir);
-          progress += tcc_ir_opt_dead_alloca_vreg_elim(ir);
-          if (tcc_state->opt_dce)
-            tcc_ir_opt_dce(ir);
-          tcc_ir_opt_compact_nops(ir);
-        }
-      }
-    }
-  }
-
-  /* Pointer-IV exit-value substitution: while V0/V1 (pointer IVs) are still
-   * VARs, replace post-loop uses with the closed-form exit value
-   * `Addr[StackLoc[init_off + step*trip_count]]`.  Later passes promote
-   * VARs to TEMPs and rename the IV, so this must run early.  Follow with
-   * branch-folding + DCE so the now-trivially-equal CMPs disappear, allowing
-   * subsequent passes to see the abort() branches as dead. */
-  if (tcc_state->opt_const_prop)
-  {
-    if (tcc_ir_opt_loop_ptr_iv_exit_subst(ir) > 0)
-    {
-      tcc_ir_opt_cmp_stack_addr_fold(ir);
-      tcc_ir_opt_branch_folding(ir);
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-    }
-  }
-
-#ifdef CONFIG_TCC_DEBUG
-  if (tcc_state->dump_ir) {
-    printf("=== IR AFTER LOOP ROTATION ===\n");
-    tcc_ir_show(ir);
-    printf("=== END IR AFTER LOOP ROTATION ===\n");
-  }
-#endif
-
-  /* Post-rotation degenerate-JUMPIF cascade.  Loop rotation can collapse
-   * a tautology (e.g. `isunordered(x,y) || (x>=y) || (x<y)` always true)
-   * into a JUMPIF whose target equals its fallthrough — observably a no-op
-   * that elim_fallthrough can drop, freeing its flag-setting CMP /
-   * __aeabi_cfcmple call (orphan_cmp_elim) and the upstream FUNCCALLVAL
-   * value chain (DSE cascades through unused TMPs).  Re-runs call_result +
-   * late_cleanup afterward so demoted f2d / isnan calls get NOPed by the
-   * pure-aeabi DSE pre-scan. */
-  if (tcc_state->opt_jump_threading && tcc_state->opt_dce)
-  {
-    int cascade_iter = 0;
-    int cascade_changes;
-    do {
-      cascade_changes = tcc_ir_opt_eliminate_fallthrough(ir);
-      cascade_changes += tcc_ir_opt_orphan_cmp_elim(ir);
-      if (tcc_state->opt_dead_store)
-        cascade_changes += tcc_ir_opt_dse(ir);
-    } while (cascade_changes > 0 && ++cascade_iter < 8);
-
-    if (cascade_iter > 0 && tcc_state->opt_dead_store)
-    {
-      /* Re-trigger dead_call_result + late_cleanup so the FUNCCALLVAL chain
-       * (f2d → isnan etc.) whose results are now unused gets demoted and
-       * NOPed by the pure-aeabi DSE pre-scan. */
-      IROptCtx ctx_cr;
-      tcc_ir_opt_ctx_init(&ctx_cr, ir);
-      tcc_ir_opt_gens_call_result_ex(&ctx_cr);
-      tcc_ir_opt_ctx_free(&ctx_cr);
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-
-      const IRPassGroup *groups;
-      int group_count;
-      tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
-      const IRPassGroup *cleanup_group = &groups[group_count - 1];
-      IROptCtx ctx_lc;
-      tcc_ir_opt_ctx_init(&ctx_lc, ir);
-      tcc_ir_opt_run_group(&ctx_lc, cleanup_group);
-      tcc_ir_opt_ctx_free(&ctx_lc);
-    }
-  }
-
-  /* Phase 4d½: Diamond Store Forwarding — when both arms of an if/else
-   * diamond store the same constant to the same computed address, forward
-   * the constant to the post-merge LOAD_INDEXED.  This enables constprop
-   * to fold soft-float comparisons (e.g. 0.8 < 0.0 → false) and
-   * eliminate dead branches, which in turn allows LCS/DCE to remove
-   * entire loop nests. */
-  if (tcc_state->opt_store_load_fwd)
-  {
-    if (tcc_ir_opt_diamond_store_fwd(ir) > 0)
-    {
-#ifdef CONFIG_TCC_DEBUG
-      dump_ir_after_pass(tcc_state, ir, "ZZ_diamond_store_fwd");
-#endif
-      for (int dsf_iter = 0; dsf_iter < 6; dsf_iter++)
-      {
-        int dsf_ch = 0;
-        if (tcc_state->opt_const_prop)
-        {
-          dsf_ch += tcc_ir_opt_const_prop_tmp(ir);
-          dsf_ch += tcc_ir_opt_const_prop(ir);
-          dsf_ch += tcc_ir_opt_const_prop_tmp(ir);
-          dsf_ch += tcc_ir_opt_value_tracking(ir);
-          dsf_ch += tcc_ir_opt_branch_folding(ir);
-        }
-        if (tcc_state->opt_nonneg_fold)
-          dsf_ch += tcc_ir_opt_nonneg_branch_fold(ir);
-        dsf_ch += tcc_ir_opt_orphan_cmp_elim(ir);
-        if (tcc_state->opt_dce)
-          dsf_ch += tcc_ir_opt_dce(ir);
-        tcc_ir_opt_compact_nops(ir);
-        if (!dsf_ch)
-          break;
-      }
-    }
-  }
-
-  /* Phase 4e: Loop Constant Simulation — collapse small constant-trip-count
-   * loops whose body has no observable side effects (pure integer/FP math,
-   * known soft-float helper calls, branches whose conditions are statically
-   * determinable).  Runs before unrolling so unrolling sees fewer candidates
-   * to expand. */
-  if (tcc_state->opt_loop_unroll)
-  {
-    /* Iterate LCS: folding one loop can expose subsequent loops as
-     * constant-foldable (their inputs are now residual stores/ASSIGNs).
-     * Cap the iteration so a non-converging case doesn't loop forever. */
-    int total_lcs_changes = 0;
-    for (int lcs_iter = 0; lcs_iter < 4; lcs_iter++)
-    {
-      int lcs_changes = tcc_ir_opt_loop_const_sim(ir);
-      if (lcs_changes == 0)
-        break;
-      total_lcs_changes += lcs_changes;
-      tcc_ir_opt_compact_nops(ir);
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      if (tcc_state->opt_const_prop)
-      {
-        tcc_ir_opt_const_prop(ir);
-        tcc_ir_opt_branch_folding(ir);
-      }
-      tcc_ir_opt_compact_nops(ir);
-    }
-    (void)total_lcs_changes;
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "ZZ_loop_const_sim");
-#endif
-  }
-
-  /* Phase 5a: Loop Unrolling - fully unroll small constant-trip-count loops.
-   * After unrolling, re-run iterative constant propagation + DCE to collapse
-   * the expanded constant arithmetic (e.g. 0+5+5+5+5+5 → 25). */
-  if (tcc_state->opt_loop_unroll)
-  {
-  dbg_scan_overlap(ir,"Q1-before-loop_unroll");
-    int unrolled = tcc_ir_opt_loop_unroll(ir);
-    if (unrolled > 0)
-    {
-      /* Compact NOPs before post-unroll iterative optimization. */
-      tcc_ir_opt_compact_nops(ir);
-      int iter2 = 0, ch2;
-      do
-      {
-        ch2 = 0;
-        if (tcc_state->opt_dce)
-          ch2 += tcc_ir_opt_dce(ir);
-        if (tcc_state->opt_dead_store)
-          ch2 += tcc_ir_opt_dse(ir);
-        if (tcc_state->opt_const_prop)
-          ch2 += tcc_ir_opt_const_prop(ir);
-        if (tcc_state->opt_const_prop)
-          ch2 += tcc_ir_opt_const_prop_tmp(ir);
-        if (tcc_state->opt_const_prop)
-          ch2 += tcc_ir_opt_branch_folding(ir);
-        if (tcc_state->opt_const_prop)
-          ch2 += tcc_ir_opt_stack_addr_nonnull_fold(ir);
-        if (tcc_state->opt_const_prop)
-          ch2 += tcc_ir_opt_setif_branch_fuse(ir);
-        if (tcc_state->opt_const_prop)
-          ch2 += tcc_ir_opt_stack_bool_diamond(ir);
-        if (tcc_state->opt_const_prop)
-          ch2 += tcc_ir_opt_or_bool_diamond(ir);
-        if (tcc_state->opt_const_prop)
-          ch2 += tcc_ir_opt_var_tmp_fwd(ir);
-        if (tcc_state->opt_const_prop)
-          ch2 += tcc_ir_opt_value_tracking(ir);
-      } while (ch2 > 0 && ++iter2 < 10);
-    }
-#ifdef CONFIG_TCC_DEBUG
-    dump_ir_after_pass(tcc_state, ir, "ZZ_loop_unroll");
-#endif
-  }
-  /* Phase 5: Loop-Invariant Code Motion - DISABLED
-   * The LICM pass has a bug in hoist_const_exprs_from_loop(): instruction
-   * indices are not adjusted by total_inserted when reading original
-   * instructions during the insertion loop, causing operand_base corruption.
-   * This produces invalid loop structures that crash IV strength reduction.
-   * TODO: re-enable after the index fix in licm.c is validated. */
-  /* Phase 5: Loop-Invariant Code Motion */
-  IRLoops *licm_loops = NULL;
-  if (tcc_state->opt_licm)
-  dbg_scan_overlap(ir,"Q2-before-licm");
-    licm_loops = tcc_ir_opt_licm_ex(ir);
-
-  /* Phase 6: Induction Variable Strength Reduction - transform array indexing
-   * from: base + i*stride (SHL + ADD each iteration)
-   * to:   ptr += stride (single ADD, enabling post-increment addressing)
-   * Uses loop structure from LICM to avoid re-detection index mismatch. */
-  if (tcc_state->opt_iv_strength_red)
-  {
-    if (licm_loops)
-      tcc_ir_opt_iv_strength_reduction_with_loops(ir, licm_loops);
-    else
-      tcc_ir_opt_iv_strength_reduction(ir);
-  }
-  tcc_ir_free_loops(licm_loops);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ_iv_strength_red");
-#endif
-
-  /* Local ALU CSE: dedupe pure arithmetic ops within a basic block.
-   * Catches `arr[i].x` + `arr[i].y` patterns where the same `i*stride+base`
-   * computation is repeated for each field access — GVN can't see these
-   * because the loop induction var has multiple defs across the function.
-   * MUST run AFTER IV strength reduction: IV-SR creates separate stride
-   * pointers per use site (T17, T16, T18 each starting at base, each
-   * incremented by stride), and dedup'ing the underlying SHL+ADD chains
-   * before IV-SR collapses one of those distinct stride pointers into
-   * a stale base, breaking the loop. After IV-SR has wired up the stride
-   * pointers, any remaining redundant arithmetic is safe to dedupe. */
-  if (tcc_state->optimize > 0 && !getenv("TCC_DISABLE_LOCAL_ALU_CSE"))
-  {
-    int loops = 0;
-    int total_changes = 0;
-    int ch;
-    while (loops++ < 4)
-    {
-      ch = tcc_ir_opt_ptr_load_cse(ir);
-      ch += tcc_ir_opt_local_alu_cse(ir);
-      if (ch <= 0)
-        break;
-      total_changes += ch;
-      if (tcc_state->opt_copy_prop)
-        tcc_ir_opt_copy_prop(ir);
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-    }
-    if (getenv("TCC_DBG_CSE"))
-      fprintf(stderr, "[local_alu_cse] %d changes in %d iterations\n", total_changes, loops);
-  }
-
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_alu_cse");
-#endif
-
-  /* Phase 6b: Pointer store-to-load forwarding — after local_alu_cse has
-   * CSE'd identical address computations (e.g. 5x `T = hstent + 12` collapsed
-   * to one), bitfield read-modify-write chains now use the same address vreg.
-   * Forward stored values to subsequent loads from the same pointer dereference,
-   * then cascade with known_bits + const_prop to simplify the chain. */
-  if (tcc_state->opt_const_prop)
-  {
-    for (int psl_round = 0; psl_round < 4; psl_round++)
-    {
-      int ch = tcc_ir_opt_ptr_store_load_fwd(ir);
-      if (ch <= 0 && psl_round > 0)
-        break;
-      if (ch > 0)
-      {
-        for (int kbi = 0; kbi < 8; kbi++)
-        {
-          int kch = 0;
-          kch += tcc_ir_opt_known_bits(ir);
-          kch += tcc_ir_opt_const_prop(ir);
-          kch += tcc_ir_opt_const_prop_tmp(ir);
-          if (tcc_state->opt_copy_prop)
-            kch += tcc_ir_opt_copy_prop(ir);
-          if (tcc_state->opt_dce)
-            tcc_ir_opt_dce(ir);
-          /* Dead-def elimination: NOP pure TEMP defs whose result is unused. */
-          {
-            int n = ir->next_instruction_index;
-            for (int di = 0; di < n; di++)
-            {
-              IRQuadCompact *dq = &ir->compact_instructions[di];
-              if (dq->op == TCCIR_OP_NOP || !irop_config[dq->op].has_dest)
-                continue;
-              if (dq->op == TCCIR_OP_STORE || dq->op == TCCIR_OP_STORE_INDEXED ||
-                  dq->op == TCCIR_OP_STORE_POSTINC || dq->op == TCCIR_OP_FUNCCALLVOID ||
-                  dq->op == TCCIR_OP_FUNCCALLVAL || dq->op == TCCIR_OP_BLOCK_COPY)
-                continue;
-              IROperand dd = tcc_ir_op_get_dest(ir, dq);
-              int32_t dv = irop_get_vreg(dd);
-              if (dv < 0 || dd.is_lval)
-                continue;
-              if (TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
-                continue;
-              int used = 0;
-              for (int dj = 0; dj < n && !used; dj++)
-              {
-                if (dj == di)
-                  continue;
-                IRQuadCompact *djq = &ir->compact_instructions[dj];
-                if (djq->op == TCCIR_OP_NOP)
-                  continue;
-                if (irop_config[djq->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, djq)) == dv)
-                  used = 1;
-                if (irop_config[djq->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, djq)) == dv)
-                  used = 1;
-                if (irop_config[djq->op].has_dest)
-                {
-                  IROperand djd = tcc_ir_op_get_dest(ir, djq);
-                  int dest_is_use = djd.is_lval ||
-                    djq->op == TCCIR_OP_STORE_INDEXED ||
-                    djq->op == TCCIR_OP_STORE_POSTINC;
-                  if (dest_is_use && irop_get_vreg(djd) == dv)
-                    used = 1;
-                }
-              }
-              if (!used)
-              {
-                dq->op = TCCIR_OP_NOP;
-                kch++;
-              }
-            }
-          }
-          tcc_ir_opt_compact_nops(ir);
-          kch += tcc_ir_opt_const_prop_tmp(ir);
-          if (kch <= 0)
-            break;
-          tcc_ir_opt_compact_nops(ir);
-        }
-      }
-    }
-  }
-
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_psl_fwd");
-#endif
-
-  if (tcc_state->opt_redundant_store)
-  {
-    if (tcc_ir_opt_rmw_byte_clear(ir) > 0)
-    {
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-    }
-  }
-
-  /* Phase 7: Strength Reduction - transform MUL by constant to shift/add */
-  if (tcc_state->opt_strength_red)
-  dbg_scan_overlap(ir,"Q3-before-strength_reduction");
-    tcc_ir_opt_strength_reduction(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_strength_red");
-#endif
-
-  /* Late copy propagation + dead store elimination.
-   * Late passes (IV strength reduction, loop rotation) may introduce
-   * redundant ASSIGN copies (e.g., T1=V1; V1=T1+1 instead of V1=V1+1).
-   * Clean them up before final DCE and code generation. */
-  if (tcc_state->opt_copy_prop)
-  {
-    int late_cp = tcc_ir_opt_copy_prop(ir);
-    if (late_cp > 0 && tcc_state->opt_dead_store)
-      tcc_ir_opt_dse(ir);
-  }
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_late_cp");
-#endif
-
-  if (tcc_state->opt_const_prop)
-  {
-    if (tcc_ir_opt_stack_addr_simplify(ir) > 0)
-    {
-      tcc_ir_opt_const_prop(ir);
-      tcc_ir_opt_const_prop_tmp(ir);
-      tcc_ir_opt_branch_folding(ir);
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      if (tcc_state->opt_dead_store)
-        tcc_ir_opt_dse(ir);
-      tcc_ir_opt_compact_nops(ir);
-    }
-  }
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_sas");
-#endif
-
-  /* Late memmove→indexed-stores: earlier calls miss patterns where the
-   * destination address is computed through inline-parameter VAR chains
-   * (STORE→LOAD→ASSIGN→ADD) that are only fully formed after const prop. */
-  if (tcc_ir_opt_memmove_to_indexed_stores(ir) > 0)
-  {
-    tcc_ir_opt_compact_nops(ir);
-    if (tcc_state->opt_dead_store)
-      tcc_ir_opt_dse(ir);
-  }
-
-  /* PACK64 peephole — collapse `((u64)hi << 32) | (u64)lo` chains. */
-  tcc_ir_opt_pack64(ir);
-
-  /* PACK64 implicit-ZEXT variant — collapse the bare `(X_hi SHL #32) OR X_lo`
-   * idiom emitted for `(long long)int_var` stores when neither half was an
-   * explicit ZEXT. */
-  tcc_ir_opt_pack64_implicit(ir);
-
-  /* PACK64 from adjacent narrow stack stores — fold a 64-bit LOAD from the
-   * param spill region into PACK64 of the two halves, so the ldrd after
-   * the spill collapses to no-op MOVs that the regalloc/codegen elides.
-   * Hits the `return x;` shape for 8-byte aggregates / long long params. */
-  if (tcc_ir_opt_pack64_from_stack_stores(ir) > 0)
-  {
-    if (tcc_state->opt_dead_store)
-      tcc_ir_opt_dse(ir);
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir);
-  }
-
-  /* SHL32-OR chain peephole — collapse the (signed-widen + shift/mask)
-   * idiom where the high half is dead.  Re-run const_prop after so the
-   * exposed `X AND 0xFFFFFFFF` (now src1 is the original i32 value) folds
-   * into an ASSIGN. */
-  if (tcc_ir_opt_shl32_or_chain(ir) > 0)
-  {
-    if (tcc_state->opt_const_prop)
-      tcc_ir_opt_const_prop(ir);
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir);
-  }
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_shl32");
-#endif
-
-  /* OR-bool-diamond — fold `acc |= (cond ? 1 : 0)` materialization. */
-  if (tcc_state->opt_const_prop)
-    tcc_ir_opt_or_bool_diamond(ir);
-
-  /* Late deref forwarding — var_tmp_fwd may have expanded VARs back to
-   * their defining deref expressions, creating STORE+CMP deref pairs. */
-  if (tcc_state->opt_const_prop)
-    tcc_ir_opt_deref_fwd(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_deref_fwd");
-#endif
-
-  /* Late VAR→TMP forwarding is deferred to after final compact_nops +
-   * eliminate_fallthrough (below), because the forward scan needs clean
-   * basic block boundaries without stale fallthrough JMPs. */
-
-  /* Stack Address CSE - eliminate redundant stack address computations.
-   * Must run AFTER IV strength reduction (which creates the ASSIGN+ADD
-   * pattern for end pointers) and after late copy propagation. */
-  if (tcc_state->opt_stack_addr_cse)
-    tcc_ir_opt_stack_addr_cse(ir);
-
-  /* Post-increment assign folding — fold T=V[lval]; V=T OP x into V=V OP x.
-   * Must run AFTER the iterative loop, not inside it.  The lval ASSIGN acts
-   * as an opacity barrier for constant propagation; folding it away inside
-   * the loop lets const prop incorrectly propagate constants through loop
-   * back-edges (e.g., IJMP).  Running it late avoids this because const prop
-   * does not run again after this point. */
-  if (tcc_state->opt_copy_prop)
-    tcc_ir_opt_postinc_assign_fold(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_paf");
-#endif
-
-  /* Combine `V = V ± C1; V = V ± C2; ...` chains into a single update.
-   * Produced by loop unrolling of pointer-increment loops once
-   * postinc_assign_fold has collapsed each iter's `T<-V; V<-T+C` pair. */
-  if (tcc_state->opt_const_prop)
-    tcc_ir_opt_var_self_add_chain_fold(ir);
-
-  /* Fold CMPs of the form `CMP V, Addr[StackLoc[Y]]` when V provably equals
-   * Addr[StackLoc[X]] + N and X+N==Y.  Enabled by the chain fold above:
-   * `V = &a[0]; V += 96; CMP V, &a[6]` → trivially true.  Follow with
-   * branch_folding + DCE to sweep newly unreachable code. */
-  if (tcc_state->opt_const_prop)
-  {
-    if (tcc_ir_opt_cmp_stack_addr_fold(ir) > 0)
-    {
-      tcc_ir_opt_branch_folding(ir);
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-    }
-  }
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_csaf");
-#endif
-
-  /* Loop-aware post-increment fusion — fuse embedded deref in loop body with
-   * latch pointer increment into LOAD_POSTINC.  Must run after IV strength
-   * reduction (Phase 6) which creates the latch ADD pattern. */
-  if (tcc_state->opt_postinc_fusion)
-    tcc_ir_opt_loop_postinc_fusion(ir);
-
-  /* Loop Bound Rematerialization - recompute SP-relative end pointers inside
-   * the loop instead of keeping them in callee-saved registers.
-   * Must run AFTER loop_postinc_fusion to avoid breaking the latch ADD pattern. */
-  if (tcc_state->opt_iv_strength_red)
-    tcc_ir_opt_loop_bound_remat(ir);
-
-  /* Decrement-to-Zero - transform count-up loops to count-down-to-zero.
-   * Must run late, after IV-SR has eliminated body uses of loop counters. */
-  dbg_scan_overlap(ir,"Q4-before-decrement_to_zero");
-  tcc_ir_opt_decrement_to_zero(ir);
-  dbg_scan_overlap(ir,"Q4b-after-decrement_to_zero");
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_dtz");
-#endif
-
-  /* Redundant Init Elimination - remove function-entry VAR inits that are
-   * always killed before use. Must run after decrement-to-zero (which NOPs
-   * pre-test guards, simplifying the control flow). */
-  if (tcc_state->opt_dead_store)
-    tcc_ir_opt_redundant_init_elim(ir);
-
-  /* Dead Loop Elimination - remove loops whose body has no side effects and
-   * whose result VARs have constant values.  Must run late, after all loop
-   * transformations and constant propagation have simplified loop bodies. */
-  if (tcc_state->opt_dce)
-  {
-    /* Dead-loop elimination collapses a side-effect-free loop into its final
-     * (constant) result.  Gate to -O2 so -O1 keeps the loop, matching GCC's
-     * -O1 (which also only elides such loops at -O2). */
-    int dle_changes = (tcc_state->optimize >= 2) ? tcc_ir_opt_dead_loop_elim(ir) : 0;
-    if (dle_changes > 0)
-    {
-      tcc_ir_opt_value_tracking(ir);
-      tcc_ir_opt_const_prop_tmp(ir);
-      tcc_ir_opt_branch_folding(ir);
-      tcc_ir_opt_dce(ir);
-      tcc_ir_opt_dse(ir);
-      tcc_ir_opt_compact_nops(ir);
-    }
-  }
-
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_dle1");
-#endif
-  tcc_ir_opt_dce(ir); /* Final pass to mark unreachable code as NOP */
-
-  /* Re-run dead loop elimination after final DCE: earlier loops may now have
-   * fully-NOPped bodies (e.g., empty CPOW/CCID loops post-inline) that the
-   * first DLE pass couldn't see because their STORE ops hadn't been killed
-   * yet.  Run DSE first to drop dead-stack-slot stores left behind by inline
-   * struct copies, then re-attempt DLE. */
-  if (tcc_state->opt_dce)
-  {
-    if (tcc_state->opt_dead_store)
-    {
-      tcc_ir_opt_dead_var_store_elim(ir);
-      tcc_ir_opt_dse(ir);
-    }
-    /* Dead-loop elimination collapses a side-effect-free loop into its final
-     * (constant) result.  Gate to -O2 so -O1 keeps the loop, matching GCC's
-     * -O1 (which also only elides such loops at -O2). */
-    int dle_changes = (tcc_state->optimize >= 2) ? tcc_ir_opt_dead_loop_elim(ir) : 0;
-    if (dle_changes > 0)
-    {
-      tcc_ir_opt_branch_folding(ir);
-      tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-    }
-  }
-
-  tcc_ir_opt_compact_nops(ir);
-
-  /* Re-run fall-through elimination after the final DCE.
-   * Later passes (loop unrolling + branch folding, strength reduction)
-   * can NOP instructions between a JUMP and its target, creating new
-   * fall-through jumps that the earlier Phase 2c pass could not see. */
-  if (tcc_state->opt_jump_threading)
-    tcc_ir_opt_eliminate_fallthrough(ir);
-
-  /* Late VAR→TMP forwarding: after final compact_nops + eliminate_fallthrough,
-   * BB boundaries are clean.  IV-SR creates new TMP chains (e.g., T66 running
-   * pointer) that got copy-propagated into VAR defs (V2 = T66).  Forward
-   * V2→T66 into subsequent TMP copies (T21 = V2 → T21 = T66), then re-run
-   * copy_prop to propagate TMP→TMP copies into DEREF uses (PARAM2 T21***DEREF***
-   * → PARAM2 T66***DEREF***), eliminating both ASSIGN MOVs and ip→param MOVs. */
-  if (tcc_state->opt_copy_prop)
-  {
-    if (tcc_ir_opt_var_tmp_fwd(ir))
-    {
-      if (tcc_state->opt_dead_store)
-      {
-        tcc_ir_opt_dead_var_store_elim(ir);
-        tcc_ir_opt_dse(ir);
-      }
-      if (tcc_ir_opt_copy_prop(ir) && tcc_state->opt_dead_store)
-        tcc_ir_opt_dse(ir);
-    }
-  }
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_vtf");
-#endif
-
-  /* PACK64 tautology — collapse PACK64(low(X), X>>32) into ASSIGN X.
-   * Must run AFTER late var_tmp_fwd + copy_prop: those passes resolve the
-   * intermediate TMP chains so PACK64's operands directly reference the
-   * defining ASSIGN/LOAD/SHR ops on a common X.  When the fold fires, the
-   * resulting `CMP X, X` is caught by identity-comparison folding in a
-   * second const_prop pass. */
-  dbg_scan_overlap(ir,"R1-before-pack64_taut");
-  if (tcc_ir_opt_pack64_tautology(ir) > 0)
-  {
-    if (tcc_state->opt_copy_prop)
-    {
-      tcc_ir_opt_var_tmp_fwd(ir);
-      tcc_ir_opt_copy_prop(ir);
-    }
-    if (tcc_state->opt_const_prop)
-      tcc_ir_opt_const_prop(ir);
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir);
-  }
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_p64t");
-#endif
-
-  /* ADD-immediate + DEREF fold into LOAD_INDEXED — DISABLED.
-   * The fold moves the memory load from the DEREF use site to the ADD
-   * site, which can violate memory ordering even with FUNCPARAMVAL-only
-   * restriction (35 GCC torture test failures).  Needs investigation of
-   * the interaction between LOAD_INDEXED codegen and call-site setup. */
-
-  /* Late loop rotation: retry rotation for loops whose bodies were too
-   * complex earlier (had conditional branches from inlined code / checks
-   * that DCE + branch folding have since eliminated). */
-  if (tcc_state->opt_loop_rotation)
-  {
-    if (tcc_ir_opt_loop_rotation(ir))
-    {
-      /* The guard CMP+JUMPIF may be dead (e.g. init=0, limit=4: 0>=4 is
-       * always false).  Run value tracking + branch folding + DCE to
-       * eliminate the dead guard and clean up. */
-      if (tcc_state->opt_const_prop)
-      {
-        tcc_ir_opt_value_tracking(ir);
-        tcc_ir_opt_const_prop(ir);
-        tcc_ir_opt_const_prop_tmp(ir);
-        tcc_ir_opt_branch_folding(ir);
-      }
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-      if (tcc_state->opt_jump_threading)
-        tcc_ir_opt_eliminate_fallthrough(ir);
-    }
-  }
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_lr");
-#endif
-
-  /* Redundant zero-trip entry-guard elimination.  Sequential counted loops
-   * sharing a counter (memclr's 3 loops over i) keep a pre-loop guard on the
-   * 2nd/3rd loops because the IV's entry value is the previous loop's exit
-   * value, invisible to immediate-init IV detection / value tracking.  Carry
-   * each loop's constant exit value forward and drop the provably-dead guards.
-   * Run LAST among loop passes (after all rotation/unroll/IV-SR) so removing a
-   * guard cannot perturb a downstream loop transform — only RA follows. */
-  if (tcc_state->opt_const_prop && !getenv("TCC_NO_GUARD_ELIM"))
-  {
-  dbg_scan_overlap(ir,"R3-before-loop_guard_elim");
-    if (tcc_ir_opt_loop_guard_elim(ir) > 0)
-    {
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-      if (tcc_state->opt_jump_threading)
-        tcc_ir_opt_eliminate_fallthrough(ir);
-    }
-  }
-
-  /* CMP narrowing — `CMP T_u64, u64_const_with_hi_0` → 32-bit CMP when
-   * T's hi is provably zero (from SHR≥32 or ZEXT).  Eliminates the hi
-   * half setup and compare. */
-  dbg_scan_overlap(ir,"P3-before-cmp_narrow_64");
-  dbg_scan_overlap(ir,"R4-just-before-cmp_narrow");
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_lge");
-#endif
-  tcc_ir_opt_cmp_narrow_64(ir);
-
-  /* ASSIGN fusion — fold `T_new = X OP Y; T_final = T_new ASSIGN` into a
-   * single op writing directly to T_final.  Runs very late so it sees the
-   * stable IR after var_to_tmp / copy_prop / dce, which is when the chain
-   * pattern is most prevalent (e.g. or_bool_diamond's true arm). */
-  dbg_scan_overlap(ir,"P4-before-assign_fuse");
-  tcc_ir_opt_assign_fuse(ir);
-  dbg_scan_overlap(ir,"P4b-after-assign_fuse");
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_af");
-#endif
-
-  /* Phase 8: Conditional Select - replace if/else diamonds with SELECT.
-   * Must run late, after all other optimizations have simplified the IR,
-   * so we see the cleanest diamond patterns. */
-  tcc_ir_opt_select(ir);
-  dbg_scan_overlap(ir,"P5-after-select");
-
-  /* Fold the `(a CMP b) ? -1 : 0` mask idiom (SETIF + #0 SUB) into a single
-   * SELECT(#-1, #0, cond).  Shares opt_select's late placement so the new
-   * SELECT's flag-setting CMP is not deleted by a downstream orphan-CMP pass. */
-  if (tcc_state->optimize > 0)
-    tcc_ir_opt_setif_neg_to_select(ir);
-#ifdef CONFIG_TCC_DEBUG
-  dump_ir_after_pass(tcc_state, ir, "ZZ2_sel");
-#endif
-
-  /* Recompute leafness after IR optimizations.
-   * IR construction marks the function non-leaf as soon as a call op is
-   * emitted, but DCE/other passes can delete calls.
-   *
-   * Complex FP operations (FADD/FSUB/FMUL/FDIV on complex operands) are
-   * also non-leaf: they expand to __aeabi_f* calls during code generation.
-   */
-  {
-    ir->leaffunc = 1;
-    ir->tail_call_only = 0;
-    int call_count = 0;
-    int call_idx = -1;
-    int has_complex_fp = 0;
-    for (int i = 0; i < ir->next_instruction_index; ++i)
-    {
-      const IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
-      {
-        ir->leaffunc = 0;
-        call_count++;
-        call_idx = i;
-      }
-      else if (q->op == TCCIR_OP_BUILTIN_APPLY)
-      {
-        ir->leaffunc = 0;
-        call_count = 99;
-      }
-      /* Complex FP ops expand to soft-float BL calls during codegen */
-      if (q->op == TCCIR_OP_FADD || q->op == TCCIR_OP_FSUB || q->op == TCCIR_OP_FMUL || q->op == TCCIR_OP_FDIV)
-      {
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        if (dest.is_complex)
-        {
-          ir->leaffunc = 0;
-          has_complex_fp = 1;
-        }
-      }
-    }
-
-    /* Tail-call detection: if there is exactly one call and it is at the tail
-     * position (immediately followed by RETURNVALUE/RETURNVOID with only NOPs
-     * between), the function can use a branch instead of bl, preserving LR. */
-    if (call_count == 1 && !has_complex_fp && !func_var && !ir->has_static_chain && call_idx >= 0)
-    {
-      const IRQuadCompact *cq = &ir->compact_instructions[call_idx];
-      int is_tail = 0;
-
-      /* Find the next non-NOP instruction after the call */
-      int j = call_idx + 1;
-      while (j < ir->next_instruction_index && ir->compact_instructions[j].op == TCCIR_OP_NOP)
-        j++;
-
-      if (j < ir->next_instruction_index)
-      {
-        const IRQuadCompact *nq = &ir->compact_instructions[j];
-        if (!nq->is_jump_target)
-        {
-          if (cq->op == TCCIR_OP_FUNCCALLVOID && nq->op == TCCIR_OP_RETURNVOID)
-          {
-            is_tail = 1;
-          }
-          else if (cq->op == TCCIR_OP_FUNCCALLVAL && nq->op == TCCIR_OP_RETURNVALUE)
-          {
-            IROperand call_dest = tcc_ir_op_get_dest(ir, cq);
-            IROperand ret_src = tcc_ir_op_get_src1(ir, nq);
-            int call_vr = irop_get_vreg(call_dest);
-            int ret_vr = irop_get_vreg(ret_src);
-            if (call_vr >= 0 && call_vr == ret_vr)
-              is_tail = 1;
-          }
-          else if (cq->op == TCCIR_OP_FUNCCALLVOID && nq->op == TCCIR_OP_RETURNVALUE)
-          {
-            /* void call followed by return of a different value — not a tail call */
-          }
-          else if (cq->op == TCCIR_OP_FUNCCALLVAL && nq->op == TCCIR_OP_RETURNVOID)
-          {
-            /* Call with unused return value followed by void return — tail call */
-            is_tail = 1;
-          }
-        }
-      }
-
-      /* Verify no remaining code after the return (other paths to different returns
-       * would mean LR could be needed). Check that everything after j is NOP. */
-      if (is_tail)
-      {
-        for (int k = j + 1; k < ir->next_instruction_index; k++)
-        {
-          if (ir->compact_instructions[k].op != TCCIR_OP_NOP)
-          {
-            is_tail = 0;
-            break;
-          }
-        }
-      }
-
-      if (is_tail)
-      {
-        ir->tail_call_only = 1;
-        ir->leaffunc = 1;
-      }
-    }
-  }
-
-  if (tcc_state->do_bench)
-  {
-    unsigned now = tcc_getclock_ms();
-    tcc_bench_log_phase(tcc_state, "func-opt", funcname, &tcc_state->bench_function_opt_time,
-                        &tcc_state->bench_function_opt_count, now - phase_start);
-    phase_start = now;
-  }
-
-  nocode_wanted = 0;
-
-  /* Capture whether the body still contains an aggregate (memmove/memcpy) copy
-   * BEFORE the late forwarding pass below collapses it away.  The end-of-function
-   * inline promote/demote uses this as the "is a struct-copier" signal: once
-   * memmove_global_load_fwd turns `struct y=g; y.f+=x; return y.f;` into a bare
-   * global load, re-scanning the final IR would wrongly see a tiny inline-worthy
-   * body and duplicate it into every caller (20040709-2 test*).  Capturing here
-   * preserves the pre-collapse classification. */
-  /* Inline classification captured BEFORE the late forwarding pass collapses a
-   * `struct y=g; y.f+=x; return y.f;` helper (fn1/fn2) into a tiny global load.
-   * A NON-static helper that (a) copies an aggregate, (b) reads a GLOBAL, and
-   * (c) takes a parameter is kept out of line: inlined at a runtime call site it
-   * just duplicates code (the global read doesn't fold and the standalone copy
-   * stays), as GCC does.  The three conditions together exclude the cases that
-   * SHOULD inline: identity forwarders `retme(x){return x;}` copy a PARAM not a
-   * global (no reads_global); `ini(void){g2=g1;...}` has no parameter (folds when
-   * inlined); pure-computation const-folders (960311, pr93744) have no aggregate
-   * copy.  Captured here because forwarding removes the memmove the demote keys on. */
-  int had_aggr_copy = 0;
-  int reads_global = 0;
-  int has_params = ir && ir->parameters_count > 0;
-  if (ir)
-  {
-    for (int ii = 0; ii < ir->next_instruction_index; ii++)
-    {
-      IRQuadCompact *q = &ir->compact_instructions[ii];
-      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
-      {
-        Sym *cs = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
-        const char *cn = cs ? get_tok_str(cs->v, NULL) : NULL;
-        if (cn && (strstr(cn, "memmove") || strstr(cn, "memcpy")))
-          had_aggr_copy = 1;
-      }
-      /* Global DATA reference — NOT a call target (src1 of FUNCCALL is the callee
-       * symbol, global but not a data read). */
-      if (!reads_global &&
-          (irop_config[q->op].has_dest || irop_config[q->op].has_src1 || irop_config[q->op].has_src2))
-      {
-        int call_callee = (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID);
-        IROperand gops[3];
-        gops[0] = tcc_ir_op_get_dest(ir, q);
-        gops[1] = call_callee ? IROP_NONE : tcc_ir_get_src1(ir, ii);
-        gops[2] = tcc_ir_get_src2(ir, ii);
-        for (int j = 0; j < 3; j++)
-          if (gops[j].is_sym && !gops[j].is_local)
-          {
-            reads_global = 1;
-            break;
-          }
-      }
-    }
-  }
-  int nonstatic_global_copier =
-      had_aggr_copy && reads_global && has_params && sym && !(sym->type.t & VT_STATIC);
-
-  /* Init-copy-from-global load forwarding: `struct y = global; ... return y.f`
-   * reads the global directly (like GCC) and drops the dead memmove + stack
-   * slot.  Runs at the END of the SSA pipeline — once the identity-retme round
-   * trip and the bitfield write-back have been eliminated, the copied slot is
-   * reduced to read-only loads (the precondition the pass checks) — and BEFORE
-   * the stack-compaction below, so the freed slot shrinks the frame.  The
-   * straight-line no-call/no-store window gate keeps it off the
-   * `x=s; r=fn(a); compare x,s` snapshot idiom (a call separates the copy from
-   * the reads there), whose copy must be preserved. */
-  if (tcc_state->optimize > 0 && tcc_state->opt_redundant_store)
-  {
-    if (tcc_ir_opt_memmove_global_load_fwd(ir) > 0)
-    {
-      if (tcc_state->opt_dce)
-        tcc_ir_opt_dce(ir);
-      tcc_ir_opt_compact_nops(ir);
-    }
-  }
-
-  /* reset local stack */
-  pop_local_syms(NULL, 0);
-
-  /* Nested calls are now handled at code generation time via backward scan.
-   * No IR reordering needed - saves O(n) memory allocations. */
-
-  /* Mark return value vregs with incoming_reg0=0 BEFORE allocation
-   * so the allocator knows they arrive in r0 and can optimize accordingly */
-  tcc_ir_mark_return_value_incoming_regs(ir);
-
-  /* Compact local stack after IR optimization.
-   * The frontend pre-allocates locals (decrementing `loc`) during parsing,
-   * but optimization may eliminate all references to those locals (e.g.,
-   * constant propagation replaces StackLoc loads with immediates and DSE
-   * removes the stores).  Scan the optimized IR for the most-negative
-   * STACKOFF reference still in use and shrink `loc` accordingly. */
-  {
-    int min_stack_ref = 0;
-    for (int i = 0; i < ir->next_instruction_index; i++)
-    {
-      const IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op == TCCIR_OP_NOP)
-        continue;
-      IROperand ops[3];
-      ops[0] = tcc_ir_op_get_dest(ir, q);
-      ops[1] = tcc_ir_get_src1(ir, i);
-      ops[2] = tcc_ir_get_src2(ir, i);
-      for (int j = 0; j < 3; j++)
-      {
-        if (ops[j].tag == IROP_TAG_STACKOFF)
-        {
-          int off = irop_get_stack_offset(ops[j]);
-          if (off < min_stack_ref)
-            min_stack_ref = off;
-        }
-      }
-    }
-    if (min_stack_ref > loc)
-    {
-      loc = min_stack_ref;
-    }
-    /* Variadic functions reserve 28 bytes at [FP-4..FP-28] for the va_area
-     * (register copies + metadata), set up in the machine prologue — not
-     * visible as STACKOFF in the IR.  Don't compact past that reservation. */
-    if (func_var && loc > -28)
-      loc = -28;
-  }
-
-  /* Disable R12 allocation for functions with computed gotos (IJMP).
-   * Changing register allocation can alter instruction encoding sizes
-   * (16-bit vs 32-bit for high registers), shifting code layout and
-   * breaking position-dependent label offset computations. */
-  int saved_regs_for_alloc = tcc_state->registers_for_allocator;
-  {
-    int has_ijmp = 0;
-    for (int i = 0; i < ir->next_instruction_index; i++)
-    {
-      if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
-      {
-        has_ijmp = 1;
-        break;
-      }
-    }
-    if (has_ijmp && tcc_state->registers_for_allocator > 12)
-      tcc_state->registers_for_allocator = 12;
-  }
-  /* Also disable R12 allocation at -O0 — unoptimized code has more
-   * scratch-heavy codegen paths with R12 encoding edge cases. */
-  if (tcc_state->optimize < 1 && tcc_state->registers_for_allocator > 12)
-    tcc_state->registers_for_allocator = 12;
-
-  /* setjmp clobber semantics: __builtin_setjmp / longjmp save and restore the
-   * callee-saved register file (r4-r11).  A longjmp therefore reverts any
-   * local variable kept in a callee-saved register to its value at the setjmp
-   * call — wrong for a variable MODIFIED between setjmp and longjmp and read
-   * after the longjmp-return (gcc.c-torture pr60003).  GCC keeps such locals in
-   * memory (which longjmp does not touch); the C standard likewise only
-   * guarantees the post-longjmp value of `volatile` automatic objects.
-   *
-   * Force every VAR vreg in a function that performs a setjmp to be
-   * memory-resident (addrtaken) so each write store-throughs and each read
-   * reloads.  Done here — after all optimization, just before regalloc — so
-   * the addrtaken-clearing opt passes (refresh_stale_var_addrtaken et al.) have
-   * already run and cannot strip the flag.  Conservative (all VARs, not just
-   * those live across the setjmp) but setjmp functions are rare. */
-  {
-    int has_setjmp = 0;
-    for (int i = 0; i < ir->next_instruction_index; i++)
-    {
-      int op = ir->compact_instructions[i].op;
-      if (op == TCCIR_OP_SETJMP || op == TCCIR_OP_NL_SETJMP)
-      {
-        has_setjmp = 1;
-        break;
-      }
-    }
-    if (has_setjmp)
-    {
-      for (int i = 0; i < ir->next_instruction_index; i++)
-      {
-        IRQuadCompact *q = &ir->compact_instructions[i];
-        if (q->op == TCCIR_OP_NOP)
-          continue;
-        for (int k = 0; k < 3; k++)
-        {
-          IROperand op = (k == 0)   ? tcc_ir_op_get_dest(ir, q)
-                         : (k == 1) ? tcc_ir_op_get_src1(ir, q)
-                                    : tcc_ir_op_get_src2(ir, q);
-          int32_t vr = irop_get_vreg(op);
-          if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
-            tcc_ir_set_addrtaken(ir, vr);
-        }
-      }
-    }
-  }
-
-  /* Bitfield insert -> ARM BFI: lower the observed-insert idiom
-   * `(W & ~field) | (V << lsb)` to a single BFI.  Must run BEFORE barrel-shift
-   * fusion (which would otherwise fold the field-value SHL into the OR).
-   * Provably non-increasing; lsb/width recorded in ir->bfi_params[]. */
-  if (tcc_state->optimize > 0)
-    tcc_ir_opt_bitfield_insert_to_bfi(ir);
-
-  /* Barrel shift fusion: fold single-use SHL/SHR/SAR/ROR into consuming ALU op.
-   * Runs just before regalloc so the register allocator sees updated live ranges.
-   * Results stored in ir->barrel_shifts[] keyed by orig_index. */
-  if (tcc_state->optimize > 0)
-    tcc_ir_barrel_shift_fusion(ir);
-
-  /* Two-shift bitfield extract `(x<<a)>>b` → UBFX, for pairs the barrel-shift
-   * fusion above could NOT fold into a consumer (it NOPs the ones it folds, so
-   * a surviving SHL+SHR is a genuine two-instruction extract feeding a store /
-   * multiply / call / multi-use that can't take a shifted operand).  Strictly
-   * reduces instruction count; runs here, before regalloc, so RA sees the
-   * UBFX and the now-dead SHL is dropped. */
-  if (tcc_state->optimize > 0)
-    tcc_ir_opt_shift_pair_to_ubfx(ir);
-
-  /* Annotate 64-bit shifts with provably-dead result halves so codegen can
-   * skip the dead half-write (the 64-bit bitfield-extract idiom: SHL #a; SHR
-   * #b, b>=32, sub-32-bit field spanning a unit word boundary).  Runs after
-   * all IR transforms (so def-use is final) and just before RA; reads the
-   * pre-RA narrowed operand btypes.  RA spills of a flagged value store/reload
-   * the dead half as never-read garbage, so the annotation stays valid.
-   * Keyed by orig_index like barrel_shifts; consumed in codegen. */
-  if (tcc_state->optimize > 0)
-    tcc_ir_opt_shift64_dead_half(ir);
-
-  /* Carry narrow plain-STORE access widths onto their value operands so the
-   * later STORE_INDEXED conversions (which take the store width from the value
-   * operand, not the dest) do not widen a char/short store to a word. */
-  if (tcc_state->optimize > 0)
-    tcc_ir_opt_narrow_store_value_btype(ir);
-
-  /* Register allocation (SSA-based linear scan) */
-  {
-    const RegAllocTarget *ra_target = arm_get_regalloc_target();
-    dbg_scan_imm_dest(ir,"before-ssa-regalloc"); dbg_scan_overlap(ir,"before-ssa-regalloc");
-    tcc_ir_ssa_regalloc(ir, ra_target, loc);
-    dbg_scan_imm_dest(ir,"after-ssa-regalloc");
-  }
-
-  /* Back-edge phi hoisting: convert JUMPIF exit + ASSIGN copies + JUMP body
-   * into ASSIGN copies + inverted JUMPIF body, eliminating one branch per loop */
-  if (tcc_state->optimize > 0)
-    tcc_ir_opt_backedge_phi_hoist(ir);
-  dbg_scan_imm_dest(ir,"after-backedge-phi-hoist");
-
-  /* Forward-diamond JUMPIF inversion: when phi copies on the else path
-   * coalesce into no-ops after regalloc, invert the JUMPIF to target the
-   * merge directly and drop the bridging unconditional JUMP. */
-  if (tcc_state->optimize > 0)
-    tcc_ir_opt_post_ra_forward_diamond(ir);
-  dbg_scan_imm_dest(ir,"after-post-ra-fwd-diamond");
-
-  /* Abort tail-merge + body-invert: per distinct noreturn callee, keep the
-   * first guarded call inline as a shared sink and invert+retarget every later
-   * guard to it, NOPing the duplicate calls.  Runs here so the jump-threading /
-   * eliminate-fallthrough / DCE cleanup below tidies the resulting NOPs. */
-  if (tcc_state->optimize > 0)
-    tcc_ir_opt_abort_tail_merge(ir);
-
-  /* SSA optimization may NOP instructions, creating stale JMP targets
-   * and fall-through JMPs.  Thread targets through NOPs first, then
-   * eliminate any resulting fall-throughs. */
-  if (tcc_state->opt_jump_threading) {
-    int jt_changes;
-    do {
-      jt_changes = tcc_ir_opt_jump_threading(ir);
-      jt_changes += tcc_ir_opt_eliminate_fallthrough(ir);
-    } while (jt_changes > 0);
-
-    /* Threading a loop guard that was inverted to branch directly to the body
-     * orphans the original `JMP body` trampoline: the conditional now targets
-     * the body and the preceding edge is an unconditional JUMP, so nothing
-     * reaches the old jump.  eliminate_fallthrough only drops JUMP-to-next,
-     * not unreachable instructions, so it survives to codegen as a dead b.w.
-     * Reachability DCE (purely control-flow based — safe post-regalloc) NOPs
-     * it; the backend skips NOPs.  We deliberately do NOT compact_nops here:
-     * renumbering perturbs the instruction indices that downstream post-RA
-     * peepholes (e.g. in-place increment coalescing) key off, which would
-     * trade the removed jump for a worse increment lowering. */
-    if (tcc_state->opt_dce)
-      tcc_ir_opt_dce(ir);
-  }
-
-  /* Re-compact local stack after SSA optimization.
-   * SSA DCE may have eliminated StackLoc stores/loads that the pre-SSA
-   * compaction (above) could not see.  Re-scan for the most-negative
-   * STACKOFF still referenced and shrink loc accordingly. */
-  {
-    int min_stack_ref = 0;
-    for (int i = 0; i < ir->next_instruction_index; i++) {
-      const IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op == TCCIR_OP_NOP)
-        continue;
-      IROperand ops[3];
-      ops[0] = tcc_ir_op_get_dest(ir, q);
-      ops[1] = tcc_ir_get_src1(ir, i);
-      ops[2] = tcc_ir_get_src2(ir, i);
-      for (int j = 0; j < 3; j++) {
-        if (ops[j].tag == IROP_TAG_STACKOFF) {
-          int off = irop_get_stack_offset(ops[j]);
-          if (off < min_stack_ref)
-            min_stack_ref = off;
-        }
-      }
-    }
-    if (min_stack_ref > loc) {
-      loc = min_stack_ref;
-    }
-    if (func_var && loc > -28)
-      loc = -28;
-  }
-
-  tcc_state->registers_for_allocator = saved_regs_for_alloc;
-
-  /* Post-allocation swap: if a return-value VAR vreg missed its preferred
-   * register (r0), try to swap with the blocker if safe.
-   * Only at -O1+ to avoid -O0 codegen edge cases with R12 encoding.
-   *
-   * Safety constraints:
-   * - Only VAR vregs (long-lived accumulators), not TEMPs
-   * - Neither interval crosses a function call
-   * - Neither is a 64-bit pair
-   * - Neither is spilled
-   * - Blocker is not a precolored PARAM
-   * - No other interval in the swap-target register overlaps the blocker */
-  for (int hi = 0; hi < ir->ls.next_interval_index; hi++)
-  {
-    LSLiveInterval *hint_li = &ir->ls.intervals[hi];
-    if (hint_li->r0 < 0 || hint_li->r1 >= 0 || hint_li->crosses_call)
-      continue;
-
-    /* Only VAR vregs — TEMPs are handled by the codegen peephole */
-    if (TCCIR_DECODE_VREG_TYPE(hint_li->vreg) != TCCIR_VREG_TYPE_VAR)
-      continue;
-
-    IRLiveInterval *hint_iri = tcc_ir_vreg_live_interval(ir, hint_li->vreg);
-    if (!hint_iri || hint_iri->incoming_reg0 < 0)
-      continue;
-
-    int wanted_reg = hint_iri->incoming_reg0;
-    if (hint_li->r0 == wanted_reg)
-      continue;
-
-    int have_reg = hint_li->r0;
-
-    /* Find the blocker: interval holding wanted_reg that overlaps hint */
-    LSLiveInterval *blocker = NULL;
-    for (int bi = 0; bi < ir->ls.next_interval_index; bi++)
-    {
-      LSLiveInterval *b = &ir->ls.intervals[bi];
-      if (b->r0 != wanted_reg || b->r1 >= 0 || b->crosses_call)
-        continue;
-      if (b->start > hint_li->end || b->end < hint_li->start)
-        continue;
-      /* Don't evict precolored PARAMs */
-      if (TCCIR_DECODE_VREG_TYPE(b->vreg) == TCCIR_VREG_TYPE_PARAM)
-      {
-        blocker = NULL;
-        break;
-      }
-      blocker = b;
-      break;
-    }
-    if (!blocker)
-      continue;
-
-    /* Safety check: can blocker use have_reg for its entire range?
-     * Also check: can hint use wanted_reg for its entire range?
-     * Use strict less-than: intervals touching at a single instruction
-     * boundary (one ends, other starts) can share a register since
-     * the ending value is consumed before the starting value is produced. */
-    int safe = 1;
-    for (int ci = 0; ci < ir->ls.next_interval_index; ci++)
-    {
-      LSLiveInterval *c = &ir->ls.intervals[ci];
-      if (c == hint_li || c == blocker)
-        continue;
-      if (c->r0 == have_reg &&
-          c->start < blocker->end && c->end > blocker->start)
-      {
-        safe = 0;
-        break;
-      }
-      if (c->r0 == wanted_reg &&
-          c->start < hint_li->end && c->end > hint_li->start)
-      {
-        safe = 0;
-        break;
-      }
-    }
-    if (!safe)
-      continue;
-
-    /* Swap registers and update dirty bitmap + liveness bitmap */
-    hint_li->r0 = wanted_reg;
-    blocker->r0 = have_reg;
-    ir->ls.dirty_registers |= (1ull << wanted_reg) | (1ull << have_reg);
-
-    /* Update live_regs_by_instruction atomically for both intervals.
-     * They may overlap — sequential clear/set would clobber one
-     * interval's bit in the overlapping region. */
-    if (ir->ls.live_regs_by_instruction)
-    {
-      int lim = ir->ls.live_regs_by_instruction_size;
-      uint32_t have_mask = (1u << have_reg);
-      uint32_t want_mask = (1u << wanted_reg);
-      int lo = (int)(hint_li->start < blocker->start ? hint_li->start : blocker->start);
-      int hi = (int)(hint_li->end > blocker->end ? hint_li->end : blocker->end);
-      for (int k = lo; k <= hi && k < lim; k++)
-      {
-        int in_hint = (k >= (int)hint_li->start && k <= (int)hint_li->end);
-        int in_blocker = (k >= (int)blocker->start && k <= (int)blocker->end);
-        ir->ls.live_regs_by_instruction[k] &= ~(have_mask | want_mask);
-        if (in_hint) ir->ls.live_regs_by_instruction[k] |= want_mask;
-        if (in_blocker) ir->ls.live_regs_by_instruction[k] |= have_mask;
-      }
-    }
-    break;
-  }
-
-  /* Reset scratch register cache before codegen */
-  tcc_ls_reset_scratch_cache(&ir->ls);
-
-  /* Stack-passed params already live in the incoming argument area.
-   * If linear-scan spilled them, drop the local spill slot so we don't bloat
-   * the frame or emit pointless prologue copies (e.g. sum40).
-   * Must run before we extend `loc` based on spill slots.
-   */
-  tcc_ir_avoid_spilling_stack_passed_params(ir);
-
-  /* Shrink frame: after optimization (DCE, constant folding), some locals may
-   * have been eliminated.  Scan the optimized IR for actually-referenced local
-   * frame offsets and shrink loc to only cover the slots still in use. */
-  {
-    int min_local_offset = 0;
-    (void)0; /* stackoff_count removed — was diagnostic only */
-    for (int i = 0; i < ir->next_instruction_index; i++)
-    {
-      const IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op == TCCIR_OP_NOP)
-        continue;
-      IROperand ops[3];
-      ops[0] = tcc_ir_op_get_dest(ir, q);
-      ops[1] = tcc_ir_op_get_src1(ir, q);
-      ops[2] = tcc_ir_op_get_src2(ir, q);
-      for (int j = 0; j < 3; j++)
-      {
-        if (irop_is_none(ops[j]))
-          continue;
-        if (irop_get_tag(ops[j]) == IROP_TAG_STACKOFF)
-        {
-          int32_t off = irop_get_stack_offset(ops[j]);
-          if (off < min_local_offset)
-            min_local_offset = off;
-        }
-      }
-    }
-    if (min_local_offset > loc)
-    {
-      loc = min_local_offset;
-    }
-    if (func_var && loc > -28)
-      loc = -28;
-  }
-
-  /* We may have removed a lot of spill slots (stack-passed params). Repack the
-   * remaining spill slots so other spills don't keep huge negative offsets. */
-  tcc_ls_compact_stack_locations(&ir->ls, loc);
-
-  /* Make sure the final stack frame is large enough for any spill slots.
-   * The linear-scan allocator assigns negative FP-relative stack locations;
-   * extend `loc` to the most-negative one so spills don't overlap locals.
-   */
-  {
-    int has_nested_chain = ir->has_static_chain;
-    if (!has_nested_chain) {
-      for (int j = 0; j < ir->next_instruction_index; j++) {
-        int op = ir->compact_instructions[j].op;
-        if (op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT) {
-          has_nested_chain = 1;
-          break;
-        }
-      }
-    }
-    /* Build bitmap of vregs referenced by live (non-NOP) instructions. */
-    int max_vreg_pos = 0;
-    for (int i = 0; i < ir->ls.next_interval_index; ++i) {
-      int p = TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[i].vreg);
-      if (p > max_vreg_pos) max_vreg_pos = p;
-    }
-    uint8_t *live_vregs = tcc_mallocz((max_vreg_pos + 8) / 8);
-    for (int j = 0; j < ir->next_instruction_index; j++) {
-      const IRQuadCompact *q = &ir->compact_instructions[j];
-      if (q->op == TCCIR_OP_NOP)
-        continue;
-      int32_t vrs[3] = { -1, -1, -1 };
-      if (irop_config[q->op].has_dest)
-        vrs[0] = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
-      if (irop_config[q->op].has_src1)
-        vrs[1] = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
-      if (irop_config[q->op].has_src2)
-        vrs[2] = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
-      for (int k = 0; k < 3; k++) {
-        if (vrs[k] < 0)
-          continue;
-        /* irop_get_vreg returns 0 (vreg_type=0, position=0) for non-vreg
-         * operands whose default-zero bit pattern doesn't encode a real
-         * vreg (e.g. GlobalSym in CALL src1, plain immediates). A
-         * position-only bitmap would then falsely mark vreg position 0
-         * (V0/T0/P0) as referenced and pin a dead stack slot. Valid vreg
-         * types start at 1 (VAR/TEMP/PARAM); filter type-0 entries out. */
-        if (TCCIR_DECODE_VREG_TYPE(vrs[k]) == 0)
-          continue;
-        int p = TCCIR_DECODE_VREG_POSITION(vrs[k]);
-        if (p <= max_vreg_pos)
-          live_vregs[p / 8] |= (1 << (p % 8));
-      }
-      /* MLA / LOAD_INDEXED / STORE_INDEXED carry a 4th operand (the MLA
-       * accumulator / indexed base) that the dest/src1/src2 scan above does
-       * not see. A vreg referenced ONLY through that operand — e.g. `block` in
-       * `tab[pred*n + block]`, lowered to `MLA acc=block` — would otherwise be
-       * judged dead here and have its spill slot dropped, eliding its
-       * materialization store and leaving uses to read an uninitialized slot. */
-      if (q->op == TCCIR_OP_MLA || q->op == TCCIR_OP_LOAD_INDEXED ||
-          q->op == TCCIR_OP_STORE_INDEXED) {
-        int32_t av = irop_get_vreg(tcc_ir_op_get_accum(ir, q));
-        if (av >= 0 && TCCIR_DECODE_VREG_TYPE(av) != 0) {
-          int p = TCCIR_DECODE_VREG_POSITION(av);
-          if (p <= max_vreg_pos)
-            live_vregs[p / 8] |= (1 << (p % 8));
-        }
-      }
-    }
-
-    int min_stack_loc = 0;
-    for (int i = 0; i < ir->ls.next_interval_index; ++i)
-    {
-      int sl = ir->ls.intervals[i].stack_location;
-      if (sl >= min_stack_loc)
-        continue;
-      /* Skip spill slots for vregs with no register and no live IR
-       * references — SSA DCE may have eliminated all uses after the
-       * register allocator assigned the spill.
-       * Bail out for functions with static chain or SET_CHAIN — nested
-       * functions access parent VARs through the frame pointer without
-       * explicit IR references in the parent. */
-      if (ir->ls.intervals[i].r0 < 0 && !has_nested_chain) {
-        if (!(live_vregs[TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[i].vreg) / 8] &
-              (1 << (TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[i].vreg) % 8)))) {
-          ir->ls.intervals[i].stack_location = 0;
-          continue;
-        }
-      }
-      min_stack_loc = sl;
-    }
-    tcc_free(live_vregs);
-
-    /* Also scan IR operands directly for explicit stack-offset references
-     * (frontend-allocated temp locals like StackLoc[-N], used by call-result
-     * spilling and similar). The frontend pre-allocates these via `loc -= N`
-     * before optimization, so dead temps inflate the frame.
-     *
-     * Skip operands whose vreg ended up fully in a register: the is_local
-     * flag is a vestigial marker from the C declaration, but the regalloc
-     * may have kept the value in a register only, leaving the stack slot
-     * unused.  Counting it here would pin the frame to a dead slot. */
-    int min_op_offset = 0;
-    if (!has_nested_chain) {
-      for (int j = 0; j < ir->next_instruction_index; j++) {
-        const IRQuadCompact *q = &ir->compact_instructions[j];
-        if (q->op == TCCIR_OP_NOP)
-          continue;
-        IROperand ops[3];
-        int nops = 0;
-        if (irop_config[q->op].has_dest)
-          ops[nops++] = tcc_ir_op_get_dest(ir, q);
-        if (irop_config[q->op].has_src1)
-          ops[nops++] = tcc_ir_op_get_src1(ir, q);
-        if (irop_config[q->op].has_src2)
-          ops[nops++] = tcc_ir_op_get_src2(ir, q);
-        for (int k = 0; k < nops; k++) {
-          IROperand *o = &ops[k];
-          int has_stackoff = (o->tag == IROP_TAG_STACKOFF) ||
-                             (o->is_local || o->is_llocal);
-          if (!has_stackoff)
-            continue;
-          int vr = irop_get_vreg(*o);
-          if (vr >= 0) {
-            IRLiveInterval *li = tcc_ir_get_live_interval(ir, vr);
-            if (li) {
-              if (li->allocation.r0 != PREG_NONE &&
-                  !(li->allocation.r0 & PREG_SPILLED) &&
-                  li->allocation.offset == 0)
-                continue; /* vreg is register-only; stack slot unused */
-              /* Spilled vreg: the operand's u.imm32 carries the frontend's
-               * original offset, but addrtaken slot coalescing may have
-               * remapped this vreg to share a slot with another.  Use the
-               * post-regalloc allocation offset, matching machine_op.c. */
-              if (li->allocation.offset != 0) {
-                int off = li->allocation.offset + ((int)o->u.imm32 - li->original_offset);
-                if (off < min_op_offset)
-                  min_op_offset = off;
-                continue;
-              }
-            }
-          }
-          int off = (int)irop_get_stack_offset(*o);
-          if (off < min_op_offset)
-            min_op_offset = off;
-        }
-      }
-    } else {
-      /* When nested-frame access is possible we can't trust the scan to
-       * cover all frame uses, so keep the original frontend-assigned loc. */
-      min_op_offset = loc;
-    }
-
-    /* Combine spill-driven and operand-driven minima. Both are <= 0; the
-     * actual frame needs to extend to whichever is more negative. */
-    if (min_op_offset < min_stack_loc)
-      min_stack_loc = min_op_offset;
-
-    /* Grow loc if spills need more space; shrink if the IR uses less than
-     * the frontend pre-allocated (dead temp locals after optimization). */
-    if (min_stack_loc < loc)
-      loc = min_stack_loc;
-    else if (!has_nested_chain && min_stack_loc > loc)
-      loc = min_stack_loc;
-    /* The variadic va_area at [FP-4..FP-28] is written by the machine
-     * prologue and never appears as a STACKOFF in the IR, so the shrink
-     * scan above doesn't see it.  Shrinking past it leaves the va_area
-     * below SP where any callee push or exception frame clobbers it. */
-    if (func_var && loc > -28)
-      loc = -28;
-  }
-
-  tcc_ir_move_coalescing(ir);
-
-  /* Frame-shrink pass — re-scan the post-coalesce IR for stack-resident
-   * operand references. Move coalescing rewrites operands and may eliminate
-   * frontend-allocated temp-local refs. If no operand still names a slot
-   * below the frontend's `loc`, the unused slots can be reclaimed. */
-  {
-    int post_min_op_offset = 0;
-    int post_has_nested_chain = ir->has_static_chain;
-    if (!post_has_nested_chain) {
-      for (int j = 0; j < ir->next_instruction_index; j++) {
-        int op = ir->compact_instructions[j].op;
-        if (op == TCCIR_OP_SET_CHAIN || op == TCCIR_OP_INIT_CHAIN_SLOT) {
-          post_has_nested_chain = 1;
-          break;
-        }
-      }
-    }
-    if (!post_has_nested_chain) {
-      for (int j = 0; j < ir->next_instruction_index; j++) {
-        const IRQuadCompact *q = &ir->compact_instructions[j];
-        if (q->op == TCCIR_OP_NOP)
-          continue;
-        IROperand ops[3];
-        int nops = 0;
-        if (irop_config[q->op].has_dest)
-          ops[nops++] = tcc_ir_op_get_dest(ir, q);
-        if (irop_config[q->op].has_src1)
-          ops[nops++] = tcc_ir_op_get_src1(ir, q);
-        if (irop_config[q->op].has_src2)
-          ops[nops++] = tcc_ir_op_get_src2(ir, q);
-        for (int k = 0; k < nops; k++) {
-          IROperand *o = &ops[k];
-          int has_stackoff = (o->tag == IROP_TAG_STACKOFF) ||
-                             (o->is_local || o->is_llocal);
-          if (!has_stackoff)
-            continue;
-          int vr = irop_get_vreg(*o);
-          if (vr >= 0) {
-            IRLiveInterval *li = tcc_ir_get_live_interval(ir, vr);
-            if (li) {
-              if (li->allocation.r0 != PREG_NONE &&
-                  !(li->allocation.r0 & PREG_SPILLED) &&
-                  li->allocation.offset == 0)
-                continue; /* register-only vreg; stack slot unused */
-              /* Spilled vreg: use the post-regalloc allocation offset.
-               * The operand's u.imm32 still carries the frontend-assigned
-               * offset, which is obsolete after addrtaken slot coalescing
-               * (multiple vregs sharing a single slot).  Compute the actual
-               * codegen offset the same way machine_op.c does. */
-              if (li->allocation.offset != 0) {
-                int off = li->allocation.offset + ((int)o->u.imm32 - li->original_offset);
-                if (off < post_min_op_offset)
-                  post_min_op_offset = off;
-                continue;
-              }
-            }
-          }
-          int off = (int)irop_get_stack_offset(*o);
-          if (off < post_min_op_offset)
-            post_min_op_offset = off;
-        }
-      }
-      /* Also keep any still-live regalloc spill slots in mind. */
-      for (int i = 0; i < ir->ls.next_interval_index; ++i) {
-        int sl = ir->ls.intervals[i].stack_location;
-        if (sl < post_min_op_offset)
-          post_min_op_offset = sl;
-      }
-      if (post_min_op_offset > loc)
-        loc = post_min_op_offset;
-      /* Keep the prologue-managed variadic va_area reserved (see above). */
-      if (func_var && loc > -28)
-        loc = -28;
-    }
-  }
-
-  /* Sync LSLiveInterval → IRLiveInterval after post-allocation modifications
-   * (register swap, move coalescing, stack-passed param rewrite, compaction). */
-  for (int i = 0; i < ir->ls.next_interval_index; ++i)
-  {
-    LSLiveInterval *lsi = &ir->ls.intervals[i];
-    tcc_ir_stack_reg_assign(ir, lsi->vreg, lsi->stack_location, lsi->r0, lsi->r1);
-    IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, lsi->vreg);
-    if (li)
-      li->crosses_call = lsi->crosses_call;
-  }
-
-  tcc_ir_register_allocation_params(ir);
-  tcc_ir_build_stack_layout(ir);
-
-  /* Compile nested functions AFTER parent's register allocation.
-   * At this point, captured variables have their final stack locations
-   * assigned by the register allocator (since they're addrtaken, they're spilled).
-   * Nested function code is emitted into .text BEFORE the parent's code. */
-  if (tcc_state->nb_nested_funcs > 0)
-  {
-    /* Resolve captured variable offsets from parent's register allocation */
-    for (int i = 0; i < tcc_state->nb_nested_funcs; i++)
-    {
-      NestedFunc *nf = &tcc_state->nested_funcs[i];
-      for (int j = 0; j < nf->nb_captured; j++)
-      {
-        int vreg = nf->captured_vregs[j];
-        if (vreg >= 0)
-        {
-          /* Get the stack location assigned by register allocator */
-          IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
-          if (interval && interval->allocation.offset != 0)
-            nf->captured_offsets[j] = interval->allocation.offset;
-        }
-      }
-    }
-    uint8_t saved_need_fp = tcc_state->need_frame_pointer;
-    uint8_t saved_force_fp = tcc_state->force_frame_pointer;
-    uint8_t saved_force_lr = tcc_state->force_lr_save;
-    /* Check if any nested function needs the parent's frame pointer BEFORE
-     * compile_nested_functions clears the nested funcs list.  The parent
-     * needs FP when a nested function uses the static chain at runtime:
-     * - trampoline_needed: address was taken, trampoline references parent FP
-     * - nb_captured > 0 and NOT eligible for inlining: compiled separately,
-     *   accesses parent vars via FP-relative chain offsets */
-    /* Determine if any nested function needs the parent's FP at runtime.
-     * Safe to clear FP when every nested function is auto-inlineable and
-     * has no trampoline — every standalone copy of those nested functions
-     * is dead code (no caller can reach it), so the parent never needs to
-     * supply its FP via the static chain.  Multi-level nesting is fine as
-     * long as every level satisfies this condition. */
-    int can_omit_fp = (tcc_state->nb_nested_funcs > 0);
-    for (int i = 0; i < tcc_state->nb_nested_funcs && can_omit_fp; i++) {
-      NestedFunc *nf = &tcc_state->nested_funcs[i];
-      if (nf->trampoline_needed ||
-          !nf->sym || !nf->sym->type.ref ||
-          !nf->sym->type.ref->f.func_auto_inline)
-        can_omit_fp = 0;
-    }
-    int needs_fp_for_nested = !can_omit_fp;
-    compile_nested_functions(sym);
-    tcc_state->force_frame_pointer = saved_force_fp;
-    tcc_state->force_lr_save = saved_force_lr;
-    tcc_state->need_frame_pointer = needs_fp_for_nested ? tcc_state->need_frame_pointer : saved_need_fp;
-
-    /* Update parent's func_ind and ELF symbol to point after nested function code.
-     * ind is now past the nested functions' machine code (not restored). */
-    func_ind = ind;
-    put_extern_sym(sym, cur_text_section, ind + 1, 0);
-  }
-
-  if (tcc_state->do_bench)
-  {
-    unsigned now = tcc_getclock_ms();
-    tcc_bench_log_phase(tcc_state, "func-alloc", funcname, &tcc_state->bench_function_alloc_time,
-                        &tcc_state->bench_function_alloc_count, now - phase_start);
-    phase_start = now;
-  }
-
-  /* Per-function pure-via-sret analysis: classify this function's body so
-   * that callers can apply dead-sret-call elimination at their call sites.
-   * Must run after all body opts (final IR), before codegen, and before
-   * func_vc is overwritten by the next function's compilation. */
-  if (tcc_state->opt_dead_store)
-    tcc_ir_analyze_pure_via_sret(ir, sym);
-
-  /* Per-function write summary: record must-write byte ranges via each
-   * pointer parameter, so callers' DSE can elide stack-slot inits the
-   * callee fully overwrites.  Same timing constraint as pure_via_sret. */
-  if (tcc_state->opt_dead_store)
-    tcc_ir_compute_func_write_summary(ir, sym);
-
-  /* TU-wide read/call summary: record (1) static globals read by this
-   * function, (2) static globals written, (3) functions called.  Consumed
-   * at end-of-TU by tcc_ir_tu_analyze_dead_statics to identify static
-   * globals with no reachable readers — their stores are then eliminated
-   * during the end-of-TU late_reopt re-compile.  Only collect during the
-   * first compile; the late_reopt re-compile already has the summary. */
-  if (tcc_state->opt_dead_store && !tcc_state->ir_late_reopt_phase)
-    tcc_ir_collect_tu_func_summary(ir, sym);
-
-  /* Before codegen, create placeholder ELF symbols for addr-taken labels
-   * (&&label) that are still on global_label_stack with c == -3.
-   * During codegen, the backend will emit relocations referencing these
-   * symbols.  After codegen, label_pop will UPDATE them with real offsets
-   * from the IR-to-code mapping. */
-  {
-    Sym *lbl;
-    for (lbl = global_label_stack; lbl && lbl != global_label_stack_start; lbl = lbl->prev)
-    {
-      if (lbl->c == -3)
-      {
-        lbl->c = 0; /* Reset marker so put_extern_sym2 creates new symbol */
-        put_extern_sym2(lbl, cur_text_section->sh_num, 0, 1, 1);
-      }
-    }
-  }
-
-  /* No-return collapse: if the function has no RETURN op anywhere (and no
-   * calls/asm/volatile/setjmp/trap), every path bottoms out in an infinite
-   * loop — caller can't observe any of the body's writes.  Replace the
-   * body with `b .`.  Matches GCC -O2 on gcc.c-torture/compile/pr70916.c.
-   * Runs before useless_function_body because pr70916-style bodies have
-   * essential STOREs that useless_body would refuse to NOP.  Reset `loc`
-   * when the collapse fires: the original body referenced stack locals
-   * (e.g. arrays), but the surviving `b .` doesn't, so the prologue no
-   * longer needs to allocate frame space. */
-  if (tcc_state->opt_dce)
-  {
-    if (tcc_ir_opt_noreturn_collapse(ir))
-      loc = 0;
-    /* Infinite self-recursion collapse: companion to noreturn_collapse for
-     * the case where the function exits the noreturn check via a self-call
-     * that dominates every return path.  Closes gcc.c-torture
-     * compile/pr10153-1.c (39→1). */
-    else if (tcc_ir_opt_infinite_self_recursion(ir, sym))
-      loc = 0;
-    /* Companion when the function makes a known-noreturn call and DCE has
-     * already eliminated post-call code (DCE treats FUNCCALL-to-noreturn
-     * as a terminator).  We can't collapse the whole body — the call
-     * itself may have observable side effects in the callee — but we can
-     * suppress the unreachable epilogue.  The backend still flushes pending
-     * literal pools when it sees ir->noreturn, so LDR-literal users remain
-     * patched even though no return sequence is emitted. */
-    else
-      tcc_ir_opt_noreturn_call_epilogue_suppress(ir);
-  }
-
-  /* UB-only body elide: every STORE in the function goes through an address
-   * derived from reading an uninitialised local — the whole function is UB
-   * and we may legally choose "return immediately".  Runs before
-   * useless_function_body so the latter doesn't need to teach about UB. */
-  if (tcc_state->opt_dce)
-  {
-    if (tcc_ir_opt_ub_only_body_elide(ir))
-      loc = 0;
-  }
-
-  /* Null-store dom-return: a STORE through a compile-time-NULL pointer that
-   * dominates every RETURNVOID is unconditional UB; collapse to bx lr.
-   * Catches gcc.c-torture/compile/pr36817 (`unsigned *p=0; *p++=0;` 18→1)
-   * which slips past ub_only_body_elide because the pointer is *explicitly*
-   * initialised to 0, not uninit. */
-  if (tcc_state->opt_dce)
-  {
-    if (tcc_ir_opt_null_store_dom_return(ir))
-      loc = 0;
-  }
-
-  /* Trap-only body suppress: constprop turned a constant `x / 0` (or `% 0`)
-   * into TCCIR_OP_TRAP, DCE NOPed the rest.  The remaining single-TRAP body
-   * never returns, so the prologue/epilogue are dead.  Reset `loc` so the
-   * frame allocated by tccgen for now-dead locals doesn't show up as SUB SP. */
-  if (tcc_state->opt_dce)
-  {
-    if (tcc_ir_opt_trap_only_body_suppress(ir))
-      loc = 0;
-  }
-
-  /* Local-only body elide: every observable effect of the function is
-   * confined to its own stack frame (writes through local pointers, calls
-   * to pure aeabi helpers, memmove/memcpy/memset into local buffers).  No
-   * caller can observe such a function's work — collapse to `bx lr`.
-   * Closes gcc.c-torture compile/991213-1's 48→1 gap to GCC. */
-  if (tcc_state->opt_dce)
-  {
-    if (tcc_ir_opt_local_only_body_elide(ir))
-      loc = 0;
-  }
-
-  /* Const-return UB elide: non-void function whose entry block executes UB
-   * (reads an untouched local stack slot) before any observable effect, and
-   * whose every RETURNVALUE returns the same constant — per C11 UB
-   * exploitation, collapse to `return const`.  Closes compile/20011109-1
-   * (`die`: 140→3). */
-  if (tcc_state->opt_dce)
-  {
-    if (tcc_ir_opt_const_return_uninit_elide(ir))
-      loc = 0;
-  }
-
-  /* Useless function body: if every surviving instruction is pure (no STORE,
-   * no CALL, no RETURNVALUE, no volatile read, etc.), NOP the entire body.
-   * Catches functions where the only "work" feeds a comparison that other
-   * passes have already eliminated (e.g. gcc.c-torture compile/20040304-2.c).
-   * Runs after every other optimization so it sees the fully-reduced IR.
-   * Reset `loc` when the body collapses: the frame was sized earlier from
-   * spills/locals the now-NOP'd ops referenced, so the prologue no longer
-   * needs to allocate any frame. */
-  if (tcc_state->opt_dce)
-  {
-    if (tcc_ir_opt_useless_function_body(ir))
-      loc = 0;
-  }
-
-  /* Late pass: merge duplicate RETURNVALUE #imm into JUMP-to-first.
-   * Runs immediately before codegen so no other pass relies on the IR
-   * having multiple distinct return sites. */
-  dbg_scan_imm_dest(ir,"before-returnvalue-merge");
-  tcc_ir_opt_returnvalue_merge(ir);
-  dbg_scan_imm_dest(ir,"after-returnvalue-merge");
-
-  /* Inter-procedural noreturn propagation: if the function makes a call to
-   * another function whose body hasn't been compiled yet (forward decl
-   * defined later in the same TU), mark the caller for late_reopt.  At
-   * end-of-TU, gen_late_reopt_functions will re-compile the caller — by
-   * which point the callee has been compiled and may have been marked
-   * func_noreturn (by noreturn_collapse/infinite_self_recursion/
-   * uninit_dom_return).  The DCE extension that treats FUNCCALL-to-
-   * noreturn as a terminator will then eliminate the unreachable post-
-   * call body of the caller.  Skip when we are already in the late_reopt
-   * re-compile phase — at that point all callees are compiled.
-   *
-   * Only fires under -O2 (matches the gating of the noreturn collapse
-   * passes themselves) and when opt_dce is on (DCE is what consumes the
-   * propagated fact).  We deliberately skip checking whether the callee
-   * is intra-TU vs extern — extern callees won't get func_noreturn set
-   * later anyway, so the worst case is a wasted re-compile.  We bound by
-   * already-set flags to avoid double-flagging. */
-  if (tcc_state->opt_dce && tcc_state->optimize >= 2 && !tcc_state->ir_late_reopt_phase &&
-      sym && sym->type.ref && !sym->type.ref->f.func_keep_tokens_for_noreturn)
-  {
-    for (int i = 0; i < ir->next_instruction_index; i++)
-    {
-      IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
-        continue;
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
-      if (!callee || !callee->type.ref || callee == sym)
-        continue;
-      /* Preserve only when the callee may gain a useful fact later.  That
-       * includes ordinary forward definitions and static inline bodies,
-       * which are emitted by gen_inline_functions after the first TU pass. */
-      if (callee->type.ref->f.func_compiled && !(callee->type.t & VT_INLINE))
-        continue;
-      /* The callee is either (a) defined later in this TU and may yet be
-       * marked func_noreturn/pure, (b) a static inline body emitted by
-       * gen_inline_functions after the first propagation point, or (c)
-       * extern-defined in another TU.  We can't tell here, so preserve
-       * tokens now (via the post-gen-function check that honors
-       * func_keep_tokens_for_noreturn).
-       * Do NOT set func_late_reopt yet — that would force a re-emit even
-       * when no callee turns out to be noreturn, and our late_reopt re-
-       * emit path is fragile when the second compile produces materially
-       * different code (e.g. exposes pre-existing miscompiles of inferred-
-       * noreturn helpers).  Instead, the end-of-TU
-       * tu_propagate_noreturn_to_callers pass walks the call graph and
-       * sets func_late_reopt=1 only for callers of callees with useful
-       * final facts (currently noreturn or pure). */
-      sym->type.ref->f.func_keep_tokens_for_noreturn = 1;
-      break;
-    }
-  }
-
-  /* Final leafness recompute: the body-elide passes above
-   * (noreturn_collapse, ub_only_body_elide, local_only_body_elide,
-   * const_return_uninit_elide, useless_function_body) can NOP every CALL
-   * in the IR.  The earlier recompute happened before them, so without
-   * this second pass the prolog would still save LR and the codegen
-   * scratch path would treat the function as non-leaf. */
-  if (!ir->leaffunc)
-  {
-    int still_has_call = 0;
-    for (int i = 0; i < ir->next_instruction_index; ++i)
-    {
-      int op = ir->compact_instructions[i].op;
-      if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_BUILTIN_APPLY)
-      {
-        still_has_call = 1;
-        break;
-      }
-    }
-    if (!still_has_call)
-      ir->leaffunc = 1;
-  }
-
-  tcc_ir_codegen_generate(ir);
-
-  if (ir->barrel_shifts) {
-    tcc_free(ir->barrel_shifts);
-    ir->barrel_shifts = NULL;
-  }
-  if (ir->shift64_dead_half) {
-    tcc_free(ir->shift64_dead_half);
-    ir->shift64_dead_half = NULL;
-  }
-  if (ir->bfi_params) {
-    tcc_free(ir->bfi_params);
-    ir->bfi_params = NULL;
-  }
-
-  if (!sym->a.naked)
-  {
-    tcc_debug_prolog_epilog(tcc_state, 1);
-    // gfunc_epilog();
-  }
-
-  if (tcc_state->do_bench)
-  {
-    unsigned now = tcc_getclock_ms();
-    tcc_bench_log_phase(tcc_state, "func-codegen", funcname, &tcc_state->bench_function_codegen_time,
-                        &tcc_state->bench_function_codegen_count, now - phase_start);
-  }
-
-#ifdef CONFIG_TCC_DEBUG
-  if (tcc_state->dump_ir)
-  {
-    tcc_ir_dump_set_show_physical_regs(1); /* Show physical registers with virtual register info */
-    printf("=== IR AFTER OPTIMIZATIONS ===\n");
-    tcc_ir_show(ir);
-    printf("=== END IR AFTER OPTIMIZATIONS ===\n");
-  }
-#endif
-
-  /* Infer and cache function purity for LICM optimization
-   * This allows LICM to hoist calls to pure functions defined in the same TU */
-  if (tcc_state->opt_licm && ir && sym)
-  {
-    /* Forward declare the inference function */
-    extern TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState * ir, Sym * func_sym);
-    extern void tcc_ir_cache_func_purity(TCCState * s, int func_token, TCCFuncPurity purity);
-
-    TCCFuncPurity purity = tcc_ir_infer_func_purity(ir, sym);
-    tcc_ir_cache_func_purity(tcc_state, sym->v, purity);
-  }
-
-  if (tcc_state->opt_ipc && ir && sym)
-  {
-    int64_t const_val;
-    int const_btype;
-    int const_cached = 0;
-    if (tcc_ir_detect_const_result(ir, &const_val, &const_btype))
-    {
-      tcc_ir_cache_const_result(tcc_state, sym->v, const_val, const_btype);
-      const_cached = 1;
-    }
-    /* If the function isn't a plain const-returning function but is a pure
-     * single-parameter dispatcher (switch / if-chain over the arg returning
-     * constants), snapshot it so callers passing a constant can fold the call. */
-    if (!const_cached)
-    {
-      TCCFuncSwitchSnapshot *snap = NULL;
-      if (tcc_ir_detect_switch_func(ir, &snap))
-        tcc_ir_cache_switch_func(tcc_state, sym->v, snap);
-    }
-  }
-
-  /* Post-optimization re-inlining: if the optimized IR is trivial,
-   * retroactively mark the function for auto-inlining so future callers
-   * inline it via the existing token-replay mechanism.
-   * Skip nested functions: marking them auto_inline causes the parent
-   * to omit the frame pointer, breaking static chain access. */
-  if (ir && sym && !sym->type.ref->f.func_auto_inline &&
-      !sym->a.nested_func &&
-      !nonstatic_global_copier &&
-      ir->next_instruction_index <= 8)
-  {
-    sym->type.ref->f.func_auto_inline = 1;
-  }
-
-  /* Keep a non-static global-aggregate-copier with a parameter (the fn1/fn2
-   * shape) out of line even after the late collapse shrank it below the
-   * trivial-inline tier — the IR>12 demote below would miss the now-tiny body.
-   * See nonstatic_global_copier above for why this set excludes retme/ini/960311. */
-  if (ir && sym && sym->type.ref->f.func_auto_inline &&
-      !sym->a.nested_func && !sym->type.ref->f.func_alwinl &&
-      nonstatic_global_copier)
-  {
-    sym->type.ref->f.func_auto_inline = 0;
-  }
-
-  /* Post-optimization revoke: a function tagged auto_inline at registration
-   * (based on token-stream length) may still produce a large IR if its body
-   * is mostly calls to other helpers (cf. fail_u64 below: ~50 tokens but
-   * ~20 IR ops dominated by FUNCCALL pairs).  Inlining such a function at N
-   * call sites multiplies the call-heavy body by N for no real savings —
-   * GCC keeps these helpers out-of-line.  We count "expensive" IR ops
-   * (calls + control flow), and if the body looks call-heavy, demote it. */
-  if (ir && sym && sym->type.ref->f.func_auto_inline &&
-      !sym->a.nested_func &&
-      !sym->type.ref->f.func_alwinl &&
-      ir->next_instruction_index > 12)
-  {
-    int call_ops = 0;
-    int has_aggr_copy = 0;
-    for (int ii = 0; ii < ir->next_instruction_index; ii++)
-    {
-      int op = ir->compact_instructions[ii].op;
-      if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
-      {
-        call_ops++;
-        Sym *cs = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, &ir->compact_instructions[ii]));
-        const char *cn = cs ? get_tok_str(cs->v, NULL) : NULL;
-        if (cn && (strstr(cn, "memmove") || strstr(cn, "memcpy")))
-          has_aggr_copy = 1;
-      }
-    }
-    /* Naturally-small functions (short token body) whose post-opt IR grew
-     * mainly because their callees were inlined into them shouldn't be
-     * demoted on IR size alone — the bloat is from in-body inlining, not
-     * intrinsic complexity.  At a call site, the same inline expansion can
-     * happen for the caller; const-prop + DCE will collapse it when args
-     * are constant.  Look up the original token body length via inline_fns. */
-    int natural_body_len = 0;
-    for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
-    {
-      if (tcc_state->inline_fns[fi]->sym == sym && tcc_state->inline_fns[fi]->func_str)
-      {
-        natural_body_len = tcc_state->inline_fns[fi]->func_str->len;
-        break;
-      }
-    }
-    /* Threshold: >=3 calls or IR larger than ~24 ops marks the body as
-     * "too expensive to inline".  Naturally-small bodies (≤60 tokens) skip
-     * the IR-size gate and only get demoted for call-heavy patterns. */
-    int naturally_small = (natural_body_len > 0 && natural_body_len <= 60);
-    /* A non-static function is always emitted standalone (its definition must
-     * stay globally visible), so inlining a non-trivial body merely duplicates
-     * it at every call site without dropping the out-of-line copy — pure bloat,
-     * which GCC avoids by keeping such helpers out of line.  Only the ≤8-IR
-     * "trivial" promote tier (handled above) is worth inlining for a non-static
-     * function; demote anything larger here.  (Static functions can still be
-     * inlined and have their standalone copy dropped by --gc-sections.) */
-    int nonstatic_bloat =
-        !(sym->type.t & VT_STATIC) && has_aggr_copy && ir->next_instruction_index > 8;
-    if (call_ops >= 3 || (!naturally_small && ir->next_instruction_index > 24) ||
-        nonstatic_bloat)
-    {
-      sym->type.ref->f.func_auto_inline = 0;
-    }
-  }
-
-  /* Mark surviving auto-inline candidates whose body keeps a non-trivial,
-   * non-foldable call (e.g. a printf wrapper) as "call-heavy".  Inlining
-   * such a body at every call site duplicates the surviving call for no
-   * savings; when a function like this is called dozens of times (macro-
-   * generated check() in 55_lshift_type), unbounded expansion explodes the
-   * compiler's memory.  The call-site logic budget-limits how many times a
-   * call-heavy callee is expanded before falling back to a normal call. */
-  if (ir && sym && sym->type.ref->f.func_auto_inline &&
-      ir->next_instruction_index > 8)
-  {
-    for (int ii = 0; ii < ir->next_instruction_index; ii++)
-    {
-      int op = ir->compact_instructions[ii].op;
-      if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
-      {
-        sym->type.ref->f.func_inline_call_heavy = 1;
-        break;
-      }
-    }
-  }
-
-  /* end of function */
-  tcc_debug_funcend(tcc_state, ind - func_ind);
-
-  /* patch symbol size */
-  elfsym(sym)->st_size = ind - func_ind;
-
-  cur_text_section->data_offset = ind;
-  local_scope = 0;
-  /* Only pop labels defined in this function - use saved stack position */
-  label_pop(&global_label_stack, global_label_stack_start, 0);
-
-  /* Resolve deferred label-difference fixups now that label ELF symbols
-     have their final code offsets from label_pop above. */
-  {
-    LabelDiffFixup *f = tcc_state->label_diff_fixups;
-    while (f)
-    {
-      LabelDiffFixup *next = f->next;
-      ElfSym *esym_plus = elfsym(f->sym_plus);
-      ElfSym *esym_minus = elfsym(f->sym_minus);
-      if (esym_plus && esym_minus)
-      {
-        int32_t diff = (int32_t)esym_plus->st_value - (int32_t)esym_minus->st_value;
-        add32le(f->sec->data + f->offset, diff);
-      }
-      tcc_free(f);
-      f = next;
-    }
-    tcc_state->label_diff_fixups = NULL;
-  }
-
-  if (ir && ir->ir_to_code_mapping)
-  {
-    tcc_free(ir->ir_to_code_mapping);
-    ir->ir_to_code_mapping = NULL;
-    ir->ir_to_code_mapping_size = 0;
-  }
-  sym_pop(&all_cleanups, NULL, 0);
-
-  /* It's better to crash than to generate wrong code */
-  cur_text_section = NULL;
-  funcname = "";       /* for safety */
-  func_vt.t = VT_VOID; /* for safety */
-  func_var = 0;        /* for safety */
-  ind = 0;             /* for safety */
-  func_ind = -1;
-  tcc_state->cur_func_sym = NULL;
-  nocode_wanted = DATA_ONLY_WANTED;
-  check_vstack();
-
-  /* do this after funcend debug info */
-  next();
-  if (ir_inline_stash_eligible(sym, ir))
-  {
-    ir_inline_stash_add(tcc_state, sym, ir);
-  }
-  else
-  {
-    tcc_ir_free(ir);
-  }
-  tcc_state->ir = NULL;
-
-  /* Publish the fact that this function's body has been compiled in this
-   * TU.  Read by gen_function's late_reopt trigger on later-compiled
-   * callers (and by the inter-procedural noreturn propagation in general). */
-  if (sym && sym->type.ref)
-    sym->type.ref->f.func_compiled = 1;
-}
-
-/* Phase 0 inliner stash: keep optimized IR of eligible `static` functions
- * alive past gen_function() so a future inliner pass can splice it into
- * callers. Today there are no consumers — this exists to validate the
- * lifecycle change (no leaks, no regressions) before the splice logic lands. */
-#ifndef IR_INLINE_STASH_SIZE_BUDGET
-#define IR_INLINE_STASH_SIZE_BUDGET 200
-#endif
-
-static int ir_inline_stash_eligible(Sym *sym, TCCIRState *ir)
-{
-  if (!sym || !ir)
-    return 0;
-  if (!(sym->type.t & VT_STATIC))
-    return 0;
-  if (sym->a.addrtaken)
-    return 0;
-  if (!sym->type.ref || sym->type.ref->f.func_type == FUNC_ELLIPSIS)
-    return 0;
-  if (ir->has_static_chain)
-    return 0;
-  if (ir->nb_nested_funcs > 0)
-    return 0;
-  if (ir->naked)
-    return 0;
-#ifdef CONFIG_TCC_ASM
-  if (ir->inline_asm_count > 0)
-    return 0;
-#endif
-  if (ir->next_instruction_index > IR_INLINE_STASH_SIZE_BUDGET)
-    return 0;
-  return 1;
-}
-
-static void ir_inline_stash_add(TCCState *s1, Sym *sym, TCCIRState *ir)
-{
-  if (s1->nb_stashed_func_irs >= s1->stashed_func_irs_capacity)
-  {
-    s1->stashed_func_irs_capacity = s1->stashed_func_irs_capacity ? s1->stashed_func_irs_capacity * 2 : 4;
-    s1->stashed_func_irs =
-        tcc_realloc(s1->stashed_func_irs, s1->stashed_func_irs_capacity * sizeof(StashedFuncIR));
-  }
-  s1->stashed_func_irs[s1->nb_stashed_func_irs].sym = sym;
-  s1->stashed_func_irs[s1->nb_stashed_func_irs].ir = ir;
-  s1->nb_stashed_func_irs++;
-}
 
 static void ir_inline_stash_flush(TCCState *s1)
 {

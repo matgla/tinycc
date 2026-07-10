@@ -16,13 +16,14 @@
  *      * Multiple rewrites in one pass
  *
  *  HARNESS NOTES:
- *    - Links the real ir/opt/ssa_opt_strength.c via UT11.
+ *    - Links the real source/opt/ssa/strength.c via UT11.
  *    - Uses ssa_build.h for hand-built vinfo + IR.
  *    - MUL/UDIV/UMOD need a src2 operand; use ssa_add_instr3().
  */
 
 #include "ssa_build.h"
 #include "ir/opt/ssa_opt.h"
+#include "opt/ssa/strength.h"
 
 #include "ut.h"
 

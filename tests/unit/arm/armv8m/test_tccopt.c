@@ -464,9 +464,9 @@ UT_TEST(test_stats_fp_cache_hits_matches_scripted_sequence)
  * of the whole test-binary PROCESS, not just one test or one call. The
  * very first call to tcc_opt_get_passes/tcc_opt_register_pass/
  * tcc_opt_run_pass/tcc_optimize_ir from ANYWHERE in this binary triggers the
- * one-time registration of the 6 builtin_passes[]. This suite is the only
+ * one-time registration of the 4 builtin_passes[]. This suite is the only
  * thing in this binary that touches those four functions, so as long as
- * test_pass_registry_first_call_registers_six_builtins runs before every
+ * test_pass_registry_first_call_registers_four_builtins runs before every
  * other test below (enforced by UT_RUN order in the suite function), the
  * "only registers once" behavior is deliberately observed exactly once, as
  * intended, rather than assumed.
@@ -481,8 +481,10 @@ static int ut_topt_custom_pass1_run(TCCIRState *ir)
 }
 
 static const char *ut_topt_grow_names[] = {
-    "grow-test-0", "grow-test-1", "grow-test-2", "grow-test-3", "grow-test-4",
-    "grow-test-5", "grow-test-6", "grow-test-7", "grow-test-8", "grow-test-9",
+    "grow-test-0",  "grow-test-1",  "grow-test-2",  "grow-test-3",
+    "grow-test-4",  "grow-test-5",  "grow-test-6",  "grow-test-7",
+    "grow-test-8",  "grow-test-9",  "grow-test-10", "grow-test-11",
+    "grow-test-12", "grow-test-13",
 };
 static int ut_topt_grow_run(TCCIRState *ir)
 {
@@ -498,16 +500,16 @@ static int ut_topt_probe_o2_run(TCCIRState *ir)
   return 0;
 }
 
-UT_TEST(test_pass_registry_first_call_registers_six_builtins)
+UT_TEST(test_pass_registry_first_call_registers_four_builtins)
 {
   int count = -1;
   const TCCOptPass *passes = tcc_opt_get_passes(&count);
   UT_ASSERT(passes != NULL);
-  UT_ASSERT_EQ(count, 6);
+  UT_ASSERT_EQ(count, 4);
 
-  static const char *expected_names[6] = {
-      "fp-offset-cache", "dce", "const-fold", "cse", "copy-prop", "strength-reduce"};
-  for (int i = 0; i < 6; i++)
+  static const char *expected_names[4] = {
+      "fp-offset-cache", "dce", "const-fold", "cse"};
+  for (int i = 0; i < 4; i++)
     UT_ASSERT_STREQ(passes[i].name, expected_names[i]);
 
   /* Spot-check flags: cse is O2|OS only, fp-offset-cache is O1|O2|OS. */
@@ -525,8 +527,8 @@ UT_TEST(test_pass_registry_second_call_does_not_reregister)
   int count2 = -1;
   const TCCOptPass *passes2 = tcc_opt_get_passes(&count2);
 
-  UT_ASSERT_EQ(count1, 6);
-  UT_ASSERT_EQ(count2, 6);        /* NOT 12 -- builtins were not re-registered */
+  UT_ASSERT_EQ(count1, 4);
+  UT_ASSERT_EQ(count2, 4);        /* NOT 8 -- builtins were not re-registered */
   UT_ASSERT(passes1 == passes2); /* same underlying array; no growth happened */
 
   return 0;
@@ -611,9 +613,9 @@ UT_TEST(test_pass_registry_grows_capacity_past_default_16)
 
   /* Default registry capacity is 16 (set on the very first-ever
    * tcc_opt_register_pass call in this process, during builtin
-   * registration). Registering 10 more passes here is guaranteed to push
-   * the running total past 16 regardless of count_before (>= 7 at this
-   * point: 6 builtins + 1 prior custom pass), forcing `capacity *= 2`
+   * registration). Registering 14 more passes here is guaranteed to push
+   * the running total past 16 regardless of count_before (>= 5 at this
+   * point: 4 builtins + 1 prior custom pass), forcing `capacity *= 2`
    * inside tcc_opt_register_pass partway through the loop. */
   int n = (int)(sizeof(ut_topt_grow_names) / sizeof(ut_topt_grow_names[0]));
   for (int i = 0; i < n; i++)
@@ -637,12 +639,12 @@ UT_TEST(test_pass_registry_grows_capacity_past_default_16)
    * corrupted across the reallocation -- both the first pass registered
    * before the growth-triggering insertion and the very last one. */
   UT_ASSERT_STREQ(passes[count_before].name, "grow-test-0");
-  UT_ASSERT_STREQ(passes[count_after - 1].name, "grow-test-9");
+  UT_ASSERT_STREQ(passes[count_after - 1].name, "grow-test-13");
 
   TCCIRState ir;
   memset(&ir, 0, sizeof(ir));
   UT_ASSERT_EQ(tcc_opt_run_pass(&ir, "grow-test-0"), 777);
-  UT_ASSERT_EQ(tcc_opt_run_pass(&ir, "grow-test-9"), 777);
+  UT_ASSERT_EQ(tcc_opt_run_pass(&ir, "grow-test-13"), 777);
 
   return 0;
 }
@@ -745,15 +747,6 @@ UT_TEST(test_pass_cse_is_noop_and_null_safe)
   return 0;
 }
 
-UT_TEST(test_pass_strength_reduction_is_noop_and_null_safe)
-{
-  UT_ASSERT_EQ(tcc_opt_strength_reduction(NULL), 0);
-
-  TCCIRState ir;
-  memset(&ir, 0, sizeof(ir));
-  UT_ASSERT_EQ(tcc_opt_strength_reduction(&ir), 0);
-  return 0;
-}
 
 UT_TEST(test_pass_dead_code_elimination_is_noop_and_null_safe)
 {
@@ -782,21 +775,6 @@ UT_TEST(test_pass_constant_folding_is_noop_and_null_safe)
   TCCOptStats stats;
   tcc_opt_get_stats(&stats);
   UT_ASSERT_EQ(stats.const_folded, 0);
-  return 0;
-}
-
-UT_TEST(test_pass_copy_propagation_is_noop_and_null_safe)
-{
-  tcc_opt_reset_stats();
-  UT_ASSERT_EQ(tcc_opt_copy_propagation(NULL), 0);
-
-  TCCIRState ir;
-  memset(&ir, 0, sizeof(ir));
-  UT_ASSERT_EQ(tcc_opt_copy_propagation(&ir), 0);
-
-  TCCOptStats stats;
-  tcc_opt_get_stats(&stats);
-  UT_ASSERT_EQ(stats.copies_propagated, 0);
   return 0;
 }
 
@@ -878,7 +856,7 @@ UT_SUITE(tccopt)
   UT_RUN(test_stats_fp_cache_hits_matches_scripted_sequence);
 
   /* --- Pass registry / driver (see ordering-constraint comment above) --- */
-  UT_RUN(test_pass_registry_first_call_registers_six_builtins);
+  UT_RUN(test_pass_registry_first_call_registers_four_builtins);
   UT_RUN(test_pass_registry_second_call_does_not_reregister);
   UT_RUN(test_pass_run_pass_known_name_dispatches_and_side_effects);
   UT_RUN(test_pass_run_pass_unknown_name_and_null_args_return_zero);
@@ -897,8 +875,6 @@ UT_SUITE(tccopt)
   /* --- Built-in placeholder pass no-op contracts --- */
   UT_RUN(test_pass_fp_offset_caching_initializes_cache);
   UT_RUN(test_pass_cse_is_noop_and_null_safe);
-  UT_RUN(test_pass_strength_reduction_is_noop_and_null_safe);
   UT_RUN(test_pass_dead_code_elimination_is_noop_and_null_safe);
   UT_RUN(test_pass_constant_folding_is_noop_and_null_safe);
-  UT_RUN(test_pass_copy_propagation_is_noop_and_null_safe);
 }

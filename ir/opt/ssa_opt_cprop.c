@@ -85,11 +85,28 @@ static int ssa_gen_cprop_assign(IRSSAOptCtx *ctx, int idx)
  * Action:  replace all uses of dest with the immediate directly
  * ============================================================================ */
 
-/* Currently unreachable: enabling immediate forwarding through ASSIGN
- * triggers latent SCCP/phi-simplify bugs on switch/goto/OR patterns where
- * branch-arm constants flow into a join point (see bug_switch_goto_or
- * test). Keep the implementation in case those bugs get fixed later. */
-__attribute__((unused))
+static IROperand ssa_cprop_imm_for_use(IROperand imm, IROperand use)
+{
+  IROperand out = imm;
+  out.is_lval = 0;
+  out.is_llocal = 0;
+  out.is_local = 0;
+  out.btype = use.btype;
+  out.is_unsigned = use.is_unsigned;
+  out.is_static = use.is_static;
+  return out;
+}
+
+static int ssa_cprop_imm_other_operand_const(TCCIRState *ir, IRQuadCompact *q,
+                                             int32_t old_vr, int src_slot)
+{
+  IROperand other = src_slot == 1 ? tcc_ir_op_get_src2(ir, q)
+                                  : tcc_ir_op_get_src1(ir, q);
+  if (irop_get_vreg(other) == old_vr)
+    return 1;
+  return irop_is_immediate(other) && !other.is_lval;
+}
+
 static int ssa_gen_cprop_imm(IRSSAOptCtx *ctx, int idx)
 {
   TCCIRState *ir = ctx->ir;
@@ -102,7 +119,7 @@ static int ssa_gen_cprop_imm(IRSSAOptCtx *ctx, int idx)
   if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
 
-  if (src.tag != IROP_TAG_IMM32 && src.tag != IROP_TAG_F32)
+  if (!irop_is_immediate(src))
     return 0;
   if (src.is_lval)
     return 0;
@@ -113,40 +130,110 @@ static int ssa_gen_cprop_imm(IRSSAOptCtx *ctx, int idx)
   if (vi->def_count > 1)
     return 0;
 
-  int count = 0;
-  while (vi->use_count > 0) {
-    IRSSAUse use = vi->uses[vi->use_count - 1];
-    if (use.kind != SSA_USE_INSTR) {
-      /* phi uses keep the vreg */
-      break;
-    }
+  int instr_uses = 0;
+  for (int u = 0; u < vi->use_count; u++) {
+    IRSSAUse use = vi->uses[u];
+    if (use.kind != SSA_USE_INSTR)
+      continue;
 
+    IRQuadCompact *uq = &ir->compact_instructions[use.idx];
+    if (tcc_ir_barrel_shift_at(ir, uq))
+      return 0;
+
+    int found = 0;
+    if (irop_config[uq->op].has_src1) {
+      IROperand s = tcc_ir_op_get_src1(ir, uq);
+      if (irop_get_vreg(s) == dest_vr) {
+        if (s.is_lval || s.is_local || s.is_llocal)
+          return 0;
+        if (uq->op == TCCIR_OP_CMP &&
+            !ssa_cprop_imm_other_operand_const(ir, uq, dest_vr, 1))
+          return 0;
+        if ((uq->op == TCCIR_OP_BOOL_AND || uq->op == TCCIR_OP_BOOL_OR) &&
+            !ssa_cprop_imm_other_operand_const(ir, uq, dest_vr, 1))
+          return 0;
+        found = 1;
+      }
+    }
+    if (irop_config[uq->op].has_src2) {
+      IROperand s = tcc_ir_op_get_src2(ir, uq);
+      if (irop_get_vreg(s) == dest_vr) {
+        if (s.is_lval || s.is_local || s.is_llocal)
+          return 0;
+        if ((uq->op == TCCIR_OP_BOOL_AND || uq->op == TCCIR_OP_BOOL_OR) &&
+            !ssa_cprop_imm_other_operand_const(ir, uq, dest_vr, 2))
+          return 0;
+        found = 1;
+      }
+    }
+    if (uq->op == TCCIR_OP_MLA) {
+      IROperand a = tcc_ir_op_get_accum(ir, uq);
+      if (irop_get_vreg(a) == dest_vr) {
+        if (a.is_lval || a.is_local || a.is_llocal)
+          return 0;
+        found = 1;
+      }
+    }
+    if (uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED ||
+        uq->op == TCCIR_OP_STORE_POSTINC) {
+      IROperand d = tcc_ir_op_get_dest(ir, uq);
+      if (irop_get_vreg(d) == dest_vr)
+        return 0;
+    }
+    if (!found)
+      return 0;
+    instr_uses++;
+  }
+
+  if (instr_uses == 0)
+    return 0;
+
+  int count = 0;
+  int original_use_count = vi->use_count;
+  IRSSAUse *uses = tcc_mallocz(original_use_count * sizeof(IRSSAUse));
+  memcpy(uses, vi->uses, original_use_count * sizeof(IRSSAUse));
+  for (int u = 0; u < original_use_count; u++) {
+    IRSSAUse use = uses[u];
+    if (use.kind != SSA_USE_INSTR)
+      continue;
     IRQuadCompact *uq = &ir->compact_instructions[use.idx];
 
     int rewrote = 0;
     if (irop_config[uq->op].has_src1) {
       IROperand s = tcc_ir_op_get_src1(ir, uq);
       if (irop_get_vreg(s) == dest_vr && !s.is_lval) {
-        tcc_ir_op_set_src1(ir, uq, src);
+        tcc_ir_op_set_src1(ir, uq, ssa_cprop_imm_for_use(src, s));
         rewrote = 1;
       }
     }
-    if (!rewrote && irop_config[uq->op].has_src2) {
+    if (irop_config[uq->op].has_src2) {
       IROperand s = tcc_ir_op_get_src2(ir, uq);
       if (irop_get_vreg(s) == dest_vr && !s.is_lval) {
-        tcc_ir_op_set_src2(ir, uq, src);
+        tcc_ir_op_set_src2(ir, uq, ssa_cprop_imm_for_use(src, s));
+        rewrote = 1;
+      }
+    }
+    if (uq->op == TCCIR_OP_MLA) {
+      IROperand a = tcc_ir_op_get_accum(ir, uq);
+      if (irop_get_vreg(a) == dest_vr && !a.is_lval) {
+        tcc_ir_op_set_accum(ir, uq, ssa_cprop_imm_for_use(src, a));
         rewrote = 1;
       }
     }
 
     if (rewrote) {
-      vi->use_count--;
+      if (uq->op == TCCIR_OP_LOAD) {
+        uq->op = TCCIR_OP_ASSIGN;
+        tcc_ir_op_set_src2(ir, uq, IROP_NONE);
+      }
+      ssa_opt_remove_use_instr(vi, use.idx);
       count++;
-    } else {
-      break;
     }
   }
+  tcc_free(uses);
 
+  if (vi->use_count == 0)
+    ssa_opt_nop_instr(ctx, idx);
   return count > 0 ? 1 : 0;
 }
 
@@ -549,7 +636,10 @@ static int ssa_gen_cprop_copy_param(IRSSAOptCtx *ctx, int idx)
     if (irop_config[kq->op].has_dest &&
         kq->op != TCCIR_OP_FUNCPARAMVAL && kq->op != TCCIR_OP_FUNCPARAMVOID) {
       IROperand kd = tcc_ir_op_get_dest(ir, kq);
-      if (irop_get_vreg(kd) == src_vr)
+      int dest_defines =
+          !(kq->op == TCCIR_OP_STORE_INDEXED || kq->op == TCCIR_OP_STORE_POSTINC ||
+            (kq->op == TCCIR_OP_STORE && kd.is_lval));
+      if (dest_defines && irop_get_vreg(kd) == src_vr && k < max_use_idx)
         return 0;
     }
   }
@@ -763,7 +853,10 @@ static int ssa_gen_cprop_copy_var_stackoff(IRSSAOptCtx *ctx, int idx)
     if (irop_config[kq->op].has_dest &&
         kq->op != TCCIR_OP_FUNCPARAMVAL && kq->op != TCCIR_OP_FUNCPARAMVOID) {
       IROperand kd = tcc_ir_op_get_dest(ir, kq);
-      if (irop_get_vreg(kd) == src_vr)
+      int dest_defines =
+          !(kq->op == TCCIR_OP_STORE_INDEXED || kq->op == TCCIR_OP_STORE_POSTINC ||
+            (kq->op == TCCIR_OP_STORE && kd.is_lval));
+      if (dest_defines && irop_get_vreg(kd) == src_vr && k < max_use_idx)
         return 0;
     }
   }
@@ -815,6 +908,8 @@ static int ssa_gen_cprop_assign_any(IRSSAOptCtx *ctx, int idx)
     return ssa_gen_cprop_copy_var_stackoff(ctx, idx);
   if (src.tag == IROP_TAG_SYMREF)
     return ssa_gen_cprop_symref_cse(ctx, idx);
+  if (src.tag == IROP_TAG_IMM32 || src.tag == IROP_TAG_F32)
+    return ssa_gen_cprop_imm(ctx, idx);
   return 0;
 }
 
@@ -1212,9 +1307,7 @@ int ssa_opt_var_to_param_forward(IRSSAOptCtx *ctx)
        * (volatile fuzz seed 16558: `(u6<<7)|x` folded to `u6|x`).  One blocked
        * use blocks the whole VAR: forwarding the others would NOP the def this
        * use still reads. */
-      if (ir->barrel_shifts && uq->orig_index >= 0 &&
-          uq->orig_index <= ir->max_orig_index &&
-          ir->barrel_shifts[uq->orig_index]) {
+      if (tcc_ir_barrel_shift_at(ir, uq)) {
         safe = 0;
         break;
       }
@@ -1537,6 +1630,15 @@ static int ssa_var_const_fold_one(IRSSAOptCtx *ctx, int idx)
     return 0;
   if (TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_VAR)
     return 0;
+  /* An address-taken or volatile slot may be observed/aliased between the prior
+   * def and this self-update; folding drops mandated accesses. */
+  {
+    int vpos = TCCIR_DECODE_VREG_POSITION(dest_vr);
+    if (vpos < ir->variables_live_intervals_size &&
+        (ir->variables_live_intervals[vpos].addrtaken ||
+         ir->variables_live_intervals[vpos].is_volatile))
+      return 0;
+  }
   if (src2.tag != IROP_TAG_IMM32 || src2.is_lval)
     return 0;
   /* src1 must be a read of the same VAR. Accept either bare VREG or lval
@@ -1558,23 +1660,30 @@ static int ssa_var_const_fold_one(IRSSAOptCtx *ctx, int idx)
     if (pq->op == TCCIR_OP_NOP)
       continue;
 
-    /* Anything that could alias Vx through memory or call kills our fold. */
-    switch (pq->op) {
-    case TCCIR_OP_FUNCCALLVAL:
-    case TCCIR_OP_FUNCCALLVOID:
-    case TCCIR_OP_STORE:
-    case TCCIR_OP_STORE_INDEXED:
-    case TCCIR_OP_STORE_POSTINC:
-    case TCCIR_OP_BLOCK_COPY:
-    case TCCIR_OP_INLINE_ASM:
-    case TCCIR_OP_VLA_ALLOC:
-    case TCCIR_OP_SETJMP:
-    case TCCIR_OP_LONGJMP:
-    case TCCIR_OP_NL_SETJMP:
-    case TCCIR_OP_NL_LONGJMP:
-      return 0;
-    default:
-      break;
+    /* A slot STORE of our own (non-addrtaken) Vx is a prior def captured
+     * below, not an aliasing write — let it fall through to the def check. */
+    if (pq->op == TCCIR_OP_STORE &&
+        irop_get_vreg(tcc_ir_op_get_dest(ir, pq)) == dest_vr) {
+      /* handled by the def-capture block below */
+    } else {
+      /* Anything that could alias Vx through memory or call kills our fold. */
+      switch (pq->op) {
+      case TCCIR_OP_FUNCCALLVAL:
+      case TCCIR_OP_FUNCCALLVOID:
+      case TCCIR_OP_STORE:
+      case TCCIR_OP_STORE_INDEXED:
+      case TCCIR_OP_STORE_POSTINC:
+      case TCCIR_OP_BLOCK_COPY:
+      case TCCIR_OP_INLINE_ASM:
+      case TCCIR_OP_VLA_ALLOC:
+      case TCCIR_OP_SETJMP:
+      case TCCIR_OP_LONGJMP:
+      case TCCIR_OP_NL_SETJMP:
+      case TCCIR_OP_NL_LONGJMP:
+        return 0;
+      default:
+        break;
+      }
     }
 
     if (irop_config[pq->op].has_dest &&
@@ -1584,7 +1693,10 @@ static int ssa_var_const_fold_one(IRSSAOptCtx *ctx, int idx)
        * (regardless of is_lval), since writes to a VAR may be expressed via
        * either bare-vreg or lval-stackoff encoding.  Match that here. */
       if (irop_get_vreg(pd) == dest_vr) {
-        if (pq->op == TCCIR_OP_ASSIGN) {
+        /* A prior constant def of Vx — via ASSIGN or a slot STORE — captures
+         * the value at this self-update (the scan proved no aliasing op lies
+         * between).  Legacy const_prop tracks ASSIGN|STORE immediate defs. */
+        if (pq->op == TCCIR_OP_ASSIGN || pq->op == TCCIR_OP_STORE) {
           IROperand ps = tcc_ir_op_get_src1(ir, pq);
           if (ps.tag == IROP_TAG_IMM32 && !ps.is_lval) {
             prior_idx = k;
@@ -1682,5 +1794,253 @@ int ssa_opt_var_const_fold(IRSSAOptCtx *ctx)
       continue;
     changes += ssa_var_const_fold_one(ctx, i);
   }
+  return changes;
+}
+
+/* ssa:var_imm_prop — an unpromoted non-addrtaken VAR whose lone def is
+ * `V <- #imm32 [ASSIGN]` is an SSA value in all but name; forward the
+ * immediate into dominated plain-value uses (legacy const_prop VAR analog). */
+
+static int var_imm_def_dominates_use(IRCFG *cfg, int def_idx, int use_idx)
+{
+  if (def_idx >= cfg->num_instrs || use_idx >= cfg->num_instrs)
+    return 0;
+  int db = cfg->instr_to_block[def_idx];
+  int ub = cfg->instr_to_block[use_idx];
+  if (db < 0 || ub < 0)
+    return 0;
+  if (db == ub)
+    return def_idx < use_idx;
+  int b = ub, steps = 0;
+  while (b >= 0 && b != db && steps++ < cfg->num_blocks) {
+    int id = cfg->blocks[b].idom;
+    if (id == b)
+      break;
+    b = id;
+  }
+  return b == db;
+}
+
+static int var_imm_prop_slot(IRSSAOptCtx *ctx, IRQuadCompact *q, int slot,
+                             const int32_t *def_idx, const uint8_t *def_cnt,
+                             const uint8_t *blocked, const uint8_t *use_cnt,
+                             int use_idx, int nv)
+{
+  TCCIRState *ir = ctx->ir;
+  IROperand s;
+  if (slot == 0)
+    s = tcc_ir_op_get_src1(ir, q);
+  else if (slot == 1)
+    s = tcc_ir_op_get_src2(ir, q);
+  else
+    s = tcc_ir_op_get_accum(ir, q);
+  /* Accept a bare (non-lval) VREG value, or the lval-STACKOFF form the frontend
+   * emits when a VAR's value is read into an arithmetic op (the value load from
+   * the VAR's own slot).  Both decode to the VAR vreg via irop_get_vreg — same
+   * acceptance as ssa_opt_var_const_fold.  A symref or pointer-deref lval is not
+   * a VAR-slot value and is rejected. */
+  int is_bare_vreg = (s.tag == IROP_TAG_VREG && !s.is_lval && !s.is_local &&
+                      !s.is_llocal && !s.is_sym);
+  int is_slot_read = (s.tag == IROP_TAG_STACKOFF && s.is_lval && !s.is_sym);
+  if (!is_bare_vreg && !is_slot_read)
+    return 0;
+  int use_bt = irop_get_btype(s);
+  if (use_bt != IROP_BTYPE_INT32 && use_bt != IROP_BTYPE_INT64)
+    return 0;
+  int32_t vr = irop_get_vreg(s);
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
+    return 0;
+  int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  if (pos >= nv || blocked[pos] || def_cnt[pos] != 1)
+    return 0;
+  IRQuadCompact *dq = &ir->compact_instructions[def_idx[pos]];
+  if (dq->op != TCCIR_OP_ASSIGN && dq->op != TCCIR_OP_STORE)
+    return 0;
+  IROperand dd = tcc_ir_op_get_dest(ir, dq);
+  int def_bt = irop_get_btype(dd);
+  /* ASSIGN produces a plain (non-lval) VAR value; a slot STORE writes the
+   * VAR's stack slot (its dest is the slot, which may be lval).  The constant
+   * is src1 in both — legacy const_prop tracks ASSIGN|STORE immediate defs
+   * alike.  Reject a lval ASSIGN (that would be a deref, not a value def);
+   * the STORE slot form is safe here because the VAR is non-addr-taken
+   * (blocked) and single-def, so nothing else can alter the slot. */
+  if (dq->op == TCCIR_OP_ASSIGN && dd.is_lval)
+    return 0;
+  /* def and use must be the same width: a 64-bit const forwarded into a
+   * 32-bit operand (or vice versa) changes the value the operand carries. */
+  if (def_bt != use_bt ||
+      (def_bt != IROP_BTYPE_INT32 && def_bt != IROP_BTYPE_INT64))
+    return 0;
+  IROperand ds = tcc_ir_op_get_src1(ir, dq);
+  int ds_ok = (def_bt == IROP_BTYPE_INT64)
+                  ? (ds.tag == IROP_TAG_IMM32 || ds.tag == IROP_TAG_I64)
+                  : (ds.tag == IROP_TAG_IMM32);
+  if (!ds_ok || ds.is_lval || ds.is_local || ds.is_sym)
+    return 0;
+  /* A 64-bit constant materialises via a multi-instruction / pool-load
+   * sequence, so forwarding it to more than one use trades a single slot
+   * load for several materialisations.  Mirror legacy const_prop's
+   * `use_count > 1 && NEEDS_POOL_LOAD` guard: forward 64-bit only single-use
+   * (where the def itself becomes dead and DCE removes it — a strict win). */
+  if (def_bt == IROP_BTYPE_INT64 && use_cnt[pos] > 1)
+    return 0;
+  if (!var_imm_def_dominates_use(ctx->cfg, def_idx[pos], use_idx))
+    return 0;
+  if (q->op == TCCIR_OP_CMP && slot == 0 &&
+      !ssa_cprop_imm_other_operand_const(ir, q, vr, 1))
+    return 0;
+  if ((q->op == TCCIR_OP_BOOL_AND || q->op == TCCIR_OP_BOOL_OR) &&
+      !ssa_cprop_imm_other_operand_const(ir, q, vr, slot + 1))
+    return 0;
+  IROperand imm = ssa_cprop_imm_for_use(ds, s);
+  if (slot == 0)
+    tcc_ir_op_set_src1(ir, q, imm);
+  else if (slot == 1)
+    tcc_ir_op_set_src2(ir, q, imm);
+  else
+    tcc_ir_op_set_accum(ir, q, imm);
+  if (q->op == TCCIR_OP_LOAD) {
+    q->op = TCCIR_OP_ASSIGN;
+    tcc_ir_op_set_src2(ir, q, IROP_NONE);
+  }
+  return 1;
+}
+
+int ssa_opt_var_imm_prop(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+  if (!cfg || !cfg->instr_to_block)
+    return 0;
+  int n = ir->next_instruction_index;
+  int nv = ir->next_local_variable;
+  if (nv <= 0)
+    return 0;
+
+  /* IJUMP/SWITCH_TABLE: CFG lacks the edges dominance needs; SETJMP: longjmp
+   * re-entry bypasses the dominator tree; ASM: may touch VARs invisibly. */
+  for (int i = 0; i < n; i++) {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE ||
+        op == TCCIR_OP_SETJMP || op == TCCIR_OP_NL_SETJMP ||
+        op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_ASM_INPUT ||
+        op == TCCIR_OP_ASM_OUTPUT)
+      return 0;
+  }
+
+  int32_t *def_idx = tcc_malloc(nv * sizeof(int32_t));
+  uint8_t *def_cnt = tcc_mallocz(nv);
+  uint8_t *blocked = tcc_mallocz(nv);
+  uint8_t *use_cnt = tcc_mallocz(nv);
+  for (int v = 0; v < nv; v++)
+    def_idx[v] = -1;
+  for (int v = 0; v < nv && v < ir->variables_live_intervals_size; v++)
+    if (ir->variables_live_intervals[v].addrtaken ||
+        ir->variables_live_intervals[v].is_volatile)
+      blocked[v] = 1;
+
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op == TCCIR_OP_LEA) {
+      IROperand s1 = tcc_ir_op_get_src1(ir, q);
+      int32_t lv = irop_get_vreg(s1);
+      if (lv >= 0 && TCCIR_DECODE_VREG_TYPE(lv) == TCCIR_VREG_TYPE_VAR &&
+          TCCIR_DECODE_VREG_POSITION(lv) < (uint32_t)nv)
+        blocked[TCCIR_DECODE_VREG_POSITION(lv)] = 1;
+    }
+    if (!irop_config[q->op].has_dest || q->op == TCCIR_OP_FUNCPARAMVAL ||
+        q->op == TCCIR_OP_FUNCPARAMVOID)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t dv = irop_get_vreg(d);
+    if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_VAR)
+      continue;
+    int pos = TCCIR_DECODE_VREG_POSITION(dv);
+    if (pos >= nv)
+      continue;
+    /* STORE_INDEXED reads its dest as base address; deref STORE writes the
+     * pointee; anything else with a VAR dest (slot-write STORE, POSTINC
+     * pointer update, ALU/CALL/ASSIGN dest) redefines the VAR. */
+    if (q->op == TCCIR_OP_STORE_INDEXED)
+      continue;
+    if (q->op == TCCIR_OP_STORE && d.is_lval && !d.is_local)
+      continue;
+    def_idx[pos] = i;
+    if (def_cnt[pos] < 2)
+      def_cnt[pos]++;
+  }
+
+  /* Per-VAR source-operand use count, for the 64-bit single-use guard. */
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    for (int slot = 0; slot < 3; slot++) {
+      IROperand s;
+      if (slot == 0) {
+        if (!irop_config[q->op].has_src1) continue;
+        s = tcc_ir_op_get_src1(ir, q);
+      } else if (slot == 1) {
+        if (!irop_config[q->op].has_src2) continue;
+        s = tcc_ir_op_get_src2(ir, q);
+      } else {
+        if (q->op != TCCIR_OP_MLA) continue;
+        s = tcc_ir_op_get_accum(ir, q);
+      }
+      if (s.tag != IROP_TAG_VREG)
+        continue;
+      int32_t vr = irop_get_vreg(s);
+      if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
+        continue;
+      int pos = TCCIR_DECODE_VREG_POSITION(vr);
+      if (pos < nv && use_cnt[pos] < 255)
+        use_cnt[pos]++;
+    }
+  }
+
+  int changes = 0;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (tcc_ir_barrel_shift_at(ir, q))
+      continue;
+    int rewrote = 0;
+    if (irop_config[q->op].has_src1)
+      rewrote |= var_imm_prop_slot(ctx, q, 0, def_idx, def_cnt, blocked, use_cnt, i, nv);
+    if (irop_config[q->op].has_src2)
+      rewrote |= var_imm_prop_slot(ctx, q, 1, def_idx, def_cnt, blocked, use_cnt, i, nv);
+    if (q->op == TCCIR_OP_MLA)
+      rewrote |= var_imm_prop_slot(ctx, q, 2, def_idx, def_cnt, blocked, use_cnt, i, nv);
+    changes += rewrote;
+  }
+
+  tcc_free(def_idx);
+  tcc_free(def_cnt);
+  tcc_free(blocked);
+  tcc_free(use_cnt);
+  return changes;
+}
+
+/* ============================================================================
+ * ssa:const_prop_tmp — SSA-time analog of the flat block-local const_prop_tmp
+ *
+ * A faithful port: reuses the flat implementation (tcc_ir_opt_const_prop_tmp_core)
+ * so there is a single source of truth for the block-local TMP/VAR constant
+ * tracker (immediate propagation, two-operand fold, SWITCH_TABLE const-index →
+ * JUMP, CMP+SETIF and soft-FP __aeabi_c[df]cmp[le|eq] both-immediate folds).
+ * Running it inside the SSA pipeline lets the flat pass eventually retire.  The
+ * transform only substitutes immediates and folds/NOPs individual ops — it
+ * never moves defs across blocks — so it is safe on SSA-form IR; branch folds
+ * (SWITCH/JUMPIF) only ever remove CFG edges, matching what ssa:branch already
+ * leaves stale for the rest of the run.  Rebuild use-def chains on change,
+ * mirroring bitop_const_fold / const_string_fold. */
+int ssa_opt_const_prop_tmp(IRSSAOptCtx *ctx)
+{
+  int changes = tcc_ir_opt_const_prop_tmp_core(ctx->ir);
+  if (changes)
+    tcc_ir_ssa_opt_rebuild(ctx);
   return changes;
 }

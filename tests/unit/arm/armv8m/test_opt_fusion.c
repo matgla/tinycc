@@ -2,8 +2,7 @@
  *  test_opt_fusion.c - suite for the Phase 3 fusion family (docs/plan_ut_next_steps.md
  *  Phase 3): bool_simplify, fusion_mla, deref_indexed, disp_fusion, chain_fold,
  *  pair_reorder (ir/opt_gens_bool.c, ir/opt_gens_fusion.c, driven through their
- *  non-static `_ex(IROptCtx*)` pipeline adapters in ir/opt_pipeline.c) and
- *  postinc (ir/opt_fusion.c, plain TCCIRState* entry).
+ *  non-static `_ex(IROptCtx*)` pipeline adapters in ir/opt_pipeline.c).
  *
  *  Each `_ex` adapter is a thin, non-static wrapper around
  *  `tcc_ir_opt_run_gens(ctx, <table>, <count>)` over a *distinct* generator
@@ -11,8 +10,8 @@
  *  already-tested passes) -- so each of these is genuinely new coverage, not
  *  duplicate exercising of shared logic.
  *
- *  Test sections after `postinc` (below the "opt_fusion.c direct-entry
- *  passes" banner and its shared utb_fusion_new()/utb_jtarget_fusion()/
+ *  Test sections below the "opt_fusion.c direct-entry
+ *  passes" banner (and its shared utb_fusion_new()/utb_jtarget_fusion()/
  *  utb_stackoff_vreg() helpers) cover the *rest* of ir/opt_fusion.c's own
  *  functions -- these are NOT registered in ir/opt_pipeline.c's
  *  PASS/PASS_GATED tables at all (so they're outside check_pass_coverage.py's
@@ -20,7 +19,7 @@
  *  called directly and unconditionally-per-flag from tccgen.c's
  *  IR-generation driver. Same "call the legacy entry directly" harness
  *  contract as every other bare pass (docs/plan_ut_next_steps.md S1):
- *  add_deref_fold, loop_postinc_fusion, barrel_shift_fusion (void return --
+ *  add_deref_fold, barrel_shift_fusion (void return --
  *  side-table output), shift_pair_to_ubfx, call_chain_rename,
  *  stackoff_addr_cse, lea_cse, lea_fold, lea_rmw_fold, assign_fuse.
  */
@@ -31,24 +30,21 @@
 #include "ut.h"
 
 /* Pass entry points. The gens_* passes take IROptCtx* (defined in
- * ir/opt_pipeline.c); postinc_fusion takes TCCIRState* directly (ir/opt_fusion.c). */
+ * ir/opt_pipeline.c). */
 int tcc_ir_opt_gens_bool_ex(IROptCtx *ctx);
 int tcc_ir_opt_gens_fusion_ex(IROptCtx *ctx);
 int tcc_ir_opt_gens_deref_indexed_ex(IROptCtx *ctx);
 int tcc_ir_opt_gens_disp_ex(IROptCtx *ctx);
 int tcc_ir_opt_gens_chain_ex(IROptCtx *ctx);
 int tcc_ir_opt_gens_pair_reorder_ex(IROptCtx *ctx);
-int tcc_ir_opt_postinc_fusion(TCCIRState *ir);
 
 /* The rest of ir/opt_fusion.c's own (non-generator-table) entry points --
  * all plain `int fn(TCCIRState *ir)` (barrel_shift_fusion returns void). */
 int tcc_ir_opt_add_deref_fold(TCCIRState *ir);
-int tcc_ir_opt_loop_postinc_fusion(TCCIRState *ir);
 void tcc_ir_barrel_shift_fusion(TCCIRState *ir);
 int tcc_ir_opt_shift_pair_to_ubfx(TCCIRState *ir);
 int tcc_ir_opt_call_chain_rename(TCCIRState *ir);
 int tcc_ir_opt_stackoff_addr_cse(TCCIRState *ir);
-int tcc_ir_opt_lea_cse(TCCIRState *ir);
 int tcc_ir_opt_lea_fold(TCCIRState *ir);
 int tcc_ir_opt_lea_rmw_fold(TCCIRState *ir);
 int tcc_ir_opt_assign_fuse(TCCIRState *ir);
@@ -104,8 +100,7 @@ static int run_ctx_pass(TCCIRState *ir, int (*pass_ex)(IROptCtx *ctx))
  *   - iroperand_pool_capacity      (tcc_ir_pool_add / tcc_ir_pool_ensure)
  *   - temporary_variables_live_intervals[_size] (tcc_ir_vreg_alloc_temp)
  *   - compact_instructions_size     (gsym_cse_insert_before realloc, used by
- *     stackoff_addr_cse; also read by tcc_ir_cfg_build/tcc_ir_detect_loops
- *     for loop_postinc_fusion)
+ *     stackoff_addr_cse)
  *   - next_local_variable / next_parameter (ir_opt_du_build's IR_DU_MODE_FULL,
  *     used by add_deref_fold [TMP_ONLY, doesn't need these two but harmless],
  *     lea_fold, assign_fuse, barrel_shift_fusion)
@@ -779,51 +774,6 @@ UT_TEST(test_pair_reorder_raw_hazard_blocks_swap)
   return 0;
 }
 
-/* ================================================================== postinc */
-
-/* POSITIVE: LOAD through a TEMP pointer immediately followed by
- * `ptr ADD #imm` (imm in [1,255]) fuses into LOAD_POSTINC + ASSIGN. */
-UT_TEST(test_postinc_load_then_add_fuses_to_load_postinc)
-{
-  TCCIRState *ir = utb_new();
-  ir->iroperand_pool_capacity = UTB_MAX_OPERANDS;
-
-  int load = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE);
-  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32), utb_imm(4, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_postinc_fusion(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_LOAD_POSTINC);
-  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, add)), 0);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): offset out of the post-indexed immediate range ([1,255])
- * -- left as a separate LOAD + ADD. */
-UT_TEST(test_postinc_out_of_range_offset_kept)
-{
-  TCCIRState *ir = utb_new();
-  ir->iroperand_pool_capacity = UTB_MAX_OPERANDS;
-
-  int load = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE);
-  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32), utb_imm(300, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_postinc_fusion(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_LOAD);
-  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_ADD);
-
-  utb_free(ir);
-  return 0;
-}
-
 /* ================================================================== add_deref_fold */
 
 /* POSITIVE: `T1 = P0 ADD #8` (single use) whose only use is a same-block
@@ -891,72 +841,6 @@ UT_TEST(test_add_deref_fold_non_param_base_kept)
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_ADD);
   UT_ASSERT(utb_src1(ir, use).is_lval);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* ================================================================== loop_postinc_fusion */
-
-/* POSITIVE: a natural loop whose latch has `T_ptr = T_ptr + #4` (self-update,
- * TEMP, offset in [1,255]) and whose single body deref is a standalone LOAD
- * through T_ptr, with a NOP immediately after the LOAD for the writeback
- * ASSIGN.  Fuses to LOAD_POSTINC + ASSIGN, and NOPs the latch ADD.
- *
- *   0: T0 = #0                        ; preheader
- *   1: T1 = T0 LOAD***DEREF***         ; header/body: standalone LOAD of T0  (deref_idx=1)
- *   2: NOP                            ; slot for the writeback ASSIGN
- *   3: T2 = T2 + #1                   ; some other body work (keeps T1 alive)
- *   4: T0 = T0 + #4                   ; latch: self-update ADD (ptr_vr=T0, offset=4)
- *   5: JUMPIF ->1 (cond T3)           ; back-edge
- *   6: RETURNVOID                     ; exit
- */
-UT_TEST(test_loop_postinc_fusion_standalone_load_fuses)
-{
-  TCCIRState *ir = utb_fusion_new(4);
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(0, I32), UTB_NONE);         /* 0 preheader */
-  int load = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE); /* 1 header */
-  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                            /* 2 assign-slot */
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(2, I32), utb_imm(1, I32));     /* 3 other body work */
-  int latch = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_temp(0, I32), utb_imm(4, I32)); /* 4 latch */
-  utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget_fusion(1), utb_temp(3, I32), UTB_NONE);    /* 5 back-edge */
-  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);                     /* 6 exit */
-
-  int changes = tcc_ir_opt_loop_postinc_fusion(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_LOAD_POSTINC);
-  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, load)), 0);                /* pointer = T0 */
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_op4(ir, load)), 4);   /* offset = 4 */
-  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_ASSIGN);                     /* writeback ASSIGN in the NOP slot */
-  UT_ASSERT_EQ(utb_vreg_pos(utb_dest(ir, 2)), 0);
-  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, 2)), 0);
-  UT_ASSERT_EQ(utb_op(ir, latch), TCCIR_OP_NOP);                    /* latch ADD removed */
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): two derefs of the pointer in the loop body -- the pass
- * requires exactly one, so it must leave everything untouched. */
-UT_TEST(test_loop_postinc_fusion_multi_deref_kept)
-{
-  TCCIRState *ir = utb_fusion_new(4);
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(0, I32), UTB_NONE);          /* 0 preheader */
-  int load1 = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE); /* 1 header */
-  int load2 = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(2, I32), utb_deref_temp(0, I32), UTB_NONE); /* 2 second deref */
-  int latch = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_temp(0, I32), utb_imm(4, I32)); /* 3 latch */
-  utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget_fusion(1), utb_temp(3, I32), UTB_NONE);     /* 4 back-edge */
-  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);                      /* 5 exit */
-
-  int changes = tcc_ir_opt_loop_postinc_fusion(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, load1), TCCIR_OP_LOAD);
-  UT_ASSERT_EQ(utb_op(ir, load2), TCCIR_OP_LOAD);
-  UT_ASSERT_EQ(utb_op(ir, latch), TCCIR_OP_ADD);
 
   utb_free(ir);
   return 0;
@@ -1168,55 +1052,6 @@ UT_TEST(test_stackoff_addr_cse_single_use_kept)
   return 0;
 }
 
-/* ================================================================== lea_cse */
-
-/* POSITIVE: two LEAs of the same vreg-backed anonymous-local StackLoc
- * (negative vreg encoding, offset 24) in the same block -- the second
- * becomes `ASSIGN dest2 <- dest1` (the canonical LEA's dest), and the first
- * LEA is left untouched as the canonical definition. */
-UT_TEST(test_lea_cse_collapses_repeated_vreg_backed_lea)
-{
-  TCCIRState *ir = utb_fusion_new(4);
-
-  IROperand slot = utb_stackoff_vreg(-2, 24, I32);
-  int lea1 = utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), slot, UTB_NONE);
-  int lea2 = utb_emit(ir, TCCIR_OP_LEA, utb_temp(2, I32), slot, UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_lea_cse(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, lea1), TCCIR_OP_LEA); /* canonical def kept */
-  UT_ASSERT_EQ(utb_op(ir, lea2), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, lea2)), 1); /* copies from lea1's dest T1 */
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): a FUNCCALLVAL between the two LEAs resets the active-CSE
- * table (conservative: caller-saved regs may not survive the call), so the
- * second LEA is *not* collapsed even though its source matches. */
-UT_TEST(test_lea_cse_call_between_resets_table)
-{
-  TCCIRState *ir = utb_fusion_new(4);
-
-  IROperand slot = utb_stackoff_vreg(-2, 24, I32);
-  int lea1 = utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), slot, UTB_NONE);
-  utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, utb_imm(0, I32), utb_imm(0, I32));
-  int lea2 = utb_emit(ir, TCCIR_OP_LEA, utb_temp(2, I32), slot, UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_lea_cse(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, lea1), TCCIR_OP_LEA);
-  UT_ASSERT_EQ(utb_op(ir, lea2), TCCIR_OP_LEA); /* not collapsed */
-
-  utb_free(ir);
-  return 0;
-}
-
 /* ================================================================== lea_fold */
 
 /* POSITIVE (Pattern A): `T1 = LEA Addr[StackLoc[16]]` (vreg=-1, the "plain"
@@ -1391,7 +1226,6 @@ UT_SUITE(opt_fusion)
   UT_COVERS("disp_fusion");
   UT_COVERS("chain_fold");
   UT_COVERS("pair_reorder");
-  UT_COVERS("postinc");
 
   UT_RUN(test_bool_simplify_and_self_folds_to_assign);
   UT_RUN(test_bool_simplify_and_distinct_kept);
@@ -1425,9 +1259,6 @@ UT_SUITE(opt_fusion)
   UT_RUN(test_pair_reorder_adjacent_indexed_stores_move_together);
   UT_RUN(test_pair_reorder_raw_hazard_blocks_swap);
 
-  UT_RUN(test_postinc_load_then_add_fuses_to_load_postinc);
-  UT_RUN(test_postinc_out_of_range_offset_kept);
-
   /* The rest of ir/opt_fusion.c's bare-entry passes below are NOT registered
    * in ir/opt_pipeline.c's PASS/PASS_GATED tables (they're called directly,
    * unconditionally-per-flag, from tccgen.c) -- so there is no registered
@@ -1437,9 +1268,6 @@ UT_SUITE(opt_fusion)
   UT_RUN(test_add_deref_fold_param_base_folds_to_load_indexed);
   UT_RUN(test_add_deref_fold_peep_through_assign_from_param);
   UT_RUN(test_add_deref_fold_non_param_base_kept);
-
-  UT_RUN(test_loop_postinc_fusion_standalone_load_fuses);
-  UT_RUN(test_loop_postinc_fusion_multi_deref_kept);
 
   UT_RUN(test_barrel_shift_fusion_shr_folds_into_sub);
   UT_RUN(test_barrel_shift_fusion_multi_use_shift_kept);
@@ -1452,9 +1280,6 @@ UT_SUITE(opt_fusion)
 
   UT_RUN(test_stackoff_addr_cse_hoists_repeated_offset);
   UT_RUN(test_stackoff_addr_cse_single_use_kept);
-
-  UT_RUN(test_lea_cse_collapses_repeated_vreg_backed_lea);
-  UT_RUN(test_lea_cse_call_between_resets_table);
 
   UT_RUN(test_lea_fold_single_deref_use_folds_to_stackloc);
   UT_RUN(test_lea_fold_multi_use_kept);

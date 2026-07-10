@@ -1,5 +1,5 @@
 /*
- *  test_ir_core.c - suite for ir/core.c IR instruction building
+ *  test_ir_core.c - suite for ir/gen/put.c, ir/gen/jump.c IR instruction building
  *
  *  Exercises instruction append, operand packing, leaf/call tracking,
  *  jump-chain backpatching, and the irop_config shape table.
@@ -259,7 +259,7 @@ UT_TEST(test_set_dest_roundtrip)
 }
 
 /* -------------------------------------------------------------------------- */
-/* ASSIGN-coalescing optimization (tcc_ir_put, ir/core.c ~535-613)            */
+/* ASSIGN-coalescing optimization (tcc_ir_put, ir/gen/put.c ~236-315)         */
 /*                                                                            */
 /* When an ASSIGN's src1 is the TEMP that was just produced as the dest of   */
 /* the immediately preceding instruction, tcc_ir_put() redirects that prior  */
@@ -441,9 +441,9 @@ UT_TEST(test_coalesce_width_mismatch_blocks_coalescing)
 {
   /* NOTE: an earlier version of this test asserted that a width mismatch
    * still coalesces via the irop_make_vreg() "else" rebuild branch at
-   * ir/core.c ~587-601.  That was wrong: `width_match` is itself one of
-   * the conjuncts of `can_coalesce` (ir/core.c:547), so inside
-   * `if (can_coalesce)` the `if (width_match)` check at line 566 always
+   * ir/gen/put.c ~288-296.  That was wrong: `width_match` is itself one of
+   * the conjuncts of `can_coalesce` (ir/gen/put.c:248), so inside
+   * `if (can_coalesce)` the `if (width_match)` check at line 267 always
    * takes the true branch.  The "else" rebuild path is therefore dead
    * code as currently gated -- a width mismatch simply blocks coalescing
    * altogether and the ASSIGN is emitted as its own instruction.  This
@@ -695,10 +695,10 @@ UT_TEST(test_utility_functions_null_safe)
 /* Token -> IR opcode mapping (tcc_irop_from_token)                           */
 /* -------------------------------------------------------------------------- */
 
-/* tcc_irop_from_token() is defined non-static in ir/core.c (called
+/* tcc_irop_from_token() is defined non-static in ir/gen/arith.c (called
  * internally by tcc_ir_gen_i()) but is not declared in ir/core.h or any
  * other header -- no production TU currently calls it from outside
- * ir/core.c.  Declare it locally here rather than editing a production
+ * ir/gen/arith.c.  Declare it locally here rather than editing a production
  * header (see swarm ground rules). */
 extern TccIrOp tcc_irop_from_token(int token);
 
@@ -1271,7 +1271,7 @@ UT_TEST(test_gen_i_add_emits_instruction_and_rewrites_vtop)
   SValue *saved_vtop = vtop;
   vtop = &vals[1];
 
-  tcc_ir_gen_add(ir);
+  tcc_ir_gen_i(ir, '+');
 
   UT_ASSERT_EQ(tcc_ir_count(ir), 1);
   UT_ASSERT_EQ(ir->compact_instructions[0].op, TCCIR_OP_ADD);

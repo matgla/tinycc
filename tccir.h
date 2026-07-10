@@ -84,6 +84,12 @@ typedef enum TccIrOp
    * ARM: UBFX Rd, Rn, #lsb, #width */
   TCCIR_OP_UBFX,
 
+  /* Signed bitfield extract: dest = sign-extend of src1 bits [lsb..lsb+width-1].
+   * src2 encodes lsb (bits 0-4) and width (bits 5-9): src2 = lsb | (width << 5).
+   * The signed analog of UBFX, from the (x<<a)>>b arithmetic-shift idiom.
+   * ARM: SBFX Rd, Rn, #lsb, #width */
+  TCCIR_OP_SBFX,
+
   /* Bitfield insert: dest = (src1 with bits [lsb..lsb+width-1] replaced by the
    * low `width` bits of src2).  Algebraically == (src1 & ~field) | (src2 << lsb)
    * for field = ((1<<width)-1)<<lsb when src2 < 2^width.  lsb/width are carried
@@ -624,6 +630,8 @@ typedef struct TCCIRState
    * barrel_shifts[i] encodes an optional barrel shift on src2 of instruction i:
    * 0 = none, else (type<<5)|amount. type: 1=SHL, 2=SHR, 3=SAR, 4=ROR. */
   uint8_t *barrel_shifts;
+  /* Element count at allocation; reads bound by this, not max_orig_index. See docs/side_table_orig_index_bounds.md */
+  int barrel_shifts_len;
 
   /* Dead-half annotations for 64-bit shift ops, keyed by orig_index.
    * Populated just before codegen, freed after.  bit0 = the result's low
@@ -631,12 +639,14 @@ typedef struct TCCIRState
    * dead.  Lets thumb_emit_shift64_mop skip the dead half-write in the
    * 64-bit bitfield-extract idiom (SHL #a; SHR #b, b>=32). */
   uint8_t *shift64_dead_half;
+  int shift64_dead_half_len;
 
   /* BFI insert parameters, keyed by orig_index.  Populated by
    * tcc_ir_opt_bitfield_insert_to_bfi just before codegen, freed after.
    * Entry = lsb (bits 0-7) | (width << 8); width >= 1 so a real BFI entry is
    * never 0.  Consumed by tcc_gen_machine_bfi_mop. */
   uint16_t *bfi_params;
+  int bfi_params_len;
 
   /* Codegen temporaries owned by tcc_ir_codegen_generate while it is running.
    * They are normally freed before return; tcc_ir_free also releases them when
@@ -715,9 +725,6 @@ int tcc_ir_spill_cache_lookup(SpillCache *cache, int offset);
 void tcc_ir_spill_cache_invalidate_reg(SpillCache *cache, int reg);
 void tcc_ir_spill_cache_invalidate_offset(SpillCache *cache, int offset);
 
-/* Check if FPU supports double precision (defined in arm-thumb-gen.c) */
-int arm_fpu_supports_double(int fpu_type);
-
 /* SValue pool accessor functions for compact IR storage.
  * Operand layout in pool: dest (if present), src1 (if present), src2 (if present).
  * Returns NULL if the operand is not used by this operation. */
@@ -751,6 +758,29 @@ static inline IROperand tcc_ir_get_dest(const TCCIRState *ir, int index)
   if (q->operand_base >= (uint32_t)ir->iroperand_pool_count)
     return IROP_NONE;
   return ir->iroperand_pool[q->operand_base];
+}
+
+/* Side tables keyed by orig_index; a 0 result means "no annotation" (including
+ * for instructions inserted after the table was populated). See docs/side_table_orig_index_bounds.md */
+static inline uint8_t tcc_ir_barrel_shift_at(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (!ir->barrel_shifts || q->orig_index < 0 || q->orig_index >= ir->barrel_shifts_len)
+    return 0;
+  return ir->barrel_shifts[q->orig_index];
+}
+
+static inline uint8_t tcc_ir_shift64_dead_half_at(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (!ir->shift64_dead_half || q->orig_index < 0 || q->orig_index >= ir->shift64_dead_half_len)
+    return 0;
+  return ir->shift64_dead_half[q->orig_index];
+}
+
+static inline uint16_t tcc_ir_bfi_params_at(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (!ir->bfi_params || q->orig_index < 0 || q->orig_index >= ir->bfi_params_len)
+    return 0;
+  return ir->bfi_params[q->orig_index];
 }
 
 static inline IROperand tcc_ir_op_get_src1(const TCCIRState *ir, const IRQuadCompact *q)

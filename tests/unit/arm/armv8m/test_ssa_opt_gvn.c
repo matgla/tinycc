@@ -1,26 +1,23 @@
 /*
- *  test_ssa_opt_gvn.c - global value numbering pass
+ *  test_ssa_opt_gvn.c - CMP+SETIF CSE folded into ssa_opt_gvn
  *
- *  Phase 2: Leaf passes.
+ *  Ports the former test_opt_cmp_cse.c (which drove the retired flat
+ *  tcc_ir_opt_cmp_setif_cse) onto the GVN hook gvn_try_cmp_setif:
  *
- *  Covers:
- *    - ssa_opt_gvn(): detecting redundant computations
- *      * x = a + b; y = a + b -> y = x (GVN)
- *      * x = a + b; y = b + a -> y = x (commutative GVN)
- *      * Different operands -> no redundancy
- *      * Different immediates -> no redundancy
- *      * MLA with accumulator redundancy
- *      * 64-bit destination decline
- *      * Barrel-shift annotation decline
- *      * Multi-definition source decline
- *      * Phi-defined source decline
- *      * lval/local/llocal source decline
- *      * Stable vs mutated PARAM handling
- *      * Dominator-tree scoped availability
+ *      CMP A, B            CMP A, B   (equal operands + cond + btypes)
+ *      V1 <-- (cond=C)  => NOP
+ *      ...                 V2 <-- V1  [ASSIGN]
+ *      CMP A, B
+ *      V2 <-- (cond=C)
+ *
+ *  GVN routes each pair by operand class: both operands GVN-stable
+ *  (immediates / single-def const vregs) -> dominator-scoped table, giving
+ *  cross-block reuse the flat pass never had; a memory/multi-def operand ->
+ *  block-local cache, inheriting gvn_local_invalidate's store/redef bailouts.
  *
  *  HARNESS NOTES:
  *    - Links the real ir/opt/ssa_opt_gvn.c via UT11.
- *    - Uses ssa_build.h for hand-built vinfo + IR.
+ *    - Uses ssa_build.h for hand-built CFG + SSA + vinfo.
  */
 
 #include "ssa_build.h"
@@ -33,477 +30,210 @@
 #include "ir/opt/ssa_opt.h"
 
 #define I32 IROP_BTYPE_INT32
-#define I64 IROP_BTYPE_INT64
+#define I16 IROP_BTYPE_INT16
 
-/* Helper to extract raw vreg encoding from an IROperand. */
-#define IROP_VR(op) ((int)(op).vr)
+#define UT_TOK_NE 0x95
+#define UT_TOK_EQ 0x94
 
-/* ========================================================================
- * Redundant computation: x = a + b; y = a + b -> y = x
- * ======================================================================== */
+#define VR_TEMP(n) irop_get_vreg(utb_temp(n, I32))
 
-UT_TEST(test_gvn_redundant_add)
+#define gvn_cmp(c, s1, s2) ssa_add_instr3((c), TCCIR_OP_CMP, UTB_NONE, (s1), (s2))
+#define gvn_setif(c, d, cond) \
+  ssa_add_instr3((c), TCCIR_OP_SETIF, (d), utb_imm((cond), I32), UTB_NONE)
+
+static void gvn_build_rebuild(ssa_ctx *c)
 {
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
-  /* t0 = #1; t1 = #2; t2 = t0 + t1; t3 = t0 + t1 -> t3 = t2 */
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(2, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32),
-                 utb_temp(1, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, I32),
-                              utb_temp(0, I32), utb_temp(1, I32));
+  ssa_ctx_build_cfg(c);
+  /* GVN walks the dominator tree via dom_children, populated here (the real
+   * pipeline gets this from SSA construction; the plain harness does not). */
+  if (c->cfg)
+    tcc_ir_cfg_compute_dom_frontiers(c->cfg);
+  ssa_ctx_build_ssa_plain(c);
+  ssa_ctx_rebuild(c);
+}
 
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
+/* -------------------------------------------------- positive paths */
 
-  int changed = ssa_opt_gvn(c.ctx);
-  /* The pass should detect the redundant ADD. */
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, add2_i)),
-               IROP_VR(utb_temp(2, I32)));
+UT_TEST(test_gvn_cmp_setif_two_imm_pairs_fold)
+{
+  /* Two CMP #5,#7 ; SETIF NE pairs (immediate operands -> dominator table).
+   * The second CMP is NOPed and its SETIF becomes ASSIGN of the first result. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/10);
+  gvn_cmp(&c, utb_imm(5, I32), utb_imm(7, I32));                 /* 0 */
+  gvn_setif(&c, utb_temp(1, I32), UT_TOK_NE);                    /* 1 */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(9, I32), utb_imm(1, I32)); /* 2 benign */
+  int cmp2 = gvn_cmp(&c, utb_imm(5, I32), utb_imm(7, I32));      /* 3 */
+  int setif2 = gvn_setif(&c, utb_temp(2, I32), UT_TOK_NE);       /* 4 */
 
+  gvn_build_rebuild(&c);
+  int changes = ssa_opt_gvn(c.ctx);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp2), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, setif2), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, setif2)), VR_TEMP(1));
   ssa_ctx_free(&c);
   return 0;
 }
 
-/* ========================================================================
- * Commutative: x = a + b; y = b + a -> y = x
- * ======================================================================== */
-
-UT_TEST(test_gvn_commutative_add)
+UT_TEST(test_gvn_cmp_setif_vreg_const_pairs_fold)
 {
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(2, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32),
-                 utb_temp(1, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, I32),
-                              utb_temp(1, I32), utb_temp(0, I32));
+  /* CMP operands are the same single-def const vreg (T0 = #5) -> both pairs key
+   * identically in the dominator table. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/10);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32)); /* 0 */
+  gvn_cmp(&c, utb_temp(0, I32), utb_imm(7, I32));                /* 1 */
+  gvn_setif(&c, utb_temp(1, I32), UT_TOK_NE);                    /* 2 */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(9, I32), utb_imm(1, I32)); /* 3 benign */
+  int cmp2 = gvn_cmp(&c, utb_temp(0, I32), utb_imm(7, I32));     /* 4 */
+  int setif2 = gvn_setif(&c, utb_temp(2, I32), UT_TOK_NE);       /* 5 */
 
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
+  gvn_build_rebuild(&c);
+  int changes = ssa_opt_gvn(c.ctx);
 
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, add2_i)),
-               IROP_VR(utb_temp(2, I32)));
-
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp2), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, setif2), TCCIR_OP_ASSIGN);
   ssa_ctx_free(&c);
   return 0;
 }
 
-/* ========================================================================
- * Non-redundant: different operands -> no optimization
- * ======================================================================== */
-
-UT_TEST(test_gvn_non_redundant)
+UT_TEST(test_gvn_cmp_setif_cross_block_fold)
 {
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
-  /* t0 = #1; t1 = #2; t2 = t0 + t1; t3 = t0 + #3 -> no redundancy */
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(2, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32),
-                 utb_temp(1, I32));
-  int add_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, I32),
-                             utb_temp(0, I32), utb_imm(3, I32));
+  /* Dominator-scoped reuse: pair in block 0 dominates a duplicate pair in
+   * block 1 (reached by an unconditional JUMP).  The flat pass, scoped to one
+   * basic block, could never fold this. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/10);
+  gvn_cmp(&c, utb_imm(5, I32), utb_imm(7, I32));                 /* 0 */
+  gvn_setif(&c, utb_temp(1, I32), UT_TOK_NE);                    /* 1 */
+  ssa_add_instr(&c, TCCIR_OP_JUMP, utb_imm(3, I32), UTB_NONE);   /* 2 -> idx 3 */
+  int cmp2 = gvn_cmp(&c, utb_imm(5, I32), utb_imm(7, I32));      /* 3 (block 1) */
+  int setif2 = gvn_setif(&c, utb_temp(2, I32), UT_TOK_NE);       /* 4 */
 
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
+  gvn_build_rebuild(&c);
+  UT_ASSERT(c.cfg->num_blocks >= 2);
+  int changes = ssa_opt_gvn(c.ctx);
 
-  int changed = ssa_opt_gvn(c.ctx);
-  /* The pass should not optimize (operands differ). */
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, add_i), TCCIR_OP_ADD);
-
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp2), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, setif2), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, setif2)), VR_TEMP(1));
   ssa_ctx_free(&c);
   return 0;
 }
 
-/* ========================================================================
- * Immediate-key distinction: same vreg, different immediates -> no merge
- * ======================================================================== */
+/* -------------------------------------------------- guard branches */
 
-UT_TEST(test_gvn_imm_key_distinct)
+UT_TEST(test_gvn_cmp_setif_cond_mismatch_no_fold)
 {
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32),
-                 utb_imm(5, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32),
-                              utb_temp(0, I32), utb_imm(6, I32));
+  /* First pair NE, second pair EQ -> cond differs (imm3 key) -> no fold. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/10);
+  gvn_cmp(&c, utb_imm(5, I32), utb_imm(7, I32));
+  gvn_setif(&c, utb_temp(1, I32), UT_TOK_NE);
+  int cmp2 = gvn_cmp(&c, utb_imm(5, I32), utb_imm(7, I32));
+  gvn_setif(&c, utb_temp(2, I32), UT_TOK_EQ);
 
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ADD);
-
+  gvn_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_gvn(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp2), TCCIR_OP_CMP);
   ssa_ctx_free(&c);
   return 0;
 }
 
-/* ========================================================================
- * MLA redundancy: dest = a*b + c
- * ======================================================================== */
-
-UT_TEST(test_gvn_mla_redundant)
+UT_TEST(test_gvn_cmp_setif_btype_mismatch_no_fold)
 {
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(2, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(3, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(4, I32));
-  ssa_add_instr4(&c, TCCIR_OP_MLA, utb_temp(3, I32), utb_temp(0, I32),
-                 utb_temp(1, I32), utb_temp(2, I32));
-  int mla2_i = ssa_add_instr4(&c, TCCIR_OP_MLA, utb_temp(4, I32),
-                              utb_temp(0, I32), utb_temp(1, I32),
-                              utb_temp(2, I32));
+  /* Operand btype differs between the two CMPs (I32 vs I16) -> btkey differs. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/10);
+  gvn_cmp(&c, utb_imm(5, I32), utb_imm(7, I32));
+  gvn_setif(&c, utb_temp(1, I32), UT_TOK_NE);
+  int cmp2 = gvn_cmp(&c, utb_imm(5, I16), utb_imm(7, I16));
+  gvn_setif(&c, utb_temp(2, I32), UT_TOK_NE);
 
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, mla2_i), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, mla2_i)),
-               IROP_VR(utb_temp(3, I32)));
-
+  gvn_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_gvn(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp2), TCCIR_OP_CMP);
   ssa_ctx_free(&c);
   return 0;
 }
 
-/* ========================================================================
- * MLA commutativity: a*b + c matches b*a + c
- * ======================================================================== */
-
-UT_TEST(test_gvn_mla_commutative)
+UT_TEST(test_gvn_cmp_setif_operand_mismatch_no_fold)
 {
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(2, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(3, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(4, I32));
-  ssa_add_instr4(&c, TCCIR_OP_MLA, utb_temp(3, I32), utb_temp(1, I32),
-                 utb_temp(0, I32), utb_temp(2, I32));
-  int mla2_i = ssa_add_instr4(&c, TCCIR_OP_MLA, utb_temp(4, I32),
-                              utb_temp(0, I32), utb_temp(1, I32),
-                              utb_temp(2, I32));
+  /* Same cond/btypes but different compared value (7 vs 9) -> operands unequal. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/10);
+  gvn_cmp(&c, utb_imm(5, I32), utb_imm(7, I32));
+  gvn_setif(&c, utb_temp(1, I32), UT_TOK_NE);
+  int cmp2 = gvn_cmp(&c, utb_imm(5, I32), utb_imm(9, I32));
+  gvn_setif(&c, utb_temp(2, I32), UT_TOK_NE);
 
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, mla2_i), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, mla2_i)),
-               IROP_VR(utb_temp(3, I32)));
-
+  gvn_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_gvn(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp2), TCCIR_OP_CMP);
   ssa_ctx_free(&c);
   return 0;
 }
 
-/* ========================================================================
- * 64-bit destination: decline to avoid truncating copy
- * ======================================================================== */
-
-UT_TEST(test_gvn_i64_dest_skip)
+UT_TEST(test_gvn_cmp_setif_operand_redef_no_fold)
 {
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(2, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I64), utb_temp(0, I32),
-                 utb_temp(1, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, I64),
-                              utb_temp(0, I32), utb_temp(1, I32));
+  /* A multi-def CMP operand (T0) routes the pair to the block-local cache; the
+   * intervening redefinition of T0 invalidates the cached entry -> no fold. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/10);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32)); /* 0 */
+  gvn_cmp(&c, utb_temp(0, I32), utb_imm(7, I32));               /* 1 */
+  gvn_setif(&c, utb_temp(1, I32), UT_TOK_NE);                   /* 2 */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(9, I32)); /* 3 redef */
+  int cmp2 = gvn_cmp(&c, utb_temp(0, I32), utb_imm(7, I32));    /* 4 */
+  gvn_setif(&c, utb_temp(2, I32), UT_TOK_NE);                   /* 5 */
 
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ADD);
-
+  gvn_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_gvn(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp2), TCCIR_OP_CMP);
   ssa_ctx_free(&c);
   return 0;
 }
 
-/* ========================================================================
- * Barrel-shift annotation: invisible to the GVN key -> decline
- * ======================================================================== */
-
-UT_TEST(test_gvn_barrel_shift_skip)
+UT_TEST(test_gvn_cmp_setif_lval_dest_skipped)
 {
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(2, I32));
-  int add1_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32),
-                              utb_temp(0, I32), utb_temp(1, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, I32),
-                              utb_temp(0, I32), utb_temp(1, I32));
+  /* A SETIF whose dest is an lvalue is not a normal value result -> not
+   * recorded as a CSE anchor. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/10);
+  gvn_cmp(&c, utb_imm(5, I32), utb_imm(7, I32));
+  gvn_setif(&c, utb_lval(utb_temp(1, I32)), UT_TOK_NE);
+  int cmp2 = gvn_cmp(&c, utb_imm(5, I32), utb_imm(7, I32));
+  gvn_setif(&c, utb_temp(2, I32), UT_TOK_NE);
 
-  /* Annotate the first ADD with a barrel shift; it must not enter the table. */
-  c.ir->barrel_shifts = tcc_mallocz(c.ir->max_orig_index + 1);
-  c.ir->barrel_shifts[add1_i] = 1;
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ADD);
-
+  gvn_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_gvn(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp2), TCCIR_OP_CMP);
   ssa_ctx_free(&c);
   return 0;
 }
 
-/* ========================================================================
- * Multi-definition source: value is not unique -> decline
- * ======================================================================== */
-
-UT_TEST(test_gvn_multi_def_src_skip)
+UT_TEST(test_gvn_cmp_setif_single_pair_no_fold)
 {
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(2, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(3, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32),
-                 utb_temp(1, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, I32),
-                              utb_temp(0, I32), utb_temp(1, I32));
+  /* A lone CMP+SETIF with no duplicate records but folds nothing (no crash). */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/10);
+  int cmp = gvn_cmp(&c, utb_imm(5, I32), utb_imm(7, I32));
+  gvn_setif(&c, utb_temp(1, I32), UT_TOK_NE);
 
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ADD);
-
+  gvn_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_gvn(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp), TCCIR_OP_CMP);
   ssa_ctx_free(&c);
   return 0;
 }
 
-/* ========================================================================
- * Phi-defined source: value merges across blocks -> decline
- * ======================================================================== */
-
-UT_TEST(test_gvn_phi_src_skip)
-{
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(2, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-
-  /* phi T0 = [T1, T1] in block 0. */
-  ssa_add_phi(&c, /*block=*/0, utb_vreg(utb_temp(0, I32)),
-              (int32_t[]){ utb_vreg(utb_temp(1, I32)),
-                           utb_vreg(utb_temp(1, I32)) }, 2);
-
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32),
-                 utb_temp(1, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, I32),
-                              utb_temp(0, I32), utb_temp(1, I32));
-
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ADD);
-
-  ssa_ctx_free(&c);
-  return 0;
-}
-
-/* ========================================================================
- * lval/local/llocal source flags: not a register value -> decline
- * ======================================================================== */
-
-UT_TEST(test_gvn_lval_src_skip)
-{
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
-  IROperand t0_lval = utb_temp(0, I32);
-  t0_lval.is_lval = 1;
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(3, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32), t0_lval,
-                 utb_temp(1, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, I32), t0_lval,
-                              utb_temp(1, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ADD);
-
-  ssa_ctx_free(&c);
-  return 0;
-}
-
-UT_TEST(test_gvn_local_src_skip)
-{
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
-  IROperand t0_local = utb_temp(0, I32);
-  t0_local.is_local = 1;
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(3, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32), t0_local,
-                 utb_temp(1, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, I32), t0_local,
-                              utb_temp(1, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ADD);
-
-  ssa_ctx_free(&c);
-  return 0;
-}
-
-UT_TEST(test_gvn_llocal_src_skip)
-{
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
-  IROperand t0_llocal = utb_temp(0, I32);
-  t0_llocal.is_llocal = 1;
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(3, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32), t0_llocal,
-                 utb_temp(1, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, I32), t0_llocal,
-                              utb_temp(1, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ADD);
-
-  ssa_ctx_free(&c);
-  return 0;
-}
-
-/* ========================================================================
- * Stable PARAM source: can hash on a parameter that is never written
- * ======================================================================== */
-
-UT_TEST(test_gvn_param_stable)
-{
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/3);
-  c.ir->next_parameter = 1;
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(1, I32), utb_param(0, I32),
-                 utb_imm(1, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32),
-                              utb_param(0, I32), utb_imm(1, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, add2_i)),
-               IROP_VR(utb_temp(1, I32)));
-
-  ssa_ctx_free(&c);
-  return 0;
-}
-
-/* ========================================================================
- * Mutated PARAM source: mid-function write makes it unstable -> decline
- * ======================================================================== */
-
-UT_TEST(test_gvn_param_mutated_skip)
-{
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/3);
-  c.ir->next_parameter = 1;
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_param(0, I32), utb_imm(5, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(1, I32), utb_param(0, I32),
-                 utb_imm(1, I32));
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32),
-                              utb_param(0, I32), utb_imm(1, I32));
-
-  ssa_ctx_build_cfg(&c);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ADD);
-
-  ssa_ctx_free(&c);
-  return 0;
-}
-
-/* ========================================================================
- * Dominator-tree scope: hash entries flow to dominated blocks and are
- * popped after the subtree.
- * ======================================================================== */
-
-UT_TEST(test_gvn_domtree_scope)
-{
-  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/5);
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32));
-  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(2, I32));
-  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32),
-                 utb_temp(1, I32));
-  /* Jump to the instruction immediately following it -> block 1 starts here. */
-  utb_emit(c.ir, TCCIR_OP_JUMP, utb_imm(4, I32), UTB_NONE, UTB_NONE);
-  int add2_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(3, I32),
-                              utb_temp(0, I32), utb_temp(1, I32));
-
-  ssa_ctx_build_cfg(&c);
-  /* GVN needs the dominator-tree children, not just idom. */
-  tcc_ir_cfg_compute_dom_frontiers(c.cfg);
-  ssa_ctx_build_ssa_plain(&c);
-  ssa_ctx_rebuild(&c);
-
-  int changed = ssa_opt_gvn(c.ctx);
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, add2_i), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, add2_i)),
-               IROP_VR(utb_temp(2, I32)));
-
-  ssa_ctx_free(&c);
-  return 0;
-}
-
-/* ========================================================================
- * Suite registration
- * ======================================================================== */
+/* ------------------------------------------------------------------ suite */
 
 UT_SUITE(ssa_opt_gvn)
 {
-  UT_COVERS("ssa:gvn");
-  UT_RUN(test_gvn_redundant_add);
-  UT_RUN(test_gvn_commutative_add);
-  UT_RUN(test_gvn_non_redundant);
-  UT_RUN(test_gvn_imm_key_distinct);
-  UT_RUN(test_gvn_mla_redundant);
-  UT_RUN(test_gvn_mla_commutative);
-  UT_RUN(test_gvn_i64_dest_skip);
-  UT_RUN(test_gvn_barrel_shift_skip);
-  UT_RUN(test_gvn_multi_def_src_skip);
-  UT_RUN(test_gvn_phi_src_skip);
-  UT_RUN(test_gvn_lval_src_skip);
-  UT_RUN(test_gvn_local_src_skip);
-  UT_RUN(test_gvn_llocal_src_skip);
-  UT_RUN(test_gvn_param_stable);
-  UT_RUN(test_gvn_param_mutated_skip);
-  UT_RUN(test_gvn_domtree_scope);
+  UT_COVERS("gvn");
+  UT_RUN(test_gvn_cmp_setif_two_imm_pairs_fold);
+  UT_RUN(test_gvn_cmp_setif_vreg_const_pairs_fold);
+  UT_RUN(test_gvn_cmp_setif_cross_block_fold);
+  UT_RUN(test_gvn_cmp_setif_cond_mismatch_no_fold);
+  UT_RUN(test_gvn_cmp_setif_btype_mismatch_no_fold);
+  UT_RUN(test_gvn_cmp_setif_operand_mismatch_no_fold);
+  UT_RUN(test_gvn_cmp_setif_operand_redef_no_fold);
+  UT_RUN(test_gvn_cmp_setif_lval_dest_skipped);
+  UT_RUN(test_gvn_cmp_setif_single_pair_no_fold);
 }

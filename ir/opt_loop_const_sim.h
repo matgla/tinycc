@@ -14,7 +14,11 @@
 #include "ir.h"
 #include "opt_engine.h"
 
-int tcc_ir_opt_loop_const_sim(struct TCCIRState *ir);
-int tcc_ir_opt_loop_const_sim_ex(struct IROptCtx *ctx);
+/* Shared loop-fold engine over an explicit flat region, driven by
+ * ssa_opt_loop_const_sim (ir/opt/ssa_opt_loop.c).  allow_extension enables the
+ * rotated-range tail extension; SSA callers pass exact membership and disable
+ * it.  Returns 1 if folded. */
+int lcs_fold_region(struct TCCIRState *ir, int start_idx, int end_idx,
+                    int header_idx, int preheader_idx, int allow_extension);
 
 #endif /* TCC_IR_OPT_LOOP_CONST_SIM_H */

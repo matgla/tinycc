@@ -617,6 +617,7 @@ int ir_opt_next_non_nop(TCCIRState *ir, int start)
 
 int ir_skip_nops_forward(TCCIRState *ir, int start, int n)
 {
+  if (start < 0) return n; /* unresolved/negative target: report not-found */
   for (int j = start; j < n; j++)
     if (ir->compact_instructions[j].op != TCCIR_OP_NOP)
       return j;

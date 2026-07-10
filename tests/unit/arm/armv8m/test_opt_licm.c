@@ -187,6 +187,35 @@ UT_TEST(test_licm_hoists_invariant_add)
   return 0;
 }
 
+/* ssa:licm — the regalloc-time driver (ssa_opt_licm) over the same engine.
+ * Pins that the relocated pass entry still hoists the invariant ADD (one new
+ * NOP; the def moves ahead of the header) and reports a change. */
+UT_TEST(test_ssa_opt_licm_hoists_invariant)
+{
+  TCCIRState *ir = utb_loop_new();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(100, I32), UTB_NONE);   /* 0 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(5, I32));/* 1 header, invariant */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(2, I32), utb_imm(1, I32));/* 2 varying */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(1), utb_temp(3, I32), UTB_NONE);      /* 3 back-edge */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);                /* 4 exit */
+
+  int n_before = ir->next_instruction_index;
+  int nops_before = count_nops(ir);
+
+  int changed = ssa_opt_licm(ir);
+
+  UT_ASSERT_EQ(changed, 1);
+  UT_ASSERT_EQ(ir->next_instruction_index, n_before + 1);
+  UT_ASSERT_EQ(count_nops(ir), nops_before + 1);
+
+  int t1_def = find_def(ir, TCCIR_OP_ADD, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 1));
+  UT_ASSERT_EQ(t1_def, 1);
+
+  utb_free(ir);
+  return 0;
+}
+
 /* POSITIVE (docs/bugs.md #7, re-enabled): a CONST function call in a loop whose
  * argument is loop-invariant is hoisted into the preheader by
  * tcc_ir_hoist_pure_calls (run first inside tcc_ir_opt_licm_ex).  The original
@@ -1508,6 +1537,7 @@ UT_SUITE(opt_licm)
 {
   UT_COVERS("licm");
   UT_RUN(test_licm_hoists_invariant_add);
+  UT_RUN(test_ssa_opt_licm_hoists_invariant);
   UT_RUN(test_licm_hoists_const_call_with_invariant_arg);
   UT_RUN(test_licm_no_hoist_pure_call_when_loop_writes_memory);
   UT_RUN(test_licm_no_loop_no_change);

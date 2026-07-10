@@ -633,3 +633,10 @@ static int tcc_ir_opt_reroll__timed(TCCIRState *ir)
   vrset_free(&defs);
   return rerolled;
 }
+
+/* ssa:reroll regalloc-time driver: runs the proven re-roller on flat IR at the
+ * head of the tcc_ir_ssa_regalloc flat region (docs/plan_legacy_loop_reroll_ssa.md). */
+int ssa_opt_reroll(TCCIRState *ir)
+{
+  return tcc_ir_opt_reroll(ir);
+}

@@ -15,7 +15,7 @@
 #include "opt_utils.h"
 #include "opt_du.h"
 
-static int ir_opt_eval_const_string_operand(TCCIRState *ir, IROperand op, int use_idx, IROperand *out, int depth)
+int ir_opt_eval_const_string_operand(TCCIRState *ir, IROperand op, int use_idx, IROperand *out, int depth)
 {
   int32_t vr;
   int def_idx;
@@ -85,7 +85,7 @@ static int ir_opt_eval_const_string_operand(TCCIRState *ir, IROperand op, int us
   }
 }
 
-static int ir_opt_fold_strcmp_result(const char *s1, const char *s2)
+int ir_opt_fold_strcmp_result(const char *s1, const char *s2)
 {
   while ((unsigned char)*s1 == (unsigned char)*s2)
   {
@@ -98,7 +98,7 @@ static int ir_opt_fold_strcmp_result(const char *s1, const char *s2)
   return (int)(unsigned char)*s1 - (int)(unsigned char)*s2;
 }
 
-static int ir_opt_fold_strncmp_result(const char *s1, const char *s2, uint64_t n)
+int ir_opt_fold_strncmp_result(const char *s1, const char *s2, uint64_t n)
 {
   if (n == 0)
     return 0;
@@ -114,7 +114,7 @@ static int ir_opt_fold_strncmp_result(const char *s1, const char *s2, uint64_t n
   return 0;
 }
 
-static int ir_opt_fold_memcmp_result(const char *s1, const char *s2, uint64_t n)
+int ir_opt_fold_memcmp_result(const char *s1, const char *s2, uint64_t n)
 {
   uint64_t i;
 
@@ -183,7 +183,7 @@ static int ir_opt_is_memcpy_like_name(const char *name)
           strcmp(name, "__aeabi_memcpy8") == 0);
 }
 
-static int ir_opt_eval_stack_strlen(TCCIRState *ir, IROperand arg, int call_idx, int *out_len)
+int ir_opt_eval_stack_strlen(TCCIRState *ir, IROperand arg, int call_idx, int *out_len)
 {
   enum { MAX_TRACK = 256 };
   uint8_t bytes[MAX_TRACK];

@@ -33,7 +33,6 @@
  * avoid pulling in the optimizer engine headers). */
 int tcc_ir_opt_entry_store_prop(TCCIRState *ir);
 int tcc_ir_opt_byte_store_merge(TCCIRState *ir);
-int tcc_ir_opt_store_redundant(TCCIRState *ir);
 int tcc_ir_opt_dead_static_store_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir);
@@ -140,51 +139,6 @@ UT_TEST(test_entry_store_no_matching_offset_kept)
   UT_ASSERT_EQ(changes, 0);
   IROperand s2 = utb_src2(ir, use);
   UT_ASSERT(s2.is_lval);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* =============================================================== store_redundant */
-
-/* POSITIVE: two STOREs through the same LEA'd pointer with no intervening
- * read -- the first (overwritten, unread) STORE is dead. */
-UT_TEST(test_store_redundant_overwritten_store_removed)
-{
-  TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
-  int dead = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(1, I32), UTB_NONE);
-  int kept = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(2, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_store_redundant(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, kept), TCCIR_OP_STORE);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): a read through the pointer between the two stores evicts
- * the tracked entry, so the first store survives (it fed a real read). */
-UT_TEST(test_store_redundant_read_between_stores_kept)
-{
-  TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
-  int first = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE);
-  int second = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(2, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_store_redundant(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, first), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, second), TCCIR_OP_STORE);
 
   utb_free(ir);
   return 0;
@@ -425,7 +379,6 @@ UT_TEST(test_global_base_share_no_elf_state_never_fires)
 UT_SUITE(opt_store_fwd)
 {
   UT_COVERS("entry_store");
-  UT_COVERS("store_redundant");
   UT_COVERS("byte_store_merge");
   UT_COVERS("dead_static_store");
   UT_COVERS("dead_local_slot");
@@ -434,9 +387,6 @@ UT_SUITE(opt_store_fwd)
 
   UT_RUN(test_entry_store_forwards_lea_add_deref);
   UT_RUN(test_entry_store_no_matching_offset_kept);
-
-  UT_RUN(test_store_redundant_overwritten_store_removed);
-  UT_RUN(test_store_redundant_read_between_stores_kept);
 
   UT_RUN(test_byte_store_merge_four_bytes_merged);
   UT_RUN(test_byte_store_merge_incomplete_group_kept);

@@ -75,7 +75,6 @@ RUN_TIMEOUT = 10
 # the Makefile-driven tcc path is unaffected, and we set this for the direct gcc
 # helper subprocesses for good measure.
 _CHILD_ENV = dict(os.environ)
-_CHILD_ENV.setdefault("ASAN_OPTIONS", "detect_leaks=0")
 
 
 @dataclass

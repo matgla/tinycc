@@ -494,32 +494,6 @@ UT_TEST(test_abi_assign_call_args_scalar32_to_r0)
   return 0;
 }
 
-/* ------------------------------------------------------------------ branch optimization state */
-
-UT_TEST(test_branch_opt_default_encoding_is_32)
-{
-  setup_gen();
-
-  tcc_gen_machine_branch_opt_init();
-  UT_ASSERT_EQ(tcc_gen_machine_branch_opt_get_encoding(0), 32);
-  UT_ASSERT_EQ(tcc_gen_machine_branch_opt_get_encoding(999), 32);
-
-  return 0;
-}
-
-UT_TEST(test_branch_opt_analyze_empty_mapping_no_crash)
-{
-  setup_gen();
-
-  tcc_gen_machine_branch_opt_init();
-  uint32_t mapping[4] = {0, 10, 20, 30};
-  tcc_gen_machine_branch_opt_analyze(mapping, 4);
-  /* With no recorded branches the conservative fallback remains. */
-  UT_ASSERT_EQ(tcc_gen_machine_branch_opt_get_encoding(0), 32);
-
-  return 0;
-}
-
 /* ------------------------------------------------------------------ dry-run state */
 
 UT_TEST(test_dry_run_lifecycle)
@@ -1046,8 +1020,6 @@ UT_SUITE(gen_dispatch_smoke)
   UT_RUN(test_abi_assign_call_args_rejects_null_layout);
   UT_RUN(test_abi_assign_call_args_rejects_null_args_when_nonzero);
   UT_RUN(test_abi_assign_call_args_scalar32_to_r0);
-  UT_RUN(test_branch_opt_default_encoding_is_32);
-  UT_RUN(test_branch_opt_analyze_empty_mapping_no_crash);
   UT_RUN(test_dry_run_lifecycle);
   UT_RUN(test_dry_run_counters_initially_zero);
   UT_RUN(test_insn_scratch_reset_count_saves_mask);

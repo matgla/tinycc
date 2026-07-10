@@ -162,6 +162,8 @@ DISASM_SKIP_TESTS = {
     "gcc-execute/uabs-1",
     "gcc-execute/uabs-2",
     "gcc-execute/uabs-3",
+    # pathological -O2 compile time (minutes), stalls the disasm comparison
+    "tests2/101_cleanup",
 }
 
 TRACE_TESTS = {"memcpy-a1", "memcpy-a2", "memcpy-a4", "memcpy-a8", "memclr"}
@@ -635,14 +637,15 @@ def build_tcc_at_rev(rev: str, jobs: int):
     if rev == "staged":
         run(["git", "-C", str(TCC_DIR), "checkout-index", "--all", "--prefix=" + str(build_dir) + "/"])
     else:
-        archive = run(["git", "-C", str(TCC_DIR), "archive", rev], stdout=subprocess.PIPE)
+        archive = subprocess.run(["git", "-C", str(TCC_DIR), "archive", rev],
+                                 stdout=subprocess.PIPE, check=True)
         subprocess.run(["tar", "-x", "-C", str(build_dir)], input=archive.stdout, check=True)
-    configure = run(["./configure"], cwd=str(build_dir), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    configure = run(["./configure"], cwd=str(build_dir))
     if configure.returncode != 0:
         eprint(f"ERROR: configure failed for {rev}")
         shutil.rmtree(build_dir)
         sys.exit(1)
-    make = run(["make", "cross", f"-j{jobs}"], cwd=str(build_dir), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    make = run(["make", "cross", f"-j{jobs}"], cwd=str(build_dir))
     if make.returncode != 0:
         eprint(f"ERROR: make cross failed for {rev}")
         shutil.rmtree(build_dir)

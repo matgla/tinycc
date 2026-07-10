@@ -298,7 +298,6 @@ static void thumb_require_materialized_reg(const char *ctx, const char *operand,
 static bool thumb_is_hw_reg(int reg);
 static int get_struct_base_addr_mop(const MachineOperand *mop, int default_reg);
 static int find_call_scratch(uint32_t extra_exclude, uint32_t arg_move_dst_mask);
-int th_has_immediate_value(int r);
 int load_word_from_base(int ir, int base, int fc, int sign);
 int th_patch_call(int t, int a);
 /* Structure to track scratch register allocation with potential save/restore */
@@ -1071,22 +1070,7 @@ static BranchOptState branch_opt_state;
 
 /* Forward declarations */
 static void branch_opt_init(void);
-static void branch_opt_record(int ir_index, int source_addr, int target_ir, int is_conditional);
 static void branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size);
-/* Public accessor for branch encoding - returns 16 or 32 */
-ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index)
-{
-  for (int i = 0; i < branch_opt_state.branch_count; i++)
-  {
-    if (branch_opt_state.branches[i].ir_index == ir_index)
-    {
-      return branch_opt_state.branches[i].encoding == BRANCH_ENC_16BIT ? 16 : 32;
-    }
-  }
-  return 32; /* Conservative fallback */
-}
-
-static BranchEncoding branch_opt_get_encoding(int ir_index);
 
 /* Check if offset fits in 16-bit conditional branch (T1 encoding)
  * Range: -256 to +254 bytes (imm8 * 2), must be even */
@@ -1114,30 +1098,6 @@ static void branch_opt_init(void)
     branch_opt_state.branch_capacity = 64;
     branch_opt_state.branches = tcc_malloc(branch_opt_state.branch_capacity * sizeof(BranchInfo));
   }
-}
-
-/* Record a branch for later optimization analysis (used by dry-run analysis path) */
-static void __attribute__((unused)) branch_opt_record(int ir_index, int source_addr, int target_ir, int is_conditional)
-{
-  if (!branch_opt_state.optimization_enabled)
-    return;
-
-  /* Grow array if needed */
-  if (branch_opt_state.branch_count >= branch_opt_state.branch_capacity)
-  {
-    branch_opt_state.branch_capacity *= 2;
-    branch_opt_state.branches =
-        tcc_realloc(branch_opt_state.branches, branch_opt_state.branch_capacity * sizeof(BranchInfo));
-  }
-
-  BranchInfo *b = &branch_opt_state.branches[branch_opt_state.branch_count++];
-  b->ir_index = ir_index;
-  b->source_addr = source_addr;
-  b->target_ir = target_ir;
-  b->target_addr = -1; /* Unknown until targets resolved */
-  b->offset = 0;
-  b->is_conditional = is_conditional;
-  b->encoding = BRANCH_ENC_32BIT; /* Conservative default */
 }
 
 /* Analyze branch offsets and select optimal encodings.
@@ -1252,20 +1212,6 @@ static void branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size)
 
   LOG_BRANCH_OPT("%d branches, %d converted to 16-bit, %d bytes saved, %d iterations", branch_opt_state.branch_count,
                  branch_opt_state.code_size_reduction / 2, branch_opt_state.code_size_reduction, iterations);
-}
-
-/* Lookup encoding decision for a given IR index */
-/* Local version that returns the enum type (used by dry-run analysis path) */
-static BranchEncoding __attribute__((unused)) branch_opt_get_encoding(int ir_index)
-{
-  for (int i = 0; i < branch_opt_state.branch_count; i++)
-  {
-    if (branch_opt_state.branches[i].ir_index == ir_index)
-    {
-      return branch_opt_state.branches[i].encoding;
-    }
-  }
-  return BRANCH_ENC_32BIT; /* Conservative fallback */
 }
 
 /* Public interface for branch optimization */
@@ -1409,7 +1355,23 @@ ST_FUNC uint16_t tcc_gen_machine_insn_scratch_saves_mask(void)
   return g_insn_scratch_saves;
 }
 
-ScratchRegAlloc th_offset_to_reg(int offset, int sign);
+/* Prolog-pushed reg from `mask`, dead at the current instruction — usable as
+ * scratch for free (prolog/epilog hides the clobber).  Real-run only:
+ * pushed_registers is not valid during dry-run. */
+static int scratch_pushed_dead_reg(TCCIRState *ir, uint32_t exclude_regs, uint32_t mask)
+{
+  if (dry_run_state.active || !pushed_registers)
+    return PREG_NONE;
+  uint32_t reserved = (1u << R_FP);
+  if (tcc_state->text_and_data_separation)
+    reserved |= (1u << 9);
+  uint32_t live = tcc_ls_compute_live_regs(&ir->ls, ir->codegen_instruction_idx);
+  if (ir->ls.live_regs_by_instruction && ir->codegen_instruction_idx >= 0 &&
+      ir->codegen_instruction_idx < ir->ls.live_regs_by_instruction_size)
+    live |= ir->ls.live_regs_by_instruction[ir->codegen_instruction_idx];
+  uint32_t candidate = pushed_registers & mask & ~exclude_regs & ~live & ~reserved;
+  return candidate ? (int)__builtin_ctz(candidate) : PREG_NONE;
+}
 
 /* Get a free scratch register using liveness information.
  * exclude_regs is a bitmap of registers that must not be used.
@@ -1436,6 +1398,12 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
       /* Never use SP or PC as scratch registers. */
       if (reg == R_SP || reg == R_PC)
         goto no_free_reg;
+      /* ip/lr force 32-bit encodings; a pushed r4-r7 dead here is free AND narrow */
+      if (reg == R_IP || reg == R_LR) {
+        int low = scratch_pushed_dead_reg(ir, exclude_regs, 0x00F0u);
+        if (low != PREG_NONE)
+          reg = low;
+      }
       LOG_SCRATCH("-> returning reg=%d (free) exclude=0x%x", reg, exclude_regs);
       result.reg = reg;
       result.saved = 0;
@@ -1453,19 +1421,11 @@ static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
      * different from real-run: pushed_registers is only valid after the
      * prolog has actually run, which is real-run.  R7 (FP) is reserved.
      * R9 is reserved as GOT base when text_and_data_separation is on. */
-    if (!dry_run_state.active && pushed_registers && reg == PREG_NONE)
+    if (reg == PREG_NONE)
     {
-      uint32_t reserved = (1u << R_FP);
-      if (tcc_state->text_and_data_separation)
-        reserved |= (1u << 9);
-      uint32_t live = tcc_ls_compute_live_regs(&ir->ls, ir->codegen_instruction_idx);
-      if (ir->ls.live_regs_by_instruction && ir->codegen_instruction_idx >= 0 &&
-          ir->codegen_instruction_idx < ir->ls.live_regs_by_instruction_size)
-        live |= ir->ls.live_regs_by_instruction[ir->codegen_instruction_idx];
-      uint32_t candidate = pushed_registers & 0x0FF0u & ~exclude_regs & ~live & ~reserved;
-      if (candidate)
+      int sreg = scratch_pushed_dead_reg(ir, exclude_regs, 0x0FF0u);
+      if (sreg != PREG_NONE)
       {
-        int sreg = (int)__builtin_ctz(candidate);
         LOG_SCRATCH("-> returning reg=%d (pre-pushed callee-saved, dead here) exclude=0x%x", sreg, exclude_regs);
         result.reg = sreg;
         result.saved = 0;
@@ -3285,11 +3245,6 @@ static ScratchRegAlloc th_offset_to_reg_ex(int off, int sign, uint32_t exclude_r
   return alloc;
 }
 
-ScratchRegAlloc th_offset_to_reg(int off, int sign)
-{
-  return th_offset_to_reg_ex(off, sign, 0);
-}
-
 int th_patch_call(int t, int a)
 {
   uint16_t *x = (uint16_t *)(cur_text_section->data + t);
@@ -4854,11 +4809,6 @@ ST_FUNC void gen_increment_tcov(SValue *sv)
   TRACE("'gen_increment_tcov'");
 }
 
-int th_has_immediate_value(int r)
-{
-  return (r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
-}
-
 typedef thumb_opcode (*thumb_reg_handler_t)(uint32_t rd, uint32_t rn, uint32_t rm,
                                             thumb_flags_behaviour flags_behaviour, thumb_shift shift_type,
                                             thumb_enforce_encoding enforce_encoding);
@@ -5893,6 +5843,32 @@ void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineO
   thumb_opcode op;
   op.size = 4;
   op.opcode = 0xF3C00000 | ((uint32_t)rn << 16) | ((uint32_t)imm3 << 12) | ((uint32_t)rd << 8) | ((uint32_t)imm2 << 6) | (uint32_t)widthm1;
+  ot(op);
+  mach_writeback_dest(&dest, rd);
+  mach_release_all(&ctx);
+}
+
+/* tcc_gen_machine_sbfx_mop: emit SBFX Rd, Rn, #lsb, #width.
+ * src2 encodes lsb (bits 0-4) and width (bits 5-9).  Same field layout as UBFX;
+ * only the base opcode differs (0xF3400000 vs 0xF3C00000). */
+void tcc_gen_machine_sbfx_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest)
+{
+  MachineCodegenContext ctx = {0};
+  int rd = mach_get_dest_reg(&ctx, &dest, 0);
+  uint32_t excl = (1u << (uint32_t)rd);
+  int rn = mach_ensure_in_reg(&ctx, &src1, excl);
+  int param = (src2.kind == MACH_OP_IMM) ? (int)src2.u.imm.val : 0;
+  int lsb = param & 0x1F;
+  int width = (param >> 5) & 0x1F;
+  if (width == 0)
+    width = 8;
+  int widthm1 = width - 1;
+  int imm3 = (lsb >> 2) & 0x7;
+  int imm2 = lsb & 0x3;
+  /* Thumb-2 SBFX encoding: 11110 0 11 0100 Rn | 0 imm3 Rd imm2 0 widthm1 */
+  thumb_opcode op;
+  op.size = 4;
+  op.opcode = 0xF3400000 | ((uint32_t)rn << 16) | ((uint32_t)imm3 << 12) | ((uint32_t)rd << 8) | ((uint32_t)imm2 << 6) | (uint32_t)widthm1;
   ot(op);
   mach_writeback_dest(&dest, rd);
   mach_release_all(&ctx);
@@ -8497,20 +8473,6 @@ static const char *get_softfp_func_name(TccIrOp op, int is_double)
     return NULL;
   default:
     return NULL;
-  }
-}
-
-/* Check if the selected FPU supports double precision operations */
-int arm_fpu_supports_double(int fpu_type)
-{
-  switch (fpu_type)
-  {
-  case ARM_FPU_FPV4_SP_D16:
-  case ARM_FPU_FPV5_SP_D16:
-  case ARM_FPU_NONE:
-    return 0; /* single-precision-only FPUs or no FPU */
-  default:
-    return 1; /* FPUs that implement double precision */
   }
 }
 

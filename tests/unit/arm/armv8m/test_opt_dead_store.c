@@ -18,27 +18,22 @@
 
 /* Pass entry points (defined in ir/opt_dce.c; forward-declared here to avoid
  * pulling in the optimizer engine headers). */
-int tcc_ir_opt_dse(TCCIRState *ir);
 int tcc_ir_opt_dead_var_store_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir);
 int tcc_ir_opt_zero_vla_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir);
 int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir);
-int tcc_ir_opt_dead_loop_elim(TCCIRState *ir);
 
 /* IROptCtx wrapper entry points. */
-int tcc_ir_opt_dse_ex(IROptCtx *ctx);
 int tcc_ir_opt_dead_var_store_elim_ex(IROptCtx *ctx);
 int tcc_ir_opt_dead_addrvar_elim_ex(IROptCtx *ctx);
 int tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(IROptCtx *ctx);
 int tcc_ir_opt_zero_vla_elim_ex(IROptCtx *ctx);
 int tcc_ir_opt_dead_before_infinite_loop_ex(IROptCtx *ctx);
 int tcc_ir_opt_infinite_loop_simplify_ex(IROptCtx *ctx);
-int tcc_ir_opt_dead_loop_elim_ex(IROptCtx *ctx);
 
 #define I32 IROP_BTYPE_INT32
-#define TOK_NE 0x95
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -74,97 +69,6 @@ static TCCIRState *utb_loop_new(void)
   ir->iroperand_pool_capacity = UTB_MAX_OPERANDS;
   ir->compact_instructions_size = UTB_MAX_INSTR;
   return ir;
-}
-
-/* ================================================================== dse */
-
-/* POSITIVE: a TEMP def with zero uses is NOPed. T1 is a dummy second, *used*
- * temp: max_tmp_pos tracks the *highest* TEMP position seen (via DSE_ENSURE_CAP,
- * called for both defs and uses), so a function referencing only T0 (position
- * 0) leaves max_tmp_pos == 0, which the pass treats as its "no TEMPs at all"
- * sentinel and bails out entirely before ever inspecting T0 (see the guard
- * test below). Adding a used T1 keeps max_tmp_pos > 0 so the pass actually
- * reaches T0. */
-UT_TEST(test_dse_dead_temp_removed)
-{
-  TCCIRState *ir = utb_new();
-
-  int dead = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
-  int live = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_imm(5, I32), utb_imm(6, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dse(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, live), TCCIR_OP_ADD);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE: a TEMP def that is read by RETURNVALUE survives; a genuinely dead
- * peer at a different position is still eliminated in the same run. */
-UT_TEST(test_dse_used_temp_kept)
-{
-  TCCIRState *ir = utb_new();
-
-  int live = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
-  int dead = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_imm(5, I32), utb_imm(6, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dse(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, live), TCCIR_OP_ADD);
-  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD (documented limitation, not fixed here): when T0 (position 0) is the
- * *only* TEMP referenced anywhere, max_tmp_pos stays 0 (position, not count),
- * which collides with the pass's "no TEMPs referenced" sentinel and makes it
- * bail out via `if (max_tmp_pos == 0) return pure_call_changes;` -- even
- * though T0 is trivially dead. The same position-0-as-sentinel pattern as
- * dead_var_store_elim's guard below, in the TEMP table instead of the VAR
- * table. Pinned per PASS_COVERAGE.md working rule: characterize, don't
- * silently fix production code in a coverage commit. */
-UT_TEST(test_dse_solo_temp0_bails_out_suspected_bug)
-{
-  TCCIRState *ir = utb_new();
-
-  int dead = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dse(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_ADD); /* NOT eliminated -- bug */
-
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (cascade): T1's only use is dead T0's producer; killing T1 drops
- * T0's use_count to 0, cascading the elimination to T0 too. */
-UT_TEST(test_dse_cascades_through_chain)
-{
-  TCCIRState *ir = utb_new();
-
-  int t0 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
-  int t1 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(3, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_dse(ir);
-
-  UT_ASSERT_EQ(changes, 2);
-  UT_ASSERT_EQ(utb_op(ir, t0), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, t1), TCCIR_OP_NOP);
-
-  utb_free(ir);
-  return 0;
 }
 
 /* ================================================================== dead_var_store_elim */
@@ -492,38 +396,12 @@ UT_TEST(test_infinite_loop_simplify_indexed_store_blocks_collapse)
   return 0;
 }
 
-/* ================================================================== dead_loop_elim */
-
-/* POSITIVE: a side-effect-free loop whose body only assigns a constant to a VAR
- * and increments a TEMP counter is dead.  The loop body is NOPed and the
- * constant assignment is hoisted to the header/preheader.
- *   0: V1 <- #5            [header; kept/hoisted]
- *   1: T0 <- T0 + #1
- *   2: CMP T0, #10
- *   3: JUMPIF NE -> 0
- *   4: RETURNVOID */
-UT_TEST(test_dead_loop_elim_const_assign_loop_removed)
-{
-  TCCIRState *ir = utb_loop_new();
-
-  int header = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(5, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_temp(0, I32), utb_imm(1, I32));
-  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_imm(10, I32));
-  int back = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(0, I32), utb_imm(TOK_NE, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
-
-  int changes = tcc_ir_opt_dead_loop_elim(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, header), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg(utb_dest(ir, header)), TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 1));
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, header)), 5);
-  UT_ASSERT_EQ(utb_op(ir, back), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_free(ir);
-  return 0;
-}
+/* Dead-loop elimination is owned by the SSA pass ssa:dead_loop
+ * (ir/opt/ssa_opt_dead_loop.c, exercised by test_ssa_opt_dead_loop.c and IR
+ * pins 327/328).  The legacy pre-SSA tcc_ir_opt_dead_loop_elim was retired
+ * 2026-07-07 (proven inert at its tccgen site — see
+ * docs/plan_legacy_loop_dead_loop_elim_ssa.md), so its two unit tests
+ * (const-VAR hoist positive, _ex-empty) were removed with the symbol. */
 
 /* ================================================================== IROptCtx wrappers */
 
@@ -533,24 +411,6 @@ static IROptCtx utb_ctx(TCCIRState *ir)
   IROptCtx ctx = {0};
   ctx.ir = ir;
   return ctx;
-}
-
-UT_TEST(test_dse_ex_forwards)
-{
-  TCCIRState *ir = utb_new();
-  int dead = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
-  int live = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_imm(5, I32), utb_imm(6, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_dse_ex(&ctx);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, live), TCCIR_OP_ADD);
-
-  utb_free(ir);
-  return 0;
 }
 
 UT_TEST(test_dead_var_store_elim_ex_forwards)
@@ -672,36 +532,16 @@ UT_TEST(test_infinite_loop_simplify_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_dead_loop_elim_ex_empty)
-{
-  TCCIRState *ir = utb_new();
-
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_dead_loop_elim_ex(&ctx);
-
-  UT_ASSERT_EQ(changes, 0);
-
-  utb_free(ir);
-  return 0;
-}
-
 /* ------------------------------------------------------------------ suite */
 
 UT_SUITE(opt_dead_store)
 {
-  UT_COVERS("dse");
   UT_COVERS("dead_var_store");   /* alias tracked by check_pass_coverage.py normalization */
   UT_COVERS("dead_addrvar");
   UT_COVERS("dead_trail_addrvar");
   UT_COVERS("zero_vla");
   UT_COVERS("dead_pre_inf");
   UT_COVERS("inf_loop_simpl");
-  UT_COVERS("dead_loop_elim");
-
-  UT_RUN(test_dse_dead_temp_removed);
-  UT_RUN(test_dse_used_temp_kept);
-  UT_RUN(test_dse_solo_temp0_bails_out_suspected_bug);
-  UT_RUN(test_dse_cascades_through_chain);
 
   UT_RUN(test_dead_var_store_unread_var_removed);
   UT_RUN(test_dead_var_store_read_var_kept);
@@ -722,14 +562,10 @@ UT_SUITE(opt_dead_store)
   UT_RUN(test_infinite_loop_simplify_dead_global_store_collapses_to_selfjump);
   UT_RUN(test_infinite_loop_simplify_indexed_store_blocks_collapse);
 
-  UT_RUN(test_dead_loop_elim_const_assign_loop_removed);
-
-  UT_RUN(test_dse_ex_forwards);
   UT_RUN(test_dead_var_store_elim_ex_forwards);
   UT_RUN(test_dead_addrvar_elim_ex_forwards);
   UT_RUN(test_dead_trailing_addrvar_store_elim_ex_forwards);
   UT_RUN(test_zero_vla_elim_ex_forwards);
   UT_RUN(test_dead_before_infinite_loop_ex_forwards);
   UT_RUN(test_infinite_loop_simplify_ex_forwards);
-  UT_RUN(test_dead_loop_elim_ex_empty);
 }

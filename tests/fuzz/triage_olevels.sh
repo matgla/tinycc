@@ -37,16 +37,23 @@ fi
 
 # High-value culprit knobs (curated from prior root causes — covers most).  Add
 # more -fno-* flags here for a wider net; see `armv8m-tcc -fno-help`-style list
-# in libtcc.c (dce/cse/const-prop/.../loop-unroll/loop-rotation/reroll-blocks).
+# in libtcc.c (dce/cse/const-prop/.../loop-unroll/reroll-blocks).  Loop rotation
+# is now the SSA pass ssa:loop_rotate — disable it with the pass-name knob
+# below (ENV:TCC_DISABLE_PASS=ssa:loop_rotate), not a -f flag.
 KNOBS=(
   "-fno-const-prop" "-fno-copy-prop" "-fno-cse" "-fno-store-load-fwd"
   "-fno-dead-store-elim" "-fno-mla-fusion" "-fno-disp-fusion" "-fno-lea-fold"
-  "-fno-jump-threading" "-fno-loop-unroll" "-fno-loop-rotation"
+  "-fno-jump-threading" "-fno-loop-unroll" "ENV:TCC_DISABLE_PASS=ssa:loop_rotate"
   "-fno-inline-functions|-fno-inline-small-functions"   # both: csmix inlining
   "ENV:TCC_NO_COALESCE=1"                                # graph coalescing
 )
 
-val() { echo "$1" | grep -oE "[0-9a-f]{8}|HardFault|Lockup|COMPILE_FAIL" | head -1; }
+# ASan/LSan awareness on by default: runseed reports TCC_ASAN / TCC_LSAN when the
+# AddressSanitizer-built compiler trips a sanitizer (memory error / leak) while
+# compiling a seed.  Opt out with an explicit empty `RUNSEED_ASAN=` in the env.
+export RUNSEED_ASAN="${RUNSEED_ASAN-1}"
+
+val() { echo "$1" | grep -oE "[0-9a-f]{8}|HardFault|Lockup|COMPILE_FAIL|TCC_ASAN|TCC_LSAN" | head -1; }
 
 # Worker: print SEED iff tcc's O0/O1/O2/Os outputs are not all identical
 # (self-contained; no pytest/xdist dependency).
@@ -59,6 +66,12 @@ sweep_one() {
   a="$(val "$(runseed "$src" -O0)")"; b="$(val "$(runseed "$src" -O1)")"
   c="$(val "$(runseed "$src" -O2)")"; d="$(val "$(runseed "$src" -Os)")"
   rm -f "$src"
+  # A sanitizer trip in the compiler (TCC_ASAN/TCC_LSAN at any level) is always a
+  # finding — even when all four levels trip it identically (so the plain
+  # all-equal check below would otherwise call it OK).
+  case "$a $b $c $d" in
+    *TCC_ASAN*|*TCC_LSAN*) echo "$s FAIL"; return;;
+  esac
   if [ "$a" = "$b" ] && [ "$a" = "$c" ] && [ "$a" = "$d" ]; then echo "$s OK"; else echo "$s FAIL"; fi
 }
 
@@ -84,7 +97,15 @@ triage_one() {
   o2="$(val "$(runseed "$src" -O2)")"; os="$(val "$(runseed "$src" -Os)")"
 
   local cls="?" bad_lvl=""
-  if [ "$o2" = "COMPILE_FAIL" ] || [ "$o1" = "COMPILE_FAIL" ]; then cls="COMPILE_CRASH"
+  # A compiler sanitizer trip classifies highest and has no O-level culprit knob
+  # (it is a bug in tcc itself, not an optimization) — leave bad_lvl empty so the
+  # bisect below is skipped.  ASan (memory error) outranks LSan (leak).
+  case "$o0$o1$o2$os" in
+    *TCC_ASAN*) cls="TCC-ASAN";;
+    *TCC_LSAN*) cls="TCC-LSAN";;
+  esac
+  if [ "$cls" != "?" ]; then :
+  elif [ "$o2" = "COMPILE_FAIL" ] || [ "$o1" = "COMPILE_FAIL" ]; then cls="COMPILE_CRASH"
   elif [ -n "$ref" ] && [ "$o0" != "$ref" ]; then cls="O0-WRONG"
   elif [ "$o1" != "$o0" ]; then cls="O1"; bad_lvl="-O1"
   elif [ "$o2" != "$o0" ]; then cls="O2"; bad_lvl="-O2"

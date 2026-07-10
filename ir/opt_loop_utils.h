@@ -95,6 +95,12 @@ int try_unroll_loop_ex(struct TCCIRState *ir, struct IRLoop *loop,
                        struct IRLoops *loops, int loop_idx);
 int try_rotate_loop(struct TCCIRState *ir, struct IRLoop *loop);
 
+/* Decrement-to-zero region rewrite (ssa:decrement_to_zero engine): rewrites a
+ * count-up pure-counter loop in [start,end] to count-down-to-zero; returns 1 if
+ * rewritten.  See docs/plan_legacy_loop_decrement_to_zero_ssa.md. */
+int dtz_try_region(struct TCCIRState *ir, int start, int end, int header_idx,
+                   int preheader_idx);
+
 /* Misc helpers */
 int signed_to_unsigned_cond(int cond_token);
 int loop_size_cmp(const void *a, const void *b);

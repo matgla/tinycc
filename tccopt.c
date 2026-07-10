@@ -261,43 +261,6 @@ int tcc_opt_cse(TCCIRState *ir)
 }
 
 /* ============================================================================
- * Copy Propagation
- * ============================================================================ */
-
-int tcc_opt_copy_propagation(TCCIRState *ir)
-{
-  if (!ir)
-    return 0;
-
-  int propagated = 0;
-
-  /* TODO: Replace uses of copied variables with the source */
-
-  opt_stats.copies_propagated += propagated;
-  return propagated;
-}
-
-/* ============================================================================
- * Strength Reduction
- * ============================================================================ */
-
-int tcc_opt_strength_reduction(TCCIRState *ir)
-{
-  if (!ir)
-    return 0;
-
-  int reduced = 0;
-
-  /* TODO: Replace expensive operations with cheaper ones
-   * - MUL by power of 2 -> SHL
-   * - DIV by power of 2 -> SAR
-   * - etc.
-   */
-
-  return reduced;
-}
-
-/* ============================================================================
  * FP Offset Caching Optimization Pass
  * ============================================================================ */
 
@@ -352,21 +315,7 @@ static TCCOptPass builtin_passes[] = {
         .run = tcc_opt_cse,
         .flags = TCC_OPT_ENABLED_O2 | TCC_OPT_ENABLED_OS,
         .should_run = NULL,
-    },
-    {
-        .name = "copy-prop",
-        .description = "Copy propagation",
-        .run = tcc_opt_copy_propagation,
-        .flags = TCC_OPT_ENABLED_O1 | TCC_OPT_ENABLED_O2 | TCC_OPT_ENABLED_OS,
-        .should_run = NULL,
-    },
-    {
-        .name = "strength-reduce",
-        .description = "Strength reduction",
-        .run = tcc_opt_strength_reduction,
-        .flags = TCC_OPT_ENABLED_O2 | TCC_OPT_ENABLED_OS,
-        .should_run = NULL,
-    },
+    }
 };
 
 void tcc_opt_register_pass(TCCOptPass *pass)

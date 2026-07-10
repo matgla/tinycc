@@ -21,6 +21,37 @@
  */
 
 #include "arm_regalloc.h"
+#include "tcc.h"
+
+/* Ops whose T16 form needs low regs; exclusions in docs/regalloc_narrow_pref.md */
+static int arm_op_narrow_capable(int op, int src2_is_imm, int scale)
+{
+  switch (op) {
+  case TCCIR_OP_ADD:
+  case TCCIR_OP_SUB:
+  case TCCIR_OP_MUL:
+  case TCCIR_OP_AND:
+  case TCCIR_OP_OR:
+  case TCCIR_OP_XOR:
+  case TCCIR_OP_SHL:
+  case TCCIR_OP_SHR:
+  case TCCIR_OP_SAR:
+  case TCCIR_OP_LOAD:
+  case TCCIR_OP_STORE:
+  case TCCIR_OP_ZEXT:
+  case TCCIR_OP_LEA:
+  case TCCIR_OP_TEST_ZERO:
+    return 1;
+  case TCCIR_OP_LOAD_INDEXED:
+  case TCCIR_OP_STORE_INDEXED:
+    return scale == 0;
+  case TCCIR_OP_CMP:
+  case TCCIR_OP_JUMPIF:
+    return src2_is_imm;
+  default:
+    return 0;
+  }
+}
 
 /* AAPCS: R0-R3 caller-saved, R4-R11 callee-saved, R12(IP) caller-saved */
 static const int arm_caller_saved[] = {0, 1, 2, 3, 12};
@@ -51,6 +82,7 @@ static const RegAllocTarget arm_target = {
         },
     .param_regs = 4,         /* R0-R3 */
     .static_chain_reg = 10,  /* R10 */
+    .op_narrow_capable = arm_op_narrow_capable,
 };
 
 const RegAllocTarget *arm_get_regalloc_target(void)

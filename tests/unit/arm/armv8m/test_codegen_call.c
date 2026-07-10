@@ -485,7 +485,7 @@ UT_TEST(test_mark_return_value_incoming_regs_skips_hint_pass_below_o1)
  * (~349-350, "break" without marking further).
  *
  * root/mid/leaf must be VAR vregs, not TEMP: tcc_ir_put()'s ASSIGN-coalescing
- * (ir/core.c ~535-613) silently collapses `ASSIGN x -> t; ASSIGN t -> y` into
+ * (ir/gen/put.c ~236-315) silently collapses `ASSIGN x -> t; ASSIGN t -> y` into
  * a single instruction with dest=y whenever the ASSIGN's src1 is a TEMP that
  * was the immediately-preceding instruction's dest -- so an all-TEMP chain
  * here would never actually reach the IR as 3 separate ASSIGNs (it collapses

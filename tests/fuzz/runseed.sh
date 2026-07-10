@@ -5,6 +5,16 @@
 #   runseed.sh <src.c> <-Ox> [extra tcc flags...]
 #
 # Prints exactly one token:  checksum=<hex> | HardFault | Lockup | COMPILE_FAIL
+#   | TCC_ASAN | TCC_LSAN   (only when RUNSEED_ASAN is set — see below)
+#
+# ASan/LSan awareness: armv8m-tcc is built with AddressSanitizer, so a memory
+# error or leak in the COMPILER ITSELF surfaces in the compile stderr.  With
+# RUNSEED_ASAN set (the sweep sets it), such a trip is reported as TCC_ASAN
+# (AddressSanitizer memory error) or TCC_LSAN (LeakSanitizer leak), taking
+# precedence over the run result — a sanitizer-tripping compiler is a finding
+# even when it still emits a correct object.  Detection is by the sanitizer's
+# own banner, NOT by exit code (tcc can exit nonzero from a benign leak after
+# writing a valid object — the trap that made diff_olevels false-positive).
 #
 # Toolchain paths are derived (no hard-coded gcc version) so it survives
 # arm-none-eabi-gcc upgrades.  Requires: armv8m-tcc built (`make cross`),
@@ -40,6 +50,8 @@ _runseed_once() {
   local d; d="$(mktemp -d 2>/dev/null)"
   [ -n "$d" ] && [ -d "$d" ] || { echo "INFRA_FAIL"; return; }
   local err="$d/err.log"
+  # When ASan-aware, force LeakSanitizer on for the tcc children (append so it
+  # wins over any inherited detect_leaks=0) so compiler leaks are observable.
   # NB: tcc prints "Memory region ..." to stdout during the link — suppress
   # stdout; keep stderr (to tell a real tcc error from a transient infra fail).
   "$TCC" $cf -c "$MPS/boot.S" -o "$d/boot.o" >/dev/null 2>"$err"
@@ -47,6 +59,12 @@ _runseed_once() {
     -o "$d/m.elf" -Wl,--gc-sections -B"$ROOT" -L"$ROOT/lib" -L"$ROOT/lib/fp" -L"$ROOT" \
     -Wl,--start-group -larmv8m-libtcc1.a -lsoftfp "$LIBC" "$LIBRDIMON" "$LIBM" "$LIBGCC" \
     -Wl,--end-group -Wl,-oformat=elf32-littlearm -T"$MPS/linker_script.ld" >/dev/null 2>>"$err"
+  # ASan/LSan awareness: a sanitizer trip in the compiler is a finding regardless
+  # of whether an object was produced, so check BEFORE the elf-existence test.
+  if [ -n "${RUNSEED_ASAN:-}" ]; then
+    if grep -qE "ERROR: AddressSanitizer:" "$err"; then echo "TCC_ASAN"; rm -rf "$d"; return; fi
+    if grep -qE "ERROR: LeakSanitizer:|detected memory leaks" "$err"; then echo "TCC_LSAN"; rm -rf "$d"; return; fi
+  fi
   if [ ! -f "$d/m.elf" ]; then
     if grep -qiE "error:|compiler_error|assert|signal|Sanitizer" "$err"; then echo "COMPILE_FAIL"
     else echo "INFRA_FAIL"; fi

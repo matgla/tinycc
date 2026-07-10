@@ -17,12 +17,12 @@
  *      - Reachability paths: JUMP, JUMPIF, RETURN, IJUMP, fall-through
  *
  *  HARNESS NOTES:
- *    - Links the real ir/opt/ssa_opt_branch.c via UT11.
+ *    - Links the real source/opt/ssa/cfg/branch.c via UT11.
  *    - Uses ssa_build.h for hand-built vinfo + IR.
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "opt/ssa/branch.h"
 
 #include "ut.h"
 
@@ -251,6 +251,123 @@ UT_TEST(test_branch_cmp_setif_false)
 }
 
 /* ========================================================================
+ * Boolean-normalisation: CMP X,#0; SETIF NE where X is provably {0,1}
+ * collapses to ASSIGN V = X.
+ * ======================================================================== */
+
+UT_TEST(test_branch_bool_norm_setif_rewritten)
+{
+  /* T0 is single-def SETIF (provably {0,1}); CMP T0,#0; SETIF NE -> V = T0. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(0, I32), utb_imm(0x95, I32));
+  int cmp = ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32),
+                           utb_imm(0, I32));
+  int setif2 = ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(1, I32),
+                             utb_imm(0x95, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_branch(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, setif2), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, setif2)),
+               utb_vreg(utb_temp(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_bool_norm_bool_and_rewritten)
+{
+  /* BOOL_AND is also accepted as a provably-{0,1} def. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  ssa_add_instr3(&c, TCCIR_OP_BOOL_AND, utb_temp(0, I32), utb_imm(1, I32),
+                 utb_imm(0, I32));
+  int cmp = ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32),
+                           utb_imm(0, I32));
+  int setif2 = ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(1, I32),
+                             utb_imm(0x95, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_branch(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, setif2), TCCIR_OP_ASSIGN);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_bool_norm_wrong_cond_kept)
+{
+  /* SETIF cond must be NE (0x95); EQ leaves the pair untouched. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(0, I32), utb_imm(0x95, I32));
+  int cmp = ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32),
+                           utb_imm(0, I32));
+  int setif2 = ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(1, I32),
+                             utb_imm(0x94, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_branch(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(c.ir, setif2), TCCIR_OP_SETIF);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_bool_norm_nonzero_cmp_kept)
+{
+  /* CMP T0,#5 -> the `!= 0` reduction does not apply. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(0, I32), utb_imm(0x95, I32));
+  int cmp = ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32),
+                           utb_imm(5, I32));
+  ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(1, I32), utb_imm(0x95, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_branch(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp), TCCIR_OP_CMP);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_bool_norm_non_bool_def_kept)
+{
+  /* T0 defined by ADD -> not provably {0,1} -> no rewrite. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32),
+                 utb_imm(2, I32));
+  int cmp = ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32),
+                           utb_imm(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(1, I32), utb_imm(0x95, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_branch(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp), TCCIR_OP_CMP);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
  * TEST_ZERO folds
  * ======================================================================== */
 
@@ -321,6 +438,8 @@ UT_TEST(test_branch_test_zero_fallthrough_setif)
  * Negative / no-fold cases
  * ======================================================================== */
 
+/* CMP of two single-def constant TEMPs: the folder chases ASSIGN #const,
+ * so non-immediate operands that hold a known constant still fold. */
 UT_TEST(test_branch_cmp_nonimm)
 {
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
@@ -334,9 +453,9 @@ UT_TEST(test_branch_cmp_nonimm)
   ssa_ctx_rebuild(&c);
 
   int changed = ssa_opt_branch(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_CMP);
-  UT_ASSERT_EQ(utb_op(c.ir, 3), TCCIR_OP_JUMPIF);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_NOP); /* CMP folded */
+  UT_ASSERT_EQ(utb_op(c.ir, 3), TCCIR_OP_NOP); /* JUMPIF: EQ(1,2) false */
 
   ssa_ctx_free(&c);
   return 0;
@@ -374,6 +493,8 @@ UT_TEST(test_branch_cmp_not_followed)
   return 0;
 }
 
+/* TEST_ZERO of a single-def constant TEMP (ASSIGN #0): the folder resolves
+ * the temp, so it folds just like a raw immediate. */
 UT_TEST(test_branch_test_zero_nonimm)
 {
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
@@ -386,8 +507,10 @@ UT_TEST(test_branch_test_zero_nonimm)
   ssa_ctx_build_ssa_plain(&c);
   ssa_ctx_rebuild(&c);
 
-  UT_ASSERT_EQ(ssa_opt_branch(c.ctx), 0);
-  UT_ASSERT_EQ(utb_op(c.ir, tz_i), TCCIR_OP_TEST_ZERO);
+  int changed = ssa_opt_branch(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, tz_i), TCCIR_OP_NOP);     /* TEST_ZERO folded */
+  UT_ASSERT_EQ(utb_op(c.ir, tz_i + 1), TCCIR_OP_JUMP); /* EQ: 0==0 taken */
 
   ssa_ctx_free(&c);
   return 0;
@@ -484,7 +607,8 @@ UT_TEST(test_branch_cmp_var_store_immediate)
 
   int changed = ssa_opt_branch(c.ctx);
   UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, 1), TCCIR_OP_JUMP); /* JUMPIF */
+  UT_ASSERT_EQ(utb_op(c.ir, 1), TCCIR_OP_NOP);   /* CMP folded via STORE scan */
+  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_JUMP);  /* JUMPIF: EQ(7,7) taken */
 
   ssa_ctx_free(&c);
   return 0;
@@ -506,7 +630,8 @@ UT_TEST(test_branch_cmp_var_deref_store_skipped)
 
   int changed = ssa_opt_branch(c.ctx);
   UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_JUMP); /* JUMPIF */
+  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_NOP);  /* CMP folded (deref STORE skipped) */
+  UT_ASSERT_EQ(utb_op(c.ir, 3), TCCIR_OP_JUMP); /* JUMPIF: EQ(7,7) taken */
 
   ssa_ctx_free(&c);
   return 0;
@@ -765,6 +890,11 @@ UT_SUITE(ssa_opt_branch)
   UT_RUN(test_branch_cmp_same_vreg_via_copy_chain);
   UT_RUN(test_branch_cmp_setif_true);
   UT_RUN(test_branch_cmp_setif_false);
+  UT_RUN(test_branch_bool_norm_setif_rewritten);
+  UT_RUN(test_branch_bool_norm_bool_and_rewritten);
+  UT_RUN(test_branch_bool_norm_wrong_cond_kept);
+  UT_RUN(test_branch_bool_norm_nonzero_cmp_kept);
+  UT_RUN(test_branch_bool_norm_non_bool_def_kept);
   UT_RUN(test_branch_test_zero_eq_taken);
   UT_RUN(test_branch_test_zero_ne_taken);
   UT_RUN(test_branch_test_zero_fallthrough_setif);

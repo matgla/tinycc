@@ -2,7 +2,7 @@
  *  test_ir_vreg.c - suite for ir/vreg.c virtual register management
  *
  *  Initialises a minimal TCCIRState (only the fields vreg.c touches)
- *  without calling tcc_ir_alloc() so we avoid pulling in core.c,
+ *  without calling tcc_ir_alloc() so we avoid pulling in ir/gen/state.c,
  *  tccls.c, and the machine-specific backend.
  */
 

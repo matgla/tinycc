@@ -609,8 +609,10 @@ int tcc_ir_opt_bitfield_insert_to_bfi(TCCIRState *ir)
         continue;
 
       /* Side-array keyed by orig_index, allocated lazily (like barrel_shifts). */
-      if (!ir->bfi_params)
+      if (!ir->bfi_params) {
         ir->bfi_params = tcc_mallocz((size_t)(ir->max_orig_index + 1) * sizeof(uint16_t));
+        ir->bfi_params_len = ir->max_orig_index + 1;
+      }
 
       orq->op = TCCIR_OP_BFI;
       tcc_ir_set_src1(ir, i, word_op);

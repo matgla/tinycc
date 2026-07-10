@@ -258,14 +258,17 @@ def ensure_codesize_corpus() -> None:
 CODESIZE_OPTS = [("o0", "-O0"), ("o1", "-O1"), ("o2", "-O2")]
 
 
-def record_codesize(conn, run_id, jobs, detail: bool, tcc_override=None) -> dict:
+def record_codesize(conn, run_id, jobs, detail: bool, tcc_override=None,
+                    opts=None) -> dict:
     """Record code size (rollup + optional per-function detail) at each opt level
-    and return {opt: corpus_compile_wall_seconds} (the coarse compile-time proxy,
-    one per level)."""
+    (all of CODESIZE_OPTS, or the `opts` subset) and return
+    {opt: corpus_compile_wall_seconds} (the coarse compile-time proxy)."""
     from regression_disasm import run_csv_mode
     ensure_codesize_corpus()
     elapsed = {}
     for opt, flag in CODESIZE_OPTS:
+        if opts is not None and opt not in opts:
+            continue
         t0 = time.monotonic()
         # Compile BOTH tcc and gcc at this level (tcc_opt=flag, gcc_opt=flag).
         csv_text = run_csv_mode(flag, None, "all", jobs,
@@ -505,7 +508,7 @@ def record_perf(conn, run_id, perf_host, perf_identity, scratch: Path,
 # ---------------------------------------------------------------------- record
 
 def record_one(conn, meta, host, branch, trigger, args, tcc_override=None,
-               do_correctness=True, do_perf=True) -> None:
+               do_correctness=True, do_perf=True, codesize_opts=None) -> None:
     t0 = time.monotonic()
     run_id = upsert_run(conn, meta, host, branch, trigger,
                         args.seed_lo, args.seed_hi, args.mode)
@@ -518,7 +521,8 @@ def record_one(conn, meta, host, branch, trigger, args, tcc_override=None,
                                  meta["commit_sha"], host, branch,
                                  args.detail_keep)
     else:
-        corpus_secs = record_codesize(conn, run_id, args.jobs, args.codesize_detail, tcc_override)
+        corpus_secs = record_codesize(conn, run_id, args.jobs, args.codesize_detail,
+                                      tcc_override, opts=codesize_opts)
         for opt, secs in corpus_secs.items():
             n_units = conn.execute(
                 "SELECT func_count FROM codesize_rollup "

@@ -681,7 +681,7 @@ UT_TEST(test_print_quad_select_tag)
   utb_emit4(ir, TCCIR_OP_SELECT, utb_temp(0, I32), utb_temp(1, I32), utb_temp(2, I32), utb_imm(TOK_EQ, I32));
 
   char *s = dump_quad(ir, 0);
-  UT_ASSERT_STREQ(s, "0000: T0 <-- T1 SELECT T2 [SELECT]\n");
+  UT_ASSERT_STREQ(s, "0000: T0 <-- T1 SELECT T2 [SELECT cond=0x94]\n");
   libc_free(s);
 
   utb_free(ir);

@@ -71,6 +71,7 @@ TEST_FILES = [
     ("bug_ull_mul10_once.c", 0),
     ("bug_ll_mul10_switch_min.c", 0),
     ("bug_parse_number_64bit.c", 0),
+    ("bug_llong_min_const_cmp.c", 0),
     ("bug_ull_mul_int_accum.c", 0),
     ("bug_struct_slot_reuse.c", 0),
     # ("bug_ternary_string.c", 0),  # Nested ternary with string literals
@@ -853,6 +854,61 @@ TEST_FILES = [
 
     # C11 _Pragma operator: pack layout via literal + DO_PRAGMA macro idiom.
     ("343_pragma_operator.c", 5),
+
+    # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
+    # + runtime control loops); pins behavior across the legacy ->
+    # ssa:first_iter_exit migration.
+    ("344_first_iter_exit.c", 0),
+
+    # Pointer-IV exit-value substitution (pr49644 idiom + runtime-trip
+    # control); pins behavior across the legacy -> ssa:ptr_iv_exit_subst
+    # migration.
+    ("345_ptr_iv_exit_subst.c", 0),
+
+    # Loop constant simulation (soft-float accumulator + residual-fed cascade +
+    # runtime-bounded control loop); pins behavior across the legacy Phase 4e ->
+    # ssa:loop_const_sim migration.
+    ("346_loop_const_sim_ssa.c", 0),
+
+    # Loop unrolling / constant-trip elimination (accumulator + symbolic-limit
+    # SELECT with zero-trip guard + then-arm need_exit_jump + runtime control);
+    # pins behavior across the legacy Phase 5a -> ssa:loop_unroll migration.
+    ("347_loop_unroll_ssa.c", 0),
+
+    # Dead-loop elimination: the "distinctive legacy domains" (address-taken
+    # memory-VAR + self-store) as correctness pins across the retirement of the
+    # legacy tcc_ir_opt_dead_loop_elim (ssa:dead_loop now owns collapse).  The
+    # memvar_rt(0) case pins that we do NOT do the legacy's unsound preheader
+    # hoist.  See docs/plan_legacy_loop_dead_loop_elim_ssa.md.
+    ("348_dead_loop_elim_retired_shapes.c", 0),
+    # Decrement-to-zero: count-up -> count-down-to-zero rewrite
+    # (ssa:decrement_to_zero) + the codegen SUBS/CMP#0 fusion that consumes it.
+    # Correctness must hold at every -O level; pure-counter purestore loops get
+    # the count-down latch at -O1+, IV-read / runtime-limit shapes decline.
+    # See docs/plan_legacy_loop_decrement_to_zero_ssa.md.
+    ("349_decrement_to_zero.c", 0),
+    # ssa:reroll — identical-block re-rolling relocated to the post-propagation
+    # regalloc flat region.  Pins (A) the fuzz-sensitive call-rerolling path
+    # (period-3 opaque calls re-roll into a counted loop, calls/accumulation
+    # exact) and (B) that foldable macro-unrolled runs still collapse downstream
+    # (the win over the legacy pre-propagation placement).
+    # See docs/plan_legacy_loop_reroll_ssa.md.
+    ("350_reroll_ssa.c", 0),
+    # stack_addr_nonnull_fold must not fold the loop-exit compare of a WALKING
+    # stack pointer (base != p while p decrements to reach base) as "distinct
+    # addresses never equal" — that drops the loop exit and collapses the caller
+    # under DCE.  Reduced from gcc.c-torture 990513-1, unmasked by relocating
+    # reroll to ssa:reroll (post-propagation).  Fixed via the in_loop guard.
+    # See docs/plan_legacy_loop_reroll_ssa.md.
+    ("351_walk_ptr_cmp_nonnull_fold.c", 0),
+    ("352_ssa_const_string_fold.c", 0),
+    ("353_ssa_symref_addend_fold.c", 0),
+    ("354_ssa_global_addr_hoist.c", 0),
+    ("355_ssa_sbfx_const_fold.c", 0),
+    ("356_ssa_bitop_const_fold.c", 0),
+    ("357_ssa_string_search_fold.c", 0),
+    ("358_ssa_clrsb_fold.c", 0),
+    ("359_signed_div_pow2.c", 0),
 ]
 
 # Per-test compiler defines (e.g. for missing platform macros)

@@ -17,7 +17,7 @@ The `tests/unit/` directory contains **host-native C unit tests** for tinycc int
 
 ### Key Design Principle: Stub What You Don't Test
 
-Unit tests link **only** the specific source files they exercise, plus minimal stubs for dependencies (memory allocators, global state). This avoids dragging in `core.c`, `tccls.c`, `arm-thumb-gen.c`, and other heavy modules.
+Unit tests link **only** the specific source files they exercise, plus minimal stubs for dependencies (memory allocators, global state). This avoids dragging in `ir/gen/*.c`, `tccls.c`, `arm-thumb-gen.c`, and other heavy modules.
 
 ---
 
@@ -358,9 +358,9 @@ and `tccir_operand.c` — so the test harness itself (`test_*.c`, `stubs.c`) is 
 (see `GCOVR_FILTERS` in `arm/armv8m/Makefile`).
 
 Reading the numbers:
-- The top-line aggregate is **low by construction**: `ir/core.c` is linked only for its
-  `irop_config[]` table (the rest is `--gc-sections`-stripped at link, so it reports ~1%).
-  Look at **per-file** numbers, not the aggregate.
+- The top-line aggregate is **low by construction**: `ir/gen/*.c` is linked only for its
+  `irop_config[]` table (`ir/gen/config.c`; the rest is `--gc-sections`-stripped at link,
+  so it reports ~1%). Look at **per-file** numbers, not the aggregate.
 - Passes with focused isolated suites read high (`opt_neg_chain` ~93%, `opt_setif_or_taut`
   ~92%, the `thop_*` encoders 75–100%). The constfold/constprop/copyprop files read low
   because many of their passes are name-gated / pull frontend symbols the isolated harness

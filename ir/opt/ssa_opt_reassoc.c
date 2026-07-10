@@ -35,9 +35,7 @@
 
 static int has_barrel_shift_annotation(TCCIRState *ir, const IRQuadCompact *q)
 {
-  return ir->barrel_shifts && q->orig_index >= 0 &&
-         q->orig_index <= ir->max_orig_index &&
-         ir->barrel_shifts[q->orig_index] != 0;
+  return tcc_ir_barrel_shift_at(ir, q) != 0;
 }
 
 static int reassoc_binary(IRSSAOptCtx *ctx, int idx)

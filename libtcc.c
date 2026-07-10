@@ -1726,7 +1726,6 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_const_prop), 0, "const-prop"},
                                     {offsetof(TCCState, opt_copy_prop), 0, "copy-prop"},
                                     {offsetof(TCCState, opt_cse), 0, "cse"},
-                                    {offsetof(TCCState, opt_bool_cse), 0, "bool-cse"},
                                     {offsetof(TCCState, opt_bool_idempotent), 0, "bool-idempotent"},
                                     {offsetof(TCCState, opt_bool_simplify), 0, "bool-simplify"},
                                     {offsetof(TCCState, opt_store_load_fwd), 0, "store-load-fwd"},
@@ -1736,17 +1735,14 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_indexed_memory), 0, "indexed-memory"},
                                     {offsetof(TCCState, opt_disp_fusion), 0, "disp-fusion"},
                                     {offsetof(TCCState, opt_lea_fold), 0, "lea-fold"},
-                                    {offsetof(TCCState, opt_postinc_fusion), 0, "postinc-fusion"},
                                     {offsetof(TCCState, opt_mla_fusion), 0, "mla-fusion"},
                                     {offsetof(TCCState, opt_stack_addr_cse), 0, "stack-addr-cse"},
                                     {offsetof(TCCState, opt_licm), 0, "licm"},
                                     {offsetof(TCCState, opt_strength_red), 0, "strength-red"},
                                     {offsetof(TCCState, opt_iv_strength_red), 0, "iv-strength-red"},
                                     {offsetof(TCCState, opt_loop_unroll), 0, "loop-unroll"},
-                                    {offsetof(TCCState, opt_loop_rotation), 0, "loop-rotation"},
                                     {offsetof(TCCState, opt_reroll), 0, "reroll-blocks"},
                                     {offsetof(TCCState, opt_jump_threading), 0, "jump-threading"},
-                                    {offsetof(TCCState, opt_nonneg_fold), 0, "nonneg-fold"},
                                     {offsetof(TCCState, opt_vrp), 0, "vrp"},
                                     {offsetof(TCCState, opt_float_narrow), 0, "float-narrow"},
                                     {offsetof(TCCState, opt_inline_functions), 0, "inline-functions"},
@@ -2283,7 +2279,6 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_const_prop = 1;
         s->opt_copy_prop = 1;
         s->opt_cse = 1;
-        s->opt_bool_cse = 1;
         s->opt_bool_idempotent = 1;
         s->opt_bool_simplify = 1;
         s->opt_store_load_fwd = 1;
@@ -2292,21 +2287,11 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_indexed_memory = 1; /* Fuse SHL+ADD+LOAD/STORE into indexed ops */
         s->opt_disp_fusion = 1;    /* Fuse ADD+imm+LOAD/STORE into displacement-addressed ops */
         s->opt_lea_fold = 1;       /* Fold LEA Addr[StackLoc]+deref into direct stack slot access */
-        s->opt_postinc_fusion = 0; /* DISABLED: fusing LOAD/STORE + ADD into a single
-                                    * LOAD_POSTINC/STORE_POSTINC is unsound when the
-                                    * pointer SPILLS — the ARM post-indexed writeback
-                                    * (ldr/str [rN],#imm) updates rN in place but the IR
-                                    * can't model it, so the spilled base never advances
-                                    * (tcc froze in parse_number on every integer literal).
-                                    * Without the fusion `*p++` lowers to an explicit
-                                    * LOAD + ADD whose result is written back correctly. */
         s->opt_stack_addr_cse = 1;  /* Hoist repeated stack address computations */
         s->opt_strength_red = 1;    /* Strength reduction for multiply (peephole) */
-        s->opt_nonneg_fold = 1;     /* Non-negative value branch folding */
         s->opt_vrp = 1;             /* Value range propagation branch folding */
         s->opt_float_narrow = 1;    /* Narrow double math to float when safe */
         s->opt_jump_threading = 1;  /* Jump threading optimization */
-        s->opt_loop_rotation = 1;   /* Rotate top-tested loops to bottom-tested */
         s->opt_inline_small = 1;    /* Inline tiny static/inline functions (≤30 words) */
         if (!s->opt_inline_limit)
           s->opt_inline_limit = 30;

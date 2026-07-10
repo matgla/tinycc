@@ -1049,9 +1049,6 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
   tcc_free(ranges);
   tcc_free(deferred_ranges);
 
-  if (changes)
-    changes += tcc_ir_opt_dce(ir);
-
   return changes;
 }
 
@@ -1067,398 +1064,7 @@ int tcc_ir_opt_vrp(TCCIRState *ir)
  *   body:    V4 = V1; CMP V4, #4; JUMPIF <U  (redundant: always taken)
  * ============================================================================ */
 
-static const char *nonneg_func_names[] = {
-    "fabs", "fabsf", "abs", "labs", "llabs", "strlen", "sizeof",
-};
 #define NUM_NONNEG_FUNCS (sizeof(nonneg_func_names) / sizeof(nonneg_func_names[0]))
-
-/* Flag-setting soft-float comparison function names.
- * __aeabi_cdcmple / __aeabi_cfcmple set ARM condition flags for a CMP-like
- * operation. The subsequent JUMPIF tests those flags with a TOK_* condition.
- * This is the default path used by TCC's soft-float FCMP lowering.
- */
-static const char *flag_cmp_funcs[] = {
-    "__aeabi_cdcmple",
-    "__aeabi_cfcmple",
-};
-#define NUM_FLAG_CMP_FUNCS (sizeof(flag_cmp_funcs) / sizeof(flag_cmp_funcs[0]))
-
-/* Maximum number of non-negative vregs to track simultaneously */
-#define MAX_NONNEG_VREGS 32
-
-/* Maximum number of pending call parameters to track */
-#define MAX_PENDING_PARAMS 16
-
-typedef struct
-{
-  int call_id;
-  int param_idx;
-  int32_t vreg;     /* -1 if immediate */
-  int is_immediate; /* 1 if the parameter is an immediate value */
-  int64_t imm_val;  /* immediate value (if is_immediate) */
-} PendingParam;
-
-int tcc_ir_opt_nonneg_branch_fold(TCCIRState *ir)
-{
-  int n = ir->next_instruction_index;
-  int changes = 0;
-
-  if (n < 3)
-    return 0;
-
-  /* Phase 1: Identify which vregs hold non-negative values.
-   * We track full 32-bit vreg IDs (type + position). */
-  int32_t nonneg_vregs[MAX_NONNEG_VREGS];
-  int nonneg_count = 0;
-
-  int pending_p0_is_imm = 0;
-  int64_t pending_p0_imm = 0;
-  int pending_p0_call_id = -1;
-
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-
-    if (q->op == TCCIR_OP_FUNCPARAMVAL)
-    {
-      IROperand ps1 = tcc_ir_op_get_src1(ir, q);
-      IROperand ps2 = tcc_ir_op_get_src2(ir, q);
-      uint32_t encoded = (uint32_t)irop_get_imm64_ex(ir, ps2);
-      if (TCCIR_DECODE_PARAM_IDX(encoded) == 0)
-      {
-        pending_p0_is_imm = irop_is_immediate(ps1);
-        pending_p0_imm = pending_p0_is_imm ? irop_get_imm64_ex(ir, ps1) : 0;
-        pending_p0_call_id = TCCIR_DECODE_CALL_ID(encoded);
-      }
-      continue;
-    }
-
-    if (q->op != TCCIR_OP_FUNCCALLVAL)
-    {
-      if (q->op != TCCIR_OP_NOP && q->op != TCCIR_OP_FUNCPARAMVOID)
-        pending_p0_call_id = -1;
-      continue;
-    }
-
-    IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    Sym *callee = irop_get_sym_ex(ir, src1);
-    if (!callee)
-    {
-      pending_p0_call_id = -1;
-      continue;
-    }
-
-    const char *name = get_tok_str(callee->v, NULL);
-    if (!name)
-    {
-      pending_p0_call_id = -1;
-      continue;
-    }
-
-    int is_nonneg = 0;
-    for (size_t j = 0; j < NUM_NONNEG_FUNCS; j++)
-    {
-      if (strcmp(name, nonneg_func_names[j]) == 0)
-      {
-        is_nonneg = 1;
-        break;
-      }
-    }
-
-    if (!is_nonneg && pending_p0_call_id >= 0 && pending_p0_is_imm)
-    {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      uint32_t call_encoded = (uint32_t)irop_get_imm64_ex(ir, src2);
-      int this_call_id = TCCIR_DECODE_CALL_ID(call_encoded);
-      if (this_call_id == pending_p0_call_id && strcmp(name, "__aeabi_f2d") == 0)
-      {
-        uint32_t fbits = (uint32_t)pending_p0_imm;
-        uint32_t sign = (fbits >> 31) & 1;
-        uint32_t exp = (fbits >> 23) & 0xFF;
-        uint32_t mant = fbits & 0x7FFFFF;
-        if (!sign && !(exp == 0xFF && mant != 0))
-          is_nonneg = 1;
-      }
-    }
-
-    pending_p0_call_id = -1;
-
-    if (is_nonneg)
-    {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t vreg = irop_get_vreg(dest);
-      if (vreg >= 0 && nonneg_count < MAX_NONNEG_VREGS)
-      {
-        nonneg_vregs[nonneg_count++] = vreg;
-        LOG_IR_GEN("NONNEG: vreg 0x%x is non-negative from call to '%s' at i=%d", vreg, name, i);
-      }
-    }
-  }
-
-  if (nonneg_count == 0)
-    return 0;
-
-  /* Phase 2: Find flag-setting soft-float comparison calls
-   * (__aeabi_cdcmple / __aeabi_cfcmple) where:
-   *   - Parameter 0 is a non-negative vreg and parameter 1 is zero (or vice versa)
-   * Then determine the JUMPIF outcome from the condition token.
-   *
-   * cdcmple(a, b) sets flags as if CMP a, b. The JUMPIF condition token
-   * directly encodes the comparison semantics (GE, LT, etc.).
-   *
-   * When a = nonneg >= 0 and b = 0:
-   *   TOK_GE / TOK_UGE: nonneg >= 0 → ALWAYS TRUE  → jump always taken
-   *   TOK_LT / TOK_ULT: nonneg <  0 → ALWAYS FALSE → jump never taken
-   *   Others (EQ, NE, GT, LE): result depends on whether nonneg == 0 → UNKNOWN
-   *
-   * When a = 0 and b = nonneg >= 0 (reversed):
-   *   TOK_LE / TOK_ULE: 0 <= nonneg → ALWAYS TRUE  → jump always taken
-   *   TOK_GT / TOK_UGT: 0 >  nonneg → ALWAYS FALSE → jump never taken
-   *   Others: UNKNOWN
-   */
-
-  PendingParam params[MAX_PENDING_PARAMS];
-  int param_count = 0;
-
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-
-    /* Collect FUNCPARAMVAL instructions */
-    if (q->op == TCCIR_OP_FUNCPARAMVAL)
-    {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      uint32_t encoded = (uint32_t)irop_get_imm64_ex(ir, src2);
-      int call_id = TCCIR_DECODE_CALL_ID(encoded);
-      int param_idx = TCCIR_DECODE_PARAM_IDX(encoded);
-
-      if (param_count < MAX_PENDING_PARAMS)
-      {
-        PendingParam *pp = &params[param_count++];
-        pp->call_id = call_id;
-        pp->param_idx = param_idx;
-        pp->is_immediate = irop_is_immediate(src1);
-        if (pp->is_immediate)
-        {
-          pp->vreg = -1;
-          pp->imm_val = irop_get_imm64_ex(ir, src1);
-        }
-        else
-        {
-          pp->vreg = irop_get_vreg(src1);
-          pp->imm_val = 0;
-        }
-      }
-      continue;
-    }
-
-    /* Check FUNCCALLVOID for flag-setting soft-float comparison. */
-    if (q->op != TCCIR_OP_FUNCCALLVOID)
-    {
-      if (q->op != TCCIR_OP_FUNCPARAMVOID && q->op != TCCIR_OP_NOP && q->op != TCCIR_OP_FUNCCALLVAL)
-        param_count = 0;
-      continue;
-    }
-
-    IROperand call_src1 = tcc_ir_op_get_src1(ir, q);
-    IROperand call_src2 = tcc_ir_op_get_src2(ir, q);
-    Sym *callee = irop_get_sym_ex(ir, call_src1);
-    if (!callee)
-    {
-      param_count = 0;
-      continue;
-    }
-
-    const char *cmp_name = get_tok_str(callee->v, NULL);
-    if (!cmp_name)
-    {
-      param_count = 0;
-      continue;
-    }
-
-    /* Check if this is a flag-setting comparison function */
-    int is_flag_cmp = 0;
-    for (size_t j = 0; j < NUM_FLAG_CMP_FUNCS; j++)
-    {
-      if (strcmp(cmp_name, flag_cmp_funcs[j]) == 0)
-      {
-        is_flag_cmp = 1;
-        break;
-      }
-    }
-
-    if (!is_flag_cmp)
-    {
-      param_count = 0;
-      continue;
-    }
-
-    /* Found a flag-setting comparison. Extract call_id to match params. */
-    uint32_t call_encoded = (uint32_t)irop_get_imm64_ex(ir, call_src2);
-    int call_id = TCCIR_DECODE_CALL_ID(call_encoded);
-
-    /* Find param 0 and param 1 for this call_id */
-    PendingParam *p0 = NULL, *p1 = NULL;
-    for (int p = 0; p < param_count; p++)
-    {
-      if (params[p].call_id == call_id)
-      {
-        if (params[p].param_idx == 0)
-          p0 = &params[p];
-        else if (params[p].param_idx == 1)
-          p1 = &params[p];
-      }
-    }
-
-    if (!p0 || !p1)
-    {
-      param_count = 0;
-      continue;
-    }
-
-    /* Determine argument layout: which is nonneg and which is zero */
-    int nonneg_is_arg0 = 0; /* 1 if cdcmple(nonneg, 0), 0 if cdcmple(0, nonneg) */
-    int pattern_found = 0;
-
-    /* Check pattern: param0 is non-negative vreg, param1 is zero */
-    if (!p0->is_immediate && p0->vreg >= 0 && p1->is_immediate && p1->imm_val == 0)
-    {
-      for (int k = 0; k < nonneg_count; k++)
-      {
-        if (nonneg_vregs[k] == p0->vreg)
-        {
-          nonneg_is_arg0 = 1;
-          pattern_found = 1;
-          break;
-        }
-      }
-    }
-    /* Check reverse: param0 is zero, param1 is non-negative vreg */
-    else if (p0->is_immediate && p0->imm_val == 0 && !p1->is_immediate && p1->vreg >= 0)
-    {
-      for (int k = 0; k < nonneg_count; k++)
-      {
-        if (nonneg_vregs[k] == p1->vreg)
-        {
-          nonneg_is_arg0 = 0;
-          pattern_found = 1;
-          break;
-        }
-      }
-    }
-
-    if (!pattern_found)
-    {
-      param_count = 0;
-      continue;
-    }
-
-    /* Find the JUMPIF that follows this FUNCCALLVOID.
-     * It should be the very next non-NOP instruction. */
-    int jumpif_idx = -1;
-    for (int j = i + 1; j < n && j <= i + 3; j++)
-    {
-      if (ir->compact_instructions[j].op == TCCIR_OP_NOP)
-        continue;
-      if (ir->compact_instructions[j].op == TCCIR_OP_JUMPIF)
-      {
-        jumpif_idx = j;
-        break;
-      }
-      break;
-    }
-
-    if (jumpif_idx < 0)
-    {
-      param_count = 0;
-      continue;
-    }
-
-    IRQuadCompact *jump_q = &ir->compact_instructions[jumpif_idx];
-    IROperand jmp_cond = tcc_ir_op_get_src1(ir, jump_q);
-    IROperand jmp_dest = tcc_ir_op_get_dest(ir, jump_q);
-    int cond_tok = (int)irop_get_imm64_ex(ir, jmp_cond);
-
-    /* Determine if the branch is always/never taken based on
-     * the condition token and which argument is non-negative.
-     *
-     * cdcmple(a, b) sets flags for "a CMP b".
-     * JUMPIF condition tests those flags. */
-    int fold_result = -1; /* -1 = unknown, 0 = never taken, 1 = always taken */
-
-    if (nonneg_is_arg0)
-    {
-      /* cdcmple(nonneg, 0): flags for "nonneg CMP 0" */
-      switch (cond_tok)
-      {
-      case TOK_GE:
-      case TOK_UGE:
-        fold_result = 1; /* nonneg >= 0: always true */
-        break;
-      case TOK_LT:
-      case TOK_ULT:
-        fold_result = 0; /* nonneg < 0: always false */
-        break;
-      default:
-        fold_result = -1; /* unknown */
-        break;
-      }
-    }
-    else
-    {
-      /* cdcmple(0, nonneg): flags for "0 CMP nonneg" */
-      switch (cond_tok)
-      {
-      case TOK_LE:
-      case TOK_ULE:
-        fold_result = 1; /* 0 <= nonneg: always true */
-        break;
-      case TOK_GT:
-      case TOK_UGT:
-        fold_result = 0; /* 0 > nonneg: always false */
-        break;
-      default:
-        fold_result = -1;
-        break;
-      }
-    }
-
-    if (fold_result < 0)
-    {
-      param_count = 0;
-      continue;
-    }
-
-    if (fold_result == 1)
-    {
-      /* Branch always taken → convert JUMPIF to unconditional JUMP. */
-      jump_q->op = TCCIR_OP_JUMP;
-      tcc_ir_set_dest(ir, jumpif_idx, jmp_dest);
-      LOG_IR_GEN("NONNEG FOLD: %s(nonneg, 0) at i=%d, JUMPIF cond=0x%x at %d "
-                 "-> always taken, unconditional JUMP to %d",
-                 cmp_name, i, cond_tok, jumpif_idx, (int)jmp_dest.u.imm32);
-      changes++;
-    }
-    else
-    {
-      /* Branch never taken → NOP out the JUMPIF. */
-      jump_q->op = TCCIR_OP_NOP;
-      LOG_IR_GEN("NONNEG FOLD: %s(nonneg, 0) at i=%d, JUMPIF cond=0x%x at %d "
-                 "-> never taken, eliminated",
-                 cmp_name, i, cond_tok, jumpif_idx);
-      changes++;
-    }
-
-    param_count = 0;
-  }
-
-  /* Run DCE to clean up dead code after folded branches */
-  if (changes)
-    changes += tcc_ir_opt_dce(ir);
-
-  return changes;
-}
 
 /* ============================================================================
  * Float Narrowing Optimization
@@ -1505,19 +1111,6 @@ int tcc_ir_opt_nonneg_branch_fold(TCCIRState *ir)
 
 #define STACK_CSE_MAX_ENTRIES 32
 
-
-int tcc_ir_opt_branch_folding(TCCIRState *ir)
-{
-  if (tcc_ir_opt_pass_disabled("branch_fold")) return 0;
-  if (ir->next_instruction_index < 2)
-    return 0;
-  IROptCtx ctx;
-  tcc_ir_opt_ctx_init(&ctx, ir);
-  int changes = tcc_ir_opt_run_gens(&ctx, branch_gens, branch_gens_count);
-  tcc_ir_opt_ctx_free(&ctx);
-  return changes;
-}
-
 /* ============================================================================
  * Stack Address Non-Null Branch Folding
  * ============================================================================
@@ -1546,6 +1139,24 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
     return 0;
 
   LOG_IR_GEN("=== STACK ADDR NONNULL FOLD START ===");
+
+  /* Mark instructions inside a loop body (spanned by a back-edge).  The
+   * address-vs-address distinctness fold below is unsound for a CMP that
+   * re-executes: a walking stack pointer (p compared to a base while p is
+   * decremented on the back-edge) is distinct on the first iteration but
+   * becomes equal, so folding it drops the loop-exit test (990513-1). */
+  uint8_t *in_loop = (uint8_t *)tcc_mallocz((size_t)n);
+  for (int j = 0; j < n; j++)
+  {
+    IRQuadCompact *qj = &ir->compact_instructions[j];
+    if (qj->op != TCCIR_OP_JUMP && qj->op != TCCIR_OP_JUMPIF)
+      continue;
+    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, qj));
+    if (t < 0 || t > j)
+      continue;
+    for (int k = t; k <= j; k++)
+      in_loop[k] = 1;
+  }
 
   /* Phase 1: Identify TEMP vregs that hold stack addresses (single-assignment,
    * always safe). Also build a flow-sensitive bitmap for VAR vregs. */
@@ -2084,7 +1695,12 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
           }
         }
       }
-      if (sa1_valid && sa2_valid && off1 == off2)
+      /* A CMP inside a loop body may re-execute with an operand that walked
+       * to a different address, so its tracked (first-iteration) offset does
+       * not prove distinctness — decline both folds there. */
+      if (in_loop[i])
+        ; /* leave unmatched */
+      else if (sa1_valid && sa2_valid && off1 == off2)
         matched = 2;
       /* Different stack addresses are provably distinct: distinct VARs each
        * occupy their own slot, so EQ/NE can be folded.  Only safe for EQ/NE
@@ -2162,6 +1778,7 @@ int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir)
 
   LOG_IR_GEN("=== STACK ADDR NONNULL FOLD END: %d branches folded ===", changes);
 
+  tcc_free(in_loop);
   return changes;
 }
 
@@ -2450,30 +2067,9 @@ int tcc_ir_opt_stack_bool_diamond(TCCIRState *ir)
   return changes;
 }
 
-/* tcc_ir_opt_or_bool_diamond: fold the common `acc |= (cond ? 1 : 0)`
- * diamond.  Source pattern (post-loop-rotation):
- *
- *   i_jmpif: JUMPIF cond → i_st_f                 (skip the true arm)
- *   ... true arm (any straight-line code, e.g. inlined printf) ...
- *   i_st_t:  STORE slot, #1
- *   i_jmp:   JUMP i_or                            (skip false arm)
- *   i_st_f:  STORE slot, #0                       (false arm)
- *   i_or:    dst = src OR slot                    (merge OR)
- *
- * The boolean is materialized to a stack slot and then OR-merged.  We can
- * skip the slot entirely by computing the OR-result directly into dst on
- * each arm:
- *
- *   i_jmpif: unchanged
- *   ... true arm ...
- *   i_st_t:  dst = src OR #1                      (true-arm result)
- *   i_jmp:   unchanged
- *   i_st_f:  dst = src ASSIGN                     (false-arm result; same as src|0)
- *   i_or:    NOP
- *
- * Constraints checked: `slot` is used only at i_st_t, i_st_f, i_or; stored
- * values are {0, 1}; no other jumps target i_or or i_st_f. */
-int tcc_ir_opt_or_bool_diamond(TCCIRState *ir)
+/* ssa:or_bool_diamond — fold `acc |= (cond ? 1 : 0)` slot materialization
+ * into per-arm ORs; see docs/plan_legacy_or_bool_diamond_ssa.md. */
+int ssa_opt_or_bool_diamond(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   int changes = 0;
@@ -2486,9 +2082,7 @@ int tcc_ir_opt_or_bool_diamond(TCCIRState *ir)
     if (q_or->op != TCCIR_OP_OR)
       continue;
 
-    /* The OR's two operands: one is the bool's stack slot (a STACKOFF
-     * with no vreg — pure compiler-temp storage), the other is the
-     * accumulator (VAR or TEMP, which has a vreg). */
+    /* One OR operand must be a no-vreg STACKOFF slot, the other the accumulator. */
     IROperand or_dest = tcc_ir_op_get_dest(ir, q_or);
     IROperand or_src1 = tcc_ir_op_get_src1(ir, q_or);
     IROperand or_src2 = tcc_ir_op_get_src2(ir, q_or);
@@ -2516,8 +2110,7 @@ int tcc_ir_opt_or_bool_diamond(TCCIRState *ir)
       continue;
     int64_t val_f = irop_get_imm64_ex(ir, st_f_src);
 
-    /* Find the unique JUMP whose target is i_or.  The STORE immediately
-     * before that JUMP writes `slot` with the other value. */
+    /* Unique JUMP targeting i_or; the STORE just before it writes the true-arm value. */
     int i_jmp = -1;
     int multi = 0;
     for (int j = 0; j < n; j++)
@@ -2603,13 +2196,7 @@ int tcc_ir_opt_or_bool_diamond(TCCIRState *ir)
     if (extra_target)
       continue;
 
-    /* Verify the slot is used only at i_st_t, i_st_f, i_or.
-     * "References" here mean the raw stack slot (STACKOFF tag with no
-     * vreg).  References to a VAR at the same stack offset don't count:
-     * TCC's stack allocator reuses a dead VAR's slot for short-lived
-     * temporaries, so the same offset can host two non-overlapping
-     * entities — the VAR's last use is always before the slot's first
-     * use here. */
+    /* Slot used only at i_st_t/i_st_f/i_or; VARs sharing the offset don't count (non-overlapping slot reuse). */
     int extra_use = 0;
 #define ORBD_REFS_SLOT(op_) (operand_references_slot((op_), slot) && irop_get_vreg(op_) < 0)
     for (int j = 0; j < n && !extra_use; j++)
@@ -2634,30 +2221,16 @@ int tcc_ir_opt_or_bool_diamond(TCCIRState *ir)
     if (i_st_t <= i_jmpif)
       continue;
 
-    /* Apply transformation:
-     *   - i_st_t: STORE slot, #1   →  dst = src OR #1
-     *   - i_st_f: STORE slot, #0   →  dst = src        (ASSIGN; same as |0)
-     *   - i_or:   dst = src OR slot → NOP
-     * The JUMPIF and the JMP from the true arm stay in place; both arms
-     * now produce the same dst directly, no stack slot needed.
-     *
-     * STORE (2 operands) → OR (3 operands) needs a new operand_base in
-     * the pool, since the old slot has no room for src2.  ASSIGN keeps
-     * the same operand count as STORE so we can edit in place. */
     LOG_IR_GEN("OPTIMIZE: OR bool diamond at i_or=%d (jmpif=%d, st_t=%d, jmp=%d, st_f=%d)", i_or, i_jmpif, i_st_t, i_jmp,
                i_st_f);
 
     IROperand acc_dest = or_dest;
-    /* `slot` is the no-vreg STACKOFF; the accumulator is whichever
-     * operand isn't the slot.  Don't filter on tag here — the accumulator
-     * may itself be a stack-allocated VAR (also STACKOFF-tagged but with
-     * a vreg). */
+    /* Accumulator may itself be a vreg-carrying STACKOFF VAR — don't filter on tag. */
     IROperand acc_src = s2_is_slot ? or_src1 : or_src2;
     int acc_btype = irop_get_btype(acc_dest);
     IROperand one_imm = irop_make_imm32(-1, 1, acc_btype);
 
-    /* True arm: dst = src OR #1.  Allocate 3 fresh operand slots at the
-     * end of the pool and point i_st_t's operand_base there. */
+    /* True arm: STORE (2 ops) becomes OR (3 ops) — needs fresh pool operand slots. */
     tcc_ir_pool_ensure(ir, 3);
     uint32_t new_base = (uint32_t)ir->iroperand_pool_count;
     ir->iroperand_pool[new_base + 0] = acc_dest;
@@ -2667,13 +2240,11 @@ int tcc_ir_opt_or_bool_diamond(TCCIRState *ir)
     q_st_t->op = TCCIR_OP_OR;
     q_st_t->operand_base = new_base;
 
-    /* False arm: dst = src (plain ASSIGN; equivalent to src | 0).  ASSIGN
-     * and STORE both use {dest, src1}, so we can edit in place. */
+    /* False arm: dst = src (src|0); ASSIGN and STORE share {dest,src1}, edit in place. */
     q_st_f->op = TCCIR_OP_ASSIGN;
     tcc_ir_set_dest(ir, i_st_f, acc_dest);
     tcc_ir_set_src1(ir, i_st_f, acc_src);
 
-    /* Merge OR is no longer needed — both arms produce the final value. */
     ir->compact_instructions[i_or].op = TCCIR_OP_NOP;
     changes++;
   }
@@ -2681,11 +2252,8 @@ int tcc_ir_opt_or_bool_diamond(TCCIRState *ir)
   return changes;
 }
 
-int tcc_ir_opt_branch_folding_ex(IROptCtx *ctx) { return tcc_ir_opt_branch_folding(ctx->ir); }
 int tcc_ir_opt_vrp_ex(IROptCtx *ctx) { return tcc_ir_opt_vrp(ctx->ir); }
-int tcc_ir_opt_nonneg_branch_fold_ex(IROptCtx *ctx) { return tcc_ir_opt_nonneg_branch_fold(ctx->ir); }
 int tcc_ir_opt_float_branch_fold_ex(IROptCtx *ctx) { return tcc_ir_opt_float_branch_fold(ctx->ir); }
 int tcc_ir_opt_stack_addr_nonnull_fold_ex(IROptCtx *ctx) { return tcc_ir_opt_stack_addr_nonnull_fold(ctx->ir); }
 int tcc_ir_opt_setif_branch_fuse_ex(IROptCtx *ctx) { return tcc_ir_opt_setif_branch_fuse(ctx->ir); }
 int tcc_ir_opt_stack_bool_diamond_ex(IROptCtx *ctx) { return tcc_ir_opt_stack_bool_diamond(ctx->ir); }
-int tcc_ir_opt_or_bool_diamond_ex(IROptCtx *ctx) { return tcc_ir_opt_or_bool_diamond(ctx->ir); }

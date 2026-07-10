@@ -9,7 +9,6 @@
  *    tcc_ir_opt_infinite_self_recursion()
  *    tcc_ir_opt_noreturn_call_epilogue_suppress()
  *    tcc_ir_opt_compact_nops()
- *    tcc_ir_opt_redundant_init_elim()
  *
  *  These are whole-body "prove no observable effect / prove non-return"
  *  passes plus the mechanical NOP-compaction pass; none had any unit
@@ -32,7 +31,6 @@ int tcc_ir_opt_trap_only_body_suppress(TCCIRState *ir);
 int tcc_ir_opt_infinite_self_recursion(TCCIRState *ir, Sym *func_sym);
 int tcc_ir_opt_noreturn_call_epilogue_suppress(TCCIRState *ir);
 int tcc_ir_opt_compact_nops(TCCIRState *ir);
-int tcc_ir_opt_redundant_init_elim(TCCIRState *ir);
 
 /* IROptCtx wrapper entry points and additional whole-function elision passes. */
 int tcc_ir_opt_useless_function_body_ex(IROptCtx *ctx);
@@ -641,98 +639,6 @@ UT_TEST(test_compact_nops_rederives_jump_target_flags)
   return 0;
 }
 
-/* ============================================================ redundant_init_elim
- *
- * Kills a function-entry `V <- #imm` init when every path from it either
- * redefines V (with an explicit source) before any use, or reaches a
- * RETURNVALUE without ever using V.
- */
-
-/* POSITIVE: V0's entry init is immediately overwritten with another explicit
- * constant before any read -> the first init is dead. */
-UT_TEST(test_redundant_init_elim_overwritten_before_use_removed)
-{
-  TCCIRState *ir = utb_new();
-  utb_alloc_var_intervals(ir, 1);
-
-  int init = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(2, I32), UTB_NONE);
-  int read = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_redundant_init_elim(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, init), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, read), TCCIR_OP_ASSIGN);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): V0's entry init IS read (no redefinition first) -> must
- * survive. */
-UT_TEST(test_redundant_init_elim_read_before_kill_kept)
-{
-  TCCIRState *ir = utb_new();
-  utb_alloc_var_intervals(ir, 1);
-
-  int init = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(1, I32), UTB_NONE);
-  int read = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_redundant_init_elim(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, init), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_op(ir, read), TCCIR_OP_ASSIGN);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): a SWITCH_TABLE anywhere in the function makes the forward
- * BFS unsound (it never follows switch-case edges), so the whole pass bails
- * out before ever inspecting any init. */
-UT_TEST(test_redundant_init_elim_switch_table_bails_out)
-{
-  TCCIRState *ir = utb_new();
-
-  int init = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(2, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_SWITCH_TABLE, UTB_NONE, utb_temp(0, I32), utb_imm(0, I32));
-
-  int changes = tcc_ir_opt_redundant_init_elim(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, init), TCCIR_OP_ASSIGN);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): the init value is address-taken (interval->addrtaken) ->
- * skipped even though it looks redundant, since a pointer write through the
- * address could observe the original value. */
-UT_TEST(test_redundant_init_elim_addrtaken_var_kept)
-{
-  TCCIRState *ir = utb_new();
-  ir->variables_live_intervals = (IRLiveInterval *)tcc_mallocz(sizeof(IRLiveInterval) * 1);
-  ir->variables_live_intervals_size = 1;
-  ir->variables_live_intervals[0].addrtaken = 1;
-
-  int init = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(2, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_redundant_init_elim(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, init), TCCIR_OP_ASSIGN);
-
-  utb_free(ir);
-  return 0;
-}
 
 /* ================================================================== IROptCtx wrappers and additional whole-body elision passes */
 
@@ -906,7 +812,6 @@ UT_SUITE(opt_dce_cleanup)
   UT_COVERS("infinite_self_recursion");
   UT_COVERS("noreturn_call_epilogue_suppress");
   UT_COVERS("compact_nops");
-  UT_COVERS("redundant_init_elim");
   UT_COVERS("ub_only_body_elide");
   UT_COVERS("local_only_body_elide");
   UT_COVERS("const_return_uninit_elide");
@@ -936,11 +841,6 @@ UT_SUITE(opt_dce_cleanup)
   UT_RUN(test_compact_nops_remaps_epilogue_target);
   UT_RUN(test_compact_nops_no_nops_no_change);
   UT_RUN(test_compact_nops_rederives_jump_target_flags);
-
-  UT_RUN(test_redundant_init_elim_overwritten_before_use_removed);
-  UT_RUN(test_redundant_init_elim_read_before_kill_kept);
-  UT_RUN(test_redundant_init_elim_switch_table_bails_out);
-  UT_RUN(test_redundant_init_elim_addrtaken_var_kept);
 
   UT_RUN(test_useless_function_body_ex_forwards);
   UT_RUN(test_noreturn_collapse_ex_forwards);

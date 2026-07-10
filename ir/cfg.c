@@ -44,8 +44,7 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
   IRCFG *cfg = tcc_mallocz(sizeof(IRCFG));
   cfg->num_instrs = n;
 
-  /* Mark leaders — recompute jump targets from scratch (don't trust
-   * stale is_jump_target flags from previous optimization passes). */
+  /* Recompute jump targets from scratch — don't trust stale flags. */
   uint8_t *is_leader = tcc_mallocz(n);
   is_leader[0] = 1;
   for (int i = 0; i < n; i++) {
@@ -57,12 +56,8 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
         is_leader[target] = 1;
       }
     }
-    /* SWITCH_TABLE case/default targets are jump targets too.  A case body
-     * reached by fall-through from the previous case is NOT otherwise a
-     * leader; without splitting there, instr_to_block[] maps the case entry
-     * to the middle of the merged block and every switch edge lands at that
-     * block's START — SCCP then const-folds values along the wrong case
-     * chain (switch fuzz seed 18613: selector 6 folded via case 3's body). */
+    /* Switch case/default targets must be leaders; otherwise SCCP folds
+     * values along the wrong chain via merged blocks. */
     if (q->op == TCCIR_OP_SWITCH_TABLE) {
       IROperand src2 = tcc_ir_op_get_src2(ir, q);
       int table_id = (int)irop_get_imm64_ex(ir, src2);
@@ -150,7 +145,7 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
     }
     else if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
              q->op == TCCIR_OP_IJUMP) {
-      /* no successors (IJUMP: conservative — skip loops containing it) */
+      /* no successors */
     }
     else {
       if (b + 1 < cfg->num_blocks)
@@ -188,7 +183,7 @@ static void cfg_compute_rpo(IRCFG *cfg)
   int *postorder = tcc_mallocz(nb * sizeof(int));
   int po_count = 0;
 
-  /* Iterative DFS using explicit stack: (block, child_index) */
+  /* Explicit-stack DFS */
   typedef struct { int block; int ci; } DFSFrame;
   DFSFrame *stack = tcc_mallocz(nb * sizeof(DFSFrame));
   int sp = 0;
@@ -227,7 +222,6 @@ static void cfg_compute_rpo(IRCFG *cfg)
   tcc_free(stack);
 }
 
-/* Cooper-Harvey-Kennedy dominator tree */
 static int cfg_intersect(IRCFG *cfg, int b1, int b2)
 {
   while (b1 != b2) {
@@ -317,15 +311,14 @@ void tcc_ir_cfg_compute_dom_frontiers(IRCFG *cfg)
   if (!cfg || cfg->num_blocks == 0)
     return;
 
-  /* Build dominator tree children lists */
+  /* Build dominator tree children */
   for (int b = 1; b < cfg->num_blocks; b++) {
     int idom = cfg->blocks[b].idom;
     if (idom >= 0 && idom != b)
       cfg_add_dom_child(&cfg->blocks[idom], b);
   }
 
-  /* Compute dominance frontier using the standard algorithm.
-   * Per-block bitset avoids O(n^2) duplicate checks in cfg_add_df. */
+  /* Standard dominance frontier; per-block bitset avoids O(n^2) dup checks. */
   int nb = cfg->num_blocks;
   int df_seen_bytes = (nb + 7) / 8;
   uint8_t *df_seen = tcc_mallocz(nb * df_seen_bytes);

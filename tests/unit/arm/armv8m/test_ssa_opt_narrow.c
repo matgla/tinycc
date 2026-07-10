@@ -11,7 +11,7 @@
  *      * Non-matching shifts / 64-bit / multi-def → no fold
  *
  *  HARNESS NOTES:
- *    - Links the real ir/opt/ssa_opt_narrow.c via UT11.
+ *    - Links the real source/opt/ssa/scalar/narrow.c via UT11.
  *    - Uses ssa_build.h for hand-built vinfo + IR.
  *    - SHL/SHR/SAR require a shift-amount src2; use ssa_add_instr4().
  *    - AND with immediate src2 also needs ssa_add_instr4().
@@ -361,7 +361,7 @@ UT_TEST(test_narrow_and_fold_shr_mask_covers)
 UT_TEST(test_narrow_and_fold_shr_mask_not_covering)
 {
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
-  /* t0 = #0xFF; t1 = t0 >> 4; t2 = t1 & 0x3 → no fold */
+  /* t0 = #0xFF; t1 = t0 >> 4; t2 = t1 & 0x3 → UBFX(t0, 4, 2) */
   ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(0xFF, I32));
   ssa_add_instr4(&c, TCCIR_OP_SHR, utb_temp(1, I32), utb_temp(0, I32),
                  utb_imm(4, I32), UTB_NONE);
@@ -373,8 +373,8 @@ UT_TEST(test_narrow_and_fold_shr_mask_not_covering)
   ssa_ctx_rebuild(&c);
 
   int changed = ssa_opt_narrow(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, and_i), TCCIR_OP_AND);
+  UT_ASSERT_EQ(changed, 1);
+  UT_ASSERT_EQ(utb_op(c.ir, and_i), TCCIR_OP_UBFX);
 
   ssa_ctx_free(&c);
   return 0;

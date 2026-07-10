@@ -6,7 +6,7 @@
  * forever — tcc itself hung here, in parse_number() (tccpp.c), compiling ANY
  * integer literal (the self-hosted compiler froze on every input).
  *
- * Fixed by disabling opt_postinc_fusion (libtcc.c): `*q++` now lowers to an
+ * Fixed by removing the post-increment fusion pass: `*q++` now lowers to an
  * explicit LOAD + ADD whose incremented result is written back to the
  * pointer's home register/spill slot correctly.
  *

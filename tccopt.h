@@ -70,12 +70,6 @@ int tcc_opt_constant_folding(TCCIRState *ir);
 /* Common Subexpression Elimination - Reuse computed values */
 int tcc_opt_cse(TCCIRState *ir);
 
-/* Copy Propagation - Replace variables with their values */
-int tcc_opt_copy_propagation(TCCIRState *ir);
-
-/* Strength Reduction - Replace expensive ops with cheaper ones */
-int tcc_opt_strength_reduction(TCCIRState *ir);
-
 /* ============================================================================
  * FP Offset Cache Optimization
  * ============================================================================

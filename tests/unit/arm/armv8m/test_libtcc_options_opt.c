@@ -71,7 +71,6 @@ UT_TEST(test_tcc_set_options_o0_leaves_opt_fields_at_default)
   UT_ASSERT_EQ(s->optimize, 0);
   UT_ASSERT_EQ(s->opt_dce, 0);
   UT_ASSERT_EQ(s->opt_const_prop, 0);
-  UT_ASSERT_EQ(s->opt_copy_prop, 0);
   UT_ASSERT_EQ(s->opt_cse, 0);
   UT_ASSERT_EQ(s->opt_licm, 0);
   UT_ASSERT_EQ(s->opt_iv_strength_red, 0);
@@ -99,7 +98,6 @@ UT_TEST(test_tcc_set_options_o1_enables_pass_batch)
   UT_ASSERT_EQ(s->opt_const_prop, 1);
   UT_ASSERT_EQ(s->opt_copy_prop, 1);
   UT_ASSERT_EQ(s->opt_cse, 1);
-  UT_ASSERT_EQ(s->opt_bool_cse, 1);
   UT_ASSERT_EQ(s->opt_bool_idempotent, 1);
   UT_ASSERT_EQ(s->opt_bool_simplify, 1);
   UT_ASSERT_EQ(s->opt_store_load_fwd, 1);
@@ -108,26 +106,20 @@ UT_TEST(test_tcc_set_options_o1_enables_pass_batch)
   UT_ASSERT_EQ(s->opt_indexed_memory, 1);
   UT_ASSERT_EQ(s->opt_disp_fusion, 1);
   UT_ASSERT_EQ(s->opt_lea_fold, 1);
-  UT_ASSERT_EQ(s->opt_mla_fusion, 1);
   UT_ASSERT_EQ(s->opt_stack_addr_cse, 1);
-  UT_ASSERT_EQ(s->opt_licm, 1);
-  UT_ASSERT_EQ(s->opt_ipc, 1);
   UT_ASSERT_EQ(s->opt_strength_red, 1);
-  UT_ASSERT_EQ(s->opt_iv_strength_red, 1);
-  UT_ASSERT_EQ(s->opt_loop_unroll, 1);
-  UT_ASSERT_EQ(s->opt_loop_rotation, 1);
-  UT_ASSERT_EQ(s->opt_reroll, 1);
-  UT_ASSERT_EQ(s->opt_nonneg_fold, 1);
   UT_ASSERT_EQ(s->opt_vrp, 1);
   UT_ASSERT_EQ(s->opt_float_narrow, 1);
   UT_ASSERT_EQ(s->opt_jump_threading, 1);
   UT_ASSERT_EQ(s->opt_inline_small, 1);
 
-  /* Explicitly left disabled at -O1 (see comment in libtcc.c: unsound
-   * when the pointer spills). */
-  UT_ASSERT_EQ(s->opt_postinc_fusion, 0);
-
-  /* -O2-only knob must NOT be enabled yet. */
+  /* -O2-only knobs must NOT be enabled yet. */
+  UT_ASSERT_EQ(s->opt_mla_fusion, 0);
+  UT_ASSERT_EQ(s->opt_licm, 0);
+  UT_ASSERT_EQ(s->opt_ipc, 0);
+  UT_ASSERT_EQ(s->opt_iv_strength_red, 0);
+  UT_ASSERT_EQ(s->opt_loop_unroll, 0);
+  UT_ASSERT_EQ(s->opt_reroll, 0);
   UT_ASSERT_EQ(s->opt_inline_functions, 0);
 
   /* opt_inline_limit was 0 (unset) so -O1 raises it to the level-1
@@ -150,11 +142,17 @@ UT_TEST(test_tcc_set_options_o2_additionally_enables_inline_functions)
 
   /* Still gets the full -O1 batch (optimize >= 1 block also runs). */
   UT_ASSERT_EQ(s->opt_dce, 1);
-  UT_ASSERT_EQ(s->opt_licm, 1);
   UT_ASSERT_EQ(s->opt_inline_small, 1);
 
-  /* -O2-only: auto-inline of larger functions, with the threshold raised
-   * from the -O1 default of 30 to 100 (opt_inline_limit < 100 check). */
+  /* -O2-only heavy tier: loops, MLA fusion, IPC, and auto-inline of larger
+   * functions with the threshold raised from the -O1 default of 30 to 100
+   * (opt_inline_limit < 100 check). */
+  UT_ASSERT_EQ(s->opt_mla_fusion, 1);
+  UT_ASSERT_EQ(s->opt_licm, 1);
+  UT_ASSERT_EQ(s->opt_ipc, 1);
+  UT_ASSERT_EQ(s->opt_iv_strength_red, 1);
+  UT_ASSERT_EQ(s->opt_loop_unroll, 1);
+  UT_ASSERT_EQ(s->opt_reroll, 1);
   UT_ASSERT_EQ(s->opt_inline_functions, 1);
   UT_ASSERT_EQ(s->opt_inline_limit, 100);
 

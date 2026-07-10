@@ -319,37 +319,6 @@ thumb_opcode thop_emit_error(const char *name, const thop_variant *table, size_t
  *  Utility functions (moved from arm-thumb-opcodes.c)
  * ═══════════════════════════════════════════════════════════════════ */
 
-void th_trace_regset(uint16_t regs)
-{
-  int first = 1;
-  (void)first;
-  THOP_TRACE("{");
-  for (unsigned r = 0; r < 16; ++r)
-  {
-    if (regs & (1u << r))
-    {
-      THOP_TRACE("%s%s", first ? "" : ",", th_reg_name(r));
-      first = 0;
-    }
-  }
-  THOP_TRACE("}");
-}
-
-void th_trace_shift_suffix(thumb_shift shift)
-{
-  if (shift.type == THUMB_SHIFT_NONE)
-    return;
-  if (shift.type == THUMB_SHIFT_RRX)
-  {
-    THOP_TRACE(", rrx");
-    return;
-  }
-  if (shift.mode == THUMB_SHIFT_REGISTER)
-    THOP_TRACE(", %s %s", th_shift_name(shift.type), th_reg_name(shift.value));
-  else
-    THOP_TRACE(", %s #%u", th_shift_name(shift.type), (unsigned)shift.value);
-}
-
 uint32_t th_packimm_10_11_0(uint32_t imm)
 {
   const uint32_t imm11 = (imm >> 1) & 0x7ff;

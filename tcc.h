@@ -1028,7 +1028,6 @@ struct TCCState
   unsigned char opt_const_prop;       /* -fconst-prop: constant propagation */
   unsigned char opt_copy_prop;        /* -fcopy-prop: copy propagation */
   unsigned char opt_cse;              /* -fcse: common subexpression elimination */
-  unsigned char opt_bool_cse;         /* -fbool-cse: boolean CSE */
   unsigned char opt_bool_idempotent;  /* -fbool-idempotent: boolean idempotent simplification */
   unsigned char opt_bool_simplify;    /* -fbool-simplify: boolean expression simplification */
   unsigned char opt_store_load_fwd;   /* -fstore-load-fwd: store-load forwarding */
@@ -1038,16 +1037,13 @@ struct TCCState
   unsigned char opt_indexed_memory;   /* -findexed-memory: indexed load/store fusion */
   unsigned char opt_disp_fusion;      /* -fdisp-fusion: ADD+LOAD/STORE -> displacement-addressed mem op */
   unsigned char opt_lea_fold;         /* -flea-fold: LEA Addr[StackLoc]+deref -> direct stack slot access */
-  unsigned char opt_postinc_fusion;   /* -fpostinc-fusion: post-increment load/store fusion */
   unsigned char opt_mla_fusion;       /* -fmla-fusion: multiply-accumulate fusion */
   unsigned char opt_stack_addr_cse;   /* -fstack-addr-cse: stack address CSE */
   unsigned char opt_licm;             /* -flicm: loop-invariant code motion */
   unsigned char opt_strength_red;     /* -fstrength-reduce: strength reduction for multiply */
   unsigned char opt_iv_strength_red;  /* -fiv-strength-red: IV strength reduction for array access */
   unsigned char opt_loop_unroll;      /* -floop-unroll: full unroll small constant-trip-count loops */
-  unsigned char opt_loop_rotation;    /* -floop-rotation: rotate top-tested loops to bottom-tested */
   unsigned char opt_reroll;           /* -freroll-blocks: re-roll N identical consecutive blocks into a loop */
-  unsigned char opt_nonneg_fold;      /* -fnonneg-fold: non-negative value branch folding */
   unsigned char opt_vrp;              /* -fvrp: value range propagation branch folding */
   unsigned char opt_float_narrow;     /* -ffloat-narrow: narrow double math to float when safe */
   unsigned char opt_jump_threading;   /* -fjump-threading: jump threading optimization */
@@ -1499,6 +1495,7 @@ enum StrBuiltinId
   STRBI_STRSTR,
   STRBI_STRPBRK,
   STRBI_STRCSPN,
+  STRBI_STRSPN,
   STRBI_MEMCMP,
   STRBI_MEMCMP_EQ,
   STRBI_MEMCHR,
@@ -1507,6 +1504,7 @@ enum StrBuiltinId
   STRBI_MEMPCPY,
   STRBI_INDEX,
   STRBI_RINDEX,
+  STRBI__COUNT,
 };
 
 /* A deferred fixup for a label-difference expression (&&sym1 - &&sym2)
@@ -1815,7 +1813,8 @@ static inline int resolve_str_builtin_id(int tok, const char *name)
              {"__tcc_strrchr", STRBI_STRRCHR},   {"strstr", STRBI_STRSTR},
              {"__tcc_strstr", STRBI_STRSTR},     {"strpbrk", STRBI_STRPBRK},
              {"__tcc_strpbrk", STRBI_STRPBRK},   {"strcspn", STRBI_STRCSPN},
-             {"__tcc_strcspn", STRBI_STRCSPN},   {"memcmp", STRBI_MEMCMP},
+             {"__tcc_strcspn", STRBI_STRCSPN},   {"strspn", STRBI_STRSPN},
+             {"memcmp", STRBI_MEMCMP},
              {"__builtin_memcmp_eq", STRBI_MEMCMP_EQ},
              {"memchr", STRBI_MEMCHR},           {"memmove", STRBI_MEMMOVE},
              {"__tcc_memmove", STRBI_MEMMOVE},   {"bcopy", STRBI_BCOPY},
@@ -2351,10 +2350,7 @@ ST_FUNC void write32le(unsigned char *p, uint32_t x);
 ST_FUNC void add32le(unsigned char *p, int32_t x);
 ST_FUNC uint64_t read64le(unsigned char *p);
 ST_FUNC void write64le(unsigned char *p, uint64_t x);
-static inline void add64le(unsigned char *p, int64_t x)
-{
-  write64le(p, read64le(p) + x);
-}
+
 #define DWARF_MAX_128 ((8 * sizeof(int64_t) + 6) / 7)
 #define dwarf_read_1(ln, end) ((ln) < (end) ? *(ln)++ : 0)
 #define dwarf_read_2(ln, end) ((ln) + 1 < (end) ? (ln) += 2, read16le((ln) - 2) : 0)
@@ -2600,6 +2596,7 @@ ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand sr
  * be encoded and the caller should fall back to the regular CMP+SELECT. */
 ST_FUNC int tcc_gen_machine_subs_eq_select_01(MachineOperand src1, MachineOperand src2, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
+ST_FUNC void tcc_gen_machine_sbfx_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_bfi_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, uint32_t params);
 ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_pack64_mop(MachineOperand src_lo, MachineOperand src_hi, MachineOperand dest);
@@ -2689,7 +2686,6 @@ ST_FUNC uint16_t tcc_gen_machine_insn_scratch_saves_mask(void);
 /* Branch optimization interface */
 ST_FUNC void tcc_gen_machine_branch_opt_init(void);
 ST_FUNC void tcc_gen_machine_branch_opt_analyze(uint32_t *ir_to_code_mapping, int mapping_size);
-ST_FUNC int tcc_gen_machine_branch_opt_get_encoding(int ir_index); /* Returns 16 or 32 */
 
 /* Reset the MOV-coalescing register-equivalence cache at IR instruction
  * boundaries (any IR op may be a branch target, so cross-IR equivalences

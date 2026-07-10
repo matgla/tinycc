@@ -27,6 +27,13 @@
 #include "cfg.h"
 #include "ssa.h"
 #include "opt/ssa_opt.h"
+#include "opt/ssa/branch.h"
+#include "const_string_fold.h"
+#include "bitop_const_fold.h"
+#include "opt/ssa/fold.h"
+#include "global_addr_hoist.h"
+#include "opt/ssa/strength.h"
+#include "opt_pipeline.h"
 #include "licm.h"
 
 extern int tcc_ir_opt_pass_disabled(const char *name);
@@ -51,6 +58,7 @@ typedef struct SSAInterval {
   uint8_t loop_phi_locked : 1; /* absorbed a loop-phi partner (carries a loop-carried value across the whole loop body); must not be evicted — spilling it mid-loop would not reload the partner's uses and corrupts the IV */
   uint8_t reg_type;
   uint16_t use_count;
+  uint16_t narrow_uses; /* static count of references from ops with 16-bit encodings (want r0-r7) */
   int8_t precolored;
   int8_t pref_reg; /* soft hint: prefer this physical reg if available (e.g. r0 for RETURNVALUE feeders) */
   int32_t hint_vreg;
@@ -310,6 +318,41 @@ static uint8_t *ra_build_jump_target_map(TCCIRState *ir)
     }
   }
   return map;
+}
+
+/* NOP any FUNCCALL left without its full FUNCPARAMVAL set (regalloc dead-code passes can strip a param off a dead fall-through while its call survives via another edge — only possible in dead code, as a param dominates its call in live code). */
+static int ra_repair_incomplete_calls(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int changed = 0;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *cq = &ir->compact_instructions[i];
+    if (cq->op != TCCIR_OP_FUNCCALLVAL && cq->op != TCCIR_OP_FUNCCALLVOID) continue;
+    IROperand cs2 = tcc_ir_op_get_src2(ir, cq);
+    if (irop_is_none(cs2)) continue;
+    int call_id = TCCIR_DECODE_CALL_ID((uint32_t)cs2.u.imm32);
+    int argc = TCCIR_DECODE_CALL_ARGC((uint32_t)cs2.u.imm32);
+    if (argc <= 0) continue;
+    int found = 0;
+    for (int j = i - 1; j >= 0 && found < argc; j--) {
+      IRQuadCompact *pq = &ir->compact_instructions[j];
+      if (pq->op != TCCIR_OP_FUNCPARAMVAL) continue;
+      IROperand ps2 = tcc_ir_op_get_src2(ir, pq);
+      if (irop_is_none(ps2)) continue;
+      if (TCCIR_DECODE_CALL_ID((uint32_t)ps2.u.imm32) == call_id) found++;
+    }
+    if (found >= argc) continue;
+    cq->op = TCCIR_OP_NOP;
+    for (int j = i - 1; j >= 0; j--) {
+      IRQuadCompact *pq = &ir->compact_instructions[j];
+      if (pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID) continue;
+      IROperand ps2 = tcc_ir_op_get_src2(ir, pq);
+      if (irop_is_none(ps2)) continue;
+      if (TCCIR_DECODE_CALL_ID((uint32_t)ps2.u.imm32) == call_id) pq->op = TCCIR_OP_NOP;
+    }
+    changed++;
+  }
+  return changed;
 }
 
 /* Try to fold CMP + JUMPIF where both CMP operands resolve to constants
@@ -2102,7 +2145,7 @@ static int ra_safe_exit_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterv
 static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                            const RegAllocTarget *target, int spill_base,
                            uint64_t *out_dirty_int, uint64_t *out_dirty_fp,
-                           int max_vreg_pos)
+                           int max_vreg_pos, int has_call)
 {
   if (count <= 0) return;
 
@@ -2487,9 +2530,9 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
 
     /* Integer: single register */
     int reg = -1;
-    RA_DBG("  alloc T%d [%u,%u] xcall=%d int_free=0x%llx active=%d",
+    RA_DBG("  alloc T%d [%u,%u] xcall=%d narrow=%u int_free=0x%llx active=%d",
            TCCIR_DECODE_VREG_POSITION(cur->vreg), cur->start, cur->end,
-           cur->crosses_call, (unsigned long long)int_free, active_count);
+           cur->crosses_call, cur->narrow_uses, (unsigned long long)int_free, active_count);
 
     /* Phi-coalescing: try the hinted partner's register first.
      * ra_build_phi_hints set hint_vreg to a vreg this interval used to
@@ -2701,13 +2744,47 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
         if (int_free & (1ull << r)) { reg = r; break; }
       }
     }
+    if (reg < 0 && !cur->crosses_call &&
+        (int)cur->start < ir->next_instruction_index) {
+      IRQuadCompact *dq = &ir->compact_instructions[cur->start];
+      if (dq->op == TCCIR_OP_MLA &&
+          irop_get_vreg(tcc_ir_op_get_dest(ir, dq)) == cur->vreg) {
+        IROperand accum = tcc_ir_op_get_accum(ir, dq);
+        if (accum.is_sym) {
+          static const int sym_mla_order[] = {10, 11, 8, 9};
+          for (int oi = 0; oi < 4; oi++) {
+            int r = sym_mla_order[oi];
+            if (r < tcc_state->registers_for_allocator &&
+                (int_free & (1ull << r))) {
+              reg = r;
+              break;
+            }
+          }
+        }
+      }
+    }
     if (reg < 0 && !cur->crosses_call) {
-      /* Try caller-saved first, then callee-saved (only for non-call-crossing) */
+      /* Narrow-dense intervals prefer r4-r7 over r12 for 16-bit encodings; gates in docs/regalloc_narrow_pref.md */
       static const int alloc_order[] = {0, 1, 2, 3, 12, 4, 5, 6, 7, 8, 9, 10, 11};
-      for (int oi = 0; oi < 13; oi++) {
-        int r = alloc_order[oi];
-        if (r >= tcc_state->registers_for_allocator) continue;
-        if (int_free & (1ull << r)) { reg = r; break; }
+      static const int alloc_order_narrow[] = {0, 1, 2, 3, 4, 5, 6, 7, 12, 8, 9, 10, 11};
+      int narrow_dense = cur->narrow_uses > 0 &&
+                         (uint32_t)cur->narrow_uses * 8 >= (cur->end - cur->start);
+      const int *order = narrow_dense ? alloc_order_narrow : alloc_order;
+      for (int pass = 0; pass < 2 && reg < 0; pass++) {
+        for (int oi = 0; oi < 13; oi++) {
+          int r = order[oi];
+          if (r >= tcc_state->registers_for_allocator) continue;
+          if (!(int_free & (1ull << r))) continue;
+          if (pass == 0 && order == alloc_order_narrow) {
+            if (r >= 4 && r <= 7 && !(dirty_int & (1ull << r)) && !has_call &&
+                cur->narrow_uses < 2)
+              continue;
+            if (r >= 8 && r != 12)
+              continue;
+          }
+          reg = r;
+          break;
+        }
       }
     }
 
@@ -2845,6 +2922,45 @@ typedef struct RAPhiCopyRecord {
   int32_t src_vreg;
   int new_instr_idx;
 } RAPhiCopyRecord;
+
+typedef struct RAPhiStats {
+  int phi_operands;
+  int parallel_requested;
+  int parallel_emitted;
+  int cycle_temporaries;
+  int participant_spills;
+  int32_t *participants;
+  int participant_count;
+  int participant_cap;
+} RAPhiStats;
+
+static void ra_phi_stats_add_participant(RAPhiStats *stats, int32_t vreg)
+{
+  if (!TCC_LOG_LS || !stats || vreg < 0)
+    return;
+
+  for (int i = 0; i < stats->participant_count; i++)
+    if (stats->participants[i] == vreg)
+      return;
+
+  if (stats->participant_count >= stats->participant_cap) {
+    int cap = stats->participant_cap ? stats->participant_cap * 2 : 16;
+    stats->participants = tcc_realloc(stats->participants,
+                                      cap * sizeof(*stats->participants));
+    stats->participant_cap = cap;
+  }
+  stats->participants[stats->participant_count++] = vreg;
+}
+
+static int ra_phi_stats_has_participant(RAPhiStats *stats, int32_t vreg)
+{
+  if (!TCC_LOG_LS || !stats)
+    return 0;
+  for (int i = 0; i < stats->participant_count; i++)
+    if (stats->participants[i] == vreg)
+      return 1;
+  return 0;
+}
 
 #define RA_MAX_PHI_COPY_RECORDS 512
 
@@ -3247,8 +3363,9 @@ static void ra_emit_scheduled_phi_copies(TCCIRState *ir, IRQuadCompact *new_inst
                                          int *wp, int *pool_wp, RAPhiCopy *copies,
                                          int copy_count, int block,
                                          RAPhiCopyRecord *records, int *record_count,
-                                         int *phi_spill_cursor)
+                                         int *phi_spill_cursor, RAPhiStats *stats)
 {
+  int start_wp = *wp;
   int emitted = 0;
   while (emitted < copy_count) {
     int progress = 0;
@@ -3289,15 +3406,22 @@ static void ra_emit_scheduled_phi_copies(TCCIRState *ir, IRQuadCompact *new_inst
       };
       RA_DBG("SSA phi resolver: breaking cyclic parallel copy in block %d with T%d",
              block, TCCIR_DECODE_VREG_POSITION(tmp_vreg));
+      if (TCC_LOG_LS) {
+        stats->cycle_temporaries++;
+        ra_phi_stats_add_participant(stats, tmp_vreg);
+      }
       ra_emit_phi_copy(ir, new_instrs, wp, pool_wp, &save, records, record_count);
       copies[ci].src_vreg = tmp_vreg;
     }
   }
+  if (TCC_LOG_LS)
+    stats->parallel_emitted += *wp - start_wp;
 }
 
 static void ra_build_live_regs_bitmap(TCCIRState *ir);
 
-static void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa)
+static void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
+                            RAPhiStats *stats)
 {
   int nb = cfg->num_blocks;
   int old_n = ir->next_instruction_index;
@@ -3338,12 +3462,19 @@ static void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa)
   for (int sb = 0; sb < nb; sb++) {
     for (IRPhiNode *phi = ssa->block_phis[sb]; phi; phi = phi->next) {
       for (int pi = 0; pi < phi->num_operands; pi++) {
+        if (TCC_LOG_LS)
+          stats->phi_operands++;
         int pred = phi->operands[pi].pred_block;
         if (pred < 0 || pred >= nb) continue;
         if (phi->operands[pi].vreg < 0) continue;
         if (!ra_phi_copy_needed(ir, phi, pi)) continue;
         copies_per_block[pred]++;
         total_copies++;
+        if (TCC_LOG_LS) {
+          stats->parallel_requested++;
+          ra_phi_stats_add_participant(stats, phi->dest_vreg);
+          ra_phi_stats_add_participant(stats, phi->operands[pi].vreg);
+        }
         if (copies_to_jumpif_succ[pred] == sb)
           jumpif_edge_has_copy[pred] = 1;
       }
@@ -3463,7 +3594,7 @@ static void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa)
         RAPhiCopy *copies = tcc_malloc(sizeof(RAPhiCopy) * target_count);
         int copy_count = ra_collect_phi_copies_for_pred(ir, cfg, ssa, b, target_block, copies);
         ra_emit_scheduled_phi_copies(ir, new_instrs, &wp, &pool_wp, copies, copy_count, b,
-                                     copy_records, &copy_record_count, &phi_spill_cursor);
+                                     copy_records, &copy_record_count, &phi_spill_cursor, stats);
         tcc_free(copies);
 
         ir->iroperand_pool[pool_wp] = old_dest;
@@ -3494,7 +3625,7 @@ static void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa)
         RAPhiCopy *copies = tcc_malloc(sizeof(RAPhiCopy) * fallthrough_count);
         int copy_count = ra_collect_phi_copies_for_pred(ir, cfg, ssa, b, fallthrough_block, copies);
         ra_emit_scheduled_phi_copies(ir, new_instrs, &wp, &pool_wp, copies, copy_count, b,
-                                     copy_records, &copy_record_count, &phi_spill_cursor);
+                                     copy_records, &copy_record_count, &phi_spill_cursor, stats);
         tcc_free(copies);
       }
       continue;
@@ -3514,7 +3645,7 @@ static void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa)
       RAPhiCopy *copies = tcc_malloc(sizeof(RAPhiCopy) * copies_per_block[b]);
       int copy_count = ra_collect_phi_copies_for_pred(ir, cfg, ssa, b, -1, copies);
       ra_emit_scheduled_phi_copies(ir, new_instrs, &wp, &pool_wp, copies, copy_count, b,
-                                   copy_records, &copy_record_count, &phi_spill_cursor);
+                                   copy_records, &copy_record_count, &phi_spill_cursor, stats);
       tcc_free(copies);
     }
 
@@ -3809,6 +3940,51 @@ static void ra_co_ops(TCCIRState *ir, IRQuadCompact *q,
       else { *out_def = irop_get_vreg(d); *has_def = 1; }
     }
   }
+}
+
+/* Static counts of references from 16-bit-encodable ops; docs/regalloc_narrow_pref.md */
+static void ra_build_narrow_weights(TCCIRState *ir, const RegAllocTarget *target,
+                                    SSAInterval *intervals, int count, int max_vreg_pos)
+{
+  if (!target->op_narrow_capable || tcc_state->optimize < 1 || count <= 0 || max_vreg_pos <= 0)
+    return;
+  if (tcc_ir_opt_pass_disabled("ra:narrow_pref"))
+    return;
+  int tbl = 4 * max_vreg_pos;
+  int32_t *iv_of = tcc_malloc(sizeof(int32_t) * tbl);
+  for (int i = 0; i < tbl; i++) iv_of[i] = -1;
+  for (int i = 0; i < count; i++) {
+    int idx = TCCIR_DECODE_VREG_TYPE(intervals[i].vreg) * max_vreg_pos +
+              TCCIR_DECODE_VREG_POSITION(intervals[i].vreg);
+    if (idx >= 0 && idx < tbl) iv_of[idx] = i;
+  }
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP) continue;
+    int src2_imm = 0, scale = 0;
+    if (irop_config[q->op].has_src2)
+      src2_imm = irop_is_immediate(tcc_ir_op_get_src2(ir, q));
+    if (q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED) {
+      IROperand s = tcc_ir_op_get_scale(ir, q);
+      if (irop_get_tag(s) == IROP_TAG_IMM32) scale = s.u.imm32;
+    }
+    if (!target->op_narrow_capable(q->op, src2_imm, scale)) continue;
+    int32_t def, uses[4];
+    int has_def, nuse;
+    ra_co_ops(ir, q, &def, &has_def, uses, &nuse);
+    int32_t ops[5];
+    int nops = 0;
+    if (has_def) ops[nops++] = def;
+    for (int k = 0; k < nuse; k++) ops[nops++] = uses[k];
+    for (int k = 0; k < nops; k++) {
+      int idx = TCCIR_DECODE_VREG_TYPE(ops[k]) * max_vreg_pos +
+                TCCIR_DECODE_VREG_POSITION(ops[k]);
+      if (idx < 0 || idx >= tbl || iv_of[idx] < 0) continue;
+      SSAInterval *iv = &intervals[iv_of[idx]];
+      if (iv->narrow_uses < UINT16_MAX) iv->narrow_uses++;
+    }
+  }
+  tcc_free(iv_of);
 }
 
 #define RA_BS_SET(bs, i)  ((bs)[(i) >> 6] |= (1ull << ((i) & 63)))
@@ -4322,7 +4498,7 @@ static void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
           if (mnext[c] < 0) continue;    /* singleton */
           /* gather members, pick rep */
           int rep_iv = -1; uint32_t lo_s = 0xffffffffu, hi_e = 0;
-          int xcall = 0; uint32_t uc = 0, sum_len = 0;
+          int xcall = 0; uint32_t uc = 0, nuc = 0, sum_len = 0;
           for (int m = c; m >= 0; m = mnext[m]) {
             int ivi = iv_of[cand_vidx[m]];
             SSAInterval *iv = &intervals[ivi];
@@ -4330,6 +4506,7 @@ static void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
             if (iv->end > hi_e) hi_e = iv->end;
             xcall |= iv->crosses_call;
             uc += iv->use_count;
+            nuc += iv->narrow_uses;
             sum_len += iv->end - iv->start + 1;
             if (rep_iv < 0 || iv->start < intervals[rep_iv].start) rep_iv = ivi;
           }
@@ -4347,6 +4524,7 @@ static void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
           intervals[rep_iv].end = hi_e;
           intervals[rep_iv].crosses_call = xcall ? 1 : 0;
           intervals[rep_iv].use_count = (uc > 65535) ? 65535 : (uint16_t)uc;
+          intervals[rep_iv].narrow_uses = (nuc > 65535) ? 65535 : (uint16_t)nuc;
           /* Store the representative's VREG (stable across the scan's qsort),
            * not its array index. */
           int32_t rep_vreg = intervals[rep_iv].vreg;
@@ -4534,7 +4712,215 @@ static void ra_promote_multidef_temps_to_vars(TCCIRState *ir, IRCFG *cfg)
 void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill_base)
 {
   if (!ir || !target) return;
+  RAPhiStats phi_stats = {0};
   dbg_scan_overlap(ir, "ssa_regalloc_entry");
+
+  /* ssa:mem_init — frontend memory-init lowering (memset(0)+const stores →
+   * rodata BLOCK_COPY; small stack/global zero-memset → direct STORE #0).
+   * Runs first on raw flat IR, before cfg_cleanup and the loop transforms
+   * below, matching its former position at the head of the tccgen.c pipeline.
+   * Ungated by -O (the lowering also fires at -O0); knob
+   * TCC_DISABLE_PASS=ssa:mem_init.  See docs/plan_legacy_flat_ir_ssa_retire.md. */
+  if (tcc_state && !tcc_ir_opt_pass_disabled("ssa:mem_init"))
+    ssa_opt_mem_init(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:mem_init");
+
+  /* ssa:cfg_cleanup — GCC-style cleanup_cfg at SSA-pipeline entry: thread jump
+   * chains / drop fall-through jumps / NOP orphan flag-setters left by the flat
+   * pipeline, so the flat-region loop transforms below (reroll/licm/loop_rotate)
+   * see normalized control flow instead of trampoline chains they would rotate
+   * around and duplicate tests for.  When the cascade fired, re-run call-result
+   * demotion + the flat late_cleanup group (self-gated passes): collapsed
+   * diamonds expose dead pure calls / VLA allocs / stores those passes could
+   * not see on their earlier run. */
+  if (tcc_state && tcc_state->optimize >= 1 && tcc_state->opt_jump_threading &&
+      !tcc_ir_opt_pass_disabled("ssa:cfg_cleanup")) {
+    const IRPassGroup *groups;
+    int group_count;
+    tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
+    const IRPassGroup *cleanup_group = &groups[group_count - 1];
+    for (int outer = 0; outer < 3; outer++) {
+      int ch = 0;
+      for (int i = 0; i < 8; i++) {
+        int c = tcc_ir_opt_jump_threading(ir);
+        c += tcc_ir_opt_eliminate_fallthrough(ir);
+        c += tcc_ir_opt_jumpif_invert(ir, 0);
+        if (c)
+          tcc_ir_opt_compact_nops(ir);
+        if (tcc_state->opt_dce) {
+          c += tcc_ir_opt_orphan_cmp_elim(ir);
+          c += tcc_ir_opt_dce(ir);
+        }
+        ch += c;
+        if (!c)
+          break;
+      }
+      if (outer == 0 && !ch)
+        break;
+      IROptCtx cl_ctx;
+      tcc_ir_opt_ctx_init(&cl_ctx, ir);
+      if (tcc_state->opt_dead_store)
+        ch += tcc_ir_opt_gens_call_result_ex(&cl_ctx);
+      ch += tcc_ir_opt_run_group(&cl_ctx, cleanup_group);
+      tcc_ir_opt_ctx_free(&cl_ctx);
+      if (!ch)
+        break;
+    }
+  }
+  tcc_ir_dump_after_pass(ir, "ssa:cfg_cleanup");
+
+  /* ssa:struct_copy_roundtrip — drop the memmove(B,A);memmove(A,B) pair left
+   * by an inlined identity `y = retme(y)` helper.  The matcher needs the two
+   * copies in one straight line; the inline expansion leaves a fall-through
+   * JMP + target marker between them that only cfg_cleanup removes, so the
+   * tccgen-time call misses the pattern (20040709-2 fn1* family). */
+  if (tcc_state && tcc_state->opt_redundant_store &&
+      !tcc_ir_opt_pass_disabled("ssa:struct_copy_roundtrip"))
+    tcc_ir_opt_struct_copy_roundtrip_elim(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:struct_copy_roundtrip");
+
+  /* ssa:or_bool_diamond — fold `acc |= (cond ? 1 : 0)` stack-slot
+   * materialization into per-arm ORs.  Needs the STORE-slot/OR adjacency that
+   * cfg_cleanup's eliminate_fallthrough just created.  Gate matches the legacy
+   * tccgen.c call (opt_const_prop); knob TCC_DISABLE_PASS=ssa:or_bool_diamond. */
+  if (tcc_state && tcc_state->opt_const_prop && !tcc_ir_opt_pass_disabled("ssa:or_bool_diamond"))
+    ssa_opt_or_bool_diamond(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:or_bool_diamond");
+
+  /* ssa:stack_addr_simplify — deref-of-known-stack-addr → direct StackLoc; legacy gate; knob TCC_DISABLE_PASS=ssa:stack_addr_simplify */
+  if (tcc_state && tcc_state->opt_const_prop && !tcc_ir_opt_pass_disabled("ssa:stack_addr_simplify"))
+    tcc_ir_opt_stack_addr_simplify(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:stack_addr_simplify");
+
+  /* ssa:reroll — re-roll runs of identical macro-unrolled blocks into a counted
+   * loop.  Runs first in the flat region (preserving reroll's legacy "earliest
+   * loop transform" order) but now post-propagation: foldable runs are already
+   * collapsed by downstream const-prop, so only non-foldable repetition survives
+   * to re-roll, which fixes the legacy pre-propagation counterproductivity.
+   * Gated opt_reroll (-O2); knob TCC_DISABLE_PASS=ssa:reroll.
+   * See docs/plan_legacy_loop_reroll_ssa.md. */
+  if (tcc_state && tcc_state->opt_reroll && !tcc_ir_opt_pass_disabled("ssa:reroll")) {
+    /* compact the (N-1)*P NOPs a successful re-roll leaves so CFG/SSA below don't iterate them */
+    if (ssa_opt_reroll(ir))
+      tcc_ir_opt_compact_nops(ir);
+  }
+  tcc_ir_dump_after_pass(ir, "ssa:reroll");
+
+  /* ssa:licm — hoist loop invariants (arithmetic + pure/const calls) to the
+   * preheader before the other loop transforms and ssa:iv_strength_reduction,
+   * preserving the legacy "LICM before IV-SR" order now that both left tccgen.
+   * Reuses the proven licm.c engine; gated opt_licm (-O2); knob
+   * TCC_DISABLE_PASS=ssa:licm. */
+  if (tcc_state && tcc_state->opt_licm && !tcc_ir_opt_pass_disabled("ssa:licm"))
+    ssa_opt_licm(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:licm");
+
+  /* Loop rotation (ssa:loop_rotate): convert safe top-tested loops to
+   * bottom-tested on flat IR, before the CFG/SSA below are built, so the
+   * downstream SSA passes and regalloc see the rotated shape.  CFG/dominator
+   * based natural-loop detection driving the proven flat-IR rewrite; gated to
+   * -O1+ (matching the legacy pass and the SSA opt tier) and disableable via
+   * TCC_DISABLE_PASS=ssa:loop_rotate. */
+  if (tcc_state && tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("ssa:loop_rotate"))
+    ssa_opt_loop_rotate(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:loop_rotate");
+
+  /* First-iteration-exit peeling (ssa:first_iter_exit): eliminate top-tested
+   * loops whose header exit test is provably true on first entry, on flat IR
+   * after rotation (rotation declines these shapes; a rotated loop's guard is
+   * outside the loop so this pass declines rotated shapes — no overlap).
+   * Gate matches the legacy tccgen.c pass exactly (-O1+ with const-prop, so
+   * -fno-const-prop keeps its meaning for bisection); disableable via
+   * TCC_DISABLE_PASS=ssa:first_iter_exit. */
+  if (tcc_state && tcc_state->optimize >= 1 && tcc_state->opt_const_prop &&
+      !tcc_ir_opt_pass_disabled("ssa:first_iter_exit"))
+    ssa_opt_first_iter_exit(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:first_iter_exit");
+
+  /* Pointer-IV exit-value substitution (ssa:ptr_iv_exit_subst): rewrite
+   * post-loop pointer-IV reads to the closed-form exit address and fold the
+   * consuming `p != &a[N]` compares (pass-owned; nothing downstream folds
+   * them).  Gate matches the legacy tccgen.c pass (-O1+ with const-prop). */
+  if (tcc_state && tcc_state->optimize >= 1 && tcc_state->opt_const_prop &&
+      !tcc_ir_opt_pass_disabled("ssa:ptr_iv_exit_subst"))
+    ssa_opt_ptr_iv_exit_subst(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:ptr_iv_exit_subst");
+
+  /* Loop constant simulation (ssa:loop_const_sim): collapse register-only
+   * bounded-trip loops to residual final values on flat IR.  Gate matches the
+   * legacy tccgen.c Phase 4e pass exactly (opt_loop_unroll, -O2 default;
+   * -floop-unroll reaches it at lower levels; -fno-loop-unroll disables both
+   * it and the unroller, keeping the shared bisection knob).  Disableable via
+   * TCC_DISABLE_PASS=ssa:loop_const_sim. */
+  if (tcc_state && tcc_state->opt_loop_unroll &&
+      !tcc_ir_opt_pass_disabled("ssa:loop_const_sim"))
+    ssa_opt_loop_const_sim(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:loop_const_sim");
+
+  /* Loop unrolling / constant-trip elimination (ssa:loop_unroll): fully unroll
+   * or close-form-eliminate small constant/symbolic-trip register-only loops on
+   * flat IR after const_sim has starved it of its own candidates.  Same gate as
+   * the legacy tccgen.c Phase 5a pass (opt_loop_unroll); the SSA/regalloc
+   * pipeline folds the residual arithmetic (no post-unroll cascade replicated).
+   * Disableable via TCC_DISABLE_PASS=ssa:loop_unroll. */
+  if (tcc_state && tcc_state->opt_loop_unroll &&
+      !tcc_ir_opt_pass_disabled("ssa:loop_unroll"))
+    ssa_opt_loop_unroll(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:loop_unroll");
+
+  /* Induction-variable strength reduction (ssa:iv_strength_reduction): transform
+   * array-indexing recurrences base + i*stride into a maintained stride pointer
+   * (enabling post-increment addressing) and optionally eliminate the counter IV
+   * against a hoisted end pointer, on flat IR after rotation/const_sim/unroll
+   * have normalized and starved the loops.  Runs before ssa:decrement_to_zero,
+   * preserving the legacy "decrement_to_zero after IV-SR" order.  Gate matches
+   * the legacy tccgen.c Phase 6 pass (opt_iv_strength_red, -O1+); disableable via
+   * TCC_DISABLE_PASS=ssa:iv_strength_reduction. */
+  if (tcc_state && tcc_state->opt_iv_strength_red &&
+      !tcc_ir_opt_pass_disabled("ssa:iv_strength_reduction"))
+    ssa_opt_iv_strength_reduction(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:iv_strength_reduction");
+
+  /* Decrement-to-zero (ssa:decrement_to_zero): rewrite count-up pure-counter
+   * loops that ssa:loop_rotate turned bottom-tested (and const_sim/unroll left
+   * as side-effecting survivors) into count-down-to-zero so the backend fuses
+   * the latch SUB+CMP#0 into a flag-setting SUBS.  Flat IR before the CFG build
+   * below, so the NOPed guard's control-flow change is reflected downstream.
+   * Gated -O1+ (matches ssa:loop_rotate, the shape provider); disableable via
+   * TCC_DISABLE_PASS=ssa:decrement_to_zero. */
+  if (tcc_state && tcc_state->optimize >= 1 &&
+      !tcc_ir_opt_pass_disabled("ssa:decrement_to_zero"))
+    ssa_opt_decrement_to_zero(ir);
+  tcc_ir_dump_after_pass(ir, "ssa:decrement_to_zero");
+
+  /* Switch-value IPCP: fold calls to single-arg pure dispatchers whose arg is
+   * constant into ASSIGN #const, replaying any captured global stores at the
+   * call site.  Runs as the last flat transform, immediately before the CFG
+   * build, so the replayed stores are only ever seen by the SSA pipeline
+   * (which handles them correctly) and not by the legacy cfg_cleanup DSE,
+   * which drops a store still read by a following CMP.  (const_call_replace is
+   * store-free and runs early in gen_function so its constant cascades.) */
+  if (tcc_state && tcc_state->opt_ipc) {
+    int ipc_ch = 0;
+    if (!tcc_ir_opt_pass_disabled("ssa:switch_call_replace"))
+      ipc_ch += tcc_ir_opt_switch_call_replace(ir);
+    /* Re-run the flat propagation group so the freshly folded ASSIGN #const
+     * cascades through the caller.  switch_call_replace runs here (not early
+     * with const_call_replace) because it replays captured global stores that
+     * must bypass the legacy cfg_cleanup DSE; this re-run recovers the caller
+     * cascade it would otherwise lose.  Gated on an actual rewrite so non-IPCP
+     * functions pay nothing. */
+    if (ipc_ch && tcc_state->optimize >= 1) {
+      const IRPassGroup *groups;
+      int group_count;
+      tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
+      IROptCtx ipc_ctx;
+      tcc_ir_opt_ctx_init(&ipc_ctx, ir);
+      tcc_ir_opt_run_group(&ipc_ctx, &groups[0]);
+      tcc_ir_opt_ctx_free(&ipc_ctx);
+    }
+    tcc_ir_dump_after_pass(ir, "ssa:switch_call_replace");
+  }
 
   /* Build CFG + dominators */
   IRCFG *cfg = tcc_ir_cfg_build(ir);
@@ -4583,23 +4969,34 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   do                                                                                                                   \
   {                                                                                                                    \
     if (!tcc_ir_opt_pass_disabled(name))                                                                               \
-      (call);                                                                                                          \
+      np_changes += (call);                                                                                            \
     tcc_ir_dump_after_pass(ir, name);                                                                                  \
   } while (0)
         ssa_opt_ctx.no_stack_fwd = 0;
-        RUN_SSA("ssa:var_const_fold", ssa_opt_var_const_fold(&ssa_opt_ctx));
-        RUN_SSA("ssa:var_forward", ssa_opt_var_forward(&ssa_opt_ctx));
-        RUN_SSA("ssa:sccp", ssa_opt_sccp(&ssa_opt_ctx));
-        RUN_SSA("ssa:load_cse", ssa_opt_load_cse(&ssa_opt_ctx));
-        RUN_SSA("ssa:cprop", ssa_opt_cprop(&ssa_opt_ctx));
-        RUN_SSA("ssa:fold", ssa_opt_fold(&ssa_opt_ctx));
-        RUN_SSA("ssa:branch", ssa_opt_branch(&ssa_opt_ctx));
-        RUN_SSA("ssa:reassoc", ssa_opt_reassoc(&ssa_opt_ctx));
-        RUN_SSA("ssa:strength", ssa_opt_strength(&ssa_opt_ctx));
-        RUN_SSA("ssa:narrow", ssa_opt_narrow(&ssa_opt_ctx));
-        RUN_SSA("ssa:gvn", ssa_opt_gvn(&ssa_opt_ctx));
-        RUN_SSA("ssa:phi_simplify", ssa_opt_phi_simplify(&ssa_opt_ctx));
-        RUN_SSA("ssa:dce", ssa_opt_dce(&ssa_opt_ctx));
+        for (int np_iter = 0; np_iter < 5; np_iter++) {
+          int np_changes = 0;
+          RUN_SSA("ssa:var_const_fold", ssa_opt_var_const_fold(&ssa_opt_ctx));
+          RUN_SSA("ssa:var_forward", ssa_opt_var_forward(&ssa_opt_ctx));
+          RUN_SSA("ssa:sccp", ssa_opt_sccp(&ssa_opt_ctx));
+          RUN_SSA("ssa:load_cse", ssa_opt_load_cse(&ssa_opt_ctx));
+          RUN_SSA("ssa:const_string_fold", tcc_ir_ssa_opt_const_string_fold(&ssa_opt_ctx));
+          RUN_SSA("ssa:bitop_const_fold", tcc_ir_ssa_opt_bitop_const_fold(&ssa_opt_ctx));
+          RUN_SSA("ssa:ptr_store_dse", tcc_ir_ssa_opt_ptr_store_dse(&ssa_opt_ctx));
+          RUN_SSA("ssa:cprop", ssa_opt_cprop(&ssa_opt_ctx));
+          RUN_SSA("ssa:fold", ssa_opt_fold(&ssa_opt_ctx));
+          RUN_SSA("ssa:var_imm_prop", ssa_opt_var_imm_prop(&ssa_opt_ctx));
+          RUN_SSA("ssa:const_prop_tmp", ssa_opt_const_prop_tmp(&ssa_opt_ctx));
+          RUN_SSA("ssa:branch", ssa_opt_branch(&ssa_opt_ctx));
+          RUN_SSA("ssa:reassoc", ssa_opt_reassoc(&ssa_opt_ctx));
+          RUN_SSA("ssa:strength", ssa_opt_strength(&ssa_opt_ctx));
+          RUN_SSA("ssa:narrow", ssa_opt_narrow(&ssa_opt_ctx));
+          RUN_SSA("ssa:gvn", ssa_opt_gvn(&ssa_opt_ctx));
+          RUN_SSA("ssa:phi_simplify", ssa_opt_phi_simplify(&ssa_opt_ctx));
+          RUN_SSA("ssa:dce", ssa_opt_dce(&ssa_opt_ctx));
+          np_changes += tcc_ir_ssa_opt_guard_collapse(&ssa_opt_ctx);
+          if (!np_changes)
+            break;
+        }
         /* Target-specific fusions (MLA, LOAD/STORE_INDEXED on ARM). These
          * don't need promotable vars or phi nodes — they pattern-match on
          * existing TEMP vregs. */
@@ -4610,6 +5007,40 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
       ssa_opt_cprop(&ssa_opt_ctx);
       ssa_opt_dce(&ssa_opt_ctx);
     }
+    if (tcc_state && tcc_state->optimize >= 1 && tcc_state->opt_redundant_store &&
+        !tcc_ir_opt_pass_disabled("ssa:rmw_byte_clear")) {
+      int c = tcc_ir_opt_rmw_byte_clear(ir);
+      if (c && tcc_state->opt_dce)
+        ssa_opt_dce(&ssa_opt_ctx);
+    }
+    tcc_ir_dump_after_pass(ir, "ssa:rmw_byte_clear");
+    /* ssa:memmove_global_fwd — rerun of the tccgen-time init-copy-from-global
+     * forwarding.  Its read-only-slot precondition only becomes true here:
+     * ssa:struct_copy_roundtrip removes the retme pair and ssa:dce ret_store
+     * kills the write-back, both inside this pipeline — after the tccgen call
+     * already ran (20040709-2 fn1* family). */
+    if (tcc_state && tcc_state->optimize >= 1 && tcc_state->opt_redundant_store &&
+        !tcc_ir_opt_pass_disabled("ssa:memmove_global_fwd")) {
+      if (tcc_ir_opt_memmove_global_load_fwd(ir) > 0 && tcc_state->opt_dce) {
+        /* Flat pass: rebuild the SSA use chains it left stale, or the DCE
+         * worklist can't cascade the now-dead dest-LEA/ADD address temps. */
+        for (int p = 0; p < ssa_opt_ctx.vinfo_cap; p++)
+          ssa_opt_ctx.vinfo[p].use_count = 0;
+        for (int i = 0; i < ir->next_instruction_index; i++) {
+          IRQuadCompact *q = &ir->compact_instructions[i];
+          if (q->op != TCCIR_OP_NOP)
+            ssa_opt_scan_instr_uses(&ssa_opt_ctx, i, q);
+        }
+        ssa_opt_dce(&ssa_opt_ctx);
+      }
+    }
+    tcc_ir_dump_after_pass(ir, "ssa:memmove_global_fwd");
+    /* Park a global address that is reloaded across calls in a callee-saved
+     * register for its whole live range, instead of reloading it from the
+     * literal pool at each call-separated use.  Runs last so target fusions
+     * have already consumed the load/store-indexed bases they hoist; -O2 only
+     * (GCC likewise only parks globals at -O2).
+     * docs/plans/gap_a_ssa_var_index_addr_prop.md (gap ②). */
     tcc_ir_ssa_opt_free(&ssa_opt_ctx);
   }
   dbg_scan_imm_dest(ir, "ssa_opt_block"); dbg_scan_overlap(ir, "ssa_opt_block");
@@ -4701,7 +5132,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * is no longer in SSA form; ra_build_intervals scans the explicit
    * copies and produces concrete intervals. */
   ra_phi_resolve_pre_ra_mode = 1;
-  ra_resolve_phis(ir, cfg, ssa);
+  ra_resolve_phis(ir, cfg, ssa, &phi_stats);
   ra_phi_resolve_pre_ra_mode = 0;
   dbg_scan_imm_dest(ir,"ra_resolve_phis");
 
@@ -4740,6 +5171,28 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   if (tcc_state->optimize >= 1)
     tcc_ir_opt_const_memcpy_to_dest(ir);
 
+  /* Park a global address reloaded across calls in a callee-saved register for
+   * its whole live range instead of reloading it from the literal pool at each
+   * call-separated use.  Runs here — after phi resolution de-SSA'd the IR — so
+   * prepending entry materializations can't desync phi resolution; block_phis
+   * is emptied, so rebuilding the CFG (which the inserts invalidate) is safe.
+   * -O2 only (GCC likewise only parks globals at -O2).
+   * docs/plans/gap_a_ssa_var_index_addr_prop.md (gap ②). */
+  if (tcc_state && tcc_state->optimize >= 2 &&
+      !tcc_ir_opt_pass_disabled("ssa:global_addr_hoist") &&
+      tcc_ir_ssa_opt_global_addr_hoist(ir) > 0) {
+    tcc_ir_cfg_free(cfg);
+    cfg = tcc_ir_cfg_build(ir);
+    tcc_ir_cfg_compute_dominators(cfg);
+    ssa->cfg = cfg;
+    /* block_phis is sized to the old block count and consumed by
+     * ra_build_intervals; the fresh CFG may have a different count. It is
+     * all-NULL post-resolution, so resize and zero it to the new count. */
+    ssa->block_phis = tcc_realloc(ssa->block_phis, cfg->num_blocks * sizeof(IRPhiNode *));
+    memset(ssa->block_phis, 0, cfg->num_blocks * sizeof(IRPhiNode *));
+  }
+  tcc_ir_dump_after_pass(ir, "ssa:global_addr_hoist");
+
   /* Build call prefix for call-crossing detection */
   int *call_prefix = ra_build_call_prefix(ir);
 
@@ -4748,6 +5201,7 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   int interval_count = 0;
   int max_vreg_pos = 0;
   ra_build_intervals(ir, cfg, ssa, &intervals, &interval_count, call_prefix, &max_vreg_pos);
+  ra_build_narrow_weights(ir, target, intervals, interval_count, max_vreg_pos);
 
   /* Build phi register hints. block_phis is empty after pre-RA resolution,
    * so the phi-based pass is a no-op; the assign-based pass picks up
@@ -4765,7 +5219,10 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
 
   /* Run linear scan */
   uint64_t dirty_int = 0, dirty_fp = 0;
-  ra_linear_scan(ir, intervals, interval_count, target, spill_base, &dirty_int, &dirty_fp, max_vreg_pos);
+  int n_instr = ir->next_instruction_index;
+  int has_call = call_prefix && n_instr > 0 && call_prefix[n_instr] > 0;
+  ra_linear_scan(ir, intervals, interval_count, target, spill_base, &dirty_int, &dirty_fp,
+                 max_vreg_pos, has_call);
 
   /* Propagate each coalesced member's allocation from its representative (which
    * the scan allocated; members were skipped).  coalesce_to holds the rep's
@@ -4789,6 +5246,18 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
     }
   }
 
+  if (TCC_LOG_LS) {
+    for (int i = 0; i < interval_count; i++) {
+      if (intervals[i].stack_location != 0 &&
+          ra_phi_stats_has_participant(&phi_stats, intervals[i].vreg))
+        phi_stats.participant_spills++;
+    }
+    LOG_LS("phi_stats operands=%d parallel_requested=%d parallel_emitted=%d cycle_temporaries=%d participant_spills=%d",
+           phi_stats.phi_operands, phi_stats.parallel_requested,
+           phi_stats.parallel_emitted, phi_stats.cycle_temporaries,
+           phi_stats.participant_spills);
+  }
+
   /* Write results to IR + LS state */
   ra_write_results(ir, intervals, interval_count);
   ir->ls.dirty_registers = dirty_int;
@@ -4808,7 +5277,10 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * bitmaps — keeps the allocation identical and only drops dead instructions. */
   ra_eliminate_dead_reg_copies(ir);
 
+  ra_repair_incomplete_calls(ir);
+
   /* Cleanup */
+  tcc_free(phi_stats.participants);
   tcc_free(intervals);
   if (call_prefix) tcc_free(call_prefix);
   tcc_ir_ssa_free(ssa);
@@ -4827,11 +5299,44 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
  * successful coalescing eliminates the copy without modifying the IR.
  * ============================================================================ */
 
+static int ra_count_copies_reaching_codegen(TCCIRState *ir)
+{
+  int copies = 0;
+
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ASSIGN)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    IROperand src = tcc_ir_op_get_src1(ir, q);
+    int32_t dest_vreg = irop_get_vreg(dest);
+    int32_t src_vreg = irop_get_vreg(src);
+    if (dest.is_lval || src.is_lval || dest_vreg < 0 || src_vreg < 0)
+      continue;
+    if (irop_get_btype(dest) != irop_get_btype(src)) {
+      copies++;
+      continue;
+    }
+
+    IRLiveInterval *dest_li = tcc_ir_vreg_live_interval(ir, dest_vreg);
+    IRLiveInterval *src_li = tcc_ir_vreg_live_interval(ir, src_vreg);
+    if (!ra_phi_copy_is_identity(dest_li, src_li))
+      copies++;
+  }
+
+  return copies;
+}
+
 int tcc_ir_move_coalescing(TCCIRState *ir)
 {
   LSLiveIntervalState *ls = &ir->ls;
-  if (!ls->live_regs_by_instruction || ls->live_regs_by_instruction_size <= 0)
+  if (!ls->live_regs_by_instruction || ls->live_regs_by_instruction_size <= 0) {
+    if (TCC_LOG_LS)
+      LOG_LS("copy_stats coalesced=0 reaching_codegen=%d",
+             ra_count_copies_reaching_codegen(ir));
     return 0;
+  }
 
   int coalesced = 0;
   const int n = ir->next_instruction_index;
@@ -5166,6 +5671,10 @@ rev_check_done:
 
   if (coalesced > 0)
     tcc_ls_recompute_dirty_registers(ls);
+
+  if (TCC_LOG_LS)
+    LOG_LS("copy_stats coalesced=%d reaching_codegen=%d", coalesced,
+           ra_count_copies_reaching_codegen(ir));
 
   return coalesced;
 }

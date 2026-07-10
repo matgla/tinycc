@@ -37,6 +37,7 @@ typedef struct RegAllocTarget {
   RegAllocClass fp_class;
   int param_regs;        /* number of parameter registers (e.g. 4) */
   int static_chain_reg;  /* -1 if none */
+  int (*op_narrow_capable)(int op, int src2_is_imm, int scale); /* op has a 16-bit encoding when operands land in low regs; NULL = no narrow forms */
 } RegAllocTarget;
 
 void tcc_ir_ssa_regalloc(struct TCCIRState *ir, const RegAllocTarget *target, int spill_base);

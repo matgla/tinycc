@@ -13,6 +13,7 @@
 #define USING_GLOBALS
 #include "tcc.h"
 #include "ir/opt/ssa_opt.h"
+#include "opt/ssa/strength.h"
 
 /* From tccgen.c - used only for debug/dump messages. */
 const char *funcname = "unit_test";
@@ -74,6 +75,18 @@ int tcc_ir_ssa_opt_run_target(IRSSAOptCtx *ctx)
   return 0;
 }
 
+int tcc_ir_ssa_opt_guard_collapse(IRSSAOptCtx *ctx)
+{
+  (void)ctx;
+  return 0;
+}
+
+int tcc_ir_ssa_opt_ptr_store_dse(IRSSAOptCtx *ctx)
+{
+  (void)ctx;
+  return 0;
+}
+
 /* Target generator registration - no target generators for RA tests. */
 void tcc_ir_ssa_opt_register_target(const struct IRSSAOptGen *gens, int count)
 {
@@ -93,9 +106,14 @@ int ssa_opt_branch(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_cmp_eq_prop(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_sccp(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_load_cse(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
+int tcc_ir_ssa_opt_const_string_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
+int tcc_ir_ssa_opt_bitop_const_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
+int tcc_ir_ssa_opt_global_addr_hoist(TCCIRState *ir) { (void)ir; return 0; }
 int ssa_opt_var_forward(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_var_to_param_forward(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_var_const_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
+int ssa_opt_var_imm_prop(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
+int ssa_opt_const_prop_tmp(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_dead_loop(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 
 /* Use-def helpers - real implementations (mirrors ir/opt/ssa_opt.c, which is
@@ -146,6 +164,35 @@ void ssa_opt_remove_use_instr(struct IRSSAVregInfo *vi, int instr_idx)
     if (vi->uses[i].kind == SSA_USE_INSTR && vi->uses[i].idx == instr_idx) {
       vi->uses[i] = vi->uses[--vi->use_count];
       return;
+    }
+  }
+}
+
+void ssa_opt_scan_instr_uses(IRSSAOptCtx *ctx, int i, IRQuadCompact *q)
+{
+  TCCIRState *ir = ctx->ir;
+  if (irop_config[q->op].has_src1) {
+    struct IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(tcc_ir_op_get_src1(ir, q)));
+    if (vi)
+      ssa_opt_add_use_instr(vi, i);
+  }
+  if (irop_config[q->op].has_src2) {
+    struct IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(tcc_ir_op_get_src2(ir, q)));
+    if (vi)
+      ssa_opt_add_use_instr(vi, i);
+  }
+  if (q->op == TCCIR_OP_MLA) {
+    struct IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(tcc_ir_op_get_accum(ir, q)));
+    if (vi)
+      ssa_opt_add_use_instr(vi, i);
+  }
+  if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+      q->op == TCCIR_OP_STORE_POSTINC) {
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (!(q->op == TCCIR_OP_STORE && !d.is_lval)) {
+      struct IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(d));
+      if (vi)
+        ssa_opt_add_use_instr(vi, i);
     }
   }
 }
