@@ -105,11 +105,15 @@ non-self operands are one value. A structural Tarjan pass also collapses
 mutually recursive phi components when they have exactly one external defined
 value and compatible types. Group replacement is preflighted atomically, so a
 protected use on any member preserves the whole component. All-self,
-all-undefined, and multi-value components remain for later passes.
+all-undefined, and multi-value components remain for later passes. A congruent
+pass then merges phis in the same block that carry identical
+`(pred_block -> vreg)` operand maps and type, keeping the first as
+representative; operand matching is by predecessor edge, not slot order, and
+uses exact vreg equality only. The three transforms iterate to a joint fixed
+point, since each can expose new opportunities for the others.
 
 Build with `TCC_LOG_IR_GEN=1` to report phis and operands before each
-simplification run, phis afterward, and trivial/SCC/congruent removals. The
-congruent count remains zero until that structural pass is enabled.
+simplification run, phis afterward, and trivial/SCC/congruent removals.
 
 Build with `TCC_LOG_LS=1` for out-of-SSA and allocation statistics:
 

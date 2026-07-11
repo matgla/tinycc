@@ -134,10 +134,6 @@ int ssa_opt_narrow(IRSSAOptCtx *ctx);
 /* Block reachability from current IR terminators (the static CFG is stale
  * after branch folds).  malloc'd array [num_blocks], caller frees. */
 uint8_t *ssa_opt_compute_reachable_blocks(IRSSAOptCtx *ctx);
-/* CMP equality-fact propagation: walks the dom tree pushing equality
- * facts from CMP+JEQ/JNE and folds redundant compares whose result is
- * already known on the current dominated path. */
-int ssa_opt_cmp_eq_prop(IRSSAOptCtx *ctx);
 int ssa_opt_sccp(IRSSAOptCtx *ctx);
 int ssa_opt_load_cse(IRSSAOptCtx *ctx);
 int ssa_opt_var_forward(IRSSAOptCtx *ctx);

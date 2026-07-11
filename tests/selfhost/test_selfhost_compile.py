@@ -84,7 +84,6 @@ SELFHOST_COMPILE_SOURCES = [
     "ir/opt/ssa_opt_sccp.c",
     "ir/opt/ssa_opt_load_cse.c",
     "ir/opt/ssa_opt_dead_loop.c",
-    "ir/opt/ssa_opt_cmp_eq.c",
     # ARMv8-M backend
     "arm-thumb-gen.c",
     "arm-thumb-callsite.c",

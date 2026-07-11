@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "ssa_opt.h"
+#include "opt_ssa_domwalk.h"
 
 /* ============================================================================
  * Dominator-Tree Global Value Numbering
@@ -309,14 +310,6 @@ static int gvn_local_eq(const GVNEntry *e,
          e->s3_tag == t3 && e->s3_lval == l3 && e->src3 == v3 && e->imm3 == m3 && e->sym3 == y3;
 }
 
-/* Worklist item for the iterative dominator-tree walk below.  kind==0 is a
- * block to process; kind==1 is a deferred "restore the GVN scope to this undo
- * watermark", scheduled to run after the block's whole subtree completes. */
-typedef struct GVNWork {
-  int kind;
-  int value;
-} GVNWork;
-
 /* Would consumer instr at use_idx itself CSE once cur_vr is replaced by rep_vr? */
 static int gvn_consumer_would_cse(IRSSAOptCtx *ctx, GVNEntry **table, int use_idx,
                                   int32_t cur_vr, int32_t rep_vr)
@@ -562,35 +555,37 @@ static int gvn_try_cmp_setif(IRSSAOptCtx *ctx, GVNEntry **table, GVNEntry *lcach
   return 0;
 }
 
-static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int b_root)
+/* Availability table threaded through the domwalk engine's `state`.  The undo
+ * stack, entry pool and param-mutated bitmap stay file-static (reset per
+ * ssa_opt_gvn call); only the hash table varies per hook invocation. */
+typedef struct GVNState {
+  GVNEntry **table;
+} GVNState;
+
+static int gvn_mark(void *state)
+{
+  (void)state;
+  return undo_count;
+}
+
+static void gvn_reset(void *state, int watermark)
+{
+  (void)state;
+  gvn_scope_pop_to(watermark);
+}
+
+/* Value-number one block, adding availability entries visible to its dominator
+ * subtree.  The scope pushed here is restored by gvn_reset after the subtree,
+ * so sibling subtrees are independent (DFS order among them is irrelevant). */
+static int gvn_visit(IRSSAOptCtx *ctx, int b, void *state)
 {
   TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+  GVNEntry **table = ((GVNState *)state)->table;
+  IRBasicBlock *bb = &cfg->blocks[b];
   int changes = 0;
-
-  /* Iterative DFS with a heap worklist instead of native recursion.  The
-   * recursion was once-per-dominator-child deep, so functions with deep
-   * branch nesting (one `if` per source statement) overflowed the 32 KB
-   * target process stack.  The scoped-availability semantics are preserved
-   * by pushing a POP marker (kind==1) before a block's children: it sits
-   * below them on the stack and so runs only after the entire subtree, just
-   * like the post-recursion gvn_scope_pop_to(saved_undo) it replaces. */
-  GVNWork *stack = tcc_malloc(sizeof *stack * 16);
-  int sp = 0, cap = 16;
-  stack[sp].kind = 0;
-  stack[sp].value = b_root;
-  sp++;
-
-  while (sp > 0) {
-    sp--;
-    if (stack[sp].kind == 1) {
-      gvn_scope_pop_to(stack[sp].value);
-      continue;
-    }
-    int b = stack[sp].value;
-    IRBasicBlock *bb = &cfg->blocks[b];
-    int saved_undo = undo_count;
-    GVNEntry lcache[GVN_LOCAL_MAX];
-    int lcount = 0;
+  GVNEntry lcache[GVN_LOCAL_MAX];
+  int lcount = 0;
 
   for (int i = bb->start_idx; i < bb->end_idx; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -846,26 +841,6 @@ static int gvn_process_block(IRSSAOptCtx *ctx, IRCFG *cfg, GVNEntry **table, int
     gvn_scope_push(table, e);
   }
 
-    /* Schedule the hash-table restore for after this block's subtree, then
-     * push the dominator-tree children above it.  Entries from this block
-     * remain visible to its children (the dominator guarantees availability);
-     * sibling subtrees are independent, so DFS order among them is irrelevant. */
-    if (sp + 1 + bb->num_dom_children > cap) {
-      while (sp + 1 + bb->num_dom_children > cap)
-        cap *= 2;
-      stack = tcc_realloc(stack, sizeof *stack * cap);
-    }
-    stack[sp].kind = 1;
-    stack[sp].value = saved_undo;
-    sp++;
-    for (int ci = 0; ci < bb->num_dom_children; ci++) {
-      stack[sp].kind = 0;
-      stack[sp].value = bb->dom_children[ci];
-      sp++;
-    }
-  } /* while (sp > 0) */
-
-  tcc_free(stack);
   return changes;
 }
 
@@ -941,7 +916,15 @@ int ssa_opt_gvn(IRSSAOptCtx *ctx)
   param_mutated_cap = 0;
   gvn_param_scan(ctx->ir);
 
-  int changes = gvn_process_block(ctx, cfg, table, 0);
+  GVNState st = { .table = table };
+  OptSSADomWalk walk = {
+    .state = &st,
+    .mark = gvn_mark,
+    .reset = gvn_reset,
+    .enter = NULL,
+    .visit = gvn_visit,
+  };
+  int changes = opt_ssa_domwalk(ctx, &walk);
 
   tcc_free(undo_stack);
   undo_stack = NULL;

@@ -6,7 +6,7 @@
  *  codegen preparation are the backend's job, driven by gen_function
  *  (source/backend/generators/); see function_pipeline.h.
  *
- *  Copyright (c) 2025 Mateusz Stadnik
+ *  Copyright (c) 2026 Mateusz Stadnik
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public

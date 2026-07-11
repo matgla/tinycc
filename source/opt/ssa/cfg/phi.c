@@ -218,6 +218,57 @@ static int phi_scc_eliminate_once(IRSSAOptCtx *ctx)
   return changes;
 }
 
+static int phi_congruent(const IRPhiNode *a, const IRPhiNode *b)
+{
+  if (a->btype != b->btype || a->num_operands != b->num_operands)
+    return 0;
+
+  for (int i = 0; i < a->num_operands; i++) {
+    int pred = a->operands[i].pred_block;
+    int32_t v = a->operands[i].vreg;
+    int found = 0;
+    for (int j = 0; j < b->num_operands; j++) {
+      if (b->operands[j].pred_block != pred)
+        continue;
+      if (b->operands[j].vreg != v)
+        return 0;
+      found = 1;
+      break;
+    }
+    if (!found)
+      return 0;
+  }
+  return 1;
+}
+
+static int phi_congruent_eliminate_once(IRSSAOptCtx *ctx)
+{
+  int changes = 0;
+
+  for (int b = 0; b < ctx->cfg->num_blocks; b++) {
+    for (IRPhiNode *rep = ctx->ssa->block_phis[b]; rep; rep = rep->next) {
+      IRPhiNode **link = &rep->next;
+      while (*link) {
+        IRPhiNode *dup = *link;
+        if (!phi_congruent(rep, dup) ||
+            !opt_dsl_phi_metadata_valid(ctx, b, dup) ||
+            !ssa_opt_can_replace_all_uses(ctx, dup->dest_vreg)) {
+          link = &(*link)->next;
+          continue;
+        }
+
+        ssa_opt_replace_all_uses(ctx, dup->dest_vreg, rep->dest_vreg);
+        if (!opt_dsl_phi_remove(ctx, b, link)) {
+          link = &(*link)->next;
+          continue;
+        }
+        changes++;
+      }
+    }
+  }
+  return changes;
+}
+
 int ssa_opt_phi_simplify(IRSSAOptCtx *ctx)
 {
   int phis_before = 0;
@@ -229,20 +280,25 @@ int ssa_opt_phi_simplify(IRSSAOptCtx *ctx)
 
   int trivial_changes = 0;
   int scc_changes = 0;
-  int structural_changes;
-  do {
-    trivial_changes += opt_dsl_run_phi_rules(
+  int congruent_changes = 0;
+  for (;;) {
+    int trivial = opt_dsl_run_phi_rules(
         ctx, phi_rules, OPT_DSL_TABLE_COUNT(phi_rules));
-    structural_changes = phi_scc_eliminate_once(ctx);
-    scc_changes += structural_changes;
-  } while (structural_changes > 0);
-  int changes = trivial_changes + scc_changes;
+    int scc = phi_scc_eliminate_once(ctx);
+    int congruent = phi_congruent_eliminate_once(ctx);
+    trivial_changes += trivial;
+    scc_changes += scc;
+    congruent_changes += congruent;
+    if (trivial + scc + congruent == 0)
+      break;
+  }
+  int changes = trivial_changes + scc_changes + congruent_changes;
 
   if (TCC_LOG_IR_GEN) {
     phis_after = opt_dsl_phi_count(ctx, NULL);
-    LOG_IR_GEN("ssa:phi_simplify phis_before=%d phis_after=%d operands_before=%d trivial_removed=%d scc_removed=%d congruent_removed=0",
+    LOG_IR_GEN("ssa:phi_simplify phis_before=%d phis_after=%d operands_before=%d trivial_removed=%d scc_removed=%d congruent_removed=%d",
                phis_before, phis_after, operands_before, trivial_changes,
-               scc_changes);
+               scc_changes, congruent_changes);
   }
 
   return changes;

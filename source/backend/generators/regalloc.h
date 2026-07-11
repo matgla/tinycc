@@ -11,7 +11,7 @@
  * gen_function (function.c) drives the sequence: it runs the optimizer
  * (source/opt), then calls into these two entry points.
  *
- *  Copyright (c) 2025 Mateusz Stadnik
+ *  Copyright (c) 2026 Mateusz Stadnik
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public

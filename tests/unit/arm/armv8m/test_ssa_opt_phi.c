@@ -355,6 +355,150 @@ UT_TEST(test_phi_simplify_scc_protected_use_is_atomic)
 }
 
 /* ========================================================================
+ * Congruent phis: two phis with identical (pred_block -> vreg) maps merge
+ * ======================================================================== */
+
+UT_TEST(test_phi_simplify_congruent_exact_merge)
+{
+  ssa_ctx c = ssa_ctx_new(1, 12);
+  ssa_ctx_init_manual(&c);
+  int32_t x = utb_vreg(utb_temp(3, I32));
+  int32_t y = utb_vreg(utb_temp(4, I32));
+  int32_t a = utb_vreg(utb_temp(5, I32));
+  int32_t b = utb_vreg(utb_temp(6, I32));
+
+  /* a added first, b second: b is the list head, so b is the representative. */
+  ssa_add_phi(&c, 0, a, (int32_t[]){ x, y }, 2);
+  ssa_add_phi(&c, 0, b, (int32_t[]){ x, y }, 2);
+  int use_a = ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(7, I32),
+                            utb_temp(5, I32));
+  int use_b = ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(8, I32),
+                            utb_temp(6, I32));
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_phi_simplify(c.ctx), 1);
+  UT_ASSERT_EQ(ssa_block_phi_count(&c, 0), 1);
+  UT_ASSERT_EQ(irop_get_vreg(ssa_instr_src1(&c, use_a)), b);
+  UT_ASSERT_EQ(irop_get_vreg(ssa_instr_src1(&c, use_b)), b);
+  UT_ASSERT_EQ(ssa_vinfo(&c, a)->def_phi_block, -1);
+  UT_ASSERT_EQ(ssa_vinfo(&c, a)->use_count, 0);
+  UT_ASSERT_EQ(ssa_vinfo(&c, b)->use_count, 2);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Different value on a shared edge → not congruent, kept
+ * ======================================================================== */
+
+UT_TEST(test_phi_simplify_congruent_diff_value_kept)
+{
+  ssa_ctx c = ssa_ctx_new(1, 12);
+  ssa_ctx_init_manual(&c);
+  int32_t x = utb_vreg(utb_temp(3, I32));
+  int32_t y = utb_vreg(utb_temp(4, I32));
+  int32_t z = utb_vreg(utb_temp(9, I32));
+  int32_t a = utb_vreg(utb_temp(5, I32));
+  int32_t b = utb_vreg(utb_temp(6, I32));
+
+  ssa_add_phi(&c, 0, a, (int32_t[]){ x, y }, 2);
+  ssa_add_phi(&c, 0, b, (int32_t[]){ x, z }, 2);
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_phi_simplify(c.ctx), 0);
+  UT_ASSERT_EQ(ssa_block_phi_count(&c, 0), 2);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Same operand set, swapped predecessor mapping → not congruent, kept
+ * ======================================================================== */
+
+UT_TEST(test_phi_simplify_congruent_swapped_preds_kept)
+{
+  ssa_ctx c = ssa_ctx_new(1, 12);
+  ssa_ctx_init_manual(&c);
+  int32_t x = utb_vreg(utb_temp(3, I32));
+  int32_t y = utb_vreg(utb_temp(4, I32));
+  int32_t a = utb_vreg(utb_temp(5, I32));
+  int32_t b = utb_vreg(utb_temp(6, I32));
+
+  ssa_add_phi(&c, 0, a, (int32_t[]){ x, y }, 2);
+  ssa_add_phi(&c, 0, b, (int32_t[]){ y, x }, 2);
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_phi_simplify(c.ctx), 0);
+  UT_ASSERT_EQ(ssa_block_phi_count(&c, 0), 2);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Type mismatch → not congruent, kept
+ * ======================================================================== */
+
+UT_TEST(test_phi_simplify_congruent_type_mismatch_kept)
+{
+  ssa_ctx c = ssa_ctx_new(1, 12);
+  ssa_ctx_init_manual(&c);
+  int32_t x = utb_vreg(utb_temp(3, I32));
+  int32_t y = utb_vreg(utb_temp(4, I32));
+  int32_t a = utb_vreg(utb_temp(5, I32));
+  int32_t b = utb_vreg(utb_temp(6, I32));
+
+  ssa_add_phi(&c, 0, a, (int32_t[]){ x, y }, 2);
+  ssa_add_phi(&c, 0, b, (int32_t[]){ x, y }, 2);
+  c.ssa->block_phis[0]->btype = IROP_BTYPE_FLOAT32;
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_phi_simplify(c.ctx), 0);
+  UT_ASSERT_EQ(ssa_block_phi_count(&c, 0), 2);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Protected use on the duplicate → merge skipped, both kept
+ * ======================================================================== */
+
+UT_TEST(test_phi_simplify_congruent_protected_use_kept)
+{
+  ssa_ctx c = ssa_ctx_new(1, 12);
+  ssa_ctx_init_manual(&c);
+  int32_t x = utb_vreg(utb_temp(3, I32));
+  int32_t y = utb_vreg(utb_temp(4, I32));
+  int32_t a = utb_vreg(utb_temp(5, I32));
+  int32_t b = utb_vreg(utb_temp(6, I32));
+
+  ssa_add_phi(&c, 0, a, (int32_t[]){ x, y }, 2);
+  ssa_add_phi(&c, 0, b, (int32_t[]){ x, y }, 2);
+  int use_i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(7, I32),
+                             utb_temp(3, I32), utb_temp(5, I32));
+  ssa_ctx_rebuild(&c);
+
+  int oi = c.ir->compact_instructions[use_i].orig_index;
+  uint8_t *barrel_shifts = tcc_mallocz((size_t)(oi + 1));
+  barrel_shifts[oi] = 1;
+  c.ir->barrel_shifts = barrel_shifts;
+  c.ir->barrel_shifts_len = oi + 1;
+
+  UT_ASSERT_EQ(ssa_opt_phi_simplify(c.ctx), 0);
+  UT_ASSERT_EQ(ssa_block_phi_count(&c, 0), 2);
+  UT_ASSERT_EQ(irop_get_vreg(ssa_instr_src2(&c, use_i)), a);
+
+  c.ir->barrel_shifts = NULL;
+  c.ir->barrel_shifts_len = 0;
+  tcc_free(barrel_shifts);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
  * Suite registration
  * ======================================================================== */
 
@@ -373,4 +517,9 @@ UT_SUITE(ssa_opt_phi)
   UT_RUN(test_phi_simplify_scc_incompatible_types_kept);
   UT_RUN(test_phi_simplify_scc_without_external_value_kept);
   UT_RUN(test_phi_simplify_scc_protected_use_is_atomic);
+  UT_RUN(test_phi_simplify_congruent_exact_merge);
+  UT_RUN(test_phi_simplify_congruent_diff_value_kept);
+  UT_RUN(test_phi_simplify_congruent_swapped_preds_kept);
+  UT_RUN(test_phi_simplify_congruent_type_mismatch_kept);
+  UT_RUN(test_phi_simplify_congruent_protected_use_kept);
 }

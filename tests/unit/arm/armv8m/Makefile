@@ -193,7 +193,7 @@ UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/arm-thumb-callsite.c \
 	$(TOP)/ir/opt/ssa_opt.c \
 	$(TOP)/source/opt/ssa/cfg/branch.c \
-	$(TOP)/ir/opt/ssa_opt_cmp_eq.c \
+	$(TOP)/source/opt/ssa/cfg/cmp_eq.c \
 	$(TOP)/ir/opt/ssa_opt_cprop.c \
 	$(TOP)/ir/opt/ssa_opt_dce.c \
 	$(TOP)/ir/opt/ssa_opt_dead_loop.c \
@@ -1171,7 +1171,7 @@ UT11_MODULE_SRCS := \
 	$(TOP)/ir/opt/ssa_opt_sccp.c \
 	$(TOP)/ir/opt/ssa_opt_load_cse.c \
 	$(TOP)/source/opt/ssa/cfg/branch.c \
-	$(TOP)/ir/opt/ssa_opt_cmp_eq.c \
+	$(TOP)/source/opt/ssa/cfg/cmp_eq.c \
 	$(TOP)/ir/opt/ssa_opt_reassoc.c \
 	$(TOP)/source/opt/ssa/scalar/narrow.c \
 	$(TOP)/source/opt/ssa/cfg/phi.c \
@@ -1203,6 +1203,8 @@ UT11_LOCAL_SRCS := \
 	test_ssa_opt_fold.c \
 	test_ssa_opt_phi.c \
 	test_ssa_opt_branch.c \
+	test_ssa_opt_cmp_eq.c \
+	test_opt_ssa_domwalk.c \
 	test_opt_dsl_pair.c \
 	test_opt_dsl_phi.c \
 	stubs.c \

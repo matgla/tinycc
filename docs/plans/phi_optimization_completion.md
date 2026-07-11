@@ -104,7 +104,15 @@ unconditional output.
 
 ---
 
-## Phase 3: Trivial Phi SCC Elimination
+## Phase 3: Trivial Phi SCC Elimination — LANDED
+
+Landed in `source/opt/ssa/cfg/phi.c` (`phi_scc_eliminate_once` /
+`phi_scc_remove_component`, Tarjan SCC) and driven from the
+`ssa_opt_phi_simplify` fixpoint loop. Full regression coverage lives in
+`tests/unit/arm/armv8m/test_ssa_opt_phi.c` (two/three-phi cycles collapse,
+two-external-value kept, all-self/undef kept, incompatible-type kept, atomic
+protected-use kept, use-count/def-metadata correctness). Validation: 282/282
+ssaopt unit tests pass; `make test` green (13529 passed, 246 skipped, 1 xfailed).
 
 ### Missing Case
 
@@ -154,7 +162,18 @@ inside a single `OPT_GEN_PHI` callback.
 
 ---
 
-## Phase 4: Congruent Phi Elimination
+## Phase 4: Congruent Phi Elimination — LANDED
+
+Landed in `source/opt/ssa/cfg/phi.c` (`phi_congruent` /
+`phi_congruent_eliminate_once`), wired into the `ssa_opt_phi_simplify` joint
+fixpoint alongside trivial + SCC. Operands are matched by `pred_block`
+(not slot order) with exact vreg equality; btype must match; the first phi in
+the block list is kept as representative; removal is preflighted with
+`ssa_opt_can_replace_all_uses` and performed through the Phase 1 helper.
+Coverage in `tests/unit/arm/armv8m/test_ssa_opt_phi.c`: exact merge with
+use redirection, differing edge value kept, swapped predecessor mapping kept,
+type mismatch kept, protected-use kept. Validation: 287/287 ssaopt unit tests
+pass; `make test` green (13529 passed, 246 skipped, 1 xfailed).
 
 ### Missing Case
 
@@ -192,22 +211,69 @@ equivalence for operands; edge copies can carry necessary out-of-SSA semantics.
 
 ---
 
-## Phase 5: Reassess Codegen Opportunities
+## Phase 5: Reassess Codegen Opportunities — DONE
 
-After Phases 1-4, use the Phase 2 counters to decide whether further work
-belongs in phi optimization or register allocation.
+### Measurement corpus
 
-Candidate RA work:
+`TCC_LOG_IR_GEN` + `TCC_LOG_LS` counters aggregated over the GCC torture suite
+compiled at `-O2` (`-nostdinc`): 3616 translation units compiled, 19,531
+functions allocated, 12,021 of them with at least one phi operand.
 
-- weight copy affinity by loop depth or estimated edge frequency;
-- prefer eliminating hot backedge copies over cold exit copies;
-- improve spill cost for intervals participating in unresolved phi cycles;
-- diagnose why graph coalescing rejects the most frequent surviving copy
-  classes.
+### Phi simplification is saturated (Phases 1-4 have ~0 further headroom)
 
-Do not add phi-to-`SELECT` conversion here initially. The flat optimizer
-already recognizes profitable diamonds, while a late conversion can extend
-live ranges or replace edge-local copies with unconditional computation.
+Over 79,026 phis seen by `ssa:phi_simplify`:
+
+| removal | count | share of phis |
+|---------|-------|---------------|
+| trivial | 197 | 0.25% |
+| SCC (Phase 3) | 8 | 0.010% |
+| congruent (Phase 4) | 0 | 0.000% |
+| **total** | **205** | **0.26%** |
+
+Renamed SSA almost never contains a redundant mutually-recursive component or
+a pair of exactly-congruent phis, so Phases 3-4 are correctness/completeness
+insurance, not a code-size lever. **No further phi structural pass is worth
+building.** Phi→`SELECT` remains out (the flat optimizer already forms
+profitable diamonds; late conversion would extend live ranges).
+
+### The cost has moved to out-of-SSA copy lowering
+
+78,190 phi copies are emitted at predecessor block ends. Their fate:
+
+| fate | count | share |
+|------|-------|-------|
+| graph-coalesced (become identity, elided free) | 23,888 | 30.6% |
+| move-coalesced post-RA | 12,337 | 15.8% |
+| **reach codegen as real register moves** | **41,965** | **53.7%** |
+
+So **more than half of all phi copies survive as actual instructions.** Copy
+cycles are a non-problem: `cycle_temporaries = 0` across the entire corpus —
+the plan's cycle-related RA candidate is retired. `participant_spills = 4,170`
+(phi-copy intervals that also spilled) is a secondary cost.
+
+Surviving copies are moderately concentrated: 38% of functions emit zero, but a
+heavy tail (127 functions with 11+, max 1,442 in one function) holds
+disproportionate weight; the top 10% of functions carry 33% of surviving
+copies.
+
+### Recommendation — next work is RA coalescing, not phi passes
+
+Ranked by leverage:
+
+1. **Raise copy-coalescing coverage.** The 53.7% (~42K moves) that survive
+   `ra_coalesce_graph` + `tcc_ir_move_coalescing` are the single largest lever.
+   First step is diagnostic: add rejection-reason counters (interference,
+   call-crossing, hint conflict, already-coalesced) to both coalescers, re-run
+   this corpus, and attack the dominant class.
+2. **Weight coalescing affinity by loop depth / edge frequency.** Prefer
+   eliminating hot backedge copies over cold exit copies; today hints are
+   frequency-blind. Targets dynamic cost even where static count is flat.
+3. **Cut phi-participant spills (4,170).** Bias the allocator to keep phi-copy
+   participants in registers, or place their spill slots so the copy degrades
+   to a direct stack move.
+
+Do **not** invest further in: phi structural passes, phi→`SELECT`, or
+cycle-breaking machinery (0 cycles observed).
 
 ---
 

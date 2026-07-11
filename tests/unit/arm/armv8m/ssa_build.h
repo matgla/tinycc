@@ -138,8 +138,10 @@ static inline int ssa_add_instr4(ssa_ctx *c, TccIrOp op, IROperand dest,
 static inline void ssa_ctx_build_cfg(ssa_ctx *c)
 {
   c->cfg = tcc_ir_cfg_build(c->ir);
-  if (c->cfg)
+  if (c->cfg) {
     tcc_ir_cfg_compute_dominators(c->cfg);
+    tcc_ir_cfg_compute_dom_frontiers(c->cfg);
+  }
 }
 
 /* ------------------------------------------------------------------ SSA build */

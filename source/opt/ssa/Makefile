@@ -26,7 +26,8 @@ SSA_OPT_SRC = \
 	source/opt/ssa/scalar/narrow.c \
 	source/opt/ssa/scalar/fold.c \
 	source/opt/ssa/cfg/phi.c \
-	source/opt/ssa/cfg/branch.c
+	source/opt/ssa/cfg/branch.c \
+	source/opt/ssa/cfg/cmp_eq.c
 
 # Header set the units depend on (force a rebuild on interface edits).
 SSA_OPT_HDRS = \
@@ -39,6 +40,7 @@ SSA_OPT_HDRS = \
 	source/opt/ssa/include/opt/ssa/fold.h \
 	source/opt/ssa/include/opt/ssa/phi.h \
 	source/opt/ssa/include/opt/ssa/branch.h \
+	source/opt/ssa/include/opt/ssa/cmp_eq.h \
 	source/opt/ssa/include/opt/ssa/ssa_opt_helpers.h \
 	$(OPT_DSL_HEADERS) \
 	tcc.h tccir.h ir/ir.h ir/opt/ssa_opt.h ir/opt_utils.h

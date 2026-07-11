@@ -16,6 +16,7 @@
 #include "bitop_const_fold.h"
 #include "opt/ssa/strength.h"
 #include "opt/ssa/fold.h"
+#include "opt/ssa/cmp_eq.h"
 #include <limits.h>
 
 extern int tcc_ir_opt_pass_disabled(const char *name);

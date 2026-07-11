@@ -74,7 +74,6 @@ ir/
 │       ├── ssa_opt_cprop.c     # SSA copy propagation
 │       ├── ssa_opt_dce.c       # SSA dead code elimination
 │       ├── ssa_opt_branch.c    # SSA branch optimization
-│       ├── ssa_opt_cmp_eq.c    # Compare equality optimization
 │       ├── ssa_opt_dead_loop.c # Dead loop elimination
 │       └── ssa_opt_sccp.c      # (listed above)
 │

@@ -20,6 +20,8 @@ UT_DECLARE_SUITE(ssa_opt_narrow);
 UT_DECLARE_SUITE(ssa_opt_fold);
 UT_DECLARE_SUITE(ssa_opt_phi);
 UT_DECLARE_SUITE(ssa_opt_branch);
+UT_DECLARE_SUITE(ssa_opt_cmp_eq);
+UT_DECLARE_SUITE(opt_ssa_domwalk);
 UT_DECLARE_SUITE(opt_dsl_pair);
 UT_DECLARE_SUITE(opt_dsl_phi);
 
@@ -37,6 +39,8 @@ int main(void)
   UT_RUN_SUITE(ssa_opt_fold);
   UT_RUN_SUITE(ssa_opt_phi);
   UT_RUN_SUITE(ssa_opt_branch);
+  UT_RUN_SUITE(ssa_opt_cmp_eq);
+  UT_RUN_SUITE(opt_ssa_domwalk);
   UT_RUN_SUITE(opt_dsl_pair);
   UT_RUN_SUITE(opt_dsl_phi);
   UT_REPORT_AND_EXIT();

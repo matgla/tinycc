@@ -11,7 +11,8 @@ OPT_DSL_HEADERS = \
 	source/opt/framework/opt_dsl_helpers.h \
 	source/opt/framework/opt_dsl_entry.h \
 	source/opt/framework/opt_dsl_ssa.h \
-	source/opt/framework/opt_dsl_phi.h
+	source/opt/framework/opt_dsl_phi.h \
+	source/opt/framework/opt_ssa_domwalk.h
 
 # Optional: example generators compiled as a test unit.
 # Enable with: make cross OPT_DSL_EXAMPLES=yes
