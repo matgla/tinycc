@@ -206,18 +206,3 @@ UT_TEST(test_add_dllref_level_minus_one_is_lookup_only)
   tcc_delete(s);
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(libtcc_symbols)
-{
-  UT_RUN(test_define_symbol_explicit_value);
-  UT_RUN(test_define_symbol_null_value_defaults_to_1);
-  UT_RUN(test_define_symbol_embedded_eq_value_and_null_arg);
-  UT_RUN(test_undefine_symbol_appends_without_disturbing_prior);
-  UT_RUN(test_add_symbol_calls_set_global_sym_with_plain_name);
-  UT_RUN(test_add_symbol_leading_underscore_prefixes_name);
-  UT_RUN(test_add_dllref_creates_new_ref);
-  UT_RUN(test_add_dllref_dedup_lowers_level_and_sets_found);
-  UT_RUN(test_add_dllref_level_minus_one_is_lookup_only);
-}

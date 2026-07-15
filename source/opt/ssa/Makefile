@@ -21,10 +21,16 @@ SSA_OPT_SRC = \
 	source/opt/ssa/string/str_strchr.c \
 	source/opt/ssa/string/str_strstr.c \
 	source/opt/ssa/memory/global_addr_hoist.c \
+	source/opt/ssa/memory/load_cse.c \
+	source/opt/ssa/memory/diamond_store_fwd.c \
 	source/opt/ssa/scalar/bitop_const_fold.c \
 	source/opt/ssa/scalar/strength.c \
+	source/opt/ssa/scalar/reassoc.c \
 	source/opt/ssa/scalar/narrow.c \
 	source/opt/ssa/scalar/fold.c \
+	source/opt/ssa/scalar/gvn.c \
+	source/opt/ssa/scalar/var_imm_prop.c \
+	source/opt/ssa/scalar/cprop.c \
 	source/opt/ssa/cfg/phi.c \
 	source/opt/ssa/cfg/branch.c \
 	source/opt/ssa/cfg/cmp_eq.c
@@ -34,13 +40,19 @@ SSA_OPT_HDRS = \
 	source/opt/ssa/string/str_handlers.h \
 	source/opt/ssa/string/const_string_fold.h \
 	source/opt/ssa/memory/global_addr_hoist.h \
+	source/opt/ssa/memory/load_cse.h \
+	source/opt/ssa/memory/diamond_store_fwd.h \
 	source/opt/ssa/scalar/bitop_const_fold.h \
 	source/opt/ssa/include/opt/ssa/strength.h \
+	source/opt/ssa/include/opt/ssa/reassoc.h \
 	source/opt/ssa/include/opt/ssa/narrow.h \
 	source/opt/ssa/include/opt/ssa/fold.h \
+	source/opt/ssa/include/opt/ssa/gvn.h \
 	source/opt/ssa/include/opt/ssa/phi.h \
 	source/opt/ssa/include/opt/ssa/branch.h \
 	source/opt/ssa/include/opt/ssa/cmp_eq.h \
+	source/opt/ssa/include/opt/ssa/var_imm_prop.h \
+	source/opt/ssa/include/opt/ssa/cprop.h \
 	source/opt/ssa/include/opt/ssa/ssa_opt_helpers.h \
 	$(OPT_DSL_HEADERS) \
 	tcc.h tccir.h ir/ir.h ir/opt/ssa_opt.h ir/opt_utils.h

@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_STACK_H
-#define TCC_IR_STACK_H
+#pragma once
 
 #include "../tcctype.h"
 
@@ -99,4 +98,3 @@ void tcc_ir_build_stack_layout(struct TCCIRState *ir);
 /* Assign physical registers to vreg - legacy name (calls tcc_ir_stack_reg_assign) */
 void tcc_ir_assign_physical_register(struct TCCIRState *ir, int vreg, int offset, int r0, int r1);
 
-#endif /* TCC_IR_STACK_H */

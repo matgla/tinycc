@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_ldrd.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_ldrd.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -302,26 +302,4 @@ UT_TEST(test_ldrd_vs_strd_base)
   UT_ASSERT_EQ(l.opcode - s.opcode, 0x100000);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_ldrd)
-{
-  UT_RUN(test_ldrd_pre_indexed_add);
-  UT_RUN(test_ldrd_pre_indexed_sub);
-  UT_RUN(test_ldrd_writeback);
-  UT_RUN(test_ldrd_post_indexed);
-  UT_RUN(test_ldrd_post_indexed_neg);
-  UT_RUN(test_ldrd_zero_offset);
-  UT_RUN(test_ldrd_max_offset);
-  UT_RUN(test_strd_pre_indexed_add);
-  UT_RUN(test_strd_pre_indexed_sub);
-  UT_RUN(test_strd_writeback);
-  UT_RUN(test_strd_post_indexed);
-  UT_RUN(test_strd_post_indexed_neg);
-  UT_RUN(test_strd_zero_offset);
-  UT_RUN(test_strd_max_offset);
-  UT_RUN(test_imm_scaling);
-  UT_RUN(test_ldrd_vs_strd_base);
 }

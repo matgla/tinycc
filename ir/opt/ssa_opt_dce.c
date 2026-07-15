@@ -1837,10 +1837,11 @@ static int dce_var_liveness(IRSSAOptCtx *ctx)
   uint32_t *lin = tcc_mallocz((size_t)nb * bmsz);
   uint32_t *live = tcc_mallocz(bmsz);
 
+  /* sticky iv->addrtaken deliberately NOT consulted: live escapes are re-derived below, so init cruft of a VAR whose LEAs all died is sweepable */
   for (int p = 0; p < num_vars; p++) {
     IRLiveInterval *iv =
         tcc_ir_get_live_interval(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, p));
-    if (!iv || iv->addrtaken || iv->is_volatile)
+    if (!iv || iv->is_volatile)
       VL_SET(excl, p);
   }
   for (int i = 0; i < n; i++) {

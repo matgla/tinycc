@@ -215,14 +215,3 @@ UT_TEST(test_sym_defaults_unknown_token_and_empty_attrs)
   UT_ASSERT(str_has(out, ", attr=-"));
   return 0;
 }
-
-UT_SUITE(tccdebug)
-{
-  UT_RUN(test_svalue_null);
-  UT_RUN(test_svalue_const_with_type_modifiers_and_spill);
-  UT_RUN(test_svalue_local_and_array_vla_bitfield);
-  UT_RUN(test_svalue_register_location_has_no_modifiers);
-  UT_RUN(test_sym_null);
-  UT_RUN(test_sym_prints_token_r_type_and_attrs);
-  UT_RUN(test_sym_defaults_unknown_token_and_empty_attrs);
-}

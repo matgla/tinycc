@@ -22,6 +22,7 @@
 
 #include "ssa_build.h"
 #include "ir/opt/ssa_opt.h"
+#include "opt/ssa/gvn.h"
 
 #include "ut.h"
 
@@ -222,18 +223,4 @@ UT_TEST(test_gvn_cmp_setif_single_pair_no_fold)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(ssa_opt_gvn)
-{
-  UT_COVERS("gvn");
-  UT_RUN(test_gvn_cmp_setif_two_imm_pairs_fold);
-  UT_RUN(test_gvn_cmp_setif_vreg_const_pairs_fold);
-  UT_RUN(test_gvn_cmp_setif_cross_block_fold);
-  UT_RUN(test_gvn_cmp_setif_cond_mismatch_no_fold);
-  UT_RUN(test_gvn_cmp_setif_btype_mismatch_no_fold);
-  UT_RUN(test_gvn_cmp_setif_operand_mismatch_no_fold);
-  UT_RUN(test_gvn_cmp_setif_operand_redef_no_fold);
-  UT_RUN(test_gvn_cmp_setif_lval_dest_skipped);
-  UT_RUN(test_gvn_cmp_setif_single_pair_no_fold);
-}
+UT_COVERS("gvn");

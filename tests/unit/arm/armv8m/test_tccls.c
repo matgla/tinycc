@@ -195,16 +195,3 @@ UT_TEST(test_find_free_scratch_reg_falls_back_to_ip_lr_then_none)
   tcc_ls_deinitialize(&ls);
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(tccls)
-{
-  UT_RUN(test_initialize_add_and_clear_intervals);
-  UT_RUN(test_compact_stack_locations_preserves_shared_slots_and_alignment);
-  UT_RUN(test_compact_stack_locations_keeps_negative_spill_base);
-  UT_RUN(test_compute_live_regs_counts_integer_intervals_only);
-  UT_RUN(test_recompute_dirty_registers_prunes_unused_callee_saved_only);
-  UT_RUN(test_find_free_scratch_reg_uses_interval_scan_and_cache);
-  UT_RUN(test_find_free_scratch_reg_falls_back_to_ip_lr_then_none);
-}

@@ -15,8 +15,9 @@ $(OPT_PIPELINE_OBJ): \
 	source/opt/function_pipeline.c \
 	source/opt/function_pipeline.h \
 	tcc.h tccir.h ir/opt.h ir/opt_utils.h ir/opt_engine.h \
-	ir/opt_pipeline.h ir/opt_gens_fusion.h ir/opt_gens_bool.h \
-	ir/opt_gens_call_result.h ir/core.h
+	ir/opt_pipeline.h ir/opt_gens_fusion.h source/opt/flat/include/opt/flat/bool.h \
+	source/opt/flat/include/opt/flat/call_result.h \
+	source/opt/flat/include/opt/flat/symaddr_cse.h ir/core.h
 	@mkdir -p $(dir $@)
 	$(OPT_PIPELINE_CC) -c $< -o $@
 

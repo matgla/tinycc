@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_CORE_H
-#define TCC_IR_CORE_H
+#pragma once
 
 /* operand.h is included via tcc.h as tccir_operand.h */
 
@@ -144,4 +143,3 @@ void tcc_ir_nonleaf_mark(struct TCCIRState *ir);
 /* Get next call ID */
 int tcc_ir_call_id_next(struct TCCIRState *ir);
 
-#endif /* TCC_IR_CORE_H */

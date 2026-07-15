@@ -233,17 +233,3 @@ UT_TEST(test_ssa_rename_rewrites_uses)
   tcc_ir_free(ir);
   return 0;
 }
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(ir_ssa)
-{
-  UT_RUN(test_ssa_construct_null);
-  UT_RUN(test_ssa_construct_no_vars);
-  UT_RUN(test_ssa_construct_unsupported_ops);
-  UT_RUN(test_ssa_single_block_no_phis);
-  UT_RUN(test_ssa_diamond_inserts_phi);
-  UT_RUN(test_ssa_rename_rewrites_uses);
-}

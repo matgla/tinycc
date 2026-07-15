@@ -15,11 +15,19 @@ It iterates up to 5 times until convergence.
 
 ## Pass Order ( SSA_RUN macro)
 
+There are two SSA optimization drivers, selected per function by whether any VAR
+was promoted to SSA/phi form:
+- **Promoted path** (`had_promotable != 0`) → `tcc_ir_ssa_opt_run` (ir/opt/ssa_opt.c),
+  the order below. Runs the broad `ssa:var_to_param_forward`.
+- **Fallback path** (nothing promotable) → the `RUN_SSA` loop in ir/regalloc.c, a
+  similar order but with `ssa:var_forward` (narrow) in place of
+  `ssa:var_to_param_forward`. `ssa_opt_vinfo`/rename are not populated here.
+
 ```c
 ssa:var_const_fold
 ssa:sccp
 ssa:cprop
-ssa:var_to_param_forward
+ssa:var_to_param_forward   (promoted path; fallback runs ssa:var_forward instead)
 ssa:fold
 ssa:cprop              (second pass)
 ssa:var_imm_prop
@@ -56,10 +64,21 @@ Copy propagation. Propagates single-def copies through the IR, replacing
 uses of the destination with the source. Runs twice to handle transitive
 copies.
 
-### ssa:var_to_param_forward
-Narrow companion to var_forward. Forwards single-def, single-use VARs
-directly into FUNCPARAMVAL sites, NOPing the original STORE. Catches
-inlined helper patterns (e.g. printf arg materialization).
+### ssa:var_forward  (fallback path)
+`ssa_opt_var_forward` (source/opt/ssa/scalar/cprop.c). Forwards a single-def,
+non-address-taken VAR into its reload-copy uses only — `Ty <- Vn [ASSIGN|LOAD]`
+becomes `Ty <- stored_val [ASSIGN]`, per-use, dominance + call-barrier guarded,
+leaving the dead def for DCE. Does NOT reach direct arithmetic/compare/param
+operand consumers (that residual is what the flat `var_tmp_fwd` still covers on
+fresh pre-SSA IR; see plan_legacy_flat_ir_ssa_retire.md).
+
+### ssa:var_to_param_forward  (promoted path)
+`ssa_opt_var_to_param_forward` (same file). The broad forwarder: a single-def,
+non-address-taken VAR whose def stores a safe value is forwarded into ALL its
+dominated value uses (any operand position, via `ssa_op_reads_vreg`), then the
+def is NOPed. All-or-nothing per VAR (bails if any use is undominated, crosses a
+call barrier, or carries a pinned barrel-shift). Name is historical — it
+generalized well beyond FUNCPARAMVAL sites.
 
 ### ssa:fold
 Arithmetic/logic folding. Simplifies expressions like `x & 0xFF`,

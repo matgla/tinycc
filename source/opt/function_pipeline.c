@@ -20,8 +20,14 @@
 #include "ir/opt_engine.h"
 #include "ir/opt_pipeline.h"
 #include "ir/opt_gens_fusion.h"
-#include "ir/opt_gens_bool.h"
-#include "ir/opt_gens_call_result.h"
+#include "opt/flat/bool.h"
+#include "opt/flat/call_result.h"
+#include "opt/flat/if_convert.h"
+#include "opt/flat/indexed_chain.h"
+#include "opt/flat/pair_reorder.h"
+#include "opt/flat/disp.h"
+#include "opt/flat/var_tmp_fwd.h"
+#include "opt/flat/symaddr_cse.h"
 #include "tccir.h"
 
 #include "function_pipeline.h"
@@ -67,8 +73,8 @@ static void run_propagation_passes(TCCIRState *ir)
 
   DUMP_IR_AFTER_PASS(ir, "propagation_group");
 
-  if (tcc_state->optimize >= 1)
-    tcc_ir_opt_globalsym_cse(ir);
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("symaddr_cse"))
+    tcc_ir_opt_symaddr_cse(ir);
 
   tcc_ir_opt_compact_nops(ir);
   DUMP_IR_AFTER_PASS(ir, "compact_nops_pre_jthread");
@@ -234,14 +240,6 @@ static void run_dead_store_and_cleanup(TCCIRState *ir)
 /* ================================================================== */
 static void run_post_pipeline_passes(TCCIRState *ir)
 {
-  if (tcc_state->opt_store_load_fwd)
-  {
-    if (tcc_ir_opt_diamond_store_fwd(ir) > 0)
-    {
-      DUMP_IR_AFTER_PASS(ir, "ZZ_diamond_store_fwd");
-    }
-  }
-
   if (tcc_ir_opt_memmove_to_indexed_stores(ir) > 0)
   {
     tcc_ir_opt_compact_nops(ir);
@@ -253,10 +251,6 @@ static void run_post_pipeline_passes(TCCIRState *ir)
   tcc_ir_opt_shl32_or_chain(ir);
 
   DUMP_IR_AFTER_PASS(ir, "ZZ2_shl32");
-
-  if (tcc_state->opt_const_prop)
-    tcc_ir_opt_deref_fwd(ir);
-  DUMP_IR_AFTER_PASS(ir, "ZZ2_deref_fwd");
 
   if (tcc_state->opt_stack_addr_cse)
     tcc_ir_opt_stack_addr_cse(ir);

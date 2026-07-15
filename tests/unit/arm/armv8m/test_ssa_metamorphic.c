@@ -20,6 +20,9 @@
 #include "ssa_build.h"
 #include "ir/opt/ssa_opt.h"
 #include "opt/ssa/strength.h"
+#include "opt/ssa/reassoc.h"
+#include "opt/ssa/gvn.h"
+#include "opt/ssa/cprop.h"
 
 #include "ut.h"
 
@@ -79,8 +82,4 @@ UT_TEST(test_metamorphic_ssa_random_snippet)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_metamorphic)
-{
-  UT_COVERS("ssa:metamorphic");
-  UT_RUN(test_metamorphic_ssa_random_snippet);
-}
+UT_COVERS("ssa:metamorphic");

@@ -13,7 +13,7 @@
 #include "ir/regalloc.h"
 #include "ir/codegen.h"
 #include "ir/machine_op.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
 
@@ -314,19 +314,4 @@ UT_TEST(test_dispatch_cvt_itof_and_ftoi_route_to_fp_mop)
   tcc_ir_free(ir_ftoi);
 
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(codegen_fp)
-{
-  UT_RUN(test_fp_interval_metadata);
-  UT_RUN(test_fp_machine_operand);
-  UT_RUN(test_fp_double_pair);
-  UT_RUN(test_fp_op_construction);
-  UT_RUN(test_complex_float_pair);
-  UT_RUN(test_dispatch_fp_binops_route_to_fp_mop);
-  UT_RUN(test_dispatch_cvt_itof_and_ftoi_route_to_fp_mop);
 }

@@ -17,8 +17,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef SOURCE_OPT_FUNCTION_PIPELINE_H
-#define SOURCE_OPT_FUNCTION_PIPELINE_H
+#pragma once
 
 #include "ir/core.h"
 
@@ -35,4 +34,3 @@
 void tcc_ir_opt_run_function_pipeline(TCCIRState *ir, Sym *sym, int func_var,
                                       int *nonstatic_global_copier);
 
-#endif /* SOURCE_OPT_FUNCTION_PIPELINE_H */

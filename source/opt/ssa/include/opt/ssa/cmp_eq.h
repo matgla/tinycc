@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_SSA_CMP_EQ_H
-#define TCC_OPT_SSA_CMP_EQ_H
+#pragma once
 
 struct IRSSAOptCtx;
 
@@ -20,4 +19,3 @@ struct IRSSAOptCtx;
  * of instructions rewritten. */
 int ssa_opt_cmp_eq_prop(struct IRSSAOptCtx *ctx);
 
-#endif /* TCC_OPT_SSA_CMP_EQ_H */

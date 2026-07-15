@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_mem_reg.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_mem_reg.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -383,28 +383,4 @@ UT_TEST(test_ldr_reg_t32_pc_constraint)
   UT_ASSERT_EQ(op.opcode, 0);
 
   return 0;
-}
-
-/* ───── suite ───── */
-
-UT_SUITE(thop_mem_reg)
-{
-  UT_RUN(test_ldr_reg_t16_basic);
-  UT_RUN(test_ldrb_reg_t16_basic);
-  UT_RUN(test_ldrh_reg_t16_basic);
-  UT_RUN(test_ldrsb_reg_t16_basic);
-  UT_RUN(test_ldrsh_reg_t16_basic);
-  UT_RUN(test_str_reg_t16_basic);
-  UT_RUN(test_strb_reg_t16_basic);
-  UT_RUN(test_strh_reg_t16_basic);
-  UT_RUN(test_ldr_reg_t16_high_reg_falls_to_t32);
-  UT_RUN(test_ldr_reg_enforce_16bit_high_reg_fails);
-  UT_RUN(test_ldr_reg_t32_lsl);
-  UT_RUN(test_str_reg_t32_lsl);
-  UT_RUN(test_ldrb_reg_t32_lsl);
-  UT_RUN(test_ldrh_reg_t32_lsl);
-  UT_RUN(test_ldr_reg_t32_invalid_shift_type);
-  UT_RUN(test_ldrsb_ldrsh_reg_t32);
-  UT_RUN(test_ldr_reg_t32_sp_constraint);
-  UT_RUN(test_ldr_reg_t32_pc_constraint);
 }

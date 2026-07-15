@@ -215,20 +215,6 @@ UT_TEST(test_def_count_single_and_multi_def)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_du)
-{
-  UT_COVERS("ir_opt_du_idx");
-  UT_COVERS("ir_opt_du_build_mode");
-  UT_COVERS("ir_opt_build_def_count");
-  UT_RUN(test_du_idx_full_mode_layout);
-  UT_RUN(test_du_idx_negative_vreg);
-  UT_RUN(test_du_idx_out_of_range);
-  UT_RUN(test_du_idx_tmp_only_mode_excludes_var_and_param);
-  UT_RUN(test_du_build_records_def_and_uses);
-  UT_RUN(test_du_build_store_dest_counted_as_use_not_def);
-  UT_RUN(test_du_build_use_count_saturates_at_two);
-  UT_RUN(test_du_build_tmp_only_mode);
-  UT_RUN(test_def_count_single_and_multi_def);
-}
+UT_COVERS("ir_opt_du_idx");
+UT_COVERS("ir_opt_du_build_mode");
+UT_COVERS("ir_opt_build_def_count");

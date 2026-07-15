@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_OPT_H
-#define TCC_IR_OPT_H
+#pragma once
 
 struct TCCIRState;
 struct TCCState;
@@ -152,16 +151,12 @@ int tcc_ir_opt_dead_lea_store_elim(struct TCCIRState *ir);
 
 /* Constant-fold read-modify-write chains (e.g. `u.e.a++` -> __aeabi_dadd) on
  * non-escaping local aggregates by propagating the slot's constant value
- * across calls and folding the dadd/dsub.  See ir/opt_const_aggregate.c. */
+ * across calls and folding the dadd/dsub.
+ * See source/opt/flat/scalar/const_aggregate.c. */
 int tcc_ir_opt_const_aggregate_fold(struct TCCIRState *ir);
 
 /* Constant fold string builtin calls such as `strcmp` and `strncmp` */
 int tcc_ir_opt_const_string_calls(struct TCCIRState *ir);
-
-/* Eliminate memcpy/memmove(dst, src, n) calls where dst and src compute the
- * same value — the copy is a provable no-op.  Triggered by `*p = *p`-style
- * aggregate self-assignments. */
-int tcc_ir_opt_self_copy_elim(struct TCCIRState *ir);
 
 /* Eliminate memmove/memcpy(dst_ptr, &stack_tmp, N) calls when the only writes
  * to stack_tmp[0..N) are local STOREs preceding the call.  Each contributing
@@ -185,9 +180,8 @@ int tcc_ir_opt_stack_bool_diamond(struct TCCIRState *ir);
  * conditions together cover every LT/EQ/GT outcome into ASSIGN #1. */
 int tcc_ir_opt_setif_or_tautology(struct TCCIRState *ir);
 
-/* VAR → TMP local forwarding. After STORE V ← T, rewrite subsequent reads of
- * V within the same BB to use T directly, avoiding the spill/reload round-trip. */
-int tcc_ir_opt_var_tmp_fwd(struct TCCIRState *ir);
+/* VAR → TMP local forwarding (tcc_ir_opt_var_tmp_fwd) moved to
+ * source/opt/flat/scalar/var_tmp_fwd.c — declared in opt/flat/var_tmp_fwd.h. */
 
 /* Local Load CSE. Within a basic block, when a VAR/PARAM is loaded twice into
  * different TEMPs, the second load is replaced with a copy of the first TEMP. */
@@ -213,14 +207,6 @@ int tcc_ir_opt_stack_addr_simplify(struct TCCIRState *ir);
 
 /* CMP Expression-Equality Fold - fold CMP when both operands are provably equal */
 int tcc_ir_opt_cmp_expr_fold(struct TCCIRState *ir);
-
-/* Self-expression arithmetic identity fold: x/x→1, x%x→0 */
-int tcc_ir_opt_self_arith_fold(struct TCCIRState *ir);
-int tcc_ir_opt_self_arith_fold_ex(struct IROptCtx *ctx);
-
-/* CMP Constant-Offset Fold - fold CMP when one operand is the other plus a
- * known constant (e.g. `(x + 1) >= x` → always true under signed-overflow UB) */
-int tcc_ir_opt_cmp_const_offset_fold(struct TCCIRState *ir);
 
 /* PACK64 peephole - collapse ZEXT + SHL #32 + ZEXT + OR -> PACK64 */
 int tcc_ir_opt_pack64(struct TCCIRState *ir);
@@ -258,16 +244,8 @@ int tcc_ir_opt_cmp_narrow_64(struct TCCIRState *ir);
  * or high word is provably unread, so codegen skips the dead half-write. */
 int tcc_ir_opt_shift64_dead_half(struct TCCIRState *ir);
 
-/* Clamp a narrow plain STORE's value-operand btype to its access width so a
- * later STORE_INDEXED conversion (which takes width from the value) does not
- * widen a char/short store to a word and clobber adjacent memory. */
-int tcc_ir_opt_narrow_store_value_btype(struct TCCIRState *ir);
-
 /* Global LOAD value CSE - deduplicate loads from the same global within a BB */
 int tcc_ir_opt_cse_global_load(struct TCCIRState *ir);
-
-/* GlobalSym CSE - hoist repeated global symbol addresses to a single TEMP */
-int tcc_ir_opt_globalsym_cse(struct TCCIRState *ir);
 
 /* Identical-block loop re-rolling - collapse macro-unrolled runs into a loop */
 int tcc_ir_opt_reroll(struct TCCIRState *ir);
@@ -299,20 +277,9 @@ int tcc_ir_opt_bitfield_insert_to_bfi(struct TCCIRState *ir);
 int tcc_ir_opt_cmp_field_fuse(struct TCCIRState *ir);
 int tcc_ir_opt_cmp_field_fuse_ex(struct IROptCtx *ctx);
 
-/* Deref forwarding - reuse loaded deref value in adjacent CMP */
-int tcc_ir_opt_deref_fwd(struct TCCIRState *ir);
-
-/* Pointer store-to-load forwarding - forward stored values to subsequent
- * loads from the same pointer dereference within a basic block */
-int tcc_ir_opt_ptr_store_load_fwd(struct TCCIRState *ir);
 
 /* Store-Load Forwarding */
 int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
-
-/* Diamond Store Forwarding - when both branches of an if/else diamond store
- * the same constant through a computed address, forward the constant to the
- * post-merge LOAD_INDEXED from the same address. */
-int tcc_ir_opt_diamond_store_fwd(struct TCCIRState *ir);
 
 /* Forward const ASSIGN to a VAR through &V LEA into deref uses.  Handles the
  * addr-taken local pattern (e.g. __attribute__((cleanup))) that var_to_tmp
@@ -370,7 +337,7 @@ int tcc_ir_opt_complex_const_param_fold(struct TCCIRState *ir);
 /* Dead Call Result Elimination - convert FUNCCALLVAL → FUNCCALLVOID when
  * the call's destination TEMP has no remaining reads.  Skips the
  * post-call moves the codegen would otherwise emit.
- * (moved to ir/opt_gens_call_result.c — engine generator) */
+ * (moved to source/opt/flat/scalar/call_result.c — engine generator) */
 
 /* Pure-via-sret analysis - infer whether the current function's only
  * observable side effect is writes through its sret-pointer parameter.
@@ -468,11 +435,8 @@ int ssa_opt_mem_init(struct TCCIRState *ir);
  * instead of N copies of the 2-instruction sequence. */
 int tcc_ir_opt_returnvalue_merge(struct TCCIRState *ir);
 
-/* Conditional Select - replace if/else diamond with SELECT (ITE on ARM) */
-int tcc_ir_opt_select(struct TCCIRState *ir);
-
-/* Fold `SETIF(cond); r <- #0 SUB t` mask idiom into SELECT(#-1, #0, cond) */
-int tcc_ir_opt_setif_neg_to_select(struct TCCIRState *ir);
+/* Conditional Select (if/else diamond -> SELECT) and setif_neg_to_select now
+ * live in source/opt/flat/cfg/if_convert.c; declared in opt/flat/if_convert.h */
 
 /* Eliminate Fall-Through Jumps - remove redundant unconditional jumps */
 int tcc_ir_opt_eliminate_fallthrough(struct TCCIRState *ir);
@@ -481,10 +445,8 @@ int tcc_ir_opt_eliminate_fallthrough(struct TCCIRState *ir);
  * ASSIGNs + inverted JUMPIF body, eliminating one branch per loop */
 int tcc_ir_opt_backedge_phi_hoist(struct TCCIRState *ir);
 
-/* Forward-Diamond JUMPIF inversion (post-regalloc): when phi copies on the
- * fall-through path coalesce into no-ops, invert the JUMPIF and skip the
- * redundant bridging unconditional JUMP. */
-int tcc_ir_opt_post_ra_forward_diamond(struct TCCIRState *ir);
+/* Forward-Diamond JUMPIF inversion (post-regalloc) now lives in
+ * source/opt/flat/cfg/if_convert.c; declared in opt/flat/if_convert.h */
 
 /* Abort tail-merge + body-invert (post-regalloc): per distinct noreturn callee,
  * keep the first guarded call inline as a shared sink and invert+retarget every
@@ -495,7 +457,6 @@ int tcc_ir_opt_abort_tail_merge(struct TCCIRState *ir);
 /* ============================================================================
  * Pipeline-ready _ex variants (accept IROptCtx* for pass manager integration)
  * ============================================================================ */
-int tcc_ir_opt_const_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_prop_tmp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_single_value_tmp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_known_bits_ex(struct IROptCtx *ctx);
@@ -508,9 +469,7 @@ int tcc_ir_opt_value_tracking_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_add_reassoc_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_stack_addr_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_expr_fold_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_cmp_const_offset_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_string_calls_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_self_copy_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_stack_addr_nonnull_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_setif_branch_fuse_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_stack_bool_diamond_ex(struct IROptCtx *ctx);
@@ -521,12 +480,9 @@ int tcc_ir_opt_pack64_tautology_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_pack64_from_stack_stores_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_narrow_64_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_sl_forward_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_deref_fwd_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_ptr_store_load_fwd_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_entry_store_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_assign_fuse_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_var_to_tmp_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_var_tmp_fwd_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_switch_to_data_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_switch_to_data(struct TCCIRState *ir);
 int tcc_ir_opt_switch_collapse_ex(struct IROptCtx *ctx);
@@ -621,13 +577,8 @@ int tcc_ir_find_defining_instruction(struct TCCIRState *ir, int32_t vreg, int be
 /* Check if a vreg has exactly one use (excluding a specific index) */
 int tcc_ir_vreg_has_single_use(struct TCCIRState *ir, int32_t vreg, int exclude_idx);
 
-/* ============================================================================
- * Strength Reduction for Multiply (Phase 3 of FUNCTION_CALLS_OPTIMIZATION_PLAN)
- * ============================================================================ */
-
-/* Transform MUL by constant into shift/add/sub sequence
- * Returns number of instructions generated (0 if not transformable) */
-int tcc_ir_strength_reduce_mul(struct TCCIRState *ir, int instr_idx);
+/* Insert a quad before an index, renumbering jump + switch-table targets */
+int tcc_ir_insert_instruction_before(struct TCCIRState *ir, int before_idx, struct IRQuadCompact *new_q);
 
 /* ============================================================================
  * Induction Variable Strength Reduction (ARRAY_SUM_OPTIMIZATION_PLAN Phase 1)
@@ -709,4 +660,3 @@ unsigned long tcc_pass_clk_us(void);
 void tcc_pass_timing_add(const char *name, unsigned long us);
 void tcc_pass_timing_dump(void);
 
-#endif /* TCC_IR_OPT_H */

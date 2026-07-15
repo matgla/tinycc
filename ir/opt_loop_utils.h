@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_OPT_LOOP_UTILS_H
-#define TCC_IR_OPT_LOOP_UTILS_H
+#pragma once
 
 #include "ir.h"
 #include "licm.h"
@@ -105,4 +104,3 @@ int dtz_try_region(struct TCCIRState *ir, int start, int end, int header_idx,
 int signed_to_unsigned_cond(int cond_token);
 int loop_size_cmp(const void *a, const void *b);
 
-#endif /* TCC_IR_OPT_LOOP_UTILS_H */

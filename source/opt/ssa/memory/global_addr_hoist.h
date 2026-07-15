@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_SSA_GLOBAL_ADDR_HOIST_H
-#define TCC_OPT_SSA_GLOBAL_ADDR_HOIST_H
+#pragma once
 
 struct TCCIRState;
 
@@ -24,4 +23,3 @@ struct TCCIRState;
  * -O2 only.  See docs/plans/gap_a_ssa_var_index_addr_prop.md (gap ②). */
 int tcc_ir_ssa_opt_global_addr_hoist(struct TCCIRState *ir);
 
-#endif /* TCC_OPT_SSA_GLOBAL_ADDR_HOIST_H */

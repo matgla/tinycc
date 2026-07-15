@@ -722,35 +722,12 @@ UT_TEST(test_shr_sar_known_bits_correct_cases)
  * ============================================================================
  */
 
-UT_SUITE(metamorphic)
-{
-  UT_COVERS("neg_chain_cse");
-  UT_COVERS("known_bits");
-  UT_COVERS("copy_prop");
-  UT_COVERS("const_prop");
-  UT_COVERS("const_prop_tmp");
-  UT_COVERS("const_var_prop");
-  UT_COVERS("add_reassoc");
-  UT_COVERS("self_arith_fold");
-  UT_COVERS("single_value_tmp");
-
-  /* Interpreter self-checks FIRST — the metamorphic loop is only trustworthy
-   * if the oracle is correct. */
-  UT_RUN(test_eval_selfcheck_arith);
-  UT_RUN(test_eval_selfcheck_wrap32);
-  UT_RUN(test_eval_selfcheck_shifts);
-  UT_RUN(test_eval_selfcheck_div_logic);
-  UT_RUN(test_eval_selfcheck_div_by_zero_traps);
-  UT_RUN(test_eval_selfcheck_bitops);
-
-  /* PART D — ZEXT findings: the now-fixed known_bits bug + a positive guard. */
-  UT_RUN(test_zext64_neg_const_known_bits_FIXED);
-  UT_RUN(test_zext32_known_bits_preserves_value);
-
-  /* PART E — SHR width findings: the now-fixed known_bits bug + guards. */
-  UT_RUN(test_shr_neg_const_known_bits_FIXED);
-  UT_RUN(test_shr_sar_known_bits_correct_cases);
-
-  /* The flagship metamorphic sweep. */
-  UT_RUN(test_metamorphic_legacy_passes);
-}
+UT_COVERS("neg_chain_cse");
+UT_COVERS("known_bits");
+UT_COVERS("copy_prop");
+UT_COVERS("const_prop");
+UT_COVERS("const_prop_tmp");
+UT_COVERS("const_var_prop");
+UT_COVERS("add_reassoc");
+UT_COVERS("self_arith_fold");
+UT_COVERS("single_value_tmp");

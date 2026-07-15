@@ -470,13 +470,8 @@ static int is_hoistable_instr(TCCIRState *ir, int instr_idx, IRLoop *loop)
 }
 #endif
 
-/*
- * Insert an instruction before a given position
- * Returns index of inserted instruction, or -1 on failure
- */
-static int insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompact *new_q)
+int tcc_ir_insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompact *new_q)
 {
-  /* Ensure we have space BEFORE inserting */
   if (ir->next_instruction_index + 1 >= ir->compact_instructions_size)
   {
     int new_size = ir->compact_instructions_size << 1;
@@ -486,18 +481,14 @@ static int insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompa
     ir->compact_instructions_size = new_size;
   }
 
-  /* Make room by shifting instructions from the end */
   for (int i = ir->next_instruction_index; i > before_idx; i--)
   {
     ir->compact_instructions[i] = ir->compact_instructions[i - 1];
   }
 
-  /* Insert new instruction */
   ir->compact_instructions[before_idx] = *new_q;
   ir->next_instruction_index++;
 
-  /* Update jump targets that point to or after before_idx
-   * All jumps targeting >= before_idx need to be incremented by 1 */
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -507,20 +498,13 @@ static int insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompa
       int target = (int)irop_get_imm64_ex(ir, dest);
       if (target >= before_idx)
       {
-        /* Update jump target - create new operand with incremented target */
         IROperand new_dest = irop_make_imm32(-1, target + 1, IROP_BTYPE_INT32);
         tcc_ir_op_set_dest(ir, q, new_dest);
       }
     }
   }
 
-  /* SWITCH_TABLE case targets live in a side table independent of the IR
-   * array; without this they silently desynchronize on every insertion
-   * (docs/bugs.md #7, combo fuzz seeds 52/80/187/311/333/392/460: hoisting a
-   * pure call out of a loop containing a switch left every case target stale
-   * by the insertion count — downstream reachability-based passes then
-   * deleted live FUNCPARAMVALs, and at runtime the dispatch jumped into the
-   * middle of the wrong case).  Mirrors gsym_cse_insert_before. */
+  /* SWITCH_TABLE targets live in a side table and desync without this (docs/bugs.md #7) */
   for (int t = 0; t < ir->num_switch_tables; t++)
   {
     TCCIRSwitchTable *table = &ir->switch_tables[t];
@@ -730,7 +714,7 @@ __attribute__((unused)) static int hoist_from_loop(TCCIRState *ir, IRLoop *loop)
 
     IRQuadCompact hoist_q = create_assign_instr(ir, hoisted_addrs[i].hoisted_vreg, src_op);
 
-    int inserted_idx = insert_instruction_before(ir, insert_pos, &hoist_q);
+    int inserted_idx = tcc_ir_insert_instruction_before(ir, insert_pos, &hoist_q);
     if (inserted_idx < 0)
     {
       LOG_LICM("Warning: failed to insert instruction");
@@ -1038,7 +1022,7 @@ static int hoist_const_exprs_from_loop(TCCIRState *ir, IRLoop *loop)
     tcc_ir_pool_add(ir, orig_src1);
     tcc_ir_pool_add(ir, orig_src2);
 
-    int inserted_idx = insert_instruction_before(ir, insert_pos, &hoist_q);
+    int inserted_idx = tcc_ir_insert_instruction_before(ir, insert_pos, &hoist_q);
     if (inserted_idx < 0)
     {
       LOG_LICM("Warning: failed to insert hoisted instruction");
@@ -1811,7 +1795,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
 
   /* Re-enabled 2026-07-02 after the ninth (and final) defect fix: the
    * combo-profile residue (seeds 52/80/187/311/333/392/460) was
-   * insert_instruction_before desynchronizing SWITCH_TABLE side-table
+   * tcc_ir_insert_instruction_before desynchronizing SWITCH_TABLE side-table
    * targets — not the linear-index call bookkeeping suspected earlier.
    * Full history in docs/bugs.md #7 (resolved). */
 
@@ -2155,7 +2139,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
         }
         tcc_ir_pool_add(ir, new_call_src2);
 
-        insert_instruction_before(ir, loop->preheader_idx + 1, &call_copy);
+        tcc_ir_insert_instruction_before(ir, loop->preheader_idx + 1, &call_copy);
         insertions_this_call++;
         total_hoisted++;
 
@@ -2188,7 +2172,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
           }
           param_copies[p].operand_base = new_operand_base;
 
-          insert_instruction_before(ir, loop->preheader_idx + 1, &param_copies[p]);
+          tcc_ir_insert_instruction_before(ir, loop->preheader_idx + 1, &param_copies[p]);
           insertions_this_call++;
           total_hoisted++;
         }
@@ -2307,6 +2291,268 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
   return total_hoisted;
 }
 
+/* Loop-invariant global-load hoisting.  A non-volatile global value read (a
+ * SYMREF-deref operand consumed by an ALU op) is loop-invariant when the loop
+ * writes no memory, so materialize it once in the preheader and rewrite the
+ * in-loop reads to the temp.  A global address is always valid to load, so
+ * speculating it onto the zero-trip path cannot fault (unlike a pointer deref),
+ * which is why no dominance-over-uses guard is needed.  Gated on
+ * loop_body_may_clobber_memory==0 so the loaded value cannot change. */
+#define GLH_MAX_PER_LOOP 2
+
+static int glh_is_value_consumer(int op)
+{
+  switch (op) {
+  case TCCIR_OP_LOAD: case TCCIR_OP_LOAD_INDEXED: case TCCIR_OP_LOAD_POSTINC:
+  case TCCIR_OP_STORE: case TCCIR_OP_STORE_INDEXED: case TCCIR_OP_STORE_POSTINC:
+  case TCCIR_OP_LEA: case TCCIR_OP_VLA_ALLOC: case TCCIR_OP_BLOCK_COPY:
+    return 0; /* here a SYMREF operand names an address, not a value */
+  default:
+    return 1;
+  }
+}
+
+typedef struct {
+  Sym *sym;
+  int64_t addend;
+  int btype;
+  IROperand src_op;   /* the exact global-deref operand, for the preheader LOAD */
+  int32_t tmp;
+} GLHCand;
+
+/* A write destination that provably cannot alias a global: a direct named-local
+ * (VAR vreg) or a direct stack slot.  A global (is_sym) or a pointer deref can. */
+static int glh_dest_is_local_slot(IROperand d)
+{
+  if (d.is_sym)
+    return 0;
+  int32_t vr = irop_get_vreg(d);
+  if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+    return 1;
+  if (irop_get_tag(d) == IROP_TAG_STACKOFF && d.is_local)
+    return 1;
+  return 0;
+}
+
+/* Would the loop write global memory (or memory that might alias a global)?
+ * Unlike loop_body_may_clobber_memory this exempts direct local-slot writes,
+ * which cannot alias a global — the case that makes `s += G` reductions
+ * hoistable.  Indexed / pointer / block writes and non-const calls stay
+ * conservative clobbers. */
+static int glh_loop_writes_globals(TCCIRState *ir, IRLoop *loop)
+{
+  for (int i = 0; i < loop->num_body_instrs; i++) {
+    int idx = loop->body_instrs[i];
+    if (idx < loop->start_idx || idx > loop->end_idx)
+      continue;
+    IRQuadCompact *q = &ir->compact_instructions[idx];
+    switch (q->op) {
+    case TCCIR_OP_NOP:
+      continue;
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+    case TCCIR_OP_BLOCK_COPY:
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_OUTPUT:
+      return 1;
+    case TCCIR_OP_STORE:
+      if (!glh_dest_is_local_slot(tcc_ir_op_get_dest(ir, q)))
+        return 1;
+      continue;
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID: {
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      if (!callee || tcc_ir_get_func_purity(ir, callee) < TCC_FUNC_PURITY_CONST)
+        return 1;
+      continue;
+    }
+    default:
+      if (irop_config[q->op].has_dest) {
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        if (d.is_lval && !glh_dest_is_local_slot(d))
+          return 1;
+      }
+      continue;
+    }
+  }
+  return 0;
+}
+
+/* A SYMREF value read (global lvalue used as a value); volatility is checked
+ * separately via the resolved symbol's type. */
+static int glh_operand_is_global_value(IROperand op)
+{
+  return op.is_lval && op.is_sym && !op.is_llocal && !op.is_local;
+}
+
+/* Shift the still-unprocessed loops' indices by `delta` for entries >= pos,
+ * after `after_li`'s insertions moved everything at/after pos forward. */
+static void glh_shift_after(IRLoops *loops, int after_li, int pos, int delta)
+{
+  for (int li = after_li + 1; li < loops->num_loops; li++) {
+    IRLoop *o = &loops->loops[li];
+    if (o->header_idx >= pos) o->header_idx += delta;
+    if (o->start_idx >= pos) o->start_idx += delta;
+    if (o->end_idx >= pos) o->end_idx += delta;
+    if (o->preheader_idx >= pos) o->preheader_idx += delta;
+    for (int b = 0; b < o->num_body_instrs; b++)
+      if (o->body_instrs[b] >= pos) o->body_instrs[b] += delta;
+  }
+}
+
+static int tcc_ir_hoist_invariant_global_loads(TCCIRState *ir, IRLoops *loops)
+{
+  if (!ir || !loops)
+    return 0;
+  if (tcc_ir_opt_pass_disabled("licm_global_load"))
+    return 0;
+
+  int total = 0;
+  for (int li = 0; li < loops->num_loops; li++) {
+    IRLoop *loop = &loops->loops[li];
+
+    /* Preheader-insertion safety: identical requirements to pure-call hoisting
+     * (docs/bugs.md #7) — a real fall-through preheader that is the header's
+     * immediate predecessor, not nested in another loop, with no entry edge
+     * from outside bypassing it, and no VLA. */
+    if (loop->preheader_idx < 0 || loop->preheader_idx != loop->header_idx - 1)
+      continue;
+    int bad = 0;
+    for (int oi = 0; oi < loops->num_loops && !bad; oi++) {
+      if (oi == li) continue;
+      IRLoop *o = &loops->loops[oi];
+      if (loop->preheader_idx >= o->start_idx && loop->preheader_idx <= o->end_idx)
+          bad = 1;
+    }
+    for (int j = 0; j < ir->next_instruction_index && !bad; j++) {
+      if (j >= loop->start_idx && j <= loop->end_idx)
+        continue;
+      IRQuadCompact *jq = &ir->compact_instructions[j];
+      if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF) {
+        int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq));
+        if (jt >= loop->header_idx && jt <= loop->end_idx)
+          bad = 1;
+      } else if (jq->op == TCCIR_OP_SWITCH_TABLE || jq->op == TCCIR_OP_IJUMP) {
+        bad = 1;
+      }
+    }
+    if (bad || loop_contains_vla(ir, loop))
+      continue;
+    /* Value-invariance gate: nothing in the loop writes the global (direct
+     * local-slot writes are exempt — they cannot alias static memory). */
+    if (glh_loop_writes_globals(ir, loop))
+      continue;
+
+    GLHCand cand[GLH_MAX_PER_LOOP];
+    int ncand = 0;
+    for (int bi = 0; bi < loop->num_body_instrs; bi++) {
+      int idx = loop->body_instrs[bi];
+      if (idx < loop->start_idx || idx > loop->end_idx)
+        continue;
+      IRQuadCompact *q = &ir->compact_instructions[idx];
+      if (q->op == TCCIR_OP_NOP || !glh_is_value_consumer(q->op))
+        continue;
+      for (int side = 0; side < 2; side++) {
+        if (side == 0 && !irop_config[q->op].has_src1) continue;
+        if (side == 1 && !irop_config[q->op].has_src2) continue;
+        IROperand op = side == 0 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        if (!glh_operand_is_global_value(op))
+          continue;
+        IRPoolSymref *ref = irop_get_symref_ex(ir, op);
+        if (!ref || !ref->sym || (ref->sym->type.t & VT_VOLATILE))
+          continue;
+        int bt = irop_get_btype(op);
+        int seen = 0;
+        for (int c = 0; c < ncand; c++)
+          if (cand[c].sym == ref->sym && cand[c].addend == ref->addend && cand[c].btype == bt) {
+            seen = 1; break;
+          }
+        if (!seen && ncand < GLH_MAX_PER_LOOP) {
+          cand[ncand].sym = ref->sym;
+          cand[ncand].addend = ref->addend;
+          cand[ncand].btype = bt;
+          cand[ncand].src_op = op;
+          cand[ncand].tmp = -1;
+          ncand++;
+        }
+      }
+    }
+    if (ncand == 0)
+      continue;
+
+    for (int c = 0; c < ncand; c++)
+      cand[c].tmp = tcc_ir_vreg_alloc_temp(ir);
+
+    /* Rewrite the in-loop reads while indices are still stable. */
+    int rewrote = 0;
+    for (int bi = 0; bi < loop->num_body_instrs; bi++) {
+      int idx = loop->body_instrs[bi];
+      if (idx < loop->start_idx || idx > loop->end_idx)
+        continue;
+      IRQuadCompact *q = &ir->compact_instructions[idx];
+      if (q->op == TCCIR_OP_NOP || !glh_is_value_consumer(q->op))
+        continue;
+      for (int side = 0; side < 2; side++) {
+        if (side == 0 && !irop_config[q->op].has_src1) continue;
+        if (side == 1 && !irop_config[q->op].has_src2) continue;
+        IROperand op = side == 0 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        if (!glh_operand_is_global_value(op))
+          continue;
+        IRPoolSymref *ref = irop_get_symref_ex(ir, op);
+        if (!ref || !ref->sym)
+          continue;
+        int bt = irop_get_btype(op);
+        for (int c = 0; c < ncand; c++) {
+          if (cand[c].sym == ref->sym && cand[c].addend == ref->addend && cand[c].btype == bt) {
+            IROperand nv = irop_make_vreg(cand[c].tmp, bt);
+            nv.is_unsigned = op.is_unsigned;
+            if (side == 0) tcc_ir_set_src1(ir, idx, nv);
+            else tcc_ir_set_src2(ir, idx, nv);
+            rewrote++;
+            break;
+          }
+        }
+      }
+    }
+    if (rewrote == 0)
+      continue;
+
+    /* Materialize `tmp <- *global [LOAD]` in the preheader (fall-through into
+     * the header).  Each insert shifts later indices forward by one. */
+    int insert_at = loop->preheader_idx + 1;
+    for (int c = 0; c < ncand; c++) {
+      IROperand dest = irop_make_vreg(cand[c].tmp, cand[c].btype);
+      dest.is_unsigned = cand[c].src_op.is_unsigned;
+      IRQuadCompact ld = {0};
+      ld.op = TCCIR_OP_LOAD;
+      ld.operand_base = tcc_ir_pool_add(ir, dest);
+      tcc_ir_pool_add(ir, cand[c].src_op);
+      tcc_ir_pool_add(ir, IROP_NONE);
+      tcc_ir_insert_instruction_before(ir, insert_at + c, &ld);
+    }
+    glh_shift_after(loops, li, insert_at, ncand);
+    total += rewrote;
+  }
+  return total;
+}
+
+/* Pure, fault-free, side-effect-free ops (dom-LICM's whole hoist whitelist).
+ * Executing one on the zero-trip path is harmless, so they may be hoisted to a
+ * dominating preheader without dominating the loop's exits — the requirement
+ * that only matters for trapping (DIV, pointer LOAD) or side-effecting ops. */
+static int licm_op_is_speculatable(int op)
+{
+  switch (op) {
+  case TCCIR_OP_ADD: case TCCIR_OP_SUB: case TCCIR_OP_MUL:
+  case TCCIR_OP_AND: case TCCIR_OP_OR: case TCCIR_OP_XOR:
+  case TCCIR_OP_SHL: case TCCIR_OP_SHR: case TCCIR_OP_SAR: case TCCIR_OP_ROR:
+  case TCCIR_OP_ASSIGN: case TCCIR_OP_LEA:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
 /* ============================================================================
  * Main Entry Point
  * ============================================================================ */
@@ -2327,6 +2573,153 @@ int ssa_opt_licm(TCCIRState *ir)
   int changed = loops != NULL;
   tcc_ir_free_loops(loops);
   return changed;
+}
+
+/* ra:stack_param_promote — cache a loop-invariant stack param in an entry temp so RA holds it in a register instead of reloading it per iteration (docs/plan_stack_param_reg_promotion.md). */
+static int param_seen_at(TCCIRState *ir, int32_t penc, int i, int *is_dest,
+                         int *is_deref, IROperand *rep)
+{
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  int seen = 0;
+  if (irop_config[q->op].has_dest &&
+      irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == penc)
+    *is_dest = 1;
+  for (int slot = 0; slot < 3; slot++) {
+    IROperand s;
+    if (slot == 0) { if (!irop_config[q->op].has_src1) continue; s = tcc_ir_op_get_src1(ir, q); }
+    else if (slot == 1) { if (!irop_config[q->op].has_src2) continue; s = tcc_ir_op_get_src2(ir, q); }
+    else { if (q->op != TCCIR_OP_MLA) continue; s = tcc_ir_op_get_accum(ir, q); }
+    if (irop_get_vreg(s) != penc)
+      continue;
+    seen = 1;
+    /* is_lval|is_local on a stack param = load its value from home (cacheable); only is_llocal derefs memory that may change. INT32 so the INT32 entry copy is full-width. */
+    if (s.is_llocal || irop_get_btype(s) != IROP_BTYPE_INT32)
+      *is_deref = 1;
+    else
+      *rep = s;
+  }
+  return seen;
+}
+
+int tcc_ir_promote_loop_stack_params(TCCIRState *ir)
+{
+  if (!ir || tcc_state->optimize <= 0)
+    return 0;
+  const int param_count = ir->next_parameter;
+  if (param_count <= 0)
+    return 0;
+
+  int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++)
+    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
+      return 0; /* computed goto: insertion index shifts are unsafe */
+
+  IRLoops *loops = tcc_ir_detect_loops(ir);
+  if (!loops || loops->num_loops == 0) {
+    tcc_ir_free_loops(loops);
+    return 0;
+  }
+
+  /* AAPCS: params beyond r0-r3 arrive on the stack; restrict to scalar 32-bit, non-address-taken. */
+  uint8_t *stack_passed = tcc_mallocz((size_t)param_count);
+  int argno = 0;
+  for (int p = 0; p < param_count; p++) {
+    IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, p));
+    int is64 = li && (li->is_double || li->is_llong);
+    if (is64 && (argno & 1))
+      argno++;
+    int in_regs = is64 ? (argno <= 2) : (argno <= 3);
+    if (li && !in_regs && !is64 && !li->addrtaken)
+      stack_passed[p] = 1;
+    argno += is64 ? 2 : 1;
+  }
+
+  /* A promoted value held across a call needs a callee-saved reg; several in a call-heavy function flood the set and spill (docs/plan_stack_param_reg_promotion.md). Only promote params whose span ends before the first call. */
+  int first_call = n;
+  for (int i = 0; i < n; i++) {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID ||
+        op == TCCIR_OP_BUILTIN_APPLY) { first_call = i; break; }
+  }
+
+  /* Phase 1: decide which params to promote (loop info still valid — no mutation). */
+  int32_t *promote_penc = tcc_mallocz(sizeof(int32_t) * param_count);
+  IROperand *promote_rep = tcc_mallocz(sizeof(IROperand) * param_count);
+  int promote_count = 0;
+  for (int p = 0; p < param_count; p++) {
+    if (!stack_passed[p])
+      continue;
+    int32_t penc = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, p);
+    int has_use = 0, is_dest = 0, is_deref = 0, used_in_loop = 0, span_end = -1;
+    IROperand rep = {0};
+    for (int i = 0; i < n; i++) {
+      if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
+        continue;
+      if (!param_seen_at(ir, penc, i, &is_dest, &is_deref, &rep))
+        continue;
+      has_use = 1;
+      if (i > span_end)
+        span_end = i;
+      /* Loop-carried: the held register lives to the back-edge, so extend the span to each containing loop's end (catches a call nested after the use). */
+      for (int L = 0; L < loops->num_loops; L++)
+        if (tcc_ir_is_in_loop(&loops->loops[L], i)) {
+          used_in_loop = 1;
+          if (loops->loops[L].end_idx > span_end)
+            span_end = loops->loops[L].end_idx;
+        }
+    }
+    if (!has_use || is_dest || is_deref || !used_in_loop || span_end >= first_call)
+      continue;
+    promote_penc[promote_count] = penc;
+    promote_rep[promote_count] = rep;
+    promote_count++;
+  }
+  tcc_ir_free_loops(loops);
+  tcc_free(stack_passed);
+
+  /* Phase 2: rewrite by-value uses to a fresh temp, then insert the entry copy (which renumbers via tcc_ir_insert_instruction_before), rescanning n each time. */
+  int promoted = 0;
+  for (int k = 0; k < promote_count; k++) {
+    int32_t penc = promote_penc[k];
+    int32_t tx = tcc_ir_get_vreg_temp(ir);
+    n = ir->next_instruction_index;
+    for (int i = 0; i < n; i++) {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (irop_config[q->op].has_src1) {
+        IROperand s = tcc_ir_op_get_src1(ir, q);
+        if (irop_get_vreg(s) == penc) {
+          IROperand nv = irop_make_vreg(tx, irop_get_btype(s));
+          nv.is_unsigned = s.is_unsigned;
+          tcc_ir_op_set_src1(ir, q, nv);
+        }
+      }
+      if (irop_config[q->op].has_src2) {
+        IROperand s = tcc_ir_op_get_src2(ir, q);
+        if (irop_get_vreg(s) == penc) {
+          IROperand nv = irop_make_vreg(tx, irop_get_btype(s));
+          nv.is_unsigned = s.is_unsigned;
+          tcc_ir_op_set_src2(ir, q, nv);
+        }
+      }
+      if (q->op == TCCIR_OP_MLA) {
+        IROperand s = tcc_ir_op_get_accum(ir, q);
+        if (irop_get_vreg(s) == penc) {
+          IROperand nv = irop_make_vreg(tx, irop_get_btype(s));
+          nv.is_unsigned = s.is_unsigned;
+          tcc_ir_op_set_accum(ir, q, nv);
+        }
+      }
+    }
+    IRQuadCompact assign = create_assign_instr(ir, tx, promote_rep[k]);
+    tcc_ir_insert_instruction_before(ir, 0, &assign);
+    promoted++;
+  }
+
+  tcc_free(promote_penc);
+  tcc_free(promote_rep);
+  return promoted;
 }
 
 static IRLoops * tcc_ir_opt_licm_ex__timed(TCCIRState *ir);
@@ -2385,6 +2778,18 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
   int hoisted_calls = tcc_ir_hoist_pure_calls(ir, loops);
   int hoisted = 0;
   (void)hoisted_calls;
+
+  /* Loop-invariant global-load hoisting runs on the fresh loop structure (same
+   * preheader shape the pure-call hoist relies on); re-detect if it changed the
+   * IR so the dom-LICM phase below sees valid indices. */
+  if (tcc_ir_hoist_invariant_global_loads(ir, loops) > 0) {
+    tcc_ir_free_loops(loops);
+    loops = tcc_ir_detect_loops(ir);
+    if (!loops || loops->num_loops == 0) {
+      tcc_ir_free_loops(loops);
+      return NULL;
+    }
+  }
 
   /* ── Dominance-based LICM ──
    * Uses proper CFG + dominator tree to detect natural loops and
@@ -2479,19 +2884,36 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
           }
           int dc_stride = max_vr + 1;
           int *def_count = tcc_mallocz(4 * dc_stride * sizeof(int));
+          /* Per-vreg use count within the loop body — a profitability signal for
+           * hoists that don't dominate the loop's exits (see the safety check). */
+          int *use_count = tcc_mallocz(4 * dc_stride * sizeof(int));
           for (int bi = 0; bi < cfg->num_blocks; bi++) {
             if (!in_loop[bi])
               continue;
             for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
               IRQuadCompact *q = &ir->compact_instructions[ii];
-              if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+              if (q->op == TCCIR_OP_NOP)
                 continue;
-              int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
-              if (vr >= 0) {
-                int pos = TCCIR_DECODE_VREG_POSITION(vr);
-                int typ = TCCIR_DECODE_VREG_TYPE(vr);
-                if (pos <= max_vr)
-                  def_count[typ * dc_stride + pos]++;
+              if (irop_config[q->op].has_dest) {
+                int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+                if (vr >= 0) {
+                  int pos = TCCIR_DECODE_VREG_POSITION(vr);
+                  int typ = TCCIR_DECODE_VREG_TYPE(vr);
+                  if (pos <= max_vr)
+                    def_count[typ * dc_stride + pos]++;
+                }
+              }
+              for (int side = 0; side < 2; side++) {
+                if (side == 0 && !irop_config[q->op].has_src1) continue;
+                if (side == 1 && !irop_config[q->op].has_src2) continue;
+                IROperand s = side == 0 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+                int32_t vr = irop_get_vreg(s);
+                if (vr >= 0) {
+                  int pos = TCCIR_DECODE_VREG_POSITION(vr);
+                  int typ = TCCIR_DECODE_VREG_TYPE(vr);
+                  if (pos <= max_vr)
+                    use_count[typ * dc_stride + pos]++;
+                }
               }
             }
           }
@@ -2652,7 +3074,7 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
               insert_pos--;
           }
 
-          /* Skip functions containing SWITCH_TABLE: insert_instruction_before
+          /* Skip functions containing SWITCH_TABLE: tcc_ir_insert_instruction_before
            * doesn't update switch table target indices, so hoisting corrupts
            * the dispatch. */
           {
@@ -2668,6 +3090,7 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
               tcc_free(is_invariant);
               tcc_free(is_exit);
               tcc_free(def_count);
+              tcc_free(use_count);
               tcc_free(in_loop);
               tcc_free(worklist);
               continue;
@@ -2676,7 +3099,7 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
 
           /* When the preheader ends in a jump, insert_pos lands strictly BEFORE
            * the header (in the preheader body).  A branch that targets that
-           * position bypasses the hoist: insert_instruction_before renumbers a
+           * position bypasses the hoist: tcc_ir_insert_instruction_before renumbers a
            * jump whose target == insert_pos to insert_pos+1, so the edge skips
            * the inserted instruction and enters the loop with the hoisted value
            * undefined.  This arises when the preheader is a bare jump block a
@@ -2700,6 +3123,7 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
               tcc_free(is_invariant);
               tcc_free(is_exit);
               tcc_free(def_count);
+              tcc_free(use_count);
               tcc_free(in_loop);
               tcc_free(worklist);
               continue;
@@ -2729,19 +3153,38 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
               if (total_hoisted_here >= max_hoist)
                 break;
 
-              /* Safety: instruction's block must dominate all exit blocks.
-               * Use bi directly — we're iterating block bi's range, and
-               * instr_to_block may be stale after cross-loop insertions. */
+              /* Safety: a trapping / side-effecting instruction may only be
+               * hoisted if its block dominates all loop exits (so it certainly
+               * ran in the original). */
               int instr_block = bi;
-              int safe = 1;
-              for (int ei = 0; ei < cfg->num_blocks && safe; ei++) {
+              int dominates_exits = 1;
+              for (int ei = 0; ei < cfg->num_blocks && dominates_exits; ei++) {
                 if (!is_exit[ei])
                   continue;
                 if (!tcc_ir_cfg_dominates(cfg, instr_block, ei))
-                  safe = 0;
+                  dominates_exits = 0;
               }
-              if (!safe)
-                continue;
+              if (!dominates_exits) {
+                /* This hoist speculates onto the zero-trip path (e.g. a rotated
+                 * for-loop's body never dominates its guard exit).  Only sound
+                 * for a pure fault-free op, and only PROFITABLE when the value
+                 * is used more than once in the loop — a single-use invariant
+                 * hoisted into a pressured loop just spills, costing more than
+                 * the one op it saved. */
+                if (!licm_op_is_speculatable(q->op))
+                  continue;
+                IROperand hd = tcc_ir_op_get_dest(ir, q);
+                int32_t hvr = irop_get_vreg(hd);
+                int hu = 0;
+                if (hvr >= 0) {
+                  int hp = TCCIR_DECODE_VREG_POSITION(hvr);
+                  int ht = TCCIR_DECODE_VREG_TYPE(hvr);
+                  if (hp <= max_vr)
+                    hu = use_count[ht * dc_stride + hp];
+                }
+                if (hu < 2)
+                  continue;
+              }
 
               /* Clone and insert at preheader */
               IRQuadCompact hoist_q = {0};
@@ -2754,10 +3197,10 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
               tcc_ir_pool_add(ir, orig_src2);
 
               int adj_insert = insert_pos + total_hoisted_here;
-              insert_instruction_before(ir, adj_insert, &hoist_q);
+              tcc_ir_insert_instruction_before(ir, adj_insert, &hoist_q);
               total_hoisted_here++;
 
-              /* NOP out the original.  insert_instruction_before shifts
+              /* NOP out the original.  tcc_ir_insert_instruction_before shifts
                * all instructions at indices >= adj_insert.  If adj_insert
                * was before or at adj_ii, the original moved to adj_ii+1;
                * otherwise it stayed at adj_ii. */
@@ -2776,7 +3219,7 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
           }
 
           /* Update CFG block indices to account for inserted instructions.
-           * Each insert_instruction_before shifts all instructions >= insert_pos.
+           * Each tcc_ir_insert_instruction_before shifts all instructions >= insert_pos.
            * After total_hoisted_here insertions at insert_pos, all blocks
            * with indices >= insert_pos are shifted forward. */
           if (total_hoisted_here > 0) {
@@ -2791,6 +3234,7 @@ static IRLoops *tcc_ir_opt_licm_ex__timed(TCCIRState *ir)
           tcc_free(is_invariant);
           tcc_free(is_exit);
           tcc_free(def_count);
+          tcc_free(use_count);
           tcc_free(in_loop);
           tcc_free(worklist);
         }

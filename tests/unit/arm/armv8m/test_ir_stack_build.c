@@ -492,35 +492,5 @@ UT_TEST(test_spill_cache_wrappers_null_ir_no_crash)
   return 0;
 }
 
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(ir_stack_build)
-{
-  UT_COVERS("tcc_ir_stack_build");
-  UT_COVERS("tcc_ir_stack_spill_cache_record");
-  UT_RUN(test_build_no_intervals_is_noop);
-  UT_RUN(test_build_null_ir_no_crash);
-  UT_RUN(test_build_intervals_all_reg_only_produces_no_slots);
-  UT_RUN(test_build_var_vreg_gets_local_kind);
-  UT_RUN(test_build_param_vreg_gets_param_spill_kind);
-  UT_RUN(test_build_temp_vreg_gets_spill_kind);
-  UT_RUN(test_build_llong_gets_8byte_slot);
-  UT_RUN(test_build_double_gets_8byte_slot);
-  UT_RUN(test_build_double_soft_gets_8byte_slot);
-  UT_RUN(test_build_float_gets_4byte_slot);
-  UT_RUN(test_build_multiple_distinct_offsets_creates_multiple_slots);
-  UT_RUN(test_build_stack_slot_index_backlink_set);
-  UT_RUN(test_build_two_intervals_same_offset_share_one_slot);
-  UT_RUN(test_build_repeated_build_resets_previous_slots);
-  UT_RUN(test_build_many_slots_grows_capacity_and_hash);
-  UT_RUN(test_slot_by_offset_finds_built_slot);
-  UT_RUN(test_slot_by_vreg_no_stack_slot_returns_null);
-  UT_RUN(test_spill_cache_record_and_lookup_roundtrip);
-  UT_RUN(test_spill_cache_clear_forgets_entries);
-  UT_RUN(test_spill_cache_invalidate_reg_removes_entry);
-  UT_RUN(test_spill_cache_invalidate_offset_removes_entry);
-  UT_RUN(test_spill_cache_record_same_reg_new_offset_invalidates_old);
-  UT_RUN(test_spill_cache_wrappers_null_ir_no_crash);
-}
+UT_COVERS("tcc_ir_stack_build");
+UT_COVERS("tcc_ir_stack_spill_cache_record");

@@ -156,16 +156,3 @@ UT_TEST(is_64bit_operand_rejects_narrow_and_null_operands)
   UT_ASSERT_EQ(tcc_driver_is_64bit_operand_for_unit_tests(&sv), 0);
   return 0;
 }
-
-UT_SUITE(tcc_driver)
-{
-  UT_RUN(default_outputfile_uses_a_out_for_executable);
-  UT_RUN(default_outputfile_uses_a_out_for_stdin_object_input);
-  UT_RUN(default_outputfile_replaces_last_extension_for_object);
-  UT_RUN(default_outputfile_keeps_extensionless_object_as_a_out);
-  UT_RUN(default_outputfile_uses_object_suffix_for_dependency_output);
-  UT_RUN(default_outputfile_relocatable_object_defaults_to_a_out);
-  UT_RUN(is_64bit_operand_identifies_wide_scalar_types);
-  UT_RUN(is_64bit_operand_masks_type_qualifiers);
-  UT_RUN(is_64bit_operand_rejects_narrow_and_null_operands);
-}

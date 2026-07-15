@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_ldrex.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_ldrex.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -220,20 +220,4 @@ UT_TEST(test_ldrexh_vs_strexh_base_diff)
   UT_ASSERT_EQ(diff, 0x100000);
 
   return 0;
-}
-
-/* ───── suite ───── */
-
-UT_SUITE(thop_ldrex)
-{
-  UT_RUN(test_ldrex_basic);
-  UT_RUN(test_strex_basic);
-  UT_RUN(test_ldrexb_basic);
-  UT_RUN(test_ldrexh_basic);
-  UT_RUN(test_strexb_basic);
-  UT_RUN(test_strexh_basic);
-  UT_RUN(test_ldrex_all_size_4);
-  UT_RUN(test_ldrex_vs_strex_base_diff);
-  UT_RUN(test_ldrexb_vs_strexb_base_diff);
-  UT_RUN(test_ldrexh_vs_strexh_base_diff);
 }

@@ -35,13 +35,13 @@
 
 #define USING_GLOBALS
 #include "ir.h"
-#include "arch/arm/arm.h"
-#include "arch/arm/thumb/thumb.h"
-#include "arch/arm/thumb/thop_alu_imm.h"
-#include "arch/arm/thumb/thop_mem_imm.h"
-#include "arch/arm/thumb/thop_mem_reg.h"
-#include "arch/arm/thumb/thop_mov.h"
-#include "arch/arm/thumb/thop_block.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_alu_imm.h"
+#include "source/backend/arch/arm/thumb/thop_mem_imm.h"
+#include "source/backend/arch/arm/thumb/thop_mem_reg.h"
+#include "source/backend/arch/arm/thumb/thop_mov.h"
+#include "source/backend/arch/arm/thumb/thop_block.h"
 #include "ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
@@ -470,25 +470,4 @@ UT_TEST(test_store_mop_spill_halfword_emits_strh)
   UT_ASSERT(bytes_match_opcode(ind, th_strh_imm(R2, R_FP, 8, 4 /* subtract */, ENFORCE_ENCODING_NONE)));
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_mem)
-{
-  UT_RUN(test_assign_reg_to_reg_distinct_regs_emits_mov);
-  UT_RUN(test_assign_reg_to_spill_emits_store_with_offset);
-  UT_RUN(test_assign_spill_to_reg_emits_load_with_offset);
-  UT_RUN(test_load_mop_spill_nonzero_offset_emits_immediate_ldr);
-  UT_RUN(test_store_mop_spill_nonzero_offset_emits_immediate_str);
-  UT_RUN(test_load_indexed_reg_base_reg_index_emits_register_offset_ldr);
-  UT_RUN(test_store_indexed_reg_base_reg_index_emits_register_offset_str);
-  UT_RUN(test_lea_frame_addr_emits_stack_address_computation);
-  UT_RUN(test_block_copy_small_fixed_size_emits_ldm_stm_pair);
-  UT_RUN(test_load_mop_spill_signed_byte_emits_ldrsb);
-  UT_RUN(test_load_mop_spill_unsigned_byte_emits_ldrb);
-  UT_RUN(test_load_mop_spill_signed_halfword_emits_ldrsh);
-  UT_RUN(test_load_mop_spill_unsigned_halfword_emits_ldrh);
-  UT_RUN(test_store_mop_spill_byte_emits_strb);
-  UT_RUN(test_store_mop_spill_halfword_emits_strh);
 }

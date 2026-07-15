@@ -213,7 +213,7 @@ def test_struct_packed_9byte_by_value():
 # -----------------------------------------------------------------------------
 # Wide-string-literal merge
 # -----------------------------------------------------------------------------
-def test_wide_string_literals_not_merged():
+def test_wide_string_literals_merged():
     obj = _compile("wide_string_merge")
     rodata = _rodata_bytes(obj)
 
@@ -222,8 +222,8 @@ def test_wide_string_literals_not_merged():
     copies = _count_subseq(rodata, literal)
 
     assert rodata, ".rodata is empty"
-    # Current codegen emits two copies; once merging lands this should become 1.
-    assert copies == 2, f"expected two unmerged wide-string copies, got {copies}"
+    # The string-literal pool dedupes identical read-only literals to one copy.
+    assert copies == 1, f"expected merged wide-string literal (1 copy), got {copies}"
 
 
 # -----------------------------------------------------------------------------
@@ -345,6 +345,25 @@ def test_control_branch_conditional_and_loop():
     assert cond_branches >= 1, "if_then_else missing any branch/conditional execution"
     udf_count = _count_mnem(ifte, "udf") + _count_mnem(ifte, "bkpt")
     assert udf_count == 0, f"if_then_else has unexpected undefined/breakpoint instructions ({udf_count})"
+
+
+def test_cmp_common_base_offset_fold_fires():
+    """Common-base CMP constant-offset fold: A = X+K1, B = X+K2 => K1 cond K2.
+
+    Each function must collapse to a constant return (no cmp), proving the fold
+    fired.  HEAD emits adds/adds/cmp + branch for these; a disabled or broken
+    fold would reintroduce the cmp and fail here.  This is the firing-level
+    regression that the QEMU test (361_cmp_offset_common_base.c), being
+    correctness-only, cannot provide.
+    """
+    obj = _compile("cmp_offset_common_base")
+    funcs = _disassemble(obj)
+    expect = {"lt_if": 111, "gt_if": 222, "le_sel": 222, "ne_sel": 111, "sub_if": 111}
+    for name, val in expect.items():
+        fn = funcs[name]
+        assert _count_mnem(fn, "cmp") == 0, f"{name}: common-base fold did not fire (cmp present)"
+        assert _count_mnem_regex(fn, rf"^movs\s+r0, #{val}\b") >= 1, \
+            f"{name}: expected folded constant return {val}"
 
 
 # -----------------------------------------------------------------------------

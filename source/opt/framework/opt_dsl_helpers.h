@@ -8,8 +8,7 @@
  *  License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_DSL_HELPERS_H
-#define TCC_OPT_DSL_HELPERS_H
+#pragma once
 
 #include "opt_dsl_types.h"
 
@@ -75,4 +74,3 @@
 #define TCC_TRACE_OPT(...) do {} while (0)
 #endif
 
-#endif /* TCC_OPT_DSL_HELPERS_H */

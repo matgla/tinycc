@@ -21,6 +21,15 @@
 static int ir_opt_pure_expr_equal_impl(TCCIRState *ir, IROperand a, int a_use_idx,
                                        IROperand b, int b_use_idx, int depth);
 
+int ir_opt_is_memcpy_or_memmove_name(const char *name)
+{
+  return name &&
+         (strcmp(name, "memcpy") == 0 || strcmp(name, "memmove") == 0 ||
+          strcmp(name, "__aeabi_memcpy") == 0 || strcmp(name, "__aeabi_memcpy4") == 0 ||
+          strcmp(name, "__aeabi_memcpy8") == 0 || strcmp(name, "__aeabi_memmove") == 0 ||
+          strcmp(name, "__aeabi_memmove4") == 0 || strcmp(name, "__aeabi_memmove8") == 0);
+}
+
 /* ============================================================================
  * Pass-disable helper (for debugging / bisection)
  * ============================================================================ */
@@ -652,9 +661,10 @@ int tcc_ir_is_pure_aeabi(const char *name)
   /* 64-bit integer comparisons */
   if (strcmp(name, "__aeabi_lcmp") == 0 || strcmp(name, "__aeabi_ulcmp") == 0)
     return 1;
-  /* 64-bit integer arithmetic */
+  /* 64-bit integer arithmetic (div/mod trap only on a zero divisor, which is UB) */
   if (strcmp(name, "__aeabi_lmul") == 0 || strcmp(name, "__aeabi_ldivmod") == 0 ||
-      strcmp(name, "__aeabi_uldivmod") == 0)
+      strcmp(name, "__aeabi_uldivmod") == 0 || strcmp(name, "__aeabi_lmod") == 0 ||
+      strcmp(name, "__aeabi_ulmod") == 0)
     return 1;
   /* 64-bit shifts */
   if (strcmp(name, "__aeabi_llsl") == 0 || strcmp(name, "__aeabi_llsr") == 0 || strcmp(name, "__aeabi_lasr") == 0)

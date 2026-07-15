@@ -73,6 +73,17 @@ UT_TEST(test_bcf_clrsb)
   return 0;
 }
 
+UT_TEST(test_bcf_bswap)
+{
+  FOLD_EQ("__bswapsi2", 0x11223344u, (int)0x44332211u);
+  FOLD_EQ("__bswapsi2", 0x000000ffu, (int)0xff000000u);
+  FOLD_EQ("__bswapsi2", 0u, 0);
+  FOLD_EQ("__bswapsi2", 0xffffffffu, (int)0xffffffffu);
+  /* __bswapdi3 (64-bit) is deliberately not folded (int-result path). */
+  NO_FOLD("__bswapdi3", 0x1122334455667788ull);
+  return 0;
+}
+
 UT_TEST(test_bcf_no_fold)
 {
   /* clz/ctz of 0 are UB -> not folded. */
@@ -87,11 +98,4 @@ UT_TEST(test_bcf_no_fold)
   return 0;
 }
 
-UT_SUITE(ssa_opt_bitop_const_fold)
-{
-  UT_COVERS("bitop_const_fold");
-  UT_RUN(test_bcf_popcount_parity);
-  UT_RUN(test_bcf_clz_ctz_ffs);
-  UT_RUN(test_bcf_clrsb);
-  UT_RUN(test_bcf_no_fold);
-}
+UT_COVERS("bitop_const_fold");

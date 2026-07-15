@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_SSA_BITOP_CONST_FOLD_H
-#define TCC_OPT_SSA_BITOP_CONST_FOLD_H
+#pragma once
 
 #include <stdint.h>
 
@@ -25,4 +24,3 @@ int tcc_ir_ssa_opt_bitop_const_fold(struct IRSSAOptCtx *ctx);
  * evaluate it on `val`.  Returns 1 (writes *out) when foldable, else 0. */
 int tcc_ir_bitop_const_eval(const char *name, int64_t val, int *out);
 
-#endif /* TCC_OPT_SSA_BITOP_CONST_FOLD_H */

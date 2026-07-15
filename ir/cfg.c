@@ -35,6 +35,24 @@ add_pred:
   tb->preds[tb->num_preds++] = from;
 }
 
+int tcc_ir_cfg_flat_has_backedge(TCCIRState *ir)
+{
+  if (!ir)
+    return 0;
+  int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_SWITCH_LOAD)
+      return 1;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
+      int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      if (target >= 0 && target <= i)
+        return 1;
+    }
+  }
+  return 0;
+}
+
 IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -169,6 +187,8 @@ void tcc_ir_cfg_free(IRCFG *cfg)
   tcc_free(cfg->blocks);
   tcc_free(cfg->rpo_order);
   tcc_free(cfg->instr_to_block);
+  tcc_free(cfg->dom_tin);
+  tcc_free(cfg->dom_tout);
   tcc_free(cfg);
 }
 
@@ -267,12 +287,73 @@ void tcc_ir_cfg_compute_dominators(IRCFG *cfg)
       }
     }
   }
+
+  /* Pre/post-order stamps over the idom tree for O(1) dominance queries. */
+  {
+    int nb = cfg->num_blocks;
+    tcc_free(cfg->dom_tin);
+    tcc_free(cfg->dom_tout);
+    cfg->dom_tin = tcc_malloc(sizeof(int) * nb);
+    cfg->dom_tout = tcc_malloc(sizeof(int) * nb);
+    cfg->dom_dfs_count = nb;
+    for (int i = 0; i < nb; i++) { cfg->dom_tin[i] = -1; cfg->dom_tout[i] = -1; }
+
+    int *ccount = tcc_mallocz(sizeof(int) * nb);
+    for (int ri = 0; ri < cfg->rpo_count; ri++) {
+      int b = cfg->rpo_order[ri];
+      int p = cfg->blocks[b].idom;
+      if (b != 0 && p >= 0 && p != b)
+        ccount[p]++;
+    }
+    int *cstart = tcc_malloc(sizeof(int) * (nb + 1));
+    cstart[0] = 0;
+    for (int i = 0; i < nb; i++) cstart[i + 1] = cstart[i] + ccount[i];
+    int *chld = tcc_malloc(sizeof(int) * (cstart[nb] > 0 ? cstart[nb] : 1));
+    int *nxt = ccount; /* reuse as per-parent write cursor, then DFS child cursor */
+    for (int i = 0; i < nb; i++) nxt[i] = cstart[i];
+    for (int ri = 0; ri < cfg->rpo_count; ri++) {
+      int b = cfg->rpo_order[ri];
+      int p = cfg->blocks[b].idom;
+      if (b != 0 && p >= 0 && p != b)
+        chld[nxt[p]++] = b;
+    }
+    for (int i = 0; i < nb; i++) nxt[i] = cstart[i];
+
+    if (cfg->rpo_count > 0) {
+      int *stack = tcc_malloc(sizeof(int) * (cfg->rpo_count + 1));
+      int sp = 0, clock = 0;
+      stack[sp++] = 0;
+      cfg->dom_tin[0] = clock++;
+      while (sp > 0) {
+        int b = stack[sp - 1];
+        if (nxt[b] < cstart[b + 1]) {
+          int c = chld[nxt[b]++];
+          cfg->dom_tin[c] = clock++;
+          stack[sp++] = c;
+        } else {
+          cfg->dom_tout[b] = clock++;
+          sp--;
+        }
+      }
+      tcc_free(stack);
+    }
+    tcc_free(ccount);
+    tcc_free(cstart);
+    tcc_free(chld);
+  }
 }
 
 int tcc_ir_cfg_dominates(IRCFG *cfg, int a, int b)
 {
   if (!cfg || a < 0 || b < 0 || a >= cfg->num_blocks || b >= cfg->num_blocks)
     return 0;
+  if (a == b)
+    return 1;
+  if (cfg->dom_tin && a < cfg->dom_dfs_count && b < cfg->dom_dfs_count) {
+    if (cfg->dom_tin[a] < 0 || cfg->dom_tin[b] < 0)
+      return 0;
+    return cfg->dom_tin[a] < cfg->dom_tin[b] && cfg->dom_tout[b] < cfg->dom_tout[a];
+  }
   while (b >= 0) {
     if (b == a)
       return 1;

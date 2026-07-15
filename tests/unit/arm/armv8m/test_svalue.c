@@ -79,13 +79,3 @@ UT_TEST(test_const_negative)
   UT_ASSERT_EQ((int64_t)sv.c.i, (int64_t)-123456789);
   return 0;
 }
-
-UT_SUITE(svalue)
-{
-  UT_RUN(test_init_clears_fields);
-  UT_RUN(test_const_i64);
-  UT_RUN(test_call_id_encoding);
-  UT_RUN(test_call_id_argc_encoding);
-  UT_RUN(test_call_id_zero);
-  UT_RUN(test_const_negative);
-}

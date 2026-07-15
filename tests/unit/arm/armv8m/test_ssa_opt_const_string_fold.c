@@ -405,24 +405,4 @@ UT_TEST(test_csf_strchr_nonconst_char_no_fold)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(ssa_opt_const_string_fold)
-{
-  UT_COVERS("const_string_fold");
-  UT_RUN(test_csf_strlen_stack_positive);
-  UT_RUN(test_csf_strlen_stack_no_nul_no_fold);
-  UT_RUN(test_csf_strlen_void_no_fold);
-  UT_RUN(test_csf_memcmp_zero_len_positive);
-  UT_RUN(test_csf_strncmp_zero_len_positive);
-  UT_RUN(test_csf_strcmp_nonconst_args_no_fold);
-  UT_RUN(test_csf_strncmp_missing_len_no_fold);
-  UT_RUN(test_csf_strcpy_nonstack_dst_no_fold);
-  UT_RUN(test_csf_strcpy_nonconst_src_no_fold);
-  UT_RUN(test_csf_driver_unknown_builtin_skip);
-  UT_RUN(test_csf_driver_memcmp_zero_fold);
-  UT_RUN(test_csf_driver_no_calls);
-  UT_RUN(test_csf_search_nonconst_no_fold);
-  UT_RUN(test_csf_search_void_no_fold);
-  UT_RUN(test_csf_strchr_nonconst_char_no_fold);
-}
+UT_COVERS("const_string_fold");

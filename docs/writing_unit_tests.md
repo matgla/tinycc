@@ -115,18 +115,22 @@ A single ~200-line header, no external libraries. Everything you need:
 
 | Macro | Purpose |
 |-------|---------|
-| `UT_TEST(name)` | Declares a test: expands to `static int name(void)`. Return `0` = pass, `-1` = fail. |
+| `UT_TEST(name)` | Declares **and auto-registers** a test: expands to `static int name(void)` plus a constructor that adds it to the registry. Return `0` = pass, `-1` = fail. |
+| `UT_TEST_DISABLED(name)` | Declares a test **without** registering it — it keeps compiling but never runs. Use for pinned-but-broken cases (with a `docs/bugs.md` entry). |
 | `UT_ASSERT(cond)` | Fail (print `file:line`, record, `return -1`) if `cond` is false. |
 | `UT_ASSERT_EQ(a, b)` | Fail unless `a == b` (both cast to `long long`); prints both values. |
 | `UT_ASSERT_NE(a, b)` | Fail unless `a != b`. |
 | `UT_ASSERT_STREQ(a, b)` | String equality, NULL-safe. |
-| `UT_SUITE(name)` | Defines a suite function `void ut_suite_##name(void)`. |
-| `UT_RUN(test)` | Runs one `UT_TEST` inside a suite body. |
-| `UT_DECLARE_SUITE(name)` | Forward-declares a suite (used in `test_main*.c`). |
-| `UT_RUN_SUITE(name)` | Runs a suite from `main()`. |
-| `UT_COVERS(pass)` | Annotation: this suite covers optimization pass `"pass"`. No-op at runtime; consumed by the pass-coverage ledger. |
-| `UT_MAIN_IMPL` | Instantiates the shared counters. **Exactly one** TU per binary uses it (the `test_main*.c` for that binary). |
-| `UT_REPORT_AND_EXIT()` | Prints the summary; returns `0` if all passed, else `1`. |
+| `UT_SUITE_SETUP(fn)` / `UT_SUITE_TEARDOWN(fn)` | Registers `fn` to run before the file's first test / after its last. Only for genuinely shared state (see `test_tccpp.c`). |
+| `UT_COVERS(pass)` | File-scope annotation: this file covers optimization pass `"pass"`. Consumed by the pass-coverage ledger. |
+| `UT_MAIN_IMPL` | Instantiates the shared counters and the test registry. **Exactly one** TU per binary uses it (the `test_main*.c` for that binary). |
+| `ut_run_all(argc, argv)` | Runs every registered test, grouped into suites by file name (`test_<suite>.c`). argv entries are substring filters on suite/test names. Returns the exit code. |
+
+There is **no suite boilerplate and no registration step**: dropping a
+`UT_TEST` into a `test_*.c` file that the Makefile links is all it takes. The
+suite name is derived from the file name; tests run in definition order within
+a file, files in link order. Run a subset with e.g.
+`./build/run_unit_tests opt_dce` or `./build/run_unit_tests test_hash_insert`.
 
 **Semantics to remember:**
 
@@ -217,14 +221,7 @@ UT_TEST(test_feature_edge_case)
   return 0;
 }
 
-/* -------------------------------------------------------- suite */
-
-UT_SUITE(<module>)
-{
-  UT_COVERS("<pass_name>");   /* optional: only for optimizer passes */
-  UT_RUN(test_feature_basic);
-  UT_RUN(test_feature_edge_case);
-}
+UT_COVERS("<pass_name>");   /* optional file-scope marker: only for optimizer passes */
 ```
 
 `tests/unit/arm/armv8m/test_arm_link.c` is a thorough worked example: table-driven
@@ -243,17 +240,7 @@ not violated):
 Use the template in §4. Include only what the module needs. Prefix `USING_GLOBALS`
 only if the module accesses `tcc_state` (see the gotcha in §6).
 
-### Step 2 — Register it in `test_main.c`
-
-Add two lines, keeping the ordering consistent with the existing list:
-
-```c
-UT_DECLARE_SUITE(my_new_module);   /* near the top, with the others */
-...
-UT_RUN_SUITE(my_new_module);       /* inside main(), in the same relative order */
-```
-
-### Step 3 — Wire it into the Makefile
+### Step 2 — Wire it into the Makefile
 
 1. Add the test file to `UT_LOCAL_SRCS`:
 
@@ -279,7 +266,7 @@ UT_RUN_SUITE(my_new_module);       /* inside main(), in the same relative order 
    layer). Don't move a file out of that list unless you've supplied the symbols
    its real code needs.
 
-### Step 4 — Build and run
+### Step 3 — Build and run
 
 ```bash
 make -C tests/unit/arm/armv8m run          # this binary only
@@ -521,10 +508,10 @@ investigate the hang — don't increase the timeout.
 
 ## 12. Pre-finish checklist
 
-- [ ] Test file is `tests/unit/arm/armv8m/test_<module>.c`, wrapped in
-      `UT_SUITE(<module>)`.
-- [ ] Registered in the right `test_main*.c` (`UT_DECLARE_SUITE` + `UT_RUN_SUITE`)
-      and listed in the right `UTn_LOCAL_SRCS` (and `UT_MODULE_SRCS` if needed).
+- [ ] Test file is `tests/unit/arm/armv8m/test_<module>.c` and is listed in the
+      right `UTn_LOCAL_SRCS` (and `UT_MODULE_SRCS` if needed).
+- [ ] No test depends on state left behind by a sibling test — every `UT_TEST`
+      in a linked file runs, in definition order.
 - [ ] **No product source was modified** — `git status` shows changes only under
       `tests/unit/` (Rule 1).
 - [ ] Every suspected bug is pinned as a characterization test **and** written up

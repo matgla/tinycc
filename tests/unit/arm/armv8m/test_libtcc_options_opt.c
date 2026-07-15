@@ -324,21 +324,3 @@ UT_TEST(test_tcc_set_options_unrecognized_w_subflag_is_not_an_error)
   tcc_delete(s);
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(libtcc_options_opt)
-{
-  UT_RUN(test_tcc_set_options_no_o_flag_leaves_opt_fields_at_default);
-  UT_RUN(test_tcc_set_options_o0_leaves_opt_fields_at_default);
-  UT_RUN(test_tcc_set_options_o1_enables_pass_batch);
-  UT_RUN(test_tcc_set_options_o2_additionally_enables_inline_functions);
-  UT_RUN(test_tcc_set_options_o2_does_not_lower_explicit_inline_limit);
-  UT_RUN(test_tcc_set_options_wall_sets_warn_batch);
-  UT_RUN(test_tcc_set_options_single_w_flag_sets_only_that_flag);
-  UT_RUN(test_tcc_set_options_w_sets_warn_none);
-  UT_RUN(test_tcc_set_options_w_suppresses_plain_warning_via_error_func);
-  UT_RUN(test_tcc_set_options_without_w_plain_warning_reaches_error_func);
-  UT_RUN(test_tcc_set_options_unrecognized_flag_returns_minus1_no_abort);
-  UT_RUN(test_tcc_set_options_unrecognized_w_subflag_is_not_an_error);
-}

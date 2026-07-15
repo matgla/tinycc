@@ -1,5 +1,5 @@
 /* fuzz struct_byval seed 182993 (O1/O2 divergence).
- * Pass: ssa:var_to_param_forward (ir/opt/ssa_opt_cprop.c).
+ * Pass: ssa:var_to_param_forward (source/opt/ssa/scalar/cprop.c).
  * Root cause: forwarding a single-def VAR's constant into a STORE_INDEXED
  * value operand used the immediate's own (narrower) btype for the store
  * width.  u4 = (unsigned)s3 (short) folded to a 16-bit-typed constant; the

@@ -499,24 +499,4 @@ UT_TEST(test_ssa_reroll_driver_rerolls_and_is_idempotent)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_reroll)
-{
-  UT_COVERS("reroll");
-  UT_RUN(test_reroll_basic_run_rerolls);
-  UT_RUN(test_reroll_emits_exact_loop_structure);
-  UT_RUN(test_reroll_min_repeats_boundary_rerolls);
-  UT_RUN(test_reroll_longer_run_uses_all_repeats);
-  UT_RUN(test_reroll_identity_rename_self_feedback_rerolls);
-  UT_RUN(test_reroll_three_repeats_no_reroll);
-  UT_RUN(test_reroll_too_few_instructions_no_reroll);
-  UT_RUN(test_reroll_distinct_blocks_no_reroll);
-  UT_RUN(test_reroll_external_use_blocks_reroll);
-  UT_RUN(test_reroll_unsafe_op_in_body_no_reroll);
-  UT_RUN(test_reroll_internal_jump_target_blocks_reroll);
-  UT_RUN(test_reroll_period_two_no_reroll);
-  UT_RUN(test_reroll_idempotent);
-  UT_RUN(test_reroll_empty_ir_no_change);
-  UT_RUN(test_ssa_reroll_driver_rerolls_and_is_idempotent);
-}
+UT_COVERS("reroll");

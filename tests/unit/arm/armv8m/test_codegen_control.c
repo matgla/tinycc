@@ -13,7 +13,7 @@
 #include "ir/regalloc.h"
 #include "ir/codegen.h"
 #include "ir/machine_op.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
 
@@ -1013,37 +1013,4 @@ UT_TEST(test_dispatch_switch_load_routes_to_switch_load_mop)
   ir->num_switch_value_tables = 0;
   tcc_ir_free(ir);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(codegen_control)
-{
-  UT_RUN(test_jumpif_operands);
-  UT_RUN(test_jump_and_ijump_operands);
-  UT_RUN(test_diamond_backpatch);
-  UT_RUN(test_bb_start);
-  UT_RUN(test_switch_operands);
-  UT_RUN(test_cmp_jmp_set_empty_stack_is_noop);
-  UT_RUN(test_cmp_jmp_set_simple_vt_cmp_emits_single_setif);
-  UT_RUN(test_cmp_jmp_set_vt_cmp_merges_pending_jtrue_chain);
-  UT_RUN(test_cmp_jmp_set_vt_jmp_emits_default_and_flipped_assign_pair);
-  UT_RUN(test_cmp_jmp_set_vt_jmpi_backpatches_real_chain);
-  UT_RUN(test_cmp_jmp_set_plain_value_is_noop);
-  UT_RUN(test_test_gen_vt_cmp_no_invert_emits_jumpif_and_returns_its_index);
-  UT_RUN(test_test_gen_vt_cmp_invert_xors_cmp_op);
-  UT_RUN(test_test_gen_plain_value_recurses_through_test_zero);
-  UT_RUN(test_test_gen_vt_jmp_matching_invert_adopts_empty_chain);
-  UT_RUN(test_test_gen_vt_jmp_matching_invert_merges_nonempty_chain);
-  UT_RUN(test_test_gen_vt_jmp_mismatched_invert_emits_jump);
-  UT_RUN(test_test_gen_constant_condition_taken_emits_jump_and_sets_nocode);
-  UT_RUN(test_test_gen_constant_condition_not_taken_is_noop);
-  UT_RUN(test_dispatch_jump_routes_to_jump_mop);
-  UT_RUN(test_dispatch_jumpif_routes_to_conditional_jump_mop);
-  UT_RUN(test_dispatch_ijump_routes_to_indirect_jump_mop);
-  UT_RUN(test_dispatch_setif_routes_to_setif_mop);
-  UT_RUN(test_dispatch_switch_table_uses_distinct_mop_per_pass);
-  UT_RUN(test_dispatch_switch_load_routes_to_switch_load_mop);
 }

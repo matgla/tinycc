@@ -7,8 +7,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_alu_imm.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_alu_imm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -376,41 +376,4 @@ UT_TEST(test_add_imm_pc_in_rd_fails_t32)
   UT_ASSERT_EQ(op.opcode, 0);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_alu_imm)
-{
-  /* ADD */
-  UT_RUN(test_add_imm_t16_imm8);
-  UT_RUN(test_add_imm_t16_imm3);
-  UT_RUN(test_add_imm_t16_sp_imm7);
-  UT_RUN(test_add_imm_t16_sp_imm8);
-  UT_RUN(test_add_imm_t32_mod_imm);
-  UT_RUN(test_add_imm_t32_mod_imm_setflags);
-  UT_RUN(test_addw_imm12);
-
-  /* SUB */
-  UT_RUN(test_sub_imm_t16_imm8);
-  UT_RUN(test_sub_imm_t16_imm3);
-  UT_RUN(test_sub_imm_t16_sp_imm7);
-  UT_RUN(test_subw_imm12);
-
-  /* T32-only ALU imm */
-  UT_RUN(test_rsb_imm_t32_mod_imm);
-  UT_RUN(test_adc_imm_t32_mod_imm);
-  UT_RUN(test_sbc_imm_t32_mod_imm);
-  UT_RUN(test_and_imm_t32_mod_imm);
-  UT_RUN(test_bic_imm_t32_mod_imm);
-  UT_RUN(test_orr_imm_t32_mod_imm);
-  UT_RUN(test_orn_imm_t32_mod_imm);
-  UT_RUN(test_eor_imm_t32_mod_imm);
-
-  /* Constraints / feature mismatches */
-  UT_RUN(test_add_imm_rd_ne_rn_falls_to_t2);
-  UT_RUN(test_add_imm_high_reg_falls_to_t32);
-  UT_RUN(test_add_imm_t16_sp_requires_sp);
-  UT_RUN(test_and_imm_no_modimm_feature_fails);
-  UT_RUN(test_add_imm_pc_in_rd_fails_t32);
 }

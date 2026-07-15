@@ -185,17 +185,3 @@ UT_TEST(test_vreg_null_alloc_temp_returns_minus1)
   UT_ASSERT_EQ(tcc_ir_vreg_alloc_var(NULL), -1);
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(ir_vreg)
-{
-  UT_RUN(test_vreg_alloc_temp_sequential);
-  UT_RUN(test_vreg_alloc_var_sequential);
-  UT_RUN(test_vreg_alloc_param_sequential);
-  UT_RUN(test_vreg_types_independent);
-  UT_RUN(test_vreg_is_valid);
-  UT_RUN(test_vreg_alloc_temp_grows_capacity);
-  UT_RUN(test_vreg_is_ignored_no_table);
-  UT_RUN(test_vreg_null_alloc_temp_returns_minus1);
-}

@@ -321,6 +321,16 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
       return m;
     }
 
+    /* Rematerialize a spilled int32 constant: emit `mov reg, #imm` instead of a
+     * stack reload (cheaper, and removes a load).  Only for a plain value read —
+     * not a pointer deref (use_llocal) or a stack-passed parameter. */
+    if (interval->remat_kind == 1 && !use_llocal && !spilled_param)
+    {
+      m.kind = MACH_OP_IMM;
+      m.u.imm.val = (int64_t)interval->remat_imm;
+      return m;
+    }
+
     m.kind = MACH_OP_SPILL;
     m.u.spill.offset = alloc_offset;
     m.needs_deref = (bool)use_llocal;

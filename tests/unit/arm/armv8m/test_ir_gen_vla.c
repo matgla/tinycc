@@ -129,12 +129,3 @@ UT_TEST(test_vla_save_then_restore_round_trip_same_slot)
   tcc_ir_free(ir);
   return 0;
 }
-
-UT_SUITE(ir_gen_vla)
-{
-  UT_RUN(test_vla_alloc_emits_op_with_size_and_align);
-  UT_RUN(test_vla_alloc_honors_requested_alignment);
-  UT_RUN(test_vla_sp_save_emits_op_with_stack_dest);
-  UT_RUN(test_vla_sp_restore_emits_op_with_stack_src);
-  UT_RUN(test_vla_save_then_restore_round_trip_same_slot);
-}

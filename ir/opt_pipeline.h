@@ -11,8 +11,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_OPT_PIPELINE_H
-#define TCC_IR_OPT_PIPELINE_H
+#pragma once
 
 #include <stdint.h>
 #include "opt_engine.h"
@@ -111,12 +110,7 @@ extern const IRPassGroup entry_store_group;
 /* Concrete gen-pass adapters (pipeline-callable) */
 int tcc_ir_opt_gens_fusion_ex(IROptCtx *ctx);
 int tcc_ir_opt_gens_deref_indexed_ex(IROptCtx *ctx);
-int tcc_ir_opt_gens_disp_ex(IROptCtx *ctx);
-int tcc_ir_opt_gens_chain_ex(IROptCtx *ctx);
-int tcc_ir_opt_gens_pair_reorder_ex(IROptCtx *ctx);
 int tcc_ir_opt_gens_bool_ex(IROptCtx *ctx);
 int tcc_ir_opt_gens_call_result_ex(IROptCtx *ctx);
-int tcc_ir_opt_gens_call_result_post_ex(IROptCtx *ctx);
 int tcc_ir_opt_gens_branch_ex(IROptCtx *ctx);
 
-#endif /* TCC_IR_OPT_PIPELINE_H */

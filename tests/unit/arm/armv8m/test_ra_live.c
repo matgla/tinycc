@@ -9,7 +9,7 @@
 #include "ir/ssa.h"
 #include "ir/vreg.h"
 #include "ir/regalloc.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "ut.h"
 
 static void setup_allocator_state(void)
@@ -157,15 +157,4 @@ UT_TEST(test_live_call_crossing)
 
   tcc_ir_free(ir);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(ra_live)
-{
-  UT_RUN(test_live_straight_line);
-  UT_RUN(test_live_loop_backedge);
-  UT_RUN(test_live_call_crossing);
 }

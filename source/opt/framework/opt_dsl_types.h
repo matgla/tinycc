@@ -8,8 +8,7 @@
  *  License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_DSL_TYPES_H
-#define TCC_OPT_DSL_TYPES_H
+#pragma once
 
 #include <stdint.h>
 
@@ -68,4 +67,3 @@ typedef struct {
   IROperand   src2;
 } IROptRewriteSpec;
 
-#endif /* TCC_OPT_DSL_TYPES_H */

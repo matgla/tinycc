@@ -18,17 +18,17 @@
 
 #define USING_GLOBALS
 #include "ir.h"
-#include "arch/arm/arm.h"
-#include "arch/arm/thumb/thumb.h"
-#include "arch/arm/thumb/thop_alu_reg.h"
-#include "arch/arm/thumb/thop_alu_imm.h"
-#include "arch/arm/thumb/thop_shift_reg.h"
-#include "arch/arm/thumb/thop_shift_imm.h"
-#include "arch/arm/thumb/thop_branch.h"
-#include "arch/arm/thumb/thop_cmp.h"
-#include "arch/arm/thumb/thop_mov.h"
-#include "arch/arm/thumb/thop_mul.h"
-#include "arch/arm/thumb/thop_system.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_alu_reg.h"
+#include "source/backend/arch/arm/thumb/thop_alu_imm.h"
+#include "source/backend/arch/arm/thumb/thop_shift_reg.h"
+#include "source/backend/arch/arm/thumb/thop_shift_imm.h"
+#include "source/backend/arch/arm/thumb/thop_branch.h"
+#include "source/backend/arch/arm/thumb/thop_cmp.h"
+#include "source/backend/arch/arm/thumb/thop_mov.h"
+#include "source/backend/arch/arm/thumb/thop_mul.h"
+#include "source/backend/arch/arm/thumb/thop_system.h"
 #include "ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
@@ -900,80 +900,4 @@ UT_TEST(test_dp_sar64_imm32)
   UT_ASSERT(bytes_match_opcode_at(2, 2, th_asr_imm(R1, R3, 31, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)));
 
   return 0;
-}
-
-/* ------------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_arith)
-{
-  /* data_processing_mop */
-  UT_RUN(test_dp_sub_reg_reg_reg_t16);
-  UT_RUN(test_dp_and_reg_reg_reg_t32);
-  UT_RUN(test_dp_or_reg_reg_reg_t32);
-  UT_RUN(test_dp_xor_reg_reg_reg_t32);
-  UT_RUN(test_dp_shl_reg_reg_reg_t32);
-  UT_RUN(test_dp_sar_reg_reg_reg_t32);
-  UT_RUN(test_dp_shr_reg_reg_reg_t32);
-  UT_RUN(test_dp_add_reg_imm_encoding_path);
-  UT_RUN(test_dp_ror_reg_reg_reg_t32);
-  UT_RUN(test_dp_ror_reg_reg_imm);
-  UT_RUN(test_dp_adc_reg_reg_reg_t32);
-  UT_RUN(test_dp_adc_reg_reg_imm);
-  UT_RUN(test_dp_cmp_reg_reg_t16);
-  UT_RUN(test_dp_cmp_reg_imm_t16);
-
-  /* data_processing_mop_flags */
-  UT_RUN(test_dp_flags_ands_reg_reg_reg);
-
-  /* 64-bit data_processing_mop */
-  UT_RUN(test_dp_add64_reg_reg_reg);
-  UT_RUN(test_dp_sub64_reg_reg_reg);
-  UT_RUN(test_dp_or64_reg_reg_reg);
-  UT_RUN(test_dp_xor64_reg_reg_reg);
-  UT_RUN(test_dp_and64_reg_reg_reg);
-  UT_RUN(test_dp_shl64_imm32);
-  UT_RUN(test_dp_shr64_imm32);
-  UT_RUN(test_dp_sar64_imm32);
-
-  /* muldiv_mop */
-  UT_RUN(test_muldiv_mul_reg_reg_reg);
-  UT_RUN(test_muldiv_sdiv_reg_reg_reg);
-  UT_RUN(test_muldiv_udiv_reg_reg_reg);
-  UT_RUN(test_muldiv_test_zero_32bit);
-  UT_RUN(test_muldiv_test_zero_64bit);
-
-  /* mla_mop */
-  UT_RUN(test_mla_dest_eq_src1_mul_src2_plus_accum);
-
-  /* umull_mop / smull_mop */
-  UT_RUN(test_umull_dest_pair_lo_hi);
-  UT_RUN(test_smull_dest_pair_lo_hi);
-
-  /* pack64_mop */
-  UT_RUN(test_pack64_lo_hi_into_reg_pair);
-
-  /* ubfx_mop */
-  UT_RUN(test_ubfx_lsb8_width4);
-
-  /* bfi_mop */
-  UT_RUN(test_bfi_inplace_host_word_eq_dest);
-  UT_RUN(test_bfi_dest_ne_host_word_inserts_mov);
-
-  /* cmp_eq64_mop */
-  UT_RUN(test_cmp_eq64_reg_pairs);
-
-  /* subs_eq_select_01 */
-  UT_RUN(test_subs_eq_select_01_emits_subs_it_movne);
-  UT_RUN(test_subs_eq_select_01_rejects_non_imm);
-
-  /* mlal_accum_mop */
-  UT_RUN(test_mlal_accum_signed_inplace_pair);
-  UT_RUN(test_mlal_accum_unsigned_inplace_pair);
-  UT_RUN(test_mlal_accum_rejects_mismatched_pair);
-
-  /* mul_const_add_fused_mop */
-  UT_RUN(test_mul_const_add_fused_pow2);
-  UT_RUN(test_mul_const_add_fused_two_n_plus_1_shift);
-  UT_RUN(test_mul_const_add_fused_two_n_minus_1_shift);
-  UT_RUN(test_mul_const_add_fused_non_fallthrough_const);
 }

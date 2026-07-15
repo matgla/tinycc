@@ -573,27 +573,4 @@ UT_TEST(test_loop_dead_bottom_tested_no_fire)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_loop_dead)
-{
-  UT_COVERS("ssa_first_iter_exit");
-  UT_RUN(test_loop_dead_test_zero_eq_fires);
-  UT_RUN(test_loop_dead_test_zero_ne_fires);
-  UT_RUN(test_loop_dead_test_zero_eq_not_taken_no_fire);
-  UT_RUN(test_loop_dead_cmp_lt_fires);
-  UT_RUN(test_loop_dead_cmp_lt_false_no_fire);
-  UT_RUN(test_loop_dead_cmp_ult_unsigned_semantics_no_fire);
-  UT_RUN(test_loop_dead_lea_deref_fires);
-  UT_RUN(test_loop_dead_store_through_ptr_fires);
-  UT_RUN(test_loop_dead_call_invalidates_no_fire);
-  UT_RUN(test_loop_dead_unknown_value_no_fire);
-  UT_RUN(test_loop_dead_no_loop_no_fire);
-  UT_RUN(test_loop_dead_jumpif_target_inside_loop_no_fire);
-  UT_RUN(test_loop_dead_test_zero_unknown_tok_no_fire);
-  UT_RUN(test_loop_dead_intervening_jump_bails_no_fire);
-  UT_RUN(test_loop_dead_idempotent);
-  UT_RUN(test_loop_dead_extra_header_pred_no_fire);
-  UT_RUN(test_loop_dead_interleaved_nonloop_code_survives);
-  UT_RUN(test_loop_dead_bottom_tested_no_fire);
-}
+UT_COVERS("ssa_first_iter_exit");

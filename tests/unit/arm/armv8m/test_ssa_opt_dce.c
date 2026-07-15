@@ -883,36 +883,4 @@ UT_TEST(test_dce_optimize_zero_skips_advanced)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_dce)
-{
-  UT_COVERS("ssa:dce");
-  UT_RUN(test_dce_dead_assign);
-  UT_RUN(test_dce_live_assign);
-  UT_RUN(test_dce_dead_store_value_def);
-  UT_RUN(test_dce_live_side_effect_temp_kept);
-  UT_RUN(test_dce_dead_mla);
-  UT_RUN(test_dce_dead_temp_chain);
-  UT_RUN(test_dce_unreachable_after_return);
-  UT_RUN(test_dce_unreachable_jump_target);
-  UT_RUN(test_dce_unreachable_indirect_jump);
-  UT_RUN(test_dce_dead_var_store);
-  UT_RUN(test_dce_live_var_store_load);
-  UT_RUN(test_dce_var_addrtaken_lea);
-  UT_RUN(test_dce_dead_var_nested_bailout);
-  UT_RUN(test_dce_mla_var_accumulator_keeps_store);
-  UT_RUN(test_dce_store_indexed_var_pointer_kept);
-  UT_RUN(test_dce_dead_var_write_through_pointer);
-  UT_RUN(test_dce_dead_stackloc_store);
-  UT_RUN(test_dce_stackloc_store_read_by_load);
-  UT_RUN(test_dce_stackloc_store_address_escape);
-  UT_RUN(test_dce_stackloc_store_is_llocal_kept);
-  UT_RUN(test_dce_stackloc_static_chain_bailout);
-  UT_RUN(test_dce_dead_overwrite_same_offset);
-  UT_RUN(test_dce_overwrite_intervening_load);
-  UT_RUN(test_dce_overwrite_call_clears_pending);
-  UT_RUN(test_dce_overwrite_unknown_alias);
-  UT_RUN(test_dce_dead_overwrite_indexed);
-  UT_RUN(test_dce_dead_phi_cycle_removed);
-  UT_RUN(test_dce_dead_phi_cycle_backedge_kept);
-  UT_RUN(test_dce_optimize_zero_skips_advanced);
-}
+UT_COVERS("ssa:dce");

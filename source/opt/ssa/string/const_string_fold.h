@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_SSA_CONST_STRING_FOLD_H
-#define TCC_OPT_SSA_CONST_STRING_FOLD_H
+#pragma once
 
 struct IRSSAOptCtx;
 
@@ -18,4 +17,3 @@ struct IRSSAOptCtx;
  * become constant in SSA (docs/plan_ssa_const_string_fold.md) still fold. */
 int tcc_ir_ssa_opt_const_string_fold(struct IRSSAOptCtx *ctx);
 
-#endif /* TCC_OPT_SSA_CONST_STRING_FOLD_H */

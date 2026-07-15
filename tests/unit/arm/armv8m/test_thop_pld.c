@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_pld.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_pld.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -214,24 +214,4 @@ UT_TEST(test_pli_reg_default_shift)
     UT_ASSERT_EQ(op.opcode, 0xF911F002);
 
     return 0;
-}
-
-/* ───── suite ───── */
-
-UT_SUITE(thop_pld)
-{
-    UT_RUN(test_pld_literal_positive);
-    UT_RUN(test_pld_literal_negative);
-    UT_RUN(test_pld_imm_positive);
-    UT_RUN(test_pld_imm_negative);
-    UT_RUN(test_pld_reg_basic);
-    UT_RUN(test_pld_reg_with_lsl);
-    UT_RUN(test_pld_reg_default_shift);
-    UT_RUN(test_pli_literal_positive);
-    UT_RUN(test_pli_literal_negative);
-    UT_RUN(test_pli_imm_positive);
-    UT_RUN(test_pli_imm_negative);
-    UT_RUN(test_pli_reg_basic);
-    UT_RUN(test_pli_reg_with_lsl);
-    UT_RUN(test_pli_reg_default_shift);
 }

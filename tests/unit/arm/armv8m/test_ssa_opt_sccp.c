@@ -834,32 +834,4 @@ UT_TEST(test_sccp_unknown)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_sccp)
-{
-  UT_COVERS("ssa:sccp");
-  UT_RUN(test_sccp_const_fold_arith_chain);
-  UT_RUN(test_sccp_const_fold_i64_pool);
-  UT_RUN(test_sccp_float_bottom);
-  UT_RUN(test_sccp_barrel_shift_guard);
-  UT_RUN(test_sccp_stack_load_forward);
-  UT_RUN(test_sccp_stack_load_non_alias_forward);
-  UT_RUN(test_sccp_stack_load_alias_no_forward);
-  UT_RUN(test_sccp_stack_load_call_barrier);
-  UT_RUN(test_sccp_stack_load_call_addr_escape_barrier);
-  UT_RUN(test_sccp_stack_load_lea_deref_forward);
-  UT_RUN(test_sccp_store_indexed_forward);
-  UT_RUN(test_sccp_var_load_forward);
-  UT_RUN(test_sccp_phi_one_edge_folds);
-  UT_RUN(test_sccp_phi_two_edges_bottom);
-  UT_RUN(test_sccp_cmp_branch_folds);
-  UT_RUN(test_sccp_test_zero_branch);
-  UT_RUN(test_sccp_loop_clobbers_slot);
-  UT_RUN(test_sccp_loop_writes_slot_post_loop);
-  UT_RUN(test_sccp_entry_block_var_ptr_alias);
-  UT_RUN(test_sccp_cmp_var_substitute);
-  UT_RUN(test_sccp_cmp_var_pool_no_substitute);
-  UT_RUN(test_sccp_store_postinc_barrier);
-  UT_RUN(test_sccp_always_taken);
-  UT_RUN(test_sccp_never_taken);
-  UT_RUN(test_sccp_unknown);
-}
+UT_COVERS("ssa:sccp");

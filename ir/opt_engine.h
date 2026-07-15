@@ -12,8 +12,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_OPT_ENGINE_H
-#define TCC_IR_OPT_ENGINE_H
+#pragma once
 
 #include <stdint.h>
 #include "opt_du.h"
@@ -40,6 +39,12 @@ typedef struct IROptCtx
   struct IRLoops *loops;
   uint32_t loops_gen;
 
+  /* Opaque per-pass state for stateful gen drivers (run_stateful_gens): a
+   * pass that maintains dataflow facts across the single forward walk stores
+   * its lattice here so its opcode gens can share it.  NULL for stateless
+   * run_gens passes. */
+  void *pass_state;
+
   int changes;
 } IROptCtx;
 
@@ -65,6 +70,23 @@ struct IRLoops *tcc_ir_opt_ctx_require_loops(IROptCtx *ctx);
 
 int tcc_ir_opt_run_gens(IROptCtx *ctx, const IROptGen *gens, int count);
 
+/* Lifecycle hooks for a stateful gen driver.  `begin` allocates the pass's
+ * lattice/state (returned pointer is stashed in ctx->pass_state); `each_pre`
+ * runs for EVERY instruction index before the NOP-skip and opcode dispatch (so
+ * a pass can reset facts at basic-block boundaries); `end` frees the state. */
+typedef struct IROptStatefulOps
+{
+  void *(*begin)(IROptCtx *ctx);
+  void (*each_pre)(IROptCtx *ctx, int i);
+  void (*end)(IROptCtx *ctx);
+} IROptStatefulOps;
+
+/* Like run_gens, but threads per-pass state (ctx->pass_state) through a single
+ * ordered forward walk and invokes the lifecycle hooks.  Enables BB-local
+ * dataflow passes (e.g. known-bits) to be expressed as opcode-triggered gens. */
+int tcc_ir_opt_run_stateful_gens(IROptCtx *ctx, const IROptGen *gens, int count,
+                                 const IROptStatefulOps *ops);
+
 /* ============================================================================
  * Iteration helpers
  * ============================================================================ */
@@ -81,4 +103,3 @@ int tcc_ir_opt_run_gens(IROptCtx *ctx, const IROptGen *gens, int count);
 /* Check if instruction index i is a merge point (requires merge_bitmap built). */
 #define IR_IS_MERGE(mb, i) ((mb)[(i) / 8] & (1 << ((i) % 8)))
 
-#endif /* TCC_IR_OPT_ENGINE_H */

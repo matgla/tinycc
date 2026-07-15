@@ -8,8 +8,7 @@
  *  License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_DSL_SSA_H
-#define TCC_OPT_DSL_SSA_H
+#pragma once
 
 /* SSA-only companion to opt_dsl.h: PAIR() matches a source operand's single SSA
  * def (a def-use peephole's producer) and binds its operands; RETIRE_PAIR()
@@ -135,4 +134,3 @@ static inline int opt_dsl_chain(IRSSAOptCtx *ctx, int i,
 #define RETIRE_PAIR(new_linked, delete_second) \
   opt_dsl_pair_retire(ctx, i, &_opt_dsl_pair, (new_linked), (delete_second))
 
-#endif /* TCC_OPT_DSL_SSA_H */

@@ -11,11 +11,11 @@
 
 #define USING_GLOBALS
 #include "ir.h"
-#include "arch/arm/arm.h"
-#include "arch/arm/thumb/thumb.h"
-#include "arch/arm/thumb/thop_mem_imm.h"
-#include "arch/arm/thumb/thop_mov.h"
-#include "arch/arm/thumb/thop_alu_imm.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_mem_imm.h"
+#include "source/backend/arch/arm/thumb/thop_mov.h"
+#include "source/backend/arch/arm/thumb/thop_alu_imm.h"
 #include "ir/machine_op.h"
 
 extern int offset_to_args;
@@ -423,32 +423,4 @@ UT_TEST(test_mach_assign_param_stack_to_reg_emits_ldr)
   UT_ASSERT(bytes_match_opcode(ind, th_ldr_imm(R0, R_FP, 8, 6 /* add */, ENFORCE_ENCODING_NONE)));
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_mach_operand)
-{
-  UT_RUN(test_mach_load_reg_same_emits_nothing);
-  UT_RUN(test_mach_load_reg_diff_emits_mov);
-  UT_RUN(test_mach_load_reg_deref_emits_ldr);
-  UT_RUN(test_mach_load_imm_emits_mov_imm);
-  UT_RUN(test_mach_load_frame_addr_zero_emits_mov_fp);
-  UT_RUN(test_mach_load_frame_addr_nonzero_emits_add_fp);
-  UT_RUN(test_mach_load_param_stack_emits_ldr);
-  UT_RUN(test_mach_load_spill_emits_ldr);
-  UT_RUN(test_mach_load_spill_deref_emits_double_load);
-
-  UT_RUN(test_mach_store_reg_emits_mov);
-  UT_RUN(test_mach_store_reg_deref_emits_str);
-  UT_RUN(test_mach_store_spill_emits_str);
-  UT_RUN(test_mach_store_frame_addr_emits_str);
-  UT_RUN(test_mach_store_param_stack_emits_str);
-
-  UT_RUN(test_mach_assign_zero_extends_32bit_imm_to_64bit_pair);
-  UT_RUN(test_mach_assign_truncates_64bit_reg_pair_to_32bit);
-  UT_RUN(test_mach_assign_reg_deref_to_reg_emits_ldr);
-  UT_RUN(test_mach_assign_spill_deref_to_reg_emits_double_load);
-  UT_RUN(test_mach_assign_frame_addr_zero_to_reg_emits_mov_fp);
-  UT_RUN(test_mach_assign_param_stack_to_reg_emits_ldr);
 }

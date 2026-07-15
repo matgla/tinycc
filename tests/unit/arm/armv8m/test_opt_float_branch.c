@@ -364,20 +364,4 @@ UT_TEST(test_float_branch_non_jumpif_after_helper_blocks_fold)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_float_branch)
-{
-  UT_COVERS("float_branch");
-
-  UT_RUN(test_float_branch_helper_same_ops_ne_then_ne_nop);
-  UT_RUN(test_float_branch_helper_same_ops_eq_then_ne_jump);
-  UT_RUN(test_float_branch_helper_swapped_ops_eq_then_eq_no_fold);
-  UT_RUN(test_float_branch_test_zero_ne_then_ne_nop);
-  UT_RUN(test_float_branch_test_zero_eq_then_ne_jump);
-
-  UT_RUN(test_float_branch_non_flag_helper_ignored);
-  UT_RUN(test_float_branch_mismatched_operands_no_fold);
-  UT_RUN(test_float_branch_merge_point_blocks_scan);
-  UT_RUN(test_float_branch_non_jumpif_after_helper_blocks_fold);
-}
+UT_COVERS("float_branch");

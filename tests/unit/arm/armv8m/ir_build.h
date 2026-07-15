@@ -31,6 +31,7 @@ static inline TCCIRState *utb_new(void)
 {
   TCCIRState *ir = (TCCIRState *)tcc_mallocz(sizeof(*ir));
   ir->compact_instructions = (IRQuadCompact *)tcc_mallocz(sizeof(IRQuadCompact) * UTB_MAX_INSTR);
+  ir->compact_instructions_size = UTB_MAX_INSTR;
   ir->iroperand_pool = (IROperand *)tcc_mallocz(sizeof(IROperand) * UTB_MAX_OPERANDS);
   ir->iroperand_pool_count = 0;
   ir->next_instruction_index = 0;

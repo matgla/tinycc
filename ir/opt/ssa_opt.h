@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_SSA_OPT_H
-#define TCC_IR_SSA_OPT_H
+#pragma once
 
 #include "cfg.h"
 #include "ssa.h"
@@ -124,32 +123,22 @@ int ssa_opt_dce(IRSSAOptCtx *ctx);
 /* Unreachable-code sweep + dead-TEMP worklist only — no CFG rebuild, safe
  * to call every guard_collapse round. */
 int ssa_opt_dce_light(IRSSAOptCtx *ctx);
-int ssa_opt_cprop(IRSSAOptCtx *ctx);
+/* ssa_opt_cprop() moved to source/opt/ssa/include/opt/ssa/cprop.h */
 /* ssa_opt_fold() moved to source/opt/ssa/include/opt/ssa/fold.h */
 int ssa_opt_phi_simplify(IRSSAOptCtx *ctx);
 /* ssa_opt_strength() moved to source/opt/ssa/include/opt/ssa/strength.h */
-int ssa_opt_gvn(IRSSAOptCtx *ctx);
-int ssa_opt_reassoc(IRSSAOptCtx *ctx);
+/* ssa_opt_gvn() moved to source/opt/ssa/include/opt/ssa/gvn.h */
+/* ssa_opt_reassoc() moved to source/opt/ssa/include/opt/ssa/reassoc.h */
 int ssa_opt_narrow(IRSSAOptCtx *ctx);
 /* Block reachability from current IR terminators (the static CFG is stale
  * after branch folds).  malloc'd array [num_blocks], caller frees. */
 uint8_t *ssa_opt_compute_reachable_blocks(IRSSAOptCtx *ctx);
 int ssa_opt_sccp(IRSSAOptCtx *ctx);
-int ssa_opt_load_cse(IRSSAOptCtx *ctx);
-int ssa_opt_var_forward(IRSSAOptCtx *ctx);
-
-/* Forward single-def, single-use, non-address-taken VARs into their lone
- * FUNCPARAMVAL use site, NOPing the original STORE.  Narrow companion to
- * ssa_opt_var_forward: only the PARAM-use case (collapses inlined-helper
- * printf-arg materialisation) and skips deref sources so as not to expose
- * SCCP stack-load alias issues. */
-int ssa_opt_var_to_param_forward(IRSSAOptCtx *ctx);
-int ssa_opt_var_const_fold(IRSSAOptCtx *ctx);
-int ssa_opt_var_imm_prop(IRSSAOptCtx *ctx);
-/* SSA-time analog of the flat block-local const_prop_tmp (TMP/VAR constant
- * tracking + propagation, two-operand fold, SWITCH_TABLE const-index → JUMP,
- * CMP+SETIF and soft-FP compare folds). */
-int ssa_opt_const_prop_tmp(IRSSAOptCtx *ctx);
+/* ssa_opt_load_cse() moved to source/opt/ssa/memory/load_cse.h */
+/* ssa_opt_var_forward() moved to source/opt/ssa/include/opt/ssa/cprop.h */
+/* ssa_opt_var_to_param_forward() moved to source/opt/ssa/include/opt/ssa/cprop.h */
+/* ssa_opt_var_const_fold() moved to source/opt/ssa/include/opt/ssa/cprop.h */
+/* ssa_opt_const_prop_tmp() moved to source/opt/ssa/include/opt/ssa/cprop.h */
 int ssa_opt_dead_loop(IRSSAOptCtx *ctx);
 
 /* Loop rotation (ssa:loop_rotate).  CFG/dominator-based natural-loop detection
@@ -222,19 +211,6 @@ int ssa_opt_iv_strength_reduction(struct TCCIRState *ir);
  * See docs/plan_legacy_loop_reroll_ssa.md. */
 int ssa_opt_reroll(struct TCCIRState *ir);
 
-/* Symbol-address rematerialization CSE (ssa:symaddr_cse).  Hoists the address
- * of a global symbol referenced inline (as the SYMREF src1 of >=3 ADDs, or the
- * lval-SYMREF base of an entry-block STORE) into a single TEMP materialized at
- * function entry, replacing the repeated `ldr rN,[pc,#off]` literal-pool loads
- * with reads of that TEMP (and folding qualifying STOREs to STORE_INDEXED off
- * the hoisted base).  Runs on flat IR just before CFG/SSA construction — the
- * shared def it creates has no pre-existing instruction for gvn to number, so
- * it is a materialization rule rather than a value-numbering match; the SSA
- * block-local reuse passes (ssa_opt_symref_operand_cse, cprop_symref_cse) then
- * pick up any remaining same-block deref uses.  Gated -O1+ (matches the retired
- * flat globalsym_cse).  See docs/plan_legacy_flat_ir_ssa_retire.md. */
-int ssa_opt_symaddr_cse(struct TCCIRState *ir);
-
 /* OR-bool-diamond (ssa:or_bool_diamond).  Folds the `acc |= (cond ? 1 : 0)`
  * stack-slot materialization into per-arm ORs (engine in ir/opt_branch.c).
  * Flat IR, right after ssa:cfg_cleanup, whose eliminate_fallthrough creates
@@ -297,4 +273,3 @@ int ssa_opt_indirect_stack_offset_ex(IRSSAOptCtx *ctx, const IRQuadCompact *q, i
 
 void tcc_ir_ssa_opt_register_target(const IRSSAOptGen *gens, int count);
 
-#endif /* TCC_IR_SSA_OPT_H */

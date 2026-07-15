@@ -69,7 +69,7 @@ static IROperand utb_callee_named(TCCIRState *ir, Sym *sym, int tok)
  * disabled = getenv(...); }`).  The shared UT binary runs test_opt_knownbits.c
  * (tcc_ir_opt_known_bits -> pass_disabled("known_bits")) and
  * test_opt_branch_fold.c-family suites (-> pass_disabled("branch_fold"))
- * BEFORE this suite in test_main.c's UT_RUN_SUITE order, so by the time this
+ * BEFORE this suite in the binary's registration order, so by the time this
  * test runs the cache is already primed from whatever TCC_DISABLE_PASS was
  * (or was not) set to when the process started.  There is no supported way
  * to reset the cache from a unit test (no accessor), and setenv() after the
@@ -826,6 +826,10 @@ UT_TEST(test_is_pure_aeabi_recognizes_categories_and_rejects_others)
   UT_ASSERT_EQ(tcc_ir_is_pure_aeabi("__aeabi_lcmp"), 1);
   UT_ASSERT_EQ(tcc_ir_is_pure_aeabi("__aeabi_ulcmp"), 1);
   UT_ASSERT_EQ(tcc_ir_is_pure_aeabi("__aeabi_lmul"), 1);
+  UT_ASSERT_EQ(tcc_ir_is_pure_aeabi("__aeabi_ldivmod"), 1);
+  UT_ASSERT_EQ(tcc_ir_is_pure_aeabi("__aeabi_uldivmod"), 1);
+  UT_ASSERT_EQ(tcc_ir_is_pure_aeabi("__aeabi_lmod"), 1);
+  UT_ASSERT_EQ(tcc_ir_is_pure_aeabi("__aeabi_ulmod"), 1);
   UT_ASSERT_EQ(tcc_ir_is_pure_aeabi("__aeabi_llsl"), 1);
   UT_ASSERT_EQ(tcc_ir_is_pure_aeabi("__aeabi_dadd"), 1);
   UT_ASSERT_EQ(tcc_ir_is_pure_aeabi("__aeabi_fcmpeq"), 1);
@@ -1818,128 +1822,4 @@ UT_TEST(test_vreg_has_single_def_ops_without_dest_dont_count)
 
   utb_free(ir);
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_utils)
-{
-  /* pass-disabled */
-  UT_RUN(test_pass_disabled_unset_env_never_disables);
-  UT_RUN(test_pass_disabled_null_name_returns_0);
-
-  /* is_power_of_2 */
-  UT_RUN(test_is_power_of_2_positive_powers);
-  UT_RUN(test_is_power_of_2_non_powers_and_nonpositive);
-
-  /* evaluate_compare_condition */
-  UT_RUN(test_evaluate_compare_condition_signed_tokens);
-  UT_RUN(test_evaluate_compare_condition_unsigned_tokens_treat_negative_as_huge);
-  UT_RUN(test_evaluate_compare_condition_unknown_token_returns_minus1);
-
-  /* ir_opt_eval_const_u64 */
-  UT_RUN(test_eval_const_u64_immediate);
-  UT_RUN(test_eval_const_u64_add_chain_folds);
-  UT_RUN(test_eval_const_u64_shr_uses_32bit_width_for_int32_operand);
-  UT_RUN(test_eval_const_u64_ror_rotates_32bit);
-  UT_RUN(test_eval_const_u64_zext_masks_to_source_width);
-  UT_RUN(test_eval_const_u64_multi_def_vreg_bails_out);
-  UT_RUN(test_eval_const_u64_address_taken_between_bails_out);
-  UT_RUN(test_eval_const_u64_depth_limit_bails_out);
-  UT_RUN(test_eval_const_u64_null_args);
-
-  /* ir_opt_eval_const_string */
-  UT_RUN(test_eval_const_string_lval_temp_rejected);
-  UT_RUN(test_eval_const_string_no_def_fails);
-  UT_RUN(test_eval_const_string_null_args);
-  UT_RUN(test_eval_const_string_depth_limit_bails_out);
-
-  /* condition token helpers */
-  UT_RUN(test_vrp_negate_cmp_tok_all_pairs);
-  UT_RUN(test_vrp_swap_cmp_tok_all_pairs);
-  UT_RUN(test_vrp_cmp_implies_reflexive_and_families);
-  UT_RUN(test_fcmp_cmp_implies_families);
-  UT_RUN(test_invert_cond_token_all_pairs);
-  UT_RUN(test_invert_condition_all_pairs);
-  UT_RUN(test_ir_negate_condition_xor_1);
-
-  /* BB/CFG helpers */
-  UT_RUN(test_build_merge_bitmap_no_merge_when_every_block_has_one_pred);
-  UT_RUN(test_build_merge_bitmap_multiple_preds_sets_bit);
-  UT_RUN(test_build_merge_bitmap_backward_edge_sets_bit);
-  UT_RUN(test_mark_block_starts_marks_jump_targets_and_entry);
-  UT_RUN(test_mark_block_starts_out_of_range_target_ignored);
-  UT_RUN(test_build_block_starts_bitmap_entry_target_and_fallthrough);
-  UT_RUN(test_next_non_nop_skips_nops_and_returns_minus1_at_end);
-  UT_RUN(test_skip_nops_forward_returns_n_when_all_nops);
-  UT_RUN(test_skip_nops_forward_finds_first_non_nop);
-  UT_RUN(test_has_other_jump_to_fast_excludes_named_jump_and_counts_rest);
-  UT_RUN(test_has_other_jump_to_fast_single_jump_excluded_leaves_none);
-  UT_RUN(test_has_other_jump_to_fast_target_out_of_range_or_zero_count);
-
-  /* purity tables */
-  UT_RUN(test_is_pure_aeabi_recognizes_categories_and_rejects_others);
-  UT_RUN(test_is_pure_helper_name_isnan_and_narrow_family);
-  UT_RUN(test_is_readonly_str_helper_name_table);
-  UT_RUN(test_is_flag_cmp_helper_name_table);
-  UT_RUN(test_is_pure_fallthrough_instruction_simple_ops);
-  UT_RUN(test_is_pure_fallthrough_instruction_pure_call_true);
-  UT_RUN(test_is_pure_fallthrough_instruction_impure_call_false);
-  UT_RUN(test_is_pure_fallthrough_instruction_bounds_and_null);
-
-  /* expression equality */
-  UT_RUN(test_nonvreg_expr_equal_stackoff_same_slot);
-  UT_RUN(test_nonvreg_expr_equal_stackoff_different_offset);
-  UT_RUN(test_nonvreg_expr_equal_stackoff_different_lval_flag);
-  UT_RUN(test_nonvreg_expr_equal_different_tags_false);
-  UT_RUN(test_nonvreg_expr_equal_symref_same_sym_and_addend);
-  UT_RUN(test_nonvreg_expr_equal_symref_different_addend);
-  UT_RUN(test_nonvreg_expr_equal_symref_different_sym);
-  UT_RUN(test_pure_expr_equal_immediates);
-  UT_RUN(test_pure_expr_equal_same_def_site_true);
-  UT_RUN(test_pure_expr_equal_identical_add_defs_true);
-  UT_RUN(test_pure_expr_equal_load_with_intervening_store_false);
-  UT_RUN(test_pure_expr_equal_load_without_intervening_store_true);
-  UT_RUN(test_pure_expr_equal_lval_vs_address_mismatch_false);
-  UT_RUN(test_pure_expr_equal_impure_call_defs_false);
-  UT_RUN(test_pure_def_equal_pure_call_defs_identical_args_true);
-  UT_RUN(test_pure_def_equal_pure_call_defs_different_argc_false);
-  UT_RUN(test_pure_def_equal_mla_commutative_operands_true);
-  UT_RUN(test_pure_def_equal_mla_different_accum_false);
-  UT_RUN(test_pure_def_equal_mismatched_opcode_false);
-  UT_RUN(test_pure_def_equal_negative_index_false);
-  UT_RUN(test_pure_def_equal_depth_limit_false);
-
-  /* call-param helpers */
-  UT_RUN(test_get_call_param_operand_finds_matching_param);
-  UT_RUN(test_get_call_param_operand_missing_param_index_fails);
-  UT_RUN(test_get_call_param_operand_different_call_id_not_matched);
-  UT_RUN(test_get_call_param_operand_invalid_call_idx);
-  UT_RUN(test_nop_call_params_nops_only_matching_call_id);
-  UT_RUN(test_nop_call_param_nops_only_matching_param_idx);
-  UT_RUN(test_change_call_argc_updates_argc_preserves_call_id);
-  UT_RUN(test_call_param_void_helpers_out_of_range_no_crash);
-
-  /* misc helpers */
-  UT_RUN(test_vreg_address_taken_between_lea_detected);
-  UT_RUN(test_vreg_address_taken_between_no_lea_returns_0);
-  UT_RUN(test_vreg_address_taken_between_different_vreg_not_counted);
-  UT_RUN(test_vreg_address_taken_between_outside_window_not_counted);
-  UT_RUN(test_vreg_address_taken_between_null_ir_returns_0);
-  UT_RUN(test_get_constant_string_from_symref_no_elf_state_returns_null);
-  UT_RUN(test_get_constant_string_from_symref_non_symref_tag_returns_null);
-  UT_RUN(test_get_constant_string_from_symref_null_ir_returns_null);
-  UT_RUN(test_get_constant_string_from_symref_negative_addend_returns_null);
-
-  /* callee symbol replacement */
-  UT_RUN(test_change_callee_sym_no_symtab_stub_returns_0_documents_current_behavior);
-  UT_RUN(test_change_callee_sym_keep_type_no_symtab_stub_returns_0);
-  UT_RUN(test_change_callee_sym_keep_type_null_sym_returns_0);
-
-  /* tcc_ir_vreg_has_single_def */
-  UT_RUN(test_vreg_has_single_def_true_for_exactly_one_def);
-  UT_RUN(test_vreg_has_single_def_false_for_multiple_defs);
-  UT_RUN(test_vreg_has_single_def_false_for_zero_defs);
-  UT_RUN(test_vreg_has_single_def_skips_nops);
-  UT_RUN(test_vreg_has_single_def_ops_without_dest_dont_count);
 }

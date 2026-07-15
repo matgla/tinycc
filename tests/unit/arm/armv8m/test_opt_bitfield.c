@@ -596,32 +596,5 @@ UT_TEST(test_bf_to_bfi_idempotent)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_bitfield)
-{
-  UT_COVERS("bitfield_insert_extract");
-  UT_COVERS("bitfield_insert_to_bfi");
-
-  UT_RUN(test_bf_extract_shr_immediate_value_folds);
-  UT_RUN(test_bf_extract_shr_temp_value_folds);
-  UT_RUN(test_bf_extract_two_shift_form_folds);
-  UT_RUN(test_bf_extract_seff_zero_two_shift_folds);
-  UT_RUN(test_bf_extract_and_low_field_folds);
-  UT_RUN(test_bf_extract_low_overlaps_window_no_fold);
-  UT_RUN(test_bf_extract_value_unbounded_no_fold);
-  UT_RUN(test_bf_extract_source_not_or_no_fold);
-  UT_RUN(test_bf_extract_lval_dest_no_fold);
-  UT_RUN(test_bf_extract_idempotent);
-
-  UT_RUN(test_bf_to_bfi_lsb_positive_folds);
-  UT_RUN(test_bf_to_bfi_lsb_zero_folds);
-  UT_RUN(test_bf_to_bfi_encodable_clearmask_no_fold);
-  UT_RUN(test_bf_to_bfi_noncontiguous_field_no_fold);
-  UT_RUN(test_bf_to_bfi_shl_lsb_mismatch_no_fold);
-  UT_RUN(test_bf_to_bfi_word_field_clear_no_fold);
-  UT_RUN(test_bf_to_bfi_value_unbounded_no_fold);
-  UT_RUN(test_bf_to_bfi_and_multiuse_no_fold);
-  UT_RUN(test_bf_to_bfi_jump_target_splits_window_no_fold);
-  UT_RUN(test_bf_to_bfi_idempotent);
-}
+UT_COVERS("bitfield_insert_extract");
+UT_COVERS("bitfield_insert_to_bfi");

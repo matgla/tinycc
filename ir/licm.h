@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_LICM_H
-#define TCC_IR_LICM_H
+#pragma once
 
 #include "ir.h"
 #include "opt.h"
@@ -90,6 +89,12 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir);
  * IR before ssa:iv_strength_reduction (docs/plan_legacy_loop_licm_ssa.md). */
 int ssa_opt_licm(TCCIRState *ir);
 
+/* ra:stack_param_promote — cache a loop-invariant stack-passed scalar param in a
+ * temp at entry so RA keeps it in a register instead of reloading from its
+ * incoming home each iteration (docs/plan_stack_param_reg_promotion.md). Runs
+ * immediately before register allocation. Returns the number of params promoted. */
+int tcc_ir_promote_loop_stack_params(TCCIRState *ir);
+
 /* Detect loops in the IR - simplified version for natural loops */
 IRLoops *tcc_ir_detect_loops(TCCIRState *ir);
 
@@ -110,4 +115,3 @@ int tcc_ir_is_in_loop(IRLoop *loop, int instr_idx);
  * Returns: max number of values that can be hoisted (>= 1) */
 int tcc_ir_estimate_hoist_budget(TCCIRState *ir, int loop_start, int loop_end, int num_params);
 
-#endif /* TCC_IR_LICM_H */

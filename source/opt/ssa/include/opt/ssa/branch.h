@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_SSA_BRANCH_H
-#define TCC_OPT_SSA_BRANCH_H
+#pragma once
 
 struct IRSSAOptCtx;
 
@@ -18,4 +17,3 @@ struct IRSSAOptCtx;
  * rewritten. */
 int ssa_opt_branch(struct IRSSAOptCtx *ctx);
 
-#endif /* TCC_OPT_SSA_BRANCH_H */

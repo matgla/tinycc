@@ -2467,14 +2467,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
     const char *name = get_tok_str(callee->v, NULL);
     if (!name)
       continue;
-    int is_memmove_like = strcmp(name, "__aeabi_memmove") == 0 ||
-                          strcmp(name, "__aeabi_memmove4") == 0 ||
-                          strcmp(name, "__aeabi_memmove8") == 0 ||
-                          strcmp(name, "__aeabi_memcpy") == 0 ||
-                          strcmp(name, "__aeabi_memcpy4") == 0 ||
-                          strcmp(name, "__aeabi_memcpy8") == 0 ||
-                          strcmp(name, "memmove") == 0 ||
-                          strcmp(name, "memcpy") == 0;
+    int is_memmove_like = ir_opt_is_memcpy_or_memmove_name(name);
     if (!is_memmove_like)
       continue;
 
@@ -3390,50 +3383,6 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
   return changes;
 }
 
-/* Carry a narrow plain STORE's access width onto its value operand.
- *
- * A plain STORE (`*p = v`) derives its store width from the DEST (lvalue)
- * btype — the codegen ignores the value operand's width.  But several later
- * transforms rewrite a plain STORE into a STORE_INDEXED, which instead derives
- * its width from the VALUE operand's btype.  When the value carries a wider
- * (INT32) expression type — e.g. after copy-propagation forwards a wider temp
- * into a char/short store, as happens collapsing `(v & ~field) | x` for a
- * packed bitfield — the converted indexed store widens to a full word and
- * clobbers the adjacent bytes (e.g. a packed-bitfield byte store overwriting
- * the next array element).
- *
- * Clamping the value operand's btype to the access width here keeps every
- * later STORE_INDEXED conversion narrow.  It is a no-op for the plain STORE
- * itself (whose width still comes from the dest), and only narrows (never
- * widens) so a correctly-narrow value is left untouched.  Runs just before
- * register allocation, after all value forwarding has settled. */
-int tcc_ir_opt_narrow_store_value_btype(TCCIRState *ir)
-{
-  int n = ir ? ir->next_instruction_index : 0;
-  int changes = 0;
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_STORE)
-      continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (!dest.is_lval)
-      continue;
-    int dbt = irop_get_btype(dest);
-    if (dbt != IROP_BTYPE_INT8 && dbt != IROP_BTYPE_INT16)
-      continue;
-    IROperand src = tcc_ir_op_get_src1(ir, q);
-    int sbt = irop_get_btype(src);
-    /* Only act when the value is wider than the access; leave already-narrow
-     * and non-integer (struct/float/64-bit) values alone. */
-    if (sbt != IROP_BTYPE_INT32)
-      continue;
-    src.btype = (uint8_t)dbt;
-    tcc_ir_set_src1(ir, i, src);
-    changes++;
-  }
-  return changes;
-}
 
 /* ============================================================================
  * Per-pass timing instrumentation (opt-in via TCC_PASS_TIMING env var).

@@ -882,37 +882,4 @@ UT_TEST(test_branch_idempotent)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_branch)
-{
-  UT_COVERS("ssa:branch");
-  UT_RUN(test_branch_cmp_imm_all_conds);
-  UT_RUN(test_branch_cmp_same_vreg_eq);
-  UT_RUN(test_branch_cmp_same_vreg_via_copy_chain);
-  UT_RUN(test_branch_cmp_setif_true);
-  UT_RUN(test_branch_cmp_setif_false);
-  UT_RUN(test_branch_bool_norm_setif_rewritten);
-  UT_RUN(test_branch_bool_norm_bool_and_rewritten);
-  UT_RUN(test_branch_bool_norm_wrong_cond_kept);
-  UT_RUN(test_branch_bool_norm_nonzero_cmp_kept);
-  UT_RUN(test_branch_bool_norm_non_bool_def_kept);
-  UT_RUN(test_branch_test_zero_eq_taken);
-  UT_RUN(test_branch_test_zero_ne_taken);
-  UT_RUN(test_branch_test_zero_fallthrough_setif);
-  UT_RUN(test_branch_cmp_nonimm);
-  UT_RUN(test_branch_cmp_unknown_token);
-  UT_RUN(test_branch_cmp_not_followed);
-  UT_RUN(test_branch_test_zero_nonimm);
-  UT_RUN(test_branch_test_zero_bad_cond);
-  UT_RUN(test_branch_cmp_setif_unknown_token);
-  UT_RUN(test_branch_cmp_var_immediate_assign);
-  UT_RUN(test_branch_cmp_var_funccall_barrier);
-  UT_RUN(test_branch_cmp_var_store_immediate);
-  UT_RUN(test_branch_cmp_var_deref_store_skipped);
-  UT_RUN(test_branch_drop_phi_edge_taken);
-  UT_RUN(test_branch_drop_phi_edge_not_taken);
-  UT_RUN(test_branch_drop_phi_edge_multi_operand);
-  UT_RUN(test_branch_prune_unreachable_phi);
-  UT_RUN(test_branch_reachable_return_terminator);
-  UT_RUN(test_branch_reachable_ijump);
-  UT_RUN(test_branch_idempotent);
-}
+UT_COVERS("ssa:branch");

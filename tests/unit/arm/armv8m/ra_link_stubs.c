@@ -14,6 +14,8 @@
 #include "tcc.h"
 #include "ir/opt/ssa_opt.h"
 #include "opt/ssa/strength.h"
+#include "opt/ssa/reassoc.h"
+#include "opt/ssa/cprop.h"
 
 /* From tccgen.c - used only for debug/dump messages. */
 const char *funcname = "unit_test";

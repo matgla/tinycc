@@ -2262,92 +2262,10 @@ UT_TEST(test_const_string_calls_strlen_stack_jump_boundary_no_direct_fold)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_constfold)
-{
-  UT_COVERS("self_copy_elim");
-  UT_COVERS("float_narrowing");
-  UT_COVERS("const_string_calls");
-  UT_COVERS("const_call_replace");
-  UT_COVERS("switch_call_replace");
-  UT_COVERS("param_addrof_const_fold");
-  UT_COVERS("local_addrof_const_fold");
-  UT_RUN(test_self_copy_elim_non_memcpy_name_no_fold);
-  UT_RUN(test_self_copy_elim_no_calls_no_fold);
-  UT_RUN(test_self_copy_elim_null_callee_no_fold);
-  UT_RUN(test_self_copy_elim_null_ir);
-  UT_RUN(test_self_copy_elim_memcpy_positive);
-  UT_RUN(test_self_copy_elim_memmove_positive);
-  UT_RUN(test_self_copy_elim_aeabi_memcpy8_positive);
-  UT_RUN(test_self_copy_elim_void_call_positive);
-  UT_RUN(test_self_copy_elim_dst_src_differ_no_fold);
-  UT_RUN(test_self_copy_elim_redefined_temp_suspected_bug);
-  UT_RUN(test_self_copy_elim_lval_mismatch_no_fold);
-  UT_RUN(test_self_copy_elim_idempotent);
-  UT_RUN(test_float_narrowing_unmatched_names_no_fold);
-  UT_RUN(test_float_narrowing_too_few_instructions_no_fold);
-  UT_RUN(test_float_narrowing_non_narrowable_middle_no_fold);
-  UT_RUN(test_float_narrowing_missing_d2f_no_fold);
-  UT_RUN(test_float_narrowing_f2d_not_consumed_no_fold);
-  UT_RUN(test_float_narrowing_no_f2d_no_fold);
-  UT_RUN(test_float_narrowing_idempotent);
-
-  UT_RUN(test_const_string_calls_unknown_builtin_no_fold);
-  UT_RUN(test_const_string_calls_null_callee_no_fold);
-  UT_RUN(test_const_string_calls_null_ir);
-  UT_RUN(test_const_string_calls_memcmp_zero_len_positive);
-  UT_RUN(test_const_string_calls_strncmp_zero_len_positive);
-  UT_RUN(test_const_string_calls_strlen_void_no_fold);
-
-  UT_RUN(test_const_call_replace_empty_cache_no_fold);
-  UT_RUN(test_const_call_replace_cached_const_positive);
-  UT_RUN(test_const_call_replace_discarded_result_nops);
-  UT_RUN(test_const_call_replace_token_mismatch_no_fold);
-
-  UT_RUN(test_switch_call_replace_empty_cache_no_fold);
-  UT_RUN(test_switch_call_replace_identity_positive);
-  UT_RUN(test_switch_call_replace_nonconst_arg_no_fold);
-  UT_RUN(test_switch_call_replace_wrong_argc_no_fold);
-
-  UT_RUN(test_param_addrof_no_params_no_fold);
-  UT_RUN(test_param_addrof_multi_bb_no_fold);
-  UT_RUN(test_param_addrof_const_fold_positive);
-  UT_RUN(test_param_addrof_const_fold_load_read_positive);
-  UT_RUN(test_param_addrof_pre_store_read_no_fold);
-  UT_RUN(test_param_addrof_escaped_pointer_no_fold);
-
-  UT_RUN(test_local_addrof_no_vars_no_fold);
-  UT_RUN(test_local_addrof_const_fold_positive);
-  UT_RUN(test_local_addrof_missing_init_no_fold);
-  UT_RUN(test_local_addrof_pre_modify_read_no_fold);
-
-  UT_RUN(test_switch_func_detect_branchy_positive);
-  UT_RUN(test_switch_call_replace_branchy_positive);
-  UT_RUN(test_switch_func_detect_two_params_rejected);
-  UT_RUN(test_switch_func_detect_llong_param_rejected);
-  UT_RUN(test_switch_func_detect_addrtaken_param_rejected);
-  UT_RUN(test_switch_func_detect_unsupported_op_rejected);
-  UT_RUN(test_switch_func_detect_no_return_rejected);
-  UT_RUN(test_switch_func_detect_unsupported_return_btype_rejected);
-  UT_RUN(test_switch_func_simulate_pure_wrapper_declines_when_replay_needed);
-  UT_RUN(test_switch_func_simulate_store_replay_positive);
-  UT_RUN(test_switch_call_replace_branchy_nonconst_arg_no_fold);
-
-  UT_RUN(test_detect_const_result_immediate_return_positive);
-  UT_RUN(test_detect_const_result_assign_then_return_positive);
-  UT_RUN(test_detect_const_result_has_params_rejected);
-  UT_RUN(test_detect_const_result_other_op_rejected);
-  UT_RUN(test_detect_const_result_too_many_instructions_rejected);
-  UT_RUN(test_detect_const_result_non_immediate_source_rejected);
-  UT_RUN(test_const_result_cache_round_trip_and_duplicate_guard);
-
-  UT_RUN(test_param_addrof_chain_lookthrough_var_imm_positive);
-  UT_RUN(test_param_addrof_multi_lea_same_param_no_fold);
-  UT_RUN(test_local_addrof_symref_store_value_positive);
-  UT_RUN(test_local_addrof_64bit_store_value_no_fold);
-
-  UT_RUN(test_const_string_calls_strlen_stack_bytes_positive);
-  UT_RUN(test_const_string_calls_strlen_stack_no_nul_no_direct_fold);
-  UT_RUN(test_const_string_calls_strlen_stack_jump_boundary_no_direct_fold);
-}
+UT_COVERS("self_copy_elim");
+UT_COVERS("float_narrowing");
+UT_COVERS("const_string_calls");
+UT_COVERS("const_call_replace");
+UT_COVERS("switch_call_replace");
+UT_COVERS("param_addrof_const_fold");
+UT_COVERS("local_addrof_const_fold");

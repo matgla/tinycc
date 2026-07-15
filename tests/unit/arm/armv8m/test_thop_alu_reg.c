@@ -7,8 +7,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_alu_reg.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_alu_reg.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -502,61 +502,4 @@ UT_TEST(test_add_reg_pc_in_rn_fails)
   UT_ASSERT_EQ(op.opcode, 0);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_alu_reg)
-{
-  /* ADD */
-  UT_RUN(test_add_reg_t16_low_reg3);
-  UT_RUN(test_add_reg_t16_sp_reg);
-  UT_RUN(test_add_reg_t16_high_reg);
-  UT_RUN(test_add_reg_t32_with_shift);
-  UT_RUN(test_add_reg_enforce_16bit_with_shift_fails);
-  UT_RUN(test_add_reg_enforce_32bit_low_regs);
-
-  /* SUB */
-  UT_RUN(test_sub_reg_t16_low_reg3);
-  UT_RUN(test_sub_reg_t32_with_shift);
-
-  /* RSB */
-  UT_RUN(test_rsb_reg_t32_only);
-  UT_RUN(test_rsb_reg_t32_with_shift);
-
-  /* ADC */
-  UT_RUN(test_adc_reg_t16_rdn_rm);
-  UT_RUN(test_adc_reg_t32_with_shift);
-
-  /* SBC */
-  UT_RUN(test_sbc_reg_t16_rdn_rm);
-  UT_RUN(test_sbc_reg_t32_with_shift);
-
-  /* AND */
-  UT_RUN(test_and_reg_t16_rdn_rm);
-  UT_RUN(test_and_reg_t32_with_shift);
-
-  /* BIC */
-  UT_RUN(test_bic_reg_t16_rdn_rm);
-  UT_RUN(test_bic_reg_t32_with_shift);
-
-  /* ORR */
-  UT_RUN(test_orr_reg_t16_rdn_rm);
-  UT_RUN(test_orr_reg_t32_with_shift);
-
-  /* ORN (T3 only) */
-  UT_RUN(test_orn_reg_t32_only);
-  UT_RUN(test_orn_reg_t32_with_shift);
-
-  /* EOR */
-  UT_RUN(test_eor_reg_t16_rdn_rm);
-  UT_RUN(test_eor_reg_t32_with_shift);
-
-  /* Constraint failures */
-  UT_RUN(test_add_reg_high_reg_falls_to_t3);
-  UT_RUN(test_adc_reg_high_reg_fails);
-  UT_RUN(test_add_reg_enforce_16bit_high_reg_fails);
-  UT_RUN(test_adc_reg_rd_ne_rn_fails_t1);
-  UT_RUN(test_add_reg_sp_in_rm_fails_t3);
-  UT_RUN(test_add_reg_pc_in_rn_fails);
 }

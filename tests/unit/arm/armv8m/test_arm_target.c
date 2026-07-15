@@ -18,8 +18,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/arm.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "tcc.h"
 
 #include "ut.h"
@@ -417,40 +417,4 @@ UT_TEST(test_tcc_target_has_unknown_cap_falls_through_to_false)
   tcc_target_cap bogus = (tcc_target_cap)9999;
   UT_ASSERT_EQ(tcc_target_has(bogus), false);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(arm_target)
-{
-  UT_RUN(test_arm_target_init_basic_fields_no_fpu);
-  UT_RUN(test_arm_target_init_null_march_defaults_to_armv8m_main);
-  UT_RUN(test_arm_target_init_mcpu_passthrough_null);
-  UT_RUN(test_arm_target_init_mfpu_vfp_dp_sets_fp_reg_count_32);
-  UT_RUN(test_arm_target_init_mfpu_d32_sets_fp_reg_count_64);
-  UT_RUN(test_arm_target_init_mfpu_sp_only_sets_fp_reg_count_32);
-  UT_RUN(test_arm_target_init_mfpu_none_string_clears_fpu_bits);
-  UT_RUN(test_arm_target_init_march_ext_sec_sets_is_secure_tz);
-  UT_RUN(test_arm_target_init_march_base_profile_omits_main_only_bits);
-  UT_RUN(test_arm_target_init_extra_feat_bits_fold_in);
-  UT_RUN(test_arm_target_init_reinit_overwrites_previous_state);
-
-  UT_RUN(test_tcc_target_has_all_caps_false_on_zero_feat);
-  UT_RUN(test_tcc_target_has_hw_divide_reads_div_bit_only);
-  UT_RUN(test_tcc_target_has_fp_sp_reads_vfp_sp_bit_only);
-  UT_RUN(test_tcc_target_has_fp_dp_reads_vfp_dp_bit_only);
-  UT_RUN(test_tcc_target_has_fp_hp_reads_fp16_bit_only);
-  UT_RUN(test_tcc_target_has_dsp_simd_reads_dsp_bit_only);
-  UT_RUN(test_tcc_target_has_saturating_arith_reads_sat_bit_only);
-  UT_RUN(test_tcc_target_has_bitfield_instrs_reads_bfx_bit_only);
-  UT_RUN(test_tcc_target_has_cond_exec_reads_it_bit_only);
-  UT_RUN(test_tcc_target_has_move_imm_wide_reads_movw_movt_bit_only);
-  UT_RUN(test_tcc_target_has_vector_reads_mve_int_bit_only);
-  UT_RUN(test_tcc_target_has_security_reads_sec_bit_only);
-  UT_RUN(test_tcc_target_has_pointer_auth_reads_pacbti_bit_only);
-  UT_RUN(test_tcc_target_has_low_overhead_loop_reads_lob_bit_only);
-  UT_RUN(test_tcc_target_has_reflects_arm_target_init_end_to_end);
-  UT_RUN(test_tcc_target_has_unknown_cap_falls_through_to_false);
 }

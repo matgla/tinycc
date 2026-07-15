@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_OPT_DU_H
-#define TCC_IR_OPT_DU_H
+#pragma once
 
 #include <stdint.h>
 
@@ -105,5 +104,3 @@ uint8_t *ir_opt_build_def_count(struct TCCIRState *ir, int n, int *out_stride);
 
 #define DC_IS_SINGLE_DEF(dc, stride, vr)                                                                               \
   ((vr) >= 0 && (dc)[TCCIR_DECODE_VREG_TYPE(vr) * (stride) + TCCIR_DECODE_VREG_POSITION(vr)] == 1)
-
-#endif /* TCC_IR_OPT_DU_H */

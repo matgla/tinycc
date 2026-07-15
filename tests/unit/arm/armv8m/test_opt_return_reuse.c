@@ -321,21 +321,4 @@ UT_TEST(test_return_reuse_ex_forwards)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_return_reuse)
-{
-  UT_COVERS("return_reuse");
-
-  UT_RUN(test_return_reuse_test_zero_eq_rewrites_return);
-  UT_RUN(test_return_reuse_cmp_nonzero_const_rewrites_return);
-  UT_RUN(test_return_reuse_temp_proven_eq_rewrites_return);
-  UT_RUN(test_return_reuse_ne_edge_no_rewrite);
-  UT_RUN(test_return_reuse_const_mismatch_no_rewrite);
-  UT_RUN(test_return_reuse_fallthrough_no_rewrite);
-  UT_RUN(test_return_reuse_lval_proven_no_rewrite);
-  UT_RUN(test_return_reuse_optimize_gate);
-  UT_RUN(test_return_reuse_idempotent);
-  UT_RUN(test_return_reuse_empty_and_tiny);
-  UT_RUN(test_return_reuse_ex_forwards);
-}
+UT_COVERS("return_reuse");

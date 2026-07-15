@@ -544,27 +544,4 @@ UT_TEST(test_strength_reduce_ignores_other_ops)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_strength)
-{
-  UT_COVERS("ssa:strength_reduce");
-  UT_RUN(test_strength_reduce_mul_pow2_src2_imm);
-  UT_RUN(test_strength_reduce_mul_pow2_src1_imm);
-  UT_RUN(test_strength_reduce_mul_by_one);
-  UT_RUN(test_strength_reduce_mul_no_imm);
-  UT_RUN(test_strength_reduce_mul_non_pow2_imm);
-  UT_RUN(test_strength_reduce_mul_zero_imm);
-  UT_RUN(test_strength_reduce_mul_lval_imm);
-  UT_RUN(test_strength_reduce_udiv_pow2);
-  UT_RUN(test_strength_reduce_udiv_by_one);
-  UT_RUN(test_strength_reduce_udiv_non_imm);
-  UT_RUN(test_strength_reduce_udiv_non_pow2);
-  UT_RUN(test_strength_reduce_udiv_lval_imm);
-  UT_RUN(test_strength_reduce_umod_pow2);
-  UT_RUN(test_strength_reduce_umod_by_one);
-  UT_RUN(test_strength_reduce_umod_non_imm);
-  UT_RUN(test_strength_reduce_umod_non_pow2);
-  UT_RUN(test_strength_reduce_umod_lval_imm);
-  UT_RUN(test_strength_reduce_multiple);
-  UT_RUN(test_strength_reduce_skips_nop);
-  UT_RUN(test_strength_reduce_ignores_other_ops);
-}
+UT_COVERS("ssa:strength_reduce");

@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_DUMP_H
-#define TCC_IR_DUMP_H
+#pragma once
 
 struct TCCIRState;
 struct SValue;
@@ -27,4 +26,3 @@ void tcc_ir_dump_vreg(int vreg, FILE *out);
 const char *tcc_ir_dump_op_name(int op);
 void tcc_ir_print_vreg(int vreg);
 
-#endif /* TCC_IR_DUMP_H */

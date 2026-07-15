@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_OPT_LOOP_CONST_SIM_H
-#define TCC_IR_OPT_LOOP_CONST_SIM_H
+#pragma once
 
 #include "ir.h"
 #include "opt_engine.h"
@@ -21,4 +20,3 @@
 int lcs_fold_region(struct TCCIRState *ir, int start_idx, int end_idx,
                     int header_idx, int preheader_idx, int allow_extension);
 
-#endif /* TCC_IR_OPT_LOOP_CONST_SIM_H */

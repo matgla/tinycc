@@ -2,7 +2,7 @@
 # Included by the top-level Makefile.
 
 # Backend generators compilation unit.
-BACKEND_GENERATORS_INC = -I$(TOP)/source/backend/generators
+BACKEND_GENERATORS_INC = -I$(TOP)/source/backend/generators -I$(TOP)/source/backend/arch/arm
 
 BACKEND_GENERATORS_CC = $(CC) $(CFLAGS) $(DEFINES) $(BACKEND_GENERATORS_INC)
 
@@ -16,10 +16,10 @@ $(X)source/backend/generators/function.o: \
 	source/backend/generators/regalloc.h \
 	source/opt/function_pipeline.h \
 	tcc.h tccir.h ir/opt.h ir/opt_utils.h ir/opt_engine.h \
-	ir/opt_pipeline.h ir/opt_gens_fusion.h ir/opt_gens_bool.h \
-	ir/opt_gens_call_result.h ir/regalloc.h ir/ssa.h \
+	ir/opt_pipeline.h ir/opt_gens_fusion.h source/opt/flat/include/opt/flat/bool.h \
+	source/opt/flat/include/opt/flat/call_result.h ir/regalloc.h ir/ssa.h \
 	ir/cfg.h ir/codegen.h ir/core.h ir/licm.h \
-	arch/arm/arm_regalloc.h
+	source/backend/arch/arm/arm_regalloc.h
 	@mkdir -p $(dir $@)
 	$(BACKEND_GENERATORS_CC) -c $< -o $@
 
@@ -30,7 +30,7 @@ $(X)source/backend/generators/regalloc.o: \
 	tcc.h tccir.h ir/opt.h ir/opt_utils.h ir/opt_engine.h \
 	ir/opt_pipeline.h ir/regalloc.h ir/ssa.h \
 	ir/cfg.h ir/codegen.h ir/core.h ir/licm.h \
-	arch/arm/arm_regalloc.h
+	source/backend/arch/arm/arm_regalloc.h
 	@mkdir -p $(dir $@)
 	$(BACKEND_GENERATORS_CC) -c $< -o $@
 

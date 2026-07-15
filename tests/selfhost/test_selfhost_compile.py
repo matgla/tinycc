@@ -50,10 +50,6 @@ SELFHOST_COMPILE_SOURCES = [
     "ir/opt_engine.c",
     "ir/opt_pipeline.c",
     "ir/opt_gens_fusion.c",
-    "ir/opt_gens_bool.c",
-    "ir/opt_gens_call_result.c",
-    "ir/opt_gens_branch.c",
-    "ir/opt_loop.c",
     "ir/opt_memory.c",
     "ir/opt_jump_thread.c",
     "ir/opt_pack64.c",
@@ -64,9 +60,7 @@ SELFHOST_COMPILE_SOURCES = [
     "ir/opt_fusion.c",
     "ir/opt_promote.c",
     "ir/opt_constprop.c",
-    "ir/opt_knownbits.c",
     "ir/opt_dead_lea_store.c",
-    "ir/opt_const_aggregate.c",
     "ir/opt_dead_vla.c",
     "ir/opt_loop_const_sim.c",
     "ir/opt_switch_data.c",
@@ -74,21 +68,16 @@ SELFHOST_COMPILE_SOURCES = [
     "ir/opt_neg_chain.c",
     "ir/opt_bitfield.c",
     "ir/opt_cmp_fuse.c",
-    "ir/opt_setif_or_taut.c",
     "ir/licm.c",
     "ir/opt/ssa_opt.c",
     "ir/opt/ssa_opt_dce.c",
-    "ir/opt/ssa_opt_cprop.c",
-    "ir/opt/ssa_opt_gvn.c",
-    "ir/opt/ssa_opt_reassoc.c",
     "ir/opt/ssa_opt_sccp.c",
-    "ir/opt/ssa_opt_load_cse.c",
     "ir/opt/ssa_opt_dead_loop.c",
     # ARMv8-M backend
-    "arm-thumb-gen.c",
-    "arm-thumb-callsite.c",
-    "arm-thumb-asm.c",
-    "arm-link.c",
+    "source/backend/arch/arm/thumb/arm-thumb-gen.c",
+    "source/backend/arch/arm/thumb/arm-thumb-callsite.c",
+    "source/backend/arch/arm/thumb/arm-thumb-asm.c",
+    "source/backend/arch/arm/arm-link.c",
 ]
 
 
@@ -102,6 +91,10 @@ def _selfhost_include_dirs(tinycc_root):
         tinycc_root / "ir",
         tinycc_root / "ir" / "opt",
         tinycc_root / "include",
+        tinycc_root / "source" / "memory" / "include",
+        tinycc_root / "source" / "opt" / "ssa" / "include",
+        tinycc_root / "source" / "backend" / "arch" / "arm",
+        tinycc_root / "source" / "backend" / "arch" / "arm" / "thumb",
     ]
 
 

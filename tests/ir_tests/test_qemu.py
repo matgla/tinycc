@@ -909,6 +909,11 @@ TEST_FILES = [
     ("357_ssa_string_search_fold.c", 0),
     ("358_ssa_clrsb_fold.c", 0),
     ("359_signed_div_pow2.c", 0),
+    ("360_self_arith_fold.c", 0),
+    ("361_cmp_offset_common_base.c", 0),
+    ("362_value_track_const_lmod_fold.c", 0),
+    ("363_pure_modulo_hoist_cse.c", 0),
+    ("364_diamond_store_fwd.c", 0),
 ]
 
 # Per-test compiler defines (e.g. for missing platform macros)

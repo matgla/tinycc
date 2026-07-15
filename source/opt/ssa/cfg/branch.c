@@ -13,6 +13,11 @@
 #include "ssa_opt.h"
 #include "opt/ssa/branch.h"
 #include "opt/ssa/ssa_opt_helpers.h"
+#include "memory/small_sequence.h"
+
+/* Inline-first per-block scratch (heap only past the inline cap). */
+TCC_SMALL_SEQUENCE_DEFINE(BranchIntSeq, int, 128)
+TCC_SMALL_SEQUENCE_DEFINE(BranchU8Seq, uint8_t, 128)
 
 /* ============================================================================
  * Branch Folding: when CMP or TEST_ZERO has constant operands (after cprop
@@ -713,7 +718,9 @@ uint8_t *ssa_opt_compute_reachable_blocks(IRSSAOptCtx *ctx)
   int nb = cfg->num_blocks;
   int n_instrs = ir->next_instruction_index;
   uint8_t *reachable = tcc_mallocz(nb);
-  int *worklist = tcc_malloc(nb * sizeof(int));
+  small_sequence(BranchIntSeq) worklist_owner = {0};
+  BranchIntSeq_init(&worklist_owner, (size_t)nb);
+  int *worklist = BranchIntSeq_data(&worklist_owner);
   int wl_head = 0, wl_tail = 0;
 
   /* Entry = block containing instruction 0.  Conservative fallback: if the
@@ -721,7 +728,6 @@ uint8_t *ssa_opt_compute_reachable_blocks(IRSSAOptCtx *ctx)
   int entry = (cfg->num_instrs > 0) ? cfg->instr_to_block[0] : -1;
   if (entry < 0 || entry >= nb) {
     for (int i = 0; i < nb; i++) reachable[i] = 1;
-    tcc_free(worklist);
     return reachable;
   }
 
@@ -787,7 +793,6 @@ uint8_t *ssa_opt_compute_reachable_blocks(IRSSAOptCtx *ctx)
 
 #undef MARK
 
-  tcc_free(worklist);
   return reachable;
 }
 
@@ -810,7 +815,9 @@ static int ssa_branch_prune_unreachable_phis(IRSSAOptCtx *ctx)
    * unreachable predecessors and drop each in turn.  ssa_drop_phi_edge
    * walks every phi at the target and removes all matching operands, so
    * one call per (dead_pred, target_block) pair handles all phis there. */
-  uint8_t *seen_pred = tcc_malloc(nb);
+  small_sequence(BranchU8Seq) seen_pred_owner = {0};
+  BranchU8Seq_init(&seen_pred_owner, (size_t)nb);
+  uint8_t *seen_pred = BranchU8Seq_data(&seen_pred_owner);
   for (int b = 0; b < nb; b++) {
     if (!reachable[b]) continue;
     if (!ctx->ssa->block_phis[b]) continue;
@@ -843,7 +850,6 @@ static int ssa_branch_prune_unreachable_phis(IRSSAOptCtx *ctx)
       after += phi->num_operands;
     changes += before - after;
   }
-  tcc_free(seen_pred);
 
   tcc_free(reachable);
   return changes;

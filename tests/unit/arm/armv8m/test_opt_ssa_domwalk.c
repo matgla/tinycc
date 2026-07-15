@@ -348,18 +348,4 @@ UT_TEST(test_domwalk_deep_chain_no_overflow)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_ssa_domwalk)
-{
-  UT_COVERS("opt_ssa_domwalk");
-  UT_RUN(test_domwalk_empty_cfg);
-  UT_RUN(test_domwalk_null_cfg);
-  UT_RUN(test_domwalk_single_block);
-  UT_RUN(test_domwalk_linear_chain);
-  UT_RUN(test_domwalk_sibling_scope_isolation);
-  UT_RUN(test_domwalk_tree_covers_all_once);
-  UT_RUN(test_domwalk_change_count_sums_hooks);
-  UT_RUN(test_domwalk_null_hooks);
-  UT_RUN(test_domwalk_deep_chain_no_overflow);
-}
+UT_COVERS("opt_ssa_domwalk");

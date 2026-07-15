@@ -454,6 +454,167 @@ UT_TEST(test_cmpfold_offset_empty_and_tiny)
   return 0;
 }
 
+/* SUB-defined offset: A = B - 4; CMP A,B; JUMPIF <S reduces to "(-4) < 0" == true.
+ * Exercises the dq->op == TCCIR_OP_SUB branch (k negated), distinct from the
+ * ADD-with-negative-immediate path covered above. */
+UT_TEST(test_cmpfold_offset_sub_def_folds_to_jump)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_SUB, utb_temp(1, I32), utb_temp(0, I32), utb_imm(4, I32));
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_temp(0, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(TOK_LT, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_cmp_const_offset_fold(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ(utb_dest(ir, ijmp).u.imm32, 4);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Swap orientation: the offset temp is the CMP's *second* operand.
+ *   A = B + 5 ; CMP B, A ; JUMPIF <S   (src1 = B, src2 = A = B + 5)
+ * The pass must try swap=1 (a = vr2 = A, b = vr1 = B), yielding delta = -k = -5,
+ * so "(-5) < 0" == true. Covers the swap==1 search branch. */
+UT_TEST(test_cmpfold_offset_swap_orientation_folds)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(5, I32));
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_temp(1, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(TOK_LT, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_cmp_const_offset_fold(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ(utb_dest(ir, ijmp).u.imm32, 4);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Commutative ADD base: A = K + B (immediate first). The pass must match the
+ * `irop_get_vreg(ds2) == b` branch (ADD only). "5 > 0" == true. */
+UT_TEST(test_cmpfold_offset_commutative_add_folds)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_imm(5, I32), utb_temp(0, I32));
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_temp(0, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(TOK_GT, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_cmp_const_offset_fold(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMP);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* COMMON-BASE fold: neither CMP operand is the other's base, but both are
+ * constant offsets of the same base X.
+ *   A = X + 1 ; B = X + 3 ; CMP A,B ; JUMPIF <S   ⇒  (1 - 3) < 0 == true. */
+UT_TEST(test_cmpfold_offset_common_base_folds_to_jump)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32), utb_imm(3, I32));
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_temp(2, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(5, I32), utb_imm(TOK_LT, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_cmp_const_offset_fold(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ(utb_dest(ir, ijmp).u.imm32, 5);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* COMMON-BASE, GE orientation: A = X + 3 ; B = X + 1 ; CMP A,B ; JUMPIF <=S
+ * ⇒ (3 - 1) <= 0 == false, so both NOP. Exercises the >0 delta / false path. */
+UT_TEST(test_cmpfold_offset_common_base_le_false_nops)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(3, I32));
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32), utb_imm(1, I32));
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_temp(2, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(5, I32), utb_imm(TOK_LE, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_cmp_const_offset_fold(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_NOP);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: distinct bases (X vs Y) give no provable offset relation. */
+UT_TEST(test_cmpfold_offset_common_base_distinct_base_no_fold)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(3, I32), utb_imm(3, I32));
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_temp(2, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(5, I32), utb_imm(TOK_LT, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_cmp_const_offset_fold(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMPIF);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: shared base redefined between the two offset ADDs — A used the old X,
+ * B the new one, so K1-K2 is not the real delta. Reaching-def guard must reject. */
+UT_TEST(test_cmpfold_offset_common_base_redefined_no_fold)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(50, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32), utb_imm(3, I32));
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_temp(2, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(6, I32), utb_imm(TOK_LT, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_cmp_const_offset_fold(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMPIF);
+
+  utb_free(ir);
+  return 0;
+}
+
 /* -------------------------------- cmp_expr_fold corner cases */
 
 /* FIXED: comparing a register value to itself.  EQ is always true, so the
@@ -813,45 +974,4 @@ UT_TEST(test_cmpfold_field_fuse_idempotent)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_cmpfold)
-{
-  UT_COVERS("cmp_fold");
-
-  /* cmp_const_offset_fold */
-  UT_RUN(test_cmpfold_offset_signed_true_folds_to_jump);
-  UT_RUN(test_cmpfold_offset_negative_delta_folds_to_jump);
-  UT_RUN(test_cmpfold_offset_eq_false_nops_both);
-  UT_RUN(test_cmpfold_offset_ne_true_folds_to_jump);
-  UT_RUN(test_cmpfold_offset_int64_delta_no_fold);
-  UT_RUN(test_cmpfold_offset_lval_base_match_folds);
-  UT_RUN(test_cmpfold_offset_lval_base_mismatch_no_fold);
-  UT_RUN(test_cmpfold_offset_address_taken_base_no_fold);
-  UT_RUN(test_cmpfold_offset_base_redefined_no_fold);
-  UT_RUN(test_cmpfold_offset_select_folds);
-  UT_RUN(test_cmpfold_offset_non_adjacent_def_folds);
-  UT_RUN(test_cmpfold_offset_unsigned_cond_no_fold);
-  UT_RUN(test_cmpfold_offset_zero_delta_no_fold);
-  UT_RUN(test_cmpfold_offset_no_arith_def_no_fold);
-  UT_RUN(test_cmpfold_offset_idempotent);
-  UT_RUN(test_cmpfold_offset_empty_and_tiny);
-
-  /* cmp_expr_fold */
-  UT_RUN(test_cmpfold_expr_same_vreg_eq_true_no_fold);
-  UT_RUN(test_cmpfold_expr_same_vreg_gt_false_no_fold);
-  UT_RUN(test_cmpfold_expr_same_vreg_ult_false_no_fold);
-  UT_RUN(test_cmpfold_expr_same_vreg_lval_mismatch_no_fold);
-  UT_RUN(test_cmpfold_expr_imm_imm_equal_no_fold);
-  UT_RUN(test_cmpfold_expr_asymmetric_vreg_imm_eq_folds);
-  UT_RUN(test_cmpfold_expr_asymmetric_vreg_imm_ne_false_folds);
-  UT_RUN(test_cmpfold_expr_pure_def_equal_folds);
-  UT_RUN(test_cmpfold_expr_idempotent);
-  UT_RUN(test_cmpfold_expr_empty_and_tiny);
-
-  /* cmp_field_fuse */
-  UT_RUN(test_cmpfold_field_fuse_width_1_bits);
-  UT_RUN(test_cmpfold_field_fuse_width_31);
-  UT_RUN(test_cmpfold_field_fuse_three_fields);
-  UT_RUN(test_cmpfold_field_fuse_idempotent);
-}
+UT_COVERS("cmp_fold");

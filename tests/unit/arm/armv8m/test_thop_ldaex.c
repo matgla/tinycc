@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_ldaex.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_ldaex.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -219,19 +219,4 @@ UT_TEST(test_ldaex_vs_stlex_base_diff)
   UT_ASSERT_EQ(diff, 0x100000);
 
   return 0;
-}
-
-/* ───── suite ───── */
-
-UT_SUITE(thop_ldaex)
-{
-  UT_RUN(test_ldaex_basic);
-  UT_RUN(test_ldaexb_basic);
-  UT_RUN(test_ldaexh_basic);
-  UT_RUN(test_stlex_basic);
-  UT_RUN(test_stlexb_basic);
-  UT_RUN(test_stlexh_basic);
-  UT_RUN(test_ldaex_feature_gate_off);
-  UT_RUN(test_ldaex_all_size_4);
-  UT_RUN(test_ldaex_vs_stlex_base_diff);
 }

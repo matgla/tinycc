@@ -13,7 +13,7 @@
 #include "ir/regalloc.h"
 #include "ir/codegen.h"
 #include "ir/machine_op.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
 
@@ -1103,34 +1103,4 @@ UT_TEST(test_dispatch_block_copy_routes_to_block_copy_mop)
 
   tcc_ir_free(ir);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(codegen_mem)
-{
-  UT_RUN(test_load_store_lowering);
-  UT_RUN(test_lea_lowering);
-  UT_RUN(test_indexed_memory_layout);
-  UT_RUN(test_codegen_backpatch_roundtrip);
-  UT_RUN(test_dispatch_load_store_route_to_mops);
-  UT_RUN(test_dispatch_lea_routes_to_lea_mop);
-  UT_RUN(test_dispatch_indexed_memory_routes_to_indexed_mops);
-  UT_RUN(test_dispatch_store_indexed_four_bytes_coalesce_into_one_word_store);
-  UT_RUN(test_dispatch_store_indexed_eight_bytes_coalesce_into_two_word_stores);
-  UT_RUN(test_dispatch_store_indexed_three_bytes_do_not_coalesce);
-  UT_RUN(test_dispatch_store_indexed_reg_pair_attempts_strd_base);
-  UT_RUN(test_dispatch_store_indexed_imm32_pair_attempts_strd_imm_base);
-  UT_RUN(test_dispatch_store_spill_reg_pair_attempts_strd_spill);
-  UT_RUN(test_dispatch_store_spill_second_deref_value_blocks_strd_spill);
-  UT_RUN(test_dispatch_store_spill_first_deref_value_blocks_strd_spill);
-  UT_RUN(test_dispatch_store_spill_imm_pair_attempts_strd_imm_spill);
-  UT_RUN(test_dispatch_store_deref_vreg_reg_pair_attempts_strd_base);
-  UT_RUN(test_dispatch_store_deref_vreg_deref_value_blocks_strd_base);
-  UT_RUN(test_dispatch_load_indexed_reg_pair_attempts_ldrd_base);
-  UT_RUN(test_dispatch_assign_spill_to_reg_pair_attempts_ldrd_spill);
-  UT_RUN(test_dispatch_assign_reg_to_spill_pair_attempts_strd_spill);
-  UT_RUN(test_dispatch_block_copy_routes_to_block_copy_mop);
 }

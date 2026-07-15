@@ -567,19 +567,4 @@ UT_TEST(test_dead_loop_no_loops)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_dead_loop)
-{
-  UT_COVERS("ssa:dead_loop");
-  UT_RUN(test_resolve_const_through_copies_direct);
-  UT_RUN(test_dl_invert_cond_token_via_pass);
-  UT_RUN(test_loop_body_no_side_effects);
-  UT_RUN(test_loop_body_with_store);
-  UT_RUN(test_proven_loop_rewrites_and_kills);
-  UT_RUN(test_proven_loop_down_counter);
-  UT_RUN(test_guarded_loop_emits_select);
-  UT_RUN(test_analyze_bails_non_const_init);
-  UT_RUN(test_phi_used_in_loop_not_rewritten);
-  UT_RUN(test_body_escape_prevents_kill);
-  UT_RUN(test_no_header_cmp_bails);
-  UT_RUN(test_dead_loop_no_loops);
-}
+UT_COVERS("ssa:dead_loop");

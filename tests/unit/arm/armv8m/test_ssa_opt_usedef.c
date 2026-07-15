@@ -307,18 +307,4 @@ UT_TEST(test_has_side_effects_store)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_usedef)
-{
-  UT_COVERS("ssa:usedef");
-  UT_RUN(test_vinfo_lookup_temp);
-  UT_RUN(test_vinfo_lookup_non_temp_returns_null);
-  UT_RUN(test_scan_instr_uses_src1_src2);
-  UT_RUN(test_replace_all_uses);
-  UT_RUN(test_nop_instr_removes_uses);
-  UT_RUN(test_resolve_lea_stackloc_lea);
-  UT_RUN(test_resolve_lea_stackloc_assign_chain);
-  UT_RUN(test_resolve_lea_stackloc_unresolved);
-  UT_RUN(test_resolve_temp_to_base_off_var);
-  UT_RUN(test_indirect_stack_offset_plain_store);
-  UT_RUN(test_has_side_effects_store);
-}
+UT_COVERS("ssa:usedef");

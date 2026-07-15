@@ -49,8 +49,8 @@
 
 #define USING_GLOBALS
 #include "ir.h"
-#include "arch/arm/arm.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
@@ -570,23 +570,4 @@ UT_TEST(test_builtin_apply_args_in_clobbered_reg_relocates_to_safe_scratch)
   UT_ASSERT_EQ(read_le16(p + 18), 0xbc10); /* POP {r4} */
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_setjmp)
-{
-  UT_RUN(test_longjmp_reg_buf_emits_expected_sequence);
-  UT_RUN(test_nl_longjmp_reg_buf_emits_expected_sequence);
-  UT_RUN(test_nl_longjmp_frame_addr_buf_ends_in_push_pop_wrapped_bx_r0);
-  UT_RUN(test_setjmp_reg_buf_frame_area_reg_dest_shape);
-  UT_RUN(test_setjmp_none_buf_does_not_crash);
-  UT_RUN(test_nl_setjmp_frame_buf_reg_dest_shape);
-  UT_RUN(test_nl_setjmp_none_buf_does_not_crash);
-  UT_RUN(test_builtin_apply_args_emits_code_for_dest);
-  UT_RUN(test_builtin_apply_args_offset_zero_emits_mov_from_sp);
-  UT_RUN(test_builtin_apply_fn_args_regs_not_clobbered_emits_expected_sequence);
-  UT_RUN(test_builtin_apply_fn_already_in_ip_skips_extra_mov);
-  UT_RUN(test_builtin_apply_dest_already_r0_skips_extra_mov);
-  UT_RUN(test_builtin_apply_args_in_clobbered_reg_relocates_to_safe_scratch);
 }

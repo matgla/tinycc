@@ -374,31 +374,9 @@ UT_TEST(test_global_base_share_no_elf_state_never_fires)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_store_fwd)
-{
-  UT_COVERS("entry_store");
-  UT_COVERS("byte_store_merge");
-  UT_COVERS("dead_static_store");
-  UT_COVERS("dead_local_slot");
-  UT_COVERS("dead_temp_local");
-  UT_COVERS("global_base_share");
-
-  UT_RUN(test_entry_store_forwards_lea_add_deref);
-  UT_RUN(test_entry_store_no_matching_offset_kept);
-
-  UT_RUN(test_byte_store_merge_four_bytes_merged);
-  UT_RUN(test_byte_store_merge_incomplete_group_kept);
-
-  UT_RUN(test_dead_static_store_unread_global_removed);
-  UT_RUN(test_dead_static_store_possibly_read_global_kept);
-
-  UT_RUN(test_dead_local_slot_unread_store_removed);
-  UT_RUN(test_dead_local_slot_read_store_kept);
-
-  UT_RUN(test_dead_temp_local_unread_store_removed);
-  UT_RUN(test_dead_temp_local_read_store_kept);
-
-  UT_RUN(test_global_base_share_no_elf_state_never_fires);
-}
+UT_COVERS("entry_store");
+UT_COVERS("byte_store_merge");
+UT_COVERS("dead_static_store");
+UT_COVERS("dead_local_slot");
+UT_COVERS("dead_temp_local");
+UT_COVERS("global_base_share");

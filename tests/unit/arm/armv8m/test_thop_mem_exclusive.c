@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_mem_exclusive.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_mem_exclusive.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -240,21 +240,4 @@ UT_TEST(test_ldah_vs_stlh_base_diff)
   UT_ASSERT_EQ(diff, 0x100000);
 
   return 0;
-}
-
-/* ───── suite ───── */
-
-UT_SUITE(thop_mem_exclusive)
-{
-  UT_RUN(test_lda_basic);
-  UT_RUN(test_ldab_basic);
-  UT_RUN(test_ldah_basic);
-  UT_RUN(test_stl_basic);
-  UT_RUN(test_stlb_basic);
-  UT_RUN(test_stlh_basic);
-  UT_RUN(test_ldaex_feature_gate_off);
-  UT_RUN(test_all_size_4);
-  UT_RUN(test_lda_vs_stl_base_diff);
-  UT_RUN(test_ldab_vs_stlb_base_diff);
-  UT_RUN(test_ldah_vs_stlh_base_diff);
 }

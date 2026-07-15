@@ -491,23 +491,4 @@ UT_TEST(test_narrow_and_fold_multi_def_inner)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_narrow)
-{
-  UT_COVERS("ssa:narrow");
-  UT_RUN(test_narrow_shl_shr_basic);
-  UT_RUN(test_narrow_shl_shr_char_trunc);
-  UT_RUN(test_narrow_shl_shr_short_trunc);
-  UT_RUN(test_narrow_shl_shr_non_matching);
-  UT_RUN(test_narrow_shl_sar_no_fold);
-  UT_RUN(test_narrow_shl_shr_int64_no_fold);
-  UT_RUN(test_narrow_shl_shr_multi_def_no_fold);
-  UT_RUN(test_narrow_shl_shr_zero_shift_no_fold);
-  UT_RUN(test_narrow_and_fold_subset_mask);
-  UT_RUN(test_narrow_and_fold_idempotent);
-  UT_RUN(test_narrow_and_fold_shr_mask_covers);
-  UT_RUN(test_narrow_and_fold_shr_mask_not_covering);
-  UT_RUN(test_narrow_and_fold_non_imm_src2);
-  UT_RUN(test_narrow_and_fold_inner_not_and);
-  UT_RUN(test_narrow_and_fold_shr_non_imm_outer);
-  UT_RUN(test_narrow_and_fold_multi_def_inner);
-}
+UT_COVERS("ssa:narrow");

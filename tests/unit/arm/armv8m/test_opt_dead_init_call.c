@@ -273,19 +273,5 @@ UT_TEST(test_dead_init_empty_ir_no_crash)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_dead_init_call)
-{
-  UT_COVERS("compute_func_write_summary");
-  UT_COVERS("dead_init_via_call");
-  UT_RUN(test_dead_init_full_coverage_store_killed);
-  UT_RUN(test_dead_init_partial_coverage_kept);
-  UT_RUN(test_dead_init_read_between_store_and_call_kept);
-  UT_RUN(test_dead_init_control_flow_boundary_kept);
-  UT_RUN(test_dead_init_no_summary_kept);
-  UT_RUN(test_dead_init_non_stack_param_kept);
-  UT_RUN(test_fws_empty_ir_no_crash);
-  UT_RUN(test_fws_idempotent_second_call_noop);
-  UT_RUN(test_dead_init_empty_ir_no_crash);
-}
+UT_COVERS("compute_func_write_summary");
+UT_COVERS("dead_init_via_call");

@@ -8,7 +8,7 @@
 
 int tcc_ir_opt_sl_forward(TCCIRState *ir);
 int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir);
-int tcc_ir_opt_diamond_store_fwd(TCCIRState *ir);
+int ssa_opt_diamond_store_fwd_core(TCCIRState *ir);
 
 #define I32 IROP_BTYPE_INT32
 #define VR_VAR(p) TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, (p))
@@ -494,7 +494,7 @@ UT_TEST(test_diamond_store_fwd_both_arms_same_const)
   int load = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(6, I32), utb_temp(1, I32), utb_temp(2, I32), utb_imm(2, I32));
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(6, I32), UTB_NONE);
 
-  int changes = tcc_ir_opt_diamond_store_fwd(ir);
+  int changes = ssa_opt_diamond_store_fwd_core(ir);
 
   UT_ASSERT(changes > 0);
   UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_ASSIGN);
@@ -506,9 +506,9 @@ UT_TEST(test_diamond_store_fwd_both_arms_same_const)
   return 0;
 }
 
-/* NEGATIVE (guard): the two branches store different constants, so the merge
- * LOAD_INDEXED cannot be resolved to a single value. */
-UT_TEST(test_diamond_store_fwd_different_const_kept)
+/* POSITIVE: different constants per arm fold via a fresh temp defined in both
+ * arms (phi after SSA rebuild); the merge load becomes a register copy. */
+UT_TEST(test_diamond_store_fwd_different_const_phi)
 {
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
@@ -529,19 +529,35 @@ UT_TEST(test_diamond_store_fwd_different_const_kept)
   int else_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
   ir->compact_instructions[else_label].is_jump_target = 1;
   utb_emit(ir, TCCIR_OP_ADD, utb_temp(5, I32), utb_temp(1, I32), utb_temp(3, I32));
-  /* Different constant than the then arm. */
   utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(5, I32)), utb_imm(43, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_JUMP, utb_imm(Lmerge, I32), UTB_NONE, UTB_NONE);
   utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
   int merge_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
   ir->compact_instructions[merge_label].is_jump_target = 1;
-  int load = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(6, I32), utb_temp(1, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(6, I32), utb_temp(1, I32), utb_temp(2, I32), utb_imm(2, I32));
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(6, I32), UTB_NONE);
+  ir->next_temporary_variable = 8;
 
-  int changes = tcc_ir_opt_diamond_store_fwd(ir);
+  int changes = ssa_opt_diamond_store_fwd_core(ir);
 
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_LOAD_INDEXED);
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(ir->next_instruction_index, 19);
+  /* then arm: STORE #42 @6, inserted ASSIGN tmp<-#42 @7, JUMP @8 -> merge @16 */
+  UT_ASSERT_EQ(utb_op(ir, 7), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 7)), 42);
+  UT_ASSERT_EQ(utb_op(ir, 8), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ((int)utb_dest(ir, 8).u.imm32, 16);
+  /* else arm shifted to @10: STORE #43 @12, inserted ASSIGN tmp<-#43 @13 */
+  UT_ASSERT_EQ((int)utb_dest(ir, 4).u.imm32, 10);
+  UT_ASSERT_EQ(utb_op(ir, 13), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 13)), 43);
+  int32_t tmp_vr = irop_get_vreg(utb_dest(ir, 7));
+  UT_ASSERT(tmp_vr >= 0);
+  UT_ASSERT_EQ(irop_get_vreg(utb_dest(ir, 13)), tmp_vr);
+  /* merge load @17 is now a copy from the temp */
+  UT_ASSERT_EQ(utb_op(ir, 17), TCCIR_OP_ASSIGN);
+  UT_ASSERT(!irop_is_immediate(utb_src1(ir, 17)));
+  UT_ASSERT_EQ(irop_get_vreg(utb_src1(ir, 17)), tmp_vr);
 
   utb_free(ir);
   return 0;
@@ -578,7 +594,7 @@ UT_TEST(test_diamond_store_fwd_no_load_kept)
   /* No LOAD_INDEXED after the merge. */
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
-  int changes = tcc_ir_opt_diamond_store_fwd(ir);
+  int changes = ssa_opt_diamond_store_fwd_core(ir);
 
   UT_ASSERT_EQ(changes, 0);
 
@@ -586,26 +602,317 @@ UT_TEST(test_diamond_store_fwd_no_load_kept)
   return 0;
 }
 
-UT_SUITE(opt_memory)
+/* POSITIVE: fused STORE_INDEXED arms (the canonical -O2 shape after indexed
+ * fusion) with a shared vreg index fold the post-merge LOAD_INDEXED. */
+UT_TEST(test_diamond_store_fwd_store_indexed_arms)
 {
-  UT_RUN(test_sl_forward_store_lval_var_slot_does_not_alias_stackloc);
-  UT_RUN(test_sl_forward_resolves_temp_before_store_width);
-  UT_RUN(test_sl_forward_pointer_store_keeps_deref_width_for_high_half);
-  UT_RUN(test_sl_forward_basic_imm_store_load);
-  UT_RUN(test_sl_forward_lea_pointer_store_load);
-  UT_RUN(test_sl_forward_cmp_lval_operand_forward);
-  UT_RUN(test_sl_forward_unknown_pointer_store_clears_tracking);
-  UT_RUN(test_sl_forward_call_invalidates_addrtaken_store);
-  UT_RUN(test_sl_forward_jump_target_blocks_forward);
-  UT_RUN(test_sl_forward_cross_bb_fallthrough);
-  UT_RUN(test_sl_forward_store_indexed_via_lea);
-  UT_RUN(test_sl_forward_pure_aeabi_call_keeps_tracking);
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_tmp_intervals(ir, 8);
 
-  UT_RUN(test_memmove_global_load_fwd_direct_local_load);
-  UT_RUN(test_memmove_global_load_fwd_intervening_store_blocks);
-  UT_RUN(test_memmove_global_load_fwd_non_global_src_kept);
+  int Lelse = 7;
+  int Lmerge = 10;
 
-  UT_RUN(test_diamond_store_fwd_both_arms_same_const);
-  UT_RUN(test_diamond_store_fwd_different_const_kept);
-  UT_RUN(test_diamond_store_fwd_no_load_kept);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), slot_addr(200), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(Lelse, I32), utb_temp(0, I32), UTB_NONE);
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, I32), utb_imm(42, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(Lmerge, I32), UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int else_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[else_label].is_jump_target = 1;
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, I32), utb_imm(42, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int merge_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[merge_label].is_jump_target = 1;
+  int load = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(3, I32), utb_temp(1, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32), UTB_NONE);
+
+  int changes = ssa_opt_diamond_store_fwd_core(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_ASSIGN);
+  IROperand s1 = utb_src1(ir, load);
+  UT_ASSERT(irop_is_immediate(s1));
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, s1), 42);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: STORE_INDEXED arms with a matching immediate index also fold. */
+UT_TEST(test_diamond_store_fwd_imm_index)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_tmp_intervals(ir, 8);
+
+  int Lelse = 7;
+  int Lmerge = 10;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), slot_addr(200), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(Lelse, I32), utb_temp(0, I32), UTB_NONE);
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, I32), utb_imm(42, I32), utb_imm(3, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(Lmerge, I32), UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int else_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[else_label].is_jump_target = 1;
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, I32), utb_imm(42, I32), utb_imm(3, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int merge_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[merge_label].is_jump_target = 1;
+  int load = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(3, I32), utb_temp(1, I32), utb_imm(3, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32), UTB_NONE);
+
+  int changes = ssa_opt_diamond_store_fwd_core(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_ASSIGN);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): a jump from outside the diamond into the merge point can
+ * reach the load without executing either store, so the fold is unsafe. */
+UT_TEST(test_diamond_store_fwd_foreign_edge_kept)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_tmp_intervals(ir, 8);
+
+  int Lelse = 8;
+  int Lmerge = 11;
+
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(Lmerge, I32), UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), slot_addr(200), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(Lelse, I32), utb_temp(0, I32), UTB_NONE);
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, I32), utb_imm(42, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(Lmerge, I32), UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int else_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[else_label].is_jump_target = 1;
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, I32), utb_imm(42, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int merge_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[merge_label].is_jump_target = 1;
+  int load = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(3, I32), utb_temp(1, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32), UTB_NONE);
+
+  int changes = ssa_opt_diamond_store_fwd_core(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_LOAD_INDEXED);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): a STORE_POSTINC after the candidate store may alias the
+ * stored slot, so the arm is rejected. */
+UT_TEST(test_diamond_store_fwd_postinc_arm_kept)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_tmp_intervals(ir, 8);
+
+  int Lelse = 9;
+  int Lmerge = 12;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), slot_addr(200), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(4, I32), slot_addr(300), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(Lelse, I32), utb_temp(0, I32), UTB_NONE);
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, I32), utb_imm(42, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_STORE_POSTINC, utb_lval(utb_temp(4, I32)), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(Lmerge, I32), UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int else_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[else_label].is_jump_target = 1;
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, I32), utb_imm(42, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int merge_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[merge_label].is_jump_target = 1;
+  int load = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(3, I32), utb_temp(1, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32), UTB_NONE);
+
+  int changes = ssa_opt_diamond_store_fwd_core(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_LOAD_INDEXED);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): byte store read back by a word load must not fold; the
+ * stored bytes only cover part of the loaded value. */
+UT_TEST(test_diamond_store_fwd_width_mismatch_kept)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_tmp_intervals(ir, 8);
+
+  int Lelse = 7;
+  int Lmerge = 10;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), slot_addr(200), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(Lelse, I32), utb_temp(0, I32), UTB_NONE);
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, IROP_BTYPE_INT8), utb_imm(42, I32), utb_temp(2, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(Lmerge, I32), UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int else_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[else_label].is_jump_target = 1;
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, IROP_BTYPE_INT8), utb_imm(42, I32), utb_temp(2, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int merge_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[merge_label].is_jump_target = 1;
+  int load = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(3, I32), utb_temp(1, I32), utb_temp(2, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32), UTB_NONE);
+
+  int changes = ssa_opt_diamond_store_fwd_core(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_LOAD_INDEXED);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: byte store of an over-wide constant folds to the sign-extended
+ * truncation the byte load would produce (511 -> (int8_t)0xFF -> -1). */
+UT_TEST(test_diamond_store_fwd_byte_sign_extend)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_tmp_intervals(ir, 8);
+
+  int Lelse = 7;
+  int Lmerge = 10;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), slot_addr(200), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(Lelse, I32), utb_temp(0, I32), UTB_NONE);
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, IROP_BTYPE_INT8), utb_imm(511, I32), utb_temp(2, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(Lmerge, I32), UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int else_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[else_label].is_jump_target = 1;
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, IROP_BTYPE_INT8), utb_imm(511, I32), utb_temp(2, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int merge_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[merge_label].is_jump_target = 1;
+  int load = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(3, IROP_BTYPE_INT8), utb_temp(1, I32), utb_temp(2, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, IROP_BTYPE_INT8), UTB_NONE);
+
+  int changes = ssa_opt_diamond_store_fwd_core(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_ASSIGN);
+  IROperand s1 = utb_src1(ir, load);
+  UT_ASSERT(irop_is_immediate(s1));
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, s1), -1);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: fused arms with different constants and a fallthrough else arm;
+ * the else def is inserted right before the merge label. */
+UT_TEST(test_diamond_store_fwd_diff_const_fused_fallthrough)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_tmp_intervals(ir, 8);
+
+  int Lelse = 7;
+  int Lmerge = 10;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), slot_addr(200), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(Lelse, I32), utb_temp(0, I32), UTB_NONE);
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, I32), utb_imm(7, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(Lmerge, I32), UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int else_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[else_label].is_jump_target = 1;
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, I32), utb_imm(5, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int merge_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[merge_label].is_jump_target = 1;
+  utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(3, I32), utb_temp(1, I32), utb_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32), UTB_NONE);
+  ir->next_temporary_variable = 8;
+
+  int changes = ssa_opt_diamond_store_fwd_core(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(ir->next_instruction_index, 15);
+  UT_ASSERT_EQ(utb_op(ir, 5), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 5)), 7);
+  UT_ASSERT_EQ(utb_op(ir, 6), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ((int)utb_dest(ir, 6).u.imm32, 12);
+  UT_ASSERT_EQ((int)utb_dest(ir, 3).u.imm32, 8);
+  UT_ASSERT_EQ(utb_op(ir, 11), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 11)), 5);
+  int32_t tmp_vr = irop_get_vreg(utb_dest(ir, 5));
+  UT_ASSERT(tmp_vr >= 0);
+  UT_ASSERT_EQ(irop_get_vreg(utb_dest(ir, 11)), tmp_vr);
+  UT_ASSERT_EQ(utb_op(ir, 13), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(irop_get_vreg(utb_src1(ir, 13)), tmp_vr);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: constants that differ raw but agree after byte truncation
+ * (511/767 -> 0xFF) take the cheap same-value path: no inserts, load folds. */
+UT_TEST(test_diamond_store_fwd_diff_const_norm_equal)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_tmp_intervals(ir, 8);
+
+  int Lelse = 7;
+  int Lmerge = 10;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(1, I32), slot_addr(200), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(Lelse, I32), utb_temp(0, I32), UTB_NONE);
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, IROP_BTYPE_INT8), utb_imm(511, I32), utb_temp(2, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(Lmerge, I32), UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int else_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[else_label].is_jump_target = 1;
+  utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(1, IROP_BTYPE_INT8), utb_imm(767, I32), utb_temp(2, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  int merge_label = utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[merge_label].is_jump_target = 1;
+  int load = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(3, IROP_BTYPE_INT8), utb_temp(1, I32), utb_temp(2, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, IROP_BTYPE_INT8), UTB_NONE);
+  ir->next_temporary_variable = 8;
+
+  int n_before = ir->next_instruction_index;
+  int changes = ssa_opt_diamond_store_fwd_core(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(ir->next_instruction_index, n_before);
+  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_ASSIGN);
+  IROperand s1 = utb_src1(ir, load);
+  UT_ASSERT(irop_is_immediate(s1));
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, s1), -1);
+
+  utb_free(ir);
+  return 0;
 }

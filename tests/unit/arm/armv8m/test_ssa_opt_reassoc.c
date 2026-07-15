@@ -11,12 +11,13 @@
  *    - dispatch table: ADD, SUB, MUL, AND, OR, XOR, SHL, SHR, SAR, ROR
  *
  *  HARNESS NOTES:
- *    - Links the real ir/opt/ssa_opt_reassoc.c via UT11.
+ *    - Links the real source/opt/ssa/scalar/reassoc.c via UT11.
  *    - Uses ssa_build.h for hand-built vinfo + IR.
  */
 
 #include "ssa_build.h"
 #include "ir/opt/ssa_opt.h"
+#include "opt/ssa/reassoc.h"
 
 #include "ut.h"
 
@@ -967,47 +968,4 @@ UT_TEST(test_reassoc_no_vinfo_inner)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_reassoc)
-{
-  UT_COVERS("ssa:reassoc");
-  /* reassoc_binary: positive constant combines */
-  UT_RUN(test_reassoc_add_positive);
-  UT_RUN(test_reassoc_mul);
-  UT_RUN(test_reassoc_and);
-  UT_RUN(test_reassoc_or);
-  UT_RUN(test_reassoc_xor);
-  UT_RUN(test_reassoc_shl);
-  UT_RUN(test_reassoc_shr);
-  UT_RUN(test_reassoc_sar);
-  UT_RUN(test_reassoc_ror);
-  /* reassoc_binary: mixed ADD/SUB combinations */
-  UT_RUN(test_reassoc_sub_then_add);
-  UT_RUN(test_reassoc_add_then_sub);
-  UT_RUN(test_reassoc_sub_sub);
-  UT_RUN(test_reassoc_sub_outer_add_inner_positive_combined);
-  UT_RUN(test_reassoc_sub_outer_add_inner_negative_combined);
-  /* overflow guards */
-  UT_RUN(test_reassoc_shl_overflow);
-  UT_RUN(test_reassoc_shr_overflow);
-  /* negative cases: structural guards */
-  UT_RUN(test_reassoc_multi_use_inner);
-  UT_RUN(test_reassoc_no_imm_outer);
-  UT_RUN(test_reassoc_inner_lval_src1);
-  UT_RUN(test_reassoc_inner_local_src1);
-  UT_RUN(test_reassoc_inner_no_imm_src2);
-  UT_RUN(test_reassoc_mismatched_ops);
-  UT_RUN(test_reassoc_param_src1);
-  UT_RUN(test_reassoc_outer_lval_src2);
-  UT_RUN(test_reassoc_no_vinfo_inner);
-  /* reassoc_add_cancel_const */
-  UT_RUN(test_reassoc_add_cancel_same_base);
-  UT_RUN(test_reassoc_add_cancel_neg_const);
-  UT_RUN(test_reassoc_add_cancel_reversed);
-  UT_RUN(test_reassoc_add_cancel_no_match);
-  UT_RUN(test_reassoc_add_cancel_different_base);
-  UT_RUN(test_reassoc_add_cancel_non_vreg_srcs);
-  UT_RUN(test_reassoc_add_cancel_multi_use);
-  UT_RUN(test_reassoc_add_cancel_wrong_inner_ops);
-  /* chained reassociation */
-  UT_RUN(test_reassoc_chain_three);
-}
+UT_COVERS("ssa:reassoc");

@@ -10,6 +10,8 @@
 
 #define USING_GLOBALS
 #include "ir.h"
+#include "arm-thumb-callsite.h"
+#include "opt/flat/if_convert.h"
 
 /* Debug tracking variable (defined in arm-thumb-gen.c) */
 extern int g_debug_current_op;
@@ -991,27 +993,10 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
   const uint32_t CALLEE_SAVED = ALL_CALLEE_SAVED & ~reserved;
 
   /* Find the LSLiveInterval holding r at instruction insn_i. */
-  LSLiveInterval *ls_iv = NULL;
-  for (int k = 0; k < ls->next_interval_index; k++)
-  {
-    LSLiveInterval *iv = &ls->intervals[k];
-    /* Only handle plain integer register allocations. */
-    if (iv->reg_type != LS_REG_TYPE_INT)
-      continue;
-    if (iv->addrtaken || iv->stack_location != 0)
-      continue;
-    /* Skip 64-bit pairs — they need two adjacent registers. */
-    if (iv->r1 >= 0 && iv->r1 < 16)
-      continue;
-    if (iv->r0 != r)
-      continue;
-    if ((int)iv->start > insn_i || (int)iv->end < insn_i)
-      continue;
-    ls_iv = iv;
-    break;
-  }
-  if (!ls_iv)
+  int holder = tcc_ls_find_int_reg_holder(ls, r, insn_i);
+  if (holder < 0)
     return -1;
+  LSLiveInterval *ls_iv = &ls->intervals[holder];
 
   /* Get the IRLiveInterval for the same vreg to check for float/double/llong. */
   IRLiveInterval *ir_iv = tcc_ir_get_live_interval(ir, (int)ls_iv->vreg);
@@ -2759,6 +2744,28 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               SCRATCH_WRAP(tcc_gen_machine_data_processing_mop_flags(a.src1, a.src2, a.dest, cq->op));
               codegen_skip_cmp = i + 1;
               ir->codegen_flags_live = 1;
+              break;
+            }
+          }
+        }
+        /* Predicate-into-SELECT (if-conversion at codegen time): when this ALU
+         * op feeds an else-identity SELECT with live CMP flags, emit it
+         * predicated into the SELECT dest — `cmp; it <cond>; rsb.w` (gcc-parity
+         * abs) — and skip the SELECT.  Pattern detection lives in
+         * source/opt/flat/cfg/if_convert.c; the backend gates the actual
+         * encoding via tcc_gen_machine_can_predicate_alu. */
+        if (ir->codegen_flags_live && !a.dest.is_64bit)
+        {
+          int sj, scc;
+          if (tcc_ir_ifconv_match_predicated_select(ir, i, &sj, &scc))
+          {
+            IROperand s_dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[sj]);
+            MachineOperand sdst = machine_op_from_ir(ir, &s_dest);
+            if (tcc_gen_machine_can_predicate_alu(a.src1, a.src2, sdst, cq->op))
+            {
+              SCRATCH_WRAP(tcc_gen_machine_predicated_alu_mop(a.src1, a.src2, sdst, cq->op, scc));
+              codegen_skip_select = sj;
+              ir->codegen_flags_live = 0;
               break;
             }
           }

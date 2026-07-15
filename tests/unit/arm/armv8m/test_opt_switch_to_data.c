@@ -346,17 +346,4 @@ UT_TEST(test_switch_to_data_no_tables_returns_zero)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_switch_to_data)
-{
-  UT_COVERS("switch_to_data");
-
-  UT_RUN(test_switch_to_data_basic_rewrite);
-  UT_RUN(test_switch_to_data_symref_value_default_rodata);
-  UT_RUN(test_switch_to_data_symref_value_share_rodata_uses_data);
-  UT_RUN(test_switch_to_data_default_shared_body_preserved);
-  UT_RUN(test_switch_to_data_non_matching_body_not_rewritten);
-  UT_RUN(test_switch_to_data_dest_mismatch_not_rewritten);
-  UT_RUN(test_switch_to_data_no_tables_returns_zero);
-}
+UT_COVERS("switch_to_data");

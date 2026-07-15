@@ -397,10 +397,13 @@ static int run_safe_no_external_use(TCCIRState *ir, int base, int P, int N)
   int run_lo = base;
   int run_hi = base + P * N;
 
-  /* Collect set of vregs that appear as DEST anywhere within the run. */
-  int set_cap = 64;
-  int set_count = 0;
-  int *set = (int *)tcc_malloc(set_cap * sizeof(int));
+  /* Hash set of vregs that appear as DEST anywhere within the run. */
+  unsigned ht_size = 64;
+  while (ht_size < (unsigned)(run_hi - run_lo) * 2u)
+    ht_size <<= 1;
+  int *ht = (int *)tcc_malloc(ht_size * sizeof(int));
+  for (unsigned j = 0; j < ht_size; j++) ht[j] = -1;
+#define RS_HASH(v) (((uint32_t)(v) * 2654435761u) & (ht_size - 1))
 
   for (int i = run_lo; i < run_hi; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -410,15 +413,10 @@ static int run_safe_no_external_use(TCCIRState *ir, int base, int P, int N)
     if (tag != IROP_TAG_VREG && tag != IROP_TAG_STACKOFF) continue;
     int v = irop_get_vreg(d);
     if (v < 0) continue;
-    int found = 0;
-    for (int j = 0; j < set_count; j++) if (set[j] == v) { found = 1; break; }
-    if (!found) {
-      if (set_count == set_cap) {
-        set_cap *= 2;
-        set = (int *)tcc_realloc(set, set_cap * sizeof(int));
-      }
-      set[set_count++] = v;
-    }
+    unsigned h = RS_HASH(v);
+    while (ht[h] >= 0 && ht[h] != v)
+      h = (h + 1) & (ht_size - 1);
+    ht[h] = v;
   }
 
   /* Walk the whole IR; if any outside-the-run instruction references one
@@ -439,13 +437,15 @@ static int run_safe_no_external_use(TCCIRState *ir, int base, int P, int N)
       if (tag != IROP_TAG_VREG && tag != IROP_TAG_STACKOFF) continue;
       int v = irop_get_vreg(op);
       if (v < 0) continue;
-      for (int j = 0; j < set_count; j++) {
-        if (set[j] == v) { unsafe = 1; break; }
-      }
+      unsigned h = RS_HASH(v);
+      while (ht[h] >= 0 && ht[h] != v)
+        h = (h + 1) & (ht_size - 1);
+      if (ht[h] == v) unsafe = 1;
     }
   }
 
-  tcc_free(set);
+#undef RS_HASH
+  tcc_free(ht);
   return !unsafe;
 }
 

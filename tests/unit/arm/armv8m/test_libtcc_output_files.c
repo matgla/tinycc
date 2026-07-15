@@ -90,13 +90,3 @@ UT_TEST(test_add_library_no_search_paths_returns_file_not_found)
   tcc_delete(s);
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(libtcc_output_files)
-{
-  UT_RUN(test_set_output_type_preprocess_sets_field_and_returns_zero);
-  UT_RUN(test_set_output_type_memory_sets_field_and_returns_zero);
-  UT_RUN(test_add_file_missing_file_returns_file_not_found);
-  UT_RUN(test_add_library_no_search_paths_returns_file_not_found);
-}

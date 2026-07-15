@@ -330,6 +330,8 @@ typedef struct IRLiveInterval
   int8_t incoming_reg1;    // for doubles: second register (-1 if not double or stack)
   int32_t original_offset; // for params: original offset from function entry point
   int stack_slot_index;    // index into stack layout (-1 if not stack-backed)
+  uint8_t remat_kind;      // 0=none, 1=imm32: recompute value instead of reloading when spilled
+  int32_t remat_imm;       // the constant when remat_kind==1
 } IRLiveInterval;
 
 typedef struct IRCallArgument

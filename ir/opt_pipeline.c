@@ -17,9 +17,16 @@
 #include "opt.h"
 #include "opt_utils.h"
 #include "opt_gens_fusion.h"
-#include "opt_gens_bool.h"
-#include "opt_gens_call_result.h"
-#include "opt_gens_branch.h"
+#include "opt/flat/bool.h"
+#include "opt/flat/call_result.h"
+#include "opt/flat/branch.h"
+#include "opt/flat/self_arith.h"
+#include "opt/flat/cmp_const_offset.h"
+#include "opt/flat/self_copy.h"
+#include "opt/flat/var_tmp_fwd.h"
+#include "opt/flat/indexed_chain.h"
+#include "opt/flat/pair_reorder.h"
+#include "opt/flat/disp.h"
 #include "opt_xform.h"
 
 #define FLAG(f) (uint16_t)offsetof(TCCState, f)
@@ -355,7 +362,6 @@ static const IROptPass propagation_passes[] = {
    * here; it converges arbitrary chain depth in a single forward pass. */
   PASS_GATED("const_agg_fold",  tcc_ir_opt_const_aggregate_fold_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("known_bits",      tcc_ir_opt_known_bits_ex,        0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
-  PASS_GATED("neg_chain_cse",   tcc_ir_opt_neg_chain_cse_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("add_reassoc",     tcc_ir_opt_add_reassoc_ex,      0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("string_calls",    tcc_ir_opt_const_string_calls_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
@@ -374,7 +380,6 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("vrp",             tcc_ir_opt_vrp_ex,              0, IR_PASS_INVALIDATES_ALL, FLAG(opt_vrp)),
   PASS_GATED("single_val_tmp",  tcc_ir_opt_single_value_tmp_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
   PASS_GATED("float_narrow",    tcc_ir_opt_float_narrowing_ex,  0, IR_PASS_INVALIDATES_DU, FLAG(opt_float_narrow)),
-  PASS_GATED("deref_fwd",       tcc_ir_opt_deref_fwd_ex,        0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
 };
 
 static const IROptPass fusion_passes[] = {
@@ -592,21 +597,6 @@ int tcc_ir_opt_gens_deref_indexed_ex(IROptCtx *ctx)
   return tcc_ir_opt_run_gens(ctx, fusion_deref_indexed_gens, fusion_deref_indexed_gens_count);
 }
 
-int tcc_ir_opt_gens_disp_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_run_gens(ctx, fusion_disp_gens, fusion_disp_gens_count);
-}
-
-int tcc_ir_opt_gens_chain_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_run_gens(ctx, fusion_chain_gens, fusion_chain_gens_count);
-}
-
-int tcc_ir_opt_gens_pair_reorder_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_run_gens(ctx, fusion_pair_reorder_gens, fusion_pair_reorder_gens_count);
-}
-
 int tcc_ir_opt_gens_bool_ex(IROptCtx *ctx)
 {
   return tcc_ir_opt_run_gens(ctx, bool_gens, bool_gens_count);
@@ -615,11 +605,6 @@ int tcc_ir_opt_gens_bool_ex(IROptCtx *ctx)
 int tcc_ir_opt_gens_call_result_ex(IROptCtx *ctx)
 {
   return tcc_ir_opt_run_gens(ctx, call_result_gens, call_result_gens_count);
-}
-
-int tcc_ir_opt_gens_call_result_post_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_run_gens(ctx, call_result_post_gens, call_result_post_gens_count);
 }
 
 int tcc_ir_opt_gens_branch_ex(IROptCtx *ctx)

@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_VREG_H
-#define TCC_IR_VREG_H
+#pragma once
 
 /* operand.h is included via tcc.h as tccir_operand.h */
 
@@ -121,4 +120,3 @@ void tcc_ir_vreg_stack_slot_set(struct TCCIRState *ir, int vreg, int slot_idx);
 /* Get frame offset for vreg */
 int tcc_ir_vreg_frame_offset_get(struct TCCIRState *ir, int vreg);
 
-#endif /* TCC_IR_VREG_H */

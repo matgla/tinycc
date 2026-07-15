@@ -873,34 +873,3 @@ UT_TEST(test_yaff_prepare_init_fini_merge)
   ut_yaff_teardown_output_state();
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(tccyaff)
-{
-  UT_RUN(test_yaff_hash_empty);
-  UT_RUN(test_yaff_hash_simple_strings);
-  UT_RUN(test_yaff_align_power_of_two);
-  UT_RUN(test_parse_object_name);
-  UT_RUN(test_get_offset_to_imported_libraries);
-
-  UT_RUN(test_hash_table_allocate_zeroes);
-  UT_RUN(test_hash_table_add_single);
-  UT_RUN(test_hash_table_add_collision_chains);
-  UT_RUN(test_hash_table_write_and_readback);
-
-  UT_RUN(test_load_yaff_rejects_bad_magic);
-  UT_RUN(test_load_yaff_and_resolve);
-  UT_RUN(test_yaff_resolve_missing_symbol_returns_zero);
-
-  UT_RUN(test_output_yaff_rejects_on_errors);
-  UT_RUN(test_output_yaff_minimal_header);
-  UT_RUN(test_output_yaff_with_exported_symbol);
-  UT_RUN(test_output_yaff_with_imported_symbol);
-  UT_RUN(test_output_yaff_local_relocation);
-  UT_RUN(test_output_yaff_data_relocation);
-  UT_RUN(test_output_yaff_symbol_table_relocation);
-  UT_RUN(test_output_yaff_exported_hidden_symbol_filtered);
-
-  UT_RUN(test_yaff_prepare_init_fini_merge);
-}

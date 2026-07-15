@@ -10,7 +10,7 @@
  *    - Invalidation: calls, stores to overlapping addresses
  *
  *  HARNESS NOTES:
- *    - Links the real ir/opt/ssa_opt_load_cse.c via UT11.
+ *    - Links the real source/opt/ssa/memory/load_cse.c via UT11.
  *    - Uses ssa_build.h for hand-built vinfo + IR.
  *    - Some tests need a real tcc_state for USING_GLOBALS; see setup_tcc_state.
  */
@@ -959,37 +959,4 @@ UT_TEST(test_unresolved_store_kills_global_state)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_load_cse)
-{
-  UT_COVERS("ssa:load_cse");
-  UT_RUN(test_stack_fwd_basic);
-  UT_RUN(test_stack_fwd_no_store);
-  UT_RUN(test_stack_fwd_overlap_invalidates);
-  UT_RUN(test_stack_fwd_imm);
-  UT_RUN(test_stack_fwd_no_stack_fwd_gate);
-  UT_RUN(test_stack_fwd_overlap_narrow_invalidates);
-  UT_RUN(test_tvstore_fwd_basic);
-  UT_RUN(test_tvstore_fwd_imm);
-  UT_RUN(test_tvstore_fwd_into_alu_operand);
-  UT_RUN(test_tvstore_invalidated_by_direct_stack_store);
-  UT_RUN(test_tvstore_narrow_type_not_tracked);
-  UT_RUN(test_iload_cse_duplicate);
-  UT_RUN(test_iload_cse_different_idx);
-  UT_RUN(test_iload_fwd_from_stack_store);
-  UT_RUN(test_store_indexed_runtime_idx_clears_stack_fwd);
-  UT_RUN(test_store_indexed_const_idx_updates_tracked_slot);
-  UT_RUN(test_invalidated_by_call);
-  UT_RUN(test_addrtaken_var_kills_ptr_state);
-  UT_RUN(test_multi_child_dom_tree_forwards);
-  UT_RUN(test_non_idom_pred_clears_state);
-  UT_RUN(test_gload_cse_basic);
-  UT_RUN(test_gload_cse_addend_mismatch);
-  UT_RUN(test_gstore_fwd_imm);
-  UT_RUN(test_gstore_fwd_temp);
-  UT_RUN(test_gstore_overwrites_gload_cse);
-  UT_RUN(test_gstore_overlap_invalidates);
-  UT_RUN(test_subword_global_store_not_forwarded);
-  UT_RUN(test_gload_volatile_guard);
-  UT_RUN(test_direct_var_assign_preserves_global_fwd);
-  UT_RUN(test_unresolved_store_kills_global_state);
-}
+UT_COVERS("ssa:load_cse");

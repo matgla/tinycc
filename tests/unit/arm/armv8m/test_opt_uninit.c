@@ -391,26 +391,5 @@ UT_TEST(test_uninit_dominates_return_ex_forwards)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_uninit)
-{
-  UT_COVERS("uninit_ub");
-  UT_COVERS("uninit_dom_ret");
-
-  UT_RUN(test_uninit_ub_entry_read_collapses);
-  UT_RUN(test_uninit_ub_no_return_path_collapses);
-  UT_RUN(test_uninit_ub_written_before_read_no_change);
-  UT_RUN(test_uninit_ub_addrtaken_no_change);
-  UT_RUN(test_uninit_ub_ijump_no_change);
-  UT_RUN(test_uninit_ub_side_effect_before_read_no_change);
-  UT_RUN(test_uninit_ub_optimize_gate);
-
-  UT_RUN(test_uninit_dom_ret_read_dominates_return_collapses);
-  UT_RUN(test_uninit_dom_ret_return_not_dominated_no_change);
-  UT_RUN(test_uninit_dom_ret_side_effects_no_change);
-  UT_RUN(test_uninit_dom_ret_no_returns_no_change);
-
-  UT_RUN(test_uninit_local_ub_ex_forwards);
-  UT_RUN(test_uninit_dominates_return_ex_forwards);
-}
+UT_COVERS("uninit_ub");
+UT_COVERS("uninit_dom_ret");

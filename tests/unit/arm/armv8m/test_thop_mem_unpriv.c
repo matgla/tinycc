@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_mem_unpriv.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_mem_unpriv.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -199,19 +199,4 @@ UT_TEST(test_mem_unpriv_enforce_16bit_fails)
   UT_ASSERT_EQ(op.opcode, 0xF8518E20);
 
   return 0;
-}
-
-/* ───── suite ───── */
-
-UT_SUITE(thop_mem_unpriv)
-{
-  UT_RUN(test_ldrt_basic);
-  UT_RUN(test_ldrbt_basic);
-  UT_RUN(test_ldrht_basic);
-  UT_RUN(test_ldrsbt_basic);
-  UT_RUN(test_ldrsht_basic);
-  UT_RUN(test_strt_basic);
-  UT_RUN(test_strbt_basic);
-  UT_RUN(test_strht_basic);
-  UT_RUN(test_mem_unpriv_enforce_16bit_fails);
 }

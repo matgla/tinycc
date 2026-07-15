@@ -41,8 +41,8 @@
 
 #define USING_GLOBALS
 #include "ir.h"
-#include "arch/arm/arm.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
@@ -379,22 +379,4 @@ UT_TEST(test_cvt_ftof_f64_to_f64_is_a_direct_pair_copy_no_call)
   UT_ASSERT_EQ(elfsec_reloc_call_count(), 0);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_fp)
-{
-  UT_RUN(test_fadd_f32_loads_args_into_r0_r1_dest_already_r0);
-  UT_RUN(test_fsub_f32_args_already_in_place_dest_needs_writeback);
-  UT_RUN(test_fmul_f32_full_sequence_with_writeback);
-  UT_RUN(test_fdiv_f64_uses_two_register_pairs_and_pair_writeback);
-  UT_RUN(test_fneg_f32_xor_sign_bit_no_call);
-  UT_RUN(test_fcmp_f32_never_writes_back_a_result_register);
-  UT_RUN(test_cvt_itof_int32_to_float32);
-  UT_RUN(test_cvt_itof_int64_src_uses_double_arg_load);
-  UT_RUN(test_cvt_ftoi_float32_to_int32_writes_back);
-  UT_RUN(test_cvt_ftoi_float32_to_int64_pair_writeback);
-  UT_RUN(test_cvt_ftof_f32_to_f32_is_a_direct_copy_no_call);
-  UT_RUN(test_cvt_ftof_f64_to_f64_is_a_direct_pair_copy_no_call);
 }

@@ -61,6 +61,8 @@ int ssa_opt_loop_rotate(TCCIRState *ir)
 {
   if (!ir || ir->next_instruction_index == 0)
     return 0;
+  if (!tcc_ir_cfg_flat_has_backedge(ir))
+    return 0;
 
   int total = 0;
   for (int pass = 0; pass < SSA_LOOP_ROTATE_MAX_PASSES; pass++) {
@@ -717,6 +719,8 @@ int ssa_opt_first_iter_exit(TCCIRState *ir)
 {
   if (!ir || ir->next_instruction_index == 0)
     return 0;
+  if (!tcc_ir_cfg_flat_has_backedge(ir))
+    return 0;
 
   int total = 0;
   for (int pass = 0; pass < SSA_FIRST_ITER_EXIT_MAX_PASSES; pass++) {
@@ -1336,6 +1340,8 @@ int ssa_opt_ptr_iv_exit_subst(TCCIRState *ir)
 {
   if (!ir || ir->next_instruction_index == 0)
     return 0;
+  if (!tcc_ir_cfg_flat_has_backedge(ir))
+    return 0;
 
   int total = 0;
   for (int pass = 0; pass < SSA_PTR_IV_EXIT_SUBST_MAX_PASSES; pass++) {
@@ -1533,6 +1539,8 @@ int ssa_opt_loop_const_sim(TCCIRState *ir)
 {
   if (!ir || ir->next_instruction_index == 0)
     return 0;
+  if (!tcc_ir_cfg_flat_has_backedge(ir))
+    return 0;
 
   int total = 0;
   for (int pass = 0; pass < SSA_LOOP_CONST_SIM_MAX_PASSES; pass++) {
@@ -1698,6 +1706,8 @@ int ssa_opt_loop_unroll(TCCIRState *ir)
 {
   if (!ir || ir->next_instruction_index == 0)
     return 0;
+  if (!tcc_ir_cfg_flat_has_backedge(ir))
+    return 0;
 
   int total = 0;
   for (int pass = 0; pass < SSA_LOOP_UNROLL_MAX_PASSES; pass++) {
@@ -1853,6 +1863,8 @@ int ssa_opt_iv_strength_reduction(TCCIRState *ir)
 {
   if (!ir || ir->next_instruction_index == 0)
     return 0;
+  if (!tcc_ir_cfg_flat_has_backedge(ir))
+    return 0;
 
   int total = 0;
   for (int pass = 0; pass < SSA_IVSR_MAX_PASSES; pass++) {
@@ -1986,6 +1998,8 @@ static int dtz_try_candidate(TCCIRState *ir, IRCFG *cfg, int header_b,
 int ssa_opt_decrement_to_zero(TCCIRState *ir)
 {
   if (!ir || ir->next_instruction_index == 0)
+    return 0;
+  if (!tcc_ir_cfg_flat_has_backedge(ir))
     return 0;
 
   int total = 0;

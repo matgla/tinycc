@@ -426,6 +426,121 @@ UT_TEST(test_select_assign_diamond_extra_else_instr_kept)
   return 0;
 }
 
+/* ================================================================== select (LOAD diamond, variable arm) */
+
+/* POSITIVE: a LOAD diamond whose arms are a plain non-lvalue register value and
+ * an immediate -- `T5<-T6[LOAD]` / `T5<-#2[LOAD]`, same dest -- collapses to a
+ * SELECT.  This is the `x>c ? x : k` shape (one arm is a variable, not const),
+ * enabled by the ir_ifconv_arm_value_safe broadening. */
+UT_TEST(test_select_load_diamond_variable_arm_collapses)
+{
+  TCCIRState *ir = utb_pool_new();
+
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_temp(1, I32));             /* 0 */
+  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(4), utb_imm(TOK_EQ, I32), UTB_NONE); /* 1: else_target=4 */
+  int then_ld = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(5, I32), utb_temp(6, I32), UTB_NONE); /* 2 then: T5<-T6 (reg) */
+  int jump = utb_emit(ir, TCCIR_OP_JUMP, utb_jtarget(5), UTB_NONE, UTB_NONE);            /* 3: -> merge(5) */
+  int else_ld = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(5, I32), utb_imm(2, I32), UTB_NONE); /* 4 else: T5<-#2 */
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_lval(utb_temp(5, I32)), UTB_NONE);    /* 5 merge */
+
+  int changes = tcc_ir_opt_select(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_SELECT);
+  UT_ASSERT_EQ(utb_op(ir, then_ld), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, jump), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, else_ld), TCCIR_OP_NOP);
+
+  UT_ASSERT_EQ(utb_vreg_pos(utb_dest(ir, jumpif)), 5);
+  UT_ASSERT_EQ(irop_get_vreg(utb_src1(ir, jumpif)), irop_get_vreg(utb_temp(6, I32))); /* then val = T6 */
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src2(ir, jumpif)), 2);                  /* else val = #2 */
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_op4(ir, jumpif)), TOK_NE);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): a LOAD arm that dereferences an lvalue (a pointer/global
+ * memory read) may fault on the not-taken path once hoisted into an
+ * unconditional SELECT, so ir_ifconv_arm_value_safe rejects it -- the diamond
+ * is left as branches. */
+UT_TEST(test_select_load_diamond_deref_arm_kept)
+{
+  TCCIRState *ir = utb_pool_new();
+
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_temp(1, I32));             /* 0 */
+  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(4), utb_imm(TOK_EQ, I32), UTB_NONE); /* 1 */
+  int then_ld = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(5, I32), utb_temp(6, I32), UTB_NONE); /* 2 then: T5<-T6 (reg) */
+  int jump = utb_emit(ir, TCCIR_OP_JUMP, utb_jtarget(5), UTB_NONE, UTB_NONE);            /* 3 */
+  int else_ld = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(5, I32), utb_lval(utb_temp(7, I32)), UTB_NONE); /* 4 else: T5<-*T7 (deref) */
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_lval(utb_temp(5, I32)), UTB_NONE);    /* 5 merge */
+
+  int changes = tcc_ir_opt_select(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_JUMPIF);
+  UT_ASSERT_EQ(utb_op(ir, then_ld), TCCIR_OP_LOAD);
+  UT_ASSERT_EQ(utb_op(ir, else_ld), TCCIR_OP_LOAD);
+  (void)jump;
+
+  utb_free(ir);
+  return 0;
+}
+
+/* ============================================ select (Stage 2: computed arm + merge temp) */
+
+/* POSITIVE (Stage 2 target -- the `x<0?-x:x` / abs2 shape).  A diamond whose
+ * then-arm computes a value into its own temp and then merges it into the
+ * result var, while the else-arm writes the result var directly:
+ *
+ *   0: CMP T9,#0
+ *   1: JUMPIF GE -> 4          (else_target=4; then runs when !GE == LT)
+ *   2: T0 <- #0 SUB T9         (then: compute -x, a pure ALU op)
+ *   3: JUMP -> 6
+ *   4: T1 <- T9  [LOAD]        (else: result var = x, written directly)
+ *   5: JUMP -> 7
+ *   6: T1 <- T0  [ASSIGN]      (then-side merge-assign: result var = -x)
+ *   7: RETURNVALUE T1          (merge)
+ *
+ * should collapse to `T1 <- SELECT(T0, T9, LT)` with the pure compute (SUB)
+ * kept and the branches / merge-assign / else-load NOP'd.  Currently
+ * tcc_ir_opt_select leaves it as a jump diamond -- this test reproduces the
+ * gap and pins the Stage 2 behavior. */
+UT_TEST(test_select_computed_arm_merge_temp_diamond_collapses)
+{
+  TCCIRState *ir = utb_pool_new();
+  utb_alloc_temp_intervals(ir, 16);
+
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(9, I32), utb_imm(0, I32));               /* 0 */
+  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(4), utb_imm(TOK_GE, I32), UTB_NONE); /* 1: else=4 */
+  int sub = utb_emit(ir, TCCIR_OP_SUB, utb_temp(0, I32), utb_imm(0, I32), utb_temp(9, I32));   /* 2: T0=-x */
+  int jmp_then = utb_emit(ir, TCCIR_OP_JUMP, utb_jtarget(6), UTB_NONE, UTB_NONE);         /* 3 */
+  int else_ld = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_temp(9, I32), UTB_NONE);/* 4: T1=x */
+  int jmp_else = utb_emit(ir, TCCIR_OP_JUMP, utb_jtarget(7), UTB_NONE, UTB_NONE);         /* 5 */
+  int merge_asg = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_temp(0, I32), UTB_NONE); /* 6: T1=T0 */
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_lval(utb_temp(1, I32)), UTB_NONE);     /* 7 merge */
+
+  int changes = tcc_ir_opt_select(ir);
+
+  UT_ASSERT(changes >= 1);
+  /* SELECT lands on the merge-assign slot; the pure compute stays unconditional. */
+  UT_ASSERT_EQ(utb_op(ir, merge_asg), TCCIR_OP_SELECT);
+  UT_ASSERT_EQ(utb_op(ir, sub), TCCIR_OP_SUB);
+  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, jmp_then), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, else_ld), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, jmp_else), TCCIR_OP_NOP);
+
+  /* SELECT: dest=T1, src1=then value (T0=-x), src2=else value (T9=x), cond=LT. */
+  UT_ASSERT_EQ(utb_vreg_pos(utb_dest(ir, merge_asg)), 1);
+  UT_ASSERT_EQ(irop_get_vreg(utb_src1(ir, merge_asg)), irop_get_vreg(utb_temp(0, I32)));
+  UT_ASSERT_EQ(irop_get_vreg(utb_src2(ir, merge_asg)), irop_get_vreg(utb_temp(9, I32)));
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_op4(ir, merge_asg)), TOK_LT);
+
+  utb_free(ir);
+  return 0;
+}
+
 /* ================================================================== select (SETIF+ASSIGN(0) collapse) */
 
 /* POSITIVE: `then: T=SETIF(NE) [setif_tok==then_cond]; JUMP->merge; else:
@@ -921,42 +1036,4 @@ UT_TEST(test_abort_tail_merge_single_site_no_change)
 
   utb_free(ir);
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_promote_extra)
-{
-  UT_RUN(test_redundant_loop_check_body_cmp_implied_folds_to_jump);
-  UT_RUN(test_redundant_loop_check_unrelated_cond_kept);
-  UT_RUN(test_redundant_loop_check_negated_cond_both_nopped);
-
-  UT_RUN(test_setif_neg_to_select_folds);
-  UT_RUN(test_setif_neg_to_select_multi_use_kept);
-
-  UT_RUN(test_select_returnvalue_diamond_collapses);
-  UT_RUN(test_select_returnvalue_diamond_vreg_arm_kept);
-
-  UT_RUN(test_select_assign_diamond_collapses);
-  UT_RUN(test_select_assign_diamond_extra_else_instr_kept);
-
-  UT_RUN(test_select_setif_zero_diamond_collapses_to_bare_setif);
-  UT_RUN(test_select_setif_nonzero_else_kept);
-
-  UT_RUN(test_select_call_diamond_collapses);
-  UT_RUN(test_select_call_diamond_different_callee_kept);
-
-  UT_RUN(test_select_fallthrough_normalize_then_collapses);
-
-  UT_RUN(test_returnvalue_merge_duplicate_becomes_jump);
-  UT_RUN(test_returnvalue_merge_int64_kept);
-
-  UT_RUN(test_backedge_phi_hoist_inverts_and_hoists);
-  UT_RUN(test_backedge_phi_hoist_spilled_operand_kept);
-
-  UT_RUN(test_post_ra_forward_diamond_collapses_and_pins_phi);
-  UT_RUN(test_post_ra_forward_diamond_different_regs_kept);
-
-  UT_RUN(test_abort_tail_merge_two_sites_merge_to_one_sink);
-  UT_RUN(test_abort_tail_merge_single_site_no_change);
 }

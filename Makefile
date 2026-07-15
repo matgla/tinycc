@@ -50,7 +50,7 @@ LIBTCC1 = libtcc1.a
 LINK_LIBTCC =
 LIBS =
 CFLAGS += $(CPPFLAGS) -std=c11 -Wunused-function -Wno-declaration-after-statement -Werror
-VPATH = $(TOPSRC) $(TOPSRC)/arch
+VPATH = $(TOPSRC) $(TOPSRC)/source/backend/arch
 -LTCC = $(TOP)/$(LIBTCC)
 
 # Dump-IR support: the -dump-ir / -dump-ir-passes options and the per-pass IR
@@ -324,14 +324,19 @@ include ir/gen/Makefile
 include source/opt/framework/Makefile
 include source/opt/Makefile
 include source/opt/ssa/Makefile
+include source/opt/flat/Makefile
 include source/backend/generators/Makefile
-IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_du.c ir/opt_xform.c ir/opt_utils.c ir/opt_alias.c ir/opt_loop_utils.c ir/opt_engine.c ir/opt_pipeline.c ir/opt_gens_fusion.c ir/opt_gens_bool.c ir/opt_gens_call_result.c ir/opt_gens_branch.c ir/opt_loop.c ir/opt_memory.c ir/opt_jump_thread.c ir/opt_pack64.c ir/opt_dce.c ir/opt_constfold.c ir/opt_branch.c ir/opt_copyprop.c ir/opt_fusion.c ir/opt_promote.c ir/opt_constprop.c ir/opt_knownbits.c ir/opt_dead_lea_store.c ir/opt_const_aggregate.c ir/opt_dead_vla.c ir/opt_loop_const_sim.c ir/opt_switch_data.c ir/opt_reroll.c ir/opt_neg_chain.c ir/opt_bitfield.c ir/opt_cmp_fuse.c ir/opt_setif_or_taut.c ir/licm.c ir/cfg.c ir/ssa.c ir/opt/ssa_opt.c ir/opt/ssa_opt_dce.c ir/opt/ssa_opt_cprop.c ir/opt/ssa_opt_gvn.c ir/opt/ssa_opt_reassoc.c ir/opt/ssa_opt_sccp.c ir/opt/ssa_opt_load_cse.c ir/opt/ssa_opt_dead_loop.c ir/opt/ssa_opt_loop.c ir/regalloc.c $(IR_GEN_FILES) ir/machine_op.c $(SSA_OPT_SRC)
-CORE_FILES = tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c tccopt.c source/opt/function_pipeline.c source/backend/generators/function.c source/backend/generators/regalloc.c $(IR_FILES)
+include source/memory/Makefile
+include source/utils/Makefile
+IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/dump.c ir/codegen.c ir/opt.c ir/opt_du.c ir/opt_xform.c ir/opt_utils.c ir/opt_alias.c ir/opt_loop_utils.c ir/opt_engine.c ir/opt_pipeline.c ir/opt_gens_fusion.c ir/opt_memory.c ir/opt_jump_thread.c ir/opt_pack64.c ir/opt_dce.c ir/opt_constfold.c ir/opt_branch.c ir/opt_copyprop.c ir/opt_fusion.c ir/opt_promote.c ir/opt_constprop.c ir/opt_dead_lea_store.c ir/opt_dead_vla.c ir/opt_loop_const_sim.c ir/opt_switch_data.c ir/opt_reroll.c ir/opt_neg_chain.c ir/opt_bitfield.c ir/opt_cmp_fuse.c ir/licm.c ir/cfg.c ir/ssa.c ir/opt/ssa_opt.c ir/opt/ssa_opt_dce.c ir/opt/ssa_opt_sccp.c ir/opt/ssa_opt_dead_loop.c ir/opt/ssa_opt_loop.c ir/regalloc.c $(IR_GEN_FILES) ir/machine_op.c $(SSA_OPT_SRC) $(FLAT_OPT_SRC)
+CORE_FILES = tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c tccopt.c source/opt/function_pipeline.c source/backend/generators/function.c source/backend/generators/regalloc.c $(MEMORY_SRC) $(IR_FILES)
 CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h tccir_operand.h tccld.h tccmachine.h tccopt.h log.h
 CORE_FILES += $(wildcard ir/*.h)
-armv8m_FILES = $(CORE_FILES) arm-thumb-gen.c arm-thumb-callsite.c arm-link.c arm-thumb-asm.c arm-thumb-defs.h thumb-tok.h arch/arm/thumb/thumb.h arch/arm/arm.h
+CORE_FILES += $(MEMORY_HDRS)
+CORE_FILES += $(UTILS_HDRS)
+armv8m_FILES = $(CORE_FILES) source/backend/arch/arm/thumb/arm-thumb-defs.h source/backend/arch/arm/thumb/arm-thumb-callsite.h source/backend/arch/arm/thumb/thumb-tok.h source/backend/arch/arm/thumb/thumb.h source/backend/arch/arm/arm.h
 armv8m_ARCH = arm
-armv8m_ARCH_LIB = $(X)arch/arm/libarm.a
+armv8m_ARCH_LIB = $(X)source/backend/arch/arm/libarm.a
 
 TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h
 
@@ -345,7 +350,7 @@ ARCH_LIB = $($T_ARCH_LIB)
 TCC_FILES = $(X)tcc.o $(LIBTCC_OBJ) $(ARCH_LIB)
 $(X)tccpp.o : $(TCCDEFS_H)
 
-DEFINES += -I$(TOP) -I$(TOP)/ir -I$(TOP)/ir/opt $(OPT_DSL_INC) $(SSA_OPT_INC)
+DEFINES += -I$(TOP) -I$(TOP)/ir -I$(TOP)/ir/opt $(OPT_DSL_INC) $(SSA_OPT_INC) $(FLAT_OPT_INC) $(MEMORY_INC) $(UTILS_INC) -I$(TOP)/source/backend/arch/arm -I$(TOP)/source/backend/arch/arm/thumb
 
 GITHASH:=$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo no)
 ifneq ($(GITHASH),no)
@@ -373,6 +378,7 @@ $(X)%.o : %.c $(LIBTCC_INC) config.mak
 
 # Architecture library — built by nested Makefile
 TARGET_ARCH_NAME = $($T_ARCH)
+ARCH_DEFINES = $(subst -I.,-I$(CURDIR),$(DEFINES))
 $(ARCH_LIB): FORCE
 	@mkdir -p $(dir $(ARCH_LIB))
 	@# Build flags changed (e.g. ASan toggled via configure)?  Drop stale objects
@@ -380,9 +386,9 @@ $(ARCH_LIB): FORCE
 	@if [ -f "$(ARCH_LIB)" ] && [ config.mak -nt "$(ARCH_LIB)" ]; then \
 		rm -f $(dir $(ARCH_LIB))*.o "$(ARCH_LIB)"; \
 	fi
-	$S$(MAKE) --no-print-directory -C arch ARCH=$(TARGET_ARCH_NAME) \
+	$S$(MAKE) --no-print-directory -C source/backend ARCH=$(TARGET_ARCH_NAME) \
 		TOP=$(CURDIR) BUILD_DIR=$(CURDIR)/$(dir $(ARCH_LIB)) \
-		CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" DEFINES="$(DEFINES)"
+		CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" DEFINES="$(ARCH_DEFINES)"
 
 $(X)ir/%.o : ir/%.c $(LIBTCC_INC) config.mak
 	@mkdir -p $(dir $@)

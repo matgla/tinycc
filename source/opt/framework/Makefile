@@ -11,6 +11,7 @@ OPT_DSL_HEADERS = \
 	source/opt/framework/opt_dsl_helpers.h \
 	source/opt/framework/opt_dsl_entry.h \
 	source/opt/framework/opt_dsl_ssa.h \
+	source/opt/framework/opt_dsl_var_const.h \
 	source/opt/framework/opt_dsl_phi.h \
 	source/opt/framework/opt_ssa_domwalk.h
 

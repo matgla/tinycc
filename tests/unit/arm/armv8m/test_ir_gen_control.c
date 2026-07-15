@@ -80,10 +80,3 @@ UT_TEST(test_return_value_has_no_dest_no_src2)
   tcc_ir_free(ir);
   return 0;
 }
-
-UT_SUITE(ir_gen_control)
-{
-  UT_RUN(test_return_value_emits_returnvalue_op);
-  UT_RUN(test_return_value_carries_const_operand);
-  UT_RUN(test_return_value_has_no_dest_no_src2);
-}

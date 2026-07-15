@@ -18,8 +18,7 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#ifndef TCC_IR_REGALLOC_H
-#define TCC_IR_REGALLOC_H
+#pragma once
 
 struct TCCIRState;
 
@@ -43,4 +42,3 @@ typedef struct RegAllocTarget {
 void tcc_ir_ssa_regalloc(struct TCCIRState *ir, const RegAllocTarget *target, int spill_base);
 int tcc_ir_move_coalescing(struct TCCIRState *ir);
 
-#endif /* TCC_IR_REGALLOC_H */

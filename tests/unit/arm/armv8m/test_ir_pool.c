@@ -146,14 +146,3 @@ UT_TEST(test_pool_ensure_from_zero_capacity_terminates)
   tcc_free(ir);
   return 0;
 }
-
-UT_SUITE(ir_pool)
-{
-  UT_RUN(test_pool_add_returns_sequential_indices);
-  UT_RUN(test_pool_get_returns_stored_value);
-  UT_RUN(test_pool_get_out_of_range_returns_zero);
-  UT_RUN(test_pool_set_overwrites_entry);
-  UT_RUN(test_pool_add_grows_capacity);
-  UT_RUN(test_pool_add_from_zero_capacity_grows);
-  UT_RUN(test_pool_ensure_from_zero_capacity_terminates);
-}

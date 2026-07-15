@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_branch.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_branch.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -283,25 +283,4 @@ UT_TEST(test_cbnz_blocked_without_feat)
   UT_ASSERT_EQ(op.opcode, 0);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_branch)
-{
-  UT_RUN(test_bx_reg_basic);
-  UT_RUN(test_blx_reg_basic);
-  UT_RUN(test_bl_t1_zero_offset);
-  UT_RUN(test_bl_t1_all_bits_set);
-  UT_RUN(test_b_t1_conditional);
-  UT_RUN(test_b_t3_conditional_zero_imm);
-  UT_RUN(test_b_t3_conditional_nonzero_imm);
-  UT_RUN(test_b_t4_zero_offset);
-  UT_RUN(test_b_t2_basic);
-  UT_RUN(test_b_t2_out_of_range);
-  UT_RUN(test_cbz_basic);
-  UT_RUN(test_cbnz_basic);
-  UT_RUN(test_cbz_various_offsets);
-  UT_RUN(test_cbz_blocked_without_feat);
-  UT_RUN(test_cbnz_blocked_without_feat);
 }

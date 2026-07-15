@@ -29,6 +29,7 @@ void tcc_ir_opt_ctx_init(IROptCtx *ctx, TCCIRState *ir)
   ctx->block_starts_gen = 0;
   ctx->loops = NULL;
   ctx->loops_gen = 0;
+  ctx->pass_state = NULL;
   ctx->changes = 0;
 }
 
@@ -137,6 +138,55 @@ int tcc_ir_opt_run_gens(IROptCtx *ctx, const IROptGen *gens, int count)
       }
     }
   }
+
+  return changes;
+}
+
+int tcc_ir_opt_run_stateful_gens(IROptCtx *ctx, const IROptGen *gens, int count,
+                                 const IROptStatefulOps *ops)
+{
+  TCCIRState *ir = ctx->ir;
+  int changes = 0;
+
+  int any_du = 0;
+  for (int g = 0; g < count; g++) {
+    if (gens[g].needs_du) {
+      any_du = 1;
+      break;
+    }
+  }
+  if (any_du)
+    tcc_ir_opt_ctx_require_du(ctx);
+
+  ctx->pass_state = ops->begin ? ops->begin(ctx) : NULL;
+
+  /* First-matching-gen-owns-the-instruction: unlike run_gens (which tries the
+   * next gen when one returns 0), a stateful pass dispatches each instruction to
+   * exactly one handler — the first gen whose op matches (a wildcard op < 0
+   * matches anything and must be registered last).  This mirrors the legacy
+   * priority chain (`if (op==STORE) …; else …; goto post_op`) where a handler
+   * updates shared lattice state whether or not it rewrites anything. */
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    /* each_pre runs before the NOP-skip so a pass can invalidate facts at
+     * basic-block boundaries even when the boundary lands on a NOP. */
+    if (ops->each_pre)
+      ops->each_pre(ctx, i);
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_NOP)
+      continue;
+    for (int g = 0; g < count; g++) {
+      if (gens[g].op >= 0 && gens[g].op != op)
+        continue;
+      int d = gens[g].fn(ctx, i);
+      if (d > 0)
+        changes += d;
+      break;
+    }
+  }
+
+  if (ops->end)
+    ops->end(ctx);
+  ctx->pass_state = NULL;
 
   return changes;
 }

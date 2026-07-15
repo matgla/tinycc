@@ -23,25 +23,43 @@ Unit tests link **only** the specific source files they exercise, plus minimal s
 
 ## Framework API (`tests/unit/ut.h`)
 
-The harness is a single 99-line header. No external libraries.
+The harness is a single self-contained header. No external libraries.
+
+### Auto-Registration (gtest-style)
+
+`UT_TEST(name)` both declares the test function **and** registers it in a global
+registry via an `__attribute__((constructor))` — there is no manual suite
+wiring. The suite name is derived from the defining file: `test_<suite>.c`.
+Tests run in definition order within a file; files run in the Makefile's link
+order. `main()` is just `UT_MAIN_IMPL;` plus `return ut_run_all(argc, argv);`.
+
+Any argv is a substring filter on suite or test names:
+
+```bash
+./build/run_unit_tests opt_dce                 # one suite (plus opt_dce_cleanup)
+./build/run_unit_tests test_hash_insert        # specific test(s)
+```
 
 ### Macros
 
 | Macro | Purpose |
 |-------|---------|
-| `UT_TEST(name)` | Declare a test function (`static int name(void)`). |
+| `UT_TEST(name)` | Declare **and register** a test (`static int name(void)`). |
+| `UT_TEST_DISABLED(name)` | Declare a test without registering it (kept compiling, never run). |
 | `UT_ASSERT(cond)` | Assert a boolean condition. On failure prints file:line and returns `-1`. |
 | `UT_ASSERT_EQ(a, b)` | Assert equality (cast to `long long`). Prints both values on failure. |
-| `UT_SUITE(name)` | Declare a suite function (`void ut_suite_##name(void)`). |
-| `UT_RUN(test)` | Execute a single test inside a suite. |
-| `UT_RUN_SUITE(name)` | Execute a suite from `main()`. |
-| `UT_DECLARE_SUITE(name)` | Forward-declare a suite (used in `test_main.c`). |
-| `UT_MAIN_IMPL` | Define the shared counters (exactly **one** TU must use this). |
-| `UT_REPORT_AND_EXIT()` | Print summary and return `0` on success, `1` on failure. |
+| `UT_ASSERT_NE(a, b)` / `UT_ASSERT_STREQ(a, b)` | Inequality / NULL-safe string equality. |
+| `UT_SUITE_SETUP(fn)` / `UT_SUITE_TEARDOWN(fn)` | Register `fn` to run before the file's first test / after its last (see `test_tccpp.c`). |
+| `UT_COVERS("pass")` | File-scope annotation: this file covers optimization pass `"pass"`. |
+| `UT_MAIN_IMPL` | Define the shared counters and registry (exactly **one** TU per binary). |
 
 ### Return Convention
 
-Tests return `0` on success, `-1` on failure. The harness tracks `ut_fail_count` globally, so an early `UT_ASSERT` failure aborts the test but other suites still run.
+Tests return `0` on success, `-1` on failure. The harness tracks `ut_fail_count` globally, so an early `UT_ASSERT` failure aborts the test but other tests still run.
+
+Because tests self-register, every `UT_TEST` in a linked file **will run** — a
+test must not depend on state left behind by a sibling (use
+`UT_SUITE_SETUP`/`UT_SUITE_TEARDOWN` or per-test fixtures instead).
 
 ---
 
@@ -53,7 +71,7 @@ tests/unit/
 ├── Makefile                      # Orchestrator (fans out to per-target dirs)
 └── arm/armv8m/                   # Per-target directory
     ├── Makefile                  # Builds run_unit_tests binary
-    ├── test_main.c               # Entry point: declares and runs all suites
+    ├── test_main.c               # Entry point: UT_MAIN_IMPL + ut_run_all()
     ├── stubs.c                   # Memory allocator stubs (tcc_malloc, tcc_free, ...)
     ├── tcc_state_stub.c          # Global TCCState pointer stub
     ├── test_chained_hash.c       # Example: suite for tcc-chained-hash.h
@@ -118,15 +136,10 @@ UT_TEST(test_feature_edge_case)
   /* ... */
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(<module>)
-{
-  UT_RUN(test_feature_basic);
-  UT_RUN(test_feature_edge_case);
-}
 ```
+
+That's it — each `UT_TEST` self-registers into the `<module>` suite (derived
+from the file name). No suite block, no `test_main.c` edits.
 
 **Guidelines:**
 
@@ -135,38 +148,7 @@ UT_SUITE(<module>)
 - If the module needs a `TCCIRState` or `TCCState`, write a minimal helper that `malloc`s a zeroed struct and manually initializes **only** the fields the module touches. See `test_ir_vreg.c` for a detailed example.
 - Tests must be **deterministic** and **self-contained** — no file I/O, no network, no randomness.
 
-### Step 3: Register the Suite in `test_main.c`
-
-Edit `tests/unit/arm/armv8m/test_main.c`. Add two lines:
-
-1. `UT_DECLARE_SUITE(<module>);` near the top.
-2. `UT_RUN_SUITE(<module>);` inside `main()`.
-
-Example:
-
-```c
-#include "ut.h"
-
-UT_MAIN_IMPL;
-
-UT_DECLARE_SUITE(chained_hash);
-UT_DECLARE_SUITE(ir_pool);
-UT_DECLARE_SUITE(ir_type);
-UT_DECLARE_SUITE(ir_vreg);
-UT_DECLARE_SUITE(my_new_module);   /* <-- ADD THIS */
-
-int main(void)
-{
-  UT_RUN_SUITE(chained_hash);
-  UT_RUN_SUITE(ir_pool);
-  UT_RUN_SUITE(ir_type);
-  UT_RUN_SUITE(ir_vreg);
-  UT_RUN_SUITE(my_new_module);     /* <-- ADD THIS */
-  UT_REPORT_AND_EXIT();
-}
-```
-
-### Step 4: Add the Source File to the Makefile
+### Step 3: Add the Source File to the Makefile
 
 Edit `tests/unit/arm/armv8m/Makefile` in **two** places:
 
@@ -196,7 +178,7 @@ UT_MODULE_SRCS := \
 
 If the module is **header-only** (like `tcc-chained-hash.h`), skip step 2.
 
-### Step 5: Build and Run
+### Step 4: Build and Run
 
 ```bash
 # From project root
@@ -378,8 +360,7 @@ under the git-ignored `build/` tree.
 Use this checklist before committing a new suite:
 
 - [ ] Test file is named `test_<module>.c` and lives in `tests/unit/arm/armv8m/`.
-- [ ] `UT_SUITE(<module>)` wraps all `UT_RUN()` calls.
-- [ ] `test_main.c` has `UT_DECLARE_SUITE` and `UT_RUN_SUITE` for the new suite.
+- [ ] Every test uses `UT_TEST` (self-registering) and depends on no sibling test's state.
 - [ ] `Makefile` lists the test file in `UT_LOCAL_SRCS`.
 - [ ] `Makefile` lists the module under test in `UT_MODULE_SRCS` (if not header-only).
 - [ ] No full `tcc_init()` or `tcc_ir_alloc()` is called unless absolutely necessary.

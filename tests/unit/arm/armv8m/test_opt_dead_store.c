@@ -532,40 +532,9 @@ UT_TEST(test_infinite_loop_simplify_ex_forwards)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_dead_store)
-{
-  UT_COVERS("dead_var_store");   /* alias tracked by check_pass_coverage.py normalization */
-  UT_COVERS("dead_addrvar");
-  UT_COVERS("dead_trail_addrvar");
-  UT_COVERS("zero_vla");
-  UT_COVERS("dead_pre_inf");
-  UT_COVERS("inf_loop_simpl");
-
-  UT_RUN(test_dead_var_store_unread_var_removed);
-  UT_RUN(test_dead_var_store_read_var_kept);
-  UT_RUN(test_dead_var_store_solo_var0_bails_out_suspected_bug);
-
-  UT_RUN(test_dead_addrvar_unread_lea_and_store_removed);
-  UT_RUN(test_dead_addrvar_read_var_keeps_lea_and_store);
-
-  UT_RUN(test_dead_trailing_addrvar_write_after_last_read_removed);
-  UT_RUN(test_dead_trailing_addrvar_write_before_read_kept);
-
-  UT_RUN(test_zero_vla_zero_size_alloc_removed);
-  UT_RUN(test_zero_vla_nonzero_size_alloc_kept);
-
-  UT_RUN(test_dead_before_inf_loop_dead_prologue_removed);
-  UT_RUN(test_dead_before_inf_loop_reachable_anchor_keeps_prologue);
-
-  UT_RUN(test_infinite_loop_simplify_dead_global_store_collapses_to_selfjump);
-  UT_RUN(test_infinite_loop_simplify_indexed_store_blocks_collapse);
-
-  UT_RUN(test_dead_var_store_elim_ex_forwards);
-  UT_RUN(test_dead_addrvar_elim_ex_forwards);
-  UT_RUN(test_dead_trailing_addrvar_store_elim_ex_forwards);
-  UT_RUN(test_zero_vla_elim_ex_forwards);
-  UT_RUN(test_dead_before_infinite_loop_ex_forwards);
-  UT_RUN(test_infinite_loop_simplify_ex_forwards);
-}
+UT_COVERS("dead_var_store");   /* alias tracked by check_pass_coverage.py normalization */
+UT_COVERS("dead_addrvar");
+UT_COVERS("dead_trail_addrvar");
+UT_COVERS("zero_vla");
+UT_COVERS("dead_pre_inf");
+UT_COVERS("inf_loop_simpl");

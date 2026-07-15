@@ -13,16 +13,16 @@
 
 #define USING_GLOBALS
 #include "ir.h"
-#include "arch/arm/arm.h"
-#include "arch/arm/thumb/thumb.h"
-#include "arch/arm/thumb/thop_branch.h"
-#include "arch/arm/thumb/thop_system.h"
-#include "arch/arm/thumb/thop_pld.h"
-#include "arch/arm/thumb/thop_alu_imm.h"
-#include "arch/arm/thumb/thop_alu_reg.h"
-#include "arch/arm/thumb/thop_mem_imm.h"
-#include "arch/arm/thumb/thop_ldrd.h"
-#include "arch/arm/thumb/thop_mov.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_branch.h"
+#include "source/backend/arch/arm/thumb/thop_system.h"
+#include "source/backend/arch/arm/thumb/thop_pld.h"
+#include "source/backend/arch/arm/thumb/thop_alu_imm.h"
+#include "source/backend/arch/arm/thumb/thop_alu_reg.h"
+#include "source/backend/arch/arm/thumb/thop_mem_imm.h"
+#include "source/backend/arch/arm/thumb/thop_ldrd.h"
+#include "source/backend/arch/arm/thumb/thop_mov.h"
 #include "ir/machine_op.h"
 
 extern int offset_to_args;
@@ -987,85 +987,4 @@ UT_TEST(test_init_chain_slot_emits_store_to_chain)
   tcc_ir_free(ir);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_dispatch_smoke)
-{
-  UT_RUN(test_dispatch_add_reg_reg_reg_emits_real_bytes);
-  UT_RUN(test_dispatch_load_reg_offset_zero_emits_real_bytes);
-  UT_RUN(test_dispatch_store_reg_offset_zero_emits_real_bytes);
-  UT_RUN(test_dispatch_jump_forward_uses_32bit_encoding);
-
-  UT_RUN(test_dispatch_indirect_jump_reg_emits_bx);
-  UT_RUN(test_dispatch_trap_mop_emits_udf);
-  UT_RUN(test_dispatch_prefetch_reg_emits_pld);
-  UT_RUN(test_dispatch_vla_sp_save_reg_emits_mov_sp);
-  UT_RUN(test_dispatch_vla_sp_restore_reg_emits_mov_sp);
-  UT_RUN(test_dispatch_select_imm_imm_emits_ite_movs);
-  UT_RUN(test_dispatch_select_identity_then_uses_inverse_cond);
-  UT_RUN(test_dispatch_backpatch_jump_to_next_insn_becomes_nop);
-  UT_RUN(test_dispatch_store_spill_fp_emits_str);
-  UT_RUN(test_dispatch_try_strd_spill_aligned_emits_strd);
-  UT_RUN(test_dispatch_try_ldrd_spill_aligned_emits_ldrd);
-  UT_RUN(test_dispatch_try_strd_base_aligned_emits_strd);
-  UT_RUN(test_dispatch_try_ldrd_base_aligned_emits_ldrd);
-  UT_RUN(test_dispatch_load_postinc_int32_emits_ldr);
-  UT_RUN(test_dispatch_store_postinc_int32_emits_str);
-  UT_RUN(test_dispatch_return_value_imm_emits_mov_r0);
-  UT_RUN(test_dispatch_lea_param_stack_emits_add);
-  UT_RUN(test_dispatch_func_parameter_void_creates_empty_site);
-
-  UT_RUN(test_abi_assign_call_args_rejects_null_layout);
-  UT_RUN(test_abi_assign_call_args_rejects_null_args_when_nonzero);
-  UT_RUN(test_abi_assign_call_args_scalar32_to_r0);
-  UT_RUN(test_dry_run_lifecycle);
-  UT_RUN(test_dry_run_counters_initially_zero);
-  UT_RUN(test_insn_scratch_reset_count_saves_mask);
-  UT_RUN(test_reset_scratch_state_no_crash);
-  UT_RUN(test_mov_coalesce_reset_no_crash);
-  UT_RUN(test_mov_equiv_reset_no_crash);
-  UT_RUN(test_imm_cache_reset_and_invalidate_live_no_crash);
-
-  UT_RUN(test_gen_fill_nops_emits_two_nops_per_four_bytes);
-
-  UT_RUN(test_scratch_acquire_single_returns_reg_and_pushes_if_needed);
-  UT_RUN(test_scratch_acquire_pair_with_avoid_arg_regs);
-  UT_RUN(test_scratch_acquire_avoid_perm_scratch);
-  UT_RUN(test_scratch_release_null_is_noop);
-
-  UT_RUN(test_cbz_jump_mop_emits_cbz);
-  UT_RUN(test_cbnz_jump_mop_emits_cbnz);
-
-  UT_RUN(test_restore_chain_loads_from_chain_slot);
-
-  UT_RUN(test_end_instruction_restores_pushed_scratch_regs);
-
-  UT_RUN(test_can_encode_stack_offset_for_reg_fp_small_offset);
-  UT_RUN(test_can_encode_stack_offset_with_param_adj);
-
-  UT_RUN(test_load_constant_32bit_imm_emits_mov);
-  UT_RUN(test_load_constant_64bit_imm_emits_two_movs);
-  UT_RUN(test_load_cmp_result_eq_emits_ite_movs);
-  UT_RUN(test_load_jmp_result_non_invert_emits_mov_branch_mov);
-
-  UT_RUN(test_reserve_pool_bytes_tracks_pending_bytes);
-
-  UT_RUN(test_number_of_registers_returns_11);
-  UT_RUN(test_pending_pool_size_empty_returns_zero);
-  UT_RUN(test_set_chain_emits_mov_r10_fp);
-
-  UT_RUN(test_store_to_stack_fp_small_offset_emits_str);
-  UT_RUN(test_store_to_stack_ex_large_offset_uses_scratch);
-  UT_RUN(test_store_to_sp_small_offset_emits_str);
-
-  UT_RUN(test_try_strd_imm_spill_distinct_values_emits_strd);
-  UT_RUN(test_try_strd_imm_spill_equal_values_reuses_reg);
-  UT_RUN(test_try_strd_imm_spill_non_adjacent_offsets_returns_zero);
-  UT_RUN(test_try_strd_imm_base_distinct_values_emits_strd);
-
-  UT_RUN(test_spill_block_copy_two_words_emits_code);
-
-  UT_RUN(test_init_chain_slot_emits_store_to_chain);
 }

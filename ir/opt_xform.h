@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_OPT_XFORM_H
-#define TCC_IR_OPT_XFORM_H
+#pragma once
 
 #include "ir.h"
 
@@ -47,5 +46,3 @@ static inline int ir_xform_operand_reads_memory(IROperand op)
  * cannot write memory, so a memory read may be moved between lo and hi
  * safely. */
 int ir_xform_range_preserves_memory(TCCIRState *ir, int lo, int hi);
-
-#endif /* TCC_IR_OPT_XFORM_H */

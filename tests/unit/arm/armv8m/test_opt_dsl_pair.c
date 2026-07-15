@@ -328,17 +328,4 @@ UT_TEST(test_pair_dsl_end_to_end)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(opt_dsl_pair)
-{
-  UT_COVERS("opt_dsl:pair");
-  UT_RUN(test_pair_match_src1_op);
-  UT_RUN(test_pair_match_src2_link);
-  UT_RUN(test_pair_match_any_op);
-  UT_RUN(test_pair_match_op_mismatch);
-  UT_RUN(test_pair_match_single_use_gate);
-  UT_RUN(test_pair_match_multi_def);
-  UT_RUN(test_pair_match_non_vreg);
-  UT_RUN(test_pair_retire_keep);
-  UT_RUN(test_pair_retire_delete);
-  UT_RUN(test_pair_dsl_end_to_end);
-}
+UT_COVERS("opt_dsl:pair");

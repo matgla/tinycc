@@ -8,8 +8,7 @@
  *  License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_DSL_H
-#define TCC_OPT_DSL_H
+#pragma once
 
 /* Optimization DSL umbrella header — include ir.h first. See docs/optimizations/opt_dsl_framework.md. */
 
@@ -57,4 +56,3 @@
     return 1; \
   } while (0)
 
-#endif /* TCC_OPT_DSL_H */

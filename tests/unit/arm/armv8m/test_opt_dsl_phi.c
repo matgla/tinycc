@@ -194,13 +194,3 @@ UT_TEST(test_phi_runner_keeps_protected_use)
   ssa_ctx_free(&c);
   return 0;
 }
-
-UT_SUITE(opt_dsl_phi)
-{
-  UT_RUN(test_phi_match_trivial_variants);
-  UT_RUN(test_phi_match_rejects_non_trivial);
-  UT_RUN(test_phi_dsl_rule_rewrite);
-  UT_RUN(test_phi_count_tracks_nodes_and_operands);
-  UT_RUN(test_phi_runner_reaches_fixed_point);
-  UT_RUN(test_phi_runner_keeps_protected_use);
-}

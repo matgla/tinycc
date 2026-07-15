@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_SSA_DOMWALK_H
-#define TCC_OPT_SSA_DOMWALK_H
+#pragma once
 
 #include "ssa_opt.h"
 
@@ -96,4 +95,3 @@ static inline int opt_ssa_domwalk(IRSSAOptCtx *ctx, const OptSSADomWalk *w)
   return changes;
 }
 
-#endif /* TCC_OPT_SSA_DOMWALK_H */

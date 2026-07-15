@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_SSA_STR_HANDLERS_H
-#define TCC_OPT_SSA_STR_HANDLERS_H
+#pragma once
 
 #include "ssa_opt.h"
 
@@ -51,4 +50,3 @@ extern const StrFoldHandler tcc_strfold_rindex;
 extern const StrFoldHandler tcc_strfold_strstr;
 extern const StrFoldHandler tcc_strfold_strpbrk;
 
-#endif /* TCC_OPT_SSA_STR_HANDLERS_H */

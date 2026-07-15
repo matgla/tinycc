@@ -64,10 +64,7 @@ static int is_recognized_mem_call(TCCIRState *ir, IRQuadCompact *q,
     *out_size_at_idx = 2;
     return 1;
   }
-  if (strcmp(name, "memcpy") == 0 || strcmp(name, "memmove") == 0 ||
-      strcmp(name, "__aeabi_memcpy") == 0 || strcmp(name, "__aeabi_memmove") == 0 ||
-      strcmp(name, "__aeabi_memcpy4") == 0 || strcmp(name, "__aeabi_memcpy8") == 0 ||
-      strcmp(name, "__aeabi_memmove4") == 0 || strcmp(name, "__aeabi_memmove8") == 0)
+  if (ir_opt_is_memcpy_or_memmove_name(name))
   {
     *out_size_at_idx = 2;
     return 1;

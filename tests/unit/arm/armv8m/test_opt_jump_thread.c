@@ -575,36 +575,5 @@ UT_TEST(test_ef_idempotent)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_jump_thread)
-{
-  UT_COVERS("jump_threading");
-  UT_COVERS("eliminate_fallthrough");
-
-  /* jump_threading */
-  UT_RUN(test_jt_chain_collapses_to_final_target);
-  UT_RUN(test_jt_skips_nops_to_real_instruction);
-  UT_RUN(test_jt_direct_target_no_change);
-  UT_RUN(test_jt_conditional_backward_guard);
-  UT_RUN(test_jt_chain_length_n);
-  UT_RUN(test_jt_cycle_terminates);
-  UT_RUN(test_jt_jump_to_self);
-  UT_RUN(test_jt_target_zero);
-  UT_RUN(test_jt_target_last);
-  UT_RUN(test_jt_target_out_of_range);
-  UT_RUN(test_jt_unconditional_backward_allowed);
-  UT_RUN(test_jt_conditional_forward_threads);
-  UT_RUN(test_jt_idempotent);
-
-  /* eliminate_fallthrough */
-  UT_RUN(test_ef_jump_to_next_becomes_nop);
-  UT_RUN(test_ef_jump_to_next_across_nop_becomes_nop);
-  UT_RUN(test_ef_jumpif_to_next_safe_becomes_nop);
-  UT_RUN(test_ef_real_branch_preserved);
-  UT_RUN(test_ef_jumpif_to_next_across_nop);
-  UT_RUN(test_ef_real_branch_backward_preserved);
-  UT_RUN(test_ef_jump_to_epilogue);
-  UT_RUN(test_ef_jumpif_both_arms_converge);
-  UT_RUN(test_ef_idempotent);
-}
+UT_COVERS("jump_threading");
+UT_COVERS("eliminate_fallthrough");

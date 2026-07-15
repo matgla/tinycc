@@ -21,10 +21,16 @@
 #include "ir/opt_utils.h"
 #include "ir/opt_engine.h"
 #include "ir/opt_pipeline.h"
+#include "opt/flat/if_convert.h"
+#include "memory/small_sequence.h"
+
+/* Inline-first per-vreg bitset (64 B inline -> 512 vregs, heap past that). */
+TCC_SMALL_SEQUENCE_DEFINE(RaLiveVregBitset, uint8_t, 64)
+#include "opt/flat/narrow_store.h"
 #include "ir/regalloc.h"
 #include "ir/ssa.h"
 #include "tccir.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 
 #include "regalloc.h"
 
@@ -245,6 +251,8 @@ static void run_ssa_and_post_ra_passes(TCCIRState *ir)
 {
   {
     const RegAllocTarget *ra_target = arm_get_regalloc_target();
+    if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("ra:stack_param_promote"))
+      tcc_ir_promote_loop_stack_params(ir);
     dbg_scan_imm_dest(ir, "before-ssa-regalloc");
     dbg_scan_overlap(ir, "before-ssa-regalloc");
     tcc_ir_ssa_regalloc(ir, ra_target, loc);
@@ -433,7 +441,9 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
       int p = TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[i].vreg);
       if (p > max_vreg_pos) max_vreg_pos = p;
     }
-    uint8_t *live_vregs = tcc_mallocz((max_vreg_pos + 8) / 8);
+    small_sequence(RaLiveVregBitset) live_vregs_owner = {0};
+    RaLiveVregBitset_init(&live_vregs_owner, (size_t)((max_vreg_pos + 8) / 8));
+    uint8_t *live_vregs = RaLiveVregBitset_data(&live_vregs_owner);
     for (int j = 0; j < ir->next_instruction_index; j++) {
       const IRQuadCompact *q = &ir->compact_instructions[j];
       if (q->op == TCCIR_OP_NOP)
@@ -480,7 +490,6 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
       }
       min_stack_loc = sl;
     }
-    tcc_free(live_vregs);
 
     /* min_op_offset scan (pre-move-coalescing) */
     int min_op_offset = 0;

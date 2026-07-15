@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_mem_imm.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_mem_imm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -539,35 +539,4 @@ UT_TEST(test_ldr_str_sp_base_t32)
   UT_ASSERT_EQ(op.opcode, 0x9801);
 
   return 0;
-}
-
-/* ───── suite ───── */
-
-UT_SUITE(thop_mem_imm)
-{
-  UT_RUN(test_ldr_imm_t16_basic);
-  UT_RUN(test_str_imm_t16_basic);
-  UT_RUN(test_ldrb_imm_t16_basic);
-  UT_RUN(test_strb_imm_t16_basic);
-  UT_RUN(test_ldrh_imm_t16_basic);
-  UT_RUN(test_strh_imm_t16_basic);
-  UT_RUN(test_ldr_imm_t16_sp_relative);
-  UT_RUN(test_str_imm_t16_sp_relative);
-  UT_RUN(test_ldr_imm_t16_high_reg_falls_to_t32);
-  UT_RUN(test_ldr_imm_enforce_16bit_high_reg_fails);
-  UT_RUN(test_ldr_imm_t32_positive);
-  UT_RUN(test_str_imm_t32_positive);
-  UT_RUN(test_ldrb_strb_imm_t32_positive);
-  UT_RUN(test_ldrh_strh_imm_t32_positive);
-  UT_RUN(test_ldrsb_ldrsh_imm_t32_positive);
-  UT_RUN(test_ldr_imm_t32_pc_positive);
-  UT_RUN(test_ldr_imm_t32_pc_negative);
-  UT_RUN(test_ldrb_strb_imm_t32_pc);
-  UT_RUN(test_ldrh_strh_imm_t32_pc);
-  UT_RUN(test_ldrsb_imm_t32_pc);
-  UT_RUN(test_ldr_imm_t32_post_inc);
-  UT_RUN(test_ldr_imm_t32_pre_index);
-  UT_RUN(test_ldr_imm_t32_negative_offset);
-  UT_RUN(test_ldrsb_ldrsh_imm_t32_indexed);
-  UT_RUN(test_ldr_str_sp_base_t32);
 }

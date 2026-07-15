@@ -307,6 +307,10 @@ class Report:
         # rollups only) -- then the verdict omits the byte breakdown.
         self.improved_bytes = None
         self.regressed_bytes = None
+        # Column labels for the two sides being diffed.  Default to the
+        # worktree-vs-server framing; --range overrides them with the two refs.
+        self.base_label = "baseline"
+        self.new_label = "worktree"
 
     def add(self, line=""):
         self.lines.append(line)
@@ -322,7 +326,8 @@ def report_codesize(rep, wt, base, tol, opts):
         rep.add()
         return
     hdr = "  {:3} {:<12} {:>10} {:>10} {:>10} {:>9} {:>18} {:>9}".format(
-        "opt", "suite", "gcc", "legacy tcc", "new tcc", "delta", "ratio base->wt", "verdict")
+        "opt", "suite", "gcc", f"{rep.base_label} tcc"[:10], f"{rep.new_label} tcc"[:10],
+        "delta", "ratio base->wt", "verdict")
     rep.add(hdr)
     rep.add("  " + "-" * (len(hdr) - 2))
     mismatch = next((opt for opt in opts
@@ -383,7 +388,7 @@ def report_codesize(rep, wt, base, tol, opts):
         if rows:
             rep.add(f"  per-suite at -{det.upper()} (nonzero movers; better first, worse below):")
             hdr = "    {:<14} {:>10} {:>10} {:>10} {:>9}  {}".format(
-                "suite", "gcc", "baseline", "worktree", "delta", "verdict")
+                "suite", "gcc", rep.base_label, rep.new_label, "delta", "verdict")
             rep.add(hdr)
             rep.add("    " + "-" * 59)
             better, worse = split_movers(rows)
@@ -439,7 +444,7 @@ def report_func_deltas(rep, wt, base, top_n, det):
         rep.add(f"  per-function at -{det.upper()} (top {len(better)} better of "
                 f"{len(all_better)}, top {len(worse)} worse of {len(all_worse)}):")
         hdr = "    {:<52} {:>8} {:>8} {:>8} {:>8}  {}".format(
-            "name", "gcc", "baseline", "worktree", "delta", "verdict")
+            "name", "gcc", rep.base_label, rep.new_label, "delta", "verdict")
         rep.add(hdr)
         rep.add("    " + "-" * 92)
         for group_i, group in enumerate((better, worse)):
@@ -464,8 +469,8 @@ def report_compile_time(rep, wt, base, opts):
         key = f"codesize_corpus_{opt}"
         if key in wt and key in base:
             w, b = wt[key], base[key]
-            lines.append("  {}: base {:.1f}s -> worktree {:.1f}s  ({:+.1f}%)".format(
-                opt, b, w, pct(w, b)))
+            lines.append("  {}: {} {:.1f}s -> {} {:.1f}s  ({:+.1f}%)".format(
+                opt, rep.base_label, b, rep.new_label, w, pct(w, b)))
     if not lines:
         return
     rep.add("COMPILE TIME  (corpus wall time; informational, hardware-noisy)")
@@ -544,6 +549,11 @@ def main(argv=None) -> int:
                           "worktree, so ratios/func_count are comparable (code size + "
                           "compile time only; correctness/perf are in-place-binary only). "
                           "Measurements are cached in the scratch db by sha and reused")
+    src.add_argument("--range", metavar="A..B", dest="rev_range",
+                     help="compare two committed revisions instead of the working "
+                          "tree: build+measure both A (base) and B (new) locally "
+                          "(same corpus + gcc) and diff B vs A. Skips `make cross` "
+                          "and the worktree. Example: --range HEAD~1..HEAD")
     p.add_argument("--refresh-baseline", action="store_true",
                    help="re-measure --baseline-commit even if its sha is already "
                         "in the scratch db (use after the corpus or gcc changed)")
@@ -580,27 +590,56 @@ def main(argv=None) -> int:
     args = p.parse_args(argv)
     args.opts = [o for o in CODESIZE_OPTS if o in (args.opt or CODESIZE_OPTS)]
 
-    if not args.url and not args.baseline_db and not args.baseline_commit:
-        p.error("need --url (fetch from server), --baseline-db (local copy), "
-                "or --baseline-commit (build+measure a ref locally)")
+    base_ref = new_ref = None
+    if args.rev_range:
+        if any((args.url, args.baseline_db, args.baseline_commit)):
+            p.error("--range is exclusive with --url/--baseline-db/--baseline-commit")
+        if ".." not in args.rev_range:
+            p.error("--range must look like A..B (e.g. HEAD~1..HEAD)")
+        base_ref, _, new_ref = args.rev_range.partition("..")
+        base_ref, new_ref = base_ref.strip(), new_ref.strip()
+        if not base_ref or not new_ref:
+            p.error("--range needs both endpoints: A..B")
+    elif not args.url and not args.baseline_db and not args.baseline_commit:
+        p.error("need --range (two commits), --url (fetch from server), "
+                "--baseline-db (local copy), or --baseline-commit (build+measure "
+                "a ref locally)")
     if args.perf and not args.perf_host:
         p.error("--perf requires --perf-host")
+    if args.rev_range and (args.correctness or args.perf):
+        warn("--correctness/--perf are ignored with --range: both endpoints are "
+             "built and measured for code size + compile time only")
+        args.correctness = args.perf = False
     if args.baseline_commit and args.correctness:
         warn("--correctness is ignored with --baseline-commit: correctness is "
              "measured against the in-place binary, not the baseline commit")
 
-    if not args.no_build:
-        build_cross(args.jobs)
-    elif not (REPO_ROOT / "armv8m-tcc").exists():
-        die("--no-build given but armv8m-tcc does not exist; build it first")
+    if not args.rev_range:
+        if not args.no_build:
+            build_cross(args.jobs)
+        elif not (REPO_ROOT / "armv8m-tcc").exists():
+            die("--no-build given but armv8m-tcc does not exist; build it first")
 
     scratch_db = args.scratch_db or str(
         Path(tempfile.gettempdir()) / "tcc-worktree-metrics.db")
-    wt_conn, wt_run, base_sha = measure_worktree(scratch_db, args)
+    if args.rev_range:
+        wt_conn = REC.connect(scratch_db)
+        wt_run = base_sha = None  # set below from the resolved refs
+    else:
+        wt_conn, wt_run, base_sha = measure_worktree(scratch_db, args)
 
     tmp_baseline = None
     try:
-        if args.baseline_commit:
+        if args.rev_range:
+            base_conn = wt_conn      # same scratch db; do not double-close
+            base_run, base_run_sha, base_subject, _bc = measure_commit_baseline(
+                wt_conn, base_ref, args)
+            new_run, new_run_sha, new_subject, _nc = measure_commit_baseline(
+                wt_conn, new_ref, args)
+            wt_run, base_sha = new_run, new_run_sha
+            how = f"local build of {base_ref}..{new_ref}"
+            host_line = f"  local range diff (same corpus + gcc)  scratch-db={scratch_db}"
+        elif args.baseline_commit:
             base_conn = wt_conn      # same scratch db; do not double-close
             base_run, base_run_sha, base_subject, cached = measure_commit_baseline(
                 wt_conn, args.baseline_commit, args)
@@ -627,10 +666,18 @@ def main(argv=None) -> int:
             host_line = f"  host={args.baseline_host}  scratch-db={scratch_db}"
 
         rep = Report()
+        if args.rev_range:
+            rep.base_label, rep.new_label = base_ref, new_ref
         rep.add("=" * 78)
-        rep.add(f"worktree (base {base_sha[:12]})  vs  baseline {base_run_sha[:12]} "
-                f"[{how}]")
-        rep.add(f"  baseline: {base_subject}")
+        if args.rev_range:
+            rep.add(f"new {new_ref} ({new_run_sha[:12]})  vs  base {base_ref} "
+                    f"({base_run_sha[:12]})  [{how}]")
+            rep.add(f"  new:  {new_subject}")
+            rep.add(f"  base: {base_subject}")
+        else:
+            rep.add(f"worktree (base {base_sha[:12]})  vs  baseline {base_run_sha[:12]} "
+                    f"[{how}]")
+            rep.add(f"  baseline: {base_subject}")
         rep.add(host_line)
         rep.add("=" * 78)
         rep.add()
@@ -644,8 +691,9 @@ def main(argv=None) -> int:
         if base_funcs:
             improved = regressed = 0
             for key in set(wt_funcs) | set(base_funcs):
-                d = ((wt_funcs.get(key) or {}).get("tcc", 0)) - \
-                    ((base_funcs.get(key) or {}).get("tcc", 0))
+                if key not in base_funcs:
+                    continue     # NEW test function; excluded like the report table
+                d = ((wt_funcs.get(key) or {}).get("tcc", 0)) - base_funcs[key]["tcc"]
                 if d < 0:
                     improved += -d
                 elif d > 0:

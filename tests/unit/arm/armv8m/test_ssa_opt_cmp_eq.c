@@ -812,28 +812,4 @@ UT_TEST(test_cmp_eq_prop_empty_cfg)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_cmp_eq)
-{
-  UT_COVERS("ssa:cmp_eq_prop");
-  UT_RUN(test_cmp_eq_prop_eq);
-  UT_RUN(test_cmp_eq_prop_ne);
-  UT_RUN(test_cmp_eq_prop_jeq_taken_folds_later_jne);
-  UT_RUN(test_cmp_eq_prop_jeq_not_taken_folds_later_jeq);
-  UT_RUN(test_cmp_eq_prop_jne_taken_folds_later_jeq);
-  UT_RUN(test_cmp_eq_prop_jne_not_taken_folds_later_jne);
-  UT_RUN(test_cmp_eq_prop_symmetric_fact_lookup);
-  UT_RUN(test_cmp_eq_prop_jne_becomes_jump);
-  UT_RUN(test_cmp_eq_prop_different_operands_no_fold);
-  UT_RUN(test_cmp_eq_prop_immediate_operand_no_fact);
-  UT_RUN(test_cmp_eq_prop_lval_operand_no_fact);
-  UT_RUN(test_cmp_eq_prop_var_operand_no_fact);
-  UT_RUN(test_cmp_eq_prop_jump_not_jumpif);
-  UT_RUN(test_cmp_eq_prop_no_cmp_before_jumpif);
-  UT_RUN(test_cmp_eq_prop_invalid_target_no_fact);
-  UT_RUN(test_cmp_eq_prop_non_eqne_token_no_fact);
-  UT_RUN(test_cmp_eq_prop_target_equals_fallthrough_no_fact);
-  UT_RUN(test_cmp_eq_prop_fact_scoped_to_subtree);
-  UT_RUN(test_cmp_eq_prop_phi_edge_dead_target);
-  UT_RUN(test_cmp_eq_prop_phi_edge_dead_fallthrough);
-  UT_RUN(test_cmp_eq_prop_empty_cfg);
-}
+UT_COVERS("ssa:cmp_eq_prop");

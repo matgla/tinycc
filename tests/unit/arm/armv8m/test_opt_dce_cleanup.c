@@ -802,57 +802,13 @@ UT_TEST(test_null_store_dom_return_ex_empty)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_dce_cleanup)
-{
-  UT_COVERS("useless_function_body");
-  UT_COVERS("noreturn_collapse");
-  UT_COVERS("trap_only_body_suppress");
-  UT_COVERS("infinite_self_recursion");
-  UT_COVERS("noreturn_call_epilogue_suppress");
-  UT_COVERS("compact_nops");
-  UT_COVERS("ub_only_body_elide");
-  UT_COVERS("local_only_body_elide");
-  UT_COVERS("const_return_uninit_elide");
-  UT_COVERS("null_store_dom_return");
-
-  UT_RUN(test_useless_body_returnvoid_only_collapses);
-  UT_RUN(test_useless_body_returnvalue_keeps_body);
-  UT_RUN(test_useless_body_ordinary_call_keeps_body);
-
-  UT_RUN(test_noreturn_collapse_self_loop_with_store_collapses);
-  UT_RUN(test_noreturn_collapse_has_return_no_change);
-  UT_RUN(test_noreturn_collapse_optimize_gate);
-
-  UT_RUN(test_trap_only_body_single_trap_suppresses_frame);
-  UT_RUN(test_trap_only_body_extra_op_no_change);
-  UT_RUN(test_trap_only_body_naked_function_no_change);
-
-  UT_RUN(test_infinite_self_recursion_unconditional_call_collapses);
-  UT_RUN(test_infinite_self_recursion_early_return_no_change);
-  UT_RUN(test_infinite_self_recursion_other_call_first_no_change);
-
-  UT_RUN(test_noreturn_call_epilogue_suppress_fires);
-  UT_RUN(test_noreturn_call_epilogue_suppress_live_return_no_change);
-  UT_RUN(test_noreturn_call_epilogue_suppress_jump_past_call_no_change);
-
-  UT_RUN(test_compact_nops_removes_nop_and_remaps_jump_target);
-  UT_RUN(test_compact_nops_remaps_epilogue_target);
-  UT_RUN(test_compact_nops_no_nops_no_change);
-  UT_RUN(test_compact_nops_rederives_jump_target_flags);
-
-  UT_RUN(test_useless_function_body_ex_forwards);
-  UT_RUN(test_noreturn_collapse_ex_forwards);
-  UT_RUN(test_trap_only_body_suppress_ex_forwards);
-  UT_RUN(test_compact_nops_ex_forwards);
-
-  UT_RUN(test_ub_only_body_elide_empty);
-  UT_RUN(test_ub_only_body_elide_ex_empty);
-  UT_RUN(test_local_only_body_elide_empty);
-  UT_RUN(test_local_only_body_elide_ex_empty);
-  UT_RUN(test_const_return_uninit_elide_empty);
-  UT_RUN(test_const_return_uninit_elide_ex_empty);
-  UT_RUN(test_null_store_dom_return_empty);
-  UT_RUN(test_null_store_dom_return_ex_empty);
-}
+UT_COVERS("useless_function_body");
+UT_COVERS("noreturn_collapse");
+UT_COVERS("trap_only_body_suppress");
+UT_COVERS("infinite_self_recursion");
+UT_COVERS("noreturn_call_epilogue_suppress");
+UT_COVERS("compact_nops");
+UT_COVERS("ub_only_body_elide");
+UT_COVERS("local_only_body_elide");
+UT_COVERS("const_return_uninit_elide");
+UT_COVERS("null_store_dom_return");

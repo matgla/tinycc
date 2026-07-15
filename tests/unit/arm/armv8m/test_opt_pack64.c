@@ -929,53 +929,10 @@ UT_TEST(test_shift64_dead_half_shift_amount_below_32_no_mark)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_pack64)
-{
-  UT_COVERS("pack64");
-  UT_COVERS("pack64_from_stack_stores");
-  UT_COVERS("pack64_implicit");
-  UT_COVERS("pack64_tautology");
-  UT_COVERS("cmp_narrow_64");
-  UT_COVERS("shl32_or_chain");
-  UT_COVERS("shift64_dead_half");
-
-  UT_RUN(test_pack64_explicit_zext_shl_or_fires);
-  UT_RUN(test_pack64_explicit_operand_order_swapped_fires);
-  UT_RUN(test_pack64_explicit_non64_or_dest_no_fire);
-  UT_RUN(test_pack64_explicit_wrong_shift_amount_no_fire);
-  UT_RUN(test_pack64_explicit_multi_use_shl_no_fire);
-
-  UT_RUN(test_pack64_stack_stores_direct_slot_fires);
-  UT_RUN(test_pack64_stack_stores_var_spill_alias_no_fire);
-  UT_RUN(test_pack64_stack_stores_missing_hi_no_fire);
-  UT_RUN(test_pack64_stack_stores_call_between_no_fire);
-  UT_RUN(test_pack64_stack_stores_redef_between_no_fire);
-  UT_RUN(test_pack64_stack_stores_non64_load_no_fire);
-
-  UT_RUN(test_pack64_implicit_shl_or_fires);
-  UT_RUN(test_pack64_implicit_lo_operand_64bit_no_fire);
-  UT_RUN(test_pack64_implicit_hi_input_64bit_no_fire);
-  UT_RUN(test_pack64_implicit_both_const_no_fire);
-
-  UT_RUN(test_pack64_tautology_identity_fires);
-  UT_RUN(test_pack64_tautology_different_vars_no_fire);
-  UT_RUN(test_pack64_tautology_wrong_shr_amount_no_fire);
-  UT_RUN(test_pack64_tautology_not_64bit_var_no_fire);
-
-  UT_RUN(test_cmp_narrow64_zext_eq_fires);
-  UT_RUN(test_cmp_narrow64_zext_ult_fires);
-  UT_RUN(test_cmp_narrow64_signed_relational_no_fire);
-  UT_RUN(test_cmp_narrow64_src2_high_bits_set_no_fire);
-  UT_RUN(test_cmp_narrow64_unproven_hi_no_fire);
-
-  UT_RUN(test_shl32_or_chain_shl32_consumer_fires);
-  UT_RUN(test_shl32_or_chain_and_low_consumer_fires);
-  UT_RUN(test_shl32_or_chain_and_wrong_mask_no_fire);
-  UT_RUN(test_shl32_or_chain_no_shl_operand_no_fire);
-
-  UT_RUN(test_shift64_dead_half_marks_skip_lo);
-  UT_RUN(test_shift64_dead_half_multi_use_no_mark);
-  UT_RUN(test_shift64_dead_half_shift_amount_below_32_no_mark);
-}
+UT_COVERS("pack64");
+UT_COVERS("pack64_from_stack_stores");
+UT_COVERS("pack64_implicit");
+UT_COVERS("pack64_tautology");
+UT_COVERS("cmp_narrow_64");
+UT_COVERS("shl32_or_chain");
+UT_COVERS("shift64_dead_half");

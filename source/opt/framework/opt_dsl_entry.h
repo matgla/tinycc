@@ -8,8 +8,7 @@
  *  License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_DSL_ENTRY_H
-#define TCC_OPT_DSL_ENTRY_H
+#pragma once
 
 /* Generator-table entry macros. See docs/optimizations/opt_dsl_framework.md. */
 
@@ -25,4 +24,3 @@
 #define OPT_DSL_TABLE_COUNT(tbl) \
   (sizeof(tbl) / sizeof((tbl)[0]))
 
-#endif /* TCC_OPT_DSL_ENTRY_H */

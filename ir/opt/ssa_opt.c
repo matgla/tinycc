@@ -14,9 +14,15 @@
 #include "opt/ssa/branch.h"
 #include "const_string_fold.h"
 #include "bitop_const_fold.h"
+#include "load_cse.h"
+#include "diamond_store_fwd.h"
 #include "opt/ssa/strength.h"
+#include "opt/ssa/reassoc.h"
 #include "opt/ssa/fold.h"
 #include "opt/ssa/cmp_eq.h"
+#include "opt/ssa/gvn.h"
+#include "opt/ssa/var_imm_prop.h"
+#include "opt/ssa/cprop.h"
 #include <limits.h>
 
 extern int tcc_ir_opt_pass_disabled(const char *name);
@@ -757,9 +763,11 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     SSA_RUN("ssa:var_to_param_forward", ssa_opt_var_to_param_forward(ctx));
     SSA_RUN("ssa:fold", ssa_opt_fold(ctx));
     SSA_RUN("ssa:cprop", ssa_opt_cprop(ctx));
+    /* SSA:var_imm_prop moved to source/opt/ssa/scalar/var_imm_prop.c */
     SSA_RUN("ssa:var_imm_prop", ssa_opt_var_imm_prop(ctx));
     SSA_RUN("ssa:const_prop_tmp", ssa_opt_const_prop_tmp(ctx));
     SSA_RUN("ssa:load_cse", ssa_opt_load_cse(ctx));
+    SSA_RUN("ssa:diamond_store_fwd", ssa_opt_diamond_store_fwd(ctx));
     SSA_RUN("ssa:const_string_fold", tcc_ir_ssa_opt_const_string_fold(ctx));
     SSA_RUN("ssa:bitop_const_fold", tcc_ir_ssa_opt_bitop_const_fold(ctx));
     SSA_RUN("ssa:ptr_store_dse", tcc_ir_ssa_opt_ptr_store_dse(ctx));

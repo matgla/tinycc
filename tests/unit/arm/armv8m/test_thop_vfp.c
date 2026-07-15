@@ -3,8 +3,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_vfp.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_vfp.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ut.h"
 
 static void setup_armv8m_vfp(void)
@@ -491,56 +491,4 @@ UT_TEST(test_vfp_dp_allowed_with_feat)
   UT_ASSERT_EQ(op.size, 4);
   UT_ASSERT_EQ(op.opcode, 0xEE310B02);
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_vfp)
-{
-  UT_RUN(test_th_vadd_f_sp);
-  UT_RUN(test_th_vadd_f_dp);
-  UT_RUN(test_th_vadd_f_sp_high_regs);
-  UT_RUN(test_th_vadd_f_dp_high_regs);
-  UT_RUN(test_th_vsub_f_sp);
-  UT_RUN(test_th_vsub_f_dp);
-  UT_RUN(test_th_vmul_f_sp);
-  UT_RUN(test_th_vmul_f_dp);
-  UT_RUN(test_th_vdiv_f_sp);
-  UT_RUN(test_th_vdiv_f_dp);
-  UT_RUN(test_th_vneg_f_sp);
-  UT_RUN(test_th_vneg_f_dp);
-  UT_RUN(test_th_vcmp_f_sp);
-  UT_RUN(test_th_vcmp_f_dp);
-  UT_RUN(test_th_vmov_register_sp);
-  UT_RUN(test_th_vmov_register_dp);
-  UT_RUN(test_th_vmov_gp_sp_to_arm);
-  UT_RUN(test_th_vmov_gp_sp_from_arm);
-  UT_RUN(test_th_vmov_gp_sp_high_reg);
-  UT_RUN(test_th_vmov_2gp_dp_to_arm);
-  UT_RUN(test_th_vmov_2gp_dp_from_arm);
-  UT_RUN(test_th_vmrs);
-  UT_RUN(test_th_vcvt_float_to_double);
-  UT_RUN(test_th_vcvt_double_to_float);
-  UT_RUN(test_th_vcvt_fp_int_s32_f32);
-  UT_RUN(test_th_vcvt_fp_int_u32_f32);
-  UT_RUN(test_th_vcvt_fp_int_f32_s32);
-  UT_RUN(test_th_vcvt_fp_int_f32_u32);
-  UT_RUN(test_th_vcvt_fp_int_s32_f64);
-  UT_RUN(test_th_vcvt_fp_int_f64_s32);
-  UT_RUN(test_th_vcvt_fp_int_f64_u32);
-  UT_RUN(test_th_vcvt_convert_s32_f32);
-  UT_RUN(test_th_vcvt_convert_f64_f32);
-  UT_RUN(test_th_vcvt_convert_f32_s32);
-  UT_RUN(test_th_vcvt_convert_u32_f64);
-  UT_RUN(test_th_vcvt_convert_unknown);
-  UT_RUN(test_th_vpush_sp);
-  UT_RUN(test_th_vpush_sp_high);
-  UT_RUN(test_th_vpush_dp);
-  UT_RUN(test_th_vpush_dp_high);
-  UT_RUN(test_th_vpop_sp);
-  UT_RUN(test_th_vpop_dp);
-  UT_RUN(test_vfp_sp_blocked_without_feat);
-  UT_RUN(test_vfp_dp_blocked_without_feat);
-  UT_RUN(test_vfp_sp_allowed_with_feat);
-  UT_RUN(test_vfp_dp_allowed_with_feat);
 }

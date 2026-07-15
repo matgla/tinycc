@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_ldr_literal.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_ldr_literal.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -154,18 +154,4 @@ UT_TEST(test_ldr_literal_t32_max_imm)
 
   /* ldr.w r5, [pc, #0xFFF]  => 0xF8DF5FFF  (GCC: f8df 5fff) */
   return 0;
-}
-
-/* ───── suite ───── */
-
-UT_SUITE(thop_ldr_literal)
-{
-  UT_RUN(test_ldr_literal_t1_basic);
-  UT_RUN(test_ldr_literal_t1_max_offset);
-  UT_RUN(test_ldr_literal_t1_high_reg_rejected);
-  UT_RUN(test_ldr_literal_t32_positive);
-  UT_RUN(test_ldr_literal_t32_negative);
-  UT_RUN(test_ldr_literal_t32_pc_rejected);
-  UT_RUN(test_ldr_literal_t32_imm_overflow_rejected);
-  UT_RUN(test_ldr_literal_t32_max_imm);
 }

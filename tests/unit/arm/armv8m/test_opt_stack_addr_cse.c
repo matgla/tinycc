@@ -212,19 +212,4 @@ UT_TEST(test_max_entries_cap_leaves_33rd_unfolded)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_stack_addr_cse)
-{
-  UT_COVERS("stack_addr_cse");
-  UT_RUN(test_single_pair_folded_add_noped);
-  UT_RUN(test_bare_assign_no_add_ignored);
-  UT_RUN(test_non_self_add_not_paired);
-  UT_RUN(test_lval_stackoff_src_rejected);
-  UT_RUN(test_empty_ir_no_crash);
-  UT_RUN(test_two_identical_pairs_cse_rewrites_use);
-  UT_RUN(test_mismatched_constant_no_cse);
-  UT_RUN(test_mismatched_offset_no_cse);
-  UT_RUN(test_redefinition_between_duplicates_blocks_cse);
-  UT_RUN(test_max_entries_cap_leaves_33rd_unfolded);
-}
+UT_COVERS("stack_addr_cse");

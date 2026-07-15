@@ -2,10 +2,11 @@
  *  test_opt_vrp.c - suite for ir/opt_branch.c value-range propagation (vrp)
  *
  *  tcc_ir_opt_vrp() tracks per-vreg [min, max] ranges derived from immediate
- *  assignments and simple ADD/SUB propagation, then folds CMP+JUMPIF sequences
- *  when the result is provable over the whole range.  It also carries ranges
- *  through unconditional jumps to single-predecessor blocks and clears them at
- *  merge points / back-edge targets.
+ *  assignments, ADD/SUB propagation, bitwise-AND masks, and shifts (SHL/SAR/SHR),
+ *  then folds CMP+JUMPIF sequences when the result is provable over the whole
+ *  range.  It carries ranges through unconditional jumps and EQ-branch taken
+ *  edges into single-predecessor blocks, and clears them at merge points /
+ *  back-edge targets.
  *
  *  These are isolated tests: a hand-built IR sequence is run through the bare
  *  pass entry point and the resulting instructions are inspected directly.
@@ -657,46 +658,163 @@ UT_TEST(test_vrp_negative_range_unsigned_ult_folds_jump)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
+/* ========================================================= range-source levers */
 
-/* The 11 UT_RUN()s below were previously disabled: they all hinge on
- * `T = ASSIGN #imm` seeding a VRP range, which tcc_ir_opt_vrp()
- * (ir/opt_branch.c) did not do. That immediate-seed branch has now been added
- * (docs/bugs.md #6, fixed), so these are re-enabled as the regression lock. */
-UT_SUITE(opt_vrp)
+/* EQ taken edge: `CMP T0,#7 ; JUMPIF EQ -> target` carries T0==7 into the target block when that
+ * target is a sole-predecessor forward block, where a second `CMP T0,#7 ; JUMPIF EQ` folds. */
+UT_TEST(test_vrp_eq_taken_edge_carries_singleton_to_target)
 {
-  UT_COVERS("vrp");
+  TCCIRState *ir = utb_new();
 
-  UT_RUN(test_vrp_const_range_lt_folds_to_jump);
-  UT_RUN(test_vrp_singleton_eq_folds_to_jump);
-  UT_RUN(test_vrp_singleton_lt_false_nops_both);
-  UT_RUN(test_vrp_unsigned_range_ult_folds_to_jump);
-  UT_RUN(test_vrp_range_propagates_through_copy);
-  UT_RUN(test_vrp_deferred_range_through_uncond_jump);
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_imm(7, I32));            /* 0 */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(TOK_EQ, I32), UTB_NONE);     /* 1: ==,->3 */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);                    /* 2: != path */
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_imm(7, I32)); /* 3: target */
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(6, I32), utb_imm(TOK_EQ, I32), UTB_NONE); /* 4 */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);                    /* 5 */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);                    /* 6 */
 
-  UT_RUN(test_vrp_unknown_range_left_untouched);
-  UT_RUN(test_vrp_merge_point_clears_ranges);
-  UT_RUN(test_vrp_backedge_target_clears_ranges);
-  UT_RUN(test_vrp_swapped_cmp_operands_no_fold);
+  int changes = tcc_ir_opt_vrp(ir);
 
-  UT_RUN(test_vrp_add_propagates_range_folds_eq);
-  UT_RUN(test_vrp_sub_propagates_range_folds_ne_false);
-  UT_RUN(test_vrp_add_unknown_src_invalidates_dest_range);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ((int)utb_dest(ir, ijmp).u.imm32, 6);
 
-  UT_RUN(test_vrp_uge_zero_tautology_always_taken);
-  UT_RUN(test_vrp_ult_zero_tautology_never_taken);
-
-  UT_RUN(test_vrp_fallthrough_constraint_folds_next_cmp);
-
-  UT_RUN(test_vrp_regreg_chain_lt_implies_le_folds_jump);
-  UT_RUN(test_vrp_regreg_chain_gt_implies_not_lt_nops_both);
-  UT_RUN(test_vrp_regreg_chain_merge_point_blocks_fold);
-
-  UT_RUN(test_vrp_cmp_setif_range_folds_to_const_one);
-  UT_RUN(test_vrp_cmp_setif_range_folds_to_const_zero);
-
-  UT_RUN(test_vrp_wide_range_eq_outside_bounds_nops_both);
-  UT_RUN(test_vrp_wide_range_ne_outside_bounds_folds_jump);
-
-  UT_RUN(test_vrp_negative_range_unsigned_ult_folds_jump);
+  utb_free(ir);
+  return 0;
 }
+
+/* AND with a non-negative mask bounds the result to [0, mask]: T1 = T0 & (1<<26) is >= 0, so the
+ * signed `T1 >= 0` (JUMPIF GE) is always true and folds — the gcc.c-torture bit.c `foo` shape. */
+UT_TEST(test_vrp_and_nonneg_mask_folds_ge_zero)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_AND, utb_temp(1, I32), utb_temp(0, I32), utb_imm(1 << 26, I32)); /* 0 */
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_imm(0, I32));     /* 1 */
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 2 */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);  /* 3 */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);  /* 4 */
+
+  int changes = tcc_ir_opt_vrp(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMP);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* A mask that includes the sign bit (negative as int32) yields no usable range: compare untouched. */
+UT_TEST(test_vrp_and_negative_mask_no_range)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_AND, utb_temp(1, I32), utb_temp(0, I32), utb_imm(-16, I32));   /* mask<0 */
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_imm(1000, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(TOK_ULT, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_vrp(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMPIF);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* SHL by a constant scales a known range: T0=3, T1 = T0 << 2 = 12 → CMP T1,#12 / JUMPIF EQ folds. */
+UT_TEST(test_vrp_shl_scales_range_folds_eq)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(3, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_SHL, utb_temp(1, I32), utb_temp(0, I32), utb_imm(2, I32));
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_imm(12, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(5, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_vrp(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMP);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* SAR (arithmetic right shift) narrows a known range: T0=20, T1 = T0 >> 2 = 5. */
+UT_TEST(test_vrp_sar_narrows_range_folds_eq)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(20, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_SAR, utb_temp(1, I32), utb_temp(0, I32), utb_imm(2, I32));
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_imm(5, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(5, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_vrp(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMP);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* SHR (logical right shift) narrows a non-negative range: T0=40, T1 = T0 >>u 3 = 5. */
+UT_TEST(test_vrp_shr_nonneg_narrows_range_folds_eq)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(40, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I32), utb_temp(0, I32), utb_imm(3, I32));
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_imm(5, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(5, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_vrp(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMP);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* SHR on a possibly-negative source is not monotone as a signed interval → no range recorded. */
+UT_TEST(test_vrp_shr_negative_source_no_range)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(-8, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I32), utb_temp(0, I32), utb_imm(1, I32));
+  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_imm(1000, I32));
+  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(5, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_vrp(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMPIF);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Regression lock for docs/bugs.md #6: VRP seeds ranges from `T = ASSIGN #imm`. */
+UT_COVERS("vrp");

@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_SSA_NARROW_H
-#define TCC_OPT_SSA_NARROW_H
+#pragma once
 
 struct IRSSAOptCtx;
 
@@ -17,4 +16,3 @@ struct IRSSAOptCtx;
  * Returns the number of instructions rewritten. */
 int ssa_opt_narrow(struct IRSSAOptCtx *ctx);
 
-#endif /* TCC_OPT_SSA_NARROW_H */

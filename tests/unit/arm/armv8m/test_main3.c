@@ -1,15 +1,15 @@
 /*
- *  test_main3.c - entry point for tccgen.c unit-test binary
+ *  test_main3.c - entry point for the tccgen.c unit-test binary (build_tccgen/run_unit_tests_tccgen)
+ *
+ *  Tests self-register via UT_TEST constructors; argv filters by
+ *  suite/test-name substring (see tests/unit/README.md).
  */
 
 #include "ut.h"
 
 UT_MAIN_IMPL;
 
-UT_DECLARE_SUITE(tccgen);
-
-int main(void)
+int main(int argc, char **argv)
 {
-  UT_RUN_SUITE(tccgen);
-  UT_REPORT_AND_EXIT();
+  return ut_run_all(argc, argv);
 }

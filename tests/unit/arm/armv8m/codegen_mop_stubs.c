@@ -22,6 +22,7 @@
 
 #define USING_GLOBALS
 #include "tcc.h"
+#include "arm-thumb-callsite.h"
 #include "codegen_mop_stubs.h"
 
 #define CGSTUB_MAX_CALLS 8192
@@ -501,6 +502,19 @@ void tcc_gen_machine_select_mop(MachineOperand then_val, MachineOperand else_val
   cgstub_record_ex("select_mop", (TccIrOp)-1, dest, then_val, else_val, cond_code, 0);
 }
 
+int tcc_gen_machine_can_predicate_alu(MachineOperand src1, MachineOperand src2,
+                                      MachineOperand dest, TccIrOp op)
+{
+  (void)src1; (void)src2; (void)dest; (void)op;
+  return 0;
+}
+
+void tcc_gen_machine_predicated_alu_mop(MachineOperand src1, MachineOperand src2,
+                                        MachineOperand dest, TccIrOp op, int cond_code)
+{
+  cgstub_record_ex("predicated_alu_mop", op, dest, src1, src2, cond_code, 0);
+}
+
 /* ============================================================================
  * Calls / parameters / return
  * ============================================================================ */
@@ -527,7 +541,8 @@ void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op)
  * stack area. Good enough for the pre-scan's stack-size estimate and for
  * Phase 4's call-family dispatch tests; not a full ABI classifier. */
 int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint,
-                                    TCCAbiCallLayout *layout, IROperand **out_args, MachineOperand **out_mops)
+                                    TCCAbiCallLayout *layout, ThumbIROperandSequence *out_args,
+                                    ThumbMachineOperandSequence *out_mops)
 {
   (void)ir;
   (void)call_idx;

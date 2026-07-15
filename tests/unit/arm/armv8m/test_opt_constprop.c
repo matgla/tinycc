@@ -54,6 +54,7 @@ int tcc_ir_opt_global_init_prop(TCCIRState *ir);
 int tcc_ir_opt_symref_const_prop(TCCIRState *ir);
 int tcc_ir_opt_complex_const_param_fold(TCCIRState *ir);
 int tcc_ir_opt_value_tracking(TCCIRState *ir);
+int tcc_ir_opt_self_arith_fold(TCCIRState *ir);
 
 #define I32 IROP_BTYPE_INT32
 #define I64 IROP_BTYPE_INT64
@@ -1346,78 +1347,406 @@ UT_TEST(test_valuetracking_unknown_call_no_fold)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_constprop)
+/* ---- 64-bit two-arg runtime-helper call builder (divmod / shift folders) ----
+ * Emits `T0(i64) = name(v0, v1)` at the current position and returns the call
+ * index.  `tok` is a synthetic token mapped to `name` for get_tok_str(). */
+static int utb_i64_helper_call(TCCIRState *ir, int tok, const char *name, IROperand v0, IROperand v1)
 {
-  UT_COVERS("const_var_prop");
-
-  UT_COVERS("const_prop_tmp");
-  UT_COVERS("global_init_prop");
-  UT_COVERS("symref_const_prop");
-  UT_COVERS("complex_const_param_fold");
-  UT_COVERS("value_tracking");
-
-  /* const_var_prop */
-  UT_RUN(test_constvarprop_imm_var_folds_into_use);
-  UT_RUN(test_constvarprop_load_of_const_var_becomes_assign);
-  UT_RUN(test_constvarprop_addrtaken_var_not_propagated);
-  UT_RUN(test_constvarprop_dead_lea_clears_addrtaken);
-  UT_RUN(test_constvarprop_lea_dest_addrtaken_keeps_source_addrtaken);
-  UT_RUN(test_constvarprop_store_lval_dest_keeps_lea_live);
-  UT_RUN(test_constvarprop_multiply_defined_not_propagated);
-  UT_RUN(test_constvarprop_nonconst_source_not_propagated);
-  UT_RUN(test_constvarprop_idempotent);
-  UT_RUN(test_constvarprop_large_imm_single_use);
-  UT_RUN(test_constvarprop_stackoff_source_not_propagated);
-
-  /* const_prop_tmp */
-  UT_RUN(test_constproptmp_i64_to_i32_assign_truncates_fact);
-  UT_RUN(test_constproptmp_ijump_keeps_register_operand);
-  UT_RUN(test_constproptmp_switch_table_const_index_to_case_jump);
-  UT_RUN(test_constproptmp_switch_table_const_index_to_default_jump);
-
-  /* global_init_prop */
-  UT_RUN(test_globalinitprop_null_ir);
-  UT_RUN(test_globalinitprop_empty);
-  UT_RUN(test_globalinitprop_non_sym_operand_no_fold);
-  UT_RUN(test_globalinitprop_non_lval_symref_no_fold);
-  UT_RUN(test_globalinitprop_weak_sym_guard);
-  UT_RUN(test_globalinitprop_volatile_guard);
-  UT_RUN(test_globalinitprop_nonstatic_nonconst_guard);
-  UT_RUN(test_globalinitprop_nonconst_static_records_late_reopt);
-  UT_RUN(test_globalinitprop_const_reaches_elfsym_no_section);
-
-  /* symref_const_prop */
-  UT_RUN(test_symrefconstprop_null_ir);
-  UT_RUN(test_symrefconstprop_no_tmp_dest);
-  UT_RUN(test_symrefconstprop_propagates_into_use);
-  UT_RUN(test_symrefconstprop_preserves_addend_and_lval);
-  UT_RUN(test_symrefconstprop_lval_source_not_tracked);
-  UT_RUN(test_symrefconstprop_redef_invalidates);
-  UT_RUN(test_symrefconstprop_assign_redef_invalidates);
-  UT_RUN(test_symrefconstprop_block_boundary_clears);
-  UT_RUN(test_symrefconstprop_idempotent);
-
-  /* complex_const_param_fold */
-  UT_RUN(test_cplxparamfold_packs_and_nops_stores);
-  UT_RUN(test_cplxparamfold_non_complex_param_no_fold);
-  UT_RUN(test_cplxparamfold_missing_component_no_fold);
-  UT_RUN(test_cplxparamfold_extra_slot_reference_no_fold);
-  UT_RUN(test_cplxparamfold_nonconst_store_no_fold);
-
-  /* value_tracking */
-  UT_RUN(test_valuetracking_empty);
-  UT_RUN(test_valuetracking_load_of_const_var_folds);
-  UT_RUN(test_valuetracking_arith_const_fold);
-  UT_RUN(test_valuetracking_shl_const_fold);
-  UT_RUN(test_valuetracking_cmp_jumpif_always_taken);
-  UT_RUN(test_valuetracking_cmp_jumpif_never_taken);
-  UT_RUN(test_valuetracking_cmp_setif_fold);
-  UT_RUN(test_valuetracking_addrtaken_not_tracked);
-  UT_RUN(test_valuetracking_merge_point_clears);
-  UT_RUN(test_valuetracking_cfg_multidef_direct_assign_not_tracked);
-  UT_RUN(test_valuetracking_lcmp_const_fold);
-  UT_RUN(test_valuetracking_ulcmp_const_fold);
-  UT_RUN(test_valuetracking_unknown_call_no_fold);
+  static Sym cs;
+  cs.v = tok;
+  utb_set_tok_str(tok, name);
+  uint32_t sidx = tcc_ir_pool_add_symref(ir, &cs, 0, 0);
+  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  const int call_id = 1;
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, v0, utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, v1, utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 1), I32));
+  return utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I64), callee,
+                  utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 2), I32));
 }
+
+/* Build a 64-bit immediate operand (imm32 carrier when it fits, else i64 pool). */
+static IROperand utb_i64op(TCCIRState *ir, int64_t v)
+{
+  if (v == (int32_t)v)
+    return irop_make_imm32(0, (int32_t)v, IROP_BTYPE_INT64);
+  return irop_make_i64(0, tcc_ir_pool_add_i64(ir, v), IROP_BTYPE_INT64);
+}
+
+/* POSITIVE (call fold, __aeabi_ldivmod): signed 64-bit division of two constant
+ * operands folds to the truncated-toward-zero quotient.  Oracle: -100 / 7 = -14. */
+UT_TEST(test_valuetracking_ldivmod_const_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 40, "__aeabi_ldivmod", utb_i64op(ir, -100), utb_i64op(ir, 7));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, icall)), (int64_t)-100 / 7);
+  utb_set_tok_str(40, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (call fold, __aeabi_uldivmod): the SAME operands under unsigned
+ * semantics give a very different quotient — proves the signedness split.
+ * Oracle: (uint64_t)-1 / 2 = 0x7FFFFFFFFFFFFFFF. */
+UT_TEST(test_valuetracking_uldivmod_unsigned_semantics)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 41, "__aeabi_uldivmod", utb_i64op(ir, -1), utb_i64op(ir, 2));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, icall)), (int64_t)((uint64_t)-1 / 2));
+  utb_set_tok_str(41, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (call fold, __aeabi_lmod): signed 64-bit modulo folds; the remainder
+ * takes the sign of the dividend.  Oracle: -17 % 5 = -2. */
+UT_TEST(test_valuetracking_lmod_const_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 42, "__aeabi_lmod", utb_i64op(ir, -17), utb_i64op(ir, 5));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, icall)), (int64_t)-17 % 5);
+  utb_set_tok_str(42, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (call fold, __aeabi_ulmod): unsigned 64-bit modulo of the same
+ * operands differs from the signed result — proves the unsigned modulo path.
+ * Oracle: (uint64_t)-1 % 10 = 5, whereas signed -1 % 10 = -1. */
+UT_TEST(test_valuetracking_ulmod_unsigned_semantics)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 43, "__aeabi_ulmod", utb_i64op(ir, -1), utb_i64op(ir, 10));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, icall)), (int64_t)((uint64_t)-1 % 10));
+  UT_ASSERT_NE(irop_get_imm64_ex(ir, utb_src1(ir, icall)), (int64_t)-1 % 10);
+  utb_set_tok_str(43, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (divmod by zero not folded): a zero divisor leaves the runtime call
+ * intact (the folder must not evaluate a host divide-by-zero). */
+UT_TEST(test_valuetracking_lmod_div_by_zero_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 44, "__aeabi_lmod", utb_i64op(ir, 5), utb_i64op(ir, 0));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_FUNCCALLVAL);
+  utb_set_tok_str(44, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (INT64_MIN %/÷ -1 not folded): signed overflow is C UB and would trap
+ * the host divide, so the folder leaves the runtime call in place. */
+UT_TEST(test_valuetracking_lmod_int64min_neg1_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 45, "__aeabi_lmod", utb_i64op(ir, INT64_MIN), utb_i64op(ir, -1));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_FUNCCALLVAL);
+  utb_set_tok_str(45, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (call fold, __aeabi_llsr with constant shift amount): a 64-bit
+ * logical right shift whose SHIFT is a known constant but whose value operand
+ * is not is lowered from a runtime call to a native IR SHR (#amount). */
+UT_TEST(test_valuetracking_llsr_lowers_to_ir_shift)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  /* value operand = a live VAR (unknown), shift amount = const 4 */
+  int icall = utb_i64_helper_call(ir, 46, "__aeabi_llsr", utb_var(0, I64), utb_i64op(ir, 4));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_SHR);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src2(ir, icall)), 4);
+  utb_set_tok_str(46, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (call fold, __bswapsi2): a 32-bit byte swap of a constant folds to
+ * the reversed-byte constant.  Oracle computed independently. */
+UT_TEST(test_valuetracking_bswapsi2_const_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  const int call_id = 1;
+  static Sym cs;
+  cs.v = 47;
+  utb_set_tok_str(47, "__bswapsi2");
+  uint32_t sidx = tcc_ir_pool_add_symref(ir, &cs, 0, 0);
+  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(0x11223344, I32),
+           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
+  int icall = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
+                       utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 1), I32));
+
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, icall)), 0x44332211);
+  utb_set_tok_str(47, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* ========================================================== self_arith_fold
+ *
+ * tcc_ir_opt_self_arith_fold rewrites x/x -> 1 and x%x -> 0 when both operands
+ * provably read the same non-volatile, non-FP global value (`is_sym && is_lval`
+ * symref, same sym + addend).  Safe because x/x is UB when x==0, so the compiler
+ * may assume x!=0.  These drive the fold and each safety gate directly. */
+
+/* Build the `Vdest <- Sref OP Sref` triple and return the instruction index. */
+static int utb_self_arith(TCCIRState *ir, TccIrOp op, Sym *sym, int32_t addend, int is_lval, int btype)
+{
+  IROperand a = utb_gsymref(ir, sym, addend, is_lval, /*is_const*/ 1, btype);
+  IROperand b = utb_gsymref(ir, sym, addend, is_lval, /*is_const*/ 1, btype);
+  return utb_emit(ir, op, utb_temp(0, I32), a, b);
+}
+
+/* PATH: signed x/x on a plain int global folds to ASSIGN #1, src2 cleared. */
+UT_TEST(test_selfarith_div_same_global_folds_to_one)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  int idiv = utb_self_arith(ir, TCCIR_OP_DIV, &gsym, 0, /*is_lval*/ 1, I32);
+  int changes = tcc_ir_opt_self_arith_fold(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, idiv)), 1);
+  UT_ASSERT_EQ(irop_get_tag(utb_src2(ir, idiv)), IROP_TAG_NONE);
+  utb_free(ir);
+  return 0;
+}
+
+/* PATH: unsigned x/x also folds to 1. */
+UT_TEST(test_selfarith_udiv_same_global_folds_to_one)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  int idiv = utb_self_arith(ir, TCCIR_OP_UDIV, &gsym, 0, /*is_lval*/ 1, I32);
+  UT_ASSERT(tcc_ir_opt_self_arith_fold(ir) > 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, idiv)), 1);
+  utb_free(ir);
+  return 0;
+}
+
+/* PATH: signed x%x folds to ASSIGN #0. */
+UT_TEST(test_selfarith_imod_same_global_folds_to_zero)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  int imod = utb_self_arith(ir, TCCIR_OP_IMOD, &gsym, 0, /*is_lval*/ 1, I32);
+  UT_ASSERT(tcc_ir_opt_self_arith_fold(ir) > 0);
+  UT_ASSERT_EQ(utb_op(ir, imod), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, imod)), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* PATH: unsigned x%x folds to 0. */
+UT_TEST(test_selfarith_umod_same_global_folds_to_zero)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  int imod = utb_self_arith(ir, TCCIR_OP_UMOD, &gsym, 0, /*is_lval*/ 1, I32);
+  UT_ASSERT(tcc_ir_opt_self_arith_fold(ir) > 0);
+  UT_ASSERT_EQ(utb_op(ir, imod), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, imod)), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (volatile): a volatile global must re-read memory each access, so x/x is
+ * not foldable. */
+UT_TEST(test_selfarith_volatile_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT | VT_VOLATILE;
+  gsym.type.ref = NULL;
+  int idiv = utb_self_arith(ir, TCCIR_OP_DIV, &gsym, 0, /*is_lval*/ 1, I32);
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (FP): a float global is excluded (x/x==1.0 is exact, but NaN/inf make the
+ * integer identity unsound and the fold emits an integer immediate). */
+UT_TEST(test_selfarith_float_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_FLOAT;
+  gsym.type.ref = NULL;
+  int idiv = utb_self_arith(ir, TCCIR_OP_DIV, &gsym, 0, /*is_lval*/ 1, I32);
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (distinct symbols): x/y with two different globals is not a self-divide. */
+UT_TEST(test_selfarith_distinct_syms_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym_a, gsym_b;
+  gsym_a.a = (struct SymAttr){0};
+  gsym_a.type.t = VT_INT;
+  gsym_a.type.ref = NULL;
+  gsym_b.a = (struct SymAttr){0};
+  gsym_b.type.t = VT_INT;
+  gsym_b.type.ref = NULL;
+  IROperand a = utb_gsymref(ir, &gsym_a, 0, /*is_lval*/ 1, /*is_const*/ 1, I32);
+  IROperand b = utb_gsymref(ir, &gsym_b, 0, /*is_lval*/ 1, /*is_const*/ 1, I32);
+  int idiv = utb_emit(ir, TCCIR_OP_DIV, utb_temp(0, I32), a, b);
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (addend): same symbol at different addends reads different bytes. */
+UT_TEST(test_selfarith_distinct_addend_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  IROperand a = utb_gsymref(ir, &gsym, 0, /*is_lval*/ 1, /*is_const*/ 1, I32);
+  IROperand b = utb_gsymref(ir, &gsym, 4, /*is_lval*/ 1, /*is_const*/ 1, I32);
+  int idiv = utb_emit(ir, TCCIR_OP_DIV, utb_temp(0, I32), a, b);
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+/* PATH (same register): `t / t` on the same vreg folds to 1 — both operands are
+ * read at the one quad, so they are the identical value. */
+UT_TEST(test_selfarith_same_vreg_div_folds_to_one)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  int idiv = utb_emit(ir, TCCIR_OP_DIV, utb_temp(0, I32), utb_temp(1, I32), utb_temp(1, I32));
+  UT_ASSERT(tcc_ir_opt_self_arith_fold(ir) > 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, idiv)), 1);
+  UT_ASSERT_EQ(irop_get_tag(utb_src2(ir, idiv)), IROP_TAG_NONE);
+  utb_free(ir);
+  return 0;
+}
+
+/* PATH (same register): `t % t` folds to 0. */
+UT_TEST(test_selfarith_same_vreg_mod_folds_to_zero)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  int imod = utb_emit(ir, TCCIR_OP_UMOD, utb_temp(0, I32), utb_var(2, I32), utb_var(2, I32));
+  UT_ASSERT(tcc_ir_opt_self_arith_fold(ir) > 0);
+  UT_ASSERT_EQ(utb_op(ir, imod), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, imod)), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (distinct registers): `a / b` on different vregs is not a self-divide. */
+UT_TEST(test_selfarith_distinct_vreg_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  int idiv = utb_emit(ir, TCCIR_OP_DIV, utb_temp(0, I32), utb_temp(1, I32), utb_temp(2, I32));
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (non-lval): an address-by-value symref (not a deref) is not the value x;
+ * `&g / &g` is a constant-address divide, not a self-value divide. */
+UT_TEST(test_selfarith_non_lval_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  int idiv = utb_self_arith(ir, TCCIR_OP_DIV, &gsym, 0, /*is_lval*/ 0, I32);
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+UT_COVERS("const_var_prop");
+UT_COVERS("const_prop_tmp");
+UT_COVERS("global_init_prop");
+UT_COVERS("symref_const_prop");
+UT_COVERS("complex_const_param_fold");
+UT_COVERS("value_tracking");

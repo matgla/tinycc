@@ -1,7 +1,7 @@
 /*
  *  test_opt_fusion.c - suite for the Phase 3 fusion family (docs/plan_ut_next_steps.md
  *  Phase 3): bool_simplify, fusion_mla, deref_indexed, disp_fusion, chain_fold,
- *  pair_reorder (ir/opt_gens_bool.c, ir/opt_gens_fusion.c, driven through their
+ *  pair_reorder (source/opt/flat/scalar/bool.c, ir/opt_gens_fusion.c, driven through their
  *  non-static `_ex(IROptCtx*)` pipeline adapters in ir/opt_pipeline.c).
  *
  *  Each `_ex` adapter is a thin, non-static wrapper around
@@ -172,6 +172,98 @@ UT_TEST(test_bool_simplify_and_distinct_kept)
 
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, op), TCCIR_OP_BOOL_AND);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: `a || a` is idempotent -> ASSIGN a (the BOOL_OR gen path). */
+UT_TEST(test_bool_simplify_or_self_folds_to_assign)
+{
+  TCCIRState *ir = utb_gens_new(3);
+
+  int op = utb_emit(ir, TCCIR_OP_BOOL_OR, utb_temp(2, I32), utb_temp(0, I32), utb_temp(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_bool_ex);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, op), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, op)), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: `a && 1` -> ASSIGN a (AND neutral element). */
+UT_TEST(test_bool_simplify_and_one_folds_to_assign)
+{
+  TCCIRState *ir = utb_gens_new(3);
+
+  int op = utb_emit(ir, TCCIR_OP_BOOL_AND, utb_temp(2, I32), utb_temp(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_bool_ex);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, op), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, op)), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: `a || 0` -> ASSIGN a (OR neutral element). */
+UT_TEST(test_bool_simplify_or_zero_folds_to_assign)
+{
+  TCCIRState *ir = utb_gens_new(3);
+
+  int op = utb_emit(ir, TCCIR_OP_BOOL_OR, utb_temp(2, I32), utb_temp(0, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_bool_ex);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, op), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, op)), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: `a && 0` -> ASSIGN 0 (AND annihilator; operands are boolean 0/1). */
+UT_TEST(test_bool_simplify_and_zero_folds_to_zero)
+{
+  TCCIRState *ir = utb_gens_new(3);
+
+  int op = utb_emit(ir, TCCIR_OP_BOOL_AND, utb_temp(2, I32), utb_temp(0, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_bool_ex);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, op), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(irop_is_immediate(utb_src1(ir, op)), 1);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, op)), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: `a || 1` -> ASSIGN 1 (OR annihilator). */
+UT_TEST(test_bool_simplify_or_one_folds_to_one)
+{
+  TCCIRState *ir = utb_gens_new(3);
+
+  int op = utb_emit(ir, TCCIR_OP_BOOL_OR, utb_temp(2, I32), utb_temp(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_bool_ex);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, op), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(irop_is_immediate(utb_src1(ir, op)), 1);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, op)), 1);
 
   utb_free(ir);
   return 0;
@@ -585,6 +677,85 @@ UT_TEST(test_disp_fusion_out_of_range_offset_kept)
   return 0;
 }
 
+/* POSITIVE: a SUB-immediate address (`*(p - 3)`) folds into a negative indexed
+ * displacement LOAD_INDEXED[base, #-imm] instead of leaving a separate SUB. */
+UT_TEST(test_disp_fusion_sub_offset_folds_negative)
+{
+  TCCIRState *ir = utb_gens_new(3);
+  tcc_state->opt_disp_fusion = 1;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1000, I32), UTB_NONE);
+  int sub = utb_emit(ir, TCCIR_OP_SUB, utb_temp(1, I32), utb_temp(0, I32), utb_imm(12, I32));
+  int load = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(2, I32), utb_deref_temp(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_disp_ex);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, sub), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, load), TCCIR_OP_LOAD_INDEXED);
+  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, load)), 0);                /* base = T0 */
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src2(ir, load)), -12); /* negated SUB imm */
+
+  tcc_state->opt_disp_fusion = 0;
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: STORE through `base + #imm` folds into STORE_INDEXED[base, #imm],
+ * carrying the stored value across into the new value slot and NOPing the ADD. */
+UT_TEST(test_disp_fusion_store_const_offset_folds)
+{
+  TCCIRState *ir = utb_gens_new(3);
+  tcc_state->opt_disp_fusion = 1;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1000, I32), UTB_NONE);
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(8, I32));
+  int store = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(1, I32), utb_temp(2, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_disp_ex);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE_INDEXED);
+  IROperand base_op = ir->iroperand_pool[ir->compact_instructions[store].operand_base + 0];
+  IROperand val_op = ir->iroperand_pool[ir->compact_instructions[store].operand_base + 1];
+  IROperand idx_op = ir->iroperand_pool[ir->compact_instructions[store].operand_base + 2];
+  UT_ASSERT_EQ(utb_vreg_pos(base_op), 0);                  /* base = T0 */
+  UT_ASSERT_EQ(utb_vreg_pos(val_op), 2);                   /* stored value = T2 */
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, idx_op), 8);
+
+  tcc_state->opt_disp_fusion = 0;
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: an ASSIGN whose source is an lval deref of `base + #imm` is treated
+ * as a load and folds to LOAD_INDEXED[base, #imm], NOPing the ADD. */
+UT_TEST(test_disp_fusion_assign_load_const_offset_folds)
+{
+  TCCIRState *ir = utb_gens_new(3);
+  tcc_state->opt_disp_fusion = 1;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1000, I32), UTB_NONE);
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(8, I32));
+  int assign = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_deref_temp(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_disp_ex);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, assign), TCCIR_OP_LOAD_INDEXED);
+  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, assign)), 0); /* base = T0 */
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src2(ir, assign)), 8);
+
+  tcc_state->opt_disp_fusion = 0;
+  utb_free(ir);
+  return 0;
+}
+
 /* ================================================================== chain_fold */
 
 /* POSITIVE: LOAD_INDEXED[base, #imm2] whose base resolves to `new_base + #imm1`
@@ -657,6 +828,76 @@ UT_TEST(test_chain_fold_merges_chained_add_into_store_indexed_offset)
   UT_ASSERT_EQ(utb_vreg_pos(new_base), 0);                          /* base = T0 */
   UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, new_index), 12);          /* 4+8 */
   UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, store)), 2);               /* value operand untouched */
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): the ADD base feeds two indexed accesses -- folding it into
+ * one displacement would strand the other use, so ir_opt_du_uses(base) != 1
+ * blocks the merge and the ADD is kept. */
+UT_TEST(test_chain_fold_multi_use_base_kept)
+{
+  TCCIRState *ir = utb_gens_new(4);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1000, I32), UTB_NONE);
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(4, I32));
+  int load1 = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(2, I32), utb_temp(1, I32), utb_imm(8, I32),
+                        utb_imm(0, I32));
+  utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(3, I32), utb_temp(1, I32), utb_imm(12, I32),
+            utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_chain_ex);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, load1)), 1); /* base still T1 */
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: a SUB producer folds too -- base = new_base - #imm1 merges into
+ * LOAD_INDEXED[new_base, #(imm2 - imm1)] (the SUB immediate is negated). */
+UT_TEST(test_chain_fold_sub_producer_folds_negated)
+{
+  TCCIRState *ir = utb_gens_new(3);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1000, I32), UTB_NONE);
+  int sub = utb_emit(ir, TCCIR_OP_SUB, utb_temp(1, I32), utb_temp(0, I32), utb_imm(4, I32));
+  int load = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(2, I32), utb_temp(1, I32), utb_imm(8, I32),
+                       utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_chain_ex);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, sub), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, load)), 0);              /* base = T0 */
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src2(ir, load)), 4); /* 8 + (-4) */
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): the base is defined by a producer that is neither ADD nor
+ * SUB (here MUL), so the `base +/- K` shape doesn't hold and the access is kept. */
+UT_TEST(test_chain_fold_non_add_sub_producer_kept)
+{
+  TCCIRState *ir = utb_gens_new(3);
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1000, I32), UTB_NONE);
+  int mul = utb_emit(ir, TCCIR_OP_MUL, utb_temp(1, I32), utb_temp(0, I32), utb_imm(4, I32));
+  int load = utb_emit4(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(2, I32), utb_temp(1, I32), utb_imm(8, I32),
+                       utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_chain_ex);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, mul), TCCIR_OP_MUL);
+  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, load)), 1); /* base still T1 */
 
   utb_free(ir);
   return 0;
@@ -769,6 +1010,33 @@ UT_TEST(test_pair_reorder_raw_hazard_blocks_swap)
   UT_ASSERT_EQ(utb_op(ir, mid), TCCIR_OP_ASSIGN);
   UT_ASSERT_EQ(utb_op(ir, load2), TCCIR_OP_LOAD_INDEXED);
   UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, mid)), 2); /* order/content unchanged */
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (correctness guard): the intervening non-lval ASSIGN *defines* the
+ * second store's value operand (T2). Hoisting store2 above it would store an
+ * undefined T2 -- a RAW hazard on the store's data input. The conflict check
+ * keys on the stored value being *produced* by an instruction in the range,
+ * distinct from the load case where the hazard is on the loaded *result*. */
+UT_TEST(test_pair_reorder_store_value_raw_hazard_blocks_swap)
+{
+  TCCIRState *ir = utb_gens_new(6);
+
+  int store1 = utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(0, I32), utb_temp(1, I32), utb_imm(0, I32),
+                          utb_imm(0, I32));
+  int mid = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(7, I32), UTB_NONE);
+  int store2 = utb_emit4(ir, TCCIR_OP_STORE_INDEXED, utb_temp(0, I32), utb_temp(2, I32), utb_imm(4, I32),
+                          utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = run_ctx_pass(ir, tcc_ir_opt_gens_pair_reorder_ex);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, store1), TCCIR_OP_STORE_INDEXED);
+  UT_ASSERT_EQ(utb_op(ir, mid), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, store2), TCCIR_OP_STORE_INDEXED);
 
   utb_free(ir);
   return 0;
@@ -1216,77 +1484,9 @@ UT_TEST(test_assign_fuse_call_producer_kept)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_fusion)
-{
-  UT_COVERS("bool_simplify");
-  UT_COVERS("fusion_mla");
-  UT_COVERS("deref_indexed");
-  UT_COVERS("disp_fusion");
-  UT_COVERS("chain_fold");
-  UT_COVERS("pair_reorder");
-
-  UT_RUN(test_bool_simplify_and_self_folds_to_assign);
-  UT_RUN(test_bool_simplify_and_distinct_kept);
-
-  UT_RUN(test_fusion_mla_rotate_pattern_collapses_to_ror);
-  UT_RUN(test_fusion_mla_non_rotate_shift_sum_kept);
-
-  UT_RUN(test_fusion_mla_mul_add_src2_folds_to_mla);
-  UT_RUN(test_fusion_mla_mul_add_src1_folds_to_mla);
-  UT_RUN(test_fusion_mla_duplicate_mul_blocks_fusion);
-  UT_RUN(test_fusion_mla_disabled_flag_keeps_mul_and_add);
-
-  UT_RUN(test_fusion_indexed_load_unscaled_register_index_folds);
-  UT_RUN(test_fusion_indexed_store_unscaled_register_index_folds);
-  UT_RUN(test_fusion_indexed_load_scaled_index_folds);
-  UT_RUN(test_fusion_indexed_load_const_operand_kept_for_disp_fusion);
-  UT_RUN(test_fusion_indexed_load_var_base_kept);
-
-  UT_RUN(test_deref_indexed_scaled_add_folds_to_load_indexed);
-  UT_RUN(test_deref_indexed_disabled_flag_keeps_deref);
-
-  UT_RUN(test_disp_fusion_load_const_offset_folds);
-  UT_RUN(test_disp_fusion_out_of_range_offset_kept);
-
-  UT_RUN(test_chain_fold_merges_chained_add_into_indexed_offset);
-  UT_RUN(test_chain_fold_out_of_range_total_kept);
-  UT_RUN(test_chain_fold_merges_chained_add_into_store_indexed_offset);
-
-  UT_RUN(test_pair_reorder_adjacent_indexed_loads_move_together);
-  UT_RUN(test_pair_reorder_non_adjacent_offsets_kept);
-  UT_RUN(test_pair_reorder_adjacent_indexed_stores_move_together);
-  UT_RUN(test_pair_reorder_raw_hazard_blocks_swap);
-
-  /* The rest of ir/opt_fusion.c's bare-entry passes below are NOT registered
-   * in ir/opt_pipeline.c's PASS/PASS_GATED tables (they're called directly,
-   * unconditionally-per-flag, from tccgen.c) -- so there is no registered
-   * pass name for check_pass_coverage.py to key a UT_COVERS(...) marker on.
-   * See the file-header comment and docs/plan_ut_next_steps.md S1. */
-
-  UT_RUN(test_add_deref_fold_param_base_folds_to_load_indexed);
-  UT_RUN(test_add_deref_fold_peep_through_assign_from_param);
-  UT_RUN(test_add_deref_fold_non_param_base_kept);
-
-  UT_RUN(test_barrel_shift_fusion_shr_folds_into_sub);
-  UT_RUN(test_barrel_shift_fusion_multi_use_shift_kept);
-
-  UT_RUN(test_shift_pair_to_ubfx_folds_shl_shr_pair);
-  UT_RUN(test_shift_pair_to_ubfx_a_greater_than_b_kept);
-
-  UT_RUN(test_call_chain_rename_renames_call_to_paramval_pair);
-  UT_RUN(test_call_chain_rename_read_before_redef_kept);
-
-  UT_RUN(test_stackoff_addr_cse_hoists_repeated_offset);
-  UT_RUN(test_stackoff_addr_cse_single_use_kept);
-
-  UT_RUN(test_lea_fold_single_deref_use_folds_to_stackloc);
-  UT_RUN(test_lea_fold_multi_use_kept);
-
-  UT_RUN(test_lea_rmw_fold_load_add_store_folds_both_derefs);
-  UT_RUN(test_lea_rmw_fold_bitfield_or_writeback_kept);
-
-  UT_RUN(test_assign_fuse_producer_dest_absorbs_assign);
-  UT_RUN(test_assign_fuse_call_producer_kept);
-}
+UT_COVERS("bool_simplify");
+UT_COVERS("fusion_mla");
+UT_COVERS("deref_indexed");
+UT_COVERS("disp_fusion");
+UT_COVERS("chain_fold");
+UT_COVERS("pair_reorder");

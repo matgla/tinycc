@@ -7,8 +7,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_adr.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_adr.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -152,17 +152,4 @@ UT_TEST(test_adr_imm_variant_selection_t1_preferred)
    thumb_opcode op_neg = th_adr_imm(5, -12, ENFORCE_ENCODING_NONE);
    UT_ASSERT_EQ(op_neg.size, 4); /* T4 is selected for negative */
    return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_adr)
-{
-  UT_RUN(test_adr_imm_t1_low_reg_positive);
-  UT_RUN(test_adr_imm_t3_any_reg_positive);
-  UT_RUN(test_adr_imm_t4_negative);
-  UT_RUN(test_adr_imm_enforce_16bit_high_reg_fails);
-  UT_RUN(test_adr_imm_imm_zero);
-  UT_RUN(test_adr_imm_rd_low_reg_only);
-  UT_RUN(test_adr_imm_variant_selection_t1_preferred);
 }

@@ -502,24 +502,4 @@ UT_TEST(test_phi_simplify_congruent_protected_use_kept)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_phi)
-{
-  UT_COVERS("ssa:phi_simplify");
-  UT_RUN(test_phi_simplify_all_same);
-  UT_RUN(test_phi_simplify_self_ref);
-  UT_RUN(test_phi_simplify_non_trivial);
-  UT_RUN(test_phi_simplify_with_undef);
-  UT_RUN(test_phi_simplify_multiple_trivial);
-  UT_RUN(test_phi_simplify_no_uses);
-  UT_RUN(test_phi_simplify_two_phi_scc);
-  UT_RUN(test_phi_simplify_three_phi_scc_across_blocks);
-  UT_RUN(test_phi_simplify_scc_two_external_values_kept);
-  UT_RUN(test_phi_simplify_scc_incompatible_types_kept);
-  UT_RUN(test_phi_simplify_scc_without_external_value_kept);
-  UT_RUN(test_phi_simplify_scc_protected_use_is_atomic);
-  UT_RUN(test_phi_simplify_congruent_exact_merge);
-  UT_RUN(test_phi_simplify_congruent_diff_value_kept);
-  UT_RUN(test_phi_simplify_congruent_swapped_preds_kept);
-  UT_RUN(test_phi_simplify_congruent_type_mismatch_kept);
-  UT_RUN(test_phi_simplify_congruent_protected_use_kept);
-}
+UT_COVERS("ssa:phi_simplify");

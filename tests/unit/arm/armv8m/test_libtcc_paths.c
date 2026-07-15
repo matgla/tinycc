@@ -113,13 +113,3 @@ UT_TEST(test_set_lib_path_then_brace_b_token_substitutes_it)
   tcc_delete(s);
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(libtcc_paths)
-{
-  UT_RUN(test_add_include_path_grows_dynarray_and_stores_content);
-  UT_RUN(test_add_sysinclude_path_grows_its_own_dynarray);
-  UT_RUN(test_add_library_path_colon_joined_splits_into_three_entries);
-  UT_RUN(test_set_lib_path_then_brace_b_token_substitutes_it);
-}

@@ -291,15 +291,4 @@ UT_TEST(test_stack_plain_store_overwrite_intervening_load)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_dce_global)
-{
-  UT_COVERS("ssa:dce:global_store");
-  UT_RUN(test_global_overwrite_same_sym);
-  UT_RUN(test_global_overwrite_intervening_load_same);
-  UT_RUN(test_global_overwrite_read_other_sym);
-  UT_RUN(test_global_overwrite_call_clears);
-  UT_RUN(test_global_overwrite_unknown_ptr_alias);
-  UT_RUN(test_stack_plain_store_overwrite_same_offset);
-  UT_RUN(test_stack_plain_store_overwrite_byte);
-  UT_RUN(test_stack_plain_store_overwrite_intervening_load);
-}
+UT_COVERS("ssa:dce:global_store");

@@ -45,7 +45,7 @@
  *  chunk of the real linker fixture graph. Out of scope per task instructions.
  */
 
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "tcc.h"
 
 #include "ut.h"
@@ -1093,60 +1093,4 @@ UT_TEST(test_relocate_thm_alu_prel_11_0_forward)
    * directly (no negate). */
   UT_ASSERT_EQ(decoded, (int)(0x80 - 4));
   return 0;
-}
-
-UT_SUITE(arm_link)
-{
-  UT_RUN(test_code_reloc_data_relocations);
-  UT_RUN(test_code_reloc_code_relocations);
-  UT_RUN(test_code_reloc_unknown_relocations);
-
-  UT_RUN(test_gotplt_entry_type_no_entry);
-  UT_RUN(test_gotplt_entry_type_auto_entry);
-  UT_RUN(test_gotplt_entry_type_build_got_only);
-  UT_RUN(test_gotplt_entry_type_always_entry);
-  UT_RUN(test_gotplt_entry_type_unknown);
-
-  UT_RUN(test_write_thumb_instruction_16bit);
-  UT_RUN(test_write_thumb_instruction_32bit);
-  UT_RUN(test_write_thumb_instruction_invalid_size_is_noop);
-  UT_RUN(test_write_thumb_instruction_zero_size_is_noop);
-
-  UT_RUN(test_relocate_pc24_forward_arm_call);
-  UT_RUN(test_relocate_pc24_out_of_range_reports_error);
-
-  UT_RUN(test_relocate_movw_abs_nc_uses_add32le);
-  UT_RUN(test_relocate_movt_abs_shifts_value_right_16);
-  UT_RUN(test_relocate_thm_movw_abs_nc_or_merges_into_existing_bits);
-  UT_RUN(test_relocate_thm_movt_abs_or_merges_into_existing_bits);
-  UT_RUN(test_relocate_movw_prel_nc_roundtrip_zero_addend);
-
-  UT_RUN(test_relocate_abs32_non_dyn_adds_value);
-  UT_RUN(test_relocate_rel32_subtracts_addr);
-
-  UT_RUN(test_relocate_gotpc);
-  UT_RUN(test_relocate_gotoff);
-  UT_RUN(test_relocate_rodata_off);
-  UT_RUN(test_relocate_got32_writes_sym_got_offset);
-  UT_RUN(test_relocate_got_prel_writes_pc_relative_got_offset);
-
-  UT_RUN(test_relocate_copy_is_noop);
-  UT_RUN(test_relocate_none_is_noop);
-  UT_RUN(test_relocate_relative_is_noop_without_pe);
-  UT_RUN(test_relocate_glob_dat_and_jump_slot_store_val_directly);
-  UT_RUN(test_relocate_v4bx_rewrites_bx_to_mov_pc);
-  UT_RUN(test_relocate_v4bx_leaves_non_bx_instruction_alone);
-  UT_RUN(test_relocate_prel31_adds_offset_preserves_top_bit);
-
-  UT_RUN(test_relocate_thm_jump6_forward_branch);
-  UT_RUN(test_relocate_thm_jump6_negative_offset_forces_nop);
-  UT_RUN(test_relocate_thm_jump6_weak_undef_is_skipped);
-  UT_RUN(test_relocate_thm_jump19_forward_branch);
-  UT_RUN(test_relocate_thm_jump19_out_of_range_reports_error);
-  UT_RUN(test_relocate_thm_pc22_call_forward);
-  UT_RUN(test_relocate_thm_jump24_sets_blx_bit);
-  UT_RUN(test_relocate_thm_pc22_weak_undef_is_skipped);
-  UT_RUN(test_relocate_thm_pc12_forward);
-  UT_RUN(test_relocate_thm_pc8_backward_sets_subtract_bit);
-  UT_RUN(test_relocate_thm_alu_prel_11_0_forward);
 }

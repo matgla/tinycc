@@ -693,28 +693,4 @@ UT_TEST(test_cmp_fuse_lone_cmp_no_crash)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_cmp_fuse)
-{
-  UT_COVERS("cmp_field_fuse");
-  UT_RUN(test_cmp_fuse_two_field_units_fuse);
-  UT_RUN(test_cmp_fuse_lval_base_blocks_fusion);
-  UT_RUN(test_cmp_fuse_asymmetric_mask_no_fuse);
-  UT_RUN(test_cmp_fuse_single_unit_no_fuse);
-  UT_RUN(test_cmp_fuse_non_ne_condition_no_fuse);
-  UT_RUN(test_cmp_fuse_three_fields_union_mask);
-  UT_RUN(test_cmp_fuse_width_one_field);
-  UT_RUN(test_cmp_fuse_width_thirty_one_field);
-  UT_RUN(test_cmp_fuse_full_mask_omits_and);
-  UT_RUN(test_cmp_fuse_offset_zero_lsb);
-  UT_RUN(test_cmp_fuse_out_of_range_shift_no_fuse);
-  UT_RUN(test_cmp_fuse_base_mismatch_no_fuse);
-  UT_RUN(test_cmp_fuse_lval_base_fuses);
-  UT_RUN(test_cmp_fuse_distant_def_fuses);
-  UT_RUN(test_cmp_fuse_unsigned_operands_fuse);
-  UT_RUN(test_cmp_fuse_lt_condition_no_fuse);
-  UT_RUN(test_cmp_fuse_idempotent);
-  UT_RUN(test_cmp_fuse_empty_ir_no_crash);
-  UT_RUN(test_cmp_fuse_lone_cmp_no_crash);
-}
+UT_COVERS("cmp_field_fuse");

@@ -1,5 +1,5 @@
 /*
- *  test_opt_setif_or_taut.c - suite for ir/opt_setif_or_taut.c
+ *  test_opt_setif_or_taut.c - suite for source/opt/flat/scalar/setif_or_taut.c
  *                             (SETIF OR-chain tautology fold)
  *
  *  tcc_ir_opt_setif_or_tautology recognizes bitwise-OR chains over CMP+SETIF
@@ -563,30 +563,4 @@ UT_TEST(test_setif_or_pass_is_idempotent)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_setif_or_taut)
-{
-  UT_COVERS("setif_or_tautology");
-  UT_RUN(test_setif_or_lt_ge_covers_all_folds_to_one);
-  UT_RUN(test_setif_or_eq_ne_covers_all_folds_to_one);
-  UT_RUN(test_setif_or_lt_eq_partial_no_fold);
-  UT_RUN(test_setif_or_different_operands_no_fold);
-  UT_RUN(test_setif_or_setif_without_cmp_no_fold);
-  UT_RUN(test_setif_or_tautology_fold_value_is_independently_one);
-  UT_RUN(test_setif_or_unsigned_ult_uge_covers_all_folds);
-  UT_RUN(test_setif_or_unsigned_ule_ugt_covers_all_folds);
-  UT_RUN(test_setif_or_signed_le_gt_covers_all_folds);
-  UT_RUN(test_setif_or_unsigned_ult_ugt_partial_no_fold);
-  UT_RUN(test_setif_or_lt_gt_partial_missing_eq_no_fold);
-  UT_RUN(test_setif_or_signed_unsigned_same_operands_do_not_mix);
-  UT_RUN(test_setif_or_different_immediate_operands_no_fold);
-  UT_RUN(test_setif_or_basic_block_boundary_resets_tracker);
-  UT_RUN(test_setif_or_operand_rewrite_invalidates_tracker);
-  UT_RUN(test_setif_or_three_way_chain_inherits_mask);
-  UT_RUN(test_setif_or_int64_tautology_folds_with_int64_immediate);
-  UT_RUN(test_setif_or_float_cmp_not_tracked);
-  UT_RUN(test_setif_or_unrecognized_condition_token_not_tracked);
-  UT_RUN(test_setif_or_or_dest_lval_no_fold);
-  UT_RUN(test_setif_or_pass_is_idempotent);
-}
+UT_COVERS("setif_or_tautology");

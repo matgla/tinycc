@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_DSL_PHI_H
-#define TCC_OPT_DSL_PHI_H
+#pragma once
 
 #include "ssa_opt.h"
 #include "opt_dsl_entry.h"
@@ -211,4 +210,3 @@ static inline int opt_dsl_run_phi_rules(IRSSAOptCtx *ctx,
 
 #define OPT_PHI_ENTRY(name) opt_dsl_dispatch_##name
 
-#endif /* TCC_OPT_DSL_PHI_H */

@@ -8,8 +8,7 @@
  *  License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_OPT_SSA_PHI_H
-#define TCC_OPT_SSA_PHI_H
+#pragma once
 
 struct IRSSAOptCtx;
 
@@ -26,4 +25,3 @@ struct IRSSAOptCtx;
  * Returns the number of phis eliminated. */
 int ssa_opt_phi_simplify(struct IRSSAOptCtx *ctx);
 
-#endif /* TCC_OPT_SSA_PHI_H */

@@ -13,7 +13,7 @@
 #include "ir/ssa.h"
 #include "ir/vreg.h"
 #include "ir/regalloc.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "ut.h"
 
 static SValue sv_var(int vreg)
@@ -208,15 +208,4 @@ UT_TEST(test_phi_dest_liveness)
 
   tcc_ir_free(ir);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(ra_phi)
-{
-  UT_RUN(test_phi_diamond_allocation);
-  UT_RUN(test_phi_copies_inserted);
-  UT_RUN(test_phi_dest_liveness);
 }

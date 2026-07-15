@@ -333,22 +333,4 @@ UT_TEST(test_var_to_tmp_redef_between_def_use_blocked)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_var_to_tmp)
-{
-  UT_COVERS("var_to_tmp");
-
-  UT_RUN(test_var_to_tmp_two_reloads_promoted);
-  UT_RUN(test_var_to_tmp_arith_def_promoted);
-  UT_RUN(test_var_to_tmp_funcparamval_promoted);
-  UT_RUN(test_var_to_tmp_multiple_defs_blocked);
-  UT_RUN(test_var_to_tmp_nonlval_use_blocked);
-  UT_RUN(test_var_to_tmp_src2_use_blocked);
-  UT_RUN(test_var_to_tmp_non_int32_blocked);
-  UT_RUN(test_var_to_tmp_interval_flags_blocked);
-  UT_RUN(test_var_to_tmp_store_def_blocked);
-  UT_RUN(test_var_to_tmp_use_across_jump_target_blocked);
-  UT_RUN(test_var_to_tmp_call_between_def_use_blocked);
-  UT_RUN(test_var_to_tmp_redef_between_def_use_blocked);
-}
+UT_COVERS("var_to_tmp");

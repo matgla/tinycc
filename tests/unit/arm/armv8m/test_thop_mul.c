@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_mul.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_mul.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -322,39 +322,4 @@ UT_TEST(test_sdiv_no_div_feature)
   UT_ASSERT_EQ(op.opcode, 0);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_mul)
-{
-  /* MUL T16 */
-  UT_RUN(test_mul_t16_rd0_rm0);
-  UT_RUN(test_mul_t16_rd5_rm5);
-
-  /* MUL T32 */
-  UT_RUN(test_mul_t32_low_regs);
-  UT_RUN(test_mul_t32_high_reg);
-
-  /* MUL wrapper auto-selection */
-  UT_RUN(test_mul_t16_auto_selection);
-  UT_RUN(test_mul_t32_auto_selection_high_reg);
-  UT_RUN(test_mul_t32_auto_selection_rd_ne_rm);
-  UT_RUN(test_mul_enforce_32bit_low_regs);
-
-  /* MLA/MLS */
-  UT_RUN(test_mla_basic);
-  UT_RUN(test_mls_basic);
-
-  /* Long multiply */
-  UT_RUN(test_umull_basic);
-  UT_RUN(test_umlal_basic);
-  UT_RUN(test_smull_basic);
-  UT_RUN(test_smlal_basic);
-
-  /* Divide */
-  UT_RUN(test_udiv_basic);
-  UT_RUN(test_udiv_no_div_feature);
-  UT_RUN(test_sdiv_basic);
-  UT_RUN(test_sdiv_no_div_feature);
 }

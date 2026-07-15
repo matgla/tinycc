@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_dsp.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_dsp.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -201,25 +201,4 @@ UT_TEST(test_pkhbt_no_dsp_fails)
   UT_ASSERT_EQ(op.opcode, 0);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_dsp)
-{
-  /* UADD8 / USUB8 / SEL */
-  UT_RUN(test_uadd8_basic);
-  UT_RUN(test_uadd8_high_regs);
-  UT_RUN(test_usub8_basic);
-  UT_RUN(test_sel_basic);
-
-  /* PKHBT */
-  UT_RUN(test_pkhbt_lsl_basic);
-  UT_RUN(test_pkhbt_lsl_imm0);
-  UT_RUN(test_pkhbt_asr_basic);
-  UT_RUN(test_pkhbt_lsl_max);
-
-  /* Feature mismatch */
-  UT_RUN(test_uadd8_no_dsp_fails);
-  UT_RUN(test_pkhbt_no_dsp_fails);
 }

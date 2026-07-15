@@ -11,13 +11,17 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "ssa.h"
+#include "memory/dynamic_bitset.h"
+#include "memory/vector.h"
 
-static inline int bitset_test(const uint8_t *bits, int pos)
+TCC_DYNAMIC_BITSET_DEFINE(SSABitset, 256)
+
+static inline int raw_bitset_test(const uint8_t *bits, int pos)
 {
   return bits[pos / 8] & (1 << (pos % 8));
 }
 
-static inline void bitset_set(uint8_t *bits, int pos)
+static inline void raw_bitset_set(uint8_t *bits, int pos)
 {
   bits[pos / 8] |= (1 << (pos % 8));
 }
@@ -44,8 +48,8 @@ static IRPhiNode *ssa_alloc_phi(int32_t orig_vreg, int32_t dest_vreg, int num_pr
 
 typedef struct {
   uint8_t *def_blocks;
-  uint8_t *addrtaken;
-  uint8_t *multi_block_def;
+  SSABitset *addrtaken;
+  SSABitset *multi_block_def;
   int *var_btype;
   int block_bitset_bytes;
   int num_vars;
@@ -54,7 +58,7 @@ typedef struct {
 /* LEA/ASM_INPUT/ASM_OUTPUT all prevent SSA promotion of the referenced VAR.
  * ASM: the codegen stores SValues with the original vreg at IR emission time;
  * SSA rename would split those into different temps, leaving stale SValues. */
-static int ssa_mark_addrtaken(TCCIRState *ir, IRQuadCompact *q, uint8_t *addrtaken, int num_vars)
+static int ssa_mark_addrtaken(TCCIRState *ir, IRQuadCompact *q, SSABitset *addrtaken, int num_vars)
 {
   int32_t vr = -1;
   if (q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_ASM_INPUT) {
@@ -69,7 +73,7 @@ static int ssa_mark_addrtaken(TCCIRState *ir, IRQuadCompact *q, uint8_t *addrtak
   if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
     if (pos < num_vars)
-      bitset_set(addrtaken, pos);
+      SSABitset_set(addrtaken, pos);
   }
   return 1;
 }
@@ -87,12 +91,15 @@ static int ssa_has_unsupported_ops(TCCIRState *ir)
   return 0;
 }
 
-static void ssa_scan_var_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info)
+static int ssa_scan_var_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info)
 {
   int n = ir->next_instruction_index;
   int num_vars = info->num_vars;
   int bitset_bytes = info->block_bitset_bytes;
-  uint8_t *has_def = tcc_mallocz((num_vars + 7) / 8);
+  dynamic_bitset(SSABitset) has_def = {0};
+
+  if (SSABitset_init(&has_def, num_vars) != 0)
+    return -1;
 
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -120,33 +127,25 @@ static void ssa_scan_var_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info)
 
     int blk = cfg->instr_to_block[i];
     uint8_t *def_bits = &info->def_blocks[pos * bitset_bytes];
-    if (bitset_test(has_def, pos)) {
-      if (!bitset_test(def_bits, blk))
-        bitset_set(info->multi_block_def, pos);
+    if (SSABitset_test(&has_def, pos)) {
+      if (!raw_bitset_test(def_bits, blk))
+        SSABitset_set(info->multi_block_def, pos);
     }
-    bitset_set(has_def, pos);
-    bitset_set(def_bits, blk);
+    SSABitset_set(&has_def, pos);
+    raw_bitset_set(def_bits, blk);
     if (dest.btype != IROP_BTYPE_INT32)
       info->var_btype[pos] = dest.btype;
   }
 
   for (int v = 0; v < num_vars; v++) {
-    if (bitset_test(info->addrtaken, v))
+    if (SSABitset_test(info->addrtaken, v))
       continue;
     if (v < ir->variables_live_intervals_size &&
         ir->variables_live_intervals[v].addrtaken)
-      bitset_set(info->addrtaken, v);
+      SSABitset_set(info->addrtaken, v);
   }
 
-  tcc_free(has_def);
-}
-
-static void ssa_var_info_free(SSAVarInfo *info)
-{
-  tcc_free(info->def_blocks);
-  tcc_free(info->addrtaken);
-  tcc_free(info->multi_block_def);
-  tcc_free(info->var_btype);
+  return 0;
 }
 
 /* Decide whether a local VAR should be promoted to SSA (and get phi nodes).
@@ -170,15 +169,15 @@ static void ssa_var_info_free(SSAVarInfo *info)
 static int ssa_var_promotable(const SSAVarInfo *info, IRCFG *cfg, int nb, int v,
                               int single_block)
 {
-  if (bitset_test(info->addrtaken, v))
+  if (SSABitset_test(info->addrtaken, v))
     return 0;
-  if (single_block || bitset_test(info->multi_block_def, v))
+  if (single_block || SSABitset_test(info->multi_block_def, v))
     return 1;
   /* Single-block-def: promote iff a phi would actually be placed, i.e. some
    * def-block has a non-empty dominance frontier. */
   const uint8_t *def_bits = &info->def_blocks[v * info->block_bitset_bytes];
   for (int b = 0; b < nb; b++) {
-    if (bitset_test(def_bits, b) && cfg->blocks[b].num_df > 0)
+    if (raw_bitset_test(def_bits, b) && cfg->blocks[b].num_df > 0)
       return 1;
   }
   return 0;
@@ -201,25 +200,25 @@ static uint8_t *ssa_build_promotable(const SSAVarInfo *info, IRCFG *cfg, int nb,
   uint8_t *is_promotable = tcc_mallocz((num_vars + 7) / 8);
   for (int v = 0; v < num_vars; v++) {
     if (ssa_var_promotable(info, cfg, nb, v, single_block))
-      bitset_set(is_promotable, v);
+      raw_bitset_set(is_promotable, v);
   }
   return is_promotable;
 }
 
 static int ssa_place_phis_for_var(IRSSAState *ssa, TCCIRState *ir, IRCFG *cfg, int v, int var_btype,
-                                  uint8_t *def_bits, int bitset_bytes,
-                                  uint8_t *has_phi, uint8_t *in_worklist, int *worklist,
+                                  uint8_t *def_bits, SSABitset *has_phi,
+                                  SSABitset *in_worklist, int *worklist,
                                   int phi_counter)
 {
   int nb = cfg->num_blocks;
   int wl_count = 0;
-  memset(has_phi, 0, bitset_bytes);
-  memset(in_worklist, 0, bitset_bytes);
+  SSABitset_clear(has_phi);
+  SSABitset_clear(in_worklist);
 
   for (int b = 0; b < nb; b++) {
-    if (bitset_test(def_bits, b)) {
+    if (raw_bitset_test(def_bits, b)) {
       worklist[wl_count++] = b;
-      bitset_set(in_worklist, b);
+      SSABitset_set(in_worklist, b);
     }
   }
 
@@ -230,9 +229,9 @@ static int ssa_place_phis_for_var(IRSSAState *ssa, TCCIRState *ir, IRCFG *cfg, i
     IRBasicBlock *bb = &cfg->blocks[b];
     for (int di = 0; di < bb->num_df; di++) {
       int df = bb->dom_frontier[di];
-      if (bitset_test(has_phi, df))
+      if (SSABitset_test(has_phi, df))
         continue;
-      bitset_set(has_phi, df);
+      SSABitset_set(has_phi, df);
 
       int num_preds = cfg->blocks[df].num_preds;
       int32_t phi_dest = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP,
@@ -245,8 +244,8 @@ static int ssa_place_phis_for_var(IRSSAState *ssa, TCCIRState *ir, IRCFG *cfg, i
       phi->next = ssa->block_phis[df];
       ssa->block_phis[df] = phi;
 
-      if (!bitset_test(in_worklist, df)) {
-        bitset_set(in_worklist, df);
+      if (!SSABitset_test(in_worklist, df)) {
+        SSABitset_set(in_worklist, df);
         worklist[wl_count++] = df;
       }
     }
@@ -270,22 +269,32 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
     return NULL;
 
   int bitset_bytes = (nb + 7) / 8;
+  scoped_vector(uint8_t) def_blocks_owner = {0};
+  scoped_vector(int) var_btype_owner = {0};
+  dynamic_bitset(SSABitset) addrtaken = {0};
+  dynamic_bitset(SSABitset) multi_block_def = {0};
+
+  if (vector_resize(&def_blocks_owner, (size_t)num_vars * bitset_bytes) != 0 ||
+      vector_resize(&var_btype_owner, num_vars) != 0 ||
+      SSABitset_init(&addrtaken, num_vars) != 0 ||
+      SSABitset_init(&multi_block_def, num_vars) != 0)
+    return NULL;
+
   SSAVarInfo info = {
-    .def_blocks = tcc_mallocz(num_vars * bitset_bytes),
-    .addrtaken = tcc_mallocz((num_vars + 7) / 8),
-    .multi_block_def = tcc_mallocz((num_vars + 7) / 8),
-    .var_btype = tcc_mallocz(num_vars * sizeof(int)),
+    .def_blocks = vector_data(&def_blocks_owner),
+    .addrtaken = &addrtaken,
+    .multi_block_def = &multi_block_def,
+    .var_btype = vector_data(&var_btype_owner),
     .block_bitset_bytes = bitset_bytes,
     .num_vars = num_vars,
   };
-  ssa_scan_var_defs(ir, cfg, &info);
+  if (ssa_scan_var_defs(ir, cfg, &info) != 0)
+    return NULL;
 
   int promotable_count;
   uint8_t *is_promotable = ssa_build_promotable(&info, cfg, nb, &promotable_count);
-  if (!is_promotable) {
-    ssa_var_info_free(&info);
+  if (!is_promotable)
     return NULL;
-  }
 
   IRSSAState *ssa = tcc_mallocz(sizeof(IRSSAState));
   ssa->cfg = cfg;
@@ -294,9 +303,16 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
   ssa->is_promotable = is_promotable;
   ssa->num_vars = num_vars;
 
-  uint8_t *has_phi = tcc_mallocz(bitset_bytes);
-  uint8_t *in_worklist = tcc_mallocz(bitset_bytes);
-  int *worklist = tcc_mallocz(nb * sizeof(int));
+  dynamic_bitset(SSABitset) has_phi = {0};
+  dynamic_bitset(SSABitset) in_worklist = {0};
+  scoped_vector(int) worklist_owner = {0};
+  if (SSABitset_init(&has_phi, nb) != 0 ||
+      SSABitset_init(&in_worklist, nb) != 0 ||
+      vector_resize(&worklist_owner, nb) != 0) {
+    tcc_ir_ssa_free(ssa);
+    return NULL;
+  }
+  int *worklist = vector_data(&worklist_owner);
   int phi_counter = 0;
 
   for (int v = 0; v < num_vars; v++) {
@@ -304,21 +320,16 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
      * addrtaken). For single-block-def vars this now also covers the ones kept
      * as VARs before — loop-carried / branch-merge-live values that need a phi.
      * In a single-block CFG the def-block has an empty DF, so this places none. */
-    if (!bitset_test(is_promotable, v))
+    if (!raw_bitset_test(is_promotable, v))
       continue;
     uint8_t *def_bits = &info.def_blocks[v * bitset_bytes];
     phi_counter = ssa_place_phis_for_var(ssa, ir, cfg, v, info.var_btype[v], def_bits,
-                                         bitset_bytes, has_phi, in_worklist, worklist,
+                                         &has_phi, &in_worklist, worklist,
                                          phi_counter);
   }
 
   ssa->next_ssa_vreg = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP,
                                           ir->next_temporary_variable + phi_counter);
-
-  tcc_free(has_phi);
-  tcc_free(in_worklist);
-  tcc_free(worklist);
-  ssa_var_info_free(&info);
 
   return ssa;
 }
@@ -327,21 +338,16 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
  * SSA Renaming
  * ============================================================================ */
 
-typedef struct { int32_t *items; int count; int cap; } VRegStack;
+typedef vector(int32_t) VRegStack;
 
 static void vstack_push(VRegStack *s, int32_t v)
 {
-  if (s->count >= s->cap) {
-    int nc = s->cap ? s->cap * 2 : 4;
-    s->items = tcc_realloc(s->items, nc * sizeof(int32_t));
-    s->cap = nc;
-  }
-  s->items[s->count++] = v;
+  vector_push_back(s, v);
 }
 
 static int32_t vstack_top(VRegStack *s)
 {
-  return s->count > 0 ? s->items[s->count - 1] : -1;
+  return s->size > 0 ? s->data[s->size - 1] : -1;
 }
 
 static int ssa_rename_use(IROperand *op, int num_vars, const uint8_t *is_promotable,
@@ -351,7 +357,7 @@ static int ssa_rename_use(IROperand *op, int num_vars, const uint8_t *is_promota
   if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
     return 0;
   int pos = TCCIR_DECODE_VREG_POSITION(vr);
-  if (pos >= num_vars || !bitset_test(is_promotable, pos))
+  if (pos >= num_vars || !raw_bitset_test(is_promotable, pos))
     return 0;
   int32_t cur = vstack_top(&stacks[pos]);
   if (cur < 0)
@@ -382,7 +388,7 @@ static void ssa_rename_phi_defs(IRSSAState *ssa, int b, VRegStack *stacks, int n
     if (TCCIR_DECODE_VREG_TYPE(orig) != TCCIR_VREG_TYPE_VAR)
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(orig);
-    if (pos < num_vars && bitset_test(ssa->is_promotable, pos))
+    if (pos < num_vars && raw_bitset_test(ssa->is_promotable, pos))
       vstack_push(&stacks[pos], phi->dest_vreg);
   }
 }
@@ -433,7 +439,7 @@ static void ssa_rename_block_instrs(TCCIRState *ir, IRSSAState *ssa, IRBasicBloc
       int32_t vr = irop_get_vreg(d);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
-        if (pos < num_vars && bitset_test(ssa->is_promotable, pos)) {
+        if (pos < num_vars && raw_bitset_test(ssa->is_promotable, pos)) {
           int32_t new_name = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, (*next_temp_pos)++);
           vstack_push(&stacks[pos], new_name);
           irop_set_vreg(&d, new_name);
@@ -468,7 +474,7 @@ static void ssa_fill_successor_phis(IRSSAState *ssa, IRCFG *cfg, int b,
       if (TCCIR_DECODE_VREG_TYPE(orig) != TCCIR_VREG_TYPE_VAR)
         continue;
       int pos = TCCIR_DECODE_VREG_POSITION(orig);
-      if (pos < num_vars && bitset_test(ssa->is_promotable, pos)) {
+      if (pos < num_vars && raw_bitset_test(ssa->is_promotable, pos)) {
         if (pred_idx < phi->num_operands)
           phi->operands[pred_idx].vreg = vstack_top(&stacks[pos]);
       }
@@ -486,18 +492,29 @@ void tcc_ir_ssa_rename(TCCIRState *ir, IRSSAState *ssa)
   int num_vars = ssa->num_vars;
   int next_temp_pos = TCCIR_DECODE_VREG_POSITION(ssa->next_ssa_vreg);
 
-  VRegStack *stacks = tcc_mallocz(num_vars * sizeof(VRegStack));
+  scoped_vector(VRegStack) stacks_owner = {0};
+  if (vector_resize(&stacks_owner, num_vars) != 0)
+    return;
+  VRegStack *stacks = vector_data(&stacks_owner);
 
   for (int v = 0; v < num_vars; v++) {
-    if (bitset_test(ssa->is_promotable, v)) {
+    if (raw_bitset_test(ssa->is_promotable, v)) {
       int32_t init_name = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, next_temp_pos++);
       vstack_push(&stacks[v], init_name);
     }
   }
 
   typedef struct { int block; int child_idx; } DomFrame;
-  DomFrame *dom_stack = tcc_mallocz(nb * sizeof(DomFrame));
-  int *saved_depths = tcc_mallocz(nb * num_vars * sizeof(int));
+  scoped_vector(DomFrame) dom_stack_owner = {0};
+  scoped_vector(int) saved_depths_owner = {0};
+  if (vector_resize(&dom_stack_owner, nb) != 0 ||
+      vector_resize(&saved_depths_owner, (size_t)nb * num_vars) != 0) {
+    for (int v = 0; v < num_vars; v++)
+      vector_cleanup(&stacks[v]);
+    return;
+  }
+  DomFrame *dom_stack = vector_data(&dom_stack_owner);
+  int *saved_depths = vector_data(&saved_depths_owner);
   int dsp = 0;
 
   dom_stack[dsp++] = (DomFrame){0, 0};
@@ -509,7 +526,7 @@ void tcc_ir_ssa_rename(TCCIRState *ir, IRSSAState *ssa)
     if (top->child_idx == 0) {
       int *frame_depths = &saved_depths[(dsp - 1) * num_vars];
       for (int v = 0; v < num_vars; v++)
-        frame_depths[v] = stacks[v].count;
+        frame_depths[v] = stacks[v].size;
 
       ssa_rename_phi_defs(ssa, b, stacks, num_vars);
       ssa_rename_block_instrs(ir, ssa, &cfg->blocks[b], stacks, num_vars, &next_temp_pos);
@@ -525,7 +542,7 @@ void tcc_ir_ssa_rename(TCCIRState *ir, IRSSAState *ssa)
     else {
       int *frame_depths = &saved_depths[(dsp - 1) * num_vars];
       for (int v = 0; v < num_vars; v++)
-        stacks[v].count = frame_depths[v];
+        stacks[v].size = frame_depths[v];
       dsp--;
     }
   }
@@ -534,10 +551,7 @@ void tcc_ir_ssa_rename(TCCIRState *ir, IRSSAState *ssa)
   ir->next_temporary_variable = next_temp_pos;
 
   for (int v = 0; v < num_vars; v++)
-    tcc_free(stacks[v].items);
-  tcc_free(stacks);
-  tcc_free(saved_depths);
-  tcc_free(dom_stack);
+    vector_cleanup(&stacks[v]);
 }
 
 void tcc_ir_ssa_free(IRSSAState *ssa)

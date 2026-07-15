@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_OPT_ALIAS_H
-#define TCC_IR_OPT_ALIAS_H
+#pragma once
 
 #include <stdint.h>
 
@@ -31,4 +30,3 @@ int is_stack_address_operand(IROperand op);
 int find_deref_use_operand(struct TCCIRState *ir, int consumer_idx,
                            int32_t vreg, int *which_out);
 
-#endif /* TCC_IR_OPT_ALIAS_H */

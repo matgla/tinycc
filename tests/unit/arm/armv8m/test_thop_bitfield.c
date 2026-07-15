@@ -8,8 +8,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_bitfield.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_bitfield.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -315,27 +315,4 @@ UT_TEST(test_usat_rd_pc_rejected)
   UT_ASSERT_EQ(op.size, 0);
   UT_ASSERT_EQ(op.opcode, 0);
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_bitfield)
-{
-  UT_RUN(test_bfc_basic);
-  UT_RUN(test_bfc_high_reg);
-  UT_RUN(test_bfi_basic);
-  UT_RUN(test_sbfx_basic);
-  UT_RUN(test_ssat_lsl);
-  UT_RUN(test_ssat_asr);
-  UT_RUN(test_ssat_no_shift);
-  UT_RUN(test_usat_no_shift);
-  UT_RUN(test_usat_lsl);
-  UT_RUN(test_usat_asr);
-  UT_RUN(test_bfx_feature_gate_off);
-  UT_RUN(test_sat_feature_gate_off);
-  UT_RUN(test_bfc_rd_pc_rejected);
-  UT_RUN(test_bfi_rd_pc_rejected);
-  UT_RUN(test_sbfx_rd_pc_rejected);
-  UT_RUN(test_ssat_rd_pc_rejected);
-  UT_RUN(test_usat_rd_pc_rejected);
 }

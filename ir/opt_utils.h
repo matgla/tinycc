@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_OPT_UTILS_H
-#define TCC_IR_OPT_UTILS_H
+#pragma once
 
 #include <stdint.h>
 
@@ -43,6 +42,19 @@ int ir_opt_fold_strncmp_result(const char *s1, const char *s2, uint64_t n);
 int ir_opt_fold_memcmp_result(const char *s1, const char *s2, uint64_t n);
 
 int evaluate_compare_condition(int64_t val1, int64_t val2, int cond_token);
+
+/* CMP-operand-aware compare eval: applies signed/unsigned + width semantics
+ * derived from the operand types (shared by flat const-prop passes and the
+ * relocated const_prop_tmp core in source/opt/flat/scalar/const_prop_tmp.c). */
+int evaluate_compare_condition_cmp_operands(int64_t val1, int64_t val2, int cond,
+                                            IROperand src1, IROperand src2);
+/* IEEE NaN branch result for a soft-FP compare condition token: 0/1/-1. */
+int nan_compare_branch_result(int cond_token);
+
+/* MLA accumulator vreg (shared by flat const-prop passes and the relocated
+ * value_tracking pass in source/opt/flat/scalar/value_tracking.c). */
+struct IRQuadCompact;
+int32_t ir_opt_mla_accum_vreg(const struct TCCIRState *ir, const struct IRQuadCompact *q);
 
 int is_power_of_2(int64_t n);
 
@@ -131,6 +143,10 @@ const char *ir_opt_get_constant_string_from_symref(struct TCCIRState *ir,
 int tcc_ir_vreg_has_single_def(struct TCCIRState *ir, int32_t vreg);
 int tcc_ir_vreg_has_multi_def(struct TCCIRState *ir, int32_t vreg);
 
+/* True for memcpy/memmove and their AAPCS variants (__aeabi_mem{cpy,move}{,4,8}).
+ * The __tcc_memmove alias is NOT included — passes that want it add it explicitly. */
+int ir_opt_is_memcpy_or_memmove_name(const char *name);
+
 /* ============================================================================
  * Callee symbol replacement helpers
  * ============================================================================ */
@@ -138,4 +154,51 @@ int tcc_ir_vreg_has_multi_def(struct TCCIRState *ir, int32_t vreg);
 int change_callee_sym(struct TCCIRState *ir, int instr_idx, const char *new_name, int ret_btype);
 int change_callee_sym_keep_type(struct TCCIRState *ir, int instr_idx, const char *new_name);
 
-#endif /* TCC_IR_OPT_UTILS_H */
+/* ============================================================================
+ * Soft-float bit reinterpretation (IEEE bit pattern <-> value)
+ * ============================================================================ */
+
+static inline float ir_bits_to_f(int64_t bits)
+{
+  union { uint32_t u; float f; } c;
+  c.u = (uint32_t)bits;
+  return c.f;
+}
+
+static inline double ir_bits_to_d(int64_t bits)
+{
+  union { uint64_t u; double d; } c;
+  c.u = (uint64_t)bits;
+  return c.d;
+}
+
+/* float result occupies the low 32 bits, sign-extended into the int64 carrier */
+static inline int64_t ir_f_to_bits(float f)
+{
+  union { uint32_t u; float f; } c;
+  c.f = f;
+  return (int64_t)(int32_t)c.u;
+}
+
+static inline int64_t ir_d_to_bits(double d)
+{
+  union { uint64_t u; double d; } c;
+  c.d = d;
+  return (int64_t)c.u;
+}
+
+/* 3-way compare (-1/0/+1) of two soft-float bit patterns; *is_nan flags the
+ * IEEE-unordered case so callers can avoid folding away that distinction */
+static inline int ir_softfp_cmp3(int is_double, int64_t a0, int64_t a1, int *is_nan)
+{
+  if (is_double)
+  {
+    double a = ir_bits_to_d(a0), b = ir_bits_to_d(a1);
+    *is_nan = (a != a) || (b != b);
+    return (a > b) - (a < b);
+  }
+  float a = ir_bits_to_f(a0), b = ir_bits_to_f(a1);
+  *is_nan = (a != a) || (b != b);
+  return (a > b) - (a < b);
+}
+

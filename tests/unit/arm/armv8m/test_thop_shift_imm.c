@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_shift_imm.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_shift_imm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -265,43 +265,4 @@ UT_TEST(test_th_lsl_imm_pc_in_rd_fails)
     UT_ASSERT_EQ(op.opcode, 0);
 
     return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_shift_imm)
-{
-    /* T1 LSL */
-    UT_RUN(test_th_lsl_imm_t1_basic);
-    UT_RUN(test_th_lsl_imm_t1_imm31);
-    UT_RUN(test_th_lsl_imm_t1_imm0_shift32);
-
-    /* T1 LSR */
-    UT_RUN(test_th_lsr_imm_t1_basic);
-    UT_RUN(test_th_lsr_imm_t1_imm31);
-
-    /* T1 ASR */
-    UT_RUN(test_th_asr_imm_t1_basic);
-    UT_RUN(test_th_asr_imm_t1_imm1);
-
-    /* T3 LSL */
-    UT_RUN(test_th_lsl_imm_t3_high_regs);
-    UT_RUN(test_th_lsl_imm_t3_low_regs);
-
-    /* T3 LSR */
-    UT_RUN(test_th_lsr_imm_t3_high_regs);
-
-    /* T3 ASR */
-    UT_RUN(test_th_asr_imm_t3_high_regs);
-
-    /* T3 ROR */
-    UT_RUN(test_th_ror_imm_t3_low_regs);
-    UT_RUN(test_th_ror_imm_t3_high_regs);
-
-    /* Constraint failures */
-    UT_RUN(test_th_lsl_imm_t1_high_reg_falls_to_t3);
-    UT_RUN(test_th_lsr_imm_t1_high_reg_falls_to_t3);
-    UT_RUN(test_th_asr_imm_enforce_16bit_high_reg_fails);
-    UT_RUN(test_th_lsl_imm_enforce_32bit_low_regs);
-    UT_RUN(test_th_lsl_imm_pc_in_rd_fails);
 }

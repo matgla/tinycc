@@ -399,26 +399,4 @@ UT_TEST(test_neg_chain_idempotent)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_neg_chain)
-{
-  UT_COVERS("neg_chain_cse");
-  UT_RUN(test_neg_chain_double_negation_folds);
-  UT_RUN(test_neg_chain_single_negation_no_fold);
-  UT_RUN(test_neg_chain_nonzero_minuend_no_fold);
-  UT_RUN(test_neg_chain_width_mismatch_no_fold);
-  UT_RUN(test_neg_chain_int8_double_negation_folds);
-  UT_RUN(test_neg_chain_int16_double_negation_folds);
-  UT_RUN(test_neg_chain_int64_double_negation_folds);
-  UT_RUN(test_neg_chain_length_3_folds);
-  UT_RUN(test_neg_chain_length_4_folds);
-  UT_RUN(test_neg_chain_mixed_width_int8_int32);
-  UT_RUN(test_neg_chain_merge_reset_clears_canon);
-  UT_RUN(test_neg_chain_reuse_after_reset);
-  UT_RUN(test_neg_chain_var_src_no_fold);
-  UT_RUN(test_neg_chain_var_dest_ignored);
-  UT_RUN(test_neg_chain_lval_src2_no_fold);
-  UT_RUN(test_neg_chain_lval_dest_ignored);
-  UT_RUN(test_neg_chain_idempotent);
-}
+UT_COVERS("neg_chain_cse");

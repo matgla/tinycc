@@ -33,6 +33,9 @@ static void ut_tccpp_teardown(void)
   tccpp_delete(tcc_state);
 }
 
+UT_SUITE_SETUP(ut_tccpp_setup);
+UT_SUITE_TEARDOWN(ut_tccpp_teardown);
+
 /* ============================================================================
  * CString helpers
  * ============================================================================ */
@@ -1370,6 +1373,8 @@ UT_TEST(test_next_with_macro_substitution)
   UT_ASSERT_EQ(tokc.i, 1);
   parse_flags = 0;
 
+  while (macro_ptr)
+    end_macro();
   free_defines(boundary);
   file = NULL;
   return 0;
@@ -1877,135 +1882,4 @@ UT_TEST(test_pragma_operator_rejects_non_string_operand)
   tcc_state->output_type = saved_output;
   file = NULL;
   return result;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(tccpp)
-{
-  ut_tccpp_setup();
-
-  /* CString */
-  UT_RUN(test_cstr_new_initializes_empty);
-  UT_RUN(test_cstr_ccat_appends_bytes_and_grows);
-  UT_RUN(test_cstr_cat_appends_with_various_len_modes);
-  UT_RUN(test_cstr_reset_clears_size_keeps_buffer);
-  UT_RUN(test_cstr_printf_formats_into_buffer);
-  UT_RUN(test_cstr_free_on_zeroed_cstring_is_safe);
-  UT_RUN(test_cstr_wccat_appends_wide_chars);
-  UT_RUN(test_cstr_u8cat_encodes_unicode);
-  UT_RUN(test_cstr_u8cat_rejects_surrogate);
-  UT_RUN(test_cstr_printf_reallocs_for_long_format);
-  UT_RUN(test_cstr_cat_len_minus_one_on_empty_string);
-  UT_RUN(test_cstr_vprintf_formats_va_list);
-
-  /* Token interning */
-  UT_RUN(test_tok_alloc_returns_same_token_for_same_string);
-  UT_RUN(test_tok_alloc_returns_distinct_tokens_for_distinct_strings);
-  UT_RUN(test_tok_alloc_materializes_builtin_keyword_at_fixed_id);
-  UT_RUN(test_tok_alloc_const_matches_tok_alloc_with_strlen);
-  UT_RUN(test_tok_ensure_returns_builtin_symbol);
-  UT_RUN(test_tok_ensure_returns_user_symbol_after_tok_alloc);
-
-  /* get_tok_str */
-  UT_RUN(test_get_tok_str_keywords_and_punctuators);
-  UT_RUN(test_get_tok_str_user_identifier);
-  UT_RUN(test_get_tok_str_integer_constant);
-  UT_RUN(test_get_tok_str_character_constant);
-  UT_RUN(test_get_tok_str_string_literal);
-  UT_RUN(test_get_tok_str_float_and_special_tokens);
-  UT_RUN(test_get_tok_str_pp_tokens);
-  UT_RUN(test_get_tok_str_wide_char_and_string);
-  UT_RUN(test_get_tok_str_anonymous_and_nameless);
-  UT_RUN(test_get_tok_str_invalid_control_char);
-  UT_RUN(test_get_tok_str_long_long_constants);
-  UT_RUN(test_get_tok_str_more_two_char_tokens);
-
-  /* TokenString */
-  UT_RUN(test_tok_str_alloc_initializes_empty);
-  UT_RUN(test_tok_str_add_stays_inline_then_grows);
-  UT_RUN(test_tok_str_add2_integer_round_trip);
-  UT_RUN(test_tok_str_ensure_heap_empty_returns_null);
-  UT_RUN(test_tok_str_ensure_heap_converts_inline_to_heap);
-  UT_RUN(test_tok_str_free_releases_heap_and_struct);
-  UT_RUN(test_tok_str_free_str_null_is_safe);
-  UT_RUN(test_begin_macro_static_buffer_end_macro_resets);
-
-  /* tok_get round-trip */
-  UT_RUN(test_tok_get_round_trip_int_string_eof);
-  UT_RUN(test_tok_str_add2_string_round_trip);
-  UT_RUN(test_tok_get_unsigned_and_double);
-  UT_RUN(test_tok_get_line_and_pack_replay);
-  UT_RUN(test_tok_get_ppnum_ppstr_round_trip);
-  UT_RUN(test_tok_str_realloc_inline_to_heap);
-  UT_RUN(test_tok_str_realloc_heap_grows);
-  UT_RUN(test_tok_get_long_long_round_trip);
-  UT_RUN(test_tok_get_float_double_round_trip);
-  UT_RUN(test_define_find_returns_null_for_undefined);
-
-  /* Misc public helpers */
-  UT_RUN(test_set_idnum_changes_character_class);
-  UT_RUN(test_tok_str_add_tok_line_number_tracking);
-  UT_RUN(test_begin_macro_end_macro_restores_macro_ptr);
-  UT_RUN(test_end_macro_to_unwinds_to_target);
-  UT_RUN(test_define_undef_clears_sym_define);
-  UT_RUN(test_free_defines_pops_to_boundary);
-  UT_RUN(test_define_push_and_find_object_macro);
-  UT_RUN(test_define_push_redefinition_checks_equality);
-  UT_RUN(test_define_push_function_macro_with_args);
-  UT_RUN(test_define_push_equal_body_no_warning);
-  UT_RUN(test_skip_to_eol_skips_logical_line);
-  UT_RUN(test_skip_to_eol_warns_on_extra_tokens);
-  UT_RUN(test_skip_to_eol_returns_on_linefeed);
-  UT_RUN(test_expect_raises_error);
-  UT_RUN(test_unget_tok_pushes_token_back);
-  UT_RUN(test_unget_tok_allocates_second_buffer);
-  UT_RUN(test_next_lexes_identifier);
-  UT_RUN(test_next_lexes_number_with_tok_num);
-  UT_RUN(test_next_lexes_string_with_tok_str);
-  UT_RUN(test_next_lexes_string_with_escapes);
-  UT_RUN(test_next_lexes_hex_number);
-  UT_RUN(test_next_lexes_increment_operator);
-  UT_RUN(test_next_skips_c_comment);
-  UT_RUN(test_next_with_macro_substitution);
-  UT_RUN(test_skip_advances_when_token_matches);
-  UT_RUN(test_skip_errors_when_token_mismatches);
-  UT_RUN(test_tccpp_putfile_relative_path);
-  UT_RUN(test_tccpp_putfile_absolute_path);
-  UT_RUN(test_preprocess_start_end_lifecycle);
-  UT_RUN(test_preprocess_start_asm_file);
-  UT_RUN(test_tcc_preprocess_simple);
-  UT_RUN(test_parse_define_function_macro_direct);
-  UT_RUN(test_parse_define_variadic_direct);
-  UT_RUN(test_pp_error_dumps_macro_context);
-  UT_RUN(test_define_undef_unmaterialized_builtin);
-  UT_RUN(test_preprocess_define_object_macro);
-  UT_RUN(test_preprocess_undef_removes_macro);
-  UT_RUN(test_preprocess_ifdef_endif);
-  UT_RUN(test_preprocess_ifdef_defined);
-  UT_RUN(test_preprocess_ifndef_bof);
-  UT_RUN(test_preprocess_if_elif_else);
-  UT_RUN(test_preprocess_defined_operator);
-  UT_RUN(test_preprocess_line_directive);
-  UT_RUN(test_preprocess_warning);
-  UT_RUN(test_preprocess_error);
-  UT_RUN(test_preprocess_include_errors);
-  UT_RUN(test_preprocess_pragma_pack);
-  UT_RUN(test_preprocess_pragma_once);
-  UT_RUN(test_preprocess_unknown_pragma);
-  UT_RUN(test_preprocess_pragma_push_pop_macro);
-
-  /* C11 _Pragma operator */
-  UT_RUN(test_pragma_operator_token_recognized);
-  UT_RUN(test_pragma_operator_applies_pack_literal);
-  UT_RUN(test_pragma_operator_applies_pack_from_macro);
-  UT_RUN(test_pragma_operator_rewrites_under_dash_E);
-  UT_RUN(test_pragma_operator_rejects_non_string_operand);
-
-  /* #pragma pack replay */
-  UT_RUN(test_pp_apply_pack_replay_set_push_pop);
-  UT_RUN(test_pp_apply_pack_replay_pop_empty_stack_errors);
-  UT_RUN(test_pp_apply_pack_replay_push_full_stack_errors);
-
-  ut_tccpp_teardown();
 }

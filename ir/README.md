@@ -43,7 +43,6 @@ ir/
 │   ├── opt_loop_const_sim.c  # Loop constant simulation
 │   ├── opt_loop_utils.c     # Loop utility functions
 │   ├── opt_fusion.c     # Instruction fusion
-│   ├── opt_gens_bool.c      # Boolean generation
 │   ├── opt_gens_branch.c    # Branch generation
 │   ├── opt_gens_call_result.c  # Call result handling
 │   ├── opt_gens_fusion.c    # Fusion generation
@@ -66,11 +65,11 @@ ir/
 │   └── opt/               # SSA-optimized passes
 │       ├── ssa_opt.h      # SSA optimization framework header
 │       ├── ssa_opt.c      # SSA pass orchestration
-│       ├── ssa_opt_gvn.c       # Global value numbering
+│       │   # (gvn moved to source/opt/ssa/scalar/gvn.c)
 │       ├── ssa_opt_sccp.c      # Sparse conditional constant propagation
-│       ├── ssa_opt_reassoc.c   # Reassociation
+│       │   # (reassoc moved to source/opt/ssa/scalar/reassoc.c)
 │       ├── ssa_opt_loop.c      # Loop optimizations (SSA)
-│       ├── ssa_opt_load_cse.c  # Load CSE
+│       │   # (load_cse moved to source/opt/ssa/memory/load_cse.c)
 │       ├── ssa_opt_cprop.c     # SSA copy propagation
 │       ├── ssa_opt_dce.c       # SSA dead code elimination
 │       ├── ssa_opt_branch.c    # SSA branch optimization

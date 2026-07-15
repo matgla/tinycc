@@ -1,19 +1,15 @@
 /*
- *  test_main10.c - entry point for the tcc/ unit-test binary
- *  (build_tcc/run_unit_tests_tcc)
+ *  test_main10.c - entry point for the tcc/ unit-test binary (build_tcc/run_unit_tests_tcc)
  *
- *  Separate from the other test_main*.c files: this binary pulls in tcc.c
- *  directly so the static/ST_FUNC helpers there can be exercised in isolation.
+ *  Tests self-register via UT_TEST constructors; argv filters by
+ *  suite/test-name substring (see tests/unit/README.md).
  */
 
 #include "ut.h"
 
 UT_MAIN_IMPL;
 
-UT_DECLARE_SUITE(tcc);
-
-int main(void)
+int main(int argc, char **argv)
 {
-  UT_RUN_SUITE(tcc);
-  UT_REPORT_AND_EXIT();
+  return ut_run_all(argc, argv);
 }

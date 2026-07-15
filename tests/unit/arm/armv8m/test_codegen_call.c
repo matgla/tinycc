@@ -15,7 +15,7 @@
 #include "ir/regalloc.h"
 #include "ir/codegen.h"
 #include "ir/machine_op.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
 
@@ -1400,50 +1400,4 @@ UT_TEST(test_dispatch_call_with_five_args_calls_func_parameter_mop_per_arg)
 
   tcc_ir_free(ir);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(codegen_call)
-{
-  UT_RUN(test_aapcs_incoming_params);
-  UT_RUN(test_aapcs_64bit_param);
-  UT_RUN(test_aapcs_param_with_preset_incoming_regs_advances_argno_past_gap);
-  UT_RUN(test_aapcs_param_with_preset_64bit_incoming_regs_advances_past_reg1);
-  UT_RUN(test_aapcs_64bit_param_at_odd_argno_skips_to_even_pair);
-  UT_RUN(test_aapcs_64bit_param_beyond_r2_spills_to_caller_stack);
-  UT_RUN(test_aapcs_64bit_param_stack_spill_preserves_existing_original_offset);
-  UT_RUN(test_aapcs_int_param_beyond_r3_spills_to_caller_stack);
-  UT_RUN(test_mark_return_value_incoming_regs_marks_call_dest_r0_r1);
-  UT_RUN(test_mark_return_value_incoming_regs_skips_hint_pass_below_o1);
-  UT_RUN(test_mark_return_value_incoming_regs_hints_root_of_assign_chain_at_o1);
-  UT_RUN(test_mark_return_value_incoming_regs_returnvalue_direct_from_param_sets_no_hint);
-  UT_RUN(test_mark_return_value_incoming_regs_chain_wont_step_onto_param_source);
-  UT_RUN(test_avoid_spilling_stack_passed_params_resets_stack_param_allocation);
-  UT_RUN(test_avoid_spilling_stack_passed_params_leaves_register_params_alone);
-  UT_RUN(test_avoid_spilling_stack_passed_params_noop_with_no_params);
-  UT_RUN(test_fill_registers_concrete_local_slot_not_rewritten);
-  UT_RUN(test_fill_registers_local_with_vreg_falls_through_to_register_path);
-  UT_RUN(test_fill_registers_stack_passed_param_becomes_vt_local_param);
-  UT_RUN(test_fill_registers_stack_passed_param_is_lvalue_forces_lval);
-  UT_RUN(test_fill_registers_register_passed_param_drops_lval);
-  UT_RUN(test_fill_registers_temp_pointer_deref_preserves_lval_in_register);
-  UT_RUN(test_fill_registers_spilled_computed_value_gets_vt_local_lval);
-  UT_RUN(test_fill_registers_spilled_pointer_deref_uses_vt_llocal);
-  UT_RUN(test_fill_registers_spilled_local_address_of_has_no_lval);
-  UT_RUN(test_fill_registers_spilled_register_param_drops_vt_param_flag);
-  UT_RUN(test_fill_registers_spilled_stack_param_keeps_vt_param_flag);
-  UT_RUN(test_fill_registers_unallocated_temp_leaves_r_untouched);
-  UT_RUN(test_fill_registers_invalid_vreg_constant_becomes_vt_const);
-  UT_RUN(test_fill_registers_invalid_vreg_preg_none_becomes_vt_const);
-  UT_RUN(test_fill_registers_invalid_vreg_zero_r_with_sym_becomes_const_sym);
-  UT_RUN(test_outgoing_call_operands);
-  UT_RUN(test_drop_return);
-  UT_RUN(test_drop_return_null_ir_is_noop);
-  UT_RUN(test_drop_return_empty_function_is_noop);
-  UT_RUN(test_dispatch_call_routes_funcparam_and_funccall_mops);
-  UT_RUN(test_dispatch_funccallvoid_drops_return_value);
-  UT_RUN(test_dispatch_call_with_five_args_calls_func_parameter_mop_per_arg);
 }

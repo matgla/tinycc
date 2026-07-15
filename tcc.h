@@ -2723,6 +2723,12 @@ ST_FUNC void tcc_gen_machine_spill_block_copy(int32_t src_spill_off, int32_t dst
 ST_FUNC void tcc_gen_machine_select_mop(MachineOperand then_val, MachineOperand else_val, MachineOperand dest,
                                         int cond_code);
 
+/* Predicated-compute fusion for an else-identity SELECT (see arm-thumb-gen.c). */
+ST_FUNC int tcc_gen_machine_can_predicate_alu(MachineOperand src1, MachineOperand src2,
+                                              MachineOperand dest, TccIrOp op);
+ST_FUNC void tcc_gen_machine_predicated_alu_mop(MachineOperand src1, MachineOperand src2,
+                                                MachineOperand dest, TccIrOp op, int cond_code);
+
 /* MachineOperand load/store into specific physical registers (for inline asm) */
 void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op);
 void tcc_gen_mach_store_from_reg(int src_reg, const MachineOperand *op);

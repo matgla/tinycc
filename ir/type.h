@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_TYPE_H
-#define TCC_IR_TYPE_H
+#pragma once
 
 /* ============================================================================
  * Type Classification - Implemented in type.c
@@ -75,4 +74,3 @@ int tcc_ir_type_op_needs_fpu(TccIrOp op);
  * Returns true when the operand holds an address that must be loaded through. */
 bool tcc_ir_operand_needs_dereference(struct SValue *sv);
 
-#endif /* TCC_IR_TYPE_H */

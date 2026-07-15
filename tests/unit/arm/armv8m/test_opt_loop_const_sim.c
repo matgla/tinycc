@@ -1208,43 +1208,4 @@ UT_TEST(test_lcs_ssa_idempotent)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_loop_const_sim)
-{
-  UT_COVERS("loop_const_sim");
-  UT_RUN(test_lcs_counting_store_in_body_blocks_fold);
-  UT_RUN(test_lcs_counting_store_used_after_blocks_fold);
-  UT_RUN(test_lcs_counting_store_nonunit_step_blocks_fold);
-  UT_RUN(test_lcs_accumulator_var_folds_to_final_value);
-  UT_RUN(test_lcs_narrow_unsigned_var_residual_preserves_is_unsigned);
-  UT_RUN(test_lcs_narrow_signed_var_residual_is_unsigned_zero);
-  UT_RUN(test_lcs_int32_overflow_wraps_in_residual);
-  UT_RUN(test_lcs_load_indexed_in_body_blocks_fold);
-  UT_RUN(test_lcs_runtime_param_value_blocks_fold);
-  UT_RUN(test_lcs_unknown_call_blocks_fold);
-  UT_RUN(test_lcs_trip_over_max_blocks_both_paths);
-  UT_RUN(test_lcs_div_by_zero_in_body_blocks_fold);
-  UT_RUN(test_lcs_addrtaken_var_blocks_fold);
-  UT_RUN(test_lcs_internal_branch_to_third_target_blocks_fold);
-  UT_RUN(test_lcs_no_loop_no_fire);
-  UT_RUN(test_lcs_memory_loop_idempotent_noop);
-  UT_RUN(test_lcs_lea_indirect_store_blocks_fold);
-  UT_RUN(test_lcs_zero_trip_store_loop_blocks_fold);
-
-  /* ssa_opt_loop_const_sim (CFG/dominator-driven driver) */
-  UT_RUN(test_lcs_ssa_accumulator_top_tested_folds);
-  UT_RUN(test_lcs_ssa_bottom_tested_folds);
-  UT_RUN(test_lcs_ssa_int32_overflow_wraps);
-  UT_RUN(test_lcs_ssa_narrow_unsigned_residual);
-  UT_RUN(test_lcs_ssa_store_in_body_declines);
-  UT_RUN(test_lcs_ssa_addrtaken_var_declines);
-  UT_RUN(test_lcs_ssa_trip_over_max_declines);
-  UT_RUN(test_lcs_ssa_seed589_switch_backjump_no_candidate);
-  UT_RUN(test_lcs_ssa_seed2426_nonmember_in_span_declines);
-  UT_RUN(test_lcs_ssa_side_entry_into_body_declines);
-  UT_RUN(test_lcs_ssa_nested_outer_folds_inner_not_separate);
-  UT_RUN(test_lcs_ssa_cascade_two_loops);
-  UT_RUN(test_lcs_ssa_three_independent_loops_fold);
-  UT_RUN(test_lcs_ssa_idempotent);
-}
+UT_COVERS("loop_const_sim");

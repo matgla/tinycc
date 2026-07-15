@@ -251,34 +251,3 @@ UT_TEST(test_set_options_MD_sets_gen_deps_and_include_sys_deps)
   tcc_delete(s);
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(libtcc_options_target)
-{
-  UT_RUN(test_set_options_mfpu_vfpv4);
-  UT_RUN(test_set_options_mfpu_fpv5_sp_d16);
-  UT_RUN(test_set_options_mfpu_none);
-  UT_RUN(test_set_options_mfpu_neon_fp_armv8);
-  UT_RUN(test_set_options_mfpu_unsupported_errors);
-
-  UT_RUN(test_set_options_mfloat_abi_soft);
-  UT_RUN(test_set_options_mfloat_abi_softfp);
-  UT_RUN(test_set_options_mfloat_abi_hard);
-
-  UT_RUN(test_set_options_std_c11);
-  UT_RUN(test_set_options_std_gnu17);
-  UT_RUN(test_set_options_std_c23);
-
-  UT_RUN(test_set_options_g_sets_debug_and_dwarf);
-  UT_RUN(test_set_options_g_digit_sets_debug_level);
-  UT_RUN(test_set_options_g3_clamps_to_2);
-
-  UT_RUN(test_set_options_o_sets_outfile);
-  UT_RUN(test_set_options_o_reassignment_overwrites_not_leaks);
-
-  UT_RUN(test_set_options_M_sets_deps_fields);
-  UT_RUN(test_set_options_MF_sets_deps_outfile);
-  UT_RUN(test_set_options_MMD_sets_gen_deps_only);
-  UT_RUN(test_set_options_MD_sets_gen_deps_and_include_sys_deps);
-}

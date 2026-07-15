@@ -845,41 +845,4 @@ UT_TEST(test_dce_ex_forwards)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_dce)
-{
-  UT_COVERS("dce");
-
-  UT_RUN(test_dce_unreachable_after_jump);
-  UT_RUN(test_dce_jumpif_keeps_both_targets);
-  UT_RUN(test_dce_ijump_skips_pass);
-  UT_RUN(test_dce_straight_line_unchanged);
-  UT_RUN(test_dce_second_run_reports_same_count);
-  UT_RUN(test_dce_empty_ir_returns_zero);
-  UT_RUN(test_dce_timing_path);
-  UT_RUN(test_dce_switch_table_marks_targets);
-  UT_RUN(test_dce_funccall_null_callee_falls_through);
-  UT_RUN(test_dce_noreturn_attr_call_elides_fallthrough);
-  UT_RUN(test_dce_named_noreturn_call_elides_fallthrough);
-  UT_RUN(test_callee_is_noreturn_null);
-  UT_RUN(test_callee_is_noreturn_attr);
-  UT_RUN(test_callee_is_noreturn_by_name_exit);
-  UT_RUN(test_useless_body_elides_pure_call);
-  UT_RUN(test_useless_body_keeps_essential_return);
-  UT_RUN(test_useless_body_empty_elides_all);
-  UT_RUN(test_noreturn_collapse_self_jump);
-  UT_RUN(test_noreturn_collapse_with_store);
-  UT_RUN(test_trap_only_body_suppress);
-  UT_RUN(test_zero_vla_elim_immediate_zero);
-  UT_RUN(test_zero_vla_elim_sp_save_restore_pair);
-  UT_RUN(test_compact_nops_removes_dead_and_fixes_targets);
-  UT_RUN(test_infinite_self_recursion_collapse);
-  UT_RUN(test_infinite_self_recursion_return_before_call);
-  UT_RUN(test_noreturn_call_epilogue_suppress);
-  UT_RUN(test_noreturn_call_epilogue_suppress_with_return);
-  UT_RUN(test_noreturn_collapse_no_jump_returns_zero);
-  UT_RUN(test_noreturn_collapse_implicit_return_returns_zero);
-  UT_RUN(test_noreturn_collapse_conditional_exit_returns_zero);
-  UT_RUN(test_dce_ex_forwards);
-}
+UT_COVERS("dce");

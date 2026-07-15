@@ -256,6 +256,13 @@ static inline int irop_is_immediate(const IROperand op)
   return tag == IROP_TAG_IMM32 || tag == IROP_TAG_F32 || tag == IROP_TAG_I64 || tag == IROP_TAG_F64;
 }
 
+/* Check if operand is a plain immediate (not a symref or lvalue).
+ * Useful for passes that need a pure constant without symbol resolution. */
+static inline int irop_is_plain_imm(const IROperand op)
+{
+  return irop_is_immediate(op) && !op.is_sym && !op.is_lval;
+}
+
 /* Get 64-bit integer value from operand (works for IMM32, I64, and STACKOFF)
  * Requires ir state for pool lookup. Pass NULL to only handle inline values. */
 static inline int64_t irop_get_imm64_ex(const struct TCCIRState *ir, IROperand op)

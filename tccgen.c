@@ -30,12 +30,12 @@
 #include "ir/opt_engine.h"
 #include "ir/opt_pipeline.h"
 #include "ir/opt_gens_fusion.h"
-#include "ir/opt_gens_bool.h"
-#include "ir/opt_gens_call_result.h"
+#include "opt/flat/bool.h"
+#include "opt/flat/call_result.h"
 #include "ir/regalloc.h"
 #include "ir/ssa.h"
 #include "tccir.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "source/opt/function_pipeline.h"
 #include "tcc_scope.h"
 
@@ -755,6 +755,8 @@ static void parse_expr_type(CType *type);
 static void init_putv(init_params *p, CType *type, unsigned long c, int vreg);
 static void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, int vreg);
 static void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, int v, int scope);
+static void str_lit_pool_reset(void);
+static void str_lit_pool_free(void);
 static int decl(int l);
 static void expr_eq(void);
 void vpush_type_size(CType *type, int *a);
@@ -952,6 +954,8 @@ ST_FUNC void tccgen_init(TCCState *s1)
   vtop = vstack - 1;
   memset(vtop, 0, sizeof *vtop);
 
+  str_lit_pool_reset();
+
   /* define some often used types */
   int_type.t = VT_INT;
 
@@ -1116,6 +1120,8 @@ void tcc_bench_log_phase(TCCState *s1, const char *operation, const char *name, 
 ST_FUNC void tccgen_finish(TCCState *s1)
 {
   tcc_debug_end(s1); /* just in case of errors: free memory */
+
+  str_lit_pool_free();
 
   /* Release per-TU function write summaries (Sym* keys are about to become
    * invalid as global_stack is popped). */
@@ -2407,6 +2413,100 @@ ST_FUNC Sym *get_sym_ref(CType *type, Section *sec, unsigned long offset, unsign
 static void vpush_ref(CType *type, Section *sec, unsigned long offset, unsigned long size)
 {
   vpushsym(type, get_sym_ref(type, sec, offset, size));
+}
+
+/* String-literal pool: dedupe identical read-only string literals so the same
+ * bytes are emitted once in rodata (identical literals may share storage per
+ * C11 6.4.5p7).  Content-keyed, per-translation-unit; see str_lit_pool_merge. */
+typedef struct StrLitEntry
+{
+  unsigned int hash;
+  addr_t off;
+  addr_t len;
+} StrLitEntry;
+static StrLitEntry *str_lit_entries;
+static int str_lit_nb, str_lit_cap;
+
+static unsigned int str_lit_hash(const unsigned char *p, addr_t n)
+{
+  unsigned int h = 2166136261u;
+  for (addr_t k = 0; k < n; k++)
+    h = (h ^ p[k]) * 16777619u;
+  return h;
+}
+
+static void str_lit_pool_reset(void)
+{
+  str_lit_nb = 0;
+}
+
+static void str_lit_pool_free(void)
+{
+  tcc_free(str_lit_entries);
+  str_lit_entries = NULL;
+  str_lit_nb = str_lit_cap = 0;
+}
+
+static int str_lit_pool_find(unsigned int h, const unsigned char *bytes, addr_t len, addr_t *out)
+{
+  for (int k = 0; k < str_lit_nb; k++)
+    if (str_lit_entries[k].hash == h && str_lit_entries[k].len == len &&
+        memcmp(rodata_section->data + str_lit_entries[k].off, bytes, len) == 0)
+    {
+      *out = str_lit_entries[k].off;
+      return 1;
+    }
+  return 0;
+}
+
+static void str_lit_pool_add(unsigned int h, addr_t off, addr_t len)
+{
+  if (str_lit_nb >= str_lit_cap)
+  {
+    int nc = str_lit_cap ? str_lit_cap * 2 : 64;
+    str_lit_entries = tcc_realloc(str_lit_entries, nc * sizeof(*str_lit_entries));
+    str_lit_cap = nc;
+  }
+  str_lit_entries[str_lit_nb].hash = h;
+  str_lit_entries[str_lit_nb].off = off;
+  str_lit_entries[str_lit_nb].len = len;
+  str_lit_nb++;
+}
+
+/* Called right after a string-literal expression is materialized in rodata
+ * (vtop is the anonymous rodata reference, its bytes freshly appended at the
+ * tail).  If an identical literal was already emitted, roll back the duplicate
+ * bytes and repoint vtop at the existing copy; otherwise record this one. */
+static void str_lit_pool_merge(addr_t pre_off)
+{
+#ifdef CONFIG_TCC_BCHECK
+  if (tcc_state->do_bounds_check)
+    return; /* bound-check padding breaks the tail-append invariant */
+#endif
+  if (NODATA_WANTED)
+    return;
+  if (!vtop->sym || vtop->c.i != 0)
+    return;
+  addr_t cur = rodata_section->data_offset;
+  addr_t off = (pre_off + 3) & ~(addr_t)3; /* string literals use 4-byte align */
+  if (off >= cur)
+    return;
+  addr_t len = cur - off;
+  unsigned char *bytes = rodata_section->data + off;
+  unsigned int h = str_lit_hash(bytes, len);
+  addr_t found;
+  if (str_lit_pool_find(h, bytes, len, &found))
+  {
+    rodata_section->data_offset = pre_off;
+    /* Re-zero the reclaimed window; string-literal init relies on section-grow zero-fill for the terminator. */
+    memset(rodata_section->data + pre_off, 0, cur - pre_off);
+    /* Repoint this literal's anon symbol at the shared copy instead of pushing a fresh ref, so no orphan symbol is left pointing into the reclaimed window. */
+    put_extern_sym2(vtop->sym, rodata_section->sh_num, found, len, 1);
+  }
+  else
+  {
+    str_lit_pool_add(h, off, len);
+  }
 }
 
 /* define a new external reference to a symbol 'v' of type 'u' */
@@ -21745,10 +21845,12 @@ tok_next:
        * decl_initializer_alloc correctly allocates size=0.  The dead IR
        * instructions that reference these symbols are removed by DCE. */
       int saved_nocode = nocode_wanted;
+      addr_t str_pre_off = rodata_section->data_offset;
       if (!(nocode_wanted & CODE_OFF_BIT))
         nocode_wanted |= DATA_ONLY_WANTED;
       decl_initializer_alloc(&type, &ad, VT_CONST, 2, 0, 0);
       nocode_wanted = saved_nocode;
+      str_lit_pool_merge(str_pre_off);
     }
     break;
   case TOK_SOTYPE:
@@ -29594,7 +29696,7 @@ static int decl(int l)
                 !inline_body_has_static_local(nf->func_str) && !inline_body_has_unsafe_loops(nf->func_str))
             {
               nf->sym->type.ref->f.func_auto_inline = 1;
-              struct InlineFunc *fn = tcc_malloc(sizeof *fn + strlen(file->filename));
+              struct InlineFunc *fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
               strcpy(fn->filename, file->filename);
               fn->sym = nf->sym;
               /* Copy the token stream — nf->func_str is freed by end_macro()
@@ -29784,7 +29886,7 @@ static int decl(int l)
         if (sym->type.t & VT_INLINE)
         {
           struct InlineFunc *fn;
-          fn = tcc_malloc(sizeof *fn + strlen(file->filename));
+          fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
           strcpy(fn->filename, file->filename);
           fn->sym = sym;
           dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
@@ -29882,7 +29984,7 @@ static int decl(int l)
            *   keep the token stream in inline_fns for call-site inlining within
            *   this TU. VT_INLINE is NOT set so ELF linkage stays global. */
           struct InlineFunc *fn;
-          fn = tcc_malloc(sizeof *fn + strlen(file->filename));
+          fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
           strcpy(fn->filename, file->filename);
           fn->sym = sym;
           fn->func_str = NULL;
@@ -30179,7 +30281,7 @@ static int decl(int l)
           const int late_reopt_cap = 512;
           if (tcc_state->opt_dead_store)
           {
-            struct InlineFunc *fn = tcc_malloc(sizeof *fn + strlen(file->filename));
+            struct InlineFunc *fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
             strcpy(fn->filename, file->filename);
             fn->sym = sym;
             fn->func_str = NULL;
