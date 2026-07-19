@@ -949,11 +949,11 @@ UT_TEST(test_lcs_ssa_trip_over_max_declines)
   TCCIRState *ir = utb_loop_new();
   utb_alloc_var_intervals(ir, 4);
 
-  /* Register-only counting loop trip=17 (store loop would decline on memory
+  /* Register-only counting loop trip=65 (store loop would decline on memory
    * first; use a plain accumulator so the trip cap is what declines). */
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);   /* 0 i=0 */
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);   /* 1 acc=0 */
-  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(17, I32));     /* 2 header */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(65, I32));     /* 2 header */
   utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(TOK_GE, I32), UTB_NONE); /* 3 exit */
   utb_emit(ir, TCCIR_OP_ADD, utb_var(1, I32), utb_var(1, I32), utb_imm(1, I32)); /* 4 acc++ */
   utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32)); /* 5 i++ */

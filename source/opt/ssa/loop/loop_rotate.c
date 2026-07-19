@@ -11,6 +11,7 @@
 #include "ir.h"
 #include "ssa_opt.h"
 #include "opt_loop_utils.h"
+#include "opt_utils.h"
 
 #define SSA_LOOP_ROTATE_MAX_PASSES 4
 
@@ -62,7 +63,13 @@ int ssa_opt_loop_rotate(TCCIRState *ir)
 
     int pass_rotated = 0;
     for (int i = 0; i < ncands; i++) {
-      pass_rotated += try_rotate_loop(ir, &cands[i]);
+      /* Rotation is the stronger transform (it also drops the per-iteration
+       * top test), so try it first; relayout picks up the many shapes its
+       * safety gates decline and removes the trampoline jumps at least. */
+      if (try_rotate_loop(ir, &cands[i]))
+        pass_rotated++;
+      else if (!tcc_ir_opt_pass_disabled("loop_relayout") && try_relayout_loop(ir, &cands[i]))
+        pass_rotated++;
     }
     tcc_free(cands);
 

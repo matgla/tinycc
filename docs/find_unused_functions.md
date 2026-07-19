@@ -1,12 +1,12 @@
 # Unused-function scan
 
-`scripts/find_unused_functions.sh` runs cppcheck's whole-program
+`scripts/find_unused_functions.py` runs cppcheck's whole-program
 `unusedFunction` check over the compiler sources and prints functions with no
 caller anywhere in the scanned set.
 
 ```bash
-scripts/find_unused_functions.sh              # tests/unit count as callers
-scripts/find_unused_functions.sh --no-tests   # dead in the compiler proper
+scripts/find_unused_functions.py              # tests/unit count as callers
+scripts/find_unused_functions.py --no-tests   # dead in the compiler proper
 ```
 
 Requires cppcheck (`dnf install cppcheck`). Takes a few minutes single-threaded
@@ -14,7 +14,7 @@ Requires cppcheck (`dnf install cppcheck`). Takes a few minutes single-threaded
 
 ## How it avoids false positives
 
-- Sources are collected with `find`, so nested dirs (`arch/arm/thumb/`) are
+- Sources are collected recursively, so nested dirs (`arch/arm/thumb/`) are
   included — a caller in a missed file makes its callee look dead.
 - The preprocessor config is pinned to the `armv8m` target defines from the
   Makefile (`DEF-armv8m`); without pinning, cppcheck either tries every

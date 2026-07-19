@@ -219,14 +219,13 @@ int tcc_ir_opt_dead_var_store_elim(TCCIRState *ir)
   return changes;
 }
 static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir);
+/* "redundant_assign" is this pass's name everywhere else (pass table, docs,
+ * TCC_DISABLE_PASS); timing under it too keeps the two layers on one row. */
 int tcc_ir_opt_redundant_var_assign(TCCIRState *ir)
 {
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on) return tcc_ir_opt_redundant_var_assign__timed(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_redundant_var_assign__timed(ir);
-  tcc_pass_timing_add("redundant_var_assign", tcc_pass_clk_us() - _t);
-  return _r;
+  int r;
+  TCC_PASS_TIMED(r, "redundant_assign", tcc_ir_opt_redundant_var_assign__timed(ir));
+  return r;
 }
 static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
 {

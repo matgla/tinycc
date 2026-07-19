@@ -46,10 +46,32 @@ static void pipeline_ensure_requirements(IROptCtx *ctx, uint32_t requires)
     tcc_ir_opt_ctx_require_loops(ctx);
 }
 
+/* Analysis rebuilds are charged to a synthetic pass so they do not inflate
+ * whichever pass happened to be the first consumer after an invalidation. */
+static void pipeline_time_requirements(IROptCtx *ctx, uint32_t requires)
+{
+  if (tcc_pass_timing_on == 0) {
+    pipeline_ensure_requirements(ctx, requires);
+    return;
+  }
+  TCCPassTimer t;
+  tcc_pass_timing_begin(&t, "P:requirements");
+  pipeline_ensure_requirements(ctx, requires);
+  tcc_pass_timing_end(&t, -1);
+}
+
+/* Called only after a pass reported changes > 0, which means the IR was
+ * mutated -- so the cached analyses are dropped unconditionally, whatever the
+ * table entry declared.  Honouring `invalidates` here instead would make the
+ * per-pass dirty tracking below depend on every table entry having an accurate
+ * mask: an entry that reports changes while declaring 0 would leave
+ * ctx->generation stale and let the driver skip passes with real work.  The
+ * four INVALIDATES_* bits are runtime-identical today in any case
+ * (docs/plans/opt_pass_dedup_and_perf.md, RC2). */
 static void pipeline_apply_invalidations(IROptCtx *ctx, uint32_t invalidates)
 {
-  if (invalidates)
-    tcc_ir_opt_ctx_invalidate(ctx);
+  (void)invalidates;
+  tcc_ir_opt_ctx_invalidate(ctx);
 }
 
 void dbg_scan_overlap(TCCIRState *ir, const char *pass);
@@ -99,12 +121,33 @@ void dbg_scan_imm_dest(TCCIRState *ir, const char *pass)
   }
 }
 
+/* Per-pass dirty tracking (docs/plans/opt_pass_dedup_and_perf.md, 1.2).
+ *
+ * A pass that reported no changes cannot find any on a later round unless
+ * something has touched the IR since.  ctx->generation is the token:
+ * pipeline_apply_invalidations bumps it on every reported change, the
+ * compact_after block bumps it, and the cascade slots bump it for the
+ * mutations they deliberately do not report (see CASCADE_END in
+ * pipeline_table.c).  So "ran clean at generation G, and generation is still
+ * G" is a sound skip condition.
+ *
+ * Measured productivity is ~2%, so this removes the large majority of pass
+ * invocations.  The skip is behaviour-preserving only as long as every mutation
+ * reaches the generation counter -- that invariant is what
+ * `make test-golden-ir` gates. */
+#define PIPELINE_MAX_TRACKED 64
+
 /* Dumping every pass here is what keeps group-only passes visible to the golden-IR harness. */
 int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
 {
   int total_changes = 0;
   int iterations = group->max_iterations > 0 ? group->max_iterations : 1;
   int iter;
+  /* generation starts at 1, so 0 reliably means "has not yet run clean". */
+  uint32_t last_clean_gen[PIPELINE_MAX_TRACKED];
+  int track = group->count <= PIPELINE_MAX_TRACKED;
+  if (track)
+    memset(last_clean_gen, 0, (size_t)group->count * sizeof(last_clean_gen[0]));
   tcc_pass_timing_init();
 
   dbg_scan_imm_dest(ctx->ir, "<before-group>");
@@ -119,16 +162,10 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
         break;
       if (tcc_ir_opt_pass_disabled(trigger->name))
         break;
-      if (tcc_pass_timing_on > 0) {
-        unsigned long _rt = tcc_pass_clk_us();
-        pipeline_ensure_requirements(ctx, trigger->requires);
-        tcc_pass_timing_add("P:requirements", tcc_pass_clk_us() - _rt);
-      } else
-        pipeline_ensure_requirements(ctx, trigger->requires);
-      unsigned long _tt = tcc_pass_timing_on > 0 ? tcc_pass_clk_us() : 0;
-      int tch = trigger->run(ctx);
-      if (tcc_pass_timing_on > 0)
-        tcc_pass_timing_add(trigger->name ? trigger->name : "P:trigger", tcc_pass_clk_us() - _tt);
+      pipeline_time_requirements(ctx, trigger->requires);
+      int tch;
+      TCC_PASS_TIMED(tch, trigger->name ? trigger->name : "P:trigger",
+                     trigger->run(ctx));
       dbg_scan_imm_dest(ctx->ir, trigger->name);
       dbg_scan_overlap(ctx->ir, trigger->name);
       tcc_ir_dump_after_pass(ctx->ir, trigger->name);
@@ -151,23 +188,28 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
       if (tcc_ir_opt_pass_disabled(pass->name))
         continue;
 
-      if (tcc_pass_timing_on > 0) {
-        unsigned long _rt = tcc_pass_clk_us();
-        pipeline_ensure_requirements(ctx, pass->requires);
-        tcc_pass_timing_add("P:requirements", tcc_pass_clk_us() - _rt);
-      } else
-        pipeline_ensure_requirements(ctx, pass->requires);
+      /* Still dump: a skipped pass must leave the golden-IR harness seeing
+       * exactly what running it would have, which is what proves the skip is
+       * output-neutral rather than merely assuming it. */
+      if (track && last_clean_gen[p] == ctx->generation) {
+        tcc_ir_dump_after_pass(ctx->ir, pass->name);
+        continue;
+      }
 
-      unsigned long _pt = tcc_pass_timing_on > 0 ? tcc_pass_clk_us() : 0;
-      int changes = pass->run(ctx);
-      if (tcc_pass_timing_on > 0)
-        tcc_pass_timing_add(pass->name ? pass->name : "P:pass", tcc_pass_clk_us() - _pt);
+      pipeline_time_requirements(ctx, pass->requires);
+
+      int changes;
+      TCC_PASS_TIMED(changes, pass->name ? pass->name : "P:pass", pass->run(ctx));
       dbg_scan_imm_dest(ctx->ir, pass->name);
       dbg_scan_overlap(ctx->ir, pass->name);
       tcc_ir_dump_after_pass(ctx->ir, pass->name);
       if (changes > 0) {
         round_changes += changes;
         pipeline_apply_invalidations(ctx, pass->invalidates);
+      } else if (track) {
+        /* No change reported and no invalidation ran, so ctx->generation is
+         * still the value this pass just proved clean. */
+        last_clean_gen[p] = ctx->generation;
       }
       pipeline_trace_pass(group, pass, iter, changes);
     }

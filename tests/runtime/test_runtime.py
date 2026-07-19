@@ -223,7 +223,9 @@ def test_cross_aeabi_divmod(runtime_compiler):
 @pytest.mark.runtime
 @pytest.mark.runtime_cross
 def test_cross_string_helpers(runtime_compiler):
-    obj = _cross_compile("string", runtime_compiler)
+    # -fno-builtin: small constant-size mem* calls are otherwise inline-expanded
+    # (mem_inline pass), and this test exists to pin the runtime-library symbols.
+    obj = _cross_compile("string", runtime_compiler, extra_cflags=["-fno-builtin"])
     syms = _nm_symbols(obj)
 
     # memcpy/memset are referenced from the runtime library.
@@ -265,18 +267,20 @@ def test_cross_builtin_bitops(runtime_compiler):
     obj = _cross_compile("builtin_bitops", runtime_compiler)
     syms = _nm_symbols(obj)
 
-    # Builtin bswap/ctz/popcount are lowered to libgcc-style symbols that are
-    # resolved by the armv8m-libtcc1.a runtime library.
+    # The builtins that have no single Thumb-2 encoding still lower to
+    # libgcc-style symbols resolved by the armv8m-libtcc1.a runtime library.
     expected = {
-        "__bswapsi2",
         "__bswapdi3",
-        "__ctzsi2",
         "__ctzdi2",
         "__popcountsi2",
         "__popcountdi2",
     }
     missing = expected - set(syms)
     assert not missing, f"missing expected bitop runtime symbols: {missing}"
+
+    # 32-bit bswap and ctz are emitted as rev/rev16 and rbit+clz instead.
+    native = {"__bswapsi2", "__ctzsi2"} & set(syms)
+    assert not native, f"expected native lowering, got runtime calls: {native}"
 
 
 @pytest.mark.runtime
@@ -293,7 +297,9 @@ def test_cross_aeabi_idiv_uidiv(runtime_compiler):
 @pytest.mark.runtime
 @pytest.mark.runtime_cross
 def test_cross_aeabi_memset_memcpy(runtime_compiler):
-    obj = _cross_compile("aeabi_memset_memcpy", runtime_compiler)
+    # -fno-builtin: small constant-size __aeabi_mem* calls are otherwise
+    # inline-expanded (mem_inline pass); this test pins the runtime symbols.
+    obj = _cross_compile("aeabi_memset_memcpy", runtime_compiler, extra_cflags=["-fno-builtin"])
     syms = _nm_symbols(obj)
 
     # ARM EABI memory helpers from lib/armeabi.c.

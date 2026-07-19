@@ -35,7 +35,9 @@ SSA_OPT_SRC = \
 	source/opt/ssa/scalar/var_imm_prop.c \
 	source/opt/ssa/scalar/cprop.c \
 	source/opt/ssa/scalar/setif_or_taut.c \
+	source/opt/ssa/scalar/bool_norm.c \
 	source/opt/ssa/scalar/cmp_offset_fold.c \
+	source/opt/ssa/scalar/tmp_block_const.c \
 	source/opt/ssa/cfg/phi.c \
 	source/opt/ssa/cfg/branch.c \
 	source/opt/ssa/cfg/or_bool_diamond.c \
@@ -90,7 +92,9 @@ SSA_OPT_HDRS = \
 	source/opt/ssa/include/opt/ssa/cmp_eq.h \
 	source/opt/ssa/include/opt/ssa/vrp.h \
 	source/opt/ssa/include/opt/ssa/setif_or_taut.h \
+	source/opt/ssa/include/opt/ssa/bool_norm.h \
 	source/opt/ssa/include/opt/ssa/cmp_offset_fold.h \
+	source/opt/ssa/include/opt/ssa/tmp_block_const.h \
 	source/opt/ssa/include/opt/ssa/var_imm_prop.h \
 	source/opt/ssa/include/opt/ssa/cprop.h \
 	source/opt/ssa/dce/dce_common.h \

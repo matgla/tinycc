@@ -148,6 +148,64 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
     if (!safe)
       continue;
 
+    /* Side entries into the ASSIGN run (a shared latch reached by several
+     * `continue` edges) are retargeted to body_target below, which SKIPS the
+     * copies.  That is only sound when every copy is a physical no-op
+     * (register allocation gave dest and src the same register — the common
+     * graph-coalesced case).  A surviving real `mov` skipped on those edges
+     * leaves the loop phi un-updated (20050502-1: `i` never incremented on
+     * the y/z break-check continue paths).  Switch-table entries can't be
+     * retargeted here at all, so any of those force a bail regardless. */
+    {
+      int side_entry = 0;
+      for (int k = 0; k < n && !side_entry; k++) {
+        if (k >= i && k <= jump_idx)
+          continue;
+        IRQuadCompact *kq = &ir->compact_instructions[k];
+        if (kq->op != TCCIR_OP_JUMP && kq->op != TCCIR_OP_JUMPIF)
+          continue;
+        int kt = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, kq));
+        if (kt >= i + 1 && kt < jump_idx)
+          side_entry = 1;
+      }
+      int switch_entry = 0;
+      for (int t = 0; t < ir->num_switch_tables && !switch_entry; t++) {
+        TCCIRSwitchTable *tbl = &ir->switch_tables[t];
+        if (tbl->default_target >= i + 1 && tbl->default_target <= jump_idx)
+          switch_entry = 1;
+        for (int j = 0; j < tbl->num_entries && !switch_entry; j++)
+          if (tbl->targets[j] >= i + 1 && tbl->targets[j] <= jump_idx)
+            switch_entry = 1;
+      }
+      if (switch_entry)
+        continue;
+      if (side_entry) {
+        int all_noop = 1;
+        for (int j = 0; j < num_assigns && all_noop; j++) {
+          IRQuadCompact *aq = &ir->compact_instructions[i + 1 + j];
+          int32_t adst_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, aq));
+          int32_t asrc_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, aq));
+          if (adst_vr < 0 || asrc_vr < 0) { all_noop = 0; break; }
+          int dst_reg = -2, dst_reg1 = -2, src_reg = -3, src_reg1 = -3;
+          for (int k = 0; k < ir->ls.next_interval_index; k++) {
+            LSLiveInterval *li = &ir->ls.intervals[k];
+            if (li->vreg == (uint32_t)adst_vr) {
+              if (li->stack_location != 0 || li->r0 < 0) { all_noop = 0; break; }
+              dst_reg = li->r0; dst_reg1 = li->r1;
+            }
+            if (li->vreg == (uint32_t)asrc_vr) {
+              if (li->stack_location != 0 || li->r0 < 0) { all_noop = 0; break; }
+              src_reg = li->r0; src_reg1 = li->r1;
+            }
+          }
+          if (dst_reg != src_reg || dst_reg1 != src_reg1)
+            all_noop = 0;
+        }
+        if (!all_noop)
+          continue;
+      }
+    }
+
     int inv_cond = invert_condition(cond);
     if (inv_cond < 0)
       continue;

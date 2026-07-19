@@ -194,17 +194,13 @@ UT_TEST(test_dce_straight_line_unchanged)
 
 /* ------------------------------------------------------ idempotence test */
 
-/* A second DCE run should ideally report 0 changes because the first run
- * already NOPed everything unreachable.  The current implementation
- * recomputes reachability from scratch and counts every unreachable
- * instruction, including ones that are already NOP, so the second run
- * returns the same non-zero count as the first.
- *
- * SUSPECTED BUG: DCE does not skip already-NOP instructions when counting
- * changes, so it is not idempotent in its return value.  This may cause
- * the pass manager to schedule extra fixpoint iterations even though no
- * real transformation happens after the first run. */
-UT_TEST(test_dce_second_run_reports_same_count)
+/* A second DCE run must report 0 changes: the first run already NOPed
+ * everything unreachable, and already-NOP instructions do not count as
+ * changes.  Groups that do not compact NOPs between iterations
+ * (propagation) rely on this — re-reporting the same unreachable NOPs
+ * every round would spin the group to its iteration cap and invalidate
+ * every other pass's dirty state (see tcc_ir_opt_dce__timed). */
+UT_TEST(test_dce_second_run_reports_zero_changes)
 {
   TCCIRState *ir = utb_new();
 
@@ -218,9 +214,8 @@ UT_TEST(test_dce_second_run_reports_same_count)
   int second = tcc_ir_opt_dce(ir);
 
   UT_ASSERT_EQ(first, 1);
-  /* Current (possibly buggy) behavior: second pass re-counts the already-NOP
-   * unreachable instruction.  Do not change production code; pin behavior. */
-  UT_ASSERT_EQ(second, first);
+  /* Idempotent return value: nothing new was NOPed on the second run. */
+  UT_ASSERT_EQ(second, 0);
   UT_ASSERT_EQ(dead_op_after_first, TCCIR_OP_NOP);
   UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP); /* no new non-NOP -> NOP changes */
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);

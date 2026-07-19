@@ -24,6 +24,54 @@ bisecting a culprit pass. Reproducers land in `tests/fuzz/fuzz_triage_repros/`.
 The sweep is **self-contained** — pure bash + `xargs -P` over `runseed.sh`, no
 `pytest`/`pytest-xdist` dependency (so it works regardless of the active venv).
 
+## Re-checking only the seeds that failed
+
+Sweeping a band to answer "did my change break anything *new*?" is almost all
+waste: you already know which seeds diverge, and re-running the other 5,999 only
+confirms that. `batch_sweep.py --seeds` takes an explicit list and skips the band
+entirely — the 25 known-divergent seeds of `sweep_all.py 0 6000` re-check in
+**under a second**, versus ~65 s for the full band and far longer for a triage
+sweep.
+
+```bash
+# One profile, one explicit list.  --olevels needs the "=" form: argparse
+# otherwise eats the leading "-O0" as a flag.
+python3 tests/fuzz/batch_sweep.py --profile ptr \
+        --seeds "1,1410,1450,2107" --olevels="-O0,-O1,-O2,gcc-O0" --no-cache
+```
+
+Output is the tagged form — `OLEVELS` (tcc levels disagree with each other),
+`VSGCC` (they agree but differ from the gcc reference), `GCCBAD` (gcc itself is
+inconsistent). Seeds are per-profile, so keep one list per profile: seed 96 of
+`combo` and seed 96 of `ptr` are different programs.
+
+The point of the re-check is the **A/B**, not the absolute count. A sweep report
+listing failing seeds means nothing on its own — those seeds may have been
+failing for months. Two ways to establish that, cheapest first:
+
+```bash
+# 1. Kill switch, if the change has one (no rebuild):
+TCC_NO_SCRATCH_DEMOTE=1 python3 tests/fuzz/batch_sweep.py --profile ptr \
+        --seeds "$SEEDS" --olevels="-O0,-O1,-O2,gcc-O0" --no-cache
+
+# 2. Against HEAD.  Now affordable, because the sweep itself is ~1 s:
+git stash -- <the files you changed> && make cross -j$(nproc)
+python3 tests/fuzz/batch_sweep.py --profile ptr --seeds "$SEEDS" \
+        --olevels="-O0,-O1,-O2,gcc-O0" --no-cache
+git stash pop && make cross -j$(nproc)
+```
+
+Identical seed sets = pre-existing, and the change is clear. A seed that
+diverges only with the change on is yours: reduce it per
+`docs/debugging_fuzz_divergences.md`.
+
+Two caveats. `batch_sweep.py` is the ~80%-recall pre-scan (it runs each seed one
+call frame deep, so miscompiles that depend on crt0's exact entry state hide) —
+a clean seed-list re-check is evidence about *those seeds*, not a certification
+of the band, so a wide sweep still has to run once. And `--no-cache` matters:
+without it a cached result from the previous build can be served back and the
+A/B compares a binary against itself.
+
 ## Prerequisites
 
 - `make cross` built `armv8m-tcc` (rebuild after any compiler change).

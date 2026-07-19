@@ -44,11 +44,13 @@ FLAT_OPT_SRC = \
 	source/opt/flat/memory/var_store_elim.c \
 	source/opt/flat/memory/entry_store_prop.c \
 	source/opt/flat/memory/sl_forward.c \
+	source/opt/flat/memory/copy_source_load_fwd.c \
 	source/opt/flat/memory/dead_local_slot.c \
 	source/opt/flat/memory/dead_temp_local.c \
 	source/opt/flat/memory/dead_static_store.c \
 	source/opt/flat/memory/global_base_share.c \
 	source/opt/flat/memory/byte_store_merge.c \
+	source/opt/flat/memory/mem_inline.c \
 	source/opt/flat/fusion/indexed_chain.c \
 	source/opt/flat/fusion/pair_reorder.c \
 	source/opt/flat/fusion/disp.c \
@@ -90,6 +92,8 @@ FLAT_OPT_SRC = \
 	source/opt/flat/loop/loop_eliminate.c \
 	source/opt/flat/loop/loop_unroll.c \
 	source/opt/flat/loop/loop_rotate.c \
+	source/opt/flat/loop/loop_relayout.c \
+	source/opt/flat/loop/seq_guard_elim.c \
 	source/opt/flat/loop/decrement_to_zero.c \
 	source/opt/flat/loop/const_sim.c \
 	source/opt/flat/scalar/neg_chain_cse.c \
@@ -108,6 +112,8 @@ FLAT_OPT_SRC = \
 	source/opt/flat/loop/stack_param_promote.c \
 	source/opt/flat/memory/invariant_global_load_hoist.c \
 	source/opt/flat/memory/invariant_temp_deref_hoist.c \
+	source/opt/flat/memory/global_deref_cse.c \
+	source/opt/flat/memory/bitfield_unit_narrow.c \
 	source/opt/flat/memory/rmw_byte_clear.c \
 	source/opt/flat/memory/local_copy_prop.c \
 	source/opt/flat/memory/struct_copy_roundtrip_elim.c \
@@ -126,6 +132,7 @@ FLAT_OPT_SRC = \
 	source/opt/flat/memory/small_global_memset_to_store.c \
 	source/opt/flat/memory/mem_init.c \
 	source/opt/flat/memory/addrof_var_fwd.c \
+	source/opt/flat/memory/ptr_local_fwd.c \
 	source/opt/flat/memory/memmove_to_indexed_stores.c
 
 # Header set the units depend on (force a rebuild on interface edits).

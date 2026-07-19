@@ -39,15 +39,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Make tests/fuzz importable (same pattern as diff_olevels.py).
-REPO_ROOT = Path(__file__).resolve().parent.parent
-FUZZ_DIR = REPO_ROOT / "tests" / "fuzz"
-if str(FUZZ_DIR) not in sys.path:
-    sys.path.insert(0, str(FUZZ_DIR))
-
-import fuzz_harness as H                      # noqa: E402
-from fuzz_harness import CompileConfig, compile_testcase, MACHINE  # noqa: E402
-from gen_c import generate_program, PROFILES  # noqa: E402
+from sources.fuzz_common import (
+    REPO_ROOT,
+    H,
+    CompileConfig,
+    compile_testcase,
+    MACHINE,
+    generate_program,
+    PROFILES,
+)
 
 DEFAULT_OPT_LEVELS = ["-O0", "-O1", "-O2", "-Os"]
 OBJDUMP = "arm-none-eabi-objdump"
@@ -196,9 +196,15 @@ def main(argv=None) -> int:
         log("reduction skipped (--skip-reduce)")
     else:
         log(f"reducing (low=-O0 high={high}) ... this can take a few minutes")
+        # Per-seed scratch dir: reduce_divergence.py otherwise defaults to the
+        # SHARED tests/fuzz/results/_reduce, so two triages running at once
+        # overwrite each other's candidate.c and the oracle answers about the
+        # sibling's program -- which "reduces" into a file that does not even
+        # compile.
         r = subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "reduce_divergence.py"),
-             str(source), f"--low=-O0", f"--high={high}", "-o", str(reduced)],
+             str(source), f"--low=-O0", f"--high={high}", "-o", str(reduced),
+             "--work-dir", str(out_dir / "_reduce")],
             capture_output=True, text=True)
         if r.returncode == 0 and reduced.exists():
             bisect_input = reduced
@@ -213,9 +219,13 @@ def main(argv=None) -> int:
         log("bisect skipped (--skip-bisect)")
     else:
         log(f"bisecting {bisect_input.name} at {high} ...")
+        # Same sharing hazard as the reduce step above: bisect_opt.py defaults
+        # to the shared tests/fuzz/results/_bisect, and every triage feeds it a
+        # file named reduced.c, so concurrent runs collide on one ELF name.
         r = subprocess.run(
             [sys.executable, str(REPO_ROOT / "scripts" / "bisect_opt.py"),
-             "--file", str(bisect_input), f"--high={high}"],
+             "--file", str(bisect_input), f"--high={high}",
+             "--work-dir", str(out_dir / "_bisect")],
             capture_output=True, text=True)
         (out_dir / "bisect.txt").write_text(r.stdout + r.stderr)
         m = re.search(r"Culprit knob\(s\).*?:\s*(.*)", r.stdout)

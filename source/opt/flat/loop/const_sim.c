@@ -20,10 +20,19 @@
 #include "opt_utils.h"
 #include "licm.h"
 
-#define LCS_MAX_TRIP_COUNT   16
-#define LCS_MAX_ITER_STEPS   512  /* steps per iteration before giving up */
+#define LCS_MAX_TRIP_COUNT   64
+/* Bounds the work a candidate can burn before being declined.  A 64-trip loop
+ * (LCS_MAX_TRIP_COUNT) with a 30-instruction body needs ~1980, so this covers
+ * every shape that actually folds while halving what a doomed one costs. */
+#define LCS_MAX_ITER_STEPS   2048
 #define LCS_MAX_TRACKED_VARS 256
 #define LCS_MAX_TRACKED_TMPS 256
+/* The per-TEMP state array is heap-allocated from the region's own maximum, so
+ * only a sanity bound applies; LCS_MAX_TRACKED_TMPS bounds the fixed-size
+ * address bitmaps in lcs_generic_loop_is_stack_local, not the simulator.  A
+ * heavily-inlined caller reaches TEMP positions in the thousands. */
+#define LCS_MAX_TMP_POS      65536
+#define LCS_MAX_VAR_POS      65536
 #define LCS_MAX_PARAMS       4
 #define LCS_MAX_CALLS        32   /* distinct call_ids tracked per iteration */
 #define LCS_MAX_MEM_SLOTS    64   /* distinct stack offsets the simulator tracks */
@@ -206,6 +215,12 @@ static int lcs_classify_softcall(const char *name, int *out_is_double, int *out_
   if (!strcmp(name, "__aeabi_cdcmple")) { *out_is_double = 1; return 21; }
   if (!strcmp(name, "__aeabi_cfcmpeq")) { return 22; }
   if (!strcmp(name, "__aeabi_cfcmple")) { return 23; }
+  /* 64-bit integer helpers: the IR passes the whole long long as one operand,
+   * so these are ordinary two-operand evaluations. */
+  if (!strcmp(name, "__aeabi_llsl")) { return 30; }
+  if (!strcmp(name, "__aeabi_llsr")) { return 31; }
+  if (!strcmp(name, "__aeabi_lasr")) { return 32; }
+  if (!strcmp(name, "__aeabi_lmul")) { return 33; }
   return 0;
 }
 
@@ -370,6 +385,24 @@ static int lcs_eval_softcall(int kind, int is_double, LcsState *st,
   int64_t a1 = nparams >= 2 ? params[1] : 0;
   int64_t result = 0;
 
+  if (kind >= 30)
+  {
+    /* Shift counts >= 64 are undefined in C; the helpers return 0 for them,
+     * but a fold must not bake in behaviour the program never relies on. */
+    if (kind != 33 && ((uint64_t)a1 >= 64))
+      return 0;
+    switch (kind) {
+    case 30: result = (int64_t)((uint64_t)a0 << (unsigned)a1); break;
+    case 31: result = (int64_t)((uint64_t)a0 >> (unsigned)a1); break;
+    case 32: result = (int64_t)(a0 >> (unsigned)a1); break;
+    case 33: result = (int64_t)((uint64_t)a0 * (uint64_t)a1); break;
+    default: return 0;
+    }
+    *out = result;
+    *out_btype = IROP_BTYPE_INT64;
+    return 1;
+  }
+
   if (kind >= 20)
   {
     st->cmp_v1 = a0;
@@ -460,6 +493,55 @@ static int lcs_eval_softcall(int kind, int is_double, LcsState *st,
   }
   *out = result;
   return 1;
+}
+
+/* tcc_ir_barrel_shift_fusion folds a single-use 32-bit shift into src2 of an
+ * ADD/SUB/AND/OR/XOR/CMP and records it in ir->barrel_shifts[] rather than in
+ * the operand — and it runs BEFORE this pass (run_post_ra_optimizations is
+ * called ahead of tcc_ir_ssa_regalloc, despite the name).  So the real RHS is
+ * `(src2 SHIFT #n)` and every src2 value read must come through here, or the
+ * simulator computes `h + v` where the code computes `h + (v << 6)`.
+ *
+ * The fusion is 32-bit only (it declines any INT64 operand) and rejects a zero
+ * amount for everything but LSL, so this is a plain 32-bit barrel shift whose
+ * result is held sign-extended, matching lcs_truncate's convention.  Returns 0
+ * for an encoding it does not model, which fails the simulation. */
+static int lcs_apply_barrel_shift(const TCCIRState *ir, const IRQuadCompact *q,
+                                  int64_t *v)
+{
+  uint8_t enc = tcc_ir_barrel_shift_at(ir, q);
+  if (!enc)
+    return 1;
+  unsigned amount = enc & 31u;
+  uint32_t x = (uint32_t)*v;
+  uint32_t res;
+  switch (enc >> 5)
+  {
+  case 1: res = x << amount; break;                       /* LSL */
+  case 2: res = x >> amount; break;                       /* LSR */
+  case 3: res = (uint32_t)((int32_t)x >> amount); break;  /* ASR */
+  case 4: res = amount ? ((x >> amount) | (x << (32 - amount))) : x; break; /* ROR */
+  default: return 0;
+  }
+  *v = (int64_t)(int32_t)res;
+  return 1;
+}
+
+/* src2 as the instruction really consumes it: value first, barrel shift after. */
+static int lcs_read_src2(const TCCIRState *ir, const LcsState *st,
+                         const IRQuadCompact *q, IROperand op, int64_t *out)
+{
+  return lcs_read_operand(ir, st, op, out) && lcs_apply_barrel_shift(ir, q, out);
+}
+
+/* A break and the latch fall-through often land on either side of a dead NOP;
+ * both are the same exit edge, so branch targets are compared NOP-normalized. */
+static int lcs_skip_nops(const TCCIRState *ir, int idx)
+{
+  int n = ir->next_instruction_index;
+  while (idx >= 0 && idx < n && ir->compact_instructions[idx].op == TCCIR_OP_NOP)
+    idx++;
+  return idx;
 }
 
 /* Returns taken/not-taken, or -1 for an unsupported token; NaN makes every relation false except "!=". */
@@ -665,8 +747,9 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
     int kind = lcs_classify_softcall(name, &is_double, &nargs);
     if (!kind) { r.action = 0; return r; }
     /* VOID variants must be cdcmp* helpers (kinds 20-23) */
-    if (op == TCCIR_OP_FUNCCALLVOID && kind < 20) { r.action = 0; return r; }
-    if (op == TCCIR_OP_FUNCCALLVAL && kind >= 20) { r.action = 0; return r; }
+    int is_flag_setter = (kind >= 20 && kind <= 23);
+    if (op == TCCIR_OP_FUNCCALLVOID && !is_flag_setter) { r.action = 0; return r; }
+    if (op == TCCIR_OP_FUNCCALLVAL && is_flag_setter) { r.action = 0; return r; }
 
     uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, src2);
     int call_id = TCCIR_DECODE_CALL_ID(enc);
@@ -695,7 +778,7 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
   {
     int64_t v1, v2;
     if (!lcs_read_operand(ir, st, src1, &v1) ||
-        !lcs_read_operand(ir, st, src2, &v2))
+        !lcs_read_src2(ir, st, q, src2, &v2))
     {
       r.action = 0;
       return r;
@@ -729,7 +812,7 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
       r.next_pc = target;
       return r;
     }
-    if (target == exit_target)
+    if (target == exit_target || lcs_skip_nops(ir, target) == exit_target)
     {
       r.action = -1;
       return r;
@@ -763,7 +846,8 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
     int target = (int)irop_get_imm64_ex(ir, dest);
 
     int target_in_loop = (target >= start_idx && target <= end_idx);
-    int target_is_exit = (target == exit_target);
+    int target_is_exit = (target == exit_target ||
+                          lcs_skip_nops(ir, target) == exit_target);
 
     if (taken)
     {
@@ -798,8 +882,11 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
   case TCCIR_OP_IMOD:
   case TCCIR_OP_UMOD:
   {
-    /* ADD/SUB of a stack address and an integer yields another stack address. */
-    if (op == TCCIR_OP_ADD || op == TCCIR_OP_SUB)
+    /* ADD/SUB of a stack address and an integer yields another stack address.
+     * A shifted address operand has no stack-model meaning, so an annotated
+     * ADD/SUB never takes this path. */
+    if ((op == TCCIR_OP_ADD || op == TCCIR_OP_SUB) &&
+        !tcc_ir_barrel_shift_at(ir, q))
     {
       int32_t a1_off, a2_off;
       int a1_is_addr = lcs_resolve_stack_addr(st, src1, &a1_off) &&
@@ -829,7 +916,7 @@ static LcsStep lcs_exec(TCCIRState *ir, LcsState *st, IRQuadCompact *q, int pc,
     }
     int64_t v1, v2;
     if (!lcs_read_operand(ir, st, src1, &v1) ||
-        !lcs_read_operand(ir, st, src2, &v2))
+        !lcs_read_src2(ir, st, q, src2, &v2))
     {
       r.action = 0;
       return r;
@@ -923,6 +1010,23 @@ static int lcs_scan_body(TCCIRState *ir, int start_idx, int end_idx,
       continue;
     if (!lcs_op_supported(q->op)) {
       return 0;
+    }
+    /* lcs_apply_barrel_shift only covers the ops tcc_ir_barrel_shift_fusion
+     * annotates today.  Should that set ever widen, an unmodelled consumer
+     * would read src2 unshifted, so decline rather than mis-simulate it. */
+    uint8_t bsh = tcc_ir_barrel_shift_at(ir, q);
+    if (bsh)
+    {
+      switch (q->op)
+      {
+      case TCCIR_OP_ADD: case TCCIR_OP_SUB: case TCCIR_OP_AND:
+      case TCCIR_OP_OR:  case TCCIR_OP_XOR: case TCCIR_OP_CMP:
+        break;
+      default:
+        return 0;
+      }
+      if ((bsh >> 5) < 1 || (bsh >> 5) > 4)
+        return 0;
     }
     /* FUNCCALL src1 is a callee SYMREF, not a value source. */
     int is_call = (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID);
@@ -1379,7 +1483,7 @@ static int lcs_find_single_exit_target(TCCIRState *ir, int start_idx,
   int exit_target = -1;
 
 #define LCS_RECORD_EXIT(t_) do {                         \
-    int _t = (t_);                                       \
+    int _t = lcs_skip_nops(ir, (t_));                    \
     if (exit_target < 0) exit_target = _t;               \
     else if (exit_target != _t) return 0;                \
   } while (0)
@@ -1418,6 +1522,27 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
   uint8_t addr_var[LCS_MAX_TRACKED_VARS] = {0};
   uint8_t addr_tmp[LCS_MAX_TRACKED_TMPS] = {0};
   int saw_stack_mem __attribute__((unused)) = 0;
+
+  /* The address bitmaps are fixed-size; a position past them would silently read
+   * as "not an address", so decline the region instead. */
+  for (int i = start_idx; i <= end_idx; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    IROperand ops[3] = { tcc_ir_op_get_dest(ir, q), tcc_ir_op_get_src1(ir, q),
+                         tcc_ir_op_get_src2(ir, q) };
+    for (int k = 0; k < 3; k++)
+    {
+      int32_t vr = irop_get_vreg(ops[k]);
+      if (vr < 0)
+        continue;
+      int vt = TCCIR_DECODE_VREG_TYPE(vr);
+      int pos = TCCIR_DECODE_VREG_POSITION(vr);
+      if (vt == TCCIR_VREG_TYPE_VAR && pos >= LCS_MAX_TRACKED_VARS)
+        return 0;
+      if (vt == TCCIR_VREG_TYPE_TEMP && pos >= LCS_MAX_TRACKED_TMPS)
+        return 0;
+    }
+  }
 
   for (int i = start_idx; i <= end_idx; i++)
   {
@@ -1595,27 +1720,24 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
       return 0;
   }
 
+  /* Compare exits NOP-normalized: a `break` and the latch fall-through are the
+   * same edge even when a dead NOP sits between their two targets. */
+  exit_target = lcs_skip_nops(ir, exit_target);
+
   /* Every branch must stay inside the range or land exactly at exit. */
   for (int i = eff_start; i <= eff_end; i++)
   {
     IRQuadCompact *qx = &ir->compact_instructions[i];
     if (qx->op != TCCIR_OP_JUMP && qx->op != TCCIR_OP_JUMPIF) continue;
     int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, qx));
-    if ((t < eff_start || t > eff_end) && t != exit_target)
+    if ((t < eff_start || t > eff_end) && lcs_skip_nops(ir, t) != exit_target)
       return 0;
   }
 
-  int max_var = -1, max_tmp = -1;
-  uint8_t written_bitmap[LCS_MAX_TRACKED_VARS / 8] = {0};
-  if (!lcs_scan_body(ir, eff_start, eff_end, &max_var, &max_tmp,
-                     written_bitmap, sizeof(written_bitmap)))
-    return 0;
-  if (max_var >= LCS_MAX_TRACKED_VARS || max_tmp >= LCS_MAX_TRACKED_TMPS)
-    return 0;
-
-  /* n_vars must also cover VARs used outside the loop, for initial-state reads. */
+  /* n_vars must also cover VARs used outside the loop, for initial-state reads,
+   * so the tables are sized from the whole function up front. */
   int n = ir->next_instruction_index;
-  int outer_max_var = max_var;
+  int outer_max_var = -1;
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -1632,8 +1754,21 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
       if (pos > outer_max_var) outer_max_var = pos;
     }
   }
-  if (outer_max_var >= LCS_MAX_TRACKED_VARS)
+  if (outer_max_var >= LCS_MAX_VAR_POS)
     return 0;
+
+  int max_var = -1, max_tmp = -1;
+  int written_bitmap_bytes = outer_max_var / 8 + 1;
+  uint8_t *written_bitmap = tcc_mallocz((size_t)written_bitmap_bytes);
+  if (!lcs_scan_body(ir, eff_start, eff_end, &max_var, &max_tmp,
+                     written_bitmap, written_bitmap_bytes) ||
+      max_tmp >= LCS_MAX_TMP_POS)
+  {
+    tcc_free(written_bitmap);
+    return 0;
+  }
+  if (max_var > outer_max_var)
+    outer_max_var = max_var;
 
   LcsState st = {0};
   st.n_vars = outer_max_var + 1;
@@ -1644,6 +1779,13 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
   st.mem   = tcc_mallocz(sizeof(LcsMemSlot) * LCS_MAX_MEM_SLOTS);
 
   lcs_init_var_state(ir, loop->start_idx, &st);
+  /* Seeding walks every pre-loop store, so a caller with many stack slots fills
+   * the table before simulation even starts.  That overflow is harmless: an
+   * untracked slot is simply unknown, so an in-loop read of it fails and an
+   * in-loop write to it hits the same full table and fails too (both paths bail
+   * on their own).  Only an overflow raised during simulation is unsafe, so the
+   * flag is reset here and re-armed for the run. */
+  st.mem_overflow = 0;
 
   /* The generic path has no primary IV; the pre-loop scan supplies its values. */
   if (have_iv_trip && iv->init_idx >= 0)
@@ -1663,9 +1805,17 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
     }
   }
 
+  /* Entry is the header, which is not always the lowest instruction in the
+   * region: a rotated loop puts the latch increment ahead of the header, and
+   * the preheader jumps over it.  Simulating (and later, placing residuals)
+   * from eff_start would run that increment on the first iteration too and
+   * write the residual into a slot the preheader jumps past (980619-1). */
+  int region_entry = (header_idx >= eff_start && header_idx <= eff_end)
+                         ? header_idx : eff_start;
+
   /* Run until the exit edge is taken, bounded by trip_count * body size. */
   int sim_ok = 1;
-  int pc = eff_start;
+  int pc = region_entry;
   int total_steps = 0;
   int step_trip_bound = have_iv_trip ? trip_count : LCS_MAX_TRIP_COUNT;
   int max_total_steps = (step_trip_bound + 1) * (eff_end - eff_start + 1) + 32;
@@ -1699,6 +1849,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
 
   if (!sim_ok || st.mem_overflow)
   {
+    tcc_free(written_bitmap);
     tcc_free(st.vars);
     tcc_free(st.tmps);
     tcc_free(st.calls);
@@ -1709,6 +1860,24 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
   /* Without a trip count the region may be a switch dispatch mis-detected as a loop. */
   if (!have_iv_trip && lcs_any_mem_used_after(ir, &st, exit_target))
   {
+    tcc_free(written_bitmap);
+    tcc_free(st.vars);
+    tcc_free(st.tmps);
+    tcc_free(st.calls);
+    tcc_free(st.mem);
+    return 0;
+  }
+
+  /* NOPing the region makes it fall through to eff_end+1.  When that is not
+   * where the loop actually exited (an `if`-arm loop leaves via a jump over the
+   * else arm), the residual must end with an explicit branch or control drops
+   * into the wrong block.  NOPs inside the region are irrelevant here: only
+   * slots past eff_end decide where the fall-through lands. */
+  int need_exit_jump = (lcs_skip_nops(ir, eff_end + 1) != exit_target);
+  if (need_exit_jump &&
+      (exit_target < 0 || exit_target >= ir->next_instruction_index))
+  {
+    tcc_free(written_bitmap);
     tcc_free(st.vars);
     tcc_free(st.tmps);
     tcc_free(st.calls);
@@ -1718,8 +1887,8 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
 
   /* Residuals can only reuse NOP slots, so count them before NOPing the loop. */
   {
-    int needed = 0;
-    int avail = eff_end - eff_start + 1;
+    int needed = need_exit_jump ? 1 : 0;
+    int avail = eff_end - region_entry + 1;
     if (have_iv_trip && TCCIR_DECODE_VREG_TYPE(iv->vreg) == TCCIR_VREG_TYPE_VAR &&
         lcs_var_used_after(ir, TCCIR_DECODE_VREG_POSITION(iv->vreg), exit_target))
       needed++;
@@ -1742,6 +1911,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
     }
     if (needed > avail)
     {
+      tcc_free(written_bitmap);
       tcc_free(st.vars);
       tcc_free(st.tmps);
       tcc_free(st.calls);
@@ -1755,7 +1925,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
   else
     LOG_IR_GEN("[LOOP-CONST-SIM] folding loop header=%d by bounded simulation", loop->header_idx);
 
-  int slot_pos = eff_start;
+  int slot_pos = region_entry;
   int slot_end = eff_end;
 
   /* Prefer the simulated final value: the loop may exit early on a data-dependent condition. */
@@ -1855,6 +2025,15 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
     write_instr_at_nop(ir, slot_pos++, TCCIR_OP_STORE, d, s, IROP_NONE);
   }
 
+  /* Restore the exit edge the NOPed region used to take, after the residuals so
+   * they are still executed.  The slot was reserved in the needed/avail count. */
+  if (need_exit_jump)
+  {
+    IROperand exit_dest = irop_make_imm32(-1, exit_target, IROP_BTYPE_INT32);
+    write_instr_at_nop(ir, slot_pos++, TCCIR_OP_JUMP, exit_dest, IROP_NONE, IROP_NONE);
+    ir->compact_instructions[exit_target].is_jump_target = 1;
+  }
+
   /* NOP the IV init and any pre-loop guard CMP+JUMPIF on the IV. */
   if (have_iv_trip && iv->init_idx >= 0 && iv->init_idx < loop->start_idx)
   {
@@ -1878,6 +2057,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
     }
   }
 
+  tcc_free(written_bitmap);
   tcc_free(st.vars);
   tcc_free(st.tmps);
   tcc_free(st.calls);

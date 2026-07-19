@@ -1,6 +1,7 @@
 # Plan: Retire flat-IR scalar passes in favor of their SSA analogs
 
-**Status:** in progress · **Created:** 2026-07-07 · **Updated:** 2026-07-19 · **Branch:** `legacyOptRemoval`
+**Status:** ★**COMPLETE** — every pass in scope is terminal, no open candidates ·
+**Created:** 2026-07-07 · **Updated:** 2026-07-19 · **Branch:** `legacyOptRemoval`
 
 Scope: pre-RA flat-IR **scalar** passes that duplicate an SSA pass already running at
 `-O1+`. For each pass, reach a terminal state — **deleted** (SSA subsumes) or **kept
@@ -49,13 +50,14 @@ too: shared helpers hide in pass files (`gsym_cse_insert_before` lived in the ot
 ## Measured -O2 gap — every live flat propagation/memory pass (2026-07-19)
 
 Gap = corpus bytes with the pass disabled minus enabled; i.e. what the flat pass still buys
-over the SSA analogs. Baseline 20229 funcs / 759497 bytes.
+over the SSA analogs. Baseline 20229 funcs / 759497 bytes. (The `string_calls` row was
+re-measured on the post-porting tree: 20230 funcs / 759428 bytes.)
 
 | Pass | Gap | Funcs | State |
 |---|---|---|---|
 | `self_arith` | +26 | 2 | [A★] pr70222-1 pre-SSA 64-bit-shift cascade |
 | `self_copy_elim` | +41 | 5 | [A★] no SSA analog |
-| **`string_calls`** | **+12** | **10** | **[B] memchr ported (was +65/13); residual = phase ordering** |
+| `string_calls` | +2 | 2 | [A★] fold half **retired**; residual is `memcmp(a,b,1)` lowering |
 | `add_reassoc` | +59 | 61 | [A★] `ssa:reassoc` deliberately single-use |
 | `cmp_expr_fold` | +105 | 4 | [A~] 4 residuals resist; likely terminal A |
 | `symref_prop` | +133 | 19 | [A★] enabler for flat `global_init`; SSA runs the inverse |
@@ -73,23 +75,46 @@ over the SSA analogs. Baseline 20229 funcs / 759497 bytes.
 | `const_var_prop` | +3529 | 238 | [A★] |
 | `known_bits` | +9967 | 148 | [A★] stateful DSL |
 
-Not table-gated (measured by stubbing): `addrof_var_fwd` **+6** — [B~], last residual
-(`pr57321`, `226_fuzz`) needs relaxing the addr-taken forwarding guard (seed-814-class,
-fuzz-sensitive). Memory cluster (`sl_forward` +10807, `dse` +1525, `dead_var_store_elim`
-+253, `entry_store_prop`) all heavily load-bearing → [A★].
+`addrof_var_fwd` **+9 / 1 func** — [A★] terminal (re-measured 2026-07-19; the pass now
+carries its own `TCC_DISABLE_PASS` check since it is called directly, not through the table).
+Memory cluster (`sl_forward` +10807, `dse` +1525, `dead_var_store_elim` +253,
+`entry_store_prop`) all heavily load-bearing → [A★].
 
-## TODO — open Branch-B candidates
+## TODO — open Branch-B candidates: **none**
 
-1. **`string_calls`** → `ssa:const_string_fold`. `memchr` handler landed 2026-07-19 (Step 1),
-   closing +53: gap **+65/13 → +12/10**, default-pipeline object-diff 0. Residual = three
-   `ir/*pure_func_*` at +3 (phase ordering) + seven diffuse +1, against −4 where flat loses.
-   Next: Step 2 classification then the Step 3 redirect-table question, both in
-   [`plan_ssa_const_string_fold.md`](plan_ssa_const_string_fold.md) § Retiring flat `string_calls`.
-2. ~~`symref_prop`~~ — **assessed 2026-07-19 → [A★] terminal.** See § below.
-3. ~~`stack_bool`~~ — **assessed 2026-07-19 → [A★] terminal.** See § below.
-4. **`addrof_var_fwd`** — [B~] +6, blocked on the fuzz-sensitive guard relaxation.
+Every candidate reached a terminal state on 2026-07-19.
 
-## Assessed 2026-07-19 — both remaining [B] candidates are Branch A
+1. ~~`string_calls`~~ — **[A★] terminal** (fold half retired to SSA). See § below.
+2. ~~`symref_prop`~~ — **[A★] terminal.** See § below.
+3. ~~`stack_bool`~~ — **[A★] terminal.** See § below.
+4. ~~`addrof_var_fwd`~~ — **[A★] terminal**, +9 in one function; the guard relaxation this was
+   blocked on was measured and buys **nothing** (the blocker is structural, not the guard).
+   See [`addrof_var_fwd_ssa_migration.md`](addrof_var_fwd_ssa_migration.md).
+
+Re-measured 2026-07-19 on the post-porting tree, all unchanged and terminal: `self_arith`
++26 · `self_copy_elim` +41 · `add_reassoc` +59 · `cmp_expr_fold` +111.
+
+## Assessed 2026-07-19 — all remaining [B] candidates are Branch A
+
+### `string_calls` → [A★] (fold half retired, lowering half stays)
+
+The pass was **split, not deleted**: every constant fold now lives in
+`ssa:const_string_fold`, and what remains in
+[`const_string_calls.c`](../source/opt/flat/scalar/const_string_calls.c) (117 lines) is pure
+lowering. Measured fold residual on the corpus is **0** — the +2/2 gap is the
+`memcmp(a,b,1)` → `__tcc_memcmp1` two-argument specialization, whose length operand only
+becomes constant after IR constant propagation (`pr100576`: `int b = sizeof v;`), so the
+frontend cannot own it.
+
+The `__tcc_*` redirect table is live (mempcpy 161 · memmove 136 · strcat 17 · strlen 16 ·
+stpncpy 5 corpus hits) and is **not** a duplicate of tccgen's redirect switch: three of those
+builtins have no frontend case at all, and the `strlen` hits come from calls *other IR passes
+create* after the frontend (`fputs(s,f)` → `fwrite(s,1,strlen(s),f)` in `991008-1`). Full
+evidence in [`plan_ssa_const_string_fold.md`](plan_ssa_const_string_fold.md) § Step 2/3.
+
+Test debt from the split was cleared: two now-vacuous `ir_opt_eval_stack_strlen` guards
+dropped from `test_opt_constfold.c`, jump-boundary guard ported to
+`test_ssa_opt_const_string_fold.c`.
 
 ### `symref_prop` → [A★]
 
@@ -107,6 +132,21 @@ reusing a cached address register). Forwarding in SSA would ping-pong with it.
 Residual after `global_init`: `strlen-2`/`strlen-3` `test_array_ref` (+30) is *not* a fold
 gap — those strlens fold either way; the delta is downstream address-hoist/RA (one
 callee-saved base vs. per-use literal loads). Rest is diffuse ±1, −6 where flat loses.
+
+### `addrof_var_fwd` → [A★]
+
+Gap is down to a single function (`gcc-execute/pr57321::main`, +9). The prize is not the
+`*p → #0` fold itself but the alias precision it gives: the unresolved `*T1` read keeps a dead
+140-byte array init alive as an `__aeabi_memset`.
+
+The blocker was believed to be the fuzz-sensitive addr-taken guard in `ssa:load_cse`. It is
+not: env-gating **both** `vslot_var_forwardable`'s addr-taken veto and `vslot_track_store`'s
+LEA-source skip off leaves the function at 30 instructions, exactly as with the guards on.
+`ssa_opt_resolve_lea_stackloc_ex` bails one step earlier — it walks TEMP defs only, and
+`T1 <-- V1` is an lval read of a VAR slot — and the deref consumer reads the stack-offset
+table while VAR-slot constants live in a different one. Closing it is a new memory-model
+capability, not a guard tweak, for 9 instructions in 1/20230 functions. Full evidence in
+[`addrof_var_fwd_ssa_migration.md`](addrof_var_fwd_ssa_migration.md).
 
 ### `stack_bool` → [A★]
 
@@ -135,7 +175,8 @@ A2 done 2026-07-19: extracted out of the shared `branch_fold.c` into
 only `float_branch`, which is fuzz-gated for deletion — after that the file goes away.
 
 **Pending user-run fuzz gates before deleting retained bodies:** float_branch · neg_chain_cse ·
-single_val_tmp · addrof_var_fwd guard relaxation.
+single_val_tmp. (The `addrof_var_fwd` guard relaxation is **dropped** — measured 2026-07-19 to
+buy nothing; no fuzz exposure was ever taken.)
 
 ## Out of scope — stay flat by design
 
@@ -167,11 +208,13 @@ construction, so no fuzz gate. `gsym_cse_insert_before` was rescued from the del
 
 ## Terminal — kept flat (Branch A)
 
-All passes marked [A★] in the gap table above, plus the memory/DCE cluster
+All passes marked [A★] in the gap table above, plus `addrof_var_fwd` and the memory/DCE cluster
 (`sl_forward`, `global_sl_fwd`, `entry_store_prop`, `dse`, `dead_var_store_elim`),
 `known_bits`, `const_prop_tmp`, `var_tmp_fwd`, `setif_or_taut`, `globalsym_cse`,
-`cmp_offset_fold`, `float_narrow` (inert, UT-only driver), `symref_prop`, `stack_bool`.
+`cmp_offset_fold`, `float_narrow` (inert, UT-only driver), `symref_prop`, `stack_bool`,
+`string_calls` (lowering-only remnant).
 
 ## Partial (SSA analog live, flat still runs)
 
-`string_calls` → `ssa:const_string_fold` (only open Branch-B pass; residual +12)
+None. `string_calls` was the last one — its fold half retired into `ssa:const_string_fold`
+(residual 0) and the lowering remnant is terminal [A★].

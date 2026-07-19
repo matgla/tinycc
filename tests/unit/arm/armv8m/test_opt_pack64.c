@@ -929,6 +929,70 @@ UT_TEST(test_shift64_dead_half_shift_amount_below_32_no_mark)
   return 0;
 }
 
+/* POSITIVE (skip_hi): a 64-bit SHR by >=32 fills its HIGH word with a constant
+ * 0.  When the single use is a TRUNCATING ASSIGN (64-bit source, 32-bit dest)
+ * that fill is never read, so the pass annotates bit1 (skip_hi).  Note the
+ * ASSIGN's SOURCE operand stays I64 -- the DEST width is what decides that only
+ * the low half is read, which is the case the rule must recognise. */
+UT_TEST(test_shift64_dead_half_marks_skip_hi_truncating_assign)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_temporary_variable = 2;
+
+  int i_shr = utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I64), utb_temp(0, I64), utb_imm(41, I32)); /* 0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_temp(1, I64), UTB_NONE);                  /* 1 */
+  ir->max_orig_index = 1;
+
+  int changes = tcc_ir_opt_shift64_dead_half(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT(ir->shift64_dead_half != NULL);
+  UT_ASSERT_EQ(ir->shift64_dead_half[ir->compact_instructions[i_shr].orig_index] & 2, 2);
+  /* No IR mutation. */
+  UT_ASSERT_EQ(utb_op(ir, i_shr), TCCIR_OP_SHR);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (skip_hi): the single use is a WIDE assign (64-bit dest), which
+ * copies both halves -- the high fill is read, so it must be materialized. */
+UT_TEST(test_shift64_dead_half_wide_use_no_skip_hi)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_temporary_variable = 2;
+
+  utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I64), utb_temp(0, I64), utb_imm(41, I32));
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I64), utb_temp(1, I64), UTB_NONE);
+  ir->max_orig_index = 1;
+
+  int changes = tcc_ir_opt_shift64_dead_half(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (skip_hi): shift amount < 32 keeps a data-dependent high word, and
+ * the emitter does not honour skip_hi on that path anyway. */
+UT_TEST(test_shift64_dead_half_skip_hi_below_32_no_mark)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_temporary_variable = 2;
+
+  utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I64), utb_temp(0, I64), utb_imm(20, I32));
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_temp(1, I64), UTB_NONE);
+  ir->max_orig_index = 1;
+
+  int changes = tcc_ir_opt_shift64_dead_half(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+
+  utb_free(ir);
+  return 0;
+}
+
 UT_COVERS("pack64");
 UT_COVERS("pack64_from_stack_stores");
 UT_COVERS("pack64_implicit");

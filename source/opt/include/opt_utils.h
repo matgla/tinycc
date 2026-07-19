@@ -39,6 +39,9 @@ int ir_opt_fold_memchr_offset(const char *s, unsigned char c, uint64_t n, int *o
 int evaluate_compare_condition(int64_t val1, int64_t val2, int cond_token);
 
 /* Applies signed/unsigned + width semantics derived from the operand types. */
+int evaluate_compare_condition_cmp_annotated(const TCCIRState *ir, const IRQuadCompact *q,
+                                             int64_t val1, int64_t val2, int cond,
+                                             IROperand src1, IROperand src2);
 int evaluate_compare_condition_cmp_operands(int64_t val1, int64_t val2, int cond,
                                             IROperand src1, IROperand src2);
 /* IEEE NaN branch result for a soft-FP compare condition token: 0/1/-1. */

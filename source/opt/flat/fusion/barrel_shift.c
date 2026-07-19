@@ -29,6 +29,17 @@
  *
  * Encoding: barrel_shifts[i] = (type<<5)|amount
  *   type: 1=SHL, 2=SHR, 3=SAR, 4=ROR.  amount: 0-31.
+ *
+ * SHL into ADD is the one combination that can LOSE instructions, because
+ * `t = x SHL #n; a = base ADD t; *a` is exactly `base[x]` -- the shape the
+ * addressing-mode selector collapses into a single `ldr rd,[base,x,lsl #n]`.
+ * Eating the shift here leaves a standalone address-forming ADD behind and
+ * costs one instruction per access (pr46883's loop body grew 25->32, pr53645
+ * 762->852).  Two gates keep only the profitable half: skip when the ADD's
+ * result reaches an address, and skip scales 1..3 outright (the only ones a
+ * scaled addressing mode can encode, so a consumer this pass does not model --
+ * PREFETCH, a later-formed indexed access -- can still claim them).  Every
+ * other consumer keeps the fusion, which is a strict win: the shift vanishes.
  */
 void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
 {
@@ -41,6 +52,49 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
 
   IROptDU du;
   ir_opt_du_build(ir, &du);
+
+  /* Vregs that reach a memory operation's address: an is_lval operand (a real
+   * pointer -- is_local/is_llocal reads a stack variable's value, not an
+   * address), or any operand of an already-formed indexed/post-inc/LEA access,
+   * whose base is src1 for loads but dest for stores.  Marking those ops'
+   * value operand too only forfeits a fusion, never breaks one.  One O(n)
+   * prepass keeps the per-candidate test O(1). */
+  uint8_t *deref_base = du.total > 0 ? tcc_mallocz((size_t)du.total) : NULL;
+  if (deref_base)
+  {
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int addressing = 0;
+      switch (q->op)
+      {
+      case TCCIR_OP_LOAD_INDEXED: case TCCIR_OP_STORE_INDEXED:
+      case TCCIR_OP_LOAD_POSTINC: case TCCIR_OP_STORE_POSTINC:
+      case TCCIR_OP_LEA:
+        addressing = 1;
+        break;
+      default:
+        break;
+      }
+      for (int k = 0; k < 3; k++)
+      {
+        if (k == 0 ? !irop_config[q->op].has_dest
+                   : k == 1 ? !irop_config[q->op].has_src1
+                            : !irop_config[q->op].has_src2)
+          continue;
+        IROperand s = k == 0 ? tcc_ir_op_get_dest(ir, q)
+                    : k == 1 ? tcc_ir_op_get_src1(ir, q)
+                             : tcc_ir_op_get_src2(ir, q);
+        if (!irop_has_vreg(s))
+          continue;
+        if (!addressing && (!s.is_lval || s.is_local || s.is_llocal))
+          continue;
+        int idx = ir_opt_du_idx(&du, irop_get_vreg(s));
+        if (idx >= 0)
+          deref_base[idx] = 1;
+      }
+    }
+  }
 
   for (int i = 0; i < n; i++)
   {
@@ -75,7 +129,6 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
       int stype;
       switch (sq->op) {
       case TCCIR_OP_SHL:
-        if (q->op == TCCIR_OP_ADD) continue;
         stype = 1; break;
       case TCCIR_OP_SHR: stype = 2; break;
       case TCCIR_OP_SAR: stype = 3; break;
@@ -112,6 +165,17 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
        * backend's shift-by-0 identity fold (arm-thumb-gen.c) to lower as MOV. */
       if (amount == 0 && stype != 1)
         continue;
+
+      /* `base + (idx << 1..3)` is a scaled addressing mode; so is any ADD whose
+       * result reaches a dereference.  Leave both for the addressing selector. */
+      if (stype == 1 && q->op == TCCIR_OP_ADD) {
+        if (amount >= 1 && amount <= 3)
+          continue;
+        IROperand ad = tcc_ir_op_get_dest(ir, q);
+        int aidx = irop_has_vreg(ad) ? ir_opt_du_idx(&du, irop_get_vreg(ad)) : -1;
+        if (!deref_base || aidx < 0 || deref_base[aidx])
+          continue;
+      }
 
       IROperand shift_src1 = tcc_ir_op_get_src1(ir, sq);
       if (!irop_has_vreg(shift_src1))
@@ -157,6 +221,7 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
     }
   }
 
+  tcc_free(deref_base);
   tcc_free(du.def);
 }
 

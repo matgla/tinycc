@@ -14,6 +14,7 @@
 #include "ir.h"
 #include "opt.h"
 #include "opt_engine.h"
+#include "opt_utils.h"
 
 /* Within one block: V=#N; T=&V; deref of T becomes #N, if &V never escapes. */
 int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir)
@@ -22,6 +23,11 @@ int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir)
   int changes = 0;
 
   if (n < 3)
+    return 0;
+
+  /* Called directly from function_pipeline.c, not through the pass table, so the
+   * bisection knob has to be checked here (docs/addrof_var_fwd_ssa_migration.md). */
+  if (tcc_ir_opt_pass_disabled("addrof_var_fwd"))
     return 0;
 
   for (int i = 0; i < n; i++)

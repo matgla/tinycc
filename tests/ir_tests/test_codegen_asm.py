@@ -10,6 +10,7 @@ levers land, the failing assertions should be flipped to lock in the wins.
 """
 
 import re
+import hashlib
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -27,7 +28,13 @@ OBJDUMP = "arm-none-eabi-objdump"
 def _compile(name, extra_cflags=()):
     """Cross-compile a case in asm/<name>.c to an object file."""
     src = ASM_DIR / f"{name}.c"
-    obj = BUILD_DIR / f"{name}.o"
+    # The object name must include the flags, not just the source: two tests
+    # compiling the same case with different -mfloat-abi/-mfpu otherwise share
+    # one .o and race under pytest-xdist.  That was invisible while both FP
+    # tests expected the same lowering; it surfaced the moment one of them
+    # started expecting VFP and the other __aeabi_ calls.
+    tag = hashlib.sha1(" ".join(extra_cflags).encode()).hexdigest()[:8] if extra_cflags else "base"
+    obj = BUILD_DIR / f"{name}.{tag}.o"
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
 
     cflags = [
@@ -152,25 +159,27 @@ def test_r9_spill_around_calls():
 # -----------------------------------------------------------------------------
 # Forward conditional branch narrowing
 # -----------------------------------------------------------------------------
-def test_forward_branch_conditional_still_wide():
+def test_forward_branch_conditional_narrows():
     obj = _compile("forward_branch_narrow")
     funcs = _disassemble(obj)
     loop = funcs["loop"]
 
-    wide_fwd = sum(_count_mnem(loop, m) for m in ("bgt.w", "bge.w", "blt.w", "ble.w", "beq.w", "bne.w"))
+    wide = sum(_count_mnem(loop, m)
+               for m in ("bgt.w", "bge.w", "blt.w", "ble.w", "beq.w", "bne.w", "b.w"))
     narrow_back = _count_mnem(loop, "blt.n")
 
     # Loop rotation is enabled, so the loop is bottom-tested: the back-edge is a
     # tight conditional narrow `blt.n` rather than an unconditional `b.n`.
     assert narrow_back >= 1, f"expected narrow backward blt.n, got {narrow_back}"
-    # Forward conditional branches still stay wide (Phase 2a not landed).
-    assert wide_fwd >= 1, f"expected forward wide conditional branch, got {wide_fwd}"
+    # Every branch here is short-range, and the rehearsal pass can prove it for
+    # the forward ones too, so nothing should be left in a wide encoding.
+    assert wide == 0, f"expected all branches narrow, got {wide} wide"
 
 
 # -----------------------------------------------------------------------------
 # CBZ/CBNZ fusion
 # -----------------------------------------------------------------------------
-def test_cbz_fusion_disabled():
+def test_cbz_fusion_fires():
     obj = _compile("cbz_fusion")
     funcs = _disassemble(obj)
 
@@ -178,12 +187,13 @@ def test_cbz_fusion_disabled():
         fn = funcs[name]
         cmp_count = _count_mnem(fn, "cmp")
         cbz_count = _count_mnem(fn, "cbz") + _count_mnem(fn, "cbnz")
-        # One of beq.w or bne.w depending on polarity.
-        cond_wide = _count_mnem(fn, "beq.w") + _count_mnem(fn, "bne.w")
+        cond = sum(_count_mnem(fn, m) for m in ("beq.w", "bne.w", "beq.n", "bne.n"))
 
-        assert cmp_count >= 1, f"{name}: expected cmp #0, got {cmp_count}"
-        assert cond_wide >= 1, f"{name}: expected wide conditional branch, got {cond_wide}"
-        assert cbz_count == 0, f"{name}: cbz/cbnz fusion unexpectedly enabled ({cbz_count})"
+        # `cmp rN,#0` + `b<eq|ne>` collapses into one 16-bit CBZ/CBNZ now that
+        # the rehearsal pass can bound the forward distance from both sides.
+        assert cbz_count >= 1, f"{name}: expected cbz/cbnz fusion, got {cbz_count}"
+        assert cmp_count == 0, f"{name}: cmp #0 should have been folded away, got {cmp_count}"
+        assert cond == 0, f"{name}: conditional branch should have been folded away, got {cond}"
 
 
 # -----------------------------------------------------------------------------
@@ -248,7 +258,9 @@ def test_arith_imm_reg_shapes():
     # Register forms.
     assert _count_mnem(funcs["add_reg"], "adds") >= 1, "add_reg missing adds"
     assert _count_mnem(funcs["sub_reg"], "subs") >= 1, "sub_reg missing subs"
-    assert _count_mnem(funcs["mul_reg"], "mul.w") >= 1, "mul_reg missing mul.w"
+    # Hardware multiply; the narrow T16 MULS form is used when the destination
+    # is also a source and NZCV is dead.
+    assert _count_mnem_regex(funcs["mul_reg"], r"^muls?(\.w)?\b") >= 1, "mul_reg missing hardware multiply"
 
 
 # -----------------------------------------------------------------------------
@@ -267,7 +279,7 @@ def test_arith_div_mod_lowering():
         fn = funcs[name]
         div_mnem = "sdiv" if name == "mod_signed" else "udiv"
         assert _count_mnem(fn, div_mnem) >= 1, f"{name} missing {div_mnem}"
-        assert _count_mnem(fn, "mul.w") >= 1, f"{name} missing mul.w"
+        assert _count_mnem_regex(fn, r"^muls?(\.w)?\b") >= 1, f"{name} missing hardware multiply"
         assert _count_mnem(fn, "subs") >= 1, f"{name} missing subs"
         assert not any("__aeabi" in ops for _, ops in fn), f"{name} unexpectedly calls runtime helper"
 
@@ -335,7 +347,7 @@ def test_control_branch_conditional_and_loop():
     count = funcs["count"]
     # Loop should have a conditional forward test and a narrow back-edge.
     assert _count_mnem(count, "cmp") >= 1, "count missing comparison"
-    assert _count_mnem_regex(count, r"^bge\.w") >= 1, "count missing forward conditional branch"
+    assert _count_mnem_regex(count, r"^bge\.[wn]") >= 1, "count missing forward conditional branch"
     assert _count_mnem(count, "b.n") >= 1, "count missing narrow back-edge"
 
     ifte = funcs["if_then_else"]
@@ -442,9 +454,12 @@ def test_call_aapcs_long_long():
     funcs = _disassemble(obj)
 
     callee = funcs["callee_long"]
-    # 64-bit args arrive in r0:r1 and r2:r3; result leaves in r0:r1.
-    assert _count_mnem_regex(callee, r"^adds\s+r4, r0, r2") >= 1, "callee_long missing low-word add"
-    assert _count_mnem_regex(callee, r"^adc\.w\s+r5, r1, r3") >= 1, "callee_long missing high-word adc"
+    # 64-bit args arrive in r0:r1 and r2:r3; result leaves in r0:r1.  The
+    # return-pair preference computes it there directly, so there is no copy
+    # out of a callee-saved pair and no prolog at all.
+    assert _count_mnem_regex(callee, r"^adds\s+r0, r0, r2") >= 1, "callee_long missing low-word add into r0"
+    assert _count_mnem_regex(callee, r"^adcs?(\.w)?\s+r1,\s*(r1,\s*)?r3") >= 1, "callee_long missing high-word adc into r1"
+    assert _count_mnem(callee, "push") == 0, "callee_long should need no callee-saved pair"
 
     caller = funcs["caller_long"]
     # Caller loads 64-bit args into r0:r1 and r2:r3 before the branch.
@@ -457,7 +472,10 @@ def test_call_aapcs_stack_arg():
 
     callee = funcs["callee_stack"]
     # Fifth arg is passed on the stack and loaded from caller's frame.
-    assert _count_mnem_regex(callee, r"^ldr\s+r2, \[sp, #24\]") >= 1, "callee_stack missing stack-arg load"
+    # Offset 8 = the two pushed regs; the old #24 additionally covered a
+    # speculative 16-byte scratch reservation that dead-frame elimination
+    # (dry-run-sized scratch areas) no longer allocates.
+    assert _count_mnem_regex(callee, r"^ldr\s+r2, \[sp, #8\]") >= 1, "callee_stack missing stack-arg load"
 
     caller = funcs["caller_stack"]
     # Caller must store the fifth arg to its own stack before calling.
@@ -481,25 +499,138 @@ def test_fp_soft_float_uses_runtime_helpers():
         assert vfp_count == 0, f"{name} unexpectedly emitted VFP instruction under soft float"
 
 
-@pytest.mark.xfail(
-    reason="hard-float VFP lowering not implemented yet (Phase 4 gap): fp_select "
-    "still emits __aeabi_fadd/__aeabi_dadd/__aeabi_fmul under -mfloat-abi=hard. "
-    "Remove this marker once the hard-float codegen work lands.",
-    strict=True,
-)
 def test_fp_hard_float_uses_vfp():
-    """Hard-float ABI with VFP should select VFP instructions, not __aeabi_* helpers.
+    """Anything but -mfloat-abi=soft should compute floats on the FPU.
 
-    This test documents the current codegen gap: even with -mfloat-abi=hard
-    -mfpu=fpv5-sp-d16, fp_select lowers to __aeabi_fadd/__aeabi_dadd/__aeabi_fmul.
-    See Phase 4 findings in docs/plan_whole_tinycc_coverage.md.
+    Was a strict xfail documenting the gap; single-precision arithmetic now
+    lowers to vadd.f32 / vmul.f32 inline (thumb_emit_vfp_arith_mop) instead of
+    __aeabi_fadd / __aeabi_fmul.  Only the *single*-precision ops are asserted:
+    on fpv5-sp-d16 there is no double-precision unit, so addd legitimately
+    stays a call.
     """
     obj = _compile("fp_select", extra_cflags=["-mfloat-abi=hard", "-mfpu=fpv5-sp-d16"])
     funcs = _disassemble(obj)
 
-    vfp_count = sum(
-        _count_mnem(funcs[name], m)
-        for name in ("addf", "addd", "mulf")
-        for m in ("vadd.f32", "vadd.f64", "vmul.f32", "vmul.f64")
-    )
-    assert vfp_count >= 1, "hard-float ABI did not emit any VFP instructions (Phase 4 gap)"
+    for name, mnem in (("addf", "vadd.f32"), ("mulf", "vmul.f32")):
+        assert _count_mnem(funcs[name], mnem) >= 1, f"{name} did not emit {mnem}"
+        assert not any("__aeabi_fadd" in ops or "__aeabi_fmul" in ops for _, ops in funcs[name]), \
+            f"{name} still calls a single-precision runtime helper"
+
+
+# -----------------------------------------------------------------------------
+# 64-bit register-deref LDRD/STRD pairing vs packed-access safety
+# -----------------------------------------------------------------------------
+def test_ldrd_deref_pairing_and_packed_safety():
+    obj = _compile("ldrd_deref_pair")
+    funcs = _disassemble(obj)
+
+    # Aligned typed derefs: the align4_ok bit unlocks the paired encodings.
+    assert _count_mnem(funcs["ll_load"], "ldrd") == 1, "ll_load: expected LDRD for *p (long long)"
+    assert _count_mnem(funcs["ll_store"], "strd") == 1, "ll_store: expected STRD for *p = v"
+    assert _count_mnem(funcs["d_load"], "ldrd") == 1, "d_load: expected LDRD for *p (double)"
+
+    # Packed-derived accesses may be < 4-byte aligned: LDRD/STRD would fault
+    # (UsageFault regardless of UNALIGN_TRP), so they must stay on the
+    # unaligned-tolerant LDR/STR pair.  pk_arr/pk_arr_store also cover the
+    # LOAD_INDEXED/STORE_INDEXED lowering via the underalign_hint transfer.
+    for name in ("pk_load", "pk_store", "pk_arr", "pk_arr_store"):
+        fn = funcs[name]
+        paired = _count_mnem(fn, "ldrd") + _count_mnem(fn, "strd")
+        assert paired == 0, f"{name}: LDRD/STRD on a packed access would fault, got {paired}"
+
+
+def test_mem_inline_expansion_policy():
+    obj = _compile("mem_inline_expand")
+    funcs = _disassemble(obj)
+
+    # n == 4: single ldr/str pair, no call, and never LDRD/STRD (char* base).
+    cp4 = funcs["cp4"]
+    assert _count_mnem(cp4, "bl") == 0, "cp4: 4-byte memcpy must inline"
+    assert _count_mnem(cp4, "ldrd") + _count_mnem(cp4, "strd") == 0, \
+        "cp4: LDRD/STRD would fault on an unaligned char*"
+
+    # n == 8 memcpy: strict policy keeps the call (2-piece expansion loses
+    # statically vs `movs #8; bl`).
+    assert _count_mnem_regex(funcs["cp8"], r"^(bl|b\.w)\s") >= 1, \
+        "cp8: 8-byte memcpy must stay a runtime call"
+
+    # n == 8 memset: movs + two word STRs, no call, no STRD.
+    st8 = funcs["st8"]
+    assert _count_mnem(st8, "bl") == 0, "st8: 8-byte memset must inline"
+    assert _count_mnem(st8, "strd") == 0, \
+        "st8: STRD would fault on an unaligned char*"
+
+    # n == 0: no call, no memory access at all.
+    cp0 = funcs["cp0"]
+    assert _count_mnem(cp0, "bl") == 0, "cp0: zero-size memcpy must vanish"
+
+    # The float-bits reinterpret expands and store-load forwards: no call and
+    # no stack traffic once the copy is forwarded.
+    fb = funcs["fbits"]
+    assert _count_mnem(fb, "bl") == 0, "fbits: 4-byte memcpy must inline"
+
+
+def test_switch_pair_merge_no_spill():
+    obj = _compile("sw_pair_merge")
+    funcs = _disassemble(obj)
+
+    # Every case must compute directly into the coalesced merge pair: no
+    # per-case spill slots, no str/ldr round-trips through the stack.  The
+    # broken shape was 4 sp accesses PER CASE (32 here); the only tolerated
+    # stack traffic is the dispatch index itself (it crosses the R12-using
+    # dispatch while every callee-saved register is occupied): 1 str + 2 ldr.
+    fn = funcs["sw8"]
+    sp_traffic = _count_mnem_regex(fn, r"^(str|ldr)(\.w)?\s.*\[sp")
+    assert sp_traffic <= 3, \
+        f"sw8: case temps must not spill (got {sp_traffic} sp accesses)"
+
+
+def test_sym_base_reuse():
+    obj = _compile("sym_base_reuse")
+    funcs = _disassemble(obj)
+
+    # Repeated accesses through the same global base must materialize the
+    # symbol address exactly once; later accesses reuse the parked register
+    # (get_scratch_reg_for_sym_addr + the imm_cache elide in load_full_const).
+    for name in ("lookup6", "scatter"):
+        fn = funcs[name]
+        pool_loads = _count_mnem_regex(fn, r"^ldr(\.w)?\s+\S+,\s*\[pc")
+        assert pool_loads == 1, \
+            f"{name}: expected 1 literal-pool base load, got {pool_loads}"
+
+
+def test_const_pool_hoist():
+    obj = _compile("const_pool_hoist")
+    funcs = _disassemble(obj)
+
+    # A MOV/MVN/MOVW-unencodable constant (0x9e3779b1) must be loaded from
+    # the literal pool exactly once per function and stay register-resident:
+    # across calls via the entry hoist, around a call-free loop via the
+    # preheader hoist (const classes in ssa:global_addr_hoist /
+    # loop_addr_hoist).
+    for name in ("hash_calls", "hash_loop"):
+        fn = funcs[name]
+        pool_loads = _count_mnem_regex(fn, r"^ldr(\.w)?\s+\S+,\s*\[pc")
+        assert pool_loads == 1, \
+            f"{name}: expected 1 literal-pool constant load, got {pool_loads}"
+
+    # Straight-line regions deliberately have NO const hoist: local_addr_cse
+    # regions are call/branch-free, where the machine-level imm_cache already
+    # reuses the register when scratch churn permits, and a hoisted temp costs
+    # a callee-saved push/pop (andok::foo went 6 -> 8 that way).  This bound
+    # characterizes the residual churn misses; tighten it if that improves.
+    straight = _count_mnem_regex(funcs["hash_straight"], r"^ldr(\.w)?\s+\S+,\s*\[pc")
+    assert straight <= 3, \
+        f"hash_straight: expected <=3 literal-pool loads, got {straight}"
+
+
+def test_bool_chain_fuse():
+    obj = _compile("bool_chain_fuse")
+    funcs = _disassemble(obj)
+
+    # Both bool checks must fold to `bl f; cmp; b<cond>`: no SETIF
+    # materialization (ite/movne/moveq) and exactly one comparison.
+    for name in ("chk_direct", "chk_inverted"):
+        fn = funcs[name]
+        assert _count_mnem(fn, "ite") == 0, f"{name}: SETIF chain not fused"
+        assert _count_mnem(fn, "cmp") == 1, f"{name}: expected a single cmp"

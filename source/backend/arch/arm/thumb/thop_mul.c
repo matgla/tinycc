@@ -37,6 +37,7 @@ static const thop_variant_shape SHAPE_MUL_T16 = {
     .size = THOP_VARIANT_T16,
     .rd_place = {0, 3},
     .rm_place = {3, 3},
+    .implicit_s = 1,
     .feat = {.t16 = 1},
 };
 
@@ -107,12 +108,21 @@ TH_TABLE(TH_SDIV, "sdiv", {&SHAPE_DIV, 0xfb90f0f0, NULL});
 thumb_opcode th_mul(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behaviour flags,
                         thumb_enforce_encoding encoding)
 {
-  (void)flags;
-  if (encoding == ENFORCE_ENCODING_32BIT || rd > 7 || rm > 7 || rn > 7 || rd != rm)
-    return thop_emit(TH_MUL_T32.name, TH_MUL_T32.variants, TH_MUL_T32.variant_count,
-                     (thop_args){.rd = rd, .rm = rm, .rn = rn});
-  return thop_emit(TH_MUL_T16.name, TH_MUL_T16.variants, TH_MUL_T16.variant_count,
-                   (thop_args){.rd = rd, .rm = rn});
+  /* T16 MULS <Rdm>,<Rn>,<Rdm> computes Rdm = Rn * Rdm, so the destination must
+     be one of the sources.  MUL is commutative, so either rd == rm or rd == rn
+     is encodable - the latter simply swaps which operand plays Rn.  The T16
+     form has an implicit S bit, so it is only usable when the caller does not
+     need NZCV preserved. */
+  bool t16_possible = encoding != ENFORCE_ENCODING_32BIT && rd <= 7 && rn <= 7 && rm <= 7 &&
+                      flags != FLAGS_BEHAVIOUR_BLOCK;
+  if (t16_possible && (rd == rm || rd == rn))
+  {
+    uint32_t other = (rd == rm) ? rn : rm;
+    return thop_emit(TH_MUL_T16.name, TH_MUL_T16.variants, TH_MUL_T16.variant_count,
+                     (thop_args){.rd = rd, .rm = other, .flags = flags, .enc = encoding});
+  }
+  return thop_emit(TH_MUL_T32.name, TH_MUL_T32.variants, TH_MUL_T32.variant_count,
+                   (thop_args){.rd = rd, .rm = rm, .rn = rn, .flags = flags, .enc = encoding});
 }
 
 thumb_opcode th_mla(uint32_t rd, uint32_t rn, uint32_t rm, uint32_t ra)

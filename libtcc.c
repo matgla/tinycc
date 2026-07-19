@@ -2068,11 +2068,20 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
           s->opt_inline_limit = n;
         break;
       }
+      /* Plain -fno-builtin: disable all builtin call inlining (mem* expansion). */
+      if (!strcmp(optarg, "no-builtin"))
+      {
+        s->no_builtin_funcs |= NO_BUILTIN_MEMFUNCS;
+        break;
+      }
       /* Handle -fno-builtin-<name> flags */
       if (!strncmp(optarg, "no-builtin-", 11))
       {
         const char *bname = optarg + 11;
-        if (!strcmp(bname, "abs"))
+        if (!strcmp(bname, "memcpy") || !strcmp(bname, "memset") ||
+            !strcmp(bname, "memmove"))
+          s->no_builtin_funcs |= NO_BUILTIN_MEMFUNCS;
+        else if (!strcmp(bname, "abs"))
           s->no_builtin_funcs |= NO_BUILTIN_ABS;
         else if (!strcmp(bname, "labs"))
           s->no_builtin_funcs |= NO_BUILTIN_LABS;
@@ -2138,6 +2147,13 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       else if (!strcmp(optarg, "fpv5-d16"))
       {
         s->fpu_type = ARM_FPU_FPV5_D16;
+      }
+      else if (!strcmp(optarg, "rp2350") || !strcmp(optarg, "rp2350-dcp"))
+      {
+        /* RP2350: FPv5-SP single-precision FPU plus the Raspberry Pi double
+         * coprocessor (DCP) on CP4.  Selects librp2350fp for the runtime
+         * calls the compiler does not lower inline. */
+        s->fpu_type = ARM_FPU_RP2350;
       }
       else if (!strcmp(optarg, "neon") || !strcmp(optarg, "neon-vfpv3"))
       {

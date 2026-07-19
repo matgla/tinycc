@@ -369,20 +369,53 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
                        : (which == 2) ? tcc_ir_op_get_src2(ir, cons_q)
                                       : tcc_ir_op_get_dest(ir, cons_q);
 
-    /* Skip a STRUCT-typed consumer operand: irop_make_stackoff writes u.imm32
-     * unconditionally, corrupting ctype_idx for a struct read. A STRUCT
-     * lea_src is fine — the scalar consumer carries its own non-struct btype. */
-    if (old_op.btype == IROP_BTYPE_STRUCT)
-      continue;
-
-    /* Direct StackLoc at the folded offset (is_lval=1), built from scratch via
-     * irop_make_stackoff so union members init cleanly, then copy the
-     * consumer's load-width info (btype/is_unsigned) onto it. */
     int folded_off = base_offset + add_offset;
-    IROperand new_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1, /*is_llocal*/ 0,
-                                          /*is_param_flag*/ (int)lea_src.is_param, old_op.btype);
-    new_op.is_unsigned = old_op.is_unsigned;
-    new_op.is_static = lea_src.is_static;
+    IROperand new_op;
+
+    if (old_op.btype == IROP_BTYPE_STRUCT)
+    {
+      /* A struct-typed slot operand keeps its offset in u.s.aux_data and its
+       * element type in u.s.ctype_idx, so irop_make_stackoff — which writes
+       * u.imm32 over both — cannot build one.  Clone the LEA's own
+       * Addr[StackLoc] source instead (same slot, same struct type) and turn it
+       * into the deref at the folded offset.  This is what folds
+       * `T = &local_struct; PARAM *T` into `PARAM StackLoc[..]`, dropping the
+       * `add rX, sp, #off` that precedes every by-value struct argument.
+       *
+       * Requires a STRUCT lea_src to clone from, and an offset that fits the
+       * int16_t aux_data field. */
+      if (lea_src.btype != IROP_BTYPE_STRUCT)
+        continue;
+      if (folded_off < -32768 || folded_off > 32767)
+        continue;
+      /* Start from the CONSUMER's operand — it is the one carrying the struct's
+       * pool ctype index (the LEA's Addr[] source need not) — and rewrite only
+       * the addressing half: `u` survives the `vr` reset because ctype_idx and
+       * aux_data live outside the bitfield word. */
+      new_op = old_op;
+      new_op.vr = 0;
+      irop_set_vreg(&new_op, -1);
+      new_op.tag = IROP_TAG_STACKOFF;
+      new_op.is_lval = 1;
+      new_op.is_llocal = 0;
+      new_op.is_local = 1;
+      new_op.is_const = 0;
+      new_op.btype = IROP_BTYPE_STRUCT;
+      new_op.u.s.aux_data = (int16_t)folded_off;
+      irop_init_phys_regs(&new_op);
+      new_op.is_param = lea_src.is_param;
+      new_op.is_static = lea_src.is_static;
+    }
+    else
+    {
+      /* Direct StackLoc at the folded offset (is_lval=1), built from scratch via
+       * irop_make_stackoff so union members init cleanly, then copy the
+       * consumer's load-width info (btype/is_unsigned) onto it. */
+      new_op = irop_make_stackoff(-1, folded_off, /*is_lval*/ 1, /*is_llocal*/ 0,
+                                  /*is_param_flag*/ (int)lea_src.is_param, old_op.btype);
+      new_op.is_unsigned = old_op.is_unsigned;
+      new_op.is_static = lea_src.is_static;
+    }
 
     if (which == 1)
       tcc_ir_op_set_src1(ir, cons_q, new_op);

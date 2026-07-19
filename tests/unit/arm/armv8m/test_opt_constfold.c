@@ -1832,13 +1832,36 @@ UT_TEST(test_detect_const_result_assign_then_return_positive)
 
 /* GUARD: a function that takes parameters is never treated as a
  * (zero-arg) constant-result function. */
-UT_TEST(test_detect_const_result_has_params_rejected)
+/* A param-taking function still folds when the op-shape check proves the body
+ * never reads the params (helper1-style: `return x ^ x` optimizes to
+ * `RETURNVALUE #K` regardless of the arguments). */
+UT_TEST(test_detect_const_result_has_params_accepted)
 {
   TCCIRState *ir = utb_new();
   ir->next_parameter = 1;
   ir->parameters_count = 1;
 
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
+
+  int64_t value;
+  int btype;
+  UT_ASSERT_EQ(tcc_ir_detect_const_result(ir, &value, &btype), 1);
+  UT_ASSERT_EQ(value, 1);
+  UT_ASSERT_EQ(btype, I32);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: a body whose returned value actually depends on a param must not
+ * fold — the return operand is a vreg with no immediate ASSIGN feeding it. */
+UT_TEST(test_detect_const_result_param_read_rejected)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 1;
+  ir->parameters_count = 1;
+
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_param(0, I32), UTB_NONE);
 
   int64_t value;
   int btype;
@@ -2070,83 +2093,6 @@ UT_TEST(test_local_addrof_64bit_store_value_no_fold)
   UT_ASSERT_EQ(utb_op(ir, i_lea), TCCIR_OP_LEA);
   UT_ASSERT_EQ(utb_op(ir, i_store), TCCIR_OP_STORE);
 
-  utb_free(ir);
-  return 0;
-}
-
-/* ============================================================================
- *  const_string_calls — stack-strlen path (ir_opt_eval_stack_strlen), which
- *  needs no ELF section data: it tracks byte-exact STORE sequences into a
- *  stack buffer and memcpy-like calls copying a (separately) const string in.
- * ============================================================================ */
-
-/* GUARD: the same stack buffer but missing the NUL terminator byte (only 2 of
- * 3 bytes known) -> ir_opt_eval_stack_strlen's final scan finds `known[i]==0`
- * before any zero byte and fails, so strlen falls through to the
- * __tcc_strlen redirect instead of a direct fold. */
-UT_TEST(test_const_string_calls_strlen_stack_no_nul_no_direct_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee_sym;
-  IROperand callee = utb_callee_named(ir, &callee_sym, 91);
-  utb_set_tok_str(91, "strlen");
-
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(0, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('h', IROP_BTYPE_INT8), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(1, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('i', IROP_BTYPE_INT8), UTB_NONE);
-  /* no NUL store */
-
-  IROperand buf_addr = irop_make_stackoff(-1, 0, 0, 0, 0, I32);
-  buf_addr.is_local = 1;
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf_addr, utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
-                        utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-
-  int changes = tcc_ir_opt_const_string_calls(ir);
-
-  /* Falls through to the __tcc_strlen redirect (a change of a different kind:
-   * change_callee_sym returns 0 here because external_global_sym is stubbed
-   * to NULL, so ultimately changes==0 and the call is left as FUNCCALLVAL). */
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_FUNCCALLVAL);
-
-  utb_set_tok_str(91, NULL);
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD: a JUMP between the stack stores and the strlen call invalidates the
- * pre-call scan (ir_opt_eval_stack_strlen bails on any jump/jump-target in
- * range), so the direct fold does not fire. */
-UT_TEST(test_const_string_calls_strlen_stack_jump_boundary_no_direct_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee_sym;
-  IROperand callee = utb_callee_named(ir, &callee_sym, 92);
-  utb_set_tok_str(92, "strlen");
-
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(0, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('h', IROP_BTYPE_INT8), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(1, 1, 0, 0, IROP_BTYPE_INT8), utb_imm(0, IROP_BTYPE_INT8), UTB_NONE);
-  /* An unconditional JUMP to the very next instruction -- still a JUMP in the
-   * pre-call scan range, which unconditionally bails the stack-strlen scan. */
-  int i_jump = utb_emit(ir, TCCIR_OP_JUMP, utb_imm(3, I32), UTB_NONE, UTB_NONE);
-
-  IROperand buf_addr = irop_make_stackoff(-1, 0, 0, 0, 0, I32);
-  buf_addr.is_local = 1;
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf_addr, utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
-                        utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-
-  int changes = tcc_ir_opt_const_string_calls(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_op(ir, i_jump), TCCIR_OP_JUMP);
-
-  utb_set_tok_str(92, NULL);
   utb_free(ir);
   return 0;
 }

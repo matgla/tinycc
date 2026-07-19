@@ -100,7 +100,15 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
         if (!irop_config[q->op].has_dest)
           continue;
         op = tcc_ir_op_get_dest(ir, q);
-        if (!op.is_lval)
+        /* A store-class dest is a USE of the base operand (address or pointer
+         * value) even with is_lval clear — STORE_INDEXED bases arrive without
+         * it from disp_fusion and mem_inline.  Missing this read kept a LEA
+         * looking dead, cleared the var's addrtaken, and register-promoted a
+         * local whose address was live (221_fuzz: str through the copied
+         * float bits). */
+        if (!op.is_lval &&
+            !(q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+              q->op == TCCIR_OP_STORE_POSTINC))
           continue;
       }
       else
@@ -221,12 +229,9 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir);
 int tcc_ir_opt_const_var_prop(TCCIRState *ir)
 {
   if (tcc_ir_opt_pass_disabled("const_var_prop")) return 0;
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on) return tcc_ir_opt_const_var_prop__timed(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_const_var_prop__timed(ir);
-  tcc_pass_timing_add("const_var_prop", tcc_pass_clk_us() - _t);
-  return _r;
+  int r;
+  TCC_PASS_TIMED(r, "const_var_prop", tcc_ir_opt_const_var_prop__timed(ir));
+  return r;
 }
 
 static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)

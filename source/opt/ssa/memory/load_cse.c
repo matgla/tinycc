@@ -577,6 +577,67 @@ static void iload_kill_for_store(GLoadState *st, int32_t store_base_vr, int stor
   }
 }
 
+/* Stack provenance of an ILoadEntry base, for the case
+ * ssa_opt_resolve_lea_stackloc() could NOT pin to an exact offset.
+ *
+ * "Unresolved" must not be read as "names global or heap memory": the common
+ * miss is a frame address plus a RUNTIME term (`&arr[0] + (i << 4)` for
+ * `arr[i][k]`), whose address still lands squarely in the frame — treating it
+ * as non-aliasing let a direct `StackLoc[n] <- v` store keep a stale indexed
+ * load alive across it (fuzz seed agg_deep:43933, test 397).
+ *
+ * So the answer defaults to "may be frame" and only turns into 0 when EVERY
+ * reachable operand of the address computation is provably outside this frame:
+ * a global/static symbol address, a caller-supplied PARAM pointer, or a plain
+ * constant.  Any load-sourced or otherwise opaque term keeps the kill. */
+static int iload_base_may_be_frame(IRSSAOptCtx *ctx, int32_t vr, int depth)
+{
+  if (vr < 0 || depth > 8)
+    return 1;
+  int type = TCCIR_DECODE_VREG_TYPE(vr);
+  if (type == TCCIR_VREG_TYPE_PARAM)
+    return 0;                     /* caller pointer: predates this frame */
+  if (type != TCCIR_VREG_TYPE_TEMP)
+    return 1;                     /* VAR &co: may hold &local */
+
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+  if (!vi || vi->def_instr < 0 || vi->def_count != 1)
+    return 1;
+
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
+  switch (dq->op) {
+  case TCCIR_OP_ASSIGN:
+  case TCCIR_OP_LEA:
+  case TCCIR_OP_ADD:
+  case TCCIR_OP_SUB:
+  case TCCIR_OP_OR:
+  case TCCIR_OP_XOR:
+  case TCCIR_OP_AND:
+  case TCCIR_OP_SHL:
+    break;
+  default:
+    return 1;                     /* LOAD/CALL/…: opaque provenance */
+  }
+
+  for (int s = 0; s < 2; s++) {
+    if (s == 0 ? !irop_config[dq->op].has_src1 : !irop_config[dq->op].has_src2)
+      continue;
+    IROperand op = s == 0 ? tcc_ir_op_get_src1(ir, dq) : tcc_ir_op_get_src2(ir, dq);
+    if (op.tag == IROP_TAG_STACKOFF || op.is_local || op.is_llocal)
+      return 1;                   /* a frame address feeds the computation */
+    if (op.is_lval)
+      return 1;                   /* value loaded from memory: unknown */
+    if (op.tag == IROP_TAG_SYMREF || op.is_sym)
+      continue;                   /* global/static address term */
+    if (irop_is_immediate(op))
+      continue;                   /* constant offset/mask term */
+    if (iload_base_may_be_frame(ctx, irop_get_vreg(op), depth + 1))
+      return 1;
+  }
+  return 0;
+}
+
 /* store to the local frame can't alias PARAM/VAR-pointer or non-stack-TEMP iloads; same-base still needs byte-range overlap */
 static void iload_kill_for_stack_store(IRSSAOptCtx *ctx, GLoadState *st, int32_t store_base_vr,
                                        int store_lo, int store_hi)
@@ -592,8 +653,10 @@ static void iload_kill_for_stack_store(IRSSAOptCtx *ctx, GLoadState *st, int32_t
     } else {
       int e_type = TCCIR_DECODE_VREG_TYPE(e->base_vr);
       if (e_type == TCCIR_VREG_TYPE_TEMP) {
-        /* TEMP base aliases only if it resolves to a stack location (union punning) */
-        if (ssa_opt_resolve_lea_stackloc(ctx, e->base_vr) != INT_MIN)
+        /* TEMP base aliases if it resolves to a stack location (union punning)
+         * OR if it merely *derives* from one (runtime-indexed frame address). */
+        if (ssa_opt_resolve_lea_stackloc(ctx, e->base_vr) != INT_MIN ||
+            iload_base_may_be_frame(ctx, e->base_vr, 0))
           kill = 1;
       } else if (e_type == TCCIR_VREG_TYPE_VAR) {
         /* VAR base may hold &local; kill conservatively */
@@ -630,8 +693,11 @@ static void iload_kill_for_direct_stack_store(IRSSAOptCtx *ctx, GLoadState *st,
           if (elo < store_hi && ehi > store_lo)
             kill = 1;
         }
+      } else if (iload_base_may_be_frame(ctx, e->base_vr, 0)) {
+        /* No exact offset, but the address still derives from the frame
+         * (e.g. `&arr[0] + (i << 4)`): it may overlap this store. */
+        kill = 1;
       }
-      /* TEMP base not resolving to the stack names global/heap memory: local store can't reach it */
     } else if (etype == TCCIR_VREG_TYPE_VAR) {
       /* VAR pointer may hold `&localarray[i]`; can't cheaply resolve its offset, invalidate conservatively */
       kill = 1;
@@ -839,6 +905,12 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
               } else {
                 new_op = se->stored_imm;
               }
+              /* src2 may carry a fused barrel shift (dest = src1 OP (src2
+               * SHIFT #n)); substituting an immediate would fold the
+               * UN-shifted value (same bail as const_prop_tmp). */
+              if (side == 1 && irop_is_immediate(new_op) &&
+                  tcc_ir_barrel_shift_at(ir, q))
+                continue;
               if (side == 0)
                 tcc_ir_set_src1(ir, i, new_op);
               else
@@ -906,6 +978,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
           }
         }
         if (!have_new)
+          continue;
+        /* Same barrel-shift bail as above: an immediate in an annotated src2
+         * would be folded/encoded un-shifted. */
+        if (side == 1 && irop_is_immediate(new_op) &&
+            tcc_ir_barrel_shift_at(ir, q))
           continue;
         if (side == 0)
           tcc_ir_set_src1(ir, i, new_op);

@@ -20,6 +20,21 @@
 #include "opt_utils.h"
 #include "opt_alias.h"
 #include "opt_loop_utils.h"
+#include "licm.h"
+
+/* A FUNCCALL whose callee is provably PURE or CONST writes no observable memory
+ * (its only stores are to its own stack frame; a store through a pointer param
+ * makes the inferred purity IMPURE).  Tracked store-load-forwarding state is
+ * therefore valid across such a call.  Same inference LICM trusts to hoist calls
+ * out of loops.  Returns 0 for indirect/unknown callees (conservative). */
+static int sl_fwd_callee_is_pure(TCCIRState *ir, IRQuadCompact *q)
+{
+  Sym *sym = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  if (!sym)
+    return 0;
+  int p = tcc_ir_get_func_purity(ir, sym);
+  return p == TCC_FUNC_PURITY_PURE || p == TCC_FUNC_PURITY_CONST;
+}
 
 
 
@@ -165,6 +180,80 @@ static int sl_fwd_narrow_demand_only(TCCIRState *ir, int32_t target_vr, int star
   return found_use ? 1 : 0;
 }
 
+/* Returns 1 iff EVERY read of value_vr anywhere in the function is "self-narrowing":
+ * an AND with an immediate mask that fits in load_bits, or a 32-bit SHL by at least
+ * (32 - load_bits).  Both produce a result that does not depend on value_vr's bits at
+ * or above load_bits, so the reader is correct even when value_vr carries arbitrary
+ * high bits (e.g. a wider store forwarded into a narrower load).  Because each such use
+ * discards the high bits *by itself*, this holds on every control-flow path with no need
+ * to reason about liveness or reachability — unlike sl_fwd_narrow_demand_only, which is
+ * a BB-local forward walk and is only sound when the forwarded value is already narrowed
+ * (its immediate-mask callers apply the mask, so its looseness is harmless there). */
+static int sl_fwd_all_uses_self_narrowing(TCCIRState *ir, int32_t value_vr, int load_bits)
+{
+  if (value_vr < 0 || load_bits <= 0 || load_bits >= 32)
+    return 0;
+  uint32_t mask_lim = (1u << load_bits) - 1;
+  int n = ir->next_instruction_index;
+  int found = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    int reads = 0;
+    if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == value_vr)
+      reads = 1;
+    if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == value_vr)
+      reads = 1;
+    if (q->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, q)) == value_vr)
+      reads = 1;
+    if (!reads)
+      continue;
+    found = 1;
+
+    if (q->op == TCCIR_OP_AND)
+    {
+      /* value_vr AND <imm fitting load_bits>: result = low bits of value_vr, correct. */
+      if (irop_is_64bit(tcc_ir_op_get_dest(ir, q)))
+        return 0;
+      IROperand a = tcc_ir_op_get_src1(ir, q);
+      IROperand b = tcc_ir_op_get_src2(ir, q);
+      IROperand imm;
+      if (irop_get_vreg(a) == value_vr && irop_is_immediate(b) && !b.is_sym)
+        imm = b;
+      else if (irop_get_vreg(b) == value_vr && irop_is_immediate(a) && !a.is_sym)
+        imm = a;
+      else
+        return 0;
+      uint64_t m = (uint64_t)(uint32_t)(int32_t)irop_get_imm64_ex(ir, imm);
+      if ((m & ~(uint64_t)mask_lim) != 0)
+        return 0;
+    }
+    else if (q->op == TCCIR_OP_SHL)
+    {
+      /* value_vr << sh with sh >= 32 - load_bits: only value_vr's low (32-sh) <= load_bits
+         bits survive the 32-bit shift, so the result is correct. */
+      if (irop_get_vreg(tcc_ir_op_get_src1(ir, q)) != value_vr)
+        return 0;
+      IROperand s2 = tcc_ir_op_get_src2(ir, q);
+      if (!irop_is_immediate(s2) || s2.is_sym)
+        return 0;
+      if (irop_is_64bit(tcc_ir_op_get_dest(ir, q)) || irop_is_64bit(tcc_ir_op_get_src1(ir, q)))
+        return 0;
+      int sh = (int)irop_get_imm64_ex(ir, s2);
+      if (sh < 32 - load_bits)
+        return 0;
+    }
+    else
+    {
+      return 0;
+    }
+  }
+  return found;
+}
+
 /* A variadic call with argc>4 spills args to a stack area of unknown size; forwarding across it is unsound. */
 static int ir_has_stack_arg_variadic_call(TCCIRState *ir)
 {
@@ -188,12 +277,9 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir);
 int tcc_ir_opt_sl_forward(TCCIRState *ir)
 {
   if (tcc_ir_opt_pass_disabled("sl_forward")) return 0;
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on) return tcc_ir_opt_sl_forward__timed(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_sl_forward__timed(ir);
-  tcc_pass_timing_add("sl_forward", tcc_pass_clk_us() - _t);
-  return _r;
+  int r;
+  TCC_PASS_TIMED(r, "sl_forward", tcc_ir_opt_sl_forward__timed(ir));
+  return r;
 }
 static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
 {
@@ -922,7 +1008,8 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
     /* Calls only invalidate addrtaken stores whose LEA appeared at/before this call. */
     if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL)
     {
-      /* Pure AEABI calls don't modify memory — tracked stores stay valid. */
+      /* A call that writes no observable memory (pure AEABI helper, or a
+       * same-TU callee inferred PURE/CONST) leaves tracked stores valid. */
       int is_pure_aeabi = 0;
       {
         IROperand csrc = tcc_ir_op_get_src1(ir, q);
@@ -933,6 +1020,8 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
           LOG_SL_FWD("CALL@i=%d callee=%s (sym=%p)", i, cname ? cname : "(null)", (void *)call_sym);
           if (cname && cname[0] == '_' && cname[1] == '_')
             is_pure_aeabi = tcc_ir_is_pure_aeabi(cname);
+          if (!is_pure_aeabi)
+            is_pure_aeabi = sl_fwd_callee_is_pure(ir, q);
         }
         else
         {
@@ -1008,9 +1097,21 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         int32_t call_dest_vr = irop_get_vreg(call_dest);
         if (call_dest_vr >= 0)
         {
+          /* Two ways the call's dest can invalidate an entry, mirroring the
+           * general redefinition scan below: it may be the VALUE some entry
+           * stored, and -- when the call returns directly into a VAR/PARAM --
+           * it may be the VARIABLE an entry is keyed on.  Only the first was
+           * checked, so `*p = 1; u = f(); read(*p);` (p == &u) forwarded the 1
+           * back over the call's result (ptr fuzz seed 1410). */
+          int call_var_overwritten =
+              (!call_dest.is_lval &&
+               (TCCIR_DECODE_VREG_TYPE(call_dest_vr) == TCCIR_VREG_TYPE_VAR ||
+                TCCIR_DECODE_VREG_TYPE(call_dest_vr) == TCCIR_VREG_TYPE_PARAM));
           for (j = 0; j < entry_count; j++)
           {
-            if (entries[j].valid && irop_get_vreg(entries[j].stored_value) == call_dest_vr)
+            if (entries[j].valid &&
+                (irop_get_vreg(entries[j].stored_value) == call_dest_vr ||
+                 (call_var_overwritten && entries[j].store_dest_vr == call_dest_vr)))
               entries[j].valid = 0;
           }
           if (!call_dest.is_lval)
@@ -1285,6 +1386,60 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
               }
               changes++;
               break;
+            }
+            /* Wider store of a NON-constant value forwarded to a narrower same-offset
+               load: on little-endian, the narrow load reads the low `load_bits` of the
+               stored value.  Forward the stored vreg directly (as an ASSIGN) when demand
+               analysis proves every use needs only those low bits — no masking required.
+
+               Restricted to an integer store that fits a single <=32-bit register: a
+               64-bit store lives in a register pair (its low word is not a plain ASSIGN of
+               the whole value), and a float store would need a reinterpreting move.  The
+               narrow load must be a sub-32-bit integer read.
+
+               The rewritten dest is retyped to the stored value's (wider) btype: the
+               forwarded value is the full <=32-bit register, so leaving the dest tagged as
+               a sub-word type would let value-tracking passes wrongly re-apply sign/zero
+               extension to a value that is not narrowed. */
+            if (store_bits > 0 && load_bits > 0 && store_bits > load_bits && store_bits <= 32 &&
+                (e->store_btype == IROP_BTYPE_INT32 || e->store_btype == IROP_BTYPE_INT16 ||
+                 e->store_btype == IROP_BTYPE_INT8) &&
+                (src1.btype == IROP_BTYPE_INT16 || src1.btype == IROP_BTYPE_INT8) &&
+                !irop_is_immediate(e->stored_value) && q->op != TCCIR_OP_FUNCPARAMVAL)
+            {
+              IROperand load_dest = tcc_ir_op_get_dest(ir, q);
+              int32_t load_dest_vr = irop_get_vreg(load_dest);
+              if (load_dest_vr >= 0 && TCCIR_DECODE_VREG_TYPE(load_dest_vr) == TCCIR_VREG_TYPE_TEMP &&
+                  sl_fwd_all_uses_self_narrowing(ir, load_dest_vr, load_bits))
+              {
+                LOG_SL_FWD("LOAD@i=%d FORWARD-NARROW-VAL: store@i=%d store_bits=%d load_bits=%d", i,
+                           e->instruction_idx, store_bits, load_bits);
+                q->op = TCCIR_OP_ASSIGN;
+                int dpool = q->operand_base; /* ASSIGN dest is operand 0 */
+                ir->iroperand_pool[dpool].btype = e->store_btype;
+                ir->iroperand_pool[dpool].is_unsigned = 1;
+                int spool = q->operand_base + irop_config[q->op].has_dest;
+                ir->iroperand_pool[spool] = e->stored_value;
+                if (TCCIR_DECODE_VREG_TYPE(load_dest_vr) == TCCIR_VREG_TYPE_TEMP)
+                {
+                  int fwd_pos = TCCIR_DECODE_VREG_POSITION(load_dest_vr);
+                  if (fwd_pos <= max_tmp)
+                  {
+                    fwd_tmp_val[fwd_pos] = e->stored_value;
+                    fwd_tmp_valid[fwd_pos] = 1;
+                  }
+                }
+                if (fwd_store_count < SL_FWD_MAX_DEAD_STORES && !e->addr_addrtaken &&
+                    irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[e->instruction_idx])) < 0)
+                {
+                  fwd_stores[fwd_store_count].store_idx = e->instruction_idx;
+                  fwd_stores[fwd_store_count].offset = e->local_offset;
+                  fwd_stores[fwd_store_count].sym = e->local_sym;
+                  fwd_store_count++;
+                }
+                changes++;
+                break;
+              }
             }
             LOG_SL_FWD("LOAD@i=%d REJECT width: store btype=%d vs load btype=%d (store at i=%d)", i,
                        (int)e->store_btype, (int)src1.btype, e->instruction_idx);
@@ -2660,18 +2815,52 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       }
     }
 
-    /* If this instruction redefines a stored-value vreg, invalidate those entries. */
-    if (irop_config[q->op].has_dest && q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_LOAD)
+    /* If this instruction redefines a stored-value vreg, invalidate those entries.
+     *
+     * STORE is excluded because the store path above owns those entries (it
+     * creates them and does its own overlap invalidation).  LOAD is excluded
+     * for the same reason ONLY when it loads into a TEMP -- the ordinary
+     * `T <-- addr [LOAD]` shape, which defines nothing a store entry is keyed
+     * on.  But a LOAD whose destination is the variable itself,
+     * `V <-- p***DEREF*** [LOAD]` (what `u = *p;` lowers to once u is a VAR),
+     * is a genuine redefinition of V, and skipping it left the entry from an
+     * earlier `V <-- #k [STORE]` live: a later read of V then forwarded the
+     * stale #k.  ptr fuzz seed 1:
+     *     V1 <-- #1              [STORE]   *p11 = 1      (p11 == &u7)
+     *     V1 <-- T7***DEREF***   [LOAD]    u7   = *p10   <- redefines u7
+     *     V6 <-- V1              [STORE]   csmix(cs,u7)  -> forwarded to #1 */
+    int load_redefines_var = 0;
+    if (q->op == TCCIR_OP_LOAD)
+    {
+      IROperand ld = tcc_ir_op_get_dest(ir, q);
+      int32_t ld_vr = irop_get_vreg(ld);
+      load_redefines_var =
+          (ld_vr >= 0 && !ld.is_lval &&
+           (TCCIR_DECODE_VREG_TYPE(ld_vr) == TCCIR_VREG_TYPE_VAR ||
+            TCCIR_DECODE_VREG_TYPE(ld_vr) == TCCIR_VREG_TYPE_PARAM));
+    }
+    if (irop_config[q->op].has_dest && q->op != TCCIR_OP_STORE &&
+        (q->op != TCCIR_OP_LOAD || load_redefines_var))
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int32_t dest_vr = irop_get_vreg(dest);
       int j;
 
+      /* A direct (non-lval) write to a VAR/PARAM overwrites the variable that
+       * a `V <-- x [STORE]` entry is keyed on: the slot view (STORE) and the
+       * vreg view (ASSIGN/arith dest) name the same object, so the entry must
+       * die or a later read forwards the pre-write value (20070212-2). */
+      int addr_var_overwritten =
+          (dest_vr >= 0 &&
+           (TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_VAR ||
+            TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_PARAM));
+
       for (j = 0; j < entry_count; j++)
       {
         if (entries[j].valid)
         {
-          if (irop_get_vreg(entries[j].stored_value) == dest_vr)
+          if (irop_get_vreg(entries[j].stored_value) == dest_vr ||
+              (addr_var_overwritten && entries[j].store_dest_vr == dest_vr))
           {
 #ifdef TCC_REGALLOC_DEBUG
             fprintf(stderr, "[SL-INVAL-VAL] i=%d invalidate store at si=%d (stored_val_vr=0x%x redefined) n=%d\n", i,
@@ -2790,6 +2979,20 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         if (!still_read)
           CHECK_ADDR_ALIAS(s2);
       }
+      /* Check the MLA accumulator (4th operand): it can read the slot directly
+         (`d <- a MLA b + StackLoc`) or via a deref of its address.  The src1/src2
+         scan above never looks at it, so without this a store read only through an
+         accumulator would be wrongly eliminated. */
+      if (!still_read && jq->op == TCCIR_OP_MLA)
+      {
+        IROperand acc = tcc_ir_op_get_accum(ir, jq);
+        if (acc.is_local && irop_get_imm64_ex(ir, acc) == off && irop_get_sym_ex(ir, acc) == sym)
+          still_read = 1;
+        if (!still_read)
+          CHECK_WIDTH_OVERLAP(acc);
+        if (!still_read)
+          CHECK_ADDR_ALIAS(acc);
+      }
       /* Check dest of non-STORE ops (e.g. LOAD dest references an address) */
       if (!still_read && jq->op != TCCIR_OP_STORE && irop_config[jq->op].has_dest)
       {
@@ -2856,12 +3059,9 @@ static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir);
 int tcc_ir_opt_global_sl_fwd(TCCIRState *ir)
 {
   if (tcc_ir_opt_pass_disabled("global_sl_fwd")) return 0;
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on) return tcc_ir_opt_global_sl_fwd__timed(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_global_sl_fwd__timed(ir);
-  tcc_pass_timing_add("global_sl_fwd", tcc_pass_clk_us() - _t);
-  return _r;
+  int r;
+  TCC_PASS_TIMED(r, "global_sl_fwd", tcc_ir_opt_global_sl_fwd__timed(ir));
+  return r;
 }
 static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
 {
@@ -2921,10 +3121,11 @@ static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
       entry_count = 0;
       continue;
     }
-    /* Calls may write any global. */
+    /* Calls may write any global — unless the callee is provably PURE/CONST. */
     if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL)
     {
-      entry_count = 0;
+      if (!sl_fwd_callee_is_pure(ir, q))
+        entry_count = 0;
       continue;
     }
 

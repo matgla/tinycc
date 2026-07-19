@@ -16,22 +16,40 @@
 #define SSA_LOOP_CONST_SIM_MAX_PASSES 4
 #define SSA_LCS_MAX_SPAN 256
 
+/* `V` (VAR vreg, is_local + is_lval) is a register-resident scalar, not memory:
+ * lcs_read_operand models it as a plain slot, so a LOAD or STORE naming one is
+ * an ordinary copy.  Every other lval — stack slot, symbol, pointer deref — is
+ * real memory the simulator would have to model, and `is_local && !is_lval` is
+ * the address-of form, which hands out an address it could then be stored
+ * through.  Both keep the region out. */
+static int lcs_operand_is_memory(IROperand op)
+{
+  if (op.is_sym || op.is_llocal)
+    return op.is_lval || op.is_local;
+  int32_t vr = irop_get_vreg(op);
+  int is_var = (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR);
+  if (op.is_lval)
+    return !(op.is_local && is_var);
+  return op.is_local;
+}
+
 static int lcs_span_has_memory(TCCIRState *ir, int start_idx, int end_idx)
 {
   for (int i = start_idx; i <= end_idx; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_STORE ||
-        q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
+    if (q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
         q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC ||
         q->op == TCCIR_OP_BLOCK_COPY)
       return 1;
-    if (irop_config[q->op].has_src1 && tcc_ir_op_get_src1(ir, q).is_lval)
+    if (irop_config[q->op].has_src1 && lcs_operand_is_memory(tcc_ir_op_get_src1(ir, q)))
       return 1;
-    if (irop_config[q->op].has_src2 && tcc_ir_op_get_src2(ir, q).is_lval)
+    if (irop_config[q->op].has_src2 && lcs_operand_is_memory(tcc_ir_op_get_src2(ir, q)))
       return 1;
-    if (q->op == TCCIR_OP_MLA && tcc_ir_op_get_accum(ir, q).is_lval)
+    if (irop_config[q->op].has_dest && lcs_operand_is_memory(tcc_ir_op_get_dest(ir, q)))
+      return 1;
+    if (q->op == TCCIR_OP_MLA && lcs_operand_is_memory(tcc_ir_op_get_accum(ir, q)))
       return 1;
   }
   return 0;

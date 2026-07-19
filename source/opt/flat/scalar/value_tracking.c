@@ -1069,7 +1069,7 @@ static int vt_handle_compare(TCCIRState *ir, IRQuadCompact *q, int i, int n, VRe
         IROperand cond = tcc_ir_op_get_src1(ir, jump_q);
         int tok = (int)irop_get_imm64_ex(ir, cond);
 
-        int result = evaluate_compare_condition_cmp_operands(val1, val2, tok, src1, src2);
+        int result = evaluate_compare_condition_cmp_annotated(ir, q, val1, val2, tok, src1, src2);
 
         if (result >= 0)
         {
@@ -1107,7 +1107,7 @@ static int vt_handle_compare(TCCIRState *ir, IRQuadCompact *q, int i, int n, VRe
 
         IROperand setif_src1 = tcc_ir_op_get_src1(ir, jump_q);
         int cond = (int)irop_get_imm64_ex(ir, setif_src1);
-        int result = evaluate_compare_condition_cmp_operands(val1, val2, cond, src1, src2);
+        int result = evaluate_compare_condition_cmp_annotated(ir, q, val1, val2, cond, src1, src2);
 
         if (result >= 0)
         {
@@ -1368,13 +1368,9 @@ int tcc_ir_opt_value_tracking(TCCIRState *ir)
 {
   if (tcc_ir_opt_pass_disabled("value_tracking"))
     return 0;
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on)
-    return tcc_ir_opt_value_tracking__timed(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_value_tracking__timed(ir);
-  tcc_pass_timing_add("value_tracking", tcc_pass_clk_us() - _t);
-  return _r;
+  int r;
+  TCC_PASS_TIMED(r, "value_tracking", tcc_ir_opt_value_tracking__timed(ir));
+  return r;
 }
 
 static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)

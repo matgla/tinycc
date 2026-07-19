@@ -88,6 +88,8 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
   m.is_unsigned = (bool)op->is_unsigned;
   m.is_64bit = (bool)irop_needs_pair(*op);
   m.is_complex = (bool)op->is_complex;
+  m.align4 = (op->aux & IROP_AUX_ALIGN4_OK) != 0;
+  m.underalign_hint = (op->aux & IROP_AUX_UNDERALIGN) != 0;
   const int tag = irop_get_tag(*op);
   const int vreg = irop_get_vreg(*op);
   m.vreg = vreg;

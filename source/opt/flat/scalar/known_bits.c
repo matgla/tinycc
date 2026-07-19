@@ -1196,6 +1196,21 @@ static int kb_dest_scalar_compute(KBState *st, TCCIRState *ir, int i, int op,
   uint32_t a_kz = 0, a_ko = 0, b_kz = 0, b_ko = 0;
   int have_kb = 0;
 
+  /* A SETIF materialises its condition as 0 or 1, so bits 31..1 are zero.
+   * Seeding that lets the AND-mask identity below strip the `& 1u` a source
+   * boolean carries, which is what blocks setif_branch_fuse from collapsing
+   * CMP+SETIF+TEST_ZERO+JUMPIF into a plain conditional branch. */
+  if (op == TCCIR_OP_SETIF && dest_btype != IROP_BTYPE_INT64)
+  {
+    st->tmp_kb[dpos].gen = st->current_gen;
+    st->tmp_kb[dpos].kz = 0xFFFFFFFEu;
+    st->tmp_kb[dpos].ko = 0;
+    st->tmp_kb[dpos].has_const = 0;
+    st->tmp_kb[dpos].has_stack_off = 0;
+    st->tmp_kb[dpos].is_low32 = 0;
+    return 0;
+  }
+
   if (op == TCCIR_OP_ASSIGN || op == TCCIR_OP_ZEXT ||
       op == TCCIR_OP_LOAD)
   {
@@ -1237,6 +1252,49 @@ static int kb_dest_scalar_compute(KBState *st, TCCIRState *ir, int i, int op,
     have_kb = h1 || h2;
     if (!h1) { a_kz = 0; a_ko = 0; }
     if (!h2) { b_kz = 0; b_ko = 0; }
+
+    /* `x & M` is a no-op when every bit outside M is already known zero in x.
+     * Rewrite to a copy so the surrounding peepholes (setif_branch_fuse, copy
+     * propagation) see through it; the full-const fold below still handles the
+     * case where x itself is fully known. */
+    if (op == TCCIR_OP_AND && dest_btype != IROP_BTYPE_INT64 &&
+        irop_get_btype(dest) != IROP_BTYPE_INT64)
+    {
+      int keep_pos = -1;
+      uint32_t mask = 0, kz = 0;
+      if (h1 && irop_is_immediate(s2) && !s2.is_sym && !s2.is_lval && irop_has_vreg(s1))
+      {
+        keep_pos = 1;
+        mask = (uint32_t)irop_get_imm64_ex(ir, s2);
+        kz = a_kz;
+      }
+      else if (h2 && irop_is_immediate(s1) && !s1.is_sym && !s1.is_lval && irop_has_vreg(s2))
+      {
+        keep_pos = 2;
+        mask = (uint32_t)irop_get_imm64_ex(ir, s1);
+        kz = b_kz;
+      }
+      if (keep_pos > 0 && (kz | mask) == 0xFFFFFFFFu)
+      {
+        IROperand keep = (keep_pos == 1) ? s1 : s2;
+        if (irop_get_btype(keep) == irop_get_btype(dest))
+        {
+          q->op = TCCIR_OP_ASSIGN;
+          tcc_ir_set_src1(ir, i, keep);
+          tcc_ir_set_src2(ir, i, IROP_NONE);
+          LOG_IR_GEN("OPTIMIZE: knownbits AND #%x identity -> copy at i=%d (kz=%08x)",
+                     mask, i, kz);
+          changes++;
+          st->tmp_kb[dpos].gen = st->current_gen;
+          st->tmp_kb[dpos].kz = kz;
+          st->tmp_kb[dpos].ko = (keep_pos == 1) ? a_ko : b_ko;
+          st->tmp_kb[dpos].has_const = 0;
+          st->tmp_kb[dpos].has_stack_off = 0;
+          st->tmp_kb[dpos].is_low32 = 0;
+          return changes;
+        }
+      }
+    }
   }
   else if (op == TCCIR_OP_ADD || op == TCCIR_OP_SUB)
   {
@@ -1854,10 +1912,7 @@ static int tcc_ir_opt_known_bits__run(TCCIRState *ir)
 int tcc_ir_opt_known_bits(TCCIRState *ir)
 {
   if (tcc_ir_opt_pass_disabled("known_bits")) return 0;
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on) return tcc_ir_opt_known_bits__run(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_known_bits__run(ir);
-  tcc_pass_timing_add("known_bits", tcc_pass_clk_us() - _t);
-  return _r;
+  int r;
+  TCC_PASS_TIMED(r, "known_bits", tcc_ir_opt_known_bits__run(ir));
+  return r;
 }

@@ -77,45 +77,20 @@ void *__va_arg(__builtin_va_list ap, int arg_type, int size, int align)
  * advances through a contiguous area of register-saved + stack arguments.
  *
  * The prologue pushes r0-r3 so they are contiguous with caller stack args.
- * Frame layout at FP:
- *   FP - 20: gr_top   (char*) — end of pushed r0-r3 = start of stack args
- *   FP - 24: reg_bytes (int)  — bytes of named args occupying r0-r3
- *   FP - 28: named_stack_bytes (int) — bytes of named args on stack
+ *
+ * There are no runtime helpers left: va_start and va_arg are both compiler
+ * intrinsics (TOK_builtin_va_start / TOK_builtin_va_arg).
+ *
+ *   va_start  materializes the address of the first anonymous argument
+ *             directly — the backend knows the prologue's push set and the
+ *             named-argument byte counts exactly.  __tcc_va_start used to
+ *             rediscover it at runtime from three metadata words the prologue
+ *             stored at FP-20/-24/-28; those stores are gone, so reviving that
+ *             helper would read garbage.
+ *   va_arg    emits the pointer bump inline: align up to max(align,4), take the
+ *             pointer, advance by (size+3)&~3.  `ap` is invariantly word
+ *             aligned, so the align step only survives for 8-byte types.
+ *             Inlining it keeps `ap` in a register (its address is no longer
+ *             taken) and replaces a 4-instruction call sequence per va_arg.
  */
-
-void __tcc_va_start(char **ap_ptr, void *fp)
-{
-  char *frame = (char *)fp;
-  char *gr_top = *(char **)(frame - 20);
-  int reg_bytes = *(int *)(frame - 24);
-  int named_stack_bytes = *(int *)(frame - 28);
-
-  if (reg_bytes < 0)
-    reg_bytes = 0;
-  if (reg_bytes > 16)
-    reg_bytes = 16;
-
-  /* Point ap to the first anonymous argument.
-   * gr_top - 16 is the start of the pushed r0-r3 area.
-   * Skip past named args in registers and on the stack. */
-  *ap_ptr = (gr_top - 16) + reg_bytes + named_stack_bytes;
-}
-
-void *__tcc_va_arg(char **ap_ptr, int size, int align)
-{
-  char *ap = *ap_ptr;
-
-  if (align < 4)
-    align = 4;
-
-  /* Align the current pointer */
-  ap = (char *)(((unsigned)ap + (unsigned)align - 1u) & ~((unsigned)align - 1u));
-
-  /* Round size up to word boundary */
-  int sz = (size + 3) & ~3;
-
-  void *result = ap;
-  *ap_ptr = ap + sz;
-  return result;
-}
 #endif

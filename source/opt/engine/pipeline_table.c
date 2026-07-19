@@ -22,11 +22,27 @@
 
 #define FLAG(f) (uint16_t)offsetof(TCCState, f)
 
+/* A cascade slot runs passes whose results deliberately do NOT feed the outer
+ * fixpoint count -- dce and compact_nops clean up after the passes that do, and
+ * counting them would keep the outer group spinning.  But they still mutate the
+ * IR, and the group driver's per-pass dirty tracking keys off ctx->generation,
+ * which only advances on a *reported* change.  So a cascade records those
+ * silent mutations and bumps the generation itself; without this, a slot that
+ * returns 0 after NOPing an instruction would let the driver skip passes that
+ * had legitimately new work.  Keep `silent` out of the returned count: it is a
+ * cache-invalidation signal, not a fixpoint signal. */
+#define CASCADE_END(ctx, total, silent)                                        \
+  do {                                                                         \
+    if ((silent) && (total) == 0)                                              \
+      tcc_ir_opt_ctx_invalidate(ctx);                                          \
+    return (total);                                                            \
+  } while (0)
+
 /* Cascade must converge locally: the outer memory-group trigger may drive only one iteration. */
 static int tcc_ir_opt_known_bits_cascade_ex(IROptCtx *ctx)
 {
   TCCIRState *ir = ctx->ir;
-  int total = 0;
+  int total = 0, silent = 0;
   for (int i = 0; i < 8; i++) {
     int ch = 0;
     ch += tcc_ir_opt_known_bits(ir);
@@ -38,9 +54,9 @@ static int tcc_ir_opt_known_bits_cascade_ex(IROptCtx *ctx)
       ch += tcc_ir_opt_gens_branch_ex(&bctx);
       tcc_ir_opt_ctx_free(&bctx);
     }
-    tcc_ir_opt_dce(ir);
+    silent += tcc_ir_opt_dce(ir);
     ch += tcc_ir_opt_eliminate_fallthrough(ir);
-    tcc_ir_opt_compact_nops(ir);
+    silent += tcc_ir_opt_compact_nops(ir);
     ch += tcc_ir_opt_sl_forward(ir);
     /* Re-run here: collapsing a guard grows the straight-line region, else forwarding stalls at the first BB boundary. */
     ch += tcc_ir_opt_global_sl_fwd(ir);
@@ -48,7 +64,7 @@ static int tcc_ir_opt_known_bits_cascade_ex(IROptCtx *ctx)
       break;
     total += ch;
   }
-  return total;
+  CASCADE_END(ctx, total, silent);
 }
 
 static int tcc_ir_opt_const_prop_cascade_ex(IROptCtx *ctx)
@@ -72,18 +88,18 @@ static int tcc_ir_opt_const_prop_cascade_ex(IROptCtx *ctx)
 static int tcc_ir_opt_branch_cleanup_cascade_ex(IROptCtx *ctx)
 {
   TCCIRState *ir = ctx->ir;
-  int total = 0;
+  int total = 0, silent = 0;
   for (int i = 0; i < 8; i++) {
     int ch = 0;
     ch += tcc_ir_opt_eliminate_fallthrough(ir);
     if (ch)
-      tcc_ir_opt_compact_nops(ir);
+      silent += tcc_ir_opt_compact_nops(ir);
     ch += tcc_ir_opt_dce(ir);
     if (!ch)
       break;
     total += ch;
   }
-  return total;
+  CASCADE_END(ctx, total, silent);
 }
 
 #define PASS(nm, fn, req, inv) { nm, fn, req, inv, 0 }
@@ -94,6 +110,8 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("uninit_ub",        tcc_ir_opt_uninit_local_ub_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
   PASS_GATED("uninit_dom_ret",   tcc_ir_opt_uninit_dominates_return_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
   PASS_GATED("dce",              tcc_ir_opt_dce_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
+  /* Resolves derefs through single-def &local pointers before the const/forwarding cluster below sees them. */
+  PASS_GATED("ptr_local_fwd",    tcc_ir_opt_ptr_local_fwd_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_store_load_fwd)),
   /* Must follow dce: its prologue clears stale `addrtaken` flags on VARs whose LEA was just DCE-ed. */
   PASS_GATED("const_var_prop", tcc_ir_opt_const_var_prop_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("global_init",     tcc_ir_opt_global_init_prop_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
@@ -107,6 +125,10 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("string_calls",    tcc_ir_opt_const_string_calls_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("ssa_string_fold", ssa_const_string_fold_flat_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  /* After the string folds (a folded call can shrink below the inline
+   * threshold) and before sl_forward/fusion so they see the expanded
+   * loads/stores.  Inserts instructions -> ALL. */
+  PASS("mem_inline",            tcc_ir_opt_mem_inline_ex,       0, IR_PASS_INVALIDATES_ALL),
   PASS_GATED("self_copy_elim",  tcc_ir_opt_self_copy_elim_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("value_tracking",  tcc_ir_opt_value_tracking_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("cmp_expr_fold",   tcc_ir_opt_cmp_expr_fold_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
@@ -130,10 +152,12 @@ static const IROptPass fusion_passes[] = {
 /* elim_fallthrough first: propagation leaves fall-through jumps whose stale block boundaries stall sl_forward. */
 static int tcc_ir_opt_memory_trigger_ex(IROptCtx *ctx)
 {
+  int silent = 0;
   if (tcc_state->opt_jump_threading &&
       tcc_ir_opt_eliminate_fallthrough(ctx->ir))
-    tcc_ir_opt_compact_nops(ctx->ir);
-  return tcc_ir_opt_sl_forward_ex(ctx);
+    silent += 1 + tcc_ir_opt_compact_nops(ctx->ir);
+  int total = tcc_ir_opt_sl_forward_ex(ctx);
+  CASCADE_END(ctx, total, silent);
 }
 
 static const IROptPass memory_passes[] = {
@@ -153,6 +177,10 @@ static const IROptPass memory_passes[] = {
 };
 
 static const IROptPass late_cleanup_passes[] = {
+  /* `(x^y) cmp y -> x cmp 0`: the plain-register XOR/CMP shape it matches only
+   * exists once the fusion group has pulled the derefs out into LOAD_INDEXED,
+   * which happens after both the propagation and memory groups have finished. */
+  PASS_GATED("cmp_xor_cancel",   tcc_ir_opt_cmp_xor_cancel_ex,   0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   /* Runs first so the dead-store passes below see the simplified CFG. */
   PASS_GATED("branch_cleanup",   tcc_ir_opt_branch_cleanup_cascade_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
   /* Must precede zero_vla so the orphaned outer SP_SAVE/RESTORE pair collapses in the same round. */
@@ -174,6 +202,12 @@ static const IROptPass late_cleanup_passes[] = {
   PASS_GATED("dead_lea_store",   tcc_ir_opt_dead_lea_store_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("dead_temp_local",  tcc_ir_opt_dead_temp_local_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   PASS_GATED("redundant_assign", tcc_ir_opt_redundant_var_assign_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
+  /* The fusable CMP;SETIF;TEST_ZERO;JUMPIF chain often only FORMS late:
+   * the memory group's final const cascade folds the XOR mask of inlined
+   * bool checks, and redundant_assign (just above) removes the XOR#0
+   * residue's `T9 <- T7` alias.  One more fuse run catches both
+   * (20141107-1 sites). */
+  PASS_GATED("setif_fuse",       tcc_ir_opt_setif_branch_fuse_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("inplace_arith",    tcc_ir_opt_store_inplace_arith_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
   PASS_GATED("global_base_share",tcc_ir_opt_global_base_share_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_indexed_memory)),
   /* Second run: the dead-store passes above expose new dead CMP/jump diamonds. */
@@ -186,24 +220,30 @@ static const IROptPass late_cleanup_passes[] = {
 static int tcc_ir_opt_entry_store_cleanup_ex(IROptCtx *ctx)
 {
   TCCIRState *ir = ctx->ir;
-  int ch = 0;
+  int ch = 0, silent = 0;
   ch += tcc_ir_opt_const_prop_tmp(ir);
   ch += tcc_ir_opt_const_var_prop(ir);
   ch += tcc_ir_opt_redundant_loop_check(ir);
-  tcc_ir_opt_dce(ir);
-  tcc_ir_opt_compact_nops(ir);
+  silent += tcc_ir_opt_dce(ir);
+  silent += tcc_ir_opt_compact_nops(ir);
   ch += tcc_ir_opt_sl_forward(ir);
-  tcc_ir_opt_dce(ir);
+  silent += tcc_ir_opt_dce(ir);
   ch += tcc_ir_opt_dead_var_store_elim(ir);
   ch += tcc_ir_opt_const_var_prop(ir);
-  tcc_ir_opt_dce(ir);
-  tcc_ir_opt_compact_nops(ir);
-  return ch;
+  silent += tcc_ir_opt_dce(ir);
+  silent += tcc_ir_opt_compact_nops(ir);
+  CASCADE_END(ctx, ch, silent);
 }
 
 static const IROptPass entry_store_passes[] = {
   PASS_GATED("entry_store",  tcc_ir_opt_entry_store_prop_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
   PASS_GATED("esp_cleanup",  tcc_ir_opt_entry_store_cleanup_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
+  /* entry_store turns slot reads into constants, and only value_tracking evaluates a
+   * soft-float helper call whose arguments have just become constant.  In the
+   * propagation group it runs before this forwarding, so it never sees them; the
+   * memory group is no good either, since its sl_forward trigger goes idle exactly
+   * when entry_store did the forwarding instead. */
+  PASS_GATED("esp_value_tracking", tcc_ir_opt_value_tracking_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
 };
 
 #undef PASS

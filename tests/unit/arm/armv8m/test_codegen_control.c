@@ -786,7 +786,7 @@ UT_TEST(test_dispatch_jump_routes_to_jump_mop)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("jump_mop"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("jump_mop"), 3);
   const CgStubCall *c = cgstub_nth_call("jump_mop", 0);
   UT_ASSERT(c != NULL);
   UT_ASSERT_EQ(c->ir_op, TCCIR_OP_JUMP);
@@ -815,7 +815,7 @@ UT_TEST(test_dispatch_jumpif_routes_to_conditional_jump_mop)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("conditional_jump_mop"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("conditional_jump_mop"), 3);
   UT_ASSERT_EQ(cgstub_call_count("cbz_jump_mop"), 0);
   const CgStubCall *c = cgstub_nth_call("conditional_jump_mop", 0);
   UT_ASSERT(c != NULL);
@@ -942,12 +942,12 @@ UT_TEST(test_dispatch_switch_table_uses_distinct_mop_per_pass)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 1); /* two-pass forced */
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 2); /* discovery + rehearsal dry pass */ /* two-pass forced */
   /* Called twice per dry-run pass: once as reserve_pool_bytes()'s argument
    * (unconditional, every pass) and once more for the dry-run-only `ind +=`
    * size estimate; the real-run pass only hits the first (unconditional)
    * call site. See ir/codegen.c ~4045-4048. */
-  UT_ASSERT_EQ(cgstub_call_count_pass("switch_table_dry_run_size", 0), 2);
+  UT_ASSERT_EQ(cgstub_call_count_pass("switch_table_dry_run_size", 0), 4); /* x2: two dry passes */
   UT_ASSERT_EQ(cgstub_call_count_pass("switch_table_dry_run_size", 1), 1);
   UT_ASSERT_EQ(cgstub_call_count_pass("switch_table_mop", 1), 1);
   UT_ASSERT_EQ(cgstub_call_count_pass("switch_table_mop", 0), 0);

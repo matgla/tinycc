@@ -10,6 +10,7 @@
 
 #define USING_GLOBALS
 #include "ir.h"
+#include "opt.h"
 #include "ssa_opt.h"
 #include "opt/ssa/branch.h"
 #include "const_string_fold.h"
@@ -22,7 +23,9 @@
 #include "opt/ssa/cmp_eq.h"
 #include "opt/ssa/vrp.h"
 #include "opt/ssa/setif_or_taut.h"
+#include "opt/ssa/bool_norm.h"
 #include "opt/ssa/cmp_offset_fold.h"
+#include "opt/ssa/tmp_block_const.h"
 #include "opt/ssa/gvn.h"
 #include "opt/ssa/var_imm_prop.h"
 #include "opt/ssa/cprop.h"
@@ -66,12 +69,17 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
   const int max_iterations = 5;
   int changes;
 
-  /* Every pass must stay observable via -dump-ir-passes=<name>. */
+  /* Every pass must stay observable via -dump-ir-passes=<name> and, under
+   * TCC_PASS_TIMING=1, in the per-pass timing dump. */
 #define SSA_RUN(name, call)                                                                                            \
   do                                                                                                                   \
   {                                                                                                                    \
     if (!tcc_ir_opt_pass_disabled(name))                                                                               \
-      changes += (call);                                                                                               \
+    {                                                                                                                  \
+      int _c;                                                                                                          \
+      TCC_PASS_TIMED(_c, name, (call));                                                                                \
+      changes += _c;                                                                                                   \
+    }                                                                                                                  \
     dbg_scan_imm_dest(ctx->ir, name);                                                                                  \
     tcc_ir_dump_after_pass(ctx->ir, name);                                                                             \
   } while (0)
@@ -84,6 +92,8 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     SSA_RUN("ssa:sccp", ssa_opt_sccp(ctx));
     SSA_RUN("ssa:cprop", ssa_opt_cprop(ctx));
     SSA_RUN("ssa:var_to_param_forward", ssa_opt_var_to_param_forward(ctx));
+    SSA_RUN("ssa:tmp_block_const",
+            (tcc_state && tcc_state->opt_const_prop) ? ssa_opt_tmp_block_const(ctx) : 0);
     SSA_RUN("ssa:fold", ssa_opt_fold(ctx));
     SSA_RUN("ssa:cprop", ssa_opt_cprop(ctx));
     SSA_RUN("ssa:var_imm_prop", ssa_opt_var_imm_prop(ctx));
@@ -98,6 +108,8 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     SSA_RUN("ssa:vrp", (tcc_state && tcc_state->opt_vrp) ? ssa_opt_vrp(ctx) : 0);
     SSA_RUN("ssa:setif_or_taut",
             (tcc_state && tcc_state->opt_const_prop) ? ssa_opt_setif_or_taut(ctx) : 0);
+    SSA_RUN("ssa:setif_mask_fold",
+            (tcc_state && tcc_state->opt_const_prop) ? ssa_opt_setif_mask_fold(ctx) : 0);
     SSA_RUN("ssa:cmp_offset_fold",
             (tcc_state && tcc_state->opt_const_prop) ? ssa_opt_cmp_offset_fold(ctx) : 0);
     SSA_RUN("ssa:reassoc", ssa_opt_reassoc(ctx));
@@ -110,14 +122,71 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
             (tcc_state && tcc_state->optimize >= 2) ? ssa_opt_dead_loop(ctx) : 0);
     SSA_RUN("ssa:dce", ssa_opt_dce(ctx));
 
-    if (target_gens && target_gen_count > 0)
-      changes += ssa_opt_run_gens(ctx, target_gens, target_gen_count);
+    if (target_gens && target_gen_count > 0) {
+      int _c;
+      TCC_PASS_TIMED(_c, "ssa:target_gens",
+                     ssa_opt_run_gens(ctx, target_gens, target_gen_count));
+      changes += _c;
+    }
 
     total += changes;
   } while (changes > 0 && iteration < max_iterations);
 #undef SSA_RUN
 
-  total += tcc_ir_ssa_opt_guard_collapse(ctx);
+  /* AFTER the main loop, never inside it: bool_norm deletes the `CMP b,#0`
+   * that setif_mask_fold matches on, so running the two together lets whichever
+   * fires first in an iteration rob the other of its shape. */
+  if (tcc_state && tcc_state->opt_const_prop &&
+      !tcc_ir_opt_pass_disabled("ssa:bool_norm")) {
+    int _c;
+    TCC_PASS_TIMED(_c, "ssa:bool_norm", ssa_opt_bool_norm(ctx));
+    tcc_ir_dump_after_pass(ctx->ir, "ssa:bool_norm");
+    total += _c;
+  }
+
+  /* Convergence tail: branch folds late in the main loop expose
+   * reaching-constant chains the capped loop never revisits; this cheap
+   * quintet finishes them off (304_fuzz whole-program fold).  Must run BEFORE
+   * guard_collapse, which is the pipeline terminator. */
+  for (int tail = 0; tail < 8 && !tcc_ir_opt_pass_disabled("ssa:late_tail"); tail++) {
+    int ch = 0;
+    if (tcc_state && tcc_state->opt_const_prop &&
+        !tcc_ir_opt_pass_disabled("ssa:tmp_block_const")) {
+      int _c;
+      TCC_PASS_TIMED(_c, "ssa:tmp_block_const", ssa_opt_tmp_block_const(ctx));
+      tcc_ir_dump_after_pass(ctx->ir, "ssa:tmp_block_const");
+      ch += _c;
+    }
+    if (!tcc_ir_opt_pass_disabled("ssa:fold")) {
+      int _c;
+      TCC_PASS_TIMED(_c, "ssa:fold", ssa_opt_fold(ctx));
+      ch += _c;
+    }
+    if (!tcc_ir_opt_pass_disabled("ssa:cprop")) {
+      int _c;
+      TCC_PASS_TIMED(_c, "ssa:cprop", ssa_opt_cprop(ctx));
+      ch += _c;
+    }
+    if (!tcc_ir_opt_pass_disabled("ssa:branch")) {
+      int _c;
+      TCC_PASS_TIMED(_c, "ssa:branch", ssa_opt_branch(ctx));
+      ch += _c;
+    }
+    if (!tcc_ir_opt_pass_disabled("ssa:dce")) {
+      int _c;
+      TCC_PASS_TIMED(_c, "ssa:dce", ssa_opt_dce(ctx));
+      ch += _c;
+    }
+    total += ch;
+    if (!ch)
+      break;
+  }
+
+  {
+    int _c;
+    TCC_PASS_TIMED(_c, "ssa:guard_collapse", tcc_ir_ssa_opt_guard_collapse_ex(ctx, 1));
+    total += _c;
+  }
 
   return total;
 }

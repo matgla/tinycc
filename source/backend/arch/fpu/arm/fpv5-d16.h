@@ -23,4 +23,4 @@
 #define USING_GLOBALS
 #include "tcc.h"
 
-const FloatingPointConfig arm_fpv5_d16_fpu_config;
+extern const FloatingPointConfig arm_fpv5_d16_fpu_config;

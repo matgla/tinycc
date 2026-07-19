@@ -6,7 +6,7 @@ include ../../../config.mak
 FP_CC ?= $(CC)
 FP_CFLAGS ?= $(CFLAGS)
 
-SRCS = fadd.c fmul.c fdiv.c fcmp.c dadd.c dmul.c ddiv.c dconv.c dcmp.c conv.c f2d_stub.S fcmp_asm.S dcmp_asm.S
+SRCS = fadd.c fmul.c fdiv.c fcmp.c dadd.c dmul.c ddiv.c dconv.c dcmp.c conv.c conv64.c f2d_stub.S fcmp_asm.S dcmp_asm.S
 BUILD_DIR ?= build
 OBJS = $(addprefix $(BUILD_DIR)/,$(SRCS:.c=.o))
 OBJS := $(OBJS:.S=.o)

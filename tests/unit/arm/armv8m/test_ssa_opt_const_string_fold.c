@@ -103,6 +103,39 @@ UT_TEST(test_csf_strlen_stack_no_nul_no_fold)
   return 0;
 }
 
+/* GUARD: a JUMP between the stack stores and the call invalidates the pre-call
+ * scan (ir_opt_eval_stack_strlen bails on any jump/jump-target in range), so
+ * even a NUL-terminated buffer does not fold.  Ported from the flat
+ * const_string_calls UT when the fold half moved to this pass. */
+UT_TEST(test_csf_strlen_stack_jump_boundary_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+
+  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(0, 1, 0, 0, I8), utb_imm('h', I8), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(1, 1, 0, 0, I8), utb_imm(0, I8), UTB_NONE);
+  /* An unconditional JUMP to the very next instruction -- still a JUMP inside
+   * the pre-call scan range, which unconditionally bails the stack scan. */
+  int i_jump = utb_emit(ir, TCCIR_OP_JUMP, utb_imm(3, I32), UTB_NONE, UTB_NONE);
+
+  IROperand buf = irop_make_stackoff(-1, 0, 0, 0, 0, I32);
+  buf.is_local = 1;
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf,
+           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
+  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), UTB_NONE,
+                        utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
+
+  StrFoldCtx c = csf_ctx(ir, i_call, STRBI_STRLEN, 1);
+
+  UT_ASSERT_EQ(tcc_strfold_strlen.can_fold(&c), 0);
+  UT_ASSERT_EQ(tcc_strfold_strlen.fold(&c), 0);
+  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_FUNCCALLVAL);
+  UT_ASSERT_EQ(utb_op(ir, i_jump), TCCIR_OP_JUMP);
+
+  utb_free(ir);
+  return 0;
+}
+
 /* GUARD: a FUNCCALLVOID strlen is not a value -> is_valued=0 -> no fold. */
 UT_TEST(test_csf_strlen_void_no_fold)
 {

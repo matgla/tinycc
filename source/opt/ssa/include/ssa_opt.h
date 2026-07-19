@@ -32,11 +32,27 @@ typedef struct IRSSAUse {
 typedef struct IRSSAVregInfo {
   int def_instr;      /* instruction index, -1 if phi/entry */
   int def_phi_block;  /* block ID if phi, -1 otherwise */
-  int def_count;      /* number of definitions (>1 means non-SSA multi-def TEMP) */
+  int def_count;      /* number of INSTRUCTION definitions; see ssa_opt_def_total */
   IRSSAUse *uses;
   int use_count;
   int use_cap;
 } IRSSAVregInfo;
+
+/* Total number of definitions of a vreg, phi included.
+ *
+ * def_count counts instruction defs ONLY -- a phi def records itself in
+ * def_phi_block and leaves def_count alone.  So a vreg that is defined by a phi
+ * and then re-defined in place (`T <-- x [STORE]`, what an assignment to a
+ * register-promoted local lowers to) reports def_count == 1 and looks like
+ * clean SSA to a `def_count > 1` test.  Any transform whose correctness rests
+ * on "this value has exactly one definition" must ask for the total, or it will
+ * forward across the second def. */
+static inline int ssa_opt_def_total(const IRSSAVregInfo *vi)
+{
+  if (!vi)
+    return 0;
+  return vi->def_count + (vi->def_phi_block >= 0 ? 1 : 0);
+}
 
 /* ============================================================================
  * Optimization Context
@@ -89,6 +105,13 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx);
 /* Fixpoint over {load_cse, cprop, fold, branch, light dce} peeling
  * sequential constant-guard chains one folded branch per round. */
 int tcc_ir_ssa_opt_guard_collapse(IRSSAOptCtx *ctx);
+/* idle_cleanup: also run the jump-retarget/fallthrough/global-store-dse
+ * cleanup when THIS invocation folded nothing but a fall-through JUMP
+ * (folded guard hopping over its NOP'd abort arm) is present — an earlier
+ * pipeline iteration's branch/dce may have left that residue, which fences
+ * global_store_dse.  Only the SSA driver passes 1; regalloc's post-SSA loop
+ * must not (shape churn there exposed miscompiles). */
+int tcc_ir_ssa_opt_guard_collapse_ex(IRSSAOptCtx *ctx, int idle_cleanup);
 /* Same-block store-store DSE for full-width stores through single-def
  * TEMP pointer derefs (bitfield RMW chains after store→load forwarding). */
 int tcc_ir_ssa_opt_ptr_store_dse(IRSSAOptCtx *ctx);
@@ -137,6 +160,9 @@ uint8_t *ssa_opt_compute_reachable_blocks(IRSSAOptCtx *ctx);
  * pass that folds a branch must call this before returning. */
 int ssa_opt_prune_unreachable_phis(IRSSAOptCtx *ctx);
 int ssa_opt_sccp(IRSSAOptCtx *ctx);
+/* SCCP's 2-operand constant evaluator (div-trap-safe); 32-bit results are
+ * sign-extended.  Returns 0 when the op is unhandled or must not fold. */
+int ssa_opt_eval_binary(int op, int64_t v1, int64_t v2, int64_t *result, int is_64);
 /* ssa_opt_load_cse() moved to source/opt/ssa/memory/load_cse.h */
 /* ssa_opt_var_forward() moved to source/opt/ssa/include/opt/ssa/cprop.h */
 /* ssa_opt_var_to_param_forward() moved to source/opt/ssa/include/opt/ssa/cprop.h */

@@ -233,6 +233,15 @@ typedef enum TccIrOp
    * Placed at the end of the enum to avoid shifting other op values, which
    * could break ranges or generated tables that depend on absolute positions. */
   TCCIR_OP_SMULL,
+  /* Single-operand bit manipulation: dest = <op>(src1), 32-bit only.
+   * These map one-to-one onto Thumb-2 instructions and exist so the
+   * __builtin_clz/ctz/bswap family does not have to go through a libcall.
+   * They are only emitted when the active target advertises the encoding
+   * (see tcc_machine_has_bit_ops). */
+  TCCIR_OP_CLZ,   /* count leading zeros (clz);  clz(0) == 32 */
+  TCCIR_OP_RBIT,  /* reverse bit order (rbit) */
+  TCCIR_OP_REV,   /* reverse byte order in a word (rev)  == bswap32 */
+  TCCIR_OP_REV16, /* reverse byte order in each halfword (rev16) */
 } TccIrOp;
 
 /* Size (in bytes) at or above which the backend lowers a TCCIR_OP_BLOCK_COPY to
@@ -658,6 +667,15 @@ typedef struct TCCIRState
   uint16_t *codegen_dry_insn_saves;
   void *codegen_mop_cache;
   uint32_t *codegen_cbz_dry_mapping;
+  /* Code address just past the last body instruction as laid out by the
+   * rehearsal pass — i.e. where the epilogue begins.  Return jumps target the
+   * epilogue, which is not an IR index, so this is what lets them be sized.
+   * 0 when no rehearsal ran. */
+  uint32_t codegen_rehearsal_end;
+  /* Running literal-pool entry total per IR instruction, recorded by the
+   * rehearsal pass; bounds the pool pressure over a forward branch's range so
+   * can_narrow_forward_branch can prove no flush lands inside it. */
+  uint16_t *codegen_dry_pool_entries;
   uint8_t *codegen_branch_target_reset;
 } TCCIRState;
 
@@ -934,6 +952,21 @@ static inline void tcc_ir_set_src2(TCCIRState *ir, int index, IROperand irop)
   if (!irop_config[q->op].has_src2)
     return;
   int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+#ifdef CONFIG_TCC_DEBUG
+  /* Tripwire: src2 with a barrel-shift annotation means the real RHS is
+   * (src2 SHIFT #n).  Substituting an immediate folds the UN-shifted value
+   * (no imm-with-shift encoding exists, and binop folds ignore the side
+   * table).  A pass that wants this must clear the annotation first. */
+  {
+    IROperand old = ir->iroperand_pool[q->operand_base + off];
+    if (tcc_ir_barrel_shift_at(ir, q) && irop_is_immediate(irop) &&
+        !irop_is_immediate(old)) {
+      fprintf(stderr, "compiler_error: immediate substituted into "
+                      "barrel-shift-annotated src2 (instr %d)\n", index);
+      abort();
+    }
+  }
+#endif
   ir->iroperand_pool[q->operand_base + off] = irop;
 }
 

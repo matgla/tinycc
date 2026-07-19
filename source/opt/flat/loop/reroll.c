@@ -456,17 +456,8 @@ static void reroll_rewrite(TCCIRState *ir, int base, int P, int N)
 }
 
 /* Linear scan picking the highest-coverage (P,N) at each position. */
-static int tcc_ir_opt_reroll__timed(TCCIRState *ir);
+/* Timed at its production call site (ssa:reroll in tcc_ir_ssa_regalloc). */
 int tcc_ir_opt_reroll(TCCIRState *ir)
-{
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on) return tcc_ir_opt_reroll__timed(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_reroll__timed(ir);
-  tcc_pass_timing_add("reroll", tcc_pass_clk_us() - _t);
-  return _r;
-}
-static int tcc_ir_opt_reroll__timed(TCCIRState *ir)
 {
   if (!ir || ir->next_instruction_index < REROLL_MIN_PERIOD * REROLL_MIN_REPEATS)
     return 0;

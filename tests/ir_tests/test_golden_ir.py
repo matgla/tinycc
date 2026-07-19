@@ -151,6 +151,32 @@ def _extract_pass_block(output, pass_name):
     return "\n".join(line.rstrip() for line in lines[start_idx + 1 : end_idx])
 
 
+_GLOBALSYM_RE = re.compile(r"GlobalSym\((\d+)\)")
+
+
+def _canonicalize_symbols(text):
+    """Renumber `GlobalSym(<tok>)` to `GlobalSym(#<n>)` by first appearance.
+
+    The number the dumper prints is a token id from the frontend's symbol
+    table, so it shifts whenever the predefined-token set or the include
+    prelude changes -- entirely unrelated to the pass under test.  Pinning it
+    made five goldens fail for reasons no pass caused, so pin the symbol's
+    IDENTITY instead: equal ids stay equal, different ids stay different, and
+    the absolute value stops mattering.
+    """
+    if text is None:
+        return None
+    mapping = {}
+
+    def repl(match):
+        tok = match.group(1)
+        if tok not in mapping:
+            mapping[tok] = len(mapping)
+        return f"GlobalSym(#{mapping[tok]})"
+
+    return _GLOBALSYM_RE.sub(repl, text)
+
+
 def _run_compiler(compiler, cflags, c_file, tmp_path):
     """Run the compiler and return captured stdout/stderr text."""
     out_file = tmp_path / f"{c_file.stem}.o"
@@ -212,6 +238,7 @@ def test_golden_ir(pass_name, case_name, c_file, expected_file, debug_compiler, 
         actual = _extract_marked_block(result.stdout, special["start"], special["end"])
     else:
         actual = _extract_pass_block(result.stdout, pass_name)
+    actual = _canonicalize_symbols(actual)
 
     if pass_name in SSA_PASS_NAMES and actual is None:
         # The SSA optimizer runs inside ir/regalloc.c and calls

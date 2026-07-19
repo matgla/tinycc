@@ -19,13 +19,16 @@
 int tcc_ir_detect_const_result(TCCIRState *ir, int64_t *value, int *btype)
 {
   int n = ir->next_instruction_index;
-  if (n == 0 || ir->parameters_count > 0)
+  if (n == 0)
     return 0;
 
   int non_nop_count = 0;
   int ret_idx = -1;
 
-  for (int i = 0; i < n; i++)
+  /* Parameters are fine: the op-shape check below proves the body never
+   * reads them (only register ASSIGNs feeding an immediate return), so the
+   * result is the same constant for every argument list. */
+  for (int i = 0; i < n && ret_idx < 0; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
@@ -36,14 +39,20 @@ int tcc_ir_detect_const_result(TCCIRState *ir, int64_t *value, int *btype)
     switch (q->op)
     {
     case TCCIR_OP_ASSIGN:
+      {
+        IROperand dest = tcc_ir_op_get_dest(ir, q);
+        if (dest.is_lval || dest.is_llocal || irop_get_vreg(dest) < 0)
+          return 0;
+      }
+      break;
     case TCCIR_OP_RETURNVALUE:
+      /* The first return ends the straight-line body (no jumps admitted),
+       * so everything after it is unreachable. */
+      ret_idx = i;
       break;
     default:
       return 0;
     }
-
-    if (q->op == TCCIR_OP_RETURNVALUE)
-      ret_idx = i;
   }
 
   if (ret_idx < 0 || non_nop_count > 4)
@@ -51,6 +60,8 @@ int tcc_ir_detect_const_result(TCCIRState *ir, int64_t *value, int *btype)
 
   IRQuadCompact *ret_q = &ir->compact_instructions[ret_idx];
   IROperand src1 = tcc_ir_op_get_src1(ir, ret_q);
+  if (src1.is_lval || src1.is_llocal)
+    return 0;
 
   if (irop_is_immediate(src1))
   {
@@ -168,20 +179,19 @@ int tcc_ir_opt_const_call_replace(TCCIRState *ir)
       tcc_ir_set_dest(ir, i, dest);
     }
 
-    for (int j = i - 1; j >= 0; j--)
+    /* NOP every param bound to this call by call_id over the whole body:
+     * argument evaluation code can sit between the FUNCPARAMs of one call
+     * (nested calls do this), so a backward consecutive walk misses some
+     * and would leave a dangling FUNCPARAM with no owning FUNCCALL. */
+    for (int j = 0; j < i; j++)
     {
       IRQuadCompact *pq = &ir->compact_instructions[j];
-      if (pq->op == TCCIR_OP_NOP)
+      if (pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID)
         continue;
-      if (pq->op == TCCIR_OP_FUNCPARAMVAL || pq->op == TCCIR_OP_FUNCPARAMVOID)
-      {
-        IROperand ps2 = tcc_ir_op_get_src2(ir, pq);
-        int p_call_id = TCCIR_DECODE_CALL_ID((int)irop_get_imm64_ex(ir, ps2));
-        if (p_call_id == call_id)
-          pq->op = TCCIR_OP_NOP;
-        continue;
-      }
-      break;
+      IROperand ps2 = tcc_ir_op_get_src2(ir, pq);
+      int p_call_id = TCCIR_DECODE_CALL_ID((int)irop_get_imm64_ex(ir, ps2));
+      if (p_call_id == call_id)
+        pq->op = TCCIR_OP_NOP;
     }
 
     changes++;

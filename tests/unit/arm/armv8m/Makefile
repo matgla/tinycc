@@ -104,6 +104,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/backend/arch/arm/thumb/thop_shift_imm.c \
 	$(TOP)/source/backend/arch/arm/thumb/thop_system.c \
 	$(TOP)/source/backend/arch/arm/thumb/thop_vfp.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_coproc.c \
 	$(TOP)/source/backend/arch/arm/thumb/thop_ldrd.c \
 	$(TOP)/source/backend/arch/arm/thumb/thop_ldaex.c \
 	$(TOP)/source/backend/arch/arm/thumb/thop_ldrex.c \
@@ -145,6 +146,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/memory/dead_static_store.c \
 	$(TOP)/source/opt/flat/memory/global_base_share.c \
 	$(TOP)/source/opt/flat/memory/byte_store_merge.c \
+	$(TOP)/source/opt/flat/memory/mem_inline.c \
 	$(TOP)/source/opt/ssa/memory/diamond_store_fwd.c \
 	$(TOP)/source/opt/flat/scalar/branch_fold.c \
 	$(TOP)/source/opt/flat/scalar/stack_bool_diamond.c \
@@ -188,6 +190,8 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/util/vreg_def_use.c \
 	$(TOP)/source/opt/engine/pass_timing.c \
 	$(TOP)/source/opt/analysis/alias.c \
+	$(TOP)/source/opt/analysis/memref.c \
+	$(TOP)/source/opt/analysis/mem_ssa.c \
 	$(TOP)/ir/cfg.c \
 	$(TOP)/source/opt/flat/loop/loop_ir_mutate.c \
 	$(TOP)/source/opt/flat/loop/iv_analysis.c \
@@ -196,6 +200,8 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/loop/loop_eliminate.c \
 	$(TOP)/source/opt/flat/loop/loop_unroll.c \
 	$(TOP)/source/opt/flat/loop/loop_rotate.c \
+	$(TOP)/source/opt/flat/loop/loop_relayout.c \
+	$(TOP)/source/opt/flat/loop/seq_guard_elim.c \
 	$(TOP)/source/opt/flat/loop/decrement_to_zero.c \
 	$(TOP)/source/opt/flat/loop/reroll.c \
 	$(TOP)/source/opt/flat/scalar/bitfield.c \
@@ -215,6 +221,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/memory/mem_init.c \
 	$(TOP)/source/opt/flat/memory/memmove_to_indexed_stores.c \
 	$(TOP)/source/opt/flat/memory/addrof_var_fwd.c \
+	$(TOP)/source/opt/flat/memory/ptr_local_fwd.c \
 	$(TOP)/source/opt/flat/memory/invariant_global_load_hoist.c \
 	$(TOP)/source/opt/flat/memory/invariant_temp_deref_hoist.c \
 	$(TOP)/source/opt/flat/memory/rmw_byte_clear.c \
@@ -316,7 +323,9 @@ UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/source/opt/ssa/cfg/cmp_eq.c \
 	$(TOP)/source/opt/ssa/cfg/vrp.c \
 	$(TOP)/source/opt/ssa/scalar/setif_or_taut.c \
+	$(TOP)/source/opt/ssa/scalar/bool_norm.c \
 	$(TOP)/source/opt/ssa/scalar/cmp_offset_fold.c \
+	$(TOP)/source/opt/ssa/scalar/tmp_block_const.c \
 	$(TOP)/source/opt/ssa/scalar/cprop.c \
 	$(TOP)/source/opt/ssa/dce/temp_worklist.c \
 	$(TOP)/source/opt/ssa/dce/unreachable.c \
@@ -455,6 +464,7 @@ UT_LOCAL_SRCS := \
 	test_thop_shift_imm.c \
 	test_thop_system.c \
 	test_thop_vfp.c \
+	test_thop_coproc.c \
 	test_thop_cmp.c \
 	test_thop_extend.c \
 	test_thop_ldrd.c \
@@ -637,10 +647,21 @@ $(COV_STAMP2):
 # backend files under test. Verified by trial-link: this exact source set
 # links clean against UT2_LOCAL_SRCS below with zero undefined symbols and
 # zero multiple definitions.
+#
+# The arch/fpu/arm/ capability tables are here because arm-thumb-gen.c's
+# arm_determine_fpu_config() names all three; only arm_soft_fpu_config is
+# defined in arm-thumb-gen.c itself. They used to resolve by accident: their
+# headers declared `const FloatingPointConfig x;` without `extern`, so every
+# includer got its own zero-initialised tentative definition. Making the
+# headers `extern` (so the real tables are actually used) turned that into an
+# undefined reference here.
 UT2_MODULE_SRCS := \
 	$(UT_MODULE_SRCS) \
 	$(TOP)/source/backend/arch/arm/thumb/arm-thumb-gen.c \
-	$(TOP)/source/backend/arch/arm/thumb/arm-thumb-callsite.c
+	$(TOP)/source/backend/arch/arm/thumb/arm-thumb-callsite.c \
+	$(TOP)/source/backend/arch/fpu/arm/fpv5-sp-d16.c \
+	$(TOP)/source/backend/arch/fpu/arm/fpv5-d16.c \
+	$(TOP)/source/backend/arch/fpu/arm/rp2350-dcp.c
 UT2_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR2)/%.o,$(UT2_MODULE_SRCS))
 
 # Harness + suites (local to this directory) for the backend binary. Reuses
@@ -1346,7 +1367,9 @@ UT11_MODULE_SRCS := \
 	$(TOP)/source/opt/ssa/cfg/cmp_eq.c \
 	$(TOP)/source/opt/ssa/cfg/vrp.c \
 	$(TOP)/source/opt/ssa/scalar/setif_or_taut.c \
+	$(TOP)/source/opt/ssa/scalar/bool_norm.c \
 	$(TOP)/source/opt/ssa/scalar/cmp_offset_fold.c \
+	$(TOP)/source/opt/ssa/scalar/tmp_block_const.c \
 	$(TOP)/source/opt/ssa/scalar/reassoc.c \
 	$(TOP)/source/opt/ssa/scalar/narrow.c \
 	$(TOP)/source/opt/ssa/cfg/phi.c \
@@ -1371,6 +1394,7 @@ UT11_LOCAL_SRCS := \
 	test_ssa_opt_cprop.c \
 	test_ssa_opt_sccp.c \
 	test_ssa_opt_dead_loop.c \
+	test_ssa_opt_dce.c \
 	test_ssa_opt_dce_global.c \
 	test_ssa_opt_gvn.c \
 	test_ssa_opt_const_string_fold.c \

@@ -46,6 +46,17 @@ int tcc_ir_vreg_has_single_use(TCCIRState *ir, int32_t vreg, int exclude_idx)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
+    /* MLA's accumulator (operand_base+3) is a real use that has_src1/2 cannot
+     * see.  Callers use "single use" to justify folding a def into its one use
+     * site, and they only ever rewrite src1/src2 — so a vreg read in an
+     * accumulator is never safely a single use.  Report multi-use rather than
+     * counting it: counting would newly admit the accumulator-only case, which
+     * today bails (use_count 0).  Same blind spot as the ssa:sccp phi
+     * materialization fixed for fuzz seeds volatile:82433 / bitfield:88932. */
+    if (q->op == TCCIR_OP_MLA &&
+        irop_get_vreg(tcc_ir_op_get_accum(ir, q)) == vreg)
+      return 0;
+
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
     IROperand src2 = tcc_ir_op_get_src2(ir, q);
 

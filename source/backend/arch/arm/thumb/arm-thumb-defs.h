@@ -58,6 +58,7 @@ enum arm_fpu_type
   ARM_FPU_FPV4_SP_D16,   /* FPv4-SP-D16 (Cortex-M4) - single precision only */
   ARM_FPU_FPV5_SP_D16,   /* FPv5-SP-D16 (Cortex-M7, ARMv8-M) - single precision */
   ARM_FPU_FPV5_D16,      /* FPv5-D16 (Cortex-M7, ARMv8-M) - single+double */
+  ARM_FPU_RP2350,        /* RP2350: FPv5-SP FPU + the DCP double coprocessor on CP4 */
   ARM_FPU_NEON,          /* NEON with VFPv3 */
   ARM_FPU_NEON_VFPV4,    /* NEON with VFPv4 */
   ARM_FPU_NEON_FP_ARMV8, /* NEON with ARMv8 FP */

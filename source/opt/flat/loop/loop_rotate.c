@@ -18,6 +18,75 @@
 #include "opt_utils.h"
 #include "opt_loop_utils.h"
 
+/* A VAR-vreg lval operand is a direct variable access (same convention as
+ * ROT_LVAL_IS_INDIRECT below); every other lval dereferences the vreg. */
+#define ROT_VAR_DIRECT(op_)                                                                                       \
+  (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op_)) == TCCIR_VREG_TYPE_VAR && (op_).is_local)
+
+/* NOTE: the former rot_iv_dead_after_exit veto (reject a call-body rotation
+ * whose IV is read after the loop) is gone.  Its cost model — a live-out IV
+ * pays a merge copy at BOTH exits — only holds while the zero-trip guard
+ * survives.  rot_guard_provably_folds is now mandatory for these shapes, and a
+ * folded guard leaves the rotated loop with a single exit, so the live-out IV
+ * is one value and needs no phi.  Measured on the memclr chain, where the
+ * liveness veto used to block every loop that shares `i`. */
+
+/* 1 when the header's exit branch is provably untaken on loop entry: the IV
+ * enters from a known constant and the CMP's other side is a literal.  A later
+ * const fold (or, for the carried case, ssa:loop_guard_elim) then deletes the
+ * pre-loop guard, so rotation costs nothing.  Without this the guard survives
+ * (runtime entry value) and rotation trades the back-branch for a guard
+ * CMP+branch — a net static loss (memclr loop 3 measured +2 per function).
+ * Used to gate the call-body shapes only.
+ *
+ * Two sources of the entry constant:
+ *   - a literal ASSIGN on the straight-line path into the header (the first
+ *     loop of a function; ordinary const prop folds this guard);
+ *   - the exit value of preceding counted loops over the same IV (loops 2..N
+ *     of a sequential chain), which only tcc_ir_loop_seq_entry_const knows —
+ *     SSA sees a phi at the header and cannot conclude i == A. */
+static int rot_guard_provably_folds(TCCIRState *ir, int hi, IRQuadCompact *cmp_q, int cond)
+{
+  IROperand s1 = tcc_ir_op_get_src1(ir, cmp_q);
+  IROperand s2 = tcc_ir_op_get_src2(ir, cmp_q);
+  if (!irop_has_vreg(s1) || !irop_is_immediate(s2))
+    return 0;
+  int32_t iv = irop_get_vreg(s1);
+  int64_t lim = irop_get_imm64_ex(ir, s2);
+  for (int i = hi - 1; i >= 0; i--)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    int op = q->op;
+    if (op == TCCIR_OP_NOP)
+      continue;
+    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF || op == TCCIR_OP_IJUMP)
+      break; /* not the straight-line entry path — try the carried value */
+    int is_def = 0;
+    if (irop_config[op].has_dest)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      is_def = irop_has_vreg(d) && irop_get_vreg(d) == iv && (!d.is_lval || ROT_VAR_DIRECT(d));
+    }
+    /* a join between the def and the header can bring a different value */
+    if (q->is_jump_target && !is_def)
+      break;
+    if (!is_def)
+      continue;
+    IROperand v = tcc_ir_op_get_src1(ir, q);
+    if (op != TCCIR_OP_ASSIGN || !irop_is_immediate(v))
+      return 0;
+    int64_t entry = irop_get_imm64_ex(ir, v);
+    return evaluate_compare_condition_cmp_annotated(ir, cmp_q, entry, lim, cond, s1, s2) == 0;
+  }
+
+  if (tcc_ir_opt_pass_disabled("ssa:loop_guard_elim"))
+    return 0;
+  int64_t carried;
+  if (!tcc_ir_loop_seq_entry_const(ir, hi, iv, &carried))
+    return 0;
+  return evaluate_compare_condition_cmp_annotated(ir, cmp_q, carried, lim, cond, s1, s2) == 0;
+}
+
 int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
 {
   int hi = loop->header_idx;
@@ -113,6 +182,10 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   int body_latch_target = -1;
   int body_end_is_implicit = 0;
   int cond_body = 0;
+  /* first instruction of the cond_body cold tail (decide + 1); calls at or
+   * after this index are allowed — the tail is proven terminating, so control
+   * never returns from it into the loop */
+  int cond_cold_start = -1;
   /* break_invert: body ends in a deciding JUMPIF-to-latch whose fall-through is the exit (`if (cond) break;`) */
   int break_invert = 0;
   int break_decide_idx = -1;
@@ -226,6 +299,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     if (!bad && decide >= 0 && branches == 1 && decide < exit_target - 1 && cold_terminates)
     {
       cond_body = 1;
+      cond_cold_start = decide + 1;
       body_latch_target = decide_target;
       body_end_jmp = exit_target - 1;
       body_end_is_implicit = 1;
@@ -336,6 +410,28 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
       if (irop_config[op].has_dest)
         ROT_NOTE_DEF(tcc_ir_op_get_dest(ir, q));
     }
+    /* Exactly one loop-carried non-IV VAR.  This is a PERFORMANCE gate, not a
+     * correctness one.
+     *
+     * It used to be a correctness gate: raising it produced wrong code at -O2
+     * (>2 broke 10 ir_tests, >3 broke 23, >8 broke 41).  That was not about
+     * carried values at all — write_instr_at_nop does not copy orig_index, and
+     * the barrel_shift / shift64_dead_half / bfi_params side tables are keyed by
+     * it, so a relocated instruction silently lost its annotation (a fused
+     * `add rd, rn, rm lsr #2` came back as a plain `add`).  The guard was
+     * accidentally hiding that by keeping most annotated loops from rotating.
+     * Fixed by preserving orig_index across the rewrite (see body_origs /
+     * latch_origs); with that in place `> 2` passes all 2364 ir_tests.
+     *
+     * It stays at 1 because rotating multi-carried loops is a measured
+     * PESSIMISATION: `> 2` costs +16,418 cycles on the ir suite (13,823,142 ->
+     * 13,839,560) for zero byte change.  Each extra carried value needs a copy
+     * at both loop exits and another live register, which outweighs the one
+     * branch per iteration that rotation saves.  Raise it only with a cycle
+     * measurement that says otherwise.
+     *
+     * (`> 8` additionally still fails 296_fuzz_assign_strd_deref_src at -O2, so
+     * there is at least one more latent bug further out.) */
     if (ncarried_defs > 1)
     {
       LOG_LOOP_OPT("Rotation: reject — body carries %d non-IV VARs", ncarried_defs);
@@ -346,20 +442,57 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
 #undef ROT_NOTE_DEF
   }
 
-  /* a call in the body makes forwarding treat preheader/body copies of a call-clobbered value as interchangeable */
+  /* Indexed loads/stores in the body are NOT rejected: that guard was vestigial.
+   * The operand save/restore below already carries the 4th pool slot they need
+   * (body_has_extra), so the rewrite reconstructs them intact.  Dropping it is
+   * what lets ordinary array loops (`for (i) s += p[i]`) bottom-test — worth
+   * ~28k cycles on the ir suite at no size cost.  The indirect-lvalue guard
+   * below is a genuinely different condition and stays.
+   *
+   * a call in the body makes forwarding treat preheader/body copies of a call-clobbered value as interchangeable */
+  /* memoized across the body scan: the carried-constant probe walks the whole
+   * function, and a body can hold several calls */
+  int guard_folds = -1;
   for (int i = body_start; i <= body_end; i++)
   {
     int op = ir->compact_instructions[i].op;
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
     {
-      LOG_LOOP_OPT("Rotation: reject — body has call at %d", i);
-      return 0;
-    }
-    if (op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED)
-    {
-      LOG_LOOP_OPT("Rotation: reject — body has indexed memory op at %d", i);
-      return 0;
+      /* A call that can return stays rejected (see the forwarding note
+       * above).  Two provably-safe exceptions, both of which make the
+       * clobber unreachable from the loop:
+       *   - a noreturn callee: control never comes back, so the clobber
+       *     cannot reach a loop-carried value.  This is the `for (i)
+       *     if (v[i] != K) abort();` check-loop shape — the single largest
+       *     un-rotated family in the corpus (memclr / memcpy-a*);
+       *   - any call inside the cond_body cold tail, whose terminating shape
+       *     cold_terminates already proved never falls back into the loop. */
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      int in_cold_tail = cond_body && cond_cold_start >= 0 && i >= cond_cold_start;
+      if (!tcc_ir_callee_is_noreturn(callee) && !in_cold_tail)
+      {
+        LOG_LOOP_OPT("Rotation: reject — body has returning hot-path call at %d", i);
+        return 0;
+      }
+      /* Call-body rotation is only profitable when it is free: the pre-loop
+       * guard must provably fold (a surviving guard trades the back-branch for
+       * CMP+branch: +2 per function on memclr loop 3), and an IV that is read
+       * after the loop must not cost a merge copy at the exit (+40,942 corpus
+       * instructions ungated).
+       *
+       * A folding guard settles the second condition too: with the guard gone
+       * the rotated loop has exactly ONE exit, so the live-out IV is a single
+       * value needing no phi — which is precisely the memclr shape (sequential
+       * check loops sharing one `i`).  Only when the guard survives does the
+       * two-exit merge appear, and only then does the liveness veto apply. */
+      if (guard_folds < 0)
+        guard_folds = rot_guard_provably_folds(ir, hi, cmp_q, cond);
+      if (!guard_folds)
+      {
+        LOG_LOOP_OPT("Rotation: reject — call body with non-foldable entry guard");
+        return 0;
+      }
     }
     if ((irop_config[op].has_src1 && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_src1(ir, q))) ||
         (irop_config[op].has_src2 && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_src2(ir, q))) ||
@@ -557,9 +690,9 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
 
   /* IROperand is packed (9 bytes), so every sub-array of this scratch buffer must be explicitly 8-aligned */
   int bc = body_count, lc = eff_latch_count;
-  size_t _rsz = bc * (2 * sizeof(int) + 4 * sizeof(IROperand) + sizeof(uint32_t))
-              + lc * (sizeof(int) + 3 * sizeof(IROperand) + sizeof(uint32_t))
-              + 12 * 8; /* per-sub-array alignment padding (<=7 bytes each) */
+  size_t _rsz = bc * (3 * sizeof(int) + 4 * sizeof(IROperand) + sizeof(uint32_t))
+              + lc * (2 * sizeof(int) + 3 * sizeof(IROperand) + sizeof(uint32_t))
+              + 14 * 8; /* per-sub-array alignment padding (<=7 bytes each) */
   char *_rbuf = (char *)tcc_mallocz(_rsz);
   /* distinct offset variables: the self-host cross wrongly CSEs a running align-and-advance pointer */
 #define _ROFF(prev, cnt, esz) ((((prev) + (size_t)(cnt) * (esz)) + 7u) & ~(size_t)7u)
@@ -575,6 +708,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   size_t _o_latch_src1s    = _ROFF(_o_latch_dests, lc, sizeof(IROperand));
   size_t _o_latch_src2s    = _ROFF(_o_latch_src1s, lc, sizeof(IROperand));
   size_t _o_latch_lines    = _ROFF(_o_latch_src2s, lc, sizeof(IROperand));
+  size_t _o_body_origs     = _ROFF(_o_latch_lines, lc, sizeof(uint32_t));
+  size_t _o_latch_origs    = _ROFF(_o_body_origs, bc, sizeof(int));
 #undef _ROFF
   int *body_ops          = (int *)(_rbuf + _o_body_ops);
   int *body_has_extra    = (int *)(_rbuf + _o_body_has_extra);
@@ -588,6 +723,14 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   IROperand *latch_src1s = (IROperand *)(_rbuf + _o_latch_src1s);
   IROperand *latch_src2s = (IROperand *)(_rbuf + _o_latch_src2s);
   uint32_t *latch_lines  = (uint32_t *)(_rbuf + _o_latch_lines);
+  /* orig_index keys the per-instruction side tables (barrel_shifts,
+   * shift64_dead_half, bfi_params).  write_instr_at_nop does not set it, so a
+   * moved instruction would inherit the destination NOP's index and silently
+   * lose its annotation — a fused `add rd, rn, rm lsr #2` came back as a plain
+   * `add rd, rn, rm`, dropping the shift (probe: an inlined hash mixer's
+   * `h + (h >> 2)` in a rotated loop). */
+  int *body_origs        = (int *)(_rbuf + _o_body_origs);
+  int *latch_origs       = (int *)(_rbuf + _o_latch_origs);
 
   for (int b = 0; b < body_count; b++)
   {
@@ -595,6 +738,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     int op = bq->op;
     body_ops[b] = op;
     body_lines[b] = bq->line_num;
+    body_origs[b] = bq->orig_index;
     /* _rbuf is pre-zeroed; never write (IROperand){0} into it — the packed operand lowers to an unaligned STRD */
     /* ops carrying a 4th pool operand: dropping it would rebuild e.g. a SELECT with cond=0 */
     body_has_extra[b] = (op == TCCIR_OP_MLA || op == TCCIR_OP_LOAD_INDEXED ||
@@ -616,6 +760,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     int op = lq->op;
     latch_ops[l] = op;
     latch_lines[l] = lq->line_num;
+    latch_origs[l] = lq->orig_index;
     if (irop_config[op].has_dest)
       latch_dests[l] = ir->iroperand_pool[lq->operand_base];
     if (irop_config[op].has_src1)
@@ -639,6 +784,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     if (body_has_extra[b])
       tcc_ir_pool_add(ir, body_extras[b]); /* 4th operand at operand_base+3 */
     ir->compact_instructions[wp].line_num = body_lines[b];
+    ir->compact_instructions[wp].orig_index = body_origs[b];
     wp++;
   }
 
@@ -694,6 +840,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   {
     write_instr_at_nop(ir, wp, latch_ops[l], latch_dests[l], latch_src1s[l], latch_src2s[l]);
     ir->compact_instructions[wp].line_num = latch_lines[l];
+    ir->compact_instructions[wp].orig_index = latch_origs[l];
     wp++;
   }
 

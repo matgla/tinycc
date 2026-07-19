@@ -414,17 +414,32 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
     }
   } else {
     /* Unscaled register index: base + index (scale 0), folded into
-     * LDR/STR Rt,[Rn,Rm].  Both ADD operands must be plain registers; a
-     * constant operand is the displacement case handled elsewhere. */
+     * LDR/STR Rt,[Rn,Rm].  Operands are either two plain registers or a
+     * global address plus a register — the scaled path already admits a
+     * SYMREF base and the backend materializes it, so the byte/short case
+     * must not be stricter (it was, which kept `for (i) s += gv[i]` over a
+     * global as ADD+DEREF and thereby blocked loop rotation's indirect-lvalue
+     * guard).  A constant operand is the displacement case handled
+     * elsewhere. */
     if (add_idx >= i)
       return 0;
-    if (!irop_has_vreg(add_src1) || !irop_has_vreg(add_src2))
+    int src1_sym = irop_get_tag(add_src1) == IROP_TAG_SYMREF;
+    int src2_sym = irop_get_tag(add_src2) == IROP_TAG_SYMREF;
+    if (src1_sym && src2_sym)
       return 0;
-    if (add_src1.is_const || add_src2.is_const)
-      return 0;
-
-    base_op = add_src1;
-    index_op = add_src2;
+    if (src1_sym || src2_sym) {
+      base_op = src1_sym ? add_src1 : add_src2;
+      index_op = src1_sym ? add_src2 : add_src1;
+      if (!irop_has_vreg(index_op) || index_op.is_const)
+        return 0;
+    } else {
+      if (!irop_has_vreg(add_src1) || !irop_has_vreg(add_src2))
+        return 0;
+      if (add_src1.is_const || add_src2.is_const)
+        return 0;
+      base_op = add_src1;
+      index_op = add_src2;
+    }
     shift_amount = 0;
 
     /* Index may be a plain register or a stack-local lvalue.  Reject
@@ -438,8 +453,9 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
 
     /* The ADD must reach the memory op with no intervening control flow and
      * no redefinition of either address component, so the fused load/store
-     * recomputes the same effective address. */
-    int32_t base_vr = irop_get_vreg(base_op);
+     * recomputes the same effective address.  A SYMREF base is a constant
+     * address — only the register components can be redefined. */
+    int32_t base_vr = irop_has_vreg(base_op) ? irop_get_vreg(base_op) : -1;
     int32_t index_vr = irop_get_vreg(index_op);
     for (int j = add_idx + 1; j < i; j++) {
       IRQuadCompact *bq = &ir->compact_instructions[j];
@@ -448,7 +464,7 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
       IROperand bd = tcc_ir_op_get_dest(ir, bq);
       if (irop_has_vreg(bd)) {
         int32_t dvr = irop_get_vreg(bd);
-        if (dvr == base_vr || dvr == index_vr)
+        if ((base_vr >= 0 && dvr == base_vr) || dvr == index_vr)
           return 0;
       }
     }
@@ -474,6 +490,11 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
   IROperand base_op_clean = base_op;
   IROperand index_op_clean = index_op;
   base_op_clean.is_lval = 0;
+  /* Transfer the packed-access mark from the deref operand being replaced
+   * (LOAD: src1, STORE: dest) onto the base: the backend's 64-bit indexed
+   * lowering uses LDRD/STRD, which fault on the unaligned addresses a packed
+   * member chain can produce. */
+  base_op_clean.aux |= (is_store ? orig_dest.aux : orig_src1.aux) & IROP_AUX_UNDERALIGN;
   IROperand scale_imm = irop_make_imm32(0, shift_amount, IROP_BTYPE_INT32);
 
   if (is_store) {
@@ -683,6 +704,8 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
       loaded_op.is_unsigned = deref_op.is_unsigned;
     IROperand base_clean = base_op;
     base_clean.is_lval = 0;
+    /* Same packed-access transfer as in ir_gen_indexed_memory_fusion. */
+    base_clean.aux |= deref_op.aux & IROP_AUX_UNDERALIGN;
     IROperand scale_imm = irop_make_imm32(0, scale_amount, IROP_BTYPE_INT32);
 
     ir->iroperand_pool[new_base_idx + 0] = loaded_op;

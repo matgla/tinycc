@@ -225,6 +225,11 @@ static int sv_read_cmp(SVState *s, int cmp_idx, SVCmp *out)
 {
   TCCIRState *ir = s->ctx->ir;
   IRQuadCompact *cq = &ir->compact_instructions[cmp_idx];
+  /* A fused barrel shift means the real rhs is (src2 SHIFT #n) — the visible
+   * operand does not describe the compared value (fuzz seed signed:8890,
+   * test 393). */
+  if (tcc_ir_barrel_shift_at(ir, cq))
+    return 0;
   if (cq->op == TCCIR_OP_TEST_ZERO)
   {
     out->x = tcc_ir_op_get_src1(ir, cq);
@@ -761,6 +766,10 @@ static int sv_cmp_verdict(SVState *s, int cmp_idx, int tok, SVCmp *cmp, int32_t 
   IRQuadCompact *cq = &ir->compact_instructions[cmp_idx];
   if (cq->op != TCCIR_OP_CMP)
     return -1;
+  /* Same barrel-shift bail as sv_read_cmp: b's range would describe the
+   * UNshifted register. */
+  if (tcc_ir_barrel_shift_at(ir, cq))
+    return -1;
   IROperand a = tcc_ir_op_get_src1(ir, cq), b = tcc_ir_op_get_src2(ir, cq);
   int64_t alo, ahi, blo, bhi;
   if (!sv_operand_range(s, a, &alo, &ahi) || !sv_operand_range(s, b, &blo, &bhi))
@@ -1079,37 +1088,6 @@ static int sv_visit(IRSSAOptCtx *ctx, int block, void *state)
 }
 
 /* Whether any instruction directly writes vr (as a non-lval dest). */
-static int sv_vreg_ever_written(TCCIRState *ir, int32_t vr)
-{
-  int n = ir->next_instruction_index;
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
-      continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (!d.is_lval && irop_get_vreg(d) == vr)
-      return 1;
-  }
-  return 0;
-}
-
-/* Count writes to a VAR slot, including the is_lval slot STORE sv_vreg_ever_written skips.
- * Counting a deref STORE `*V<-x` too only over-marks V non-stable, which is sound.  Stops at 2. */
-static int sv_var_write_count(TCCIRState *ir, int32_t vr)
-{
-  int n = ir->next_instruction_index, cnt = 0;
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
-      continue;
-    if (irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == vr && ++cnt > 1)
-      break;
-  }
-  return cnt;
-}
-
 int ssa_opt_vrp(IRSSAOptCtx *ctx)
 {
   IRCFG *cfg = ctx->cfg;
@@ -1131,35 +1109,77 @@ int ssa_opt_vrp(IRSSAOptCtx *ctx)
   SVRangeSeq_init(&ranges_owner, (size_t)s.cap);
   s.ranges = SVRangeSeq_data(&ranges_owner);
 
-  /* Precomputed so sv_slot's per-lookup test is O(1) instead of an O(n) scan. */
-  if (s.param_cap > 0)
+  /* Precomputed so sv_slot's per-lookup test is O(1) instead of an O(n) scan.
+   * ONE fused pass over the instructions collects write counts and
+   * address-taken flags for every PARAM and VAR slot at once; the previous
+   * per-slot sv_vreg_ever_written / sv_var_write_count /
+   * ir_opt_vreg_address_taken_between scans made setup O((P+V)*n) —
+   * 18.5 s of tests2/101_cleanup's -O1 compile before the domwalk even
+   * started (the pass runs ~23x through the pipeline).
+   *
+   * Semantics mirrored exactly: a PARAM counts as written only by a
+   * non-lval dest (sv_vreg_ever_written); a VAR write counts lval slot
+   * STOREs too (sv_var_write_count); address-taken is a LEA whose src1 is
+   * the slot's vreg. */
+  if (s.param_cap > 0 || s.var_cap > 0)
   {
     int n = ir->next_instruction_index;
-    SVFlagSeq_init(&param_stable_owner, (size_t)s.param_cap);
-    s.param_stable = SVFlagSeq_data(&param_stable_owner);
-    for (int p = 0; p < s.param_cap; p++)
+    uint8_t *pw = s.param_cap > 0 ? tcc_mallocz((size_t)s.param_cap * 2) : NULL;
+    uint8_t *pt = pw ? pw + s.param_cap : NULL;
+    uint8_t *vw = s.var_cap > 0 ? tcc_mallocz((size_t)s.var_cap * 2) : NULL;
+    uint8_t *vt = vw ? vw + s.var_cap : NULL;
+    for (int i = 0; i < n; i++)
     {
-      int32_t pvr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_PARAM, p);
-      s.param_stable[p] =
-          !sv_vreg_ever_written(ir, pvr) && !ir_opt_vreg_address_taken_between(ir, pvr, -1, n);
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (q->op == TCCIR_OP_LEA)
+      {
+        int32_t avr = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+        if (avr >= 0)
+        {
+          int at = TCCIR_DECODE_VREG_TYPE(avr), ap = TCCIR_DECODE_VREG_POSITION(avr);
+          if (pt && at == TCCIR_VREG_TYPE_PARAM && ap >= 0 && ap < s.param_cap)
+            pt[ap] = 1;
+          if (vt && at == TCCIR_VREG_TYPE_VAR && ap >= 0 && ap < s.var_cap)
+            vt[ap] = 1;
+        }
+      }
+      if (!irop_config[q->op].has_dest)
+        continue;
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      int32_t dvr = irop_get_vreg(d);
+      if (dvr < 0)
+        continue;
+      {
+        int dt = TCCIR_DECODE_VREG_TYPE(dvr), dp = TCCIR_DECODE_VREG_POSITION(dvr);
+        if (pw && dt == TCCIR_VREG_TYPE_PARAM && dp >= 0 && dp < s.param_cap && !d.is_lval)
+          pw[dp] = 1;
+        if (vw && dt == TCCIR_VREG_TYPE_VAR && dp >= 0 && dp < s.var_cap && vw[dp] < 2)
+          vw[dp]++;
+      }
     }
-  }
-
-  /* Stable VAR: written once, address never taken, not volatile. */
-  if (s.var_cap > 0)
-  {
-    int n = ir->next_instruction_index;
-    SVFlagSeq_init(&var_stable_owner, (size_t)s.var_cap);
-    s.var_stable = SVFlagSeq_data(&var_stable_owner);
-    for (int v = 0; v < s.var_cap; v++)
+    if (s.param_cap > 0)
     {
-      int32_t vvr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, v);
-      int is_vol = (v < ir->variables_live_intervals_size &&
-                    ir->variables_live_intervals[v].is_volatile);
-      s.var_stable[v] =
-          !is_vol && sv_var_write_count(ir, vvr) == 1 &&
-          !ir_opt_vreg_address_taken_between(ir, vvr, -1, n);
+      SVFlagSeq_init(&param_stable_owner, (size_t)s.param_cap);
+      s.param_stable = SVFlagSeq_data(&param_stable_owner);
+      for (int p = 0; p < s.param_cap; p++)
+        s.param_stable[p] = !pw[p] && !pt[p];
     }
+    /* Stable VAR: written once, address never taken, not volatile. */
+    if (s.var_cap > 0)
+    {
+      SVFlagSeq_init(&var_stable_owner, (size_t)s.var_cap);
+      s.var_stable = SVFlagSeq_data(&var_stable_owner);
+      for (int v = 0; v < s.var_cap; v++)
+      {
+        int is_vol = (v < ir->variables_live_intervals_size &&
+                      ir->variables_live_intervals[v].is_volatile);
+        s.var_stable[v] = !is_vol && vw[v] == 1 && !vt[v];
+      }
+    }
+    tcc_free(pw);
+    tcc_free(vw);
   }
 
   OptSSADomWalk walk = {

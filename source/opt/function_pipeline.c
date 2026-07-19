@@ -135,6 +135,15 @@ static void run_opt_pipeline(TCCIRState *ir)
 /* ================================================================== */
 static void run_store_load_fwd_passes(TCCIRState *ir)
 {
+  /* Redirect copied-local-field loads to their source global BEFORE store-load
+   * forwarding collapses the copy field-stores; the redirected global loads then
+   * CSE with the independent source loads and the self-comparisons fold. */
+  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
+  {
+    if (tcc_ir_opt_copy_source_load_fwd(ir))
+      tcc_ir_opt_cmp_expr_fold(ir);
+    DUMP_IR_AFTER_PASS(ir, "ZZ_csfwd");
+  }
   if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
   {
     IROptCtx esp_ctx;
@@ -225,6 +234,29 @@ static void run_dead_store_and_cleanup(TCCIRState *ir)
 
   tcc_ir_opt_memmove_to_indexed_stores(ir);
   tcc_ir_opt_compact_nops(ir);
+
+  /* Late, for the reason spelled out below: an early run would hide the reads
+   * from the interprocedural const cascades.  Unlike the address CSE it keeps
+   * one direct SYMREF lvalue read in the IR, so the post-codegen reader
+   * analyses stay sound. */
+  if (tcc_state->optimize >= 1)
+    tcc_ir_opt_global_deref_cse(ir);
+
+  /* Runs on the single-load shape global_deref_cse produces. */
+  if (tcc_state->optimize >= 1 && tcc_ir_opt_bitfield_unit_narrow(ir) > 0)
+    tcc_ir_opt_compact_nops(ir);
+
+  /* NOTE: a "late" symbol-address CSE run (lval loads/stores and symref
+   * indexed bases rebased onto a hoisted address — see
+   * tcc_ir_opt_symaddr_cse_late) is NOT invoked: the TU-level analyses that
+   * run AFTER codegen (purity inference, detect_const_result, write
+   * summaries, tu_no_readers, post-opt auto-inline marking) all pattern-match
+   * SYMREF operand shapes in the final IR.  Hiding accesses behind a vreg
+   * base either blinds interprocedural folds (20040629-1 main 11 -> 2214) or
+   * risks unsound summaries (a static whose reads became vreg-based looks
+   * reader-free to tu_dead_statics).  The remaining duplicate-literal-load
+   * gap belongs at the MACHINE level: extend codegen's single-entry
+   * cached_global_sym reuse cache instead. */
 
 #ifdef CONFIG_TCC_DEBUG
   if (tcc_state->dump_ir) {

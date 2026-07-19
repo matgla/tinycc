@@ -15,6 +15,9 @@
 
 
 
+#include "opt_utils.h"
+#include "memref.h"
+
 #include "tu_summary.h"
 
 void tu_symset_add(TuSymSet *s, Sym *sym)
@@ -70,6 +73,7 @@ void tcc_ir_tu_func_summary_clear_all(void)
     tu_symset_free(&tu_summary_head->calls);
     tu_symset_free(&tu_summary_head->static_reads);
     tu_symset_free(&tu_summary_head->static_writes);
+    tu_symset_free(&tu_summary_head->global_writes);
     tcc_free(tu_summary_head);
     tu_summary_head = n;
   }
@@ -228,6 +232,100 @@ void tcc_ir_collect_tu_static_reads_preopt(TCCIRState *ir)
   }
 }
 
+/* Block-copy / fill helpers whose only memory effect is through the destination
+ * pointer (argument 0).  Callers resolve that pointer at the call site, so the
+ * mod-ref walk may skip these even though they have no TU summary. */
+static int tu_is_block_copy_helper(const char *nm)
+{
+  if (!nm)
+    return 0;
+  return !strcmp(nm, "memcpy") || !strcmp(nm, "memmove") || !strcmp(nm, "memset") ||
+         !strcmp(nm, "__aeabi_memcpy") || !strcmp(nm, "__aeabi_memmove") ||
+         !strcmp(nm, "__aeabi_memset") || !strcmp(nm, "__aeabi_memclr") ||
+         !strcmp(nm, "__aeabi_memcpy4") || !strcmp(nm, "__aeabi_memmove4") ||
+         !strcmp(nm, "__aeabi_memcpy8") || !strcmp(nm, "__aeabi_memmove8") ||
+         !strcmp(nm, "__aeabi_memset4") || !strcmp(nm, "__aeabi_memset8") ||
+         !strcmp(nm, "__aeabi_memclr4") || !strcmp(nm, "__aeabi_memclr8");
+}
+
+/* --- mod-ref query -------------------------------------------------------- */
+
+#define TU_MODREF_MAX_VISIT 64
+
+/* Can any function reachable from `callee` write `L`?  Walks the intra-TU call
+ * graph collected above.  Every uncertainty is an immediate yes:
+ *   - no summary (external callee, or a caller compiled before its callee —
+ *     summaries are seeded post-codegen per function, so forward refs miss)
+ *   - writes_unknown (a store this pass could not attribute to a symbol; this is
+ *     also what makes a FRAME query safe, since reaching the caller's frame
+ *     requires a pointer the callee could not have named)
+ *   - more than TU_MODREF_MAX_VISIT distinct callees (give up rather than grow) */
+static int tu_modref_walk(Sym *callee, MemLoc L)
+{
+  Sym *visited[TU_MODREF_MAX_VISIT];
+  int nvisited = 0;
+  Sym *stack[TU_MODREF_MAX_VISIT];
+  int nstack = 0;
+
+  stack[nstack++] = callee;
+  while (nstack > 0)
+  {
+    Sym *f = stack[--nstack];
+    int seen = 0;
+    for (int i = 0; i < nvisited; i++)
+      if (visited[i] == f)
+      {
+        seen = 1;
+        break;
+      }
+    if (seen)
+      continue;
+    if (nvisited >= TU_MODREF_MAX_VISIT)
+      return 1;
+    visited[nvisited++] = f;
+
+    TuFuncSummary *s = tu_summary_lookup(f);
+    if (!s)
+    {
+      /* No summary.  A block-copy helper's effect was already resolved into the
+       * CALLER's summary from its destination argument, so it is not an unknown
+       * here; anything else (external, or not yet compiled) is. */
+      if (tu_is_block_copy_helper(get_tok_str(f->v, NULL)))
+        continue;
+      return 1;
+    }
+    if (s->writes_unknown)
+      return 1;
+    if (L.kind == MEMLOC_GLOBAL && L.sym &&
+        tu_symset_contains(&s->global_writes, L.sym))
+      return 1;
+
+    for (int i = 0; i < s->calls.count; i++)
+    {
+      if (nstack >= TU_MODREF_MAX_VISIT)
+        return 1;
+      stack[nstack++] = s->calls.items[i];
+    }
+  }
+  return 0;
+}
+
+int tcc_ir_call_may_write(TCCIRState *ir, int call_idx, MemLoc L)
+{
+  if (!ir || call_idx < 0 || call_idx >= ir->next_instruction_index)
+    return 1;
+  IRQuadCompact *q = &ir->compact_instructions[call_idx];
+  if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+    return 1;
+  /* An UNKNOWN location aliases everything, so no summary can rule it out. */
+  if (L.kind != MEMLOC_GLOBAL && L.kind != MEMLOC_FRAME)
+    return 1;
+  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  if (!callee)
+    return 1; /* indirect call */
+  return tu_modref_walk(callee, L);
+}
+
 void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
 {
   if (!ir || !func_sym)
@@ -237,6 +335,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
 
   TuFuncSummary *s = tcc_mallocz(sizeof(*s));
   s->func_sym = func_sym;
+  int tu_dbg = getenv("TCC_MODREF_DBG") != NULL;
 
   const int n = ir->next_instruction_index;
   int writes_any_static = 0;
@@ -405,11 +504,59 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
       break;
     }
 
+    /* Mod-ref: opaque memory writers that the precise STORE handling below does
+     * not model.  (Plain STOREs are excluded — they are attributed exactly.) */
+    switch (q->op)
+    {
+    case TCCIR_OP_BLOCK_COPY:
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_LONGJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_NL_LONGJMP:
+    case TCCIR_OP_BUILTIN_APPLY_ARGS:
+    case TCCIR_OP_BUILTIN_APPLY:
+    case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_VLA_SP_SAVE:
+    case TCCIR_OP_VLA_SP_RESTORE:
+    case TCCIR_OP_SET_CHAIN:
+    case TCCIR_OP_INIT_CHAIN_SLOT:
+    case TCCIR_OP_IJUMP:
+      s->writes_unknown = 1;
+      break;
+    default:
+      break;
+    }
+
     if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
     {
       Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
       if (callee)
         tu_symset_add(&s->calls, callee);
+
+      /* Mod-ref: a block-copy/fill helper writes ONLY through its destination
+       * pointer, so resolve that here rather than letting the (summary-less,
+       * external) callee poison the walk.  Without this a helper that merely
+       * copies into the caller's OWN local — `y = retme(y)` in the 20040709-2
+       * fn1* helpers — makes the caller look like it may write any global.
+       * The callee still goes into `calls` above so tu_noreturn/tu_dead_statics
+       * keep their existing view; tu_modref_walk skips it by name. */
+      if (callee && tu_is_block_copy_helper(get_tok_str(callee->v, NULL)))
+      {
+        IROperand p0;
+        if (ir_opt_get_call_param_operand(ir, i, 0, &p0))
+        {
+          MemLoc dl = memloc_of_pointer(ir, p0, i);
+          if (dl.kind == MEMLOC_GLOBAL && dl.sym)
+            tu_symset_add(&s->global_writes, dl.sym);
+          else if (dl.kind != MEMLOC_FRAME)
+            s->writes_unknown = 1;
+        }
+        else
+          s->writes_unknown = 1;
+      }
     }
 
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
@@ -438,6 +585,16 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
         tu_symset_add(&s->static_writes, write_sym);
         writes_any_static = 1;
       }
+
+      /* Mod-ref: attribute this write to a named global or to our own frame.
+       * memloc_of resolves direct StackLoc, `&sym+addend` derefs and pointer
+       * def-chains; anything it cannot name (a param pointer, a loaded pointer)
+       * may alias any global, so it poisons the whole summary. */
+      MemLoc wl = memloc_of(ir, dest, i);
+      if (wl.kind == MEMLOC_GLOBAL && wl.sym)
+        tu_symset_add(&s->global_writes, wl.sym);
+      else if (wl.kind != MEMLOC_FRAME)
+        s->writes_unknown = 1;
     }
 
     /* A LOAD whose address operand is a static's SYMREF is a value read; the generic scan below would file it as address-only. */
@@ -562,6 +719,19 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
 
   if (writes_any_static && func_sym->type.ref)
     func_sym->type.ref->f.tu_static_writer = 1;
+
+  if (tu_dbg)
+  {
+    fprintf(stderr, "[modref] %s: writes_unknown=%d global_writes=[",
+            get_tok_str(func_sym->v, NULL), s->writes_unknown);
+    for (int k = 0; k < s->global_writes.count; k++)
+      fprintf(stderr, "%s%s", k ? "," : "",
+              get_tok_str(s->global_writes.items[k]->v, NULL));
+    fprintf(stderr, "] calls=[");
+    for (int k = 0; k < s->calls.count; k++)
+      fprintf(stderr, "%s%s", k ? "," : "", get_tok_str(s->calls.items[k]->v, NULL));
+    fprintf(stderr, "]\n");
+  }
 
   s->next = tu_summary_head;
   tu_summary_head = s;

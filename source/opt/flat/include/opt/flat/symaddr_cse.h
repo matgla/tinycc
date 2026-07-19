@@ -18,5 +18,6 @@ extern const int symaddr_cse_gens_count;
 
 int tcc_ir_opt_symaddr_cse_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_symaddr_cse(struct TCCIRState *ir);
+int tcc_ir_opt_symaddr_cse_late(struct TCCIRState *ir);
 
 #endif

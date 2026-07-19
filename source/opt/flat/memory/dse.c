@@ -15,16 +15,14 @@
 #include "opt_engine.h"
 #include "opt_utils.h"
 #include "opt_du.h"
+#include "opt_alias.h"
 
 static int tcc_ir_opt_dse__timed(TCCIRState *ir);
 int tcc_ir_opt_dse(TCCIRState *ir)
 {
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on) return tcc_ir_opt_dse__timed(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_dse__timed(ir);
-  tcc_pass_timing_add("dse", tcc_pass_clk_us() - _t);
-  return _r;
+  int r;
+  TCC_PASS_TIMED(r, "dse", tcc_ir_opt_dse__timed(ir));
+  return r;
 }
 
 static int dse_operand_is_wide(IROperand op)
@@ -949,8 +947,22 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       int64_t off;
       dse_stackloc_sym_off(ir, dest, &sym, &off);
 
-      LOG_IR_GEN("DSE-SL: i=%d off=%lld sym=%p test=%d", i, (long long)off, (void *)sym, !!STACKLOC_TEST(sym, off));
-      if (!STACKLOC_TEST(sym, off))
+      /* A store is live if ANY byte it writes is read, not just its first one:
+       * `struct S x = g;` stores 4 bytes at StackLoc[-4] while `x.topfield`
+       * reads 2 bytes at StackLoc[-2].  Testing only the base byte declared
+       * that store dead and left the field reading an uninitialized slot. */
+      int swidth = ir_opt_store_btype_size_bytes(irop_get_btype(dest));
+      if (swidth <= 0 || irop_get_btype(dest) == IROP_BTYPE_STRUCT)
+        swidth = -1; /* unknown extent: keep the store */
+      else if (dest.is_complex)
+        swidth *= 2;
+      int live = (swidth < 0);
+      for (int b = 0; !live && b < swidth; b++)
+        if (STACKLOC_TEST(sym, off + b))
+          live = 1;
+
+      LOG_IR_GEN("DSE-SL: i=%d off=%lld sym=%p width=%d live=%d", i, (long long)off, (void *)sym, swidth, live);
+      if (!live)
       {
         q->op = TCCIR_OP_NOP;
         changes++;

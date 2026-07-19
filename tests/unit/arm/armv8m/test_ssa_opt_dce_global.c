@@ -23,6 +23,7 @@
 #include "tcc.h"
 
 #define I32 IROP_BTYPE_INT32
+#define I16 IROP_BTYPE_INT16
 #define I8 IROP_BTYPE_INT8
 
 /* Anonymous stack-location operand (vreg -1, is_local=1). */
@@ -273,6 +274,588 @@ UT_TEST(test_stack_plain_store_overwrite_intervening_load)
   ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(0, I32),
                  utb_temp(1, I32));
   ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  run_dce(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Store through a LEA-derived global pointer resolves to the same global:
+ * second direct write kills the first
+ * ======================================================================== */
+
+UT_TEST(test_global_store_through_lea_ptr)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g;
+  g.v = 200;
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_lval(utb_temp(0, I32)), utb_imm(1, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  int changed = run_dce(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Store through a two-hop chain (LEA -> ASSIGN) still resolves to the global
+ * ======================================================================== */
+
+UT_TEST(test_global_store_through_assign_chain)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  static Sym g;
+  g.v = 201;
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_temp(0, I32));
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_lval(utb_temp(1, I32)), utb_imm(1, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  int changed = run_dce(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * ADD offset accumulation: two stores through LEA+ADD hit the same (g+4)
+ * ======================================================================== */
+
+UT_TEST(test_global_store_through_add_offset)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  static Sym g;
+  g.v = 202;
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32),
+                 utb_imm(4, I32));
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_lval(utb_temp(1, I32)), utb_imm(1, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_lval(utb_temp(1, I32)), utb_imm(2, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  int changed = run_dce(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * SUB offset accumulation: two stores through LEA+SUB hit the same (g-4)
+ * ======================================================================== */
+
+UT_TEST(test_global_store_through_sub_offset)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  static Sym g;
+  g.v = 203;
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  ssa_add_instr3(&c, TCCIR_OP_SUB, utb_temp(1, I32), utb_temp(0, I32),
+                 utb_imm(4, I32));
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_lval(utb_temp(1, I32)), utb_imm(1, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_lval(utb_temp(1, I32)), utb_imm(2, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  int changed = run_dce(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * STORE_INDEXED with an immediate index resolves to an exact global ref;
+ * a later direct store to the same (sym, off, width) kills it
+ * ======================================================================== */
+
+UT_TEST(test_global_store_indexed_imm_exact)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g;
+  g.v = 204;
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  int store1 = ssa_add_instr4(&c, TCCIR_OP_STORE_INDEXED, utb_temp(0, I32),
+                              utb_imm(1, I32), utb_imm(0, I32),
+                              utb_imm(0, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  int changed = run_dce(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * STORE_INDEXED with a runtime index is a whole-global store: it is not
+ * tracked and does not evict pendings, so the overwrite pair still folds
+ * ======================================================================== */
+
+UT_TEST(test_global_store_indexed_var_index_untracked)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  static Sym g;
+  g.v = 205;
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(3, I32));
+  int storex = ssa_add_instr4(&c, TCCIR_OP_STORE_INDEXED, utb_temp(0, I32),
+                              utb_imm(5, I32), utb_temp(1, I32),
+                              utb_imm(0, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  int changed = run_dce(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, storex), TCCIR_OP_STORE_INDEXED);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Read of a global through a LEA-resolved TEMP pointer evicts the pending
+ * store: both direct stores stay
+ * ======================================================================== */
+
+UT_TEST(test_global_read_through_lea_ptr_keeps)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  static Sym g;
+  g.v = 206;
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(1, I32),
+                utb_lval(utb_temp(0, I32)));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  run_dce(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Load through an unresolvable lval TEMP flushes all pendings: both stay
+ * ======================================================================== */
+
+UT_TEST(test_global_load_unknown_ptr_flush)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  static Sym g;
+  g.v = 207;
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  /* temp 1 has no defining instruction: an unknown pointer. */
+  ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(0, I32),
+                utb_lval(utb_temp(1, I32)));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  run_dce(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * LOAD_INDEXED with a runtime index reads the whole global: the pending
+ * store is evicted, so both direct stores stay
+ * ======================================================================== */
+
+UT_TEST(test_global_load_indexed_var_index_evicts)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/3);
+  static Sym g;
+  g.v = 208;
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(2, I32));
+  ssa_add_instr4(&c, TCCIR_OP_LOAD_INDEXED, utb_temp(2, I32),
+                 utb_temp(0, I32), utb_temp(1, I32), utb_imm(0, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  run_dce(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * LOAD_INDEXED with an immediate index is an exact read of the same
+ * (sym, off, width): the pending store is evicted, both stores stay
+ * ======================================================================== */
+
+UT_TEST(test_global_load_indexed_imm_exact_evicts)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  static Sym g;
+  g.v = 209;
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  ssa_add_instr4(&c, TCCIR_OP_LOAD_INDEXED, utb_temp(1, I32),
+                 utb_temp(0, I32), utb_imm(0, I32), utb_imm(0, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  run_dce(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * LOAD_INDEXED with an unresolvable base flushes all pendings: both stay
+ * ======================================================================== */
+
+UT_TEST(test_global_load_indexed_unknown_base_flush)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  static Sym g;
+  g.v = 210;
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  /* temp 1 has no defining instruction: an unknown base pointer. */
+  ssa_add_instr4(&c, TCCIR_OP_LOAD_INDEXED, utb_temp(0, I32),
+                 utb_temp(1, I32), utb_imm(0, I32), utb_imm(0, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  run_dce(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * LOAD_INDEXED through a non-TEMP (PARAM) base cannot resolve to a global;
+ * treated as may-alias-anything: both stores stay
+ * ======================================================================== */
+
+UT_TEST(test_global_load_indexed_param_base_flush)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g;
+  g.v = 211;
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  ssa_add_instr4(&c, TCCIR_OP_LOAD_INDEXED, utb_temp(0, I32),
+                 utb_param(0, I32), utb_imm(0, I32), utb_imm(0, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  run_dce(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * MLA accumulator that derefs a global (via a LEA-resolved TEMP) reads it:
+ * the pending store is evicted, both stores stay
+ * ======================================================================== */
+
+UT_TEST(test_global_mla_accum_read_keeps)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  static Sym g;
+  g.v = 212;
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(2, I32));
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(3, I32));
+  ssa_add_instr4(&c, TCCIR_OP_MLA, utb_temp(3, I32), utb_temp(1, I32),
+                 utb_temp(2, I32), utb_lval(utb_temp(0, I32)));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  run_dce(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Partial overlap (g+2, width 2 vs pending g+0, width 4) evicts the pending
+ * store WITHOUT NOP-ing it; a later read evicts the narrower store too, so
+ * both stores survive
+ * ======================================================================== */
+
+UT_TEST(test_global_partial_overlap_keeps_both)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/3);
+  static Sym g;
+  g.v = 213;
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 0, 0, 0, I32));
+  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32),
+                 utb_imm(2, I32));
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_lval(utb_temp(1, I16)), utb_imm(2, I16));
+  ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(2, I32),
+                utb_symref(c.ir, &g, 1, 0, 0, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  run_dce(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Store through a TEMP whose def is not an address pattern (MUL result):
+ * treated as may-alias-anything, both global stores stay
+ * ======================================================================== */
+
+UT_TEST(test_global_store_through_unresolvable_temp_flush)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/3);
+  static Sym g;
+  g.v = 214;
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(6, I32));
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(7, I32));
+  ssa_add_instr3(&c, TCCIR_OP_MUL, utb_temp(2, I32), utb_temp(0, I32),
+                 utb_temp(1, I32));
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_STORE, utb_lval(utb_temp(2, I32)),
+                utb_imm(9, I32));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  run_dce(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Read through a TEMP that resolves to a STACK slot is not a global read:
+ * it does not block the global overwrite elimination
+ * ======================================================================== */
+
+UT_TEST(test_global_read_lea_stackloc_not_global)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  static Sym g;
+  g.v = 215;
+  ssa_add_instr(&c, TCCIR_OP_LEA, utb_temp(0, I32), gsl_anon(0, 0, I32));
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(1, I32),
+                utb_lval(utb_temp(0, I32)));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  c.ctx = tcc_mallocz(sizeof(*c.ctx));
+  tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
+
+  int changed = run_dce(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, store1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, store2), TCCIR_OP_STORE);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * A symref read with a non-scalar width (struct) is unreadable: flush,
+ * both stores stay
+ * ======================================================================== */
+
+UT_TEST(test_global_symref_zero_width_flush)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g;
+  g.v = 216;
+  int store1 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(0, I32),
+                utb_symref(c.ir, &g, 1, 0, 0, IROP_BTYPE_STRUCT));
+  int store2 = ssa_add_instr(&c, TCCIR_OP_STORE,
+                             utb_symref(c.ir, &g, 1, 0, 0, I32),
+                             utb_imm(2, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32));
 
   ssa_ctx_build_cfg(&c);
   ssa_ctx_build_ssa_plain(&c);

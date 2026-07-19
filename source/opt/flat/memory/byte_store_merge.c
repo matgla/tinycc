@@ -139,8 +139,13 @@ static int rse_resolve_temp_addr_impl(TCCIRState *ir, int32_t vr,
     base_off = (int64_t)sr->addend;
     resolved = 1;
   }
-  /* Case B: src1 is a stack-local STACKOFF (Addr[StackLoc[off]]). */
-  else if (s1.is_local && !s1.is_lval && !s1.is_llocal && irop_get_tag(s1) == IROP_TAG_STACKOFF)
+  /* Case B: src1 is a stack-local STACKOFF (Addr[StackLoc[off]]).  A non-zero
+     vreg_type marks a vreg's *potential* spill encoding, where the offset is only
+     metadata and the program reads the vreg — see IROP_TAG_STACKOFF in
+     tccir_operand.h.  Treating one as a real slot would key two unrelated
+     addresses the same. */
+  else if (s1.is_local && !s1.is_lval && !s1.is_llocal && irop_get_tag(s1) == IROP_TAG_STACKOFF &&
+           irop_get_vreg(s1) < 0)
   {
     base_sym = NULL;
     base_off = irop_get_stack_offset(s1);
@@ -234,6 +239,18 @@ static int rse_resolve_store_addr(TCCIRState *ir, IRQuadCompact *q,
     return 1;
   }
 
+  /* Direct anonymous stack slot: `StackLoc[off] <-- value`.  Keyed the same way
+     as the LEA form above (NULL sym, frame offset), so the two unify.  Restricted
+     to slots with no backing vreg: a VAR-backed local reports offset 0 whatever
+     its position, so its offset would alias every other VAR's. */
+  if (dest.is_local && dest.is_lval && !dest.is_llocal && irop_get_tag(dest) == IROP_TAG_STACKOFF &&
+      irop_get_vreg(dest) < 0)
+  {
+    *out_sym = NULL;
+    *out_off = irop_get_stack_offset(dest) + extra;
+    return 1;
+  }
+
   /* TEMP base form: dest is the TEMP holding the address. */
   if (op == TCCIR_OP_STORE && !dest.is_lval)
     return 0;
@@ -248,8 +265,129 @@ static int rse_resolve_store_addr(TCCIRState *ir, IRQuadCompact *q,
   return 1;
 }
 
-/* Merge 4 consecutive constant INT8 stores at a word-aligned base into one
-   INT32 store, so the redundant-store pass can see the wider write. */
+/* True when `q` neither touches memory nor transfers control, so it can sit
+   between two stores being merged without affecting the merge: the merged store
+   lands at the first store's position, and only a memory access (which could
+   read the half-filled word or alias it) or a branch (which could skip a
+   constituent store) makes moving the later writes earlier observable.  Any
+   lvalue operand is a deref, so those count as memory accesses too. */
+static int rse_is_merge_transparent(TCCIRState *ir, IRQuadCompact *q)
+{
+  switch (q->op)
+  {
+  case TCCIR_OP_ADD:
+  case TCCIR_OP_SUB:
+  case TCCIR_OP_MUL:
+  case TCCIR_OP_AND:
+  case TCCIR_OP_OR:
+  case TCCIR_OP_XOR:
+  case TCCIR_OP_SHL:
+  case TCCIR_OP_SAR:
+  case TCCIR_OP_SHR:
+  case TCCIR_OP_ASSIGN:
+  case TCCIR_OP_LEA:
+    break;
+  default:
+    return 0;
+  }
+  if (q->is_jump_target)
+    return 0;
+  if (irop_config[q->op].has_src1 && tcc_ir_op_get_src1(ir, q).is_lval)
+    return 0;
+  if (irop_config[q->op].has_src2 && tcc_ir_op_get_src2(ir, q).is_lval)
+    return 0;
+  if (irop_config[q->op].has_dest && tcc_ir_op_get_dest(ir, q).is_lval)
+    return 0;
+  return 1;
+}
+
+/* Regions handed to a mem* helper as its source buffer.
+ *
+ * Widening the stores that fill such a buffer is semantically fine but loses
+ * code: tcc_ir_opt_const_memcpy_to_dest (which runs much later, from regalloc)
+ * rewrites the copy into stores of the buffer's constant contents *at the
+ * granularity it finds them*, and only same-width stores forward into the
+ * destination's loads.  20030408-1 fills `const char X[8]` byte by byte, copies
+ * it to `buffer`, then compares `buffer` byte by byte: left alone the whole
+ * function folds to `return 0`, merged it becomes 8 loads and 8 compares,
+ * because a word store does not forward into a byte load at offset +1.
+ *
+ * This is a quality heuristic, not a correctness gate — an address or size that
+ * does not resolve simply imposes no constraint. */
+#define RSE_MAX_COPY_SRC 32
+typedef struct
+{
+  const Sym *sym;
+  int64_t base;
+  int64_t end;
+} RseRegion;
+
+/* Resolve a call-argument operand to the (sym, offset) address it denotes. */
+static int rse_resolve_arg_addr(TCCIRState *ir, IROperand arg, const Sym **out_sym, int64_t *out_off)
+{
+  if (arg.is_lval)
+    return 0;
+  if (arg.is_sym)
+  {
+    IRPoolSymref *sr = irop_get_symref_ex(ir, arg);
+    if (!sr || !sr->sym)
+      return 0;
+    *out_sym = sr->sym;
+    *out_off = (int64_t)sr->addend;
+    return 1;
+  }
+  if (arg.is_local && !arg.is_llocal && irop_get_tag(arg) == IROP_TAG_STACKOFF && irop_get_vreg(arg) < 0)
+  {
+    *out_sym = NULL;
+    *out_off = irop_get_stack_offset(arg);
+    return 1;
+  }
+  return rse_resolve_temp_addr(ir, irop_get_vreg(arg), out_sym, out_off);
+}
+
+static int rse_collect_copy_sources(TCCIRState *ir, RseRegion *out, int max)
+{
+  int n = ir->next_instruction_index;
+  int count = 0;
+
+  for (int i = 0; i < n && count < max; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
+      continue;
+
+    /* mem{cpy,move}(dst, src, size): args are looked up by call id rather than
+       by position in the stream — the address computation for one argument is
+       emitted between the FUNCPARAM ops of the others. */
+    IROperand size_op, src_op;
+    if (!ir_opt_get_call_param_operand(ir, i, 2, &size_op))
+      continue;
+    if (!irop_is_immediate(size_op) || size_op.is_sym)
+      continue;
+    int64_t size = irop_get_imm64_ex(ir, size_op);
+    if (size <= 0 || size > 4096)
+      continue;
+    if (!ir_opt_get_call_param_operand(ir, i, 1, &src_op))
+      continue;
+
+    const Sym *sym = NULL;
+    int64_t off = 0;
+    if (!rse_resolve_arg_addr(ir, src_op, &sym, &off))
+      continue;
+
+    out[count].sym = sym;
+    out[count].base = off;
+    out[count].end = off + size;
+    count++;
+  }
+  return count;
+}
+
+/* Merge consecutive constant sub-word stores that together fill one aligned word
+   into a single INT32 store, so the redundant-store pass can see the wider write.
+   Handles 4 INT8, 2 INT16, and INT8/INT16 mixtures alike — a `vector(8, short)`
+   built lane by lane is two constant `strh`s per word, the same shape as four
+   constant `strb`s. */
 int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -258,24 +396,36 @@ int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
   if (n == 0)
     return 0;
 
+  /* rse_resolve_store_addr resolves a TEMP base through this map; without it
+     every store whose address sits in a temp silently failed to resolve, and
+     only the direct-SYMREF form could ever merge. */
+  rse_build_def_map(ir);
+
+  RseRegion copy_srcs[RSE_MAX_COPY_SRC];
+  int copy_src_count = rse_collect_copy_sources(ir, copy_srcs, RSE_MAX_COPY_SRC);
+
   const Sym *grp_sym = NULL;
   int64_t grp_base = 0;
-  int grp_count = 0;
+  int grp_filled = 0; /* bytes of the word covered so far, always from byte 0 */
+  int grp_count = 0;  /* number of stores in the group */
   int grp_indices[4];
-  int32_t grp_values[4];
+  int32_t grp_merged = 0;
 
   for (int i = 0; i <= n; i++)
   {
-    int is_byte_store = 0;
+    int is_sub_word_store = 0;
+    int cur_width = 0;
     const Sym *cur_sym = NULL;
     int64_t cur_off = 0;
-    int32_t cur_val = 0;
+    uint32_t cur_val = 0;
 
     if (i < n)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
 
-      if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_ASSIGN)
+      /* Lanes of an aggregate are built value-then-address, so the constituent
+         stores are separated by the ADD/LEA that forms the next lane's address. */
+      if (q->op == TCCIR_OP_NOP || rse_is_merge_transparent(ir, q))
         continue;
 
       if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED)
@@ -287,42 +437,62 @@ int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
         else
           store_btype = irop_get_btype(tcc_ir_op_get_dest(ir, q));
 
-        if (store_btype == IROP_BTYPE_INT8 && irop_is_immediate(src1) &&
+        if ((store_btype == IROP_BTYPE_INT8 || store_btype == IROP_BTYPE_INT16) && irop_is_immediate(src1) &&
             rse_resolve_store_addr(ir, q, &cur_sym, &cur_off))
         {
-          cur_val = (int32_t)irop_get_imm64_ex(ir, src1) & 0xFF;
-          is_byte_store = 1;
+          cur_width = (store_btype == IROP_BTYPE_INT8) ? 1 : 2;
+          /* A misaligned halfword store straddles the word boundary. */
+          if (cur_width == 1 || (cur_off & 1) == 0)
+          {
+            uint32_t mask = (cur_width == 1) ? 0xFFu : 0xFFFFu;
+            cur_val = (uint32_t)irop_get_imm64_ex(ir, src1) & mask;
+            is_sub_word_store = 1;
+          }
         }
       }
     }
 
-    if (is_byte_store)
+    if (is_sub_word_store)
     {
       int64_t aligned_base = cur_off & ~3LL;
       int byte_pos = (int)(cur_off & 3);
 
-      if (grp_count > 0 && cur_sym == grp_sym && aligned_base == grp_base && byte_pos == grp_count)
+      if (grp_count > 0 && cur_sym == grp_sym && aligned_base == grp_base && byte_pos == grp_filled)
       {
-        grp_values[grp_count] = cur_val;
-        grp_indices[grp_count] = i;
-        grp_count++;
+        grp_merged |= cur_val << (byte_pos * 8);
+        grp_indices[grp_count++] = i;
+        grp_filled += cur_width;
       }
       else
       {
         grp_count = 0;
+        grp_filled = 0;
         if (byte_pos == 0)
         {
           grp_sym = cur_sym;
           grp_base = aligned_base;
-          grp_values[0] = cur_val;
+          grp_merged = cur_val;
           grp_indices[0] = i;
           grp_count = 1;
+          grp_filled = cur_width;
         }
       }
 
-      if (grp_count == 4)
+      if (grp_filled == 4)
       {
-        int32_t merged = grp_values[0] | (grp_values[1] << 8) | (grp_values[2] << 16) | (grp_values[3] << 24);
+        int feeds_copy = 0;
+        for (int k = 0; k < copy_src_count; k++)
+          if (copy_srcs[k].sym == grp_sym && grp_base < copy_srcs[k].end && copy_srcs[k].base < grp_base + 4)
+          {
+            feeds_copy = 1;
+            break;
+          }
+        if (feeds_copy)
+        {
+          grp_count = 0;
+          grp_filled = 0;
+          continue;
+        }
 
         IRQuadCompact *fq = &ir->compact_instructions[grp_indices[0]];
         if (fq->op == TCCIR_OP_STORE)
@@ -331,22 +501,25 @@ int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
           dest.btype = IROP_BTYPE_INT32;
           tcc_ir_op_set_dest(ir, fq, dest);
         }
-        IROperand new_src1 = irop_make_imm32(-1, merged, IROP_BTYPE_INT32);
+        IROperand new_src1 = irop_make_imm32(-1, (int32_t)grp_merged, IROP_BTYPE_INT32);
         tcc_ir_op_set_src1(ir, fq, new_src1);
 
-        for (int k = 1; k < 4; k++)
+        for (int k = 1; k < grp_count; k++)
           ir->compact_instructions[grp_indices[k]].op = TCCIR_OP_NOP;
 
         changes++;
         grp_count = 0;
+        grp_filled = 0;
       }
     }
     else
     {
       grp_count = 0;
+      grp_filled = 0;
     }
   }
 
+  rse_free_def_map();
   return changes;
 }
 

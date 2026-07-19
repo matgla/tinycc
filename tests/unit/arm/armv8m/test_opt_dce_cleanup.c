@@ -9,6 +9,9 @@
  *    tcc_ir_opt_infinite_self_recursion()
  *    tcc_ir_opt_noreturn_call_epilogue_suppress()
  *    tcc_ir_opt_compact_nops()
+ *    tcc_ir_opt_const_return_uninit_elide()
+ *    tcc_ir_opt_ub_only_body_elide()
+ *    tcc_ir_opt_null_store_dom_return()
  *
  *  These are whole-body "prove no observable effect / prove non-return"
  *  passes plus the mechanical NOP-compaction pass; none had any unit
@@ -730,9 +733,449 @@ UT_TEST(test_compact_nops_ex_forwards)
   return 0;
 }
 
-/* Empty-IR guards for additional whole-function elision passes that live in
- * ir/opt_dce.c but have no dedicated suite yet.  These exercise the wrapper
- * line and the n==0 / optimize-gate early returns. */
+/* ================================================== const_return_uninit_elide
+ *
+ * O2-only: when every RETURNVALUE returns the same constant AND the entry
+ * block reads an uninitialized stack slot / VAR vreg before any observable
+ * side effect, the whole body collapses to a single RETURNVALUE-const.
+ */
+
+/* POSITIVE: entry-block ADD reads StackLoc[8] (raw frontend STACKOFF, never
+ * stored) before any side effect; the single RETURNVALUE is a constant.
+ *   0: ADD T0 <- StackLoc[8], #1   (uninit read)
+ *   1: RETURNVALUE #42
+ * -> 0: RETURNVALUE #42, 1: NOP ; leaffunc set. */
+UT_TEST(test_crue_uninit_stack_read_collapses_to_const_return)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_stackoff(8, /*is_lval*/ 1, 0, 0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(42, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_return_uninit_elide(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_RETURNVALUE);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 0)), 42);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(ir->leaffunc, 1);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* POSITIVE: same collapse triggered by a read of a never-written,
+ * never-address-taken VAR vreg instead of a raw stack slot. */
+UT_TEST(test_crue_uninit_var_read_collapses_to_const_return)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(7, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_return_uninit_elide(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_RETURNVALUE);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 0)), 7);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(ir->leaffunc, 1);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* NEGATIVE (guard): the slot is initialised by an earlier (non-observable)
+ * ASSIGN to the same StackLoc[8] -- the read is then well-defined, no UB to
+ * exploit. */
+UT_TEST(test_crue_initialised_slot_no_change)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  int init = utb_emit(ir, TCCIR_OP_ASSIGN, utb_stackoff(8, 1, 0, 0, I32), utb_imm(5, I32), UTB_NONE);
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_stackoff(8, 1, 0, 0, I32), utb_imm(1, I32));
+  int ret = utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(42, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_return_uninit_elide(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, init), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_op(ir, ret), TCCIR_OP_RETURNVALUE);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* NEGATIVE (guard): a STORE (observable side effect) precedes the uninit
+ * read -- collapsing would drop the store, so the pass must bail. */
+UT_TEST(test_crue_store_before_uninit_read_no_change)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  set_optimize2();
+
+  static Sym gsym;
+  memset(&gsym, 0, sizeof(gsym));
+  IROperand gx = utb_symref(ir, &gsym, /*is_lval*/ 1, /*is_local*/ 0, /*is_const*/ 0, I32);
+
+  int store = utb_emit(ir, TCCIR_OP_STORE, gx, utb_imm(5, I32), UTB_NONE);
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_stackoff(8, 1, 0, 0, I32), utb_imm(1, I32));
+  int ret = utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(42, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_return_uninit_elide(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_op(ir, ret), TCCIR_OP_RETURNVALUE);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* NEGATIVE (guard): two RETURNVALUEs with DIFFERENT constants -- there is no
+ * single constant to collapse to.
+ *   0: JUMPIF -> 2, T0
+ *   1: RETURNVALUE #1
+ *   2: RETURNVALUE #2 */
+UT_TEST(test_crue_differing_return_constants_no_change)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(2, I32), utb_temp(0, I32), UTB_NONE);
+  int ret1 = utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
+  int ret2 = utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(2, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_return_uninit_elide(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_JUMPIF);
+  UT_ASSERT_EQ(utb_op(ir, ret1), TCCIR_OP_RETURNVALUE);
+  UT_ASSERT_EQ(utb_op(ir, ret2), TCCIR_OP_RETURNVALUE);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* NEGATIVE (guard): the pass is O2-only; at -O1 it must not fire even on an
+ * otherwise-qualifying body. */
+UT_TEST(test_crue_optimize_gate)
+{
+  TCCIRState *ir = utb_new();
+  tcc_state->optimize = 1;
+
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_stackoff(8, 1, 0, 0, I32), utb_imm(1, I32));
+  int ret = utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(42, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_const_return_uninit_elide(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_op(ir, ret), TCCIR_OP_RETURNVALUE);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* ========================================================= ub_only_body_elide
+ *
+ * O2-only: when every STORE in a void function goes through an address that
+ * is tainted by an uninitialized VAR/stack read (whole-function UB), the
+ * entire body is NOPed out.
+ */
+
+/* POSITIVE: the only STORE's address is a TEMP defined by an uninit VAR
+ * read -> whole body collapses to NOPs.
+ *   0: ASSIGN T0 <- V0   (V0 never written/address-taken -> taints T0)
+ *   1: STORE T0, #7      (store through garbage pointer)
+ *   2: RETURNVOID */
+UT_TEST(test_ub_elide_store_through_uninit_pointer_collapses)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(7, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_ub_only_body_elide(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(ir->leaffunc, 1);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* POSITIVE: taint propagates through a chain of TEMP defs -- the STORE
+ * address is two defs away from the uninit read.
+ *   0: ASSIGN T0 <- V0
+ *   1: ADD T1 <- T0, #4
+ *   2: STORE T1, #7
+ *   3: RETURNVOID */
+UT_TEST(test_ub_elide_taint_propagates_through_temps)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(4, I32));
+  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(1, I32)), utb_imm(7, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_ub_only_body_elide(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  for (int i = 0; i < 4; i++)
+    UT_ASSERT_EQ(utb_op(ir, i), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(ir->leaffunc, 1);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* NEGATIVE (guard): a STORE through a well-defined global address is a real,
+ * observable write -> no elision even though an uninit read exists nearby. */
+UT_TEST(test_ub_elide_global_store_keeps_body)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  set_optimize2();
+
+  static Sym gsym;
+  memset(&gsym, 0, sizeof(gsym));
+  IROperand gx = utb_symref(ir, &gsym, /*is_lval*/ 1, /*is_local*/ 0, /*is_const*/ 0, I32);
+
+  int asn = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  int store = utb_emit(ir, TCCIR_OP_STORE, gx, utb_imm(7, I32), UTB_NONE);
+  int ret = utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_ub_only_body_elide(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, asn), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, ret), TCCIR_OP_RETURNVOID);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* NEGATIVE (guard): the VAR is written before being read, so the TEMP
+ * feeding the STORE address is not tainted. */
+UT_TEST(test_ub_elide_written_var_not_tainted_no_change)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(5, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  int store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(7, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_ub_only_body_elide(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* NEGATIVE (guard): a RETURNVALUE anywhere makes the function non-void; the
+ * pass can't drop the return value and must bail in its first scan. */
+UT_TEST(test_ub_elide_returnvalue_no_change)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  int store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(7, I32), UTB_NONE);
+  int ret = utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_ub_only_body_elide(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, ret), TCCIR_OP_RETURNVALUE);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* NEGATIVE (guard): the pass is O2-only; at -O1 it must not fire even on an
+ * otherwise-qualifying body. */
+UT_TEST(test_ub_elide_optimize_gate)
+{
+  TCCIRState *ir = utb_new();
+  tcc_state->optimize = 1;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  int store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(7, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_ub_only_body_elide(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* ======================================================== null_store_dom_return
+ *
+ * O2-only: a STORE through a compile-time NULL pointer that dominates every
+ * function exit (RETURNVOID or CFG leaf) makes the whole body UB -> NOP all.
+ */
+
+/* POSITIVE: direct STORE through an immediate NULL address followed by
+ * RETURNVOID in the same (only) block -> whole body collapses.
+ *   0: STORE [NULL], #1
+ *   1: RETURNVOID */
+UT_TEST(test_nsdr_immediate_null_store_collapses)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_imm(0, I32)), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_null_store_dom_return(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(ir->leaffunc, 1);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* POSITIVE: the STORE address is a TEMP assigned constant 0 earlier in
+ * linear flow (known-zero tracking through ASSIGN).
+ *   0: ASSIGN T0 <- #0
+ *   1: STORE T0, #1
+ *   2: RETURNVOID */
+UT_TEST(test_nsdr_known_zero_temp_store_collapses)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_null_store_dom_return(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  for (int i = 0; i < 3; i++)
+    UT_ASSERT_EQ(utb_op(ir, i), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(ir->leaffunc, 1);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* NEGATIVE (guard): the STORE address is a TEMP assigned a NON-zero constant
+ * -- no UB, nothing to elide. */
+UT_TEST(test_nsdr_nonzero_temp_store_no_change)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  int asn = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(4, I32), UTB_NONE);
+  int store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_imm(1, I32), UTB_NONE);
+  int ret = utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_null_store_dom_return(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, asn), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, ret), TCCIR_OP_RETURNVOID);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* NEGATIVE (guard): the NULL store sits on only one branch -- the other
+ * branch's RETURNVOID is NOT dominated by the store block, so the function
+ * can exit cleanly and must be kept.
+ *   0: JUMPIF -> 3, T0
+ *   1: STORE [NULL], #1
+ *   2: RETURNVOID
+ *   3: RETURNVOID  (reachable without passing the store) */
+UT_TEST(test_nsdr_non_dominated_return_no_change)
+{
+  TCCIRState *ir = utb_new();
+  set_optimize2();
+
+  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_temp(0, I32), UTB_NONE);
+  int store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_imm(0, I32)), utb_imm(1, I32), UTB_NONE);
+  int ret1 = utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  int ret2 = utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_null_store_dom_return(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_JUMPIF);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, ret1), TCCIR_OP_RETURNVOID);
+  UT_ASSERT_EQ(utb_op(ir, ret2), TCCIR_OP_RETURNVOID);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* NEGATIVE (guard): the pass is O2-only; at -O1 it must not fire even on an
+ * otherwise-qualifying body. */
+UT_TEST(test_nsdr_optimize_gate)
+{
+  TCCIRState *ir = utb_new();
+  tcc_state->optimize = 1;
+
+  int store = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_imm(0, I32)), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  int changes = tcc_ir_opt_null_store_dom_return(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
+
+  utb_free(ir);
+  reset_state();
+  return 0;
+}
+
+/* Empty-IR guards for the whole-function elision passes: they exercise the
+ * wrapper line and the n==0 / optimize-gate early returns, complementing the
+ * dedicated positive/negative sections above. */
 
 UT_TEST(test_ub_only_body_elide_empty)
 {

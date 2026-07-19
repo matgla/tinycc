@@ -2944,6 +2944,10 @@ static const char *tccelf_get_fp_lib_name(TCCState *s1)
     case ARM_FPU_FPV4_SP_D16:
     case ARM_FPU_FPV5_SP_D16:
       return "vfpv4sp";
+    case ARM_FPU_RP2350:
+      /* RP2350 double coprocessor: doubles go through the DCP sequences in
+       * librp2350fp rather than the generic soft-float implementations. */
+      return "rp2350fp";
     case ARM_FPU_FPV5_D16:
     case ARM_FPU_NEON:
     case ARM_FPU_NEON_VFPV4:

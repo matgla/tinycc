@@ -81,7 +81,7 @@ jobs:
           PYTEST_JUNIT_XML: /tmp/ci-junit.xml
         run: |
           source .venv/bin/activate 2>/dev/null || true
-          bash scripts/collect_ci_failure_artifacts.sh "$PWD/ci-failure-artifacts"
+          python3 scripts/collect_ci_failure_artifacts.py "$PWD/ci-failure-artifacts"
 
       - name: Upload failure artifacts
         if: failure()

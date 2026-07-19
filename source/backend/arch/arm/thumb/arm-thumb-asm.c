@@ -51,6 +51,7 @@
 #include "source/backend/arch/arm/thumb/thop_rev.h"
 #include "source/backend/arch/arm/thumb/thop_system.h"
 #include "source/backend/arch/arm/thumb/thop_tbb.h"
+#include "source/backend/arch/arm/thumb/thop_coproc.h"
 #include "source/backend/arch/arm/thumb/thop_vfp.h"
 #include "source/backend/arch/arm/thumb/thumb.h"
 #include "tcc.h"
@@ -69,6 +70,8 @@ enum
   OPT_IM32,
   OPT_VREG32,
   OPT_VREG64,
+  OPT_COPROC, /* p0..p15   */
+  OPT_CREG,   /* c0..c15   */
 };
 #define OP_REG32 (1 << OPT_REG32)
 #define OP_VREG32 (1 << OPT_VREG32)
@@ -80,6 +83,8 @@ enum
 #define OP_REGSET32 (1 << OPT_REGSET32)
 #define OP_VREGSETS32 (OP_VREG32 | OP_REGSET32)
 #define OP_VREGSETD32 (OP_VREG64 | OP_REGSET32)
+#define OP_COPROC (1 << OPT_COPROC)
+#define OP_CREG (1 << OPT_CREG)
 
 static bool thumb_operand_is_immediate(int type)
 {
@@ -912,6 +917,36 @@ static bool parse_operand(TCCState *s1, Operand *op)
       op->type = regset_type;
       op->regset = regset;
     }
+    return true;
+  }
+  else if (tok >= TOK_ASM_p0 && tok <= TOK_ASM_p15)
+  {
+    op->type = OP_COPROC;
+    op->reg = (uint8_t)(tok - TOK_ASM_p0);
+    next(); // skip coprocessor number
+    return true;
+  }
+  else if (tok >= TOK_ASM_c0 && tok <= TOK_ASM_c15)
+  {
+    op->type = OP_CREG;
+    op->reg = (uint8_t)(tok - TOK_ASM_c0);
+    next(); // skip coprocessor register
+    return true;
+  }
+  else if (tok >= TOK_ASM_cr0 && tok <= TOK_ASM_cr15)
+  {
+    op->type = OP_CREG;
+    op->reg = (uint8_t)(tok - TOK_ASM_cr0);
+    next(); // skip coprocessor register
+    return true;
+  }
+  else if (tok == TOK_ASM_apsr_nzcv)
+  {
+    /* MRC/MRC2 with Rt == PC writes the condition flags rather than a
+       general register; GNU as spells that destination `apsr_nzcv`. */
+    op->type = OP_REG32;
+    op->reg = R_PC;
+    next();
     return true;
   }
   else if ((reg = asm_parse_vfp_regvar(tok, 0)) != -1)
@@ -2606,6 +2641,99 @@ static thumb_opcode thumb_vmrs_opcode(TCCState *s1, int token)
   return th_vmrs(rt);
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ *  Coprocessor access: cdp/cdp2, mcr/mcr2, mrc/mrc2, mcrr/mcrr2, mrrc/mrrc2
+ *
+ *    cdp{2}  pN, #opc1, CRd, CRn, CRm, #opc2
+ *    mcr{2}  pN, #opc1, Rt,  CRn, CRm, #opc2
+ *    mrc{2}  pN, #opc1, Rt,  CRn, CRm, #opc2
+ *    mcrr{2} pN, #opc1, Rt,  Rt2, CRm
+ *    mrrc{2} pN, #opc1, Rt,  Rt2, CRm
+ *
+ *  GNU as accepts the opc1/opc2 fields with or without a leading '#', and
+ *  writes opc2 as `{N}` when disassembling; parse_operand already treats a
+ *  bare integer and a '#'-prefixed one identically.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+static uint32_t thumb_coproc_operand_imm(TCCState *s1, const char *mnemonic, const char *what, uint32_t max)
+{
+  Operand op = {};
+  parse_operand(s1, &op);
+  if (!thumb_operand_is_immediate(op.type) || op.e.sym)
+    tcc_error("%s: %s must be an immediate", mnemonic, what);
+  if (op.e.v > max)
+    tcc_error("%s: %s must be in range 0..%u", mnemonic, what, max);
+  return op.e.v;
+}
+
+static uint32_t thumb_coproc_operand_reg(TCCState *s1, const char *mnemonic, const char *what, uint32_t want_type)
+{
+  Operand op = {};
+  parse_operand(s1, &op);
+  if (op.type != want_type)
+    tcc_error("%s: %s has the wrong operand kind", mnemonic, what);
+  return op.reg;
+}
+
+static void thumb_coproc_comma(const char *mnemonic)
+{
+  if (tok != ',')
+    tcc_error("%s: expected ','", mnemonic);
+  next();
+}
+
+static thumb_opcode thumb_coproc_opcode(TCCState *s1, int token)
+{
+  const char *mnemonic = get_tok_str(token, NULL);
+  const int two = (token == TOK_ASM_cdp2 || token == TOK_ASM_mcr2 || token == TOK_ASM_mrc2 ||
+                   token == TOK_ASM_mcrr2 || token == TOK_ASM_mrrc2);
+  const int is_cdp = (token == TOK_ASM_cdp || token == TOK_ASM_cdp2);
+  const int is_pair = (token == TOK_ASM_mcrr || token == TOK_ASM_mcrr2 || token == TOK_ASM_mrrc ||
+                       token == TOK_ASM_mrrc2);
+
+  /* opc1 is 4 bits on CDP/MCRR/MRRC but only 3 on MCR/MRC. */
+  const uint32_t opc1_max = (is_cdp || is_pair) ? 15 : 7;
+
+  uint32_t coproc = thumb_coproc_operand_reg(s1, mnemonic, "coprocessor number", OP_COPROC);
+  thumb_coproc_comma(mnemonic);
+  uint32_t opc1 = thumb_coproc_operand_imm(s1, mnemonic, "opc1", opc1_max);
+  thumb_coproc_comma(mnemonic);
+
+  if (is_pair)
+  {
+    uint32_t rt = thumb_coproc_operand_reg(s1, mnemonic, "Rt", OP_REG32);
+    thumb_coproc_comma(mnemonic);
+    uint32_t rt2 = thumb_coproc_operand_reg(s1, mnemonic, "Rt2", OP_REG32);
+    thumb_coproc_comma(mnemonic);
+    uint32_t crm = thumb_coproc_operand_reg(s1, mnemonic, "CRm", OP_CREG);
+
+    if (token == TOK_ASM_mcrr || token == TOK_ASM_mcrr2)
+      return th_mcrr(coproc, opc1, rt, rt2, crm, two);
+    return th_mrrc(coproc, opc1, rt, rt2, crm, two);
+  }
+
+  /* CDP takes a coprocessor register as its destination, MCR/MRC a core one. */
+  uint32_t rd = thumb_coproc_operand_reg(s1, mnemonic, is_cdp ? "CRd" : "Rt", is_cdp ? OP_CREG : OP_REG32);
+  thumb_coproc_comma(mnemonic);
+  uint32_t crn = thumb_coproc_operand_reg(s1, mnemonic, "CRn", OP_CREG);
+  thumb_coproc_comma(mnemonic);
+  uint32_t crm = thumb_coproc_operand_reg(s1, mnemonic, "CRm", OP_CREG);
+
+  /* opc2 defaults to 0 when omitted, matching GNU as. */
+  uint32_t opc2 = 0;
+  if (tok == ',')
+  {
+    next();
+    opc2 = thumb_coproc_operand_imm(s1, mnemonic, "opc2", 7);
+  }
+
+  if (is_cdp)
+    return th_cdp(coproc, opc1, rd, crn, crm, opc2, two);
+  if (token == TOK_ASM_mcr || token == TOK_ASM_mcr2)
+    return th_mcr(coproc, opc1, rd, crn, crm, opc2, two);
+  return th_mrc(coproc, opc1, rd, crn, crm, opc2, two);
+}
+
 static thumb_opcode thumb_vcvt_opcode(TCCState *s1, int token, const char *orig_token_str)
 {
   // VCVT instruction for floating-point conversions
@@ -3617,6 +3745,17 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
   case TOK_ASM_vpush:
   case TOK_ASM_vpop:
     return thumb_emit_opcode(thumb_vpushvpop_opcode(s1, token));
+  case TOK_ASM_cdp:
+  case TOK_ASM_cdp2:
+  case TOK_ASM_mcr:
+  case TOK_ASM_mcr2:
+  case TOK_ASM_mrc:
+  case TOK_ASM_mrc2:
+  case TOK_ASM_mcrr:
+  case TOK_ASM_mcrr2:
+  case TOK_ASM_mrrc:
+  case TOK_ASM_mrrc2:
+    return thumb_emit_opcode(thumb_coproc_opcode(s1, token));
   default:
     printf("asm_opcode: unknown token %s\n", get_tok_str(token, NULL));
     expect("known instruction");

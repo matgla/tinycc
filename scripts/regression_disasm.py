@@ -34,13 +34,14 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 
-from disasm_common import (
-    SCRIPT_DIR,
+from sources.disasm_common import (
+    BASELINE_DIR,
     TCC_DIR,
     DisasmCache,
     compile_gcc,
     compile_tcc,
     count_all_functions,
+    get_mapping_data_ranges,
     disassemble,
     eprint,
     get_functions,
@@ -221,6 +222,8 @@ def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_d
         eprint(f"  TRACE {key}: disassembling")
     tcc_text = disassemble(tcc_obj)
     gcc_text = disassemble(gcc_obj)
+    tcc_ranges = get_mapping_data_ranges(tcc_obj)
+    gcc_ranges = get_mapping_data_ranges(gcc_obj)
     if trace:
         eprint(f"  TRACE {key}: disasm done (tcc={len(tcc_text)} gcc={len(gcc_text)} chars)")
     tcc_dump_path.write_text(tcc_text)
@@ -243,8 +246,8 @@ def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_d
             with PRINT_LOCK:
                 eprint(f"[{idx}/{total}] {key} ... SKIP (no functions)")
             return {"type": "skip", "key": key, "reason": "no functions"}
-        tcc_counts = count_all_functions(tcc_text, sorted(tcc_funcs), with_clones=False)
-        gcc_counts = count_all_functions(gcc_text, sorted(gcc_funcs), with_clones=True)
+        tcc_counts = count_all_functions(tcc_text, sorted(tcc_funcs), with_clones=False, data_ranges=tcc_ranges)
+        gcc_counts = count_all_functions(gcc_text, sorted(gcc_funcs), with_clones=True, data_ranges=gcc_ranges)
         tcc_total = sum(tcc_counts.values())
         gcc_total = sum(gcc_counts.values())
         if tcc_total == 0 and gcc_total == 0:
@@ -256,8 +259,8 @@ def process_one(idx: int, total: int, suite: str, src: str, tmpdir: Path, dump_d
     else:
         if trace:
             eprint(f"  TRACE {key}: counting instructions")
-        tcc_counts = count_all_functions(tcc_text, common, with_clones=False)
-        gcc_counts = count_all_functions(gcc_text, common, with_clones=True)
+        tcc_counts = count_all_functions(tcc_text, common, with_clones=False, data_ranges=tcc_ranges)
+        gcc_counts = count_all_functions(gcc_text, common, with_clones=True, data_ranges=gcc_ranges)
         funcs = [(func, tcc_counts[func], gcc_counts[func]) for func in common]
 
     tcc_obj.unlink(missing_ok=True)
@@ -358,7 +361,8 @@ def output_csv(data, gcc_opt, tcc_opt="-O2"):
 
 
 def save_baseline(data, name, gcc_opt):
-    path = SCRIPT_DIR / f"{name}.csv"
+    BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    path = BASELINE_DIR / f"{name}.csv"
     head = subprocess.run(["git", "-C", str(TCC_DIR), "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
     rev = head.stdout.strip() if head.returncode == 0 else "unknown"
     with open(path, "w") as f:
@@ -371,7 +375,7 @@ def save_baseline(data, name, gcc_opt):
 
 
 def diff_baseline(data, name, gcc_opt):
-    path = SCRIPT_DIR / f"{name}.csv"
+    path = BASELINE_DIR / f"{name}.csv"
     if not path.exists():
         eprint(f"ERROR: Baseline file not found: {path}")
         sys.exit(1)
@@ -577,7 +581,7 @@ def print_graph(left_csv_text: str, right_csv_text: str, left_label: str, right_
         test_tcc = defaultdict(int)
         suite_tcc = defaultdict(int)
         suite_gcc = defaultdict(int)
-        gcc_col = f"gcc_{gcc_opt}"
+        gcc_col = f"gcc_{gcc_opt.lstrip('-')}"
         for row in reader:
             test_key = row["suite"] + "/" + row["test"]
             test_tcc[test_key] += int(row["tcc_O2"])

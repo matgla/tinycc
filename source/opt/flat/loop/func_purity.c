@@ -220,6 +220,11 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
             }
           }
 
+          /* soft-float / 64-bit AEABI helpers compute from their arguments
+           * alone, so a function is not made impure by calling one */
+          if (callee_purity == TCC_FUNC_PURITY_UNKNOWN && tcc_ir_is_pure_aeabi(callee_name))
+            callee_purity = TCC_FUNC_PURITY_CONST;
+
           if (callee_purity == TCC_FUNC_PURITY_UNKNOWN)
           {
             int func_pure = callee->f.func_pure;
@@ -318,6 +323,16 @@ int tcc_ir_get_func_purity(TCCIRState *ir, Sym *sym)
       LOG_LICM("Found '%s' in pure function table with purity=%d", func_name, pure_func_table[i].purity);
       return pure_func_table[i].purity;
     }
+  }
+
+  /* Soft-float / 64-bit AEABI helpers compute from their arguments alone: they
+   * touch no memory, so they are CONST.  Without this the LICM/DCE purity query
+   * classifies every `__aeabi_dmul` as IMPURE and a loop-invariant soft-float
+   * expression is recomputed on every iteration. */
+  if (tcc_ir_is_pure_aeabi(func_name))
+  {
+    LOG_LICM("Function '%s' is a pure AEABI helper (CONST)", func_name);
+    return TCC_FUNC_PURITY_CONST;
   }
 
   /* noreturn functions exit or loop forever, never pure */

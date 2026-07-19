@@ -130,10 +130,34 @@ typedef struct __attribute__((packed)) IROperand
   uint8_t is_static : 1;   /* VT_STATIC flag */
   uint8_t is_sym : 1;      /* VT_SYM: has associated symbol */
   uint8_t is_param : 1;    /* VT_PARAM: stack-passed parameter (needs offset_to_args) */
-  uint8_t _pad : 4;        /* unused — available for future flags */
+  uint8_t aux : 4;         /* IROP_AUX_* flag bits (see below).  Deliberately ONE
+                            * 4-bit member accessed via masks, not individual
+                            * 1-bit members: growing this struct's bitfield
+                            * member count makes host GCC stop scalarizing the
+                            * packed 9-byte struct in by-value copies, which
+                            * measurably tripled whole-IR scan passes (vrp on
+                            * tests2/101_cleanup went 19s -> 56s). */
 } IROperand;
 
 _Static_assert(sizeof(IROperand) == 9, "IROperand must be 9 bytes");
+
+/* IROperand.aux flag bits. */
+#define IROP_AUX_ALIGN4_OK 0x1u   /* 64-bit lvalue only: the accessed address is
+                                   * proven >= 4-byte aligned (static type rules,
+                                   * no packed member in the access chain), so the
+                                   * backend may use LDRD/STRD through a general
+                                   * base register.  Default clear = not proven;
+                                   * operands built by IR passes stay clear and
+                                   * fall back to the unaligned-safe LDR/STR pair. */
+#define IROP_AUX_UNDERALIGN 0x2u  /* The access chain crossed a packed member, so
+                                   * the address may be < 4-byte aligned.
+                                   * Inverse-polarity sibling of ALIGN4_OK for the
+                                   * LOAD_INDEXED / STORE_INDEXED path, whose
+                                   * 64-bit lowering has historically assumed
+                                   * alignment: fusion passes copy this from the
+                                   * original deref operand onto the base operand,
+                                   * and the backend then avoids LDRD/STRD.
+                                   * Default clear keeps legacy indexed behavior. */
 
 /* ============================================================================
  * Pool entry types - separate arrays for cache efficiency
@@ -366,7 +390,7 @@ static inline int32_t irop_get_vreg(const IROperand op)
 
 /* Sentinel for "no operand" */
 #define IROP_NONE                                                                                                      \
-  ((IROperand){.vr = -1, .u = {.imm32 = 0}, .is_unsigned = 0, .is_static = 0, .is_sym = 0, .is_param = 0, ._pad = 0})
+  ((IROperand){.vr = -1, .u = {.imm32 = 0}, .is_unsigned = 0, .is_static = 0, .is_sym = 0, .is_param = 0, .aux = 0})
 
 /* Helper to initialize type-flag byte to defaults */
 static inline void irop_init_phys_regs(IROperand *op)
@@ -375,7 +399,7 @@ static inline void irop_init_phys_regs(IROperand *op)
   op->is_static = 0;
   op->is_sym = 0;
   op->is_param = 0;
-  op->_pad = 0;
+  op->aux = 0;
 }
 
 /* Helper to set vreg fields from a vreg value.

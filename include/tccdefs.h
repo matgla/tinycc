@@ -319,12 +319,13 @@ typedef char *__builtin_va_list;
    Runtime helpers in lib/va_list.c. */
 typedef char *__builtin_va_list;
 
-void __tcc_va_start(char **ap_ptr, void *fp);
-void *__tcc_va_arg(char **ap_ptr, int size, int align);
-
-#define __builtin_va_start(ap, ...) __tcc_va_start(&(ap), __builtin_frame_address(0))
-/* __builtin_va_arg is handled as a compiler intrinsic (TOK_builtin_va_arg)
-   to support VLA struct types passed by invisible reference. */
+/* __builtin_va_start and __builtin_va_arg are compiler intrinsics
+   (TOK_builtin_va_start / TOK_builtin_va_arg), so ARM needs no va_list runtime
+   helpers at all.  va_start expands to the address of the first anonymous
+   argument, which the backend knows exactly; va_arg expands to the pointer bump
+   (align up, take, advance), which also keeps `ap` in a register because its
+   address is never taken.  va_arg being an intrinsic additionally supports VLA
+   struct types passed by invisible reference. */
 #define __builtin_va_copy(dest, src) (dest) = (src)
 
 #elif defined __aarch64__

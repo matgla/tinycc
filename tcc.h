@@ -508,6 +508,9 @@ struct FuncAttr
       func_auto_inline : 1,             /* compiler-selected auto-inline candidate (small func) */
       func_inline_call_heavy : 1,       /* auto-inline body keeps a non-foldable call: budget-limit expansions */
       func_eval_only_inline : 1,        /* body saved for const-fold only, not regular inlining */
+      func_const_arg_loop : 1,          /* post-opt body is a register-only loop: keep tokens so an
+                                           all-constant call site can inline it and let
+                                           ssa:loop_const_sim fold the loop to its final value */
       func_pure_via_sret : 1,           /* inferred: only observable side effect is *sret_arg writes */
       func_late_reopt : 1,              /* body kept for end-of-TU re-optimization (non-const static global fold) */
       tu_static_writer : 1,             /* function writes >=1 non-const static global (set during summary collection) */
@@ -993,6 +996,8 @@ struct TCCState
 #define NO_BUILTIN_ULABS (1u << 4)
 #define NO_BUILTIN_ULLABS (1u << 5)
 #define NO_BUILTIN_UMAXABS (1u << 6)
+#define NO_BUILTIN_MEMFUNCS (1u << 7) /* keep memcpy/memset/__aeabi_mem* as real calls
+                                       * (plain -fno-builtin, or -fno-builtin-mem{cpy,set}) */
   unsigned int no_builtin_funcs;
 
   /* warning switches */
@@ -2178,6 +2183,7 @@ ST_FUNC void gaddrof(void);
 ST_FUNC int gv(int rc);
 ST_FUNC void gv2(int rc1, int rc2);
 ST_FUNC void gen_op(int op);
+ST_FUNC void gen_op_vector_reset(void);
 ST_FUNC int type_size(const CType *type, int *a);
 ST_FUNC void mk_pointer(CType *type);
 ST_FUNC void vstore(void);
@@ -2598,6 +2604,12 @@ ST_FUNC int tcc_gen_machine_subs_eq_select_01(MachineOperand src1, MachineOperan
 ST_FUNC void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_sbfx_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_bfi_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, uint32_t params);
+/* Single-operand bit manipulation: dest = <op>(src1) for TCCIR_OP_CLZ / RBIT /
+ * REV / REV16.  Only called when tcc_machine_has_bit_ops() is true. */
+ST_FUNC void tcc_gen_machine_bitop1_mop(MachineOperand src1, MachineOperand dest, TccIrOp op);
+/* Does the active target encode clz/rbit/rev/rev16?  Front ends use this to
+ * decide between the native opcode and the libgcc helper call. */
+ST_FUNC int tcc_machine_has_bit_ops(void);
 ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_pack64_mop(MachineOperand src_lo, MachineOperand src_hi, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
@@ -2652,6 +2664,11 @@ ST_FUNC void tcc_gen_machine_save_call_context(void);
 ST_FUNC void tcc_gen_machine_restore_call_context(void);
 ST_FUNC int tcc_gen_machine_jump_mop(TccIrOp op, int32_t target_ir, int ir_idx);
 ST_FUNC int tcc_gen_machine_conditional_jump_mop(int32_t condition, TccIrOp op, int32_t target_ir, int ir_idx);
+ST_FUNC void tcc_gen_machine_dry_run_set_rehearsal(int on);
+ST_FUNC int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx);
+ST_FUNC int tcc_gen_machine_pool_flushes_total(void);
+ST_FUNC int tcc_gen_machine_pool_entries_total(void);
+ST_FUNC int tcc_gen_machine_const_needs_pool(int32_t value);
 ST_FUNC int tcc_gen_machine_pending_pool_size(void);
 ST_FUNC int tcc_gen_machine_cbz_jump_mop(int rn, int nonzero, int32_t target_ir, int ir_idx);
 ST_FUNC int tcc_gen_machine_switch_table_dry_run_size(int num_entries);
@@ -2672,6 +2689,7 @@ ST_FUNC void tcc_gen_machine_dry_run_start(void);
 ST_FUNC void tcc_gen_machine_dry_run_end(void);
 ST_FUNC int tcc_gen_machine_dry_run_get_lr_push_count(void);
 ST_FUNC uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void);
+ST_FUNC int tcc_gen_machine_dry_run_get_max_nested_saves(void);
 ST_FUNC void tcc_gen_machine_reset_scratch_state(void);
 ST_FUNC int tcc_gen_machine_dry_run_is_active(void);
 ST_FUNC int tcc_gen_machine_real_run_had_scratch_push(void);

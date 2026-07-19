@@ -79,6 +79,177 @@ static int cef_symref_same(TCCIRState *ir, IROperand a, IROperand b)
   return a_ref && b_ref && a_ref->sym == b_ref->sym && a_ref->addend == b_ref->addend;
 }
 
+/* The instruction that consumes this CMP's flags, or NULL. */
+static IRQuadCompact *cef_flag_consumer(TCCIRState *ir, int cmp_idx)
+{
+  int n = ir->next_instruction_index;
+  int j = cmp_idx + 1;
+  while (j < n && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+    j++;
+  if (j >= n)
+    return NULL;
+  IRQuadCompact *use = &ir->compact_instructions[j];
+  if (use->is_jump_target)
+    return NULL;
+  if (use->op != TCCIR_OP_SELECT && use->op != TCCIR_OP_SETIF && use->op != TCCIR_OP_JUMPIF)
+    return NULL;
+
+  /* A second consumer would read flags this fold does not preserve. */
+  int k = j + 1;
+  while (k < n && ir->compact_instructions[k].op == TCCIR_OP_NOP)
+    k++;
+  if (k < n)
+  {
+    TccIrOp next = ir->compact_instructions[k].op;
+    if (next == TCCIR_OP_SELECT || next == TCCIR_OP_SETIF || next == TCCIR_OP_JUMPIF)
+      return NULL;
+  }
+  return use;
+}
+
+/* No memory write, call or control-flow join between two points, so a value
+ * read at `from` still reads the same at `to`. */
+static int cef_memory_stable_between(TCCIRState *ir, int from, int to, IROperand moved)
+{
+  int32_t moved_vr = irop_get_vreg(moved);
+  for (int k = from + 1; k < to; k++)
+  {
+    IRQuadCompact *kq = &ir->compact_instructions[k];
+    TccIrOp kop = kq->op;
+    if (kop == TCCIR_OP_NOP)
+      continue;
+    if (kq->is_jump_target)
+      return 0;
+    if (kop == TCCIR_OP_STORE || kop == TCCIR_OP_STORE_INDEXED ||
+        kop == TCCIR_OP_STORE_POSTINC || kop == TCCIR_OP_BLOCK_COPY ||
+        kop == TCCIR_OP_INLINE_ASM || kop == TCCIR_OP_VLA_ALLOC ||
+        kop == TCCIR_OP_FUNCCALLVOID || kop == TCCIR_OP_FUNCCALLVAL ||
+        kop == TCCIR_OP_JUMP || kop == TCCIR_OP_JUMPIF || kop == TCCIR_OP_IJUMP)
+      return 0;
+    if (!irop_config[kop].has_dest)
+      continue;
+    IROperand kd = tcc_ir_op_get_dest(ir, kq);
+    /* A destination naming memory mutates it like a STORE. */
+    if (kd.is_lval || irop_get_tag(kd) == IROP_TAG_STACKOFF)
+      return 0;
+    if (moved_vr >= 0 && irop_get_vreg(kd) == moved_vr)
+      return 0;
+  }
+  return 1;
+}
+
+/* `(x ^ y) == y`  ==>  `x == 0`  (and the mirrored/`!=` forms).
+ *
+ * Exact for equality because only Z is consulted: for a == (x^y) and b == y,
+ * Z(a-b) is set exactly when x is zero.  It does NOT hold for the relational
+ * predicates — N/C/V differ — hence the EQ/NE gate on the flag consumer.
+ * Dropping the XOR usually kills the cancelled operand's load as well, which
+ * is where the win comes from (element-wise `(*p ^ *q) == *q` vector masks). */
+static int cef_xor_cancel(TCCIRState *ir, const uint8_t *dc, int dc_stride)
+{
+  int n = ir->next_instruction_index;
+  int changes = 0;
+
+  for (int i = 0; i < n - 1; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_CMP)
+      continue;
+
+    IRQuadCompact *use = cef_flag_consumer(ir, i);
+    if (!use)
+      continue;
+    IROperand cond = (use->op == TCCIR_OP_SELECT) ? ir->iroperand_pool[use->operand_base + 3]
+                                                  : tcc_ir_op_get_src1(ir, use);
+    int tok = (int)irop_get_imm64_ex(ir, cond);
+    if (tok != TOK_EQ && tok != TOK_NE)
+      continue;
+
+    IROperand cs[2];
+    cs[0] = tcc_ir_op_get_src1(ir, q);
+    cs[1] = tcc_ir_op_get_src2(ir, q);
+    if (cef_operand_is_volatile_local(ir, cs[0]) || cef_operand_is_volatile_local(ir, cs[1]))
+      continue;
+
+    /* Either CMP operand may name the XOR; the other is the cancelling term. */
+    for (int side = 0; side < 2; side++)
+    {
+      IROperand xor_op = cs[side];
+      IROperand other_op = cs[!side];
+
+      /* The XOR result must reach the CMP as a plain single-def value. */
+      int32_t xor_vr = irop_get_vreg(xor_op);
+      if (xor_op.is_lval || xor_vr < 0 || irop_get_btype(xor_op) != IROP_BTYPE_INT32)
+        continue;
+      if (!DC_IS_SINGLE_DEF(dc, dc_stride, xor_vr))
+        continue;
+
+      int xor_def = tcc_ir_find_defining_instruction(ir, xor_vr, i);
+      if (xor_def < 0)
+        continue;
+      IRQuadCompact *xq = &ir->compact_instructions[xor_def];
+      if (xq->op != TCCIR_OP_XOR)
+        continue;
+
+      IROperand xs[2];
+      xs[0] = tcc_ir_op_get_src1(ir, xq);
+      xs[1] = tcc_ir_op_get_src2(ir, xq);
+      /* Uniform 32-bit width throughout: a narrower view on either side would
+       * make `x == 0` ask about different bits than `(x^y) == y` did. */
+      if (irop_get_btype(xs[0]) != IROP_BTYPE_INT32 || irop_get_btype(xs[1]) != IROP_BTYPE_INT32 ||
+          irop_get_btype(other_op) != IROP_BTYPE_INT32)
+        continue;
+      if (cef_operand_is_volatile_local(ir, xs[0]) || cef_operand_is_volatile_local(ir, xs[1]))
+        continue;
+
+      /* Which XOR operand does the CMP's other side re-read?  The operands are
+       * usually embedded derefs of two distinct address temps, so this is an
+       * expression comparison (which also proves memory stayed stable). */
+      int matched = -1;
+      for (int k = 0; k < 2 && matched < 0; k++)
+        if (ir_opt_pure_expr_equal(ir, other_op, i, xs[k], xor_def, 0))
+          matched = k;
+      if (matched < 0)
+        continue;
+
+      IROperand keep = xs[!matched];
+      /* Moving `keep` down from the XOR to the CMP re-reads it there, so
+       * nothing in between may write memory or redefine its address. */
+      if (!cef_memory_stable_between(ir, xor_def, i, keep))
+        continue;
+
+      tcc_ir_set_src1(ir, i, keep);
+      tcc_ir_set_src2(ir, i, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
+      changes++;
+      LOG_IR_GEN("OPTIMIZE: (x^y) cmp y -> x cmp 0 at i=%d", i);
+      break;
+    }
+  }
+
+  return changes;
+}
+
+/* Standalone entry: the fusion group is what turns the embedded derefs of
+ * `(*p ^ *q) == *q` into the plain-register XOR/CMP form this fold matches, so
+ * it must also run after that group, not only inside cmp_expr_fold. */
+int tcc_ir_opt_cmp_xor_cancel(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n < 2 || n > 4000)
+    return 0;
+
+  int dc_stride = 0;
+  uint8_t *dc = ir_opt_build_def_count(ir, n, &dc_stride);
+  int changes = cef_xor_cancel(ir, dc, dc_stride);
+  tcc_free(dc);
+
+  if (changes)
+    changes += tcc_ir_opt_dce(ir);
+  return changes;
+}
+
+int tcc_ir_opt_cmp_xor_cancel_ex(IROptCtx *ctx) { return tcc_ir_opt_cmp_xor_cancel(ctx->ir); }
+
 int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -89,6 +260,8 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
 
   int dc_stride = 0;
   uint8_t *dc = ir_opt_build_def_count(ir, n, &dc_stride);
+
+  changes += cef_xor_cancel(ir, dc, dc_stride);
 
   for (int i = 0; i < n - 1; i++)
   {

@@ -191,6 +191,13 @@ Ground truth oracle is `gcc -m32 -funsigned-char` (ARM ABI: unsigned char,
 32-bit long). Sweep/triage infrastructure is documented in
 `docs/fuzz_triage_guide.md`.
 
+To decide whether the seeds a sweep flagged are *new*, do not re-sweep the band:
+`python3 tests/fuzz/batch_sweep.py --profile P --seeds "1,1410,…"
+--olevels="-O0,-O1,-O2,gcc-O0" --no-cache` re-checks an explicit list in about a
+second, so the same list can be run against HEAD (or with the change's kill
+switch) for a real A/B. See "Re-checking only the seeds that failed" in
+`docs/fuzz_triage_guide.md`.
+
 ## Extending the Compiler
 
 **New IR instruction:**
@@ -221,6 +228,18 @@ cd lib/fp && make FPU=rp2350        # RP2350 DCP
 - The first run builds newlib: `cd tests/ir_tests/qemu/mps2-an505 && sh ./build_newlib.sh`
 - GCC torture tests use a git submodule at `tests/gcctestsuite/gcc-testsuite`; tests using `__builtin_*` or `_Complex` are auto-skipped
 - Each tests2 test runs at both `-O0` and `-O1`
+
+## Developer Scripts (`scripts/`)
+
+- `scripts/*.py` are the runnable entry points; invoke them directly. The
+  directory is Python-only — don't add shell scripts.
+- `scripts/sources/` holds the importable modules behind them — `disasm_common.py`
+  (compile/disassemble/count + the best-known-result cache) and `fuzz_common.py`
+  (puts `tests/fuzz` on `sys.path` and re-exports the harness). Import them as
+  `from sources.disasm_common import ...`; runners resolve the package because
+  Python puts the runner's own directory on `sys.path`.
+- `regression_disasm.py` baselines are read from and written to
+  `metrics/baselines/`; `--diff p1_baseline` looks there.
 
 ## Coding Guidelines
 

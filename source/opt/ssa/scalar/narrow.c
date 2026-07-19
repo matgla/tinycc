@@ -69,13 +69,55 @@ OPT_GEN_SSA(narrow_and, TCCIR_OP_AND) {
   uint32_t outer = (uint32_t)imm(src2);
   int32_t src1_vr = vreg(src1);
 
-  if (pop == TCCIR_OP_AND) {
+  /* Compose an AND-mask with a masking predecessor, where a `UBFX(v, 0, w)`
+   * counts as `AND(v, (1<<w)-1)` (lsb 0 only):
+   *   AND(AND(v, m1),      m2) -> AND(v, m1 & m2)
+   *   AND(UBFX(v, 0, w),   m2) -> AND(v, ((1<<w)-1) & m2)
+   * When the outer mask already covers the inner one (m1 ⊆ m2), the outer AND
+   * is a no-op and folds to a copy of the inner result.  Otherwise, when the
+   * inner def is single-use, drop it and mask v directly — this is the
+   * backward-redundant "truncate to storage width, then mask to field width"
+   * that bitfield reads emit (a `UBFX #0,#16` feeding `& 0x7ff`), which no
+   * forward known-bits pass can see. */
+  if (pop == TCCIR_OP_AND || pop == TCCIR_OP_UBFX) {
     if (!is_imm32(psrc2))
       return 0;
-    uint32_t inner = (uint32_t)imm(psrc2);
-    if ((inner & outer) != inner)
+    /* 32-bit masks only: a 32-bit AND over a 64-bit value clears its high half. */
+    if (irop_is_64bit(dest) || irop_is_64bit(src1) ||
+        irop_is_64bit(pdest) || irop_is_64bit(psrc1))
       return 0;
-    REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = narrow_copy_src(dest, src1_vr));
+    uint32_t inner;
+    if (pop == TCCIR_OP_AND) {
+      inner = (uint32_t)imm(psrc2);
+    } else {
+      int32_t param = (int32_t)imm(psrc2);
+      int lsb = param & 31, width = (param >> 5) & 63;
+      if (lsb != 0 || width <= 0 || width >= 32)
+        return 0;
+      inner = (1u << width) - 1;
+    }
+    /* outer covers inner: the outer AND changes nothing */
+    if ((inner & outer) == inner)
+      REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = narrow_copy_src(dest, src1_vr));
+    /* inner dies: compose the two masks and read v directly.  A contiguous
+     * low-bits result becomes a UBFX (the canonical form this pass emits for
+     * the SHR case, and the shape the bitfield store→load forward matches);
+     * anything else stays a plain AND. */
+    if (pvi->use_count == 1) {
+      uint32_t m = inner & outer;
+      int w = (m != 0 && (m & (m + 1)) == 0) ? __builtin_popcount(m) : 0;
+      RETIRE_PAIR(psrc1, 1);
+      if (w >= 1 && w < 32)
+        REWRITE(
+          .new_op = TCCIR_OP_UBFX,
+          .src1   = psrc1,
+          .src2   = irop_make_imm32(-1, 0 | (w << 5), IROP_BTYPE_INT32));
+      REWRITE(
+        .new_op = TCCIR_OP_AND,
+        .src1   = psrc1,
+        .src2   = irop_make_imm32(-1, (int32_t)m, dest.btype));
+    }
+    return 0;
   }
 
   if (pop == TCCIR_OP_SHR) {

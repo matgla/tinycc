@@ -93,6 +93,22 @@ int try_eliminate_loop_symbolic(struct TCCIRState *ir, struct IRLoop *loop);
 int try_unroll_loop_ex(struct TCCIRState *ir, struct IRLoop *loop,
                        struct IRLoops *loops, int loop_idx);
 int try_rotate_loop(struct TCCIRState *ir, struct IRLoop *loop);
+/* Placement-only sibling of rotation: moves a `for` body ahead of its
+ * increment so the two bridging jumps become fall-throughs. */
+int try_relayout_loop(struct TCCIRState *ir, struct IRLoop *loop);
+
+/* Zero-trip entry-guard elimination for chains of sequential counted loops
+ * (source/opt/flat/loop/seq_guard_elim.c).  Carries the IV constant forward in
+ * program order (exit value = init + trip*step) so a rotated loop whose IV
+ * enters as the previous loop's exit value can drop its `CMP/JUMPIF` guard.
+ * Returns the number of guards removed. */
+int tcc_ir_opt_loop_guard_elim(struct TCCIRState *ir);
+
+/* Query side of the same walker: constant value of `vreg` on entry to
+ * instruction `at_idx`, carried across preceding counted loops.  1 on success.
+ * Rotation uses it to decide whether its guard will fold before committing. */
+int tcc_ir_loop_seq_entry_const(struct TCCIRState *ir, int at_idx, int32_t vreg,
+                                int64_t *out_val);
 
 /* Rewrites a count-up pure-counter loop in [start,end] to count-down-to-zero; 1 if rewritten. */
 int dtz_try_region(struct TCCIRState *ir, int start, int end, int header_idx,

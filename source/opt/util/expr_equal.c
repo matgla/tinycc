@@ -325,6 +325,32 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
   }
 }
 
+/* Recognize `T` where T's only def is `T <- [A] LOAD`, yielding the address
+ * operand A and the index at which the read actually happens.  Used to compare a
+ * value read through an explicit LOAD temp against the same memory named
+ * directly as an operand. */
+static int ir_opt_load_temp_addr(TCCIRState *ir, IROperand op, int use_idx,
+                                 IROperand *out_addr, int *out_read_idx)
+{
+  if (op.is_lval || irop_get_tag(op) != IROP_TAG_VREG)
+    return 0;
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || !tcc_ir_vreg_has_single_def(ir, vr))
+    return 0;
+  int d = tcc_ir_find_defining_instruction(ir, vr, use_idx);
+  if (d < 0)
+    return 0;
+  IRQuadCompact *q = &ir->compact_instructions[d];
+  if (q->op != TCCIR_OP_LOAD)
+    return 0;
+  IROperand src = tcc_ir_op_get_src1(ir, q);
+  if (!src.is_lval)
+    return 0;
+  *out_addr = src;
+  *out_read_idx = d;
+  return 1;
+}
+
 static int ir_opt_pure_expr_equal_impl(TCCIRState *ir, IROperand a, int a_use_idx,
                                        IROperand b, int b_use_idx, int depth)
 {
@@ -347,6 +373,31 @@ static int ir_opt_pure_expr_equal_impl(TCCIRState *ir, IROperand a, int a_use_id
 
   a_tag = irop_get_tag(a);
   b_tag = irop_get_tag(b);
+
+  /* One side reads memory through an explicit LOAD temp while the other names
+   * the same memory directly as an operand:
+   *     T7 <- [G+8] LOAD ;  T3 <- T7            SHL #20      (side A)
+   *                        T5 <- [G+8]*DEREF*   SHL #20      (side B)
+   * Same value, different tree shape, so the tag comparison below rejects it.
+   * copy_source_load_fwd produces exactly this mismatch — it rewrites a load's
+   * ADDRESS and keeps the LOAD, while the expression it must compare equal to
+   * reads the global inline.  Equal iff the addresses match and memory is stable
+   * between the two reads (the LOAD's own index is where its read happens). */
+  if (a_tag != b_tag)
+  {
+    IROperand laddr;
+    int lidx;
+    if (a_tag == IROP_TAG_VREG && b.is_lval && b_use_idx >= 0 &&
+        ir_opt_load_temp_addr(ir, a, a_use_idx, &laddr, &lidx))
+
+      return ir_opt_nonvreg_expr_equal(ir, laddr, b) &&
+             ir_opt_pure_def_memory_stable(ir, lidx, b_use_idx);
+    if (b_tag == IROP_TAG_VREG && a.is_lval && a_use_idx >= 0 &&
+        ir_opt_load_temp_addr(ir, b, b_use_idx, &laddr, &lidx))
+      return ir_opt_nonvreg_expr_equal(ir, a, laddr) &&
+             ir_opt_pure_def_memory_stable(ir, a_use_idx, lidx);
+  }
+
   if (a_tag != IROP_TAG_VREG || b_tag != IROP_TAG_VREG)
   {
     if (!ir_opt_nonvreg_expr_equal(ir, a, b))

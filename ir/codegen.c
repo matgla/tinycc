@@ -1093,6 +1093,183 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
   return new_r;
 }
 
+/* How many allocatable registers the fixup has freed at one instruction, i.e.
+ * how many extra scratch registers the real run will find there compared to
+ * the dry run that recorded the save.  R7 (frame pointer), SP and PC are never
+ * handed out as scratch, so they must not count. */
+static int ir_codegen_regs_freed_at(uint32_t orig_live, uint32_t live_now)
+{
+  const uint32_t allocatable = 0x1F7Fu; /* R0-R6, R8-R12 */
+  return __builtin_popcount(orig_live & ~live_now & allocatable);
+}
+
+/* ============================================================================
+ * Phase-3 scratch conflict fixup, last resort: demote the blocker to memory
+ * ============================================================================
+ *
+ * try_reassign_scratch_conflict() can only move the blocking vreg to another
+ * register.  When every register is occupied across the blocker's whole live
+ * range there is nowhere to move it, and the real run then pays a
+ * save/use/restore round trip (STR + LDR, plus the reload of anything the
+ * scratch clobbered) at EVERY instruction in that window.
+ *
+ * 20041011-1 is the pathological case: 30 volatile ints copied in and out
+ * inside a loop.  The allocator hands out all 10 free registers, so the
+ * remaining 20 copies each cost 7 instructions instead of 2 — the scratch
+ * machinery spends 4 of them saving and restoring the two registers it
+ * borrows, and the third is a literal-pool reload of the global's address
+ * that only exists because the borrow invalidated the cached copy.
+ *
+ * Spilling ONE such blocker outright turns its register into a permanently
+ * free scratch for the whole window.  The value then costs one memory access
+ * per reference, which is cheaper than two per blocked instruction as soon as
+ * the window is wider than the vreg's use count.
+ *
+ * Returns the demoted vreg on success, -1 when nothing could be demoted.  The
+ * caller assigns the stack slot afterwards (the frame's low areas have not
+ * been laid out yet at this point), so the interval is left marked with
+ * DEMOTE_PENDING_SLOT until then.
+ */
+#define DEMOTE_PENDING_SLOT 1 /* non-zero placeholder; frame offsets are negative */
+
+static int try_demote_scratch_conflict(TCCIRState *ir, int r, int insn_i, const uint16_t *dry_insn_saves,
+                                       const int *dry_insn_scratch, int n_insns)
+{
+  LSLiveIntervalState *ls = &ir->ls;
+
+  static int disabled = -1;
+  if (disabled < 0)
+    disabled = getenv("TCC_NO_SCRATCH_DEMOTE") ? 1 : 0;
+  if (disabled)
+    return -1;
+
+  int holder = tcc_ls_find_int_reg_holder(ls, r, insn_i);
+  if (holder < 0)
+    return -1;
+  LSLiveInterval *ls_iv = &ls->intervals[holder];
+
+  /* Already memory-backed, or part of a graph-coalesced class whose copies
+   * were erased on the assumption that both ends share this register. */
+  if (ls_iv->stack_location != 0 || ls_iv->addrtaken || ls_iv->co_member)
+    return -1;
+  if (ls_iv->reg_type != LS_REG_TYPE_INT || ls_iv->r1 >= 0)
+    return -1;
+
+  IRLiveInterval *ir_iv = tcc_ir_get_live_interval(ir, (int)ls_iv->vreg);
+  if (!ir_iv)
+    return -1;
+  if (ir_iv->is_float || ir_iv->is_double || ir_iv->is_llong || ir_iv->is_complex || ir_iv->use_vfp)
+    return -1;
+  /* ABI-pinned (parameter / call result) and phi-pinned intervals must keep
+   * the register the surrounding code already committed to. */
+  if (ir_iv->incoming_reg0 >= 0 || ir_iv->phi_pinned || ir_iv->addrtaken)
+    return -1;
+  if (ir_iv->allocation.offset != 0)
+    return -1;
+  if (ir_iv->allocation.r0 != (uint16_t)r)
+    return -1;
+  /* A rematerializable constant is reloaded with a MOV, never from memory —
+   * demoting it frees the register without any memory traffic, but it also
+   * cannot be the thing that makes an instruction need scratch. Leave it. */
+  if (ir_iv->remat_kind != 0)
+    return -1;
+
+  const int start = (int)ls_iv->start;
+  const int end = (int)ls_iv->end;
+  if (start < 0 || end < start || end >= n_insns)
+    return -1;
+
+  /* The register must be held by this interval ALONE over its whole range.
+   * A second claimant means move coalescing put a copy's two ends on the same
+   * register and erased the copy; demoting one end would drop the value. */
+  for (int k = 0; k < ls->next_interval_index; k++)
+  {
+    const LSLiveInterval *other = &ls->intervals[k];
+    if (other == ls_iv || other->stack_location != 0)
+      continue;
+    if (other->r0 != r && other->r1 != r)
+      continue;
+    if ((int)other->start <= end && (int)other->end >= start)
+      return -1;
+  }
+
+  /* Benefit: every instruction inside the range that the dry run had to save
+   * r at stops paying STR+LDR (2 instructions).  Cost: one memory access per
+   * reference to the vreg.
+   *
+   * An instruction that references the vreg does NOT count as benefit: after
+   * the demotion it still needs a register there, to hold the reloaded value,
+   * so the borrow does not go away — it only changes what it is for.  Counting
+   * those was what made 920928-2::g look like a 6-instruction win when it was
+   * a 6-instruction loss (every blocked instruction was also a reference). */
+  int blocked = 0;
+  int refs = 0;
+  for (int j = start; j <= end; j++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    int here = 0;
+    if (q->op != TCCIR_OP_NOP)
+    {
+      if (irop_config[q->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == (int)ls_iv->vreg)
+        here++;
+      if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == (int)ls_iv->vreg)
+        here++;
+      if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == (int)ls_iv->vreg)
+        here++;
+    }
+    refs += here;
+    if (here || !(dry_insn_saves[j] & (1u << (unsigned)r)))
+      continue;
+    /* dry_insn_saves is a pass-0 prediction made before the reassignment
+     * fixups above (and any earlier demotion) ran.  Only count j when the real
+     * run will still come up short of scratch registers there — otherwise the
+     * predicted save never happens and the demotion buys nothing (920928-2::g:
+     * six predicted saves, none real, six extra reloads of a pointer that had
+     * been sitting in R0).  The comparison is against how many scratch
+     * registers the instruction wants, not against zero: an instruction that
+     * borrows two still pays for the second when only one is free. */
+    if (ls->live_regs_by_instruction && j < ls->live_regs_by_instruction_size)
+    {
+      uint32_t free_now = ~ls->live_regs_by_instruction[j] & 0x1F7Fu & ~(1u << (unsigned)r);
+      if (__builtin_popcount(free_now) >= dry_insn_scratch[j])
+        continue;
+    }
+    blocked++;
+  }
+  /* Demanding a real window, not a one-off blip: freeing the register is not
+   * guaranteed to remove the save (the instruction may want two scratches, or
+   * the borrow may be excluded by the operands), while the added memory
+   * traffic is certain.  Below this width the model is not reliable enough —
+   * every corpus regression measured came from a 2-instruction window. */
+  if (blocked < 4)
+    return -1;
+  /* The +4 margin covers the reload's own scratch needs and the saves that
+   * freeing a single register does not remove. */
+  if (2 * blocked <= refs + 4)
+    return -1;
+
+  if (tcc_state && tcc_state->verbose)
+    fprintf(stderr, "[phase3-demote] insn=%d vreg=%d R%d -> memory (blocked=%d refs=%d range=%d..%d)\n", insn_i,
+            (int)ls_iv->vreg, r, blocked, refs, start, end);
+
+  /* --- Apply the demotion.  The real slot is assigned by the caller. --- */
+  ls_iv->r0 = -1;
+  ls_iv->stack_location = DEMOTE_PENDING_SLOT;
+  ir_iv->allocation.r0 = PREG_SPILLED | PREG_REG_NONE;
+  ir_iv->allocation.r1 = PREG_NONE;
+  ir_iv->allocation.offset = DEMOTE_PENDING_SLOT;
+
+  /* No other interval claims r over [start, end] (checked above), so the whole
+   * window can be released unconditionally. */
+  if (ls->live_regs_by_instruction)
+  {
+    for (int j = start; j <= end && j < ls->live_regs_by_instruction_size; j++)
+      ls->live_regs_by_instruction[j] &= ~(1u << (unsigned)r);
+  }
+
+  return (int)ls_iv->vreg;
+}
+
 /* ============================================================================
  * Helper: sub-component fixup for register-pair operands used as LOAD/STORE
  * sources.  When a STACKOFF operand accesses a sub-component of a 64-bit
@@ -2106,6 +2283,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   ir->codegen_dry_insn_scratch = dry_insn_scratch;
   ir->codegen_dry_insn_saves = dry_insn_saves;
 
+  /* Vregs the phase-3 fixup demoted from a register to memory (see
+   * try_demote_scratch_conflict).  Their stack slots are carved out of the
+   * frame together with the scratch save area, after the dry run settles. */
+  int demoted_vregs[4];
+  int demoted_count = 0;
+
   /* ============================================================================
    * OPTION A: Skip dry-run for scratch-conflict-free functions
    * ============================================================================
@@ -2121,21 +2304,44 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
    *   - Branch optimizer falls back to 32-bit encodings for all branches
    *     (2 bytes wasted per branch; acceptable tradeoff).
    * ============================================================================ */
-  const int can_skip_dry_run =
+  /* The dry run used to have one consumer — scratch accounting — so it was
+   * skipped whenever enough registers were provably free that no scratch push
+   * could occur.  Forward-branch narrowing is a second consumer: it needs the
+   * rehearsal's address map to size a branch whose target is not emitted yet.
+   * Skipping costs 2 bytes per forward branch, which measured at ~2% of .text
+   * across the torture corpus, against no measurable compile-time saving (the
+   * dry passes emit no bytes).  So any function with a forward branch runs
+   * them; straight-line functions keep the old fast path. */
+  int has_forward_branch = 0;
+  for (int bi = 0; bi < ir->next_instruction_index && !has_forward_branch; bi++)
+  {
+    IRQuadCompact *bq = &ir->compact_instructions[bi];
+    if (bq->op != TCCIR_OP_JUMP && bq->op != TCCIR_OP_JUMPIF)
+      continue;
+    IROperand bdest = tcc_ir_op_get_dest(ir, bq);
+    if (irop_is_none(bdest))
+      continue;
+    if ((int)bdest.u.imm32 > bi)
+      has_forward_branch = 1;
+  }
+
+  int can_skip_dry_run =
+      !has_forward_branch &&
       __builtin_popcountll(ir->ls.dirty_registers) <= (unsigned)(tcc_state->registers_for_allocator - 2) &&
       __builtin_popcountll(ir->ls.dirty_float_registers) <= (unsigned)(tcc_state->float_registers_for_allocator - 2);
 
   if (can_skip_dry_run)
   {
-    /* When FP is omitted and the dry run is skipped, allocate a safety-net
-     * scratch save area.  Even with few dirty registers, exclude_regs can
-     * make all free registers unavailable for scratch, forcing a PUSH that
-     * would break SP-relative addressing.  The area costs only 8 bytes of
-     * stack and allows get_scratch_reg_with_save() to use STR/LDR.
-     *
-     * Skip when the function has no SP-relative accesses at all: no locals,
-     * no spills, no outgoing args (stack_size == 0), AND no stack-passed
-     * parameters (whose offsets are also SP-relative via offset_to_args). */
+    /* When FP is omitted and the dry run is skipped, get_scratch_reg_with_save()
+     * has no reserved save area, and a PUSH fallback would move SP under
+     * SP-relative addressing.  The old answer was a conservative 16-byte
+     * reservation whenever a scratch-capable op or a stack param was present —
+     * measured at 367 corpus functions carrying a fully-dead frame (the saves
+     * almost never happen).  New answer: those functions run the dry-run
+     * passes instead, which discover the ACTUAL max scratch depth and size the
+     * area exactly (usually zero).  The dry passes emit no bytes and measured
+     * no compile-time cost when forward-branch functions were routed through
+     * them; straight-line scratch-free functions still take the fast path. */
     int has_stack_params = 0;
     for (int p = 0; p < ir->next_parameter; p++)
     {
@@ -2145,7 +2351,15 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         break;
       }
     }
-    if (!tcc_state->need_frame_pointer && !tcc_state->force_frame_pointer && (stack_size > 0 || has_stack_params))
+    /* A nested-call save reservation on this path is sized purely from the
+     * over-approximated static liveness; the dry run sizes it exactly and
+     * usually to zero.  Demote those functions too. */
+    if (!tcc_state->need_frame_pointer && !tcc_state->func_dynamic_sp &&
+        ir->call_nested_save_size > 0)
+      can_skip_dry_run = 0;
+
+    if (can_skip_dry_run &&
+        !tcc_state->need_frame_pointer && !tcc_state->force_frame_pointer && (stack_size > 0 || has_stack_params))
     {
       /* Scratch save area is a safety net for get_scratch_reg_with_save()
        * paths that PUSH/STR into the area when no free register is found.
@@ -2226,44 +2440,26 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         might_need_scratch = 1;
 
       if (might_need_scratch)
-      {
-        ir->scratch_save_size = 16; /* 4 slots — 64-bit ops on 32-bit ARM can need 3+ simultaneous scratch saves */
-        loc -= ir->scratch_save_size;
-        /* The outgoing call-arg area must stay at the very bottom of the
-         * frame (stack args are stored at literal [SP, #stack_off]), and the
-         * nested-call save area (R0-R3/R9 saves around calls) is addressed
-         * literally at [SP + call_outgoing_size + n*4] directly above it.
-         * The scratch area must therefore sit ABOVE BOTH: putting it lower
-         * maps scratch saves onto already-written argument slots or onto the
-         * saved R9/GOT base (restoring r9 = scratch garbage after the call). */
-        if (ir->call_outgoing_size > 0 || ir->call_nested_save_size > 0)
-        {
-          ir->call_outgoing_base = loc;
-          ir->call_nested_save_base = loc + ir->call_outgoing_size;
-          ir->scratch_save_base = loc + ir->call_outgoing_size + ir->call_nested_save_size;
-        }
-        else
-        {
-          ir->scratch_save_base = loc;
-        }
-        stack_size = (-loc + 7) & ~7;
-      }
+        can_skip_dry_run = 0; /* dry run sizes the scratch area exactly */
     }
 
-    /* Mirror the dry-run finalisation: init branch opt (sets 32-bit fallback),
-     * reset scratch/spill/fp state, then emit prologue immediately. */
-    tcc_gen_machine_branch_opt_init();
-    tcc_gen_machine_reset_scratch_state();
-    tcc_ir_spill_cache_clear(&ir->spill_cache);
-    tcc_ir_opt_fp_cache_clear(ir);
-    /* Pre-patch allocations for FUNCPARAMVAL fusion, then trim ghost
-     * callee-saved registers from dirty_registers before prologue. */
-    ir_codegen_pre_patch_funcparam_allocations(ir);
-    ir_codegen_recompute_dirty_from_allocations(ir);
-    if (!ir->naked)
-      tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size, extra_prologue_regs);
-    if (!ir->naked)
-      tcc_debug_prolog_epilog(tcc_state, 0);
+    if (can_skip_dry_run)
+    {
+      /* Mirror the dry-run finalisation: init branch opt (sets 32-bit fallback),
+       * reset scratch/spill/fp state, then emit prologue immediately. */
+      tcc_gen_machine_branch_opt_init();
+      tcc_gen_machine_reset_scratch_state();
+      tcc_ir_spill_cache_clear(&ir->spill_cache);
+      tcc_ir_opt_fp_cache_clear(ir);
+      /* Pre-patch allocations for FUNCPARAMVAL fusion, then trim ghost
+       * callee-saved registers from dirty_registers before prologue. */
+      ir_codegen_pre_patch_funcparam_allocations(ir);
+      ir_codegen_recompute_dirty_from_allocations(ir);
+      if (!ir->naked)
+        tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size, extra_prologue_regs);
+      if (!ir->naked)
+        tcc_debug_prolog_epilog(tcc_state, 0);
+    }
   }
 
   /* ============================================================================
@@ -2289,8 +2485,14 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   ir->codegen_mop_cache = mop_cache;
   int use_mop_cache = 0;
 
-  const int pass_start = can_skip_dry_run ? 1 : 0;
+  const int pass_start = can_skip_dry_run ? 2 : 0;
   uint32_t *cbz_dry_mapping = NULL;
+  uint16_t *dry_pool_entries = NULL;
+  if (ir->next_instruction_index > 0)
+  {
+    dry_pool_entries = tcc_mallocz(ir->next_instruction_index * sizeof(uint16_t));
+    ir->codegen_dry_pool_entries = dry_pool_entries;
+  }
 
   /* Branch-target reset map for the materialisation cache (imm_cache).
    *
@@ -2343,34 +2545,40 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       memset(branch_target_reset, 1, (size_t)ir->next_instruction_index);
   }
 
-  for (int pass = pass_start; pass < 2; pass++)
+  /* Pass 0 discovery (dry), pass 1 rehearsal (dry), pass 2 real.
+   *
+   * Pass 0 is what it always was: it discovers scratch pushes, LR usage and the
+   * scratch save area, and its finalisation reassigns registers and resizes the
+   * frame — so the code pass 0 lays out is NOT the code the real pass emits.
+   *
+   * Pass 1 reruns the same loop AFTER all of that has settled, from the same
+   * `ind` the real pass starts at and with the same register assignments, so
+   * its address map is a faithful model of the real layout. */
+  for (int pass = pass_start; pass < 3; pass++)
   {
-    const int is_dry_run = (pass == 0);
+    const int is_dry_run = (pass < 2);
+    const int is_rehearsal = (pass == 1);
     int codegen_skip_cmp = -1;
     int codegen_skip_select = -1; /* SUBS+IT peephole: skip this SELECT (CMP already emitted SUBS+IT+MOVNE in its slot). */
     int codegen_cbz_reg = -1;    /* pending CBZ: physical register for compare */
     int codegen_cbz_nonzero = 0; /* pending CBZ: 0=CBZ (EQ), 1=CBNZ (NE) */
     /* CBZ/CBNZ peephole: fuse `CMP rN,#0; JUMPIF EQ/NE` into a single 16-bit
-     * CBZ/CBNZ.  DISABLED — it is unsound and crashes the backend.
+     * CBZ/CBNZ.
      *
-     * CBZ/CBNZ are forward-only with a 0..126-byte range, and the peephole
-     * commits the 2-byte encoding irrevocably while only ESTIMATING the forward
-     * distance (the target is not yet emitted in the single forward real pass).
-     * Both estimators are unsound:
-     *   - can_skip_dry_run path: `ir_gap*10 + pending_pool_size <= 126` assumes
-     *     ~10 bytes/IR-op, but a single op can emit far more (64-bit arithmetic,
-     *     literal-pool loads, block copies), so the real distance overflows 126
-     *     (e.g. offset=166).
-     *   - dry-mapping path: distances from a NO-CBZ dry run diverge from the
-     *     real layout once literal-pool flush points shift between the passes,
-     *     producing wildly wrong (even negative) final offsets (e.g. -1192).
-     * When the real offset does not fit, th_patch_call() has no way to widen a
-     * committed 2-byte CBZ in place and aborts with
-     * "CBZ/CBNZ target out of range".  Falling back to the always-correct
-     * CMP rN,#0 + B<cond>.W (full +/-1MB range) costs only 4 bytes/branch and
-     * never crashes.  Re-enable only behind a proper iterative branch-
-     * relaxation pass that re-emits out-of-range CBZ candidates as wide. */
-    const int cbz_enabled = 0;
+     * This was disabled for a long time because both distance estimators it
+     * had were unsound.  CBZ is forward-only with a 0..126 byte range and the
+     * peephole commits the 2-byte encoding irrevocably, while the target is not
+     * emitted yet; when the real offset did not fit, th_patch_call() had no way
+     * to widen it in place and aborted.  The old estimators were an
+     * instructions-times-ten guess, and distances from the *discovery* dry run,
+     * which diverge from the real layout (that pass reassigns registers and
+     * resizes the frame afterwards).
+     *
+     * The rehearsal pass fixes exactly that: it lays the function out the way
+     * the real pass will, so tcc_gen_machine_cbz_forward_ok() can bound the real
+     * offset from both sides and reject anything a pool flush could disturb.
+     * That is the "proper branch relaxation" the old comment asked for. */
+    const int cbz_enabled = !is_dry_run && cbz_dry_mapping != NULL;
 
     /* ---- Pass-specific initialisation ---- */
     if (is_dry_run)
@@ -2378,6 +2586,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       tcc_gen_machine_dry_run_init();
       tcc_gen_machine_branch_opt_init();
       tcc_gen_machine_dry_run_start();
+      tcc_gen_machine_dry_run_set_rehearsal(is_rehearsal);
       tcc_gen_machine_reset_scratch_state();
       tcc_ir_spill_cache_clear(&ir->spill_cache);
     }
@@ -2413,6 +2622,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       g_debug_current_op = (int)cq->op;
 
       ir_to_code_mapping[i] = ind;
+
+      /* Snapshot pool pressure for can_narrow_forward_branch. */
+      if (is_rehearsal && dry_pool_entries)
+      {
+        int en = tcc_gen_machine_pool_entries_total();
+        dry_pool_entries[i] = (uint16_t)(en > 0xFFFF ? 0xFFFF : en);
+      }
 
       /* Reset the STR→LDR memory-reload cache at every IR instruction
        * boundary (it tracks memory state, which an aliasing store on a
@@ -2477,7 +2693,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   {                                                                                                                    \
     tcc_gen_machine_insn_scratch_reset();                                                                              \
     call;                                                                                                              \
-    ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);                                 \
+    ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);                                 \
   } while (0)
 
       switch (cq->op)
@@ -2562,7 +2778,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                                                                     b.dest);
                 if (fused)
                 {
-                  ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+                  ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
                   i = next_j;
                   break;
                 }
@@ -2596,20 +2812,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 int target_ir = irop_is_none(jdest) ? -1 : (int)jdest.u.imm32;
                 if (target_ir > i && target_ir < (int)ir->ir_to_code_mapping_size)
                 {
-                  int cbz_in_range = 0;
-                  if (cbz_dry_mapping)
-                  {
-                    int estimated_dist = (int)(ir_to_code_mapping[target_ir] - ind);
-                    int dry_dist = (int)(cbz_dry_mapping[target_ir] - cbz_dry_mapping[i]);
-                    cbz_in_range = (dry_dist >= 4 && dry_dist <= 126 && estimated_dist >= 0);
-                  }
-                  else
-                  {
-                    int ir_gap = target_ir - i;
-                    int est = ir_gap * 10 + tcc_gen_machine_pending_pool_size();
-                    cbz_in_range = (ir_gap >= 1 && est <= 126);
-                  }
-                  if (cbz_in_range)
+                  if (tcc_gen_machine_cbz_forward_ok(target_ir, i))
                   {
                     codegen_cbz_reg = cbz_a.src1.u.reg.r0;
                     codegen_cbz_nonzero = (ct == 0x95);
@@ -2684,7 +2887,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               int fused = tcc_gen_machine_mlal_accum_mop(a.src1, a.src2, *accum, b.dest, cq->op == TCCIR_OP_SMULL);
               if (fused)
               {
-                ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+                ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
                 i = next_j;
                 break;
               }
@@ -2708,7 +2911,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                       tcc_gen_machine_mlal_accum_mop(a.src1, a.src2, *accum, *accum, cq->op == TCCIR_OP_SMULL);
                   if (fused)
                   {
-                    ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+                    ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
                     i = store_j;
                     break;
                   }
@@ -2837,20 +3040,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 int target_ir = irop_is_none(jdest) ? -1 : (int)jdest.u.imm32;
                 if (target_ir > i && target_ir < (int)ir->ir_to_code_mapping_size)
                 {
-                  int cbz_in_range = 0;
-                  if (cbz_dry_mapping)
-                  {
-                    int estimated_dist = (int)(ir_to_code_mapping[target_ir] - ind);
-                    int dry_dist = (int)(cbz_dry_mapping[target_ir] - cbz_dry_mapping[i]);
-                    cbz_in_range = (dry_dist >= 4 && dry_dist <= 126 && estimated_dist >= 0);
-                  }
-                  else
-                  {
-                    int ir_gap = target_ir - i;
-                    int est = ir_gap * 10 + tcc_gen_machine_pending_pool_size();
-                    cbz_in_range = (ir_gap >= 1 && est <= 126);
-                  }
-                  if (cbz_in_range)
+                  if (tcc_gen_machine_cbz_forward_ok(target_ir, i))
                   {
                     codegen_cbz_reg = cbz_a.src1.u.reg.r0;
                     codegen_cbz_nonzero = (ct == 0x95); /* NE → CBNZ */
@@ -2988,6 +3178,15 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
         uint32_t params = tcc_ir_bfi_params_at(ir, cq);
         SCRATCH_WRAP(tcc_gen_machine_bfi_mop(a.src1, a.src2, a.dest, params));
+        break;
+      }
+      case TCCIR_OP_CLZ:
+      case TCCIR_OP_RBIT:
+      case TCCIR_OP_REV:
+      case TCCIR_OP_REV16:
+      {
+        MopArgs a = DECODE(.dest = 1, .src1 = 1);
+        SCRATCH_WRAP(tcc_gen_machine_bitop1_mop(a.src1, a.dest, cq->op));
         break;
       }
       case TCCIR_OP_FADD:
@@ -3230,6 +3429,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
          * existing STORE_INDEXED-only peephole misses the pair. */
         if (a.dest.kind == MACH_OP_REG && a.dest.needs_deref &&
             a.src1.kind == MACH_OP_REG && !a.src1.is_64bit && !a.src1.needs_deref &&
+            !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
@@ -3253,6 +3453,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -3281,6 +3482,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
          * before the paired store. */
         if (a.dest.kind == MACH_OP_REG && a.dest.needs_deref &&
             a.src1.kind == MACH_OP_IMM && !a.src1.is_64bit &&
+            !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
@@ -3302,6 +3504,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -3367,6 +3570,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
             a.src2.kind == MACH_OP_IMM &&
             a.src1.kind == MACH_OP_REG && !a.src1.needs_deref &&
+            !a.src1.underalign_hint && !a.dest.underalign_hint &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
@@ -3384,6 +3588,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.src1.kind == MACH_OP_REG && !b.src1.needs_deref &&
+                !b.src1.underalign_hint && !b.dest.underalign_hint &&
                 (b.dest.btype == IROP_BTYPE_INT32 || b.dest.btype == IROP_BTYPE_FLOAT32) &&
                 a.src1.u.reg.r0 == b.src1.u.reg.r0)
             {
@@ -3434,6 +3639,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
             a.src2.kind == MACH_OP_IMM &&
             a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
+            !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = -1;
@@ -3492,6 +3698,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -3529,6 +3736,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
             a.src2.kind == MACH_OP_IMM &&
             a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
+            !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
@@ -3550,6 +3758,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -3753,8 +3962,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           }
           if (!is_dry_run && has_trailing_code)
           {
-            /* Pass -1 as target: return jumps go forward to the epilogue
-             * (backpatched later), so they must not be narrowed. */
+            /* Target -1 means "the epilogue", which is not an IR index.  The
+             * emitter sizes it from the rehearsal's end-of-body address. */
             int ret_branch_size = tcc_gen_machine_jump_mop(cq->op, -1, i);
             return_jump_addrs[num_return_jumps++] = ind - ret_branch_size;
           }
@@ -4017,7 +4226,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         MopArgs a = DECODE(.dest = 2, .src1 = 1);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_func_call_mop(a.src1, src2_ir, a.dest, drop_return_value, ir, i);
-        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
         tcc_ir_spill_cache_clear(&ir->spill_cache);
         if (ir->has_static_chain)
           tcc_gen_machine_restore_chain();
@@ -4155,7 +4364,38 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     }
 
     /* ---- Pass-specific finalisation ---- */
-    if (is_dry_run)
+    if (is_rehearsal)
+    {
+      /* The rehearsal exists only to produce an address map the real pass will
+       * match.  Capture it, then rewind everything the real pass redoes. */
+      tcc_gen_machine_dry_run_end();
+      tcc_gen_machine_dry_run_set_rehearsal(0);
+
+      if (cbz_dry_mapping)
+        tcc_free(cbz_dry_mapping);
+      cbz_dry_mapping = tcc_malloc(ir->ir_to_code_mapping_size * sizeof(uint32_t));
+      ir->codegen_cbz_dry_mapping = cbz_dry_mapping;
+      memcpy(cbz_dry_mapping, ir_to_code_mapping, ir->ir_to_code_mapping_size * sizeof(uint32_t));
+      ir->codegen_rehearsal_end = (uint32_t)ind;
+
+      ind = saved_ind;
+      loc = saved_loc;
+      ir->call_outgoing_base = saved_call_outgoing_base;
+      ir->call_nested_save_base = saved_call_nested_save_base;
+      ir->codegen_instruction_idx = saved_codegen_idx;
+
+      tcc_gen_machine_reset_scratch_state();
+      tcc_ir_spill_cache_clear(&ir->spill_cache);
+      tcc_ir_opt_fp_cache_clear(ir);
+      /* Both passes must START from the same backend cache state or the
+       * rehearsal is not a model of the real pass.  dry_run_init/start reset
+       * the MOV-equivalence and STR->LDR caches before each dry pass; nothing
+       * reset them before the real pass, so it used to inherit the dry pass's
+       * equivalences and could elide a `mov` that is actually needed
+       * (tests2/25_quicksort::partition dropped `mov r4, r0` at -O2). */
+      tcc_gen_machine_mov_coalesce_reset();
+    }
+    else if (is_dry_run)
     {
       /* End dry-run and analyze results */
       tcc_gen_machine_dry_run_end();
@@ -4197,11 +4437,25 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * one avoids the push/pop entirely AND keeps instructions compact. */
       {
         int any_fixup = 0;
+        /* Snapshot the pre-fixup live map: an instruction is only "fixed" once
+         * we have actually freed as many registers at it as the dry run had to
+         * save.  Counting "some R0-R3 is free" instead under-counts whenever
+         * one instruction borrows two scratch registers (a global's address
+         * plus the value) and leaves the second borrow paying save/restore. */
+        uint32_t *orig_live = NULL;
+        int orig_live_n = 0;
+        if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
+        {
+          orig_live_n = ir->ls.live_regs_by_instruction_size;
+          orig_live = tcc_malloc((size_t)orig_live_n * sizeof(uint32_t));
+          memcpy(orig_live, ir->ls.live_regs_by_instruction, (size_t)orig_live_n * sizeof(uint32_t));
+        }
         for (int i = 0; i < ir->next_instruction_index; i++)
         {
           uint16_t saves = dry_insn_saves[i];
           if (!saves)
             continue;
+          const int need = __builtin_popcount(saves);
           int all_fixed = 1;
           while (saves)
           {
@@ -4219,9 +4473,17 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                * can be freed, tcc_ls_find_free_scratch_reg will find it during
                * the real run and no push/pop will be needed. */
               int alt_fixed = 0;
+              int enough_freed = 0;
               if (ir->ls.live_regs_by_instruction && i < ir->ls.live_regs_by_instruction_size)
               {
                 uint32_t live = ir->ls.live_regs_by_instruction[i];
+                /* Has the fixup already handed this instruction as many extra
+                 * registers as the dry run had to save?  "Some R0-R3 is free"
+                 * is not the same question: an instruction that borrows two
+                 * scratch registers (a global's address plus the value) still
+                 * pays save/restore for the second one. */
+                enough_freed = (orig_live && i < orig_live_n &&
+                                ir_codegen_regs_freed_at(orig_live[i], live) >= need);
                 /* If any R0-R3 is already free, the real run will use it. */
                 if ((~live & 0xFu) & ~(1u << r))
                 {
@@ -4243,6 +4505,20 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                   }
                 }
               }
+              /* Nothing could be moved (or not enough of it): spill the
+               * blocker so its register becomes a permanently free scratch
+               * over the blocked window. */
+              if (!enough_freed && demoted_count < (int)(sizeof(demoted_vregs) / sizeof(demoted_vregs[0])))
+              {
+                int dv = try_demote_scratch_conflict(ir, r, i, dry_insn_saves, dry_insn_scratch,
+                                                     ir->next_instruction_index);
+                if (dv >= 0)
+                {
+                  demoted_vregs[demoted_count++] = dv;
+                  any_fixup = 1;
+                  alt_fixed = 1;
+                }
+              }
               if (!alt_fixed)
                 all_fixed = 0;
             }
@@ -4250,6 +4526,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           if (all_fixed)
             dry_insn_scratch[i] = 0;
         }
+        if (orig_live)
+          tcc_free(orig_live);
         if (any_fixup)
         {
           tcc_ls_reset_scratch_cache(&ir->ls);
@@ -4259,6 +4537,30 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           ir->codegen_mop_cache = NULL;
         }
         use_mop_cache = (mop_cache != NULL);
+      }
+
+      /* Shrink the nested-call save area to the dry run's ACTUAL maximum.
+       * The static max_nested_save_regs sizing over-approximates from blob
+       * liveness bitmaps (311 corpus functions carried a reservation with
+       * zero stores into it).  The call-site save logic is deterministic
+       * across passes, so the dry run's per-site maximum is exact.  All
+       * frame areas below the locals shift up by the returned slack; the
+       * call sites address these areas by SIZE ([SP + outgoing], slots
+       * upward), so only loc and the two base fields need adjusting.
+       * Skipped under FP/dynamic-SP frames (FP-relative bias math). */
+      if (!tcc_state->need_frame_pointer && !tcc_state->func_dynamic_sp &&
+          ir->call_nested_save_size > 0)
+      {
+        int actual = tcc_gen_machine_dry_run_get_max_nested_saves() * 4;
+        if (actual < ir->call_nested_save_size)
+        {
+          int delta = ir->call_nested_save_size - actual;
+          ir->call_nested_save_size = actual;
+          loc += delta;
+          ir->call_nested_save_base += delta;
+          ir->call_outgoing_base += delta;
+          stack_size = (-loc + 7) & ~7;
+        }
       }
 
       /* Allocate scratch save area if the dry run detected scratch pushes.
@@ -4315,6 +4617,44 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         }
       }
 
+      /* Home slots for the vregs the phase-3 fixup demoted to memory.  Carved
+       * out the same way as the scratch save area: the frame grows downward
+       * and the areas addressed by literal SP offsets slide with it. */
+      if (demoted_count > 0)
+      {
+        int demote_size = (demoted_count * 4 + 7) & ~7;
+        loc -= demote_size;
+        int slot_base;
+        if (ir->call_outgoing_size > 0 || ir->call_nested_save_size > 0 || ir->scratch_save_size > 0)
+        {
+          ir->call_outgoing_base = loc;
+          ir->call_nested_save_base = loc + ir->call_outgoing_size;
+          ir->scratch_save_base = loc + ir->call_outgoing_size + ir->call_nested_save_size;
+          slot_base = ir->scratch_save_base + ir->scratch_save_size;
+        }
+        else
+        {
+          slot_base = loc;
+        }
+        for (int k = 0; k < demoted_count; k++)
+        {
+          int off = slot_base + k * 4;
+          IRLiveInterval *dli = tcc_ir_get_live_interval(ir, demoted_vregs[k]);
+          if (dli)
+          {
+            dli->allocation.r0 = PREG_SPILLED | PREG_REG_NONE;
+            dli->allocation.r1 = PREG_NONE;
+            dli->allocation.offset = off;
+          }
+          for (int j = 0; j < ir->ls.next_interval_index; j++)
+          {
+            if (ir->ls.intervals[j].vreg == (uint32_t)demoted_vregs[k])
+              ir->ls.intervals[j].stack_location = (uint32_t)off;
+          }
+        }
+        stack_size = (-loc + 7) & ~7;
+      }
+
       /* Reset scratch state for real pass */
       tcc_gen_machine_reset_scratch_state();
       tcc_ir_spill_cache_clear(&ir->spill_cache);
@@ -4339,6 +4679,9 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   if (cbz_dry_mapping)
     tcc_free(cbz_dry_mapping);
   ir->codegen_cbz_dry_mapping = NULL;
+  if (dry_pool_entries)
+    tcc_free(dry_pool_entries);
+  ir->codegen_dry_pool_entries = NULL;
   if (branch_target_reset)
     tcc_free(branch_target_reset);
   ir->codegen_branch_target_reset = NULL;

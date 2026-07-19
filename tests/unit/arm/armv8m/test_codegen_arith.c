@@ -423,10 +423,11 @@ UT_TEST(test_dispatch_add_agrees_across_dry_and_real_pass)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 2); /* discovery + rehearsal dry pass */
   int dry_adds = cgstub_call_count_pass("data_processing_mop", 0);
   int real_adds = cgstub_call_count_pass("data_processing_mop", 1);
-  UT_ASSERT_EQ(dry_adds, NPARAM - 1);
+  /* Two dry passes (discovery + rehearsal): each op is dispatched twice. */
+  UT_ASSERT_EQ(dry_adds, 2 * (NPARAM - 1));
   UT_ASSERT_EQ(real_adds, NPARAM - 1);
 
   tcc_ir_free(ir);
@@ -483,7 +484,7 @@ UT_TEST(test_dispatch_add_cmp_zero_jumpif_eq_fuses_into_flags_mop)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("data_processing_mop_flags"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("data_processing_mop_flags"), 3);
   UT_ASSERT_EQ(cgstub_call_count("data_processing_mop"), 0); /* fused away, not double-emitted */
   const CgStubCall *c_flags = cgstub_nth_call("data_processing_mop_flags", 0);
   UT_ASSERT(c_flags != NULL);
@@ -491,8 +492,8 @@ UT_TEST(test_dispatch_add_cmp_zero_jumpif_eq_fuses_into_flags_mop)
   UT_ASSERT_EQ(c_flags->dest_kind, MACH_OP_REG);
 
   /* The CMP is skipped (not dispatched at all); JUMPIF still dispatches
-   * normally to conditional_jump_mop. */
-  UT_ASSERT_EQ(cgstub_call_count("conditional_jump_mop"), 1);
+   * normally to conditional_jump_mop, once per pass. */
+  UT_ASSERT_EQ(cgstub_call_count("conditional_jump_mop"), 3);
 
   tcc_ir_free(ir);
   return 0;
@@ -528,7 +529,7 @@ UT_TEST(test_dispatch_sub_cmp_zero_jumpif_ne_fuses_into_flags_mop)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("data_processing_mop_flags"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("data_processing_mop_flags"), 3);
   UT_ASSERT_EQ(cgstub_call_count("data_processing_mop"), 0);
   const CgStubCall *c_flags = cgstub_nth_call("data_processing_mop_flags", 0);
   UT_ASSERT(c_flags != NULL);

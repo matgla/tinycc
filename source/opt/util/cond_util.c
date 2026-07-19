@@ -235,9 +235,11 @@ static int cmp_operand_is_unsigned_int(IROperand op)
 
 static int cmp_operands_unsigned_width(IROperand src1, IROperand src2)
 {
-  return (irop_get_tag(src1) == IROP_TAG_I64 ||
-          irop_get_tag(src2) == IROP_TAG_I64 ||
-          irop_get_btype(src1) == IROP_BTYPE_INT64 ||
+  /* Width is semantic (btype), never storage: IROP_TAG_I64 on a non-INT64
+   * operand is just a pooled 32-bit constant that doesn't fit a signed imm32
+   * (same convention as fold_read_imm32), and its i64 slot may be sign- OR
+   * zero-extended depending on the producing pass. */
+  return (irop_get_btype(src1) == IROP_BTYPE_INT64 ||
           irop_get_btype(src2) == IROP_BTYPE_INT64)
              ? 64
              : 32;
@@ -261,6 +263,38 @@ static int unsigned_cond_for_cmp_operands(int cond, IROperand src1, IROperand sr
   default:
     return cond;
   }
+}
+
+/* Like evaluate_compare_condition_cmp_operands, but honours a barrel-shift
+ * annotation on the CMP: the real comparison is src1 vs (src2 SHIFT #n), so
+ * the shift must be applied to val2 before evaluating (encoding: stype=bs>>5,
+ * 1=LSL 2=LSR 3=ASR 4=ROR, amount=bs&31 — same as fold_apply_barrel).  Every
+ * CMP-fold site must use THIS entry point when it has the CMP quad in hand:
+ * evaluating the raw operand values mis-folds (int)(short) narrowing compares
+ * whose SHL16/ASR16 got fused into the CMP (fuzz seeds signed:840 in
+ * branch.c, signed:8890 in const_prop_tmp/value_tracking; tests 386/393). */
+int evaluate_compare_condition_cmp_annotated(const TCCIRState *ir, const IRQuadCompact *q,
+                                             int64_t val1, int64_t val2, int cond,
+                                             IROperand src1, IROperand src2)
+{
+  uint8_t bs = tcc_ir_barrel_shift_at(ir, q);
+  if (bs) {
+    if (irop_is_64bit(src1) || irop_is_64bit(src2))
+      return -1;
+    uint32_t m = (uint32_t)val2;
+    int amount = bs & 0x1F;
+    switch (bs >> 5) {
+    case 1: m = m << amount; break;
+    case 2: m = m >> amount; break;
+    case 3: m = (m >> amount) |
+                (((m & 0x80000000u) && amount) ? ~(0xFFFFFFFFu >> amount) : 0u);
+      break;
+    case 4: m = amount ? ((m >> amount) | (m << (32 - amount))) : m; break;
+    default: return -1;
+    }
+    val2 = (int64_t)(int32_t)m;
+  }
+  return evaluate_compare_condition_cmp_operands(val1, val2, cond, src1, src2);
 }
 
 int evaluate_compare_condition_cmp_operands(int64_t val1, int64_t val2, int cond,

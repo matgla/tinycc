@@ -56,6 +56,40 @@ static int64_t ir_opt_fit_const_to_operand(int64_t val, IROperand op)
   }
 }
 
+/* Whether substituting `val` through `op` keeps its value.
+ *
+ * Fitting the constant to the operand's declared width is right when that width
+ * describes the access -- a char slot really does hold 8 bits.  It is wrong when
+ * the width is merely inherited: a `?:` whose arms are a wide constant and a
+ * narrow variable produces ONE merge temp, and it can pick up the narrow arm's
+ * btype while carrying the wide arm's value.  Folding through that operand
+ * truncated 1767579187 to 51 (agg_deep fuzz seed 2343, and its short/16-bit
+ * variant).  A mismatch means the operand's width is not describing this value,
+ * so leave the instruction alone rather than substitute a different number.
+ *
+ * The INT32 width needs splitting apart, because the fit does two unrelated
+ * jobs there -- see the comment on that branch.  Treating it as one and
+ * rejecting every INT32 mismatch made 57 longlong/combo_num seeds diverge. */
+static int cpt_const_survives_operand(int64_t val, IROperand op)
+{
+  int bt = irop_get_btype(op);
+  if (bt == IROP_BTYPE_INT8 || bt == IROP_BTYPE_INT16)
+    return ir_opt_fit_const_to_operand(val, op) == val;
+  if (bt == IROP_BTYPE_INT32) {
+    /* Two different things wear the INT32 fit.  Dropping bits above 32 is the
+     * intended 64->32 lowering and the longlong paths depend on it, so a value
+     * that genuinely needs more than 32 bits is left alone.  Re-reading the
+     * SAME 32 bits under the other signedness is not a lowering, it is a
+     * different number, and recording that is what the sub-word case above
+     * does wrong one width up. */
+    int fits32 = (val == (int64_t)(int32_t)val || val == (int64_t)(uint32_t)val);
+    if (!fits32)
+      return 1;
+    return ir_opt_fit_const_to_operand(val, op) == val;
+  }
+  return 1;
+}
+
 static IROperand cpt_make_const(TCCIRState *ir, int64_t val, int btype)
 {
   if (val == (int32_t)val)
@@ -196,6 +230,8 @@ static int cpt_propagate_src1(CPTCtx *c, int i)
     }
   }
   int btype = irop_get_btype(src1);
+  if (!cpt_const_survives_operand(prop_val, src1))
+    return 0;
   prop_val = ir_opt_fit_const_to_operand(prop_val, src1);
   IROperand new_src1 = cpt_make_const(ir, prop_val, btype);
   new_src1.is_unsigned = src1.is_unsigned;
@@ -210,12 +246,20 @@ static int cpt_propagate_src2(CPTCtx *c, int i)
   IRQuadCompact *q = &ir->compact_instructions[i];
   if (!irop_config[q->op].has_src2)
     return 0;
+  /* src2 may carry a fused barrel shift (dest = src1 OP (src2 SHIFT #n)).
+   * Substituting a constant folds the UN-shifted value — codegen has no
+   * imm-with-shift encoding, and downstream binop folds ignore the
+   * annotation entirely (269/281 fuzz checksums). */
+  if (tcc_ir_barrel_shift_at(ir, q))
+    return 0;
   IROperand src2 = tcc_ir_op_get_src2(ir, q);
   int64_t prop_val;
   if (!cpt_operand_const(c, src2, &prop_val))
     return 0;
   LOG_IR_GEN("OPTIMIZE: const propagate vreg %d = %lld to src2 at i=%d", irop_get_vreg(src2), (long long)prop_val, i);
   int btype = irop_get_btype(src2);
+  if (!cpt_const_survives_operand(prop_val, src2))
+    return 0;
   int64_t val = ir_opt_fit_const_to_operand(prop_val, src2);
   /* widen narrow const to zero-extended INT64 for INT64 bitwise ops so codegen doesn't sign-extend into the high reg */
   if (irop_get_btype(tcc_ir_op_get_src1(ir, q)) == IROP_BTYPE_INT64 && btype != IROP_BTYPE_INT64 &&
@@ -240,6 +284,9 @@ static int cpt_try_fold_binop(CPTCtx *c, int i)
   IROperand fs1 = tcc_ir_op_get_src1(ir, q);
   IROperand fs2 = tcc_ir_op_get_src2(ir, q);
   if (!irop_is_immediate(fs1) || !irop_is_immediate(fs2))
+    return 0;
+  /* A barrel-shift annotation means the real RHS is (src2 SHIFT #n). */
+  if (tcc_ir_barrel_shift_at(ir, q))
     return 0;
   int64_t v1 = irop_get_imm64_ex(ir, fs1);
   int64_t v2 = irop_get_imm64_ex(ir, fs2);
@@ -384,7 +431,7 @@ static int cpt_try_cmp_setif_fold(CPTCtx *c, int i)
   int64_t cv2 = irop_get_imm64_ex(ir, cs2);
   IROperand setif_src1 = tcc_ir_op_get_src1(ir, next_q);
   int cond = (int)irop_get_imm64_ex(ir, setif_src1);
-  int result = evaluate_compare_condition_cmp_operands(cv1, cv2, cond, cs1, cs2);
+  int result = evaluate_compare_condition_cmp_annotated(ir, q, cv1, cv2, cond, cs1, cs2);
   if (result < 0)
     return 0;
   q->op = TCCIR_OP_NOP;
@@ -477,7 +524,8 @@ static void cpt_track_tmp_def(CPTCtx *c, int i)
   if (pos > c->max_tmp_pos)
     return;
   IROperand cur_src1 = tcc_ir_op_get_src1(ir, q);
-  if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_CVT_FTOF) && irop_is_immediate(cur_src1))
+  if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_CVT_FTOF) && irop_is_immediate(cur_src1) &&
+      cpt_const_survives_operand(irop_get_imm64_ex(ir, cur_src1), dest))
   {
     c->tmp_info[pos].gen = c->current_gen;
     c->tmp_info[pos].value = ir_opt_fit_const_to_operand(irop_get_imm64_ex(ir, cur_src1), dest);
@@ -503,7 +551,8 @@ static void cpt_track_var_def(CPTCtx *c, int i)
   if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_STORE) && !dest.is_lval)
   {
     IROperand cur_src1 = tcc_ir_op_get_src1(ir, q);
-    if (irop_is_immediate(cur_src1) && !cur_src1.is_sym)
+    if (irop_is_immediate(cur_src1) && !cur_src1.is_sym &&
+        cpt_const_survives_operand(irop_get_imm64_ex(ir, cur_src1), dest))
     {
       c->var_info[pos].gen = c->current_gen;
       c->var_info[pos].value = ir_opt_fit_const_to_operand(irop_get_imm64_ex(ir, cur_src1), dest);
@@ -604,10 +653,7 @@ int tcc_ir_opt_const_prop_tmp_core(TCCIRState *ir)
 int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
 {
   if (tcc_ir_opt_pass_disabled("const_prop_tmp")) return 0;
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on) return tcc_ir_opt_const_prop_tmp_core(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_const_prop_tmp_core(ir);
-  tcc_pass_timing_add("const_prop_tmp", tcc_pass_clk_us() - _t);
-  return _r;
+  int r;
+  TCC_PASS_TIMED(r, "const_prop_tmp", tcc_ir_opt_const_prop_tmp_core(ir));
+  return r;
 }

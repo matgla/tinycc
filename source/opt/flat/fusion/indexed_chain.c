@@ -82,6 +82,9 @@ OPT_GEN_FLAT(indexed_chain, TCCIR_OP_LOAD_INDEXED)
 
   new_base.is_lval = 0;
   new_base.btype = base_op.btype;
+  /* The chained base addresses the same object: keep the packed-access mark
+   * so the 64-bit lowering stays off LDRD/STRD. */
+  new_base.aux |= base_op.aux & IROP_AUX_UNDERALIGN;
   ir->iroperand_pool[q->operand_base + base_slot] = new_base;
   ir->iroperand_pool[q->operand_base + 2] = irop_make_imm32(0, (int32_t)imm_total, IROP_BTYPE_INT32);
 

@@ -34,7 +34,25 @@ OPT_GEN_SSA(cprop_assign, TCCIR_OP_ASSIGN) {
   int32_t src_vr = vreg(src1);
 
   IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, dest_vr);
-  if (vi && vi->def_count > 1)
+  if (ssa_opt_def_total(vi) > 1)
+    return 0;
+
+  /* The SOURCE must be single-def too.  A TEMP is not automatically SSA: an
+   * in-place `T <-- x [STORE]` (what a register-promoted local's assignment
+   * lowers to) is a second def under the SAME name, so forwarding src into a
+   * use that sits AFTER that store hands out the new value where the old one
+   * was copied.  ptr fuzz seed 2513:
+   *     T17 <-- #a [ASSIGN]      u5 = a
+   *     T3  <-- T17 [ASSIGN]     u4 = u5      (copy of the OLD value)
+   *     T17 <-- #b [STORE]       u5 = b
+   *     PARAM1 T3                            -> rewritten to T17, i.e. #b.
+   *
+   * Both tests go through ssa_opt_def_total, not def_count: when the first def
+   * is a PHI (the same local written on one arm of an if) def_count is 1 even
+   * though the STORE makes two, and the plain check let exactly this shape
+   * through a second time. */
+  IRSSAVregInfo *svi = ssa_opt_vinfo(ctx, src_vr);
+  if (ssa_opt_def_total(svi) > 1)
     return 0;
 
   /* dest feeding a phi: folding it away reintroduces the lost-copy problem at
@@ -1317,12 +1335,18 @@ int ssa_opt_var_const_fold(IRSSAOptCtx *ctx)
 
 /* ssa:const_prop_tmp — SSA-time analog of the flat block-local const_prop_tmp,
  * reusing the flat core (tcc_ir_opt_const_prop_tmp_core) as the single source of
- * truth.  Only substitutes immediates and folds/NOPs individual ops, never moves
- * defs across blocks, so it is safe on SSA IR; rebuild use-def chains on change. */
+ * truth.  It never moves defs across blocks, but it DOES fold decided branches
+ * (cpt_try_softfp_cmp_fold rewrites a constant __aeabi_c[df]cmp + JUMPIF into
+ * JUMP/NOP), so like every branch-folding SSA pass it must prune phi operands
+ * whose pred block became unreachable — otherwise ra_resolve_phis later emits
+ * the dead arm's copy onto the surviving straight-line path, clobbering the
+ * live value (fuzz seed fp_round:10, test 383). */
 int ssa_opt_const_prop_tmp(IRSSAOptCtx *ctx)
 {
   int changes = tcc_ir_opt_const_prop_tmp_core(ctx->ir);
-  if (changes)
+  if (changes) {
     tcc_ir_ssa_opt_rebuild(ctx);
+    changes += ssa_opt_prune_unreachable_phis(ctx);
+  }
   return changes;
 }

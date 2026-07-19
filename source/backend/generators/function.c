@@ -69,6 +69,44 @@ static void func_vla_arg(Sym *sym);
 static int  ir_inline_stash_eligible(Sym *sym, TCCIRState *ir);
 static void ir_inline_stash_add(TCCState *s1, Sym *sym, TCCIRState *ir);
 
+/* A `V` operand (VAR vreg, is_local + is_lval) names a register-resident scalar;
+ * every other lval — a stack slot, a symbol, a pointer deref — is real memory,
+ * and `is_local && !is_lval` is the address-of form.  Mirrors the split
+ * lcs_span_has_memory applies, so this predicts what it will accept. */
+static int ir_operand_is_memory(IROperand op)
+{
+  if (op.is_sym || op.is_llocal)
+    return op.is_lval || op.is_local;
+  int32_t vr = irop_get_vreg(op);
+  int is_var = (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR);
+  if (op.is_lval)
+    return !(op.is_local && is_var);
+  return op.is_local;
+}
+
+/* Whether the optimized body works purely on registers/scalars, i.e. whether a
+ * loop inside it is a candidate for constant-argument simulation. */
+static int ir_body_is_register_only(TCCIRState *ir)
+{
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC ||
+        q->op == TCCIR_OP_BLOCK_COPY)
+      return 0;
+    if (irop_config[q->op].has_dest && ir_operand_is_memory(tcc_ir_op_get_dest(ir, q)))
+      return 0;
+    if (irop_config[q->op].has_src1 && ir_operand_is_memory(tcc_ir_op_get_src1(ir, q)))
+      return 0;
+    if (irop_config[q->op].has_src2 && ir_operand_is_memory(tcc_ir_op_get_src2(ir, q)))
+      return 0;
+  }
+  return 1;
+}
+
 void gen_function(Sym *sym)
 {
   struct scope f = {0};
@@ -116,6 +154,8 @@ void gen_function(Sym *sym)
   LOG_IR_GEN("Generating IR for function %s", funcname);
   ir = tcc_ir_alloc();
   tcc_state->ir = ir;
+  /* Vector-expression recipes index this function's IR; start clean. */
+  gen_op_vector_reset();
   ir->naked = sym->a.naked;
   ir->is_variadic = func_var;
 
@@ -426,9 +466,13 @@ void gen_function(Sym *sym)
   {
     int call_ops = 0;
     int has_aggr_copy = 0;
+    int has_loop = 0;
+    int real_ops = 0;
     for (int ii = 0; ii < ir->next_instruction_index; ii++)
     {
       int op = ir->compact_instructions[ii].op;
+      if (op != TCCIR_OP_NOP)
+        real_ops++;
       if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
       {
         call_ops++;
@@ -436,6 +480,12 @@ void gen_function(Sym *sym)
         const char *cn = cs ? get_tok_str(cs->v, NULL) : NULL;
         if (cn && (strstr(cn, "memmove") || strstr(cn, "memcpy")))
           has_aggr_copy = 1;
+      }
+      if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
+      {
+        IROperand jd = tcc_ir_op_get_dest(ir, &ir->compact_instructions[ii]);
+        if ((int)irop_get_imm64_ex(ir, jd) <= ii)
+          has_loop = 1;
       }
     }
     /* Naturally-small functions (short token body) whose post-opt IR grew
@@ -466,11 +516,29 @@ void gen_function(Sym *sym)
      * inlined and have their standalone copy dropped by --gc-sections.) */
     int nonstatic_bloat =
         !(sym->type.t & VT_STATIC) && has_aggr_copy && ir->next_instruction_index > 8;
+    /* A body that keeps a loop after optimization is dominated by its loop at
+     * runtime, so inlining buys only the call overhead while duplicating the
+     * loop at every site — GCC keeps such helpers out of line.  The slot-count
+     * gate below used to catch these by accident (unfused 64-bit and indexed
+     * code was fat); ldrd/strd pairing shrank pr38048-2's foo from 27 slots to
+     * 24 with identical real ops and flipped it straight through the `> 24`
+     * boundary, inlining loop bodies into main in pr38048-2 (+23), pr53163
+     * (+47), 258_derived_iv_strength_reduction (+32) and builtin-bitops-1
+     * (+183).  Count real ops, not slots, so residual NOPs cannot decide.
+     * The ≤12 floor keeps tiny loop helpers inlinable for the constant-arg
+     * path, where loop_const_sim can still fold the whole thing. */
+    int loop_body = has_loop && real_ops > 12;
     if (call_ops >= 3 || (!naturally_small && ir->next_instruction_index > 24) ||
-        nonstatic_bloat)
+        nonstatic_bloat || loop_body)
     {
       sym->type.ref->f.func_auto_inline = 0;
     }
+    /* A loop the body keeps is only worth duplicating at an all-constant call
+     * site if ssa:loop_const_sim can then collapse it, which it only does for
+     * register-only regions.  Record that here, where the optimized IR is in
+     * hand, so tccgen keeps the token stream for exactly those helpers. */
+    if (loop_body && ir_body_is_register_only(ir))
+      sym->type.ref->f.func_const_arg_loop = 1;
   }
 
   /* Mark surviving auto-inline candidates whose body keeps a non-trivial,

@@ -1,25 +1,37 @@
 #!/usr/bin/env python3
 """
-asan_sweep.py — corpus enumeration + sweep driver + dedup/report for the
-tinycc ASAN/UBSan bug-hunting sweep (Phase BH, Track 1).
+asan_sweep.py — Phase BH / Track 1 ASAN+UBSan corpus sweep for tinycc.
 
-This is a *helper* invoked by scripts/asan_sweep.sh; the bash script remains the
-entry point.  It exists because robust corpus enumeration (gcc-torture builtins
-source expansion, shardable file lists), per-file compile invocation, sanitizer
-signature detection and stack-frame dedup are far cleaner in Python than in bash.
+The cross compiler armv8m-tcc is built with AddressSanitizer ON by default
+(config.mak: -fsanitize=address), so compiling any corpus file *with* it makes
+tcc report ASAN/LeakSanitizer errors on its OWN heap bugs.  The ORACLE is the
+sanitizer output printed by tcc, not the compile exit code: a plain
+"unsupported feature" compile error is NOT a hit.
 
-The oracle is the sanitizer output printed by `armv8m-tcc` (built with
--fsanitize=address by default).  An ordinary "unsupported feature" compile error
-(nonzero exit, no sanitizer line) is NOT a hit; only a real sanitizer report is.
+This sweeps the corpus (gcc-torture compile+execute, tests2, ir_tests) across
+-O0/-O1/-O2, greps stderr for sanitizer signatures, and dedups hits by the top
+meaningful backtrace frames so one bug across many files collapses to one entry.
 
-Test/tooling only.  Does not modify production code or config.mak.
+Test/tooling only.  Does NOT modify production code.  --with-ubsan builds a
+SEPARATE compiler out-of-band (config.mak is saved+restored) so the shared
+armv8m-tcc other agents depend on is never mutated.
+
+Examples:
+  # full sweep, all corpora, all O-levels:
+  scripts/asan_sweep.py --corpus all
+  # one shard of gcc-torture for a parallel fleet:
+  scripts/asan_sweep.py --corpus gcc-torture --shard 3/40
+  # quick smoke:
+  scripts/asan_sweep.py --corpus tests2 --limit 30
 """
 
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -208,8 +220,80 @@ def run_one(compiler, include_flags, abi_flags, opt, primary, extras, timeout):
     return rc, stderr
 
 
+# --------------------------------------------------------------------------
+# Harness flags
+# --------------------------------------------------------------------------
+# Reconstruct the EXACT include/ABI flags the real torture harness passes when
+# CC is armv8m-tcc.  Mirrors tests/ir_tests/qemu/mps2-an505/Makefile:
+#   GCC_ABI_FLAGS = -mcpu=cortex-m33 -mthumb -mfloat-abi=soft
+#   CFLAGS += -nostdlib -fvisibility=hidden $(GCC_ABI_FLAGS) -ffunction-sections
+#   (armv8m-tcc branch) -I libc_includes -I libc_imports -I newlib
+#                       -I $(ARM_SYSROOT)/include -I $(TCC_PATH)/include
+
+GCC_ABI_FLAGS = ["-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft"]
+DEFAULT_ABI_FLAGS = ["-nostdlib", "-fvisibility=hidden",
+                     *GCC_ABI_FLAGS, "-ffunction-sections"]
+
+
+def arm_sysroot() -> str:
+    try:
+        proc = subprocess.run(
+            ["arm-none-eabi-gcc", *GCC_ABI_FLAGS, "--print-sysroot"],
+            capture_output=True, text=True,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "/usr/arm-none-eabi"
+
+
+def default_include_flags() -> list:
+    libc = (REPO / "tests" / "ir_tests" / "libc_includes").resolve()
+    imports = (REPO / "tests" / "ir_tests" / "libc_imports").resolve()
+    return [
+        f"-I{libc}",
+        f"-I{imports}",
+        f"-I{libc / 'newlib'}",
+        f"-I{arm_sysroot()}/include",
+        f"-I{REPO / 'include'}",
+    ]
+
+
+def build_ubsan_compiler(dest_dir: Path) -> Path:
+    """Build a SEPARATE UBSan compiler out-of-band.
+
+    ./configure rewrites config.mak, so it is saved and restored around the
+    build and the shared ASAN armv8m-tcc is rebuilt afterwards -- concurrent
+    users of the tree must never see it mutated.
+    """
+    config = REPO / "config.mak"
+    backup = Path(tempfile.mkstemp(prefix="config.mak.bak.")[1])
+    shutil.copy(config, backup)
+    ubsan_tcc = dest_dir / "armv8m-tcc"
+    try:
+        subprocess.run(["./configure", "--enable-ubsan"], cwd=REPO,
+                       check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(["make", "cross"], cwd=REPO, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        shutil.copy(REPO / "armv8m-tcc", ubsan_tcc)
+    finally:
+        shutil.copy(backup, config)
+        backup.unlink(missing_ok=True)
+        print("restored config.mak")
+        # Rebuild the shared ASAN compiler so concurrent agents see it unchanged.
+        if subprocess.run(["make", "cross"], cwd=REPO,
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode != 0:
+            print("warning: could not rebuild shared ASAN armv8m-tcc; run 'make cross'",
+                  file=sys.stderr)
+    return ubsan_tcc
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--compiler", default=str(REPO / "armv8m-tcc"),
                     help="path to the cross compiler (ASAN-built armv8m-tcc)")
     ap.add_argument("--corpus", default="all",
@@ -230,6 +314,9 @@ def main():
                     help="write the deduped report here (also printed to stdout)")
     ap.add_argument("--list-hits-raw", default=None,
                     help="append every raw hit line (file|olevel|key) here")
+    ap.add_argument("--with-ubsan", action="store_true",
+                    help="ALSO build an out-of-band UBSan compiler and sweep with it "
+                         "(rebuilds into a temp dir, restoring config.mak; SLOW)")
     ap.add_argument("--progress-every", type=int, default=100)
     args = ap.parse_args()
 
@@ -242,17 +329,46 @@ def main():
             return 2
 
     olevels = [o.strip() for o in args.olevels.split(",") if o.strip()]
-    include_flags = args.include_flags.split()
-    abi_flags = args.abi_flags.split()
+    # Values not supplied fall back to the flags the real harness Makefile uses.
+    include_flags = args.include_flags.split() or default_include_flags()
+    abi_flags = args.abi_flags.split() or DEFAULT_ABI_FLAGS
+
+    compiler = Path(args.compiler)
+    if not (compiler.is_file() and os.access(compiler, os.X_OK)):
+        print(f"error: compiler not found or not executable: {compiler}", file=sys.stderr)
+        print("       build it with 'make cross' first.", file=sys.stderr)
+        return 2
+
+    rc = run_sweep(compiler, "asan", args, shard, olevels, include_flags, abi_flags)
+    if rc != 0 or not args.with_ubsan:
+        return rc
+
+    print()
+    print("################################################################")
+    print("# --with-ubsan: building a SEPARATE UBSan compiler out-of-band")
+    print("# (config.mak is saved + restored; shared armv8m-tcc untouched)")
+    print("################################################################")
+    ubsan_dir = Path(tempfile.mkdtemp(prefix="asan_sweep_ubsan."))
+    try:
+        ubsan_tcc = build_ubsan_compiler(ubsan_dir)
+        rc = run_sweep(ubsan_tcc, "ubsan", args, shard, olevels, include_flags, abi_flags)
+    except subprocess.CalledProcessError:
+        print("UBSan build failed", file=sys.stderr)
+        rc = 1
+    finally:
+        shutil.rmtree(ubsan_dir, ignore_errors=True)
+    return rc
+
+
+def run_sweep(compiler, tag, args, shard, olevels, include_flags, abi_flags):
+    """Sweep one compiler over the corpus and print (optionally write) a report."""
+    print("=" * 64)
+    print(f" Sweep ({tag}): {compiler}")
+    print("=" * 64)
 
     items = enumerate_corpus(args.corpus)
     total_files = len(items)
     items = apply_shard_limit(items, shard, args.limit)
-
-    compiler = Path(args.compiler)
-    if not compiler.exists():
-        print(f"error: compiler not found: {compiler}", file=sys.stderr)
-        return 2
 
     # bug_key -> dict(summary, key_frames, count, repros=[(file, olevel)])
     bugs = {}
@@ -328,7 +444,12 @@ def main():
     print(report)
 
     if args.report:
-        Path(args.report).write_text(report)
+        report_path = Path(args.report)
+        if tag == "ubsan":
+            # Keep the ASAN report intact when both sweeps run in one invocation.
+            report_path = report_path.with_name(
+                report_path.stem + ".ubsan" + (report_path.suffix or ".txt"))
+        report_path.write_text(report)
     if args.list_hits_raw and raw_hits:
         with open(args.list_hits_raw, "a") as f:
             for h in raw_hits:

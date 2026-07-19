@@ -237,6 +237,9 @@ void tcc_ir_free(TCCIRState *ir)
   ir->codegen_mop_cache = NULL;
   tcc_free(ir->codegen_cbz_dry_mapping);
   ir->codegen_cbz_dry_mapping = NULL;
+  ir->codegen_rehearsal_end = 0;
+  tcc_free(ir->codegen_dry_pool_entries);
+  ir->codegen_dry_pool_entries = NULL;
   tcc_free(ir->codegen_branch_target_reset);
   ir->codegen_branch_target_reset = NULL;
 

@@ -79,16 +79,25 @@ ifneq (,$(findstring armv8m-tcc,$(CC)))
 CFLAGS += -I$(LIBC_INCLUDES) -I$(LIBC_IMPORTS) -I$(NEWLIB_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
 TCC_FLAGS += -B$(TCC_PATH)
 LDFLAGS += -B$(TCC_PATH)
+
+# `-lsoftfp` resolves to lib/fp/libsoftfp.so (the yaff shared object) before
+# libsoftfp.a, which left every __aeabi_* symbol to be supplied by libgcc --
+# so the FP suite was silently testing libgcc, not the in-tree soft-float
+# library, and 524 conformance vectors' worth of bugs stayed invisible.
+# Name the static archive explicitly.  Defined outside the USE_NEWLIB_BUILD
+# split below because both branches reference it.
+SOFTFP_A := $(TCC_PATH)/lib/fp/libsoftfp.a
+
 ifeq ($(USE_NEWLIB_BUILD),1)
 NEWLIB_LIBC_A := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBC_G))),$(NEWLIB_LIBC_G),$(NEWLIB_DIR)/libc.a)
 NEWLIB_LIBM_A := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBM_G))),$(NEWLIB_LIBM_G),$(NEWLIB_DIR)/libm.a)
 NEWLIB_LIBRDIMON_A := $(LIBGLOSS_PATH)/librdimon.a
-LDFLAGS += -L$(TCC_PATH)/lib -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group -larmv8m-libtcc1.a -lsoftfp $(NEWLIB_LIBC_A) $(NEWLIB_LIBRDIMON_A) $(NEWLIB_LIBM_A) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
+LDFLAGS += -L$(TCC_PATH)/lib -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group -larmv8m-libtcc1.a $(SOFTFP_A) $(NEWLIB_LIBC_A) $(NEWLIB_LIBRDIMON_A) $(NEWLIB_LIBM_A) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
 CRT_LIBS = $(CRT_CRTI_PATH) $(LIBGLOSS_PATH)/rdimon-crt0.o $(CRT_CRTEND_PATH) $(CRT_CRTN_PATH)
 else
 LIBC_A_PATH := $(if $(filter 1,$(DEBUG_LIBC)),$(LIBC_G_PATH),$(LIBC_PATH))
 LIBM_A_PATH := $(if $(filter 1,$(DEBUG_LIBC)),$(LIBM_G_PATH),$(LIBM_PATH))
-LDFLAGS += -L$(TCC_PATH)/lib -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group $(LIBC_A_PATH) $(LIBRDIMON_PATH) -lsoftfp -larmv8m-libtcc1.a $(LIBM_A_PATH) $(LIBC_A_PATH) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
+LDFLAGS += -L$(TCC_PATH)/lib -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group $(LIBC_A_PATH) $(LIBRDIMON_PATH) $(SOFTFP_A) -larmv8m-libtcc1.a $(LIBM_A_PATH) $(LIBC_A_PATH) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
 CRT_LIBS = $(CRT_CRTI_PATH) $(RDIMON_CRT0_PATH) $(CRT_CRTEND_PATH) $(CRT_CRTN_PATH)
 endif
 else

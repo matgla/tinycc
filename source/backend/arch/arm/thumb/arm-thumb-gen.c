@@ -129,6 +129,7 @@ ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int 
 }
 
 #include "source/backend/arch/fpu/arm/fpv5-sp-d16.h"
+#include "source/backend/arch/fpu/arm/rp2350-dcp.h"
 #include "source/backend/arch/fpu/arm/fpv5-d16.h"
 #include "source/backend/arch/arm/thumb/thumb.h"
 #include "source/backend/arch/arm/thumb/thop_adr.h"
@@ -138,6 +139,8 @@ ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int 
 #include "source/backend/arch/arm/thumb/thop_branch.h"
 #include "source/backend/arch/arm/thumb/thop_cmp.h"
 #include "source/backend/arch/arm/thumb/thop_extend.h"
+#include "source/backend/arch/arm/thumb/thop_coproc.h"
+#include "source/backend/arch/arm/thumb/thop_vfp.h"
 #include "source/backend/arch/arm/thumb/thop_ldr_literal.h"
 #include "source/backend/arch/arm/thumb/thop_ldrd.h"
 #include "source/backend/arch/arm/thumb/thop_mem_imm.h"
@@ -147,6 +150,7 @@ ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int 
 #include "source/backend/arch/arm/thumb/thop_mvn.h"
 #include "source/backend/arch/arm/thumb/thop_pld.h"
 #include "source/backend/arch/arm/thumb/thop_shift_imm.h"
+#include "source/backend/arch/arm/thumb/thop_rev.h"
 #include "source/backend/arch/arm/thumb/thop_shift_reg.h"
 #include "source/backend/arch/arm/thumb/thop_system.h"
 
@@ -315,6 +319,8 @@ typedef struct ScratchRegAlloc
 
 /* Forward declarations needed by multi-scratch helpers. */
 static ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs);
+static ScratchRegAlloc get_scratch_reg_for_sym_addr(Sym *raw_sym, int64_t imm, uint32_t exclude_regs);
+static ScratchRegAlloc get_scratch_reg_for_const(int64_t value, uint32_t exclude_regs);
 static void restore_scratch_reg(ScratchRegAlloc *alloc);
 static void load_from_base(int r, int r1, int irop_btype, int is_unsigned, int fc, int sign, uint32_t base);
 static void th_store32_imm_or_reg_ex(int src_reg, uint32_t base_reg, int abs_off, int sign, uint32_t extra_exclude);
@@ -452,6 +458,39 @@ static int mach_alloc_scratch(MachineCodegenContext *ctx, uint32_t excl)
   return alloc.reg;
 }
 
+/* mach_alloc_scratch variant for a scratch that will receive &sym+imm (via
+ * tcc_machine_load_constant): same ctx bookkeeping, but the register choice
+ * goes through get_scratch_reg_for_sym_addr so a repeat materialization of
+ * the same symbol address reuses the register still holding it (the
+ * subsequent load then elides to zero instructions). */
+static int mach_alloc_scratch_for_sym(MachineCodegenContext *ctx, uint32_t excl, Sym *sym, int64_t imm)
+{
+  if (ctx->n_scratch >= MACH_CTX_MAX_SCRATCH)
+    tcc_error("compiler_error: mach_alloc_scratch: per-instruction scratch limit exceeded");
+  ScratchRegAlloc alloc = get_scratch_reg_for_sym_addr(sym, imm, excl);
+  ctx->scratches[ctx->n_scratch++] = alloc;
+  g_insn_scratch_allocs++;
+  if (alloc.would_save)
+    g_insn_scratch_saves |= (uint16_t)(1u << (unsigned)alloc.reg);
+  return alloc.reg;
+}
+
+/* mach_alloc_scratch variant for a scratch that will receive a plain integer
+ * constant: routes the register choice through get_scratch_reg_for_const so a
+ * repeat materialization of the same literal reuses the register still holding
+ * it (the subsequent load then elides to zero instructions). */
+static int mach_alloc_scratch_for_const(MachineCodegenContext *ctx, uint32_t excl, int64_t value)
+{
+  if (ctx->n_scratch >= MACH_CTX_MAX_SCRATCH)
+    tcc_error("compiler_error: mach_alloc_scratch: per-instruction scratch limit exceeded");
+  ScratchRegAlloc alloc = get_scratch_reg_for_const(value, excl);
+  ctx->scratches[ctx->n_scratch++] = alloc;
+  g_insn_scratch_allocs++;
+  if (alloc.would_save)
+    g_insn_scratch_saves |= (uint16_t)(1u << (unsigned)alloc.reg);
+  return alloc.reg;
+}
+
 /* Release all scratch registers allocated for the current instruction in
  * reverse (LIFO) order — required because ARM push/pop works by register
  * number, so the last-pushed register must be popped first. */
@@ -516,7 +555,7 @@ static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *
 
   case MACH_OP_IMM:
   {
-    int r = mach_alloc_scratch(ctx, excl);
+    int r = mach_alloc_scratch_for_const(ctx, excl, op->u.imm.val);
     tcc_machine_load_constant(r, PREG_REG_NONE, op->u.imm.val, 0, NULL);
     return r;
   }
@@ -536,7 +575,7 @@ static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *
     if (!op->needs_deref)
     {
       /* Load symbol address (with addend baked in). */
-      int r = mach_alloc_scratch(ctx, excl);
+      int r = mach_alloc_scratch_for_sym(ctx, excl, sym, op->u.sym.addend);
       tcc_machine_load_constant(r, PREG_REG_NONE, op->u.sym.addend, 0, sym);
       return r;
     }
@@ -544,7 +583,7 @@ static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *
     {
       /* Load symbol address into a scratch base reg, then dereference. */
       int r = mach_alloc_scratch(ctx, excl);
-      int base = mach_alloc_scratch(ctx, excl | (1u << (uint32_t)r));
+      int base = mach_alloc_scratch_for_sym(ctx, excl | (1u << (uint32_t)r), sym, 0);
       tcc_machine_load_constant(base, PREG_REG_NONE, 0, 0, sym);
       const int32_t addend = op->u.sym.addend;
       load_from_base(r, PREG_REG_NONE, op->btype, (int)op->is_unsigned, addend < 0 ? (int)(-addend) : (int)addend,
@@ -713,7 +752,7 @@ static void mach_writeback_dest(const MachineOperand *op, int reg)
     /* Global variable: load symbol address, then store through it. */
     Sym *sym = op->u.sym.sym ? validate_sym_for_reloc(op->u.sym.sym) : NULL;
     uint32_t excl = (1u << (uint32_t)reg);
-    ScratchRegAlloc rr = get_scratch_reg_with_save(excl);
+    ScratchRegAlloc rr = get_scratch_reg_for_sym_addr(sym, 0, excl);
     tcc_machine_load_constant(rr.reg, PREG_REG_NONE, 0, 0, sym);
     const int32_t addend = op->u.sym.addend;
     const int abs_off = addend < 0 ? (int)(-addend) : (int)addend;
@@ -789,10 +828,11 @@ void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op)
       return;
     }
     /* Symbol deref: load address into dest_reg as scratch, then dereference.
-     * Use get_scratch_reg_with_save for the base so it won't clobber dest_reg. */
+     * Use get_scratch_reg_for_sym_addr for the base so it won't clobber
+     * dest_reg (and reuses a register already holding the address). */
     {
       uint32_t excl = (1u << (uint32_t)dest_reg);
-      ScratchRegAlloc base_alloc = get_scratch_reg_with_save(excl);
+      ScratchRegAlloc base_alloc = get_scratch_reg_for_sym_addr(sym, 0, excl);
       tcc_machine_load_constant(base_alloc.reg, PREG_REG_NONE, 0, 0, sym);
       const int32_t addend = op->u.sym.addend;
       load_from_base(dest_reg, PREG_REG_NONE, op->btype, (int)op->is_unsigned,
@@ -861,9 +901,39 @@ typedef struct CodeGenDryRunState
   int scratch_push_count;       /* Total scratch push operations */
   int lr_push_count;            /* Times LR specifically was pushed */
   int instruction_count;        /* IR instructions processed */
+  int max_nested_saves;         /* Max nested-call save slots used at any call site */
 } CodeGenDryRunState;
 
 static CodeGenDryRunState dry_run_state;
+/* Rehearsal mode: still a dry run (ot() writes no bytes) but every decision is
+ * made exactly as the real pass would make it, so the resulting address map is
+ * a faithful size model.  The discovery dry run cannot be one: where it finds
+ * no free scratch register it merely RECORDS the push and emits nothing, and
+ * its finalisation then reassigns registers and resizes the frame — so its
+ * layout is not the layout the real pass produces. */
+static int dry_run_rehearsal = 0;
+ST_FUNC void tcc_gen_machine_dry_run_set_rehearsal(int on) { dry_run_rehearsal = on; }
+
+/* Mapping-symbol emission, gated to the real pass.  Dry passes advance `ind`
+ * with drifted offsets (branches emit wide), so a symbol emitted there points
+ * mid-pool or mid-code and actively misleads objdump — that is exactly the
+ * bug that made the ungated th_sym_* calls worse than useless. */
+static void map_sym_d(void)
+{
+  if (dry_run_state.active || nocode_wanted)
+    return;
+  th_sym_d();
+}
+
+static void map_sym_t(void)
+{
+  if (dry_run_state.active || nocode_wanted)
+    return;
+  th_sym_t();
+}
+/* True only for the discovery dry run: "model what would happen" rather than
+ * "emit what the real pass emits". */
+#define DRY_RUN_MODELLING (dry_run_state.active && !dry_run_rehearsal)
 
 /* Bytes the real run's scratch PUSHes have currently moved SP below its
  * steady-state position.  Derived from the push bookkeeping so it can never
@@ -884,6 +954,15 @@ static int scratch_push_sp_bias(void)
  * This allows accurate code size tracking without affecting the real pass. */
 static ThumbLiteralPoolEntry *dry_run_literal_pool = NULL;
 static int dry_run_literal_pool_count = 0;
+
+/* Monotonic per-function totals (never reset by a pool flush) used by the
+ * forward-branch narrowing safety check: the rehearsal records them per IR
+ * instruction so the real pass can bound the pool pressure over a branch's
+ * range and prove no flush can land inside it. */
+static int pool_flushes_total = 0;
+static int pool_entries_total = 0;
+ST_FUNC int tcc_gen_machine_pool_flushes_total(void) { return pool_flushes_total; }
+ST_FUNC int tcc_gen_machine_pool_entries_total(void) { return pool_entries_total; }
 static int dry_run_literal_pool_size = 0;
 
 /* Literal pool dedup uses the same bucket+chain scheme as TinyCC's ELF hashes.
@@ -1285,6 +1364,8 @@ ST_FUNC void tcc_gen_machine_dry_run_start(void)
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = PREG_NONE;
   thumb_gen_state.function_argument_count = 0;
+  pool_flushes_total = 0;
+  pool_entries_total = 0;
   /* call_sites_by_id - don't modify, just track that we saved it */
   imm_cache_reset_all();
 }
@@ -1292,6 +1373,10 @@ ST_FUNC void tcc_gen_machine_dry_run_start(void)
 ST_FUNC void tcc_gen_machine_dry_run_end(void)
 {
   dry_run_state.active = 0;
+  /* The real pass re-counts from zero so its running totals line up with the
+   * per-instruction snapshots the rehearsal recorded. */
+  pool_flushes_total = 0;
+  pool_entries_total = 0;
   /* Restore thumb_gen_state after dry-run */
   thumb_gen_state_snapshot_restore(&dry_run_snapshot);
   imm_cache_reset_all();
@@ -1310,6 +1395,13 @@ ST_FUNC int tcc_gen_machine_dry_run_get_lr_push_count(void)
 ST_FUNC uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void)
 {
   return dry_run_state.scratch_regs_pushed;
+}
+
+/* Max nested-call save slots any call site used during the dry run — the
+ * exact demand the static max_nested_save_regs reservation over-approximates. */
+ST_FUNC int tcc_gen_machine_dry_run_get_max_nested_saves(void)
+{
+  return dry_run_state.max_nested_saves;
 }
 
 /* Check if dry-run mode is currently active */
@@ -1365,7 +1457,7 @@ ST_FUNC uint16_t tcc_gen_machine_insn_scratch_saves_mask(void)
  * pushed_registers is not valid during dry-run. */
 static int scratch_pushed_dead_reg(TCCIRState *ir, uint32_t exclude_regs, uint32_t mask)
 {
-  if (dry_run_state.active || !pushed_registers)
+  if (DRY_RUN_MODELLING || !pushed_registers)
     return PREG_NONE;
   uint32_t reserved = (1u << R_FP);
   if (tcc_state->text_and_data_separation)
@@ -1504,7 +1596,7 @@ no_free_reg:
   LOG_SCRATCH("WARNING: no free scratch register! Saving r%d to stack", reg_to_save);
 
   /* Dry run: record what we would push, but don't emit */
-  if (dry_run_state.active)
+  if (DRY_RUN_MODELLING)
   {
     dry_run_record_push(reg_to_save);
     /* Return as if it's free for consistent allocation decisions */
@@ -1564,7 +1656,7 @@ static void restore_scratch_reg(ScratchRegAlloc *alloc)
   if (alloc->saved)
     imm_cache_invalidate_reg(alloc->reg);
   /* Dry run: don't emit pop, just update tracking */
-  if (dry_run_state.active)
+  if (DRY_RUN_MODELLING)
   {
     if (alloc->saved)
     {
@@ -1642,7 +1734,7 @@ static void restore_scratch_reg(ScratchRegAlloc *alloc)
 static void restore_all_pushed_scratch_regs(void)
 {
   /* Dry run: don't emit pops, just reset tracking */
-  if (dry_run_state.active)
+  if (DRY_RUN_MODELLING)
   {
     scratch_push_count = 0;
     scratch_save_slot = 0;
@@ -1910,6 +2002,142 @@ static void imm_cache_invalidate_reg(int reg)
 {
   if (reg >= 0 && reg < 16)
     imm_cache[reg].valid = 0;
+}
+
+/* Scratch selection for a SYMBOL-ADDRESS materialization (the chosen register
+ * will receive &sym+imm via tcc_machine_load_constant / load_full_const).
+ *
+ * Two placement rules close most of the duplicate literal-pool-load gap
+ * (census: 11k duplicate same-literal `ldr [pc]` loads vs GCC's 5k):
+ *
+ *  1. If a free register ALREADY holds &sym+imm (per imm_cache), hand THAT
+ *     register out — load_full_const's reuse check then elides the load
+ *     entirely, so a repeat materialization costs zero instructions.
+ *  2. On a miss, park the address in the HIGHEST free register of R0-R3.
+ *     Every other scratch user (spill reloads, marshaling) allocates
+ *     lowest-first, so a symbol base placed in R3 survives the R0 churn and
+ *     turns the NEXT materialization into case 1.  (An unrolled
+ *     table-indexed kernel — mibench_rijndael's encrypt — reloaded the same
+ *     table base 14x through R0 precisely because the reload target was
+ *     also every other user's first-choice scratch.)
+ *
+ * Both decisions read only imm_cache and liveness, which are maintained
+ * identically in the dry and real passes (the invariant the elide path in
+ * load_full_const already relies on), so dry/real code sizes stay in sync.
+ * Every other case falls back to get_scratch_reg_with_save. */
+static int try_scratch_reg_for_sym_addr(Sym *raw_sym, int64_t imm, uint32_t exclude_regs, ScratchRegAlloc *out)
+{
+  TCCIRState *ir = tcc_state->ir;
+  Sym *vsym = raw_sym ? validate_sym_for_reloc(raw_sym) : NULL;
+  if (vsym && ir && thumb_gen_state.generating_function)
+  {
+    /* Live set at this instruction: the same union tcc_ls_find_free_scratch_reg
+     * builds (per-instruction bitmap ∪ interval scan, via the LS cache). */
+    uint32_t live = exclude_regs | scratch_global_exclude | (1u << R_SP) | (1u << R_PC);
+    if (ir->leaffunc)
+      live |= (1u << R_LR);
+    LSLiveIntervalState *ls = &ir->ls;
+    int idx = ir->codegen_instruction_idx;
+    if (ls->live_regs_by_instruction && idx >= 0 && idx < ls->live_regs_by_instruction_size)
+      live |= ls->live_regs_by_instruction[idx];
+    if (ls->cached_instruction_idx == idx)
+      live |= ls->cached_live_regs;
+    else
+    {
+      uint32_t computed = tcc_ls_compute_live_regs(ls, idx);
+      ls->cached_instruction_idx = idx;
+      ls->cached_live_regs = computed;
+      live |= computed;
+    }
+    /* 1) Reuse a free register that already holds &sym+imm. */
+    for (int r = 0; r < 16; r++)
+    {
+      if (!(live & (1u << r)) && imm_cache[r].valid && imm_cache[r].sym == vsym &&
+          imm_cache[r].value == imm)
+      {
+        ScratchRegAlloc res = {0};
+        res.reg = r;
+        scratch_global_exclude |= (1u << r);
+        *out = res;
+        return 1;
+      }
+    }
+    /* 2) Miss: highest free low register, away from the lowest-first churn. */
+    {
+      uint32_t avail_low = (~live) & 0xFu;
+      if (avail_low)
+      {
+        ScratchRegAlloc res = {0};
+        res.reg = 31 - __builtin_clz(avail_low);
+        scratch_global_exclude |= (1u << (uint32_t)res.reg);
+        *out = res;
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static ScratchRegAlloc get_scratch_reg_for_sym_addr(Sym *raw_sym, int64_t imm, uint32_t exclude_regs)
+{
+  ScratchRegAlloc res;
+  if (try_scratch_reg_for_sym_addr(raw_sym, imm, exclude_regs, &res))
+    return res;
+  return get_scratch_reg_with_save(exclude_regs);
+}
+
+/* Scratch selection for a PLAIN-CONSTANT materialization (the chosen register
+ * will receive `value` via tcc_machine_load_constant).
+ *
+ * Same rule 1 as get_scratch_reg_for_sym_addr, for integer literals: when a
+ * free register still holds `value`, hand THAT register out and the early-out
+ * in tcc_machine_load_constant makes the materialization cost zero
+ * instructions.  Register-saturated straight-line code re-materializes the
+ * same literal constantly -- a rolling-hash chain reloaded its multiplier from
+ * the literal pool once per round (252_fuzz: 143 pool loads for 64 distinct
+ * words) because the chain's own values kept every scratch churning.
+ *
+ * Rule 2 of the symbol path (park high, away from the lowest-first churn) is
+ * deliberately NOT copied: a literal, unlike a global's base address, is
+ * usually consumed once right where it is produced, and parking it high only
+ * displaces the spill traffic that wants those registers.
+ *
+ * The decision reads only imm_cache and liveness, both maintained identically
+ * in the dry and real passes, so code sizes stay in sync. */
+static ScratchRegAlloc get_scratch_reg_for_const(int64_t value, uint32_t exclude_regs)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (ir && thumb_gen_state.generating_function)
+  {
+    uint32_t live = exclude_regs | scratch_global_exclude | (1u << R_SP) | (1u << R_PC);
+    if (ir->leaffunc)
+      live |= (1u << R_LR);
+    LSLiveIntervalState *ls = &ir->ls;
+    int idx = ir->codegen_instruction_idx;
+    if (ls->live_regs_by_instruction && idx >= 0 && idx < ls->live_regs_by_instruction_size)
+      live |= ls->live_regs_by_instruction[idx];
+    if (ls->cached_instruction_idx == idx)
+      live |= ls->cached_live_regs;
+    else
+    {
+      uint32_t computed = tcc_ls_compute_live_regs(ls, idx);
+      ls->cached_instruction_idx = idx;
+      ls->cached_live_regs = computed;
+      live |= computed;
+    }
+    for (int r = 0; r < 16; r++)
+    {
+      if (!(live & (1u << r)) && imm_cache[r].valid && imm_cache[r].sym == NULL &&
+          imm_cache[r].value == value)
+      {
+        ScratchRegAlloc res = {0};
+        res.reg = r;
+        scratch_global_exclude |= (1u << r);
+        return res;
+      }
+    }
+  }
+  return get_scratch_reg_with_save(exclude_regs);
 }
 
 static void mov_equiv_reset_all(void)
@@ -2360,6 +2588,8 @@ static const char *arm_fpu_type_to_mfpu_str(unsigned char fpu_type)
     return "fpv4-sp-d16";
   case ARM_FPU_FPV5_SP_D16:
     return "fpv5-sp-d16";
+  case ARM_FPU_RP2350:
+    return "rp2350";
   case ARM_FPU_FPV5_D16:
     return "fpv5-d16";
   case ARM_FPU_NONE:
@@ -2383,6 +2613,8 @@ const FloatingPointConfig *arm_determine_fpu_config(struct TCCState *s)
     return &arm_fpv5_sp_d16_fpu_config;
   case ARM_FPU_FPV5_D16:
     return &arm_fpv5_d16_fpu_config;
+  case ARM_FPU_RP2350:
+    return &arm_rp2350_dcp_fpu_config;
   default:
     fprintf(stderr, "unsupported FPU type: %d for ARM architecture", s->fpu_type);
     exit(1);
@@ -2519,6 +2751,7 @@ static void th_literal_pool_generate(void)
   }
 
   generating_pool = 1;
+  pool_flushes_total++;
   const int this_pool = ++pool_seq;
 
   /* Use dry-run pool during dry-run, otherwise use the real pool */
@@ -2561,7 +2794,7 @@ static void th_literal_pool_generate(void)
   ThumbLitPosSeq_init(&literal_positions_owner, (size_t)pool_count);
   int *literal_positions = ThumbLitPosSeq_data(&literal_positions_owner);
 
-  th_sym_d();
+  map_sym_d();
 
   /* First pass: emit unique literals and record their positions */
   for (int i = 0; i < pool_count; i++)
@@ -2638,7 +2871,10 @@ static void th_literal_pool_generate(void)
    * the precomputed pool size and what was really written.
    * Offset is relative to PC (branch_pos + 4).
    */
-  if (thumb_gen_state.generating_function)
+  /* A dry run advances `ind` without growing the section, so branch_pos can
+   * point past cur_text_section->data — patching there corrupts the heap.  The
+   * bytes are discarded anyway.  (Valgrind: invalid write of size 2.) */
+  if (thumb_gen_state.generating_function && !dry_run_state.active)
   {
     const int branch_after_pool = ind - branch_pos - 4;
     // th_patch_call(branch_pos, branch_after_pool);
@@ -2653,7 +2889,7 @@ static void th_literal_pool_generate(void)
                   this_pool, branch_pos, need_align, pool_size, ind, branch_after_pool);
     }
   }
-  th_sym_t();
+  map_sym_t();
 
   /* Second pass: patch all instructions to point to correct literal position */
   for (int i = 0; i < pool_count; i++)
@@ -2662,6 +2898,12 @@ static void th_literal_pool_generate(void)
     int literal_pos = literal_positions[i];
     int aligned_position = ((literal_pos - entry->patch_position) + 3) & ~3;
 
+    /* Same reason as the skip-branch above: during a dry run `ind` has run past
+     * the end of cur_text_section->data, so neither the diagnostic reads below
+     * nor the patches may touch it. */
+    if (dry_run_state.active)
+      continue;
+
     uint16_t b0_prev = 0, b1_prev = 0;
     if (thumb_gen_state.generating_function)
     {
@@ -2669,12 +2911,29 @@ static void th_literal_pool_generate(void)
       b1_prev = *(uint16_t *)(cur_text_section->data + branch_pos + 2);
     }
 
+    /* The offset MUST fit the encoding.  Masking it into place unchecked --
+     * which is what these three sites used to do -- turns an out-of-range pool
+     * into a load from whatever code happens to sit at (pc + offset mod range):
+     * no diagnostic, a plausible-looking binary, and a fault or silent garbage
+     * only when that path executes.  th_literal_pool_would_flush_for() is
+     * supposed to keep the distance in range, but its budget is an estimate
+     * (see the note on tcc_gen_machine_cbz_forward_ok) and it has drifted
+     * before, so this is the backstop that makes such a drift a build failure
+     * instead of a miscompile. */
+    int field = aligned_position - 4;
+    int limit = (entry->short_instruction || entry->data_size == 8) ? (0xff << 2) : 0xfff;
+    if (field < 0 || field > limit)
+      tcc_error("compiler_error: literal pool out of range for %s at 0x%x: offset %d exceeds %d "
+                "(pool at 0x%x). The flush budget in ot() let the pool drift too far from the load.",
+                entry->short_instruction ? "LDR(T1)" : (entry->data_size == 8 ? "LDRD" : "LDR.W"),
+                entry->patch_position, field, limit, literal_pos);
+
     // patch the instruction that references this literal
     if (entry->short_instruction)
     {
       /* Short LDR literal (T1): imm8 word-aligned in bits 0-7 */
       uint16_t *patch_ins = (uint16_t *)(cur_text_section->data + entry->patch_position);
-      *patch_ins |= (((aligned_position - 4) >> 2) & 0x00ff);
+      *patch_ins |= ((field >> 2) & 0x00ff);
     }
     else if (entry->data_size == 8)
     {
@@ -2683,13 +2942,13 @@ static void th_literal_pool_generate(void)
       uint16_t *patch_ins1 = (uint16_t *)(cur_text_section->data + entry->patch_position + 2);
       /* Set P=1 (bit 8) and U=1 (bit 7) for positive offset, pre-indexed */
       *patch_ins0 |= (1 << 8) | (1 << 7); /* P and U bits */
-      *patch_ins1 |= (((aligned_position - 4) >> 2) & 0x00ff);
+      *patch_ins1 |= ((field >> 2) & 0x00ff);
     }
     else
     {
       /* Long LDR literal (T2): imm12 byte offset in bits 0-11 of second halfword */
       uint16_t *patch_ins = (uint16_t *)(cur_text_section->data + entry->patch_position + 2);
-      *patch_ins |= (((aligned_position - 4)) & 0x0fff);
+      *patch_ins |= (field & 0x0fff);
     }
 
     if (thumb_gen_state.generating_function && tcc_state && tcc_state->verbose)
@@ -2714,6 +2973,31 @@ static void th_literal_pool_generate(void)
   literal_pool_lookup_cache_clear(&literal_pool_last_lookup);
 }
 
+/* Byte budget from the first literal load of a pool window to the last word of
+ * that pool.  The architectural ceiling is 1024: the patch in
+ * th_literal_pool_generate() encodes (aligned_position - 4), and both the T1
+ * LDR-literal and the LDRD-literal forms carry an 8-bit word-scaled offset,
+ * i.e. at most 1020 bytes.
+ *
+ * Every trigger below tests `code_size + pool_count * 4`, which is only a proxy
+ * for that distance and undercounts it: the test runs after
+ * `code_size += op.size` so the sum overshoots on crossing; the pool is
+ * preceded by a skip branch and up to 2 bytes of alignment; and a flush
+ * suppressed by op_in_it_block is deferred to the end of the IT block.  An
+ * exact check would have to measure from the earliest pending entry's
+ * patch_position, but entries are allocated before that field is known (see
+ * load_full_const), so the proxy stays and carries a cushion instead.
+ *
+ * All of it used to be unaccounted for, every site testing a bare 1020: the
+ * sum overshot the 1024-byte ceiling and the patch masked the offset down, so
+ * the load read whatever code sat at (pc + offset mod 1024).  A first attempt
+ * at 1000 was still not enough -- inline DCP compares shifted where flushes
+ * land and produced a 1032-byte span.  960 matches the 64-byte cushion
+ * tcc_gen_machine_cbz_forward_ok() already uses against the same drift, and
+ * the range check in th_literal_pool_generate() is the backstop that turns any
+ * future miss into a build failure rather than a silent miscompile. */
+#define THUMB_POOL_FLUSH_BUDGET 960
+
 static void th_literal_pool_reserve_upcoming_bytes(int upcoming_bytes)
 {
   if (!thumb_gen_state.generating_function)
@@ -2723,7 +3007,7 @@ static void th_literal_pool_reserve_upcoming_bytes(int upcoming_bytes)
   if (pool_count == 0)
     return;
 
-  if (thumb_gen_state.code_size + pool_count * 4 + upcoming_bytes >= 1020)
+  if (thumb_gen_state.code_size + pool_count * 4 + upcoming_bytes >= THUMB_POOL_FLUSH_BUDGET)
     th_literal_pool_generate();
 }
 
@@ -2734,7 +3018,7 @@ static int th_literal_pool_would_flush_for(int upcoming_bytes)
   if (!thumb_gen_state.generating_function || pool_count == 0)
     return 0;
 
-  return thumb_gen_state.code_size + pool_count * 4 + upcoming_bytes >= 1020;
+  return thumb_gen_state.code_size + pool_count * 4 + upcoming_bytes >= THUMB_POOL_FLUSH_BUDGET;
 }
 
 /* Count of conditioned instructions still pending inside an IT/ITE/... block,
@@ -3096,7 +3380,8 @@ int ot(thumb_opcode op)
       int it_len = mov_equiv_it_block_length(op);
       if (it_len > 0)
       {
-        if (thumb_gen_state.code_size + op.size + thumb_gen_state.literal_pool_count * 4 + 12 * it_len >= 1020)
+        if (thumb_gen_state.code_size + op.size + thumb_gen_state.literal_pool_count * 4 + 12 * it_len >=
+            THUMB_POOL_FLUSH_BUDGET)
           th_literal_pool_generate();
         pool_flush_it_pending = it_len;
       }
@@ -3115,7 +3400,7 @@ int ot(thumb_opcode op)
        * code size including the literal pool, so that ind matches
        * between dry-run and real pass. */
       const int max_offset = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4;
-      if (max_offset >= 1020 && !op_in_it_block)
+      if (max_offset >= THUMB_POOL_FLUSH_BUDGET && !op_in_it_block)
       {
         th_literal_pool_generate();
       }
@@ -3130,7 +3415,7 @@ int ot(thumb_opcode op)
     thumb_gen_state.code_size += op.size;
     // 16-bit encoding for ldr should be efficient
     const int max_offset = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4;
-    if (max_offset >= 1020 && !op_in_it_block)
+    if (max_offset >= THUMB_POOL_FLUSH_BUDGET && !op_in_it_block)
     {
       th_literal_pool_generate();
     }
@@ -3230,6 +3515,16 @@ static thumb_opcode th_generic_mov_imm(uint32_t r, int imm)
     return th_mvn_imm(r, 0, -imm - 1, flags_safe(), ENFORCE_ENCODING_NONE);
   }
   return th_mov_imm(r, imm, flags_safe(), ENFORCE_ENCODING_NONE);
+}
+
+/* Pure query for the IR-level constant hoist: true when a 32-bit constant has
+ * no single-instruction materialization (all MOV/MOVW/MVN encodings fail) and
+ * tcc_machine_load_constant would fall through to a literal-pool load.  Probes
+ * with r0 so the 16-bit MOVS form is reachable — encodability is the same for
+ * every register from there (MOV.W covers imm8 for high registers). */
+ST_FUNC int tcc_gen_machine_const_needs_pool(int32_t value)
+{
+  return th_generic_mov_imm(0, value).size == 0;
 }
 static ScratchRegAlloc th_offset_to_reg_ex(int off, int sign, uint32_t exclude_regs)
 {
@@ -3432,6 +3727,8 @@ ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, TCCIRSwitchTab
   ot_check(th_bx_reg(rt));
 
   int table_start = ind;
+  /* The offset table is data in .text — mark it for disassemblers. */
+  map_sym_d();
   for (int i = 0; i < table->num_entries; i++)
   {
     g(0);
@@ -3439,6 +3736,7 @@ ST_FUNC void tcc_gen_machine_switch_table_mop(MachineOperand src, TCCIRSwitchTab
     g(0);
     g(0);
   }
+  map_sym_t();
   table->table_code_addr = table_start;
   mach_release_all(&ctx);
 }
@@ -4073,6 +4371,8 @@ static void th_store8_imm_or_reg(int src_reg, uint32_t base_reg, int abs_off, in
 static ThumbLiteralPoolEntry *th_literal_pool_allocate()
 {
   ThumbLiteralPoolEntry *entry;
+
+  pool_entries_total++;
 
   /* During dry-run, use separate pool to avoid modifying the real pool.
    * This prevents memory corruption when restoring state after dry-run. */
@@ -4976,9 +5276,14 @@ static MachineOperand mach_resolve_deref_64(MachineCodegenContext *mctx, const M
   int hi_reg = mach_alloc_scratch(mctx, *excl);
   *excl |= (1u << (uint32_t)hi_reg);
 
-  /* Load [base+0] → lo, [base+4] → hi (32-bit loads). */
-  load_from_base(lo_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 0, 0, (uint32_t)base_reg);
-  load_from_base(hi_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 4, 0, (uint32_t)base_reg);
+  /* Load [base+0] → lo, [base+4] → hi.  Proven-aligned access (op->align4,
+   * from the frontend's packed-access tracking): one LDRD; otherwise the
+   * unaligned-safe pair of 32-bit loads. */
+  if (!(op->align4 && try_ldrd_pair(lo_reg, hi_reg, base_reg, 0, 0)))
+  {
+    load_from_base(lo_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 0, 0, (uint32_t)base_reg);
+    load_from_base(hi_reg, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 4, 0, (uint32_t)base_reg);
+  }
 
   /* Build a clean register-pair operand. */
   MachineOperand result = {0};
@@ -5053,6 +5358,64 @@ static MachineOperand mach_make_hi_half(const MachineOperand *op)
     break;
   }
   return hi;
+}
+
+/* Materialize both 32-bit halves of a 64-bit operand into registers.
+ *
+ * When the source is a plain, word-aligned stack slot the two halves sit at
+ * adjacent addresses — exactly LDRD's shape, so one instruction replaces the
+ * two LDRs the per-half `mach_ensure_in_reg` calls would emit.  A `long long`
+ * comparison or arithmetic op reading a local is otherwise the one 64-bit
+ * memory shape that never pairs (STOREs already fuse to STRD, and derefs pair
+ * via mach_resolve_deref_64), which is why `if (x.a != y.a)` on 64-bit fields
+ * costs four loads instead of two.
+ *
+ * Every other operand kind, and any slot LDRD cannot reach, falls back to the
+ * original per-half path, so behaviour there is unchanged.  `*excl` picks up
+ * both chosen registers, mirroring what the callers did by hand. */
+static void mach_ensure_pair_in_regs(MachineCodegenContext *ctx, const MachineOperand *op64,
+                                     uint32_t *excl, int *out_lo, int *out_hi)
+{
+  MachineOperand lo = mach_make_lo_half(op64);
+  MachineOperand hi = mach_make_hi_half(op64);
+  lo.btype = IROP_BTYPE_INT32;
+  hi.btype = IROP_BTYPE_INT32;
+
+  if (op64->is_64bit && lo.kind == MACH_OP_SPILL && !lo.needs_deref && (lo.u.spill.offset & 3) == 0)
+  {
+    int rlo = mach_alloc_scratch(ctx, *excl);
+    int rhi = mach_alloc_scratch(ctx, *excl | (1u << (uint32_t)rlo));
+    if (rlo != rhi)
+    {
+      /* LDRD, or — when its offset/register constraints do not hold — the two
+       * single-word loads into the scratches we already own. */
+      if (!tcc_gen_machine_try_ldrd_spill(rlo, lo.u.spill.offset, rhi, hi.u.spill.offset))
+      {
+        tcc_machine_load_spill_slot(rlo, lo.u.spill.offset);
+        tcc_machine_load_spill_slot(rhi, hi.u.spill.offset);
+      }
+      *excl |= (1u << (uint32_t)rlo) | (1u << (uint32_t)rhi);
+      *out_lo = rlo;
+      *out_hi = rhi;
+      return;
+    }
+    tcc_machine_load_spill_slot(rlo, lo.u.spill.offset);
+    *excl |= (1u << (uint32_t)rlo);
+    *out_lo = rlo;
+    *out_hi = mach_ensure_in_reg(ctx, &hi, *excl);
+    if (thumb_is_hw_reg(*out_hi))
+      *excl |= (1u << (uint32_t)*out_hi);
+    return;
+  }
+
+  int rlo = mach_ensure_in_reg(ctx, &lo, *excl);
+  if (thumb_is_hw_reg(rlo))
+    *excl |= (1u << (uint32_t)rlo);
+  int rhi = mach_ensure_in_reg(ctx, &hi, *excl);
+  if (thumb_is_hw_reg(rhi))
+    *excl |= (1u << (uint32_t)rhi);
+  *out_lo = rlo;
+  *out_hi = rhi;
 }
 
 /* ============================================================
@@ -5531,6 +5894,37 @@ static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const M
   const bool dest_sets_flags = (op == TCCIR_OP_CMP);
   MachineCodegenContext mctx = {0};
 
+  /* Barrel-shifted immediate src2: the ALU immediate form has no shift field,
+   * so if src2 carries a barrel-shift annotation but has been lowered to an
+   * immediate (a rematerialized constant substituted for the shift's source
+   * register — see ra_mark_rematerializable), fold the shift into the constant
+   * and clear the annotation.  Without this the shift is silently dropped: the
+   * immediate path below emits `<op> Rd, Rn, #imm` and the `if (!imm_emitted)`
+   * shift block never runs (fuzz seed longlong:6393 — `y ^ (u5 LSR #31)` with
+   * u5 remat'd to #1 wrongly emitted `eor r,r,#1` instead of `eor r,r,#0`).
+   * The fusion pass keeps amount in 0..31 (never the ARM "0 means 32" LSR/ASR/
+   * ROR case), so these C shifts are well-defined. */
+  MachineOperand src2_folded;
+  if (barrel_shift != 0 && src2->kind == MACH_OP_IMM && !src2->needs_deref && !src2->is_64bit)
+  {
+    uint32_t stype = (barrel_shift >> 5) & 7;
+    uint32_t samt = barrel_shift & 31;
+    uint32_t v = (uint32_t)src2->u.imm.val;
+    uint32_t r;
+    switch (stype)
+    {
+    case 1: r = v << samt; break;                                     /* LSL */
+    case 2: r = v >> samt; break;                                     /* LSR */
+    case 3: r = (uint32_t)((int32_t)v >> samt); break;                /* ASR */
+    case 4: r = samt ? ((v >> samt) | (v << (32 - samt))) : v; break; /* ROR */
+    default: r = v; break;
+    }
+    src2_folded = *src2;
+    src2_folded.u.imm.val = (int64_t)(int32_t)r;
+    src2 = &src2_folded;
+    barrel_shift = 0;
+  }
+
   /* RSB fast path: SUB with immediate src1 → RSB Rd, src2, #imm.
    * Avoids materializing the immediate into a register.
    * Only attempt when the immediate is encodable as a Thumb-2 modified
@@ -5636,6 +6030,37 @@ static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const M
       ubfx_op.opcode =
           0xF3C00000 | ((uint32_t)src1_reg << 16) | ((uint32_t)dest_reg << 8) | (uint32_t)widthm1;
       ot(ubfx_op);
+      if (dest->kind != MACH_OP_NONE)
+      {
+        const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
+                              (dest->kind == MACH_OP_REG && (dest->needs_deref || dest->u.reg.r0 == (int)PREG_REG_NONE));
+        if (needs_wb)
+          mach_writeback_dest(dest, dest_reg);
+      }
+      mach_release_all(&mctx);
+      return;
+    }
+  }
+
+  /* BIC fast path: AND with a mask that is NOT encodable as a Thumb-2 modified
+   * immediate but whose complement IS → BIC Rd, Rn, #~mask.  `x & ~m` is
+   * exactly `BIC x, m`, and bitfield read-modify-write generates a stream of
+   * these ("clear the field, then OR the new value in"), where the clear mask
+   * 0xFFFFFFC0-style never encodes but the field mask 0x3F always does.
+   * Without this the mask costs a separate MVN/MOVW to materialize, making the
+   * AND two instructions. */
+  if (op == TCCIR_OP_AND && !dest_sets_flags && barrel_shift == 0 &&
+      src2->kind == MACH_OP_IMM && !src2->needs_deref && !src2->is_64bit &&
+      flags != FLAGS_BEHAVIOUR_SET)
+  {
+    uint32_t mask = (uint32_t)src2->u.imm.val;
+    uint32_t nmask = ~mask;
+    if (nmask != 0 && th_pack_const(mask) == 0 && th_pack_const(nmask) != 0)
+    {
+      int dest_reg = mach_get_dest_reg(&mctx, dest, 0);
+      uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
+      int src1_reg = mach_ensure_in_reg(&mctx, src1, excl);
+      ot_check(th_bic_imm((uint32_t)dest_reg, (uint32_t)src1_reg, nmask, flags, ENFORCE_ENCODING_NONE));
       if (dest->kind != MACH_OP_NONE)
       {
         const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
@@ -5850,6 +6275,44 @@ void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineO
   op.size = 4;
   op.opcode = 0xF3C00000 | ((uint32_t)rn << 16) | ((uint32_t)imm3 << 12) | ((uint32_t)rd << 8) | ((uint32_t)imm2 << 6) | (uint32_t)widthm1;
   ot(op);
+  mach_writeback_dest(&dest, rd);
+  mach_release_all(&ctx);
+}
+
+/* tcc_machine_has_bit_ops: does the active core encode clz/rbit/rev/rev16?
+ * All four live in the Thumb-2 main extension (rev/rev16 also have a T16 form,
+ * but the front end needs one answer for the whole family, so require T32 +
+ * clz_rbit). */
+ST_FUNC int tcc_machine_has_bit_ops(void)
+{
+  return arm_target_dependent.feat.t32 && arm_target_dependent.feat.clz_rbit;
+}
+
+/* tcc_gen_machine_bitop1_mop: emit a single-operand bit manipulation,
+ * dest = <op>(src1), for TCCIR_OP_CLZ / RBIT / REV / REV16. */
+ST_FUNC void tcc_gen_machine_bitop1_mop(MachineOperand src1, MachineOperand dest, TccIrOp op)
+{
+  MachineCodegenContext ctx = {0};
+  int rd = mach_get_dest_reg(&ctx, &dest, 0);
+  int rm = mach_ensure_in_reg(&ctx, &src1, (1u << (uint32_t)rd));
+  switch (op)
+  {
+  case TCCIR_OP_CLZ:
+    ot_check(th_clz((uint32_t)rd, (uint32_t)rm));
+    break;
+  case TCCIR_OP_RBIT:
+    ot_check(th_rbit((uint32_t)rd, (uint32_t)rm));
+    break;
+  case TCCIR_OP_REV:
+    ot_check(th_rev((uint32_t)rd, (uint32_t)rm, ENFORCE_ENCODING_NONE));
+    break;
+  case TCCIR_OP_REV16:
+    ot_check(th_rev16((uint32_t)rd, (uint32_t)rm, ENFORCE_ENCODING_NONE));
+    break;
+  default:
+    tcc_error("compiler_error: tcc_gen_machine_bitop1_mop: unhandled op %d", (int)op);
+    break;
+  }
   mach_writeback_dest(&dest, rd);
   mach_release_all(&ctx);
 }
@@ -6580,17 +7043,8 @@ ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand sr
   MachineOperand r_src1 = mach_resolve_deref_64(&ctx, &src1, &excl);
   MachineOperand r_src2 = mach_resolve_deref_64(&ctx, &src2, &excl);
 
-  MachineOperand s1_lo = mach_make_lo_half(&r_src1);
-  s1_lo.btype = IROP_BTYPE_INT32;
-  int rn_lo = mach_ensure_in_reg(&ctx, &s1_lo, excl);
-  if (thumb_is_hw_reg(rn_lo))
-    excl |= (1u << (uint32_t)rn_lo);
-
-  MachineOperand s1_hi = mach_make_hi_half(&r_src1);
-  s1_hi.btype = IROP_BTYPE_INT32;
-  int rn_hi = mach_ensure_in_reg(&ctx, &s1_hi, excl);
-  if (thumb_is_hw_reg(rn_hi))
-    excl |= (1u << (uint32_t)rn_hi);
+  int rn_lo, rn_hi;
+  mach_ensure_pair_in_regs(&ctx, &r_src1, &excl, &rn_lo, &rn_hi);
 
   /* Immediate-CMP fast path: if src2 is a u64 immediate, try the cmp-imm
    * form (`cmp.w Rn, #imm`) for each half — avoids loading the constant
@@ -6615,19 +7069,28 @@ ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand sr
   int lo_uses_imm = (r_src2.kind == MACH_OP_IMM && lo_imm_op.size);
 
   int rm_lo = 0, rm_hi = 0;
-  if (!lo_uses_imm)
+  if (!lo_uses_imm && !hi_uses_imm)
   {
-    MachineOperand s2_lo = mach_make_lo_half(&r_src2);
-    s2_lo.btype = IROP_BTYPE_INT32;
-    rm_lo = mach_ensure_in_reg(&ctx, &s2_lo, excl);
-    if (thumb_is_hw_reg(rm_lo))
-      excl |= (1u << (uint32_t)rm_lo);
+    /* Both halves are needed in registers — pair them (the immediate fast path
+     * above is the only case that wants one half loaded and not the other). */
+    mach_ensure_pair_in_regs(&ctx, &r_src2, &excl, &rm_lo, &rm_hi);
   }
-  if (!hi_uses_imm)
+  else
   {
-    MachineOperand s2_hi = mach_make_hi_half(&r_src2);
-    s2_hi.btype = IROP_BTYPE_INT32;
-    rm_hi = mach_ensure_in_reg(&ctx, &s2_hi, excl);
+    if (!lo_uses_imm)
+    {
+      MachineOperand s2_lo = mach_make_lo_half(&r_src2);
+      s2_lo.btype = IROP_BTYPE_INT32;
+      rm_lo = mach_ensure_in_reg(&ctx, &s2_lo, excl);
+      if (thumb_is_hw_reg(rm_lo))
+        excl |= (1u << (uint32_t)rm_lo);
+    }
+    if (!hi_uses_imm)
+    {
+      MachineOperand s2_hi = mach_make_hi_half(&r_src2);
+      s2_hi.btype = IROP_BTYPE_INT32;
+      rm_hi = mach_ensure_in_reg(&ctx, &s2_hi, excl);
+    }
   }
 
   if (hi_uses_imm)
@@ -7046,6 +7509,15 @@ ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest,
 
     if (src.is_64bit)
     {
+      /* Whole 64-bit local → register pair: one LDRD instead of the two LDRs
+       * the per-half recursion below would emit. */
+      if (src.kind == MACH_OP_SPILL && !src.needs_deref && (src.u.spill.offset & 3) == 0 &&
+          dest.kind == MACH_OP_REG && !dest.needs_deref && thumb_is_hw_reg(dest.u.reg.r0) &&
+          thumb_is_hw_reg(dest.u.reg.r1) && dest.u.reg.r0 != dest.u.reg.r1 &&
+          tcc_gen_machine_try_ldrd_spill(dest.u.reg.r0, src.u.spill.offset, dest.u.reg.r1,
+                                         src.u.spill.offset + 4))
+        return;
+
       MachineOperand src_lo = mach_make_lo_half(&src);
       MachineOperand src_hi = mach_make_hi_half(&src);
       src_lo.btype = IROP_BTYPE_INT32;
@@ -7134,11 +7606,30 @@ ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest,
     }
     else
     {
-      /* Load symbol address into dest_reg, then dereference through it. */
-      tcc_machine_load_constant(dest_reg, PREG_REG_NONE, 0, 0, sym);
       const int32_t addend = src.u.sym.addend;
-      load_from_base(dest_reg, PREG_REG_NONE, src.btype, (int)src.is_unsigned,
-                     addend < 0 ? (int)(-addend) : (int)addend, addend < 0 ? 1 : 0, (uint32_t)dest_reg);
+      const int abs_off = addend < 0 ? (int)(-addend) : (int)addend;
+      const int sign = addend < 0 ? 1 : 0;
+      /* Prefer a base register OTHER than dest_reg: `ldr rD,[rD,#off]`
+       * overwrites the address with the loaded value, so imm_cache loses it
+       * and the store that follows a read-modify-write has to re-load the
+       * literal.  A separate base keeps the address cached (and an imm_cache
+       * hit removes this materialization entirely).  Only when no register is
+       * free do we fall back to routing through dest_reg - taking a
+       * push/pop there would cost more than the reload it saves. */
+      ScratchRegAlloc base;
+      if (try_scratch_reg_for_sym_addr(sym, 0, (1u << (uint32_t)dest_reg), &base))
+      {
+        tcc_machine_load_constant(base.reg, PREG_REG_NONE, 0, 0, sym);
+        load_from_base(dest_reg, PREG_REG_NONE, src.btype, (int)src.is_unsigned, abs_off, sign,
+                       (uint32_t)base.reg);
+        restore_scratch_reg(&base);
+      }
+      else
+      {
+        tcc_machine_load_constant(dest_reg, PREG_REG_NONE, 0, 0, sym);
+        load_from_base(dest_reg, PREG_REG_NONE, src.btype, (int)src.is_unsigned, abs_off, sign,
+                       (uint32_t)dest_reg);
+      }
     }
     break;
   }
@@ -7429,7 +7920,14 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
   case MACH_OP_REG:
     if (src.needs_deref)
     {
-      /* Register-indirect: LDR dest, [src_reg] */
+      /* Register-indirect: LDR dest, [src_reg].
+       * 64-bit + proven >= 4-byte alignment (src.align4, from the frontend's
+       * packed-access tracking): use LDRD directly.  LDRD Rt==Rn is fine
+       * without writeback, so no base-preservation dance is needed.  Without
+       * the proof, load_from_base emits the unaligned-safe LDR pair. */
+      if (dest.is_64bit && !dest.is_complex && src.align4 && dest_r1 != (int)PREG_REG_NONE &&
+          try_ldrd_pair(dest_reg, dest_r1, src.u.reg.r0, 0, 0))
+        break;
       load_from_base(dest_reg, dest_r1, btype, is_unsigned, 0, 0, (uint32_t)src.u.reg.r0);
     }
     else
@@ -7483,6 +7981,10 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
         ot_check(th_ldr_reg((uint32_t)ptr_r, base, (uint32_t)rr.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         restore_scratch_reg(&rr);
       }
+      /* 64-bit + proven alignment: LDRD through the loaded pointer. */
+      if (dest.is_64bit && !dest.is_complex && src.align4 && dest_r1 != (int)PREG_REG_NONE &&
+          try_ldrd_pair(dest_reg, dest_r1, ptr_r, 0, 0))
+        break;
       load_from_base(dest_reg, dest_r1, btype, is_unsigned, 0, 0, (uint32_t)ptr_r);
     }
     break;
@@ -7509,7 +8011,7 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
       break;
     }
     /* needs_deref: load symbol address into scratch, then dereference. */
-    int addr_r = mach_alloc_scratch(&ctx, (uint32_t)1u << (uint32_t)dest_reg);
+    int addr_r = mach_alloc_scratch_for_sym(&ctx, (uint32_t)1u << (uint32_t)dest_reg, sym, 0);
     tcc_machine_load_constant(addr_r, PREG_REG_NONE, 0, 0, sym);
     /* For a 64-bit deref, try LDRD when we can prove the symbol's address
      * at `addend` is 4-byte aligned.  Otherwise fall back to the pair of
@@ -7687,12 +8189,15 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
     case MACH_OP_REG:
       if (dest.needs_deref)
       {
-        /* 64-bit pointer-store through a register-held address.  Do NOT use
-         * STRD here: ARMv7-M/v8-M requires 4-byte alignment for STRD and
-         * faults otherwise, but the pointer may target packed-struct memory
-         * that is only 1- or 2-byte aligned.  Plain STR tolerates unaligned
-         * (UNALIGN_TRP=0 default) so two 32-bit stores stay safe. */
+        /* 64-bit pointer-store through a register-held address.  STRD needs
+         * a 4-byte-aligned address on ARMv7-M/v8-M (faults otherwise,
+         * regardless of UNALIGN_TRP); use it only when the frontend proved
+         * alignment (dest.align4 — no packed member in the access chain).
+         * Otherwise the pointer may target packed-struct memory that is only
+         * 1- or 2-byte aligned, so two plain STRs stay the safe fallback. */
         const uint32_t base = (uint32_t)dest.u.reg.r0;
+        if (dest.align4 && try_strd_pair(lo_reg, hi_reg, (int)base, 0, 0))
+          break;
         th_store32_imm_or_reg_ex(lo_reg, base, 0, 0, excl | (1u << base));
         th_store32_imm_or_reg_ex(hi_reg, base, 4, 0, excl | (1u << base));
       }
@@ -7737,9 +8242,11 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
           ot_check(th_ldr_reg((uint32_t)ptr_r, base, (uint32_t)rr.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           restore_scratch_reg(&rr);
         }
-        /* Pointer-through store from an LLOCAL spill slot: the target
-         * address is arbitrary (may be unaligned packed-struct memory), so
-         * skip STRD. */
+        /* Pointer-through store from an LLOCAL spill slot: STRD only when
+         * the frontend proved >= 4-byte alignment of the target (dest.align4);
+         * an arbitrary pointer may reference unaligned packed-struct memory. */
+        if (dest.align4 && try_strd_pair(lo_reg, hi_reg, ptr_r, 0, 0))
+          break;
         th_store32_imm_or_reg_ex(lo_reg, (uint32_t)ptr_r, 0, 0, excl | (1u << (uint32_t)ptr_r));
         th_store32_imm_or_reg_ex(hi_reg, (uint32_t)ptr_r, 4, 0, excl | (1u << (uint32_t)ptr_r));
       }
@@ -7778,7 +8285,7 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
        * scalar globals) or the symbol was explicitly aligned.  Packed structs
        * and struct-typed globals stay on the STR-pair path. */
       Sym *sym = dest.u.sym.sym ? validate_sym_for_reloc(dest.u.sym.sym) : NULL;
-      int addr_r = mach_alloc_scratch(&ctx, excl);
+      int addr_r = mach_alloc_scratch_for_sym(&ctx, excl, sym, 0);
       tcc_machine_load_constant(addr_r, PREG_REG_NONE, 0, 0, sym);
       const int32_t addend = dest.u.sym.addend;
       const int32_t addend_hi = addend + 4;
@@ -7941,7 +8448,7 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
   case MACH_OP_SYMBOL:
   {
     Sym *sym = dest.u.sym.sym ? validate_sym_for_reloc(dest.u.sym.sym) : NULL;
-    int addr_r = mach_alloc_scratch(&ctx, (uint32_t)1u << (uint32_t)src_reg);
+    int addr_r = mach_alloc_scratch_for_sym(&ctx, (uint32_t)1u << (uint32_t)src_reg, sym, 0);
     tcc_machine_load_constant(addr_r, PREG_REG_NONE, 0, 0, sym);
     const int32_t addend = dest.u.sym.addend;
     const int abs_off = addend < 0 ? (int)(-addend) : (int)addend;
@@ -8071,8 +8578,10 @@ ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperan
                           : (thumb_shift){.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
 
   /* Fast path: 64-bit constant-displacement load using LDRD [base, #imm].
-   * LDRD supports word-aligned offsets in range [-1020, 1020]. */
-  if (dest.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM)
+   * LDRD supports word-aligned offsets in range [-1020, 1020].
+   * base.underalign_hint (packed-derived address): skip — LDRD faults on
+   * unaligned addresses; the generic path below emits an LDR pair instead. */
+  if (dest.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM && !base.underalign_hint)
   {
     int imm = (int)index.u.imm.val;
     int sign = (imm < 0);
@@ -8153,7 +8662,15 @@ ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperan
     int ea_r = mach_alloc_scratch(&ctx, excl);
     ot_check(th_add_reg((uint32_t)ea_r, (uint32_t)base_reg, (uint32_t)index_reg, flags_safe(), shift,
                         ENFORCE_ENCODING_NONE));
-    ot_check(th_ldrd_imm((uint32_t)dest_lo, (uint32_t)dest_hi, (uint32_t)ea_r, 0, 5));
+    if (base.underalign_hint)
+    {
+      /* Packed-derived address: LDRD faults on unaligned addresses, plain LDR
+       * tolerates them (UNALIGN_TRP=0).  load_from_base with a general base
+       * register emits the safe LDR pair. */
+      load_from_base(dest_lo, dest_hi, IROP_BTYPE_INT64, 0, 0, 0, (uint32_t)ea_r);
+    }
+    else
+      ot_check(th_ldrd_imm((uint32_t)dest_lo, (uint32_t)dest_hi, (uint32_t)ea_r, 0, 5));
     if (!dest_is_reg)
     {
       MachineOperand dest_lo_mop = mach_make_lo_half(&dest);
@@ -8271,8 +8788,10 @@ ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOpera
                           ? (thumb_shift){.type = THUMB_SHIFT_NONE, .value = 0, .mode = THUMB_SHIFT_IMMEDIATE}
                           : (thumb_shift){.type = THUMB_SHIFT_LSL, .value = (uint32_t)shift_amount, .mode = THUMB_SHIFT_IMMEDIATE};
 
-  /* Fast path: 64-bit constant-displacement store using STRD [base, #imm]. */
-  if (value.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM)
+  /* Fast path: 64-bit constant-displacement store using STRD [base, #imm].
+   * base.underalign_hint (packed-derived address): skip — STRD faults on
+   * unaligned addresses; the generic path below emits an STR pair instead. */
+  if (value.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM && !base.underalign_hint)
   {
     int imm = (int)index.u.imm.val;
     int sign = (imm < 0);
@@ -8318,7 +8837,16 @@ ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOpera
     int ea_r = mach_alloc_scratch(&ctx, excl);
     ot_check(th_add_reg((uint32_t)ea_r, (uint32_t)base_reg, (uint32_t)index_reg, flags_safe(), shift,
                         ENFORCE_ENCODING_NONE));
-    ot_check(th_strd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)ea_r, 0, 6));
+    if (base.underalign_hint)
+    {
+      /* Packed-derived address: STRD faults on unaligned addresses, plain STR
+       * tolerates them (UNALIGN_TRP=0).  Store the halves separately. */
+      excl |= (1u << (uint32_t)ea_r);
+      th_store32_imm_or_reg_ex(lo_reg, (uint32_t)ea_r, 0, 0, excl);
+      th_store32_imm_or_reg_ex(hi_reg, (uint32_t)ea_r, 4, 0, excl);
+    }
+    else
+      ot_check(th_strd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)ea_r, 0, 6));
     mach_release_all(&ctx);
     return;
   }
@@ -8909,6 +9437,201 @@ static void complex_pair_writeback(MachineOperand *d_lo, int lo_reg, MachineOper
   }
 }
 
+/* thumb_emit_dcp_addsub_mop: inline double add/subtract on RP2350's DCP.
+ *
+ * The sequence is the one in lib/fp/arm/rp2350/dcp_aeabi.S, itself transcribed
+ * from pico-sdk's dcp_canned.inc.S -- keep the two in step:
+ *
+ *   WXUP a ; WYUP b ; ADD0 ; ADD1|SUB1 ; NRDD ; RDDA|RDDS
+ *
+ * Six instructions, no scratch registers, and -- unlike the library form --
+ * on whichever registers the allocator already chose.  `mcrr`/`mrrc` move a
+ * GPR *pair* but place no consecutiveness constraint on it (that is LDRD's
+ * rule, not theirs), so any two distinct registers work and nothing has to be
+ * shuffled into r0-r3 first.
+ *
+ * Overwriting a source register with the result is safe: WXUP/WYUP have
+ * already copied both operands into the coprocessor by the time RDDA/RDDS
+ * writes back.  The destination is still excluded from source allocation
+ * because the shared 64-bit idiom does that, not because it is required.
+ */
+static void thumb_emit_dcp_addsub_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, int is_sub)
+{
+  MachineCodegenContext mctx = {0};
+  uint32_t excl = 0;
+
+  /* Destination pair first, so deref resolution never allocates a scratch that
+   * overlaps it and then restores over the result (same reason as the integer
+   * 64-bit path). */
+  int rd_lo, rd_hi;
+  bool store_lo = false, store_hi = false;
+  if (dest.kind == MACH_OP_REG && !dest.needs_deref && dest.u.reg.r0 != (int)PREG_REG_NONE && dest.u.reg.r1 >= 0)
+  {
+    rd_lo = dest.u.reg.r0;
+    rd_hi = dest.u.reg.r1;
+    excl |= (1u << (uint32_t)rd_lo) | (1u << (uint32_t)rd_hi);
+  }
+  else
+  {
+    rd_lo = mach_alloc_scratch(&mctx, excl);
+    excl |= (1u << (uint32_t)rd_lo);
+    rd_hi = mach_alloc_scratch(&mctx, excl);
+    excl |= (1u << (uint32_t)rd_hi);
+    store_lo = store_hi = (dest.kind != MACH_OP_NONE);
+  }
+
+  /* Pre-exclude both sources' registers so resolving one deref cannot steal
+   * the physical registers of the other. */
+  if (src1.kind == MACH_OP_REG)
+  {
+    if (src1.u.reg.r0 != (int)PREG_REG_NONE)
+      excl |= (1u << (uint32_t)src1.u.reg.r0);
+    if (!src1.needs_deref && src1.is_64bit && src1.u.reg.r1 >= 0)
+      excl |= (1u << (uint32_t)src1.u.reg.r1);
+  }
+  if (src2.kind == MACH_OP_REG)
+  {
+    if (src2.u.reg.r0 != (int)PREG_REG_NONE)
+      excl |= (1u << (uint32_t)src2.u.reg.r0);
+    if (!src2.needs_deref && src2.is_64bit && src2.u.reg.r1 >= 0)
+      excl |= (1u << (uint32_t)src2.u.reg.r1);
+  }
+
+  MachineOperand a = mach_resolve_deref_64(&mctx, &src1, &excl);
+  MachineOperand b = mach_resolve_deref_64(&mctx, &src2, &excl);
+
+  int a_lo, a_hi, b_lo, b_hi;
+  mach_ensure_pair_in_regs(&mctx, &a, &excl, &a_lo, &a_hi);
+  mach_ensure_pair_in_regs(&mctx, &b, &excl, &b_lo, &b_hi);
+
+  ot_check(th_mcrr(4, 1, (uint32_t)a_lo, (uint32_t)a_hi, 0, 0)); /* WXUP a */
+  ot_check(th_mcrr(4, 1, (uint32_t)b_lo, (uint32_t)b_hi, 1, 0)); /* WYUP b */
+  ot_check(th_cdp(4, 0, 0, 0, 1, 0, 0));                         /* ADD0 */
+  ot_check(th_cdp(4, 1, 0, 0, 1, is_sub ? 1 : 0, 0));            /* SUB1 : ADD1 */
+  ot_check(th_cdp(4, 8, 0, 0, 0, 1, 0));                         /* NRDD */
+  ot_check(th_mrrc(4, is_sub ? 3 : 1, (uint32_t)rd_lo, (uint32_t)rd_hi, 0, 0)); /* RDDS : RDDA */
+
+  if (store_lo)
+  {
+    MachineOperand dst_lo = mach_make_lo_half(&dest);
+    dst_lo.btype = IROP_BTYPE_INT32;
+    mach_writeback_dest(&dst_lo, rd_lo);
+  }
+  if (store_hi)
+  {
+    MachineOperand dst_hi = mach_make_hi_half(&dest);
+    dst_hi.btype = IROP_BTYPE_INT32;
+    mach_writeback_dest(&dst_hi, rd_hi);
+  }
+  mach_release_all(&mctx);
+}
+
+/* thumb_emit_vfp_arith_mop: inline single-precision arithmetic on the FPU.
+ *
+ *   vmov s0, rn ; vmov s1, rm ; v<op>.f32 s0, s0, s1 ; vmov rd, s0
+ *
+ * Four instructions against a BL plus the library's own five.  s0/s1 are used
+ * as fixed scratch rather than allocated: this is the softfp ABI, so no float
+ * value ever lives in a VFP register between operations and s0-s15 are free at
+ * every point.  That is also what keeps this independent of Phase 5 proper --
+ * making floats *live* in s0-s15 needs a register class and th_vldr/th_vstr
+ * (which do not exist yet) for spill and reload.
+ *
+ * The values move through GPRs on both sides, so nothing here depends on the
+ * float ABI and fast-mode objects stay link-compatible with portable ones.
+ */
+static void thumb_emit_vfp_arith_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op)
+{
+  MachineCodegenContext ctx = {0};
+  int rd = mach_get_dest_reg(&ctx, &dest, 0);
+  uint32_t excl = (1u << (uint32_t)rd);
+  int rn = mach_ensure_in_reg(&ctx, &src1, excl);
+  if (thumb_is_hw_reg(rn))
+    excl |= (1u << (uint32_t)rn);
+  int rm = mach_ensure_in_reg(&ctx, &src2, excl);
+
+  ot_check(th_vmov_gp_sp((uint16_t)rn, 0, 0)); /* s0 = rn */
+  ot_check(th_vmov_gp_sp((uint16_t)rm, 1, 0)); /* s1 = rm */
+  switch (op)
+  {
+  case TCCIR_OP_FADD:
+    ot_check(th_vadd_f(0, 0, 1, 0));
+    break;
+  case TCCIR_OP_FSUB:
+    ot_check(th_vsub_f(0, 0, 1, 0));
+    break;
+  case TCCIR_OP_FMUL:
+    ot_check(th_vmul_f(0, 0, 1, 0));
+    break;
+  case TCCIR_OP_FDIV:
+    ot_check(th_vdiv_f(0, 0, 1, 0));
+    break;
+  default:
+    tcc_error("compiler_error: thumb_emit_vfp_arith_mop: unhandled op %d", (int)op);
+    break;
+  }
+  ot_check(th_vmov_gp_sp((uint16_t)rd, 0, 1)); /* rd = s0 */
+
+  mach_writeback_dest(&dest, rd);
+  mach_release_all(&ctx);
+}
+
+/* thumb_emit_dcp_cmp_mop: inline double compare on RP2350's DCP.
+ *
+ *   WXUP a ; WYUP b ; ADD0 ; RCMP apsr_nzcv
+ *
+ * Four instructions and no result register: RCMP with Rt == PC writes the
+ * relation directly into the flags, so the compare feeds an ordinary
+ * conditional branch instead of a call plus flag decode.
+ *
+ * The flag encoding is the AEABI's -- C set means "ordered and >=", Z set
+ * means equal, V set means unordered -- and is read with *unsigned*
+ * conditions.  ir/gen/float.c already mirrored the operands and recorded
+ * TOK_UGT / TOK_UGE accordingly, so this only has to compare in operand
+ * order.
+ *
+ * The RCMP is emitted LAST, after mach_release_all(): releasing can restore
+ * saved scratch registers, and the flags must be the final thing written
+ * before the branch consumes them.  Splitting ADD0 from RCMP is safe because
+ * the DCP holds its state across unrelated core instructions -- that is the
+ * same property __rp2350_dcp_save/_restore rely on.
+ */
+static void thumb_emit_dcp_cmp_mop(MachineOperand src1, MachineOperand src2)
+{
+  MachineCodegenContext mctx = {0};
+  uint32_t excl = 0;
+
+  if (src1.kind == MACH_OP_REG)
+  {
+    if (src1.u.reg.r0 != (int)PREG_REG_NONE)
+      excl |= (1u << (uint32_t)src1.u.reg.r0);
+    if (!src1.needs_deref && src1.is_64bit && src1.u.reg.r1 >= 0)
+      excl |= (1u << (uint32_t)src1.u.reg.r1);
+  }
+  if (src2.kind == MACH_OP_REG)
+  {
+    if (src2.u.reg.r0 != (int)PREG_REG_NONE)
+      excl |= (1u << (uint32_t)src2.u.reg.r0);
+    if (!src2.needs_deref && src2.is_64bit && src2.u.reg.r1 >= 0)
+      excl |= (1u << (uint32_t)src2.u.reg.r1);
+  }
+
+  MachineOperand a = mach_resolve_deref_64(&mctx, &src1, &excl);
+  MachineOperand b = mach_resolve_deref_64(&mctx, &src2, &excl);
+
+  int a_lo, a_hi, b_lo, b_hi;
+  mach_ensure_pair_in_regs(&mctx, &a, &excl, &a_lo, &a_hi);
+  mach_ensure_pair_in_regs(&mctx, &b, &excl, &b_lo, &b_hi);
+
+  ot_check(th_mcrr(4, 1, (uint32_t)a_lo, (uint32_t)a_hi, 0, 0)); /* WXUP a */
+  ot_check(th_mcrr(4, 1, (uint32_t)b_lo, (uint32_t)b_hi, 1, 0)); /* WYUP b */
+  ot_check(th_cdp(4, 0, 0, 0, 1, 0, 0));                         /* ADD0 */
+
+  mach_release_all(&mctx);
+
+  ot_check(th_mrc(4, 0, R_PC, 0, 0, 1, 0)); /* RCMP apsr_nzcv */
+}
+
 /* Process complex double addition/subtraction via MachineOperands.
  * (a+bi) + (c+di) = (a+c) + (b+d)i
  * (a+bi) - (c+di) = (a-c) + (b-d)i
@@ -9320,6 +10043,45 @@ ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, Ma
   const int is_double = (src1.btype == IROP_BTYPE_FLOAT64) || (dest.btype == IROP_BTYPE_FLOAT64);
   const char *func_name = NULL;
 
+  /* --- Inline double lowering, where the target has it ---
+   *
+   * Reaching here with a has_d* bit set means ir_put_soft_call_fpu_if_needed()
+   * deliberately did NOT rewrite this operation into an __aeabi_ call, so the
+   * backend owes an inline sequence.  Falling through to the call path would
+   * still produce working code, but ir_op_is_implicit_call_ra() keys its
+   * clobber model on the same bits -- so the two must agree or the allocator
+   * stops modelling r0-r3 as dead across an operation that still calls.
+   * Enable a has_d* bit and its emitter in the same commit. */
+  {
+    const FloatingPointConfig *fpu = architecture_config.fpu;
+    if (is_double && fpu && fpu->double_impl == FP_DOUBLE_IMPL_DCP)
+    {
+      if (op == TCCIR_OP_FADD && fpu->has_dadd)
+        return thumb_emit_dcp_addsub_mop(src1, src2, dest, 0);
+      if (op == TCCIR_OP_FSUB && fpu->has_dsub)
+        return thumb_emit_dcp_addsub_mop(src1, src2, dest, 1);
+      if (op == TCCIR_OP_FCMP && fpu->has_dcmp)
+        return thumb_emit_dcp_cmp_mop(src1, src2);
+    }
+
+    /* Single precision is plain VFP wherever it is inline at all -- there is
+     * no second single-precision implementation on ARM to discriminate
+     * between, so has_f* alone selects the sequence.
+     *
+     * -mfloat-abi=soft is the one mode that forbids it: soft means "emit no
+     * FPU instructions at all", as distinct from softfp, which is FPU
+     * instructions with GPR argument passing (the default here, and what
+     * -mfpu=rp2350 keeps).  has_f* describes the silicon, not the ABI, so the
+     * ABI has to be checked separately or `-mfloat-abi=soft` starts emitting
+     * vadd.f32. */
+    if (!is_double && fpu && tcc_state && tcc_state->float_abi != ARM_SOFT_FLOAT)
+    {
+      if ((op == TCCIR_OP_FADD && fpu->has_fadd) || (op == TCCIR_OP_FSUB && fpu->has_fsub) ||
+          (op == TCCIR_OP_FMUL && fpu->has_fmul) || (op == TCCIR_OP_FDIV && fpu->has_fdiv))
+        return thumb_emit_vfp_arith_mop(src1, src2, dest, op);
+    }
+  }
+
   /* --- FNEG: XOR sign bit, no BL needed --- */
   if (op == TCCIR_OP_FNEG)
   {
@@ -9607,7 +10369,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       push_align_pad = 4;
     }
 
-    th_sym_t();
+    map_sym_t();
 
     /* Variadic: push r0-r3 FIRST so they are contiguous with stack args */
     vararg_push_size = 0;
@@ -9673,7 +10435,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       }
     }
 
-    th_sym_t();
+    map_sym_t();
 
     /* Variadic: push r0-r3 FIRST so they are contiguous with stack args */
     vararg_push_size = 0;
@@ -9754,12 +10516,6 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    * save area above the callee-saved pushes, adjacent to the stack arguments.
    * __gr_top points to the end of that area (= start of stack args).
    */
-  int named_reg_bytes = 0;
-  if (func_var && ir)
-  {
-    named_reg_bytes = ir->named_arg_reg_bytes;
-  }
-
   if (func_var)
   {
     /* Store r0-r3 at FP-16..FP-4 for named parameter access.
@@ -9770,23 +10526,12 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     tcc_gen_machine_store_to_stack(R2, -(callee_push_size + 8));
     tcc_gen_machine_store_to_stack(R3, -(callee_push_size + 4));
 
-    /* __gr_top = FP + offset_to_args (end of pushed r0-r3, start of stack args).
-     * This is the top of the contiguous register save + stack arg area. */
-    {
-      const int fp_or_sp = tcc_state->need_frame_pointer ? R_FP : R_SP;
-      ot_check(th_add_imm(R12, fp_or_sp, offset_to_args, flags_safe(), ENFORCE_ENCODING_NONE));
-    }
-    tcc_gen_machine_store_to_stack(R12, -(callee_push_size + 20));
-
-    /* store the number of named-arg bytes consumed in r0-r3 */
-    tcc_machine_load_constant(R12, PREG_NONE, named_reg_bytes, 0, NULL);
-    tcc_gen_machine_store_to_stack(R12, -(callee_push_size + 24));
-
-    /* store named stack arg bytes at FP-28 so __tcc_va_start can compute
-     * __stack = __gr_top + named_stack_bytes (skipping named args on stack) */
-    int named_stack_bytes = ir ? ir->named_arg_stack_bytes : 0;
-    tcc_machine_load_constant(R12, PREG_NONE, named_stack_bytes, 0, NULL);
-    tcc_gen_machine_store_to_stack(R12, -(callee_push_size + 28));
+    /* The frame-metadata triple that used to live at FP-20/-24/-28 (__gr_top,
+     * named_arg_reg_bytes, named_arg_stack_bytes) is gone: it existed purely so
+     * the runtime __tcc_va_start could rediscover the address of the first
+     * anonymous argument.  TOK_builtin_va_start now materializes that address
+     * directly (a PARAM-relative LEA), so those six prologue instructions were
+     * dead in every variadic function. */
   }
 
   /* __builtin_apply_args: save incoming r0-r3 and stack args pointer
@@ -10445,11 +11190,35 @@ static void load_immediate(int reg, uint32_t imm, Sym *sym, int update_flags)
     return;
   }
 
+  /* Plain-constant reuse, same contract as tcc_machine_load_constant: when the
+   * per-register materialisation cache still says `reg` holds this exact
+   * constant, the MOV is dead.  Call-argument marshalling is where this pays:
+   * every stack-passed literal takes a fresh find_call_scratch()+load_immediate
+   * pair, and a variadic call with a run of zero arguments therefore emitted
+   * `movs rN,#0; str rN,[sp,#k]` once per word instead of hoisting the zero.
+   * imm_cache is invalidated by ot()'s emit-level decode and reset at IR
+   * boundaries/calls in both the dry and real passes, so the decision (and the
+   * resulting code size) stays identical between them. */
+  const int cacheable = thumb_gen_state.generating_function && reg >= 0 && reg < 16;
+  const int64_t key = (int64_t)(uint32_t)imm;
+
+  if (cacheable && imm_cache[reg].valid && imm_cache[reg].sym == NULL && imm_cache[reg].value == key)
+    return;
+
   /* Try to encode as ARM immediate (supports various rotated 8-bit patterns) */
   if (!ot(th_generic_mov_imm(reg, imm)))
   {
     /* Value doesn't fit in immediate encoding, use literal pool */
     load_full_const(reg, PREG_NONE, imm, 0);
+  }
+
+  /* Record after the emit: ot()/load_full_const just invalidated imm_cache[reg]
+   * for the instruction they produced. */
+  if (cacheable)
+  {
+    imm_cache[reg].value = key;
+    imm_cache[reg].sym = NULL;
+    imm_cache[reg].valid = 1;
   }
 }
 
@@ -10625,10 +11394,13 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
           uint32_t excl = (1u << m->dst_reg) | (1u << m->dst_reg_hi);
           base = mach_ensure_in_reg(&mctx, &addr, excl);
         }
-        /* Use the 64-bit load_from_base path so it preserves the base when
-         * base == dst_reg (otherwise the lo-load would clobber it before
-         * the hi-load can use it). */
-        load_from_base(m->dst_reg, m->dst_reg_hi, IROP_BTYPE_INT64, 0, 0, 0, (uint32_t)base);
+        /* Proven-aligned access (mop.align4): LDRD straight into the pair —
+         * Rt == Rn is fine without writeback, so no base preservation needed.
+         * Otherwise the 64-bit load_from_base path, which preserves the base
+         * when base == dst_reg (the lo-load would clobber it before the
+         * hi-load can use it) and stays unaligned-safe. */
+        if (!(m->mop.align4 && try_ldrd_pair(m->dst_reg, m->dst_reg_hi, base, 0, 0)))
+          load_from_base(m->dst_reg, m->dst_reg_hi, IROP_BTYPE_INT64, 0, 0, 0, (uint32_t)base);
       }
       else
       {
@@ -11147,8 +11919,51 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
   int struct_size = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->stack_size : loc->size;
   int words = (struct_size + 3) / 4;
 
-  ScratchRegAlloc struct_sc = get_scratch_reg_with_save(0);
-  int base_addr_reg = get_struct_base_addr_mop(mop, struct_sc.reg);
+  /* A frame-resident source needs no base register: LDR/LDRD carry the frame
+   * offset in their own immediate field, so the `add rX, sp, #off` that
+   * get_struct_base_addr_mop emits is pure overhead — one instruction per
+   * marshaled by-value struct argument.  Only take the direct form while every
+   * source word stays inside the offset range both LDR and LDRD encode
+   * (word-aligned, 0..1020); outside it the per-word fallback would cost more
+   * than the single ADD.  Nothing in the loop below pushes a scratch across a
+   * source load, so the SP bias folded in here stays valid throughout. */
+  int frame_raw = 0;
+  bool src_is_frame = false;
+  if (mop->kind == MACH_OP_SPILL && !mop->needs_deref)
+  {
+    frame_raw = mop->u.spill.offset;
+    src_is_frame = true;
+  }
+  else if (mop->kind == MACH_OP_FRAME_ADDR)
+  {
+    frame_raw = mop->u.frame.offset;
+    src_is_frame = true;
+  }
+
+  int base_bias = 0;
+  int base_addr_reg;
+  ScratchRegAlloc struct_sc = {0};
+  bool have_struct_sc = false;
+
+  if (src_is_frame)
+  {
+    const int adj = fp_adjust_local_offset(frame_raw, 0);
+    const int first = adj + struct_src_offset;
+    const int last = first + (words > 0 ? (words - 1) * 4 : 0);
+    if ((adj & 3) == 0 && first >= 0 && last <= 1020)
+    {
+      base_addr_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+      base_bias = adj;
+    }
+    else
+      src_is_frame = false;
+  }
+  if (!src_is_frame)
+  {
+    struct_sc = get_scratch_reg_with_save(0);
+    have_struct_sc = true;
+    base_addr_reg = get_struct_base_addr_mop(mop, struct_sc.reg);
+  }
 
   /* Second data register (besides LR) for paired LDRD/STRD.  find_call_scratch
    * never pushes (SP-relative store offsets must stay valid) and we exclude LR
@@ -11164,7 +11979,7 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
   {
     for (; w + 1 < words; w += 2)
     {
-      int src_off = struct_src_offset + w * 4;
+      int src_off = base_bias + struct_src_offset + w * 4;
       int dst_off = stack_offset + w * 4;
 
       if (!(src_aligned && tcc_gen_machine_try_ldrd_base(ARM_LR, data2, base_addr_reg, src_off)))
@@ -11183,12 +11998,13 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
   /* Trailing odd word, or every word when pairing was unavailable. */
   for (; w < words; ++w)
   {
-    int src_off = struct_src_offset + w * 4;
+    int src_off = base_bias + struct_src_offset + w * 4;
     int dst_off = stack_offset + w * 4;
     load_struct_word_into(ARM_LR, base_addr_reg, src_off);
     store_word_to_stack_safe(ARM_LR, dst_off, base_addr_reg);
   }
-  restore_scratch_reg(&struct_sc);
+  if (have_struct_sc)
+    restore_scratch_reg(&struct_sc);
 }
 
 /* Find a free scratch register via liveness (no push/pop).
@@ -11260,17 +12076,48 @@ static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, T
      * presave_stack_args_from_arg_regs before the register shuffle. */
     if (mop->u.reg.r0 <= ARM_R3 || mop->u.reg.r1 <= ARM_R3)
       return;
-    store_word_to_stack(mop->u.reg.r0, lo_offset);
-    store_word_to_stack(mop->u.reg.r1, hi_offset);
+    /* The two halves land on adjacent, word-aligned SP slots — exactly STRD's
+     * shape.  (STRD to the outgoing argument area is always safe: SP-relative,
+     * word-multiple offset, SP 8-aligned.) */
+    if (!tcc_gen_machine_try_strd_base(mop->u.reg.r0, mop->u.reg.r1, ARM_SP, lo_offset))
+    {
+      store_word_to_stack(mop->u.reg.r0, lo_offset);
+      store_word_to_stack(mop->u.reg.r1, hi_offset);
+    }
   }
   else if (mop->kind == MACH_OP_IMM)
   {
     uint64_t imm64 = (uint64_t)mop->u.imm.val;
+    uint32_t lo_val = (uint32_t)imm64;
+    uint32_t hi_val = (uint32_t)(imm64 >> 32);
     int scr = find_call_scratch(0, arg_move_dst_mask);
-    load_immediate(scr, (uint32_t)imm64, NULL, false);
-    store_word_to_stack(scr, lo_offset);
-    load_immediate(scr, (uint32_t)(imm64 >> 32), NULL, false);
-    store_word_to_stack(scr, hi_offset);
+    load_immediate(scr, lo_val, NULL, false);
+
+    /* Pair the two halves into one STRD.  When both halves are equal (every
+     * `0.0`/`0LL` variadic argument) the single scratch is stored twice —
+     * try_strd_pair permits Rt == Rt2 (only LDRD forbids it).  Otherwise take a
+     * second scratch for the high half; find_call_scratch falls back to R_IP
+     * without honouring the exclude mask, so a collision means no pair. */
+    int hi_scr = scr;
+    if (hi_val != lo_val)
+    {
+      hi_scr = find_call_scratch(1u << (uint32_t)scr, arg_move_dst_mask);
+      if (hi_scr == scr)
+      {
+        /* No second scratch: fall back to the sequential two-store form. */
+        store_word_to_stack(scr, lo_offset);
+        load_immediate(scr, hi_val, NULL, false);
+        store_word_to_stack(scr, hi_offset);
+        return;
+      }
+      load_immediate(hi_scr, hi_val, NULL, false);
+    }
+
+    if (!tcc_gen_machine_try_strd_base(scr, hi_scr, ARM_SP, lo_offset))
+    {
+      store_word_to_stack(scr, lo_offset);
+      store_word_to_stack(hi_scr, hi_offset);
+    }
   }
   else if (mop->needs_deref && mop->kind != MACH_OP_PARAM_STACK)
   {
@@ -11916,6 +12763,8 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
       }
     }
   }
+  if (nested_save_count > dry_run_state.max_nested_saves)
+    dry_run_state.max_nested_saves = nested_save_count;
 
   /* Stack args are already placed in the pre-reserved outgoing area at [SP+0].
    * No need to adjust SP — the area was allocated in the prologue. */
@@ -12133,6 +12982,187 @@ static int can_narrow_backward_branch(int32_t target_ir, int is_conditional, int
   return is_conditional ? branch_fits_t1(offset) : branch_fits_t2(offset);
 }
 
+/* Check if a FORWARD branch to target_ir can use a narrow encoding.
+ *
+ * The target address is not known yet in the real pass — it is backpatched
+ * later — so the decision comes from the rehearsal pass, which laid the
+ * function out with the same registers and frame the real pass uses and
+ * differs from it only by emitting every branch wide.  The real pass is
+ * therefore never larger, so the real distance between two IR instructions is
+ * <= their rehearsal distance, and "fits in range in the rehearsal" implies
+ * "fits in range for real".
+ *
+ * The one way that breaks is a literal pool flush landing between the branch
+ * and its target in the real pass but not in the rehearsal — it inserts up to
+ * ~1 KB.  Since the real pass emits fewer bytes, code_size grows more slowly
+ * and a flush can only move LATER, so one sitting before the branch in the
+ * rehearsal could drift into the range.  Rather than pin flush points, this
+ * refuses to narrow unless no flush is possible at all: the range adds at most
+ * dry_dist bytes of code and (entries in range * 4) bytes of pool, and if that
+ * upper bound stays below the flush threshold the monotonicity argument holds
+ * unconditionally. */
+/* Upper bound on how many bytes the real pass can shed, relative to the
+ * rehearsal, strictly between two IR instructions.  The rehearsal emits every
+ * branch wide and never fuses CBZ, so the only shrink sources are:
+ *   - a wide branch narrowed to its 16-bit form            (4 -> 2, saves 2)
+ *   - a CMP+B.W pair fused into a single CBZ/CBNZ          (6 -> 2, saves 4)
+ * Both are bounded by 4 bytes per branch instruction in the range, so counting
+ * branches is a safe over-estimate. */
+static int rehearsal_max_shrink_between(TCCIRState *ir, int from_ir, int to_ir)
+{
+  int branches = 0;
+  for (int k = from_ir + 1; k < to_ir; k++)
+  {
+    TccIrOp op = (TccIrOp)ir->compact_instructions[k].op;
+    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
+      branches++;
+  }
+  return branches * 4;
+}
+
+/* Can `CMP rN,#0; B<eq|ne> target` at current_ir_idx be fused into a single
+ * 16-bit CBZ/CBNZ?  CBZ is forward-only with a 0..126 byte range and cannot be
+ * widened in place once committed (th_patch_call errors), so the check has to
+ * be sound in BOTH directions, unlike plain narrowing which only needs an
+ * upper bound:
+ *
+ *   upper — the real offset is at most the rehearsal-derived one, because the
+ *           real pass only ever shrinks;
+ *   lower — the real offset is at least that minus the maximum shrink the
+ *           range can undergo, and it must not go below 0.
+ *
+ * The fusion itself removes 6 bytes (CMP + wide branch) and puts back 2 at the
+ * branch site, which is why the base offset is dry_dist - 8 rather than the
+ * dry_dist - 4 that plain narrowing uses. */
+ST_FUNC int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir || !ir->codegen_cbz_dry_mapping || !ir->codegen_dry_pool_entries)
+    return 0;
+  if (current_ir_idx < 0 || target_ir <= current_ir_idx)
+    return 0;
+  if (target_ir >= ir->ir_to_code_mapping_size || target_ir >= ir->next_instruction_index)
+    return 0;
+
+  const uint32_t *dry = ir->codegen_cbz_dry_mapping;
+  int dry_dist = (int)dry[target_ir] - (int)dry[current_ir_idx];
+  if (dry_dist < 0)
+    return 0;
+
+  int max_offset = dry_dist - 8;
+  int min_offset = max_offset - rehearsal_max_shrink_between(ir, current_ir_idx, target_ir);
+  if (min_offset < 0 || max_offset > 126)
+    return 0;
+
+  /* A pool flush anywhere in the range would push the branch out of its 126-byte
+   * reach, and unlike a wide branch it cannot be repaired.  Same bound as
+   * can_narrow_forward_branch. */
+  if (th_literal_pool_would_flush_for(2))
+    return 0;
+  int entries_in_range =
+      (int)ir->codegen_dry_pool_entries[target_ir] - (int)ir->codegen_dry_pool_entries[current_ir_idx];
+  if (entries_in_range < 0)
+    return 0;
+  /* The emitter flushes at THUMB_POOL_FLUSH_BUDGET on code_size + pool*4 + upcoming, evaluated
+   * continuously while the range's instructions emit.  This one-shot estimate
+   * tracks the same terms, but the real pass can drift past it — alignment
+   * padding, the branch-over-pool word, per-emit upcoming bytes, dry-vs-real
+   * sizing differences.  Fuzz seed float:8061 passed at pressure 1016 and then
+   * took a 188-byte in-range flush (COMPILE_FAIL at th_patch_call, offset
+   * 204).  Require a 64-byte cushion so a hairline pass can't commit an
+   * unrepairable CBZ. */
+  int pressure = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4 + dry_dist +
+                 entries_in_range * 4 + 8;
+  if (pressure >= THUMB_POOL_FLUSH_BUDGET - 64)
+    return 0;
+
+  return 1;
+}
+
+/* Return jumps pass target_ir == -1: they go to the epilogue, which has no IR
+ * index, so can_narrow_forward_branch cannot size them and they were always
+ * emitted wide.  The rehearsal recorded where the body ends — which is exactly
+ * where the epilogue begins — so the same monotonicity argument applies: the
+ * real pass is never larger, so a distance that fits in the rehearsal fits for
+ * real.  Same pool-flush bound as the forward case, using the running entry
+ * total at the end of the function. */
+static int can_narrow_epilogue_branch(int32_t target_ir, int current_ir_idx)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (target_ir != -1)
+    return 0;
+  if (!ir || !ir->codegen_cbz_dry_mapping || !ir->codegen_dry_pool_entries)
+    return 0;
+  if (current_ir_idx < 0 || current_ir_idx >= ir->next_instruction_index)
+    return 0;
+  if (ir->codegen_rehearsal_end == 0)
+    return 0;
+
+  int dry_dist = (int)ir->codegen_rehearsal_end - (int)ir->codegen_cbz_dry_mapping[current_ir_idx];
+  if (dry_dist < 0)
+    return 0;
+  if (!branch_fits_t2(dry_dist - 4))
+    return 0;
+
+  if (th_literal_pool_would_flush_for(2))
+    return 0;
+
+  /* Bound the pool pressure over the whole remaining body: entries added from
+   * here to the last instruction is the most that can accumulate before the
+   * epilogue. */
+  int last = ir->next_instruction_index - 1;
+  int entries_in_range = (int)ir->codegen_dry_pool_entries[last] -
+                         (int)ir->codegen_dry_pool_entries[current_ir_idx];
+  if (entries_in_range < 0)
+    return 0;
+  int pressure = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4 + dry_dist +
+                 entries_in_range * 4 + 8;
+  if (pressure >= THUMB_POOL_FLUSH_BUDGET)
+    return 0;
+
+  return 1;
+}
+
+static int can_narrow_forward_branch(int32_t target_ir, int is_conditional, int current_ir_idx)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir || !ir->codegen_cbz_dry_mapping || !ir->codegen_dry_pool_entries)
+    return 0;
+  if (current_ir_idx < 0 || target_ir <= current_ir_idx)
+    return 0;
+  if (target_ir >= ir->ir_to_code_mapping_size || target_ir >= ir->next_instruction_index)
+    return 0;
+
+  const uint32_t *dry = ir->codegen_cbz_dry_mapping;
+  int dry_dist = (int)dry[target_ir] - (int)dry[current_ir_idx];
+  if (dry_dist < 0)
+    return 0;
+
+  /* dry[current_ir_idx] is the START of the IR instruction; the branch may sit
+   * a few bytes into it, which only makes the true offset smaller.  Dropping
+   * the 4-byte Thumb pipeline bias keeps the estimate conservative. */
+  int est_offset = dry_dist - 4;
+  if (!(is_conditional ? branch_fits_t1(est_offset) : branch_fits_t2(est_offset)))
+    return 0;
+
+  /* A flush scheduled at this very point would move the branch itself. */
+  if (th_literal_pool_would_flush_for(2))
+    return 0;
+
+  int entries_in_range =
+      (int)ir->codegen_dry_pool_entries[target_ir] - (int)ir->codegen_dry_pool_entries[current_ir_idx];
+  if (entries_in_range < 0)
+    return 0;
+  /* THUMB_POOL_FLUSH_BUDGET is the flush threshold in th_literal_pool_reserve_upcoming_bytes; the
+   * slack covers the flush's own skip-branch and alignment padding. */
+  int pressure = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4 + dry_dist +
+                 entries_in_range * 4 + 8;
+  if (pressure >= THUMB_POOL_FLUSH_BUDGET)
+    return 0;
+
+  return 1;
+}
+
 ST_FUNC int tcc_gen_machine_jump_mop(TccIrOp op, int32_t target_ir, int ir_idx)
 {
 
@@ -12143,8 +13173,9 @@ ST_FUNC int tcc_gen_machine_jump_mop(TccIrOp op, int32_t target_ir, int ir_idx)
     return 4;
   }
 
-  /* Real pass: try narrow encoding for backward branches */
-  if (can_narrow_backward_branch(target_ir, 0, ir_idx))
+  /* Real pass: try narrow encoding, backward first then forward */
+  if (can_narrow_backward_branch(target_ir, 0, ir_idx) || can_narrow_forward_branch(target_ir, 0, ir_idx) ||
+      can_narrow_epilogue_branch(target_ir, ir_idx))
   {
     ot_check(th_b_t2(0)); /* 16-bit unconditional */
     return 2;
@@ -12167,8 +13198,8 @@ ST_FUNC int tcc_gen_machine_conditional_jump_mop(int32_t condition, TccIrOp op, 
     return 4;
   }
 
-  /* Real pass: try narrow encoding for backward branches */
-  if (can_narrow_backward_branch(target_ir, 1, ir_idx))
+  /* Real pass: try narrow encoding, backward first then forward */
+  if (can_narrow_backward_branch(target_ir, 1, ir_idx) || can_narrow_forward_branch(target_ir, 1, ir_idx))
   {
     ot_check(th_b_t1(cond, 0)); /* 16-bit conditional */
     return 2;

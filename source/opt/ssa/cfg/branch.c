@@ -458,7 +458,7 @@ static int ssa_operand_const(IRSSAOptCtx *ctx, IRBasicBlock *cmp_bb, int cmp_idx
   if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
       op.tag == IROP_TAG_VREG && !op.is_lval) {
     IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
-    if (vi && vi->def_instr >= 0 && vi->def_count <= 1) {
+    if (vi && vi->def_instr >= 0 && vi->def_count <= 1 && vi->def_phi_block < 0) {
       IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
       if (dq->op == TCCIR_OP_ASSIGN) {
         IROperand ds = tcc_ir_op_get_src1(ir, dq);
@@ -998,11 +998,36 @@ static int ssa_fold_cmp_jumpif(IRSSAOptCtx *ctx, int cmp_idx)
   int cmp_block = ssa_block_for_instr(ctx->cfg, cmp_idx);
   IRBasicBlock *cmp_bb = (cmp_block >= 0) ? &ctx->cfg->blocks[cmp_block] : NULL;
 
+  /* A barrel annotation means the CMP really compares src1 against
+   * (src2 SHIFT #n).  In the constant path the shift is applied to v2 below;
+   * every other proof (reflexive/bitfield/expr-equal/stack-addr) reasons
+   * about the RAW src2 and is invalidated by the shift (fuzz seed
+   * signed:840, test 386). */
+  uint8_t cmp_bs = tcc_ir_barrel_shift_at(ir, cmp_q);
+
   /* Reduce the CMP to known values; eqne_only limits stack-address proofs
    * (non-null / possibly-one-aggregate) to EQ/NE conditions. */
   int64_t v1, v2;
   int eqne_only = 0;
   if (ssa_cmp_values_const(ctx, cmp_bb, cmp_idx, src1, src2, &v1, &v2)) {
+    if (cmp_bs) {
+      if (irop_is_64bit(src1) || irop_is_64bit(src2))
+        return 0;
+      uint32_t m = (uint32_t)v2;
+      int amount = cmp_bs & 0x1F;
+      switch (cmp_bs >> 5) {  /* same encoding as fold_apply_barrel */
+      case 1: m = m << amount; break;
+      case 2: m = m >> amount; break;
+      case 3: m = (m >> amount) |
+                  (((m & 0x80000000u) && amount) ? ~(0xFFFFFFFFu >> amount) : 0u);
+        break;
+      case 4: m = amount ? ((m >> amount) | (m << (32 - amount))) : m; break;
+      default: return 0;
+      }
+      v2 = (int64_t)(int32_t)m;
+    }
+  } else if (cmp_bs) {
+    return 0;
   } else if (ssa_cmp_values_reflexive(ctx, src1, src2) ||
              ssa_cmp_values_bitfield(ctx, cmp_idx) ||
              ssa_cmp_values_expr_equal(ctx, cmp_bb, cmp_idx, src1, src2)) {
@@ -1051,7 +1076,9 @@ static int ssa_tz_const_src(IRSSAOptCtx *ctx, IROperand src1, int64_t *out)
   if (vr < 0 || src1.is_lval || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
   IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
-  if (!vi || vi->def_count != 1 || vi->def_instr < 0)
+  /* A phi-defined vreg merges other values at its header: the lone
+   * instruction def is only the entry-path constant. */
+  if (!vi || vi->def_count != 1 || vi->def_instr < 0 || vi->def_phi_block >= 0)
     return 0;
   IRQuadCompact *dq = &ctx->ir->compact_instructions[vi->def_instr];
   if (dq->op != TCCIR_OP_ASSIGN)
@@ -1091,8 +1118,28 @@ static int ssa_fold_test_zero(IRSSAOptCtx *ctx, int tz_idx)
   if (j >= n)
     return 0;
   IRQuadCompact *next_q = &ir->compact_instructions[j];
-  if (next_q->op != TCCIR_OP_JUMPIF)
-    return 0;
+  if (next_q->op != TCCIR_OP_JUMPIF) {
+    /* SETIF/SELECT consumer: same generic fold the constant-CMP path uses.
+     * A jump-target consumer also reads flags set on the other entry path;
+     * keep the TEST_ZERO when a second consumer may still read its flags. */
+    if (next_q->is_jump_target)
+      return 0;
+    int ctok = ssa_flag_consumer_tok(ctx, j);
+    if (ctok < 0)
+      return 0;
+    int result = eval_cond(val, 0, ctok);
+    if (result < 0)
+      return 0;
+    int k2 = ir_skip_nops_forward(ir, j + 1, n);
+    int more_consumers =
+        (k2 < n) && (ir->compact_instructions[k2].op == TCCIR_OP_SETIF ||
+                     ir->compact_instructions[k2].op == TCCIR_OP_JUMPIF ||
+                     ir->compact_instructions[k2].op == TCCIR_OP_SELECT);
+    ssa_rewrite_flag_consumer(ctx, j, result);
+    if (!more_consumers)
+      ssa_opt_nop_instr(ctx, tz_idx);
+    return 1;
+  }
 
   int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, next_q));
   if (tok != TOK_EQ && tok != TOK_NE)

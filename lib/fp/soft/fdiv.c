@@ -72,11 +72,35 @@ float __aeabi_fdiv(float a, float b)
     return ur.f;
   }
 
-  /* Add implicit bit */
+  /* Add implicit bit for normals; scale subnormals into normal form and pay
+   * for it in the exponent, so the restoring division below always starts from
+   * a full-width significand. */
   if (a_exp != 0)
+  {
     a_mant |= FLOAT_IMPLICIT_BIT;
+  }
+  else
+  {
+    a_exp = 1;
+    while (!(a_mant & FLOAT_IMPLICIT_BIT))
+    {
+      a_mant <<= 1;
+      a_exp--;
+    }
+  }
   if (b_exp != 0)
+  {
     b_mant |= FLOAT_IMPLICIT_BIT;
+  }
+  else
+  {
+    b_exp = 1;
+    while (!(b_mant & FLOAT_IMPLICIT_BIT))
+    {
+      b_mant <<= 1;
+      b_exp--;
+    }
+  }
 
   /* Calculate result exponent */
   int result_exp = a_exp - b_exp + FLOAT_EXP_BIAS;
@@ -93,8 +117,11 @@ float __aeabi_fdiv(float a, float b)
     result_exp--;
   }
 
-  /* Generate 25 bits (1 integer + 23 fraction + 1 guard) */
-  for (int i = 0; i < 25; i++)
+  /* Generate 24 significand bits plus SFP_GRS guard bits.  After the
+   * alignment above the first iteration always sets a bit, so the quotient
+   * lands with its leading bit at 23 + SFP_GRS -- exactly where
+   * sfp_round_pack_float() expects it. */
+  for (int i = 0; i < 24 + SFP_GRS; i++)
   {
     quotient <<= 1;
     if (dividend >= divisor)
@@ -105,31 +132,12 @@ float __aeabi_fdiv(float a, float b)
     dividend <<= 1;
   }
 
-  /* Round using guard bit - round half up */
-  uint32_t guard = quotient & 1;
-  quotient >>= 1;
-  if (guard && dividend)
-    quotient++;
+  /* A non-zero remainder means the quotient is inexact; fold that into the
+   * sticky bit.  The old code inspected only a single guard bit and rounded
+   * half *up*, which both mis-rounded exact ties (they must go to even) and
+   * lost the information needed to tell a tie from just-above-a-tie. */
+  quotient |= (dividend != 0);
 
-  /* Final normalization - quotient should be in [2^23, 2^24) */
-  if (quotient >= (FLOAT_IMPLICIT_BIT << 1))
-  {
-    quotient >>= 1;
-    result_exp++;
-  }
-
-  if (result_exp >= 0xFF)
-  {
-    ur.u = make_float(result_sign, 0xFF, 0);
-    return ur.f;
-  }
-  if (result_exp <= 0)
-  {
-    ur.u = make_float(result_sign, 0, 0);
-    return ur.f;
-  }
-
-  uint32_t result_mant = (uint32_t)quotient & FLOAT_MANT_MASK;
-  ur.u = make_float(result_sign, result_exp, result_mant);
+  ur.u = sfp_round_pack_float(result_sign, result_exp, (uint32_t)quotient);
   return ur.f;
 }

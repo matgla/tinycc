@@ -44,12 +44,9 @@ int tcc_ir_callee_is_noreturn(Sym *callee)
 static int tcc_ir_opt_dce__timed(TCCIRState *ir);
 int tcc_ir_opt_dce(TCCIRState *ir)
 {
-  tcc_pass_timing_init();
-  if (!tcc_pass_timing_on) return tcc_ir_opt_dce__timed(ir);
-  unsigned long _t = tcc_pass_clk_us();
-  int _r = tcc_ir_opt_dce__timed(ir);
-  tcc_pass_timing_add("dce", tcc_pass_clk_us() - _t);
-  return _r;
+  int r;
+  TCC_PASS_TIMED(r, "dce", tcc_ir_opt_dce__timed(ir));
+  return r;
 }
 static int tcc_ir_opt_dce__timed(TCCIRState *ir)
 {
@@ -155,11 +152,16 @@ static int tcc_ir_opt_dce__timed(TCCIRState *ir)
 
 #undef MARK_REACHABLE
 
-  /* Mark unreachable instructions as NOP (no array compaction needed) */
+  /* Mark unreachable instructions as NOP (no array compaction needed).
+   * Already-NOP instructions must not count as changes: groups that do not
+   * compact NOPs between iterations (propagation) would otherwise see the
+   * same unreachable NOPs "eliminated" again every round, spinning the group
+   * to its iteration cap and invalidating every other pass's dirty state. */
   int changes = 0;
   for (int i = 0; i < n; i++)
   {
-    if (!(reachable[i / 8] & (1 << (i % 8))))
+    if (!(reachable[i / 8] & (1 << (i % 8))) &&
+        ir->compact_instructions[i].op != TCCIR_OP_NOP)
     {
       ir->compact_instructions[i].op = TCCIR_OP_NOP;
       changes++;

@@ -53,6 +53,14 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "SHR";
   case TCCIR_OP_ROR:
     return "ROR";
+  case TCCIR_OP_CLZ:
+    return "CLZ";
+  case TCCIR_OP_RBIT:
+    return "RBIT";
+  case TCCIR_OP_REV:
+    return "REV";
+  case TCCIR_OP_REV16:
+    return "REV16";
   case TCCIR_OP_PDIV:
     return "PDIV";
   case TCCIR_OP_UDIV:

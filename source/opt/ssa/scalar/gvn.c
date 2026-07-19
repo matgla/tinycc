@@ -12,6 +12,7 @@
 #include "ir.h"
 #include "ssa_opt.h"
 #include "opt_ssa_domwalk.h"
+#include "opt_utils.h" /* pure-helper predicates + call-parameter accessors */
 #include "opt/ssa/gvn.h"
 
 /* ============================================================================
@@ -424,6 +425,289 @@ static int gvn_try_lea(IRSSAOptCtx *ctx, GVNEntry **table, int i)
   return 0;
 }
 
+/* CSE duplicate calls to "const" runtime helpers — routines that touch no
+ * memory, so two calls with equal arguments are interchangeable (the contract
+ * stated on ir_opt_is_pure_helper_name / tcc_ir_is_pure_aeabi).
+ *
+ * Without this, every call is opaque to GVN (gvn_local_flushes) and the
+ * soft-float helpers are re-called for each occurrence of the same expression.
+ * It also costs REACHABILITY proofs: `isunordered(x,y) || !isunordered(x,y)`
+ * is a tautology only once both calls are known to be one value, which is what
+ * lets the dead arm — and its call to an undefined link_error symbol — be
+ * deleted (gcc torture ieee/compare-fp-3 test7).
+ *
+ * Because these helpers read no memory, an intervening store or impure call
+ * cannot change the result; only the argument values decide it.  That is why an
+ * entry may live in the dominator-scoped table rather than the local cache that
+ * the call barrier flushes.
+ *
+ * Limited to one or two register arguments, which covers the whole aeabi
+ * compare/convert/arith set. */
+#define GVN_PURE_CALL_MAX_ARGS 2
+
+static int gvn_pure_callee(TCCIRState *ir, IRQuadCompact *q, Sym **out_sym)
+{
+  IROperand callee = tcc_ir_op_get_src1(ir, q);
+  if (irop_get_tag(callee) != IROP_TAG_SYMREF)
+    return 0;
+  IRPoolSymref *sr = irop_get_symref_ex(ir, callee);
+  if (!sr || !sr->sym || sr->addend != 0)
+    return 0;
+  const char *name = get_tok_str(sr->sym->v, NULL);
+  if (!name)
+    return 0;
+  if (!tcc_ir_is_pure_aeabi(name) && !ir_opt_is_pure_helper_name(name))
+    return 0;
+  *out_sym = sr->sym;
+  return 1;
+}
+
+/* Nothing between the two calls (exclusive) can have changed an argument.
+ * Needed only for arguments that are not SSA-stable — after inlining these are
+ * lvalue reads of the caller's stack slots, whose value is whatever memory
+ * holds at that point.  A jump target ends the stretch because control could
+ * enter carrying other values; stores and impure calls because either can
+ * write the slot, including through a pointer. */
+static int gvn_pure_call_args_unchanged(IRSSAOptCtx *ctx, int from, int to,
+                                        const IROperand *args, int nargs)
+{
+  TCCIRState *ir = ctx->ir;
+  if (from < 0 || to <= from)
+    return 0;
+  for (int k = from + 1; k < to; k++) {
+    IRQuadCompact *q = &ir->compact_instructions[k];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->is_jump_target)
+      return 0;
+    switch (q->op) {
+    case TCCIR_OP_STORE:
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+    case TCCIR_OP_BLOCK_COPY:
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+    case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_LONGJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_NL_LONGJMP:
+      return 0;
+    default:
+      break;
+    }
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t dv = irop_get_vreg(d);
+    if (dv < 0)
+      continue;
+    for (int a = 0; a < nargs; a++)
+      if (irop_get_vreg(args[a]) == dv)
+        return 0;
+  }
+  return 1;
+}
+
+static int gvn_try_pure_call(IRSSAOptCtx *ctx, GVNEntry **table, int i)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+
+  Sym *callee = NULL;
+  if (!gvn_pure_callee(ir, q, &callee))
+    return 0;
+
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  int32_t dest_vr = irop_get_vreg(dest);
+  if (dest_vr < 0 || dest.is_lval ||
+      TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  IRSSAVregInfo *dvi = ssa_opt_vinfo(ctx, dest_vr);
+  if (dvi && dvi->def_count > 1)
+    return 0;
+
+  /* Read the argument list.  A helper with more arguments than the key can
+   * hold must not be numbered, or two different calls would collide. */
+  IROperand args[GVN_PURE_CALL_MAX_ARGS];
+  int nargs = 0;
+  while (nargs < GVN_PURE_CALL_MAX_ARGS &&
+         ir_opt_get_call_param_operand(ir, i, nargs, &args[nargs]))
+    nargs++;
+  if (nargs == 0)
+    return 0;
+  IROperand overflow;
+  if (ir_opt_get_call_param_operand(ir, i, GVN_PURE_CALL_MAX_ARGS, &overflow))
+    return 0;
+
+  /* Argument admissibility.  GVN_SRC_OK is deliberately NOT required here:
+   * it rejects local and lvalue operands, and after inlining the arguments are
+   * exactly that — the callee's parameters became locals of the caller, read
+   * as lvalues out of their stack slots.  That is the dominant shape this pass
+   * exists to cover (gcc torture ieee/compare-fp-3 all_tests), so instead of
+   * rejecting it, anything not SSA-stable clears `args_ssa_stable` and must
+   * then survive gvn_pure_call_args_unchanged before it may be reused — a
+   * stretch with no store, no impure call and no jump target, which is what
+   * makes re-reading the same slot give the same value.
+   *
+   * Volatile operands are refused outright: every read of one is a mandated
+   * access that must not be elided, however stable the surrounding code is. */
+  int args_ssa_stable = 1;
+  for (int a = 0; a < nargs; a++) {
+    if (args[a].is_llocal || gvn_operand_is_volatile_var(ir, args[a]))
+      return 0;
+    if (args[a].is_lval && irop_get_tag(args[a]) == IROP_TAG_SYMREF) {
+      IRPoolSymref *asr = irop_get_symref_ex(ir, args[a]);
+      if (!asr || !asr->sym || (asr->sym->type.t & VT_VOLATILE))
+        return 0;
+    }
+    if (!GVN_SRC_OK(args[a]) || gvn_src_class(ctx, args[a]) != 0)
+      args_ssa_stable = 0;
+  }
+
+  /* Key the arguments exactly the way every other GVN path does.  Reading the
+   * value with irop_get_imm64_ex and narrowing it would be WRONG: an F64
+   * operand yields the raw double bits, whose low 32 bits are zero for 1.0,
+   * -1.0 and 0.0 alike, so `ddiv(1.0,0.0)` and `ddiv(-1.0,0.0)` would collide
+   * and -inf would become +inf (gcc torture ieee/hugeval). */
+  uint8_t t[GVN_PURE_CALL_MAX_ARGS] = {0};
+  int32_t v[GVN_PURE_CALL_MAX_ARGS] = {0};
+  int32_t im[GVN_PURE_CALL_MAX_ARGS] = {0};
+  Sym *sy[GVN_PURE_CALL_MAX_ARGS] = {0};
+  for (int a = 0; a < nargs; a++)
+    gvn_operand_key(ir, args[a], &t[a], &v[a], &im[a], &sy[a]);
+
+  /* Callee identity and arity ride in the third key slot. */
+  GVNEntry *existing = gvn_find(table, TCCIR_OP_FUNCCALLVAL,
+                                t[0], v[0], im[0], sy[0],
+                                t[1], v[1], im[1], sy[1],
+                                (uint8_t)nargs, 0, 0, callee);
+  if (existing && existing->def_idx > i)
+    existing = NULL;
+  if (existing && !args_ssa_stable &&
+      !gvn_pure_call_args_unchanged(ctx, existing->def_idx, i, args, nargs))
+    existing = NULL;
+
+  if (existing && existing->result_vr >= 0 && existing->result_vr != dest_vr &&
+      ssa_opt_can_replace_all_uses(ctx, dest_vr)) {
+    if (ssa_opt_replace_all_uses(ctx, dest_vr, existing->result_vr)) {
+      ir_opt_nop_call_params(ir, i);
+      ssa_opt_nop_instr(ctx, i);
+      return 1;
+    }
+    return 0;
+  }
+
+  GVNEntry *e = gvn_alloc_entry();
+  if (!e)
+    return 0;
+  e->op = TCCIR_OP_FUNCCALLVAL;
+  e->s1_tag = t[0]; e->src1 = v[0]; e->imm1 = im[0]; e->sym1 = sy[0];
+  e->s2_tag = t[1]; e->src2 = v[1]; e->imm2 = im[1]; e->sym2 = sy[1];
+  e->s3_tag = (uint8_t)nargs; e->sym3 = callee;
+  e->result_vr = dest_vr;
+  e->def_idx = i;
+  gvn_scope_push(table, e);
+  return 0;
+}
+
+/* CSE duplicate NARROWING copies: `Ta(i32) <- X(i64) [ASSIGN]` taking the low
+ * word of a pair.  This is the pair-half-extract idiom the 64-bit multiply
+ * lowering emits — `T5 <- T1` and `T9 <- T1` are the same 32 bits, once per
+ * consumer, and each costs a `mov`.
+ *
+ * Plain copy propagation cannot touch these: forwarding X itself into the
+ * consumer would hand it a PAIR operand where a single word is wanted.  So the
+ * dup is rewritten to copy the FIRST narrowing instead (`T9 <- T5`), which is
+ * width-preserving and therefore admissible to ra_build_assign_hints — the
+ * allocator then gives both the same register and the post-RA move coalescer
+ * erases the `mov`.  Only the narrowing direction is handled; a WIDENING copy
+ * must materialize a high word, which is not a shared value (see the width
+ * gate in ra_build_assign_hints).
+ *
+ * The key carries the dest's width and signedness so copies that narrow the
+ * same source to different types never merge. */
+static int gvn_try_assign_narrow(IRSSAOptCtx *ctx, GVNEntry **table, int i)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  if (tcc_ir_barrel_shift_at(ir, q))
+    return 0;
+
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  int32_t dest_vr = irop_get_vreg(dest);
+  if (dest_vr < 0 || dest.is_lval || dest.is_llocal ||
+      TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  /* Integer destinations only, and never a pair/complex one: this rule is
+   * about taking the low WORD of an integer pair.  irop_is_64bit() also
+   * reports true for FLOAT64 and for is_complex operands (whose second half
+   * lives in a different register class), so test the btype explicitly. */
+  if (dest.is_complex)
+    return 0;
+  int dbt = irop_get_btype(dest);
+  if (dbt != IROP_BTYPE_INT32 && dbt != IROP_BTYPE_INT16 && dbt != IROP_BTYPE_INT8)
+    return 0;
+
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, dest_vr);
+  if (vi && vi->def_count > 1)
+    return 0;
+
+  IROperand src = tcc_ir_op_get_src1(ir, q);
+  if (src.is_lval || src.is_llocal || src.is_sym || src.is_complex)
+    return 0;
+  /* Source must be an integer PAIR — same-width copies already belong to
+   * cprop, and a float pair is not a low/high integer-word split. */
+  if (irop_get_btype(src) != IROP_BTYPE_INT64)
+    return 0;
+  int32_t src_vr = irop_get_vreg(src);
+  if (src_vr < 0 || TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  /* Dominator-scoped table entries require an SSA-stable source. */
+  if (gvn_src_class(ctx, src) != 0)
+    return 0;
+
+  int32_t key = (int32_t)((uint32_t)irop_get_btype(dest) << 1) | (dest.is_unsigned ? 1 : 0);
+
+  GVNEntry *existing = gvn_find(table, TCCIR_OP_ASSIGN, IROP_TAG_VREG, src_vr, key,
+                                NULL, 0, 0, 0, NULL, 0, 0, 0, NULL);
+  if (existing && existing->def_idx > i)
+    existing = NULL;
+
+  if (existing) {
+    if (existing->result_vr == dest_vr || existing->result_vr < 0)
+      return 0;
+    IROperand new_src = dest;
+    new_src.vr = existing->result_vr;
+    new_src.tag = IROP_TAG_VREG;
+    new_src.is_lval = 0;
+    new_src.is_local = 0;
+    new_src.is_llocal = 0;
+    new_src.u.imm32 = 0;
+    IRSSAVregInfo *svi = ssa_opt_vinfo(ctx, src_vr);
+    if (svi)
+      ssa_opt_remove_use_instr(svi, i);
+    IRSSAVregInfo *rvi = ssa_opt_vinfo(ctx, existing->result_vr);
+    if (rvi)
+      ssa_opt_add_use_instr(rvi, i);
+    tcc_ir_set_src1(ir, i, new_src);
+    return 1;
+  }
+
+  GVNEntry *e = gvn_alloc_entry();
+  if (!e)
+    return 0;
+  e->op = TCCIR_OP_ASSIGN;
+  e->s1_tag = IROP_TAG_VREG;
+  e->src1 = src_vr;
+  e->imm1 = key;
+  e->result_vr = dest_vr;
+  e->def_idx = i;
+  gvn_scope_push(table, e);
+  return 0;
+}
+
 /* 64-bit dup: ASSIGN pair-copies drop the high word downstream (seed 686), so substitute uses directly and NOP the dup */
 static int gvn_subst_64bit(IRSSAOptCtx *ctx, int i, int32_t dest_vr,
                            int32_t result_vr, int result_def_idx)
@@ -616,6 +900,16 @@ static int gvn_visit(IRSSAOptCtx *ctx, int b, void *state)
 
     if (q->op == TCCIR_OP_SETIF) {
       changes += gvn_try_cmp_setif(ctx, table, lcache, &lcount, i, bb);
+      continue;
+    }
+
+    if (q->op == TCCIR_OP_ASSIGN) {
+      changes += gvn_try_assign_narrow(ctx, table, i);
+      continue;
+    }
+
+    if (q->op == TCCIR_OP_FUNCCALLVAL) {
+      changes += gvn_try_pure_call(ctx, table, i);
       continue;
     }
 

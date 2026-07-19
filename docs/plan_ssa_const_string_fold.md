@@ -1,6 +1,6 @@
 # Plan: SSA const-string folding — `ssa:const_string_fold`
 
-**Status:** v1 landed · memchr ported (Step 1 done) · next = classify the +12 residual · **Branch:** `legacyOptRemoval`
+**Status:** ★**terminal** — fold half fully retired to SSA; flat `string_calls` is lowering-only and stays · **Branch:** `legacyOptRemoval`
 Part of [`plan_legacy_flat_ir_ssa_retire.md`](plan_legacy_flat_ir_ssa_retire.md).
 
 ## Why the SSA pass exists
@@ -99,28 +99,73 @@ the call in place to `ASSIGN`:
 
 Reuse the flat helpers as-is; do not re-implement `ir_opt_fold_memchr_offset`.
 
-### Step 2 — classify the remainder (**measured: +12 / 10 funcs**)
+### Step 2 — classify the remainder — **DONE 2026-07-19: residual fold gap is 0**
 
-| Function | Δ | Class |
+The fold half of flat `string_calls` is **gone**; the file is now 117 lines of pure lowering
+(redirects + the `memcmp(a,b,1)` specialization). Re-measured on the current tree:
+
+`TCC_DISABLE_PASS=string_calls`, -O2, 20230 funcs / 759428 instrs → **+2 across 2 functions**
+(was +12/10). Both are the *same* cause, and neither is a fold:
+
+| Function | Δ | Cause |
 |---|---|---|
-| `ir/{100,102,103}_pure_func_*::main` | +3 each | phase ordering |
-| `bug/bug_gnu_ternary_elvis::test7_chained` · `gcc-compile/pr100576::foo` · `gcc-execute/{memcpy-bi,strcmp::main_test,string-opt-5,strlen::main_test}` · `ir/353_ssa_symref_addend_fold::main` | +1 each | diffuse |
-| `ir/bench_strcmp::main` | **−4** | flat is worse |
+| `gcc-compile/pr100576::foo` | +1 | `memcmp(p,v,b)` with `b = sizeof v` → `__tcc_memcmp1` |
+| `gcc-execute/memcpy-bi::main` | +1 | same specialization |
 
-Decide per the state machine:
-- residual 0 → Branch B, delete the flat pass;
-- residual is the `+3` phase-ordering class → check whether moving the flat entry later, or
-  letting `ssa:const_string_fold` run an extra round, absorbs it;
-- residual needs pre-SSA IR → Branch A, keep flat and stop.
+Both deltas are exactly the `movs r2, #1` the two-argument helper avoids. The earlier
+`+3` phase-ordering cluster and the `−4` where flat was worse are **both gone** — later SSA
+porting absorbed them. So the fold residual is **0** and the fold half is terminal-B: retired.
 
-### Step 3 — the redirect table is a separate concern
+The `memcmp(a,b,1)` specialization itself cannot move to the frontend: in `pr100576` the
+length only becomes constant after IR constant propagation (`int b = sizeof v;`), which is
+why it lives in an IR pass. It is lowering (helper selection), not folding.
 
-Flat `string_calls` also carries a `__tcc_*` **call-redirect** table
-([`:367-375`](../source/opt/flat/scalar/const_string_calls.c#L367-L375)) with no SSA analog.
-The frontend already owns redirects (`strbi_is_redirect_target`, `tccgen.c`), so this looks
-like a dead fallback — but **prove it fires zero times before deleting**; the +65 measurement
-cannot separate it from the folds. If it is live, it stays flat (it is lowering, not
-optimization) and only the fold half retires.
+### Step 3 — the redirect table is live → stays flat — **DONE 2026-07-19**
+
+Measured by instrumenting each redirect branch with a stderr marker and compiling the whole
+4257-test corpus at `-O2 -c`:
+
+| Redirect | Hits | Frontend (`tccgen.c`) case? |
+|---|---|---|
+| `__tcc_mempcpy` | 161 | none |
+| `__tcc_memmove` | 136 | partial (the memcpy-expansion path only) |
+| `__tcc_strcat` | 17 | none |
+| `__tcc_strlen` | 16 | yes — **but see below** |
+| `__tcc_stpncpy` | 5 | none |
+| `__tcc_memcmp1` | 2 | none (needs const-propagated `n`) |
+
+Not a dead fallback. Two independent reasons it must stay:
+
+1. `mempcpy` / `strcat` / `stpncpy` have **no** case in tccgen's redirect switch at all.
+2. The `strlen` hits prove the general point: other **IR passes emit new string-builtin calls
+   after the frontend has run**. `gcc-compile/991008-1.c` contains no `strlen` — the calls
+   come from `fputs(s, f)` being lowered to `fwrite(s, 1, strlen(s), f)`; the flat pass
+   redirects them, and `ssa:const_string_fold` then folds the `strlen` away entirely. A
+   frontend-only redirect can never see these.
+
+`strbi_is_redirect_target` in `tcc.h` is *not* a second redirect implementation — it is the
+anti-inline guard that exists **because** this IR pass does the redirect.
+
+The remaining table entries (`strcpy`, `strchr`/`index`, `stpcpy`, `strnlen`, `strpbrk`,
+`strrchr`/`rindex`, `strstr`, `strcspn`, `strncpy`, `strncat`, `strcmp`, `strncmp`, `bcopy`)
+fire zero times on the corpus because tccgen wins the race for source-level calls — they are
+kept deliberately as the backstop for IR-generated calls of the same kind (the `strlen` case
+above is the existence proof that the backstop is load-bearing, and corpus-silence is not
+evidence of deadness).
+
+### Terminal state
+
+- **Fold half:** retired. `ssa:const_string_fold` owns all constant string folding; the flat
+  pass carries none. Corpus fold residual 0.
+- **Lowering half:** stays flat as [A★] — helper redirects + `memcmp(a,b,1)`, both of which
+  need to run on IR after other passes have created/constant-folded calls.
+- **Tests:** the two flat UTs that guarded `ir_opt_eval_stack_strlen` through
+  `const_string_calls` were vacuous after the fold half moved (the helper now serves
+  [`str_strlen.c`](../source/opt/ssa/string/str_strlen.c)). Deleted from
+  `test_opt_constfold.c`; the missing jump-boundary guard was ported to
+  `test_ssa_opt_const_string_fold.c` as `test_csf_strlen_stack_jump_boundary_no_fold`,
+  joining the already-ported positive and no-NUL guards.
+- **Gates:** `make test` 13645 passed / 161 skipped / 1 xfailed · `make ut` 0 failed.
 
 ### Validation
 

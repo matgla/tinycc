@@ -74,19 +74,63 @@ void tcc_ir_gen_f(TCCIRState *ir, int op)
     {
       ir_op = TCCIR_OP_FCMP;
 
-      /* IEEE 754 NaN fix: __aeabi_cdcmple(a,b) / __aeabi_cfcmple(a,b)
-       * only set correct CPSR flags for LE/LT/EQ/NE conditions.  For
-       * GT/GE the NaN "unordered" flag mapping makes the condition
-       * evaluate TRUE instead of FALSE.
-       *
-       * Fix: for GT/GE, swap operands so that cdcmple(b,a) is called,
-       * then test with the mirrored condition (LT/LE).  This produces
-       * the correct result for all cases including NaN.
-       *   a >  b  →  cdcmple(b, a), test LT
-       *   a >= b  →  cdcmple(b, a), test LE
-       */
       int cmp_op = op;
-      if (op == TOK_GT || op == TOK_UGT)
+
+      /* An inline DCP compare uses a different flag convention entirely.
+       * RCMP writes the relation straight into NZCV in the AEABI's own
+       * encoding -- C set means "ordered and >=", Z set means equal, V set
+       * means unordered -- which is read with *unsigned* conditions.  That is
+       * not the signed three-way encoding __aeabi_cdcmple produces (flags as
+       * if `cmp r,#0` on -1/0/1/2; see lib/fp/arm/rp2350/dcp_aeabi.S), so the
+       * fix-up below has to be a different one:
+       *
+       *   a >  b  ->  RCMP(a, b), HI      (no swap: HI *is* ">")
+       *   a >= b  ->  RCMP(a, b), HS
+       *   a <  b  ->  RCMP(b, a), HI      (RCMP has no "<"; mirror instead)
+       *   a <= b  ->  RCMP(b, a), HS
+       *   a == b  ->  RCMP(a, b), EQ      (Z alone)
+       *   a != b  ->  RCMP(a, b), NE
+       *
+       * Unordered falls out correctly everywhere: RCMP leaves C clear on
+       * unordered, so all four relational tests are false and only NE is true.
+       */
+      const FloatingPointConfig *dcp_fpu = architecture_config.fpu;
+      const int dcp_cmp = dcp_fpu && dcp_fpu->has_dcmp && dcp_fpu->double_impl == FP_DOUBLE_IMPL_DCP &&
+                          (vtop[0].type.t & VT_BTYPE) == VT_DOUBLE && (vtop[-1].type.t & VT_BTYPE) == VT_DOUBLE;
+      if (dcp_cmp)
+      {
+        switch (op)
+        {
+        case TOK_LT:
+        case TOK_ULT:
+          vswap();
+          cmp_op = TOK_UGT;
+          break;
+        case TOK_LE:
+        case TOK_ULE:
+          vswap();
+          cmp_op = TOK_UGE;
+          break;
+        case TOK_GT:
+        case TOK_UGT:
+          cmp_op = TOK_UGT;
+          break;
+        case TOK_GE:
+        case TOK_UGE:
+          cmp_op = TOK_UGE;
+          break;
+        default: /* EQ / NE read Z directly and need no fix-up */
+          break;
+        }
+      }
+      /* Soft-float path: __aeabi_cdcmple(a,b) / __aeabi_cfcmple(a,b) only set
+       * correct CPSR flags for LE/LT/EQ/NE.  For GT/GE the NaN "unordered"
+       * mapping makes the condition evaluate TRUE instead of FALSE, so swap
+       * the operands and test the mirrored condition:
+       *   a >  b  ->  cdcmple(b, a), test LT
+       *   a >= b  ->  cdcmple(b, a), test LE
+       */
+      else if (op == TOK_GT || op == TOK_UGT)
       {
         vswap();
         cmp_op = (op == TOK_GT) ? TOK_LT : TOK_ULT;

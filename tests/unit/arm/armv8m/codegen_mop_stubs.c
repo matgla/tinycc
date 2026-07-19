@@ -234,6 +234,16 @@ void tcc_gen_machine_bfi_mop(MachineOperand src1, MachineOperand src2, MachineOp
   cgstub_record("bfi_mop", (TccIrOp)-1, dest, src1, src2);
 }
 
+void tcc_gen_machine_bitop1_mop(MachineOperand src1, MachineOperand dest, TccIrOp op)
+{
+  cgstub_record("bitop1_mop", op, dest, src1, CGSTUB_NO_OP);
+}
+
+int tcc_machine_has_bit_ops(void)
+{
+  return 1;
+}
+
 void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op)
 {
   cgstub_record("assign_mop", op, dest, src, CGSTUB_NO_OP);
@@ -450,6 +460,28 @@ int tcc_gen_machine_cbz_jump_mop(int rn, int nonzero, int32_t target_ir, int ir_
   return cgstub_knobs.branch_size_16 ? 2 : 4;
 }
 
+int tcc_gen_machine_pool_flushes_total(void)
+{
+  return 0;
+}
+
+int tcc_gen_machine_pool_entries_total(void)
+{
+  return 0;
+}
+
+int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx)
+{
+  (void)target_ir;
+  (void)current_ir_idx;
+  return 0; /* dispatch tests exercise the non-fused path */
+}
+
+void tcc_gen_machine_dry_run_set_rehearsal(int on)
+{
+  (void)on;
+}
+
 int tcc_gen_machine_pending_pool_size(void)
 {
   cgstub_record("pending_pool_size", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
@@ -633,6 +665,12 @@ uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void)
   return cgstub_knobs.scratch_regs_pushed;
 }
 
+int tcc_gen_machine_dry_run_get_max_nested_saves(void)
+{
+  cgstub_record("dry_run_get_max_nested_saves", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
+  return 0;
+}
+
 void tcc_gen_machine_reset_scratch_state(void)
 {
   cgstub_record("reset_scratch_state", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
@@ -674,6 +712,11 @@ void tcc_gen_machine_branch_opt_analyze(uint32_t *ir_to_code_mapping, int mappin
 void tcc_gen_machine_mov_equiv_reset(void)
 {
   cgstub_record("mov_equiv_reset", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
+}
+
+void tcc_gen_machine_mov_coalesce_reset(void)
+{
+  cgstub_record("mov_coalesce_reset", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
 }
 
 void tcc_gen_machine_reserve_pool_bytes(int upcoming_bytes)

@@ -92,6 +92,62 @@ DEF_ASM(fpexc)
 
 DEF_ASM(apsr_nzcv)
 
+/* coprocessor numbers (mcr/mrc/mcrr/mrrc/cdp) — p0..p15 must stay contiguous */
+
+DEF_ASM(p0)
+DEF_ASM(p1)
+DEF_ASM(p2)
+DEF_ASM(p3)
+DEF_ASM(p4)
+DEF_ASM(p5)
+DEF_ASM(p6)
+DEF_ASM(p7)
+DEF_ASM(p8)
+DEF_ASM(p9)
+DEF_ASM(p10)
+DEF_ASM(p11)
+DEF_ASM(p12)
+DEF_ASM(p13)
+DEF_ASM(p14)
+DEF_ASM(p15)
+
+/* coprocessor registers — c0..c15 must stay contiguous, likewise cr0..cr15.
+   GNU as accepts both spellings; the DCP headers in the Pico SDK use `c`. */
+
+DEF_ASM(c0)
+DEF_ASM(c1)
+DEF_ASM(c2)
+DEF_ASM(c3)
+DEF_ASM(c4)
+DEF_ASM(c5)
+DEF_ASM(c6)
+DEF_ASM(c7)
+DEF_ASM(c8)
+DEF_ASM(c9)
+DEF_ASM(c10)
+DEF_ASM(c11)
+DEF_ASM(c12)
+DEF_ASM(c13)
+DEF_ASM(c14)
+DEF_ASM(c15)
+
+DEF_ASM(cr0)
+DEF_ASM(cr1)
+DEF_ASM(cr2)
+DEF_ASM(cr3)
+DEF_ASM(cr4)
+DEF_ASM(cr5)
+DEF_ASM(cr6)
+DEF_ASM(cr7)
+DEF_ASM(cr8)
+DEF_ASM(cr9)
+DEF_ASM(cr10)
+DEF_ASM(cr11)
+DEF_ASM(cr12)
+DEF_ASM(cr13)
+DEF_ASM(cr14)
+DEF_ASM(cr15)
+
 /* data processing directives */
 
 DEF_ASM(asl)
@@ -352,5 +408,17 @@ DEF_ASM_BASE(vneg)
 DEF_ASM_BASE(vcmp)
 DEF_ASM_BASE(vmov)
 DEF_ASM_BASE(vmrs)
+
+/* coprocessor access (ARMv7-M / ARMv8-M Mainline) */
+DEF_ASM_BASE(cdp)
+DEF_ASM_BASE(cdp2)
+DEF_ASM_BASE(mcr)
+DEF_ASM_BASE(mcr2)
+DEF_ASM_BASE(mrc)
+DEF_ASM_BASE(mrc2)
+DEF_ASM_BASE(mcrr)
+DEF_ASM_BASE(mcrr2)
+DEF_ASM_BASE(mrrc)
+DEF_ASM_BASE(mrrc2)
 
 /* multiplication */

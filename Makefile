@@ -604,6 +604,12 @@ test-aeabi-host:
 		$(CC) -O2 -DHOST_TEST $(AEABI_HOST_TEST_DIR)/$$t.c -o $(AEABI_HOST_TEST_DIR)/$$t -lm && \
 		$(AEABI_HOST_TEST_DIR)/$$t || exit 1; \
 	done
+	@# Bit-exact IEEE-754 conformance against host-generated reference vectors.
+	@# Unlike the tests above -- which carry their own copies of the algorithms
+	@# -- this compiles and calls the shipped lib/fp/soft sources directly, so a
+	@# regression in the library cannot hide behind a re-implementation.
+	@echo "Running FP conformance against lib/fp/soft..."
+	@CC="$(CC)" tests/fp/run_host_softfp_test.sh || exit 1
 	@echo "------------ aeabi host tests passed ------------"
 
 .PHONY: test-venv
@@ -822,7 +828,7 @@ tcc_c$(EXESUF): $($T_FILES)
 # Output: coverage-tccgen/index.html + coverage-tccgen/tccgen.info
 .PHONY: coverage-tccgen
 coverage-tccgen:
-	@$(TOPSRC)/scripts/coverage_tccgen.sh
+	@$(TOPSRC)/scripts/coverage_tccgen.py
 # test the installed tcc instead
 test-install: $(TCCDEFS_H)
 	@$(MAKE) -C tests TESTINSTALL=yes #_all
@@ -946,7 +952,7 @@ CONTAINER_REMOTE_IMAGE = $(CONTAINER_REGISTRY)/$(CONTAINER_REPOSITORY)
 CONTAINER_LOCAL_VERSION_IMAGE = $(CONTAINER_LOCAL_IMAGE):$(CONTAINER_VERSION)
 CONTAINER_REMOTE_VERSION_IMAGE = $(CONTAINER_REMOTE_IMAGE):$(CONTAINER_VERSION)
 CONTAINER_REMOTE_LATEST_IMAGE = $(CONTAINER_REMOTE_IMAGE):latest
-RUN_CONTAINER ?= ./scripts/run_container.sh -v $(CONTAINER_VERSION)
+RUN_CONTAINER ?= ./scripts/run_container.py -v $(CONTAINER_VERSION)
 
 build_container:
 	podman manifest rm $(CONTAINER_LOCAL_VERSION_IMAGE) >/dev/null 2>&1 || true

@@ -152,6 +152,54 @@ UT_TEST(test_mul_t32_auto_selection_rd_ne_rm)
   return 0;
 }
 
+UT_TEST(test_mul_t16_commutative_rd_eq_rn)
+{
+  setup_armv7m();
+
+  /* MUL is commutative, so rd == rn is encodable as T16 too: the operand that
+     is not the destination plays Rn.  muls r0, r1 => 0x4348 */
+  thumb_opcode op = th_mul(0, 0, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 2);
+  UT_ASSERT_EQ(op.opcode, 0x4348);
+
+  /* muls r7, r6 => 0x4340 | 7 | (6<<3) = 0x4377 */
+  op = th_mul(7, 7, 6, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 2);
+  UT_ASSERT_EQ(op.opcode, 0x4377);
+
+  return 0;
+}
+
+UT_TEST(test_mul_t16_rejected_when_flags_must_be_preserved)
+{
+  setup_armv7m();
+
+  /* T16 MULS has an implicit S bit, so it must not be selected when the caller
+     needs NZCV preserved - fall back to the flag-transparent T32 encoding. */
+  thumb_opcode op = th_mul(0, 1, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xFB01F000);
+
+  op = th_mul(0, 0, 1, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xFB00F001);
+
+  return 0;
+}
+
+UT_TEST(test_mul_t32_cannot_set_flags)
+{
+  setup_armv7m();
+
+  /* MULS exists only as T16; a flag-setting multiply with three distinct
+     registers is not encodable and must be rejected rather than silently
+     dropping the S bit. */
+  thumb_opcode op = th_mul(0, 1, 2, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 0);
+
+  return 0;
+}
+
 UT_TEST(test_mul_enforce_32bit_low_regs)
 {
   setup_armv7m();

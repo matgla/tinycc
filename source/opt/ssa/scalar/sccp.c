@@ -449,6 +449,33 @@ static int sccp_slot_addr_escapes(SCCPState *s, int load_lo, int load_hi)
   return 0;
 }
 
+/* A def of an address-taken VAR writes the var's stack slot even though it
+ * is not a STORE op (`V <-- #k [ASSIGN]`, arith dests).  A resolved &V load
+ * reads that same slot — semi-pruned SSA promotes the pointer-holding var,
+ * so `&V` chains now reach the resolver where they used to bottom out at an
+ * opaque VAR (gcc-torture 20041019-1: `*p = 9; V = 10; return *p` folded
+ * to 9).  Overlap of the def's slot with [load_lo, load_hi) is a clobber. */
+static int sccp_var_def_clobbers_slot(SCCPState *s, IRQuadCompact *q,
+                                      int load_lo, int load_hi)
+{
+  TCCIRState *ir = s->ctx->ir;
+  if (!irop_config[q->op].has_dest)
+    return 0;
+  if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+      q->op == TCCIR_OP_STORE_POSTINC)
+    return 0; /* STORE-family dests are handled by the store target checks */
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  int32_t dv = irop_get_vreg(d);
+  if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_VAR)
+    return 0;
+  IRLiveInterval *vi = tcc_ir_vreg_live_interval(ir, dv);
+  if (!vi || !vi->addrtaken)
+    return 0;
+  int lo = vi->original_offset;
+  int hi = lo + sccp_btype_bytes(irop_get_btype(d));
+  return hi > load_lo && load_hi > lo;
+}
+
 /* SCCP_TOP means the block start was reached with no matching or aliasing store. */
 static int sccp_scan_block_for_stack_store(SCCPState *s, IRBasicBlock *bb,
                                            int start_idx, int soff,
@@ -463,6 +490,8 @@ static int sccp_scan_block_for_stack_store(SCCPState *s, IRBasicBlock *bb,
     IRQuadCompact *sq = &ir->compact_instructions[si];
     if (sq->op == TCCIR_OP_NOP)
       continue;
+    if (sccp_var_def_clobbers_slot(s, sq, load_lo, load_hi))
+      return SCCP_BOTTOM;
     if (sq->op == TCCIR_OP_FUNCCALLVOID || sq->op == TCCIR_OP_FUNCCALLVAL) {
       /* A call only clobbers slots whose address escaped to callees. */
       if (sccp_slot_addr_escapes(s, load_lo, load_hi))
@@ -529,6 +558,8 @@ static int sccp_no_aliasing_between(SCCPState *s, int store_idx, int load_idx,
     TccIrOp op = q->op;
     if (op == TCCIR_OP_NOP)
       continue;
+    if (sccp_var_def_clobbers_slot(s, q, load_lo, load_hi))
+      return 0;
     if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL) {
       /* A call only clobbers slots whose address escaped to callees. */
       if (sccp_slot_addr_escapes(s, load_lo, load_hi))
@@ -591,6 +622,8 @@ static int sccp_resolved_stack_write_between(SCCPState *s, int store_idx, int lo
   int load_hi = soff + load_size;
   for (int i = store_idx + 1; i < load_idx; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
+    if (sccp_var_def_clobbers_slot(s, q, load_lo, load_hi))
+      return 1;
     if (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
         q->op != TCCIR_OP_STORE_POSTINC)
       continue;
@@ -634,15 +667,42 @@ static int sccp_loop_clobbers_slot(SCCPState *s, int load_idx, int soff, int loa
   int load_size = sccp_btype_bytes(load_btype);
   int load_lo = soff, load_hi = soff + load_size;
   TCCIRState *ir = s->ctx->ir;
-  for (int li = 0; li < s->loops->num_loops; li++) {
-    IRLoop *loop = &s->loops->loops[li];
-    if (load_idx < loop->start_idx || load_idx > loop->end_idx)
-      continue;
-    for (int i = loop->start_idx; i <= loop->end_idx; i++) {
+  /* A multi-arm loop body (if/else with distinct latches) can be recorded as
+   * SEVERAL overlapping linear ranges: the load sits in one range while the
+   * clobbering store sits in a sibling range of the SAME natural loop
+   * (fuzz seed longlong:5039 — while-loop whose else arm rewrites the slot
+   * lived in a second [start,end] the containing-range scan never visited).
+   * Union every range that transitively overlaps the load's range and scan
+   * the whole union. */
+  {
+    int span_lo = -1, span_hi = -1;
+    for (int li = 0; li < s->loops->num_loops; li++) {
+      IRLoop *loop = &s->loops->loops[li];
+      if (load_idx >= loop->start_idx && load_idx <= loop->end_idx) {
+        if (span_lo < 0 || loop->start_idx < span_lo) span_lo = loop->start_idx;
+        if (loop->end_idx > span_hi) span_hi = loop->end_idx;
+      }
+    }
+    if (span_lo < 0)
+      return 0;
+    int grew = 1;
+    while (grew) {
+      grew = 0;
+      for (int li = 0; li < s->loops->num_loops; li++) {
+        IRLoop *loop = &s->loops->loops[li];
+        if (loop->start_idx > span_hi || loop->end_idx < span_lo)
+          continue;  /* disjoint */
+        if (loop->start_idx < span_lo) { span_lo = loop->start_idx; grew = 1; }
+        if (loop->end_idx > span_hi) { span_hi = loop->end_idx; grew = 1; }
+      }
+    }
+    for (int i = span_lo; i <= span_hi; i++) {
       IRQuadCompact *q = &ir->compact_instructions[i];
       TccIrOp op = q->op;
       if (op == TCCIR_OP_NOP)
         continue;
+      if (sccp_var_def_clobbers_slot(s, q, load_lo, load_hi))
+        return 1;
       if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_BLOCK_COPY)
         return 1;
       if (op != TCCIR_OP_STORE && op != TCCIR_OP_STORE_INDEXED && op != TCCIR_OP_STORE_POSTINC)
@@ -704,6 +764,8 @@ static int sccp_loop_writes_slot_between(SCCPState *s, int from_idx, int to_idx,
       /* Calls with no by-ref slot arg are left to the resolved-store check below. */
       if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_BLOCK_COPY)
         continue;
+      if (sccp_var_def_clobbers_slot(s, q, load_lo, load_hi))
+        return 1;
       if (op != TCCIR_OP_STORE && op != TCCIR_OP_STORE_INDEXED && op != TCCIR_OP_STORE_POSTINC)
         continue;
       int store_btype = 0;
@@ -1065,6 +1127,11 @@ static int sccp_eval_binary(int op, int64_t v1, int64_t v2, int64_t *result,
   return 1;
 }
 
+int ssa_opt_eval_binary(int op, int64_t v1, int64_t v2, int64_t *result, int is_64)
+{
+  return sccp_eval_binary(op, v1, v2, result, is_64);
+}
+
 static int sccp_eval_cond(int64_t v1, int64_t v2, int tok)
 {
   switch (tok) {
@@ -1168,8 +1235,20 @@ static void sccp_visit_instr(SCCPState *s, int idx)
   if (!s->block_reachable[block])
     return;
 
+  /* A plain STORE whose dest is a non-lval TEMP is a value def (semi-pruned
+   * promotion rewrites `V <-- x [STORE]` to the version temp): its cell must
+   * meet the stored value or later uses fold to a STALE earlier def
+   * (304_fuzz).  Lval dests (through-pointer stores) stay excluded. */
+  int store_def_of_temp = 0;
+  if (q->op == TCCIR_OP_STORE) {
+    IROperand sd = tcc_ir_op_get_dest(ir, q);
+    int32_t sdv = irop_get_vreg(sd);
+    store_def_of_temp = (!sd.is_lval && sdv >= 0 &&
+                         TCCIR_DECODE_VREG_TYPE(sdv) == TCCIR_VREG_TYPE_TEMP);
+  }
   if (irop_config[q->op].has_dest &&
-      q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
+      (q->op != TCCIR_OP_STORE || store_def_of_temp) &&
+      q->op != TCCIR_OP_STORE_INDEXED &&
       q->op != TCCIR_OP_STORE_POSTINC &&
       q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID) {
     IROperand dest = tcc_ir_op_get_dest(ir, q);
@@ -1195,7 +1274,7 @@ static void sccp_visit_instr(SCCPState *s, int idx)
 
     int is_64 = (dest.btype == IROP_BTYPE_INT64);
 
-    if (q->op == TCCIR_OP_ASSIGN) {
+    if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_STORE) {
       IROperand src = tcc_ir_op_get_src1(ir, q);
       if (src.is_lval || src.is_local || src.is_llocal) {
         if (sccp_set_bottom(dest_cell))
@@ -1362,9 +1441,33 @@ handle_control_flow:
             v1 = (int64_t)(int32_t)(uint32_t)v1;
             v2 = (int64_t)(int32_t)(uint32_t)v2;
           }
+          /* A fused barrel shift makes the real comparison
+           * `s1 vs (s2 SHIFT #n)` — apply it to v2 before evaluating
+           * (encoding as in evaluate_compare_condition_cmp_annotated;
+           * fuzz seed signed:8890, test 393). */
+          int bs_ok = 1;
+          uint8_t cbs = tcc_ir_barrel_shift_at(ir, cmp_q);
+          if (cbs) {
+            if (cmp_btype == IROP_BTYPE_INT64) {
+              bs_ok = 0;
+            } else {
+              uint32_t m = (uint32_t)v2;
+              int amount = cbs & 0x1F;
+              switch (cbs >> 5) {
+              case 1: m = m << amount; break;
+              case 2: m = m >> amount; break;
+              case 3: m = (m >> amount) |
+                          (((m & 0x80000000u) && amount) ? ~(0xFFFFFFFFu >> amount) : 0u);
+                break;
+              case 4: m = amount ? ((m >> amount) | (m << (32 - amount))) : m; break;
+              default: bs_ok = 0; break;
+              }
+              v2 = (int64_t)(int32_t)m;
+            }
+          }
           IROperand cond = tcc_ir_op_get_src1(ir, q);
           int tok = (int)irop_get_imm64_ex(ir, cond);
-          int result = sccp_eval_cond(v1, v2, tok);
+          int result = bs_ok ? sccp_eval_cond(v1, v2, tok) : -1;
           if (result >= 0) {
             if (result)
               sccp_add_cfg_edge(s, block, target_block);
@@ -1442,15 +1545,34 @@ static void sccp_process_cfg_edge(SCCPState *s, int pred, int succ)
   }
 }
 
-/* Idempotent: a rewritten operand no longer matches old_vr. */
+/* Idempotent: a rewritten operand no longer matches old_vr.
+ * The immediate ADOPTS each use site's btype/signedness: the folded value may
+ * come from a narrower def (a short-typed phi arm), and a STORE/STORE_INDEXED
+ * value operand sets the STORE WIDTH — installing the def-btyped imm turned a
+ * word field store into strh, leaving the upper half stale (fuzz seed
+ * bitfield:372, test 392; same family as tests 385/390). */
 static void sccp_set_instr_operands_imm(IRSSAOptCtx *ctx, int idx, int32_t old_vr, IROperand imm)
 {
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *q = &ir->compact_instructions[idx];
-  if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == old_vr)
-    tcc_ir_set_src1(ir, idx, imm);
-  if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == old_vr)
-    tcc_ir_set_src2(ir, idx, imm);
+  if (irop_config[q->op].has_src1) {
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    if (irop_get_vreg(s) == old_vr) {
+      IROperand ns = imm;
+      ns.btype = s.btype;
+      ns.is_unsigned = s.is_unsigned;
+      tcc_ir_set_src1(ir, idx, ns);
+    }
+  }
+  if (irop_config[q->op].has_src2) {
+    IROperand s = tcc_ir_op_get_src2(ir, q);
+    if (irop_get_vreg(s) == old_vr) {
+      IROperand ns = imm;
+      ns.btype = s.btype;
+      ns.is_unsigned = s.is_unsigned;
+      tcc_ir_set_src2(ir, idx, ns);
+    }
+  }
 }
 
 /* Drops the SSA_USE_PHI entries for this (block, slot) so dead defs can be DCE'd. */
@@ -1501,6 +1623,20 @@ static int sccp_materialize_const_phis(SCCPState *s)
         if (use.kind != SSA_USE_INSTR) { ok = 0; break; }
         IRQuadCompact *uq = &ir->compact_instructions[use.idx];
         if (tcc_ir_barrel_shift_at(ir, uq)) { ok = 0; break; }
+        /* MLA's accumulator lives at operand_base+3, which
+         * sccp_set_instr_operands_imm below does not rewrite.  A `T = X*P + P`
+         * MLA reads the phi in BOTH src2 and the accumulator, so it passes the
+         * src1/src2 admission test below, gets its src slots rewritten, and
+         * then outlives the phi we delete -- leaving the accumulator naming a
+         * defless temp that codegen resolves to an undefined register:
+         *   T77 <- #545302529 MLA #820016041 + T92     (T92 has no def)
+         * (fuzz seeds volatile:82433 and bitfield:88932; tests 398/399).
+         * Bailing rather than extending the rewrite: an immediate accumulator
+         * is representable (ssa:var_imm_prop installs one) but needs a
+         * materializing register at codegen, and skipping these costs 0 bytes
+         * across the ir_tests corpus. */
+        if (uq->op == TCCIR_OP_MLA &&
+            irop_get_vreg(tcc_ir_op_get_accum(ir, uq)) == dvr) { ok = 0; break; }
         int in_src = 0;
         if (irop_config[uq->op].has_src1 &&
             irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == dvr)

@@ -4,9 +4,14 @@
 0003: T0 <-- Addr[StackLoc[-8]]
 0004: V0 <-- T0 [STORE]
 0005: T1 <-- V0 [ASSIGN]
-0006: T2 <-- V0 [ASSIGN]
-0007: T3 <-- T2 ADD #4
-0008: T4 <-- #1 [ASSIGN]
-0009: JMP to 10
-0010: T5 <-- T4 [ASSIGN]
-0011: RETURNVALUE T5
+0006: CMP #0,#0
+0007: JMP to 12  if "!="
+0008: T2 <-- V0 [ASSIGN]
+0009: T3 <-- T2 ADD #4
+0010: T4 <-- #1 [ASSIGN]
+0011: JMP to 13
+0012: T4 <-- #0 [ASSIGN]
+0013: StackLoc[-16] <-- T4 [STORE]
+0014: JMP to 15
+0015: T5 <-- StackLoc[-16] [LOAD]
+0016: RETURNVALUE T5

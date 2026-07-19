@@ -40,7 +40,8 @@ static const thop_feat THOP_PROFILE_ARMV7M_CORE = {.t16 = 1,
                                                    .tbb_tbh = 1,
                                                    .cbz = 1,
                                                    .sat = 1,
-                                                   .div = 1};
+                                                   .div = 1,
+                                                   .coproc = 1};
 
 static const thop_feat THOP_PROFILE_ARMV7EM_CORE = {.t16 = 1,
                                                     .t32 = 1,
@@ -53,7 +54,8 @@ static const thop_feat THOP_PROFILE_ARMV7EM_CORE = {.t16 = 1,
                                                     .cbz = 1,
                                                     .sat = 1,
                                                     .div = 1,
-                                                    .dsp = 1};
+                                                    .dsp = 1,
+                                                    .coproc = 1};
 
 static const thop_feat THOP_PROFILE_ARMV8M_BASE_CORE = {.t16 = 1, .movw_movt = 1, .cbz = 1, .ldaex = 1};
 
@@ -70,7 +72,8 @@ static const thop_feat THOP_PROFILE_ARMV8M_MAIN_CORE = {.t16 = 1,
                                                         .div = 1,
                                                         .dsp = 1,
                                                         .ldaex = 1,
-                                                        .fp_armv8 = 1};
+                                                        .fp_armv8 = 1,
+                                                        .coproc = 1};
 
 static const thop_feat THOP_PROFILE_ARMV81M_MAIN_CORE = {.t16 = 1,
                                                          .t32 = 1,
@@ -86,7 +89,8 @@ static const thop_feat THOP_PROFILE_ARMV81M_MAIN_CORE = {.t16 = 1,
                                                          .dsp = 1,
                                                          .ldaex = 1,
                                                          .fp_armv8 = 1,
-                                                         .lob = 1};
+                                                         .lob = 1,
+                                                         .coproc = 1};
 
 /* ───── Optional extension bundles ───── */
 
@@ -182,6 +186,11 @@ static thop_feat thop_feats_from_mfpu(const char *s)
   if (!strcmp(s, "vfpv4-sp-d16") || !strcmp(s, "fpv4-sp-d16"))
     return THOP_FPU_VFPV4_SP_D16;
   if (!strcmp(s, "fpv5-sp-d16"))
+    return THOP_FPU_FPV5_SP_D16;
+  /* RP2350's FP unit is FPv5-SP; its double support is the DCP coprocessor,
+   * which is reached through CP4 rather than any VFP double register, so no
+   * vfp_dp bit here.  coproc is already set by every Mainline profile. */
+  if (!strcmp(s, "rp2350"))
     return THOP_FPU_FPV5_SP_D16;
   if (!strcmp(s, "fpv5-d16"))
     return THOP_FPU_FPV5_D16;
@@ -510,17 +519,28 @@ thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd, uint3
   };
 }
 
-// Thumb ELF management
+// Thumb ELF management — ARM mapping symbols (AAELF).  objdump uses these to
+// switch between disassembling Thumb code ($t) and dumping data words ($d);
+// without them it loses sync at in-text literal pools and prints real
+// instructions as `.word`, which corrupts any tooling that counts objdump
+// lines (regression_disasm mis-scored pr50310::foo by ~90 this way).
+// Callers must emit these only during the REAL pass — dry-run offsets drift
+// (all branches emit wide), so a dry-pass symbol lands mid-pool or mid-code
+// and misleads objdump worse than no symbol at all.
 // Start of T32 instructions
 void th_sym_t()
 {
   const int info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
-  set_elf_sym(symtab_section, ind, 0, info, 0, 1, "$t");
+  if (getenv("TCC_MAPSYM_TRACE"))
+    fprintf(stderr, "[mapsym] $t ind=0x%x sec=%s\n", ind, cur_text_section ? cur_text_section->name : "?");
+  set_elf_sym(symtab_section, ind, 0, info, 0, cur_text_section->sh_num, "$t");
 }
 
 // Start of data
 void th_sym_d()
 {
   const int info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
-  set_elf_sym(symtab_section, ind, 0, info, 0, 1, "$d");
+  if (getenv("TCC_MAPSYM_TRACE"))
+    fprintf(stderr, "[mapsym] $d ind=0x%x sec=%s\n", ind, cur_text_section ? cur_text_section->name : "?");
+  set_elf_sym(symtab_section, ind, 0, info, 0, cur_text_section->sh_num, "$d");
 }

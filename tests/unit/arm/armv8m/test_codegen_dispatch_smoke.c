@@ -184,8 +184,8 @@ UT_TEST(test_dispatch_smoke_forces_two_pass_when_register_pressure_high)
 
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 1);
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_end"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 2); /* discovery + rehearsal dry pass */
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_end"), 2); /* discovery + rehearsal */
   UT_ASSERT(cgstub_call_count_pass("data_processing_mop", 0) > 0);
   UT_ASSERT(cgstub_call_count_pass("data_processing_mop", 1) > 0);
 

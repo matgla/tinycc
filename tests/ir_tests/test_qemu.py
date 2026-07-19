@@ -291,6 +291,18 @@ TEST_FILES = [
 
     # IEEE 754 NaN comparison tests (soft-float GT/GE fix)
     ("170_nan_comparison.c", 0),
+    ("421_fp_conformance.c", 0),
+    ("422_const_pool_hoist.c", 0),
+
+    # 64-bit bitfield extract: shl/shr->and fold, signed/word-crossing
+    # non-fold cases, INT64 global deref CSE region invalidation
+    ("423_llong_bitfield_extract.c", 0),
+
+    # __builtin_isunordered lowered to a single __aeabi_[df]cmpun call
+    ("424_isunordered_cmpun.c", 0),
+
+    # GVN value-numbering of const runtime helpers (duplicate-call CSE)
+    ("425_pure_call_cse.c", 0),
 
     # Compile-time strlen constant folding
     ("171_strlen_constfold.c", 0),
@@ -916,6 +928,93 @@ TEST_FILES = [
     ("364_diamond_store_fwd.c", 0),
     ("365_stack_addr_distinct_locals_cmp.c", 0),
     ("366_ssa_memchr_fold.c", 0),
+    ("367_ssa_addr_cse_hoist.c", 0),
+    ("368_native_bit_builtins.c", 0),
+    ("369_switch_operand_reuse.c", 0),
+    ("370_ptr_struct_copy_inline.c", 0),
+    ("371_forward_branch_narrowing.c", 0),
+    ("372_ldrd_align_deref.c", 0),
+    ("373_loop_rotate_global_call.c", 0),
+    ("380_coalesce_diamond_pair.c", 0),
+    ("381_fuzz_cmp_fold_pooled_imm_width.c", 0),
+    ("382_fuzz_guard_collapse_phi_cfg_desync.c", 0),
+    ("383_fuzz_softfp_cmp_fold_phi_prune.c", 0),
+    ("384_fuzz_load_cse_barrel_shift_imm.c", 0),
+    ("385_fuzz_dead_loop_imm_store_width.c", 0),
+    ("386_fuzz_cmp_fold_barrel_shift_src2.c", 0),
+    ("387_fuzz_licm_pair_call_hoist.c", 0),
+    ("388_fuzz_licm_partial_chain_hoist.c", 0),
+    ("389_fuzz_sccp_split_loop_range_clobber.c", 0),
+    ("390_fuzz_dead_loop_double_phi_imm.c", 0),
+    ("391_fuzz_cbz_pool_flush_cushion.c", 0),
+    ("392_fuzz_sccp_phi_imm_store_width.c", 0),
+    ("393_fuzz_flat_cmp_fold_barrel_annot.c", 0),
+    ("394_fuzz_barrel_shift_imm_remat_drop.c", 0),
+    ("395_fuzz_setif_xor_invert_diamond_join.c", 0),
+    ("396_fuzz_fold_double_neg_barrel_shift.c", 0),
+    ("397_fuzz_load_cse_indexed_frame_alias.c", 0),
+    ("398_fuzz_sccp_phi_mla_accum.c", 0),
+    ("399_fuzz_sccp_phi_mla_accum_loop.c", 0),
+
+    # SSA: a full-width slot STORE to an upward-exposed local is a fresh
+    # definition that phi placement must see (ir/ssa.c
+    # ssa_store_slot_def_pos).  Pins the join / loop-carried / aliased
+    # shapes the STORE-def path can get wrong.
+    ("400_ssa_store_def_global_var.c", 0),
+
+    # Codegen: SHL->ADD barrel fusion (and the scaled-addressing shapes it must
+    # leave alone), plus the SETIF `& mask` identity that unblocks
+    # setif_branch_fuse.
+    ("401_barrel_shl_add_setif_mask.c", 0),
+
+    # Loops: zero-trip entry-guard elimination across a chain of sequential
+    # counted loops (source/opt/flat/loop/seq_guard_elim.c) and the rotation
+    # gate that depends on it.  Pins the exit-value carry, the shapes the
+    # walker must decline (zero-trip middle guard, runtime entry, address-taken
+    # IV, a branch between the loops, negative step).
+    ("402_seq_loop_guard_elim.c", 0),
+
+    # SSA narrowing: mask-composition fold in narrow_and.  A bitfield read
+    # narrower than its storage unit emits truncate-to-container then
+    # mask-to-field; the inner mask is backward-redundant and the two compose
+    # (a UBFX(v,0,w) counts as an AND), emitting the canonical UBFX form.
+    ("403_mask_compose_narrow.c", 0),
+    ("404_licm_escaped_dest.c", 0),
+    ("405_cmp_const_reverse.c", 0),
+    # Element-major fusion of chained vector_size expressions: a consumer
+    # recomputes its operands' elements inline and deletes the producer's loop.
+    ("406_vector_elem_major_fusion.c", 0),
+    # `(x^y) cmp y` -> `x cmp 0`, which holds for == / != but not for the
+    # relational predicates (N/C/V are not preserved).
+    ("407_cmp_xor_cancel.c", 0),
+    # copy_source_load_fwd: redirecting `x.f` to `G.f` after `x = G` must respect
+    # per-field disjointness and the demanded bits of a bitfield read — a write
+    # to a different field (or to other bits of the same word) may not block the
+    # forward, but a write to the read's own bits must.
+    ("408_copy_source_bitfield_fwd.c", 0),
+    # SETIF state-mask algebra + 0/1 re-normalization elimination (PR107881):
+    # two booleans over the same operand pair collapse to one compare, and a
+    # value already known to be 0/1 needs no `!= 0`.  Signedness must not merge
+    # across the mask, non-boolean values must keep the real compare, and
+    # widening a SETIF into a binary op needs a fresh operand-pool block.
+    ("409_setif_mask_bool_norm.c", 0),
+    # Pruned SSA phi placement: a phi goes only where the VAR is live-in, not
+    # over the whole iterated dominance frontier of its defs.  Block-scoped
+    # loop-body vars lose their dead loop-header/latch phi pair (and the
+    # slot-to-slot copy SSA destruction made of it), while accumulators,
+    # branch-arm defs, in-place 64-bit writes, dereferenced pointer vars and
+    # loop-live-out values must all keep theirs.
+    ("410_pruned_ssa_live_in.c", 0),
+    ("411_entry_store_var_ptr_base.c", 0),
+    ("412_subword_store_merge.c", 0),
+    ("413_scratch_demote_spill.c", 0),
+    ("414_fuzz_cprop_assign_store_redef.c", 0),
+    ("415_fuzz_slfwd_load_into_var.c", 0),
+    ("416_fuzz_cprop_phi_store_redef.c", 0),
+    ("417_fuzz_const_prop_narrow_dest.c", 0),
+    ("418_fuzz_slfwd_call_dest_var.c", 0),
+    ("419_loop_const_sim_wide_trip.c", 0),
+    ("420_bitfield_unit_narrow.c", 0),
 ]
 
 # Per-test compiler defines (e.g. for missing platform macros)

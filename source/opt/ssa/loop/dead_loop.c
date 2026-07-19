@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "ssa_opt.h"
+#include "opt/ssa/ssa_opt_helpers.h"
 #include "licm.h"
 
 static int resolve_const_through_copies(IRSSAOptCtx *ctx, int32_t vr, int64_t *out_const)
@@ -339,8 +340,12 @@ static int rewrite_loop_exit_phis(IRSSAOptCtx *ctx, IRLoop *loop)
       continue;
 
     IROperand imm_op = irop_make_imm32(0, (int32_t)latch_const, phi->btype);
-    if (phi->btype == IROP_BTYPE_INT64) {
-      /* irop_make_imm32 stores only 32 bits. */
+    if (phi->btype == IROP_BTYPE_INT64 || phi->btype == IROP_BTYPE_FLOAT64 ||
+        phi->btype == IROP_BTYPE_FLOAT32) {
+      /* irop_make_imm32 stores only 32 bits (a FLOAT64 latch constant is a
+       * pair — truncating it rewrote a double to garbage, fuzz seed
+       * fp_round:46, test 390), and FP consumers expect an F32/F64-tagged
+       * operand, not TAG_IMM32. */
       continue;
     }
 
@@ -359,14 +364,18 @@ static int rewrite_loop_exit_phis(IRSSAOptCtx *ctx, IRLoop *loop)
       if (irop_config[uq->op].has_src1) {
         IROperand s = tcc_ir_op_get_src1(ir, uq);
         if (irop_get_vreg(s) == phi->dest_vreg && !s.is_lval) {
-          tcc_ir_op_set_src1(ir, uq, imm_op);
+          /* Adopt the USE-site width: the phi may be narrower (char-typed
+           * latch value) than the use — a STORE/STORE_INDEXED value operand
+           * sets the store width, so installing the phi-btyped immediate
+           * shrinks a word store to strb (fuzz seed bitfield:310). */
+          tcc_ir_op_set_src1(ir, uq, ssa_cprop_imm_for_use(imm_op, s));
           rewritten_here = 1;
         }
       }
       if (irop_config[uq->op].has_src2) {
         IROperand s = tcc_ir_op_get_src2(ir, uq);
         if (irop_get_vreg(s) == phi->dest_vreg && !s.is_lval) {
-          tcc_ir_op_set_src2(ir, uq, imm_op);
+          tcc_ir_op_set_src2(ir, uq, ssa_cprop_imm_for_use(imm_op, s));
           rewritten_here = 1;
         }
       }

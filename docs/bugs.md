@@ -54,3 +54,16 @@ test asserts the corrected behavior. Detailed reports live in
   `test_stack_store_lval_vreg_src_tracked_bug` and
   `test_temp_indir_store_lval_src_tracked_bug` pin the current buggy
   behavior — flip their assertions once fixed. Not yet fixed.
+
+- [dce_dead_var_stores drops a store whose fused lval source is a volatile read](bugs/dce-dead-var-store-volatile-lval-src.md)
+  — the elimination loop in `source/opt/ssa/dce/dead_var_stores.c` NOPs a
+  `STORE` to a dead VAR slot without checking whether the stored value is a
+  volatile memory read; for the fused mem-copy form
+  `STORE lval(V0slot) <- lval(V1)` with volatile `V1`, the mandated volatile
+  access dies with the store. Sibling passes have the guard
+  (`vl_removable` in var_liveness.c, dest check in temp_worklist.c); this one
+  only guards the destination slot. Correctness/miscompile, confirmed at
+  pass level (no end-to-end C reproducer yet). Regression lock:
+  `tests/unit/arm/armv8m/test_ssa_opt_dce.c`
+  `test_dce_dead_var_store_volatile_lval_src_bug` pins the current buggy
+  behavior — flip its assertions once fixed. Not yet fixed.

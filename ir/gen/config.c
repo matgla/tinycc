@@ -121,6 +121,11 @@ const IRRegistersConfig irop_config[] = {
     /* SELECT: dest=result, src1=then_val, src2=else_val, pool[+3]=condition */
     [TCCIR_OP_SELECT] = {1, 1, 1},
     [TCCIR_OP_ROR] = {1, 1, 1},
+    /* Single-operand bit manipulation: dest = <op>(src1) */
+    [TCCIR_OP_CLZ] = {1, 1, 0},
+    [TCCIR_OP_RBIT] = {1, 1, 0},
+    [TCCIR_OP_REV] = {1, 1, 0},
+    [TCCIR_OP_REV16] = {1, 1, 0},
 }
 ;
 // clang-format on

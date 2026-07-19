@@ -27,12 +27,7 @@ import argparse
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-FUZZ_DIR = REPO_ROOT / "tests" / "fuzz"
-if str(FUZZ_DIR) not in sys.path:
-    sys.path.insert(0, str(FUZZ_DIR))
-
-import fuzz_harness as H  # noqa: E402
+from sources.fuzz_common import FUZZ_DIR, H
 
 
 def diverges(source_text: str, low: str, high: str, work_dir: Path) -> bool:

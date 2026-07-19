@@ -452,25 +452,17 @@ static void udr_prescan_addr_taken(TCCIRState *ir, uint8_t *addr_taken, int max_
  * before writing it, that read is C11 UB; collapse the body to `b .` (matching
  * GCC on gcc.c-torture/compile/931102-1.c). The scan stops at the first
  * branch/call/return or later jump-target, so conditional reads don't trigger. */
-int tcc_ir_opt_uninit_local_ub(TCCIRState *ir)
+#define UNINIT_MAX_VAR_POS 1024
+
+/* Entry-block scan for a read of a VAR not yet written in program order.
+ * `addr_taken` may be NULL, which widens the result to a superset (address-taken
+ * VARs are no longer excluded) — that is exactly what a pre-filter is allowed to
+ * do, and it lets the caller establish there is something to find before paying
+ * for the whole-function prescans. */
+static int udr_entry_block_reads_uninit(TCCIRState *ir, const uint8_t *addr_taken)
 {
   int n = ir->next_instruction_index;
-  if (n == 0)
-    return 0;
-  /* O2-only: UB exploitation is too aggressive for lower levels. */
-  if (!tcc_state || tcc_state->optimize < 2)
-    return 0;
-
-  /* Inline asm operands aren't modeled and IJUMP targets are unknown: bail. */
-  if (udr_has_inline_asm_or_ijump(ir))
-    return 0;
-
-#define UNINIT_MAX_VAR_POS 1024
   uint8_t written[(UNINIT_MAX_VAR_POS + 7) / 8] = {0};
-  uint8_t addr_taken[(UNINIT_MAX_VAR_POS + 7) / 8] = {0};
-  udr_prescan_addr_taken(ir, addr_taken, UNINIT_MAX_VAR_POS);
-
-  int found_uninit = 0;
 
   for (int i = 0; i < n; i++)
   {
@@ -482,7 +474,7 @@ int tcc_ir_opt_uninit_local_ub(TCCIRState *ir)
       break;
 
     /* Check src1 / src2 for read of an unwritten VAR. */
-    for (int k = 1; k <= 2 && !found_uninit; k++)
+    for (int k = 1; k <= 2; k++)
     {
       IROperand sop;
       if (!udr_get_operand(ir, q, k, &sop))
@@ -499,16 +491,11 @@ int tcc_ir_opt_uninit_local_ub(TCCIRState *ir)
       if (pos < 0 || pos >= UNINIT_MAX_VAR_POS)
         continue;
       /* Skip address-taken VARs — pointer writes may have initialized them. */
-      if (addr_taken[pos >> 3] & (uint8_t)(1u << (pos & 7)))
+      if (addr_taken && (addr_taken[pos >> 3] & (uint8_t)(1u << (pos & 7))))
         continue;
       if (!(written[pos >> 3] & (uint8_t)(1u << (pos & 7))))
-      {
-        found_uninit = 1;
-        break;
-      }
+        return 1;
     }
-    if (found_uninit)
-      break;
 
     /* Apply this op's WRITE after the read check (program order). */
     if (irop_config[q->op].has_dest)
@@ -529,9 +516,33 @@ int tcc_ir_opt_uninit_local_ub(TCCIRState *ir)
         q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
       break;
   }
-#undef UNINIT_MAX_VAR_POS
+  return 0;
+}
 
-  if (!found_uninit)
+int tcc_ir_opt_uninit_local_ub(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n == 0)
+    return 0;
+  /* O2-only: UB exploitation is too aggressive for lower levels. */
+  if (!tcc_state || tcc_state->optimize < 2)
+    return 0;
+
+  /* The decisive scan only ever looks at the entry block, but the two guards it
+   * depends on are whole-function.  Run the entry-block scan first in its
+   * superset form: on this corpus it rejects ~99% of functions, and only the
+   * survivors pay for the full scans below. */
+  if (!udr_entry_block_reads_uninit(ir, NULL))
+    return 0;
+
+  /* Inline asm operands aren't modeled and IJUMP targets are unknown: bail. */
+  if (udr_has_inline_asm_or_ijump(ir))
+    return 0;
+
+  uint8_t addr_taken[(UNINIT_MAX_VAR_POS + 7) / 8] = {0};
+  udr_prescan_addr_taken(ir, addr_taken, UNINIT_MAX_VAR_POS);
+
+  if (!udr_entry_block_reads_uninit(ir, addr_taken))
     return 0;
 
   /* Keep observable work only when it can actually reach a return; a function
@@ -577,35 +588,14 @@ int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir)
   if (!tcc_state || tcc_state->optimize < 2)
     return 0;
 
-  /* Inline asm / computed goto: same conservative bail as uninit_local_ub. */
-  if (udr_has_inline_asm_or_ijump(ir))
-    return 0;
-
-  /* Require an explicit or implicit return (JUMP/JUMPIF past-end == epilogue). */
-  int has_return = 0;
-  int has_implicit_return = 0;
-  for (int i = 0; i < n; i++)
-  {
-    TccIrOp op = ir->compact_instructions[i].op;
-    if (op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID)
-    {
-      has_return = 1;
-      break;
-    }
-    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
-    {
-      IROperand d = tcc_ir_op_get_dest(ir, &ir->compact_instructions[i]);
-      int t = (int)irop_get_imm64_ex(ir, d);
-      if (t >= n)
-        has_implicit_return = 1;
-    }
-  }
-  if (!has_return && !has_implicit_return)
-    return 0;
-
-  /* Don't exploit the UB when the function does observable work before return. */
-  if (udr_has_observable_side_effects(ir))
-    return 0;
+  /* Guard order below is by cost, not by logic: every one of these is a pure
+   * predicate over the same unmodified IR, so they may run in any order, and
+   * the pass fires on ~0% of real functions.  The uninit-read scan is the
+   * decisive one and is two cheap operand walks; the guards it used to sit
+   * behind each walk the whole function, one of them (side effects) doing
+   * per-instruction symbol lookups for the volatile check.  Running the
+   * decisive scan first means the expensive guards are only reached by the
+   * handful of functions that could actually collapse. */
 
 #define UDR_MAX_VAR_POS 1024
   uint8_t written[(UDR_MAX_VAR_POS + 7) / 8] = {0};
@@ -659,6 +649,36 @@ int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir)
 #undef UDR_MAX_VAR_POS
 
   if (uninit_read_idx < 0)
+    return 0;
+
+  /* Require an explicit or implicit return (JUMP/JUMPIF past-end == epilogue). */
+  int has_return = 0;
+  int has_implicit_return = 0;
+  for (int i = 0; i < n; i++)
+  {
+    TccIrOp op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID)
+    {
+      has_return = 1;
+      break;
+    }
+    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, &ir->compact_instructions[i]);
+      int t = (int)irop_get_imm64_ex(ir, d);
+      if (t >= n)
+        has_implicit_return = 1;
+    }
+  }
+  if (!has_return && !has_implicit_return)
+    return 0;
+
+  /* Inline asm operands aren't modeled and IJUMP targets are unknown: bail. */
+  if (udr_has_inline_asm_or_ijump(ir))
+    return 0;
+
+  /* Don't exploit the UB when the function does observable work before return. */
+  if (udr_has_observable_side_effects(ir))
     return 0;
 
   /* Build CFG + dominators and verify the uninit read dominates every RETURN. */

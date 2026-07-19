@@ -26,6 +26,7 @@ set(BENCHMARK_OPT_LEVEL "1" CACHE STRING "Optimization level (0 or 1)")
 # Timing/calibration code stays in GCC-compiled minimal_uart_picosdk.c
 set(BENCHMARK_LIB_SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/bench_math.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bench_double.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bench_control.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bench_string.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bench_algorithm.c
@@ -84,7 +85,18 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
     # TCC_EXE is typically at <tcc_root>/armv8m-tcc, libs are at <tcc_root>/lib/fp/
     get_filename_component(TCC_DIR ${TCC_EXE} DIRECTORY)
     set(TCC_RUNTIME_LIB "${TCC_DIR}/armv8m-libtcc1.a")
-    set(TCC_FP_LIB "${TCC_DIR}/lib/fp/libsoftfp.a")
+    # Which FP runtime the benchmark links, and whether TCC lowers FP inline.
+    # Declared here (not only in the FP-conformance section below) so that
+    # `run_benchmark.py --fp-lib rp2350fp --mfpu rp2350` measures the DCP --
+    # otherwise the benchmark always linked libsoftfp and a DCP-vs-soft
+    # comparison silently measured the same binary twice.
+    set(FP_LIB "softfp" CACHE STRING "FP runtime library from lib/fp (softfp, rp2350fp, vfpv4sp, vfpv5dp)")
+    set(FP_MFPU "" CACHE STRING "Value for TCC's -mfpu= when building benchmarks")
+    set(TCC_FP_LIB "${TCC_DIR}/lib/fp/lib${FP_LIB}.a")
+    set(BENCH_MFPU_FLAG "")
+    if(NOT FP_MFPU STREQUAL "")
+        set(BENCH_MFPU_FLAG "-mfpu=${FP_MFPU}")
+    endif()
     if(EXISTS ${TCC_RUNTIME_LIB})
         message(STATUS "Using TCC runtime library: ${TCC_RUNTIME_LIB}")
     else()
@@ -122,7 +134,7 @@ if(BENCHMARK_COMPILER STREQUAL "TCC")
         # Add custom command for each object file
         add_custom_command(
             OUTPUT ${obj}
-            COMMAND ${TCC_EXE} -c ${BENCH_ARCH_FLAGS} -O${BENCHMARK_OPT_LEVEL} -g
+            COMMAND ${TCC_EXE} -c ${BENCH_ARCH_FLAGS} ${BENCH_MFPU_FLAG} -O${BENCHMARK_OPT_LEVEL} -g
                 -DBENCHMARK_OPT_LEVEL=${BENCHMARK_OPT_LEVEL}
                 -I${CMAKE_CURRENT_SOURCE_DIR}
                 -I${CMAKE_CURRENT_SOURCE_DIR}/../../include
@@ -208,6 +220,16 @@ target_link_libraries(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}
 # (instead of Pico SDK's optimized pico_float library)
 pico_set_float_implementation(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX} compiler)
 
+# ...and the same for DOUBLE, which is not implied by the float setting.  Left
+# unset, pico_double_default wins and the SDK links its own DCP assembly with
+# `-Wl,--wrap=__aeabi_dadd` (and friends), so every double operation is
+# intercepted before it can reach the compiler's runtime.  The symptom is
+# subtle: `--fp-lib softfp` and `--fp-lib rp2350fp` produce byte-identical
+# images, because neither one's FP library is ever called.  Any TCC-vs-GCC
+# double comparison made before this line was also measuring pico-sdk, not the
+# compilers.
+pico_set_double_implementation(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX} compiler)
+
 # For TCC builds, also link TCC's runtime libraries explicitly.
 # TCC-generated objects can reference helper symbols from armv8m-libtcc1.a
 # and software floating-point entry points from libsoftfp.a.
@@ -229,6 +251,86 @@ pico_add_extra_outputs(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX})
 
 # Set linker script for RAM execution (no flash)
 pico_set_binary_type(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX} copy_to_ram)
+
+# ============================================================================
+# FP conformance executable (separate image; see fp_conformance_main.c for why)
+#
+# Configure with -DBUILD_FP_CONFORMANCE=ON.  The FP runtime under test is
+# selected by -DFP_LIB=<name>, matching the short library names in lib/fp:
+#   softfp    (default)  pure software floating point
+#   rp2350fp             RP2350 double coprocessor
+# and the compiler's own lowering is selected by -DFP_MFPU=<name>, e.g.
+#   -DFP_MFPU=rp2350 to emit inline DCP/VFP instead of __aeabi_* calls.
+# ============================================================================
+
+option(BUILD_FP_CONFORMANCE "Build the floating-point conformance image" OFF)
+# FP_LIB / FP_MFPU are declared in the TCC block above (shared with the
+# benchmark image); the conformance image reuses them as-is.
+
+if(BUILD_FP_CONFORMANCE)
+    set(FP_CONF_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../fp)
+    set(FP_CONF_SRC ${FP_CONF_DIR}/fp_conformance.c)
+
+    if(BENCHMARK_COMPILER STREQUAL "TCC")
+        set(FP_TCC_LIB "${TCC_DIR}/lib/fp/lib${FP_LIB}.a")
+        if(NOT EXISTS ${FP_TCC_LIB})
+            message(FATAL_ERROR "FP library not found: ${FP_TCC_LIB} (build it with `make fp-libs`)")
+        endif()
+
+        set(FP_MFPU_FLAG "")
+        if(NOT FP_MFPU STREQUAL "")
+            set(FP_MFPU_FLAG "-mfpu=${FP_MFPU}")
+        endif()
+
+        set(FP_CONF_OBJ "${CMAKE_CURRENT_BINARY_DIR}/fp_conformance_tcc.o")
+        add_custom_command(
+            OUTPUT ${FP_CONF_OBJ}
+            COMMAND ${TCC_EXE} -c ${BENCH_ARCH_FLAGS} ${FP_MFPU_FLAG} -O${BENCHMARK_OPT_LEVEL} -g
+                -I${FP_CONF_DIR}
+                -I${CMAKE_CURRENT_SOURCE_DIR}/../../include
+                ${TCC_LIBC_INCLUDE_FLAGS}
+                ${FP_CONF_SRC} -o ${FP_CONF_OBJ}
+            DEPENDS ${FP_CONF_SRC} ${FP_CONF_DIR}/fp_vectors.h ${FP_CONF_DIR}/fp_conformance.h
+            COMMENT "Compiling fp_conformance.c with TCC -O${BENCHMARK_OPT_LEVEL} ${FP_MFPU_FLAG}"
+        )
+        add_custom_target(fp_conformance_obj ALL DEPENDS ${FP_CONF_OBJ})
+
+        add_executable(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX} fp_conformance_main.c)
+        add_dependencies(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX} fp_conformance_obj)
+        target_link_libraries(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX}
+            ${FP_CONF_OBJ}
+            -Wl,--start-group ${TCC_RUNTIME_LIB} ${FP_TCC_LIB} -Wl,--end-group
+        )
+        set(FP_BUILD_ID "tcc-O${BENCHMARK_OPT_LEVEL}-${FP_LIB}${FP_MFPU_FLAG}")
+    else()
+        add_executable(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX} fp_conformance_main.c ${FP_CONF_SRC})
+        target_compile_options(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX} PRIVATE
+            ${BENCH_ARCH_FLAGS} -O${BENCHMARK_OPT_LEVEL} -g)
+        set(FP_BUILD_ID "gcc-O${BENCHMARK_OPT_LEVEL}-libgcc")
+    endif()
+
+    target_include_directories(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX} PRIVATE
+        ${FP_CONF_DIR} ${BENCH_INCLUDE_DIRS})
+
+    target_compile_definitions(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX} PUBLIC
+        PICO_DEFAULT_UART_TX_PIN=32
+        PICO_DEFAULT_UART_RX_PIN=33
+        FP_CONFORMANCE_BUILD_ID="${FP_BUILD_ID}")
+
+    target_link_libraries(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX}
+        pico_stdlib hardware_uart hardware_gpio)
+
+    # Same reasoning as the benchmark image: use the compiler's own FP lowering
+    # rather than the SDK's optimized pico_float, since that lowering is what
+    # is under test.
+    pico_set_float_implementation(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX} compiler)
+    pico_set_double_implementation(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX} compiler)
+
+    pico_add_extra_outputs(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX})
+    pico_set_binary_type(fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX} copy_to_ram)
+
+    message(STATUS "FP conformance image: fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX} (${FP_BUILD_ID})")
+endif()
 
 message(STATUS "")
 message(STATUS "==========================================")

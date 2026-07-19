@@ -149,6 +149,40 @@ int ir_opt_eval_const_u64(TCCIRState *ir, IROperand op, int use_idx, uint64_t *o
     *out = v & mask;
     return 1;
   }
+  case TCCIR_OP_CLZ:
+  case TCCIR_OP_RBIT:
+  case TCCIR_OP_REV:
+  case TCCIR_OP_REV16:
+  {
+    uint64_t v;
+    if (!ir_opt_eval_const_u64(ir, tcc_ir_op_get_src1(ir, q), def_idx, &v, depth + 1))
+      return 0;
+    uint32_t x = (uint32_t)v;
+    switch (q->op)
+    {
+    case TCCIR_OP_CLZ:
+      /* The hardware defines clz(0) == 32, so this needs no zero guard. */
+      *out = x ? (uint64_t)__builtin_clz(x) : 32ULL;
+      break;
+    case TCCIR_OP_RBIT:
+    {
+      uint32_t r = 0;
+      for (int b = 0; b < 32; b++)
+        r |= ((x >> b) & 1u) << (31 - b);
+      *out = r;
+      break;
+    }
+    case TCCIR_OP_REV:
+      *out = (uint64_t)__builtin_bswap32(x);
+      break;
+    case TCCIR_OP_REV16:
+      *out = (uint64_t)(((x & 0x00FF00FFu) << 8) | ((x >> 8) & 0x00FF00FFu));
+      break;
+    default:
+      return 0;
+    }
+    return 1;
+  }
   default:
     return 0;
   }

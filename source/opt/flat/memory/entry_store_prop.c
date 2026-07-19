@@ -90,6 +90,12 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     IROperand value;
     int btype;
     int idx;
+    /* Store dest was an anonymous stack slot (no backing vreg).  Only those may be
+       matched by offset against a *direct* StackLoc read (Phase 3c): a VAR-backed
+       local reports stack offset 0 regardless of position, so offset alone does not
+       identify it. */
+    int anon_slot;
+    int is_unsigned;
   } estores[MAX_ENTRY_STORES];
   int estore_count = 0;
 #define ESTORE_COMPACT() \
@@ -106,7 +112,12 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   } bc_ranges[MAX_BC_RANGES];
   int bc_range_count = 0;
 
-  for (int i = 0; i < n && estore_count < MAX_ENTRY_STORES; i++)
+  /* Index one past the last instruction Phase 1 examined: the first jump/jump-target, or
+     n for a straight-line function, or wherever the MAX_ENTRY_STORES cap stopped it.
+     Phase 1.5 rescans from here, so it must not cover the entry stores themselves. */
+  int entry_scan_end = 0;
+  int i;
+  for (i = 0; i < n && estore_count < MAX_ENTRY_STORES; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->is_jump_target)
@@ -156,11 +167,14 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
           }
         }
         IROperand imm = irop_make_imm32(-1, val, IROP_BTYPE_INT32);
+        int bc_anon = (irop_get_vreg(bc_dest) < 0);
         if (found >= 0)
         {
           estores[found].value = imm;
           estores[found].btype = IROP_BTYPE_INT32;
           estores[found].idx = i;
+          estores[found].anon_slot = bc_anon;
+          estores[found].is_unsigned = 0;
         }
         else
         {
@@ -168,6 +182,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
           estores[estore_count].value = imm;
           estores[estore_count].btype = IROP_BTYPE_INT32;
           estores[estore_count].idx = i;
+          estores[estore_count].anon_slot = bc_anon;
+          estores[estore_count].is_unsigned = 0;
           estore_count++;
         }
       }
@@ -198,6 +214,23 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       continue;
 
     int64_t off = irop_get_stack_offset(dest);
+    {
+      /* Kill every *overlapping* entry at a different offset, not just the exact-offset
+         one: a `double` initializer stores 8 bytes at -96 while the preceding zero-init
+         wrote 4-byte words at -96 and -92, and the stale -92 word would otherwise still
+         read as 0.  Exact-offset entries are handled by last-write-wins below. */
+      int store_sz = ir_opt_store_btype_size_bytes(irop_get_btype(dest));
+      int64_t st_end = off + (store_sz > 0 ? store_sz : 1);
+      for (int k = 0; k < estore_count; k++)
+      {
+        if (estores[k].offset == 0x7FFFFFFFLL || estores[k].offset == off)
+          continue;
+        int esz = ir_opt_store_btype_size_bytes(estores[k].btype);
+        int64_t e_end = estores[k].offset + (esz > 0 ? esz : 1);
+        if (estores[k].offset < st_end && off < e_end)
+          estores[k].offset = 0x7FFFFFFFLL;
+      }
+    }
 
     /* Only const or stack-address values; anything else invalidates the prior entry (last-write-wins). */
     int is_const = irop_is_immediate(src1);
@@ -227,6 +260,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       estores[found].value = src1;
       estores[found].btype = irop_get_btype(dest);
       estores[found].idx = i;
+      estores[found].anon_slot = (irop_get_vreg(dest) < 0);
+      estores[found].is_unsigned = dest.is_unsigned;
     }
     else if (estore_count < MAX_ENTRY_STORES)
     {
@@ -234,9 +269,13 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       estores[estore_count].value = src1;
       estores[estore_count].btype = irop_get_btype(dest);
       estores[estore_count].idx = i;
+      estores[estore_count].anon_slot = (irop_get_vreg(dest) < 0);
+      estores[estore_count].is_unsigned = dest.is_unsigned;
       estore_count++;
     }
   }
+
+  entry_scan_end = i;
 
   LOG_IR_GEN("ENTRY_STORE_PROP: %d entry-BB stores collected", estore_count);
   if (estore_count == 0)
@@ -244,16 +283,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
 
   /* Phase 1.5: invalidate entries for offsets written anywhere after the entry BB. */
   {
-    int entry_bb_end = 0;
-    for (int j = 0; j < n; j++)
-    {
-      IRQuadCompact *eq = &ir->compact_instructions[j];
-      if (eq->is_jump_target || eq->op == TCCIR_OP_JUMP || eq->op == TCCIR_OP_JUMPIF)
-      {
-        entry_bb_end = j;
-        break;
-      }
-    }
+    int entry_bb_end = entry_scan_end;
     for (int j = entry_bb_end; j < n; j++)
     {
       IRQuadCompact *eq = &ir->compact_instructions[j];
@@ -302,13 +332,22 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       }
       if (!have_soff)
         continue;
-      for (int k = 0; k < estore_count; k++)
       {
-        if (estores[k].offset == soff)
+        /* Overlap, not exact offset: an 8-byte store at -96 also kills a 4-byte entry at -92. */
+        int ssz = ir_opt_store_btype_size_bytes(irop_get_btype(sd));
+        int64_t s_end = soff + (ssz > 0 ? ssz : 1);
+        for (int k = 0; k < estore_count; k++)
         {
-          /* Once overwritten after the entry BB, a later load may see the new value, not the initializer. */
-          LOG_IR_GEN("ENTRY_STORE_PROP: invalidated off=%lld (rewritten at i=%d)", (long long)soff, j);
-          estores[k].offset = 0x7FFFFFFFLL;
+          if (estores[k].offset == 0x7FFFFFFFLL)
+            continue;
+          int esz = ir_opt_store_btype_size_bytes(estores[k].btype);
+          int64_t e_end = estores[k].offset + (esz > 0 ? esz : 1);
+          if (estores[k].offset < s_end && soff < e_end)
+          {
+            /* Once overwritten after the entry BB, a later load may see the new value, not the initializer. */
+            LOG_IR_GEN("ENTRY_STORE_PROP: invalidated off=%lld (rewritten at i=%d)", (long long)estores[k].offset, j);
+            estores[k].offset = 0x7FFFFFFFLL;
+          }
         }
       }
     }
@@ -371,7 +410,10 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       }
       if (!have)
         continue;
-      /* Bound invalidation to the escaped object's extent [esc_off, obj_end): a BLOCK_COPY range, else the contiguous run of entry stores. */
+      /* Bound invalidation to the escaped object's extent [esc_off, obj_end): a BLOCK_COPY range, else the contiguous run of entry stores.
+         Do NOT consult ir->stack_layout here: it is built during register allocation,
+         long after this pass, so any slot it reports is stale/absent and shrinking
+         obj_end to it silently under-invalidates an escaped array (guard test 110). */
       int64_t obj_end = esc_off;
       for (int r = 0; r < bc_range_count; r++)
       {
@@ -461,15 +503,19 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
 
-    /* ASSIGN/LEA with Addr[StackLoc[X]] source → record in LEA map */
-    if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA)
+    /* ASSIGN/LEA with Addr[StackLoc[X]] source → record in LEA map.
+       STORE too, and not only for symmetry: an inlined pointer parameter lands as
+       `V <-- Addr[StackLoc[X]] [STORE]`, and missing it loses the base for every
+       runtime-indexed store through V — which Phase 2.6 then fails to invalidate. */
+    if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_STORE)
     {
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
       if (src1.is_local && !src1.is_lval && irop_get_tag(src1) == IROP_TAG_STACKOFF)
       {
         IROperand dest = tcc_ir_op_get_dest(ir, q);
         int32_t vr = irop_get_vreg(dest);
-        if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+        /* A STORE with a TEMP dest writes *through* the temp; it does not define it. */
+        if (q->op != TCCIR_OP_STORE && vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
         {
           int p = TCCIR_DECODE_VREG_POSITION(vr);
           if (p <= max_tmp)
@@ -589,6 +635,22 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
               rt_valid[dp] = 1;
             }
           }
+          else if (s1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_VAR &&
+                   irop_is_immediate(s2) && !s2.is_sym)
+          {
+            /* Same, one indirection out: the base pointer lives in a VAR alias. */
+            int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
+            if (sp <= max_var && var_lea_map[sp].valid)
+            {
+              lea_map[dp].offset = var_lea_map[sp].offset + irop_get_imm64_ex(ir, s2);
+              lea_map[dp].valid = 1;
+            }
+            else if (sp <= max_var && var_rt_valid[sp])
+            {
+              rt_base[dp] = var_rt_base[sp];
+              rt_valid[dp] = 1;
+            }
+          }
           else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF && irop_is_immediate(s2) &&
                    !s2.is_sym)
           {
@@ -605,6 +667,12 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
               int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
               if (sp <= max_tmp && lea_map[sp].valid) { base = lea_map[sp].offset; have = 1; }
               else if (sp <= max_tmp && rt_valid[sp]) { base = rt_base[sp]; have = 1; }
+            }
+            else if (s1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_VAR)
+            {
+              int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
+              if (sp <= max_var && var_lea_map[sp].valid) { base = var_lea_map[sp].offset; have = 1; }
+              else if (sp <= max_var && var_rt_valid[sp]) { base = var_rt_base[sp]; have = 1; }
             }
             else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF)
             {
@@ -1029,6 +1097,65 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       }
 
       LOG_IR_GEN("ENTRY_STORE_PROP: i=%d LOAD_INDEXED forwarded at eff_off=%lld", i, (long long)eff_off);
+      changes++;
+      break;
+    }
+  }
+
+  /* Phase 3c: forward entry-BB stores into *direct* StackLoc lvalue reads.
+     Phase 3 only rewrites derefs whose address sits in a TEMP (the LEA map); by the time
+     this pass runs, earlier address-folding passes have already collapsed most of those
+     into a plain `StackLoc[X]` lvalue operand, which Phase 3 then skips.  Those reads are
+     the common shape for `local.field` / `vec[const]` after csfwd, and leaving them
+     un-forwarded costs the whole downstream const-fold chain (soft-float helper calls in
+     particular) once a call or a loop join has cleared the BB-local sl_forward state.
+
+     The invalidation analysis above is read-form independent, so this reuses exactly the
+     safety net Phase 3 already relies on.  Extra guards here: both sides must be anonymous
+     stack slots (a VAR-backed local reports offset 0 regardless of position), the value
+     types must match exactly, and struct/func operands are left alone. */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_LOAD && q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_FUNCPARAMVAL)
+      continue;
+
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    if (!src1.is_local || !src1.is_lval || src1.is_llocal || src1.is_complex)
+      continue;
+    if (irop_get_tag(src1) != IROP_TAG_STACKOFF)
+      continue;
+    if (irop_get_vreg(src1) >= 0)
+      continue; /* VAR/TEMP-backed: its stack offset does not identify the slot */
+
+    int read_btype = irop_get_btype(src1);
+    if (read_btype == IROP_BTYPE_STRUCT || read_btype == IROP_BTYPE_FUNC)
+      continue; /* aggregates are not a single-operand forward */
+
+    int64_t read_off = irop_get_stack_offset(src1);
+
+    for (int k = 0; k < estore_count; k++)
+    {
+      if (estores[k].offset != read_off)
+        continue;
+      if (i <= estores[k].idx)
+        continue;
+      if (!estores[k].anon_slot)
+        continue;
+      if (estores[k].btype != read_btype)
+        continue;
+      if (estores[k].is_unsigned != (int)src1.is_unsigned)
+        continue;
+      if (!irop_is_immediate(estores[k].value))
+        continue;
+
+      if (q->op != TCCIR_OP_FUNCPARAMVAL)
+        q->op = TCCIR_OP_ASSIGN;
+      {
+        int pool_off = q->operand_base + irop_config[q->op].has_dest;
+        ir->iroperand_pool[pool_off] = estores[k].value;
+      }
+      LOG_IR_GEN("ENTRY_STORE_PROP: i=%d direct StackLoc read forwarded at off=%lld", i, (long long)read_off);
       changes++;
       break;
     }

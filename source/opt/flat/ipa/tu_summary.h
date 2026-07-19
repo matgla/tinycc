@@ -25,6 +25,16 @@ typedef struct TuFuncSummary
   TuSymSet static_reads;   /* static globals read or address-taken */
   TuSymSet static_writes;  /* static globals written */
   int body_elide_blocker;  /* obvious non-call side effect in the body */
+
+  /* --- mod-ref (may-write) summary, for tcc_ir_call_may_write ---------------
+   * Unlike static_writes above (which is VT_STATIC-only and exists for dead-
+   * static elimination), these describe EVERY write the body can perform, so a
+   * caller can ask "can this call write location L?".  They must stay a sound
+   * over-approximation: anything not attributable to a named global or to this
+   * function's own frame sets writes_unknown. */
+  TuSymSet global_writes;  /* named globals written (static or not) */
+  int writes_unknown;      /* a write that could not be attributed to a symbol */
+
   struct TuFuncSummary *next;
 } TuFuncSummary;
 

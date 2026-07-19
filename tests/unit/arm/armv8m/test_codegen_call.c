@@ -1395,8 +1395,15 @@ UT_TEST(test_dispatch_call_with_five_args_calls_func_parameter_mop_per_arg)
   ir->leaffunc = 0;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("func_parameter_mop"), NARGS);
-  UT_ASSERT_EQ(cgstub_call_count("func_call_mop"), 1);
+  /* Outgoing stack args route this function through the dry-run passes (they
+   * size the scratch area exactly instead of the old blanket reservation), so
+   * every stub fires once per codegen pass.  Assert the per-arg property
+   * relative to the call count rather than a fixed pass count. */
+  {
+    int call_passes = cgstub_call_count("func_call_mop");
+    UT_ASSERT(call_passes >= 1);
+    UT_ASSERT_EQ(cgstub_call_count("func_parameter_mop"), NARGS * call_passes);
+  }
 
   tcc_ir_free(ir);
   return 0;

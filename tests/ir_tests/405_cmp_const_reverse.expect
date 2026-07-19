@@ -1,0 +1,3 @@
+mismatches=0
+s_lt(4)=0 s_lt(6)=1 s_ge(4)=1 s_ge(6)=0
+u_gt(0)=1 u_gt(9)=0 u_top(0xffffffff)=0

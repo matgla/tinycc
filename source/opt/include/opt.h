@@ -121,6 +121,7 @@ int tcc_ir_opt_cmp_stack_addr_fold(struct TCCIRState *ir);
 int tcc_ir_opt_stack_addr_simplify(struct TCCIRState *ir);
 
 int tcc_ir_opt_cmp_expr_fold(struct TCCIRState *ir);
+int tcc_ir_opt_cmp_xor_cancel(struct TCCIRState *ir);
 
 /* ZEXT + SHL #32 + ZEXT + OR -> PACK64. */
 int tcc_ir_opt_pack64(struct TCCIRState *ir);
@@ -169,12 +170,25 @@ int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
 /* Forwards a const ASSIGN to a VAR through its &V LEA into deref uses (the addr-taken shape var_to_tmp skips). */
 int tcc_ir_opt_addrof_var_fwd(struct TCCIRState *ir);
 
+/* Rewrites derefs through single-def entry-block `P = &V` pointer VARs (and their TEMP copies) to direct V accesses. */
+int tcc_ir_opt_ptr_local_fwd(struct TCCIRState *ir);
+int tcc_ir_opt_ptr_local_fwd_ex(struct IROptCtx *ctx);
+
+/* Forwards a load of a copied local field (`x=G; ... x.field`) to the source global `G.field`. */
+int tcc_ir_opt_copy_source_load_fwd(struct TCCIRState *ir);
+
 /* Forwards STORE GlobalSym(X) into later in-BB deref reads; invalidated by calls, aliasing stores, BB boundaries. */
 int tcc_ir_opt_global_sl_fwd(struct TCCIRState *ir);
 
 /* Cross-BB CSE of global ASSIGN/LOAD; requires forward-only control flow and no aliasing stores. */
 int tcc_ir_opt_invariant_global_load_hoist(struct TCCIRState *ir);
 int tcc_ir_opt_invariant_global_load_hoist_ex(struct IROptCtx *ctx);
+
+/* CSEs a global lvalue operand read >1 time in one straight-line clobber-free region into a single ASSIGN. */
+int tcc_ir_opt_global_deref_cse(struct TCCIRState *ir);
+
+/* Narrows a whole-word bitfield RMW to the byte/halfword the field exactly fills. */
+int tcc_ir_opt_bitfield_unit_narrow(struct TCCIRState *ir);
 
 /* Inserts one `T_v = T***DEREF***` after a singly-defined pointer TEMP and rewrites later derefs to T_v non-lval. */
 int tcc_ir_opt_invariant_temp_deref_hoist(struct TCCIRState *ir);
@@ -283,8 +297,11 @@ int tcc_ir_opt_value_tracking_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_add_reassoc_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_stack_addr_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_expr_fold_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_cmp_xor_cancel_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_string_calls_ex(struct IROptCtx *ctx);
 int ssa_const_string_fold_flat_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_mem_inline(struct TCCIRState *ir);
+int tcc_ir_opt_mem_inline_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_setif_branch_fuse_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_stack_bool_diamond_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_float_narrowing_ex(struct IROptCtx *ctx);
@@ -409,5 +426,35 @@ int tcc_ir_opt_switch_call_replace(struct TCCIRState *ir);
 extern signed char tcc_pass_timing_on;
 void tcc_pass_timing_init(void);
 unsigned long tcc_pass_clk_us(void);
-void tcc_pass_timing_add(const char *name, unsigned long us);
 void tcc_pass_timing_dump(void);
+
+/* Scoped timer.  Nested frames of the same pass name are suppressed, so a pass
+ * that times itself and is also timed by the pipeline driver is counted once.
+ * Reported time is exclusive of nested timed passes, which is what makes the
+ * cascade slots (kb_cascade, const_cascade, ...) readable. */
+typedef struct TCCPassTimer {
+  unsigned long start_us;
+  unsigned long saved_child_us;
+  const char *name;
+  signed char active;
+} TCCPassTimer;
+
+void tcc_pass_timing_begin(TCCPassTimer *t, const char *name);
+/* changes < 0 means "this pass does not report a change count". */
+void tcc_pass_timing_end(TCCPassTimer *t, int changes);
+
+/* Time `call` under `name` and leave its value in `res`.  The `== 0` test is
+ * the off-by-default fast path: tcc_pass_timing_on is -1 until the first
+ * tcc_pass_timing_begin() resolves it, so every later call skips the timer
+ * entirely and the instrumentation costs one predictable branch. */
+#define TCC_PASS_TIMED(res, name, call)                                        \
+  do {                                                                         \
+    if (tcc_pass_timing_on == 0) {                                             \
+      (res) = (call);                                                          \
+      break;                                                                   \
+    }                                                                          \
+    TCCPassTimer _tcc_pt;                                                      \
+    tcc_pass_timing_begin(&_tcc_pt, (name));                                   \
+    (res) = (call);                                                            \
+    tcc_pass_timing_end(&_tcc_pt, (int)(res));                                 \
+  } while (0)
