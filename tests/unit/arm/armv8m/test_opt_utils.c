@@ -1823,3 +1823,269 @@ UT_TEST(test_vreg_has_single_def_ops_without_dest_dont_count)
   utb_free(ir);
   return 0;
 }
+
+/* =========================================================================
+ * Soft-float bit reinterpretation helpers (static inline in ir/opt_utils.h):
+ * ir_bits_to_f / ir_bits_to_d / ir_f_to_bits / ir_d_to_bits / ir_softfp_cmp3
+ *
+ * Pure IEEE-754 bit-pattern <-> value conversions (Pattern A -- no fixtures,
+ * no TCCIRState).  Oracles are exact bit patterns.  Contract points under
+ * test:
+ *  - ir_bits_to_f() truncates its int64 carrier to the LOW 32 bits, so the
+ *    sign-extended carriers produced by ir_f_to_bits() round-trip cleanly.
+ *  - ir_f_to_bits() sign-extends the 32-bit float pattern into the int64
+ *    carrier (header comment: "sign-extended into the int64 carrier") --
+ *    floats with bit 31 set therefore produce NEGATIVE int64 values.
+ *  - ir_d_to_bits()/ir_bits_to_d() use all 64 bits (no extension/truncation).
+ *  - ir_softfp_cmp3() returns (a > b) - (a < b), i.e. -1/0/+1, and sets
+ *    *is_nan when either operand is NaN.  With a NaN operand both compares
+ *    are false, so the return collapses to 0 -- *is_nan is the ONLY signal
+ *    distinguishing "unordered" from "equal".  This is the exact convention
+ *    the production callers rely on: vt_try_fold_float_compare
+ *    (source/opt/flat/scalar/value_tracking.c:417) refuses to fold when
+ *    is_nan is set, and const_prop_tmp.c:424-427 feeds the -1/0/+1 result
+ *    as val1 against 0 into evaluate_compare_condition, substituting
+ *    nan_compare_branch_result() instead when is_nan is set.
+ * ========================================================================= */
+
+UT_TEST(test_bits_to_f_exact_values)
+{
+  /* Value-level oracles for exactly-representable constants. */
+  UT_ASSERT(ir_bits_to_f(0x00000000LL) == 0.0f);
+  UT_ASSERT(ir_bits_to_f(0x3F800000LL) == 1.0f);
+  UT_ASSERT(ir_bits_to_f(0x3FC00000LL) == 1.5f);
+  UT_ASSERT(ir_bits_to_f(0x40000000LL) == 2.0f);
+  UT_ASSERT(ir_bits_to_f(0xBFC00000LL) == -1.5f);
+  UT_ASSERT(ir_bits_to_f(0xC0000000LL) == -2.0f);
+
+  /* +inf / -inf / qNaN have no literal to == against; pin them bit-exactly
+   * through the inverse conversion instead. */
+  UT_ASSERT_EQ(ir_f_to_bits(ir_bits_to_f(0x7F800000LL)), 0x7F800000LL);                 /* +inf */
+  UT_ASSERT_EQ(ir_f_to_bits(ir_bits_to_f(0xFF800000LL)), (int64_t)0xFFFFFFFFFF800000ULL); /* -inf */
+  UT_ASSERT_EQ(ir_f_to_bits(ir_bits_to_f(0x7FC00000LL)), 0x7FC00000LL);                 /* qNaN */
+  return 0;
+}
+
+UT_TEST(test_bits_to_f_truncates_high_carrier_bits)
+{
+  /* Callers hand in int64 carriers whose high 32 bits may be sign-extension
+   * (from ir_f_to_bits) or unrelated bits; only the low 32 bits count. */
+  UT_ASSERT(ir_bits_to_f((int64_t)0xFFFFFFFF3FC00000ULL) == 1.5f);
+  UT_ASSERT(ir_bits_to_f((int64_t)0xDEADBEEF3FC00000ULL) == 1.5f);
+  UT_ASSERT(ir_bits_to_f((int64_t)0xFFFFFFFF00000000ULL) == 0.0f);
+  UT_ASSERT(ir_bits_to_f(0x00000000BFC00000LL) == -1.5f);
+  return 0;
+}
+
+UT_TEST(test_bits_to_d_exact_values)
+{
+  UT_ASSERT(ir_bits_to_d(0x0000000000000000LL) == 0.0);
+  UT_ASSERT(ir_bits_to_d(0x3FF0000000000000LL) == 1.0);
+  UT_ASSERT(ir_bits_to_d(0x3FF8000000000000LL) == 1.5);
+  UT_ASSERT(ir_bits_to_d(0x4000000000000000LL) == 2.0);
+  UT_ASSERT(ir_bits_to_d((int64_t)0xBFF8000000000000ULL) == -1.5);
+
+  /* +inf / qNaN pinned bit-exactly via the inverse conversion. */
+  UT_ASSERT_EQ(ir_d_to_bits(ir_bits_to_d(0x7FF0000000000000LL)), 0x7FF0000000000000LL);               /* +inf */
+  UT_ASSERT_EQ(ir_d_to_bits(ir_bits_to_d((int64_t)0x7FF8000000000000ULL)),
+               (int64_t)0x7FF8000000000000ULL);                                                     /* qNaN */
+  return 0;
+}
+
+UT_TEST(test_f_to_bits_exact_patterns_and_sign_extension)
+{
+  UT_ASSERT_EQ(ir_f_to_bits(0.0f), 0x00000000LL);
+  UT_ASSERT_EQ(ir_f_to_bits(1.0f), 0x3F800000LL);
+  UT_ASSERT_EQ(ir_f_to_bits(1.5f), 0x3FC00000LL);
+  UT_ASSERT_EQ(ir_f_to_bits(2.0f), 0x40000000LL);
+
+  /* Patterns with bit 31 set SIGN-EXTEND into the int64 carrier -- this is
+   * the documented contract (see the header comment above ir_f_to_bits),
+   * not an accident: the float occupies the low 32 bits and bit 31 is
+   * replicated upward into bits 32..63. */
+  UT_ASSERT_EQ(ir_f_to_bits(-1.5f), (int64_t)0xFFFFFFFFBFC00000ULL);
+  UT_ASSERT_EQ(ir_f_to_bits(-2.0f), (int64_t)0xFFFFFFFFC0000000ULL);
+  UT_ASSERT_EQ(ir_f_to_bits(-0.0f), (int64_t)0xFFFFFFFF80000000ULL);
+
+  /* Sign-extended -0.0f must NOT alias the int64 value of +0.0f. */
+  UT_ASSERT_NE(ir_f_to_bits(-0.0f), ir_f_to_bits(0.0f));
+  return 0;
+}
+
+UT_TEST(test_d_to_bits_exact_patterns)
+{
+  UT_ASSERT_EQ(ir_d_to_bits(0.0), 0x0000000000000000LL);
+  UT_ASSERT_EQ(ir_d_to_bits(1.0), 0x3FF0000000000000LL);
+  UT_ASSERT_EQ(ir_d_to_bits(1.5), 0x3FF8000000000000LL);
+  UT_ASSERT_EQ(ir_d_to_bits(2.0), 0x4000000000000000LL);
+
+  /* Full 64-bit reinterpretation: top-bit-set patterns come back as
+   * negative int64 values (a plain (int64_t) cast of the uint64 pattern). */
+  UT_ASSERT_EQ(ir_d_to_bits(-1.5), (int64_t)0xBFF8000000000000ULL);
+  UT_ASSERT_EQ(ir_d_to_bits(-0.0), (int64_t)0x8000000000000000ULL); /* INT64_MIN */
+  UT_ASSERT_NE(ir_d_to_bits(-0.0), ir_d_to_bits(0.0));
+  return 0;
+}
+
+UT_TEST(test_float_bits_roundtrip_bit_exact)
+{
+  /* bits -> float -> bits must be the identity on every 32-bit pattern,
+   * including the ones with no value-level == semantics (NaN payloads,
+   * subnormals, -0.0).  Expected value is the sign-extended carrier. */
+  static const uint32_t pats[] = {
+    0x00000000u, /* +0.0 */
+    0x80000000u, /* -0.0 */
+    0x3F800000u, /* 1.0 */
+    0x3FC00000u, /* 1.5 */
+    0x7F800000u, /* +inf */
+    0xFF800000u, /* -inf */
+    0x7FC00000u, /* qNaN */
+    0x7FC00001u, /* qNaN with a payload bit (must be preserved) */
+    0xFFA00000u, /* negative sNaN */
+    0x00000001u, /* min subnormal */
+    0x007FFFFFu, /* max subnormal */
+  };
+  for (size_t i = 0; i < sizeof(pats) / sizeof(pats[0]); i++)
+    UT_ASSERT_EQ(ir_f_to_bits(ir_bits_to_f((int64_t)pats[i])), (int64_t)(int32_t)pats[i]);
+  return 0;
+}
+
+UT_TEST(test_double_bits_roundtrip_bit_exact)
+{
+  static const uint64_t pats[] = {
+    0x0000000000000000ull, /* +0.0 */
+    0x8000000000000000ull, /* -0.0 */
+    0x3FF0000000000000ull, /* 1.0 */
+    0x3FF8000000000000ull, /* 1.5 */
+    0x7FF0000000000000ull, /* +inf */
+    0xFFF0000000000000ull, /* -inf */
+    0x7FF8000000000000ull, /* qNaN */
+    0x7FF8000000000001ull, /* qNaN with a payload bit */
+    0xFFF4000000000000ull, /* negative sNaN */
+    0x0000000000000001ull, /* min subnormal */
+  };
+  for (size_t i = 0; i < sizeof(pats) / sizeof(pats[0]); i++)
+    UT_ASSERT_EQ(ir_d_to_bits(ir_bits_to_d((int64_t)pats[i])), (int64_t)pats[i]);
+  return 0;
+}
+
+UT_TEST(test_softfp_cmp3_float_ordered)
+{
+  int is_nan = -1; /* poisoned: every call must overwrite it */
+
+  UT_ASSERT_EQ(ir_softfp_cmp3(/*is_double*/ 0, 0x3F800000LL, 0x40000000LL, &is_nan), -1); /* 1.0f < 2.0f */
+  UT_ASSERT_EQ(is_nan, 0);
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, 0x40000000LL, 0x3F800000LL, &is_nan), +1);               /* 2.0f > 1.0f */
+  UT_ASSERT_EQ(is_nan, 0);
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, 0x3FC00000LL, 0x3FC00000LL, &is_nan), 0);                /* 1.5f == 1.5f */
+  UT_ASSERT_EQ(is_nan, 0);
+
+  /* Infinities order like ordinary values. */
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, (int64_t)0xFFFFFFFFFF800000ULL, 0x3F800000LL, &is_nan), -1); /* -inf < 1.0f */
+  UT_ASSERT_EQ(is_nan, 0);
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, 0x7F800000LL, 0x7F800000LL, &is_nan), 0);                    /* +inf == +inf */
+  UT_ASSERT_EQ(is_nan, 0);
+
+  /* Sign-extended carriers (exactly what ir_f_to_bits hands callers) must
+   * compare identically to zero-extended ones -- the low-32 truncation in
+   * ir_bits_to_f is what makes this work. */
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, ir_f_to_bits(-1.5f), ir_f_to_bits(1.5f), &is_nan), -1);
+  UT_ASSERT_EQ(is_nan, 0);
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, ir_f_to_bits(1.5f), ir_f_to_bits(-1.5f), &is_nan), +1);
+  UT_ASSERT_EQ(is_nan, 0);
+  return 0;
+}
+
+UT_TEST(test_softfp_cmp3_float_plus_zero_equals_minus_zero)
+{
+  int is_nan = -1;
+  /* IEEE: +0.0 == -0.0 even though the bit patterns differ -- a bitwise
+   * compare would get this wrong; this is the whole point of a soft-fp cmp3. */
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, 0x00000000LL, (int64_t)0xFFFFFFFF80000000ULL, &is_nan), 0);
+  UT_ASSERT_EQ(is_nan, 0);
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, (int64_t)0xFFFFFFFF80000000ULL, 0x00000000LL, &is_nan), 0);
+  UT_ASSERT_EQ(is_nan, 0);
+  /* ...but -0.0 still orders below any positive value. */
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, (int64_t)0xFFFFFFFF80000000ULL, 0x3F800000LL, &is_nan), -1);
+  UT_ASSERT_EQ(is_nan, 0);
+  return 0;
+}
+
+UT_TEST(test_softfp_cmp3_float_nan_unordered)
+{
+  int is_nan = -1;
+  /* Unordered: (a>b)-(a<b) collapses to 0 with a NaN operand, so the return
+   * value alone CANNOT distinguish NaN from equality -- *is_nan is the
+   * contract callers (value_tracking.c:417, const_prop_tmp.c:424) use to
+   * avoid folding the comparison into a wrong constant. */
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, 0x7FC00000LL, 0x3F800000LL, &is_nan), 0); /* qNaN vs 1.0f */
+  UT_ASSERT_EQ(is_nan, 1);
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, 0x3F800000LL, 0x7FC00000LL, &is_nan), 0); /* 1.0f vs qNaN */
+  UT_ASSERT_EQ(is_nan, 1);
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, 0x7FC00000LL, 0x7FC00000LL, &is_nan), 0); /* qNaN vs qNaN */
+  UT_ASSERT_EQ(is_nan, 1);
+  /* A signaling NaN, and NaN-vs-inf, are unordered too. */
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, 0x7FA00000LL, 0x7F800000LL, &is_nan), 0); /* sNaN vs +inf */
+  UT_ASSERT_EQ(is_nan, 1);
+  return 0;
+}
+
+UT_TEST(test_softfp_cmp3_double_ordered)
+{
+  int is_nan = -1;
+
+  UT_ASSERT_EQ(ir_softfp_cmp3(/*is_double*/ 1, 0x3FF0000000000000LL, 0x4000000000000000LL, &is_nan), -1); /* 1.0 < 2.0 */
+  UT_ASSERT_EQ(is_nan, 0);
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, 0x4000000000000000LL, 0x3FF0000000000000LL, &is_nan), +1);               /* 2.0 > 1.0 */
+  UT_ASSERT_EQ(is_nan, 0);
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, 0x3FF8000000000000LL, 0x3FF8000000000000LL, &is_nan), 0);                /* 1.5 == 1.5 */
+  UT_ASSERT_EQ(is_nan, 0);
+
+  /* IEEE: +0.0 == -0.0 in double mode too (the -0.0 carrier is INT64_MIN). */
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, 0LL, (int64_t)0x8000000000000000ULL, &is_nan), 0);
+  UT_ASSERT_EQ(is_nan, 0);
+
+  /* Infinities. */
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, (int64_t)0xFFF0000000000000ULL, 0x3FF0000000000000LL, &is_nan), -1); /* -inf < 1.0 */
+  UT_ASSERT_EQ(is_nan, 0);
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, 0x7FF0000000000000LL, 0x7FF0000000000000LL, &is_nan), 0);            /* +inf == +inf */
+  UT_ASSERT_EQ(is_nan, 0);
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, (int64_t)0xFFF0000000000000ULL, 0x7FF0000000000000LL, &is_nan), -1); /* -inf < +inf */
+  UT_ASSERT_EQ(is_nan, 0);
+  return 0;
+}
+
+UT_TEST(test_softfp_cmp3_double_nan_unordered)
+{
+  int is_nan = -1;
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, 0x7FF8000000000000LL, 0x3FF0000000000000LL, &is_nan), 0); /* qNaN vs 1.0 */
+  UT_ASSERT_EQ(is_nan, 1);
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, 0x3FF0000000000000LL, 0x7FF8000000000000LL, &is_nan), 0); /* 1.0 vs qNaN */
+  UT_ASSERT_EQ(is_nan, 1);
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, (int64_t)0xFFF8000000000000ULL, 0x7FF8000000000000LL, &is_nan), 0); /* -NaN vs +NaN */
+  UT_ASSERT_EQ(is_nan, 1);
+  /* A signaling NaN (quiet bit clear) is unordered too. */
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, 0x7FF4000000000000LL, 0LL, &is_nan), 0);
+  UT_ASSERT_EQ(is_nan, 1);
+  return 0;
+}
+
+UT_TEST(test_softfp_cmp3_is_double_selects_interpretation)
+{
+  int is_nan = -1;
+  /* The SAME 64-bit carrier decodes differently per mode:
+   * 0x3FF0000000000000 is 1.0 as a double, but its low 32 bits are
+   * 0x00000000 == +0.0f as a float. */
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, 0x3FF0000000000000LL, 0LL, &is_nan), +1); /* double: 1.0 > 0.0 */
+  UT_ASSERT_EQ(is_nan, 0);
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, 0x3FF0000000000000LL, 0LL, &is_nan), 0);  /* float: +0.0f == +0.0f */
+  UT_ASSERT_EQ(is_nan, 0);
+
+  /* 0x7FF8000000000000 is qNaN as a double but +0.0f as a float -- so the
+   * is_nan flag itself is mode-dependent. */
+  UT_ASSERT_EQ(ir_softfp_cmp3(1, 0x7FF8000000000000LL, 0LL, &is_nan), 0);
+  UT_ASSERT_EQ(is_nan, 1); /* double: unordered */
+  UT_ASSERT_EQ(ir_softfp_cmp3(0, 0x7FF8000000000000LL, 0LL, &is_nan), 0);
+  UT_ASSERT_EQ(is_nan, 0); /* float: +0.0f == +0.0f, NOT NaN */
+  return 0;
+}

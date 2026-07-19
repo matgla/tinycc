@@ -44,7 +44,7 @@
 #include "source/backend/arch/arm/arm.h"
 #include "source/backend/arch/arm/ssa_opt_arm.h"
 #include "arm-thumb-defs.h"
-#include "ir/opt.h"
+#include "source/opt/include/opt.h"
 #include "tcc-chained-hash.h"
 #include "tcc.h"
 #include "tccir.h"

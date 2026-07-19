@@ -20,7 +20,7 @@
 
 #include "tcc.h"
 #include "tccld.h"
-#include "ir/opt.h"
+#include "source/opt/include/opt.h"
 
 /********************************************************/
 /* global variables */

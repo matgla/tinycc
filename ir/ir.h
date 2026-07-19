@@ -33,7 +33,7 @@
 #include "pool.h"
 #include "regalloc.h"
 #include "ssa.h"
-#include "opt/ssa_opt.h"
+#include "ssa_opt.h"
 #include "stack.h"
 #include "type.h"
 #include "vreg.h"

@@ -21,7 +21,7 @@
 #define TCC_UT_IR_BUILD_H
 
 #define USING_GLOBALS
-#include "ir.h"
+#include <ir.h>
 
 /* Generous fixed pools — unit-test functions are tiny. */
 #define UTB_MAX_INSTR 256

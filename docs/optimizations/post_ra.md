@@ -76,3 +76,17 @@ regardless of optimization level.
 The pre-RA passes (SSA opt, loop transforms) have a larger impact on
 register pressure by reducing live ranges and eliminating dead code.
 Post-RA passes then optimize the final register assignment.
+
+## Rejected: post-phi dead-ASSIGN elimination
+
+A `ra_dead_assign_elim` pass — eliminating ASSIGN copies whose destination is
+overwritten before any read — was prototyped in `ir/regalloc.c` and left
+disabled until it was removed in the 2026-07-19 relocation batch.
+
+Phi resolution emits one copy per CFG edge for every phi; when an earlier pass
+folds an edge away, its copies survive as dead stores, which is what the pass
+targeted.  The implementation was unsound: a naive linear walk of "no use
+before redef" ignores that a jump *to* an instruction between the copy and the
+redefinition can land there without passing through the copy, so on that path
+the redefinition supplies the value and the copy was bypassed entirely.  A
+proper post-dominance check is required before this can be revived.

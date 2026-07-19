@@ -10,14 +10,14 @@ Flat IR loop transforms → CFG + dominators → SSA construction → SSA rename
 → SSA optimization passes → Phi resolution → Register allocation
 ```
 
-The SSA engine is driven by `tcc_ir_ssa_opt_run()` in `ir/opt/ssa_opt.c`.
+The SSA engine is driven by `tcc_ir_ssa_opt_run()` in `source/opt/ssa/engine/driver.c`.
 It iterates up to 5 times until convergence.
 
 ## Pass Order ( SSA_RUN macro)
 
 There are two SSA optimization drivers, selected per function by whether any VAR
 was promoted to SSA/phi form:
-- **Promoted path** (`had_promotable != 0`) → `tcc_ir_ssa_opt_run` (ir/opt/ssa_opt.c),
+- **Promoted path** (`had_promotable != 0`) → `tcc_ir_ssa_opt_run` (source/opt/ssa/engine/driver.c),
   the order below. Runs the broad `ssa:var_to_param_forward`.
 - **Fallback path** (nothing promotable) → the `RUN_SSA` loop in ir/regalloc.c, a
   similar order but with `ssa:var_forward` (narrow) in place of

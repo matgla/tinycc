@@ -175,7 +175,7 @@ void tcc_elf_add_sec_idx(void *s, const char *name, unsigned long addr,
   /* Do nothing. */
 }
 
-/* Pulled in transitively by ssa_opt_dce.c -> opt_dce.c
+/* Pulled in transitively by the SSA DCE passes -> flat dce
  * (tcc_ir_callee_is_noreturn).  No ELF symbol table or token pool exists in
  * this harness, so report "no ELF symbol" and an empty name — the DCE tests
  * never depend on noreturn-callee classification. */
@@ -185,10 +185,15 @@ ElfSym *elfsym(Sym *s)
   return NULL;
 }
 
+/* Consults the settable token table in stubs.c (utb_set_tok_str) so
+ * name-gated passes can be driven from unit tests; defaults to "" when the
+ * token was never mapped. */
+const char *utb_tok_name_lookup(int tok);
+
 const char *get_tok_str(int v, CValue *cv)
 {
-  (void)v;
   (void)cv;
-  return "";
+  const char *name = utb_tok_name_lookup(v);
+  return name ? name : "";
 }
 #endif /* UT_SSA_OPT_REAL */

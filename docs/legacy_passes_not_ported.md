@@ -30,7 +30,7 @@ All twelve enumerated loop passes are no longer invoked from the `tccgen.c` tail
 
 - `loop_rotation` → `ssa:loop_rotate` (`ir/regalloc.c`)
 - `loop_dead_first_iter` → `ssa:first_iter_exit` (`ir/regalloc.c`)
-- `loop_ptr_iv_exit_subst` → `ssa:ptr_iv_exit_subst` (`ir/opt/ssa_opt_loop.c`)
+- `loop_ptr_iv_exit_subst` → `ssa:ptr_iv_exit_subst` (`source/opt/ssa/loop/ptr_iv_exit_subst.c`)
 - `loop_const_sim` → `ssa:loop_const_sim`
 - `loop_unroll` → `ssa:loop_unroll`
 - `licm` → `ssa:licm` (relocated to regalloc-time flat region)

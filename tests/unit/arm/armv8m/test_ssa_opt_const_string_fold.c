@@ -405,4 +405,47 @@ UT_TEST(test_csf_strchr_nonconst_char_no_fold)
   return 0;
 }
 
+/* Emit a 3-arg FUNCCALL* with non-constant temps for s/c and `n` immediate. */
+static int emit_memchr_call(TCCIRState *ir, int is_valued, int n, int call_id)
+{
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, I32),
+           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, I32),
+           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 1), I32));
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(n, I32),
+           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 2), I32));
+  if (is_valued)
+    return utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(2, I32), UTB_NONE,
+                    utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 3), I32));
+  return utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, UTB_NONE,
+                  utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 3), I32));
+}
+
+/* GUARD: memchr with a non-constant haystack/needle does not fold. */
+UT_TEST(test_csf_memchr_nonconst_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  int i_call = emit_memchr_call(ir, 1, 4, 1);
+  StrFoldCtx c = csf_ctx(ir, i_call, STRBI_MEMCHR, 1);
+  UT_ASSERT_EQ(tcc_strfold_memchr.can_fold(&c), 0);
+  UT_ASSERT_EQ(tcc_strfold_memchr.fold(&c), 0);
+  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_FUNCCALLVAL);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: a void (discarded-result) memchr never folds. */
+UT_TEST(test_csf_memchr_void_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  int i_call = emit_memchr_call(ir, 0, 4, 1);
+  StrFoldCtx c = csf_ctx(ir, i_call, STRBI_MEMCHR, 0);
+  UT_ASSERT_EQ(tcc_strfold_memchr.can_fold(&c), 0);
+  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_FUNCCALLVOID);
+  utb_free(ir);
+  return 0;
+}
+
 UT_COVERS("const_string_fold");

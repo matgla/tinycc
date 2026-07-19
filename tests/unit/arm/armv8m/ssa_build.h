@@ -25,13 +25,13 @@
 #define SSA_BUILD_H
 
 #include "ir_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 /* ========================================================================
  * ssa_ctx - hand-built SSA fixture

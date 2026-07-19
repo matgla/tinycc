@@ -51,6 +51,38 @@ SSA_PASS_NAMES = {
 
 GOLDEN_ROOT = CURRENT_DIR / "golden"
 
+# Special golden groups that snapshot a whole-pipeline dump (via `-dump-ir`)
+# rather than a single `-dump-ir-passes=<pass>` block.  Keyed by directory name.
+# `volatile` captures the final post-register-allocation IR so the snapshot
+# proves the full contract end to end: a volatile local's loads/stores are
+# neither const-folded by any optimizer pass nor promoted into a register by
+# the allocator (a register-promoted slot would show `R<n>(V<m>)` with no
+# real load/store).
+SPECIAL_GROUPS = {
+    "volatile": {
+        "cflags": ["-O2", "-dump-ir"],
+        "start": "=== IR AFTER OPTIMIZATIONS ===",
+        "end": "=== END IR AFTER OPTIMIZATIONS ===",
+    },
+}
+
+
+def _extract_marked_block(output, start_marker, end_marker):
+    """Extract the lines strictly between start_marker and end_marker."""
+    lines = output.splitlines()
+    start_idx = end_idx = None
+    for i, line in enumerate(lines):
+        if line.strip() == start_marker:
+            start_idx = i
+        elif line.strip() == end_marker and start_idx is not None:
+            end_idx = i
+            break
+    if start_idx is None:
+        return None
+    if end_idx is None:
+        end_idx = len(lines) - 1
+    return "\n".join(line.rstrip() for line in lines[start_idx + 1 : end_idx])
+
 
 def _find_debug_compiler(compiler_override=None):
     if compiler_override is not None:
@@ -162,7 +194,11 @@ def debug_compiler(pytestconfig):
 def test_golden_ir(pass_name, case_name, c_file, expected_file, debug_compiler, tmp_path, request):
     updating = request.config.getoption("--update")
 
-    cflags = ["-O2", f"-dump-ir-passes={pass_name}"]
+    special = SPECIAL_GROUPS.get(pass_name)
+    if special is not None:
+        cflags = list(special["cflags"])
+    else:
+        cflags = ["-O2", f"-dump-ir-passes={pass_name}"]
     result, cmd = _run_compiler(debug_compiler, cflags, c_file, tmp_path)
 
     if result.returncode != 0:
@@ -172,7 +208,10 @@ def test_golden_ir(pass_name, case_name, c_file, expected_file, debug_compiler, 
             f"Output:\n{result.stdout}"
         )
 
-    actual = _extract_pass_block(result.stdout, pass_name)
+    if special is not None:
+        actual = _extract_marked_block(result.stdout, special["start"], special["end"])
+    else:
+        actual = _extract_pass_block(result.stdout, pass_name)
 
     if pass_name in SSA_PASS_NAMES and actual is None:
         # The SSA optimizer runs inside ir/regalloc.c and calls

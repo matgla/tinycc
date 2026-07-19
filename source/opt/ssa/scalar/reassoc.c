@@ -84,7 +84,12 @@ static int reassoc_consts_cancel(int op1, int op2, IROperand imm1, IROperand imm
 }
 
 /* (x OP c1) OP c2 → x OP (c1 OP c2).  Serves every reassociable binary op; the
- * generator reads q->op at runtime, so one dispatch covers the whole table. */
+ * generator reads q->op at runtime, so one dispatch covers the whole table.
+ * Single-use inner def only: this pass runs late (just before RA), so forwarding
+ * a multi-use base into the outer op extends the base's live range and spills in
+ * large high-pressure blocks (measured: rijndael encrypt/decrypt +15 each, with
+ * only synthetic-test wins) — the still-active flat add_reassoc reassociates
+ * early where it is safe. */
 OPT_GEN_SSA(reassoc_bin, 0) {
   int new_op = OPT_DSL_KEEP_OP;
   int32_t combined = 0;
@@ -104,6 +109,41 @@ OPT_GEN_SSA(reassoc_bin, 0) {
   RETIRE_PAIR(psrc1, 0);
   REWRITE(.new_op = new_op, .src1 = psrc1,
           .src2 = mk_imm_bt(combined, dest.btype));
+}
+
+/* `T = ASSIGN symref(S,+A); T2 = T ± imm` → `T2 = ASSIGN symref(S, A±imm)`.
+ * The SSA analog of the flat add_reassoc def-is-ASSIGN-symref case: cprop does
+ * not forward address constants into arithmetic, so the symref stays behind a
+ * single-def TEMP producer.  Fires only when the producer is single-use: then
+ * the producer dies and the rewrite is 3 instrs -> 2.  With a shared base the
+ * distinct-addend materializations (movw/movt each) cost more than the
+ * per-use `adds` they replace — measured: strlen-3/4 test_array_* +25,
+ * 20021120-1::foo +118 swing (kill a -115 win) vs only +6 of multi-use fixes.
+ * The direct `symref(S,+A) ± imm` operand form is ssa:fold's
+ * fold_symref_addend. */
+OPT_GEN_SSA(reassoc_symref_def, 0) {
+  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  GUARD(
+    when(q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB);
+    and(is_imm32(src2));
+    and_not(tcc_ir_barrel_shift_at(ir, q)));
+  PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = TCCIR_OP_ASSIGN, .single_use = 1);
+  GUARD(
+    when(irop_get_tag(psrc1) == IROP_TAG_SYMREF && !psrc1.is_lval));
+  IRPoolSymref *sr = irop_get_symref_ex(ir, psrc1);
+  if (!sr || !sr->sym)
+    return 0;
+  int64_t na = (int64_t)sr->addend +
+               ((q->op == TCCIR_OP_SUB) ? -(int64_t)(int32_t)src2.u.imm32
+                                        : (int64_t)(int32_t)src2.u.imm32);
+  if (na != (int32_t)na)
+    return 0;
+  uint32_t nidx = tcc_ir_pool_add_symref(ir, sr->sym, (int32_t)na, sr->flags);
+  IROperand nsrc = irop_make_symref(-1, nidx, 0, psrc1.is_local, psrc1.is_const,
+                                    irop_get_btype(psrc1));
+  nsrc.is_unsigned = psrc1.is_unsigned;
+  RETIRE_PAIR(nsrc, 1);
+  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = nsrc);
 }
 
 /* (a + c) + (a - c) → a + a (and the symmetric orderings): both operands are
@@ -154,18 +194,29 @@ OPT_GEN_SSA(reassoc_add_cancel, TCCIR_OP_ADD) {
   REWRITE(.src1 = a_op, .src2 = a_op);
 }
 
+/* ADD/SUB try the symref-def collapse first (it consumes an ASSIGN producer,
+ * which reassoc_bin's ADD/SUB-immediate chain cannot see), then the generic
+ * constant merge. */
+static int reassoc_addsub_dispatch(IRSSAOptCtx *ctx, int i)
+{
+  int r = opt_dsl_dispatch_reassoc_symref_def(ctx, i);
+  if (r)
+    return r;
+  return opt_dsl_dispatch_reassoc_bin(ctx, i);
+}
+
 /* ADD tries the cancel pattern first, then the generic constant merge. */
 static int reassoc_add_dispatch(IRSSAOptCtx *ctx, int i)
 {
   int r = opt_dsl_dispatch_reassoc_add_cancel(ctx, i);
   if (r)
     return r;
-  return opt_dsl_dispatch_reassoc_bin(ctx, i);
+  return reassoc_addsub_dispatch(ctx, i);
 }
 
 static const IRSSAOptGen reassoc_gens[] = {
   { TCCIR_OP_ADD, reassoc_add_dispatch,         "reassoc_add" },
-  { TCCIR_OP_SUB, opt_dsl_dispatch_reassoc_bin, "reassoc_sub" },
+  { TCCIR_OP_SUB, reassoc_addsub_dispatch,      "reassoc_sub" },
   { TCCIR_OP_MUL, opt_dsl_dispatch_reassoc_bin, "reassoc_mul" },
   { TCCIR_OP_AND, opt_dsl_dispatch_reassoc_bin, "reassoc_and" },
   { TCCIR_OP_OR,  opt_dsl_dispatch_reassoc_bin, "reassoc_or" },

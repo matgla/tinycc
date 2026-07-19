@@ -18,7 +18,7 @@
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 #include "opt/ssa/strength.h"
 #include "opt/ssa/reassoc.h"
 #include "opt/ssa/gvn.h"
@@ -28,7 +28,7 @@
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #define I32 IROP_BTYPE_INT32
 

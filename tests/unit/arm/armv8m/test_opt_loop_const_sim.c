@@ -1,6 +1,6 @@
 /*
  *  test_opt_loop_const_sim.c - suite for ssa_opt_loop_const_sim
- *                               (ir/opt/ssa_opt_loop.c, loop constant simulation)
+ *                               (source/opt/ssa/loop/loop_const_sim.c)
  *
  *  ssa_opt_loop_const_sim symbolically executes a small-trip-count loop body
  *  at compile time when every address/value the body touches is statically

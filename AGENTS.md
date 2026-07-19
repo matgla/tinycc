@@ -66,7 +66,7 @@ pytest tests/thumb/armv8m/ -v             # assembler tests
 C Source → Preprocessor (tccpp.c)
          → Parser + type checker (tccgen.c)
          → IR generation (tccir.h / ir/core.c)
-         → IR optimizations (ir/opt.c, ir/licm.c)
+         → IR optimizations (source/opt/)
          → Register allocation (tcls.c + ir/live.c)
          → Thumb-2 code gen (arm-thumb-gen.c)
          → ELF output (tccelf.c, tccld.c)
@@ -81,8 +81,7 @@ IR interface is `tccir.h`.
 
 | File | Role |
 |------|------|
-| `ir/opt.c` | Main optimizations: constant folding, DCE, etc. |
-| `ir/licm.c` | Loop-invariant code motion |
+| `source/opt/` | The whole optimizer: `include/` (interface headers), `util/`, `analysis/`, `engine/`, `flat/`, `ssa/`, `ra/`, `framework/` |
 | `ir/core.c` | IR construction and manipulation |
 | `ir/live.c` | Liveness analysis for register allocation |
 | `ir/mat.c` | Value materialization (reg/memory allocation) |

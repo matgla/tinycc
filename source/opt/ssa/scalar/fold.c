@@ -255,6 +255,22 @@ OPT_GEN_SSA(fold_div_zero_trap, -1) {
   REWRITE(.new_op = TCCIR_OP_TRAP);
 }
 
+/* dest = A SELECT A [cond]  ->  dest = A.  Identical immediate arms make the
+ * result independent of the condition, whose value then becomes dead (DCE'd).
+ * Cleans up const diamonds that vrp / if-conversion leave as `#k SELECT #k`
+ * (sccp propagates through instruction defs, not phi/select-fed merges). */
+OPT_GEN_SSA(fold_select_equal, TCCIR_OP_SELECT) {
+  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  GUARD(
+    when(irop_get_vreg(src1) < 0 && irop_get_vreg(src2) < 0);
+    and(irop_is_immediate(src1) && irop_is_immediate(src2) &&
+        !src1.is_sym && !src2.is_sym &&
+        irop_get_btype(src1) == irop_get_btype(src2) &&
+        irop_get_imm64_ex(ir, src1) == irop_get_imm64_ex(ir, src2)));
+  opt_dsl_drop_use(ctx, tcc_ir_op_get_cond(ir, q), i);
+  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = src1);
+}
+
 /* Both operands immediate: full constant fold.  An IMM32 operand of a 64-bit
  * op is a sign-extended 64-bit constant; 32-bit evaluation would lose the high
  * word (fuzz longlong seed 3161: `#imm SHR #32`). */
@@ -370,7 +386,9 @@ OPT_GEN_SSA(fold_const_eval, -1) {
   REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = imm);
 }
 
-/* x - x, x ^ x -> 0;  x & x, x | x -> x */
+/* x - x, x ^ x, x % x -> 0;  x / x -> 1;  x & x, x | x -> x.  x/x and x%x
+ * assume x != 0 (division by zero is UB, so the zero case never reaches here);
+ * src1 == src2 rules out the INT_MIN/-1 overflow trap. */
 OPT_GEN_SSA(fold_x_op_x, -1) {
   PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
   GUARD(
@@ -380,10 +398,18 @@ OPT_GEN_SSA(fold_x_op_x, -1) {
   switch (q->op) {
   case TCCIR_OP_SUB:
   case TCCIR_OP_XOR:
+  case TCCIR_OP_IMOD:
+  case TCCIR_OP_UMOD:
     opt_dsl_drop_use(ctx, src1, i);
     opt_dsl_drop_use(ctx, src1, i);
     REWRITE(.new_op = TCCIR_OP_ASSIGN,
             .src1 = mk_imm_bt(0, dest.btype));
+  case TCCIR_OP_DIV:
+  case TCCIR_OP_UDIV:
+    opt_dsl_drop_use(ctx, src1, i);
+    opt_dsl_drop_use(ctx, src1, i);
+    REWRITE(.new_op = TCCIR_OP_ASSIGN,
+            .src1 = mk_imm_bt(1, dest.btype));
   case TCCIR_OP_AND:
   case TCCIR_OP_OR:
     opt_dsl_drop_use(ctx, src1, i);
@@ -391,6 +417,33 @@ OPT_GEN_SSA(fold_x_op_x, -1) {
   default:
     return 0;
   }
+}
+
+/* *g / *g -> 1, *g % *g -> 0 for the same non-volatile, non-FP global symref
+ * read (matching sym + addend) on both sides.  Both operands are read by this
+ * one quad, so the value is identical; x/x and x%x assume x != 0 (UB otherwise).
+ * The register form is handled by fold_x_op_x; this covers the direct symref-lval
+ * operands (`a / a` on a global) that never get a vreg. */
+OPT_GEN_SSA(fold_divmod_self_symref, -1) {
+  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  GUARD(
+    when(q->op == TCCIR_OP_DIV || q->op == TCCIR_OP_UDIV ||
+         q->op == TCCIR_OP_IMOD || q->op == TCCIR_OP_UMOD);
+    and(src1.is_sym && src1.is_lval && src2.is_sym && src2.is_lval));
+  IRPoolSymref *a_ref = irop_get_symref_ex(ir, src1);
+  IRPoolSymref *b_ref = irop_get_symref_ex(ir, src2);
+  if (!a_ref || !b_ref || a_ref->sym != b_ref->sym ||
+      a_ref->addend != b_ref->addend)
+    return 0;
+  int ttype = a_ref->sym->type.t;
+  int btype = ttype & VT_BTYPE;
+  if ((ttype & VT_VOLATILE) ||
+      btype == VT_FLOAT || btype == VT_DOUBLE || btype == VT_LDOUBLE)
+    return 0;
+  int fold_val = (q->op == TCCIR_OP_IMOD || q->op == TCCIR_OP_UMOD) ? 0 : 1;
+  tcc_ir_set_src2(ir, i, IROP_NONE);
+  REWRITE(.new_op = TCCIR_OP_ASSIGN,
+          .src1 = mk_imm_bt(fold_val, dest.btype));
 }
 
 /* One XOR arm is #-1, the other is `a` itself (common after LOAD-CSE folds
@@ -850,6 +903,7 @@ static const OptDslSSARule fold_binary_rules[] = {
   opt_dsl_dispatch_fold_div_zero_trap,
   opt_dsl_dispatch_fold_const_eval,
   opt_dsl_dispatch_fold_x_op_x,
+  opt_dsl_dispatch_fold_divmod_self_symref,
   opt_dsl_dispatch_fold_bitcomp_src2,
   opt_dsl_dispatch_fold_bitcomp_src1,
   opt_dsl_dispatch_fold_xor_cancel_src1,
@@ -892,6 +946,7 @@ static const IRSSAOptGen fold_gens[] = {
   OPT_GEN_ENTRY(fold_bfi,  TCCIR_OP_BFI),
   OPT_GEN_ENTRY(fold_ubfx, TCCIR_OP_UBFX),
   OPT_GEN_ENTRY(fold_sbfx, TCCIR_OP_SBFX),
+  OPT_GEN_ENTRY(fold_select_equal, TCCIR_OP_SELECT),
   { TCCIR_OP_ADD,  fold_binary,    "fold_add" },
   { TCCIR_OP_SUB,  fold_binary,    "fold_sub" },
   { TCCIR_OP_MUL,  fold_binary,    "fold_mul" },

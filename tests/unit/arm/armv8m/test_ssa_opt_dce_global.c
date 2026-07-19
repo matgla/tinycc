@@ -1,7 +1,7 @@
 /*
  *  test_ssa_opt_dce_global.c - dead redundant GLOBAL store elimination
  *
- *  Covers dce_dead_global_stores() in ir/opt/ssa_opt_dce.c: block-local
+ *  Covers dce_dead_global_stores() in source/opt/ssa/dce/dead_global_stores.c: block-local
  *  overwrite elimination for stores to global symbols (`STORE g <- a;
  *  STORE g <- b` with no intervening read of `g`).  This is the SSA-side
  *  companion to the legacy flat store_redundant global path.
@@ -10,12 +10,12 @@
  *  so they exercise the global path without depending on live-interval setup.
  *
  *  HARNESS NOTES:
- *    - Links the real ir/opt/ssa_opt_dce.c via UT11.
+ *    - Links the real passes in source/opt/ssa/dce/ via UT11.
  *    - Uses ssa_build.h for hand-built vinfo + IR.
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #include "ut.h"
 

@@ -46,7 +46,6 @@ int tcc_ir_opt_self_arith_fold(TCCIRState *ir);
 int tcc_ir_opt_single_value_tmp(TCCIRState *ir);
 int tcc_ir_opt_cmp_field_fuse(TCCIRState *ir);
 int tcc_ir_opt_jump_threading(TCCIRState *ir);
-int tcc_ir_opt_setif_or_tautology(TCCIRState *ir);
 int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir);
 int tcc_ir_opt_licm(TCCIRState *ir);
 
@@ -70,7 +69,6 @@ static const PassEntry g_passes[] = {
     {"single_value_tmp", tcc_ir_opt_single_value_tmp},
     {"cmp_field_fuse", tcc_ir_opt_cmp_field_fuse},
     {"jump_threading", tcc_ir_opt_jump_threading},
-    {"setif_or_tautology", tcc_ir_opt_setif_or_tautology},
     {"dead_lea_store_elim", tcc_ir_opt_dead_lea_store_elim},
     {"licm", tcc_ir_opt_licm},
 };

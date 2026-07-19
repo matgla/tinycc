@@ -129,6 +129,11 @@ static void cpt_mark_addrtaken(TCCIRState *ir, int n, int max_var, uint8_t *var_
         var_addrtaken[vp / 8] |= (1 << (vp % 8));
     }
   }
+  /* Volatile VARs must never be tracked as holding a constant: exclude them
+   * the same way as address-taken VARs so their loads stay real. */
+  for (int vp = 0; vp <= max_var && vp < ir->variables_live_intervals_size; vp++)
+    if (ir->variables_live_intervals[vp].is_volatile)
+      var_addrtaken[vp / 8] |= (1 << (vp % 8));
 }
 
 static int cpt_is_block_boundary(int op)
@@ -594,4 +599,15 @@ int tcc_ir_opt_const_prop_tmp_core(TCCIRState *ir)
   }
 
   return changes;
+}
+
+int tcc_ir_opt_const_prop_tmp(TCCIRState *ir)
+{
+  if (tcc_ir_opt_pass_disabled("const_prop_tmp")) return 0;
+  tcc_pass_timing_init();
+  if (!tcc_pass_timing_on) return tcc_ir_opt_const_prop_tmp_core(ir);
+  unsigned long _t = tcc_pass_clk_us();
+  int _r = tcc_ir_opt_const_prop_tmp_core(ir);
+  tcc_pass_timing_add("const_prop_tmp", tcc_pass_clk_us() - _t);
+  return _r;
 }

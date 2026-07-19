@@ -1,10 +1,15 @@
 # Porting an SSA optimization pass to `source/opt/ssa`
 
-How to relocate an `ir/opt/ssa_opt_*.c` pass into the componentized
+How to add or relocate an SSA optimization pass in the componentized
 `source/opt/ssa/` tree, optionally refactoring it onto the DSL framework in
 `source/opt/framework`. Written to keep the next port a short, mechanical loop
 instead of a rediscovery exercise. Reference port: `ssa_opt_strength`
 (`git log` around `source/opt/ssa/strength.c`).
+
+`ir/opt/` no longer exists: every pass and the engine itself now live under
+`source/opt/ssa/` (the engine in `source/opt/ssa/engine/`), and the shared
+engine header is `source/opt/ssa/include/ssa_opt.h`. The `ir/opt/...` paths in
+the checklist below are kept only to describe where the older ports came from.
 
 ## The target layout
 
@@ -18,7 +23,7 @@ Include paths are `-Isource/opt/ssa` **and** `-Isource/opt/ssa/include`
 (already in `SSA_OPT_INC` and `UT_CFLAGS`). Headers are reached by their
 **component path**, e.g. `#include "opt/ssa/strength.h"` — the `opt/ssa/`
 prefix is what makes the include collision-proof and unambiguous (there is no
-`ir/opt/ssa/` dir, so it can only resolve under `include/`). Add shared
+`opt/ssa/` dir outside `include/`, so it can only resolve there). Add shared
 predicates to `ssa_opt_helpers.h`; keep pass-specific helpers `static` in the
 `.c`.
 
@@ -101,18 +106,16 @@ int ssa_opt_<pass>(IRSSAOptCtx *ctx)
    DSL. `OPT_DSL_INC`/`SSA_OPT_INC` are already in the top Makefile's global
    `DEFINES`, so nothing else is needed for the core build.
 3. **Extract the API**: remove `int ssa_opt_<pass>(...)` from
-   `ir/opt/ssa_opt.h`, put it in `source/opt/ssa/include/opt/ssa/<pass>.h`
+   `source/opt/ssa/include/ssa_opt.h`, put it in `source/opt/ssa/include/opt/ssa/<pass>.h`
    (forward-declare `struct IRSSAOptCtx;`), then add
    `#include "opt/ssa/<pass>.h"` to every consumer. For the reference port those
-   were: `ir/opt/ssa_opt.c`, `ir/regalloc.c`, and the UT files below. Grep first:
+   were: `source/opt/ssa/engine/driver.c`, `ir/regalloc.c`, and the UT files below. Grep first:
    `grep -rln ssa_opt_<pass> --include=*.c`.
-4. **`tests/unit/arm/armv8m/Makefile`**: repoint the two `$(TOP)/ir/opt/…` refs
-   (in `UT_COVERAGE_ONLY_SRCS` and `UT11_MODULE_SRCS`) to
-   `$(TOP)/source/opt/ssa/<pass>.c`. `UT_CFLAGS` already carries
+4. **`tests/unit/arm/armv8m/Makefile`**: list the new `$(TOP)/source/opt/ssa/<pass>.c`
+   in `UT_COVERAGE_ONLY_SRCS` and `UT11_MODULE_SRCS`. `UT_CFLAGS` already carries
    `-I…/source/opt/ssa`, `-I…/source/opt/ssa/include`, and
    `-I…/source/opt/framework` — no flag change unless you add a new include root.
-5. **`tests/selfhost/test_selfhost_compile.py`**: drop the hard-coded
-   `ir/opt/ssa_opt_<pass>.c` string. That list has no `source/opt/*` entries by
+5. **`tests/selfhost/test_selfhost_compile.py`**: drop any hard-coded stale path. That list has no `source/opt/*` entries by
    design — relocated passes are simply out of its scope. A stale path fails the
    `missing source files` assert (which fires *before* the no-sysroot skip).
 6. **`ir/README.md`** tree entry (cosmetic).

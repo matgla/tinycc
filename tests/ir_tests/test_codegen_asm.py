@@ -31,7 +31,7 @@ def _compile(name, extra_cflags=()):
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
 
     cflags = [
-        "-O1",
+        "-O2",
         "-nostdlib",
         "-fvisibility=hidden",
         "-mcpu=cortex-m33",
@@ -364,6 +364,57 @@ def test_cmp_common_base_offset_fold_fires():
         assert _count_mnem(fn, "cmp") == 0, f"{name}: common-base fold did not fire (cmp present)"
         assert _count_mnem_regex(fn, rf"^movs\s+r0, #{val}\b") >= 1, \
             f"{name}: expected folded constant return {val}"
+
+
+def test_float_narrow_fires():
+    """Soft-FP double->float demotion fold: f2d -> floor -> [d2f] narrows to floorf.
+
+    Case 1 (`q`, result narrowed back to float) must collapse to a tail call to
+    floorf with no f2d/d2f conversion calls and no double `floor` call.
+    Case 2 (`q1`, result stays double) must swap to floorf + f2d (again no
+    double `floor` and no d2f).  With the fold disabled or broken, the
+    __aeabi_f2d/__aeabi_d2f helpers and the double `floor` call reappear.
+    """
+    obj = _compile("float_narrow")
+    funcs = _disassemble(obj)
+
+    q = funcs["q"]
+    assert _count_mnem_regex(q, r"^b\.w\s+.*<floorf>") >= 1, \
+        "q: demotion fold did not fire (no tail call to floorf)"
+    assert not any("__aeabi_f2d" in ops or "__aeabi_d2f" in ops for _, ops in q), \
+        "q: f2d/d2f conversion calls survived the demotion fold"
+    assert not any(re.search(r"<floor>", ops) for _, ops in q), \
+        "q: double floor() call survived the demotion fold"
+
+    q1 = funcs["q1"]
+    assert _count_mnem_regex(q1, r"^bl\s+.*<floorf>") >= 1, \
+        "q1: demotion fold did not fire (no floorf call)"
+    assert not any("__aeabi_d2f" in ops for _, ops in q1), \
+        "q1: unexpected d2f in double-result shape"
+    assert not any(re.search(r"<floor>", ops) for _, ops in q1), \
+        "q1: double floor() call survived the demotion fold"
+
+
+def test_return_const_reuse_fires():
+    """Return-constant register reuse: `return C` on the equality edge of
+    TEST_ZERO V / CMP V,#C returns V (provably == C there, already in a
+    register) instead of rematerializing C.
+
+    SSA home: ssa:branch (return-const reuse); the retired flat return_reuse
+    pass did the same rewrite pre-SSA.  A disabled or broken fold
+    reintroduces the `movs r0, #C` and fails here.  Covers the gcc-torture
+    shapes pr106433::bar (TEST_ZERO, C == 0) and 920812-1::f (CMP, C == 1).
+    """
+    obj = _compile("return_const_reuse")
+    funcs = _disassemble(obj)
+
+    bar = funcs["bar_inf"]
+    assert _count_mnem_regex(bar, r"^movs\s+r0, #0\b") == 0, \
+        "bar_inf: return-const reuse did not fire (movs r0, #0 present)"
+
+    fsw = funcs["f_switch"]
+    assert _count_mnem_regex(fsw, r"^movs\s+r0, #1\b") == 0, \
+        "f_switch: return-const reuse did not fire (movs r0, #1 present)"
 
 
 # -----------------------------------------------------------------------------

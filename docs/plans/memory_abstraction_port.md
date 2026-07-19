@@ -1,9 +1,10 @@
 # Memory Abstraction Port: route source/ allocations through existing primitives
 
-**Status:** in-progress (Phase 0 + Phase E done; Phase A mostly done — 8 files converted
+**Status:** in-progress (Phase 0 + Phase E done; Phase A mostly done — 9 files converted
 [const_aggregate, const_var_prop, const_prop_tmp, value_tracking, if_convert, branch, backend
-regalloc + arm-thumb-gen, vrp]; 2 reclassified/deferred [opt_dsl_var_const.h, gvn.c → Phase C];
-strategy revised for slow-heap target — `small_sequence` now default, Phase F added)
+regalloc + arm-thumb-gen, flat vrp (since retired), ssa/cfg/vrp]; 2 reclassified/deferred
+[opt_dsl_var_const.h, gvn.c → Phase C]; strategy revised for slow-heap target — `small_sequence`
+now default, Phase F added)
 · **Branch:** `legacyOptRemoval`
 
 ## Goal
@@ -465,6 +466,73 @@ object-diff **0 changed functions** at -O2 (all suites, vs pre-batch baseline), 
   init-fail `return 0` can't leak it; both `tcc_free`s dropped (auto-cleanup). `is_merge` stays manual —
   returned by `ir_opt_build_merge_bitmap`, not a scope-local alloc. Object-diff **0 changed functions** at
   -O2 (all suites); `make ut` (`opt_vrp` 24/24, leak-sanitized, 12 binaries) + `make test` (13,635) green.
+  *(File since retired with the flat vrp pass — row kept for the cap rationale only.)*
+- `[~]` `source/opt/ssa/cfg/vrp.c` — **follow-on (2026-07-17).** All 4 raw allocs removed (zero left).
+  Fixed-size → `small_sequence`: `ranges` → `SVRangeSeq` (`SVRange`, **cap 64** = 768 B after the
+  struct was packed 24→12 B, see the readability refactor below), `param_stable`/`var_stable` →
+  `SVFlagSeq` (`uint8_t`, **cap 32** = 32 B each); 832 B inline total in the one frame. **Caps are
+  measured, not guessed** — see the measurement note below. The `SVState`
+  struct keeps its raw `ranges`/`*_stable`
+  pointers as aliases into the owners (`small_sequence` is init-once and never moves after `_init`, and
+  the owners outlive the domwalk) — so the hook bodies are unchanged. NULL-ness is not load-bearing here
+  (`sv_slot` bounds-checks `*_cap` before touching the flag arrays), so the `tmp_read` gotcha does not
+  apply. **Also took the growable `log`** (hand-rolled `tcc_realloc` doubling, a Phase B/Pattern 2 site)
+  → `TCC_VECTOR_DEFINE(SVUndoVec)` + `scoped_named_vector`, since `small_sequence` is init-once: the
+  owner lives in `ssa_opt_vrp` and `SVState` holds `SVUndoVec *log`, which drops the `log_count`/`log_cap`
+  fields (watermark = `log->size`, undo = `_pop_back`). Chose `TCC_VECTOR_DEFINE` (all `static inline`)
+  over `scoped_vector(T)` to avoid a UT link dep on `source/memory/vector.c`. Growth curve changes (4×2
+  vs 64×2) — heap-traffic only, not codegen. All 4 `tcc_free`s dropped; `ssa_opt_vrp` now tail-returns
+  `opt_ssa_domwalk`. `make cross` clean at `-Werror`; user confirmed tests green.
+
+  **Cap measurement (method worth reusing for every Phase A/B cap).** Temporarily `fprintf`'d
+  `cap/temp_cap/param_cap/var_cap` from `ssa_opt_vrp`, compiled all 1,682 `gcc.c-torture/execute`
+  files at `-O2` → **28,407 calls**. Result — the distribution is *bimodal with a hard knee*, not a
+  smooth tail:
+
+  | `ranges` cap | 16 | 32 | 48 | **64** | 128 |
+  |---|---|---|---|---|---|
+  | calls fully inline | 19.5% | 95.8% | 97.4% | **97.9%** | 98.8% |
+  | inline bytes @ 24 B/slot | 384 | 768 | 1152 | 1536 | 3072 |
+  | inline bytes @ 12 B/slot (packed) | 192 | 384 | 576 | **768** | 1536 |
+
+  73% of all calls sit at exactly 26 or 28 slots (`cap` mode), so **cap 16 lands just below the mode
+  and wins almost nothing** (19.5%); cap 32 clears it (95.8%) and 64 reaches 97.9%. `param_cap`
+  **maxes at 13 across the entire corpus** (cap 32 → 100%); `var_cap` cap 32 → 99.8%. Lesson: the
+  plan's "cover the common case, not the max" rule needs the *actual mode* — the guessed cap 16
+  (from the `sizeof(T)≲512 B` rule alone) was the worst of both worlds, and the guessed flag cap 64
+  was 2× oversized for arrays that never exceed 13. Packing `SVRange` 24→12 B then bought cap 64
+  (97.9%) for the same 768 B that cap 32 (95.8%) cost unpacked.
+
+  **Readability refactor (same session, 2026-07-17).** Assessed `ssa:vrp` for a DSL port first —
+  **it does not fit, and this is structural, not effort**: (1) `IRSSAOptGen` is
+  `{int op; ssa_gen_fn fn; const char *name;}` and `ssa_opt_run_gens` dispatches opcode→`fn(ctx, i)`
+  with **no state/begin/end hook** (the SSA side lacks even flat's `run_stateful_gens`), so a
+  dom-scoped range map has nowhere to live; (2) `PAIR`/`opt_dsl_pair_match` links only through
+  **vreg def-use** (`vi->def_instr`), but CMP+JUMPIF is a **flag** dependency with no vreg edge;
+  (3) `REWRITE` mutates instruction `i` only, while every vrp fold mutates *two* instructions plus
+  CFG state (`ssa_drop_phi_edge`). The DSL is for opcode-triggered peepholes; vrp is dominator-scoped
+  dataflow. Done instead, all four codegen-neutral:
+  - **`sv_jumpif_edges()`** — the target/fall-through resolution (read `dest.u.imm32`, bounds-check
+    against `num_instrs`, skip NOPs, bounds-check again) was copy-pasted **3×**; now one helper reusing
+    the existing `ir_skip_nops_forward`. This is exactly the code that caused the `instr_to_block` ASan
+    OOB class, so 3 copies → 1 shrinks that surface.
+  - **`SVCmp` + `sv_read_cmp()`** — the ~8-line `CMP x,#c` decode preamble was repeated in
+    `_jumpif`/`_setif`/`_select`/`sv_enter` (**4×**). `c_ok` is reported rather than rejected because
+    the tautology-vs-0 fold needs no constant.
+  - **`sv_seed_def` split** (107 lines → a 20-line dispatcher + `sv_seed_assign`/`_addsub`/`_bitop`).
+  - **`SVRange` packed** `{int valid; int64_t lo,hi}` (24 B) → `{int32_t lo,hi; uint8_t valid}` (12 B);
+    `SVUndo` 32→16 B. Safe because every seeding path already clamps to int32 — and now **`sv_set`,
+    the sole writer, enforces it**: an out-of-domain fact is dropped, not truncated (unreachable today,
+    but the guard is what makes the narrowing future-proof).
+
+  **Verification (the strong gate for a behavior-preserving refactor):** object-diff vs the
+  pre-refactor build — **0 changed functions / 20,429 unchanged** at -O2 over all suites (the ±2 NEW
+  `gcc-execute/*::main` are the documented harness nondeterminism). `make test` 13,550 passed /
+  246 skipped / 1 xfailed. **Note on that count:** it is *not* comparable to the 13,635/161 recorded
+  elsewhere in this doc — those runs used a non-ASan `config.mak`; under ASan, 85 QEMU/torture
+  *execution* tests self-skip as "too slow" (81 `test_gcc_torture_ir` + 4 `test_qemu`), and
+  13,550+246 == 13,635+161 == 13,796 total. Byte-identical codegen makes those execution tests
+  redundant anyway.
 
 ### Phase B — Pattern 2: scope-local growable → Phase F type / `scoped_vector`
 

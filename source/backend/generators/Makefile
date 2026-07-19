@@ -15,10 +15,10 @@ $(X)source/backend/generators/function.o: \
 	source/backend/generators/function.c \
 	source/backend/generators/regalloc.h \
 	source/opt/function_pipeline.h \
-	tcc.h tccir.h ir/opt.h ir/opt_utils.h ir/opt_engine.h \
-	ir/opt_pipeline.h ir/opt_gens_fusion.h source/opt/flat/include/opt/flat/bool.h \
+	tcc.h tccir.h source/opt/include/opt.h source/opt/include/opt_utils.h source/opt/include/opt_engine.h \
+	source/opt/include/opt_pipeline.h source/opt/include/opt_gens_fusion.h source/opt/flat/include/opt/flat/bool.h \
 	source/opt/flat/include/opt/flat/call_result.h ir/regalloc.h ir/ssa.h \
-	ir/cfg.h ir/codegen.h ir/core.h ir/licm.h \
+	ir/cfg.h ir/codegen.h ir/core.h source/opt/include/licm.h \
 	source/backend/arch/arm/arm_regalloc.h
 	@mkdir -p $(dir $@)
 	$(BACKEND_GENERATORS_CC) -c $< -o $@
@@ -27,9 +27,9 @@ $(X)source/backend/generators/function.o: \
 $(X)source/backend/generators/regalloc.o: \
 	source/backend/generators/regalloc.c \
 	source/backend/generators/regalloc.h \
-	tcc.h tccir.h ir/opt.h ir/opt_utils.h ir/opt_engine.h \
-	ir/opt_pipeline.h ir/regalloc.h ir/ssa.h \
-	ir/cfg.h ir/codegen.h ir/core.h ir/licm.h \
+	tcc.h tccir.h source/opt/include/opt.h source/opt/include/opt_utils.h source/opt/include/opt_engine.h \
+	source/opt/include/opt_pipeline.h ir/regalloc.h ir/ssa.h \
+	ir/cfg.h ir/codegen.h ir/core.h source/opt/include/licm.h \
 	source/backend/arch/arm/arm_regalloc.h
 	@mkdir -p $(dir $@)
 	$(BACKEND_GENERATORS_CC) -c $< -o $@

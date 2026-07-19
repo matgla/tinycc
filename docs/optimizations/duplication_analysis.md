@@ -6,13 +6,13 @@ why the duplication exists.
 
 ## Methodology
 
-- Legacy passes: defined in `ir/opt_pipeline.c`, run on flat IR before
+- Legacy passes: defined in `source/opt/engine/pipeline_table.c`, run on flat IR before
   CFG/SSA construction.
-- SSA passes: defined in `ir/opt/ssa_opt.c` (driver) and `ir/opt/ssa_opt_*.c`
-  (implementations), run after SSA construction on SSA-form IR with
-  use-def chains.
+- SSA passes: driver in `source/opt/ssa/engine/`, implementations under
+  `source/opt/ssa/{scalar,cfg,memory,string,dce,loop}/`, run after SSA
+  construction on SSA-form IR with use-def chains.
 - Flat-IR loop transforms: defined inline in `ir/regalloc.c` before SSA
-  construction, use engines from `ir/opt/ssa_opt_loop.c` and `ir/opt_loop_utils.c`.
+  construction, use engines from `source/opt/ssa/loop/` and `source/opt/flat/loop/`.
 
 ## True Duplicates (Same Goal, Different Implementation)
 
@@ -24,7 +24,7 @@ but runs later in the pipeline.
 
 | Legacy | SSA |
 |--------|-----|
-| `tcc_ir_opt_dce()` in `ir/opt_dce.c` | `ssa_opt_dce()` in `ir/opt/ssa_opt_dce.c` |
+| `tcc_ir_opt_dce()` in `source/opt/flat/dce/dce.c` | `ssa_opt_dce()` in `source/opt/ssa/dce/dce.c` |
 | Operates on flat IR, uses DU chains (live analysis) | Operates on SSA IR, uses vreg def_count + use lists |
 | Gated by `opt_dce` flag | Always runs at -O1+ (no flag gate) |
 | Present in: propagation, fusion, late_cleanup, kb_cascade, const_cascade, entry_store | Present in: main SSA driver, guard_collapse, cfg_cleanup |

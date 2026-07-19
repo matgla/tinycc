@@ -20,6 +20,7 @@ static const StrFoldHandler *const g_handlers[] = {
     &tcc_strfold_strcmp,
     &tcc_strfold_strncmp,
     &tcc_strfold_memcmp,
+    &tcc_strfold_memchr,
     &tcc_strfold_strcpy,
     &tcc_strfold_strspn,
     &tcc_strfold_strcspn,
@@ -47,9 +48,10 @@ static void ensure_index_built(void)
   g_index_built = 1;
 }
 
-int tcc_ir_ssa_opt_const_string_fold(IRSSAOptCtx *ctx)
+/* ctx may be NULL: the early flat-region run has no SSA state yet, and every
+ * handler either ignores it or checks it (str_strcpy). */
+static int const_string_fold_core(TCCIRState *ir, IRSSAOptCtx *ctx)
 {
-  TCCIRState *ir = ctx->ir;
   int changes = 0;
 
   ensure_index_built();
@@ -87,8 +89,20 @@ int tcc_ir_ssa_opt_const_string_fold(IRSSAOptCtx *ctx)
       changes += h->fold(&c);
   }
 
+  return changes;
+}
+
+int tcc_ir_ssa_opt_const_string_fold(IRSSAOptCtx *ctx)
+{
+  int changes = const_string_fold_core(ctx->ir, ctx);
+
   if (changes)
     tcc_ir_ssa_opt_rebuild(ctx);
 
   return changes;
+}
+
+int tcc_ir_ssa_opt_const_string_fold_flat(TCCIRState *ir)
+{
+  return const_string_fold_core(ir, NULL);
 }

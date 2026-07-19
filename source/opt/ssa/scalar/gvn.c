@@ -112,6 +112,19 @@ static uint32_t gvn_hash(int op, uint8_t s1_tag, int32_t s1, int32_t imm1, Sym *
   return h & (GVN_HASH_SIZE - 1);
 }
 
+/* A local volatile VAR operand: two identical reads of it must not be CSE'd,
+ * since every load is a mandated memory access.  (Volatile globals carry the
+ * flag on their Sym and are handled by the s*_sym VT_VOLATILE checks.) */
+static int gvn_operand_is_volatile_var(TCCIRState *ir, IROperand s)
+{
+  int32_t v = irop_get_vreg(s);
+  if (v < 0 || TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_VAR ||
+      !tcc_ir_vreg_is_valid(ir, v))
+    return 0;
+  IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, v);
+  return li && li->is_volatile;
+}
+
 /* SYMREF pool entries are never deduplicated, so key them by resolved
  * (sym, addend) — two references to the same global must compare equal. */
 static void gvn_operand_key(TCCIRState *ir, IROperand op, uint8_t *tag, int32_t *vr,
@@ -496,7 +509,8 @@ static int gvn_try_cmp_setif(IRSSAOptCtx *ctx, GVNEntry **table, GVNEntry *lcach
   gvn_operand_key(ir, cmp_s1, &s1_tag, &s1_vr, &s1_imm, &s1_sym);
   gvn_operand_key(ir, cmp_s2, &s2_tag, &s2_vr, &s2_imm, &s2_sym);
   if ((s1_sym && (s1_sym->type.t & VT_VOLATILE)) ||
-      (s2_sym && (s2_sym->type.t & VT_VOLATILE)))
+      (s2_sym && (s2_sym->type.t & VT_VOLATILE)) ||
+      gvn_operand_is_volatile_var(ir, cmp_s1) || gvn_operand_is_volatile_var(ir, cmp_s2))
     return 0;
   uint8_t s1_lv = cmp_s1.is_lval, s2_lv = cmp_s2.is_lval;
 
@@ -669,7 +683,9 @@ static int gvn_visit(IRSSAOptCtx *ctx, int b, void *state)
     if (local) {
       /* Volatile reads must all be emitted — never CSE them. */
       if ((s1_sym && (s1_sym->type.t & VT_VOLATILE)) || (s2_sym && (s2_sym->type.t & VT_VOLATILE)) ||
-          (s3_sym && (s3_sym->type.t & VT_VOLATILE)))
+          (s3_sym && (s3_sym->type.t & VT_VOLATILE)) ||
+          gvn_operand_is_volatile_var(ir, src1) || gvn_operand_is_volatile_var(ir, src2) ||
+          (is_mla && gvn_operand_is_volatile_var(ir, accum)))
         continue;
       uint8_t s1_lv = src1.is_lval, s2_lv = src2.is_lval;
       uint8_t s3_lv = is_mla ? accum.is_lval : 0;

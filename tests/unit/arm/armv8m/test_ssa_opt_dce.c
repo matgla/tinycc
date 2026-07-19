@@ -13,18 +13,18 @@
  *    - ssa_opt_dce(): optimize-level gating
  *
  *  HARNESS NOTES:
- *    - Links the real ir/opt/ssa_opt_dce.c via UT11.
+ *    - Links the real passes in source/opt/ssa/dce/ via UT11.
  *    - Uses ssa_build.h for hand-built vinfo + IR.
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #define I32 IROP_BTYPE_INT32
 

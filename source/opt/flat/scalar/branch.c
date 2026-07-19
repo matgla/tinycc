@@ -245,3 +245,16 @@ const IROptGen branch_gens[] = {
 };
 
 const int branch_gens_count = sizeof(branch_gens) / sizeof(branch_gens[0]);
+
+int tcc_ir_opt_setif_branch_fuse(TCCIRState *ir)
+{
+  if (ir->next_instruction_index < 4)
+    return 0;
+  IROptCtx ctx;
+  tcc_ir_opt_ctx_init(&ctx, ir);
+  int changes = tcc_ir_opt_run_gens(&ctx, branch_gens, branch_gens_count);
+  tcc_ir_opt_ctx_free(&ctx);
+  return changes;
+}
+
+int tcc_ir_opt_setif_branch_fuse_ex(IROptCtx *ctx) { return tcc_ir_opt_setif_branch_fuse(ctx->ir); }

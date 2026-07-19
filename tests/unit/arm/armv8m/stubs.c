@@ -538,5 +538,50 @@ int gv(int rc)
  *  binary.
  */
 
-/* Nothing to stub - all required functions are in libtcc.c. */
+#include <stddef.h>
+
+struct CType;
+
+/* Settable token→name table so name-gated passes (ssa:narrow's demotion
+ * fold) can be driven from unit tests.  get_tok_str() itself lives in
+ * elfsec_stubs.c and consults this table via utb_tok_name_lookup(). */
+#define UTB_TOKEN_BASE 256
+#define UTB_MAX_TOK 1024
+static const char *utb_tok_names[UTB_MAX_TOK];
+
+void utb_set_tok_str(int tok, const char *name)
+{
+  if (tok >= 0 && tok < UTB_MAX_TOK)
+    utb_tok_names[tok] = name;
+}
+
+const char *utb_tok_name_lookup(int tok)
+{
+  if (tok >= 0 && tok < UTB_MAX_TOK)
+    return utb_tok_names[tok];
+  return NULL;
+}
+
+/* Frontend symbol-table stubs referenced by opt_utils.c's change_callee_sym
+ * (pulled in via ssa:narrow).  Returning NULL makes the rename decline
+ * safely — the positive callee swap is covered by ir_tests instead. */
+struct Sym *global_stack = NULL;
+
+struct Sym *sym_push2(struct Sym **ps, int v, int t, int c)
+{
+  (void)ps; (void)v; (void)t; (void)c;
+  return NULL;
+}
+
+struct Sym *external_global_sym(int v, struct CType *type)
+{
+  (void)v; (void)type;
+  return NULL;
+}
+
+int tok_alloc_const(const char *str)
+{
+  (void)str;
+  return 0;
+}
 #endif /* UT_SSA_OPT_REAL */

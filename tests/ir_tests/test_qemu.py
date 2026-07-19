@@ -914,6 +914,8 @@ TEST_FILES = [
     ("362_value_track_const_lmod_fold.c", 0),
     ("363_pure_modulo_hoist_cse.c", 0),
     ("364_diamond_store_fwd.c", 0),
+    ("365_stack_addr_distinct_locals_cmp.c", 0),
+    ("366_ssa_memchr_fold.c", 0),
 ]
 
 # Per-test compiler defines (e.g. for missing platform macros)

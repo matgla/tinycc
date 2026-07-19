@@ -292,9 +292,10 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
       var_info_cap = new_cap;
     }
 
-    /* Address-taken VARs can be modified through aliases. */
+    /* Address-taken VARs can be modified through aliases; volatile VARs must
+     * never have their loads folded to the stored value. */
     IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest_vr);
-    if (interval && interval->addrtaken)
+    if (interval && (interval->addrtaken || interval->is_volatile))
     {
       var_info[pos].def_count++;
       var_info[pos].is_constant = 0;

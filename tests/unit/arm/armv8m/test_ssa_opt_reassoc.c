@@ -16,14 +16,14 @@
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 #include "opt/ssa/reassoc.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #define I32 IROP_BTYPE_INT32
 
@@ -959,6 +959,131 @@ UT_TEST(test_reassoc_no_vinfo_inner)
 
   int changed = ssa_opt_reassoc(c.ctx);
   UT_ASSERT_EQ(changed, 0);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Symref-def collapse: T = ASSIGN symref(S,+A); T2 = T ± imm
+ *                  →   T2 = ASSIGN symref(S, A±imm)
+ * Fires only when the producer is single-use (otherwise the per-site
+ * movw/movt address materializations would cost more than the shared-base
+ * adds they replace).
+ * ======================================================================== */
+
+static IROperand reassoc_symref_addend(TCCIRState *ir, Sym *sym, int32_t addend)
+{
+  uint32_t sidx = tcc_ir_pool_add_symref(ir, sym, addend, 0);
+  return irop_make_symref(-1, sidx, 0, 0, 0, I32);
+}
+
+UT_TEST(test_reassoc_symref_def_add)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/3);
+  static Sym g;
+  g.v = 100;
+  g.type.t = VT_INT;
+  /* t0 = &g+8; t1 = t0 + #4  →  t1 = &g+12, t0 dead */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32),
+                reassoc_symref_addend(c.ir, &g, 8));
+  int i = reassoc_emit_imm(&c, TCCIR_OP_ADD, 1, 0, 4);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_reassoc(c.ctx);
+  UT_ASSERT(changed >= 1);
+
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  IROperand s1 = utb_src1(c.ir, i);
+  UT_ASSERT(s1.tag == IROP_TAG_SYMREF);
+  IRPoolSymref *sr = irop_get_symref_ex(c.ir, s1);
+  UT_ASSERT(sr && sr->sym == &g);
+  UT_ASSERT_EQ(sr->addend, 12);
+  UT_ASSERT_EQ(utb_op(c.ir, 0), TCCIR_OP_NOP);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_reassoc_symref_def_sub)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/3);
+  static Sym g;
+  g.v = 100;
+  g.type.t = VT_INT;
+  /* t0 = &g+8; t1 = t0 - #4  →  t1 = &g+4 */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32),
+                reassoc_symref_addend(c.ir, &g, 8));
+  int i = reassoc_emit_imm(&c, TCCIR_OP_SUB, 1, 0, 4);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_reassoc(c.ctx);
+  UT_ASSERT(changed >= 1);
+
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  IROperand s1 = utb_src1(c.ir, i);
+  UT_ASSERT(s1.tag == IROP_TAG_SYMREF);
+  IRPoolSymref *sr = irop_get_symref_ex(c.ir, s1);
+  UT_ASSERT(sr && sr->sym == &g);
+  UT_ASSERT_EQ(sr->addend, 4);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* Multi-use producer: distinct-addend materializations would cost more than
+ * the shared-base adds — must not fire. */
+UT_TEST(test_reassoc_symref_def_multiuse_no_fire)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  static Sym g;
+  g.v = 100;
+  g.type.t = VT_INT;
+  /* t0 = &g+8; t1 = t0 + #4; t2 = t0 + #8 */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32),
+                reassoc_symref_addend(c.ir, &g, 8));
+  int i1 = reassoc_emit_imm(&c, TCCIR_OP_ADD, 1, 0, 4);
+  int i2 = reassoc_emit_imm(&c, TCCIR_OP_ADD, 2, 0, 8);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_reassoc(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, i1), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_op(c.ir, i2), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_op(c.ir, 0), TCCIR_OP_ASSIGN);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* Producer whose symref is an lval (a real dereference) must not fold. */
+UT_TEST(test_reassoc_symref_def_lval_no_fire)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/3);
+  static Sym g;
+  g.v = 100;
+  g.type.t = VT_INT;
+  IROperand lv = reassoc_symref_addend(c.ir, &g, 8);
+  lv.is_lval = 1;
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), lv);
+  int i = reassoc_emit_imm(&c, TCCIR_OP_ADD, 1, 0, 4);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_reassoc(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ADD);
 
   ssa_ctx_free(&c);
   return 0;

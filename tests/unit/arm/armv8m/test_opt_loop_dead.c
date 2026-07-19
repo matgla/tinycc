@@ -1,6 +1,6 @@
 /*
  *  test_opt_loop_dead.c - suite for ssa_opt_first_iter_exit
- *  (ir/opt/ssa_opt_loop.c, first-iteration-exit loop elimination)
+ *  (source/opt/ssa/loop/first_iter_exit.c)
  *
  *  ssa_opt_first_iter_exit eliminates a top-tested natural loop whose header
  *  exit-test (TEST_ZERO / CMP + JUMPIF) is statically true on entry.  Loop

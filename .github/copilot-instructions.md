@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Specialized TinyCC fork targeting **ARMv8-M** (Cortex-M33) Thumb-2. IR-based pipeline: C source → preprocessor (`tccpp.c`) → parser (`tccgen.c`) → IR (`tccir.h`, `ir/core.c`) → optimizations (`ir/opt.c`, `ir/licm.c`) → register allocation (`tccls.c`, `ir/live.c`) → Thumb-2 codegen (`arm-thumb-gen.c`) → ELF (`tccelf.c`).
+Specialized TinyCC fork targeting **ARMv8-M** (Cortex-M33) Thumb-2. IR-based pipeline: C source → preprocessor (`tccpp.c`) → parser (`tccgen.c`) → IR (`tccir.h`, `ir/core.c`) → optimizations (`ir/opt.c`, `source/opt/flat/loop/licm.c`) → register allocation (`tccls.c`, `ir/live.c`) → Thumb-2 codegen (`arm-thumb-gen.c`) → ELF (`tccelf.c`).
 
 ## Build & Test
 

@@ -153,6 +153,34 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   }
 }
 
+/* True if any operand of `q` reads or writes a volatile-qualified local slot.
+ * Used to defeat the store→reload spill-cache peephole for volatile accesses:
+ * each volatile load must reach memory, never reuse a just-stored register. */
+static int ir_codegen_op_touches_volatile(TCCIRState *ir, IRQuadCompact *q)
+{
+  IROperand ops[4];
+  int no = 0;
+  if (irop_config[q->op].has_dest) ops[no++] = tcc_ir_op_get_dest(ir, q);
+  if (irop_config[q->op].has_src1) ops[no++] = tcc_ir_op_get_src1(ir, q);
+  if (irop_config[q->op].has_src2) ops[no++] = tcc_ir_op_get_src2(ir, q);
+  if (q->op == TCCIR_OP_MLA) ops[no++] = tcc_ir_op_get_accum(ir, q);
+  for (int k = 0; k < no; k++)
+  {
+    int32_t vr = irop_get_vreg(ops[k]);
+    if (vr < 0)
+      continue;
+    int t = TCCIR_DECODE_VREG_TYPE(vr);
+    if (t != TCCIR_VREG_TYPE_VAR && t != TCCIR_VREG_TYPE_PARAM)
+      continue;
+    if (!tcc_ir_vreg_is_valid(ir, vr))
+      continue;
+    IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, vr);
+    if (iv && iv->is_volatile)
+      return 1;
+  }
+  return 0;
+}
+
 /* ============================================================================
  * Parameter Register Allocation
  * ============================================================================ */
@@ -2399,6 +2427,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * to its callee-saved home pair and then back to the next call's
        * argument pair — coalesce away. */
       tcc_gen_machine_strldr_cache_reset();
+      /* Volatile slot access: drop the store→reload spill-cache peephole so
+       * each volatile load reaches memory instead of reusing a just-stored
+       * register (the peephole is otherwise only cleared at jump targets). */
+      if (ir_codegen_op_touches_volatile(ir, cq))
+        tcc_ir_spill_cache_clear(&ir->spill_cache);
       /* Like imm_cache below, the GPR-equivalence cache must also drop at
        * backward (loop) branch targets that is_jump_target misses at -O0:
        * an equivalence recorded before the loop (e.g. the prologue's

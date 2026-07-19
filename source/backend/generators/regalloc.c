@@ -16,11 +16,11 @@
 #include "ir/cfg.h"
 #include "ir/codegen.h"
 #include "ir/core.h"
-#include "ir/licm.h"
-#include "ir/opt.h"
-#include "ir/opt_utils.h"
-#include "ir/opt_engine.h"
-#include "ir/opt_pipeline.h"
+#include "source/opt/include/licm.h"
+#include "source/opt/include/opt.h"
+#include "source/opt/include/opt_utils.h"
+#include "source/opt/include/opt_engine.h"
+#include "source/opt/include/opt_pipeline.h"
 #include "opt/flat/if_convert.h"
 #include "memory/small_sequence.h"
 
@@ -44,6 +44,63 @@ extern void dbg_scan_overlap(TCCIRState *ir, const char *pass);
 /* ================================================================== */
 /*  Analyze whether the function is a leaf / tail-call-only           */
 /* ================================================================== */
+
+/* True when the call at call_idx sits in tail position: the next non-NOP
+ * instruction is RETURNVOID, or RETURNVALUE of the call's dest vreg, and only
+ * NOPs follow.  Shared by the pre-SSA analysis and the post-opt re-check. */
+static int ir_call_is_tail_positioned(TCCIRState *ir, int call_idx)
+{
+  const IRQuadCompact *cq = &ir->compact_instructions[call_idx];
+  int is_tail = 0;
+
+  int j = call_idx + 1;
+  while (j < ir->next_instruction_index && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+    j++;
+
+  if (j < ir->next_instruction_index)
+  {
+    const IRQuadCompact *nq = &ir->compact_instructions[j];
+    if (!nq->is_jump_target)
+    {
+      if (cq->op == TCCIR_OP_FUNCCALLVOID && nq->op == TCCIR_OP_RETURNVOID)
+      {
+        is_tail = 1;
+      }
+      else if (cq->op == TCCIR_OP_FUNCCALLVAL && nq->op == TCCIR_OP_RETURNVALUE)
+      {
+        IROperand call_dest = tcc_ir_op_get_dest(ir, cq);
+        IROperand ret_src = tcc_ir_op_get_src1(ir, nq);
+        int call_vr = irop_get_vreg(call_dest);
+        int ret_vr = irop_get_vreg(ret_src);
+        if (call_vr >= 0 && call_vr == ret_vr)
+          is_tail = 1;
+      }
+      else if (cq->op == TCCIR_OP_FUNCCALLVOID && nq->op == TCCIR_OP_RETURNVALUE)
+      {
+        /* void call followed by value return — not a tail call */
+      }
+      else if (cq->op == TCCIR_OP_FUNCCALLVAL && nq->op == TCCIR_OP_RETURNVOID)
+      {
+        is_tail = 1;
+      }
+    }
+  }
+
+  if (is_tail)
+  {
+    for (int k = j + 1; k < ir->next_instruction_index; k++)
+    {
+      if (ir->compact_instructions[k].op != TCCIR_OP_NOP)
+      {
+        is_tail = 0;
+        break;
+      }
+    }
+  }
+
+  return is_tail;
+}
+
 void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
 {
   ir->leaffunc = 1;
@@ -78,55 +135,7 @@ void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
 
   if (call_count == 1 && !has_complex_fp && !func_var && !ir->has_static_chain && call_idx >= 0)
   {
-    const IRQuadCompact *cq = &ir->compact_instructions[call_idx];
-    int is_tail = 0;
-
-    int j = call_idx + 1;
-    while (j < ir->next_instruction_index && ir->compact_instructions[j].op == TCCIR_OP_NOP)
-      j++;
-
-    if (j < ir->next_instruction_index)
-    {
-      const IRQuadCompact *nq = &ir->compact_instructions[j];
-      if (!nq->is_jump_target)
-      {
-        if (cq->op == TCCIR_OP_FUNCCALLVOID && nq->op == TCCIR_OP_RETURNVOID)
-        {
-          is_tail = 1;
-        }
-        else if (cq->op == TCCIR_OP_FUNCCALLVAL && nq->op == TCCIR_OP_RETURNVALUE)
-        {
-          IROperand call_dest = tcc_ir_op_get_dest(ir, cq);
-          IROperand ret_src = tcc_ir_op_get_src1(ir, nq);
-          int call_vr = irop_get_vreg(call_dest);
-          int ret_vr = irop_get_vreg(ret_src);
-          if (call_vr >= 0 && call_vr == ret_vr)
-            is_tail = 1;
-        }
-        else if (cq->op == TCCIR_OP_FUNCCALLVOID && nq->op == TCCIR_OP_RETURNVALUE)
-        {
-          /* void call followed by value return — not a tail call */
-        }
-        else if (cq->op == TCCIR_OP_FUNCCALLVAL && nq->op == TCCIR_OP_RETURNVOID)
-        {
-          is_tail = 1;
-        }
-      }
-    }
-
-    if (is_tail)
-    {
-      for (int k = j + 1; k < ir->next_instruction_index; k++)
-      {
-        if (ir->compact_instructions[k].op != TCCIR_OP_NOP)
-        {
-          is_tail = 0;
-          break;
-        }
-      }
-    }
-
-    if (is_tail)
+    if (ir_call_is_tail_positioned(ir, call_idx))
     {
       ir->tail_call_only = 1;
       ir->leaffunc = 1;
@@ -778,6 +787,44 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
     }
     if (!still_has_call)
       ir->leaffunc = 1;
+  }
+
+  /* Re-check tail-call status after all optimizations (one-directional:
+   * upgrade only, never clear).  Passes running after the pre-SSA analysis
+   * in tcc_ir_backend_analyze_leaf_and_tail_calls can leave a lone call in
+   * tail position — e.g. the ssa:narrow soft-FP demotion fold NOPs the
+   * f2d/d2f conversion calls around a math libcall — which the early
+   * analysis could not yet see.  The frame/stack guards in codegen still
+   * veto ineligible functions afterwards. */
+  if (!ir->tail_call_only && !ir->has_static_chain && sym && sym->type.ref &&
+      sym->type.ref->f.func_type != FUNC_ELLIPSIS)
+  {
+    int call_count = 0, call_idx = -1, has_complex_fp = 0;
+    for (int i = 0; i < ir->next_instruction_index; ++i)
+    {
+      const IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+      {
+        call_count++;
+        call_idx = i;
+      }
+      else if (q->op == TCCIR_OP_BUILTIN_APPLY)
+      {
+        call_count = 99;
+        break;
+      }
+      if (q->op == TCCIR_OP_FADD || q->op == TCCIR_OP_FSUB || q->op == TCCIR_OP_FMUL || q->op == TCCIR_OP_FDIV)
+      {
+        IROperand dest = tcc_ir_op_get_dest(ir, q);
+        if (dest.is_complex)
+          has_complex_fp = 1;
+      }
+    }
+    if (call_count == 1 && !has_complex_fp && call_idx >= 0 && ir_call_is_tail_positioned(ir, call_idx))
+    {
+      ir->tail_call_only = 1;
+      ir->leaffunc = 1;
+    }
   }
 }
 

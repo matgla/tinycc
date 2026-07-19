@@ -197,6 +197,14 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
   IROperand src = src1;
   int32_t src_vr = vreg(src1);
 
+  /* Never CSE a load of a volatile VAR against a prior load: each read is a
+   * mandated memory access that must survive. */
+  if (src_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src_vr) == TCCIR_VREG_TYPE_VAR) {
+    IRLiveInterval *si = tcc_ir_vreg_live_interval(ir, src_vr);
+    if (si && si->is_volatile)
+      return 0;
+  }
+
   int blk = cfg->instr_to_block[i];
   if (blk < 0 || blk >= cfg->num_blocks)
     return 0;
@@ -712,6 +720,8 @@ int ssa_opt_symref_operand_cse(IRSSAOptCtx *ctx)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
+    if (i >= cfg->num_instrs)   /* instr appended after CFG build: no block map */
+      continue;
     int blk = cfg->instr_to_block[i];
     if (blk < 0 || blk >= cfg->num_blocks)
       continue;
@@ -856,6 +866,11 @@ static void var_collect_facts(TCCIRState *ir, VarFacts *f)
       }
     }
   }
+  /* Volatile VARs must never be forwarded to their uses: every load is a
+   * mandated access.  Treat them like address-taken for both consumers. */
+  for (int v = 0; v < nv && v < ir->variables_live_intervals_size; v++)
+    if (ir->variables_live_intervals[v].is_volatile)
+      VARF_SET(f->addrtaken, v);
 }
 
 /* Forward single-def VAR `pos` (def at `def_idx`) into all its dominated value
@@ -1054,6 +1069,8 @@ int ssa_opt_var_forward(IRSSAOptCtx *ctx)
   for (int i = 0; i < ir->next_instruction_index; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD)
+      continue;
+    if (i >= cfg->num_instrs)   /* appended after CFG build: no block map */
       continue;
 
     IROperand src = tcc_ir_op_get_src1(ir, q);

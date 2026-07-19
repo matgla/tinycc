@@ -40,6 +40,7 @@ extern const StrFoldHandler tcc_strfold_strlen;
 extern const StrFoldHandler tcc_strfold_strcmp;
 extern const StrFoldHandler tcc_strfold_strncmp;
 extern const StrFoldHandler tcc_strfold_memcmp;
+extern const StrFoldHandler tcc_strfold_memchr;
 extern const StrFoldHandler tcc_strfold_strcpy;
 extern const StrFoldHandler tcc_strfold_strspn;
 extern const StrFoldHandler tcc_strfold_strcspn;

@@ -23,14 +23,14 @@
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 #include "opt/ssa/fold.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #define I32 IROP_BTYPE_INT32
 #define I64 IROP_BTYPE_INT64
@@ -702,6 +702,133 @@ UT_TEST(test_fold_or_self_self)
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
   UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_div_self_one)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_DIV, utb_temp(1, I32),
+                         utb_temp(0, I32), utb_temp(0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 1);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_udiv_self_one)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_UDIV, utb_temp(1, I32),
+                         utb_temp(0, I32), utb_temp(0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 1);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_imod_self_zero)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_IMOD, utb_temp(1, I32),
+                         utb_temp(0, I32), utb_temp(0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 0);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_umod_self_zero)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_UMOD, utb_temp(1, I32),
+                         utb_temp(0, I32), utb_temp(0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 0);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* Symref form: `*g / *g -> 1`, `*g % *g -> 0` for the same non-volatile global. */
+UT_TEST(test_fold_div_self_symref_one)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g;
+  g.v = 100;
+  g.type.t = VT_INT;
+  int i = ssa_add_instr3(&c, TCCIR_OP_DIV, utb_temp(0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 1);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_mod_self_symref_zero)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g;
+  g.v = 100;
+  g.type.t = VT_INT;
+  int i = ssa_add_instr3(&c, TCCIR_OP_IMOD, utb_temp(0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 0);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* Distinct globals must not fold: `*g / *h` is a real divide. */
+UT_TEST(test_fold_div_symref_distinct_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g, h;
+  g.v = 100;
+  g.type.t = VT_INT;
+  h.v = 101;
+  h.type.t = VT_INT;
+  int i = ssa_add_instr3(&c, TCCIR_OP_DIV, utb_temp(0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32),
+                         utb_symref(c.ir, &h, 1, 0, 0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_DIV);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* A volatile global reads twice may differ — must not fold. */
+UT_TEST(test_fold_div_symref_volatile_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g;
+  g.v = 100;
+  g.type.t = VT_INT | VT_VOLATILE;
+  int i = ssa_add_instr3(&c, TCCIR_OP_DIV, utb_temp(0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_DIV);
   ssa_ctx_free(&c);
   return 0;
 }

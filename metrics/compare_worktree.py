@@ -14,14 +14,37 @@ uncommitted change (e.g. an SSA loop-pass migration on this branch):
      a local copy via --baseline-db;
   4. diff worktree-vs-baseline and print BOTH improvements and regressions.
 
-Default scope is code size + compile time (fast, deterministic, no hardware).
+A broken worktree must never produce a passing verdict -- code-size deltas look
+misleadingly "better" when a change miscompiles.  The gate for that is the
+corpus pass itself: it compiles, links and RUNS every runnable test on both
+sides and reports any test that passes on the baseline but fails on the
+worktree, which also fails the exit.  It is differential by design, so the
+harness being cruder than tests/ir_tests/test_qemu.py does not matter -- what it
+mishandles fails identically on both sides (see metrics/qemu_corpus.py).
+
+`make test` therefore no longer runs by default; it duplicated that work (its
+ir matrix already builds every test at -O0/-O1/-O2/-Os) while the code-size pass
+compiled the same corpus again.  --tests re-enables it for what the corpus does
+NOT cover: ut, frontend, linker, debug, runtime, selfhost, asm.
+
+Default measurement scope is code size + compile time + per-test QEMU cycles
+(instructions retired under -icount; see docs/qemu_cycle_profiling.md), so one
+report answers both "is it smaller?" and "is it faster?".  Unlike
+correctness/perf, cycles are measured on BOTH sides -- including a
+--baseline-commit/--range build -- so they always diff per test rather than only
+where the baseline happens to match.  Cycles are cheap enough to leave on: the
+whole runnable corpus (~2300 tests) links+runs in ~11s at -j12, well under the
+code-size compile it rides alongside.  --no-cycles skips them anyway,
+--cycles-suite narrows them.
+
 --correctness adds the fuzz O1/O2 divergence sweep (minutes) and --perf adds the
 RP2350 cycle benchmark (needs the board over SSH) -- both measured on the
 worktree side and diffed against the baseline where it has matching rows.
 
-Exit status is 0 unless --strict is given, in which case a code-size regression
-beyond --codesize-tolerance-pct (on the -O2 <total> ratio) or a new correctness
-divergence returns 1 -- mirroring metrics/gate.py's block half.
+A new correctness divergence (a test that regressed / miscompiled) ALWAYS returns
+1 -- a failing test must never pass silently, regardless of --strict.  --strict
+additionally returns 1 on a code-size regression beyond --codesize-tolerance-pct
+(on the -O2 <total> ratio) -- mirroring metrics/gate.py's block half.
 
 Examples
 --------
@@ -40,8 +63,14 @@ Examples
   # forces a re-measure)
   python3 metrics/compare_worktree.py --baseline-commit mob
 
-  # fast iteration: production level only (skips the o0/o1 corpus compiles)
+  # fast iteration: production level only (skips the o0/o1 corpus compiles).
+  # Code size AND per-test cycles are both diffed, in one report.
   python3 metrics/compare_worktree.py --baseline-commit mob --opt o2
+
+  # cover the tests that overrun SysTick's 24-bit wrap at the default shift
+  # (mibench_dijkstra and friends), at coarser resolution
+  python3 metrics/compare_worktree.py --baseline-commit mob --opt o2 \
+      --cycles-shift 0
 """
 
 import argparse
@@ -92,6 +121,26 @@ def build_cross(jobs: int) -> None:
         die("make cross reported success but armv8m-tcc is missing")
 
 
+def run_regression_tests(jobs: int) -> None:
+    """Run the `make test` regression suite on the worktree binary; abort the run
+    on any failure.
+
+    NOT the default gate any more: the corpus pass links and runs every test
+    itself and diffs per-test verdicts against the baseline, subsuming what
+    `make test` contributed here.  --tests re-enables it for the parts the
+    corpus does not cover: ut, frontend, linker, debug, runtime, selfhost, asm.
+    """
+    info(f"running regression suite (make test -j{jobs}) ...")
+    r = subprocess.run(["make", "test", f"-j{jobs}"], cwd=str(REPO_ROOT),
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        tail = "\n".join((r.stdout + r.stderr).splitlines()[-30:])
+        die(f"`make test` FAILED (exit {r.returncode}) -- the worktree has a test "
+            f"regression, so the code-size comparison is not trustworthy. Fix the "
+            f"failure, or pass --no-tests to compare code size anyway.\n\n{tail}")
+    info("regression suite passed")
+
+
 def measure_worktree(scratch_db: str, args) -> tuple[sqlite3.Connection, int, str]:
     """Record the in-place armv8m-tcc into `scratch_db` under the worktree key.
     Returns (open connection, worktree run_id, base commit sha)."""
@@ -108,16 +157,18 @@ def measure_worktree(scratch_db: str, args) -> tuple[sqlite3.Connection, int, st
         jobs=args.jobs, codesize_detail=True, import_codesize_from=None,
         detail_db=None, detail_keep=None, perf_host=args.perf_host,
         perf_identity=args.perf_identity, perf_strict=False,
+        cycles_suite=args.cycles_suite, cycles_shift=args.cycles_shift_eff,
         scratch=args.scratch or tempfile.gettempdir())
 
     conn = REC.connect(scratch_db)
     info(f"measuring worktree (base {base_sha[:12]}, {tag}, "
          f"opts={'/'.join(args.opts)}"
          f"{', +correctness' if args.correctness else ''}"
+         f"{', +cycles' if args.cycles else ''}"
          f"{', +perf' if args.perf else ''}) ...")
     REC.record_one(conn, meta, WORKTREE_HOST, "worktree", "worktree", rec_args,
                    do_correctness=args.correctness, do_perf=bool(args.perf and args.perf_host),
-                   codesize_opts=args.opts)
+                   codesize_opts=args.opts, do_cycles=args.cycles)
     run_id = conn.execute(
         "SELECT run_id FROM runs WHERE commit_sha=? AND host=?",
         (WORKTREE_SHA, WORKTREE_HOST)).fetchone()[0]
@@ -142,7 +193,9 @@ def measure_commit_baseline(conn, ref, args) -> tuple[int, str, str, bool]:
 
     Correctness/perf are NOT measured here: record_one runs those against the
     in-place armv8m-tcc (batch_sweep hardcodes it), which would silently score
-    the worktree binary, not this commit's.
+    the worktree binary, not this commit's.  QEMU cycles ARE measured when
+    --cycles is given -- qemu_cycles.measure takes the compiler path, so it
+    scores THIS commit's build.
     Returns (run_id, commit_sha, subject, was_cached).
     """
     from regression_disasm import build_tcc_at_rev
@@ -150,12 +203,23 @@ def measure_commit_baseline(conn, ref, args) -> tuple[int, str, str, bool]:
     base_sha = base["commit_sha"]
     if not args.refresh_baseline:
         ph = ",".join("?" * len(args.opts))
+        # A cached run only counts if it covers what THIS run compares: one
+        # measured without --cycles (or at another opt) must not satisfy a
+        # --cycles request, so key on the opt the report actually diffs.
+        cycles_ok, cycles_args = "", ()
+        if args.cycles:
+            # Also key on shift: counts scale with 2^shift, so a baseline cached
+            # at another shift would diff incomparable units silently.
+            cycles_ok = ("AND EXISTS(SELECT 1 FROM qemu_cycles q "
+                         "WHERE q.run_id=r.run_id AND q.opt=? AND q.shift=?)")
+            cycles_args = (args.opts[-1], args.cycles_shift_eff)
         row = conn.execute(
             "SELECT r.run_id, r.subject FROM runs r WHERE r.commit_sha=? AND r.host=? "
             "AND (SELECT COUNT(DISTINCT c.opt) FROM codesize_rollup c "
             f"WHERE c.run_id=r.run_id AND c.suite='<total>' AND c.opt IN ({ph}))=? "
-            "LIMIT 1",
-            (base_sha, WORKTREE_HOST, *args.opts, len(args.opts))).fetchone()
+            f"{cycles_ok} LIMIT 1",
+            (base_sha, WORKTREE_HOST, *args.opts, len(args.opts),
+             *cycles_args)).fetchone()
         if row:
             info(f"baseline {ref} ({base_sha[:12]}) already measured in scratch db; "
                  "reusing cached run (--refresh-baseline to re-measure)")
@@ -167,13 +231,16 @@ def measure_commit_baseline(conn, ref, args) -> tuple[int, str, str, bool]:
         db=None, seed_lo=args.seed_lo, seed_hi=args.seed_hi, mode=args.mode,
         jobs=args.jobs, codesize_detail=True, import_codesize_from=None,
         detail_db=None, detail_keep=None, perf_host=None, perf_identity=None,
-        perf_strict=False, scratch=args.scratch or tempfile.gettempdir())
+        perf_strict=False, cycles_suite=args.cycles_suite,
+        cycles_shift=args.cycles_shift_eff,
+        scratch=args.scratch or tempfile.gettempdir())
     try:
         info(f"measuring baseline commit code size (tcc={tcc_path}, "
-             f"opts={'/'.join(args.opts)}) ...")
+             f"opts={'/'.join(args.opts)}"
+             f"{', +cycles' if args.cycles else ''}) ...")
         REC.record_one(conn, meta, WORKTREE_HOST, "baseline", "baseline", rec_args,
                        tcc_override=tcc_path, do_correctness=False, do_perf=False,
-                       codesize_opts=args.opts)
+                       codesize_opts=args.opts, do_cycles=args.cycles)
     finally:
         shutil.rmtree(build_dir, ignore_errors=True)
     run_id = conn.execute(
@@ -265,6 +332,20 @@ def load_perf(conn, run_id) -> dict:
         (run_id,))}
 
 
+def load_qemu_cycles(conn, run_id, opt="o2") -> dict:
+    """{(suite, test): cycles} for tests that produced a count."""
+    return {(suite, test): cycles for suite, test, cycles in conn.execute(
+        "SELECT suite,test,cycles FROM qemu_cycles WHERE run_id=? AND opt=? "
+        "AND cycles IS NOT NULL", (run_id, opt))}
+
+
+def load_qemu_verdicts(conn, run_id, opt="o2") -> dict:
+    """{(suite, test): passed} for every test that ran."""
+    return {(suite, test): bool(passed) for suite, test, passed in conn.execute(
+        "SELECT suite,test,passed FROM qemu_cycles WHERE run_id=? AND opt=?",
+        (run_id, opt))}
+
+
 def load_correctness(conn, run_id) -> dict:
     out = {}
     for p, o in conn.execute(
@@ -301,12 +382,19 @@ class Report:
         self.lines = []
         self.regressions = 0
         self.improvements = 0
+        # correctness (test) regressions only; these fail the exit unconditionally
+        # (a code-size regression alone needs --strict, a miscompile never does).
+        self.correctness_regressions = 0
         # gross code-size movement (tcc instructions) at the selected opt level,
         # decomposed so the verdict can show both sides instead of just the net.
         # None when per-function baseline data is unavailable (server db keeps
         # rollups only) -- then the verdict omits the byte breakdown.
         self.improved_bytes = None
         self.regressed_bytes = None
+        # Net QEMU cycle movement over tests measured on both sides, and the
+        # baseline total it is relative to.  None unless --cycles ran.
+        self.cycles_delta = None
+        self.cycles_base = None
         # Column labels for the two sides being diffed.  Default to the
         # worktree-vs-server framing; --range overrides them with the two refs.
         self.base_label = "baseline"
@@ -501,6 +589,119 @@ def report_perf(rep, wt, base):
     rep.add()
 
 
+def report_qemu_functional(rep, wt, base, det):
+    """Diff per-test functional verdicts between the two sides.
+
+    This replaces `make test` as the gate.  It is differential ON PURPOSE: the
+    corpus harness is cruder than test_qemu.py (no tagged/args/xfail handling),
+    so a test it mishandles fails on BOTH sides and cancels -- only a test that
+    passes on the baseline and fails on the worktree is reported, and that is a
+    real behaviour change.  Absolute pass counts here are NOT a `make test`
+    verdict and must not be read as one.
+    """
+    rep.add(f"FUNCTIONAL at -{det.upper()}  (compile+link+run per test; "
+            "new failure = regression)")
+    if not wt:
+        rep.add("  no tests ran on the worktree side -- the corpus gate did NOT "
+                "run (qemu missing, or newlib not built?)")
+        rep.add()
+        return
+    if not base:
+        rep.add(f"  {len(wt)} test(s) ran, {sum(1 for v in wt.values() if not v)} "
+                "failed, but the baseline has no verdicts to diff against -- "
+                "NO functional gate this run (use --baseline-commit/--range)")
+        rep.add()
+        return
+
+    common = set(wt) & set(base)
+    broke = sorted(k for k in common if base[k] and not wt[k])
+    fixed = sorted(k for k in common if not base[k] and wt[k])
+    both_bad = sum(1 for k in common if not base[k] and not wt[k])
+
+    rep.add("  {} test(s) run on both sides: {} newly failing, {} newly passing, "
+            "{} failing on both (pre-existing, not gated)".format(
+                len(common), len(broke), len(fixed), both_bad))
+    for k in broke:
+        rep.add(f"    REGRESSED  {k[0]}/{k[1]}")
+    for k in fixed:
+        rep.add(f"    fixed      {k[0]}/{k[1]}")
+    if broke:
+        rep.regressions += 1
+        rep.correctness_regressions += 1
+    if fixed:
+        rep.improvements += 1
+    rep.add()
+
+
+def report_qemu_cycles(rep, wt, base, top_n, det):
+    """Per-test QEMU cycle deltas: a total over the tests both sides measured,
+    then the largest movers.  Informational -- a cycle regression never fails the
+    exit (see the verdict rules in main)."""
+    rep.add(f"QEMU CYCLES at -{det.upper()}  (instructions retired under -icount; "
+            "deterministic; lower is better)")
+    if not wt:
+        # Cycles run by default, so an empty side means measurement failed
+        # (no qemu, unbuilt newlib) -- say so rather than omit the section.
+        rep.add("  no cycles measured on the worktree side -- see the [metrics] "
+                "warnings above (qemu missing, or newlib not built?)")
+        rep.add()
+        return
+    if not base:
+        rep.add(f"  {len(wt)} test(s) measured on the {rep.new_label} side, but the "
+                f"baseline has no qemu_cycles rows -- nothing to diff")
+        rep.add()
+        return
+
+    rows, new_rows = [], []
+    tot_w = tot_b = 0
+    for key in set(wt) | set(base):
+        w, b = wt.get(key), base.get(key)
+        name = f"{key[0]}/{key[1]}"
+        if b is None:
+            new_rows.append((0, name, None, w))
+            continue
+        if w is None:
+            continue        # measured on the baseline only; not comparable
+        tot_w += w
+        tot_b += b
+        if w != b:
+            rows.append((w - b, name, b, w))
+
+    if tot_b:
+        d = tot_w - tot_b
+        rep.add("  total over {} test(s) measured on both sides: {} {:,} -> {} {:,}"
+                "  ({:+,d}, {:+.2f}%)  {}".format(
+                    len(set(wt) & set(base)), rep.base_label, tot_b, rep.new_label,
+                    tot_w, d, pct(tot_w, tot_b), tag_lower_is_better(d)))
+        rep.cycles_delta = d
+        rep.cycles_base = tot_b
+    if new_rows:
+        rep.add(f"  ({len(new_rows)} test(s) measured only on the {rep.new_label} "
+                "side, excluded from the total)")
+    rep.add()
+
+    if not rows:
+        rep.add("  no per-test movers")
+        rep.add()
+        return
+    all_better, all_worse = split_movers(rows)
+    better, worse = all_better[:top_n], all_worse[:top_n]
+    rep.add(f"  per-test movers (top {len(better)} better of {len(all_better)}, "
+            f"top {len(worse)} worse of {len(all_worse)}):")
+    hdr = "    {:<44} {:>12} {:>12} {:>10} {:>8}  {}".format(
+        "test", rep.base_label, rep.new_label, "delta", "pct", "verdict")
+    rep.add(hdr)
+    rep.add("    " + "-" * (len(hdr) - 4))
+    for group_i, group in enumerate((better, worse)):
+        if group_i and better and worse:
+            rep.add("    " + "-" * (len(hdr) - 4))
+        for d, name, b, w in group:
+            rep.add("    {:<44} {:>12,} {:>12,} {:>+10,} {:>+7.1f}%  {}".format(
+                name if len(name) <= 44 else "..." + name[-41:],
+                b, w, d, pct(w, b), tag_lower_is_better(d)))
+    rep.add()
+
+
 def report_correctness(rep, wt, base):
     if not wt:
         return
@@ -519,6 +720,7 @@ def report_correctness(rep, wt, base):
         fixed = sorted(b - w)
         if new:
             rep.regressions += 1
+            rep.correctness_regressions += 1
         if fixed:
             rep.improvements += 1
         if new or fixed:
@@ -566,10 +768,35 @@ def main(argv=None) -> int:
                         "default: all three)")
     p.add_argument("--no-build", action="store_true",
                    help="do not run `make cross` first (armv8m-tcc must be current)")
+    p.add_argument("--tests", dest="run_tests", action="store_true",
+                   help="also run the full `make test` suite first, aborting the "
+                        "comparison on any failure. Off by default: the corpus "
+                        "pass already links, runs and diffs every corpus test "
+                        "per side. Use this for what the corpus does NOT cover "
+                        "-- ut, frontend, linker, debug, runtime, selfhost, asm")
+    p.add_argument("--no-tests", dest="run_tests", action="store_false",
+                   help=argparse.SUPPRESS)      # back-compat no-op; tests are off by default
+    p.set_defaults(run_tests=False)
     p.add_argument("--correctness", action="store_true",
                    help="also run the fuzz O1/O2 divergence sweep (slow)")
     p.add_argument("--perf", action="store_true",
                    help="also run the RP2350 cycle benchmark (needs --perf-host)")
+    p.add_argument("--no-cycles", dest="cycles", action="store_false",
+                   help="skip the per-test QEMU cycle measurement (it runs by "
+                        "default, on BOTH sides, including a "
+                        "--baseline-commit/--range build): every runnable test "
+                        "is linked and run per opt level, ~11s for the whole "
+                        "corpus. See docs/qemu_cycle_profiling.md")
+    p.add_argument("--cycles-suite", default="all",
+                   help="restrict --cycles to one suite (e.g. 'ir', 'float'); "
+                        "default: every runnable suite, incl. gcc-execute")
+    p.add_argument("--cycles-shift", type=int, metavar="N",
+                   help="qemu -icount shift for --cycles (default 5: ~1 tick per "
+                        "instruction). Tests exceeding SysTick's 24-bit wrap are "
+                        "DROPPED rather than undercounted, which at the default "
+                        "excludes the heaviest benchmarks (mibench_dijkstra runs "
+                        "28M instructions); --cycles-shift 0 buys ~40x headroom "
+                        "at ~40 instructions per tick")
     p.add_argument("--seed-lo", type=int, default=0)
     p.add_argument("--seed-hi", type=int, default=2000)
     p.add_argument("--mode", choices=["prescan", "triage"], default="prescan")
@@ -589,6 +816,10 @@ def main(argv=None) -> int:
                    help="exit 1 if any code-size or correctness regression is found")
     args = p.parse_args(argv)
     args.opts = [o for o in CODESIZE_OPTS if o in (args.opt or CODESIZE_OPTS)]
+    # Resolve once: the baseline cache keys on the shift actually measured at.
+    from qemu_corpus import DEFAULT_SHIFT
+    args.cycles_shift_eff = (DEFAULT_SHIFT if args.cycles_shift is None
+                             else args.cycles_shift)
 
     base_ref = new_ref = None
     if args.rev_range:
@@ -619,6 +850,10 @@ def main(argv=None) -> int:
             build_cross(args.jobs)
         elif not (REPO_ROOT / "armv8m-tcc").exists():
             die("--no-build given but armv8m-tcc does not exist; build it first")
+        # Run the regression suite before the (slow) measurement: a miscompile
+        # makes code-size deltas look "better", so a test failure must abort.
+        if args.run_tests:
+            run_regression_tests(args.jobs)
 
     scratch_db = args.scratch_db or str(
         Path(tempfile.gettempdir()) / "tcc-worktree-metrics.db")
@@ -704,6 +939,12 @@ def main(argv=None) -> int:
             report_func_deltas(rep, wt_funcs, base_funcs, args.top_funcs, det)
         report_compile_time(rep, load_compile_time(wt_conn, wt_run),
                             load_compile_time(base_conn, base_run), args.opts)
+        if args.cycles:
+            report_qemu_functional(rep, load_qemu_verdicts(wt_conn, wt_run, det),
+                                   load_qemu_verdicts(base_conn, base_run, det), det)
+            report_qemu_cycles(rep, load_qemu_cycles(wt_conn, wt_run, det),
+                               load_qemu_cycles(base_conn, base_run, det),
+                               args.top_funcs or 50, det)
         if args.perf:
             report_perf(rep, load_perf(wt_conn, wt_run), load_perf(base_conn, base_run))
         if args.correctness:
@@ -712,12 +953,22 @@ def main(argv=None) -> int:
 
         verdict = (f"VERDICT: {rep.improvements} improvement(s), "
                    f"{rep.regressions} regression(s)")
+        if rep.correctness_regressions:
+            # The whole reason the gate runs before you read the deltas: a
+            # miscompile makes code size look "better" for free.
+            verdict += ("\n        NOT TRUSTWORTHY: a test regressed, so the "
+                        "size/cycle deltas below reflect a miscompile, not a win")
         if rep.improved_bytes is not None:
             net = rep.regressed_bytes - rep.improved_bytes
             verdict += (f"\n        code size at -{det.upper()}: "
                         f"improved by {rep.improved_bytes:,}, "
                         f"regressed by {rep.regressed_bytes:,} "
                         f"(net {net:+,d}) instructions")
+        if rep.cycles_delta is not None:
+            verdict += (f"\n        qemu cycles at -{det.upper()}: "
+                        f"{rep.cycles_delta:+,d} "
+                        f"({pct(rep.cycles_base + rep.cycles_delta, rep.cycles_base):+.2f}%) "
+                        f"{tag_lower_is_better(rep.cycles_delta)}")
         rep.add("=" * 78)
         rep.add(verdict)
         rep.add("=" * 78)
@@ -732,6 +983,10 @@ def main(argv=None) -> int:
             except OSError:
                 pass
 
+    # A correctness/test regression always fails; a code-size regression only
+    # fails under --strict.
+    if rep.correctness_regressions:
+        return 1
     if args.strict and rep.regressions:
         return 1
     return 0

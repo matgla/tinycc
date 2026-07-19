@@ -140,8 +140,13 @@ static int ssa_scan_var_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info)
   for (int v = 0; v < num_vars; v++) {
     if (SSABitset_test(info->addrtaken, v))
       continue;
+    /* A volatile VAR must not be promoted to a TEMP: promotion turns its
+     * memory loads/stores into value copies, eliding the mandated accesses.
+     * The addrtaken bitset gates promotion, so barring it here keeps a
+     * volatile VAR memory-resident. */
     if (v < ir->variables_live_intervals_size &&
-        ir->variables_live_intervals[v].addrtaken)
+        (ir->variables_live_intervals[v].addrtaken ||
+         ir->variables_live_intervals[v].is_volatile))
       SSABitset_set(info->addrtaken, v);
   }
 

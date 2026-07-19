@@ -12,7 +12,7 @@
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 #include "opt/ssa/strength.h"
 #include "opt/ssa/reassoc.h"
 #include "opt/ssa/cprop.h"
@@ -106,9 +106,13 @@ int ssa_opt_reassoc(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_narrow(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_branch(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_cmp_eq_prop(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
+int ssa_opt_vrp(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
+int ssa_opt_setif_or_taut(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
+int ssa_opt_cmp_offset_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_sccp(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_load_cse(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int tcc_ir_ssa_opt_const_string_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
+int tcc_ir_ssa_opt_const_string_fold_flat(TCCIRState *ir) { (void)ir; return 0; }
 int tcc_ir_ssa_opt_bitop_const_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int tcc_ir_ssa_opt_global_addr_hoist(TCCIRState *ir) { (void)ir; return 0; }
 int ssa_opt_var_forward(IRSSAOptCtx *ctx) { (void)ctx; return 0; }

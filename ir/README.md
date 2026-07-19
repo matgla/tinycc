@@ -26,59 +26,12 @@ ir/
 │   ├── operand.h/c      # IROperand definitions
 │   └── machine_op.h/c   # Machine-specific opcode helpers
 │
-├── Optimization pipeline
-│   ├── opt.h/c          # Optimization framework, pass engine, pipeline
-│   ├── opt_engine.h/c   # Pass registration and execution engine
-│   ├── opt_utils.h/c    # Shared optimization utilities
-│   ├── opt_xform.h/c    # IR transformations
-│   ├── opt_du.h/c       # Definition-use chains
-│   ├── opt_alias.h/c    # Alias analysis
-│   ├── opt_constfold.c  # Constant folding
-│   ├── opt_constprop.c  # Constant propagation
-│   ├── opt_copyprop.c   # Copy propagation
-│   ├── opt_dce.c        # Dead code elimination
-│   ├── opt_branch.c     # Branch optimization
-│   ├── opt_memory.c     # Memory optimization
-│   ├── opt_loop.c       # Loop optimizations
-│   ├── opt_loop_const_sim.c  # Loop constant simulation
-│   ├── opt_loop_utils.c     # Loop utility functions
-│   ├── opt_fusion.c     # Instruction fusion
-│   ├── opt_gens_branch.c    # Branch generation
-│   ├── opt_gens_call_result.c  # Call result handling
-│   ├── opt_gens_fusion.c    # Fusion generation
-│   ├── opt_jump_thread.c    # Jump threading
-│   ├── opt_knownbits.c      # Known bits analysis
-│   ├── opt_neg_chain.c      # Negation chain elimination
-│   ├── opt_pack64.c         # 64-bit packing
-│   ├── opt_pipeline.c       # Pipeline scheduling
-│   ├── opt_promote.c        # Type promotion
-│   ├── opt_reroll.c         # Loop rerolling
-│   ├── opt_setif_or_taut.c  # SETIF/tautology optimization
-│   ├── opt_switch_data.c    # Switch data optimization
-│   ├── opt_dead_vla.c       # Dead VLA elimination
-│   ├── opt_dead_lea_store.c # Dead LEA/store elimination
-│   ├── opt_const_aggregate.c # Constant aggregate handling
-│   └── opt_cmp_fuse.c       # Compare fusion
-│
 ├── SSA
-│   ├── ssa.h/c            # SSA form construction and manipulation
-│   └── opt/               # SSA-optimized passes
-│       ├── ssa_opt.h      # SSA optimization framework header
-│       ├── ssa_opt.c      # SSA pass orchestration
-│       │   # (gvn moved to source/opt/ssa/scalar/gvn.c)
-│       ├── ssa_opt_sccp.c      # Sparse conditional constant propagation
-│       │   # (reassoc moved to source/opt/ssa/scalar/reassoc.c)
-│       ├── ssa_opt_loop.c      # Loop optimizations (SSA)
-│       │   # (load_cse moved to source/opt/ssa/memory/load_cse.c)
-│       ├── ssa_opt_cprop.c     # SSA copy propagation
-│       ├── ssa_opt_dce.c       # SSA dead code elimination
-│       ├── ssa_opt_branch.c    # SSA branch optimization
-│       ├── ssa_opt_dead_loop.c # Dead loop elimination
-│       └── ssa_opt_sccp.c      # (listed above)
+│   └── ssa.h/c          # SSA form construction and manipulation
 │
 ├── Code generation
 │   ├── codegen.h/c        # Codegen helpers
-│   ├── regalloc.h/c       # Register allocation
+│   ├── regalloc.h/c       # Register allocation (pre-RA passes: source/opt/ra/)
 │   └── gen/               # IR instruction generators
 │       ├── arith.c        # Arithmetic instruction gen
 │       ├── asm.c          # Assembler instruction gen
@@ -97,13 +50,30 @@ ir/
     └── Makefile           # (project root) compiles ir/*.c
 ```
 
+The optimizer lives entirely under `source/opt/` — no pass, engine, or
+interface header remains here:
+
+```
+source/opt/include/     opt.h, opt_utils.h, opt_du.h, opt_alias.h, opt_engine.h,
+                        opt_pipeline.h, opt_xform.h, opt_gens_fusion.h,
+                        opt_loop_utils.h, opt_loop_const_sim.h, opt_reroll.h,
+                        licm.h, tccopt.h   (-I$(TOP)/source/opt/include)
+source/opt/util/        shared helpers (const eval, cond tokens, purity, ...)
+source/opt/analysis/    def-use chains, stack-slot aliasing
+source/opt/engine/      pass context, gen drivers, pipeline tables, registry
+source/opt/flat/        pre-SSA passes  (scalar/cfg/fusion/memory/dce/loop/ipa)
+source/opt/ssa/         SSA passes + engine/, include/ssa_opt.h
+source/opt/ra/          pre-RA cleanup passes
+source/opt/framework/   the OPT_GEN DSL
+```
+
 ## Module Architecture
 
 The IR pipeline processes IR in this order:
 
 1. **IRBuilder** (`core.h/c`) — constructs IR from C AST
 2. **SSA** (`ssa.h/c`) — converts to SSA form
-3. **Optimizations** (`opt/`, `opt/*.c`) — pass-based optimization
+3. **Optimizations** (`source/opt/`) — pass-based optimization
 4. **Register allocation** (`regalloc.h/c`) — assigns physical registers
 5. **Code generation** (`codegen.h/c`, `gen/`) — emits machine code
 

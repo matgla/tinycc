@@ -12,7 +12,7 @@ before and after register allocation:
                               ▼
  ┌─────────────────────────────────────────────────────────────────┐
  │  PHASE 1: Legacy Pre-SSA Flat-IR Optimizations                 │
- │  ir/opt_pipeline.c  (tcc_ir_opt_run_default)                   │
+ │  source/opt/engine/  (tcc_ir_opt_run_default)                   │
  │  Pass groups: entry_store → propagation → memory → fusion →     │
  │              late_cleanup                                      │
  │  Runs at every -O level; pass groups selected by level.          │
@@ -82,13 +82,16 @@ before and after register allocation:
 
 | File | Role |
 |------|------|
-| `ir/opt_pipeline.c` | Pre-SSA pass groups, level presets, cascade wrappers |
-| `ir/opt_engine.c` | Pre-SSA generator dispatch, `IROptCtx` |
+| `source/opt/engine/pipeline_table.c` | Pre-SSA pass groups, level presets, cascade wrappers |
+| `source/opt/engine/pipeline_run.c` | Group/pipeline driver, requirement + invalidation handling |
+| `source/opt/engine/ctx.c`, `run_gens.c` | Pre-SSA generator dispatch, `IROptCtx` |
+| `source/opt/util/`, `source/opt/analysis/` | Shared optimizer utilities, DU chains, alias analysis |
 | `ir/ssa.c` | SSA construction (phi placement) and renaming |
-| `ir/opt/ssa_opt.c` | SSA generator dispatch, use-def chains, guard collapse |
-| `ir/opt/ssa_opt.h` | SSA pass declarations |
-| `ir/opt/*.c` | Individual pre-SSA passes (constprop, dce, etc.) |
-| `ir/opt/ssa_opt_*.c` | Individual SSA passes |
+| `source/opt/ssa/engine/` | SSA generator dispatch, use-def chains, operand rewriting, stack resolution |
+| `source/opt/ra/` | Pre-RA cleanup passes (const-branch fold, phi-const chain, incomplete-call repair) |
+| `ir/opt/ssa_opt.h` | SSA engine + pass declarations |
+| `source/opt/flat/*/*.c` | Individual pre-SSA passes (constprop, dce, etc.) |
+| `source/opt/ssa/*/*.c` | Individual SSA passes |
 | `ir/regalloc.c` | Register allocation + SSA pipeline driver + post-RA |
 | `ir/opt_promote.c` | Post-RA diamond forwarding |
 | `arch/arm/ssa_opt_arm.c` | ARM-specific SSA generators (MLA, indexed mem) |

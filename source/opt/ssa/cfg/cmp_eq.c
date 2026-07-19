@@ -172,9 +172,12 @@ static int try_fold_cmp(IRSSAOptCtx *ctx, CmpEqState *st,
       while (ft < cfg->num_instrs && ir->compact_instructions[ft].op == TCCIR_OP_NOP)
         ft++;
       if (ft < cfg->num_instrs) {
+        int jdst_idx = (int)jdst.u.imm32;   /* target may index past instr_to_block */
+        int tgt_block = (jdst_idx >= 0 && jdst_idx < cfg->num_instrs)
+                          ? cfg->instr_to_block[jdst_idx] : -1;
         int pred_block = cfg->instr_to_block[jmp_idx];
         int ft_block = cfg->instr_to_block[ft];
-        if (ft_block != cfg->instr_to_block[(int)jdst.u.imm32])
+        if (ft_block != tgt_block)
           ssa_drop_phi_edge(ctx, pred_block, ft_block);
       }
     }

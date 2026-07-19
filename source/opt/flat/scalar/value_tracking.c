@@ -203,7 +203,7 @@ static void vt_analyze(TCCIRState *ir, int n, ValueTrackingAnalysis *a)
   {
     int32_t vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, pos);
     IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vr);
-    if (interval && interval->addrtaken)
+    if (interval && (interval->addrtaken || interval->is_volatile))
       a->is_addrtaken[pos / 8] |= (1 << (pos % 8));
   }
 }

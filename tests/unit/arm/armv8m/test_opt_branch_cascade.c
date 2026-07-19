@@ -20,7 +20,6 @@
 
 /* Pass entry points (defined in ir/opt_branch.c and ir/opt_promote.c;
  * forward-declared here to avoid pulling in the optimizer engine headers). */
-int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir);
 int tcc_ir_opt_setif_branch_fuse(TCCIRState *ir);
 int tcc_ir_opt_stack_bool_diamond(TCCIRState *ir);
 int ssa_opt_or_bool_diamond(TCCIRState *ir);
@@ -63,53 +62,6 @@ static TCCIRState *utb_pool_new(void)
   TCCIRState *ir = utb_new();
   ir->iroperand_pool_capacity = UTB_MAX_OPERANDS;
   return ir;
-}
-
-/* ================================================================== stack_nonnull */
-
-/* POSITIVE: a CMP of a known stack address against 0, EQ-branch -- a stack
- * address is never NULL, so the compare is always false: both CMP and the
- * JUMPIF are dead. */
-UT_TEST(test_stack_nonnull_eq_zero_folds_to_nop)
-{
-  TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
-  int cmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_imm(0, I32));
-  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(2, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_stack_addr_nonnull_fold(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_NOP);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): T0 is an arbitrary value, not a known stack address --
- * the CMP/JUMPIF pair must survive untouched. */
-UT_TEST(test_stack_nonnull_non_stackaddr_kept)
-{
-  TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32), UTB_NONE);
-  int cmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_imm(0, I32));
-  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(2, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_stack_addr_nonnull_fold(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_CMP);
-  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_JUMPIF);
-
-  utb_free(ir);
-  return 0;
 }
 
 /* ================================================================== setif_fuse */
@@ -569,7 +521,6 @@ UT_TEST(test_var_tmp_fwd_addrtaken_no_lea_forwards)
   return 0;
 }
 
-UT_COVERS("stack_nonnull");
 UT_COVERS("setif_fuse");
 UT_COVERS("branch_fold_test_zero");
 UT_COVERS("stack_bool");

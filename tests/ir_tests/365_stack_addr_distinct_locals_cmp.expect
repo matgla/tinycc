@@ -1,0 +1,5 @@
+distinct_vars=0
+same_var=1
+distinct_slots=0
+same_slot=1
+var_nonnull=1

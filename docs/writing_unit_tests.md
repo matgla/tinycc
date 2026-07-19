@@ -157,7 +157,7 @@ another file's stub *also* defines — linking both is a guaranteed
 | 2 | `run-backend` | `run_unit_tests_backend` | `arm-thumb-gen.c` + `arm-thumb-callsite.c` (real emitters, no mop stubs) | `test_main2.c` |
 | 3 | `run-tccgen` | `run_unit_tests_tccgen` | `tccgen.c` (`#include`d, see §7) | `test_main3.c` |
 | 4 | `run-libtcc-api` | `run_unit_tests_libtcc_api` | `libtcc.c` | `test_main4.c` |
-| 5 | `run-tccopt` | `run_unit_tests_tccopt` | `tccopt.c` | `test_main5.c` |
+| 5 | `run-tccopt` | `run_unit_tests_tccopt` | `source/opt/engine/fp_mat_cache.c` + `pass_registry.c` | `test_main5.c` |
 | 6 | `run-tccelf` | `run_unit_tests_tccelf` | `tccelf.c` | `test_main6.c` |
 | 7 | `run-tccpp` | `run_unit_tests_tccpp` | `tccpp.c` | `test_main7.c` |
 | 8 | `run-tcctools` | `run_unit_tests_tcctools` | `tcctools.c` | `test_main8.c` |
@@ -171,7 +171,7 @@ another file's stub *also* defines — linking both is a guaranteed
   **the main binary (1)**. This is where almost all new suites go.
 - Testing the raw Thumb-2 emitters in `arm-thumb-gen.c` (asserting the actual
   emitted bytes through the real backend) → **backend binary (2)**.
-- Testing `tccgen.c` / `libtcc.c` / `tccopt.c` / `tccelf.c` / `tccpp.c` /
+- Testing `tccgen.c` / `libtcc.c` / `tccelf.c` / `tccpp.c` /
   `tcctools.c` / `tccyaff.c` / `tcc.c` → their **dedicated isolated binary**.
 
 The aggregate `make run` (and top-level `make ut`) runs binaries **1, 3, 6, 7, 8,

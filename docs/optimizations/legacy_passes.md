@@ -1,7 +1,7 @@
 # Legacy Pre-SSA Flat-IR Optimizations
 
 These passes operate on flat IR before SSA construction. They are organized
-into **pass groups** defined in `ir/opt_pipeline.c`, each with a name,
+into **pass groups** defined in `source/opt/engine/pipeline_table.c`, each with a name,
 pass list, max iterations, and optional trigger pass.
 
 ## Pipeline Structure

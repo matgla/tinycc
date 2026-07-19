@@ -834,80 +834,6 @@ UT_TEST(test_const_string_calls_null_ir)
   return 0;
 }
 
-/* POSITIVE: memcmp(a, b, 0) folds to ASSIGN #0 regardless of the (here
- * non-constant) string args — n==0 is handled before any string evaluation,
- * so this fires in isolation without ELF section data.  Independently, two
- * memory regions compared over 0 bytes are equal, hence 0. */
-UT_TEST(test_const_string_calls_memcmp_zero_len_positive)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee_sym;
-  IROperand callee = utb_callee_named(ir, &callee_sym, 61);
-  utb_set_tok_str(61, "memcmp");
-
-  const int call_id = 2;
-  int i_p0 = utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, I32),
-                      utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
-  int i_p1 = utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, I32),
-                      utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 1), I32));
-  int i_p2 = utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(0, I32),
-                      utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 2), I32));
-  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(2, I32), callee,
-                        utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 3), I32));
-
-  int changes = tcc_ir_opt_const_string_calls(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_ASSIGN);
-  UT_ASSERT(irop_is_immediate(utb_src1(ir, i_call)));
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, i_call)), 0);
-  /* params NOP'd */
-  UT_ASSERT_EQ(utb_op(ir, i_p0), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, i_p1), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, i_p2), TCCIR_OP_NOP);
-
-  utb_set_tok_str(61, NULL);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: strncmp(a, b, 0) folds to ASSIGN #0 (n==0 path, independent of
- * string contents). */
-UT_TEST(test_const_string_calls_strncmp_zero_len_positive)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee_sym;
-  IROperand callee = utb_callee_named(ir, &callee_sym, 62);
-  utb_set_tok_str(62, "strncmp");
-
-  const int call_id = 3;
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, I32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, I32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 1), I32));
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(0, I32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 2), I32));
-  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(2, I32), callee,
-                        utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 3), I32));
-
-  int changes = tcc_ir_opt_const_string_calls(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, i_call)), 0);
-
-  /* Idempotent: a second pass over the rewritten ASSIGN reports no change. */
-  UT_ASSERT_EQ(tcc_ir_opt_const_string_calls(ir), 0);
-
-  utb_set_tok_str(62, NULL);
-  utb_free(ir);
-  return 0;
-}
-
 /* GUARD: a FUNCCALLVOID strlen is not foldable (the strlen fold path is gated
  * on FUNCCALLVAL).  With external_global_sym stubbed to NULL, the redirect to
  * __tcc_strlen via change_callee_sym_keep_type also cannot complete, so the
@@ -2153,43 +2079,6 @@ UT_TEST(test_local_addrof_64bit_store_value_no_fold)
  *  needs no ELF section data: it tracks byte-exact STORE sequences into a
  *  stack buffer and memcpy-like calls copying a (separately) const string in.
  * ============================================================================ */
-
-/* POSITIVE: byte-by-byte STOREs build "hi\0" on the stack; strlen() of that
- * buffer's address folds to #2 via the stack-strlen scan (no ELF data
- * needed -- distinct from the .rodata-backed strlen path). */
-UT_TEST(test_const_string_calls_strlen_stack_bytes_positive)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee_sym;
-  IROperand callee = utb_callee_named(ir, &callee_sym, 90);
-  utb_set_tok_str(90, "strlen");
-
-  /* Stack buffer at STACKOFF 0: 'h','i','\0' as three INT8 stores. */
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(0, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('h', IROP_BTYPE_INT8), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(1, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('i', IROP_BTYPE_INT8), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(2, 1, 0, 0, IROP_BTYPE_INT8), utb_imm(0, IROP_BTYPE_INT8), UTB_NONE);
-
-  /* strlen(&buf) -- arg is the bare stack address (STACKOFF, vreg=-1, not
-   * lval, is_local=1), matching ir_opt_stack_addr_offset's expected shape. */
-  IROperand buf_addr = irop_make_stackoff(-1, 0, 0 /* not lval */, 0, 0, I32);
-  buf_addr.is_local = 1;
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf_addr, utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
-                        utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-
-  int changes = tcc_ir_opt_const_string_calls(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_ASSIGN);
-  UT_ASSERT(irop_is_immediate(utb_src1(ir, i_call)));
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, i_call)), 2);
-
-  utb_set_tok_str(90, NULL);
-  utb_free(ir);
-  return 0;
-}
 
 /* GUARD: the same stack buffer but missing the NUL terminator byte (only 2 of
  * 3 bytes known) -> ir_opt_eval_stack_strlen's final scan finds `known[i]==0`

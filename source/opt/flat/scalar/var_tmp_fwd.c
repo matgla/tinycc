@@ -137,6 +137,8 @@ OPT_GEN_FLAT(var_tmp_fwd, -1)
 
   {
     IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest_vr);
+    if (interval && interval->is_volatile)
+      return 0;
     if (interval && interval->addrtaken)
     {
       int dpos = TCCIR_DECODE_VREG_POSITION(dest_vr);

@@ -42,3 +42,8 @@ typedef struct RegAllocTarget {
 void tcc_ir_ssa_regalloc(struct TCCIRState *ir, const RegAllocTarget *target, int spill_base);
 int tcc_ir_move_coalescing(struct TCCIRState *ir);
 
+/* Pre-RA cleanup passes (source/opt/ra/), run from tcc_ir_ssa_regalloc(). */
+int ra_repair_incomplete_calls(struct TCCIRState *ir);
+int ra_fold_const_branches(struct TCCIRState *ir);
+int ra_fold_phi_const_chain(struct TCCIRState *ir);
+
