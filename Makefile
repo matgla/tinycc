@@ -763,6 +763,27 @@ test-selfhost: cross
 		cd $(TOP)/tests/selfhost && $(PYTEST) -q --compiler=$(CROSS_COMPILER); \
 	fi
 
+# Re-run the floating-point tests under one float ABI.  The ABI is a whole-program
+# choice (it selects the matching libc/libm/libgcc/crt), so it is set through the
+# harness rather than as a cflag:
+#
+#   make test-fp FLOAT_ABI=hard      # or softfp / soft (default soft)
+#
+# `make test` covers the soft ABI plus the self-contained hard-float suite;
+# this target is how you exercise libc/libm interop under the other ABIs.
+# Note: only single precision is implemented for -mfloat-abi=hard — doubles
+# still travel in GPR pairs, so double libm calls are not ABI-compatible yet
+# (see docs/plan_vfp_hard_float.md).
+FLOAT_ABI ?= soft
+.PHONY: test-fp
+test-fp: cross test-venv test-prepare
+	@echo "------------ float tests (-mfloat-abi=$(FLOAT_ABI)) ------------"
+	@if [ "$(USE_VENV)" = "1" ]; then \
+		cd $(IRTESTS_DIR) && TCC_FLOAT_ABI=$(FLOAT_ABI) "$(VENV_PY)" -m pytest -s $(PYTEST_XDIST) -k "float or fp_" -m "not golden_ir"; \
+	else \
+		cd $(IRTESTS_DIR) && TCC_FLOAT_ABI=$(FLOAT_ABI) $(PYTEST) -s $(PYTEST_XDIST) -k "float or fp_" -m "not golden_ir"; \
+	fi
+
 # run IR tests via pytest (preferred)
 .PHONY: test-ir
 test-ir: cross test-venv test-prepare download-gcc-tests

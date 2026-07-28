@@ -193,24 +193,42 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
    * stored to stack since r0-r3 are caller-saved.
    * In both cases, we need to track which register each parameter arrives in.
    */
-  int argno = 0;     // current GPR argument register (r0-r3)
-  int vfp_argno = 0; // current VFP argument register (s0-s15, hard-float)
+  int argno = 0;             // current GPR argument register (r0-r3)
+  unsigned vfp_used = 0;     // bitmap of allocated VFP arg registers s0-s15
   const int hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && !ir->is_variadic);
   for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
   {
     const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
     IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, encoded_vreg);
 
-    /* Hard-float: a single-precision float parameter arrives in a VFP register
-     * (s0..s15), consuming the independent VFP counter — not a GPR slot.  Marked
-     * with LS_VFP_REG_BASE so the prolog homes it from the right register file. */
-    if (hard_float && interval && interval->is_float && !interval->is_double &&
-        interval->incoming_reg0 < 0 && vfp_argno < 16)
+    /* Hard-float: scalar float/double parameters arrive in VFP registers
+     * (s0..s15, viewed as d0..d7), consuming an independent bank — not GPR
+     * slots.  Allocation back-fills exactly as tcc_abi_classify_argument does:
+     * a float takes the lowest free s-register, a double the lowest free
+     * even-aligned pair.  incoming_reg0 is marked with LS_VFP_REG_BASE so the
+     * prolog homes it from the right register file. */
+    if (hard_float && interval && interval->is_float && !interval->is_complex &&
+        interval->incoming_reg0 < 0)
     {
-      interval->incoming_reg0 = LS_VFP_REG_BASE + vfp_argno;
-      interval->incoming_reg1 = -1;
-      vfp_argno++;
-      continue;
+      const int slots = interval->is_double ? 2 : 1;
+      const int step = slots;
+      int base = -1;
+      for (int cand = 0; cand + slots <= 16; cand += step)
+      {
+        const unsigned mask = (unsigned)((1u << slots) - 1u) << cand;
+        if (!(vfp_used & mask))
+        {
+          vfp_used |= mask;
+          base = cand;
+          break;
+        }
+      }
+      if (base >= 0)
+      {
+        interval->incoming_reg0 = LS_VFP_REG_BASE + base;
+        interval->incoming_reg1 = -1;
+        continue;
+      }
     }
     /* is_double for soft-float (LS_REG_TYPE_DOUBLE_SOFT) or is_llong for 64-bit
      */
@@ -406,7 +424,7 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
 
   uint8_t *is_stack_passed = tcc_mallocz((size_t)param_count);
   int argno = 0;
-  int vfp_argno = 0;
+  unsigned vfp_used = 0;
   const int hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && !ir->is_variadic);
   for (int vreg = 0; vreg < param_count; ++vreg)
   {
@@ -415,15 +433,27 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
     if (!interval)
       continue;
 
-    /* Hard-float: a single-precision float param consumes a VFP argument slot
-     * (s0..s15), not a GPR one — it is only stack-passed past s15.  Must mirror
-     * tcc_ir_register_allocation_params or in-register float params 5+ get
-     * their linear-scan allocation wrongly reset here. */
-    if (hard_float && interval->is_float && !interval->is_double)
+    /* Hard-float: a scalar float/double param consumes VFP argument slots
+     * (s0..s15), not GPR ones — it is only stack-passed once the VFP bank is
+     * full.  Must mirror tcc_ir_register_allocation_params (same back-filling
+     * rule) or in-register float params get their linear-scan allocation
+     * wrongly reset here and collapse onto a shared stack slot. */
+    if (hard_float && interval->is_float && !interval->is_complex)
     {
-      if (vfp_argno >= 16)
+      const int slots = interval->is_double ? 2 : 1;
+      int base = -1;
+      for (int cand = 0; cand + slots <= 16; cand += slots)
+      {
+        const unsigned mask = (unsigned)((1u << slots) - 1u) << cand;
+        if (!(vfp_used & mask))
+        {
+          vfp_used |= mask;
+          base = cand;
+          break;
+        }
+      }
+      if (base < 0)
         is_stack_passed[vreg] = 1;
-      vfp_argno++;
       continue;
     }
 

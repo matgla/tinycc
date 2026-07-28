@@ -557,12 +557,35 @@ UT_TEST(test_th_vldr_sp_blocked_without_feat)
   return 0;
 }
 
-UT_TEST(test_th_vldr_dp_blocked_without_feat)
+/* 64-bit load/store is DATA MOVEMENT, not double arithmetic: it stays available
+ * on a single-precision-only unit (FPv5-SP-D16 has s0-s15 addressable as d0-d7),
+ * which is what makes the hard-float double ABI encodable there.  Only the
+ * single-precision feature gates it. */
+UT_TEST(test_th_vldr_dp_allowed_without_dp_feat)
 {
   setup_no_vfp_dp();
   thumb_opcode op = th_vldr(0, 0, 0, 1);
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED900B00);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_dp_blocked_without_any_fpu)
+{
+  setup_no_vfp_sp();
+  thumb_opcode op = th_vldr(0, 0, 0, 1);
   UT_ASSERT_EQ(op.size, 0);
   UT_ASSERT_EQ(op.opcode, 0);
+  return 0;
+}
+
+/* Same for the GPR-pair <-> d-register move used to pass doubles. */
+UT_TEST(test_th_vmov_2gp_dp_allowed_without_dp_feat)
+{
+  setup_no_vfp_dp();
+  thumb_opcode op = th_vmov_2gp_dp(0, 1, 0, 1); /* R0, R1 <- D0 */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xEC510B10);
   return 0;
 }
 

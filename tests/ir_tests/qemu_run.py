@@ -58,6 +58,16 @@ def _detect_valgrind():
 VALGRIND_ENABLED = _detect_valgrind()
 VALGRIND_TIMEOUT_MULTIPLIER = 10 if VALGRIND_ENABLED else 1
 
+# Float ABI the whole suite builds and links with.  Set TCC_FLOAT_ABI=hard (or
+# softfp) to re-run the tests against the matching libc/libm/libgcc — the ABI has
+# to be chosen at link time, not per translation unit.  Defaults to soft, which
+# keeps the standard `make test` output unchanged.
+VALID_FLOAT_ABIS = ("soft", "softfp", "hard")
+DEFAULT_FLOAT_ABI = os.environ.get("TCC_FLOAT_ABI", "soft")
+DEFAULT_FPU = os.environ.get("TCC_FPU", "fpv5-sp-d16")
+if DEFAULT_FLOAT_ABI not in VALID_FLOAT_ABIS:
+    raise SystemExit(f"TCC_FLOAT_ABI={DEFAULT_FLOAT_ABI!r} invalid; want one of {VALID_FLOAT_ABIS}")
+
 
 class SubprocessSUT:
     """Minimal pexpect-like interface for reading QEMU output without PTYs.
@@ -274,6 +284,13 @@ class CompileConfig:
     output_prefix: str = ""  # Prefix to add to output filename (e.g. "O0_")
     output_suffix: str = ""  # Suffix to add to output filename (e.g. "_tag")
     timeout: int = 60 * ASAN_TIMEOUT_MULTIPLIER * VALGRIND_TIMEOUT_MULTIPLIER  # Timeout in seconds for compilation (0 = no timeout)
+    # Float ABI to compile AND link with ("soft", "softfp", "hard").  This picks
+    # the matching libc/libm/libgcc, so it cannot be passed as a plain cflag:
+    # a hard-float caller linked against soft-float libm would pass float
+    # arguments in s0-s15 and have them read from GPRs.  None = harness default
+    # (TCC_FLOAT_ABI env var, else the Makefile's own default of soft).
+    float_abi: Optional[str] = None
+    fpu: Optional[str] = None
 
     def __post_init__(self):
         if self.compiler is None:
@@ -330,7 +347,7 @@ def get_test_output_file(test_name, output_dir=None, prefix="", suffix=""):
     return output_dir / f"{prefix}{Path(primary).stem}{suffix}.elf"
 
 
-def build_make_command(test_file, machine, compiler, output_dir=None, cflags=None, defines=None, cc_wrapper=None, two_phase=False, output_prefix="", output_suffix=""):
+def build_make_command(test_file, machine, compiler, output_dir=None, cflags=None, defines=None, cc_wrapper=None, two_phase=False, output_prefix="", output_suffix="", float_abi=None, fpu=None):
     """Build the make command for compiling a test case."""
     make_dir = CURRENT_DIR / 'qemu' / machine
     test_files = [str(f) for f in _as_file_list(test_file)]
@@ -361,6 +378,12 @@ def build_make_command(test_file, machine, compiler, output_dir=None, cflags=Non
         cmd.append(f"CC_WRAPPER={cc_wrapper}")
     if two_phase:
         cmd.append("TWO_PHASE=1")
+    # The float ABI is a build-wide choice (compiler flags + which libc/libm/
+    # libgcc get linked), so it goes to the Makefile rather than into CFLAGS.
+    if float_abi:
+        cmd.append(f"FLOAT_ABI={float_abi}")
+    if fpu:
+        cmd.append(f"FPU={fpu}")
     return cmd
 
 
@@ -689,7 +712,9 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
         cc_wrapper=cc_wrapper,
         two_phase=config.two_phase,
         output_prefix=config.output_prefix,
-        output_suffix=config.output_suffix
+        output_suffix=config.output_suffix,
+        float_abi=config.float_abi or DEFAULT_FLOAT_ABI,
+        fpu=config.fpu or DEFAULT_FPU,
     )
 
     # Clean if needed

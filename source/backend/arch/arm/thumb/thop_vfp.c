@@ -234,6 +234,17 @@ static const thop_variant_shape SHAPE_VFP_DP = {
     .feat = {.t32 = 1, .vfp_dp = 1},
 };
 
+/* 64-bit *data movement* (vldr/vstr/vmov of a d-register).  Only double
+ * ARITHMETIC needs vfp_dp: a single-precision-only unit such as FPv5-SP-D16
+ * still has 16 single registers addressable as d0-d7, and moving 64 bits
+ * through them is legal (verified against arm-none-eabi-as, and it is how GCC
+ * passes doubles under -mfloat-abi=hard -mfpu=fpv5-sp-d16).  Gating these on
+ * vfp_dp would make the hard-float double ABI unencodable on that FPU. */
+static const thop_variant_shape SHAPE_VFP_DP_MOVE = {
+    .size = THOP_VARIANT_T32,
+    .feat = {.t32 = 1, .vfp_sp = 1},
+};
+
 static const thop_variant_shape SHAPE_VMOVGPSP = {
     .size = THOP_VARIANT_T32,
     .rd_place = {12, 4},
@@ -246,7 +257,7 @@ static const thop_variant_shape SHAPE_VMOV2GPDP = {
     .rd_place = {12, 4},
     .rn_place = {16, 4},
     .imm2_place = {20, 1},
-    .feat = {.t32 = 1, .vfp_dp = 1},
+    .feat = {.t32 = 1, .vfp_sp = 1}, /* data movement — see SHAPE_VFP_DP_MOVE */
 };
 
 static const thop_variant_shape SHAPE_VMRS = {
@@ -321,11 +332,11 @@ TH_TABLE(TH_VPOP_DP, "vpop.f64", {&SHAPE_VFP_SP, 0xecbd0b00, vfp_pushpop_emit});
 
 /* VLDR SP / DP */
 TH_TABLE(TH_VLDR_SP, "vldr.f32", {&SHAPE_VFP_SP, 0xed900a00, vfp_ldst_emit});
-TH_TABLE(TH_VLDR_DP, "vldr.f64", {&SHAPE_VFP_DP, 0xed900b00, vfp_ldst_emit});
+TH_TABLE(TH_VLDR_DP, "vldr.f64", {&SHAPE_VFP_DP_MOVE, 0xed900b00, vfp_ldst_emit});
 
 /* VSTR SP / DP */
 TH_TABLE(TH_VSTR_SP, "vstr.f32", {&SHAPE_VFP_SP, 0xed800a00, vfp_ldst_emit});
-TH_TABLE(TH_VSTR_DP, "vstr.f64", {&SHAPE_VFP_DP, 0xed800b00, vfp_ldst_emit});
+TH_TABLE(TH_VSTR_DP, "vstr.f64", {&SHAPE_VFP_DP_MOVE, 0xed800b00, vfp_ldst_emit});
 
 /* VMOV register SP / DP */
 TH_TABLE(TH_VMOV_REG_SP, "vmov.f32", {&SHAPE_VFP_SP, 0xeeb00a40, vmov_reg_emit});

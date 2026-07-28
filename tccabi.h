@@ -81,10 +81,16 @@ typedef struct TCCAbiCallLayout
   uint8_t next_reg;
   int32_t next_stack_off;
 
-  /* Hard-float VFP argument state (ARM AAPCS "VFP" variant). */
-  uint8_t next_vfp_reg; /* next free single-precision arg register s0..s15 */
-  uint8_t hard_float;   /* place float args in VFP registers */
-  uint8_t is_variadic;  /* variadic callee: FP args use the base (GPR) standard */
+  /* Hard-float VFP argument state (ARM AAPCS "VFP" variant).
+   * Allocation back-fills: a float takes the lowest free s-register and a
+   * double the lowest free even-aligned pair, so a double can sit above a gap
+   * that a later float still fits into.  Hence a per-register bitmap rather
+   * than a bump counter.  Once one FP argument has to go on the stack, the VFP
+   * bank is closed for every later argument too (AAPCS §6.5). */
+  uint16_t vfp_used;     /* bitmap of allocated s0..s15 */
+  uint8_t vfp_exhausted; /* an FP argument has spilled to the stack */
+  uint8_t hard_float;    /* place float args in VFP registers */
+  uint8_t is_variadic;   /* variadic callee: FP args use the base (GPR) standard */
 
   int32_t stack_size;  /* total outgoing argument stack area (bytes), aligned */
   uint8_t stack_align; /* required stack alignment at call boundary */

@@ -2435,6 +2435,20 @@ PUB_FUNC const char *default_elfinterp(struct TCCState *s);
 ST_FUNC void arm_init(struct TCCState *s);
 ST_FUNC void arm_deinit(struct TCCState *s);
 ST_FUNC void gen_increment_tcov(SValue *sv);
+
+/* ARM EABI build attributes (.ARM.attributes) describing the code we emit.
+ * Derived from the resolved target profile and float ABI by the ARM backend;
+ * the generic ELF writer only formats them.  A zero fp_arch/hardfp_use/vfp_args
+ * means "omit that attribute" (its absence is the ABI's default). */
+typedef struct ArmEabiAttrs
+{
+  const char *cpu_name; /* Tag_CPU_name (string) */
+  int cpu_arch;         /* Tag_CPU_arch */
+  int fp_arch;          /* Tag_FP_arch */
+  int hardfp_use;       /* Tag_ABI_HardFP_use */
+  int vfp_args;         /* Tag_ABI_VFP_args */
+} ArmEabiAttrs;
+ST_FUNC void arm_get_eabi_attrs(struct TCCState *s, ArmEabiAttrs *out);
 #endif
 
 /* ------------ tccasm.c ------------ */

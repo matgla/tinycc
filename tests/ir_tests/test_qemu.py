@@ -1321,12 +1321,16 @@ def _escape_regex(line):
     return re.escape(line)
 
 
-def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10):
+def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10,
+                   float_abi=None):
     expected_lines, expect_exit = load_expect_file(test_file)
     if expect_exit is not None:
         expected_exit_code = expect_exit
     opt_suffix = f"_{opt_level.replace('-', '').replace(' ', '_')}"
-    config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir)
+    if float_abi:
+        opt_suffix += f"_{float_abi}"
+    config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir,
+                           float_abi=float_abi)
     sut, loglines = run_test(test_file, MACHINE, args, defines=defines, config=config)
     expected_lines = _strip_compiler_output(expected_lines, loglines)
     try:
@@ -1470,6 +1474,7 @@ HARD_FLOAT_TEST_FILES = [
     ("fp_hard_call_exec.c", 1),
     ("fp_hard_loop_exec.c", 1),
     ("fp_hard_absplit_exec.c", 1),
+    ("fp_hard_double_exec.c", 1),
 ]
 HARD_FLOAT_CFLAGS = "-mfloat-abi=hard -mfpu=fpv5-sp-d16"
 
@@ -1491,6 +1496,23 @@ _HARD_FLOAT_PARAMS, _HARD_FLOAT_IDS = _generate_hard_float_params()
 def test_hard_float_execution(test_file, expected_exit_code, opt_level, tmp_path):
     cflags = f"{opt_level} {HARD_FLOAT_CFLAGS}"
     _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
+
+
+# Float ABI x libm interop.  These call real libc/libm functions, which follow
+# the program's float ABI (unlike __aeabi_* helpers, which are always base-PCS),
+# so the whole program — including libc, libm, libgcc and the C runtime — has to
+# be built for one ABI.  float_abi= selects that consistently; passing
+# -mfloat-abi as a bare cflag would compile one way and link the other.
+_LIBM_ABI_PARAMS = [
+    (abi, opt) for abi in ("soft", "softfp", "hard") for opt in OPT_LEVELS
+]
+
+
+@pytest.mark.parametrize("float_abi,opt_level", _LIBM_ABI_PARAMS,
+                         ids=[f"fp_libm_{a}{o}" for a, o in _LIBM_ABI_PARAMS])
+def test_libm_float_abi(float_abi, opt_level, tmp_path):
+    _run_qemu_test("fp_libm_exec.c", 1, opt_level=opt_level, output_dir=tmp_path,
+                   float_abi=float_abi)
 
 
 # Nested function xfail tests (not yet implemented)

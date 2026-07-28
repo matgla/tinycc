@@ -156,7 +156,9 @@ void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAb
     desc.alignment = (uint8_t)align;
   }
 
-  desc.is_float = is_float(type->t) ? 1 : 0;
+  /* Scalar float/double only: complex is passed as a composite (see above), so
+   * it must not be diverted into the VFP argument bank. */
+  desc.is_float = (is_float(type->t) && !(type->t & VT_COMPLEX) && (type->t & VT_BTYPE) != VT_STRUCT) ? 1 : 0;
 
   TCCAbiArgLoc loc_info = tcc_abi_classify_argument(call_layout, arg_index, &desc);
   tcc_ir_params_update_tracking(ir, loc_info, call_layout);

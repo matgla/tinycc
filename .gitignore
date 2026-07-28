@@ -136,3 +136,4 @@ fuzz_resweep*
 *.csv
 # FP conformance images built by tests/benchmarks/run_fp_conformance.py
 tests/benchmarks/build_fp_*/
+metrics/baselines
