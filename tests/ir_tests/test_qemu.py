@@ -304,6 +304,14 @@ TEST_FILES = [
     # GVN value-numbering of const runtime helpers (duplicate-call CSE)
     ("425_pure_call_cse.c", 0),
 
+    # entry_store_prop must not forward a local's entry store through a pointer
+    # that only may-alias it (phi of {param, &local}) or that was advanced
+    ("426_entry_store_phi_alias.c", 0),
+
+    # mem_inline must move a STRUCT slot's offset out of the split u.s encoding
+    # when it narrows the slot's btype (offset was becoming offset << 16)
+    ("427_mem_inline_struct_slot.c", 0),
+
     # Compile-time strlen constant folding
     ("171_strlen_constfold.c", 0),
 

@@ -9,6 +9,11 @@ typedef struct {
   uint32_t *chain;
 } YaffHashTable;
 
+void tcc_free_hash_table(YaffHashTable *ht);
+
+/* Scope-owned hash table; must be zero-initialized at declaration. */
+#define scoped_yaff_hash_table YaffHashTable __attribute__((cleanup(tcc_free_hash_table)))
+
 typedef struct __attribute__((packed)) YaffHeader {
   uint8_t magic[4];
   uint8_t module_type;

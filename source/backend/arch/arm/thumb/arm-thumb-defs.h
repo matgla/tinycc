@@ -211,6 +211,15 @@ struct ThumbGeneratorState
   ThumbLiteralPoolEntry *literal_pool;
   int literal_pool_size;
   int literal_pool_count;
+  /* `ind` of the earliest pending literal load, -1 when none pending.  The
+   * pool flush trigger measures its distance from `ind` directly, so raw o()
+   * emissions (switch tables, inline data) that bypass code_size accounting
+   * cannot starve the flush. */
+  int pool_window_first;
+  /* Exact byte size of the pending pool (4 or 8 per unique entry; shared
+   * entries add nothing) — literal_pool_count * 4 undercounts LDRD/double
+   * entries. */
+  int pool_bytes;
   Sym *cached_global_sym;
   int cached_global_reg;
   int *function_argument_list;

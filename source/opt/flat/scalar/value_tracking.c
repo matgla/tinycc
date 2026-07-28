@@ -13,6 +13,8 @@
 
 #define USING_GLOBALS
 
+#include <math.h> /* isinf/isnan/isfinite/signbit — not pulled in transitively on YasOS libm */
+
 #include "ir.h"
 #include "opt.h"
 #include "opt_du.h"

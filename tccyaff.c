@@ -22,6 +22,7 @@
 
 #include <stdbool.h>
 
+#include "memory/unique_ptr.h"
 #include "tccyaff.h"
 
 #define TCC_YAFF_MAX_SYMBOL_ENTRY_SIZE 255
@@ -48,10 +49,8 @@ void tcc_allocate_hash_table(YaffHashTable *ht, uint32_t number_of_buckets, uint
 {
   ht->nbucket = number_of_buckets;
   ht->nchain = count;
-  ht->bucket = tcc_malloc(ht->nbucket * sizeof(uint32_t));
-  ht->chain = tcc_malloc(ht->nchain * sizeof(uint32_t));
-  memset(ht->bucket, 0, ht->nbucket * sizeof(uint32_t));
-  memset(ht->chain, 0, ht->nchain * sizeof(uint32_t));
+  unique_ptr_reset(ht->bucket, tcc_mallocz(ht->nbucket * sizeof(uint32_t)));
+  unique_ptr_reset(ht->chain, tcc_mallocz(ht->nchain * sizeof(uint32_t)));
 }
 
 void tcc_add_hash_entry(YaffHashTable *ht, const char *name, uint32_t i)
@@ -73,8 +72,10 @@ void tcc_add_hash_entry(YaffHashTable *ht, const char *name, uint32_t i)
 
 void tcc_free_hash_table(YaffHashTable *ht)
 {
-  tcc_free(ht->bucket);
-  tcc_free(ht->chain);
+  unique_ptr_reset(ht->bucket, NULL);
+  unique_ptr_reset(ht->chain, NULL);
+  ht->nbucket = 0;
+  ht->nchain = 0;
 }
 
 void tcc_write_hash_table(YaffHashTable *ht, FILE *f)
@@ -1069,8 +1070,8 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
   char *name;
   uint32_t aligned_name_len = 0;
   uint32_t text_offset = 0, aligned_text_offset = 0;
-  YaffHashTable imported_symbols_hashtable;
-  YaffHashTable exported_symbols_hashtable;
+  scoped_yaff_hash_table imported_symbols_hashtable = {0};
+  scoped_yaff_hash_table exported_symbols_hashtable = {0};
   fflush(stdout);
 
   /* Materialize lazy sections before accessing their data pointers */

@@ -50,8 +50,12 @@ void *tcc_realloc(void *ptr, unsigned long size)
   return p;
 }
 
+unsigned tcc_test_free_count;
+
 void tcc_free(void *ptr)
 {
+  if (ptr)
+    tcc_test_free_count++;
   free(ptr);
 }
 

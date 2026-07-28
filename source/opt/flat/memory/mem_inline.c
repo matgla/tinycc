@@ -443,9 +443,8 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
           d.is_unsigned = 1;
           if (src_stk || src_var)
           {
-            IROperand slot = src_stk ? src : src_varop;
+            IROperand slot = irop_retype_scalar(src_stk ? src : src_varop, mi_btype(ws[k]));
             slot.is_lval = 1;
-            slot.btype = mi_btype(ws[k]);
             slot.is_unsigned = 1;
             mi_emit_at(ir, slots[si++], TCCIR_OP_LOAD, d, slot,
                        irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
@@ -464,9 +463,8 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
           v.is_unsigned = 1;
           if (dst_stk || dst_var)
           {
-            IROperand slot = dst_stk ? dst : dst_varop;
+            IROperand slot = irop_retype_scalar(dst_stk ? dst : dst_varop, mi_btype(ws[k]));
             slot.is_lval = 1;
-            slot.btype = mi_btype(ws[k]);
             slot.is_unsigned = 1;
             mi_emit_at(ir, slots[si++], TCCIR_OP_STORE, slot, v,
                        irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
@@ -491,9 +489,8 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
         IROperand v = irop_make_imm32(-1, (int32_t)pv, mi_btype(ws[k]));
         if (dst_stk || dst_var)
         {
-          IROperand slot = dst_stk ? dst : dst_varop;
+          IROperand slot = irop_retype_scalar(dst_stk ? dst : dst_varop, mi_btype(ws[k]));
           slot.is_lval = 1;
-          slot.btype = mi_btype(ws[k]);
           slot.is_unsigned = 1;
           mi_emit_at(ir, slots[si++], TCCIR_OP_STORE, slot, v,
                      irop_make_imm32(-1, 0, IROP_BTYPE_INT32));

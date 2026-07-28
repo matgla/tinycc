@@ -76,6 +76,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/ir/dump.c \
 	$(TOP)/ir/stack.c \
 	$(TOP)/ir/ssa.c \
+	$(TOP)/source/memory/unique_ptr.c \
 	$(TOP)/source/memory/vector.c \
 	$(TOP)/source/opt/ssa/scalar/gvn.c \
 	$(TOP)/source/opt/ssa/loop/loop_rotate.c \
@@ -1204,7 +1205,8 @@ $(COV_STAMP9):
 
 UT9_MODULE_SRCS := \
 	$(TOP)/tccyaff.c \
-	$(TOP)/tccelf.c
+	$(TOP)/tccelf.c \
+	$(TOP)/source/memory/unique_ptr.c
 UT9_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR9)/%.o,$(UT9_MODULE_SRCS))
 
 UT9_LOCAL_SRCS := \

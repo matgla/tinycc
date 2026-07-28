@@ -488,7 +488,35 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   {
     int64_t offset;
     int valid;
+    /* The binding is only a MAY-alias: some vreg on the chain that produced it
+       has more than one definition, so at a given use the pointer need not hold
+       this address at all (`s = cond ? param : &local;`, or a `p++` that already
+       moved it).  Such an entry is still good enough to *invalidate* an entry
+       store (Phases 2.5/2.6 want may-alias), but forwarding a stored value into
+       a load through it (Phases 3/3b/3c) would be unsound. */
+    int maybe;
   } SimpleLeaEntry;
+
+  /* Definition counts, used only to set `maybe` above.  A write *through* a
+     pointer (`T***DEREF*** <-- v`) is not a definition of the pointer, hence the
+     is_lval test. */
+  uint8_t *tmp_defs = tcc_mallocz(max_tmp + 1);
+  uint8_t *var_defs = tcc_mallocz(max_var + 1);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (!irop_config[q->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t vr = irop_get_vreg(d);
+    if (vr < 0 || d.is_lval)
+      continue;
+    int p = TCCIR_DECODE_VREG_POSITION(vr);
+    if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && p <= max_tmp && tmp_defs[p] < 2)
+      tmp_defs[p]++;
+    else if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && p <= max_var && var_defs[p] < 2)
+      var_defs[p]++;
+  }
 
   SimpleLeaEntry *lea_map = tcc_mallocz(sizeof(SimpleLeaEntry) * (max_tmp + 1));
   SimpleLeaEntry *var_lea_map = tcc_mallocz(sizeof(SimpleLeaEntry) * (max_var + 1));
@@ -498,6 +526,17 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   /* VAR analogue of rt_base: a `&arr[RUNTIME_index]` pointer materialised into a VAR local. */
   int64_t *var_rt_base = tcc_mallocz(sizeof(int64_t) * (max_var + 1));
   uint8_t *var_rt_valid = tcc_mallocz(max_var + 1);
+
+/* Record `map[p] = off`, inheriting the may-alias taint of whatever produced the
+   address (src_maybe) and adding this vreg's own if it has several definitions. */
+#define LEA_SET(map, defs, p, off, src_maybe)                  \
+  do {                                                         \
+    int _p = (p);                                              \
+    (map)[_p].offset = (off);                                  \
+    (map)[_p].valid = 1;                                       \
+    (map)[_p].maybe = ((src_maybe) || (defs)[_p] > 1) ? 1 : 0; \
+  } while (0)
+
 
   for (int i = 0; i < n; i++)
   {
@@ -520,8 +559,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
           int p = TCCIR_DECODE_VREG_POSITION(vr);
           if (p <= max_tmp)
           {
-            lea_map[p].offset = irop_get_stack_offset(src1);
-            lea_map[p].valid = 1;
+            LEA_SET(lea_map, tmp_defs, p, irop_get_stack_offset(src1), 0);
           }
         }
         /* Same address landing directly in a VAR alias pointer: record it for later store invalidation. */
@@ -530,8 +568,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
           int p = TCCIR_DECODE_VREG_POSITION(vr);
           if (p <= max_var)
           {
-            var_lea_map[p].offset = irop_get_stack_offset(src1);
-            var_lea_map[p].valid = 1;
+            LEA_SET(var_lea_map, var_defs, p, irop_get_stack_offset(src1), 0);
           }
         }
       }
@@ -551,8 +588,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         int dp = TCCIR_DECODE_VREG_POSITION(d_vr);
         if (sp <= max_tmp && lea_map[sp].valid && dp <= max_var)
         {
-          var_lea_map[dp].offset = lea_map[sp].offset;
-          var_lea_map[dp].valid = 1;
+          LEA_SET(var_lea_map, var_defs, dp, lea_map[sp].offset, lea_map[sp].maybe);
         }
         /* Carry a runtime array base into the VAR alias pointer too. */
         else if (sp <= max_tmp && rt_valid[sp] && dp <= max_var)
@@ -577,8 +613,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         int dp = TCCIR_DECODE_VREG_POSITION(d_vr);
         if (sp <= max_var && var_lea_map[sp].valid && dp <= max_tmp)
         {
-          lea_map[dp].offset = var_lea_map[sp].offset;
-          lea_map[dp].valid = 1;
+          LEA_SET(lea_map, tmp_defs, dp, var_lea_map[sp].offset, var_lea_map[sp].maybe);
         }
         /* A TEMP copied from a VAR runtime array pointer carries the runtime base. */
         else if (sp <= max_var && var_rt_valid[sp] && dp <= max_tmp)
@@ -595,8 +630,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         int dp = TCCIR_DECODE_VREG_POSITION(d_vr);
         if (sp <= max_tmp && lea_map[sp].valid && dp <= max_tmp)
         {
-          lea_map[dp].offset = lea_map[sp].offset;
-          lea_map[dp].valid = 1;
+          LEA_SET(lea_map, tmp_defs, dp, lea_map[sp].offset, lea_map[sp].maybe);
         }
         else if (sp <= max_tmp && rt_valid[sp] && dp <= max_tmp)
         {
@@ -625,8 +659,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
             int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
             if (sp <= max_tmp && lea_map[sp].valid)
             {
-              lea_map[dp].offset = lea_map[sp].offset + irop_get_imm64_ex(ir, s2);
-              lea_map[dp].valid = 1;
+              LEA_SET(lea_map, tmp_defs, dp, lea_map[sp].offset + irop_get_imm64_ex(ir, s2), lea_map[sp].maybe);
             }
             else if (sp <= max_tmp && rt_valid[sp])
             {
@@ -642,8 +675,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
             int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
             if (sp <= max_var && var_lea_map[sp].valid)
             {
-              lea_map[dp].offset = var_lea_map[sp].offset + irop_get_imm64_ex(ir, s2);
-              lea_map[dp].valid = 1;
+              LEA_SET(lea_map, tmp_defs, dp, var_lea_map[sp].offset + irop_get_imm64_ex(ir, s2), var_lea_map[sp].maybe);
             }
             else if (sp <= max_var && var_rt_valid[sp])
             {
@@ -654,8 +686,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
           else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF && irop_is_immediate(s2) &&
                    !s2.is_sym)
           {
-            lea_map[dp].offset = irop_get_stack_offset(s1) + irop_get_imm64_ex(ir, s2);
-            lea_map[dp].valid = 1;
+            LEA_SET(lea_map, tmp_defs, dp, irop_get_stack_offset(s1) + irop_get_imm64_ex(ir, s2), 0);
           }
           else if (!irop_is_immediate(s2))
           {
@@ -698,8 +729,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
             int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
             if (sp <= max_tmp && lea_map[sp].valid)
             {
-              var_lea_map[dp].offset = lea_map[sp].offset + irop_get_imm64_ex(ir, s2);
-              var_lea_map[dp].valid = 1;
+              LEA_SET(var_lea_map, var_defs, dp, lea_map[sp].offset + irop_get_imm64_ex(ir, s2), lea_map[sp].maybe);
             }
             else if (sp <= max_tmp && rt_valid[sp])
             {
@@ -711,8 +741,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
           else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF &&
                    irop_is_immediate(s2) && !s2.is_sym)
           {
-            var_lea_map[dp].offset = irop_get_stack_offset(s1) + irop_get_imm64_ex(ir, s2);
-            var_lea_map[dp].valid = 1;
+            LEA_SET(var_lea_map, var_defs, dp, irop_get_stack_offset(s1) + irop_get_imm64_ex(ir, s2), 0);
           }
           /* `V = base + RUNTIME index` into a VAR: record the array base for runtime-store invalidation. */
           else if (!irop_is_immediate(s2))
@@ -996,6 +1025,10 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       int p = TCCIR_DECODE_VREG_POSITION(vr);
       if (p > max_tmp || !lea_map[p].valid)
         continue;
+      /* May-alias only (multiply-defined pointer): invalidation may use it,
+         forwarding may not. */
+      if (lea_map[p].maybe)
+        continue;
 
       int64_t resolved_offset = lea_map[p].offset;
 
@@ -1043,6 +1076,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     int bp = TCCIR_DECODE_VREG_POSITION(base_vr);
     if (bp > max_tmp || !lea_map[bp].valid)
       continue;
+    if (lea_map[bp].maybe)
+      continue; /* see Phase 3 */
 
     int64_t base_off = lea_map[bp].offset;
     IROperand scale_op = ir->iroperand_pool[q->operand_base + 3];
@@ -1090,8 +1125,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
           int dp = TCCIR_DECODE_VREG_POSITION(d_vr);
           if (dp <= max_tmp)
           {
-            lea_map[dp].offset = irop_get_stack_offset(estores[k].value);
-            lea_map[dp].valid = 1;
+            LEA_SET(lea_map, tmp_defs, dp, irop_get_stack_offset(estores[k].value), 0);
           }
         }
       }
@@ -1161,6 +1195,10 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     }
   }
 
+#undef LEA_SET
+
+  tcc_free(tmp_defs);
+  tcc_free(var_defs);
   tcc_free(lea_map);
   tcc_free(var_lea_map);
   tcc_free(rt_base);

@@ -58,7 +58,7 @@ New code must use the ownership utilities under `source/memory/include/memory/` 
 - `vector` — growable typed arrays.
 - `small_sequence` — fixed-size sequences that stay inline at common sizes and fall back to the heap.
 - `dynamic_bitset` — owned bitsets with inline word storage and heap fallback.
-- `unique_ptr` — scope-owned libc allocations; **never** use it to own `tcc_malloc*` memory because its deleter is `free`.
+- `unique_ptr` — scope-owned single allocations; its deleter is `tcc_free`, so it owns `tcc_malloc*`/`tcc_realloc` memory and **never** plain `malloc` memory.
 
 Raw pointers are acceptable only at existing shared ABI/layout boundaries that cannot yet be represented by these utilities. Keep the framework owner inside the implementation wherever possible, and extend `source/memory` for recurring ownership patterns rather than adding new manual allocation/free pairs.
 

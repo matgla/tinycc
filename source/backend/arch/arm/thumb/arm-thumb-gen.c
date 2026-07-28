@@ -182,12 +182,14 @@ static inline Sym *validate_sym_for_reloc(Sym *sym)
   return sym;
 }
 
+/* Reserved-namespace names only: predefining plain identifiers (`arm`,
+ * `arm_elf`) breaks valid C11 code that uses them — the native bootstrap
+ * died on a local variable named `arm`.  GCC only defines such unprefixed
+ * macros in -std=gnu* mode, which tcc does not implement. */
 ST_DATA const char *const target_machine_defs = "__arm__\0"
                                                 "__arm\0"
-                                                "arm\0"
                                                 "__arm_elf__\0"
                                                 "__arm_elf\0"
-                                                "arm_elf\0"
 #if defined TCC_TARGET_ARM_ARCHV8M
                                                 "__ARM_ARCH_8M__\0"
                                                 "__ARM_ARCH_EXT_IDIV__\0"
@@ -1097,6 +1099,8 @@ typedef struct ThumbGenStateSnapshot
   int code_size;
   int literal_pool_count;
   int literal_pool_size;
+  int pool_window_first;
+  int pool_bytes;
   ThumbLiteralPoolEntry *literal_pool;
   Sym *cached_global_sym;
   int cached_global_reg;
@@ -1112,6 +1116,8 @@ static void thumb_gen_state_snapshot_save(ThumbGenStateSnapshot *snap)
   snap->code_size = thumb_gen_state.code_size;
   snap->literal_pool_count = thumb_gen_state.literal_pool_count;
   snap->literal_pool_size = thumb_gen_state.literal_pool_size;
+  snap->pool_window_first = thumb_gen_state.pool_window_first;
+  snap->pool_bytes = thumb_gen_state.pool_bytes;
   snap->literal_pool = thumb_gen_state.literal_pool;
   snap->cached_global_sym = thumb_gen_state.cached_global_sym;
   snap->cached_global_reg = thumb_gen_state.cached_global_reg;
@@ -1132,6 +1138,8 @@ static void thumb_gen_state_snapshot_restore(ThumbGenStateSnapshot *snap)
   thumb_gen_state.literal_pool = snap->literal_pool;
   thumb_gen_state.literal_pool_count = snap->literal_pool_count;
   thumb_gen_state.literal_pool_size = snap->literal_pool_size;
+  thumb_gen_state.pool_window_first = snap->pool_window_first;
+  thumb_gen_state.pool_bytes = snap->pool_bytes;
   thumb_gen_state.cached_global_sym = snap->cached_global_sym;
   thumb_gen_state.cached_global_reg = snap->cached_global_reg;
   thumb_gen_state.function_argument_count = snap->function_argument_count;
@@ -1389,6 +1397,8 @@ ST_FUNC void tcc_gen_machine_dry_run_start(void)
   /* Reset state that should start fresh for dry-run */
   thumb_gen_state.code_size = 0;
   thumb_gen_state.literal_pool_count = 0;
+  thumb_gen_state.pool_window_first = -1;
+  thumb_gen_state.pool_bytes = 0;
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = PREG_NONE;
   thumb_gen_state.function_argument_count = 0;
@@ -2567,6 +2577,8 @@ static void th_literal_pool_init()
 {
   thumb_gen_state.literal_pool_size = 64;
   thumb_gen_state.literal_pool_count = 0;
+  thumb_gen_state.pool_window_first = -1;
+  thumb_gen_state.pool_bytes = 0;
   if (thumb_gen_state.literal_pool)
   {
     tcc_free(thumb_gen_state.literal_pool);
@@ -2722,6 +2734,8 @@ ST_FUNC void arm_deinit(struct TCCState *s)
   dry_run_literal_pool = NULL;
   thumb_gen_state.literal_pool_size = 0;
   thumb_gen_state.literal_pool_count = 0;
+  thumb_gen_state.pool_window_first = -1;
+  thumb_gen_state.pool_bytes = 0;
   dry_run_literal_pool_size = 0;
   dry_run_literal_pool_count = 0;
   thumb_gen_state.generating_function = 0;
@@ -2998,6 +3012,8 @@ static void th_literal_pool_generate(void)
   }
 
   thumb_gen_state.literal_pool_count = 0;
+  thumb_gen_state.pool_window_first = -1;
+  thumb_gen_state.pool_bytes = 0;
   thumb_gen_state.code_size = 0;
   generating_pool = 0;
   /* Clear the hash table after flushing pool */
@@ -3005,52 +3021,60 @@ static void th_literal_pool_generate(void)
   literal_pool_lookup_cache_clear(&literal_pool_last_lookup);
 }
 
-/* Byte budget from the first literal load of a pool window to the last word of
- * that pool.  The architectural ceiling is 1024: the patch in
+/* Architectural ceiling for a pool window: the patch in
  * th_literal_pool_generate() encodes (aligned_position - 4), and both the T1
  * LDR-literal and the LDRD-literal forms carry an 8-bit word-scaled offset,
- * i.e. at most 1020 bytes.
- *
- * Every trigger below tests `code_size + pool_count * 4`, which is only a proxy
- * for that distance and undercounts it: the test runs after
- * `code_size += op.size` so the sum overshoots on crossing; the pool is
- * preceded by a skip branch and up to 2 bytes of alignment; and a flush
- * suppressed by op_in_it_block is deferred to the end of the IT block.  An
- * exact check would have to measure from the earliest pending entry's
- * patch_position, but entries are allocated before that field is known (see
- * load_full_const), so the proxy stays and carries a cushion instead.
- *
- * All of it used to be unaccounted for, every site testing a bare 1020: the
- * sum overshot the 1024-byte ceiling and the patch masked the offset down, so
- * the load read whatever code sat at (pc + offset mod 1024).  A first attempt
- * at 1000 was still not enough -- inline DCP compares shifted where flushes
- * land and produced a 1032-byte span.  960 matches the 64-byte cushion
- * tcc_gen_machine_cbz_forward_ok() already uses against the same drift, and
- * the range check in th_literal_pool_generate() is the backstop that turns any
- * future miss into a build failure rather than a silent miscompile. */
-#define THUMB_POOL_FLUSH_BUDGET 960
+ * i.e. at most 1020 bytes from the load to its literal. */
+#define THUMB_POOL_RANGE_LIMIT 1020
+/* Slack under the ceiling for what the span measurement cannot see coming: a
+ * flush suppressed by op_in_it_block is deferred to the end of the IT block
+ * (up to 4 conditioned insns, each able to add a pool entry), and multi-op
+ * sequences reserve only an estimate of their size. */
+#define THUMB_POOL_FLUSH_SLACK 64
+
+/* Exact span from the earliest pending literal load to the projected end of
+ * the pool if it were flushed after `upcoming_bytes` more code: measured from
+ * `ind` (ground truth — includes raw o() emissions such as switch_to_data
+ * jump tables that bypass code_size accounting; verbs.c/zork drifted 236
+ * bytes that way and blew the old `code_size + pool_count * 4` proxy), plus
+ * the B.W over the pool, worst-case alignment pad, and the exact pool bytes.
+ * Runs identically in the dry and real passes: both advance `ind` and both
+ * update the window fields through th_literal_pool_note_entry(). */
+static int th_pool_span_after(int upcoming_bytes)
+{
+  int pool_count = dry_run_state.active ? dry_run_literal_pool_count : thumb_gen_state.literal_pool_count;
+  if (pool_count == 0 || thumb_gen_state.pool_window_first < 0)
+    return 0;
+  return (ind - thumb_gen_state.pool_window_first) + upcoming_bytes + 4 /* B.W */ + 2 /* align */ +
+         thumb_gen_state.pool_bytes;
+}
+
+/* Fold a freshly initialized entry into the window bookkeeping.  Must run
+ * after the caller has set patch_position/data_size (find_or_allocate cannot:
+ * those fields are filled in afterwards). */
+static void th_literal_pool_note_entry(const ThumbLiteralPoolEntry *entry)
+{
+  if (thumb_gen_state.pool_window_first < 0 || entry->patch_position < thumb_gen_state.pool_window_first)
+    thumb_gen_state.pool_window_first = entry->patch_position;
+  if (entry->shared_index == -1)
+    thumb_gen_state.pool_bytes += (entry->data_size == 8) ? 8 : 4;
+}
 
 static void th_literal_pool_reserve_upcoming_bytes(int upcoming_bytes)
 {
   if (!thumb_gen_state.generating_function)
     return;
 
-  int pool_count = dry_run_state.active ? dry_run_literal_pool_count : thumb_gen_state.literal_pool_count;
-  if (pool_count == 0)
-    return;
-
-  if (thumb_gen_state.code_size + pool_count * 4 + upcoming_bytes >= THUMB_POOL_FLUSH_BUDGET)
+  if (th_pool_span_after(upcoming_bytes) >= THUMB_POOL_RANGE_LIMIT - THUMB_POOL_FLUSH_SLACK)
     th_literal_pool_generate();
 }
 
 static int th_literal_pool_would_flush_for(int upcoming_bytes)
 {
-  int pool_count = dry_run_state.active ? dry_run_literal_pool_count : thumb_gen_state.literal_pool_count;
-
-  if (!thumb_gen_state.generating_function || pool_count == 0)
+  if (!thumb_gen_state.generating_function)
     return 0;
 
-  return thumb_gen_state.code_size + pool_count * 4 + upcoming_bytes >= THUMB_POOL_FLUSH_BUDGET;
+  return th_pool_span_after(upcoming_bytes) >= THUMB_POOL_RANGE_LIMIT - THUMB_POOL_FLUSH_SLACK;
 }
 
 /* Count of conditioned instructions still pending inside an IT/ITE/... block,
@@ -3412,8 +3436,9 @@ int ot(thumb_opcode op)
       int it_len = mov_equiv_it_block_length(op);
       if (it_len > 0)
       {
-        if (thumb_gen_state.code_size + op.size + thumb_gen_state.literal_pool_count * 4 + 12 * it_len >=
-            THUMB_POOL_FLUSH_BUDGET)
+        /* 12 * it_len: worst case per conditioned insn is 4 code bytes plus
+         * an 8-byte pool entry. */
+        if (th_pool_span_after(op.size + 12 * it_len) >= THUMB_POOL_RANGE_LIMIT - THUMB_POOL_FLUSH_SLACK)
           th_literal_pool_generate();
         pool_flush_it_pending = it_len;
       }
@@ -3431,8 +3456,7 @@ int ot(thumb_opcode op)
        * We need to call th_literal_pool_generate to properly track the
        * code size including the literal pool, so that ind matches
        * between dry-run and real pass. */
-      const int max_offset = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4;
-      if (max_offset >= THUMB_POOL_FLUSH_BUDGET && !op_in_it_block)
+      if (th_pool_span_after(op.size) >= THUMB_POOL_RANGE_LIMIT - THUMB_POOL_FLUSH_SLACK && !op_in_it_block)
       {
         th_literal_pool_generate();
       }
@@ -3445,9 +3469,7 @@ int ot(thumb_opcode op)
   if (thumb_gen_state.generating_function)
   {
     thumb_gen_state.code_size += op.size;
-    // 16-bit encoding for ldr should be efficient
-    const int max_offset = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4;
-    if (max_offset >= THUMB_POOL_FLUSH_BUDGET && !op_in_it_block)
+    if (th_pool_span_after(op.size) >= THUMB_POOL_RANGE_LIMIT - THUMB_POOL_FLUSH_SLACK && !op_in_it_block)
     {
       th_literal_pool_generate();
     }
@@ -4589,6 +4611,7 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
   entry->relocation = -1; /* No relocation by default */
   entry->data_size = (r1 == PREG_NONE) ? 4 : 8;
   entry->short_instruction = (r1 == PREG_NONE && load_ins.size == 2);
+  th_literal_pool_note_entry(entry);
 
   if (!sym)
   {
@@ -4770,6 +4793,7 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
             entry2->relocation = -1;
             entry2->data_size = 4;
             entry2->short_instruction = (ldr.size == 2);
+            th_literal_pool_note_entry(entry2);
             ot_check(
                 th_add_reg(r, r, scratch, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
             restore_scratch_reg(&scratch_alloc);
@@ -4810,6 +4834,7 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
             entry2->relocation = -1;
             entry2->data_size = 4;
             entry2->short_instruction = (ldr.size == 2);
+            th_literal_pool_note_entry(entry2);
             ot_check(
                 th_add_reg(r, r, scratch, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
             restore_scratch_reg(&scratch_alloc);
@@ -13356,17 +13381,17 @@ ST_FUNC int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx
       (int)ir->codegen_dry_pool_entries[target_ir] - (int)ir->codegen_dry_pool_entries[current_ir_idx];
   if (entries_in_range < 0)
     return 0;
-  /* The emitter flushes at THUMB_POOL_FLUSH_BUDGET on code_size + pool*4 + upcoming, evaluated
-   * continuously while the range's instructions emit.  This one-shot estimate
-   * tracks the same terms, but the real pass can drift past it — alignment
-   * padding, the branch-over-pool word, per-emit upcoming bytes, dry-vs-real
-   * sizing differences.  Fuzz seed float:8061 passed at pressure 1016 and then
-   * took a 188-byte in-range flush (COMPILE_FAIL at th_patch_call, offset
-   * 204).  Require a 64-byte cushion so a hairline pass can't commit an
-   * unrepairable CBZ. */
-  int pressure = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4 + dry_dist +
-                 entries_in_range * 4 + 8;
-  if (pressure >= THUMB_POOL_FLUSH_BUDGET - 64)
+  /* The emitter flushes when th_pool_span_after() reaches the range limit,
+   * evaluated continuously while the range's instructions emit.  This
+   * one-shot estimate bounds the span at any point in the range: the current
+   * span plus the range's code bytes plus the pool bytes its entries can
+   * add.  The real pass can still drift past it — per-emit upcoming bytes,
+   * dry-vs-real sizing differences.  Fuzz seed float:8061 passed a hairline
+   * check and then took a 188-byte in-range flush (COMPILE_FAIL at
+   * th_patch_call, offset 204).  Require an extra 64-byte cushion so a
+   * hairline pass can't commit an unrepairable CBZ. */
+  int pressure = th_pool_span_after(8) + dry_dist + entries_in_range * 4;
+  if (pressure >= THUMB_POOL_RANGE_LIMIT - THUMB_POOL_FLUSH_SLACK - 64)
     return 0;
 
   return 1;
@@ -13408,9 +13433,8 @@ static int can_narrow_epilogue_branch(int32_t target_ir, int current_ir_idx)
                          (int)ir->codegen_dry_pool_entries[current_ir_idx];
   if (entries_in_range < 0)
     return 0;
-  int pressure = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4 + dry_dist +
-                 entries_in_range * 4 + 8;
-  if (pressure >= THUMB_POOL_FLUSH_BUDGET)
+  int pressure = th_pool_span_after(8) + dry_dist + entries_in_range * 4;
+  if (pressure >= THUMB_POOL_RANGE_LIMIT - THUMB_POOL_FLUSH_SLACK)
     return 0;
 
   return 1;
@@ -13446,11 +13470,10 @@ static int can_narrow_forward_branch(int32_t target_ir, int is_conditional, int 
       (int)ir->codegen_dry_pool_entries[target_ir] - (int)ir->codegen_dry_pool_entries[current_ir_idx];
   if (entries_in_range < 0)
     return 0;
-  /* THUMB_POOL_FLUSH_BUDGET is the flush threshold in th_literal_pool_reserve_upcoming_bytes; the
-   * slack covers the flush's own skip-branch and alignment padding. */
-  int pressure = thumb_gen_state.code_size + thumb_gen_state.literal_pool_count * 4 + dry_dist +
-                 entries_in_range * 4 + 8;
-  if (pressure >= THUMB_POOL_FLUSH_BUDGET)
+  /* Same bound as tcc_gen_machine_cbz_forward_ok: no flush can trigger in
+   * the range while this stays under the flush threshold. */
+  int pressure = th_pool_span_after(8) + dry_dist + entries_in_range * 4;
+  if (pressure >= THUMB_POOL_RANGE_LIMIT - THUMB_POOL_FLUSH_SLACK)
     return 0;
 
   return 1;

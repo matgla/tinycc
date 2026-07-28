@@ -146,7 +146,9 @@
 
 #elif defined __YasOS__
 #define __GNUC__ 4
-#define __linux__ 1
+/* Note: no `#define __linux__` here — target_os_defs (tccpp.c) already
+ * predefines __linux__/__linux for YasOS, and c2str would mangle the line
+ * into a bogus `#define TARGETOS_Linux 1` predefine (unreserved name). */
 
 #elif defined __APPLE__
 /* emulate APPLE-GCC to make libc's headerfiles compile: */

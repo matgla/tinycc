@@ -575,6 +575,38 @@ static inline int32_t irop_get_stack_offset(const IROperand op)
   return op.u.imm32;
 }
 
+/* Re-type an operand to a scalar (non-STRUCT) base type, keeping the payload
+ * in the field the new btype reads it from.
+ *
+ * A STRUCT-typed operand uses the split `u.s` encoding: the CType pool index
+ * in the low half and the tag's real payload in the HIGH half (u.s.aux_data) --
+ * a STACKOFF's slot offset, a SYMREF's/I64's pool index, an IMM32's value.
+ * Every scalar btype reads that payload from the full-width `u` instead.  So a
+ * bare `op.btype = IROP_BTYPE_INT32` on a struct slot silently reinterprets
+ * offset O as (O << 16 | ctype_idx): mem_inline narrowing a `memcpy(s.field,
+ * "...", 4)` destination turned StackLoc[-92] into StackLoc[-6029312] and the
+ * frame allocator sized tcc_output_yaff's prologue to match (6 MiB `sub sp` ->
+ * process stack overflow at the first call).  Narrow slot operands through
+ * here instead. */
+static inline IROperand irop_retype_scalar(IROperand op, int btype)
+{
+  int tag;
+  if (op.btype != IROP_BTYPE_STRUCT || btype == IROP_BTYPE_STRUCT)
+  {
+    op.btype = btype;
+    return op;
+  }
+  tag = irop_get_tag(op);
+  if (tag == IROP_TAG_STACKOFF || tag == IROP_TAG_IMM32)
+    op.u.imm32 = (int32_t)op.u.s.aux_data; /* signed payload */
+  else if (tag == IROP_TAG_SYMREF || tag == IROP_TAG_I64)
+    op.u.pool_idx = (uint16_t)op.u.s.aux_data; /* unsigned pool index */
+  else
+    op.u.imm32 = 0; /* pure vreg: the CType index was the only payload */
+  op.btype = btype;
+  return op;
+}
+
 /* Get immediate value (for IMM32 tag - NOT for STACKOFF with struct types!) */
 static inline int32_t irop_get_imm32(const IROperand op)
 {
