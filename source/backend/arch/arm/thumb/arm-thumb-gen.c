@@ -114,7 +114,8 @@ ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int 
   call_layout.next_reg = 0;       /* ARM AAPCS: start with R0 */
   call_layout.next_stack_off = 0; /* start at stack base */
   call_layout.stack_align = 8;    /* ARM requires 8-byte SP alignment */
-  call_layout.next_vfp_reg = 0;   /* AAPCS VFP: start with s0 */
+  call_layout.vfp_used = 0; /* AAPCS VFP: whole s0-s15 bank free */
+  call_layout.vfp_exhausted = 0;
   call_layout.hard_float = out_layout->hard_float;
   call_layout.is_variadic = out_layout->is_variadic;
 
@@ -2648,6 +2649,58 @@ const FloatingPointConfig *arm_determine_fpu_config(struct TCCState *s)
     exit(1);
     return NULL;
   }
+}
+
+/* Report the ARM EABI build attributes for the code this invocation emits.
+ * Values follow the ABI addenda; readelf -A renders them.  The FP trio is what
+ * makes an object's float ABI checkable by a linker:
+ *   Tag_FP_arch       — which FP unit's instructions may appear (0 = none)
+ *   Tag_ABI_HardFP_use — 1 ("SP only") when the unit has no double precision
+ *   Tag_ABI_VFP_args  — 1 only for -mfloat-abi=hard; its absence means the base
+ *                       (GPR) argument standard, which is what soft/softfp use. */
+ST_FUNC void arm_get_eabi_attrs(struct TCCState *s, ArmEabiAttrs *out)
+{
+  /* Thumb-2 is the mainline/baseline discriminator: v8-M.baseline has no t32. */
+  const int mainline = arm_target_dependent.feat.t32 ? 1 : 0;
+  out->cpu_name = mainline ? "8-M.MAIN" : "8-M.BASE";
+  out->cpu_arch = mainline ? 17 /* v8-M.mainline */ : 16 /* v8-M.baseline */;
+
+  out->fp_arch = 0;
+  out->hardfp_use = 0;
+  out->vfp_args = 0;
+
+  /* -mfloat-abi=soft emits no FP instructions at all, so it advertises no FP
+   * unit even when -mfpu names one. */
+  if (s->float_abi == ARM_SOFT_FLOAT)
+    return;
+
+  switch (s->fpu_type)
+  {
+  case ARM_FPU_FPV5_SP_D16:
+  case ARM_FPU_RP2350:
+    out->fp_arch = 8;    /* FPv5/FP-D16 for ARMv8 */
+    out->hardfp_use = 1; /* single precision only */
+    break;
+  case ARM_FPU_FPV5_D16:
+    out->fp_arch = 8; /* same unit, double precision present */
+    break;
+  case ARM_FPU_FPV4_SP_D16:
+    out->fp_arch = 6; /* VFPv4-D16 */
+    out->hardfp_use = 1;
+    break;
+  case ARM_FPU_NONE:
+    return;
+  default:
+    /* AUTO and the non-M-profile units: describe what the resolved unit can
+     * do rather than guessing a name. */
+    out->fp_arch = 8;
+    if (architecture_config.fpu && !architecture_config.fpu->has_dadd)
+      out->hardfp_use = 1;
+    break;
+  }
+
+  if (s->float_abi == ARM_HARD_FLOAT)
+    out->vfp_args = 1; /* FP arguments/results in VFP registers */
 }
 
 ST_FUNC void arm_init(struct TCCState *s)
@@ -10364,6 +10417,23 @@ ST_FUNC void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op)
     return;
   }
 
+  /* Hard-float double return: the value goes in d0 (AAPCS VFP).  Doubles are
+   * not VFP-resident here, so materialize the GPR pair and pack it into d0. */
+  if (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && src.is_64bit && src.btype == IROP_BTYPE_FLOAT64 &&
+      !src.is_complex)
+  {
+    MachineCodegenContext ctx = {0};
+    MachineOperand lo = mach_make_lo_half(&src);
+    MachineOperand hi = mach_make_hi_half(&src);
+    lo.btype = IROP_BTYPE_INT32;
+    hi.btype = IROP_BTYPE_INT32;
+    int rlo = mach_ensure_in_reg(&ctx, &lo, 0);
+    int rhi = mach_ensure_in_reg(&ctx, &hi, (1u << (uint32_t)rlo));
+    ot_check(th_vmov_2gp_dp((uint16_t)rlo, (uint16_t)rhi, 0, 0)); /* d0 = rlo,rhi */
+    mach_release_all(&ctx);
+    return;
+  }
+
   /* 64-bit return: lo word → R0 (REG_IRET), hi word → R1 (REG_IRE2).
    * AAPCS guarantees that for a 64-bit pair src.u.reg.r1 = src.u.reg.r0 + 1 ≥ R1,
    * so hi is never in R0.  Moving lo→R0 first is always safe.
@@ -10728,6 +10798,17 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     ParamMove *moves = tcc_malloc(sizeof(ParamMove) * max_param_moves);
     int move_count = 0;
 
+    /* Hard-float double parameters arrive in d0-d7 but are not VFP-resident, so
+     * each is unpacked into its allocated GPR pair.  Collected here and emitted
+     * after the GPR parallel move: the unpack overwrites GPRs that may still
+     * hold incoming GPR arguments. */
+    typedef struct DoubleUnpack
+    {
+      int dreg, lo, hi;
+    } DoubleUnpack;
+    DoubleUnpack dbl_unpack[8];
+    int dbl_unpack_count = 0;
+
     /* Build a bitmask of ALL incoming argument registers (R0-R3) that need
      * to be saved.  When storing a spilled parameter to the stack at a large
      * offset, the scratch register allocator must NOT pick any of these
@@ -10783,13 +10864,26 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       {
         /* Adjust for callee-saved gap below FP in two-phase push. */
         const int stack_offset = fp_adjust_local_offset(interval->allocation.offset, 0);
-        /* Float param arriving in a VFP register but spilled to the stack:
-         * bridge it through a GPR scratch to reuse the ordinary store. */
+        /* Float/double param arriving in a VFP register but spilled to the
+         * stack: bridge it through GPR scratch to reuse the ordinary store.  A
+         * double occupies d<n> and needs both halves written. */
         if (is_vfp_reg(incoming_r0))
         {
           ScratchRegAlloc sc = get_scratch_reg_with_save(incoming_arg_regs_mask);
-          ot_check(th_vmov_gp_sp((uint16_t)sc.reg, (uint16_t)vfp_num(incoming_r0), 1)); /* gpr = s_incoming */
-          tcc_gen_machine_store_to_stack_ex(sc.reg, stack_offset, incoming_arg_regs_mask);
+          if (is_64bit)
+          {
+            ScratchRegAlloc sc2 = get_scratch_reg_with_save(incoming_arg_regs_mask | (1u << (uint32_t)sc.reg));
+            ot_check(th_vmov_2gp_dp((uint16_t)sc.reg, (uint16_t)sc2.reg,
+                                    (uint16_t)(vfp_num(incoming_r0) / 2), 1)); /* lo,hi = d<n> */
+            tcc_gen_machine_store_to_stack_ex(sc.reg, stack_offset, incoming_arg_regs_mask);
+            tcc_gen_machine_store_to_stack_ex(sc2.reg, stack_offset + 4, incoming_arg_regs_mask);
+            restore_scratch_reg(&sc2);
+          }
+          else
+          {
+            ot_check(th_vmov_gp_sp((uint16_t)sc.reg, (uint16_t)vfp_num(incoming_r0), 1)); /* gpr = s_incoming */
+            tcc_gen_machine_store_to_stack_ex(sc.reg, stack_offset, incoming_arg_regs_mask);
+          }
           restore_scratch_reg(&sc);
           continue;
         }
@@ -10806,6 +10900,22 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
           tcc_gen_machine_store_to_stack_ex(incoming_r0, stack_offset, incoming_arg_regs_mask);
           incoming_arg_regs_mask &= ~(1u << incoming_r0);
         }
+        continue;
+      }
+
+      /* Double parameter arriving in a VFP register (hard-float): it is not
+       * VFP-resident — there is no double-precision arithmetic here — so unpack
+       * d<n> into the GPR pair the allocator gave it.  Emitted before the GPR
+       * parallel move, whose sources are all still live. */
+      if (is_64bit && is_vfp_reg(incoming_r0) && alloc_r0 != PREG_NONE && alloc_r0 >= 0 && alloc_r1 >= 0)
+      {
+        /* Deferred: the unpack writes GPRs that may still hold incoming GPR
+         * arguments (a leading int parameter sits in r0, and d0 commonly unpacks
+         * into r0:r1), so it must run only after the GPR parallel move below has
+         * consumed them. */
+        if (dbl_unpack_count < (int)(sizeof(dbl_unpack) / sizeof(dbl_unpack[0])))
+          dbl_unpack[dbl_unpack_count++] =
+              (DoubleUnpack){.dreg = vfp_num(incoming_r0) / 2, .lo = alloc_r0, .hi = alloc_r1};
         continue;
       }
 
@@ -10956,6 +11066,13 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
         cur = src;
       }
     }
+
+    /* Now that every incoming GPR argument has reached its home, it is safe to
+     * overwrite the argument registers: unpack the hard-float doubles from
+     * d0-d7 into their allocated GPR pairs. */
+    for (int i = 0; i < dbl_unpack_count; ++i)
+      ot_check(th_vmov_2gp_dp((uint16_t)dbl_unpack[i].lo, (uint16_t)dbl_unpack[i].hi,
+                              (uint16_t)dbl_unpack[i].dreg, 1));
 
     tcc_free(moves);
   }
@@ -12492,11 +12609,33 @@ static void emit_vfp_arg_moves(CallGenContext *ctx)
   int dst[16], src[16];
   const MachineOperand *mop[16];
   int n = 0;
+  const uint32_t gpr_excl_all = (uint32_t)(ctx->call_site->registers_map & 0xffffu);
+
   for (int i = 0; i < ctx->argc && n < 16; ++i)
   {
     const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
     if (loc->kind != TCC_ABI_LOC_VFP_REG)
       continue;
+
+    /* Double: the value lives in a GPR pair (doubles are not VFP-resident —
+     * there is no double-precision arithmetic on this FPU), so pack the two
+     * halves straight into the d-register.  Emitted immediately: d-registers
+     * are not sources for any other argument move. */
+    if (loc->reg_count == 2)
+    {
+      MachineCodegenContext mctx = {0};
+      MachineOperand m = ctx->mops[i];
+      MachineOperand lo = mach_make_lo_half(&m);
+      MachineOperand hi = mach_make_hi_half(&m);
+      lo.btype = IROP_BTYPE_INT32;
+      hi.btype = IROP_BTYPE_INT32;
+      int rlo = mach_ensure_in_reg(&mctx, &lo, gpr_excl_all);
+      int rhi = mach_ensure_in_reg(&mctx, &hi, gpr_excl_all | (1u << (uint32_t)rlo));
+      ot_check(th_vmov_2gp_dp((uint16_t)rlo, (uint16_t)rhi, (uint16_t)(loc->reg_base / 2), 0));
+      mach_release_all(&mctx);
+      continue;
+    }
+
     dst[n] = loc->reg_base;
     const MachineOperand *m = &ctx->mops[i];
     src[n] = (m->kind == MACH_OP_VFP_REG) ? m->u.reg.r0 : -1; /* -1 = materialize */
@@ -12506,7 +12645,7 @@ static void emit_vfp_arg_moves(CallGenContext *ctx)
   if (n == 0)
     return;
 
-  const uint32_t gpr_excl = (uint32_t)(ctx->call_site->registers_map & 0xffffu);
+  const uint32_t gpr_excl = gpr_excl_all;
   int remaining = n;
   while (remaining > 0)
   {
@@ -12940,6 +13079,25 @@ static void handle_return_value_mop(const MachineOperand *dest_mop, int drop_val
       mach_writeback_dest(dest_mop, r);
       mach_release_all(&ctx);
     }
+    return;
+  }
+
+  /* Hard-float double return arrives in d0 (AAPCS VFP) — unless the callee is a
+   * soft __aeabi_* helper, whose result comes back in the R0:R1 pair. */
+  if (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && !soft_float_return && dest_mop->is_64bit &&
+      dest_mop->btype == IROP_BTYPE_FLOAT64 && !dest_mop->is_complex)
+  {
+    MachineCodegenContext ctx = {0};
+    MachineOperand lo = mach_make_lo_half(dest_mop);
+    MachineOperand hi = mach_make_hi_half(dest_mop);
+    lo.btype = IROP_BTYPE_INT32;
+    hi.btype = IROP_BTYPE_INT32;
+    int rlo = mach_get_dest_reg(&ctx, &lo, 0);
+    int rhi = mach_get_dest_reg(&ctx, &hi, (1u << (uint32_t)rlo));
+    ot_check(th_vmov_2gp_dp((uint16_t)rlo, (uint16_t)rhi, 0, 1)); /* rlo,rhi = d0 */
+    mach_writeback_dest(&lo, rlo);
+    mach_writeback_dest(&hi, rhi);
+    mach_release_all(&ctx);
     return;
   }
 

@@ -166,8 +166,110 @@ GPR+stack+VFP banks.  `addf` is now full AAPCS-VFP:
 s0-s5.  Gate: 24 execute tests, make test 13803, make ut green.
 
 **Hard-float single-precision ABI is now COMPLETE** (args s0-s15, return s0,
-native arith, VFP register class).  Remaining follow-ups: doubles (still soft),
-`.ARM.attributes` `Tag_ABI_VFP_args` audit, hard-float newlib, rp2350 CI.
+native arith, VFP register class).
+
+### ✅ `.ARM.attributes` fixed (2026-07-28, commit 405094bb)
+
+The section was a hardcoded **ARMv6** blob patched at fixed byte offsets, so
+every ARMv8-M binary misdescribed itself (`Tag_CPU_arch: v6`, `Tag_ARM_ISA_use:
+Yes` — M-profile has no ARM ISA, `Tag_FP_arch: VFPv2` regardless of `-mfpu`);
+`Tag_ABI_HardFP_use` and `Tag_CPU_arch_profile` were absent.  `Tag_ABI_VFP_args`
+itself was already correct (the non-hard path overwrote the tag).  It is now
+built programmatically from `arm_get_eabi_attrs()`, and the float trio matches
+`arm-none-eabi-gcc` byte-for-byte for cortex-m33 + fpv5-sp-d16:
+
+| ABI | Tag_FP_arch | Tag_ABI_HardFP_use | Tag_ABI_VFP_args | e_flags |
+|---|---|---|---|---|
+| soft | *(absent)* | *(absent)* | *(absent)* | soft-float |
+| softfp | FPv5/FP-D16 for ARMv8 | SP only | *(absent)* | soft-float |
+| hard | FPv5/FP-D16 for ARMv8 | SP only | VFP registers | hard-float |
+
+Deliberate differences from GCC: `Tag_ABI_enum_size` stays `int` (tcc's actual
+enum ABI; arm-none-eabi-gcc defaults to short enums — worth a separate audit)
+and `Tag_DSP_extension` is not claimed.  Pinned by
+`tests/ir_tests/test_elf_attributes.py`.
+
+**Known gap:** attributes are emitted only at *link* time — tcc object files
+carry no `.ARM.attributes` at all, so GNU `ld` cannot ABI-check them.  Adding it
+per-object needs care (tcc's linker creates its own section and would then see
+one per input object).
+
+### ✅ Float ABI selectable end-to-end (2026-07-28, commit d98c8368)
+
+The harness hardcoded `-mfloat-abi=soft` for the *link*, so hard-float tests could
+only ever be self-contained.  Now one `FLOAT_ABI`/`FPU` knob drives compiler
+flags **and** library selection:
+
+- `tests/ir_tests/qemu/mps2-an505/Makefile` — `FLOAT_ABI=soft|softfp|hard`.
+  The in-tree newlib is soft-only, so other ABIs use the toolchain multilib
+  (`thumb/v8-m.main+fp/{softfp,hard}`), which ships libc/libm/libgcc/librdimon/crt.
+- `build_newlib.sh <abi> [fpu]` — per-ABI newlib tree, for targets the multilib
+  does not cover.
+- `qemu_run.py` — `CompileConfig.float_abi/fpu` → make vars, defaulting from
+  `TCC_FLOAT_ABI` / `TCC_FPU`.
+- `make test-fp FLOAT_ABI=hard` — re-run the float tests under one ABI.
+- `fp_libm_exec.c` — real libm calls, run across all 3 ABIs × 4 opt levels.
+
+**Two bugs it surfaced immediately:**
+1. `lib/builtin.c`'s freestanding C float fallbacks (`fabsf`, `floorf`,
+   `fmaxf`, …) live in `armv8m-libtcc1.a`, built with the compiler's default
+   ABI, and **preceded libm in the link** — so a hard-float program got the
+   soft-ABI `fabsf` and `fabsf(-3.5f)` returned `-3`.  Fixed by putting libm
+   before libtcc1.  (`__aeabi_*` helpers are unaffected: the RTABI fixes them to
+   the base PCS regardless of the caller, which is why `lib/fp` stays soft-built.)
+2. `USE_NEWLIB_BUILD=0` requested `libc_g.a`/`libm_g.a` unconditionally though
+   only the local newlib has debug variants — now `wildcard`-guarded.
+
+### ✅ Doubles in d0-d7 (2026-07-28, commit 091f22da) — hard-float ABI COMPLETE
+
+The last correctness gap.  Verified against `arm-none-eabi-gcc`: AAPCS-VFP
+passes doubles in `d0-d7` **even on a single-precision-only FPU** — the ABI says
+where arguments live, not which arithmetic exists, so the callee unpacks `d0`
+into a GPR pair to call `__aeabi_dadd`.  Doubles therefore stay non-VFP-resident
+internally and only the ABI boundary moved.  `addd()` now assembles
+byte-identically to GCC's for the same flags.
+
+- **Allocation is a bitmap, not a counter** — AAPCS back-fills: a float takes
+  the lowest free s-register, a double the lowest free *even-aligned* pair.
+  `mixd(int,double,float,double)` → `d0`/`s2`/**`d2`**, with `s3` left free.
+  Once one FP argument spills to the stack, the VFP bank closes for all later
+  ones.  Mirrored in all three places that must agree (`arm_aapcs.c`,
+  `register_allocation_params`, `avoid_spilling_stack_passed_params`).
+- **Real miscompile fixed:** the callee's `vmov r0,r1,d0` unpack ran *before*
+  the GPR parallel move, clobbering a leading `int` parameter still sitting in
+  r0.  Unpacks are now deferred until after that move.
+- **Encoder gating corrected:** 64-bit `vmov`/`vldr`/`vstr` were gated on
+  `vfp_dp`, which made the double ABI unencodable on `fpv5-sp-d16`.  They are
+  *data movement*, not double arithmetic, and are legal whenever the register
+  file exists (confirmed with `arm-none-eabi-as`) — now gated on `vfp_sp`.
+
+`make test-fp` is **96/96 under all three ABIs** (was 93/96 for hard).
+
+**The hard-float ABI is now complete**: args in s0-s15/d0-d7, returns in s0/d0,
+native single-precision arithmetic, correct ELF/EABI marking, and libc/libm
+interop under soft, softfp and hard.
+
+### ✅ CI wiring (2026-07-28, commit 4bdb5528)
+
+- **QEMU** (`build-and-test`): a "Float ABI matrix" step runs the float tests
+  under **softfp and hard** in addition to `make test`'s soft coverage — this is
+  what makes the libm interop tests meaningful, since they link libc/libm/libgcc
+  built for the same ABI.  Guarded: warns and skips if the image's
+  arm-none-eabi lacks the matching multilib, rather than failing on container
+  contents.  Dry-run verbatim: 96 passed under both.
+- **RP2350** (`metrics`, self-hosted): runs `run_fp_conformance.py` in two
+  configurations — the soft-float baseline (control: the identical IEEE-754
+  vectors run under QEMU as `421_fp_conformance.c`, so the two must agree) and
+  **inline DCP/VFP codegen**, which QEMU cannot model at all.  Placed after the
+  metrics steps so a conformance failure still leaves perf/codesize recorded.
+
+Remaining follow-ups (none are hard-float correctness gaps):
+- **hard-float on RP2350 silicon** — needs the pico-sdk rebuilt for the hard
+  ABI; deliberately not attempted as untested CMake plumbing.
+- native `vadd.f64` on a DP-capable FPU (`-mfpu=fpv5-d16`).
+- `.ARM.attributes` in object files (link-time only today).
+- a known-broken `fmaxf`/`fminf` — wrong under *soft* too (returns a double bit
+  pattern); pre-existing and unrelated to the ABI work.
 
 ### Historical: first activation attempt (2026-07-28) — caller works, callee >4-float bug, REVERTED
 

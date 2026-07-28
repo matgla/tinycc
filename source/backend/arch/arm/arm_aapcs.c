@@ -64,25 +64,49 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
   loc.reg_count = 0;
   loc.stack_off = 0;
 
-  /* Hard-float single-precision: pass in the next VFP argument register
-   * (s0..s15), else on the stack.  Variadic callees use the base standard
-   * (GPRs), so this only applies to non-variadic calls.  Doubles stay soft
-   * (GPR pairs) for now and fall through to the SCALAR64 path. */
-  if (layout->hard_float && !layout->is_variadic && arg_desc->is_float && size == 4)
+  /* Hard-float scalar float/double: pass in VFP argument registers (s0..s15,
+   * viewed as d0..d7 for doubles), else on the stack.  Variadic callees use the
+   * base standard (GPRs), so this only applies to non-variadic calls.
+   *
+   * Doubles ride the VFP bank even on a single-precision-only FPU: the ABI is
+   * about where arguments live, not about which arithmetic exists, so the
+   * callee unpacks d0 into a GPR pair to call __aeabi_dadd.  That is what
+   * arm-none-eabi-gcc does for -mfpu=fpv5-sp-d16, and matching it is what makes
+   * our objects interoperate with its libm. */
+  if (layout->hard_float && !layout->is_variadic && arg_desc->is_float && (size == 4 || size == 8))
   {
-    if (layout->next_vfp_reg < 16)
+    const int slots = size / 4;             /* s-registers consumed */
+    const int step = (slots == 2) ? 2 : 1;  /* doubles must be even-aligned */
+    int base = -1;
+
+    if (!layout->vfp_exhausted)
+    {
+      for (int cand = 0; cand + slots <= 16; cand += step)
+      {
+        const unsigned mask = (unsigned)((1u << slots) - 1u) << cand;
+        if (!(layout->vfp_used & mask))
+        {
+          layout->vfp_used |= (uint16_t)mask;
+          base = cand;
+          break;
+        }
+      }
+      if (base < 0)
+        layout->vfp_exhausted = 1; /* no more VFP for any later argument */
+    }
+
+    if (base >= 0)
     {
       loc.kind = TCC_ABI_LOC_VFP_REG;
-      loc.reg_base = layout->next_vfp_reg;
-      loc.reg_count = 1;
-      layout->next_vfp_reg++;
+      loc.reg_base = (uint8_t)base;
+      loc.reg_count = (uint8_t)slots;
     }
     else
     {
-      layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, 4);
+      layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, size);
       loc.kind = TCC_ABI_LOC_STACK;
       loc.stack_off = layout->next_stack_off;
-      layout->next_stack_off += 4;
+      layout->next_stack_off += size;
     }
     layout->stack_size = tcc_abi_align_up_int(layout->next_stack_off, layout->stack_align ? layout->stack_align : 8);
     return loc;

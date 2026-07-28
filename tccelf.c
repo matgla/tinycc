@@ -4399,39 +4399,86 @@ static void reorder_sections(TCCState *s1, int *sec_order)
 }
 
 #ifdef TCC_TARGET_ARM
+/* Emit the ARM EABI build-attributes section describing the code we produced.
+ * Consumers (ld, gdb, objdump) use it to check ABI compatibility between
+ * objects — most importantly Tag_ABI_VFP_args, which says whether FP arguments
+ * travel in VFP registers (-mfloat-abi=hard) or GPRs (soft/softfp).
+ *
+ * Layout (ABI addenda §2.2):
+ *   'A' | uint32 vendor_len | "aeabi\0" | 0x01 Tag_File | uint32 sub_len | pairs
+ * where vendor_len counts everything after the 'A' (including itself) and
+ * sub_len counts the Tag_File byte, its length field and the attribute pairs.
+ * Every tag and value we emit is < 128, so each is a one-byte ULEB128. */
 static void create_arm_attribute_section(TCCState *s1)
 {
-  // Needed for DLL support.
-  static const unsigned char arm_attr[] = {
-      0x41,                               // 'A'
-      0x2c, 0x00, 0x00, 0x00,             // size 0x2c
-      'a',  'e',  'a',  'b',  'i',  0x00, // "aeabi"
-      0x01, 0x22, 0x00, 0x00, 0x00,       // 'File Attributes', size 0x22
-      0x05, 0x36, 0x00,                   // 'CPU_name', "6"
-      0x06, 0x06,                         // 'CPU_arch', 'v6'
-      0x08, 0x01,                         // 'ARM_ISA_use', 'Yes'
-      0x09, 0x01,                         // 'THUMB_ISA_use', 'Thumb-1'
-      0x0a, 0x02,                         // 'FP_arch', 'VFPv2'
-      0x12, 0x04,                         // 'ABI_PCS_wchar_t', 4
-      0x14, 0x01,                         // 'ABI_FP_denormal', 'Needed'
-      0x15, 0x01,                         // 'ABI_FP_exceptions', 'Needed'
-      0x17, 0x03,                         // 'ABI_FP_number_model', 'IEEE 754'
-      0x18, 0x01,                         // 'ABI_align_needed', '8-byte'
-      0x19, 0x01,                         // 'ABI_align_preserved', '8-byte, except leaf SP'
-      0x1a, 0x02,                         // 'ABI_enum_size', 'int'
-      0x1c, 0x01,                         // 'ABI_VFP_args', 'VFP registers'
-      0x22, 0x01                          // 'CPU_unaligned_access', 'v6'
-  };
-  Section *attr = new_section(s1, ".ARM.attributes", SHT_ARM_ATTRIBUTES, 0);
-  unsigned char *ptr = section_ptr_add(attr, sizeof(arm_attr));
-  attr->sh_addralign = 1;
-  memcpy(ptr, arm_attr, sizeof(arm_attr));
-  if (s1->float_abi != ARM_HARD_FLOAT)
+  ArmEabiAttrs a;
+  arm_get_eabi_attrs(s1, &a);
+
+  unsigned char body[96];
+  int n = 0;
+
+  body[n++] = 5; /* Tag_CPU_name (NUL-terminated string) */
+  for (const char *p = a.cpu_name; *p; p++)
+    body[n++] = (unsigned char)*p;
+  body[n++] = 0;
+  body[n++] = 6;
+  body[n++] = (unsigned char)a.cpu_arch; /* Tag_CPU_arch */
+  body[n++] = 7;
+  body[n++] = 'M'; /* Tag_CPU_arch_profile: Microcontroller */
+  body[n++] = 9;
+  body[n++] = 3; /* Tag_THUMB_ISA_use: Yes.  No Tag_ARM_ISA_use:
+                  * M-profile has no ARM instruction set. */
+  if (a.fp_arch)
   {
-    ptr[26] = 0x00; // 'FP_arch', 'No'
-    ptr[41] = 0x1e; // 'ABI_optimization_goals'
-    ptr[42] = 0x06; // 'Aggressive Debug'
+    body[n++] = 10;
+    body[n++] = (unsigned char)a.fp_arch; /* Tag_FP_arch */
   }
+  body[n++] = 18;
+  body[n++] = 4; /* Tag_ABI_PCS_wchar_t: 4 */
+  body[n++] = 20;
+  body[n++] = 1; /* Tag_ABI_FP_denormal: Needed */
+  body[n++] = 21;
+  body[n++] = 1; /* Tag_ABI_FP_exceptions: Needed */
+  body[n++] = 23;
+  body[n++] = 3; /* Tag_ABI_FP_number_model: IEEE 754 */
+  body[n++] = 24;
+  body[n++] = 1; /* Tag_ABI_align_needed: 8-byte */
+  body[n++] = 25;
+  body[n++] = 1; /* Tag_ABI_align_preserved: 8-byte, except leaf SP */
+  body[n++] = 26;
+  body[n++] = 2; /* Tag_ABI_enum_size: int (arm-none-eabi-gcc defaults to
+                  * 'small' instead — a deliberate, declared difference). */
+  if (a.hardfp_use)
+  {
+    body[n++] = 27;
+    body[n++] = (unsigned char)a.hardfp_use; /* Tag_ABI_HardFP_use */
+  }
+  if (a.vfp_args)
+  {
+    body[n++] = 28;
+    body[n++] = (unsigned char)a.vfp_args; /* Tag_ABI_VFP_args */
+  }
+  body[n++] = 30;
+  body[n++] = 6; /* Tag_ABI_optimization_goals: Aggressive Debug */
+  body[n++] = 34;
+  body[n++] = 1; /* Tag_CPU_unaligned_access: v6 */
+
+  const int sub_len = 1 + 4 + n;
+  const int vendor_len = 4 + 6 + sub_len;
+
+  Section *attr = new_section(s1, ".ARM.attributes", SHT_ARM_ATTRIBUTES, 0);
+  attr->sh_addralign = 1;
+  unsigned char *ptr = section_ptr_add(attr, 1 + vendor_len);
+  int o = 0;
+  ptr[o++] = 'A';
+  write32le(ptr + o, vendor_len);
+  o += 4;
+  memcpy(ptr + o, "aeabi", 6);
+  o += 6;
+  ptr[o++] = 1; /* Tag_File */
+  write32le(ptr + o, sub_len);
+  o += 4;
+  memcpy(ptr + o, body, n);
 }
 #endif
 
