@@ -236,6 +236,9 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
             arg_descs[param_idx].alignment = 4;
           }
 
+          arg_descs[param_idx].is_float =
+              (src1_irop.btype == IROP_BTYPE_FLOAT32 || src1_irop.btype == IROP_BTYPE_FLOAT64);
+
           found[param_idx] = 1;
           found_count++;
         }

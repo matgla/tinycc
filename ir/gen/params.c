@@ -24,6 +24,12 @@ void tcc_ir_params_add(TCCIRState *ir, CType *func_type)
   /* Initialize layout for argument classification */
   memset(&call_layout, 0, sizeof(call_layout));
 
+  /* Hard-float: a non-variadic function receives its float parameters in VFP
+   * registers (s0..s15), matching the caller's placement.  A variadic function
+   * uses the base (GPR) standard for every parameter. */
+  call_layout.hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT);
+  call_layout.is_variadic = variadic;
+
   /* Set up local variable area - variadic functions need extra space */
   loc = variadic ? -28 : 0;
   func_vc = 0;
@@ -149,6 +155,8 @@ void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAb
     desc.size = 4;
     desc.alignment = (uint8_t)align;
   }
+
+  desc.is_float = is_float(type->t) ? 1 : 0;
 
   TCCAbiArgLoc loc_info = tcc_abi_classify_argument(call_layout, arg_index, &desc);
   tcc_ir_params_update_tracking(ir, loc_info, call_layout);
@@ -409,10 +417,13 @@ void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiA
   if (sym->a.param_volatile)
     pushed_type.t |= VT_VOLATILE;
 
-  if (loc_info->kind == TCC_ABI_LOC_REG)
+  if (loc_info->kind == TCC_ABI_LOC_REG || loc_info->kind == TCC_ABI_LOC_VFP_REG)
   {
+    /* Register-resident parameter (GPR or, for hard-float floats, a VFP
+     * register).  VFP passing only happens for non-variadic functions, so the
+     * variadic stack-slot handling never applies to TCC_ABI_LOC_VFP_REG. */
     flags = VT_PARAM | VT_LVAL;
-    if (variadic)
+    if (variadic && loc_info->kind == TCC_ABI_LOC_REG)
     {
       addr = -16 + (loc_info->reg_base * 4);
       flags |= VT_LOCAL;

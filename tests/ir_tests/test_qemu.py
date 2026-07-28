@@ -1450,6 +1450,41 @@ def test_qemu_execution(test_file, expected_exit_code, timeout, opt_level, tmp_p
     _run_qemu_test(test_file, expected_exit_code, defines=defines, opt_level=opt_level, output_dir=tmp_path, timeout=timeout)
 
 
+# Hard-float (-mfloat-abi=hard) execution gate.  Compiles with the VFP
+# single-precision register class (MACH_OP_VFP_REG) across all opt levels and
+# checks the numeric result via exit code.  fp_hard_mixed_exec.c covers mixed
+# int+float parameter passing, which used to miscompile (the VFP≡GPR aliasing —
+# see docs/plan_vfp_hard_float.md) and is now correct.
+HARD_FLOAT_TEST_FILES = [
+    ("fp_hard_sp_exec.c", 1),
+    ("fp_hard_mixed_exec.c", 1),
+    ("fp_hard_mem_exec.c", 1),
+    ("fp_hard_call_exec.c", 1),
+    ("fp_hard_loop_exec.c", 1),
+    ("fp_hard_absplit_exec.c", 1),
+]
+HARD_FLOAT_CFLAGS = "-mfloat-abi=hard -mfpu=fpv5-sp-d16"
+
+
+def _generate_hard_float_params():
+    params = []
+    ids = []
+    for test_file, expected in HARD_FLOAT_TEST_FILES:
+        for opt in OPT_LEVELS:
+            params.append((test_file, expected, opt))
+            ids.append(f"{_test_id(test_file)}_hard{opt}")
+    return params, ids
+
+
+_HARD_FLOAT_PARAMS, _HARD_FLOAT_IDS = _generate_hard_float_params()
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _HARD_FLOAT_PARAMS, ids=_HARD_FLOAT_IDS)
+def test_hard_float_execution(test_file, expected_exit_code, opt_level, tmp_path):
+    cflags = f"{opt_level} {HARD_FLOAT_CFLAGS}"
+    _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
+
+
 # Nested function xfail tests (not yet implemented)
 def _generate_nested_xfail_params():
     params = []

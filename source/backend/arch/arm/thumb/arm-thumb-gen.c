@@ -114,6 +114,9 @@ ST_FUNC int tcc_gen_machine_abi_assign_call_args(const TCCAbiArgDesc *args, int 
   call_layout.next_reg = 0;       /* ARM AAPCS: start with R0 */
   call_layout.next_stack_off = 0; /* start at stack base */
   call_layout.stack_align = 8;    /* ARM requires 8-byte SP alignment */
+  call_layout.next_vfp_reg = 0;   /* AAPCS VFP: start with s0 */
+  call_layout.hard_float = out_layout->hard_float;
+  call_layout.is_variadic = out_layout->is_variadic;
 
   for (int i = 0; i < argc; ++i)
   {
@@ -439,6 +442,17 @@ typedef struct MachineCodegenContext
 static int g_insn_scratch_allocs = 0;     /* total scratch allocs this instruction */
 static uint16_t g_insn_scratch_saves = 0; /* registers that required PUSH this instruction */
 
+/* --- Hard-float single-precision VFP support ---
+ * Float operands reach codegen as MACH_OP_VFP_REG (u.reg.r0 = s-register 0-31),
+ * a distinct kind from GPR MACH_OP_REG.  s14/s15 are held out of the allocator
+ * (arm_init) as fixed VFP scratch so the FP emitters can shuttle GPR/imm/spill
+ * operands through the FPU without clobbering a live float.  is_vfp_reg tests a
+ * raw allocation register number (LS_VFP_REG_BASE + n) as written by the RA. */
+#define VFP_SCRATCH0 14
+#define VFP_SCRATCH1 15
+static inline int is_vfp_reg(int r) { return LS_IS_VFP_REG(r); }
+static inline int vfp_num(int r) { return LS_VFP_REG_NUM(r); }
+
 
 /* Allocate a scratch register for the current instruction.
  * excl: bitmask of registers that must not be chosen.
@@ -520,6 +534,14 @@ static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *
     {
       int r = mach_alloc_scratch(ctx, excl);
       tcc_machine_load_constant(r, PREG_REG_NONE, 0, 0, NULL);
+      return r;
+    }
+
+  case MACH_OP_VFP_REG:
+    /* Bridge a single-precision VFP register into a GPR for GPR-path consumers. */
+    {
+      int r = mach_alloc_scratch(ctx, excl);
+      ot_check(th_vmov_gp_sp((uint16_t)r, (uint16_t)op->u.reg.r0, 1)); /* r = sN */
       return r;
     }
 
@@ -667,11 +689,13 @@ static int mach_get_dest_reg(MachineCodegenContext *ctx, const MachineOperand *o
     /* No pre-allocated register or store-through-pointer: need scratch. */
     return mach_alloc_scratch(ctx, excl);
 
+  case MACH_OP_VFP_REG:
   case MACH_OP_SPILL:
   case MACH_OP_FRAME_ADDR:
   case MACH_OP_PARAM_STACK:
   case MACH_OP_CHAIN_REL:
   case MACH_OP_SYMBOL:
+    /* VFP dest: compute in a GPR scratch; mach_writeback_dest bridges it to sN. */
     return mach_alloc_scratch(ctx, excl);
 
   default:
@@ -691,6 +715,10 @@ static void mach_writeback_dest(const MachineOperand *op, int reg)
 
   switch (op->kind)
   {
+  case MACH_OP_VFP_REG:
+    ot_check(th_vmov_gp_sp((uint16_t)reg, (uint16_t)op->u.reg.r0, 0)); /* sN = reg */
+    break;
+
   case MACH_OP_REG:
     if (!op->needs_deref)
     {
@@ -2658,6 +2686,10 @@ ST_FUNC void arm_init(struct TCCState *s)
   {
     s->float_registers_for_allocator = architecture_config.fpu->reg_count;
     s->float_registers_map_for_allocator = (1ull << ((uint64_t)s->float_registers_for_allocator)) - 1;
+    /* Hold s14/s15 out of the allocator: the single-precision FP emitters use
+     * them as fixed VFP scratch (VFP_SCRATCH0/1) to shuttle GPR/imm/spill
+     * operands through the FPU without clobbering a live float. */
+    s->float_registers_map_for_allocator &= ~((1ull << VFP_SCRATCH0) | (1ull << VFP_SCRATCH1));
   }
   else
   {
@@ -7547,6 +7579,31 @@ ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest,
     return;
   }
 
+  /* Single-precision float in a VFP register (hard-float): vmov between s-regs,
+   * or bridge through a GPR for the GPR/imm/spill/memory endpoint. */
+  if (src.kind == MACH_OP_VFP_REG || dest.kind == MACH_OP_VFP_REG)
+  {
+    if (src.kind == MACH_OP_VFP_REG && dest.kind == MACH_OP_VFP_REG)
+    {
+      if (src.u.reg.r0 != dest.u.reg.r0)
+        ot_check(th_vmov_register((uint16_t)dest.u.reg.r0, (uint16_t)src.u.reg.r0, 0));
+      return;
+    }
+    MachineCodegenContext vctx = {0};
+    if (dest.kind == MACH_OP_VFP_REG)
+    {
+      int gpr = mach_ensure_in_reg(&vctx, &src, 0); /* GPR/imm/spill/... -> GPR */
+      ot_check(th_vmov_gp_sp((uint16_t)gpr, (uint16_t)dest.u.reg.r0, 0)); /* sN = gpr */
+    }
+    else
+    {
+      int gpr = mach_ensure_in_reg(&vctx, &src, 0); /* VFP src bridges to a GPR */
+      mach_writeback_dest(&dest, gpr);
+    }
+    mach_release_all(&vctx);
+    return;
+  }
+
   MachineCodegenContext mctx = {0};
 
   /* --- Fast path: source is already in a register (no dereference) ---
@@ -7891,6 +7948,15 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
   MachineCodegenContext ctx = {0};
   (void)op;
 
+  /* A load whose source is a VFP register is a read out of that s-register (a
+   * register-promoted float), not a memory load — delegate to the VFP-aware
+   * assign path, which handles every destination kind. */
+  if (src.kind == MACH_OP_VFP_REG)
+  {
+    tcc_gen_machine_assign_mop(src, dest, TCCIR_OP_ASSIGN);
+    return;
+  }
+
   /* Determine dest register — allocates scratch if dest is SPILL/PARAM_STACK. */
   const bool dest_is_simple_reg =
       (dest.kind == MACH_OP_REG && !dest.needs_deref && dest.u.reg.r0 != (int)PREG_REG_NONE);
@@ -8109,6 +8175,15 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
 {
   MachineCodegenContext ctx = {0};
   (void)op;
+
+  /* A store whose destination is a VFP register is a write into that s-register
+   * (a register-promoted float), not a memory store — delegate to the VFP-aware
+   * assign path. */
+  if (dest.kind == MACH_OP_VFP_REG)
+  {
+    tcc_gen_machine_assign_mop(src, dest, TCCIR_OP_ASSIGN);
+    return;
+  }
 
   /* 128-bit complex double store: emit four 32-bit stores for real lo/hi + imag lo/hi.
    * Complex double values are 16 bytes: real (8 bytes) at base, imag (8 bytes) at base+8.
@@ -9020,6 +9095,9 @@ static void fp_mop_load_arg(int target_reg, const MachineOperand *op)
   {
   case MACH_OP_NONE:
     return;
+  case MACH_OP_VFP_REG:
+    ot_check(th_vmov_gp_sp((uint16_t)target_reg, (uint16_t)op->u.reg.r0, 1)); /* target = sN */
+    return;
   case MACH_OP_REG:
     if (!op->needs_deref)
     {
@@ -9540,9 +9618,50 @@ static void thumb_emit_dcp_addsub_mop(MachineOperand src1, MachineOperand src2, 
  * The values move through GPRs on both sides, so nothing here depends on the
  * float ABI and fast-mode objects stay link-compatible with portable ones.
  */
+/* Get a float operand into a single-precision register: use it directly when it
+ * already lives in one (MACH_OP_VFP_REG), else materialize it through a GPR into
+ * the caller-provided scratch s-register. */
+static int vfp_operand_to_sreg(MachineCodegenContext *ctx, const MachineOperand *op, int scratch_s)
+{
+  if (op->kind == MACH_OP_VFP_REG)
+    return op->u.reg.r0;
+  int gpr = mach_ensure_in_reg(ctx, op, 0);
+  ot_check(th_vmov_gp_sp((uint16_t)gpr, (uint16_t)scratch_s, 0)); /* scratch_s = gpr */
+  return scratch_s;
+}
+
 static void thumb_emit_vfp_arith_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op)
 {
   MachineCodegenContext ctx = {0};
+
+  /* Hard-float: operate on real single-precision registers.  VFP-resident
+   * operands/dest are used directly (v<op>.f32 sd, sn, sm); GPR/imm/spill
+   * endpoints are materialized through the reserved s14/s15 scratch. */
+  if (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT)
+  {
+    int sn = vfp_operand_to_sreg(&ctx, &src1, VFP_SCRATCH0);
+    int sm = vfp_operand_to_sreg(&ctx, &src2, VFP_SCRATCH1);
+    int sd = (dest.kind == MACH_OP_VFP_REG) ? dest.u.reg.r0 : VFP_SCRATCH0;
+    switch (op)
+    {
+    case TCCIR_OP_FADD: ot_check(th_vadd_f((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 0)); break;
+    case TCCIR_OP_FSUB: ot_check(th_vsub_f((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 0)); break;
+    case TCCIR_OP_FMUL: ot_check(th_vmul_f((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 0)); break;
+    case TCCIR_OP_FDIV: ot_check(th_vdiv_f((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 0)); break;
+    default: tcc_error("compiler_error: thumb_emit_vfp_arith_mop: unhandled op %d", (int)op); break;
+    }
+    if (dest.kind != MACH_OP_VFP_REG)
+    {
+      int rd = mach_get_dest_reg(&ctx, &dest, 0);
+      ot_check(th_vmov_gp_sp((uint16_t)rd, (uint16_t)sd, 1)); /* rd = sd */
+      mach_writeback_dest(&dest, rd);
+    }
+    mach_release_all(&ctx);
+    return;
+  }
+
+  /* Softfp: no float ever lives in a VFP register, so s0/s1 are free fixed
+   * scratch.  Values move through GPRs on both sides — kept byte-identical. */
   int rd = mach_get_dest_reg(&ctx, &dest, 0);
   uint32_t excl = (1u << (uint32_t)rd);
   int rn = mach_ensure_in_reg(&ctx, &src1, excl);
@@ -10227,6 +10346,24 @@ ST_FUNC void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op)
 {
   (void)op;
 
+  /* Hard-float single-precision return: the value goes in s0 (AAPCS VFP). */
+  if (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && !src.is_64bit && src.btype == IROP_BTYPE_FLOAT32)
+  {
+    if (src.kind == MACH_OP_VFP_REG)
+    {
+      if (src.u.reg.r0 != 0)
+        ot_check(th_vmov_register(0, (uint16_t)src.u.reg.r0, 0)); /* s0 = s_src */
+    }
+    else
+    {
+      MachineCodegenContext ctx = {0};
+      int r = mach_ensure_in_reg(&ctx, &src, 0);
+      ot_check(th_vmov_gp_sp((uint16_t)r, 0, 0)); /* s0 = r */
+      mach_release_all(&ctx);
+    }
+    return;
+  }
+
   /* 64-bit return: lo word → R0 (REG_IRET), hi word → R1 (REG_IRE2).
    * AAPCS guarantees that for a 64-bit pair src.u.reg.r1 = src.u.reg.r0 + 1 ≥ R1,
    * so hi is never in R0.  Moving lo→R0 first is always safe.
@@ -10646,6 +10783,16 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       {
         /* Adjust for callee-saved gap below FP in two-phase push. */
         const int stack_offset = fp_adjust_local_offset(interval->allocation.offset, 0);
+        /* Float param arriving in a VFP register but spilled to the stack:
+         * bridge it through a GPR scratch to reuse the ordinary store. */
+        if (is_vfp_reg(incoming_r0))
+        {
+          ScratchRegAlloc sc = get_scratch_reg_with_save(incoming_arg_regs_mask);
+          ot_check(th_vmov_gp_sp((uint16_t)sc.reg, (uint16_t)vfp_num(incoming_r0), 1)); /* gpr = s_incoming */
+          tcc_gen_machine_store_to_stack_ex(sc.reg, stack_offset, incoming_arg_regs_mask);
+          restore_scratch_reg(&sc);
+          continue;
+        }
         if (is_64bit && incoming_r1 >= 0)
         {
           tcc_gen_machine_store_to_stack_ex(incoming_r0, stack_offset, incoming_arg_regs_mask);
@@ -10671,6 +10818,24 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
        * subsequent spill-store for another parameter could use it as scratch
        * and destroy the value before the parallel move consumes it.
        */
+      if (alloc_r0 != PREG_NONE && is_vfp_reg(alloc_r0))
+      {
+        /* Float parameter homed to a VFP register.  It arrives either in a VFP
+         * register (hard-float argument passing) or in a GPR (soft layout);
+         * either way move it into its VFP home now, while the incoming register
+         * is still live.  VFP destinations never participate in the GPR parallel
+         * move (different register file), so emitting here is safe. */
+        if (is_vfp_reg(incoming_r0))
+        {
+          if (incoming_r0 != alloc_r0)
+            ot_check(th_vmov_register((uint16_t)vfp_num(alloc_r0), (uint16_t)vfp_num(incoming_r0), 0));
+        }
+        else
+        {
+          ot_check(th_vmov_gp_sp((uint16_t)incoming_r0, (uint16_t)vfp_num(alloc_r0), 0));
+        }
+        continue;
+      }
       if (alloc_r0 != PREG_NONE && alloc_r0 >= 0 && alloc_r0 <= R12 && alloc_r0 != incoming_r0)
       {
         moves[move_count++] = (ParamMove){.dst = alloc_r0, .src = incoming_r0};
@@ -12316,6 +12481,80 @@ static int build_register_arg_moves(CallGenContext *ctx, ThumbArgMove *reg_moves
   return move_count;
 }
 
+/* Place hard-float single-precision arguments into their VFP argument registers
+ * (s0..s15).  Emitted AFTER the GPR argument moves so r0-r3 already hold their
+ * final values.  VFP-resident sources form a permutation among the s-registers,
+ * resolved as a parallel move with VFP_SCRATCH0 (s14) breaking any cycle; other
+ * sources (imm/memory) are materialized through a GPR scratch that excludes the
+ * GPR argument registers. */
+static void emit_vfp_arg_moves(CallGenContext *ctx)
+{
+  int dst[16], src[16];
+  const MachineOperand *mop[16];
+  int n = 0;
+  for (int i = 0; i < ctx->argc && n < 16; ++i)
+  {
+    const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
+    if (loc->kind != TCC_ABI_LOC_VFP_REG)
+      continue;
+    dst[n] = loc->reg_base;
+    const MachineOperand *m = &ctx->mops[i];
+    src[n] = (m->kind == MACH_OP_VFP_REG) ? m->u.reg.r0 : -1; /* -1 = materialize */
+    mop[n] = m;
+    n++;
+  }
+  if (n == 0)
+    return;
+
+  const uint32_t gpr_excl = (uint32_t)(ctx->call_site->registers_map & 0xffffu);
+  int remaining = n;
+  while (remaining > 0)
+  {
+    int progressed = 0;
+    for (int i = 0; i < n; ++i)
+    {
+      if (dst[i] < 0)
+        continue;
+      /* Safe to emit when this destination is not still needed as a source. */
+      int needed = 0;
+      for (int j = 0; j < n; ++j)
+        if (dst[j] >= 0 && j != i && src[j] == dst[i])
+        {
+          needed = 1;
+          break;
+        }
+      if (needed)
+        continue;
+      if (src[i] >= 0)
+      {
+        if (src[i] != dst[i])
+          ot_check(th_vmov_register((uint16_t)dst[i], (uint16_t)src[i], 0)); /* vmov.f32 sd, ss */
+      }
+      else
+      {
+        MachineCodegenContext mctx = {0};
+        int gpr = mach_ensure_in_reg(&mctx, mop[i], gpr_excl);
+        ot_check(th_vmov_gp_sp((uint16_t)gpr, (uint16_t)dst[i], 0)); /* sd = gpr */
+        mach_release_all(&mctx);
+      }
+      dst[i] = -1;
+      remaining--;
+      progressed = 1;
+    }
+    if (!progressed)
+    {
+      /* Only cycles of VFP-resident moves remain: park one source in s14. */
+      for (int i = 0; i < n; ++i)
+        if (dst[i] >= 0 && src[i] >= 0)
+        {
+          ot_check(th_vmov_register(VFP_SCRATCH0, (uint16_t)src[i], 0));
+          src[i] = VFP_SCRATCH0;
+          break;
+        }
+    }
+  }
+}
+
 /* Pre-save stack arguments that source from R0-R3 before register shuffle */
 static void presave_stack_args_from_arg_regs(CallGenContext *ctx)
 {
@@ -12325,7 +12564,7 @@ static void presave_stack_args_from_arg_regs(CallGenContext *ctx)
     const MachineOperand *mop = &ctx->mops[i];
     const int bt = mop->btype;
 
-    if (loc->kind == TCC_ABI_LOC_REG)
+    if (loc->kind == TCC_ABI_LOC_REG || loc->kind == TCC_ABI_LOC_VFP_REG)
       continue;
     if (bt == IROP_BTYPE_STRUCT || mop->is_complex)
       continue;
@@ -12362,8 +12601,8 @@ static void presave_stack_args_from_arg_regs(CallGenContext *ctx)
 /* True for a plain 32-bit immediate argument destined for a stack slot. */
 static int is_simple_imm_stack_arg(const TCCAbiArgLoc *loc, const MachineOperand *mop)
 {
-  return loc->kind != TCC_ABI_LOC_REG && mop->kind == MACH_OP_IMM && !mop->is_64bit &&
-         mop->btype != IROP_BTYPE_STRUCT && !mop->is_complex;
+  return loc->kind != TCC_ABI_LOC_REG && loc->kind != TCC_ABI_LOC_VFP_REG && mop->kind == MACH_OP_IMM &&
+         !mop->is_64bit && mop->btype != IROP_BTYPE_STRUCT && !mop->is_complex;
 }
 
 /* One collected immediate stack store, for the grouped/windowed emission path. */
@@ -12463,7 +12702,7 @@ static void place_stack_arguments_inline(CallGenContext *ctx)
     const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
     const MachineOperand *mop = &ctx->mops[i];
 
-    if (loc->kind == TCC_ABI_LOC_REG)
+    if (loc->kind == TCC_ABI_LOC_REG || loc->kind == TCC_ABI_LOC_VFP_REG)
       continue;
 
     int stack_offset = loc->stack_off;
@@ -12528,7 +12767,7 @@ static void place_stack_arguments(CallGenContext *ctx)
   {
     const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
     const MachineOperand *mop = &ctx->mops[i];
-    if (loc->kind == TCC_ABI_LOC_REG || is_simple_imm_stack_arg(loc, mop))
+    if (loc->kind == TCC_ABI_LOC_REG || loc->kind == TCC_ABI_LOC_VFP_REG || is_simple_imm_stack_arg(loc, mop))
       continue;
     place_one_stack_arg(ctx, loc, mop, loc->stack_off, i);
   }
@@ -12654,10 +12893,56 @@ static void place_stack_arguments(CallGenContext *ctx)
  *   MACH_OP_NONE  — no-op (void return or drop_value)
  * 64-bit pairs (int64, double, complex float) are split into lo/hi halves
  * via mach_make_lo_half / mach_make_hi_half (R0 → lo, R1 → hi). */
-static void handle_return_value_mop(const MachineOperand *dest_mop, int drop_value)
+/* True when a call targets a soft-float __aeabi_* runtime helper, which returns
+ * a float in R0 (soft ABI) even under hard-float — as opposed to a user
+ * function, which returns it in s0.  The __aeabi_ namespace is reserved, so the
+ * name is an unambiguous signal. */
+static int mach_callee_is_aeabi(const MachineOperand *func_mop)
+{
+  if (func_mop->kind != MACH_OP_SYMBOL || !func_mop->u.sym.sym)
+    return 0;
+  const char *name = get_tok_str(func_mop->u.sym.sym->v, NULL);
+  return name && strncmp(name, "__aeabi_", 8) == 0;
+}
+
+/* True when the callee is a variadic (FUNC_ELLIPSIS) function.  Such a callee
+ * receives every argument by the base (GPR) standard, so FP arguments are not
+ * placed in VFP registers.  Indirect calls (no symbol) are assumed non-variadic
+ * — function pointers to variadic functions are rare. */
+static int mach_callee_is_variadic(const MachineOperand *func_mop)
+{
+  if (func_mop->kind != MACH_OP_SYMBOL || !func_mop->u.sym.sym)
+    return 0;
+  Sym *s = func_mop->u.sym.sym;
+  return s->type.ref && s->type.ref->f.func_type == FUNC_ELLIPSIS;
+}
+
+static void handle_return_value_mop(const MachineOperand *dest_mop, int drop_value, int soft_float_return)
 {
   if (drop_value)
     return;
+
+  /* Hard-float single-precision return arrives in s0 (AAPCS VFP) — unless the
+   * callee is a soft __aeabi_* helper, which returns it in R0. */
+  if (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && !soft_float_return && !dest_mop->is_64bit &&
+      dest_mop->btype == IROP_BTYPE_FLOAT32)
+  {
+    if (dest_mop->kind == MACH_OP_VFP_REG)
+    {
+      if (dest_mop->u.reg.r0 != 0)
+        ot_check(th_vmov_register((uint16_t)dest_mop->u.reg.r0, 0, 0)); /* s_dest = s0 */
+    }
+    else
+    {
+      MachineCodegenContext ctx = {0};
+      int r = mach_get_dest_reg(&ctx, dest_mop, 0);
+      ot_check(th_vmov_gp_sp((uint16_t)r, 0, 1)); /* r = s0 */
+      mach_writeback_dest(dest_mop, r);
+      mach_release_all(&ctx);
+    }
+    return;
+  }
+
   if (dest_mop->is_64bit)
   {
     /* 64-bit return value: R0 = low word, R1 = high word (AAPCS). */
@@ -12699,6 +12984,13 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   /* === Build ABI layout === */
   TCCAbiCallLayout layout;
   memset(&layout, 0, sizeof(layout));
+
+  /* Hard-float VFP argument passing applies to non-variadic user functions.
+   * Soft __aeabi_* helpers take their float arguments in GPRs regardless, and a
+   * variadic callee passes every argument by the base (GPR) standard. */
+  layout.hard_float =
+      (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT) && !mach_callee_is_aeabi(&func_mop);
+  layout.is_variadic = mach_callee_is_variadic(&func_mop);
 
   small_sequence(ThumbIROperandSequence) args_owner = {0};
   small_sequence(ThumbMachineOperandSequence) mops_owner = {0};
@@ -12864,6 +13156,7 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   /* === Now block all R0-R3 and emit register argument moves === */
   scratch_global_exclude |= 0x0F;
   thumb_emit_parallel_arg_moves(reg_moves, reg_move_count);
+  emit_vfp_arg_moves(&ctx);
 
   /* === Tail call: tear down frame before branching === */
   if (tail_call_pending)
@@ -12903,7 +13196,7 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     goto call_cleanup;
   }
 
-  handle_return_value_mop(&dest_mop, drop_value);
+  handle_return_value_mop(&dest_mop, drop_value, mach_callee_is_aeabi(&func_mop));
 
   /* === Cleanup: restore nested-call saved registers via LDR === */
   if (arg_regs_save_mask)

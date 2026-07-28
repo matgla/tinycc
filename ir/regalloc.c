@@ -70,6 +70,7 @@ typedef struct SSAInterval {
   int8_t r1;
   int32_t stack_location;
   uint8_t crosses_call : 1;
+  uint8_t crosses_real_call : 1; /* crosses a real FUNCCALL (VFP caller-saved clobber) — excludes native FP-op implicit calls */
   uint8_t addrtaken : 1;
   uint8_t is_volatile : 1; /* volatile-qualified local: force to a stack slot so every access is a real ldr/str */
   uint8_t is_param : 1;
@@ -123,6 +124,32 @@ static int *ra_build_call_prefix(TCCIRState *ir)
     /* A large BLOCK_COPY lowers to a memcpy() call in the backend, clobbering
      * the caller-saved registers.  The inline (small) lowering saves/restores
      * everything it touches, so only the memcpy-sized copies count as calls. */
+    if (!is_call && op == TCCIR_OP_BLOCK_COPY) {
+      int bc_size = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      if (bc_size >= TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES)
+        is_call = 1;
+    }
+    prefix[i + 1] = prefix[i] + is_call;
+  }
+  return prefix;
+}
+
+/* Prefix of REAL calls only — user function calls, __aeabi helpers (all
+ * FUNCCALLVAL/VOID), BUILTIN_APPLY, and memcpy-sized block copies.  Unlike
+ * ra_build_call_prefix it excludes native FP-op implicit "calls" (a single-
+ * precision vadd.f32 clobbers nothing), so it answers "does this value cross a
+ * call that clobbers the caller-saved VFP registers?". */
+static int *ra_build_real_call_prefix(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n <= 0)
+    return NULL;
+  int *prefix = tcc_malloc(sizeof(int) * (n + 1));
+  prefix[0] = 0;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    TccIrOp op = q->op;
+    int is_call = (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_BUILTIN_APPLY);
     if (!is_call && op == TCCIR_OP_BLOCK_COPY) {
       int bc_size = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
       if (bc_size >= TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES)
@@ -216,6 +243,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   /* SWITCH_TABLE/SWITCH_LOAD dispatch clobbers R_IP (R12); see
    * ra_has_switch_in_range below. */
   int *switch_prefix = ra_build_switch_prefix(ir);
+  int *real_call_prefix = ra_build_real_call_prefix(ir);
 
   /* Allocate per-vreg start/end tracking indexed by encoded vreg.
    * Use flat arrays indexed by (type * max_pos + position). */
@@ -913,6 +941,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
        * stays 0 (lets the allocator place it in a caller-saved arg reg).
        * For other vregs whose end lands at a call (e.g., the function
        * pointer of an indirect call), keep the conservative crosses_call=1. */
+      iv->crosses_real_call = ra_has_call_in_range(real_call_prefix, iv->start, iv->end, n) ? 1 : 0;
       if (!iv->crosses_call) {
         iv->crosses_call = ra_has_call_in_range(call_prefix, iv->start, iv->end, n);
         if (!iv->crosses_call && iv->end < (uint32_t)n) {
@@ -945,8 +974,17 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
        * onto a different register and emit a redundant mov to r0. */
       if (type == TCCIR_VREG_TYPE_PARAM) {
         iv->start = 0;
-        if (pos < 4 && !iv->crosses_call && li->incoming_reg0 >= 0)
-          iv->precolored = li->incoming_reg0;
+        if (!iv->crosses_call && li->incoming_reg0 >= 0) {
+          /* GPR params: up to 4 argument registers (r0-r3).  Hard-float float
+           * params arrive in VFP argument registers (s0-s15) — precolor those
+           * too so they land in their incoming register. */
+          if (LS_IS_VFP_REG(li->incoming_reg0)) {
+            if (LS_VFP_REG_NUM(li->incoming_reg0) < 16)
+              iv->precolored = li->incoming_reg0;
+          } else if (pos < 4) {
+            iv->precolored = li->incoming_reg0;
+          }
+        }
       } else if (li->incoming_reg0 >= 0 && iv->reg_type == LS_REG_TYPE_INT) {
         /* Non-PARAM with incoming_reg0 hint (set by setup_returnvalue_hint
          * in codegen): use as a soft preference. The linear scan will try
@@ -983,6 +1021,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   if (out_max_vreg_pos)
     *out_max_vreg_pos = max_vreg_pos;
   if (switch_prefix) tcc_free(switch_prefix);
+  if (real_call_prefix) tcc_free(real_call_prefix);
   #undef VREG_IDX
 }
 
@@ -1835,8 +1874,14 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
     if (cur->precolored >= 0) {
       int reg = cur->precolored;
       cur->r0 = reg;
-      int_free &= ~(1ull << reg);
-      dirty_int |= (1ull << reg);
+      if (LS_IS_VFP_REG(reg)) {
+        /* Hard-float float param precolored to its incoming VFP register. */
+        fp_free &= ~(1ull << (uint64_t)LS_VFP_REG_NUM(reg));
+        dirty_fp |= (1ull << (uint64_t)LS_VFP_REG_NUM(reg));
+      } else {
+        int_free &= ~(1ull << reg);
+        dirty_int |= (1ull << reg);
+      }
       /* Insert into active set */
       active[active_count++] = cur;
       continue;
@@ -1845,7 +1890,12 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
     /* Float/double: use FP class */
     if (cur->reg_type == LS_REG_TYPE_FLOAT) {
       int reg = -1;
-      if (fp_free) {
+      /* Every allocatable single-precision VFP register (s0-s13) is caller-saved
+       * and there are no callee-saved VFP registers in the allocation map, so a
+       * float that is live across a REAL call cannot stay in a VFP register —
+       * force it to a stack slot.  Native FP-op "implicit calls" (a single-
+       * precision vadd.f32) clobber nothing, so they do not force a spill. */
+      if (!cur->crosses_real_call && fp_free) {
         reg = __builtin_ctzll(fp_free);
         fp_free &= ~(1ull << reg);
         dirty_fp |= (1ull << reg);

@@ -342,8 +342,11 @@ int tcc_ir_vreg_type_get(TCCIRState *ir, int vreg)
       return interval->is_double ? LS_REG_TYPE_COMPLEX_DOUBLE : LS_REG_TYPE_COMPLEX_FLOAT;
     if (interval->is_float)
     {
+      /* Only single-precision floats occupy the VFP register class.  Doubles
+       * stay soft (GPR pairs + __aeabi_d*) even under hard-float — also required
+       * on fpv5-sp-d16, whose FPU has no double-precision unit. */
       if (interval->is_double)
-        return interval->use_vfp ? LS_REG_TYPE_DOUBLE : LS_REG_TYPE_DOUBLE_SOFT;
+        return LS_REG_TYPE_DOUBLE_SOFT;
       return interval->use_vfp ? LS_REG_TYPE_FLOAT : LS_REG_TYPE_INT;
     }
   }

@@ -132,6 +132,22 @@ static thumb_opcode vfp_pushpop_emit(uint32_t base, const thop_args *a)
   return (thumb_opcode){.size = 4, .opcode = op};
 }
 
+/* VLDR / VSTR single-register load/store (SP coproc 1010 / DP coproc 1011).
+ *   base carries the U=add bit set; a->imm2==0 selects a subtracted offset.
+ *   a->imm is the pre-scaled imm8 (byte offset / 4), a->rn the GPR base. */
+static thumb_opcode vfp_ldst_emit(uint32_t base, const thop_args *a)
+{
+  uint32_t D, Vd;
+  if (base & (1u << 8))
+    vfp_pack_dp(a->rd, &D, &Vd);
+  else
+    vfp_pack_sp(a->rd, &D, &Vd);
+  uint32_t op = base | (D << 22) | (a->rn << 16) | (Vd << 12) | (a->imm & 0xff);
+  if (a->imm2 == 0)
+    op &= ~(1u << 23);
+  return (thumb_opcode){.size = 4, .opcode = op};
+}
+
 /* VMOV between GPR and single-precision VFP register */
 static thumb_opcode vmov_gp_sp_emit(uint32_t base, const thop_args *a)
 {
@@ -303,6 +319,14 @@ TH_TABLE(TH_VPUSH_DP, "vpush.f64", {&SHAPE_VFP_SP, 0xed2d0b00, vfp_pushpop_emit}
 TH_TABLE(TH_VPOP_SP, "vpop.f32", {&SHAPE_VFP_SP, 0xecbd0a00, vfp_pushpop_emit});
 TH_TABLE(TH_VPOP_DP, "vpop.f64", {&SHAPE_VFP_SP, 0xecbd0b00, vfp_pushpop_emit});
 
+/* VLDR SP / DP */
+TH_TABLE(TH_VLDR_SP, "vldr.f32", {&SHAPE_VFP_SP, 0xed900a00, vfp_ldst_emit});
+TH_TABLE(TH_VLDR_DP, "vldr.f64", {&SHAPE_VFP_DP, 0xed900b00, vfp_ldst_emit});
+
+/* VSTR SP / DP */
+TH_TABLE(TH_VSTR_SP, "vstr.f32", {&SHAPE_VFP_SP, 0xed800a00, vfp_ldst_emit});
+TH_TABLE(TH_VSTR_DP, "vstr.f64", {&SHAPE_VFP_DP, 0xed800b00, vfp_ldst_emit});
+
 /* VMOV register SP / DP */
 TH_TABLE(TH_VMOV_REG_SP, "vmov.f32", {&SHAPE_VFP_SP, 0xeeb00a40, vmov_reg_emit});
 TH_TABLE(TH_VMOV_REG_DP, "vmov.f64", {&SHAPE_VFP_DP, 0xeeb00b40, vmov_reg_emit});
@@ -396,6 +420,28 @@ thumb_opcode th_vpop(uint32_t regs, uint32_t is_doubleword)
   if (is_doubleword == 0)
     return thop_emit(TH_VPOP_SP.name, TH_VPOP_SP.variants, TH_VPOP_SP.variant_count, (thop_args){.imm = regs});
   return thop_emit(TH_VPOP_DP.name, TH_VPOP_DP.variants, TH_VPOP_DP.variant_count, (thop_args){.imm = regs});
+}
+
+thumb_opcode th_vldr(uint32_t vd, uint32_t rn, int32_t offset, uint32_t is_double)
+{
+  uint32_t u = (offset >= 0) ? 1u : 0u;
+  uint32_t imm8 = ((uint32_t)(offset < 0 ? -offset : offset) >> 2) & 0xff;
+  if (is_double == 0)
+    return thop_emit(TH_VLDR_SP.name, TH_VLDR_SP.variants, TH_VLDR_SP.variant_count,
+                     (thop_args){.rd = vd, .rn = rn, .imm = imm8, .imm2 = u});
+  return thop_emit(TH_VLDR_DP.name, TH_VLDR_DP.variants, TH_VLDR_DP.variant_count,
+                   (thop_args){.rd = vd, .rn = rn, .imm = imm8, .imm2 = u});
+}
+
+thumb_opcode th_vstr(uint32_t vd, uint32_t rn, int32_t offset, uint32_t is_double)
+{
+  uint32_t u = (offset >= 0) ? 1u : 0u;
+  uint32_t imm8 = ((uint32_t)(offset < 0 ? -offset : offset) >> 2) & 0xff;
+  if (is_double == 0)
+    return thop_emit(TH_VSTR_SP.name, TH_VSTR_SP.variants, TH_VSTR_SP.variant_count,
+                     (thop_args){.rd = vd, .rn = rn, .imm = imm8, .imm2 = u});
+  return thop_emit(TH_VSTR_DP.name, TH_VSTR_DP.variants, TH_VSTR_DP.variant_count,
+                   (thop_args){.rd = vd, .rn = rn, .imm = imm8, .imm2 = u});
 }
 
 thumb_opcode th_vmov_register(uint16_t vd, uint16_t vm, uint32_t sz)

@@ -251,6 +251,13 @@ int ssa_opt_replace_all_uses(IRSSAOptCtx *ctx, int32_t old_vr, int32_t new_vr)
   return 0;
 }
 
+int ssa_opt_can_replace_all_uses(IRSSAOptCtx *ctx, int32_t old_vr)
+{
+  (void)ctx;
+  (void)old_vr;
+  return 0;
+}
+
 void ssa_drop_phi_edge(IRSSAOptCtx *ctx, int dead_pred_block, int target_block_idx)
 {
   (void)ctx;

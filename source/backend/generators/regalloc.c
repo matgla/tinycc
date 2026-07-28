@@ -45,6 +45,18 @@ extern void dbg_scan_overlap(TCCIRState *ir, const char *pass);
 /*  Analyze whether the function is a leaf / tail-call-only           */
 /* ================================================================== */
 
+/* True when a hard-float single-precision float value would be tail-returned.
+ * The tail callee may be a soft __aeabi_* helper (e.g. __aeabi_fneg / _i2f) that
+ * returns the float in R0, but our function must return it in s0 — so the call
+ * is kept non-tail and return_value_mop places the result in s0. */
+static int ir_tail_call_returns_hard_float(TCCIRState *ir, int call_idx)
+{
+  if (!tcc_state || tcc_state->float_abi != ARM_HARD_FLOAT)
+    return 0;
+  IROperand call_dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[call_idx]);
+  return irop_get_btype(call_dest) == IROP_BTYPE_FLOAT32;
+}
+
 /* True when the call at call_idx sits in tail position: the next non-NOP
  * instruction is RETURNVOID, or RETURNVALUE of the call's dest vreg, and only
  * NOPs follow.  Shared by the pre-SSA analysis and the post-opt re-check. */
@@ -135,7 +147,7 @@ void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
 
   if (call_count == 1 && !has_complex_fp && !func_var && !ir->has_static_chain && call_idx >= 0)
   {
-    if (ir_call_is_tail_positioned(ir, call_idx))
+    if (ir_call_is_tail_positioned(ir, call_idx) && !ir_tail_call_returns_hard_float(ir, call_idx))
     {
       ir->tail_call_only = 1;
       ir->leaffunc = 1;
@@ -820,7 +832,8 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
           has_complex_fp = 1;
       }
     }
-    if (call_count == 1 && !has_complex_fp && call_idx >= 0 && ir_call_is_tail_positioned(ir, call_idx))
+    if (call_count == 1 && !has_complex_fp && call_idx >= 0 && ir_call_is_tail_positioned(ir, call_idx) &&
+        !ir_tail_call_returns_hard_float(ir, call_idx))
     {
       ir->tail_call_only = 1;
       ir->leaffunc = 1;

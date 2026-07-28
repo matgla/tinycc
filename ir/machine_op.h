@@ -61,6 +61,9 @@ typedef enum
   MACH_OP_SYMBOL,      /* Symbol reference (global/extern/function) */
   MACH_OP_PARAM_STACK, /* Stack-passed parameter in caller's argument frame */
   MACH_OP_CHAIN_REL,   /* Captured variable: chain_index + FP-relative offset in parent */
+  MACH_OP_VFP_REG,     /* Value in a single-precision VFP register (hard-float);
+                        * u.reg.r0 holds the s-register number 0-31, a distinct
+                        * register file from the GPRs of MACH_OP_REG. */
 } MachineOperandKind;
 
 typedef struct MachineOperand

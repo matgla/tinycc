@@ -193,11 +193,25 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
    * stored to stack since r0-r3 are caller-saved.
    * In both cases, we need to track which register each parameter arrives in.
    */
-  int argno = 0; // current register number (r0-r3)
+  int argno = 0;     // current GPR argument register (r0-r3)
+  int vfp_argno = 0; // current VFP argument register (s0-s15, hard-float)
+  const int hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && !ir->is_variadic);
   for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
   {
     const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
     IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, encoded_vreg);
+
+    /* Hard-float: a single-precision float parameter arrives in a VFP register
+     * (s0..s15), consuming the independent VFP counter — not a GPR slot.  Marked
+     * with LS_VFP_REG_BASE so the prolog homes it from the right register file. */
+    if (hard_float && interval && interval->is_float && !interval->is_double &&
+        interval->incoming_reg0 < 0 && vfp_argno < 16)
+    {
+      interval->incoming_reg0 = LS_VFP_REG_BASE + vfp_argno;
+      interval->incoming_reg1 = -1;
+      vfp_argno++;
+      continue;
+    }
     /* is_double for soft-float (LS_REG_TYPE_DOUBLE_SOFT) or is_llong for 64-bit
      */
     int is_64bit = interval && (interval->is_double || interval->is_llong || interval->is_complex);
@@ -392,12 +406,26 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
 
   uint8_t *is_stack_passed = tcc_mallocz((size_t)param_count);
   int argno = 0;
+  int vfp_argno = 0;
+  const int hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && !ir->is_variadic);
   for (int vreg = 0; vreg < param_count; ++vreg)
   {
     const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
     IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, encoded_vreg);
     if (!interval)
       continue;
+
+    /* Hard-float: a single-precision float param consumes a VFP argument slot
+     * (s0..s15), not a GPR one — it is only stack-passed past s15.  Must mirror
+     * tcc_ir_register_allocation_params or in-register float params 5+ get
+     * their linear-scan allocation wrongly reset here. */
+    if (hard_float && interval->is_float && !interval->is_double)
+    {
+      if (vfp_argno >= 16)
+        is_stack_passed[vreg] = 1;
+      vfp_argno++;
+      continue;
+    }
 
     const int is_64bit = interval->is_double || interval->is_llong;
     if (is_64bit && (argno & 1))

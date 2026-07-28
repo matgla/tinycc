@@ -454,6 +454,119 @@ UT_TEST(test_th_vpop_dp)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  VLDR / VSTR (single-register load/store)  — encodings cross-checked
+ *  against arm-none-eabi-as -mfpu=fpv5-sp-d16 -mfloat-abi=hard.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+UT_TEST(test_th_vldr_sp_zero_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(0, 0, 0, 0); /* vldr s0, [r0] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED900A00);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_sp_pos_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(1, 3, 16, 0); /* vldr s1, [r3, #16] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xEDD30A04);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_sp_neg_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(2, 0, -8, 0); /* vldr s2, [r0, #-8] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED101A02);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_sp_high_reg)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(16, 0, 0, 0); /* vldr s16, [r0] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED908A00);
+  return 0;
+}
+
+UT_TEST(test_th_vstr_sp_zero_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vstr(0, 0, 0, 0); /* vstr s0, [r0] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED800A00);
+  return 0;
+}
+
+UT_TEST(test_th_vstr_sp_pos_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vstr(5, 2, 20, 0); /* vstr s5, [r2, #20] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xEDC22A05);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_dp_zero_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(0, 0, 0, 1); /* vldr d0, [r0] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED900B00);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_dp_pos_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(3, 1, 40, 1); /* vldr d3, [r1, #40] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED913B0A);
+  return 0;
+}
+
+UT_TEST(test_th_vstr_dp_zero_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vstr(0, 0, 0, 1); /* vstr d0, [r0] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED800B00);
+  return 0;
+}
+
+UT_TEST(test_th_vstr_dp_neg_offset_high_reg)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vstr(7, 4, -16, 1); /* vstr d7, [r4, #-16] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED047B04);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_sp_blocked_without_feat)
+{
+  setup_no_vfp_sp();
+  thumb_opcode op = th_vldr(0, 0, 0, 0);
+  UT_ASSERT_EQ(op.size, 0);
+  UT_ASSERT_EQ(op.opcode, 0);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_dp_blocked_without_feat)
+{
+  setup_no_vfp_dp();
+  thumb_opcode op = th_vldr(0, 0, 0, 1);
+  UT_ASSERT_EQ(op.size, 0);
+  UT_ASSERT_EQ(op.opcode, 0);
+  return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  Feature gates
  * ═══════════════════════════════════════════════════════════════════ */
 

@@ -8,19 +8,27 @@ What is missing is the **codegen path**: `tcc_gen_machine_fp_mop()` in `arm-thum
 
 The goal is to make `-mfloat-abi=hard` emit VFP instructions and use the VFP register bank for FP values, parameters, and return values, while keeping soft-float behavior unchanged.
 
+> **Note (2026-07-28):** the source tree was restructured — the backend is now
+> `source/backend/arch/arm/thumb/arm-thumb-gen.c` (not `libs/tinycc/…`); the IR
+> layer (RA, codegen driver, vreg) lives under `ir/`.  Paths below reflect the
+> new layout.  The state summary was refreshed after auditing the live code.
+
 ## Current state summary
 
 | Layer | State |
 |---|---|
-| Command-line parsing | `-mfloat-abi=hard` and `-mfpu=fpv{4,5}*dp{16,32}` parsed into `float_abi` / `fpu_type` |
-| Feature resolution | `thumb_resolve_features()` in `arch/arm/thumb/thumb.c` maps `-mfpu=…` to `vfp_sp` / `vfp_dp` / `fp_armv8` bits |
-| VFP encoder | `thop_vfp.c` has `th_vadd_f`, `th_vsub_f`, `th_vmul_f`, `th_vdiv_f`, `th_vcmp_f`, `th_vneg_f`, `th_vcvt_*`, `th_vmov_*`, `th_vpush`/`th_vpop`, `th_vmrs` |
-| Allocator hint | `ir/vreg.c` sets `interval->use_vfp = (float_abi == ARM_HARD_FLOAT)` |
-| FPU config | `arm_determine_fpu_config()` and `architecture_config.fpu` configured in `arm_init()` |
-| Register bank | `s->float_registers_for_allocator` set to FPU register count when hard-float |
-| **Missing** | Backend `tcc_gen_machine_fp_mop()` has no hard-float branch |
-| **Missing** | AAPCS call layout (`thumb_build_call_layout_from_ir`) does not place FP args in `s0-s15`/`d0-d7` for hard-float |
-| **Missing** | Return-value path does not use `s0`/`d0` for hard-float |
+| Command-line parsing | `-mfloat-abi=hard` and `-mfpu=fpv{4,5}*dp{16,32}` parsed into `float_abi` / `fpu_type` — ✅ |
+| Feature resolution | `thumb_resolve_features()` maps `-mfpu=…` to `vfp_sp` / `vfp_dp` / `fp_armv8` bits — ✅ |
+| VFP encoder | `thop_vfp.c`: arith/cmp/neg/cvt/vmov/vpush/vpop/vmrs, **plus `th_vldr`/`th_vstr`** (added 2026-07-28) — ✅ |
+| Allocator hint | `ir/vreg.c:289` sets `interval->use_vfp = (float_abi == ARM_HARD_FLOAT)`; `tcc_ir_vreg_type_get` maps float/double → `LS_REG_TYPE_FLOAT`/`LS_REG_TYPE_DOUBLE` — ✅ |
+| RA float bank | `ir/regalloc.c:1846-1883` allocates `s0-s15` for `LS_REG_TYPE_FLOAT` and even `s`-pairs for `LS_REG_TYPE_DOUBLE`, tagged `LS_VFP_REG_BASE (0x40) + n` — ✅ (producer only) |
+| FPU config / bank size | `arm_determine_fpu_config()`; `float_registers_{for,map}_for_allocator` set when hard-float — ✅ |
+| SP arith emission | `tcc_gen_machine_fp_mop()` → `thumb_emit_vfp_arith_mop()` emits `vadd/vsub/vmul/vdiv.f32` when `float_abi != soft` — ✅ but **GPR-shuffled** (softfp style; operands move through GPRs, floats never *live* in `s`-regs) |
+| Return classification | `gfunc_sret():4316` already branches on `ARM_HARD_FLOAT` for float/HFA returns — ✅ |
+| **Gap — MOP VFP-awareness** | `LS_IS_VFP_REG`/`LS_VFP_REG_BASE` are **never decoded** downstream: `mach_ensure_in_reg`/`mach_get_dest_reg`/`mach_writeback_dest`/`thumb_is_hw_reg` treat `r0≥0x40` as a bogus GPR. No `vldr`/`vstr` spill/reload wired. So RA-allocated VFP operands cannot be consumed. |
+| **Gap — AAPCS args** | `arm_aapcs.c` / `arm-thumb-callsite.c` / `build_register_arg_moves` are GPR-only; float/double args go to `r0-r3`/stack, never `s0-s15`/`d0-d7`. `TCCAbiArgLoc` has no VFP field. |
+| **Gap — param homing** | `tcc_ir_register_allocation_params` (`ir/codegen.c:197`) sets `incoming_reg0` to a GPR index; prolog drops any `≥16` reg. `use_vfp` is set but unused for the ABI edge. |
+| **Gap — return regs** | `tcc_gen_machine_return_value_mop:10226`, `handle_return_value_mop:12657`, `mark_return_value_incoming_regs (codegen.c:291)` hardcode `R0/R1`, never `s0/d0`. |
 
 ## Goal
 
@@ -31,6 +39,260 @@ When `float_abi == ARM_HARD_FLOAT` and the selected FPU supports the operation:
 3. FP function arguments and return values follow the AAPCS hard-float convention (`s0-s15` / `d0-d7`, then stack).
 4. Spills, reloads, and moves between GPR and VFP registers use `vldr`/`vstr`/`vmov`.
 5. Existing soft-float (`-mfloat-abi=soft` / `softfp`) output is byte-for-byte unchanged.
+
+## ⚠️ Key finding (2026-07-28) — the VFP≡GPR accident
+
+Audit + `DBG_VFP` instrumentation of the linear scan established the real
+dynamics, which **differ from this plan's original assumption** that the
+allocator does not use VFP registers:
+
+- In hard-float the RA **does** type every float vreg `LS_REG_TYPE_FLOAT`
+  (`reg_type=1`, `fpmap=0xffff`) and **does** assign it a VFP register
+  `LS_VFP_REG_BASE(0x40)+n` (`ir/regalloc.c:1846`).
+- But codegen never decodes `0x40+n`.  `thumb_emit_vfp_arith_mop` passes it to
+  `th_vmov_gp_sp`, whose encoder masks the register to its low 4 bits — so
+  **VFP-reg-`n` silently aliases GPR-`rn`**.  Because *defs and uses* both mask
+  identically, the float effectively lives in `rn` and shuffles through fixed
+  `s0/s1`.  Output is **correct but softfp-quality**, and `-mfloat-abi=hard`
+  is presently **byte-identical to `-mfloat-abi=softfp`**.
+- **Latent hazard:** in a *mixed* int+float function, "VFP-reg-4" and "GPR-r4"
+  both resolve to `r4`, so an int temp and a float temp that are simultaneously
+  live can clobber each other.  Harmless *today* only because the default test
+  ABI is softfp (floats → `LS_REG_TYPE_INT` → GPR, no VFP numbers ever appear).
+  `make test` runs softfp, so **it does not cover the hard-float VFP path** —
+  Phase 2+ needs its own hard-float execution gate.
+
+**Consequence for sequencing:** Phases 2/3/4 are **coupled**, not independent.
+The moment codegen treats `0x40+n` as a real `sN` (Phase 2), the VFP≡GPR
+equivalence breaks, so the ABI edges must move in the same change: params
+arriving in `r0-r3` need `r→s` moves at entry (or Phase 3's real `s`-reg
+passing) and returns need `s→r0` (or Phase 4's `s0`).  Plan to land Phase 2+3+4
+as one coherent hard-float-ABI change, gated by a QEMU hard-float execute test.
+
+## ✅ Single-precision VFP register class landed (2026-07-28) — via `MACH_OP_VFP_REG`
+
+A first approach-A attempt (preserve the `0x40` marker through
+`machine_op_from_ir`) hit a wall: the codegen represents registers as a 5-bit
+`PREG` field (`PREG_NONE=0x1F`, `PREG_SPILLED=0x20`, `& PREG_REG_NONE`
+everywhere; ~31 masking sites, ~45 `<=R12`/`<16` guards, 78 `thumb_is_hw_reg`
+callers), so a `0x40+n` GPR-space number gets masked back to `rn` in many
+independent paths — whack-a-mole.  That attempt was reverted.
+
+**Resolution — option 2: a distinct `MACH_OP_VFP_REG` operand kind.**  Floats
+reach codegen as `MACH_OP_VFP_REG` (`u.reg.r0` = s-register 0-31), a different
+kind from GPR `MACH_OP_REG`.  A VFP operand can therefore never match a
+`kind == MACH_OP_REG` test, so no GPR-path mask ever sees it — and every
+unhandled path hits a `default: tcc_error` (loud crash, not a silent
+miscompile).  Soft/softfp never produce the kind (`use_vfp=0` → floats are
+`LS_REG_TYPE_INT`), so their output is byte-identical.  Landed changes:
+- `ir/machine_op.{h,c}` — the new kind; emitted for `LS_IS_VFP_REG` allocations.
+- `ir/vreg.c` — hard-float doubles → `DOUBLE_SOFT` (confine VFP to singles).
+- `ir/regalloc.c` — a float live across a call **must spill**: every allocatable
+  VFP reg (s0-s13) is caller-saved and there are no callee-saved VFP regs in the
+  map, so `crosses_call` floats get a stack slot.
+- `arm-thumb-gen.c` — VFP cases in `mach_ensure_in_reg` / `mach_get_dest_reg` /
+  `mach_writeback_dest` (GPR↔VFP `vmov` bridge), `fp_mop_load_arg`, `assign_mop`,
+  `store_mop`/`load_mop` (delegate a VFP src/dest to the assign path), the arith
+  emitter (reserved `s14/s15` scratch under hard-float), param homing (GPR→VFP
+  `vmov`), and reserving `s14/s15` in `arm_init`.
+
+Verified: `make test` (13791 pass, soft/softfp byte-identical), `make ut` green,
+and 20 hard-float QEMU execute tests (5 files × 4 opt levels) covering
+arith/neg/compare/cvt, mixed int+float params (the old miscompile — now correct),
+memory/arrays/globals/pointer-deref, ternary select, function pointers, >4 stack
+float args, and float loops/dot-product/polynomial.
+
+**Still soft at the ABI boundary (approach A):** float args/returns still cross
+calls in GPRs.  Real `s`-register argument passing (approach B — needs a float
+flag through `arm_aapcs.c`) and native VFP emission (skip the GPR round-trip)
+are follow-ups.  Doubles remain soft.  Loud-crash paths not yet exercised
+(`lea_mop`, `select_emit_inline`, `prefetch`, complex) will `tcc_error` rather
+than miscompile if hit — handle as found.
+
+## Approach B (real s-register ABI) — investigation (2026-07-28)
+
+Native single-precision arithmetic landed (commit 2679b659): `addf` is now
+`vmov s0,r0; vmov s1,r1; vadd.f32 s2,s0,s1; vmov r0,s2` — the remaining moves are
+the soft-ABI argument delivery (r0/r1→s0/s1) and return (s2→r0).  Removing those
+is approach B.  Attempted the **return-in-s0** half first (it has no variadic
+complication) and found the ordering constraint that blocks it:
+
+**Return-in-s0 requires native FNEG / CVT_ITOF first.**  A float-returning
+function whose body is a single FP op tail-calls the soft helper — e.g.
+`negf` → `b.w __aeabi_fneg`, `float f(int){return (float)x;}` → `__aeabi_i2f` —
+and those helpers return the float in **R0**, not s0.  So the return ABI can't
+move to s0 until FNEG and int→float conversion emit **natively** (vneg.f32 /
+vcvt.f32.s32).
+
+**The blocker for native FNEG/CVT is the FPU config, by design.**  The lowering
+gate `ir_put_soft_call_fpu_if_needed` (ir/gen/softfloat.c) keys ONLY on
+`architecture_config.fpu` capability bits, deliberately ignoring `float_abi`
+(pinned by `test_fpu_gate_ignores_float_abi`).  The **fpv5-sp-d16 config
+under-advertises**: `has_fadd/fsub/fmul/fdiv` are set but `has_fneg`, `has_fcmp`,
+`has_itof`, `has_ftoi` are **not**, even though the silicon has `vneg`/`vcmp`/
+`vcvt`.  A `float_abi`-gated shortcut in the gate violates the design and breaks
+those unit tests (tried, reverted).
+
+**Decision needed (affects softfp):** completing the fpv5-sp-d16 caps (+ the
+matching backend native emitters for FNEG/CVT/FCMP) makes **both** softfp and
+hard-float use the FPU natively for those ops — correct (softfp = FPU + GPR
+passing) but it **changes softfp output**, so golden-IR / test-codegen-asm
+expectations regenerate.  FCMP additionally needs the frontend to switch from
+the __aeabi unsigned branch conditions to VFP's signed conditions.
+
+**Approach-B roadmap:**
+1. ~~Return-in-s0~~ **DONE (commit 9b483f64).**  Avoided the FPU-caps/softfp-churn
+   route entirely: instead of native FNEG/CVT, (a) keep a float-returning tail
+   call non-tail under hard-float (`ir_tail_call_returns_hard_float`, regalloc.c)
+   so the result flows through `return_value_mop`, and (b) have the caller read
+   the return from s0 EXCEPT when the callee is a soft `__aeabi_*` helper — those
+   return in R0 (`mach_callee_is_aeabi`, name-based, reserved namespace).  `addf`
+   now ends `vadd.f32 s2,s0,s1; vmov.f32 s0,s2`.
+### ✅ Arg passing LANDED (2026-07-28, commit 4a69cab2) — approach B complete
+
+Second attempt succeeded.  The ">4-float callee bug" root cause was
+`tcc_ir_avoid_spilling_stack_passed_params` (ir/codegen.c): it recomputed
+"stack-passed" params with the GPR-only `argno<=3` rule, so float params 5+ had
+their correct linear-scan s4/s5 allocation force-reset to `PREG_NONE` in the
+`ir->ls` table, which the backend copy loop then propagated over the IR
+intervals — both collapsed onto a shared bogus `[fp+0]` slot.  Fixed by
+mirroring the VFP argument counter there.  Also fixed while landing: the three
+stack-arg placement paths + `is_simple_imm_stack_arg` treated "not
+TCC_ABI_LOC_REG" as "stack", phantom-storing VFP-loc args at `[sp+0]` (a real
+clobber for mixed calls with genuine stack args) — all now skip
+`TCC_ABI_LOC_VFP_REG`.  New `fp_hard_absplit_exec.c` covers mixed
+GPR+stack+VFP banks.  `addf` is now full AAPCS-VFP:
+`vadd.f32 s2,s0,s1; vmov.f32 s0,s2; bx lr`; `sum6f` is a pure vadd chain over
+s0-s5.  Gate: 24 execute tests, make test 13803, make ut green.
+
+**Hard-float single-precision ABI is now COMPLETE** (args s0-s15, return s0,
+native arith, VFP register class).  Remaining follow-ups: doubles (still soft),
+`.ARM.attributes` `Tag_ABI_VFP_args` audit, hard-float newlib, rp2350 CI.
+
+### Historical: first activation attempt (2026-07-28) — caller works, callee >4-float bug, REVERTED
+
+Wired the full activation on top of the scaffolding and got the **caller** side
+working perfectly — `addf` compiled to `vadd.f32 s2,s0,s1; vmov.f32 s0,s2; bx lr`
+with args arriving in s0/s1.  18/20 hard-float execute tests passed.  The 2
+failures were `fp_hard_call_exec` (a 6-float-arg `sum6`), and chasing it exposed
+a chain of callee/RA issues — each fixed, the next appeared:
+- `params.c` needs `desc.is_float` too (else the callee classifies floats as GPR).
+- The RA models a single-precision `FADD` as an **implicit call** (`has_dadd=0`),
+  so `crosses_call` is a false positive → added `crosses_real_call` (real
+  FUNCCALL only) for the VFP-spill decision.
+- The RA `precolored` path and the `pos < 4` param cap are GPR-centric (mask into
+  `int_free`, cap at 4 arg regs) — extended for VFP.
+- **Unresolved:** for >4 float params the linear scan *does* allocate them to
+  s4/s5 (fp_free decrements), but the allocation does **not persist** to
+  `IRLiveInterval.allocation.r0` (stays `PREG_NONE`) by `machine_op_from_ir`
+  time, so P4/P5 collapse to an unallocated stack slot `[fp+0]` (they collide).
+  `tcc_ir_register_allocation_params` runs twice (codegen.c:516 + backend
+  regalloc.c:649) around the scan; the float-param incoming/allocation handling
+  is not robust to that double pass.  The `≤4`-float-arg case works.
+
+Reverted the activation (kept return-in-s0 + inert scaffolding, all green).
+**Next attempt must first understand the two `register_allocation_params` passes
+vs the linear scan, and make float-param VFP allocation persist** (the scan
+already allocates correctly).  A cap-at-4 avoids the bug but violates AAPCS.
+
+2. **Argument passing in s0-s15** (next, atomic — caller + callee together):
+   - `tccabi.h`: `TCCAbiArgDesc.is_float`; new `TCC_ABI_LOC_VFP_REG` loc kind;
+     `TCCAbiCallLayout.next_vfp_reg` + `is_variadic`.
+   - `arm_aapcs.c`: place `is_float && size==4` args in s0-s15 when hard-float
+     and not variadic; else the existing GPR/stack path.
+   - Caller: `build_reg_move_32bit` / `build_register_arg_moves` move a float arg
+     into its s-register (VFP-resident → `vmov.f32`; else materialize).
+   - Callee: `ir/codegen.c` param homing + `ir/gen/params.c` set the float
+     param's incoming location to its s-register.
+   - **Variadic:** a variadic callee passes ALL args (named + `...`) in GPRs
+     (base standard), so detect variadic at the call site (callee `Sym` type =
+     `FUNC_ELLIPSIS`) and fall back to the soft layout.  Callee side already
+     knows via `sym->f.func_type`.
+3. `.ARM.attributes` `Tag_ABI_VFP_args` audit; doubles in d0-d7 (later).
+
+## Progress log
+
+- **2026-07-28** — Phase 1 (encoders): added `th_vldr` / `th_vstr` to `thop_vfp.c`
+  (single + double precision, signed SP-relative imm8 offset, U-bit handling),
+  declared in `thop_vfp.h`.  12 unit tests in `test_thop_vfp.c`, all encodings
+  cross-checked against `arm-none-eabi-as`.  `make ut` green; no codegen path
+  calls them yet, so soft-float output is byte-identical.  These are the
+  spill/reload primitive the in-tree note at `arm-thumb-gen.c:9537` flagged as
+  missing.
+
+- **2026-07-28** — Safety net (chosen before the Phase 2-4 rewrite, since
+  `make test` runs softfp and cannot cover the hard-float path): added a
+  hard-float QEMU execution gate in `tests/ir_tests/test_qemu.py`:
+  - `test_hard_float_execution` / `fp_hard_sp_exec.c` — pure single-precision
+    (arith, neg, compare, cvt, float params/returns).  **Green at
+    -O0/-O1/-O2/-Os**; the regression net that must stay passing through the
+    rewrite.
+  - `test_hard_float_mixed_xfail` / `fp_hard_mixed_exec.c` — mixed int+float
+    params, **strict-xfail**.  Confirmed the VFP≡GPR accident is a *live*
+    miscompile (not merely latent): `mix(int,float,int)` computes `n*n` instead
+    of `x*x` at -O0/-Os because the float param aliases an int GPR (folded away,
+    so masked, at -O1/-O2; volatile args force the call at every level).  Flips
+    to xpass when Phase 2-4 lands → promote into the green gate, drop the xfail.
+
+  **Next: Phase 2+3+4 (coupled)** — decode `LS_VFP_REG_BASE` in the MOP/mach
+  layer as a real `sN`, emit native VFP, move params/returns to `s`-regs, wire
+  `vldr`/`vstr` spill+reload.  Gate every step on the hard-float execute tests
+  above + `make test` (soft/softfp byte-identity) + `make ut`.
+
+## Concrete implementation design (approach A — 2026-07-28)
+
+Approach A keeps the **soft argument layout** (floats cross call boundaries in
+GPRs) but makes floats *live* in real VFP registers internally, with explicit
+GPR↔VFP bridges at the edges.  It fixes the confirmed mixed int/float
+miscompile and is confined to the ARM backend (no frontend / `arm_aapcs.c`
+changes).  Real `s`-register argument passing (approach B) is a later phase.
+
+**Everything is gated on `is_vfp_reg(r)` (`r >= LS_VFP_REG_BASE`) or
+`float_abi == ARM_HARD_FLOAT`.** In soft/softfp, `use_vfp=0` so floats are
+`LS_REG_TYPE_INT` (GPR, `r < 0x40`); no VFP number ever appears → every new
+branch is dead → soft/softfp output stays byte-identical.  **This must land
+atomically** — a half-migrated state where some sites treat `0x40+n` as a real
+`sN` while others still mask it to `rn` will miscompile.
+
+Sites (all in `source/backend/arch/arm/thumb/arm-thumb-gen.c` unless noted):
+
+1. **Reserve FP scratch** — `arm_init` (`2657`): when hard-float, mask `s14/s15`
+   out of `float_registers_map_for_allocator` (→ `0x3fff`) so the RA never
+   allocates them; use them as the emitters' fixed VFP scratch (`VS0=14`,
+   `VS1=15`).  Safe: soft-ABI float args use GPRs, so `s14/s15` are never ABI
+   argument slots here.
+2. **Decode helpers** — `is_vfp_reg(r)=(r>=0x40&&r<0x60)`, `vfp_num(r)=r-0x40`
+   (wrap `LS_IS_VFP_REG`/`LS_VFP_REG_NUM`).
+3. **Core operand bridge** — `mach_ensure_in_reg` (`512`): VFP-resident
+   `MACH_OP_REG` → alloc GPR scratch, `vmov gpr, sN`, return gpr.
+   `mach_writeback_dest` (`687`): VFP-resident dest → `vmov sN, reg`.
+   `mach_get_dest_reg` (`657`): VFP-resident → GPR scratch (compute in GPR,
+   writeback bridges to `sN`).  (Makes every GPR-centric load/store/move handle
+   float operands transparently; `MACH_OP_SPILL` of a float loads/stores its
+   bits via GPR, so no `vldr`/`vstr` needed for correctness.)
+4. **Native FP emitters** — `thumb_emit_vfp_arith_mop` (`9543`) + FNEG / FCMP /
+   CVT_ITOF / CVT_FTOI / CVT_FTOF paths in `tcc_gen_machine_fp_mop`: resolve
+   each operand to an `s`-reg (VFP-resident → `vfp_num`; else materialize into
+   `VS0`/`VS1` via `vmov`/`vldr`), emit `v<op>.f32 sd,sn,sm` (or `vneg`/`vcmp`+
+   `vmrs`/`vcvt`), then bridge the dest out if it is not VFP-resident.  Replaces
+   the current fixed-`s0/s1` shuffle (which is unsafe once `s0/s1` are
+   allocatable floats).
+5. **Param homing** — prolog parallel-move (`10674`): the `alloc_r0 <= R12`
+   guard drops VFP homes today (root cause of the `mix` miscompile).  Add a
+   GPR→VFP move for float params: `vmov s_alloc, r_incoming`.  VFP dests are
+   never GPR sources, so emit them after the GPR parallel move (always acyclic).
+6. **Return** — `tcc_gen_machine_return_value_mop` (`10226`) already routes
+   through `mach_ensure_in_reg`, so the core bridge (step 3) makes `vmov r?,sN;
+   mov r0,r?` fall out for free; verify no direct `u.reg.r0` read bypasses it.
+7. **Call-arg marshalling** — `build_register_arg_moves` (`12248`): a float arg
+   in `sN` must reach its GPR arg register via `vmov rk, sN` (bridge) rather
+   than a masked GPR `mov`.
+8. **assign/copy** — `tcc_gen_machine_assign_mop`: float `MACH_OP_REG`↔REG via
+   `vmov.f32`; REG↔SPILL via the GPR bridge; REG↔GPR via `vmov_gp_sp`.
+
+Validation: `test_hard_float_execution` green + `test_hard_float_mixed_xfail`
+flips to xpass (→ promote to the green gate, drop the xfail) + `make test`
+(soft/softfp byte-identical) + `make ut`.
 
 ## Approach
 

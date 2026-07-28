@@ -64,6 +64,30 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
   loc.reg_count = 0;
   loc.stack_off = 0;
 
+  /* Hard-float single-precision: pass in the next VFP argument register
+   * (s0..s15), else on the stack.  Variadic callees use the base standard
+   * (GPRs), so this only applies to non-variadic calls.  Doubles stay soft
+   * (GPR pairs) for now and fall through to the SCALAR64 path. */
+  if (layout->hard_float && !layout->is_variadic && arg_desc->is_float && size == 4)
+  {
+    if (layout->next_vfp_reg < 16)
+    {
+      loc.kind = TCC_ABI_LOC_VFP_REG;
+      loc.reg_base = layout->next_vfp_reg;
+      loc.reg_count = 1;
+      layout->next_vfp_reg++;
+    }
+    else
+    {
+      layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, 4);
+      loc.kind = TCC_ABI_LOC_STACK;
+      loc.stack_off = layout->next_stack_off;
+      layout->next_stack_off += 4;
+    }
+    layout->stack_size = tcc_abi_align_up_int(layout->next_stack_off, layout->stack_align ? layout->stack_align : 8);
+    return loc;
+  }
+
   if (arg_desc->kind == TCC_ABI_ARG_SCALAR64)
   {
     if (layout->next_reg & 1)
