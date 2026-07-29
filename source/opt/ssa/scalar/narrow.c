@@ -350,6 +350,13 @@ static int narrow_float_demote(IRSSAOptCtx *ctx)
     if (!float_name)
       continue;
 
+    /* Never narrow into a self-call: inside float_name's OWN definition
+     * (libm's `float ceilf(float x) { return (float)ceil((double)x); }`)
+     * the rewrite creates infinite recursion, which
+     * infinite_self_recursion then collapses to a `b .` self-loop. */
+    if (funcname && !strcmp(funcname, float_name))
+      continue;
+
     /* Param 0 must be a TEMP whose single def / single use is an f2d call,
      * or a double immediate that is exactly a float value (an f2d-folded
      * constant).  `orig` is the operand the float variant will take. */

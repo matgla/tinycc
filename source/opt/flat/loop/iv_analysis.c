@@ -41,6 +41,13 @@ int find_induction_vars_ex(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int 
     if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_VAR)
       continue;
 
+    /* IV consumers (closed forms, unroll trip math, strength reduction) do
+     * their step/init/final arithmetic in 32-bit ints and build INT32
+     * operands for the rewritten IR; a 64-bit (or sub-word) IV would get its
+     * high word silently dropped.  Only classic INT32 IVs are sound. */
+    if (irop_get_btype(dest) != IROP_BTYPE_INT32)
+      continue;
+
     /* Pattern: V = V + const  OR  V = T + const where T := V (copy-through) */
     int effective_src_vr = src1_vr;
     if (allow_copy_through && src1_vr != dest_vr && src1_vr >= 0 && irop_is_immediate(src2))

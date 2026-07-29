@@ -1426,6 +1426,10 @@ struct TCCState
   uint8_t in_inline_expansion; /* nonzero while expanding inline body */
   uint8_t inline_expansion_depth; /* nested expansion depth, capped to bound work */
   int inline_return_loc;       /* stack offset for storing return value */
+  uint8_t inline_return_redirected; /* a struct `return <local>;` already
+                                     * retargeted inline_return_loc; any later
+                                     * return in the same body must COPY into
+                                     * that slot instead of retargeting again */
   int inline_const_arg_count;  /* constant-like current inline params */
 
   /* Named Return Value Optimization (NRVO) target.

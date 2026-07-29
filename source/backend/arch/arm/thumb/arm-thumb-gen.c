@@ -12344,7 +12344,17 @@ static int find_call_scratch(uint32_t extra_exclude, uint32_t arg_move_dst_mask)
     {
       uint32_t live = ir->ls.live_regs_by_instruction[ir->codegen_instruction_idx];
       uint32_t callee_pushed = pushed_registers & 0x0FF0u; /* R4-R11 that were pushed */
-      uint32_t candidates = callee_pushed & ~live & ~exclude;
+      /* R7 is the frame base: liveness never models it (it is not an
+       * interval), so it ALWAYS looks dead here — handing it out clobbered
+       * the FP mid-marshal and every later FP-relative address computed
+       * from garbage (lac_slot_key: `ldr r7,[ip,#8]` for a struct stack
+       * arg, then `sub ip, r7, #12` for the next arg).  R9 is the GOT
+       * base under text_and_data_separation.  Mirrors the reserved set in
+       * scratch_pushed_dead_reg. */
+      uint32_t reserved = (1u << R_FP);
+      if (tcc_state->text_and_data_separation)
+        reserved |= (1u << 9);
+      uint32_t candidates = callee_pushed & ~live & ~exclude & ~reserved;
       if (candidates)
       {
         /* Prefer low registers (R4-R7) for 16-bit encoding */

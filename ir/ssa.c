@@ -148,7 +148,14 @@ static int ssa_scan_var_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    if (ssa_mark_addrtaken(ir, q, info->addrtaken, num_vars))
+    /* LEA marks its SOURCE var addrtaken, but its DEST is an ordinary fresh
+     * full definition — the rename phase hands it a fresh name through the
+     * generic dest path, so phi placement must see the def or a use at the
+     * join silently binds to the older name (p = NULL; if (c) p = &x; *p
+     * folded the NULL through).  ASM_INPUT has no renameable dest and
+     * ASM_OUTPUT's dest is the addrtaken var itself, so both stay skipped. */
+    if (ssa_mark_addrtaken(ir, q, info->addrtaken, num_vars) &&
+        q->op != TCCIR_OP_LEA)
       continue;
 
     if (!irop_config[q->op].has_dest)
@@ -442,10 +449,10 @@ static uint8_t *ssa_compute_live_in(TCCIRState *ir, IRCFG *cfg,
     if (!irop_config[q->op].has_dest)
       continue;
     /* Mirrors the skips in ssa_scan_var_defs: these never define a fresh
-     * name, and LEA/ASM_* mark the var addrtaken (so unpromotable) anyway. */
+     * name.  ASM_* mark the var addrtaken (so unpromotable) anyway; a LEA
+     * dest however IS a fresh full definition (kill) — see the def scan. */
     if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID ||
-        q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_ASM_INPUT ||
-        q->op == TCCIR_OP_ASM_OUTPUT)
+        q->op == TCCIR_OP_ASM_INPUT || q->op == TCCIR_OP_ASM_OUTPUT)
       continue;
 
     IROperand d = tcc_ir_op_get_dest(ir, q);

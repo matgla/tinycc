@@ -191,6 +191,17 @@ int tcc_ir_opt_float_narrowing(TCCIRState *ir)
       continue;
     }
 
+    /* Never narrow into a self-call.  Inside float_name's OWN definition —
+     * libm's `float ceilf(float x) { return (float)ceil((double)x); }` — the
+     * rewrite turns the wrapper into `return ceilf(x);`, which
+     * infinite_self_recursion then (rightly, by then) collapses into a `b .`
+     * self-loop: every ceilf/floorf/roundf/truncf call on the device hung. */
+    if (funcname && strcmp(funcname, float_name) == 0)
+    {
+      pending_param_idx = -1;
+      continue;
+    }
+
     ConvCallInfo *f2d_info = NULL;
     for (int k = 0; k < num_f2d; k++)
     {

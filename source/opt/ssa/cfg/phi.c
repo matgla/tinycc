@@ -14,9 +14,40 @@
 #include "opt_dsl_phi.h"
 #include "opt/ssa/phi.h"
 
+/* Phi elimination replaces every use of the phi's dest NAME with the
+ * replacement NAME.  That is only meaning-preserving when both names are
+ * genuine SSA values: this IR allows in-place re-definition of a phi dest
+ * (`T <-- x [STORE]`, an assignment to a register-promoted local), so a
+ * dest with def_count > 0 has uses that refer to the STORE's value, not the
+ * phi's — rewriting them forwards across the second def (see the
+ * ssa_opt_def_total comment in ssa_opt.h).  Symmetrically the replacement
+ * must be single-def, or a use placed after its in-place redef reads the
+ * new value where the phi carried the old one.  Casualty: tccgen's
+ * token_stream_references_local_object — the loop-head phi for `v` was also
+ * assigned in-place by the inlined sym_find's `v = t`, and eliminating the
+ * phi rewrote `v = t - 256` into `v = v - 256` (v uninitialized), so the
+ * self-hosted tcc dropped locals referenced by __builtin_va_arg_pack call
+ * args (gcc-torture pr37669: 'chmap' undeclared). */
+static int phi_dest_is_sole_def(IRSSAOptCtx *ctx, const IRPhiNode *phi)
+{
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, phi->dest_vreg);
+  return vi && vi->def_phi_block >= 0 && vi->def_count == 0;
+}
+
+static int phi_replacement_value_stable(IRSSAOptCtx *ctx, int32_t vr)
+{
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  /* def_total 0 = entry-undef placeholder; 1 = clean single def. */
+  return ssa_opt_def_total(ssa_opt_vinfo(ctx, vr)) <= 1;
+}
+
 OPT_GEN_PHI(phi_trivial)
 {
   PATTERN_PHI(.kind = IR_PHI_PATTERN_TRIVIAL);
+  if (!phi_dest_is_sole_def(ctx, phi) ||
+      !phi_replacement_value_stable(ctx, replacement_vreg))
+    return 0;
   REWRITE_PHI(.replacement = replacement_vreg);
 }
 
@@ -143,11 +174,17 @@ static int phi_scc_remove_component(IRSSAOptCtx *ctx, PhiSCCState *state,
       !phi_scc_replacement_type_valid(ctx, state, replacement, btype))
     return 0;
 
+  /* The replacement must be a stable single-def value (a clean phi dest
+   * passes too: its phi def is the single def). */
+  if (!phi_replacement_value_stable(ctx, replacement))
+    return 0;
+
   for (int i = 0; i < state->node_count; i++) {
     PhiSCCNode *node = &state->nodes[i];
     if (node->component != component)
       continue;
-    if (!opt_dsl_phi_metadata_valid(ctx, node->block, node->phi) ||
+    if (!phi_dest_is_sole_def(ctx, node->phi) ||
+        !opt_dsl_phi_metadata_valid(ctx, node->block, node->phi) ||
         !ssa_opt_can_replace_all_uses(ctx, node->phi->dest_vreg))
       return 0;
   }
@@ -251,6 +288,8 @@ static int phi_congruent_eliminate_once(IRSSAOptCtx *ctx)
       while (*link) {
         IRPhiNode *dup = *link;
         if (!phi_congruent(rep, dup) ||
+            !phi_dest_is_sole_def(ctx, dup) ||
+            !phi_dest_is_sole_def(ctx, rep) ||
             !opt_dsl_phi_metadata_valid(ctx, b, dup) ||
             !ssa_opt_can_replace_all_uses(ctx, dup->dest_vreg)) {
           link = &(*link)->next;

@@ -585,3 +585,8 @@ int tok_alloc_const(const char *str)
   return 0;
 }
 #endif /* UT_SSA_OPT_REAL */
+
+/* Needed by BOTH builds (outside the guard): tccgen's current-function
+ * name, read by narrow.c's float-demote self-call guard.  tccgen.c is not
+ * linked into any UT binary, so provide the definition here. */
+const char *funcname;

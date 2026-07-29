@@ -537,8 +537,9 @@ static int rewrite_loop_exit_phis_guarded(IRSSAOptCtx *ctx, IRLoop *loop, LoopEn
   for (IRPhiNode *phi = ssa->block_phis[info->header_block]; phi; phi = phi->next) {
     if (phi == info->iv_phi) continue;       /* IV phi handled by edge-drop */
     if (phi->num_operands != 2) continue;
-    /* irop_make_imm32 stores only 32 bits. */
-    if (phi->btype == IROP_BTYPE_INT64) continue;
+    /* irop_make_imm32 stores only 32 bits, and the SELECT this becomes only
+     * moves a single core register (no pairs, no VFP). */
+    if (!irop_btype_select_lowerable(phi->btype)) continue;
 
     int pre_slot = -1, latch_slot = -1;
     for (int oi = 0; oi < phi->num_operands; oi++) {

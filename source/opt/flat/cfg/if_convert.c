@@ -114,6 +114,8 @@ int tcc_ir_opt_setif_neg_to_select(TCCIRState *ir)
     /* Rewrite the negate in place as SELECT(#-1, #0, cond), reusing its dest. */
     IROperand sub_dest = tcc_ir_op_get_dest(ir, sub);
     int dest_btype = irop_get_btype(sub_dest);
+    if (!irop_btype_select_lowerable(dest_btype))
+      continue;
     IROperand then_v = irop_make_imm32(-1, -1, dest_btype);
     IROperand else_v = irop_make_imm32(-1, 0, dest_btype);
     IROperand cond_op = irop_make_imm32(-1, cond, VT_INT);
@@ -418,6 +420,9 @@ int tcc_ir_opt_select(TCCIRState *ir)
         continue;
       if (else_tag != IROP_TAG_SYMREF && else_tag != IROP_TAG_IMM32)
         continue;
+      if (!irop_btype_select_lowerable(irop_get_btype(then_val)) ||
+          !irop_btype_select_lowerable(irop_get_btype(else_val)))
+        continue;
 
       /* ---- Transform ---- */
 
@@ -520,6 +525,11 @@ int tcc_ir_opt_select(TCCIRState *ir)
       if (after_else != merge_target)
         continue;
 
+      if (!irop_btype_select_lowerable(irop_get_btype(then_dest)) ||
+          !irop_btype_select_lowerable(irop_get_btype(then_val)) ||
+          !irop_btype_select_lowerable(irop_get_btype(else_val)))
+        continue;
+
       /* Allocate 4 pool entries for SELECT */
       IROperand sel_cond = irop_make_imm32(-1, then_cond, VT_INT);
       int pool_base = tcc_ir_iroperand_pool_add(ir, then_dest);
@@ -588,7 +598,8 @@ int tcc_ir_opt_select(TCCIRState *ir)
           int32_t tm_vr = irop_get_vreg(tm);
           int merge = ir_skip_nops_forward(ir, mvia_i + 1, n);
           int else_start2 = ir_skip_nops_forward(ir, else_target, n);
-          if (tm_vr >= 0 && irop_get_vreg(masg_src) == tc_vr && !irop_op_is_lval(masg_src) &&
+          if (tm_vr >= 0 && irop_btype_select_lowerable(irop_get_btype(tm)) &&
+              irop_get_vreg(masg_src) == tc_vr && !irop_op_is_lval(masg_src) &&
               tcc_ir_vreg_has_single_use(ir, tc_vr, -1) && else_start2 < n)
           {
             IRQuadCompact *elq = &ir->compact_instructions[else_start2];
@@ -596,6 +607,7 @@ int tcc_ir_opt_select(TCCIRState *ir)
             if ((elq->op == TCCIR_OP_LOAD || elq->op == TCCIR_OP_ASSIGN) &&
                 irop_get_vreg(tcc_ir_op_get_dest(ir, elq)) == tm_vr &&
                 ir_ifconv_arm_value_safe(ir, elq) &&
+                irop_btype_select_lowerable(irop_get_btype(tcc_ir_op_get_src1(ir, elq))) &&
                 else_jmp < n && ir->compact_instructions[else_jmp].op == TCCIR_OP_JUMP &&
                 (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, &ir->compact_instructions[else_jmp])) == merge)
             {
@@ -736,6 +748,10 @@ int tcc_ir_opt_select(TCCIRState *ir)
       IROperand else_val = tcc_ir_op_get_src1(ir, else_q);
       int else_tag = irop_get_tag(else_val);
       if (else_tag != IROP_TAG_IMM32 && else_tag != IROP_TAG_SYMREF)
+        continue;
+
+      if (!irop_btype_select_lowerable(irop_get_btype(then_val)) ||
+          !irop_btype_select_lowerable(irop_get_btype(else_val)))
         continue;
 
       /* Else block must immediately follow the then RETURNVALUE

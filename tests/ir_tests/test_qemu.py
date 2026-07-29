@@ -312,6 +312,60 @@ TEST_FILES = [
     # when it narrows the slot's btype (offset was becoming offset << 16)
     ("427_mem_inline_struct_slot.c", 0),
 
+    # find_call_scratch must not hand out r7 (frame base, never a liveness
+    # interval) as a data scratch while marshaling stack-passed struct args
+    ("428_callsite_struct_fp_clobber.c", 0),
+
+    # SSA phi placement must record a LEA's dest as a fresh def; a pointer
+    # var (p=NULL; if (c) p=&x;) lost the &x def at the join and *p folded
+    # to a NULL deref at every -O level
+    ("429_ssa_lea_dest_phi.c", 0),
+
+    # Frontend backedges (gjmp_addr) must mark their target is_jump_target;
+    # a fallthrough-only loop condition lost its TEST_ZERO to setif_fuse and
+    # the continue path spun forever on the same bitmask bit
+    ("430_backedge_jump_target_fuse.c", 0),
+
+    # A param's implicit entry def means a conditional overwrite is never its
+    # single def; cmp_expr_fold folded post-assign compares of a stack param
+    # to the assigned constant (dropped barrel shifts in the native tcc)
+    ("431_param_conditional_zero_singledef.c", 0),
+
+    # struct-valued ternary: roundtrip-elim resolved the copy's address temp
+    # through only the latest textual def and deleted a real cross-slot copy
+    ("432_struct_ternary_roundtrip_elim.c", 0),
+
+    # global_addr_hoist must not rewrite STRUCT symref operands: the vreg
+    # replacement drops the split-encoded ctype_idx and the callsite marshals
+    # a by-value struct global with a garbage type
+    ("433_struct_byval_global_addr_hoist.c", 0),
+
+    # inline expansion must retarget the struct return slot only ONCE; a
+    # second `return <local>;` moved the caller's read off the first return's
+    # slot, whose value was never copied (uninitialized read)
+    ("434_inline_two_returns_struct_slot.c", 0),
+
+    # 64-bit/FP values must not be if-converted to SELECT: the single-register
+    # ITE lowering keeps garbage in the high word (self-host: known_bits'
+    # width mask got dest_btype as its high word, collapsing all i64 folds)
+    ("435_llong_select_high_word.c", 0),
+
+    # SCCP must not match anon StackLoc stores against address-taken VARs by
+    # original_offset (a creation-time watermark, not a real slot): it forwarded
+    # `m.kind = 1` into loads of the out-params sym/off (memloc_of's shape)
+    ("436_sccp_addrtaken_var_slot_confusion.c", 0),
+
+    # double->float libcall narrowing must not rewrite `(float)ceil((double)x)`
+    # into a SELF-call inside ceilf's own definition (libm wrappers collapsed
+    # to `b .` self-loops via infinite_self_recursion; device fp hang)
+    ("437_libcall_narrow_self_recursion.c", 0),
+
+    # VRP must not resolve a loop-carried phi operand (prev = last iter's t)
+    # against ranges scoped to the current iteration's guards; it folded
+    # `prev == K` checks away (tccgen's prescan lost its &&-parent-label
+    # handling: nested-fn label torture tests failed to compile)
+    ("438_vrp_loop_phi_carried_range.c", 0),
+
     # Compile-time strlen constant folding
     ("171_strlen_constfold.c", 0),
 

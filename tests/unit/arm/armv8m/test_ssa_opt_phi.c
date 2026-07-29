@@ -499,6 +499,98 @@ UT_TEST(test_phi_simplify_congruent_protected_use_kept)
 }
 
 /* ========================================================================
+ * pr37669 regression: a phi dest that is ALSO re-defined in place by an
+ * instruction (`T <-- x [STORE]`, what an assignment to a register-promoted
+ * local lowers to) is not a pure SSA value.  Eliminating the phi rewrites
+ * the uses that refer to the INSTRUCTION def onto the replacement — in
+ * tccgen's token_stream_references_local_object this turned the inlined
+ * sym_find's `v = t - 256` into `v = v - 256` with v uninitialized.  The
+ * phi must be kept.
+ * ======================================================================== */
+
+UT_TEST(test_phi_simplify_dest_inplace_redef_kept)
+{
+  ssa_ctx c = ssa_ctx_new(1, 12);
+  ssa_ctx_init_manual(&c);
+  int32_t x = utb_vreg(utb_temp(3, I32));
+  int32_t v = utb_vreg(utb_temp(5, I32));
+
+  /* Loop-head shape: v = phi(x, v-self) — trivially matchable — plus an
+   * in-place second def of v and a use that refers to that second def. */
+  ssa_add_phi(&c, 0, v, (int32_t[]){ x, v }, 2);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(5, I32), utb_temp(4, I32));
+  int use_i = ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(6, I32),
+                            utb_temp(5, I32));
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_phi_simplify(c.ctx), 0);
+  UT_ASSERT_EQ(ssa_block_phi_count(&c, 0), 1);
+  UT_ASSERT_EQ(irop_get_vreg(ssa_instr_src1(&c, use_i)), v);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Symmetric hazard: the REPLACEMENT has a second in-place def.  A use of
+ * the phi placed after that redef would read the new value where the phi
+ * carried the old one — elimination must be skipped.
+ * ======================================================================== */
+
+UT_TEST(test_phi_simplify_multidef_replacement_kept)
+{
+  ssa_ctx c = ssa_ctx_new(1, 12);
+  ssa_ctx_init_manual(&c);
+  int32_t x = utb_vreg(utb_temp(3, I32));
+  int32_t v = utb_vreg(utb_temp(5, I32));
+
+  ssa_add_phi(&c, 0, v, (int32_t[]){ x, x }, 2);
+  /* Two instruction defs of x (in-place redef of a promoted local). */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(3, I32), utb_temp(8, I32));
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(3, I32), utb_temp(9, I32));
+  int use_i = ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(6, I32),
+                            utb_temp(5, I32));
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_phi_simplify(c.ctx), 0);
+  UT_ASSERT_EQ(ssa_block_phi_count(&c, 0), 1);
+  UT_ASSERT_EQ(irop_get_vreg(ssa_instr_src1(&c, use_i)), v);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Congruent-merge variant of the same hazard: the duplicate phi's dest has
+ * an in-place second def — merging would redirect the instruction-def uses
+ * onto the representative.  Both phis must be kept.
+ * ======================================================================== */
+
+UT_TEST(test_phi_simplify_congruent_inplace_redef_kept)
+{
+  ssa_ctx c = ssa_ctx_new(1, 12);
+  ssa_ctx_init_manual(&c);
+  int32_t x = utb_vreg(utb_temp(3, I32));
+  int32_t y = utb_vreg(utb_temp(4, I32));
+  int32_t a = utb_vreg(utb_temp(5, I32));
+  int32_t b = utb_vreg(utb_temp(6, I32));
+
+  ssa_add_phi(&c, 0, a, (int32_t[]){ x, y }, 2);
+  ssa_add_phi(&c, 0, b, (int32_t[]){ x, y }, 2);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(6, I32), utb_temp(8, I32));
+  int use_i = ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(7, I32),
+                            utb_temp(6, I32));
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_phi_simplify(c.ctx), 0);
+  UT_ASSERT_EQ(ssa_block_phi_count(&c, 0), 2);
+  UT_ASSERT_EQ(irop_get_vreg(ssa_instr_src1(&c, use_i)), b);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
  * Suite registration
  * ======================================================================== */
 

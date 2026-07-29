@@ -120,6 +120,15 @@ void ir_opt_du_build_mode(TCCIRState *ir, IROptDU *du, uint8_t mode)
         du->use[idx]++;
     }
   }
+  /* A parameter carries an implicit ENTRY definition (the caller's argument)
+   * with no defining instruction, so an explicitly assigned param never has a
+   * single knowable def — see the matching bump in ir_opt_build_def_count. */
+  if (mode != IR_DU_MODE_TMP_ONLY)
+  {
+    for (int p = du->max_var + du->max_tmp; p < du->total; p++)
+      if (du->def_cnt[p] == 1)
+        du->def_cnt[p]++;
+  }
 }
 
 uint8_t *ir_opt_build_def_count(TCCIRState *ir, int n, int *out_stride)
@@ -151,6 +160,19 @@ uint8_t *ir_opt_build_def_count(TCCIRState *ir, int n, int *out_stride)
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
     if (dc[typ * stride + pos] < 2)
       dc[typ * stride + pos]++;
+  }
+  /* A parameter carries an implicit ENTRY definition — the caller's argument
+   * value — with no defining instruction in the IR.  An explicitly assigned
+   * param therefore never has a single knowable def: without this,
+   * cmp_expr_fold treated a conditionally-overwritten stack param
+   * (`if (c) bs = 0; ... if (bs != 0)`) as constant 0 for every compare after
+   * the assign (arm-thumb-gen.o's barrel_shift lost its shifts at -O1/-O2).
+   * Count the entry value as one more def so DC_IS_SINGLE_DEF stays false. */
+  {
+    uint8_t *prow = &dc[TCCIR_VREG_TYPE_PARAM * stride];
+    for (int p = 0; p < stride; p++)
+      if (prow[p] == 1)
+        prow[p]++;
   }
   *out_stride = stride;
   return dc;

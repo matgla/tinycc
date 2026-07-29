@@ -398,6 +398,7 @@ UT_LOCAL_SRCS := \
 	test_opt_utils.c \
 	test_opt_stack_addr_cse.c \
 	test_opt_memset_fold.c \
+	test_opt_mem_inline.c \
 	test_opt_dead_init_call.c \
 	test_opt_memmove.c \
 	test_opt_loop_utils.c \

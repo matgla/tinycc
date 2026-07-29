@@ -202,6 +202,14 @@ static int gah_operand_hoistable(const TCCIRState *ir, IROperand op, Sym **out_s
     return 0;
   if (irop_get_tag(op) != IROP_TAG_SYMREF)
     return 0;
+  /* A STRUCT-typed operand keeps its type identity in the split u.s encoding
+   * (ctype_idx), which a plain vreg operand cannot carry: rewriting the
+   * FUNCPARAMVAL of a by-value struct global to a hoisted vreg dropped the
+   * callsite's struct size/layout (arm-thumb-gen.c marshaled its 12-byte
+   * THUMB_SHIFT_DEFAULT as a 32-byte blob → th_mov_reg got garbage → invalid
+   * opcode 0x0). Keep struct symrefs un-hoisted. */
+  if (op.btype == IROP_BTYPE_STRUCT)
+    return 0;
   sr = irop_get_symref_ex(ir, op);
   if (!sr || !sr->sym)
     return 0;

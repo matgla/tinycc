@@ -496,6 +496,9 @@ typedef struct TCCIRState
   uint8_t prevent_coalescing;
   uint8_t has_static_chain : 1;      /* function uses static chain for nested func */
   uint8_t needs_chain_save : 1;      /* must save chain at FP-4 for multi-hop child access */
+  uint8_t emits_set_chain : 1;       /* parent writes R10 (SET_CHAIN/INIT_CHAIN_SLOT) to call a
+                                        nested function; R10 is callee-saved, so it must be in
+                                        the prologue save mask and excluded from reassignment */
   int32_t static_chain_vreg;         /* vreg holding static chain pointer (parent FP) */
   int32_t captured_offsets_list[32]; /* offsets of captured vars (for chain-relative access) */
   int32_t captured_chain_depths[32]; /* 1 = direct R10, 2+ = multi-hop */

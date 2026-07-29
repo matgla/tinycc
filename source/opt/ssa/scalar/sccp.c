@@ -471,9 +471,11 @@ static int sccp_var_def_clobbers_slot(SCCPState *s, IRQuadCompact *q,
   IRLiveInterval *vi = tcc_ir_vreg_live_interval(ir, dv);
   if (!vi || !vi->addrtaken)
     return 0;
-  int lo = vi->original_offset;
-  int hi = lo + sccp_btype_bytes(irop_get_btype(d));
-  return hi > load_lo && load_hi > lo;
+  /* original_offset is a creation-time frontend watermark, not the var's
+   * final frame slot, so the def's true slot is unknowable here.  Claim the
+   * clobber unconditionally: missing one folds a stale value (miscompile),
+   * over-claiming only costs a fold. */
+  return 1;
 }
 
 /* SCCP_TOP means the block start was reached with no matching or aliasing store. */
@@ -911,11 +913,18 @@ static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
     if (q->op == TCCIR_OP_STORE) {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       if (dest.tag == IROP_TAG_STACKOFF && dest.is_local && dest.is_lval) {
+        /* original_offset is the frontend's creation-time `loc` watermark,
+         * not the var's final frame slot (that only exists after regalloc):
+         * several distinct address-taken VARs can report the SAME offset,
+         * which can also equal an unrelated anon local's StackLoc.  Matching
+         * it against this store forwarded `m.kind = 1` into loads of `sym`
+         * and `off` in memref.c's memloc_of, wrecking every self-hosted
+         * build's alias analysis.  An anon StackLoc store can neither be
+         * proven to BE nor to MISS an address-taken var's slot here, so give
+         * up on the walk; for a non-addrtaken var it cannot alias at all. */
         IRLiveInterval *vi = tcc_ir_vreg_live_interval(ir, var_vreg);
-        /* VAR and anon-local offsets can collide, so addrtaken must gate the match. */
-        if (vi && vi->addrtaken && vi->original_offset == irop_get_stack_offset(dest))
-          return sccp_get_store_src_value(s, tcc_ir_op_get_src1(ir, q), out,
-                                          dep_src_pos);
+        if (vi && vi->addrtaken)
+          return SCCP_BOTTOM;
         continue;
       }
 

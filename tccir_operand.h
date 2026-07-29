@@ -257,6 +257,17 @@ static inline int irop_get_btype(const IROperand op)
   return op.btype;
 }
 
+/* A value SELECT lowers to one ITE block moving a SINGLE core register
+ * (tcc_gen_machine_select_mop); 64-bit values live in register pairs and FP
+ * values in VFP registers, neither of which that lowering moves, so
+ * if-conversion must keep the branchy diamond for them.  The high word of an
+ * INT64 select otherwise silently keeps whatever the register pair held. */
+static inline int irop_btype_select_lowerable(int btype)
+{
+  return btype == IROP_BTYPE_INT32 || btype == IROP_BTYPE_INT8 ||
+         btype == IROP_BTYPE_INT16;
+}
+
 /* Check if operand has a 64-bit type */
 static inline int irop_is_64bit(const IROperand op)
 {

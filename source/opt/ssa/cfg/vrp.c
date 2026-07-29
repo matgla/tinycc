@@ -259,6 +259,30 @@ static int sv_read_cmp(SVState *s, int cmp_idx, SVCmp *out)
 static void sv_set(SVState *s, int slot, int64_t lo, int64_t hi);
 
 /* The phi that defines vr, or NULL if vr is not a phi result. */
+/* A loop phi carries a value across a BACK EDGE: that operand holds the
+ * PREVIOUS iteration's value, so any range in scope at the current program
+ * point (this iteration's guards) says nothing about it.  Evaluating such an
+ * operand with sv_resolve_range let `if (t >= TOK_IDENT) { if (prev_tok ==
+ * TOK_LAND) ... }` fold the prev_tok check away (prescan_captured_vars lost
+ * its &&-label block: every parent-__label__ address-of in a nested function
+ * failed with "label used but not defined").  An edge P->H is a back edge
+ * iff the phi's block H dominates P. */
+static int sv_phi_is_loop_phi(SVState *s, IRPhiNode *phi, int32_t dest_vr)
+{
+  IRSSAVregInfo *vi = ssa_opt_vinfo(s->ctx, dest_vr);
+  IRCFG *cfg = s->ctx->cfg;
+  if (!vi || vi->def_phi_block < 0 || !cfg)
+    return 1; /* unknown home block: assume the worst */
+  for (int i = 0; i < phi->num_operands; i++)
+  {
+    int p = phi->operands[i].pred_block;
+    if (p < 0 || p >= cfg->num_blocks ||
+        tcc_ir_cfg_dominates(cfg, vi->def_phi_block, p))
+      return 1;
+  }
+  return 0;
+}
+
 static IRPhiNode *sv_phi_for(SVState *s, int32_t vr)
 {
   if (vr < 0)
@@ -757,7 +781,8 @@ static int sv_cmp_verdict(SVState *s, int cmp_idx, int tok, SVCmp *cmp, int32_t 
     if (verdict < 0 && cmp->c_ok && (tok == VRP_TOK_EQ || tok == VRP_TOK_NE))
     {
       IRPhiNode *phi = sv_phi_for(s, cmp->xvr);
-      if (phi && sv_phi_excludes_const(s, phi, cmp->c))
+      if (phi && !sv_phi_is_loop_phi(s, phi, cmp->xvr) &&
+          sv_phi_excludes_const(s, phi, cmp->c))
         verdict = (tok == VRP_TOK_NE) ? 1 : 0;
     }
     return verdict;
@@ -1015,7 +1040,7 @@ static int sv_enter(IRSSAOptCtx *ctx, int block, void *state)
   if (lo == hi)
   {
     IRPhiNode *phi = sv_phi_for(s, cmp.xvr);
-    if (phi)
+    if (phi && !sv_phi_is_loop_phi(s, phi, cmp.xvr))
       sv_backprop_phi_eq(s, phi, lo);
   }
   return 0;
@@ -1032,6 +1057,8 @@ static void sv_seed_phis(SVState *s, int block)
     int dslot = sv_slot(s, p->dest_vreg);
     if (dslot < 0 || s->ranges[dslot].valid || p->num_operands <= 0)
       continue;
+    if (sv_phi_is_loop_phi(s, p, p->dest_vreg))
+      continue; /* backedge operand ranges describe the WRONG iteration */
     int64_t lo = INT64_MAX, hi = INT64_MIN;
     int k;
     for (k = 0; k < p->num_operands; k++)

@@ -1074,7 +1074,7 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
   uint32_t reserved = (1u << ARM_FP_REG); /* always exclude frame pointer */
   if (tcc_state->text_and_data_separation)
     reserved |= (1u << ARM_R9); /* R9 holds GOT base — must not be clobbered */
-  if (ir->has_static_chain)
+  if (ir->has_static_chain || ir->emits_set_chain)
     reserved |= (1u << (uint32_t)architecture_config.static_chain_reg);
   const uint32_t CALLEE_SAVED = ALL_CALLEE_SAVED & ~reserved;
 
@@ -2329,6 +2329,26 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   if (ir->has_static_chain)
   {
     extra_prologue_regs |= (1 << architecture_config.static_chain_reg);
+  }
+  else
+  {
+    /* A PARENT that calls its nested functions writes R10 at the call site
+     * (SET_CHAIN / INIT_CHAIN_SLOT pass the chain = its own FP).  R10 is
+     * AAPCS callee-saved, so the parent's own caller may keep a live value
+     * there — tccasm's asm_instr held nb_labels in R10 while
+     * parse_asm_operands called ITS nested helper, and every asm inside a
+     * nested function died with "invalid asm label count".  Put R10 in the
+     * prologue save mask whenever the body emits a chain write. */
+    for (int ci = 0; ci < ir->next_instruction_index; ci++)
+    {
+      int cop = ir->compact_instructions[ci].op;
+      if (cop == TCCIR_OP_SET_CHAIN || cop == TCCIR_OP_INIT_CHAIN_SLOT)
+      {
+        ir->emits_set_chain = 1;
+        extra_prologue_regs |= (1 << architecture_config.static_chain_reg);
+        break;
+      }
+    }
   }
 
   /* Phase-3 per-instruction scratch constraint recording.

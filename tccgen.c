@@ -820,6 +820,28 @@ static int gjmp_acs(int t)
   return t;
 }
 
+/* Jump to an already-emitted instruction (loop backedge, backward goto).
+ * Unlike the gsym chain path, nothing later backpatches this jump, so the
+ * target must be marked as a jump target HERE — optimization passes (e.g.
+ * setif_branch_fuse) trust is_jump_target when deciding whether a flag-setting
+ * instruction can be removed, and a fallthrough-only loop condition has no
+ * other jump that would mark it. */
+static int gjmp_addr_acs(int a)
+{
+  TCCIRState *ir = tcc_state->ir;
+  SValue dest;
+  svalue_init(&dest);
+  dest.vr = -1;
+  dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
+  dest.c.i = a;
+  int t = tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+  if (a >= 0 && a < ir->next_instruction_index)
+    ir->compact_instructions[a].is_jump_target = 1;
+  else if (a == ir->next_instruction_index)
+    ir->next_insn_is_jump_target = 1;
+  return t;
+}
+
 /* These are #undef'd at the end of this file */
 #define gjmp_addr gjmp_addr_acs
 #define gjmp gjmp_acs
@@ -17914,6 +17936,7 @@ va_arg_pack_done:
        * store-to-inline_return_loc + jump-to-rsym pattern. */
       uint8_t saved_in_inline_expansion = tcc_state->in_inline_expansion;
       int saved_inline_return_loc = tcc_state->inline_return_loc;
+      uint8_t saved_inline_return_redirected = tcc_state->inline_return_redirected;
 
       /* Set up inline function context */
       func_vt = s->type; /* return type */
@@ -17953,6 +17976,7 @@ va_arg_pack_done:
        * expansion and NOT for nested '{...}' blocks inside the inline body. */
       tcc_state->in_inline_expansion = local_scope;
       tcc_state->inline_return_loc = inline_ret_loc;
+      tcc_state->inline_return_redirected = 0;
       tcc_state->inline_expansion_depth++;
       root_scope = cur_scope;
 
@@ -17986,6 +18010,7 @@ va_arg_pack_done:
       inline_ret_loc = tcc_state->inline_return_loc;
       tcc_state->in_inline_expansion = saved_in_inline_expansion;
       tcc_state->inline_return_loc = saved_inline_return_loc;
+      tcc_state->inline_return_redirected = saved_inline_return_redirected;
       tcc_state->inline_expansion_depth--;
       func_vt = saved_func_vt;
       func_var = saved_func_var;
@@ -25925,12 +25950,14 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   struct scope *saved_root_scope = root_scope;
   uint8_t saved_in_inline_expansion = tcc_state->in_inline_expansion;
   int saved_inline_return_loc = tcc_state->inline_return_loc;
+  uint8_t saved_inline_return_redirected = tcc_state->inline_return_redirected;
 
   func_vt = s->type; /* void */
   func_var = 0;
   rsym = -1;
   tcc_state->in_inline_expansion = local_scope;
   tcc_state->inline_return_loc = 0;
+  tcc_state->inline_return_redirected = 0;
   tcc_state->inline_expansion_depth++;
   root_scope = cur_scope;
 
@@ -25961,6 +25988,7 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   /* --- Restore state --- */
   tcc_state->in_inline_expansion = saved_in_inline_expansion;
   tcc_state->inline_return_loc = saved_inline_return_loc;
+  tcc_state->inline_return_redirected = saved_inline_return_redirected;
   tcc_state->inline_expansion_depth--;
   func_vt = saved_func_vt;
   func_var = saved_func_var;
@@ -26273,7 +26301,6 @@ again:
   }
   else if (t == TOK_WHILE)
   {
-    SValue dest;
     new_scope_s(&o);
     d = gind();
     skip('(');
@@ -26287,12 +26314,7 @@ again:
     a = tcc_ir_codegen_test_gen(tcc_state->ir, 1, -1);
     b = -1; /* Initialize continue chain with -1 sentinel */
     lblock(&a, &b);
-    // gjmp_addr(d);
-    svalue_init(&dest);
-    dest.vr = -1;
-    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-    dest.c.i = d;
-    d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+    d = gjmp_addr(d);
     // gsym_addr(b, d);
     tcc_ir_backpatch_to_here(tcc_state->ir, a);
     tcc_ir_backpatch(tcc_state->ir, b, d);
@@ -26395,11 +26417,20 @@ again:
            * if it's a simple stack local.  This eliminates one memmove —
            * the caller's assignment will copy directly from the inlined
            * function's local variable. */
-          if ((vtop->r & (VT_LOCAL | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && vtop->vr == -1)
+          if ((vtop->r & (VT_LOCAL | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && vtop->vr == -1 &&
+              !tcc_state->inline_return_redirected)
           {
+            /* Only the FIRST return may retarget the slot.  Retargeting again
+             * would move the caller's read away from the slot the first
+             * return left its value in — and that first return emits no copy,
+             * so its path would read an uninitialized slot (a two-return
+             * `return local;` / `return f();` body did exactly that).  Later
+             * returns take the vstore() copy below, which writes into this
+             * same retargeted slot. */
             LOG_INLINE_STRUCT("[inline-struct] redirect return: loc %d -> %d", (int)tcc_state->inline_return_loc,
                               (int)vtop->c.i);
             tcc_state->inline_return_loc = vtop->c.i;
+            tcc_state->inline_return_redirected = 1;
             vtop--;
           }
           else
@@ -26547,12 +26578,7 @@ again:
       c = tcc_state->ir->next_instruction_index;
       gexpr();
       vpop();
-      // gjmp_addr(c);
-      svalue_init(&dest);
-      dest.vr = -1;
-      dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-      dest.c.i = d;
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      gjmp_addr(d);
       tcc_ir_backpatch_to_here(tcc_state->ir, e);
       // gsym(e);
     }
@@ -26560,17 +26586,11 @@ again:
     /* Save line number before loop body for backward jump */
     saved_line_num = file->line_num;
     lblock(&a, &b);
-    // gjmp_addr(d);
-    SValue dest;
-    svalue_init(&dest);
-    dest.vr = -1;
-    dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-    dest.c.i = c;
     /* Temporarily restore line number for backward jump instruction */
     {
       int cur_line = file->line_num;
       file->line_num = saved_line_num;
-      d = tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+      d = gjmp_addr(c);
       file->line_num = cur_line;
     }
     tcc_ir_backpatch_to_here(tcc_state->ir, a);
@@ -26856,14 +26876,8 @@ again:
         }
         else
         {
-          SValue dest;
-          svalue_init(&dest);
           try_call_cleanup_goto(s->cleanupstate);
-          dest.vr = -1;
-          dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
-          dest.c.i = s->jind;
-          // gjmp_addr(s->jind);
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_JUMP, NULL, NULL, &dest);
+          gjmp_addr(s->jind);
         }
         next();
       } /* !is_nonlocal_goto */

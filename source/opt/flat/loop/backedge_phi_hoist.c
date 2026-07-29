@@ -145,6 +145,44 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
       }
     }
 
+    /* This pass runs POST-RA: two different vregs can share one physical
+     * register (the latch copy `var <- next_tmp` is routinely coalesced into
+     * a single register).  The vreg-identity scan above is blind to that: the
+     * exit path may read the OTHER vreg living in the ASSIGN dest's register
+     * (ir/cfg.c compute_dominators: `next<-pred` hoisted above the
+     * `new_idom==-1` branch overwrote r6, and the else arm passed r6 — the
+     * coalesced new_idom — to cfg_intersect, corrupting every idom; the
+     * device tcc built from it died with "invalid opcode" on -O2).  A copy
+     * that is a physical no-op (dest and src assigned the same registers)
+     * cannot clobber anything; any other copy whose dest register is claimed
+     * by another interval still live at the branch is unsafe. */
+    for (int j = 0; j < num_assigns && safe; j++) {
+      IRQuadCompact *aq = &ir->compact_instructions[i + 1 + j];
+      int32_t adst_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, aq));
+      int32_t asrc_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, aq));
+      LSLiveInterval *di = NULL, *si = NULL;
+      if (adst_vr < 0)
+        continue;
+      for (int k = 0; k < ir->ls.next_interval_index; k++) {
+        LSLiveInterval *li = &ir->ls.intervals[k];
+        if (!di && li->vreg == (uint32_t)adst_vr)
+          di = li;
+        if (!si && asrc_vr >= 0 && li->vreg == (uint32_t)asrc_vr)
+          si = li;
+      }
+      if (!di || di->r0 < 0) {
+        safe = 0; /* no allocation info: cannot prove the clobber is confined */
+        break;
+      }
+      if (si && si->r0 == di->r0 && si->r1 == di->r1)
+        continue; /* physical no-op copy */
+      if (tcc_ls_reg_held_by_other(&ir->ls, di->r0, i, di))
+        safe = 0;
+      if (safe && di->r1 >= 0 && di->r1 < 16 &&
+          tcc_ls_reg_held_by_other(&ir->ls, di->r1, i, di))
+        safe = 0;
+    }
+
     if (!safe)
       continue;
 

@@ -872,6 +872,76 @@ UT_TEST(test_backedge_phi_hoist_spilled_operand_kept)
   return 0;
 }
 
+/* NEGATIVE (guard): post-RA physical aliasing.  The phi ASSIGN's dest (T1,
+ * r6) is a REAL copy (src T2 lives in r2), and a DIFFERENT vreg (T3, the
+ * register-coalesced partner) also lives in r6 across the branch and is read
+ * on the exit path.  Hoisting the copy above the guard would clobber T3's
+ * value on that path -- the vreg-identity exit scan cannot see it (T3 != T1).
+ * This is the ir/cfg.c compute_dominators miscompile: `next <- pred` hoisted
+ * above `new_idom == -1` overwrote r6, and the else arm passed the clobbered
+ * r6 to cfg_intersect, corrupting every idom (the -O2-built device tcc then
+ * died with "received invalid opcode").  The transform must not fire. */
+UT_TEST(test_backedge_phi_hoist_coalesced_reg_alias_kept)
+{
+  TCCIRState *ir = utb_new();
+  utb_ls_new(ir);
+  utb_ls_reg(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 1), 6); /* phi dest: r6 */
+  utb_ls_reg(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 2), 2); /* phi src: r2 (real mov) */
+  utb_ls_reg(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 3), 6); /* coalesced partner: also r6, live across */
+
+  int cmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(3, I32), utb_imm(-1, I32));      /* 0 */
+  int jif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(5), utb_imm(TOK_NE, I32), UTB_NONE); /* 1: exit=5 */
+  int asg = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_temp(2, I32), UTB_NONE);   /* 2: phi copy */
+  int jmp = utb_emit(ir, TCCIR_OP_JUMP, utb_jtarget(0), UTB_NONE, UTB_NONE);               /* 3: back edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                                /* 4 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(4, I32), utb_temp(3, I32), utb_imm(1, I32));         /* 5: exit reads T3 (r6) */
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(4, I32), UTB_NONE);                /* 6 */
+
+  int changes = tcc_ir_opt_backedge_phi_hoist(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, jif), TCCIR_OP_JUMPIF);
+  UT_ASSERT_EQ(utb_op(ir, asg), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, jmp), TCCIR_OP_JUMP);
+
+  utb_free(ir);
+  utb_ls_free(ir);
+  return 0;
+}
+
+/* POSITIVE control for the aliasing guard: identical shape, but the other
+ * r6 interval is NOT live at the branch (its range ends long before), so the
+ * real copy clobbers nothing and the hoist stays enabled. */
+UT_TEST(test_backedge_phi_hoist_dead_reg_alias_still_hoists)
+{
+  TCCIRState *ir = utb_new();
+  utb_ls_new(ir);
+  utb_ls_reg(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 1), 6);
+  utb_ls_reg(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 2), 2);
+  /* T3 also got r6, but its live range [600,1000] does not cover the branch. */
+  tcc_ls_add_live_interval(&ir->ls, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 3), 600, 1000, 0, 0,
+                           LS_REG_TYPE_INT, 0, 6);
+
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_imm(10, I32));                /* 0 */
+  int jif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(5), utb_imm(TOK_GE, I32), UTB_NONE); /* 1: exit=5 */
+  int asg = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_temp(2, I32), UTB_NONE);   /* 2 */
+  int jmp = utb_emit(ir, TCCIR_OP_JUMP, utb_jtarget(0), UTB_NONE, UTB_NONE);               /* 3 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(4, I32), utb_temp(4, I32), utb_imm(1, I32));         /* 4 */
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(4, I32), UTB_NONE);                /* 5 */
+
+  int changes = tcc_ir_opt_backedge_phi_hoist(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_op(ir, jif), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, asg), TCCIR_OP_JUMPIF);
+  UT_ASSERT_EQ(utb_op(ir, jmp), TCCIR_OP_NOP);
+
+  utb_free(ir);
+  utb_ls_free(ir);
+  return 0;
+}
+
 /* ================================================================== post_ra_forward_diamond */
 
 /* POSITIVE: a strict forward diamond `JUMPIF cond->T; ASSIGN(coalesced

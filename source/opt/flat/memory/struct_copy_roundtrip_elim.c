@@ -77,7 +77,27 @@ static int scre_resolve_slot_addr(TCCIRState *ir, IROperand op, int before_idx, 
     IROperand dd = tcc_ir_op_get_dest(ir, dq);
     if (!irop_has_vreg(dd) || irop_get_vreg(dd) != vr)
       continue;
-    /* Found the (latest) def of the param vreg. */
+    /* Found the textually latest def of the param vreg BEFORE the use.  That
+     * is only THE reaching def if the vreg has no other def anywhere: for a
+     * struct-valued ternary `cond ? f() : g()` the address temp is a phi with
+     * one `T <- Addr[StackLoc[..]]` per arm, and resolving through the
+     * fall-through arm's def eliminated a real cross-slot transfer as a
+     * "roundtrip" (the on-device tcc corrupted SELECT folds in its own
+     * ssa_rewrite_flag_consumer this way). */
+    for (int o = 0; o < ir->next_instruction_index; o++)
+    {
+      if (o == d)
+        continue;
+      IRQuadCompact *oq = &ir->compact_instructions[o];
+      if (oq->op == TCCIR_OP_NOP || !irop_config[oq->op].has_dest)
+        continue;
+      if (oq->op == TCCIR_OP_STORE || oq->op == TCCIR_OP_STORE_INDEXED ||
+          oq->op == TCCIR_OP_STORE_POSTINC)
+        continue; /* store dest is an address use, not a def */
+      IROperand od = tcc_ir_op_get_dest(ir, oq);
+      if (irop_has_vreg(od) && irop_get_vreg(od) == vr && !od.is_lval)
+        return 0;
+    }
     if (dq->op != TCCIR_OP_LEA && dq->op != TCCIR_OP_ASSIGN)
       return 0;
     IROperand ds1 = tcc_ir_op_get_src1(ir, dq);
