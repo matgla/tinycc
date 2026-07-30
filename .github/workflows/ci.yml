@@ -286,8 +286,15 @@ jobs:
           python3 tests/benchmarks/run_fp_conformance.py "$PERF_HOST" \
               --identity "$PERF_IDENTITY" --opt-level 1
           echo "--- RP2350 DCP inline codegen ---"
+          # --allow-ftz only on this configuration: the DCP flushes subnormals to
+          # zero and has no path that doesn't (pico-sdk's own dcp_canned.inc.S
+          # sequences, which ours are transcribed from, behave the same).  The
+          # flag accepts exactly that deviation -- any non-subnormal vector still
+          # fails the step.  The baseline above deliberately does NOT get it, so
+          # soft float stays held to full IEEE-754.
           python3 tests/benchmarks/run_fp_conformance.py "$PERF_HOST" \
-              --identity "$PERF_IDENTITY" --opt-level 1 --fp-lib rp2350fp --mfpu rp2350
+              --identity "$PERF_IDENTITY" --opt-level 1 --fp-lib rp2350fp --mfpu rp2350 \
+              --allow-ftz
 
       - name: Gate
         if: ${{ vars.METRICS_GATE_ENABLED == 'true' }}

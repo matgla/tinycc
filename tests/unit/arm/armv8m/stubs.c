@@ -586,7 +586,10 @@ int tok_alloc_const(const char *str)
 }
 #endif /* UT_SSA_OPT_REAL */
 
-/* Needed by BOTH builds (outside the guard): tccgen's current-function
- * name, read by narrow.c's float-demote self-call guard.  tccgen.c is not
- * linked into any UT binary, so provide the definition here. */
+/* tccgen's current-function name, read by narrow.c's float-demote
+ * self-call guard.  Only the ssaopt build needs it from here: the main and
+ * backend builds link ra_link_stubs.c, which already defines it (defining
+ * it in both files is a multiple-definition link error under -fno-common). */
+#ifdef UT_SSA_OPT_REAL
 const char *funcname;
+#endif
