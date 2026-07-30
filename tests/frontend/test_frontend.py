@@ -99,6 +99,30 @@ def _normalize_predefined_macros(output):
     return output
 
 
+_GLOBALSYM_RE = re.compile(r"GlobalSym\((\d+)\)")
+
+
+def _canonicalize_symbols(text):
+    """Renumber `GlobalSym(<tok>)` to `GlobalSym(#<n>)` by first appearance.
+
+    The number the dumper prints is a frontend token id, so it shifts whenever
+    the predefined-token set changes -- e.g. dropping the `arm` / `arm_elf`
+    machine defines moved every id down by two and broke eight goldens that no
+    frontend change had touched.  Pin the symbol's IDENTITY instead: equal ids
+    stay equal, different ids stay different, the absolute value stops
+    mattering.  Same canonicalization as tests/ir_tests/test_golden_ir.py.
+    """
+    mapping = {}
+
+    def repl(match):
+        tok = match.group(1)
+        if tok not in mapping:
+            mapping[tok] = len(mapping)
+        return f"GlobalSym(#{mapping[tok]})"
+
+    return _GLOBALSYM_RE.sub(repl, text)
+
+
 def _discover_cases(mode, golden_ext):
     """Return [(case_name, c_file, golden_file), ...] for a frontend mode."""
     mode_dir = FRONTEND_DIR / mode
@@ -221,7 +245,7 @@ def test_types(name, c_file, golden, debug_compiler, tmp_path, request):
             f"Stderr:\n{result.stderr}"
         )
 
-    actual = result.stdout
+    actual = _canonicalize_symbols(result.stdout)
 
     if updating:
         golden.write_text(actual)
