@@ -841,6 +841,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   }
   if (estore_count == 0)
   {
+    tcc_free(tmp_defs);
+    tcc_free(var_defs);
     tcc_free(lea_map);
     tcc_free(var_lea_map);
     tcc_free(rt_base);
