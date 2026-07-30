@@ -123,6 +123,12 @@ void tcc_ir_pools_free(TCCIRState *ir)
 
 uint32_t tcc_ir_pool_add_i64(TCCIRState *ir, int64_t val)
 {
+  /* Intern: slots are never mutated in place, so equal values can share one.
+   * Value-numbering keys I64 operands by pool_idx (gvn_src_class), so without
+   * this, two instructions folding the same 64-bit constant are never CSE'd. */
+  for (uint32_t k = 0; k < ir->pool_i64_count; k++)
+    if (ir->pool_i64[k] == val)
+      return k;
   if (ir->pool_i64_count >= ir->pool_i64_capacity)
   {
     ir->pool_i64_capacity *= 2;
@@ -580,6 +586,21 @@ done:
   /* DONE: Phase 2 - Set complex flag for all paths */
   result.is_complex = is_complex;
 
+  /* 64-bit deref alignment: a 64-bit lvalue whose access chain never crossed
+   * a packed struct member is >= 4-byte aligned by C's static type rules
+   * (long long / double have natural alignment 8), so the backend may use
+   * LDRD/STRD through a general base register.  sv->underaligned is set at
+   * member access and propagated through pointer arithmetic; when it is set
+   * the operand stays on the unaligned-safe LDR/STR-pair path. */
+  if (result.is_lval && (irop_bt == IROP_BTYPE_INT64 || irop_bt == IROP_BTYPE_FLOAT64) && !sv->underaligned &&
+      !is_complex)
+    result.aux |= IROP_AUX_ALIGN4_OK;
+  /* Inverse-polarity mark for the indexed-op path: fusion passes transfer it
+   * from the deref operand onto the LOAD/STORE_INDEXED base operand so the
+   * backend can suppress its alignment-assuming LDRD/STRD lowering. */
+  if (result.is_lval && sv->underaligned)
+    result.aux |= IROP_AUX_UNDERALIGN;
+
   /* Debug: verify round-trip conversion preserves data */
   // irop_compare_svalue(ir, sv, result, "svalue_to_iroperand");
   return result;
@@ -604,6 +625,15 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
   /* DONE: Phase 2 - Restore complex type flag from IROperand to SValue */
   if (op.is_complex)
     out->type.t |= VT_COMPLEX;
+
+  /* Keep round-trips conservative: a 64-bit lvalue that was NOT proven
+   * 4-byte aligned must come back marked underaligned, or a later
+   * svalue_to_iroperand would re-derive align4_ok=1 from the bare type and
+   * unlock LDRD/STRD on a possibly-packed address. */
+  if (op.is_lval && (irop_bt == IROP_BTYPE_INT64 || irop_bt == IROP_BTYPE_FLOAT64) && !(op.aux & IROP_AUX_ALIGN4_OK))
+    out->underaligned = 1;
+  if (op.aux & IROP_AUX_UNDERALIGN)
+    out->underaligned = 1;
 
   switch (tag)
   {

@@ -75,11 +75,17 @@ double __aeabi_dadd(double a, double b)
     return ur.d;
   }
 
-  /* Add implicit bit for normalized numbers */
+  /* Add the implicit bit for normals.  A subnormal has a stored exponent of 0
+   * but an *effective* exponent of 1 (it is 0.mant x 2^-1022, not 2^-1023);
+   * using the stored 0 misaligns every subnormal by one binade. */
   if (a_exp != 0)
     a_mant |= DOUBLE_IMPLICIT_BIT;
+  else
+    a_exp = 1;
   if (b_exp != 0)
     b_mant |= DOUBLE_IMPLICIT_BIT;
+  else
+    b_exp = 1;
 
   /* Align exponents - shift smaller mantissa right.
    * Work with 3 extra low bits (guard/round/sticky) so bits shifted out
@@ -129,13 +135,6 @@ double __aeabi_dadd(double a, double b)
     /* Same sign: add mantissas */
     result_mant = a_mant + b_mant;
     result_sign = a_sign;
-
-    /* Check for overflow (carry); keep the shifted-out bit as sticky */
-    if (result_mant & ((DOUBLE_IMPLICIT_BIT << 1) << 3))
-    {
-      result_mant = (result_mant >> 1) | (result_mant & 1);
-      result_exp++;
-    }
   }
   else
   {
@@ -151,51 +150,19 @@ double __aeabi_dadd(double a, double b)
       result_sign = b_sign;
     }
 
-    /* Normalize - shift left until implicit bit is set */
+    /* Exact cancellation is +0 in round-to-nearest (IEEE 754 section 6.3). */
     if (result_mant == 0)
     {
       ur.u = 0;
       return ur.d;
     }
-    while (!(result_mant & (DOUBLE_IMPLICIT_BIT << 3)) && result_exp > 0)
-    {
-      result_mant <<= 1;
-      result_exp--;
-    }
   }
 
-  /* Round to nearest, ties to even, using the guard/round/sticky bits */
-  {
-    uint64_t grs = result_mant & 7;
-    result_mant >>= 3;
-    if (grs > 4 || (grs == 4 && (result_mant & 1)))
-    {
-      result_mant++;
-      if (result_mant & (DOUBLE_IMPLICIT_BIT << 1))
-      {
-        result_mant >>= 1;
-        result_exp++;
-      }
-    }
-  }
-
-  /* Check for overflow to infinity */
-  if (result_exp >= 0x7FF)
-  {
-    ur.u = make_double(result_sign, 0x7FF, 0);
-    return ur.d;
-  }
-
-  /* Check for underflow to zero */
-  if (result_exp <= 0)
-  {
-    ur.u = make_double(result_sign, 0, 0);
-    return ur.d;
-  }
-
-  /* Remove implicit bit and build result */
-  result_mant &= DOUBLE_MANT_MASK;
-  ur.u = make_double(result_sign, result_exp, result_mant);
+  /* Normalization, gradual underflow to subnormals, round-to-nearest-even and
+   * overflow to infinity all happen here.  The previous code normalized only
+   * while result_exp > 0 and then flushed any result with result_exp <= 0 to
+   * zero, so every subnormal result was lost. */
+  ur.u = sfp_round_pack_double(result_sign, result_exp, result_mant);
   return ur.d;
 }
 

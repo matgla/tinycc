@@ -929,53 +929,74 @@ UT_TEST(test_shift64_dead_half_shift_amount_below_32_no_mark)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_pack64)
+/* POSITIVE (skip_hi): a 64-bit SHR by >=32 fills its HIGH word with a constant
+ * 0.  When the single use is a TRUNCATING ASSIGN (64-bit source, 32-bit dest)
+ * that fill is never read, so the pass annotates bit1 (skip_hi).  Note the
+ * ASSIGN's SOURCE operand stays I64 -- the DEST width is what decides that only
+ * the low half is read, which is the case the rule must recognise. */
+UT_TEST(test_shift64_dead_half_marks_skip_hi_truncating_assign)
 {
-  UT_COVERS("pack64");
-  UT_COVERS("pack64_from_stack_stores");
-  UT_COVERS("pack64_implicit");
-  UT_COVERS("pack64_tautology");
-  UT_COVERS("cmp_narrow_64");
-  UT_COVERS("shl32_or_chain");
-  UT_COVERS("shift64_dead_half");
+  TCCIRState *ir = utb_new();
+  ir->next_temporary_variable = 2;
 
-  UT_RUN(test_pack64_explicit_zext_shl_or_fires);
-  UT_RUN(test_pack64_explicit_operand_order_swapped_fires);
-  UT_RUN(test_pack64_explicit_non64_or_dest_no_fire);
-  UT_RUN(test_pack64_explicit_wrong_shift_amount_no_fire);
-  UT_RUN(test_pack64_explicit_multi_use_shl_no_fire);
+  int i_shr = utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I64), utb_temp(0, I64), utb_imm(41, I32)); /* 0 */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_temp(1, I64), UTB_NONE);                  /* 1 */
+  ir->max_orig_index = 1;
 
-  UT_RUN(test_pack64_stack_stores_direct_slot_fires);
-  UT_RUN(test_pack64_stack_stores_var_spill_alias_no_fire);
-  UT_RUN(test_pack64_stack_stores_missing_hi_no_fire);
-  UT_RUN(test_pack64_stack_stores_call_between_no_fire);
-  UT_RUN(test_pack64_stack_stores_redef_between_no_fire);
-  UT_RUN(test_pack64_stack_stores_non64_load_no_fire);
+  int changes = tcc_ir_opt_shift64_dead_half(ir);
 
-  UT_RUN(test_pack64_implicit_shl_or_fires);
-  UT_RUN(test_pack64_implicit_lo_operand_64bit_no_fire);
-  UT_RUN(test_pack64_implicit_hi_input_64bit_no_fire);
-  UT_RUN(test_pack64_implicit_both_const_no_fire);
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT(ir->shift64_dead_half != NULL);
+  UT_ASSERT_EQ(ir->shift64_dead_half[ir->compact_instructions[i_shr].orig_index] & 2, 2);
+  /* No IR mutation. */
+  UT_ASSERT_EQ(utb_op(ir, i_shr), TCCIR_OP_SHR);
 
-  UT_RUN(test_pack64_tautology_identity_fires);
-  UT_RUN(test_pack64_tautology_different_vars_no_fire);
-  UT_RUN(test_pack64_tautology_wrong_shr_amount_no_fire);
-  UT_RUN(test_pack64_tautology_not_64bit_var_no_fire);
-
-  UT_RUN(test_cmp_narrow64_zext_eq_fires);
-  UT_RUN(test_cmp_narrow64_zext_ult_fires);
-  UT_RUN(test_cmp_narrow64_signed_relational_no_fire);
-  UT_RUN(test_cmp_narrow64_src2_high_bits_set_no_fire);
-  UT_RUN(test_cmp_narrow64_unproven_hi_no_fire);
-
-  UT_RUN(test_shl32_or_chain_shl32_consumer_fires);
-  UT_RUN(test_shl32_or_chain_and_low_consumer_fires);
-  UT_RUN(test_shl32_or_chain_and_wrong_mask_no_fire);
-  UT_RUN(test_shl32_or_chain_no_shl_operand_no_fire);
-
-  UT_RUN(test_shift64_dead_half_marks_skip_lo);
-  UT_RUN(test_shift64_dead_half_multi_use_no_mark);
-  UT_RUN(test_shift64_dead_half_shift_amount_below_32_no_mark);
+  utb_free(ir);
+  return 0;
 }
+
+/* NEGATIVE (skip_hi): the single use is a WIDE assign (64-bit dest), which
+ * copies both halves -- the high fill is read, so it must be materialized. */
+UT_TEST(test_shift64_dead_half_wide_use_no_skip_hi)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_temporary_variable = 2;
+
+  utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I64), utb_temp(0, I64), utb_imm(41, I32));
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I64), utb_temp(1, I64), UTB_NONE);
+  ir->max_orig_index = 1;
+
+  int changes = tcc_ir_opt_shift64_dead_half(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (skip_hi): shift amount < 32 keeps a data-dependent high word, and
+ * the emitter does not honour skip_hi on that path anyway. */
+UT_TEST(test_shift64_dead_half_skip_hi_below_32_no_mark)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_temporary_variable = 2;
+
+  utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I64), utb_temp(0, I64), utb_imm(20, I32));
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_temp(1, I64), UTB_NONE);
+  ir->max_orig_index = 1;
+
+  int changes = tcc_ir_opt_shift64_dead_half(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+UT_COVERS("pack64");
+UT_COVERS("pack64_from_stack_stores");
+UT_COVERS("pack64_implicit");
+UT_COVERS("pack64_tautology");
+UT_COVERS("cmp_narrow_64");
+UT_COVERS("shl32_or_chain");
+UT_COVERS("shift64_dead_half");

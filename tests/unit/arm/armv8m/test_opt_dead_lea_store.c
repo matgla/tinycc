@@ -467,25 +467,4 @@ UT_TEST(test_dls_offset_zero_dead)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_dead_lea_store)
-{
-  UT_COVERS("dead_lea_store_elim");
-  UT_RUN(test_dls_dead_direct_store_removed);
-  UT_RUN(test_dls_dead_lea_deref_store_removed);
-  UT_RUN(test_dls_store_with_later_load_kept);
-  UT_RUN(test_dls_address_escape_bails);
-  UT_RUN(test_dls_no_temps_early_out);
-  UT_RUN(test_dls_disjoint_ranges_dead);
-  UT_RUN(test_dls_overlapping_ranges_kept);
-  UT_RUN(test_dls_width_mismatch_kept);
-  UT_RUN(test_dls_multiple_stores_same_slot_dead);
-  UT_RUN(test_dls_multiple_stores_earlier_not_eliminated);
-  UT_RUN(test_dls_deref_read_keeps_store);
-  UT_RUN(test_dls_lea_temp_address_escape_bails);
-  UT_RUN(test_dls_loop_carried_read_kept);
-  UT_RUN(test_dls_unsupported_opcode_bails);
-  UT_RUN(test_dls_empty_function_returns_zero);
-  UT_RUN(test_dls_offset_zero_dead);
-}
+UT_COVERS("dead_lea_store_elim");

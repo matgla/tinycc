@@ -20,14 +20,14 @@
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include <limits.h>
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #define I32 IROP_BTYPE_INT32
 #define I64 IROP_BTYPE_INT64
@@ -148,7 +148,7 @@ UT_TEST(test_sccp_barrel_shift_guard)
   int n = and_i + 1;
   c.ir->barrel_shifts = tcc_mallocz(n * sizeof(uint8_t));
   c.ir->barrel_shifts[and_i] = 1;
-  c.ir->max_orig_index = and_i;
+  c.ir->barrel_shifts_len = n;
 
   int changed = ssa_opt_sccp(c.ctx);
   (void)changed;
@@ -242,7 +242,8 @@ UT_TEST(test_sccp_stack_load_alias_no_forward)
 }
 
 /* ========================================================================
- * A function call is a memory barrier for stack-load forwarding.
+ * A call is only a stack-load-forwarding barrier when the slot's address
+ * escapes to the callee; a non-escaped slot forwards across the call.
  * ======================================================================== */
 
 UT_TEST(test_sccp_stack_load_call_barrier)
@@ -250,6 +251,30 @@ UT_TEST(test_sccp_stack_load_call_barrier)
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
   IROperand slot = utb_stackoff(8, 1, 0, 0, I32);
   ssa_add_instr(&c, TCCIR_OP_STORE, slot, utb_imm(42, I32));
+  ssa_add_instr3(&c, TCCIR_OP_FUNCCALLVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  int load_i = ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(0, I32), slot);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_sccp(c.ctx);
+  UT_ASSERT(changed >= 1);
+
+  UT_ASSERT_EQ(utb_op(c.ir, load_i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, load_i).u.imm32, 42);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_sccp_stack_load_call_addr_escape_barrier)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  IROperand slot = utb_stackoff(8, 1, 0, 0, I32);
+  IROperand addr = utb_stackoff(8, 0, 0, 0, I32);
+  ssa_add_instr(&c, TCCIR_OP_STORE, slot, utb_imm(42, I32));
+  ssa_add_instr3(&c, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, addr, utb_imm(0, I32));
   ssa_add_instr3(&c, TCCIR_OP_FUNCCALLVOID, UTB_NONE, UTB_NONE, UTB_NONE);
   int load_i = ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(0, I32), slot);
 
@@ -809,31 +834,4 @@ UT_TEST(test_sccp_unknown)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_sccp)
-{
-  UT_COVERS("ssa:sccp");
-  UT_RUN(test_sccp_const_fold_arith_chain);
-  UT_RUN(test_sccp_const_fold_i64_pool);
-  UT_RUN(test_sccp_float_bottom);
-  UT_RUN(test_sccp_barrel_shift_guard);
-  UT_RUN(test_sccp_stack_load_forward);
-  UT_RUN(test_sccp_stack_load_non_alias_forward);
-  UT_RUN(test_sccp_stack_load_alias_no_forward);
-  UT_RUN(test_sccp_stack_load_call_barrier);
-  UT_RUN(test_sccp_stack_load_lea_deref_forward);
-  UT_RUN(test_sccp_store_indexed_forward);
-  UT_RUN(test_sccp_var_load_forward);
-  UT_RUN(test_sccp_phi_one_edge_folds);
-  UT_RUN(test_sccp_phi_two_edges_bottom);
-  UT_RUN(test_sccp_cmp_branch_folds);
-  UT_RUN(test_sccp_test_zero_branch);
-  UT_RUN(test_sccp_loop_clobbers_slot);
-  UT_RUN(test_sccp_loop_writes_slot_post_loop);
-  UT_RUN(test_sccp_entry_block_var_ptr_alias);
-  UT_RUN(test_sccp_cmp_var_substitute);
-  UT_RUN(test_sccp_cmp_var_pool_no_substitute);
-  UT_RUN(test_sccp_store_postinc_barrier);
-  UT_RUN(test_sccp_always_taken);
-  UT_RUN(test_sccp_never_taken);
-  UT_RUN(test_sccp_unknown);
-}
+UT_COVERS("ssa:sccp");

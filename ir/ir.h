@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_INTERNAL_H
-#define TCC_IR_INTERNAL_H
+#pragma once
 
 #include <stdbool.h>
 
@@ -34,9 +33,8 @@
 #include "pool.h"
 #include "regalloc.h"
 #include "ssa.h"
-#include "opt/ssa_opt.h"
+#include "ssa_opt.h"
 #include "stack.h"
 #include "type.h"
 #include "vreg.h"
 
-#endif /* TCC_IR_INTERNAL_H */

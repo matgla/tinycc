@@ -15,7 +15,23 @@ CC_WRAPPER ?=
 # Size tool for binary analysis
 SIZE_CMD ?= arm-none-eabi-size
 
-GCC_ABI_FLAGS = -mcpu=cortex-m33 -mthumb -mfloat-abi=soft #-mfloat-abi=hard -mfpu=fpv5-sp-d16
+# Float ABI under test:
+#   soft   - no FP instructions at all, FP arguments in GPRs
+#   softfp - FP instructions allowed, FP arguments still in GPRs
+#   hard   - AAPCS-VFP: FP arguments/results in VFP registers (s0-s15)
+# The ABI must match the libraries we link against, or float arguments are
+# passed one way and read another.  FLOAT_ABI drives both the compiler flags and
+# the library selection below, so `make ... FLOAT_ABI=hard` is self-consistent.
+FLOAT_ABI ?= soft
+FPU ?= fpv5-sp-d16
+
+ifeq ($(FLOAT_ABI),soft)
+FLOAT_FLAGS = -mfloat-abi=soft
+else
+FLOAT_FLAGS = -mfloat-abi=$(FLOAT_ABI) -mfpu=$(FPU)
+endif
+
+GCC_ABI_FLAGS = -mcpu=cortex-m33 -mthumb $(FLOAT_FLAGS)
 
 ARM_SYSROOT = $(shell arm-none-eabi-gcc $(GCC_ABI_FLAGS) --print-sysroot)
 MULTI_DIR = $(shell arm-none-eabi-gcc $(GCC_ABI_FLAGS) -print-multi-directory)
@@ -41,13 +57,27 @@ LIBM_G_PATH = $(shell arm-none-eabi-gcc $(GCC_ABI_FLAGS) -print-file-name=libm_g
 LIBRDIMON_PATH = $(shell arm-none-eabi-gcc $(GCC_ABI_FLAGS) -print-file-name=librdimon.a)
 
 # If set to 1, force using the locally built newlib/libgloss archives.
-# Note: newlib_build in this repo is a single-variant build (no multilib).
+# Note: each newlib_build dir is a single-variant build (no multilib), so there
+# is one per float ABI.  Only the soft one is built by default; for the other
+# ABIs the toolchain ships a complete matching multilib
+# (thumb/v8-m.main+fp/{softfp,hard}: libc, libm, libgcc, librdimon, crt), so we
+# use that instead of requiring a local newlib build per ABI.  Override with
+# USE_NEWLIB_BUILD=1 after running `sh build_newlib.sh $(FLOAT_ABI)`.
+ifeq ($(FLOAT_ABI),soft)
 USE_NEWLIB_BUILD ?= 1
+else
+USE_NEWLIB_BUILD ?= 0
+endif
 
 # If set to 1, link against debug libc/libm (libc_g.a, libm_g.a) when available.
 DEBUG_LIBC ?= 1
 
+# One newlib build tree per float ABI; the soft one keeps the historical name.
+ifeq ($(FLOAT_ABI),soft)
 NEWLIB_BUILD_DIR = $(MAKEFILE_DIR)/newlib_build
+else
+NEWLIB_BUILD_DIR = $(MAKEFILE_DIR)/newlib_build-$(FLOAT_ABI)
+endif
 NEWLIB_DIR = $(NEWLIB_BUILD_DIR)/arm-none-eabi/newlib
 NEWLIB_LIBC_G = $(NEWLIB_DIR)/libc_g.a
 NEWLIB_LIBM_G = $(NEWLIB_DIR)/libm_g.a
@@ -79,16 +109,34 @@ ifneq (,$(findstring armv8m-tcc,$(CC)))
 CFLAGS += -I$(LIBC_INCLUDES) -I$(LIBC_IMPORTS) -I$(NEWLIB_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
 TCC_FLAGS += -B$(TCC_PATH)
 LDFLAGS += -B$(TCC_PATH)
+
+# `-lsoftfp` resolves to lib/fp/libsoftfp.so (the yaff shared object) before
+# libsoftfp.a, which left every __aeabi_* symbol to be supplied by libgcc --
+# so the FP suite was silently testing libgcc, not the in-tree soft-float
+# library, and 524 conformance vectors' worth of bugs stayed invisible.
+# Name the static archive explicitly.  Defined outside the USE_NEWLIB_BUILD
+# split below because both branches reference it.
+SOFTFP_A := $(TCC_PATH)/lib/fp/libsoftfp.a
+
 ifeq ($(USE_NEWLIB_BUILD),1)
 NEWLIB_LIBC_A := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBC_G))),$(NEWLIB_LIBC_G),$(NEWLIB_DIR)/libc.a)
 NEWLIB_LIBM_A := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(NEWLIB_LIBM_G))),$(NEWLIB_LIBM_G),$(NEWLIB_DIR)/libm.a)
 NEWLIB_LIBRDIMON_A := $(LIBGLOSS_PATH)/librdimon.a
-LDFLAGS += -L$(TCC_PATH)/lib -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group -larmv8m-libtcc1.a -lsoftfp $(NEWLIB_LIBC_A) $(NEWLIB_LIBRDIMON_A) $(NEWLIB_LIBM_A) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
+LDFLAGS += -L$(TCC_PATH)/lib -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group -larmv8m-libtcc1.a $(SOFTFP_A) $(NEWLIB_LIBC_A) $(NEWLIB_LIBRDIMON_A) $(NEWLIB_LIBM_A) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
 CRT_LIBS = $(CRT_CRTI_PATH) $(LIBGLOSS_PATH)/rdimon-crt0.o $(CRT_CRTEND_PATH) $(CRT_CRTN_PATH)
 else
-LIBC_A_PATH := $(if $(filter 1,$(DEBUG_LIBC)),$(LIBC_G_PATH),$(LIBC_PATH))
-LIBM_A_PATH := $(if $(filter 1,$(DEBUG_LIBC)),$(LIBM_G_PATH),$(LIBM_PATH))
-LDFLAGS += -L$(TCC_PATH)/lib -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group $(LIBC_A_PATH) $(LIBRDIMON_PATH) -lsoftfp -larmv8m-libtcc1.a $(LIBM_A_PATH) $(LIBC_A_PATH) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
+# The toolchain multilibs ship no debug (libc_g.a / libm_g.a) variants — only
+# the locally built newlib does — so fall back to the normal archives when the
+# debug ones are absent, as the USE_NEWLIB_BUILD=1 branch above already does.
+LIBC_A_PATH := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(LIBC_G_PATH))),$(LIBC_G_PATH),$(LIBC_PATH))
+LIBM_A_PATH := $(if $(and $(filter 1,$(DEBUG_LIBC)),$(wildcard $(LIBM_G_PATH))),$(LIBM_G_PATH),$(LIBM_PATH))
+# libm precedes libtcc1: lib/builtin.c carries freestanding fallbacks for C
+# float APIs (fabsf, floorf, fmaxf, ...) built with the compiler's own default
+# ABI, so with a real libm present those must not shadow it — under
+# -mfloat-abi=hard the fallbacks would read float arguments from GPRs while the
+# caller passed them in s0-s15.  The C library owns the C library functions;
+# libtcc1 only supplies compiler runtime helpers.
+LDFLAGS += -L$(TCC_PATH)/lib -L$(TCC_PATH)/lib/fp -L$(TCC_PATH) -Wl,--start-group $(LIBC_A_PATH) $(LIBRDIMON_PATH) $(SOFTFP_A) $(LIBM_A_PATH) -larmv8m-libtcc1.a $(LIBC_A_PATH) $(LIBGCC_PATH) -Wl,--end-group -Wl,-oformat=elf32-littlearm -T$(MAKEFILE_DIR)linker_script.ld -v
 CRT_LIBS = $(CRT_CRTI_PATH) $(RDIMON_CRT0_PATH) $(CRT_CRTEND_PATH) $(CRT_CRTN_PATH)
 endif
 else
@@ -116,10 +164,11 @@ $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.S | $(OUTPUT)
 $(TARGET): $(OBJS) $(if $(filter 1,$(USE_NEWLIB_BUILD)),$(NEWLIB_DIR)/libc.a)
 	$(CC_WRAPPER) $(CC) $(CFLAGS) $(OBJS) $(CRT_LIBS) -o $@ $(LDFLAGS)
 
-# Build newlib from source if not already built.
+# Build newlib from source if not already built (soft ABI by default; other
+# ABIs normally use the toolchain multilib instead — see USE_NEWLIB_BUILD).
 $(NEWLIB_DIR)/libc.a:
-	@echo "newlib not found, building..."
-	cd $(MAKEFILE_DIR) && sh build_newlib.sh
+	@echo "newlib ($(FLOAT_ABI)) not found, building..."
+	cd $(MAKEFILE_DIR) && sh build_newlib.sh $(FLOAT_ABI) $(FPU)
 
 # Report binary size after build
 size: $(TARGET)

@@ -143,7 +143,6 @@ PROFILES = [
 LOW_RECALL_ON_PRESCAN = {"ptr", "struct_byval"}
 
 _CHILD_ENV = dict(os.environ)
-_CHILD_ENV.setdefault("ASAN_OPTIONS", "detect_leaks=0")
 
 _PRINT_LOCK = threading.Lock()
 
@@ -306,35 +305,40 @@ def _triage_report_path(profile: str, lo: int, hi: int) -> Path:
     return REPO_ROOT / stem
 
 
-def _parse_triage_report(path: Path) -> list[int]:
-    """Extract the divergent seed ids from a triage_olevels.sh markdown table —
-    the first column of each `| <seed> | ... |` row.  Header/separator rows have
-    no leading integer so they're skipped."""
+def _parse_triage_report(path: Path) -> tuple[list[int], list[int]]:
+    """Split a triage_olevels.sh markdown table into (miscompile_seeds,
+    sanitizer_seeds).  Column 1 is the seed, column 2 the class; TCC-ASAN /
+    TCC-LSAN rows are compiler-sanitizer findings (a bug in tcc itself), kept
+    apart from O-level miscompiles so the combined report counts each in its own
+    column.  Header/separator rows have no leading integer so they're skipped."""
     if not path.exists():
-        return []
-    seeds = set()
+        return [], []
+    mis, san = set(), set()
     for line in path.read_text().splitlines():
-        m = re.match(r"\|\s*(\d+)\s*\|", line)
-        if m:
-            seeds.add(int(m.group(1)))
-    return sorted(seeds)
+        m = re.match(r"\|\s*(\d+)\s*\|\s*([^|]*?)\s*\|", line)
+        if not m:
+            continue
+        (san if m.group(2).startswith("TCC-") else mis).add(int(m.group(1)))
+    return sorted(mis), sorted(san)
 
 
-def run_olevels_triage_sweep(profile: str, lo: int, hi: int, jobs: int, emit) -> tuple[list[int], str]:
+def run_olevels_triage_sweep(profile: str, lo: int, hi: int, jobs: int, emit) -> tuple[list[int], list[int], str]:
     """Full-recall olevels discovery for --mode triage.  Runs triage_olevels.sh
     over the whole band with NO SEEDS and NO FAST_SWEEP, so it does its exhaustive
     per-seed sweep_one (no batch_sweep, no ~80% recall gap) AND culprit-bisects the
-    divergent seeds in one pass.  Returns (divergent_seeds, error_or_empty); the
-    per-seed table is written to fuzz_triage_[<profile>_]<lo>_<hi>.md as a side
-    effect (the script skips writing it when nothing diverges)."""
+    divergent seeds in one pass.  Returns (miscompile_seeds, sanitizer_seeds,
+    error_or_empty) — sanitizer_seeds are TCC-ASAN/TCC-LSAN trips in the compiler
+    itself; the per-seed table is written to fuzz_triage_[<profile>_]<lo>_<hi>.md
+    as a side effect (the script skips writing it when nothing diverges)."""
     env = dict(_CHILD_ENV, FUZZ_PROFILE=profile)   # no SEEDS / no FAST_SWEEP => full-recall sweep
     cmd = ["bash", str(TRIAGE_SH), str(lo), str(hi), str(jobs)]
     rc, out = _stream(cmd, env, emit)
     if rc is None:
-        return [], "triage_olevels.sh " + out
+        return [], [], "triage_olevels.sh " + out
     if rc != 0:
-        return [], f"triage_olevels.sh rc={rc} (see streamed output above)"
-    return _parse_triage_report(_triage_report_path(profile, lo, hi)), ""
+        return [], [], f"triage_olevels.sh rc={rc} (see streamed output above)"
+    mis, san = _parse_triage_report(_triage_report_path(profile, lo, hi))
+    return mis, san, ""
 
 
 def run_triage(profile: str, seeds: list[int], jobs: int, emit) -> str:
@@ -360,6 +364,7 @@ def run_profile(idx: int, n_profiles: int, name: str, oracle: str, blurb: str,
 
     ol_seeds: list[int] = []
     ol_err = ""
+    san_seeds: list[int] = []   # compiler ASan/LSan trips (triage mode only)
     vg_cell = "—"
     vg_seeds: list[int] = []
     gcc_bad: list[int] = []   # gcc self-inconsistent (oracle-unreliable, quarantined)
@@ -392,13 +397,16 @@ def run_profile(idx: int, n_profiles: int, name: str, oracle: str, blurb: str,
         # also culprit-bisects every divergent seed in the same pass.
         if args.mode == "triage":
             emit(f"olevels full-recall sweep+triage [{args.lo}..{args.hi}] (no batch) ...")
-            ol_seeds, ol_err = run_olevels_triage_sweep(name, args.lo, args.hi, jobs, emit)
+            ol_seeds, san_seeds, ol_err = run_olevels_triage_sweep(name, args.lo, args.hi, jobs, emit)
         else:
             emit(f"olevels pre-scan [{args.lo}..{args.hi}] ...")
             ol_seeds, ol_err = run_olevels_prescan(name, args.lo, args.hi, jobs, emit)
         ol_cell = ol_err or str(len(ol_seeds))
         emit(f"olevels = {ol_cell}  [{time.monotonic() - t0:.0f}s]"
              + (f"  -> {ol_seeds[:20]}{' ...' if len(ol_seeds) > 20 else ''}" if ol_seeds else ""))
+        if san_seeds:
+            emit(f"asan/lsan = {len(san_seeds)}  -> {san_seeds[:20]}"
+                 f"{' ...' if len(san_seeds) > 20 else ''}  (compiler sanitizer trips)")
 
         if not args.olevels_only and oracle in ("vsgcc", "both"):
             t1 = time.monotonic()
@@ -419,11 +427,16 @@ def run_profile(idx: int, n_profiles: int, name: str, oracle: str, blurb: str,
     # seeds were set aside; the specific seed ids are in the live sweep log.
     vg_display = vg_cell + (f" (+{len(gcc_bad)} gcc-bad quarantined)" if gcc_bad else "")
 
+    # A compiler ASan/LSan trip flags the profile as much as a miscompile does.
+    san_cell = str(len(san_seeds)) if args.mode == "triage" else "—"
     detail: list[str] = []
-    flagged = sorted(set(ol_seeds) | set(vg_seeds))
+    flagged = sorted(set(ol_seeds) | set(vg_seeds) | set(san_seeds))
     if flagged:
         detail.append(f"\n## `{name}` — {len(flagged)} divergent seed(s)\n")
         detail.append("```\n" + " ".join(str(s) for s in flagged) + "\n```\n")
+        if san_seeds:
+            detail.append(f"\n**Compiler sanitizer trips (ASan/LSan in tcc): "
+                          f"{len(san_seeds)}** — {' '.join(str(s) for s in san_seeds)}\n")
         if args.mode == "triage":
             # olevels-divergent seeds were already culprit-bisected by the
             # full-recall sweep above; triage only the vs-gcc-ONLY seeds (the
@@ -440,7 +453,7 @@ def run_profile(idx: int, n_profiles: int, name: str, oracle: str, blurb: str,
             if refs:
                 detail.append("Culprit bisect: see " + " and ".join(refs) + ".\n")
     emit(f"[{name} done in {time.monotonic() - t0:.0f}s · {len(flagged)} flagged]")
-    return {"ol_cell": ol_cell, "recall_note": recall_note,
+    return {"ol_cell": ol_cell, "recall_note": recall_note, "san_cell": san_cell,
             "vg_display": vg_display, "flagged": flagged, "detail": detail}
 
 
@@ -476,8 +489,8 @@ def main(argv=None) -> int:
              f"Mode: **{args.mode}** · jobs: {args.jobs} · "
              f"oracles: olevels{'' if args.olevels_only else ' + vs-gcc (ABI profiles)'}",
              "",
-             "| profile | olevels | vs-gcc | yield rank seam |",
-             "|---|---|---|---|"]
+             "| profile | olevels | asan/lsan | vs-gcc | yield rank seam |",
+             "|---|---|---|---|---|"]
     n_diverged = 0
     detail: list[str] = []
     start = time.monotonic()
@@ -504,11 +517,13 @@ def main(argv=None) -> int:
                 results[name] = fut.result()
             except Exception as e:                          # pragma: no cover
                 results[name] = {"ol_cell": f"error: {e}", "recall_note": "",
-                                 "vg_display": "—", "flagged": [], "detail": []}
+                                 "san_cell": "—", "vg_display": "—",
+                                 "flagged": [], "detail": []}
 
     for name, oracle, blurb in profiles:
         r = results[name]
-        lines.append(f"| `{name}` | {r['ol_cell']}{r['recall_note']} | {r['vg_display']} | {blurb} |")
+        lines.append(f"| `{name}` | {r['ol_cell']}{r['recall_note']} | {r['san_cell']} | "
+                     f"{r['vg_display']} | {blurb} |")
         if r["flagged"]:
             n_diverged += 1
         detail.extend(r["detail"])

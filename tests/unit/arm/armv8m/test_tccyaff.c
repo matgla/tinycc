@@ -36,11 +36,13 @@ void tcc_yaff_prepare_init_fini(TCCState *s1);
 #endif
 void tcc_allocate_hash_table(YaffHashTable *ht, uint32_t number_of_buckets, uint32_t count);
 void tcc_add_hash_entry(YaffHashTable *ht, const char *name, uint32_t i);
-void tcc_free_hash_table(YaffHashTable *ht);
 void tcc_write_hash_table(YaffHashTable *ht, FILE *f);
 uint32_t tcc_yaff_align(YaffHeader *header, uint32_t size);
 const char *tcc_parse_object_name(YaffHeader *header);
 uint32_t tcc_get_offset_to_imported_libraries(YaffHeader *header);
+
+/* tcc_free() call counter kept by tccyaff_stubs.c. */
+extern unsigned tcc_test_free_count;
 
 /* ============================================================================
  * Pure helpers
@@ -112,7 +114,7 @@ UT_TEST(test_get_offset_to_imported_libraries)
 
 UT_TEST(test_hash_table_allocate_zeroes)
 {
-  YaffHashTable ht;
+  scoped_yaff_hash_table ht = {0};
   tcc_allocate_hash_table(&ht, 7, 10);
   UT_ASSERT_EQ(ht.nbucket, 7u);
   UT_ASSERT_EQ(ht.nchain, 10u);
@@ -126,9 +128,49 @@ UT_TEST(test_hash_table_allocate_zeroes)
   return 0;
 }
 
+UT_TEST(test_hash_table_scope_exit_frees_buffers)
+{
+  unsigned before = tcc_test_free_count;
+  {
+    scoped_yaff_hash_table ht = {0};
+    tcc_allocate_hash_table(&ht, 4, 4);
+  }
+  UT_ASSERT_EQ(tcc_test_free_count - before, 2u);
+  return 0;
+}
+
+UT_TEST(test_hash_table_free_clears_and_is_idempotent)
+{
+  scoped_yaff_hash_table ht = {0};
+  tcc_allocate_hash_table(&ht, 4, 4);
+  tcc_free_hash_table(&ht);
+  UT_ASSERT(ht.bucket == NULL);
+  UT_ASSERT(ht.chain == NULL);
+  UT_ASSERT_EQ(ht.nbucket, 0u);
+  UT_ASSERT_EQ(ht.nchain, 0u);
+
+  unsigned before = tcc_test_free_count;
+  tcc_free_hash_table(&ht);
+  UT_ASSERT_EQ(tcc_test_free_count - before, 0u);
+  return 0;
+}
+
+UT_TEST(test_hash_table_reallocate_releases_previous)
+{
+  scoped_yaff_hash_table ht = {0};
+  tcc_allocate_hash_table(&ht, 4, 4);
+
+  unsigned before = tcc_test_free_count;
+  tcc_allocate_hash_table(&ht, 8, 8);
+  UT_ASSERT_EQ(tcc_test_free_count - before, 2u);
+  UT_ASSERT_EQ(ht.nbucket, 8u);
+  UT_ASSERT_EQ(ht.nchain, 8u);
+  return 0;
+}
+
 UT_TEST(test_hash_table_add_single)
 {
-  YaffHashTable ht;
+  scoped_yaff_hash_table ht = {0};
   tcc_allocate_hash_table(&ht, 8, 8);
   tcc_add_hash_entry(&ht, "alpha", 3);
   uint32_t b = tcc_yaff_hash("alpha") % 8;
@@ -140,7 +182,7 @@ UT_TEST(test_hash_table_add_single)
 UT_TEST(test_hash_table_add_collision_chains)
 {
   /* Force a collision by using bucket count 1: every name lands in bucket 0. */
-  YaffHashTable ht;
+  scoped_yaff_hash_table ht = {0};
   tcc_allocate_hash_table(&ht, 1, 8);
   tcc_add_hash_entry(&ht, "first", 1);
   tcc_add_hash_entry(&ht, "second", 2);
@@ -157,7 +199,7 @@ UT_TEST(test_hash_table_add_collision_chains)
 
 UT_TEST(test_hash_table_write_and_readback)
 {
-  YaffHashTable ht;
+  scoped_yaff_hash_table ht = {0};
   tcc_allocate_hash_table(&ht, 4, 4);
   tcc_add_hash_entry(&ht, "x", 1);
 
@@ -872,35 +914,4 @@ UT_TEST(test_yaff_prepare_init_fini_merge)
 
   ut_yaff_teardown_output_state();
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(tccyaff)
-{
-  UT_RUN(test_yaff_hash_empty);
-  UT_RUN(test_yaff_hash_simple_strings);
-  UT_RUN(test_yaff_align_power_of_two);
-  UT_RUN(test_parse_object_name);
-  UT_RUN(test_get_offset_to_imported_libraries);
-
-  UT_RUN(test_hash_table_allocate_zeroes);
-  UT_RUN(test_hash_table_add_single);
-  UT_RUN(test_hash_table_add_collision_chains);
-  UT_RUN(test_hash_table_write_and_readback);
-
-  UT_RUN(test_load_yaff_rejects_bad_magic);
-  UT_RUN(test_load_yaff_and_resolve);
-  UT_RUN(test_yaff_resolve_missing_symbol_returns_zero);
-
-  UT_RUN(test_output_yaff_rejects_on_errors);
-  UT_RUN(test_output_yaff_minimal_header);
-  UT_RUN(test_output_yaff_with_exported_symbol);
-  UT_RUN(test_output_yaff_with_imported_symbol);
-  UT_RUN(test_output_yaff_local_relocation);
-  UT_RUN(test_output_yaff_data_relocation);
-  UT_RUN(test_output_yaff_symbol_table_relocation);
-  UT_RUN(test_output_yaff_exported_hidden_symbol_filtered);
-
-  UT_RUN(test_yaff_prepare_init_fini_merge);
 }

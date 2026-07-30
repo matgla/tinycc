@@ -97,6 +97,23 @@ void section_prealloc(Section *sec, unsigned long size)
     section_realloc(sec, needed);
 }
 
+/* From tccelf.c — real little-endian writers; ir/opt.c's block-copy
+ * initializer patches rodata bytes through them, so faking would corrupt
+ * the very bytes the tests assert on. */
+void write32le(unsigned char *p, uint32_t x)
+{
+  p[0] = (unsigned char)(x & 0xff);
+  p[1] = (unsigned char)((x >> 8) & 0xff);
+  p[2] = (unsigned char)((x >> 16) & 0xff);
+  p[3] = (unsigned char)((x >> 24) & 0xff);
+}
+
+void write64le(unsigned char *p, uint64_t x)
+{
+  write32le(p, (uint32_t)x);
+  write32le(p + 4, (uint32_t)(x >> 32));
+}
+
 /* From tccopt.c (coverage-only, not linked here). arm-thumb-gen.c's
  * mach_ensure_in_reg/tcc_machine_addr_of_stack_slot call these
  * unconditionally as part of one shared switch-per-MachineOperandKind

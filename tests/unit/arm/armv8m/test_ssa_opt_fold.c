@@ -18,18 +18,19 @@
  *      * Non-TEMP destinations are left untouched
  *
  *  HARNESS NOTES:
- *    - Links the real ir/opt/ssa_opt_fold.c via UT11.
+ *    - Links the real source/opt/ssa/fold.c via UT11.
  *    - Uses ssa_build.h for hand-built vinfo + IR.
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
+#include "opt/ssa/fold.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #define I32 IROP_BTYPE_INT32
 #define I64 IROP_BTYPE_INT64
@@ -238,8 +239,8 @@ UT_TEST(test_fold_div_by_zero_no_fold)
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
   int i = fold_emit_binimm(&c, TCCIR_OP_DIV, 0, 5, 0);
   fold_build_rebuild(&c);
-  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
-  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_DIV);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_TRAP);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -249,8 +250,8 @@ UT_TEST(test_fold_udiv_by_zero_no_fold)
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
   int i = fold_emit_binimm(&c, TCCIR_OP_UDIV, 0, 5, 0);
   fold_build_rebuild(&c);
-  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
-  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_UDIV);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_TRAP);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -260,8 +261,8 @@ UT_TEST(test_fold_imod_by_zero_no_fold)
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
   int i = fold_emit_binimm(&c, TCCIR_OP_IMOD, 0, 5, 0);
   fold_build_rebuild(&c);
-  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
-  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_IMOD);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_TRAP);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -271,8 +272,8 @@ UT_TEST(test_fold_umod_by_zero_no_fold)
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
   int i = fold_emit_binimm(&c, TCCIR_OP_UMOD, 0, 5, 0);
   fold_build_rebuild(&c);
-  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
-  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_UMOD);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_TRAP);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -426,7 +427,7 @@ UT_TEST(test_fold_identity_add_zero)
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
   UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -439,7 +440,7 @@ UT_TEST(test_fold_identity_sub_zero)
                          utb_temp(0, I32), utb_imm(0, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -452,7 +453,7 @@ UT_TEST(test_fold_identity_mul_one)
                          utb_temp(0, I32), utb_imm(1, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -465,7 +466,7 @@ UT_TEST(test_fold_identity_or_zero)
                          utb_temp(0, I32), utb_imm(0, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -478,7 +479,7 @@ UT_TEST(test_fold_identity_xor_zero)
                          utb_temp(0, I32), utb_imm(0, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -495,9 +496,9 @@ UT_TEST(test_fold_identity_shifts_zero)
                              utb_temp(0, I32), utb_imm(0, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 3);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i_shl)), IROP_VR(utb_temp(0, I32)));
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i_shr)), IROP_VR(utb_temp(0, I32)));
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i_sar)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i_shl).u.imm32, 5);
+  UT_ASSERT_EQ(utb_src1(c.ir, i_shr).u.imm32, 5);
+  UT_ASSERT_EQ(utb_src1(c.ir, i_sar).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -510,7 +511,7 @@ UT_TEST(test_fold_identity_and_minus_one)
                          utb_temp(0, I32), utb_imm(-1, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -566,7 +567,7 @@ UT_TEST(test_fold_commutative_add_zero)
                          utb_imm(0, I32), utb_temp(0, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -579,7 +580,7 @@ UT_TEST(test_fold_commutative_or_zero)
                          utb_imm(0, I32), utb_temp(0, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -592,7 +593,7 @@ UT_TEST(test_fold_commutative_xor_zero)
                          utb_imm(0, I32), utb_temp(0, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -605,7 +606,7 @@ UT_TEST(test_fold_commutative_mul_one)
                          utb_imm(1, I32), utb_temp(0, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -618,7 +619,7 @@ UT_TEST(test_fold_commutative_and_minus_one)
                          utb_imm(-1, I32), utb_temp(0, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -687,7 +688,7 @@ UT_TEST(test_fold_and_self_self)
                          utb_temp(0, I32), utb_temp(0, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -700,7 +701,134 @@ UT_TEST(test_fold_or_self_self)
                          utb_temp(0, I32), utb_temp(0, I32));
   fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_div_self_one)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_DIV, utb_temp(1, I32),
+                         utb_temp(0, I32), utb_temp(0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 1);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_udiv_self_one)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_UDIV, utb_temp(1, I32),
+                         utb_temp(0, I32), utb_temp(0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 1);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_imod_self_zero)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_IMOD, utb_temp(1, I32),
+                         utb_temp(0, I32), utb_temp(0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 0);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_umod_self_zero)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_UMOD, utb_temp(1, I32),
+                         utb_temp(0, I32), utb_temp(0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 0);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* Symref form: `*g / *g -> 1`, `*g % *g -> 0` for the same non-volatile global. */
+UT_TEST(test_fold_div_self_symref_one)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g;
+  g.v = 100;
+  g.type.t = VT_INT;
+  int i = ssa_add_instr3(&c, TCCIR_OP_DIV, utb_temp(0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 1);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_mod_self_symref_zero)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g;
+  g.v = 100;
+  g.type.t = VT_INT;
+  int i = ssa_add_instr3(&c, TCCIR_OP_IMOD, utb_temp(0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 0);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* Distinct globals must not fold: `*g / *h` is a real divide. */
+UT_TEST(test_fold_div_symref_distinct_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g, h;
+  g.v = 100;
+  g.type.t = VT_INT;
+  h.v = 101;
+  h.type.t = VT_INT;
+  int i = ssa_add_instr3(&c, TCCIR_OP_DIV, utb_temp(0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32),
+                         utb_symref(c.ir, &h, 1, 0, 0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_DIV);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* A volatile global reads twice may differ — must not fold. */
+UT_TEST(test_fold_div_symref_volatile_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
+  static Sym g;
+  g.v = 100;
+  g.type.t = VT_INT | VT_VOLATILE;
+  int i = ssa_add_instr3(&c, TCCIR_OP_DIV, utb_temp(0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32),
+                         utb_symref(c.ir, &g, 1, 0, 0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_DIV);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -718,7 +846,7 @@ UT_TEST(test_fold_or_compl_minus_one)
   int i = ssa_add_instr3(&c, TCCIR_OP_OR, utb_temp(2, I32),
                          utb_temp(0, I32), utb_temp(1, I32));
   fold_build_rebuild(&c);
-  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 2);
   UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
   UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, -1);
   ssa_ctx_free(&c);
@@ -734,7 +862,7 @@ UT_TEST(test_fold_and_compl_zero)
   int i = ssa_add_instr3(&c, TCCIR_OP_AND, utb_temp(2, I32),
                          utb_temp(0, I32), utb_temp(1, I32));
   fold_build_rebuild(&c);
-  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 2);
   UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 0);
   ssa_ctx_free(&c);
   return 0;
@@ -753,9 +881,9 @@ UT_TEST(test_fold_double_negation)
   int i = ssa_add_instr3(&c, TCCIR_OP_SUB, utb_temp(2, I32),
                          utb_imm(0, I32), utb_temp(1, I32));
   fold_build_rebuild(&c);
-  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 2);
   UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 7);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -789,8 +917,9 @@ UT_TEST(test_fold_no_resolve_const_vreg_cross_block)
                          utb_temp(0, I32), utb_imm(0, I32));
   c.ctx = tcc_mallocz(sizeof(*c.ctx));
   tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
-  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
-  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 5);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -804,8 +933,9 @@ UT_TEST(test_fold_no_resolve_const_vreg_non_assign_def)
   int i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(2, I32),
                          utb_temp(1, I32), utb_imm(0, I32));
   fold_build_rebuild(&c);
-  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
-  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 2);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 2);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -818,8 +948,273 @@ UT_TEST(test_fold_no_resolve_const_vreg_multi_def)
   int i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(1, I32),
                          utb_temp(0, I32), utb_imm(0, I32));
   fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * Absorbing / identity folds with an opaque (non-resolvable) operand
+ * ======================================================================== */
+
+/* Defines t as an unresolvable value: ASSIGN from an lval constant. */
+static void fold_emit_opaque(ssa_ctx *c, int t)
+{
+  IROperand src = utb_imm(5, I32);
+  src.is_lval = 1;
+  ssa_add_instr(c, TCCIR_OP_ASSIGN, utb_temp(t, I32), src);
+}
+
+UT_TEST(test_fold_absorb_or_minus_one_opaque)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/3);
+  fold_emit_opaque(&c, 0);
+  int i = ssa_add_instr3(&c, TCCIR_OP_OR, utb_temp(1, I32),
+                         utb_temp(0, I32), utb_imm(-1, I32));
+  int j = ssa_add_instr3(&c, TCCIR_OP_OR, utb_temp(2, I32),
+                         utb_imm(-1, I32), utb_temp(0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 2);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, -1);
+  UT_ASSERT_EQ(utb_src1(c.ir, j).u.imm32, -1);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_absorb_shift_zero_src)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
+  fold_emit_opaque(&c, 0);
+  int i_shl = ssa_add_instr3(&c, TCCIR_OP_SHL, utb_temp(1, I32),
+                             utb_imm(0, I32), utb_temp(0, I32));
+  int i_shr = ssa_add_instr3(&c, TCCIR_OP_SHR, utb_temp(2, I32),
+                             utb_imm(0, I32), utb_temp(0, I32));
+  int i_sar = ssa_add_instr3(&c, TCCIR_OP_SAR, utb_temp(3, I32),
+                             utb_imm(0, I32), utb_temp(0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 3);
+  UT_ASSERT_EQ(utb_op(c.ir, i_shl), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i_shl).u.imm32, 0);
+  UT_ASSERT_EQ(utb_src1(c.ir, i_shr).u.imm32, 0);
+  UT_ASSERT_EQ(utb_src1(c.ir, i_sar).u.imm32, 0);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_identity_div_one)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/3);
+  fold_emit_opaque(&c, 0);
+  int i_div = ssa_add_instr3(&c, TCCIR_OP_DIV, utb_temp(1, I32),
+                             utb_temp(0, I32), utb_imm(1, I32));
+  int i_udiv = ssa_add_instr3(&c, TCCIR_OP_UDIV, utb_temp(2, I32),
+                              utb_temp(0, I32), utb_imm(1, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 2);
+  UT_ASSERT_EQ(utb_op(c.ir, i_div), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i_div)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_op(c.ir, i_udiv), TCCIR_OP_ASSIGN);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_absorb_mod_one)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
+  fold_emit_opaque(&c, 0);
+  int i_imod = ssa_add_instr3(&c, TCCIR_OP_IMOD, utb_temp(1, I32),
+                              utb_temp(0, I32), utb_imm(1, I32));
+  int i_imod_m1 = ssa_add_instr3(&c, TCCIR_OP_IMOD, utb_temp(2, I32),
+                                 utb_temp(0, I32), utb_imm(-1, I32));
+  int i_umod = ssa_add_instr3(&c, TCCIR_OP_UMOD, utb_temp(3, I32),
+                              utb_temp(0, I32), utb_imm(1, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 3);
+  UT_ASSERT_EQ(utb_src1(c.ir, i_imod).u.imm32, 0);
+  UT_ASSERT_EQ(utb_src1(c.ir, i_imod_m1).u.imm32, 0);
+  UT_ASSERT_EQ(utb_src1(c.ir, i_umod).u.imm32, 0);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_div_minus_one_to_rsb)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  fold_emit_opaque(&c, 0);
+  int i = ssa_add_instr3(&c, TCCIR_OP_DIV, utb_temp(1, I32),
+                         utb_temp(0, I32), utb_imm(-1, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_SUB);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src2(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_xor_cancel_vreg)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
+  fold_emit_opaque(&c, 0);
+  fold_emit_opaque(&c, 1);
+  ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(2, I32),
+                 utb_temp(0, I32), utb_temp(1, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(3, I32),
+                         utb_temp(2, I32), utb_temp(1, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_xor_cancel_double_complement)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  fold_emit_opaque(&c, 0);
+  ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(1, I32),
+                 utb_temp(0, I32), utb_imm(-1, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(2, I32),
+                         utb_temp(1, I32), utb_imm(-1, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_xor_cancel_no_match)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/6);
+  fold_emit_opaque(&c, 0);
+  fold_emit_opaque(&c, 1);
+  fold_emit_opaque(&c, 2);
+  ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(3, I32),
+                 utb_temp(0, I32), utb_temp(1, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(4, I32),
+                         utb_temp(3, I32), utb_temp(2, I32));
+  fold_build_rebuild(&c);
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
-  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_XOR);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_xor_cancel_multidef_y_no_fold)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/6);
+  fold_emit_opaque(&c, 0);
+  fold_emit_opaque(&c, 1);
+  ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(2, I32),
+                 utb_temp(0, I32), utb_temp(1, I32));
+  fold_emit_opaque(&c, 1);
+  int i = ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(3, I32),
+                         utb_temp(2, I32), utb_temp(1, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_XOR);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_absorption_and_or)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
+  fold_emit_opaque(&c, 0);
+  fold_emit_opaque(&c, 1);
+  ssa_add_instr3(&c, TCCIR_OP_OR, utb_temp(2, I32),
+                 utb_temp(0, I32), utb_temp(1, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_AND, utb_temp(3, I32),
+                         utb_temp(0, I32), utb_temp(2, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_absorption_or_and_swapped)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
+  fold_emit_opaque(&c, 0);
+  fold_emit_opaque(&c, 1);
+  ssa_add_instr3(&c, TCCIR_OP_AND, utb_temp(2, I32),
+                 utb_temp(1, I32), utb_temp(0, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_OR, utb_temp(3, I32),
+                         utb_temp(2, I32), utb_temp(0, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_absorption_no_shared_arm)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/6);
+  fold_emit_opaque(&c, 0);
+  fold_emit_opaque(&c, 1);
+  fold_emit_opaque(&c, 2);
+  ssa_add_instr3(&c, TCCIR_OP_OR, utb_temp(3, I32),
+                 utb_temp(1, I32), utb_temp(2, I32));
+  int i = ssa_add_instr3(&c, TCCIR_OP_AND, utb_temp(4, I32),
+                         utb_temp(0, I32), utb_temp(3, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_AND);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_shift_chain_merge)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/6);
+  fold_emit_opaque(&c, 0);
+  ssa_add_instr3(&c, TCCIR_OP_SHL, utb_temp(1, I32),
+                 utb_temp(0, I32), utb_imm(3, I32));
+  int i_shl = ssa_add_instr3(&c, TCCIR_OP_SHL, utb_temp(2, I32),
+                             utb_temp(1, I32), utb_imm(4, I32));
+  ssa_add_instr3(&c, TCCIR_OP_SHR, utb_temp(3, I32),
+                 utb_temp(0, I32), utb_imm(5, I32));
+  int i_shr = ssa_add_instr3(&c, TCCIR_OP_SHR, utb_temp(4, I32),
+                             utb_temp(3, I32), utb_imm(6, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 2);
+  UT_ASSERT_EQ(utb_op(c.ir, i_shl), TCCIR_OP_SHL);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i_shl)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src2(c.ir, i_shl).u.imm32, 7);
+  UT_ASSERT_EQ(utb_op(c.ir, i_shr), TCCIR_OP_SHR);
+  UT_ASSERT_EQ(utb_src2(c.ir, i_shr).u.imm32, 11);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_fold_shift_chain_overflow_and_sar_saturate)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/6);
+  fold_emit_opaque(&c, 0);
+  ssa_add_instr3(&c, TCCIR_OP_SHL, utb_temp(1, I32),
+                 utb_temp(0, I32), utb_imm(20, I32));
+  int i_shl = ssa_add_instr3(&c, TCCIR_OP_SHL, utb_temp(2, I32),
+                             utb_temp(1, I32), utb_imm(15, I32));
+  ssa_add_instr3(&c, TCCIR_OP_SAR, utb_temp(3, I32),
+                 utb_temp(0, I32), utb_imm(20, I32));
+  int i_sar = ssa_add_instr3(&c, TCCIR_OP_SAR, utb_temp(4, I32),
+                             utb_temp(3, I32), utb_imm(15, I32));
+  fold_build_rebuild(&c);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 2);
+  UT_ASSERT_EQ(utb_op(c.ir, i_shl), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i_shl).u.imm32, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, i_sar), TCCIR_OP_SAR);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i_sar)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(utb_src2(c.ir, i_sar).u.imm32, 31);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -833,8 +1228,9 @@ UT_TEST(test_fold_no_resolve_lval_const)
   int i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(1, I32),
                          utb_temp(0, I32), utb_imm(0, I32));
   fold_build_rebuild(&c);
-  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
-  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, i)), IROP_VR(utb_temp(0, I32)));
   ssa_ctx_free(&c);
   return 0;
 }
@@ -847,13 +1243,16 @@ UT_TEST(test_fold_barrel_shift_annotation_blocks_fold)
 {
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
   int i = fold_emit_binimm(&c, TCCIR_OP_ADD, 0, 3, 5);
-  uint8_t *bs = tcc_mallocz((size_t)(c.ir->max_orig_index + 1));
-  c.ir->barrel_shifts = bs;
-  c.ir->barrel_shifts[i] = 1;
   fold_build_rebuild(&c);
+  int oi = c.ir->compact_instructions[i].orig_index;
+  uint8_t *bs = tcc_mallocz((size_t)(oi + 1));
+  bs[oi] = 1;
+  c.ir->barrel_shifts = bs;
+  c.ir->barrel_shifts_len = oi + 1;
   UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
   UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ADD);
   c.ir->barrel_shifts = NULL;
+  c.ir->barrel_shifts_len = 0;
   tcc_free(bs);
   ssa_ctx_free(&c);
   return 0;
@@ -865,8 +1264,9 @@ UT_TEST(test_fold_non_temp_dest_no_fold)
   int i = ssa_add_instr3(&c, TCCIR_OP_ADD, utb_var(0, I32),
                          utb_imm(3, I32), utb_imm(5, I32));
   fold_build_rebuild(&c);
-  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 0);
-  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(ssa_opt_fold(c.ctx), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, i), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_src1(c.ir, i).u.imm32, 8);
   ssa_ctx_free(&c);
   return 0;
 }
@@ -875,64 +1275,4 @@ UT_TEST(test_fold_non_temp_dest_no_fold)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_fold)
-{
-  UT_COVERS("ssa:fold");
-  UT_RUN(test_fold_add_zero);
-  UT_RUN(test_fold_mul_one);
-  UT_RUN(test_fold_mul_zero);
-  UT_RUN(test_fold_non_immediate);
-  UT_RUN(test_fold_add_imm);
-  UT_RUN(test_fold_sub_imm);
-  UT_RUN(test_fold_mul_imm);
-  UT_RUN(test_fold_and_or_xor_imm);
-  UT_RUN(test_fold_shl_imm);
-  UT_RUN(test_fold_shr_imm);
-  UT_RUN(test_fold_sar_imm);
-  UT_RUN(test_fold_ror_imm);
-  UT_RUN(test_fold_div_udiv_imod_umod_imm);
-  UT_RUN(test_fold_div_by_zero_no_fold);
-  UT_RUN(test_fold_udiv_by_zero_no_fold);
-  UT_RUN(test_fold_imod_by_zero_no_fold);
-  UT_RUN(test_fold_umod_by_zero_no_fold);
-  UT_RUN(test_fold_int_min_div_minus_one_no_fold);
-  UT_RUN(test_fold_shifts_overflow_imm);
-  UT_RUN(test_fold_add_imm64);
-  UT_RUN(test_fold_sub_mul_and_or_xor_imm64);
-  UT_RUN(test_fold_shifts_imm64);
-  UT_RUN(test_fold_div64_imm);
-  UT_RUN(test_fold_shifts_overflow_imm64);
-  UT_RUN(test_fold_ror_imm64_no_fold);
-  UT_RUN(test_fold_mul_imm64_widening_result);
-  UT_RUN(test_fold_identity_add_zero);
-  UT_RUN(test_fold_identity_sub_zero);
-  UT_RUN(test_fold_identity_mul_one);
-  UT_RUN(test_fold_identity_or_zero);
-  UT_RUN(test_fold_identity_xor_zero);
-  UT_RUN(test_fold_identity_shifts_zero);
-  UT_RUN(test_fold_identity_and_minus_one);
-  UT_RUN(test_fold_absorb_mul_zero);
-  UT_RUN(test_fold_absorb_and_zero);
-  UT_RUN(test_fold_absorb_or_minus_one);
-  UT_RUN(test_fold_commutative_add_zero);
-  UT_RUN(test_fold_commutative_or_zero);
-  UT_RUN(test_fold_commutative_xor_zero);
-  UT_RUN(test_fold_commutative_mul_one);
-  UT_RUN(test_fold_commutative_and_minus_one);
-  UT_RUN(test_fold_commutative_absorb_mul_zero);
-  UT_RUN(test_fold_commutative_absorb_and_zero);
-  UT_RUN(test_fold_sub_self_zero);
-  UT_RUN(test_fold_xor_self_zero);
-  UT_RUN(test_fold_and_self_self);
-  UT_RUN(test_fold_or_self_self);
-  UT_RUN(test_fold_or_compl_minus_one);
-  UT_RUN(test_fold_and_compl_zero);
-  UT_RUN(test_fold_double_negation);
-  UT_RUN(test_fold_resolves_const_vreg_same_block);
-  UT_RUN(test_fold_no_resolve_const_vreg_cross_block);
-  UT_RUN(test_fold_no_resolve_const_vreg_non_assign_def);
-  UT_RUN(test_fold_no_resolve_const_vreg_multi_def);
-  UT_RUN(test_fold_no_resolve_lval_const);
-  UT_RUN(test_fold_barrel_shift_annotation_blocks_fold);
-  UT_RUN(test_fold_non_temp_dest_no_fold);
-}
+UT_COVERS("ssa:fold");

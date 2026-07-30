@@ -17,7 +17,6 @@
  *      th_shift_type_to_op, th_shift_value_to_sr_type,
  *      th_generic_op_reg_shift_with_status.
  *    - th_sym_t/th_sym_d ELF `$t`/`$d` mapping-symbol emitters.
- *    - th_trace_regset/th_trace_shift_suffix debug-trace helpers.
  *
  *  Oracle values for th_pack_const/th_packimm_3_8_1 were cross-checked
  *  against `arm-none-eabi-as -march=armv8-m.main` disassembly of the
@@ -26,7 +25,7 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ut.h"
 
 /* ------------------------------------------------------------------ helpers */
@@ -662,49 +661,6 @@ UT_TEST(test_generic_op_reg_shift_asr_shift_encodes_sr2)
   return 0;
 }
 
-/* ============================================================ */
-/*  th_trace_regset() / th_trace_shift_suffix()                   */
-/*  Trace helpers gated by THOP_TRACE (compiled to nothing unless */
-/*  TCC_LOG_THOP=1); calling them must never crash regardless.    */
-/* ============================================================ */
-
-UT_TEST(test_trace_regset_does_not_crash_empty_set)
-{
-  th_trace_regset(0);
-  return 0;
-}
-
-UT_TEST(test_trace_regset_does_not_crash_full_set)
-{
-  th_trace_regset(0xFFFF);
-  return 0;
-}
-
-UT_TEST(test_trace_shift_suffix_none_is_noop)
-{
-  th_trace_shift_suffix((thumb_shift){.type = THUMB_SHIFT_NONE});
-  return 0;
-}
-
-UT_TEST(test_trace_shift_suffix_rrx_does_not_crash)
-{
-  th_trace_shift_suffix((thumb_shift){.type = THUMB_SHIFT_RRX});
-  return 0;
-}
-
-UT_TEST(test_trace_shift_suffix_register_mode_does_not_crash)
-{
-  th_trace_shift_suffix((thumb_shift){
-      .type = THUMB_SHIFT_LSL, .value = 2, .mode = THUMB_SHIFT_REGISTER});
-  return 0;
-}
-
-UT_TEST(test_trace_shift_suffix_immediate_mode_does_not_crash)
-{
-  th_trace_shift_suffix((thumb_shift){
-      .type = THUMB_SHIFT_LSR, .value = 7, .mode = THUMB_SHIFT_IMMEDIATE});
-  return 0;
-}
 
 /* ============================================================ */
 /*  th_sym_t() / th_sym_d() -- ELF $t/$d mapping symbols          */
@@ -726,84 +682,3 @@ UT_TEST(test_sym_d_does_not_crash)
 }
 
 /* ======================================================================== */
-
-UT_SUITE(thumb_core)
-{
-  UT_RUN(test_resolve_features_null_march_defaults_to_v8m_main);
-  UT_RUN(test_resolve_features_armv6m_core);
-  UT_RUN(test_resolve_features_armv7em_core_has_dsp);
-  UT_RUN(test_resolve_features_armv8m_base_core);
-  UT_RUN(test_resolve_features_armv81m_main_has_lob);
-  UT_RUN(test_resolve_features_plus_dsp_extension);
-  UT_RUN(test_resolve_features_plus_fp_extension);
-  UT_RUN(test_resolve_features_plus_fp_dp_extension);
-  UT_RUN(test_resolve_features_plus_mve_fp_extension);
-  UT_RUN(test_resolve_features_plus_multiple_extensions_chained);
-  UT_RUN(test_resolve_features_extra_feat_bits_ored_in);
-  UT_RUN(test_resolve_features_mfpu_ored_on_top_of_march);
-  UT_RUN(test_resolve_features_mfpu_none_leaves_no_fp);
-  UT_RUN(test_resolve_fpu_vfpv4_sp_d16_aliases);
-  UT_RUN(test_resolve_fpu_fpv5_sp_d16_has_fp_armv8);
-  UT_RUN(test_resolve_fpu_fpv5_d32_has_d32_flag);
-  UT_RUN(test_resolve_fpu_fp_armv8_full_has_fp16);
-  UT_RUN(test_resolve_fpu_none_string_and_null_are_equivalent);
-  UT_RUN(test_resolve_fpu_does_not_fold_in_core_features);
-
-  UT_RUN(test_emit_error_returns_zero_opcode_reg_constraint_fail);
-  UT_RUN(test_emit_error_returns_zero_opcode_feature_mismatch);
-  UT_RUN(test_emit_error_empty_table);
-  UT_RUN(test_emit_error_reached_via_thop_emit_fallthrough);
-
-  UT_RUN(test_pack_const_plain_byte);
-  UT_RUN(test_pack_const_00xy00xy_pattern);
-  UT_RUN(test_pack_const_xy00xy00_pattern);
-  UT_RUN(test_pack_const_xyxyxyxy_pattern);
-  UT_RUN(test_pack_const_rotated_msb_byte);
-  UT_RUN(test_pack_const_rotated_top_bit_only);
-  UT_RUN(test_pack_const_rotated_mid_value);
-  UT_RUN(test_pack_const_unrepresentable_returns_zero);
-  UT_RUN(test_pack_const_cache_returns_consistent_value_on_repeat);
-
-  UT_RUN(test_packimm_3_8_1_matches_movw_disassembly);
-  UT_RUN(test_packimm_3_8_1_zero);
-  UT_RUN(test_packimm_3_8_1_max_16bit);
-  UT_RUN(test_packimm_3_8_1_field_isolation);
-
-  UT_RUN(test_packimm_10_11_0_zero);
-  UT_RUN(test_packimm_10_11_0_positive_offset_bits);
-  UT_RUN(test_packimm_10_11_0_sign_bit_flips_j1_j2);
-
-  UT_RUN(test_encbranch_basic_forward);
-  UT_RUN(test_encbranch_basic_backward);
-  UT_RUN(test_encbranch_8_halfword_scaled);
-  UT_RUN(test_encbranch_8_negative_wraps_into_byte);
-  UT_RUN(test_encbranch_11_halfword_scaled);
-  UT_RUN(test_encbranch_11_masks_to_11_bits);
-  UT_RUN(test_encbranch_20_halfword_scaled_no_mask);
-  UT_RUN(test_encbranch_20_negative);
-
-  UT_RUN(test_encbranch_b_t3_zero);
-  UT_RUN(test_encbranch_b_t3_low_imm11_only);
-  UT_RUN(test_encbranch_b_t3_imm6_field);
-  UT_RUN(test_encbranch_b_t3_sign_bit_sets_s_and_a);
-
-  UT_RUN(test_shift_type_to_op_all_known_values);
-  UT_RUN(test_shift_value_to_sr_type_none_and_lsl_are_zero);
-  UT_RUN(test_shift_value_to_sr_type_lsr_asr);
-  UT_RUN(test_shift_value_to_sr_type_ror_and_rrx_share_encoding);
-
-  UT_RUN(test_generic_op_reg_shift_no_shift_no_status);
-  UT_RUN(test_generic_op_reg_shift_with_lsl_shift);
-  UT_RUN(test_generic_op_reg_shift_sets_status_bit_20);
-  UT_RUN(test_generic_op_reg_shift_asr_shift_encodes_sr2);
-
-  UT_RUN(test_trace_regset_does_not_crash_empty_set);
-  UT_RUN(test_trace_regset_does_not_crash_full_set);
-  UT_RUN(test_trace_shift_suffix_none_is_noop);
-  UT_RUN(test_trace_shift_suffix_rrx_does_not_crash);
-  UT_RUN(test_trace_shift_suffix_register_mode_does_not_crash);
-  UT_RUN(test_trace_shift_suffix_immediate_mode_does_not_crash);
-
-  UT_RUN(test_sym_t_does_not_crash);
-  UT_RUN(test_sym_d_does_not_crash);
-}

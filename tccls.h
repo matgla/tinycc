@@ -71,6 +71,15 @@ typedef struct LSLiveIntervalState
 
   int cached_instruction_idx;
   uint32_t cached_live_regs;
+
+  /* compute_live_regs sweep index; assumes start/end frozen post-RA, adds/clears invalidate */
+  int *live_sweep_order;
+  int *live_sweep_active;
+  int live_sweep_valid;
+  int live_sweep_count;
+  int live_sweep_pos;
+  int live_sweep_active_count;
+  int live_sweep_last_idx;
 } LSLiveIntervalState;
 
 void tcc_ls_initialize(LSLiveIntervalState *ls);
@@ -86,6 +95,9 @@ void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base);
 void tcc_ls_reset_scratch_cache(LSLiveIntervalState *ls);
 
 uint32_t tcc_ls_compute_live_regs(LSLiveIntervalState *ls, int instruction_idx);
+
+/* Lowest-index single-register INT interval (non-addrtaken, non-spilled) holding r at instruction_idx, or -1. */
+int tcc_ls_find_int_reg_holder(LSLiveIntervalState *ls, int r, int instruction_idx);
 
 int tcc_ls_reg_held_by_other(const LSLiveIntervalState *ls, int reg, int pos, const LSLiveInterval *skip);
 

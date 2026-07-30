@@ -380,6 +380,7 @@ DEF(TOK_builtin_va_start, "__builtin_va_start")
 #elif defined TCC_TARGET_X86_64
 DEF(TOK_builtin_va_arg_types, "__builtin_va_arg_types")
 #elif defined TCC_TARGET_ARM
+DEF(TOK_builtin_va_start, "__builtin_va_start")
 DEF(TOK_builtin_va_arg, "__builtin_va_arg")
 DEF(TOK___tcc_va_arg, "__tcc_va_arg")
 DEF(TOK_NOINSTRUMENT1, "no_instrument_function")

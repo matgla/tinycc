@@ -16,7 +16,7 @@
 #include "ir/codegen.h"
 #include "ir/machine_op.h"
 #include "tccmachine.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
 
@@ -571,27 +571,4 @@ UT_TEST(test_dispatch_builtin_apply_routes_to_builtin_apply_mop)
 
   tcc_ir_free(ir);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(codegen_atomic)
-{
-  UT_RUN(test_machine_interface_registration);
-  UT_RUN(test_machine_defaults);
-  UT_RUN(test_atomic_style_llocal_operand);
-  UT_RUN(test_atomic_style_param_operand);
-  UT_RUN(test_dispatch_trap_routes_to_trap_mop);
-  UT_RUN(test_dispatch_prefetch_routes_to_prefetch_mop_with_rw_hint);
-  UT_RUN(test_dispatch_set_chain_routes_to_set_chain);
-  UT_RUN(test_dispatch_init_chain_slot_and_asm_noops);
-  UT_RUN(test_dispatch_vla_alloc_routes_to_vla_mop);
-  UT_RUN(test_dispatch_setjmp_routes_to_setjmp_mop);
-  UT_RUN(test_dispatch_longjmp_routes_to_longjmp_mop);
-  UT_RUN(test_dispatch_nl_setjmp_routes_to_nl_setjmp_mop);
-  UT_RUN(test_dispatch_nl_longjmp_routes_to_nl_longjmp_mop);
-  UT_RUN(test_dispatch_builtin_apply_args_routes_to_builtin_apply_args_mop);
-  UT_RUN(test_dispatch_builtin_apply_routes_to_builtin_apply_mop);
 }

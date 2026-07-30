@@ -33,7 +33,6 @@
  * avoid pulling in the optimizer engine headers). */
 int tcc_ir_opt_entry_store_prop(TCCIRState *ir);
 int tcc_ir_opt_byte_store_merge(TCCIRState *ir);
-int tcc_ir_opt_store_redundant(TCCIRState *ir);
 int tcc_ir_opt_dead_static_store_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir);
@@ -145,46 +144,83 @@ UT_TEST(test_entry_store_no_matching_offset_kept)
   return 0;
 }
 
-/* =============================================================== store_redundant */
-
-/* POSITIVE: two STOREs through the same LEA'd pointer with no intervening
- * read -- the first (overwritten, unread) STORE is dead. */
-UT_TEST(test_store_redundant_overwritten_store_removed)
+/* NEGATIVE (guard): the TEMP carrying the address is REDEFINED with something
+ * that is not a stack address, so at the deref it only *may* point at the slot
+ * -- forwarding the entry store would be unsound.
+ *
+ * This is the `s = cond ? param : &local;` shape: the LEA is one edge of the
+ * phi, the parameter is the other, and both defs land in the same vreg. The
+ * LEA map used to be write-only (nothing ever invalidated an entry), so the
+ * deref was folded to the stored constant on both paths -- see
+ * tests/ir_tests/426_entry_store_phi_alias.c for the C-level repro.
+ *   0: StackLoc[-56] <-- #7
+ *   1: JUMP -> 2
+ *   2: T0 = LEA Addr[StackLoc[-56]]     [jump target]
+ *   3: T0 = ASSIGN P0                   [second def: not a stack address]
+ *   4: T1 = #0 ADD T0***DEREF***        [must stay a load]
+ */
+UT_TEST(test_entry_store_redefined_temp_not_forwarded)
 {
   TCCIRState *ir = utb_new();
 
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
-  int dead = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(1, I32), UTB_NONE);
-  int kept = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(2, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_slot_lval(-56, I32), utb_imm(7, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE);
+  int lea = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-56, I32), UTB_NONE);
+  ir->compact_instructions[lea].is_jump_target = 1;
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_param(0, I32), UTB_NONE);
+  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_imm(0, I32), utb_deref_temp(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
 
-  int changes = tcc_ir_opt_store_redundant(ir);
+  int changes = tcc_ir_opt_entry_store_prop(ir);
 
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, kept), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(changes, 0);
+  IROperand s2 = utb_src2(ir, use);
+  UT_ASSERT(s2.is_lval);
 
   utb_free(ir);
   return 0;
 }
 
-/* NEGATIVE (guard): a read through the pointer between the two stores evicts
- * the tracked entry, so the first store survives (it fed a real read). */
-UT_TEST(test_store_redundant_read_between_stores_kept)
+/* NEGATIVE (guard): the shape tcc actually emits for
+ *   `for (s = *argv ? argv : fallback; *s; s++) use(*s);`
+ * (from `armv8m-tcc -O1 -dump-ir-passes=entry_store`, condensed). The two ends
+ * of the ternary write the SAME temp -- one an `Addr[StackLoc]`, one a load of
+ * the parameter -- the value flows through a VAR and is then advanced by the
+ * `s++`, so the deref resolves to the array's *second* element. Both hazards
+ * (may-alias phi and stale-after-increment offset) must block forwarding.
+ *   0: StackLoc[-8] <-- #0             [fallback[0] = 0]
+ *   1: StackLoc[-4] <-- #0             [fallback[1] = 0  <- the value that leaked]
+ *   2: JUMP -> 3
+ *   3: T1 <-- Addr[StackLoc[-8]]       [jump target: s = fallback]
+ *   4: T1 <-- P0 [LOAD]                [other edge: s = argv]
+ *   5: V0 <-- T1
+ *   6: T4 <-- V0
+ *   7: V0 <-- T4 ADD #4                [s++]
+ *   8: T6 <-- V0
+ *   9: T7 = #0 ADD T6***DEREF***       [use(*s): must stay a load]
+ */
+UT_TEST(test_entry_store_phi_temp_after_increment_not_forwarded)
 {
   TCCIRState *ir = utb_new();
 
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
-  int first = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE);
-  int second = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(2, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_slot_lval(-8, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_slot_lval(-4, I32), utb_imm(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(3, I32), UTB_NONE, UTB_NONE);
+  int lea = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_slot_addr(-8, I32), UTB_NONE);
+  ir->compact_instructions[lea].is_jump_target = 1;
+  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), utb_param(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_temp(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(4, I32), utb_var(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_temp(4, I32), utb_imm(4, I32));
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(6, I32), utb_var(0, I32), UTB_NONE);
+  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(7, I32), utb_imm(0, I32), utb_deref_temp(6, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(7, I32), UTB_NONE);
 
-  int changes = tcc_ir_opt_store_redundant(ir);
+  int changes = tcc_ir_opt_entry_store_prop(ir);
 
   UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, first), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, second), TCCIR_OP_STORE);
+  IROperand s2 = utb_src2(ir, use);
+  UT_ASSERT(s2.is_lval);
 
   utb_free(ir);
   return 0;
@@ -420,35 +456,9 @@ UT_TEST(test_global_base_share_no_elf_state_never_fires)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_store_fwd)
-{
-  UT_COVERS("entry_store");
-  UT_COVERS("store_redundant");
-  UT_COVERS("byte_store_merge");
-  UT_COVERS("dead_static_store");
-  UT_COVERS("dead_local_slot");
-  UT_COVERS("dead_temp_local");
-  UT_COVERS("global_base_share");
-
-  UT_RUN(test_entry_store_forwards_lea_add_deref);
-  UT_RUN(test_entry_store_no_matching_offset_kept);
-
-  UT_RUN(test_store_redundant_overwritten_store_removed);
-  UT_RUN(test_store_redundant_read_between_stores_kept);
-
-  UT_RUN(test_byte_store_merge_four_bytes_merged);
-  UT_RUN(test_byte_store_merge_incomplete_group_kept);
-
-  UT_RUN(test_dead_static_store_unread_global_removed);
-  UT_RUN(test_dead_static_store_possibly_read_global_kept);
-
-  UT_RUN(test_dead_local_slot_unread_store_removed);
-  UT_RUN(test_dead_local_slot_read_store_kept);
-
-  UT_RUN(test_dead_temp_local_unread_store_removed);
-  UT_RUN(test_dead_temp_local_read_store_kept);
-
-  UT_RUN(test_global_base_share_no_elf_state_never_fires);
-}
+UT_COVERS("entry_store");
+UT_COVERS("byte_store_merge");
+UT_COVERS("dead_static_store");
+UT_COVERS("dead_local_slot");
+UT_COVERS("dead_temp_local");
+UT_COVERS("global_base_share");

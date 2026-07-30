@@ -27,6 +27,7 @@ typedef struct TCCAbiArgDesc
   TCCAbiArgKind kind;
   uint32_t size;     /* bytes (struct actual size; scalars: 4/8) */
   uint8_t alignment; /* bytes (power of two); use at least 4 */
+  uint8_t is_float;  /* scalar floating-point (float/double) — VFP-eligible */
 } TCCAbiArgDesc;
 
 typedef enum TCCAbiLocKind
@@ -34,6 +35,7 @@ typedef enum TCCAbiLocKind
   TCC_ABI_LOC_REG = 1,
   TCC_ABI_LOC_STACK,
   TCC_ABI_LOC_REG_STACK, /* Split: some words in regs, rest on stack */
+  TCC_ABI_LOC_VFP_REG,   /* Hard-float: in VFP register(s); reg_base = s-reg # */
 } TCCAbiLocKind;
 
 typedef struct TCCAbiArgLoc
@@ -78,6 +80,17 @@ typedef struct TCCAbiCallLayout
    */
   uint8_t next_reg;
   int32_t next_stack_off;
+
+  /* Hard-float VFP argument state (ARM AAPCS "VFP" variant).
+   * Allocation back-fills: a float takes the lowest free s-register and a
+   * double the lowest free even-aligned pair, so a double can sit above a gap
+   * that a later float still fits into.  Hence a per-register bitmap rather
+   * than a bump counter.  Once one FP argument has to go on the stack, the VFP
+   * bank is closed for every later argument too (AAPCS §6.5). */
+  uint16_t vfp_used;     /* bitmap of allocated s0..s15 */
+  uint8_t vfp_exhausted; /* an FP argument has spilled to the stack */
+  uint8_t hard_float;    /* place float args in VFP registers */
+  uint8_t is_variadic;   /* variadic callee: FP args use the base (GPR) standard */
 
   int32_t stack_size;  /* total outgoing argument stack area (bytes), aligned */
   uint8_t stack_align; /* required stack alignment at call boundary */

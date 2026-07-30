@@ -160,14 +160,4 @@ UT_TEST(test_switch_collapse_no_tables_returns_zero)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_switch_collapse)
-{
-  UT_COVERS("switch_collapse");
-
-  UT_RUN(test_switch_collapse_all_targets_same_merge);
-  UT_RUN(test_switch_collapse_follows_nop_chains);
-  UT_RUN(test_switch_collapse_mismatched_case_preserved);
-  UT_RUN(test_switch_collapse_no_tables_returns_zero);
-}
+UT_COVERS("switch_collapse");

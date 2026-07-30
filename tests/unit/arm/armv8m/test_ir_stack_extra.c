@@ -157,20 +157,5 @@ UT_TEST(test_stack_reset_null_ir_no_crash)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(ir_stack_extra)
-{
-  UT_COVERS("tcc_ir_stack_frame_size");
-  UT_COVERS("tcc_ir_stack_reg_assign");
-  UT_RUN(test_frame_size_multiple_slots_max_end);
-  UT_RUN(test_frame_size_null_ir);
-  UT_RUN(test_double_spill_marks_r1_spilled);
-  UT_RUN(test_llong_spill_marks_r1_spilled);
-  UT_RUN(test_32bit_spill_leaves_r1_none);
-  UT_RUN(test_stack_reg_offset_recorded);
-  UT_RUN(test_reg_get_no_live_interval);
-  UT_RUN(test_args_offset_and_size_nonzero);
-  UT_RUN(test_slot_count_null_ir);
-  UT_RUN(test_stack_reset_null_ir_no_crash);
-}
+UT_COVERS("tcc_ir_stack_frame_size");
+UT_COVERS("tcc_ir_stack_reg_assign");

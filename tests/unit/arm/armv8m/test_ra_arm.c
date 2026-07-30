@@ -11,7 +11,7 @@
 #include "ir/ssa.h"
 #include "ir/vreg.h"
 #include "ir/regalloc.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "ut.h"
 
 /* -------------------------------------------------------------------------- */
@@ -185,15 +185,4 @@ UT_TEST(test_arm_register_range)
 
   tcc_ir_free(ir);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(ra_arm)
-{
-  UT_RUN(test_arm_target_descriptor);
-  UT_RUN(test_arm_fp_interval_types);
-  UT_RUN(test_arm_register_range);
 }

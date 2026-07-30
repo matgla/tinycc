@@ -1,0 +1,4 @@
+static b10=10
+char q_ok=1 last=99
+runtime p_ok=1 r9=18
+[returns 0]

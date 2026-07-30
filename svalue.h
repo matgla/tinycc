@@ -34,6 +34,14 @@ typedef struct SValue
 {
   uint8_t pr0_reg : 5;     /* Physical register number (0-15 for ARM, 31=PREG_REG_NONE) */
   uint8_t pr0_spilled : 1; /* Spilled to stack flag */
+  uint8_t underaligned : 1; /* Access through this value may be < 4-byte aligned
+                             * (packed-struct member chain).  Set at member access
+                             * and propagated through pointer arithmetic; read by
+                             * svalue_to_iroperand to decide whether a 64-bit
+                             * deref may use LDRD/STRD (which fault on unaligned
+                             * addresses on ARMv7-M/v8-M).  A stale 1 only costs
+                             * the optimization; a lost 1 would fault, so setters
+                             * must never be skipped. */
   uint8_t pr1_reg : 5;     /* Physical register number (0-15 for ARM, 31=PREG_REG_NONE) */
   uint8_t pr1_spilled : 1; /* Spilled to stack flag */
 

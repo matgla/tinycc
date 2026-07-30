@@ -24,6 +24,17 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* How the backend lowers the has_d* double operations when they are enabled.
+ * The has_* bits say *whether* an operation is emitted inline; this says *what*
+ * to emit, because "double add is inline" means `vadd.f64` on an fpv5-d16 part
+ * and a six-instruction CP4 sequence on RP2350's DCP. */
+typedef enum
+{
+  FP_DOUBLE_IMPL_NONE = 0, /* no inline double lowering (every has_d* clear) */
+  FP_DOUBLE_IMPL_VFP,      /* VFP double registers: vadd.f64, vmul.f64, ... */
+  FP_DOUBLE_IMPL_DCP,      /* RP2350 DCP: mcrr/cdp/mrrc sequences on GPR pairs */
+} FpDoubleImpl;
+
 typedef struct FloatingPointConfig
 {
   int8_t reg_size;
@@ -52,6 +63,7 @@ typedef struct FloatingPointConfig
   int32_t has_ftol : 1;
   int32_t has_fneg : 1;
   int32_t has_dneg : 1;
+  uint8_t double_impl; /* FpDoubleImpl; only meaningful when a has_d* bit is set */
   uint64_t fpu_feat;
 } FloatingPointConfig;
 

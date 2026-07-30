@@ -164,45 +164,62 @@ double __aeabi_dmul(double a, double b)
    */
   if (a_exp != 0 && b_exp != 0)
   {
-    if (a_mant == 0)
+    int exp = a_exp + b_exp - DOUBLE_EXP_BIAS;
+
+    /* Only when the result is a normal number.  Out of range the shortcut is
+     * not actually a shortcut: an underflowing result still has to be shifted
+     * into the subnormal range and rounded there (this path used to flush it
+     * to zero, so DBL_MIN * 0.5 returned 0 instead of DBL_MIN/2), and an
+     * overflowing one still has to round before deciding on infinity.  Both
+     * are exactly what the general path below does. */
+    if (exp > 0 && exp < 0x7FF)
     {
-      int exp = a_exp + b_exp - DOUBLE_EXP_BIAS;
-      if (exp >= 0x7FF)
+      if (a_mant == 0)
       {
-        ur.u = make_double(result_sign, 0x7FF, 0);
+        ur.u = make_double(result_sign, exp, b_mant);
         return ur.d;
       }
-      if (exp <= 0)
+      if (b_mant == 0)
       {
-        ur.u = make_double(result_sign, 0, 0);
+        ur.u = make_double(result_sign, exp, a_mant);
         return ur.d;
       }
-      ur.u = make_double(result_sign, exp, b_mant);
-      return ur.d;
-    }
-    if (b_mant == 0)
-    {
-      int exp = a_exp + b_exp - DOUBLE_EXP_BIAS;
-      if (exp >= 0x7FF)
-      {
-        ur.u = make_double(result_sign, 0x7FF, 0);
-        return ur.d;
-      }
-      if (exp <= 0)
-      {
-        ur.u = make_double(result_sign, 0, 0);
-        return ur.d;
-      }
-      ur.u = make_double(result_sign, exp, a_mant);
-      return ur.d;
     }
   }
 
-  /* Add implicit bit for normalized numbers */
+  /* Add implicit bit for normalized numbers.
+   *
+   * Subnormals are normalized here instead: their effective exponent is 1 and
+   * their leading bit sits below bit 52, which would break the "leading 1 of
+   * the product is at bit 104 or 105" invariant the shift below relies on.
+   * Scaling them into the normal form (and paying for it in the exponent,
+   * which may go negative) keeps the whole 106-bit path unchanged. */
   if (a_exp != 0)
+  {
     a_mant |= DOUBLE_IMPLICIT_BIT;
+  }
+  else
+  {
+    a_exp = 1;
+    while (!(a_mant & DOUBLE_IMPLICIT_BIT))
+    {
+      a_mant <<= 1;
+      a_exp--;
+    }
+  }
   if (b_exp != 0)
+  {
     b_mant |= DOUBLE_IMPLICIT_BIT;
+  }
+  else
+  {
+    b_exp = 1;
+    while (!(b_mant & DOUBLE_IMPLICIT_BIT))
+    {
+      b_mant <<= 1;
+      b_exp--;
+    }
+  }
 
   /* Calculate result exponent: ea + eb - bias */
   int result_exp = a_exp + b_exp - DOUBLE_EXP_BIAS;
@@ -267,35 +284,17 @@ double __aeabi_dmul(double a, double b)
 
   uint64_t mant = ((uint64_t)mant_hi32 << 32) | (uint64_t)mant_lo32;
 
-  /* Round to nearest, ties to even: increment if guard==1 and
-   * (sticky==1 or LSB==1).
-   */
-  if (guard && (sticky || (mant & 1ULL)))
-    mant++;
-
-  /* Handle rounding overflow (e.g. 1.111... + 1 ulp -> 10.000...). */
-  if (mant & (DOUBLE_IMPLICIT_BIT << 1))
+  /* Hand the significand plus its guard/sticky bits to the shared rounding
+   * core.  Rounding must happen *after* any shift into the subnormal range,
+   * otherwise a result that underflows is rounded at full precision and then
+   * truncated -- and the previous code rounded first and then flushed every
+   * result with result_exp <= 0 to zero outright.
+   *
+   * guard occupies bit 2 and sticky bit 0 of the SFP_GRS field, which makes
+   * "guard && (sticky || lsb)" exactly the nearest-even rule the core applies. */
   {
-    mant >>= 1;
-    result_exp++;
-  }
-
-  /* Check for overflow to infinity */
-  if (result_exp >= 0x7FF)
-  {
-    ur.u = make_double(result_sign, 0x7FF, 0);
+    uint64_t mant_grs = (mant << SFP_GRS) | ((uint64_t)(guard != 0) << (SFP_GRS - 1)) | (uint64_t)(sticky != 0);
+    ur.u = sfp_round_pack_double(result_sign, result_exp, mant_grs);
     return ur.d;
   }
-
-  /* Check for underflow to zero */
-  if (result_exp <= 0)
-  {
-    ur.u = make_double(result_sign, 0, 0);
-    return ur.d;
-  }
-
-  /* Remove implicit bit */
-  mant &= DOUBLE_MANT_MASK;
-  ur.u = make_double(result_sign, result_exp, mant);
-  return ur.d;
 }

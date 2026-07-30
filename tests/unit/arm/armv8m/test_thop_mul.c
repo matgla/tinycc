@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_mul.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_mul.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -148,6 +148,54 @@ UT_TEST(test_mul_t32_auto_selection_rd_ne_rm)
   thumb_opcode op = th_mul(0, 1, 2, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
   UT_ASSERT_EQ(op.size, 4);
   UT_ASSERT_EQ(op.opcode, 0xFB01F002);
+
+  return 0;
+}
+
+UT_TEST(test_mul_t16_commutative_rd_eq_rn)
+{
+  setup_armv7m();
+
+  /* MUL is commutative, so rd == rn is encodable as T16 too: the operand that
+     is not the destination plays Rn.  muls r0, r1 => 0x4348 */
+  thumb_opcode op = th_mul(0, 0, 1, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 2);
+  UT_ASSERT_EQ(op.opcode, 0x4348);
+
+  /* muls r7, r6 => 0x4340 | 7 | (6<<3) = 0x4377 */
+  op = th_mul(7, 7, 6, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 2);
+  UT_ASSERT_EQ(op.opcode, 0x4377);
+
+  return 0;
+}
+
+UT_TEST(test_mul_t16_rejected_when_flags_must_be_preserved)
+{
+  setup_armv7m();
+
+  /* T16 MULS has an implicit S bit, so it must not be selected when the caller
+     needs NZCV preserved - fall back to the flag-transparent T32 encoding. */
+  thumb_opcode op = th_mul(0, 1, 0, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xFB01F000);
+
+  op = th_mul(0, 0, 1, FLAGS_BEHAVIOUR_BLOCK, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xFB00F001);
+
+  return 0;
+}
+
+UT_TEST(test_mul_t32_cannot_set_flags)
+{
+  setup_armv7m();
+
+  /* MULS exists only as T16; a flag-setting multiply with three distinct
+     registers is not encodable and must be rejected rather than silently
+     dropping the S bit. */
+  thumb_opcode op = th_mul(0, 1, 2, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 0);
 
   return 0;
 }
@@ -322,39 +370,4 @@ UT_TEST(test_sdiv_no_div_feature)
   UT_ASSERT_EQ(op.opcode, 0);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_mul)
-{
-  /* MUL T16 */
-  UT_RUN(test_mul_t16_rd0_rm0);
-  UT_RUN(test_mul_t16_rd5_rm5);
-
-  /* MUL T32 */
-  UT_RUN(test_mul_t32_low_regs);
-  UT_RUN(test_mul_t32_high_reg);
-
-  /* MUL wrapper auto-selection */
-  UT_RUN(test_mul_t16_auto_selection);
-  UT_RUN(test_mul_t32_auto_selection_high_reg);
-  UT_RUN(test_mul_t32_auto_selection_rd_ne_rm);
-  UT_RUN(test_mul_enforce_32bit_low_regs);
-
-  /* MLA/MLS */
-  UT_RUN(test_mla_basic);
-  UT_RUN(test_mls_basic);
-
-  /* Long multiply */
-  UT_RUN(test_umull_basic);
-  UT_RUN(test_umlal_basic);
-  UT_RUN(test_smull_basic);
-  UT_RUN(test_smlal_basic);
-
-  /* Divide */
-  UT_RUN(test_udiv_basic);
-  UT_RUN(test_udiv_no_div_feature);
-  UT_RUN(test_sdiv_basic);
-  UT_RUN(test_sdiv_no_div_feature);
 }

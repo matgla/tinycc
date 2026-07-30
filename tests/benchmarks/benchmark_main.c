@@ -29,7 +29,7 @@ extern void benchmark_watchdog_stop(void);
 typedef int (*benchmark_func_t)(int iterations);
 
 /* Benchmark registration */
-#define MAX_BENCHMARKS 24
+#define MAX_BENCHMARKS 32
 
 typedef struct
 {
@@ -132,6 +132,7 @@ int benchmark_main(void)
   {
     benchmarks_initialized = 1;
     init_math_benchmarks();
+    init_double_benchmarks();
     init_control_benchmarks();
     init_string_benchmarks();
     init_algorithm_benchmarks();

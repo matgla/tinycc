@@ -3,8 +3,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_system.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_system.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ut.h"
 
 static void setup_armv8m(void)
@@ -225,33 +225,4 @@ UT_TEST(test_th_clz)
   UT_ASSERT_EQ(op.size, 4);
   UT_ASSERT_EQ(op.opcode, 0xFAB2F182);
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_system)
-{
-  UT_RUN(test_th_nop_t16);
-  UT_RUN(test_th_nop_t32);
-  UT_RUN(test_th_sev_t16);
-  UT_RUN(test_th_sev_t32);
-  UT_RUN(test_th_wfe_t16);
-  UT_RUN(test_th_wfe_t32);
-  UT_RUN(test_th_wfi_t16);
-  UT_RUN(test_th_wfi_t32);
-  UT_RUN(test_th_yield_t16);
-  UT_RUN(test_th_yield_t32);
-  UT_RUN(test_th_svc);
-  UT_RUN(test_th_bkpt);
-  UT_RUN(test_th_udf_t16);
-  UT_RUN(test_th_udf_t32);
-  UT_RUN(test_th_cps);
-  UT_RUN(test_th_cps_zero);
-  UT_RUN(test_th_clrex);
-  UT_RUN(test_th_csdb);
-  UT_RUN(test_th_dmb);
-  UT_RUN(test_th_dsb);
-  UT_RUN(test_th_isb);
-  UT_RUN(test_th_ssbb);
-  UT_RUN(test_th_clz);
 }

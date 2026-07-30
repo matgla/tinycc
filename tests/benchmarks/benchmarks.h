@@ -47,6 +47,11 @@ extern const int benchmark_opt_level;
 /* External declarations for all benchmarks */
 int bench_integer_math(int iterations);
 int bench_float_math(int iterations);
+int bench_double_add(int iterations);
+int bench_double_mul(int iterations);
+int bench_double_div(int iterations);
+int bench_double_cmp(int iterations);
+int bench_double_mixed(int iterations);
 int bench_array_sum(int iterations);
 int bench_bitwise_mix(int iterations);
 int bench_function_calls(int iterations);
@@ -65,6 +70,7 @@ int bench_matrix_mul(int iterations);
 
 /* Registration functions */
 void init_math_benchmarks(void);
+void init_double_benchmarks(void);
 void init_control_benchmarks(void);
 void init_string_benchmarks(void);
 void init_algorithm_benchmarks(void);

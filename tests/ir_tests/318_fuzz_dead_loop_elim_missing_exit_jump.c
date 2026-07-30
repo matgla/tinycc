@@ -1,14 +1,16 @@
 /* fuzz switch seed 198468 (O1 divergence, second cause).
- * Pass: tcc_ir_opt_dead_loop_elim (ir/opt_dce.c).
+ * Historical pass: tcc_ir_opt_dead_loop_elim (ir/opt_dce.c) — retired 2026-07-07;
+ * dead-loop collapse is now owned by ssa:dead_loop (ir/opt/ssa_opt_dead_loop.c),
+ * whose try_kill_loop_body always writes an explicit `JUMP exit_target`, so this
+ * bug class is structurally impossible on the SSA path.  Kept as an
+ * anti-regression pin: the collapsed loop must not drop its exit edge.
  * Root cause: same class as 317 but a different eliminator.  A loop whose body
  * only assigns a constant to a VAR plus a counter (`u6 = s2 ^ const`, folded to
- * `u6 = #const` after const-prop) is removed by dead_loop_elim, which NOP'd the
+ * `u6 = #const` after const-prop) was removed by dead_loop_elim, which NOP'd the
  * whole body — including the forward exit branch — and hoisted the constant
  * into the preheader, relying on fall-through to the exit target.  As the loop
  * is the then-arm of an `if`, fall-through dropped into the else block, so the
  * else `csmix(cs, 212)` executed too.
- * Fix: restore the exit edge with an explicit JUMP when fall-through would not
- * reach the exit target (need_exit_jump).
  */
 #include <stdio.h>
 

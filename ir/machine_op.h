@@ -61,6 +61,9 @@ typedef enum
   MACH_OP_SYMBOL,      /* Symbol reference (global/extern/function) */
   MACH_OP_PARAM_STACK, /* Stack-passed parameter in caller's argument frame */
   MACH_OP_CHAIN_REL,   /* Captured variable: chain_index + FP-relative offset in parent */
+  MACH_OP_VFP_REG,     /* Value in a single-precision VFP register (hard-float);
+                        * u.reg.r0 holds the s-register number 0-31, a distinct
+                        * register file from the GPRs of MACH_OP_REG. */
 } MachineOperandKind;
 
 typedef struct MachineOperand
@@ -72,6 +75,13 @@ typedef struct MachineOperand
   bool is_64bit;           /* Two-register value (INT64 or FLOAT64) */
   bool is_unsigned;        /* Unsigned type (VT_UNSIGNED) */
   bool is_complex;         /* Complex type (VT_COMPLEX) */
+  bool align4;             /* 64-bit deref only: the accessed address is proven
+                            * >= 4-byte aligned, so LDRD/STRD may be used through
+                            * a general base register (IROperand.align4_ok). */
+  bool underalign_hint;    /* Base of an indexed access whose chain crossed a
+                            * packed member: address may be < 4-byte aligned, so
+                            * the 64-bit indexed lowering must avoid LDRD/STRD
+                            * (IROperand.underalign_hint). */
   union
   {
     struct

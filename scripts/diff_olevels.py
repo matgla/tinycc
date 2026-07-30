@@ -31,42 +31,9 @@ import argparse
 import sys
 from pathlib import Path
 
-# Make tests/fuzz importable.
-REPO_ROOT = Path(__file__).resolve().parent.parent
-FUZZ_DIR = REPO_ROOT / "tests" / "fuzz"
-if str(FUZZ_DIR) not in sys.path:
-    sys.path.insert(0, str(FUZZ_DIR))
-
-import fuzz_harness as H            # noqa: E402
-from gen_c import generate_program  # noqa: E402
+from sources.fuzz_common import FUZZ_DIR, H, generate_program, parse_seed_spec
 
 DEFAULT_OPT_LEVELS = ["-O0", "-O1", "-O2"]
-
-
-def parse_seed_spec(args) -> list[int]:
-    """Resolve --seed / --seeds RANGE / --count+--start into a seed list."""
-    seeds: list[int] = []
-    if args.seeds:
-        for token in args.seeds.split(","):
-            token = token.strip()
-            if "-" in token:
-                lo, hi = token.split("-", 1)
-                seeds.extend(range(int(lo), int(hi) + 1))
-            elif token:
-                seeds.append(int(token))
-    seeds.extend(args.seed or [])
-    if args.count:
-        seeds.extend(range(args.start, args.start + args.count))
-    if not seeds and not args.file:
-        seeds = list(range(0, 20))   # sensible default
-    # De-dup, preserve order.
-    seen = set()
-    out = []
-    for s in seeds:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
 
 
 def _save_divergence(results_dir: Path, tag: str, source: Path, results) -> Path:

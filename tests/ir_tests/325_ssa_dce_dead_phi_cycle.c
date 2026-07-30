@@ -1,4 +1,4 @@
-/* Exercise ssa_opt_dce.c: dead phi-cycle elimination.
+/* Exercise source/opt/ssa/dce/dead_phi_cycles.c.
  * The 'dead' loop-carried value feeds only itself and should be removed,
  * while the live loop-carried values s and i must be preserved. */
 #include <stdio.h>

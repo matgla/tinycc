@@ -28,9 +28,9 @@
 #include "ir/regalloc.h"
 #include "ir/codegen.h"
 #include "ir/machine_op.h"
-#include "arch/arm/arm.h"
-#include "arch/arm/arm_regalloc.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "arm-thumb-defs.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
@@ -492,22 +492,4 @@ UT_TEST(test_func_call_mop_one_arg_via_real_ir_places_arg_then_calls)
 
   tcc_ir_free(ir);
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_call)
-{
-  UT_RUN(test_func_parameter_mop_marks_argument_present);
-  UT_RUN(test_func_parameter_mop_grows_argument_list_and_backfills_gap);
-  UT_RUN(test_func_parameter_mop_void_creates_site_without_argument_entry);
-  UT_RUN(test_func_parameter_mop_dry_run_skips_argument_list_mutation);
-  UT_RUN(test_return_value_mop_already_in_r0_emits_nothing);
-  UT_RUN(test_return_value_mop_imm_loads_constant_into_r0);
-  UT_RUN(test_return_value_mop_register_emits_mov_to_r0);
-  UT_RUN(test_return_value_mop_64bit_moves_pair_to_r0_r1);
-  UT_RUN(test_func_call_mop_zero_arg_indirect_void_emits_only_blx);
-  UT_RUN(test_func_call_mop_zero_arg_indirect_writes_back_return_value);
-  UT_RUN(test_func_call_mop_zero_arg_direct_symbol_emits_bl_and_relocation);
-  UT_RUN(test_func_call_mop_one_arg_via_real_ir_places_arg_then_calls);
 }

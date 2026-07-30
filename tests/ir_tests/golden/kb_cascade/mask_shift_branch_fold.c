@@ -5,9 +5,14 @@
  * 0, which folds the `== 0` branch, DCEs the dead arm, and (via the re-run
  * sl_forward inside the cascade) collapses the whole function to a single
  * constant return -- more than one constituent pass must fire in sequence for
- * this to converge in one pipeline invocation. */
-int f(int cond) {
+ * this to converge in one pipeline invocation.
+ *
+ * The runtime-indexed store keeps entry_store_prop out of it: that pass would
+ * otherwise forward the constant itself, leaving this group's sl_forward trigger
+ * idle and the cascade never running -- i.e. the case would stop covering it. */
+int f(int cond, int n) {
     int arr[4];
+    arr[n & 3] = 1;
     arr[0] = 5;
     int v = arr[0];
     int w = v & 0xF0;

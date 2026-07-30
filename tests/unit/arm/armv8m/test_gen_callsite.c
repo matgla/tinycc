@@ -15,6 +15,7 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "arm-thumb-defs.h"
+#include "arm-thumb-callsite.h"
 #include "ir_build.h"
 
 #include "ut.h"
@@ -39,14 +40,15 @@ static IROperand cs_param_marker(int call_id, int param_idx)
   return utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, param_idx), IROP_BTYPE_INT32);
 }
 
-static void cs_layout_free(TCCAbiCallLayout *layout, IROperand *args, MachineOperand *mops)
+static void cs_layout_free(TCCAbiCallLayout *layout, ThumbIROperandSequence *args,
+                           ThumbMachineOperandSequence *mops)
 {
   if (layout->locs)
     tcc_free(layout->locs);
   if (args)
-    tcc_free(args);
+    ThumbIROperandSequence_cleanup(args);
   if (mops)
-    tcc_free(mops);
+    ThumbMachineOperandSequence_cleanup(mops);
 }
 
 /* ------------------------------------------------------------ call-site table */
@@ -244,8 +246,8 @@ UT_TEST(test_build_call_layout_argc_hint_five_int_args_r0_r3_then_stack)
 
   TCCAbiCallLayout layout;
   memset(&layout, 0, sizeof(layout));
-  IROperand *out_args = NULL;
-  MachineOperand *out_mops = NULL;
+  small_sequence(ThumbIROperandSequence) out_args = {0};
+  small_sequence(ThumbMachineOperandSequence) out_mops = {0};
 
   int argc = thumb_build_call_layout_from_ir(ir, call_idx, call_id, 5, &layout, &out_args, &out_mops);
 
@@ -262,22 +264,59 @@ UT_TEST(test_build_call_layout_argc_hint_five_int_args_r0_r3_then_stack)
   UT_ASSERT_EQ((int)layout.locs[4].kind, TCC_ABI_LOC_STACK);
   UT_ASSERT_EQ((int)layout.locs[4].stack_off, 0);
 
-  UT_ASSERT(out_args != NULL);
-  UT_ASSERT(out_mops != NULL);
+  UT_ASSERT_EQ(out_args.size, 5);
+  UT_ASSERT_EQ(out_mops.size, 5);
+  IROperand *args = ThumbIROperandSequence_data(&out_args);
+  MachineOperand *mops = ThumbMachineOperandSequence_data(&out_mops);
   for (int i = 0; i < 5; i++)
   {
-    UT_ASSERT_EQ(irop_get_imm32(out_args[i]), vals[i]);
-    UT_ASSERT_EQ((int)out_mops[i].kind, MACH_OP_IMM);
-    UT_ASSERT_EQ((long long)out_mops[i].u.imm.val, vals[i]);
+    UT_ASSERT_EQ(irop_get_imm32(args[i]), vals[i]);
+    UT_ASSERT_EQ((int)mops[i].kind, MACH_OP_IMM);
+    UT_ASSERT_EQ((long long)mops[i].u.imm.val, vals[i]);
   }
 
-  cs_layout_free(&layout, out_args, out_mops);
+  cs_layout_free(&layout, &out_args, &out_mops);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_build_call_layout_argc_hint_seventeen_args_uses_heap_sequence)
+{
+  TCCIRState *ir = utb_new();
+  const int call_id = 7;
+  const int argc_hint = 17;
+
+  for (int i = 0; i < argc_hint; ++i) {
+    utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(i + 1, IROP_BTYPE_INT32),
+             cs_param_marker(call_id, i));
+  }
+
+  TCCAbiCallLayout layout;
+  memset(&layout, 0, sizeof(layout));
+  small_sequence(ThumbIROperandSequence) out_args = {0};
+  small_sequence(ThumbMachineOperandSequence) out_mops = {0};
+
+  int argc = thumb_build_call_layout_from_ir(ir, ir->next_instruction_index, call_id, argc_hint, &layout, &out_args,
+                                             &out_mops);
+
+  UT_ASSERT_EQ(argc, argc_hint);
+  UT_ASSERT_EQ(layout.argc, argc_hint);
+  UT_ASSERT(!ThumbIROperandSequence_is_inline(&out_args));
+  UT_ASSERT(!ThumbMachineOperandSequence_is_inline(&out_mops));
+  IROperand *args = ThumbIROperandSequence_data(&out_args);
+  MachineOperand *mops = ThumbMachineOperandSequence_data(&out_mops);
+  for (int i = 0; i < argc_hint; ++i) {
+    UT_ASSERT_EQ(irop_get_imm32(args[i]), i + 1);
+    UT_ASSERT_EQ((int)mops[i].kind, MACH_OP_IMM);
+  }
+
+  cs_layout_free(&layout, &out_args, &out_mops);
   utb_free(ir);
   return 0;
 }
 
 /* argc_hint == 0: the argc<=0 short-circuit must return 0 immediately, with
- * out_args/out_mops both set to NULL (no allocation at all) and an
+ * out_args/out_mops both empty (no allocation at all) and an
  * argc-0/stack_size-0 layout -- ir/../arm-thumb-callsite.c's own early-return
  * block. No FUNCPARAMVAL needs to exist for this call_id at all. */
 UT_TEST(test_build_call_layout_argc_hint_zero_short_circuits)
@@ -286,8 +325,8 @@ UT_TEST(test_build_call_layout_argc_hint_zero_short_circuits)
 
   TCCAbiCallLayout layout;
   memset(&layout, 0xAA, sizeof(layout)); /* poison, so the early-return must overwrite argc/stack_size */
-  IROperand *out_args = (IROperand *)0x1; /* poison pointer: must be overwritten to NULL */
-  MachineOperand *out_mops = (MachineOperand *)0x1;
+  small_sequence(ThumbIROperandSequence) out_args = { .size = 1 };
+  small_sequence(ThumbMachineOperandSequence) out_mops = { .size = 1 };
 
   int argc = thumb_build_call_layout_from_ir(ir, /*call_idx=*/0, /*call_id=*/0, /*argc_hint=*/0, &layout, &out_args,
                                              &out_mops);
@@ -295,8 +334,8 @@ UT_TEST(test_build_call_layout_argc_hint_zero_short_circuits)
   UT_ASSERT_EQ(argc, 0);
   UT_ASSERT_EQ(layout.argc, 0);
   UT_ASSERT_EQ(layout.stack_size, 0);
-  UT_ASSERT(out_args == NULL);
-  UT_ASSERT(out_mops == NULL);
+  UT_ASSERT_EQ(out_args.size, 0);
+  UT_ASSERT_EQ(out_mops.size, 0);
 
   utb_free(ir);
   return 0;
@@ -345,7 +384,7 @@ UT_TEST(test_build_call_layout_argc_hint_64bit_arg_uses_even_reg_pair)
 
   TCCAbiCallLayout layout;
   memset(&layout, 0, sizeof(layout));
-  IROperand *out_args = NULL;
+  small_sequence(ThumbIROperandSequence) out_args = {0};
 
   int argc = thumb_build_call_layout_from_ir(ir, call_idx, call_id, 2, &layout, &out_args, NULL);
 
@@ -358,7 +397,7 @@ UT_TEST(test_build_call_layout_argc_hint_64bit_arg_uses_even_reg_pair)
   UT_ASSERT_EQ((int)layout.locs[1].reg_base, 2); /* skipped r1 to align the pair */
   UT_ASSERT_EQ((int)layout.locs[1].reg_count, 2);
 
-  cs_layout_free(&layout, out_args, NULL);
+  cs_layout_free(&layout, &out_args, NULL);
   utb_free(ir);
   return 0;
 }
@@ -385,8 +424,8 @@ UT_TEST(test_build_call_layout_legacy_scan_finds_argc_and_filters_other_call_ids
 
   TCCAbiCallLayout layout;
   memset(&layout, 0, sizeof(layout));
-  IROperand *out_args = NULL;
-  MachineOperand *out_mops = NULL;
+  small_sequence(ThumbIROperandSequence) out_args = {0};
+  small_sequence(ThumbMachineOperandSequence) out_mops = {0};
 
   int argc = thumb_build_call_layout_from_ir(ir, call_idx, call_id, /*argc_hint=*/-1, &layout, &out_args, &out_mops);
 
@@ -397,12 +436,12 @@ UT_TEST(test_build_call_layout_legacy_scan_finds_argc_and_filters_other_call_ids
   UT_ASSERT_EQ((int)layout.locs[1].reg_base, 1);
   UT_ASSERT_EQ((int)layout.locs[2].reg_base, 2);
 
-  UT_ASSERT(out_args != NULL);
-  UT_ASSERT_EQ(irop_get_imm32(out_args[0]), 1);
-  UT_ASSERT_EQ(irop_get_imm32(out_args[1]), 2);
-  UT_ASSERT_EQ(irop_get_imm32(out_args[2]), 3);
+  IROperand *args = ThumbIROperandSequence_data(&out_args);
+  UT_ASSERT_EQ(irop_get_imm32(args[0]), 1);
+  UT_ASSERT_EQ(irop_get_imm32(args[1]), 2);
+  UT_ASSERT_EQ(irop_get_imm32(args[2]), 3);
 
-  cs_layout_free(&layout, out_args, out_mops);
+  cs_layout_free(&layout, &out_args, &out_mops);
   utb_free(ir);
   return 0;
 }
@@ -419,8 +458,8 @@ UT_TEST(test_build_call_layout_legacy_scan_no_matching_funcparamval_yields_argc_
 
   TCCAbiCallLayout layout;
   memset(&layout, 0, sizeof(layout));
-  IROperand *out_args = (IROperand *)0x1;
-  MachineOperand *out_mops = (MachineOperand *)0x1;
+  small_sequence(ThumbIROperandSequence) out_args = { .size = 1 };
+  small_sequence(ThumbMachineOperandSequence) out_mops = { .size = 1 };
 
   /* Ask for a different call_id (9) than the one FUNCPARAMVAL actually carries (4). */
   int argc = thumb_build_call_layout_from_ir(ir, call_idx, /*call_id=*/9, /*argc_hint=*/-1, &layout, &out_args,
@@ -428,8 +467,8 @@ UT_TEST(test_build_call_layout_legacy_scan_no_matching_funcparamval_yields_argc_
 
   UT_ASSERT_EQ(argc, 0);
   UT_ASSERT_EQ(layout.argc, 0);
-  UT_ASSERT(out_args == NULL);
-  UT_ASSERT(out_mops == NULL);
+  UT_ASSERT_EQ(out_args.size, 0);
+  UT_ASSERT_EQ(out_mops.size, 0);
 
   utb_free(ir);
   return 0;
@@ -452,15 +491,16 @@ UT_TEST(test_build_call_layout_legacy_scan_ignores_instructions_at_or_after_call
 
   TCCAbiCallLayout layout;
   memset(&layout, 0, sizeof(layout));
-  IROperand *out_args = NULL;
+  small_sequence(ThumbIROperandSequence) out_args = {0};
 
   int argc = thumb_build_call_layout_from_ir(ir, call_idx, call_id, /*argc_hint=*/-1, &layout, &out_args, NULL);
 
   UT_ASSERT_EQ(argc, 2); /* param_idx 2's FUNCPARAMVAL at call_idx itself is not scanned */
-  UT_ASSERT_EQ(irop_get_imm32(out_args[0]), 1);
-  UT_ASSERT_EQ(irop_get_imm32(out_args[1]), 2);
+  IROperand *args = ThumbIROperandSequence_data(&out_args);
+  UT_ASSERT_EQ(irop_get_imm32(args[0]), 1);
+  UT_ASSERT_EQ(irop_get_imm32(args[1]), 2);
 
-  cs_layout_free(&layout, out_args, NULL);
+  cs_layout_free(&layout, &out_args, NULL);
   utb_free(ir);
   return 0;
 }
@@ -473,15 +513,15 @@ UT_TEST(test_build_call_layout_negative_call_idx_returns_error)
 
   TCCAbiCallLayout layout;
   memset(&layout, 0, sizeof(layout));
-  IROperand *out_args = NULL;
-  MachineOperand *out_mops = NULL;
+  small_sequence(ThumbIROperandSequence) out_args = {0};
+  small_sequence(ThumbMachineOperandSequence) out_mops = {0};
 
   int argc = thumb_build_call_layout_from_ir(ir, /*call_idx=*/-1, /*call_id=*/0, /*argc_hint=*/-1, &layout,
                                              &out_args, &out_mops);
 
   UT_ASSERT_EQ(argc, -1);
-  UT_ASSERT(out_args == NULL);
-  UT_ASSERT(out_mops == NULL);
+  UT_ASSERT_EQ(out_args.size, 0);
+  UT_ASSERT_EQ(out_mops.size, 0);
 
   utb_free(ir);
   return 0;
@@ -497,33 +537,4 @@ UT_TEST(test_build_call_layout_null_ir_returns_error)
   UT_ASSERT_EQ(argc, -1);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_callsite)
-{
-  UT_RUN(test_get_or_create_call_site_first_call_grows_to_16);
-  UT_RUN(test_get_or_create_call_site_within_first_batch_does_not_regrow);
-  UT_RUN(test_get_or_create_call_site_doubles_past_16);
-  UT_RUN(test_get_or_create_call_site_large_id_doubles_repeatedly);
-  UT_RUN(test_get_or_create_call_site_negative_id_returns_null);
-  UT_RUN(test_get_or_create_call_site_idempotent_same_id_returns_same_slot);
-  UT_RUN(test_get_call_site_for_id_null_table_returns_null);
-  UT_RUN(test_get_call_site_for_id_negative_returns_null);
-  UT_RUN(test_get_call_site_for_id_at_or_beyond_size_returns_null);
-  UT_RUN(test_get_call_site_for_id_returns_created_slot);
-  UT_RUN(test_free_call_sites_resets_table_to_null_and_zero);
-  UT_RUN(test_free_call_sites_on_already_empty_state_is_noop);
-
-  UT_RUN(test_build_call_layout_argc_hint_five_int_args_r0_r3_then_stack);
-  UT_RUN(test_build_call_layout_argc_hint_zero_short_circuits);
-  UT_RUN(test_build_call_layout_argc_hint_null_out_params_are_optional);
-  UT_RUN(test_build_call_layout_argc_hint_64bit_arg_uses_even_reg_pair);
-
-  UT_RUN(test_build_call_layout_legacy_scan_finds_argc_and_filters_other_call_ids);
-  UT_RUN(test_build_call_layout_legacy_scan_no_matching_funcparamval_yields_argc_zero);
-  UT_RUN(test_build_call_layout_legacy_scan_ignores_instructions_at_or_after_call_idx);
-  UT_RUN(test_build_call_layout_negative_call_idx_returns_error);
-  UT_RUN(test_build_call_layout_null_ir_returns_error);
 }

@@ -45,6 +45,13 @@ void tcc_ls_initialize(LSLiveIntervalState *ls)
   ls->live_regs_by_instruction_size = 0;
   ls->cached_instruction_idx = -1;
   ls->cached_live_regs = 0;
+  ls->live_sweep_order = NULL;
+  ls->live_sweep_active = NULL;
+  ls->live_sweep_valid = 0;
+  ls->live_sweep_count = 0;
+  ls->live_sweep_pos = 0;
+  ls->live_sweep_active_count = 0;
+  ls->live_sweep_last_idx = -1;
 }
 
 void tcc_ls_deinitialize(LSLiveIntervalState *ls)
@@ -58,6 +65,12 @@ void tcc_ls_deinitialize(LSLiveIntervalState *ls)
     ls->live_regs_by_instruction = NULL;
     ls->live_regs_by_instruction_size = 0;
   }
+
+  tcc_free(ls->live_sweep_order);
+  tcc_free(ls->live_sweep_active);
+  ls->live_sweep_order = NULL;
+  ls->live_sweep_active = NULL;
+  ls->live_sweep_valid = 0;
 }
 
 void tcc_ls_reset_scratch_cache(LSLiveIntervalState *ls)
@@ -70,6 +83,7 @@ void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls)
 {
   ls->next_interval_index = 0;
   ls->next_active_index = 0;
+  ls->live_sweep_valid = 0;
 
   if (ls->live_regs_by_instruction)
   {
@@ -110,6 +124,7 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
     interval->sort_key = ((uint64_t)(!is_param) << 33) | ((uint64_t)(uint32_t)end << 1) | (lvalue ? 0u : 1u);
   }
   ls->next_interval_index++;
+  ls->live_sweep_valid = 0;
 }
 
 static int tcc_ls_reg_type_stack_size(int reg_type)
@@ -154,9 +169,17 @@ void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base)
   SlotMapEntry *map = tcc_malloc(sizeof(SlotMapEntry) * n);
   int map_count = 0;
 
-  /* Pass 1: collect distinct old offsets and track the max size required
-   * at each (so a slot shared by a 4-byte and an 8-byte interval gets an
-   * 8-byte allocation). */
+  unsigned ht_size = 16;
+  while (ht_size < (unsigned)n * 2)
+    ht_size <<= 1;
+  int *ht = tcc_malloc(sizeof(int) * ht_size);
+  for (unsigned i = 0; i < ht_size; ++i)
+    ht[i] = -1;
+#define SLOT_HASH(off) (((uint32_t)(off) * 2654435761u) & (ht_size - 1))
+
+  /* Pass 1: collect distinct old offsets in first-encounter order (pass 2
+   * assigns new offsets in that order) and track the max size required at
+   * each (so a slot shared by a 4-byte and an 8-byte interval gets 8). */
   for (int i = 0; i < n; ++i)
   {
     LSLiveInterval *it = &ls->intervals[i];
@@ -164,25 +187,20 @@ void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base)
       continue;
 
     const int size = tcc_ls_reg_type_stack_size(it->reg_type);
-    int found = -1;
-    for (int j = 0; j < map_count; ++j)
+    unsigned h = SLOT_HASH(it->stack_location);
+    while (ht[h] >= 0 && map[ht[h]].old_offset != (int)it->stack_location)
+      h = (h + 1) & (ht_size - 1);
+    if (ht[h] >= 0)
     {
-      if (map[j].old_offset == it->stack_location)
-      {
-        found = j;
-        break;
-      }
-    }
-    if (found >= 0)
-    {
-      if (size > map[found].size)
-        map[found].size = size;
+      if (size > map[ht[h]].size)
+        map[ht[h]].size = size;
     }
     else
     {
       map[map_count].old_offset = it->stack_location;
       map[map_count].size = size;
       map[map_count].new_offset = 0;
+      ht[h] = map_count;
       map_count++;
     }
   }
@@ -207,17 +225,19 @@ void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base)
     if (it->stack_location == 0)
       continue;
 
-    for (int j = 0; j < map_count; ++j)
+    unsigned h = SLOT_HASH(it->stack_location);
+    while (ht[h] >= 0 && map[ht[h]].old_offset != (int)it->stack_location)
+      h = (h + 1) & (ht_size - 1);
+    if (ht[h] >= 0)
     {
-      if (map[j].old_offset == it->stack_location)
-      {
-        it->stack_location = map[j].new_offset;
-        STACK_ALLOC_LOG("compact", it->vreg, map[j].new_offset, map[j].size);
-        break;
-      }
+      int j = ht[h];
+      it->stack_location = map[j].new_offset;
+      STACK_ALLOC_LOG("compact", it->vreg, map[j].new_offset, map[j].size);
     }
   }
 
+#undef SLOT_HASH
+  tcc_free(ht);
   tcc_free(map);
 }
 
@@ -241,29 +261,111 @@ void tcc_ls_recompute_dirty_registers(LSLiveIntervalState *ls)
   ls->dirty_registers = non_callee | (callee_dirty & callee_used);
 }
 
+static uint32_t ls_interval_live_mask(const LSLiveInterval *interval, uint32_t idx)
+{
+  uint32_t mask = 0;
+  if (interval->reg_type != LS_REG_TYPE_INT && interval->reg_type != LS_REG_TYPE_LLONG)
+    return 0;
+  if (interval->start <= idx && interval->end >= idx) {
+    if (interval->r0 >= 0 && interval->r0 < 16)
+      mask |= (1u << interval->r0);
+    if (interval->r1 >= 0 && interval->r1 < 16)
+      mask |= (1u << interval->r1);
+  }
+  return mask;
+}
+
+static const LSLiveInterval *ls_sweep_cmp_intervals;
+
+static int ls_sweep_cmp_start(const void *a, const void *b)
+{
+  uint32_t sa = ls_sweep_cmp_intervals[*(const int *)a].start;
+  uint32_t sb = ls_sweep_cmp_intervals[*(const int *)b].start;
+  return sa < sb ? -1 : sa > sb;
+}
+
+/* Advance the sweep so live_sweep_active holds exactly the intervals with
+ * start <= idx <= end (idx must be >= 0). */
+static void ls_sweep_advance(LSLiveIntervalState *ls, uint32_t idx)
+{
+  if (!ls->live_sweep_valid) {
+    int n = ls->next_interval_index;
+    ls->live_sweep_order = tcc_realloc(ls->live_sweep_order, sizeof(int) * (n > 0 ? n : 1));
+    ls->live_sweep_active = tcc_realloc(ls->live_sweep_active, sizeof(int) * (n > 0 ? n : 1));
+    for (int i = 0; i < n; ++i)
+      ls->live_sweep_order[i] = i;
+    ls_sweep_cmp_intervals = ls->intervals;
+    qsort(ls->live_sweep_order, n, sizeof(int), ls_sweep_cmp_start);
+    ls->live_sweep_count = n;
+    ls->live_sweep_valid = 1;
+    ls->live_sweep_pos = 0;
+    ls->live_sweep_active_count = 0;
+    ls->live_sweep_last_idx = -1;
+  }
+
+  if ((int)idx < ls->live_sweep_last_idx) {
+    ls->live_sweep_pos = 0;
+    ls->live_sweep_active_count = 0;
+  }
+  ls->live_sweep_last_idx = (int)idx;
+
+  while (ls->live_sweep_pos < ls->live_sweep_count &&
+         ls->intervals[ls->live_sweep_order[ls->live_sweep_pos]].start <= idx) {
+    int ii = ls->live_sweep_order[ls->live_sweep_pos++];
+    if (ls->intervals[ii].end >= idx)
+      ls->live_sweep_active[ls->live_sweep_active_count++] = ii;
+  }
+
+  int kept = 0;
+  for (int k = 0; k < ls->live_sweep_active_count; ++k) {
+    int ii = ls->live_sweep_active[k];
+    if (ls->intervals[ii].end < idx)
+      continue;
+    ls->live_sweep_active[kept++] = ii;
+  }
+  ls->live_sweep_active_count = kept;
+}
+
 uint32_t tcc_ls_compute_live_regs(LSLiveIntervalState *ls, int instruction_idx)
 {
+  if (instruction_idx < 0) {
+    uint32_t live_regs = 0;
+    for (int i = 0; i < ls->next_interval_index; ++i)
+      live_regs |= ls_interval_live_mask(&ls->intervals[i], (uint32_t)instruction_idx);
+    return live_regs;
+  }
+
+  ls_sweep_advance(ls, (uint32_t)instruction_idx);
+
   uint32_t live_regs = 0;
-  for (int i = 0; i < ls->next_interval_index; ++i)
-  {
-    LSLiveInterval *interval = &ls->intervals[i];
+  for (int k = 0; k < ls->live_sweep_active_count; ++k)
+    live_regs |= ls_interval_live_mask(&ls->intervals[ls->live_sweep_active[k]], (uint32_t)instruction_idx);
+  return live_regs;
+}
 
-    if (interval->reg_type != LS_REG_TYPE_INT && interval->reg_type != LS_REG_TYPE_LLONG)
-      continue;
-
-    if (interval->start <= (uint32_t)instruction_idx && interval->end >= (uint32_t)instruction_idx)
-    {
-      if (interval->r0 >= 0 && interval->r0 < 16)
-      {
-        live_regs |= (1 << interval->r0);
-      }
-      if (interval->r1 >= 0 && interval->r1 < 16)
-      {
-        live_regs |= (1 << interval->r1);
-      }
+int tcc_ls_find_int_reg_holder(LSLiveIntervalState *ls, int r, int instruction_idx)
+{
+  int best = -1;
+  if (instruction_idx >= 0) {
+    ls_sweep_advance(ls, (uint32_t)instruction_idx);
+    for (int k = 0; k < ls->live_sweep_active_count; ++k) {
+      int ii = ls->live_sweep_active[k];
+      const LSLiveInterval *iv = &ls->intervals[ii];
+      if (iv->reg_type != LS_REG_TYPE_INT)
+        continue;
+      if (iv->addrtaken || iv->stack_location != 0)
+        continue;
+      if (iv->r1 >= 0 && iv->r1 < 16)
+        continue;
+      if (iv->r0 != r)
+        continue;
+      if ((int)iv->start > instruction_idx || (int)iv->end < instruction_idx)
+        continue;
+      if (best < 0 || ii < best)
+        best = ii;
     }
   }
-  return live_regs;
+  return best;
 }
 
 /* True when physical register `reg` is claimed at instruction `pos` by any

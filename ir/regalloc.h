@@ -18,8 +18,7 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#ifndef TCC_IR_REGALLOC_H
-#define TCC_IR_REGALLOC_H
+#pragma once
 
 struct TCCIRState;
 
@@ -37,9 +36,14 @@ typedef struct RegAllocTarget {
   RegAllocClass fp_class;
   int param_regs;        /* number of parameter registers (e.g. 4) */
   int static_chain_reg;  /* -1 if none */
+  int (*op_narrow_capable)(int op, int src2_is_imm, int scale); /* op has a 16-bit encoding when operands land in low regs; NULL = no narrow forms */
 } RegAllocTarget;
 
 void tcc_ir_ssa_regalloc(struct TCCIRState *ir, const RegAllocTarget *target, int spill_base);
 int tcc_ir_move_coalescing(struct TCCIRState *ir);
 
-#endif /* TCC_IR_REGALLOC_H */
+/* Pre-RA cleanup passes (source/opt/ra/), run from tcc_ir_ssa_regalloc(). */
+int ra_repair_incomplete_calls(struct TCCIRState *ir);
+int ra_fold_const_branches(struct TCCIRState *ir);
+int ra_fold_phi_const_chain(struct TCCIRState *ir);
+

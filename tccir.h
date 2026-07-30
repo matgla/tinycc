@@ -84,6 +84,12 @@ typedef enum TccIrOp
    * ARM: UBFX Rd, Rn, #lsb, #width */
   TCCIR_OP_UBFX,
 
+  /* Signed bitfield extract: dest = sign-extend of src1 bits [lsb..lsb+width-1].
+   * src2 encodes lsb (bits 0-4) and width (bits 5-9): src2 = lsb | (width << 5).
+   * The signed analog of UBFX, from the (x<<a)>>b arithmetic-shift idiom.
+   * ARM: SBFX Rd, Rn, #lsb, #width */
+  TCCIR_OP_SBFX,
+
   /* Bitfield insert: dest = (src1 with bits [lsb..lsb+width-1] replaced by the
    * low `width` bits of src2).  Algebraically == (src1 & ~field) | (src2 << lsb)
    * for field = ((1<<width)-1)<<lsb when src2 < 2^width.  lsb/width are carried
@@ -227,6 +233,15 @@ typedef enum TccIrOp
    * Placed at the end of the enum to avoid shifting other op values, which
    * could break ranges or generated tables that depend on absolute positions. */
   TCCIR_OP_SMULL,
+  /* Single-operand bit manipulation: dest = <op>(src1), 32-bit only.
+   * These map one-to-one onto Thumb-2 instructions and exist so the
+   * __builtin_clz/ctz/bswap family does not have to go through a libcall.
+   * They are only emitted when the active target advertises the encoding
+   * (see tcc_machine_has_bit_ops). */
+  TCCIR_OP_CLZ,   /* count leading zeros (clz);  clz(0) == 32 */
+  TCCIR_OP_RBIT,  /* reverse bit order (rbit) */
+  TCCIR_OP_REV,   /* reverse byte order in a word (rev)  == bswap32 */
+  TCCIR_OP_REV16, /* reverse byte order in each halfword (rev16) */
 } TccIrOp;
 
 /* Size (in bytes) at or above which the backend lowers a TCCIR_OP_BLOCK_COPY to
@@ -324,6 +339,8 @@ typedef struct IRLiveInterval
   int8_t incoming_reg1;    // for doubles: second register (-1 if not double or stack)
   int32_t original_offset; // for params: original offset from function entry point
   int stack_slot_index;    // index into stack layout (-1 if not stack-backed)
+  uint8_t remat_kind;      // 0=none, 1=imm32: recompute value instead of reloading when spilled
+  int32_t remat_imm;       // the constant when remat_kind==1
 } IRLiveInterval;
 
 typedef struct IRCallArgument
@@ -479,6 +496,9 @@ typedef struct TCCIRState
   uint8_t prevent_coalescing;
   uint8_t has_static_chain : 1;      /* function uses static chain for nested func */
   uint8_t needs_chain_save : 1;      /* must save chain at FP-4 for multi-hop child access */
+  uint8_t emits_set_chain : 1;       /* parent writes R10 (SET_CHAIN/INIT_CHAIN_SLOT) to call a
+                                        nested function; R10 is callee-saved, so it must be in
+                                        the prologue save mask and excluded from reassignment */
   int32_t static_chain_vreg;         /* vreg holding static chain pointer (parent FP) */
   int32_t captured_offsets_list[32]; /* offsets of captured vars (for chain-relative access) */
   int32_t captured_chain_depths[32]; /* 1 = direct R10, 2+ = multi-hop */
@@ -624,6 +644,8 @@ typedef struct TCCIRState
    * barrel_shifts[i] encodes an optional barrel shift on src2 of instruction i:
    * 0 = none, else (type<<5)|amount. type: 1=SHL, 2=SHR, 3=SAR, 4=ROR. */
   uint8_t *barrel_shifts;
+  /* Element count at allocation; reads bound by this, not max_orig_index. See docs/side_table_orig_index_bounds.md */
+  int barrel_shifts_len;
 
   /* Dead-half annotations for 64-bit shift ops, keyed by orig_index.
    * Populated just before codegen, freed after.  bit0 = the result's low
@@ -631,12 +653,14 @@ typedef struct TCCIRState
    * dead.  Lets thumb_emit_shift64_mop skip the dead half-write in the
    * 64-bit bitfield-extract idiom (SHL #a; SHR #b, b>=32). */
   uint8_t *shift64_dead_half;
+  int shift64_dead_half_len;
 
   /* BFI insert parameters, keyed by orig_index.  Populated by
    * tcc_ir_opt_bitfield_insert_to_bfi just before codegen, freed after.
    * Entry = lsb (bits 0-7) | (width << 8); width >= 1 so a real BFI entry is
    * never 0.  Consumed by tcc_gen_machine_bfi_mop. */
   uint16_t *bfi_params;
+  int bfi_params_len;
 
   /* Codegen temporaries owned by tcc_ir_codegen_generate while it is running.
    * They are normally freed before return; tcc_ir_free also releases them when
@@ -646,6 +670,15 @@ typedef struct TCCIRState
   uint16_t *codegen_dry_insn_saves;
   void *codegen_mop_cache;
   uint32_t *codegen_cbz_dry_mapping;
+  /* Code address just past the last body instruction as laid out by the
+   * rehearsal pass — i.e. where the epilogue begins.  Return jumps target the
+   * epilogue, which is not an IR index, so this is what lets them be sized.
+   * 0 when no rehearsal ran. */
+  uint32_t codegen_rehearsal_end;
+  /* Running literal-pool entry total per IR instruction, recorded by the
+   * rehearsal pass; bounds the pool pressure over a forward branch's range so
+   * can_narrow_forward_branch can prove no flush lands inside it. */
+  uint16_t *codegen_dry_pool_entries;
   uint8_t *codegen_branch_target_reset;
 } TCCIRState;
 
@@ -715,9 +748,6 @@ int tcc_ir_spill_cache_lookup(SpillCache *cache, int offset);
 void tcc_ir_spill_cache_invalidate_reg(SpillCache *cache, int reg);
 void tcc_ir_spill_cache_invalidate_offset(SpillCache *cache, int offset);
 
-/* Check if FPU supports double precision (defined in arm-thumb-gen.c) */
-int arm_fpu_supports_double(int fpu_type);
-
 /* SValue pool accessor functions for compact IR storage.
  * Operand layout in pool: dest (if present), src1 (if present), src2 (if present).
  * Returns NULL if the operand is not used by this operation. */
@@ -751,6 +781,29 @@ static inline IROperand tcc_ir_get_dest(const TCCIRState *ir, int index)
   if (q->operand_base >= (uint32_t)ir->iroperand_pool_count)
     return IROP_NONE;
   return ir->iroperand_pool[q->operand_base];
+}
+
+/* Side tables keyed by orig_index; a 0 result means "no annotation" (including
+ * for instructions inserted after the table was populated). See docs/side_table_orig_index_bounds.md */
+static inline uint8_t tcc_ir_barrel_shift_at(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (!ir->barrel_shifts || q->orig_index < 0 || q->orig_index >= ir->barrel_shifts_len)
+    return 0;
+  return ir->barrel_shifts[q->orig_index];
+}
+
+static inline uint8_t tcc_ir_shift64_dead_half_at(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (!ir->shift64_dead_half || q->orig_index < 0 || q->orig_index >= ir->shift64_dead_half_len)
+    return 0;
+  return ir->shift64_dead_half[q->orig_index];
+}
+
+static inline uint16_t tcc_ir_bfi_params_at(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (!ir->bfi_params || q->orig_index < 0 || q->orig_index >= ir->bfi_params_len)
+    return 0;
+  return ir->bfi_params[q->orig_index];
 }
 
 static inline IROperand tcc_ir_op_get_src1(const TCCIRState *ir, const IRQuadCompact *q)
@@ -902,6 +955,21 @@ static inline void tcc_ir_set_src2(TCCIRState *ir, int index, IROperand irop)
   if (!irop_config[q->op].has_src2)
     return;
   int off = irop_config[q->op].has_dest + irop_config[q->op].has_src1;
+#ifdef CONFIG_TCC_DEBUG
+  /* Tripwire: src2 with a barrel-shift annotation means the real RHS is
+   * (src2 SHIFT #n).  Substituting an immediate folds the UN-shifted value
+   * (no imm-with-shift encoding exists, and binop folds ignore the side
+   * table).  A pass that wants this must clear the annotation first. */
+  {
+    IROperand old = ir->iroperand_pool[q->operand_base + off];
+    if (tcc_ir_barrel_shift_at(ir, q) && irop_is_immediate(irop) &&
+        !irop_is_immediate(old)) {
+      fprintf(stderr, "compiler_error: immediate substituted into "
+                      "barrel-shift-annotated src2 (instr %d)\n", index);
+      abort();
+    }
+  }
+#endif
   ir->iroperand_pool[q->operand_base + off] = irop;
 }
 

@@ -9,8 +9,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_rev.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_rev.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -220,23 +220,4 @@ UT_TEST(test_rbit_without_clz_rbit_feature_fails)
     UT_ASSERT_EQ(op.opcode, 0);
 
     return 0;
-}
-
-/* ───── suite ───── */
-
-UT_SUITE(thop_rev)
-{
-    UT_RUN(test_rev_t1_low_regs);
-    UT_RUN(test_rev_t2_high_regs);
-    UT_RUN(test_rev_t1_auto_high_reg_falls_to_t2);
-    UT_RUN(test_rev_enforce_16bit_high_reg_fails);
-    UT_RUN(test_rev16_t1_low_regs);
-    UT_RUN(test_rev16_t2_high_regs);
-    UT_RUN(test_rev16_t1_auto_high_reg_falls_to_t2);
-    UT_RUN(test_revsh_t1_low_regs);
-    UT_RUN(test_revsh_t2_high_regs);
-    UT_RUN(test_revsh_t1_auto_high_reg_falls_to_t2);
-    UT_RUN(test_rbit_t2_basic);
-    UT_RUN(test_rbit_t2_high_regs);
-    UT_RUN(test_rbit_without_clz_rbit_feature_fails);
 }

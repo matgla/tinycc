@@ -404,21 +404,23 @@ def test_data_sections_quirk():
 
 @pytest.mark.linker
 @pytest.mark.linker_section
-def test_string_literal_no_merge():
-    obj = _compile_to_object("05_string_literal_no_merge", "sections")
+def test_string_literal_merge():
+    obj = _compile_to_object("05_string_literal_merge", "sections")
     syms = _readelf_syms(obj)
     sections = _readelf_sections(obj)
 
     literals = [s for s in syms if s["name"].startswith("L.")]
-    assert len(literals) == 2, f"expected 2 separate literal symbols, got {literals}"
-    # Not deduplicated: two distinct storage offsets for the same bytes.
-    assert literals[0]["value"] != literals[1]["value"]
+    # Deduplicated in the frontend: each literal keeps its own anon symbol, but
+    # identical bytes share a single storage offset (no orphan symbol left over).
+    assert len(literals) == 2, f"expected 2 literal symbols, got {literals}"
+    assert literals[0]["value"] == literals[1]["value"], (
+        f"identical literals not deduplicated: {literals}"
+    )
 
     rodata = next(s for s in sections if s["name"] == ".rodata")
-    # No SHF_MERGE ('M') or SHF_STRINGS ('S') flag: not a mergeable string
-    # section. This is a simplification relative to gcc (which would use a
-    # mergeable .rodata.str1.1 section), not a spec violation, so it is
-    # locked in here as current behavior.
+    # One physical copy of "hello\0" => 6 bytes; dedup is done by the compiler,
+    # not via a mergeable (SHF_MERGE/SHF_STRINGS) .rodata.str section.
+    assert int(rodata["size"], 16) == 6, f"expected a single 6-byte copy, got {rodata['size']}"
     assert "M" not in rodata["flags"] and "S" not in rodata["flags"], (
         f".rodata unexpectedly mergeable: flags={rodata['flags']}"
     )

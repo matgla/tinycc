@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_CODEGEN_H
-#define TCC_IR_CODEGEN_H
+#pragma once
 
 struct TCCIRState;
 struct IROperand;
@@ -90,4 +89,3 @@ void tcc_ir_codegen_drop_return(struct TCCIRState *ir);
 /* Mark start of basic block */
 void tcc_ir_codegen_bb_start(struct TCCIRState *ir);
 
-#endif /* TCC_IR_CODEGEN_H */

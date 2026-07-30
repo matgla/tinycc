@@ -81,11 +81,35 @@ double __aeabi_ddiv(double a, double b)
     return ur.d;
   }
 
-  /* Add implicit bit for normalized numbers */
+  /* Add implicit bit for normals; scale subnormals into normal form and pay
+   * for it in the exponent, so the restoring division below always starts from
+   * a full-width significand. */
   if (a_exp != 0)
+  {
     a_mant |= DOUBLE_IMPLICIT_BIT;
+  }
+  else
+  {
+    a_exp = 1;
+    while (!(a_mant & DOUBLE_IMPLICIT_BIT))
+    {
+      a_mant <<= 1;
+      a_exp--;
+    }
+  }
   if (b_exp != 0)
+  {
     b_mant |= DOUBLE_IMPLICIT_BIT;
+  }
+  else
+  {
+    b_exp = 1;
+    while (!(b_mant & DOUBLE_IMPLICIT_BIT))
+    {
+      b_mant <<= 1;
+      b_exp--;
+    }
+  }
 
   /* Calculate result exponent: ea - eb + bias */
   int result_exp = a_exp - b_exp + DOUBLE_EXP_BIAS;
@@ -108,8 +132,12 @@ double __aeabi_ddiv(double a, double b)
     result_exp--;
   }
 
-  /* Perform 54 iterations to get 54 bits (53 + 1 guard bit) */
-  for (int i = 0; i < 54; i++)
+  /* Generate 53 significand bits plus SFP_GRS guard bits.  After the
+   * alignment above the first iteration always sets a bit, so the quotient
+   * lands with its leading bit at 52 + SFP_GRS -- exactly where
+   * sfp_round_pack_double() expects it.  (dividend stays below 2^54
+   * throughout: it is reduced below the divisor before each shift.) */
+  for (int i = 0; i < 53 + SFP_GRS; i++)
   {
     quotient <<= 1;
     if (!(dividend < divisor))
@@ -120,43 +148,11 @@ double __aeabi_ddiv(double a, double b)
     dividend <<= 1;
   }
 
-  /* Use guard bit for rounding, then scale back to 53 bits */
-  uint64_t guard = quotient & 1;
-  quotient >>= 1;
-  if (guard && dividend)
-  {
-    quotient++;
-  }
+  /* A non-zero remainder means the quotient is inexact; fold that into the
+   * sticky bit.  The old code kept a single guard bit and rounded half *up*,
+   * so exact ties went the wrong way and subnormal results were flushed. */
+  quotient |= (dividend != 0);
 
-  /* Normalize quotient - should have MSB around bit 53 */
-  /* Shift to get 52-bit mantissa */
-  while (!(quotient < (DOUBLE_IMPLICIT_BIT << 1)))
-  {
-    quotient >>= 1;
-    result_exp++;
-  }
-  while (quotient && !(quotient & DOUBLE_IMPLICIT_BIT))
-  {
-    quotient <<= 1;
-    result_exp--;
-  }
-
-  /* Check for overflow to infinity */
-  if (result_exp >= 0x7FF)
-  {
-    ur.u = make_double(result_sign, 0x7FF, 0);
-    return ur.d;
-  }
-
-  /* Check for underflow to zero */
-  if (result_exp <= 0)
-  {
-    ur.u = make_double(result_sign, 0, 0);
-    return ur.d;
-  }
-
-  /* Remove implicit bit */
-  uint64_t result_mant = quotient & DOUBLE_MANT_MASK;
-  ur.u = make_double(result_sign, result_exp, result_mant);
+  ur.u = sfp_round_pack_double(result_sign, result_exp, quotient);
   return ur.d;
 }

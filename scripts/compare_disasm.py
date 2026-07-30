@@ -21,9 +21,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from disasm_common import (
+from sources.disasm_common import (
     DisasmCache,
-    TCC_DIR,
     compile_gcc,
     compile_tcc,
     compare_functions,

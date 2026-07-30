@@ -108,10 +108,27 @@ def rev_list(n: int) -> list[str]:
 
 # ------------------------------------------------------------------------- db
 
+def migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing db up to the current schema.
+
+    `CREATE TABLE IF NOT EXISTS` initializes but never evolves: a table created
+    by an older revision keeps its old columns and the next INSERT fails on the
+    arity mismatch.  qemu_cycles rows are cheap to regenerate (~11s for the
+    corpus) and carry no history worth preserving, so recreate rather than
+    ALTER; anything with real history would need a column-preserving migration.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(qemu_cycles)")}
+    if cols and not {"passed", "shift"} <= cols:
+        warn("qemu_cycles predates the verdict/shift columns -- recreating "
+             "(its rows are re-measured, not history)")
+        conn.execute("DROP TABLE qemu_cycles")
+
+
 def connect(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=60)
     conn.execute("PRAGMA foreign_keys = ON")
+    migrate(conn)                                # evolve before (re)creating
     conn.executescript(SCHEMA_SQL.read_text())   # self-initializing / idempotent
     return conn
 
@@ -141,7 +158,7 @@ def upsert_run(conn: sqlite3.Connection, meta: dict, host: str, branch: str,
         "SELECT run_id FROM runs WHERE commit_sha=? AND host=?",
         (meta["commit_sha"], host)).fetchone()[0]
     for tbl in ("correctness", "correctness_seed", "codesize_rollup",
-                "codesize_func", "compile_time", "perf"):
+                "codesize_func", "compile_time", "perf", "qemu_cycles"):
         conn.execute(f"DELETE FROM {tbl} WHERE run_id=?", (run_id,))
     return run_id
 
@@ -258,14 +275,17 @@ def ensure_codesize_corpus() -> None:
 CODESIZE_OPTS = [("o0", "-O0"), ("o1", "-O1"), ("o2", "-O2")]
 
 
-def record_codesize(conn, run_id, jobs, detail: bool, tcc_override=None) -> dict:
+def record_codesize(conn, run_id, jobs, detail: bool, tcc_override=None,
+                    opts=None) -> dict:
     """Record code size (rollup + optional per-function detail) at each opt level
-    and return {opt: corpus_compile_wall_seconds} (the coarse compile-time proxy,
-    one per level)."""
+    (all of CODESIZE_OPTS, or the `opts` subset) and return
+    {opt: corpus_compile_wall_seconds} (the coarse compile-time proxy)."""
     from regression_disasm import run_csv_mode
     ensure_codesize_corpus()
     elapsed = {}
     for opt, flag in CODESIZE_OPTS:
+        if opts is not None and opt not in opts:
+            continue
         t0 = time.monotonic()
         # Compile BOTH tcc and gcc at this level (tcc_opt=flag, gcc_opt=flag).
         csv_text = run_csv_mode(flag, None, "all", jobs,
@@ -295,6 +315,37 @@ def record_codesize(conn, run_id, jobs, detail: bool, tcc_override=None) -> dict
              f"ratio={tot[1]/tot[2]:.3f} in {elapsed[opt]:.0f}s"
              if tot[2] else f"codesize[{opt}]: {tot[0]} funcs in {elapsed[opt]:.0f}s")
     return elapsed
+
+
+def record_qemu_cycles(conn, run_id, jobs, tcc_override=None, opts=None,
+                       suite="all", shift=None) -> None:
+    """Run the QEMU corpus at each opt level, recording per test its functional
+    verdict and its cycle count from one compile+link+run.
+
+    Unlike correctness/perf (which hardcode the in-place armv8m-tcc), this takes
+    the compiler path, so it scores a --backfill/--baseline-commit build too --
+    which is what lets compare_worktree diff verdicts between two builds.
+    """
+    from qemu_corpus import DEFAULT_SHIFT, run_corpus
+    tcc = Path(tcc_override) if tcc_override else (REPO_ROOT / "armv8m-tcc")
+    shift = DEFAULT_SHIFT if shift is None else shift
+    for opt, flag in CODESIZE_OPTS:
+        if opts is not None and opt not in opts:
+            continue
+        try:
+            rows = run_corpus(tcc, flag, suite, jobs, shift=shift)
+        except Exception as exc:
+            # Not measured (no qemu, unbuilt newlib) -- leave a gap, not a false 0.
+            warn(f"qemu corpus[{opt}]: {exc} -- skipping rows")
+            continue
+        conn.executemany(
+            "INSERT OR REPLACE INTO qemu_cycles VALUES(?,?,?,?,?,?,?)",
+            [(run_id, r["suite"], r["test"], opt, r["cycles"], shift, r["passed"])
+             for r in rows])
+        timed = [r["cycles"] for r in rows if r["cycles"] is not None]
+        info(f"qemu_cycles[{opt}]: {len(rows)} tests, "
+             f"{sum(1 for r in rows if not r['passed'])} failed, "
+             f"{sum(timed):,} cycles over {len(timed)} timed (shift={shift})")
 
 
 def record_compile_time(conn, run_id, scope, corpus_secs, n_units) -> None:
@@ -505,7 +556,8 @@ def record_perf(conn, run_id, perf_host, perf_identity, scratch: Path,
 # ---------------------------------------------------------------------- record
 
 def record_one(conn, meta, host, branch, trigger, args, tcc_override=None,
-               do_correctness=True, do_perf=True) -> None:
+               do_correctness=True, do_perf=True, codesize_opts=None,
+               do_cycles=False) -> None:
     t0 = time.monotonic()
     run_id = upsert_run(conn, meta, host, branch, trigger,
                         args.seed_lo, args.seed_hi, args.mode)
@@ -518,7 +570,8 @@ def record_one(conn, meta, host, branch, trigger, args, tcc_override=None,
                                  meta["commit_sha"], host, branch,
                                  args.detail_keep)
     else:
-        corpus_secs = record_codesize(conn, run_id, args.jobs, args.codesize_detail, tcc_override)
+        corpus_secs = record_codesize(conn, run_id, args.jobs, args.codesize_detail,
+                                      tcc_override, opts=codesize_opts)
         for opt, secs in corpus_secs.items():
             n_units = conn.execute(
                 "SELECT func_count FROM codesize_rollup "
@@ -536,6 +589,11 @@ def record_one(conn, meta, host, branch, trigger, args, tcc_override=None,
             else:
                 warn("--detail-db requested without --codesize-detail; no "
                      "per-function rows were recorded to sync")
+    if do_cycles:
+        record_qemu_cycles(conn, run_id, args.jobs, tcc_override,
+                           opts=codesize_opts,
+                           suite=getattr(args, "cycles_suite", "all"),
+                           shift=getattr(args, "cycles_shift", None))
     if do_perf and args.perf_host:
         record_perf(conn, run_id, args.perf_host, args.perf_identity,
                     Path(args.scratch or "."), strict=args.perf_strict)

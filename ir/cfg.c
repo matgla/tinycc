@@ -35,6 +35,24 @@ add_pred:
   tb->preds[tb->num_preds++] = from;
 }
 
+int tcc_ir_cfg_flat_has_backedge(TCCIRState *ir)
+{
+  if (!ir)
+    return 0;
+  int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_SWITCH_LOAD)
+      return 1;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
+      int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      if (target >= 0 && target <= i)
+        return 1;
+    }
+  }
+  return 0;
+}
+
 IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -44,8 +62,7 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
   IRCFG *cfg = tcc_mallocz(sizeof(IRCFG));
   cfg->num_instrs = n;
 
-  /* Mark leaders — recompute jump targets from scratch (don't trust
-   * stale is_jump_target flags from previous optimization passes). */
+  /* Recompute jump targets from scratch — don't trust stale flags. */
   uint8_t *is_leader = tcc_mallocz(n);
   is_leader[0] = 1;
   for (int i = 0; i < n; i++) {
@@ -57,12 +74,8 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
         is_leader[target] = 1;
       }
     }
-    /* SWITCH_TABLE case/default targets are jump targets too.  A case body
-     * reached by fall-through from the previous case is NOT otherwise a
-     * leader; without splitting there, instr_to_block[] maps the case entry
-     * to the middle of the merged block and every switch edge lands at that
-     * block's START — SCCP then const-folds values along the wrong case
-     * chain (switch fuzz seed 18613: selector 6 folded via case 3's body). */
+    /* Switch case/default targets must be leaders; otherwise SCCP folds
+     * values along the wrong chain via merged blocks. */
     if (q->op == TCCIR_OP_SWITCH_TABLE) {
       IROperand src2 = tcc_ir_op_get_src2(ir, q);
       int table_id = (int)irop_get_imm64_ex(ir, src2);
@@ -150,7 +163,7 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
     }
     else if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
              q->op == TCCIR_OP_IJUMP) {
-      /* no successors (IJUMP: conservative — skip loops containing it) */
+      /* no successors */
     }
     else {
       if (b + 1 < cfg->num_blocks)
@@ -174,6 +187,8 @@ void tcc_ir_cfg_free(IRCFG *cfg)
   tcc_free(cfg->blocks);
   tcc_free(cfg->rpo_order);
   tcc_free(cfg->instr_to_block);
+  tcc_free(cfg->dom_tin);
+  tcc_free(cfg->dom_tout);
   tcc_free(cfg);
 }
 
@@ -188,7 +203,7 @@ static void cfg_compute_rpo(IRCFG *cfg)
   int *postorder = tcc_mallocz(nb * sizeof(int));
   int po_count = 0;
 
-  /* Iterative DFS using explicit stack: (block, child_index) */
+  /* Explicit-stack DFS */
   typedef struct { int block; int ci; } DFSFrame;
   DFSFrame *stack = tcc_mallocz(nb * sizeof(DFSFrame));
   int sp = 0;
@@ -227,7 +242,6 @@ static void cfg_compute_rpo(IRCFG *cfg)
   tcc_free(stack);
 }
 
-/* Cooper-Harvey-Kennedy dominator tree */
 static int cfg_intersect(IRCFG *cfg, int b1, int b2)
 {
   while (b1 != b2) {
@@ -273,12 +287,73 @@ void tcc_ir_cfg_compute_dominators(IRCFG *cfg)
       }
     }
   }
+
+  /* Pre/post-order stamps over the idom tree for O(1) dominance queries. */
+  {
+    int nb = cfg->num_blocks;
+    tcc_free(cfg->dom_tin);
+    tcc_free(cfg->dom_tout);
+    cfg->dom_tin = tcc_malloc(sizeof(int) * nb);
+    cfg->dom_tout = tcc_malloc(sizeof(int) * nb);
+    cfg->dom_dfs_count = nb;
+    for (int i = 0; i < nb; i++) { cfg->dom_tin[i] = -1; cfg->dom_tout[i] = -1; }
+
+    int *ccount = tcc_mallocz(sizeof(int) * nb);
+    for (int ri = 0; ri < cfg->rpo_count; ri++) {
+      int b = cfg->rpo_order[ri];
+      int p = cfg->blocks[b].idom;
+      if (b != 0 && p >= 0 && p != b)
+        ccount[p]++;
+    }
+    int *cstart = tcc_malloc(sizeof(int) * (nb + 1));
+    cstart[0] = 0;
+    for (int i = 0; i < nb; i++) cstart[i + 1] = cstart[i] + ccount[i];
+    int *chld = tcc_malloc(sizeof(int) * (cstart[nb] > 0 ? cstart[nb] : 1));
+    int *nxt = ccount; /* reuse as per-parent write cursor, then DFS child cursor */
+    for (int i = 0; i < nb; i++) nxt[i] = cstart[i];
+    for (int ri = 0; ri < cfg->rpo_count; ri++) {
+      int b = cfg->rpo_order[ri];
+      int p = cfg->blocks[b].idom;
+      if (b != 0 && p >= 0 && p != b)
+        chld[nxt[p]++] = b;
+    }
+    for (int i = 0; i < nb; i++) nxt[i] = cstart[i];
+
+    if (cfg->rpo_count > 0) {
+      int *stack = tcc_malloc(sizeof(int) * (cfg->rpo_count + 1));
+      int sp = 0, clock = 0;
+      stack[sp++] = 0;
+      cfg->dom_tin[0] = clock++;
+      while (sp > 0) {
+        int b = stack[sp - 1];
+        if (nxt[b] < cstart[b + 1]) {
+          int c = chld[nxt[b]++];
+          cfg->dom_tin[c] = clock++;
+          stack[sp++] = c;
+        } else {
+          cfg->dom_tout[b] = clock++;
+          sp--;
+        }
+      }
+      tcc_free(stack);
+    }
+    tcc_free(ccount);
+    tcc_free(cstart);
+    tcc_free(chld);
+  }
 }
 
 int tcc_ir_cfg_dominates(IRCFG *cfg, int a, int b)
 {
   if (!cfg || a < 0 || b < 0 || a >= cfg->num_blocks || b >= cfg->num_blocks)
     return 0;
+  if (a == b)
+    return 1;
+  if (cfg->dom_tin && a < cfg->dom_dfs_count && b < cfg->dom_dfs_count) {
+    if (cfg->dom_tin[a] < 0 || cfg->dom_tin[b] < 0)
+      return 0;
+    return cfg->dom_tin[a] < cfg->dom_tin[b] && cfg->dom_tout[b] < cfg->dom_tout[a];
+  }
   while (b >= 0) {
     if (b == a)
       return 1;
@@ -317,15 +392,14 @@ void tcc_ir_cfg_compute_dom_frontiers(IRCFG *cfg)
   if (!cfg || cfg->num_blocks == 0)
     return;
 
-  /* Build dominator tree children lists */
+  /* Build dominator tree children */
   for (int b = 1; b < cfg->num_blocks; b++) {
     int idom = cfg->blocks[b].idom;
     if (idom >= 0 && idom != b)
       cfg_add_dom_child(&cfg->blocks[idom], b);
   }
 
-  /* Compute dominance frontier using the standard algorithm.
-   * Per-block bitset avoids O(n^2) duplicate checks in cfg_add_df. */
+  /* Standard dominance frontier; per-block bitset avoids O(n^2) dup checks. */
   int nb = cfg->num_blocks;
   int df_seen_bytes = (nb + 7) / 8;
   uint8_t *df_seen = tcc_mallocz(nb * df_seen_bytes);

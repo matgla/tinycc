@@ -42,7 +42,7 @@
 #include "ir/regalloc.h"
 #include "ir/codegen.h"
 #include "ir/machine_op.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
 
@@ -137,7 +137,7 @@ UT_TEST(test_dispatch_prolog_and_epilog_called_exactly_once_two_pass_path)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 1); /* confirms two-pass ran */
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 2); /* discovery + rehearsal dry pass */ /* confirms two-pass ran */
   UT_ASSERT_EQ(cgstub_call_count("prolog"), 1);
   UT_ASSERT_EQ(cgstub_call_count("epilog"), 1);
 
@@ -233,7 +233,7 @@ UT_TEST(test_dispatch_prolog_forces_lr_when_dry_run_reports_lr_push_in_leaf_fn)
   ir->leaffunc = 1; /* original_leaffunc gate: only leaf functions apply this */
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 1); /* two-pass path required */
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 2); /* discovery + rehearsal dry pass */ /* two-pass path required */
   UT_ASSERT_EQ(cgstub_call_count("prolog"), 1);
   const CgStubLastProlog *p = cgstub_get_last_prolog();
   UT_ASSERT(p->called);
@@ -341,7 +341,7 @@ UT_TEST(test_phase3_scratch_conflict_reassignment_frees_scratch_register)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 1); /* confirms two-pass ran */
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 2); /* discovery + rehearsal dry pass */ /* confirms two-pass ran */
 
   /* The fixup should have relocated t[0] off r0_before onto a free
    * callee-saved register (R4-R11 minus R7) -- observable directly via the
@@ -419,7 +419,7 @@ UT_TEST(test_phase3_alt_reassign_relocates_unpinned_r0_r3_occupant)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 2); /* discovery + rehearsal dry pass */
 
   /* p0/p1/p2 stay put (ABI-pinned, never reassignable). */
   UT_ASSERT_EQ(tcc_ir_vreg_live_interval(ir, p0)->allocation.r0, 0);
@@ -498,7 +498,7 @@ UT_TEST(test_dispatch_scratch_save_size_uses_global_bitmap_when_no_per_insn_save
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 1); /* confirms two-pass ran */
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 2); /* discovery + rehearsal dry pass */ /* confirms two-pass ran */
   UT_ASSERT_EQ(ir->scratch_save_size, 16);              /* (3*4+7) & ~7 == 16 */
 
   tcc_ir_free(ir);
@@ -552,26 +552,9 @@ UT_TEST(test_dispatch_scratch_save_size_stays_zero_when_no_scratch_pushes_at_all
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 2); /* discovery + rehearsal dry pass */
   UT_ASSERT_EQ(ir->scratch_save_size, 0);
 
   tcc_ir_free(ir);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(codegen_dispatch_prolog)
-{
-  UT_RUN(test_dispatch_prolog_and_epilog_called_exactly_once_two_pass_path);
-  UT_RUN(test_dispatch_prolog_and_epilog_called_exactly_once_skip_path);
-  UT_RUN(test_dispatch_epilog_called_once_with_two_return_paths);
-  UT_RUN(test_dispatch_prolog_forces_lr_when_dry_run_reports_lr_push_in_leaf_fn);
-  UT_RUN(test_dispatch_prolog_no_lr_forced_when_knob_is_zero);
-  UT_RUN(test_phase3_scratch_conflict_reassignment_frees_scratch_register);
-  UT_RUN(test_phase3_alt_reassign_relocates_unpinned_r0_r3_occupant);
-  UT_RUN(test_dispatch_scratch_save_size_uses_global_bitmap_when_no_per_insn_saves);
-  UT_RUN(test_dispatch_scratch_save_size_stays_zero_when_no_scratch_pushes_at_all);
 }

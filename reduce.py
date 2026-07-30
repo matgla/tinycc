@@ -18,7 +18,7 @@ import argparse, os, re, subprocess, sys, random, tempfile, shutil
 
 REPO = os.path.abspath(os.path.dirname(__file__))
 RUN = os.path.join(REPO, "tests", "ir_tests", "run.py")
-ENV = dict(os.environ, ASAN_OPTIONS="detect_leaks=0")
+ENV = dict(os.environ)
 ENV.pop("TCC_DISABLE_PASS", None)
 
 _cache: dict[bytes, tuple[str, str]] = {}

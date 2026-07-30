@@ -14,7 +14,7 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ut.h"
 
 /* ------------------------------------------------------------------ helpers */
@@ -1388,111 +1388,4 @@ UT_TEST(test_combo_alu_t32_rm_sp_fail)
                               TABLE_COMBO_ALU_T32.variant_count, a);
   ASSERT_FAIL(op);
   return 0;
-}
-
-/* ======================================================================== */
-/*  SUITE                                                                    */
-/* ======================================================================== */
-
-UT_SUITE(thop_constraints)
-{
-  /* register constraints */
-  UT_RUN(test_reg_low_only_pass);
-  UT_RUN(test_reg_low_only_fail_r8);
-  UT_RUN(test_reg_low_only_fail_r15);
-  UT_RUN(test_reg_not_sp_pass);
-  UT_RUN(test_reg_not_sp_fail_r13);
-  UT_RUN(test_reg_not_pc_pass);
-  UT_RUN(test_reg_not_pc_fail_r15);
-  UT_RUN(test_reg_not_lr_pass);
-  UT_RUN(test_reg_not_lr_fail_r14);
-  UT_RUN(test_reg_sp_only_pass);
-  UT_RUN(test_reg_sp_only_fail_r12);
-  UT_RUN(test_reg_pc_only_pass);
-  UT_RUN(test_reg_pc_only_fail_r14);
-  UT_RUN(test_reg_combined_mask_pass);
-  UT_RUN(test_reg_combined_mask_fail_high_reg);
-
-  /* equality constraints */
-  UT_RUN(test_reg_eq_rn_pass);
-  UT_RUN(test_reg_eq_rn_fail_mismatch);
-  UT_RUN(test_reg_eq_rn_fail_rd_not_low);
-  UT_RUN(test_reg_eq_rm_pass);
-  UT_RUN(test_reg_eq_rm_fail_mismatch);
-
-  /* register-list constraints */
-  UT_RUN(test_reg_low_regset_pass);
-  UT_RUN(test_reg_low_regset_fail_bit8);
-  UT_RUN(test_reg_rm_bit_not_sp_pass);
-  UT_RUN(test_reg_rm_bit_not_sp_fail);
-  UT_RUN(test_reg_rm_bits_not_lr_pc_pass);
-  UT_RUN(test_reg_rm_bits_not_lr_pc_fail_lr);
-  UT_RUN(test_reg_rm_bits_not_lr_pc_fail_pc);
-
-  /* encoding enforcement */
-  UT_RUN(test_enc_none_prefers_first);
-  UT_RUN(test_enc_force_16bit_ok);
-  UT_RUN(test_enc_force_16bit_fail);
-  UT_RUN(test_enc_force_32bit_ok);
-  UT_RUN(test_enc_force_32bit_only_table);
-
-  /* feature gating */
-  UT_RUN(test_feat_dsp_present);
-  UT_RUN(test_feat_dsp_missing);
-  UT_RUN(test_feat_div_present);
-  UT_RUN(test_feat_div_missing);
-
-  /* S-bit / IT-block */
-  UT_RUN(test_sbit_has_s_bit_not_set);
-  UT_RUN(test_sbit_has_s_bit_set);
-  UT_RUN(test_sbit_set_but_no_s_bit_support);
-  UT_RUN(test_implicit_s_outside_it);
-  UT_RUN(test_implicit_s_inside_it);
-  UT_RUN(test_forbid_s_in_it_outside_it);
-  UT_RUN(test_forbid_s_in_it_inside_it);
-
-  /* shift constraints */
-  UT_RUN(test_shift_lsl_allowed);
-  UT_RUN(test_shift_lsr_rejected);
-  UT_RUN(test_shift_none_allowed_when_fields_present);
-  UT_RUN(test_shift_any_rejected_when_no_fields);
-
-  /* PUW constraints */
-  UT_RUN(test_puw_fixed_match);
-  UT_RUN(test_puw_fixed_mismatch);
-  UT_RUN(test_puw_bits_any_value);
-
-  /* immediate validation */
-  UT_RUN(test_imm_raw_width_pass);
-  UT_RUN(test_imm_raw_width_fail);
-  UT_RUN(test_imm_raw_scaled_pass);
-  UT_RUN(test_imm_raw_scaled_fail_not_aligned);
-  UT_RUN(test_imm_raw_scaled_fail_too_big);
-  UT_RUN(test_imm_raw_signed_pass_negative);
-  UT_RUN(test_imm_raw_signed_fail_positive);
-  UT_RUN(test_imm_raw_signed_fail_zero);
-  UT_RUN(test_imm_none_zero_ok);
-  UT_RUN(test_imm_none_any_value_ignored);
-  UT_RUN(test_imm_pack_const_zero);
-  UT_RUN(test_imm_pack_const_valid);
-  UT_RUN(test_imm_pack_const_invalid);
-  UT_RUN(test_imm_pack_3_8_1_pass);
-  UT_RUN(test_imm_pack_3_8_1_fail_too_big);
-
-  /* special placement fields */
-  UT_RUN(test_has_rd_hi_low);
-  UT_RUN(test_has_rd_hi_high);
-  UT_RUN(test_dn_rd_split_r8);
-  UT_RUN(test_dn_rd_split_r12);
-  UT_RUN(test_split_imm_placement);
-  UT_RUN(test_exclude_bit_clears_bit);
-
-  /* fallback / multi-variant */
-  UT_RUN(test_fallback_t16_to_t32);
-  UT_RUN(test_fallback_t16_when_possible);
-
-  /* combined constraints */
-  UT_RUN(test_combo_alu_t32_pass);
-  UT_RUN(test_combo_alu_t32_rd_pc_fail);
-  UT_RUN(test_combo_alu_t32_rm_sp_fail);
 }

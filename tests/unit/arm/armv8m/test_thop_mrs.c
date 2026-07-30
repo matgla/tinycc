@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_mrs.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_mrs.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -121,15 +121,4 @@ UT_TEST(test_th_msr_primask)
   UT_ASSERT_EQ(op.opcode, 0xF3818810);
 
   return 0;
-}
-
-UT_SUITE(thop_mrs)
-{
-  UT_RUN(test_th_mrs_basic);
-  UT_RUN(test_th_mrs_ipsr);
-  UT_RUN(test_th_mrs_primask);
-  UT_RUN(test_th_mrs_control);
-  UT_RUN(test_th_msr_basic);
-  UT_RUN(test_th_msr_control);
-  UT_RUN(test_th_msr_primask);
 }

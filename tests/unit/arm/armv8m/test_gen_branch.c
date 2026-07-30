@@ -10,8 +10,8 @@
 
 #define USING_GLOBALS
 #include "ir.h"
-#include "arch/arm/arm.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
@@ -243,16 +243,4 @@ UT_TEST(test_bool_mop_and_reg_reg_emits_cmp_it_sequence)
   UT_ASSERT_EQ(read_le16(cur_text_section->data + 12), 0x2001);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_branch)
-{
-  UT_RUN(test_jump_mop_backward_narrows_to_16bit);
-  UT_RUN(test_conditional_jump_mop_backward_eq_narrows_to_16bit);
-  UT_RUN(test_conditional_jump_mop_not_backward_uses_32bit_ne);
-  UT_RUN(test_setif_mop_eq_32bit_emits_ite_and_movs);
-  UT_RUN(test_bool_mop_or_reg_reg_emits_orr_it_sequence);
-  UT_RUN(test_bool_mop_and_reg_reg_emits_cmp_it_sequence);
 }

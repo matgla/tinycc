@@ -187,6 +187,35 @@ UT_TEST(test_licm_hoists_invariant_add)
   return 0;
 }
 
+/* ssa:licm — the regalloc-time driver (ssa_opt_licm) over the same engine.
+ * Pins that the relocated pass entry still hoists the invariant ADD (one new
+ * NOP; the def moves ahead of the header) and reports a change. */
+UT_TEST(test_ssa_opt_licm_hoists_invariant)
+{
+  TCCIRState *ir = utb_loop_new();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(100, I32), UTB_NONE);   /* 0 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(5, I32));/* 1 header, invariant */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(2, I32), utb_imm(1, I32));/* 2 varying */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(1), utb_temp(3, I32), UTB_NONE);      /* 3 back-edge */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);                /* 4 exit */
+
+  int n_before = ir->next_instruction_index;
+  int nops_before = count_nops(ir);
+
+  int changed = ssa_opt_licm(ir);
+
+  UT_ASSERT_EQ(changed, 1);
+  UT_ASSERT_EQ(ir->next_instruction_index, n_before + 1);
+  UT_ASSERT_EQ(count_nops(ir), nops_before + 1);
+
+  int t1_def = find_def(ir, TCCIR_OP_ADD, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 1));
+  UT_ASSERT_EQ(t1_def, 1);
+
+  utb_free(ir);
+  return 0;
+}
+
 /* POSITIVE (docs/bugs.md #7, re-enabled): a CONST function call in a loop whose
  * argument is loop-invariant is hoisted into the preheader by
  * tcc_ir_hoist_pure_calls (run first inside tcc_ir_opt_licm_ex).  The original
@@ -1502,62 +1531,4 @@ UT_TEST(test_infer_purity_null_args_are_impure)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_licm)
-{
-  UT_COVERS("licm");
-  UT_RUN(test_licm_hoists_invariant_add);
-  UT_RUN(test_licm_hoists_const_call_with_invariant_arg);
-  UT_RUN(test_licm_no_hoist_pure_call_when_loop_writes_memory);
-  UT_RUN(test_licm_no_loop_no_change);
-  UT_RUN(test_licm_loop_no_invariant_no_hoist);
-  UT_RUN(test_licm_deref_source_not_hoisted);
-  UT_RUN(test_licm_in_loop_def_blocks_hoist);
-  UT_RUN(test_licm_store_not_hoisted);
-  UT_RUN(test_licm_div_not_hoisted);
-  UT_RUN(test_licm_lea_stack_addr_hoisted);
-  UT_RUN(test_licm_header_at_entry_no_hoist);
-  UT_RUN(test_licm_merge_preheader_no_hoist);
-  UT_RUN(test_licm_multiple_back_edges_hoisted_once);
-  UT_RUN(test_licm_nested_loop_hoists_to_right_preheader);
-  UT_RUN(test_licm_idempotent_no_new_hoists);
-
-  UT_RUN(test_detect_loops_finds_single_backward_jump);
-  UT_RUN(test_detect_loops_no_backward_jump_returns_null);
-  UT_RUN(test_detect_loops_empty_ir_returns_null);
-  UT_RUN(test_detect_loops_filters_switch_break_subset);
-
-  UT_RUN(test_hoist_budget_low_pressure_floor_of_three);
-  UT_RUN(test_hoist_budget_shrinks_with_more_params);
-  UT_RUN(test_hoist_budget_shrinks_with_more_distinct_vregs);
-  UT_RUN(test_hoist_budget_floors_at_one);
-  UT_RUN(test_hoist_budget_defaults_total_regs_when_unset);
-
-  UT_RUN(test_purity_cache_add_then_lookup_roundtrips);
-  UT_RUN(test_purity_cache_lookup_miss_returns_minus_one);
-  UT_RUN(test_purity_cache_duplicate_token_keeps_first_value);
-  UT_RUN(test_purity_cache_rejects_token_below_tok_ident);
-
-  UT_RUN(test_get_func_purity_null_sym_is_unknown);
-  UT_RUN(test_get_func_purity_non_function_sym_is_impure);
-  UT_RUN(test_get_func_purity_well_known_table_hit);
-  UT_RUN(test_get_func_purity_well_known_table_const_hit);
-  UT_RUN(test_get_func_purity_noreturn_attr_is_impure);
-  UT_RUN(test_get_func_purity_const_attr);
-  UT_RUN(test_get_func_purity_pure_attr);
-  UT_RUN(test_get_func_purity_attr_from_type_ref_propagates);
-  UT_RUN(test_get_func_purity_cache_hit);
-  UT_RUN(test_get_func_purity_unknown_defaults_impure);
-
-  UT_RUN(test_infer_purity_stack_only_store_is_const);
-  UT_RUN(test_infer_purity_global_load_is_pure_not_const);
-  UT_RUN(test_infer_purity_global_store_is_impure);
-  UT_RUN(test_infer_purity_indirect_call_is_impure);
-  UT_RUN(test_infer_purity_call_to_known_pure_callee_downgrades_to_pure);
-  UT_RUN(test_infer_purity_call_to_known_const_callee_stays_const);
-  UT_RUN(test_infer_purity_call_to_unknown_callee_is_impure);
-  UT_RUN(test_infer_purity_opaque_op_trap_is_impure);
-  UT_RUN(test_infer_purity_vla_alloc_is_impure);
-  UT_RUN(test_infer_purity_null_args_are_impure);
-}
+UT_COVERS("licm");

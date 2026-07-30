@@ -1,0 +1,10 @@
+join_both_arms: 221 330
+join_one_arm: 55 44
+loop_carried: 1 4 364
+aliased_store: 108 107
+two_vars: 100002 1200
+rt join_both_arms: 221 330
+rt join_one_arm: 55 44
+rt loop_carried: 364
+rt aliased_store: 108 107
+rt two_vars: 100002 1200

@@ -11,8 +11,8 @@
 
 #define USING_GLOBALS
 #include "ir.h"
-#include "arch/arm/arm.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
@@ -213,17 +213,4 @@ UT_TEST(test_vla_sp_restore_reg_src_emits_mov)
   UT_ASSERT_EQ(read_le16(cur_text_section->data), 0x469Du); /* MOV SP, r3 */
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_atomic)
-{
-  UT_RUN(test_trap_mop_emits_udf_t16);
-  UT_RUN(test_prefetch_mop_reg_read_emits_pld);
-  UT_RUN(test_prefetch_mop_reg_write_hint_same_encoding);
-  UT_RUN(test_prefetch_mop_frame_addr_zero_offset_emits_pld_fp);
-  UT_RUN(test_vla_alloc_reg_size_imm_align_emits_sub_bic_mov);
-  UT_RUN(test_vla_sp_save_reg_dest_fast_path_emits_mov);
-  UT_RUN(test_vla_sp_restore_reg_src_emits_mov);
 }

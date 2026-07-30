@@ -71,6 +71,7 @@ TEST_FILES = [
     ("bug_ull_mul10_once.c", 0),
     ("bug_ll_mul10_switch_min.c", 0),
     ("bug_parse_number_64bit.c", 0),
+    ("bug_llong_min_const_cmp.c", 0),
     ("bug_ull_mul_int_accum.c", 0),
     ("bug_struct_slot_reuse.c", 0),
     # ("bug_ternary_string.c", 0),  # Nested ternary with string literals
@@ -290,6 +291,80 @@ TEST_FILES = [
 
     # IEEE 754 NaN comparison tests (soft-float GT/GE fix)
     ("170_nan_comparison.c", 0),
+    ("421_fp_conformance.c", 0),
+    ("422_const_pool_hoist.c", 0),
+
+    # 64-bit bitfield extract: shl/shr->and fold, signed/word-crossing
+    # non-fold cases, INT64 global deref CSE region invalidation
+    ("423_llong_bitfield_extract.c", 0),
+
+    # __builtin_isunordered lowered to a single __aeabi_[df]cmpun call
+    ("424_isunordered_cmpun.c", 0),
+
+    # GVN value-numbering of const runtime helpers (duplicate-call CSE)
+    ("425_pure_call_cse.c", 0),
+
+    # entry_store_prop must not forward a local's entry store through a pointer
+    # that only may-alias it (phi of {param, &local}) or that was advanced
+    ("426_entry_store_phi_alias.c", 0),
+
+    # mem_inline must move a STRUCT slot's offset out of the split u.s encoding
+    # when it narrows the slot's btype (offset was becoming offset << 16)
+    ("427_mem_inline_struct_slot.c", 0),
+
+    # find_call_scratch must not hand out r7 (frame base, never a liveness
+    # interval) as a data scratch while marshaling stack-passed struct args
+    ("428_callsite_struct_fp_clobber.c", 0),
+
+    # SSA phi placement must record a LEA's dest as a fresh def; a pointer
+    # var (p=NULL; if (c) p=&x;) lost the &x def at the join and *p folded
+    # to a NULL deref at every -O level
+    ("429_ssa_lea_dest_phi.c", 0),
+
+    # Frontend backedges (gjmp_addr) must mark their target is_jump_target;
+    # a fallthrough-only loop condition lost its TEST_ZERO to setif_fuse and
+    # the continue path spun forever on the same bitmask bit
+    ("430_backedge_jump_target_fuse.c", 0),
+
+    # A param's implicit entry def means a conditional overwrite is never its
+    # single def; cmp_expr_fold folded post-assign compares of a stack param
+    # to the assigned constant (dropped barrel shifts in the native tcc)
+    ("431_param_conditional_zero_singledef.c", 0),
+
+    # struct-valued ternary: roundtrip-elim resolved the copy's address temp
+    # through only the latest textual def and deleted a real cross-slot copy
+    ("432_struct_ternary_roundtrip_elim.c", 0),
+
+    # global_addr_hoist must not rewrite STRUCT symref operands: the vreg
+    # replacement drops the split-encoded ctype_idx and the callsite marshals
+    # a by-value struct global with a garbage type
+    ("433_struct_byval_global_addr_hoist.c", 0),
+
+    # inline expansion must retarget the struct return slot only ONCE; a
+    # second `return <local>;` moved the caller's read off the first return's
+    # slot, whose value was never copied (uninitialized read)
+    ("434_inline_two_returns_struct_slot.c", 0),
+
+    # 64-bit/FP values must not be if-converted to SELECT: the single-register
+    # ITE lowering keeps garbage in the high word (self-host: known_bits'
+    # width mask got dest_btype as its high word, collapsing all i64 folds)
+    ("435_llong_select_high_word.c", 0),
+
+    # SCCP must not match anon StackLoc stores against address-taken VARs by
+    # original_offset (a creation-time watermark, not a real slot): it forwarded
+    # `m.kind = 1` into loads of the out-params sym/off (memloc_of's shape)
+    ("436_sccp_addrtaken_var_slot_confusion.c", 0),
+
+    # double->float libcall narrowing must not rewrite `(float)ceil((double)x)`
+    # into a SELF-call inside ceilf's own definition (libm wrappers collapsed
+    # to `b .` self-loops via infinite_self_recursion; device fp hang)
+    ("437_libcall_narrow_self_recursion.c", 0),
+
+    # VRP must not resolve a loop-carried phi operand (prev = last iter's t)
+    # against ranges scoped to the current iteration's guards; it folded
+    # `prev == K` checks away (tccgen's prescan lost its &&-parent-label
+    # handling: nested-fn label torture tests failed to compile)
+    ("438_vrp_loop_phi_carried_range.c", 0),
 
     # Compile-time strlen constant folding
     ("171_strlen_constfold.c", 0),
@@ -853,6 +928,155 @@ TEST_FILES = [
 
     # C11 _Pragma operator: pack layout via literal + DO_PRAGMA macro idiom.
     ("343_pragma_operator.c", 5),
+
+    # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
+    # + runtime control loops); pins behavior across the legacy ->
+    # ssa:first_iter_exit migration.
+    ("344_first_iter_exit.c", 0),
+
+    # Pointer-IV exit-value substitution (pr49644 idiom + runtime-trip
+    # control); pins behavior across the legacy -> ssa:ptr_iv_exit_subst
+    # migration.
+    ("345_ptr_iv_exit_subst.c", 0),
+
+    # Loop constant simulation (soft-float accumulator + residual-fed cascade +
+    # runtime-bounded control loop); pins behavior across the legacy Phase 4e ->
+    # ssa:loop_const_sim migration.
+    ("346_loop_const_sim_ssa.c", 0),
+
+    # Loop unrolling / constant-trip elimination (accumulator + symbolic-limit
+    # SELECT with zero-trip guard + then-arm need_exit_jump + runtime control);
+    # pins behavior across the legacy Phase 5a -> ssa:loop_unroll migration.
+    ("347_loop_unroll_ssa.c", 0),
+
+    # Dead-loop elimination: the "distinctive legacy domains" (address-taken
+    # memory-VAR + self-store) as correctness pins across the retirement of the
+    # legacy tcc_ir_opt_dead_loop_elim (ssa:dead_loop now owns collapse).  The
+    # memvar_rt(0) case pins that we do NOT do the legacy's unsound preheader
+    # hoist.  See docs/plan_legacy_loop_dead_loop_elim_ssa.md.
+    ("348_dead_loop_elim_retired_shapes.c", 0),
+    # Decrement-to-zero: count-up -> count-down-to-zero rewrite
+    # (ssa:decrement_to_zero) + the codegen SUBS/CMP#0 fusion that consumes it.
+    # Correctness must hold at every -O level; pure-counter purestore loops get
+    # the count-down latch at -O1+, IV-read / runtime-limit shapes decline.
+    # See docs/plan_legacy_loop_decrement_to_zero_ssa.md.
+    ("349_decrement_to_zero.c", 0),
+    # ssa:reroll — identical-block re-rolling relocated to the post-propagation
+    # regalloc flat region.  Pins (A) the fuzz-sensitive call-rerolling path
+    # (period-3 opaque calls re-roll into a counted loop, calls/accumulation
+    # exact) and (B) that foldable macro-unrolled runs still collapse downstream
+    # (the win over the legacy pre-propagation placement).
+    # See docs/plan_legacy_loop_reroll_ssa.md.
+    ("350_reroll_ssa.c", 0),
+    # stack_addr_nonnull_fold must not fold the loop-exit compare of a WALKING
+    # stack pointer (base != p while p decrements to reach base) as "distinct
+    # addresses never equal" — that drops the loop exit and collapses the caller
+    # under DCE.  Reduced from gcc.c-torture 990513-1, unmasked by relocating
+    # reroll to ssa:reroll (post-propagation).  Fixed via the in_loop guard.
+    # See docs/plan_legacy_loop_reroll_ssa.md.
+    ("351_walk_ptr_cmp_nonnull_fold.c", 0),
+    ("352_ssa_const_string_fold.c", 0),
+    ("353_ssa_symref_addend_fold.c", 0),
+    ("354_ssa_global_addr_hoist.c", 0),
+    ("355_ssa_sbfx_const_fold.c", 0),
+    ("356_ssa_bitop_const_fold.c", 0),
+    ("357_ssa_string_search_fold.c", 0),
+    ("358_ssa_clrsb_fold.c", 0),
+    ("359_signed_div_pow2.c", 0),
+    ("360_self_arith_fold.c", 0),
+    ("361_cmp_offset_common_base.c", 0),
+    ("362_value_track_const_lmod_fold.c", 0),
+    ("363_pure_modulo_hoist_cse.c", 0),
+    ("364_diamond_store_fwd.c", 0),
+    ("365_stack_addr_distinct_locals_cmp.c", 0),
+    ("366_ssa_memchr_fold.c", 0),
+    ("367_ssa_addr_cse_hoist.c", 0),
+    ("368_native_bit_builtins.c", 0),
+    ("369_switch_operand_reuse.c", 0),
+    ("370_ptr_struct_copy_inline.c", 0),
+    ("371_forward_branch_narrowing.c", 0),
+    ("372_ldrd_align_deref.c", 0),
+    ("373_loop_rotate_global_call.c", 0),
+    ("380_coalesce_diamond_pair.c", 0),
+    ("381_fuzz_cmp_fold_pooled_imm_width.c", 0),
+    ("382_fuzz_guard_collapse_phi_cfg_desync.c", 0),
+    ("383_fuzz_softfp_cmp_fold_phi_prune.c", 0),
+    ("384_fuzz_load_cse_barrel_shift_imm.c", 0),
+    ("385_fuzz_dead_loop_imm_store_width.c", 0),
+    ("386_fuzz_cmp_fold_barrel_shift_src2.c", 0),
+    ("387_fuzz_licm_pair_call_hoist.c", 0),
+    ("388_fuzz_licm_partial_chain_hoist.c", 0),
+    ("389_fuzz_sccp_split_loop_range_clobber.c", 0),
+    ("390_fuzz_dead_loop_double_phi_imm.c", 0),
+    ("391_fuzz_cbz_pool_flush_cushion.c", 0),
+    ("392_fuzz_sccp_phi_imm_store_width.c", 0),
+    ("393_fuzz_flat_cmp_fold_barrel_annot.c", 0),
+    ("394_fuzz_barrel_shift_imm_remat_drop.c", 0),
+    ("395_fuzz_setif_xor_invert_diamond_join.c", 0),
+    ("396_fuzz_fold_double_neg_barrel_shift.c", 0),
+    ("397_fuzz_load_cse_indexed_frame_alias.c", 0),
+    ("398_fuzz_sccp_phi_mla_accum.c", 0),
+    ("399_fuzz_sccp_phi_mla_accum_loop.c", 0),
+
+    # SSA: a full-width slot STORE to an upward-exposed local is a fresh
+    # definition that phi placement must see (ir/ssa.c
+    # ssa_store_slot_def_pos).  Pins the join / loop-carried / aliased
+    # shapes the STORE-def path can get wrong.
+    ("400_ssa_store_def_global_var.c", 0),
+
+    # Codegen: SHL->ADD barrel fusion (and the scaled-addressing shapes it must
+    # leave alone), plus the SETIF `& mask` identity that unblocks
+    # setif_branch_fuse.
+    ("401_barrel_shl_add_setif_mask.c", 0),
+
+    # Loops: zero-trip entry-guard elimination across a chain of sequential
+    # counted loops (source/opt/flat/loop/seq_guard_elim.c) and the rotation
+    # gate that depends on it.  Pins the exit-value carry, the shapes the
+    # walker must decline (zero-trip middle guard, runtime entry, address-taken
+    # IV, a branch between the loops, negative step).
+    ("402_seq_loop_guard_elim.c", 0),
+
+    # SSA narrowing: mask-composition fold in narrow_and.  A bitfield read
+    # narrower than its storage unit emits truncate-to-container then
+    # mask-to-field; the inner mask is backward-redundant and the two compose
+    # (a UBFX(v,0,w) counts as an AND), emitting the canonical UBFX form.
+    ("403_mask_compose_narrow.c", 0),
+    ("404_licm_escaped_dest.c", 0),
+    ("405_cmp_const_reverse.c", 0),
+    # Element-major fusion of chained vector_size expressions: a consumer
+    # recomputes its operands' elements inline and deletes the producer's loop.
+    ("406_vector_elem_major_fusion.c", 0),
+    # `(x^y) cmp y` -> `x cmp 0`, which holds for == / != but not for the
+    # relational predicates (N/C/V are not preserved).
+    ("407_cmp_xor_cancel.c", 0),
+    # copy_source_load_fwd: redirecting `x.f` to `G.f` after `x = G` must respect
+    # per-field disjointness and the demanded bits of a bitfield read — a write
+    # to a different field (or to other bits of the same word) may not block the
+    # forward, but a write to the read's own bits must.
+    ("408_copy_source_bitfield_fwd.c", 0),
+    # SETIF state-mask algebra + 0/1 re-normalization elimination (PR107881):
+    # two booleans over the same operand pair collapse to one compare, and a
+    # value already known to be 0/1 needs no `!= 0`.  Signedness must not merge
+    # across the mask, non-boolean values must keep the real compare, and
+    # widening a SETIF into a binary op needs a fresh operand-pool block.
+    ("409_setif_mask_bool_norm.c", 0),
+    # Pruned SSA phi placement: a phi goes only where the VAR is live-in, not
+    # over the whole iterated dominance frontier of its defs.  Block-scoped
+    # loop-body vars lose their dead loop-header/latch phi pair (and the
+    # slot-to-slot copy SSA destruction made of it), while accumulators,
+    # branch-arm defs, in-place 64-bit writes, dereferenced pointer vars and
+    # loop-live-out values must all keep theirs.
+    ("410_pruned_ssa_live_in.c", 0),
+    ("411_entry_store_var_ptr_base.c", 0),
+    ("412_subword_store_merge.c", 0),
+    ("413_scratch_demote_spill.c", 0),
+    ("414_fuzz_cprop_assign_store_redef.c", 0),
+    ("415_fuzz_slfwd_load_into_var.c", 0),
+    ("416_fuzz_cprop_phi_store_redef.c", 0),
+    ("417_fuzz_const_prop_narrow_dest.c", 0),
+    ("418_fuzz_slfwd_call_dest_var.c", 0),
+    ("419_loop_const_sim_wide_trip.c", 0),
+    ("420_bitfield_unit_narrow.c", 0),
 ]
 
 # Per-test compiler defines (e.g. for missing platform macros)
@@ -1151,12 +1375,16 @@ def _escape_regex(line):
     return re.escape(line)
 
 
-def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10):
+def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10,
+                   float_abi=None):
     expected_lines, expect_exit = load_expect_file(test_file)
     if expect_exit is not None:
         expected_exit_code = expect_exit
     opt_suffix = f"_{opt_level.replace('-', '').replace(' ', '_')}"
-    config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir)
+    if float_abi:
+        opt_suffix += f"_{float_abi}"
+    config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir,
+                           float_abi=float_abi)
     sut, loglines = run_test(test_file, MACHINE, args, defines=defines, config=config)
     expected_lines = _strip_compiler_output(expected_lines, loglines)
     try:
@@ -1286,6 +1514,59 @@ def test_qemu_execution(test_file, expected_exit_code, timeout, opt_level, tmp_p
 
     defines = TEST_FILE_DEFINES.get(primary)
     _run_qemu_test(test_file, expected_exit_code, defines=defines, opt_level=opt_level, output_dir=tmp_path, timeout=timeout)
+
+
+# Hard-float (-mfloat-abi=hard) execution gate.  Compiles with the VFP
+# single-precision register class (MACH_OP_VFP_REG) across all opt levels and
+# checks the numeric result via exit code.  fp_hard_mixed_exec.c covers mixed
+# int+float parameter passing, which used to miscompile (the VFP≡GPR aliasing —
+# see docs/plan_vfp_hard_float.md) and is now correct.
+HARD_FLOAT_TEST_FILES = [
+    ("fp_hard_sp_exec.c", 1),
+    ("fp_hard_mixed_exec.c", 1),
+    ("fp_hard_mem_exec.c", 1),
+    ("fp_hard_call_exec.c", 1),
+    ("fp_hard_loop_exec.c", 1),
+    ("fp_hard_absplit_exec.c", 1),
+    ("fp_hard_double_exec.c", 1),
+]
+HARD_FLOAT_CFLAGS = "-mfloat-abi=hard -mfpu=fpv5-sp-d16"
+
+
+def _generate_hard_float_params():
+    params = []
+    ids = []
+    for test_file, expected in HARD_FLOAT_TEST_FILES:
+        for opt in OPT_LEVELS:
+            params.append((test_file, expected, opt))
+            ids.append(f"{_test_id(test_file)}_hard{opt}")
+    return params, ids
+
+
+_HARD_FLOAT_PARAMS, _HARD_FLOAT_IDS = _generate_hard_float_params()
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _HARD_FLOAT_PARAMS, ids=_HARD_FLOAT_IDS)
+def test_hard_float_execution(test_file, expected_exit_code, opt_level, tmp_path):
+    cflags = f"{opt_level} {HARD_FLOAT_CFLAGS}"
+    _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
+
+
+# Float ABI x libm interop.  These call real libc/libm functions, which follow
+# the program's float ABI (unlike __aeabi_* helpers, which are always base-PCS),
+# so the whole program — including libc, libm, libgcc and the C runtime — has to
+# be built for one ABI.  float_abi= selects that consistently; passing
+# -mfloat-abi as a bare cflag would compile one way and link the other.
+_LIBM_ABI_PARAMS = [
+    (abi, opt) for abi in ("soft", "softfp", "hard") for opt in OPT_LEVELS
+]
+
+
+@pytest.mark.parametrize("float_abi,opt_level", _LIBM_ABI_PARAMS,
+                         ids=[f"fp_libm_{a}{o}" for a, o in _LIBM_ABI_PARAMS])
+def test_libm_float_abi(float_abi, opt_level, tmp_path):
+    _run_qemu_test("fp_libm_exec.c", 1, opt_level=opt_level, output_dir=tmp_path,
+                   float_abi=float_abi)
 
 
 # Nested function xfail tests (not yet implemented)

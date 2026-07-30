@@ -142,20 +142,3 @@ UT_TEST(test_type_spilled_sv)
   UT_ASSERT(!tcc_ir_type_spilled(&sv_live));
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(ir_type)
-{
-  UT_RUN(test_type_is_float);
-  UT_RUN(test_type_is_double);
-  UT_RUN(test_type_is_64bit);
-  UT_RUN(test_type_is_ptr);
-  UT_RUN(test_type_is_struct);
-  UT_RUN(test_type_is_void);
-  UT_RUN(test_type_unsigned_signed);
-  UT_RUN(test_type_is_bool);
-  UT_RUN(test_type_is_int);
-  UT_RUN(test_type_op_needs_fpu);
-  UT_RUN(test_type_spilled_sv);
-}

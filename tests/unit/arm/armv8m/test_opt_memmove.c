@@ -435,24 +435,4 @@ UT_TEST(test_memmove_empty_ir_no_crash)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_memmove)
-{
-  UT_COVERS("memmove_to_indexed_stores");
-  UT_RUN(test_memmove_stackoff_two_stores_full_coverage);
-  UT_RUN(test_memmove_stackoff_single_int64_store);
-  UT_RUN(test_memmove_vreg_dst_becomes_store_indexed);
-  UT_RUN(test_memmove_size64_full_coverage_edge);
-  UT_RUN(test_memmove_partial_coverage_keeps_call);
-  UT_RUN(test_memmove_dst_src_overlap_keeps_call);
-  UT_RUN(test_memmove_temp_read_elsewhere_keeps_call);
-  UT_RUN(test_memmove_size_over_cap_keeps_call);
-  UT_RUN(test_memmove_non_memcpy_callee_keeps_call);
-  UT_RUN(test_memmove_funccallval_with_reader_keeps_call);
-  UT_RUN(test_memmove_indirect_store_through_vreg_preserves_bytes);
-  UT_RUN(test_memmove_store_indexed_source_preserves_bytes);
-  UT_RUN(test_memmove_dead_pre_store_is_noped);
-  UT_RUN(test_memmove_lea_addr_reused_elsewhere_keeps_call);
-  UT_RUN(test_memmove_empty_ir_no_crash);
-}
+UT_COVERS("memmove_to_indexed_stores");

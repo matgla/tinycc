@@ -118,6 +118,8 @@ armv8m-tcc.debug
 .cache
 scripts/.disasm_cache.json
 scripts/.disasm_cache.pending.json
+# regression_disasm baselines live in metrics/baselines/; keep scripts/ code-only
+scripts/*.csv
 
 # Python test artifacts
 __pycache__/
@@ -128,3 +130,10 @@ tests/fuzz/fuzz_triage_repros/
 tests/fuzz/.sweep_cache/
 tests/unit/arm/armv8m/build*
 
+fuzz_triage*
+fuzz_sweep*
+fuzz_resweep*
+*.csv
+# FP conformance images built by tests/benchmarks/run_fp_conformance.py
+tests/benchmarks/build_fp_*/
+metrics/baselines

@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_shift_reg.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_shift_reg.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -251,33 +251,4 @@ UT_TEST(test_th_lsl_reg_sp_in_rm_fails)
   UT_ASSERT_EQ(op.opcode, 0);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_shift_reg)
-{
-  /* T1 */
-  UT_RUN(test_th_lsl_reg_t1_low);
-  UT_RUN(test_th_lsr_reg_t1_low);
-  UT_RUN(test_th_asr_reg_t1_low);
-
-  /* T3 */
-  UT_RUN(test_th_lsl_reg_t3_high);
-  UT_RUN(test_th_lsr_reg_t3_high);
-  UT_RUN(test_th_asr_reg_t3_high);
-  UT_RUN(test_th_ror_reg_t3_only);
-  UT_RUN(test_th_ror_reg_t3_low);
-
-  /* Flags */
-  UT_RUN(test_th_lsl_reg_t3_set_flags);
-  UT_RUN(test_th_lsr_reg_t3_set_flags);
-
-  /* Constraints */
-  UT_RUN(test_th_lsl_reg_t1_rd_ne_rn_falls_to_t3);
-  UT_RUN(test_th_lsl_reg_enforce_16bit_rd_ne_rn_fails);
-  UT_RUN(test_th_lsl_reg_enforce_32bit_low_regs);
-  UT_RUN(test_th_lsl_reg_t1_high_reg_falls_to_t3);
-  UT_RUN(test_th_lsl_reg_pc_in_rd_fails);
-  UT_RUN(test_th_lsl_reg_sp_in_rm_fails);
 }

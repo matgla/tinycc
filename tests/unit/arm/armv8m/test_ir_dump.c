@@ -681,7 +681,7 @@ UT_TEST(test_print_quad_select_tag)
   utb_emit4(ir, TCCIR_OP_SELECT, utb_temp(0, I32), utb_temp(1, I32), utb_temp(2, I32), utb_imm(TOK_EQ, I32));
 
   char *s = dump_quad(ir, 0);
-  UT_ASSERT_STREQ(s, "0000: T0 <-- T1 SELECT T2 [SELECT]\n");
+  UT_ASSERT_STREQ(s, "0000: T0 <-- T1 SELECT T2 [SELECT cond=0x94]\n");
   libc_free(s);
 
   utb_free(ir);
@@ -1048,68 +1048,4 @@ UT_TEST(test_spill_mark_ansi_colors)
   UT_ASSERT_STREQ(UT_SPILL_MARK_BEGIN, "\033[41m");
   UT_ASSERT_STREQ(UT_SPILL_MARK_END, "\033[0m");
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(ir_dump)
-{
-  UT_RUN(test_get_op_name_known_ops);
-  UT_RUN(test_get_op_name_unknown);
-  UT_RUN(test_dump_op_name_same_as_get);
-
-  UT_RUN(test_print_operand_imm32);
-  UT_RUN(test_print_operand_i64_wide_value);
-  UT_RUN(test_print_operand_symref_plain);
-  UT_RUN(test_print_operand_symref_addend_and_deref);
-  UT_RUN(test_print_operand_symref_null_sym_fallback);
-  UT_RUN(test_print_operand_stackoff_with_vreg_short_form);
-  UT_RUN(test_print_operand_stackoff_no_vreg_raw_offset);
-  UT_RUN(test_print_operand_stackoff_llocal_no_physreg);
-  UT_RUN(test_print_operand_default_vreg_prefixes);
-  UT_RUN(test_print_operand_default_no_vreg_fallback);
-  UT_RUN(test_print_operand_physreg_allocated_not_spilled);
-  UT_RUN(test_print_operand_physreg_spilled);
-
-  UT_RUN(test_print_quad_default_arith);
-  UT_RUN(test_print_quad_pc_padding);
-  UT_RUN(test_print_quad_returnvalue);
-  UT_RUN(test_print_quad_returnvoid);
-  UT_RUN(test_print_quad_set_chain);
-  UT_RUN(test_print_quad_funcparamval);
-  UT_RUN(test_print_quad_jump);
-  UT_RUN(test_print_quad_jumpif_named_ccs);
-  UT_RUN(test_print_quad_jumpif_unknown_cc_numeric_fallback);
-  UT_RUN(test_print_quad_setif_cond_hex);
-  UT_RUN(test_print_quad_ijump);
-  UT_RUN(test_print_quad_cmp);
-  UT_RUN(test_print_quad_mla);
-  UT_RUN(test_print_quad_store_tag);
-  UT_RUN(test_print_quad_load_tag);
-  UT_RUN(test_print_quad_assign_tag);
-  UT_RUN(test_print_quad_select_tag);
-  UT_RUN(test_print_quad_block_copy_tag);
-  UT_RUN(test_print_quad_funccallval);
-
-  UT_RUN(test_ir_show_concatenates_every_instruction_in_order);
-  UT_RUN(test_ir_show_empty_function_prints_nothing);
-
-  UT_RUN(test_dump_after_pass_noop_without_config_debug);
-
-  UT_RUN(test_print_svalue_const_plain_and_symbol);
-  UT_RUN(test_print_svalue_const_llong_uses_wide_format);
-  UT_RUN(test_print_svalue_vt_cmp_jmp_jmpi);
-  UT_RUN(test_print_svalue_local_vreg_short_form);
-  UT_RUN(test_print_svalue_local_no_vreg_raw_offset);
-  UT_RUN(test_print_svalue_llocal_no_spill);
-  UT_RUN(test_print_svalue_default_param_no_deref_despite_lval);
-  UT_RUN(test_print_svalue_default_temp_deref);
-
-  UT_RUN(test_passes_match_all);
-  UT_RUN(test_passes_match_single);
-  UT_RUN(test_passes_match_null_state);
-  UT_RUN(test_dump_set_show_physical_regs_no_crash);
-  UT_RUN(test_spill_mark_ansi_colors);
 }

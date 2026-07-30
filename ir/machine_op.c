@@ -88,6 +88,8 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
   m.is_unsigned = (bool)op->is_unsigned;
   m.is_64bit = (bool)irop_needs_pair(*op);
   m.is_complex = (bool)op->is_complex;
+  m.align4 = (op->aux & IROP_AUX_ALIGN4_OK) != 0;
+  m.underalign_hint = (op->aux & IROP_AUX_UNDERALIGN) != 0;
   const int tag = irop_get_tag(*op);
   const int vreg = irop_get_vreg(*op);
   m.vreg = vreg;
@@ -321,6 +323,16 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
       return m;
     }
 
+    /* Rematerialize a spilled int32 constant: emit `mov reg, #imm` instead of a
+     * stack reload (cheaper, and removes a load).  Only for a plain value read —
+     * not a pointer deref (use_llocal) or a stack-passed parameter. */
+    if (interval->remat_kind == 1 && !use_llocal && !spilled_param)
+    {
+      m.kind = MACH_OP_IMM;
+      m.u.imm.val = (int64_t)interval->remat_imm;
+      return m;
+    }
+
     m.kind = MACH_OP_SPILL;
     m.u.spill.offset = alloc_offset;
     m.needs_deref = (bool)use_llocal;
@@ -332,6 +344,17 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
   /* ------------------------------------------------------------------ */
   if (interval->allocation.r0 != PREG_NONE)
   {
+    /* Single-precision float in a VFP register (hard-float): a distinct operand
+     * kind so no GPR-path consumer can mask the register number back onto a GPR
+     * (the VFP=GPR aliasing).  u.reg.r0 carries the s-register number 0-31. */
+    if (LS_IS_VFP_REG(interval->allocation.r0))
+    {
+      m.kind = MACH_OP_VFP_REG;
+      m.u.reg.r0 = (int)LS_VFP_REG_NUM(interval->allocation.r0);
+      m.u.reg.r1 = -1;
+      m.needs_deref = false;
+      return m;
+    }
     m.kind = MACH_OP_REG;
     m.u.reg.r0 = (int)(interval->allocation.r0 & PREG_REG_NONE);
     m.u.reg.r1 = m.is_64bit ? (int)(interval->allocation.r1 & PREG_REG_NONE) : -1;

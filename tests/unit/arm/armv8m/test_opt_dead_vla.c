@@ -522,34 +522,6 @@ UT_TEST(test_dead_alloca_vreg_idempotent)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_dead_vla)
-{
-  UT_COVERS("dead_vla_struct_elim");
-  UT_COVERS("alloca_load_fwd");
-  UT_COVERS("dead_alloca_vreg_elim");
-
-  UT_RUN(test_dead_vla_struct_basic_elim);
-  UT_RUN(test_dead_vla_struct_two_link_chain);
-  UT_RUN(test_dead_vla_struct_load_through_tainted_bails);
-  UT_RUN(test_dead_vla_struct_address_escape_bails);
-  UT_RUN(test_dead_vla_struct_second_slot_writer_bails);
-  UT_RUN(test_dead_vla_struct_ijump_bails);
-  UT_RUN(test_dead_vla_struct_captured_locals_bails);
-  UT_RUN(test_dead_vla_struct_idempotent);
-
-  UT_RUN(test_alloca_load_fwd_basic);
-  UT_RUN(test_alloca_load_fwd_not_adjacent_no_fold);
-  UT_RUN(test_alloca_load_fwd_extra_slot_reader_no_fold);
-  UT_RUN(test_alloca_load_fwd_lval_load_dest_no_fold);
-  UT_RUN(test_alloca_load_fwd_idempotent);
-
-  UT_RUN(test_dead_alloca_vreg_basic_elim);
-  UT_RUN(test_dead_alloca_vreg_propagation_chain);
-  UT_RUN(test_dead_alloca_vreg_funccall_bails);
-  UT_RUN(test_dead_alloca_vreg_load_through_pointer_bails);
-  UT_RUN(test_dead_alloca_vreg_pointer_escape_bails);
-  UT_RUN(test_dead_alloca_vreg_set_chain_bails);
-  UT_RUN(test_dead_alloca_vreg_idempotent);
-}
+UT_COVERS("dead_vla_struct_elim");
+UT_COVERS("alloca_load_fwd");
+UT_COVERS("dead_alloca_vreg_elim");

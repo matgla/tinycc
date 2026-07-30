@@ -48,12 +48,13 @@
 /* Pass entry points (declared in ir/opt.h; forward-declared to avoid pulling in
  * the optimizer engine headers). */
 int tcc_ir_opt_const_var_prop(TCCIRState *ir);
-int tcc_ir_opt_const_prop(TCCIRState *ir);
+
 int tcc_ir_opt_const_prop_tmp(TCCIRState *ir);
 int tcc_ir_opt_global_init_prop(TCCIRState *ir);
 int tcc_ir_opt_symref_const_prop(TCCIRState *ir);
 int tcc_ir_opt_complex_const_param_fold(TCCIRState *ir);
 int tcc_ir_opt_value_tracking(TCCIRState *ir);
+int tcc_ir_opt_self_arith_fold(TCCIRState *ir);
 
 #define I32 IROP_BTYPE_INT32
 #define I64 IROP_BTYPE_INT64
@@ -294,141 +295,6 @@ UT_TEST(test_constvarprop_nonconst_source_not_propagated)
   return 0;
 }
 
-/* ================================================================= const_prop */
-
-/* POSITIVE (two-constant fold): const_prop folds an arithmetic op whose both
- * operands are immediates into a single ASSIGN of the computed value.
- *   T0 = #5 ADD #3   ->  T0 = ASSIGN #8   (src2 cleared)
- * No VAR destinations exist, so no live-interval table is needed. */
-UT_TEST(test_constprop_two_const_add_folds)
-{
-  TCCIRState *ir = utb_new();
-
-  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(5, I32), utb_imm(3, I32));
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT(changes > 0);
-  /* The ADD collapses to an ASSIGN of the constant result. */
-  UT_ASSERT_EQ(utb_op(ir, iadd), TCCIR_OP_ASSIGN);
-  IROperand s1 = utb_src1(ir, iadd);
-  UT_ASSERT_EQ(irop_is_immediate(s1), 1);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, s1), 8);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (two-constant fold, MUL): demonstrates folding is not ADD-specific.
- *   T0 = #6 MUL #7   ->  T0 = ASSIGN #42 */
-UT_TEST(test_constprop_two_const_mul_folds)
-{
-  TCCIRState *ir = utb_new();
-
-  int imul = utb_emit(ir, TCCIR_OP_MUL, utb_temp(0, I32), utb_imm(6, I32), utb_imm(7, I32));
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, imul), TCCIR_OP_ASSIGN);
-  IROperand s1 = utb_src1(ir, imul);
-  UT_ASSERT_EQ(irop_is_immediate(s1), 1);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, s1), 42);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (VAR const propagated then folded): const_prop first propagates a
- * single-def immediate VAR into the ADD's src1, then folds the now all-constant
- * ADD into an ASSIGN.
- *   V0 <- #5
- *   T0 = V0 ADD #3   ->  T0 = ASSIGN #8 */
-UT_TEST(test_constprop_var_const_propagated_and_folded)
-{
-  TCCIRState *ir = utb_new();
-  utb_alloc_var_intervals(ir, 4);
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(5, I32), UTB_NONE);
-  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(3, I32));
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, iadd), TCCIR_OP_ASSIGN);
-  IROperand s1 = utb_src1(ir, iadd);
-  UT_ASSERT_EQ(irop_is_immediate(s1), 1);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, s1), 8);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (algebraic simplify): X + 0 = X.  With a non-constant src1 and a
- * constant 0 in src2, const_prop converts the ADD into an ASSIGN that copies
- * src1 unchanged (the non-constant operand is preserved, src2 cleared).
- *   T0 = T1 ADD #0   ->  T0 = ASSIGN T1 */
-UT_TEST(test_constprop_add_zero_simplifies_to_copy)
-{
-  TCCIRState *ir = utb_new();
-
-  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_temp(1, I32), utb_imm(0, I32));
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT(changes > 0);
-  /* Becomes a plain copy of the non-constant src1. */
-  UT_ASSERT_EQ(utb_op(ir, iadd), TCCIR_OP_ASSIGN);
-  IROperand s1 = utb_src1(ir, iadd);
-  UT_ASSERT_EQ(irop_is_immediate(s1), 0);
-  UT_ASSERT_EQ(utb_vreg(s1), VR_TMP(1));
-
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (algebraic simplify): X * 0 = 0.  const_prop replaces the whole op
- * with an ASSIGN of constant 0, even though src1 is non-constant.
- *   T0 = T1 MUL #0   ->  T0 = ASSIGN #0 */
-UT_TEST(test_constprop_mul_zero_simplifies_to_zero)
-{
-  TCCIRState *ir = utb_new();
-
-  int imul = utb_emit(ir, TCCIR_OP_MUL, utb_temp(0, I32), utb_temp(1, I32), utb_imm(0, I32));
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, imul), TCCIR_OP_ASSIGN);
-  IROperand s1 = utb_src1(ir, imul);
-  UT_ASSERT_EQ(irop_is_immediate(s1), 1);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, s1), 0);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE: an ADD of two non-constant TEMPs has nothing to fold or simplify
- * (neither operand is an immediate, no identity applies) -> no change, the op
- * stays an ADD with both register operands intact.
- *   T0 = T1 ADD T2   ->  unchanged */
-UT_TEST(test_constprop_two_nonconst_not_folded)
-{
-  TCCIRState *ir = utb_new();
-
-  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_temp(1, I32), utb_temp(2, I32));
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, iadd), TCCIR_OP_ADD);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, iadd)), VR_TMP(1));
-  UT_ASSERT_EQ(utb_vreg(utb_src2(ir, iadd)), VR_TMP(2));
-
-  utb_free(ir);
-  return 0;
-}
-
 /* Helper for 64-bit immediates that don't fit in int32_t. */
 static IROperand utb_imm64(TCCIRState *ir, int64_t val, int btype)
 {
@@ -502,642 +368,7 @@ UT_TEST(test_constvarprop_stackoff_source_not_propagated)
   return 0;
 }
 
-/* ==================================================== more const_prop tests */
 
-/* POSITIVE (algebraic): X - 0 -> X. */
-UT_TEST(test_constprop_sub_zero_identity)
-{
-  TCCIRState *ir = utb_new();
-  int isub = utb_emit(ir, TCCIR_OP_SUB, utb_temp(0, I32), utb_temp(1, I32), utb_imm(0, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, isub), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, isub)), VR_TMP(1));
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (algebraic): X | 0 -> X (commutative). */
-UT_TEST(test_constprop_or_zero_identity)
-{
-  TCCIRState *ir = utb_new();
-  int ior = utb_emit(ir, TCCIR_OP_OR, utb_temp(0, I32), utb_imm(0, I32), utb_temp(1, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ior), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, ior)), VR_TMP(1));
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (algebraic): X & -1 -> X. */
-UT_TEST(test_constprop_and_minusone_identity)
-{
-  TCCIRState *ir = utb_new();
-  int iand = utb_emit(ir, TCCIR_OP_AND, utb_temp(0, I32), utb_temp(1, I32), utb_imm(-1, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, iand), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, iand)), VR_TMP(1));
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (algebraic): X | -1 -> -1. */
-UT_TEST(test_constprop_or_minusone_to_const)
-{
-  TCCIRState *ir = utb_new();
-  int ior = utb_emit(ir, TCCIR_OP_OR, utb_temp(0, I32), utb_temp(1, I32), utb_imm(-1, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ior), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, ior)), -1);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (algebraic): X & 0 -> 0. */
-UT_TEST(test_constprop_and_zero_to_zero)
-{
-  TCCIRState *ir = utb_new();
-  int iand = utb_emit(ir, TCCIR_OP_AND, utb_temp(0, I32), utb_temp(1, I32), utb_imm(0, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, iand), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iand)), 0);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (algebraic): X ^ 0 -> X. */
-UT_TEST(test_constprop_xor_zero_identity)
-{
-  TCCIRState *ir = utb_new();
-  int ixor = utb_emit(ir, TCCIR_OP_XOR, utb_temp(0, I32), utb_temp(1, I32), utb_imm(0, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ixor), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, ixor)), VR_TMP(1));
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (constant fold): X ^ X -> 0 for a constant X. */
-UT_TEST(test_constprop_xor_same_const_to_zero)
-{
-  TCCIRState *ir = utb_new();
-  int ixor = utb_emit(ir, TCCIR_OP_XOR, utb_temp(0, I32), utb_imm(0xAA, I32), utb_imm(0xAA, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ixor), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, ixor)), 0);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (algebraic): X * 1 -> X. */
-UT_TEST(test_constprop_mul_one_identity)
-{
-  TCCIRState *ir = utb_new();
-  int imul = utb_emit(ir, TCCIR_OP_MUL, utb_temp(0, I32), utb_temp(1, I32), utb_imm(1, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, imul), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, imul)), VR_TMP(1));
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (constant fold): X - X -> 0 for a constant X. */
-UT_TEST(test_constprop_sub_same_const_to_zero)
-{
-  TCCIRState *ir = utb_new();
-  int isub = utb_emit(ir, TCCIR_OP_SUB, utb_temp(0, I32), utb_imm(7, I32), utb_imm(7, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, isub), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, isub)), 0);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (constant fold): X * 2^k computed as two-constant MUL. */
-UT_TEST(test_constprop_mul_pow2_const)
-{
-  TCCIRState *ir = utb_new();
-  int imul = utb_emit(ir, TCCIR_OP_MUL, utb_temp(0, I32), utb_imm(3, I32), utb_imm(8, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, imul), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, imul)), 24);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: INT_MAX + 1 wraps to INT_MIN in 32-bit two's complement. */
-UT_TEST(test_constprop_intmax_plus_one_wraps)
-{
-  TCCIRState *ir = utb_new();
-  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(INT_MAX, I32), utb_imm(1, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, iadd), TCCIR_OP_ASSIGN);
-  int32_t expected = (int32_t)((uint32_t)INT_MAX + 1u);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iadd)), (int)expected);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: INT_MIN - 1 wraps to INT_MAX in 32-bit two's complement. */
-UT_TEST(test_constprop_intmin_minus_one_wraps)
-{
-  TCCIRState *ir = utb_new();
-  int isub = utb_emit(ir, TCCIR_OP_SUB, utb_temp(0, I32), utb_imm(INT_MIN, I32), utb_imm(1, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, isub), TCCIR_OP_ASSIGN);
-  int32_t expected = (int32_t)((uint32_t)INT_MIN - 1u);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, isub)), (int)expected);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: sign-bit addition wraps to 0. */
-UT_TEST(test_constprop_overflow_signbit_add_wraps)
-{
-  TCCIRState *ir = utb_new();
-  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(0x80000000, I32), utb_imm(0x80000000, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, iadd), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iadd)), 0);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: shift by 0 is an identity (SHL). */
-UT_TEST(test_constprop_shl_zero_identity)
-{
-  TCCIRState *ir = utb_new();
-  int ish = utb_emit(ir, TCCIR_OP_SHL, utb_temp(0, I32), utb_temp(1, I32), utb_imm(0, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ish), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, ish)), VR_TMP(1));
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: 1 << 31 = 0x80000000. */
-UT_TEST(test_constprop_shl_31)
-{
-  TCCIRState *ir = utb_new();
-  int ish = utb_emit(ir, TCCIR_OP_SHL, utb_temp(0, I32), utb_imm(1, I32), utb_imm(31, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ish), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, ish)), (int)0x80000000);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD: 1 << 32 is not folded (shift width >= width). */
-UT_TEST(test_constprop_shl_32_bails)
-{
-  TCCIRState *ir = utb_new();
-  int ish = utb_emit(ir, TCCIR_OP_SHL, utb_temp(0, I32), utb_imm(1, I32), utb_imm(32, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, ish), TCCIR_OP_SHL);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: logical shift right by 31 of sign-bit value yields 1. */
-UT_TEST(test_constprop_shr_31)
-{
-  TCCIRState *ir = utb_new();
-  int ish = utb_emit(ir, TCCIR_OP_SHR, utb_temp(0, I32), utb_imm(0x80000000, I32), utb_imm(31, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ish), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, ish)), 1);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: arithmetic shift right by 31 of negative value yields -1. */
-UT_TEST(test_constprop_sar_31)
-{
-  TCCIRState *ir = utb_new();
-  int ish = utb_emit(ir, TCCIR_OP_SAR, utb_temp(0, I32), utb_imm(0x80000000, I32), utb_imm(31, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ish), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, ish)), -1);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: signed division rounds toward zero. */
-UT_TEST(test_constprop_signed_div)
-{
-  TCCIRState *ir = utb_new();
-  int idiv = utb_emit(ir, TCCIR_OP_DIV, utb_temp(0, I32), utb_imm(-5, I32), utb_imm(2, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, idiv)), -2);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: signed modulo. */
-UT_TEST(test_constprop_signed_mod)
-{
-  TCCIRState *ir = utb_new();
-  int imod = utb_emit(ir, TCCIR_OP_IMOD, utb_temp(0, I32), utb_imm(-5, I32), utb_imm(2, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, imod), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, imod)), -1);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: unsigned division uses modulo 2^32. */
-UT_TEST(test_constprop_unsigned_div)
-{
-  TCCIRState *ir = utb_new();
-  int idiv = utb_emit(ir, TCCIR_OP_UDIV, utb_temp(0, I32), utb_unsigned(utb_imm(-5, I32)), utb_imm(2, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_ASSIGN);
-  uint32_t expected = (uint32_t)-5 / 2u;
-  UT_ASSERT_EQ((unsigned)irop_get_imm64_ex(ir, utb_src1(ir, idiv)), expected);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: unsigned modulo. */
-UT_TEST(test_constprop_unsigned_mod)
-{
-  TCCIRState *ir = utb_new();
-  int imod = utb_emit(ir, TCCIR_OP_UMOD, utb_temp(0, I32), utb_unsigned(utb_imm(-5, I32)), utb_imm(2, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, imod), TCCIR_OP_ASSIGN);
-  uint32_t expected = (uint32_t)-5 % 2u;
-  UT_ASSERT_EQ((unsigned)irop_get_imm64_ex(ir, utb_src1(ir, imod)), expected);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* BEHAVIOUR: division by constant zero is UB; the pass replaces it with TRAP
- * rather than folding. */
-UT_TEST(test_constprop_div_by_zero_trap)
-{
-  TCCIRState *ir = utb_new();
-  int idiv = utb_emit(ir, TCCIR_OP_DIV, utb_temp(0, I32), utb_imm(5, I32), utb_imm(0, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_TRAP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* BEHAVIOUR: modulo by constant zero is UB; the pass replaces it with TRAP. */
-UT_TEST(test_constprop_mod_by_zero_trap)
-{
-  TCCIRState *ir = utb_new();
-  int imod = utb_emit(ir, TCCIR_OP_IMOD, utb_temp(0, I32), utb_imm(5, I32), utb_imm(0, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, imod), TCCIR_OP_TRAP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* FIXED: INT_MIN / -1 overflows in two's-complement signed division.  The
- * folder now bails (matching the UB-bail convention already used by the
- * second folding routine), leaving the DIV in place rather than folding to
- * a target-dependent INT_MIN. */
-UT_TEST(test_constprop_intmin_div_neg1_bugs)
-{
-  TCCIRState *ir = utb_new();
-  int idiv = utb_emit(ir, TCCIR_OP_DIV, utb_temp(0, I32), utb_imm(INT_MIN, I32), utb_imm(-1, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: 64-bit addition does not get truncated to 32 bits. */
-UT_TEST(test_constprop_int64_add)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I64), utb_imm(0x7fffffff, I64), utb_imm(1, I64));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, iadd), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, iadd)), 0x80000000LL);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* SEMI-ORACLE: 64-bit addition with a value outside the 32-bit range. */
-UT_TEST(test_constprop_int64_add_large)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-  IROperand c1 = utb_imm64(ir, 0x100000000LL, I64);
-  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I64), c1, utb_imm(1, I64));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, iadd), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, iadd)), 0x100000001LL);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD: a large constant VAR with multiple uses is kept in the VAR so it is
- * materialised once; the pass suppresses propagation to avoid N pool loads. */
-UT_TEST(test_constprop_large_const_multi_use_kept)
-{
-  TCCIRState *ir = utb_new();
-  utb_alloc_var_intervals(ir, 4);
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0x12345678, I32), UTB_NONE);
-  int i1 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(1, I32));
-  int i2 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_var(0, I32), utb_imm(1, I32));
-
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, i1)), VR_VAR(0));
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, i2)), VR_VAR(0));
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: a large constant VAR with a single use is propagated. */
-UT_TEST(test_constprop_large_const_single_use_propagates)
-{
-  TCCIRState *ir = utb_new();
-  utb_alloc_var_intervals(ir, 4);
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0x12345678, I32), UTB_NONE);
-  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(1, I32));
-
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, iadd), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iadd)), 0x12345679);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD: a VAR marked as complex is not propagated, even when single-def
- * immediate. */
-UT_TEST(test_constprop_complex_var_not_propagated)
-{
-  TCCIRState *ir = utb_new();
-  utb_alloc_var_intervals(ir, 4);
-  ir->variables_live_intervals[0].is_complex = 1;
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(5, I32), UTB_NONE);
-  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_var(0, I32), utb_imm(1, I32));
-
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, iadd)), VR_VAR(0));
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* IDEMPOTENCE: const_prop reaches a fixpoint in a single iteration. */
-UT_TEST(test_constprop_idempotent)
-{
-  TCCIRState *ir = utb_new();
-  int iadd = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(5, I32), utb_imm(3, I32));
-  int total = utb_run_to_fixpoint(ir, tcc_ir_opt_const_prop, 5);
-  UT_ASSERT(total > 0);
-  UT_ASSERT_EQ(utb_op(ir, iadd), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iadd)), 8);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: SHL #24 then SHR #24 (byte cast) folds to AND #0xFF. */
-UT_TEST(test_constprop_byte_cast_shl_shr_to_and)
-{
-  TCCIRState *ir = utb_new();
-  int ish = utb_emit(ir, TCCIR_OP_SHL, utb_temp(0, I32), utb_temp(1, I32), utb_imm(24, I32));
-  int ishr = utb_emit(ir, TCCIR_OP_SHR, utb_temp(2, I32), utb_temp(0, I32), utb_imm(24, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ish), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, ishr), TCCIR_OP_AND);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src2(ir, ishr)), 0xFF);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: SHR #8 then AND #0xFF fuses to UBFX #8,#8. */
-UT_TEST(test_constprop_shr_and_to_ubfx)
-{
-  TCCIRState *ir = utb_new();
-  int ish = utb_emit(ir, TCCIR_OP_SHR, utb_temp(0, I32), utb_temp(1, I32), utb_imm(8, I32));
-  int iand = utb_emit(ir, TCCIR_OP_AND, utb_temp(2, I32), utb_temp(0, I32), utb_imm(0xFF, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ish), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, iand), TCCIR_OP_UBFX);
-  int param = (int)irop_get_imm64_ex(ir, utb_src2(ir, iand));
-  UT_ASSERT_EQ(param, 8 | (8 << 5));
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: (x ^ C) ^ C -> x. */
-UT_TEST(test_constprop_xor_cancellation)
-{
-  TCCIRState *ir = utb_new();
-  int ix1 = utb_emit(ir, TCCIR_OP_XOR, utb_temp(0, I32), utb_temp(1, I32), utb_imm(0xAA, I32));
-  int ix2 = utb_emit(ir, TCCIR_OP_XOR, utb_temp(2, I32), utb_temp(0, I32), utb_imm(0xAA, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ix1), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, ix2), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, ix2)), VR_TMP(1));
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: CMP of two constants followed by SETIF folds to the boolean result. */
-UT_TEST(test_constprop_cmp_setif_fold_gt)
-{
-  TCCIRState *ir = utb_new();
-  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_imm(5, I32), utb_imm(3, I32));
-  int iset = utb_emit(ir, TCCIR_OP_SETIF, utb_temp(0, I32), utb_imm(0x9f, I32), UTB_NONE);
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, iset), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iset)), 1);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: CMP #imm, Vreg is rewritten to CMP Vreg, #imm and the consuming
- * condition is swapped so the backend can use its register-immediate compare
- * encodings without changing semantics. */
-UT_TEST(test_constprop_cmp_imm_left_swaps_condition)
-{
-  TCCIRState *ir = utb_new();
-  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_imm(3, I32), utb_temp(0, I32));
-  int iset = utb_emit(ir, TCCIR_OP_SETIF, utb_temp(1, I32), utb_imm(TOK_LT, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, icmp)), VR_TMP(0));
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src2(ir, icmp)), 3);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iset)), TOK_GT);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: signed-looking comparison tokens are evaluated as unsigned when
- * either integer operand is marked unsigned.  Without the unsigned conversion,
- * (-1 < 1) would fold true; with uint32 semantics it folds false. */
-UT_TEST(test_constprop_unsigned_operand_cmp_uses_unsigned_order)
-{
-  TCCIRState *ir = utb_new();
-  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_unsigned(utb_imm(-1, I32)), utb_imm(1, I32));
-  int iset = utb_emit(ir, TCCIR_OP_SETIF, utb_temp(0, I32), utb_imm(TOK_LT, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, iset), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iset)), 0);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: CMP of the same vreg followed by JUMPIF EQ is always taken. */
-UT_TEST(test_constprop_cmp_same_vreg_jumpif_always_taken)
-{
-  TCCIRState *ir = utb_new();
-  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_temp(0, I32));
-  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(2, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_JUMP);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_dest(ir, ijmp)), 2);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: CMP of the same vreg followed by JUMPIF NE is never taken. */
-UT_TEST(test_constprop_cmp_same_vreg_jumpif_never_taken)
-{
-  TCCIRState *ir = utb_new();
-  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_temp(0, I32));
-  int ijmp = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(2, I32), utb_imm(TOK_NE, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, ijmp), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD: same vreg with mismatched lval-ness is not value-identical. */
-UT_TEST(test_constprop_cmp_same_vreg_lval_mismatch_not_identity)
-{
-  TCCIRState *ir = utb_new();
-  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_lval(utb_temp(0, I32)), utb_temp(0, I32));
-  int iset = utb_emit(ir, TCCIR_OP_SETIF, utb_temp(1, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_CMP);
-  UT_ASSERT_EQ(utb_op(ir, iset), TCCIR_OP_SETIF);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: a single-def TMP assigned from an unmodified PARAM is value-identical
- * to that PARAM, so CMP copy,param folds. */
-UT_TEST(test_constprop_cmp_copy_of_param_setif_folds)
-{
-  TCCIRState *ir = utb_new();
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_param(0, I32), UTB_NONE);
-  int icmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_param(0, I32));
-  int iset = utb_emit(ir, TCCIR_OP_SETIF, utb_temp(1, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, icmp), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, iset), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, iset)), 1);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 4), 0);
-  utb_free(ir);
-  return 0;
-}
 
 /* GUARD: a 64-bit immediate assigned into a 32-bit temp must be tracked as the
  * truncated 32-bit value.  This mirrors `(int)(long long)(V2SI){2,2}` after
@@ -1248,42 +479,7 @@ UT_TEST(test_constproptmp_switch_table_const_index_to_default_jump)
   return 0;
 }
 
-/* GUARD: BOOL_OR with only one constant operand is left untouched because the
- * backend cannot materialise mixed const/reg boolean ops. */
-UT_TEST(test_constprop_bool_or_one_const_no_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_alloc_var_intervals(ir, 4);
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(1, I32), UTB_NONE);
-  int ior = utb_emit(ir, TCCIR_OP_BOOL_OR, utb_temp(0, I32), utb_var(0, I32), utb_temp(1, I32));
-  int changes = tcc_ir_opt_const_prop(ir);
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, ior), TCCIR_OP_BOOL_OR);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
 
-/* POSITIVE: BOOL_OR is folded when both operands are known constants, so the
- * mixed const/register backend restriction does not apply. */
-UT_TEST(test_constprop_bool_or_two_const_vars_folds)
-{
-  TCCIRState *ir = utb_new();
-  utb_alloc_var_intervals(ir, 4);
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(42, I32), UTB_NONE);
-  int ior = utb_emit(ir, TCCIR_OP_BOOL_OR, utb_temp(0, I32), utb_var(0, I32), utb_var(1, I32));
-
-  int changes = tcc_ir_opt_const_prop(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, ior), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, ior)), 1);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 8), 0);
-  utb_free(ir);
-  return 0;
-}
 
 /* ============================================================ global_init_prop
  *
@@ -2151,127 +1347,406 @@ UT_TEST(test_valuetracking_unknown_call_no_fold)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_constprop)
+/* ---- 64-bit two-arg runtime-helper call builder (divmod / shift folders) ----
+ * Emits `T0(i64) = name(v0, v1)` at the current position and returns the call
+ * index.  `tok` is a synthetic token mapped to `name` for get_tok_str(). */
+static int utb_i64_helper_call(TCCIRState *ir, int tok, const char *name, IROperand v0, IROperand v1)
 {
-  UT_COVERS("const_var_prop");
-  UT_COVERS("const_prop");
-  UT_COVERS("const_prop_tmp");
-  UT_COVERS("global_init_prop");
-  UT_COVERS("symref_const_prop");
-  UT_COVERS("complex_const_param_fold");
-  UT_COVERS("value_tracking");
-
-  /* const_var_prop */
-  UT_RUN(test_constvarprop_imm_var_folds_into_use);
-  UT_RUN(test_constvarprop_load_of_const_var_becomes_assign);
-  UT_RUN(test_constvarprop_addrtaken_var_not_propagated);
-  UT_RUN(test_constvarprop_dead_lea_clears_addrtaken);
-  UT_RUN(test_constvarprop_lea_dest_addrtaken_keeps_source_addrtaken);
-  UT_RUN(test_constvarprop_store_lval_dest_keeps_lea_live);
-  UT_RUN(test_constvarprop_multiply_defined_not_propagated);
-  UT_RUN(test_constvarprop_nonconst_source_not_propagated);
-  UT_RUN(test_constvarprop_idempotent);
-  UT_RUN(test_constvarprop_large_imm_single_use);
-  UT_RUN(test_constvarprop_stackoff_source_not_propagated);
-
-  /* const_prop */
-  UT_RUN(test_constprop_two_const_add_folds);
-  UT_RUN(test_constprop_two_const_mul_folds);
-  UT_RUN(test_constprop_var_const_propagated_and_folded);
-  UT_RUN(test_constprop_add_zero_simplifies_to_copy);
-  UT_RUN(test_constprop_mul_zero_simplifies_to_zero);
-  UT_RUN(test_constprop_two_nonconst_not_folded);
-  UT_RUN(test_constprop_sub_zero_identity);
-  UT_RUN(test_constprop_or_zero_identity);
-  UT_RUN(test_constprop_and_minusone_identity);
-  UT_RUN(test_constprop_or_minusone_to_const);
-  UT_RUN(test_constprop_and_zero_to_zero);
-  UT_RUN(test_constprop_xor_zero_identity);
-  UT_RUN(test_constprop_xor_same_const_to_zero);
-  UT_RUN(test_constprop_mul_one_identity);
-  UT_RUN(test_constprop_sub_same_const_to_zero);
-  UT_RUN(test_constprop_mul_pow2_const);
-  UT_RUN(test_constprop_intmax_plus_one_wraps);
-  UT_RUN(test_constprop_intmin_minus_one_wraps);
-  UT_RUN(test_constprop_overflow_signbit_add_wraps);
-  UT_RUN(test_constprop_shl_zero_identity);
-  UT_RUN(test_constprop_shl_31);
-  UT_RUN(test_constprop_shl_32_bails);
-  UT_RUN(test_constprop_shr_31);
-  UT_RUN(test_constprop_sar_31);
-  UT_RUN(test_constprop_signed_div);
-  UT_RUN(test_constprop_signed_mod);
-  UT_RUN(test_constprop_unsigned_div);
-  UT_RUN(test_constprop_unsigned_mod);
-  UT_RUN(test_constprop_div_by_zero_trap);
-  UT_RUN(test_constprop_mod_by_zero_trap);
-  UT_RUN(test_constprop_intmin_div_neg1_bugs);
-  UT_RUN(test_constprop_int64_add);
-  UT_RUN(test_constprop_int64_add_large);
-  UT_RUN(test_constprop_large_const_multi_use_kept);
-  UT_RUN(test_constprop_large_const_single_use_propagates);
-  UT_RUN(test_constprop_complex_var_not_propagated);
-  UT_RUN(test_constprop_idempotent);
-  UT_RUN(test_constprop_byte_cast_shl_shr_to_and);
-  UT_RUN(test_constprop_shr_and_to_ubfx);
-  UT_RUN(test_constprop_xor_cancellation);
-  UT_RUN(test_constprop_cmp_setif_fold_gt);
-  UT_RUN(test_constprop_cmp_imm_left_swaps_condition);
-  UT_RUN(test_constprop_unsigned_operand_cmp_uses_unsigned_order);
-  UT_RUN(test_constprop_cmp_same_vreg_jumpif_always_taken);
-  UT_RUN(test_constprop_cmp_same_vreg_jumpif_never_taken);
-  UT_RUN(test_constprop_cmp_same_vreg_lval_mismatch_not_identity);
-  UT_RUN(test_constprop_cmp_copy_of_param_setif_folds);
-  UT_RUN(test_constproptmp_i64_to_i32_assign_truncates_fact);
-  UT_RUN(test_constproptmp_ijump_keeps_register_operand);
-  UT_RUN(test_constproptmp_switch_table_const_index_to_case_jump);
-  UT_RUN(test_constproptmp_switch_table_const_index_to_default_jump);
-  UT_RUN(test_constprop_bool_or_one_const_no_fold);
-  UT_RUN(test_constprop_bool_or_two_const_vars_folds);
-
-  /* global_init_prop */
-  UT_RUN(test_globalinitprop_null_ir);
-  UT_RUN(test_globalinitprop_empty);
-  UT_RUN(test_globalinitprop_non_sym_operand_no_fold);
-  UT_RUN(test_globalinitprop_non_lval_symref_no_fold);
-  UT_RUN(test_globalinitprop_weak_sym_guard);
-  UT_RUN(test_globalinitprop_volatile_guard);
-  UT_RUN(test_globalinitprop_nonstatic_nonconst_guard);
-  UT_RUN(test_globalinitprop_nonconst_static_records_late_reopt);
-  UT_RUN(test_globalinitprop_const_reaches_elfsym_no_section);
-
-  /* symref_const_prop */
-  UT_RUN(test_symrefconstprop_null_ir);
-  UT_RUN(test_symrefconstprop_no_tmp_dest);
-  UT_RUN(test_symrefconstprop_propagates_into_use);
-  UT_RUN(test_symrefconstprop_preserves_addend_and_lval);
-  UT_RUN(test_symrefconstprop_lval_source_not_tracked);
-  UT_RUN(test_symrefconstprop_redef_invalidates);
-  UT_RUN(test_symrefconstprop_assign_redef_invalidates);
-  UT_RUN(test_symrefconstprop_block_boundary_clears);
-  UT_RUN(test_symrefconstprop_idempotent);
-
-  /* complex_const_param_fold */
-  UT_RUN(test_cplxparamfold_packs_and_nops_stores);
-  UT_RUN(test_cplxparamfold_non_complex_param_no_fold);
-  UT_RUN(test_cplxparamfold_missing_component_no_fold);
-  UT_RUN(test_cplxparamfold_extra_slot_reference_no_fold);
-  UT_RUN(test_cplxparamfold_nonconst_store_no_fold);
-
-  /* value_tracking */
-  UT_RUN(test_valuetracking_empty);
-  UT_RUN(test_valuetracking_load_of_const_var_folds);
-  UT_RUN(test_valuetracking_arith_const_fold);
-  UT_RUN(test_valuetracking_shl_const_fold);
-  UT_RUN(test_valuetracking_cmp_jumpif_always_taken);
-  UT_RUN(test_valuetracking_cmp_jumpif_never_taken);
-  UT_RUN(test_valuetracking_cmp_setif_fold);
-  UT_RUN(test_valuetracking_addrtaken_not_tracked);
-  UT_RUN(test_valuetracking_merge_point_clears);
-  UT_RUN(test_valuetracking_cfg_multidef_direct_assign_not_tracked);
-  UT_RUN(test_valuetracking_lcmp_const_fold);
-  UT_RUN(test_valuetracking_ulcmp_const_fold);
-  UT_RUN(test_valuetracking_unknown_call_no_fold);
+  static Sym cs;
+  cs.v = tok;
+  utb_set_tok_str(tok, name);
+  uint32_t sidx = tcc_ir_pool_add_symref(ir, &cs, 0, 0);
+  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  const int call_id = 1;
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, v0, utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, v1, utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 1), I32));
+  return utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I64), callee,
+                  utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 2), I32));
 }
+
+/* Build a 64-bit immediate operand (imm32 carrier when it fits, else i64 pool). */
+static IROperand utb_i64op(TCCIRState *ir, int64_t v)
+{
+  if (v == (int32_t)v)
+    return irop_make_imm32(0, (int32_t)v, IROP_BTYPE_INT64);
+  return irop_make_i64(0, tcc_ir_pool_add_i64(ir, v), IROP_BTYPE_INT64);
+}
+
+/* POSITIVE (call fold, __aeabi_ldivmod): signed 64-bit division of two constant
+ * operands folds to the truncated-toward-zero quotient.  Oracle: -100 / 7 = -14. */
+UT_TEST(test_valuetracking_ldivmod_const_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 40, "__aeabi_ldivmod", utb_i64op(ir, -100), utb_i64op(ir, 7));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, icall)), (int64_t)-100 / 7);
+  utb_set_tok_str(40, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (call fold, __aeabi_uldivmod): the SAME operands under unsigned
+ * semantics give a very different quotient — proves the signedness split.
+ * Oracle: (uint64_t)-1 / 2 = 0x7FFFFFFFFFFFFFFF. */
+UT_TEST(test_valuetracking_uldivmod_unsigned_semantics)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 41, "__aeabi_uldivmod", utb_i64op(ir, -1), utb_i64op(ir, 2));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, icall)), (int64_t)((uint64_t)-1 / 2));
+  utb_set_tok_str(41, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (call fold, __aeabi_lmod): signed 64-bit modulo folds; the remainder
+ * takes the sign of the dividend.  Oracle: -17 % 5 = -2. */
+UT_TEST(test_valuetracking_lmod_const_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 42, "__aeabi_lmod", utb_i64op(ir, -17), utb_i64op(ir, 5));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, icall)), (int64_t)-17 % 5);
+  utb_set_tok_str(42, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (call fold, __aeabi_ulmod): unsigned 64-bit modulo of the same
+ * operands differs from the signed result — proves the unsigned modulo path.
+ * Oracle: (uint64_t)-1 % 10 = 5, whereas signed -1 % 10 = -1. */
+UT_TEST(test_valuetracking_ulmod_unsigned_semantics)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 43, "__aeabi_ulmod", utb_i64op(ir, -1), utb_i64op(ir, 10));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, icall)), (int64_t)((uint64_t)-1 % 10));
+  UT_ASSERT_NE(irop_get_imm64_ex(ir, utb_src1(ir, icall)), (int64_t)-1 % 10);
+  utb_set_tok_str(43, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (divmod by zero not folded): a zero divisor leaves the runtime call
+ * intact (the folder must not evaluate a host divide-by-zero). */
+UT_TEST(test_valuetracking_lmod_div_by_zero_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 44, "__aeabi_lmod", utb_i64op(ir, 5), utb_i64op(ir, 0));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_FUNCCALLVAL);
+  utb_set_tok_str(44, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (INT64_MIN %/÷ -1 not folded): signed overflow is C UB and would trap
+ * the host divide, so the folder leaves the runtime call in place. */
+UT_TEST(test_valuetracking_lmod_int64min_neg1_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  int icall = utb_i64_helper_call(ir, 45, "__aeabi_lmod", utb_i64op(ir, INT64_MIN), utb_i64op(ir, -1));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_FUNCCALLVAL);
+  utb_set_tok_str(45, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (call fold, __aeabi_llsr with constant shift amount): a 64-bit
+ * logical right shift whose SHIFT is a known constant but whose value operand
+ * is not is lowered from a runtime call to a native IR SHR (#amount). */
+UT_TEST(test_valuetracking_llsr_lowers_to_ir_shift)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  /* value operand = a live VAR (unknown), shift amount = const 4 */
+  int icall = utb_i64_helper_call(ir, 46, "__aeabi_llsr", utb_var(0, I64), utb_i64op(ir, 4));
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_SHR);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src2(ir, icall)), 4);
+  utb_set_tok_str(46, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (call fold, __bswapsi2): a 32-bit byte swap of a constant folds to
+ * the reversed-byte constant.  Oracle computed independently. */
+UT_TEST(test_valuetracking_bswapsi2_const_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_alloc_var_intervals(ir, 4);
+
+  const int call_id = 1;
+  static Sym cs;
+  cs.v = 47;
+  utb_set_tok_str(47, "__bswapsi2");
+  uint32_t sidx = tcc_ir_pool_add_symref(ir, &cs, 0, 0);
+  IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(0x11223344, I32),
+           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
+  int icall = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
+                       utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 1), I32));
+
+  int changes = tcc_ir_opt_value_tracking(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, icall)), 0x44332211);
+  utb_set_tok_str(47, NULL);
+  utb_free(ir);
+  return 0;
+}
+
+/* ========================================================== self_arith_fold
+ *
+ * tcc_ir_opt_self_arith_fold rewrites x/x -> 1 and x%x -> 0 when both operands
+ * provably read the same non-volatile, non-FP global value (`is_sym && is_lval`
+ * symref, same sym + addend).  Safe because x/x is UB when x==0, so the compiler
+ * may assume x!=0.  These drive the fold and each safety gate directly. */
+
+/* Build the `Vdest <- Sref OP Sref` triple and return the instruction index. */
+static int utb_self_arith(TCCIRState *ir, TccIrOp op, Sym *sym, int32_t addend, int is_lval, int btype)
+{
+  IROperand a = utb_gsymref(ir, sym, addend, is_lval, /*is_const*/ 1, btype);
+  IROperand b = utb_gsymref(ir, sym, addend, is_lval, /*is_const*/ 1, btype);
+  return utb_emit(ir, op, utb_temp(0, I32), a, b);
+}
+
+/* PATH: signed x/x on a plain int global folds to ASSIGN #1, src2 cleared. */
+UT_TEST(test_selfarith_div_same_global_folds_to_one)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  int idiv = utb_self_arith(ir, TCCIR_OP_DIV, &gsym, 0, /*is_lval*/ 1, I32);
+  int changes = tcc_ir_opt_self_arith_fold(ir);
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, idiv)), 1);
+  UT_ASSERT_EQ(irop_get_tag(utb_src2(ir, idiv)), IROP_TAG_NONE);
+  utb_free(ir);
+  return 0;
+}
+
+/* PATH: unsigned x/x also folds to 1. */
+UT_TEST(test_selfarith_udiv_same_global_folds_to_one)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  int idiv = utb_self_arith(ir, TCCIR_OP_UDIV, &gsym, 0, /*is_lval*/ 1, I32);
+  UT_ASSERT(tcc_ir_opt_self_arith_fold(ir) > 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, idiv)), 1);
+  utb_free(ir);
+  return 0;
+}
+
+/* PATH: signed x%x folds to ASSIGN #0. */
+UT_TEST(test_selfarith_imod_same_global_folds_to_zero)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  int imod = utb_self_arith(ir, TCCIR_OP_IMOD, &gsym, 0, /*is_lval*/ 1, I32);
+  UT_ASSERT(tcc_ir_opt_self_arith_fold(ir) > 0);
+  UT_ASSERT_EQ(utb_op(ir, imod), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, imod)), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* PATH: unsigned x%x folds to 0. */
+UT_TEST(test_selfarith_umod_same_global_folds_to_zero)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  int imod = utb_self_arith(ir, TCCIR_OP_UMOD, &gsym, 0, /*is_lval*/ 1, I32);
+  UT_ASSERT(tcc_ir_opt_self_arith_fold(ir) > 0);
+  UT_ASSERT_EQ(utb_op(ir, imod), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, imod)), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (volatile): a volatile global must re-read memory each access, so x/x is
+ * not foldable. */
+UT_TEST(test_selfarith_volatile_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT | VT_VOLATILE;
+  gsym.type.ref = NULL;
+  int idiv = utb_self_arith(ir, TCCIR_OP_DIV, &gsym, 0, /*is_lval*/ 1, I32);
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (FP): a float global is excluded (x/x==1.0 is exact, but NaN/inf make the
+ * integer identity unsound and the fold emits an integer immediate). */
+UT_TEST(test_selfarith_float_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_FLOAT;
+  gsym.type.ref = NULL;
+  int idiv = utb_self_arith(ir, TCCIR_OP_DIV, &gsym, 0, /*is_lval*/ 1, I32);
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (distinct symbols): x/y with two different globals is not a self-divide. */
+UT_TEST(test_selfarith_distinct_syms_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym_a, gsym_b;
+  gsym_a.a = (struct SymAttr){0};
+  gsym_a.type.t = VT_INT;
+  gsym_a.type.ref = NULL;
+  gsym_b.a = (struct SymAttr){0};
+  gsym_b.type.t = VT_INT;
+  gsym_b.type.ref = NULL;
+  IROperand a = utb_gsymref(ir, &gsym_a, 0, /*is_lval*/ 1, /*is_const*/ 1, I32);
+  IROperand b = utb_gsymref(ir, &gsym_b, 0, /*is_lval*/ 1, /*is_const*/ 1, I32);
+  int idiv = utb_emit(ir, TCCIR_OP_DIV, utb_temp(0, I32), a, b);
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (addend): same symbol at different addends reads different bytes. */
+UT_TEST(test_selfarith_distinct_addend_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  IROperand a = utb_gsymref(ir, &gsym, 0, /*is_lval*/ 1, /*is_const*/ 1, I32);
+  IROperand b = utb_gsymref(ir, &gsym, 4, /*is_lval*/ 1, /*is_const*/ 1, I32);
+  int idiv = utb_emit(ir, TCCIR_OP_DIV, utb_temp(0, I32), a, b);
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+/* PATH (same register): `t / t` on the same vreg folds to 1 — both operands are
+ * read at the one quad, so they are the identical value. */
+UT_TEST(test_selfarith_same_vreg_div_folds_to_one)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  int idiv = utb_emit(ir, TCCIR_OP_DIV, utb_temp(0, I32), utb_temp(1, I32), utb_temp(1, I32));
+  UT_ASSERT(tcc_ir_opt_self_arith_fold(ir) > 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, idiv)), 1);
+  UT_ASSERT_EQ(irop_get_tag(utb_src2(ir, idiv)), IROP_TAG_NONE);
+  utb_free(ir);
+  return 0;
+}
+
+/* PATH (same register): `t % t` folds to 0. */
+UT_TEST(test_selfarith_same_vreg_mod_folds_to_zero)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  int imod = utb_emit(ir, TCCIR_OP_UMOD, utb_temp(0, I32), utb_var(2, I32), utb_var(2, I32));
+  UT_ASSERT(tcc_ir_opt_self_arith_fold(ir) > 0);
+  UT_ASSERT_EQ(utb_op(ir, imod), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, imod)), 0);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (distinct registers): `a / b` on different vregs is not a self-divide. */
+UT_TEST(test_selfarith_distinct_vreg_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  int idiv = utb_emit(ir, TCCIR_OP_DIV, utb_temp(0, I32), utb_temp(1, I32), utb_temp(2, I32));
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (non-lval): an address-by-value symref (not a deref) is not the value x;
+ * `&g / &g` is a constant-address divide, not a self-value divide. */
+UT_TEST(test_selfarith_non_lval_no_fold)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  static Sym gsym;
+  gsym.a = (struct SymAttr){0};
+  gsym.type.t = VT_INT;
+  gsym.type.ref = NULL;
+  int idiv = utb_self_arith(ir, TCCIR_OP_DIV, &gsym, 0, /*is_lval*/ 0, I32);
+  UT_ASSERT_EQ(tcc_ir_opt_self_arith_fold(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, idiv), TCCIR_OP_DIV);
+  utb_free(ir);
+  return 0;
+}
+
+UT_COVERS("const_var_prop");
+UT_COVERS("const_prop_tmp");
+UT_COVERS("global_init_prop");
+UT_COVERS("symref_const_prop");
+UT_COVERS("complex_const_param_fold");
+UT_COVERS("value_tracking");

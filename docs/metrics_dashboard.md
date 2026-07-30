@@ -184,6 +184,42 @@ python3 metrics/gate.py --db /var/lib/tcc-metrics/metrics.db \
 Once a `--strict` run comes back clean, flip the CI gate on by setting the
 `METRICS_GATE_ENABLED` repo variable to `true`.
 
+## Comparing a working tree against the server baseline
+
+`metrics/gate.py` diffs one *recorded commit* against its parent inside the DB.
+While iterating on an **uncommitted** change (e.g. an SSA loop-pass migration on
+this branch) use `metrics/compare_worktree.py` instead — it measures the current
+working tree locally and diffs it against the server's recorded baseline,
+reporting **both** improvements and regressions:
+
+```bash
+python3 metrics/compare_worktree.py --url http://<pi>:8008
+```
+
+That does four things: builds `armv8m-tcc` from the working tree (`make cross`,
+skip with `--no-build`), measures it into a throwaway scratch `metrics.db` under
+a synthetic `worktree` identity (reusing `record.py` verbatim), fetches the
+server's baseline `metrics.db` over HTTP (see the `/metrics.db` route below),
+and prints a code-size / compile-time delta table. The baseline row it compares
+against is, in order of preference: your current `HEAD` commit, the merge-base
+with `mob`, or the newest recorded run for the host.
+
+Default scope is code size + compile time (fast, deterministic, no hardware).
+Add the slow families explicitly:
+
+```bash
+# also sweep fuzz correctness (new seed = regression, fixed seed = improvement)
+python3 metrics/compare_worktree.py --url http://<pi>:8008 --correctness --seed-hi 2000
+# also benchmark RP2350 cycles (needs the board over SSH)
+python3 metrics/compare_worktree.py --url http://<pi>:8008 --perf --perf-host <host>
+```
+
+`--strict` exits non-zero on a code-size regression (beyond
+`--codesize-tolerance-pct`, default 1%, on the `-O2` `<total>` ratio) or a new
+correctness divergence — the same block half as `gate.py`. Compile time and perf
+are reported but never gate (hardware-noisy). Offline, point `--baseline-db` at a
+`metrics.db` you copied over yourself instead of `--url`.
+
 ## Grafana
 
 Grafana runs as a systemd-managed `podman-compose` stack, so it comes back on
@@ -237,7 +273,14 @@ python3 metrics/codesize_detail_server.py \
 It opens on `http://<pi>:8008`. The index lists recorded commits; each commit
 has a file-level comparison against its recorded parent, with links down to
 function-level deltas. It reads the detail DB read-only and uses only Python's
-standard library. File and function tables can be sorted by clicking column
+standard library.
+
+The same server also exposes the **main** `metrics.db` for download at
+`http://<pi>:8008/metrics.db` (`--metrics-db`, default
+`/var/lib/tcc-metrics/metrics.db`). It streams a consistent online-backup
+snapshot, so a concurrent `record.py` write can't hand out a torn read. This is
+the baseline source `metrics/compare_worktree.py --url` fetches; pass
+`--metrics-db ''` to disable the route. File and function tables can be sorted by clicking column
 headers, and the `change` filter can restrict the view to regressions or
 improvements.
 

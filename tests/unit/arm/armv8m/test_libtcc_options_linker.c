@@ -164,16 +164,3 @@ UT_TEST(test_wl_boolean_flag_before_value_suboption)
   tcc_delete(s);
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(libtcc_options_linker)
-{
-  UT_RUN(test_wl_bsymbolic_sets_symbolic_flag);
-  UT_RUN(test_wl_rpath_sets_rpath_field);
-  UT_RUN(test_wl_soname_sets_soname_field);
-  UT_RUN(test_wl_gc_sections_sets_flag);
-  UT_RUN(test_wl_combined_suboptions_all_land);
-  UT_RUN(test_wl_boolean_flag_before_value_suboption);
-  UT_RUN(test_wl_unrecognized_suboption_returns_error);
-}

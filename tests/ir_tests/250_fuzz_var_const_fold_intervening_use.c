@@ -1,4 +1,4 @@
-/* Regression: ssa_opt_var_const_fold (ir/opt/ssa_opt_cprop.c) deleted the
+/* Regression: ssa_opt_var_const_fold (source/opt/ssa/scalar/cprop.c) deleted the
  * prior constant def of a VAR when folding a later self-update of that VAR,
  * without checking for an intervening USE of the def between the two.
  *

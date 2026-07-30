@@ -180,24 +180,3 @@ UT_TEST(test_legacy_assign_physical_register)
   tcc_ir_free(ir);
   return 0;
 }
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(ir_stack)
-{
-  UT_RUN(test_slot_count_empty);
-  UT_RUN(test_slot_by_vreg_invalid);
-  UT_RUN(test_slot_by_offset_invalid);
-  UT_RUN(test_frame_size_empty);
-  UT_RUN(test_alignment_is_eight);
-  UT_RUN(test_args_offset_and_size_default);
-  UT_RUN(test_reg_assign_and_get);
-  UT_RUN(test_spilled_var_gets_spilled_flag);
-  UT_RUN(test_reg_get_unassigned_vreg);
-  UT_RUN(test_stack_reset_clears_slots);
-  UT_RUN(test_slot_by_index_bounds);
-  UT_RUN(test_legacy_build_stack_layout_no_crash);
-  UT_RUN(test_legacy_assign_physical_register);
-}

@@ -8,8 +8,7 @@
  * License as published by the Free Software Foundation.
  */
 
-#ifndef TCC_IR_POOL_H
-#define TCC_IR_POOL_H
+#pragma once
 
 /* operand.h is included via tcc.h as tccir_operand.h */
 
@@ -82,4 +81,3 @@ int tcc_ir_pool_jump_target_get(struct TCCIRState *ir, int instr_idx);
 /* Convenience wrapper for setting jump target */
 void tcc_ir_set_dest_jump_target(struct TCCIRState *ir, int instr_idx, int target_address);
 
-#endif /* TCC_IR_POOL_H */

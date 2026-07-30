@@ -5,8 +5,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_block.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_block.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -227,30 +227,4 @@ UT_TEST(test_stm_exclude_bit)
   /* r0 bit cleared from raw placement -> only r2 remains -> 0xC004 */
   UT_ASSERT_EQ(op.opcode, 0xC004);
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_block)
-{
-  UT_RUN(test_push_t1_basic);
-  UT_RUN(test_push_t1_with_lr);
-  UT_RUN(test_push_t2);
-  UT_RUN(test_pop_t1_basic);
-  UT_RUN(test_pop_t1_with_pc);
-  UT_RUN(test_pop_t2_with_pc);
-  UT_RUN(test_pop_t2_with_lr);
-  UT_RUN(test_ldm_t1);
-  UT_RUN(test_ldm_t3);
-  UT_RUN(test_ldm_sp_delegates_to_pop);
-  UT_RUN(test_ldm_sp_wide_delegates_to_pop_t2);
-  UT_RUN(test_stm_t1);
-  UT_RUN(test_stm_no_writeback_forces_t32);
-  UT_RUN(test_stm_t3);
-  UT_RUN(test_ldmdb_basic);
-  UT_RUN(test_ldmdb_no_writeback);
-  UT_RUN(test_stmdb_basic);
-  UT_RUN(test_stmdb_no_writeback);
-  UT_RUN(test_ldm_exclude_bit);
-  UT_RUN(test_stm_exclude_bit);
 }

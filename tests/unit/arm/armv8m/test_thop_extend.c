@@ -5,8 +5,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_extend.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_extend.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ut.h"
 
 static void setup_armv7m(void)
@@ -193,17 +193,4 @@ UT_TEST(test_extend_high_reg_t1_fails)
   UT_ASSERT_EQ(op.size, 4);
 
   return 0;
-}
-
-UT_SUITE(thop_extend)
-{
-  UT_RUN(test_sxth_t1_low_reg);
-  UT_RUN(test_sxth_t2_with_rotation);
-  UT_RUN(test_uxtb_t1);
-  UT_RUN(test_sxtb_t2_with_rotation);
-  UT_RUN(test_uxth_t2_with_rotation);
-  UT_RUN(test_uxtb_t2_with_rotation);
-  UT_RUN(test_extend_enforce_16bit_with_rotation_fails);
-  UT_RUN(test_extend_enforce_32bit_always_t2);
-  UT_RUN(test_extend_high_reg_t1_fails);
 }

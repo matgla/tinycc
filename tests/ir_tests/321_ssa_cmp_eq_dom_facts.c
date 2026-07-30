@@ -1,4 +1,4 @@
-/* Exercise ssa_opt_cmp_eq.c: equality/inequality fact propagation
+/* Exercise source/opt/ssa/cfg/cmp_eq.c: equality/inequality fact propagation
  * through the dominator tree.  Facts pushed by an outer CMP+JEQ must be
  * visible in dominated blocks and correctly popped when leaving the subtree. */
 #include <stdio.h>

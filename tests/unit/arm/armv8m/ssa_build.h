@@ -25,13 +25,13 @@
 #define SSA_BUILD_H
 
 #include "ir_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 /* ========================================================================
  * ssa_ctx - hand-built SSA fixture
@@ -138,8 +138,10 @@ static inline int ssa_add_instr4(ssa_ctx *c, TccIrOp op, IROperand dest,
 static inline void ssa_ctx_build_cfg(ssa_ctx *c)
 {
   c->cfg = tcc_ir_cfg_build(c->ir);
-  if (c->cfg)
+  if (c->cfg) {
     tcc_ir_cfg_compute_dominators(c->cfg);
+    tcc_ir_cfg_compute_dom_frontiers(c->cfg);
+  }
 }
 
 /* ------------------------------------------------------------------ SSA build */
@@ -225,6 +227,19 @@ static inline IRSSAVregInfo *ssa_vinfo(ssa_ctx *c, int32_t vreg)
 }
 
 /* ------------------------------------------------------------------ manual CFG/SSA construction */
+
+/* Allocate the VAR live-interval array the DCE sub-passes consult
+ * (dce_var_liveness, dce_temp_worklist volatile guard). Real compilation
+ * always sizes variables_live_intervals to next_local_variable; hand-built
+ * fixtures must mirror that or tcc_ir_get_live_interval() aborts. */
+static inline void ssa_ctx_alloc_var_intervals(ssa_ctx *c, int num_vars)
+{
+  c->ir->next_local_variable = num_vars;
+  tcc_free(c->ir->variables_live_intervals);
+  c->ir->variables_live_intervals =
+      tcc_mallocz(sizeof(IRLiveInterval) * num_vars);
+  c->ir->variables_live_intervals_size = num_vars;
+}
 
 /* Manually create a minimal CFG with 1 block and an empty SSA state.
  * This is used by tests that need to add phis or instructions before

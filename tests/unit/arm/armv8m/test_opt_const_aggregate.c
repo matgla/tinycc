@@ -543,24 +543,4 @@ UT_TEST(test_const_agg_lea_plus_offset_root_folds)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_const_aggregate)
-{
-  UT_COVERS("const_aggregate_fold");
-  UT_RUN(test_const_agg_single_dadd_folds);
-  UT_RUN(test_const_agg_single_dsub_folds);
-  UT_RUN(test_const_agg_chain_depth2_one_pass);
-  UT_RUN(test_const_agg_idempotent);
-  UT_RUN(test_const_agg_address_escape_no_fold);
-  UT_RUN(test_const_agg_memcpy_source_still_folds);
-  UT_RUN(test_const_agg_no_lea_root_no_fold);
-  UT_RUN(test_const_agg_nonconst_arg_no_fold);
-  UT_RUN(test_const_agg_non_dadd_callee_no_fold);
-  UT_RUN(test_const_agg_ijump_bails);
-  UT_RUN(test_const_agg_oob_jump_target_bails);
-  UT_RUN(test_const_agg_merge_conflict_no_fold);
-  UT_RUN(test_const_agg_merge_agree_folds);
-  UT_RUN(test_const_agg_unknown_overstore_kills);
-  UT_RUN(test_const_agg_lea_plus_offset_root_folds);
-}
+UT_COVERS("const_aggregate_fold");

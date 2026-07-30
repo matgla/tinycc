@@ -17,8 +17,8 @@
 
 #define USING_GLOBALS
 #include "ir.h"
-#include "arch/arm/arm.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
@@ -278,22 +278,4 @@ UT_TEST(test_finish_noreturn_emits_no_pop_or_branch)
   UT_ASSERT_EQ(ind, base);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_prolog)
-{
-  UT_RUN(test_prolog_leaf_no_regs_no_stack_emits_nothing);
-  UT_RUN(test_prolog_nonleaf_no_regs_no_stack_pushes_lr_padded_with_r3);
-  UT_RUN(test_prolog_callee_saved_r4_r5_r10_emits_t2_push);
-  UT_RUN(test_prolog_extra_prologue_regs_lr_forces_lr_save_even_leaf);
-  UT_RUN(test_prolog_stack_size_rounds_up_to_8_byte_alignment);
-
-  UT_RUN(test_epilog_leaf_no_regs_no_stack_emits_bx_lr);
-  UT_RUN(test_epilog_nonleaf_pops_r3_lr_as_pc);
-  UT_RUN(test_epilog_callee_saved_r4_r5_r10_pops_t2);
-
-  UT_RUN(test_finish_noreturn_clears_generating_function_flag);
-  UT_RUN(test_finish_noreturn_emits_no_pop_or_branch);
 }

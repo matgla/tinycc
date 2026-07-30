@@ -194,16 +194,4 @@ UT_TEST(test_redundant_var_assign_ex_forwards)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_redundant_assign)
-{
-  UT_COVERS("redundant_assign");
-  UT_RUN(test_redundant_var_assign_positive);
-  UT_RUN(test_redundant_var_assign_read_keeps);
-  UT_RUN(test_redundant_var_assign_jump_target_flushes);
-  UT_RUN(test_redundant_var_assign_idempotent);
-  UT_RUN(test_redundant_var_assign_var0_skipped);
-  UT_RUN(test_redundant_var_assign_empty);
-  UT_RUN(test_redundant_var_assign_ex_forwards);
-}
+UT_COVERS("redundant_assign");

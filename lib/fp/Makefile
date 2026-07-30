@@ -69,6 +69,40 @@ build:
 	@# Backward-compatible symlink (e.g. libtcc1-fp-soft-armv8m.a -> libsoftfp.a)
 	@ln -sf $(TARGET_LIB) $(TARGET_COMPAT)
 	@echo "Created $(TARGET_LIB) (compat: $(TARGET_COMPAT))"
+	@$(MAKE) --no-print-directory check-self-contained FPU=$(FPU)
+
+# An FP runtime must define the entire __aeabi_ set on its own.  If it leaves a
+# gap, the linker fills it from libgcc -- and libgcc's objects bundle several
+# entry points each, so one missing symbol drags in duplicates of ones we
+# already define and the link dies on "multiple definition".  libsoftfp is the
+# reference set because it is the only complete one.
+#
+# Only rp2350 is held to this yet; libvfpv4sp and libvfpv5dp have the same
+# latent hole (they lean on the linker for their soft-float fallbacks) and are
+# listed here so the exemption is visible rather than silent.
+SELF_CONTAINED_VARIANTS = rp2350
+FP_NM ?= $(shell command -v arm-none-eabi-nm 2>/dev/null || command -v nm 2>/dev/null)
+
+check-self-contained:
+ifneq ($(filter $(FPU),$(SELF_CONTAINED_VARIANTS)),)
+	@if [ -z "$(FP_NM)" ]; then \
+		echo "check-self-contained: no nm found, skipping"; \
+	elif [ ! -f libsoftfp.a ]; then \
+		echo "check-self-contained: libsoftfp.a not built yet, skipping"; \
+	else \
+		$(FP_NM) --defined-only libsoftfp.a | grep -o '__aeabi_[a-z0-9_]*' | sort -u > $(BUILD_DIR)/.soft.syms; \
+		$(FP_NM) --defined-only $(TARGET_LIB) | grep -o '__aeabi_[a-z0-9_]*' | sort -u > $(BUILD_DIR)/.$(FPU).syms; \
+		missing=$$(comm -23 $(BUILD_DIR)/.soft.syms $(BUILD_DIR)/.$(FPU).syms); \
+		if [ -n "$$missing" ]; then \
+			echo "ERROR: $(TARGET_LIB) is not self-contained; libgcc will be pulled in for:"; \
+			echo "$$missing" | sed 's/^/  /'; \
+			exit 1; \
+		fi; \
+		echo "$(TARGET_LIB): self-contained (covers all $$(wc -l < $(BUILD_DIR)/.soft.syms) __aeabi_ symbols)"; \
+	fi
+else
+	@:
+endif
 
 # Build shared library version of the current FPU variant
 # Objects are rebuilt with -fPIC in a separate directory
@@ -119,4 +153,4 @@ clean:
 	rm -f libsoftfp.so.elf libvfpv4sp.so.elf libvfpv5dp.so.elf librp2350fp.so.elf
 	rm -f libtcc1-fp-*.a
 
-.PHONY: all build build-shared all-variants all-shared clean
+.PHONY: all build build-shared all-variants all-shared clean check-self-contained

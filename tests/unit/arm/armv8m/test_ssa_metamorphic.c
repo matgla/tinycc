@@ -18,13 +18,17 @@
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
+#include "opt/ssa/strength.h"
+#include "opt/ssa/reassoc.h"
+#include "opt/ssa/gvn.h"
+#include "opt/ssa/cprop.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #define I32 IROP_BTYPE_INT32
 
@@ -78,8 +82,4 @@ UT_TEST(test_metamorphic_ssa_random_snippet)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_metamorphic)
-{
-  UT_COVERS("ssa:metamorphic");
-  UT_RUN(test_metamorphic_ssa_random_snippet);
-}
+UT_COVERS("ssa:metamorphic");

@@ -6,7 +6,7 @@
  * cannot be barrel-shifted, so codegen silently dropped the shift and
  * `(u6 << 7) | (u6 & s2)` collapsed from 385 to 3.
  * Fixed by blocking VAR->use forwarding into any barrel-shift-annotated
- * instruction in ssa_opt_var_to_param_forward (ir/opt/ssa_opt_cprop.c).
+ * instruction in ssa_opt_var_to_param_forward (source/opt/ssa/scalar/cprop.c).
  * Ground truth (tcc -O0, all levels agree after fix): checksum=42f25408.
  */
 #include <stdio.h>

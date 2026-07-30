@@ -16,19 +16,20 @@
  *      * Multiple rewrites in one pass
  *
  *  HARNESS NOTES:
- *    - Links the real ir/opt/ssa_opt_strength.c via UT11.
+ *    - Links the real source/opt/ssa/strength.c via UT11.
  *    - Uses ssa_build.h for hand-built vinfo + IR.
  *    - MUL/UDIV/UMOD need a src2 operand; use ssa_add_instr3().
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
+#include "opt/ssa/strength.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #define I32 IROP_BTYPE_INT32
 
@@ -540,30 +541,185 @@ UT_TEST(test_strength_reduce_ignores_other_ops)
 }
 
 /* ========================================================================
+ * MUL with F32 immediate (PATTERN constraint matches, but is_imm32 rejects)
+ * ======================================================================== */
+
+UT_TEST(test_strength_reduce_mul_f32_imm)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  /* t0 = #8; t1 = t0 * #4.0f -> no optimization (F32 is not IMM32) */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(8, I32));
+  IROperand f32_imm = irop_make_f32(0, 0); /* F32 with bits=0 */
+  int mul_i = ssa_add_instr3(&c, TCCIR_OP_MUL, utb_temp(1, I32),
+                             utb_temp(0, I32), f32_imm);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_strength(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, mul_i), TCCIR_OP_MUL);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * MUL with I64 immediate (PATTERN constraint matches, but is_imm32 rejects)
+ * ======================================================================== */
+
+UT_TEST(test_strength_reduce_mul_i64_imm)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  /* t0 = #8; t1 = t0 * #4 (I64) -> no optimization (I64 is not IMM32) */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(8, I32));
+  int idx = tcc_ir_pool_add_i64(c.ir, 4);
+  IROperand i64_imm = irop_make_i64(0, idx, IROP_BTYPE_INT64);
+  int mul_i = ssa_add_instr3(&c, TCCIR_OP_MUL, utb_temp(1, I32),
+                             utb_temp(0, I32), i64_imm);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_strength(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, mul_i), TCCIR_OP_MUL);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * UDIV with F32 immediate (PATTERN constraint matches, but is_imm32 rejects)
+ * ======================================================================== */
+
+UT_TEST(test_strength_reduce_udiv_f32_imm)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  /* t0 = #16; t1 = t0 / #4.0f -> no optimization (F32 is not IMM32) */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(16, I32));
+  IROperand f32_imm = irop_make_f32(0, 0);
+  int div_i = ssa_add_instr3(&c, TCCIR_OP_UDIV, utb_temp(1, I32),
+                             utb_temp(0, I32), f32_imm);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_strength(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, div_i), TCCIR_OP_UDIV);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * UDIV with I64 immediate (PATTERN constraint matches, but is_imm32 rejects)
+ * ======================================================================== */
+
+UT_TEST(test_strength_reduce_udiv_i64_imm)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  /* t0 = #16; t1 = t0 / #4 (I64) -> no optimization (I64 is not IMM32) */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(16, I32));
+  int idx = tcc_ir_pool_add_i64(c.ir, 4);
+  IROperand i64_imm = irop_make_i64(0, idx, IROP_BTYPE_INT64);
+  int div_i = ssa_add_instr3(&c, TCCIR_OP_UDIV, utb_temp(1, I32),
+                             utb_temp(0, I32), i64_imm);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_strength(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, div_i), TCCIR_OP_UDIV);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * UMOD with F32 immediate (PATTERN constraint matches, but is_imm32 rejects)
+ * ======================================================================== */
+
+UT_TEST(test_strength_reduce_umod_f32_imm)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  /* t0 = #10; t1 = t0 % #4.0f -> no optimization (F32 is not IMM32) */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(10, I32));
+  IROperand f32_imm = irop_make_f32(0, 0);
+  int mod_i = ssa_add_instr3(&c, TCCIR_OP_UMOD, utb_temp(1, I32),
+                             utb_temp(0, I32), f32_imm);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_strength(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, mod_i), TCCIR_OP_UMOD);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * UMOD with I64 immediate (PATTERN constraint matches, but is_imm32 rejects)
+ * ======================================================================== */
+
+UT_TEST(test_strength_reduce_umod_i64_imm)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  /* t0 = #10; t1 = t0 % #4 (I64) -> no optimization (I64 is not IMM32) */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(10, I32));
+  int idx = tcc_ir_pool_add_i64(c.ir, 4);
+  IROperand i64_imm = irop_make_i64(0, idx, IROP_BTYPE_INT64);
+  int mod_i = ssa_add_instr3(&c, TCCIR_OP_UMOD, utb_temp(1, I32),
+                             utb_temp(0, I32), i64_imm);
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_strength(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, mod_i), TCCIR_OP_UMOD);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * MUL with src1 F32 imm, src2 TEMP (swapped operands, non-IMM32)
+ * ======================================================================== */
+
+UT_TEST(test_strength_reduce_mul_f32_imm_src1)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  /* t0 = #8; t1 = #4.0f * t0 -> no optimization (F32 is not IMM32) */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(8, I32));
+  IROperand f32_imm = irop_make_f32(0, 0);
+  int mul_i = ssa_add_instr3(&c, TCCIR_OP_MUL, utb_temp(1, I32),
+                             f32_imm, utb_temp(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_strength(c.ctx);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, mul_i), TCCIR_OP_MUL);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_strength)
-{
-  UT_COVERS("ssa:strength_reduce");
-  UT_RUN(test_strength_reduce_mul_pow2_src2_imm);
-  UT_RUN(test_strength_reduce_mul_pow2_src1_imm);
-  UT_RUN(test_strength_reduce_mul_by_one);
-  UT_RUN(test_strength_reduce_mul_no_imm);
-  UT_RUN(test_strength_reduce_mul_non_pow2_imm);
-  UT_RUN(test_strength_reduce_mul_zero_imm);
-  UT_RUN(test_strength_reduce_mul_lval_imm);
-  UT_RUN(test_strength_reduce_udiv_pow2);
-  UT_RUN(test_strength_reduce_udiv_by_one);
-  UT_RUN(test_strength_reduce_udiv_non_imm);
-  UT_RUN(test_strength_reduce_udiv_non_pow2);
-  UT_RUN(test_strength_reduce_udiv_lval_imm);
-  UT_RUN(test_strength_reduce_umod_pow2);
-  UT_RUN(test_strength_reduce_umod_by_one);
-  UT_RUN(test_strength_reduce_umod_non_imm);
-  UT_RUN(test_strength_reduce_umod_non_pow2);
-  UT_RUN(test_strength_reduce_umod_lval_imm);
-  UT_RUN(test_strength_reduce_multiple);
-  UT_RUN(test_strength_reduce_skips_nop);
-  UT_RUN(test_strength_reduce_ignores_other_ops);
-}
+UT_COVERS("ssa:strength_reduce");

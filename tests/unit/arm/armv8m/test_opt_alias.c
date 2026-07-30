@@ -185,27 +185,9 @@ UT_TEST(test_stack_slot_range_zero_size_slot_skipped)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_alias)
-{
-  UT_COVERS("ir_opt_store_btype_size_bytes");
-  UT_COVERS("stackoff_same_slot");
-  UT_COVERS("operand_references_slot");
-  UT_COVERS("is_stack_address_operand");
-  UT_COVERS("find_deref_use_operand");
-  UT_COVERS("ir_opt_stack_slot_range_for_offset");
-  UT_RUN(test_store_btype_size_all_widths);
-  UT_RUN(test_same_slot_equal_offsets_match);
-  UT_RUN(test_same_slot_different_offset_no_match);
-  UT_RUN(test_same_slot_llocal_flag_distinguishes);
-  UT_RUN(test_same_slot_non_stackoff_rejected);
-  UT_RUN(test_operand_references_slot);
-  UT_RUN(test_is_stack_address_operand);
-  UT_RUN(test_find_deref_use_single_match_in_src1);
-  UT_RUN(test_find_deref_use_single_match_in_src2);
-  UT_RUN(test_find_deref_use_no_match_returns_zero);
-  UT_RUN(test_find_deref_use_multiple_matches_returns_zero);
-  UT_RUN(test_stack_slot_range_found_via_linear_scan);
-  UT_RUN(test_stack_slot_range_zero_size_slot_skipped);
-}
+UT_COVERS("ir_opt_store_btype_size_bytes");
+UT_COVERS("stackoff_same_slot");
+UT_COVERS("operand_references_slot");
+UT_COVERS("is_stack_address_operand");
+UT_COVERS("find_deref_use_operand");
+UT_COVERS("ir_opt_stack_slot_range_for_offset");

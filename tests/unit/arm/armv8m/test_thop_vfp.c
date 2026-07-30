@@ -3,8 +3,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_vfp.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_vfp.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ut.h"
 
 static void setup_armv8m_vfp(void)
@@ -454,6 +454,142 @@ UT_TEST(test_th_vpop_dp)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  VLDR / VSTR (single-register load/store)  — encodings cross-checked
+ *  against arm-none-eabi-as -mfpu=fpv5-sp-d16 -mfloat-abi=hard.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+UT_TEST(test_th_vldr_sp_zero_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(0, 0, 0, 0); /* vldr s0, [r0] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED900A00);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_sp_pos_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(1, 3, 16, 0); /* vldr s1, [r3, #16] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xEDD30A04);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_sp_neg_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(2, 0, -8, 0); /* vldr s2, [r0, #-8] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED101A02);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_sp_high_reg)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(16, 0, 0, 0); /* vldr s16, [r0] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED908A00);
+  return 0;
+}
+
+UT_TEST(test_th_vstr_sp_zero_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vstr(0, 0, 0, 0); /* vstr s0, [r0] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED800A00);
+  return 0;
+}
+
+UT_TEST(test_th_vstr_sp_pos_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vstr(5, 2, 20, 0); /* vstr s5, [r2, #20] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xEDC22A05);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_dp_zero_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(0, 0, 0, 1); /* vldr d0, [r0] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED900B00);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_dp_pos_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vldr(3, 1, 40, 1); /* vldr d3, [r1, #40] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED913B0A);
+  return 0;
+}
+
+UT_TEST(test_th_vstr_dp_zero_offset)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vstr(0, 0, 0, 1); /* vstr d0, [r0] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED800B00);
+  return 0;
+}
+
+UT_TEST(test_th_vstr_dp_neg_offset_high_reg)
+{
+  setup_armv8m_vfp();
+  thumb_opcode op = th_vstr(7, 4, -16, 1); /* vstr d7, [r4, #-16] */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED047B04);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_sp_blocked_without_feat)
+{
+  setup_no_vfp_sp();
+  thumb_opcode op = th_vldr(0, 0, 0, 0);
+  UT_ASSERT_EQ(op.size, 0);
+  UT_ASSERT_EQ(op.opcode, 0);
+  return 0;
+}
+
+/* 64-bit load/store is DATA MOVEMENT, not double arithmetic: it stays available
+ * on a single-precision-only unit (FPv5-SP-D16 has s0-s15 addressable as d0-d7),
+ * which is what makes the hard-float double ABI encodable there.  Only the
+ * single-precision feature gates it. */
+UT_TEST(test_th_vldr_dp_allowed_without_dp_feat)
+{
+  setup_no_vfp_dp();
+  thumb_opcode op = th_vldr(0, 0, 0, 1);
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xED900B00);
+  return 0;
+}
+
+UT_TEST(test_th_vldr_dp_blocked_without_any_fpu)
+{
+  setup_no_vfp_sp();
+  thumb_opcode op = th_vldr(0, 0, 0, 1);
+  UT_ASSERT_EQ(op.size, 0);
+  UT_ASSERT_EQ(op.opcode, 0);
+  return 0;
+}
+
+/* Same for the GPR-pair <-> d-register move used to pass doubles. */
+UT_TEST(test_th_vmov_2gp_dp_allowed_without_dp_feat)
+{
+  setup_no_vfp_dp();
+  thumb_opcode op = th_vmov_2gp_dp(0, 1, 0, 1); /* R0, R1 <- D0 */
+  UT_ASSERT_EQ(op.size, 4);
+  UT_ASSERT_EQ(op.opcode, 0xEC510B10);
+  return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  Feature gates
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -491,56 +627,4 @@ UT_TEST(test_vfp_dp_allowed_with_feat)
   UT_ASSERT_EQ(op.size, 4);
   UT_ASSERT_EQ(op.opcode, 0xEE310B02);
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_vfp)
-{
-  UT_RUN(test_th_vadd_f_sp);
-  UT_RUN(test_th_vadd_f_dp);
-  UT_RUN(test_th_vadd_f_sp_high_regs);
-  UT_RUN(test_th_vadd_f_dp_high_regs);
-  UT_RUN(test_th_vsub_f_sp);
-  UT_RUN(test_th_vsub_f_dp);
-  UT_RUN(test_th_vmul_f_sp);
-  UT_RUN(test_th_vmul_f_dp);
-  UT_RUN(test_th_vdiv_f_sp);
-  UT_RUN(test_th_vdiv_f_dp);
-  UT_RUN(test_th_vneg_f_sp);
-  UT_RUN(test_th_vneg_f_dp);
-  UT_RUN(test_th_vcmp_f_sp);
-  UT_RUN(test_th_vcmp_f_dp);
-  UT_RUN(test_th_vmov_register_sp);
-  UT_RUN(test_th_vmov_register_dp);
-  UT_RUN(test_th_vmov_gp_sp_to_arm);
-  UT_RUN(test_th_vmov_gp_sp_from_arm);
-  UT_RUN(test_th_vmov_gp_sp_high_reg);
-  UT_RUN(test_th_vmov_2gp_dp_to_arm);
-  UT_RUN(test_th_vmov_2gp_dp_from_arm);
-  UT_RUN(test_th_vmrs);
-  UT_RUN(test_th_vcvt_float_to_double);
-  UT_RUN(test_th_vcvt_double_to_float);
-  UT_RUN(test_th_vcvt_fp_int_s32_f32);
-  UT_RUN(test_th_vcvt_fp_int_u32_f32);
-  UT_RUN(test_th_vcvt_fp_int_f32_s32);
-  UT_RUN(test_th_vcvt_fp_int_f32_u32);
-  UT_RUN(test_th_vcvt_fp_int_s32_f64);
-  UT_RUN(test_th_vcvt_fp_int_f64_s32);
-  UT_RUN(test_th_vcvt_fp_int_f64_u32);
-  UT_RUN(test_th_vcvt_convert_s32_f32);
-  UT_RUN(test_th_vcvt_convert_f64_f32);
-  UT_RUN(test_th_vcvt_convert_f32_s32);
-  UT_RUN(test_th_vcvt_convert_u32_f64);
-  UT_RUN(test_th_vcvt_convert_unknown);
-  UT_RUN(test_th_vpush_sp);
-  UT_RUN(test_th_vpush_sp_high);
-  UT_RUN(test_th_vpush_dp);
-  UT_RUN(test_th_vpush_dp_high);
-  UT_RUN(test_th_vpop_sp);
-  UT_RUN(test_th_vpop_dp);
-  UT_RUN(test_vfp_sp_blocked_without_feat);
-  UT_RUN(test_vfp_dp_blocked_without_feat);
-  UT_RUN(test_vfp_sp_allowed_with_feat);
-  UT_RUN(test_vfp_dp_allowed_with_feat);
 }

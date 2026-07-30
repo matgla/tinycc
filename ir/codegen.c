@@ -10,6 +10,8 @@
 
 #define USING_GLOBALS
 #include "ir.h"
+#include "arm-thumb-callsite.h"
+#include "opt/flat/if_convert.h"
 
 /* Debug tracking variable (defined in arm-thumb-gen.c) */
 extern int g_debug_current_op;
@@ -23,16 +25,9 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   int old_r = sv->r;
   int old_v = old_r & VT_VALMASK;
 
-  /* VT_LOCAL/VT_LLOCAL operands can mean either:
-   * - a concrete stack slot (vr == -1), e.g. VLA save slots, or
-   * - a logical local tracked as a vreg by the IR (vr != -1).
-   *
-   * For concrete stack slots, do not rewrite them into registers here; doing
-   * so can create uninitialized register reads at runtime.
-   *
-   * For locals that do carry a vreg, they must participate in register
-   * allocation so that defs/uses stay consistent.
-   */
+  /* Concrete stack slots (vr == -1) must not be rewritten into registers;
+   * that would create uninitialized reads.  Locals with a vreg must
+   * participate in allocation so defs/uses stay consistent. */
   if ((old_v == VT_LOCAL || old_v == VT_LLOCAL) && sv->vr == -1)
   {
     sv->pr0_reg = PREG_REG_NONE;
@@ -45,14 +40,9 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   {
     IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, sv->vr);
 
-    /* Stack-passed parameters: if not allocated to a register, treat them as
-     * residing in the incoming argument area (VT_PARAM) rather than forcing a
-     * separate local spill slot.
-     *
-     * This is safe under AAPCS: the caller's argument stack area remains valid
-     * for the duration of the call, and it also provides a correct addressable
-     * home for '&param' semantics.
-     */
+    /* Stack-passed params (not allocated to a register) live in the caller's
+     * argument area (VT_PARAM).  AAPCS guarantees that area is valid for the
+     * call's duration and provides an addressable home for '&param'. */
     if (TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 < 0 &&
         interval->allocation.r0 == PREG_NONE && interval->allocation.offset == 0)
     {
@@ -70,11 +60,9 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
       return;
     }
 
-    /* Register-passed parameters: if allocated to a register (not spilled),
-     * clear VT_LVAL. The value is already in the register, no dereference needed.
-     * VT_LVAL is only used on parameters for address-of operations (&param) or
-     * when they're on the stack (VT_LOCAL).
-     */
+    /* Register-passed params already in a register need no VT_LVAL — the
+     * value is already there.  VT_LVAL is only needed for &param or stack
+     * params (VT_LOCAL). */
     int is_register_param =
         (TCCIR_DECODE_VREG_TYPE(sv->vr) == TCCIR_VREG_TYPE_PARAM && interval && interval->incoming_reg0 >= 0);
 
@@ -84,52 +72,33 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
     sv->pr1_spilled = (interval->allocation.r1 & PREG_SPILLED) != 0;
     sv->c.i = interval->allocation.offset;
 
-    /* Determine if we should preserve VT_LVAL:
-     * - If old_r was VT_LOCAL|VT_LVAL (local variable on stack), and now
-     *   it's allocated to a register, we should NOT preserve VT_LVAL because
-     *   the value is already in the register, no load needed.
-     * - If old_r has VT_LVAL but (old_r & VT_VALMASK) < VT_CONST, it means
-     *   the vreg holds a pointer that needs dereferencing - preserve VT_LVAL.
-     * - Register parameters: do NOT preserve VT_LVAL when allocated to a register.
-     *   VT_LVAL on parameters is only needed for stack params (VT_LOCAL) or for
-     *   address-of operations.
-     * - If old_r does NOT have VT_LVAL, this is an address-of operation
-     *   (we want the address, not the value). Do NOT add VT_LVAL. */
+    /* Preserve VT_LVAL for pointer derefs and address-of ops; not for
+     * register-resident params (value already there) or address-of
+     * expressions (we want the address, not the value). */
     int preserve_flags = old_r & VT_PARAM; /* Always preserve VT_PARAM */
     if ((old_r & VT_LVAL) && old_v < VT_CONST && old_v != VT_LOCAL && old_v != VT_LLOCAL && !is_register_param)
     {
       /* The vreg holds a pointer that needs dereferencing.
-       * Note: VT_LOCAL/VT_LLOCAL use VT_LVAL to mean "load from stack slot".
-       * When such a local/param is promoted to a register, we must NOT
-       * preserve VT_LVAL, otherwise we turn a plain value into a pointer
-       * dereference (double-indirection bugs).
-       */
+       * Note: VT_LOCAL/VT_LLOCAL use VT_LVAL to mean "load from stack slot";
+       * promoting such a local/param to a register must NOT preserve VT_LVAL
+       * or we turn a plain value into a pointer dereference. */
       preserve_flags |= VT_LVAL;
     }
 
     if ((interval->allocation.r0 & PREG_SPILLED) || interval->allocation.offset != 0)
     {
-      /* Spilled to stack - treat as local.
-       * For computed values (old_r was 0 or a register), add VT_LVAL to load the value.
-       * For address-of expressions (old_r == VT_LOCAL without VT_LVAL), don't add VT_LVAL.
-       * If original had VT_LVAL (pointer dereference), preserve it.
+      /* Spilled to stack — treat as local.
+       * Computed values always need VT_LVAL to load from the spill slot.
+       * Locals preserve their existing VT_LVAL to distinguish load vs address-of.
        *
-       * DOUBLE INDIRECTION CASE: If old_r has VT_LVAL AND the original was NOT
-       * already a local variable (VT_LOCAL), then the code wants to DEREFERENCE
-       * the value held in this vreg. If that value is spilled:
-       *   - Spill slot contains a POINTER value (e.g., result of ADD on address)
-       *   - Need to: (1) load pointer from spill, (2) dereference it
-       * Use VT_LLOCAL to encode this double-indirection requirement.
+       * DOUBLE INDIRECTION: If old_r has VT_LVAL but the original was NOT
+       * VT_LOCAL/VT_LLOCAL, the code wants to DEREFERENCE the spilled value
+       * (load pointer, then deref).  Use VT_LLOCAL to encode this.
+       * VT_LOCAL/VT_LLOCAL's VT_LVAL means "access this stack slot", not
+       * "dereference pointer in vreg" — do NOT use VT_LLOCAL there.
        *
-       * But if old_v == VT_LOCAL, the VT_LVAL means "load/store from/to this stack slot"
-       * which is standard local variable access - do NOT use VT_LLOCAL.
-       *
-       * ADDRESS-OF CASE: If old_v == VT_LOCAL and old_r does NOT have VT_LVAL,
-       * this is an address-of operation (&var). We want the ADDRESS of the spill
-       * slot, not its contents. Do NOT add VT_LVAL in this case.
-       *
-       * COMPUTED VALUE CASE: If old_v was a register (computed value that got
-       * spilled), we ALWAYS need VT_LVAL to load the value from the spill slot. */
+       * ADDRESS-OF: If old_v == VT_LOCAL and old_r lacks VT_LVAL, this is
+       * &var — we want the spill-slot address, not its contents. */
       int need_lval;
       if (old_v == VT_LOCAL || old_v == VT_LLOCAL)
       {
@@ -151,11 +120,10 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
          * "access this stack slot" not "dereference pointer in vreg". */
         base_kind = VT_LLOCAL;
       }
-      /* Only preserve VT_PARAM for stack-passed parameters (incoming_reg0 < 0).
-       * Register-passed parameters that are spilled to local stack should NOT
-       * have VT_PARAM set, because VT_PARAM causes load_to_dest to add
-       * offset_to_args (for accessing caller's argument area), but spilled
-       * register params live in the callee's local stack area (negative FP offset). */
+      /* Only preserve VT_PARAM for stack-passed params (incoming_reg0 < 0).
+       * Spilled register params live in the callee's local stack area
+       * (negative FP offset), not the caller's argument area, so VT_PARAM
+       * would incorrectly add offset_to_args. */
       int spilled_param_flag = 0;
       if ((old_r & VT_PARAM) && interval->incoming_reg0 < 0)
       {
@@ -172,17 +140,45 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
   else if ((sv->vr == -1 || sv->vr == 0 || TCCIR_DECODE_VREG_TYPE(sv->vr) == 0) &&
            (sv->r == -1 || sv->r == PREG_REG_NONE || (old_v >= VT_CONST)))
   {
-    /* No valid vreg and either invalid .r or a constant - preserve important flags.
-     * This handles global symbol references (VT_CONST | VT_SYM) and plain constants. */
+    /* No valid vreg and either invalid .r or a constant — preserve flags.
+     * Handles VT_CONST|VT_SYM (global symbols) and plain constants. */
     int flags = sv->r & (VT_LVAL | VT_SYM);
     sv->r = VT_CONST | flags;
   }
   else if (sv->vr == -1 && old_r == 0 && sv->sym)
   {
-    /* Special case: old_r=0 but has a symbol - this is a function symbol reference
-     * that wasn't marked as VT_CONST. Preserve the symbol. */
+    /* Special case: old_r=0 with a symbol — function symbol ref not marked
+     * VT_CONST. Preserve the symbol. */
     sv->r = VT_CONST | VT_SYM;
   }
+}
+
+/* True if any operand of `q` reads or writes a volatile-qualified local slot.
+ * Used to defeat the store→reload spill-cache peephole for volatile accesses:
+ * each volatile load must reach memory, never reuse a just-stored register. */
+static int ir_codegen_op_touches_volatile(TCCIRState *ir, IRQuadCompact *q)
+{
+  IROperand ops[4];
+  int no = 0;
+  if (irop_config[q->op].has_dest) ops[no++] = tcc_ir_op_get_dest(ir, q);
+  if (irop_config[q->op].has_src1) ops[no++] = tcc_ir_op_get_src1(ir, q);
+  if (irop_config[q->op].has_src2) ops[no++] = tcc_ir_op_get_src2(ir, q);
+  if (q->op == TCCIR_OP_MLA) ops[no++] = tcc_ir_op_get_accum(ir, q);
+  for (int k = 0; k < no; k++)
+  {
+    int32_t vr = irop_get_vreg(ops[k]);
+    if (vr < 0)
+      continue;
+    int t = TCCIR_DECODE_VREG_TYPE(vr);
+    if (t != TCCIR_VREG_TYPE_VAR && t != TCCIR_VREG_TYPE_PARAM)
+      continue;
+    if (!tcc_ir_vreg_is_valid(ir, vr))
+      continue;
+    IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, vr);
+    if (iv && iv->is_volatile)
+      return 1;
+  }
+  return 0;
 }
 
 /* ============================================================================
@@ -197,11 +193,43 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
    * stored to stack since r0-r3 are caller-saved.
    * In both cases, we need to track which register each parameter arrives in.
    */
-  int argno = 0; // current register number (r0-r3)
+  int argno = 0;             // current GPR argument register (r0-r3)
+  unsigned vfp_used = 0;     // bitmap of allocated VFP arg registers s0-s15
+  const int hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && !ir->is_variadic);
   for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
   {
     const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
     IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, encoded_vreg);
+
+    /* Hard-float: scalar float/double parameters arrive in VFP registers
+     * (s0..s15, viewed as d0..d7), consuming an independent bank — not GPR
+     * slots.  Allocation back-fills exactly as tcc_abi_classify_argument does:
+     * a float takes the lowest free s-register, a double the lowest free
+     * even-aligned pair.  incoming_reg0 is marked with LS_VFP_REG_BASE so the
+     * prolog homes it from the right register file. */
+    if (hard_float && interval && interval->is_float && !interval->is_complex &&
+        interval->incoming_reg0 < 0)
+    {
+      const int slots = interval->is_double ? 2 : 1;
+      const int step = slots;
+      int base = -1;
+      for (int cand = 0; cand + slots <= 16; cand += step)
+      {
+        const unsigned mask = (unsigned)((1u << slots) - 1u) << cand;
+        if (!(vfp_used & mask))
+        {
+          vfp_used |= mask;
+          base = cand;
+          break;
+        }
+      }
+      if (base >= 0)
+      {
+        interval->incoming_reg0 = LS_VFP_REG_BASE + base;
+        interval->incoming_reg1 = -1;
+        continue;
+      }
+    }
     /* is_double for soft-float (LS_REG_TYPE_DOUBLE_SOFT) or is_llong for 64-bit
      */
     int is_64bit = interval && (interval->is_double || interval->is_llong || interval->is_complex);
@@ -237,10 +265,9 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
         /* Parameter arrives in registers */
         interval->incoming_reg0 = argno;
         interval->incoming_reg1 = argno + 1;
-        /* NOTE: For leaf functions, the linear scanner has already assigned registers.
-         * Don't overwrite interval->allocation here - it would clobber the correct allocation
-         * with argno (parameter index), which is NOT the same as the physical register number.
-         * The prolog will use incoming_reg0/1 to know which registers the parameter arrives in. */
+        /* Don't overwrite interval->allocation here — it was set by the linear
+         * scanner and argno (param index) is NOT the physical register number.
+         * The prolog uses incoming_reg0/1 to know where the param arrives. */
       }
       else
       {
@@ -256,8 +283,7 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
          */
         if (interval->original_offset == 0)
           interval->original_offset = (argno - 4) * 4;
-        /* See 64-bit case above: do not overwrite allocator spill slots with
-         * caller-stack offsets.
+        /* Don't overwrite allocator spill slots with caller-stack offsets.
          */
         interval->allocation.r0 = PREG_NONE;
         interval->allocation.r1 = PREG_NONE;
@@ -283,8 +309,7 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
          */
         if (interval->original_offset == 0)
           interval->original_offset = (argno - 4) * 4;
-        /* See 64-bit case above: do not overwrite allocator spill slots with
-         * caller-stack offsets.
+        /* Don't overwrite allocator spill slots with caller-stack offsets.
          */
         interval->allocation.r0 = PREG_NONE;
         interval->allocation.r1 = PREG_NONE;
@@ -300,7 +325,7 @@ void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir)
   if (!ir)
     return;
 
-  /* Scan all instructions to find FUNCCALLVAL that produce return values */
+  /* Find FUNCCALLVAL instructions that produce return values */
   for (int i = 0; i < ir->next_instruction_index; ++i)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -324,9 +349,8 @@ void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir)
       interval->incoming_reg1 = -1;
   }
 
-  /* Mark the root source vreg of RETURNVALUE with incoming_reg0=0
-   * as a hint for the post-allocation swap pass. Only at -O1+ to
-   * avoid interfering with -O0 codegen paths that read incoming_reg0. */
+  /* Hint post-allocation swap pass: mark RETURNVALUE's source vreg with
+   * incoming_reg0=0.  Only at -O1+ to avoid interfering with -O0 paths. */
   if (tcc_state->optimize < 1)
     return;
 
@@ -400,12 +424,38 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
 
   uint8_t *is_stack_passed = tcc_mallocz((size_t)param_count);
   int argno = 0;
+  unsigned vfp_used = 0;
+  const int hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && !ir->is_variadic);
   for (int vreg = 0; vreg < param_count; ++vreg)
   {
     const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
     IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, encoded_vreg);
     if (!interval)
       continue;
+
+    /* Hard-float: a scalar float/double param consumes VFP argument slots
+     * (s0..s15), not GPR ones — it is only stack-passed once the VFP bank is
+     * full.  Must mirror tcc_ir_register_allocation_params (same back-filling
+     * rule) or in-register float params get their linear-scan allocation
+     * wrongly reset here and collapse onto a shared stack slot. */
+    if (hard_float && interval->is_float && !interval->is_complex)
+    {
+      const int slots = interval->is_double ? 2 : 1;
+      int base = -1;
+      for (int cand = 0; cand + slots <= 16; cand += slots)
+      {
+        const unsigned mask = (unsigned)((1u << slots) - 1u) << cand;
+        if (!(vfp_used & mask))
+        {
+          vfp_used |= mask;
+          base = cand;
+          break;
+        }
+      }
+      if (base < 0)
+        is_stack_passed[vreg] = 1;
+      continue;
+    }
 
     const int is_64bit = interval->is_double || interval->is_llong;
     if (is_64bit && (argno & 1))
@@ -418,11 +468,9 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
     argno += is_64bit ? 2 : 1;
   }
 
-  /* Rewrite linear-scan results: stack-passed params already have an incoming
-   * memory home (caller arg area), so if the allocator spilled them, drop the
-   * local spill slot. Also force address-taken stack params to remain in
-   * memory (we can use the incoming slot as their addressable home).
-   */
+  /* Rewrite linear-scan results: stack-passed params already have a memory
+   * home (caller arg area), so drop any local spill slot.  Also force
+   * address-taken stack params to remain in memory. */
   for (int i = 0; i < ir->ls.next_interval_index; ++i)
   {
     LSLiveInterval *ls = &ir->ls.intervals[i];
@@ -434,10 +482,9 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
     if (!is_stack_passed[pidx])
       continue;
 
-    /* Stack-passed params live in the caller's argument area. If linear-scan
-     * assigned them a register (without spilling), the prolog won't load them
-     * into that register, causing incorrect code. Always reset r0/r1 to force
-     * them to use the incoming stack location via VT_PARAM path. */
+    /* Stack-passed params live in the caller's argument area.  If linear-scan
+     * assigned them a register (without spilling), the prolog won't load
+     * them — always reset r0/r1 to force use of the incoming stack location. */
     ls->r0 = PREG_NONE;
     ls->r1 = PREG_NONE;
     ls->stack_location = 0;
@@ -517,7 +564,7 @@ void tcc_ir_codegen_cmp_jmp_set(TCCIRState *ir)
 {
   if (ir == NULL)
     return;
-  /* Guard against invalid vtop - can happen with empty structs */
+  /* Guard against invalid vtop (empty structs) */
   extern SValue _vstack[];
   if (vtop < _vstack + 1) /* vstack is defined as (_vstack + 1) */
     return;
@@ -538,7 +585,7 @@ void tcc_ir_codegen_cmp_jmp_set(TCCIRState *ir)
 
     if (jtrue >= 0 || jfalse >= 0)
     {
-      /* We have pending jump chains - need to merge them with the comparison */
+      /* Merge pending jump chains with the comparison */
       SValue jump_dest;
       svalue_init(&jump_dest);
       jump_dest.vr = -1;
@@ -672,22 +719,19 @@ int tcc_ir_codegen_test_gen(TCCIRState *ir, int invert, int test)
     svalue_init(&dest);
     src.vr = -1;
     src.r = VT_CONST;
-    /* Use cmp_op and invert if needed. In TCC, comparison tokens are designed
-     * so that XORing with 1 inverts them (e.g., TOK_EQ ^ 1 = TOK_NE) */
+    /* TCC comparison tokens: XORing with 1 inverts (e.g. TOK_EQ ^ 1 = TOK_NE) */
     int cond = vtop->cmp_op ^ invert;
-    /* Validate condition is a valid comparison token */
     src.c.i = cond;
     dest.vr = -1;
     dest.r = VT_CONST; /* Mark as constant so jump target is stored in u.imm32 */
     dest.c.i = test;
     test = tcc_ir_put(ir, TCCIR_OP_JUMPIF, &src, NULL, &dest);
 
-    /* Handle pending jump chains - merge with the appropriate chain */
+    /* Handle pending jump chains */
     if (invert)
     {
-      /* inv=1: we want to jump when condition is false */
-      /* Merge any existing "jump-on-false" chain with the new jump.
-       * Patch the opposite chain (jump-on-true) to fall through here. */
+      /* inv=1: jump when condition is false — merge "jump-on-false" chain,
+       * patch "jump-on-true" to fall through. */
       if (jfalse >= 0)
       {
         tcc_ir_backpatch_first(ir, jfalse, test);
@@ -700,9 +744,8 @@ int tcc_ir_codegen_test_gen(TCCIRState *ir, int invert, int test)
     }
     else
     {
-      /* inv=0: we want to jump when condition is true */
-      /* Merge any existing "jump-on-true" chain with the new jump.
-       * Patch the opposite chain (jump-on-false) to fall through here. */
+      /* inv=0: jump when condition is true — merge "jump-on-true" chain,
+       * patch "jump-on-false" to fall through. */
       if (jtrue >= 0)
       {
         tcc_ir_backpatch_first(ir, jtrue, test);
@@ -870,13 +913,12 @@ static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
   uint8_t clobber_regs[NB_ASM_REGS];
   memcpy(clobber_regs, ia->clobber_regs, sizeof(clobber_regs));
 
-  /* Compute reserved_regs: physical registers of vregs that are live at this
-   * INLINE_ASM instruction but are NOT asm operands.  The constraint solver
-   * must avoid these registers when picking registers for "r" constraints,
-   * otherwise the operand load will clobber the live value.
+  /* Compute reserved_regs: physical registers of live vregs that are NOT
+   * asm operands.  The constraint solver must avoid these when picking "r"
+   * constraints, otherwise operand loads clobber live values.
    *
    * Unlike clobber_regs, reserved_regs only affect constraint allocation —
-   * they do NOT trigger save/restore in asm_gen_code prolog/epilog. */
+   * they don't trigger save/restore in asm prolog/epilog. */
   uint8_t reserved_regs[NB_ASM_REGS];
   memset(reserved_regs, 0, sizeof(reserved_regs));
   {
@@ -920,21 +962,16 @@ static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
       }
     }
 
-    /* Asm operands themselves are allowed to reuse their currently assigned
-     * physical registers.  Only non-operand live values need to remain
-     * reserved from the constraint solver.  Without this, an inline asm that
-     * already has several live register operands can spuriously run out of
-     * allocatable "r" registers in IR mode. */
+    /* Asm operands can reuse their assigned physical registers.  Only non-
+     * operand live values need to remain reserved — otherwise inline asm with
+     * several live register operands spuriously runs out of allocatable "r"
+     * registers. */
     for (int i = 0; i < nb_operands; ++i)
     {
-      /* For an lvalue operand such as "+r"(*p), pr0_reg holds the ADDRESS of
-       * the value (the pointer), not the value itself.  That pointer is read
-       * both by the prolog load (ldr op->reg,[ptr]) and the epilog store
-       * (str op->reg,[ptr]), so it must survive across the asm body.  If we
-       * un-reserved it, the constraint solver could pick the same register
-       * for op->reg, and the prolog load would clobber the pointer before the
-       * store ran.  Keep lvalue-operand registers reserved so the value gets a
-       * distinct register. */
+      /* For lvalue operands like "+r"(*p), pr0_reg holds the ADDRESS (pointer),
+       * not the value.  That pointer is read by both prolog load and epilog
+       * store, so it must survive across the asm body.  Keep lvalue-operand
+       * registers reserved so the value gets a distinct register. */
       if (vals[i].r & VT_LVAL)
         continue;
       if (!vals[i].pr0_spilled && vals[i].pr0_reg != PREG_REG_NONE && vals[i].pr0_reg < NB_ASM_REGS)
@@ -983,10 +1020,9 @@ static void tcc_ir_codegen_backpatch_jumps(TCCIRState *ir, uint32_t *ir_to_code_
 
   /* Backpatch switch table entries.
    * Table entries are 32-bit signed PC-relative offsets with Thumb bit.
-   * The reference point is table_start, which is the PC value when
-   * the 16-bit ADD Rt, PC instruction at ind+10 reads PC (= ind+10+4 = ind+14 = table_start).
+   * Reference point is table_start (PC at the 16-bit ADD Rt,PC instruction).
    * Formula: table[i] = (target_addr | 1) - table_start
-   * This must happen after all code is generated so forward targets are mapped. */
+   * Must happen after all code is generated so forward targets are mapped. */
   for (int t = 0; t < ir->num_switch_tables; t++)
   {
     TCCIRSwitchTable *table = &ir->switch_tables[t];
@@ -1013,19 +1049,14 @@ static void tcc_ir_codegen_backpatch_jumps(TCCIRState *ir, uint32_t *ir_to_code_
  * Phase-3 scratch conflict fixup
  * ============================================================================
  *
- * After the dry run has identified which instructions would push a register
- * to the stack (no free scratch register available), this function tries to
- * move the vreg currently occupying that register to a free callee-saved
- * register.  This eliminates the push/pop overhead for those instructions.
+ * After the dry run identifies instructions that would push a register
+ * (no free scratch available), this function tries to move the vreg
+ * currently occupying that register to a free callee-saved register.
+ * This eliminates the push/pop overhead.
  *
- * Parameters:
- *   ir     - current function IR state
- *   r      - physical register that would be pushed at instruction insn_i
- *   insn_i - the instruction index where the push was noted
- *
- * Returns the new physical register on success, -1 if no reassignment could
- * be made (e.g. all callee-saved registers are already occupied over the
- * vreg's live range, or the interval is complex / 64-bit / float).
+ * Returns the new physical register on success, -1 if no reassignment
+ * could be made (e.g. all callee-saved registers occupied over the vreg's
+ * live range, or the interval is complex / 64-bit / float).
  */
 static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
 {
@@ -1033,12 +1064,9 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
 
   /* Callee-saved registers R4-R11 (bits 4..11 = 0x0FF0), minus reserved
    * special-purpose registers:
-   *   R7  = R_FP (= 7): always reserved as frame pointer by the ARM backend.
-   *     arm-thumb-gen.c: "Always reserve R7 (FP) and never allocate it as a
-   *     general register."  The linear-scan allocator never assigns vregs to R7,
-   *     so it never appears in live_regs_by_instruction.  We must exclude it
-   *     here as well, otherwise we would clobber the frame pointer.
+   *   R7  = R_FP (= 7): always reserved as frame pointer.
    *   R10 = static_chain_reg (= 10): reserved when function uses a static chain.
+   *   R9: reserved when text_and_data_separation (GOT base).
    */
   const uint32_t ALL_CALLEE_SAVED = 0x0FF0u;
   const uint32_t ARM_FP_REG = 7u;         /* R_FP = R7, defined in thumb.h */
@@ -1046,32 +1074,15 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
   uint32_t reserved = (1u << ARM_FP_REG); /* always exclude frame pointer */
   if (tcc_state->text_and_data_separation)
     reserved |= (1u << ARM_R9); /* R9 holds GOT base — must not be clobbered */
-  if (ir->has_static_chain)
+  if (ir->has_static_chain || ir->emits_set_chain)
     reserved |= (1u << (uint32_t)architecture_config.static_chain_reg);
   const uint32_t CALLEE_SAVED = ALL_CALLEE_SAVED & ~reserved;
 
   /* Find the LSLiveInterval holding r at instruction insn_i. */
-  LSLiveInterval *ls_iv = NULL;
-  for (int k = 0; k < ls->next_interval_index; k++)
-  {
-    LSLiveInterval *iv = &ls->intervals[k];
-    /* Only handle plain integer register allocations. */
-    if (iv->reg_type != LS_REG_TYPE_INT)
-      continue;
-    if (iv->addrtaken || iv->stack_location != 0)
-      continue;
-    /* Skip 64-bit pairs — they need two adjacent registers. */
-    if (iv->r1 >= 0 && iv->r1 < 16)
-      continue;
-    if (iv->r0 != r)
-      continue;
-    if ((int)iv->start > insn_i || (int)iv->end < insn_i)
-      continue;
-    ls_iv = iv;
-    break;
-  }
-  if (!ls_iv)
+  int holder = tcc_ls_find_int_reg_holder(ls, r, insn_i);
+  if (holder < 0)
     return -1;
+  LSLiveInterval *ls_iv = &ls->intervals[holder];
 
   /* Get the IRLiveInterval for the same vreg to check for float/double/llong. */
   IRLiveInterval *ir_iv = tcc_ir_get_live_interval(ir, (int)ls_iv->vreg);
@@ -1140,15 +1151,192 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
   return new_r;
 }
 
+/* How many allocatable registers the fixup has freed at one instruction, i.e.
+ * how many extra scratch registers the real run will find there compared to
+ * the dry run that recorded the save.  R7 (frame pointer), SP and PC are never
+ * handed out as scratch, so they must not count. */
+static int ir_codegen_regs_freed_at(uint32_t orig_live, uint32_t live_now)
+{
+  const uint32_t allocatable = 0x1F7Fu; /* R0-R6, R8-R12 */
+  return __builtin_popcount(orig_live & ~live_now & allocatable);
+}
+
+/* ============================================================================
+ * Phase-3 scratch conflict fixup, last resort: demote the blocker to memory
+ * ============================================================================
+ *
+ * try_reassign_scratch_conflict() can only move the blocking vreg to another
+ * register.  When every register is occupied across the blocker's whole live
+ * range there is nowhere to move it, and the real run then pays a
+ * save/use/restore round trip (STR + LDR, plus the reload of anything the
+ * scratch clobbered) at EVERY instruction in that window.
+ *
+ * 20041011-1 is the pathological case: 30 volatile ints copied in and out
+ * inside a loop.  The allocator hands out all 10 free registers, so the
+ * remaining 20 copies each cost 7 instructions instead of 2 — the scratch
+ * machinery spends 4 of them saving and restoring the two registers it
+ * borrows, and the third is a literal-pool reload of the global's address
+ * that only exists because the borrow invalidated the cached copy.
+ *
+ * Spilling ONE such blocker outright turns its register into a permanently
+ * free scratch for the whole window.  The value then costs one memory access
+ * per reference, which is cheaper than two per blocked instruction as soon as
+ * the window is wider than the vreg's use count.
+ *
+ * Returns the demoted vreg on success, -1 when nothing could be demoted.  The
+ * caller assigns the stack slot afterwards (the frame's low areas have not
+ * been laid out yet at this point), so the interval is left marked with
+ * DEMOTE_PENDING_SLOT until then.
+ */
+#define DEMOTE_PENDING_SLOT 1 /* non-zero placeholder; frame offsets are negative */
+
+static int try_demote_scratch_conflict(TCCIRState *ir, int r, int insn_i, const uint16_t *dry_insn_saves,
+                                       const int *dry_insn_scratch, int n_insns)
+{
+  LSLiveIntervalState *ls = &ir->ls;
+
+  static int disabled = -1;
+  if (disabled < 0)
+    disabled = getenv("TCC_NO_SCRATCH_DEMOTE") ? 1 : 0;
+  if (disabled)
+    return -1;
+
+  int holder = tcc_ls_find_int_reg_holder(ls, r, insn_i);
+  if (holder < 0)
+    return -1;
+  LSLiveInterval *ls_iv = &ls->intervals[holder];
+
+  /* Already memory-backed, or part of a graph-coalesced class whose copies
+   * were erased on the assumption that both ends share this register. */
+  if (ls_iv->stack_location != 0 || ls_iv->addrtaken || ls_iv->co_member)
+    return -1;
+  if (ls_iv->reg_type != LS_REG_TYPE_INT || ls_iv->r1 >= 0)
+    return -1;
+
+  IRLiveInterval *ir_iv = tcc_ir_get_live_interval(ir, (int)ls_iv->vreg);
+  if (!ir_iv)
+    return -1;
+  if (ir_iv->is_float || ir_iv->is_double || ir_iv->is_llong || ir_iv->is_complex || ir_iv->use_vfp)
+    return -1;
+  /* ABI-pinned (parameter / call result) and phi-pinned intervals must keep
+   * the register the surrounding code already committed to. */
+  if (ir_iv->incoming_reg0 >= 0 || ir_iv->phi_pinned || ir_iv->addrtaken)
+    return -1;
+  if (ir_iv->allocation.offset != 0)
+    return -1;
+  if (ir_iv->allocation.r0 != (uint16_t)r)
+    return -1;
+  /* A rematerializable constant is reloaded with a MOV, never from memory —
+   * demoting it frees the register without any memory traffic, but it also
+   * cannot be the thing that makes an instruction need scratch. Leave it. */
+  if (ir_iv->remat_kind != 0)
+    return -1;
+
+  const int start = (int)ls_iv->start;
+  const int end = (int)ls_iv->end;
+  if (start < 0 || end < start || end >= n_insns)
+    return -1;
+
+  /* The register must be held by this interval ALONE over its whole range.
+   * A second claimant means move coalescing put a copy's two ends on the same
+   * register and erased the copy; demoting one end would drop the value. */
+  for (int k = 0; k < ls->next_interval_index; k++)
+  {
+    const LSLiveInterval *other = &ls->intervals[k];
+    if (other == ls_iv || other->stack_location != 0)
+      continue;
+    if (other->r0 != r && other->r1 != r)
+      continue;
+    if ((int)other->start <= end && (int)other->end >= start)
+      return -1;
+  }
+
+  /* Benefit: every instruction inside the range that the dry run had to save
+   * r at stops paying STR+LDR (2 instructions).  Cost: one memory access per
+   * reference to the vreg.
+   *
+   * An instruction that references the vreg does NOT count as benefit: after
+   * the demotion it still needs a register there, to hold the reloaded value,
+   * so the borrow does not go away — it only changes what it is for.  Counting
+   * those was what made 920928-2::g look like a 6-instruction win when it was
+   * a 6-instruction loss (every blocked instruction was also a reference). */
+  int blocked = 0;
+  int refs = 0;
+  for (int j = start; j <= end; j++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    int here = 0;
+    if (q->op != TCCIR_OP_NOP)
+    {
+      if (irop_config[q->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == (int)ls_iv->vreg)
+        here++;
+      if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == (int)ls_iv->vreg)
+        here++;
+      if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == (int)ls_iv->vreg)
+        here++;
+    }
+    refs += here;
+    if (here || !(dry_insn_saves[j] & (1u << (unsigned)r)))
+      continue;
+    /* dry_insn_saves is a pass-0 prediction made before the reassignment
+     * fixups above (and any earlier demotion) ran.  Only count j when the real
+     * run will still come up short of scratch registers there — otherwise the
+     * predicted save never happens and the demotion buys nothing (920928-2::g:
+     * six predicted saves, none real, six extra reloads of a pointer that had
+     * been sitting in R0).  The comparison is against how many scratch
+     * registers the instruction wants, not against zero: an instruction that
+     * borrows two still pays for the second when only one is free. */
+    if (ls->live_regs_by_instruction && j < ls->live_regs_by_instruction_size)
+    {
+      uint32_t free_now = ~ls->live_regs_by_instruction[j] & 0x1F7Fu & ~(1u << (unsigned)r);
+      if (__builtin_popcount(free_now) >= dry_insn_scratch[j])
+        continue;
+    }
+    blocked++;
+  }
+  /* Demanding a real window, not a one-off blip: freeing the register is not
+   * guaranteed to remove the save (the instruction may want two scratches, or
+   * the borrow may be excluded by the operands), while the added memory
+   * traffic is certain.  Below this width the model is not reliable enough —
+   * every corpus regression measured came from a 2-instruction window. */
+  if (blocked < 4)
+    return -1;
+  /* The +4 margin covers the reload's own scratch needs and the saves that
+   * freeing a single register does not remove. */
+  if (2 * blocked <= refs + 4)
+    return -1;
+
+  if (tcc_state && tcc_state->verbose)
+    fprintf(stderr, "[phase3-demote] insn=%d vreg=%d R%d -> memory (blocked=%d refs=%d range=%d..%d)\n", insn_i,
+            (int)ls_iv->vreg, r, blocked, refs, start, end);
+
+  /* --- Apply the demotion.  The real slot is assigned by the caller. --- */
+  ls_iv->r0 = -1;
+  ls_iv->stack_location = DEMOTE_PENDING_SLOT;
+  ir_iv->allocation.r0 = PREG_SPILLED | PREG_REG_NONE;
+  ir_iv->allocation.r1 = PREG_NONE;
+  ir_iv->allocation.offset = DEMOTE_PENDING_SLOT;
+
+  /* No other interval claims r over [start, end] (checked above), so the whole
+   * window can be released unconditionally. */
+  if (ls->live_regs_by_instruction)
+  {
+    for (int j = start; j <= end && j < ls->live_regs_by_instruction_size; j++)
+      ls->live_regs_by_instruction[j] &= ~(1u << (unsigned)r);
+  }
+
+  return (int)ls_iv->vreg;
+}
+
 /* ============================================================================
  * Helper: sub-component fixup for register-pair operands used as LOAD/STORE
- * sources.  When a local STACKOFF operand accesses a sub-component of a 64-bit
- * pair (e.g., __imag__ on _Complex float), the original operand's byte offset
- * differs from the interval's base offset.  In that case, rewrite the
- * MachineOperand to use r1 (second register of the pair) instead of r0.
+ * sources.  When a STACKOFF operand accesses a sub-component of a 64-bit
+ * pair (e.g., __imag__ on _Complex float), the byte offset differs from the
+ * interval's base offset.  Rewrite the MachineOperand to use r1 instead of
+ * r0.
  *
- * This MUST NOT be applied to DP/ASSIGN operands — a 64-bit pair allocated as
- * a register pair can also have a non-zero delta, but that is not a
+ * MUST NOT be applied to DP/ASSIGN operands — a 64-bit pair allocated as a
+ * register pair can also have a non-zero delta, but that is not a
  * sub-component access.
  * ============================================================================ */
 static void mop_fixup_subcomponent(MachineOperand *mop, const IROperand *op, TCCIRState *ir)
@@ -1171,8 +1359,8 @@ static void mop_fixup_subcomponent(MachineOperand *mop, const IROperand *op, TCC
 }
 
 /* Check whether any live interval (other than skip_vreg) is allocated to
- * physical register `reg` and overlaps the range [start, end].  Returns
- * true if a conflict exists, meaning we cannot reassign skip_vreg to `reg`. */
+ * physical register `reg` and overlaps [start, end].  Returns true if a
+ * conflict exists, meaning we cannot reassign skip_vreg to `reg`. */
 static bool ir_reg_conflict(const TCCIRState *ir, int reg, uint32_t start, uint32_t end, int skip_vreg)
 {
   const struct
@@ -1212,14 +1400,13 @@ static bool ir_reg_conflict(const TCCIRState *ir, int reg, uint32_t start, uint3
 /* ============================================================================
  * Pre-prologue FUNCPARAMVAL allocation patching
  *
- * When a LOAD/LOAD_INDEXED/LOAD_POSTINC/ASSIGN produces a value that is
- * immediately consumed by FUNCPARAMVAL (param 0..3), the codegen peephole
- * would load directly into the ABI register (R0-R3) instead of the
- * allocator-assigned register.  If the allocator assigned a callee-saved
- * register, it becomes a ghost save.
+ * When a LOAD/LOAD_INDEXED/LOAD_POSTINC/ASSIGN produces a value immediately
+ * consumed by FUNCPARAMVAL (param 0..3), the codegen peephole loads directly
+ * into the ABI register (R0-R3) instead of the allocator-assigned register.
+ * If the allocator assigned a callee-saved register, it becomes a ghost save.
  *
  * This pre-pass patches those allocations BEFORE prologue emission so that
- * dirty_registers can be recomputed accurately.  It mirrors the logic in
+ * dirty_registers can be recomputed accurately.  Mirrors the logic in
  * ir_codegen_before_ret_peephole's FUNCPARAMVAL branch, but only patches
  * allocations (no MachineOperand output needed).
  * ============================================================================ */
@@ -1310,7 +1497,7 @@ static void ir_codegen_pre_patch_funcparam_allocations(TCCIRState *ir)
  *
  * After peephole/pre-patch optimizations change IRLiveInterval.allocation,
  * the allocator's dirty_registers bitmap may contain callee-saved registers
- * that are no longer referenced by any interval.  Rebuild from ground truth.
+ * no longer referenced by any interval.  Rebuild from ground truth.
  * ============================================================================ */
 static void ir_codegen_recompute_dirty_from_allocations(TCCIRState *ir)
 {
@@ -1348,7 +1535,7 @@ static void ir_codegen_recompute_dirty_from_allocations(TCCIRState *ir)
  * Before-Return Peephole
  *
  * When a LOAD, LOAD_INDEXED, or ASSIGN is immediately followed by a
- * RETURNVALUE on the same vreg (with no intervening jump target), patch the
+ * RETURNVALUE on the same vreg (no intervening jump target), patch the
  * dest vreg's allocation to R0 (R0+R1 for 64-bit) and construct a synthetic
  * MACH_OP_REG MachineOperand.  This eliminates the extra move that
  * RETURNVALUE would otherwise emit.
@@ -1363,13 +1550,12 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
   if (dest_vr < 0)
     return false;
 
-  /* Find the next non-NOP instruction, skipping over dead code.
-   * NOPs are skipped regardless of is_jump_target — a branch landing on
-   * a NOP falls through without affecting register state, so the peephole
-   * assumption ("instruction i's result flows to j") remains valid.
-   * Only check is_jump_target on the actual consumer (non-NOP) — if a
-   * branch can reach it without executing instruction i, the peephole
-   * would produce wrong code. */
+  /* Find the next non-NOP instruction.  NOPs are skipped regardless of
+   * is_jump_target — a branch landing on a NOP falls through without
+   * affecting register state, so the peephole assumption ("instruction i's
+   * result flows to j") remains valid.  Only check is_jump_target on the
+   * actual consumer (non-NOP) — if a branch can reach it without executing
+   * instruction i, the peephole would produce wrong code. */
   int j = i + 1;
   while (j < ir->next_instruction_index)
   {
@@ -1414,9 +1600,9 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
     return true;
   }
 
-  /* Peephole: when the next instruction is an ASSIGN that just copies our dest
+  /* Peephole: when the next instruction is an ASSIGN copying our dest
    * vreg into another register, load directly into the ASSIGN's destination.
-   * This eliminates "ldr rT, [pc,#imm]; mov rD, rT" sequences.
+   * Eliminates "ldr rT, [pc,#imm]; mov rD, rT" sequences.
    *
    * Safety: the dest vreg must die at the ASSIGN (end == i+1), ensuring no
    * other instruction reads the old allocation. */
@@ -1480,7 +1666,7 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
 
   /* Peephole: when the next non-NOP instruction is FUNCPARAMVAL using our dest
    * vreg as a 32-bit scalar argument, load directly into the parameter register
-   * (R0+param_index).  This eliminates "ldr rT, ...; mov r0, rT" sequences
+   * (R0+param_index).  Eliminates "ldr rT, ...; mov r0, rT" sequences
    * generated when a SELECT/LOAD result feeds a function call parameter.
    *
    * Only applies to simple 32-bit scalar arguments (param_index 0..3). */
@@ -1611,12 +1797,8 @@ static inline void ir_codegen_track_scratch(int is_dry_run, int i, TccIrOp op, i
  * skipped NOP between `i` and the partner is a branch target: fusing `i` and
  * the partner into a single instruction is illegal if a branch can land on that
  * NOP, because the partner would then be reachable without executing `i` (and
- * vice-versa).  This is the ternary-merge case where both arms store to
- * adjacent spill slots — the merge NOP sits between the true-arm store and the
- * post-merge store (signed fuzz seed 2987, O0 HardFault: the fused STRD landed
- * on the true-arm path only, so the false arm both mis-stored and left the
- * merge label with no code address -> `b.w 0`).  branch_target_reset[] catches
- * targets that the is_jump_target bit misses at -O0. */
+ * vice-versa).  branch_target_reset[] catches targets that is_jump_target
+ * misses at -O0. */
 static int ir_codegen_next_nonnop_no_label(TCCIRState *ir, const uint8_t *branch_target_reset, int i)
 {
   for (int j = i + 1; j < ir->next_instruction_index; j++)
@@ -1631,6 +1813,31 @@ static int ir_codegen_next_nonnop_no_label(TCCIRState *ir, const uint8_t *branch
     return j;
   }
   return -1;
+}
+
+/* True if idx is an ASSIGN/LOAD copy that materialises to a physical self-move
+ * (src and dst the same hw register), which the assign/load codegen elides to
+ * no code — so it can be scanned over between a flag-setting op and its
+ * consuming branch without disturbing the flags.  Same identity-move idiom the
+ * STRD-fusion scan uses (ir/codegen.c). */
+static int ir_codegen_is_identity_move(TCCIRState *ir, int idx)
+{
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD)
+    return 0;
+  IROperand s = tcc_ir_op_get_src1(ir, q);
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  if (d.tag != IROP_TAG_VREG || d.is_lval)
+    return 0;
+  if (!(s.tag == IROP_TAG_VREG || (s.tag == IROP_TAG_STACKOFF && s.is_local)))
+    return 0;
+  if (s.is_llocal || s.is_sym)
+    return 0;
+  MachineOperand sm = machine_op_from_ir(ir, &s);
+  MachineOperand dm = machine_op_from_ir(ir, &d);
+  return sm.kind == MACH_OP_REG && dm.kind == MACH_OP_REG &&
+         !sm.needs_deref && !dm.needs_deref &&
+         sm.u.reg.r0 == dm.u.reg.r0 && sm.u.reg.r0 >= 0;
 }
 
 static int ir_codegen_count_vreg_uses(TCCIRState *ir, int32_t vreg)
@@ -1665,8 +1872,7 @@ static int ir_codegen_count_vreg_uses(TCCIRState *ir, int32_t vreg)
  * ALL operand slots including the (lval) dest of a STORE, because the
  * live-interval `end` can under-approximate cross-block / loop-back-edge uses
  * and let the fusion fire on a strided struct store (base+idx*odd instead of
- * base+idx*C) — a misaligned store that smashes the heap (00_assignment
- * auto-PCH fault; 02-08 self-host cfg->blocks smash). */
+ * base+idx*C) — a misaligned store that smashes the heap. */
 static int ir_codegen_vreg_used_elsewhere(TCCIRState *ir, int32_t vreg, int def_idx, int use_idx)
 {
   if (vreg < 0)
@@ -1716,7 +1922,7 @@ static void tcc_ir_debug_codegen_generate_entry(TCCIRState *ir)
  *
  * MopSpec encodes which MachineOperands to extract for a given IR instruction.
  * decode_mop_args() performs all machine_op_from_ir / peephole / fixup calls
- * once, returning a MopArgs struct.  Switch cases then just forward to the
+ * once, returning a MopArgs struct.  Switch cases then forward to the
  * appropriate backend function with the pre-decoded args.
  *
  * dest modes: 0 = none, 1 = normal, 2 = with before-return peephole
@@ -1795,8 +2001,7 @@ static inline MopArgs ir_decode_cached(int is_dry_run, int use_mop_cache, MopArg
    * ASSIGN's dest was only retargeted to a register later in the dry-run
    * fires the coalesce peephole in the real-run only, retargeting the load
    * while every cached consumer still reads the source's pre-patch register
-   * (ptr fuzz seed 30436: `ldr r8, [...]` immediately clobbered by the
-   * stale-cache copy `mov r8, ip`). */
+   * (ptr fuzz seed 30436: `ldr r8, [...]` clobbered by stale-cache `mov r8, ip`). */
   if (!is_dry_run && use_mop_cache)
   {
     MopArgs cached = mop_cache[i];
@@ -1874,8 +2079,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
    * PRE-SCAN: Compute maximum outgoing call stack argument size
    * ============================================================================
    * Scan all FUNCCALLVAL/FUNCCALLVOID instructions to find the maximum stack
-   * argument area needed across all calls.  This allows us to pre-reserve the
-   * area in the frame and avoid dynamic SP adjustments at each call site.
+   * argument area needed across all calls.  Pre-reserve the area in the
+   * frame to avoid dynamic SP adjustments at each call site.
    */
   {
     int max_outgoing = 0;
@@ -2125,6 +2330,26 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   {
     extra_prologue_regs |= (1 << architecture_config.static_chain_reg);
   }
+  else
+  {
+    /* A PARENT that calls its nested functions writes R10 at the call site
+     * (SET_CHAIN / INIT_CHAIN_SLOT pass the chain = its own FP).  R10 is
+     * AAPCS callee-saved, so the parent's own caller may keep a live value
+     * there — tccasm's asm_instr held nb_labels in R10 while
+     * parse_asm_operands called ITS nested helper, and every asm inside a
+     * nested function died with "invalid asm label count".  Put R10 in the
+     * prologue save mask whenever the body emits a chain write. */
+    for (int ci = 0; ci < ir->next_instruction_index; ci++)
+    {
+      int cop = ir->compact_instructions[ci].op;
+      if (cop == TCCIR_OP_SET_CHAIN || cop == TCCIR_OP_INIT_CHAIN_SLOT)
+      {
+        ir->emits_set_chain = 1;
+        extra_prologue_regs |= (1 << architecture_config.static_chain_reg);
+        break;
+      }
+    }
+  }
 
   /* Phase-3 per-instruction scratch constraint recording.
    * Allocated once per function; indexed by instruction index.
@@ -2135,6 +2360,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   uint16_t *dry_insn_saves = tcc_mallocz(ir->next_instruction_index * sizeof(uint16_t));
   ir->codegen_dry_insn_scratch = dry_insn_scratch;
   ir->codegen_dry_insn_saves = dry_insn_saves;
+
+  /* Vregs the phase-3 fixup demoted from a register to memory (see
+   * try_demote_scratch_conflict).  Their stack slots are carved out of the
+   * frame together with the scratch save area, after the dry run settles. */
+  int demoted_vregs[4];
+  int demoted_count = 0;
 
   /* ============================================================================
    * OPTION A: Skip dry-run for scratch-conflict-free functions
@@ -2151,21 +2382,44 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
    *   - Branch optimizer falls back to 32-bit encodings for all branches
    *     (2 bytes wasted per branch; acceptable tradeoff).
    * ============================================================================ */
-  const int can_skip_dry_run =
+  /* The dry run used to have one consumer — scratch accounting — so it was
+   * skipped whenever enough registers were provably free that no scratch push
+   * could occur.  Forward-branch narrowing is a second consumer: it needs the
+   * rehearsal's address map to size a branch whose target is not emitted yet.
+   * Skipping costs 2 bytes per forward branch, which measured at ~2% of .text
+   * across the torture corpus, against no measurable compile-time saving (the
+   * dry passes emit no bytes).  So any function with a forward branch runs
+   * them; straight-line functions keep the old fast path. */
+  int has_forward_branch = 0;
+  for (int bi = 0; bi < ir->next_instruction_index && !has_forward_branch; bi++)
+  {
+    IRQuadCompact *bq = &ir->compact_instructions[bi];
+    if (bq->op != TCCIR_OP_JUMP && bq->op != TCCIR_OP_JUMPIF)
+      continue;
+    IROperand bdest = tcc_ir_op_get_dest(ir, bq);
+    if (irop_is_none(bdest))
+      continue;
+    if ((int)bdest.u.imm32 > bi)
+      has_forward_branch = 1;
+  }
+
+  int can_skip_dry_run =
+      !has_forward_branch &&
       __builtin_popcountll(ir->ls.dirty_registers) <= (unsigned)(tcc_state->registers_for_allocator - 2) &&
       __builtin_popcountll(ir->ls.dirty_float_registers) <= (unsigned)(tcc_state->float_registers_for_allocator - 2);
 
   if (can_skip_dry_run)
   {
-    /* When FP is omitted and the dry run is skipped, allocate a safety-net
-     * scratch save area.  Even with few dirty registers, exclude_regs can
-     * make all free registers unavailable for scratch, forcing a PUSH that
-     * would break SP-relative addressing.  The area costs only 8 bytes of
-     * stack and allows get_scratch_reg_with_save() to use STR/LDR.
-     *
-     * Skip when the function has no SP-relative accesses at all: no locals,
-     * no spills, no outgoing args (stack_size == 0), AND no stack-passed
-     * parameters (whose offsets are also SP-relative via offset_to_args). */
+    /* When FP is omitted and the dry run is skipped, get_scratch_reg_with_save()
+     * has no reserved save area, and a PUSH fallback would move SP under
+     * SP-relative addressing.  The old answer was a conservative 16-byte
+     * reservation whenever a scratch-capable op or a stack param was present —
+     * measured at 367 corpus functions carrying a fully-dead frame (the saves
+     * almost never happen).  New answer: those functions run the dry-run
+     * passes instead, which discover the ACTUAL max scratch depth and size the
+     * area exactly (usually zero).  The dry passes emit no bytes and measured
+     * no compile-time cost when forward-branch functions were routed through
+     * them; straight-line scratch-free functions still take the fast path. */
     int has_stack_params = 0;
     for (int p = 0; p < ir->next_parameter; p++)
     {
@@ -2175,7 +2429,15 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         break;
       }
     }
-    if (!tcc_state->need_frame_pointer && !tcc_state->force_frame_pointer && (stack_size > 0 || has_stack_params))
+    /* A nested-call save reservation on this path is sized purely from the
+     * over-approximated static liveness; the dry run sizes it exactly and
+     * usually to zero.  Demote those functions too. */
+    if (!tcc_state->need_frame_pointer && !tcc_state->func_dynamic_sp &&
+        ir->call_nested_save_size > 0)
+      can_skip_dry_run = 0;
+
+    if (can_skip_dry_run &&
+        !tcc_state->need_frame_pointer && !tcc_state->force_frame_pointer && (stack_size > 0 || has_stack_params))
     {
       /* Scratch save area is a safety net for get_scratch_reg_with_save()
        * paths that PUSH/STR into the area when no free register is found.
@@ -2256,44 +2518,26 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         might_need_scratch = 1;
 
       if (might_need_scratch)
-      {
-        ir->scratch_save_size = 16; /* 4 slots — 64-bit ops on 32-bit ARM can need 3+ simultaneous scratch saves */
-        loc -= ir->scratch_save_size;
-        /* The outgoing call-arg area must stay at the very bottom of the
-         * frame (stack args are stored at literal [SP, #stack_off]), and the
-         * nested-call save area (R0-R3/R9 saves around calls) is addressed
-         * literally at [SP + call_outgoing_size + n*4] directly above it.
-         * The scratch area must therefore sit ABOVE BOTH: putting it lower
-         * maps scratch saves onto already-written argument slots or onto the
-         * saved R9/GOT base (restoring r9 = scratch garbage after the call). */
-        if (ir->call_outgoing_size > 0 || ir->call_nested_save_size > 0)
-        {
-          ir->call_outgoing_base = loc;
-          ir->call_nested_save_base = loc + ir->call_outgoing_size;
-          ir->scratch_save_base = loc + ir->call_outgoing_size + ir->call_nested_save_size;
-        }
-        else
-        {
-          ir->scratch_save_base = loc;
-        }
-        stack_size = (-loc + 7) & ~7;
-      }
+        can_skip_dry_run = 0; /* dry run sizes the scratch area exactly */
     }
 
-    /* Mirror the dry-run finalisation: init branch opt (sets 32-bit fallback),
-     * reset scratch/spill/fp state, then emit prologue immediately. */
-    tcc_gen_machine_branch_opt_init();
-    tcc_gen_machine_reset_scratch_state();
-    tcc_ir_spill_cache_clear(&ir->spill_cache);
-    tcc_ir_opt_fp_cache_clear(ir);
-    /* Pre-patch allocations for FUNCPARAMVAL fusion, then trim ghost
-     * callee-saved registers from dirty_registers before prologue. */
-    ir_codegen_pre_patch_funcparam_allocations(ir);
-    ir_codegen_recompute_dirty_from_allocations(ir);
-    if (!ir->naked)
-      tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size, extra_prologue_regs);
-    if (!ir->naked)
-      tcc_debug_prolog_epilog(tcc_state, 0);
+    if (can_skip_dry_run)
+    {
+      /* Mirror the dry-run finalisation: init branch opt (sets 32-bit fallback),
+       * reset scratch/spill/fp state, then emit prologue immediately. */
+      tcc_gen_machine_branch_opt_init();
+      tcc_gen_machine_reset_scratch_state();
+      tcc_ir_spill_cache_clear(&ir->spill_cache);
+      tcc_ir_opt_fp_cache_clear(ir);
+      /* Pre-patch allocations for FUNCPARAMVAL fusion, then trim ghost
+       * callee-saved registers from dirty_registers before prologue. */
+      ir_codegen_pre_patch_funcparam_allocations(ir);
+      ir_codegen_recompute_dirty_from_allocations(ir);
+      if (!ir->naked)
+        tcc_gen_machine_prolog(ir->leaffunc, ir->ls.dirty_registers, stack_size, extra_prologue_regs);
+      if (!ir->naked)
+        tcc_debug_prolog_epilog(tcc_state, 0);
+    }
   }
 
   /* ============================================================================
@@ -2319,8 +2563,14 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   ir->codegen_mop_cache = mop_cache;
   int use_mop_cache = 0;
 
-  const int pass_start = can_skip_dry_run ? 1 : 0;
+  const int pass_start = can_skip_dry_run ? 2 : 0;
   uint32_t *cbz_dry_mapping = NULL;
+  uint16_t *dry_pool_entries = NULL;
+  if (ir->next_instruction_index > 0)
+  {
+    dry_pool_entries = tcc_mallocz(ir->next_instruction_index * sizeof(uint16_t));
+    ir->codegen_dry_pool_entries = dry_pool_entries;
+  }
 
   /* Branch-target reset map for the materialisation cache (imm_cache).
    *
@@ -2373,34 +2623,40 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       memset(branch_target_reset, 1, (size_t)ir->next_instruction_index);
   }
 
-  for (int pass = pass_start; pass < 2; pass++)
+  /* Pass 0 discovery (dry), pass 1 rehearsal (dry), pass 2 real.
+   *
+   * Pass 0 is what it always was: it discovers scratch pushes, LR usage and the
+   * scratch save area, and its finalisation reassigns registers and resizes the
+   * frame — so the code pass 0 lays out is NOT the code the real pass emits.
+   *
+   * Pass 1 reruns the same loop AFTER all of that has settled, from the same
+   * `ind` the real pass starts at and with the same register assignments, so
+   * its address map is a faithful model of the real layout. */
+  for (int pass = pass_start; pass < 3; pass++)
   {
-    const int is_dry_run = (pass == 0);
+    const int is_dry_run = (pass < 2);
+    const int is_rehearsal = (pass == 1);
     int codegen_skip_cmp = -1;
     int codegen_skip_select = -1; /* SUBS+IT peephole: skip this SELECT (CMP already emitted SUBS+IT+MOVNE in its slot). */
     int codegen_cbz_reg = -1;    /* pending CBZ: physical register for compare */
     int codegen_cbz_nonzero = 0; /* pending CBZ: 0=CBZ (EQ), 1=CBNZ (NE) */
     /* CBZ/CBNZ peephole: fuse `CMP rN,#0; JUMPIF EQ/NE` into a single 16-bit
-     * CBZ/CBNZ.  DISABLED — it is unsound and crashes the backend.
+     * CBZ/CBNZ.
      *
-     * CBZ/CBNZ are forward-only with a 0..126-byte range, and the peephole
-     * commits the 2-byte encoding irrevocably while only ESTIMATING the forward
-     * distance (the target is not yet emitted in the single forward real pass).
-     * Both estimators are unsound:
-     *   - can_skip_dry_run path: `ir_gap*10 + pending_pool_size <= 126` assumes
-     *     ~10 bytes/IR-op, but a single op can emit far more (64-bit arithmetic,
-     *     literal-pool loads, block copies), so the real distance overflows 126
-     *     (e.g. offset=166).
-     *   - dry-mapping path: distances from a NO-CBZ dry run diverge from the
-     *     real layout once literal-pool flush points shift between the passes,
-     *     producing wildly wrong (even negative) final offsets (e.g. -1192).
-     * When the real offset does not fit, th_patch_call() has no way to widen a
-     * committed 2-byte CBZ in place and aborts with
-     * "CBZ/CBNZ target out of range".  Falling back to the always-correct
-     * CMP rN,#0 + B<cond>.W (full +/-1MB range) costs only 4 bytes/branch and
-     * never crashes.  Re-enable only behind a proper iterative branch-
-     * relaxation pass that re-emits out-of-range CBZ candidates as wide. */
-    const int cbz_enabled = 0;
+     * This was disabled for a long time because both distance estimators it
+     * had were unsound.  CBZ is forward-only with a 0..126 byte range and the
+     * peephole commits the 2-byte encoding irrevocably, while the target is not
+     * emitted yet; when the real offset did not fit, th_patch_call() had no way
+     * to widen it in place and aborted.  The old estimators were an
+     * instructions-times-ten guess, and distances from the *discovery* dry run,
+     * which diverge from the real layout (that pass reassigns registers and
+     * resizes the frame afterwards).
+     *
+     * The rehearsal pass fixes exactly that: it lays the function out the way
+     * the real pass will, so tcc_gen_machine_cbz_forward_ok() can bound the real
+     * offset from both sides and reject anything a pool flush could disturb.
+     * That is the "proper branch relaxation" the old comment asked for. */
+    const int cbz_enabled = !is_dry_run && cbz_dry_mapping != NULL;
 
     /* ---- Pass-specific initialisation ---- */
     if (is_dry_run)
@@ -2408,6 +2664,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       tcc_gen_machine_dry_run_init();
       tcc_gen_machine_branch_opt_init();
       tcc_gen_machine_dry_run_start();
+      tcc_gen_machine_dry_run_set_rehearsal(is_rehearsal);
       tcc_gen_machine_reset_scratch_state();
       tcc_ir_spill_cache_clear(&ir->spill_cache);
     }
@@ -2444,6 +2701,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
       ir_to_code_mapping[i] = ind;
 
+      /* Snapshot pool pressure for can_narrow_forward_branch. */
+      if (is_rehearsal && dry_pool_entries)
+      {
+        int en = tcc_gen_machine_pool_entries_total();
+        dry_pool_entries[i] = (uint16_t)(en > 0xFFFF ? 0xFFFF : en);
+      }
+
       /* Reset the STR→LDR memory-reload cache at every IR instruction
        * boundary (it tracks memory state, which an aliasing store on a
        * jumped-from path could invalidate without an emit the tracker sees).
@@ -2457,6 +2721,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * to its callee-saved home pair and then back to the next call's
        * argument pair — coalesce away. */
       tcc_gen_machine_strldr_cache_reset();
+      /* Volatile slot access: drop the store→reload spill-cache peephole so
+       * each volatile load reaches memory instead of reusing a just-stored
+       * register (the peephole is otherwise only cleared at jump targets). */
+      if (ir_codegen_op_touches_volatile(ir, cq))
+        tcc_ir_spill_cache_clear(&ir->spill_cache);
       /* Like imm_cache below, the GPR-equivalence cache must also drop at
        * backward (loop) branch targets that is_jump_target misses at -O0:
        * an equivalence recorded before the loop (e.g. the prologue's
@@ -2502,7 +2771,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   {                                                                                                                    \
     tcc_gen_machine_insn_scratch_reset();                                                                              \
     call;                                                                                                              \
-    ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);                                 \
+    ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);                                 \
   } while (0)
 
       switch (cq->op)
@@ -2541,8 +2810,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
              * entirely, silently dropping that shift, so skip the fusion. */
             if (next_j >= 0 && ir->compact_instructions[next_j].op == TCCIR_OP_ADD &&
                 !ir->compact_instructions[next_j].is_jump_target &&
-                !(ir->barrel_shifts && ir->compact_instructions[next_j].orig_index >= 0 &&
-                  ir->barrel_shifts[ir->compact_instructions[next_j].orig_index]))
+                !tcc_ir_barrel_shift_at(ir, &ir->compact_instructions[next_j]))
             {
               IRQuadCompact *nq = &ir->compact_instructions[next_j];
               IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
@@ -2588,7 +2856,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                                                                     b.dest);
                 if (fused)
                 {
-                  ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+                  ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
                   i = next_j;
                   break;
                 }
@@ -2622,20 +2890,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 int target_ir = irop_is_none(jdest) ? -1 : (int)jdest.u.imm32;
                 if (target_ir > i && target_ir < (int)ir->ir_to_code_mapping_size)
                 {
-                  int cbz_in_range = 0;
-                  if (cbz_dry_mapping)
-                  {
-                    int estimated_dist = (int)(ir_to_code_mapping[target_ir] - ind);
-                    int dry_dist = (int)(cbz_dry_mapping[target_ir] - cbz_dry_mapping[i]);
-                    cbz_in_range = (dry_dist >= 4 && dry_dist <= 126 && estimated_dist >= 0);
-                  }
-                  else
-                  {
-                    int ir_gap = target_ir - i;
-                    int est = ir_gap * 10 + tcc_gen_machine_pending_pool_size();
-                    cbz_in_range = (ir_gap >= 1 && est <= 126);
-                  }
-                  if (cbz_in_range)
+                  if (tcc_gen_machine_cbz_forward_ok(target_ir, i))
                   {
                     codegen_cbz_reg = cbz_a.src1.u.reg.r0;
                     codegen_cbz_nonzero = (ct == 0x95);
@@ -2710,7 +2965,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               int fused = tcc_gen_machine_mlal_accum_mop(a.src1, a.src2, *accum, b.dest, cq->op == TCCIR_OP_SMULL);
               if (fused)
               {
-                ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+                ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
                 i = next_j;
                 break;
               }
@@ -2734,7 +2989,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                       tcc_gen_machine_mlal_accum_mop(a.src1, a.src2, *accum, *accum, cq->op == TCCIR_OP_SMULL);
                   if (fused)
                   {
-                    ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+                    ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
                     i = store_j;
                     break;
                   }
@@ -2765,10 +3020,14 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           {
             IROperand cmp_s1 = tcc_ir_op_get_src1(ir, nq);
             IROperand cmp_s2 = tcc_ir_op_get_src2(ir, nq);
-            /* Only safe for EQ/NE conditions (Z flag only). */
+            /* Only safe for EQ/NE conditions (Z flag only).  Scan over an
+             * out-of-SSA phi copy that materialised to a physical self-move
+             * (emits no code, preserves flags) so a rotated count-down latch
+             * `subs; cmp #0; <coalesced copy>; bne` still fuses. */
             int next_jmpif_idx = i + 2;
             while (next_jmpif_idx < ir->next_instruction_index &&
-                   ir->compact_instructions[next_jmpif_idx].op == TCCIR_OP_NOP)
+                   (ir->compact_instructions[next_jmpif_idx].op == TCCIR_OP_NOP ||
+                    ir_codegen_is_identity_move(ir, next_jmpif_idx)))
               next_jmpif_idx++;
             int cond_safe = 0;
             if (next_jmpif_idx < ir->next_instruction_index &&
@@ -2803,8 +3062,30 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             }
           }
         }
+        /* Predicate-into-SELECT (if-conversion at codegen time): when this ALU
+         * op feeds an else-identity SELECT with live CMP flags, emit it
+         * predicated into the SELECT dest — `cmp; it <cond>; rsb.w` (gcc-parity
+         * abs) — and skip the SELECT.  Pattern detection lives in
+         * source/opt/flat/cfg/if_convert.c; the backend gates the actual
+         * encoding via tcc_gen_machine_can_predicate_alu. */
+        if (ir->codegen_flags_live && !a.dest.is_64bit)
         {
-          uint32_t bs = ir->barrel_shifts ? ir->barrel_shifts[cq->orig_index] : 0;
+          int sj, scc;
+          if (tcc_ir_ifconv_match_predicated_select(ir, i, &sj, &scc))
+          {
+            IROperand s_dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[sj]);
+            MachineOperand sdst = machine_op_from_ir(ir, &s_dest);
+            if (tcc_gen_machine_can_predicate_alu(a.src1, a.src2, sdst, cq->op))
+            {
+              SCRATCH_WRAP(tcc_gen_machine_predicated_alu_mop(a.src1, a.src2, sdst, cq->op, scc));
+              codegen_skip_select = sj;
+              ir->codegen_flags_live = 0;
+              break;
+            }
+          }
+        }
+        {
+          uint32_t bs = tcc_ir_barrel_shift_at(ir, cq);
           SCRATCH_WRAP(tcc_gen_machine_data_processing_mop(a.src1, a.src2, a.dest, cq->op, bs));
         }
         break;
@@ -2837,20 +3118,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 int target_ir = irop_is_none(jdest) ? -1 : (int)jdest.u.imm32;
                 if (target_ir > i && target_ir < (int)ir->ir_to_code_mapping_size)
                 {
-                  int cbz_in_range = 0;
-                  if (cbz_dry_mapping)
-                  {
-                    int estimated_dist = (int)(ir_to_code_mapping[target_ir] - ind);
-                    int dry_dist = (int)(cbz_dry_mapping[target_ir] - cbz_dry_mapping[i]);
-                    cbz_in_range = (dry_dist >= 4 && dry_dist <= 126 && estimated_dist >= 0);
-                  }
-                  else
-                  {
-                    int ir_gap = target_ir - i;
-                    int est = ir_gap * 10 + tcc_gen_machine_pending_pool_size();
-                    cbz_in_range = (ir_gap >= 1 && est <= 126);
-                  }
-                  if (cbz_in_range)
+                  if (tcc_gen_machine_cbz_forward_ok(target_ir, i))
                   {
                     codegen_cbz_reg = cbz_a.src1.u.reg.r0;
                     codegen_cbz_nonzero = (ct == 0x95); /* NE → CBNZ */
@@ -2962,12 +3230,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
         {
-          uint32_t bs = ir->barrel_shifts ? ir->barrel_shifts[cq->orig_index] : 0;
+          uint32_t bs = tcc_ir_barrel_shift_at(ir, cq);
           /* For 64-bit shifts, pass dead-half annotations in bits 16-17 so the
            * emitter can skip the dead low/high word write. */
-          if ((cq->op == TCCIR_OP_SHL || cq->op == TCCIR_OP_SHR || cq->op == TCCIR_OP_SAR) &&
-              ir->shift64_dead_half)
-            bs |= (uint32_t)ir->shift64_dead_half[cq->orig_index] << 16;
+          if (cq->op == TCCIR_OP_SHL || cq->op == TCCIR_OP_SHR || cq->op == TCCIR_OP_SAR)
+            bs |= (uint32_t)tcc_ir_shift64_dead_half_at(ir, cq) << 16;
           SCRATCH_WRAP(tcc_gen_machine_data_processing_mop(a.src1, a.src2, a.dest, cq->op, bs));
         }
         break;
@@ -2978,11 +3245,26 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         SCRATCH_WRAP(tcc_gen_machine_ubfx_mop(a.src1, a.src2, a.dest));
         break;
       }
+      case TCCIR_OP_SBFX:
+      {
+        MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
+        SCRATCH_WRAP(tcc_gen_machine_sbfx_mop(a.src1, a.src2, a.dest));
+        break;
+      }
       case TCCIR_OP_BFI:
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
-        uint32_t params = ir->bfi_params ? ir->bfi_params[cq->orig_index] : 0;
+        uint32_t params = tcc_ir_bfi_params_at(ir, cq);
         SCRATCH_WRAP(tcc_gen_machine_bfi_mop(a.src1, a.src2, a.dest, params));
+        break;
+      }
+      case TCCIR_OP_CLZ:
+      case TCCIR_OP_RBIT:
+      case TCCIR_OP_REV:
+      case TCCIR_OP_REV16:
+      {
+        MopArgs a = DECODE(.dest = 1, .src1 = 1);
+        SCRATCH_WRAP(tcc_gen_machine_bitop1_mop(a.src1, a.dest, cq->op));
         break;
       }
       case TCCIR_OP_FADD:
@@ -3225,6 +3507,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
          * existing STORE_INDEXED-only peephole misses the pair. */
         if (a.dest.kind == MACH_OP_REG && a.dest.needs_deref &&
             a.src1.kind == MACH_OP_REG && !a.src1.is_64bit && !a.src1.needs_deref &&
+            !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
@@ -3248,6 +3531,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -3276,6 +3560,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
          * before the paired store. */
         if (a.dest.kind == MACH_OP_REG && a.dest.needs_deref &&
             a.src1.kind == MACH_OP_IMM && !a.src1.is_64bit &&
+            !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
@@ -3297,6 +3582,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -3362,6 +3648,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
             a.src2.kind == MACH_OP_IMM &&
             a.src1.kind == MACH_OP_REG && !a.src1.needs_deref &&
+            !a.src1.underalign_hint && !a.dest.underalign_hint &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
@@ -3379,6 +3666,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.src1.kind == MACH_OP_REG && !b.src1.needs_deref &&
+                !b.src1.underalign_hint && !b.dest.underalign_hint &&
                 (b.dest.btype == IROP_BTYPE_INT32 || b.dest.btype == IROP_BTYPE_FLOAT32) &&
                 a.src1.u.reg.r0 == b.src1.u.reg.r0)
             {
@@ -3429,6 +3717,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
             a.src2.kind == MACH_OP_IMM &&
             a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
+            !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = -1;
@@ -3487,6 +3776,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -3524,6 +3814,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
             a.src2.kind == MACH_OP_IMM &&
             a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
+            !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
@@ -3545,6 +3836,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
+                !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -3748,8 +4040,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           }
           if (!is_dry_run && has_trailing_code)
           {
-            /* Pass -1 as target: return jumps go forward to the epilogue
-             * (backpatched later), so they must not be narrowed. */
+            /* Target -1 means "the epilogue", which is not an IR index.  The
+             * emitter sizes it from the rehearsal's end-of-body address. */
             int ret_branch_size = tcc_gen_machine_jump_mop(cq->op, -1, i);
             return_jump_addrs[num_return_jumps++] = ind - ret_branch_size;
           }
@@ -4012,7 +4304,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         MopArgs a = DECODE(.dest = 2, .src1 = 1);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_func_call_mop(a.src1, src2_ir, a.dest, drop_return_value, ir, i);
-        ir_codegen_track_scratch(is_dry_run, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
         tcc_ir_spill_cache_clear(&ir->spill_cache);
         if (ir->has_static_chain)
           tcc_gen_machine_restore_chain();
@@ -4150,7 +4442,38 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     }
 
     /* ---- Pass-specific finalisation ---- */
-    if (is_dry_run)
+    if (is_rehearsal)
+    {
+      /* The rehearsal exists only to produce an address map the real pass will
+       * match.  Capture it, then rewind everything the real pass redoes. */
+      tcc_gen_machine_dry_run_end();
+      tcc_gen_machine_dry_run_set_rehearsal(0);
+
+      if (cbz_dry_mapping)
+        tcc_free(cbz_dry_mapping);
+      cbz_dry_mapping = tcc_malloc(ir->ir_to_code_mapping_size * sizeof(uint32_t));
+      ir->codegen_cbz_dry_mapping = cbz_dry_mapping;
+      memcpy(cbz_dry_mapping, ir_to_code_mapping, ir->ir_to_code_mapping_size * sizeof(uint32_t));
+      ir->codegen_rehearsal_end = (uint32_t)ind;
+
+      ind = saved_ind;
+      loc = saved_loc;
+      ir->call_outgoing_base = saved_call_outgoing_base;
+      ir->call_nested_save_base = saved_call_nested_save_base;
+      ir->codegen_instruction_idx = saved_codegen_idx;
+
+      tcc_gen_machine_reset_scratch_state();
+      tcc_ir_spill_cache_clear(&ir->spill_cache);
+      tcc_ir_opt_fp_cache_clear(ir);
+      /* Both passes must START from the same backend cache state or the
+       * rehearsal is not a model of the real pass.  dry_run_init/start reset
+       * the MOV-equivalence and STR->LDR caches before each dry pass; nothing
+       * reset them before the real pass, so it used to inherit the dry pass's
+       * equivalences and could elide a `mov` that is actually needed
+       * (tests2/25_quicksort::partition dropped `mov r4, r0` at -O2). */
+      tcc_gen_machine_mov_coalesce_reset();
+    }
+    else if (is_dry_run)
     {
       /* End dry-run and analyze results */
       tcc_gen_machine_dry_run_end();
@@ -4192,11 +4515,25 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * one avoids the push/pop entirely AND keeps instructions compact. */
       {
         int any_fixup = 0;
+        /* Snapshot the pre-fixup live map: an instruction is only "fixed" once
+         * we have actually freed as many registers at it as the dry run had to
+         * save.  Counting "some R0-R3 is free" instead under-counts whenever
+         * one instruction borrows two scratch registers (a global's address
+         * plus the value) and leaves the second borrow paying save/restore. */
+        uint32_t *orig_live = NULL;
+        int orig_live_n = 0;
+        if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
+        {
+          orig_live_n = ir->ls.live_regs_by_instruction_size;
+          orig_live = tcc_malloc((size_t)orig_live_n * sizeof(uint32_t));
+          memcpy(orig_live, ir->ls.live_regs_by_instruction, (size_t)orig_live_n * sizeof(uint32_t));
+        }
         for (int i = 0; i < ir->next_instruction_index; i++)
         {
           uint16_t saves = dry_insn_saves[i];
           if (!saves)
             continue;
+          const int need = __builtin_popcount(saves);
           int all_fixed = 1;
           while (saves)
           {
@@ -4214,9 +4551,17 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                * can be freed, tcc_ls_find_free_scratch_reg will find it during
                * the real run and no push/pop will be needed. */
               int alt_fixed = 0;
+              int enough_freed = 0;
               if (ir->ls.live_regs_by_instruction && i < ir->ls.live_regs_by_instruction_size)
               {
                 uint32_t live = ir->ls.live_regs_by_instruction[i];
+                /* Has the fixup already handed this instruction as many extra
+                 * registers as the dry run had to save?  "Some R0-R3 is free"
+                 * is not the same question: an instruction that borrows two
+                 * scratch registers (a global's address plus the value) still
+                 * pays save/restore for the second one. */
+                enough_freed = (orig_live && i < orig_live_n &&
+                                ir_codegen_regs_freed_at(orig_live[i], live) >= need);
                 /* If any R0-R3 is already free, the real run will use it. */
                 if ((~live & 0xFu) & ~(1u << r))
                 {
@@ -4238,6 +4583,20 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                   }
                 }
               }
+              /* Nothing could be moved (or not enough of it): spill the
+               * blocker so its register becomes a permanently free scratch
+               * over the blocked window. */
+              if (!enough_freed && demoted_count < (int)(sizeof(demoted_vregs) / sizeof(demoted_vregs[0])))
+              {
+                int dv = try_demote_scratch_conflict(ir, r, i, dry_insn_saves, dry_insn_scratch,
+                                                     ir->next_instruction_index);
+                if (dv >= 0)
+                {
+                  demoted_vregs[demoted_count++] = dv;
+                  any_fixup = 1;
+                  alt_fixed = 1;
+                }
+              }
               if (!alt_fixed)
                 all_fixed = 0;
             }
@@ -4245,6 +4604,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           if (all_fixed)
             dry_insn_scratch[i] = 0;
         }
+        if (orig_live)
+          tcc_free(orig_live);
         if (any_fixup)
         {
           tcc_ls_reset_scratch_cache(&ir->ls);
@@ -4254,6 +4615,30 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           ir->codegen_mop_cache = NULL;
         }
         use_mop_cache = (mop_cache != NULL);
+      }
+
+      /* Shrink the nested-call save area to the dry run's ACTUAL maximum.
+       * The static max_nested_save_regs sizing over-approximates from blob
+       * liveness bitmaps (311 corpus functions carried a reservation with
+       * zero stores into it).  The call-site save logic is deterministic
+       * across passes, so the dry run's per-site maximum is exact.  All
+       * frame areas below the locals shift up by the returned slack; the
+       * call sites address these areas by SIZE ([SP + outgoing], slots
+       * upward), so only loc and the two base fields need adjusting.
+       * Skipped under FP/dynamic-SP frames (FP-relative bias math). */
+      if (!tcc_state->need_frame_pointer && !tcc_state->func_dynamic_sp &&
+          ir->call_nested_save_size > 0)
+      {
+        int actual = tcc_gen_machine_dry_run_get_max_nested_saves() * 4;
+        if (actual < ir->call_nested_save_size)
+        {
+          int delta = ir->call_nested_save_size - actual;
+          ir->call_nested_save_size = actual;
+          loc += delta;
+          ir->call_nested_save_base += delta;
+          ir->call_outgoing_base += delta;
+          stack_size = (-loc + 7) & ~7;
+        }
       }
 
       /* Allocate scratch save area if the dry run detected scratch pushes.
@@ -4310,6 +4695,44 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         }
       }
 
+      /* Home slots for the vregs the phase-3 fixup demoted to memory.  Carved
+       * out the same way as the scratch save area: the frame grows downward
+       * and the areas addressed by literal SP offsets slide with it. */
+      if (demoted_count > 0)
+      {
+        int demote_size = (demoted_count * 4 + 7) & ~7;
+        loc -= demote_size;
+        int slot_base;
+        if (ir->call_outgoing_size > 0 || ir->call_nested_save_size > 0 || ir->scratch_save_size > 0)
+        {
+          ir->call_outgoing_base = loc;
+          ir->call_nested_save_base = loc + ir->call_outgoing_size;
+          ir->scratch_save_base = loc + ir->call_outgoing_size + ir->call_nested_save_size;
+          slot_base = ir->scratch_save_base + ir->scratch_save_size;
+        }
+        else
+        {
+          slot_base = loc;
+        }
+        for (int k = 0; k < demoted_count; k++)
+        {
+          int off = slot_base + k * 4;
+          IRLiveInterval *dli = tcc_ir_get_live_interval(ir, demoted_vregs[k]);
+          if (dli)
+          {
+            dli->allocation.r0 = PREG_SPILLED | PREG_REG_NONE;
+            dli->allocation.r1 = PREG_NONE;
+            dli->allocation.offset = off;
+          }
+          for (int j = 0; j < ir->ls.next_interval_index; j++)
+          {
+            if (ir->ls.intervals[j].vreg == (uint32_t)demoted_vregs[k])
+              ir->ls.intervals[j].stack_location = (uint32_t)off;
+          }
+        }
+        stack_size = (-loc + 7) & ~7;
+      }
+
       /* Reset scratch state for real pass */
       tcc_gen_machine_reset_scratch_state();
       tcc_ir_spill_cache_clear(&ir->spill_cache);
@@ -4334,6 +4757,9 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   if (cbz_dry_mapping)
     tcc_free(cbz_dry_mapping);
   ir->codegen_cbz_dry_mapping = NULL;
+  if (dry_pool_entries)
+    tcc_free(dry_pool_entries);
+  ir->codegen_dry_pool_entries = NULL;
   if (branch_target_reset)
     tcc_free(branch_target_reset);
   ir->codegen_branch_target_reset = NULL;

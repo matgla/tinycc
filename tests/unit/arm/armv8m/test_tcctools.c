@@ -426,25 +426,3 @@ UT_TEST(test_tcc_tool_ar_create_list_extract)
     remove(extracted);
     return 0;
 }
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(tcctools)
-{
-    UT_RUN(test_read16le_write16le_roundtrip);
-    UT_RUN(test_read32le_write32le_roundtrip);
-    UT_RUN(test_add32le);
-    UT_RUN(test_read64le_write64le_roundtrip);
-
-    UT_RUN(test_gen_makedeps_explicit_filename);
-    UT_RUN(test_gen_makedeps_auto_filename);
-    UT_RUN(test_gen_makedeps_escapes_spaces);
-    UT_RUN(test_gen_makedeps_deduplicates_deps);
-    UT_RUN(test_gen_makedeps_phony_targets);
-
-    UT_RUN(test_tcc_tool_ar_invalid_usage);
-    UT_RUN(test_tcc_tool_ar_create_empty_archive);
-    UT_RUN(test_tcc_tool_ar_create_list_extract);
-}

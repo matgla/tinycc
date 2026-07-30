@@ -72,13 +72,24 @@ float __aeabi_fadd(float a, float b)
     return ur.f;
   }
 
-  /* Add implicit bit for normalized numbers */
+  /* Add the implicit bit for normals.  A subnormal has a stored exponent of 0
+   * but an *effective* exponent of 1 (it is 0.mant x 2^-126, not 0.mant x
+   * 2^-127); using the stored 0 here misaligns every subnormal by one binade. */
   if (a_exp != 0)
     a_mant |= FLOAT_IMPLICIT_BIT;
+  else
+    a_exp = 1;
   if (b_exp != 0)
     b_mant |= FLOAT_IMPLICIT_BIT;
+  else
+    b_exp = 1;
 
-  /* Align exponents */
+  /* Carry SFP_GRS guard bits so the alignment shift below cannot silently
+   * discard the information the final rounding depends on. */
+  a_mant <<= SFP_GRS;
+  b_mant <<= SFP_GRS;
+
+  /* Align exponents, accumulating everything shifted out into the sticky bit. */
   int exp_diff = a_exp - b_exp;
   int result_exp;
   uint32_t result_mant;
@@ -86,18 +97,12 @@ float __aeabi_fadd(float a, float b)
 
   if (exp_diff > 0)
   {
-    if (exp_diff < 32)
-      b_mant >>= exp_diff;
-    else
-      b_mant = 0;
+    b_mant = sfp_shr_sticky32(b_mant, exp_diff);
     result_exp = a_exp;
   }
   else if (exp_diff < 0)
   {
-    if (-exp_diff < 32)
-      a_mant >>= -exp_diff;
-    else
-      a_mant = 0;
+    a_mant = sfp_shr_sticky32(a_mant, -exp_diff);
     result_exp = b_exp;
   }
   else
@@ -105,16 +110,12 @@ float __aeabi_fadd(float a, float b)
     result_exp = a_exp;
   }
 
-  /* Add or subtract mantissas */
+  /* Add or subtract mantissas.  Normalization, gradual underflow, rounding and
+   * overflow are all handled by sfp_round_pack_float(). */
   if (a_sign == b_sign)
   {
     result_mant = a_mant + b_mant;
     result_sign = a_sign;
-    if (result_mant & (FLOAT_IMPLICIT_BIT << 1))
-    {
-      result_mant >>= 1;
-      result_exp++;
-    }
   }
   else
   {
@@ -128,31 +129,16 @@ float __aeabi_fadd(float a, float b)
       result_mant = b_mant - a_mant;
       result_sign = b_sign;
     }
+    /* Exact cancellation is +0 in round-to-nearest, regardless of operand
+     * signs (IEEE 754 section 6.3). */
     if (result_mant == 0)
     {
       ur.u = 0;
       return ur.f;
     }
-    while (!(result_mant & FLOAT_IMPLICIT_BIT) && result_exp > 0)
-    {
-      result_mant <<= 1;
-      result_exp--;
-    }
   }
 
-  if (result_exp >= 0xFF)
-  {
-    ur.u = make_float(result_sign, 0xFF, 0);
-    return ur.f;
-  }
-  if (result_exp <= 0)
-  {
-    ur.u = make_float(result_sign, 0, 0);
-    return ur.f;
-  }
-
-  result_mant &= FLOAT_MANT_MASK;
-  ur.u = make_float(result_sign, result_exp, result_mant);
+  ur.u = sfp_round_pack_float(result_sign, result_exp, result_mant);
   return ur.f;
 }
 

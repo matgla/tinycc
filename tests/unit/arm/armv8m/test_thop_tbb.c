@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_tbb.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_tbb.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -206,21 +206,4 @@ UT_TEST(test_th_tbh_blocked_without_feat)
   UT_ASSERT_EQ(op.opcode, 0);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_tbb)
-{
-  UT_RUN(test_th_tbb_basic);
-  UT_RUN(test_th_tbb_rn_rm_variants);
-  UT_RUN(test_th_tbh_basic);
-  UT_RUN(test_th_tbh_rn_rm_variants);
-  UT_RUN(test_th_tt_basic);
-  UT_RUN(test_th_tt_with_a);
-  UT_RUN(test_th_tt_with_t);
-  UT_RUN(test_th_tt_with_a_and_t);
-  UT_RUN(test_th_tt_various_regs);
-  UT_RUN(test_th_tbb_blocked_without_feat);
-  UT_RUN(test_th_tbh_blocked_without_feat);
 }

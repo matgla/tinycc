@@ -13,7 +13,7 @@
 #include "ir/regalloc.h"
 #include "ir/codegen.h"
 #include "ir/machine_op.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
 
@@ -786,7 +786,7 @@ UT_TEST(test_dispatch_jump_routes_to_jump_mop)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("jump_mop"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("jump_mop"), 3);
   const CgStubCall *c = cgstub_nth_call("jump_mop", 0);
   UT_ASSERT(c != NULL);
   UT_ASSERT_EQ(c->ir_op, TCCIR_OP_JUMP);
@@ -815,7 +815,7 @@ UT_TEST(test_dispatch_jumpif_routes_to_conditional_jump_mop)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("conditional_jump_mop"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("conditional_jump_mop"), 3);
   UT_ASSERT_EQ(cgstub_call_count("cbz_jump_mop"), 0);
   const CgStubCall *c = cgstub_nth_call("conditional_jump_mop", 0);
   UT_ASSERT(c != NULL);
@@ -942,12 +942,12 @@ UT_TEST(test_dispatch_switch_table_uses_distinct_mop_per_pass)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 1); /* two-pass forced */
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 2); /* discovery + rehearsal dry pass */ /* two-pass forced */
   /* Called twice per dry-run pass: once as reserve_pool_bytes()'s argument
    * (unconditional, every pass) and once more for the dry-run-only `ind +=`
    * size estimate; the real-run pass only hits the first (unconditional)
    * call site. See ir/codegen.c ~4045-4048. */
-  UT_ASSERT_EQ(cgstub_call_count_pass("switch_table_dry_run_size", 0), 2);
+  UT_ASSERT_EQ(cgstub_call_count_pass("switch_table_dry_run_size", 0), 4); /* x2: two dry passes */
   UT_ASSERT_EQ(cgstub_call_count_pass("switch_table_dry_run_size", 1), 1);
   UT_ASSERT_EQ(cgstub_call_count_pass("switch_table_mop", 1), 1);
   UT_ASSERT_EQ(cgstub_call_count_pass("switch_table_mop", 0), 0);
@@ -957,7 +957,7 @@ UT_TEST(test_dispatch_switch_table_uses_distinct_mop_per_pass)
   UT_ASSERT_EQ(sz->aux0, 3); /* num_entries */
 
   /* tcc_ir_free() walks and tcc_free()s switch_tables[i].targets and
-   * switch_tables itself (see ir/core.c ~266) -- both point at this test's
+   * switch_tables itself (see ir/gen/state.c ~269) -- both point at this test's
    * stack/static arrays, not tcc_malloc'd memory. Detach before freeing,
    * same reason test_opt_switch_collapse.c uses the lighter utb_free(). */
   ir->switch_tables = NULL;
@@ -1013,37 +1013,4 @@ UT_TEST(test_dispatch_switch_load_routes_to_switch_load_mop)
   ir->num_switch_value_tables = 0;
   tcc_ir_free(ir);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(codegen_control)
-{
-  UT_RUN(test_jumpif_operands);
-  UT_RUN(test_jump_and_ijump_operands);
-  UT_RUN(test_diamond_backpatch);
-  UT_RUN(test_bb_start);
-  UT_RUN(test_switch_operands);
-  UT_RUN(test_cmp_jmp_set_empty_stack_is_noop);
-  UT_RUN(test_cmp_jmp_set_simple_vt_cmp_emits_single_setif);
-  UT_RUN(test_cmp_jmp_set_vt_cmp_merges_pending_jtrue_chain);
-  UT_RUN(test_cmp_jmp_set_vt_jmp_emits_default_and_flipped_assign_pair);
-  UT_RUN(test_cmp_jmp_set_vt_jmpi_backpatches_real_chain);
-  UT_RUN(test_cmp_jmp_set_plain_value_is_noop);
-  UT_RUN(test_test_gen_vt_cmp_no_invert_emits_jumpif_and_returns_its_index);
-  UT_RUN(test_test_gen_vt_cmp_invert_xors_cmp_op);
-  UT_RUN(test_test_gen_plain_value_recurses_through_test_zero);
-  UT_RUN(test_test_gen_vt_jmp_matching_invert_adopts_empty_chain);
-  UT_RUN(test_test_gen_vt_jmp_matching_invert_merges_nonempty_chain);
-  UT_RUN(test_test_gen_vt_jmp_mismatched_invert_emits_jump);
-  UT_RUN(test_test_gen_constant_condition_taken_emits_jump_and_sets_nocode);
-  UT_RUN(test_test_gen_constant_condition_not_taken_is_noop);
-  UT_RUN(test_dispatch_jump_routes_to_jump_mop);
-  UT_RUN(test_dispatch_jumpif_routes_to_conditional_jump_mop);
-  UT_RUN(test_dispatch_ijump_routes_to_indirect_jump_mop);
-  UT_RUN(test_dispatch_setif_routes_to_setif_mop);
-  UT_RUN(test_dispatch_switch_table_uses_distinct_mop_per_pass);
-  UT_RUN(test_dispatch_switch_load_routes_to_switch_load_mop);
 }

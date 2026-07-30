@@ -5,8 +5,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_cmp.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_cmp.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ut.h"
 
 /* ------------------------------------------------------------------ setup */
@@ -241,26 +241,4 @@ UT_TEST(test_th_teq_reg_t32_no_shift)
   UT_ASSERT_EQ(op.opcode, 0xEA910F02);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(thop_cmp)
-{
-  UT_RUN(test_th_cmp_imm_t16);
-  UT_RUN(test_th_cmp_reg_t1);
-  UT_RUN(test_th_cmp_reg_t2);
-  UT_RUN(test_th_cmp_imm_t32);
-  UT_RUN(test_th_tst_imm_t32);
-  UT_RUN(test_th_cmp_reg_t32);
-  UT_RUN(test_th_teq_reg_t32);
-  UT_RUN(test_th_teq_reg_t32_no_shift);
-  UT_RUN(test_th_cmn_reg_t16);
-  UT_RUN(test_th_cmn_reg_t32_with_shift);
-  UT_RUN(test_th_tst_reg_t16);
-  UT_RUN(test_th_tst_reg_t32);
-  UT_RUN(test_th_cmn_imm_t32);
-  UT_RUN(test_th_tst_imm_t32_exact);
-  UT_RUN(test_th_teq_imm_t32_exact);
-  UT_RUN(test_th_cmp_imm_handler_ignores_rd_and_matches_th_cmp_imm);
 }

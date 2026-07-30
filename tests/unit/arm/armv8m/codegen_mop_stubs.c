@@ -22,6 +22,7 @@
 
 #define USING_GLOBALS
 #include "tcc.h"
+#include "arm-thumb-callsite.h"
 #include "codegen_mop_stubs.h"
 
 #define CGSTUB_MAX_CALLS 8192
@@ -222,10 +223,25 @@ void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineO
   cgstub_record("ubfx_mop", (TccIrOp)-1, dest, src1, src2);
 }
 
+void tcc_gen_machine_sbfx_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest)
+{
+  cgstub_record("sbfx_mop", (TccIrOp)-1, dest, src1, src2);
+}
+
 void tcc_gen_machine_bfi_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, uint32_t params)
 {
   (void)params;
   cgstub_record("bfi_mop", (TccIrOp)-1, dest, src1, src2);
+}
+
+void tcc_gen_machine_bitop1_mop(MachineOperand src1, MachineOperand dest, TccIrOp op)
+{
+  cgstub_record("bitop1_mop", op, dest, src1, CGSTUB_NO_OP);
+}
+
+int tcc_machine_has_bit_ops(void)
+{
+  return 1;
 }
 
 void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op)
@@ -444,6 +460,28 @@ int tcc_gen_machine_cbz_jump_mop(int rn, int nonzero, int32_t target_ir, int ir_
   return cgstub_knobs.branch_size_16 ? 2 : 4;
 }
 
+int tcc_gen_machine_pool_flushes_total(void)
+{
+  return 0;
+}
+
+int tcc_gen_machine_pool_entries_total(void)
+{
+  return 0;
+}
+
+int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx)
+{
+  (void)target_ir;
+  (void)current_ir_idx;
+  return 0; /* dispatch tests exercise the non-fused path */
+}
+
+void tcc_gen_machine_dry_run_set_rehearsal(int on)
+{
+  (void)on;
+}
+
 int tcc_gen_machine_pending_pool_size(void)
 {
   cgstub_record("pending_pool_size", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
@@ -496,6 +534,19 @@ void tcc_gen_machine_select_mop(MachineOperand then_val, MachineOperand else_val
   cgstub_record_ex("select_mop", (TccIrOp)-1, dest, then_val, else_val, cond_code, 0);
 }
 
+int tcc_gen_machine_can_predicate_alu(MachineOperand src1, MachineOperand src2,
+                                      MachineOperand dest, TccIrOp op)
+{
+  (void)src1; (void)src2; (void)dest; (void)op;
+  return 0;
+}
+
+void tcc_gen_machine_predicated_alu_mop(MachineOperand src1, MachineOperand src2,
+                                        MachineOperand dest, TccIrOp op, int cond_code)
+{
+  cgstub_record_ex("predicated_alu_mop", op, dest, src1, src2, cond_code, 0);
+}
+
 /* ============================================================================
  * Calls / parameters / return
  * ============================================================================ */
@@ -522,7 +573,8 @@ void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op)
  * stack area. Good enough for the pre-scan's stack-size estimate and for
  * Phase 4's call-family dispatch tests; not a full ABI classifier. */
 int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint,
-                                    TCCAbiCallLayout *layout, IROperand **out_args, MachineOperand **out_mops)
+                                    TCCAbiCallLayout *layout, ThumbIROperandSequence *out_args,
+                                    ThumbMachineOperandSequence *out_mops)
 {
   (void)ir;
   (void)call_idx;
@@ -613,6 +665,12 @@ uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void)
   return cgstub_knobs.scratch_regs_pushed;
 }
 
+int tcc_gen_machine_dry_run_get_max_nested_saves(void)
+{
+  cgstub_record("dry_run_get_max_nested_saves", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
+  return 0;
+}
+
 void tcc_gen_machine_reset_scratch_state(void)
 {
   cgstub_record("reset_scratch_state", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
@@ -654,6 +712,11 @@ void tcc_gen_machine_branch_opt_analyze(uint32_t *ir_to_code_mapping, int mappin
 void tcc_gen_machine_mov_equiv_reset(void)
 {
   cgstub_record("mov_equiv_reset", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
+}
+
+void tcc_gen_machine_mov_coalesce_reset(void)
+{
+  cgstub_record("mov_coalesce_reset", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
 }
 
 void tcc_gen_machine_reserve_pool_bytes(int upcoming_bytes)
@@ -889,10 +952,10 @@ void tcc_opt_fp_mat_cache_clear(TCCIRState *ir)
   (void)ir;
 }
 
-/* From tccgen.c -- ir/core.c:tcc_ir_local_add() calls sym_push() to build a
- * local-stack symbol.  This binary links ir/core.c but not tccgen.c, so a NULL
- * returning stub satisfies the linker for hand-built IR tests (no real
- * frontend symbol table is present). */
+/* From tccgen.c -- ir/gen/params.c:tcc_ir_local_add() calls sym_push() to build
+ * a local-stack symbol.  This binary links the ir/gen sources but not tccgen.c,
+ * so a NULL returning stub satisfies the linker for hand-built IR tests (no
+ * real frontend symbol table is present). */
 Sym *sym_push(int v, CType *type, int r, int c)
 {
   (void)v; (void)type; (void)r; (void)c;

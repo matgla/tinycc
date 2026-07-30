@@ -1,19 +1,15 @@
 /*
- *  test_main7.c - entry point for the tccpp/ unit-test binary
- *  (build_tccpp/run_unit_tests_tccpp)
+ *  test_main7.c - entry point for the tccpp/ unit-test binary (build_tccpp/run_unit_tests_tccpp)
  *
- *  Separate from test_main.c: this binary links the REAL tccpp.c directly
- *  (see the Makefile's UT7_* section).
+ *  Tests self-register via UT_TEST constructors; argv filters by
+ *  suite/test-name substring (see tests/unit/README.md).
  */
 
 #include "ut.h"
 
 UT_MAIN_IMPL;
 
-UT_DECLARE_SUITE(tccpp);
-
-int main(void)
+int main(int argc, char **argv)
 {
-  UT_RUN_SUITE(tccpp);
-  UT_REPORT_AND_EXIT();
+  return ut_run_all(argc, argv);
 }

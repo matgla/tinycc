@@ -9,22 +9,30 @@
  *      * (x AND #m1) AND #m2 → simplify            [redundant-mask]
  *      * (x SHR #n) AND #mask → x SHR #n           [mask-covers-bits]
  *      * Non-matching shifts / 64-bit / multi-def → no fold
+ *    - soft-FP double→float demotion fold:
+ *      * tcc_ir_ssa_narrow_f64_imm_exact_f32() exact/inexact/NaN/IMM32 forms
+ *      * full f2d→floor→d2f shape declines without mutation when the callee
+ *        rename cannot complete (harness external_global_sym stub → NULL);
+ *        the positive fold is covered by test_codegen_asm.py's
+ *        test_float_narrow_fires
  *
  *  HARNESS NOTES:
- *    - Links the real ir/opt/ssa_opt_narrow.c via UT11.
+ *    - Links the real source/opt/ssa/scalar/narrow.c via UT11.
  *    - Uses ssa_build.h for hand-built vinfo + IR.
  *    - SHL/SHR/SAR require a shift-amount src2; use ssa_add_instr4().
  *    - AND with immediate src2 also needs ssa_add_instr4().
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
+#include "opt/ssa/narrow.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
+#include <string.h>
 
 #define I32 IROP_BTYPE_INT32
 #define I64 IROP_BTYPE_INT64
@@ -361,7 +369,7 @@ UT_TEST(test_narrow_and_fold_shr_mask_covers)
 UT_TEST(test_narrow_and_fold_shr_mask_not_covering)
 {
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
-  /* t0 = #0xFF; t1 = t0 >> 4; t2 = t1 & 0x3 → no fold */
+  /* t0 = #0xFF; t1 = t0 >> 4; t2 = t1 & 0x3 → UBFX(t0, 4, 2) */
   ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(0xFF, I32));
   ssa_add_instr4(&c, TCCIR_OP_SHR, utb_temp(1, I32), utb_temp(0, I32),
                  utb_imm(4, I32), UTB_NONE);
@@ -373,8 +381,8 @@ UT_TEST(test_narrow_and_fold_shr_mask_not_covering)
   ssa_ctx_rebuild(&c);
 
   int changed = ssa_opt_narrow(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, and_i), TCCIR_OP_AND);
+  UT_ASSERT_EQ(changed, 1);
+  UT_ASSERT_EQ(utb_op(c.ir, and_i), TCCIR_OP_UBFX);
 
   ssa_ctx_free(&c);
   return 0;
@@ -488,26 +496,201 @@ UT_TEST(test_narrow_and_fold_multi_def_inner)
 }
 
 /* ========================================================================
+ * float demotion fold: tcc_ir_ssa_narrow_f64_imm_exact_f32 helper
+ *
+ * Double-immediate -> F32 narrowing used by the soft-FP demotion fold.
+ * IMM32+FLOAT64 (integer-valued shorthand) always narrows; F64 pool
+ * constants must be exactly float-representable.
+ * ======================================================================== */
+
+static double ut_bits_to_d(uint64_t b)
+{
+  double d;
+  memcpy(&d, &b, sizeof(d));
+  return d;
+}
+
+static uint64_t ut_d_to_bits(double d)
+{
+  uint64_t b;
+  memcpy(&b, &d, sizeof(b));
+  return b;
+}
+
+static uint32_t ut_f_to_bits(float f)
+{
+  uint32_t b;
+  memcpy(&b, &f, sizeof(b));
+  return b;
+}
+
+UT_TEST(test_narrow_f64_imm_exact_basic)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+
+  /* 0.0, 1.5, -2.0, 2^24 and +Inf are all exact float values. */
+  const double vals[] = { 0.0, 1.5, -2.0, 16777216.0, -0.0,
+                          3.4028234663852886e38 };
+  for (size_t k = 0; k < sizeof(vals) / sizeof(vals[0]); k++)
+  {
+    uint32_t idx = tcc_ir_pool_add_f64(c.ir, ut_d_to_bits(vals[k]));
+    IROperand out;
+    UT_ASSERT_EQ(tcc_ir_ssa_narrow_f64_imm_exact_f32(c.ir, irop_make_f64(0, idx), &out), 1);
+    UT_ASSERT_EQ(out.tag, IROP_TAG_F32);
+    UT_ASSERT_EQ(out.u.f32_bits, ut_f_to_bits((float)vals[k]));
+  }
+
+  /* +Inf is an exact float value too. */
+  {
+    uint32_t idx = tcc_ir_pool_add_f64(c.ir, ut_d_to_bits(1.0 / 0.0));
+    IROperand out;
+    UT_ASSERT_EQ(tcc_ir_ssa_narrow_f64_imm_exact_f32(c.ir, irop_make_f64(0, idx), &out), 1);
+    UT_ASSERT_EQ(out.u.f32_bits, ut_f_to_bits((float)(1.0 / 0.0)));
+  }
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_narrow_f64_imm_inexact_rejects)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+
+  /* None of these is exactly representable as a float; narrowing ahead of
+   * floorf would change rounding, so the helper must refuse. */
+  const double vals[] = { 0.1, 0.9999999999999999, 1.0 / 3.0, 1e-50,
+                          16777217.0 /* 2^24+1 */, -1.0000000000000002 };
+  for (size_t k = 0; k < sizeof(vals) / sizeof(vals[0]); k++)
+  {
+    uint32_t idx = tcc_ir_pool_add_f64(c.ir, ut_d_to_bits(vals[k]));
+    IROperand out;
+    UT_ASSERT_EQ(tcc_ir_ssa_narrow_f64_imm_exact_f32(c.ir, irop_make_f64(0, idx), &out), 0);
+  }
+
+  /* The canonical quiet NaN round-trips bit-exactly through the cast and is
+   * accepted; that is sound here because every table entry (floor/ceil/...)
+   * propagates NaN unchanged on both the double and float paths. */
+  {
+    uint32_t idx = tcc_ir_pool_add_f64(c.ir, 0x7FF8000000000000ULL);
+    IROperand out;
+    UT_ASSERT_EQ(tcc_ir_ssa_narrow_f64_imm_exact_f32(c.ir, irop_make_f64(0, idx), &out), 1);
+  }
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_narrow_f64_imm_imm32_shorthand)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+
+  /* IMM32 + FLOAT64: integer-valued double shorthand; always sound. */
+  const int32_t vals[] = { 0, 5, -3, 1000000, -2147483647 };
+  for (size_t k = 0; k < sizeof(vals) / sizeof(vals[0]); k++)
+  {
+    IROperand op = irop_make_imm32(0, vals[k], IROP_BTYPE_FLOAT64);
+    IROperand out;
+    UT_ASSERT_EQ(tcc_ir_ssa_narrow_f64_imm_exact_f32(c.ir, op, &out), 1);
+    UT_ASSERT_EQ(out.tag, IROP_TAG_F32);
+    UT_ASSERT_EQ(out.u.f32_bits, ut_f_to_bits((float)(double)(int64_t)vals[k]));
+  }
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_narrow_f64_imm_wrong_form_rejects)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/2);
+  IROperand out;
+
+  /* F32 input is not a double immediate. */
+  UT_ASSERT_EQ(tcc_ir_ssa_narrow_f64_imm_exact_f32(c.ir, irop_make_f32(0, 0), &out), 0);
+  /* Plain integer immediate. */
+  UT_ASSERT_EQ(tcc_ir_ssa_narrow_f64_imm_exact_f32(c.ir, irop_make_imm32(0, 5, I32), &out), 0);
+  /* I64 pool entry without FLOAT64 btype. */
+  {
+    uint32_t idx = tcc_ir_pool_add_i64(c.ir, 0);
+    UT_ASSERT_EQ(tcc_ir_ssa_narrow_f64_imm_exact_f32(c.ir, irop_make_i64(0, idx, I64), &out), 0);
+  }
+  /* VREG operand. */
+  UT_ASSERT_EQ(tcc_ir_ssa_narrow_f64_imm_exact_f32(c.ir, utb_temp(0, I32), &out), 0);
+  /* lval F64. */
+  {
+    uint32_t idx = tcc_ir_pool_add_f64(c.ir, ut_d_to_bits(0.0));
+    IROperand op = irop_make_f64(0, idx);
+    op.is_lval = 1;
+    UT_ASSERT_EQ(tcc_ir_ssa_narrow_f64_imm_exact_f32(c.ir, op, &out), 0);
+  }
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
+ * float demotion fold: full f2d -> floor -> d2f shape, unresolved rename
+ *
+ * The harness's external_global_sym() stub returns NULL, so
+ * change_callee_sym() fails and the fold must decline WITHOUT having
+ * mutated anything (no param redirection, no NOPs).  The positive path is
+ * covered end-to-end by tests/ir_tests/test_codegen_asm.py
+ * (test_float_narrow_fires).
+ * ======================================================================== */
+
+UT_TEST(test_narrow_float_demote_rename_fails_no_mutation)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/5);
+
+  static Sym f2d_sym, floor_sym, d2f_sym;
+  utb_set_tok_str(600, "__aeabi_f2d");
+  utb_set_tok_str(601, "floor");
+  utb_set_tok_str(602, "__aeabi_d2f");
+  f2d_sym.v = 600;
+  floor_sym.v = 601;
+  d2f_sym.v = 602;
+
+  const int id_f2d = 1, id_floor = 2, id_d2f = 3;
+  /* PARAM T0 ; T1 = f2d ; PARAM T1 ; T2 = floor ; PARAM T2 ; T3 = d2f ; RET T3 */
+  ssa_add_instr3(&c, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, I32),
+                 utb_imm((int32_t)TCCIR_ENCODE_PARAM(id_f2d, 0), I32));
+  int i_f2d = ssa_add_instr3(&c, TCCIR_OP_FUNCCALLVAL, utb_temp(1, I64),
+                             irop_make_symref(0, tcc_ir_pool_add_symref(c.ir, &f2d_sym, 0, 0), 0, 0, 0, I32),
+                             utb_imm((int32_t)TCCIR_ENCODE_CALL(id_f2d, 1), I32));
+  ssa_add_instr3(&c, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, I64),
+                 utb_imm((int32_t)TCCIR_ENCODE_PARAM(id_floor, 0), I32));
+  int i_floor = ssa_add_instr3(&c, TCCIR_OP_FUNCCALLVAL, utb_temp(2, I64),
+                               irop_make_symref(0, tcc_ir_pool_add_symref(c.ir, &floor_sym, 0, 0), 0, 0, 0, I32),
+                               utb_imm((int32_t)TCCIR_ENCODE_CALL(id_floor, 1), I32));
+  ssa_add_instr3(&c, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(2, I64),
+                 utb_imm((int32_t)TCCIR_ENCODE_PARAM(id_d2f, 0), I32));
+  int i_d2f = ssa_add_instr3(&c, TCCIR_OP_FUNCCALLVAL, utb_temp(3, I32),
+                             irop_make_symref(0, tcc_ir_pool_add_symref(c.ir, &d2f_sym, 0, 0), 0, 0, 0, I32),
+                             utb_imm((int32_t)TCCIR_ENCODE_CALL(id_d2f, 1), I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_narrow(c.ctx);
+
+  /* Rename cannot complete in the harness: zero changes, and the whole call
+   * sequence (calls + params) must be byte-identical to the input. */
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, i_f2d), TCCIR_OP_FUNCCALLVAL);
+  UT_ASSERT_EQ(utb_op(c.ir, i_floor), TCCIR_OP_FUNCCALLVAL);
+  UT_ASSERT_EQ(utb_op(c.ir, i_d2f), TCCIR_OP_FUNCCALLVAL);
+  UT_ASSERT_EQ(IROP_VR(utb_dest(c.ir, i_floor)), IROP_VR(utb_temp(2, I64)));
+
+  utb_set_tok_str(600, NULL);
+  utb_set_tok_str(601, NULL);
+  utb_set_tok_str(602, NULL);
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_narrow)
-{
-  UT_COVERS("ssa:narrow");
-  UT_RUN(test_narrow_shl_shr_basic);
-  UT_RUN(test_narrow_shl_shr_char_trunc);
-  UT_RUN(test_narrow_shl_shr_short_trunc);
-  UT_RUN(test_narrow_shl_shr_non_matching);
-  UT_RUN(test_narrow_shl_sar_no_fold);
-  UT_RUN(test_narrow_shl_shr_int64_no_fold);
-  UT_RUN(test_narrow_shl_shr_multi_def_no_fold);
-  UT_RUN(test_narrow_shl_shr_zero_shift_no_fold);
-  UT_RUN(test_narrow_and_fold_subset_mask);
-  UT_RUN(test_narrow_and_fold_idempotent);
-  UT_RUN(test_narrow_and_fold_shr_mask_covers);
-  UT_RUN(test_narrow_and_fold_shr_mask_not_covering);
-  UT_RUN(test_narrow_and_fold_non_imm_src2);
-  UT_RUN(test_narrow_and_fold_inner_not_and);
-  UT_RUN(test_narrow_and_fold_shr_non_imm_outer);
-  UT_RUN(test_narrow_and_fold_multi_def_inner);
-}
+UT_COVERS("ssa:narrow");

@@ -19,13 +19,13 @@
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #define I32 IROP_BTYPE_INT32
 #define I64 IROP_BTYPE_INT64
@@ -356,18 +356,4 @@ UT_TEST(test_phi_simplify_all_self)
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_build)
-{
-  UT_COVERS("ssa:substrate");
-  UT_RUN(test_ssa_ctx_lifecycle);
-  UT_RUN(test_cfg_single_block_straight_line);
-  UT_RUN(test_ssa_plain_no_phis);
-  UT_RUN(test_vinfo_construction_defs);
-  UT_RUN(test_vinfo_construction_uses);
-  UT_RUN(test_use_def_add_remove_use);
-  UT_RUN(test_phi_hand_built);
-  UT_RUN(test_phi_simplify_collapses_trivial_phi);
-  UT_RUN(test_phi_simplify_self_ref);
-  UT_RUN(test_phi_simplify_non_trivial_kept);
-  UT_RUN(test_phi_simplify_all_self);
-}
+UT_COVERS("ssa:substrate");

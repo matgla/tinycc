@@ -1,5 +1,5 @@
 /*
- *  test_ir_core.c - suite for ir/core.c IR instruction building
+ *  test_ir_core.c - suite for ir/gen/put.c, ir/gen/jump.c IR instruction building
  *
  *  Exercises instruction append, operand packing, leaf/call tracking,
  *  jump-chain backpatching, and the irop_config shape table.
@@ -259,7 +259,7 @@ UT_TEST(test_set_dest_roundtrip)
 }
 
 /* -------------------------------------------------------------------------- */
-/* ASSIGN-coalescing optimization (tcc_ir_put, ir/core.c ~535-613)            */
+/* ASSIGN-coalescing optimization (tcc_ir_put, ir/gen/put.c ~236-315)         */
 /*                                                                            */
 /* When an ASSIGN's src1 is the TEMP that was just produced as the dest of   */
 /* the immediately preceding instruction, tcc_ir_put() redirects that prior  */
@@ -441,9 +441,9 @@ UT_TEST(test_coalesce_width_mismatch_blocks_coalescing)
 {
   /* NOTE: an earlier version of this test asserted that a width mismatch
    * still coalesces via the irop_make_vreg() "else" rebuild branch at
-   * ir/core.c ~587-601.  That was wrong: `width_match` is itself one of
-   * the conjuncts of `can_coalesce` (ir/core.c:547), so inside
-   * `if (can_coalesce)` the `if (width_match)` check at line 566 always
+   * ir/gen/put.c ~288-296.  That was wrong: `width_match` is itself one of
+   * the conjuncts of `can_coalesce` (ir/gen/put.c:248), so inside
+   * `if (can_coalesce)` the `if (width_match)` check at line 267 always
    * takes the true branch.  The "else" rebuild path is therefore dead
    * code as currently gated -- a width mismatch simply blocks coalescing
    * altogether and the ASSIGN is emitted as its own instruction.  This
@@ -695,10 +695,10 @@ UT_TEST(test_utility_functions_null_safe)
 /* Token -> IR opcode mapping (tcc_irop_from_token)                           */
 /* -------------------------------------------------------------------------- */
 
-/* tcc_irop_from_token() is defined non-static in ir/core.c (called
+/* tcc_irop_from_token() is defined non-static in ir/gen/arith.c (called
  * internally by tcc_ir_gen_i()) but is not declared in ir/core.h or any
  * other header -- no production TU currently calls it from outside
- * ir/core.c.  Declare it locally here rather than editing a production
+ * ir/gen/arith.c.  Declare it locally here rather than editing a production
  * header (see swarm ground rules). */
 extern TccIrOp tcc_irop_from_token(int token);
 
@@ -1271,7 +1271,7 @@ UT_TEST(test_gen_i_add_emits_instruction_and_rewrites_vtop)
   SValue *saved_vtop = vtop;
   vtop = &vals[1];
 
-  tcc_ir_gen_add(ir);
+  tcc_ir_gen_i(ir, '+');
 
   UT_ASSERT_EQ(tcc_ir_count(ir), 1);
   UT_ASSERT_EQ(ir->compact_instructions[0].op, TCCIR_OP_ADD);
@@ -1396,71 +1396,3 @@ UT_TEST(test_asm_add_copies_clobber_regs_and_grows_capacity)
   return 0;
 }
 #endif /* CONFIG_TCC_ASM */
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(ir_core)
-{
-  UT_RUN(test_alloc_fresh_block_has_zero_instructions);
-  UT_RUN(test_put_add_packs_operands);
-  UT_RUN(test_put_no_op_has_no_operands);
-  UT_RUN(test_count_and_current_idx);
-  UT_RUN(test_leaf_by_default);
-  UT_RUN(test_call_marks_nonleaf);
-  UT_RUN(test_nonleaf_mark_explicit);
-  UT_RUN(test_call_id_next_monotonic);
-  UT_RUN(test_set_dest_roundtrip);
-  UT_RUN(test_coalesce_assign_from_prev_temp_dest);
-  UT_RUN(test_coalesce_skipped_when_src1_is_var_not_temp);
-  UT_RUN(test_coalesce_skipped_at_basic_block_start);
-  UT_RUN(test_coalesce_skipped_when_prevent_coalescing_set);
-  UT_RUN(test_coalesce_skipped_when_src1_is_lval);
-  UT_RUN(test_coalesce_skipped_when_src1_vreg_mismatches_prev_dest);
-  UT_RUN(test_coalesce_width_mismatch_blocks_coalescing);
-  UT_RUN(test_coalesce_into_real_stack_slot_sets_stackoff_tag);
-  UT_RUN(test_backpatch_to_here);
-  UT_RUN(test_backpatch_walks_multi_link_chain);
-  UT_RUN(test_backpatch_negative_chain_is_noop);
-  UT_RUN(test_backpatch_stops_at_non_jump_instruction);
-  UT_RUN(test_backpatch_first_patches_only_last_link);
-  UT_RUN(test_backpatch_first_negative_chain_is_noop);
-  UT_RUN(test_gjmp_append_links_new_chain_onto_existing);
-  UT_RUN(test_gjmp_append_returns_t_when_n_out_of_range);
-  UT_RUN(test_utility_functions_null_safe);
-  UT_RUN(test_irop_from_token_arithmetic);
-  UT_RUN(test_irop_from_token_carry_and_wide_mul);
-  UT_RUN(test_irop_from_token_shifts);
-  UT_RUN(test_irop_from_token_all_comparisons_map_to_cmp);
-  UT_RUN(test_put_infers_dest_type_from_untyped_dest_and_src1);
-  UT_RUN(test_put_assign_marks_dest_lvalue_when_src1_is_plain_value);
-  UT_RUN(test_put_assign_does_not_mark_lvalue_when_src1_is_stack_addr);
-  UT_RUN(test_put_lea_marks_src1_addrtaken);
-  UT_RUN(test_put_funccallval_marks_nonleaf);
-  UT_RUN(test_put_suppressed_by_nocode_wanted);
-  UT_RUN(test_put_not_suppressed_by_code_off_bit_alone);
-  UT_RUN(test_put_no_op_zero_line_num_when_file_is_null);
-#ifdef CONFIG_TCC_ASM
-  UT_RUN(test_asm_add_stores_operands_and_marks_nonleaf);
-  UT_RUN(test_asm_put_emits_inline_asm_instruction);
-#endif
-  UT_RUN(test_irop_config_shapes);
-  UT_RUN(test_try_get_live_interval_null_and_invalid);
-  UT_RUN(test_get_live_interval_matches_vreg_live_interval);
-  UT_RUN(test_local_add_computes_stack_address);
-  UT_RUN(test_params_update_tracking);
-  UT_RUN(test_backpatch_sets_pending_jump_target_flag);
-  UT_RUN(test_backpatch_stops_when_next_already_target);
-  UT_RUN(test_backpatch_first_stops_at_out_of_range);
-  UT_RUN(test_put_grows_compact_instructions_past_initial_capacity);
-  UT_RUN(test_put_honors_next_insn_is_jump_target);
-  UT_RUN(test_put_dest_type_inference_corner_cases);
-  UT_RUN(test_gen_i_add_emits_instruction_and_rewrites_vtop);
-  UT_RUN(test_gen_i_umull_promotes_result_to_llong);
-  UT_RUN(test_gen_i_cmp_emits_cmp_and_sets_vtop_condition);
-  UT_RUN(test_ensure_sym_registered_for_anonymous_symbol);
-#ifdef CONFIG_TCC_ASM
-  UT_RUN(test_asm_add_copies_clobber_regs_and_grows_capacity);
-#endif
-}

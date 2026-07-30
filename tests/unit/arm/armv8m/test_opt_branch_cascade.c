@@ -20,10 +20,9 @@
 
 /* Pass entry points (defined in ir/opt_branch.c and ir/opt_promote.c;
  * forward-declared here to avoid pulling in the optimizer engine headers). */
-int tcc_ir_opt_stack_addr_nonnull_fold(TCCIRState *ir);
 int tcc_ir_opt_setif_branch_fuse(TCCIRState *ir);
 int tcc_ir_opt_stack_bool_diamond(TCCIRState *ir);
-int tcc_ir_opt_or_bool_diamond(TCCIRState *ir);
+int ssa_opt_or_bool_diamond(TCCIRState *ir);
 int tcc_ir_opt_var_tmp_fwd(TCCIRState *ir);
 
 #define I32 IROP_BTYPE_INT32
@@ -63,53 +62,6 @@ static TCCIRState *utb_pool_new(void)
   TCCIRState *ir = utb_new();
   ir->iroperand_pool_capacity = UTB_MAX_OPERANDS;
   return ir;
-}
-
-/* ================================================================== stack_nonnull */
-
-/* POSITIVE: a CMP of a known stack address against 0, EQ-branch -- a stack
- * address is never NULL, so the compare is always false: both CMP and the
- * JUMPIF are dead. */
-UT_TEST(test_stack_nonnull_eq_zero_folds_to_nop)
-{
-  TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
-  int cmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_imm(0, I32));
-  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(2, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_stack_addr_nonnull_fold(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_NOP);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): T0 is an arbitrary value, not a known stack address --
- * the CMP/JUMPIF pair must survive untouched. */
-UT_TEST(test_stack_nonnull_non_stackaddr_kept)
-{
-  TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32), UTB_NONE);
-  int cmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_imm(0, I32));
-  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(2, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_stack_addr_nonnull_fold(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_CMP);
-  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_JUMPIF);
-
-  utb_free(ir);
-  return 0;
 }
 
 /* ================================================================== setif_fuse */
@@ -162,6 +114,101 @@ UT_TEST(test_setif_fuse_multi_use_setif_kept)
   UT_ASSERT_EQ(utb_op(ir, setif), TCCIR_OP_SETIF);
   UT_ASSERT_EQ(utb_op(ir, test_zero), TCCIR_OP_TEST_ZERO);
   UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_JUMPIF);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* ============================================================ branch_fold_test_zero */
+
+/* POSITIVE: TEST_ZERO #0 + JUMPIF EQ -- the constant is zero so an EQ branch is
+ * always taken: TEST_ZERO becomes NOP and the JUMPIF becomes an unconditional
+ * JUMP that keeps the original target. */
+UT_TEST(test_branch_fold_test_zero_taken_becomes_jump)
+{
+  TCCIRState *ir = utb_new();
+
+  int test_zero = utb_emit(ir, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_imm(0, I32), UTB_NONE);
+  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(2, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_setif_branch_fuse(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, test_zero), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_dest(ir, jumpif)), 3);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: TEST_ZERO #7 + JUMPIF EQ -- the constant is non-zero so the EQ
+ * branch is never taken: both instructions become NOP (control falls through). */
+UT_TEST(test_branch_fold_test_zero_not_taken_becomes_nop)
+{
+  TCCIRState *ir = utb_new();
+
+  int test_zero = utb_emit(ir, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_imm(7, I32), UTB_NONE);
+  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(2, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_setif_branch_fuse(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, test_zero), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_NOP);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): the tested value is a runtime temp, not an immediate --
+ * nothing is known about the flag, so the pair must survive untouched. */
+UT_TEST(test_branch_fold_test_zero_non_immediate_kept)
+{
+  TCCIRState *ir = utb_new();
+
+  int test_zero = utb_emit(ir, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(2, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_setif_branch_fuse(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, test_zero), TCCIR_OP_TEST_ZERO);
+  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_JUMPIF);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: a not-taken TEST_ZERO whose flags are also consumed by a following
+ * SETIF. After NOPing the dead branch, the SETIF (which would read stale flags)
+ * is folded to the known constant: TEST_ZERO #7 + JUMPIF EQ (not taken) leaves a
+ * SETIF NE which resolves to (7 != 0) == 1, an ASSIGN #1. */
+UT_TEST(test_branch_fold_test_zero_folds_trailing_setif)
+{
+  TCCIRState *ir = utb_new();
+
+  int test_zero = utb_emit(ir, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_imm(7, I32), UTB_NONE);
+  int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
+  int setif = utb_emit(ir, TCCIR_OP_SETIF, utb_temp(0, I32), utb_imm(TOK_NE, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(2, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_setif_branch_fuse(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, test_zero), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, jumpif), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, setif), TCCIR_OP_ASSIGN);
+  IROperand imm = utb_src1(ir, setif);
+  UT_ASSERT(irop_is_immediate(imm));
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, imm), 1);
 
   utb_free(ir);
   return 0;
@@ -255,7 +302,7 @@ UT_TEST(test_or_bool_diamond_collapses_to_direct_or)
   int i_or = utb_emit(ir, TCCIR_OP_OR, utb_temp(2, I32), utb_temp(1, I32), utb_slot_lval(-8, I32));
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
 
-  int changes = tcc_ir_opt_or_bool_diamond(ir);
+  int changes = ssa_opt_or_bool_diamond(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, i_jmpif), TCCIR_OP_JUMPIF); /* untouched */
@@ -282,7 +329,7 @@ UT_TEST(test_or_bool_diamond_extra_slot_use_kept)
   int extra = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(3, I32), utb_slot_lval(-8, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
 
-  int changes = tcc_ir_opt_or_bool_diamond(ir);
+  int changes = ssa_opt_or_bool_diamond(ir);
 
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, i_st_t), TCCIR_OP_STORE);
@@ -342,28 +389,140 @@ UT_TEST(test_var_tmp_fwd_nonadjacent_temp_kept)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_branch_cascade)
+/* POSITIVE: V appearing in a src2 read position is forwarded too. */
+UT_TEST(test_var_tmp_fwd_forwards_src2)
 {
-  UT_COVERS("stack_nonnull");
-  UT_COVERS("setif_fuse");
-  UT_COVERS("stack_bool");
-  UT_COVERS("or_bool");
-  UT_COVERS("var_tmp_fwd");
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 1);
 
-  UT_RUN(test_stack_nonnull_eq_zero_folds_to_nop);
-  UT_RUN(test_stack_nonnull_non_stackaddr_kept);
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_STORE, utb_var(0, I32), utb_temp(0, I32), UTB_NONE);
+  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_imm(5, I32), utb_var(0, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
 
-  UT_RUN(test_setif_fuse_chain_collapses_to_direct_branch);
-  UT_RUN(test_setif_fuse_multi_use_setif_kept);
+  int changes = tcc_ir_opt_var_tmp_fwd(ir);
 
-  UT_RUN(test_stack_bool_diamond_collapses_to_direct_jumps);
-  UT_RUN(test_stack_bool_diamond_non_immediate_store_kept);
+  UT_ASSERT_EQ(changes, 1);
+  IROperand src2 = utb_src2(ir, use);
+  UT_ASSERT_EQ(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(src2)), TCCIR_VREG_TYPE_TEMP);
+  UT_ASSERT_EQ(utb_vreg_pos(src2), 0);
 
-  UT_RUN(test_or_bool_diamond_collapses_to_direct_or);
-  UT_RUN(test_or_bool_diamond_extra_slot_use_kept);
-
-  UT_RUN(test_var_tmp_fwd_forwards_adjacent_temp);
-  UT_RUN(test_var_tmp_fwd_nonadjacent_temp_kept);
+  utb_free(ir);
+  return 0;
 }
+
+/* NEGATIVE (DEREF guard): the STORE source is an lval TEMP (a memory deref),
+ * not a register-held value -- forwarding would duplicate the read. */
+UT_TEST(test_var_tmp_fwd_lval_temp_src_kept)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 1);
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_STORE, utb_var(0, I32), utb_lval(utb_temp(0, I32)), UTB_NONE);
+  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_var(0, I32), utb_imm(5, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_var_tmp_fwd(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(utb_src1(ir, use))), TCCIR_VREG_TYPE_VAR);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (address guard): T is defined by a LEA, so it holds a computed
+ * address; forwarding it would break downstream stack-slot liveness analyses. */
+UT_TEST(test_var_tmp_fwd_lea_source_kept)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 1);
+
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, utb_var(0, I32), utb_temp(0, I32), UTB_NONE);
+  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_var(0, I32), utb_imm(5, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_var_tmp_fwd(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(utb_src1(ir, use))), TCCIR_VREG_TYPE_VAR);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (BB boundary): a back-edge JUMP targets the use, so V may hold a
+ * different value on re-entry -- forwarding must stop at the jump target. */
+UT_TEST(test_var_tmp_fwd_stops_at_jump_target)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 1);
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_STORE, utb_var(0, I32), utb_temp(0, I32), UTB_NONE);
+  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_var(0, I32), utb_imm(5, I32));
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(2, I32), UTB_NONE, UTB_NONE); /* back-edge to index 2 (the use) */
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_var_tmp_fwd(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(utb_src1(ir, use))), TCCIR_VREG_TYPE_VAR);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (aliasing): the VAR is address-taken AND a LEA of it exists, so its
+ * slot may be read through the pointer -- forwarding is unsound. */
+UT_TEST(test_var_tmp_fwd_addrtaken_with_lea_kept)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 2);
+  ir->variables_live_intervals[1].addrtaken = 1;
+
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(9, I32), utb_var(1, I32), UTB_NONE); /* &V1 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_STORE, utb_var(1, I32), utb_temp(0, I32), UTB_NONE);
+  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_var(1, I32), utb_imm(5, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_var_tmp_fwd(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(utb_src1(ir, use))), TCCIR_VREG_TYPE_VAR);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE (stale annotation): address-taken is set but there is no LEA / chain
+ * aliasing path, so the annotation is stale and forwarding is still safe. */
+UT_TEST(test_var_tmp_fwd_addrtaken_no_lea_forwards)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 1);
+  ir->variables_live_intervals[0].addrtaken = 1;
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_STORE, utb_var(0, I32), utb_temp(0, I32), UTB_NONE);
+  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_var(0, I32), utb_imm(5, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_var_tmp_fwd(ir);
+
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(utb_vreg_pos(utb_src1(ir, use)), 0);
+  UT_ASSERT_EQ(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(utb_src1(ir, use))), TCCIR_VREG_TYPE_TEMP);
+
+  utb_free(ir);
+  return 0;
+}
+
+UT_COVERS("setif_fuse");
+UT_COVERS("branch_fold_test_zero");
+UT_COVERS("stack_bool");
+UT_COVERS("ssa:or_bool_diamond");
+UT_COVERS("var_tmp_fwd");

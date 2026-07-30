@@ -37,6 +37,7 @@ int tcc_ir_opt_known_bits(TCCIRState *ir);
 #define I8  IROP_BTYPE_INT8
 #define I16 IROP_BTYPE_INT16
 #define I32 IROP_BTYPE_INT32
+#define I64 IROP_BTYPE_INT64
 
 /* Build a direct StackLoc[off] lvalue operand (is_lval=1, no vreg) that the
  * pass recognizes via kb_is_direct_stackoff(). */
@@ -741,41 +742,172 @@ UT_TEST(test_knownbits_test_zero_fold_wellformed)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_knownbits)
+/* TEST_ZERO of a provably non-zero value + JUMPIF NE folds to an unconditional
+ * JUMP (the taken branch), complementing the EQ->NOP case above.  Verifies the
+ * branch_taken=1 path preserves the JUMPIF's target on the rewritten JUMP. */
+UT_TEST(test_knownbits_test_zero_ne_folds_to_jump)
 {
-  UT_COVERS("known_bits");
-  UT_RUN(test_knownbits_and_zero_folds);
-  UT_RUN(test_knownbits_or_allones_folds);
-  UT_RUN(test_knownbits_or_then_shl_folds_word);
-  UT_RUN(test_knownbits_narrow_unsigned_load_masks_width);
-  UT_RUN(test_knownbits_narrow_signed_load_sign_extends);
-  UT_RUN(test_knownbits_assign_lval_immediate_keeps_load_shape);
-  UT_RUN(test_knownbits_lval_shift_keeps_load_shape);
-  UT_RUN(test_knownbits_jumpif_after_stack_store_invalidates_merge_slot);
-  UT_RUN(test_knownbits_unknown_operands_no_fold);
-  UT_RUN(test_knownbits_partial_known_no_fold);
-  UT_RUN(test_knownbits_and_allones_identity);
-  UT_RUN(test_knownbits_partial_and_fully_determines);
-  UT_RUN(test_knownbits_or_zero_identity);
-  UT_RUN(test_knownbits_xor_self_no_fold);
-  UT_RUN(test_knownbits_xor_zero_identity);
-  UT_RUN(test_knownbits_shl_zero_identity);
-  UT_RUN(test_knownbits_shl_31_known_one);
-  UT_RUN(test_knownbits_shl_32_yields_zero);
-  UT_RUN(test_knownbits_shr_30_logical_shift);
-  UT_RUN(test_knownbits_shr_32_yields_zero);
-  UT_RUN(test_knownbits_sar_zero_identity);
-  UT_RUN(test_knownbits_sar_31_negative);
-  UT_RUN(test_knownbits_sar_31_positive);
-  UT_RUN(test_knownbits_sar_32_unhandled);
-  UT_RUN(test_knownbits_shl_negative_count_no_fold);
-  UT_RUN(test_knownbits_narrow_unsigned16_load_zero_extends);
-  UT_RUN(test_knownbits_narrow_signed16_load_sign_extends);
-  UT_RUN(test_knownbits_ubfx_lsb0_width1_no_fold);
-  UT_RUN(test_knownbits_ubfx_full_width_no_fold);
-  UT_RUN(test_knownbits_ubfx_lsb_plus_width_overflow_no_fold);
-  UT_RUN(test_knownbits_reaches_fixpoint);
-  UT_RUN(test_knownbits_test_zero_fold_wellformed);
+  TCCIRState *ir = utb_new();
+
+  /* T0 = #1, T1 = T0 OR #1  -> T1's low bit is known-one (provably non-zero). */
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_OR, utb_temp(1, I32), utb_temp(0, I32), utb_imm(1, I32));
+  int tz = utb_emit(ir, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+  int j = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(0, I32), utb_imm(0x95, I32),
+                   UTB_NONE);
+
+  int changes = tcc_ir_opt_known_bits(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, tz), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, j), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_dest(ir, j)), 0);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 2), 0);
+
+  utb_free(ir);
+  return 0;
 }
+
+/* CMP src1, #0 + JUMPIF sign fold: when src1's sign bit is known-one it is
+ * provably negative, so a signed `< 0` (tok 0x9c) branch is always taken.  The
+ * CMP is NOPed and the JUMPIF becomes an unconditional JUMP.  Exercises the
+ * sign-only fold path (distinct from the fully-known CMP fold). */
+UT_TEST(test_knownbits_cmp_zero_sign_negative_folds_jump)
+{
+  TCCIRState *ir = utb_new();
+
+  /* T1 = param0 OR #0x80000000 -> bit 31 known-one -> provably negative. */
+  utb_emit(ir, TCCIR_OP_OR, utb_temp(1, I32),
+           utb_param(0, I32), utb_imm((int32_t)0x80000000, I32));
+  int c = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_imm(0, I32));
+  int j = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(0, I32), utb_imm(0x9c, I32),
+                   UTB_NONE);
+
+  int changes = tcc_ir_opt_known_bits(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, c), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, j), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ(utb_assert_wellformed(ir, 1), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* CMP src1, #0 + JUMPIF sign fold, non-taken direction: a provably-negative
+ * src1 makes a signed `>= 0` (tok 0x9d) branch never taken, so both the CMP and
+ * the JUMPIF are NOPed (control falls through). */
+UT_TEST(test_knownbits_cmp_zero_sign_negative_drops_ge_branch)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_OR, utb_temp(1, I32),
+           utb_param(0, I32), utb_imm((int32_t)0x80000000, I32));
+  int c = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_imm(0, I32));
+  int j = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(0, I32), utb_imm(0x9d, I32),
+                   UTB_NONE);
+
+  int changes = tcc_ir_opt_known_bits(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, c), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, j), TCCIR_OP_NOP);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* INT64 low-32 tracking: a 64-bit SHL by >= 32 makes the low 32 bits provably
+ * zero (is_low32 fact).  When that value is used as the shift amount of a
+ * 32-bit SHL, the pass narrows the 64-bit operand to the known 32-bit immediate
+ * (#0) in place, without folding the outer SHL (its shifted value is unknown). */
+UT_TEST(test_knownbits_int64_low32_narrows_shift_amount)
+{
+  TCCIRState *ir = utb_new();
+
+  /* T1(I64) = param0(I64) SHL #32 -> low 32 bits are all zero. */
+  utb_emit(ir, TCCIR_OP_SHL, utb_temp(1, I64), utb_param(0, I64),
+           utb_imm(32, I32));
+  /* T2(I32) = param1(I32) SHL T1(I64) -> the 64-bit amount narrows to #0. */
+  int s = utb_emit(ir, TCCIR_OP_SHL, utb_temp(2, I32), utb_param(1, I32),
+                   utb_temp(1, I64));
+
+  int changes = tcc_ir_opt_known_bits(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, s), TCCIR_OP_SHL);
+  UT_ASSERT(irop_is_immediate(utb_src2(ir, s)));
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src2(ir, s)), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* MUL of two fully-known values folds to the product immediate.
+ *   T0 = #6, T1 = #7, T2 = T0 * T1  -> T2 = #42. */
+UT_TEST(test_knownbits_mul_consts_fold)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(6, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(7, I32), UTB_NONE);
+  int i2 = utb_emit(ir, TCCIR_OP_MUL, utb_temp(2, I32),
+                    utb_temp(0, I32), utb_temp(1, I32));
+
+  int changes = tcc_ir_opt_known_bits(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, i2), TCCIR_OP_ASSIGN);
+  UT_ASSERT(irop_is_immediate(utb_src1(ir, i2)));
+  UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, i2)), 42);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* CMP x, #C (C != 0) + JUMPIF EQ where a known bit of x contradicts C: the
+ * equality is impossible, so the EQ branch is dead (CMP + JUMPIF both NOPed).
+ *   T1 = param0 OR #1   ; bit 0 known-one
+ *   CMP T1, #4          ; 4 has bit0 = 0 -> T1 != 4 provable
+ *   JUMPIF EQ           ; never taken */
+UT_TEST(test_knownbits_cmp_const_eq_bit_incompatible_drops_branch)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_OR, utb_temp(1, I32), utb_param(0, I32), utb_imm(1, I32));
+  int c = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_imm(4, I32));
+  int j = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(0, I32), utb_imm(0x94, I32),
+                   UTB_NONE);
+
+  int changes = tcc_ir_opt_known_bits(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, c), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, j), TCCIR_OP_NOP);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Companion: same incompatibility with JUMPIF NE makes the branch always taken
+ * (CMP NOPed, JUMPIF -> unconditional JUMP). */
+UT_TEST(test_knownbits_cmp_const_ne_bit_incompatible_takes_branch)
+{
+  TCCIRState *ir = utb_new();
+
+  utb_emit(ir, TCCIR_OP_OR, utb_temp(1, I32), utb_param(0, I32), utb_imm(1, I32));
+  int c = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(1, I32), utb_imm(4, I32));
+  int j = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(0, I32), utb_imm(0x95, I32),
+                   UTB_NONE);
+
+  int changes = tcc_ir_opt_known_bits(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT_EQ(utb_op(ir, c), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, j), TCCIR_OP_JUMP);
+
+  utb_free(ir);
+  return 0;
+}
+
+UT_COVERS("known_bits");

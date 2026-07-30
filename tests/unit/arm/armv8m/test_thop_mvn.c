@@ -9,8 +9,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_mvn.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_mvn.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -301,35 +301,4 @@ UT_TEST(test_mvn_reg_t3_sp_in_rm_fails)
   UT_ASSERT_EQ(op.opcode, 0);
 
   return 0;
-}
-
-/* ───── suite ───── */
-
-UT_SUITE(thop_mvn)
-{
-  /* MVN register T1 */
-  UT_RUN(test_mvn_reg_t1_basic);
-  UT_RUN(test_mvn_reg_t1_rd_ne_rn_falls_to_t3);
-
-  /* MVN register T3 */
-  UT_RUN(test_mvn_reg_t3_basic);
-  UT_RUN(test_mvn_reg_t3_high_reg);
-  UT_RUN(test_mvn_reg_t3_with_shift_lsl);
-  UT_RUN(test_mvn_reg_t3_with_shift_lsr);
-  UT_RUN(test_mvn_reg_t3_with_shift_asr);
-  UT_RUN(test_mvn_reg_t3_with_shift_ror);
-  UT_RUN(test_mvn_reg_t3_with_rrx);
-  UT_RUN(test_mvn_reg_t3_setflags);
-  UT_RUN(test_mvn_reg_t3_enforce_16bit_fails);
-
-  /* MVN immediate T3 */
-  UT_RUN(test_mvn_imm_basic);
-  UT_RUN(test_mvn_imm_with_flags);
-  UT_RUN(test_mvn_imm_high_reg);
-  UT_RUN(test_mvn_imm_enforce_16bit_fails);
-
-  /* Constraint failures */
-  UT_RUN(test_mvn_reg_t1_high_reg_fails);
-  UT_RUN(test_mvn_reg_t3_pc_in_rm_fails);
-  UT_RUN(test_mvn_reg_t3_sp_in_rm_fails);
 }

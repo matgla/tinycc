@@ -67,40 +67,40 @@ float __aeabi_fmul(float a, float b)
     return ur.f;
   }
 
-  /* Add implicit bit */
+  /* Add the implicit bit for normals; a subnormal's effective exponent is 1,
+   * not the stored 0. */
   if (a_exp != 0)
     a_mant |= FLOAT_IMPLICIT_BIT;
+  else
+    a_exp = 1;
   if (b_exp != 0)
     b_mant |= FLOAT_IMPLICIT_BIT;
+  else
+    b_exp = 1;
 
-  /* Calculate result exponent */
+  /* 24 x 24 -> 48 bits.  Each input is m x 2^-23, so the product is p x 2^-46. */
+  uint64_t product = (uint64_t)a_mant * (uint64_t)b_mant;
   int result_exp = a_exp + b_exp - FLOAT_EXP_BIAS;
 
-  /* Multiply mantissas (24-bit * 24-bit = 48-bit) */
-  uint64_t product = (uint64_t)a_mant * (uint64_t)b_mant;
-
-  /* Normalize: product is in bits 46-0, implicit bit at 46 or 47 */
-  if (product & (1ULL << 47))
+  /* Normalize the product to a known leading-bit position *before* narrowing
+   * it to 32 bits.  A subnormal operand leaves the leading bit far below 46,
+   * so a fixed shift would discard significant bits rather than just guard
+   * bits (FLT_MIN_SUBNORMAL * FLT_MAX lost 20 bits of significand that way). */
   {
-    product >>= 1;
-    result_exp++;
+    int lead = 63 - clz64(product);
+    int adj = 46 - lead;
+    if (adj > 0)
+      product <<= adj;
+    else if (adj < 0)
+      product = sfp_shr_sticky64(product, -adj);
+    result_exp -= adj;
   }
 
-  /* Shift to get 23-bit mantissa */
-  uint32_t result_mant = (uint32_t)(product >> 23);
+  /* Reduce to the position sfp_round_pack_float() expects (leading bit at
+   * 23 + SFP_GRS), folding the discarded bits into the sticky bit rather than
+   * dropping them -- dropping them truncated every inexact product. */
+  uint32_t result_mant = (uint32_t)sfp_shr_sticky64(product, 46 - (23 + SFP_GRS));
 
-  if (result_exp >= 0xFF)
-  {
-    ur.u = make_float(result_sign, 0xFF, 0);
-    return ur.f;
-  }
-  if (result_exp <= 0)
-  {
-    ur.u = make_float(result_sign, 0, 0);
-    return ur.f;
-  }
-
-  result_mant &= FLOAT_MANT_MASK;
-  ur.u = make_float(result_sign, result_exp, result_mant);
+  ur.u = sfp_round_pack_float(result_sign, result_exp, result_mant);
   return ur.f;
 }

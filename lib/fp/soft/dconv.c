@@ -157,81 +157,9 @@ unsigned int __aeabi_d2uiz(double a)
   return (uint32_t)__aeabi_llsr(mant, -shift);
 }
 
-/* Convert double to unsigned 64-bit integer (truncate toward zero) */
-unsigned long long __aeabi_d2ulz(double a)
-{
-  union
-  {
-    double d;
-    uint64_t u;
-  } ua;
-  ua.d = a;
-  uint64_t bits = ua.u;
-
-  int sign = double_sign(bits);
-  int exp = double_exp(bits);
-  uint64_t mant = double_mant(bits);
-
-  if (sign)
-    return 0;
-  if (exp == 0x7FF)
-    return 0; /* NaN/Inf */
-  if (exp == 0)
-    return 0; /* Zero/denormal */
-
-  mant |= DOUBLE_IMPLICIT_BIT;
-  int actual_exp = exp - DOUBLE_EXP_BIAS;
-  if (actual_exp < 0)
-    return 0;
-  if (actual_exp >= 64)
-    return ~0ULL;
-
-  int shift = actual_exp - 52;
-  if (shift >= 0)
-  {
-    if (shift >= 64)
-      return ~0ULL;
-    return (unsigned long long)__aeabi_llsl((long long)mant, shift);
-  }
-  return (unsigned long long)__aeabi_llsr(mant, -shift);
-}
-
-/* Convert double to signed 64-bit integer (truncate toward zero) */
-long long __aeabi_d2lz(double a)
-{
-  union
-  {
-    double d;
-    uint64_t u;
-  } ua;
-  ua.d = a;
-  uint64_t bits = ua.u;
-
-  int sign = double_sign(bits);
-  int exp = double_exp(bits);
-  uint64_t mant = double_mant(bits);
-
-  if (exp == 0x7FF)
-    return 0; /* NaN/Inf */
-  if (exp == 0)
-    return 0; /* Zero/denormal */
-
-  mant |= DOUBLE_IMPLICIT_BIT;
-  int actual_exp = exp - DOUBLE_EXP_BIAS;
-  if (actual_exp < 0)
-    return 0;
-  if (actual_exp >= 63)
-    return sign ? (long long)0x8000000000000000ULL : (long long)0x7FFFFFFFFFFFFFFFULL;
-
-  int shift = actual_exp - 52;
-  unsigned long long magnitude;
-  if (shift >= 0)
-    magnitude = (unsigned long long)__aeabi_llsl((long long)mant, shift);
-  else
-    magnitude = (unsigned long long)__aeabi_llsr(mant, -shift);
-
-  return sign ? -(long long)magnitude : (long long)magnitude;
-}
+/* The 64-bit forms (__aeabi_d2lz / __aeabi_d2ulz) live in conv64.c so that a
+ * hardware FP runtime can link them without also getting the 32-bit
+ * conversions above, which it implements itself. */
 
 /* Convert single to double precision (raw float bits in r0). */
 double __aeabi_f2d_bits(uint32_t bits)
@@ -263,6 +191,22 @@ double __aeabi_f2d_bits(uint32_t bits)
     /* Zero */
     ur.w.hi = (uint32_t)sign << 31;
     ur.w.lo = 0;
+    return ur.d;
+  }
+
+  if (exp == 0)
+  {
+    /* Subnormal float.  Its significand has no implicit leading 1, so copying
+     * it straight across (as the code below does for normals) produced a
+     * completely wrong value -- FLT_MIN_SUBNORMAL widened to ~5.4e-39 instead
+     * of 1.4e-45.  Double has ample exponent range, so every float subnormal
+     * is exactly representable as a *normal* double once normalized. */
+    int msb_pos = 31 - clz32(mant); /* 0..22 */
+    int sub_exp = DOUBLE_EXP_BIAS - FLOAT_EXP_BIAS + 1 + msb_pos - 23;
+    uint64_t dmant = (uint64_t)__aeabi_llsl((long long)mant, 52 - msb_pos) & DOUBLE_MANT_MASK;
+
+    ur.w.hi = ((uint32_t)sign << 31) | ((uint32_t)sub_exp << 20) | (uint32_t)(dmant >> 32);
+    ur.w.lo = (uint32_t)dmant;
     return ur.d;
   }
 
@@ -309,26 +253,31 @@ float __aeabi_d2f(double a)
     return ur.f;
   }
 
-  /* Convert exponent */
-  int new_exp = exp - DOUBLE_EXP_BIAS + FLOAT_EXP_BIAS;
-
-  /* Check for overflow -> infinity */
-  if (new_exp >= 0xFF)
+  /* Restore the implicit bit for normals; a subnormal double is far below the
+   * float range and will simply round away, but it must still go through the
+   * same path rather than being special-cased to zero. */
+  uint64_t sig;
+  int src_exp;
+  if (exp != 0)
   {
-    ur.u = ((uint32_t)sign << 31) | 0x7F800000U;
-    return ur.f;
+    sig = mant | DOUBLE_IMPLICIT_BIT;
+    src_exp = exp;
+  }
+  else
+  {
+    sig = mant;
+    src_exp = 1;
   }
 
-  /* Check for underflow -> zero */
-  if (new_exp <= 0)
-  {
-    ur.u = (uint32_t)sign << 31;
-    return ur.f;
-  }
+  int new_exp = src_exp - DOUBLE_EXP_BIAS + FLOAT_EXP_BIAS;
 
-  /* Truncate mantissa from 52 bits to 23 bits */
-  uint32_t new_mant = (uint32_t)__aeabi_llsr(mant, 29);
+  /* Narrow the 53-bit significand (leading bit at 52) to the position the
+   * rounding core expects, keeping everything shifted out as sticky.  The old
+   * code truncated with a bare >> 29 and flushed any result with new_exp <= 0
+   * to zero, so (double)(1/3.0) narrowed to 0x3eaaaaaa instead of 0x3eaaaaab
+   * and every subnormal float result was lost. */
+  uint32_t new_mant = (uint32_t)sfp_shr_sticky64(sig, 52 - (23 + SFP_GRS));
 
-  ur.u = ((uint32_t)sign << 31) | ((uint32_t)new_exp << 23) | new_mant;
+  ur.u = sfp_round_pack_float(sign, new_exp, new_mant);
   return ur.f;
 }

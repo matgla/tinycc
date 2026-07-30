@@ -3,7 +3,8 @@
  *  already covered by test_opt_memory.c (sl_forward guard cases) or
  *  test_opt_store_fwd.c (entry_store, byte_store_merge, store_redundant,
  *  dead_static_store, dead_local_slot, dead_temp_local, global_base_share) or
- *  test_opt_deref_fwd.c / test_opt_global_sl_fwd.c (deref_fwd, global_sl_fwd).
+ *  test_opt_global_sl_fwd.c (global_sl_fwd).  (deref_fwd was retired 2026-07-14 —
+ *  subsumed by ssa:load_cse.)
  *
  *  This file adds coverage for the remaining bare `int tcc_ir_opt_<name>
  *  (TCCIRState *ir)` entries in ir/opt_memory.c that are called directly from
@@ -13,8 +14,6 @@
  *  contract this still follows):
  *
  *    - addrof_var_fwd            (tcc_ir_opt_addrof_var_fwd)
- *    - ptr_load_cse              (tcc_ir_opt_ptr_load_cse)
- *    - ptr_store_load_fwd        (tcc_ir_opt_ptr_store_load_fwd)
  *    - invariant_global_load_hoist (tcc_ir_opt_invariant_global_load_hoist)
  *    - invariant_temp_deref_hoist  (tcc_ir_opt_invariant_temp_deref_hoist)
  *    - rmw_byte_clear            (tcc_ir_opt_rmw_byte_clear)
@@ -42,8 +41,6 @@
 /* Pass entry points (defined in ir/opt_memory.c; forward-declared here to
  * avoid pulling in the optimizer engine headers). */
 int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir);
-int tcc_ir_opt_ptr_load_cse(TCCIRState *ir);
-int tcc_ir_opt_ptr_store_load_fwd(TCCIRState *ir);
 int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir);
 int tcc_ir_opt_invariant_temp_deref_hoist(TCCIRState *ir);
 int tcc_ir_opt_rmw_byte_clear(TCCIRState *ir);
@@ -167,147 +164,6 @@ UT_TEST(test_addrof_var_fwd_redefinition_blocks_forward)
   return 0;
 }
 
-/* ================================================================ ptr_load_cse */
-
-/* POSITIVE: two ASSIGNs load the same pointer deref (T0***DEREF***) into T1
- * and T3 with nothing but a pure ALU op between them -- the second load is
- * redundant; it is NOPed and its (surviving) use is redirected to T1. */
-UT_TEST(test_ptr_load_cse_second_deref_load_removed)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-  ir->next_temporary_variable = 5; /* T0..T4 used by hand below */
-
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
-  int load1 = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(1, I32), utb_imm(1, I32));
-  int load2 = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(3, I32), utb_deref_temp(0, I32), UTB_NONE);
-  int use2 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(4, I32), utb_temp(3, I32), utb_imm(2, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(4, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_ptr_load_cse(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, load1), TCCIR_OP_ASSIGN); /* the anchor load survives */
-  UT_ASSERT_EQ(utb_op(ir, load2), TCCIR_OP_NOP);     /* the redundant load is gone */
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, use2)), utb_vreg(utb_temp(1, I32))); /* redirected to T1 */
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): a STORE between the two derefs invalidates the cached
- * pointer load -- the second deref load must survive. */
-UT_TEST(test_ptr_load_cse_intervening_store_blocks)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-  ir->next_temporary_variable = 4; /* T0..T3 used by hand below */
-
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_deref_temp(0, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(9, I32), UTB_NONE);
-  int load2 = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(3, I32), utb_deref_temp(0, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_ptr_load_cse(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, load2), TCCIR_OP_ASSIGN);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* ================================================================ ptr_store_load_fwd */
-
-/* POSITIVE: STORE through a TEMP-typed pointer deref, then a read of the same
- * deref -- the read is forwarded to the stored value.
- *
- * NOTE: the pass only tracks a STORE whose *value* operand already carries a
- * vreg (irop_get_vreg(src) >= 0, checked via `val_vr >= 0` in
- * tcc_ir_opt_ptr_store_load_fwd) -- see ir/opt_memory.c. A bare immediate
- * built with utb_imm() has vreg_type 0 (irop_get_vreg() == -1, by design --
- * see the utb_imm() doc comment in ir_build.h), so storing an immediate
- * directly never enters the cache. Materialize the stored value into a temp
- * via ASSIGN first so it has a real vreg, matching what the frontend/earlier
- * passes would actually feed this pass. */
-UT_TEST(test_ptr_store_load_fwd_forwards_stored_value)
-{
-  TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(5, I32), UTB_NONE);
-  int store = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_temp(2, I32), UTB_NONE);
-  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp(0, I32), utb_imm(0, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_ptr_store_load_fwd(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
-  IROperand s1 = utb_src1(ir, use);
-  UT_ASSERT(!s1.is_lval);
-  UT_ASSERT_EQ(irop_get_vreg(s1), irop_get_vreg(utb_temp(2, I32)));
-
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE (dead-store half): two STOREs to the same pointer deref with no
- * intervening read -- the first (overwritten) STORE is dead.
- *
- * NOTE: same vreg-carrying-value requirement as above -- see the comment on
- * test_ptr_store_load_fwd_forwards_stored_value. */
-UT_TEST(test_ptr_store_load_fwd_overwritten_store_removed)
-{
-  TCCIRState *ir = utb_new();
-
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(3, I32), utb_imm(2, I32), UTB_NONE);
-  int dead = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_temp(2, I32), UTB_NONE);
-  int kept = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_temp(3, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_ptr_store_load_fwd(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, kept), TCCIR_OP_STORE);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): a call between the store and the read clears all tracked
- * entries (the callee may write through the same pointer) -- the read must
- * NOT be forwarded. */
-UT_TEST(test_ptr_store_load_fwd_call_clears_tracking)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee_sym;
-  utb_set_tok_str(TOK_FOO, "foo");
-  IROperand callee = utb_callee(ir, &callee_sym, TOK_FOO);
-
-  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_slot_addr(-8, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(5, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, callee, utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 0), I32));
-  int use = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp(0, I32), utb_imm(0, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_ptr_store_load_fwd(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  IROperand s1 = utb_src1(ir, use);
-  UT_ASSERT(s1.is_lval);
-
-  utb_free(ir);
-  return 0;
-}
-
 /* ================================================================ invariant_global_load_hoist */
 
 /* POSITIVE: the same non-volatile, never-directly-stored global is loaded
@@ -421,6 +277,47 @@ UT_TEST(test_invariant_temp_deref_hoist_two_derefs_hoisted)
   UT_ASSERT(!s1_use1.is_lval || utb_vreg(s1_use1) != utb_vreg(utb_temp(0, I32)));
   UT_ASSERT(!s1_use2.is_lval || utb_vreg(s1_use2) != utb_vreg(utb_temp(0, I32)));
   UT_ASSERT_EQ(utb_vreg(s1_use1), utb_vreg(s1_use2));
+
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_invariant_temp_deref_hoist_copy_chain_hoisted)
+{
+  TCCIRState *ir = utb_hoist_new(5); /* T0..T4 used by hand below */
+
+  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(0, I32), utb_slot_lval(-8, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_temp(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_temp(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(3, I32), utb_deref_temp(1, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(4, I32), utb_deref_temp(2, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(4, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_invariant_temp_deref_hoist(ir);
+
+  UT_ASSERT(changes > 0);
+
+  int use1 = -1, use2 = -1;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    if (utb_op(ir, i) != TCCIR_OP_ADD)
+      continue;
+    int32_t dv = utb_vreg(utb_dest(ir, i));
+    if (dv == utb_vreg(utb_temp(3, I32)))
+      use1 = i;
+    else if (dv == utb_vreg(utb_temp(4, I32)))
+      use2 = i;
+  }
+  UT_ASSERT(use1 >= 0);
+  UT_ASSERT(use2 >= 0);
+
+  IROperand s1_use1 = utb_src1(ir, use1);
+  IROperand s1_use2 = utb_src1(ir, use2);
+  UT_ASSERT(!s1_use1.is_lval);
+  UT_ASSERT(!s1_use2.is_lval);
+  UT_ASSERT_EQ(utb_vreg(s1_use1), utb_vreg(s1_use2));
+  UT_ASSERT(utb_vreg(s1_use1) != utb_vreg(utb_temp(1, I32)));
+  UT_ASSERT(utb_vreg(s1_use2) != utb_vreg(utb_temp(2, I32)));
 
   utb_free(ir);
   return 0;
@@ -729,37 +626,4 @@ UT_TEST(test_const_memcpy_to_dest_incomplete_coverage_kept)
 
   utb_free(ir);
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_memory_extra)
-{
-  UT_RUN(test_addrof_var_fwd_lea_deref_resolves_to_constant);
-  UT_RUN(test_addrof_var_fwd_redefinition_blocks_forward);
-
-  UT_RUN(test_ptr_load_cse_second_deref_load_removed);
-  UT_RUN(test_ptr_load_cse_intervening_store_blocks);
-
-  UT_RUN(test_ptr_store_load_fwd_forwards_stored_value);
-  UT_RUN(test_ptr_store_load_fwd_overwritten_store_removed);
-  UT_RUN(test_ptr_store_load_fwd_call_clears_tracking);
-
-  UT_RUN(test_invariant_global_load_hoist_second_load_becomes_assign);
-  UT_RUN(test_invariant_global_load_hoist_written_global_kept);
-
-  UT_RUN(test_invariant_temp_deref_hoist_two_derefs_hoisted);
-  UT_RUN(test_invariant_temp_deref_hoist_intervening_call_blocks);
-
-  UT_RUN(test_rmw_byte_clear_and_store_becomes_byte_store);
-  UT_RUN(test_rmw_byte_clear_multi_use_and_result_kept);
-
-  UT_RUN(test_local_copy_prop_four_pairs_redirect_writes);
-  UT_RUN(test_local_copy_prop_three_pairs_kept);
-
-  UT_RUN(test_struct_copy_roundtrip_elim_removes_both_calls);
-  UT_RUN(test_struct_copy_roundtrip_elim_intervening_store_blocks);
-
-  UT_RUN(test_const_memcpy_to_dest_folds_call_away);
-  UT_RUN(test_const_memcpy_to_dest_incomplete_coverage_kept);
 }

@@ -11,10 +11,6 @@
 #define USING_GLOBALS
 #include "ir.h"
 
-/* ============================================================================
- * Operation Name Mapping
- * ============================================================================ */
-
 const char *tcc_ir_get_op_name(TccIrOp op)
 {
   switch (op)
@@ -57,6 +53,14 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "SHR";
   case TCCIR_OP_ROR:
     return "ROR";
+  case TCCIR_OP_CLZ:
+    return "CLZ";
+  case TCCIR_OP_RBIT:
+    return "RBIT";
+  case TCCIR_OP_REV:
+    return "REV";
+  case TCCIR_OP_REV16:
+    return "REV16";
   case TCCIR_OP_PDIV:
     return "PDIV";
   case TCCIR_OP_UDIV:
@@ -102,6 +106,8 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "TEST_ZERO";
   case TCCIR_OP_UBFX:
     return "UBFX";
+  case TCCIR_OP_SBFX:
+    return "SBFX";
   case TCCIR_OP_BFI:
     return "BFI";
   case TCCIR_OP_FADD:
@@ -189,441 +195,30 @@ const char *tcc_ir_get_op_name(TccIrOp op)
   }
 }
 
-/* ============================================================================
- * Dump Implementation
- * ============================================================================ */
-
-void tcc_ir_dump(TCCIRState *ir, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)out;
-}
-
-void tcc_ir_dump_stdout(TCCIRState *ir)
-{
-  tcc_ir_dump(ir, stdout);
-}
-
-void tcc_ir_dump_instr(TCCIRState *ir, int idx, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)idx;
-  (void)out;
-}
-
-void tcc_ir_dump_range(TCCIRState *ir, int start, int end, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)start;
-  (void)end;
-  (void)out;
-}
-
-void tcc_ir_dump_svalue(TCCIRState *ir, const SValue *sv, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)sv;
-  (void)out;
-}
-
-void tcc_ir_dump_svalue_short(TCCIRState *ir, const SValue *sv, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)sv;
-  (void)out;
-}
-
-void tcc_ir_dump_op(TCCIRState *ir, IROperand op, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)op;
-  (void)out;
-}
-
-void tcc_ir_dump_op_short(TCCIRState *ir, IROperand op, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)op;
-  (void)out;
-}
-
-void tcc_ir_dump_quad(TCCIRState *ir, TACQuadruple *q, int pc, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)q;
-  (void)pc;
-  (void)out;
-}
-
-void tcc_ir_dump_compact(TCCIRState *ir, IRQuadCompact *q, int pc, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)q;
-  (void)pc;
-  (void)out;
-}
-
-void tcc_ir_dump_vreg(TCCIRState *ir, int vreg, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)vreg;
-  (void)out;
-}
-
-/* ============================================================================
- * Legacy Dump Functions (from tccir.c)
- * ============================================================================
- * These functions are used when TCC_DUMP_THUMB_GEN is enabled for debugging
- * the code generation process.
- * ============================================================================ */
-
-#if TCC_DUMP_THUMB_GEN
-
-#include "../tccmachine.h"
-
-void tcc_dump_svalue_short_to(FILE *out, const SValue *sv)
-{
-  if (!sv)
-  {
-    fprintf(out, "<null>");
-    return;
-  }
-
-  const int r = sv->r;
-  const int val_loc = r & VT_VALMASK;
-  switch (val_loc)
-  {
-  case VT_CONST:
-    if (r & VT_SYM)
-    {
-      fprintf(out, "%s", get_tok_str(sv->sym ? sv->sym->v : 0, NULL));
-      if (sv->c.i)
-        fprintf(out, "+%d", (int)sv->c.i);
-    }
-    else
-    {
-      if (!(r & VT_LVAL))
-        fprintf(out, "#%d", (int)sv->c.i);
-      else
-        fprintf(out, "#%d***DEREF***", (int)sv->c.i);
-    }
-    break;
-  case VT_LLOCAL:
-    /* VT_LLOCAL with VT_LVAL: spilled pointer needing double dereference */
-    if (sv->pr0_reg != PREG_REG_NONE && sv->pr0_spilled)
-      fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]***DEREF***" SPILL_MARK_END, (int)sv->c.i);
-    else
-      fprintf(out, "VT_LLOCAL(cval=%d)", (int)sv->c.i);
-    break;
-  case VT_LOCAL:
-    if (sv->pr0_reg != PREG_REG_NONE)
-    {
-      if (sv->pr0_spilled)
-        fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, (int)sv->c.i);
-      else
-      {
-        if (!(r & VT_LVAL))
-          fprintf(out, "&");
-        fprintf(out, "R%d", sv->pr0_reg);
-        /* Also show virtual register info if available */
-        if (sv->vr != -1)
-        {
-          fprintf(out, "(");
-          fprintf(out, "VReg %s:%d", tcc_ir_get_vreg_type_string(sv->vr), TCCIR_DECODE_VREG_POSITION(sv->vr));
-          fprintf(out, ")");
-        }
-      }
-    }
-    else if (sv->vr != -1)
-    {
-      if (!(r & VT_LVAL))
-        fprintf(out, "&");
-      /* Match tcc_ir_print_vreg() formatting */
-      fprintf(out, "VReg %s:%d", tcc_ir_get_vreg_type_string(sv->vr), TCCIR_DECODE_VREG_POSITION(sv->vr));
-    }
-    else if (!(r & VT_LVAL))
-    {
-      fprintf(out, "Addr[StackLoc[%d]]", (int)sv->c.i);
-    }
-    else
-    {
-      fprintf(out, "StackLoc[%d]", (int)sv->c.i);
-    }
-    break;
-  case VT_CMP:
-    fprintf(out, "VT_CMP");
-    break;
-  case VT_JMP:
-    fprintf(out, "VT_JMP");
-    break;
-  case VT_JMPI:
-    fprintf(out, "VT_JMPI");
-    break;
-  default:
-    if (sv->pr0_reg == PREG_REG_NONE)
-    {
-      fprintf(out, "VReg %s:%d", tcc_ir_get_vreg_type_string(sv->vr), TCCIR_DECODE_VREG_POSITION(sv->vr));
-      if (tcc_ir_operand_needs_dereference(sv))
-        fprintf(out, "***DEREF***");
-    }
-    else
-    {
-      if (sv->pr0_spilled)
-        fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, (int)sv->c.i);
-      else
-      {
-        fprintf(out, "R%d", sv->pr0_reg);
-        /* Also show virtual register info if available */
-        if (sv->vr != -1)
-        {
-          fprintf(out, "(");
-          fprintf(out, "VReg %s:%d", tcc_ir_get_vreg_type_string(sv->vr), TCCIR_DECODE_VREG_POSITION(sv->vr));
-          fprintf(out, ")");
-        }
-      }
-      if (tcc_ir_operand_needs_dereference(sv))
-        fprintf(out, "***DEREF***");
-    }
-    break;
-  }
-}
-
-void tcc_dump_quadruple_to(FILE *out, const TACQuadruple *q, int pc)
-{
-  if (!q)
-  {
-    fprintf(out, "%04d: <null>\n", pc);
-    return;
-  }
-
-  const int op = q->op;
-  fprintf(out, "%04d: ", pc);
-  switch (op)
-  {
-  case TCCIR_OP_NOP:
-  case TCCIR_OP_PREFETCH:
-  case TCCIR_OP_TRAP:
-  case TCCIR_OP_RETURNVALUE:
-  case TCCIR_OP_RETURNVOID:
-  case TCCIR_OP_FUNCCALLVOID:
-  case TCCIR_OP_FUNCCALLVAL:
-  case TCCIR_OP_FUNCPARAMVOID:
-  case TCCIR_OP_TEST_ZERO:
-  case TCCIR_OP_CMP:
-    fprintf(out, "%s ", tcc_ir_get_op_name(op));
-    break;
-  case TCCIR_OP_FUNCPARAMVAL:
-    fprintf(out, "%s%d[call_%d] ", tcc_ir_get_op_name(op), TCCIR_DECODE_PARAM_IDX(q->src2.c.i),
-            TCCIR_DECODE_CALL_ID(q->src2.c.i));
-    break;
-  case TCCIR_OP_JUMP:
-  case TCCIR_OP_JUMPIF:
-    fprintf(out, "JMP to %d ", (int)q->dest.c.i);
-    break;
-  case TCCIR_OP_IJUMP:
-    /* Mnemonic only; the generic has_src1 block below prints src1 once.
-       See docs/bugs.md #5 (matching the fix in tcc_print_quadruple_irop). */
-    fprintf(out, "IJMP ");
-    break;
-  default:
-    tcc_dump_svalue_short_to(out, &q->dest);
-    fprintf(out, " <-- ");
-    break;
-  }
-
-  if (irop_config[op].has_src1)
-  {
-    if (op == TCCIR_OP_SETIF)
-      fprintf(out, "(cond=0x%x)", (unsigned)q->src1.c.i);
-    else if (op != TCCIR_OP_JUMPIF)
-      tcc_dump_svalue_short_to(out, &q->src1);
-  }
-
-  if (irop_config[op].has_src2)
-  {
-    switch (op)
-    {
-    case TCCIR_OP_CMP:
-      fprintf(out, ",");
-      tcc_dump_svalue_short_to(out, &q->src2);
-      break;
-    case TCCIR_OP_FUNCPARAMVAL:
-    case TCCIR_OP_FUNCCALLVAL:
-      break;
-    default:
-      fprintf(out, " %s ", tcc_ir_get_op_name(op));
-      tcc_dump_svalue_short_to(out, &q->src2);
-      break;
-    }
-  }
-
-  if (op == TCCIR_OP_BLOCK_COPY)
-    fprintf(out, " [BLOCK_COPY]");
-  else if (op == TCCIR_OP_SELECT)
-    fprintf(out, " [SELECT]");
-  else if (op == TCCIR_OP_STORE)
-    fprintf(out, " [STORE]");
-  else if (op == TCCIR_OP_LOAD)
-    fprintf(out, " [LOAD]");
-  else if (op == TCCIR_OP_ASSIGN)
-    fprintf(out, " [ASSIGN]");
-  else if (op == TCCIR_OP_FUNCCALLVAL)
-  {
-    fprintf(out, " --> ");
-    tcc_dump_svalue_short_to(out, &q->dest);
-  }
-  else if (op == TCCIR_OP_JUMPIF)
-  {
-    fprintf(out, " if \"");
-    switch (q->src1.c.i)
-    {
-    case TOK_EQ:
-      fprintf(out, "==");
-      break;
-    case TOK_NE:
-      fprintf(out, "!=");
-      break;
-    case TOK_LT:
-      fprintf(out, "<S");
-      break;
-    case TOK_GT:
-      fprintf(out, ">S");
-      break;
-    case TOK_LE:
-      fprintf(out, "<=S");
-      break;
-    case TOK_GE:
-      fprintf(out, ">=S");
-      break;
-    case TOK_ULT:
-      fprintf(out, "<U");
-      break;
-    case TOK_UGT:
-      fprintf(out, ">U");
-      break;
-    case TOK_ULE:
-      fprintf(out, "<=U");
-      break;
-    case TOK_UGE:
-      fprintf(out, ">=U");
-      break;
-    default:
-      fprintf(out, "cc=0x%x", (unsigned)q->src1.c.i);
-      break;
-    }
-    fprintf(out, "\"");
-  }
-  else if (op == TCCIR_OP_SETIF)
-  {
-    fprintf(out, "1 if \"");
-    switch (q->src1.c.i)
-    {
-    case TOK_EQ:
-      fprintf(out, "==");
-      break;
-    case TOK_NE:
-      fprintf(out, "!=");
-      break;
-    case TOK_LT:
-      fprintf(out, "<S");
-      break;
-    case TOK_GT:
-      fprintf(out, ">S");
-      break;
-    case TOK_LE:
-      fprintf(out, "<=S");
-      break;
-    case TOK_GE:
-      fprintf(out, ">=S");
-      break;
-    case TOK_ULT:
-      fprintf(out, "<U");
-      break;
-    case TOK_UGT:
-      fprintf(out, ">U");
-      break;
-    case TOK_ULE:
-      fprintf(out, "<=U");
-      break;
-    case TOK_UGE:
-      fprintf(out, ">=U");
-      break;
-    default:
-      fprintf(out, "cc=0x%x", (unsigned)q->src1.c.i);
-      break;
-    }
-    fprintf(out, "\"");
-  }
-
-  fprintf(out, "\n");
-}
-
-#endif /* TCC_DUMP_THUMB_GEN */
-
-void tcc_ir_dump_live(TCCIRState *ir, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)out;
-}
-
-void tcc_ir_dump_live_vreg(TCCIRState *ir, int vreg, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)vreg;
-  (void)out;
-}
-
-void tcc_ir_dump_stack(TCCIRState *ir, FILE *out)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)ir;
-  (void)out;
-}
-
 const char *tcc_ir_dump_op_name(int op)
 {
   return tcc_ir_get_op_name((TccIrOp)op);
 }
 
-const char *tcc_ir_dump_vreg_type(int vreg_type)
+void tcc_ir_dump_vreg(int vreg, FILE *out)
 {
-  /* TODO: Move implementation from tccir.c */
-  (void)vreg_type;
-  return "unknown";
+  fprintf(out, "VReg %s:%d", tcc_ir_vreg_type_string(vreg), TCCIR_DECODE_VREG_POSITION(vreg));
 }
 
-/* Print vreg to stdout - legacy function used throughout codebase */
 void tcc_ir_print_vreg(int vreg)
 {
-  printf("VReg %s:%d", tcc_ir_vreg_type_string(vreg), TCCIR_DECODE_VREG_POSITION(vreg));
+  tcc_ir_dump_vreg(vreg, stdout);
 }
 
-/* Flag to control whether to show physical registers in IR dump.
- * This is set to 1 after register allocation, so the second dump shows
- * physical registers, while the first dump (before optimizations) shows
- * only virtual registers. */
+/* 0 before register allocation (vregs only), 1 after (physical regs shown) */
 static int show_physical_regs = 0;
 
-/* Set whether to show physical registers in IR dump */
 void tcc_ir_dump_set_show_physical_regs(int show)
 {
   show_physical_regs = show;
 }
 
-/* Returns 1 if `pass_name` is selected by the comma-separated -dump-ir-passes=
- * list in s->dump_ir_passes (or the list contains the special token "all"). */
+/* Matches pass_name against the comma-separated -dump-ir-passes= list ("all" selects every pass) */
 int tcc_ir_dump_passes_match(TCCState *s, const char *pass_name)
 {
   if (!s || !s->dump_ir_passes || !pass_name)
@@ -645,11 +240,7 @@ int tcc_ir_dump_passes_match(TCCState *s, const char *pass_name)
   return 0;
 }
 
-/* If pass_name is selected by -dump-ir-passes=, print the IR labeled with the
- * pass name as "=== AFTER <name> ===" ... "=== END AFTER <name> ===".  Shared by
- * the legacy optimize loop (tccgen.c RUN_PASS / dump_ir_after_pass) and the SSA
- * optimizer driver (ir/opt/ssa_opt.c) so every pass is observable the same way.
- * A no-op unless built with CONFIG_TCC_DEBUG. */
+/* Shared by tccgen.c RUN_PASS and ir/opt/ssa_opt.c so every pass is observable the same way */
 void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name)
 {
 #ifdef CONFIG_TCC_DEBUG
@@ -657,9 +248,8 @@ void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name)
     return;
   tcc_ir_dump_set_show_physical_regs(0);
   printf("=== AFTER %s ===\n", pass_name);
-  tcc_ir_show(ir);
-  /* Switch side tables are absolute-index consumers that renumbering passes
-   * must keep in sync — print them so a stale target is visible in the dump. */
+  tcc_ir_dump(ir, stdout);
+  /* Switch side tables consume absolute indices; print them so a stale target is visible */
   for (int t = 0; t < ir->num_switch_tables; t++) {
     TCCIRSwitchTable *tbl = &ir->switch_tables[t];
     printf("SWTAB %d: min=%lld max=%lld default=%d targets=[", t,
@@ -675,7 +265,6 @@ void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name)
 #endif
 }
 
-/* Get the short prefix for a vreg type: V, T, or P */
 static char vreg_type_prefix(int vreg)
 {
   switch (TCCIR_DECODE_VREG_TYPE(vreg))
@@ -691,19 +280,14 @@ static char vreg_type_prefix(int vreg)
   }
 }
 
-/* Print vreg in short format like V0, T1, P2 */
-static void print_vreg_short(int vreg)
+static void dump_vreg_short(int vreg, FILE *out)
 {
-  printf("%c%d", vreg_type_prefix(vreg), TCCIR_DECODE_VREG_POSITION(vreg));
+  fprintf(out, "%c%d", vreg_type_prefix(vreg), TCCIR_DECODE_VREG_POSITION(vreg));
 }
 
-/* Spill mark macros for debugging output */
 #define SPILL_MARK_BEGIN "\033[41m"
 #define SPILL_MARK_END "\033[0m"
 
-/* Helper to get physical register allocation for a vreg.
- * Returns the allocated physical register (0-15), or PREG_NONE if spilled/not allocated.
- * Also sets *spilled to 1 if the vreg is spilled to stack, *offset to spill location. */
 static int get_vreg_physical_reg(TCCIRState *ir, int32_t vreg, int *spilled, int *offset)
 {
   if (vreg < 0 || !ir)
@@ -731,8 +315,7 @@ static int get_vreg_physical_reg(TCCIRState *ir, int32_t vreg, int *spilled, int
   return r0 & PREG_REG_NONE;
 }
 
-/* Print IROperand in short form (moved from tccir.c) */
-void print_iroperand_short(TCCIRState *ir, IROperand op)
+void tcc_ir_dump_op(TCCIRState *ir, IROperand op, FILE *out)
 {
   int tag = irop_get_tag(op);
 
@@ -747,15 +330,15 @@ void print_iroperand_short(TCCIRState *ir, IROperand op)
       IRPoolSymref *symref = irop_get_symref_ex(ir, op);
       if (symref)
         addend = symref->addend;
-      printf("GlobalSym(%d)", sym->v);
+      fprintf(out, "GlobalSym(%d)", sym->v);
       if (addend != 0)
-        printf("+%d", (int)addend);
+        fprintf(out, "+%d", (int)addend);
       if (op.is_lval)
-        printf("***DEREF***");
+        fprintf(out, "***DEREF***");
     }
     else
     {
-      printf("GlobalSym(?)");
+      fprintf(out, "GlobalSym(?)");
     }
   }
   break;
@@ -765,9 +348,9 @@ void print_iroperand_short(TCCIRState *ir, IROperand op)
   case IROP_TAG_F64:
   {
     if (op.btype == IROP_BTYPE_INT64)
-      printf("#%lld", (long long)irop_get_imm64_ex(ir, op));
+      fprintf(out, "#%lld", (long long)irop_get_imm64_ex(ir, op));
     else
-      printf("#%d", (int)irop_get_imm64_ex(ir, op));
+      fprintf(out, "#%d", (int)irop_get_imm64_ex(ir, op));
   }
   break;
   case IROP_TAG_STACKOFF:
@@ -780,9 +363,9 @@ void print_iroperand_short(TCCIRState *ir, IROperand op)
       if (show_physical_regs && vreg != -1)
         preg = get_vreg_physical_reg(ir, vreg, &spilled, &offset);
       if (preg != PREG_NONE && spilled)
-        printf(SPILL_MARK_BEGIN "SpillLoc[%d]***DEREF***" SPILL_MARK_END, offset);
+        fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]***DEREF***" SPILL_MARK_END, offset);
       else
-        printf("VT_LLOCAL (cval=%ld)", (long)irop_get_stack_offset(op));
+        fprintf(out, "VT_LLOCAL (cval=%ld)", (long)irop_get_stack_offset(op));
     }
     else
     {
@@ -795,34 +378,33 @@ void print_iroperand_short(TCCIRState *ir, IROperand op)
       if (show_physical_regs && preg != PREG_NONE)
       {
         if (spilled)
-          printf(SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, offset);
+          fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, offset);
         else
         {
           if (!op.is_lval)
-            printf("&");
-          printf("R%d", preg);
-          /* Also show virtual register info if available */
+            fprintf(out, "&");
+          fprintf(out, "R%d", preg);
           if (vreg != -1)
           {
-            printf("(");
-            print_vreg_short(vreg);
-            printf(")");
+            fprintf(out, "(");
+            dump_vreg_short(vreg, out);
+            fprintf(out, ")");
           }
         }
       }
       else if (irop_get_vreg(op) != -1)
       {
         if (!op.is_lval)
-          printf("&");
-        print_vreg_short(irop_get_vreg(op));
+          fprintf(out, "&");
+        dump_vreg_short(irop_get_vreg(op), out);
       }
       else if (!op.is_lval)
       {
-        printf("Addr[StackLoc[%ld]]", (long)irop_get_stack_offset(op));
+        fprintf(out, "Addr[StackLoc[%ld]]", (long)irop_get_stack_offset(op));
       }
       else
       {
-        printf("StackLoc[%ld]", (long)irop_get_stack_offset(op));
+        fprintf(out, "StackLoc[%ld]", (long)irop_get_stack_offset(op));
       }
     }
     break;
@@ -839,37 +421,42 @@ void print_iroperand_short(TCCIRState *ir, IROperand op)
     if (!show_physical_regs || preg == PREG_NONE)
     {
       if (vreg != -1)
-        print_vreg_short(vreg);
+        dump_vreg_short(vreg, out);
       else
-        printf("VReg?");
+        fprintf(out, "VReg?");
       if (irop_op_is_lval(op))
-        printf("***DEREF***");
+        fprintf(out, "***DEREF***");
     }
     else
     {
       if (spilled)
       {
-        printf(SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, offset);
+        fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%d]" SPILL_MARK_END, offset);
       }
       else
       {
-        printf("R%d", preg);
-        /* Also show virtual register info if available */
+        fprintf(out, "R%d", preg);
         if (vreg != -1)
         {
-          printf("(");
-          print_vreg_short(vreg);
-          printf(")");
+          fprintf(out, "(");
+          dump_vreg_short(vreg, out);
+          fprintf(out, ")");
         }
       }
       if (irop_op_is_lval(op))
-        printf("***DEREF***");
+        fprintf(out, "***DEREF***");
     }
     break;
   }
   }
-} /* Print SValue in short form (moved from tccir.c) */
-void print_svalue_short(SValue *sv)
+}
+
+void print_iroperand_short(TCCIRState *ir, IROperand op)
+{
+  tcc_ir_dump_op(ir, op, stdout);
+}
+
+void tcc_ir_dump_svalue_short(SValue *sv, FILE *out)
 {
   int val_loc = sv->r & VT_VALMASK;
 
@@ -878,107 +465,109 @@ void print_svalue_short(SValue *sv)
   case VT_CONST:
     if (sv->r & VT_SYM)
     {
-      printf("GlobalSym(%d)", sv->sym->v);
+      fprintf(out, "GlobalSym(%d)", sv->sym->v);
       if (sv->c.i != 0)
-        printf("+%d", (int)sv->c.i);
+        fprintf(out, "+%d", (int)sv->c.i);
       if (sv->r & VT_LVAL)
-        printf("***DEREF***");
+        fprintf(out, "***DEREF***");
     }
     else
     {
       if ((sv->type.t & VT_BTYPE) == VT_LLONG)
-        printf("#%lld", (long long)sv->c.i);
+        fprintf(out, "#%lld", (long long)sv->c.i);
       else
-        printf("#%d", (int)sv->c.i);
+        fprintf(out, "#%d", (int)sv->c.i);
     }
     break;
   case VT_LLOCAL:
     if (sv->pr0_reg != PREG_REG_NONE && sv->pr0_spilled)
-      printf(SPILL_MARK_BEGIN "SpillLoc[%ld]***DEREF***" SPILL_MARK_END, (long)sv->c.i);
+      fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%ld]***DEREF***" SPILL_MARK_END, (long)sv->c.i);
     else
-      printf("VT_LLOCAL (cval=%ld)", (long)sv->c.i);
+      fprintf(out, "VT_LLOCAL (cval=%ld)", (long)sv->c.i);
     break;
   case VT_LOCAL:
     if (show_physical_regs && sv->pr0_reg != PREG_REG_NONE)
     {
       if (sv->pr0_spilled)
-        printf(SPILL_MARK_BEGIN "SpillLoc[%ld]" SPILL_MARK_END, (long)sv->c.i);
+        fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%ld]" SPILL_MARK_END, (long)sv->c.i);
       else
       {
         if (!(sv->r & VT_LVAL))
-          printf("&");
-        printf("R%d", sv->pr0_reg);
-        /* Also show virtual register info if available */
+          fprintf(out, "&");
+        fprintf(out, "R%d", sv->pr0_reg);
         if (sv->vr != -1)
         {
-          printf("(");
-          print_vreg_short(sv->vr);
-          printf(")");
+          fprintf(out, "(");
+          dump_vreg_short(sv->vr, out);
+          fprintf(out, ")");
         }
       }
     }
     else if (sv->vr != -1)
     {
       if (!(sv->r & VT_LVAL))
-        printf("&");
-      print_vreg_short(sv->vr);
+        fprintf(out, "&");
+      dump_vreg_short(sv->vr, out);
     }
     else if (!(sv->r & VT_LVAL))
     {
-      printf("Addr[StackLoc[%ld]]", (long)sv->c.i);
+      fprintf(out, "Addr[StackLoc[%ld]]", (long)sv->c.i);
     }
     else
     {
-      printf("StackLoc[%ld]", (long)sv->c.i);
+      fprintf(out, "StackLoc[%ld]", (long)sv->c.i);
     }
     break;
   case VT_CMP:
-    printf("VT_CMP");
+    fprintf(out, "VT_CMP");
     break;
   case VT_JMP:
-    printf("VT_JMP");
+    fprintf(out, "VT_JMP");
     break;
   case VT_JMPI:
-    printf("VT_JMPI");
+    fprintf(out, "VT_JMPI");
     break;
   default:
     if (!show_physical_regs || sv->pr0_reg == PREG_REG_NONE)
     {
-      print_vreg_short(sv->vr);
+      dump_vreg_short(sv->vr, out);
       if (tcc_ir_operand_needs_dereference(sv))
-        printf("***DEREF***");
+        fprintf(out, "***DEREF***");
     }
     else
     {
       if (sv->pr0_spilled)
-        printf(SPILL_MARK_BEGIN "SpillLoc[%ld]" SPILL_MARK_END, (long)sv->c.i);
+        fprintf(out, SPILL_MARK_BEGIN "SpillLoc[%ld]" SPILL_MARK_END, (long)sv->c.i);
       else
       {
-        printf("R%d", sv->pr0_reg);
-        /* Also show virtual register info if available */
+        fprintf(out, "R%d", sv->pr0_reg);
         if (sv->vr != -1)
         {
-          printf("(");
-          print_vreg_short(sv->vr);
-          printf(")");
+          fprintf(out, "(");
+          dump_vreg_short(sv->vr, out);
+          fprintf(out, ")");
         }
       }
       if (tcc_ir_operand_needs_dereference(sv))
-        printf("***DEREF***");
+        fprintf(out, "***DEREF***");
     }
     break;
   }
 }
 
-/* Print quadruple IR operation (moved from tccir.c) */
-void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc)
+void print_svalue_short(SValue *sv)
+{
+  tcc_ir_dump_svalue_short(sv, stdout);
+}
+
+void tcc_ir_dump_compact(TCCIRState *ir, IRQuadCompact *q, int pc, FILE *out)
 {
   int op = q->op;
   IROperand src1 = tcc_ir_op_get_src1(ir, q);
   IROperand src2 = tcc_ir_op_get_src2(ir, q);
   IROperand dest = tcc_ir_op_get_dest(ir, q);
 
-  printf("%04d: ", pc);
+  fprintf(out, "%04d: ", pc);
   switch (op)
   {
   case TCCIR_OP_NOP:
@@ -991,49 +580,45 @@ void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc)
   case TCCIR_OP_FUNCPARAMVOID:
   case TCCIR_OP_TEST_ZERO:
   case TCCIR_OP_CMP:
-    printf("%s ", tcc_ir_get_op_name((TccIrOp)op));
+    fprintf(out, "%s ", tcc_ir_get_op_name((TccIrOp)op));
     break;
   case TCCIR_OP_SET_CHAIN:
-    printf("%s /* R10 <- FP */ ", tcc_ir_get_op_name((TccIrOp)op));
+    fprintf(out, "%s /* R10 <- FP */ ", tcc_ir_get_op_name((TccIrOp)op));
     break;
   case TCCIR_OP_FUNCPARAMVAL:
-    printf("%s%d[call_%d] ", tcc_ir_get_op_name((TccIrOp)op), TCCIR_DECODE_PARAM_IDX(irop_get_imm64_ex(ir, src2)),
-           TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, src2)));
+    fprintf(out, "%s%d[call_%d] ", tcc_ir_get_op_name((TccIrOp)op), TCCIR_DECODE_PARAM_IDX(irop_get_imm64_ex(ir, src2)),
+            TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, src2)));
     break;
   case TCCIR_OP_JUMP:
   case TCCIR_OP_JUMPIF:
-    printf("JMP to %ld ", (long)irop_get_imm64_ex(ir, dest));
+    fprintf(out, "JMP to %ld ", (long)irop_get_imm64_ex(ir, dest));
     break;
   case TCCIR_OP_IJUMP:
-    /* Only print the mnemonic here; the generic has_src1 block below prints
-       src1 (the target register) exactly once.  Printing it here too produced
-       a double "IJMP T4 T4" (docs/bugs.md #5).  Unlike JUMPIF/MLA, IJUMP is
-       not excluded from that block, so this case must not print src1 itself. */
-    printf("IJMP ");
+    /* Mnemonic only; the generic has_src1 block below prints src1 once (docs/bugs.md #5) */
+    fprintf(out, "IJMP ");
     break;
   case TCCIR_OP_MLA:
-    /* MLA has 4 operands: dest = src1 * src2 + accum */
-    print_iroperand_short(ir, dest);
-    printf(" <-- ");
-    print_iroperand_short(ir, src1);
-    printf(" MLA ");
-    print_iroperand_short(ir, src2);
-    printf(" + ");
+    tcc_ir_dump_op(ir, dest, out);
+    fprintf(out, " <-- ");
+    tcc_ir_dump_op(ir, src1, out);
+    fprintf(out, " MLA ");
+    tcc_ir_dump_op(ir, src2, out);
+    fprintf(out, " + ");
     break;
   default:
-    print_iroperand_short(ir, dest);
-    printf(" <-- ");
+    tcc_ir_dump_op(ir, dest, out);
+    fprintf(out, " <-- ");
   }
 
   if (irop_config[op].has_src1)
   {
     if (op == TCCIR_OP_SETIF)
     {
-      printf("(cond=0x%lx)", (unsigned long)irop_get_imm64_ex(ir, src1));
+      fprintf(out, "(cond=0x%lx)", (unsigned long)irop_get_imm64_ex(ir, src1));
     }
     else if (op != TCCIR_OP_JUMPIF && op != TCCIR_OP_MLA)
     {
-      print_iroperand_short(ir, src1);
+      tcc_ir_dump_op(ir, src1, out);
     }
   }
 
@@ -1042,99 +627,117 @@ void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc)
     switch (op)
     {
     case TCCIR_OP_CMP:
-      printf(",");
-      print_iroperand_short(ir, src2);
+      fprintf(out, ",");
+      tcc_ir_dump_op(ir, src2, out);
       break;
     case TCCIR_OP_FUNCPARAMVAL:
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_MLA:
       break;
     default:
-      printf(" %s ", tcc_ir_get_op_name((TccIrOp)op));
-      print_iroperand_short(ir, src2);
+      fprintf(out, " %s ", tcc_ir_get_op_name((TccIrOp)op));
+      tcc_ir_dump_op(ir, src2, out);
     }
   }
 
   if (op == TCCIR_OP_BLOCK_COPY)
-    printf(" [BLOCK_COPY]");
+    fprintf(out, " [BLOCK_COPY]");
   else if (op == TCCIR_OP_SELECT)
-    printf(" [SELECT]");
+    fprintf(out, " [SELECT cond=0x%lx]",
+            (unsigned long)irop_get_imm64_ex(ir, tcc_ir_op_get_cond(ir, q)));
   else if (op == TCCIR_OP_STORE)
-    printf(" [STORE]");
+    fprintf(out, " [STORE]");
   else if (op == TCCIR_OP_LOAD)
-    printf(" [LOAD]");
+    fprintf(out, " [LOAD]");
   else if (op == TCCIR_OP_ASSIGN)
-    printf(" [ASSIGN]");
+    fprintf(out, " [ASSIGN]");
   else if (op == TCCIR_OP_FUNCCALLVAL)
   {
-    printf(" --> ");
-    print_iroperand_short(ir, dest);
+    fprintf(out, " --> ");
+    tcc_ir_dump_op(ir, dest, out);
   }
   else if (op == TCCIR_OP_JUMPIF)
   {
-    printf(" if \"");
+    fprintf(out, " if \"");
     switch ((int)irop_get_imm64_ex(ir, src1))
     {
     case TOK_EQ:
-      printf("==");
+      fprintf(out, "==");
       break;
     case TOK_NE:
-      printf("!=");
+      fprintf(out, "!=");
       break;
     case TOK_LT:
-      printf("<S");
+      fprintf(out, "<S");
       break;
     case TOK_GT:
-      printf(">S");
+      fprintf(out, ">S");
       break;
     case TOK_LE:
-      printf("<=S");
+      fprintf(out, "<=S");
       break;
     case TOK_GE:
-      printf(">=S");
+      fprintf(out, ">=S");
       break;
     case TOK_ULT:
-      printf("<U");
+      fprintf(out, "<U");
       break;
     case TOK_UGT:
-      printf(">U");
+      fprintf(out, ">U");
       break;
     case TOK_ULE:
-      printf("<=U");
+      fprintf(out, "<=U");
       break;
     case TOK_UGE:
-      printf(">=U");
+      fprintf(out, ">=U");
       break;
     default:
-      printf("?");
+      fprintf(out, "?");
       break;
     }
-    printf("\"");
+    fprintf(out, "\"");
   }
   else if (op == TCCIR_OP_MLA)
   {
-    /* Print the 4th operand (accumulator) */
     IROperand accum = tcc_ir_op_get_accum(ir, q);
-    print_iroperand_short(ir, accum);
+    tcc_ir_dump_op(ir, accum, out);
   }
-  printf("\n");
+  fprintf(out, "\n");
 }
 
-/* Show IR block (moved from tccir.c) */
+void tcc_print_quadruple_irop(TCCIRState *ir, IRQuadCompact *q, int pc)
+{
+  tcc_ir_dump_compact(ir, q, pc, stdout);
+}
+
+void tcc_ir_dump_instr(TCCIRState *ir, int idx, FILE *out)
+{
+  if (idx < 0 || idx >= ir->next_instruction_index)
+    return;
+  tcc_ir_dump_compact(ir, &ir->compact_instructions[idx], idx, out);
+}
+
+void tcc_ir_dump_range(TCCIRState *ir, int start, int end, FILE *out)
+{
+  if (start < 0)
+    start = 0;
+  if (end > ir->next_instruction_index)
+    end = ir->next_instruction_index;
+  for (int i = start; i < end; i++)
+    tcc_ir_dump_compact(ir, &ir->compact_instructions[i], i, out);
+}
+
+void tcc_ir_dump(TCCIRState *ir, FILE *out)
+{
+  tcc_ir_dump_range(ir, 0, ir->next_instruction_index, out);
+}
+
+void tcc_ir_dump_stdout(TCCIRState *ir)
+{
+  tcc_ir_dump(ir, stdout);
+}
+
 void tcc_ir_show(TCCIRState *ir)
 {
-  for (int i = 0; i < ir->next_instruction_index; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    tcc_print_quadruple_irop(ir, q, i);
-  }
-}
-
-int tcc_ir_dump_try_objdump(const unsigned char *bytes, size_t len, uint32_t start_vma)
-{
-  /* TODO: Move implementation from tccir.c */
-  (void)bytes;
-  (void)len;
-  (void)start_vma;
-  return 0;
+  tcc_ir_dump(ir, stdout);
 }

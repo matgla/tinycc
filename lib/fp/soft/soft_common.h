@@ -177,4 +177,152 @@ static inline uint32_t make_float(int sign, int exp, uint32_t mant)
   return ((uint32_t)sign << 31) | ((uint32_t)exp << 23) | (mant & FLOAT_MANT_MASK);
 }
 
+/* ===== ROUNDING CORE =====
+ *
+ * IEEE 754 requires round-to-nearest-ties-to-even and gradual underflow to
+ * subnormals.  Getting either wrong is invisible in casual testing but shows up
+ * immediately against bit-exact reference vectors (tests/fp/), so the logic
+ * lives here once rather than being re-derived in add/sub/mul/div/convert.
+ *
+ * Callers carry SFP_GRS extra low-order bits below the significand: the top two
+ * are guard and round, and the lowest is a *sticky* bit that must be OR-ed with
+ * every bit ever shifted out.  Dropping those bits instead of accumulating them
+ * is what makes a naive implementation truncate toward zero.
+ */
+
+#define SFP_GRS 3
+
+/* Right-shift, folding everything shifted out into the sticky (bit 0).  A
+ * plain >> would silently discard the information rounding depends on. */
+static inline uint32_t sfp_shr_sticky32(uint32_t m, int shift)
+{
+  if (shift <= 0)
+    return m;
+  if (shift >= 32)
+    return m != 0; /* all bits become sticky */
+  return (m >> shift) | ((m & (((uint32_t)1 << shift) - 1)) != 0);
+}
+
+static inline uint64_t sfp_shr_sticky64(uint64_t m, int shift)
+{
+  if (shift <= 0)
+    return m;
+  if (shift >= 64)
+    return m != 0;
+  return (m >> shift) | ((m & (((uint64_t)1 << shift) - 1)) != 0);
+}
+
+/* Normalize, round and pack a float.
+ *
+ * `mant` holds the significand shifted left by SFP_GRS, so a normalized value
+ * has its leading bit at FLOAT_NORM_BIT.  `exp` is the biased exponent for that
+ * position.  Neither needs to be normalized on entry: this routine shifts the
+ * leading bit into place, denormalizes when the exponent falls below 1, rounds
+ * to nearest-even, and handles the carry a round-up can produce (including the
+ * subnormal->normal and normal->infinity boundaries).
+ */
+#define FLOAT_NORM_BIT ((uint32_t)1 << (23 + SFP_GRS))
+
+static inline uint32_t sfp_round_pack_float(int sign, int exp, uint32_t mant)
+{
+  uint32_t lsb, rem;
+
+  if (mant == 0)
+    return make_float(sign, 0, 0);
+
+  /* Bring the leading bit to FLOAT_NORM_BIT. */
+  while (mant >= (FLOAT_NORM_BIT << 1))
+  {
+    mant = sfp_shr_sticky32(mant, 1);
+    exp++;
+  }
+  while (mant < FLOAT_NORM_BIT)
+  {
+    mant <<= 1;
+    exp--;
+  }
+
+  /* Gradual underflow: shift into subnormal range *before* rounding, so the
+   * rounding decision is made at the precision the result will actually have. */
+  if (exp <= 0)
+  {
+    mant = sfp_shr_sticky32(mant, 1 - exp);
+    exp = 0;
+  }
+
+  /* Round to nearest, ties to even. */
+  lsb = (mant >> SFP_GRS) & 1;
+  rem = mant & ((1u << SFP_GRS) - 1);
+  if (rem > (1u << (SFP_GRS - 1)) || (rem == (1u << (SFP_GRS - 1)) && lsb))
+    mant += (1u << SFP_GRS);
+  mant >>= SFP_GRS;
+
+  /* A round-up can carry into the next binade -- and for a subnormal that is
+   * exactly how it becomes the smallest normal. */
+  if (exp == 0)
+  {
+    if (mant & FLOAT_IMPLICIT_BIT)
+      exp = 1;
+  }
+  else if (mant & (FLOAT_IMPLICIT_BIT << 1))
+  {
+    mant >>= 1;
+    exp++;
+  }
+
+  if (exp >= 0xFF)
+    return make_float(sign, 0xFF, 0); /* overflow to infinity */
+
+  return make_float(sign, exp, mant);
+}
+
+#define DOUBLE_NORM_BIT ((uint64_t)1 << (52 + SFP_GRS))
+
+static inline uint64_t sfp_round_pack_double(int sign, int exp, uint64_t mant)
+{
+  uint64_t lsb, rem;
+
+  if (mant == 0)
+    return make_double(sign, 0, 0);
+
+  while (mant >= (DOUBLE_NORM_BIT << 1))
+  {
+    mant = sfp_shr_sticky64(mant, 1);
+    exp++;
+  }
+  while (mant < DOUBLE_NORM_BIT)
+  {
+    mant <<= 1;
+    exp--;
+  }
+
+  if (exp <= 0)
+  {
+    mant = sfp_shr_sticky64(mant, 1 - exp);
+    exp = 0;
+  }
+
+  lsb = (mant >> SFP_GRS) & 1;
+  rem = mant & (((uint64_t)1 << SFP_GRS) - 1);
+  if (rem > ((uint64_t)1 << (SFP_GRS - 1)) || (rem == ((uint64_t)1 << (SFP_GRS - 1)) && lsb))
+    mant += ((uint64_t)1 << SFP_GRS);
+  mant >>= SFP_GRS;
+
+  if (exp == 0)
+  {
+    if (mant & DOUBLE_IMPLICIT_BIT)
+      exp = 1;
+  }
+  else if (mant & (DOUBLE_IMPLICIT_BIT << 1))
+  {
+    mant >>= 1;
+    exp++;
+  }
+
+  if (exp >= 0x7FF)
+    return make_double(sign, 0x7FF, 0);
+
+  return make_double(sign, exp, mant);
+}
+
 #endif /* SOFT_COMMON_H */

@@ -17,18 +17,18 @@
  *      - Reachability paths: JUMP, JUMPIF, RETURN, IJUMP, fall-through
  *
  *  HARNESS NOTES:
- *    - Links the real ir/opt/ssa_opt_branch.c via UT11.
+ *    - Links the real source/opt/ssa/cfg/branch.c via UT11.
  *    - Uses ssa_build.h for hand-built vinfo + IR.
  */
 
 #include "ssa_build.h"
-#include "ir/opt/ssa_opt.h"
+#include "opt/ssa/branch.h"
 
 #include "ut.h"
 
 #define USING_GLOBALS
 #include "tcc.h"
-#include "ir/opt/ssa_opt.h"
+#include "source/opt/ssa/include/ssa_opt.h"
 
 #define I32 IROP_BTYPE_INT32
 
@@ -251,6 +251,123 @@ UT_TEST(test_branch_cmp_setif_false)
 }
 
 /* ========================================================================
+ * Boolean-normalisation: CMP X,#0; SETIF NE where X is provably {0,1}
+ * collapses to ASSIGN V = X.
+ * ======================================================================== */
+
+UT_TEST(test_branch_bool_norm_setif_rewritten)
+{
+  /* T0 is single-def SETIF (provably {0,1}); CMP T0,#0; SETIF NE -> V = T0. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(0, I32), utb_imm(0x95, I32));
+  int cmp = ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32),
+                           utb_imm(0, I32));
+  int setif2 = ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(1, I32),
+                             utb_imm(0x95, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_branch(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, setif2), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, setif2)),
+               utb_vreg(utb_temp(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_bool_norm_bool_and_rewritten)
+{
+  /* BOOL_AND is also accepted as a provably-{0,1} def. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  ssa_add_instr3(&c, TCCIR_OP_BOOL_AND, utb_temp(0, I32), utb_imm(1, I32),
+                 utb_imm(0, I32));
+  int cmp = ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32),
+                           utb_imm(0, I32));
+  int setif2 = ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(1, I32),
+                             utb_imm(0x95, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = ssa_opt_branch(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(c.ir, setif2), TCCIR_OP_ASSIGN);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_bool_norm_wrong_cond_kept)
+{
+  /* SETIF cond must be NE (0x95); EQ leaves the pair untouched. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(0, I32), utb_imm(0x95, I32));
+  int cmp = ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32),
+                           utb_imm(0, I32));
+  int setif2 = ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(1, I32),
+                             utb_imm(0x94, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_branch(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(c.ir, setif2), TCCIR_OP_SETIF);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_bool_norm_nonzero_cmp_kept)
+{
+  /* CMP T0,#5 -> the `!= 0` reduction does not apply. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(0, I32), utb_imm(0x95, I32));
+  int cmp = ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32),
+                           utb_imm(5, I32));
+  ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(1, I32), utb_imm(0x95, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_branch(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp), TCCIR_OP_CMP);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_bool_norm_non_bool_def_kept)
+{
+  /* T0 defined by ADD -> not provably {0,1} -> no rewrite. */
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
+  ssa_add_instr3(&c, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32),
+                 utb_imm(2, I32));
+  int cmp = ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32),
+                           utb_imm(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_SETIF, utb_temp(1, I32), utb_imm(0x95, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  UT_ASSERT_EQ(ssa_opt_branch(c.ctx), 0);
+  UT_ASSERT_EQ(utb_op(c.ir, cmp), TCCIR_OP_CMP);
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
  * TEST_ZERO folds
  * ======================================================================== */
 
@@ -321,6 +438,8 @@ UT_TEST(test_branch_test_zero_fallthrough_setif)
  * Negative / no-fold cases
  * ======================================================================== */
 
+/* CMP of two single-def constant TEMPs: the folder chases ASSIGN #const,
+ * so non-immediate operands that hold a known constant still fold. */
 UT_TEST(test_branch_cmp_nonimm)
 {
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
@@ -334,9 +453,9 @@ UT_TEST(test_branch_cmp_nonimm)
   ssa_ctx_rebuild(&c);
 
   int changed = ssa_opt_branch(c.ctx);
-  UT_ASSERT_EQ(changed, 0);
-  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_CMP);
-  UT_ASSERT_EQ(utb_op(c.ir, 3), TCCIR_OP_JUMPIF);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_NOP); /* CMP folded */
+  UT_ASSERT_EQ(utb_op(c.ir, 3), TCCIR_OP_NOP); /* JUMPIF: EQ(1,2) false */
 
   ssa_ctx_free(&c);
   return 0;
@@ -374,6 +493,8 @@ UT_TEST(test_branch_cmp_not_followed)
   return 0;
 }
 
+/* TEST_ZERO of a single-def constant TEMP (ASSIGN #0): the folder resolves
+ * the temp, so it folds just like a raw immediate. */
 UT_TEST(test_branch_test_zero_nonimm)
 {
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/4);
@@ -386,8 +507,10 @@ UT_TEST(test_branch_test_zero_nonimm)
   ssa_ctx_build_ssa_plain(&c);
   ssa_ctx_rebuild(&c);
 
-  UT_ASSERT_EQ(ssa_opt_branch(c.ctx), 0);
-  UT_ASSERT_EQ(utb_op(c.ir, tz_i), TCCIR_OP_TEST_ZERO);
+  int changed = ssa_opt_branch(c.ctx);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, tz_i), TCCIR_OP_NOP);     /* TEST_ZERO folded */
+  UT_ASSERT_EQ(utb_op(c.ir, tz_i + 1), TCCIR_OP_JUMP); /* EQ: 0==0 taken */
 
   ssa_ctx_free(&c);
   return 0;
@@ -484,7 +607,8 @@ UT_TEST(test_branch_cmp_var_store_immediate)
 
   int changed = ssa_opt_branch(c.ctx);
   UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, 1), TCCIR_OP_JUMP); /* JUMPIF */
+  UT_ASSERT_EQ(utb_op(c.ir, 1), TCCIR_OP_NOP);   /* CMP folded via STORE scan */
+  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_JUMP);  /* JUMPIF: EQ(7,7) taken */
 
   ssa_ctx_free(&c);
   return 0;
@@ -506,7 +630,8 @@ UT_TEST(test_branch_cmp_var_deref_store_skipped)
 
   int changed = ssa_opt_branch(c.ctx);
   UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_JUMP); /* JUMPIF */
+  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_NOP);  /* CMP folded (deref STORE skipped) */
+  UT_ASSERT_EQ(utb_op(c.ir, 3), TCCIR_OP_JUMP); /* JUMPIF: EQ(7,7) taken */
 
   ssa_ctx_free(&c);
   return 0;
@@ -754,35 +879,225 @@ UT_TEST(test_branch_idempotent)
 }
 
 /* ========================================================================
+ * Return-constant register reuse (branch_retreuse gen)
+ *
+ * `RETURNVALUE C` reached only via the equality edge of `TEST_ZERO V`
+ * (C == 0) or `CMP V, #C` returns V instead of C.  0x94 = TOK_EQ,
+ * 0x95 = TOK_NE.  The gen is -O2-gated, so tests enter a tcc_state with
+ * the desired optimize level (UT11 links the real libtcc.c globals).
+ * ======================================================================== */
+
+static int run_branch_with_opt_level(IRSSAOptCtx *ctx, int level)
+{
+  static TCCState tcc_state_storage;
+
+  memset(&tcc_state_storage, 0, sizeof(tcc_state_storage));
+  tcc_state_storage.optimize = level;
+  tcc_enter_state(&tcc_state_storage);
+  int changed = ssa_opt_branch(ctx);
+  tcc_exit_state(&tcc_state_storage);
+  return changed;
+}
+
+UT_TEST(test_branch_return_reuse_test_zero)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  /* 0: TEST_ZERO P0; 1: JUMPIF EQ -> 3; 2: RETURNVALUE #1; 3: RETURNVALUE #0 */
+  ssa_add_instr(&c, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_param(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(0x94, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = run_branch_with_opt_level(c.ctx, 2);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 3)), IROP_VR(utb_param(0, I32)));
+  /* The fall-through return keeps its own constant. */
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 2)), IROP_VR(utb_imm(1, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_return_reuse_cmp_imm)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  /* 0: T0 <-- P0; 1: CMP T0,#1; 2: JUMPIF EQ -> 4;
+   * 3: RETURNVALUE #0; 4: RETURNVALUE #1 */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_param(0, I32));
+  ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(0x94, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = run_branch_with_opt_level(c.ctx, 2);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 4)), IROP_VR(utb_temp(0, I32)));
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 3)), IROP_VR(utb_imm(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_return_reuse_cmp_imm_first)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  /* Immediate as CMP src1: CMP #5, T0; EQ edge returns #5 -> T0. */
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_param(0, I32));
+  ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_imm(5, I32), utb_temp(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(0x94, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(5, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = run_branch_with_opt_level(c.ctx, 2);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 4)), IROP_VR(utb_temp(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_return_reuse_decline_ne_edge)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  /* Same shape but the branch to the return is the NE edge: no proof. */
+  ssa_add_instr(&c, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_param(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(0x95, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = run_branch_with_opt_level(c.ctx, 2);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 3)), IROP_VR(utb_imm(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_return_reuse_decline_two_preds)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  /* A second (unconditional) predecessor reaches the return: no proof. */
+  ssa_add_instr(&c, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_param(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(0x94, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMP, utb_imm(3, I32), UTB_NONE);
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = run_branch_with_opt_level(c.ctx, 2);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 3)), IROP_VR(utb_imm(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_return_reuse_decline_fallthrough)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  /* Fall-through into the return block (predecessor is an ASSIGN). */
+  ssa_add_instr(&c, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_param(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(0x94, I32));
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(7, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = run_branch_with_opt_level(c.ctx, 2);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 3)), IROP_VR(utb_imm(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_return_reuse_decline_nonzero_const)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  /* TEST_ZERO only proves V == 0; a #1 return can't reuse it. */
+  ssa_add_instr(&c, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_param(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(0x94, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = run_branch_with_opt_level(c.ctx, 2);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 3)), IROP_VR(utb_imm(1, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_return_reuse_decline_btype_mismatch)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  /* V is I32 but the return is I64: widths differ, no reuse. */
+  ssa_add_instr(&c, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_param(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(0x94, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE,
+                utb_imm(0, IROP_BTYPE_INT64));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = run_branch_with_opt_level(c.ctx, 2);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 3)),
+               IROP_VR(utb_imm(0, IROP_BTYPE_INT64)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_return_reuse_decline_o1)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  /* -O1: the gen is gated to -O2 like the retired flat pass. */
+  ssa_add_instr(&c, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_param(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(0x94, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = run_branch_with_opt_level(c.ctx, 1);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 3)), IROP_VR(utb_imm(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+/* ========================================================================
  * Suite registration
  * ======================================================================== */
 
-UT_SUITE(ssa_opt_branch)
-{
-  UT_COVERS("ssa:branch");
-  UT_RUN(test_branch_cmp_imm_all_conds);
-  UT_RUN(test_branch_cmp_same_vreg_eq);
-  UT_RUN(test_branch_cmp_same_vreg_via_copy_chain);
-  UT_RUN(test_branch_cmp_setif_true);
-  UT_RUN(test_branch_cmp_setif_false);
-  UT_RUN(test_branch_test_zero_eq_taken);
-  UT_RUN(test_branch_test_zero_ne_taken);
-  UT_RUN(test_branch_test_zero_fallthrough_setif);
-  UT_RUN(test_branch_cmp_nonimm);
-  UT_RUN(test_branch_cmp_unknown_token);
-  UT_RUN(test_branch_cmp_not_followed);
-  UT_RUN(test_branch_test_zero_nonimm);
-  UT_RUN(test_branch_test_zero_bad_cond);
-  UT_RUN(test_branch_cmp_setif_unknown_token);
-  UT_RUN(test_branch_cmp_var_immediate_assign);
-  UT_RUN(test_branch_cmp_var_funccall_barrier);
-  UT_RUN(test_branch_cmp_var_store_immediate);
-  UT_RUN(test_branch_cmp_var_deref_store_skipped);
-  UT_RUN(test_branch_drop_phi_edge_taken);
-  UT_RUN(test_branch_drop_phi_edge_not_taken);
-  UT_RUN(test_branch_drop_phi_edge_multi_operand);
-  UT_RUN(test_branch_prune_unreachable_phi);
-  UT_RUN(test_branch_reachable_return_terminator);
-  UT_RUN(test_branch_reachable_ijump);
-  UT_RUN(test_branch_idempotent);
-}
+UT_COVERS("ssa:branch");

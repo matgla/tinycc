@@ -11,7 +11,7 @@
  * stack slot, so the tail `csmix(cs, u4)` mixed 0 instead of 0xbe954e5c.
  *
  * tcc -O0/-O1 were correct; only -O2 (where u4 is promoted + spilled under
- * register pressure, so the phi exists) miscompiled.  Fix: ir/opt/ssa_opt_phi.c
+ * register pressure, so the phi exists) miscompiled.  Fix: source/opt/ssa/cfg/phi.c
  * keeps the phi when its dest still has uses after the replacement attempt.
  * Expected checksum is gcc -m32 -funsigned-char.
  */

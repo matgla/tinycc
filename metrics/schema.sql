@@ -130,6 +130,34 @@ CREATE TABLE IF NOT EXISTS perf (
     PRIMARY KEY(run_id, benchmark, compiler, opt_level)
 );
 
+-- (5) One row per QEMU corpus test that RAN: its functional verdict and its
+-- cycle count (docs/qemu_cycle_profiling.md).  Both come from a single
+-- compile+link+run, so correctness and speed share one pass.
+--
+-- cycles is NULL when the test ran but produced no count (crash, hang, or a run
+-- over the SysTick wrap) -- `passed` is still meaningful there, which is why
+-- the column is nullable rather than the row being dropped.
+--
+-- Deterministic instructions-retired under `-icount`, NOT silicon cycles --
+-- unlike `perf` (RP2350 hardware) these are host-independent and reproducible,
+-- so they diff cleanly between two builds.  `shift` is the -icount shift used:
+-- counts scale with 2^N, so rows from different shifts are NOT comparable and
+-- must never be diffed against each other -- compare_worktree keys its baseline
+-- cache on it.
+--
+-- `passed` is this harness's cruder verdict, not test_qemu.py's; it is only
+-- ever compared against the other side of the same diff (see qemu_corpus.py).
+CREATE TABLE IF NOT EXISTS qemu_cycles (
+    run_id INTEGER NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    suite  TEXT    NOT NULL,
+    test   TEXT    NOT NULL,
+    opt    TEXT    NOT NULL,      -- 'o0' | 'o1' | 'o2'
+    cycles INTEGER,               -- NULL: ran but yielded no count
+    shift  INTEGER NOT NULL,
+    passed INTEGER NOT NULL,
+    PRIMARY KEY(run_id, suite, test, opt)
+);
+
 -- Gate allowlist (track-first -> block): pre-existing / accepted divergences the
 -- gate must not fail on.  A row with a concrete `seed` accepts exactly that seed;
 -- a row with seed IS NULL accepts a count baseline (`baseline`) for the profile.

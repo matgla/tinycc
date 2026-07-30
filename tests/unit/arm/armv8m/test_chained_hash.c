@@ -168,17 +168,3 @@ UT_TEST(test_hash_destroy_nulls_pointers)
   UT_ASSERT_EQ(h.hashed_count, 0);
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(chained_hash)
-{
-  UT_RUN(test_hash_init_state);
-  UT_RUN(test_hash_insert_and_lookup_single);
-  UT_RUN(test_hash_insert_chain_same_bucket);
-  UT_RUN(test_hash_entry_hash_roundtrip);
-  UT_RUN(test_hash_clear_resets_counts);
-  UT_RUN(test_hash_reserve_grows_capacity);
-  UT_RUN(test_hash_auto_rebuild_on_overflow);
-  UT_RUN(test_hash_destroy_nulls_pointers);
-}

@@ -2,7 +2,7 @@
  *  test_ir_vreg.c - suite for ir/vreg.c virtual register management
  *
  *  Initialises a minimal TCCIRState (only the fields vreg.c touches)
- *  without calling tcc_ir_alloc() so we avoid pulling in core.c,
+ *  without calling tcc_ir_alloc() so we avoid pulling in ir/gen/state.c,
  *  tccls.c, and the machine-specific backend.
  */
 
@@ -184,18 +184,4 @@ UT_TEST(test_vreg_null_alloc_temp_returns_minus1)
   UT_ASSERT_EQ(tcc_ir_vreg_alloc_temp(NULL), -1);
   UT_ASSERT_EQ(tcc_ir_vreg_alloc_var(NULL), -1);
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(ir_vreg)
-{
-  UT_RUN(test_vreg_alloc_temp_sequential);
-  UT_RUN(test_vreg_alloc_var_sequential);
-  UT_RUN(test_vreg_alloc_param_sequential);
-  UT_RUN(test_vreg_types_independent);
-  UT_RUN(test_vreg_is_valid);
-  UT_RUN(test_vreg_alloc_temp_grows_capacity);
-  UT_RUN(test_vreg_is_ignored_no_table);
-  UT_RUN(test_vreg_null_alloc_temp_returns_minus1);
 }

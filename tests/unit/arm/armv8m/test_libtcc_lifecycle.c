@@ -41,11 +41,3 @@ UT_TEST(test_tcc_new_delete_cycle_no_leak)
   }
   return 0;
 }
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(libtcc_lifecycle)
-{
-  UT_RUN(test_tcc_new_sets_defaults);
-  UT_RUN(test_tcc_new_delete_cycle_no_leak);
-}

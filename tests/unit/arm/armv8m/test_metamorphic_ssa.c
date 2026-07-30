@@ -65,8 +65,3 @@ UT_TEST(test_metamorphic_ssa_skipped)
           "         enabling path. No SSA property is asserted here (honest skip).\n");
   return 0;
 }
-
-UT_SUITE(metamorphic_ssa)
-{
-  UT_RUN(test_metamorphic_ssa_skipped);
-}

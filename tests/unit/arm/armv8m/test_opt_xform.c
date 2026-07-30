@@ -26,6 +26,7 @@
 /* Pass entry point (declared in ir/opt_xform.h; forward-declared here to avoid
  * pulling in the optimizer engine headers). */
 int tcc_ir_opt_store_inplace_arith(TCCIRState *ir);
+int tcc_ir_opt_narrow_store_value_btype(TCCIRState *ir);
 
 #define I32 IROP_BTYPE_INT32
 #define I64 IROP_BTYPE_INT64
@@ -561,30 +562,96 @@ UT_TEST(test_xform_two_independent_folds)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
+/* ================================================= narrow_store_value_btype
+ *
+ * A STORE through an int8/int16 lval of a wider (int32) value narrows the
+ * stored value's btype to the access width, so the backend can pick a
+ * byte/halfword store without a redundant truncation.  Only wider-than-access
+ * integer values are touched; already-narrow, 64-bit and FP values are left. */
 
-UT_SUITE(opt_xform)
+/* PATH: int8 lval store of an int32 value narrows the value to int8. */
+UT_TEST(test_narrowstore_int8_dest_narrows_value)
 {
-  UT_COVERS("store_inplace_arith");
-  UT_RUN(test_xform_add_param_inplace);
-  UT_RUN(test_xform_sub_var_inplace);
-  UT_RUN(test_xform_all_simple_ops_fold);
-  UT_RUN(test_xform_mul_not_folded);
-  UT_RUN(test_xform_skips_intervening_nop);
-  UT_RUN(test_xform_addrtaken_no_fold);
-  UT_RUN(test_xform_v_is_lvalue_no_fold);
-  UT_RUN(test_xform_v_is_llong_no_fold);
-  UT_RUN(test_xform_v_is_double_no_fold);
-  UT_RUN(test_xform_int8_width_no_fold);
-  UT_RUN(test_xform_width_mismatch_no_fold);
-  UT_RUN(test_xform_store_dest_lval_no_fold);
-  UT_RUN(test_xform_store_src_lval_no_fold);
-  UT_RUN(test_xform_extra_use_of_t_no_fold);
-  UT_RUN(test_xform_next_not_store_no_fold);
-  UT_RUN(test_xform_store_dest_temp_no_fold);
-  UT_RUN(test_xform_arith_dest_not_temp_no_fold);
-  UT_RUN(test_xform_arith_dest_lval_no_fold);
-  UT_RUN(test_xform_block_boundary_no_fold);
-  UT_RUN(test_xform_idempotent);
-  UT_RUN(test_xform_two_independent_folds);
+  TCCIRState *ir = utb_new();
+  utb_alloc_all_intervals(ir, 8);
+  int st = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I8)), utb_temp(1, I32), UTB_NONE);
+  int changes = tcc_ir_opt_narrow_store_value_btype(ir);
+  UT_ASSERT_EQ(changes, 1);
+  UT_ASSERT_EQ(irop_get_btype(utb_src1(ir, st)), I8);
+  utb_free(ir);
+  return 0;
 }
+
+/* PATH: int16 lval store narrows to int16. */
+UT_TEST(test_narrowstore_int16_dest_narrows_value)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_all_intervals(ir, 8);
+  int st = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I16)), utb_temp(1, I32), UTB_NONE);
+  UT_ASSERT_EQ(tcc_ir_opt_narrow_store_value_btype(ir), 1);
+  UT_ASSERT_EQ(irop_get_btype(utb_src1(ir, st)), I16);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (access not narrow): an int32 lval store keeps the int32 value. */
+UT_TEST(test_narrowstore_int32_dest_no_change)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_all_intervals(ir, 8);
+  int st = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I32)), utb_temp(1, I32), UTB_NONE);
+  UT_ASSERT_EQ(tcc_ir_opt_narrow_store_value_btype(ir), 0);
+  UT_ASSERT_EQ(irop_get_btype(utb_src1(ir, st)), I32);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (dest not lval): only a memory (lval) destination is narrowed. */
+UT_TEST(test_narrowstore_non_lval_dest_no_change)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_all_intervals(ir, 8);
+  int st = utb_emit(ir, TCCIR_OP_STORE, utb_temp(0, I8), utb_temp(1, I32), UTB_NONE);
+  UT_ASSERT_EQ(tcc_ir_opt_narrow_store_value_btype(ir), 0);
+  UT_ASSERT_EQ(irop_get_btype(utb_src1(ir, st)), I32);
+  utb_free(ir);
+  return 0;
+}
+
+/* PATH (int16 value, int8 access): a value wider than the access is narrowed
+ * even when it is not int32 — int16 stored through an int8 lval -> int8. */
+UT_TEST(test_narrowstore_int16_value_int8_dest_narrows)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_all_intervals(ir, 8);
+  int st = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I8)), utb_temp(1, I16), UTB_NONE);
+  UT_ASSERT_EQ(tcc_ir_opt_narrow_store_value_btype(ir), 1);
+  UT_ASSERT_EQ(irop_get_btype(utb_src1(ir, st)), I8);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (value narrower-or-equal / 64-bit): an already-narrow, equal-width or
+ * 64-bit value is left alone — only a strictly-wider integer is narrowed. */
+UT_TEST(test_narrowstore_value_not_int32_no_change)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_all_intervals(ir, 8);
+  int st8 = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(0, I8)), utb_temp(1, I8), UTB_NONE);
+  int st64 = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(2, I16)), utb_temp(3, I64), UTB_NONE);
+  UT_ASSERT_EQ(tcc_ir_opt_narrow_store_value_btype(ir), 0);
+  UT_ASSERT_EQ(irop_get_btype(utb_src1(ir, st8)), I8);
+  UT_ASSERT_EQ(irop_get_btype(utb_src1(ir, st64)), I64);
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD (NULL ir). */
+UT_TEST(test_narrowstore_null_ir)
+{
+  UT_ASSERT_EQ(tcc_ir_opt_narrow_store_value_btype(NULL), 0);
+  return 0;
+}
+
+UT_COVERS("store_inplace_arith");
+UT_COVERS("narrow_store_value_btype");

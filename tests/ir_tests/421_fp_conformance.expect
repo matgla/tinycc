@@ -1,0 +1,3 @@
+FP conformance: 3057 double vectors, 2803 float vectors
+FP conformance: double 0 failed / 3057, float 0 failed / 2803
+FP conformance: PASS

@@ -14,7 +14,7 @@
 #include "ir/regalloc.h"
 #include "ir/codegen.h"
 #include "ir/machine_op.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
 
@@ -423,10 +423,11 @@ UT_TEST(test_dispatch_add_agrees_across_dry_and_real_pass)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("dry_run_start"), 2); /* discovery + rehearsal dry pass */
   int dry_adds = cgstub_call_count_pass("data_processing_mop", 0);
   int real_adds = cgstub_call_count_pass("data_processing_mop", 1);
-  UT_ASSERT_EQ(dry_adds, NPARAM - 1);
+  /* Two dry passes (discovery + rehearsal): each op is dispatched twice. */
+  UT_ASSERT_EQ(dry_adds, 2 * (NPARAM - 1));
   UT_ASSERT_EQ(real_adds, NPARAM - 1);
 
   tcc_ir_free(ir);
@@ -483,7 +484,7 @@ UT_TEST(test_dispatch_add_cmp_zero_jumpif_eq_fuses_into_flags_mop)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("data_processing_mop_flags"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("data_processing_mop_flags"), 3);
   UT_ASSERT_EQ(cgstub_call_count("data_processing_mop"), 0); /* fused away, not double-emitted */
   const CgStubCall *c_flags = cgstub_nth_call("data_processing_mop_flags", 0);
   UT_ASSERT(c_flags != NULL);
@@ -491,8 +492,8 @@ UT_TEST(test_dispatch_add_cmp_zero_jumpif_eq_fuses_into_flags_mop)
   UT_ASSERT_EQ(c_flags->dest_kind, MACH_OP_REG);
 
   /* The CMP is skipped (not dispatched at all); JUMPIF still dispatches
-   * normally to conditional_jump_mop. */
-  UT_ASSERT_EQ(cgstub_call_count("conditional_jump_mop"), 1);
+   * normally to conditional_jump_mop, once per pass. */
+  UT_ASSERT_EQ(cgstub_call_count("conditional_jump_mop"), 3);
 
   tcc_ir_free(ir);
   return 0;
@@ -528,7 +529,7 @@ UT_TEST(test_dispatch_sub_cmp_zero_jumpif_ne_fuses_into_flags_mop)
   ir->leaffunc = 1;
   tcc_ir_codegen_generate(ir);
 
-  UT_ASSERT_EQ(cgstub_call_count("data_processing_mop_flags"), 1);
+  UT_ASSERT_EQ(cgstub_call_count("data_processing_mop_flags"), 3);
   UT_ASSERT_EQ(cgstub_call_count("data_processing_mop"), 0);
   const CgStubCall *c_flags = cgstub_nth_call("data_processing_mop_flags", 0);
   UT_ASSERT(c_flags != NULL);
@@ -971,30 +972,4 @@ UT_TEST(test_dispatch_umull_used_twice_blocks_mlal_fusion_attempt)
 
   tcc_ir_free(ir);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(codegen_arith)
-{
-  UT_RUN(test_codegen_arith_accessors);
-  UT_RUN(test_arith_immediate_and_register_operands);
-  UT_RUN(test_arith_op_family_lowering);
-  UT_RUN(test_arith_64bit_pair);
-  UT_RUN(test_dispatch_add_routes_to_data_processing_mop);
-  UT_RUN(test_dispatch_arith_op_family_routes_correctly);
-  UT_RUN(test_dispatch_umull_smull_route_to_dedicated_mops);
-  UT_RUN(test_dispatch_add_agrees_across_dry_and_real_pass);
-  UT_RUN(test_dispatch_add_cmp_zero_jumpif_eq_fuses_into_flags_mop);
-  UT_RUN(test_dispatch_sub_cmp_zero_jumpif_ne_fuses_into_flags_mop);
-  UT_RUN(test_dispatch_cmp_select_01_attempts_subs_eq_select);
-  UT_RUN(test_dispatch_zext_routes_to_assign_mop_forced_to_assign_op);
-  UT_RUN(test_dispatch_pack64_routes_to_pack64_mop);
-  UT_RUN(test_dispatch_mul_const_add_attempts_fused_shifted_add);
-  UT_RUN(test_dispatch_mul_const_add_used_elsewhere_blocks_fusion_attempt);
-  UT_RUN(test_dispatch_mla_32bit_routes_to_mla_mop);
-  UT_RUN(test_dispatch_umull_add_attempts_mlal_fusion);
-  UT_RUN(test_dispatch_umull_used_twice_blocks_mlal_fusion_attempt);
 }

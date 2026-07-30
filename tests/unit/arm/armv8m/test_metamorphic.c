@@ -39,18 +39,13 @@
 /* ── legacy pass entry points (forward-declared; defined in ir/opt_*.c) ── */
 int tcc_ir_opt_neg_chain_cse(TCCIRState *ir);
 int tcc_ir_opt_known_bits(TCCIRState *ir);
-int tcc_ir_opt_copy_prop(TCCIRState *ir);
-int tcc_ir_opt_const_prop(TCCIRState *ir);
 int tcc_ir_opt_const_prop_tmp(TCCIRState *ir);
 int tcc_ir_opt_const_var_prop(TCCIRState *ir);
 int tcc_ir_opt_add_reassoc(TCCIRState *ir);
 int tcc_ir_opt_self_arith_fold(TCCIRState *ir);
-int tcc_ir_opt_local_alu_cse(TCCIRState *ir);
-int tcc_ir_opt_bool_cse(TCCIRState *ir);
 int tcc_ir_opt_single_value_tmp(TCCIRState *ir);
 int tcc_ir_opt_cmp_field_fuse(TCCIRState *ir);
 int tcc_ir_opt_jump_threading(TCCIRState *ir);
-int tcc_ir_opt_setif_or_tautology(TCCIRState *ir);
 int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir);
 int tcc_ir_opt_licm(TCCIRState *ir);
 
@@ -67,18 +62,13 @@ typedef struct PassEntry
 static const PassEntry g_passes[] = {
     {"neg_chain_cse", tcc_ir_opt_neg_chain_cse},
     {"known_bits", tcc_ir_opt_known_bits},
-    {"copy_prop", tcc_ir_opt_copy_prop},
-    {"const_prop", tcc_ir_opt_const_prop},
     {"const_prop_tmp", tcc_ir_opt_const_prop_tmp},
     {"const_var_prop", tcc_ir_opt_const_var_prop},
     {"add_reassoc", tcc_ir_opt_add_reassoc},
     {"self_arith_fold", tcc_ir_opt_self_arith_fold},
-    {"local_alu_cse", tcc_ir_opt_local_alu_cse},
-    {"bool_cse", tcc_ir_opt_bool_cse},
     {"single_value_tmp", tcc_ir_opt_single_value_tmp},
     {"cmp_field_fuse", tcc_ir_opt_cmp_field_fuse},
     {"jump_threading", tcc_ir_opt_jump_threading},
-    {"setif_or_tautology", tcc_ir_opt_setif_or_tautology},
     {"dead_lea_store_elim", tcc_ir_opt_dead_lea_store_elim},
     {"licm", tcc_ir_opt_licm},
 };
@@ -300,34 +290,6 @@ UT_TEST(test_eval_selfcheck_bitops)
   return 0;
 }
 
-/* Cross-validate: the interpreter's fold of a fully-constant function must
- * equal what const_prop computes when it folds the same function to a single
- * ASSIGN. This ties eval() to the production fold code (an independent path). */
-UT_TEST(test_eval_selfcheck_matches_constprop_fold)
-{
-  /* T1 = (#100 * #7) ^ #255 ; everything constant. */
-  TCCIRState *a = utb_new();
-  irg_init_const_pools(a);
-  utb_emit(a, TCCIR_OP_MUL, utb_temp(1, IROP_BTYPE_INT32),
-           utb_imm(100, IROP_BTYPE_INT32), utb_imm(7, IROP_BTYPE_INT32));
-  utb_emit(a, TCCIR_OP_XOR, utb_temp(2, IROP_BTYPE_INT32),
-           utb_temp(1, IROP_BTYPE_INT32), utb_imm(255, IROP_BTYPE_INT32));
-
-  IreResult before;
-  ire_eval(a, NULL, 0, &before);
-  UT_ASSERT_EQ(before.status, IRE_OK);
-  UT_ASSERT_EQ(before.temp[2], (100 * 7) ^ 255);
-
-  /* Run const_prop to fixpoint; eval again; values must be identical. */
-  utb_run_to_fixpoint(a, tcc_ir_opt_const_prop, 16);
-  IreResult after;
-  ire_eval(a, NULL, 0, &after);
-  UT_ASSERT_EQ(after.status, IRE_OK);
-  UT_ASSERT(ire_result_equal(&before, &after));
-
-  free_gen_ir(a);
-  return 0;
-}
 
 /* ============================================================================
  *  PART B — delta-reducer (shrinks a failing function to a minimal repro)
@@ -758,38 +720,12 @@ UT_TEST(test_shr_sar_known_bits_correct_cases)
  * ============================================================================
  */
 
-UT_SUITE(metamorphic)
-{
-  UT_COVERS("neg_chain_cse");
-  UT_COVERS("known_bits");
-  UT_COVERS("copy_prop");
-  UT_COVERS("const_prop");
-  UT_COVERS("const_prop_tmp");
-  UT_COVERS("const_var_prop");
-  UT_COVERS("add_reassoc");
-  UT_COVERS("self_arith_fold");
-  UT_COVERS("local_alu_cse");
-  UT_COVERS("bool_cse");
-  UT_COVERS("single_value_tmp");
-
-  /* Interpreter self-checks FIRST — the metamorphic loop is only trustworthy
-   * if the oracle is correct. */
-  UT_RUN(test_eval_selfcheck_arith);
-  UT_RUN(test_eval_selfcheck_wrap32);
-  UT_RUN(test_eval_selfcheck_shifts);
-  UT_RUN(test_eval_selfcheck_div_logic);
-  UT_RUN(test_eval_selfcheck_div_by_zero_traps);
-  UT_RUN(test_eval_selfcheck_bitops);
-  UT_RUN(test_eval_selfcheck_matches_constprop_fold);
-
-  /* PART D — ZEXT findings: the now-fixed known_bits bug + a positive guard. */
-  UT_RUN(test_zext64_neg_const_known_bits_FIXED);
-  UT_RUN(test_zext32_known_bits_preserves_value);
-
-  /* PART E — SHR width findings: the now-fixed known_bits bug + guards. */
-  UT_RUN(test_shr_neg_const_known_bits_FIXED);
-  UT_RUN(test_shr_sar_known_bits_correct_cases);
-
-  /* The flagship metamorphic sweep. */
-  UT_RUN(test_metamorphic_legacy_passes);
-}
+UT_COVERS("neg_chain_cse");
+UT_COVERS("known_bits");
+UT_COVERS("copy_prop");
+UT_COVERS("const_prop");
+UT_COVERS("const_prop_tmp");
+UT_COVERS("const_var_prop");
+UT_COVERS("add_reassoc");
+UT_COVERS("self_arith_fold");
+UT_COVERS("single_value_tmp");

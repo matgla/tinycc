@@ -16,8 +16,8 @@
 
 #define USING_GLOBALS
 #include "ir.h"
-#include "arch/arm/arm.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/arm.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 #include "ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
@@ -274,19 +274,4 @@ UT_TEST(test_switch_load_mop_second_word_is_ldr_w_dest_ip_index_lsl2)
   UT_ASSERT_EQ(hw1, 0x0021);
 
   return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(gen_switch)
-{
-  UT_RUN(test_switch_table_dry_run_size_zero_entries);
-  UT_RUN(test_switch_table_dry_run_size_scales_by_four_per_entry);
-  UT_RUN(test_switch_load_dry_run_size_is_fixed_eight_bytes);
-  UT_RUN(test_switch_table_mop_zero_entries_emits_preamble_only);
-  UT_RUN(test_switch_table_mop_emits_preamble_plus_zeroed_table_slots);
-  UT_RUN(test_switch_table_mop_preamble_encodes_lsl_and_terminal_bx);
-  UT_RUN(test_switch_load_mop_requires_rodata_symbol);
-  UT_RUN(test_switch_load_mop_emits_exactly_eight_bytes);
-  UT_RUN(test_switch_load_mop_second_word_is_ldr_w_dest_ip_index_lsl2);
 }

@@ -1,0 +1,5 @@
+spin=100 s7=7 s50=50
+sink=29
+prod=60
+sym=42 runtime=100
+[returns 0]

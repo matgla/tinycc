@@ -360,24 +360,5 @@ UT_TEST(test_memset_global_funccallval_with_reader_kept)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_memset_fold)
-{
-  UT_COVERS("small_memset_to_store");
-  UT_COVERS("small_global_memset_to_store");
-  UT_RUN(test_memset_local_size4_single_int32_store);
-  UT_RUN(test_memset_local_size8_single_int64_store);
-  UT_RUN(test_memset_local_size2_and_size1);
-  UT_RUN(test_memset_local_size3_two_stores_repurposes_param_slot);
-  UT_RUN(test_memset_local_size7_bails_needs_three_stores);
-  UT_RUN(test_memset_local_size_over_cap_bails);
-  UT_RUN(test_memset_local_nonzero_fill_kept);
-  UT_RUN(test_memset_local_non_stack_dest_kept);
-  UT_RUN(test_memset_local_unknown_callee_kept);
-  UT_RUN(test_memset_local_lval_dest_kept);
-  UT_RUN(test_memset_global_size4_folds);
-  UT_RUN(test_memset_global_aeabi_arg_order_swap);
-  UT_RUN(test_memset_global_size3_bails_single_store_only);
-  UT_RUN(test_memset_global_funccallval_with_reader_kept);
-}
+UT_COVERS("small_memset_to_store");
+UT_COVERS("small_global_memset_to_store");

@@ -1,0 +1,5 @@
+accum=10
+sym_pos=30 sym_zero=0 sym_neg=0
+then=1 else=2
+runtime=45
+[returns 0]

@@ -248,15 +248,4 @@ UT_TEST(test_global_sl_fwd_redef_of_forwarded_temp_drops_entry)
   return 0;
 }
 
-UT_SUITE(opt_global_sl_fwd)
-{
-  UT_RUN(test_global_sl_fwd_imm_store_to_add);
-  UT_RUN(test_global_sl_fwd_temp_store_to_add);
-  UT_RUN(test_global_sl_fwd_load_becomes_assign);
-  UT_RUN(test_global_sl_fwd_call_clears_tracking);
-  UT_RUN(test_global_sl_fwd_unknown_store_clears_tracking);
-  UT_RUN(test_global_sl_fwd_jump_target_clears_tracking);
-  UT_RUN(test_global_sl_fwd_different_global_kept);
-  UT_RUN(test_global_sl_fwd_redef_of_forwarded_temp_drops_entry);
-  UT_COVERS("global_sl_fwd");
-}
+UT_COVERS("global_sl_fwd");

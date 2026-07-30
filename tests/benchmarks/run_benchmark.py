@@ -199,7 +199,21 @@ def update_compiler_marker(build_dir: Path, compiler: str):
     marker_file.touch()
 
 
-def build_compiler(compiler: str, ssh_host: str, opt_level: str = "1") -> Tuple[bool, Optional[Path], Dict[str, int]]:
+def benchmark_build_dir(compiler: str, opt_level: str, fp_lib: str = "softfp", mfpu: str = "") -> Path:
+    """Build directory for one (compiler, -O, FP runtime, -mfpu) combination.
+
+    The FP runtime and -mfpu are part of the build identity, so two runs that
+    differ only in those get different trees.  This MUST be the single source
+    of that name: --skip-build used to reconstruct the path itself without the
+    FP parts, so `--fp-lib rp2350fp --skip-build` silently re-flashed the
+    softfp image and reported the two configurations as identical.
+    """
+    fp_tag = "" if (fp_lib == "softfp" and not mfpu) else f"_{fp_lib}" + (f"_{mfpu}" if mfpu else "")
+    return Path(__file__).parent / f"build_pico_{compiler.lower()}_O{opt_level}{fp_tag}"
+
+
+def build_compiler(compiler: str, ssh_host: str, opt_level: str = "1",
+                   fp_lib: str = "softfp", mfpu: str = "") -> Tuple[bool, Optional[Path], Dict[str, int]]:
     """Build benchmark for specified compiler (tcc or gcc)."""
     print(f"\n{'='*50}")
     print(f"Building {compiler.upper()} version -O{opt_level}")
@@ -207,7 +221,7 @@ def build_compiler(compiler: str, ssh_host: str, opt_level: str = "1") -> Tuple[
 
     script_dir = Path(__file__).parent
     # Use separate build directories for each optimization level to speed up recompilation
-    build_dir = script_dir / f"build_pico_{compiler.lower()}_O{opt_level}"
+    build_dir = benchmark_build_dir(compiler, opt_level, fp_lib, mfpu)
     pico_sdk_path = (script_dir / "libs" / "pico-sdk").resolve()
 
     # Create build directory
@@ -243,7 +257,9 @@ def build_compiler(compiler: str, ssh_host: str, opt_level: str = "1") -> Tuple[
         "-DPICO_PLATFORM=rp2350",  # Force RP2350 for ARMv8-M
         "-DCMAKE_BUILD_TYPE=Release",
         f"-DBENCHMARK_COMPILER={compiler.upper()}",
-        f"-DBENCHMARK_OPT_LEVEL={opt_level}"
+        f"-DBENCHMARK_OPT_LEVEL={opt_level}",
+        f"-DFP_LIB={fp_lib}",
+        f"-DFP_MFPU={mfpu}",
     ]
     code, stdout, stderr = run_command(cmake_cmd, cwd=build_dir, env=env)
     if code != 0:
@@ -1374,6 +1390,12 @@ def main():
     parser.add_argument("--serial-log", help="Save full raw UART/serial log to file")
     parser.add_argument("--opt-level", "-O", choices=["0", "1", "2", "both", "all"], default="1",
                         help="Optimization level: 0, 1, 2, 'both' (O0+O1), or 'all' (O0+O1+O2) (default: 1)")
+    parser.add_argument("--fp-lib", default="softfp",
+                        choices=["softfp", "rp2350fp", "vfpv4sp", "vfpv5dp"],
+                        help="FP runtime from lib/fp to link into the TCC build (default: softfp). "
+                             "Uses a separate build tree per selection.")
+    parser.add_argument("--mfpu", default="",
+                        help="value for TCC's -mfpu= (e.g. rp2350 for inline DCP/VFP)")
     parser.add_argument("--save-data", help="Save raw results to JSON for later reuse")
     parser.add_argument("--load-data", help="Load results from JSON instead of running on hardware")
 
@@ -1448,13 +1470,19 @@ def main():
         # Build and run TCC
         if not args.only or args.only == "tcc":
             if not args.skip_build:
-                success, elf_path, size_info = build_compiler("tcc", args.host, opt_level)
+                success, elf_path, size_info = build_compiler("tcc", args.host, opt_level,
+                                                              args.fp_lib, args.mfpu)
                 if not success:
                     print("TCC build failed!")
                     if args.only == "tcc":
                         sys.exit(1)
             else:
-                elf_path = Path(__file__).parent / f"build_pico_tcc_O{opt_level}/minimal_uart_picosdk_tcc.elf"
+                elf_path = (benchmark_build_dir("tcc", opt_level, args.fp_lib, args.mfpu)
+                            / "minimal_uart_picosdk_tcc.elf")
+                if not elf_path.exists():
+                    print(f"--skip-build: no image at {elf_path} -- build it first "
+                          f"(drop --skip-build, or check --fp-lib/--mfpu)")
+                    sys.exit(1)
                 size_info = get_binary_size(elf_path)
 
             if elf_path and elf_path.exists():

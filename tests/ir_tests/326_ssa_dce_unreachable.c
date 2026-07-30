@@ -1,4 +1,4 @@
-/* Exercise ssa_opt_dce.c: unreachable-code elimination.
+/* Exercise source/opt/ssa/dce/unreachable.c.
  * The call after the unconditional return must be NOP'd and must not
  * increment the global counter. */
 #include <stdio.h>

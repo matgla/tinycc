@@ -11,6 +11,8 @@
 TOP := $(abspath $(CURDIR)/../../../..)
 UT_ROOT := $(abspath $(CURDIR)/../..)
 
+include $(TOP)/ir/gen/Makefile
+
 # Host compiler (do NOT use the armv8m cross compiler).
 HOSTCC ?= gcc
 
@@ -57,12 +59,13 @@ UT_DEFINES := \
 	-DTCC_TARGET_ARM_ARCHV8M
 
 # -ffunction-sections/-fdata-sections + -Wl,--gc-sections (link rule below) let
-# us pull the irop_config[] table out of the heavy ir/core.c without dragging in
-# its frontend functions (sym_push, vtop, ...) — unreferenced sections are GC'd.
+# us pull the irop_config[] table (ir/gen/config.c) out of the heavy ir/gen/*.c
+# modules without dragging in their frontend functions (sym_push, vtop, ...) —
+# unreferenced sections are GC'd.
 UT_CFLAGS := -std=c11 -g -O0 -Wall -Werror -Wno-unused-function \
 			 -Wno-declaration-after-statement \
 			 -ffunction-sections -fdata-sections \
-			 -I$(TOP) -I$(TOP)/ir -I$(TOP)/ir/opt -I$(UT_ROOT) $(UT_DEFINES) $(UT_COV_CFLAGS)
+			 -I$(TOP) -I$(TOP)/ir -I$(TOP)/source/opt/include -I$(TOP)/source/memory/include -I$(TOP)/source/utils/include -I$(TOP)/source/backend/arch/arm -I$(TOP)/source/backend/arch/arm/thumb -I$(TOP)/source/opt/ssa -I$(TOP)/source/opt/ssa/include -I$(TOP)/source/opt/ssa/string -I$(TOP)/source/opt/ssa/scalar -I$(TOP)/source/opt/ssa/memory -I$(TOP)/source/opt/flat/include -I$(TOP)/source/opt/flat/ipa -I$(TOP)/source/opt/framework -I$(UT_ROOT) $(UT_DEFINES) $(UT_COV_CFLAGS)
 UT_DEPFLAGS := -MMD -MP
 
 # Modules under test (built from tinycc sources, host compilation).
@@ -73,91 +76,213 @@ UT_MODULE_SRCS := \
 	$(TOP)/ir/dump.c \
 	$(TOP)/ir/stack.c \
 	$(TOP)/ir/ssa.c \
-	$(TOP)/ir/opt/ssa_opt_gvn.c \
+	$(TOP)/source/memory/unique_ptr.c \
+	$(TOP)/source/memory/vector.c \
+	$(TOP)/source/opt/ssa/scalar/gvn.c \
+	$(TOP)/source/opt/ssa/loop/loop_rotate.c \
+	$(TOP)/source/opt/ssa/loop/first_iter_exit.c \
+	$(TOP)/source/opt/ssa/loop/loop_cand.c \
+	$(TOP)/source/opt/ssa/loop/ptr_iv_exit_subst.c \
+	$(TOP)/source/opt/ssa/loop/loop_const_sim.c \
+	$(TOP)/source/opt/ssa/loop/loop_unroll.c \
+	$(TOP)/source/opt/ssa/loop/iv_strength_reduction.c \
+	$(TOP)/source/opt/ssa/loop/decrement_to_zero.c \
 	$(TOP)/svalue.c \
-	$(TOP)/arch/arm/arm.c \
-	$(TOP)/arch/arm/thumb/thumb.c \
-	$(TOP)/arch/arm/thumb/thop_adr.c \
-	$(TOP)/arch/arm/thumb/thop_bitfield.c \
-	$(TOP)/arch/arm/thumb/thop_block.c \
-	$(TOP)/arch/arm/thumb/thop_mrs.c \
-	$(TOP)/arch/arm/thumb/thop_branch.c \
-	$(TOP)/arch/arm/thumb/thop_cmp.c \
-	$(TOP)/arch/arm/thumb/thop_extend.c \
-	$(TOP)/arch/arm/thumb/thop_alu_reg.c \
-	$(TOP)/arch/arm/thumb/thop_alu_imm.c \
-	$(TOP)/arch/arm/thumb/thop_dsp.c \
-	$(TOP)/arch/arm/thumb/thop_tbb.c \
-	$(TOP)/arch/arm/thumb/thop_shift_reg.c \
-	$(TOP)/arch/arm/thumb/thop_shift_imm.c \
-	$(TOP)/arch/arm/thumb/thop_system.c \
-	$(TOP)/arch/arm/thumb/thop_vfp.c \
-	$(TOP)/arch/arm/thumb/thop_ldrd.c \
-	$(TOP)/arch/arm/thumb/thop_ldaex.c \
-	$(TOP)/arch/arm/thumb/thop_ldrex.c \
-	$(TOP)/arch/arm/thumb/thop_mem_exclusive.c \
-	$(TOP)/arch/arm/thumb/thop_mem_imm.c \
-	$(TOP)/arch/arm/thumb/thop_mem_reg.c \
-	$(TOP)/arch/arm/thumb/thop_mem_unpriv.c \
-	$(TOP)/arch/arm/thumb/thop_mov.c \
-	$(TOP)/arch/arm/thumb/thop_ldr_literal.c \
-	$(TOP)/arch/arm/thumb/thop_mul.c \
-	$(TOP)/arch/arm/thumb/thop_mvn.c \
-	$(TOP)/arch/arm/thumb/thop_pld.c \
-	$(TOP)/arch/arm/thumb/thop_rev.c \
+	$(TOP)/source/backend/arch/arm/arm.c \
+	$(TOP)/source/backend/arch/arm/thumb/thumb.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_adr.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_bitfield.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_block.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_mrs.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_branch.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_cmp.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_extend.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_alu_reg.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_alu_imm.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_dsp.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_tbb.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_shift_reg.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_shift_imm.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_system.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_vfp.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_coproc.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_ldrd.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_ldaex.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_ldrex.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_mem_exclusive.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_mem_imm.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_mem_reg.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_mem_unpriv.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_mov.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_ldr_literal.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_mul.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_mvn.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_pld.c \
+	$(TOP)/source/backend/arch/arm/thumb/thop_rev.c \
 	$(TOP)/tccir_operand.c \
-	$(TOP)/ir/core.c \
-	$(TOP)/ir/opt_utils.c \
-	$(TOP)/ir/opt_neg_chain.c \
-	$(TOP)/ir/opt_knownbits.c \
-	$(TOP)/ir/opt_copyprop.c \
-	$(TOP)/ir/opt_cmp_fuse.c \
-	$(TOP)/ir/opt_constprop.c \
-	$(TOP)/ir/opt_du.c \
-	$(TOP)/ir/opt_constfold.c \
-	$(TOP)/ir/licm.c \
-	$(TOP)/ir/opt_jump_thread.c \
-	$(TOP)/ir/opt_setif_or_taut.c \
-	$(TOP)/ir/opt_dead_lea_store.c \
-	$(TOP)/ir/opt_dce.c \
-	$(TOP)/ir/opt_branch.c \
-	$(TOP)/ir/opt_hash.c \
-	$(TOP)/ir/opt.c \
-	$(TOP)/ir/opt_alias.c \
+	$(addprefix $(TOP)/,$(IR_GEN_FILES)) \
+	$(TOP)/source/opt/util/pass_disable.c \
+	$(TOP)/source/opt/util/const_eval.c \
+	$(TOP)/source/opt/util/const_string_eval.c \
+	$(TOP)/source/opt/util/cond_util.c \
+	$(TOP)/source/opt/util/block_scan.c \
+	$(TOP)/source/opt/util/purity.c \
+	$(TOP)/source/opt/util/expr_equal.c \
+	$(TOP)/source/opt/util/call_params.c \
+	$(TOP)/source/opt/util/vreg_query.c \
+	$(TOP)/source/opt/util/xform.c \
+	$(TOP)/source/opt/util/ir_insert.c \
+	$(TOP)/source/opt/flat/scalar/neg_chain_cse.c \
+	$(TOP)/source/opt/flat/scalar/known_bits.c \
+	$(TOP)/source/opt/flat/scalar/const_prop_tmp.c \
+	$(TOP)/source/opt/flat/scalar/value_tracking.c \
+	$(TOP)/source/opt/flat/scalar/const_var_prop.c \
+	$(TOP)/source/opt/flat/memory/symaddr_cse.c \
+	$(TOP)/source/opt/flat/memory/dse.c \
+	$(TOP)/source/opt/flat/memory/var_store_elim.c \
+	$(TOP)/source/opt/flat/memory/entry_store_prop.c \
+	$(TOP)/source/opt/flat/memory/sl_forward.c \
+	$(TOP)/source/opt/flat/memory/dead_local_slot.c \
+	$(TOP)/source/opt/flat/memory/dead_temp_local.c \
+	$(TOP)/source/opt/flat/memory/dead_static_store.c \
+	$(TOP)/source/opt/flat/memory/global_base_share.c \
+	$(TOP)/source/opt/flat/memory/byte_store_merge.c \
+	$(TOP)/source/opt/flat/memory/mem_inline.c \
+	$(TOP)/source/opt/ssa/memory/diamond_store_fwd.c \
+	$(TOP)/source/opt/flat/scalar/branch_fold.c \
+	$(TOP)/source/opt/flat/scalar/stack_bool_diamond.c \
+	$(TOP)/source/opt/flat/scalar/global_init_prop.c \
+	$(TOP)/source/opt/flat/scalar/symref_const_prop.c \
+	$(TOP)/source/opt/flat/scalar/complex_const_param_fold.c \
+	$(TOP)/source/opt/flat/scalar/stack_addr_fold.c \
+	$(TOP)/source/opt/flat/scalar/single_value_tmp.c \
+	$(TOP)/source/opt/flat/scalar/cmp_field_fuse.c \
+	$(TOP)/source/opt/analysis/du_chains.c \
+	$(TOP)/source/opt/flat/scalar/const_string_calls.c \
+	$(TOP)/source/opt/flat/scalar/const_call_fold.c \
+	$(TOP)/source/opt/flat/scalar/addrof_const_fold.c \
+	$(TOP)/source/opt/flat/loop/loop_detect.c \
+	$(TOP)/source/opt/flat/loop/func_purity.c \
+	$(TOP)/source/opt/flat/loop/licm.c \
+	$(TOP)/source/opt/flat/loop/stack_param_promote.c \
+	$(TOP)/source/opt/flat/cfg/jump_thread.c \
+	$(TOP)/source/opt/flat/cfg/jumpif_invert.c \
+	$(TOP)/source/opt/flat/memory/dead_lea_store.c \
+	$(TOP)/source/opt/flat/memory/store_inplace_arith.c \
+	$(TOP)/source/opt/flat/scalar/redundant_loop_check.c \
+	$(TOP)/source/opt/flat/dce/dce.c \
+	$(TOP)/source/opt/flat/dce/compact_nops.c \
+	$(TOP)/source/opt/flat/dce/orphan_cmp_elim.c \
+	$(TOP)/source/opt/flat/dce/zero_vla_elim.c \
+	$(TOP)/source/opt/flat/dce/body_essential.c \
+	$(TOP)/source/opt/flat/dce/noreturn_collapse.c \
+	$(TOP)/source/opt/flat/dce/infinite_loop_simplify.c \
+	$(TOP)/source/opt/flat/dce/trap_only_body_suppress.c \
+	$(TOP)/source/opt/flat/dce/infinite_self_recursion.c \
+	$(TOP)/source/opt/flat/dce/noreturn_call_epilogue.c \
+	$(TOP)/source/opt/flat/dce/dead_addrvar_elim.c \
+	$(TOP)/source/opt/flat/dce/dead_trailing_addrvar_store.c \
+	$(TOP)/source/opt/flat/dce/uninit_ub.c \
+	$(TOP)/source/opt/flat/dce/ub_only_body_elide.c \
+	$(TOP)/source/opt/flat/dce/const_return_uninit_elide.c \
+	$(TOP)/source/opt/flat/dce/null_store_dom_return.c \
+	$(TOP)/source/opt/ssa/cfg/or_bool_diamond.c \
+	$(TOP)/source/opt/engine/fp_cache_shim.c \
+	$(TOP)/source/opt/util/vreg_def_use.c \
+	$(TOP)/source/opt/engine/pass_timing.c \
+	$(TOP)/source/opt/analysis/alias.c \
+	$(TOP)/source/opt/analysis/memref.c \
+	$(TOP)/source/opt/analysis/mem_ssa.c \
 	$(TOP)/ir/cfg.c \
-	$(TOP)/ir/opt_loop_utils.c \
-	$(TOP)/ir/opt_loop_dead.c \
-	$(TOP)/ir/opt_reroll.c \
-	$(TOP)/ir/opt_bitfield.c \
-	$(TOP)/ir/opt_const_aggregate.c \
-	$(TOP)/ir/opt_memory.c \
-	$(TOP)/ir/opt_dead_vla.c \
-	$(TOP)/ir/opt_xform.c \
-	$(TOP)/ir/opt_engine.c \
-	$(TOP)/ir/opt_gens_branch.c \
-	$(TOP)/ir/opt_promote.c \
-	$(TOP)/ir/opt_gens_bool.c \
-	$(TOP)/ir/opt_gens_fusion.c \
-	$(TOP)/ir/opt_fusion.c \
-	$(TOP)/ir/opt_gens_call_result.c \
-	$(TOP)/ir/opt_pipeline.c \
+	$(TOP)/source/opt/flat/loop/loop_ir_mutate.c \
+	$(TOP)/source/opt/flat/loop/iv_analysis.c \
+	$(TOP)/source/opt/flat/loop/iv_strength_reduction.c \
+	$(TOP)/source/opt/flat/loop/loop_exit_analysis.c \
+	$(TOP)/source/opt/flat/loop/loop_eliminate.c \
+	$(TOP)/source/opt/flat/loop/loop_unroll.c \
+	$(TOP)/source/opt/flat/loop/loop_rotate.c \
+	$(TOP)/source/opt/flat/loop/loop_relayout.c \
+	$(TOP)/source/opt/flat/loop/seq_guard_elim.c \
+	$(TOP)/source/opt/flat/loop/decrement_to_zero.c \
+	$(TOP)/source/opt/flat/loop/reroll.c \
+	$(TOP)/source/opt/flat/scalar/bitfield.c \
+	$(TOP)/source/opt/flat/scalar/cmp_expr_fold.c \
+	$(TOP)/source/opt/flat/scalar/float_narrow.c \
+	$(TOP)/source/opt/flat/scalar/const_aggregate.c \
+	$(TOP)/source/opt/flat/ipa/pure_via_sret.c \
+	$(TOP)/source/opt/flat/ipa/func_write_summary.c \
+	$(TOP)/source/opt/flat/ipa/tu_func_summary.c \
+	$(TOP)/source/opt/flat/ipa/tu_noreturn.c \
+	$(TOP)/source/opt/flat/ipa/tu_dead_statics.c \
+	$(TOP)/source/opt/flat/memory/dead_init_via_call.c \
+	$(TOP)/source/opt/flat/memory/stack_addr_cse.c \
+	$(TOP)/source/opt/flat/memory/block_copy_init.c \
+	$(TOP)/source/opt/flat/memory/small_memset_to_store.c \
+	$(TOP)/source/opt/flat/memory/small_global_memset_to_store.c \
+	$(TOP)/source/opt/flat/memory/mem_init.c \
+	$(TOP)/source/opt/flat/memory/memmove_to_indexed_stores.c \
+	$(TOP)/source/opt/flat/memory/addrof_var_fwd.c \
+	$(TOP)/source/opt/flat/memory/ptr_local_fwd.c \
+	$(TOP)/source/opt/flat/memory/invariant_global_load_hoist.c \
+	$(TOP)/source/opt/flat/memory/invariant_temp_deref_hoist.c \
+	$(TOP)/source/opt/flat/memory/rmw_byte_clear.c \
+	$(TOP)/source/opt/flat/memory/local_copy_prop.c \
+	$(TOP)/source/opt/flat/memory/struct_copy_roundtrip_elim.c \
+	$(TOP)/source/opt/flat/dce/dead_vla.c \
+	$(TOP)/source/opt/engine/ctx.c \
+	$(TOP)/source/opt/engine/run_gens.c \
+	$(TOP)/source/opt/flat/scalar/branch.c \
+	$(TOP)/source/opt/flat/scalar/var_to_tmp.c \
+	$(TOP)/source/opt/flat/cfg/returnvalue_merge.c \
+	$(TOP)/source/opt/flat/loop/backedge_phi_hoist.c \
+	$(TOP)/source/opt/flat/cfg/abort_tail_merge.c \
+	$(TOP)/source/opt/flat/cfg/if_convert.c \
+	$(TOP)/source/opt/flat/scalar/bool.c \
+	$(TOP)/source/opt/flat/fusion/gens_fusion.c \
+	$(TOP)/source/opt/flat/fusion/add_deref_fold.c \
+	$(TOP)/source/opt/flat/fusion/call_chain_rename.c \
+	$(TOP)/source/opt/flat/fusion/stackoff_addr_cse.c \
+	$(TOP)/source/opt/flat/fusion/lea_fold.c \
+	$(TOP)/source/opt/flat/fusion/lea_rmw_fold.c \
+	$(TOP)/source/opt/flat/fusion/assign_fuse.c \
+	$(TOP)/source/opt/flat/fusion/pack64.c \
+	$(TOP)/source/opt/flat/fusion/pack64_tautology.c \
+	$(TOP)/source/opt/flat/fusion/cmp_narrow_64.c \
+	$(TOP)/source/opt/flat/fusion/shl32_or_chain.c \
+	$(TOP)/source/opt/flat/fusion/barrel_shift.c \
+	$(TOP)/source/opt/flat/fusion/shift_pair_ubfx.c \
+	$(TOP)/source/opt/flat/scalar/call_result.c \
+	$(TOP)/source/opt/flat/scalar/self_arith.c \
+	$(TOP)/source/opt/flat/scalar/narrow_store.c \
+	$(TOP)/source/opt/flat/scalar/self_copy.c \
+	$(TOP)/source/opt/flat/scalar/var_tmp_fwd.c \
+	$(TOP)/source/opt/flat/scalar/switch_collapse.c \
+	$(TOP)/source/opt/flat/scalar/add_reassoc.c \
+	$(TOP)/source/opt/flat/fusion/indexed_chain.c \
+	$(TOP)/source/opt/flat/fusion/pair_reorder.c \
+	$(TOP)/source/opt/flat/fusion/disp.c \
+	$(TOP)/source/opt/engine/pipeline_run.c \
+	$(TOP)/source/opt/engine/pipeline_table.c \
+	$(TOP)/source/opt/engine/gen_adapters.c \
 		$(TOP)/ir/regalloc.c \
+		$(TOP)/source/opt/ra/const_branch_fold.c \
+		$(TOP)/source/opt/ra/incomplete_calls.c \
+		$(TOP)/source/opt/ra/phi_const_chain.c \
 		$(TOP)/ir/codegen.c \
 		$(TOP)/ir/machine_op.c \
 		$(TOP)/tccls.c \
 		$(TOP)/tccmachine.c \
-		$(TOP)/arch/arm/arm_regalloc.c \
-		$(TOP)/arch/arm/arm_aapcs.c \
-		$(TOP)/arch/arm/ssa_opt_arm.c \
-		$(TOP)/ir/opt_loop.c \
-		$(TOP)/ir/opt_pack64.c \
-		$(TOP)/ir/opt_loop_const_sim.c \
-		$(TOP)/arm-thumb-asm.c \
-		$(TOP)/arm-link.c \
+		$(TOP)/source/backend/arch/arm/arm_regalloc.c \
+		$(TOP)/source/backend/arch/arm/arm_aapcs.c \
+		$(TOP)/source/backend/arch/arm/ssa_opt_arm.c \
+		$(TOP)/source/opt/flat/fusion/shift64_dead_half.c \
+		$(TOP)/source/opt/flat/loop/const_sim.c \
+		$(TOP)/source/backend/arch/arm/thumb/arm-thumb-asm.c \
+		$(TOP)/source/backend/arch/arm/arm-link.c \
 		$(TOP)/tccld.c \
 		$(TOP)/tccdebug.c \
 		$(TOP)/tccyaff.c \
-		$(TOP)/ir/opt_switch_data.c
+		$(TOP)/source/opt/flat/cfg/switch_to_data.c
 
 # arm-thumb-asm.c stays in UT_MODULE_SRCS because the backend (UT2) and ssaopt
 # (UT11) binaries link it for real (their test_gen_*/ssa suites need g()/
@@ -167,7 +292,7 @@ UT_MODULE_SRCS := \
 # multiple-definition error for every ST_FUNC it exports. Filter it out of the
 # main link only; UT2/UT11 re-pattern UT_MODULE_SRCS into their own build dirs
 # and are unaffected.
-UT_MODULE_OBJS := $(filter-out $(BUILD_DIR)/arm-thumb-asm.o,\
+UT_MODULE_OBJS := $(filter-out $(BUILD_DIR)/source/backend/arch/arm/thumb/arm-thumb-asm.o,\
 	$(patsubst $(TOP)/%.c,$(BUILD_DIR)/%.o,$(UT_MODULE_SRCS)))
 
 # Product sources that are never *linked* into the UT binary: each one's
@@ -186,46 +311,70 @@ UT_MODULE_OBJS := $(filter-out $(BUILD_DIR)/arm-thumb-asm.o,\
 # (get_sym_ref/greloc/section_add/int_type) and the two pre-existing no-op
 # stubs that duplicated its two entry points (tcc_ir_opt_switch_to_data in
 # ra_link_stubs.c, tcc_ir_opt_switch_collapse_ex in stubs.c) were deleted.
+# Trailing entries are cross-build TUs (CORE_FILES / SSA_OPT_SRC / FPU-variant
+# backend) that no unit suite links today — registered at 0% until one does.
 UT_COVERAGE_ONLY_SRCS := \
-	$(TOP)/arm-thumb-gen.c \
-	$(TOP)/arm-thumb-callsite.c \
-	$(TOP)/ir/opt/ssa_opt.c \
-	$(TOP)/ir/opt/ssa_opt_branch.c \
-	$(TOP)/ir/opt/ssa_opt_cmp_eq.c \
-	$(TOP)/ir/opt/ssa_opt_cprop.c \
-	$(TOP)/ir/opt/ssa_opt_dce.c \
-	$(TOP)/ir/opt/ssa_opt_dead_loop.c \
-	$(TOP)/ir/opt/ssa_opt_fold.c \
-	$(TOP)/ir/opt/ssa_opt_load_cse.c \
-	$(TOP)/ir/opt/ssa_opt_narrow.c \
-	$(TOP)/ir/opt/ssa_opt_phi.c \
-	$(TOP)/ir/opt/ssa_opt_reassoc.c \
-	$(TOP)/ir/opt/ssa_opt_sccp.c \
-	$(TOP)/ir/opt/ssa_opt_strength.c \
+	$(TOP)/source/backend/arch/arm/thumb/arm-thumb-gen.c \
+	$(TOP)/source/backend/arch/arm/thumb/arm-thumb-callsite.c \
+	$(TOP)/source/opt/ssa/engine/use_def.c \
+	$(TOP)/source/opt/ssa/engine/rewrite.c \
+	$(TOP)/source/opt/ssa/engine/stack_resolve.c \
+	$(TOP)/source/opt/ssa/engine/driver.c \
+	$(TOP)/source/opt/ssa/cfg/branch.c \
+	$(TOP)/source/opt/ssa/cfg/cmp_eq.c \
+	$(TOP)/source/opt/ssa/cfg/vrp.c \
+	$(TOP)/source/opt/ssa/scalar/setif_or_taut.c \
+	$(TOP)/source/opt/ssa/scalar/bool_norm.c \
+	$(TOP)/source/opt/ssa/scalar/cmp_offset_fold.c \
+	$(TOP)/source/opt/ssa/scalar/tmp_block_const.c \
+	$(TOP)/source/opt/ssa/scalar/cprop.c \
+	$(TOP)/source/opt/ssa/dce/temp_worklist.c \
+	$(TOP)/source/opt/ssa/dce/unreachable.c \
+	$(TOP)/source/opt/ssa/dce/dead_var_stores.c \
+	$(TOP)/source/opt/ssa/dce/stackloc_stores.c \
+	$(TOP)/source/opt/ssa/dce/dce_common.c \
+	$(TOP)/source/opt/ssa/dce/orphan_params.c \
+	$(TOP)/source/opt/ssa/dce/ret_path_frame_store.c \
+	$(TOP)/source/opt/ssa/dce/dead_phi_cycles.c \
+	$(TOP)/source/opt/ssa/dce/dead_overwrite_stores.c \
+	$(TOP)/source/opt/ssa/dce/dead_global_stores.c \
+	$(TOP)/source/opt/ssa/dce/var_liveness.c \
+	$(TOP)/source/opt/ssa/dce/dce.c \
+	$(TOP)/source/opt/ssa/loop/dead_loop.c \
+	$(TOP)/source/opt/ssa/scalar/fold.c \
+	$(TOP)/source/opt/ssa/memory/load_cse.c \
+	$(TOP)/source/opt/ssa/memory/global_store_dse.c \
+	$(TOP)/source/opt/ssa/memory/ptr_store_dse.c \
+	$(TOP)/source/opt/ssa/cfg/guard_collapse.c \
+	$(TOP)/source/opt/ssa/scalar/narrow.c \
+	$(TOP)/source/opt/ssa/cfg/phi.c \
+	$(TOP)/source/opt/ssa/scalar/reassoc.c \
+	$(TOP)/source/opt/ssa/scalar/sccp.c \
+	$(TOP)/source/opt/ssa/scalar/strength.c \
 	$(TOP)/tccgen.c \
 	$(TOP)/tccdbg.c \
 	$(TOP)/tccasm.c \
-	$(TOP)/tccopt.c \
+	$(TOP)/source/opt/engine/fp_mat_cache.c \
+	$(TOP)/source/opt/engine/pass_registry.c \
 	$(TOP)/tcctools.c \
 	$(TOP)/tcc.c \
-	$(TOP)/libtcc.c
+	$(TOP)/libtcc.c \
+	$(TOP)/source/opt/function_pipeline.c \
+	$(TOP)/source/opt/ssa/memory/global_addr_hoist.c \
+	$(TOP)/source/backend/generators/function.c \
+	$(TOP)/source/backend/generators/regalloc.c
 UT_COVERAGE_ONLY_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR)/%.o,$(UT_COVERAGE_ONLY_SRCS))
 
 # Harness + suites (local to this directory).
 UT_LOCAL_SRCS := \
-	test_thop_tbb.c \
-	test_thop_shift_reg.c \
-	test_thop_shift_imm.c \
-	test_thop_system.c \
-	test_thop_vfp.c \
 	test_main.c \
-	test_thop_mrs.c \
-	test_thop_bitfield.c \
 	test_chained_hash.c \
 	test_ir_pool.c \
 	test_ir_type.c \
 	test_ir_vreg.c \
 	test_ir_core.c \
+	test_ir_gen_control.c \
+	test_ir_gen_vla.c \
 	test_ir_dump.c \
 	test_ir_stack.c \
 	test_ir_ssa.c \
@@ -236,25 +385,23 @@ UT_LOCAL_SRCS := \
 	test_ra_linearscan.c \
 	test_ra_phi.c \
 	test_ra_arm.c \
+	test_arm_regalloc_narrow.c \
 	test_arm_target.c \
 	test_arm_aapcs.c \
 	test_arm_link.c \
 	test_ld_script.c \
-	ra_link_stubs.c \
 	test_opt_neg_chain.c \
 	test_opt_knownbits.c \
-	test_opt_copyprop.c \
+	test_opt_symaddr_cse.c \
 	test_opt_cmp_fuse.c \
 	test_opt_helpers.c \
 	test_opt_utils.c \
 	test_opt_stack_addr_cse.c \
-	test_opt_bool_norm.c \
-	test_opt_cmp_cse.c \
 	test_opt_memset_fold.c \
+	test_opt_mem_inline.c \
 	test_opt_dead_init_call.c \
 	test_opt_memmove.c \
 	test_opt_loop_utils.c \
-	test_opt_loop.c \
 	test_opt_du.c \
 	test_opt_alias.c \
 	test_ir_stack_extra.c \
@@ -264,7 +411,6 @@ UT_LOCAL_SRCS := \
 	test_opt_constfold.c \
 	test_opt_licm.c \
 	test_opt_jump_thread.c \
-	test_opt_setif_or_taut.c \
 	test_opt_dead_lea_store.c \
 	test_opt_loop_dead.c \
 	test_opt_loop_const_sim.c \
@@ -282,19 +428,13 @@ UT_LOCAL_SRCS := \
 	test_opt_promote_extra.c \
 	test_opt_fusion.c \
 	test_opt_pipeline_orchestration.c \
-	test_opt_branch_fold.c \
-	test_opt_vrp.c \
-	test_opt_orphan_cmp.c \
 	test_opt_float_branch.c \
 	test_opt_redundant_assign.c \
-	test_opt_nonneg_fold.c \
-	test_opt_return_reuse.c \
 	test_opt_uninit.c \
 	test_opt_dead_vla.c \
 	test_opt_xform.c \
 	test_opt_switch_collapse.c \
 	test_opt_switch_to_data.c \
-	elfsec_stubs.c \
 	test_metamorphic.c \
 	test_metamorphic_ssa.c \
 	test_ssa_opt_arm.c \
@@ -306,19 +446,27 @@ UT_LOCAL_SRCS := \
 	test_codegen_atomic.c \
 	test_codegen_dispatch_smoke.c \
 	test_codegen_dispatch_prolog.c \
+	test_gen_softfloat.c \
 	test_tcc_driver.c \
 	test_tccasm.c \
 	test_tccdbg.c \
 	test_tccdebug.c \
-	codegen_mop_stubs.c \
 	test_thop_adr.c \
 	test_thop_alu_reg.c \
 	test_thop_alu_imm.c \
 	test_thop_dsp.c \
+	test_thop_bitfield.c \
 	test_thop_block.c \
 	test_thop_constraints.c \
 	test_thumb_core.c \
 	test_thop_branch.c \
+	test_thop_mrs.c \
+	test_thop_tbb.c \
+	test_thop_shift_reg.c \
+	test_thop_shift_imm.c \
+	test_thop_system.c \
+	test_thop_vfp.c \
+	test_thop_coproc.c \
 	test_thop_cmp.c \
 	test_thop_extend.c \
 	test_thop_ldrd.c \
@@ -335,6 +483,9 @@ UT_LOCAL_SRCS := \
 	test_thop_pld.c \
 	test_thop_rev.c \
 	test_arm_thumb_asm.c \
+	ra_link_stubs.c \
+	elfsec_stubs.c \
+	codegen_mop_stubs.c \
 	stubs.c \
 	stubs_gen_machine_fallback.c \
 	tcc_state_stub.c
@@ -354,7 +505,9 @@ COV_DIR := $(BUILD_DIR)/coverage
 GCOVR_FILTERS := \
 	--filter '$(TOP)/ir/' \
 	--filter '$(TOP)/[^/]+\.c$$' \
-	--filter '$(TOP)/arch/arm/'
+	--filter '$(TOP)/source/backend/' \
+	--filter '$(TOP)/source/opt/' \
+	--filter '$(TOP)/source/memory/'
 
 .PHONY: all run clean coverage run-tccpp coverage-tccpp run-tcc coverage-tcc
 
@@ -390,6 +543,7 @@ coverage:
 	$(MAKE) COVERAGE=1 $(UT9_BIN)
 	$(MAKE) COVERAGE=1 $(UT10_BIN)
 	$(MAKE) COVERAGE=1 $(UT11_BIN)
+	$(MAKE) COVERAGE=1 $(UT12_BIN)
 	./$(UT_BIN)
 	./$(UT2_BIN)
 	./$(UT3_BIN)
@@ -401,6 +555,7 @@ coverage:
 	./$(UT9_BIN)
 	./$(UT10_BIN)
 	./$(UT11_BIN)
+	./$(UT12_BIN)
 	@mkdir -p $(COV_DIR)
 	gcovr --root $(TOP) \
 		$(CURDIR)/$(BUILD_DIR) \
@@ -414,6 +569,7 @@ coverage:
 		$(CURDIR)/$(BUILD_DIR9) \
 		$(CURDIR)/$(BUILD_DIR10) \
 		$(CURDIR)/$(BUILD_DIR11) \
+		$(CURDIR)/$(BUILD_DIR12) \
 		$(GCOVR_FILTERS) \
 		--exclude-unreachable-branches \
 		--exclude-throw-branches \
@@ -456,12 +612,12 @@ $(BUILD_DIR)/%.o: $(TOP)/%.c Makefile $(COV_STAMP)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 # arch/arm/arm.o — build from the tinycc source tree.
-$(BUILD_DIR)/arch/arm/%.o: $(TOP)/arch/arm/%.c Makefile $(COV_STAMP)
+$(BUILD_DIR)/arch/arm/%.o: $(TOP)/source/backend/arch/arm/%.c Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 # arch/arm/thumb/thumb.o and thop_adr.o — build from the tinycc source tree.
-$(BUILD_DIR)/arch/arm/thumb/%.o: $(TOP)/arch/arm/thumb/%.c Makefile $(COV_STAMP)
+$(BUILD_DIR)/arch/arm/thumb/%.o: $(TOP)/source/backend/arch/arm/thumb/%.c Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
@@ -475,9 +631,8 @@ $(BUILD_DIR)/arch/arm/thumb/%.o: $(TOP)/arch/arm/thumb/%.c Makefile $(COV_STAMP)
 # can't share the main run_unit_tests binary: codegen_mop_stubs.c fakes the
 # exact ~78 tcc_gen_machine_* entry points arm-thumb-gen.c defines for real
 # (guaranteed "multiple definition" on every one of them), so this is a
-# second, independent binary with its own build tree (opt-in via
-# `make run-backend` / `make coverage-backend`, not yet wired into the
-# default `run`/`coverage` targets).
+# second, independent binary with its own build tree. Part of the default
+# `all`/`run`/`coverage` targets; `make run-backend` runs it alone.
 # ---------------------------------------------------------------------------
 
 BUILD_DIR2 := build_backend
@@ -494,10 +649,21 @@ $(COV_STAMP2):
 # backend files under test. Verified by trial-link: this exact source set
 # links clean against UT2_LOCAL_SRCS below with zero undefined symbols and
 # zero multiple definitions.
+#
+# The arch/fpu/arm/ capability tables are here because arm-thumb-gen.c's
+# arm_determine_fpu_config() names all three; only arm_soft_fpu_config is
+# defined in arm-thumb-gen.c itself. They used to resolve by accident: their
+# headers declared `const FloatingPointConfig x;` without `extern`, so every
+# includer got its own zero-initialised tentative definition. Making the
+# headers `extern` (so the real tables are actually used) turned that into an
+# undefined reference here.
 UT2_MODULE_SRCS := \
 	$(UT_MODULE_SRCS) \
-	$(TOP)/arm-thumb-gen.c \
-	$(TOP)/arm-thumb-callsite.c
+	$(TOP)/source/backend/arch/arm/thumb/arm-thumb-gen.c \
+	$(TOP)/source/backend/arch/arm/thumb/arm-thumb-callsite.c \
+	$(TOP)/source/backend/arch/fpu/arm/fpv5-sp-d16.c \
+	$(TOP)/source/backend/arch/fpu/arm/fpv5-d16.c \
+	$(TOP)/source/backend/arch/fpu/arm/rp2350-dcp.c
 UT2_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR2)/%.o,$(UT2_MODULE_SRCS))
 
 # Harness + suites (local to this directory) for the backend binary. Reuses
@@ -514,6 +680,7 @@ UT2_LOCAL_SRCS := \
 	test_gen_mem.c \
 	test_gen_branch.c \
 	test_gen_switch.c \
+	test_gen_float.c \
 	test_gen_fp.c \
 	test_gen_atomic.c \
 	test_gen_call.c \
@@ -568,11 +735,11 @@ $(BUILD_DIR2)/ir/%.o: $(TOP)/ir/%.c Makefile $(COV_STAMP2)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
-$(BUILD_DIR2)/arch/arm/thumb/%.o: $(TOP)/arch/arm/thumb/%.c Makefile $(COV_STAMP2)
+$(BUILD_DIR2)/arch/arm/thumb/%.o: $(TOP)/source/backend/arch/arm/thumb/%.c Makefile $(COV_STAMP2)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
-$(BUILD_DIR2)/arch/arm/%.o: $(TOP)/arch/arm/%.c Makefile $(COV_STAMP2)
+$(BUILD_DIR2)/arch/arm/%.o: $(TOP)/source/backend/arch/arm/%.c Makefile $(COV_STAMP2)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
@@ -723,8 +890,7 @@ $(BUILD_DIR4)/%.o: $(TOP)/%.c Makefile $(COV_STAMP4)
 # free is stubbed in stubs.c (main binary), and _clear/_lookup/_record are
 # stubbed in codegen_mop_stubs.c/codegen_backend_stubs.c -- linking the real
 # tccopt.c into any of those would be an immediate multiple-definition error.
-# Opt-in via `make run-tccopt` (not part of the default `all`/`run`), mirroring
-# the UT2_BIN/UT4_BIN precedent above.
+# Part of the default `all`/`run` targets; `make run-tccopt` runs it alone.
 # ---------------------------------------------------------------------------
 
 BUILD_DIR5 := build_tccopt
@@ -737,7 +903,8 @@ $(COV_STAMP5):
 	@touch $@
 
 UT5_MODULE_SRCS := \
-	$(TOP)/tccopt.c
+	$(TOP)/source/opt/engine/fp_mat_cache.c \
+	$(TOP)/source/opt/engine/pass_registry.c
 UT5_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR5)/%.o,$(UT5_MODULE_SRCS))
 
 UT5_LOCAL_SRCS := \
@@ -928,7 +1095,15 @@ $(BUILD_DIR7)/%.o: %.c $(UT_ROOT)/ut.h Makefile $(COV_STAMP7)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
-$(BUILD_DIR7)/%.o: $(TOP)/%.c Makefile $(COV_STAMP7)
+# tccpp.c includes the generated header tccdefs_.h (CONFIG_TCC_PREDEFS=1 in
+# config.h), which the top-level Makefile produces from include/tccdefs.h via
+# its c2str rule.  Delegate to it so this suite also builds after a top-level
+# `make clean` (which removes *_.h) — the depfile cannot express this edge
+# because the first compile fails before -MMD output is written.
+$(TOP)/tccdefs_.h: $(TOP)/include/tccdefs.h
+	$(MAKE) -C $(TOP) tccdefs_.h
+
+$(BUILD_DIR7)/%.o: $(TOP)/%.c Makefile $(COV_STAMP7) $(TOP)/tccdefs_.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
@@ -1031,7 +1206,8 @@ $(COV_STAMP9):
 
 UT9_MODULE_SRCS := \
 	$(TOP)/tccyaff.c \
-	$(TOP)/tccelf.c
+	$(TOP)/tccelf.c \
+	$(TOP)/source/memory/unique_ptr.c
 UT9_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR9)/%.o,$(UT9_MODULE_SRCS))
 
 UT9_LOCAL_SRCS := \
@@ -1167,27 +1343,80 @@ $(COV_STAMP11):
 UT11_MODULE_SRCS := \
 	$(UT_MODULE_SRCS) \
 	$(TOP)/libtcc.c \
-	$(TOP)/ir/opt/ssa_opt.c \
-	$(TOP)/ir/opt/ssa_opt_cprop.c \
-	$(TOP)/ir/opt/ssa_opt_dce.c \
-	$(TOP)/ir/opt/ssa_opt_fold.c \
-	$(TOP)/ir/opt/ssa_opt_sccp.c \
-	$(TOP)/ir/opt/ssa_opt_load_cse.c \
-	$(TOP)/ir/opt/ssa_opt_branch.c \
-	$(TOP)/ir/opt/ssa_opt_cmp_eq.c \
-	$(TOP)/ir/opt/ssa_opt_reassoc.c \
-	$(TOP)/ir/opt/ssa_opt_narrow.c \
-	$(TOP)/ir/opt/ssa_opt_phi.c \
-	$(TOP)/ir/opt/ssa_opt_strength.c \
-	$(TOP)/ir/opt/ssa_opt_dead_loop.c
-	# ssa_opt_gvn.c already in UT_MODULE_SRCS
+	$(TOP)/source/opt/ssa/engine/use_def.c \
+	$(TOP)/source/opt/ssa/engine/rewrite.c \
+	$(TOP)/source/opt/ssa/engine/stack_resolve.c \
+	$(TOP)/source/opt/ssa/engine/driver.c \
+	$(TOP)/source/opt/ssa/scalar/cprop.c \
+	$(TOP)/source/opt/ssa/dce/temp_worklist.c \
+	$(TOP)/source/opt/ssa/dce/unreachable.c \
+	$(TOP)/source/opt/ssa/dce/dead_var_stores.c \
+	$(TOP)/source/opt/ssa/dce/stackloc_stores.c \
+	$(TOP)/source/opt/ssa/dce/dce_common.c \
+	$(TOP)/source/opt/ssa/dce/orphan_params.c \
+	$(TOP)/source/opt/ssa/dce/ret_path_frame_store.c \
+	$(TOP)/source/opt/ssa/dce/dead_phi_cycles.c \
+	$(TOP)/source/opt/ssa/dce/dead_overwrite_stores.c \
+	$(TOP)/source/opt/ssa/dce/dead_global_stores.c \
+	$(TOP)/source/opt/ssa/dce/var_liveness.c \
+	$(TOP)/source/opt/ssa/dce/dce.c \
+	$(TOP)/source/opt/ssa/scalar/fold.c \
+	$(TOP)/source/opt/ssa/scalar/sccp.c \
+	$(TOP)/source/opt/ssa/memory/load_cse.c \
+	$(TOP)/source/opt/ssa/memory/global_store_dse.c \
+	$(TOP)/source/opt/ssa/memory/ptr_store_dse.c \
+	$(TOP)/source/opt/ssa/cfg/guard_collapse.c \
+	$(TOP)/source/opt/ssa/cfg/branch.c \
+	$(TOP)/source/opt/ssa/cfg/cmp_eq.c \
+	$(TOP)/source/opt/ssa/cfg/vrp.c \
+	$(TOP)/source/opt/ssa/scalar/setif_or_taut.c \
+	$(TOP)/source/opt/ssa/scalar/bool_norm.c \
+	$(TOP)/source/opt/ssa/scalar/cmp_offset_fold.c \
+	$(TOP)/source/opt/ssa/scalar/tmp_block_const.c \
+	$(TOP)/source/opt/ssa/scalar/reassoc.c \
+	$(TOP)/source/opt/ssa/scalar/narrow.c \
+	$(TOP)/source/opt/ssa/cfg/phi.c \
+	$(TOP)/source/opt/ssa/scalar/strength.c \
+	$(TOP)/source/opt/ssa/loop/dead_loop.c \
+	$(TOP)/source/opt/ssa/string/const_string_fold.c \
+	$(TOP)/source/opt/ssa/string/str_strlen.c \
+	$(TOP)/source/opt/ssa/string/str_strcmp.c \
+	$(TOP)/source/opt/ssa/string/str_strcpy.c \
+	$(TOP)/source/opt/ssa/string/str_strspn.c \
+	$(TOP)/source/opt/ssa/string/str_strchr.c \
+	$(TOP)/source/opt/ssa/string/str_strstr.c \
+	$(TOP)/source/opt/ssa/string/str_memchr.c \
+	$(TOP)/source/opt/ssa/scalar/bitop_const_fold.c \
+	$(TOP)/source/opt/ssa/scalar/var_imm_prop.c
+	# gvn.c already in UT_MODULE_SRCS (source/opt/ssa/scalar/gvn.c)
 
 UT11_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR11)/%.o,$(UT11_MODULE_SRCS))
 
 UT11_LOCAL_SRCS := \
 	test_main11.c \
+	test_ssa_opt_cprop.c \
 	test_ssa_opt_sccp.c \
 	test_ssa_opt_dead_loop.c \
+	test_ssa_opt_dce.c \
+	test_ssa_opt_dce_global.c \
+	test_ssa_opt_gvn.c \
+	test_ssa_opt_const_string_fold.c \
+	test_ssa_opt_str_strcpy.c \
+	test_ssa_opt_bitop_const_fold.c \
+	test_ssa_opt_strength.c \
+	test_ssa_opt_reassoc.c \
+	test_ssa_opt_narrow.c \
+	test_ssa_opt_fold.c \
+	test_ssa_opt_phi.c \
+	test_ssa_opt_branch.c \
+	test_ssa_opt_cmp_eq.c \
+	test_ssa_opt_vrp.c \
+	test_ssa_opt_setif_or_taut.c \
+	test_ssa_opt_cmp_offset_fold.c \
+	test_ssa_opt_load_cse.c \
+	test_opt_ssa_domwalk.c \
+	test_opt_dsl_pair.c \
+	test_opt_dsl_phi.c \
 	stubs.c \
 	elfsec_stubs.c \
 	tcc_state_stub.c
@@ -1254,20 +1483,93 @@ $(BUILD_DIR11)/%.o: $(TOP)/%.c Makefile $(COV_STAMP11) | $(UT11_DIRS)
 -include $(UT11_DEPS)
 
 # ---------------------------------------------------------------------------
+# UT12 — memory utilities.
+# ---------------------------------------------------------------------------
+
+BUILD_DIR12 := build_unique_ptr
+
+COV_STAMP12 := $(BUILD_DIR12)/.coverage-$(COVERAGE)
+
+$(COV_STAMP12):
+	@mkdir -p $(dir $@)
+	@rm -f $(BUILD_DIR12)/.coverage-*
+	@touch $@
+
+UT12_MODULE_SRCS := \
+	$(TOP)/source/memory/unique_ptr.c \
+	$(TOP)/source/memory/vector.c
+UT12_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR12)/%.o,$(UT12_MODULE_SRCS))
+
+UT12_LOCAL_SRCS := \
+	test_main12.c \
+	test_defer.c \
+	test_dynamic_bitset.c \
+	test_bitspan.c \
+	test_bit_matrix.c \
+	test_small_sequence.c \
+	test_unique_ptr.c \
+	test_vector.c \
+	stubs_unique_ptr.c
+UT12_LOCAL_OBJS := $(patsubst %.c,$(BUILD_DIR12)/%.o,$(UT12_LOCAL_SRCS))
+
+UT12_OBJS := $(UT12_LOCAL_OBJS) $(UT12_MODULE_OBJS)
+UT12_DEPS := $(UT12_OBJS:.o=.d)
+UT12_BIN := $(BUILD_DIR12)/run_unit_tests_unique_ptr
+UT12_CFLAGS := $(UT_CFLAGS)
+
+COV_DIR12 := $(BUILD_DIR12)/coverage
+
+.PHONY: run-unique-ptr coverage-unique-ptr
+run-unique-ptr: $(UT12_BIN)
+	./$(UT12_BIN)
+
+coverage-unique-ptr:
+	rm -rf $(BUILD_DIR12)
+	$(MAKE) COVERAGE=1 $(UT12_BIN)
+	./$(UT12_BIN)
+	@mkdir -p $(COV_DIR12)
+	gcovr --root $(TOP) $(CURDIR)/$(BUILD_DIR12) \
+		$(GCOVR_FILTERS) \
+		--exclude-unreachable-branches \
+		--exclude-throw-branches \
+		--sort uncovered-percent \
+		--txt $(COV_DIR12)/coverage.txt \
+		--html-details $(COV_DIR12)/index.html \
+		--print-summary
+
+$(UT12_BIN): $(UT12_OBJS)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -Wl,--gc-sections -Wl,--wrap=tcc_free $(UT_COV_LDFLAGS) -o $@ $^
+
+$(BUILD_DIR12)/%.o: %.c $(UT_ROOT)/ut.h Makefile $(COV_STAMP12)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(UT12_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
+
+$(BUILD_DIR12)/%.o: $(TOP)/%.c Makefile $(COV_STAMP12)
+	@mkdir -p $(dir $@)
+	$(HOSTCC) $(UT12_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
+
+-include $(UT12_DEPS)
+
+# ---------------------------------------------------------------------------
 # Aggregate targets (defined here so all UT*_BIN variables are in scope).
 # ---------------------------------------------------------------------------
 
-all: $(UT_BIN) $(UT3_BIN) $(UT6_BIN) $(UT7_BIN) $(UT8_BIN) $(UT9_BIN) $(UT10_BIN) $(UT11_BIN)
+all: $(UT_BIN) $(UT2_BIN) $(UT3_BIN) $(UT4_BIN) $(UT5_BIN) $(UT6_BIN) $(UT7_BIN) $(UT8_BIN) $(UT9_BIN) $(UT10_BIN) $(UT11_BIN) $(UT12_BIN)
 
-run: $(UT_BIN) $(UT3_BIN) $(UT6_BIN) $(UT7_BIN) $(UT8_BIN) $(UT9_BIN) $(UT10_BIN) $(UT11_BIN)
+run: $(UT_BIN) $(UT2_BIN) $(UT3_BIN) $(UT4_BIN) $(UT5_BIN) $(UT6_BIN) $(UT7_BIN) $(UT8_BIN) $(UT9_BIN) $(UT10_BIN) $(UT11_BIN) $(UT12_BIN)
 	./$(UT_BIN)
+	./$(UT2_BIN)
 	./$(UT3_BIN)
+	./$(UT4_BIN)
+	./$(UT5_BIN)
 	./$(UT6_BIN)
 	./$(UT7_BIN)
 	./$(UT8_BIN)
 	./$(UT9_BIN)
 	./$(UT10_BIN)
 	./$(UT11_BIN)
+	./$(UT12_BIN)
 
 clean:
-	rm -rf $(BUILD_DIR) $(BUILD_DIR2) $(BUILD_DIR3) $(BUILD_DIR4) $(BUILD_DIR5) $(BUILD_DIR6) $(BUILD_DIR7) $(BUILD_DIR8) $(BUILD_DIR9) $(BUILD_DIR10) $(BUILD_DIR11)
+	rm -rf $(BUILD_DIR) $(BUILD_DIR2) $(BUILD_DIR3) $(BUILD_DIR4) $(BUILD_DIR5) $(BUILD_DIR6) $(BUILD_DIR7) $(BUILD_DIR8) $(BUILD_DIR9) $(BUILD_DIR10) $(BUILD_DIR11) $(BUILD_DIR12)

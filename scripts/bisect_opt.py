@@ -14,7 +14,7 @@ correct, tcc -O1 wrong), this script tells you *exactly* what to look at:
       failing level, walks consecutive pass outputs, and flags the pass where a
       memory read (LOAD / LOAD_INDEXED / ``***DEREF***``) at a given instruction
       address turns into a constant ``#...`` -- the classic misfold signature.
-      Each flagged pass is correlated (via ir/opt_pipeline.c) to its gating knob
+      Each flagged pass is correlated (via source/opt/engine/pipeline_table.c) to its gating knob
       and printed with the before/after IR lines.
 
 The two phases cross-check: Phase A names the culprit knob(s); Phase B names the
@@ -41,13 +41,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-FUZZ_DIR = REPO_ROOT / "tests" / "fuzz"
-if str(FUZZ_DIR) not in sys.path:
-    sys.path.insert(0, str(FUZZ_DIR))
-
-import fuzz_harness as H  # noqa: E402
-from gen_c import generate_program  # noqa: E402
+from sources.fuzz_common import FUZZ_DIR, REPO_ROOT, H, generate_program
 
 IR_TESTS_DIR = H.IR_TESTS_DIR
 TCC = H.TCC_BIN
@@ -82,13 +76,13 @@ def _parse_pass_to_knob() -> dict[str, str]:
     """Map individual pass name -> knob name from the PASS_GATED table.
 
     Reads the ``PASS_GATED("name", ..., FLAG(opt_X))`` entries in
-    ir/opt_pipeline.c.  Note: the per-pass IR dump labels group-level phases
+    source/opt/engine/pipeline_table.c.  Note: the per-pass IR dump labels group-level phases
     (e.g. ``entry_store_group``, ``propagation_group``) that aggregate several
     such passes, so a dump label often does NOT appear in this map.  Use
     :func:`_parse_group_labels` to recognise group labels, and
     :func:`_passes_for_knob` to list the individual passes a knob gates.
     """
-    src = (REPO_ROOT / "ir" / "opt_pipeline.c").read_text()
+    src = (REPO_ROOT / "source" / "opt" / "engine" / "pipeline_table.c").read_text()
     out: dict[str, str] = {}
     for m in re.finditer(r'PASS_GATED\(\s*"([^"]+)"[^)]*?FLAG\(opt_([a-z_]+)\)', src):
         out.setdefault(m.group(1), m.group(2))
@@ -98,7 +92,7 @@ def _parse_pass_to_knob() -> dict[str, str]:
 def _parse_group_labels() -> set[str]:
     """Return the set of IRPassGroup variable names (dump labels that are
     groups rather than individual passes)."""
-    src = (REPO_ROOT / "ir" / "opt_pipeline.c").read_text()
+    src = (REPO_ROOT / "source" / "opt" / "engine" / "pipeline_table.c").read_text()
     return set(re.findall(r'IRPassGroup\s+(\w+)\s*=', src))
 
 

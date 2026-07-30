@@ -32,10 +32,17 @@ typedef struct IRCFG
   int rpo_count;
   int *instr_to_block;
   int num_instrs;
+  /* dominator-tree DFS stamps for O(1) dominance queries; -1 = unreachable */
+  int *dom_tin;
+  int *dom_tout;
+  int dom_dfs_count;
 } IRCFG;
 
 IRCFG *tcc_ir_cfg_build(struct TCCIRState *ir);
 void tcc_ir_cfg_free(IRCFG *cfg);
+/* Cheap flat pre-scan: false only when the function provably has no back-edge
+ * (loop passes may then skip CFG+dominator construction entirely). */
+int tcc_ir_cfg_flat_has_backedge(struct TCCIRState *ir);
 void tcc_ir_cfg_compute_dominators(IRCFG *cfg);
 void tcc_ir_cfg_compute_dom_frontiers(IRCFG *cfg);
 int tcc_ir_cfg_dominates(IRCFG *cfg, int a, int b);

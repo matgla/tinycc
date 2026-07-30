@@ -185,25 +185,5 @@ UT_TEST(test_single_use_nops_skipped)
   return 0;
 }
 
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_helpers)
-{
-  UT_COVERS("find_defining_instruction");
-  UT_COVERS("vreg_has_single_use");
-  UT_RUN(test_find_def_null_ir);
-  UT_RUN(test_find_def_negative_vreg);
-  UT_RUN(test_find_def_before_idx_zero);
-  UT_RUN(test_find_def_finds_nearest);
-  UT_RUN(test_find_def_skips_nops);
-  UT_RUN(test_find_def_undefined_returns_minus_one);
-  UT_RUN(test_find_def_returns_nearest_when_two_defs);
-  UT_RUN(test_single_use_null_ir);
-  UT_RUN(test_single_use_negative_vreg);
-  UT_RUN(test_single_use_zero_uses_is_false);
-  UT_RUN(test_single_use_exactly_one);
-  UT_RUN(test_single_use_two_short_circuits);
-  UT_RUN(test_single_use_exclude_idx);
-  UT_RUN(test_single_use_read_in_src2_counts);
-  UT_RUN(test_single_use_nops_skipped);
-}
+UT_COVERS("find_defining_instruction");
+UT_COVERS("vreg_has_single_use");

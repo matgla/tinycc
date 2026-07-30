@@ -13,7 +13,7 @@
 #include "ir/regalloc.h"
 #include "ir/codegen.h"
 #include "ir/machine_op.h"
-#include "arch/arm/arm_regalloc.h"
+#include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
 
@@ -438,9 +438,9 @@ UT_TEST(test_codegen_backpatch_roundtrip)
  * 3415/3490 respectively), each ending in exactly one mop call for the shapes
  * built here. BLOCK_COPY (needs a real Sym* this bare harness can't build --
  * see stubs.c's always-NULL sym_push2/external_global_sym) and
- * LOAD_POSTINC/STORE_POSTINC (normally synthesized by the postinc-fusion
- * optimizer pass, not emitted directly by the frontend) are documented gaps,
- * left uncovered here -- see docs/plan_codegen_unit_tests.md.
+ * LOAD_POSTINC/STORE_POSTINC (post-increment opcodes still lowered by
+ * ir/codegen.c but no longer produced by any optimizer pass) are documented
+ * gaps, left uncovered here -- see docs/plan_codegen_unit_tests.md.
  * ============================================================================ */
 
 UT_TEST(test_dispatch_load_store_route_to_mops)
@@ -1103,34 +1103,4 @@ UT_TEST(test_dispatch_block_copy_routes_to_block_copy_mop)
 
   tcc_ir_free(ir);
   return 0;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Suite                                                                      */
-/* -------------------------------------------------------------------------- */
-
-UT_SUITE(codegen_mem)
-{
-  UT_RUN(test_load_store_lowering);
-  UT_RUN(test_lea_lowering);
-  UT_RUN(test_indexed_memory_layout);
-  UT_RUN(test_codegen_backpatch_roundtrip);
-  UT_RUN(test_dispatch_load_store_route_to_mops);
-  UT_RUN(test_dispatch_lea_routes_to_lea_mop);
-  UT_RUN(test_dispatch_indexed_memory_routes_to_indexed_mops);
-  UT_RUN(test_dispatch_store_indexed_four_bytes_coalesce_into_one_word_store);
-  UT_RUN(test_dispatch_store_indexed_eight_bytes_coalesce_into_two_word_stores);
-  UT_RUN(test_dispatch_store_indexed_three_bytes_do_not_coalesce);
-  UT_RUN(test_dispatch_store_indexed_reg_pair_attempts_strd_base);
-  UT_RUN(test_dispatch_store_indexed_imm32_pair_attempts_strd_imm_base);
-  UT_RUN(test_dispatch_store_spill_reg_pair_attempts_strd_spill);
-  UT_RUN(test_dispatch_store_spill_second_deref_value_blocks_strd_spill);
-  UT_RUN(test_dispatch_store_spill_first_deref_value_blocks_strd_spill);
-  UT_RUN(test_dispatch_store_spill_imm_pair_attempts_strd_imm_spill);
-  UT_RUN(test_dispatch_store_deref_vreg_reg_pair_attempts_strd_base);
-  UT_RUN(test_dispatch_store_deref_vreg_deref_value_blocks_strd_base);
-  UT_RUN(test_dispatch_load_indexed_reg_pair_attempts_ldrd_base);
-  UT_RUN(test_dispatch_assign_spill_to_reg_pair_attempts_ldrd_spill);
-  UT_RUN(test_dispatch_assign_reg_to_spill_pair_attempts_strd_spill);
-  UT_RUN(test_dispatch_block_copy_routes_to_block_copy_mop);
 }

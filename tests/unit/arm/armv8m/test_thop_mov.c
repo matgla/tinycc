@@ -6,8 +6,8 @@
  */
 
 #define USING_GLOBALS
-#include "arch/arm/thumb/thop_mov.h"
-#include "arch/arm/thumb/thumb.h"
+#include "source/backend/arch/arm/thumb/thop_mov.h"
+#include "source/backend/arch/arm/thumb/thumb.h"
 
 #include "ut.h"
 
@@ -232,20 +232,4 @@ UT_TEST(test_movt_low_reg)
   UT_ASSERT_EQ(op.opcode, 0xF6CA30CD);
 
   return 0;
-}
-
-/* ───── suite ───── */
-
-UT_SUITE(thop_mov)
-{
-  UT_RUN(test_mov_reg_t1_high_basic);
-  UT_RUN(test_mov_reg_t1_shift_basic);
-  UT_RUN(test_mov_imm_t1_basic);
-  UT_RUN(test_mov_imm_t3_basic);
-  UT_RUN(test_mov_imm_t4_basic);
-  UT_RUN(test_movt_basic);
-  UT_RUN(test_mov_reg_shift_basic);
-  UT_RUN(test_mov_reg_t1_low_regs);
-  UT_RUN(test_mov_reg_enforce_16bit_high_reg);
-  UT_RUN(test_movt_low_reg);
 }

@@ -834,80 +834,6 @@ UT_TEST(test_const_string_calls_null_ir)
   return 0;
 }
 
-/* POSITIVE: memcmp(a, b, 0) folds to ASSIGN #0 regardless of the (here
- * non-constant) string args — n==0 is handled before any string evaluation,
- * so this fires in isolation without ELF section data.  Independently, two
- * memory regions compared over 0 bytes are equal, hence 0. */
-UT_TEST(test_const_string_calls_memcmp_zero_len_positive)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee_sym;
-  IROperand callee = utb_callee_named(ir, &callee_sym, 61);
-  utb_set_tok_str(61, "memcmp");
-
-  const int call_id = 2;
-  int i_p0 = utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, I32),
-                      utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
-  int i_p1 = utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, I32),
-                      utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 1), I32));
-  int i_p2 = utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(0, I32),
-                      utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 2), I32));
-  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(2, I32), callee,
-                        utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 3), I32));
-
-  int changes = tcc_ir_opt_const_string_calls(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_ASSIGN);
-  UT_ASSERT(irop_is_immediate(utb_src1(ir, i_call)));
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, i_call)), 0);
-  /* params NOP'd */
-  UT_ASSERT_EQ(utb_op(ir, i_p0), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, i_p1), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, i_p2), TCCIR_OP_NOP);
-
-  utb_set_tok_str(61, NULL);
-  utb_free(ir);
-  return 0;
-}
-
-/* POSITIVE: strncmp(a, b, 0) folds to ASSIGN #0 (n==0 path, independent of
- * string contents). */
-UT_TEST(test_const_string_calls_strncmp_zero_len_positive)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee_sym;
-  IROperand callee = utb_callee_named(ir, &callee_sym, 62);
-  utb_set_tok_str(62, "strncmp");
-
-  const int call_id = 3;
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, I32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 0), I32));
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, I32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 1), I32));
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_imm(0, I32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(call_id, 2), I32));
-  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(2, I32), callee,
-                        utb_imm((int32_t)TCCIR_ENCODE_CALL(call_id, 3), I32));
-
-  int changes = tcc_ir_opt_const_string_calls(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, i_call)), 0);
-
-  /* Idempotent: a second pass over the rewritten ASSIGN reports no change. */
-  UT_ASSERT_EQ(tcc_ir_opt_const_string_calls(ir), 0);
-
-  utb_set_tok_str(62, NULL);
-  utb_free(ir);
-  return 0;
-}
-
 /* GUARD: a FUNCCALLVOID strlen is not foldable (the strlen fold path is gated
  * on FUNCCALLVAL).  With external_global_sym stubbed to NULL, the redirect to
  * __tcc_strlen via change_callee_sym_keep_type also cannot complete, so the
@@ -1906,13 +1832,36 @@ UT_TEST(test_detect_const_result_assign_then_return_positive)
 
 /* GUARD: a function that takes parameters is never treated as a
  * (zero-arg) constant-result function. */
-UT_TEST(test_detect_const_result_has_params_rejected)
+/* A param-taking function still folds when the op-shape check proves the body
+ * never reads the params (helper1-style: `return x ^ x` optimizes to
+ * `RETURNVALUE #K` regardless of the arguments). */
+UT_TEST(test_detect_const_result_has_params_accepted)
 {
   TCCIRState *ir = utb_new();
   ir->next_parameter = 1;
   ir->parameters_count = 1;
 
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(1, I32), UTB_NONE);
+
+  int64_t value;
+  int btype;
+  UT_ASSERT_EQ(tcc_ir_detect_const_result(ir, &value, &btype), 1);
+  UT_ASSERT_EQ(value, 1);
+  UT_ASSERT_EQ(btype, I32);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* GUARD: a body whose returned value actually depends on a param must not
+ * fold — the return operand is a vreg with no immediate ASSIGN feeding it. */
+UT_TEST(test_detect_const_result_param_read_rejected)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_parameter = 1;
+  ir->parameters_count = 1;
+
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_param(0, I32), UTB_NONE);
 
   int64_t value;
   int btype;
@@ -2148,206 +2097,10 @@ UT_TEST(test_local_addrof_64bit_store_value_no_fold)
   return 0;
 }
 
-/* ============================================================================
- *  const_string_calls — stack-strlen path (ir_opt_eval_stack_strlen), which
- *  needs no ELF section data: it tracks byte-exact STORE sequences into a
- *  stack buffer and memcpy-like calls copying a (separately) const string in.
- * ============================================================================ */
-
-/* POSITIVE: byte-by-byte STOREs build "hi\0" on the stack; strlen() of that
- * buffer's address folds to #2 via the stack-strlen scan (no ELF data
- * needed -- distinct from the .rodata-backed strlen path). */
-UT_TEST(test_const_string_calls_strlen_stack_bytes_positive)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee_sym;
-  IROperand callee = utb_callee_named(ir, &callee_sym, 90);
-  utb_set_tok_str(90, "strlen");
-
-  /* Stack buffer at STACKOFF 0: 'h','i','\0' as three INT8 stores. */
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(0, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('h', IROP_BTYPE_INT8), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(1, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('i', IROP_BTYPE_INT8), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(2, 1, 0, 0, IROP_BTYPE_INT8), utb_imm(0, IROP_BTYPE_INT8), UTB_NONE);
-
-  /* strlen(&buf) -- arg is the bare stack address (STACKOFF, vreg=-1, not
-   * lval, is_local=1), matching ir_opt_stack_addr_offset's expected shape. */
-  IROperand buf_addr = irop_make_stackoff(-1, 0, 0 /* not lval */, 0, 0, I32);
-  buf_addr.is_local = 1;
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf_addr, utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
-                        utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-
-  int changes = tcc_ir_opt_const_string_calls(ir);
-
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_ASSIGN);
-  UT_ASSERT(irop_is_immediate(utb_src1(ir, i_call)));
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, i_call)), 2);
-
-  utb_set_tok_str(90, NULL);
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD: the same stack buffer but missing the NUL terminator byte (only 2 of
- * 3 bytes known) -> ir_opt_eval_stack_strlen's final scan finds `known[i]==0`
- * before any zero byte and fails, so strlen falls through to the
- * __tcc_strlen redirect instead of a direct fold. */
-UT_TEST(test_const_string_calls_strlen_stack_no_nul_no_direct_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee_sym;
-  IROperand callee = utb_callee_named(ir, &callee_sym, 91);
-  utb_set_tok_str(91, "strlen");
-
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(0, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('h', IROP_BTYPE_INT8), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(1, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('i', IROP_BTYPE_INT8), UTB_NONE);
-  /* no NUL store */
-
-  IROperand buf_addr = irop_make_stackoff(-1, 0, 0, 0, 0, I32);
-  buf_addr.is_local = 1;
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf_addr, utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
-                        utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-
-  int changes = tcc_ir_opt_const_string_calls(ir);
-
-  /* Falls through to the __tcc_strlen redirect (a change of a different kind:
-   * change_callee_sym returns 0 here because external_global_sym is stubbed
-   * to NULL, so ultimately changes==0 and the call is left as FUNCCALLVAL). */
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_FUNCCALLVAL);
-
-  utb_set_tok_str(91, NULL);
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD: a JUMP between the stack stores and the strlen call invalidates the
- * pre-call scan (ir_opt_eval_stack_strlen bails on any jump/jump-target in
- * range), so the direct fold does not fire. */
-UT_TEST(test_const_string_calls_strlen_stack_jump_boundary_no_direct_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym callee_sym;
-  IROperand callee = utb_callee_named(ir, &callee_sym, 92);
-  utb_set_tok_str(92, "strlen");
-
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(0, 1, 0, 0, IROP_BTYPE_INT8), utb_imm('h', IROP_BTYPE_INT8), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(1, 1, 0, 0, IROP_BTYPE_INT8), utb_imm(0, IROP_BTYPE_INT8), UTB_NONE);
-  /* An unconditional JUMP to the very next instruction -- still a JUMP in the
-   * pre-call scan range, which unconditionally bails the stack-strlen scan. */
-  int i_jump = utb_emit(ir, TCCIR_OP_JUMP, utb_imm(3, I32), UTB_NONE, UTB_NONE);
-
-  IROperand buf_addr = irop_make_stackoff(-1, 0, 0, 0, 0, I32);
-  buf_addr.is_local = 1;
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, buf_addr, utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(0, I32), callee,
-                        utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-
-  int changes = tcc_ir_opt_const_string_calls(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_op(ir, i_jump), TCCIR_OP_JUMP);
-
-  utb_set_tok_str(92, NULL);
-  utb_free(ir);
-  return 0;
-}
-
-/* ------------------------------------------------------------------ suite */
-
-UT_SUITE(opt_constfold)
-{
-  UT_COVERS("self_copy_elim");
-  UT_COVERS("float_narrowing");
-  UT_COVERS("const_string_calls");
-  UT_COVERS("const_call_replace");
-  UT_COVERS("switch_call_replace");
-  UT_COVERS("param_addrof_const_fold");
-  UT_COVERS("local_addrof_const_fold");
-  UT_RUN(test_self_copy_elim_non_memcpy_name_no_fold);
-  UT_RUN(test_self_copy_elim_no_calls_no_fold);
-  UT_RUN(test_self_copy_elim_null_callee_no_fold);
-  UT_RUN(test_self_copy_elim_null_ir);
-  UT_RUN(test_self_copy_elim_memcpy_positive);
-  UT_RUN(test_self_copy_elim_memmove_positive);
-  UT_RUN(test_self_copy_elim_aeabi_memcpy8_positive);
-  UT_RUN(test_self_copy_elim_void_call_positive);
-  UT_RUN(test_self_copy_elim_dst_src_differ_no_fold);
-  UT_RUN(test_self_copy_elim_redefined_temp_suspected_bug);
-  UT_RUN(test_self_copy_elim_lval_mismatch_no_fold);
-  UT_RUN(test_self_copy_elim_idempotent);
-  UT_RUN(test_float_narrowing_unmatched_names_no_fold);
-  UT_RUN(test_float_narrowing_too_few_instructions_no_fold);
-  UT_RUN(test_float_narrowing_non_narrowable_middle_no_fold);
-  UT_RUN(test_float_narrowing_missing_d2f_no_fold);
-  UT_RUN(test_float_narrowing_f2d_not_consumed_no_fold);
-  UT_RUN(test_float_narrowing_no_f2d_no_fold);
-  UT_RUN(test_float_narrowing_idempotent);
-
-  UT_RUN(test_const_string_calls_unknown_builtin_no_fold);
-  UT_RUN(test_const_string_calls_null_callee_no_fold);
-  UT_RUN(test_const_string_calls_null_ir);
-  UT_RUN(test_const_string_calls_memcmp_zero_len_positive);
-  UT_RUN(test_const_string_calls_strncmp_zero_len_positive);
-  UT_RUN(test_const_string_calls_strlen_void_no_fold);
-
-  UT_RUN(test_const_call_replace_empty_cache_no_fold);
-  UT_RUN(test_const_call_replace_cached_const_positive);
-  UT_RUN(test_const_call_replace_discarded_result_nops);
-  UT_RUN(test_const_call_replace_token_mismatch_no_fold);
-
-  UT_RUN(test_switch_call_replace_empty_cache_no_fold);
-  UT_RUN(test_switch_call_replace_identity_positive);
-  UT_RUN(test_switch_call_replace_nonconst_arg_no_fold);
-  UT_RUN(test_switch_call_replace_wrong_argc_no_fold);
-
-  UT_RUN(test_param_addrof_no_params_no_fold);
-  UT_RUN(test_param_addrof_multi_bb_no_fold);
-  UT_RUN(test_param_addrof_const_fold_positive);
-  UT_RUN(test_param_addrof_const_fold_load_read_positive);
-  UT_RUN(test_param_addrof_pre_store_read_no_fold);
-  UT_RUN(test_param_addrof_escaped_pointer_no_fold);
-
-  UT_RUN(test_local_addrof_no_vars_no_fold);
-  UT_RUN(test_local_addrof_const_fold_positive);
-  UT_RUN(test_local_addrof_missing_init_no_fold);
-  UT_RUN(test_local_addrof_pre_modify_read_no_fold);
-
-  UT_RUN(test_switch_func_detect_branchy_positive);
-  UT_RUN(test_switch_call_replace_branchy_positive);
-  UT_RUN(test_switch_func_detect_two_params_rejected);
-  UT_RUN(test_switch_func_detect_llong_param_rejected);
-  UT_RUN(test_switch_func_detect_addrtaken_param_rejected);
-  UT_RUN(test_switch_func_detect_unsupported_op_rejected);
-  UT_RUN(test_switch_func_detect_no_return_rejected);
-  UT_RUN(test_switch_func_detect_unsupported_return_btype_rejected);
-  UT_RUN(test_switch_func_simulate_pure_wrapper_declines_when_replay_needed);
-  UT_RUN(test_switch_func_simulate_store_replay_positive);
-  UT_RUN(test_switch_call_replace_branchy_nonconst_arg_no_fold);
-
-  UT_RUN(test_detect_const_result_immediate_return_positive);
-  UT_RUN(test_detect_const_result_assign_then_return_positive);
-  UT_RUN(test_detect_const_result_has_params_rejected);
-  UT_RUN(test_detect_const_result_other_op_rejected);
-  UT_RUN(test_detect_const_result_too_many_instructions_rejected);
-  UT_RUN(test_detect_const_result_non_immediate_source_rejected);
-  UT_RUN(test_const_result_cache_round_trip_and_duplicate_guard);
-
-  UT_RUN(test_param_addrof_chain_lookthrough_var_imm_positive);
-  UT_RUN(test_param_addrof_multi_lea_same_param_no_fold);
-  UT_RUN(test_local_addrof_symref_store_value_positive);
-  UT_RUN(test_local_addrof_64bit_store_value_no_fold);
-
-  UT_RUN(test_const_string_calls_strlen_stack_bytes_positive);
-  UT_RUN(test_const_string_calls_strlen_stack_no_nul_no_direct_fold);
-  UT_RUN(test_const_string_calls_strlen_stack_jump_boundary_no_direct_fold);
-}
+UT_COVERS("self_copy_elim");
+UT_COVERS("float_narrowing");
+UT_COVERS("const_string_calls");
+UT_COVERS("const_call_replace");
+UT_COVERS("switch_call_replace");
+UT_COVERS("param_addrof_const_fold");
+UT_COVERS("local_addrof_const_fold");
