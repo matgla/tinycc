@@ -16,14 +16,29 @@ SRCS = thumb.c thop_alu_imm.c thop_alu_reg.c thop_cmp.c thop_shift_imm.c thop_sh
 OBJS = $(addprefix $(BUILD_DIR)/, $(SRCS:.c=.o))
 LIB  = $(BUILD_DIR)/libthumb.a
 
+# See arch/arm/Makefile: without these, an edit to tcc.h or arm-thumb-defs.h
+# leaves every thumb object stale and `make` says there is nothing to do.
+CORE_HDRS = $(wildcard $(TOP)/*.h) \
+	$(wildcard $(TOP)/source/include/*.h) \
+	$(wildcard $(TOP)/source/driver/*.h) \
+	$(wildcard $(TOP)/source/frontend/*.h) \
+	$(wildcard $(TOP)/source/ir/*.h) \
+	$(wildcard $(TOP)/source/machine/*.h) \
+	$(wildcard $(TOP)/source/obj/*.h) \
+	$(wildcard $(TOP)/source/support/*.h) \
+	$(wildcard $(TOP)/source/opt/include/*.h) \
+	$(wildcard $(TOP)/source/memory/include/memory/*.h) \
+	$(wildcard $(TOP)/source/backend/arch/arm/*.h) \
+	$(wildcard $(TOP)/source/backend/arch/arm/thumb/*.h)
+
 all: $(LIB)
 
 $(LIB): $(OBJS)
 	$(AR) rcs $@ $^
 
-$(BUILD_DIR)/%.o: %.c
+$(BUILD_DIR)/%.o: %.c $(CORE_HDRS)
 	@mkdir -p $(dir $@)
-	$(CC) -o $@ -c $< $(CFLAGS) $(DEFINES) -I$(TOP) -I$(TOP)/ir
+	$(CC) -o $@ -c $< $(CFLAGS) $(DEFINES) -I$(TOP) -I$(TOP)/source/ir
 
 clean:
 	rm -f $(OBJS) $(LIB)

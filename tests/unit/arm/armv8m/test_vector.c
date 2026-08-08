@@ -44,6 +44,16 @@ void *tcc_realloc(void *value, unsigned long size)
   return test_reallocate(value, (size_t)size);
 }
 
+/* vector.c's tcc_realloc calls come through tcc.h's allocation-attribution
+   wrapper, so that is the name it references; route it to the counting
+   allocator above, which the assertions below are written against. */
+void *tcc_realloc_at(void *value, unsigned long size, const char *file, int line)
+{
+  (void)file;
+  (void)line;
+  return tcc_realloc(value, size);
+}
+
 void tcc_free(void *value)
 {
   test_deallocate(value);

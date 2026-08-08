@@ -161,7 +161,7 @@ UT_TEST(test_code_reloc_data_relocations)
   static const int data_types[] = {
       R_ARM_MOVT_ABS, R_ARM_MOVW_ABS_NC, R_ARM_THM_MOVT_ABS, R_ARM_THM_MOVW_ABS_NC,
       R_ARM_ABS32, R_ARM_REL32, R_ARM_GOTPC, R_ARM_GOTOFF, R_ARM_RODATA_OFF,
-      R_ARM_GOT32, R_ARM_GOT_PREL, R_ARM_COPY, R_ARM_GLOB_DAT, R_ARM_NONE,
+      R_ARM_GOT32, R_ARM_GOT_SBREL12, R_ARM_GOT_PREL, R_ARM_COPY, R_ARM_GLOB_DAT, R_ARM_NONE,
       R_ARM_TARGET1, R_ARM_MOVT_PREL, R_ARM_MOVW_PREL_NC};
   for (size_t i = 0; i < sizeof(data_types) / sizeof(data_types[0]); i++)
     UT_ASSERT_EQ(code_reloc(data_types[i]), 0);
@@ -228,6 +228,7 @@ UT_TEST(test_gotplt_entry_type_build_got_only)
 UT_TEST(test_gotplt_entry_type_always_entry)
 {
   UT_ASSERT_EQ(gotplt_entry_type(R_ARM_GOT32), ALWAYS_GOTPLT_ENTRY);
+  UT_ASSERT_EQ(gotplt_entry_type(R_ARM_GOT_SBREL12), ALWAYS_GOTPLT_ENTRY);
   UT_ASSERT_EQ(gotplt_entry_type(R_ARM_GOT_PREL), ALWAYS_GOTPLT_ENTRY);
   return 0;
 }

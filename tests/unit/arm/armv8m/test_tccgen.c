@@ -14,9 +14,68 @@
 #include "ut.h"
 
 /* The module under test, pulled into this TU so its file-local statics are
- * reachable.  Everything below (stubs, helpers, tests) sees tccgen.c's real
- * globals and prototypes. */
-#include "tccgen.c"
+ * reachable.  Everything below (stubs, helpers, tests) sees the frontend's
+ * real globals and prototypes.
+ *
+ * tccgen.c was split into source/frontend/gen/ (see docs/plan_tccgen_split.md).
+ * The parts are included here in their ORIGINAL tccgen.c line order, which
+ * reconstructs the single translation unit this suite was written against --
+ * file-local `static` helpers stay reachable, and the mid-file #define scoping
+ * (expr/infix.c's `precedence`, and friends) keeps the meaning it had before
+ * the split.  Order matters; regenerate it from the range table in
+ * docs/plan_tccgen_split.md rather than sorting alphabetically. */
+#include "source/frontend/gen/core/state.c"
+#include "source/frontend/gen/op/fold_math.c"
+#include "source/frontend/gen/core/suppress.c"
+#include "source/frontend/gen/core/predicates.c"
+#include "source/frontend/gen/sym/elfsym.c"
+#include "source/frontend/gen/sym/symtab.c"
+#include "source/frontend/gen/value/vstack.c"
+#include "source/frontend/gen/value/strlit_pool.c"
+#include "source/frontend/gen/sym/attr_merge.c"
+#include "source/frontend/gen/value/load.c"
+#include "source/frontend/gen/value/longlong.c"
+#include "source/frontend/gen/op/int.c"
+#include "source/frontend/gen/op/float.c"
+#include "source/frontend/gen/type/compare.c"
+#include "source/frontend/gen/op/complex.c"
+#include "source/frontend/gen/op/op.c"
+#include "source/frontend/gen/builtin/string.c"
+#include "source/frontend/gen/inline/analysis.c"
+#include "source/frontend/gen/inline/const_eval.c"
+#include "source/frontend/gen/type/cast.c"
+#include "source/frontend/gen/type/size.c"
+#include "source/frontend/gen/op/vector.c"
+#include "source/frontend/gen/store/struct_copy.c"
+#include "source/frontend/gen/type/assign_check.c"
+#include "source/frontend/gen/store/vstore.c"
+#include "source/frontend/gen/decl/attribute.c"
+#include "source/frontend/gen/decl/struct.c"
+#include "source/frontend/gen/decl/btype.c"
+#include "source/frontend/gen/decl/predef_protos.c"
+#include "source/frontend/gen/decl/declarator.c"
+#include "source/frontend/gen/expr/indir.c"
+#include "source/frontend/gen/expr/atomic.c"
+#include "source/frontend/gen/builtin/misc.c"
+#include "source/frontend/gen/builtin/call.c"
+#include "source/frontend/gen/builtin/fp.c"
+#include "source/frontend/gen/builtin/fp2.c"
+#include "source/frontend/gen/builtin/overflow.c"
+#include "source/frontend/gen/builtin/simd.c"
+#include "source/frontend/gen/builtin/chk.c"
+#include "source/frontend/gen/expr/unary.c"
+#include "source/frontend/gen/expr/primary.c"
+#include "source/frontend/gen/expr/infix.c"
+#include "source/frontend/gen/expr/cond.c"
+#include "source/frontend/gen/stmt/ret.c"
+#include "source/frontend/gen/stmt/switch.c"
+#include "source/frontend/gen/stmt/cleanup.c"
+#include "source/frontend/gen/stmt/block.c"
+#include "source/frontend/gen/init/initializer.c"
+#include "source/frontend/gen/init/alloc.c"
+#include "source/frontend/gen/nested/nested.c"
+#include "source/frontend/gen/inline/emit.c"
+#include "source/frontend/gen/decl/decl.c"
 
 /* Minimal stubs for symbols referenced by vstack helpers in tccgen.c.
    The dedicated tccgen binary links only tccgen.c + the harness, so these
@@ -255,19 +314,9 @@ int is_power_of_2(int64_t n) { return n > 0 && (n & (n - 1)) == 0; }
 const int reg_classes[NB_REGS];
 const IRRegistersConfig irop_config[512];
 
-int irop_btype_to_vt_btype(int irop_btype) { return irop_btype; }
-int64_t *tcc_ir_pool_get_i64_ptr(const struct TCCIRState *ir, uint32_t idx)
-{
-  (void)ir;
-  (void)idx;
-  return NULL;
-}
-uint64_t *tcc_ir_pool_get_f64_ptr(const struct TCCIRState *ir, uint32_t idx)
-{
-  (void)ir;
-  (void)idx;
-  return NULL;
-}
+/* irop_btype_to_vt_btype, tcc_ir_pool_get_i64_ptr and tcc_ir_pool_get_f64_ptr
+   were stubbed here while they were header inlines; tccir_operand.c is linked
+   into this binary now (see UT3_MODULE_SRCS), so the real ones are used. */
 int tcc_ir_get_vreg_temp(TCCIRState *ir)
 {
   (void)ir;
@@ -326,19 +375,40 @@ static void *ut_pool_alloc(unsigned long size)
   return p;
 }
 
-void *tcc_malloc(unsigned long size) { return ut_pool_alloc(size); }
-void *tcc_mallocz(unsigned long size)
+/* tcc.h rewrites every tcc_malloc/tcc_mallocz/tcc_realloc call into its
+   attribution wrapper (tcc_malloc_at & co., which record the source line of
+   mmap-class allocations for -bench), so those are the names tccgen.c actually
+   references -- and the names this file has to define, since the macros would
+   otherwise rewrite the definitions themselves.  The plain spellings follow for
+   any TU in this binary that does not include tcc.h. */
+#undef tcc_malloc
+#undef tcc_mallocz
+#undef tcc_realloc
+
+void *tcc_malloc_at(unsigned long size, const char *file, int line)
 {
-  void *p = ut_pool_alloc(size);
+  (void)file;
+  (void)line;
+  return ut_pool_alloc(size);
+}
+void *tcc_mallocz_at(unsigned long size, const char *file, int line)
+{
+  void *p = tcc_malloc_at(size, file, line);
   memset(p, 0, size);
   return p;
 }
-void *tcc_realloc(void *ptr, unsigned long size)
+void *tcc_realloc_at(void *ptr, unsigned long size, const char *file, int line)
 {
-  void *p = ut_pool_alloc(size);
+  void *p = tcc_malloc_at(size, file, line);
   if (ptr)
     memcpy(p, ptr, size);
   return p;
+}
+void *tcc_malloc(unsigned long size) { return tcc_malloc_at(size, "<unattributed>", 0); }
+void *tcc_mallocz(unsigned long size) { return tcc_mallocz_at(size, "<unattributed>", 0); }
+void *tcc_realloc(void *ptr, unsigned long size)
+{
+  return tcc_realloc_at(ptr, size, "<unattributed>", 0);
 }
 void tcc_free(void *ptr) { (void)ptr; }
 

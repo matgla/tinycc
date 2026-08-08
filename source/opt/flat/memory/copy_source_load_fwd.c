@@ -63,19 +63,12 @@
 #include "licm.h"
 #include "memref.h"
 
-extern int tcc_ir_opt_pass_disabled(const char *name);
 
 #define CSF_MAX_FIELDS 64
 
 /* TCC_CSF_DBG=1 traces every rejected forward and why — the fastest way to tell
  * "the copy map never saw it" from "the region was not clean". */
-static int csf_dbg(void)
-{
-  static int cached = -1;
-  if (cached < 0)
-    cached = getenv("TCC_CSF_DBG") != NULL;
-  return cached;
-}
+TCC_DBG_ENV_FLAG(csf_dbg, "TCC_CSF_DBG")
 #define CSF_DBG(...)                                                                               \
   do                                                                                               \
   {                                                                                                \

@@ -10,9 +10,9 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "cfg.h"
-#include "ir/ssa.h"
-#include "ir/vreg.h"
-#include "ir/regalloc.h"
+#include "source/ir/ssa.h"
+#include "source/ir/vreg.h"
+#include "source/ir/regalloc.h"
 #include "source/backend/arch/arm/arm_regalloc.h"
 #include "ut.h"
 

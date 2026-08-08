@@ -7,7 +7,7 @@
 
 #define USING_GLOBALS
 #include "ir.h"
-#include "ir/regalloc.h"
+#include "source/ir/regalloc.h"
 #include "source/backend/arch/arm/arm_regalloc.h"
 #include "ut.h"
 

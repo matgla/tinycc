@@ -67,7 +67,7 @@ BASE_TCC_FLAGS = [
 
 def _parse_knobs() -> list[str]:
     """Extract the list of -f<knob> optimization flags from libtcc.c."""
-    src = (REPO_ROOT / "libtcc.c").read_text()
+    src = (REPO_ROOT / "source" / "driver" / "libtcc.c").read_text()
     return sorted(set(re.findall(r'offsetof\(TCCState, (opt_[a-z_]+)\), 0, "([a-z-]+)"', src)),
                   key=lambda t: t[1])
 

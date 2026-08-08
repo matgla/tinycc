@@ -11,7 +11,7 @@
 TOP := $(abspath $(CURDIR)/../../../..)
 UT_ROOT := $(abspath $(CURDIR)/../..)
 
-include $(TOP)/ir/gen/Makefile
+include $(TOP)/source/ir/gen/Makefile
 
 # Host compiler (do NOT use the armv8m cross compiler).
 HOSTCC ?= gcc
@@ -65,17 +65,17 @@ UT_DEFINES := \
 UT_CFLAGS := -std=c11 -g -O0 -Wall -Werror -Wno-unused-function \
 			 -Wno-declaration-after-statement \
 			 -ffunction-sections -fdata-sections \
-			 -I$(TOP) -I$(TOP)/ir -I$(TOP)/source/opt/include -I$(TOP)/source/memory/include -I$(TOP)/source/utils/include -I$(TOP)/source/backend/arch/arm -I$(TOP)/source/backend/arch/arm/thumb -I$(TOP)/source/opt/ssa -I$(TOP)/source/opt/ssa/include -I$(TOP)/source/opt/ssa/string -I$(TOP)/source/opt/ssa/scalar -I$(TOP)/source/opt/ssa/memory -I$(TOP)/source/opt/flat/include -I$(TOP)/source/opt/flat/ipa -I$(TOP)/source/opt/framework -I$(UT_ROOT) $(UT_DEFINES) $(UT_COV_CFLAGS)
+			 -I$(TOP) -I$(TOP)/source/include -I$(TOP)/source/driver -I$(TOP)/source/frontend -I$(TOP)/source/ir -I$(TOP)/source/machine -I$(TOP)/source/obj -I$(TOP)/source/support -I$(TOP)/source/opt/include -I$(TOP)/source/memory/include -I$(TOP)/source/utils/include -I$(TOP)/source/backend/arch/arm -I$(TOP)/source/backend/arch/arm/thumb -I$(TOP)/source/opt/ssa -I$(TOP)/source/opt/ssa/include -I$(TOP)/source/opt/ssa/string -I$(TOP)/source/opt/ssa/scalar -I$(TOP)/source/opt/ssa/memory -I$(TOP)/source/opt/flat/include -I$(TOP)/source/opt/flat/ipa -I$(TOP)/source/opt/framework -I$(TOP)/source/frontend/gen -I$(UT_ROOT) $(UT_DEFINES) $(UT_COV_CFLAGS)
 UT_DEPFLAGS := -MMD -MP
 
 # Modules under test (built from tinycc sources, host compilation).
 UT_MODULE_SRCS := \
-	$(TOP)/ir/pool.c \
-	$(TOP)/ir/type.c \
-	$(TOP)/ir/vreg.c \
-	$(TOP)/ir/dump.c \
-	$(TOP)/ir/stack.c \
-	$(TOP)/ir/ssa.c \
+	$(TOP)/source/ir/pool.c \
+	$(TOP)/source/ir/type.c \
+	$(TOP)/source/ir/vreg.c \
+	$(TOP)/source/ir/dump.c \
+	$(TOP)/source/ir/stack.c \
+	$(TOP)/source/ir/ssa.c \
 	$(TOP)/source/memory/unique_ptr.c \
 	$(TOP)/source/memory/vector.c \
 	$(TOP)/source/opt/ssa/scalar/gvn.c \
@@ -87,7 +87,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/ssa/loop/loop_unroll.c \
 	$(TOP)/source/opt/ssa/loop/iv_strength_reduction.c \
 	$(TOP)/source/opt/ssa/loop/decrement_to_zero.c \
-	$(TOP)/svalue.c \
+	$(TOP)/source/frontend/svalue.c \
 	$(TOP)/source/backend/arch/arm/arm.c \
 	$(TOP)/source/backend/arch/arm/thumb/thumb.c \
 	$(TOP)/source/backend/arch/arm/thumb/thop_adr.c \
@@ -119,7 +119,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/backend/arch/arm/thumb/thop_mvn.c \
 	$(TOP)/source/backend/arch/arm/thumb/thop_pld.c \
 	$(TOP)/source/backend/arch/arm/thumb/thop_rev.c \
-	$(TOP)/tccir_operand.c \
+	$(TOP)/source/ir/tccir_operand.c \
 	$(addprefix $(TOP)/,$(IR_GEN_FILES)) \
 	$(TOP)/source/opt/util/pass_disable.c \
 	$(TOP)/source/opt/util/const_eval.c \
@@ -193,7 +193,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/analysis/alias.c \
 	$(TOP)/source/opt/analysis/memref.c \
 	$(TOP)/source/opt/analysis/mem_ssa.c \
-	$(TOP)/ir/cfg.c \
+	$(TOP)/source/ir/cfg.c \
 	$(TOP)/source/opt/flat/loop/loop_ir_mutate.c \
 	$(TOP)/source/opt/flat/loop/iv_analysis.c \
 	$(TOP)/source/opt/flat/loop/iv_strength_reduction.c \
@@ -264,14 +264,14 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/engine/pipeline_run.c \
 	$(TOP)/source/opt/engine/pipeline_table.c \
 	$(TOP)/source/opt/engine/gen_adapters.c \
-		$(TOP)/ir/regalloc.c \
+		$(TOP)/source/ir/regalloc.c \
 		$(TOP)/source/opt/ra/const_branch_fold.c \
 		$(TOP)/source/opt/ra/incomplete_calls.c \
 		$(TOP)/source/opt/ra/phi_const_chain.c \
-		$(TOP)/ir/codegen.c \
-		$(TOP)/ir/machine_op.c \
-		$(TOP)/tccls.c \
-		$(TOP)/tccmachine.c \
+		$(TOP)/source/ir/codegen.c \
+		$(TOP)/source/ir/machine_op.c \
+		$(TOP)/source/machine/tccls.c \
+		$(TOP)/source/machine/tccmachine.c \
 		$(TOP)/source/backend/arch/arm/arm_regalloc.c \
 		$(TOP)/source/backend/arch/arm/arm_aapcs.c \
 		$(TOP)/source/backend/arch/arm/ssa_opt_arm.c \
@@ -279,9 +279,9 @@ UT_MODULE_SRCS := \
 		$(TOP)/source/opt/flat/loop/const_sim.c \
 		$(TOP)/source/backend/arch/arm/thumb/arm-thumb-asm.c \
 		$(TOP)/source/backend/arch/arm/arm-link.c \
-		$(TOP)/tccld.c \
-		$(TOP)/tccdebug.c \
-		$(TOP)/tccyaff.c \
+		$(TOP)/source/obj/tccld.c \
+		$(TOP)/source/support/tccdebug.c \
+		$(TOP)/source/obj/tccyaff.c \
 		$(TOP)/source/opt/flat/cfg/switch_to_data.c
 
 # arm-thumb-asm.c stays in UT_MODULE_SRCS because the backend (UT2) and ssaopt
@@ -351,14 +351,65 @@ UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/source/opt/ssa/scalar/reassoc.c \
 	$(TOP)/source/opt/ssa/scalar/sccp.c \
 	$(TOP)/source/opt/ssa/scalar/strength.c \
-	$(TOP)/tccgen.c \
-	$(TOP)/tccdbg.c \
-	$(TOP)/tccasm.c \
+	$(TOP)/source/frontend/gen/builtin/call.c \
+	$(TOP)/source/frontend/gen/builtin/chk.c \
+	$(TOP)/source/frontend/gen/builtin/fp.c \
+	$(TOP)/source/frontend/gen/builtin/fp2.c \
+	$(TOP)/source/frontend/gen/builtin/misc.c \
+	$(TOP)/source/frontend/gen/builtin/overflow.c \
+	$(TOP)/source/frontend/gen/builtin/simd.c \
+	$(TOP)/source/frontend/gen/builtin/string.c \
+	$(TOP)/source/frontend/gen/core/predicates.c \
+	$(TOP)/source/frontend/gen/core/state.c \
+	$(TOP)/source/frontend/gen/core/suppress.c \
+	$(TOP)/source/frontend/gen/decl/attribute.c \
+	$(TOP)/source/frontend/gen/decl/btype.c \
+	$(TOP)/source/frontend/gen/decl/decl.c \
+	$(TOP)/source/frontend/gen/decl/declarator.c \
+	$(TOP)/source/frontend/gen/decl/predef_protos.c \
+	$(TOP)/source/frontend/gen/decl/struct.c \
+	$(TOP)/source/frontend/gen/expr/atomic.c \
+	$(TOP)/source/frontend/gen/expr/cond.c \
+	$(TOP)/source/frontend/gen/expr/indir.c \
+	$(TOP)/source/frontend/gen/expr/infix.c \
+	$(TOP)/source/frontend/gen/expr/primary.c \
+	$(TOP)/source/frontend/gen/expr/unary.c \
+	$(TOP)/source/frontend/gen/init/alloc.c \
+	$(TOP)/source/frontend/gen/init/initializer.c \
+	$(TOP)/source/frontend/gen/inline/analysis.c \
+	$(TOP)/source/frontend/gen/inline/const_eval.c \
+	$(TOP)/source/frontend/gen/inline/emit.c \
+	$(TOP)/source/frontend/gen/nested/nested.c \
+	$(TOP)/source/frontend/gen/op/complex.c \
+	$(TOP)/source/frontend/gen/op/float.c \
+	$(TOP)/source/frontend/gen/op/fold_math.c \
+	$(TOP)/source/frontend/gen/op/int.c \
+	$(TOP)/source/frontend/gen/op/op.c \
+	$(TOP)/source/frontend/gen/op/vector.c \
+	$(TOP)/source/frontend/gen/stmt/block.c \
+	$(TOP)/source/frontend/gen/stmt/cleanup.c \
+	$(TOP)/source/frontend/gen/stmt/ret.c \
+	$(TOP)/source/frontend/gen/stmt/switch.c \
+	$(TOP)/source/frontend/gen/store/struct_copy.c \
+	$(TOP)/source/frontend/gen/store/vstore.c \
+	$(TOP)/source/frontend/gen/sym/attr_merge.c \
+	$(TOP)/source/frontend/gen/sym/elfsym.c \
+	$(TOP)/source/frontend/gen/sym/symtab.c \
+	$(TOP)/source/frontend/gen/type/assign_check.c \
+	$(TOP)/source/frontend/gen/type/cast.c \
+	$(TOP)/source/frontend/gen/type/compare.c \
+	$(TOP)/source/frontend/gen/type/size.c \
+	$(TOP)/source/frontend/gen/value/load.c \
+	$(TOP)/source/frontend/gen/value/longlong.c \
+	$(TOP)/source/frontend/gen/value/strlit_pool.c \
+	$(TOP)/source/frontend/gen/value/vstack.c \
+	$(TOP)/source/obj/tccdbg.c \
+	$(TOP)/source/frontend/tccasm.c \
 	$(TOP)/source/opt/engine/fp_mat_cache.c \
 	$(TOP)/source/opt/engine/pass_registry.c \
-	$(TOP)/tcctools.c \
-	$(TOP)/tcc.c \
-	$(TOP)/libtcc.c \
+	$(TOP)/source/driver/tcctools.c \
+	$(TOP)/source/driver/tcc.c \
+	$(TOP)/source/driver/libtcc.c \
 	$(TOP)/source/opt/function_pipeline.c \
 	$(TOP)/source/opt/ssa/memory/global_addr_hoist.c \
 	$(TOP)/source/backend/generators/function.c \
@@ -503,7 +554,7 @@ COV_DIR := $(BUILD_DIR)/coverage
 # test-harness sources under tests/unit/arm/armv8m/ — those are excluded by
 # simply not matching any filter below.
 GCOVR_FILTERS := \
-	--filter '$(TOP)/ir/' \
+	--filter '$(TOP)/source/ir/' \
 	--filter '$(TOP)/[^/]+\.c$$' \
 	--filter '$(TOP)/source/backend/' \
 	--filter '$(TOP)/source/opt/' \
@@ -592,17 +643,17 @@ $(BUILD_DIR)/%.o: %.c $(UT_ROOT)/ut.h Makefile $(COV_STAMP)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 # ir/pool.o etc — build from the tinycc source tree, preserve layout under build/.
-$(BUILD_DIR)/ir/%.o: $(TOP)/ir/%.c Makefile $(COV_STAMP)
+$(BUILD_DIR)/ir/%.o: $(TOP)/source/ir/%.c Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 # libtcc.o — build from the tinycc source tree.
-$(BUILD_DIR)/libtcc.o: $(TOP)/libtcc.c Makefile $(COV_STAMP)
+$(BUILD_DIR)/libtcc.o: $(TOP)/source/driver/libtcc.c Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 # tccir_operand.o — top-level source (pool getters for the opt-pass suites).
-$(BUILD_DIR)/tccir_operand.o: $(TOP)/tccir_operand.c Makefile $(COV_STAMP)
+$(BUILD_DIR)/tccir_operand.o: $(TOP)/source/ir/tccir_operand.c Makefile $(COV_STAMP)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
@@ -731,7 +782,7 @@ $(BUILD_DIR2)/%.o: %.c $(UT_ROOT)/ut.h Makefile $(COV_STAMP2)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
-$(BUILD_DIR2)/ir/%.o: $(TOP)/ir/%.c Makefile $(COV_STAMP2)
+$(BUILD_DIR2)/ir/%.o: $(TOP)/source/ir/%.c Makefile $(COV_STAMP2)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
@@ -769,8 +820,14 @@ $(COV_STAMP3):
 # tccgen.c's file-local `static` helpers, not just its ST_FUNC surface. Linking
 # tccgen.o too would be a multiple-definition error. Its coverage is attributed
 # to the test_tccgen.o TU (gcov tracks the #included source file).
-UT3_MODULE_SRCS :=
-UT3_MODULE_OBJS :=
+#
+# tccir_operand.c IS linked: the IROperand accessors tccgen.c reads (
+# irop_get_vreg, tcc_ir_op_get_src1, ...) used to be static inline in
+# tccir_operand.h and now have out-of-line definitions there, so the suite has
+# to link the real module rather than get them for free from the header.
+UT3_MODULE_SRCS := \
+	$(TOP)/source/ir/tccir_operand.c
+UT3_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR3)/%.o,$(UT3_MODULE_SRCS))
 
 UT3_LOCAL_SRCS := \
 	test_main3.c \
@@ -821,7 +878,7 @@ $(COV_STAMP4):
 	@touch $@
 
 UT4_MODULE_SRCS := \
-	$(TOP)/libtcc.c
+	$(TOP)/source/driver/libtcc.c
 UT4_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR4)/%.o,$(UT4_MODULE_SRCS))
 
 UT4_LOCAL_SRCS := \
@@ -974,7 +1031,7 @@ $(COV_STAMP6):
 	@touch $@
 
 UT6_MODULE_SRCS := \
-	$(TOP)/tccelf.c
+	$(TOP)/source/obj/tccelf.c
 UT6_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR6)/%.o,$(UT6_MODULE_SRCS))
 
 UT6_LOCAL_SRCS := \
@@ -1049,7 +1106,7 @@ $(COV_STAMP7):
 	@touch $@
 
 UT7_MODULE_SRCS := \
-	$(TOP)/tccpp.c
+	$(TOP)/source/frontend/tccpp.c
 UT7_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR7)/%.o,$(UT7_MODULE_SRCS))
 
 UT7_LOCAL_SRCS := \
@@ -1130,7 +1187,7 @@ $(COV_STAMP8):
 	@touch $@
 
 UT8_MODULE_SRCS := \
-	$(TOP)/tcctools.c
+	$(TOP)/source/driver/tcctools.c
 UT8_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR8)/%.o,$(UT8_MODULE_SRCS))
 
 UT8_LOCAL_SRCS := \
@@ -1205,8 +1262,8 @@ $(COV_STAMP9):
 	@touch $@
 
 UT9_MODULE_SRCS := \
-	$(TOP)/tccyaff.c \
-	$(TOP)/tccelf.c \
+	$(TOP)/source/obj/tccyaff.c \
+	$(TOP)/source/obj/tccelf.c \
 	$(TOP)/source/memory/unique_ptr.c
 UT9_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR9)/%.o,$(UT9_MODULE_SRCS))
 
@@ -1342,7 +1399,7 @@ $(COV_STAMP11):
 
 UT11_MODULE_SRCS := \
 	$(UT_MODULE_SRCS) \
-	$(TOP)/libtcc.c \
+	$(TOP)/source/driver/libtcc.c \
 	$(TOP)/source/opt/ssa/engine/use_def.c \
 	$(TOP)/source/opt/ssa/engine/rewrite.c \
 	$(TOP)/source/opt/ssa/engine/stack_resolve.c \
@@ -1471,7 +1528,7 @@ $(BUILD_DIR11)/%.o: %.c $(UT_ROOT)/ut.h Makefile $(COV_STAMP11) | $(UT11_DIRS)
 	$(HOSTCC) $(UT_CFLAGS) -DUT_SSA_OPT_REAL $(UT_DEPFLAGS) -c $< -o $@
 
 # ir/opt/ssa_opt*.c — build from the tinycc source tree, preserve layout.
-$(BUILD_DIR11)/ir/%.o: $(TOP)/ir/%.c Makefile $(COV_STAMP11) | $(UT11_DIRS)
+$(BUILD_DIR11)/ir/%.o: $(TOP)/source/ir/%.c Makefile $(COV_STAMP11) | $(UT11_DIRS)
 	@mkdir -p $(dir $@)
 	$(HOSTCC) $(UT_CFLAGS) -DUT_SSA_OPT_REAL $(UT_DEPFLAGS) -c $< -o $@
 

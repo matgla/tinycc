@@ -21,47 +21,46 @@ import pytest
 from selfhost_runner import compile_tinycc_source
 
 SELFHOST_COMPILE_SOURCES = [
-    # top-level
-    "libtcc.c",
-    "svalue.c",
-    "tcc.c",
-    "tccasm.c",
-    "tccdbg.c",
-    "tccdebug.c",
-    "tccelf.c",
-    "tccgen.c",
-    "tccir_operand.c",
-    "tccld.c",
-    "tccls.c",
-    "tccmachine.c",
-    "tccpp.c",
-    "tcctools.c",
-    "tccyaff.c",
-    # ir/
-    "ir/cfg.c",
-    "ir/codegen.c",
-    "ir/dump.c",
-    "ir/machine_op.c",
-    "ir/pool.c",
-    "ir/regalloc.c",
-    "ir/ssa.c",
-    "ir/stack.c",
-    "ir/type.c",
-    "ir/vreg.c",
-    # ir/gen/
-    "ir/gen/arith.c",
-    "ir/gen/asm.c",
-    "ir/gen/config.c",
-    "ir/gen/control.c",
-    "ir/gen/float.c",
-    "ir/gen/jump.c",
-    "ir/gen/live.c",
-    "ir/gen/params.c",
-    "ir/gen/put.c",
-    "ir/gen/softfloat.c",
-    "ir/gen/state.c",
-    "ir/gen/util.c",
-    "ir/gen/vla.c",
+    # driver / frontend / ir / machine / obj / support
+    "source/driver/libtcc.c",
+    "source/frontend/svalue.c",
+    "source/driver/tcc.c",
+    "source/frontend/tccasm.c",
+    "source/obj/tccdbg.c",
+    "source/support/tccdebug.c",
+    "source/obj/tccelf.c",
+    "source/ir/tccir_operand.c",
+    "source/obj/tccld.c",
+    "source/machine/tccls.c",
+    "source/machine/tccmachine.c",
+    "source/frontend/tccpp.c",
+    "source/driver/tcctools.c",
+    "source/obj/tccyaff.c",
+    # source/ir/
+    "source/ir/cfg.c",
+    "source/ir/codegen.c",
+    "source/ir/dump.c",
+    "source/ir/machine_op.c",
+    "source/ir/pool.c",
+    "source/ir/regalloc.c",
+    "source/ir/ssa.c",
+    "source/ir/stack.c",
+    "source/ir/type.c",
+    "source/ir/vreg.c",
+    # source/ir/gen/
+    "source/ir/gen/arith.c",
+    "source/ir/gen/asm.c",
+    "source/ir/gen/config.c",
+    "source/ir/gen/control.c",
+    "source/ir/gen/float.c",
+    "source/ir/gen/jump.c",
+    "source/ir/gen/live.c",
+    "source/ir/gen/params.c",
+    "source/ir/gen/put.c",
+    "source/ir/gen/softfloat.c",
+    "source/ir/gen/state.c",
+    "source/ir/gen/util.c",
+    "source/ir/gen/vla.c",
     # source/backend/arch/arm/
     "source/backend/arch/arm/arm-link.c",
     "source/backend/arch/arm/arm.c",
@@ -109,6 +108,71 @@ SELFHOST_COMPILE_SOURCES = [
     # source/backend/generators/
     "source/backend/generators/function.c",
     "source/backend/generators/regalloc.c",
+    # source/frontend/gen/builtin/
+    "source/frontend/gen/builtin/call.c",
+    "source/frontend/gen/builtin/chk.c",
+    "source/frontend/gen/builtin/fp.c",
+    "source/frontend/gen/builtin/fp2.c",
+    "source/frontend/gen/builtin/misc.c",
+    "source/frontend/gen/builtin/overflow.c",
+    "source/frontend/gen/builtin/simd.c",
+    "source/frontend/gen/builtin/string.c",
+    # source/frontend/gen/core/
+    "source/frontend/gen/core/predicates.c",
+    "source/frontend/gen/core/state.c",
+    "source/frontend/gen/core/suppress.c",
+    # source/frontend/gen/decl/
+    "source/frontend/gen/decl/attribute.c",
+    "source/frontend/gen/decl/btype.c",
+    "source/frontend/gen/decl/decl.c",
+    "source/frontend/gen/decl/declarator.c",
+    "source/frontend/gen/decl/predef_protos.c",
+    "source/frontend/gen/decl/struct.c",
+    # source/frontend/gen/expr/
+    "source/frontend/gen/expr/atomic.c",
+    "source/frontend/gen/expr/cond.c",
+    "source/frontend/gen/expr/indir.c",
+    "source/frontend/gen/expr/infix.c",
+    "source/frontend/gen/expr/primary.c",
+    "source/frontend/gen/expr/unary.c",
+    # source/frontend/gen/init/
+    "source/frontend/gen/init/alloc.c",
+    "source/frontend/gen/init/initializer.c",
+    # source/frontend/gen/inline/
+    "source/frontend/gen/inline/analysis.c",
+    "source/frontend/gen/inline/const_eval.c",
+    "source/frontend/gen/inline/emit.c",
+    # source/frontend/gen/nested/
+    "source/frontend/gen/nested/nested.c",
+    # source/frontend/gen/op/
+    "source/frontend/gen/op/complex.c",
+    "source/frontend/gen/op/float.c",
+    "source/frontend/gen/op/fold_math.c",
+    "source/frontend/gen/op/int.c",
+    "source/frontend/gen/op/op.c",
+    "source/frontend/gen/op/vector.c",
+    # source/frontend/gen/stmt/
+    "source/frontend/gen/stmt/block.c",
+    "source/frontend/gen/stmt/cleanup.c",
+    "source/frontend/gen/stmt/ret.c",
+    "source/frontend/gen/stmt/switch.c",
+    # source/frontend/gen/store/
+    "source/frontend/gen/store/struct_copy.c",
+    "source/frontend/gen/store/vstore.c",
+    # source/frontend/gen/sym/
+    "source/frontend/gen/sym/attr_merge.c",
+    "source/frontend/gen/sym/elfsym.c",
+    "source/frontend/gen/sym/symtab.c",
+    # source/frontend/gen/type/
+    "source/frontend/gen/type/assign_check.c",
+    "source/frontend/gen/type/cast.c",
+    "source/frontend/gen/type/compare.c",
+    "source/frontend/gen/type/size.c",
+    # source/frontend/gen/value/
+    "source/frontend/gen/value/load.c",
+    "source/frontend/gen/value/longlong.c",
+    "source/frontend/gen/value/strlit_pool.c",
+    "source/frontend/gen/value/vstack.c",
     # source/memory/
     "source/memory/unique_ptr.c",
     "source/memory/vector.c",
@@ -457,9 +521,14 @@ def test_predefined_macros_stay_in_reserved_namespace(selfhost_compiler, tmp_pat
 def test_selfhost_source_list_in_sync():
     """SELFHOST_COMPILE_SOURCES must cover every TU the native bootstrap builds.
 
-    Queries the top-level Makefile for TCC_FILES and parses the ARM backend
+    Queries the top-level Makefile for CORE_SRC and parses the ARM backend
     sub-Makefile SRCS lists.  Any file compiled by the bootstrap but missing
     here escapes the compile gate entirely.
+
+    CORE_SRC, not TCC_FILES: since each module archives into its own library,
+    TCC_FILES is one entry object plus a handful of .a files and would tell us
+    nothing about which TUs went into them.  CORE_SRC is the union of every
+    module's source list, which is what the bootstrap actually compiles.
     """
     tinycc_root = Path(__file__).parent.parent.parent
     if not (tinycc_root / "config.mak").exists():
@@ -469,7 +538,7 @@ def test_selfhost_source_list_in_sync():
         [
             "make",
             "--no-print-directory",
-            '--eval=selfhost-print-files: ; @printf "%s\\n" $(TCC_FILES)',
+            '--eval=selfhost-print-files: ; @printf "%s\\n" $(CORE_SRC)',
             "selfhost-print-files",
             "CROSS_TARGET=armv8m",
         ],
@@ -482,11 +551,7 @@ def test_selfhost_source_list_in_sync():
     if result.returncode != 0:
         pytest.skip(f"make query failed:\n{result.stdout}")
 
-    expected = set()
-    for tok in result.stdout.split():
-        name = tok[len("armv8m-"):] if tok.startswith("armv8m-") else tok
-        if name.endswith(".o"):
-            expected.add(name[:-2] + ".c")
+    expected = {tok for tok in result.stdout.split() if tok.endswith(".c")}
 
     # The backend archive (libarm.a) is built by sub-makes with the same CC;
     # their source lists are plain `SRCS = ...` / `FPU_SRCS = ...` lines.

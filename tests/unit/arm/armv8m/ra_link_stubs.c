@@ -17,8 +17,15 @@
 #include "opt/ssa/reassoc.h"
 #include "opt/ssa/cprop.h"
 
-/* From tccgen.c - used only for debug/dump messages. */
+/* From the frontend (source/frontend/gen/core/state.c, formerly tccgen.c) -
+ * used only for debug/dump messages. */
 const char *funcname = "unit_test";
+
+/* Also from the frontend: ir/regalloc.c's ra_may_need_frame_pointer() reads
+ * it to decide whether a variadic function needs a frame pointer.  The RA
+ * suites build IR directly and never parse a function, so 0 (not variadic)
+ * is the right answer for every test. */
+int func_var = 0;
 
 /* dbg_scan_overlap / dbg_scan_imm_dest used to be stubbed here too, but
  * ir/opt_pipeline.c (linked for tests/unit/arm/armv8m/test_opt_fusion.c's

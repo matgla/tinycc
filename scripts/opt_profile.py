@@ -120,7 +120,8 @@ def main():
     ap.add_argument("files", nargs="*", help="explicit source files")
     ap.add_argument("--limit", type=int, default=0, help="use only the first N sources")
     ap.add_argument("--levels", default="0,2", help="comma-separated -O levels for the wall-clock table")
-    ap.add_argument("--table-level", default="2", help="-O level to profile per-pass")
+    ap.add_argument("--table-level", default=None,
+                    help="-O level to profile per-pass (default: last of --levels)")
     ap.add_argument("--no-table", action="store_true", help="wall clock only")
     ap.add_argument("--cflags", default="", help="extra flags passed to every compile")
     args = ap.parse_args()
@@ -138,9 +139,12 @@ def main():
         print("%-8s %10.2f %8d" % ("-O" + level.strip(), secs, ok))
     if args.no_table:
         return 0
+    table_level = args.table_level
+    if table_level is None:
+        table_level = args.levels.split(",")[-1].strip()
     print()
-    print("=== TCC_PASS_TIMING aggregate at -O%s ===" % args.table_level)
-    print_table(pass_table(args.cc, files, args.table_level, extra))
+    print("=== TCC_PASS_TIMING aggregate at -O%s ===" % table_level)
+    print_table(pass_table(args.cc, files, table_level, extra))
     return 0
 
 

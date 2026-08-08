@@ -15,7 +15,6 @@
 #include "opt_utils.h"
 
 extern int gsym_cse_insert_before(TCCIRState *ir, int before_idx, IRQuadCompact *new_q);
-extern int tcc_ir_opt_pass_disabled(const char *name);
 
 /* ============================================================================
  * Global deref-operand CSE (tcc_ir_opt_global_deref_cse)

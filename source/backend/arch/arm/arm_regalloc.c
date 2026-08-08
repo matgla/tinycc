@@ -82,6 +82,13 @@ static const RegAllocTarget arm_target = {
         },
     .param_regs = 4,         /* R0-R3 */
     .static_chain_reg = 10,  /* R10 */
+    .frame_pointer_reg = 7,  /* R7: Thumb FP, allocatable in no-FP functions */
+    /* R8: the cheapest register to give up — a high register cannot take the
+     * 16-bit encodings R4-R6 can, so the body loses least by parking the
+     * .rodata base there.  The backend still prefers a low register when the
+     * allocation happens to leave one free. */
+    .rodata_anchor_reg = 8,
+    .rodata_anchor_sites = tcc_gen_machine_rodata_anchor_ir_sites,
     .op_narrow_capable = arm_op_narrow_capable,
 };
 

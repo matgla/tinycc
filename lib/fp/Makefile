@@ -77,10 +77,13 @@ build:
 # already define and the link dies on "multiple definition".  libsoftfp is the
 # reference set because it is the only complete one.
 #
-# Only rp2350 is held to this yet; libvfpv4sp and libvfpv5dp have the same
-# latent hole (they lean on the linker for their soft-float fallbacks) and are
-# listed here so the exemption is visible rather than silent.
-SELF_CONTAINED_VARIANTS = rp2350
+# rp2350 and vfpv4-sp are held to this.  libvfpv5dp still has the latent hole
+# (it leans on the linker for its soft-float fallbacks, and its cf* compares
+# overlap fcmp_asm.S so it cannot simply borrow it); the exemption is listed
+# here so it is visible rather than silent.  No board in tree selects it --
+# it would need a Cortex-M7-class double unit -- so closing it can wait until
+# one does.
+SELF_CONTAINED_VARIANTS = rp2350 vfpv4-sp
 FP_NM ?= $(shell command -v arm-none-eabi-nm 2>/dev/null || command -v nm 2>/dev/null)
 
 check-self-contained:

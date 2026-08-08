@@ -75,7 +75,7 @@ ifneq (,$(filter FreeBSD NetBSD,$(TARGETOS)))
   TESTS += test1
 endif
 
-RUN_TCC = -run $(TOPSRC)/tcc.c $(TCCFLAGS)
+RUN_TCC = -run $(TOPSRC)/source/driver/tcc.c $(TCCFLAGS)
 DISAS = objdump -d
 ifdef CONFIG_OSX
 DUMPTCC = (set -x; $(TOP)/tcc -vv; otool -L $(TOP)/tcc; exit 1)
@@ -116,7 +116,7 @@ hello-run: ../examples/ex1.c
 
 libtes%: libtcc_tes%$(EXESUF)
 	@echo ------------ $@ ------------
-	./libtcc_tes$*$(EXESUF) $(TOPSRC)/tcc.c $(TCCFLAGS)
+	./libtcc_tes$*$(EXESUF) $(TOPSRC)/source/driver/tcc.c $(TCCFLAGS)
 
 libtcc_test$(EXESUF): libtcc_test.c
 	$(CC) -o $@ $< $(CFLAGS) $(-LTCC) $(LIBS)
@@ -182,23 +182,23 @@ test4_static: tcctest.c test.ref
 # use tcc to create libtcc.so/.dll and the tcc(.exe) frontend and run them
 dlltest:
 	@echo ------------ $@ ------------
-	$(TCC) -DLIBTCC_AS_DLL $(TOPSRC)/libtcc.c $(LIBS) -shared -o libtcc2$(DLLSUF)
-	$(TCC) -DONE_SOURCE=0 $(TOPSRC)/tcc.c libtcc2$(DLLSUF) $(LIBS) -Wl,-rpath=. -o tcc2$(EXESUF)
+	$(TCC) -DLIBTCC_AS_DLL $(TOPSRC)/source/driver/libtcc.c $(LIBS) -shared -o libtcc2$(DLLSUF)
+	$(TCC) -DONE_SOURCE=0 $(TOPSRC)/source/driver/tcc.c libtcc2$(DLLSUF) $(LIBS) -Wl,-rpath=. -o tcc2$(EXESUF)
 	./tcc2$(EXESUF) $(TCCFLAGS) $(RUN_TCC) -run $(TOPSRC)/examples/ex1.c
 ifeq (,$(filter Darwin WIN32,$(TARGETOS)))
 	@echo ------------ $@ with PIC ------------
-	$(CC) $(CFLAGS) -fPIC -DLIBTCC_AS_DLL -c $(TOPSRC)/libtcc.c
+	$(CC) $(CFLAGS) -fPIC -DLIBTCC_AS_DLL -c $(TOPSRC)/source/driver/libtcc.c
 	$(TCC) libtcc.o $(LIBS) -shared -o libtcc2$(DLLSUF)
-	$(TCC) -DONE_SOURCE=0 $(TOPSRC)/tcc.c libtcc2$(DLLSUF) $(LIBS) -Wl,-rpath=. -o tcc2$(EXESUF)
+	$(TCC) -DONE_SOURCE=0 $(TOPSRC)/source/driver/tcc.c libtcc2$(DLLSUF) $(LIBS) -Wl,-rpath=. -o tcc2$(EXESUF)
 	./tcc2$(EXESUF) $(TCCFLAGS) $(RUN_TCC) -run $(TOPSRC)/examples/ex1.c
 endif
 	@rm tcc2$(EXESUF) libtcc2$(DLLSUF)
 
 memtest:
 	@echo ------------ $@ ------------
-	$(CC) $(CFLAGS) -DMEM_DEBUG=2 $(TOPSRC)/tcc.c $(LIBS) -o memtest-tcc$(EXESUF)
-	./memtest-tcc$(EXESUF) $(TCCFLAGS) $(TOPSRC)/tcc.c $(LIBS)
-	./memtest-tcc$(EXESUF) $(TCCFLAGS) -run $(TOPSRC)/tcc.c $(TCCFLAGS) -w $(TOPSRC)/tests/tcctest.c
+	$(CC) $(CFLAGS) -DMEM_DEBUG=2 $(TOPSRC)/source/driver/tcc.c $(LIBS) -o memtest-tcc$(EXESUF)
+	./memtest-tcc$(EXESUF) $(TCCFLAGS) $(TOPSRC)/source/driver/tcc.c $(LIBS)
+	./memtest-tcc$(EXESUF) $(TCCFLAGS) -run $(TOPSRC)/source/driver/tcc.c $(TCCFLAGS) -w $(TOPSRC)/tests/tcctest.c
 	@echo OK
 
 # memory and bound check auto test
@@ -225,9 +225,9 @@ btest: boundtest.c
 
 tccb:
 	@echo ------------ $@ ------------
-	$(TCC) -b $(TOPSRC)/tcc.c $(TCCFLAGS) -o tccb1.exe
+	$(TCC) -b $(TOPSRC)/source/driver/tcc.c $(TCCFLAGS) -o tccb1.exe
 	mv tccb1.exe tccb2.exe
-	./tccb2.exe -b $(TOPSRC)/tcc.c $(TCCFLAGS) -o tccb1.exe
+	./tccb2.exe -b $(TOPSRC)/source/driver/tcc.c $(TCCFLAGS) -o tccb1.exe
 	cmp -s tccb1.exe tccb2.exe && echo "Exe Bound-Test OK"
 
 
@@ -274,7 +274,7 @@ asmtest2: MAYBE_RUN_TCC = $(RUN_TCC)
 abitest-cc.exe: abitest.c
 	$(CC) -o $@ $^ $(CFLAGS) $(-LTCC) $(LIBS) -w
 
-abitest-tcc.exe: abitest.c libtcc.c
+abitest-tcc.exe: abitest.c $(TOPSRC)/source/driver/libtcc.c
 	$(TCC) -o $@ $^ $(LIBS)
 
 abitest-% : abitest-%.exe
@@ -346,7 +346,7 @@ CROSS-TGTS = \
 
 define CROSS-COMPILE
  @echo " . $(1)"
- $(TCC) $(DEF-$1) -DTCC_CROSS_TEST -run $(TOPSRC)/tcc.c \
+ $(TCC) $(DEF-$1) -DTCC_CROSS_TEST -run $(TOPSRC)/source/driver/tcc.c \
     -c $(if $(findstring c67,$1),$(filter %/ex3.c,$^),$<) -w $(TCCFLAGS)
 
 endef

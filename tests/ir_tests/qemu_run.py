@@ -36,6 +36,65 @@ DEFAULT_PERF_FREQUENCY = 999
 was_cleaned = False
 
 
+_TOOLCHAIN_CHECKED = {}
+
+
+def _check_toolchain(compiler):
+    """Return an actionable message if the cross toolchain can't run this test.
+
+    `make test-ir` depends on `cross`, so it always has a compiler and the
+    runtime archives.  A bare `run.py` does not, and the two ways it goes wrong
+    are both silent enough to look like codegen bugs:
+
+      * build_rootfs.sh leaves the tree-root armv8m-tcc as the *ARM* stage-2
+        binary (the host cross moves to bin/), so make execs an ARM YAFF file
+        and reports "Exec format error" 30 lines below the failure it prints;
+      * armv8m-libtcc1.a / lib/fp/*.a are only built by `make cross`, and
+        without them the link fails with "library not found" for a library
+        nobody expects to be missing.
+
+    Result is cached per compiler path: compile_testcase runs thousands of
+    times per suite and this execs the compiler.
+    """
+    key = str(compiler)
+    if key in _TOOLCHAIN_CHECKED:
+        return _TOOLCHAIN_CHECKED[key]
+
+    tcc_root = (CURRENT_DIR / "../..").resolve()
+    hint = f"build it with:  cd {tcc_root} && make cross"
+    problem = None
+
+    path = Path(compiler)
+    if not path.exists():
+        problem = f"compiler not found: {path}"
+    else:
+        try:
+            proc = subprocess.run(
+                [str(path), "-v"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30,
+                env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"},
+            )
+            if proc.returncode != 0:
+                problem = (f"{path} exited {proc.returncode} on -v: "
+                           f"{proc.stdout.decode('utf-8', 'replace').strip()}")
+        except OSError as exc:
+            problem = (f"{path} is not executable on this host ({exc}).  "
+                       f"build_rootfs.sh leaves the on-device ARM compiler here "
+                       f"and puts the host cross in bin/")
+        except subprocess.TimeoutExpired:
+            problem = f"{path} did not respond to -v within 30s"
+
+    if problem is None:
+        missing = [str(p) for p in (tcc_root / "armv8m-libtcc1.a",) if not p.exists()]
+        if not list((tcc_root / "lib" / "fp").glob("*.a")):
+            missing.append(str(tcc_root / "lib/fp/*.a"))
+        if missing:
+            problem = "missing runtime libraries: " + ", ".join(missing)
+
+    _TOOLCHAIN_CHECKED[key] = f"{problem}\n{hint}" if problem else None
+    return _TOOLCHAIN_CHECKED[key]
+
+
 def _detect_asan():
     """Check if the compiler was built with AddressSanitizer by inspecting config.mak."""
     config_mak = CURRENT_DIR / "../../config.mak"
@@ -677,6 +736,17 @@ def compile_testcase(test_file, machine, compiler=None, cflags=None, config=None
     # Determine output directory
     output_dir = config.output_dir or (CURRENT_DIR / "build")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    toolchain_problem = _check_toolchain(config.compiler)
+    if toolchain_problem:
+        return CompileResult(
+            success=False,
+            elf_file=get_test_output_file(test_file, output_dir, prefix=config.output_prefix, suffix=config.output_suffix),
+            output_lines=toolchain_problem.splitlines(),
+            compile_time_s=0.0,
+            make_command=[],
+            error=toolchain_problem,
+        )
 
     # Setup profiler
     cc_wrapper = None

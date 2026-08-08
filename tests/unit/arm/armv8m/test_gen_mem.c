@@ -42,7 +42,7 @@
 #include "source/backend/arch/arm/thumb/thop_mem_reg.h"
 #include "source/backend/arch/arm/thumb/thop_mov.h"
 #include "source/backend/arch/arm/thumb/thop_block.h"
-#include "ir/machine_op.h"
+#include "source/ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
 #include "ir_build.h"

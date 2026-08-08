@@ -20,7 +20,7 @@
 
 #pragma once
 
-#include "ir/core.h"
+#include "source/ir/core.h"
 
 /* Analyze whether the function is a leaf / tail-call-only, setting
  * ir->leaffunc and ir->tail_call_only.  Backend property consumed by

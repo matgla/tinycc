@@ -1174,14 +1174,18 @@ static int ssa_fold_test_zero(IRSSAOptCtx *ctx, int tz_idx)
   return 1;
 }
 
-/* ---- non-negative soft-float compare folding ---- */
+/* ---- non-negative compare folding ---- */
 
-/* A soft-float flag compare (__aeabi_cdcmple/__aeabi_cfcmple) of a provably
- * non-negative value against 0.0 has a known outcome for the >= / < family. */
+/* A flag compare of a provably non-negative value against 0.0 has a known
+ * outcome for the >= / < family, whether it is a soft-float libcall
+ * (__aeabi_cdcmple/__aeabi_cfcmple) or an inline hardware FCMP. */
 static const char *ssa_nonneg_func_names[] = {
     "fabs", "fabsf", "abs", "labs", "llabs", "strlen", "sizeof",
     "__aeabi_ui2d", "__aeabi_ui2f",  /* unsigned → float is always >= 0 */
 };
+/* ...of which only these can still hand back a NaN (fabs(NaN) is NaN), which
+ * halves what ssa_nonneg_cmp_outcome() may conclude about them. */
+static const char *ssa_nonneg_nan_func_names[] = {"fabs", "fabsf"};
 static const char *ssa_flag_cmp_funcs[] = {
     "__aeabi_cdcmple", "__aeabi_cfcmple",
 };
@@ -1234,16 +1238,23 @@ static int ssa_call_param0_imm(TCCIRState *ir, int call_idx, int64_t *out)
 }
 
 /* A call whose result is provably non-negative: fabs/abs/strlen/... or
- * __aeabi_f2d of a non-negative single-precision constant. */
-static int ssa_call_result_nonneg(TCCIRState *ir, int def_idx)
+ * __aeabi_f2d of a non-negative single-precision constant.  `*may_be_nan` is
+ * set when the proof holds only in the "not less than zero" sense because the
+ * result can be a NaN. */
+static int ssa_call_result_nonneg(TCCIRState *ir, int def_idx, int *may_be_nan)
 {
   IRQuadCompact *dq = &ir->compact_instructions[def_idx];
+  *may_be_nan = 0;
   if (dq->op != TCCIR_OP_FUNCCALLVAL) return 0;
   const char *name = ssa_call_callee_name(ir, dq);
   if (!name) return 0;
   if (ssa_name_in(name, ssa_nonneg_func_names,
-                  (int)(sizeof(ssa_nonneg_func_names) / sizeof(ssa_nonneg_func_names[0]))))
+                  (int)(sizeof(ssa_nonneg_func_names) / sizeof(ssa_nonneg_func_names[0])))) {
+    *may_be_nan = ssa_name_in(name, ssa_nonneg_nan_func_names,
+                              (int)(sizeof(ssa_nonneg_nan_func_names) /
+                                    sizeof(ssa_nonneg_nan_func_names[0])));
     return 1;
+  }
   if (strcmp(name, "__aeabi_f2d") == 0) {
     int64_t fimm;
     if (ssa_call_param0_imm(ir, def_idx, &fimm)) {
@@ -1251,7 +1262,7 @@ static int ssa_call_result_nonneg(TCCIRState *ir, int def_idx)
       uint32_t sign = (fbits >> 31) & 1;
       uint32_t exp = (fbits >> 23) & 0xFF;
       uint32_t mant = fbits & 0x7FFFFF;
-      if (!sign && !(exp == 0xFF && mant != 0)) return 1;
+      if (!sign && !(exp == 0xFF && mant != 0)) return 1;  /* NaN excluded here */
     }
   }
   return 0;
@@ -1260,15 +1271,16 @@ static int ssa_call_result_nonneg(TCCIRState *ir, int def_idx)
 /* Is the value read from `vreg` at `use_idx` provably non-negative?  TEMPs
  * resolve through SSA vinfo; unpromoted VAR slots scan back to the nearest slot
  * def, bailing on any potentially-aliasing write. */
-static int ssa_vreg_is_nonneg(IRSSAOptCtx *ctx, int32_t vreg, int use_idx)
+static int ssa_vreg_is_nonneg(IRSSAOptCtx *ctx, int32_t vreg, int use_idx, int *may_be_nan)
 {
+  *may_be_nan = 0;
   if (vreg < 0) return 0;
   TCCIRState *ir = ctx->ir;
 
   if (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_TEMP) {
     IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vreg);
     if (!vi || vi->def_instr < 0 || vi->def_count > 1) return 0;
-    return ssa_call_result_nonneg(ir, vi->def_instr);
+    return ssa_call_result_nonneg(ir, vi->def_instr, may_be_nan);
   }
 
   if (TCCIR_DECODE_VREG_TYPE(vreg) != TCCIR_VREG_TYPE_VAR) return 0;
@@ -1283,7 +1295,7 @@ static int ssa_vreg_is_nonneg(IRSSAOptCtx *ctx, int32_t vreg, int use_idx)
           TCCIR_DECODE_VREG_POSITION(kdv) == var_pos) {
         if (kq->op == TCCIR_OP_STORE && kd.is_lval && !kd.is_local)
           continue; /* pointer-deref through V, not a slot def */
-        return ssa_call_result_nonneg(ir, k);
+        return ssa_call_result_nonneg(ir, k, may_be_nan);
       }
     }
     if (kq->op == TCCIR_OP_STORE_INDEXED || kq->op == TCCIR_OP_STORE_POSTINC)
@@ -1296,6 +1308,61 @@ static int ssa_vreg_is_nonneg(IRSSAOptCtx *ctx, int32_t vreg, int use_idx)
     }
   }
   return 0;
+}
+
+/* Split a comparison token into its base relation, plus whether the predicate
+ * comes out true when the operands are unordered (a NaN is involved).  Which
+ * spelling carries "unordered" depends on the flag setter, so the two
+ * lowerings need different answers for the same token:
+ *
+ *   hw_tokens=1 (inline DCP compare): the U tokens are the unordered-true ones
+ *     and the plain ones ordered, exactly as tcc_ir_gen_f() records them.
+ *   hw_tokens=0 (__aeabi_c[df]cmple): the libcall folds unordered onto
+ *     "greater", so GT/GE come out true on a NaN and LT/LE false -- and each U
+ *     spelling lowers identically to its plain one (get_softfp_func_name()).
+ *
+ * Returns the base relation (TOK_LT/TOK_LE/TOK_GT/TOK_GE), or -1. */
+static int ssa_fp_cmp_relation(int tok, int hw_tokens, int *unordered_true)
+{
+  switch (tok) {
+  case TOK_LT:  *unordered_true = 0;          return TOK_LT;
+  case TOK_ULT: *unordered_true = hw_tokens;  return TOK_LT;
+  case TOK_LE:  *unordered_true = 0;          return TOK_LE;
+  case TOK_ULE: *unordered_true = hw_tokens;  return TOK_LE;
+  case TOK_GT:  *unordered_true = !hw_tokens; return TOK_GT;
+  case TOK_UGT: *unordered_true = 1;          return TOK_GT;
+  case TOK_GE:  *unordered_true = !hw_tokens; return TOK_GE;
+  case TOK_UGE: *unordered_true = 1;          return TOK_GE;
+  default: return -1;
+  }
+}
+
+/* Outcome of `v REL 0.0` (nonneg_is_arg0) or `0.0 REL v` for a provably
+ * non-negative v, or -1 when the relation leaves it open.
+ *
+ * Once v may be a NaN only half the directions survive: the unordered answer
+ * has to agree with the ordered one.  `fabs(x) < 0.0` is false either way, so
+ * it still folds -- that is the whole point of
+ * gcc.c-torture/execute/20020720-1.c -- but `fabs(x) >= 0.0` is *not* provably
+ * true, and gcc does not fold it either. */
+static int ssa_nonneg_cmp_outcome(int nonneg_is_arg0, int tok, int may_be_nan, int hw_tokens)
+{
+  int unordered_true;
+  int rel = ssa_fp_cmp_relation(tok, hw_tokens, &unordered_true);
+  if (rel < 0) return -1;
+
+  int ordered;  /* the answer for every ordered non-negative v */
+  if (nonneg_is_arg0) {
+    if (rel == TOK_GE) ordered = 1;
+    else if (rel == TOK_LT) ordered = 0;
+    else return -1;  /* v <= 0 / v > 0 still depend on v */
+  } else {
+    if (rel == TOK_LE) ordered = 1;
+    else if (rel == TOK_GT) ordered = 0;
+    else return -1;
+  }
+  if (may_be_nan && unordered_true != ordered) return -1;
+  return ordered;
 }
 
 static int ssa_fold_nonneg_cmp(IRSSAOptCtx *ctx, int call_idx)
@@ -1313,14 +1380,14 @@ static int ssa_fold_nonneg_cmp(IRSSAOptCtx *ctx, int call_idx)
   if (ssa_call_params(ir, call_idx, p, 2) != 3)
     return 0;
 
-  int nonneg_is_arg0;
+  int nonneg_is_arg0, may_be_nan;
   if (!irop_is_immediate(p[0]) && irop_is_immediate(p[1]) &&
       irop_get_imm64_ex(ir, p[1]) == 0 &&
-      ssa_vreg_is_nonneg(ctx, irop_get_vreg(p[0]), call_idx))
+      ssa_vreg_is_nonneg(ctx, irop_get_vreg(p[0]), call_idx, &may_be_nan))
     nonneg_is_arg0 = 1;
   else if (irop_is_immediate(p[0]) && irop_get_imm64_ex(ir, p[0]) == 0 &&
            !irop_is_immediate(p[1]) &&
-           ssa_vreg_is_nonneg(ctx, irop_get_vreg(p[1]), call_idx))
+           ssa_vreg_is_nonneg(ctx, irop_get_vreg(p[1]), call_idx, &may_be_nan))
     nonneg_is_arg0 = 0;
   else
     return 0;
@@ -1328,18 +1395,68 @@ static int ssa_fold_nonneg_cmp(IRSSAOptCtx *ctx, int call_idx)
   int j = ir_skip_nops_forward(ir, call_idx + 1, n);
   if (j >= n) return 0;
 
-  int cond_tok = ssa_flag_consumer_tok(ctx, j);
-  int fold_result = -1;
-  if (nonneg_is_arg0) {
-    if (cond_tok == TOK_GE || cond_tok == TOK_UGE) fold_result = 1;
-    else if (cond_tok == TOK_LT || cond_tok == TOK_ULT) fold_result = 0;
-  } else {
-    if (cond_tok == TOK_LE || cond_tok == TOK_ULE) fold_result = 1;
-    else if (cond_tok == TOK_GT || cond_tok == TOK_UGT) fold_result = 0;
-  }
+  int fold_result = ssa_nonneg_cmp_outcome(nonneg_is_arg0, ssa_flag_consumer_tok(ctx, j),
+                                           may_be_nan, 0);
   if (fold_result < 0) return 0;
 
   ssa_rewrite_flag_consumer(ctx, j, fold_result);
+  return 1;
+}
+
+/* Same proof against an inline hardware compare.  With -mfpu=rp2350 a double
+ * compare never becomes an __aeabi_ call, so the libcall shape above stops
+ * matching and gcc.c-torture/execute/20020720-1.c keeps its link_error() call
+ * at -O1/-O2.
+ *
+ * Only the DCP double compare reaches here at all: ir/gen/softfloat.c rewrites
+ * every FCMP the FPU cannot do inline into a call, and has_dcmp is set by that
+ * config alone.  Insisting on it is not just documentation -- a single-precision
+ * or non-DCP FCMP would carry tcc_ir_gen_f()'s *mirrored* soft-float tokens
+ * instead, which ssa_nonneg_cmp_outcome() reads under the other convention. */
+static int ssa_fold_nonneg_fcmp(IRSSAOptCtx *ctx, int cmp_idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *cmp_q = &ir->compact_instructions[cmp_idx];
+  int n = ir->next_instruction_index;
+
+  const FloatingPointConfig *fpu = architecture_config.fpu;
+  if (!fpu || !fpu->has_dcmp || fpu->double_impl != FP_DOUBLE_IMPL_DCP)
+    return 0;
+
+  IROperand a = tcc_ir_op_get_src1(ir, cmp_q);
+  IROperand b = tcc_ir_op_get_src2(ir, cmp_q);
+  if (a.is_lval || b.is_lval || a.btype != IROP_BTYPE_FLOAT64 || b.btype != IROP_BTYPE_FLOAT64)
+    return 0;
+
+  int nonneg_is_arg0, may_be_nan;
+  if (!irop_is_immediate(a) && irop_is_immediate(b) && irop_get_imm64_ex(ir, b) == 0 &&
+      ssa_vreg_is_nonneg(ctx, irop_get_vreg(a), cmp_idx, &may_be_nan))
+    nonneg_is_arg0 = 1;
+  else if (irop_is_immediate(a) && irop_get_imm64_ex(ir, a) == 0 && !irop_is_immediate(b) &&
+           ssa_vreg_is_nonneg(ctx, irop_get_vreg(b), cmp_idx, &may_be_nan))
+    nonneg_is_arg0 = 0;
+  else
+    return 0;
+
+  int j = ir_skip_nops_forward(ir, cmp_idx + 1, n);
+  if (j >= n) return 0;
+  /* A consumer that is itself a jump target also reads flags set on the other
+   * entry path, which this compare says nothing about. */
+  if (ir->compact_instructions[j].is_jump_target) return 0;
+
+  int fold_result = ssa_nonneg_cmp_outcome(nonneg_is_arg0, ssa_flag_consumer_tok(ctx, j),
+                                           may_be_nan, 1);
+  if (fold_result < 0) return 0;
+
+  /* The compare produced nothing but the flags this consumer just stopped
+   * reading, so it goes too unless a second consumer follows. */
+  int k = ir_skip_nops_forward(ir, j + 1, n);
+  int more_consumers = (k < n) && (ir->compact_instructions[k].op == TCCIR_OP_SETIF ||
+                                   ir->compact_instructions[k].op == TCCIR_OP_JUMPIF ||
+                                   ir->compact_instructions[k].op == TCCIR_OP_SELECT);
+  ssa_rewrite_flag_consumer(ctx, j, fold_result);
+  if (!more_consumers)
+    ssa_opt_nop_instr(ctx, cmp_idx);
   return 1;
 }
 
@@ -1652,6 +1769,7 @@ static const IRSSAOptGen branch_gens[] = {
   { TCCIR_OP_CMP,          ssa_fold_cmp_jumpif, "branch_cmp" },
   { TCCIR_OP_TEST_ZERO,    ssa_fold_test_zero,  "branch_tz" },
   { TCCIR_OP_FUNCCALLVOID, ssa_fold_nonneg_cmp, "branch_nonneg" },
+  { TCCIR_OP_FCMP,         ssa_fold_nonneg_fcmp, "branch_nonneg_fcmp" },
   { TCCIR_OP_RETURNVALUE,  ssa_fold_return_const_reuse, "branch_retreuse" },
 };
 

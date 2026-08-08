@@ -19,7 +19,7 @@
 
 #pragma once
 
-#include "ir/core.h"
+#include "source/ir/core.h"
 
 /* Run the target-independent optimization pipeline on `ir`.
  *

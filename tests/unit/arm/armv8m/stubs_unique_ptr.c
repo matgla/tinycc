@@ -33,6 +33,24 @@ void *tcc_mallocz(unsigned long size)
   return p;
 }
 
+/* tcc.h rewrites every tcc_malloc/tcc_mallocz call site into these
+ * allocation-attribution wrappers, so those are the names vector.c and
+ * unique_ptr.c actually reference.  (tcc_realloc_at goes with tcc_realloc in
+ * test_vector.c, whose counting allocator the vector tests assert on.) */
+void *tcc_malloc_at(unsigned long size, const char *file, int line)
+{
+  (void)file;
+  (void)line;
+  return tcc_malloc(size);
+}
+
+void *tcc_mallocz_at(unsigned long size, const char *file, int line)
+{
+  (void)file;
+  (void)line;
+  return tcc_mallocz(size);
+}
+
 char *tcc_strdup(const char *str)
 {
   size_t n = strlen(str) + 1;

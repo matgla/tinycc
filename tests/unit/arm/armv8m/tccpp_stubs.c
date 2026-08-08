@@ -15,11 +15,18 @@
 #include "tcc.h"
 
 /* tcc.h redirects malloc/realloc/free/strdup to use_tcc_*.  Undo that here
-   so this TU can call the raw libc allocators for its own implementations. */
+   so this TU can call the raw libc allocators for its own implementations.
+   It also rewrites tcc_malloc/tcc_mallocz/tcc_realloc into the
+   allocation-attribution wrappers (tcc_malloc_at & co.), which would rewrite
+   the definitions below along with the call sites -- so undo that too and
+   define both spellings by hand. */
 #undef malloc
 #undef realloc
 #undef free
 #undef strdup
+#undef tcc_malloc
+#undef tcc_mallocz
+#undef tcc_realloc
 
 #include <setjmp.h>
 #include <stdarg.h>
@@ -67,6 +74,31 @@ void *tcc_realloc(void *ptr, unsigned long size)
     exit(1);
   }
   return p;
+}
+
+/* tcc.h rewrites every tcc_malloc/tcc_mallocz/tcc_realloc call site into these
+ * allocation-attribution wrappers (they record the source line of mmap-class
+ * allocations for -bench), so the stub layer has to answer to the wrapper
+ * names too.  The accounting is of no interest here: just forward. */
+void *tcc_malloc_at(unsigned long size, const char *file, int line)
+{
+  (void)file;
+  (void)line;
+  return tcc_malloc(size);
+}
+
+void *tcc_mallocz_at(unsigned long size, const char *file, int line)
+{
+  (void)file;
+  (void)line;
+  return tcc_mallocz(size);
+}
+
+void *tcc_realloc_at(void *ptr, unsigned long size, const char *file, int line)
+{
+  (void)file;
+  (void)line;
+  return tcc_realloc(ptr, size);
 }
 
 void tcc_free(void *ptr)

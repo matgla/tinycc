@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-coverage_tccgen.py -- merged line-coverage report for tccgen.c.
+coverage_tccgen.py -- merged line-coverage report for source/frontend/gen/.
 
-tccgen.c is the C parser / type checker / IR-emission frontend.  Most of it
-only runs inside the full compile pipeline, so the isolated unit-test binary
-(tests/unit/arm/armv8m, which #includes tccgen.c and stubs the IR/ELF/pp
-boundary) can only reach its pure `static` helpers.  This script produces the
-*merged* picture by combining two coverage sources for the same source file:
+source/frontend/gen/ is the C parser / type checker / IR-emission frontend
+(the former monolithic tccgen.c, split across 52 TUs -- see
+docs/plan_tccgen_split.md).  Most of it only runs inside the full compile
+pipeline, so the isolated unit-test binary (tests/unit/arm/armv8m, which
+#includes the gen sources and stubs the IR/ELF/pp boundary) can only reach its
+pure `static` helpers.  This script produces the *merged* picture by combining
+two coverage sources for the same sources:
 
-  1. the real cross compiler (armv8m-tcc) with tccgen.c instrumented, run over
+  1. the real cross compiler (armv8m-tcc) with every gen TU instrumented, run over
      the whole compile-test corpus (ir_tests, tests2, frontend, gcc-torture) at
      several -O levels -- this exercises the parser/codegen pipeline; and
   2. the isolated tccgen unit tests (make -C tests/unit/arm/armv8m COVERAGE=1),
@@ -60,10 +62,16 @@ class Cfg:
         self.olevels = args.olevels.split()
         self.out = Path(args.out)
         self.no_torture = args.no_torture
-        self.obj = f"{self.x}tccgen.o"
         self.bin = f"{self.x}tcc"
-        self.gcno = f"{self.x}tccgen.gcno"
-        self.gcda = f"{self.x}tccgen.gcda"
+        # tccgen.c was split into source/frontend/gen/ (see
+        # docs/plan_tccgen_split.md): instrument every TU of the split rather
+        # than the single former armv8m-tccgen.o.
+        gen_root = TOP / "source" / "frontend" / "gen"
+        self.gen_srcs = sorted(
+            str(q.relative_to(TOP)) for q in gen_root.rglob("*.c"))
+        self.objs = [f"{self.x}{s[:-2]}.o" for s in self.gen_srcs]
+        self.gcnos = [f"{self.x}{s[:-2]}.gcno" for s in self.gen_srcs]
+        self.gcdas = [f"{self.x}{s[:-2]}.gcda" for s in self.gen_srcs]
         self.unitdir = TOP / "tests" / "unit" / "arm" / "armv8m"
         self.unit_gcda = self.unitdir / "build_tccgen" / "test_tccgen.gcda"
 
@@ -106,7 +114,7 @@ def collect_corpus(cfg: Cfg) -> tuple[list, list]:
 def sweep(cfg: Cfg, sources: list, extra_flags: list) -> None:
     """Compile every source at every -O level through the instrumented compiler.
 
-    Compile failures are expected and ignored -- the point is to drive tccgen.c,
+    Compile failures are expected and ignored -- the point is to drive the frontend,
     not to pass the corpus.
     """
     if not sources:
@@ -131,7 +139,7 @@ def sweep(cfg: Cfg, sources: list, extra_flags: list) -> None:
 
 def cleanup(cfg: Cfg, work: Path) -> None:
     print("==> restoring normal (uninstrumented) build")
-    for f in (cfg.obj, cfg.bin, cfg.gcno, cfg.gcda):
+    for f in [cfg.bin, *cfg.objs, *cfg.gcnos, *cfg.gcdas]:
         (TOP / f).unlink(missing_ok=True)
     subprocess.run(["make", "cross"], cwd=TOP,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -183,16 +191,30 @@ def main() -> int:
         print("==> building baseline cross compiler")
         run(["make", "cross"], stdout=subprocess.DEVNULL)
 
-        print(f"==> instrumenting {cfg.obj} (tccgen.c only) and relinking {cfg.bin}")
-        (TOP / cfg.obj).unlink(missing_ok=True)
+        print(f"==> instrumenting {len(cfg.objs)} source/frontend/gen TUs "
+              f"and relinking {cfg.bin}")
+        for o in cfg.objs:
+            (TOP / o).unlink(missing_ok=True)
         (TOP / cfg.bin).unlink(missing_ok=True)
 
-        cc_cmd = derive_make_command(cfg, cfg.obj, r"(gcc|cc).* -c tccgen\.c( |$)")
-        if not cc_cmd:
-            print(f"coverage_tccgen: could not derive compile command for {cfg.obj}",
-                  file=sys.stderr)
-            return 3
-        run(cc_cmd + " --coverage -fprofile-update=atomic", shell=True)
+        for src, obj in zip(cfg.gen_srcs, cfg.objs):
+            cc_cmd = derive_make_command(
+                cfg, obj, rf"(gcc|cc).* -c {re.escape(src)}( |$)")
+            if not cc_cmd:
+                print(f"coverage_tccgen: could not derive compile command for {obj}",
+                      file=sys.stderr)
+                return 3
+            run(cc_cmd + " --coverage -fprofile-update=atomic", shell=True)
+
+        # The gen TUs are archived into the frontend module library, and the
+        # link consumes that archive rather than the loose objects.  Re-archive
+        # it from the freshly instrumented objects first: otherwise the relink
+        # quietly picks up the previous, uninstrumented members and every .gcda
+        # comes out empty.
+        frontend_lib = f"{cfg.x}source/frontend/libfrontend.a"
+        (TOP / frontend_lib).unlink(missing_ok=True)
+        run(["make", f"CROSS_TARGET={cfg.target}", frontend_lib],
+            stdout=subprocess.DEVNULL)
 
         link_cmd = derive_make_command(cfg, cfg.bin, rf"(gcc|cc) -o {re.escape(cfg.bin)} ")
         if not link_cmd:
@@ -218,34 +240,35 @@ def main() -> int:
         sweep(cfg, inc_sources, ARMF + inc_flags)
         sweep(cfg, free_sources, [])
 
-        if not (TOP / cfg.gcda).is_file():
-            print(f"coverage_tccgen: no {cfg.gcda} produced -- corpus empty?",
-                  file=sys.stderr)
+        produced = [g for g in cfg.gcdas if (TOP / g).is_file()]
+        if not produced:
+            print("coverage_tccgen: no source/frontend/gen .gcda produced "
+                  "-- corpus empty?", file=sys.stderr)
             return 4
 
         print("==> merging coverage (real corpus + unit tests)")
         real_info, unit_info = work / "real.info", work / "unit.info"
         merged_info, tccgen_info = work / "merged.info", work / "tccgen.info"
-        run(["geninfo", str(TOP / cfg.gcda), "-o", str(real_info),
+        run(["geninfo", *[str(TOP / g) for g in produced], "-o", str(real_info),
              "--gcov-tool", "gcov", "-q"], stderr=subprocess.DEVNULL)
         run(["geninfo", str(cfg.unit_gcda), "-o", str(unit_info),
              "--gcov-tool", "gcov", "-q"], stderr=subprocess.DEVNULL)
         run(["lcov", "-a", str(real_info), "-a", str(unit_info),
              "-o", str(merged_info), "--rc", "geninfo_unexecuted_blocks=1", "-q"],
             stderr=subprocess.DEVNULL)
-        run(["lcov", "--extract", str(merged_info), "*/tccgen.c",
+        run(["lcov", "--extract", str(merged_info), "*/source/frontend/gen/*",
              "-o", str(tccgen_info), "-q"], stderr=subprocess.DEVNULL)
 
         cfg.out.mkdir(parents=True, exist_ok=True)
         shutil.copy(tccgen_info, cfg.out / "tccgen.info")
         run(["genhtml", str(tccgen_info), "-o", str(cfg.out), "-q", "--title",
-             "tccgen.c merged coverage (unit tests + real-compiler corpus)"],
+             "source/frontend/gen merged coverage (unit tests + real-compiler corpus)"],
             stderr=subprocess.DEVNULL)
 
         summary = subprocess.run(["lcov", "--summary", str(tccgen_info)],
                                  cwd=TOP, capture_output=True, text=True)
         print()
-        print("======================= tccgen.c merged coverage =======================")
+        print("=============== source/frontend/gen merged coverage ===============")
         for line in (summary.stdout + summary.stderr).splitlines():
             if re.search(r"lines|functions", line, re.I):
                 print(line)

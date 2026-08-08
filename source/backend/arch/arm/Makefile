@@ -17,6 +17,24 @@ DEFINES   ?=
 SRCS = arm.c arm_aapcs.c arm_regalloc.c ssa_opt_arm.c arm-link.c
 OBJS = $(addprefix $(BUILD_DIR)/, $(SRCS:.c=.o))
 
+# Headers these TUs see.  Without them a `make` after any tcc.h / config.h edit
+# reports nothing to do and relinks objects built against the previous struct
+# layout — the top-level Makefile drops the whole object dir when config.h or
+# config.mak moves, but that guard cannot see an ordinary header edit.
+CORE_HDRS = $(wildcard $(TOP)/*.h) \
+	$(wildcard $(TOP)/source/include/*.h) \
+	$(wildcard $(TOP)/source/driver/*.h) \
+	$(wildcard $(TOP)/source/frontend/*.h) \
+	$(wildcard $(TOP)/source/ir/*.h) \
+	$(wildcard $(TOP)/source/machine/*.h) \
+	$(wildcard $(TOP)/source/obj/*.h) \
+	$(wildcard $(TOP)/source/support/*.h) \
+	$(wildcard $(TOP)/source/opt/include/*.h) \
+	$(wildcard $(TOP)/source/opt/framework/*.h) \
+	$(wildcard $(TOP)/source/memory/include/memory/*.h) \
+	$(wildcard $(TOP)/source/backend/arch/arm/*.h) \
+	$(wildcard $(TOP)/source/backend/arch/arm/thumb/*.h)
+
 # Per-FPU capability tables (arch/fpu/arm/).  These were previously not built
 # at all: their headers declared `const FloatingPointConfig x;` with no extern,
 # which is a tentative definition, so every includer quietly got its own
@@ -26,9 +44,9 @@ FPU_SRCS = fpv5-sp-d16.c fpv5-d16.c rp2350-dcp.c
 FPU_OBJS = $(addprefix $(BUILD_DIR)/fpu-, $(FPU_SRCS:.c=.o))
 OBJS += $(FPU_OBJS)
 
-$(BUILD_DIR)/fpu-%.o: $(TOP)/source/backend/arch/fpu/arm/%.c
+$(BUILD_DIR)/fpu-%.o: $(TOP)/source/backend/arch/fpu/arm/%.c $(CORE_HDRS)
 	@mkdir -p $(dir $@)
-	$(CC) -o $@ -c $< $(CFLAGS) $(DEFINES) -I$(TOP) -I$(TOP)/ir -I$(TOP)/ir/opt
+	$(CC) -o $@ -c $< $(CFLAGS) $(DEFINES) -I$(TOP) -I$(TOP)/source/ir 
 
 ISA_DIRS = thumb
 ISA_LIBS = $(foreach d,$(ISA_DIRS),$(BUILD_DIR)/lib$(d).a)
@@ -49,9 +67,9 @@ $(BUILD_DIR)/lib%.a: FORCE
 	$(MAKE) --no-print-directory -C $* \
 		TOP=$(TOP) BUILD_DIR=$(BUILD_DIR)
 
-$(BUILD_DIR)/%.o: %.c
+$(BUILD_DIR)/%.o: %.c $(CORE_HDRS)
 	@mkdir -p $(dir $@)
-	$(CC) -o $@ -c $< $(CFLAGS) $(DEFINES) -I$(TOP) -I$(TOP)/ir -I$(TOP)/ir/opt
+	$(CC) -o $@ -c $< $(CFLAGS) $(DEFINES) -I$(TOP) -I$(TOP)/source/ir 
 
 clean:
 	rm -f $(OBJS) $(LIB) $(ISA_LIBS)

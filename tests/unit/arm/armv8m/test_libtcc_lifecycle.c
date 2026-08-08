@@ -20,7 +20,13 @@ UT_TEST(test_tcc_new_sets_defaults)
   UT_ASSERT_EQ(s->dollars_in_identifiers, 1);
   UT_ASSERT_EQ(s->cversion, 201112);
   UT_ASSERT_EQ(s->float_abi, ARM_SOFTFP_FLOAT);
+  /* A build may ship a different default -mfpu (-DCONFIG_TCC_DEFAULT_FPU=...);
+   * assert whatever this build was configured for, not a hardcoded soft. */
+#ifdef CONFIG_TCC_DEFAULT_FPU
+  UT_ASSERT_EQ(s->fpu_type, CONFIG_TCC_DEFAULT_FPU);
+#else
   UT_ASSERT_EQ(s->fpu_type, ARM_FPU_AUTO);
+#endif
   UT_ASSERT(s->ppfp == stdout);
   UT_ASSERT(s->tcc_lib_path != NULL);
 

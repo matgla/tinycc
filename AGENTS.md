@@ -63,35 +63,70 @@ pytest tests/thumb/armv8m/ -v             # assembler tests
 ## Compilation Pipeline
 
 ```
-C Source → Preprocessor (tccpp.c)
-         → Parser + type checker (tccgen.c)
-         → IR generation (tccir.h / ir/core.c)
+C Source → Preprocessor (source/frontend/tccpp.c)
+         → Parser + type checker (source/frontend/gen/)
+         → IR generation (source/ir/tccir.h, source/ir/gen/)
          → IR optimizations (source/opt/)
-         → Register allocation (tcls.c + ir/live.c)
-         → Thumb-2 code gen (arm-thumb-gen.c)
-         → ELF output (tccelf.c, tccld.c)
+         → Register allocation (source/machine/tccls.c + source/ir/regalloc.c)
+         → Thumb-2 code gen (source/backend/arch/arm/thumb/arm-thumb-gen.c)
+         → ELF output (source/obj/tccelf.c, source/obj/tccld.c)
 ```
+
+## Source Tree
+
+All compiler code lives under `source/`, one directory per module. Each module
+owns its headers, carries its own `Makefile`, and builds to its own static
+library; the top-level `Makefile` includes those module Makefiles and links the
+libraries into `armv8m-tcc`. The repo root holds only build inputs
+(`configure`, `config.mak`, `conftest.c`), generated headers (`tccdefs_.h`,
+`tccdecls_.h`), shipped headers (`include/`), and project metadata.
+
+| Module | Library | Contents |
+|--------|---------|----------|
+| `source/include/` | — | `tcc.h` (the umbrella header) and `tcctypes.h` |
+| `source/driver/` | `libtccdriver.a` | `tcc.c` (CLI main), `tcctools.c` (ar/tool dispatch, `#include`d by `tcc.c`), `libtcc.c` (TCCState, options, compile/link driver), `libtcc.h` |
+| `source/frontend/` | `libfrontend.a` | `tccpp.c` (preprocessor/tokenizer), `tccasm.c` (GAS asm frontend), `svalue.c`, `tcctok.h`, and `gen/` — the parser / type checker / IR emission |
+| `source/ir/` | `libir.a` | Target-independent IR: pool, CFG, SSA, codegen dispatch, SSA regalloc, `tccir_operand.c`, and `gen/` (instruction emission) |
+| `source/opt/` | `libopt.a` | The whole optimizer: `include/`, `util/`, `analysis/`, `engine/`, `flat/`, `ssa/`, `ra/`, `framework/` |
+| `source/machine/` | `libmachine.a` | The generic backend boundary: `tccls.c` (linear scan), `tccmachine.c`, `tcc_target.h`, `tccabi.h` |
+| `source/obj/` | `libobj.a` | `tccelf.c`, `tccld.c` (linker scripts), `tccyaff.c` (YAFF flat format), `tccdbg.c` (DWARF/STABS), `elf.h`, `dwarf.h`, `stab.h` |
+| `source/support/` | `libsupport.a` | `tccdebug.c` (SValue/Sym printers for gdb), `log.h`, `tcc-chained-hash.h`, `tccdbgenv.h` |
+| `source/memory/` | `libmemory.a` | `vector.c`, `unique_ptr.c` and the container headers |
+| `source/utils/` | — | Header-only helpers (`defer.h`) |
+| `source/backend/` | `libarm.a`, `libgenerators.a` | `arch/arm/` (+ `thumb/`, `fpu/`) and the generic `generators/` |
+
+The module libraries are linked `--whole-archive`. That is load-bearing, not
+cosmetic: several TUs are referenced by nothing (the gdb pretty-printers, opt
+passes not yet wired into the pipeline table), and an ordinary archive link
+drops them silently — 53 symbols and 67 KB of `.text` on the first attempt.
+`ARCH_LIB` deliberately stays outside the group so its orphaned members keep
+being dropped as before.
+
+Adding a module: create `source/<name>/` with a `Makefile` defining
+`<NAME>_INC` / `<NAME>_SRC` / `<NAME>_HDRS`, an object rule, and a
+`$(<NAME>_LIB): $(<NAME>_OBJ)` rule whose recipe is `$(ar-lib)`. Then add the
+`include` line and the `_INC` / `_LIB` / `_SRC` references to the top-level
+`Makefile`. Include order matters — see the comment above the include block.
 
 ## Code Architecture
 
-### IR Subsystem (`ir/`)
+### IR Subsystem (`source/ir/`)
 
-Internal IR modules — included via `ir/ir.h`, not part of public API. Public
-IR interface is `tccir.h`.
+Internal IR modules — included via `source/ir/ir.h`, not part of public API.
+Public IR interface is `source/ir/tccir.h`.
 
 | File | Role |
 |------|------|
-| `source/opt/` | The whole optimizer: `include/` (interface headers), `util/`, `analysis/`, `engine/`, `flat/`, `ssa/`, `ra/`, `framework/` |
-| `ir/core.c` | IR construction and manipulation |
-| `ir/live.c` | Liveness analysis for register allocation |
-| `ir/mat.c` | Value materialization (reg/memory allocation) |
-| `ir/codegen.c` | Central dispatch: unified two-pass loop (dry-run + real-run) routing IR ops to backend `_mop` handlers |
-| `ir/vreg.c` | Virtual register management |
-| `ir/stack.c` | Stack frame layout |
+| `source/ir/gen/` | IR construction and manipulation (the former `ir/core.c`) |
+| `source/ir/gen/live.c` | Liveness analysis for register allocation |
+| `source/ir/codegen.c` | Central dispatch: unified two-pass loop (dry-run + real-run) routing IR ops to backend `_mop` handlers |
+| `source/ir/regalloc.c` | SSA register allocator, parameterized by `RegAllocTarget` |
+| `source/ir/vreg.c` | Virtual register management |
+| `source/ir/stack.c` | Stack frame layout |
 
 IR naming conventions:
 - Internal functions: `ir_<module>_<action>()` (static)
-- Public API (in `tccir.h`): `tcc_ir_<action>()`
+- Public API (in `source/ir/tccir.h`): `tcc_ir_<action>()`
 
 ### IR Opcodes
 
@@ -104,8 +139,8 @@ Defined in `tccir.h` as `TccIrOp` enum. Key opcode groups:
 
 ### Register Allocation
 
-Two-phase in `tccls.c`:
-1. Liveness analysis (`ir/live.c`) — compute live ranges
+Two-phase in `source/machine/tccls.c`:
+1. Liveness analysis (`source/ir/gen/live.c`) — compute live ranges
 2. Linear scan — assign physical registers (r0–r12), spill overflow
 
 ARM AAPCS: r0–r3 for first 4 arguments; caller-saved r0–r3, r12, lr;
@@ -144,7 +179,7 @@ make CFLAGS+='-DTCC_LOG_IV_SR=1'        # induction variable / strength reductio
 make CFLAGS+='-DTCC_LOG_LICM=1'         # loop-invariant code motion
 make CFLAGS+='-DTCC_LOG_LS=1'           # linear scan register allocator
 make CFLAGS+='-DTCC_LOG_STACK_ALLOC=1'  # stack frame allocation
-make CFLAGS+='-DTCC_LOG_CODEGEN=1'      # frontend code generation (tccgen.c)
+make CFLAGS+='-DTCC_LOG_CODEGEN=1'      # frontend code generation (source/frontend/gen/)
 make CFLAGS+='-DTCC_LOG_INLINE_STRUCT=1' # inline struct return expansion
 make CFLAGS+='-DTCC_LOG_CALLSITE=1'     # call site processing
 make CFLAGS+='-DTCC_LOG_YAFF=1'         # YAFF object format
@@ -172,6 +207,53 @@ At runtime:
 ./armv8m-tcc -dump-ir -c test.c     # dump IR
 ./armv8m-tcc -vv -c test.c          # verbose output
 ```
+
+### Debug env knobs (`tccdbgenv.h`)
+
+The ~30 `getenv`-driven knobs — pass-disable switches for bisecting a miscompile
+(`TCC_DISABLE_PASS`, `TCC_NO_COALESCE`, …), A/B levers an optimization decision
+was priced with (`TCC_NO_REHEARSAL`, `TCC_KEEP_FWD_DRY`, …) and pure traces
+(`DBG_CLINL`, `DUMP_IR_CG`, `SCAN_OVERLAP`, …) — go through **`tccdbgenv.h`**.
+**Never call `getenv` directly from compiler code**: a raw call is unlatched (so
+it re-walks `environ` inside a per-pass loop) and it survives into the release
+binary. Declare the knob instead, next to the code it gates:
+
+```c
+TCC_DBG_ENV_FLAG(cg_no_rehearsal, "TCC_NO_REHEARSAL")   /* set / not set  */
+TCC_DBG_ENV_STR (pass_disable_list, "TCC_DISABLE_PASS") /* value or NULL  */
+TCC_DBG_ENV_INT (ra_coalesce_env_level, "TCC_COALESCE", 2) /* int + default */
+
+TCC_DBG_TRACE(cg_no_rehearsal, (stderr, "skipping: %s\n", name)); /* fprintf */
+TCC_DBG_BLOCK(cg_dump_ir_cg) { tcc_ir_show(ir); }                 /* block   */
+```
+
+Each expands to a latched `static inline` accessor. `CONFIG_TCC_DEBUG_ENV=0`
+turns them into compile-time constants (`0` / `NULL` / the default), so the
+guarded code is dead and the lookups are gone; `TCC_DBG_TRACE` bodies vanish in
+the preprocessor, so they go at any `-O` level. Two symbols with no natural home
+in a single TU — `dbg_scan_overlap` / `dbg_scan_imm_dest` and
+`tcc_ir_opt_pass_disabled` — are declared in `tccir.h` so the release no-op
+reaches every call site and the *calls* disappear too, not just the bodies.
+
+Build settings:
+
+| build | knobs |
+|---|---|
+| `make cross` (default, `CONFIG_TCC_DEBUG` on) | **on** — the host bisect tooling works unchanged |
+| `make cross CONFIG_debugenv=no` | off |
+| `make cross CONFIG_minimal=yes` | off (no `CONFIG_TCC_DEBUG`) |
+| `build_rootfs.sh` cross stage | on |
+| `build_rootfs.sh` native/device stage | **off** |
+| `build_rootfs.sh --debug-tcc` | on everywhere |
+
+Measured on the armv8m device compiler: `.text` 1,451,584 → 1,437,000
+(−14,584 B), `.rodata` −2,360 B, file −17,272 B; `getenv` calls 27.1 → 3.0 per
+compile; output byte-identical over 1,545 corpus compiles (`tests/ir_tests`,
+−O0/−O1/−O2).
+
+**Consequence:** on a release device compiler `TCC_PASS_TIMING=1` (e.g. via
+`YASOS_TCC_ENV_PREFIX`) no longer produces the PASS_TIME table — use `-bench`,
+which drives the same instrumentation through `tcc_state->do_bench`.
 
 ## Debugging an Optimizer Miscompilation
 

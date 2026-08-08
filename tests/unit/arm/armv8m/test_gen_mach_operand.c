@@ -16,7 +16,7 @@
 #include "source/backend/arch/arm/thumb/thop_mem_imm.h"
 #include "source/backend/arch/arm/thumb/thop_mov.h"
 #include "source/backend/arch/arm/thumb/thop_alu_imm.h"
-#include "ir/machine_op.h"
+#include "source/ir/machine_op.h"
 
 extern int offset_to_args;
 #include "codegen_backend_stubs.h"

@@ -74,10 +74,19 @@ static void pipeline_apply_invalidations(IROptCtx *ctx, uint32_t invalidates)
   tcc_ir_opt_ctx_invalidate(ctx);
 }
 
-void dbg_scan_overlap(TCCIRState *ir, const char *pass);
+#if CONFIG_TCC_DEBUG_ENV
+
+/* Both scans below run after every pass of every function, and in a normal run
+ * the getenv IS the whole call: glibc's is a linear walk of environ with a
+ * strncmp per entry, which made getenv 5.4% of the instructions in a 600-file
+ * corpus compile.  Hence the latch -- and hence the #if, which drops the calls
+ * too (the no-op macros live next to the declarations in tccir.h). */
+TCC_DBG_ENV_FLAG(dbg_scan_overlap_on, "SCAN_OVERLAP")
+TCC_DBG_ENV_FLAG(dbg_scan_imm_dest_on, "SCAN_IMM_DEST")
+
 void dbg_scan_overlap(TCCIRState *ir, const char *pass)
 {
-  if (!getenv("SCAN_OVERLAP"))
+  if (!dbg_scan_overlap_on())
     return;
   int n = ir->next_instruction_index;
   for (int a = 0; a < n; a++) {
@@ -101,10 +110,9 @@ void dbg_scan_overlap(TCCIRState *ir, const char *pass)
   }
 }
 
-void dbg_scan_imm_dest(TCCIRState *ir, const char *pass);
 void dbg_scan_imm_dest(TCCIRState *ir, const char *pass)
 {
-  if (!getenv("SCAN_IMM_DEST"))
+  if (!dbg_scan_imm_dest_on())
     return;
   for (int i = 0; i < ir->next_instruction_index; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -120,6 +128,8 @@ void dbg_scan_imm_dest(TCCIRState *ir, const char *pass)
     }
   }
 }
+
+#endif /* CONFIG_TCC_DEBUG_ENV */
 
 /* Per-pass dirty tracking (docs/plans/opt_pass_dedup_and_perf.md, 1.2).
  *

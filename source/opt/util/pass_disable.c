@@ -15,15 +15,14 @@
 #include "ir.h"
 #include "opt_utils.h"
 
+#if CONFIG_TCC_DEBUG_ENV
+
+TCC_DBG_ENV_STR(pass_disable_list, "TCC_DISABLE_PASS")
+
 /* Bisection helper: TCC_DISABLE_PASS is a comma/space separated pass-name list. */
 int tcc_ir_opt_pass_disabled(const char *name)
 {
-  static const char *disabled = NULL;
-  static int checked = 0;
-  if (!checked) {
-    checked = 1;
-    disabled = getenv("TCC_DISABLE_PASS");
-  }
+  const char *disabled = pass_disable_list();
   if (!disabled || !name)
     return 0;
   const char *p = disabled;
@@ -42,3 +41,5 @@ int tcc_ir_opt_pass_disabled(const char *name)
   }
   return 0;
 }
+
+#endif /* CONFIG_TCC_DEBUG_ENV */

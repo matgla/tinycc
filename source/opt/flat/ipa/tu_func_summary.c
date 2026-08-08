@@ -326,6 +326,8 @@ int tcc_ir_call_may_write(TCCIRState *ir, int call_idx, MemLoc L)
   return tu_modref_walk(callee, L);
 }
 
+TCC_DBG_ENV_FLAG(tu_modref_dbg, "TCC_MODREF_DBG")
+
 void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
 {
   if (!ir || !func_sym)
@@ -335,7 +337,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
 
   TuFuncSummary *s = tcc_mallocz(sizeof(*s));
   s->func_sym = func_sym;
-  int tu_dbg = getenv("TCC_MODREF_DBG") != NULL;
+  const int tu_dbg = tu_modref_dbg();
 
   const int n = ir->next_instruction_index;
   int writes_any_static = 0;

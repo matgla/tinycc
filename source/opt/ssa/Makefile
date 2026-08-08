@@ -102,8 +102,8 @@ SSA_OPT_HDRS = \
 	source/opt/ssa/loop/loop_cand.h \
 	source/opt/ssa/include/opt/ssa/ssa_opt_helpers.h \
 	$(OPT_DSL_HEADERS) \
-	tcc.h tccir.h ir/ir.h source/opt/ssa/include/ssa_opt.h source/opt/include/opt_utils.h
+	source/include/tcc.h source/ir/tccir.h source/ir/ir.h source/opt/ssa/include/ssa_opt.h source/opt/include/opt_utils.h
 
-$(X)source/opt/ssa/%.o: source/opt/ssa/%.c $(SSA_OPT_HDRS) config.mak
+$(X)source/opt/ssa/%.o: source/opt/ssa/%.c $(SSA_OPT_HDRS) $(TCC_CORE_DEPS)
 	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))

@@ -41,6 +41,33 @@ static int fail_by_op[2][FP_OP_COUNT];
 static int fail_by_op_subnormal[2][FP_OP_COUNT];
 static int total_by_op[2][FP_OP_COUNT];
 
+/* Vectors whose divergence is the documented flush-to-zero deviation rather
+ * than a defect (see below).  Reported only alongside real failures: a clean
+ * run's output has to stay the three lines 421_fp_conformance.expect matches,
+ * and that one file has to serve both the soft-float and the DCP build. */
+static int tolerated_ftz;
+
+/* The RP2350 double coprocessor flushes subnormal operands and results to zero
+ * and offers no path that doesn't -- pico-sdk's own double_aeabi_dcp.S behaves
+ * identically and says so.  docs/userspace_floating_point.md documents this as
+ * the accepted trade-off of CONFIG_BUILD_USERSPACE_HARDWARE_FP on that part.
+ *
+ * So on a DCP build a double-bank mismatch with a subnormal operand or
+ * reference result is expected behaviour, and counting it as a failure would
+ * leave this gate permanently red -- which costs more than it catches, because
+ * a red gate stops reporting the divergences that ARE defects.  Those still
+ * fail: the tolerance is exactly "one of the values involved is subnormal",
+ * nothing wider, and single precision (FPv5-SP, fully IEEE) is never
+ * tolerated.  tcc defines the macro only for -mfpu=rp2350.
+ *
+ * The benchmark runner reaches the same conclusion from the outside with
+ * `tests/benchmarks/run_fp_conformance.py --allow-ftz`. */
+#ifdef __TCC_DOUBLE_FLUSHES_SUBNORMALS__
+#define FP_TOLERATE_SUBNORMAL_DOUBLE 1
+#else
+#define FP_TOLERATE_SUBNORMAL_DOUBLE 0
+#endif
+
 static int d_is_subnormal_bits(uint64_t b)
 {
   return ((b >> 52) & 0x7FFu) == 0 && (b & 0x000FFFFFFFFFFFFFull) != 0;
@@ -217,8 +244,14 @@ int fp_conformance_run_double(void)
     {
       /* the payload is unspecified; only NaN-ness is required */
       int ok = (v->op == FPOP_NARROW) ? f_is_nan_bits((uint32_t)got) : d_is_nan_bits(got);
-      tally(FP_BANK_D, v->op, !ok, sub);
-      if (!ok)
+      int bad = !ok;
+      if (bad && sub && FP_TOLERATE_SUBNORMAL_DOUBLE)
+      {
+        tolerated_ftz++;
+        bad = 0;
+      }
+      tally(FP_BANK_D, v->op, bad, sub);
+      if (bad)
       {
         failures++;
         fail_d(i, v, got);
@@ -226,11 +259,19 @@ int fp_conformance_run_double(void)
       continue;
     }
 
-    tally(FP_BANK_D, v->op, got != v->r, sub);
-    if (got != v->r)
     {
-      failures++;
-      fail_d(i, v, got);
+      int bad = (got != v->r);
+      if (bad && sub && FP_TOLERATE_SUBNORMAL_DOUBLE)
+      {
+        tolerated_ftz++;
+        bad = 0;
+      }
+      tally(FP_BANK_D, v->op, bad, sub);
+      if (bad)
+      {
+        failures++;
+        fail_d(i, v, got);
+      }
     }
   }
 
@@ -324,6 +365,7 @@ int fp_conformance_run(void)
   int fd, ff;
 
   reported = 0;
+  tolerated_ftz = 0;
   memset(fail_by_op, 0, sizeof(fail_by_op));
   memset(fail_by_op_subnormal, 0, sizeof(fail_by_op_subnormal));
   memset(total_by_op, 0, sizeof(total_by_op));
@@ -351,6 +393,8 @@ int fp_conformance_run(void)
      * accept that deviation (--allow-ftz) while still failing on anything
      * else, so the gate stays meaningful instead of permanently red. */
     printf("FP conformance: %d of %d failures involve subnormals\r\n", sub, fd + ff);
+    if (tolerated_ftz)
+      printf("FP conformance: %d subnormal double deviations tolerated (flush-to-zero build)\r\n", tolerated_ftz);
   }
 
   printf("FP conformance: double %d failed / %d, float %d failed / %d\r\n", fd, FP_VECTORS_D_COUNT, ff,

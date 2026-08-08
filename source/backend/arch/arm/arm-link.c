@@ -22,6 +22,7 @@ ST_FUNC int code_reloc(int reloc_type)
   case R_ARM_GOTOFF:
   case R_ARM_RODATA_OFF:
   case R_ARM_GOT32:
+  case R_ARM_GOT_SBREL12:
   case R_ARM_GOT_PREL:
   case R_ARM_COPY:
   case R_ARM_GLOB_DAT:
@@ -95,6 +96,7 @@ ST_FUNC int gotplt_entry_type(int reloc_type)
     return BUILD_GOT_ONLY;
 
   case R_ARM_GOT32:
+  case R_ARM_GOT_SBREL12:
   case R_ARM_GOT_PREL:
     return ALWAYS_GOTPLT_ENTRY;
   }
@@ -590,6 +592,24 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     /* we load the got offset */
     write32le(ptr, get_sym_attr(s1, sym_index, 0)->got_offset);
     return;
+  case R_ARM_GOT_SBREL12:
+  {
+    /* Patch the GOT slot offset into the imm12 of `ldr.w Rt,[r9,#imm12]`
+     * (T3: hw1 = 0xF8D0|Rn, hw2 = Rt<<12|imm12, each stored little-endian). */
+    unsigned long got_offset = get_sym_attr(s1, sym_index, 0)->got_offset;
+    if (got_offset > 0xfff)
+    {
+      const char *name = (const char *)symtab_section->link->data + sym->st_name;
+      tcc_error_noabort("GOT slot for '%s' at offset %lu exceeds the 4096-byte "
+                        "SB-relative range; rebuild this module with "
+                        "-mno-sb-relative-got",
+                        name, got_offset);
+      return;
+    }
+    /* imm12 is bits 0-11 of hw2, i.e. bits 16-27 of the little-endian word. */
+    write32le(ptr, (read32le(ptr) & ~(0xfffu << 16)) | ((uint32_t)got_offset << 16));
+    return;
+  }
   case R_ARM_GOT_PREL:
     /* we load the pc relative got offset */
     write32le(ptr, s1->got->sh_addr + get_sym_attr(s1, sym_index, 0)->got_offset - addr - 8);

@@ -2,7 +2,9 @@
 
 ## Project Overview
 
-Specialized TinyCC fork targeting **ARMv8-M** (Cortex-M33) Thumb-2. IR-based pipeline: C source → preprocessor (`tccpp.c`) → parser (`tccgen.c`) → IR (`tccir.h`, `ir/core.c`) → optimizations (`ir/opt.c`, `source/opt/flat/loop/licm.c`) → register allocation (`tccls.c`, `ir/live.c`) → Thumb-2 codegen (`arm-thumb-gen.c`) → ELF (`tccelf.c`).
+Specialized TinyCC fork targeting **ARMv8-M** (Cortex-M33) Thumb-2. IR-based pipeline: C source → preprocessor (`source/frontend/tccpp.c`) → parser (`source/frontend/gen/`) → IR (`source/ir/tccir.h`, `source/ir/gen/`) → optimizations (`source/opt/`) → register allocation (`source/machine/tccls.c`, `source/ir/regalloc.c`) → Thumb-2 codegen (`source/backend/arch/arm/thumb/arm-thumb-gen.c`) → ELF (`source/obj/tccelf.c`).
+
+All compiler code lives under `source/`, one module per directory, each with its own Makefile and static library. See the Source Tree table in `AGENTS.md`.
 
 ## Build & Test
 
@@ -19,14 +21,14 @@ Single-file testing: `cd tests/ir_tests && python run.py -c mytest.c` (add `--du
 
 | File | Role |
 |---|---|
-| `tccgen.c` | C parser + type system (largest file) |
-| `arm-thumb-gen.c` | IR → Thumb-2 backend (~12k lines) |
-| `ir/codegen.c` | Central dispatch: routes IR ops to backend handlers |
-| `ir/machine_op.h` | `MachineOperand` type (8 kinds: REG, SPILL, IMM, FRAME_ADDR, SYMBOL, PARAM_STACK, CHAIN_REL, NONE) |
-| `ir/machine_op.c` | `machine_op_from_ir()` — converts IROperand to MachineOperand |
-| `tccls.c` | Linear-scan register allocator |
-| `arm-thumb-callsite.c` | AAPCS call-site layout builder |
-| `arch/arm_aapcs.c` | ARM procedure call standard |
+| `source/frontend/gen/` | C parser + type system (split across 13 subdirectories) |
+| `source/backend/arch/arm/thumb/arm-thumb-gen.c` | IR → Thumb-2 backend (~12k lines) |
+| `source/ir/codegen.c` | Central dispatch: routes IR ops to backend handlers |
+| `source/ir/machine_op.h` | `MachineOperand` type (8 kinds: REG, SPILL, IMM, FRAME_ADDR, SYMBOL, PARAM_STACK, CHAIN_REL, NONE) |
+| `source/ir/machine_op.c` | `machine_op_from_ir()` — converts IROperand to MachineOperand |
+| `source/machine/tccls.c` | Linear-scan register allocator |
+| `source/backend/arch/arm/thumb/arm-thumb-callsite.c` | AAPCS call-site layout builder |
+| `source/backend/arch/arm/arm_aapcs.c` | ARM procedure call standard |
 
 ## Architecture Patterns
 
@@ -36,7 +38,7 @@ Backend functions follow a dual naming convention during the ongoing materializa
 - `tcc_gen_machine_<op>_mop(MachineOperand ...)` — **new** MachineOperand-based handlers (preferred)
 - `tcc_gen_machine_<op>_op(IROperand ...)` — **legacy** IROperand-based handlers (being removed)
 
-All backend handler declarations live in `tcc.h` (~line 2114+). New code should use `_mop` variants exclusively.
+All backend handler declarations live in `source/include/tcc.h` (~line 2114+). New code should use `_mop` variants exclusively.
 
 ### IR Dispatch (ir/codegen.c)
 

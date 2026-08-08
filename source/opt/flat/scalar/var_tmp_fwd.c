@@ -135,6 +135,15 @@ OPT_GEN_FLAT(var_tmp_fwd, -1)
   if (TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_VAR)
     return 0;
 
+  /* `V***DEREF*** <- T` stores T through the pointer V; it does NOT define V.
+   * Forwarding off it replaces every later *read* of the pointer with the value
+   * that was written through it. In `*(rr = *rd) = ++cnt; rr[i] = x;` that
+   * turned the base of the indexed stores from rr into cnt, so they wrote to
+   * the absolute address cnt + offset (toybox save_redirect, ir_test 439).
+   * The src side is already guarded below for the mirror-image reason. */
+  if (irop_op_is_lval(dest))
+    return 0;
+
   {
     IRLiveInterval *interval = tcc_ir_get_live_interval(ir, dest_vr);
     if (interval && interval->is_volatile)

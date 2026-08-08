@@ -98,12 +98,16 @@ UT_TEST(test_get_offset_to_imported_libraries)
   memset(buf, 0, sizeof(buf));
   YaffHeader *h = (YaffHeader *)buf;
   h->alignment = 4;
+  /* The architecture section sits between the name and the library table. */
+  const uint32_t arch_len = (uint32_t)sizeof(YaffArchSection);
+  UT_ASSERT_EQ(arch_len % 4u, 0u);
+
   strcpy(buf + sizeof(YaffHeader), "bar"); /* len 4 incl null -> aligned 4 */
-  uint32_t expected = (uint32_t)sizeof(YaffHeader) + 4;
+  uint32_t expected = (uint32_t)sizeof(YaffHeader) + 4 + arch_len;
   UT_ASSERT_EQ(tcc_get_offset_to_imported_libraries(h), expected);
 
   strcpy(buf + sizeof(YaffHeader), "b"); /* len 2 incl null -> aligned 4 */
-  expected = (uint32_t)sizeof(YaffHeader) + 4;
+  expected = (uint32_t)sizeof(YaffHeader) + 4 + arch_len;
   UT_ASSERT_EQ(tcc_get_offset_to_imported_libraries(h), expected);
   return 0;
 }
@@ -592,6 +596,115 @@ UT_TEST(test_output_yaff_minimal_header)
   fseek(f, sizeof(YaffHeader), SEEK_SET);
   UT_ASSERT_EQ(fread(name, 1, sizeof("minimal.yaff"), f), sizeof("minimal.yaff"));
   UT_ASSERT_STREQ(name, "minimal.yaff");
+
+  fclose(f);
+  unlink(path);
+  ut_yaff_teardown_output_state();
+  return 0;
+}
+
+/* Read the architecture section the header points at. Offset 0 lands inside
+ * the header, so it also means "absent"; the callers assert it is not 0. */
+static void ut_yaff_read_arch_section(FILE *f, const YaffHeader *h, YaffArchSection *out)
+{
+  memset(out, 0, sizeof(*out));
+  if (h->arch_section_offset == 0)
+  {
+    fprintf(stderr, "header carries no architecture section\n");
+    return;
+  }
+  fseek(f, h->arch_section_offset, SEEK_SET);
+  if (fread(out, sizeof(YaffArchSection), 1, f) != 1u)
+  {
+    fprintf(stderr, "fread of YaffArchSection failed\n");
+    memset(out, 0, sizeof(*out));
+  }
+}
+
+UT_TEST(test_output_yaff_arch_section_soft_float)
+{
+  ut_yaff_setup_minimal_output_state();
+  tcc_state->float_abi = ARM_SOFT_FLOAT;
+  tcc_state->fpu_type = ARM_FPU_RP2350; /* -mfloat-abi=soft overrides -mfpu */
+
+  char path[] = "/tmp/tccyaff_ut_out_arch_soft_XXXXXX";
+  FILE *f = ut_yaff_open_temp(path);
+
+  UT_ASSERT_EQ(tcc_output_yaff(tcc_state, f, "soft.yaff"), 0);
+
+  YaffHeader h;
+  ut_yaff_read_header(f, &h);
+  UT_ASSERT_EQ(h.yaff_version, (uint8_t)YAFF_VERSION);
+  UT_ASSERT_EQ(h.arch, (uint16_t)YAFF_ARCH_ARMV8_M);
+  UT_ASSERT_NE(h.arch_section_offset, 0u);
+
+  YaffArchSection a;
+  ut_yaff_read_arch_section(f, &h, &a);
+  UT_ASSERT_EQ(a.size, (uint16_t)sizeof(YaffArchSection));
+  UT_ASSERT_EQ(a.arch, (uint8_t)YAFF_ARCH_ARMV8_M);
+  UT_ASSERT_EQ(a.float_abi, (uint8_t)YAFF_FLOAT_ABI_SOFT);
+  UT_ASSERT_EQ(a.fpu, (uint8_t)YAFF_FPU_NONE);
+  UT_ASSERT_EQ(a.required_features, 0u);
+
+  fclose(f);
+  unlink(path);
+  ut_yaff_teardown_output_state();
+  return 0;
+}
+
+UT_TEST(test_output_yaff_arch_section_rp2350)
+{
+  ut_yaff_setup_minimal_output_state();
+  tcc_state->float_abi = ARM_SOFTFP_FLOAT;
+  tcc_state->fpu_type = ARM_FPU_RP2350;
+
+  char path[] = "/tmp/tccyaff_ut_out_arch_dcp_XXXXXX";
+  FILE *f = ut_yaff_open_temp(path);
+
+  UT_ASSERT_EQ(tcc_output_yaff(tcc_state, f, "dcp.yaff"), 0);
+
+  YaffHeader h;
+  ut_yaff_read_header(f, &h);
+
+  YaffArchSection a;
+  ut_yaff_read_arch_section(f, &h, &a);
+  UT_ASSERT_EQ(a.float_abi, (uint8_t)YAFF_FLOAT_ABI_SOFTFP);
+  UT_ASSERT_EQ(a.fpu, (uint8_t)YAFF_FPU_RP2350);
+  /* The DCP is required even though nothing here inlines a DCP sequence: the
+   * image links librp2350fp, which runs them. */
+  UT_ASSERT_EQ(a.required_features, (uint32_t)(YAFF_ARCH_FEATURE_FPU_SP | YAFF_ARCH_FEATURE_DCP));
+
+  /* The section sits between the object name and the imported-library table,
+   * and leaves that table aligned. */
+  UT_ASSERT_EQ(h.arch_section_offset, (uint16_t)(sizeof(YaffHeader) + tcc_yaff_align(&h, sizeof("dcp.yaff"))));
+  UT_ASSERT_EQ(h.imported_libraries_offset,
+               (uint16_t)(h.arch_section_offset + tcc_yaff_align(&h, sizeof(YaffArchSection))));
+  UT_ASSERT_EQ(h.imported_libraries_offset % h.alignment, 0u);
+
+  fclose(f);
+  unlink(path);
+  ut_yaff_teardown_output_state();
+  return 0;
+}
+
+UT_TEST(test_output_yaff_arch_section_single_precision_only)
+{
+  ut_yaff_setup_minimal_output_state();
+  tcc_state->float_abi = ARM_SOFTFP_FLOAT;
+  tcc_state->fpu_type = ARM_FPU_FPV5_SP_D16;
+
+  char path[] = "/tmp/tccyaff_ut_out_arch_sp_XXXXXX";
+  FILE *f = ut_yaff_open_temp(path);
+
+  UT_ASSERT_EQ(tcc_output_yaff(tcc_state, f, "sp.yaff"), 0);
+
+  YaffHeader h;
+  ut_yaff_read_header(f, &h);
+
+  YaffArchSection a;
+  ut_yaff_read_arch_section(f, &h, &a);
+  UT_ASSERT_EQ(a.fpu, (uint8_t)YAFF_FPU_FPV5_SP_D16);
+  UT_ASSERT_EQ(a.required_features, (uint32_t)YAFF_ARCH_FEATURE_FPU_SP);
 
   fclose(f);
   unlink(path);

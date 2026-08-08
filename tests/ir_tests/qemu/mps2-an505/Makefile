@@ -108,6 +108,10 @@ CRT_LIBS =
 ifneq (,$(findstring armv8m-tcc,$(CC)))
 CFLAGS += -I$(LIBC_INCLUDES) -I$(LIBC_IMPORTS) -I$(NEWLIB_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
 TCC_FLAGS += -B$(TCC_PATH)
+# These images are bare metal: nothing sets up a GOT base in R9, so the
+# SB-relative addressing a YASOS build defaults to has no runtime to back it.
+# Coverage for it lives in the yasos.zig QEMU smoke, which has the loader.
+TCC_FLAGS += -mno-sb-relative-got
 LDFLAGS += -B$(TCC_PATH)
 
 # `-lsoftfp` resolves to lib/fp/libsoftfp.so (the yaff shared object) before

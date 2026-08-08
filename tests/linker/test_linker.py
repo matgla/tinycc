@@ -7,6 +7,7 @@ linker/ELF output; if the format changes the tests should be flipped to lock
 in the new layout.
 """
 
+import functools
 import re
 import subprocess
 from pathlib import Path
@@ -35,10 +36,36 @@ def _base_cflags():
     ]
 
 
-def _compile_to_object(name, subdir, extra_cflags=()):
-    """Cross-compile a case in <subdir>/<name>.c to a relocatable object."""
+@functools.lru_cache(maxsize=None)
+def _compiler_targets_yasos():
+    """True when the cross compiler was built with -DTARGETOS_YasOS=1.
+
+    Two differently configured builds land at the same paths: build_rootfs.sh
+    passes -DTARGETOS_YasOS=1, a plain `make cross` does not.  tcc_new() turns
+    PIC, text/data separation and the SB-relative GOT on only for the YasOS
+    build, so the same source gets different relocations from each.  Probing a
+    predefine keeps the check independent of the relocations under test -- the
+    alternative (compiling and looking at what came out) would assert nothing.
+    """
+    result = subprocess.run(
+        [str(TCC), "-dM", "-E", "-xc", "/dev/null"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    assert result.returncode == 0, f"predefine probe failed: {result.stderr}"
+    return "__YasOS__" in result.stdout
+
+
+def _compile_to_object(name, subdir, extra_cflags=(), obj_name=None):
+    """Cross-compile a case in <subdir>/<name>.c to a relocatable object.
+
+    obj_name overrides the object's basename so that one case compiled several
+    ways (different -m flags) does not overwrite its own output.
+    """
     src = LINKER_DIR / subdir / f"{name}.c"
-    obj = BUILD_DIR / subdir / f"{name}.o"
+    obj = BUILD_DIR / subdir / f"{obj_name or name}.o"
     obj.parent.mkdir(parents=True, exist_ok=True)
 
     cflags = _base_cflags() + ["-c"] + list(extra_cflags)
@@ -227,6 +254,21 @@ def _objdump_sections(obj):
 # -----------------------------------------------------------------------------
 # relocations/
 # -----------------------------------------------------------------------------
+# How an external/global data reference is addressed is a property of the
+# addressing mode, and the mode is selected by flags whose defaults differ
+# between compiler builds (see _compiler_targets_yasos).  Naming the mode on
+# the command line is what makes the expected relocation exact:
+#   R_ARM_GOT_BREL    - GOT offset in a literal pool word (R_ARM_GOT32).
+#   R_ARM_GOT_SBREL12 - GOT offset in the imm12 of `ldr.w Rt,[r9,#imm12]`.
+#     Private to this toolchain, and it reuses ABI value 138, so readelf names
+#     it by the ARM ABI meaning of that number: R_ARM_THM_BF18.
+GOT_ENCODINGS = [
+    ("litpool", ["-mno-sb-relative-got"], "R_ARM_GOT_BREL"),
+    ("sbrel12", ["-msb-relative-got"], "R_ARM_THM_BF18"),
+]
+GOT_DATA_RELOCS = {enc[2] for enc in GOT_ENCODINGS}
+
+
 @pytest.mark.linker
 @pytest.mark.linker_reloc
 def test_relocation_global_external():
@@ -240,12 +282,51 @@ def test_relocation_global_external():
     assert "R_ARM_THM_JUMP24" in types, f"expected R_ARM_THM_JUMP24, got {types}"
     assert by_name.get("external_func") == "R_ARM_THM_JUMP24"
 
-    # External/global data should use absolute 32-bit relocations.
-    assert "R_ARM_ABS32" in types, f"expected R_ARM_ABS32, got {types}"
-    assert by_name.get("external_var") == "R_ARM_ABS32"
-    assert by_name.get("global_var") == "R_ARM_ABS32"
+    # With no -m flags the data reference follows the compiler's *default*
+    # mode.  A YasOS-targeted build defaults to PIC + text/data separation, so
+    # the data segment moves independently of .text and no absolute address can
+    # be baked into the code: the reference goes through the GOT.  A plain
+    # `make cross` build defaults to neither and bakes the address in.
+    if _compiler_targets_yasos():
+        expected = GOT_DATA_RELOCS
+        assert "R_ARM_ABS32" not in types, f"data should not be absolute, got {types}"
+    else:
+        expected = {"R_ARM_ABS32"}
+    assert by_name.get("external_var") in expected, f"got {by_name}"
+    assert by_name.get("global_var") in expected, f"got {by_name}"
 
     # Static data is resolved locally and should not generate a relocation.
+    assert "static_var" not in by_name
+
+
+@pytest.mark.linker
+@pytest.mark.linker_reloc
+@pytest.mark.parametrize(
+    "mode_flags, data_reloc",
+    [pytest.param(flags, reloc, id=name) for name, flags, reloc in GOT_ENCODINGS],
+)
+def test_relocation_global_external_got_encoding(mode_flags, data_reloc):
+    """External data goes through the GOT once text/data separation is on.
+
+    Both encodings are requested explicitly, so this pins the exact relocation
+    on either compiler build rather than on whichever defaults it was built
+    with -- the two produce identical objects for these flags.
+    """
+    obj = _compile_to_object(
+        "01_global_external",
+        "relocations",
+        extra_cflags=["-fpic", "-mpic-data-is-text-relative"] + mode_flags,
+        obj_name=f"01_global_external_{data_reloc}",
+    )
+    relocs = _readelf_reloc(obj)
+
+    types = {r["type"] for r in relocs}
+    by_name = {r["sym_name"]: r["type"] for r in relocs}
+
+    assert by_name.get("external_func") == "R_ARM_THM_JUMP24"
+    assert "R_ARM_ABS32" not in types, f"data should not be absolute, got {types}"
+    assert by_name.get("external_var") == data_reloc, f"got {by_name}"
+    assert by_name.get("global_var") == data_reloc, f"got {by_name}"
     assert "static_var" not in by_name
 
 
@@ -356,12 +437,14 @@ def test_function_sections():
     obj = _compile_to_object("02_function_sections", "sections")
     names = _objdump_sections(obj)
 
-    # With -ffunction-sections enabled the standard .text section still exists.
-    # This fork currently keeps all functions in the single .text section rather
-    # than emitting per-function .text.func_name subsections; if that changes
-    # this assertion should be flipped to require the subsections.
+    # With -ffunction-sections enabled the standard .text section still exists
+    # (asm blobs and nested functions land there), and every C function gets
+    # its own .text.<name> subsection so the linker's gc_sections() can drop
+    # unreferenced bodies individually.  At final link the survivors are
+    # coalesced back into one .text (coalesce_function_sections in tccelf.c).
     assert ".text" in names, f"missing .text section; sections: {names}"
-    assert ".text.func_a" not in names, f"unexpected per-function section; sections: {names}"
+    assert ".text.func_a" in names, f"missing per-function section; sections: {names}"
+    assert ".text.func_b" in names, f"missing per-function section; sections: {names}"
 
 
 @pytest.mark.linker
@@ -572,13 +655,24 @@ def test_yaff_output_structure(tinycc_root):
         module_type, arch, yaff_version = unpack_from("<BHB", data, 4)
         assert magic == b"YAFF"
         assert module_type in (1, 2)  # executable or dynamic library
-        assert arch == 1  # ARM
-        assert yaff_version == 1
+        # Format 2 carries a real instruction set in `arch` (YaffArch in
+        # tccyaff.h) instead of the "this is ARM" constant format 1 wrote, and
+        # backs it with the YaffArchSection at arch_section_offset.
+        assert arch == 4  # YAFF_ARCH_ARMV8_M
+        assert yaff_version == 2
 
-        code_length = unpack_from("<I", data, 10)[0]
-        data_length = unpack_from("<I", data, 18)[0]
-        bss_length = unpack_from("<I", data, 22)[0]
-        entry = unpack_from("<I", data, 26)[0]
+        # YaffArchSection sits at arch_section_offset (u16 at 60) and starts
+        # with its own size, so a loader can read the prefix it understands.
+        arch_section_offset = unpack_from("<H", data, 60)[0]
+        assert arch_section_offset != 0  # never 0 from format 2 on
+        section_size, section_arch = unpack_from("<HB", data, arch_section_offset)
+        assert section_size >= 12
+        assert section_arch == arch  # the section must agree with the header
+
+        code_length = unpack_from("<I", data, 8)[0]
+        data_length = unpack_from("<I", data, 16)[0]
+        bss_length = unpack_from("<I", data, 20)[0]
+        entry = unpack_from("<I", data, 24)[0]
 
         # The test program has non-empty code, data, and an entry point.
         assert code_length > 0
@@ -596,3 +690,127 @@ def test_yaff_output_structure(tinycc_root):
         )
 
     pytest.fail(f"output is neither YAFF nor ELF: {data[:16]!r}")
+
+
+@pytest.mark.linker
+@pytest.mark.linker_section
+def test_gc_sections_collects_dead_static_bodies(tinycc_root):
+    """--gc-sections over .o inputs: unreferenced static bodies vanish;
+    address-taken statics and default-visibility globals survive.
+
+    Links from a relocatable object on purpose -- that is the path the
+    self-hosted device tcc takes, and it only works because the loader keeps
+    .text.* input sections split when gc_sections is on (see
+    get_merged_section_name).  A regression to load-time folding shows up
+    here as gc_dead_static surviving.
+    """
+    obj = _compile_to_object("06_gc_sections", "sections")
+    out = BUILD_DIR / "sections" / "06_gc_sections.elf"
+    cmd = [
+        str(TCC),
+        "-nostdlib",
+        f"-B{tinycc_root}/lib",
+        f"-L{tinycc_root}/lib/fp",
+        f"-L{tinycc_root}",
+        "-Wl,--gc-sections",
+        "-Wl,-e,entry",
+        "-g",  # plain EXE output strips .symtab; -g keeps it for the asserts
+        str(obj),
+        "-o",
+        str(out),
+    ]
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
+    assert result.returncode == 0, f"link failed: {cmd}\n{result.stdout}\n{result.stderr}"
+
+    syms = {s["name"]: s for s in _readelf_syms(out)}
+
+    # Kept: the entry point, the dispatch-table target, and the export.
+    assert "entry" in syms
+    assert "gc_addr_taken" in syms, "address-taken static was collected"
+    assert "gc_exported_unused" in syms, (
+        "default-visibility global was collected -- yasld modules resolve "
+        "exports at runtime with no witnessing relocation, so exports must "
+        "be GC roots"
+    )
+
+    def collected(name):
+        """Collected symbols either disappear or carry the ABS tombstone."""
+        s = syms.get(name)
+        return s is None or s.get("ndx") == "ABS" or s["value"].lower().startswith("ffffffff")
+
+    assert collected("gc_dead_static"), f"dead static survived GC: {syms.get('gc_dead_static')}"
+    assert collected("gc_hidden_unused"), (
+        f"hidden unreferenced global survived GC: {syms.get('gc_hidden_unused')}"
+    )
+
+
+@pytest.mark.linker
+@pytest.mark.linker_section
+def test_yaff_gc_sections_got_in_range(tinycc_root):
+    """YAFF + --gc-sections: every populated GOT slot must map into the
+    module's offset space.
+
+    This is the combination no other test exercises (the QEMU harness links
+    ELF, the plain YAFF test links without GC), and it is exactly where the
+    device boot broke: debug relocations referencing SHN_ABS 0xFFFFFFFF
+    tombstones of collected code made build_got_entries fabricate
+    out-of-range GOT slots, and yasld refuses the whole module at exec time
+    ("Can't find section for GOT[n]: OffsetOutOfRange").
+    """
+    from struct import unpack_from
+
+    src = LINKER_DIR / "yaff" / "01_basic.c"
+    out = BUILD_DIR / "yaff" / "01_basic_gc.yaff"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(TCC),
+        "-O1",
+        "-nostdlib",
+        "-fvisibility=hidden",
+        "-mcpu=cortex-m33",
+        "-mthumb",
+        "-mfloat-abi=soft",
+        "-ffunction-sections",
+        "-g",  # -g is what pins/tombstones interact with; the device build uses it
+        "-Wl,--gc-sections",
+        f"-B{tinycc_root}/lib",
+        f"-L{tinycc_root}/lib/fp",
+        f"-L{tinycc_root}",
+        str(src),
+        "-o",
+        str(out),
+    ]
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
+    assert result.returncode == 0, f"link failed: {cmd}\n{result.stdout}\n{result.stderr}"
+
+    data = out.read_bytes()
+    if not data.startswith(b"YAFF"):
+        pytest.skip("cross compiler produced ELF, not YAFF (not a YasOS build)")
+
+    # Header layout per tccyaff.h (packed, little-endian).
+    code_len, init_len, data_len, bss_len, _entry = unpack_from("<5I", data, 8)
+    got_len, _gotplt_len, plt_len = unpack_from("<3I", data, 48)
+    text_off = unpack_from("<10H", data, 60)[5]
+
+    # File order per the writer: [text][plt][rodata|pad|data][got].
+    got_file_off = text_off + code_len + plt_len + data_len
+    limit = code_len + init_len + plt_len + data_len + bss_len + got_len
+
+    bad = []
+    for i in range(got_len // 8):
+        # The first three GOT entries are reserved for the loader itself
+        # (yasld skips them too) and hold values outside the offset space.
+        if i < 3:
+            continue
+        symbol_offset, word2 = unpack_from("<II", data, got_file_off + i * 8)
+        if symbol_offset != 0 and symbol_offset >= limit:
+            bad.append((i, symbol_offset, word2))
+    assert not bad, (
+        f"GOT slots outside the module offset space (limit {limit:#x}) -- "
+        f"yasld will refuse to load this module: "
+        + ", ".join(f"GOT[{i}]={so:#x}" for i, so, _ in bad[:8])
+    )

@@ -15,7 +15,6 @@
 #include "opt_utils.h"
 #include "tccir_operand.h"
 
-extern int tcc_ir_opt_pass_disabled(const char *name);
 
 /* ============================================================================
  * Bitfield unit narrowing (tcc_ir_opt_bitfield_unit_narrow)
