@@ -21,12 +21,11 @@ lib/fp/
 │   └── Makefile
 │
 └── arm/                          # ARM architecture specific
-    ├── vfpv4-sp/                # Cortex-M4F (single-precision FPU)
+    ├── vfpv4-sp/                # FPv4-SP / FPv5-SP (single-precision FPU)
     │   ├── fops.c               # Float ops (VADD.F32, VMUL.F32, etc.)
-    │   ├── fcmp.c               # Float comparison
     │   ├── conv.c               # Float conversions
-    │   ├── dops_soft.c          # Double ops (delegated to soft)
-    │   └── Makefile
+    │   └── Makefile             # + doubles and compares borrowed from soft/
+    │                            #   (self-contained; see check-self-contained)
     │
     ├── vfpv5-dp/                # Cortex-M7 (double-precision FPU)
     │   ├── ops.c                # Float and double arithmetic

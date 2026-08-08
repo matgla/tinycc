@@ -77,11 +77,14 @@ static int ir_abort_guard_site(TCCIRState *ir, int i, int n, int *call_idx, int 
 
 /* Per noreturn callee, keep ONE site inline as the shared sink; invert + retarget the rest and NOP their param+call. */
 /* Sink choice prefers a cbz/cbnz-eligible site: inverting it would cost cmp+bne (cbz/cbnz are forward-only), saving nothing. */
+/* TCC_NO_ABORT_MERGE: attribution knob -- the pass has no -f flag of its own. */
+TCC_DBG_ENV_FLAG(atm_disabled, "TCC_NO_ABORT_MERGE")
+
 /* A kept-inline site is a safe sink: it keeps its fall-through-into-call layout, and argc==0 means no arg setup differs per edge. */
 /* Runs post-regalloc, before the jump-thread / fallthrough / DCE cleanup; deliberately no compact_nops (renumbering breaks index-keyed peepholes). */
 int tcc_ir_opt_abort_tail_merge(TCCIRState *ir)
 {
-  if (getenv("TCC_NO_ABORT_MERGE"))
+  if (atm_disabled())
     return 0;
 
   int n = ir->next_instruction_index;

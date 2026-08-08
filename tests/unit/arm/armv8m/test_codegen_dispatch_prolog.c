@@ -37,11 +37,11 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "cfg.h"
-#include "ir/ssa.h"
-#include "ir/vreg.h"
-#include "ir/regalloc.h"
-#include "ir/codegen.h"
-#include "ir/machine_op.h"
+#include "source/ir/ssa.h"
+#include "source/ir/vreg.h"
+#include "source/ir/regalloc.h"
+#include "source/ir/codegen.h"
+#include "source/ir/machine_op.h"
 #include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
@@ -95,6 +95,10 @@ static TCCIRState *build_two_pass_forcing_ir(SValue *out_acc)
 {
   TCCIRState *ir = tcc_ir_alloc();
   setup_tcc_state();
+  /* -O0 skips the rehearsal walk and drops the forward-branch term that forces
+   * the discovery pass (see `cg_skip_rehearsal` / `fwd_branch_may_force_dry` in
+   * ir/codegen.c), so register pressure alone no longer buys two passes. */
+  tcc_state->optimize = 1;
 
   enum
   {
@@ -294,7 +298,7 @@ UT_TEST(test_phase3_scratch_conflict_reassignment_frees_scratch_register)
   tcc_state->float_abi = ARM_HARD_FLOAT;
   tcc_state->float_registers_for_allocator = 32;
   tcc_state->float_registers_map_for_allocator = (1ull << 32) - 1;
-  tcc_state->optimize = 0;
+  tcc_state->optimize = 1; /* -O1: at -O0 the dry-run walk this asserts on is skipped */
   tcc_state->need_frame_pointer = 0; /* not reset between tests; be explicit */
   tcc_state->force_frame_pointer = 0;
 
@@ -377,7 +381,7 @@ UT_TEST(test_phase3_alt_reassign_relocates_unpinned_r0_r3_occupant)
   tcc_state->float_abi = ARM_HARD_FLOAT;
   tcc_state->float_registers_for_allocator = 32;
   tcc_state->float_registers_map_for_allocator = (1ull << 32) - 1;
-  tcc_state->optimize = 0;
+  tcc_state->optimize = 1; /* -O1: at -O0 the dry-run walk this asserts on is skipped */
   tcc_state->need_frame_pointer = 0; /* not reset between tests; be explicit */
   tcc_state->force_frame_pointer = 0;
 
@@ -460,7 +464,7 @@ UT_TEST(test_dispatch_scratch_save_size_uses_global_bitmap_when_no_per_insn_save
   tcc_state->float_abi = ARM_HARD_FLOAT;
   tcc_state->float_registers_for_allocator = 32;
   tcc_state->float_registers_map_for_allocator = (1ull << 32) - 1;
-  tcc_state->optimize = 0;
+  tcc_state->optimize = 1; /* -O1: at -O0 the dry-run walk this asserts on is skipped */
   tcc_state->need_frame_pointer = 0;
   tcc_state->force_frame_pointer = 0;
 
@@ -518,7 +522,7 @@ UT_TEST(test_dispatch_scratch_save_size_stays_zero_when_no_scratch_pushes_at_all
   tcc_state->float_abi = ARM_HARD_FLOAT;
   tcc_state->float_registers_for_allocator = 32;
   tcc_state->float_registers_map_for_allocator = (1ull << 32) - 1;
-  tcc_state->optimize = 0;
+  tcc_state->optimize = 1; /* -O1: at -O0 the dry-run walk this asserts on is skipped */
   tcc_state->need_frame_pointer = 0;
   tcc_state->force_frame_pointer = 0;
 

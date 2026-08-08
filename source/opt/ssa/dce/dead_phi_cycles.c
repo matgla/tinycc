@@ -15,6 +15,8 @@
 #include "dce_passes.h"
 
 
+TCC_DBG_ENV_FLAG(dbg_phi_cycles, "TCC_DBG_PHI_CYCLES")
+
 static int ssa_dce_block_in_backedge_region(IRCFG *cfg, int block)
 {
   if (!cfg || block < 0 || block >= cfg->num_blocks)
@@ -219,7 +221,7 @@ int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
               pp = &phi->next;
               continue;
             }
-            if (getenv("TCC_DBG_PHI_CYCLES")) {
+            TCC_DBG_BLOCK(dbg_phi_cycles) {
               fprintf(stderr, "[phi_cycles] remove phi block=%d dest=T%d ops:", b, dp);
               for (int pi = 0; pi < phi->num_operands; pi++)
                 fprintf(stderr, " %d", phi->operands[pi].vreg);

@@ -129,6 +129,9 @@ int find_induction_vars_ex(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int 
 
 
 /* Find derived induction variables: base + (IV << shift), used for indexing */
+/* Queried per candidate inside the derived-IV scan — latch it. */
+TCC_DBG_ENV_FLAG(dbg_mlaiv, "TCC_DBG_MLAIV")
+
 int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_ivs, DerivedIV *divs, int max_divs)
 {
   int num_divs = 0;
@@ -380,7 +383,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
   }
 
   /* Second pass: MLA-fused DIV — dest = IV*stride + invariant base */
-  if (getenv("TCC_DBG_MLAIV")) {
+  if (dbg_mlaiv()) {
     fprintf(stderr, "[MLAIV] scan loop [%d..%d]\n", mla_scan_start, mla_scan_end);
     for (int dbg = mla_scan_start; dbg <= mla_scan_end; dbg++)
       fprintf(stderr, "[MLAIV]   idx %d op=%d\n", dbg, ir->compact_instructions[dbg].op);
@@ -391,7 +394,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
 
     if (q->op != TCCIR_OP_MLA)
       continue;
-    if (getenv("TCC_DBG_MLAIV"))
+    if (dbg_mlaiv())
       fprintf(stderr, "[MLAIV] candidate MLA at idx %d\n", i);
 
     IROperand dest = tcc_ir_op_get_dest(ir, q);
@@ -501,7 +504,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     divs[num_divs].share_with = -1;
     num_divs++;
 
-    if (getenv("TCC_DBG_MLAIV"))
+    if (dbg_mlaiv())
       fprintf(stderr, "[MLAIV] FOUND MLA-DIV at idx %d, stride=%d, iv_vr=%d, base_vr=%d\n", i, stride, iv_vr, base_vr);
     LOG_IV_SR("IV_SR: Found MLA-DIV base+%d*VAR%d at MLA idx=%d (fused)", stride, TCCIR_DECODE_VREG_POSITION(iv_vr), i);
   }

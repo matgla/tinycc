@@ -19,10 +19,13 @@ Pure C implementations for targets without hardware FPU:
 ### ARM VFPv4-sp (Cortex-M4F)
 Hardware single-precision FPU for ARM Cortex-M4F:
 - ✅ `fops.c` - Float operations using VADD.F32, VMUL.F32, VDIV.F32
-- ✅ `fcmp.c` - Float comparisons using VCMP.F32
 - ✅ `conv.c` - Float conversions (VCVT.*)
-- ✅ `dops_soft.c` - Double ops delegated to soft float
-- ✅ Architecture: `-march=armv7e-m -mfpu=fpv4-sp-d16`
+- ✅ Doubles, 64-bit conversions and all compares: compiled into this archive
+  from `soft/`, so it defines the whole `__aeabi_` set on its own
+  (`make check-self-contained`). The former `dops_soft.c` (wrappers that called
+  symbols nobody defined) and the local `fcmp.c` (returned FPSCR in r0 instead
+  of setting the flags) were removed.
+- ✅ Architecture: `-mcpu=cortex-m33 -mthumb -mfloat-abi=soft -mfpu=fpv5-sp-d16`
 
 ### ARM VFPv5-dp (Cortex-M7)
 Full hardware FPU supporting both single and double precision:

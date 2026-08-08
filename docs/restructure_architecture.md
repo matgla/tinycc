@@ -120,6 +120,17 @@ split correctly: `tccelf.c` drives, `arm-link.c` implements
 
 ## §3 Target source tree
 
+> **Status: the file moves in this section are done.** Every `.c`/`.h` that used to sit in
+> the repo root now lives under `source/` in the module layout below, each module carrying
+> its own Makefile and building to its own static library (`AGENTS.md` → Source Tree has
+> the current map). Two deliberate departures from the tree as drafted here: the backend
+> lives at `source/backend/arch/<arch>/` rather than `source/arch/` (per
+> `plans/backend_arch_restructure.md`, which landed first), and file basenames were kept
+> as-is — `source/obj/tccelf.c`, not `source/obj/elf.c` — so that `git log --follow` and
+> every existing doc reference still resolve. What remains open is the *decoupling* work,
+> not the layout: the six leaks in §2, the `machine.h` contract in §5, and the splits in
+> §6–§7. Moving a file did not de-ARM it.
+
 File basenames keep their identity where the file moves unchanged (`←` annotations show
 origin); new names appear only where a file is split. Repo root keeps `include/` (headers
 shipped to compiled programs), `lib/` (runtime library), `tests/`, `scripts/`, `docs/`.

@@ -13,9 +13,9 @@
  */
 
 #include "tcc.h"
-#include "ir/cfg.h"
-#include "ir/codegen.h"
-#include "ir/core.h"
+#include "source/ir/cfg.h"
+#include "source/ir/codegen.h"
+#include "source/ir/core.h"
 #include "source/opt/include/licm.h"
 #include "source/opt/include/opt.h"
 #include "source/opt/include/opt_utils.h"
@@ -27,8 +27,8 @@
 /* Inline-first per-vreg bitset (64 B inline -> 512 vregs, heap past that). */
 TCC_SMALL_SEQUENCE_DEFINE(RaLiveVregBitset, uint8_t, 64)
 #include "opt/flat/narrow_store.h"
-#include "ir/regalloc.h"
-#include "ir/ssa.h"
+#include "source/ir/regalloc.h"
+#include "source/ir/ssa.h"
 #include "tccir.h"
 #include "source/backend/arch/arm/arm_regalloc.h"
 
@@ -38,9 +38,6 @@ extern void compile_nested_functions(Sym *parent_sym);
 extern void pop_local_syms(Sym *b, int keep);
 extern void tcc_bench_log_phase(TCCState *s1, const char *operation, const char *name,
                                 unsigned *total_time, unsigned *count, unsigned elapsed);
-extern void dbg_scan_imm_dest(TCCIRState *ir, const char *pass);
-extern void dbg_scan_overlap(TCCIRState *ir, const char *pass);
-
 /* ================================================================== */
 /*  Analyze whether the function is a leaf / tail-call-only           */
 /* ================================================================== */
@@ -854,20 +851,38 @@ void tcc_ir_backend_regalloc_pipeline(TCCIRState *ir, Sym *sym, int func_var,
   tcc_ir_mark_return_value_incoming_regs(ir);
 
   int saved_regs_for_alloc = tcc_state->registers_for_allocator;
+  /* PASS_TIME split of the func-alloc bucket, phase by phase */
+  TCCPassTimer ra_pt;
+  tcc_pass_timing_begin(&ra_pt, "ra:setup_alloc");
   setup_register_allocation(ir, func_var);
+  tcc_pass_timing_end(&ra_pt, -1);
 
+  tcc_pass_timing_begin(&ra_pt, "ra:post_ra");
   run_post_ra_optimizations(ir);
+  tcc_pass_timing_end(&ra_pt, -1);
+  tcc_pass_timing_begin(&ra_pt, "ra:ssa_post_ra");
   run_ssa_and_post_ra_passes(ir);
+  tcc_pass_timing_end(&ra_pt, -1);
+  tcc_pass_timing_begin(&ra_pt, "ra:jump_thread");
   run_jump_threading_loop(ir);
+  tcc_pass_timing_end(&ra_pt, -1);
+  tcc_pass_timing_begin(&ra_pt, "ra:min_stack_ref");
   compute_min_stack_ref(ir, func_var);
+  tcc_pass_timing_end(&ra_pt, -1);
   tcc_state->registers_for_allocator = saved_regs_for_alloc;
+  tcc_pass_timing_begin(&ra_pt, "ra:coalesce");
   run_register_coalescing(ir);
+  tcc_pass_timing_end(&ra_pt, -1);
+  tcc_pass_timing_begin(&ra_pt, "ra:stack_layout");
   compute_stack_layout(ir, func_var);
+  tcc_pass_timing_end(&ra_pt, -1);
+  tcc_pass_timing_begin(&ra_pt, "ra:nested_fini");
   finalize_nested_functions(ir, sym);
+  tcc_pass_timing_end(&ra_pt, -1);
 
   if (tcc_state->do_bench)
   {
-    unsigned now = tcc_getclock_ms();
+    unsigned now = tcc_getclock_us();
     tcc_bench_log_phase(tcc_state, "func-alloc", funcname, &tcc_state->bench_function_alloc_time,
                         &tcc_state->bench_function_alloc_count, now - *phase_start);
     *phase_start = now;

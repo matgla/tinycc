@@ -87,6 +87,10 @@ static int rot_guard_provably_folds(TCCIRState *ir, int hi, IRQuadCompact *cmp_q
   return evaluate_compare_condition_cmp_annotated(ir, cmp_q, carried, lim, cond, s1, s2) == 0;
 }
 
+/* TCC_NO_COALESCE also restores the pre-coalesce body-scan bound here, so one
+ * binary carries both arms of the rotation/coalescing A/B. */
+TCC_DBG_ENV_FLAG(lr_no_coalesce, "TCC_NO_COALESCE")
+
 int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
 {
   int hi = loop->header_idx;
@@ -191,7 +195,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   int break_decide_idx = -1;
   /* bound scans to this loop's exit so a sibling loop's back-edge is not misread as an inner loop */
   int body_scan_limit = body_start + 100;
-  if (!getenv("TCC_NO_COALESCE")) {
+  if (!lr_no_coalesce()) {
     if (exit_target > body_start && exit_target < body_scan_limit)
       body_scan_limit = exit_target;
   }

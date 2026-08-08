@@ -13,7 +13,6 @@
 #include "ssa_opt.h"
 #include "dce_passes.h"
 
-extern int tcc_ir_opt_pass_disabled(const char *name);
 
 int ssa_opt_dce_light(IRSSAOptCtx *ctx)
 {

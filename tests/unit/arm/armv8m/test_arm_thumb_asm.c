@@ -2701,15 +2701,18 @@ UT_TEST(test_parse_condition_str_prefix_match)
   return 0;
 }
 
-UT_TEST(test_parse_condition_str_unknown_and_aliases_default_to_al)
+UT_TEST(test_parse_condition_str_aliases_resolve_through_cond_names)
 {
-  /* "al" and the carry aliases hs/lo are NOT special-cased here (unlike
-     cond_names[] used by thumb_parse_token_suffix); they fall through to the
-     default 0xe (COND_AL). */
+  /* The lookup walks cond_names[] -- the same table thumb_parse_token_suffix
+     uses -- so the carry aliases decode to the conditions they name rather
+     than falling through to AL: hs == cs (2), lo == cc (3).  "al" is in the
+     table too, with its own 0xe.  An unrecognised string is not a value this
+     can return: it reaches tcc_error(). */
   UT_ASSERT_EQ(thumb_parse_condition_str("al"), 0xe);
-  UT_ASSERT_EQ(thumb_parse_condition_str("hs"), 0xe);
-  UT_ASSERT_EQ(thumb_parse_condition_str("lo"), 0xe);
-  UT_ASSERT_EQ(thumb_parse_condition_str("zz"), 0xe);
+  UT_ASSERT_EQ(thumb_parse_condition_str("hs"), 0x2);
+  UT_ASSERT_EQ(thumb_parse_condition_str("cs"), 0x2);
+  UT_ASSERT_EQ(thumb_parse_condition_str("lo"), 0x3);
+  UT_ASSERT_EQ(thumb_parse_condition_str("cc"), 0x3);
   return 0;
 }
 

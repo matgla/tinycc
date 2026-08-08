@@ -217,6 +217,7 @@ enum float_abi float_abi;
 unsigned char text_and_data_separation;
 unsigned char allow_r9_write;
 unsigned char pic;
+unsigned char sb_relative_got;
 
 int offset_to_args = 0;
 
@@ -271,6 +272,23 @@ static inline int fp_adjust_local_offset(int frame_offset, int is_param)
  * while materializing an indirect call target). Applied on top of per-call
  * exclude masks. */
 static uint32_t scratch_global_exclude = 0;
+
+/* Callee-saved register holding this function's .rodata runtime base for the
+ * whole body, or -1 when the function addresses shared .rodata the long way.
+ * Claimed per function by tcc_gen_machine_rodata_anchor_claim(); see the
+ * commentary there. */
+static int rodata_anchor_reg = -1;
+
+/* Registers no scratch picker may ever hand out in this function: R9 is the
+ * GOT base under text/data separation, and the rodata anchor holds a value
+ * with no interval behind it, so liveness always reports it dead. */
+static uint32_t scratch_exclude_baseline(void)
+{
+  uint32_t mask = text_and_data_separation ? (1u << R9) : 0;
+  if (rodata_anchor_reg >= 0)
+    mask |= 1u << rodata_anchor_reg;
+  return mask;
+}
 
 /* Track registers that were PUSH'ed by get_scratch_reg_with_save() in ORDER.
  * We must POP in reverse order since ARM POP with register lists always pops
@@ -933,6 +951,7 @@ typedef struct CodeGenDryRunState
   int lr_push_count;            /* Times LR specifically was pushed */
   int instruction_count;        /* IR instructions processed */
   int max_nested_saves;         /* Max nested-call save slots used at any call site */
+  int rodata_anchor_sites;      /* Shared-.rodata addresses materialised in the body */
 } CodeGenDryRunState;
 
 static CodeGenDryRunState dry_run_state;
@@ -1443,6 +1462,92 @@ ST_FUNC int tcc_gen_machine_dry_run_get_max_nested_saves(void)
   return dry_run_state.max_nested_saves;
 }
 
+ST_FUNC void tcc_gen_machine_rodata_anchor_reset(void)
+{
+  rodata_anchor_reg = -1;
+}
+
+ST_FUNC int tcc_gen_machine_rodata_anchor_get(void)
+{
+  return rodata_anchor_reg;
+}
+
+/* Claim a callee-saved register to hold this function's .rodata runtime base.
+ *
+ * A shared-.rodata address is anchor + link-time offset, and the anchor lives
+ * in a GOT slot, so every reference has to load it.  Done per reference that
+ * costs a scratch register nobody has:
+ *   push {tmp}; ldr.w tmp,[r9,#24]; add r,r,tmp; pop {tmp}    (10 bytes)
+ * Two earlier attempts tried to drop the push/pop by proving some register was
+ * free at the site.  Both miscompiled, because load_full_const is reached from
+ * compound emissions (block copies, 64-bit STRD marshalling) that hold values
+ * in registers by hand, with no interval behind them — liveness reports those
+ * registers dead and hands one straight back.
+ *
+ * Hoisting removes the question.  The anchor is loaded once in the prologue
+ * into a register the allocator did not use, and each reference is then a
+ * bare `add r,r,anchor` — 2 bytes, no scratch, so there is nothing for a
+ * hand-held value to collide with.  The register is excluded from every
+ * scratch picker for the whole body (scratch_exclude_baseline), which also
+ * keeps it out of the two pools that hand out prologue-pushed registers on
+ * the grounds that the epilogue restores them.
+ *
+ * Called from the discovery run's finalisation, so `used_registers` is the
+ * settled allocation and the decision precedes both the prologue and the two
+ * passes that model it — dry and real always agree on the encoding.  Being
+ * wrong in either direction only costs bytes: an unclaimed function keeps the
+ * push/pop form, and a claimed one that turns out to reference nothing wastes
+ * a prologue load.  Returns the mask to add to the prologue push list. */
+ST_FUNC uint32_t tcc_gen_machine_rodata_anchor_claim(uint64_t used_registers)
+{
+  rodata_anchor_reg = -1;
+
+  if (!tcc_state->share_rodata || !text_and_data_separation)
+    return 0;
+
+  /* One reference pays for the prologue load and its push/pop at best; two
+   * clear it.  (Per-function counts are heavily skewed — most functions that
+   * touch .rodata at all touch it several times.) */
+  if (dry_run_state.rodata_anchor_sites < 2)
+    return 0;
+
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir || ir->naked)
+    return 0; /* no prologue to hoist into, so nothing saves the register */
+
+  /* Inline asm can name a register outright, which neither the allocator nor
+   * used_registers can see.  Same reservation the frame pointer makes. */
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    const int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_ASM_INPUT || op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_ASM_OUTPUT)
+      return 0;
+  }
+
+  /* R7 is the frame base whenever the prologue decides it needs one, and that
+   * decision is made after this point.  R10 is the static chain register.  R11
+   * and R12 are the backend's permanent scratch pair (they are deliberately
+   * not sticky in scratch_global_exclude, so excluding them here would not
+   * hold).  What is left is R4-R6 and R8, and the low three come first: they
+   * keep PUSH/POP in the 16-bit encoding, so a function that already saves a
+   * low register pays nothing at all for the save. */
+  static const int candidates[] = {R4, R5, R6, R8};
+  uint32_t taken = (uint32_t)used_registers | scratch_global_exclude;
+  for (unsigned i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++)
+  {
+    const int r = candidates[i];
+    if (taken & (1u << r))
+      continue;
+    rodata_anchor_reg = r;
+    /* Sticky for the whole body: the reset points rebuild the exclude mask
+     * from scratch_exclude_baseline(), but the real pass can start without
+     * passing through one of them (-O0 skips the rehearsal). */
+    scratch_global_exclude |= 1u << r;
+    return 1u << r;
+  }
+  return 0;
+}
+
 /* Check if dry-run mode is currently active */
 ST_FUNC int tcc_gen_machine_dry_run_is_active(void)
 {
@@ -1454,7 +1559,7 @@ ST_FUNC void tcc_gen_machine_reset_scratch_state(void)
 {
   /* When text_and_data_separation is active, R9 holds the GOT base and must
    * NEVER be used as a scratch register. Permanently exclude it. */
-  scratch_global_exclude = text_and_data_separation ? (1u << R9) : 0;
+  scratch_global_exclude = scratch_exclude_baseline();
   scratch_push_count = 0;
   scratch_save_slot = 0;
   memset(scratch_push_stack, 0, sizeof(scratch_push_stack));
@@ -1498,7 +1603,7 @@ static int scratch_pushed_dead_reg(TCCIRState *ir, uint32_t exclude_regs, uint32
 {
   if (DRY_RUN_MODELLING || !pushed_registers)
     return PREG_NONE;
-  uint32_t reserved = (1u << R_FP);
+  uint32_t reserved = (1u << R_FP) | scratch_exclude_baseline();
   if (tcc_state->text_and_data_separation)
     reserved |= (1u << 9);
   uint32_t live = tcc_ls_compute_live_regs(&ir->ls, ir->codegen_instruction_idx);
@@ -1777,7 +1882,7 @@ static void restore_all_pushed_scratch_regs(void)
   {
     scratch_push_count = 0;
     scratch_save_slot = 0;
-    scratch_global_exclude = text_and_data_separation ? (1u << R9) : 0;
+    scratch_global_exclude = scratch_exclude_baseline();
     return;
   }
 
@@ -1810,7 +1915,7 @@ static void restore_all_pushed_scratch_regs(void)
   scratch_push_count = 0;
   /* Also reset global exclude for next IR instruction.
    * Keep R9 excluded if text_and_data_separation is active. */
-  scratch_global_exclude = text_and_data_separation ? (1u << R9) : 0;
+  scratch_global_exclude = scratch_exclude_baseline();
 }
 
 ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigned flags)
@@ -2647,6 +2752,23 @@ const FloatingPointConfig *arm_determine_fpu_config(struct TCCState *s)
     return &arm_soft_fpu_config;
   }
 
+  /* -mfloat-abi=soft means "emit no FP instructions at all", whatever -mfpu
+   * names.  Resolving that to the soft table here -- rather than only checking
+   * the ABI at the emitters -- keeps the one contract the has_* bits carry:
+   * ir_put_soft_call_fpu_if_needed() reads them to decide whether the op stays
+   * an __aeabi_ call, and ir_op_is_implicit_call_ra() reads the SAME bits to
+   * decide whether it still clobbers r0-r3.  With the bits set but the emitter
+   * refusing to inline, the backend emits a BL whose clobber the allocator no
+   * longer models: wrong code, not a missed optimisation.
+   *
+   * Reachable in practice since a build can ship a default -mfpu
+   * (CONFIG_TCC_DEFAULT_FPU): before that, `-mfloat-abi=soft` alone left
+   * fpu_type at AUTO and landed on the soft table by the check above. */
+  if (s->float_abi == ARM_SOFT_FLOAT)
+  {
+    return &arm_soft_fpu_config;
+  }
+
   switch (s->fpu_type)
   {
   case ARM_FPU_FPV4_SP_D16:
@@ -2729,6 +2851,7 @@ ST_FUNC void arm_init(struct TCCState *s)
   float_abi = s->float_abi;
   text_and_data_separation = s->text_and_data_separation;
   pic = s->pic;
+  sb_relative_got = s->sb_relative_got;
   s->parameters_registers = 4;
   /* R12 (IP) is the standard inter-procedure scratch register.
    * R11 is also available for allocation but reserved during call argument processing. */
@@ -4565,6 +4688,93 @@ static ThumbLiteralPoolEntry *th_literal_pool_find_or_allocate(Sym *sym, int64_t
   return entry;
 }
 
+/* PIC + text/data-separation relocation choice. Single source of truth: the
+ * SB-relative fast path and the literal-pool path must agree, or the dry-run
+ * and real passes emit different sizes. See docs/sb_relative_got.md. */
+static int th_pic_reloc_for_sym(Sym *sym, int sym_off)
+{
+  int sym_in_code_section = 0;
+  int sym_in_rodata = 0;
+  if (sym_off > 0 && sym_off < tcc_state->nb_sections)
+  {
+    Section *sym_sec = tcc_state->sections[sym_off];
+    if (sym_sec && (sym_sec->sh_flags & SHF_EXECINSTR))
+      sym_in_code_section = 1;
+    /* Exact pointer match: only the main .rodata is anchor-addressed. */
+    if (sym_sec && sym_sec == rodata_section)
+      sym_in_rodata = 1;
+  }
+  if (tcc_state->share_rodata && (sym->type.t & VT_STATIC) && sym_off != SHN_UNDEF && sym_in_rodata)
+    return R_ARM_RODATA_OFF;
+  /* sym_off == SHN_UNDEF: forward-declared, section unknown — GOT32 is safe. */
+  if ((sym->type.t & VT_STATIC) && sym_off != SHN_UNDEF && sym_off != cur_text_section->sh_num &&
+      !sym_in_code_section)
+    return R_ARM_GOTOFF;
+  return R_ARM_GOT32;
+}
+
+/* References in this body that a hoisted .rodata anchor would serve, counted
+ * from the IR so the register allocator can decide whether to leave a register
+ * for one.  An over- or under-count only moves bytes: the backend still emits
+ * whatever form the register situation allows.  Symbols reach codegen from
+ * places with no IR operand behind them (libcall names, switch tables), so
+ * this is a floor, not the exact site count. */
+ST_FUNC int tcc_gen_machine_rodata_anchor_ir_sites(const TCCIRState *ir, int stop_at)
+{
+  if (!ir || !tcc_state->share_rodata || !text_and_data_separation)
+    return 0;
+
+  int sites = 0;
+  for (int i = 0; i < ir->next_instruction_index && sites < stop_at; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    const IROperand ops[3] = {tcc_ir_op_get_dest(ir, q), tcc_ir_op_get_src1(ir, q),
+                              tcc_ir_op_get_src2(ir, q)};
+    for (int k = 0; k < 3; k++)
+    {
+      Sym *sym = irop_get_sym_ex(ir, ops[k]);
+      if (!sym)
+        continue;
+      ElfSym *esym = elfsym(sym);
+      if (th_pic_reloc_for_sym(sym, esym ? esym->st_shndx : 0) == R_ARM_RODATA_OFF)
+        sites++;
+    }
+  }
+  return sites;
+}
+
+/* Add a symbol addend to an already-materialised address in r. imm == 0 is the
+ * common case and is skipped: it cost 9,733 dead instructions (19 KiB) across
+ * the compiler's own build. imm is pass-invariant, so sizes still agree. */
+static void th_emit_sym_addend(int r, int64_t imm)
+{
+  thumb_opcode ot;
+  if (imm == 0)
+    return;
+  if ((ot = th_add_imm(r, r, imm, flags_safe(), ENFORCE_ENCODING_NONE)).size != 0)
+  {
+    ot_check(ot);
+    return;
+  }
+  uint32_t exclude_regs = (1 << r);
+  ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(exclude_regs);
+  int scratch = scratch_alloc.reg;
+
+  thumb_opcode ldr = th_ldr_literal(scratch, 0, 1);
+  ot_check(ldr);
+
+  ThumbLiteralPoolEntry *entry2 = th_literal_pool_allocate();
+  entry2->sym = NULL;
+  entry2->imm = imm;
+  entry2->patch_position = ind - ldr.size;
+  entry2->relocation = -1;
+  entry2->data_size = 4;
+  entry2->short_instruction = (ldr.size == 2);
+  th_literal_pool_note_entry(entry2);
+  ot_check(th_add_reg(r, r, scratch, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  restore_scratch_reg(&scratch_alloc);
+}
+
 static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
 {
   struct Sym *sym = _lfc_sym;
@@ -4621,6 +4831,29 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
       {
         /* Registration failed - symbol can't be externalized */
         sym = NULL;
+      }
+    }
+  }
+
+  /* SB-relative GOT: a single `ldr.w Rt,[r9,#imm12]` replaces literal + add R9
+   * + load and the pool word. Goes through ot_check rather than
+   * ot_check_ldr_imm on purpose — the latter's redundant-reload cache is keyed
+   * on the pre-relocation immediate (0), which would conflate distinct
+   * symbols. See docs/sb_relative_got.md. */
+  if (sym && pic && text_and_data_separation && sb_relative_got && r1 == PREG_NONE)
+  {
+    ElfSym *sb_esym = elfsym(sym);
+    int sb_sym_off = sb_esym ? sb_esym->st_shndx : 0;
+    if (th_pic_reloc_for_sym(sym, sb_sym_off) == R_ARM_GOT32)
+    {
+      thumb_opcode sb_ins = th_ldr_imm(r, R9, 0, 6, ENFORCE_ENCODING_32BIT);
+      if (sb_ins.size != 0)
+      {
+        ot_check(sb_ins);
+        if (!dry_run_state.active)
+          greloc(cur_text_section, sym, ind - sb_ins.size, R_ARM_GOT_SBREL12);
+        th_emit_sym_addend(r, imm);
+        return;
       }
     }
   }
@@ -4717,41 +4950,7 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
          *   and the YAFF writer emits a data relocation so the dynamic
          *   loader patches the slot to the runtime code address.
          */
-        int sym_in_code_section = 0;
-        int sym_in_rodata = 0;
-        if (sym_off > 0 && sym_off < tcc_state->nb_sections)
-        {
-          Section *sym_sec = tcc_state->sections[sym_off];
-          if (sym_sec && (sym_sec->sh_flags & SHF_EXECINSTR))
-            sym_in_code_section = 1;
-          /* Only the main .rodata section is anchor-addressed: R_ARM_RODATA_OFF
-           * resolves against rodata_section->sh_addr, so a symbol in any OTHER
-           * read-only section would be mis-addressed. Exact pointer match. */
-          if (sym_sec && sym_sec == rodata_section)
-            sym_in_rodata = 1;
-        }
-        if (tcc_state->share_rodata && (sym->type.t & VT_STATIC) && sym_off != SHN_UNDEF &&
-            sym_in_rodata)
-        {
-          /* Same-module pure-const .rodata symbol: address via the rodata
-           * anchor (shared base) + R_ARM_RODATA_OFF (offset within .rodata),
-           * not GOTOFF (which assumes rodata sits at a fixed distance from the
-           * per-process GOT — false once .rodata is shared XIP). */
-          entry->relocation = R_ARM_RODATA_OFF;
-        }
-        else if (sym->type.t & VT_STATIC && sym_off != SHN_UNDEF && sym_off != cur_text_section->sh_num &&
-            !sym_in_code_section)
-        {
-          /* Static data symbol — GOTOFF (same segment as GOT).
-           * sym_off == SHN_UNDEF means the function is forward-declared
-           * but not yet defined — we don't know its section, so we must
-           * use GOT32 (safe indirect path) instead of GOTOFF. */
-          entry->relocation = R_ARM_GOTOFF;
-        }
-        else
-        {
-          entry->relocation = R_ARM_GOT32;
-        }
+        entry->relocation = th_pic_reloc_for_sym(sym, sym_off);
       }
       else
       {
@@ -4773,84 +4972,53 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
     {
       if (text_and_data_separation)
       {
-        /* Mirror the relocation selection above:
-         * - Static data symbol → R_ARM_GOTOFF → add R9
-         * - Everything else    → R_ARM_GOT32  → add R9; ldr [r]; add imm
-         */
-        int sym_in_code_section_cg = 0;
-        if (sym_off > 0 && sym_off < tcc_state->nb_sections)
-        {
-          Section *sym_sec = tcc_state->sections[sym_off];
-          if (sym_sec && (sym_sec->sh_flags & SHF_EXECINSTR))
-            sym_in_code_section_cg = 1;
-        }
+        /* Dispatch on the relocation chosen above — GOTOFF adds R9, GOT32
+         * adds R9 then loads through the slot. */
         if (entry->relocation == R_ARM_RODATA_OFF)
         {
           /* Shared .rodata anchor: r holds (sym - rodata_base) from the
-           * R_ARM_RODATA_OFF literal. Add the rodata runtime base from the
-           * reserved GOT anchor slot:
-           *   push {tmp}; ldr tmp, [R9, #24]; add r, r, tmp; pop {tmp}
-           * Use a DETERMINISTIC fixed scratch (a low register other than r,
-           * saved by push/pop), NOT get_scratch_reg_with_save: the latter's
-           * callee-saved fallback is gated on !dry_run_state.active, so under
-           * register pressure (e.g. ps's larger functions) it can pick a
-           * different register in the dry-run vs real pass, desync instruction
-           * sizes, and corrupt literal-pool offsets — yielding a near-NULL
-           * rodata address. A fixed push/pop emits identically in both passes. */
-          int anchor_tmp = (r == 0) ? 1 : 0;
-          ot_check(th_push((uint16_t)(1u << anchor_tmp)));
-          ot_check_ldr_imm(anchor_tmp, R9, YAFF_RODATA_ANCHOR_GOT_OFFSET, 6, ENFORCE_ENCODING_NONE);
-          ot_check(
-              th_add_reg(r, r, anchor_tmp, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-          ot_check(th_pop((uint16_t)(1u << anchor_tmp)));
+           * R_ARM_RODATA_OFF literal; add the rodata runtime base. */
+          if (DRY_RUN_MODELLING)
+            dry_run_state.rodata_anchor_sites++;
+          if (rodata_anchor_reg >= 0)
+          {
+            /* The prologue parked the base in a register reserved for the
+             * whole body (tcc_gen_machine_rodata_anchor_claim). */
+            if (r == rodata_anchor_reg)
+              tcc_error("compiler_error: rodata anchor r%d handed out as a value register",
+                        rodata_anchor_reg);
+            ot_check(th_add_reg(r, r, rodata_anchor_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+                                ENFORCE_ENCODING_NONE));
+          }
+          else
+          {
+            /*   push {tmp}; ldr tmp, [R9, #24]; add r, r, tmp; pop {tmp}
+             * Use a DETERMINISTIC fixed scratch (a low register other than r,
+             * saved by push/pop), NOT get_scratch_reg_with_save: the latter's
+             * callee-saved fallback is gated on !dry_run_state.active, so under
+             * register pressure (e.g. ps's larger functions) it can pick a
+             * different register in the dry-run vs real pass, desync instruction
+             * sizes, and corrupt literal-pool offsets — yielding a near-NULL
+             * rodata address. A fixed push/pop emits identically in both passes. */
+            int anchor_tmp = (r == 0) ? 1 : 0;
+            ot_check(th_push((uint16_t)(1u << anchor_tmp)));
+            ot_check_ldr_imm(anchor_tmp, R9, YAFF_RODATA_ANCHOR_GOT_OFFSET, 6, ENFORCE_ENCODING_NONE);
+            ot_check(
+                th_add_reg(r, r, anchor_tmp, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+            ot_check(th_pop((uint16_t)(1u << anchor_tmp)));
+          }
         }
-        else if (sym->type.t & VT_STATIC && sym_off != SHN_UNDEF && sym_off != cur_text_section->sh_num &&
-            !sym_in_code_section_cg)
+        else if (entry->relocation == R_ARM_GOTOFF)
         {
           /* Static data symbol — GOTOFF (add R9) */
           ot_check(th_add_reg(r, r, R9, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         }
         else
         {
-          thumb_opcode ot;
           ot_check(th_add_reg(r, r, R9, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
 
           ot_check_ldr_imm(r, r, 0, 6, ENFORCE_ENCODING_NONE);
-          ot = th_add_imm(r, r, imm, flags_safe(), ENFORCE_ENCODING_NONE);
-          if (ot.size != 0)
-          {
-            ot_check(ot);
-          }
-          else
-          {
-            // size += o.size;
-            // ot_check(o);
-            // ot_check(th_b_t4(4));
-            // th_sym_d();
-            // thus that immediate value must be preserved without linker touch
-            // o(imm & 0xffff);
-            // o(imm >> 16);
-            // th_sym_t();
-            /* Find a free scratch register for literal pool entry */
-            uint32_t exclude_regs = (1 << r); /* Exclude destination register */
-            ScratchRegAlloc scratch_alloc = get_scratch_reg_with_save(exclude_regs);
-            int scratch = scratch_alloc.reg;
-
-            thumb_opcode ldr = th_ldr_literal(scratch, 0, 1);
-            ot_check(ldr);
-
-            ThumbLiteralPoolEntry *entry2 = th_literal_pool_allocate();
-            entry2->sym = NULL;
-            entry2->imm = imm;
-            entry2->patch_position = ind - ldr.size;
-            entry2->relocation = -1;
-            entry2->data_size = 4;
-            entry2->short_instruction = (ldr.size == 2);
-            th_literal_pool_note_entry(entry2);
-            ot_check(
-                th_add_reg(r, r, scratch, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-            restore_scratch_reg(&scratch_alloc);
-          }
+          th_emit_sym_addend(r, imm);
         }
       }
       else
@@ -4865,8 +5033,12 @@ static void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
           thumb_opcode ot;
           ot_check(th_add_reg(r, r, R_PC, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           ot_check_ldr_imm(r, r, 4, 6, ENFORCE_ENCODING_NONE);
-          ot = th_add_imm(r, r, imm, flags_safe(), ENFORCE_ENCODING_NONE);
-          if (ot.size != 0)
+          /* Same zero-addend skip as the GOT-relative path above. */
+          if (imm == 0)
+          {
+            /* no addend: nothing to add */
+          }
+          else if ((ot = th_add_imm(r, r, imm, flags_safe(), ENFORCE_ENCODING_NONE)).size != 0)
           {
             ot_check(ot);
           }
@@ -10551,6 +10723,14 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    * needs a predictable {FP, LR} layout at [FP+0] and [FP+4]. */
   const int standard_frame_record = need_fp && tcc_state->force_lr_save;
 
+  /* The allocator hands out R7 only when ra_may_need_frame_pointer predicted
+   * no frame pointer; a function that reaches here needing FP with R7
+   * allocated means the prediction missed a forcing condition, and silently
+   * continuing would use one register as frame base and value at once. */
+  if (need_fp && (used_registers & (1ULL << R_FP)))
+    tcc_error("compiler_error: R7 allocated in a frame-pointer function "
+              "(ra_may_need_frame_pointer out of sync with a forcing site)");
+
   /* Collect callee-saved registers */
   uint16_t callee_regs_local = 0;
   int callee_count = 0;
@@ -10558,8 +10738,8 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   {
     if (tcc_state->text_and_data_separation && i == R9)
       continue;
-    if (i == R_FP)
-      continue; /* r7 handled separately for FP */
+    if (i == R_FP && need_fp)
+      continue; /* r7 is the frame base; pushed via frame_regs instead */
     if (used_registers & (1ULL << i))
     {
       callee_regs_local |= (1 << i);
@@ -10567,14 +10747,20 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     }
   }
 
-  /* Add static chain register (R10) for nested functions. */
-  if (extra_prologue_regs & (1u << ARM_R10))
+  /* Registers codegen asks to be saved on top of the allocation: the static
+   * chain register (R10) for nested functions, and the rodata anchor. */
+  for (int i = R4; i <= R11; ++i)
   {
-    if (!(callee_regs_local & (1u << ARM_R10)))
-    {
-      callee_regs_local |= (1u << ARM_R10);
-      callee_count++;
-    }
+    if (!(extra_prologue_regs & (1u << i)))
+      continue;
+    if (tcc_state->text_and_data_separation && i == R9)
+      continue;
+    if (i == R_FP && need_fp)
+      continue;
+    if (callee_regs_local & (1u << i))
+      continue;
+    callee_regs_local |= (1u << i);
+    callee_count++;
   }
 
   int push_align_pad = 0; /* 4 if push count is odd, absorbed into SUB SP */
@@ -10732,6 +10918,35 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    * The pad sits at the top of the SUB SP region, right below pushed regs,
    * so locals occupy SP+0 .. SP+allocated_stack_size-1, matching the same
    * addresses as the old push-IP-for-alignment approach. */
+
+  /* Save the PIC GOT base (R9) once, into slot 0 of the nested-call save area.
+   *
+   * R9 is caller-saved under text_and_data_separation, so every call reloads
+   * it from the frame; but the value never changes within a function, so the
+   * store only has to happen once.  It used to be emitted at each call site
+   * next to the reload, which cost 45,329 instructions (165 KiB) in the
+   * compiler's own build and produced runs of literally
+   *   ldr.w r9, [sp] ; str.w r9, [sp]
+   * where the reload was immediately followed by writing the same value back.
+   *
+   * call_nested_save_size is non-zero exactly when the function has at least
+   * one call under text_and_data_separation (ir/codegen.c, where the area is
+   * sized), so it is the same guard in both codegen passes — and R9 is saved
+   * at every one of those call sites, so slot 0 is always reserved for it. */
+  if (tcc_state->text_and_data_separation && ir && ir->call_nested_save_size > 0)
+  {
+    const int r9_slot_offset = ir->call_outgoing_size;
+    if (tcc_state->func_dynamic_sp)
+      /* VLA/alloca: the runtime SP has moved, so the call sites address these
+       * slots FP-relative with this bias.  Match it. */
+      tcc_gen_machine_store_to_stack_ex(ARM_R9, r9_slot_offset - (callee_push_size + epilogue_stack_dealloc),
+                                        1u << ARM_R9);
+    else
+      /* Plain SP-relative, matching the store_word_to_stack() the call sites
+       * used: these slots are always addressed off SP when the frame is
+       * static, even in functions that also keep a frame pointer. */
+      tcc_gen_machine_store_to_sp(ARM_R9, r9_slot_offset);
+  }
 
   /* Save incoming static chain (R10) at fixed chain slot.
    * With two-phase push, callee-saved regs are below FP, so the chain
@@ -11101,6 +11316,13 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
     tcc_free(moves);
   }
+
+  /* Materialise the .rodata base for the body.  Last in the prologue: the
+   * parameter shuffle above may borrow any callee-saved register that holds
+   * no incoming argument, which includes this one until it is loaded.  R9 is
+   * the incoming GOT base and nothing in the prologue writes it. */
+  if (rodata_anchor_reg >= 0)
+    ot_check_ldr_imm(rodata_anchor_reg, R9, YAFF_RODATA_ANCHOR_GOT_OFFSET, 6, ENFORCE_ENCODING_NONE);
 }
 
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
@@ -11184,6 +11406,9 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
   }
 
   thumb_gen_state.generating_function = 0;
+  /* The anchor register holds this function's .rodata base and the epilogue
+   * has just restored the caller's value in it. */
+  rodata_anchor_reg = -1;
   th_literal_pool_generate();
   thumb_free_call_sites();
 }
@@ -11191,6 +11416,7 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
 ST_FUNC void tcc_gen_machine_finish_noreturn(void)
 {
   thumb_gen_state.generating_function = 0;
+  rodata_anchor_reg = -1;
   th_literal_pool_generate();
   thumb_free_call_sites();
 }
@@ -11569,6 +11795,43 @@ typedef struct CallGenContext
                                * because the subsequent register moves will overwrite them. */
 } CallGenContext;
 
+/* Is the by-value struct source ADDRESS provably 4-byte aligned?
+ *
+ * `struct_src_align` is the C type's alignment, and it is 1 for every packed
+ * aggregate — tinycc's own 9-byte IROperand, which dominates these call sites,
+ * being the obvious one.  What LDRD and LDM actually require is an aligned
+ * address, so for a frame-resident source ask the offset instead of the type.
+ *
+ * Only the low two bits matter, and they survive the frame bias: SP is 8-byte
+ * aligned and FP 4-byte aligned at steady state, and every term
+ * fp_adjust_local_offset() adds (allocated_stack_size, callee_push_size,
+ * scratch_push_sp_bias) is a multiple of 4.  Testing the RAW offset therefore
+ * gives the same answer as testing the adjusted one, and — unlike the adjusted
+ * one, whose scratch_push_sp_bias() term is dry-run gated — it reads the same
+ * in the rehearsal and the real pass, so it cannot desync the two code sizes.
+ *
+ * Incoming stack parameters are aligned by construction (arm_aapcs.c floors
+ * every argument slot at 4 and offset_to_args is a multiple of 4), but the
+ * check is written out rather than assumed. */
+static bool struct_src_addr_aligned4(const ThumbArgMove *m)
+{
+  if (m->struct_src_align >= 4)
+    return true;
+  if (m->mop.needs_deref)
+    return false; /* address comes from memory — nothing provable */
+  switch (m->mop.kind)
+  {
+  case MACH_OP_SPILL:
+    return (m->mop.u.spill.offset & 3) == 0;
+  case MACH_OP_FRAME_ADDR:
+    return (m->mop.u.frame.offset & 3) == 0;
+  case MACH_OP_PARAM_STACK:
+    return ((m->mop.u.param.offset + offset_to_args) & 3) == 0;
+  default:
+    return false;
+  }
+}
+
 static void thumb_emit_arg_move(const ThumbArgMove *m)
 {
   if (m->kind == THUMB_ARG_MOVE_REG)
@@ -11625,11 +11888,33 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
     int base_addr_reg = get_struct_base_addr_mop(&m->mop, struct_scratch.reg);
 
     /* Load each word from the struct into consecutive target registers.
-     * Adjacent word pairs use LDRD when the struct's natural alignment is >= 4
-     * (so the source address is 4-byte aligned — LDRD faults otherwise) and
-     * neither destination register aliases the base (LDRD writes Rt then Rt2;
-     * an alias would read a clobbered base on the fallback path / be unsafe). */
-    bool src_aligned = (m->struct_src_align >= 4);
+     * Adjacent word pairs use LDRD when the source ADDRESS is 4-byte aligned
+     * (LDRD faults otherwise) and neither destination register aliases the base
+     * (LDRD writes Rt then Rt2; an alias would read a clobbered base on the
+     * fallback path / be unsafe). */
+    bool src_aligned = struct_src_addr_aligned4(m);
+
+    /* A single LDMIA.W replaces the whole per-word load sequence.  It only pays
+     * from three words up: at two, the LDRD in the loop below is already one
+     * 4-byte instruction.
+     *
+     * th_ldm() silently strips the base register from the list when there is no
+     * writeback, so a base sitting inside the destination range would quietly
+     * load one register too few — reject that here instead of relying on the
+     * helper.  PC and SP must stay out of the list too: PC would turn the load
+     * into a branch. */
+    int last_dst = base_dst + word_count - 1;
+    if (word_count >= 3 && src_aligned && base_addr_reg != R_SP && base_dst >= 0 && last_dst <= R_IP &&
+        !(base_addr_reg >= base_dst && base_addr_reg <= last_dst))
+    {
+      uint32_t regset = 0;
+      for (int k = 0; k < word_count; ++k)
+        regset |= 1u << (unsigned)(base_dst + k);
+      ot_check(th_ldm((uint32_t)base_addr_reg, regset, 0 /* no writeback */, ENFORCE_ENCODING_NONE));
+      restore_scratch_reg(&struct_scratch);
+      return;
+    }
+
     int w = 0;
     for (; w + 1 < word_count; )
     {
@@ -12351,7 +12636,7 @@ static int find_call_scratch(uint32_t extra_exclude, uint32_t arg_move_dst_mask)
        * arg, then `sub ip, r7, #12` for the next arg).  R9 is the GOT
        * base under text_and_data_separation.  Mirrors the reserved set in
        * scratch_pushed_dead_reg. */
-      uint32_t reserved = (1u << R_FP);
+      uint32_t reserved = (1u << R_FP) | scratch_exclude_baseline();
       if (tcc_state->text_and_data_separation)
         reserved |= (1u << 9);
       uint32_t candidates = callee_pushed & ~live & ~exclude & ~reserved;
@@ -12912,6 +13197,10 @@ static void place_stack_arguments_inline(CallGenContext *ctx)
  *     value is loaded once per window rather than once per argument.
  * Reordering pure-immediate stores to distinct, non-aliasing stack slots leaves
  * the pre-call stack image unchanged, so it is observationally identical. */
+/* TCC_NO_STACK_ARG_GROUP restores the ungrouped inline path, the control arm
+ * of the windowed stack-argument A/B. */
+TCC_DBG_ENV_FLAG(th_no_stack_arg_group, "TCC_NO_STACK_ARG_GROUP")
+
 static void place_stack_arguments(CallGenContext *ctx)
 {
   int max_imm_off = -1;
@@ -12928,7 +13217,7 @@ static void place_stack_arguments(CallGenContext *ctx)
     }
   }
 
-  if (!(max_imm_off > 4092 && imm_count >= 2) || getenv("TCC_NO_STACK_ARG_GROUP"))
+  if (!(max_imm_off > 4092 && imm_count >= 2) || th_no_stack_arg_group())
   {
     place_stack_arguments_inline(ctx);
     return;
@@ -13091,6 +13380,43 @@ static int mach_callee_is_variadic(const MachineOperand *func_mop)
   return s->type.ref && s->type.ref->f.func_type == FUNC_ELLIPSIS;
 }
 
+/* True when the callee is a function this translation unit has already
+ * emitted, so the call cannot leave the module and R9 survives it.
+ *
+ * Only an already-defined symbol qualifies: the test reads the ELF symbol,
+ * and a forward reference (callee defined later in the TU, or extern) is
+ * still SHN_UNDEF here, so it conservatively keeps the reload.  That also
+ * makes the predicate stable across the dry run and the real pass, which it
+ * must be or literal-pool windows desync -- the dry run skips
+ * put_extern_sym, but that only ever creates UNDEF entries, so a symbol
+ * reads defined in both passes or neither.
+ *
+ * STT_FUNC is required so a same-named data symbol cannot qualify, and the
+ * target section must be executable: an SHN_ABS or data-section symbol is
+ * not a function body we compiled under this R9 contract. */
+static int thumb_callee_in_this_module(const MachineOperand *func_mop)
+{
+  Sym *sym;
+  ElfSym *esym;
+  Section *sec;
+
+  if (!text_and_data_separation)
+    return 0;
+  if (func_mop->kind != MACH_OP_SYMBOL || !func_mop->u.sym.sym)
+    return 0;
+  sym = func_mop->u.sym.sym;
+  if (sym->v & SYM_FIELD)
+    return 0;
+  esym = elfsym(sym);
+  if (!esym || esym->st_shndx == SHN_UNDEF || esym->st_shndx == SHN_ABS ||
+      esym->st_shndx >= tcc_state->nb_sections)
+    return 0;
+  if (ELFW(ST_TYPE)(esym->st_info) != STT_FUNC)
+    return 0;
+  sec = tcc_state->sections[esym->st_shndx];
+  return sec && (sec->sh_flags & SHF_EXECINSTR) != 0;
+}
+
 static void handle_return_value_mop(const MachineOperand *dest_mop, int drop_value, int soft_float_return)
 {
   if (drop_value)
@@ -13219,6 +13545,23 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   if (!tail_call_pending && text_and_data_separation)
     arg_regs_save_mask |= (1 << ARM_R9);
 
+  /* ...but a callee in THIS module shares our GOT base and hands it back
+   * intact, so its reload is dead.  R9 is not allocatable under
+   * text_and_data_separation, tail calls are disabled outright in this mode
+   * (ir/codegen.c), and every call site below reloads R9, so a function here
+   * either never touches R9 or returns with its own module's base in it --
+   * which for a same-module callee is the value we already hold.  Only the
+   * cross-module path breaks that: an import goes through a loader thunk that
+   * swaps in the callee's base and tail-jumps, so nothing restores ours.
+   *
+   * Note this suppresses the RELOAD only, never the mask bit: the mask also
+   * assigns save-area slots, and clearing R9 from it would slide R0-R3 down
+   * onto slot 0 and overwrite the prologue-stored GOT base for every other
+   * call site in the function. */
+  int restore_r9 = 1;
+  if (arg_regs_save_mask & (1 << ARM_R9))
+    restore_r9 = !thumb_callee_in_this_module(&func_mop);
+
   /* Save nested-call registers to pre-reserved frame area via STR.
    * The nested save area is at [SP + ir->call_outgoing_size].
    *
@@ -13234,8 +13577,23 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   int nested_save_count = 0;
   if (arg_regs_save_mask)
   {
+    /* R9 takes slot 0 so that its frame offset is the same at every call site
+     * in the function.  That is what lets the store be hoisted: the GOT base
+     * is function-invariant, so the single store in the prologue dominates
+     * every reload below and the per-call-site store is redundant.  It used to
+     * be emitted here, and because R9 was slotted after whichever of R0-R3
+     * happened to be live the offset moved from call to call, which is what
+     * hid the redundancy.  The argument registers, whose live set genuinely
+     * does vary per call site, are packed above it.
+     *
+     * Emitting the store here again would be harmless but wasteful: it was
+     * 45,329 instructions (165 KiB) across the compiler's own build. */
+    if (arg_regs_save_mask & (1 << ARM_R9))
+      nested_save_count = 1;
     for (int r = 0; r < 16; r++)
     {
+      if (r == ARM_R9)
+        continue;
       if (arg_regs_save_mask & (1 << r))
       {
         if (tcc_state->func_dynamic_sp)
@@ -13397,12 +13755,17 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     /* Match the FP-relative addressing used by the save side in functions
      * with VLA/alloca (runtime SP has moved; see the save block above). */
     const int restore_base = tcc_state->func_dynamic_sp ? R_FP : ARM_SP;
-    int restore_idx = 0;
+    /* Mirror the slot assignment of the save block: R9 is at slot 0 (stored
+     * once in the prologue), the argument registers start above it. */
+    int restore_idx = (arg_regs_save_mask & (1 << ARM_R9)) ? 1 : 0;
     for (int r = 0; r < 16; r++)
     {
+      if (r == ARM_R9 && !restore_r9)
+        continue; /* same-module callee: our GOT base is still live in R9 */
       if (arg_regs_save_mask & (1 << r))
       {
-        int off = nested_save_sp_offset + restore_idx * 4 + nested_save_fp_bias;
+        int slot = (r == ARM_R9) ? 0 : restore_idx;
+        int off = nested_save_sp_offset + slot * 4 + nested_save_fp_bias;
         int sign = (off < 0);
         int abs_off = sign ? -off : off;
         /* R9 restore in text_and_data_separation mode needs the write guard
@@ -13419,7 +13782,8 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
         }
         if (r == ARM_R9 && text_and_data_separation)
           allow_r9_write = 0;
-        restore_idx++;
+        if (r != ARM_R9)
+          restore_idx++;
       }
     }
   }

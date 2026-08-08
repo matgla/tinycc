@@ -30,7 +30,6 @@
 #include "opt/ssa/var_imm_prop.h"
 #include "opt/ssa/cprop.h"
 
-extern int tcc_ir_opt_pass_disabled(const char *name);
 
 static const IRSSAOptGen *target_gens;
 static int target_gen_count;
@@ -61,7 +60,6 @@ int ssa_opt_run_gens(IRSSAOptCtx *ctx, const IRSSAOptGen *gens, int count)
   return changes;
 }
 
-void dbg_scan_imm_dest(TCCIRState *ir, const char *pass);
 int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
 {
   int total = 0;

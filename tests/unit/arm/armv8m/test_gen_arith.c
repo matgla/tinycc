@@ -29,7 +29,7 @@
 #include "source/backend/arch/arm/thumb/thop_mov.h"
 #include "source/backend/arch/arm/thumb/thop_mul.h"
 #include "source/backend/arch/arm/thumb/thop_system.h"
-#include "ir/machine_op.h"
+#include "source/ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
 

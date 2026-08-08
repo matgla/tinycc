@@ -14,7 +14,6 @@
 #include "load_cse.h"
 #include <limits.h>
 
-extern int tcc_ir_opt_pass_disabled(const char *name);
 
 #define GLOAD_MAX 16
 #define SSTORE_MAX 16

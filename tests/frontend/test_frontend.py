@@ -233,8 +233,13 @@ TYPES_CASE_IDS = [name for name, _, _ in TYPES_CASES]
 @pytest.mark.frontend_types
 def test_types(name, c_file, golden, debug_compiler, tmp_path, request):
     updating = request.config.getoption("--update")
+    # -mfpu=none pins the float lowering the goldens were recorded under.
+    # Without it the IR for a float expression depends on how the compiler was
+    # configured: a build with CONFIG_TCC_DEFAULT_FPU set to a VFP unit emits
+    # FADD where these goldens expect the __aeabi_fadd call. Float codegen per
+    # FPU/ABI is what tests/ir_tests and `make test-fp` cover.
     result, cmd = _run_compiler(
-        debug_compiler, ["-dump-ir", "-c"], c_file, tmp_path
+        debug_compiler, ["-dump-ir", "-mfpu=none", "-c"], c_file, tmp_path
     )
 
     if result.returncode != 0:

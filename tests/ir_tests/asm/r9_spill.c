@@ -1,8 +1,8 @@
 /* Phase D lever: R9 GOT-base save/restore around calls.
- * With -mpic-data-is-text-relative the backend treats R9 as the GOT base and
- * currently saves/restores it around every call.  This test characterizes the
- * current behavior; once Phase 1 of plan_binary_size_reduction.md lands it
- * should be flipped to assert the absence of these saves.
+ * With -mpic-data-is-text-relative the backend treats R9 as the GOT base.  It
+ * used to save and restore it around every call; Phase 1 of
+ * plan_binary_size_reduction.md hoisted the save, so the shape to hold now is
+ * one store in the prologue and one reload after each call.
  */
 int callee(int x);
 

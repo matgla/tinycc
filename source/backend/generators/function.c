@@ -9,9 +9,9 @@
  */
 
 #include "tcc.h"
-#include "ir/cfg.h"
-#include "ir/codegen.h"
-#include "ir/core.h"
+#include "source/ir/cfg.h"
+#include "source/ir/codegen.h"
+#include "source/ir/core.h"
 #include "source/opt/include/licm.h"
 #include "source/opt/include/opt.h"
 #include "source/opt/include/opt_utils.h"
@@ -20,8 +20,8 @@
 #include "source/opt/include/opt_gens_fusion.h"
 #include "opt/flat/bool.h"
 #include "opt/flat/call_result.h"
-#include "ir/regalloc.h"
-#include "ir/ssa.h"
+#include "source/ir/regalloc.h"
+#include "source/ir/ssa.h"
 #include "tccir.h"
 #include "source/backend/arch/arm/arm_regalloc.h"
 #include "tcc_scope.h"
@@ -198,7 +198,7 @@ void gen_function(Sym *sym)
 
   func_vla_arg(sym);
   if (tcc_state->do_bench)
-    phase_start = tcc_getclock_ms();
+    phase_start = tcc_getclock_us();
   block(0);
   tcc_ir_backpatch_to_here(ir, rsym);
 
@@ -320,7 +320,7 @@ void gen_function(Sym *sym)
 
   if (tcc_state->do_bench)
   {
-    unsigned now = tcc_getclock_ms();
+    unsigned now = tcc_getclock_us();
     tcc_bench_log_phase(tcc_state, "func-body", funcname, &tcc_state->bench_function_body_time,
                         &tcc_state->bench_function_body_count, now - phase_start);
     phase_start = now;
@@ -337,7 +337,7 @@ void gen_function(Sym *sym)
 
   if (tcc_state->do_bench)
   {
-    unsigned now = tcc_getclock_ms();
+    unsigned now = tcc_getclock_us();
     tcc_bench_log_phase(tcc_state, "func-opt", funcname, &tcc_state->bench_function_opt_time,
                         &tcc_state->bench_function_opt_count, now - phase_start);
     phase_start = now;
@@ -372,7 +372,7 @@ void gen_function(Sym *sym)
 
   if (tcc_state->do_bench)
   {
-    unsigned now = tcc_getclock_ms();
+    unsigned now = tcc_getclock_us();
     tcc_bench_log_phase(tcc_state, "func-codegen", funcname, &tcc_state->bench_function_codegen_time,
                         &tcc_state->bench_function_codegen_count, now - phase_start);
   }

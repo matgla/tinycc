@@ -1683,13 +1683,16 @@ static int sccp_materialize_const_phis(SCCPState *s)
   return changes;
 }
 
-void dbg_scan_imm_dest(TCCIRState *ir, const char *pass);
+/* Called from inside the rewrite loop — latch it (see ssa_no_store2assign). */
+TCC_DBG_ENV_FLAG(scan_imm_dest, "SCAN_IMM_DEST")
+TCC_DBG_ENV_FLAG(sccp_dump_ob, "DUMP_OB")
+
 static int sccp_apply(SCCPState *s)
 {
   TCCIRState *ir = s->ctx->ir;
   int changes = 0;
 
-  if (getenv("DUMP_OB")) {
+  TCC_DBG_BLOCK(sccp_dump_ob) {
     fprintf(stderr, "=== operand layout at sccp_apply entry ===\n");
     for (int i = 0; i < ir->next_instruction_index && i < 12; i++) {
       IRQuadCompact *q = &ir->compact_instructions[i];
@@ -1724,10 +1727,10 @@ static int sccp_apply(SCCPState *s)
     }
 
     IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (getenv("SCAN_IMM_DEST"))
-      fprintf(stderr, "SCCP rewrite def_instr=%d orig_op=%d has_dest=%d has_src1=%d has_src2=%d ob=%d\n",
-              vi->def_instr, (int)q->op, irop_config[q->op].has_dest, irop_config[q->op].has_src1,
-              irop_config[q->op].has_src2, q->operand_base);
+    TCC_DBG_TRACE(scan_imm_dest,
+                  (stderr, "SCCP rewrite def_instr=%d orig_op=%d has_dest=%d has_src1=%d has_src2=%d ob=%d\n",
+                   vi->def_instr, (int)q->op, irop_config[q->op].has_dest, irop_config[q->op].has_src1,
+                   irop_config[q->op].has_src2, q->operand_base));
     int64_t val = s->cells[pos].value;
     IROperand imm;
     if (val == (int64_t)(int32_t)val) {
@@ -1750,7 +1753,7 @@ static int sccp_apply(SCCPState *s)
     tcc_ir_set_src1(ir, vi->def_instr, imm);
     tcc_ir_set_src2(ir, vi->def_instr, IROP_NONE);
     changes++;
-    if (getenv("SCAN_IMM_DEST")) {
+    TCC_DBG_BLOCK(scan_imm_dest) {
       for (int j = 0; j < ir->next_instruction_index; j++) {
         IRQuadCompact *jq = &ir->compact_instructions[j];
         if (jq->op != TCCIR_OP_ASSIGN) continue;

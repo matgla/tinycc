@@ -20,7 +20,7 @@
 
 #pragma once
 
-#include "ir/regalloc.h"
+#include "source/ir/regalloc.h"
 
 const RegAllocTarget *arm_get_regalloc_target(void);
 

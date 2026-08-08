@@ -149,8 +149,12 @@ def test_r9_spill_around_calls():
     ldr_r9 = _count_mnem_regex(caller, r"^ldr\.w.*r9")
     mov_r9_r10 = _count_mnem_regex(caller, r"^mov\s+.*r9.*r10")
 
-    # Current codegen: R9 is saved before each call and restored after.
-    assert str_r9 >= 2, f"expected R9 saves around calls, got {str_r9} str.w r9"
+    # R9 holds the PIC GOT base and is function-invariant, so 173819f4 hoisted
+    # the save out of the call sites: one store in the prologue, a reload after
+    # each call.  Exactly one — a second store means the per-call re-save is
+    # back (42,356 of the 45,329 stores were dead), zero means the reloads have
+    # nothing to read.
+    assert str_r9 == 1, f"expected a single hoisted R9 save, got {str_r9} str.w r9"
     assert ldr_r9 >= 2, f"expected R9 restores after calls, got {ldr_r9} ldr.w r9"
     # Phase 1b (callee-saved R10 holding the GOT base) is not implemented yet.
     assert mov_r9_r10 == 0, "unexpected mov r9, r10 (Phase 1b not landed)"
@@ -634,3 +638,69 @@ def test_bool_chain_fuse():
         fn = funcs[name]
         assert _count_mnem(fn, "ite") == 0, f"{name}: SETIF chain not fused"
         assert _count_mnem(fn, "cmp") == 1, f"{name}: expected a single cmp"
+
+
+# -----------------------------------------------------------------------------
+# Inline asm operand marshalling
+# -----------------------------------------------------------------------------
+def _symbolic_gpr_eval(func_insns, params):
+    """Interpret a mov/add-only function symbolically over its parameters.
+
+    Returns the Counter of parameter terms left in r0 (the return register).
+    Registers start holding the AAPCS core arguments, so r0="a", r1="b", ...
+    Anything other than a register mov/add or the final `bx lr` fails the test:
+    the point is to notice unexpected codegen rather than to skip past it.
+    """
+    state = {i: Counter([name]) for i, name in enumerate(params)}
+    reg = re.compile(r"^r(\d+)$|^(ip)$")
+
+    def rnum(tok):
+        m = reg.match(tok.strip())
+        assert m, f"unexpected operand {tok!r} in {func_insns}"
+        return 12 if m.group(2) else int(m.group(1))
+
+    for mnem, ops in func_insns:
+        parts = [p.strip() for p in ops.split(",")] if ops else []
+        if mnem in ("mov", "mov.w", "movs"):
+            d, s = rnum(parts[0]), rnum(parts[1])
+            state[d] = Counter(state.get(s, Counter()))
+        elif mnem in ("add", "add.w", "adds"):
+            if len(parts) == 2:  # T1: add rd, rm
+                d, s = rnum(parts[0]), rnum(parts[1])
+                state[d] = state.get(d, Counter()) + state.get(s, Counter())
+            else:
+                d, a, b = rnum(parts[0]), rnum(parts[1]), rnum(parts[2])
+                state[d] = state.get(a, Counter()) + state.get(b, Counter())
+        elif mnem == "bx":
+            break
+        else:
+            raise AssertionError(f"unexpected instruction {mnem} {ops!r}")
+    return state.get(0, Counter())
+
+
+def test_asm_operand_loads_do_not_clobber_each_other():
+    """Each "r" operand must reach the asm body holding its own value.
+
+    Regression test for asm_gen_code emitting the operand loads in declaration
+    order: with register-allocated values that is a parallel move, and loading
+    %1 into a register that still held %2's source destroyed it.  Float
+    parameters trigger the permutation (a in r2, b in r0, constraints wanting r0
+    and r1), so `"r"(a), "r"(b)` loaded `a` into both -- which is why
+    libvfpv4sp's hardware __aeabi_fadd computed a+a.
+    """
+    obj = _compile("asm_operand_shuffle")
+    funcs = _disassemble(obj)
+
+    cases = {
+        "two_floats": ["a", "b"],
+        "two_ints": ["a", "b"],
+        "three_floats": ["a", "b", "c"],
+    }
+    for name, params in cases.items():
+        got = _symbolic_gpr_eval(funcs[name], params)
+        want = Counter(params)
+        assert got == want, (
+            f"{name}: asm body summed {sorted(got.elements())}, expected "
+            f"{sorted(want.elements())} -- an operand load clobbered another "
+            f"operand's source"
+        )

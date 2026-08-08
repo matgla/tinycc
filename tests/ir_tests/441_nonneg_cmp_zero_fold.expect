@@ -1,0 +1,17 @@
+nan_lt=0
+nan_ge=0
+nan_gt0=0
+nan_le0=0
+nanf_lt=0
+nanf_ge=0
+nanf_gt0=0
+nanf_le0=0
+val_lt=0
+val_ge=1
+val_gt0=0
+val_le0=1
+valf_lt=0
+valf_ge=1
+valf_gt0=0
+valf_le0=1
+PASS

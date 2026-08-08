@@ -1013,12 +1013,11 @@ static int cmd_try_one(TCCIRState *ir, int ci)
   return 1;
 }
 
+TCC_DBG_ENV_FLAG(bsm_no_const_memcpy, "TCC_NO_CONST_MEMCPY")
+
 int tcc_ir_opt_const_memcpy_to_dest(TCCIRState *ir)
 {
-  static int disabled = -1;
-  if (disabled < 0)
-    disabled = getenv("TCC_NO_CONST_MEMCPY") != NULL;
-  if (disabled)
+  if (bsm_no_const_memcpy())
     return 0;
 
   int n = ir->next_instruction_index;

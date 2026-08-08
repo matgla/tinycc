@@ -52,7 +52,8 @@ int32_t ir_opt_mla_accum_vreg(const struct TCCIRState *ir, const struct IRQuadCo
 
 int is_power_of_2(int64_t n);
 
-int tcc_ir_opt_pass_disabled(const char *name);
+/* tcc_ir_opt_pass_disabled (TCC_DISABLE_PASS) is declared in tccir.h — its
+ * release no-op has to reach TUs that never include this header. */
 
 int vrp_negate_cmp_tok(int tok);
 int vrp_swap_cmp_tok(int tok);

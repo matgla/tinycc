@@ -659,6 +659,35 @@ int tcc_gen_machine_dry_run_get_lr_push_count(void)
   return cgstub_knobs.lr_push_count;
 }
 
+uint32_t tcc_gen_machine_rodata_anchor_claim(uint64_t used_registers)
+{
+  (void)used_registers;
+  cgstub_record("rodata_anchor_claim", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
+  return 0;
+}
+
+void tcc_gen_machine_rodata_anchor_reset(void)
+{
+  cgstub_record("rodata_anchor_reset", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
+}
+
+/* Site scan for the rodata anchor: the real one (arm-thumb-gen.c) walks the
+ * IR counting anchor-worthy references.  Reporting 0 keeps the allocator on
+ * its no-anchor path, which is what these tests expect. */
+int tcc_gen_machine_rodata_anchor_ir_sites(const struct TCCIRState *ir, int stop_at)
+{
+  (void)ir;
+  (void)stop_at;
+  cgstub_record("rodata_anchor_ir_sites", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
+  return 0;
+}
+
+int tcc_gen_machine_rodata_anchor_get(void)
+{
+  cgstub_record("rodata_anchor_get", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
+  return -1;
+}
+
 uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void)
 {
   cgstub_record("dry_run_get_scratch_regs_pushed", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);

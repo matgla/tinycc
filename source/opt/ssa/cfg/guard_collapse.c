@@ -17,7 +17,6 @@
 #include "opt/ssa/cprop.h"
 #include "global_store_dse.h"
 
-extern int tcc_ir_opt_pass_disabled(const char *name);
 
 /* Const-guard chains fold one guard per round, so iterate until branch folding runs dry. */
 int tcc_ir_ssa_opt_guard_collapse(IRSSAOptCtx *ctx)

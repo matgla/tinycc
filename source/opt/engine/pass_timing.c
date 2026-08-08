@@ -15,11 +15,17 @@
 
 signed char tcc_pass_timing_on = -1;
 
+/* TCC_PASS_TIMING=1 is the env form of -bench for the per-pass table
+ * (scripts/opt_profile.py drives it).  Compiled out of a release build, where
+ * -bench (tcc_state->do_bench) remains the way in — so an on-device PASS_TIME
+ * dump needs the flag, not the variable. */
+TCC_DBG_ENV_FLAG(pass_timing_env_on, "TCC_PASS_TIMING")
+
 void tcc_pass_timing_init(void)
 {
   if (tcc_pass_timing_on < 0)
     tcc_pass_timing_on =
-        (getenv("TCC_PASS_TIMING") || (tcc_state && tcc_state->do_bench)) ? 1 : 0;
+        (pass_timing_env_on() || (tcc_state && tcc_state->do_bench)) ? 1 : 0;
 }
 
 unsigned long tcc_pass_clk_us(void)

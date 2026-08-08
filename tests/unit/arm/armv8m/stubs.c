@@ -63,6 +63,32 @@ void *tcc_realloc(void *ptr, unsigned long size)
   return p;
 }
 
+/* tcc.h routes every tcc_malloc/tcc_mallocz/tcc_realloc call site through these
+ * attribution wrappers (they record the source line of mmap-class allocations
+ * for -bench).  The modules under test are compiled against that header, so the
+ * stub layer has to answer to the wrapper names; the accounting itself is of no
+ * interest here, so they just forward. */
+void *tcc_malloc_at(unsigned long size, const char *file, int line)
+{
+  (void)file;
+  (void)line;
+  return tcc_malloc(size);
+}
+
+void *tcc_mallocz_at(unsigned long size, const char *file, int line)
+{
+  (void)file;
+  (void)line;
+  return tcc_mallocz(size);
+}
+
+void *tcc_realloc_at(void *ptr, unsigned long size, const char *file, int line)
+{
+  (void)file;
+  (void)line;
+  return tcc_realloc(ptr, size);
+}
+
 void tcc_free(void *ptr)
 {
   free(ptr);

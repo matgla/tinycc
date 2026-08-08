@@ -61,6 +61,48 @@ in pico-sdk's `double_aeabi_dcp.S`. **Keep doubles on the GPR ABI permanently.**
 
 ### Landed and verified
 
+**Shipped to the whole userland (yasos.zig).** `-mfpu=rp2350` is no longer opt-in
+per command line: `CONFIG_BUILD_USERSPACE_HARDWARE_FP` compiles the default into
+the toolchain (`-DCONFIG_TCC_DEFAULT_FPU=ARM_FPU_RP2350` on both tcc stages), so
+every rootfs library, every application, tcc's own bootstrap and on-device
+compiles use it, and each link picks the matching runtime. See
+`docs/userspace_floating_point.md` in the yasos.zig root for the switch, the
+per-CPU FPU mapping and the FTZ contract. Three things had to be true first:
+
+- **Phase 3d is half closed — the scheduler now saves DCP state.** The
+  preemptor-saves contract needed an implementation before this could ship, and
+  in an OS the preemptor is the context switch, not an ISR:
+  `source/arch/armv8-m/context_switch.S` (yasos.zig) peeks `PCMP` on every
+  switch and saves/restores X/Y/EFD when a sequence is in flight. The library
+  half (ISR-safe `__aeabi_*` entry points) is still open — see below.
+- **`libvfpv4sp` is self-contained**, so the QEMU Cortex-M33 boards can run the
+  inline-VFP half of this work (they have FPv5-SP but no CP4) without libgcc
+  filling gaps. It was 20 `__aeabi_*` symbols short and its `__aeabi_cfcmp*`
+  returned FPSCR in r0 instead of setting the flags — a convention nothing in
+  the tree tests against. Now borrows the same soft objects rp2350 does (plus
+  `fcmp.c`/`fcmp_asm.S`, dropping the local wrong ones) and is covered by
+  `make check-self-contained`.
+- **Two compiler bugs the hardware float path walked straight into**, both fixed:
+  - `asm_gen_code` loaded inline-asm operands in declaration order, so one
+    operand's destination register clobbered another's still-pending source. Float
+    parameters made it fire (allocator picks r2/r0, constraints want r0/r1), which
+    is why `libvfpv4sp`'s hand-written `__aeabi_fadd` computed `a+a`. The loads
+    are now sequenced as the parallel move they are, breaking cycles through the
+    stack. Regression test: `test_asm_operand_loads_do_not_clobber_each_other`
+    (`tests/ir_tests/test_codegen_asm.py`), mutation-checked.
+  - `arm_determine_fpu_config()` ignored `-mfloat-abi=soft`, leaving the `has_*`
+    bits set while the emitters refused to inline — so the backend emitted a `BL`
+    whose r0-r3 clobber `ir_op_is_implicit_call_ra()` no longer modelled. Latent
+    while `-mfloat-abi=soft` implied no `-mfpu`; a compiled-in default makes it
+    reachable. `soft` now resolves to the soft table, which also makes this test
+    suite immune to a compiler shipped with a default `-mfpu` (it passes
+    `-mfloat-abi=soft` throughout).
+
+  Validated on QEMU (mps2-an505, `fpv5-sp-d16` + `libvfpv4sp`): full yasos smoke
+  suite **13352 passed / 216 skipped / 0 failed**, including
+  `421_fp_conformance` on device at -O0/-O1/-O2 — 3057/3057 double, 2803/2803
+  float, bit-exact.
+
 **Phase 1 — coprocessor instructions.** Nothing in-tree could emit or assemble a
 CP4 instruction; `thumb.h`'s `coproc` feature bit was reserved but never set.
 
@@ -386,8 +428,8 @@ Roughly in the order they are worth doing:
 
 | # | Item | Why now | Size |
 |---|---|---|---|
-| 1 | **Ratify the FTZ policy** (3c-bis) | A user-visible correctness contract that is currently undocumented; blocks recommending the flag | decision + docs |
-| 2 | **Reentrancy** (3d) | The preemptor-saves contract is written down but not implemented in either half; invisible to every test we have | small–medium |
+| 1 | ~~**Ratify the FTZ policy** (3c-bis)~~ | DONE: accepted and documented where users meet the switch (`docs/userspace_floating_point.md` in yasos.zig, and the `CONFIG_BUILD_USERSPACE_HARDWARE_FP` help text) | decision + docs |
+| 2 | **Reentrancy — library half** (3d) | Scheduler half landed (context switch saves X/Y/EFD); the `__aeabi_*` entry points still do not call their own save/restore, so an ISR doing double math can corrupt an interrupted sequence | small–medium |
 | 3 | **`dneg` + DCP conversions** (4) | Zero-scratch, sequences already hardware-verified in `dcp_aeabi.S`; transcription plus a bit each | small |
 | 4 | **VFP `fneg` / conversions / `fcmp`** (5) | Same shape as the landed float arithmetic; `fcmp` needs a third condition mapping | small–medium |
 | 5 | **`dmul`** (4) | `double_mul` is 2.8x where add/sub reach 28.8x, but 7 scratch registers need a real answer | medium |
@@ -396,6 +438,11 @@ Roughly in the order they are worth doing:
 
 Items 3 and 4 are the cheap ones. Item 6 is the easiest to forget and the
 easiest to regress on, because nothing fails — the code just gets bigger.
+
+Now that the whole userland is built this way, item 6 also has a bigger blast
+radius than when `-mfpu=rp2350` was opt-in: every constant fold and purity check
+that matches on an `__aeabi_` symbol name is dark for `dadd`/`dsub`/`dcmp` and
+the float arithmetic across the entire rootfs.
 
 ### Phase 3c-bis — decide the subnormal policy *(immediate)*
 
@@ -437,25 +484,37 @@ Everything up to the flash step is reproducible without a board:
 locally. `tests/ir_tests/170_nan_comparison.c` does *not* guard the DCP compare
 path — it runs on QEMU, which never executes a DCP instruction.
 
-### Phase 3d — reentrancy *(known gap, now the largest one)*
+### Phase 3d — reentrancy *(scheduler half landed; library half still open)*
 
 A DCP sequence is not atomic. If an interrupt preempts one and the handler also
 uses the DCP, the interrupted computation is corrupted. The agreed contract is
-**preemptor saves**: inlined sequences run unguarded, and any ISR touching
-doubles must reach the DCP through the `__aeabi_*` entry points, which do the
-engaged-check and save/restore.
+**preemptor saves**: inlined sequences run unguarded, and any preemptor that
+touches doubles saves the state first.
 
-`__rp2350_dcp_save` / `_restore` / `_engaged` exist in `dcp_aeabi.S`, but **the
-entry points do not yet use them**, so the library is not currently ISR-safe.
-The single-threaded case is correct.
+**The scheduler half is implemented** (yasos.zig, not here). Under a preemptive
+OS the preemptor that matters is the context switch, not an ISR: two processes
+each doing double arithmetic corrupt each other with nothing else involved, at a
+5 ms switch period, silently. `source/arch/armv8-m/context_switch.S`
+(`DCP_SAVE_STATE` / `DCP_RESTORE_STATE`, gated on `CONFIG_CPU_HAS_DCP` +
+`CONFIG_BUILD_USERSPACE_HARDWARE_FP`) peeks `PCMP` on every switch — one
+non-engaging instruction — and saves X/Y/EFD into the process's software frame
+only when a sequence is in flight. `REFD` clears the engaged flag and the
+`W*MD` writes re-engage, so a process preempted twice inside one sequence is
+saved twice.
 
-**This moved up the list when Phase 4 landed.** The contract only holds if the
-unguarded half is the *inlined* code and the guarded half is the library — and
-until the entry points actually call save/restore, neither half is guarded.
-Before `-mfpu=rp2350` is recommended for anything with interrupts, this needs
-closing. Nothing in the conformance suite or the benchmarks touches it; both are
-single-threaded, which is exactly why it has stayed invisible through every
-green run so far.
+**The library half is still open.** `__rp2350_dcp_save` / `_restore` /
+`_engaged` exist in `dcp_aeabi.S`, but **the entry points do not yet use them**,
+so an *interrupt handler* doing double arithmetic through `__aeabi_*` can still
+corrupt an interrupted user-space sequence. On yasos.zig that is currently
+unreachable — kernel ISRs are compiled by arm-none-eabi-gcc, which has no DCP
+support, and their doubles come from libgcc — but it has to close before any
+userspace ISR-like context (signal handler, driver callback in a library) does
+double math.
+
+Nothing in the conformance suite or the benchmarks touches either half; both are
+single-threaded, which is exactly why this stayed invisible through every green
+run. The scheduler half is now exercised implicitly by every multi-process smoke
+run on hardware.
 
 pico-sdk's `saving_func` avoids duplicating each sequence with an `lr`-hooking
 trick: the entry point sits after a `push {lr}` / `bl generic_save_state` /

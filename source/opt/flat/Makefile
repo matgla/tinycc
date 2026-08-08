@@ -153,9 +153,9 @@ FLAT_OPT_HDRS = \
 	source/opt/flat/include/opt/flat/disp.h \
 	source/opt/flat/include/opt/flat/if_convert.h \
 	$(OPT_DSL_HEADERS) \
-	$(wildcard ir/*.h) \
-	tcc.h tccir.h
+	$(wildcard source/ir/*.h) \
+	source/include/tcc.h source/ir/tccir.h
 
-$(X)source/opt/flat/%.o: source/opt/flat/%.c $(FLAT_OPT_HDRS) config.mak
+$(X)source/opt/flat/%.o: source/opt/flat/%.c $(FLAT_OPT_HDRS) $(TCC_CORE_DEPS)
 	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))

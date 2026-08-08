@@ -107,12 +107,11 @@ static int caf_dop(TCCIRState *ir, IRQuadCompact *q)
   return 0;
 }
 
+TCC_DBG_ENV_FLAG(cagg_disabled, "TCC_NO_CONST_AGG")
+
 int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
 {
-  static int disabled = -1;
-  if (disabled < 0)
-    disabled = getenv("TCC_NO_CONST_AGG") != NULL;
-  if (disabled)
+  if (cagg_disabled())
     return 0;
 
   int n = ir->next_instruction_index;

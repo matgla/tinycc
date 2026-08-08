@@ -8,11 +8,11 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "cfg.h"
-#include "ir/ssa.h"
-#include "ir/vreg.h"
-#include "ir/regalloc.h"
-#include "ir/codegen.h"
-#include "ir/machine_op.h"
+#include "source/ir/ssa.h"
+#include "source/ir/vreg.h"
+#include "source/ir/regalloc.h"
+#include "source/ir/codegen.h"
+#include "source/ir/machine_op.h"
 #include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
@@ -54,6 +54,17 @@ static void setup_tcc_state(void)
   tcc_state->float_registers_for_allocator = 32;
   tcc_state->float_registers_map_for_allocator = (1ull << 32) - 1;
   tcc_state->optimize = 0;
+}
+
+/* -O0 no longer runs the dry-run/rehearsal walks: it skips the rehearsal
+ * outright and drops the forward-branch term that would otherwise force the
+ * discovery pass (see the two comments around `cg_skip_rehearsal` and
+ * `fwd_branch_may_force_dry` in ir/codegen.c).  Tests that assert on two-pass
+ * dispatch therefore have to opt into an optimizing level. */
+static void setup_tcc_state_two_pass(void)
+{
+  setup_tcc_state();
+  tcc_state->optimize = 1;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -771,7 +782,7 @@ UT_TEST(test_dispatch_jump_routes_to_jump_mop)
 {
   cgstub_reset();
   TCCIRState *ir = tcc_ir_alloc();
-  setup_tcc_state();
+  setup_tcc_state_two_pass();
 
   int v = tcc_ir_vreg_alloc_temp(ir);
   SValue s_v = sv_var(v);
@@ -800,7 +811,7 @@ UT_TEST(test_dispatch_jumpif_routes_to_conditional_jump_mop)
 {
   cgstub_reset();
   TCCIRState *ir = tcc_ir_alloc();
-  setup_tcc_state();
+  setup_tcc_state_two_pass();
 
   int cond = tcc_ir_vreg_alloc_temp(ir);
   SValue s_cond = sv_var(cond);
@@ -897,7 +908,7 @@ UT_TEST(test_dispatch_switch_table_uses_distinct_mop_per_pass)
   cgstub_set_switch_entry_sizes(4, 4);
 
   TCCIRState *ir = tcc_ir_alloc();
-  setup_tcc_state();
+  setup_tcc_state_two_pass();
 
   enum
   {

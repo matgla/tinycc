@@ -13,7 +13,7 @@
 #include "ir.h"
 #include "source/backend/arch/arm/arm.h"
 #include "source/backend/arch/arm/thumb/thumb.h"
-#include "ir/machine_op.h"
+#include "source/ir/machine_op.h"
 #include "codegen_backend_stubs.h"
 #include "elfsec_stubs.h"
 

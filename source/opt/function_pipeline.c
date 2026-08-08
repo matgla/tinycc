@@ -14,7 +14,7 @@
  */
 
 #include "tcc.h"
-#include "ir/core.h"
+#include "source/ir/core.h"
 #include "source/opt/include/opt.h"
 #include "source/opt/include/opt_utils.h"
 #include "source/opt/include/opt_engine.h"
@@ -33,8 +33,6 @@
 #include "function_pipeline.h"
 
 #include <string.h>
-
-extern void dbg_scan_overlap(TCCIRState *ir, const char *pass);
 
 #ifdef CONFIG_TCC_DEBUG
 #define DUMP_IR_AFTER_PASS(ir, name) dump_ir_after_pass(ir, name)
@@ -232,7 +230,8 @@ static void run_dead_store_and_cleanup(TCCIRState *ir)
     }
   }
 
-  tcc_ir_opt_memmove_to_indexed_stores(ir);
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("memmove_to_indexed_stores"))
+    tcc_ir_opt_memmove_to_indexed_stores(ir);
   tcc_ir_opt_compact_nops(ir);
 
   /* Late, for the reason spelled out below: an early run would hide the reads
@@ -272,15 +271,32 @@ static void run_dead_store_and_cleanup(TCCIRState *ir)
 /* ================================================================== */
 static void run_post_pipeline_passes(TCCIRState *ir)
 {
-  if (tcc_ir_opt_memmove_to_indexed_stores(ir) > 0)
+  /* -O0 gating (docs/plans/o0_compile_perf.md §8).  Everything below marked
+   * `optimize >= 1` is a pure optimization that also does nothing measurable
+   * at -O0: the whole -O0 test suite stays green without them (1804
+   * gcc-torture execute + 2628 compile/other tests) AND -O0 .text over the
+   * torture corpus moves by +16 B total, while compile time drops ~2.7% on
+   * body-heavy TUs.  Each keeps its TCC_DISABLE_PASS knob for bisecting.
+   *
+   * pack64_implicit is deliberately NOT gated: it is the one pass in this
+   * group the -O0 suite depends on (gcc.dg/bitfld-3 computes a wrong result
+   * without it), i.e. it currently masks a latent 64-bit bitfield bug in the
+   * unoptimized path.  Gating it would expose that bug at -O0; it needs a
+   * real fix in the OR/SHL lowering first. */
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("memmove_to_indexed_stores") &&
+      tcc_ir_opt_memmove_to_indexed_stores(ir) > 0)
   {
     tcc_ir_opt_compact_nops(ir);
   }
 
-  tcc_ir_opt_pack64(ir);
-  tcc_ir_opt_pack64_implicit(ir);
-  tcc_ir_opt_pack64_from_stack_stores(ir);
-  tcc_ir_opt_shl32_or_chain(ir);
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("pack64"))
+    tcc_ir_opt_pack64(ir);
+  if (!tcc_ir_opt_pass_disabled("pack64_implicit"))
+    tcc_ir_opt_pack64_implicit(ir); /* ungated on purpose -- see note above */
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("pack64_from_stack_stores"))
+    tcc_ir_opt_pack64_from_stack_stores(ir);
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("shl32_or_chain"))
+    tcc_ir_opt_shl32_or_chain(ir);
 
   DUMP_IR_AFTER_PASS(ir, "ZZ2_shl32");
 
@@ -306,7 +322,7 @@ static void run_post_pipeline_passes(TCCIRState *ir)
   DUMP_IR_AFTER_PASS(ir, "ZZ2_vtf");
 
   dbg_scan_overlap(ir, "R1-before-pack64_taut");
-  if (tcc_ir_opt_pack64_tautology(ir) > 0)
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("pack64_tautology") && tcc_ir_opt_pack64_tautology(ir) > 0)
   {
     if (tcc_state->opt_copy_prop)
     {
@@ -318,14 +334,21 @@ static void run_post_pipeline_passes(TCCIRState *ir)
   dbg_scan_overlap(ir, "P3-before-cmp_narrow_64");
   dbg_scan_overlap(ir, "R4-just-before-cmp_narrow");
   DUMP_IR_AFTER_PASS(ir, "ZZ2_lge");
-  tcc_ir_opt_cmp_narrow_64(ir);
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("cmp_narrow_64"))
+    tcc_ir_opt_cmp_narrow_64(ir);
 
   dbg_scan_overlap(ir, "P4-before-assign_fuse");
-  tcc_ir_opt_assign_fuse(ir);
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("assign_fuse"))
+    tcc_ir_opt_assign_fuse(ir);
   dbg_scan_overlap(ir, "P4b-after-assign_fuse");
   DUMP_IR_AFTER_PASS(ir, "ZZ2_af");
 
-  tcc_ir_opt_select(ir);
+  /* NOT gated: if-conversion is the one pass in this group that pays for
+   itself at -O0 -- gating it grew -O0 .text by 12.7% (259,376 -> 292,418 B
+   over the 286-object torture corpus).  The other seven are size-neutral
+   there (+16 B total) and are gated above. */
+  if (!tcc_ir_opt_pass_disabled("select"))
+    tcc_ir_opt_select(ir);
   dbg_scan_overlap(ir, "P5-after-select");
 
   if (tcc_state->optimize > 0)

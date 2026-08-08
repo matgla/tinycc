@@ -366,6 +366,14 @@ TEST_FILES = [
     # handling: nested-fn label torture tests failed to compile)
     ("438_vrp_loop_phi_carried_range.c", 0),
 
+    # var_tmp_fwd must not forward off `V***DEREF*** <- T`: that stores T
+    # THROUGH the pointer V, it does not define V. Later reads of the pointer
+    # were rewritten to the stored value, so `*(rr = *rd) = ++cnt; rr[i] = x;`
+    # emitted the indexed stores with cnt as the base register (toybox
+    # save_redirect wrote its redirect undo list to absolute address cnt+off,
+    # leaving it zeroed -> unredirect ran dup2(0,0)+close(0) on the shell)
+    ("439_assign_expr_pointer_base.c", 0),
+
     # Compile-time strlen constant folding
     ("171_strlen_constfold.c", 0),
 

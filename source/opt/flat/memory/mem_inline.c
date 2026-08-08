@@ -508,14 +508,13 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
   return 1;
 }
 
+TCC_DBG_ENV_FLAG(mi_disabled, "TCC_NO_MEM_INLINE")
+
 int tcc_ir_opt_mem_inline(TCCIRState *ir)
 {
-  static int disabled = -1;
   int changes = 0;
 
-  if (disabled < 0)
-    disabled = getenv("TCC_NO_MEM_INLINE") != NULL;
-  if (disabled || tcc_ir_opt_pass_disabled("mem_inline"))
+  if (mi_disabled() || tcc_ir_opt_pass_disabled("mem_inline"))
     return 0;
   if (tcc_state->no_builtin_funcs & NO_BUILTIN_MEMFUNCS)
     return 0;

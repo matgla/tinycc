@@ -528,10 +528,14 @@ thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd, uint3
 // (all branches emit wide), so a dry-pass symbol lands mid-pool or mid-code
 // and misleads objdump worse than no symbol at all.
 // Start of T32 instructions
+/* Emitted per mapping symbol, i.e. many times per function — latch the env
+ * lookup rather than walk environ at each one. */
+TCC_DBG_ENV_FLAG(th_mapsym_trace, "TCC_MAPSYM_TRACE")
+
 void th_sym_t()
 {
   const int info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
-  if (getenv("TCC_MAPSYM_TRACE"))
+  if (th_mapsym_trace())
     fprintf(stderr, "[mapsym] $t ind=0x%x sec=%s\n", ind, cur_text_section ? cur_text_section->name : "?");
   set_elf_sym(symtab_section, ind, 0, info, 0, cur_text_section->sh_num, "$t");
 }
@@ -540,7 +544,218 @@ void th_sym_t()
 void th_sym_d()
 {
   const int info = ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE);
-  if (getenv("TCC_MAPSYM_TRACE"))
+  if (th_mapsym_trace())
     fprintf(stderr, "[mapsym] $d ind=0x%x sec=%s\n", ind, cur_text_section ? cur_text_section->name : "?");
   set_elf_sym(symtab_section, ind, 0, info, 0, cur_text_section->sh_num, "$d");
+}
+
+/* ---------------------------------------------------------------------
+ * Out-of-line definitions for the two helpers declared in thumb.h.
+ *
+ * They were `static inline`, thop_emit additionally always_inline.  tcc
+ * ignores the attribute and emits an out-of-line copy per including TU
+ * anyway -- 28 copies of thop_emit, 98 KiB -- while every call site in
+ * the image is already a `bl`.  One definition here changes nothing at
+ * those call sites.
+ * ------------------------------------------------------------------- */
+bool thop_feat32_subset(thop_feat32 sub, thop_feat sup)
+{
+  uint32_t s = thop_feat32_bits(sub);
+  return (s & (uint32_t)thop_feat_bits(sup)) == s;
+}
+
+thumb_opcode thop_emit(const char *name, const thop_variant *table, size_t n, thop_args a)
+{
+  const thop_feat target_feat = arm_target_dependent.feat;
+
+  for (size_t i = 0; i < n; i++)
+  {
+    const thop_variant *v = &table[i];
+    const thop_variant_shape *s = v->shape;
+
+    if (!thop_feat32_subset(s->feat, target_feat))
+    {
+      THOP_TRACE("%s: variant %zu skipped (feature mismatch)\n", name ? name : "?unknown?", i);
+      continue;
+    }
+
+    if (a.enc == ENFORCE_ENCODING_16BIT && s->size != THOP_VARIANT_T16)
+    {
+      THOP_TRACE("%s: variant %zu skipped (encoding T%d, requested T16)\n", name ? name : "?unknown?", i, (int)s->size);
+      continue;
+    }
+    if (a.enc == ENFORCE_ENCODING_32BIT && s->size != THOP_VARIANT_T32)
+    {
+      THOP_TRACE("%s: variant %zu skipped (encoding T%d, requested T32)\n", name ? name : "?unknown?", i, (int)s->size);
+      continue;
+    }
+
+    if ((s->rd_place.width || s->rd_con) && !thop_reg_ok(a.rd, s->rd_con))
+    {
+      THOP_TRACE("%s: variant %zu skipped (rd=%u constraint failed)\n", name ? name : "?unknown?", i, a.rd);
+      continue;
+    }
+    if ((s->rn_place.width || s->rn_con) && !thop_reg_ok(a.rn, s->rn_con))
+    {
+      THOP_TRACE("%s: variant %zu skipped (rn=%u constraint failed)\n", name ? name : "?unknown?", i, a.rn);
+      continue;
+    }
+    if ((s->rm_place.width || s->rm_con) && !thop_reg_ok(a.rm, s->rm_con))
+    {
+      THOP_TRACE("%s: variant %zu skipped (rm=%u constraint failed)\n", name ? name : "?unknown?", i, a.rm);
+      continue;
+    }
+    if ((s->ra_place.width || s->ra_con) && !thop_reg_ok(a.ra, s->ra_con))
+    {
+      THOP_TRACE("%s: variant %zu skipped (ra=%u constraint failed)\n", name ? name : "?unknown?", i, a.ra);
+      continue;
+    }
+
+    if ((s->rd_con & REG_EQ_RN) && a.rd != a.rn)
+    {
+      THOP_TRACE("%s: variant %zu skipped (rd==rn required, got rd=%u rn=%u)\n", name ? name : "?unknown?", i, a.rd, a.rn);
+      continue;
+    }
+    if ((s->rd_con & REG_EQ_RM) && a.rd != a.rm)
+    {
+      THOP_TRACE("%s: variant %zu skipped (rd==rm required, got rd=%u rm=%u)\n", name ? name : "?unknown?", i, a.rd, a.rm);
+      continue;
+    }
+
+    if (a.flags == FLAGS_BEHAVIOUR_SET && !s->has_s_bit && !s->implicit_s)
+    {
+      THOP_TRACE("%s: variant %zu skipped (flags SET but no s-bit)\n", name ? name : "?unknown?", i);
+      continue;
+    }
+    if (a.flags == FLAGS_BEHAVIOUR_BLOCK && s->implicit_s)
+    {
+      THOP_TRACE("%s: variant %zu skipped (implicit S-bit conflicts with BLOCK)\n", name ? name : "?unknown?", i);
+      continue;
+    }
+    if (s->forbid_s_in_it && a.in_it_block && a.flags == FLAGS_BEHAVIOUR_SET)
+    {
+      THOP_TRACE("%s: variant %zu skipped (S-bit forbidden in IT block)\n", name ? name : "?unknown?", i);
+      continue;
+    }
+    if (s->implicit_s && a.in_it_block)
+    {
+      THOP_TRACE("%s: variant %zu skipped (implicit S-bit not allowed in IT block)\n", name ? name : "?unknown?", i);
+      continue;
+    }
+
+    if (a.shift.type != THUMB_SHIFT_NONE)
+    {
+      bool has_shift_fields = s->shift_type_bits.width || s->shift_imm2_bits.width || s->shift_imm3_bits.width;
+      if (!has_shift_fields && s->shift_allowed == 0)
+      {
+        THOP_TRACE("%s: variant %zu skipped (no shift support, type=%u)\n", name ? name : "?unknown?", i, a.shift.type);
+        continue;
+      }
+      if (s->shift_allowed != 0 && !(s->shift_allowed & (1u << a.shift.type)))
+      {
+        THOP_TRACE("%s: variant %zu skipped (shift type %u not allowed)\n", name ? name : "?unknown?", i, a.shift.type);
+        continue;
+      }
+    }
+
+    if (s->puw_bits.width == 0 && s->puw_fixed != 0 && a.puw != s->puw_fixed)
+    {
+      THOP_TRACE("%s: variant %zu skipped (puw=%u, expected fixed=%u)\n", name ? name : "?unknown?", i, a.puw, s->puw_fixed);
+      continue;
+    }
+
+    uint32_t imm_bits = 0;
+    if (s->imm.kind != IMM_NONE)
+    {
+      if (!thop_try_imm(s, a.imm, &imm_bits))
+      {
+        THOP_TRACE("%s: variant %zu skipped (immediate %u invalid for this encoding)\n", name ? name : "?unknown?", i, a.imm);
+        continue;
+      }
+    }
+
+    /* ── bitmask-field pre-processing ── */
+    if ((s->rm_con & REG_LOW_REGSET) && (a.rm & ~0xff))
+    {
+      THOP_TRACE("%s: variant %zu skipped (regset bits [15:8] set, got 0x%x)\n", name ? name : "?unknown?", i, a.rm);
+      continue;
+    }
+    if ((s->rm_con & REG_RM_BIT_NOT_SP) && (a.rm & (1u << 13)))
+    {
+      THOP_TRACE("%s: variant %zu skipped (SP not allowed in reglist)\n", name ? name : "?unknown?", i);
+      continue;
+    }
+    if ((s->rm_con & REG_RM_BITS_NOT_LR_PC) && (a.rm & ((1u << 14) | (1u << 15))))
+    {
+      THOP_TRACE("%s: variant %zu skipped (LR/PC not allowed in reglist)\n", name ? name : "?unknown?", i);
+      continue;
+    }
+
+    /* exclude_bit: clear specified bit from rm before raw placement */
+    uint32_t rm_for_place = a.rm;
+    if (s->rm_raw_place.width && a.exclude_bit)
+      rm_for_place &= ~(1u << a.exclude_bit);
+
+    if (v->custom)
+    {
+      thumb_opcode r = v->custom(v->base, &a);
+      if (r.size)
+      {
+        THOP_TRACE("%s: custom T%d base=0x%x → 0x%x\n", name ? name : "?unknown?", (int)i + 1, v->base, r.opcode);
+        return r;
+      }
+      continue;
+    }
+
+    uint32_t op = v->base;
+    op |= thop_place(a.rd, s->rd_place);
+    if (s->has_rd_hi)
+      op |= thop_place(a.rd >> s->rd_place.width, (bitfield){7, 1});
+    op |= thop_place(a.rn, s->rn_place);
+    op |= thop_place(a.rm, s->rm_place);
+    op |= thop_place(a.ra, s->ra_place);
+    op |= imm_bits;
+
+    /* ── DN:Rd split (T1 high-register MOV) ── */
+    if (s->dn_rd_split.width)
+    {
+      uint32_t dn = (a.rd >> 3) & 1;
+      op |= thop_place(dn, (bitfield){7, 1});
+      op |= thop_place(a.rd & ((1u << s->dn_rd_split.width) - 1), s->dn_rd_split);
+    }
+
+    if (s->has_s_bit && a.flags == FLAGS_BEHAVIOUR_SET)
+      op |= (1u << 20);
+
+    if (s->shift_type_bits.width)
+    {
+      uint32_t sr = th_shift_value_to_sr_type(a.shift);
+      op |= thop_place(sr, s->shift_type_bits);
+    }
+    if (s->shift_imm2_bits.width)
+      op |= thop_place(a.shift.value & 0x3, s->shift_imm2_bits);
+    if (s->shift_imm3_bits.width)
+      op |= thop_place((a.shift.value >> 2) & 0x7, s->shift_imm3_bits);
+
+    if (s->imm2_place.width)
+      op |= thop_place(a.imm2, s->imm2_place);
+    if (s->split_imm2_place.width)
+      op |= thop_place(a.imm & 0x3, s->split_imm2_place);
+    if (s->split_imm3_place.width)
+      op |= thop_place((a.imm >> 2) & 0x7, s->split_imm3_place);
+
+    if (s->puw_bits.width)
+      op |= thop_place(a.puw & 0x7, s->puw_bits);
+
+    /* ── raw register list placement ── */
+    if (s->rm_raw_place.width)
+      op |= thop_place(rm_for_place, s->rm_raw_place);
+
+    THOP_TRACE("%s: matched T%d base=0x%x → 0x%x\n", name ? name : "?unknown?", (int)i + 1, v->base, op);
+
+    return (thumb_opcode){.size = s->size, .opcode = op};
+  }
+
+  THOP_TRACE("%s: ERROR no variant matched! (tried %zu variants)\n", name ? name : "?unknown?", n);
+  return thop_emit_error(name, table, n, a);
 }

@@ -322,35 +322,136 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
       gen_le16(saved_regset); /* register list second halfword */
     }
 
-    /* generate load code */
+    /* Sequence the operand loads.  Emitting them in declaration order is wrong
+     * as soon as one operand's destination register still holds another
+     * operand's source value: the first load clobbers it and the second reads
+     * garbage.  With register-allocated values that permutation is ordinary
+     * rather than exotic -- two float parameters ended up in r2 and r0 while
+     * the constraints asked for r0 and r1, so `"r"(a), "r"(b)` loaded a into
+     * both registers and every __asm__ over two same-typed operands silently
+     * computed f(a, a).  So treat the loads as the parallel move they are:
+     * emit one only once no pending load still reads its destination, and
+     * break a cycle through the stack.
+     *
+     * A cycle unwinds completely once broken (the chain empties from the
+     * pushed edge), so at most one value is parked at a time and the push/pop
+     * pair stays properly nested. */
+    struct
+    {
+      int dest;         /* register being written */
+      int src;          /* register read, or -1 if this load reads none */
+      int done;         /* already emitted */
+      int from_stack;   /* source was pushed; satisfy with a pop */
+      IROperand ir_src; /* what to load, when not from_stack */
+    } loads[MAX_ASM_OPERANDS];
+    int nb_loads = 0;
+
     for (i = 0; i < nb_operands; i++)
     {
       op = &operands[i];
-      if (op->reg >= 0)
+      if (op->reg < 0)
+        continue;
+
+      IROperand src;
+      if ((op->vt->r & VT_VALMASK) == VT_LLOCAL && op->is_memory)
       {
-        if ((op->vt->r & VT_VALMASK) == VT_LLOCAL && op->is_memory)
-        {
-          /* memory reference case (for both input and
-             output cases) */
-          /* Convert LLOCAL stack slot to a pointer in a LOCAL stack slot.
-            This matches the old SValue rewrite to VT_LOCAL|VT_LVAL with VT_PTR type. */
-          IROperand src = svalue_to_iroperand(tcc_state->ir, op->vt);
-          src.is_llocal = 0;
-          src.is_lval = 1;
-          src.btype = IROP_BTYPE_INT32; /* pointers are 32-bit on ARMv8-M */
-          MachineOperand mop = machine_op_from_ir(tcc_state->ir, &src);
-          tcc_gen_mach_load_to_reg(op->reg, &mop);
-        }
-        else if (i >= nb_outputs || op->is_rw)
-        { // not write-only
-          /* load value in register */
-          IROperand src = svalue_to_iroperand(tcc_state->ir, op->vt);
-          MachineOperand mop = machine_op_from_ir(tcc_state->ir, &src);
-          tcc_gen_mach_load_to_reg(op->reg, &mop);
-          if (op->is_llong)
-            tcc_error("long long not implemented");
-        }
+        /* memory reference case (for both input and
+           output cases) */
+        /* Convert LLOCAL stack slot to a pointer in a LOCAL stack slot.
+          This matches the old SValue rewrite to VT_LOCAL|VT_LVAL with VT_PTR type. */
+        src = svalue_to_iroperand(tcc_state->ir, op->vt);
+        src.is_llocal = 0;
+        src.is_lval = 1;
+        src.btype = IROP_BTYPE_INT32; /* pointers are 32-bit on ARMv8-M */
       }
+      else if (i >= nb_outputs || op->is_rw)
+      { // not write-only
+        src = svalue_to_iroperand(tcc_state->ir, op->vt);
+        if (op->is_llong)
+          tcc_error("long long not implemented");
+      }
+      else
+      {
+        continue; /* write-only output: nothing to load */
+      }
+
+      /* Only a plain register source can be destroyed by another load: the
+       * other kinds read sp/fp/r10 or an immediate, and the constraint solver
+       * hands out r0-r8 only, so they cannot collide with a destination. */
+      MachineOperand probe = machine_op_from_ir(tcc_state->ir, &src);
+      const int src_reg = (probe.kind == MACH_OP_REG && !probe.needs_deref) ? probe.u.reg.r0 : -1;
+
+      loads[nb_loads].dest = op->reg;
+      loads[nb_loads].src = src_reg;
+      loads[nb_loads].done = 0;
+      loads[nb_loads].from_stack = 0;
+      loads[nb_loads].ir_src = src;
+      nb_loads++;
+    }
+
+    int remaining = nb_loads;
+    while (remaining > 0)
+    {
+      int progress = 0;
+      for (int l = 0; l < nb_loads; l++)
+      {
+        if (loads[l].done)
+          continue;
+
+        int blocked = 0;
+        for (int m = 0; m < nb_loads && !blocked; m++)
+        {
+          if (m == l || loads[m].done)
+            continue;
+          blocked = (loads[m].src >= 0 && loads[m].src == loads[l].dest);
+        }
+        if (blocked)
+          continue;
+
+        if (loads[l].from_stack)
+        {
+          /* LDMIA SP!, {dest, lr} -- same raw encoding idiom as the register
+           * save/restore above.  lr rides along purely to keep the transfer two
+           * registers wide: a single-register STMDB/LDMIA SP! is UNPREDICTABLE,
+           * and operand registers reach r8, past what the 16-bit push/pop
+           * encodes.  lr comes back with the value it was pushed with, and
+           * dest < lr always, so the register-number-to-address order pairs
+           * them correctly. */
+          gen_le16(0xe8bd);
+          gen_le16((1u << (uint32_t)loads[l].dest) | (1u << R_LR));
+        }
+        else
+        {
+          MachineOperand mop = machine_op_from_ir(tcc_state->ir, &loads[l].ir_src);
+          tcc_gen_mach_load_to_reg(loads[l].dest, &mop);
+        }
+        loads[l].done = 1;
+        remaining--;
+        progress = 1;
+      }
+
+      if (progress)
+        continue;
+
+      /* Nothing is emittable: the remaining loads form one or more permutation
+       * cycles.  Park the source of one of them on the stack.  That load then
+       * reads no register, which unblocks whoever wanted to write it, and the
+       * cycle unwinds; the parked value comes back with a pop into its
+       * destination as the last step of that cycle. */
+      int broke = 0;
+      for (int l = 0; l < nb_loads && !broke; l++)
+      {
+        if (loads[l].done || loads[l].src < 0)
+          continue;
+        /* STMDB SP!, {src, lr}; see the pop above for why lr is paired in. */
+        gen_le16(0xe92d);
+        gen_le16((1u << (uint32_t)loads[l].src) | (1u << R_LR));
+        loads[l].src = -1;
+        loads[l].from_stack = 1;
+        broke = 1;
+      }
+      if (!broke)
+        tcc_error("compiler_error: cannot sequence inline asm operand loads");
     }
   }
   else
@@ -1299,64 +1400,24 @@ ST_FUNC int thumb_parse_token_suffix(int token, int *base_token)
   return condition;
 }
 
+/* Map a condition-code mnemonic to its 4-bit encoding, using the same
+ * cond_names table the instruction-suffix parser uses so the two can never
+ * drift.  That drift is exactly what this replaced: the hand-rolled chain
+ * here knew "cs"/"cc" but not their "hs"/"lo" aliases, and an unknown name
+ * fell through to 0xe (AL).  `ite hs` therefore assembled as `ite al`, whose
+ * else-branch condition is UNPREDICTABLE -- on the M33 both halves execute,
+ * so __aeabi_dcmple/__aeabi_dcmpge in lib/fp/arm/rp2350/dcp_aeabi.S always
+ * returned 0.  An unrecognized name is now an error rather than a silent AL. */
 static int thumb_parse_condition_str(const char *condition_str)
 {
-  if (strncmp(condition_str, "eq", 2) == 0)
+  for (const cond_name_entry_t *e = cond_names; e->name; e++)
   {
-    return 0;
+    if (strncmp(condition_str, e->name, 2) == 0)
+    {
+      return e->code;
+    }
   }
-  else if (strncmp(condition_str, "ne", 2) == 0)
-  {
-    return 1;
-  }
-  else if (strncmp(condition_str, "cs", 2) == 0)
-  {
-    return 2;
-  }
-  else if (strncmp(condition_str, "cc", 2) == 0)
-  {
-    return 3;
-  }
-  else if (strncmp(condition_str, "mi", 2) == 0)
-  {
-    return 4;
-  }
-  else if (strncmp(condition_str, "pl", 2) == 0)
-  {
-    return 5;
-  }
-  else if (strncmp(condition_str, "vs", 2) == 0)
-  {
-    return 6;
-  }
-  else if (strncmp(condition_str, "vc", 2) == 0)
-  {
-    return 7;
-  }
-  else if (strncmp(condition_str, "hi", 2) == 0)
-  {
-    return 8;
-  }
-  else if (strncmp(condition_str, "ls", 2) == 0)
-  {
-    return 9;
-  }
-  else if (strncmp(condition_str, "ge", 2) == 0)
-  {
-    return 0xa;
-  }
-  else if (strncmp(condition_str, "lt", 2) == 0)
-  {
-    return 0xb;
-  }
-  else if (strncmp(condition_str, "gt", 2) == 0)
-  {
-    return 0xc;
-  }
-  else if (strncmp(condition_str, "le", 2) == 0)
-  {
-    return 0xd;
-  }
+  tcc_error("unknown condition code '%s'", condition_str);
   return 0xe;
 }
 

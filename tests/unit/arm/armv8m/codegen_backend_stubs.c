@@ -15,7 +15,7 @@
 
 /* From tccgen.c — true if the current function is variadic. Every mop test
  * builds a fixed-arity function, so 0 is correct for all of them. */
-int func_var = 0;
+/* func_var now lives in ra_link_stubs.c, which this binary also links. */
 
 /* From tccgen.c. Only reached via arm_init()'s func_float_type/
  * func_double_type setup -- those two CTypes are never read anywhere after

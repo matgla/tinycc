@@ -244,7 +244,7 @@ static Sym *ut_soft_external_global_sym(int v, CType *type)
 #define type_size ut_soft_type_size
 #define external_global_sym ut_soft_external_global_sym
 #define _tcc_error ut_soft_error_recorder
-#include "ir/gen/softfloat.c"
+#include "source/ir/gen/softfloat.c"
 #undef _tcc_error
 #undef external_global_sym
 #undef type_size

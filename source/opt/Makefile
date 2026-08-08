@@ -14,10 +14,11 @@ OPT_PIPELINE_OBJ = $(X)source/opt/function_pipeline.o
 $(OPT_PIPELINE_OBJ): \
 	source/opt/function_pipeline.c \
 	source/opt/function_pipeline.h \
-	tcc.h tccir.h source/opt/include/opt.h source/opt/include/opt_utils.h source/opt/include/opt_engine.h \
+	source/include/tcc.h source/ir/tccir.h source/opt/include/opt.h source/opt/include/opt_utils.h source/opt/include/opt_engine.h \
 	source/opt/include/opt_pipeline.h source/opt/include/opt_gens_fusion.h source/opt/flat/include/opt/flat/bool.h \
 	source/opt/flat/include/opt/flat/call_result.h \
-	source/opt/flat/include/opt/flat/symaddr_cse.h ir/core.h
+	source/opt/flat/include/opt/flat/symaddr_cse.h source/ir/core.h \
+	$(TCC_CORE_DEPS)
 	@mkdir -p $(dir $@)
 	$(OPT_PIPELINE_CC) -c $< -o $@
 
@@ -50,9 +51,11 @@ CORE_OPT_SRC = \
 	source/opt/engine/fp_mat_cache.c \
 	source/opt/engine/pass_registry.c
 
-# Interface headers these units depend on.
+# Interface headers these units depend on.  $(TCC_CORE_DEPS) is not optional:
+# these TUs include source/include/tcc.h, so configure's defines decide struct TCCState's
+# layout for them too.
 CORE_OPT_HDRS = \
-	tcc.h tccir.h ir/ir.h $(wildcard source/opt/include/*.h)
+	source/include/tcc.h source/ir/tccir.h source/ir/ir.h $(wildcard source/opt/include/*.h) $(TCC_CORE_DEPS)
 
 # Pre-RA cleanup passes, relocated out of ir/regalloc.c.
 RA_OPT_SRC = \
@@ -60,21 +63,37 @@ RA_OPT_SRC = \
 	source/opt/ra/incomplete_calls.c \
 	source/opt/ra/phi_const_chain.c
 
-$(X)source/opt/ra/%.o: source/opt/ra/%.c $(CORE_OPT_HDRS) ir/regalloc.h config.mak
+$(X)source/opt/ra/%.o: source/opt/ra/%.c $(CORE_OPT_HDRS) source/ir/regalloc.h
 	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
-$(X)source/opt/util/%.o: source/opt/util/%.c $(CORE_OPT_HDRS) config.mak
+$(X)source/opt/util/%.o: source/opt/util/%.c $(CORE_OPT_HDRS)
 	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
-$(X)source/opt/analysis/%.o: source/opt/analysis/%.c $(CORE_OPT_HDRS) config.mak
+$(X)source/opt/analysis/%.o: source/opt/analysis/%.c $(CORE_OPT_HDRS)
 	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
-$(X)source/opt/engine/%.o: source/opt/engine/%.c $(CORE_OPT_HDRS) config.mak
+$(X)source/opt/engine/%.o: source/opt/engine/%.c $(CORE_OPT_HDRS)
 	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
+
+# The module library.  $(SSA_OPT_SRC) and $(FLAT_OPT_SRC) come from the ssa/ and
+# flat/ sub-Makefiles, so this file must be included after both — prerequisite
+# lists are expanded when the rule is read, not when it runs.
+OPT_SRC = \
+	source/opt/function_pipeline.c \
+	$(CORE_OPT_SRC) \
+	$(RA_OPT_SRC) \
+	$(SSA_OPT_SRC) \
+	$(FLAT_OPT_SRC)
+
+OPT_OBJ = $(patsubst %.c,$(X)%.o,$(OPT_SRC))
+OPT_LIB = $(X)source/opt/libopt.a
+
+$(OPT_LIB): $(OPT_OBJ)
+	$(ar-lib)
 
 # Phony target for development workflow.
 .PHONY: opt-pipeline-check

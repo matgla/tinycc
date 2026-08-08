@@ -65,6 +65,25 @@ ifneq ($(CONFIG_minimal),yes)
  CFLAGS += -DCONFIG_TCC_DEBUG
 endif
 
+# getenv-driven debug/bisect knobs (TCC_DISABLE_PASS, TCC_NO_COALESCE, DBG_CLINL,
+# SCAN_OVERLAP, ...).  See tccdbgenv.h for the full rationale and for how to add
+# one.  CONFIG_TCC_DEBUG_ENV defaults to CONFIG_TCC_DEBUG's setting, so a plain
+# `make cross` keeps every knob and the host bisect tooling (bisect_pass.sh,
+# scripts/opt_profile.py, reduce.py, tests/fuzz/triage_olevels.sh) works unchanged.
+#
+# CONFIG_debugenv=no compiles them all out: each knob folds to a compile-time
+# constant, the code it guarded becomes dead, and the ~27 getenv lookups a
+# compile makes drop to the 3 real ones (CPATH & friends).  Measured on the
+# armv8m device compiler: .text -14,584 B, total -17,272 B, output byte-identical
+# over 1,545 corpus compiles.  build_rootfs.sh passes this for the on-device
+# compiler unless --debug-tcc was given.
+ifeq ($(CONFIG_debugenv),no)
+ CFLAGS += -DCONFIG_TCC_DEBUG_ENV=0
+endif
+ifeq ($(CONFIG_debugenv),yes)
+ CFLAGS += -DCONFIG_TCC_DEBUG_ENV=1
+endif
+
 ifdef CONFIG_WIN32
  CFG = -win
  ifneq ($(CONFIG_static),yes)
@@ -320,37 +339,143 @@ LIB-$(TR) ?= {B}:/usr/$(TRIPLET-$T)/lib:/usr/lib/$(MARCH-$T)
 INC-$(TR) ?= {B}/include:/usr/$(TRIPLET-$T)/include:/usr/include
 endif
 
-include ir/gen/Makefile
+# The core dependency set for every object rule, here and in the included
+# sub-Makefiles (which are read before CORE_FILES/LIBTCC_INC exist, so they
+# cannot use those).
+#
+# Every TU in the tree includes tcc.h, and tcc.h reaches the rest of the shared
+# headers: config.h directly, elf.h via tcctypes.h, and so on.  Naming them
+# individually has gone stale repeatedly, so take the lot by wildcard -- one
+# wildcard per module header directory, since the headers moved out of the repo
+# root and in with the module that owns them.  config.mak is here for the
+# *flags* (ASan, -g, -DCONFIG_TCC_DEBUG), which no header records.
+#
+# Getting this wrong is quiet and expensive.  config.h's CONFIG_TCC_BCHECK adds
+# three members to struct TCCState; when a reconfigure enabled it, the three
+# rules that listed neither config.h nor config.mak kept their old objects, so
+# `gen_function` stored tcc_state->ir at offset 11328 while `vstore` read it
+# from 11344.  Every compile then died in tcc_ir_put on a NULL IR pointer —
+# after a `make` that reported nothing to do.
+TCC_HDR_DIRS = source/include source/driver source/frontend source/ir \
+	source/machine source/obj source/support
+TCC_CORE_DEPS = $(wildcard *.h) \
+	$(foreach d,$(TCC_HDR_DIRS),$(wildcard $(d)/*.h)) \
+	config.mak
+
+# Archive a module's objects into its library.  Shared by every module Makefile
+# below so they all agree on how a lib is produced.
+define ar-lib
+@mkdir -p $(dir $@)
+@rm -f $@
+$S$(AR) rcs $@ $^
+endef
+
+# Module build configurations.  Order matters: a rule's prerequisite list is
+# expanded when the rule is read, so a module has to be included after
+# everything whose variables it names.  That is why each gen/ precedes its
+# parent, and why source/opt/Makefile -- which collects the ssa/ and flat/ pass
+# lists into one library -- comes last of the opt group.
+include source/include/Makefile
+include source/utils/Makefile
+include source/memory/Makefile
+include source/support/Makefile
+include source/machine/Makefile
+include source/obj/Makefile
+include source/driver/Makefile
+include source/ir/gen/Makefile
+include source/ir/Makefile
+include source/frontend/gen/Makefile
+include source/frontend/Makefile
 include source/opt/framework/Makefile
-include source/opt/Makefile
 include source/opt/ssa/Makefile
 include source/opt/flat/Makefile
+include source/opt/Makefile
 include source/backend/generators/Makefile
-include source/memory/Makefile
-include source/utils/Makefile
-IR_FILES = ir/type.c ir/pool.c ir/vreg.c ir/stack.c ir/dump.c ir/codegen.c ir/cfg.c ir/ssa.c ir/regalloc.c $(IR_GEN_FILES) ir/machine_op.c $(CORE_OPT_SRC) $(RA_OPT_SRC) $(SSA_OPT_SRC) $(FLAT_OPT_SRC)
-CORE_FILES = tccir_operand.c tccls.c tcc.c tcctools.c libtcc.c tccpp.c tccgen.c tccdbg.c tccelf.c tccasm.c tccyaff.c tccld.c tccdebug.c svalue.c tccmachine.c source/opt/function_pipeline.c source/backend/generators/function.c source/backend/generators/regalloc.c $(MEMORY_SRC) $(IR_FILES)
-CORE_FILES += tcc.h config.h libtcc.h tcctok.h tccir.h tccir_operand.h tccld.h tccmachine.h log.h
-CORE_FILES += $(wildcard ir/*.h) $(wildcard source/opt/include/*.h)
-CORE_FILES += $(MEMORY_HDRS)
-CORE_FILES += $(UTILS_HDRS)
+
+# The whole source set, assembled from what each module declares rather than
+# restated here.  Feeds $T_FILES below, and the tags / coverage targets.
+CORE_SRC = $(DRIVER_MAIN_SRC) $(DRIVER_SRC) $(FRONTEND_SRC) $(GEN_SRC) \
+	$(IR_SRC) $(IR_GEN_FILES) $(MACHINE_SRC) $(OBJ_SRC) $(SUPPORT_SRC) \
+	$(OPT_SRC) $(MEMORY_SRC) $(BACKEND_GENERATORS_SRC)
+
+CORE_HDR = $(CORE_HDRS) $(DRIVER_HDRS) $(FRONTEND_HDRS) $(GEN_HDRS) \
+	$(IR_HDRS) $(MACHINE_HDRS) $(OBJ_HDRS) $(SUPPORT_HDRS) $(MEMORY_HDRS) \
+	$(UTILS_HDRS) $(wildcard source/opt/include/*.h) $(wildcard *.h)
+
+CORE_FILES = $(CORE_SRC) $(CORE_HDR)
 armv8m_FILES = $(CORE_FILES) source/backend/arch/arm/thumb/arm-thumb-defs.h source/backend/arch/arm/thumb/arm-thumb-callsite.h source/backend/arch/arm/thumb/thumb-tok.h source/backend/arch/arm/thumb/thumb.h source/backend/arch/arm/arm.h
 armv8m_ARCH = arm
 armv8m_ARCH_LIB = $(X)source/backend/arch/arm/libarm.a
 
-TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h
+TCCDEFS_H$(subst yes,,$(CONFIG_predefs)) = tccdefs_.h tccdecls_.h
 
 # libtcc sources
-LIBTCC_SRC = $(filter-out tcc.c tcctools.c,$(filter %.c,$($T_FILES)))
+LIBTCC_SRC = $(filter-out $(DRIVER_MAIN_SRC) source/driver/tcctools.c,$(filter %.c,$($T_FILES)))
 
 # Compile from separate objects
 LIBTCC_OBJ = $(patsubst %.c,$(X)%.o,$(LIBTCC_SRC))
 LIBTCC_INC = $(filter %.h %-gen.c %-link.c,$($T_FILES))
 ARCH_LIB = $($T_ARCH_LIB)
-TCC_FILES = $(X)tcc.o $(LIBTCC_OBJ) $(ARCH_LIB)
-$(X)tccpp.o : $(TCCDEFS_H)
 
-DEFINES += -I$(TOP) -I$(TOP)/ir -I$(TOP)/source/opt/include $(OPT_DSL_INC) $(SSA_OPT_INC) $(FLAT_OPT_INC) $(MEMORY_INC) $(UTILS_INC) -I$(TOP)/source/backend/arch/arm -I$(TOP)/source/backend/arch/arm/thumb
+# Every module builds to its own static library; the executable is the CLI
+# entry object plus those libs.
+#
+# MODULE_LIBS is linked --whole-archive, which is not decoration.  A normal
+# archive scan only pulls the members that resolve an undefined symbol, and
+# these modules hold TUs nothing references by design: the SValue/Sym
+# pretty-printers exist to be called from gdb, and several opt passes are
+# compiled but not yet wired into the pipeline table.  Linking the archives
+# a la carte dropped 53 symbols (all of tccmachine.c, the pass registry, eight
+# tcc_ir_opt_* passes and their _ex thunks) and 67 KB of .text without a word
+# of warning.  --whole-archive reproduces exactly what listing the objects
+# individually used to do.  Both GNU ld and tcc's own linker implement it
+# (libtcc.c "?whole-archive" -> AFF_WHOLE_ARCHIVE), which matters because the
+# YasOS self-host bootstrap relinks this with armv8m-tcc itself.
+#
+# ARCH_LIB stays outside the group: it is a real library, already linked a la
+# carte before this split, and it bundles orphaned members (arm-thumb-scratch.c)
+# that must keep being dropped.
+MODULE_LIBS = $(DRIVER_LIB) $(FRONTEND_LIB) $(OPT_LIB) $(IR_LIB) \
+	$(BACKEND_GENERATORS_LIB) $(MACHINE_LIB) $(OBJ_LIB) $(SUPPORT_LIB) \
+	$(MEMORY_LIB)
+
+TCC_LIBS = $(MODULE_LIBS) $(ARCH_LIB)
+TCC_FILES = $(DRIVER_MAIN_OBJ) $(TCC_LIBS)
+$(X)source/frontend/tccpp.o : $(TCCDEFS_H) tccdefs_table_.h
+
+# Stage B of the predefine pipeline: tccdefs_.h -> tccdefs_table_.h.
+#
+# Unlike c2str (stage A) this generator must be compiled with the TARGET's
+# defines: tccdefs_.h keeps the column-1 conditionals as host directives, so
+# "which predefines this target actually has" is only known once the host
+# preprocessor has run over it.  Hence $(DEFINES) here -- the same flags the
+# cross objects get -- while the binary itself is built for and run on the
+# host.  It emits the macros pre-tokenised so the compiler can materialise
+# them on demand instead of lexing 3.7 KB of text on every invocation.
+#
+# Only the -D half of CFLAGS is passed: the target macros are what select the
+# right block of tccdefs_.h (without them tcc.h falls back to i386 and the
+# build dies on a missing i386-tok.h), while the rest of CFLAGS is ARM codegen
+# (-mcpu, -fpie) that a host binary must not be built with.
+#
+# Deliberately NOT part of $(TCCDEFS_H): that list is also a prerequisite of the
+# outer `%-tcc` rule, which runs before $T is set, so DEFINES would carry no
+# -DTCC_TARGET_* and tcc.h would select i386.  Hanging it off tccpp.o keeps it
+# in the per-target sub-make.  The helper is named per target for the same
+# parallel-make reason c2str is (see above).
+#
+# gcc, not $(CC), for the same reason the c2str rule hardcodes it: this is a
+# HOST tool, and in the native/self-host stage $(CC) is armv8m-tcc, which would
+# build it for the target (and fail on the yasos libc's missing strtok_r).
+tccdefs_table_.h : tccdefs_.h gen_predef_table.c
+	$Sgcc -o gen_predef_table-$T$(EXESUF) gen_predef_table.c \
+	  $(addsuffix ,$(DEFINES) $(filter -D%,$(CFLAGS))) \
+	  && ./gen_predef_table-$T$(EXESUF) $@ && rm -f gen_predef_table-$T$(EXESUF)
+
+DEFINES += -I$(TOP) $(CORE_INC) $(DRIVER_INC) $(FRONTEND_INC) $(IR_INC) \
+	$(MACHINE_INC) $(OBJ_INC) $(SUPPORT_INC) -I$(TOP)/source/opt/include \
+	$(OPT_DSL_INC) $(SSA_OPT_INC) $(FLAT_OPT_INC) $(MEMORY_INC) $(UTILS_INC) \
+	$(GEN_INC) -I$(TOP)/source/backend/arch/arm -I$(TOP)/source/backend/arch/arm/thumb
 
 GITHASH:=$(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo no)
 ifneq ($(GITHASH),no)
@@ -365,15 +490,24 @@ LDFLAGS += -g
 endif
 
 # convert "include/tccdefs.h" to "tccdefs_.h"
+#
+# The helper is named per stem. It used to be a single `c2str.exe`, which was
+# fine while tccdefs_.h was the only target using this rule; tccdecls_.h made it
+# two, and under `make -j` both recipes then wrote and exec'd the same file --
+# one of them hitting it mid-link, which fails as "Text file busy" (ETXTBSY) and
+# takes the build down with error 126. The cross-tcc rule below already guards
+# the same hazard through $(TCCDEFS_H); that guard was never extended to cover a
+# second stem.
 %_.h : include/%.h conftest.c
 	# todo: how to pass host CC there?
-	gcc -DC2STR $(filter %.c,$^) -o c2str.exe && ./c2str.exe $< $@
+	gcc -DC2STR $(filter %.c,$^) -o c2str-$*.exe && ./c2str-$*.exe $< $@ && rm -f c2str-$*.exe
 
 # target specific object rules
 # (depend on config.mak so toggling build flags — e.g. ASan via
 # ./configure [--disable-asan] — forces a recompile instead of silently
 # relinking stale, differently-instrumented objects)
 $(X)%.o : %.c $(LIBTCC_INC) config.mak
+	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
 # Architecture library — built by nested Makefile
@@ -382,7 +516,9 @@ ARCH_DEFINES = $(subst -I.,-I$(CURDIR),$(DEFINES))
 $(ARCH_LIB): FORCE
 	@mkdir -p $(dir $(ARCH_LIB))
 	@# Build flags changed (e.g. ASan toggled via configure)?  Drop stale objects
-	@# since the nested arch Makefile only tracks source timestamps, not flags.
+	@# since the nested arch Makefile tracks source and header timestamps, not
+	@# flags.  configure's *defines* need no help here: config.h is a header, and
+	@# the arch Makefile's CORE_HDRS covers it.
 	@if [ -f "$(ARCH_LIB)" ] && [ config.mak -nt "$(ARCH_LIB)" ]; then \
 		rm -f $(dir $(ARCH_LIB))*.o "$(ARCH_LIB)"; \
 	fi
@@ -390,13 +526,10 @@ $(ARCH_LIB): FORCE
 		TOP=$(CURDIR) BUILD_DIR=$(CURDIR)/$(dir $(ARCH_LIB)) \
 		CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" DEFINES="$(ARCH_DEFINES)"
 
-$(X)ir/%.o : ir/%.c $(LIBTCC_INC) config.mak
-	@mkdir -p $(dir $@)
-	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
-
 # additional dependencies
-$(X)tcc.o : tcctools.c
-$(X)tcc.o : DEFINES += $(DEF_GITHASH)
+# tcctools.c is #included by tcc.c rather than compiled on its own.
+$(DRIVER_MAIN_OBJ) : source/driver/tcctools.c
+$(DRIVER_MAIN_OBJ) : DEFINES += $(DEF_GITHASH)
 
 # Host Tiny C Compiler
 # tcc$(EXESUF): tcc.o $(LIBTCC)
@@ -413,7 +546,7 @@ $(X)tcc.o : DEFINES += $(DEF_GITHASH)
 	@$(MAKE) --no-print-directory $@ CROSS_TARGET=$*
 
 $(CROSS_TARGET)-tcc$(EXESUF): $(TCC_FILES)
-	$S$(CC) -o $@ $^ $(LDFLAGS) $(LIBS)
+	$S$(CC) -o $@ $(DRIVER_MAIN_OBJ) -Wl,--whole-archive $(MODULE_LIBS) -Wl,--no-whole-archive $(ARCH_LIB) $(LDFLAGS) $(LIBS)
 
 # Cross libtcc1.a
 %-libtcc1.a : %-tcc$(EXESUF) FORCE
@@ -441,7 +574,7 @@ tcc.1 : tcc-doc.pod
 	$(call run-if,pod2man,--section=1 --center="Tiny C Compiler" \
 		--release="$(VERSION)" $< >$@)
 %.pod : %.texi
-	$(call run-if,perl,$(TOPSRC)/texi2pod.pl $< $@)
+	$(call run-if,perl,$(TOPSRC)/scripts/texi2pod.pl $< $@)
 
 doc : $(TCCDOCS)
 
@@ -474,17 +607,17 @@ install-unx:
 	$(call IFw,$(TOPSRC)/lib/fp/libsoftfp.so $(TOPSRC)/lib/fp/libvfpv4sp.so $(TOPSRC)/lib/fp/libvfpv5dp.so $(TOPSRC)/lib/fp/librp2350fp.so,"$(tccdir)/fp")
 	$(call IFw,$(TOPSRC)/lib/fp/libsoftfp.a $(TOPSRC)/lib/fp/libvfpv4sp.a $(TOPSRC)/lib/fp/libvfpv5dp.a $(TOPSRC)/lib/fp/librp2350fp.a,"$(libdir)")
 	$(call IFw,$(TOPSRC)/lib/fp/libsoftfp.so $(TOPSRC)/lib/fp/libvfpv4sp.so $(TOPSRC)/lib/fp/libvfpv5dp.so $(TOPSRC)/lib/fp/librp2350fp.so,"$(libdir)")
-	$(call IF,$(TOPSRC)/include/*.h $(TOPSRC)/tcclib.h,"$(tccdir)/include")
+	$(call IF,$(TOPSRC)/include/*.h,"$(tccdir)/include")
 	@if [ -d "$(TOPSRC)/pch" ]; then echo "-> $(tccdir)/pch : $(TOPSRC)/pch" ; mkdir -p "$(tccdir)/pch" && cp -r "$(TOPSRC)/pch"/. "$(tccdir)/pch" ; fi
 	$(call $(if $(findstring .so,$(LIBTCC)),IBw,IFw),$(LIBTCC),"$(libdir)")
-	$(call IF,$(TOPSRC)/libtcc.h,"$(includedir)")
+	$(call IF,$(TOPSRC)/source/driver/libtcc.h,"$(includedir)")
 	$(call IFw,tcc.1,"$(mandir)/man1")
 	$(call IFw,tcc-doc.info,"$(infodir)")
 	$(call IFw,tcc-doc.html,"$(docdir)")
 ifneq "$(wildcard $(LIBTCC1_W))" ""
 	$(call IFw,$(TOPSRC)/win32/lib/*.def $(LIBTCC1_W),"$(tccdir)/win32/lib")
 	$(call IR,$(TOPSRC)/win32/include,"$(tccdir)/win32/include")
-	$(call IF,$(TOPSRC)/include/*.h $(TOPSRC)/tcclib.h,"$(tccdir)/win32/include")
+	$(call IF,$(TOPSRC)/include/*.h,"$(tccdir)/win32/include")
 endif
 
 # uninstall
@@ -499,7 +632,7 @@ uninstall-unx:
 # --------------------------------------------------------------------------
 # other stuff
 
-TAGFILES = *.[ch] include/*.h lib/*.[chS]
+TAGFILES = $(CORE_FILES) include/*.h lib/*.[chS]
 tags : ; ctags $(TAGFILES)
 # cannot have both tags and TAGS on windows
 ETAGS : ; etags $(TAGFILES)
@@ -713,6 +846,40 @@ warn-check: armv8m-tcc$(EXESUF) patch-newlib
 	if [ "$$fail" -ne 0 ]; then exit 1; fi
 	@echo "------------ warn-check: passed ------------"
 
+# -finline-limit must mean the same thing wherever it sits relative to -O2.
+# It used to not: -O2 force-RAISED the limit to its own default, so
+# `-finline-limit=N -O2` was silently discarded while `-O2 -finline-limit=N`
+# worked. The fixture's helper is deliberately sized between the two limits so
+# an ignored flag shows up as different code, not just a different size.
+.PHONY: optflag-check
+optflag-check: armv8m-tcc$(EXESUF)
+	@echo "------------ optflag-check: -finline-limit vs -O argument order ------------"
+	@d=$$(mktemp -d) ; \
+	trap 'rm -rf "$$d"' EXIT ; \
+	printf '%s\n' \
+		'static int blend(int a, int b, int c) {' \
+		'  int t = a * 3 + b * 5;' \
+		'  int u = c ^ (a << 2);' \
+		'  int v = (t > u) ? (t - u) : (u - t);' \
+		'  return v + t - u + (a & b) + (b | c);' \
+		'}' \
+		'int sink1(int x) { return blend(x, x + 1, x + 2); }' \
+		'int sink2(int x) { return blend(x * 2, x, x - 7); }' \
+		'int sink3(int x) { return blend(x, 11, x ^ 3); }' \
+		> "$$d/ilim.c" ; \
+	./armv8m-tcc$(EXESUF) -c "$$d/ilim.c" -O2 -o "$$d/plain.o" || exit 1 ; \
+	./armv8m-tcc$(EXESUF) -c "$$d/ilim.c" -O2 -finline-limit=20 -o "$$d/after.o" || exit 1 ; \
+	./armv8m-tcc$(EXESUF) -c "$$d/ilim.c" -finline-limit=20 -O2 -o "$$d/before.o" || exit 1 ; \
+	if ! cmp -s "$$d/after.o" "$$d/before.o"; then \
+		echo "FAIL: -finline-limit=20 -O2 differs from -O2 -finline-limit=20 (argument order changes meaning)" ; \
+		exit 1 ; \
+	fi ; \
+	if cmp -s "$$d/plain.o" "$$d/after.o"; then \
+		echo "FAIL: -finline-limit=20 produced the same code as plain -O2 -- the fixture no longer straddles the two limits, so this check proves nothing" ; \
+		exit 1 ; \
+	fi
+	@echo "------------ optflag-check: passed ------------"
+
 # run frontend coverage tests
 # Fast, QEMU-free preprocessor / type-system / diagnostic golden tests.
 test-frontend: cross
@@ -796,7 +963,7 @@ test-ir: cross test-venv test-prepare download-gcc-tests
 
 # container target: runs the full test suite (all test-* targets below)
 .NOTPARALLEL: test test-full test-all
-test: cross test-aeabi-host test-asm warn-check opt-dsl-check test-venv test-prepare download-gcc-tests ut test-frontend test-linker test-debug test-runtime test-selfhost test-ir
+test: cross test-aeabi-host test-asm warn-check optflag-check opt-dsl-check test-venv test-prepare download-gcc-tests ut test-frontend test-linker test-debug test-runtime test-selfhost test-ir
 	@echo "------------ test suite complete ------------"
 
 # Fully sequential test run: disables pytest-xdist too, for the cleanest logs.
@@ -840,10 +1007,11 @@ tcov-tes% : tcc_c$(EXESUF)
 	@rm -f $<.tcov
 	@$(MAKE) --no-print-directory TCC_LOCAL=$(CURDIR)/$< tes$*
 tcc_c$(EXESUF): $($T_FILES)
-	$S$(TCC) tcc.c -o $@ -ftest-coverage $(DEFINES) $(LIBS)
+	$S$(TCC) source/driver/tcc.c -o $@ -ftest-coverage $(DEFINES) $(LIBS)
 
-# Merged line-coverage report for tccgen.c: the real cross compiler (tccgen.c
-# instrumented) run over the whole compile-test corpus, unioned with the
+# Merged line-coverage report for source/frontend/gen/ (the former tccgen.c,
+# see docs/plan_tccgen_split.md): the real cross compiler with every gen TU
+# instrumented, run over the whole compile-test corpus, unioned with the
 # isolated tccgen unit tests.  Restores the normal build on exit.  Requires
 # lcov/genhtml.  Tunables: COV_JOBS, COV_OLEVELS, COV_OUT, COV_NO_TORTURE=1.
 # Output: coverage-tccgen/index.html + coverage-tccgen/tccgen.info
@@ -857,7 +1025,7 @@ test-install: $(TCCDEFS_H)
 clean:
 	@rm -f tcc *-tcc tcc_p tcc_c
 	@rm -f tags ETAGS *.o *.a *.so* *.out *.log lib*.def *.exe *.dll
-	@rm -rf *-ir/ *-arch/
+	@rm -rf *-ir/ *-arch/ *-source/
 	@rm -f a.out *.dylib *_.h *.pod *.tcov
 	@$(MAKE) -s -C lib $@
 	@$(MAKE) -s -C tests $@

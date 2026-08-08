@@ -20,6 +20,28 @@ from qemu_run import compile_testcase, prepare_test, CompileConfig  # noqa: E402
 MACHINE = "mps2-an505"
 
 
+class GuestUnavailable(RuntimeError):
+    """The YasOS guest never ran the command, so nothing was measured.
+
+    Distinct from a run that produced the wrong answer: a caller should skip on
+    this, not fail.  The usual cause is the kernel image in zig-out/bin being
+    built for a different QEMU machine than the FAT harness boots (it hardcodes
+    mps2-an505 and the fatdisk window of that board), which locks the guest up
+    in early boot and takes the serial pty down with it.
+    """
+
+
+# Seen in the FAT runner's output when the guest died rather than answered.
+# qemu_fatdisk_run.py echoes the QEMU log when the process exits before the pty
+# appears; once it is gone, pyserial reports EIO on the dead pty.
+_GUEST_DEAD_MARKERS = (
+    "qemu: fatal",
+    "Lockup:",
+    "Input/output error",
+    "no pty",
+)
+
+
 def _find_python_with_serial():
     """Return a python interpreter that has pyserial installed."""
     for exe in [sys.executable, "/usr/bin/python3", "python3"]:
@@ -225,6 +247,11 @@ def run_native_via_fat(
             break
 
     if exit_code is None:
+        if any(marker in stdout for marker in _GUEST_DEAD_MARKERS):
+            raise GuestUnavailable(
+                f"YasOS guest did not boot under QEMU {MACHINE}\n"
+                f"FAT runner output:\n{stdout}"
+            )
         raise RuntimeError(
             f"Could not determine native exit code for {test_file.name}.\n"
             f"FAT runner output:\n{stdout}"
