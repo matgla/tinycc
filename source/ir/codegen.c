@@ -2087,6 +2087,13 @@ static inline MopArgs ir_decode_cached(int is_dry_run, int use_mop_cache, MopArg
   return a;
 }
 
+/* TEMPORARY INSTRUMENT storage: see the use site in tcc_ir_codegen_generate.
+ * Defined here rather than in libtcc.c because codegen is what writes it (8
+ * sites below) and libtcc.c only prints it under -bench -- and because the
+ * unit tests link ir/codegen.c but not driver/libtcc.c (UT_MODULE_SRCS vs
+ * UT_COVERAGE_ONLY_SRCS), so a definition over there fails to link `ut`. */
+unsigned long tcc_dryreason[8];
+
 void tcc_ir_codegen_generate(TCCIRState *ir)
 {
   IRQuadCompact *cq;
@@ -2487,10 +2494,17 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       has_forward_branch = 1;
   }
 
+  /* TEMPORARY INSTRUMENT: why does the dry walk run?  cg:dry is 68.5 s of the
+     corpus (48% of codegen, the single largest item in the compiler) and the
+     answer decides between a conservative analytic scratch estimate and a
+     prologue backpatch.  Counts are dumped under -bench. */
+  extern unsigned long tcc_dryreason[8];
   int can_skip_dry_run =
       !has_forward_branch &&
       __builtin_popcountll(ir->ls.dirty_registers) <= (unsigned)(tcc_state->registers_for_allocator - 2) &&
       __builtin_popcountll(ir->ls.dirty_float_registers) <= (unsigned)(tcc_state->float_registers_for_allocator - 2);
+  tcc_dryreason[0] += !!has_forward_branch;
+  tcc_dryreason[7] += (!has_forward_branch && !can_skip_dry_run);
 
   if (can_skip_dry_run)
   {
@@ -2543,7 +2557,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
          * scratch for the high half; div/mod call helpers; block-copy and
          * VLA touch SP/memcpy; inline asm and indexed memory ops are
          * unconstrained.  Any of these forces the safety net. */
-        if (op >= TCCIR_OP_FADD && op <= TCCIR_OP_CVT_FTOI) { might_need_scratch = 1; break; }
+        if (op >= TCCIR_OP_FADD && op <= TCCIR_OP_CVT_FTOI) { might_need_scratch = 1; tcc_dryreason[1]++; break; }
         switch (op)
         {
         case TCCIR_OP_DIV:
@@ -2567,6 +2581,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         case TCCIR_OP_SWITCH_TABLE:
         case TCCIR_OP_SWITCH_LOAD:
           might_need_scratch = 1;
+          tcc_dryreason[2]++;
           break;
         default:
           break;
@@ -2580,26 +2595,27 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         if (irop_is_64bit(d) || irop_is_64bit(s1) || irop_is_64bit(s2))
         {
           might_need_scratch = 1;
+          tcc_dryreason[3]++;
           break;
         }
       }
       /* Calls with stack-passed args: the call-site setup may need scratch
        * to materialise the argument values into SP-relative slots. */
       if (!might_need_scratch && ir->call_outgoing_size > 0)
-        might_need_scratch = 1;
+        might_need_scratch = 1, tcc_dryreason[4]++;
       /* Incoming stack params: reads from [sp + offset_to_args] may collide
        * with live argument registers, forcing get_scratch_reg_with_save to
        * STR the register into the reserved area before the load.
        * Only relevant if some non-NOP op actually runs — a fully-NOP'd body
        * (useless_function_body) never loads those params. */
       if (!might_need_scratch && has_stack_params && has_any_op)
-        might_need_scratch = 1;
+        might_need_scratch = 1, tcc_dryreason[5]++;
       /* Large frames need scratch to materialise SP-relative offsets that
        * exceed the immediate-encoding range of Thumb-2 LDR/STR.  A simple
        * 124-byte threshold matches the LDR rt,[sp,#imm5*4] limit; above
        * that, individual access sites may need an extra register. */
       if (!might_need_scratch && stack_size > 124)
-        might_need_scratch = 1;
+        might_need_scratch = 1, tcc_dryreason[6]++;
 
       if (might_need_scratch)
         can_skip_dry_run = 0; /* dry run sizes the scratch area exactly */

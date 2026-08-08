@@ -2607,8 +2607,13 @@ static void tcc_print_bench_breakdown(const char *label, unsigned total_us, unsi
          (double)total_us / count);
 }
 
+extern unsigned long tcc_dryreason[8]; /* defined in ir/codegen.c, which writes it */
+
 PUB_FUNC void tcc_print_stats(TCCState *s1, unsigned total_time)
 {
+  fprintf(stderr, "# dryreason fwd=%lu fp=%lu op=%lu i64=%lu callargs=%lu stackparam=%lu bigframe=%lu regs=%lu\n",
+          tcc_dryreason[0], tcc_dryreason[1], tcc_dryreason[2], tcc_dryreason[3],
+          tcc_dryreason[4], tcc_dryreason[5], tcc_dryreason[6], tcc_dryreason[7]);
   if (!total_time)
     total_time = 1;
   fprintf(stderr,
