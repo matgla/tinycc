@@ -5234,6 +5234,19 @@ static void predef_materialize(TokenSym *ts, int idx)
   int i;
   int saved_tok = tok;
   CValue saved_tokc = tokc;
+  /* A predefine materialises at the point its name is first interned, which may
+     be in the middle of a #if expression -- and parse_number() consults pp_expr
+     to decide that every integer constant is intmax_t (C preprocessor
+     arithmetic).  That rule is about the expression being evaluated, not about
+     the macro body being stored: a body tokenised under it keeps the 64-bit type
+     for the rest of the translation unit.  <limits.h> hits this on its very
+     first line of real work (`#if __SCHAR_MAX__ == __INT_MAX__`), which is what
+     made sizeof(__INT_MAX__) 8 and turned UINT_MAX into a signed long long, so
+     `(unsigned)x < UINT_MAX` compiled to a *signed* compare.  Bodies must be
+     tokenised exactly as parse_define would tokenise them, i.e. with pp_expr
+     off; the pp evaluator promotes the resulting TOK_CINT itself. */
+  int saved_pp_expr = pp_expr;
+  pp_expr = 0;
 
   /* Parameters, for function-like macros: the table spells them inside the
      name field exactly as the text form did. */
@@ -5288,6 +5301,7 @@ static void predef_materialize(TokenSym *ts, int idx)
 
   tok = saved_tok;
   tokc = saved_tokc;
+  pp_expr = saved_pp_expr;
 }
 
 /* Called from tok_alloc_new once the TokenSym is linked into table_ident.

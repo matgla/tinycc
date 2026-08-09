@@ -1,0 +1,10 @@
+reached=1
+sz_intmax=4
+sz_INT_MAX=4
+sz_UINT_MAX=4
+sz_SCHAR_MAX=4
+neg_lt_umax=0
+umax_plus1=0
+taut0=1
+taut5=1
+PASS
