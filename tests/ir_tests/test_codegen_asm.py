@@ -521,6 +521,34 @@ def test_fp_hard_float_uses_vfp():
             f"{name} still calls a single-precision runtime helper"
 
 
+def test_nonneg_cmp_zero_fold_keeps_nan_directions_dcp():
+    """ssa:branch must not fold `fabs(x) >= 0.0` on the inline DCP compare.
+
+    A NaN makes that false, so only the `< 0.0` half may be decided at compile
+    time (gcc.c-torture/execute/20020720-1.c pins that half).  The DCP spells
+    every relation with an *unsigned* condition token, and reading those as if
+    the U meant "unordered-true" folded the wrong half -- silently, because no
+    host or QEMU target has a DCP to run the result on.  ir_tests/441 catches
+    it on real RP2350 silicon; this catches it here.
+    """
+    obj = _compile("nonneg_cmp_zero_fold", extra_cflags=["-mfloat-abi=hard", "-mfpu=rp2350"])
+    funcs = _disassemble(obj)
+
+    # `mrc 4, 0, APSR_nzcv, ...` is the DCP compare handing its result to the
+    # flags; a folded compare has no flag read at all.
+    def reads_dcp_flags(fn):
+        return _count_mnem_regex(funcs[fn], r"\bAPSR_nzcv\b") >= 1
+
+    for name in ("ge_must_not_fold", "le0_must_not_fold"):
+        assert reads_dcp_flags(name), (
+            f"{name}: fabs() can be a NaN, so the compare must survive to run time"
+        )
+    for name in ("lt_folds", "gt0_folds"):
+        assert not reads_dcp_flags(name), (
+            f"{name}: false for every value including NaN, so it should fold away"
+        )
+
+
 # -----------------------------------------------------------------------------
 # 64-bit register-deref LDRD/STRD pairing vs packed-access safety
 # -----------------------------------------------------------------------------

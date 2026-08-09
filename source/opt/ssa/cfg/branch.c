@@ -1315,8 +1315,14 @@ static int ssa_vreg_is_nonneg(IRSSAOptCtx *ctx, int32_t vreg, int use_idx, int *
  * spelling carries "unordered" depends on the flag setter, so the two
  * lowerings need different answers for the same token:
  *
- *   hw_tokens=1 (inline DCP compare): the U tokens are the unordered-true ones
- *     and the plain ones ordered, exactly as tcc_ir_gen_f() records them.
+ *   hw_tokens=1 (inline DCP compare): the U spelling is the ARM *unsigned*
+ *     condition the relation lowers to, not an unordered-true predicate --
+ *     tcc_ir_gen_f() records every DCP relation as TOK_UGT/TOK_UGE (mirroring
+ *     the operands for < and <=), and a jump inverts those to TOK_ULT/TOK_ULE.
+ *     RCMP leaves C clear when the operands are unordered, so HI/HS (UGT/UGE)
+ *     come out false on a NaN and their inverses LO/LS (ULT/ULE) come out true.
+ *     The plain signed spellings read flags RCMP does not set that way, so they
+ *     get no answer at all.
  *   hw_tokens=0 (__aeabi_c[df]cmple): the libcall folds unordered onto
  *     "greater", so GT/GE come out true on a NaN and LT/LE false -- and each U
  *     spelling lowers identically to its plain one (get_softfp_func_name()).
@@ -1324,17 +1330,26 @@ static int ssa_vreg_is_nonneg(IRSSAOptCtx *ctx, int32_t vreg, int use_idx, int *
  * Returns the base relation (TOK_LT/TOK_LE/TOK_GT/TOK_GE), or -1. */
 static int ssa_fp_cmp_relation(int tok, int hw_tokens, int *unordered_true)
 {
+  int rel, is_unsigned_spelling;
   switch (tok) {
-  case TOK_LT:  *unordered_true = 0;          return TOK_LT;
-  case TOK_ULT: *unordered_true = hw_tokens;  return TOK_LT;
-  case TOK_LE:  *unordered_true = 0;          return TOK_LE;
-  case TOK_ULE: *unordered_true = hw_tokens;  return TOK_LE;
-  case TOK_GT:  *unordered_true = !hw_tokens; return TOK_GT;
-  case TOK_UGT: *unordered_true = 1;          return TOK_GT;
-  case TOK_GE:  *unordered_true = !hw_tokens; return TOK_GE;
-  case TOK_UGE: *unordered_true = 1;          return TOK_GE;
+  case TOK_LT:  rel = TOK_LT; is_unsigned_spelling = 0; break;
+  case TOK_ULT: rel = TOK_LT; is_unsigned_spelling = 1; break;
+  case TOK_LE:  rel = TOK_LE; is_unsigned_spelling = 0; break;
+  case TOK_ULE: rel = TOK_LE; is_unsigned_spelling = 1; break;
+  case TOK_GT:  rel = TOK_GT; is_unsigned_spelling = 0; break;
+  case TOK_UGT: rel = TOK_GT; is_unsigned_spelling = 1; break;
+  case TOK_GE:  rel = TOK_GE; is_unsigned_spelling = 0; break;
+  case TOK_UGE: rel = TOK_GE; is_unsigned_spelling = 1; break;
   default: return -1;
   }
+
+  if (hw_tokens) {
+    if (!is_unsigned_spelling) return -1;
+    *unordered_true = (rel == TOK_LT || rel == TOK_LE);
+  } else {
+    *unordered_true = (rel == TOK_GT || rel == TOK_GE);
+  }
+  return rel;
 }
 
 /* Outcome of `v REL 0.0` (nonneg_is_arg0) or `0.0 REL v` for a provably
