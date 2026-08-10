@@ -16,98 +16,132 @@ with the Thumb-2 instruction set.
 **2. Custom IR (Intermediate Representation)**
 The original TCC uses a simple, direct translation to machine code. This fork
 introduces a **three-address code IR** with explicit register operands, enabling
-separate front-end and back-end. Key files: `tccir.c`, `tccir.h`,
-`tccir_operand.h`.
+a separate front-end and back-end, and an SSA form built on top of it.
+Public interface: `source/ir/tccir.h`; construction in `source/ir/gen/`.
 
-**3. Register Allocation**
-This fork includes a **two-phase linear scan register allocator** (`tccls.c`)
-that performs liveness analysis and assigns physical registers. The original TCC
-uses a simpler approach without liveness analysis.
+**3. Optimizer**
+Upstream TCC does not optimize. This fork carries a full optimizer under
+`source/opt/`, driven by a pass pipeline table (`source/opt/engine/`) with two
+phases — flat-IR peepholes/fusion (`opt/flat/`) and SSA passes (`opt/ssa/`) —
+plus alias and def-use analysis, pre/post-RA passes, and a declarative pass DSL
+(`opt/framework/`). `-O1` does scalar cleanup, ARM addressing-mode fusion,
+constant/range propagation, loop rotation and light inlining; `-O2` adds the
+heavy tier (loop unrolling, IV strength reduction, LICM, re-rolling, MUL+ADD→MLA
+fusion, interprocedural constant propagation, full small-function inlining).
 
-**4. Code Generation**
+**4. Register Allocation**
+An **SSA register allocator** (`source/ir/regalloc.c`, parameterized by
+`RegAllocTarget`) with a linear-scan core (`source/machine/tccls.c`) performs
+liveness analysis and assigns physical registers, including the VFP bank. The
+original TCC uses a simpler approach without liveness analysis.
+
+**5. Code Generation**
 Instead of x86 code generation, this fork generates **Thumb-2 machine code**
-via `arm-thumb-gen.c` and `arm-thumb-opcodes.c`. It supports the ARMv8-M
-instruction set including DSP extensions.
+via `source/backend/arch/arm/thumb/`: `arm-thumb-gen.c` drives the per-opcode
+`thop_*.c` encoders (ALU, memory, branch, DSP, coprocessor, VFP, exclusive
+access, …), which walk instruction variants narrow→wide and pick the first
+whose constraints hold. Covers the ARMv8-M instruction set including DSP
+extensions.
 
-**5. Floating Point Options**
-Multiple FP back-ends are supported:
-- Software FP (pure C) — **currently the only working option**
-- VFPv4-sp (single-precision, Cortex-M4F) — infrastructure in place, not yet functional
-- VFPv5-dp (double-precision, Cortex-M7) — infrastructure in place, not yet functional
-- RP2350 DCP (double coprocessor) — infrastructure in place, not yet functional
+**6. Floating Point**
+Hardware floating point is supported: VFP single-precision codegen, the full
+AAPCS-VFP hard-float ABI, and inline RP2350 DCP sequences for `double`.
+See the *Floating Point* section below for flags, coverage and limits.
 
-Hardware FP support is not yet implemented; only soft-float can be used.
-
-**6. Library Mode**
+**7. Library Mode**
 Can be used as `libtcc.a` for **JIT compilation** in host applications.
 
-**7. ARM-Specific Features**
-- ARM Procedure Call Standard (AAPCS) support
+**8. ARM-Specific Features**
+- ARM Procedure Call Standard (AAPCS/AAPCS-VFP) support
 - ARMv8-M EABI helper functions
 - ARM assembler parser for inline assembly
-- ARM-specific ELF linking (`arm-link.c`)
+- ARM-specific ELF linking (`source/backend/arch/arm/arm-link.c`)
 
-**8. Runtime Library**
+**9. YAFF Output for YasOS**
+Besides ELF, the linker emits **YAFF** (`source/obj/tccyaff.c`), a flat
+position-independent module format for the YasOS loader, selected with
+`-Wl,-oformat=yaff` (executables and shared libraries alike). The YasOS target
+also defaults to PIC with text/data separation, shared read-only `.rodata`, and
+SB-relative GOT addressing — `-no-share-rodata` and `-mno-sb-relative-got` opt
+back out.
+
+**10. Self-Hosting on Target**
+The compiler builds for ARMv8-M itself and runs on-device under YasOS, so the
+same sources produce both the host cross compiler and an on-target compiler
+(`tests/selfhost/`).
+
+**11. Runtime Library**
 Includes a custom runtime library (`libtcc1`) with ARM EABI helpers in
 `lib/armeabi.c` and `lib/armv8m_eabi.c`.
 
 Project Structure
 -----------------
 
+All compiler code lives under `source/`, one directory per module. Each module
+owns its headers, carries its own `Makefile` and builds to its own static
+library; the top-level `Makefile` links them into `armv8m-tcc`. The repo root
+holds only build inputs, generated headers and project metadata.
+
 ```
 .
-├── Core Compiler Sources
-│   ├── tcc.c              # Main driver/CLI entry point
-│   ├── tccpp.c            # C preprocessor
-│   ├── tccgen.c           # C parser and type system
-│   ├── tccir.c            # IR generator
-│   ├── tccir.h            # IR definitions and opcodes
-│   ├── tccir_operand.c    # IR operand handling
-│   ├── tccir_operand.h    # IR operand definitions
-│   ├── tccls.c            # Liveness analysis and register allocation
-│   ├── tccld.c            # Linker
-│   ├── tccelf.c           # ELF file format support
-│   ├── tccasm.c           # Inline assembler
-│   ├── tccdbg.c           # Debug info generation
-│   ├── tccdebug.c         # Debug utilities
-│   ├── libtcc.c           # Library API implementation
-│   └── tccyaff.c          # YAFF support
+├── source/                  # Compiler sources (one module per directory)
+│   ├── include/             # tcc.h (umbrella header), tcctypes.h
+│   ├── driver/              # tcc.c (CLI), libtcc.c (TCCState/options/driver), tcctools.c
+│   ├── frontend/            # tccpp.c (preprocessor), tccasm.c (GAS asm), svalue.c
+│   │   └── gen/             # Parser, type checker, IR emission (the former tccgen.c)
+│   ├── ir/                  # Target-independent IR
+│   │   ├── tccir.h          # Public IR interface (opcodes, builder)
+│   │   ├── gen/             # IR construction (arith, control, float, params, vla, ...)
+│   │   ├── cfg.c ssa.c      # CFG and SSA form
+│   │   ├── codegen.c        # Two-pass dispatch (dry-run + real-run) to backend _mop handlers
+│   │   ├── regalloc.c       # SSA register allocator (parameterized by RegAllocTarget)
+│   │   └── vreg.c stack.c   # Virtual registers, stack frame layout
+│   ├── opt/                 # Optimizer
+│   │   ├── engine/          # Pass registry, pipeline table, pass timing
+│   │   ├── flat/            # Flat-IR passes (cfg, dce, fusion, loop, memory, scalar, ipa)
+│   │   ├── ssa/             # SSA passes (cfg, dce, loop, memory, scalar, string)
+│   │   ├── analysis/        # Alias analysis, def-use chains, memory SSA
+│   │   ├── ra/              # Pre/post register-allocation passes
+│   │   └── framework/       # Declarative pass DSL
+│   ├── machine/             # Backend boundary: tccls.c (linear scan), tccmachine.c, tccabi.h
+│   ├── backend/
+│   │   ├── arch/arm/        # arm.c, arm_aapcs.c, arm-link.c, arm_regalloc.c, ssa_opt_arm.c
+│   │   │   └── thumb/       # arm-thumb-gen.c, arm-thumb-asm.c, thop_*.c encoders
+│   │   ├── arch/fpu/        # FPU capability descriptions
+│   │   └── generators/      # Target-independent generator helpers
+│   ├── obj/                 # tccelf.c, tccld.c, tccyaff.c (YAFF), tccdbg.c (DWARF/STABS)
+│   ├── support/             # tccdebug.c (gdb printers), logging, debug-env knobs
+│   ├── memory/              # vector.c, unique_ptr.c, container headers
+│   └── utils/               # Header-only helpers
 │
-├── ARM-Specific Sources
-│   ├── arm-thumb-gen.c    # Thumb-2 code generator
-│   ├── arm-thumb-opcodes.c# Thumb-2 opcode builders
-│   ├── arm-thumb-opcodes.h# Thumb-2 instruction definitions
-│   ├── arm-thumb-asm.c    # ARM assembler parser
-│   ├── arm-thumb-callsite.c# Call site handling
-│   ├── arm-thumb-defs.h   # ARM-specific definitions
-│   ├── arm-link.c         # ARM linker support
-│   ├── arch/armv8m.c      # ARMv8-M architecture config
-│   └── arch/arm_aapcs.c   # ARM Procedure Call Standard
+├── lib/                     # Runtime library sources (libtcc1)
+│   ├── libtcc1.c            # Core runtime functions
+│   ├── armeabi.c            # ARM EABI helpers
+│   ├── armv8m_eabi.c        # ARMv8-M EABI specific
+│   ├── builtin.c            # Freestanding builtin fallbacks
+│   └── fp/                  # Floating point libraries (see Floating Point)
+├── include/                 # Headers shipped with the compiler
 │
-├── Libraries
-│   ├── lib/               # Runtime library sources
-│   │   ├── libtcc1.c      # Core runtime functions
-│   │   ├── armeabi.c      # ARM EABI helpers
-│   │   ├── armv8m_eabi.c  # ARMv8-M EABI specific
-│   │   └── fp/            # Floating point libraries
-│   ├── include/           # System headers
+├── tests/
+│   ├── ir_tests/            # Primary suite: compile + run under QEMU (pytest)
+│   ├── unit/                # Host unit tests for individual passes (make ut)
+│   ├── thumb/armv8m/        # Thumb-2 encoder tests
+│   ├── frontend/ linker/    # Per-subsystem pytest suites
+│   ├── debug/ runtime/      #  "
+│   ├── selfhost/            # The compiler compiling itself
+│   ├── gcctestsuite/        # GCC torture tests (fetched on demand)
+│   ├── benchmarks/          # Performance, code size, FP conformance
+│   ├── fuzz/                # Fuzzing and divergence triage
+│   └── tests2/ pp/          # Upstream legacy suites
 │
-├── Tests
-│   ├── tests/ir_tests/    # IR-level tests (pytest)
-│   ├── tests/thumb/armv8m/# Thumb-2 instruction tests
-│   ├── tests/tests2/      # C language compliance tests
-│   ├── tests/pp/          # Preprocessor tests
-│   └── tests/benchmarks/  # Performance benchmarks
+├── scripts/                 # Bisect, reduce, disassembly diff, container runner
+├── metrics/                 # Code size / performance tracking, Grafana dashboards
+├── docs/                    # Design documents and plans
 │
-├── Build System
-│   ├── configure          # Configuration script
-│   ├── Makefile           # Main build rules
-│   └── config.h           # Generated configuration
-│
-└── Documentation
-    ├── tcc-doc.texi       # Texinfo documentation source
-    ├── LAZY_SECTION_LOADING.md
-    └── asm_port.md
+├── configure                # Configuration script
+├── Makefile                 # Top-level build rules (module Makefiles under source/*)
+├── config.h / config.mak    # Generated configuration
+└── tcc-doc.texi             # Texinfo documentation source
 ```
 
 Build
@@ -118,21 +152,23 @@ Build
 ./configure [options]
 ```
 
-`./configure` accepts the following options:
+Frequently used `./configure` options:
 
 | Flag | Description |
 |------|-------------|
-| `--enable-O2` | Build an optimized TCC compiler |
 | `--enable-cross` | Build the ARMv8-M cross compiler (`armv8m-tcc`) |
-| `--debug` | Enable IR debug output (`-dump-ir`) and compile TCC with debug symbols |
+| `--enable-O0` … `--enable-O3`, `--enable-Os`, `--enable-Og` | Optimization level TCC itself is built with (`-O2` default) |
+| `--disable-asan` | **AddressSanitizer is ON by default**; disable it for fast or production builds |
+| `--enable-ubsan`, `--enable-lsan` | Additional sanitizers |
+| `--debug` | Include debug info in the resulting binaries |
 
 Example:
 ```bash
-./configure --enable-cross --enable-O2 --debug
+./configure --enable-cross --disable-asan
 make cross
 ```
 
-Run `./configure --help` for more options.
+Run `./configure --help` for the full list.
 
 ```bash
 # Build ARMv8-M cross compiler
@@ -141,25 +177,123 @@ make cross
 # Build everything including FP libraries
 make cross fp-libs
 
-# Run tests
+# Run the full test suite
 make test -j16
 ```
 
-Docker
-------
+Two build-time knobs affect what ends up in the binary:
 
-A Dockerfile provides a reproducible build environment:
+| Variable | Effect |
+|----------|--------|
+| `make cross CONFIG_minimal=yes` | Drops the `-dump-ir` / `-dump-ir-passes` machinery (`CONFIG_TCC_DEBUG`), which is on by default so IR tooling and the golden-IR tests work with a plain `make cross`. Generated code is unaffected either way. |
+| `make cross CONFIG_debugenv=no` | Compiles out the getenv-driven debug/bisect knobs (`TCC_DISABLE_PASS`, `TCC_NO_COALESCE`, …); each folds to a compile-time constant. Worth ~17 KB on the device compiler, but disables the host bisect tooling. |
+
+Floating Point
+--------------
+
+Both software and **hardware** floating point are supported. Two flags select
+the behaviour:
+
+| Flag | Values | Meaning |
+|------|--------|---------|
+| `-mfloat-abi=` | `soft`, `softfp` (default), `hard` | how FP values cross a call boundary |
+| `-mfpu=` | `none`, `fpv4-sp-d16`, `fpv5-sp-d16`, `fpv5-d16`, `rp2350` (= `rp2350-dcp`) | which FP unit may be used inside a function |
+
+The compile-time default can be changed for a whole toolchain with
+`-DCONFIG_TCC_DEFAULT_FPU=ARM_FPU_...` (e.g. `ARM_FPU_RP2350`); an explicit
+`-mfpu=` on the command line still wins, and the float ABI is untouched, so
+objects stay link-compatible across the switch. Code that must stay soft-float
+has to say `-mfpu=none` rather than rely on the default.
+
+**What is emitted inline** (with `-mfloat-abi=softfp` or `hard`;
+`-mfloat-abi=soft` disables all inline FP codegen regardless of `-mfpu`)
+
+| Operation | `-mfpu=none` | `fpv4/fpv5-sp-d16` | `-mfpu=rp2350` |
+|---|---|---|---|
+| `float` add/sub/mul/div | `__aeabi_f*` | `vadd/vsub/vmul/vdiv.f32` | `vadd/vsub/vmul/vdiv.f32` |
+| `float` compare/convert/negate | `__aeabi_*` | `__aeabi_*` | `__aeabi_*` |
+| `double` add/sub/compare | `__aeabi_d*` | `__aeabi_d*` | inline DCP (CP4) sequences |
+| `double` mul/div/convert | `__aeabi_d*` | `__aeabi_d*` | `__aeabi_d*` (DCP-backed library) |
+
+**Hard-float ABI** (`-mfloat-abi=hard`) is complete: `float` arguments in
+`s0-s15`, `double` arguments in `d0-d7` with AAPCS back-filling, returns in
+`s0`/`d0`, VFP spills/reloads via `vldr`/`vstr`, and `.ARM.attributes`
+(`Tag_FP_arch`, `Tag_ABI_HardFP_use`, `Tag_ABI_VFP_args`) matching
+`arm-none-eabi-gcc` byte-for-byte. `softfp` keeps the base PCS at call
+boundaries while still using the FPU internally, so it links against
+soft-float libraries unchanged.
+
+Note that AAPCS-VFP passes doubles in `d0-d7` even on a single-precision-only
+FPU — the ABI says where arguments live, not which arithmetic exists, so a
+callee unpacks `d0` into a GPR pair to call `__aeabi_dadd`.
+
+**Runtime libraries** (`make fp-libs`, sources in `lib/fp/`):
+
+| Library | `-mfpu` | Contents |
+|---------|---------|----------|
+| `libsoftfp` | `none` | pure software IEEE-754 |
+| `libvfpv4sp` | `fpv4-sp-d16`, `fpv5-sp-d16` | float in HW, double in SW (self-contained) |
+| `libvfpv5dp` | `fpv5-d16` | float and double in HW |
+| `librp2350fp` | `rp2350` | double via the RP2350 DCP coprocessor |
+
+**Testing**
 
 ```bash
-# Build container
-make container-build
+# Float tests under one ABI (soft | softfp | hard)
+make test-fp FLOAT_ABI=hard
 
-# Run tests inside container
-docker run --rm -v $(pwd):/workspace tinycc-armv8m bash -c "\
-  virtualenv .venv && \
-  source .venv/bin/activate && \
-  make test -j$(nproc)"
+# IEEE-754 conformance on real RP2350 silicon (inline DCP/VFP codegen,
+# which QEMU cannot model); the same vectors run under QEMU as
+# tests/ir_tests/421_fp_conformance.c
+python3 tests/benchmarks/run_fp_conformance.py <host> --opt-level 1 \
+    --fp-lib rp2350fp --mfpu rp2350 --allow-ftz
 ```
+
+`--allow-ftz` applies only to the DCP configuration: the coprocessor flushes
+subnormals to zero and has no path that doesn't. The soft-float baseline (the
+same script without those flags) stays held to full IEEE-754.
+
+**Current limits**
+
+- `float` compares, conversions and negate still go through `__aeabi_*`
+  helpers even with an FPU selected.
+- No native `vadd.f64` on a double-precision unit (`-mfpu=fpv5-d16`); doubles
+  always call, or use DCP on RP2350.
+- DCP `dmul`, `dneg` and the double conversions are not inlined yet.
+- `.ARM.attributes` is written at link time only — object files carry none, so
+  GNU `ld` cannot ABI-check them.
+- `-mfloat-abi=hard` on RP2350 silicon is untested (needs pico-sdk rebuilt for
+  the hard ABI); RP2350 uses `softfp` today.
+- The DCP save/restore hooks exist in `dcp_aeabi.S` but the library entry
+  points do not use them, so an interrupt handler doing `double` math can
+  corrupt an interrupted user-space DCP sequence. The OS context switch half
+  is handled on YasOS.
+
+Details: `docs/plan_vfp_hard_float.md` (VFP / hard-float ABI),
+`docs/plan_rp2350_dcp.md` (DCP), `lib/fp/README.md` (runtime libraries).
+
+Container
+---------
+
+A Dockerfile provides a reproducible build environment, published as
+`ghcr.io/matgla/tinycc-armv8m`. The `run` target pulls it and mounts the repo
+(`scripts/run_container.py` does the plumbing; podman by default, or
+`CONTAINER_RUNTIME=docker`):
+
+```bash
+# Interactive shell in the container
+make run
+
+# Run one command inside it
+make run CMD='make test -j16'
+
+# Build the multi-arch image locally / push it
+make build_container
+make push_container
+```
+
+`container-build` / `container-pull` / `container-push` / `docker-build` /
+`docker-start` remain as aliases.
 
 Testing
 -------
@@ -169,12 +303,30 @@ Testing
 # pulled, sparsely, not the whole gcc repo (~1.3 GB):
 make download-gcc-tests        # or: bash tests/gcctestsuite/download_gcc_tests.sh
 
-# Run IR tests
+# Full suite: IR tests + asm + unit tests + frontend/linker/debug/runtime/selfhost
 make test -j16
 
-# GCC torture tests
+# Same, but sequential — clean logs
+make test-sequential
+
+# Everything above plus the GCC torture tests
 make test-all
 ```
+
+Individual suites:
+
+| Target | Scope |
+|--------|-------|
+| `make test-ir` | The primary QEMU corpus in `tests/ir_tests/` |
+| `make ut` | Host unit tests for individual optimizer passes |
+| `make test-asm` | Thumb-2 encoder tests (`tests/thumb/armv8m/`) |
+| `make test-fp FLOAT_ABI=…` | Float tests under one ABI (see *Floating Point*) |
+| `make test-selfhost` | The compiler compiling its own sources |
+| `make test-frontend`, `test-linker`, `test-debug`, `test-runtime` | Per-subsystem suites |
+| `make test-gcc-torture-compile`, `test-gcc-torture-execute` | GCC torture, split by phase |
+| `make test-golden-ir` | Golden IR dumps (needs a `CONFIG_TCC_DEBUG` build) |
+
+`make help` lists the rest.
 
 Quick Test Runner
 -----------------
@@ -190,6 +342,11 @@ python run.py -c mytest.c --cflags="-O1"
 
 # Dump IR
 python run.py -c mytest.c --cflags="-O1" --dump-ir
+
+# Compare against GCC, pass program arguments, or attach a debugger
+python run.py -c mytest.c --gcc arm-none-eabi-gcc
+python run.py -c mytest.c -a arg1 arg2
+python run.py -c mytest.c --gdb
 ```
 
 Debugging
@@ -199,15 +356,25 @@ Debugging
 # Show IR output
 ./armv8m-tcc -dump-ir -c test.c
 
-# Verbose output
+# Dump IR after each named optimizer pass (comma-separated, or 'all')
+./armv8m-tcc -dump-ir-passes=all -O2 -c test.c
+
+# Verbose: version banner plus every file read and written
 ./armv8m-tcc -vv -c test.c
 ```
 
-Enable debug logging at build time:
-```bash
-make CFLAGS+='-DTCC_LS_DEBUG'    # Register allocator debug
-make CFLAGS+='-DCONFIG_TCC_DEBUG' # IR dump support
-```
+Both dump options need a compiler built with `CONFIG_TCC_DEBUG`, which is the
+default (see *Build*).
+
+The getenv knobs described in `source/support/tccdbgenv.h` — `TCC_DISABLE_PASS`
+and friends — bisect a miscompile to a single pass without rebuilding;
+`scripts/bisect_pass.sh` and `scripts/opt_profile.py` drive them.
+
+For extra compile-time logging (e.g. `-DTCC_LS_DEBUG` for the register
+allocator), add the define to `CFLAGS` in `config.mak` or pass it to
+`./configure --extra-cflags=`. Do **not** use `make CFLAGS+=-DFOO`: that
+overrides the flags the sub-makes compute, so the affected TUs silently lose
+`-fsanitize=address` and the resulting mixed binary crashes in unrelated code.
 
 License
 -------
