@@ -9,7 +9,20 @@
  *
  * The runtime-indexed store keeps entry_store_prop out of it: that pass would
  * otherwise forward the constant itself, leaving this group's sl_forward trigger
- * idle and the cascade never running -- i.e. the case would stop covering it. */
+ * idle and the cascade never running -- i.e. the case would stop covering it.
+ *
+ * What the snapshot actually pins today is weaker than the paragraph above:
+ * `v`/`w`/`z` land in VARs, which the known_bits lattice does not track (it
+ * follows TMPs and stack slots), so by the time kb_cascade runs, const_cascade
+ * has already folded the chain and setif_fuse has already folded the guard --
+ * this slot only compacts the NOPs they left. The three dead `V0/V1/V2 <-- #k`
+ * assigns survive to here because const_var_prop's dominance guard (see
+ * source/opt/flat/scalar/const_var_prop.c) drops a VAR's constant when a use
+ * sits at a jump target, and its phase 3 only NOPs defs it still believes are
+ * constant; the late dead-store passes remove them, and the function does end
+ * up as a single `RETURNVALUE #100`. Restoring true kb_cascade coverage needs a
+ * case whose known bits live in a TMP or stack slot and are revealed only by
+ * the memory group's sl_forward. */
 int f(int cond, int n) {
     int arr[4];
     arr[n & 3] = 1;
