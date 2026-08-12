@@ -94,9 +94,20 @@ void tcc_ir_gen_f(TCCIRState *ir, int op)
        * Unordered falls out correctly everywhere: RCMP leaves C clear on
        * unordered, so all four relational tests are false and only NE is true.
        */
+      /* Which operands count as "double" here has to be decided exactly the way
+       * ir_put_soft_call_fpu_if_needed() decides it, or the two disagree and the
+       * condition fix-up below is applied to the wrong flag convention.  That
+       * gate is `tcc_is_64bit_operand(src1) || tcc_is_64bit_operand(src2)`, and
+       * tcc_is_64bit_operand() accepts VT_LDOUBLE as well as VT_DOUBLE --
+       * LDOUBLE_SIZE is 8 on ARM, so `long double` *is* a double here and the
+       * backend emits an inline RCMP for it.  Testing VT_DOUBLE alone left
+       * `long double` comparisons reading DCP flags with the signed soft-float
+       * conditions; since RCMP's bit 31 is the DCP "engaged" flag rather than a
+       * sign, `gt`/`ge`/`lt`/`le` there test nothing meaningful (gcc-torture
+       * ieee/inf-2, ieee/inf-3: testl() aborted, test() and testf() passed). */
       const FloatingPointConfig *dcp_fpu = architecture_config.fpu;
       const int dcp_cmp = dcp_fpu && dcp_fpu->has_dcmp && dcp_fpu->double_impl == FP_DOUBLE_IMPL_DCP &&
-                          (vtop[0].type.t & VT_BTYPE) == VT_DOUBLE && (vtop[-1].type.t & VT_BTYPE) == VT_DOUBLE;
+                          (tcc_is_64bit_operand(&vtop[0]) || tcc_is_64bit_operand(&vtop[-1]));
       if (dcp_cmp)
       {
         switch (op)

@@ -691,6 +691,27 @@ void tcc_ir_codegen_cmp_jmp_set(TCCIRState *ir)
     IROperand end_dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[end_jump]);
     end_dest.u.imm32 = ir->next_instruction_index;
     tcc_ir_op_set_dest(ir, &ir->compact_instructions[end_jump], end_dest);
+    /* `dest` has just been written on two different paths, so the next ASSIGN
+     * must not be coalesced into the one that happens to sit last.  tcc_ir_put()
+     * rewrites the *previous* instruction's destination and drops the copy, and
+     * it rewrites only that one def: the other arm would keep writing a temp
+     * nothing reads, leaving the real destination undefined on that path.
+     *
+     * `int t = (a == 9) || (0 && (a == 4));` is the whole bug --
+     *
+     *   T0 <-- #0          fall-through arm
+     *   JMP end
+     *   V0 <-- #1          jump-chain arm, coalesced with the store to `t`
+     *   LOAD V0            reads V0, which the fall-through path never wrote
+     *
+     * so `t` came back as whatever was in the register.  In vstore() that
+     * expression is `is_64bit_type`, and a garbage non-zero sent every
+     * `unsigned char`/`short` assignment down the 64-bit store path, skipping
+     * the force_charshort_cast() that is the only thing narrowing the value
+     * (gcc-torture doloop-1/2, 20030916-1, pr19005, pr51933, arith-rand).
+     *
+     * The VT_CMP branch above already ends with this call for the same reason. */
+    tcc_ir_codegen_bb_start(ir);
     vtop->vr = dest.vr;
     vtop->r = 0;
   }

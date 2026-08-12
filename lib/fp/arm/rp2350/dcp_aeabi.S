@@ -200,13 +200,41 @@ __rp2350_f2d:
     bx lr
 .size __rp2350_f2d, .-__rp2350_f2d
 
-/* dcp_double2float_m r0, r0,r1 */
+/* dcp_double2float_m r0, r0,r1
+ *
+ * NRDF flushes to zero any result that does not land in the *normal* float
+ * range, so every double whose float image is subnormal came back 0 -- and
+ * since tccpp.c narrows hex float literals with `tokc.f = (float)d`, the
+ * self-hosted compiler silently zeroed them at parse time as well (see
+ * d2f_subnormal.c).  Screen the biased exponent first and hand that one band
+ * to software; everything else keeps the three-instruction DCP path.
+ *
+ *   exp == 0        double zero or subnormal -- float image is +-0, NRDF right
+ *   1 <= exp <= 896 float image is subnormal or 0  -- NRDF wrong, go software
+ *   exp >= 897      normal float, overflow to Inf, or Inf/NaN -- NRDF right
+ *
+ * 897 is the smallest biased exponent whose value is >= 2^-126, the smallest
+ * normal float.
+ *
+ * Written with shifts and a movw rather than `ubfx`/`cbz`/`cmp rN,#897`: this
+ * file is assembled by tcc's own assembler, which has no ubfx (see dcmpun
+ * above) or cbz, and 897 is not a Thumb modified immediate.
+ */
 .global __rp2350_d2f
 .type __rp2350_d2f, %function
 .global __aeabi_d2f
 .type __aeabi_d2f, %function
 __rp2350_d2f:
 __aeabi_d2f:
+    lsls r2, r1, #1                 /* drop the sign bit */
+    lsrs r2, r2, #21                /* r2 = biased exponent of the double */
+    cmp  r2, #0
+    beq  1f                         /* zero/subnormal double -> +-0 */
+    movw r3, #897
+    cmp  r2, r3
+    bhs  1f                         /* normal, overflow, Inf or NaN */
+    b    __rp2350_d2f_subnormal     /* tail call; argument stays in r0,r1 */
+1:
     mcrr p4, #1, r0, r1, c0         /* WXUP r0,r1 */
     cdp  p4, #8, c0, c0, c2, #1     /* NRDF */
     mrc  p4, #0, r0, c0, c2, #5     /* RDFG r0 */

@@ -22,7 +22,10 @@ include ../../../../config.mak
 FP_CC ?= $(CC)
 FP_CFLAGS ?= $(CFLAGS)
 
-SRCS = dcp_init.c
+# d2f_subnormal.c is the software tail of __aeabi_d2f: the DCP's NRDF flushes
+# subnormal results to zero, so dcp_aeabi.S screens the exponent and tail-calls
+# it for the one band that needs a real subnormal.
+SRCS = dcp_init.c d2f_subnormal.c
 ASMS = dcp_aeabi.S
 
 # Borrowed verbatim from the soft-float runtime; see above.

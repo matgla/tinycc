@@ -264,6 +264,7 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
     int64_t value; /* immediate value, or pool_idx for symrefs */
     int btype;
     int is_unsigned;
+    int def_index; /* instruction index of the single def; -1 if none recorded */
   } VarInfo;
 
   VarInfo *var_info = NULL;
@@ -315,6 +316,7 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
       if (irop_is_immediate(src1) && !src1.is_sym && !src1.is_lval && !src1.is_local && var_info[pos].def_count == 1)
       {
         var_info[pos].is_constant = 1;
+        var_info[pos].def_index = i;
         var_info[pos].is_sym = 0;
         var_info[pos].value = irop_get_imm64_ex(ir, src1);
         var_info[pos].btype = irop_get_btype(src1);
@@ -326,6 +328,7 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
                var_info[pos].def_count == 1)
       {
         var_info[pos].is_constant = 1;
+        var_info[pos].def_index = i;
         var_info[pos].is_sym = 1;
         var_info[pos].sym_is_lval = src1.is_lval;
         var_info[pos].sym_is_local = src1.is_local;
@@ -384,6 +387,91 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
     if (var_info[i].def_count > 1)
       var_info[i].is_constant = 0;
   }
+
+  /* A single *visible* def is not the same as a single reaching def.  The
+   * short-circuit boolean lowering ends a `||` chain with the two arms writing
+   * different vregs -- the taken arm assigns into the variable, the fall-through
+   * arm assigns into a TEMP that regalloc later coalesces with it:
+   *
+   *   T1741 <-- #0 [ASSIGN]        ; chain fell through
+   *   JMP to L
+   *   V69   <-- #1 [ASSIGN]        ; a jtrue target landed here
+   * L: TEST_ZERO V69
+   *
+   * Scanning dests sees exactly one def of V69, so V69 reads as the constant 1
+   * and every use folds to 1 -- the `#0` arm simply never reaches the scan.  In
+   * `vstore()` that VAR is `is_64bit_type`, and folding it deleted the
+   * single-word store branch along with the `force_charshort_cast()` that is the
+   * only thing narrowing a value stored through TCCIR_OP_ASSIGN; every `unsigned
+   * char`/`short` local in the self-hosted compiler then kept its full width.
+   *
+   * The def must therefore dominate the uses, and the cheap conservative test
+   * for that is: refuse if any use precedes the def, or if anything can branch
+   * *into* the range between the def and a use, since such a branch bypasses
+   * the def.  Losing the fold on those VARs costs an immediate
+   * rematerialization; keeping it costs correctness.
+   *
+   * The incoming-branch map is built here rather than read from
+   * `is_jump_target`, which is maintained opportunistically -- backedges have
+   * been observed not to set it -- and a guard that silently under-reports is
+   * worse than no guard.  `is_jump_target` is still folded in, because switch
+   * tables record their targets only that way.
+   */
+  {
+    small_sequence(CvpBitset) branched_into_owner = {0};
+    if (CvpBitset_init(&branched_into_owner, (size_t)((n + 8) / 8)) != 0)
+      goto skip_dominance_guard;
+    uint8_t *branched_into = CvpBitset_data(&branched_into_owner);
+
+    for (i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (ir->compact_instructions[i].is_jump_target)
+        branched_into[i / 8] |= (1 << (i % 8));
+      if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+        continue;
+      int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      if (target >= 0 && target < n)
+        branched_into[target / 8] |= (1 << (target % 8));
+    }
+
+    for (i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      for (int slot = 0; slot < 2; slot++)
+      {
+        int has = (slot == 0) ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
+        if (!has)
+          continue;
+        IROperand op = (slot == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        int32_t vr = irop_get_vreg(op);
+        if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
+          continue;
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos > max_var_pos || !var_info[pos].is_constant)
+          continue;
+        int d = var_info[pos].def_index;
+        if (i <= d)
+        {
+          var_info[pos].is_constant = 0;
+          continue;
+        }
+        for (int j = d + 1; j <= i; j++)
+        {
+          if (branched_into[j / 8] & (1 << (j % 8)))
+          {
+            var_info[pos].is_constant = 0;
+            break;
+          }
+        }
+      }
+    }
+  }
+skip_dominance_guard:;
 
   /* Phase 2: replace uses.  A local without lval is an address-of (LEA), not a value load —
    * never substitute those. */
