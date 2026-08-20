@@ -963,6 +963,9 @@ static int fold_bfx_value(IRSSAOptCtx *ctx, int i, int is_signed, int32_t *out)
 OPT_GEN_SSA(fold_ubfx, TCCIR_OP_UBFX) {
   int32_t result = 0;
   PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  /* fold_bfx_value extracts from the source's LOW word; UBFX_HI_HALF does not
+   * name that word.  See source/opt/flat/fusion/shift64_extract_ubfx.c. */
+  GUARD(when(!(is_imm32(src2) && ((int32_t)imm(src2) & UBFX_HI_HALF))));
   GUARD(when(fold_bfx_value(ctx, i, 0, &result)));
   REWRITE(.new_op = TCCIR_OP_ASSIGN,
           .src1 = mk_imm_bt(result, irop_get_btype(dest)));

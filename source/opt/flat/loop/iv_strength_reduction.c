@@ -39,17 +39,30 @@ static int sr_div_value_stays_in_regs(TCCIRState *ir, int lo, int hi, int32_t se
 
       /* STORE dest slot holds the write address; MLA accum lives at pool +3, invisible to src1/src2 (ptr-6869). */
       IROperand reads[4];
+      int slots[4]; /* 1 = src1, 2 = src2, 3 = dest, 4 = accum */
       int nreads = 0;
       int dest_is_read = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
                           q->op == TCCIR_OP_STORE_POSTINC || q->op == TCCIR_OP_FUNCPARAMVAL);
       if (irop_config[q->op].has_src1)
+      {
+        slots[nreads] = 1;
         reads[nreads++] = tcc_ir_op_get_src1(ir, q);
+      }
       if (irop_config[q->op].has_src2)
+      {
+        slots[nreads] = 2;
         reads[nreads++] = tcc_ir_op_get_src2(ir, q);
+      }
       if (dest_is_read && irop_config[q->op].has_dest)
+      {
+        slots[nreads] = 3;
         reads[nreads++] = tcc_ir_op_get_dest(ir, q);
+      }
       if (q->op == TCCIR_OP_MLA)
+      {
+        slots[nreads] = 4;
         reads[nreads++] = tcc_ir_op_get_accum(ir, q);
+      }
 
       int reads_taint = 0;
       for (int r = 0; r < nreads; r++)
@@ -68,10 +81,32 @@ static int sr_div_value_stays_in_regs(TCCIRState *ir, int lo, int hi, int32_t se
         }
         if (!t)
           continue;
-        /* lval read = deref of the tainted value, except the plain "fetch VAR" form (VAR vreg + is_local). */
+        /* lval read = deref of the tainted value, except the plain "fetch VAR" form (VAR vreg + is_local).
+         *
+         * ...and except when the deref IS the memory access: the tainted value
+         * sits in the ADDRESS slot of a plain load/store.  That is the whole
+         * point of an address derived from an IV (`a[i]`), and the rewrite
+         * preserves it exactly -- transform_derived_iv turns the defining ADD
+         * into `T = ptr`, and ptr holds the identical value (base + i*stride)
+         * at that point in the iteration.  What this scan must still catch is
+         * the address being PUBLISHED (stored to memory, passed to a call,
+         * used to index something else); every one of those reads the taint
+         * from a non-address slot and still falls through to the op-kind check
+         * below.  Refusing the deref outright was the most common rejection
+         * across the benchmark sources (`escape scan ... feeds_mem=1`). */
         if (reads[r].is_lval &&
             !(TCCIR_DECODE_VREG_TYPE(rv) == TCCIR_VREG_TYPE_VAR && reads[r].is_local))
-          return 0;
+        {
+          int addr_slot =
+              ((q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_LOAD_INDEXED) && slots[r] == 1) ||
+              ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) && slots[r] == 3);
+          if (!addr_slot)
+            return 0;
+          /* The address is consumed here; the loaded/stored VALUE is memory
+           * contents, not the pointer, so nothing propagates and this op must
+           * not be judged by the ALU-only rule below. */
+          continue;
+        }
         reads_taint = 1;
       }
       if (!reads_taint)
@@ -129,14 +164,6 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
   if (tcc_ir_opt_pass_disabled("derived_iv"))
     return 0;
 
-  /* Skip DIVs whose use is an indexed load/store; the backend already forms efficient indexed addressing. */
-  if (div->use_idx >= 0 && div->use_idx < ir->next_instruction_index)
-  {
-    int uop = ir->compact_instructions[div->use_idx].op;
-    if (uop == TCCIR_OP_STORE_INDEXED || uop == TCCIR_OP_LOAD_INDEXED)
-      return 0;
-  }
-
   /* Shared-pointer rewrites unsupported (no escape analysis for the duplicate's use site); defer to re-detection (docs/bugs.md #2). */
   if (shared_ptr_vreg >= 0)
     return 0;
@@ -145,8 +172,28 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
   if (div->use_idx >= 0 && div->use_idx < ir->next_instruction_index)
   {
     int uop = ir->compact_instructions[div->use_idx].op;
-    int feeds_mem = (uop == TCCIR_OP_STORE_INDEXED || uop == TCCIR_OP_LOAD_INDEXED);
-    if (!feeds_mem)
+    /* An INDEXED use consumes the derived address as an ADDRESSING MODE, so no
+     * address value is produced and nothing can escape -- it is the safest
+     * shape, not the most dangerous one.  (The escape scan below would track
+     * a LOAD_INDEXED's dest, which is the loaded VALUE, not an address.)
+     *
+     * This path used to be turned off here and one gate above, on the premise
+     * that "the backend already forms efficient indexed addressing".  Measured
+     * on the RP2350 Cortex-M33 with hand-written asm probes over a 256-word
+     * walk (cycles per element, same body otherwise):
+     *
+     *   ldr.w r3,[base,i,lsl #2] + adds i + cmp + blt   5 instr   8.012
+     *   ldr   r3,[p]  + adds p,#4 + cmp p,end + bne     5 instr   7.012
+     *   ldr   r3,[p],#4           + cmp p,end + bne     4 instr   6.012
+     *
+     * A scaled register offset costs a full extra cycle over a plain base
+     * register at equal instruction count, so the indexed form is the SLOWEST
+     * of the three, not the most efficient.  Strength-reducing it to the
+     * pointer walk (which is what this pass then does, including replacing the
+     * loop test with a pointer compare) is the 7.012 row; that is also exactly
+     * the shape gcc emits for these loops. */
+    int feeds_mem = 0;
+    if (uop != TCCIR_OP_STORE_INDEXED && uop != TCCIR_OP_LOAD_INDEXED)
     {
       IROperand ud = tcc_ir_op_get_dest(ir, &ir->compact_instructions[div->use_idx]);
       int32_t ud_vr = irop_get_vreg(ud);
@@ -203,7 +250,12 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
   /* Verify base vreg is defined before insert_pos (LICM can hoist a base def after the header → use-before-def). */
   {
     int32_t base_vr = irop_get_vreg(div->base_op);
-    if (base_vr >= 0)
+    /* A PARAM is live-in: it has no defining quad anywhere in the function, so
+     * the scan below can never find one and every `f(const int *a) { ... a[i]
+     * ... }` loop -- the single most common array-walk shape there is -- was
+     * rejected here.  The guard exists to catch a base whose def LICM hoisted
+     * to *after* the header; an incoming argument cannot have that problem. */
+    if (base_vr >= 0 && TCCIR_DECODE_VREG_TYPE(base_vr) != TCCIR_VREG_TYPE_PARAM)
     {
       int def_found_before = 0;
       for (int i = 0; i < insert_pos; i++)

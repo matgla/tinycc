@@ -138,6 +138,31 @@ static int ir_opt_operand_is_volatile_sym(TCCIRState *ir, IROperand s)
   return sym && (sym->type.t & VT_VOLATILE);
 }
 
+/* Every way an operand can name volatile storage, in one place: a volatile
+ * global (the Sym), a volatile local or parameter (the live interval — note
+ * `volatile int x; x = 1;` lowers to a direct `V <- #1 [ASSIGN]`, never a
+ * STORE, so the opcode switch alone would call it dead), and every other
+ * volatile lvalue access — a `volatile T *` deref, a volatile member, a cast —
+ * which only the operand's access mark records. */
+static int ir_opt_operand_access_is_volatile(TCCIRState *ir, IROperand op)
+{
+  if (ir_opt_operand_is_volatile_sym(ir, op))
+    return 1;
+  if (op.is_lval && tcc_ir_access_is_volatile(ir, op))
+    return 1;
+  if (op.is_sym || op.is_llocal)
+    return 0;
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0)
+    return 0;
+  int vt = TCCIR_DECODE_VREG_TYPE(vr);
+  if (vt == TCCIR_VREG_TYPE_VAR)
+    return ir_opt_vreg_sym_is_volatile(vr);
+  if (vt == TCCIR_VREG_TYPE_PARAM)
+    return ir_opt_param_vreg_is_volatile(TCCIR_DECODE_VREG_POSITION(vr));
+  return 0;
+}
+
 static int ir_opt_op_is_essential(TCCIRState *ir, IRQuadCompact *q, int idx,
                                   const uint8_t *pure_call_ids, int pure_call_id_bytes)
 {
@@ -212,10 +237,12 @@ static int ir_opt_op_is_essential(TCCIRState *ir, IRQuadCompact *q, int idx,
     break;
   }
 
-  /* Volatile sym read on any source: keep the function alive. */
-  if (irop_config[q->op].has_src1 && ir_opt_operand_is_volatile_sym(ir, tcc_ir_op_get_src1(ir, q)))
+  /* Any volatile access — read OR write — keeps the function alive. */
+  if (irop_config[q->op].has_dest && ir_opt_operand_access_is_volatile(ir, tcc_ir_op_get_dest(ir, q)))
     return 1;
-  if (irop_config[q->op].has_src2 && ir_opt_operand_is_volatile_sym(ir, tcc_ir_op_get_src2(ir, q)))
+  if (irop_config[q->op].has_src1 && ir_opt_operand_access_is_volatile(ir, tcc_ir_op_get_src1(ir, q)))
+    return 1;
+  if (irop_config[q->op].has_src2 && ir_opt_operand_access_is_volatile(ir, tcc_ir_op_get_src2(ir, q)))
     return 1;
   return 0;
 }
@@ -1100,7 +1127,7 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
       break;
     }
 
-    /* Volatile sym access on any operand keeps the body alive. */
+    /* Any volatile access on any operand keeps the body alive. */
     for (int k = 0; k <= 2; k++)
     {
       IROperand op;
@@ -1122,7 +1149,7 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
           continue;
         op = tcc_ir_op_get_src2(ir, q);
       }
-      if (ir_opt_operand_is_volatile_sym(ir, op))
+      if (ir_opt_operand_access_is_volatile(ir, op))
         return 0;
     }
   }

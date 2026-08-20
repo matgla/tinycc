@@ -78,6 +78,33 @@ static inline int is_zero_bits(uint64_t bits)
   return (double_exp(bits) == 0) && (double_mant(bits) == 0);
 }
 
+/* Same three tests, taking the exponent and mantissa a caller has already
+ * extracted.
+ *
+ * Every arithmetic routine unpacks both operands up front and then runs a
+ * chain of classifier tests, each ending in `return`.  Passing raw bits makes
+ * each test re-derive the fields, and because every test sits in its own basic
+ * block after a return, the compiler's CSE cannot reach across to share them:
+ * __aeabi_dadd came out with ten exponent extracts and eleven mantissa masks
+ * against gcc's two and four.  These routines are straight-line, so that waste
+ * is on the common path, not in a cold corner.
+ *
+ * The _bits forms stay for callers that genuinely have only the raw value. */
+static inline int is_nan_parts(int exp, uint64_t mant)
+{
+  return (exp == 0x7FF) && (mant != 0);
+}
+
+static inline int is_inf_parts(int exp, uint64_t mant)
+{
+  return (exp == 0x7FF) && (mant == 0);
+}
+
+static inline int is_zero_parts(int exp, uint64_t mant)
+{
+  return (exp == 0) && (mant == 0);
+}
+
 /* Build double from components */
 static inline uint64_t make_double(int sign, int exp, uint64_t mant)
 {
@@ -250,8 +277,9 @@ static inline uint32_t sfp_round_pack_float(int sign, int exp, uint32_t mant)
     exp = 0;
   }
 
-  /* Round to nearest, ties to even. */
-  lsb = (mant >> SFP_GRS) & 1;
+  /* Round to nearest, ties to even.  `lsb` is only tested for truth, so test
+   * the bit in place rather than shifting it down -- see the double version. */
+  lsb = mant & (1u << SFP_GRS);
   rem = mant & ((1u << SFP_GRS) - 1);
   if (rem > (1u << (SFP_GRS - 1)) || (rem == (1u << (SFP_GRS - 1)) && lsb))
     mant += (1u << SFP_GRS);
@@ -287,7 +315,12 @@ static inline uint64_t sfp_round_pack_double(int sign, int exp, uint64_t mant)
 
   while (mant >= (DOUBLE_NORM_BIT << 1))
   {
-    mant = sfp_shr_sticky64(mant, 1);
+    /* sfp_shr_sticky64(mant, 1) written out: the shift count is the literal 1,
+     * so the helper's two range tests fold away, but its 64-bit RETURN still
+     * went through the inlined-call result slot -- a str/str + ldr/ldr round
+     * trip and four register copies inside this loop, which runs on a third of
+     * all calls.  The expression form leaves the value in registers. */
+    mant = (mant >> 1) | (mant & 1);
     exp++;
   }
   while (mant < DOUBLE_NORM_BIT)
@@ -302,7 +335,11 @@ static inline uint64_t sfp_round_pack_double(int sign, int exp, uint64_t mant)
     exp = 0;
   }
 
-  lsb = (mant >> SFP_GRS) & 1;
+  /* `lsb` is only ever tested for truth, so test the bit where it sits.  As
+   * `(mant >> SFP_GRS) & 1` it cost a full 64-bit shift -- three instructions
+   * for a result the `mant >>= SFP_GRS` below recomputes anyway, and which no
+   * CSE may share because the rounding in between can change `mant`. */
+  lsb = mant & ((uint64_t)1 << SFP_GRS);
   rem = mant & (((uint64_t)1 << SFP_GRS) - 1);
   if (rem > ((uint64_t)1 << (SFP_GRS - 1)) || (rem == ((uint64_t)1 << (SFP_GRS - 1)) && lsb))
     mant += ((uint64_t)1 << SFP_GRS);

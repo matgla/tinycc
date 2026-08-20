@@ -206,7 +206,9 @@ UT_TEST(test_knownbits_assign_lval_immediate_keeps_load_shape)
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, i_as), TCCIR_OP_ASSIGN);
   UT_ASSERT_EQ((int)utb_src1(ir, i_as).is_lval, 1);
-  UT_ASSERT(irop_is_immediate(utb_src1(ir, i_as)));
+  /* irop_is_immediate answers NO for an lvalue immediate on purpose — it names
+   * an absolute address, not a value — so check the encoding directly. */
+  UT_ASSERT(irop_is_lval_imm_addr(utb_src1(ir, i_as)));
   UT_ASSERT_EQ(irop_get_imm64_ex(ir, utb_src1(ir, i_as)), 1234);
 
   utb_free(ir);

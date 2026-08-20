@@ -7,89 +7,42 @@
 #include "../fp_abi.h"
 #include "soft_common.h"
 
-/* 64x64 -> 128 multiply.
+/* 64x64 -> 128 multiply, as four 32x32->64 partial products.
  *
- * Keep multiplications to 32x32->64, but avoid doing 64-bit additions.
- * Some low-opt codegen paths for 64-bit add/adc are unreliable; accumulating
- * in 32-bit words with explicit carry keeps the result stable at -O0/-O1.
+ * This used to split each 32x32 into 16-bit halves and accumulate in 32-bit
+ * words with explicit carry, to dodge armv8m codegen that was unreliable for
+ * 64-bit add/adc and for shifts by 32.  That is no longer true: the backend
+ * emits UMULL for a widening 32x32 multiply and ADDS/ADC for a 64-bit add,
+ * both verified against the FP conformance vectors.  The hand decomposition
+ * cost ~20 instructions per partial product where UMULL is one, and this is
+ * the hot path -- a dynamic profile of the benchmark's dmul kernel puts
+ * 87,576 calls through here against 5,000 through the classifiers.
+ *
+ * Only two 64-bit idioms appear below, both of which lower cleanly: extracting
+ * a high word, `(uint32_t)(x >> 32)`, and composing one, `(uint64_t)hi << 32`.
  */
-static inline uint32_t add32_c(uint32_t a, uint32_t b, uint32_t cin, uint32_t *cout)
-{
-  uint32_t s = a + b;
-  uint32_t c = (s < a);
-  uint32_t s2 = s + cin;
-  c |= (s2 < s);
-  *cout = c;
-  return s2;
-}
-
-static inline void add64_shift32(uint32_t *w1, uint32_t *w2, uint32_t *w3, uint32_t lo, uint32_t hi)
-{
-  uint32_t c;
-  *w1 = add32_c(*w1, lo, 0, &c);
-  *w2 = add32_c(*w2, hi, c, &c);
-  *w3 = add32_c(*w3, 0, c, &c);
-}
-
-static inline void add64_shift64(uint32_t *w2, uint32_t *w3, uint32_t lo, uint32_t hi)
-{
-  uint32_t c;
-  *w2 = add32_c(*w2, lo, 0, &c);
-  *w3 = add32_c(*w3, hi, c, &c);
-}
-
-static inline void mul32wide_u32(uint32_t a, uint32_t b, uint32_t *lo, uint32_t *hi)
-{
-  const uint32_t a0 = a & 0xFFFFu;
-  const uint32_t a1 = a >> 16;
-  const uint32_t b0 = b & 0xFFFFu;
-  const uint32_t b1 = b >> 16;
-
-  const uint32_t p0 = a0 * b0;
-  const uint32_t p1 = a0 * b1;
-  const uint32_t p2 = a1 * b0;
-  const uint32_t p3 = a1 * b1;
-
-  const uint32_t mid = (p0 >> 16) + (p1 & 0xFFFFu) + (p2 & 0xFFFFu);
-  *lo = (p0 & 0xFFFFu) | (mid << 16);
-  *hi = p3 + (p1 >> 16) + (p2 >> 16) + (mid >> 16);
-}
-
 static inline void mul64wide(uint64_t a, uint64_t b, uint64_t *hi, uint64_t *lo)
 {
-  /* Avoid 64-bit shifts-by-32 here.
-   * Some low-opt codegen paths have historically produced wrong results for
-   * those, which breaks the wide-multiply path for non-power-of-two inputs.
-   */
-  /* Extract 32-bit words by shift/truncate, not via a u64_words union local:
-   * the armv8m cross drops the union's 64-bit store and then reads the high
-   * word from uninitialised stack (a partial-read aliasing miscompile that
-   * survives even -O0).  Direct casts are codegen-correct here. */
-  uint32_t a0 = (uint32_t)a;
-  uint32_t a1 = (uint32_t)(a >> 32);
-  uint32_t b0 = (uint32_t)b;
-  uint32_t b1 = (uint32_t)(b >> 32);
+  /* Extract the 32-bit words by shift/truncate, not via a u64_words union
+   * local: the armv8m cross drops the union's 64-bit store and then reads the
+   * high word from uninitialised stack (a partial-read aliasing miscompile
+   * that survives even -O0).  Direct casts are codegen-correct here. */
+  const uint32_t a0 = (uint32_t)a, a1 = (uint32_t)(a >> 32);
+  const uint32_t b0 = (uint32_t)b, b1 = (uint32_t)(b >> 32);
 
-  uint32_t p0_lo, p0_hi;
-  uint32_t p1_lo, p1_hi;
-  uint32_t p2_lo, p2_hi;
-  uint32_t p3_lo, p3_hi;
-  mul32wide_u32(a0, b0, &p0_lo, &p0_hi);
-  mul32wide_u32(a0, b1, &p1_lo, &p1_hi);
-  mul32wide_u32(a1, b0, &p2_lo, &p2_hi);
-  mul32wide_u32(a1, b1, &p3_lo, &p3_hi);
+  const uint64_t p00 = (uint64_t)a0 * b0;
+  const uint64_t p01 = (uint64_t)a0 * b1;
+  const uint64_t p10 = (uint64_t)a1 * b0;
+  const uint64_t p11 = (uint64_t)a1 * b1;
 
-  uint32_t w0 = p0_lo;
-  uint32_t w1 = p0_hi;
-  uint32_t w2 = 0;
-  uint32_t w3 = 0;
+  /* The 2^32 column: three 32-bit addends, so it needs 34 bits and cannot be
+   * held in a uint32_t.  Its carry-out feeds the 2^64 column. */
+  const uint64_t mid = (uint64_t)(uint32_t)(p00 >> 32) + (uint32_t)p01 + (uint32_t)p10;
 
-  add64_shift32(&w1, &w2, &w3, p1_lo, p1_hi);
-  add64_shift32(&w1, &w2, &w3, p2_lo, p2_hi);
-  add64_shift64(&w2, &w3, p3_lo, p3_hi);
-
-  *lo = ((uint64_t)w1 << 32) | (uint64_t)w0;
-  *hi = ((uint64_t)w3 << 32) | (uint64_t)w2;
+  *lo = ((uint64_t)(uint32_t)mid << 32) | (uint32_t)p00;
+  /* Cannot overflow: p11 <= (2^32-1)^2 leaves exactly enough headroom for the
+   * two high halves and the carry (max total 2^64-1). */
+  *hi = p11 + (uint32_t)(p01 >> 32) + (uint32_t)(p10 >> 32) + (uint32_t)(mid >> 32);
 }
 
 /* Multiply two double-precision floats */
@@ -114,44 +67,58 @@ double __aeabi_dmul(double a, double b)
   /* Result sign is XOR of input signs */
   int result_sign = a_sign ^ b_sign;
 
-  /* Handle NaN */
-  if (is_nan_bits(a_bits))
+  /* NaN, infinity and zero, nested rather than written as a flat sequence of
+   * independent `if`s.
+   *
+   * Flat, this read `is_nan_parts(a)`, `is_nan_parts(b)`, `is_inf_parts(a)`,
+   * `is_inf_parts(b)`, `is_zero_parts(a) || is_zero_parts(b)` -- which tests
+   * `a_exp == 0x7FF` twice and `b_exp == 0x7FF` twice, and each of those needs
+   * a `movw` to materialize 0x7FF before the compare.  Every re-test is
+   * decided by an earlier branch on the same value, so a compiler that threads
+   * jumps through duplicated test blocks removes them; tcc does not thread.
+   * Nesting hands it the threaded form: one maximal-exponent test per operand
+   * on the common path.  See the same rewrite in dadd.c. */
+  if (a_exp == 0x7FF)
   {
-    ur.u = a_bits;
-    return ur.d;
-  }
-  if (is_nan_bits(b_bits))
-  {
-    ur.u = b_bits;
-    return ur.d;
-  }
-
-  /* Handle infinity */
-  if (is_inf_bits(a_bits))
-  {
-    if (is_zero_bits(b_bits))
+    if (a_mant != 0)
     {
-      /* inf * 0 = NaN */
-      ur.u = 0x7FF8000000000000ULL;
+      ur.u = a_bits; /* a is NaN */
+      return ur.d;
+    }
+    /* a is an infinity; a NaN b still wins, as in the flat order. */
+    if (b_exp == 0x7FF && b_mant != 0)
+    {
+      ur.u = b_bits; /* b is NaN */
+      return ur.d;
+    }
+    if (b_exp == 0 && b_mant == 0)
+    {
+      ur.u = 0x7FF8000000000000ULL; /* inf * 0 = NaN */
       return ur.d;
     }
     ur.u = make_double(result_sign, 0x7FF, 0);
     return ur.d;
   }
-  if (is_inf_bits(b_bits))
+  if (b_exp == 0x7FF)
   {
-    if (is_zero_bits(a_bits))
+    if (b_mant != 0)
     {
-      /* 0 * inf = NaN */
-      ur.u = 0x7FF8000000000000ULL;
+      ur.u = b_bits; /* b is NaN */
+      return ur.d;
+    }
+    /* b is an infinity and a is finite. */
+    if (a_exp == 0 && a_mant == 0)
+    {
+      ur.u = 0x7FF8000000000000ULL; /* 0 * inf = NaN */
       return ur.d;
     }
     ur.u = make_double(result_sign, 0x7FF, 0);
     return ur.d;
   }
 
-  /* Handle zero */
-  if (is_zero_bits(a_bits) || is_zero_bits(b_bits))
+  /* Zero.  Neither operand is a NaN or an infinity here, so the mantissa test
+   * only runs for the operands whose exponent is already known to be 0. */
+  if ((a_exp == 0 && a_mant == 0) || (b_exp == 0 && b_mant == 0))
   {
     ur.u = make_double(result_sign, 0, 0);
     return ur.d;

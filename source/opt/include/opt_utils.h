@@ -29,6 +29,11 @@ int ir_opt_eval_const_string_operand(struct TCCIRState *ir, IROperand op,
 int ir_opt_eval_stack_strlen(struct TCCIRState *ir, IROperand arg,
                              int call_idx, int *out_len);
 
+/* Resolve a frame buffer whose contents are known to a rodata string: *out_sym is
+ * a symref operand usable as a copy source, *out_len its strlen. */
+int ir_opt_eval_stack_const_string(struct TCCIRState *ir, IROperand arg, int use_idx,
+                                   IROperand *out_sym, int *out_len);
+
 /* Byte semantics. */
 int ir_opt_fold_strcmp_result(const char *s1, const char *s2);
 int ir_opt_fold_strncmp_result(const char *s1, const char *s2, uint64_t n);
@@ -50,6 +55,12 @@ int nan_compare_branch_result(int cond_token);
 struct IRQuadCompact;
 int32_t ir_opt_mla_accum_vreg(const struct TCCIRState *ir, const struct IRQuadCompact *q);
 
+/* 1 when this instruction performs a memory access that may be volatile, so a
+ * pass must not delete, duplicate or reorder it against another such access.
+ * Answers 0 for every instruction of a function that never touches volatile
+ * memory — see TCCIRState.func_has_volatile_access. */
+int tcc_ir_instr_access_is_volatile(const struct TCCIRState *ir, const struct IRQuadCompact *q);
+
 int is_power_of_2(int64_t n);
 
 /* tcc_ir_opt_pass_disabled (TCC_DISABLE_PASS) is declared in tccir.h — its
@@ -60,6 +71,7 @@ int vrp_swap_cmp_tok(int tok);
 int vrp_cmp_implies(int known_true, int check);
 int fcmp_cmp_implies(int known_true, int check);
 int invert_cond_token(int tok);
+int swap_cond_token(int tok);
 int invert_condition(int cond);
 int ir_negate_condition(int cond);
 

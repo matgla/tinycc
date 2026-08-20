@@ -158,6 +158,47 @@ _Static_assert(sizeof(IROperand) == 9, "IROperand must be 9 bytes");
                                    * original deref operand onto the base operand,
                                    * and the backend then avoids LDRD/STRD.
                                    * Default clear keeps legacy indexed behavior. */
+#define IROP_AUX_NONVOLATILE 0x4u /* lvalue operands only: the access is proven
+                                   * NOT volatile, because the SValue it was
+                                   * built from carried no VT_VOLATILE.  Same
+                                   * "proven, default-clear" polarity as
+                                   * ALIGN4_OK, and for the same reason: the IR
+                                   * has nowhere else to record volatility of a
+                                   * `T***DEREF***` read (there is no Sym to ask),
+                                   * so a pass that would collapse two reads into
+                                   * one must see this bit to know it may.  An
+                                   * operand synthesized by a pass stays clear and
+                                   * is simply treated as possibly volatile — the
+                                   * omission costs an optimization, never
+                                   * correctness. */
+
+/* Is this operand's memory access possibly volatile?  Takes the deref (lvalue)
+ * operand of a LOAD/STORE, or the BASE operand of a LOAD/STORE_INDEXED, onto
+ * which the fusion passes transfer the mark (see irop_carry_access_marks).
+ * Answers "yes" for an operand a pass synthesized without a mark, which costs
+ * an optimization, never correctness.
+ *
+ * Optimizer passes call tcc_ir_access_is_volatile (tccir.h) instead, which
+ * first checks whether the function touches volatile memory at all; this bare
+ * form is for code that has no TCCIRState in hand. */
+static inline int irop_access_is_volatile(IROperand op)
+{
+  return !(op.aux & IROP_AUX_NONVOLATILE);
+}
+
+/* Move the marks that describe the ACCESS (not the address) from the deref
+ * operand a fusion replaces onto the base operand of the LOAD/STORE_INDEXED
+ * that replaces it.  UNDERALIGN keeps the backend's 64-bit lowering off
+ * LDRD/STRD; NONVOLATILE lets the load/store CSE and DSE passes see that the
+ * access may be collapsed.  UNDERALIGN is OR'd (either operand may carry it),
+ * NONVOLATILE is copied: it is a "proven" bit, and inheriting a stale one from
+ * the address operand would license CSE of a volatile access. */
+static inline void irop_carry_access_marks(IROperand *base, IROperand deref)
+{
+  unsigned a = (unsigned)base->aux | ((unsigned)deref.aux & IROP_AUX_UNDERALIGN);
+  a = (a & ~(unsigned)IROP_AUX_NONVOLATILE) | ((unsigned)deref.aux & IROP_AUX_NONVOLATILE);
+  base->aux = a & 0xfu;
+}
 
 /* ============================================================================
  * Pool entry types - separate arrays for cache efficiency
@@ -269,6 +310,12 @@ int irop_is_immediate(const IROperand op);
 /* Check if operand is a plain immediate (not a symref or lvalue).
  * Useful for passes that need a pure constant without symbol resolution. */
 int irop_is_plain_imm(const IROperand op);
+
+/* An absolute ADDRESS written as an lvalue immediate — `*(volatile T *)0x4000`
+ * or a deref of a NULL constant.  irop_is_immediate deliberately answers "no"
+ * for these (they name memory, not a value), so the few passes that want the
+ * address itself ask this instead. */
+int irop_is_lval_imm_addr(const IROperand op);
 
 /* Get 64-bit integer value from operand (works for IMM32, I64, and STACKOFF)
  * Requires ir state for pool lookup. Pass NULL to only handle inline values. */

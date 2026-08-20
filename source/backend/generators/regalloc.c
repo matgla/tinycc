@@ -257,9 +257,6 @@ static void run_post_ra_optimizations(TCCIRState *ir)
     tcc_ir_opt_shift_pair_to_ubfx(ir);
 
   if (tcc_state->optimize > 0)
-    tcc_ir_opt_shift64_dead_half(ir);
-
-  if (tcc_state->optimize > 0)
     tcc_ir_opt_narrow_store_value_btype(ir);
 }
 
@@ -278,6 +275,16 @@ static void run_ssa_and_post_ra_passes(TCCIRState *ir)
     tcc_ir_ssa_regalloc(ir, ra_target, loc);
     dbg_scan_imm_dest(ir, "after-ssa-regalloc");
   }
+
+  /* After tcc_ir_ssa_regalloc, because the SSA engine runs inside it: sccp is
+   * what folds a compare's first operand to a constant, and the whole point of
+   * this pass is to put that constant back on the right where `cmp` can encode
+   * it.  The operand stays an immediate in the IR past allocation -- codegen
+   * materializes it into a scratch register at emit time -- so swapping here
+   * still deletes the `mov`. */
+  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("ra:cmp_imm_swap"))
+    tcc_ir_opt_cmp_imm_swap(ir);
+  tcc_ir_dump_after_pass(ir, "ra:cmp_imm_swap");
 
   if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("ra:backedge_phi_hoist"))
     tcc_ir_opt_backedge_phi_hoist(ir);
@@ -866,6 +873,14 @@ void tcc_ir_backend_regalloc_pipeline(TCCIRState *ir, Sym *sym, int func_var,
   tcc_pass_timing_begin(&ra_pt, "ra:jump_thread");
   run_jump_threading_loop(ir);
   tcc_pass_timing_end(&ra_pt, -1);
+  /* After threading, never before: threading retargets branches, and a branch
+   * redirected into the block whose compare this deletes would arrive carrying
+   * somebody else's flags.  After ra:cmp_imm_swap for the reason given there. */
+  tcc_pass_timing_begin(&ra_pt, "ra:redundant_cmp");
+  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("ra:redundant_cmp"))
+    tcc_ir_opt_redundant_cmp(ir);
+  tcc_pass_timing_end(&ra_pt, -1);
+  tcc_ir_dump_after_pass(ir, "ra:redundant_cmp");
   tcc_pass_timing_begin(&ra_pt, "ra:min_stack_ref");
   compute_min_stack_ref(ir, func_var);
   tcc_pass_timing_end(&ra_pt, -1);
@@ -873,6 +888,25 @@ void tcc_ir_backend_regalloc_pipeline(TCCIRState *ir, Sym *sym, int func_var,
   tcc_pass_timing_begin(&ra_pt, "ra:coalesce");
   run_register_coalescing(ir);
   tcc_pass_timing_end(&ra_pt, -1);
+  /* Annotate dead 64-bit shift halves LAST.  The rules are gated on the
+   * shift result having a single use, which only holds against the FINAL
+   * instruction stream: this used to run before tcc_ir_ssa_regalloc, and a
+   * later CSE that redirected a second reader onto the same shift left the
+   * annotation claiming a half was dead when it had just acquired a live
+   * reader.  Codegen then skipped emitting that half and read whatever the
+   * register happened to hold -- silently wrong values, no crash.  Nothing
+   * below this point rewrites operands. */
+  tcc_pass_timing_begin(&ra_pt, "ra:shift64_dead_half");
+  if (tcc_state->optimize > 0)
+    tcc_ir_opt_shift64_dead_half(ir);
+  tcc_pass_timing_end(&ra_pt, -1);
+
+  /* Same "nothing below rewrites operands" requirement, for the same reason. */
+  tcc_pass_timing_begin(&ra_pt, "ra:zero_half64");
+  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("zero_half64"))
+    tcc_ir_opt_zero_half64(ir);
+  tcc_pass_timing_end(&ra_pt, -1);
+
   tcc_pass_timing_begin(&ra_pt, "ra:stack_layout");
   compute_stack_layout(ir, func_var);
   tcc_pass_timing_end(&ra_pt, -1);

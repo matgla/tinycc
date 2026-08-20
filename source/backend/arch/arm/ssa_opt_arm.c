@@ -246,8 +246,10 @@ int ssa_gen_arm_fuse_shl_add_to_load_indexed(IRSSAOptCtx *ctx, int instr_idx)
   }
   load_q->operand_base = lb;
 
-  /* base: clear lval since LOAD_INDEXED handles the deref */
+  /* base: clear lval since LOAD_INDEXED handles the deref, but carry the
+   * replaced deref's access marks (alignment, volatility) onto it. */
   base.is_lval = 0;
+  irop_carry_access_marks(&base, load_src);
 
   ir->iroperand_pool[lb + 0] = load_dest;
   ir->iroperand_pool[lb + 1] = base;
@@ -374,6 +376,7 @@ int ssa_gen_arm_fuse_shl_add_to_store_indexed(IRSSAOptCtx *ctx, int instr_idx)
   store_q->operand_base = sb;
 
   base.is_lval = 0;
+  irop_carry_access_marks(&base, store_dest);
 
   ir->iroperand_pool[sb + 0] = base;
   ir->iroperand_pool[sb + 1] = store_src;
@@ -594,6 +597,7 @@ int ssa_gen_arm_fuse_load_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
   IROperand scale_op = irop_make_imm32(0, 0, IROP_BTYPE_INT32);
   IROperand base_clean = base;
   base_clean.is_lval = 0;
+  irop_carry_access_marks(&base_clean, load_src);
 
   load_q->op = TCCIR_OP_LOAD_INDEXED;
   load_q->operand_base = lb;
@@ -665,6 +669,7 @@ int ssa_gen_arm_fuse_store_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
   IROperand scale_op = irop_make_imm32(0, 0, IROP_BTYPE_INT32);
   IROperand base_clean = base;
   base_clean.is_lval = 0;
+  irop_carry_access_marks(&base_clean, store_dest);
 
   store_q->op = TCCIR_OP_STORE_INDEXED;
   store_q->operand_base = sb;
@@ -765,6 +770,7 @@ int ssa_gen_arm_fuse_mla_accum_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
   IROperand lea_dest = tcc_ir_op_get_dest(ir, dq);
   IROperand base_clean = base_op;
   base_clean.is_lval = 0;
+  irop_carry_access_marks(&base_clean, accum);
 
   /* Rewrite the defining ADD into LOAD_INDEXED(base, #imm, scale=0). */
   int lb = ir->iroperand_pool_count;
@@ -914,6 +920,7 @@ int ssa_gen_arm_fuse_store_src_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
 
   IROperand base_clean = base_op;
   base_clean.is_lval = 0;
+  irop_carry_access_marks(&base_clean, store_src);
 
   int lb = ir->iroperand_pool_count;
   tcc_ir_pool_add(ir, IROP_NONE);

@@ -909,6 +909,9 @@ LIBTCCAPI TCCState *tcc_new(void)
   s->warn_discarded_qualifiers = 1;
   s->ms_extensions = 1;
   s->unwind_tables = 1;
+  /* vreg 0 is a real vreg, so "no vreg bound" has to be -1, not the zeroed
+   * default. */
+  s->inline_return_vr = -1;
 
 #ifdef CHAR_IS_UNSIGNED
   s->char_is_unsigned = 1;
@@ -2412,7 +2415,22 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       s->filetype = x | (s->filetype & ~AFF_TYPE_MASK);
       break;
     case TCC_OPTION_O:
-      s->optimize = atoi(optarg);
+      /* -Os / -Oz went through atoi() and came out 0, so they were silently
+       * -O0 -- and because -O comes from a plain option scan, a command line
+       * of `-O2 ... -Os` (toybox's) reset an explicit -O2 back to nothing.
+       *
+       * They alias -O2.  There is no size tier yet: nothing in the pipeline
+       * trades speed for size, so the honest meaning of "optimize for size" is
+       * "everything we have", and the alias is where the size-preferring
+       * decisions get hung when they arrive.  Note that on today's numbers -O2
+       * is not the smallest output -- over tests/ir_tests -O1 is 511,724 bytes
+       * of .text against -O2's 540,146, because -O2 spends the difference on
+       * unrolling and full inlining -- so the first real -Os work is teaching
+       * this tier to skip those two. */
+      if (optarg[0] == 's' || optarg[0] == 'z')
+        s->optimize = 2;
+      else
+        s->optimize = atoi(optarg);
       /* -O1: scalar cleanup, cheap ARM addressing-mode fusion, constant/range
        * folding, loop rotation, and light inlining of explicitly-inline / tiny
        * functions — the same class of work GCC does at -O1.  The heavy tier

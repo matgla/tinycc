@@ -95,6 +95,14 @@ void write_instr_at_nop(TCCIRState *ir, int pos, TccIrOp op, IROperand dest, IRO
 {
   IRQuadCompact *q = &ir->compact_instructions[pos];
   q->op = op;
+  /* Fresh orig_index, same reason as insert_instr_at above — and one more: the
+   * slot's PREVIOUS occupant's index is still sitting here, so a synthesized
+   * instruction would inherit that instruction's side-table annotations.  A
+   * rotated loop's new tail CMP landed on a slot whose old occupant was an
+   * `orr rd,rn,rm lsl #8`, and came out as `cmp r2,#100 lsl #8` — 25600 — so
+   * the loop never exited (pr71083).  Callers that MOVE an instruction (see
+   * loop_rotate's body_origs/latch_origs) restore the real index afterwards. */
+  q->orig_index = ++ir->max_orig_index;
   q->is_jump_target = 0;
   /* Only write operand slots the instr uses, so pool layout matches codegen. */
   int base = ir->iroperand_pool_count;
@@ -113,6 +121,7 @@ void write_select_at_nop(TCCIRState *ir, int pos, IROperand dest, IROperand then
 {
   IRQuadCompact *q = &ir->compact_instructions[pos];
   q->op = TCCIR_OP_SELECT;
+  q->orig_index = ++ir->max_orig_index;
   q->is_jump_target = 0;
   IROperand cond_op = irop_make_imm32(-1, cond_tok, IROP_BTYPE_INT32);
   int base = tcc_ir_pool_add(ir, dest);

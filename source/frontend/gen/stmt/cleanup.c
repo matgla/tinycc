@@ -175,6 +175,7 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   struct scope *saved_root_scope = root_scope;
   uint8_t saved_in_inline_expansion = tcc_state->in_inline_expansion;
   int saved_inline_return_loc = tcc_state->inline_return_loc;
+  int saved_inline_return_vr = tcc_state->inline_return_vr;
   uint8_t saved_inline_return_redirected = tcc_state->inline_return_redirected;
 
   func_vt = s->type; /* void */
@@ -182,6 +183,9 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   rsym = -1;
   tcc_state->in_inline_expansion = local_scope;
   tcc_state->inline_return_loc = 0;
+  /* -1, not 0: vreg 0 is a real vreg, and a cleanup body is void so nothing
+   * should ever bind this one. */
+  tcc_state->inline_return_vr = -1;
   tcc_state->inline_return_redirected = 0;
   tcc_state->inline_expansion_depth++;
   root_scope = cur_scope;
@@ -213,6 +217,7 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   /* --- Restore state --- */
   tcc_state->in_inline_expansion = saved_in_inline_expansion;
   tcc_state->inline_return_loc = saved_inline_return_loc;
+  tcc_state->inline_return_vr = saved_inline_return_vr;
   tcc_state->inline_return_redirected = saved_inline_return_redirected;
   tcc_state->inline_expansion_depth--;
   func_vt = saved_func_vt;

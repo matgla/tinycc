@@ -110,25 +110,41 @@ int ssa_opt_iv_strength_reduction(TCCIRState *ir)
     uint8_t *scratch = tcc_malloc((size_t)nb);
     uint8_t *other = tcc_malloc((size_t)nb);
 
+    /* Innermost first, then the rest.
+     *
+     * This used to be "outermost only", which meant the pass never looked at a
+     * nested loop -- and a nested loop is where the hot array walk almost
+     * always lives (`for (n) for (j) sum += a[j];`).  Every array loop in the
+     * benchmark suite is an inner loop, so the whole transform was dead there.
+     * ivsr_try_candidate already handles an inner loop correctly: it collects
+     * that header's own members, and iv_strength_reduction_core's insert guard
+     * explicitly allows landing the preheader init inside a PARENT loop (the
+     * init is simply re-run per outer iteration, which is what it must do).
+     *
+     * Round 0 takes headers containing no other loop, so when both levels are
+     * transformable the hot one wins the single transform this pass performs;
+     * round 1 keeps the previous outer-loop coverage. */
     int changed = 0;
-    for (int h = 0; h < nb && !changed; h++) {
-      if (!is_header[h])
-        continue;
-      /* Outermost only: skip a header whose loop is contained in another. */
-      int inner = 0;
-      for (int h2 = 0; h2 < nb && !inner; h2++) {
-        if (h2 == h || !is_header[h2])
+    for (int round = 0; round < 2 && !changed; round++) {
+      for (int h = 0; h < nb && !changed; h++) {
+        if (!is_header[h])
           continue;
-        lcs_collect_header_members(cfg, h2, other, scratch);
-        if (other[h])
-          inner = 1;
+        lcs_collect_header_members(cfg, h, member, scratch);
+        int contains_other = 0;
+        for (int h2 = 0; h2 < nb && !contains_other; h2++) {
+          if (h2 == h || !is_header[h2])
+            continue;
+          if (member[h2])
+            contains_other = 1;
+        }
+        if (contains_other != round)
+          continue;
+        changed = ivsr_try_candidate(ir, cfg, h, member, scratch);
+        if (changed)
+          LOG_IR_GEN("[ssa:iv_strength_reduction] transformed header_b=%d", h);
       }
-      if (inner)
-        continue;
-      changed = ivsr_try_candidate(ir, cfg, h, member, scratch);
-      if (changed)
-        LOG_IR_GEN("[ssa:iv_strength_reduction] transformed header_b=%d", h);
     }
+    (void)other;
 
     tcc_free(is_header);
     tcc_free(member);

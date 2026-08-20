@@ -63,6 +63,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir);
 
 /* ssa:licm — runs on flat IR before ssa:iv_strength_reduction. */
 int ssa_opt_licm(TCCIRState *ir);
+int ssa_opt_licm_global_load(TCCIRState *ir);
 
 /* Must run immediately before register allocation; returns params promoted. */
 int tcc_ir_promote_loop_stack_params(TCCIRState *ir);

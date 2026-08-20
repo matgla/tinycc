@@ -122,6 +122,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/ir/tccir_operand.c \
 	$(addprefix $(TOP)/,$(IR_GEN_FILES)) \
 	$(TOP)/source/opt/util/pass_disable.c \
+	$(TOP)/source/opt/util/volatile_access.c \
 	$(TOP)/source/opt/util/const_eval.c \
 	$(TOP)/source/opt/util/const_string_eval.c \
 	$(TOP)/source/opt/util/cond_util.c \
@@ -166,6 +167,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/loop/licm.c \
 	$(TOP)/source/opt/flat/loop/stack_param_promote.c \
 	$(TOP)/source/opt/flat/cfg/jump_thread.c \
+	$(TOP)/source/opt/flat/cfg/bool_diamond_branch.c \
 	$(TOP)/source/opt/flat/cfg/jumpif_invert.c \
 	$(TOP)/source/opt/flat/memory/dead_lea_store.c \
 	$(TOP)/source/opt/flat/memory/store_inplace_arith.c \
@@ -173,6 +175,8 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/dce/dce.c \
 	$(TOP)/source/opt/flat/dce/compact_nops.c \
 	$(TOP)/source/opt/flat/dce/orphan_cmp_elim.c \
+	$(TOP)/source/opt/flat/dce/redundant_cmp.c \
+	$(TOP)/source/opt/flat/scalar/sdiv_pow2.c \
 	$(TOP)/source/opt/flat/dce/zero_vla_elim.c \
 	$(TOP)/source/opt/flat/dce/body_essential.c \
 	$(TOP)/source/opt/flat/dce/noreturn_collapse.c \
@@ -225,6 +229,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/memory/ptr_local_fwd.c \
 	$(TOP)/source/opt/flat/memory/invariant_global_load_hoist.c \
 	$(TOP)/source/opt/flat/memory/invariant_temp_deref_hoist.c \
+	$(TOP)/source/opt/flat/memory/deref_operand_cse.c \
 	$(TOP)/source/opt/flat/memory/rmw_byte_clear.c \
 	$(TOP)/source/opt/flat/memory/local_copy_prop.c \
 	$(TOP)/source/opt/flat/memory/struct_copy_roundtrip_elim.c \
@@ -256,6 +261,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/scalar/narrow_store.c \
 	$(TOP)/source/opt/flat/scalar/self_copy.c \
 	$(TOP)/source/opt/flat/scalar/var_tmp_fwd.c \
+	$(TOP)/source/opt/flat/scalar/inline_param_copy.c \
 	$(TOP)/source/opt/flat/scalar/switch_collapse.c \
 	$(TOP)/source/opt/flat/scalar/add_reassoc.c \
 	$(TOP)/source/opt/flat/fusion/indexed_chain.c \
@@ -458,6 +464,8 @@ UT_LOCAL_SRCS := \
 	test_ir_stack_extra.c \
 	test_ir_stack_build.c \
 	test_opt_cmpfold.c \
+	test_opt_redundant_cmp.c \
+	test_opt_sdiv_pow2.c \
 	test_opt_constprop.c \
 	test_opt_constfold.c \
 	test_opt_licm.c \
@@ -1471,6 +1479,7 @@ UT11_LOCAL_SRCS := \
 	test_ssa_opt_setif_or_taut.c \
 	test_ssa_opt_cmp_offset_fold.c \
 	test_ssa_opt_load_cse.c \
+	test_opt_volatile.c \
 	test_opt_ssa_domwalk.c \
 	test_opt_dsl_pair.c \
 	test_opt_dsl_phi.c \

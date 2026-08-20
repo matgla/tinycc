@@ -109,6 +109,12 @@ int tcc_ir_opt_orphan_cmp_elim(TCCIRState *ir)
     if (q->is_jump_target)
       continue;
 
+    /* Nobody reading the flags does not make the comparison free: reaching its
+     * operands can be a mandated volatile access.  `int t = (mmio == 3);` with t
+     * unread is a CMP whose flags die, and dropping it drops the load. */
+    if (tcc_ir_instr_access_is_volatile(ir, q))
+      continue;
+
     for (int b = 0; b < bytes; b++)
       visited[b] = 0;
 

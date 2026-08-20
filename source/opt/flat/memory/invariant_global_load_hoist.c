@@ -223,6 +223,11 @@ int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir)
 
     if (ref->sym->type.t & VT_VOLATILE)
       continue;
+    /* A symbol whose own type is not volatile can still be accessed volatilely
+     * through a member (`struct { volatile int a; }`), and two reads of that
+     * member are two mandated accesses, not one to hoist. */
+    if (tcc_ir_access_is_volatile(ir, src1))
+      continue;
 
     int is_written = 0;
     for (int k = 0; k < num_written; k++)

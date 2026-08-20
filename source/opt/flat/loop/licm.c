@@ -10,6 +10,7 @@
 
 #include "licm.h"
 #include "opt.h"
+#include "opt_alias.h"
 #include "opt_utils.h"
 #include "cfg.h"
 #include "core.h"
@@ -926,10 +927,17 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
 static int glh_is_value_consumer(int op)
 {
   switch (op) {
-  case TCCIR_OP_LOAD: case TCCIR_OP_LOAD_INDEXED: case TCCIR_OP_LOAD_POSTINC:
+  case TCCIR_OP_LOAD_INDEXED: case TCCIR_OP_LOAD_POSTINC:
   case TCCIR_OP_STORE: case TCCIR_OP_STORE_INDEXED: case TCCIR_OP_STORE_POSTINC:
   case TCCIR_OP_LEA: case TCCIR_OP_VLA_ALLOC: case TCCIR_OP_BLOCK_COPY:
     return 0; /* here a SYMREF operand names an address, not a value */
+  case TCCIR_OP_LOAD:
+    /* A plain LOAD off a SYMREF-DEREF reads the global's value, exactly as the
+     * ASSIGN form does -- there is no index to make the location vary.  It was
+     * lumped in with the indexed forms above, which is why
+     * mibench_stringsearch's `tbl[i] = len` loop reloaded `len` every
+     * iteration: the frontend emits that read as a LOAD, not an ASSIGN. */
+    return 1;
   default:
     return 1;
   }
@@ -957,14 +965,109 @@ static int glh_dest_is_local_slot(IROperand d)
   return 0;
 }
 
-/* Would the loop write global memory (or memory that might alias a global)?
- * Unlike loop_body_may_clobber_memory this exempts direct local-slot writes,
- * which cannot alias a global — the case that makes `s += G` reductions
- * hoistable.  Indexed / pointer / block writes and non-const calls stay
- * conservative clobbers. */
-static int glh_loop_writes_globals(TCCIRState *ir, IRLoop *loop)
+/* The single definition of a TEMP vreg, or -1. */
+static int glh_single_def_of(TCCIRState *ir, int32_t vr)
 {
-  for (int i = 0; i < loop->num_body_instrs; i++) {
+  int def = -1;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (d.is_lval || irop_get_vreg(d) != vr)
+      continue;
+    if (def >= 0)
+      return -1;
+    def = i;
+  }
+  return def;
+}
+
+/* The global object a written ADDRESS is confined to, or NULL when unknown.
+ *
+ * `GlobalSym(X) ADD/SUB v` keeps the address inside X: reaching another object
+ * through pointer arithmetic on X is undefined, so the write cannot touch one.
+ * That is the whole point -- it lets `for (i..) tbl[i] = len;` hoist the load
+ * of `len`, which mibench_stringsearch's init_search reloaded on all 256
+ * iterations because the store through `&tbl[i]` counted as a write to "some
+ * global".
+ *
+ * `saw_var` is what keeps global_base_share out of it.  That pass re-bases a
+ * direct store to one global onto a NEIGHBOUR's address with a CONSTANT delta,
+ * so after it `(sym=a, off=4)` and `(sym=b, off=0)` are one location under two
+ * names and Sym*-keyed reasoning is unsound (see
+ * tests/ir_tests/459_global_base_share_alias.c).  It only ever rewrites a
+ * direct SYMREF-deref STORE and only with a constant offset, so requiring a
+ * NON-IMMEDIATE component somewhere in the chain excludes everything it can
+ * produce.  A weak symbol is refused for the same reason that pass refuses
+ * one: it can be interposed onto another definition. */
+static Sym *glh_addr_confined_sym(TCCIRState *ir, IROperand addr, int saw_var, int depth)
+{
+  if (irop_get_tag(addr) == IROP_TAG_SYMREF && !addr.is_lval && !addr.is_local) {
+    if (!saw_var)
+      return NULL;
+    IRPoolSymref *sr = irop_get_symref_ex(ir, addr);
+    if (!sr || !sr->sym || sr->sym->a.weak || (sr->sym->type.t & VT_VOLATILE))
+      return NULL;
+    return sr->sym;
+  }
+  if (depth <= 0)
+    return NULL;
+  int32_t vr = irop_get_vreg(addr);
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+    return NULL;
+  int def = glh_single_def_of(ir, vr);
+  if (def < 0)
+    return NULL;
+  IRQuadCompact *dq = &ir->compact_instructions[def];
+  if (dq->op != TCCIR_OP_ASSIGN && dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_SUB)
+    return NULL;
+  IROperand s1 = tcc_ir_op_get_src1(ir, dq);
+  if (dq->op == TCCIR_OP_ASSIGN)
+    return glh_addr_confined_sym(ir, s1, saw_var, depth - 1);
+  IROperand s2 = tcc_ir_op_get_src2(ir, dq);
+  /* One side carries the object, the other the displacement. */
+  if (irop_get_tag(s1) == IROP_TAG_SYMREF && !s1.is_lval)
+    return glh_addr_confined_sym(ir, s1, saw_var || !irop_is_immediate(s2), depth - 1);
+  if (dq->op == TCCIR_OP_ADD && irop_get_tag(s2) == IROP_TAG_SYMREF && !s2.is_lval)
+    return glh_addr_confined_sym(ir, s2, saw_var || !irop_is_immediate(s1), depth - 1);
+  return glh_addr_confined_sym(ir, s1, saw_var || !irop_is_immediate(s2), depth - 1);
+}
+
+#define GLH_MAX_WRITTEN 8
+
+typedef struct GLHWrites
+{
+  Sym *syms[GLH_MAX_WRITTEN];
+  int n;
+  int unknown; /* a write this cannot place: refuse every candidate */
+} GLHWrites;
+
+static void glh_note_write(GLHWrites *w, Sym *sym)
+{
+  if (!sym) {
+    w->unknown = 1;
+    return;
+  }
+  for (int i = 0; i < w->n; i++)
+    if (w->syms[i] == sym)
+      return;
+  if (w->n >= GLH_MAX_WRITTEN)
+    w->unknown = 1;
+  else
+    w->syms[w->n++] = sym;
+}
+
+/* Which globals does the loop write?  Unlike loop_body_may_clobber_memory this
+ * exempts direct local-slot writes, which cannot alias a global — the case that
+ * makes `s += G` reductions hoistable — and now also places a write that is
+ * confined to one named global, so a candidate in a DIFFERENT global stays
+ * hoistable.  Anything unplaceable sets `unknown`. */
+static void glh_collect_global_writes(TCCIRState *ir, IRLoop *loop, GLHWrites *w)
+{
+  w->n = 0;
+  w->unknown = 0;
+  for (int i = 0; i < loop->num_body_instrs && !w->unknown; i++) {
     int idx = loop->body_instrs[i];
     if (idx < loop->start_idx || idx > loop->end_idx)
       continue;
@@ -972,32 +1075,60 @@ static int glh_loop_writes_globals(TCCIRState *ir, IRLoop *loop)
     switch (q->op) {
     case TCCIR_OP_NOP:
       continue;
-    case TCCIR_OP_STORE_INDEXED:
     case TCCIR_OP_STORE_POSTINC:
     case TCCIR_OP_BLOCK_COPY:
     case TCCIR_OP_INLINE_ASM:
     case TCCIR_OP_ASM_OUTPUT:
-      return 1;
-    case TCCIR_OP_STORE:
-      if (!glh_dest_is_local_slot(tcc_ir_op_get_dest(ir, q)))
-        return 1;
+      w->unknown = 1;
       continue;
+    case TCCIR_OP_STORE_INDEXED: {
+      /* A constant index is exactly what global_base_share emits, so only a
+       * variable one identifies the object. */
+      IROperand ix = irop_config[q->op].has_src2 ? tcc_ir_op_get_src2(ir, q) : IROP_NONE;
+      IROperand base = tcc_ir_op_get_dest(ir, q);
+      glh_note_write(w, irop_is_immediate(ix)
+                            ? NULL
+                            : glh_addr_confined_sym(ir, base, 1, 4));
+      continue;
+    }
+    case TCCIR_OP_STORE: {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      if (glh_dest_is_local_slot(d))
+        continue;
+      if (irop_get_tag(d) == IROP_TAG_SYMREF && d.is_lval) {
+        /* A direct named store: confined to that symbol whatever the addend. */
+        IRPoolSymref *sr = irop_get_symref_ex(ir, d);
+        glh_note_write(w, (sr && sr->sym && !sr->sym->a.weak) ? sr->sym : NULL);
+        continue;
+      }
+      glh_note_write(w, glh_addr_confined_sym(ir, d, 0, 4));
+      continue;
+    }
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_FUNCCALLVOID: {
       Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
       if (!callee || tcc_ir_get_func_purity(ir, callee) < TCC_FUNC_PURITY_CONST)
-        return 1;
+        w->unknown = 1;
       continue;
     }
     default:
       if (irop_config[q->op].has_dest) {
         IROperand d = tcc_ir_op_get_dest(ir, q);
         if (d.is_lval && !glh_dest_is_local_slot(d))
-          return 1;
+          w->unknown = 1;
       }
       continue;
     }
   }
+}
+
+static int glh_writes_sym(const GLHWrites *w, const Sym *sym)
+{
+  if (w->unknown)
+    return 1;
+  for (int i = 0; i < w->n; i++)
+    if (w->syms[i] == sym)
+      return 1;
   return 0;
 }
 
@@ -1061,9 +1192,13 @@ static int tcc_ir_hoist_invariant_global_loads(TCCIRState *ir, IRLoops *loops)
     }
     if (bad || loop_contains_vla(ir, loop))
       continue;
-    /* Value-invariance gate: nothing in the loop writes the global (direct
-     * local-slot writes are exempt — they cannot alias static memory). */
-    if (glh_loop_writes_globals(ir, loop))
+    /* Value-invariance gate: the loop must not write the global this candidate
+     * reads.  Direct local-slot writes are exempt (they cannot alias static
+     * memory), and a write confined to a DIFFERENT named global is exempt too;
+     * anything unplaceable refuses every candidate in this loop. */
+    GLHWrites writes;
+    glh_collect_global_writes(ir, loop, &writes);
+    if (writes.unknown)
       continue;
 
     GLHCand cand[GLH_MAX_PER_LOOP];
@@ -1083,6 +1218,8 @@ static int tcc_ir_hoist_invariant_global_loads(TCCIRState *ir, IRLoops *loops)
           continue;
         IRPoolSymref *ref = irop_get_symref_ex(ir, op);
         if (!ref || !ref->sym || (ref->sym->type.t & VT_VOLATILE))
+          continue;
+        if (ref->sym->a.weak || glh_writes_sym(&writes, ref->sym))
           continue;
         int bt = irop_get_btype(op);
         int seen = 0;
@@ -1159,10 +1296,496 @@ static int tcc_ir_hoist_invariant_global_loads(TCCIRState *ir, IRLoops *loops)
   return total;
 }
 
+/* ============================================================================
+ * Invariant reads of a local's own stack slot
+ *
+ * dom-LICM declines every instruction with an lval source, because an lval is
+ * normally a pointer dereference whose target can change under the loop.  A
+ * bare `StackLoc[off]` source is different: it names a local's own frame slot
+ * directly, so it IS provably invariant whenever nothing in the loop can write
+ * those bytes.  That is the difference between
+ *
+ *     ldr r1,[sp,#4] / mov r2,#400 / ldr r3,=adj / mla sl,r1,r2,r3
+ *
+ * being recomputed on every inner iteration and being hoisted once
+ * (mibench_dijkstra's `adj_matrix[current.node][node]`, where `current` is a
+ * 12-byte struct copy the frontend lowers to an __aeabi_memmove4 call).
+ * ==========================================================================*/
+
+/* A direct read of a named local variable: the IR's `V<n>` lvalue form, where
+ * the vreg IS the variable rather than a pointer to be dereferenced.  Such a
+ * read is a load from the variable's own slot, so it is only as invariant as
+ * the slot — but when the address is never taken anywhere in the function, the
+ * only writes are the explicit defs the def_count scan below already sees.
+ * Without this, EVERY instruction reading a named local (`t = 63 - i`) counted
+ * as a memory dereference and LICM hoisted nothing out of an ordinary
+ * `for (j...) if (a[j] > a[j+1])` loop. */
+/* Move a jump target off a NOP.
+ *
+ * A hoist inserts the clone at the loop header's index and NOPs the original
+ * one slot later — which is the header itself, so the loop now BEGINS with a
+ * NOP that still carries is_jump_target.  The CFG splits there, and
+ * ssa:loop_rotate matches a header as exactly CMP/JUMPIF/JUMP at hi..hi+2 and
+ * silently declines anything else, so every loop LICM helped lost rotation
+ * (bubble sort's inner loop, dijkstra's, ...).
+ *
+ * Retargeting rather than compacting is deliberate: compacting changes the
+ * instruction COUNT, and the frontend's auto-inline revoke is a threshold on
+ * exactly that count, so it silently re-decides inlining for unrelated
+ * functions (gcc-torture pr47428 started re-compiling a body at end-of-TU and
+ * hard-erroring on an implicit declaration that had since acquired a real
+ * prototype).  Retargeting leaves every index alone. */
+static void licm_move_jump_target_off_nop(TCCIRState *ir, int nop_pos)
+{
+  int n = ir->next_instruction_index;
+  if (nop_pos < 0 || nop_pos >= n)
+    return;
+  if (!ir->compact_instructions[nop_pos].is_jump_target)
+    return;
+  /* A computed jump can reach any label; its targets are not in the operands,
+   * so the flag cannot be proved unused. */
+  for (int i = 0; i < n; i++)
+    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
+      return;
+  int t = nop_pos + 1;
+  while (t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP &&
+         !ir->compact_instructions[t].is_jump_target)
+    t++;
+  if (t >= n)
+    return;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    if ((int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q)) != nop_pos)
+      continue;
+    tcc_ir_op_set_dest(ir, q, irop_make_imm32(-1, t, IROP_BTYPE_INT32));
+  }
+  for (int k = 0; k < ir->num_switch_tables; k++)
+  {
+    TCCIRSwitchTable *tbl = &ir->switch_tables[k];
+    if (tbl->default_target == nop_pos)
+      tbl->default_target = t;
+    if (!tbl->targets)
+      continue;
+    for (int j = 0; j < tbl->num_entries; j++)
+      if (tbl->targets[j] == nop_pos)
+        tbl->targets[j] = t;
+  }
+  ir->compact_instructions[t].is_jump_target = 1;
+  ir->compact_instructions[nop_pos].is_jump_target = 0;
+}
+
+static int licm_is_direct_var_read(TCCIRState *ir, IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || !op.is_local || op.is_llocal)
+    return 0;
+  if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
+    return 0;
+  if (irop_access_is_volatile(op))
+    return 0;
+  return !vreg_addr_taken_anywhere(ir, vr);
+}
+
+/* A direct read of a named local's slot.  `Addr[StackLoc[off]]` (is_lval == 0)
+ * is the slot's ADDRESS and is already accepted as invariant; the vreg-carrying
+ * forms are VARs, which the ordinary def-count machinery handles. */
+static int licm_is_direct_slot_read(IROperand op)
+{
+  return irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_lval && op.is_local &&
+         !op.is_llocal && irop_get_vreg(op) == -1;
+}
+
+/* Callees that touch only the bytes their pointer arguments name and neither
+ * store nor publish the pointer itself (LLVM's `nocapture`): handing one
+ * `&local` does not let anything else reach the local.  This is exactly the
+ * shape a small struct assignment lowers to — `T = &current;
+ * __aeabi_memmove4(T, &queue[h], 12)`. */
+static int licm_name_is_noncapturing_mem(const char *nm)
+{
+  if (!nm)
+    return 0;
+  if (ir_opt_is_memcpy_or_memmove_name(nm))
+    return 1;
+  return !strcmp(nm, "memset") || !strcmp(nm, "__aeabi_memset") ||
+         !strcmp(nm, "__aeabi_memset4") || !strcmp(nm, "__aeabi_memset8") ||
+         !strcmp(nm, "__aeabi_memclr") || !strcmp(nm, "__aeabi_memclr4") ||
+         !strcmp(nm, "__aeabi_memclr8");
+}
+
+static int licm_instr_in_loop(IRCFG *cfg, const uint8_t *in_loop, int idx)
+{
+  for (int bi = 0; bi < cfg->num_blocks; bi++)
+    if (in_loop[bi] && idx >= cfg->blocks[bi].start_idx && idx < cfg->blocks[bi].end_idx)
+      return 1;
+  return 0;
+}
+
+/* Every operand of a quad: dest, src1, src2 and MLA's accumulator. */
+static int licm_quad_operands(TCCIRState *ir, int idx, IROperand *out)
+{
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  int n = 0;
+  if (irop_config[q->op].has_dest)
+    out[n++] = tcc_ir_op_get_dest(ir, q);
+  if (irop_config[q->op].has_src1)
+    out[n++] = tcc_ir_op_get_src1(ir, q);
+  if (irop_config[q->op].has_src2)
+    out[n++] = tcc_ir_op_get_src2(ir, q);
+  if (q->op == TCCIR_OP_MLA)
+    out[n++] = tcc_ir_op_get_accum(ir, q);
+  return n;
+}
+
+/* Is `vr` mentioned by any instruction other than `def_idx`?  Dest mentions
+ * count too — the callers want "nobody else touches this", not a use count. */
+static int licm_vreg_touched_elsewhere(TCCIRState *ir, int32_t vr, int def_idx)
+{
+  if (vr < 0)
+    return 0;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    IROperand ops[4];
+    int n;
+    if (i == def_idx || q->op == TCCIR_OP_NOP)
+      continue;
+    n = licm_quad_operands(ir, i, ops);
+    for (int k = 0; k < n; k++)
+      if (irop_get_vreg(ops[k]) == vr)
+        return 1;
+  }
+  return 0;
+}
+
+#define LICM_MAX_ADDR_TEMPS 4
+#define LICM_MAX_MEM_PARAMS 16
+
+/* Can the loop reach `slot` through a pointer?  Sound over-approximation: the
+ * slot's ADDRESS must be materialized only by `LEA T <- &slot` quads outside
+ * the loop, and every use of such a T must be an argument of a non-capturing
+ * mem* helper that is itself outside the loop.  Anything else — an address
+ * materialized inside the loop, pointer arithmetic on it, a store of it, an
+ * unknown callee, or a memcpy whose returned dst pointer somebody keeps —
+ * counts as escaped, and then a store or call in the loop may write the slot. */
+static int licm_slot_addr_escapes(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop, IROperand slot)
+{
+  int32_t addr_tmp[LICM_MAX_ADDR_TEMPS];
+  int n_addr = 0;
+  int ok_param[LICM_MAX_MEM_PARAMS];
+  int n_ok = 0;
+  int64_t slot_base = irop_get_stack_offset(slot);
+  int slot_size = ir_opt_store_btype_size_bytes(irop_get_btype(slot));
+  int64_t slot_end = slot_base + (slot_size > 0 ? slot_size : 1);
+
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    IROperand ops[4], d;
+    int n, refs = 0;
+    int32_t dv;
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    n = licm_quad_operands(ir, i, ops);
+    for (int k = 0; k < n && !refs; k++)
+    {
+      int64_t ab, ae;
+      if (ops[k].is_lval || irop_get_tag(ops[k]) != IROP_TAG_STACKOFF)
+        continue;
+      /* A frame ADDRESS.  It can reach our slot unless it provably names a
+       * different frame object.  Compare RESOLVED slot ranges, never raw
+       * operand fields: on a STRUCT-typed operand the offset lives in
+       * u.s.aux_data and the imm32 is a pool index, so `&gof` and `gof.argc`
+       * name the same slot yet share no field (this is why
+       * operand_references_slot cannot be used here).  A VT_LLOCAL slot holds
+       * a pointer to somewhere else entirely — always assume it aliases. */
+      if (!ops[k].is_llocal &&
+          ir_opt_stack_slot_range_for_offset(ir, irop_get_stack_offset(ops[k]), &ab, &ae) &&
+          (slot_end <= ab || slot_base >= ae))
+        continue;
+      refs = 1;
+    }
+    if (!refs)
+      continue;
+    if (q->op != TCCIR_OP_LEA || licm_instr_in_loop(cfg, in_loop, i))
+      return 1;
+    d = tcc_ir_op_get_dest(ir, q);
+    dv = irop_get_vreg(d);
+    if (d.is_lval || dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
+      return 1;
+    if (n_addr >= LICM_MAX_ADDR_TEMPS)
+      return 1;
+    addr_tmp[n_addr++] = dv;
+  }
+  if (n_addr == 0)
+    return 0; /* address never taken — no pointer can name the slot */
+
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    Sym *callee;
+    if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+      continue;
+    callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    if (!callee || !licm_name_is_noncapturing_mem(get_tok_str(callee->v, NULL)))
+      continue;
+    if (licm_instr_in_loop(cfg, in_loop, i))
+      continue;
+    if (q->op == TCCIR_OP_FUNCCALLVAL &&
+        licm_vreg_touched_elsewhere(ir, irop_get_vreg(tcc_ir_op_get_dest(ir, q)), i))
+      continue; /* the returned dst pointer is kept — its args are not safe */
+    for (int k = 0; k < 4; k++)
+    {
+      int pi = ir_opt_get_call_param_index(ir, i, k);
+      if (pi < 0)
+        continue;
+      if (n_ok >= LICM_MAX_MEM_PARAMS)
+        return 1;
+      ok_param[n_ok++] = pi;
+    }
+  }
+
+  /* Every READ of an address temp must be one of those arguments.  Only source
+   * positions count as reads; a plain dest is the temp's own definition (an
+   * lval dest is a store THROUGH the pointer, i.e. a read of it, and is caught
+   * because a store quad is never an argument quad). */
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    IROperand ops[4];
+    int n, reads = 0, allowed = 0;
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    n = licm_quad_operands(ir, i, ops);
+    for (int k = 0; k < n && !reads; k++)
+    {
+      /* ops[0] is the dest when the op has one; skip it unless it is an lval. */
+      int is_dest = irop_config[q->op].has_dest && k == 0;
+      if (is_dest && !ops[k].is_lval)
+        continue;
+      for (int a = 0; a < n_addr; a++)
+        if (irop_get_vreg(ops[k]) == addr_tmp[a])
+        {
+          reads = 1;
+          break;
+        }
+    }
+    if (!reads)
+      continue;
+    for (int k = 0; k < n_ok && !allowed; k++)
+      allowed = (ok_param[k] == i);
+    if (!allowed)
+      return 1;
+  }
+  return 0;
+}
+
+/* A write inside the loop that could land on an arbitrary frame slot: a direct
+ * anonymous-slot destination (matched offset-blind — accesses of different
+ * widths overlap without sharing an offset), a block copy, inline asm, or a VLA
+ * that moves sp.  VAR destinations are exempt: a named local has its own slot. */
+static int licm_loop_writes_frame(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop)
+{
+  for (int bi = 0; bi < cfg->num_blocks; bi++)
+  {
+    if (!in_loop[bi])
+      continue;
+    for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[ii];
+      switch (q->op)
+      {
+      case TCCIR_OP_NOP:
+        continue;
+      case TCCIR_OP_BLOCK_COPY:
+      case TCCIR_OP_INLINE_ASM:
+      case TCCIR_OP_ASM_OUTPUT:
+      case TCCIR_OP_VLA_ALLOC:
+        return 1;
+      default:
+        break;
+      }
+      if (irop_config[q->op].has_dest)
+      {
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        if (irop_get_tag(d) == IROP_TAG_STACKOFF && irop_get_vreg(d) < 0)
+          return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Per-loop memo for the two scans above (both are O(function) and the fixed
+ * point below asks the same question many times). */
+typedef struct
+{
+  int writes_frame; /* -1 until computed */
+  int n;
+  int32_t key_off[8];
+  signed char key_bt[8];
+  signed char verdict[8];
+} LicmSlotCtx;
+
+static int licm_slot_read_is_invariant(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop,
+                                       IROperand slot, LicmSlotCtx *ctx)
+{
+  int32_t off = irop_get_stack_offset(slot);
+  int bt = irop_get_btype(slot);
+  int v;
+  if (ctx->writes_frame < 0)
+    ctx->writes_frame = licm_loop_writes_frame(ir, cfg, in_loop);
+  if (ctx->writes_frame)
+    return 0;
+  /* Keyed on (offset, btype): the access WIDTH is part of the alias question. */
+  for (int i = 0; i < ctx->n; i++)
+    if (ctx->key_off[i] == off && ctx->key_bt[i] == (signed char)bt)
+      return ctx->verdict[i];
+  v = !licm_slot_addr_escapes(ir, cfg, in_loop, slot);
+  if (ctx->n < (int)(sizeof(ctx->key_off) / sizeof(ctx->key_off[0])))
+  {
+    ctx->key_off[ctx->n] = off;
+    ctx->key_bt[ctx->n] = (signed char)bt;
+    ctx->verdict[ctx->n] = (signed char)v;
+    ctx->n++;
+  }
+  return v;
+}
+
+/* Second chance for the invariant-global-load hoist, run AFTER loop rotation.
+ *
+ * ssa:licm runs BEFORE ssa:loop_rotate, so it sees the frontend's un-rotated
+ * header/latch/body shape whose preheader is not the header's immediate
+ * predecessor -- and the hoist's preheader-insertion safety demands exactly
+ * that, so it declines every ordinary `for` loop.  mibench_stringsearch's
+ * `for (i = 0; i <= UCHAR_MAX; i++) tbl[i] = len;` is one: it reloaded `len`
+ * from memory on all 256 iterations.  Rotation produces the shape the hoist
+ * wants, so run it once more on the rotated loops. */
+int ssa_opt_licm_global_load(TCCIRState *ir)
+{
+  if (!ir || tcc_ir_opt_pass_disabled("licm_global_load_post"))
+    return 0;
+  IRLoops *loops = tcc_ir_detect_loops(ir);
+  if (!loops)
+    return 0;
+  int changed = 0;
+  if (loops->num_loops > 0)
+    changed = tcc_ir_hoist_invariant_global_loads(ir, loops);
+  tcc_ir_free_loops(loops);
+  return changed;
+}
+
+/* ── Speculative-hoist profitability ──
+ * A hoist that does not dominate the loop's exits trades ONE loop-long live
+ * value for the ops it removes, so a single-use invariant is normally declined.
+ * A CHAIN of invariant ops is the exception: `t = slot * 400; u = &g + t` still
+ * leaves exactly one value live in the loop while removing both ops.  The two
+ * predicates below recognise a chain from either end — the producer (all its
+ * in-loop uses leave with it, so it costs nothing) and the consumer (it retires
+ * a single-use invariant producer, so two ops go for one register). */
+static int licm_all_uses_invariant(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop,
+                                   const uint8_t *is_invariant, int idx, int32_t vr)
+{
+  int seen = 0;
+  if (vr < 0)
+    return 0;
+  for (int bi = 0; bi < cfg->num_blocks; bi++)
+  {
+    if (!in_loop[bi])
+      continue;
+    for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[ii];
+      IROperand ops[4];
+      int n, uses = 0;
+      if (ii == idx || q->op == TCCIR_OP_NOP)
+        continue;
+      n = licm_quad_operands(ir, ii, ops);
+      for (int k = 0; k < n; k++)
+        if (irop_get_vreg(ops[k]) == vr)
+          uses = 1;
+      if (!uses)
+        continue;
+      if (!is_invariant[ii])
+        return 0;
+      seen = 1;
+    }
+  }
+  return seen;
+}
+
+static int licm_feeds_from_invariant_chain(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop,
+                                           const uint8_t *is_invariant, const int *def_count,
+                                           const int *use_count, int dc_stride, int max_vr, int idx)
+{
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  for (int oi = 0; oi < 2; oi++)
+  {
+    IROperand s;
+    int32_t v;
+    int p, t;
+    if (oi == 0 && !irop_config[q->op].has_src1)
+      continue;
+    if (oi == 1 && !irop_config[q->op].has_src2)
+      continue;
+    s = (oi == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+    v = irop_get_vreg(s);
+    if (v < 0)
+      continue;
+    p = TCCIR_DECODE_VREG_POSITION(v);
+    t = TCCIR_DECODE_VREG_TYPE(v);
+    if (p > max_vr)
+      continue;
+    if (def_count[t * dc_stride + p] != 1 || use_count[t * dc_stride + p] != 1)
+      continue;
+    for (int bi = 0; bi < cfg->num_blocks; bi++)
+    {
+      if (!in_loop[bi])
+        continue;
+      for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++)
+      {
+        IRQuadCompact *dq = &ir->compact_instructions[ii];
+        if (dq->op == TCCIR_OP_NOP || !irop_config[dq->op].has_dest)
+          continue;
+        if (irop_get_vreg(tcc_ir_op_get_dest(ir, dq)) != v)
+          continue;
+        if (is_invariant[ii])
+          return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 /* Pure, fault-free, side-effect-free ops (dom-LICM's whole hoist whitelist).
  * Executing one on the zero-trip path is harmless, so they may be hoisted to a
  * dominating preheader without dominating the loop's exits — the requirement
- * that only matters for trapping (DIV, pointer LOAD) or side-effecting ops. */
+ * that only matters for trapping (DIV, pointer LOAD) or side-effecting ops.
+ * LOAD is deliberately NOT here: admitting a proven-invariant slot read was
+ * measured over the ir_tests corpus at 1 file changed, +8 bytes, and no cycle
+ * change on mibench_dijkstra — the reloads it targets are separate single-use
+ * temps, so each is still rejected by the use_count gate.
+ *
+ * The follow-up this used to propose — slot-load CSE, one preheader load
+ * feeding every in-loop read — was built and MEASURED on the rig, and it is a
+ * LOSS.  Do not re-propose it.  It does what it says: dijkstra's inner loop
+ * loses all four `current.dist` / `current.node` reloads (and its two stores
+ * fuse into STRD).  But each merged read leaves a value live across the whole
+ * loop, that pressure evicts `queue_tail`, and phi resolution answers with
+ * `mov fp,r3` / `mov r3,fp` on the HOT path — the `edge == NONE` arm, ~70% of
+ * iterations, which grows 8 -> 11 instructions to save 4 loads on the ~30% arm:
+ *
+ *     mibench_dijkstra   off 26,522,784   <=2 slots 27,350,520 (+3.12%)
+ *                                         <=1 slot  28,785,239 (+8.53%)
+ *
+ * (every other benchmark within +-0.5%; the reverted tree reproduces 26,522,784
+ * to the cycle).  Capping at one slot keeps the hot path at 8 instructions and
+ * still measures worse, so the damage is not just the copies one can see.  The
+ * un-rotated loop shape is what makes any extra loop-long value this expensive;
+ * the way out is SROA on the 12-byte struct copy — which REMOVES memory traffic
+ * instead of trading it for pressure — not a smarter hoist. */
 static int licm_op_is_speculatable(int op)
 {
   switch (op) {
@@ -1392,7 +2015,10 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               total_loop_instrs += cfg->blocks[bi].end_idx - cfg->blocks[bi].start_idx;
 
           uint8_t *is_invariant = tcc_mallocz(ir->next_instruction_index);
+          LicmSlotCtx slot_ctx;
           int inv_changed = 1;
+          slot_ctx.writes_frame = -1;
+          slot_ctx.n = 0;
           while (inv_changed) {
             inv_changed = 0;
             for (int bi = 0; bi < cfg->num_blocks; bi++) {
@@ -1455,17 +2081,25 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                       continue;
                   }
                 }
-                /* Skip instructions with memory dereference sources —
-                 * these are loads that may read volatile/changing memory. */
+                /* Skip instructions with memory dereference sources — these are
+                 * loads that may read volatile/changing memory.  A bare
+                 * `StackLoc[off]` source is not a dereference but a named
+                 * local's own slot, so it is allowed once proved unwritable by
+                 * the loop (licm_slot_read_is_invariant). */
                 {
                   int has_deref = 0;
-                  if (irop_config[q->op].has_src1) {
-                    IROperand s = tcc_ir_op_get_src1(ir, q);
-                    if (s.is_lval || irop_op_is_lval(s)) has_deref = 1;
-                  }
-                  if (!has_deref && irop_config[q->op].has_src2) {
-                    IROperand s = tcc_ir_op_get_src2(ir, q);
-                    if (s.is_lval || irop_op_is_lval(s)) has_deref = 1;
+                  for (int oi = 0; oi < 2 && !has_deref; oi++) {
+                    IROperand s;
+                    if (oi == 0 && !irop_config[q->op].has_src1) continue;
+                    if (oi == 1 && !irop_config[q->op].has_src2) continue;
+                    s = (oi == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+                    if (!(s.is_lval || irop_op_is_lval(s))) continue;
+                    if (licm_is_direct_slot_read(s) &&
+                        licm_slot_read_is_invariant(ir, cfg, in_loop, s, &slot_ctx))
+                      continue;
+                    if (licm_is_direct_var_read(ir, s))
+                      continue; /* named local, address never taken — def_count covers it */
+                    has_deref = 1;
                   }
                   if (has_deref) continue;
                 }
@@ -1484,6 +2118,8 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                     continue; /* constant/symbol — invariant */
                   if (tag == IROP_TAG_STACKOFF && !op.is_lval)
                     continue; /* stack address — invariant */
+                  if (licm_is_direct_slot_read(op))
+                    continue; /* slot value — invariance proved by the gate above */
                   int32_t vr = irop_get_vreg(op);
                   if (vr < 0) {
                     all_inv = 0;
@@ -1609,6 +2245,27 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
             }
           }
 
+          /* Chain profitability for the speculative-hoist gate below.  Computed
+           * HERE, before the first insertion: is_invariant and the CFG both
+           * index pre-insertion positions, while the hoist loop below reads the
+           * IR at shifted ones. */
+          uint8_t *chain_ok = tcc_mallocz(ir->next_instruction_index);
+          for (int bi = 0; bi < cfg->num_blocks; bi++) {
+            if (!in_loop[bi])
+              continue;
+            for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
+              IRQuadCompact *cq = &ir->compact_instructions[ii];
+              int32_t cdv;
+              if (!is_invariant[ii] || cq->op == TCCIR_OP_NOP)
+                continue;
+              cdv = irop_config[cq->op].has_dest ? irop_get_vreg(tcc_ir_op_get_dest(ir, cq)) : -1;
+              if (licm_all_uses_invariant(ir, cfg, in_loop, is_invariant, ii, cdv) ||
+                  licm_feeds_from_invariant_chain(ir, cfg, in_loop, is_invariant, def_count,
+                                                  use_count, dc_stride, max_vr, ii))
+                chain_ok[ii] = 1;
+            }
+          }
+
           /* Estimate how many values we can hoist without starving the loop body */
           int loop_start_idx = cfg->blocks[h].start_idx;
           int loop_end_idx = cfg->blocks[b].end_idx;
@@ -1656,7 +2313,8 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                  * for a pure fault-free op, and only PROFITABLE when the value
                  * is used more than once in the loop — a single-use invariant
                  * hoisted into a pressured loop just spills, costing more than
-                 * the one op it saved. */
+                 * the one op it saved — unless it is part of an invariant CHAIN
+                 * that leaves as a unit for that same one register (chain_ok). */
                 if (!licm_op_is_speculatable(q->op))
                   continue;
                 IROperand hd = tcc_ir_op_get_dest(ir, q);
@@ -1668,7 +2326,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                   if (hp <= max_vr)
                     hu = use_count[ht * dc_stride + hp];
                 }
-                if (hu < 2)
+                if (hu < 2 && !chain_ok[ii])
                   continue;
               }
 
@@ -1699,6 +2357,15 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               /* Clone and insert at preheader */
               IRQuadCompact hoist_q = {0};
               hoist_q.op = q->op;
+              /* Carry orig_index across the move.  The side tables the backend
+               * reads just before codegen (barrel_shifts, shift64_dead_half,
+               * zero_half64, bfi_params) are keyed by it, so a clone left at
+               * the zeroed default both loses its own annotation and aliases
+               * instruction 0's slot — a hoisted `add rd,rn,rm lsl #4` came
+               * back as a plain `add` (244_fuzz_entry_store_rt_base_plus_imm).
+               * The original is NOP'd below, so the index is not duplicated. */
+              hoist_q.orig_index = q->orig_index;
+              hoist_q.line_num = q->line_num;
               IROperand orig_dest = tcc_ir_op_get_dest(ir, q);
               IROperand orig_src1 = tcc_ir_op_get_src1(ir, q);
               IROperand orig_src2 = tcc_ir_op_get_src2(ir, q);
@@ -1722,6 +2389,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                 nop_pos = adj_ii;
               }
               ir->compact_instructions[nop_pos].op = TCCIR_OP_NOP;
+              licm_move_jump_target_off_nop(ir, nop_pos);
               hoisted++;
               {
                 int32_t hdvr = irop_get_vreg(orig_dest);
@@ -1737,6 +2405,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
             }
           }
           tcc_free(hoisted_dest);
+          tcc_free(chain_ok);
 
           /* Update CFG block indices to account for inserted instructions.
            * Each tcc_ir_insert_instruction_before shifts all instructions >= insert_pos.

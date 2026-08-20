@@ -195,6 +195,15 @@ int tcc_ir_opt_shift64_dead_half(TCCIRState *ir)
   }
 
   int changes = 0;
+
+  /* Recompute from scratch.  The table is keyed by orig_index and the rules
+   * below only ever OR bits in, so a bit set on an earlier IR state would
+   * survive into a later one where it is no longer justified -- and a stale
+   * skip_lo makes codegen read a register it never wrote.  See the ordering
+   * note at the call site. */
+  if (ir->shift64_dead_half)
+    memset(ir->shift64_dead_half, 0, (size_t)ir->shift64_dead_half_len);
+
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];

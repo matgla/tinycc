@@ -147,9 +147,10 @@ OPT_GEN_FLAT(disp, TCCIR_OP_LOAD)
   if (is_store) {
     IROperand base_for_store = base_op;
     base_for_store.is_lval = 0;
-    /* Carry the packed-access mark from the replaced deref operand: the
-     * backend's 64-bit indexed lowering assumes alignment (LDRD/STRD). */
-    base_for_store.aux |= orig_dest.aux & IROP_AUX_UNDERALIGN;
+    /* Carry the access marks from the replaced deref operand: the backend's
+     * 64-bit indexed lowering assumes alignment (LDRD/STRD), and the store
+     * DSE passes must still see whether the access is volatile. */
+    irop_carry_access_marks(&base_for_store, orig_dest);
     ir->iroperand_pool[new_base_idx + 0] = base_for_store;
     ir->iroperand_pool[new_base_idx + 1] = orig_src1;
     ir->iroperand_pool[new_base_idx + 2] = index_imm;
@@ -158,7 +159,7 @@ OPT_GEN_FLAT(disp, TCCIR_OP_LOAD)
   } else {
     IROperand base_for_load = base_op;
     base_for_load.is_lval = 0;
-    base_for_load.aux |= orig_src1.aux & IROP_AUX_UNDERALIGN;
+    irop_carry_access_marks(&base_for_load, orig_src1);
     IROperand new_dest = orig_dest;
     if (q->op == TCCIR_OP_ASSIGN) {
       new_dest.btype = addr_op.btype;

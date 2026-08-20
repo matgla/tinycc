@@ -420,7 +420,16 @@ again:
     dbt_bt = dbt & VT_BTYPE;
     sbt_bt = sbt & VT_BTYPE;
     if (dbt_bt == VT_VOID)
+    {
+      /* `(void)*p` on volatile storage is a mandated read, and this cast is
+       * where the type that says so disappears — so perform the load here,
+       * before the operand becomes an untyped discard. */
+      if ((vtop->r & VT_LVAL) && !nocode_wanted && sbt_bt != VT_STRUCT &&
+          ((vtop->type.t & VT_VOLATILE) || vtop->volatile_access ||
+           (vtop->sym && (vtop->sym->type.t & VT_VOLATILE))))
+        gv(RC_TYPE(vtop->type.t));
       goto done;
+    }
     if (sbt_bt == VT_VOID)
     {
     error:
@@ -901,6 +910,12 @@ again:
     gen_op(TOK_SHR);
   }
 done:
+  /* The strip below is where a volatile access stops being recognisable: the
+   * qualifier is gone before the IR operand is built, and a deref through a
+   * register has no Sym to consult afterwards.  Record it first, from the old
+   * type and the new one alike. */
+  if ((vtop->type.t | type->t) & VT_VOLATILE)
+    vtop->volatile_access = 1;
   vtop->type = *type;
   vtop->type.t &= ~(VT_CONSTANT | VT_VOLATILE | VT_ARRAY);
 }

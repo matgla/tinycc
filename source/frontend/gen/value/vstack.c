@@ -72,6 +72,7 @@ void vsetc(CType *type, int r, CValue *vc)
   vtop->underaligned = 0; /* fresh value: alignment derives from its type;
                            * a stale 1 from a reused vstack slot would
                            * needlessly block LDRD/STRD pairing */
+  vtop->volatile_access = 0; /* likewise: volatility derives from the fresh type */
   vtop->pr1_reg = PREG_REG_NONE;
   vtop->pr1_spilled = 0;
   vtop->sym = NULL;
@@ -112,6 +113,27 @@ ST_FUNC void vpop(void)
   }
   vtop--;
   print_vstack("vpop");
+}
+
+/* An expression whose value is discarded still has to perform its volatile
+ * read: `*p;` and a volatile operand of a comma expression or a for-loop
+ * increment are mandated accesses (the read-to-clear MMIO idiom is exactly
+ * this shape), but vpop drops the lvalue without ever loading it.  Structs are
+ * left alone — there is no register to load one into.  The `(void)x` spelling
+ * is handled where the cast erases the type, in gen_cast. */
+ST_FUNC void gv_discarded_volatile(void)
+{
+  if (nocode_wanted)
+    return;
+  if (!(vtop->r & VT_LVAL))
+    return;
+  int bt = vtop->type.t & VT_BTYPE;
+  if (bt == VT_STRUCT || bt == VT_VOID || (vtop->type.t & (VT_ARRAY | VT_VLA)))
+    return;
+  if (!((vtop->type.t & VT_VOLATILE) || vtop->volatile_access ||
+        (vtop->sym && (vtop->sym->type.t & VT_VOLATILE))))
+    return;
+  gv(RC_TYPE(vtop->type.t));
 }
 
 /* push constant of type "type" with useless value */

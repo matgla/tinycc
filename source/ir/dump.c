@@ -351,6 +351,9 @@ void tcc_ir_dump_op(TCCIRState *ir, IROperand op, FILE *out)
       fprintf(out, "#%lld", (long long)irop_get_imm64_ex(ir, op));
     else
       fprintf(out, "#%d", (int)irop_get_imm64_ex(ir, op));
+    /* An lvalue immediate is an absolute address read through, not a value. */
+    if (op.is_lval)
+      fprintf(out, "***DEREF***");
   }
   break;
   case IROP_TAG_STACKOFF:

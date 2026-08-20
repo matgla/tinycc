@@ -1,0 +1,6 @@
+wide=0040000000000000 hi=02000000 lo=00000000 spread=0080000000000001
+wide=0000000000000004 hi=00000000 lo=00000020 spread=0000000000000009
+wide=fffffffffffffffc hi=ffffffff lo=ffffffe0 spread=fffffffffffffff9
+wide=00000003fffffffc hi=0000001f lo=ffffffe0 spread=00000007fffffff9
+wide=48d159e26af37bc0 hi=468acf13 lo=579bde00 spread=91a2b3c4d5e6f781
+OK

@@ -49,6 +49,10 @@ int dce_temp_worklist(IRSSAOptCtx *ctx)
           continue;
       }
     }
+    /* A volatile READ is a mandated access even when nothing uses the value:
+     * `*p;` and `(void)REG;` are the read-to-clear MMIO idiom. */
+    if (tcc_ir_instr_access_is_volatile(ctx->ir, q))
+      continue;
     if (ssa_opt_has_side_effects(q->op)) {
       /* A non-lval STORE dest is the value-def encoding `T = expr`: no memory write. */
       int killable = 0;

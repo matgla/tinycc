@@ -34,7 +34,10 @@ typedef struct {
   int32_t base_vr;
   int32_t result_vr;
   int btype;
-  int32_t idx_imm;
+  int32_t idx_imm;   /* valid when idx_vr < 0 */
+  int32_t idx_vr;    /* TEMP holding a runtime index, or -1 for the constant form */
+  int32_t base_off;  /* frame offset when base_is_stack; base_vr is -1 then */
+  uint8_t base_is_stack;
   uint8_t scale;
 } ILoadEntry;
 
@@ -454,17 +457,42 @@ static void tvstore_remove_vr(GLoadState *st, int32_t vr)
   }
 }
 
-static int iload_find(const GLoadState *st, int32_t base_vr, int32_t idx_imm, int scale, int btype)
+/* An entry whose index is a runtime register: its byte offset is unknown, so
+ * every same-base range test below must treat it as "may overlap". */
+static inline int iload_idx_is_reg(const ILoadEntry *e) { return e->idx_vr >= 0; }
+
+/* A base that is a direct `Addr[StackLoc[n]]` operand carries no vreg, so it is
+ * keyed by its frame offset instead and flagged.  base_vr stays -1, which no
+ * real vreg key ever equals, so every base_vr comparison below reads "different
+ * base" for such an entry -- the conservative answer everywhere it matters. */
+static int iload_find_ex(const GLoadState *st, int32_t base_vr, int base_is_stack,
+                         int32_t base_off, int32_t idx_imm, int32_t idx_vr,
+                         int scale, int btype)
 {
   for (int k = 0; k < st->ilcount; k++) {
-    if (st->iloads[k].base_vr == base_vr && st->iloads[k].idx_imm == idx_imm &&
-        st->iloads[k].scale == scale && st->iloads[k].btype == btype)
-      return k;
+    const ILoadEntry *e = &st->iloads[k];
+    if (e->scale != scale || e->btype != btype || e->idx_vr != idx_vr)
+      continue;
+    if (e->base_is_stack != (uint8_t)base_is_stack)
+      continue;
+    if (base_is_stack ? (e->base_off != base_off) : (e->base_vr != base_vr))
+      continue;
+    if (idx_vr < 0 && e->idx_imm != idx_imm)
+      continue;
+    return k;
   }
   return -1;
 }
 
-static void iload_track(GLoadState *st, int32_t base_vr, int32_t idx_imm, int scale, int btype, int32_t result_vr)
+static int iload_find(const GLoadState *st, int32_t base_vr, int32_t idx_imm,
+                      int32_t idx_vr, int scale, int btype)
+{
+  return iload_find_ex(st, base_vr, 0, 0, idx_imm, idx_vr, scale, btype);
+}
+
+static void iload_track_ex(GLoadState *st, int32_t base_vr, int base_is_stack,
+                           int32_t base_off, int32_t idx_imm, int32_t idx_vr,
+                           int scale, int btype, int32_t result_vr)
 {
   if (st->ilcount >= ILOAD_MAX)
     return;
@@ -473,13 +501,23 @@ static void iload_track(GLoadState *st, int32_t base_vr, int32_t idx_imm, int sc
   e->result_vr = result_vr;
   e->btype = btype;
   e->idx_imm = idx_imm;
+  e->idx_vr = idx_vr;
+  e->base_off = base_off;
+  e->base_is_stack = (uint8_t)base_is_stack;
   e->scale = (uint8_t)scale;
+}
+
+static void iload_track(GLoadState *st, int32_t base_vr, int32_t idx_imm, int32_t idx_vr,
+                        int scale, int btype, int32_t result_vr)
+{
+  iload_track_ex(st, base_vr, 0, 0, idx_imm, idx_vr, scale, btype, result_vr);
 }
 
 static void iload_remove_vr(GLoadState *st, int32_t vr)
 {
   for (int k = 0; k < st->ilcount; k++) {
-    if (st->iloads[k].base_vr == vr || st->iloads[k].result_vr == vr) {
+    if (st->iloads[k].base_vr == vr || st->iloads[k].result_vr == vr ||
+        st->iloads[k].idx_vr == vr) {
       st->iloads[k] = st->iloads[--st->ilcount];
       k--;
     }
@@ -561,7 +599,7 @@ static void iload_kill_for_store(GLoadState *st, int32_t store_base_vr, int stor
   for (int k = 0; k < st->ilcount; k++) {
     const ILoadEntry *e = &st->iloads[k];
     int kill = 0;
-    if (e->base_vr != store_base_vr) {
+    if (e->base_vr != store_base_vr || iload_idx_is_reg(e)) {
       kill = 1;
     } else {
       int eo = (int)e->idx_imm * (1 << e->scale);
@@ -645,10 +683,16 @@ static void iload_kill_for_stack_store(IRSSAOptCtx *ctx, GLoadState *st, int32_t
     const ILoadEntry *e = &st->iloads[k];
     int kill = 0;
     if (e->base_vr == store_base_vr) {
-      int eo = (int)e->idx_imm * (1 << e->scale);
-      int eh = eo + slot_btype_bytes(e->btype);
-      if (eo < store_hi && eh > store_lo)
+      if (iload_idx_is_reg(e)) {
         kill = 1;
+      } else {
+        int eo = (int)e->idx_imm * (1 << e->scale);
+        int eh = eo + slot_btype_bytes(e->btype);
+        if (eo < store_hi && eh > store_lo)
+          kill = 1;
+      }
+    } else if (e->base_is_stack) {
+      kill = 1;                   /* entry names the frame outright */
     } else {
       int e_type = TCCIR_DECODE_VREG_TYPE(e->base_vr);
       if (e_type == TCCIR_VREG_TYPE_TEMP) {
@@ -679,12 +723,28 @@ static void iload_kill_for_direct_stack_store(IRSSAOptCtx *ctx, GLoadState *st,
   for (int k = 0; k < st->ilcount; k++) {
     const ILoadEntry *e = &st->iloads[k];
     int kill = 0;
+    if (e->base_is_stack) {
+      if (!store_off_exact || iload_idx_is_reg(e)) {
+        kill = 1;
+      } else {
+        int elo = e->base_off + (int)e->idx_imm * (1 << e->scale);
+        int ehi = elo + slot_btype_bytes(e->btype);
+        if (elo < store_hi && ehi > store_lo)
+          kill = 1;
+      }
+      if (kill) {
+        st->iloads[k] = st->iloads[--st->ilcount];
+        k--;
+      }
+      continue;
+    }
     int etype = TCCIR_DECODE_VREG_TYPE(e->base_vr);
     if (etype == TCCIR_VREG_TYPE_TEMP) {
       int base_off = ssa_opt_resolve_lea_stackloc(ctx, e->base_vr);
       if (base_off != INT_MIN) {
-        if (!store_off_exact) {
-          /* placeholder store offset (named-local slot form): can't compare byte ranges, any stack base may alias */
+        if (!store_off_exact || iload_idx_is_reg(e)) {
+          /* placeholder store offset (named-local slot form), or a runtime
+           * index: can't compare byte ranges, any stack base may alias */
           kill = 1;
         } else {
           int elo = base_off + (int)e->idx_imm * (1 << e->scale);
@@ -847,7 +907,8 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         /* global-deref ALU operand (bitfield RMW fused form): forward a tracked store/load */
         if (op.is_lval && op.is_sym && !op.is_llocal && !op.is_local) {
           IRPoolSymref *ref = irop_get_symref_ex(ir, op);
-          if (ref && ref->sym && !(ref->sym->type.t & VT_VOLATILE)) {
+          if (ref && ref->sym && !(ref->sym->type.t & VT_VOLATILE) &&
+              !tcc_ir_access_is_volatile(ir, op)) {
             int op_btype = irop_get_btype(op);
             IROperand new_op;
             int have_new = 0;
@@ -966,7 +1027,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
             co = 0;
           }
           if (cb == pvr || lcse_base_stable(dc, cb)) {
-            int fk = iload_find(st, cb, co, 0, op_btype);
+            int fk = iload_find(st, cb, co, -1, 0, op_btype);
             if (fk >= 0) {
               new_op = irop_make_vreg(st->iloads[fk].result_vr, op_btype);
               IRSSAVregInfo *rvi = ssa_opt_vinfo(ctx, st->iloads[fk].result_vr);
@@ -1349,7 +1410,9 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
       }
     }
 
-    /* LOAD_INDEXED CSE: dedupe `T_dest = *(T_base + (#idx << #scale))` for const index/scale */
+    /* LOAD_INDEXED CSE: dedupe `T_dest = *(base + (idx << #scale))`.  The index
+     * may be constant or a single-def TEMP; the base may be a vreg or a direct
+     * frame slot. */
     if (q->op == TCCIR_OP_LOAD_INDEXED) {
       IROperand idx_dest = tcc_ir_op_get_dest(ir, q);
       IROperand idx_base = tcc_ir_op_get_src1(ir, q);
@@ -1360,9 +1423,25 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
       int32_t il_base_vr = irop_get_vreg(idx_base);
       if (il_dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(il_dest_vr) != TCCIR_VREG_TYPE_TEMP)
         continue;
-      if (il_base_vr < 0)
+      /* A volatile load must be neither replaced by an earlier value nor
+       * recorded as one: the fusion passes transfer the access mark from the
+       * deref operand onto the base (irop_carry_access_marks). */
+      if (tcc_ir_access_is_volatile(ir, idx_base))
         continue;
-      {
+      /* A direct `Addr[StackLoc[n]]` base -- what indexing a local array lowers
+       * to -- has no vreg, so key it by the frame offset instead.  It is a
+       * constant address for the life of the frame, hence at least as stable
+       * as any vreg base. */
+      int il_base_is_stack = 0;
+      int32_t il_base_off = 0;
+      if (idx_base.tag == IROP_TAG_STACKOFF && il_base_vr < 0 &&
+          idx_base.is_local && !idx_base.is_llocal) {
+        il_base_is_stack = 1;
+        il_base_off = irop_get_stack_offset(idx_base);
+        il_base_vr = -1;
+      } else {
+        if (il_base_vr < 0)
+          continue;
         /* zero-hop base read: any TEMP/VAR base is version-safe; PARAM needs zero textual defs (LcseDefCounts) */
         int il_base_type = TCCIR_DECODE_VREG_TYPE(il_base_vr);
         if (il_base_type == TCCIR_VREG_TYPE_PARAM) {
@@ -1374,10 +1453,26 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
       }
       if (idx_base.is_lval)
         continue;
-      if (!irop_is_immediate(idx_idx) || !irop_is_immediate(idx_sc))
+      if (!irop_is_immediate(idx_sc))
         continue;
+      /* The index may also be a runtime value.  Restricted to a TEMP with a
+       * single total definition: that makes the vreg identity a value identity,
+       * so two loads naming the same index TEMP address the same element -- and
+       * a VAR or PARAM index would need the version reasoning lcse_base_stable
+       * does for bases.  ssa_opt_def_total, not def_count: a phi def plus an
+       * in-place redef reports def_count == 1 and is NOT single-valued. */
+      int32_t il_idx_vr = -1;
+      if (!irop_is_immediate(idx_idx)) {
+        il_idx_vr = irop_get_vreg(idx_idx);
+        if (il_idx_vr < 0 || TCCIR_DECODE_VREG_TYPE(il_idx_vr) != TCCIR_VREG_TYPE_TEMP)
+          continue;
+        if (idx_idx.is_lval || idx_idx.is_local || idx_idx.is_llocal)
+          continue;
+        if (ssa_opt_def_total(ssa_opt_vinfo(ctx, il_idx_vr)) != 1)
+          continue;
+      }
 
-      int32_t il_idx = irop_get_imm32(idx_idx);
+      int32_t il_idx = (il_idx_vr < 0) ? irop_get_imm32(idx_idx) : 0;
       int il_scale = irop_get_imm32(idx_sc);
       int il_btype = irop_get_btype(idx_dest);
 
@@ -1411,7 +1506,8 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         }
       }
 
-      int found = iload_find(st, il_base_vr, il_idx, il_scale, il_btype);
+      int found = iload_find_ex(st, il_base_vr, il_base_is_stack, il_base_off,
+                                il_idx, il_idx_vr, il_scale, il_btype);
       if (found >= 0) {
         int32_t earlier_vr = st->iloads[found].result_vr;
         IROperand new_src = irop_make_vreg(earlier_vr, il_btype);
@@ -1420,18 +1516,27 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         if (rvi)
           ssa_opt_add_use_instr(rvi, i);
 
-        IRSSAVregInfo *bvi = ssa_opt_vinfo(ctx, il_base_vr);
-        if (bvi)
-          ssa_opt_remove_use_instr(bvi, i);
+        if (il_base_vr >= 0) {
+          IRSSAVregInfo *bvi = ssa_opt_vinfo(ctx, il_base_vr);
+          if (bvi)
+            ssa_opt_remove_use_instr(bvi, i);
+        }
 
+        if (il_idx_vr >= 0) {
+          IRSSAVregInfo *ivi = ssa_opt_vinfo(ctx, il_idx_vr);
+          if (ivi)
+            ssa_opt_remove_use_instr(ivi, i);
+        }
         q->op = TCCIR_OP_ASSIGN;
         tcc_ir_set_src1(ir, i, new_src);
         tcc_ir_set_src2(ir, i, IROP_NONE);
-        iload_track(st, il_base_vr, il_idx, il_scale, il_btype, il_dest_vr);
+        iload_track_ex(st, il_base_vr, il_base_is_stack, il_base_off, il_idx,
+                       il_idx_vr, il_scale, il_btype, il_dest_vr);
         changes++;
         continue;
       }
-      iload_track(st, il_base_vr, il_idx, il_scale, il_btype, il_dest_vr);
+      iload_track_ex(st, il_base_vr, il_base_is_stack, il_base_off, il_idx,
+                     il_idx_vr, il_scale, il_btype, il_dest_vr);
       continue;
     }
 
@@ -1452,6 +1557,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
       continue;
     int dest_btype = irop_get_btype(dest);
     if (q->op == TCCIR_OP_ASSIGN && irop_get_btype(src1) != dest_btype)
+      continue;
+
+    /* A volatile read has to happen every time: no store-forwarding into it,
+     * and it is not a value later reads may reuse. */
+    if (tcc_ir_access_is_volatile(ir, src1))
       continue;
 
     /* forward LOAD `T_vreg_DEREF` from a recent STORE through the same T_vreg */
@@ -1497,7 +1607,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         }
         /* base stability: TEMP single-def; VAR/PARAM need <=1 textual def; zero-hop form reads the current value */
         if (canon_base == ptr_vr || lcse_base_stable(dc, canon_base)) {
-          int found = iload_find(st, canon_base, canon_off, 0, dest_btype);
+          int found = iload_find(st, canon_base, canon_off, -1, 0, dest_btype);
           if (found >= 0) {
             int32_t earlier_vr = st->iloads[found].result_vr;
             IROperand new_src = irop_make_vreg(earlier_vr, dest_btype);
@@ -1510,11 +1620,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
             q->op = TCCIR_OP_ASSIGN;
             tcc_ir_set_src1(ir, i, new_src);
             tcc_ir_set_src2(ir, i, IROP_NONE);
-            iload_track(st, canon_base, canon_off, 0, dest_btype, dest_vr);
+            iload_track(st, canon_base, canon_off, -1, 0, dest_btype, dest_vr);
             changes++;
             continue;
           }
-          iload_track(st, canon_base, canon_off, 0, dest_btype, dest_vr);
+          iload_track(st, canon_base, canon_off, -1, 0, dest_btype, dest_vr);
         }
       }
     }
@@ -1574,7 +1684,10 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
     IRPoolSymref *ref = irop_get_symref_ex(ir, src1);
     if (!ref || !ref->sym)
       continue;
-    if (ref->sym->type.t & VT_VOLATILE)
+    /* Volatility: the Sym answers only for a whole volatile object, so the
+     * operand mark decides for `volatile int a[4]`, a volatile member of a
+     * plain struct, and casts (v17/v18 in tests/ir_tests/asm/volatile_access.c). */
+    if ((ref->sym->type.t & VT_VOLATILE) || tcc_ir_access_is_volatile(ir, src1))
       continue;
 
     /* prefer a tracked store over an earlier load: eliminates the LOAD and an immediate folds further */

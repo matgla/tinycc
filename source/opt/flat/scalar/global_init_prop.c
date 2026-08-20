@@ -53,6 +53,12 @@ int tcc_ir_opt_global_init_prop(TCCIRState *ir)
         continue;
       if (ttype & VT_VOLATILE)
         continue;
+      /* The symbol's own type is not volatile when only a MEMBER of it is
+       * (`static struct { volatile int a; int b; } gs;`), so the access has to
+       * be asked as well -- otherwise gs.a folds to the zero initialiser and
+       * the mandated load disappears. */
+      if (tcc_ir_access_is_volatile(ir, opnd))
+        continue;
 
       int is_const_q = (ttype & VT_CONSTANT) != 0;
       /* For arrays, const qualifies the element type; check the pointed-to type. */

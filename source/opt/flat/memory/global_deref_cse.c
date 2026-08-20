@@ -109,7 +109,10 @@ static int gdcse_is_global_read(TCCIRState *ir, IROperand op, IRPoolSymref **out
   IRPoolSymref *sr = irop_get_symref_ex(ir, op);
   if (!sr || !sr->sym)
     return 0;
-  if (sr->sym->type.t & VT_VOLATILE)
+  /* The Sym only knows about a wholly-volatile object; `volatile int a[4]`
+   * carries the qualifier on the element type and a volatile struct member
+   * carries it on the member, so the access mark on the operand decides. */
+  if ((sr->sym->type.t & VT_VOLATILE) || tcc_ir_access_is_volatile(ir, op))
     return 0;
   *out = sr;
   return 1;

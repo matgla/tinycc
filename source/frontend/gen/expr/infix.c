@@ -308,13 +308,19 @@ ST_FUNC void gexpr(void)
   {
     do
     {
+      gv_discarded_volatile();
       vpop();
       next();
       expr_eq();
       tcc_ir_codegen_drop_return(tcc_state->ir);
     } while (tok == ',');
 
-    /* convert array & function to pointer */
+    /* convert array & function to pointer.  It also strips the qualifiers, so
+     * record a volatile access first — otherwise the comma expression's value
+     * arrives at its consumer (or at the statement-level discard) looking like
+     * an ordinary read, and `(void)(x, *REG)` loses the read. */
+    if (vtop->type.t & VT_VOLATILE)
+      vtop->volatile_access = 1;
     convert_parameter_type(&vtop->type);
 
     /* make builtin_constant_p((1,2)) return 0 (like on gcc) */

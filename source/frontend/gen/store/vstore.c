@@ -793,13 +793,27 @@ ST_FUNC void vstore(void)
      * `*d = *s` shape — the common one, and the one that otherwise costs a
      * __aeabi_memmove4 call — is allowed up to 16 bytes.  Sixteen is also the
      * point where an LDM/STM pair stops fitting the scratch budget. */
-    int both_reg_deref = IS_REG_DEREF_LVAL(vtop[-1].r) && IS_REG_DEREF_LVAL(vtop[0].r);
-    int inline_copy_max = both_reg_deref ? 16 : 8;
+    /* The same reasoning admits the MIRROR shape, `local = *p` / `local =
+     * arr[i]` — a register-deref SOURCE read into a frame slot.  It is the
+     * commonest struct-copy idiom in C and the one the size-tuned mixed-copy
+     * cap above (4 bytes) sends to __aeabi_memmove4: mibench_dijkstra's
+     * `item_t current = queue[head++]` is 12 bytes, so it paid a ~110-cycle
+     * call 20,042 times per benchmark run where gcc emits two loads.  The
+     * width-mismatch hazard is a property of the SOURCE, and an opaque
+     * pointer deref has no store to mis-narrow, so this direction gets the
+     * same 16-byte ceiling as the both-reg-deref case. */
+    int src_reg_deref_lval = IS_REG_DEREF_LVAL(vtop[0].r);
+    int dst_reg_deref_lval = IS_REG_DEREF_LVAL(vtop[-1].r);
+    int dst_slot_lval = IS_LOCAL_LVAL(vtop[-1].r) || IS_GLOBAL_LVAL(vtop[-1].r);
+    int both_reg_deref = dst_reg_deref_lval && src_reg_deref_lval;
+    int slot_from_deref = dst_slot_lval && src_reg_deref_lval;
+    int inline_copy_max = (both_reg_deref || slot_from_deref) ? 16 : 8;
     if (tcc_state->ir && !has_vla && size > 0 && size <= inline_copy_max &&
         !(size & 3) && !(align & 3) && !NOEVAL_WANTED &&
-        IS_REG_DEREF_LVAL(vtop[-1].r) &&
-        (IS_LOCAL_LVAL(vtop[0].r) || IS_GLOBAL_LVAL(vtop[0].r) ||
-         IS_REG_DEREF_LVAL(vtop[0].r)))
+        ((dst_reg_deref_lval &&
+          (IS_LOCAL_LVAL(vtop[0].r) || IS_GLOBAL_LVAL(vtop[0].r) ||
+           src_reg_deref_lval)) ||
+         slot_from_deref))
     {
       SValue src = vtop[0];
       SValue dst = vtop[-1];
@@ -894,33 +908,48 @@ ST_FUNC void vstore(void)
         tmp.r = 0;
         tmp.vr = tmp_vregs[i];
 
-        SValue dst_ptr;
-        if (off == 0)
-        {
-          dst_ptr = dst_base;
-        }
-        else
-        {
-          SValue off_imm;
-          svalue_init(&off_imm);
-          off_imm.type.t = VT_INT;
-          off_imm.r = VT_CONST;
-          off_imm.vr = -1;
-          off_imm.c.i = off;
-
-          svalue_init(&dst_ptr);
-          dst_ptr.type.t = VT_PTR;
-          dst_ptr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
-          dst_ptr.r = 0;
-
-          tcc_ir_put(tcc_state->ir, TCCIR_OP_ADD, &dst_base, &off_imm, &dst_ptr);
-        }
-
         SValue store_dst;
         svalue_init(&store_dst);
         store_dst.type = word_type;
-        store_dst.r = VT_LVAL;
-        store_dst.vr = dst_ptr.vr;
+
+        if (dst_slot_lval)
+        {
+          /* Frame slot / global: the offset rides in c.i, exactly as the
+           * LOCAL/GLOBAL word-copy path above emits it.  No address
+           * arithmetic, and the slot stays visible to store-load
+           * forwarding and DSE. */
+          store_dst.r = dst.r;
+          store_dst.vr = dst.vr;
+          store_dst.sym = dst.sym;
+          store_dst.c.i = dst.c.i + off;
+        }
+        else
+        {
+          SValue dst_ptr;
+          if (off == 0)
+          {
+            dst_ptr = dst_base;
+          }
+          else
+          {
+            SValue off_imm;
+            svalue_init(&off_imm);
+            off_imm.type.t = VT_INT;
+            off_imm.r = VT_CONST;
+            off_imm.vr = -1;
+            off_imm.c.i = off;
+
+            svalue_init(&dst_ptr);
+            dst_ptr.type.t = VT_PTR;
+            dst_ptr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+            dst_ptr.r = 0;
+
+            tcc_ir_put(tcc_state->ir, TCCIR_OP_ADD, &dst_base, &off_imm, &dst_ptr);
+          }
+
+          store_dst.r = VT_LVAL;
+          store_dst.vr = dst_ptr.vr;
+        }
 
         tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &store_dst);
       }

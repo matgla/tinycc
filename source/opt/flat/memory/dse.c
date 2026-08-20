@@ -264,8 +264,13 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
     _pure;                                                                                                             \
   })
 
+  /* A volatile access is mandated whether or not its value is wanted, so it is
+   * never dead-eligible however ordinary its source operand looks -- a symref
+   * can name a volatile global. */
+#define DSE_IS_DEAD_ELIGIBLE(_q) (!tcc_ir_instr_access_is_volatile(ir, (_q)) && DSE_SOURCE_IS_PURE(_q))
+
   /* A LOAD is dead-eligible only when its source is side-effect-free: immediate, symref, or LOCAL stack slot. */
-#define DSE_IS_DEAD_ELIGIBLE(_q)                                                                                       \
+#define DSE_SOURCE_IS_PURE(_q)                                                                                         \
   (((_q)->op != TCCIR_OP_STORE && (_q)->op != TCCIR_OP_STORE_INDEXED && (_q)->op != TCCIR_OP_STORE_POSTINC &&          \
     (_q)->op != TCCIR_OP_LOAD_POSTINC && (_q)->op != TCCIR_OP_LOAD && (_q)->op != TCCIR_OP_FUNCCALLVAL &&              \
     (_q)->op != TCCIR_OP_FUNCCALLVOID && (_q)->op != TCCIR_OP_FUNCPARAMVAL && (_q)->op != TCCIR_OP_FUNCPARAMVOID) ||   \

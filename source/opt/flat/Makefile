@@ -28,6 +28,7 @@ FLAT_OPT_SRC = \
 	source/opt/flat/scalar/narrow_store.c \
 	source/opt/flat/scalar/self_copy.c \
 	source/opt/flat/scalar/var_tmp_fwd.c \
+	source/opt/flat/scalar/inline_param_copy.c \
 	source/opt/flat/scalar/known_bits.c \
 	source/opt/flat/scalar/const_prop_tmp.c \
 	source/opt/flat/scalar/value_tracking.c \
@@ -64,7 +65,10 @@ FLAT_OPT_SRC = \
 	source/opt/flat/fusion/pack64.c \
 	source/opt/flat/fusion/pack64_tautology.c \
 	source/opt/flat/fusion/cmp_narrow_64.c \
+	source/opt/flat/fusion/cmp_imm_swap.c \
+	source/opt/flat/fusion/and64_narrow.c \
 	source/opt/flat/fusion/shl32_or_chain.c \
+	source/opt/flat/scalar/sdiv_pow2.c \
 	source/opt/flat/memory/dead_lea_store.c \
 	source/opt/flat/memory/store_inplace_arith.c \
 	source/opt/flat/scalar/redundant_loop_check.c \
@@ -84,6 +88,7 @@ FLAT_OPT_SRC = \
 	source/opt/flat/dce/dce.c \
 	source/opt/flat/dce/compact_nops.c \
 	source/opt/flat/dce/orphan_cmp_elim.c \
+	source/opt/flat/dce/redundant_cmp.c \
 	source/opt/flat/dce/zero_vla_elim.c \
 	source/opt/flat/loop/loop_ir_mutate.c \
 	source/opt/flat/loop/iv_analysis.c \
@@ -101,6 +106,7 @@ FLAT_OPT_SRC = \
 	source/opt/flat/cfg/switch_to_data.c \
 	source/opt/flat/dce/dead_vla.c \
 	source/opt/flat/cfg/jump_thread.c \
+	source/opt/flat/cfg/bool_diamond_branch.c \
 	source/opt/flat/cfg/jumpif_invert.c \
 	source/opt/flat/scalar/var_to_tmp.c \
 	source/opt/flat/cfg/returnvalue_merge.c \
@@ -113,6 +119,7 @@ FLAT_OPT_SRC = \
 	source/opt/flat/memory/invariant_global_load_hoist.c \
 	source/opt/flat/memory/invariant_temp_deref_hoist.c \
 	source/opt/flat/memory/global_deref_cse.c \
+	source/opt/flat/memory/deref_operand_cse.c \
 	source/opt/flat/memory/bitfield_unit_narrow.c \
 	source/opt/flat/memory/rmw_byte_clear.c \
 	source/opt/flat/memory/local_copy_prop.c \
@@ -120,6 +127,8 @@ FLAT_OPT_SRC = \
 	source/opt/flat/fusion/barrel_shift.c \
 	source/opt/flat/fusion/shift_pair_ubfx.c \
 	source/opt/flat/fusion/shift64_dead_half.c \
+	source/opt/flat/fusion/zero_half64.c \
+	source/opt/flat/fusion/shift64_extract_ubfx.c \
 	source/opt/flat/ipa/pure_via_sret.c \
 	source/opt/flat/ipa/func_write_summary.c \
 	source/opt/flat/ipa/tu_func_summary.c \

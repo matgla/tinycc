@@ -144,48 +144,47 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
 
       int64_t base_off = irop_get_stack_offset(bc_dest);
       int total_size = (int)irop_get_imm64_ex(ir, bc_sz);
-      if (total_size <= 0 || (total_size & 3) || total_size > 256)
-        continue;
-
       size_t avail = 0;
-      const uint8_t *data = ir_opt_get_rodata_bytes(ir, bc_src, &avail);
-      if (!data || avail < (size_t)total_size)
+      const uint8_t *data = total_size > 0 ? ir_opt_get_rodata_bytes(ir, bc_src, &avail) : NULL;
+
+      /* A BLOCK_COPY this scan cannot expand into per-word entry stores is still a
+       * write.  Drop every entry store it covers -- keeping one would let a later
+       * load from the range be forwarded a value the copy has since overwritten.
+       * A sub-word size reaches here via the strcpy fold (strlen+1 need not be a
+       * whole number of words), so this is not a can't-happen path. */
+      if (total_size <= 0 || (total_size & 3) || total_size > 256 || !data ||
+          avail < (size_t)total_size)
+      {
+        if (total_size > 0)
+          for (int k = 0; k < estore_count; k++)
+            if (estores[k].offset >= base_off && estores[k].offset < base_off + total_size)
+              estores[k].offset = 0x7FFFFFFFLL;
+        ESTORE_COMPACT();
         continue;
+      }
+
+      /* The copy overwrites the whole range, so every entry inside it is stale --
+       * including sub-word ones the per-word rewrite below would step over.  Drop
+       * them all first, then record what the copy leaves behind. */
+      for (int k = 0; k < estore_count; k++)
+        if (estores[k].offset >= base_off && estores[k].offset < base_off + total_size)
+          estores[k].offset = 0x7FFFFFFFLL;
+      ESTORE_COMPACT();
 
       int nwords = total_size / 4;
       for (int w = 0; w < nwords && estore_count < MAX_ENTRY_STORES; w++)
       {
         int32_t val = (int32_t)read32le((unsigned char *)(data + w * 4));
         int64_t off = base_off + w * 4;
-        int found = -1;
-        for (int k = 0; k < estore_count; k++)
-        {
-          if (estores[k].offset == off)
-          {
-            found = k;
-            break;
-          }
-        }
         IROperand imm = irop_make_imm32(-1, val, IROP_BTYPE_INT32);
         int bc_anon = (irop_get_vreg(bc_dest) < 0);
-        if (found >= 0)
-        {
-          estores[found].value = imm;
-          estores[found].btype = IROP_BTYPE_INT32;
-          estores[found].idx = i;
-          estores[found].anon_slot = bc_anon;
-          estores[found].is_unsigned = 0;
-        }
-        else
-        {
-          estores[estore_count].offset = off;
-          estores[estore_count].value = imm;
-          estores[estore_count].btype = IROP_BTYPE_INT32;
-          estores[estore_count].idx = i;
-          estores[estore_count].anon_slot = bc_anon;
-          estores[estore_count].is_unsigned = 0;
-          estore_count++;
-        }
+        estores[estore_count].offset = off;
+        estores[estore_count].value = imm;
+        estores[estore_count].btype = IROP_BTYPE_INT32;
+        estores[estore_count].idx = i;
+        estores[estore_count].anon_slot = bc_anon;
+        estores[estore_count].is_unsigned = 0;
+        estore_count++;
       }
       if (bc_range_count < MAX_BC_RANGES)
       {

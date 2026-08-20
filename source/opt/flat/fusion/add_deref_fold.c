@@ -184,11 +184,25 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
 
     IROperand load_dest = dest;
     load_dest.btype = load_btype;
+    /* Signedness must come from the DEREF use too, not just the width.  The
+     * backend picks LDRB vs LDRSB (and LDRH vs LDRSH) from the *destination*
+     * operand's is_unsigned, and `dest` here is the ADD's pointer temp, whose
+     * flag says nothing about the loaded value.  Carrying the width over while
+     * leaving the sign behind turned every `unsigned char` field load that got
+     * folded into a sign-extending LDRSB -- so a byte of 255 arrived as -1.
+     * (gcc.c-torture pr82524: `foo(y->c.a, 255 - v)` computed 0 instead of
+     * 255, but only when a later argument was a computed expression, which is
+     * what routes the load through this fold.) */
+    load_dest.is_unsigned = use_op.is_unsigned;
 
     /* Convert ADD to LOAD_INDEXED: allocate 4 contiguous pool entries */
     IROperand scale_op = irop_make_imm32(-1, 0, IROP_BTYPE_INT32);
+    /* The deref moves from the use site onto the base, and so must its access
+     * marks — the load/store CSE passes read volatility off the base. */
+    IROperand base_marked = src1;
+    irop_carry_access_marks(&base_marked, use_op);
     int new_base = tcc_ir_pool_add(ir, load_dest);
-    tcc_ir_pool_add(ir, src1);
+    tcc_ir_pool_add(ir, base_marked);
     tcc_ir_pool_add(ir, src2);
     tcc_ir_pool_add(ir, scale_op);
     q->operand_base = new_base;

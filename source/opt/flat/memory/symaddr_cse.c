@@ -258,12 +258,17 @@ OPT_GEN_FLAT(symaddr_store, TCCIR_OP_STORE)
   SymaddrEntry *base = symaddr_find_base(st, sr, &delta);
   GUARD(when(base != NULL));
   tcc_ir_pool_ensure(ir, 4);
-  int operand_base = ir->iroperand_pool_count;
-  tcc_ir_pool_add(ir, irop_make_vreg(base->hoist_vreg, IROP_BTYPE_INT32));
-  tcc_ir_pool_add(ir, src1);
-  tcc_ir_pool_add(ir, mk_imm(delta));
-  tcc_ir_pool_add(ir, mk_imm(0));
-  q->operand_base = operand_base;
+  {
+    IROperand new_base = irop_make_vreg(base->hoist_vreg, IROP_BTYPE_INT32);
+    /* The deref moves onto the base operand; its access marks go with it. */
+    irop_carry_access_marks(&new_base, dest);
+    int operand_base = ir->iroperand_pool_count;
+    tcc_ir_pool_add(ir, new_base);
+    tcc_ir_pool_add(ir, src1);
+    tcc_ir_pool_add(ir, mk_imm(delta));
+    tcc_ir_pool_add(ir, mk_imm(0));
+    q->operand_base = operand_base;
+  }
   REWRITE(.new_op = TCCIR_OP_STORE_INDEXED);
 }
 
@@ -289,6 +294,7 @@ OPT_GEN_FLAT(symaddr_load, TCCIR_OP_LOAD)
   GUARD(when(base != NULL));
   {
     IROperand new_base = irop_make_vreg(base->hoist_vreg, IROP_BTYPE_INT32);
+    irop_carry_access_marks(&new_base, src1);
     IROperand new_dest = dest;
     tcc_ir_pool_ensure(ir, 4);
     int operand_base = ir->iroperand_pool_count;

@@ -112,6 +112,10 @@ int tcc_ir_opt_stack_bool_diamond(struct TCCIRState *ir);
 /* Single-BB VAR -> TMP promotion for a non-address-taken VAR with one def and in-BB lval-ASSIGN reads only. */
 int tcc_ir_opt_var_to_tmp(struct TCCIRState *ir);
 
+/* Drops the redundant per-parameter local an inline expansion creates (Vpar = Vsrc copy). */
+int tcc_ir_opt_inline_param_copy_elim(struct TCCIRState *ir);
+int tcc_ir_opt_inline_param_copy_elim_ex(struct IROptCtx *ctx);
+
 int tcc_ir_opt_add_reassoc(struct TCCIRState *ir);
 
 /* Folds `CMP V, Addr[StackLoc[Y]]` (and its JUMPIF/SELECT) when V is provably Addr[StackLoc[X]] + N, X+N == Y. */
@@ -137,6 +141,8 @@ int tcc_ir_opt_pack64_from_stack_stores(struct TCCIRState *ir);
 
 /* `((X SHL 32) OR Y) SHL 32` -> `Y SHL 32`, and the AND #0xFFFFFFFF analogue. */
 int tcc_ir_opt_shl32_or_chain(struct TCCIRState *ir);
+/* Signed `x / 2^n` -> bias + arithmetic shift, so no SDIV is emitted. */
+int tcc_ir_opt_sdiv_pow2(struct TCCIRState *ir);
 
 /* Folds `T_new = X OP Y; T_final = T_new` into one op. */
 int tcc_ir_opt_assign_fuse(struct TCCIRState *ir);
@@ -144,8 +150,30 @@ int tcc_ir_opt_assign_fuse(struct TCCIRState *ir);
 /* `CMP T_u64, u64_imm_with_hi_0` -> 32-bit when T's hi half is provably zero (SHR>=32 or ZEXT). */
 int tcc_ir_opt_cmp_narrow_64(struct TCCIRState *ir);
 
+/* `CMP imm, reg` -> `CMP reg, imm` with the condition mirrored on every flag
+ * reader, so the constant reaches `cmp`'s immediate slot instead of a `mov`. */
+int tcc_ir_opt_cmp_imm_swap(struct TCCIRState *ir);
+/* Delete a CMP whose flags a dominating identical CMP already left in place. */
+int tcc_ir_opt_redundant_cmp(struct TCCIRState *ir);
+
+/* `T_u64 AND imm_with_hi_0` -> 32-bit when the result is only ever read as 32 bits.
+ * Also makes the AND a low-only consumer, which lets shift64_dead_half mark the
+ * SHR feeding it (the `(bits >> c) & mask` extract idiom). */
+int tcc_ir_opt_and64_narrow(struct TCCIRState *ir);
+
 /* Flags SHL/SHR/SAR results whose low or high word is provably unread, so codegen skips the dead half-write. */
 int tcc_ir_opt_shift64_dead_half(struct TCCIRState *ir);
+
+/* Annotate the halves of 64-bit values that are provably zero, and the halves
+ * of a result that no consumer reads as a consequence.  Runs last, after every
+ * operand rewrite -- the dead-half rule is only valid against the final
+ * instruction stream. */
+int tcc_ir_opt_zero_half64(struct TCCIRState *ir);
+
+/* `(v64 >> k) & mask` with k >= 32 is one UBFX on v64's high word.  Must run
+ * after the mask narrowing passes (and64_narrow / narrow.c) have made the
+ * consumer 32-bit, and before shift64_dead_half, whose producer disappears. */
+int tcc_ir_opt_shift64_extract_ubfx(struct TCCIRState *ir);
 
 /* Collapses identical macro-unrolled block runs back into a loop. */
 int tcc_ir_opt_reroll(struct TCCIRState *ir);
@@ -186,6 +214,7 @@ int tcc_ir_opt_invariant_global_load_hoist_ex(struct IROptCtx *ctx);
 
 /* CSEs a global lvalue operand read >1 time in one straight-line clobber-free region into a single ASSIGN. */
 int tcc_ir_opt_global_deref_cse(struct TCCIRState *ir);
+int tcc_ir_opt_deref_operand_cse(struct TCCIRState *ir);
 
 /* Narrows a whole-word bitfield RMW to the byte/halfword the field exactly fills. */
 int tcc_ir_opt_bitfield_unit_narrow(struct TCCIRState *ir);
@@ -246,6 +275,10 @@ int tcc_ir_opt_dead_temp_local_elim(struct TCCIRState *ir);
 int tcc_ir_opt_dead_temp_local_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_call_chain_rename(struct TCCIRState *ir);
 int tcc_ir_opt_stackoff_addr_cse(struct TCCIRState *ir);
+/* Late variant (run from regalloc, after alias-sensitive passes): park the
+ * STACKOFF base of an already-fused LOAD/STORE_INDEXED in a register instead of
+ * re-materializing `add rX, sp, #off` at every access. */
+int tcc_ir_opt_stackoff_indexed_base_cse(struct TCCIRState *ir);
 int tcc_ir_opt_lea_fold(struct TCCIRState *ir);
 int tcc_ir_opt_lea_rmw_fold(struct TCCIRState *ir);
 int tcc_ir_opt_add_deref_fold(struct TCCIRState *ir);
@@ -257,6 +290,7 @@ int tcc_ir_opt_float_branch_fold(struct TCCIRState *ir);
 int tcc_ir_opt_redundant_loop_check(struct TCCIRState *ir);
 int tcc_ir_opt_float_narrowing(struct TCCIRState *ir);
 int tcc_ir_opt_jump_threading(struct TCCIRState *ir);
+int tcc_ir_opt_bool_diamond_branch(struct TCCIRState *ir);
 int tcc_ir_opt_orphan_cmp_elim(struct TCCIRState *ir);
 
 /* `JUMPIF C -> A; JUMP -> B` -> `JUMPIF !C -> B`; allow_backward=0 pre-RA keeps rotation's body->latch JUMP intact. */
@@ -309,6 +343,8 @@ int tcc_ir_opt_pack64_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_pack64_tautology_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_pack64_from_stack_stores_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_narrow_64_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_cmp_imm_swap_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_and64_narrow_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_sl_forward_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_entry_store_prop_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_assign_fuse_ex(struct IROptCtx *ctx);

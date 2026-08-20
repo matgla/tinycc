@@ -5,6 +5,8 @@
  *    branch_fold_test_zero — fold TEST_ZERO #const + JUMPIF to unconditional/NOP
  *    branch_fold_cmp       — fold CMP #const,#const + JUMPIF to unconditional/NOP
  *    setif_branch_fuse     — fuse CMP+SETIF+TEST_ZERO+JUMPIF → CMP+JUMPIF
+ *    setif_branch_remat    — redo the comparison at a DISTANT branch on its
+ *                            SETIF result, so the 0/1 never gets materialized
  *
  *  Copyright (c) 2025 Mateusz Stadnik
  *
@@ -320,6 +322,199 @@ OPT_GEN_FLAT(setif_branch_fuse, TCCIR_OP_CMP)
   return 1;
 }
 
+/* CMP a,b; SETIF cond -> T, where every use of T is a branch test
+ *      ->  the comparison redone at each branch, and the quartet deleted.
+ *
+ * setif_branch_fuse above needs the TEST_ZERO to be the very next instruction.
+ * The predicates soft float is built from are not: `const int a_max_exp =
+ * (a_exp == 0x7FF);` is computed at the top of __aeabi_dadd and branched on
+ * forty instructions later -- sometimes twice -- so the boolean is materialized
+ * with a `cmp`/`ite`/`moveq`/`movne` quartet and then tested against zero again
+ * at every use.  Redoing the comparison at the branch costs the same two
+ * instructions the TEST_ZERO pair already cost, and makes the quartet dead.
+ *
+ * Legality needs no dataflow walk.  The SETIF is T's only definition, so a path
+ * reaching a use without executing it would be reading an uninitialised value;
+ * and only NOPs separate the CMP from the SETIF, so whenever T is defined the
+ * comparison ran.  What is left to establish is that the operands still HOLD
+ * what was compared, which is why each non-immediate one must have exactly one
+ * definition in the function -- and must be a value, not a memory read, whose
+ * repetition could observe a different word.
+ *
+ * At most one non-immediate operand.  The transform trades the boolean's live
+ * range for its operands', over the same span; with one register operand that
+ * is a wash, with two it hands the allocator an extra simultaneous value -- the
+ * trade that reverted five earlier attempts on this same library.
+ *
+ * The now-orphaned CMP is left for orphan_cmp_elim: whether its flags still
+ * have a consumer is that pass's question, not this one's.
+ */
+OPT_GEN_FLAT(setif_branch_remat, TCCIR_OP_CMP)
+{
+  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY, .src2 = IR_CONSTRAINT_ANY });
+
+  const int n = ir->next_instruction_index;
+  int si = ir_skip_nops_forward(ir, i + 1, n);
+  if (si >= n)
+    return 0;
+
+  IRQuadCompact *setif_q = &ir->compact_instructions[si];
+  if (setif_q->op != TCCIR_OP_SETIF)
+    return 0;
+  /* A label anywhere between means the SETIF is reachable without the CMP. */
+  for (int j = i + 1; j <= si; j++)
+    if (ir->compact_instructions[j].is_jump_target)
+      return 0;
+
+  IROperand setif_dest = tcc_ir_op_get_dest(ir, setif_q);
+  int32_t sv = irop_get_vreg(setif_dest);
+  if (sv < 0 || setif_dest.is_lval)
+    return 0;
+  /* A named local counts as well as a temp -- `const int a_max_exp = ...` is
+   * exactly the shape this is here for.  Its address escaping is caught by the
+   * use scan below, which admits nothing but a branch test. */
+  if (TCCIR_DECODE_VREG_TYPE(sv) != TCCIR_VREG_TYPE_TEMP &&
+      TCCIR_DECODE_VREG_TYPE(sv) != TCCIR_VREG_TYPE_VAR)
+    return 0;
+  if (irop_get_btype(setif_dest) == IROP_BTYPE_INT64)
+    return 0;
+  if (tcc_ir_access_is_volatile(ir, setif_dest))
+    return 0;
+  if (!tcc_ir_vreg_has_single_def(ir, sv))
+    return 0;
+
+  int nregs = 0;
+  for (int k = 0; k < 2; k++)
+  {
+    IROperand o = k ? src2 : src1;
+    if (irop_is_plain_imm(o))
+      continue;
+    int32_t vr = irop_get_vreg(o);
+    if (vr < 0 || o.is_lval || o.is_local || o.is_sym)
+      return 0;
+    /* A TEMP and nothing else.  Its address is never taken, so no callee and
+     * no store through a pointer can change it behind this scan -- and unlike
+     * a parameter it carries no implicit definition at function entry, which
+     * tcc_ir_vreg_has_single_def does not count.  (A parameter with one
+     * explicit def therefore has TWO, and comparing it again at the branch
+     * would compare the NEW value: the f2 case in tests2 pins that.) */
+    if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      return 0;
+    if (!tcc_ir_vreg_has_single_def(ir, vr))
+      return 0;
+    if (++nregs > 1)
+      return 0;
+  }
+  if (nregs == 0)
+    return 0; /* constant folding owns this shape */
+
+  const int setif_tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, setif_q));
+  const int inv_tok = invert_cond_token(setif_tok);
+
+#define REMAT_MAX_USES 8
+  int use_idx[REMAT_MAX_USES];
+  int jmp_idx[REMAT_MAX_USES];
+  int new_tok[REMAT_MAX_USES];
+  int nuses = 0;
+
+  for (int u = 0; u < n; u++)
+  {
+    IRQuadCompact *uq = &ir->compact_instructions[u];
+    if (u == si || uq->op == TCCIR_OP_NOP)
+      continue;
+    if (irop_config[uq->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == sv)
+      return 0; /* redefined, or written through as an address */
+
+    int reads = 0;
+    for (int k = 1; k <= 3; k++)
+    {
+      IROperand o = (k == 1)   ? (irop_config[uq->op].has_src1 ? tcc_ir_op_get_src1(ir, uq) : IROP_NONE)
+                    : (k == 2) ? (irop_config[uq->op].has_src2 ? tcc_ir_op_get_src2(ir, uq) : IROP_NONE)
+                               : (uq->op == TCCIR_OP_MLA ? tcc_ir_op_get_accum(ir, uq) : IROP_NONE);
+      if (irop_get_vreg(o) == sv)
+        reads = 1;
+    }
+    if (!reads)
+      continue;
+    if (u < si || nuses >= REMAT_MAX_USES)
+      return 0;
+
+    /* 64-bit EQ/NE emits `CMP T,#0` where the 32-bit form emits TEST_ZERO;
+     * both set Z from T == 0 and both occupy one slot, which is what lets the
+     * comparison be written back over them without moving anything. */
+    if (uq->op == TCCIR_OP_TEST_ZERO)
+    {
+      if (irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) != sv)
+        return 0;
+    }
+    else if (uq->op == TCCIR_OP_CMP)
+    {
+      IROperand a = tcc_ir_op_get_src1(ir, uq);
+      IROperand b = tcc_ir_op_get_src2(ir, uq);
+      if (irop_get_vreg(a) != sv || !irop_is_plain_imm(b) || irop_get_imm64_ex(ir, b) != 0)
+        return 0;
+    }
+    else
+      return 0;
+
+    int ji = ir_skip_nops_forward(ir, u + 1, n);
+    if (ji >= n)
+      return 0;
+    IRQuadCompact *jq = &ir->compact_instructions[ji];
+    if (jq->op != TCCIR_OP_JUMPIF)
+      return 0;
+    for (int j = u + 1; j <= ji; j++)
+      if (ir->compact_instructions[j].is_jump_target)
+        return 0;
+
+    int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jq));
+    int nt;
+    if (jt == 0x94)
+      nt = inv_tok;
+    else if (jt == 0x95)
+      nt = setif_tok;
+    else
+      return 0;
+    if (nt < 0)
+      return 0;
+
+    use_idx[nuses] = u;
+    jmp_idx[nuses] = ji;
+    new_tok[nuses] = nt;
+    nuses++;
+  }
+  if (nuses == 0)
+    return 0;
+
+  /* TEST_ZERO owns ONE operand slot and CMP needs two, so the comparison
+   * cannot be written over it in place -- the src2 write would land in the
+   * next instruction's operands.  Take fresh slots at the pool tail and
+   * re-point operand_base, and take them all BEFORE mutating anything so a
+   * pool that will not grow leaves the IR untouched. */
+  int new_base[REMAT_MAX_USES];
+  for (int u = 0; u < nuses; u++)
+  {
+    tcc_ir_pool_ensure(ir, 2);
+    if (ir->iroperand_pool_count + 2 > ir->iroperand_pool_capacity)
+      return 0;
+    new_base[u] = ir->iroperand_pool_count;
+    tcc_ir_pool_add(ir, src1);
+    tcc_ir_pool_add(ir, src2);
+  }
+
+  for (int u = 0; u < nuses; u++)
+  {
+    IRQuadCompact *uq = &ir->compact_instructions[use_idx[u]];
+    IROperand jcond = tcc_ir_op_get_src1(ir, &ir->compact_instructions[jmp_idx[u]]);
+    uq->op = TCCIR_OP_CMP;
+    uq->operand_base = new_base[u];
+    tcc_ir_set_src1(ir, jmp_idx[u], irop_make_imm32(-1, new_tok[u], irop_get_btype(jcond)));
+  }
+  setif_q->op = TCCIR_OP_NOP;
+#undef REMAT_MAX_USES
+  return 1;
+}
+
 /* (SETIF cond -> T); U <- T XOR #1  ->  U <- SETIF !cond, when T is single-use
  * and only NOPs separate the two (the CMP's flags are still current at the XOR
  * position).  A SETIF result is 0/1, so XOR #1 is boolean NOT.  Feeds the
@@ -448,6 +643,7 @@ const IROptGen branch_gens[] = {
     {TCCIR_OP_CMP, opt_dsl_dispatch_bool_call_norm_flat, "bool_call_norm", 0},
     {TCCIR_OP_XOR, opt_dsl_dispatch_setif_xor_invert_flat, "setif_xor_invert", 0},
     {TCCIR_OP_CMP, opt_dsl_dispatch_setif_branch_fuse_flat, "setif_branch_fuse", 0},
+    {TCCIR_OP_CMP, opt_dsl_dispatch_setif_branch_remat_flat, "setif_branch_remat", 0},
     {TCCIR_OP_CMP, opt_dsl_dispatch_branch_fold_cmp_flat, "branch_fold_cmp", 0},
     {TCCIR_OP_TEST_ZERO, opt_dsl_dispatch_branch_fold_test_zero_flat, "branch_fold_test_zero", 0},
 };

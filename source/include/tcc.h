@@ -585,6 +585,11 @@ struct FuncAttr
       func_rewritten_extern_inline : 1, /* extern inline rewritten to non-extern inline-only def */
       func_outofline_needed : 1,        /* always_inline call could not stay call-site-only */
       func_auto_inline : 1,             /* compiler-selected auto-inline candidate (small func) */
+      func_deferred_inline : 1,         /* auto-inline candidate that was NOT compiled at definition time:
+                                           a `static inline` whose body gen_inline_functions still owes the
+                                           TU.  Emit it there iff some call site fell back to a real call
+                                           (sym->c set); without this bit that emission is skipped and a
+                                           declined call site links against nothing. */
       func_inline_call_heavy : 1,       /* auto-inline body keeps a non-foldable call: budget-limit expansions */
       func_eval_only_inline : 1,        /* body saved for const-fold only, not regular inlining */
       func_const_arg_loop : 1,          /* post-opt body is a register-only loop: keep tokens so an
@@ -1527,6 +1532,11 @@ struct TCCState
   uint8_t in_inline_expansion; /* nonzero while expanding inline body */
   uint8_t inline_expansion_depth; /* nested expansion depth, capped to bound work */
   int inline_return_loc;       /* stack offset for storing return value */
+  int inline_return_vr;        /* vreg bound to that slot for scalar returns,
+                                * -1 when the return goes through memory only.
+                                * Bound like a compiler-generated local so the
+                                * allocator can keep the inlined return value in
+                                * a register instead of a frame round trip. */
   uint8_t inline_return_redirected; /* a struct `return <local>;` already
                                      * retargeted inline_return_loc; any later
                                      * return in the same body must COPY into
@@ -2299,6 +2309,10 @@ ST_FUNC void vrott(int n);
 ST_FUNC void vrotb(int n);
 ST_FUNC void vrev(int n);
 ST_FUNC void vpop(void);
+/* Force the read of a volatile lvalue whose value is about to be discarded
+ * (`*p;`, a comma operand, a for-loop increment).  vpop alone drops the lvalue
+ * without ever loading it, which silently deletes the read-to-clear idiom. */
+ST_FUNC void gv_discarded_volatile(void);
 #if PTR_SIZE == 4
 ST_FUNC void lexpand(void);
 #endif
@@ -2732,8 +2746,13 @@ ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert)
 
 ST_FUNC void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
                                                  TccIrOp op, uint32_t barrel_shift);
+/* `barrel_shift` carries the same annotation word as tcc_gen_machine_data_processing_mop:
+ * bits 0-15 the barrel shift, 16-17 shift64_dead_half, 18-23 zero_half64.  Every
+ * dispatch site must pass it -- zero_half64's producer analysis assumes the
+ * emitter can see its verdict, and a site that drops it makes codegen read a
+ * register nothing wrote. */
 ST_FUNC void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOperand src2, MachineOperand dest,
-                                                       TccIrOp op);
+                                                       TccIrOp op, uint32_t barrel_shift);
 ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand src2);
 /* SUBS+IT peephole helper: emits `SUBS dest, src1, src2; IT NE; MOVNE dest, #1`
  * collapsing a CMP+SELECT(1,0,NE) / SELECT(0,1,EQ) pair into 3 instructions.
@@ -2750,6 +2769,9 @@ ST_FUNC void tcc_gen_machine_bitop1_mop(MachineOperand src1, MachineOperand dest
  * decide between the native opcode and the libgcc helper call. */
 ST_FUNC int tcc_machine_has_bit_ops(void);
 ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
+/* Same, plus zero_half64's verdict in `zh` (bits 4-5: which halves of a 64-bit
+ * destination no consumer reads and so need not be written). */
+ST_FUNC void tcc_gen_machine_assign_mop_ex(MachineOperand src, MachineOperand dest, TccIrOp op, uint32_t zh);
 ST_FUNC void tcc_gen_machine_pack64_mop(MachineOperand src_lo, MachineOperand src_hi, MachineOperand dest);
 ST_FUNC void tcc_gen_machine_setif_mop(MachineOperand src, MachineOperand dest, TccIrOp op);
 ST_FUNC void tcc_gen_machine_bool_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op);
@@ -2859,6 +2881,7 @@ ST_FUNC void tcc_gen_machine_mov_coalesce_reset(void);
 ST_FUNC void tcc_gen_machine_mov_equiv_reset(void);
 ST_FUNC void tcc_gen_machine_reserve_pool_bytes(int upcoming_bytes);
 ST_FUNC void tcc_gen_machine_strldr_cache_reset(void);
+ST_FUNC void tcc_gen_machine_strldr_cache_set_enabled(int enabled);
 ST_FUNC void tcc_gen_machine_imm_cache_reset(void);
 ST_FUNC void tcc_gen_machine_imm_cache_invalidate_live(uint32_t live_mask);
 

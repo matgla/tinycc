@@ -26,6 +26,7 @@ $(OPT_PIPELINE_OBJ): \
 # utilities, pre-SSA analyses, and the pass engine/pipeline driver.
 CORE_OPT_SRC = \
 	source/opt/util/pass_disable.c \
+	source/opt/util/volatile_access.c \
 	source/opt/util/const_eval.c \
 	source/opt/util/const_string_eval.c \
 	source/opt/util/cond_util.c \

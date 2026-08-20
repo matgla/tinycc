@@ -622,6 +622,14 @@ typedef struct TCCIRState
    * global (which the standalone unit-test link does not provide). */
   int func_has_label_addr;
 
+  /* Set the first time IR generation builds a VOLATILE lvalue operand for this
+   * function.  Clear means the body performs no volatile access at all, which
+   * lets every CSE/DSE/forwarding pass skip its per-operand volatility check —
+   * and, more importantly, keeps them from being blinded by an operand a pass
+   * synthesized without the (proven-non-volatile) mark.  See
+   * tcc_ir_access_is_volatile below and IROP_AUX_NONVOLATILE. */
+  int func_has_volatile_access;
+
   LSLiveIntervalState ls;
 
   /* Extra scratch allocation flags to apply during materialization for the current IR instruction. */
@@ -655,6 +663,14 @@ typedef struct TCCIRState
   uint8_t *shift64_dead_half;
   int shift64_dead_half_len;
 
+  /* Known-zero / dead 64-bit halves, keyed by orig_index.  Populated just
+   * before codegen by tcc_ir_opt_zero_half64, freed after.  bits 0-3 say which
+   * halves of src1/src2 are provably the constant zero; bits 4-5 say which
+   * halves of the destination no consumer reads and therefore need not be
+   * written.  See source/opt/flat/fusion/zero_half64.c. */
+  uint8_t *zero_half64;
+  int zero_half64_len;
+
   /* BFI insert parameters, keyed by orig_index.  Populated by
    * tcc_ir_opt_bitfield_insert_to_bfi just before codegen, freed after.
    * Entry = lsb (bits 0-7) | (width << 8); width >= 1 so a real BFI entry is
@@ -681,6 +697,23 @@ typedef struct TCCIRState
   uint16_t *codegen_dry_pool_entries;
   uint8_t *codegen_branch_target_reset;
 } TCCIRState;
+
+/* Volatility queries for the optimizer, in the two shapes memory ops come in:
+ * `op` is the deref (lvalue) operand of a LOAD/STORE, or the BASE operand of a
+ * LOAD_INDEXED/STORE_INDEXED (the fusion passes transfer the mark onto it, see
+ * irop_carry_access_marks).  A pass that removes, reuses or reorders a memory
+ * access must ask THIS, not the accessed Sym's type: a Sym cannot express
+ * `volatile int a[4]` (the qualifier is on the element type), a volatile member
+ * of a plain struct, a `(volatile T *)` cast, or a bare `T***DEREF***`.
+ *
+ * The function-level flag comes first so that a body with no volatile access at
+ * all — nearly all of them — answers "not volatile" for every operand, including
+ * the ones passes synthesize without a mark.  Only inside a function that really
+ * does touch volatile memory does the conservative per-operand default bite. */
+static inline int tcc_ir_access_is_volatile(const TCCIRState *ir, IROperand op)
+{
+  return ir->func_has_volatile_access && irop_access_is_volatile(op);
+}
 
 /* IR invariant scanners, called after every pass of every function from the
  * pipeline driver and from ~25 hand-placed probes.  SCAN_OVERLAP is O(n^2) over
@@ -832,6 +865,15 @@ IROperand tcc_ir_get_dest(const TCCIRState *ir, int index);
 uint8_t tcc_ir_barrel_shift_at(const TCCIRState *ir, const IRQuadCompact *q);
 
 uint8_t tcc_ir_shift64_dead_half_at(const TCCIRState *ir, const IRQuadCompact *q);
+
+uint8_t tcc_ir_zero_half64_at(const TCCIRState *ir, const IRQuadCompact *q);
+
+/* UBFX/SBFX parameter word: lsb in bits 0-4, width in bits 5-9.  Bit 12 says
+ * the field lives in the HIGH word of a 64-bit src1 -- `(v64 >> 52) & 0x7FF`
+ * and friends, where the lsb stays 0..31 so every reader of the width and the
+ * value range keeps working unchanged.  See
+ * source/opt/flat/fusion/shift64_extract_ubfx.c. */
+#define UBFX_HI_HALF 0x1000
 
 uint16_t tcc_ir_bfi_params_at(const TCCIRState *ir, const IRQuadCompact *q);
 

@@ -906,6 +906,14 @@ static int ssa_cmp_values_expr_equal(IRSSAOptCtx *ctx, IRBasicBlock *cmp_bb,
       irop_get_btype(src2) == IROP_BTYPE_FLOAT32 || irop_get_btype(src2) == IROP_BTYPE_FLOAT64)
     return 0;
 
+  /* Proving the two sides equal does not remove the reads they are made of: a
+   * volatile access is mandated however decidable the comparison is.
+   * ssa_deref_sym_foldable below sees only the symbol's own type, which is not
+   * volatile when just a member of it is. */
+  if (cmp_idx >= 0 && cmp_idx < ir->next_instruction_index &&
+      tcc_ir_instr_access_is_volatile(ir, &ir->compact_instructions[cmp_idx]))
+    return 0;
+
   /* R1/R2/R3 symref identity is matched on the resolved (sym, addend, deref)
    * triple, which already distinguishes a deref from an address — so it does
    * not need the operand is_lval to match (a VAR slot holding an address is

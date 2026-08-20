@@ -1727,6 +1727,347 @@ static int ra_safe_exit_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterv
  * site: add the condition HERE FIRST when adding one there.  Inline asm does
  * not force a frame pointer, but its text can name r7 outright, which the
  * allocator cannot see — keep the register reserved in such functions. */
+/* ============================================================================
+ * Accurate per-vreg liveness, for the allocator's last-resort register share
+ *
+ * ra_build_intervals models every value as ONE contiguous [start,end] range.
+ * That is a strict over-approximation across a diamond: a value defined above
+ * an if/else and read only in ONE arm looks live in the other arm too, so the
+ * linear scan sees a false conflict and spills a value that could have had a
+ * register for free.  `__aeabi_dadd`'s alignment block is the shape: `exp_diff`
+ * is read in the `exp_diff > 0` arm and again in the `exp_diff < 0` arm, so its
+ * register looks busy in BOTH -- and the 64-bit temp defined there was written
+ * to the frame and read back at the very next instruction.
+ *
+ * This computes real liveness (backward dataflow over the CFG, the same
+ * def/use model the graph coalescer trusts, deferred PARAM sources included)
+ * and records, per vreg, every instruction index at which it is live-in or
+ * live-out.  ra_linear_scan consults it ONLY when it is about to spill: if an
+ * active interval is provably dead across the whole of the new interval's
+ * range, the two cannot conflict on any path and can share one register.
+ *
+ * Unknown answers are reported BUSY, so a failure to build (un-enumerated CFG
+ * edges, a vreg outside the table, an oversized function) can only cost a
+ * sharing opportunity, never create a clobber.
+ * ========================================================================== */
+typedef struct RaAliveInfo
+{
+  int valid;
+  int n;      /* instruction indices covered: [0, n) */
+  int tbl;    /* vreg slot table size */
+  int maxpos;
+  int words;  /* uint64 words per vreg row */
+  int ndense;
+  int *dense;     /* tbl entries: slot -> row index, or -1 */
+  uint64_t *rows; /* ndense rows of `words` words */
+} RaAliveInfo;
+
+#define RA_ALIVE_VIDX(info, vr) \
+  ((TCCIR_DECODE_VREG_TYPE(vr) * (info)->maxpos) + TCCIR_DECODE_VREG_POSITION(vr))
+
+/* Cap: a row per vreg over the whole instruction range.  Beyond this the
+ * bitmap is not worth the compile time or the memory, and the allocator just
+ * keeps its previous behaviour. */
+#define RA_ALIVE_MAX_WORDS (1 << 18) /* 2 MiB */
+
+/* Row of instruction indices at which `vreg` is live (live-in or live-out),
+ * or NULL when the answer is not known. */
+static const uint64_t *ra_alive_row(const RaAliveInfo *info, int32_t vreg)
+{
+  if (!info || !info->valid)
+    return NULL;
+  int vi = RA_ALIVE_VIDX(info, vreg);
+  if (vi < 0 || vi >= info->tbl)
+    return NULL;
+  int d = info->dense[vi];
+  if (d < 0)
+    return NULL;
+  return info->rows + (size_t)d * (size_t)info->words;
+}
+
+/* 1 if `vreg` may be live anywhere in [lo,hi].  Conservative: unknown -> 1.
+ *
+ * The range asked about is the NEW interval's [start,end] -- the window over
+ * which the allocator guarantees it the register -- and NOT its accurate live
+ * set.  Those differ: the interval over-approximates, and a donor live inside
+ * one of its holes has still had its value destroyed by the def at `start`.
+ * Testing the two live SETS against each other instead looks stronger and is
+ * wrong; it miscompiles bench_double.c's Mandelbrot kernel. */
+static int ra_alive_busy(const RaAliveInfo *info, int32_t vreg, uint32_t lo, uint32_t hi)
+{
+  const uint64_t *row = ra_alive_row(info, vreg);
+  if (!row)
+    return 1;
+  if (hi >= (uint32_t)info->n)
+    hi = (uint32_t)info->n - 1;
+  if (lo > hi)
+    return 1;
+  for (uint32_t k = lo; k <= hi; k++)
+  {
+    uint32_t w = k >> 6;
+    if ((k & 63) == 0 && row[w] == 0 && k + 63 <= hi)
+    {
+      k += 63;
+      continue;
+    }
+    if (row[w] & (1ull << (k & 63)))
+      return 1;
+  }
+  return 0;
+}
+
+static void ra_alive_free(RaAliveInfo *info)
+{
+  if (!info)
+    return;
+  tcc_free(info->dense);
+  tcc_free(info->rows);
+  memset(info, 0, sizeof *info);
+}
+
+/* Cheap pre-check so the dataflow is not built for a function that could never
+ * use it.  A graph-coalesced class is disqualifying by construction: the
+ * representative's register carries the whole class, which its own vreg's
+ * liveness does not describe.  The return-block share is per-interval and is
+ * handled at the donor (`reg_shared`) plus an interlock in the scan. */
+static int ra_alive_worth_building(TCCIRState *ir, const SSAInterval *intervals, int count)
+{
+  if (tcc_state->optimize < 1)
+    return 0;
+  if (tcc_ir_opt_pass_disabled("ra:alive_share"))
+    return 0;
+  for (int i = 0; i < count; i++)
+    if (intervals[i].coalesce_to >= 0 || intervals[i].co_member)
+      return 0;
+  /* A back-edge is disqualifying, and MEASURED so: with loops admitted
+   * double_add improves a further 1.9% and bench_double.c's Mandelbrot kernel
+   * MISCOMPILES.  A loop puts values on a register that no single vreg's
+   * liveness describes -- the loop-phi absorb is only the visible half -- so
+   * the donor filters are not sufficient there. */
+  const int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    if (t >= 0 && t <= i)
+      return 0;
+  }
+  return 1;
+}
+
+static void ra_alive_build(TCCIRState *ir, RaAliveInfo *info, int max_vreg_pos)
+{
+  memset(info, 0, sizeof *info);
+  const int n = ir->next_instruction_index;
+  if (n <= 0 || max_vreg_pos <= 0)
+    return;
+  if (tcc_state->optimize < 1)
+    return;
+  /* Un-enumerated edges make the dataflow unsound; same guard the coalescer
+   * and the scratch-liveness refinement use. */
+  for (int i = 0; i < n; i++)
+  {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD)
+      return;
+  }
+
+  IRCFG *cfg = tcc_ir_cfg_build(ir);
+  if (!cfg)
+    return;
+  tcc_ir_cfg_compute_rpo(cfg);
+  const int nb = cfg->num_blocks;
+  if (nb <= 0)
+  {
+    tcc_ir_cfg_free(cfg);
+    return;
+  }
+
+  const int maxpos = max_vreg_pos;
+  const int tbl = 4 * maxpos;
+  #define AVIDX(vr) ((TCCIR_DECODE_VREG_TYPE(vr) * maxpos) + TCCIR_DECODE_VREG_POSITION(vr))
+
+  int *dense = tcc_malloc(sizeof(int) * tbl);
+  for (int i = 0; i < tbl; i++)
+    dense[i] = -1;
+  int ndense = 0;
+  for (int i = 0; i < n; i++)
+  {
+    int32_t def = -1, hd = 0, uses[4], nu = 0;
+    ra_co_ops(ir, &ir->compact_instructions[i], &def, &hd, uses, &nu);
+    for (int k = 0; k < nu; k++)
+    {
+      if (!tcc_ir_vreg_is_valid(ir, uses[k])) continue;
+      int u = AVIDX(uses[k]);
+      if (u >= 0 && u < tbl && dense[u] < 0) dense[u] = ndense++;
+    }
+    if (hd && tcc_ir_vreg_is_valid(ir, def))
+    {
+      int d = AVIDX(def);
+      if (d >= 0 && d < tbl && dense[d] < 0) dense[d] = ndense++;
+    }
+  }
+  if (ndense == 0)
+  {
+    tcc_free(dense);
+    tcc_ir_cfg_free(cfg);
+    return;
+  }
+
+  const int words = (n + 63) / 64;
+  if ((size_t)ndense * (size_t)words > RA_ALIVE_MAX_WORDS)
+  {
+    tcc_free(dense);
+    tcc_ir_cfg_free(cfg);
+    return;
+  }
+
+  /* Deferred PARAM sources are read again at their CALL, after anything
+   * between the PARAM quad and the call; ra_build_intervals extends ends for
+   * exactly this, and the liveness has to model it or a share would clobber an
+   * argument already marshalled. */
+  int *call_param_head = tcc_malloc(sizeof(int) * n);
+  int *param_sibling = tcc_malloc(sizeof(int) * n);
+  for (int i = 0; i < n; i++) { call_param_head[i] = -1; param_sibling[i] = -1; }
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCPARAMVAL) continue;
+    IROperand s1 = tcc_ir_op_get_src1(ir, q);
+    if (!irop_has_vreg(s1) || irop_is_immediate(s1)) continue;
+    int cid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+    if (cid < 0) continue;
+    for (int j = i + 1; j < n; j++)
+    {
+      IRQuadCompact *qq = &ir->compact_instructions[j];
+      if (qq->op != TCCIR_OP_FUNCCALLVOID && qq->op != TCCIR_OP_FUNCCALLVAL) continue;
+      if (TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, qq))) == cid)
+      {
+        param_sibling[i] = call_param_head[j];
+        call_param_head[j] = i;
+        break;
+      }
+    }
+  }
+  #define AV_FOR_PARAM_USES(call_idx, vr_, body)                                    \
+    do {                                                                            \
+      for (int p_ = call_param_head[(call_idx)]; p_ >= 0; p_ = param_sibling[p_]) {  \
+        IROperand ps_ = tcc_ir_op_get_src1(ir, &ir->compact_instructions[p_]);       \
+        int32_t vr_ = irop_get_vreg(ps_);                                           \
+        if (!tcc_ir_vreg_is_valid(ir, vr_)) continue;                               \
+        body                                                                        \
+      }                                                                             \
+    } while (0)
+
+  const int bw = (ndense + 63) / 64;
+  uint64_t *use_b = tcc_mallocz(sizeof(uint64_t) * (size_t)nb * bw);
+  uint64_t *def_b = tcc_mallocz(sizeof(uint64_t) * (size_t)nb * bw);
+  uint64_t *in_b = tcc_mallocz(sizeof(uint64_t) * (size_t)nb * bw);
+  uint64_t *out_b = tcc_mallocz(sizeof(uint64_t) * (size_t)nb * bw);
+
+  for (int b = 0; b < nb; b++)
+  {
+    uint64_t *ub = use_b + (size_t)b * bw, *db = def_b + (size_t)b * bw;
+    int s = cfg->blocks[b].start_idx, e = cfg->blocks[b].end_idx;
+    for (int i = s; i < e && i < n; i++)
+    {
+      int32_t def = -1, hd = 0, uses[4], nu = 0;
+      ra_co_ops(ir, &ir->compact_instructions[i], &def, &hd, uses, &nu);
+      for (int k = 0; k < nu; k++)
+      {
+        if (!tcc_ir_vreg_is_valid(ir, uses[k])) continue;
+        int u = AVIDX(uses[k]); if (u < 0 || u >= tbl || dense[u] < 0) continue;
+        if (!tcc_bitspan_test(db, dense[u])) tcc_bitspan_set(ub, dense[u]);
+      }
+      AV_FOR_PARAM_USES(i, vr, {
+        int u = AVIDX(vr); if (u < 0 || u >= tbl || dense[u] < 0) continue;
+        if (!tcc_bitspan_test(db, dense[u])) tcc_bitspan_set(ub, dense[u]);
+      });
+      if (hd && tcc_ir_vreg_is_valid(ir, def))
+      {
+        int d = AVIDX(def); if (d >= 0 && d < tbl && dense[d] >= 0) tcc_bitspan_set(db, dense[d]);
+      }
+    }
+  }
+
+  int changed = 1, guard = 0;
+  while (changed && guard++ < nb + 4)
+  {
+    changed = 0;
+    for (int ri = cfg->rpo_count - 1; ri >= 0; ri--)
+    {
+      int b = cfg->rpo_order ? cfg->rpo_order[ri] : ri;
+      if (b < 0 || b >= nb) continue;
+      uint64_t *lo = out_b + (size_t)b * bw, *li = in_b + (size_t)b * bw;
+      uint64_t *ub = use_b + (size_t)b * bw, *db = def_b + (size_t)b * bw;
+      tcc_bitspan_zero(lo, bw);
+      for (int si = 0; si < cfg->blocks[b].num_succs; si++)
+      {
+        int sb = cfg->blocks[b].succs[si];
+        if (sb < 0 || sb >= nb) continue;
+        tcc_bitspan_or(lo, in_b + (size_t)sb * bw, bw);
+      }
+      changed |= tcc_bitspan_or_andnot(li, ub, lo, db, bw);
+    }
+  }
+
+  uint64_t *rows = tcc_mallocz(sizeof(uint64_t) * (size_t)ndense * words);
+  uint64_t *live = tcc_malloc(sizeof(uint64_t) * bw);
+  for (int b = 0; b < nb; b++)
+  {
+    int s = cfg->blocks[b].start_idx, e = cfg->blocks[b].end_idx;
+    tcc_bitspan_copy(live, out_b + (size_t)b * bw, bw);
+    for (int i = (e < n ? e : n) - 1; i >= s; i--)
+    {
+      /* Mark live-OUT of i, then live-IN of i: a vreg counted at either end
+       * must keep its register across i. */
+      tcc_bitspan_for_each_set(live, bw, ndense, di)
+      {
+        rows[(size_t)di * words + (i >> 6)] |= (1ull << (i & 63));
+      }
+      int32_t def = -1, hd = 0, uses[4], nu = 0;
+      ra_co_ops(ir, &ir->compact_instructions[i], &def, &hd, uses, &nu);
+      if (hd && tcc_ir_vreg_is_valid(ir, def))
+      {
+        int d = AVIDX(def);
+        if (d >= 0 && d < tbl && dense[d] >= 0) tcc_bitspan_reset(live, dense[d]);
+      }
+      for (int k = 0; k < nu; k++)
+      {
+        if (!tcc_ir_vreg_is_valid(ir, uses[k])) continue;
+        int u = AVIDX(uses[k]); if (u < 0 || u >= tbl || dense[u] < 0) continue;
+        tcc_bitspan_set(live, dense[u]);
+      }
+      AV_FOR_PARAM_USES(i, vr, {
+        int u = AVIDX(vr); if (u < 0 || u >= tbl || dense[u] < 0) continue;
+        tcc_bitspan_set(live, dense[u]);
+      });
+      tcc_bitspan_for_each_set(live, bw, ndense, di)
+      {
+        rows[(size_t)di * words + (i >> 6)] |= (1ull << (i & 63));
+      }
+    }
+  }
+
+  tcc_free(live);
+  tcc_free(use_b); tcc_free(def_b); tcc_free(in_b); tcc_free(out_b);
+  tcc_free(call_param_head); tcc_free(param_sibling);
+  tcc_ir_cfg_free(cfg);
+  #undef AV_FOR_PARAM_USES
+  #undef AVIDX
+
+  info->valid = 1;
+  info->n = n;
+  info->tbl = tbl;
+  info->maxpos = maxpos;
+  info->words = words;
+  info->ndense = ndense;
+  info->dense = dense;
+  info->rows = rows;
+}
+
 static int ra_may_need_frame_pointer(const TCCIRState *ir)
 {
   if (tcc_state->force_frame_pointer || tcc_state->force_lr_save)
@@ -1748,14 +2089,70 @@ static int ra_may_need_frame_pointer(const TCCIRState *ir)
   return 0;
 }
 
+/* Can physical register `r` be handed to `cur` even though an active interval
+ * still owns it?  Yes exactly when EVERY active interval holding it is provably
+ * dead across the whole of cur's range: then no execution reads that register's
+ * old value from inside the range, and on the paths where the old value IS read
+ * later, cur was never defined and never wrote it.
+ *
+ * Every donor property that would make its vreg's own liveness an incomplete
+ * description of what the register holds -- a coalesced class, a loop-phi
+ * absorb, a return-block share, an address-taken home -- disqualifies it. */
+static int ra_alive_reg_shareable(const RaAliveInfo *alive, SSAInterval *cur,
+                                  SSAInterval **active, int active_count, int r,
+                                  const RegAllocTarget *target)
+{
+  if (!alive || !alive->valid)
+    return 0;
+  if (r < 0 || r >= tcc_state->registers_for_allocator)
+    return 0;
+  if (cur->crosses_call)
+  {
+    int ok = 0;
+    for (int ci = 0; ci < target->int_class.num_callee_saved; ci++)
+      if (target->int_class.callee_saved[ci] == r) { ok = 1; break; }
+    if (!ok)
+      return 0;
+  }
+  int holders = 0;
+  for (int j = 0; j < active_count; j++)
+  {
+    SSAInterval *a = active[j];
+    if (a == cur || a->stack_location != 0)
+      continue;
+    if (a->r0 != r && a->r1 != r)
+      continue;
+    holders++;
+    if (a->precolored >= 0 || a->co_member || a->loop_phi_locked || a->reg_shared || a->addrtaken)
+      return 0;
+    if (a->reg_type == LS_REG_TYPE_FLOAT || a->reg_type == LS_REG_TYPE_DOUBLE)
+      return 0;
+    if (ra_alive_busy(alive, (int32_t)a->vreg, cur->start, cur->end))
+      return 0;
+  }
+  return holders > 0;
+}
+
 static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                            const RegAllocTarget *target, int spill_base,
                            uint64_t *out_dirty_int, uint64_t *out_dirty_fp,
-                           int max_vreg_pos, int has_call)
+                           int max_vreg_pos, int has_call, const RaAliveInfo *alive)
 {
   if (count <= 0) return;
 
   qsort(intervals, count, sizeof(SSAInterval), sort_by_start);
+
+  /* Accurate-liveness register sharing; ra_alive_worth_building did the
+   * gating, and a failed build leaves `valid` clear.
+   *
+   * The return-block share below (`reg_shared`) is the one other mechanism
+   * that puts a second owner on a register, and it leaves that owner OUT of
+   * `active` -- so neither mechanism can see the other's extra holder.  The
+   * two are interlocked: whichever fires first in a function locks the other
+   * out for the rest of it. */
+  int share_ok = (alive && alive->valid);
+  int alive_shared_used = 0;
+  int reg_shared_used = 0;
 
   /* Build vreg -> interval lookup for phi hint resolution */
   int hint_tbl_size = (max_vreg_pos > 0) ? 4 * max_vreg_pos : 1;
@@ -2186,6 +2583,95 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
         cur->r1 = r1;
         active[active_count++] = cur;
       } else {
+        /* Boundary reuse for 64-bit pairs.
+         *
+         * An interval whose end == cur->start is read (at the latest) by the
+         * very instruction that defines cur, so its pair is free the moment
+         * that instruction retires.  The strict `<` expiration above still
+         * counts it as active, which is why the pair paths saw 0-1 free
+         * registers and spilled temps that live for a single instruction.
+         * Handing cur exactly that pair makes dest == that source, and the
+         * dest-equals-source case is safe for the ops below:
+         *
+         *   ADD/SUB/AND/OR/XOR : thumb_emit_data_processing_mop64 writes the
+         *     low half then reads the high half, so an EXACT pair match is
+         *     fine (partial overlap is not — we never create one, since we
+         *     take both registers of one interval).
+         *   SHL/SHR/SAR        : thumb_emit_shift64_mop is already alias
+         *     aware (it computes the cross-shift into a temp first and
+         *     reorders the halves when dst aliases src).
+         *   ASSIGN             : a copy onto itself; both movs become
+         *     mov rX, rX and are elided.
+         *
+         * MUL/UMULL/MLA are excluded: UMULL requires its destination pair not
+         * to overlap the sources at all.  Calls are excluded because the
+         * result lands in fixed registers.  This is the pair analogue of the
+         * single-INT phi-hint boundary case further below, whose comment
+         * blanket-excluded pairs; the shift emitter turned out to be safe. */
+        int def_op = (cur->start < ir->next_instruction_index)
+                         ? ir->compact_instructions[cur->start].op : -1;
+        int op_ok = (def_op == TCCIR_OP_ADD || def_op == TCCIR_OP_SUB || def_op == TCCIR_OP_AND ||
+                     def_op == TCCIR_OP_OR || def_op == TCCIR_OP_XOR || def_op == TCCIR_OP_SHL ||
+                     def_op == TCCIR_OP_SHR || def_op == TCCIR_OP_SAR || def_op == TCCIR_OP_ASSIGN);
+        int reused = 0;
+        if (op_ok && cur->reg_type == LS_REG_TYPE_LLONG) {
+          for (int k = 0; k < active_count; k++) {
+            SSAInterval *p = active[k];
+            if (p->end != cur->start || p->r0 < 0 || p->r1 < 0 || p->stack_location != 0)
+              continue;
+            if (p->co_member || cur->co_member || p->loop_phi_locked)
+              continue;
+            if (p->r0 >= tcc_state->registers_for_allocator ||
+                p->r1 >= tcc_state->registers_for_allocator)
+              continue;
+            if (cur->crosses_call) {
+              int c0 = 0, c1 = 0;
+              for (int ci = 0; ci < target->int_class.num_callee_saved; ci++) {
+                if (target->int_class.callee_saved[ci] == p->r0) c0 = 1;
+                if (target->int_class.callee_saved[ci] == p->r1) c1 = 1;
+              }
+              if (!c0 || !c1)
+                continue;
+            }
+            cur->r0 = p->r0;
+            cur->r1 = p->r1;
+            ir->ls.dirty_registers |= (1ull << p->r0) | (1ull << p->r1);
+            active[k] = active[--active_count];
+            active[active_count++] = cur;
+            reused = 1;
+            break;
+          }
+        }
+        if (reused)
+          continue;
+
+        /* Share two registers whose current owners are dead across cur's whole
+         * range, rather than writing a 64-bit temp to the frame and reading it
+         * straight back. */
+        if (share_ok && !reg_shared_used)
+        {
+          int p0 = -1, p1 = -1;
+          for (int r = 0; r < 13 && p1 < 0; r++)
+          {
+            if (int_free & (1ull << r))
+              continue; /* a free register would have been taken above */
+            if (!ra_alive_reg_shareable(alive, cur, active, active_count, r, target))
+              continue;
+            if (p0 < 0) p0 = r; else p1 = r;
+          }
+          if (p1 >= 0)
+          {
+            dirty_int |= ((1ull << p0) | (1ull << p1));
+            cur->r0 = p0;
+            cur->r1 = p1;
+            alive_shared_used = 1;
+            active[active_count++] = cur;
+            RA_DBG("  alive_share pair T%d [%u,%u] -> R%d:R%d",
+                   TCCIR_DECODE_VREG_POSITION(cur->vreg), cur->start, cur->end, p0, p1);
+            continue;
+          }
+        }
+
         spill_loc -= 8;
         cur->stack_location = spill_loc;
       }
@@ -2373,7 +2859,7 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
            * partner's live range emit their own reads of hr unaffected —
            * those paths never execute cur's def, so partner's value
            * remains intact in hr along them. */
-          if (reg < 0 && cur->end > cur->start &&
+          if (reg < 0 && !alive_shared_used && cur->end > cur->start &&
               (int)cur->end < ir->next_instruction_index) {
             IRQuadCompact *eq = &ir->compact_instructions[cur->end];
             if (eq->op == TCCIR_OP_RETURNVALUE || eq->op == TCCIR_OP_RETURNVOID) {
@@ -2397,6 +2883,7 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                 if (!conflict) {
                   cur->r0 = hr;
                   cur->reg_shared = 1;
+                  reg_shared_used = 1;
                   dirty_int |= (1ull << hr);
                   reg = hr;
                   break;
@@ -2477,6 +2964,27 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
       cur->r0 = reg;
       active[active_count++] = cur;
     } else {
+      /* Before spilling, look for a register whose current owner is provably
+       * dead across cur's whole range: sharing it costs nothing, where a spill
+       * costs a store plus a reload at every use. */
+      if (share_ok && !reg_shared_used) {
+        int sh = -1;
+        for (int r = 0; r < 13; r++) {
+          if (int_free & (1ull << r)) continue; /* a free one was taken above */
+          if (!ra_alive_reg_shareable(alive, cur, active, active_count, r, target)) continue;
+          sh = r;
+          break;
+        }
+        if (sh >= 0) {
+          dirty_int |= (1ull << sh);
+          cur->r0 = sh;
+          alive_shared_used = 1;
+          active[active_count++] = cur;
+          RA_DBG("  alive_share T%d [%u,%u] -> R%d",
+                 TCCIR_DECODE_VREG_POSITION(cur->vreg), cur->start, cur->end, sh);
+          continue;
+        }
+      }
       /* Spill: among intervals that extend past cur, evict the one
        * with the lowest spill cost (fewest loop-weighted uses).
        * use_count is already weighted by loop depth (4^depth per use),
@@ -4939,6 +5447,11 @@ static int ra_cfg_cleanup(TCCIRState *ir)
     int ch = 0;
     for (int i = 0; i < 8; i++) {
       int c = tcc_ir_opt_jump_threading(ir);
+      /* Inside the cascade, not beside it: retargeting the constant arm's edge
+       * turns the true arm's trailing JUMP into a fall-through and orphans the
+       * merge label, and only eliminate_fallthrough + dce below can collect
+       * that -- which is what exposes `T <-- (cond)` to setif fusion. */
+      c += tcc_ir_opt_bool_diamond_branch(ir);
       c += tcc_ir_opt_eliminate_fallthrough(ir);
       c += tcc_ir_opt_jumpif_invert(ir, 0);
       if (c)
@@ -5038,6 +5551,14 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * TCC_DISABLE_PASS=ssa:loop_rotate. */
   RA_FLAT_PASS(ra_ch, "ssa:loop_rotate", tcc_state->optimize >= 1,
                ssa_opt_loop_rotate(ir));
+
+  /* ssa:licm ran BEFORE rotation and so saw the un-rotated header/latch/body
+   * shape, whose preheader is not the header's immediate predecessor — the
+   * invariant-global-load hoist's insertion safety demands exactly that, so it
+   * declined every ordinary `for` loop.  Rotation provides the shape; give the
+   * hoist a second chance on it. */
+  RA_FLAT_PASS(ra_ch, "ssa:licm_global_load", tcc_state->opt_licm,
+               ssa_opt_licm_global_load(ir));
 
   /* Zero-trip guard elimination (ssa:loop_guard_elim): drop the pre-loop
    * `CMP iv,#lim / JUMPIF` that rotation leaves in front of a bottom-tested
@@ -5485,12 +6006,24 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * docs/plans/gap_a_ssa_var_index_addr_prop.md (gap ②). */
   if (tcc_state && tcc_state->optimize >= 2) {
     int addr_changes = 0;
+    /* Before the address hoists, so it matches operands the frontend built
+     * (which carry IROP_AUX_NONVOLATILE) rather than bases synthesized by a
+     * pass.  Here rather than in the flat pipeline because the two reads it
+     * collapses only name the same address temp once GVN has run — see the
+     * header of source/opt/flat/memory/deref_operand_cse.c. */
+    addr_changes += tcc_ir_opt_deref_operand_cse(ir);
     if (!tcc_ir_opt_pass_disabled("ssa:global_addr_hoist"))
       addr_changes += tcc_ir_ssa_opt_global_addr_hoist(ir);
     if (!tcc_ir_opt_pass_disabled("ssa:loop_addr_hoist"))
       addr_changes += tcc_ir_ssa_opt_loop_addr_hoist(ir);
     if (!tcc_ir_opt_pass_disabled("ssa:local_addr_cse"))
       addr_changes += tcc_ir_ssa_opt_local_addr_cse(ir);
+    /* Same reason these three run here: an indexed access's STACKOFF base is a
+     * DIRECT frame reference that slot-based alias analysis reads precisely, so
+     * parking it in a register may only happen once every alias-sensitive pass
+     * is done (early it miscompiles gcc.c-torture pr51466). */
+    if (!tcc_ir_opt_pass_disabled("ssa:stackoff_indexed_base_cse"))
+      addr_changes += tcc_ir_opt_stackoff_indexed_base_cse(ir);
     if (addr_changes > 0) {
       tcc_ir_cfg_free(cfg);
       cfg = tcc_ir_cfg_build(ir);
@@ -5541,8 +6074,13 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   uint64_t dirty_int = 0, dirty_fp = 0;
   int n_instr = ir->next_instruction_index;
   int has_call = call_prefix && n_instr > 0 && call_prefix[n_instr] > 0;
+  RaAliveInfo alive;
+  memset(&alive, 0, sizeof alive);
+  if (ra_alive_worth_building(ir, intervals, interval_count))
+    ra_alive_build(ir, &alive, max_vreg_pos);
   ra_linear_scan(ir, intervals, interval_count, target, spill_base, &dirty_int, &dirty_fp,
-                 max_vreg_pos, has_call);
+                 max_vreg_pos, has_call, &alive);
+  ra_alive_free(&alive);
   tcc_pass_timing_end(&ra2_pt, -1);
   tcc_pass_timing_begin(&ra2_pt, "ra2:finish");
 
@@ -5614,6 +6152,828 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
 }
 
 /* ============================================================================
+ * Post-Allocation Redundant Reload Elimination
+ *
+ * Every soft-float routine opens by punning its arguments through a union:
+ *
+ *   StackLoc[-8] <-- R0(P0) [STORE]     ; ua.d = a
+ *   R0(V0)      <-- StackLoc[-8] [LOAD] ; a_bits = ua.u
+ *
+ * which lowers to `strd r0,r1,[sp,#N]` immediately followed by
+ * `ldrd r0,r1,[sp,#N]` -- a reload of registers that already hold the value.
+ * sl_forward refuses to forward it because the two ends have different types
+ * (FLOAT64 -> INT64), and forwarding it BEFORE allocation was measured and
+ * reverted: keeping the punned value in a register stretched a 64-bit live
+ * range and the linear-scan allocator cascaded into spills (dadd +13.4%).
+ *
+ * After allocation that trade no longer exists.  The registers are already
+ * chosen, so dropping a load that rewrites a register with the value it
+ * already holds cannot lengthen anything -- it only removes a memory access.
+ *
+ * The analysis is a straight-line available-value table: remember which
+ * register pair was last stored to each frame slot, drop a later load of that
+ * slot into exactly those registers, and invalidate on anything that could
+ * disturb either side.
+ * ==========================================================================*/
+
+/* An allocation half carries its physical register in the low five bits and a
+ * spill flag at 0x20, but an UNALLOCATED half is the all-ones sentinel -- and
+ * that sentinel has the spill bit set.  So "is this half spilled" is only a
+ * question once the half names a register; asked unconditionally it answers
+ * yes for the absent high half of every 32-bit value.  Codegen already reads
+ * it this way (ir/codegen.c takes pr1_reg and pr1_spilled apart separately).
+ */
+static int ra_alloc_half_unset(uint16_t half)
+{
+  return (half & PREG_REG_NONE) == PREG_REG_NONE;
+}
+
+static int ra_alloc_half_spilled(uint16_t half)
+{
+  return !ra_alloc_half_unset(half) && (half & PREG_SPILLED) != 0;
+}
+
+/* A direct frame slot: `StackLoc[off]` as a memory operand (an `Addr[...]`
+ * form has is_lval clear and is an address, not a location). */
+static int ra_rl_slot_offset(IROperand op, int *off)
+{
+  if (op.tag != IROP_TAG_STACKOFF || op.is_llocal || op.is_sym)
+    return 0;
+  if (irop_get_vreg(op) != -1 || !op.is_lval)
+    return 0;
+  *off = (int)irop_get_stack_offset(op);
+  return 1;
+}
+
+/* Physical registers behind a plain register operand, as codegen resolves it. */
+static int ra_rl_operand_regs(TCCIRState *ir, IROperand op, int *r0, int *r1)
+{
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || !tcc_ir_vreg_is_valid(ir, vr))
+    return 0;
+  IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, vr);
+  if (!li || li->allocation.offset != 0)
+    return 0;
+  if (ra_alloc_half_spilled(li->allocation.r0) || ra_alloc_half_spilled(li->allocation.r1))
+    return 0;
+  int a0 = li->allocation.r0 & PREG_REG_NONE;
+  int a1 = li->allocation.r1 & PREG_REG_NONE;
+  if (a0 == PREG_REG_NONE)
+    return 0;
+  *r0 = a0;
+  *r1 = (a1 == PREG_REG_NONE) ? -1 : a1;
+  return 1;
+}
+
+/* Bytes an access moves when the register ends up holding EXACTLY the slot's
+ * contents.  A sub-word access does not: `strb r2,[sp,#N]` writes only r2's
+ * low byte and `ldrb r2,[sp,#N]` brings it back zero-extended, so neither end
+ * of such a pair may be matched against the other or against a word access.
+ * FLOAT64/INT64 (and FLOAT32/INT32) share a width because a 64-bit soft-float
+ * value lives in the same GPR pair as the integer it was punned from -- that
+ * equivalence is the whole point of the pass. */
+static int ra_rl_exact_width(int btype)
+{
+  switch (btype)
+  {
+  case IROP_BTYPE_INT32:
+  case IROP_BTYPE_FLOAT32:
+    return 4;
+  case IROP_BTYPE_INT64:
+  case IROP_BTYPE_FLOAT64:
+    return 8;
+  default:
+    return 0;
+  }
+}
+
+typedef struct RARelSlot
+{
+  int off;      /* frame offset of the slot */
+  int size;     /* bytes the access covered (4 or 8; exact, see above) */
+  int r0, r1;   /* registers whose value it holds (r1 < 0 when 32-bit) */
+  int def_idx;  /* the store that put it there */
+  int valid;
+} RARelSlot;
+
+#define RA_REL_MAX_TRACKED 16
+
+/* Keep `regs` occupied over [lo,hi] so the encoder cannot hand them out.
+ *
+ * A register outside every live interval holds nothing the allocator is
+ * accounting for, and the encoder helps itself to exactly those whenever it
+ * has to materialise an operand: `R0 <- StackLoc[-12] ADD StackLoc[-36]` is
+ * three instructions, two of them loads of the operands into whatever happens
+ * to be free.  Neither load exists at IR level, so nothing in this pass sees
+ * them -- it would go on believing a slot's value is in a register the
+ * encoder had already reused (nested_struct_return printed dx + dy where it
+ * meant p.y + dy).
+ *
+ * Refusing whenever the register is dead somewhere in between is correct but
+ * throws away most of what this pass is for.  Reserving it instead makes the
+ * assumption true: both scratch pickers -- tcc_ls_find_free_scratch_reg and
+ * scratch_pushed_dead_reg -- union live_regs_by_instruction[] into what they
+ * consider taken, and codegen has not run yet.  Nothing else owns the
+ * register over this window, or it would have been live and there would be
+ * nothing to reserve. */
+static void ra_rl_reserve_regs(LSLiveIntervalState *ls, int r0, int r1, int lo, int hi)
+{
+  if (!ls->live_regs_by_instruction)
+    return;
+  for (int k = lo; k <= hi && k < ls->live_regs_by_instruction_size; ++k)
+  {
+    if (k < 0)
+      continue;
+    if (r0 >= 0)
+      ls->live_regs_by_instruction[k] |= (1u << r0);
+    if (r1 >= 0)
+      ls->live_regs_by_instruction[k] |= (1u << r1);
+  }
+}
+
+static int ra_redundant_reload_elim(TCCIRState *ir)
+{
+  LSLiveIntervalState *ls = &ir->ls;
+  const int n = ir->next_instruction_index;
+  int removed = 0;
+
+  if (tcc_state->optimize < 1)
+    return 0;
+  if (tcc_ir_opt_pass_disabled("ra:reload_elim"))
+    return 0;
+
+  /* A slot whose address is taken anywhere can be written through that
+   * pointer, so it is never tracked. */
+  int escaped[RA_REL_MAX_TRACKED];
+  int nescaped = 0;
+  int escape_overflow = 0;
+  for (int i = 0; i < n; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    for (int k = 0; k < 4; ++k)
+    {
+      IROperand op = (k == 0)   ? (irop_config[q->op].has_dest ? tcc_ir_op_get_dest(ir, q) : IROP_NONE)
+                     : (k == 1) ? (irop_config[q->op].has_src1 ? tcc_ir_op_get_src1(ir, q) : IROP_NONE)
+                     : (k == 2) ? (irop_config[q->op].has_src2 ? tcc_ir_op_get_src2(ir, q) : IROP_NONE)
+                                : (q->op == TCCIR_OP_MLA ? tcc_ir_op_get_accum(ir, q) : IROP_NONE);
+      if (op.tag != IROP_TAG_STACKOFF || op.is_llocal || op.is_lval)
+        continue;
+      if (irop_get_vreg(op) != -1)
+        continue;
+      int off = (int)irop_get_stack_offset(op); /* Addr[StackLoc[off]] */
+      if (nescaped < RA_REL_MAX_TRACKED)
+        escaped[nescaped++] = off;
+      else
+        escape_overflow = 1;
+    }
+  }
+
+  RARelSlot tracked[RA_REL_MAX_TRACKED];
+  int ntracked = 0;
+
+  for (int i = 0; i < n; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+
+    /* Control can arrive here from anywhere else; nothing carries over. */
+    if (q->is_jump_target)
+      ntracked = 0;
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    switch (q->op)
+    {
+    /* A call, a write through a pointer or an indexed write can land on any
+     * slot, and inline asm can do anything at all. */
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+    case TCCIR_OP_STORE_INDEXED:
+    case TCCIR_OP_STORE_POSTINC:
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_VLA_SP_RESTORE:
+      ntracked = 0;
+      continue;
+    default:
+      break;
+    }
+
+    int slot_off = 0;
+
+    /* Drop a load that rewrites the very registers already holding the slot. */
+    if (q->op == TCCIR_OP_LOAD && ntracked &&
+        ra_rl_slot_offset(tcc_ir_op_get_src1(ir, q), &slot_off))
+    {
+      int d0 = 0, d1 = 0;
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int width = ra_rl_exact_width(irop_get_btype(tcc_ir_op_get_src1(ir, q)));
+      if (width && !dest.is_lval && ra_rl_operand_regs(ir, dest, &d0, &d1) &&
+          ((d1 >= 0) == (width == 8)))
+      {
+        for (int t = 0; t < ntracked; ++t)
+        {
+          if (!tracked[t].valid || tracked[t].off != slot_off ||
+              tracked[t].size != width)
+            continue;
+          if (tracked[t].r0 != d0 || tracked[t].r1 != d1)
+            break;
+          ra_rl_reserve_regs(ls, tracked[t].r0, tracked[t].r1, tracked[t].def_idx, i);
+          q->op = TCCIR_OP_NOP;
+          removed++;
+          RA_DBG("reload_elim @%d: slot %d already in R%d/R%d", i, slot_off, d0, d1);
+          break;
+        }
+      }
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+    }
+
+    /* Record a store, after invalidating whatever it overlaps. */
+    if (q->op == TCCIR_OP_STORE &&
+        ra_rl_slot_offset(tcc_ir_op_get_dest(ir, q), &slot_off))
+    {
+      IROperand val = tcc_ir_op_get_src1(ir, q);
+      int s0 = 0, s1 = 0;
+      int dst_bt = irop_get_btype(tcc_ir_op_get_dest(ir, q));
+      int size = ra_rl_exact_width(dst_bt);
+      int inval_size = size;
+      if (!size)
+      {
+        /* A sub-word store writes at most two bytes, so invalidating a whole
+         * word over-covers it; it leaves no register holding the slot, so it
+         * records nothing.  Anything else (a struct copy) has a width this
+         * code cannot see -- assume it reached everything. */
+        if (dst_bt != IROP_BTYPE_INT8 && dst_bt != IROP_BTYPE_INT16)
+        {
+          ntracked = 0;
+          continue;
+        }
+        inval_size = 4;
+      }
+
+      for (int t = 0; t < ntracked; ++t)
+        if (tracked[t].valid && slot_off < tracked[t].off + tracked[t].size &&
+            tracked[t].off < slot_off + inval_size)
+          tracked[t].valid = 0;
+
+      int is_escaped = escape_overflow;
+      for (int e = 0; e < nescaped && !is_escaped; ++e)
+        if (escaped[e] == slot_off)
+          is_escaped = 1;
+
+      if (size && !is_escaped && !val.is_lval && ra_rl_operand_regs(ir, val, &s0, &s1) &&
+          ((s1 >= 0) == (size == 8)) && ra_rl_exact_width(irop_get_btype(val)) == size &&
+          ntracked < RA_REL_MAX_TRACKED)
+      {
+        tracked[ntracked].off = slot_off;
+        tracked[ntracked].size = size;
+        tracked[ntracked].r0 = s0;
+        tracked[ntracked].r1 = s1;
+        tracked[ntracked].def_idx = i;
+        tracked[ntracked].valid = 1;
+        ntracked++;
+      }
+      continue;
+    }
+
+    /* A store to a slot we could not decode, or through a vreg, may hit
+     * anything we are holding. */
+    if (q->op == TCCIR_OP_STORE)
+    {
+      ntracked = 0;
+      continue;
+    }
+
+    /* Any other write to a register drops the entries that named it. */
+    if (irop_config[q->op].has_dest)
+    {
+      IROperand dest = tcc_ir_op_get_dest(ir, q);
+      int d0 = 0, d1 = 0;
+      if (!dest.is_lval && ra_rl_operand_regs(ir, dest, &d0, &d1))
+      {
+        for (int t = 0; t < ntracked; ++t)
+          if (tracked[t].valid &&
+              (tracked[t].r0 == d0 || tracked[t].r1 == d0 ||
+               (d1 >= 0 && (tracked[t].r0 == d1 || tracked[t].r1 == d1))))
+            tracked[t].valid = 0;
+      }
+      else if (!dest.is_lval && irop_get_vreg(dest) >= 0)
+      {
+        /* Destination register unknown -- assume it hit everything. */
+        ntracked = 0;
+      }
+    }
+  }
+
+  return removed;
+}
+
+/* ============================================================================
+ * Post-Allocation Dead Frame-Store Elimination
+ *
+ * The reload elimination above is what leaves these behind.  Every soft-float
+ * routine opens by punning its arguments through a union:
+ *
+ *   StackLoc[-8] <-- R0(P0) [STORE]      ; ua.d = a
+ *   R0(V0)       <-- StackLoc[-8] [LOAD] ; a_bits = ua.u
+ *
+ * Once the reload is gone nothing in the function reads that slot again, and
+ * the store is `strd r0,r1,[sp,#N]` writing two words no one will ever look at.
+ * __aeabi_dadd opens with two such slots, __aeabi_dmul with four.  The IR-level
+ * dead-store pass (dce_dead_stackloc_stores) cannot reach them: it runs before
+ * allocation, while the reload is still a reader.
+ *
+ * The rule is deliberately blunt -- a store dies only when NO instruction
+ * anywhere in the function names an overlapping byte of its slot -- so it needs
+ * no ordering or dominance reasoning and stays correct however control flows.
+ * Anything that could reach a frame slot without naming it rules the whole
+ * function out: an address taken of any slot, an indexed access based on one
+ * (which reaches past the operand's own width), inline asm, setjmp, a VLA
+ * moving sp, or a nested function's static chain.
+ * ==========================================================================*/
+
+/* Bytes an access to a frame slot covers, or 0 when the width is not
+ * statically known -- a struct copy or a complex pair reaches further than its
+ * component btype says. */
+static int ra_dfs_width(IROperand op)
+{
+  if (op.is_complex)
+    return 0;
+  switch (irop_get_btype(op))
+  {
+  case IROP_BTYPE_INT8:
+    return 1;
+  case IROP_BTYPE_INT16:
+    return 2;
+  case IROP_BTYPE_INT32:
+  case IROP_BTYPE_FLOAT32:
+    return 4;
+  case IROP_BTYPE_INT64:
+  case IROP_BTYPE_FLOAT64:
+    return 8;
+  default:
+    return 0;
+  }
+}
+
+/* A plain frame slot operand: `StackLoc[off]` naming memory directly. */
+static int ra_dfs_is_slot(IROperand op)
+{
+  return op.tag == IROP_TAG_STACKOFF && !op.is_sym && irop_get_vreg(op) == -1;
+}
+
+#define RA_DFS_MAX_READS 256
+
+static int ra_dead_frame_store_elim(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  int removed = 0;
+
+  if (tcc_state->optimize < 1)
+    return 0;
+  if (tcc_ir_opt_pass_disabled("ra:dead_frame_store"))
+    return 0;
+  if (ir->has_static_chain)
+    return 0;
+
+  struct
+  {
+    int off;
+    int size;
+  } reads[RA_DFS_MAX_READS];
+  int nreads = 0;
+
+  for (int i = 0; i < n; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+
+    switch (q->op)
+    {
+    case TCCIR_OP_INLINE_ASM:
+    case TCCIR_OP_ASM_INPUT:
+    case TCCIR_OP_ASM_OUTPUT:
+    case TCCIR_OP_SETJMP:
+    case TCCIR_OP_NL_SETJMP:
+    case TCCIR_OP_VLA_ALLOC:
+    case TCCIR_OP_VLA_SP_RESTORE:
+    case TCCIR_OP_SET_CHAIN:
+    case TCCIR_OP_INIT_CHAIN_SLOT:
+      return 0;
+    default:
+      break;
+    }
+
+    /* An indexed or post-incrementing access based on a slot runs off the end
+     * of the operand's own btype, so its width says nothing about what it
+     * touched. */
+    const int reaches_past_width =
+        (q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
+         q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC);
+
+    for (int k = 0; k < 4; ++k)
+    {
+      IROperand op = (k == 0)   ? (irop_config[q->op].has_dest ? tcc_ir_op_get_dest(ir, q) : IROP_NONE)
+                     : (k == 1) ? (irop_config[q->op].has_src1 ? tcc_ir_op_get_src1(ir, q) : IROP_NONE)
+                     : (k == 2) ? (irop_config[q->op].has_src2 ? tcc_ir_op_get_src2(ir, q) : IROP_NONE)
+                                : (q->op == TCCIR_OP_MLA ? tcc_ir_op_get_accum(ir, q) : IROP_NONE);
+      if (!ra_dfs_is_slot(op))
+        continue;
+      /* `Addr[StackLoc[..]]` hands the address to something this scan cannot
+       * follow; is_llocal reaches memory through a pointer held in the slot. */
+      if (!op.is_lval || op.is_llocal || reaches_past_width)
+        return 0;
+      /* The destination of a plain STORE is the write under consideration, not
+       * a read.  Every other appearance keeps the slot alive. */
+      if (k == 0 && q->op == TCCIR_OP_STORE)
+        continue;
+      int w = ra_dfs_width(op);
+      if (w == 0 || nreads >= RA_DFS_MAX_READS)
+        return 0;
+      reads[nreads].off = (int)irop_get_stack_offset(op);
+      reads[nreads].size = w;
+      nreads++;
+    }
+  }
+
+  for (int i = 0; i < n; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_STORE)
+      continue;
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    if (!ra_dfs_is_slot(dest) || !dest.is_lval || dest.is_llocal)
+      continue;
+    if (tcc_ir_access_is_volatile(ir, dest))
+      continue;
+    const int w = ra_dfs_width(dest);
+    if (w == 0)
+      continue;
+    const int off = (int)irop_get_stack_offset(dest);
+    int is_read = 0;
+    for (int r = 0; r < nreads && !is_read; ++r)
+      if (off < reads[r].off + reads[r].size && reads[r].off < off + w)
+        is_read = 1;
+    if (is_read)
+      continue;
+    q->op = TCCIR_OP_NOP;
+    removed++;
+    RA_DBG("dead_frame_store @%d: slot %d (%d bytes) is never read", i, off, w);
+  }
+
+  return removed;
+}
+
+/* ============================================================================
+ * Post-Allocation Copy Propagation
+ *
+ * Move coalescing (below) removes a register copy by REASSIGNING one of its
+ * endpoints so the move degenerates to `mov rX,rX`.  Both of its directions
+ * need one endpoint's register to be free across the other's live range, so
+ * neither can fire when the source OUTLIVES the copy: the source is still
+ * sitting in its own register, which is precisely why that register is not
+ * free.
+ *
+ * That is the dominant shape in soft float, where one union-punned 64-bit
+ * value feeds a dozen inlined accessors:
+ *
+ *   R4(T8)  <-- ...                  ; a_bits, live to the end of the function
+ *   R8(T18) <-- &R4(T8) [ASSIGN]     ; mov r8,r4 / mov r9,r5
+ *   R8(T19) <-- &R8(T18) SHR #52     ; reads only the high half
+ *
+ * The complementary transform needs no free register at all: rewrite T18's
+ * reads back to T8 and drop the copy.  That is legal exactly when T8's
+ * register still holds T8 everywhere T18 is live, and the allocator's own
+ * invariant -- one live interval per physical register at a time -- makes
+ * that checkable by scanning the interval list for another claimant.
+ *
+ * Nothing here changes an allocation, so unlike every hint- or
+ * forwarding-based attempt on these same copies, it cannot stretch a live
+ * range and trade a move for a spill.  Each removed quad is a removed
+ * instruction.
+ * ==========================================================================*/
+
+/* Ops whose operands are pinned to particular physical registers (ABI slots,
+ * asm constraints, the static chain) or whose destination must not alias a
+ * source: a read inside one of these cannot be redirected to another
+ * register. */
+static int ra_cp_use_is_redirectable(int op)
+{
+  switch (op)
+  {
+  case TCCIR_OP_RETURNVALUE:
+  case TCCIR_OP_FUNCPARAMVAL:
+  case TCCIR_OP_FUNCPARAMVOID:
+  case TCCIR_OP_FUNCCALLVAL:
+  case TCCIR_OP_FUNCCALLVOID:
+  case TCCIR_OP_SET_CHAIN:
+  case TCCIR_OP_ASM_INPUT:
+  case TCCIR_OP_ASM_OUTPUT:
+  case TCCIR_OP_INLINE_ASM:
+  case TCCIR_OP_IJUMP:
+  case TCCIR_OP_SWITCH_TABLE:
+  case TCCIR_OP_SWITCH_LOAD:
+  case TCCIR_OP_SETJMP:
+  case TCCIR_OP_NL_SETJMP:
+  case TCCIR_OP_UMULL:
+  case TCCIR_OP_MLA:
+  case TCCIR_OP_VLA_ALLOC:
+  case TCCIR_OP_VLA_SP_SAVE:
+  case TCCIR_OP_VLA_SP_RESTORE:
+    return 0;
+  default:
+    return 1;
+  }
+}
+
+/* Does any interval other than `keep` occupy one of `keep`'s registers at some
+ * point in [lo,hi]?  If not, `keep`'s registers still hold `keep`'s value
+ * across the whole window and reads of a copy of it can be redirected there. */
+static int ra_cp_src_regs_clobbered(const LSLiveIntervalState *ls,
+                                    const LSLiveInterval *keep,
+                                    uint32_t lo, uint32_t hi)
+{
+  int regs[2];
+  int nregs = 0;
+  regs[nregs++] = keep->r0;
+  if (keep->r1 >= 0 && keep->r1 < PREG_NONE && keep->r1 != keep->r0)
+    regs[nregs++] = keep->r1;
+
+  for (int j = 0; j < ls->next_interval_index; ++j)
+  {
+    const LSLiveInterval *x = &ls->intervals[j];
+    if (x == keep || x->stack_location != 0)
+      continue;
+    if (x->start > hi || x->end < lo)
+      continue;
+    for (int r = 0; r < nregs; ++r)
+      if (x->r0 == regs[r] || x->r1 == regs[r])
+      {
+        return 1;
+      }
+  }
+  return 0;
+}
+
+/* Rewrite the reads of a copy's destination back to its source and drop the
+ * copy.  Returns the number of copies removed. */
+static int ra_copy_propagate(TCCIRState *ir)
+{
+  LSLiveIntervalState *ls = &ir->ls;
+  const int n = ir->next_instruction_index;
+  int removed = 0;
+
+  if (tcc_state->optimize < 1)
+    return 0;
+  if (!ls->live_regs_by_instruction || ls->live_regs_by_instruction_size <= 0)
+    return 0;
+  if (tcc_ir_opt_pass_disabled("ra:copy_prop"))
+    return 0;
+
+  for (int i = 0; i < n; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    IROperand src = tcc_ir_op_get_src1(ir, q);
+    /* A LOAD off a vreg whose interval ended up in a register performs no
+     * memory access -- it is a register copy at codegen, and the IR generator
+     * emits the inlined `temp = var` binding in exactly that form.  Skip
+     * is_llocal (a real dereference through a pointer) and is_sym (a global).
+     * Sub-word LOADs emit a UXTB/SXTH alongside the move to narrow the value,
+     * so only full-width copies qualify. */
+    int is_copy_load = 0;
+    if (q->op == TCCIR_OP_LOAD)
+    {
+      int dbt = irop_get_btype(dest), sbt = irop_get_btype(src);
+      /* is_lval on a STACKOFF source is the VAR's own slot being read, which
+       * for a register-resident VAR is a register copy.  On a VREG source it
+       * is a DEREFERENCE OF THAT REGISTER -- `R4 <- R3***DEREF***` reads the
+       * memory R3 points at, and rewriting its readers to R3 hands them the
+       * address instead of the value (pr90311: `b -= c < (unsigned char) a`
+       * subtracted from &b).  is_llocal is not the flag that separates them;
+       * a plain pointer dereference does not set it. */
+      int deref_through_reg = (src.tag == IROP_TAG_VREG && src.is_lval);
+      if ((src.tag == IROP_TAG_VREG || (src.tag == IROP_TAG_STACKOFF && src.is_local)) &&
+          !deref_through_reg && !src.is_llocal && !src.is_sym && dbt == sbt &&
+          (dbt == IROP_BTYPE_INT32 || dbt == IROP_BTYPE_INT64 || dbt == IROP_BTYPE_FUNC))
+        is_copy_load = 1;
+      if (!is_copy_load)
+        continue;
+    }
+    /* Plain register-to-register only; an lval on either side is memory --
+     * except a copy-LOAD, whose source carries is_lval for the VAR read. */
+    if (dest.is_lval || (src.is_lval && !is_copy_load))
+      continue;
+    if (irop_get_btype(dest) != irop_get_btype(src))
+      continue;
+
+    int32_t dv = irop_get_vreg(dest);
+    int32_t sv = irop_get_vreg(src);
+    if (dv < 0 || sv < 0 || dv == sv)
+      continue;
+    if (!tcc_ir_vreg_is_valid(ir, dv) || !tcc_ir_vreg_is_valid(ir, sv))
+      continue;
+    /* The destination must be a temp: a VAR has a home beyond its register.
+     * The source may be a VAR -- a register-resident one is just a register,
+     * and it is the punned `a_bits` that every inlined accessor re-reads --
+     * but then every write to it counts as a redefinition (below). */
+    int src_is_var = (TCCIR_DECODE_VREG_TYPE(sv) == TCCIR_VREG_TYPE_VAR);
+    if (TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+    if (TCCIR_DECODE_VREG_TYPE(sv) != TCCIR_VREG_TYPE_TEMP && !src_is_var)
+      continue;
+
+    /* One interval per endpoint.  A vreg split across several intervals can
+     * hold a DIFFERENT register in each, and the range reasoning below reads
+     * a single interval's bounds -- picking one of several would let a read
+     * be redirected into the register the other half was living in. */
+    LSLiveInterval *src_iv = NULL, *dst_iv = NULL;
+    int src_ivs = 0, dst_ivs = 0;
+    for (int j = 0; j < ls->next_interval_index; ++j)
+    {
+      if (ls->intervals[j].vreg == (uint32_t)sv) { src_iv = &ls->intervals[j]; src_ivs++; }
+      if (ls->intervals[j].vreg == (uint32_t)dv) { dst_iv = &ls->intervals[j]; dst_ivs++; }
+    }
+    if (!src_iv || !dst_iv || src_ivs != 1 || dst_ivs != 1)
+      continue;
+    /* PREG_NONE/PREG_SPILLED are >= 0 but are not registers. */
+    if (src_iv->r0 < 0 || src_iv->r0 >= PREG_NONE)
+      continue;
+    if (src_iv->stack_location != 0)
+      continue;
+    /* A SPILLED destination is the better case, not a disqualifying one: the
+     * copy the allocator could not keep in a register costs a store and a
+     * reload at every read, and redirecting those reads to the source removes
+     * all of it.  __aeabi_dadd's `b_bits` is exactly this -- one 64-bit ASSIGN
+     * off the parameter, spilled, then loaded back four bytes at a time.  The
+     * legality argument below never mentions the destination's register, only
+     * that the SOURCE's registers still hold the source across the reads, so
+     * it carries over unchanged. */
+    const int dst_spilled = (dst_iv->r0 < 0 || dst_iv->r0 >= PREG_NONE || dst_iv->stack_location != 0);
+    /* Both ends must sit in the same register class, and a 64-bit class means
+     * a register PAIR: redirecting a paired read to an interval that only owns
+     * r0 hands the backend a half-formed operand (it asserts on r1 == 31).  A
+     * register-resident VAR can be exactly that. */
+    if (src_iv->reg_type != dst_iv->reg_type)
+      continue;
+    if (!dst_spilled)
+    {
+      int src_pair = (src_iv->r1 >= 0 && src_iv->r1 < PREG_NONE);
+      int dst_pair = (dst_iv->r1 >= 0 && dst_iv->r1 < PREG_NONE);
+      if (src_pair != dst_pair)
+        continue;
+    }
+    if (src_iv->addrtaken || dst_iv->addrtaken)
+      continue;
+    /* dst's register is shared with a graph-coalesced class that expects this
+     * write to land; src is only read, so its class membership is harmless. */
+    if (dst_iv->co_member)
+      continue;
+    /* The LS intervals above drive the allocator; codegen resolves an operand
+     * through the IR-level interval's `allocation` instead, and the two are
+     * not interchangeable -- a VAR can be register-resident there with no high
+     * half, which the backend rejects the moment a 64-bit read names it.
+     * Validate against the structure codegen will actually consult. */
+    {
+      IRLiveInterval *src_li = tcc_ir_vreg_live_interval(ir, sv);
+      IRLiveInterval *dst_li = tcc_ir_vreg_live_interval(ir, dv);
+      if (!src_li || !dst_li)
+        continue;
+      if (src_li->allocation.offset != 0)
+        continue;
+      if (ra_alloc_half_spilled(src_li->allocation.r0) ||
+          ra_alloc_half_spilled(src_li->allocation.r1))
+        continue;
+      if (ra_alloc_half_unset(src_li->allocation.r0))
+        continue;
+      /* The source must carry the full width the reads expect.  With a
+       * register-resident destination that is "both are pairs or neither is";
+       * with a spilled one there is no destination pair to compare against, so
+       * the operand btype -- already required equal above -- decides. */
+      const int src_paired = ((src_li->allocation.r1 & PREG_REG_NONE) != PREG_REG_NONE);
+      if (!dst_spilled)
+      {
+        if (dst_li->allocation.offset != 0)
+          continue;
+        if (ra_alloc_half_spilled(dst_li->allocation.r0) ||
+            ra_alloc_half_spilled(dst_li->allocation.r1))
+          continue;
+        if (ra_alloc_half_unset(dst_li->allocation.r0))
+          continue;
+        if (src_paired != ((dst_li->allocation.r1 & PREG_REG_NONE) != PREG_REG_NONE))
+          continue;
+      }
+      else if (src_paired != (irop_get_btype(dest) == IROP_BTYPE_INT64 ||
+                              irop_get_btype(dest) == IROP_BTYPE_FLOAT64))
+        continue;
+    }
+
+    /* Already the same register: codegen elides it, nothing to remove. */
+    if (src_iv->r0 == dst_iv->r0 && src_iv->r1 == dst_iv->r1)
+      continue;
+    /* src must already be live at the copy. */
+    if (src_iv->start > (uint32_t)i)
+      continue;
+
+    /* Collect dst's reads.  Require exactly one definition (this copy), every
+     * read after it, and every read in an op whose operands are not pinned. */
+    int ok = 1;
+    int nuses = 0;
+    int last_use = i;
+    for (int k = 0; k < n; ++k)
+    {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (k == i || qk->op == TCCIR_OP_NOP)
+        continue;
+      if (irop_config[qk->op].has_dest &&
+          irop_get_vreg(tcc_ir_op_get_dest(ir, qk)) == dv)
+      { ok = 0; break; } /* redefined, or written through as an address */
+
+      int reads = 0;
+      if (irop_config[qk->op].has_src1 &&
+          irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == dv)
+        reads = 1;
+      if (!reads && irop_config[qk->op].has_src2 &&
+          irop_get_vreg(tcc_ir_op_get_src2(ir, qk)) == dv)
+        reads = 1;
+      if (!reads && qk->op == TCCIR_OP_MLA &&
+          irop_get_vreg(tcc_ir_op_get_accum(ir, qk)) == dv)
+        reads = 1;
+      if (!reads)
+        continue;
+
+      if (k < i || !ra_cp_use_is_redirectable(qk->op))
+      { ok = 0; break; }
+      nuses++;
+      if (k > last_use)
+        last_use = k;
+    }
+    /* nuses == 0 is a dead copy; ra_eliminate_dead_reg_copies owns that. */
+    if (!ok || nuses == 0)
+      continue;
+
+    /* src's value must survive to the last redirected read. */
+    if (src_iv->end < (uint32_t)last_use)
+      continue;
+    /* ...and no other interval may claim src's registers over that window. */
+    if (ra_cp_src_regs_clobbered(ls, src_iv, (uint32_t)i, (uint32_t)last_use))
+      continue;
+    /* ...and src itself must not be redefined under the reads. */
+    for (int k = i + 1; k <= last_use; ++k)
+    {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op == TCCIR_OP_NOP || !irop_config[qk->op].has_dest)
+        continue;
+      IROperand dk = tcc_ir_op_get_dest(ir, qk);
+      /* For a temp, an lval destination is a store THROUGH it (an address
+       * use), not a new value.  For a VAR it is a write to the variable, so
+       * there is no exemption. */
+      if (dk.is_lval && !src_is_var)
+        continue;
+      if (irop_get_vreg(dk) == sv)
+      { ok = 0; break; }
+    }
+    if (!ok)
+      continue;
+
+    for (int k = i + 1; k <= last_use; ++k)
+    {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op == TCCIR_OP_NOP)
+        continue;
+      if (irop_config[qk->op].has_src1)
+      {
+        IROperand o = tcc_ir_op_get_src1(ir, qk);
+        if (irop_get_vreg(o) == dv)
+        { irop_set_vreg(&o, sv); tcc_ir_set_src1(ir, k, o); }
+      }
+      if (irop_config[qk->op].has_src2)
+      {
+        IROperand o = tcc_ir_op_get_src2(ir, qk);
+        if (irop_get_vreg(o) == dv)
+        { irop_set_vreg(&o, sv); tcc_ir_set_src2(ir, k, o); }
+      }
+    }
+    q->op = TCCIR_OP_NOP;
+    removed++;
+    RA_DBG("copy_prop @%d: T%d -> T%d (R%d), %d use(s) to %d", i,
+           (int)(dv & 0xffffff), (int)(sv & 0xffffff), src_iv->r0, nuses, last_use);
+  }
+
+  return removed;
+}
+
+/* ============================================================================
  * Post-Allocation Move Coalescing
  *
  * Eliminates register-to-register copies (ASSIGN dest = src) by making both
@@ -5654,9 +7014,656 @@ static int ra_count_copies_reaching_codegen(TCCIRState *ir)
   return copies;
 }
 
+/* Is `vr` mentioned by any instruction at all? */
+static int ra_rp_vreg_mentioned(TCCIRState *ir, uint32_t vr)
+{
+  const int n = ir->next_instruction_index;
+  for (int k = 0; k < n; ++k)
+  {
+    IRQuadCompact *qk = &ir->compact_instructions[k];
+    if (qk->op == TCCIR_OP_NOP)
+      continue;
+    if (irop_config[qk->op].has_dest &&
+        (uint32_t)irop_get_vreg(tcc_ir_op_get_dest(ir, qk)) == vr)
+      return 1;
+    if (irop_config[qk->op].has_src1 &&
+        (uint32_t)irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == vr)
+      return 1;
+    if (irop_config[qk->op].has_src2 &&
+        (uint32_t)irop_get_vreg(tcc_ir_op_get_src2(ir, qk)) == vr)
+      return 1;
+    if (qk->op == TCCIR_OP_MLA &&
+        (uint32_t)irop_get_vreg(tcc_ir_op_get_accum(ir, qk)) == vr)
+      return 1;
+  }
+  return 0;
+}
+
+/* Is any of `keep`'s registers claimed by another interval over [lo,hi]?
+ *
+ * ra_cp_src_regs_clobbered answers the same question, but every pass that
+ * deletes an instruction leaves the interval of the value it computed behind:
+ * the vreg is then mentioned nowhere, yet its interval still claims its
+ * registers over the range it used to occupy.  Such a phantom holds no value
+ * and cannot clobber anything -- and because it sits exactly where the deleted
+ * instruction was, it lands on the one-instruction window this pass asks
+ * about far more often than its share.  So a claim is only believed once its
+ * vreg is shown to still exist in the instruction stream.
+ */
+static int ra_rp_dst_regs_busy(TCCIRState *ir, const LSLiveIntervalState *ls,
+                               const LSLiveInterval *keep, uint32_t lo, uint32_t hi)
+{
+  int regs[2];
+  int nregs = 0;
+  regs[nregs++] = keep->r0;
+  if (keep->r1 >= 0 && keep->r1 < PREG_NONE && keep->r1 != keep->r0)
+    regs[nregs++] = keep->r1;
+
+  for (int j = 0; j < ls->next_interval_index; ++j)
+  {
+    const LSLiveInterval *x = &ls->intervals[j];
+    if (x == keep || x->stack_location != 0)
+      continue;
+    if (x->start > hi || x->end < lo)
+      continue;
+    int hits = 0;
+    for (int r = 0; r < nregs; ++r)
+      if (x->r0 == regs[r] || x->r1 == regs[r])
+        hits = 1;
+    if (!hits)
+      continue;
+    if (ra_rp_vreg_mentioned(ir, x->vreg))
+      return 1;
+  }
+  return 0;
+}
+
+/* Which producers may have their destination register changed.  This is an
+ * ALLOW list, not a deny list: an op earns a place only when its destination
+ * is a plain register write the encoder is free to direct anywhere.  A fixed
+ * destination (a call's r0, UMULL's pair, the division helpers), a
+ * two-address one (BFI presets its dest to the host word) and one the encoder
+ * also reads (the postinc forms write back through their base, LDRD against
+ * its own base is unpredictable) all stay off it. */
+static int ra_rp_def_is_retargetable(int op)
+{
+  switch (op)
+  {
+  case TCCIR_OP_ADD:
+  case TCCIR_OP_SUB:
+  case TCCIR_OP_MUL:
+  case TCCIR_OP_AND:
+  case TCCIR_OP_OR:
+  case TCCIR_OP_XOR:
+  case TCCIR_OP_SHL:
+  case TCCIR_OP_SAR:
+  case TCCIR_OP_SHR:
+  case TCCIR_OP_UBFX:
+  case TCCIR_OP_SBFX:
+  case TCCIR_OP_ZEXT:
+  case TCCIR_OP_SETIF:
+  case TCCIR_OP_ASSIGN:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* Retarget the producer of a dying copy source, and drop the copy.
+ *
+ *     ubfx  r9, r1, #20, #11        ubfx  sl, r1, #20, #11
+ *     mov   sl, r9              ->
+ *
+ * This is the backward sibling of ra_copy_propagate.  Copy propagation
+ * rewrites the reads of a copy's DESTINATION back to its source, so it needs
+ * the source to still be the occupant of its register across every one of
+ * them -- a long-lived destination therefore rules it out.  Retargeting goes
+ * the other way: the producer writes the destination's register directly, the
+ * copy disappears, and whatever reads of the source remain are rewritten to
+ * the destination, which holds the identical value from the producer onwards.
+ *
+ * Nothing here depends on how long the destination lives.  What it costs is
+ * that the destination is born one instruction earlier, so its register has
+ * to be free over that one instruction -- and, when the source outlives the
+ * copy, that the source's last read still falls inside the destination's own
+ * live range, so no range grows at the far end either.
+ *
+ * The move coalescer's forward direction covers the same shape by giving the
+ * destination the SOURCE's register, but only when that register is free
+ * across the destination's whole live range, which for a value computed early
+ * and used late it usually is not.  Retargeting asks for far less: the
+ * destination's register must be free over the single instruction the value's
+ * definition moves back by.
+ *
+ * Every candidate is checked against the whole function rather than against
+ * the live intervals alone, so an interval that over-approximates cannot make
+ * a read of the source disappear.
+ */
+static int ra_retarget_producer(TCCIRState *ir)
+{
+  LSLiveIntervalState *ls = &ir->ls;
+  const int n = ir->next_instruction_index;
+  int retargeted = 0;
+
+  if (tcc_state->optimize < 1)
+    return 0;
+  if (!ls->live_regs_by_instruction || ls->live_regs_by_instruction_size <= 0)
+    return 0;
+  if (tcc_ir_opt_pass_disabled("ra:retarget_producer"))
+    return 0;
+  const int tbl_size = ls->live_regs_by_instruction_size;
+
+  for (int i = 0; i < n; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ASSIGN)
+      continue;
+    /* Control may reach the copy without passing the producer, in which case
+     * the copy is the only thing establishing the destination on that path. */
+    if (q->is_jump_target)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    IROperand src = tcc_ir_op_get_src1(ir, q);
+    if (dest.is_lval || src.is_lval)
+      continue;
+    if (irop_get_btype(dest) != irop_get_btype(src))
+      continue;
+
+    int32_t dv = irop_get_vreg(dest);
+    int32_t sv = irop_get_vreg(src);
+    if (dv < 0 || sv < 0 || dv == sv)
+      continue;
+    if (!tcc_ir_vreg_is_valid(ir, dv) || !tcc_ir_vreg_is_valid(ir, sv))
+      continue;
+    /* Both ends must be temps.  A VAR has a home beyond its register, and the
+     * source's disappears entirely here. */
+    if (TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP ||
+        TCCIR_DECODE_VREG_TYPE(sv) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+
+    /* The producer is the instruction before the copy; NOPs left by earlier
+     * passes do not count as instructions, but a NOP that is a jump target
+     * still lets control in between the two. */
+    int d = -1;
+    for (int k = i - 1; k >= 0; --k)
+    {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op != TCCIR_OP_NOP) { d = k; break; }
+      if (qk->is_jump_target) break;
+    }
+    if (d < 0)
+      continue;
+    IRQuadCompact *pq = &ir->compact_instructions[d];
+    if (!ra_rp_def_is_retargetable(pq->op) || !irop_config[pq->op].has_dest)
+      continue;
+    IROperand pd = tcc_ir_op_get_dest(ir, pq);
+    if (pd.is_lval || irop_get_vreg(pd) != sv)
+      continue;
+    /* The width the encoder lowers by is the DESTINATION's, and passes that
+     * narrow a value retype operands in place -- so the producer's own view of
+     * its destination must be the width the copy moves. */
+    if (irop_get_btype(pd) != irop_get_btype(dest))
+      continue;
+
+    /* Exactly one interval per endpoint: a split vreg holds a different
+     * register in each half, and the reasoning below reads one pair of
+     * bounds. */
+    LSLiveInterval *src_iv = NULL, *dst_iv = NULL;
+    int src_ivs = 0, dst_ivs = 0;
+    for (int j = 0; j < ls->next_interval_index; ++j)
+    {
+      if (ls->intervals[j].vreg == (uint32_t)sv) { src_iv = &ls->intervals[j]; src_ivs++; }
+      if (ls->intervals[j].vreg == (uint32_t)dv) { dst_iv = &ls->intervals[j]; dst_ivs++; }
+    }
+    if (!src_iv || !dst_iv || src_ivs != 1 || dst_ivs != 1)
+      continue;
+    /* PREG_NONE/PREG_SPILLED are >= 0 but are not registers.  Both ends must
+     * be register-resident: a spilled destination would turn the producer's
+     * write into a spill store, which is not what this is measuring. */
+    if (src_iv->r0 < 0 || src_iv->r0 >= PREG_NONE || src_iv->stack_location != 0)
+      continue;
+    if (dst_iv->r0 < 0 || dst_iv->r0 >= PREG_NONE || dst_iv->stack_location != 0)
+      continue;
+    if (src_iv->reg_type != dst_iv->reg_type)
+      continue;
+    /* A 64-bit class means a register PAIR; handing the encoder a destination
+     * that owns only its low half aborts it (r1 == 31). */
+    {
+      int src_pair = (src_iv->r1 >= 0 && src_iv->r1 < PREG_NONE);
+      int dst_pair = (dst_iv->r1 >= 0 && dst_iv->r1 < PREG_NONE);
+      if (src_pair != dst_pair)
+        continue;
+    }
+    if (src_iv->addrtaken || dst_iv->addrtaken)
+      continue;
+    /* A graph-coalesced interval shares one register with its whole class. */
+    if (src_iv->co_member || dst_iv->co_member)
+      continue;
+    /* Already the same register: codegen elides the move, nothing to remove. */
+    if (src_iv->r0 == dst_iv->r0 && src_iv->r1 == dst_iv->r1)
+      continue;
+
+    /* Codegen resolves an operand through the IR-level interval's allocation,
+     * not through the LS one, and the two are not interchangeable. */
+    {
+      IRLiveInterval *src_li = tcc_ir_vreg_live_interval(ir, sv);
+      IRLiveInterval *dst_li = tcc_ir_vreg_live_interval(ir, dv);
+      if (!src_li || !dst_li)
+        continue;
+      if (dst_li->allocation.offset != 0)
+        continue;
+      if (ra_alloc_half_spilled(dst_li->allocation.r0) ||
+          ra_alloc_half_spilled(dst_li->allocation.r1))
+        continue;
+      if (ra_alloc_half_unset(dst_li->allocation.r0))
+        continue;
+      if (ra_alloc_half_unset(src_li->allocation.r1) !=
+          ra_alloc_half_unset(dst_li->allocation.r1))
+        continue;
+    }
+
+    /* The source is born at the producer, the destination at the copy, and
+     * the source does not outlive the destination -- the value ends up in the
+     * destination's register, which is guaranteed to be the destination's own
+     * only up to where the allocator said it ends. */
+    if (src_iv->start != (uint32_t)d)
+      continue;
+    if (dst_iv->start != (uint32_t)i)
+      continue;
+    if (src_iv->end > dst_iv->end)
+      continue;
+
+    /* The destination's registers must be free from the producer to the last
+     * read that will be redirected onto them.  Below the copy that window is
+     * inside the destination's own range and the check is a formality; above
+     * it, it is what makes moving the definition back safe -- and it is also
+     * what keeps the producer's operands out of the way, since a source of
+     * the producer is live at the producer, and a multi-instruction lowering
+     * need not read all of its operands before writing its first half. */
+    {
+      uint32_t hi = src_iv->end > (uint32_t)i ? src_iv->end : (uint32_t)i;
+      if (ra_rp_dst_regs_busy(ir, ls, dst_iv, (uint32_t)d, hi))
+        continue;
+    }
+
+    /* Now against the instruction stream rather than the intervals, so that
+     * an interval which over-approximates cannot hide a mention.  Outside the
+     * producer and the copy, the source may only be READ, only below the copy
+     * and inside the destination's range, and only by an op whose operands are
+     * not pinned.  A mention in a DEST operand is refused whatever it means --
+     * a redefinition invalidates the rewrite, and a store THROUGH the source
+     * is a read this pass does not rewrite.  The destination, in turn, must
+     * not be written anywhere but the copy. */
+    int ok = 1;
+    int last_use = i;
+    for (int k = 0; k < n; ++k)
+    {
+      if (k == d || k == i)
+        continue;
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op == TCCIR_OP_NOP)
+        continue;
+      /* Control must not be able to enter at the copy: on such an edge the
+       * copy is the only thing that establishes the destination, and the
+       * producer that would replace it never ran.  `is_jump_target` says this
+       * already and is checked above, but it is a bit many passes maintain by
+       * hand, so the branches are also read directly.  A computed target is
+       * refused outright because it names no index to compare against. */
+      if (qk->op == TCCIR_OP_IJUMP || qk->op == TCCIR_OP_SWITCH_TABLE ||
+          qk->op == TCCIR_OP_SWITCH_LOAD || qk->op == TCCIR_OP_SETJMP ||
+          qk->op == TCCIR_OP_NL_SETJMP)
+      { ok = 0; break; }
+      if ((qk->op == TCCIR_OP_JUMP || qk->op == TCCIR_OP_JUMPIF) &&
+          (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, qk)) == i)
+      { ok = 0; break; }
+      if (irop_config[qk->op].has_dest &&
+          irop_get_vreg(tcc_ir_op_get_dest(ir, qk)) == sv)
+      { ok = 0; break; }
+      int reads = 0;
+      if (irop_config[qk->op].has_src1 &&
+          irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == sv)
+        reads = 1;
+      if (!reads && irop_config[qk->op].has_src2 &&
+          irop_get_vreg(tcc_ir_op_get_src2(ir, qk)) == sv)
+        reads = 1;
+      if (!reads && qk->op == TCCIR_OP_MLA &&
+          irop_get_vreg(tcc_ir_op_get_accum(ir, qk)) == sv)
+        reads = 1;
+      if (!reads)
+        continue;
+      if (k < i || (uint32_t)k > dst_iv->end || !ra_cp_use_is_redirectable(qk->op))
+      { ok = 0; break; }
+      if (k > last_use)
+        last_use = k;
+    }
+    if (!ok)
+      continue;
+    /* The redirected reads must all see the value the producer wrote, so the
+     * destination may not be given a new one underneath them.  Only the span
+     * that actually carries a redirected read matters: a temp reassigned
+     * beyond the last of them is none of this transform's business. */
+    for (int k = i + 1; k <= last_use; ++k)
+    {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op == TCCIR_OP_NOP)
+        continue;
+      if (irop_config[qk->op].has_dest &&
+          irop_get_vreg(tcc_ir_op_get_dest(ir, qk)) == dv)
+      { ok = 0; break; }
+    }
+    if (!ok)
+      continue;
+
+    irop_set_vreg(&pd, dv);
+    tcc_ir_set_dest(ir, d, pd);
+    q->op = TCCIR_OP_NOP;
+    for (int k = i + 1; k <= last_use; ++k)
+    {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op == TCCIR_OP_NOP)
+        continue;
+      if (irop_config[qk->op].has_src1)
+      {
+        IROperand o = tcc_ir_op_get_src1(ir, qk);
+        if (irop_get_vreg(o) == sv)
+        { irop_set_vreg(&o, dv); tcc_ir_set_src1(ir, k, o); }
+      }
+      if (irop_config[qk->op].has_src2)
+      {
+        IROperand o = tcc_ir_op_get_src2(ir, qk);
+        if (irop_get_vreg(o) == sv)
+        { irop_set_vreg(&o, dv); tcc_ir_set_src2(ir, k, o); }
+      }
+    }
+
+    /* The destination is now born at the producer.  The source's interval is
+     * left claiming its own registers over [d,i]; nothing writes them any
+     * more, but pretending they are still busy only costs later passes an
+     * opportunity, where clearing them wrongly would cost correctness. */
+    dst_iv->start = (uint32_t)d;
+    {
+      IRLiveInterval *dst_li = tcc_ir_vreg_live_interval(ir, dv);
+      if (dst_li && dst_li->start > (uint32_t)d)
+        dst_li->start = (uint32_t)d;
+    }
+    for (int k = d; k <= i && k < tbl_size; ++k)
+    {
+      ls->live_regs_by_instruction[k] |= (1u << dst_iv->r0);
+      if (dst_iv->r1 >= 0 && dst_iv->r1 < PREG_NONE)
+        ls->live_regs_by_instruction[k] |= (1u << dst_iv->r1);
+    }
+    retargeted++;
+    RA_DBG("retarget_producer @%d: %s dest T%d -> T%d (R%d), reads to %d", d,
+           tcc_ir_get_op_name((TccIrOp)pq->op), (int)(sv & 0xffffff),
+           (int)(dv & 0xffffff), dst_iv->r0, last_use);
+  }
+
+  return retargeted;
+}
+
+/* ── ra:load_postinc / ra:store_postinc ──
+ *
+ * `D <- P***DEREF***` immediately followed (in the same straight-line region)
+ * by `P <- P + #k` is ARM's post-indexed load, `ldr D,[P],#k`; the mirrored
+ * `P***DEREF*** <- V; P <- P + #k` is the post-indexed store, `str V,[P],#k`.
+ * The backend has emitted both forms since forever
+ * (tcc_gen_machine_load/store_postinc_mop), but until now NOTHING in the
+ * pipeline ever produced the ops, so the whole addressing mode was dead code.
+ * Every IV-strength-reduced pointer walk paid a separate `adds P,#k`; on the
+ * M33 the post-increment is also a cycle cheaper than the separate add (docs,
+ * and tcc-m33-addressing-mode-cycle-costs).
+ *
+ * The store arm only sees IV-strength-reduced walks (`a[i] = v` loops turned
+ * into a pointer walk).  A source-level `*p++ = v` does NOT lower to this
+ * shape but to a copy of the pointer followed by the increment
+ * (`T <- P; P <- T + k; T***DEREF*** <- V`); that needs its own matcher plus
+ * a liveness proof that T is dead, and is still absent.
+ *
+ * This runs POST-allocation deliberately.  Pre-RA the fused op writes P without
+ * the allocator being told (irop_config says the POSTINC ops read P as a USE
+ * only), and P is exactly the loop-carried value the allocator most needs to
+ * model.  After allocation both registers are already fixed and folding the
+ * add changes no allocation at all.
+ *
+ * The operand layout is the indexed-op one: two value slots, unused, increment
+ * at operand_base+3 (codegen reads it via tcc_ir_op_get_scale), so the fused
+ * instruction takes four fresh pool slots rather than reusing the original
+ * op's two.
+ */
+static int ra_load_postinc_fuse(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  int fused = 0;
+
+  if (tcc_state->optimize < 1)
+    return 0;
+  int load_disabled = tcc_ir_opt_pass_disabled("ra:load_postinc");
+  int store_disabled = tcc_ir_opt_pass_disabled("ra:store_postinc");
+  if (load_disabled && store_disabled)
+    return 0;
+
+  for (int i = 0; i < n; ++i)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    int is_load = (q->op == TCCIR_OP_LOAD);
+    int is_store = (q->op == TCCIR_OP_STORE);
+    if (!is_load && !is_store)
+      continue;
+    if (is_load ? load_disabled : store_disabled)
+      continue;
+
+    /* LOAD: `value <- ptr***DEREF***` — ptr is src1, an lvalue.
+     * STORE: `ptr***DEREF*** <- value` — ptr is the dest, an lvalue. */
+    IROperand ptr = is_load ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
+    IROperand value = is_load ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+
+    /* A dereference THROUGH a register: `R4 <- R3***DEREF***`.  is_local /
+     * is_llocal / is_sym are the frame-slot and global forms, which name memory
+     * some other way and have no pointer register to write back. */
+    if (irop_get_tag(ptr) != IROP_TAG_VREG || !ptr.is_lval)
+      continue;
+    if (ptr.is_local || ptr.is_llocal || ptr.is_sym || ptr.is_complex)
+      continue;
+    /* No volatility guard is needed: the fusion neither removes, duplicates nor
+     * reorders the access.  `ldr D,[P],#k` performs exactly the access the
+     * original did, in the same place; only the address arithmetic moves. */
+    if (value.is_lval)
+      continue;
+    /* load_postinc_mop takes the access width from the DEST operand (and
+     * store_postinc_mop from the VALUE operand), while a plain LOAD/STORE
+     * takes it from the lvalue.  Requiring the two to agree makes the forms
+     * equivalent; a widening load (`int c = *bytep`, dest INT32 over an INT8
+     * access) would otherwise silently become LDR.  Signedness only matters
+     * for loads — a store of width N writes the low N bytes either way.
+     * 64-bit is LDRD/STRD-with-writeback and stays out until it has its own
+     * test. */
+    {
+      int vbt = irop_get_btype(value), pbt = irop_get_btype(ptr);
+      if (vbt != pbt || (is_load && value.is_unsigned != ptr.is_unsigned))
+        continue;
+      if (vbt != IROP_BTYPE_INT32 && vbt != IROP_BTYPE_INT16 && vbt != IROP_BTYPE_INT8)
+        continue;
+    }
+
+    int32_t pv = irop_get_vreg(ptr);
+    int32_t dv = irop_get_vreg(value);
+    if (pv < 0 || dv < 0 || pv == dv)
+      continue;
+
+    /* The pointer must live in a real register: load_postinc_mop writes the
+     * incremented address back to the register it found the base in, and never
+     * to a spill slot, so a spilled P would silently lose the increment. */
+    {
+      IRLiveInterval *pli = tcc_ir_vreg_live_interval(ir, pv);
+      if (!pli || pli->allocation.offset != 0)
+        continue;
+      if (ra_alloc_half_unset(pli->allocation.r0) ||
+          ra_alloc_half_spilled(pli->allocation.r0))
+        continue;
+    }
+
+    /* Scan forward for `P <- P + #k`, bailing on anything that would change
+     * what the fusion means.  The jump-target check comes BEFORE the NOP
+     * skip: a NOPed quad that is still a jump target means a path enters the
+     * window that never executed the access, and once the add is folded away
+     * that path would leave P un-incremented. */
+    int add_idx = -1;
+    int assign_idx = -1; /* the `P <- T` half of a renamed split, if any */
+    for (int j = i + 1; j < n; ++j)
+    {
+      IRQuadCompact *jq = &ir->compact_instructions[j];
+      /* Leaving the region: an instruction reached from elsewhere may arrive
+       * with P un-incremented, and a branch may skip the add entirely. */
+      if (jq->is_jump_target)
+        break;
+      if (jq->op == TCCIR_OP_NOP)
+        continue;
+      if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF ||
+          jq->op == TCCIR_OP_IJUMP || jq->op == TCCIR_OP_SWITCH_TABLE ||
+          jq->op == TCCIR_OP_RETURNVALUE || jq->op == TCCIR_OP_RETURNVOID)
+        break;
+
+      if (jq->op == TCCIR_OP_ADD)
+      {
+        IROperand ad = tcc_ir_op_get_dest(ir, jq);
+        IROperand a1 = tcc_ir_op_get_src1(ir, jq);
+        IROperand a2 = tcc_ir_op_get_src2(ir, jq);
+        if (!ad.is_lval && irop_get_vreg(a1) == pv && irop_is_immediate(a2))
+        {
+          int64_t k = irop_get_imm64_ex(ir, a2);
+          int32_t av = irop_get_vreg(ad);
+          if (k >= 1 && k <= 255 && av == pv)
+          {
+            add_idx = j; /* in-place: P <- P + #k */
+          }
+          else if (k >= 1 && k <= 255 && av >= 0)
+          {
+            /* SSA rename splits the in-place bump into `T <- P + #k` followed
+             * by `P <- T [ASSIGN]`.  That is still the same increment when T
+             * is born at the ADD and dies at the copy — prove it with the
+             * allocator's own intervals, then fold and NOP both halves.
+             * Between the two halves only non-jump-target NOPs may sit. */
+            for (int m = j + 1; m < n; ++m)
+            {
+              IRQuadCompact *mq = &ir->compact_instructions[m];
+              if (mq->is_jump_target)
+                break;
+              if (mq->op == TCCIR_OP_NOP)
+                continue;
+              if (mq->op == TCCIR_OP_ASSIGN)
+              {
+                IROperand cd = tcc_ir_op_get_dest(ir, mq);
+                IROperand cs = tcc_ir_op_get_src1(ir, mq);
+                if (!cd.is_lval && !cs.is_lval && irop_get_vreg(cd) == pv &&
+                    irop_get_vreg(cs) == av)
+                {
+                  IRLiveInterval *tli = tcc_ir_vreg_live_interval(ir, av);
+                  if (tli && tli->start == (uint32_t)j && tli->end == (uint32_t)m)
+                  {
+                    add_idx = j;
+                    assign_idx = m;
+                  }
+                }
+              }
+              break; /* first non-NOP decides either way */
+            }
+          }
+        }
+        if (add_idx >= 0)
+          break;
+      }
+
+      /* Any other read or write of P in between would see the wrong value
+       * once the increment moves up to the load. */
+      {
+        int touches = 0;
+        for (int k = 0; k < 3 && !touches; ++k)
+        {
+          IROperand o;
+          if (k == 0)
+          {
+            if (!irop_config[jq->op].has_dest)
+              continue;
+            o = tcc_ir_op_get_dest(ir, jq);
+          }
+          else if (k == 1)
+          {
+            if (!irop_config[jq->op].has_src1)
+              continue;
+            o = tcc_ir_op_get_src1(ir, jq);
+          }
+          else
+          {
+            if (!irop_config[jq->op].has_src2)
+              continue;
+            o = tcc_ir_op_get_src2(ir, jq);
+          }
+          if (irop_get_vreg(o) == pv)
+            touches = 1;
+        }
+        if (jq->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, jq)) == pv)
+          touches = 1;
+        if (touches)
+          break;
+      }
+    }
+    if (add_idx < 0)
+      continue;
+
+    IRQuadCompact *aq = &ir->compact_instructions[add_idx];
+    IROperand incr = tcc_ir_op_get_src2(ir, aq);
+
+    /* Four fresh pool slots: dest, ptr, unused, increment (see the header). */
+    int nb = ir->iroperand_pool_count;
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+    tcc_ir_pool_add(ir, IROP_NONE);
+    if (nb + 3 >= ir->iroperand_pool_capacity)
+      continue;
+
+    q->op = is_load ? TCCIR_OP_LOAD_POSTINC : TCCIR_OP_STORE_POSTINC;
+    q->operand_base = (uint32_t)nb;
+    /* The backend wants the POINTER VALUE here, not the lvalue it dereferences:
+     * mach_ensure_in_reg on an lval operand emits a load OF the pointer from
+     * the memory it names, and the writeback then lands in a scratch. */
+    IROperand base = ptr;
+    base.is_lval = 0;
+    base.aux = 0;
+    /* LOAD_POSTINC decodes {dest=value, src1=base}; STORE_POSTINC decodes
+     * {dest=base, src1=value} — the same slots as the plain ops they replace. */
+    ir->iroperand_pool[nb + 0] = is_load ? value : base;
+    ir->iroperand_pool[nb + 1] = is_load ? base : value;
+    ir->iroperand_pool[nb + 2] = IROP_NONE;
+    ir->iroperand_pool[nb + 3] = incr;
+    aq->op = TCCIR_OP_NOP;
+    if (assign_idx >= 0)
+      ir->compact_instructions[assign_idx].op = TCCIR_OP_NOP; /* the `P <- T` half */
+    fused++;
+    RA_DBG("%s_postinc @%d: folded +%d from @%d", is_load ? "load" : "store", i,
+           (int)irop_get_imm64_ex(ir, incr), add_idx);
+  }
+
+  return fused;
+}
+
 int tcc_ir_move_coalescing(TCCIRState *ir)
 {
   LSLiveIntervalState *ls = &ir->ls;
+
+  /* Copies whose source outlives them cannot be coalesced by reassignment;
+   * propagate those away first so the loop below only sees the rest. */
+  int propagated = ra_copy_propagate(ir);
+  /* Then the copies whose source is born one instruction earlier, which have a
+   * producer to retarget instead of reads to redirect. */
+  int retargeted = ra_retarget_producer(ir);
+  /* Drop reloads of a slot into the registers that already hold it -- the
+   * union punning every soft-float routine opens with. */
+  int reloads = ra_redundant_reload_elim(ir);
+  /* And then the stores those reloads were the only reader of. */
+  reloads += ra_dead_frame_store_elim(ir);
+
   if (!ls->live_regs_by_instruction || ls->live_regs_by_instruction_size <= 0) {
     if (TCC_LOG_LS)
       LOG_LS("copy_stats coalesced=0 reaching_codegen=%d",
@@ -5998,9 +8005,14 @@ rev_check_done:
   if (coalesced > 0)
     tcc_ls_recompute_dirty_registers(ls);
 
+  /* Last: the IR is in its final shape, so an increment folded into a load
+   * cannot be moved apart again. */
+  int postinc = ra_load_postinc_fuse(ir);
+
   if (TCC_LOG_LS)
-    LOG_LS("copy_stats coalesced=%d reaching_codegen=%d", coalesced,
+    LOG_LS("copy_stats propagated=%d reloads=%d coalesced=%d retargeted=%d reaching_codegen=%d",
+           propagated, reloads, coalesced, retargeted,
            ra_count_copies_reaching_codegen(ir));
 
-  return coalesced;
+  return coalesced + propagated + reloads + retargeted + postinc;
 }

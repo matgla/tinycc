@@ -40,6 +40,7 @@ SSA_OPT_SRC = \
 	source/opt/ssa/scalar/tmp_block_const.c \
 	source/opt/ssa/cfg/phi.c \
 	source/opt/ssa/cfg/branch.c \
+	source/opt/ssa/cfg/switch_fold.c \
 	source/opt/ssa/cfg/or_bool_diamond.c \
 	source/opt/ssa/cfg/cmp_eq.c \
 	source/opt/ssa/cfg/vrp.c \

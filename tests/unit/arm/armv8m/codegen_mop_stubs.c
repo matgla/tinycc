@@ -202,8 +202,9 @@ void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src
 }
 
 void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOperand src2, MachineOperand dest,
-                                               TccIrOp op)
+                                               TccIrOp op, uint32_t barrel_shift)
 {
+  (void)barrel_shift;
   cgstub_record("data_processing_mop_flags", op, dest, src1, src2);
 }
 
@@ -246,6 +247,12 @@ int tcc_machine_has_bit_ops(void)
 
 void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op)
 {
+  cgstub_record("assign_mop", op, dest, src, CGSTUB_NO_OP);
+}
+
+void tcc_gen_machine_assign_mop_ex(MachineOperand src, MachineOperand dest, TccIrOp op, uint32_t zh)
+{
+  (void)zh;
   cgstub_record("assign_mop", op, dest, src, CGSTUB_NO_OP);
 }
 
@@ -757,6 +764,12 @@ void tcc_gen_machine_reserve_pool_bytes(int upcoming_bytes)
 void tcc_gen_machine_strldr_cache_reset(void)
 {
   cgstub_record("strldr_cache_reset", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
+}
+
+void tcc_gen_machine_strldr_cache_set_enabled(int enabled)
+{
+  (void)enabled;
+  cgstub_record("strldr_cache_set_enabled", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
 }
 
 void tcc_gen_machine_imm_cache_reset(void)

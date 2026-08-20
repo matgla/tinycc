@@ -93,6 +93,13 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
       break;
     }
 
+    /* A volatile access anywhere keeps the function alive.  The symbol scan below
+     * only catches a symbol that is itself volatile; when just a MEMBER is
+     * (`struct { volatile int a; }`), the symbol's type is not, and only the
+     * access carries the bit. */
+    if (tcc_ir_instr_access_is_volatile(ir, q))
+      return 0;
+
     /* A volatile sym on any operand keeps the function alive (observable write). */
     for (int k = 0; k <= 2; k++)
     {

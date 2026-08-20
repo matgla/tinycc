@@ -186,10 +186,6 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   int body_latch_target = -1;
   int body_end_is_implicit = 0;
   int cond_body = 0;
-  /* first instruction of the cond_body cold tail (decide + 1); calls at or
-   * after this index are allowed — the tail is proven terminating, so control
-   * never returns from it into the loop */
-  int cond_cold_start = -1;
   /* break_invert: body ends in a deciding JUMPIF-to-latch whose fall-through is the exit (`if (cond) break;`) */
   int break_invert = 0;
   int break_decide_idx = -1;
@@ -303,7 +299,6 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     if (!bad && decide >= 0 && branches == 1 && decide < exit_target - 1 && cold_terminates)
     {
       cond_body = 1;
-      cond_cold_start = decide + 1;
       body_latch_target = decide_target;
       body_end_jmp = exit_target - 1;
       body_end_is_implicit = 1;
@@ -351,7 +346,17 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   if (body_count > 128)
     return 0;
 
-  /* an lval that is not a local VAR dereferences a vreg-carried address; later passes mishandle those once rotated */
+  /* An lval that is not a local VAR dereferences a vreg-carried address.  Bodies
+     holding one used to be rejected outright ("later passes mishandle those once
+     rotated") -- that was one concrete bug, not a class: write_instr_at_nop left
+     the rotated loop's new tail CMP carrying the slot's PREVIOUS occupant's
+     orig_index, so it inherited that instruction's barrel-shift annotation and a
+     `cmp r2,#100` came out as `cmp r2,#100 lsl #8` (25600) -- the loop never
+     exited (gcc-torture pr71083, pr65401, pr56866, pr51581-1).  Pointer-walking
+     bodies are simply where the annotated ops live.  With orig_index fixed at
+     the source, admitting them is worth -2.8% cycles on the QEMU corpus
+     (dijkstra -1.33M, stringsearch -396k, memcpy-1 -338k, strcmp-1 -218k) for
+     zero test changes.  The macro stays: ROT_VAR_DIRECT shares its convention. */
 #define ROT_LVAL_IS_INDIRECT(op_)                                                                               \
   ((op_).is_lval && irop_get_vreg(op_) >= 0 &&                                                                  \
    !(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op_)) == TCCIR_VREG_TYPE_VAR && (op_).is_local))
@@ -451,9 +456,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
    * (body_has_extra), so the rewrite reconstructs them intact.  Dropping it is
    * what lets ordinary array loops (`for (i) s += p[i]`) bottom-test — worth
    * ~28k cycles on the ir suite at no size cost.  The indirect-lvalue guard
-   * below is a genuinely different condition and stays.
-   *
-   * a call in the body makes forwarding treat preheader/body copies of a call-clobbered value as interchangeable */
+   * below is a genuinely different condition and stays. */
   /* memoized across the body scan: the carried-constant probe walks the whole
    * function, and a body can hold several calls */
   int guard_folds = -1;
@@ -463,22 +466,19 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
     {
-      /* A call that can return stays rejected (see the forwarding note
-       * above).  Two provably-safe exceptions, both of which make the
-       * clobber unreachable from the loop:
-       *   - a noreturn callee: control never comes back, so the clobber
-       *     cannot reach a loop-carried value.  This is the `for (i)
-       *     if (v[i] != K) abort();` check-loop shape — the single largest
-       *     un-rotated family in the corpus (memclr / memcpy-a*);
+      /* A call that can return used to be rejected outright, on the
+       * forwarding note above.  Re-tested: with rot_guard_provably_folds
+       * mandatory below, the corpus shows no divergence and the ordinary
+       * `for (i = 0; i < N; i++) f(tab[i]);` shape -- every loop that calls
+       * anything, which is where TCC's remaining back-branch tax lives --
+       * bottom-tests like the call-free ones.  The two shapes that were
+       * already exempt stay exempt for their own reasons and need no guard
+       * reasoning of their own:
+       *   - a noreturn callee: control never comes back, so a clobber cannot
+       *     reach a loop-carried value.  This is the `for (i) if (v[i] != K)
+       *     abort();` check-loop shape (memclr / memcpy-a*);
        *   - any call inside the cond_body cold tail, whose terminating shape
-       *     cold_terminates already proved never falls back into the loop. */
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
-      int in_cold_tail = cond_body && cond_cold_start >= 0 && i >= cond_cold_start;
-      if (!tcc_ir_callee_is_noreturn(callee) && !in_cold_tail)
-      {
-        LOG_LOOP_OPT("Rotation: reject — body has returning hot-path call at %d", i);
-        return 0;
-      }
+       *     cold_terminates already proves never falls back into the loop. */
       /* Call-body rotation is only profitable when it is free: the pre-loop
        * guard must provably fold (a surviving guard trades the back-branch for
        * CMP+branch: +2 per function on memclr loop 3), and an IV that is read
@@ -498,6 +498,16 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
         return 0;
       }
     }
+    /* Rotating a body that walks memory through a pointer is a measured LOSS on
+       real Cortex-M33 silicon even though it retires FEWER instructions: the
+       rotated form leans on scaled-index addressing, which the M33 charges an
+       extra cycle for and QEMU's icount charges nothing (see
+       docs/qemu_cycle_profiling.md).  Measured on the RP2350 rig by swapping
+       one object at a time back to the old compiler: mibench_dijkstra +5.1%,
+       mibench_stringsearch +8.7%, bench_memcpy +13.7%, against -9%/-12%/-8%
+       INSTRUCTIONS in the QEMU corpus.  Loops over named locals (bubble sort's
+       inner loop) are admitted and are a clear win, so the gate is the operand
+       form, not rotation itself. */
     if ((irop_config[op].has_src1 && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_src1(ir, q))) ||
         (irop_config[op].has_src2 && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_src2(ir, q))) ||
         (op == TCCIR_OP_MLA && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_accum(ir, q))) ||
@@ -646,6 +656,33 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
   int region_end = body_end_jmp; /* last slot to overwrite (was body→latch JUMP) */
   int avail_slots = region_end - region_start + 1;
 
+  /* A SWITCH_TABLE's arms are IR indices held OUTSIDE the instruction stream,
+   * in ir->switch_tables[], so the body-branch scan above never sees them and
+   * the post-move remap below has to be told about them separately.  Left
+   * stale they point at whatever now occupies the old slot: an inlined
+   * `switch` in a rotated body dispatched two arms along, and the two arms
+   * nothing pointed at any more were deleted as dead
+   * (451_switch_const_selector).  Refuse the rotation outright for a target
+   * that lands in the overwritten region but in neither relocated range —
+   * the back-edge slot, or a NOP gap — since there is no index to map it to. */
+  for (int t = 0; t < ir->num_switch_tables; t++)
+  {
+    TCCIRSwitchTable *tbl = &ir->switch_tables[t];
+    for (int j = -1; j < tbl->num_entries; j++)
+    {
+      int tgt = (j < 0) ? tbl->default_target : (tbl->targets ? tbl->targets[j] : -1);
+      if (tgt < region_start || tgt > region_end)
+        continue;
+      if (tgt >= body_start && tgt <= body_end_jmp)
+        continue;
+      if (tgt >= body_latch_target && tgt <= latch_end)
+        continue;
+      LOG_LOOP_OPT("Rotation: reject — switch table %d target %d is inside [%d,%d] with no mapping", t, tgt,
+                   region_start, region_end);
+      return 0;
+    }
+  }
+
   /* the bottom test falls through to region_end+1; an explicit JUMP is needed when that misses exit_target */
   int need_exit_jump = 0;
   {
@@ -792,11 +829,11 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     wp++;
   }
 
+  int body_offset = region_start - body_start;
+  int latch_offset = (region_start + body_count) - eff_latch_start;
+
   if (body_has_branches)
   {
-    int body_offset = region_start - body_start;
-    int latch_new_start = region_start + body_count;
-    int latch_offset = latch_new_start - eff_latch_start;
     for (int i = body_target; i < body_target + body_count; i++)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
@@ -820,6 +857,30 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
             ir->compact_instructions[new_target].is_jump_target = 1;
         }
       }
+    }
+  }
+
+  /* Same relocation, applied to the arm indices the switch tables hold (see the
+   * pre-check above for why they need their own pass). */
+  for (int t = 0; t < ir->num_switch_tables; t++)
+  {
+    TCCIRSwitchTable *tbl = &ir->switch_tables[t];
+    for (int j = -1; j < tbl->num_entries; j++)
+    {
+      int *slot = (j < 0) ? &tbl->default_target : (tbl->targets ? &tbl->targets[j] : NULL);
+      if (!slot)
+        break;
+      int tgt = *slot;
+      int mapped = -1;
+      if (tgt >= body_start && tgt <= body_end_jmp)
+        mapped = tgt + body_offset;
+      else if (tgt >= eff_latch_start && tgt <= latch_end)
+        mapped = tgt + latch_offset;
+      if (mapped < 0)
+        continue;
+      *slot = mapped;
+      if (mapped < n)
+        ir->compact_instructions[mapped].is_jump_target = 1;
     }
   }
 

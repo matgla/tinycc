@@ -47,6 +47,7 @@ int tcc_ir_opt_rmw_byte_clear(TCCIRState *ir);
 int tcc_ir_opt_local_copy_prop(TCCIRState *ir);
 int tcc_ir_opt_struct_copy_roundtrip_elim(TCCIRState *ir);
 int tcc_ir_opt_const_memcpy_to_dest(TCCIRState *ir);
+int tcc_ir_opt_deref_operand_cse(TCCIRState *ir);
 
 #define I8  IROP_BTYPE_INT8
 #define I32 IROP_BTYPE_INT32
@@ -69,6 +70,15 @@ static IROperand utb_slot_addr(int32_t off, int btype)
 static IROperand utb_deref_temp(int pos, int btype)
 {
   return utb_lval(utb_temp(pos, btype));
+}
+
+/* A deref whose access is proven non-volatile.  deref_operand_cse declines
+ * anything without the mark, so every positive case must carry it. */
+static IROperand utb_deref_temp_nv(int pos, int btype)
+{
+  IROperand op = utb_lval(utb_temp(pos, btype));
+  op.aux |= IROP_AUX_NONVOLATILE;
+  return op;
 }
 
 static IROperand utb_var_lval(int pos, int btype)
@@ -350,6 +360,168 @@ UT_TEST(test_invariant_temp_deref_hoist_intervening_call_blocks)
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_vreg(utb_src1(ir, use1)), utb_vreg(utb_temp(0, I32)));
   UT_ASSERT_EQ(utb_vreg(utb_src1(ir, use2)), utb_vreg(utb_temp(0, I32)));
+  UT_ASSERT(utb_src1(ir, use1).is_lval);
+  UT_ASSERT(utb_src1(ir, use2).is_lval);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* ================================================================ deref_operand_cse */
+
+/* Returns the vreg both reads were rewritten onto, or -1 if either still
+ * dereferences the base.  The insert shifts positions, so the two ADDs are
+ * located by their dest vreg. */
+static int32_t docse_shared_read_vreg(TCCIRState *ir, int dest_a, int dest_b)
+{
+  int a = -1, b = -1;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    if (utb_op(ir, i) != TCCIR_OP_ADD)
+      continue;
+    int32_t dv = utb_vreg(utb_dest(ir, i));
+    if (dv == utb_vreg(utb_temp(dest_a, I32)))
+      a = i;
+    else if (dv == utb_vreg(utb_temp(dest_b, I32)))
+      b = i;
+  }
+  if (a < 0 || b < 0)
+    return -1;
+  IROperand sa = utb_src1(ir, a);
+  IROperand sb = utb_src1(ir, b);
+  if (sa.is_lval || sb.is_lval || utb_vreg(sa) != utb_vreg(sb))
+    return -1;
+  return utb_vreg(sa);
+}
+
+/* POSITIVE: the same word is read through T0 twice with only a pure ALU op
+ * between -- one inserted ASSIGN loads it, both reads become that TEMP. */
+UT_TEST(test_deref_operand_cse_two_reads_share_one_load)
+{
+  TCCIRState *ir = utb_hoist_new(3); /* T0..T2 used by hand below */
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp_nv(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_deref_temp_nv(0, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_deref_operand_cse(ir);
+
+  UT_ASSERT(changes > 0);
+  int32_t shared = docse_shared_read_vreg(ir, 1, 2);
+  UT_ASSERT(shared >= 0);
+  UT_ASSERT(shared != utb_vreg(utb_temp(0, I32)));
+
+  /* The inserted ASSIGN is the one and only remaining dereference of T0. */
+  int derefs = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IROperand s1 = utb_src1(ir, i);
+    if (s1.is_lval && utb_vreg(s1) == utb_vreg(utb_temp(0, I32)))
+      derefs++;
+  }
+  UT_ASSERT_EQ(derefs, 1);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: a conditional jump between the two reads does NOT end the region.
+ * The second read is only reached by falling through, so the value loaded at
+ * the first (dominating) read is still the right one -- this is the shape of
+ * `a[i].f == C || a[i].f > x`, mibench_dijkstra's inner loop. */
+UT_TEST(test_deref_operand_cse_spans_conditional_jump)
+{
+  TCCIRState *ir = utb_hoist_new(4); /* T0..T3 used by hand below */
+
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp_nv(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_temp(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_deref_temp_nv(0, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32), UTB_NONE);
+
+  int changes = tcc_ir_opt_deref_operand_cse(ir);
+
+  UT_ASSERT(changes > 0);
+  UT_ASSERT(docse_shared_read_vreg(ir, 1, 2) >= 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): the reads are not marked non-volatile.  Nothing in the IR
+ * can tell a volatile deref from a plain one, so an unmarked operand must be
+ * left alone -- two volatile reads are two reads. */
+UT_TEST(test_deref_operand_cse_unmarked_read_is_left_alone)
+{
+  TCCIRState *ir = utb_hoist_new(3);
+
+  int use1 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp(0, I32), utb_imm(1, I32));
+  int use2 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_deref_temp(0, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  UT_ASSERT_EQ(tcc_ir_opt_deref_operand_cse(ir), 0);
+  UT_ASSERT(utb_src1(ir, use1).is_lval);
+  UT_ASSERT(utb_src1(ir, use2).is_lval);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): a store to a *stack local* sits between the two reads.
+ * The GlobalSym pass treats that as harmless, and here it is not: the address
+ * in T0 is opaque and may well be that local's. */
+UT_TEST(test_deref_operand_cse_store_to_local_blocks)
+{
+  TCCIRState *ir = utb_hoist_new(3);
+
+  int use1 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp_nv(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_STORE, utb_slot_lval(-8, I32), utb_imm(7, I32), UTB_NONE);
+  int use2 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_deref_temp_nv(0, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  UT_ASSERT_EQ(tcc_ir_opt_deref_operand_cse(ir), 0);
+  UT_ASSERT(utb_src1(ir, use1).is_lval);
+  UT_ASSERT(utb_src1(ir, use2).is_lval);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): a call between the reads may write through T0. */
+UT_TEST(test_deref_operand_cse_intervening_call_blocks)
+{
+  TCCIRState *ir = utb_hoist_new(3);
+
+  static Sym docse_callee_sym;
+  utb_set_tok_str(TOK_FOO, "foo");
+  IROperand callee = utb_callee(ir, &docse_callee_sym, TOK_FOO);
+
+  int use1 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp_nv(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, callee, utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 0), I32));
+  int use2 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_deref_temp_nv(0, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  UT_ASSERT_EQ(tcc_ir_opt_deref_operand_cse(ir), 0);
+  UT_ASSERT(utb_src1(ir, use1).is_lval);
+  UT_ASSERT(utb_src1(ir, use2).is_lval);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): T0 is given a new address between the reads.  The IR is
+ * de-SSA'd where this pass runs, so this is reachable, and the two reads are
+ * of different words. */
+UT_TEST(test_deref_operand_cse_base_redefinition_blocks)
+{
+  TCCIRState *ir = utb_hoist_new(4);
+
+  int use1 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp_nv(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_temp(0, I32), utb_imm(4, I32));
+  int use2 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_deref_temp_nv(0, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
+
+  UT_ASSERT_EQ(tcc_ir_opt_deref_operand_cse(ir), 0);
   UT_ASSERT(utb_src1(ir, use1).is_lval);
   UT_ASSERT(utb_src1(ir, use2).is_lval);
 

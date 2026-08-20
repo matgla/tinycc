@@ -8,12 +8,12 @@
  * License as published by the Free Software Foundation.
  */
 
-/* strcpy(stack_dst, "literal") -> BLOCK_COPY(dst, literal, L+1) when L+1 is a
- * whole number of words.  BLOCK_COPY copies word-at-a-time; a non-multiple of 4
- * would clobber dst past the terminating NUL, so those are left as the runtime
- * __tcc_strcpy call.  The backend lowers a small BLOCK_COPY to inline stores and
- * a large one to memcpy -- both strictly better than the strcpy call.  Operand
- * convention mirrors the memset->BLOCK_COPY rewrite in ir/opt.c. */
+/* strcpy(stack_dst, "literal") -> BLOCK_COPY(dst, literal, L+1).  The backend
+ * lowers a small BLOCK_COPY to inline stores and a large one to memcpy -- both
+ * strictly better than the strcpy call.  L+1 need not be a whole number of
+ * words: tcc_gen_machine_block_copy_mop copies the 1..3 byte tail as bytes, so
+ * dst is never touched past the terminating NUL.  Operand convention mirrors
+ * the memset->BLOCK_COPY rewrite in ir/opt.c. */
 
 #include "ir.h"
 #include "ssa_opt.h"
@@ -38,11 +38,18 @@ static int strcpy_prepare(const StrFoldCtx *c, IROperand *out_dst, IROperand *ou
   if (irop_get_tag(dst) != IROP_TAG_STACKOFF || dst.is_lval)
     return 0;
 
-  if (!ir_opt_eval_const_string(c->ir, src, c->call_idx, &s, 0) ||
-      !ir_opt_eval_const_string_operand(c->ir, src, c->call_idx, &src_sym, 0))
+  if (ir_opt_eval_const_string(c->ir, src, c->call_idx, &s, 0) &&
+      ir_opt_eval_const_string_operand(c->ir, src, c->call_idx, &src_sym, 0))
+  {
+    len = (int)strlen(s);
+  }
+  else if (!ir_opt_eval_stack_const_string(c->ir, src, c->call_idx, &src_sym, &len))
+  {
+    /* A frame buffer holding known contents copies from the rodata those contents
+     * came from, which is what lets a local const array feed an inlined copy. */
     return 0;
-  len = (int)strlen(s);
-  if (len < 0 || ((len + 1) & 3) != 0)
+  }
+  if (len < 0)
     return 0;
 
   /* BLOCK_COPY reads the source with LDM, which faults on an unaligned base.
