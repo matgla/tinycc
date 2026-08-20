@@ -54,14 +54,24 @@ static int rcmp_operand_same(IROperand a, IROperand b)
          a.aux == b.aux;
 }
 
-static int rcmp_same_compare(TCCIRState *ir, int a, int b)
+/* May the compare at `del` be dropped in favour of the flags the one at `keep`
+ * left behind?  Deliberately asymmetric: `del` is the instruction that goes
+ * away, and a compare whose operand names volatile memory re-reads that memory
+ * to make its flags -- a read C requires to happen.  Identical flags are
+ * exactly the wrong reason to drop one, because `if (x < 5 && x > 5)` on a
+ * volatile x must still load x twice even though the second load provably
+ * cannot make the pair true.  The volatility of `keep` does not matter: it
+ * stays, so its access stays with it. */
+static int rcmp_can_drop(TCCIRState *ir, int keep, int del)
 {
-  IRQuadCompact *qa = &ir->compact_instructions[a];
-  IRQuadCompact *qb = &ir->compact_instructions[b];
-  if (qa->op != TCCIR_OP_CMP || qb->op != TCCIR_OP_CMP)
+  IRQuadCompact *qk = &ir->compact_instructions[keep];
+  IRQuadCompact *qd = &ir->compact_instructions[del];
+  if (qk->op != TCCIR_OP_CMP || qd->op != TCCIR_OP_CMP)
     return 0;
-  return rcmp_operand_same(tcc_ir_op_get_src1(ir, qa), tcc_ir_op_get_src1(ir, qb)) &&
-         rcmp_operand_same(tcc_ir_op_get_src2(ir, qa), tcc_ir_op_get_src2(ir, qb));
+  if (tcc_ir_instr_access_is_volatile(ir, qd))
+    return 0;
+  return rcmp_operand_same(tcc_ir_op_get_src1(ir, qk), tcc_ir_op_get_src1(ir, qd)) &&
+         rcmp_operand_same(tcc_ir_op_get_src2(ir, qk), tcc_ir_op_get_src2(ir, qd));
 }
 
 /* First index at or after `from` holding something other than a NOP. */
@@ -192,7 +202,7 @@ int tcc_ir_opt_redundant_cmp(TCCIRState *ir)
         if (prev < 0 || !rcmp_is_terminator(ir->compact_instructions[prev].op))
           ok = 0;
       }
-      if (ok && m != i && rcmp_same_compare(ir, i, m))
+      if (ok && m != i && rcmp_can_drop(ir, i, m))
       {
         LOG_IR_GEN("OPTIMIZE: redundant_cmp at %d (flags from %d, taken edge)", m, i);
         ir->compact_instructions[m].op = TCCIR_OP_NOP;
@@ -208,7 +218,7 @@ int tcc_ir_opt_redundant_cmp(TCCIRState *ir)
       for (int k = j + 1; ok && k <= m; k++)
         if (rcmp_is_entry(entry, k))
           ok = 0;
-      if (ok && m != i && rcmp_same_compare(ir, i, m))
+      if (ok && m != i && rcmp_can_drop(ir, i, m))
       {
         LOG_IR_GEN("OPTIMIZE: redundant_cmp at %d (flags from %d, fall-through)", m, i);
         ir->compact_instructions[m].op = TCCIR_OP_NOP;

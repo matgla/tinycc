@@ -1,17 +1,13 @@
 0000: StackLoc[-8] <-- #0 [STORE]
 0001: StackLoc[-4] <-- #0 [STORE]
-0002: StackLoc[-4] <-- #5 [STORE]
-0003: T0 <-- Addr[StackLoc[-8]]
-0004: V0 <-- T0 [STORE]
-0005: T1 <-- V0 [ASSIGN]
-0006: CMP #0,#0
-0007: JMP to 12  if "!="
-0008: T2 <-- V0 [ASSIGN]
-0009: T3 <-- T2 ADD #4
-0010: T4 <-- #1 [ASSIGN]
-0011: JMP to 13
-0012: T4 <-- #0 [ASSIGN]
-0013: StackLoc[-16] <-- T4 [STORE]
-0014: JMP to 15
-0015: T5 <-- StackLoc[-16] [LOAD]
-0016: RETURNVALUE T5
+0002: StackLoc[-8] <-- #3 [STORE]
+0003: StackLoc[-4] <-- #5 [STORE]
+0004: T0 <-- Addr[StackLoc[-8]]
+0005: T1 <-- T0 [ASSIGN]
+0006: T2 <-- T0 [ASSIGN]
+0007: T6 <-- #5 [ASSIGN]
+0008: T4 <-- #3 ADD #5
+0009: JMP to 10
+0010: PARAM0[call_0] T4
+0011: CALL GlobalSym(#0) --> T5
+0012: RETURNVALUE T5
