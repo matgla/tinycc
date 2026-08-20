@@ -194,6 +194,13 @@ int tcc_ir_opt_cmp_imm_swap(TCCIRState *ir)
     if (irop_is_64bit(src1) || irop_is_64bit(src2))
       continue;
 
+    /* A barrel-shift annotation binds to the src2 SLOT of its instruction:
+     * the compare really reads (src2 SHIFT #n).  The exchange would re-anchor
+     * the shift onto the former constant, and there is no src1-shifted form
+     * to move it to, so such a compare cannot be swapped at all. */
+    if (tcc_ir_barrel_shift_at(ir, q))
+      continue;
+
     enum { CIS_MAX_READERS = 8 };
     int readers[CIS_MAX_READERS];
     int nreaders = cis_collect_readers(ir, i, entry, readers, CIS_MAX_READERS);

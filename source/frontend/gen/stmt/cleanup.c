@@ -177,6 +177,14 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   int saved_inline_return_loc = tcc_state->inline_return_loc;
   int saved_inline_return_vr = tcc_state->inline_return_vr;
   uint8_t saved_inline_return_redirected = tcc_state->inline_return_redirected;
+  /* Scope-exit cleanups are emitted even in CODE_OFF regions (see
+   * try_call_scope_cleanup), and the replayed body's internal control flow
+   * flips CODE_OFF back on when a forward branch inside it is resolved.  The
+   * call this expansion replaces leaves reachability untouched, so the state
+   * must survive the replay -- without this, a cleanup body containing an
+   * `if` cleared the CODE_OFF a final `return` had set, and the enclosing
+   * function got a spurious "function might return no value". */
+  int saved_nocode_wanted = nocode_wanted;
 
   func_vt = s->type; /* void */
   func_var = 0;
@@ -215,6 +223,7 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   tcc_ir_backpatch_to_here(tcc_state->ir, rsym);
 
   /* --- Restore state --- */
+  nocode_wanted = saved_nocode_wanted;
   tcc_state->in_inline_expansion = saved_in_inline_expansion;
   tcc_state->inline_return_loc = saved_inline_return_loc;
   tcc_state->inline_return_vr = saved_inline_return_vr;

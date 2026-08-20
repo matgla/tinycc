@@ -1,0 +1,4 @@
+subset=1 0 1
+pun4=3f800000 c0200000
+assemble=00c0ffee deadbeef
+zpun=00000000 12345678

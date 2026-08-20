@@ -150,10 +150,23 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
     int dst_is_stackoff = 0;
     int dst_base = 0;
     int32_t dst_vr = -1;
+    /* When the destination slot belongs to a NAMED local, the relocated
+     * stores must carry that name: an anonymous store into a named var's
+     * storage is invisible to every name-keyed analysis (the anonymous
+     * StackLoc DCE sees no anonymous reader, var liveness sees no named
+     * writer), and NOPing the dst LEA below also un-address-takes the var.
+     * The mirror image of the named-VAR source-store guard further down. */
+    IROperand dst_name_op = p_dst;
+    int dst_named = 0;
     if (irop_get_tag(p_dst) == IROP_TAG_STACKOFF && p_dst.is_local && !p_dst.is_lval)
     {
       dst_is_stackoff = 1;
       dst_base = (int)irop_get_imm64_ex(ir, p_dst);
+      if (irop_get_vreg(p_dst) >= 0)
+      {
+        dst_named = 1;
+        dst_name_op = p_dst;
+      }
       /* Forbid overlap with src range; the rewrite assumes non-overlap. */
       if (dst_base + total_size > tmp_base && dst_base < tmp_base + total_size)
         continue;
@@ -194,8 +207,14 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
               dst_is_stackoff = 1;
               dst_base = (int)irop_get_imm64_ex(ir, ls) + trace_add;
               dst_vr = -1;
+              if (irop_get_vreg(ls) >= 0)
+              {
+                dst_named = 1;
+                dst_name_op = ls;
+              }
               if (dst_base + total_size > tmp_base && dst_base < tmp_base + total_size) {
                 dst_is_stackoff = 0;
+                dst_named = 0;
                 dst_vr = irop_get_vreg(p_dst);
               }
               break;
@@ -531,6 +550,12 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         continue;
     }
 
+    /* The memset rewrite only shifts PARAM0's offset, leaving an anonymous
+     * address of the named var's slot behind — the same invisibility this
+     * pass must avoid.  Rare combination; just refuse it. */
+    if (dst_named && memset_idx >= 0)
+      continue;
+
     /* Stores into the src range before this index are dead: the contributing stores fully cover it. */
     int earliest_contrib_idx = i;
     for (int s = 0; s < nstores; s++)
@@ -781,7 +806,27 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
 
       if (dst_is_stackoff)
       {
-        if (irop_get_tag(st_dest_old) == IROP_TAG_STACKOFF && st_dest_old.is_local &&
+        if (dst_named)
+        {
+          /* The store must write the named var AS that var: keep its vreg
+           * identity so name-keyed liveness/DCE see the definition, with the
+           * per-store width and interior offset (the same shape a struct
+           * member write through the var produces). */
+          int store_btype = (sq->op == TCCIR_OP_STORE_INDEXED)
+                            ? irop_get_btype(st_src)
+                            : irop_get_btype(st_dest_old);
+          IROperand new_dest = dst_name_op;
+          new_dest.is_lval = 1;
+          new_dest.btype = store_btype;
+          new_dest.u.imm32 = dst_base + offset;
+          tcc_ir_pool_ensure(ir, 2);
+          int new_pool = ir->iroperand_pool_count;
+          tcc_ir_pool_add(ir, new_dest);
+          tcc_ir_pool_add(ir, st_src);
+          sq->op = TCCIR_OP_STORE;
+          sq->operand_base = new_pool;
+        }
+        else if (irop_get_tag(st_dest_old) == IROP_TAG_STACKOFF && st_dest_old.is_local &&
             sq->op == TCCIR_OP_STORE)
         {
           IROperand new_dest = st_dest_old;

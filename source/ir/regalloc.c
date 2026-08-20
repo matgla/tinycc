@@ -6849,6 +6849,14 @@ static int ra_copy_propagate(TCCIRState *ir)
       IRLiveInterval *dst_li = tcc_ir_vreg_live_interval(ir, dv);
       if (!src_li || !dst_li)
         continue;
+      /* A phi-pinned dest shares its register with an identity-elided phi
+       * partner (post_ra_forward_diamond / ra_phi_copy_needed): the partner's
+       * reads continue PAST dst's own interval, and this copy is the only
+       * write that puts the value there.  Removing it leaves the shared
+       * register stale on the path the elided copy used to cover — the
+       * ra_refine_live_regs_accurate clamp-diamond self-host break. */
+      if (dst_li->phi_pinned)
+        continue;
       if (src_li->allocation.offset != 0)
         continue;
       if (ra_alloc_half_spilled(src_li->allocation.r0) ||
@@ -7250,6 +7258,12 @@ static int ra_retarget_producer(TCCIRState *ir)
       IRLiveInterval *src_li = tcc_ir_vreg_live_interval(ir, sv);
       IRLiveInterval *dst_li = tcc_ir_vreg_live_interval(ir, dv);
       if (!src_li || !dst_li)
+        continue;
+      /* Retargeting moves the producer's write off src's register.  A
+       * phi-pinned src shares that register with an identity-elided phi
+       * partner whose reads outlive src's interval — the write must stay.
+       * (Mirror of the ra_copy_propagate guard.) */
+      if (src_li->phi_pinned)
         continue;
       if (dst_li->allocation.offset != 0)
         continue;

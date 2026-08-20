@@ -534,6 +534,28 @@ TEST_FILES = [
     # neighbour's address.  Both directions are covered here.
     ("466_licm_global_load_alias.c", 0),
 
+    # Scaled derefs reduced to a pointer walk that ends post-indexed
+    # (iv_scaled_deref + ra:load_postinc/ra:store_postinc): correctness pins
+    # for walk/index desync, write-back register, and fused store placement.
+    # (Shipped with the pass but missed from this list.)
+    ("467_scaled_deref_ptr_walk_postinc.c", 0),
+
+    # memmove_to_indexed_stores relocated a covered temp's stores onto the
+    # memcpy DESTINATION as anonymous StackLoc writes.  When that destination
+    # is a NAMED local (the inlined memcpy type-pun shape), the anonymous
+    # stores are invisible to every name-keyed analysis and the anonymous
+    # StackLoc DCE deletes them, leaving the named load reading uninitialized
+    # frame — the self-host break where the device tcc rejected every 'ldr'.
+    # The relocated stores must keep the destination var's vreg identity.
+    ("468_memmove_fold_named_dst.c", 0),
+
+    # A clamp diamond whose bound phi copy is identity-elided by
+    # post_ra_forward_diamond (phi_pinned share): ra_copy_propagate /
+    # ra_retarget_producer must not delete or retarget the pinned def, or the
+    # shared register enters the loop holding a stale pointer and the loop
+    # bound becomes an address (the 04_for.c on-device self-host HardFault).
+    ("469_phi_pinned_copy_prop.c", 0),
+
     # Compile-time strlen constant folding
     ("171_strlen_constfold.c", 0),
 
