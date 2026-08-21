@@ -1005,6 +1005,19 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         /* else: fall-through predecessor — keep current state intact */
       }
     }
+    /* BLOCK_COPY writes a whole range of a frame object at once.  This pass has
+     * no representation for that, so drop everything rather than forward a value
+     * the copy has overwritten -- which is what happened to the byte stores that
+     * a folded strcpy copies over. */
+    if (q->op == TCCIR_OP_BLOCK_COPY)
+    {
+      LOG_IR_GEN("STORE-LOAD: Invalidate all at i=%d due to BLOCK_COPY", i);
+      memset(hash_table, 0, sizeof(hash_table));
+      entry_count = 0;
+      write_tracker_gen++;
+      continue;
+    }
+
     /* Calls only invalidate addrtaken stores whose LEA appeared at/before this call. */
     if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL)
     {
@@ -1152,6 +1165,12 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
       int64_t addr_offset;
       uint32_t h;
       StoreEntry *e;
+
+      /* A volatile read must be performed, not answered from a tracked store
+       * (`volatile int x; x = 1; x = 2;` — the reads are what keep both
+       * stores alive). */
+      if (tcc_ir_access_is_volatile(ir, src1))
+        continue;
 
       /* Only forward for stack locals or LEA-resolvable non-locals. */
       int load_via_lea = 0;
@@ -1924,6 +1943,14 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
           addr_sym = NULL;
           addr_offset = irop_get_imm64_ex(ir, src1);
         }
+
+        /* Per-VAR sentinel sym, exactly as the LOAD and STORE-source paths
+         * stamp it.  Without it a VAR operand keys as (NULL, 0) -- every VAR
+         * reads offset 0 -- so it matched no VAR store (the miss that kept an
+         * inlined predicate's 0/1 materialized) and could match an anonymous
+         * StackLoc entry that happened to sit at offset 0. */
+        if (addr_vr >= 0 && TCCIR_DECODE_VREG_TYPE(addr_vr) == TCCIR_VREG_TYPE_VAR)
+          addr_sym = (const Sym *)(uintptr_t)(1 + (unsigned)TCCIR_DECODE_VREG_POSITION(addr_vr));
 
         uint32_t h = ((uintptr_t)addr_sym * 31 + (uint32_t)addr_offset * 17) % 128;
         StoreEntry *e;
@@ -3140,6 +3167,9 @@ static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
         IROperand u = (s == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
         if (!u.is_sym || !u.is_lval)
           continue;
+        /* A volatile read of the global has to stay a read. */
+        if (tcc_ir_access_is_volatile(ir, u))
+          continue;
         IRPoolSymref *uref = irop_get_symref_ex(ir, u);
         if (!uref || !uref->sym)
           continue;
@@ -3191,6 +3221,19 @@ static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
         IRPoolSymref *dref = irop_get_symref_ex(ir, dest);
         if (!dref || !dref->sym)
           continue;
+        if (tcc_ir_access_is_volatile(ir, dest))
+        {
+          /* Don't hand a volatile location's value to later reads; drop any
+           * entry it overwrites. */
+          for (int k = 0; k < entry_count;)
+          {
+            if (entries[k].sym == dref->sym && entries[k].addend == dref->addend)
+              entries[k] = entries[--entry_count];
+            else
+              k++;
+          }
+          continue;
+        }
         int dbtype = irop_get_btype(dest);
         /* Track plain value vregs and immediate constants (INT32/INT64); invalidate anything else. */
         int32_t val_vr = irop_get_vreg(src1);
@@ -3263,7 +3306,8 @@ static int tcc_ir_opt_global_sl_fwd__timed(TCCIRState *ir)
       }
       continue;
     }
-    if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC)
+    if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC ||
+        q->op == TCCIR_OP_BLOCK_COPY)
     {
       /* These could hit any address — invalidate. */
       entry_count = 0;

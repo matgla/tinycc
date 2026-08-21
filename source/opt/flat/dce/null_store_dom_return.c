@@ -90,6 +90,11 @@ int tcc_ir_opt_null_store_dom_return(TCCIRState *ir)
           return 0;
       }
     }
+
+      /* A volatile MEMBER of a non-volatile symbol only shows up on the access,
+       * not on the symbol's type. */
+      if (tcc_ir_instr_access_is_volatile(ir, q))
+        return 0;
   }
 #define NSDR_MAX_TEMP 8192
 #define NSDR_MAX_VAR 1024
@@ -171,7 +176,7 @@ int tcc_ir_opt_null_store_dom_return(TCCIRState *ir)
       if (dest.is_lval && !dest.is_local)
       {
         /* Direct immediate NULL address operand. */
-        if (irop_is_immediate(dest) && irop_get_imm64_ex(ir, dest) == 0)
+        if (irop_is_lval_imm_addr(dest) && irop_get_imm64_ex(ir, dest) == 0)
         {
           ub_store_idx = i;
           break;

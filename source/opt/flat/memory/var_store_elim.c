@@ -46,6 +46,12 @@ static int var_pos_in_range(IROperand op, int max_var)
 /* 1 if q's only effect is defining its dest (safe to NOP when dest unread) */
 static int ir_op_pure_for_dead_var_dest(TCCIRState *ir, IRQuadCompact *q)
 {
+  /* A volatile access happens whether or not anyone wants the value, so an
+   * instruction performing one is never pure -- `int t = mmio;` with t unread
+   * still has to load.  Free for functions that touch no volatile memory. */
+  if (tcc_ir_instr_access_is_volatile(ir, q))
+    return 0;
+
   switch (q->op) {
   case TCCIR_OP_NOP:
   case TCCIR_OP_STORE_INDEXED:
@@ -78,7 +84,7 @@ static int ir_op_pure_for_dead_var_dest(TCCIRState *ir, IRQuadCompact *q)
   case TCCIR_OP_CMP:
     return 0;
   case TCCIR_OP_LOAD: {
-    /* no MMIO / volatile risk */
+    /* volatile ruled out above; what is left must not be MMIO */
     IROperand s = tcc_ir_op_get_src1(ir, q);
     int32_t v = irop_get_vreg(s);
     return irop_is_immediate(s) || s.is_sym ||

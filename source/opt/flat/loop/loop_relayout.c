@@ -36,6 +36,13 @@
  * why it needs none of rotation's semantic gates (calls, indexed memory and
  * pointer lvalues in the body are all fine here).
  *
+ * The header need not be a single `CMP / JUMPIF`.  A short-circuit condition
+ * (`while (x && i < 32)`) emits one test/JUMPIF pair per conjunct, so the
+ * trampoline is found by scanning the header's fall-through chain rather than
+ * assumed at hi + 2.  Everything ahead of the trampoline keeps its index and
+ * is never permuted, so only an unconditional transfer inside that chain, or
+ * a test branching into the middle of the region, disqualifies the loop.
+ *
  * The rewrite permutes IRQuadCompact records in place.  Each record carries
  * its own operand_base, so moving the record moves its operands with it and
  * the operand pool is never touched.  Every old index in the permuted region
@@ -54,7 +61,7 @@
  * Indices outside the region map to themselves. */
 typedef struct RelayoutMap
 {
-  int region_start; /* hi + 2 */
+  int region_start; /* the header's body trampoline */
   int region_end;   /* body_end_jmp */
   int body_start;
   int body_end; /* last body instruction, excludes the body->latch JUMP */
@@ -151,19 +158,41 @@ int try_relayout_loop(TCCIRState *ir, IRLoop *loop)
   if (hi + 2 > loop->end_idx)
     return 0;
 
-  IRQuadCompact *cmp_q = &ir->compact_instructions[hi];
-  IRQuadCompact *jif_q = &ir->compact_instructions[hi + 1];
-  IRQuadCompact *jmp_q = &ir->compact_instructions[hi + 2];
-
-  if (cmp_q->op != TCCIR_OP_CMP || jif_q->op != TCCIR_OP_JUMPIF || jmp_q->op != TCCIR_OP_JUMP)
+  /* The header is a fall-through chain of tests ending in the body
+   * trampoline.  A single `CMP / JUMPIF` is the common case, but a
+   * short-circuit condition (`while (x && i < 32)`) emits one test/JUMPIF
+   * pair per conjunct, so scan for the trampoline rather than assuming it
+   * sits at hi + 2.  Everything ahead of the trampoline keeps its index and
+   * is never permuted; all that matters is that control still reaches the
+   * trampoline by fall-through, so only an unconditional transfer in the
+   * chain disqualifies it. */
+  int tramp_idx = -1;
+  int num_tests = 0;
+  for (int i = hi; i <= loop->end_idx; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_JUMP)
+    {
+      tramp_idx = i;
+      break;
+    }
+    if (q->op == TCCIR_OP_JUMPIF)
+    {
+      num_tests++;
+      continue;
+    }
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_RETURNVOID || q->op == TCCIR_OP_RETURNVALUE)
+      RJ("header-transfer");
+  }
+  if (tramp_idx < 0 || num_tests == 0 || tramp_idx <= hi || tramp_idx + 2 > loop->end_idx)
     RJ("header-shape");
 
-  int exit_target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jif_q));
+  IRQuadCompact *jmp_q = &ir->compact_instructions[tramp_idx];
   int body_start = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jmp_q));
 
   /* back edge: first JUMP to the header below the trampoline */
   int backedge_idx = -1;
-  for (int i = hi + 3; i <= loop->end_idx; i++)
+  for (int i = tramp_idx + 1; i <= loop->end_idx; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP && (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q)) == hi)
@@ -175,7 +204,7 @@ int try_relayout_loop(TCCIRState *ir, IRLoop *loop)
   if (backedge_idx < 0)
     RJ("no-backedge");
 
-  int latch_start = hi + 3;
+  int latch_start = tramp_idx + 1;
   int latch_end = backedge_idx - 1;
   if (latch_end < latch_start)
     RJ("empty-latch");
@@ -209,7 +238,7 @@ int try_relayout_loop(TCCIRState *ir, IRLoop *loop)
   if (body_end_jmp < 0)
     RJ("no-body-latch-jump");
 
-  int region_start = hi + 2;
+  int region_start = tramp_idx;
   int region_end = body_end_jmp;
   int body_end = body_end_jmp - 1;
   int body_count = body_end - body_start + 1;
@@ -217,11 +246,19 @@ int try_relayout_loop(TCCIRState *ir, IRLoop *loop)
   if (body_count <= 0 || eff_latch_count <= 0)
     RJ("degenerate-counts");
 
-  /* the loop's own exit, and everything reachable after it, must lie outside
+  /* every header exit, and everything reachable after it, must lie outside
    * the region: an exit into the middle of it is a shape this pass does not
-   * model */
-  if (exit_target >= region_start && exit_target <= region_end)
-    RJ("exit-inside-region");
+   * model.  A header test that branches to the body itself is fine -- that
+   * target is remapped like any other. */
+  for (int i = hi; i < tramp_idx; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    if (t >= region_start && t <= region_end && t != body_start)
+      RJ("exit-inside-region");
+  }
 
   /* an IJUMP anywhere in the region has un-enumerable targets that cannot be
    * remapped */

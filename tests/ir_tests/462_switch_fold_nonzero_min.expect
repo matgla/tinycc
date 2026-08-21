@@ -1,0 +1,5 @@
+neg min: r = 0
+pos min: s = 120
+out of range: t = 7
+runtime neg min: u = 0
+PASS

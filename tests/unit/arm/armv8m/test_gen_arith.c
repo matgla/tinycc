@@ -336,7 +336,7 @@ UT_TEST(test_dp_flags_ands_reg_reg_reg)
    * as test_dp_and_reg_reg_reg_t32 but with S=1 (bit 20) set:
    * 0xEA000000 | S | rd<<8 | rn<<16 | rm = 0xEA110002. */
   tcc_gen_machine_data_processing_mop_flags(mop_reg(R1, IROP_BTYPE_INT32), mop_reg(R2, IROP_BTYPE_INT32),
-                                            mop_reg(R0, IROP_BTYPE_INT32), TCCIR_OP_AND);
+                                            mop_reg(R0, IROP_BTYPE_INT32), TCCIR_OP_AND, 0);
 
   UT_ASSERT_EQ(ind, 4);
   UT_ASSERT_EQ(read_le16(cur_text_section->data), 0xEA11);

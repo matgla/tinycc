@@ -373,11 +373,18 @@ void gen_inline_functions(TCCState *s)
       if (sym && (sym->type.t & VT_INLINE) && sym->type.ref && sym->type.ref->f.func_alwinl && !sym->a.addrtaken &&
           !sym->type.ref->f.func_outofline_needed)
         continue;
-      if (sym && sym->type.ref && (sym->type.ref->f.func_auto_inline || sym->type.ref->f.func_eval_only_inline))
+      if (sym && sym->type.ref && (sym->type.ref->f.func_auto_inline || sym->type.ref->f.func_eval_only_inline) &&
+          !sym->type.ref->f.func_deferred_inline)
       {
         /* All auto-inline and eval-only-inline functions (static and
          * non-static) are compiled immediately at definition time.
-         * Skip here — never re-emit. */
+         * Skip here — never re-emit.
+         *
+         * func_deferred_inline is the exception: those are `static inline`
+         * bodies this function still owes the TU, so they must fall through
+         * to the sym->c ("was actually referenced") test below.  A call site
+         * can always decline — inline asm in the body, address taken, a
+         * shadowed identifier — and then the real call needs a real symbol. */
         if (s->verbose >= 2)
           fprintf(stderr, "[auto-inline] gen_inline_functions: skipping %s (compiled at definition)\n",
                   get_tok_str(sym->v & ~SYM_FIELD, NULL));

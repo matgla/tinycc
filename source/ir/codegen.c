@@ -2827,6 +2827,16 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     int saved_call_outgoing_base = ir->call_outgoing_base;
     int saved_call_nested_save_base = ir->call_nested_save_base;
 
+    /* A function that touches volatile anywhere switches the memory cache OFF
+     * for its whole body.  Resetting per IR op would not be enough -- the two
+     * reads of `return *p + *p` on a `volatile int *` are one op -- and the
+     * per-op volatile predicate below only recognises volatile LOCALS anyway,
+     * not a volatile global or a volatile deref.  Volatile bodies are rare.
+     * Knob: TCC_DISABLE_PASS=codegen:strldr_xir. */
+    const int strldr_reset_every_op =
+        ir->func_has_volatile_access || tcc_ir_opt_pass_disabled("codegen:strldr_xir");
+    tcc_gen_machine_strldr_cache_set_enabled(!strldr_reset_every_op);
+
     /* ---- Instruction loop ---- */
     for (int i = 0; i < ir->next_instruction_index; i++)
     {
@@ -2859,19 +2869,32 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         dry_pool_entries[i] = (uint16_t)(en > 0xFFFF ? 0xFFFF : en);
       }
 
-      /* Reset the STR→LDR memory-reload cache at every IR instruction
-       * boundary (it tracks memory state, which an aliasing store on a
-       * jumped-from path could invalidate without an emit the tracker sees).
+      /* The STR/LDR memory-reload cache follows the same rule as the
+       * MOV-equivalence cache below: every emitted instruction updates it
+       * through ot() (a register write invalidates the entries naming that
+       * register, a store invalidates what it may alias, and a call or any
+       * unclassified opcode forces a full reset), so emission-order facts
+       * only stop describing reality at a real control-flow merge.
        *
-       * The MOV-equivalence (GPR value) cache, by contrast, stays sound
-       * across straight-line IR-op boundaries: every emitted instruction
-       * updates it (invalidating its dest reg, with calls/unknown opcodes
-       * forcing a full reset), so register equivalences only become invalid
-       * at a real control-flow merge.  Reset it only at jump targets; this
-       * lets cross-IR `mov` chains — e.g. a soft-float double result copied
-       * to its callee-saved home pair and then back to the next call's
-       * argument pair — coalesce away. */
-      tcc_gen_machine_strldr_cache_reset();
+       * Resetting it at EVERY IR boundary — which is what this did — meant a
+       * spilled value materialized by one IR op was reloaded from scratch by
+       * the next, and the shape that costs is a whole basic block of them:
+       * reload four spilled halves, compare, branch, and reload the same four
+       * in the not-taken arm.
+       *
+       * The extra resets over the mov_equiv condition are the two things a
+       * memory cache has that a register cache does not: inline asm, which
+       * emits code that never passes through ot() at all (and only in the
+       * real pass), and a volatile access, which must reach memory rather
+       * than answer from a register. */
+      int strldr_barrier =
+          strldr_reset_every_op ||
+          cq->is_jump_target || (branch_target_reset && branch_target_reset[i]) ||
+          cq->op == TCCIR_OP_INLINE_ASM || cq->op == TCCIR_OP_ASM_INPUT ||
+          cq->op == TCCIR_OP_ASM_OUTPUT || cq->op == TCCIR_OP_SETJMP ||
+          cq->op == TCCIR_OP_NL_SETJMP || ir_codegen_op_touches_volatile(ir, cq);
+      if (strldr_barrier)
+        tcc_gen_machine_strldr_cache_reset();
       /* Volatile slot access: drop the store→reload spill-cache peephole so
        * each volatile load reaches memory instead of reusing a just-stored
        * register (the peephole is otherwise only cleared at jump targets). */
@@ -3206,7 +3229,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 irop_has_vreg(cmp_s1) &&
                 irop_get_vreg(cmp_s1) == irop_get_vreg(dest_ir))
             {
-              SCRATCH_WRAP(tcc_gen_machine_data_processing_mop_flags(a.src1, a.src2, a.dest, cq->op));
+              SCRATCH_WRAP(tcc_gen_machine_data_processing_mop_flags(
+                  a.src1, a.src2, a.dest, cq->op, (uint32_t)tcc_ir_zero_half64_at(ir, cq) << 18));
               codegen_skip_cmp = i + 1;
               ir->codegen_flags_live = 1;
               break;
@@ -3236,7 +3260,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           }
         }
         {
+          /* ADD/SUB: the zero_half64 bits matter here too -- its producer rule
+           * assumes the carry lowering can see them. */
           uint32_t bs = tcc_ir_barrel_shift_at(ir, cq);
+          bs |= (uint32_t)tcc_ir_zero_half64_at(ir, cq) << 18;
           SCRATCH_WRAP(tcc_gen_machine_data_processing_mop(a.src1, a.src2, a.dest, cq->op, bs));
         }
         break;
@@ -3386,6 +3413,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
            * emitter can skip the dead low/high word write. */
           if (cq->op == TCCIR_OP_SHL || cq->op == TCCIR_OP_SHR || cq->op == TCCIR_OP_SAR)
             bs |= (uint32_t)tcc_ir_shift64_dead_half_at(ir, cq) << 16;
+          /* Bits 18-23: which 64-bit operand halves are provably zero, and
+           * which halves of the result no consumer reads.  See
+           * source/opt/flat/fusion/zero_half64.c. */
+          bs |= (uint32_t)tcc_ir_zero_half64_at(ir, cq) << 18;
           SCRATCH_WRAP(tcc_gen_machine_data_processing_mop(a.src1, a.src2, a.dest, cq->op, bs));
         }
         break;
@@ -4321,7 +4352,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           }
         }
 
-        SCRATCH_WRAP(tcc_gen_machine_assign_mop(a.src1, a.dest, cq->op));
+        SCRATCH_WRAP(tcc_gen_machine_assign_mop_ex(a.src1, a.dest, cq->op, tcc_ir_zero_half64_at(ir, cq)));
         break;
       }
       case TCCIR_OP_ZEXT:
@@ -4331,7 +4362,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
          * ZEXT as a distinct opcode is to be opaque to the IR optimizer's
          * value-tracking, which would otherwise sign-extend the source. */
         MopArgs a = DECODE(.dest = 2, .src1 = 1);
-        SCRATCH_WRAP(tcc_gen_machine_assign_mop(a.src1, a.dest, TCCIR_OP_ASSIGN));
+        SCRATCH_WRAP(tcc_gen_machine_assign_mop_ex(a.src1, a.dest, TCCIR_OP_ASSIGN, tcc_ir_zero_half64_at(ir, cq)));
         break;
       }
       case TCCIR_OP_PACK64:

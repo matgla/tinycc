@@ -700,6 +700,9 @@ IRTESTS_REQUIREMENTS := $(IRTESTS_DIR)/requirements.txt
 IRTESTS_VENV_STAMP := $(VENV_DIR)/.irtests-requirements.stamp
 PCH_BENCHMARK_SCRIPT := $(IRTESTS_DIR)/benchmark_pch.py
 PCH_PREPARE_SCRIPT := $(IRTESTS_DIR)/prepare_pch.py
+# The recipe below cd's into $(IRTESTS_DIR) before running pytest, so this is
+# passed through $(abspath ...) there: $(TOP) is "." in this Makefile, and a
+# relative --compiler would be looked up from the test directory instead.
 GOLDEN_IR_COMPILER ?= $(TOP)/armv8m-tcc.debug
 
 NEWLIB_DIR := $(IRTESTS_DIR)/qemu/mps2-an505/newlib_build/arm-none-eabi/newlib
@@ -981,7 +984,7 @@ test-golden-ir: cross test-venv
 	@echo "------------ golden IR snapshot tests ------------"
 	@compiler_arg=""; \
 	if [ -x "$(GOLDEN_IR_COMPILER)" ]; then \
-		compiler_arg="--compiler $(GOLDEN_IR_COMPILER)"; \
+		compiler_arg="--compiler $(abspath $(GOLDEN_IR_COMPILER))"; \
 	fi; \
 	k_arg=""; \
 	if [ -n "$(K)" ]; then \

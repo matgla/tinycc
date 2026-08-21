@@ -234,6 +234,12 @@ void tcc_ir_free(TCCIRState *ir)
     ir->barrel_shifts = NULL;
     ir->barrel_shifts_len = 0;
   }
+  if (ir->zero_half64)
+  {
+    tcc_free(ir->zero_half64);
+    ir->zero_half64 = NULL;
+    ir->zero_half64_len = 0;
+  }
   if (ir->shift64_dead_half)
   {
     tcc_free(ir->shift64_dead_half);

@@ -106,6 +106,11 @@ int tcc_ir_opt_infinite_self_recursion(TCCIRState *ir, Sym *func_sym)
           return 0;
       }
     }
+
+      /* A volatile MEMBER of a non-volatile symbol only shows up on the access,
+       * not on the symbol's type. */
+      if (tcc_ir_instr_access_is_volatile(ir, q))
+        return 0;
   }
 
   if (self_call_idx < 0)

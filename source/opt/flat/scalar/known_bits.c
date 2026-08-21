@@ -1880,6 +1880,9 @@ const IROptGen known_bits_gens[] = {
     OPT_GEN_ENTRY_FLAT(kb_store_indexed, TCCIR_OP_STORE_POSTINC),
     OPT_GEN_ENTRY_FLAT(kb_call, TCCIR_OP_FUNCCALLVOID),
     OPT_GEN_ENTRY_FLAT(kb_call, TCCIR_OP_FUNCCALLVAL),
+    /* BLOCK_COPY writes a whole frame range at once; this pass tracks slots
+     * individually and has no way to express that, so treat it as a barrier. */
+    OPT_GEN_ENTRY_FLAT(kb_barrier, TCCIR_OP_BLOCK_COPY),
     OPT_GEN_ENTRY_FLAT(kb_barrier, TCCIR_OP_IJUMP),
     OPT_GEN_ENTRY_FLAT(kb_barrier, TCCIR_OP_INLINE_ASM),
     OPT_GEN_ENTRY_FLAT(kb_barrier, TCCIR_OP_SETJMP),

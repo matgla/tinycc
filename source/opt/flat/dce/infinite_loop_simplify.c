@@ -91,6 +91,11 @@ int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir)
         }
       }
 
+      /* The symbol scan above misses a volatile MEMBER of a non-volatile
+       * symbol; only the access itself carries that. */
+      if (tcc_ir_instr_access_is_volatile(ir, q))
+        has_volatile = 1;
+
       if (q->op == TCCIR_OP_JUMPIF)
       {
         IROperand dest = tcc_ir_op_get_dest(ir, q);
@@ -187,7 +192,7 @@ int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir)
           all_stores_dead = 0;
           break;
         }
-        if (sr->sym->type.t & VT_VOLATILE)
+        if ((sr->sym->type.t & VT_VOLATILE) || tcc_ir_instr_access_is_volatile(ir, q))
         {
           all_stores_dead = 0;
           break;

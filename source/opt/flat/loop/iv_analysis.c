@@ -132,6 +132,166 @@ int find_induction_vars_ex(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int 
 /* Queried per candidate inside the derived-IV scan — latch it. */
 TCC_DBG_ENV_FLAG(dbg_mlaiv, "TCC_DBG_MLAIV")
 
+/* Is the IV counter itself removable once its address uses become a pointer
+ * walk?  The IV may only be read by: its own self-increment, a copy-through
+ * `T = V` just before that increment, indexed uses where it is the index, up
+ * to two `CMP V,#imm` (header pre-test + latch test), and the whitelisted
+ * instruction(s) computing THIS derived IV's offset (the SHL/MUL, or a fused
+ * MLA).  Anything else means try_eliminate_iv_counter will fail and the loop
+ * would carry BOTH the index and the new pointer -- pure added work, measured
+ * at +14.6% on mibench_dijkstra before this gate existed. */
+static int iv_ctr_eliminable(TCCIRState *ir, int32_t iv_vr, int iv_def_idx, int allow_a, int allow_b)
+{
+  int safe = 1;
+  int cmp_count = 0;
+  for (int j = 0; j < ir->next_instruction_index && safe; j++)
+  {
+    IRQuadCompact *uq = &ir->compact_instructions[j];
+    if (uq->op == TCCIR_OP_NOP)
+      continue;
+    if (j == iv_def_idx || j == allow_a || j == allow_b)
+      continue;
+
+    if (uq->op == TCCIR_OP_LOAD_INDEXED || uq->op == TCCIR_OP_STORE_INDEXED)
+    {
+      if (irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == iv_vr)
+        continue;
+    }
+
+    if (uq->op == TCCIR_OP_ASSIGN && j >= iv_def_idx - 3 && j < iv_def_idx)
+    {
+      if (irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == iv_vr)
+        continue;
+    }
+
+    if (uq->op == TCCIR_OP_CMP)
+    {
+      IROperand cs1 = tcc_ir_op_get_src1(ir, uq);
+      IROperand cs2 = tcc_ir_op_get_src2(ir, uq);
+      if (irop_get_vreg(cs1) == iv_vr && irop_is_immediate(cs2) && cmp_count < 2)
+      {
+        cmp_count++;
+        continue;
+      }
+    }
+
+    if (irop_config[uq->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == iv_vr)
+      safe = 0;
+    if (safe && irop_config[uq->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == iv_vr)
+      safe = 0;
+  }
+  return safe && cmp_count > 0;
+}
+
+/* Does this derived address value reach a real memory access (rather than
+ * being consumed by an indexed op's addressing mode)?  Those are the DIVs the
+ * escape scan in transform_derived_iv used to refuse outright. */
+static int iv_div_addr_is_dereffed(TCCIRState *ir, int32_t dest_vr)
+{
+  if (dest_vr < 0)
+    return 0;
+  for (int j = 0; j < ir->next_instruction_index; j++)
+  {
+    IRQuadCompact *uq = &ir->compact_instructions[j];
+    if (uq->op == TCCIR_OP_LOAD || uq->op == TCCIR_OP_LOAD_INDEXED)
+    {
+      IROperand s1 = tcc_ir_op_get_src1(ir, uq);
+      if (s1.is_lval && irop_get_vreg(s1) == dest_vr)
+        return 1;
+    }
+    if (uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, uq);
+      if (d.is_lval && irop_get_vreg(d) == dest_vr)
+        return 1;
+    }
+  }
+  return 0;
+}
+
+/* Will the pointer walk this SCALED deref DIV becomes end in a post-indexed
+ * access?  A scaled deref used to be rejected outright: the indexed-memory
+ * fusion folds `base + (i << k)` into the addressing mode anyway, so the walk
+ * merely traded `str.w r,[base,i,lsl #2]` for `str r,[p]` + `adds p,#k` —
+ * measured a LOSS in situ (mibench_stringsearch +12.4%).  With
+ * ra:load_postinc / ra:store_postinc the bump disappears into the access
+ * (`str r,[p],#k`), which drops an instruction per iteration AND the scaled
+ * index's +1 cycle, so the walk wins exactly when that fusion will fire.
+ *
+ * Admit the DIV only when the fused shape is assured:
+ *   - stride within the post-index immediate range (1..255);
+ *   - every use of the address value is the ADDRESS SLOT of a plain
+ *     LOAD/STORE whose access is INT32 with a register value — the shape the
+ *     ra matcher folds (INT16/INT8 loads widen, which the matcher refuses);
+ *   - at least one such access is inside the loop body;
+ *   - the counter is provably removable (iv_ctr_eliminable), else the loop
+ *     carries BOTH the index and the pointer.
+ * allow_a/allow_b whitelist the instruction(s) computing THIS DIV's offset
+ * for the eliminability check (the SHL/MUL, or the fused MLA itself). */
+static int iv_scaled_deref_postinc_viable(TCCIRState *ir, IRLoop *loop, int32_t dest_vr,
+                                          int stride, InductionVar *iv, int allow_a, int allow_b)
+{
+  if (tcc_ir_opt_pass_disabled("iv_scaled_deref"))
+    return 0;
+  if (dest_vr < 0 || stride < 1 || stride > 255)
+    return 0;
+
+  int in_loop_access = 0;
+  for (int j = 0; j < ir->next_instruction_index; j++)
+  {
+    IRQuadCompact *uq = &ir->compact_instructions[j];
+    if (uq->op == TCCIR_OP_NOP)
+      continue;
+
+    int is_load = (uq->op == TCCIR_OP_LOAD);
+    int is_store = (uq->op == TCCIR_OP_STORE);
+
+    /* Address-slot use: src1 of a LOAD, dest of a STORE. */
+    if (is_load || is_store)
+    {
+      IROperand addr = is_load ? tcc_ir_op_get_src1(ir, uq) : tcc_ir_op_get_dest(ir, uq);
+      IROperand val = is_load ? tcc_ir_op_get_dest(ir, uq) : tcc_ir_op_get_src1(ir, uq);
+      if (addr.is_lval && irop_get_vreg(addr) == dest_vr)
+      {
+        if (val.is_lval || irop_get_vreg(val) < 0)
+          return 0;
+        if (irop_get_btype(addr) != IROP_BTYPE_INT32 || irop_get_btype(val) != IROP_BTYPE_INT32)
+          return 0;
+        if (is_load && val.is_unsigned != addr.is_unsigned)
+          return 0;
+        if (j >= loop->start_idx && j <= loop->end_idx)
+          in_loop_access = 1;
+        /* The other slot (the loaded/stored VALUE) may still read dest_vr —
+         * fall through to the generic check below for it. */
+        if (irop_get_vreg(val) != dest_vr)
+          continue;
+        return 0; /* address also stored/loaded as a value — not a pure walk */
+      }
+    }
+
+    /* Any other read of the address value disqualifies: it escapes the
+     * addressing role (stored, compared, passed, used to index...). */
+    if (irop_config[uq->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == dest_vr)
+      return 0;
+    if (irop_config[uq->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == dest_vr)
+      return 0;
+    if ((uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED ||
+         uq->op == TCCIR_OP_STORE_POSTINC || uq->op == TCCIR_OP_FUNCPARAMVAL) &&
+        irop_config[uq->op].has_dest)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, uq);
+      if (irop_get_vreg(d) == dest_vr)
+        return 0;
+    }
+    if (uq->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, uq)) == dest_vr)
+      return 0;
+  }
+  if (!in_loop_access)
+    return 0;
+
+  return iv_ctr_eliminable(ir, iv->vreg, iv->def_idx, allow_a, allow_b);
+}
+
 int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_ivs, DerivedIV *divs, int max_divs)
 {
   int num_divs = 0;
@@ -369,6 +529,35 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
       continue; /* SHL result used by other instructions - can't NOP it */
     }
 
+    /* A SCALED address that is actually dereferenced buys nothing here.  The
+     * SHL+ADD this transform would delete does not survive to the machine
+     * anyway: the indexed-memory fusion folds `base + (i << k)` straight into
+     * the load/store addressing mode, so the loop is the same length either
+     * way and the transform merely trades `str.w r,[base,i,lsl #2]` for
+     * `str r,[p]` + `adds p,#4`.  Measured, that trade is a LOSS in situ --
+     * mibench_stringsearch's 256-entry fill loop went +12.4% (a reproducible
+     * +1 cycle per element) even though a stand-alone asm replica of the two
+     * loops is neutral (6.274 vs 6.285 cycles/element) and the isolated
+     * addressing-mode probes favour the pointer form.  A per-TU bisect
+     * (TCC_DISABLE_PASS=derived_iv on that one file) pinned it to exactly this
+     * transform.
+     *
+     * The exception is the post-indexed shape: when every use of the address
+     * is a plain 32-bit access and the counter goes away, the walk's bump
+     * folds into the access (`str r,[p],#4`) and the loop DROPS an
+     * instruction instead of trading even — see
+     * iv_scaled_deref_postinc_viable.
+     *
+     * The unscaled case is different and is handled by the fourth pass below:
+     * there the address computation genuinely stays in the loop, because a
+     * byte access off a stack base never gets folded. */
+    if (iv_div_addr_is_dereffed(ir, dest_vr) &&
+        !iv_scaled_deref_postinc_viable(ir, loop, dest_vr, stride, &ivs[iv_idx], shl_idx, -1))
+    {
+      LOG_IV_SR("IV_SR: Skipping scaled deref DIV at idx=%d — address folds into the addressing mode anyway", i);
+      continue;
+    }
+
     divs[num_divs].iv_idx = iv_idx;
     divs[num_divs].base_vreg = base_vr;
     divs[num_divs].base_op = *base_op;
@@ -495,6 +684,17 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     if (use_count < 1)
       continue;
 
+    /* Same reasoning as the scaled ADD case above: an MLA-derived address is
+     * scaled by construction, so the deref would fold into the addressing
+     * mode regardless — unless the walk ends post-indexed (the MLA itself is
+     * the whitelisted IV use here; there is no separate SHL/MUL). */
+    if (iv_div_addr_is_dereffed(ir, dest_vr) &&
+        !iv_scaled_deref_postinc_viable(ir, loop, dest_vr, stride, &ivs[iv_idx], i, -1))
+    {
+      LOG_IV_SR("IV_SR: Skipping scaled deref MLA-DIV at idx=%d — folds into the addressing mode anyway", i);
+      continue;
+    }
+
     divs[num_divs].iv_idx = iv_idx;
     divs[num_divs].base_vreg = base_vr;
     divs[num_divs].base_op = accum;
@@ -602,61 +802,11 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
       continue;
     int stride = ivs[iv_idx].step * (1 << scale);
 
-    /* Eliminability gate: IV usable only by self-increment, copy-through, indexed uses, and up to two CMP-vs-imm; else net regression */
-    int safe_to_transform = 1;
-    int cmp_count = 0;
-    int iv_def_idx = ivs[iv_idx].def_idx;
-    for (int j = 0; j < ir->next_instruction_index && safe_to_transform; j++)
+    /* Eliminability gate (see iv_ctr_eliminable). */
+    if (!iv_ctr_eliminable(ir, iv_vr, ivs[iv_idx].def_idx, -1, -1))
     {
-      IRQuadCompact *uq = &ir->compact_instructions[j];
-      if (uq->op == TCCIR_OP_NOP)
-        continue;
-      if (j == iv_def_idx)
-        continue;
-
-      /* Allow indexed uses where IV is the index — these are the transform sites */
-      if (uq->op == TCCIR_OP_LOAD_INDEXED || uq->op == TCCIR_OP_STORE_INDEXED)
-      {
-        if (irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == iv_vr)
-          continue;
-      }
-
-      /* Allow copy-through `T = V` just before the self-increment */
-      if (uq->op == TCCIR_OP_ASSIGN && j >= iv_def_idx - 3 && j < iv_def_idx)
-      {
-        if (irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == iv_vr)
-          continue;
-      }
-
-      /* Allow up to two CMP V_iv,#imm (header pre-test + back-edge test) */
-      if (uq->op == TCCIR_OP_CMP)
-      {
-        IROperand cs1 = tcc_ir_op_get_src1(ir, uq);
-        IROperand cs2 = tcc_ir_op_get_src2(ir, uq);
-        if (irop_get_vreg(cs1) == iv_vr && irop_is_immediate(cs2) && cmp_count < 2)
-        {
-          cmp_count++;
-          continue;
-        }
-      }
-
-      if (irop_config[uq->op].has_src1)
-      {
-        IROperand s1 = tcc_ir_op_get_src1(ir, uq);
-        if (irop_get_vreg(s1) == iv_vr)
-          safe_to_transform = 0;
-      }
-      if (safe_to_transform && irop_config[uq->op].has_src2)
-      {
-        IROperand s2 = tcc_ir_op_get_src2(ir, uq);
-        if (irop_get_vreg(s2) == iv_vr)
-          safe_to_transform = 0;
-      }
-    }
-    if (!safe_to_transform || cmp_count == 0)
-    {
-      LOG_IV_SR("IV_SR: Skipping INDEXED-DIV at idx=%d — IV VAR%d not eliminable (cmp_count=%d)", i,
-                TCCIR_DECODE_VREG_POSITION(iv_vr), cmp_count);
+      LOG_IV_SR("IV_SR: Skipping INDEXED-DIV at idx=%d — IV VAR%d not eliminable", i,
+                TCCIR_DECODE_VREG_POSITION(iv_vr));
       continue;
     }
 
@@ -671,6 +821,119 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
 
     LOG_IV_SR("IV_SR: Found INDEXED-DIV base+%d*VAR%d at %s idx=%d (scale=%d, stride=%d)", stride,
               TCCIR_DECODE_VREG_POSITION(iv_vr), is_load ? "LOAD_INDEXED" : "STORE_INDEXED", i, scale, stride);
+  }
+
+  /* Fourth pass: UNSCALED derived IV — `T = base + iv`, no shift, no multiply.
+   *
+   * That is what a byte array produces (`dst[j]`), and nothing else sees it:
+   * the first pass keys on a SHL/MUL feeding the ADD and there is none, and a
+   * byte access off a stack base never gets folded into LOAD_INDEXED either
+   * (the unscaled fusion path rejects a local base).  So the address really
+   * does stay in the loop -- `bench_memcpy`'s checksum loop recomputed
+   * `mov r2,sp` + `adds r1,r2,r0` every iteration around its `ldrb`.  Unlike
+   * the scaled cases rejected above, replacing that with a pointer walk
+   * genuinely removes instructions.
+   *
+   * Restricted to a dereferenced address (this is about addressing, not
+   * arithmetic) whose counter is provably removable -- with stride 1 the
+   * pointer bump costs exactly what the index bump cost, so the win only
+   * exists if the index goes away. */
+  for (int bi = 0; bi < loop->num_body_instrs && num_divs < max_divs; bi++)
+  {
+    int i = loop->body_instrs[bi];
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ADD)
+      continue;
+
+    IROperand dest = tcc_ir_op_get_dest(ir, q);
+    int32_t dest_vr = irop_get_vreg(dest);
+    if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP || dest.is_lval)
+      continue;
+    if (!iv_div_addr_is_dereffed(ir, dest_vr))
+      continue;
+
+    /* Skip an ADD an earlier pass already claimed. */
+    int dup = 0;
+    for (int d = 0; d < num_divs; d++)
+      if (divs[d].use_idx == i)
+        dup = 1;
+    if (dup)
+      continue;
+
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    IROperand src2 = tcc_ir_op_get_src2(ir, q);
+
+    /* Exactly one operand is a BIV of this loop; the other is the base. */
+    int iv_idx = -1;
+    IROperand base_op = IROP_NONE;
+    for (int side = 0; side < 2 && iv_idx < 0; side++)
+    {
+      IROperand cand = side ? src2 : src1;
+      IROperand other = side ? src1 : src2;
+      int32_t cand_vr = irop_get_vreg(cand);
+      /* A local VAR is read through an lval operand (`V0` + is_local) -- the
+       * plain "fetch the variable" form, not a dereference, and exactly how
+       * the IV appears here. */
+      if (cand_vr < 0 ||
+          (cand.is_lval && !(TCCIR_DECODE_VREG_TYPE(cand_vr) == TCCIR_VREG_TYPE_VAR && cand.is_local)))
+        continue;
+      if (irop_is_immediate(other))
+        continue;
+      for (int k = 0; k < num_ivs; k++)
+      {
+        if (ivs[k].vreg != cand_vr)
+          continue;
+        int32_t other_vr = irop_get_vreg(other);
+        int other_is_iv = 0;
+        for (int k2 = 0; k2 < num_ivs; k2++)
+          if (other_vr >= 0 && ivs[k2].vreg == other_vr)
+            other_is_iv = 1;
+        if (other_is_iv)
+          break; /* `i + j` is not a base plus an index */
+        iv_idx = k;
+        base_op = other;
+        break;
+      }
+    }
+    if (iv_idx < 0)
+      continue;
+
+    /* Base must be loop-invariant. */
+    int32_t base_vr = irop_get_vreg(base_op);
+    if (base_vr >= 0)
+    {
+      int redefined = 0;
+      for (int bj = 0; bj < loop->num_body_instrs && !redefined; bj++)
+      {
+        int j = loop->body_instrs[bj];
+        IRQuadCompact *lq = &ir->compact_instructions[j];
+        if (lq->op == TCCIR_OP_NOP || j == i)
+          continue;
+        if (irop_config[lq->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, lq)) == base_vr)
+          redefined = 1;
+      }
+      if (redefined)
+        continue;
+    }
+
+    if (!iv_ctr_eliminable(ir, ivs[iv_idx].vreg, ivs[iv_idx].def_idx, i, -1))
+    {
+      LOG_IV_SR("IV_SR: Skipping unscaled DIV at idx=%d — IV VAR%d not eliminable", i,
+                TCCIR_DECODE_VREG_POSITION(ivs[iv_idx].vreg));
+      continue;
+    }
+
+    divs[num_divs].iv_idx = iv_idx;
+    divs[num_divs].base_vreg = base_vr;
+    divs[num_divs].base_op = base_op;
+    divs[num_divs].stride = ivs[iv_idx].step;
+    divs[num_divs].use_idx = i;
+    divs[num_divs].shl_idx = -1; /* no shift to NOP */
+    divs[num_divs].share_with = -1;
+    num_divs++;
+
+    LOG_IV_SR("IV_SR: Found unscaled DIV base+%d*VAR%d at ADD idx=%d", ivs[iv_idx].step,
+              TCCIR_DECODE_VREG_POSITION(ivs[iv_idx].vreg), i);
   }
 
   return num_divs;

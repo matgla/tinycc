@@ -514,6 +514,58 @@ int decl(int l)
           dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
           skip_or_save_block(&fn->func_str);
 
+          /* An explicit `inline` used to *disable* the inliner: this branch
+           * saved the body and deferred emission, but never set
+           * func_auto_inline, so every call site emitted a plain call.  Only
+           * functions the user did NOT mark inline reached the auto-inline
+           * path below.  That is backwards, and it costs the most in exactly
+           * the code that relies on the idiom -- header-defined `static
+           * inline` helpers.  lib/fp/soft is the extreme case: every helper in
+           * soft_common.h is `static inline`, so __aeabi_dadd made 18 calls to
+           * one-shift accessors that gcc folds into the body (3.76x on the
+           * double benchmarks).
+           *
+           * Apply the same eligibility test the auto path uses and set the
+           * flag so call sites replay the body.  Deferred emission is a
+           * strict win over the auto path here: if every call site inlines
+           * and the address is never taken, gen_inline_functions emits no
+           * standalone copy at all.
+           *
+           * The gate must be token-length based.  gen_function's post-opt
+           * revoke (IR > 8 / call-heavy) cannot help a deferred body -- it
+           * compiles after the call sites have already been decided.
+           *
+           * STATIC ONLY.  A non-static `inline` is a C99 inline *definition*
+           * (and gnu89 `extern inline` another rule again): the standalone
+           * body is emitted on different terms, and marking it auto_inline
+           * makes gen_inline_functions skip emission while some call site
+           * still needs the symbol -- "undefined symbol 'add1_inline'".
+           * Static inline has internal linkage, so dropping the standalone
+           * copy once every site inlined is safe, and it is the idiom that
+           * matters here (all of soft_common.h). */
+          if (sym->type.ref && (sym->type.t & VT_STATIC) &&
+              sym->type.ref->f.func_type != FUNC_ELLIPSIS &&
+              !sym->type.ref->f.func_alwinl && !sym->type.ref->f.func_noinline &&
+              (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
+              tcc_state->nb_vla_param_exprs == 0 && fn->func_str)
+          {
+            int sig = auto_inline_sig_ok(sym);
+            int thr = tcc_state->opt_inline_limit > 0 ? tcc_state->opt_inline_limit
+                                                      : (tcc_state->opt_inline_functions ? 60 : 30);
+            /* Void-returning with 64-bit params: same narrow cap as the auto
+             * path (longer bodies trip an IR coalescing bug on narrowed locals). */
+            if (sig == 2)
+              thr = 15;
+            if (sig && fn->func_str->len <= thr && !inline_body_has_apply_args(fn->func_str) &&
+                !inline_body_has_unsafe_loops(fn->func_str) && !inline_body_has_static_local(fn->func_str))
+            {
+              sym->type.ref->f.func_auto_inline = 1;
+              /* Body is still owed to gen_inline_functions, unlike the auto
+               * path below which compiles the standalone copy right here. */
+              sym->type.ref->f.func_deferred_inline = 1;
+            }
+          }
+
           /* Scan saved token stream for __builtin_va_arg_pack() usage.
            * If found, mark the function so call sites can expand it. */
           if (fn->func_str && sym->type.ref)

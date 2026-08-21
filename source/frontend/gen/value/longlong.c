@@ -705,16 +705,27 @@ void gen_opl(int op)
   case TOK_SAR:
   case TOK_SHR:
   case TOK_SHL:
-    if (tcc_state->ir && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+    if (tcc_state->ir)
     {
       /* IR mode: generate a single 64-bit shift instruction directly.
        * The lexpand/lbuild decomposition produces intermediate 32-bit values
        * that lbuild then recombines via SHL-by-32 + OR, but that inner SHL
        * has a 32-bit source operand causing incorrect codegen on ARM Thumb
        * (32-bit LSL by 32 produces zero).  Emitting the shift as a native
-       * 64-bit IR op lets the backend handle it correctly. */
+       * 64-bit IR op lets the backend handle it correctly.
+       *
+       * A non-constant count goes the same way rather than to
+       * __aeabi_llsl/llsr/lasr: the backend expands it into the eight-or-so
+       * instruction register sequence (thumb_emit_shift64_reg_mop), where the
+       * helper cost a call plus ~30 instructions of its own.  Materialize the
+       * count first so a comparison or jump-flavoured operand becomes an
+       * ordinary value before it is handed to the IR. */
+      const int count_is_const = (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
+      if (!count_is_const)
+        gv(RC_INT);
       t = vtop[-1].type.t;
-      c = (int)vtop->c.i;
+      if (count_is_const)
+        c = (int)vtop->c.i;
       int dest_type = VT_LLONG | (t & VT_UNSIGNED);
       TccIrOp ir_op;
       switch (op)

@@ -169,6 +169,9 @@ int ssa_opt_eval_binary(int op, int64_t v1, int64_t v2, int64_t *result, int is_
 /* ssa_opt_var_const_fold() moved to source/opt/ssa/include/opt/ssa/cprop.h */
 /* ssa_opt_const_prop_tmp() moved to source/opt/ssa/include/opt/ssa/cprop.h */
 int ssa_opt_dead_loop(IRSSAOptCtx *ctx);
+/* ssa:switch_fold -- a SWITCH_TABLE whose selector is a compile-time constant
+ * becomes an unconditional JUMP to the arm it selects. */
+int ssa_opt_switch_fold(IRSSAOptCtx *ctx);
 
 /* Loop rotation (ssa:loop_rotate).  CFG/dominator-based natural-loop detection
  * driving the flat-IR rewrite; runs on flat IR just before CFG/SSA

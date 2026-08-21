@@ -300,6 +300,13 @@ static void run_post_pipeline_passes(TCCIRState *ir)
 
   DUMP_IR_AFTER_PASS(ir, "ZZ2_shl32");
 
+  /* After the const folders, so a constant dividend still collapses to one
+   * immediate instead of a three-op shift chain. */
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("sdiv_pow2"))
+    tcc_ir_opt_sdiv_pow2(ir);
+
+  DUMP_IR_AFTER_PASS(ir, "ZZ2_sdivp2");
+
   if (tcc_state->opt_stack_addr_cse)
     tcc_ir_opt_stack_addr_cse(ir);
 
@@ -336,6 +343,18 @@ static void run_post_pipeline_passes(TCCIRState *ir)
   DUMP_IR_AFTER_PASS(ir, "ZZ2_lge");
   if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("cmp_narrow_64"))
     tcc_ir_opt_cmp_narrow_64(ir);
+
+  /* Must precede tcc_ir_opt_shift64_dead_half (run from regalloc): narrowing the
+   * AND is what makes it a low-only consumer, which is the precondition that
+   * pass tests before it can mark the feeding SHR's high half dead. */
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("and64_narrow"))
+    tcc_ir_opt_and64_narrow(ir);
+
+  /* After the mask narrowing above, before shift64_dead_half in regalloc: the
+   * shift this folds away is the one that pass would have annotated. */
+  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("shift64_extract_ubfx"))
+    tcc_ir_opt_shift64_extract_ubfx(ir);
+  DUMP_IR_AFTER_PASS(ir, "ZZ2_a64n");
 
   dbg_scan_overlap(ir, "P4-before-assign_fuse");
   if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("assign_fuse"))

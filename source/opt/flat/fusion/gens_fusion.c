@@ -490,11 +490,11 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
   IROperand base_op_clean = base_op;
   IROperand index_op_clean = index_op;
   base_op_clean.is_lval = 0;
-  /* Transfer the packed-access mark from the deref operand being replaced
-   * (LOAD: src1, STORE: dest) onto the base: the backend's 64-bit indexed
-   * lowering uses LDRD/STRD, which fault on the unaligned addresses a packed
-   * member chain can produce. */
-  base_op_clean.aux |= (is_store ? orig_dest.aux : orig_src1.aux) & IROP_AUX_UNDERALIGN;
+  /* Transfer the access marks from the deref operand being replaced (LOAD:
+   * src1, STORE: dest) onto the base: the backend's 64-bit indexed lowering
+   * uses LDRD/STRD, which fault on the unaligned addresses a packed member
+   * chain can produce, and the load/store CSE passes need the volatility. */
+  irop_carry_access_marks(&base_op_clean, is_store ? orig_dest : orig_src1);
   IROperand scale_imm = irop_make_imm32(0, shift_amount, IROP_BTYPE_INT32);
 
   if (is_store) {
@@ -534,12 +534,18 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
 
   IRQuadCompact *q = &ir->compact_instructions[i];
 
-  /* CMP is intentionally excluded: folding a deref into a CMP rewrites the read
-   * as a LOAD_INDEXED that downstream DSE/alias fails to see as a use and can
-   * delete the producing stores (miscompiles gcc-torture loop-11). */
+  /* CMP is IN scope.  It used to be excluded because the rewrite turns the read
+   * into a LOAD_INDEXED that DSE/alias was said to miss as a use, deleting the
+   * producing stores (gcc-torture loop-11).  That no longer holds: the DSE and
+   * static-store passes walk operand slots via irop_config[] rather than
+   * switching on the opcode, so a LOAD_INDEXED base reads like any other use.
+   * loop-11 -- whose `if (a[i] != i)` is exactly the excluded shape -- passes
+   * with the fold and drops 1982 -> 1599 cycles.  A compare is where a deref
+   * survives as an operand most often (a LOAD gets its own fusion), so the
+   * exclusion was costing `lsl`+`add` on every compared array element. */
   if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_LOAD_INDEXED ||
       q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC ||
-      q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_CMP || q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF ||
+      q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF ||
       q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_RETURNVALUE ||
       q->op == TCCIR_OP_RETURNVOID)
     return 0;
@@ -704,8 +710,8 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
       loaded_op.is_unsigned = deref_op.is_unsigned;
     IROperand base_clean = base_op;
     base_clean.is_lval = 0;
-    /* Same packed-access transfer as in ir_gen_indexed_memory_fusion. */
-    base_clean.aux |= deref_op.aux & IROP_AUX_UNDERALIGN;
+    /* Same access-mark transfer as in ir_gen_indexed_memory_fusion. */
+    irop_carry_access_marks(&base_clean, deref_op);
     IROperand scale_imm = irop_make_imm32(0, scale_amount, IROP_BTYPE_INT32);
 
     ir->iroperand_pool[new_base_idx + 0] = loaded_op;

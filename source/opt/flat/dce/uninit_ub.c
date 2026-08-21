@@ -75,6 +75,9 @@ static int udr_instr_has_volatile_operand(TCCIRState *ir, IRQuadCompact *q)
       if (vs && (vs->type.t & VT_VOLATILE))
         return 1;
     }
+    /* A volatile MEMBER / deref / cast is recorded on the access, not the sym. */
+    if (tcc_ir_instr_access_is_volatile(ir, q))
+      return 1;
   }
   return 0;
 }

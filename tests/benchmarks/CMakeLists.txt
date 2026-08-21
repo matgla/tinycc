@@ -183,6 +183,56 @@ elseif(BENCHMARK_COMPILER STREQUAL "GCC")
     set(BENCHMARK_LIB benchmark_lib_gcc)
     set(BENCHMARK_EXECUTABLE_SUFFIX "_gcc")
 
+    # ------------------------------------------------------------------
+    # Soft-float runtime for the GCC arm, built from the SAME sources the
+    # TCC arm uses (lib/fp/soft), so the double benchmarks compare the two
+    # COMPILERS instead of comparing TCC's C against libgcc's hand-written
+    # ieee754-df.S.
+    #
+    # Left off, the GCC image resolves every __aeabi_d* call from libgcc,
+    # whose dadd/dmul/ddiv are assembly.  That made double_add read 4.12x
+    # and double_mixed 3.93x while the same source compiled by both
+    # compilers differs by only ~1.13x in size -- i.e. almost all of the
+    # measured "gap" was implementation, not code generation.
+    #
+    # libsoftfp defines the complete __aeabi_ set on its own (lib/fp's
+    # check-self-contained target enforces exactly this), so listing it
+    # ahead of libgcc resolves every FP entry point here and libgcc is
+    # never pulled in for them -- no duplicate-definition link errors.
+    #
+    # Set BENCH_GCC_FP_FROM_SOURCE=OFF to restore the libgcc baseline.
+    option(BENCH_GCC_FP_FROM_SOURCE
+           "Build GCC's soft-float runtime from lib/fp/soft instead of using libgcc" ON)
+
+    if(BENCH_GCC_FP_FROM_SOURCE)
+        set(FP_SOFT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/fp/soft)
+        # Mirrors SRCS in lib/fp/soft/Makefile -- keep in step with it.
+        set(FP_SOFT_SRCS
+            fadd.c fmul.c fdiv.c fcmp.c dadd.c dmul.c ddiv.c
+            dconv.c dcmp.c conv.c conv64.c
+            f2d_stub.S fcmp_asm.S dcmp_asm.S)
+        set(FP_SOFT_PATHS "")
+        foreach(f ${FP_SOFT_SRCS})
+            list(APPEND FP_SOFT_PATHS ${FP_SOFT_DIR}/${f})
+        endforeach()
+
+        add_library(softfp_gcc STATIC ${FP_SOFT_PATHS})
+        # Same flags lib/fp/soft/Makefile uses (-O2 regardless of the
+        # benchmark's opt level: the TCC arm links a prebuilt libsoftfp.a
+        # that is always built -O2, so matching it keeps the arms honest).
+        target_compile_options(softfp_gcc PRIVATE
+            ${BENCH_ARCH_FLAGS} -O2 -Wall -Wextra -g)
+        target_include_directories(softfp_gcc PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../lib
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/fp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+        set(GCC_FP_LIB softfp_gcc)
+        message(STATUS "GCC soft-float runtime built from lib/fp/soft (same sources as TCC)")
+    else()
+        set(GCC_FP_LIB "")
+        message(STATUS "GCC soft-float runtime: libgcc (NOT source-matched with TCC)")
+    endif()
+
 else()
     message(FATAL_ERROR "BENCHMARK_COMPILER must be TCC or GCC")
 endif()
@@ -238,6 +288,16 @@ if(BENCHMARK_COMPILER STREQUAL "TCC" AND (TCC_RUNTIME_LIB OR TCC_FP_LIB))
         -Wl,--start-group ${TCC_RUNTIME_LIB} ${TCC_FP_LIB} -Wl,--end-group
     )
     message(STATUS "Linked TCC runtime libraries for benchmark build")
+endif()
+
+# The GCC arm's source-matched soft-float runtime (see BENCH_GCC_FP_FROM_SOURCE).
+# It must precede libgcc on the link line, which target_link_libraries does:
+# libgcc is appended by the compiler driver after every explicit library.
+if(BENCHMARK_COMPILER STREQUAL "GCC" AND GCC_FP_LIB)
+    target_link_libraries(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}
+        ${GCC_FP_LIB}
+    )
+    message(STATUS "Linked source-matched soft-float runtime for GCC benchmark build")
 endif()
 
 target_compile_definitions(minimal_uart_picosdk${BENCHMARK_EXECUTABLE_SUFFIX}

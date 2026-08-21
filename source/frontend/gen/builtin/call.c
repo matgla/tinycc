@@ -404,6 +404,33 @@ void unary_funcall(void)
         (call_func_sym->type.ref->f.func_auto_inline || call_func_sym->type.ref->f.func_eval_only_inline))))
     can_inline_eval = 1;
 
+  /* ---- One level of direct self-recursion ----
+   * A recursive callee cannot be inlined away, but expanding its body ONCE
+   * into itself halves the dynamic call count: every second level of the
+   * recursion tree is then handled inline, and each removed call is a
+   * PUSH/POP/BL/return the M-profile core no longer executes.  (gcc does the
+   * same thing at -O2, several levels deep -- it is the whole of its 2x lead
+   * on recursive fib.)
+   *
+   * Exactly one level, and only from the standalone body: inside the
+   * expansion `in_inline_expansion` is set, so the inner self-calls fail this
+   * test and are emitted as ordinary calls.  That refusal happens at the gate
+   * below, before any of the callee's IR is emitted -- the partial-expansion
+   * leftover the old unconditional refusal was written against. */
+  int self_inline_ok = 0;
+  if (can_inline_eval && call_func_sym == tcc_state->cur_func_sym &&
+      !tcc_state->in_inline_expansion && tcc_state->opt_inline_functions &&
+      call_func_sym->type.ref && call_func_sym->type.ref->f.func_auto_inline &&
+      !call_func_sym->a.nested_func)
+  {
+    int rbt = call_func_sym->type.ref->type.t & VT_BTYPE;
+    /* Struct and floating returns go through the sret/multi-register paths
+     * the expansion does not model for a self-call. */
+    if (rbt == VT_VOID || rbt == VT_BOOL || rbt == VT_BYTE || rbt == VT_SHORT ||
+        rbt == VT_INT || rbt == VT_LLONG || rbt == VT_PTR)
+      self_inline_ok = 1;
+  }
+
   /* Detect printf-family functions that can be optimized.
    * We recognize standard (printf, fprintf), unlocked stdio variants,
    * v-variants (vprintf, vfprintf), and fortified (_chk) variants.
@@ -1492,6 +1519,16 @@ va_arg_pack_done:
     /* Already handled above */
   }
   else if (can_inline_eval && !NOEVAL_WANTED && call_func_sym && saved_arg_count == nb_real_args && tcc_state->ir &&
+           /* Never expand a call to the function being compiled, EXCEPT for the
+            * single self-recursive level `self_inline_ok` allows (see above).
+            * Without that exception the attempt is not free: the expansion
+            * re-parses the body and gets as far as emitting its first
+            * declaration before the depth cap stops it, leaving that IR behind.
+            * For `void f(void) { int t = g; f(); }` the leftover was a second
+            * load of g -- invisible for a plain global (CSE folds it), a
+            * duplicated access when g is volatile.  self_inline_ok is false at
+            * every depth but 0, so the nested attempt never starts. */
+           (call_func_sym != tcc_state->cur_func_sym || self_inline_ok) &&
            /* Allow nested inlining under controlled conditions:
             * - Void/struct/integer return: safe at depth < 3.
             * - Pointer return: still gated to depth<1 to avoid the
@@ -1850,6 +1887,7 @@ va_arg_pack_done:
        * store-to-inline_return_loc + jump-to-rsym pattern. */
       uint8_t saved_in_inline_expansion = tcc_state->in_inline_expansion;
       int saved_inline_return_loc = tcc_state->inline_return_loc;
+      int saved_inline_return_vr = tcc_state->inline_return_vr;
       uint8_t saved_inline_return_redirected = tcc_state->inline_return_redirected;
 
       /* Set up inline function context */
@@ -1860,9 +1898,20 @@ va_arg_pack_done:
       /* Allocate return value local for non-void functions */
       int is_void_inline = ((func_vt.t & VT_BTYPE) == VT_VOID);
       int inline_ret_loc = 0;
+      int inline_ret_vr = -1;
       if (!is_void_inline)
       {
-        if (ret_nregs == 0)
+        /* `ret.c.i != 0` is the "an sret buffer really was allocated" test.
+         * Local slots are carved out of `loc`, which starts at 0 and only
+         * decrements, so a genuine slot offset is always negative and 0 can
+         * only mean the sret setup never ran -- which is exactly the case
+         * when the call is being inlined instead of emitted.  Trusting the 0
+         * put the return temporary at frame offset 0 while nothing reserved
+         * space for it, so a struct return wrote straight over the saved
+         * registers and the caller's frame: gcc.c-torture builtins/pr22237
+         * memmove'd 256 bytes to [sp] under a `push {r4, lr}` and returned
+         * through a clobbered lr. */
+        if (ret_nregs == 0 && ret.c.i != 0)
         {
           /* Struct return via sret: reuse the sret buffer that was already
            * allocated (at ret.c.i) instead of allocating a separate slot.
@@ -1881,6 +1930,36 @@ va_arg_pack_done:
           loc = (loc - rsize) & -ralign;
           inline_ret_loc = loc;
         }
+
+        /* Bind a variable vreg to that slot for single-word integer and
+         * pointer returns, exactly as sym_push() does for a scalar local.  The
+         * slot stays reserved -- the allocator may still spill to it -- but
+         * with a vreg the value can live in a register instead of paying a
+         * store on every `return` path and a load at the join.  That round trip
+         * is the whole cost difference between an inlined body and the same
+         * code written out by hand.
+         *
+         * A VAR, not a TEMP: a body with several `return`s defines the value
+         * more than once, and the passes that assume a temp has a single def
+         * miscompile that (an inlined three-way `return` in lib/fp/soft turned
+         * subnormal d2f results into the smallest normal).  A VAR is the
+         * representation those passes already expect to be assigned twice.
+         *
+         * Word-size integers and pointers only: 64-bit and floating returns
+         * need the pair/FP marking the allocator keys off, and a struct
+         * return's slot is the sret buffer the callee stores through. */
+        int rbt = func_vt.t & VT_BTYPE;
+        if (ret_nregs > 0 &&
+            (rbt == VT_BOOL || rbt == VT_BYTE || rbt == VT_SHORT || rbt == VT_INT || rbt == VT_PTR) &&
+            !(func_vt.t & (VT_ARRAY | VT_VLA | VT_COMPLEX | VT_VECTOR | VT_VOLATILE)))
+        {
+          inline_ret_vr = tcc_ir_get_vreg_var(tcc_state->ir);
+          if (inline_ret_vr >= 0)
+          {
+            tcc_ir_assign_physical_register(tcc_state->ir, inline_ret_vr, inline_ret_loc, -1, -1);
+            tcc_ir_set_original_offset(tcc_state->ir, inline_ret_vr, inline_ret_loc);
+          }
+        }
       }
 
       /* Set inline expansion flags.
@@ -1890,6 +1969,7 @@ va_arg_pack_done:
        * expansion and NOT for nested '{...}' blocks inside the inline body. */
       tcc_state->in_inline_expansion = local_scope;
       tcc_state->inline_return_loc = inline_ret_loc;
+      tcc_state->inline_return_vr = inline_ret_vr;
       tcc_state->inline_return_redirected = 0;
       tcc_state->inline_expansion_depth++;
       root_scope = cur_scope;
@@ -1924,6 +2004,7 @@ va_arg_pack_done:
       inline_ret_loc = tcc_state->inline_return_loc;
       tcc_state->in_inline_expansion = saved_in_inline_expansion;
       tcc_state->inline_return_loc = saved_inline_return_loc;
+      tcc_state->inline_return_vr = saved_inline_return_vr;
       tcc_state->inline_return_redirected = saved_inline_return_redirected;
       tcc_state->inline_expansion_depth--;
       func_vt = saved_func_vt;
@@ -1955,7 +2036,7 @@ va_arg_pack_done:
          * processing the bar call), triggering a spurious second inline. */
         vtop->type = s->type;
         vtop->r = VT_LOCAL | VT_LVAL;
-        vtop->vr = -1;
+        vtop->vr = inline_ret_vr;
         vtop->c.i = inline_ret_loc;
         vtop->sym = NULL;
       }

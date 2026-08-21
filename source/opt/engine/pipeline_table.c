@@ -137,6 +137,12 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("setif_fuse",      tcc_ir_opt_setif_branch_fuse_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("stack_bool",      tcc_ir_opt_stack_bool_diamond_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
   PASS_GATED("var_tmp_fwd",     tcc_ir_opt_var_tmp_fwd_ex,      0, IR_PASS_INVALIDATES_DU, FLAG(opt_const_prop)),
+  /* Restored: this entry was dropped by b9b1be1a ("Removed legacy optimization
+   * loops"), which left the pass compiled but unreachable -- declared, with an
+   * _ex wrapper, and called from nowhere.  Same gate and invalidation it
+   * carried in the pre-refactor table. */
+  PASS_GATED("var_to_tmp",      tcc_ir_opt_var_to_tmp_ex,       0, IR_PASS_INVALIDATES_DU, FLAG(opt_copy_prop)),
+  PASS_GATED("inline_param_copy", tcc_ir_opt_inline_param_copy_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_copy_prop)),
 };
 
 static const IROptPass fusion_passes[] = {

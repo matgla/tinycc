@@ -416,7 +416,10 @@ again:
               ret_dst.type.t = (ret_dst.type.t & ~VT_BTYPE) | VT_INT;
           }
           ret_dst.r = VT_LOCAL | VT_LVAL;
-          ret_dst.vr = -1;
+          /* The vreg (when the call site bound one) makes this a write to a
+           * compiler-generated local rather than to a raw frame slot, so the
+           * allocator can keep the inlined return value in a register. */
+          ret_dst.vr = tcc_state->inline_return_vr;
           ret_dst.c.i = tcc_state->inline_return_loc;
           tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, vtop, NULL, &ret_dst);
           vtop--;
@@ -489,6 +492,7 @@ again:
       {
         /* no, regular for-loop init expr */
         gexpr();
+        gv_discarded_volatile();
         vpop();
       }
     }
@@ -514,6 +518,7 @@ again:
       // d = gind();
       c = tcc_state->ir->next_instruction_index;
       gexpr();
+      gv_discarded_volatile();
       vpop();
       gjmp_addr(d);
       tcc_ir_backpatch_to_here(tcc_state->ir, e);
@@ -904,6 +909,7 @@ again:
         {
           gexpr();
           tcc_ir_codegen_drop_return(tcc_state->ir);
+          gv_discarded_volatile();
           vpop();
         }
         skip(';');

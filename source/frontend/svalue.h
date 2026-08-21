@@ -42,6 +42,16 @@ typedef struct SValue
                              * addresses on ARMv7-M/v8-M).  A stale 1 only costs
                              * the optimization; a lost 1 would fault, so setters
                              * must never be skipped. */
+  uint8_t volatile_access : 1; /* This value's memory access is, or may be,
+                                * volatile.  Sticky: set the moment a qualifier
+                                * is about to be dropped from the type and never
+                                * cleared for the life of the value, because by
+                                * the time svalue_to_iroperand runs the type has
+                                * been normalized and a `T***DEREF***` operand
+                                * has no Sym left to ask.  Over-marking only
+                                * costs an optimization; a lost mark would let a
+                                * deref CSE collapse two volatile reads into
+                                * one, so setters err towards 1. */
   uint8_t pr1_reg : 5;     /* Physical register number (0-15 for ARM, 31=PREG_REG_NONE) */
   uint8_t pr1_spilled : 1; /* Spilled to stack flag */
 

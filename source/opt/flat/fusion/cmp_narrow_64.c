@@ -16,6 +16,84 @@
 
 
 
+
+/* The high 32 bits of `op` are provably zero.
+ * Returns 0 = not proven, 1 = proven (a value), 2 = proven and `op` is a
+ * constant, whose value lands in *imm_out so the caller can re-encode it. */
+static int cn64_hi_is_zero(TCCIRState *ir, const int *def_idx, int max_tmp_pos,
+                           IROperand op, uint64_t *imm_out)
+{
+  if (irop_is_immediate(op))
+  {
+    uint64_t v = (uint64_t)irop_get_imm64_ex(ir, op);
+    if ((v >> 32) != 0)
+      return 0;
+    if (imm_out)
+      *imm_out = v;
+    return 2;
+  }
+
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0)
+    return 0;
+  int di = -1;
+  const int type = TCCIR_DECODE_VREG_TYPE(vr);
+  if (type == TCCIR_VREG_TYPE_TEMP)
+  {
+    int pos = TCCIR_DECODE_VREG_POSITION(vr);
+    if (pos <= max_tmp_pos)
+      di = def_idx[pos];
+  }
+  else if (type == TCCIR_VREG_TYPE_VAR)
+  {
+    /* A named local needs more care than a temp: several definitions, or an
+     * address handed out to something this scan cannot follow, and the def
+     * found here is not the one reaching the compare. */
+    if (!tcc_ir_vreg_has_single_def(ir, vr))
+      return 0;
+    for (int k = 0; k < ir->next_instruction_index; k++)
+    {
+      IRQuadCompact *qk = &ir->compact_instructions[k];
+      if (qk->op == TCCIR_OP_NOP)
+        continue;
+      if (qk->op == TCCIR_OP_LEA && irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == vr)
+        return 0;
+      if (irop_config[qk->op].has_dest && di < 0 &&
+          irop_get_vreg(tcc_ir_op_get_dest(ir, qk)) == vr)
+        di = k;
+    }
+  }
+  if (di < 0)
+    return 0;
+
+  IRQuadCompact *qd = &ir->compact_instructions[di];
+  if (qd->op == TCCIR_OP_ZEXT)
+    return 1; /* u32 -> u64 always zeroes the high half */
+  if (qd->op == TCCIR_OP_SHR)
+  {
+    IROperand amt = tcc_ir_op_get_src2(ir, qd);
+    IROperand val = tcc_ir_op_get_src1(ir, qd);
+    if (irop_is_immediate(amt) && irop_get_imm64_ex(ir, amt) >= 32 &&
+        irop_get_btype(val) == IROP_BTYPE_INT64)
+      return 1;
+  }
+  if (qd->op == TCCIR_OP_AND)
+  {
+    /* A mask whose high word is zero zeroes the result's, whatever the other
+     * operand holds.  `rem = mant & 7` then `rem > 4` is how
+     * sfp_round_pack_double writes its rounding decision, and without this it
+     * is a 64-bit compare: two instructions to build the 64-bit 4, a CMP and
+     * an SBCS, for what `cmp rn,#4` says on its own. */
+    for (int k = 0; k < 2; k++)
+    {
+      IROperand m = k ? tcc_ir_op_get_src2(ir, qd) : tcc_ir_op_get_src1(ir, qd);
+      if (irop_is_immediate(m) && ((uint64_t)irop_get_imm64_ex(ir, m) >> 32) == 0)
+        return 1;
+    }
+  }
+  return 0;
+}
+
 int tcc_ir_opt_cmp_narrow_64(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -120,45 +198,16 @@ int tcc_ir_opt_cmp_narrow_64(TCCIRState *ir)
     if (!cond_ok)
       continue;
 
-    /* src1 must be a TEMP whose def proves hi=0. */
-    int32_t s1_vr = irop_get_vreg(src1);
-    if (TCCIR_DECODE_VREG_TYPE(s1_vr) != TCCIR_VREG_TYPE_TEMP)
-      continue;
-    int s1_pos = TCCIR_DECODE_VREG_POSITION(s1_vr);
-    if (s1_pos > max_tmp_pos || def_idx[s1_pos] < 0)
-      continue;
-    IRQuadCompact *q_def = &ir->compact_instructions[def_idx[s1_pos]];
-    int s1_hi_zero = 0;
-    if (q_def->op == TCCIR_OP_ZEXT)
-    {
-      /* ZEXT from u32 → u64 always zeros the high half. */
-      s1_hi_zero = 1;
-    }
-    else if (q_def->op == TCCIR_OP_SHR)
-    {
-      IROperand shr_amt = tcc_ir_op_get_src2(ir, q_def);
-      if (irop_is_immediate(shr_amt) && irop_get_imm64_ex(ir, shr_amt) >= 32)
-      {
-        IROperand shr_src = tcc_ir_op_get_src1(ir, q_def);
-        if (irop_get_btype(shr_src) == IROP_BTYPE_INT64)
-          s1_hi_zero = 1;
-      }
-    }
-    if (!s1_hi_zero)
-      continue;
+    /* Both operands' high words must be provably zero; either one may be the
+     * constant, since the frontend swaps the operands of a UGT/ULE compare to
+     * reach the condition codes the backend has. */
+    uint64_t imm1 = 0, imm2 = 0;
+    int z1 = cn64_hi_is_zero(ir, def_idx, max_tmp_pos, src1, &imm1);
+    int z2 = cn64_hi_is_zero(ir, def_idx, max_tmp_pos, src2, &imm2);
 
-    /* src2 must be a u64 constant with high 32 bits == 0. Two forms:
-     *   (a) inline immediate
-     *   (b) VAR whose STORE def wrote a u64 constant — printf arg locals
-     *       stay VAR-stored after const-prop, so walk the def chain. */
-    uint64_t imm;
-    int got_imm = 0;
-    if (irop_is_immediate(src2))
-    {
-      imm = (uint64_t)irop_get_imm64_ex(ir, src2);
-      got_imm = 1;
-    }
-    else if (var_def_idx)
+    /* A VAR holding a constant only reaches the compare through its STORE --
+     * the shape printf argument locals keep after const-prop. */
+    if (!z2 && var_def_idx)
     {
       int32_t s2_vr = irop_get_vreg(src2);
       if (TCCIR_DECODE_VREG_TYPE(s2_vr) == TCCIR_VREG_TYPE_VAR)
@@ -170,28 +219,87 @@ int tcc_ir_opt_cmp_narrow_64(TCCIRState *ir)
           if (q_vdef->op == TCCIR_OP_STORE)
           {
             IROperand store_src = tcc_ir_op_get_src1(ir, q_vdef);
-            if (irop_is_immediate(store_src))
+            if (irop_is_immediate(store_src) &&
+                ((uint64_t)irop_get_imm64_ex(ir, store_src) >> 32) == 0)
             {
-              imm = (uint64_t)irop_get_imm64_ex(ir, store_src);
-              got_imm = 1;
+              imm2 = (uint64_t)irop_get_imm64_ex(ir, store_src);
+              z2 = 2;
             }
           }
         }
       }
     }
-    if (!got_imm)
-      continue;
-    if ((imm >> 32) != 0)
+    if (!z1 || !z2)
       continue;
 
-    /* Narrow both CMP operands to INT32 by patching its operand-pool
-     * entries; T's def stays u64, so other consumers still see u64. */
-    LOG_IR_GEN("OPTIMIZE: cmp_narrow_64 at i=%d (T%d hi=0, imm=%llu)", i, s1_pos, (unsigned long long)imm);
-    IROperand new_src1 = src1;
+    /* The 64-bit lowering has no GT/LE form, so the frontend reaches those by
+     * exchanging the operands -- which leaves the constant in src1, where the
+     * backend has to put it in a register first.  Once the compare is 32 bits
+     * that constraint is gone: exchange them back and mirror the condition on
+     * every flag reader, and `mov rX,#4; cmp rX,rn` becomes `cmp rn,#4`. */
+    int swap = (z1 == 2 && z2 != 2);
+    if (swap)
+    {
+      int ok = 1;
+      for (int j = i + 1; j < n; j++)
+      {
+        IRQuadCompact *qj = &ir->compact_instructions[j];
+        if (qj->op == TCCIR_OP_NOP)
+          continue;
+        if (qj->op != TCCIR_OP_SETIF && qj->op != TCCIR_OP_JUMPIF)
+          break;
+        if (qj->is_jump_target)
+        {
+          ok = 0;
+          break;
+        }
+        IROperand c = tcc_ir_op_get_src1(ir, qj);
+        if (!irop_is_immediate(c) || swap_cond_token((int)irop_get_imm64_ex(ir, c)) < 0)
+        {
+          ok = 0;
+          break;
+        }
+      }
+      if (ok)
+      {
+        for (int j = i + 1; j < n; j++)
+        {
+          IRQuadCompact *qj = &ir->compact_instructions[j];
+          if (qj->op == TCCIR_OP_NOP)
+            continue;
+          if (qj->op != TCCIR_OP_SETIF && qj->op != TCCIR_OP_JUMPIF)
+            break;
+          IROperand c = tcc_ir_op_get_src1(ir, qj);
+          int st = swap_cond_token((int)irop_get_imm64_ex(ir, c));
+          tcc_ir_set_src1(ir, j, irop_make_imm32(-1, st, irop_get_btype(c)));
+        }
+      }
+      else
+        swap = 0;
+    }
+
+    /* Narrow both CMP operands to INT32 by patching its operand-pool entries;
+     * each source's own def stays u64, so other consumers still see u64. */
+    LOG_IR_GEN("OPTIMIZE: cmp_narrow_64 at i=%d (both operands hi=0, swap=%d)", i, swap);
+    IROperand new_src1 = (z1 == 2)
+                             ? irop_make_imm32(-1, (int32_t)(uint32_t)imm1, IROP_BTYPE_INT32)
+                             : src1;
+    IROperand new_src2 = (z2 == 2)
+                             ? irop_make_imm32(-1, (int32_t)(uint32_t)imm2, IROP_BTYPE_INT32)
+                             : src2;
     new_src1.btype = IROP_BTYPE_INT32;
+    new_src2.btype = IROP_BTYPE_INT32;
+    if (z1 == 2)
+      new_src1.is_unsigned = src1.is_unsigned;
+    if (z2 == 2)
+      new_src2.is_unsigned = src2.is_unsigned;
+    if (swap)
+    {
+      IROperand t = new_src1;
+      new_src1 = new_src2;
+      new_src2 = t;
+    }
     tcc_ir_set_src1(ir, i, new_src1);
-    IROperand new_src2 = irop_make_imm32(-1, (int32_t)(uint32_t)imm, IROP_BTYPE_INT32);
-    new_src2.is_unsigned = src2.is_unsigned;
     tcc_ir_set_src2(ir, i, new_src2);
     changes++;
   }

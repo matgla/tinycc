@@ -363,6 +363,89 @@ def test_control_branch_conditional_and_loop():
     assert udf_count == 0, f"if_then_else has unexpected undefined/breakpoint instructions ({udf_count})"
 
 
+def test_size_flags_alias_o2():
+    """-Os / -Oz are a real tier, not a silent -O0.
+
+    `s->optimize = atoi(optarg)` turned both into 0, so -Os meant "no
+    optimization" -- and since -O is a plain option scan, `-O2 ... -Os` (which
+    is what toybox passes) threw the -O2 away.  They alias -O2 until there is
+    an actual size tier to point them at.
+    """
+    o0 = _disassemble(_compile("dead_loop_rotated", extra_cflags=["-O0"]))
+    o2 = _disassemble(_compile("dead_loop_rotated", extra_cflags=["-O2"]))
+    os_ = _disassemble(_compile("dead_loop_rotated", extra_cflags=["-Os"]))
+    oz = _disassemble(_compile("dead_loop_rotated", extra_cflags=["-Oz"]))
+
+    assert os_ == o2, "-Os should select the same tier as -O2"
+    assert oz == o2, "-Oz should select the same tier as -O2"
+    assert os_ != o0, "-Os is still a silent -O0"
+
+
+def test_switch_const_selector_folds():
+    """ssa:switch_fold: `switch (7)` picks its arm at compile time.
+
+    Before, the selector was never looked at: SCCP propagated the constant into
+    the dispatch and stopped, so const_seven became a .rodata value table read
+    with a constant index, and the in-loop shape kept a full PC-relative
+    indirect jump on every iteration.  A runtime selector must still dispatch.
+    """
+    obj = _compile("switch_const_selector")
+    funcs = _disassemble(obj)
+
+    for name, want in (("const_seven", "1000"), ("const_out_of_range", "-1")):
+        fn = funcs[name]
+        assert len(fn) == 2, f"{name} should be one move plus bx lr, got {fn}"
+        assert _count_mnem_regex(fn, r"^ldr") == 0, f"{name} still reads a table"
+
+    # The dispatch is gone, so ssa:dead_loop can take the loop with it.
+    loop = funcs["const_switch_in_loop"]
+    assert _count_mnem_regex(loop, r"^b[a-z]*\.[wn] ") == 0, (
+        f"const_switch_in_loop still branches: {loop}"
+    )
+    assert _count_mnem_regex(loop, r"^ldr") == 0, "const_switch_in_loop still reads a table"
+
+    var = funcs["variable_selector"]
+    assert _count_mnem_regex(var, r"^bx (ip|r)") >= 1, (
+        "variable_selector lost its indirect dispatch"
+    )
+
+
+def test_dead_loop_rotated_kills_back_edge():
+    """ssa:dead_loop, rotated arm: a pure counting loop whose exit value is a
+    constant must lose its back-edge entirely, leaving only the entry guard.
+
+    Every loop tcc rotates is bottom-tested, and the pass used to require a CMP
+    as the first instruction of the header -- so it matched nothing real and
+    const_result kept a 2-cmp / 2-branch counting loop.  The negatives each
+    trip one of the conditions and must still count.
+    """
+    obj = _compile("dead_loop_rotated")
+    funcs = _disassemble(obj)
+
+    branch = r"^b[a-z]*\.[wn] "
+
+    kept = funcs["const_result"]
+    assert _count_mnem(kept, "cmp") == 1, (
+        f"const_result should keep only the entry guard's cmp, got "
+        f"{_count_mnem(kept, 'cmp')}"
+    )
+    assert _count_mnem_regex(kept, branch) == 1, (
+        f"const_result still has a back-edge: "
+        f"{_count_mnem_regex(kept, branch)} branches"
+    )
+
+    for name, why in (
+        ("mangle", "exit value depends on the trip count"),
+        ("counter_escapes", "the counter is read after the loop"),
+        ("store_each", "the body stores"),
+        ("volatile_poll", "the body reads volatile memory"),
+    ):
+        fn = funcs[name]
+        assert _count_mnem_regex(fn, branch) >= 2, (
+            f"{name} lost its back-edge but {why}"
+        )
+
+
 def test_cmp_common_base_offset_fold_fires():
     """Common-base CMP constant-offset fold: A = X+K1, B = X+K2 => K1 cond K2.
 
@@ -668,6 +751,79 @@ def test_bool_chain_fuse():
         assert _count_mnem(fn, "cmp") == 1, f"{name}: expected a single cmp"
 
 
+def test_inlined_bool_predicate_branches_like_the_written_test():
+    """`if (pred(a, b))` on a static inline must not materialize the 0/1.
+
+    The inlined callee returns a value, so the short-circuit arrives as a
+    diamond feeding a TEST_ZERO.  ssa:bool_diamond_branch sends the constant
+    arm's edge straight to the side of that test its constant picks, which
+    kills the arm and lets setif fusion reach the survivor.  The check is a
+    comparison against the hand-written form rather than an absolute count, so
+    it keeps its teeth if the branch lowering itself changes.
+    """
+    obj = _compile("inline_bool_predicate")
+    funcs = _disassemble(obj)
+
+    for inlined, written in (("inlined_and", "written_and"), ("inlined_or", "written_or")):
+        fn = funcs[inlined]
+        ref = funcs[written]
+        assert _count_mnem(fn, "ite") == 0, f"{inlined}: boolean still materialized"
+        for mnem in ("cmp", "orrs", "movs", "b", "bne", "beq"):
+            assert _count_mnem(fn, mnem) <= _count_mnem(ref, mnem), (
+                f"{inlined}: more {mnem!r} than the hand-written {written}"
+            )
+        # Not a length comparison: the inlined form still carries one extra
+        # register copy from parameter marshalling, which is a different gap.
+        # What must match is the branch skeleton.
+        branches = lambda insns: sum(
+            1 for m, _ in insns if m.split(".")[0] in ("b", "bne", "beq", "cbz", "cbnz")
+        )
+        assert branches(fn) == branches(ref), (
+            f"{inlined}: branch count {branches(fn)} != hand-written {branches(ref)}"
+        )
+
+
+def test_pointer_chase_keeps_every_dereference():
+    """`***ppp` must emit three loads.
+
+    The frame-slot reload cache records that a load leaves its destination
+    holding the memory it read.  For `ldr r0,[r0]` that is false -- the
+    register is the loaded VALUE afterwards, not the address -- and recording
+    it elides the next link of the chain.
+    """
+    obj = _compile("spill_reload_cache")
+    fn = _disassemble(obj)["chase"]
+    loads = [a for m, a in fn if m.split(".")[0] == "ldr"]
+    assert len(loads) >= 3, f"pointer chase lost a dereference: {fn}"
+
+
+def test_frame_slot_reloads_collapse_across_ir_ops():
+    """A spilled value materialized twice in a row is loaded once.
+
+    Every frame slot `reload_pair` reads is read again by the next IR op with
+    a conditional branch in between, so this fails both if the cache is reset
+    at every IR boundary and if a plain branch invalidates it.
+    """
+    obj = _compile("spill_reload_cache")
+    fn = _disassemble(obj)["reload_pair"]
+
+    seen = set()
+    repeats = 0
+    for mnem, args in fn:
+        base = mnem.split(".")[0]
+        m = re.match(r"^(r\d+|ip|lr|fp|sl), \[(sp|r7|fp)(?:, #(-?\d+))?\]$", args)
+        if base == "ldr" and m:
+            key = (m.group(1), m.group(2), m.group(3) or "0")
+            if key in seen:
+                repeats += 1
+            seen.add(key)
+        elif base in ("bl", "blx") or base.startswith("push") or base.startswith("pop"):
+            seen.clear()   # a call clobbers registers and memory alike
+    assert repeats == 0, (
+        f"{repeats} frame slot(s) reloaded into a register that already held them: {fn}"
+    )
+
+
 # -----------------------------------------------------------------------------
 # Inline asm operand marshalling
 # -----------------------------------------------------------------------------
@@ -732,3 +888,91 @@ def test_asm_operand_loads_do_not_clobber_each_other():
             f"{sorted(want.elements())} -- an operand load clobbered another "
             f"operand's source"
         )
+
+
+# -----------------------------------------------------------------------------
+# Volatile accesses survive CSE / DSE / store-forwarding
+# -----------------------------------------------------------------------------
+def _mem_counts(func_insns):
+    """(loads, stores) of real memory accesses, excluding the literal pool.
+
+    `ldr rX, [pc, #N]` materializes a constant (a global's address, an MMIO
+    address); it is not an access to the object under test.
+    """
+    loads = stores = 0
+    for mnem, ops in func_insns:
+        if "[pc," in ops or ", [pc" in ops:
+            continue
+        if mnem.startswith("ldr"):
+            loads += 1
+        elif mnem.startswith("str"):
+            stores += 1
+    return loads, stores
+
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"])
+def test_volatile_accesses_all_survive(opt):
+    """Every volatile read and write must reach the machine code.
+
+    The case file names each function `v<N>_<loads>_<stores>` with the minimum
+    number of real ldr/str it must contain, and `c<N>_...` for the same shape
+    without volatile — the controls prove the optimization being blocked for
+    the volatile cases still fires when it is allowed to.
+
+    This locks in a sweep that found seven distinct volatile bugs at once:
+    LOAD_INDEXED CSE (`p[1] + p[1]`), the sym-keyed global CSE missing
+    `volatile int a[4]` and volatile struct members, dead-store elimination of
+    volatile global and local writes, store-to-load forwarding into a volatile
+    read, whole-body elision of a function whose only effect is a volatile
+    write, the discarded read (`*p;`, `(void)REG;`), and — the worst — every
+    `*(volatile T *)0x40000000` MMIO read compiling to the ADDRESS instead of a
+    load.
+    """
+    obj = _compile("volatile_access", extra_cflags=[opt])
+    funcs = _disassemble(obj)
+
+    cases = [(n, f) for n, f in funcs.items() if re.match(r"^[vc]\d+_\d+_\d+$", n)]
+    assert len(cases) >= 40, f"case file did not compile fully: {sorted(funcs)}"
+
+    failures = []
+    for name, insns in sorted(cases):
+        want_loads, want_stores = (int(x) for x in name.rsplit("_", 2)[1:])
+        loads, stores = _mem_counts(insns)
+        if loads < want_loads or stores < want_stores:
+            failures.append(
+                f"{name}: want >={want_loads} ldr / >={want_stores} str, got {loads}/{stores}"
+            )
+    assert not failures, f"volatile accesses dropped at {opt}:\n  " + "\n  ".join(failures)
+
+@pytest.mark.parametrize("opt", ["-O0", "-O1", "-O2"])
+def test_volatile_access_not_duplicated(opt):
+    """A volatile access must happen EXACTLY as often as the source says.
+
+    The sweep above checks minimums, which cannot see an access emitted twice.
+    The `x` cases are compiled as written and must hold their name's count
+    exactly.  The `r` cases are self-recursive, and at -O1/-O2 one level of the
+    recursion is expanded into the body, so each holds two copies of the count
+    while each surviving call covers two levels -- see asm/volatile_once.c.
+    That multiplier is asserted, not tolerated: a third copy would mean the
+    expansion ran deeper than intended, and a single one that it stopped
+    happening.
+
+    -O0 is the only arm with no expansion.  (_compile passes -O2 ahead of
+    `opt`, and the driver's -O2 feature flags are sticky, so the -O1 arm is
+    really -O2's inliner at -O1's optimize level.)
+    """
+    obj = _compile("volatile_once", extra_cflags=[opt])
+    funcs = _disassemble(obj)
+
+    cases = [(n, f) for n, f in funcs.items() if re.match(r"^[xr]\d+_\d+_\d+$", n)]
+    assert len(cases) >= 9, f"case file did not compile fully: {sorted(funcs)}"
+
+    copies = 1 if opt == "-O0" else 2
+    failures = []
+    for name, insns in sorted(cases):
+        mult = copies if name[0] == "r" else 1
+        want_loads, want_stores = (int(x) * mult for x in name.rsplit("_", 2)[1:])
+        loads, stores = _mem_counts(insns)
+        if loads != want_loads or stores != want_stores:
+            failures.append(f"{name}: want exactly {want_loads} ldr / {want_stores} str, got {loads}/{stores}")
+    assert not failures, f"wrong number of volatile accesses at {opt}:\n  " + "\n  ".join(failures)

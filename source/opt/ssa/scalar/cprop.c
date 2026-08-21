@@ -216,12 +216,17 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
   int32_t src_vr = vreg(src1);
 
   /* Never CSE a load of a volatile VAR against a prior load: each read is a
-   * mandated memory access that must survive. */
+   * mandated memory access that must survive.  The live interval carries that
+   * for a declared `volatile` local; for everything else — a deref of a
+   * `volatile T *`, a volatile member, a cast — the operand's access mark is
+   * the only record. */
   if (src_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src_vr) == TCCIR_VREG_TYPE_VAR) {
     IRLiveInterval *si = tcc_ir_vreg_live_interval(ir, src_vr);
     if (si && si->is_volatile)
       return 0;
   }
+  if (tcc_ir_access_is_volatile(ir, src1))
+    return 0;
 
   int blk = cfg->instr_to_block[i];
   if (blk < 0 || blk >= cfg->num_blocks)

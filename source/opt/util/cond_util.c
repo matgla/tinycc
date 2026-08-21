@@ -143,6 +143,37 @@ int fcmp_cmp_implies(int known_true, int check)
   }
 }
 
+/* The condition for the SAME comparison with its operands exchanged:
+ * `a < b` read the other way round is `b > a`.  Not the inverse -- EQ and NE
+ * are their own mirror, and the strictness of an ordered test does not flip. */
+int swap_cond_token(int tok)
+{
+  switch (tok)
+  {
+  case 0x94: /* EQ */
+  case 0x95: /* NE */
+    return tok;
+  case 0x9c:
+    return 0x9f; /* LT -> GT */
+  case 0x9f:
+    return 0x9c; /* GT -> LT */
+  case 0x9e:
+    return 0x9d; /* LE -> GE */
+  case 0x9d:
+    return 0x9e; /* GE -> LE */
+  case 0x92:
+    return 0x97; /* ULT -> UGT */
+  case 0x97:
+    return 0x92; /* UGT -> ULT */
+  case 0x96:
+    return 0x93; /* ULE -> UGE */
+  case 0x93:
+    return 0x96; /* UGE -> ULE */
+  default:
+    return -1;
+  }
+}
+
 int invert_cond_token(int tok)
 {
   switch (tok)

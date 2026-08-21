@@ -313,6 +313,39 @@ static inline void irop_copy_svalue_info(IROperand *op, const SValue *sv)
  * The vreg field is ALWAYS preserved from sv->vr.
  * Physical register allocation and type flags are also preserved.
  */
+/* Does this type contain a volatile member anywhere?  A struct copy lowers to
+ * word loads typed by the WORD, not by the member they land on, so
+ * `struct S { volatile int a; } t = g;` reaches the marking in
+ * svalue_to_iroperand with a plain int SValue and a struct-typed Sym, and was
+ * marked provably-non-volatile -- global_init_prop then replaced the load with
+ * the initialiser.  Conservative for a struct mixing volatile and ordinary
+ * members: every access to it is then treated as volatile, which costs
+ * optimization, not correctness.  Scalars exit on the first test. */
+static int ctype_has_volatile_member(const CType *t, int depth)
+{
+  if (!t || depth > 8)
+    return 0;
+  if (t->t & VT_VOLATILE)
+    return 1;
+  if (t->t & VT_ARRAY)
+    return t->ref ? ctype_has_volatile_member(&t->ref->type, depth + 1) : 0;
+  if ((t->t & VT_BTYPE) != VT_STRUCT || !t->ref)
+    return 0;
+  for (Sym *f = t->ref->next; f; f = f->next)
+    if (ctype_has_volatile_member(&f->type, depth + 1))
+      return 1;
+  return 0;
+}
+
+static int svalue_access_is_aggregate_volatile(const SValue *sv)
+{
+  if (!sv->sym)
+    return 0;
+  if (!(sv->sym->type.t & VT_ARRAY) && (sv->sym->type.t & VT_BTYPE) != VT_STRUCT)
+    return 0;
+  return ctype_has_volatile_member(&sv->sym->type, 0);
+}
+
 IROperand svalue_to_iroperand(TCCIRState *ir, const SValue *sv)
 {
   if (!sv)
@@ -601,6 +634,21 @@ done:
   if (result.is_lval && sv->underaligned)
     result.aux |= IROP_AUX_UNDERALIGN;
 
+  /* Volatility, recorded in the same proven-or-clear polarity: an lvalue
+   * operand is marked only when the SValue it came from is non-volatile.
+   * This is the single point where the C type is still in hand — a
+   * `T***DEREF***` read reaches the optimizer with no Sym to ask, so without
+   * the mark a deref-operand CSE could not tell `*p` on a plain pointer from
+   * `*p` on a volatile one, which must be re-read at every use. */
+  if (result.is_lval && !(sv->type.t & VT_VOLATILE) && !sv->volatile_access &&
+      !(sv->sym && (sv->sym->type.t & VT_VOLATILE)) &&
+      !svalue_access_is_aggregate_volatile(sv))
+    result.aux |= IROP_AUX_NONVOLATILE;
+  else if (result.is_lval && ir)
+    /* One volatile access anywhere in the body arms the per-operand checks for
+     * the whole function; see func_has_volatile_access. */
+    ir->func_has_volatile_access = 1;
+
   /* Debug: verify round-trip conversion preserves data */
   // irop_compare_svalue(ir, sv, result, "svalue_to_iroperand");
   return result;
@@ -634,6 +682,12 @@ void iroperand_to_svalue(const TCCIRState *ir, IROperand op, SValue *out)
     out->underaligned = 1;
   if (op.aux & IROP_AUX_UNDERALIGN)
     out->underaligned = 1;
+  /* Same conservative direction for volatility: an lvalue that was not PROVEN
+   * non-volatile must come back marked, or a later svalue_to_iroperand would
+   * re-derive the proven bit from a bare type and license CSE of a volatile
+   * access. */
+  if (op.is_lval && !(op.aux & IROP_AUX_NONVOLATILE))
+    out->volatile_access = 1;
 
   switch (tag)
   {
@@ -1086,6 +1140,13 @@ uint8_t tcc_ir_barrel_shift_at(const TCCIRState *ir, const IRQuadCompact *q)
   return ir->barrel_shifts[q->orig_index];
 }
 
+uint8_t tcc_ir_zero_half64_at(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (!ir->zero_half64 || q->orig_index < 0 || q->orig_index >= ir->zero_half64_len)
+    return 0;
+  return ir->zero_half64[q->orig_index];
+}
+
 uint8_t tcc_ir_shift64_dead_half_at(const TCCIRState *ir, const IRQuadCompact *q)
 {
   if (!ir->shift64_dead_half || q->orig_index < 0 || q->orig_index >= ir->shift64_dead_half_len)
@@ -1321,7 +1382,22 @@ int irop_needs_pair(const IROperand op)
 int irop_is_immediate(const IROperand op)
 {
   int tag = irop_get_tag(op);
+  /* An LVALUE immediate is an absolute ADDRESS to read through, never a
+   * constant value: `*(volatile unsigned *)0x40000000` reaches the optimizer
+   * as an IMM32 operand with is_lval set, exactly the way a global deref
+   * reaches it as an lvalue SYMREF.  Answering "yes, a constant" for it let
+   * every folder substitute the address for the loaded word (`REG & 1` folded
+   * to `0x40000000 & 1`), which is the MMIO register idiom mis-compiled. */
+  if (op.is_lval)
+    return 0;
   return tag == IROP_TAG_IMM32 || tag == IROP_TAG_F32 || tag == IROP_TAG_I64 || tag == IROP_TAG_F64;
+}
+
+int irop_is_lval_imm_addr(const IROperand op)
+{
+  int tag = irop_get_tag(op);
+  return op.is_lval && !op.is_sym &&
+         (tag == IROP_TAG_IMM32 || tag == IROP_TAG_I64);
 }
 
 int irop_is_plain_imm(const IROperand op)

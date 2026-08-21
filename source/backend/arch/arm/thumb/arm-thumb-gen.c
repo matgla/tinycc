@@ -326,6 +326,7 @@ static void mov_equiv_reset_all(void);
 static void imm_cache_reset_all(void);
 static void imm_cache_invalidate_reg(int reg);
 ST_FUNC void tcc_gen_machine_strldr_cache_reset(void);
+ST_FUNC void tcc_gen_machine_strldr_cache_set_enabled(int enabled);
 ST_FUNC void tcc_gen_machine_imm_cache_reset(void);
 static void thumb_require_materialized_reg(const char *ctx, const char *operand, int reg);
 static bool thumb_is_hw_reg(int reg);
@@ -598,6 +599,16 @@ static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *
 
   case MACH_OP_IMM:
   {
+    if (op->needs_deref)
+    {
+      /* Absolute-address lvalue (`*(T *)0x40000000`) used as a value operand:
+       * materialize the address, then read through it. */
+      int addr_r = mach_alloc_scratch(ctx, excl);
+      tcc_machine_load_constant(addr_r, PREG_REG_NONE, op->u.imm.val, 0, NULL);
+      int r = mach_alloc_scratch(ctx, excl | (1u << (uint32_t)addr_r));
+      load_from_base(r, PREG_REG_NONE, op->btype, (int)op->is_unsigned, 0, 0, (uint32_t)addr_r);
+      return r;
+    }
     int r = mach_alloc_scratch_for_const(ctx, excl, op->u.imm.val);
     tcc_machine_load_constant(r, PREG_REG_NONE, op->u.imm.val, 0, NULL);
     return r;
@@ -680,7 +691,8 @@ static int mach_ensure_imm_or_reg(MachineCodegenContext *ctx, const MachineOpera
                                   thumb_flags_behaviour flags, bool *imm_emitted)
 {
   *imm_emitted = false;
-  if (op->kind == MACH_OP_IMM && imm_handler)
+  /* An lvalue immediate is an ADDRESS to read through, not an operand value. */
+  if (op->kind == MACH_OP_IMM && !op->needs_deref && imm_handler)
   {
     const uint32_t imm_val = (uint32_t)op->u.imm.val;
     if (ot(thumb_call_imm_handler(imm_handler, (uint32_t)dest_reg, (uint32_t)src1_reg, imm_val, flags,
@@ -2405,6 +2417,15 @@ static int decode_mov_reg_plain(thumb_opcode op, int *rd_out, int *rm_out)
   return 0;
 }
 
+/* Bit layout of tcc_ir_zero_half64_at's byte, as it arrives in bits 18-23 of
+ * `barrel_shift`.  Mirrors source/opt/flat/fusion/zero_half64.c. */
+#define ZH64_S1_LO 0x01u
+#define ZH64_S1_HI 0x02u
+#define ZH64_S2_LO 0x04u
+#define ZH64_S2_HI 0x08u
+#define ZH64_D_LO 0x10u
+#define ZH64_D_HI 0x20u
+
 /* ---------------------------------------------------------------------------
  * STR -> LDR redundant-reload peephole
  *
@@ -2426,7 +2447,8 @@ typedef struct StrLdrCacheEntry
   uint8_t valid;
   uint8_t rt;
   uint8_t rn;
-  uint8_t size; /* 2 or 4 */
+  uint8_t size;  /* encoding size, 2 or 4 */
+  uint8_t width; /* bytes the access moves; only 4 is ever recorded */
   int imm;
   uint32_t puw;
 } StrLdrCacheEntry;
@@ -2434,10 +2456,34 @@ typedef struct StrLdrCacheEntry
 #define STRLDR_CACHE_CAPACITY 8
 static StrLdrCacheEntry strldr_cache[STRLDR_CACHE_CAPACITY];
 static int strldr_cache_count;
+/* Off for a function that touches volatile ANYWHERE.  Resetting per IR op is
+ * not enough: `return *p + *p` on a `volatile int *` is two reads inside ONE
+ * op, and both have to reach memory.  Volatile bodies are rare, so the whole
+ * function pays rather than the analysis getting clever. */
+static int strldr_cache_off;
 
 ST_FUNC void tcc_gen_machine_strldr_cache_reset(void)
 {
   strldr_cache_count = 0;
+}
+
+ST_FUNC void tcc_gen_machine_strldr_cache_set_enabled(int enabled)
+{
+  strldr_cache_off = !enabled;
+  strldr_cache_count = 0;
+}
+
+/* A backend-internal branch target: code below is reachable from somewhere
+ * other than the preceding instruction, so no emission-order fact survives.
+ * There are exactly three such points (one `gsym` and the two setjmp resume
+ * labels); every other merge is an IR-level jump target that codegen.c
+ * already resets at.  Needed because a plain branch no longer resets the
+ * memory cache on its own -- see thumb_op_is_plain_branch. */
+static void codegen_internal_merge_point(void)
+{
+  mov_equiv_reset_all();
+  tcc_gen_machine_strldr_cache_reset();
+  imm_cache_reset_all();
 }
 
 ST_FUNC void tcc_gen_machine_imm_cache_reset(void)
@@ -2466,20 +2512,55 @@ static void strldr_cache_invalidate_reg(int reg)
   }
 }
 
-static void strldr_cache_record_str(int rt, int rn, int imm, uint32_t puw, int size)
+/* Drop every entry a write of `width` bytes at [rn + imm] could reach.
+ *
+ * Two accesses are provably distinct only when they name the same base
+ * register and their byte ranges do not overlap: different base registers may
+ * hold the same address (a pointer into the frame aliases SP), so a store
+ * through one of them has to clear the other's entries.  A write to `rn`
+ * itself is handled separately by strldr_cache_invalidate_reg, which is what
+ * makes "same base register" mean "same address" here. */
+static void strldr_cache_invalidate_mem(int rn, int imm, int width)
+{
+  for (int i = 0; i < strldr_cache_count; i++)
+  {
+    StrLdrCacheEntry *e = &strldr_cache[i];
+    if (!e->valid)
+      continue;
+    if (e->rn == rn && (e->imm + (int)e->width <= imm || imm + width <= e->imm))
+      continue;
+    e->valid = 0;
+  }
+}
+
+/* Record that `rt` holds [rn + imm] after this access.  True of a store and of
+ * a load alike -- which is the point: a spilled value materialized twice in a
+ * row is two LOADS, not a store and a load, so a store-only cache never sees
+ * the shape at all.
+ *
+ * Only 4-byte accesses are recorded.  A sub-word access does not leave the
+ * register holding the memory: `strb rt,[rn,#4]` writes rt's low byte and
+ * `ldrb rt,[rn,#4]` brings it back zero-extended, and the T1 STRB imm5 is
+ * UNSCALED where the T1 STR imm5 is word-scaled, so the two decode to the same
+ * (rt, rn, imm, size) triple and would match each other. */
+static void strldr_cache_record_access(int rt, int rn, int imm, uint32_t puw, int size, int width, int is_store)
 {
   if (puw != 6)
   {
     tcc_gen_machine_strldr_cache_reset();
     return;
   }
-  /* Overwriting the same slot invalidates any prior cache entry for it. */
-  for (int i = 0; i < strldr_cache_count; i++)
-  {
-    StrLdrCacheEntry *e = &strldr_cache[i];
-    if (e->valid && e->rn == rn && e->imm == imm)
-      e->valid = 0;
-  }
+  if (is_store)
+    strldr_cache_invalidate_mem(rn, imm, width);
+  if (width != 4)
+    return;
+  /* `ldr r0,[r0]` overwrites its own base: afterwards r0 is the loaded VALUE,
+   * not the address it was loaded from, so "r0 holds [r0+0]" describes a slot
+   * that no longer exists.  Recording it collapses a pointer-chase --
+   * `ldr r0,[r0]; ldr r0,[r0]` for `**pp` -- into a single dereference.
+   * A store cannot hit this: it writes no register. */
+  if (!is_store && rt == rn)
+    return;
   if (strldr_cache_count >= STRLDR_CACHE_CAPACITY)
   {
     tcc_gen_machine_strldr_cache_reset();
@@ -2491,32 +2572,49 @@ static void strldr_cache_record_str(int rt, int rn, int imm, uint32_t puw, int s
   e->imm = imm;
   e->puw = puw;
   e->size = (uint8_t)size;
+  e->width = (uint8_t)width;
 }
 
 /* Return 1 when a matching unclobbered STR entry exists that makes this
  * LDR redundant.  Matches on all fields so a 16-bit LDR won't be elided
  * against a 32-bit STR (and vice versa) — the encodings might pick
  * different scale semantics. */
-static int strldr_cache_try_match_ldr(int rt, int rn, int imm, uint32_t puw, int size)
+static int strldr_cache_try_match_ldr(int rt, int rn, int imm, uint32_t puw, int size, int width)
 {
-  if (puw != 6)
+  if (strldr_cache_off || puw != 6 || width != 4)
     return 0;
   for (int i = 0; i < strldr_cache_count; i++)
   {
     StrLdrCacheEntry *e = &strldr_cache[i];
     if (!e->valid)
       continue;
-    if (e->rt == rt && e->rn == rn && e->imm == imm && e->puw == puw && e->size == size)
+    if (e->rt == rt && e->rn == rn && e->imm == imm && e->puw == puw && e->size == size &&
+        e->width == width)
       return 1;
   }
   return 0;
+}
+
+/* Both halves of an LDRD already sitting in the registers it would load them
+ * into: the instruction moves nothing.  Asked per half, so a pair written by
+ * two single STRs counts as much as one written by a STRD.  Neither register
+ * may be the base -- the load would otherwise overwrite the address it reads
+ * from, and the entries describe a slot that no longer exists. */
+static int strldr_cache_ldrd_is_redundant(int rt, int rt2, int rn, int imm, uint32_t puw)
+{
+  if (!thumb_gen_state.generating_function || puw != 6)
+    return 0;
+  if (rt == rn || rt2 == rn)
+    return 0;
+  return strldr_cache_try_match_ldr(rt, rn, imm, puw, 4, 4) &&
+         strldr_cache_try_match_ldr(rt2, rn, imm + 4, puw, 4, 4);
 }
 
 /* Decode T1/T2/T3 STR/LDR immediate-offset forms with no writeback.
  * Returns 1 and fills outputs when the opcode matches, 0 otherwise.
  * *is_str_out is 1 for STR, 0 for LDR. */
 static int decode_str_ldr_imm(thumb_opcode op, int *is_str_out, int *rt_out, int *rn_out, int *imm_out,
-                              uint32_t *puw_out)
+                              uint32_t *puw_out, int *width_out)
 {
   if (op.size == 2)
   {
@@ -2530,6 +2628,7 @@ static int decode_str_ldr_imm(thumb_opcode op, int *is_str_out, int *rt_out, int
       *rn_out = (hw >> 3) & 0x7;
       *imm_out = ((hw >> 6) & 0x1F) << 2;
       *puw_out = 6;
+      *width_out = 4;
       return 1;
     }
     /* T2: SP-relative. 0b10010 = STR, 0b10011 = LDR (imm8 word-scaled). */
@@ -2541,6 +2640,7 @@ static int decode_str_ldr_imm(thumb_opcode op, int *is_str_out, int *rt_out, int
       *rn_out = R_SP;
       *imm_out = (hw & 0xFF) << 2;
       *puw_out = 6;
+      *width_out = 4;
       return 1;
     }
     /* STRB/LDRB imm5: 0111 0xxx (STR) / 0111 1xxx (LDR). */
@@ -2551,6 +2651,7 @@ static int decode_str_ldr_imm(thumb_opcode op, int *is_str_out, int *rt_out, int
       *rn_out = (hw >> 3) & 0x7;
       *imm_out = (hw >> 6) & 0x1F;
       *puw_out = 6;
+      *width_out = 1;
       return 1;
     }
     /* STRH/LDRH imm5: 1000 0xxx (STR) / 1000 1xxx (LDR). */
@@ -2561,6 +2662,7 @@ static int decode_str_ldr_imm(thumb_opcode op, int *is_str_out, int *rt_out, int
       *rn_out = (hw >> 3) & 0x7;
       *imm_out = ((hw >> 6) & 0x1F) << 1;
       *puw_out = 6;
+      *width_out = 2;
       return 1;
     }
     return 0;
@@ -2583,11 +2685,58 @@ static int decode_str_ldr_imm(thumb_opcode op, int *is_str_out, int *rt_out, int
       *rt_out = (lo >> 12) & 0xF;
       *imm_out = lo & 0xFFF;
       *puw_out = 6;
+      *width_out = 1 << ((hi >> 5) & 3); /* size field: 0=byte, 1=half, 2=word */
+      return 1;
+    }
+    /* T4: STR/LDR indexed forms (imm8, PUW at lo[10:8], marker lo[11]=1):
+     * 0xF84x lo[11]=1 is STR post/pre-indexed or negative-offset, 0xF85x the
+     * LDR forms, 0xF80x/F81x/F82x/F83x the byte/half ones, 0xF91x/F93x the
+     * signed loads.  hi bit 7 clear separates these from every imm12 form
+     * (0xF88x..0xF8Dx, 0xF99x/0xF9Bx), whose low 12 bits could otherwise
+     * fake the lo[11] marker.  These are the write-back encodings
+     * ra:load_postinc / ra:store_postinc emit: on W=1 the BASE register
+     * changes, which the caller must see or every cache keyed on Rn goes
+     * stale (the postinc fusion's whole point is that Rn no longer holds the
+     * old address). */
+    if ((hi & 0xFE80) == 0xF800 && (lo & 0x0800))
+    {
+      int is_ldr = (hi >> 4) & 1;
+      int rn = hi & 0xF;
+      if (rn == 0xF)
+        return 0; /* PC-relative literal form (imm12 with bit 11 set); skip. */
+      *is_str_out = !is_ldr;
+      *rn_out = rn;
+      *rt_out = (lo >> 12) & 0xF;
+      *imm_out = lo & 0xFF;
+      *puw_out = (lo >> 8) & 0x7;
+      *width_out = 1 << ((hi >> 5) & 3); /* size field: 0=byte, 1=half, 2=word */
       return 1;
     }
     return 0;
   }
   return 0;
+}
+
+/* LDRD/STRD (Thumb-2), immediate offset: 1110 100P U1W0 nnnn (STRD) /
+ * 1110 100P U1W1 nnnn (LDRD), imm8 word-scaled in the low halfword.  These
+ * move EIGHT bytes, so a cache that only understands 4-byte accesses has to
+ * see them or a `strd` would silently leave a stale entry for either half. */
+static int decode_strd_ldrd_imm(thumb_opcode op, int *is_str_out, int *rn_out, int *imm_out)
+{
+  if (op.size != 4)
+    return 0;
+  uint16_t hi = (uint16_t)((op.opcode >> 16) & 0xFFFF);
+  if ((hi & 0xFE40) != 0xE840)
+    return 0;
+  int rn = hi & 0xF;
+  if (rn == 0xF)
+    return 0; /* PC-relative literal form. */
+  int add = (hi >> 7) & 1;
+  int imm = (int)((op.opcode & 0xFF) << 2);
+  *is_str_out = !((hi >> 4) & 1);
+  *rn_out = rn;
+  *imm_out = add ? imm : -imm;
+  return 1;
 }
 
 /* Emit LDR Rt, [Rn, #imm] unless the STR-cache already knows Rt still
@@ -2599,7 +2748,7 @@ static int ot_check_ldr_imm(uint32_t rt, uint32_t rn, int imm, uint32_t puw, thu
 {
   thumb_opcode ins = th_ldr_imm(rt, rn, imm, puw, enc);
   if (thumb_gen_state.generating_function && puw == 6 && ins.size != 0 &&
-      strldr_cache_try_match_ldr((int)rt, (int)rn, imm, puw, ins.size))
+      strldr_cache_try_match_ldr((int)rt, (int)rn, imm, puw, ins.size, 4))
   {
     /* Redundant reload: Rt still holds [Rn+imm] from an earlier STR that
      * has not been clobbered.  No emission, no cache update needed — the
@@ -3278,6 +3427,43 @@ int is_valid_opcode(thumb_opcode op)
  * full-cache reset in ot().  Recognising them keeps the mov-equiv and
  * imm-in-reg caches alive across a CMP, which lets a follow-up redundant
  * load_immediate elide. */
+/* B / B<c> / CBZ / CBNZ: transfer control and write nothing else.  BL, BLX and
+ * BX are deliberately NOT here -- BL/BLX write LR and clobber caller-saved
+ * registers and memory, and BX ends the block. */
+static int thumb_op_is_plain_branch(thumb_opcode op)
+{
+  if (op.size == 2)
+  {
+    uint16_t hw = (uint16_t)(op.opcode & 0xFFFF);
+    /* B<c> T1: 1101 cccc imm8.  cond 1110 is UDF and 1111 is SVC. */
+    if ((hw & 0xF000) == 0xD000)
+    {
+      int cond = (hw >> 8) & 0xF;
+      return cond != 0xE && cond != 0xF;
+    }
+    /* B T2: 11100 imm11. */
+    if ((hw & 0xF800) == 0xE000)
+      return 1;
+    /* CBZ/CBNZ: 1011 op 0 i 1 imm5 Rn3. */
+    if ((hw & 0xF500) == 0xB100)
+      return 1;
+    return 0;
+  }
+  if (op.size == 4)
+  {
+    uint16_t hi = (uint16_t)((op.opcode >> 16) & 0xFFFF);
+    uint16_t lo = (uint16_t)(op.opcode & 0xFFFF);
+    if ((hi & 0xF800) != 0xF000)
+      return 0;
+    /* lo[15:14,12]: 10x0 = B T3 (conditional), 10x1 = B T4.  BL is 11x1 and
+     * BLX is 11x0, both of which write LR. */
+    if ((lo & 0xD000) == 0x8000 || (lo & 0xD000) == 0x9000)
+      return 1;
+    return 0;
+  }
+  return 0;
+}
+
 static int thumb_op_is_pure_flag_setter(thumb_opcode op)
 {
   uint32_t w = op.opcode;
@@ -3474,6 +3660,10 @@ int ot(thumb_opcode op)
       {
         /* CMP/CMN/TST/TEQ — no GPR clobber even under predication. */
       }
+      else if (thumb_op_is_plain_branch(op))
+      {
+        /* Writes neither a GPR nor memory; see the unconditioned path. */
+      }
       else
       {
         int dest = thumb_decode_dest_reg(op);
@@ -3503,25 +3693,33 @@ int ot(thumb_opcode op)
       else
       {
         int mv_rd = -1, mv_rm = -1;
-        int sl_is_str = 0, sl_rt = 0, sl_rn = 0, sl_imm = 0;
+        int sl_is_str = 0, sl_rt = 0, sl_rn = 0, sl_imm = 0, sl_width = 0;
         uint32_t sl_puw = 0;
-        if (decode_str_ldr_imm(op, &sl_is_str, &sl_rt, &sl_rn, &sl_imm, &sl_puw))
+        int sd_is_str = 0, sd_rn = 0, sd_imm = 0;
+        if (decode_str_ldr_imm(op, &sl_is_str, &sl_rt, &sl_rn, &sl_imm, &sl_puw, &sl_width))
         {
-          if (sl_is_str)
+          if (!sl_is_str)
           {
-            /* STR does not write a register; record the store for
-             * redundant-reload matching.  MOV-equiv is unaffected. */
-            strldr_cache_record_str(sl_rt, sl_rn, sl_imm, sl_puw, op.size);
-          }
-          else
-          {
-            /* LDR writes Rt: invalidate both caches for that register.
+            /* LDR writes Rt: invalidate both caches for that register FIRST.
              * If the call-site helper ran the match it would have
              * elided without reaching ot(); so if we get here, this LDR
              * is actually emitting and genuinely clobbers Rt. */
             mov_equiv_invalidate_reg(sl_rt);
             strldr_cache_invalidate_reg(sl_rt);
             imm_cache_invalidate_reg(sl_rt);
+          }
+          /* Either way Rt now holds [Rn+imm], so both directions are worth
+           * recording; a store additionally kills what it overwrote. */
+          strldr_cache_record_access(sl_rt, sl_rn, sl_imm, sl_puw, op.size, sl_width, sl_is_str);
+          if (sl_puw & 1)
+          {
+            /* Write-back form (post/pre-indexed): Rn now holds the UPDATED
+             * address.  record_access already threw the whole strldr cache
+             * away (puw != 6); the register-equivalence and known-immediate
+             * caches must drop Rn too, or a later `mov rn,rx` / immediate
+             * rematerialization gets elided against the pre-increment value. */
+            mov_equiv_invalidate_reg(sl_rn);
+            imm_cache_invalidate_reg(sl_rn);
           }
         }
         else if (decode_mov_reg_plain(op, &mv_rd, &mv_rm))
@@ -3556,12 +3754,47 @@ int ot(thumb_opcode op)
             imm_cache_invalidate_reg(rt);
             imm_cache_invalidate_reg(rt2);
           }
-          /* STRD: no GPR write, leave the mov_equiv cache alone. */
+          else if (decode_strd_ldrd_imm(op, &sd_is_str, &sd_rn, &sd_imm))
+          {
+            /* STRD writes no GPR, but it writes EIGHT bytes of memory: with
+             * the cache living across IR ops, missing that leaves a stale
+             * entry for either half.  Undecodable form -> assume the worst. */
+            strldr_cache_invalidate_mem(sd_rn, sd_imm, 8);
+            /* Then record what it just put there, as the two 4-byte slots the
+             * rest of the cache is made of.  That is what lets the LDRD which
+             * reads the pair straight back -- the return-value slot round trip
+             * every 64-bit helper ends with -- be skipped entirely. */
+            if (sd_imm >= 0)
+            {
+              /* Only the U=1 form: every entry in this cache is a puw==6
+               * access, and handing a subtract-offset one to the recorder
+               * would make it throw the whole cache away. */
+              int sd_rt = (int)((op.opcode >> 12) & 0xF);
+              int sd_rt2 = (int)((op.opcode >> 8) & 0xF);
+              strldr_cache_record_access(sd_rt, sd_rn, sd_imm, 6, 4, 4, 1);
+              strldr_cache_record_access(sd_rt2, sd_rn, sd_imm + 4, 6, 4, 4, 1);
+            }
+          }
+          else
+          {
+            tcc_gen_machine_strldr_cache_reset();
+          }
         }
         else if (thumb_op_is_pure_flag_setter(op))
         {
           /* CMP/CMN/TST/TEQ write only the flags — no GPR clobber, no
            * cache invalidation needed. */
+        }
+        else if (thumb_op_is_plain_branch(op))
+        {
+          /* B / B<c> / CBZ / CBNZ write neither a GPR nor memory, so the
+           * FALL-THROUGH path's register and memory state is exactly what it
+           * was before -- and the taken path lands on an IR-level jump target,
+           * where codegen.c resets.  Without this a conditional branch inside
+           * a basic block would drop every entry, which is the whole shape
+           * this cache exists for: reload four spilled halves, compare, branch,
+           * and use the same four in the not-taken arm.  BL/BLX are NOT here:
+           * they write LR and clobber memory, and fall into the reset below. */
         }
         else
         {
@@ -4158,6 +4391,19 @@ int load_word_from_base(int ir, int base, int fc, int sign)
 {
   const thumb_opcode ins = th_ldr_imm(ir, base, fc, sign ? 4 : 6, ENFORCE_ENCODING_NONE);
   TRACE("Load word sign: %d, r %d, base: %d, fc: %d\n", sign, ir, base, fc, sign);
+  /* This is the path every spill reload takes, so it -- not just the
+   * ot_check_ldr_imm call sites -- is where the memory cache has to be
+   * consulted.  Returning the encoded size without emitting keeps the
+   * caller's "did it encode?" contract intact; only `ind` stands still. */
+  if (ins.size != 0 && thumb_gen_state.generating_function && !sign &&
+      strldr_cache_try_match_ldr(ir, base, fc, 6, ins.size, 4))
+    return ins.size;
+  /* Satisfying the load from ANOTHER register holding the slot (`mov rt,rh`)
+   * was built and MEASURED on the rig, and it is a small LOSS -- rijndael and
+   * double_mul improve, double_add/cmp/mixed/div all give more back, total
+   * -0.09% against -0.12% for this same-register form alone.  A `mov` and a
+   * cached-line `ldr` from the frame cost about the same on M33, so all it
+   * really does is move code.  Do not re-propose without a measurement. */
   return ot(ins);
 }
 
@@ -4227,6 +4473,8 @@ static int try_ldrd_pair(int lo_reg, int hi_reg, int base, int abs_off, int sign
   if (lo_reg == hi_reg)
     return 0;
   const uint32_t puw = sign ? 4u : 6u;
+  if (strldr_cache_ldrd_is_redundant(lo_reg, hi_reg, base, abs_off, puw))
+    return 1;
   ot_check(th_ldrd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)base, abs_off, puw));
   return 1;
 }
@@ -5258,6 +5506,7 @@ ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert)
   ot_check(th_generic_mov_imm(dest_reg, invert ? 0 : 1));
   ot_check(th_b_t4(2));
   gsym(jmp_addr);
+  codegen_internal_merge_point();
   ot_check(th_generic_mov_imm(dest_reg, invert ? 1 : 0));
 }
 
@@ -5312,7 +5561,8 @@ static void load_from_base(int r, int r1, int irop_btype, int is_unsigned, int f
         ir_high <= R_LR && ir_high != R_SP && r != ir_high)
     {
       uint32_t puw = sign ? 4 : 6;
-      ot_check(th_ldrd_imm((uint32_t)r, (uint32_t)ir_high, base_reg, fc, puw));
+      if (!strldr_cache_ldrd_is_redundant(r, ir_high, (int)base_reg, fc, puw))
+        ot_check(th_ldrd_imm((uint32_t)r, (uint32_t)ir_high, base_reg, fc, puw));
       if (base_alloc.saved)
         restore_scratch_reg(&base_alloc);
       if (ir_high_alloc.saved)
@@ -5468,6 +5718,137 @@ static uint32_t thumb_exclude_mask_for_regs(int count, const int *regs)
 static bool thumb_is_hw_reg(int reg)
 {
   return reg >= 0 && reg <= 15;
+}
+
+/* ============================================================
+ * thumb_and_imm_form / thumb_emit_and_imm_special
+ * ============================================================
+ * One-instruction lowerings of `AND Rd, Rn, #mask` that never materialize the
+ * mask.  Thumb-2's AND-immediate takes only a modified immediate (8 bits
+ * rotated, or a byte replicated across the word), so an ordinary bitfield mask
+ * -- 0x7FF, 0x000FFFFF, 0x007FFFFF -- costs a movw/movt pair or a literal-pool
+ * load on top of the AND.  In the soft-float library that pair is the single
+ * most common shape there is: every classifier opens with
+ * `bits & DOUBLE_MANT_MASK`.
+ *
+ * The classification is a pure function of the mask so that a caller can
+ * decide BEFORE resolving operands into registers -- resolving can itself emit
+ * (a spilled source becomes a load), so a caller that resolved first and then
+ * fell through to the general path would emit that load twice.
+ *
+ * None of these forms writes the flags, so the caller must already have
+ * established that no flag result is wanted.  `flags` is passed through for
+ * BIC, which does have a flag-setting encoding.
+ */
+typedef enum ThumbAndImmForm
+{
+  AND_IMM_NONE = 0, /* nothing better than the general path */
+  AND_IMM_UXTB,     /* mask 0xFF */
+  AND_IMM_UXTH,     /* mask 0xFFFF */
+  AND_IMM_UBFX,     /* low-contiguous run of ones */
+  AND_IMM_BIC,      /* complement encodes as a modified immediate */
+} ThumbAndImmForm;
+
+static ThumbAndImmForm thumb_and_imm_form(uint32_t mask)
+{
+  /* Zero-extends: a 2-byte encoding when both registers are low, against 4
+   * bytes for the AND-immediate, which has no narrow form at all. */
+  if (mask == 0xFFu)
+    return AND_IMM_UXTB;
+  if (mask == 0xFFFFu)
+    return AND_IMM_UXTH;
+
+  /* A mask the AND-immediate already encodes is one instruction as it stands;
+   * these forms only pay off when they remove a constant materialization. */
+  if (th_pack_const(mask) != 0)
+    return AND_IMM_NONE;
+
+  /* A low-contiguous run of ones is exactly UBFX Rd, Rn, #0, #W.  0 and
+   * 0xFFFFFFFF are degenerate (the callers fold them to a load-zero and a
+   * copy) and UBFX cannot encode width 32 anyway. */
+  if (mask != 0 && mask != 0xFFFFFFFFu && (mask & (mask + 1)) == 0)
+    return AND_IMM_UBFX;
+
+  /* `x & ~m` is `BIC x, m`, and a clear-mask whose complement encodes is the
+   * usual shape of a bitfield read-modify-write. */
+  if (~mask != 0 && th_pack_const(~mask) != 0)
+    return AND_IMM_BIC;
+
+  return AND_IMM_NONE;
+}
+
+static void thumb_emit_and_imm_special(ThumbAndImmForm form, int rd, int rn, uint32_t mask,
+                                       thumb_flags_behaviour flags)
+{
+  switch (form)
+  {
+  case AND_IMM_UXTB:
+    ot_check(th_uxtb((uint32_t)rd, (uint32_t)rn, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    return;
+  case AND_IMM_UXTH:
+    ot_check(th_uxth((uint32_t)rd, (uint32_t)rn, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    return;
+  case AND_IMM_UBFX:
+  {
+    int width = 0;
+    while ((mask >> width) & 1u)
+      width++;
+    thumb_opcode ubfx_op;
+    ubfx_op.size = 4;
+    /* 11110 0 11 1100 Rn | 0 imm3 Rd imm2 0 widthm1, with lsb 0 (imm3=imm2=0). */
+    ubfx_op.opcode = 0xF3C00000u | ((uint32_t)rn << 16) | ((uint32_t)rd << 8) | (uint32_t)(width - 1);
+    ot(ubfx_op);
+    return;
+  }
+  case AND_IMM_BIC:
+    ot_check(th_bic_imm((uint32_t)rd, (uint32_t)rn, ~mask, flags, ENFORCE_ENCODING_NONE));
+    return;
+  case AND_IMM_NONE:
+  default:
+    tcc_error("thumb_emit_and_imm_special: no form for mask 0x%x", (unsigned)mask);
+    return;
+  }
+}
+
+/* ============================================================
+ * thumb_try_orrs_zero64
+ * ============================================================
+ * A 64-bit value is zero exactly when the bitwise OR of its halves is, so
+ * `ORRS Rt, Rlo, Rhi` sets Z for the whole comparison in one instruction where
+ * the general form needs three (`CMP hi,#0` / `IT EQ` / `CMPEQ lo,#0`).  Only
+ * Z is meaningful afterwards, which is all an equality comparison consumes --
+ * the three-instruction form is no better in that respect, since which of its
+ * two CMPs ran last decides N/C/V.
+ *
+ * ORRS needs a destination the CMP form does not, so this fires only when the
+ * allocator has a register genuinely free at this point: buying one with a
+ * push/pop would cost more than the two instructions it saves.  Rt may alias
+ * either source -- ORRS reads both operands before writing.
+ *
+ * `soft_common.h`'s classifiers are built out of this test (`double_mant(bits)
+ * != 0` and friends), 60 sites across the soft-float library.
+ *
+ * Returns 1 if it emitted the comparison, 0 if the caller must fall back.
+ */
+static int thumb_try_orrs_zero64(int rn_lo, int rn_hi)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir)
+    return 0;
+  if (!thumb_is_hw_reg(rn_lo) || !thumb_is_hw_reg(rn_hi))
+    return 0;
+
+  const uint32_t excl = scratch_global_exclude;
+  int rt = tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, excl, ir->leaffunc);
+  if (rt == (int)PREG_NONE || !thumb_is_hw_reg(rt))
+    return 0;
+
+  thumb_opcode orrs = th_orr_reg((uint32_t)rt, (uint32_t)rn_lo, (uint32_t)rn_hi, FLAGS_BEHAVIOUR_SET,
+                                 THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE);
+  if (orrs.size == 0)
+    return 0;
+  ot_check(orrs);
+  return 1;
 }
 
 static void thumb_emit_op_imm_fallback(int rd, int rn, uint32_t imm, thumb_flags_behaviour flags,
@@ -5712,10 +6093,14 @@ static void mach_ensure_pair_in_regs(MachineCodegenContext *ctx, const MachineOp
  *
  * If src1 is not 64-bit (e.g. int promoted to long long), its high half is
  * zero-extended.  Similarly for src2.
+ *
+ * `zh` carries source/opt/flat/fusion/zero_half64.c's verdict in its low six
+ * bits: which operand halves are provably the constant zero, and which halves
+ * of the result no consumer reads.
  */
 static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const MachineOperand *src2,
                                              const MachineOperand *dest, TccIrOp op, ThumbDataProcessingHandler regular,
-                                             ThumbDataProcessingHandler carry_h, bool uses_carry)
+                                             ThumbDataProcessingHandler carry_h, bool uses_carry, uint32_t zh)
 {
   (void)op;
   MachineCodegenContext mctx = {0};
@@ -5768,13 +6153,96 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
   MachineOperand r_src2 = mach_resolve_deref_64(&mctx, src2, &excl);
   src2 = &r_src2;
 
+  /* 1b. Plan the HIGH half before loading anything.
+   *
+   * A source that is not 64-bit is zero-extended, and against a zero half a
+   * bitwise op has a constant answer: OR/XOR copy the other operand, AND give
+   * zero.  Deciding that here rather than after the loads means the zero is
+   * never materialised AND the scratch register that would have held it is
+   * never allocated -- on a saturated function that scratch costs a push/pop
+   * of a callee-saved register too.
+   *
+   * `(uint64_t)x | ((uint64_t)y << 32)` and the make_double/make_float packing
+   * idiom soft float is built from are exactly this shape: before this, each
+   * such OR paid `movs rt,#0` plus an `orr rd,rt,rm` that could only ever
+   * return rm. */
+  enum
+  {
+    HALF_NORMAL = 0, /* emit the handler over both registers of this half */
+    HALF_ZERO,       /* result half is the constant 0 */
+    HALF_COPY_S1,    /* result half is src1's */
+    HALF_COPY_S2,    /* result half is src2's */
+    HALF_CARRY_IMM0, /* carry op, src2 half is zero: `adc/sbc rd, rn, #0` */
+    HALF_DEAD        /* nothing reads the result half; emit nothing at all */
+  };
+  /* A non-64-bit source is zero-extended by construction; the annotation adds
+   * the halves a 64-bit value is only *known* to hold zero in. */
+  const bool s1_lo_zero = (zh & ZH64_S1_LO) != 0;
+  const bool s1_hi_zero = !src1->is_64bit || (zh & ZH64_S1_HI) != 0;
+  const bool s2_lo_zero = (zh & ZH64_S2_LO) != 0;
+  const bool s2_hi_zero = (src2->kind != MACH_OP_IMM && !src2->is_64bit) || (zh & ZH64_S2_HI) != 0;
+  int lo_plan = HALF_NORMAL, hi_plan = HALF_NORMAL;
+  /* Carry ops need the real words (the carry still has to propagate), and
+   * CMP's halves must set flags, so neither can take a shortcut. */
+  if (!uses_carry && op != TCCIR_OP_CMP && src2->kind != MACH_OP_IMM)
+  {
+    for (int half = 0; half < 2; half++)
+    {
+      const bool z1 = half ? s1_hi_zero : s1_lo_zero;
+      const bool z2 = half ? s2_hi_zero : s2_lo_zero;
+      int plan = HALF_NORMAL;
+      if (!z1 && !z2)
+        plan = HALF_NORMAL;
+      else if (op == TCCIR_OP_AND)
+        plan = HALF_ZERO;
+      else if (op == TCCIR_OP_OR || op == TCCIR_OP_XOR)
+        plan = (z1 && z2) ? HALF_ZERO : (z1 ? HALF_COPY_S2 : HALF_COPY_S1);
+      if (half)
+        hi_plan = plan;
+      else
+        lo_plan = plan;
+    }
+  }
+  /* A carry op cannot skip a half -- the carry still has to propagate -- but a
+   * zero high word on src2 turns the high half into `adc rd, rn, #0` /
+   * `sbc rd, rn, #0`, which reads no second register and needs no `mov rt, #0`
+   * to feed it.  This is most of what sfp_div_sig64 spends its zeros on:
+   * Knuth-D adds and subtracts 32-bit quantities from 64-bit ones throughout,
+   * and each one was materialising a zero purely to be added to a high word.
+   * src1 is deliberately not covered: SUB is not commutative, and mirroring
+   * this rule in zero_half64's producer analysis is only sound while the
+   * emitter's choice is unambiguous. */
+  if (uses_carry && op != TCCIR_OP_CMP && src2->kind != MACH_OP_IMM && s2_hi_zero)
+    hi_plan = HALF_CARRY_IMM0;
+
+  /* A half no consumer reads outranks every plan above: skip it entirely.
+   * Only ever set for a register destination -- a memory one still owes its
+   * full eight bytes whatever the vreg uses do. */
+  if ((zh & ZH64_D_LO) && !uses_carry && op != TCCIR_OP_CMP)
+    lo_plan = HALF_DEAD;
+  if ((zh & ZH64_D_HI) && !uses_carry && op != TCCIR_OP_CMP)
+    hi_plan = HALF_DEAD;
+  const bool need_rn_lo = (lo_plan == HALF_NORMAL || lo_plan == HALF_COPY_S1 || lo_plan == HALF_CARRY_IMM0);
+  const bool need_rn_hi = (hi_plan == HALF_NORMAL || hi_plan == HALF_COPY_S1 || hi_plan == HALF_CARRY_IMM0);
+  const bool need_rm_lo = (lo_plan == HALF_NORMAL || lo_plan == HALF_COPY_S1 || lo_plan == HALF_COPY_S2 ||
+                           lo_plan == HALF_CARRY_IMM0);
+  const bool need_rm_hi = (hi_plan == HALF_NORMAL || hi_plan == HALF_COPY_S2);
+
   /* 2. Load src1 low and high halves into registers. */
-  MachineOperand s1_lo = mach_make_lo_half(src1);
-  int rn_lo = mach_ensure_in_reg(&mctx, &s1_lo, excl);
-  if (thumb_is_hw_reg(rn_lo))
-    excl |= (1u << (uint32_t)rn_lo);
-  int rn_hi;
-  if (src1->is_64bit)
+  int rn_lo = (int)PREG_REG_NONE;
+  if (need_rn_lo)
+  {
+    MachineOperand s1_lo = mach_make_lo_half(src1);
+    rn_lo = mach_ensure_in_reg(&mctx, &s1_lo, excl);
+    if (thumb_is_hw_reg(rn_lo))
+      excl |= (1u << (uint32_t)rn_lo);
+  }
+  int rn_hi = (int)PREG_REG_NONE;
+  if (!need_rn_hi)
+  {
+    /* left unloaded on purpose -- nothing below reads it */
+  }
+  else if (src1->is_64bit)
   {
     MachineOperand s1_hi = mach_make_hi_half(src1);
     rn_hi = mach_ensure_in_reg(&mctx, &s1_hi, excl);
@@ -5784,7 +6252,7 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
     rn_hi = mach_alloc_scratch(&mctx, excl);
     ot_check(th_mov_imm((uint32_t)rn_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
   }
-  if (thumb_is_hw_reg(rn_hi))
+  if (need_rn_hi && thumb_is_hw_reg(rn_hi))
     excl |= (1u << (uint32_t)rn_hi);
 
   /* 3. Load src2 and emit the 64-bit operation. */
@@ -5813,6 +6281,8 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
       const bool can_simplify = (half == 0) ? can_simplify_lo : can_simplify_hi;
       const ThumbDataProcessingHandler *h = (half == 0) ? &regular : &carry_h;
 
+      if ((half == 0 ? lo_plan : hi_plan) == HALF_DEAD)
+        continue;
       if (can_simplify && (is_or || is_xor) && imm == 0)
       {
         if (rd != rn)
@@ -5829,6 +6299,15 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
           ot_check_mov_reg((uint32_t)rd, (uint32_t)rn, flags_safe(),
                            THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
       }
+      /* A 64-bit AND against a bitfield mask splits into two half-masks, and
+       * the interesting half is never a modified immediate: DOUBLE_MANT_MASK's
+       * high half is 0x000FFFFF, which the fallback below materializes from the
+       * literal pool at every one of the dozen sites a soft-float classifier
+       * has.  UBFX does the same job in one instruction with no constant. */
+      else if (can_simplify && is_and && thumb_and_imm_form(imm) != AND_IMM_NONE)
+      {
+        thumb_emit_and_imm_special(thumb_and_imm_form(imm), rd, rn, imm, fb);
+      }
       else
       {
         thumb_emit_op_imm_fallback(rd, rn, imm, fb, *h);
@@ -5837,12 +6316,20 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
   }
   else
   {
-    MachineOperand s2_lo = mach_make_lo_half(src2);
-    int rm_lo = mach_ensure_in_reg(&mctx, &s2_lo, excl);
-    if (thumb_is_hw_reg(rm_lo))
-      excl |= (1u << (uint32_t)rm_lo);
-    int rm_hi;
-    if (src2->is_64bit)
+    int rm_lo = (int)PREG_REG_NONE;
+    if (need_rm_lo)
+    {
+      MachineOperand s2_lo = mach_make_lo_half(src2);
+      rm_lo = mach_ensure_in_reg(&mctx, &s2_lo, excl);
+      if (thumb_is_hw_reg(rm_lo))
+        excl |= (1u << (uint32_t)rm_lo);
+    }
+    int rm_hi = (int)PREG_REG_NONE;
+    if (!need_rm_hi)
+    {
+      /* left unloaded on purpose -- the high-half plan does not read it */
+    }
+    else if (src2->is_64bit)
     {
       MachineOperand s2_hi = mach_make_hi_half(src2);
       rm_hi = mach_ensure_in_reg(&mctx, &s2_hi, excl);
@@ -5852,26 +6339,312 @@ static void thumb_emit_data_processing_mop64(const MachineOperand *src1, const M
       rm_hi = mach_alloc_scratch(&mctx, excl);
       ot_check(th_mov_imm((uint32_t)rm_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
     }
+    for (int half = 0; half < 2; half++)
     {
-      ot_check(thumb_call_reg_handler(regular.reg_handler, (uint32_t)rd_lo, (uint32_t)rn_lo, (uint32_t)rm_lo, lo_flags,
-                                      THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      ot_check(thumb_call_reg_handler(carry_h.reg_handler, (uint32_t)rd_hi, (uint32_t)rn_hi, (uint32_t)rm_hi,
-                                      hi_flags, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      const int plan = half ? hi_plan : lo_plan;
+      const int rd = half ? rd_hi : rd_lo;
+      const int rn = half ? rn_hi : rn_lo;
+      const int rm = half ? rm_hi : rm_lo;
+      const thumb_flags_behaviour fb = half ? hi_flags : lo_flags;
+      const ThumbDataProcessingHandler *h = half ? &carry_h : &regular;
+      switch (plan)
+      {
+      case HALF_DEAD:
+        break;
+      case HALF_ZERO:
+        ot_check(th_mov_imm((uint32_t)rd, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+        break;
+      case HALF_COPY_S1:
+        if (rd != rn)
+          ot_check_mov_reg((uint32_t)rd, (uint32_t)rn, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                           false);
+        break;
+      case HALF_COPY_S2:
+        if (rd != rm)
+          ot_check_mov_reg((uint32_t)rd, (uint32_t)rm, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                           false);
+        break;
+      case HALF_CARRY_IMM0:
+        thumb_emit_op_imm_fallback(rd, rn, 0, fb, *h);
+        break;
+      default:
+        ot_check(thumb_call_reg_handler(h->reg_handler, (uint32_t)rd, (uint32_t)rn, (uint32_t)rm, fb,
+                                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+        break;
+      }
     }
   }
 
-  /* 4. Write results back to spill/param slots if dest was not pre-allocated. */
-  if (store_lo)
+  /* 4. Write results back to spill/param slots if dest was not pre-allocated.
+   *    A half nothing reads is not written back either -- the slot keeps
+   *    whatever it held, which is exactly what "dead" asserts. */
+  if (store_lo && lo_plan != HALF_DEAD)
   {
     MachineOperand dst_lo = mach_make_lo_half(dest);
     dst_lo.btype = IROP_BTYPE_INT32;
     mach_writeback_dest(&dst_lo, rd_lo);
   }
-  if (store_hi)
+  if (store_hi && hi_plan != HALF_DEAD)
   {
     MachineOperand dst_hi = mach_make_hi_half(dest);
     dst_hi.btype = IROP_BTYPE_INT32;
     mach_writeback_dest(&dst_hi, rd_hi);
+  }
+  mach_release_all(&mctx);
+}
+
+/* ============================================================
+ * thumb_emit_shift64_reg_mop
+ * ============================================================
+ * 64-bit SHL / SHR / SAR whose count is a value rather than a literal.
+ *
+ * Before this every such shift went to __aeabi_llsl / __aeabi_llsr /
+ * __aeabi_lasr.  Those helpers are compiled from C like any other library
+ * routine, so each one costs a call, a frame and ~30 executed instructions; a
+ * dynamic profile of __aeabi_dadd put two of them -- the alignment shift and
+ * the `(1ULL << n) - 1` mask -- at 62 of its 267 instructions per call.
+ * Inline the same work is 8 instructions and touches no memory.
+ *
+ * The sequences lean on ARM's register-shift rule: LSL/LSR/ASR by a register
+ * read only the bottom BYTE of the count, and a count of 32 or more yields 0
+ * (LSL/LSR) or a full sign fill (ASR).  That makes the `32 - n` and `n - 32`
+ * cross terms self-disabling over the half of the range where they must not
+ * contribute, so the logical shifts need neither a branch nor a conditional:
+ *
+ *   x << n :  hi = (hi << n) | (lo >> (32-n)) | (lo << (n-32));  lo = lo << n
+ *   x >> n :  lo = (lo >> n) | (hi << (32-n)) | (hi >> (n-32));  hi = hi >> n
+ *
+ * SAR cannot borrow that trick for its cross term -- `hi ASR (n-32)` is a sign
+ * fill when n < 32, which would flood the low half with ones where it must
+ * contribute nothing -- so it selects between the two halves of the range with
+ * a mask taken from the sign of `n - 32`.  A mask and not an IT/MOVGE pair
+ * because this runs wherever the allocator placed the shift, including with a
+ * pending CMP's flags still live.
+ *
+ * Counts of 64 and above are undefined in C; the sequences give 0 (or a sign
+ * fill for SAR), which is what GCC's inline expansion produces as well.
+ */
+static void thumb_emit_shift64_reg_mop(const MachineOperand *src1, const MachineOperand *src2,
+                                       const MachineOperand *dest, TccIrOp op, bool skip_lo, bool skip_hi)
+{
+  const bool is_left = (op == TCCIR_OP_SHL);
+  const bool arith_right = (op == TCCIR_OP_SAR);
+
+  MachineCodegenContext mctx = {0};
+  uint32_t excl = 0;
+
+  /* Destination pair first, exactly as the immediate path does, so that deref
+   * resolution never hands out a scratch that overlaps it. */
+  int dst_lo, dst_hi;
+  bool store_lo = false, store_hi = false;
+  if (dest->kind == MACH_OP_REG && !dest->needs_deref && dest->u.reg.r0 != (int)PREG_REG_NONE && dest->u.reg.r1 >= 0)
+  {
+    dst_lo = dest->u.reg.r0;
+    dst_hi = dest->u.reg.r1;
+    excl |= (1u << (uint32_t)dst_lo) | (1u << (uint32_t)dst_hi);
+  }
+  else
+  {
+    dst_lo = mach_alloc_scratch(&mctx, excl);
+    excl |= (1u << (uint32_t)dst_lo);
+    dst_hi = mach_alloc_scratch(&mctx, excl);
+    excl |= (1u << (uint32_t)dst_hi);
+    store_lo = store_hi = (dest->kind != MACH_OP_NONE);
+  }
+
+  if (src1->kind == MACH_OP_REG)
+  {
+    if (src1->u.reg.r0 != (int)PREG_REG_NONE)
+      excl |= (1u << (uint32_t)src1->u.reg.r0);
+    if (!src1->needs_deref && src1->is_64bit && src1->u.reg.r1 >= 0)
+      excl |= (1u << (uint32_t)src1->u.reg.r1);
+  }
+  if (src2->kind == MACH_OP_REG)
+  {
+    if (src2->u.reg.r0 != (int)PREG_REG_NONE)
+      excl |= (1u << (uint32_t)src2->u.reg.r0);
+    if (!src2->needs_deref && src2->is_64bit && src2->u.reg.r1 >= 0)
+      excl |= (1u << (uint32_t)src2->u.reg.r1);
+  }
+
+  MachineOperand r_src1 = mach_resolve_deref_64(&mctx, src1, &excl);
+  src1 = &r_src1;
+
+  MachineOperand s1_lo = mach_make_lo_half(src1);
+  int src_lo = mach_ensure_in_reg(&mctx, &s1_lo, excl);
+  if (thumb_is_hw_reg(src_lo))
+    excl |= (1u << (uint32_t)src_lo);
+
+  /* A high word that is a known zero deletes every term that reads it -- and
+   * the register that would have held it.  `(1ULL << n) - 1`, the mask soft
+   * float builds every alignment sticky-bit from, is exactly this shape: the
+   * generic sequence would materialize a zero just to shift and OR it in. */
+  const int hi_is_zero =
+      !arith_right && (!src1->is_64bit ||
+                       (src1->kind == MACH_OP_IMM && ((uint64_t)src1->u.imm.val >> 32) == 0));
+
+  int src_hi = (int)PREG_REG_NONE;
+  if (!hi_is_zero)
+  {
+    if (src1->is_64bit)
+    {
+      MachineOperand s1_hi = mach_make_hi_half(src1);
+      src_hi = mach_ensure_in_reg(&mctx, &s1_hi, excl);
+      if (thumb_is_hw_reg(src_hi))
+        excl |= (1u << (uint32_t)src_hi);
+    }
+    else
+    {
+      src_hi = mach_alloc_scratch(&mctx, excl);
+      excl |= (1u << (uint32_t)src_hi);
+      ot_check(th_asr_imm((uint32_t)src_hi, (uint32_t)src_lo, 31, flags_safe(), ENFORCE_ENCODING_NONE));
+    }
+  }
+
+  /* Only the low word of a 64-bit count can matter — the hardware reads one
+   * byte of it. */
+  MachineOperand cnt_op = src2->is_64bit ? mach_make_lo_half(src2) : *src2;
+  int cnt = mach_ensure_in_reg(&mctx, &cnt_op, excl);
+  if (thumb_is_hw_reg(cnt))
+    excl |= (1u << (uint32_t)cnt);
+
+  /* The half that collects the cross terms.  Writing it straight into the
+   * destination saves a MOV, but only where that register is neither a source
+   * half still to be read nor the count. */
+  /* A right shift of a zero-high-word value needs no accumulator and no
+   * temporaries; allocating them anyway can cost a scratch push/pop. */
+  const bool need_acc = (!is_left && hi_is_zero) ? false : (is_left ? !skip_hi : !skip_lo);
+  const int acc_pref = is_left ? dst_hi : dst_lo;
+  const int acc_conflict = is_left ? src_lo : src_hi;
+  int acc = -1;
+  if (need_acc)
+  {
+    acc = (acc_pref != acc_conflict && acc_pref != cnt) ? acc_pref : -1;
+    if (acc < 0)
+    {
+      acc = mach_alloc_scratch(&mctx, excl);
+      excl |= (1u << (uint32_t)acc);
+    }
+  }
+
+  int t0 = -1, t1 = -1;
+  if (need_acc)
+  {
+    t0 = mach_alloc_scratch(&mctx, excl);
+    excl |= (1u << (uint32_t)t0);
+    if (arith_right)
+    {
+      t1 = mach_alloc_scratch(&mctx, excl);
+      excl |= (1u << (uint32_t)t1);
+    }
+  }
+
+  if (is_left)
+  {
+    if (need_acc)
+    {
+      ot_check(th_rsb_imm((uint32_t)t0, (uint32_t)cnt, 32, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (hi_is_zero)
+      {
+        /* (0 << n) | (lo >> (32-n)) is just the cross term. */
+        ot_check(th_lsr_reg((uint32_t)acc, (uint32_t)src_lo, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+      }
+      else
+      {
+        ot_check(th_lsl_reg((uint32_t)acc, (uint32_t)src_hi, (uint32_t)cnt, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+        ot_check(th_lsr_reg((uint32_t)t0, (uint32_t)src_lo, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+        ot_check(th_orr_reg((uint32_t)acc, (uint32_t)acc, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+      }
+      ot_check(th_sub_imm((uint32_t)t0, (uint32_t)cnt, 32, flags_safe(), ENFORCE_ENCODING_NONE));
+      ot_check(th_lsl_reg((uint32_t)t0, (uint32_t)src_lo, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      ot_check(th_orr_reg((uint32_t)acc, (uint32_t)acc, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+    }
+    /* dst_lo last: it is the final read of src_lo and of the count. */
+    if (!skip_lo)
+      ot_check(th_lsl_reg((uint32_t)dst_lo, (uint32_t)src_lo, (uint32_t)cnt, flags_safe(), THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+    if (need_acc && acc != dst_hi)
+      ot_check_mov_reg((uint32_t)dst_hi, (uint32_t)acc, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                       false);
+  }
+  else if (hi_is_zero)
+  {
+    /* Every cross term reads the zero high word, so the whole shift is one
+     * instruction and a zero fill. */
+    if (!skip_lo)
+      ot_check(th_lsr_reg((uint32_t)dst_lo, (uint32_t)src_lo, (uint32_t)cnt, flags_safe(), THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+    if (!skip_hi)
+      ot_check(th_mov_imm((uint32_t)dst_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
+  }
+  else
+  {
+    if (need_acc)
+    {
+      ot_check(th_rsb_imm((uint32_t)t0, (uint32_t)cnt, 32, flags_safe(), ENFORCE_ENCODING_NONE));
+      ot_check(th_lsr_reg((uint32_t)acc, (uint32_t)src_lo, (uint32_t)cnt, flags_safe(), THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      ot_check(th_lsl_reg((uint32_t)t0, (uint32_t)src_hi, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      ot_check(th_orr_reg((uint32_t)acc, (uint32_t)acc, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                          ENFORCE_ENCODING_NONE));
+      ot_check(th_sub_imm((uint32_t)t0, (uint32_t)cnt, 32, flags_safe(), ENFORCE_ENCODING_NONE));
+      if (arith_right)
+      {
+        /* `hi ASR (n-32)` is only the answer for n >= 32; below that it is a
+         * sign fill that must contribute nothing.  `(n-32) ASR 31` is all-ones
+         * exactly on that range, so it selects between the two candidates
+         * without touching the flags. */
+        ot_check(th_asr_reg((uint32_t)t1, (uint32_t)src_hi, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+        ot_check(th_asr_imm((uint32_t)t0, (uint32_t)t0, 31, flags_safe(), ENFORCE_ENCODING_NONE));
+        ot_check(th_and_reg((uint32_t)acc, (uint32_t)acc, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+        ot_check(th_bic_reg((uint32_t)t1, (uint32_t)t1, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+        ot_check(th_orr_reg((uint32_t)acc, (uint32_t)acc, (uint32_t)t1, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+      }
+      else
+      {
+        ot_check(th_lsr_reg((uint32_t)t0, (uint32_t)src_hi, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+        ot_check(th_orr_reg((uint32_t)acc, (uint32_t)acc, (uint32_t)t0, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+      }
+    }
+    /* dst_hi last: it is the final read of src_hi and of the count. */
+    if (!skip_hi)
+    {
+      if (arith_right)
+        ot_check(th_asr_reg((uint32_t)dst_hi, (uint32_t)src_hi, (uint32_t)cnt, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+      else
+        ot_check(th_lsr_reg((uint32_t)dst_hi, (uint32_t)src_hi, (uint32_t)cnt, flags_safe(), THUMB_SHIFT_DEFAULT,
+                            ENFORCE_ENCODING_NONE));
+    }
+    if (need_acc && acc != dst_lo)
+      ot_check_mov_reg((uint32_t)dst_lo, (uint32_t)acc, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
+                       false);
+  }
+
+  if (store_lo && !skip_lo)
+  {
+    MachineOperand dst_lo_op = mach_make_lo_half(dest);
+    dst_lo_op.btype = IROP_BTYPE_INT32;
+    mach_writeback_dest(&dst_lo_op, dst_lo);
+  }
+  if (store_hi && !skip_hi)
+  {
+    MachineOperand dst_hi_op = mach_make_hi_half(dest);
+    dst_hi_op.btype = IROP_BTYPE_INT32;
+    mach_writeback_dest(&dst_hi_op, dst_hi);
   }
   mach_release_all(&mctx);
 }
@@ -5889,7 +6662,7 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
 {
   if (src2->kind != MACH_OP_IMM)
   {
-    tcc_error("compiler_error: thumb_emit_shift64_mop: non-immediate shift count");
+    thumb_emit_shift64_reg_mop(src1, src2, dest, op, skip_lo, skip_hi);
     return;
   }
   const uint32_t sh = (uint32_t)(uint64_t)src2->u.imm.val;
@@ -5967,17 +6740,28 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
   int hi_needed = 1;
   if (is_left && sh >= 32)
     hi_needed = 0;
-  else if (!is_left && sh >= 64)
+  else if (!is_left && sh >= 64 && !arith_right)
     hi_needed = 0;
+  /* SAR by >= 64 is the exception: its tail fills BOTH halves from the sign of
+   * src_hi, so it reads the very half the count would suggest is irrelevant.
+   * Declaring it unneeded left src_hi as PREG_REG_NONE and the tail encoded a
+   * shift off a register that was never loaded. */
 
-  /* Load src1 high half or compute by extension. */
+  /* Load src1 high half or compute by extension.  `hi_needed` gates the
+   * ALREADY-64-bit case too: materializing a half nothing below reads is a
+   * whole instruction, and `(uint64_t)sign << 63` in make_double is exactly
+   * that -- the widening puts a zero in a register purely to shift it out of
+   * existence. */
   int src_hi = (int)PREG_REG_NONE;
   if (src1->is_64bit)
   {
-    MachineOperand s1_hi = mach_make_hi_half(src1);
-    src_hi = mach_ensure_in_reg(&mctx, &s1_hi, excl);
-    if (thumb_is_hw_reg(src_hi))
-      excl |= (1u << (uint32_t)src_hi);
+    if (hi_needed)
+    {
+      MachineOperand s1_hi = mach_make_hi_half(src1);
+      src_hi = mach_ensure_in_reg(&mctx, &s1_hi, excl);
+      if (thumb_is_hw_reg(src_hi))
+        excl |= (1u << (uint32_t)src_hi);
+    }
   }
   else if (hi_needed)
   {
@@ -5990,8 +6774,28 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
       ot_check(th_mov_imm((uint32_t)src_hi, 0, flags_safe(), ENFORCE_ENCODING_NONE));
   }
 
+  /* `x <<= 1` is ADDS/ADC: two instructions where the generic sh<32 path below
+   * needs four (cross-shift into a scratch, a shift per half, then an OR).
+   * This is the step every restoring-division and normalization loop is built
+   * from -- a dynamic profile of ddiv puts 280,000 iterations through it for
+   * the benchmark's double kernels, against 5,000 through everything else.
+   *
+   * Two guards.  ADDS/ADC write the flags, so it must not run while a pending
+   * CMP's flags are still live.  And ADC has to read src_hi AFTER ADDS has
+   * written dst_lo, so dst_lo aliasing src_hi rules the pair out; every other
+   * aliasing case is safe, since each instruction reads its sources before
+   * writing its destination. */
+  if (is_left && sh == 1 && !skip_lo && !skip_hi &&
+      thumb_is_hw_reg(src_lo) && thumb_is_hw_reg(src_hi) && dst_lo != src_hi &&
+      !(tcc_state->ir && tcc_state->ir->codegen_flags_live))
+  {
+    ot_check(th_add_reg((uint32_t)dst_lo, (uint32_t)src_lo, (uint32_t)src_lo, FLAGS_BEHAVIOUR_SET,
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    ot_check(th_adc_reg((uint32_t)dst_hi, (uint32_t)src_hi, (uint32_t)src_hi, flags_safe(),
+                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  }
   /* Emit the shift — logic identical to thumb_emit_shift64_imm core. */
-  if (sh == 0)
+  else if (sh == 0)
   {
     ot_check_mov_reg((uint32_t)dst_lo, (uint32_t)src_lo, flags_safe(), THUMB_SHIFT_DEFAULT,
                      ENFORCE_ENCODING_NONE, false);
@@ -6000,6 +6804,41 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
   }
   else if (sh < 32)
   {
+    /* The cross term is an ORR away from being free: T2 ORR takes a shifted
+     * REGISTER operand, so `orr rd, rd, src, LSR #(32-sh)` does in one
+     * instruction what a separate shift into a scratch plus a plain ORR did in
+     * two -- and it needs no scratch at all, which on a saturated function is
+     * a push/pop as well.  Every 64-bit shift by a literal in soft float is
+     * this shape (`mant <<= 3`, `mant >> 3`), and __aeabi_dadd runs two per
+     * call.
+     *
+     * Only the aliasing case the fallback below reorders for is excluded: the
+     * destination half written FIRST must not be the source half the ORR still
+     * has to read. */
+    const uint32_t cross_amount = (uint32_t)(32 - sh);
+    const thumb_shift cross_fold = {is_left ? THUMB_SHIFT_LSR : THUMB_SHIFT_LSL, cross_amount,
+                                    THUMB_SHIFT_IMMEDIATE};
+    if (is_left && dst_hi != src_lo)
+    {
+      ot_check(thumb_call_imm_handler(dst_hi_shift, (uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(),
+                                      ENFORCE_ENCODING_NONE));
+      ot_check(th_orr_reg((uint32_t)dst_hi, (uint32_t)dst_hi, (uint32_t)src_lo, flags_safe(), cross_fold,
+                          ENFORCE_ENCODING_32BIT));
+      if (!skip_lo)
+        ot_check(thumb_call_imm_handler(dst_lo_shift, (uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(),
+                                        ENFORCE_ENCODING_NONE));
+      goto shift64_imm_done;
+    }
+    if (!is_left && dst_lo != src_hi)
+    {
+      ot_check(th_lsr_imm((uint32_t)dst_lo, (uint32_t)src_lo, sh, flags_safe(), ENFORCE_ENCODING_NONE));
+      ot_check(th_orr_reg((uint32_t)dst_lo, (uint32_t)dst_lo, (uint32_t)src_hi, flags_safe(), cross_fold,
+                          ENFORCE_ENCODING_32BIT));
+      ot_check(thumb_call_imm_handler(dst_hi_shift, (uint32_t)dst_hi, (uint32_t)src_hi, sh, flags_safe(),
+                                      ENFORCE_ENCODING_NONE));
+      goto shift64_imm_done;
+    }
+
     const int regs[] = {dst_lo, dst_hi, src_lo, src_hi};
     ScratchRegAlloc tmp = get_scratch_reg_with_save(thumb_exclude_mask_for_regs(4, regs) | excl);
     if (is_left)
@@ -6145,6 +6984,7 @@ static void thumb_emit_shift64_mop(const MachineOperand *src1, const MachineOper
     }
   }
 
+shift64_imm_done:
   /* Write back.  A dead half was never materialized, so skip its store. */
   if (store_lo && !skip_lo)
   {
@@ -6258,91 +7098,23 @@ static void thumb_emit_data_processing_mop32(const MachineOperand *src1, const M
     return;
   }
 
-  /* UXTB/UXTH fast path: AND with #0xFF or #0xFFFF → UXTB/UXTH.
-   * 16-bit encoding (2 bytes) vs 32-bit AND immediate (4 bytes). */
+  /* Mask fast paths: AND with an immediate the AND-immediate encoding cannot
+   * hold, lowered as UXTB/UXTH/UBFX/BIC instead of materializing a constant.
+   * See thumb_try_and_imm_special; the 64-bit half-lowering shares it. */
   if (op == TCCIR_OP_AND && !dest_sets_flags && barrel_shift == 0 &&
       src2->kind == MACH_OP_IMM && !src2->needs_deref && !src2->is_64bit &&
       flags != FLAGS_BEHAVIOUR_SET)
   {
-    uint32_t mask = (uint32_t)src2->u.imm.val;
-    if (mask == 0xFF || mask == 0xFFFF)
+    const uint32_t mask = (uint32_t)src2->u.imm.val;
+    const ThumbAndImmForm form = thumb_and_imm_form(mask);
+    /* Classify before resolving: on AND_IMM_NONE nothing has been emitted and
+     * the general path below resolves both operands itself. */
+    if (form != AND_IMM_NONE)
     {
       int dest_reg = mach_get_dest_reg(&mctx, dest, 0);
       uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
       int src1_reg = mach_ensure_in_reg(&mctx, src1, excl);
-      if (mask == 0xFF)
-        ot_check(th_uxtb((uint32_t)dest_reg, (uint32_t)src1_reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      else
-        ot_check(th_uxth((uint32_t)dest_reg, (uint32_t)src1_reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-      if (dest->kind != MACH_OP_NONE)
-      {
-        const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
-                              (dest->kind == MACH_OP_REG && (dest->needs_deref || dest->u.reg.r0 == (int)PREG_REG_NONE));
-        if (needs_wb)
-          mach_writeback_dest(dest, dest_reg);
-      }
-      mach_release_all(&mctx);
-      return;
-    }
-  }
-
-  /* UBFX fast path: AND with a low-contiguous mask #((1<<W)-1) that is NOT
-   * encodable as a Thumb-2 modified immediate → UBFX Rd, Rn, #0, #W.  Without
-   * this the mask needs a separate movw to materialize (e.g. 0x7ff for an
-   * 11-bit bitfield), so AND becomes two instructions; UBFX #0,#W is one and
-   * semantically identical for the unsigned low-bits mask.  W==8/16 are handled
-   * by the UXTB/UXTH path above, and any encodable mask stays a 1-instruction
-   * AND (no win), so this only fires when it strictly removes the movw. */
-  if (op == TCCIR_OP_AND && !dest_sets_flags && barrel_shift == 0 &&
-      src2->kind == MACH_OP_IMM && !src2->needs_deref && !src2->is_64bit &&
-      flags != FLAGS_BEHAVIOUR_SET)
-  {
-    uint32_t mask = (uint32_t)src2->u.imm.val;
-    if (mask != 0 && mask != 0xFFFFFFFFu && (mask & (mask + 1)) == 0 && th_pack_const(mask) == 0)
-    {
-      int width = 0;
-      while ((mask >> width) & 1u)
-        width++;
-      int dest_reg = mach_get_dest_reg(&mctx, dest, 0);
-      uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
-      int src1_reg = mach_ensure_in_reg(&mctx, src1, excl);
-      int widthm1 = width - 1;
-      thumb_opcode ubfx_op;
-      ubfx_op.size = 4;
-      ubfx_op.opcode =
-          0xF3C00000 | ((uint32_t)src1_reg << 16) | ((uint32_t)dest_reg << 8) | (uint32_t)widthm1;
-      ot(ubfx_op);
-      if (dest->kind != MACH_OP_NONE)
-      {
-        const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
-                              (dest->kind == MACH_OP_REG && (dest->needs_deref || dest->u.reg.r0 == (int)PREG_REG_NONE));
-        if (needs_wb)
-          mach_writeback_dest(dest, dest_reg);
-      }
-      mach_release_all(&mctx);
-      return;
-    }
-  }
-
-  /* BIC fast path: AND with a mask that is NOT encodable as a Thumb-2 modified
-   * immediate but whose complement IS → BIC Rd, Rn, #~mask.  `x & ~m` is
-   * exactly `BIC x, m`, and bitfield read-modify-write generates a stream of
-   * these ("clear the field, then OR the new value in"), where the clear mask
-   * 0xFFFFFFC0-style never encodes but the field mask 0x3F always does.
-   * Without this the mask costs a separate MVN/MOVW to materialize, making the
-   * AND two instructions. */
-  if (op == TCCIR_OP_AND && !dest_sets_flags && barrel_shift == 0 &&
-      src2->kind == MACH_OP_IMM && !src2->needs_deref && !src2->is_64bit &&
-      flags != FLAGS_BEHAVIOUR_SET)
-  {
-    uint32_t mask = (uint32_t)src2->u.imm.val;
-    uint32_t nmask = ~mask;
-    if (nmask != 0 && th_pack_const(mask) == 0 && th_pack_const(nmask) != 0)
-    {
-      int dest_reg = mach_get_dest_reg(&mctx, dest, 0);
-      uint32_t excl = thumb_is_hw_reg(dest_reg) ? (1u << (uint32_t)dest_reg) : 0;
-      int src1_reg = mach_ensure_in_reg(&mctx, src1, excl);
-      ot_check(th_bic_imm((uint32_t)dest_reg, (uint32_t)src1_reg, nmask, flags, ENFORCE_ENCODING_NONE));
+      thumb_emit_and_imm_special(form, dest_reg, src1_reg, mask, flags);
       if (dest->kind != MACH_OP_NONE)
       {
         const bool needs_wb = dest->kind == MACH_OP_SPILL || dest->kind == MACH_OP_PARAM_STACK ||
@@ -6432,9 +7204,10 @@ void tcc_gen_machine_data_processing_mop(MachineOperand src1, MachineOperand src
   data_processing_mop_impl(src1, src2, dest, op, flags_safe(), barrel_shift);
 }
 
-void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op)
+void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOperand src2, MachineOperand dest,
+                                               TccIrOp op, uint32_t barrel_shift)
 {
-  data_processing_mop_impl(src1, src2, dest, op, FLAGS_BEHAVIOUR_SET, 0);
+  data_processing_mop_impl(src1, src2, dest, op, FLAGS_BEHAVIOUR_SET, barrel_shift);
 }
 
 static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, MachineOperand dest, TccIrOp op,
@@ -6524,12 +7297,17 @@ static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, M
   {
     if (op == TCCIR_OP_SHL || op == TCCIR_OP_SHR || op == TCCIR_OP_SAR)
     {
-      bool skip_lo = (barrel_shift >> 16) & 1;
-      bool skip_hi = (barrel_shift >> 17) & 1;
+      /* Two independent reasons a half need not be written: shift64_dead_half's
+       * bitfield-extract rule (bits 16-17), and zero_half64 finding the half a
+       * provable zero that every consumer now ignores (bit 22/23). */
+      const uint32_t zh = (barrel_shift >> 18) & 0x3Fu;
+      bool skip_lo = ((barrel_shift >> 16) & 1) || (zh & ZH64_D_LO) != 0;
+      bool skip_hi = ((barrel_shift >> 17) & 1) || (zh & ZH64_D_HI) != 0;
       thumb_emit_shift64_mop(&src1, &src2, &dest, op, skip_lo, skip_hi);
     }
     else
-      thumb_emit_data_processing_mop64(&src1, &src2, &dest, op, handler, carry_handler, uses_carry);
+      thumb_emit_data_processing_mop64(&src1, &src2, &dest, op, handler, carry_handler, uses_carry,
+                                       (barrel_shift >> 18) & 0x3Fu);
     return;
   }
 
@@ -6543,8 +7321,12 @@ void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineO
   MachineCodegenContext ctx = {0};
   int rd = mach_get_dest_reg(&ctx, &dest, 0);
   uint32_t excl = (1u << (uint32_t)rd);
-  int rn = mach_ensure_in_reg(&ctx, &src1, excl);
   int param = (src2.kind == MACH_OP_IMM) ? (int)src2.u.imm.val : 0;
+  /* The field may live in the HIGH word of a 64-bit source: `(v >> 52) & 0x7FF`
+   * is one UBFX on that word, with no shift in front of it. */
+  if ((param & UBFX_HI_HALF) && src1.is_64bit && !src1.needs_deref)
+    src1 = mach_make_hi_half(&src1);
+  int rn = mach_ensure_in_reg(&ctx, &src1, excl);
   int lsb = param & 0x1F;
   int width = (param >> 5) & 0x1F;
   if (width == 0)
@@ -7279,10 +8061,13 @@ ST_FUNC void tcc_gen_machine_muldiv_mop(MachineOperand src1, MachineOperand src2
       if (thumb_is_hw_reg(r_lo))
         excl |= (1u << (uint32_t)r_lo);
       int r_hi = mach_ensure_in_reg(&ctx, &hi, excl);
-      ot_check(th_cmp_imm(r_lo, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
-      th_literal_pool_reserve_upcoming_bytes(6);
-      ot_check(th_it(mapcc(TOK_EQ), 0x8)); /* IT EQ (single instruction) */
-      ot_check(th_cmp_imm(r_hi, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+      if (!thumb_try_orrs_zero64(r_lo, r_hi))
+      {
+        ot_check(th_cmp_imm(r_lo, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+        th_literal_pool_reserve_upcoming_bytes(6);
+        ot_check(th_it(mapcc(TOK_EQ), 0x8)); /* IT EQ (single instruction) */
+        ot_check(th_cmp_imm(r_hi, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+      }
     }
     else
     {
@@ -7349,6 +8134,14 @@ ST_FUNC void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand sr
    * registers for halves that need them. */
   int hi_uses_imm = (r_src2.kind == MACH_OP_IMM && hi_imm_op.size);
   int lo_uses_imm = (r_src2.kind == MACH_OP_IMM && lo_imm_op.size);
+
+  /* Comparing against literal zero is `(lo | hi) == 0`, one ORRS. */
+  if (r_src2.kind == MACH_OP_IMM && (uint64_t)r_src2.u.imm.val == 0 &&
+      thumb_try_orrs_zero64(rn_lo, rn_hi))
+  {
+    mach_release_all(&ctx);
+    return;
+  }
 
   int rm_lo = 0, rm_hi = 0;
   if (!lo_uses_imm && !hi_uses_imm)
@@ -7733,7 +8526,16 @@ ST_FUNC void tcc_gen_machine_pack64_mop(MachineOperand src_lo, MachineOperand sr
  */
 ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest, TccIrOp op)
 {
+  tcc_gen_machine_assign_mop_ex(src, dest, op, 0);
+}
+
+ST_FUNC void tcc_gen_machine_assign_mop_ex(MachineOperand src, MachineOperand dest, TccIrOp op, uint32_t zh)
+{
   (void)op;
+  /* Only the top-level 64-bit destination consults `zh`; the per-half recursive
+   * calls below have already split the pair and pass 0. */
+  const bool dst_lo_dead = (zh & ZH64_D_LO) != 0;
+  const bool dst_hi_dead = (zh & ZH64_D_HI) != 0;
 
   /* 64-bit pair assignment: handle each 32-bit half independently.
    * mach_make_lo/hi_half splits MACH_OP_REG (r0:r1), MACH_OP_SPILL (offset,
@@ -7793,9 +8595,12 @@ ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest,
     {
       /* Whole 64-bit local → register pair: one LDRD instead of the two LDRs
        * the per-half recursion below would emit. */
-      if (src.kind == MACH_OP_SPILL && !src.needs_deref && (src.u.spill.offset & 3) == 0 &&
-          dest.kind == MACH_OP_REG && !dest.needs_deref && thumb_is_hw_reg(dest.u.reg.r0) &&
-          thumb_is_hw_reg(dest.u.reg.r1) && dest.u.reg.r0 != dest.u.reg.r1 &&
+      /* LDRD moves both halves at once, so it is only the right choice while
+       * both are wanted. */
+      if (!dst_lo_dead && !dst_hi_dead && src.kind == MACH_OP_SPILL && !src.needs_deref &&
+          (src.u.spill.offset & 3) == 0 && dest.kind == MACH_OP_REG && !dest.needs_deref &&
+          thumb_is_hw_reg(dest.u.reg.r0) && thumb_is_hw_reg(dest.u.reg.r1) &&
+          dest.u.reg.r0 != dest.u.reg.r1 &&
           tcc_gen_machine_try_ldrd_spill(dest.u.reg.r0, src.u.spill.offset, dest.u.reg.r1,
                                          src.u.spill.offset + 4))
         return;
@@ -7804,18 +8609,25 @@ ST_FUNC void tcc_gen_machine_assign_mop(MachineOperand src, MachineOperand dest,
       MachineOperand src_hi = mach_make_hi_half(&src);
       src_lo.btype = IROP_BTYPE_INT32;
       src_hi.btype = IROP_BTYPE_INT32;
-      tcc_gen_machine_assign_mop(src_lo, dst_lo, op);
-      tcc_gen_machine_assign_mop(src_hi, dst_hi, op);
+      if (!dst_lo_dead)
+        tcc_gen_machine_assign_mop(src_lo, dst_lo, op);
+      if (!dst_hi_dead)
+        tcc_gen_machine_assign_mop(src_hi, dst_hi, op);
     }
     else
     {
-      /* 32-bit source into 64-bit dest: assign lo half, zero the high half. */
+      /* 32-bit source into 64-bit dest: assign lo half, zero the high half.
+       * That zero is the single commonest instruction in soft float -- every
+       * `(uint64_t)x` before a shift-and-OR pays one -- so skipping it when no
+       * consumer reads the half is the point of the whole annotation. */
       MachineOperand zero = {0};
       zero.kind = MACH_OP_IMM;
       zero.u.imm.val = 0;
       zero.btype = IROP_BTYPE_INT32;
-      tcc_gen_machine_assign_mop(src, dst_lo, op);
-      tcc_gen_machine_assign_mop(zero, dst_hi, op);
+      if (!dst_lo_dead)
+        tcc_gen_machine_assign_mop(src, dst_lo, op);
+      if (!dst_hi_dead)
+        tcc_gen_machine_assign_mop(zero, dst_hi, op);
     }
     return;
   }
@@ -8343,7 +9155,19 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
   }
 
   case MACH_OP_IMM:
-    /* Treat as constant load (e.g. loading from address 0 — rare but handle gracefully) */
+    if (src.needs_deref)
+    {
+      /* Read through an absolute address: `*(volatile T *)0x40000000`, the
+       * MMIO register idiom.  Materialize the address, then load from it —
+       * the same shape as the MACH_OP_SYMBOL deref path above, and the mirror
+       * of the store side, which has always done this.  Alignment of an
+       * arbitrary constant address is unknown, so no LDRD. */
+      int addr_r = mach_alloc_scratch(&ctx, (uint32_t)1u << (uint32_t)dest_reg);
+      tcc_machine_load_constant(addr_r, PREG_REG_NONE, src.u.imm.val, 0, NULL);
+      load_from_base(dest_reg, dest_r1, btype, is_unsigned, 0, 0, (uint32_t)addr_r);
+      break;
+    }
+    /* Not an lvalue: the immediate IS the value. */
     tcc_machine_load_constant(dest_reg, dest_r1, src.u.imm.val, (int)dest.is_64bit, NULL);
     break;
 
@@ -14457,8 +15281,8 @@ ST_FUNC void tcc_gen_machine_predicated_alu_mop(MachineOperand src1, MachineOper
 
 ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROperand src, int size)
 {
-  if (size <= 0 || (size & 3))
-    tcc_error("compiler_error: block_copy size must be positive multiple of 4, got %d", size);
+  if (size <= 0)
+    tcc_error("compiler_error: block_copy size must be positive, got %d", size);
 
   /* Get the source symbol from the SYMREF operand */
   IRPoolSymref *symref = irop_get_symref_ex(ir, src);
@@ -14547,6 +15371,7 @@ ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROp
 
   /* Handle remaining words individually */
   int dr = data_regs[0]; /* first data register */
+  int single_words = remaining_words;
   while (remaining_words > 0)
   {
     ot_check_ldr_imm(dr, r_src, 0, 6, ENFORCE_ENCODING_NONE);
@@ -14559,6 +15384,23 @@ ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROp
         tcc_error("compiler_error: block_copy cannot advance dest pointer");
     }
     remaining_words--;
+  }
+
+  /* Copy the 1..3 trailing bytes of a size that is not a whole number of words.
+   * Writing them as bytes matters: a strcpy fold must not touch dst past the
+   * terminating NUL, so the copy may not be rounded up to a word.  The LDM/STM
+   * chunks advanced the pointers by writeback; the single-word loop above stops
+   * ON its last word rather than past it, so the tail sits 4 bytes further on
+   * whenever that loop ran at all. */
+  int tail = size & 3;
+  if (tail)
+  {
+    int tail_off = single_words > 0 ? 4 : 0;
+    for (int b = 0; b < tail; b++)
+    {
+      ot_check(th_ldrb_imm(dr, r_src, tail_off + b, 6, ENFORCE_ENCODING_NONE));
+      ot_check(th_strb_imm(dr, r_dst, tail_off + b, 6, ENFORCE_ENCODING_NONE));
+    }
   }
 
   /* Restore all scratch registers in reverse order: data regs first, then ptrs */
@@ -14800,6 +15642,7 @@ ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand area,
   int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
   ot_check(th_mov_imm(dest_reg, 0, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 0 */
   ot_check(th_b_t4(4));                                                                     /* B.W +4 (skip resume) */
+  codegen_internal_merge_point(); /* longjmp lands below */
 
   /* ---- resume_label: longjmp lands here ---- */
   ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 1 */
@@ -14862,6 +15705,7 @@ ST_FUNC void tcc_gen_machine_nl_setjmp_mop(MachineOperand buf, MachineOperand de
   int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
   ot_check(th_mov_imm(dest_reg, 0, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 0 */
   ot_check(th_b_t4(4));                                                                     /* B.W +4 (skip resume) */
+  codegen_internal_merge_point(); /* longjmp lands below */
 
   /* ---- resume_label: longjmp lands here ---- */
   ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 1 */

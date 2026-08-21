@@ -278,6 +278,14 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
         cef_operand_is_volatile_local(ir, src2))
       continue;
 
+    /* Deciding the comparison does not remove the reads it is made of.  The
+     * volatile check further down only guards the branch that proves two
+     * symref derefs equal; ir_opt_nonvreg_expr_equal above it reaches the same
+     * conclusion first and never asked, so `g == g` on a volatile global folded
+     * to 1 with both loads gone.  Ask once, for the whole instruction. */
+    if (tcc_ir_instr_access_is_volatile(ir, q))
+      continue;
+
     int def1 = -1, def2 = -1;
     int is_equal = 0;
     int both_nonvreg = (vr1 < 0 && vr2 < 0);

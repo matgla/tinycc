@@ -102,16 +102,23 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
   case IROP_TAG_IMM32:
     m.kind = MACH_OP_IMM;
     m.u.imm.val = (int64_t)irop_get_imm32(*op);
+    /* An lvalue immediate is an absolute ADDRESS (`*(volatile T *)0x40000000`),
+     * not a value: the consumers deref it exactly like a MACH_OP_SYMBOL. */
+    m.needs_deref = (bool)op->is_lval;
     return m;
   case IROP_TAG_F32:
     /* Store raw IEEE-754 bits; the backend decides how to encode them. */
     m.kind = MACH_OP_IMM;
     m.u.imm.val = (int64_t)(uint64_t)op->u.f32_bits;
+    m.needs_deref = (bool)op->is_lval;
     return m;
   case IROP_TAG_I64:
   case IROP_TAG_F64:
     m.kind = MACH_OP_IMM;
     m.u.imm.val = irop_get_imm64_ex(ir, *op);
+    /* Same as IMM32: `*(volatile long long *)0x40000000` reaches here as an
+     * lvalue whose payload is the ADDRESS, not the 64-bit value. */
+    m.needs_deref = (bool)op->is_lval;
     return m;
   case IROP_TAG_SYMREF:
   {

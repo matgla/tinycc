@@ -538,8 +538,14 @@ static int lac_slot_count(const TCCIRState *ir, IRQuadCompact *q, uint8_t *slots
   /* A plain STORE carries its target ADDRESS in dest, not a result register --
    * the one op where dest is a value the backend materializes.  Without this
    * a loop that writes a global keeps reloading the address for the store even
-   * though the hoisted temp already holds it (pr64494). */
-  if (q->op == TCCIR_OP_STORE)
+   * though the hoisted temp already holds it (pr64494).
+   *
+   * STORE_INDEXED's dest is the identical role (the base register), so it must
+   * be enumerated too: `global_array[i] = v` lowers to STORE_INDEXED, and
+   * leaving its base invisible to this collector made every such loop reload
+   * `&array` from the literal pool on each iteration (mibench_stringsearch
+   * -27.4% once fixed). */
+  if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED)
     slots[n++] = GAH_SLOT_DEST;
   (void)ir;
   return n;
@@ -730,6 +736,12 @@ int tcc_ir_ssa_opt_local_addr_cse(TCCIRState *ir)
  * (+8..11 instructions of spill each), 3 excludes mibench_crc32's budget-4
  * inner loop and gives back its -131k cycles. */
 #define LAH_MIN_BUDGET 2
+/* Parking across a call spends a CALLEE-saved register, so the loop must have
+ * room the allocator was not already going to use, and only the hottest
+ * address is worth that: a second one competes for the same handful of
+ * registers and pays a second push/pop for it. */
+#define LAH_CALL_MIN_BUDGET 4
+#define LAH_CALL_MAX_HOISTS 1
 #define LAH_MAX_LOOPS 32
 
 typedef struct {
@@ -906,18 +918,23 @@ int tcc_ir_ssa_opt_loop_addr_hoist(TCCIRState *ir)
 
   for (int l = 0; l < nloops; l++) {
     LacClass classes[LAC_MAX_CLASSES];
-    int nclasses = 0, picked = 0, pos, max_hoists;
+    int nclasses = 0, picked = 0, pos, max_hoists, has_call;
 
     lah_collect_body(cfg, loops[l].header, loops[l].latch, in_loop, worklist);
     pos = lah_preheader_pos(ir, cfg, loops[l].header, in_loop);
     if (pos < 0)
       continue;
     /* A call in the body forces the parked address into a callee-saved
-     * register -- an extra push/pop plus pressure on the values the loop
-     * already keeps there, which outweighs the reload it removes.  In a
-     * call-free loop the caller-saved registers are free and it is pure win. */
-    if (lah_body_has_call(ir, cfg, in_loop))
-      continue;
+     * register: an extra push/pop, plus pressure on the values the loop
+     * already keeps there.  In a call-free loop the caller-saved registers are
+     * free and parking is pure win, so the bar there is only LAH_MIN_BUDGET.
+     *
+     * Across a call the push/pop is a fixed two instructions against a reload
+     * removed on every iteration, so the trade is still worth making -- but
+     * only with room to spare, and only for the single hottest address:
+     * `for (i) f(tab[i])` reloads &tab from the pool every trip, which is
+     * where a loop calling anything at all loses to GCC. */
+    has_call = lah_body_has_call(ir, cfg, in_loop);
 
     for (int b = 0; b < cfg->num_blocks; b++) {
       if (!in_loop[b])
@@ -959,9 +976,10 @@ int tcc_ir_ssa_opt_loop_addr_hoist(TCCIRState *ir)
      * (mibench_crc32's inner loop, +65k cycles that way, faster than baseline
      * once both of its addresses are parked).  The estimate is clamped to >= 1
      * even for a saturated loop, so keep clear of that floor. */
-    max_hoists = lah_loop_budget(ir, cfg, in_loop) - LAH_MIN_BUDGET;
-    if (max_hoists > LAH_MAX_HOISTS)
-      max_hoists = LAH_MAX_HOISTS;
+    max_hoists = lah_loop_budget(ir, cfg, in_loop) -
+                 (has_call ? LAH_CALL_MIN_BUDGET : LAH_MIN_BUDGET);
+    if (max_hoists > (has_call ? LAH_CALL_MAX_HOISTS : LAH_MAX_HOISTS))
+      max_hoists = has_call ? LAH_CALL_MAX_HOISTS : LAH_MAX_HOISTS;
     /* Const classes are opportunistic passengers: they ride only when the
      * loop keeps a register of slack beyond the all-or-nothing minimum, and
      * they must never veto the established address hoists.  loop-2b::f is

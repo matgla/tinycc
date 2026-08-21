@@ -172,6 +172,10 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
         if (sym && (sym->type.t & VT_VOLATILE))
           return 0;
       }
+      /* Only the symbol's own type is checked above; a volatile MEMBER, a
+       * `volatile T *` deref or a cast is recorded on the access instead. */
+      if (tcc_ir_instr_access_is_volatile(ir, q))
+        return 0;
       /* Address-of a VAR-vreg local: exclude from the uninit-VAR check (pointer alias may write it). */
       {
         int32_t vr = irop_get_vreg(op);

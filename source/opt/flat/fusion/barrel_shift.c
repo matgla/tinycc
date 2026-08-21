@@ -40,6 +40,14 @@
  * scaled addressing mode can encode, so a consumer this pass does not model --
  * PREFETCH, a later-formed indexed access -- can still claim them).  Every
  * other consumer keeps the fusion, which is a strict win: the shift vanishes.
+ *
+ * The ALU operand and the shift may name the SAME register.  `x + (x >>u 31)`
+ * -- the bias step of a signed divide by two, and the shape of every
+ * `a OP (a SHIFT k)` idiom -- encodes as one `add.w rd, rn, rn, lsr #31`,
+ * because Rn and Rm are independent fields that may hold the same number.
+ * This pass used to refuse that case; the refusal cost an instruction every
+ * time and protected nothing (87 such fusions appear across an exhaustive
+ * op x shift-kind x amount matrix, all matching gcc's answers).
  */
 void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
 {
@@ -186,8 +194,6 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
       IROperand other = (attempt == 0) ? tcc_ir_op_get_src1(ir, q)
                                         : tcc_ir_op_get_src2(ir, q);
       if (!irop_has_vreg(other))
-        continue;
-      if (irop_has_vreg(other) && irop_get_vreg(other) == shift_src_vr)
         continue;
 
       int safe = 1;

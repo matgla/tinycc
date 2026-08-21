@@ -102,6 +102,7 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     SSA_RUN("ssa:bitop_const_fold", tcc_ir_ssa_opt_bitop_const_fold(ctx));
     SSA_RUN("ssa:ptr_store_dse", tcc_ir_ssa_opt_ptr_store_dse(ctx));
     SSA_RUN("ssa:branch", ssa_opt_branch(ctx));
+    SSA_RUN("ssa:switch_fold", ssa_opt_switch_fold(ctx));
     SSA_RUN("ssa:cmp_eq_prop", ssa_opt_cmp_eq_prop(ctx));
     SSA_RUN("ssa:vrp", (tcc_state && tcc_state->opt_vrp) ? ssa_opt_vrp(ctx) : 0);
     SSA_RUN("ssa:setif_or_taut",
@@ -115,7 +116,12 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     SSA_RUN("ssa:narrow", ssa_opt_narrow(ctx));
     SSA_RUN("ssa:gvn", ssa_opt_gvn(ctx));
     SSA_RUN("ssa:phi_simplify", ssa_opt_phi_simplify(ctx));
-    /* -O2 only: -O1 keeps empty counting loops intact. */
+    /* -O2, not -O1: gcc deletes a pure counting loop only at -O2 -- its -O1
+     * folds the body to a constant but still runs the trip count.  Gating this
+     * at -O1 made our -O1 strictly stronger than its gcc peer, to the point
+     * that bench_conditionals compiled byte-identically at -O1 and -O2 here
+     * while gcc -O1 spent 4034 cycles on an empty loop.  Deleting the loop
+     * belongs to the heavy tier alongside unrolling/LICM/IV-strength-red. */
     SSA_RUN("ssa:dead_loop",
             (tcc_state && tcc_state->optimize >= 2) ? ssa_opt_dead_loop(ctx) : 0);
     SSA_RUN("ssa:dce", ssa_opt_dce(ctx));

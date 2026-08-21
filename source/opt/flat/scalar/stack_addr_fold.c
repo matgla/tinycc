@@ -58,8 +58,11 @@ static int ir_resolve_stack_addr_value(TCCIRState *ir, IROperand op, int at_idx,
   return 1;
 }
 
-/* Presence map of vregs with at least one def; indexed pos*3 + (type-1). */
+/* Presence map of vregs with at least one def; indexed pos*3 + (type-1).
+ * sav_def_only records the index of that def while the count is exactly one,
+ * and -2 once a second def appears. */
 static uint8_t *sav_def_present;
+static int *sav_def_only;
 static int sav_def_present_maxpos = -1;
 
 static int sav_is_def_op(int op)
@@ -89,27 +92,52 @@ static void sav_build_def_map(TCCIRState *ir)
   if (maxpos < 0)
     return;
   sav_def_present = (uint8_t *)tcc_mallocz((size_t)(maxpos + 1) * 3);
+  sav_def_only = (int *)tcc_malloc((size_t)(maxpos + 1) * 3 * sizeof(int));
+  for (int k = 0; k < (maxpos + 1) * 3; k++)
+    sav_def_only[k] = -1;
   sav_def_present_maxpos = maxpos;
   for (int j = 0; j < n; j++)
   {
     IRQuadCompact *q = &ir->compact_instructions[j];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest || !sav_is_def_op(q->op))
       continue;
-    int32_t dvr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t dvr = irop_get_vreg(d);
     if (dvr < 0)
       continue;
     int type = TCCIR_DECODE_VREG_TYPE(dvr);
     int pos = TCCIR_DECODE_VREG_POSITION(dvr);
-    if (type >= 1 && type <= 3)
-      sav_def_present[pos * 3 + (type - 1)] = 1;
+    if (type < 1 || type > 3)
+      continue;
+    int k = pos * 3 + (type - 1);
+    sav_def_present[k] = 1;
+    /* A write THROUGH the vreg is a use, but so is `has_dest` with is_lval --
+     * it is not a def of the vreg, and counting it as one would let a second
+     * def slip past the uniqueness test. */
+    sav_def_only[k] = d.is_lval ? -2 : (sav_def_only[k] == -1 ? j : -2);
   }
 }
 
 static void sav_free_def_map(void)
 {
   tcc_free(sav_def_present);
+  tcc_free(sav_def_only);
   sav_def_present = NULL;
+  sav_def_only = NULL;
   sav_def_present_maxpos = -1;
+}
+
+/* Index of vr's single def in the function, or -1 when there is not exactly one. */
+static int sav_vreg_unique_def(int32_t vr)
+{
+  if (!sav_def_only)
+    return -1;
+  int type = TCCIR_DECODE_VREG_TYPE(vr);
+  int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  if (type < 1 || type > 3 || pos > sav_def_present_maxpos)
+    return -1;
+  int only = sav_def_only[pos * 3 + (type - 1)];
+  return only >= 0 ? only : -1;
 }
 
 /* Returns 1 if vr definitely has no qualifying def (walk would return 0). */
@@ -145,6 +173,36 @@ static int ir_resolve_stack_addr_value_ex(TCCIRState *ir, IROperand op, int at_i
   /* Fast reject: a vreg with no def anywhere resolves to 0 — skip the scan. */
   if (sav_vreg_has_no_def(vr))
     return 0;
+
+  /* A vreg with exactly ONE def in the function holds that def's value at
+   * every use the def reaches, so a merge in between says nothing -- and the
+   * backward scan below, which refuses to cross one, cannot see it.  That is
+   * `ur`'s address in __aeabi_dadd: assigned once above a diamond and
+   * dereferenced below it, which left the slot address-taken and stopped
+   * every downstream pass from tracking the slot at all.  A use the single def
+   * does NOT reach is reading an uninitialized vreg, undefined either way, and
+   * the pass has already refused functions with backward control flow, so
+   * there is no loop-carried case to get wrong.  Only a DIRECT address is
+   * accepted here; anything needing arithmetic still goes through the scan. */
+  {
+    int only = sav_vreg_unique_def(vr);
+    if (only >= 0 && only != at_idx)
+    {
+      IRQuadCompact *dq = &ir->compact_instructions[only];
+      if (dq->op == TCCIR_OP_ASSIGN || dq->op == TCCIR_OP_LEA)
+      {
+        IROperand src = tcc_ir_op_get_src1(ir, dq);
+        int direct = (irop_get_tag(src) == IROP_TAG_STACKOFF && irop_get_vreg(src) == -1 &&
+                      (dq->op == TCCIR_OP_LEA ? !src.is_llocal : !src.is_lval));
+        if (direct)
+        {
+          out->off = (int)irop_get_stack_offset(src);
+          out->is_param = src.is_param;
+          return 1;
+        }
+      }
+    }
+  }
 
   /* A vreg read at a merge point has an edge-dependent value — bail. */
   if (at_idx >= 0 && at_idx < ir->next_instruction_index &&

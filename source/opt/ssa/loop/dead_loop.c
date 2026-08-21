@@ -14,6 +14,40 @@
 #include "opt/ssa/ssa_opt_helpers.h"
 #include "licm.h"
 
+/* Both arms of this pass are shape matchers, and every bail is silent.  The
+ * block/phi/loop-bounds dump is what tells you which one you tripped -- the
+ * rotated arm was written against it. */
+TCC_DBG_ENV_FLAG(dbg_dead_loop, "TCC_DBG_DEAD_LOOP")
+
+static void dl_dump(IRSSAOptCtx *ctx, IRLoops *loops)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+  fprintf(stderr, "[DL] ---- func, %d instrs, %d blocks, %d loops\n",
+          ir->next_instruction_index, cfg ? cfg->num_blocks : -1,
+          loops ? loops->num_loops : 0);
+  for (int b = 0; cfg && b < cfg->num_blocks; b++) {
+    fprintf(stderr, "[DL] block %d: [%d..%d] preds:", b,
+            cfg->blocks[b].start_idx, cfg->blocks[b].end_idx);
+    for (int p = 0; p < cfg->blocks[b].num_preds; p++)
+      fprintf(stderr, " %d", cfg->blocks[b].preds[p]);
+    fprintf(stderr, "\n");
+    for (IRPhiNode *phi = ctx->ssa->block_phis[b]; phi; phi = phi->next) {
+      fprintf(stderr, "[DL]   phi T%d <-", TCCIR_DECODE_VREG_POSITION(phi->dest_vreg));
+      for (int o = 0; o < phi->num_operands; o++)
+        fprintf(stderr, " [bb%d: T%d]", phi->operands[o].pred_block,
+                TCCIR_DECODE_VREG_POSITION(phi->operands[o].vreg));
+      fprintf(stderr, "\n");
+    }
+  }
+  for (int li = 0; loops && li < loops->num_loops; li++) {
+    IRLoop *l = &loops->loops[li];
+    fprintf(stderr, "[DL] loop %d: header=%d start=%d end=%d pre=%d nbody=%d depth=%d\n",
+            li, l->header_idx, l->start_idx, l->end_idx, l->preheader_idx,
+            l->num_body_instrs, l->depth);
+  }
+}
+
 static int resolve_const_through_copies(IRSSAOptCtx *ctx, int32_t vr, int64_t *out_const)
 {
   TCCIRState *ir = ctx->ir;
@@ -740,6 +774,364 @@ static int rewrite_loop_exit_phis_guarded(IRSSAOptCtx *ctx, IRLoop *loop, LoopEn
   return num_cands;
 }
 
+/* ---------------------------------------------------------------------------
+ * Rotated (bottom-test) loops
+ *
+ * analyze_loop_entry above only matches the un-rotated shape — CMP as the
+ * first instruction of the header.  A loop that came out of rotation
+ *
+ *     guard:  CMP init, bound ; JUMPIF !cond -> exit
+ *     body:   <pure>
+ *     latch:  iv' = iv + step ; CMP iv', bound ; JUMPIF cond -> body
+ *
+ * has no CMP at its header, so it fell straight through the pass.  That is
+ * every counting loop the pipeline actually produces: bench_function_calls
+ * folds its five calls to one constant and then still spent 5035 cycles
+ * running the empty 1000-iteration shell gcc deletes in 62.
+ *
+ * The rewrite kills the back-edge only and leaves the body in place, so the
+ * body runs exactly once and the exit-block phis keep both of their edges.
+ * That is sound when the body is pure, the trip count is finite, and every
+ * value the body defines that is read after the loop is a compile-time
+ * constant — identical on iteration 1 and iteration N.  DCE removes whatever
+ * the straight-line remains no longer feed.
+ * ------------------------------------------------------------------------ */
+
+#define DL_MAX_ESCAPE_CANDS 64
+
+static int dl_block_in_loop(IRCFG *cfg, IRLoop *loop, int b)
+{
+  if (!cfg || b < 0 || b >= cfg->num_blocks)
+    return 0;
+  return cfg->blocks[b].start_idx >= loop->start_idx &&
+         cfg->blocks[b].start_idx <= loop->end_idx;
+}
+
+static int dl_instr_in_loop(IRLoop *loop, int idx)
+{
+  return idx >= loop->start_idx && idx <= loop->end_idx;
+}
+
+/* Hop ASSIGN copies to the value's origin; returns vr itself when it isn't one. */
+static int32_t dl_skip_copies(IRSSAOptCtx *ctx, int32_t vr)
+{
+  TCCIRState *ir = ctx->ir;
+  for (int hop = 0; hop < 8 && vr >= 0; hop++) {
+    if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      return vr;
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+    if (!vi || vi->def_instr < 0 || ssa_opt_def_total(vi) != 1)
+      return vr;
+    IRQuadCompact *q = &ir->compact_instructions[vi->def_instr];
+    if (q->op != TCCIR_OP_ASSIGN)
+      return vr;
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    if (s.is_lval || s.tag != IROP_TAG_VREG)
+      return vr;
+    vr = irop_get_vreg(s);
+  }
+  return vr;
+}
+
+/* Direct IR scan, not use-def chains: the bound only has to survive the body. */
+static int dl_vreg_untouched_in_loop(IRSSAOptCtx *ctx, IRLoop *loop, int32_t vr)
+{
+  TCCIRState *ir = ctx->ir;
+  if (vr < 0)
+    return 0;
+  for (int i = loop->start_idx; i <= loop->end_idx && i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    if (irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == vr)
+      return 0;
+  }
+  for (int b = 0; ctx->cfg && b < ctx->cfg->num_blocks; b++) {
+    if (!dl_block_in_loop(ctx->cfg, loop, b))
+      continue;
+    for (IRPhiNode *p = ctx->ssa->block_phis[b]; p; p = p->next)
+      if (p->dest_vreg == vr)
+        return 0;
+  }
+  return 1;
+}
+
+/* The latch counts up toward the bound (or down toward it), so the back-edge
+ * condition goes false after finitely many iterations.  Unsigned <= / >= are
+ * excluded: with the bound at the type's extreme they wrap round forever. */
+static int dl_cond_terminates(int tok, int going_up)
+{
+  if (going_up)
+    return tok == TOK_LT || tok == TOK_ULT || tok == TOK_LE;
+  return tok == TOK_GT || tok == TOK_UGT || tok == TOK_GE;
+}
+
+static int dl_operand_is_int(IROperand op)
+{
+  return op.btype != IROP_BTYPE_FLOAT32 && op.btype != IROP_BTYPE_FLOAT64;
+}
+
+/* Exactly one back-edge, and no path from outside lands past the header:
+ * removing the back-edge of one of two latches, or of a loop a switch jumps
+ * into, changes where the other entry falls out to. */
+static int dl_single_entry_single_latch(IRSSAOptCtx *ctx, IRLoop *loop, int jpf_idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+
+  int back_edges = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE) {
+      /* Targets are not in the dest operand, so they cannot be checked. */
+      if (!dl_instr_in_loop(loop, i))
+        return 0;
+      continue;
+    }
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    if (target == loop->header_idx) {
+      if (i >= loop->header_idx) {
+        back_edges++;
+        if (i != jpf_idx)
+          return 0;
+      }
+      continue;
+    }
+    /* A jump from outside into the body proper re-enters past the header. */
+    if (target > loop->start_idx && target <= loop->end_idx && !dl_instr_in_loop(loop, i))
+      return 0;
+  }
+  if (back_edges != 1)
+    return 0;
+
+  int header_block = cfg->instr_to_block[loop->header_idx];
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    if (b == header_block || !dl_block_in_loop(cfg, loop, b))
+      continue;
+    for (int p = 0; p < cfg->blocks[b].num_preds; p++)
+      if (!dl_block_in_loop(cfg, loop, cfg->blocks[b].preds[p]))
+        return 0;
+  }
+  return 1;
+}
+
+/* Values the body defines that are not compile-time constants.  Collected by
+ * direct scan rather than off the use lists, which under-report once a pass
+ * has NOP'd an instruction without unlinking its uses — here that would read
+ * as "nothing escapes" and delete a loop whose result is still wanted. */
+static int dl_collect_varying_defs(IRSSAOptCtx *ctx, IRLoop *loop,
+                                   int32_t *cands, int *num_cands)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+
+  for (int idx = loop->start_idx; idx <= loop->end_idx; idx++) {
+    IRQuadCompact *q = &ir->compact_instructions[idx];
+    if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+      continue;
+    if (!irop_config[q->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t vr = irop_get_vreg(d);
+    if (vr < 0)
+      continue;
+    /* Non-TEMP defs inside a loop body imply observable state. */
+    if (d.is_lval || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      return 0;
+
+    int64_t cv;
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+    if (vi && ssa_opt_def_total(vi) == 1 && resolve_const_through_copies(ctx, vr, &cv))
+      continue;
+    if (*num_cands >= DL_MAX_ESCAPE_CANDS)
+      return 0;
+    cands[(*num_cands)++] = vr;
+  }
+
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    if (!dl_block_in_loop(cfg, loop, b))
+      continue;
+    for (IRPhiNode *p = ctx->ssa->block_phis[b]; p; p = p->next) {
+      if (*num_cands >= DL_MAX_ESCAPE_CANDS)
+        return 0;
+      cands[(*num_cands)++] = p->dest_vreg;
+    }
+  }
+  return 1;
+}
+
+static int dl_in_cands(const int32_t *cands, int num_cands, int32_t vr)
+{
+  if (vr < 0)
+    return 0;
+  for (int i = 0; i < num_cands; i++)
+    if (cands[i] == vr)
+      return 1;
+  return 0;
+}
+
+static int dl_any_cand_read_outside(IRSSAOptCtx *ctx, IRLoop *loop,
+                                    const int32_t *cands, int num_cands)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    if (dl_instr_in_loop(loop, i))
+      continue;
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (irop_config[q->op].has_src1 &&
+        dl_in_cands(cands, num_cands, irop_get_vreg(tcc_ir_op_get_src1(ir, q))))
+      return 1;
+    if (irop_config[q->op].has_src2 &&
+        dl_in_cands(cands, num_cands, irop_get_vreg(tcc_ir_op_get_src2(ir, q))))
+      return 1;
+    if (q->op == TCCIR_OP_MLA &&
+        dl_in_cands(cands, num_cands, irop_get_vreg(tcc_ir_op_get_accum(ir, q))))
+      return 1;
+    if (irop_config[q->op].has_dest &&
+        dl_in_cands(cands, num_cands, irop_get_vreg(tcc_ir_op_get_dest(ir, q))))
+      return 1; /* re-def or memory write through the value */
+  }
+
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    if (dl_block_in_loop(cfg, loop, b))
+      continue;
+    for (IRPhiNode *p = ctx->ssa->block_phis[b]; p; p = p->next)
+      for (int o = 0; o < p->num_operands; o++)
+        if (dl_in_cands(cands, num_cands, p->operands[o].vreg))
+          return 1;
+  }
+  return 0;
+}
+
+static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
+{
+  TCCIRState *ir = ctx->ir;
+  IRSSAState *ssa = ctx->ssa;
+  IRCFG *cfg = ctx->cfg;
+
+  /* Body must end at the back-edge; a forward-jumped tail past it would become
+   * the fall-through target once the JUMPIF goes away. */
+  if (loop_max_idx(loop) != loop->end_idx)
+    return 0;
+
+  int jpf_idx = loop->end_idx;
+  if (jpf_idx + 1 >= ir->next_instruction_index)
+    return 0;
+  if (jpf_idx >= cfg->num_instrs || loop->header_idx >= cfg->num_instrs)
+    return 0;
+  if (!ssa->block_phis)
+    return 0;
+
+  IRQuadCompact *jpf = &ir->compact_instructions[jpf_idx];
+  if (jpf->op != TCCIR_OP_JUMPIF)
+    return 0;
+  if ((int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jpf)) != loop->header_idx)
+    return 0;
+
+  int cmp_idx = jpf_idx - 1;
+  while (cmp_idx >= loop->start_idx && ir->compact_instructions[cmp_idx].op == TCCIR_OP_NOP)
+    cmp_idx--;
+  if (cmp_idx < loop->start_idx)
+    return 0;
+  IRQuadCompact *cmp = &ir->compact_instructions[cmp_idx];
+  if (cmp->op != TCCIR_OP_CMP)
+    return 0;
+
+  int header_block = cfg->instr_to_block[loop->header_idx];
+  int latch_block = cfg->instr_to_block[jpf_idx];
+  int fallthru_block = cfg->instr_to_block[jpf_idx + 1];
+  if (header_block < 0 || latch_block < 0 || fallthru_block < 0)
+    return 0;
+  if (fallthru_block == header_block || dl_block_in_loop(cfg, loop, fallthru_block))
+    return 0;
+
+  /* --- the compare drives a monotone induction variable ------------------ */
+  IROperand c1 = tcc_ir_op_get_src1(ir, cmp);
+  IROperand c2 = tcc_ir_op_get_src2(ir, cmp);
+  if (c1.is_lval || c2.is_lval || !dl_operand_is_int(c1) || !dl_operand_is_int(c2))
+    return 0;
+  if (tcc_ir_barrel_shift_at(ir, cmp) != 0)
+    return 0;
+
+  int32_t next_vr = irop_get_vreg(c1);
+  if (next_vr < 0)
+    return 0;
+  if (!irop_is_immediate(c2) && !dl_vreg_untouched_in_loop(ctx, loop, irop_get_vreg(c2)))
+    return 0;
+
+  int32_t next_base = dl_skip_copies(ctx, next_vr);
+  IRPhiNode *iv_phi = NULL;
+  int going_up = 0;
+
+  for (IRPhiNode *p = ssa->block_phis[header_block]; p && !iv_phi; p = p->next) {
+    if (p->num_operands != 2)
+      continue;
+    int32_t latch_vr = -1;
+    for (int oi = 0; oi < p->num_operands; oi++)
+      if (p->operands[oi].pred_block == latch_block)
+        latch_vr = p->operands[oi].vreg;
+    if (latch_vr < 0 || dl_skip_copies(ctx, latch_vr) != next_base)
+      continue;
+
+    IRSSAVregInfo *bvi = ssa_opt_vinfo(ctx, next_base);
+    if (!bvi || bvi->def_instr < 0 || ssa_opt_def_total(bvi) != 1)
+      continue;
+    if (!dl_instr_in_loop(loop, bvi->def_instr))
+      continue;
+    IRQuadCompact *dq = &ir->compact_instructions[bvi->def_instr];
+    if (dq->op != TCCIR_OP_ADD && dq->op != TCCIR_OP_SUB)
+      continue;
+    if (tcc_ir_barrel_shift_at(ir, dq) != 0)
+      continue;
+    IROperand a = tcc_ir_op_get_src1(ir, dq);
+    IROperand step_op = tcc_ir_op_get_src2(ir, dq);
+    if (a.is_lval || step_op.is_lval)
+      continue;
+    if (dl_skip_copies(ctx, irop_get_vreg(a)) != p->dest_vreg)
+      continue;
+    if (!irop_is_immediate(step_op) || !dl_operand_is_int(step_op))
+      continue;
+    if (irop_get_imm64_ex(ir, step_op) <= 0)
+      continue;
+
+    going_up = (dq->op == TCCIR_OP_ADD);
+    iv_phi = p;
+  }
+  if (!iv_phi)
+    return 0;
+
+  int back_tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jpf));
+  if (!dl_cond_terminates(back_tok, going_up))
+    return 0;
+
+  /* Whole-IR scans last: by here the loop is known to be a pure counting one,
+   * which is a handful of loops per translation unit rather than every one. */
+  if (!dl_single_entry_single_latch(ctx, loop, jpf_idx))
+    return 0;
+
+  /* --- nothing the body computes may differ between iteration 1 and N ---- */
+  int32_t cands[DL_MAX_ESCAPE_CANDS];
+  int num_cands = 0;
+  if (!dl_collect_varying_defs(ctx, loop, cands, &num_cands))
+    return 0;
+  if (dl_any_cand_read_outside(ctx, loop, cands, num_cands))
+    return 0;
+
+  /* Back-edge dies, fall-through survives — the same rewrite as folding the
+   * latch JUMPIF not-taken.  Drop the phi operands first: ssa_drop_phi_edge
+   * walks the use lists the NOPs are about to invalidate. */
+  ssa_drop_phi_edge(ctx, latch_block, header_block);
+  ssa_opt_nop_instr(ctx, cmp_idx);
+  ssa_opt_nop_instr(ctx, jpf_idx);
+  return 1;
+}
+
 int ssa_opt_dead_loop(IRSSAOptCtx *ctx)
 {
   TCCIRState *ir = ctx->ir;
@@ -748,11 +1140,18 @@ int ssa_opt_dead_loop(IRSSAOptCtx *ctx)
   if (ir->next_instruction_index == 0)
     return 0;
 
+  /* A volatile access is not a side effect in ssa_opt_has_side_effects, so the
+   * purity test below would happily delete a `while (n--) x = *mmio;` poll. */
+  if (ir->func_has_volatile_access)
+    return 0;
+
   IRLoops *loops = tcc_ir_detect_loops(ir);
   if (!loops || loops->num_loops == 0) {
     tcc_ir_free_loops(loops);
     return 0;
   }
+
+  TCC_DBG_BLOCK(dbg_dead_loop) { dl_dump(ctx, loops); }
 
   int total = 0;
   for (int li = 0; li < loops->num_loops; li++) {
@@ -763,8 +1162,10 @@ int ssa_opt_dead_loop(IRSSAOptCtx *ctx)
       continue;
 
     LoopEntryInfo info;
-    if (!analyze_loop_entry(ctx, loop, &info))
+    if (!analyze_loop_entry(ctx, loop, &info)) {
+      total += try_kill_rotated_loop(ctx, loop);
       continue;
+    }
 
     if (info.proven_runs) {
       total += rewrite_loop_exit_phis(ctx, loop);

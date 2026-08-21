@@ -374,6 +374,188 @@ TEST_FILES = [
     # leaving it zeroed -> unredirect ran dup2(0,0)+close(0) on the shell)
     ("439_assign_expr_pointer_base.c", 0),
 
+    # dom-LICM may hoist an invariant read of a local's OWN stack slot
+    # (`StackLoc[off]`, not a pointer deref) out of a loop that stores to
+    # globals, provided the slot's address escapes no further than a
+    # non-capturing mem* helper outside the loop -- the shape a small struct
+    # assignment lowers to (`T = &cur; __aeabi_memmove4(T, &queue[h], 12)`).
+    # Guards both directions: the address escaping to a global, and a write
+    # through a pointer taken inside the loop, must still block the hoist.
+    ("443_licm_invariant_slot_read.c", 0),
+
+    # IV strength reduction reaching an INNER loop, over indexed loads/stores.
+    # Both were gated off: the transform refused LOAD_INDEXED/STORE_INDEXED
+    # uses ("the backend already forms efficient indexed addressing" -- measured
+    # false on Cortex-M33: a scaled register offset costs +1 cycle over a plain
+    # base at equal instruction count), and the driver only ever considered
+    # outermost loops, while every hot array walk is nested.  Each case fails
+    # with a wrong sum, not merely slower code, if the pointer walk desyncs
+    # from the index it replaced.
+    ("444_iv_ptr_walk_inner_loop.c", 0),
+
+    # Post-allocation copy propagation and redundant reload elimination
+    # (source/ir/regalloc.c).  Both rewrite or delete instructions that already
+    # name physical registers, so an error is a silent wrong value rather than
+    # a crash, and the rest of the corpus never produces their shape: one
+    # union-punned 64-bit value re-read by a dozen inlined accessors across
+    # branches, which is how every soft-float routine opens.  Also pins the
+    # cases they must REFUSE -- a source redefined under the copy's uses, and a
+    # punned slot whose address escapes to a callee that rewrites it.
+    ("445_postra_copy_prop_reload.c", 0),
+
+    # shift64_dead_half's annotation is only valid against the FINAL
+    # instruction stream (source/opt/flat/fusion/shift64_dead_half.c).  It ran
+    # before register allocation, so a later CSE could give the shift a second
+    # reader after a half had been declared dead -- codegen then skipped
+    # emitting that half and the consumer read an uninitialised register.  A
+    # silent wrong value with no crash, and nothing else in the corpus has the
+    # shape: two readers of one 64-bit shift, one per half.
+    ("446_shift64_dead_half_two_uses.c", 0),
+
+    # setif_branch_remat rewrites branch CONDITIONS, so a mistake is a silently
+    # inverted or skipped branch rather than a crash -- and the whole corpus
+    # stayed green while an earlier version of it miscompiled a parameter
+    # reassigned between the comparison and the branch.
+    ("447_setif_branch_remat.c", 0),
+
+    # 64-bit shift lowering: the ORR-folded cross term, the variable-count
+    # sequence, and its zero-high-word specialization.  A dropped shift field
+    # or a mis-disabled cross term is a wrong value with no fault.
+    ("448_shift64_lowering.c", 0),
+
+    # cmp_narrow_64 rewrites a compare's operand WIDTH.  A signed order on a
+    # zero-high-word value must keep 64 bits (positive at 64, negative as
+    # int32), and a named local needs one definition and no escaping address.
+    ("449_cmp_narrow_64.c", 0),
+
+    # Every loop tcc rotates ends up bottom-tested, and ssa:dead_loop only
+    # matched the un-rotated shape (CMP first in the header) -- so it fired on
+    # nothing real.  The rotated arm kills the back-edge; the negatives here
+    # each trip one of its conditions (trip-count-dependent exit value, an
+    # escaping counter, a store, a second back-edge, a volatile read).
+    ("450_dead_loop_rotated.c", 0),
+
+    # ssa:switch_fold picks the arm of a constant-selector SWITCH_TABLE at
+    # compile time.  What it has to get right is every way a selector can miss
+    # the table -- below min, above max, no default arm, a negative min -- plus
+    # arms that fall through and arms with a side effect.
+    ("451_switch_const_selector.c", 0),
+
+    # A folded strcpy copies exactly strlen+1 bytes, which need not be a whole
+    # number of words -- the 1..3 byte tail goes as bytes so nothing past the
+    # terminating NUL is touched.
+    ("452_strcpy_subword_tail.c", 0),
+
+    # That fold turns the call into a BLOCK_COPY over the destination range.
+    # Passes that forward a stored value to a later load must treat it as a
+    # killing write; three of them did not, and reads came back with bytes the
+    # copy had already overwritten (sccp, known_bits, entry_store_prop).
+    ("453_block_copy_clobbers_stale_store.c", 0),
+
+    # strcpy from a frame buffer with known contents copies from the rodata the
+    # contents came from.  The cases here are the reasons to refuse: the buffer
+    # is rewritten in the loop, an opaque callee can write through it, or it is
+    # itself a copy destination.
+    ("454_strcpy_stack_const_source.c", 0),
+
+    # zero_half64 tells codegen which halves of a 64-bit value are provably the
+    # constant zero, and which halves of a result no consumer reads and so need
+    # not be written -- a wrong answer leaves a register unwritten and whatever
+    # the allocator left in it is read as the value.  The refusals matter as
+    # much as the rewrites: an immediate second operand, a narrow destination,
+    # and a value assigned twice.
+    ("455_zero_half64.c", 0),
+
+    # `(v64 >> k) & mask` with k >= 32 as one UBFX on the high word -- every
+    # accessor in lib/fp/soft/soft_common.h.  Sweeps every count and width, and
+    # pins the refusals: a field straddling the word boundary, a count below
+    # 32, an arithmetic shift, a shift read twice, a source rewritten in
+    # between.
+    ("456_shift64_extract_ubfx.c", 0),
+
+    # ra:retarget_producer makes the instruction before a register copy write
+    # the copy's destination and deletes the copy, then rewrites the reads of
+    # the source that outlive it.  Both directions of that are physical-register
+    # edits, so what has to hold is the refusals: an ABI-fixed destination, a
+    # label between producer and copy, a source read again as an address, a
+    # destination redefined under a redirected read, and the 64-bit pair form.
+    ("457_retarget_producer.c", 0),
+
+    # The encoder's frame-slot reload cache reaches the 64-bit pair forms: a
+    # `ldrd rA,rB,[slot]` right after the `strd rA,rB,[slot]` that filled them
+    # is not emitted.  The cases that matter are the ones where the slot or a
+    # register changes underneath -- through a pointer, through a callee, one
+    # word at a time, or read back as volatile -- where a skipped load returns
+    # the value from before the change.
+    ("458_ldrd_after_strd.c", 0),
+
+    # global_base_share re-bases a store onto a neighbouring global's address,
+    # so `b = 1` resolves as (sym=a, off=4) while a read of `b` resolves as
+    # (sym=b, off=0).  The dead-store pass compared those by Sym* and dropped a
+    # store whose value was still being read; it compares linker addresses now.
+    ("459_global_base_share_alias.c", 0),
+
+    # cmp_imm_swap exchanges the operands of a `CMP #k, reg` so the constant
+    # lands in `cmp`'s immediate slot, which is only correct if the condition is
+    # mirrored on every reader of the flags.
+    ("460_cmp_imm_swap.c", 0),
+
+    # One level of a recursive function is expanded into itself at -O1/-O2.
+    # Static instruction counts cannot tell a correctly guarded expansion from
+    # one whose copy escaped the guard, so count the side effects at run time.
+    ("461_self_inline_side_effects.c", 0),
+
+    # ssa:switch_fold indexed the frontend's already-normalized selector with
+    # the raw case value, so a constant `switch` over a table whose lowest case
+    # is not 0 ran the wrong arm.
+    ("462_switch_fold_nonzero_min.c", 0),
+
+    # Loop rotation relocates the body; a SWITCH_TABLE's arm indices live
+    # outside the instruction stream and were left pointing at the old slots.
+    ("463_rotate_switch_in_body.c", 0),
+
+    # loop_relayout matched only a single-test `CMP; JUMPIF; JUMP` header, so
+    # any short-circuit loop condition kept both trampoline jumps.  Covers the
+    # multi-test header shapes plus the edges the permutation has to remap:
+    # a `||` test branching into the body, continue/break, nesting, siblings.
+    ("464_relayout_multitest_header.c", 0),
+
+    # The linear scan models a value as one [start,end] range, so a value read
+    # in only ONE arm of a diamond looks live in the other and a temp defined
+    # there spilled with registers going spare.  ra:alive_share hands it a
+    # register whose owner is provably dead across its range; these are the
+    # shapes where that would be a wrong-VALUE bug if the liveness were wrong.
+    ("465_alive_share_regalloc.c", 0),
+
+    # licm_global_load's gate was "does the loop write ANY global", so a loop
+    # filling one global array reloaded an unrelated global scalar every
+    # iteration.  A store to `&G + <variable>` cannot reach another object;
+    # a CONSTANT offset can, because global_base_share re-bases a store onto a
+    # neighbour's address.  Both directions are covered here.
+    ("466_licm_global_load_alias.c", 0),
+
+    # Scaled derefs reduced to a pointer walk that ends post-indexed
+    # (iv_scaled_deref + ra:load_postinc/ra:store_postinc): correctness pins
+    # for walk/index desync, write-back register, and fused store placement.
+    # (Shipped with the pass but missed from this list.)
+    ("467_scaled_deref_ptr_walk_postinc.c", 0),
+
+    # memmove_to_indexed_stores relocated a covered temp's stores onto the
+    # memcpy DESTINATION as anonymous StackLoc writes.  When that destination
+    # is a NAMED local (the inlined memcpy type-pun shape), the anonymous
+    # stores are invisible to every name-keyed analysis and the anonymous
+    # StackLoc DCE deletes them, leaving the named load reading uninitialized
+    # frame — the self-host break where the device tcc rejected every 'ldr'.
+    # The relocated stores must keep the destination var's vreg identity.
+    ("468_memmove_fold_named_dst.c", 0),
+
+    # A clamp diamond whose bound phi copy is identity-elided by
+    # post_ra_forward_diamond (phi_pinned share): ra_copy_propagate /
+    # ra_retarget_producer must not delete or retarget the pinned def, or the
+    # shared register enters the loop holding a stale pointer and the loop
+    # bound becomes an address (the 04_for.c on-device self-host HardFault).
+    ("469_phi_pinned_copy_prop.c", 0),
+
     # Compile-time strlen constant folding
     ("171_strlen_constfold.c", 0),
 

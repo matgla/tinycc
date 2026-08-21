@@ -1,0 +1,11 @@
+i=-2 pick=-70 off=900
+i=-1 pick=-70 off=900
+i=0 pick=70 off=900
+i=1 pick=71 off=900
+i=2 pick=72 off=900
+i=3 pick=73 off=7
+i=4 pick=74 off=6
+i=5 pick=-70 off=4
+i=6 pick=-70 off=8
+i=7 pick=-70 off=900
+sum=8448

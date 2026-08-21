@@ -688,7 +688,10 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    int is_store = (q->op == TCCIR_OP_STORE);
+    /* BLOCK_COPY's dest is a pure write of a bounded range (size in src2), just
+     * like a STORE's -- recording it as a read would make every copy into a
+     * frame buffer look live and no dead one could ever be removed. */
+    int is_store = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_BLOCK_COPY);
 
     for (int k = 0; k < 4; k++)
     {

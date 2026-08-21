@@ -123,6 +123,14 @@ OPT_GEN_SSA(narrow_and, TCCIR_OP_AND) {
   if (pop == TCCIR_OP_SHR) {
     if (!is_imm32(psrc2))
       return 0;
+    /* 32-bit shifts only, for the same reason narrow_shr states above: `max_bits`
+     * below counts the bits a shift can leave live, and at INT64 a `>> 28`
+     * leaves 36 of them, not 4.  Without this the mask was dropped outright --
+     * `(u64 >> 28) & 0xFF` returned the whole 36-bit shift result.  The 64-bit
+     * form with a count of 32 or more is a high-word field and belongs to
+     * source/opt/flat/fusion/shift64_extract_ubfx.c. */
+    if (irop_is_64bit(pdest) || irop_is_64bit(psrc1) || irop_is_64bit(dest) || irop_is_64bit(src1))
+      return 0;
     int32_t shift = (int32_t)imm(psrc2);
     if (shift <= 0 || shift >= 32)
       return 0;
@@ -154,8 +162,12 @@ OPT_GEN_SSA(narrow_ubfx, TCCIR_OP_UBFX) {
 
   int32_t param = (int32_t)imm(src2);
   int lsb = param & 31, width = (param >> 5) & 63, n = (int)imm(psrc2);
+  /* UBFX_HI_HALF reads the high word of a 64-bit source, so its lsb is an
+   * offset within that word and adding a shift count to it names a different
+   * field.  See source/opt/flat/fusion/shift64_extract_ubfx.c. */
   GUARD(
-    when(width > 0);
+    when(!(param & UBFX_HI_HALF));
+    and(width > 0);
     and(n > 0 && n < 32);
     and(lsb + n + width <= 32));
 

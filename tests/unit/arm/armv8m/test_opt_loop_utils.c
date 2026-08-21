@@ -684,13 +684,20 @@ UT_TEST(test_loop_size_cmp_orders_ascending_by_span)
 
 /* ============================================ transform_derived_iv */
 
-UT_TEST(test_transform_derived_iv_skips_memory_feeding_div)
+UT_TEST(test_transform_derived_iv_allows_address_slot_deref)
 {
-  /* A DIV whose computed address is dereferenced inside the loop must be
-   * SKIPPED (docs/bugs.md #2): the escape scan in transform_derived_iv
-   * (sr_div_value_stays_in_regs) sees the lval read of the address temp and
-   * disqualifies the DIV.  The function is a no-op and all out-params keep
-   * their "nothing happened" sentinels. */
+  /* A DIV whose address is dereferenced in the ADDRESS SLOT of a plain
+   * load/store IS reduced.  That is the whole point of an IV-derived address
+   * (`a[i]`), and the rewrite preserves it: the defining ADD becomes
+   * `T = ptr`, and ptr holds the identical base + i*stride at that point.
+   *
+   * The escape scan used to refuse this outright, which made `escape scan ...
+   * feeds_mem=1` the most common rejection across the benchmark sources; it
+   * now admits the address slot of a LOAD src1 / STORE dest and still catches
+   * an address that is PUBLISHED -- see
+   * test_transform_derived_iv_skips_published_address.  Whether such a DIV is
+   * worth reducing is a separate question decided earlier, in
+   * find_derived_ivs: see test_find_derived_ivs_scaled_deref_skipped. */
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
   utb_init_temp_intervals(ir, /*reserved=*/4); /* TEMP0..3 hand-used below */
@@ -729,17 +736,17 @@ UT_TEST(test_transform_derived_iv_skips_memory_feeding_div)
 
   int ret = transform_derived_iv(ir, &L, &iv, &div, &out_ptr_vreg, &out_idx_shift, &out_postnop, &out_stride_pos, -1);
 
-  UT_ASSERT_EQ(ret, 0);
-  /* Out-params reset to "nothing happened" sentinels. */
-  UT_ASSERT_EQ(out_ptr_vreg, -1);
-  UT_ASSERT_EQ(out_idx_shift, 0);
-  UT_ASSERT_EQ(out_postnop, -1);
-  UT_ASSERT_EQ(out_stride_pos, -1);
-  /* No instructions inserted, nothing rewritten. */
-  UT_ASSERT_EQ(ir->next_instruction_index, n_before);
-  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_SHL);
-  UT_ASSERT_EQ(utb_op(ir, 4), TCCIR_OP_ADD);
-  UT_ASSERT_EQ(utb_op(ir, 5), TCCIR_OP_LOAD);
+  UT_ASSERT_EQ(ret, 3); /* full success: init + replace + stride */
+  UT_ASSERT(out_ptr_vreg >= 0);
+  UT_ASSERT_EQ(out_idx_shift, 1); /* init_val == 0 -> single `ptr = base` ASSIGN */
+  UT_ASSERT_EQ(out_postnop, -1);  /* no INDEXED rewrite -> no postnop slot */
+  /* Preheader init and the stride bump were both inserted. */
+  UT_ASSERT_EQ(ir->next_instruction_index, n_before + 2);
+  /* The SHL is gone and the ADD became the `T2 = ptr` copy; the LOAD still
+   * dereferences T2, so the memory access is preserved exactly. */
+  UT_ASSERT_EQ(utb_op(ir, 4), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, 5), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, 6), TCCIR_OP_LOAD);
 
   utb_free(ir);
   return 0;
@@ -1058,15 +1065,21 @@ UT_TEST(test_eliminate_loop_zero_trip_gives_up)
 
 UT_TEST(test_find_derived_ivs_shl_add_pattern)
 {
-  /* Classic address-computation DIV: T1 = V0 << 2; T2 = base + T1; STORE [T2].
+  /* Classic address-computation DIV: T1 = V0 << 2; T2 = base + T1.
    * base is an immediate (no vreg) so it's trivially loop-invariant.
-   * find_derived_ivs requires loop->body_instrs[] populated explicitly. */
+   * find_derived_ivs requires loop->body_instrs[] populated explicitly.
+   *
+   * T2 is consumed by plain arithmetic rather than a dereference: a SCALED
+   * address that is actually dereferenced is now rejected on purpose (it folds
+   * into the addressing mode anyway), which is pinned separately by
+   * test_find_derived_ivs_scaled_deref_skipped.  This case keeps the coverage
+   * of the SHL+ADD recognition itself -- stride, use_idx and shl_idx. */
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);      /* 0 preheader */
   utb_emit(ir, TCCIR_OP_SHL, utb_temp(1, I32), utb_var(0, I32), utb_imm(2, I32)); /* 1 shl */
   utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_imm(200, I32), utb_temp(1, I32)); /* 2 addr=base+shl */
-  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(2, I32)), utb_var(0, I32), UTB_NONE); /* 3 STORE *addr=V0 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(3, I32), utb_temp(2, I32), utb_imm(1, I32)); /* 3 reg-only use */
   utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 4 iv inc */
   utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);               /* 5 back-edge */
 
@@ -1092,16 +1105,186 @@ UT_TEST(test_find_derived_ivs_shl_add_pattern)
   return 0;
 }
 
+UT_TEST(test_find_derived_ivs_scaled_deref_skipped)
+{
+  /* The same SHL+ADD address as test_find_derived_ivs_shl_add_pattern, but the
+   * address IS dereferenced (`STORE *T2`).  Rejected on purpose: the indexed
+   * memory fusion folds `base + (i << k)` into the load/store addressing mode,
+   * so the SHL+ADD this transform would delete never reaches the machine and
+   * the rewrite only trades `str.w r,[base,i,lsl #2]` for `str r,[p]` +
+   * `adds p,#4`.  Measured in situ that trade LOSES -- mibench_stringsearch
+   * +12.4%, a reproducible +1 cycle per element.
+   *
+   * The ONE exception is the post-indexed shape
+   * (iv_scaled_deref_postinc_viable): an eliminable counter whose address
+   * feeds only plain INT32 accesses, where the bump folds into the access
+   * (`str r,[p],#4`) and the walk drops an instruction instead of trading
+   * even.  This loop has NO loop test at all, so the counter is not
+   * eliminable and the rejection stands; the admitted variant is
+   * test_find_derived_ivs_scaled_deref_postinc_admitted.  The UNSCALED form
+   * (fourth pass) is always worth reducing, because a byte access off a stack
+   * base is never folded. */
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);      /* 0 */
+  utb_emit(ir, TCCIR_OP_SHL, utb_temp(1, I32), utb_var(0, I32), utb_imm(2, I32)); /* 1 shl */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_imm(200, I32), utb_temp(1, I32)); /* 2 addr */
+  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(2, I32)), utb_var(0, I32), UTB_NONE); /* 3 deref */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 4 iv inc */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);               /* 5 */
+
+  IRLoop L = utb_loop(1, 1, 5, 0);
+  int body[] = {1, 2, 3, 4};
+  L.body_instrs = body;
+  L.num_body_instrs = 4;
+
+  InductionVar ivs[4];
+  int num_ivs = find_induction_vars_ex(ir, &L, ivs, 4, 0);
+  UT_ASSERT_EQ(num_ivs, 1);
+
+  DerivedIV divs[4];
+  UT_ASSERT_EQ(find_derived_ivs(ir, &L, ivs, num_ivs, divs, 4), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* Shared scaffold for the postinc-viable admission cases: an ELIMINABLE
+ * counted loop (header CMP V0,#64 + JUMPIF exit) whose SHL+ADD address feeds
+ * one plain STORE.  The variations poke exactly one gate each. */
+static TCCIRState *utb_scaled_deref_counted_loop(IROperand store_dest, IROperand store_val, int shl_amount)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);      /* 0 preheader init */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(64, I32));        /* 1 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(99, I32), utb_imm(UT_GE, I32), UTB_NONE); /* 2 exit */
+  utb_emit(ir, TCCIR_OP_SHL, utb_temp(1, I32), utb_var(0, I32), utb_imm(shl_amount, I32)); /* 3 shl */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_imm(200, I32), utb_temp(1, I32)); /* 4 addr */
+  utb_emit(ir, TCCIR_OP_STORE, store_dest, store_val, UTB_NONE);                  /* 5 deref */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32)); /* 6 iv inc */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);              /* 7 back-edge */
+  return ir;
+}
+
+static int utb_scaled_deref_num_divs(TCCIRState *ir, DerivedIV *divs)
+{
+  IRLoop L = utb_loop(1, 1, 7, 0);
+  int body[] = {3, 4, 5, 6};
+  L.body_instrs = body;
+  L.num_body_instrs = 4;
+
+  InductionVar ivs[4];
+  int num_ivs = find_induction_vars_ex(ir, &L, ivs, 4, 0);
+  if (num_ivs != 1)
+    return -1; /* scaffold broke — callers assert on the count and will FAIL */
+  return find_derived_ivs(ir, &L, ivs, num_ivs, divs, 4);
+}
+
+UT_TEST(test_find_derived_ivs_scaled_deref_postinc_admitted)
+{
+  /* The rejected shape from test_find_derived_ivs_scaled_deref_skipped made
+   * postinc-viable: the counter is eliminable (CMP V0,#64 + JUMPIF exit, no
+   * other IV uses beyond the whitelisted SHL) and the address feeds exactly
+   * one plain INT32 STORE with a register value.  The walk this becomes ends
+   * in `str r,[p],#4` (ra:store_postinc), which is the shape where reducing
+   * a SCALED deref WINS — so iv_scaled_deref_postinc_viable admits it. */
+  TCCIRState *ir = utb_scaled_deref_counted_loop(utb_lval(utb_temp(2, I32)), utb_var(1, I32), 2);
+  DerivedIV divs[4];
+  int num_divs = utb_scaled_deref_num_divs(ir, divs);
+  UT_ASSERT_EQ(num_divs, 1);
+  UT_ASSERT_EQ(divs[0].stride, 4);
+  UT_ASSERT_EQ(divs[0].use_idx, 4);
+  UT_ASSERT_EQ(divs[0].shl_idx, 3);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_find_derived_ivs_scaled_deref_narrow_access_skipped)
+{
+  /* Same eliminable loop, but the access is INT16.  A narrow access is
+   * outside what the postinc fusion folds (loads widen; the ra matcher
+   * requires the btypes to agree), so the walk would keep its separate
+   * `adds p,#k` — the measured losing trade.  Stays rejected. */
+  TCCIRState *ir = utb_scaled_deref_counted_loop(utb_lval(utb_temp(2, IROP_BTYPE_INT16)),
+                                                 utb_var(1, IROP_BTYPE_INT16), 1);
+  DerivedIV divs[4];
+  UT_ASSERT_EQ(utb_scaled_deref_num_divs(ir, divs), 0);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_find_derived_ivs_scaled_deref_big_stride_skipped)
+{
+  /* Same eliminable loop with SHL #8: stride 256 is beyond the post-index
+   * immediate range (1..255), so the bump cannot fold and the rejection
+   * stands. */
+  TCCIRState *ir = utb_scaled_deref_counted_loop(utb_lval(utb_temp(2, I32)), utb_var(1, I32), 8);
+  DerivedIV divs[4];
+  UT_ASSERT_EQ(utb_scaled_deref_num_divs(ir, divs), 0);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_find_derived_ivs_scaled_deref_imm_value_skipped)
+{
+  /* Same eliminable loop storing an IMMEDIATE.  ra:store_postinc only fuses
+   * a register value, so the fused shape is not assured and the rejection
+   * stands. */
+  TCCIRState *ir = utb_scaled_deref_counted_loop(utb_lval(utb_temp(2, I32)), utb_imm(7, I32), 2);
+  DerivedIV divs[4];
+  UT_ASSERT_EQ(utb_scaled_deref_num_divs(ir, divs), 0);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_find_derived_ivs_mla_scaled_deref_postinc_admitted)
+{
+  /* MLA counterpart of the admitted case: the fused MLA is itself the
+   * whitelisted IV use, the counter is eliminable, and the address feeds one
+   * plain INT32 STORE with a register value. */
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);      /* 0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(64, I32));        /* 1 header */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(99, I32), utb_imm(UT_GE, I32), UTB_NONE); /* 2 exit */
+  utb_emit4(ir, TCCIR_OP_MLA, utb_temp(1, I32), utb_var(0, I32), utb_imm(12, I32),
+            utb_stackoff(200, 0, 0, 0, I32));                                     /* 3 mla addr */
+  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(1, I32)), utb_var(1, I32), UTB_NONE); /* 4 deref */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 5 iv inc */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);               /* 6 back-edge */
+
+  IRLoop L = utb_loop(1, 1, 6, 0);
+  int body[] = {3, 4, 5};
+  L.body_instrs = body;
+  L.num_body_instrs = 3;
+
+  InductionVar ivs[4];
+  int num_ivs = find_induction_vars_ex(ir, &L, ivs, 4, 0);
+  UT_ASSERT_EQ(num_ivs, 1);
+
+  DerivedIV divs[4];
+  int num_divs = find_derived_ivs(ir, &L, ivs, num_ivs, divs, 4);
+  UT_ASSERT_EQ(num_divs, 1);
+  UT_ASSERT_EQ(divs[0].stride, 12);
+  UT_ASSERT_EQ(divs[0].use_idx, 3);
+  UT_ASSERT_EQ(divs[0].shl_idx, -1); /* fused into the MLA */
+
+  utb_free(ir);
+  return 0;
+}
+
 UT_TEST(test_find_derived_ivs_mul_variant_and_operand_order)
 {
   /* T1 = V0 * 8 (MUL, not SHL); T2 = T1 + base (SHL/MUL result in src1, base
-   * in src2 — the "check src1" fallback path). */
+   * in src2 — the "check src1" fallback path).  Reg-only use of T2, for the
+   * reason given in test_find_derived_ivs_shl_add_pattern. */
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);      /* 0 */
   utb_emit(ir, TCCIR_OP_MUL, utb_temp(1, I32), utb_var(0, I32), utb_imm(8, I32)); /* 1 mul */
   utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(1, I32), utb_imm(200, I32)); /* 2 addr=mul+base */
-  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(2, I32)), utb_var(0, I32), UTB_NONE); /* 3 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(3, I32), utb_temp(2, I32), utb_imm(1, I32)); /* 3 reg-only use */
   utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 4 */
   utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);               /* 5 */
 
@@ -1187,13 +1370,16 @@ UT_TEST(test_find_derived_ivs_dead_add_result_skipped)
 UT_TEST(test_find_derived_ivs_mla_fused_pattern)
 {
   /* Second pass: MLA-fused DIV.  dest = V0 * 4 + accum, accum loop-invariant
-   * (a STACKOFF base, never redefined in the loop). */
+   * (a STACKOFF base, never redefined in the loop).  Reg-only use of the
+   * result: an MLA address is scaled by construction, so dereferencing it is
+   * rejected for the same reason as the ADD pass -- pinned by
+   * test_find_derived_ivs_mla_scaled_deref_skipped. */
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE); /* 0 */
   utb_emit4(ir, TCCIR_OP_MLA, utb_temp(1, I32), utb_var(0, I32), utb_imm(4, I32),
             utb_stackoff(200, 0, 0, 0, I32));                                /* 1 mla */
-  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(1, I32)), utb_var(0, I32), UTB_NONE); /* 2 use */
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_temp(1, I32), utb_imm(1, I32)); /* 2 reg-only use */
   utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 3 */
   utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);               /* 4 */
 
@@ -1213,6 +1399,38 @@ UT_TEST(test_find_derived_ivs_mla_fused_pattern)
   UT_ASSERT_EQ(divs[0].stride, 4);
   UT_ASSERT_EQ(divs[0].use_idx, 1);
   UT_ASSERT_EQ(divs[0].shl_idx, -1); /* fused — nothing to NOP */
+
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_find_derived_ivs_mla_scaled_deref_skipped)
+{
+  /* MLA counterpart of test_find_derived_ivs_scaled_deref_skipped.  An
+   * MLA-derived address is scaled by construction, so a dereference folds into
+   * the addressing mode just the same; the MLA pass carries its own copy of
+   * the rejection (and of the postinc-viable exception — this loop has no
+   * loop test AND stores the IV itself, so it stays rejected). */
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE); /* 0 */
+  utb_emit4(ir, TCCIR_OP_MLA, utb_temp(1, I32), utb_var(0, I32), utb_imm(4, I32),
+            utb_stackoff(200, 0, 0, 0, I32));                                /* 1 mla */
+  utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(1, I32)), utb_var(0, I32), UTB_NONE); /* 2 deref */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32));  /* 3 */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);               /* 4 */
+
+  IRLoop L = utb_loop(1, 1, 4, 0);
+  int body[] = {1, 2, 3};
+  L.body_instrs = body;
+  L.num_body_instrs = 3;
+
+  InductionVar ivs[4];
+  int num_ivs = find_induction_vars_ex(ir, &L, ivs, 4, 0);
+  UT_ASSERT_EQ(num_ivs, 1);
+
+  DerivedIV divs[4];
+  UT_ASSERT_EQ(find_derived_ivs(ir, &L, ivs, num_ivs, divs, 4), 0);
 
   utb_free(ir);
   return 0;
@@ -1594,11 +1812,13 @@ UT_TEST(test_iv_sr_core_ivs_but_no_divs_yields_zero_changes)
 
 UT_TEST(test_iv_sr_core_memory_feeding_div_yields_zero)
 {
-  /* A loop WITH a genuine DIV (find_derived_ivs succeeds) whose address is
-   * stored through (`STORE *T2`) produces zero total_changes end-to-end:
-   * transform_derived_iv's escape scan disqualifies memory-feeding DIVs
-   * (see test_transform_derived_iv_skips_memory_feeding_div and
-   * docs/bugs.md #2). */
+  /* A loop whose scaled address is stored through (`STORE *T2`) produces zero
+   * total_changes end-to-end.  The rejection now happens in find_derived_ivs,
+   * which refuses a scaled address that is dereferenced (see
+   * test_find_derived_ivs_scaled_deref_skipped), so no DIV is even offered to
+   * the transform -- the escape scan that used to catch this now admits an
+   * address-slot deref (test_transform_derived_iv_allows_address_slot_deref).
+   * Either way the end-to-end answer is zero, which is what this pins. */
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);      /* 0 preheader */
@@ -1737,29 +1957,135 @@ UT_TEST(test_rotate_loop_no_backedge_declines)
   return 0;
 }
 
-UT_TEST(test_rotate_loop_call_in_body_declines)
+/* Same shape as emit_rotatable_loop, but the body is one call.  Split out so
+ * the two call-body tests differ only in the header CMP's second operand. */
+static IRLoop emit_call_body_loop(TCCIRState *ir, IROperand bound)
 {
-  /* A function call in the body blocks rotation (call-clobbered live ranges
-   * across the rotated shape). */
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
   static Sym foo;
   uint32_t sidx = tcc_ir_pool_add_symref(ir, &foo, 0, 0);
   IROperand callee = irop_make_symref(0, sidx, 0, 0, 0, I32);
 
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);     /* 0 */
-  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(5, I32));        /* 1 */
-  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(9, I32), utb_imm(UT_GE, I32), UTB_NONE); /* 2 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), bound);                  /* 1 */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(8, I32), utb_imm(UT_GE, I32), UTB_NONE); /* 2 */
   utb_emit(ir, TCCIR_OP_JUMP, utb_imm(6, I32), UTB_NONE, UTB_NONE);              /* 3 */
   utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32)); /* 4 */
   utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);              /* 5 */
   utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, callee,
            utb_imm((int32_t)TCCIR_ENCODE_CALL(0, 0), I32));                      /* 6 body call */
   utb_emit(ir, TCCIR_OP_JUMP, utb_imm(4, I32), UTB_NONE, UTB_NONE);              /* 7 */
-  IRLoop L = utb_loop(1, 1, 7, 0);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);               /* 8 exit_target */
+  return utb_loop(1, 1, 7, 0);
+}
+
+UT_TEST(test_rotate_loop_call_in_body_rotates)
+{
+  /* A call that can return no longer blocks rotation: `for (i = 0; i < 5;
+   * i++) foo();` is the shape every loop that calls anything has, and it was
+   * paying an unconditional back-edge branch per iteration for a hazard the
+   * corpus does not show.  What still has to hold is the entry guard folding
+   * (i enters as the constant 0, bound is a literal) — see the companion test
+   * below. */
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  IRLoop L = emit_call_body_loop(ir, utb_imm(5, I32));
+
+  UT_ASSERT_EQ(try_rotate_loop(ir, &L), 1);
+
+  /* Body call relocated to region_start = hi + 2 = 3, and it is the new
+   * back-edge target; latch, tail CMP and inverted tail JUMPIF follow. */
+  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_FUNCCALLVOID);
+  UT_ASSERT_EQ(ir->compact_instructions[3].is_jump_target, 1);
+  UT_ASSERT_EQ(utb_op(ir, 4), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_op(ir, 5), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, 6), TCCIR_OP_JUMPIF);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 6)), UT_LT);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_dest(ir, 6)), 3);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_rotate_loop_call_body_runtime_bound_declines)
+{
+  /* Identical but for the bound: a VAR, so rot_guard_provably_folds cannot
+   * prove the pre-loop guard untaken.  The guard then survives and rotation
+   * trades one back-edge branch for a CMP + branch — a static loss — so a
+   * call body without a folding guard is still refused. */
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  IRLoop L = emit_call_body_loop(ir, utb_var(1, I32));
 
   UT_ASSERT_EQ(try_rotate_loop(ir, &L), 0);
   UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP); /* untouched */
+  UT_ASSERT_EQ(utb_op(ir, 6), TCCIR_OP_FUNCCALLVOID);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_rotate_loop_remaps_switch_table_targets)
+{
+  /* A SWITCH_TABLE's arm indices live in ir->switch_tables[], not in the
+   * instruction stream, so the body-branch remap never walks them.  Left
+   * stale they address whatever now occupies the old slot — the arms move,
+   * the table does not.  Body [6..7] moves to [3..4], so every target in that
+   * range must shift by -3; the default target outside the region must not
+   * move at all. */
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+
+  static int targets[2];
+  targets[0] = 6; /* body start */
+  targets[1] = 7; /* body-to-latch JUMP slot */
+  TCCIRSwitchTable tables[1];
+  memset(tables, 0, sizeof tables);
+  tables[0].min_val = 0;
+  tables[0].max_val = 1;
+  tables[0].default_target = 8; /* exit_target, outside the moved region */
+  tables[0].targets = targets;
+  tables[0].num_entries = 2;
+  ir->switch_tables = tables;
+  ir->num_switch_tables = 1;
+
+  IRLoop L = emit_rotatable_loop(ir);
+  UT_ASSERT_EQ(try_rotate_loop(ir, &L), 1);
+
+  UT_ASSERT_EQ(targets[0], 3);
+  UT_ASSERT_EQ(targets[1], 4);
+  UT_ASSERT_EQ(tables[0].default_target, 8);
+
+  ir->switch_tables = NULL;
+  ir->num_switch_tables = 0;
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_rotate_loop_unmappable_switch_target_declines)
+{
+  /* A target inside the overwritten region but in neither relocated range —
+   * here the back-edge JUMP slot 5 — has no index to map to, so the whole
+   * rotation is refused rather than left pointing at a rewritten slot. */
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+
+  static int targets2[1];
+  targets2[0] = 5; /* the back-edge JUMP, which rotation replaces */
+  TCCIRSwitchTable tables[1];
+  memset(tables, 0, sizeof tables);
+  tables[0].min_val = 0;
+  tables[0].max_val = 0;
+  tables[0].default_target = 8;
+  tables[0].targets = targets2;
+  tables[0].num_entries = 1;
+  ir->switch_tables = tables;
+  ir->num_switch_tables = 1;
+
+  IRLoop L = emit_rotatable_loop(ir);
+  UT_ASSERT_EQ(try_rotate_loop(ir, &L), 0);
+  UT_ASSERT_EQ(utb_op(ir, 6), TCCIR_OP_STORE); /* body untouched */
+  UT_ASSERT_EQ(targets2[0], 5);
+
+  ir->switch_tables = NULL;
+  ir->num_switch_tables = 0;
   utb_free(ir);
   return 0;
 }

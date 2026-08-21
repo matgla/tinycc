@@ -205,6 +205,10 @@ static int rse_resolve_store_addr(TCCIRState *ir, IRQuadCompact *q,
   int op = q->op;
   if (op != TCCIR_OP_STORE && op != TCCIR_OP_STORE_INDEXED)
     return 0;
+  /* A volatile write must reach the device exactly as written: four byte
+   * stores to a volatile register block are four bus writes, not one word. */
+  if (tcc_ir_instr_access_is_volatile(ir, q))
+    return 0;
 
   int64_t extra = 0;
   if (op == TCCIR_OP_STORE_INDEXED)
@@ -575,6 +579,9 @@ static int cmd_op_lval(TCCIRState *ir, IROperand op, const Sym **sym, int64_t *o
 static int cmd_store_addr(TCCIRState *ir, IRQuadCompact *q, const Sym **sym,
                           int64_t *off, int *width)
 {
+  /* Same rule as in rse_resolve_store_addr: volatile writes don't merge. */
+  if (tcc_ir_instr_access_is_volatile(ir, q))
+    return 0;
   if (q->op == TCCIR_OP_STORE)
   {
     IROperand d = tcc_ir_op_get_dest(ir, q);

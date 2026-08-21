@@ -502,6 +502,20 @@ static int sccp_scan_block_for_stack_store(SCCPState *s, IRBasicBlock *bb,
     }
     if (sq->op == TCCIR_OP_STORE_POSTINC)
       return SCCP_BOTTOM;  /* writes to memory + updates pointer */
+    /* A BLOCK_COPY between the store and the load overwrites its whole range;
+     * without this the stale store is forwarded across a folded strcpy. */
+    if (sq->op == TCCIR_OP_BLOCK_COPY) {
+      IROperand bcd = tcc_ir_op_get_dest(ir, sq);
+      IROperand bcsz = tcc_ir_op_get_src2(ir, sq);
+      if (irop_get_tag(bcd) != IROP_TAG_STACKOFF || irop_get_vreg(bcd) != -1 ||
+          !irop_is_immediate(bcsz))
+        return SCCP_BOTTOM;
+      int bc_lo = (int)irop_get_stack_offset(bcd);
+      int bc_hi = bc_lo + (int)irop_get_imm64_ex(ir, bcsz);
+      if (bc_hi > load_lo && load_hi > bc_lo)
+        return SCCP_BOTTOM;
+      continue;
+    }
     if (sq->op == TCCIR_OP_STORE_INDEXED || sq->op == TCCIR_OP_STORE) {
       int store_btype = 0;
       int target = sccp_store_target_off(s->ctx, sq, &store_btype);
