@@ -1,0 +1,2 @@
+error:
+implicit declaration of function 'undeclared_callee'

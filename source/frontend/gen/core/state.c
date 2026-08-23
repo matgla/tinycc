@@ -370,6 +370,11 @@ ST_FUNC void tccgen_finish(TCCState *s1)
 {
   tcc_debug_end(s1); /* just in case of errors: free memory */
 
+  /* An error raised while a call site was replaying an inline body longjmps
+     past inline_restore_label_bindings(), stranding the token/label arrays it
+     would have freed. */
+  inline_release_hidden_label_bindings();
+
   str_lit_pool_free();
 
   /* Release per-TU function write summaries (Sym* keys are about to become

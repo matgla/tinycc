@@ -289,9 +289,14 @@ def test_diagnostics(
     name, c_file, golden, frontend_compiler, tmp_path, request
 ):
     updating = request.config.getoption("--update")
-    result, cmd = _run_compiler(
-        frontend_compiler, ["-Werror", "-c"], c_file, tmp_path
-    )
+    # Optional per-case flags: a sibling <case>.flags file, whitespace
+    # separated. Needed for cases that only arise under optimization (the
+    # auto-inliner, for one, does nothing at -O0).
+    cflags = ["-Werror", "-c"]
+    flags_file = c_file.with_suffix(".flags")
+    if flags_file.exists():
+        cflags += flags_file.read_text().split()
+    result, cmd = _run_compiler(frontend_compiler, cflags, c_file, tmp_path)
 
     if result.returncode == 0:
         raise AssertionError(
@@ -300,6 +305,16 @@ def test_diagnostics(
         )
 
     actual = result.stderr
+
+    # An ASan/LSan report on an error path means the unwind out of the parser
+    # skipped a free -- see diagnostics/inline_body_error.c, where a compile
+    # error inside an inlined body leaked the hidden-label arrays. The
+    # substring check below passes either way, so flag it here instead.
+    if "Sanitizer:" in actual:
+        raise AssertionError(
+            f"Sanitizer report on the error path for diagnostics/{name}\n"
+            f"Command: {' '.join(cmd)}\n{actual}"
+        )
 
     if updating:
         golden.write_text(actual)

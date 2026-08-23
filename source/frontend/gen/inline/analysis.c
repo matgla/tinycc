@@ -889,6 +889,69 @@ void inline_scan_body_features(TokenString *func_str, int *has_addr_of_label, in
   }
 }
 
+/* Live hidden-label frames, innermost last.
+ *
+ * A compile error inside a replayed inline body longjmps straight out of
+ * unary_funcall to tcc_compile's setjmp, so the inline_restore_label_bindings()
+ * that owns the two allocations below never runs -- ASan reported them as a
+ * 72-byte leak on every -Werror=implicit-function-declaration hit in the toybox
+ * build, which buried the real diagnostic.  Recording the frames lets the TU
+ * teardown reclaim whatever the unwind skipped.  The array itself is reachable
+ * from a static and reused across TUs, so it is not itself a leak. */
+typedef struct HiddenLabelFrame
+{
+  int *tokens;
+  Sym **saved_labels;
+} HiddenLabelFrame;
+
+static HiddenLabelFrame *hidden_label_frames;
+static int nb_hidden_label_frames;
+static int hidden_label_frames_capacity;
+
+static void inline_push_hidden_label_frame(int *tokens, Sym **saved_labels)
+{
+  if (nb_hidden_label_frames >= hidden_label_frames_capacity)
+  {
+    hidden_label_frames_capacity = hidden_label_frames_capacity ? hidden_label_frames_capacity * 2 : 8;
+    hidden_label_frames =
+        tcc_realloc(hidden_label_frames, hidden_label_frames_capacity * sizeof(*hidden_label_frames));
+  }
+  hidden_label_frames[nb_hidden_label_frames].tokens = tokens;
+  hidden_label_frames[nb_hidden_label_frames].saved_labels = saved_labels;
+  nb_hidden_label_frames++;
+}
+
+/* Expansions nest strictly, so the matching frame is normally the top one; scan
+ * anyway rather than trust that and drop somebody else's. */
+static void inline_pop_hidden_label_frame(int *tokens)
+{
+  for (int i = nb_hidden_label_frames - 1; i >= 0; --i)
+  {
+    if (hidden_label_frames[i].tokens != tokens)
+      continue;
+    for (int j = i + 1; j < nb_hidden_label_frames; ++j)
+      hidden_label_frames[j - 1] = hidden_label_frames[j];
+    nb_hidden_label_frames--;
+    return;
+  }
+}
+
+/* Called from tccgen_finish() on both the normal and the aborted path.  The
+ * saved sym_label pointers are deliberately NOT written back: the TU teardown
+ * pops label_stack right after this, which restores those bindings itself, and
+ * the values we hold would be stale by then. */
+void inline_release_hidden_label_bindings(void)
+{
+  while (nb_hidden_label_frames > 0)
+  {
+    HiddenLabelFrame *f = &hidden_label_frames[--nb_hidden_label_frames];
+    tcc_free(f->saved_labels);
+    tcc_free(f->tokens);
+    f->saved_labels = NULL;
+    f->tokens = NULL;
+  }
+}
+
 static int inline_collect_ident_tokens(TokenString *func_str, int **tokens_out)
 {
   const int *tp;
@@ -954,11 +1017,13 @@ Sym **inline_hide_label_bindings(TokenString *func_str, int **tokens_out, int *c
 
   *tokens_out = tokens;
   *count_out = count;
+  inline_push_hidden_label_frame(tokens, saved_labels);
   return saved_labels;
 }
 
 void inline_restore_label_bindings(int *tokens, Sym **saved_labels, int count)
 {
+  inline_pop_hidden_label_frame(tokens);
   for (int i = 0; i < count; ++i)
   {
     int ident_idx = tokens[i] - TOK_IDENT;

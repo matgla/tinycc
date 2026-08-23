@@ -472,6 +472,7 @@ int inline_body_has_unsafe_loops(TokenString *func_str);
 int inline_body_has_unsafe_shadowed_ident(TokenString *func_str, Sym *call_func_sym);
 Sym **inline_hide_label_bindings(TokenString *func_str, int **tokens_out, int *count_out);
 void inline_restore_label_bindings(int *tokens, Sym **saved_labels, int count);
+void inline_release_hidden_label_bindings(void);
 void inline_scan_body_features(TokenString *func_str, int *has_addr_of_label, int *has_inline_asm);
 int nested_callee_captures_reachable(TCCState *s, Sym *call_func_sym, NestedFunc *current_nf);
 int nested_callee_has_genuine_capture(TCCState *s, Sym *call_func_sym);
