@@ -374,14 +374,20 @@ int tcc_ir_opt_deref_operand_cse(TCCIRState *ir)
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
 
+    /* The entry-point flush comes BEFORE the NOP skip: a branch target is an
+     * index, and earlier passes routinely blank the instruction sitting at one
+     * (a JUMPIF's else-arm, a collapsed block).  Control still arrives there
+     * and falls through, so skipping the flush would let a region span the
+     * join and hand the merge block a temp only one predecessor defines. */
     if (i > 0 && entry_map[i])
     {
       changes += docse_flush(ir, entries, &num_entries, &i, &n, &entry_map);
       q = &ir->compact_instructions[i];
     }
+
+    if (q->op == TCCIR_OP_NOP)
+      continue;
 
     if (docse_clobbers(ir, q))
     {

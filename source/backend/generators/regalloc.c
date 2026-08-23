@@ -336,6 +336,12 @@ static void run_register_coalescing(TCCIRState *ir)
     IRLiveInterval *hint_iri = tcc_ir_vreg_live_interval(ir, hint_li->vreg);
     if (!hint_iri || hint_iri->incoming_reg0 < 0)
       continue;
+    /* An identity phi copy that was deleted because its two vregs share a
+     * register leaves nothing in the IR to keep them in sync; phi_pinned says
+     * so.  Swapping such an interval's register here silently un-pairs them
+     * and the merge block reads a register one predecessor never wrote. */
+    if (hint_iri->phi_pinned)
+      continue;
 
     int wanted_reg = hint_iri->incoming_reg0;
     if (hint_li->r0 == wanted_reg)
@@ -355,6 +361,14 @@ static void run_register_coalescing(TCCIRState *ir)
       {
         blocker = NULL;
         break;
+      }
+      {
+        IRLiveInterval *b_iri = tcc_ir_vreg_live_interval(ir, b->vreg);
+        if (b_iri && b_iri->phi_pinned)
+        {
+          blocker = NULL;
+          break;
+        }
       }
       blocker = b;
       break;

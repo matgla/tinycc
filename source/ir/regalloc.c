@@ -7779,6 +7779,21 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
      * (the other members keep the class register), corrupting the value. */
     if (src_iv->co_member || dst_iv->co_member) continue;
 
+    /* Nor a phi-pinned one.  post_ra_forward_diamond / ra_phi_copy_needed
+     * delete an identity phi copy precisely BECAUSE its two vregs already sit
+     * in one register, and set phi_pinned to say the pairing is now load
+     * bearing: no instruction is left that would re-establish it.  Moving
+     * either endpoint to a different register here silently un-pairs them, and
+     * the merge block reads a register the elided-copy path never wrote.
+     * (Same guard as ra_copy_propagate / ra_retarget_producer above; this loop
+     * reassigns registers rather than rewriting operands, so it needs it too.) */
+    {
+      IRLiveInterval *src_ir_iv = tcc_ir_vreg_live_interval(ir, sv);
+      IRLiveInterval *dst_ir_iv = tcc_ir_vreg_live_interval(ir, dv);
+      if ((src_ir_iv && src_ir_iv->phi_pinned) || (dst_ir_iv && dst_ir_iv->phi_pinned))
+        continue;
+    }
+
     /* Forward direction: reassign dest to use src's register.
      * Requires src to die at this ASSIGN. */
     if (src_iv->end == (uint32_t)i) {

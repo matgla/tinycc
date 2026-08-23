@@ -283,12 +283,24 @@ int tcc_ir_opt_global_deref_cse(TCCIRState *ir)
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
+
+    /* A jump target can be entered from elsewhere, so it ends the region
+     * before this instruction.  Tested BEFORE the NOP skip, because earlier
+     * passes blank the instruction that sits at a branch target often enough
+     * (a folded guard, a collapsed else arm) that skipping it would let a
+     * region span the join and hand the merge block a temp only one
+     * predecessor defines. */
+    if (i > 0 && q->is_jump_target)
+    {
+      changes += gdcse_flush(ir, entries, &num_entries, &i, &n);
+      q = &ir->compact_instructions[i];
+    }
+
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    /* A jump target can be entered from elsewhere, and a clobber can rewrite
-     * what was read: both end the region before this instruction. */
-    if ((i > 0 && q->is_jump_target) || gdcse_clobbers(ir, q))
+    /* A clobber can rewrite what was read: it ends the region too. */
+    if (gdcse_clobbers(ir, q))
     {
       changes += gdcse_flush(ir, entries, &num_entries, &i, &n);
       q = &ir->compact_instructions[i];

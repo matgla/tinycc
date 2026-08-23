@@ -556,6 +556,25 @@ TEST_FILES = [
     # bound becomes an address (the 04_for.c on-device self-host HardFault).
     ("469_phi_pinned_copy_prop.c", 0),
 
+    # loop_relayout runs to a fixpoint, and its own previous iteration leaves
+    # the body's early-exit block between the trampoline and the back edge.
+    # The leading latch gap is treated as dead NOPs -- never copied into the
+    # permuted buffer, folded onto the increment by relayout_map -- so that
+    # live `return` was deleted and every branch to it retargeted at the loop
+    # increment.  Needs a dense (contiguous-case) switch to reach the second
+    # iteration; this is dce_var_liveness's own bail-out shape, whose loss made
+    # the self-hosted tcc drop stores to nested-function captures.
+    ("470_relayout_live_latch_gap.c", 0),
+
+    # deref_operand_cse / global_deref_cse end their region at every entry
+    # point, but the scan skipped NOPs FIRST -- and a branch target is an
+    # index, whose instruction earlier passes routinely blank.  The region then
+    # spanned the join and the merge block read a CSE temp only the
+    # fall-through predecessor had defined.  This is lcs_try_candidate's own
+    # eff_start/eff_end shape, which is why the self-hosted tcc folded away
+    # loops that should have run (74 of 78 QEMU failures, 2026-08-23).
+    ("471_deref_cse_nop_join.c", 0),
+
     # Compile-time strlen constant folding
     ("171_strlen_constfold.c", 0),
 

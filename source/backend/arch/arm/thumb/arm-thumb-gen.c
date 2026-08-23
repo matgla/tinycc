@@ -2361,10 +2361,34 @@ static void mov_equiv_record_mov(int rd, int rm)
  * caller passing a shift, setting flags, or using IT-conditional forms
  * always emits through ot_check so that the semantics of those MOVs is
  * preserved. */
+/* Count of conditioned instructions still pending inside an IT/ITE/... block,
+ * tracked by ot().  Kept separate from mov_equiv_it_pending, which
+ * mov_equiv_reset_all() may zero mid-block.
+ *
+ * Two things must not happen while this is non-zero, both because an IT's
+ * condition mask covers a FIXED number of following instructions:
+ *
+ *  - a literal-pool flush: it emits its pool + B.W skip-branch BEFORE the
+ *    bytes of the op being emitted, so the branch would occupy a conditioned
+ *    slot, inherit the IT condition, and the opposite arm would fall through
+ *    into pool data and execute it (fuzz ptr seed 5759: O2 HardFault);
+ *  - eliding an instruction: dropping one shifts every later instruction up a
+ *    slot, so the next unconditional instruction is swallowed INTO the block
+ *    and the remaining ones take the wrong condition.
+ *
+ * ot() decrements it as each conditioned op is emitted, so on entry to the
+ * helpers below a non-zero value means "the op about to be emitted is inside
+ * an IT block". */
+static int pool_flush_it_pending;
+
 static int ot_check_mov_reg(uint32_t rd, uint32_t rm, thumb_flags_behaviour flags, thumb_shift shift,
                             thumb_enforce_encoding enc, bool in_it)
 {
-  const int coalesceable = (flags != FLAGS_BEHAVIOUR_SET) && !in_it && (shift.type == THUMB_SHIFT_NONE) && (rd < 16) &&
+  /* `in_it` is what the caller believes; pool_flush_it_pending is what ot()
+   * actually tracked.  Honour both -- a caller that forgets the flag would
+   * corrupt the block exactly as an elided conditional LDR does. */
+  const int coalesceable = (flags != FLAGS_BEHAVIOUR_SET) && !in_it && (pool_flush_it_pending == 0) &&
+                           (shift.type == THUMB_SHIFT_NONE) && (rd < 16) &&
                            (rm < 16) && thumb_gen_state.generating_function;
   if (coalesceable && (rd == rm || mov_equiv[rd] == mov_equiv[rm]))
   {
@@ -2582,6 +2606,24 @@ static void strldr_cache_record_access(int rt, int rn, int imm, uint32_t puw, in
 static int strldr_cache_try_match_ldr(int rt, int rn, int imm, uint32_t puw, int size, int width)
 {
   if (strldr_cache_off || puw != 6 || width != 4)
+    return 0;
+  /* Never answer inside an IT block.  An IT's mask conditions a FIXED number
+   * of following instructions, so eliding one pulls the next unconditional
+   * instruction into the block and shifts every remaining condition by a
+   * slot.  The shape this was found on:
+   *
+   *      str    r0,[sp,#468]        str     r0,[sp,#468]
+   *      ite    ne                  ite     ne
+   *      ldrne  r0,[sp,#468]   ->   movne.w r0,#0          <- was the eq arm
+   *      moveq.w r0,#0              ldreq.w r2,[sp,#1148]  <- swallowed in
+   *      ldr.w  r2,[sp,#1148]
+   *
+   * leaving r2 uninitialised on the ne path.  The guard belongs here rather
+   * than at the call sites because all of them -- ot_check_ldr_imm,
+   * load_word_from_base (which every spill reload takes) and the LDRD pair
+   * check -- ask through this one function.  Same reasoning as the
+   * literal-pool flush suppression that pool_flush_it_pending was added for. */
+  if (pool_flush_it_pending != 0)
     return 0;
   for (int i = 0; i < strldr_cache_count; i++)
   {
@@ -3401,16 +3443,6 @@ static int th_literal_pool_would_flush_for(int upcoming_bytes)
 
   return th_pool_span_after(upcoming_bytes) >= THUMB_POOL_RANGE_LIMIT - THUMB_POOL_FLUSH_SLACK;
 }
-
-/* Count of conditioned instructions still pending inside an IT/ITE/... block,
- * tracked by ot() purely for literal-pool flush suppression.  Kept separate
- * from mov_equiv_it_pending, which mov_equiv_reset_all() may zero mid-block.
- * While this is non-zero a pool flush would land INSIDE the IT block: the
- * flush emits its pool + B.W skip-branch BEFORE the bytes of the op being
- * emitted, so the branch would occupy a conditioned slot, inherit the IT
- * condition, and the opposite arm would fall through into pool data and
- * execute it (fuzz ptr seed 5759: O2 HardFault). */
-static int pool_flush_it_pending;
 
 int is_valid_opcode(thumb_opcode op)
 {

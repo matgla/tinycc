@@ -238,6 +238,20 @@ int try_relayout_loop(TCCIRState *ir, IRLoop *loop)
   if (body_end_jmp < 0)
     RJ("no-body-latch-jump");
 
+  /* The latch indices ahead of the one the body actually jumps to are assumed
+   * dead: they are not copied into the permuted buffer and get no index of
+   * their own, and relayout_map folds the whole span onto new_latch_start
+   * ("control continues at the increment").  That is only true for NOPs.  A
+   * live instruction there is deleted outright and every branch to it is
+   * silently retargeted at the increment -- which is what a *previous*
+   * relayout of this same loop produces: it leaves the body's early-exit
+   * block sitting between the trampoline and the back edge, and this pass
+   * runs to a fixpoint, so the next iteration sees it as a leading latch
+   * instruction.  Same reasoning as the "live-gap" check above. */
+  for (int i = latch_start; i < eff_latch_start; i++)
+    if (ir->compact_instructions[i].op != TCCIR_OP_NOP)
+      RJ("live-latch-gap");
+
   int region_start = tramp_idx;
   int region_end = body_end_jmp;
   int body_end = body_end_jmp - 1;
