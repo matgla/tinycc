@@ -5707,6 +5707,9 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
     tcc_ir_ssa_rename(ir, ssa);
   }
   tcc_ir_dump_after_pass(ir, "ssa_rename");
+  /* The same state with the joins shown -- `ssa_rename`'s flat listing reads
+   * phi destinations that nothing in it defines. */
+  tcc_ir_dump_ssa_after_pass(ir, ssa, "ssa_phi");
   dbg_scan_imm_dest(ir, "ssa_rename"); dbg_scan_overlap(ir, "ssa_rename");
   tcc_pass_timing_end(&ra2_pt, -1);
   tcc_pass_timing_begin(&ra2_pt, "ra2:ssaopt");
@@ -5888,6 +5891,8 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
      * docs/plans/gap_a_ssa_var_index_addr_prop.md (gap ②). */
     tcc_ir_ssa_opt_free(&ssa_opt_ctx);
   }
+  /* And once the passes have had it: which phis survived them. */
+  tcc_ir_dump_ssa_after_pass(ir, ssa, "ssa_phi_opt");
   dbg_scan_imm_dest(ir, "ssa_opt_block"); dbg_scan_overlap(ir, "ssa_opt_block");
 
   /* Set types from operand btypes (same as tcc_ir_live_analysis).
@@ -5981,6 +5986,10 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   tcc_pass_timing_begin(&ra2_pt, "ra2:phis_folds");
   ra_resolve_phis(ir, cfg, ssa, &phi_stats);
   ra_phi_resolve_pre_ra_mode = 0;
+  /* The one edit that makes a phi disappear: every dump before this one can
+   * have phis in it (with -dump-ir-passes=ssa_phi to see them) and no dump
+   * after it can, because there is no phi left to show. */
+  tcc_ir_dump_after_pass(ir, "ra_resolve_phis");
   dbg_scan_imm_dest(ir,"ra_resolve_phis");
 
   /* Collapse "TMP <- const; T_phi <- TMP" chains the phi resolver leaves

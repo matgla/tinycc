@@ -783,6 +783,15 @@ void tcc_ir_dump_set_show_physical_regs(int show);
  * the SSA optimizer driver in ir/opt/ssa_opt.c). */
 int tcc_ir_dump_passes_match(TCCState *s, const char *pass_name);
 void tcc_ir_dump_after_pass(TCCIRState *ir, const char *pass_name);
+/* The same dump, printed the way SSA is written down: one section per basic
+ * block, the phi nodes at the head of it, then that block's instructions.  A
+ * phi is NOT in the instruction array -- it lives in IRSSAState.block_phis --
+ * so the flat dump above cannot show one at all, and its listing after
+ * `ssa_rename` reads names nothing in it defines.  Selected by the same
+ * -dump-ir-passes=<name> list; the pipeline offers `ssa_phi` (straight after
+ * renaming) and `ssa_phi_opt` (after the SSA pass pipeline). */
+struct IRSSAState;
+void tcc_ir_dump_ssa_after_pass(TCCIRState *ir, struct IRSSAState *ssa, const char *pass_name);
 void tcc_ir_set_addrtaken(TCCIRState *ir, int vreg);
 
 IRLiveInterval *tcc_ir_get_live_interval(TCCIRState *ir, int vreg);

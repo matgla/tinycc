@@ -744,3 +744,101 @@ void tcc_ir_show(TCCIRState *ir)
 {
   tcc_ir_dump(ir, stdout);
 }
+
+/* Print the function the way SSA is written down: one section per basic block,
+ * the phi nodes at the head of it, then that block's instructions.
+ *
+ * `tcc_ir_dump_after_pass` cannot do this and never could: a phi is not an
+ * instruction here, it is an IRPhiNode hanging off IRSSAState.block_phis, so
+ * the flat listing after `ssa_rename` shows uses of names that nothing in it
+ * defines -- the phi destinations.  This is the same IR with the joins put
+ * back, which is what makes a rename dump readable.
+ *
+ *     B1  [0002..0004]  preds: B0 B3
+ *           T4 <-- PHI [B0: T8, B3: T10]   ; V0
+ *     0002: CMP T5,P0
+ *
+ * The `; V0` is IRPhiNode.orig_vreg -- the variable slot the value had before
+ * promotion, which is the name the source used.  Debug-only, like every other
+ * dump in this file. */
+void tcc_ir_dump_ssa_after_pass(TCCIRState *ir, struct IRSSAState *ssa, const char *pass_name)
+{
+#ifdef CONFIG_TCC_DEBUG
+  if (!tcc_ir_dump_passes_match(tcc_state, pass_name))
+    return;
+  IRCFG *cfg = ssa ? ssa->cfg : NULL;
+  if (!cfg)
+    return;
+  tcc_ir_dump_set_show_physical_regs(0);
+  printf("=== AFTER %s ===\n", pass_name);
+
+  int count = ir->next_instruction_index;
+  unsigned char *printed = count > 0 ? tcc_mallocz(count) : NULL;
+
+  for (int b = 0; b < cfg->num_blocks; b++)
+  {
+    IRBasicBlock *blk = &cfg->blocks[b];
+    /* end_idx is exclusive (cfg.c builds it as the next leader's index). */
+    printf("B%d  [%04d..%04d]  preds:", b, blk->start_idx, blk->end_idx - 1);
+    if (!blk->num_preds)
+      printf(" -");
+    for (int p = 0; p < blk->num_preds; p++)
+      printf(" B%d", blk->preds[p]);
+    printf("\n");
+
+    for (IRPhiNode *phi = ssa->block_phis ? ssa->block_phis[b] : NULL; phi; phi = phi->next)
+    {
+      printf("      ");
+      dump_vreg_short(phi->dest_vreg, stdout);
+      printf(" <-- PHI [");
+      for (int i = 0; i < phi->num_operands; i++)
+      {
+        printf("%sB%d: ", i ? ", " : "", phi->operands[i].pred_block);
+        if (phi->operands[i].vreg < 0)
+          printf("undef");
+        else
+          dump_vreg_short(phi->operands[i].vreg, stdout);
+      }
+      printf("]");
+      if (phi->orig_vreg >= 0)
+      {
+        printf("   ; ");
+        dump_vreg_short(phi->orig_vreg, stdout);
+      }
+      printf("\n");
+    }
+
+    for (int i = blk->start_idx; i < blk->end_idx && i < count; i++)
+    {
+      if (i < 0)
+        continue;
+      tcc_ir_dump_compact(ir, &ir->compact_instructions[i], i, stdout);
+      if (printed)
+        printed[i] = 1;
+    }
+  }
+
+  /* Anything the CFG does not own -- trailing NOPs, an unreachable tail left by
+   * a fold -- is still part of the array the next pass sees, so say so rather
+   * than dropping it silently. */
+  if (printed)
+  {
+    int announced = 0;
+    for (int i = 0; i < count; i++)
+    {
+      if (printed[i])
+        continue;
+      if (!announced++)
+        printf("(in no block)\n");
+      tcc_ir_dump_compact(ir, &ir->compact_instructions[i], i, stdout);
+    }
+    tcc_free(printed);
+  }
+
+  printf("=== END AFTER %s ===\n", pass_name);
+#else
+  (void)ir;
+  (void)ssa;
+  (void)pass_name;
+#endif
+}
