@@ -192,7 +192,10 @@ jobs:
   metrics:
     needs: codesize
     runs-on: [self-hosted, rpi5, pimoroni_pico_plus2]
-    timeout-minutes: 120
+    # 180, not 120: the board-touching steps below can spend up to 90 min waiting
+    # on the cross-repo board lock (see 'Import codesize + record perf') before
+    # they even start flashing.
+    timeout-minutes: 180
     concurrency:
       group: metrics-rpi5
       cancel-in-progress: false
@@ -233,7 +236,25 @@ jobs:
         # into Grafana's metrics.db. --detail-db copies the per-function rows to
         # a separate DB for metrics/codesize_detail_server.py. --perf-host runs
         # the RP2350 board benchmark. --keep/--detail-keep bound DB growth.
+        #
+        # The Pi hosting this runner also hosts matgla/yasos.zig's hardware-smoke
+        # runner, and that job flashes the SAME RP2350 over the SAME CMSIS-DAP
+        # probe. GitHub's `concurrency:` groups are repo-scoped, so metrics-rpi5
+        # serializes this job only against other tinycc runs -- on 2026-08-24 a
+        # yasos smoke run held the board for the whole 09:44-09:52Z perf window
+        # and all six arms (tcc AND gcc, O0/O1/O2) came back with no usable data.
+        # Both repos take this host lock around every board-touching step; the fd
+        # stays open for the rest of the step, so the lock covers the whole run
+        # and is released when the step's shell exits. -w bounds the wait so a
+        # stale holder fails the job with a clear reason instead of hanging until
+        # the job timeout.
         run: |
+          exec 9>/var/lock/rp2350-board.lock
+          flock -w 5400 9 || {
+            echo "::error::RP2350 board lock still held after 90 min --" \
+                 "another run (likely matgla/yasos.zig hardware_smoke on this Pi) owns the probe"
+            exit 1
+          }
           python3 metrics/record.py --db "$METRICS_DB" --rev HEAD --no-correctness \
               --import-codesize-from "$RUNNER_TEMP/codesize/codesize.db" \
               --detail-db "$CODESIZE_DETAIL_DB" --detail-keep 20 \
@@ -282,6 +303,13 @@ jobs:
         # perf/codesize rows recorded.
         run: |
           set -e
+          # Same shared-board lock as the perf step above (see its comment).
+          exec 9>/var/lock/rp2350-board.lock
+          flock -w 5400 9 || {
+            echo "::error::RP2350 board lock still held after 90 min --" \
+                 "another run (likely matgla/yasos.zig hardware_smoke on this Pi) owns the probe"
+            exit 1
+          }
           echo "--- soft-float baseline ---"
           python3 tests/benchmarks/run_fp_conformance.py "$PERF_HOST" \
               --identity "$PERF_IDENTITY" --opt-level 1
