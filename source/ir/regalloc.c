@@ -5815,7 +5815,28 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
 #undef RUN_SSA
       }
     } else {
-      ssa_opt_cprop(&ssa_opt_ctx);
+      /* -O0.  `ssa_opt_dce` here is *not* an optimization the level is meant to
+       * turn off: at optimize == 0 its body is `dce_temp_worklist` +
+       * `dce_unreachable` (everything else in it is gated on optimize >= 1), so
+       * what it removes is a dead compiler-generated temp and a block nothing
+       * can reach.  Unreachable code is not code, and dropping it is
+       * load-bearing at -O0 -- gcc-torture's `link_error` tests
+       * (`medce-1`, `20030330-1`, `ieee/fp-cmp-7`) fold their condition in the
+       * *frontend* and are left with a `JMP` over a call that must not reach
+       * the linker.  gcc -O0 drops it too.
+       *
+       * `ssa_opt_cprop` used to run here and has been removed, because that one
+       * is an optimization.  Its immediate dispatcher (`ssa_gen_cprop_imm`)
+       * forwarded `T <- #k [ASSIGN]` into every use, so
+       * `int k = 4 * 2; t = n * k;` reached the encoder at -O0 as a single
+       * `MUL #8` -- which the backend then turned into a shifted add, making
+       * -O0 output indistinguishable from -O2 on any function small enough to
+       * read.  Propagating a value is exactly what -O0 promises not to do; with
+       * it gone the same function keeps its `movs r1, #8` and a real `mul`.
+       *
+       * If something else ever *has* to run at -O0, it is lowering, and it
+       * belongs in the lowering path rather than in the else arm of the
+       * optimizer's gate. */
       ssa_opt_dce(&ssa_opt_ctx);
     }
     if (tcc_state && tcc_state->optimize >= 1 && tcc_state->opt_redundant_store &&
