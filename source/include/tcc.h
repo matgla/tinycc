@@ -1139,6 +1139,10 @@ struct TCCState
   unsigned char opt_vrp;              /* -fvrp: value range propagation branch folding */
   unsigned char opt_float_narrow;     /* -ffloat-narrow: narrow double math to float when safe */
   unsigned char opt_jump_threading;   /* -fjump-threading: jump threading optimization */
+  /* Per-caller budget for const-arg inlining of *loop* bodies; reset for each
+   * function in gen_function(). See the CONST_LOOP_INLINE_BUDGET use in
+   * frontend/gen/builtin/call.c. */
+  int const_loop_inline_used;
   unsigned char opt_inline_functions; /* -finline-functions: auto-inline small functions at -O2 */
   unsigned char opt_inline_small;     /* -finline-small-functions: auto-inline tiny functions at -O1 */
   unsigned char opt_ipc;              /* interprocedural constant propagation */

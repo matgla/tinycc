@@ -139,6 +139,8 @@ void gen_function(Sym *sym)
   func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
   func_has_label_addr = 0;
   tcc_state->cur_func_sym = sym;
+  /* Per-caller budget: see CONST_LOOP_INLINE_BUDGET in gen/builtin/call.c. */
+  tcc_state->const_loop_inline_used = 0;
 
   /* NOTE: we patch the symbol size later */
   put_extern_sym(sym, cur_text_section, ind + 1, 0);

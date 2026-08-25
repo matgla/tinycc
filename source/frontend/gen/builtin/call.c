@@ -1611,26 +1611,9 @@ va_arg_pack_done:
         !call_func_sym->type.ref->f.func_auto_inline &&
         saved_arg_count == nb_real_args &&
         inline_fn && inline_fn->func_str &&
-        /* No loops, whatever the arity.  This guard used to apply only to the
-         * zero-arg branch below, which left the const-arg case free to inline a
-         * loop body -- and this path deliberately bypasses auto-inline
-         * *registration*, so it also bypassed the `for`-loop rejection that
-         * `inline_body_has_unsafe_loops` does there.  Two problems with that.
-         *
-         * Cost: "const-prop + DCE will collapse it" only holds if the optimizer
-         * can fully unroll the loop, so a 32/64-iteration bit loop expanded at
-         * every const call site multiplies instead of folding.  gcc-torture's
-         * builtin-bitops-1 is the motivating case -- ~220 const-arg calls into
-         * such helpers from TEST() macro expansion -- and it OOMed the device
-         * tcc ("memory full") at -O2 while costing 423 MB / 0.48 s on the host
-         * against 45 MB / 0.03 s with auto-inline off.
-         *
-         * Safety: those call sites are `if (a != my_ffs(K))` -- expression
-         * context, which is exactly the backward-jump case `inline_body_has_loops`
-         * documents as mis-handled by token replay. */
-        !inline_body_has_loops(inline_fn->func_str) &&
         (saved_arg_count > 0 ||
-         tcc_ir_lookup_func_purity(tcc_state, call_func_sym->v) == TCC_FUNC_PURITY_CONST))
+         (tcc_ir_lookup_func_purity(tcc_state, call_func_sym->v) == TCC_FUNC_PURITY_CONST &&
+          !inline_body_has_loops(inline_fn->func_str))))
     {
       int all_const = 1;
       for (int ai = 0; ai < saved_arg_count; ai++)
@@ -1642,6 +1625,35 @@ va_arg_pack_done:
         }
       }
       eval_only_all_const = all_const;
+
+      /* Budget the *loop* bodies only, per calling function.
+       *
+       * "const-prop + DCE will collapse it" holds only if the optimizer can
+       * fully unroll the loop.  A handful of such expansions do fold and are
+       * worth it; a macro that emits hundreds does not -- it multiplies.
+       * gcc-torture's builtin-bitops-1 is the case that matters: TEST(x, sfx)
+       * makes ~220 const-arg calls into 32/64-iteration bit-loop helpers, which
+       * cost 423 MB / 0.48 s on the host and killed the device tcc outright
+       * with "memory full" at -O2.
+       *
+       * The budget is deliberately high and per-caller, not per-callee: below
+       * it nothing changes at all, so ordinary code -- tcc's own sources
+       * included -- compiles byte-identically, and only a caller that is
+       * clearly abusing the path is cut off.  A flat ban here was tried first
+       * and is NOT equivalent: it perturbed the self-host build and produced a
+       * wild branch (92 gcc-torture HardFaults, all at the same PC).
+       *
+       * The has-loops scan runs only for a call that already qualifies, which
+       * is a small set. */
+#define CONST_LOOP_INLINE_BUDGET 16
+      if (eval_only_all_const && saved_arg_count > 0 &&
+          inline_body_has_loops(inline_fn->func_str))
+      {
+        if (tcc_state->const_loop_inline_used >= CONST_LOOP_INLINE_BUDGET)
+          eval_only_all_const = 0;
+        else
+          tcc_state->const_loop_inline_used++;
+      }
     }
 
     /* Skip inline expansion for eval-only functions whose constant result
