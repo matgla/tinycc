@@ -1611,9 +1611,26 @@ va_arg_pack_done:
         !call_func_sym->type.ref->f.func_auto_inline &&
         saved_arg_count == nb_real_args &&
         inline_fn && inline_fn->func_str &&
+        /* No loops, whatever the arity.  This guard used to apply only to the
+         * zero-arg branch below, which left the const-arg case free to inline a
+         * loop body -- and this path deliberately bypasses auto-inline
+         * *registration*, so it also bypassed the `for`-loop rejection that
+         * `inline_body_has_unsafe_loops` does there.  Two problems with that.
+         *
+         * Cost: "const-prop + DCE will collapse it" only holds if the optimizer
+         * can fully unroll the loop, so a 32/64-iteration bit loop expanded at
+         * every const call site multiplies instead of folding.  gcc-torture's
+         * builtin-bitops-1 is the motivating case -- ~220 const-arg calls into
+         * such helpers from TEST() macro expansion -- and it OOMed the device
+         * tcc ("memory full") at -O2 while costing 423 MB / 0.48 s on the host
+         * against 45 MB / 0.03 s with auto-inline off.
+         *
+         * Safety: those call sites are `if (a != my_ffs(K))` -- expression
+         * context, which is exactly the backward-jump case `inline_body_has_loops`
+         * documents as mis-handled by token replay. */
+        !inline_body_has_loops(inline_fn->func_str) &&
         (saved_arg_count > 0 ||
-         (tcc_ir_lookup_func_purity(tcc_state, call_func_sym->v) == TCC_FUNC_PURITY_CONST &&
-          !inline_body_has_loops(inline_fn->func_str))))
+         tcc_ir_lookup_func_purity(tcc_state, call_func_sym->v) == TCC_FUNC_PURITY_CONST))
     {
       int all_const = 1;
       for (int ai = 0; ai < saved_arg_count; ai++)
