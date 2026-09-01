@@ -392,6 +392,52 @@ if(BUILD_FP_CONFORMANCE)
     message(STATUS "FP conformance image: fp_conformance${BENCHMARK_EXECUTABLE_SUFFIX} (${FP_BUILD_ID})")
 endif()
 
+# ============================================================================
+# Instruction-width demo (separate image; see width_demo_main.c for why)
+#
+# Configure with -DBUILD_WIDTH_DEMO=ON.  Always GCC-built and always
+# compiler-independent: the units under test are the hand-written Thumb-2
+# sequences in width_kernels.S, so BENCHMARK_COMPILER has no bearing on what
+# is measured and the image is not part of the tracked benchmark numbers.
+# ============================================================================
+
+option(BUILD_WIDTH_DEMO "Build the instruction-width vs cycles demo image" OFF)
+
+if(BUILD_WIDTH_DEMO)
+    add_executable(width_demo
+        ${CMAKE_CURRENT_SOURCE_DIR}/width_demo_main.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/width_kernels.S
+    )
+
+    target_compile_options(width_demo PRIVATE ${BENCH_ARCH_FLAGS} -O2 -g)
+
+    # Deliberately NOT ${BENCH_INCLUDE_DIRS}: that set puts the IR suite's
+    # libc_includes ahead of the toolchain's own headers, and the SDK's
+    # pico_float / pico_double sources then compile against a math.h with no
+    # HUGE_VALF and no log2/exp2/ldexp/remquo.  This image needs nothing from
+    # there -- its only headers are the SDK's and the C library's.
+
+    target_compile_definitions(width_demo PUBLIC
+        PICO_DEFAULT_UART_TX_PIN=32
+        PICO_DEFAULT_UART_RX_PIN=33)
+
+    target_link_libraries(width_demo pico_stdlib hardware_uart hardware_gpio hardware_sync)
+
+    # Nothing here is floating point; keep the SDK's optimized FP libraries out
+    # of the image so it stays small and quick to rebuild.
+    pico_set_float_implementation(width_demo compiler)
+    pico_set_double_implementation(width_demo compiler)
+
+    pico_add_extra_outputs(width_demo)
+
+    # Run from SRAM: the point of the measurement is the core's cost per
+    # instruction, and executing from XIP flash would fold the cache into
+    # every number.
+    pico_set_binary_type(width_demo copy_to_ram)
+
+    message(STATUS "Instruction-width demo image: width_demo")
+endif()
+
 message(STATUS "")
 message(STATUS "==========================================")
 message(STATUS "Benchmark Configuration:")
