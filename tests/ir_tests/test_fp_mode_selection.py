@@ -205,9 +205,8 @@ def _link_yaff(tmp_path, name, *flags):
             "-nostdlib",
             # Link the way every rootfs Makefile links a YAFF image.  YAFF is only
             # the default output of a TCC_TARGET_YASOS build -- the plain
-            # `--enable-cross` compiler CI builds writes ELF unless asked -- and
-            # without -Ttext/-section-alignment the writer falls over the ELF
-            # page layout (ASan: heap overflow writing .data).
+            # `--enable-cross` compiler CI builds writes ELF unless asked.  The
+            # default page layout is covered by test_yaff_section_padding.py.
             "-Wl,-oformat=yaff",
             "-Wl,-Ttext=0x0",
             "-Wl,-section-alignment=0x4",

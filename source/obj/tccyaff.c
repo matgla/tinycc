@@ -1166,6 +1166,29 @@ ST_FUNC void tcc_yaff_prepare_init_fini(TCCState *s1)
   }
 }
 
+/* Write a section's image: sh_size bytes, of which only the first data_offset
+ * have anything behind them.
+ *
+ * Layout rounds sh_size up past the section's contents whenever the section
+ * opens a new segment (layout_sections: `s->sh_size = (s->sh_size + align) &
+ * ~align`), and for a non-ELF output that alignment is the segment alignment
+ * -- the page size, unless -section-alignment says otherwise.  Everything in
+ * the header and the relocation offsets is computed from sh_size, so the tail
+ * does have to be in the file; but fwrite'ing sh_size bytes straight out of
+ * `data` read past the buffer for it.  A small program linked without
+ * -section-alignment has 256 bytes of .data padded to 4096, and ASan stopped
+ * the link there.  The tail is padding, so it goes out as zeros. */
+static void tcc_yaff_write_section_image(Section *s, FILE *f)
+{
+  addr_t have = s->data_offset < s->sh_size ? s->data_offset : s->sh_size;
+  addr_t i;
+
+  if (have)
+    fwrite(s->data, 1, have, f);
+  for (i = have; i < s->sh_size; ++i)
+    fputc(0, f);
+}
+
 ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
 {
   int i, file_type;
@@ -1385,14 +1408,14 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
   }
   header.text_offset = aligned_text_offset;
 
-  fwrite(text_section->data, 1, text_section->sh_size, f);
+  tcc_yaff_write_section_image(text_section, f);
   if (s1->plt)
   {
-    fwrite(s1->plt->data, 1, s1->plt->sh_size, f);
+    tcc_yaff_write_section_image(s1->plt, f);
     header.plt_length = s1->plt->sh_size;
   }
 
-  fwrite(rodata_section->data, 1, rodata_section->sh_size, f);
+  tcc_yaff_write_section_image(rodata_section, f);
   /* Write alignment padding between rodata and data (if any) */
   {
     addr_t rodata_end = rodata_section->sh_addr + rodata_section->sh_size;
@@ -1403,11 +1426,11 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
         fputc(0, f);
     }
   }
-  fwrite(data_section->data, 1, data_section->sh_size, f);
+  tcc_yaff_write_section_image(data_section, f);
   /* No file padding between data and GOT — the bss region (including
    * any alignment padding before it) is zero-initialized by the loader.
    * bss_length already accounts for the alignment gap. */
-  fwrite(s1->got->data, 1, s1->got->sh_size, f);
+  tcc_yaff_write_section_image(s1->got, f);
   fseek(f, 0, SEEK_SET);
   fwrite(&header, 1, sizeof(YaffHeader), f);
   fflush(f);
