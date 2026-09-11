@@ -2960,6 +2960,20 @@ const FloatingPointConfig *arm_determine_fpu_config(struct TCCState *s)
     return &arm_soft_fpu_config;
   }
 
+  /* -mfp-inline=none: keep the FPU the target has -- so the link still selects
+   * the hardware-backed runtime and the image still declares it needs the unit
+   * -- but route every operation through a call.  Returning the soft table is
+   * how that is spelled, for the same reason -mfloat-abi=soft does above: the
+   * has_* bits are read twice, once by ir_put_soft_call_fpu_if_needed() to
+   * decide whether the op stays an __aeabi_ call and once by
+   * ir_op_is_implicit_call_ra() to decide whether it still clobbers r0-r3.
+   * Refusing to inline anywhere but here would leave the second reader
+   * believing an operation that is now a BL keeps its registers. */
+  if (s->fp_inline == ARM_FP_INLINE_NONE)
+  {
+    return &arm_soft_fpu_config;
+  }
+
   switch (s->fpu_type)
   {
   case ARM_FPU_FPV4_SP_D16:
@@ -11775,6 +11789,30 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    * so locals occupy SP+0 .. SP+allocated_stack_size-1, matching the same
    * addresses as the old push-IP-for-alignment approach. */
 
+  /* Everything from here to the parameter shuffle below runs before a single
+   * incoming value has been moved to its allocated home, so these registers
+   * are all still live and none of them may be taken as a scratch register:
+   * R0-R3 (the argument registers -- all four, not just the named ones, since
+   * a variadic function saves the anonymous ones too), R9 (the GOT base under
+   * text_and_data_separation) and the static chain register.
+   *
+   * A store whose offset does not fit the STR immediate needs a register to
+   * hold the offset, and the scratch picker's idea of "free" comes from the
+   * live intervals, which do not model the incoming registers at prologue
+   * position.  It therefore handed out R0.  In a function with alloca and a
+   * frame deeper than the 255-byte negative STR immediate -- glob() and
+   * fnmatch() in GNU make's gnulib, among others -- the R9 spill below then
+   * emitted
+   *     movw r0,#0x131c ; rsb r0,r0,#0 ; str.w r9,[r7,r0]
+   *     movw r4,#0x1018 ; rsb r4,r4,#0 ; str   r0,[r7,r4]
+   * and the first parameter, which the second store was meant to spill, was
+   * the offset constant by the time it got there. */
+  uint32_t prologue_incoming_mask = (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3);
+  if (tcc_state->text_and_data_separation)
+    prologue_incoming_mask |= (1u << ARM_R9);
+  if (ir && ir->has_static_chain)
+    prologue_incoming_mask |= (1u << architecture_config.static_chain_reg);
+
   /* Save the PIC GOT base (R9) once, into slot 0 of the nested-call save area.
    *
    * R9 is caller-saved under text_and_data_separation, so every call reloads
@@ -11796,12 +11834,12 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       /* VLA/alloca: the runtime SP has moved, so the call sites address these
        * slots FP-relative with this bias.  Match it. */
       tcc_gen_machine_store_to_stack_ex(ARM_R9, r9_slot_offset - (callee_push_size + epilogue_stack_dealloc),
-                                        1u << ARM_R9);
+                                        prologue_incoming_mask);
     else
       /* Plain SP-relative, matching the store_word_to_stack() the call sites
        * used: these slots are always addressed off SP when the frame is
        * static, even in functions that also keep a frame pointer. */
-      tcc_gen_machine_store_to_sp(ARM_R9, r9_slot_offset);
+      tcc_gen_machine_store_to_sp_ex(ARM_R9, r9_slot_offset, prologue_incoming_mask);
   }
 
   /* Save incoming static chain (R10) at fixed chain slot.
@@ -11810,7 +11848,8 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    * The body reads via offset -4 which gets fp_adjust_local_offset applied. */
   if (ir && ir->has_static_chain)
   {
-    tcc_gen_machine_store_to_stack(architecture_config.static_chain_reg, -(callee_push_size + 4));
+    tcc_gen_machine_store_to_stack_ex(architecture_config.static_chain_reg, -(callee_push_size + 4),
+                                      prologue_incoming_mask);
   }
 
   /* For variadic functions, save incoming r0-r3 in a fixed area at FP-16..FP-4
@@ -11824,10 +11863,10 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     /* Store r0-r3 at FP-16..FP-4 for named parameter access.
      * (The contiguous PUSH'd copy is at FP+offset_to_args-16..FP+offset_to_args-4
      * and is used by va_arg for anonymous argument traversal.) */
-    tcc_gen_machine_store_to_stack(R0, -(callee_push_size + 16));
-    tcc_gen_machine_store_to_stack(R1, -(callee_push_size + 12));
-    tcc_gen_machine_store_to_stack(R2, -(callee_push_size + 8));
-    tcc_gen_machine_store_to_stack(R3, -(callee_push_size + 4));
+    tcc_gen_machine_store_to_stack_ex(R0, -(callee_push_size + 16), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R1, -(callee_push_size + 12), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R2, -(callee_push_size + 8), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R3, -(callee_push_size + 4), prologue_incoming_mask);
 
     /* The frame-metadata triple that used to live at FP-20/-24/-28 (__gr_top,
      * named_arg_reg_bytes, named_arg_stack_bytes) is gone: it existed purely so
@@ -11853,13 +11892,13 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       const int fp_or_sp = tcc_state->need_frame_pointer ? R_FP : R_SP;
       ot_check(th_add_imm(R_IP, fp_or_sp, offset_to_args, flags_safe(), ENFORCE_ENCODING_NONE));
     }
-    tcc_gen_machine_store_to_stack_ex(R_IP, adj, (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3));
+    tcc_gen_machine_store_to_stack_ex(R_IP, adj, prologue_incoming_mask);
 
     /* Store r0-r3 at offsets +4, +8, +12, +16 from the block start */
-    tcc_gen_machine_store_to_stack_ex(R0, adj + 4, (1u << R1) | (1u << R2) | (1u << R3));
-    tcc_gen_machine_store_to_stack_ex(R1, adj + 8, (1u << R0) | (1u << R2) | (1u << R3));
-    tcc_gen_machine_store_to_stack_ex(R2, adj + 12, (1u << R0) | (1u << R1) | (1u << R3));
-    tcc_gen_machine_store_to_stack_ex(R3, adj + 16, (1u << R0) | (1u << R1) | (1u << R2));
+    tcc_gen_machine_store_to_stack_ex(R0, adj + 4, prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R1, adj + 8, prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R2, adj + 12, prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R3, adj + 16, prologue_incoming_mask);
   }
 
   /* Move parameters from incoming registers to their allocated locations.
@@ -12444,12 +12483,19 @@ ST_FUNC void tcc_gen_machine_store_to_stack_ex(int reg, int offset, uint32_t ext
  */
 ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset)
 {
+  tcc_gen_machine_store_to_sp_ex(reg, offset, 0);
+}
+
+/* SP-relative store with extra scratch exclusions; see the _ex comment on the
+ * FP-relative variant above. */
+ST_FUNC void tcc_gen_machine_store_to_sp_ex(int reg, int offset, uint32_t extra_exclude)
+{
   int sign = (offset < 0);
   int abs_offset = sign ? -offset : offset;
 
   if (!store_word_to_base(reg, R_SP, abs_offset, sign))
   {
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << R_SP));
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << R_SP) | extra_exclude);
     int rr = rr_alloc.reg;
     ot_check(th_str_reg(reg, R_SP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
@@ -14989,6 +15035,33 @@ ST_FUNC void tcc_gen_machine_end_instruction(void)
   restore_all_pushed_scratch_regs();
 }
 
+/* Bytes of outgoing-argument area that have to stay below the live stack top.
+ *
+ * Stack arguments are written at [SP, SP+call_outgoing_size) right before the
+ * BL, because that is where AAPCS says the callee looks for them, so SP cannot
+ * also be the block alloca just handed back -- the next call with a stack
+ * argument writes straight over it.  GNU make's pattern_search does exactly
+ * that: `int_file = alloca (sizeof (struct file))` followed by a five-argument
+ * recursive call, and the fifth argument landed on int_file->name, so the
+ * callee dereferenced a NULL name.
+ *
+ * SP is therefore kept this many bytes below the *logical* stack top:
+ * VLA_ALLOC carves its block off that top and then drops SP past a fresh
+ * outgoing area, and VLA_SP_SAVE / VLA_SP_RESTORE convert between the two.
+ * The conversion is symmetric, so the SAVE/RESTORE pairs that bracket a VLA
+ * scope still round-trip, and the SAVE that captures an alloca's result now
+ * yields the block rather than the argument area beneath it.
+ *
+ * The nested-call R9/argument save slots need no equivalent: in a dynamic-SP
+ * function they are already addressed FP-relative (see gfunc_prolog and the
+ * call-site nested_save_fp_bias). */
+static int vla_outgoing_reserve(void)
+{
+  TCCIRState *ir = tcc_state->ir;
+  int k = (ir && ir->call_outgoing_size > 0) ? ir->call_outgoing_size : 0;
+  return (k + 7) & ~7;
+}
+
 /* tcc_gen_machine_vla_mop: MachineOperand-based entry point for VLA operations.
  *
  *   VLA_ALLOC:      src1=size(bytes), src2=alignment(IMM bytes), dest unused
@@ -15016,8 +15089,28 @@ ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, M
     if (r == R_SP)
       tcc_error("compiler_error: VLA alloc picked SP as temp");
 
+    const int vla_reserve = vla_outgoing_reserve();
+
     /* r = SP - r  (subtract size from stack pointer) */
     ot_check(th_sub_reg(r, R_SP, r, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+
+    /* ... and back up to the logical top, so the block is carved above the
+     * outgoing-argument area rather than on top of it. */
+    if (vla_reserve)
+    {
+      thumb_opcode add_res = th_add_imm(r, r, (uint32_t)vla_reserve, flags_safe(), ENFORCE_ENCODING_NONE);
+      if (is_valid_opcode(add_res))
+      {
+        ot(add_res);
+      }
+      else
+      {
+        int res_reg = mach_alloc_scratch(&ctx, 1u << (uint32_t)r);
+        if (!ot(th_generic_mov_imm(res_reg, vla_reserve)))
+          load_full_const(res_reg, PREG_NONE, LFC_SPLIT(vla_reserve));
+        ot_check(th_add_reg(r, r, res_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      }
+    }
 
     if (align > 1)
     {
@@ -15033,6 +15126,8 @@ ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, M
     }
 
     ot_check_mov_reg(R_SP, r, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    /* r is the new logical top; SP sits a fresh outgoing area below it. */
+    gadd_sp(-vla_reserve);
     break;
   }
   case TCCIR_OP_VLA_SP_SAVE:
@@ -15042,26 +15137,36 @@ ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, M
      * generic path would emit.  Triggered by the alloca-load-fwd IR pass
      * which rewrites a `VLA_SP_SAVE slot; LOAD vreg <- slot` pair into a
      * single `VLA_SP_SAVE vreg`. */
+    const int save_reserve = vla_outgoing_reserve();
     if (dest.kind == MACH_OP_REG && !dest.needs_deref &&
         dest.u.reg.r0 != (int)PREG_REG_NONE)
     {
       ot_check_mov_reg((uint32_t)dest.u.reg.r0, R_SP, flags_safe(),
                        THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+      if (save_reserve)
+        ot_check(th_add_imm((uint32_t)dest.u.reg.r0, (uint32_t)dest.u.reg.r0, (uint32_t)save_reserve,
+                            flags_safe(), ENFORCE_ENCODING_NONE));
       break;
     }
-    /* Save current SP to the destination save slot via a scratch register. */
+    /* Save the logical stack top to the destination save slot via a scratch. */
     ScratchRegAlloc sp_scratch = get_scratch_reg_with_save(0);
     ot_check_mov_reg(sp_scratch.reg, R_SP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE,
                      false);
+    if (save_reserve)
+      ot_check(th_add_imm((uint32_t)sp_scratch.reg, (uint32_t)sp_scratch.reg, (uint32_t)save_reserve,
+                          flags_safe(), ENFORCE_ENCODING_NONE));
     mach_writeback_dest(&dest, sp_scratch.reg);
     restore_scratch_reg(&sp_scratch);
     break;
   }
   case TCCIR_OP_VLA_SP_RESTORE:
   {
-    /* Load the saved SP from src1 into a register, then restore SP. */
+    /* Load the saved logical top from src1, then put SP back below it.  The
+     * SUB goes through SP rather than the loaded register: src1 may be a live
+     * vreg (alloca_load_fwd hands one over) that this must not clobber. */
     int saved_sp = mach_ensure_in_reg(&ctx, &src1, 0);
     ot_check_mov_reg(R_SP, saved_sp, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    gadd_sp(-vla_outgoing_reserve());
     break;
   }
   default:

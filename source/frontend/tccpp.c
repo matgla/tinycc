@@ -5450,7 +5450,10 @@ static void tcc_predefs_base(TCCState *s1, CString *cs, int is_asm, int include_
        from the generated table when its name is first interned (see
        tcc_predef_try_materialize). The one non-#define line the text carried,
        `typedef char *__builtin_va_list;`, still has to be seen by the parser,
-       so it is emitted here -- one line instead of 3.7 KB. */
+       so it is emitted here -- one line instead of 3.7 KB.  -E has no parser
+       to feed, and anything put here lands in its output; see the
+       TCC_OUTPUT_PREPROCESS arm below. */
+    if (s1->output_type != TCC_OUTPUT_PREPROCESS)
     {
       int ri;
       for (ri = 0; tcc_predef_raw[ri]; ri++)
@@ -5468,7 +5471,20 @@ static void tcc_predefs_base(TCCState *s1, CString *cs, int is_asm, int include_
        conditional on (bcheck renames, leading underscore); -E never sees
        either form. TCC_NO_PROGRAMMATIC_DECLS forces the text path for A/B
        validation. */
-    if (s1->output_type != TCC_OUTPUT_PREPROCESS &&
+    if (s1->output_type == TCC_OUTPUT_PREPROCESS)
+    {
+      /* Neither form, as the comment above says.  -E reproduces the
+         translation unit, and these declarations are not part of it: no
+         consumer of the output needs them, and one that reads the output as
+         data gets them as stray text.  gnulib's configure greps
+         `$CC $CFLAGS -E conftest.c` for the -Wno-* options the compiler
+         accepts; with the prologue present it took the whole thing for a flag
+         list, so GL_CFLAG_GNULIB_WARNINGS became
+         `typedef char*__builtin_va_list; void* __builtin_memcpy (...) ...`
+         and every compile line in the generated Makefiles died in the shell
+         on the first `(`. */
+    }
+    else if (
 #ifdef CONFIG_TCC_BCHECK
         !s1->do_bounds_check &&
 #endif

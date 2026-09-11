@@ -172,11 +172,17 @@ static int analyze_dead_vla(TCCIRState *ir, int vla_idx, int max_tmp,
         reads_tainted = 1;
     }
 
-    /* Tainted deref-dest = kill candidate; tainted src1 = the pointer escapes. */
-    if (q->op == TCCIR_OP_STORE)
+    /* Tainted deref-dest = kill candidate; tainted src1 = the pointer escapes.
+     * The indexed/postinc forms address through a plain (non-lval) dest, so
+     * they need the same treatment -- see the dest-is-a-use comment in
+     * sweep_orphan_tmp_defs. */
+    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_STORE_POSTINC)
     {
       int dpos;
-      int dest_is_tainted = has_d && operand_is_temp_lval(d, &dpos) &&
+      int dest_is_tainted = has_d &&
+                            (q->op == TCCIR_OP_STORE ? operand_is_temp_lval(d, &dpos)
+                                                     : operand_is_temp(d, &dpos)) &&
                             dpos <= max_tmp && tainted[dpos];
       if (has_s1)
       {
@@ -300,11 +306,24 @@ static int sweep_orphan_tmp_defs(TCCIRState *ir, int max_tmp)
             use_count[p]++;
         }
       }
-      /* A STORE's deref-dest is a use of the address TEMP, not a def. */
-      if (q->op == TCCIR_OP_STORE && irop_config[q->op].has_dest)
+      /* Every store's dest names the address it writes through -- a use of
+       * that TEMP, not a def.  STORE spells it as an lval (deref) operand;
+       * STORE_INDEXED and STORE_POSTINC carry the base in a plain dest with
+       * the displacement in the instruction, so `is_lval` is false there and
+       * the operand still has to be counted.  Missing them let this sweep NOP
+       * the LEA feeding an indexed store: `T4 <- Addr[StackLoc[-32]]` looked
+       * unused because its only consumer was `T4 <- T6 STORE_INDEXED #20`,
+       * and the emitted code then stored through whatever register the
+       * allocator had given the now-undefined T4 (GNU make's eval_makefile
+       * wrote ebuf.floc through three uninitialised callee-saved registers).
+       * This sweep runs over the whole function, not just the dead VLA's own
+       * chain, so any indexed store in the function was exposed. */
+      if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+           q->op == TCCIR_OP_STORE_POSTINC) &&
+          irop_config[q->op].has_dest)
       {
         IROperand d = tcc_ir_op_get_dest(ir, q);
-        if (d.is_lval)
+        if (d.is_lval || q->op != TCCIR_OP_STORE)
         {
           int32_t vr = irop_get_vreg(d);
           if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)

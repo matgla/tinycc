@@ -2945,6 +2945,16 @@ static const char *tccelf_get_fp_lib_name(TCCState *s1)
   if (s1->float_abi == ARM_HARD_FLOAT)
     return NULL;
 
+  /* -mfloat-abi=soft means "no FP instructions anywhere in this image", and the
+   * runtime the image links is part of the image.  Pairing it with a hardware
+   * -mfpu used to be the only way to say "hardware, behind a call" and so
+   * quietly linked librp2350fp -- DCP instructions, on a build that had just
+   * declared it emits none, with a YAFF header that asked the loader for
+   * nothing.  That mode now has its own flag (-mfp-inline=none), which leaves
+   * this one free to mean what it says. */
+  if (s1->float_abi == ARM_SOFT_FLOAT)
+    return "softfp";
+
   if (s1->fpu_type)
   {
     switch (s1->fpu_type)
@@ -2987,6 +2997,24 @@ static const char *tccelf_get_fp_lib_name(TCCState *s1)
  *
  * Hard float ABI needs no FP library (uses raw FP instructions).
  */
+/* Is the __aeabi_ runtime bound as a shared object rather than copied in from
+ * an archive?  -mfp-lib decides; AUTO keeps the historical split, where only
+ * the on-device compiler binds the shared object. */
+ST_FUNC int tccelf_arm_fp_lib_is_shared(TCCState *s1)
+{
+  if (s1->static_link)
+    return 0;
+  if (s1->fp_lib == ARM_FP_LIB_SHARED)
+    return 1;
+  if (s1->fp_lib == ARM_FP_LIB_STATIC)
+    return 0;
+#if TARGETOS_YasOS && defined(TCC_IS_NATIVE)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
 ST_FUNC void tccelf_add_arm_fp_lib(TCCState *s1)
 {
   const char *fp_lib = tccelf_get_fp_lib_name(s1);
@@ -2997,18 +3025,16 @@ ST_FUNC void tccelf_add_arm_fp_lib(TCCState *s1)
     return;
   }
 
-#if TARGETOS_YasOS && defined(TCC_IS_NATIVE)
-  if (!s1->static_link)
+  if (tccelf_arm_fp_lib_is_shared(s1))
   {
-    /* YasOS native: search library_paths for libXXX.so then libXXX.a
-     * (e.g. /usr/lib/libsoftfp.so). Only for the on-device compiler;
-     * the cross-compiler (no TCC_IS_NATIVE) uses the static path below. */
+    /* Search library_paths for libXXX.so then libXXX.a (e.g.
+     * /usr/lib/libsoftfp.so), so the __aeabi_ entry points are resolved by the
+     * OS's dynamic loader at exec instead of copied into this module. */
     if (s1->verbose)
       printf("Adding ARM FP shared library: lib%s\n", fp_lib);
     tcc_add_library(s1, fp_lib);
     return;
   }
-#endif
 
   /* Cross-compiler or static link: find via tcc lib path (fp/ subdirectory).
    * tcc_add_dll() searches library_paths which includes {B} = tcc_lib_path,
@@ -3047,6 +3073,23 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
   tcc_add_bcheck(s1);
 #endif
   tcc_add_pragma_libs(s1);
+
+  /* A shared FP runtime has to be bound BEFORE libc.
+   *
+   * Every shared object in this rootfs that was ever linked against the FP
+   * archive absorbed a copy of the __aeabi_ set and re-exports it -- libc.so
+   * alone exports fifteen doubles entry points.  The loader resolves an import
+   * by walking the module's dependencies in the order the image lists them
+   * (Module.find_symbol over `children`, appended in import order), so an
+   * image that named libc first would silently run libc's copy of every
+   * operation and the -mfpu it was built with would decide nothing.  Binding
+   * the runtime the link actually selected first is what makes the choice
+   * stick.  The archive path keeps the old position: an archive is searched a
+   * la carte, so it has to come after the objects that reference it. */
+#if defined TCC_TARGET_ARM
+  if (tccelf_arm_fp_lib_is_shared(s1))
+    tccelf_add_arm_fp_lib(s1);
+#endif
 
   /* Standard libraries (skipped by -nostdlib) */
   if (!s1->nostdlib)
@@ -3097,7 +3140,8 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
    * __aeabi_lcmp, etc.), so the FP library must come first so that its
    * undefined references exist when libtcc1.a is processed à la carte. */
 #if defined TCC_TARGET_ARM
-  tccelf_add_arm_fp_lib(s1);
+  if (!tccelf_arm_fp_lib_is_shared(s1))
+    tccelf_add_arm_fp_lib(s1);
 #endif
   if (TCC_LIBTCC1[0])
     tcc_add_support(s1, TCC_LIBTCC1);

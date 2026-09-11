@@ -937,6 +937,17 @@ LIBTCCAPI TCCState *tcc_new(void)
 #else
   s->fpu_type = ARM_FPU_AUTO; /* default to auto-detect */
 #endif
+  s->fp_inline = ARM_FP_INLINE_AUTO;
+  /* CONFIG_TCC_DEFAULT_FP_LIB names an arm_fp_lib enumerator, so a build whose
+   * rootfs keeps one shared copy of the __aeabi_ runtime can ship a compiler
+   * that binds it that way with no flags at all -- the same reach argument as
+   * CONFIG_TCC_DEFAULT_FPU above, and for the same reason: half the Makefiles
+   * in this tree never learned to pass a link flag. */
+#ifdef CONFIG_TCC_DEFAULT_FP_LIB
+  s->fp_lib = CONFIG_TCC_DEFAULT_FP_LIB;
+#else
+  s->fp_lib = ARM_FP_LIB_AUTO;
+#endif
 #if defined(TCC_TARGET_YASOS)
   s->text_and_data_separation = 1;
   s->pic = 1;
@@ -1673,6 +1684,8 @@ enum
   TCC_OPTION_O,
   TCC_OPTION_mfloat_abi,
   TCC_OPTION_mfpu,
+  TCC_OPTION_mfp_inline,
+  TCC_OPTION_mfp_lib,
   TCC_OPTION_march,
   TCC_OPTION_m,
   TCC_OPTION_f,
@@ -1770,6 +1783,10 @@ static const TCCOption tcc_options[] = {
     {"mfloat-abi", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG},
     {"mfpu=", TCC_OPTION_mfpu, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"mfpu", TCC_OPTION_mfpu, TCC_OPTION_HAS_ARG},
+    {"mfp-inline=", TCC_OPTION_mfp_inline, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
+    {"mfp-inline", TCC_OPTION_mfp_inline, TCC_OPTION_HAS_ARG},
+    {"mfp-lib=", TCC_OPTION_mfp_lib, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
+    {"mfp-lib", TCC_OPTION_mfp_lib, TCC_OPTION_HAS_ARG},
     {"march=", TCC_OPTION_march, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"march", TCC_OPTION_march, TCC_OPTION_HAS_ARG},
     {"mpic-data-is-text-relative", TCC_OPTION_mpic_data_is_text_relative, 0},
@@ -2306,6 +2323,24 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       {
         return tcc_error_noabort("unsupported FPU type '%s'", optarg);
       }
+      break;
+    case TCC_OPTION_mfp_inline:
+      if (!strcmp(optarg, "auto"))
+        s->fp_inline = ARM_FP_INLINE_AUTO;
+      else if (!strcmp(optarg, "none"))
+        s->fp_inline = ARM_FP_INLINE_NONE;
+      else
+        return tcc_error_noabort("unsupported -mfp-inline value '%s' (auto, none)", optarg);
+      break;
+    case TCC_OPTION_mfp_lib:
+      if (!strcmp(optarg, "auto"))
+        s->fp_lib = ARM_FP_LIB_AUTO;
+      else if (!strcmp(optarg, "static"))
+        s->fp_lib = ARM_FP_LIB_STATIC;
+      else if (!strcmp(optarg, "shared"))
+        s->fp_lib = ARM_FP_LIB_SHARED;
+      else
+        return tcc_error_noabort("unsupported -mfp-lib value '%s' (auto, static, shared)", optarg);
       break;
     case TCC_OPTION_march:
       s->march_str = optarg;

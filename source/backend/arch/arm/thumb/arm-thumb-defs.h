@@ -64,6 +64,36 @@ enum arm_fpu_type
   ARM_FPU_NEON_FP_ARMV8, /* NEON with ARMv8 FP */
 };
 
+/* -mfp-inline=: may the backend lower an FP operation to instructions, or must
+ * every one of them become an __aeabi_* call into the FP runtime?
+ *
+ * This is deliberately *not* the same question as -mfloat-abi.  `soft` means
+ * "this image contains no FP instructions at all", which also forces the pure
+ * software runtime; `-mfp-inline=none` keeps the -mfpu the target really has
+ * -- and therefore keeps the hardware-backed runtime, and the architecture
+ * requirements that go with it -- while moving every operation behind a call.
+ * The two together are what make "hardware, behind a call" a mode you can
+ * select rather than a side effect of two flags that mean something else. */
+enum arm_fp_inline
+{
+  ARM_FP_INLINE_AUTO = 0, /* inline whatever the FPU table implements */
+  ARM_FP_INLINE_NONE,     /* every FP operation becomes a runtime call */
+};
+
+/* -mfp-lib=: how the __aeabi_* runtime the link needs is bound.
+ *
+ * AUTO keeps the historical split -- the on-device compiler binds the shared
+ * object, a cross build copies the archive in -- because that is what every
+ * existing rootfs was built with.  SHARED asks for the shared object from a
+ * cross build too, which is what puts the FP runtime behind the OS's dynamic
+ * loader; STATIC asks for the archive even on the device. */
+enum arm_fp_lib
+{
+  ARM_FP_LIB_AUTO = 0, /* shared when native, archive when cross-compiling */
+  ARM_FP_LIB_STATIC,   /* always fp/lib<name>.a */
+  ARM_FP_LIB_SHARED,   /* always -l<name>, resolved by the dynamic loader */
+};
+
 /* Assembly interface */
 #define CONFIG_TCC_ASM
 #define NB_ASM_REGS 16

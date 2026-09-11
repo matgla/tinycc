@@ -1209,6 +1209,8 @@ struct TCCState
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   unsigned char float_abi; /* float ABI of the generated code*/
   unsigned char fpu_type;  /* FPU type for ARM hardfp */
+  unsigned char fp_inline;  /* -mfp-inline=: enum arm_fp_inline */
+  unsigned char fp_lib;     /* -mfp-lib=: enum arm_fp_lib */
   const char *march_str;   /* -march= value, NULL means default */
 #endif
   unsigned char text_and_data_separation; /* support for GCC
@@ -2425,6 +2427,7 @@ ST_FUNC void tccelf_add_crtbegin(TCCState *s1);
 ST_FUNC void tccelf_add_crtend(TCCState *s1);
 #if defined TCC_TARGET_ARM
 ST_FUNC void tccelf_add_arm_fp_lib(TCCState *s1);
+ST_FUNC int tccelf_arm_fp_lib_is_shared(TCCState *s1);
 #endif
 #endif
 #ifndef TCC_TARGET_PE
@@ -2801,6 +2804,7 @@ ST_FUNC void tcc_gen_machine_func_parameter_mop(MachineOperand src1, MachineOper
 ST_FUNC void tcc_gen_machine_store_to_stack(int reg, int offset);
 ST_FUNC void tcc_gen_machine_store_to_stack_ex(int reg, int offset, uint32_t extra_exclude);
 ST_FUNC void tcc_gen_machine_store_to_sp(int reg, int offset);
+ST_FUNC void tcc_gen_machine_store_to_sp_ex(int reg, int offset, uint32_t extra_exclude);
 
 ST_FUNC void tcc_gen_machine_lea_mop(MachineOperand dest, MachineOperand src);
 ST_FUNC int tcc_gen_machine_number_of_registers(void);
