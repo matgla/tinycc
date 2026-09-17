@@ -583,7 +583,11 @@ fi
 if confvars_has asan; then
   CFLAGS="$CFLAGS -fsanitize=address -fno-omit-frame-pointer"
   # libasan must appear before other libs on the final link line.
-  LDFLAGS="-lasan $LDFLAGS -fsanitize=address"
+  if test "$cc_name" = "clang"; then
+    LDFLAGS="$LDFLAGS -fsanitize=address"
+  else
+    LDFLAGS="-lasan $LDFLAGS -fsanitize=address"
+  fi
 fi
 if confvars_has ubsan; then
   CFLAGS="$CFLAGS -fsanitize=undefined -fno-omit-frame-pointer"

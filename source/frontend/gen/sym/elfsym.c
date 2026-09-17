@@ -142,7 +142,7 @@ ST_FUNC void put_extern_sym2(Sym *sym, int sh_num, addr_t value, unsigned long s
       }
       if (ref->f.func_call == FUNC_STDCALL && can_add_underscore)
       {
-        sprintf(buf1, "_%s@%d", name, ref->f.func_args * PTR_SIZE);
+        snprintf(buf1, sizeof(buf1), "_%s@%d", name, ref->f.func_args * PTR_SIZE);
         name = buf1;
         other |= ST_PE_STDCALL;
         can_add_underscore = 0;

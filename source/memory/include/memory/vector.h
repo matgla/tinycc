@@ -34,14 +34,14 @@ int tcc_vector_shrink_to_fit_storage(void *data_owner, size_t size, size_t *capa
     size_t capacity;                                                                                              \
   } name;                                                                                                         \
                                                                                                                   \
-  static inline void name##_init(name *vector)                                                                    \
+  static inline __attribute__((unused)) void name##_init(name *vector)                                            \
   {                                                                                                               \
     vector->data = NULL;                                                                                          \
     vector->size = 0;                                                                                             \
     vector->capacity = 0;                                                                                         \
   }                                                                                                               \
                                                                                                                   \
-  static inline void name##_cleanup(name *vector)                                                                 \
+  static inline __attribute__((unused)) void name##_cleanup(name *vector)                                         \
   {                                                                                                               \
     if (vector->data != NULL) {                                                                                   \
       deallocate(vector->data);                                                                                   \
@@ -49,17 +49,17 @@ int tcc_vector_shrink_to_fit_storage(void *data_owner, size_t size, size_t *capa
     name##_init(vector);                                                                                          \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_empty(const name *vector)                                                              \
+  static inline __attribute__((unused)) int name##_empty(const name *vector)                                      \
   {                                                                                                               \
     return vector->size == 0;                                                                                     \
   }                                                                                                               \
                                                                                                                   \
-  static inline void name##_clear(name *vector)                                                                   \
+  static inline __attribute__((unused)) void name##_clear(name *vector)                                           \
   {                                                                                                               \
     vector->size = 0;                                                                                             \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_reserve(name *vector, size_t capacity)                                                 \
+  static inline __attribute__((unused)) int name##_reserve(name *vector, size_t capacity)                         \
   {                                                                                                               \
     type *data;                                                                                                   \
                                                                                                                   \
@@ -78,7 +78,7 @@ int tcc_vector_shrink_to_fit_storage(void *data_owner, size_t size, size_t *capa
     return 0;                                                                                                     \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_grow(name *vector, size_t minimum_capacity)                                            \
+  static inline __attribute__((unused)) int name##_grow(name *vector, size_t minimum_capacity)                    \
   {                                                                                                               \
     size_t capacity;                                                                                              \
                                                                                                                   \
@@ -96,7 +96,7 @@ int tcc_vector_shrink_to_fit_storage(void *data_owner, size_t size, size_t *capa
     return name##_reserve(vector, capacity);                                                                      \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_resize(name *vector, size_t size)                                                      \
+  static inline __attribute__((unused)) int name##_resize(name *vector, size_t size)                              \
   {                                                                                                               \
     size_t old_size = vector->size;                                                                               \
                                                                                                                   \
@@ -110,7 +110,7 @@ int tcc_vector_shrink_to_fit_storage(void *data_owner, size_t size, size_t *capa
     return 0;                                                                                                     \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_push_back(name *vector, type value)                                                    \
+  static inline __attribute__((unused)) int name##_push_back(name *vector, type value)                            \
   {                                                                                                               \
     if (vector->size == SIZE_MAX || name##_grow(vector, vector->size + 1) != 0) {                                 \
       return -1;                                                                                                  \
@@ -119,7 +119,7 @@ int tcc_vector_shrink_to_fit_storage(void *data_owner, size_t size, size_t *capa
     return 0;                                                                                                     \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_pop_back(name *vector, type *value)                                                    \
+  static inline __attribute__((unused)) int name##_pop_back(name *vector, type *value)                            \
   {                                                                                                               \
     if (name##_empty(vector)) {                                                                                   \
       return -1;                                                                                                  \
@@ -131,7 +131,7 @@ int tcc_vector_shrink_to_fit_storage(void *data_owner, size_t size, size_t *capa
     return 0;                                                                                                     \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_insert(name *vector, size_t index, type value)                                         \
+  static inline __attribute__((unused)) int name##_insert(name *vector, size_t index, type value)                 \
   {                                                                                                               \
     if (index > vector->size || vector->size == SIZE_MAX ||                                                       \
         name##_grow(vector, vector->size + 1) != 0) {                                                             \
@@ -143,7 +143,7 @@ int tcc_vector_shrink_to_fit_storage(void *data_owner, size_t size, size_t *capa
     return 0;                                                                                                     \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_erase(name *vector, size_t index)                                                      \
+  static inline __attribute__((unused)) int name##_erase(name *vector, size_t index)                              \
   {                                                                                                               \
     if (index >= vector->size) {                                                                                  \
       return -1;                                                                                                  \
@@ -153,7 +153,7 @@ int tcc_vector_shrink_to_fit_storage(void *data_owner, size_t size, size_t *capa
     return 0;                                                                                                     \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_shrink_to_fit(name *vector)                                                           \
+  static inline __attribute__((unused)) int name##_shrink_to_fit(name *vector)                                   \
   {                                                                                                               \
     type *data;                                                                                                   \
                                                                                                                   \

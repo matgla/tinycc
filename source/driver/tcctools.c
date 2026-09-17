@@ -223,7 +223,7 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
   }
   created_file = argv[i_lib];
 
-  sprintf(tfile, "%s.tmp", argv[i_lib]);
+  snprintf(tfile, sizeof(tfile), "%s.tmp", argv[i_lib]);
   if ((fo = fopen(tfile, "wb+")) == NULL)
   {
     fprintf(stderr, "tcc: ar: can't create temporary file %s\n", tfile);
@@ -334,7 +334,7 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
     memset(arhdro.ar_name, ' ', sizeof(arhdro.ar_name));
     memcpy(arhdro.ar_name, name, istrlen);
     arhdro.ar_name[istrlen] = '/';
-    sprintf(stmp, "%-10d", fsize);
+    snprintf(stmp, sizeof(stmp), "%-10d", fsize);
     memcpy(&arhdro.ar_size, stmp, 10);
     fwrite(&arhdro, sizeof(arhdro), 1, fo);
     fwrite(buf, fsize, 1, fo);
@@ -361,7 +361,7 @@ ST_FUNC int tcc_tool_ar(TCCState *s1, int argc, char **argv)
   }
   {
     int sym_tbl_sz = (funccnt + 1) * sizeof(int);
-    sprintf(stmp, "%-10d", (int)(strpos + sym_tbl_sz) + fpos);
+    snprintf(stmp, sizeof(stmp), "%-10d", (int)(strpos + sym_tbl_sz) + fpos);
   }
   memcpy(&arhdr.ar_size, stmp, 10);
   fwrite(&arhdr, sizeof(arhdr), 1, fh);

@@ -32,14 +32,14 @@
     int words_per_row;                                                                                           \
   } name;                                                                                                         \
                                                                                                                   \
-  static inline void name##_init_empty(name *matrix)                                                              \
+  static inline __attribute__((unused)) void name##_init_empty(name *matrix)                                      \
   {                                                                                                               \
     matrix->words = NULL;                                                                                        \
     matrix->rows = 0;                                                                                            \
     matrix->words_per_row = 0;                                                                                   \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_init(name *matrix, int rows, int columns)                                              \
+  static inline __attribute__((unused)) int name##_init(name *matrix, int rows, int columns)                      \
   {                                                                                                               \
     int words_per_row = (columns + 63) / 64;                                                                     \
     size_t total = (size_t)rows * (size_t)words_per_row;                                                         \
@@ -66,7 +66,7 @@
     return 0;                                                                                                    \
   }                                                                                                              \
                                                                                                                   \
-  static inline void name##_cleanup(name *matrix)                                                                 \
+  static inline __attribute__((unused)) void name##_cleanup(name *matrix)                                         \
   {                                                                                                               \
     if (matrix->words != NULL) {                                                                                 \
       deallocate(matrix->words);                                                                                 \
@@ -74,27 +74,27 @@
     name##_init_empty(matrix);                                                                                    \
   }                                                                                                              \
                                                                                                                   \
-  static inline uint64_t *name##_row(name *matrix, int row)                                                       \
+  static inline __attribute__((unused)) uint64_t *name##_row(name *matrix, int row)                               \
   {                                                                                                              \
     return matrix->words + (size_t)row * (size_t)matrix->words_per_row;                                          \
   }                                                                                                              \
                                                                                                                   \
-  static inline const uint64_t *name##_const_row(const name *matrix, int row)                                     \
+  static inline __attribute__((unused)) const uint64_t *name##_const_row(const name *matrix, int row)             \
   {                                                                                                              \
     return matrix->words + (size_t)row * (size_t)matrix->words_per_row;                                          \
   }                                                                                                              \
                                                                                                                   \
-  static inline void name##_set(name *matrix, int row, int bit)                                                   \
+  static inline __attribute__((unused)) void name##_set(name *matrix, int row, int bit)                           \
   {                                                                                                              \
     tcc_bitspan_set(name##_row(matrix, row), (size_t)bit);                                                       \
   }                                                                                                              \
                                                                                                                   \
-  static inline void name##_reset(name *matrix, int row, int bit)                                                 \
+  static inline __attribute__((unused)) void name##_reset(name *matrix, int row, int bit)                         \
   {                                                                                                              \
     tcc_bitspan_reset(name##_row(matrix, row), (size_t)bit);                                                     \
   }                                                                                                              \
                                                                                                                   \
-  static inline int name##_test(const name *matrix, int row, int bit)                                             \
+  static inline __attribute__((unused)) int name##_test(const name *matrix, int row, int bit)                     \
   {                                                                                                              \
     return tcc_bitspan_test(name##_const_row(matrix, row), (size_t)bit);                                         \
   }

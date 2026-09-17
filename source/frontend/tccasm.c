@@ -992,9 +992,9 @@ static void asm_parse_directive(TCCState *s1, int global)
       next();
     }
     if (n)
-      sprintf(sname, "%s%d", get_tok_str(tok1, NULL), n);
+      snprintf(sname, sizeof(sname), "%s%d", get_tok_str(tok1, NULL), n);
     else
-      sprintf(sname, "%s", get_tok_str(tok1, NULL));
+      snprintf(sname, sizeof(sname), "%s", get_tok_str(tok1, NULL));
     use_section(s1, sname);
   }
   break;
@@ -1674,28 +1674,28 @@ ST_FUNC void tcc_asm_emit_inline(ASMOperand *operands, int nb_operands, int nb_o
   cstr_free_s(&astr);
 }
 
+static void maybe_substitute_inline_const_arg(SValue *sv)
+{
+  if (!tcc_state->in_inline_expansion)
+    return;
+  if ((sv->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL))
+    return;
+
+  for (int i = 0; i < tcc_state->inline_const_arg_count; i++)
+  {
+    if (tcc_state->inline_const_args[i].vreg == sv->vr && tcc_state->inline_const_args[i].stack_offset == sv->c.i)
+    {
+      *sv = tcc_state->inline_const_args[i].value;
+      return;
+    }
+  }
+}
+
 static void parse_asm_operands(ASMOperand *operands, int *nb_operands_ptr, int is_output)
 {
   ASMOperand *op;
   int nb_operands;
   char *astr;
-
-  auto void maybe_substitute_inline_const_arg(SValue * sv)
-  {
-    if (!tcc_state->in_inline_expansion)
-      return;
-    if ((sv->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL))
-      return;
-
-    for (int i = 0; i < tcc_state->inline_const_arg_count; i++)
-    {
-      if (tcc_state->inline_const_args[i].vreg == sv->vr && tcc_state->inline_const_args[i].stack_offset == sv->c.i)
-      {
-        *sv = tcc_state->inline_const_args[i].value;
-        return;
-      }
-    }
-  }
 
   if (tok != ':')
   {

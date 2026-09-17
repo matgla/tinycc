@@ -131,7 +131,7 @@ void parse_atomic(int atok)
     break;
   }
 
-  sprintf(buf, "%s_%d", get_tok_str(atok, 0), size);
+  snprintf(buf, sizeof(buf), "%s_%d", get_tok_str(atok, 0), size);
   vpush_helper_func(tok_alloc_const(buf));
   {
     int call_argc = arg - save;

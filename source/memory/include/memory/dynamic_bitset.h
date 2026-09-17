@@ -28,29 +28,29 @@
     } storage;                                                                                                    \
   } name;                                                                                                         \
                                                                                                                   \
-  static inline size_t name##_word_count(const name *bitset)                                                      \
+  static inline __attribute__((unused)) size_t name##_word_count(const name *bitset)                              \
   {                                                                                                               \
     return bitset->size / TCC_DYNAMIC_BITSET_WORD_BITS +                                                         \
            (bitset->size % TCC_DYNAMIC_BITSET_WORD_BITS != 0);                                                    \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_is_inline(const name *bitset)                                                          \
+  static inline __attribute__((unused)) int name##_is_inline(const name *bitset)                                  \
   {                                                                                                               \
     return name##_word_count(bitset) <=                                                                           \
            ((inline_bit_capacity) + TCC_DYNAMIC_BITSET_WORD_BITS - 1) / TCC_DYNAMIC_BITSET_WORD_BITS;             \
   }                                                                                                               \
                                                                                                                   \
-  static inline uint64_t *name##_data(name *bitset)                                                               \
+  static inline __attribute__((unused)) uint64_t *name##_data(name *bitset)                                       \
   {                                                                                                               \
     return name##_is_inline(bitset) ? bitset->storage.inline_values : bitset->storage.heap;                        \
   }                                                                                                               \
                                                                                                                   \
-  static inline const uint64_t *name##_const_data(const name *bitset)                                             \
+  static inline __attribute__((unused)) const uint64_t *name##_const_data(const name *bitset)                     \
   {                                                                                                               \
     return name##_is_inline(bitset) ? bitset->storage.inline_values : bitset->storage.heap;                        \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_init(name *bitset, size_t size)                                                        \
+  static inline __attribute__((unused)) int name##_init(name *bitset, size_t size)                                \
   {                                                                                                               \
     size_t word_count;                                                                                            \
                                                                                                                   \
@@ -74,7 +74,7 @@
     return 0;                                                                                                     \
   }                                                                                                               \
                                                                                                                   \
-  static inline void name##_cleanup(name *bitset)                                                                 \
+  static inline __attribute__((unused)) void name##_cleanup(name *bitset)                                         \
   {                                                                                                               \
     if (!name##_is_inline(bitset) && bitset->storage.heap != NULL) {                                              \
       deallocate(bitset->storage.heap);                                                                           \
@@ -83,12 +83,12 @@
     bitset->size = 0;                                                                                             \
   }                                                                                                               \
                                                                                                                   \
-  static inline void name##_clear(name *bitset)                                                                   \
+  static inline __attribute__((unused)) void name##_clear(name *bitset)                                           \
   {                                                                                                               \
     memset(name##_data(bitset), 0, name##_word_count(bitset) * sizeof(uint64_t));                                 \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_test(const name *bitset, size_t position)                                               \
+  static inline __attribute__((unused)) int name##_test(const name *bitset, size_t position)                       \
   {                                                                                                               \
     if (position >= bitset->size) {                                                                               \
       return 0;                                                                                                   \
@@ -97,7 +97,7 @@
             (position % TCC_DYNAMIC_BITSET_WORD_BITS)) & 1;                                                       \
   }                                                                                                               \
                                                                                                                   \
-  static inline void name##_set(name *bitset, size_t position)                                                    \
+  static inline __attribute__((unused)) void name##_set(name *bitset, size_t position)                            \
   {                                                                                                               \
     if (position < bitset->size) {                                                                                \
       name##_data(bitset)[position / TCC_DYNAMIC_BITSET_WORD_BITS] |=                                             \
@@ -105,7 +105,7 @@
     }                                                                                                             \
   }                                                                                                               \
                                                                                                                   \
-  static inline void name##_reset(name *bitset, size_t position)                                                  \
+  static inline __attribute__((unused)) void name##_reset(name *bitset, size_t position)                          \
   {                                                                                                               \
     if (position < bitset->size) {                                                                                \
       name##_data(bitset)[position / TCC_DYNAMIC_BITSET_WORD_BITS] &=                                             \
@@ -113,7 +113,7 @@
     }                                                                                                             \
   }                                                                                                               \
                                                                                                                   \
-  static inline void name##_move(name *destination, name *source)                                                 \
+  static inline __attribute__((unused)) void name##_move(name *destination, name *source)                         \
   {                                                                                                               \
     size_t word_count;                                                                                            \
                                                                                                                   \

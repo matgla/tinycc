@@ -809,9 +809,9 @@ ST_FUNC const char *get_tok_str(int v, CValue *cv)
   case TOK_CULLONG:
     /* XXX: not quite exact, but only useful for testing  */
 #ifdef _WIN32
-    sprintf(p, "%u", (unsigned)cv->i);
+    snprintf(p, cstr_buf.size_allocated, "%u", (unsigned)cv->i);
 #else
-    sprintf(p, "%llu", (unsigned long long)cv->i);
+    snprintf(p, cstr_buf.size_allocated, "%llu", (unsigned long long)cv->i);
 #endif
     break;
   case TOK_LCHAR:
@@ -900,7 +900,7 @@ ST_FUNC const char *get_tok_str(int v, CValue *cv)
       }
       if (v >= 127 || (v < 32 && !is_space(v) && v != '\n'))
       {
-        sprintf(p, "<\\x%02x>", v);
+        snprintf(p, cstr_buf.size_allocated, "<\\x%02x>", v);
         break;
       }
     addv:
@@ -927,7 +927,7 @@ ST_FUNC const char *get_tok_str(int v, CValue *cv)
     else if (v >= SYM_FIRST_ANOM)
     {
       /* special name for anonymous symbol */
-      sprintf(p, "L.%u", v - SYM_FIRST_ANOM);
+      snprintf(p, cstr_buf.size_allocated, "L.%u", v - SYM_FIRST_ANOM);
     }
     else
     {

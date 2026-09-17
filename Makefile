@@ -203,8 +203,10 @@ SAN_ENV = LSAN_OPTIONS=detect_leaks=0 ASAN_OPTIONS=detect_leaks=0
 # by exporting your own [AL]SAN_OPTIONS (e.g. detect_leaks=0) to opt out.
 # The nested fp-libs build (SAN_ENV above) keeps leak detection off so the
 # build can still complete.
+ifndef CONFIG_OSX
 export LSAN_OPTIONS ?= detect_leaks=1
 export ASAN_OPTIONS ?= detect_leaks=1
+endif
 endif
 
 
@@ -438,6 +440,12 @@ ARCH_LIB = $($T_ARCH_LIB)
 MODULE_LIBS = $(DRIVER_LIB) $(FRONTEND_LIB) $(OPT_LIB) $(IR_LIB) \
 	$(BACKEND_GENERATORS_LIB) $(MACHINE_LIB) $(OBJ_LIB) $(SUPPORT_LIB) \
 	$(MEMORY_LIB)
+LINK_MODULE_LIBS = -Wl,--whole-archive $(MODULE_LIBS) -Wl,--no-whole-archive
+ifdef CONFIG_OSX
+ ifneq ($(CC_NAME),tcc)
+  LINK_MODULE_LIBS = $(foreach l,$(MODULE_LIBS),-Wl,-force_load,$(l))
+ endif
+endif
 
 TCC_LIBS = $(MODULE_LIBS) $(ARCH_LIB)
 TCC_FILES = $(DRIVER_MAIN_OBJ) $(TCC_LIBS)
@@ -546,7 +554,7 @@ $(DRIVER_MAIN_OBJ) : DEFINES += $(DEF_GITHASH)
 	@$(MAKE) --no-print-directory $@ CROSS_TARGET=$*
 
 $(CROSS_TARGET)-tcc$(EXESUF): $(TCC_FILES)
-	$S$(CC) -o $@ $(DRIVER_MAIN_OBJ) -Wl,--whole-archive $(MODULE_LIBS) -Wl,--no-whole-archive $(ARCH_LIB) $(LDFLAGS) $(LIBS)
+	$S$(CC) -o $@ $(DRIVER_MAIN_OBJ) $(LINK_MODULE_LIBS) $(ARCH_LIB) $(LDFLAGS) $(LIBS)
 
 # Cross libtcc1.a
 %-libtcc1.a : %-tcc$(EXESUF) FORCE

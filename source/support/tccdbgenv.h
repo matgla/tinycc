@@ -75,7 +75,7 @@
  * Note the deliberate `!= NULL` rather than a value test -- VAR= (empty) still
  * counts as set, matching what these knobs have always done. */
 #define TCC_DBG_ENV_FLAG(fn, var)                                                                  \
-  static inline int fn(void)                                                                       \
+  static inline __attribute__((unused)) int fn(void)                                               \
   {                                                                                                \
     static signed char tcc_dbgenv_cached_ = -1;                                                    \
     if (tcc_dbgenv_cached_ < 0)                                                                    \
@@ -85,7 +85,7 @@
 
 /* String knob: the value, or NULL when unset. */
 #define TCC_DBG_ENV_STR(fn, var)                                                                   \
-  static inline const char *fn(void)                                                               \
+  static inline __attribute__((unused)) const char *fn(void)                                       \
   {                                                                                                \
     static const char *tcc_dbgenv_cached_;                                                         \
     static int tcc_dbgenv_checked_;                                                                \
@@ -99,7 +99,7 @@
 
 /* Integer knob: atoi(value), or `dflt` when unset or set to the empty string. */
 #define TCC_DBG_ENV_INT(fn, var, dflt)                                                             \
-  static inline int fn(void)                                                                       \
+  static inline __attribute__((unused)) int fn(void)                                               \
   {                                                                                                \
     static int tcc_dbgenv_cached_ = (dflt);                                                        \
     static int tcc_dbgenv_checked_;                                                                \

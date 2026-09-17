@@ -25,22 +25,22 @@
     } storage;                                                                                                    \
   } name;                                                                                                         \
                                                                                                                   \
-  static inline int name##_is_inline(const name *sequence)                                                        \
+  static inline __attribute__((unused)) int name##_is_inline(const name *sequence)                                \
   {                                                                                                               \
     return sequence->size <= (inline_capacity);                                                                   \
   }                                                                                                               \
                                                                                                                   \
-  static inline type *name##_data(name *sequence)                                                                 \
+  static inline __attribute__((unused)) type *name##_data(name *sequence)                                         \
   {                                                                                                               \
     return name##_is_inline(sequence) ? sequence->storage.inline_values : sequence->storage.heap;                  \
   }                                                                                                               \
                                                                                                                   \
-  static inline const type *name##_const_data(const name *sequence)                                               \
+  static inline __attribute__((unused)) const type *name##_const_data(const name *sequence)                       \
   {                                                                                                               \
     return name##_is_inline(sequence) ? sequence->storage.inline_values : sequence->storage.heap;                  \
   }                                                                                                               \
                                                                                                                   \
-  static inline int name##_init(name *sequence, size_t size)                                                       \
+  static inline __attribute__((unused)) int name##_init(name *sequence, size_t size)                               \
   {                                                                                                               \
     sequence->size = size;                                                                                        \
     if (size > SIZE_MAX / sizeof(type)) {                                                                         \
@@ -59,7 +59,7 @@
     return 0;                                                                                                     \
   }                                                                                                               \
                                                                                                                   \
-  static inline void name##_cleanup(name *sequence)                                                               \
+  static inline __attribute__((unused)) void name##_cleanup(name *sequence)                                       \
   {                                                                                                               \
     if (!name##_is_inline(sequence) && sequence->storage.heap != NULL) {                                           \
       deallocate(sequence->storage.heap);                                                                         \
@@ -68,7 +68,7 @@
     sequence->size = 0;                                                                                           \
   }                                                                                                               \
                                                                                                                   \
-  static inline void name##_move(name *destination, name *source)                                                 \
+  static inline __attribute__((unused)) void name##_move(name *destination, name *source)                         \
   {                                                                                                               \
     if (destination == source) {                                                                                  \
       return;                                                                                                     \

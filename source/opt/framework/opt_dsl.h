@@ -16,6 +16,10 @@
 #include "opt_dsl_helpers.h"
 #include "opt_dsl_entry.h"
 
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Winitializer-overrides"
+#endif
+
 /* OPT_GEN_SSA(name, OP) — opens dispatch fn opt_dsl_dispatch_##name(ctx, i). */
 #define OPT_GEN_SSA(name, op) \
   static int opt_dsl_dispatch_##name(IRSSAOptCtx *ctx, int i); \
