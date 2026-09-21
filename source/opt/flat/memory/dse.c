@@ -25,6 +25,23 @@ int tcc_ir_opt_dse(TCCIRState *ir)
   return r;
 }
 
+/* Whether `q` assigns its dest from its sources.  The stores do not: their
+ * dest is the address written through (or, for STORE_INDEXED/POSTINC, the
+ * base pointer), and an address in src1 is a value leaving for memory. */
+static int dse_defines_dest(const IRQuadCompact *q, IROperand dest)
+{
+  switch (q->op)
+  {
+  case TCCIR_OP_STORE_INDEXED:
+  case TCCIR_OP_STORE_POSTINC:
+    return 0;
+  case TCCIR_OP_STORE:
+    return !dest.is_lval;
+  default:
+    return 1;
+  }
+}
+
 static int dse_operand_is_wide(IROperand op)
 {
   return op.btype == IROP_BTYPE_INT64 || op.btype == IROP_BTYPE_FLOAT64;
@@ -594,7 +611,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
           {
             IROperand d = tcc_ir_op_get_dest(ir, q);
             int32_t dvr = irop_get_vreg(d);
-            if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
+            if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && dse_defines_dest(q, d))
             {
               int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
               if (dpos <= max_tmp_stackloc)
@@ -865,7 +882,8 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       {
         IROperand s = tcc_ir_op_get_src1(ir, q);
         /* Skip range marking for address-of feeding a write-only TMP (writes only, no read). */
-        if (s.is_local && !s.is_lval && irop_get_vreg(s) < 0 && addr_tmp != NULL)
+        if (s.is_local && !s.is_lval && irop_get_vreg(s) < 0 && addr_tmp != NULL &&
+            dse_defines_dest(q, tcc_ir_op_get_dest(ir, q)))
         {
           IROperand d = tcc_ir_op_get_dest(ir, q);
           int32_t dvr = irop_get_vreg(d);
