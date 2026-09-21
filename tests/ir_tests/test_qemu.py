@@ -209,6 +209,7 @@ TEST_FILES = [
     # loads/stores through a pointer to a frame object become direct slots
     ("test_stack_deref_fold.c", 0),
     ("test_ptr_local_fwd.c", 0),
+    ("test_struct_arg_stack.c", 0),
 
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),

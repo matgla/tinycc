@@ -12832,6 +12832,42 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
       }
     }
 
+    /* A struct in the frame loads word by word straight off sp/fp, without
+     * first building its address in a scratch register
+     * (`add.w ip, sp, #N; ldr r1, [ip]`).  The sources and offsets are the
+     * ones get_struct_base_addr_mop would address: only a spill slot's
+     * needs_deref means the slot holds a pointer.  Taken when every word encodes
+     * and the loads are no larger than the address + LDM form (8 bytes). */
+    if (base_dst >= 0 && ((m->mop.kind == MACH_OP_SPILL && !m->mop.needs_deref) ||
+                          m->mop.kind == MACH_OP_PARAM_STACK || m->mop.kind == MACH_OP_FRAME_ADDR))
+    {
+      int off;
+      if (m->mop.kind == MACH_OP_PARAM_STACK)
+        off = m->mop.u.param.offset + offset_to_args;
+      else
+        off = fp_adjust_local_offset(m->mop.kind == MACH_OP_SPILL ? m->mop.u.spill.offset : m->mop.u.frame.offset, 0);
+      int base = tcc_state->need_frame_pointer ? R_FP : R_SP;
+      int bytes = 0;
+      for (int w = 0; w < word_count && bytes >= 0; ++w)
+      {
+        int o = off + 4 * w;
+        int size = base_dst + w == base ? 0
+                                         : th_ldr_imm(base_dst + w, base, o < 0 ? -o : o, o < 0 ? 4 : 6,
+                                                      ENFORCE_ENCODING_NONE)
+                                               .size;
+        bytes = size ? bytes + size : -1;
+      }
+      if (bytes > 0 && (word_count <= 2 || bytes <= 8))
+      {
+        for (int w = 0; w < word_count; ++w)
+        {
+          int o = off + 4 * w;
+          load_word_from_base(base_dst + w, base, o < 0 ? -o : o, o < 0);
+        }
+        return;
+      }
+    }
+
     /* Get the struct base address into a scratch register */
     ScratchRegAlloc struct_scratch = get_scratch_reg_with_save(0);
     int base_addr_reg = get_struct_base_addr_mop(&m->mop, struct_scratch.reg);
