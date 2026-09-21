@@ -2160,6 +2160,94 @@ static int ra_alive_reg_shareable(const RaAliveInfo *alive, SSAInterval *cur,
   return holders > 0;
 }
 
+/* Spill-slot reuse.  A spilled interval only touches its slot inside
+ * [start, end], so once it has expired the slot can hold a later interval of
+ * the same size.  Without this every spill took a fresh slot for the whole
+ * function, and a frame grew with the TOTAL number of spills rather than the
+ * most that are live at once -- Zig's generated C, one long function body of
+ * short-lived temporaries after another, had median frames of 104 bytes where
+ * gcc needs 36, with 123k stack accesses past the 16-bit LDR/STR [sp] reach.
+ *
+ * A slot is reused only if its previous owner ended before the new owner
+ * STARTS.  That is automatic for an interval spilled when the scan reaches it,
+ * but not for an eviction victim: it had a register since its start and is
+ * spilled for the whole interval, so a slot freed after that start is still
+ * shared.  TCC_NO_SPILL_REUSE=1 restores the fresh-slot behaviour. */
+TCC_DBG_ENV_FLAG(ra_no_spill_reuse, "TCC_NO_SPILL_REUSE")
+
+typedef struct
+{
+  int off, size;
+  uint32_t released; /* end of the interval that last held the slot */
+} RaFreeSpillSlot;
+
+typedef struct
+{
+  SSAInterval *iv;
+  int size;
+} RaActiveSpill;
+
+typedef struct
+{
+  RaFreeSpillSlot *free_slots;
+  int free_count;
+  RaActiveSpill *active; /* spilled intervals still live */
+  int active_count;
+  uint32_t active_min_end;
+} RaSpillPool;
+
+static void ra_spill_pool_expire(RaSpillPool *p, uint32_t pos)
+{
+  if (p->active_count == 0 || p->active_min_end >= pos)
+    return;
+  int w = 0;
+  p->active_min_end = UINT32_MAX;
+  for (int j = 0; j < p->active_count; j++)
+  {
+    SSAInterval *a = p->active[j].iv;
+    if (a->end < pos)
+    {
+      RaFreeSpillSlot *f = &p->free_slots[p->free_count++];
+      f->off = a->stack_location;
+      f->size = p->active[j].size;
+      f->released = a->end;
+    }
+    else
+    {
+      p->active[w++] = p->active[j];
+      if (a->end < p->active_min_end)
+        p->active_min_end = a->end;
+    }
+  }
+  p->active_count = w;
+}
+
+/* Give `iv` a `size`-byte spill slot: a free one released before iv->start,
+ * else a fresh one below *spill_loc. */
+static void ra_spill_pool_assign(RaSpillPool *p, SSAInterval *iv, int size, int *spill_loc)
+{
+  int off = 0, found = 0;
+  if (!ra_no_spill_reuse())
+    for (int k = p->free_count - 1; k >= 0; k--)
+      if (p->free_slots[k].size == size && p->free_slots[k].released < iv->start)
+      {
+        off = p->free_slots[k].off;
+        p->free_slots[k] = p->free_slots[--p->free_count];
+        found = 1;
+        break;
+      }
+  if (!found)
+  {
+    *spill_loc -= size;
+    off = *spill_loc;
+  }
+  iv->stack_location = off;
+  p->active[p->active_count].iv = iv;
+  p->active[p->active_count++].size = size;
+  if (iv->end < p->active_min_end)
+    p->active_min_end = iv->end;
+}
+
 static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                            const RegAllocTarget *target, int spill_base,
                            uint64_t *out_dirty_int, uint64_t *out_dirty_fp,
@@ -2274,6 +2362,10 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   int free_slots_4_count = 0;
 
   int spill_loc = spill_base;
+  RaSpillPool spool = {0};
+  spool.free_slots = tcc_malloc(sizeof(RaFreeSpillSlot) * count);
+  spool.active = tcc_malloc(sizeof(RaActiveSpill) * count);
+  spool.active_min_end = UINT32_MAX;
 
   for (int i = 0; i < count; i++) {
     SSAInterval *cur = &intervals[i];
@@ -2352,6 +2444,8 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
       active_addrtaken_count = wa;
     }
 
+    ra_spill_pool_expire(&spool, cur->start);
+
     /* Address-taken: force spill.
      * Reuse an expired addrtaken slot when one is available; otherwise grow
      * the spill area.  Slot reuse is correct here because the addrtaken
@@ -2409,8 +2503,7 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
         cur->r0 = LS_VFP_REG_BASE + reg;
         active[active_count++] = cur;
       } else {
-        spill_loc -= 4;
-        cur->stack_location = spill_loc;
+        ra_spill_pool_assign(&spool, cur, 4, &spill_loc);
       }
       continue;
     }
@@ -2431,8 +2524,7 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
         cur->r1 = LS_VFP_REG_BASE + reg + 1;
         active[active_count++] = cur;
       } else {
-        spill_loc -= 8;
-        cur->stack_location = spill_loc;
+        ra_spill_pool_assign(&spool, cur, 8, &spill_loc);
       }
       continue;
     }
@@ -2597,8 +2689,7 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
           }
           if (!victim || victim_uses >= cur->use_count) break;
           int_free |= (1ull << victim->r0);
-          spill_loc -= 4;
-          victim->stack_location = spill_loc;
+          ra_spill_pool_assign(&spool, victim, 4, &spill_loc);
           victim->r0 = -1;
           active[victim_idx] = active[--active_count];
         }
@@ -2699,16 +2790,14 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
           }
         }
 
-        spill_loc -= 8;
-        cur->stack_location = spill_loc;
+        ra_spill_pool_assign(&spool, cur, 8, &spill_loc);
       }
       continue;
     }
 
     /* Complex double: always spill (128-bit) */
     if (cur->reg_type == LS_REG_TYPE_COMPLEX_DOUBLE) {
-      spill_loc -= 16;
-      cur->stack_location = spill_loc;
+      ra_spill_pool_assign(&spool, cur, 16, &spill_loc);
       continue;
     }
 
@@ -3039,19 +3128,19 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
         /* Evict victim, give its register to cur */
         reg = victim->r0;
         victim->r0 = -1;
-        spill_loc -= 4;
-        victim->stack_location = spill_loc;
+        ra_spill_pool_assign(&spool, victim, 4, &spill_loc);
         /* Remove victim from active */
         active[victim_idx] = active[--active_count];
         cur->r0 = reg;
         active[active_count++] = cur;
       } else {
-        spill_loc -= 4;
-        cur->stack_location = spill_loc;
+        ra_spill_pool_assign(&spool, cur, 4, &spill_loc);
       }
     }
   }
 
+  tcc_free(spool.free_slots);
+  tcc_free(spool.active);
   tcc_free(active);
   tcc_free(active_addrtaken);
   tcc_free(free_slots_4);

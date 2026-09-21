@@ -185,6 +185,9 @@ TEST_FILES = [
     # small aggregates copied as LOAD/STORE chunks instead of __aeabi_memmove
     ("test_small_aggregate_copy.c", 0),
 
+    # spill slots reused after their interval expires (incl. eviction victims)
+    ("test_spill_slot_reuse.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
 
