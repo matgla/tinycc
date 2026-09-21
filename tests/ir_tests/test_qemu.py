@@ -196,6 +196,9 @@ TEST_FILES = [
     # an array of structs with a VLA member is itself a VLA
     ("bug_vla_struct_array.c", 0),
 
+    # a constant initializer copied from .rodata keeps its narrow fields narrow
+    ("bug_block_copy_init_narrow.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
 
