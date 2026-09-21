@@ -228,3 +228,128 @@ int ssa_opt_indirect_stack_offset_ex(IRSSAOptCtx *ctx, const IRQuadCompact *q, i
     return INT_MIN;
   return base_off + irop_get_imm32(idx);
 }
+
+/* ssa:stack_deref_fold -- a load or store through a TEMP pointer whose value is
+ * a constant frame address becomes a direct StackLoc access.
+ *
+ * The Zig C backend names every sub-object through a pointer temporary
+ * (`t3 = &t2->major; (*t3) = 5;`), assigned in each arm of a switch, so before
+ * SSA the pointer is a multi-definition VAR and stack_addr_simplify cannot
+ * follow it; it also stays away from any function with a loop.  After renaming
+ * each arm's pointer is a single-definition TEMP, and resolving it here turns
+ * `add rX, sp, #off; str rY, [rX]` into `str rY, [sp, #off]`; DCE then drops
+ * the address arithmetic.  Every hop must be the value's only definition, phi
+ * included: the rewrite replaces the use outright. */
+static int sdf_resolve(IRSSAOptCtx *ctx, int32_t vr, int *out_off, int32_t *out_slot_vr)
+{
+  TCCIRState *ir = ctx->ir;
+  int acc = 0;
+  for (int hop = 0; hop < 16; hop++) {
+    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      return 0;
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+    if (!vi || vi->def_instr < 0 || ssa_opt_def_total(vi) != 1)
+      return 0;
+    IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
+    IROperand src = tcc_ir_op_get_src1(ir, dq);
+    int direct = irop_get_tag(src) == IROP_TAG_STACKOFF && irop_get_vreg(src) < 0 && src.is_local &&
+                 !src.is_lval && !src.is_llocal && !src.is_param;
+    int copy = irop_get_tag(src) == IROP_TAG_VREG && !src.is_lval && !src.is_local && !src.is_llocal;
+    if (dq->op == TCCIR_OP_ASSIGN || dq->op == TCCIR_OP_LEA) {
+      if (direct) {
+        *out_off = irop_get_stack_offset(src) + acc;
+        *out_slot_vr = irop_get_vreg(src);
+        return 1;
+      }
+      if (dq->op == TCCIR_OP_ASSIGN && copy) {
+        vr = irop_get_vreg(src);
+        continue;
+      }
+      return 0;
+    }
+    if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB) {
+      IROperand s2 = tcc_ir_op_get_src2(ir, dq);
+      if (irop_get_tag(s2) != IROP_TAG_IMM32 || s2.is_lval)
+        return 0;
+      int d = irop_get_imm32(s2);
+      acc += dq->op == TCCIR_OP_ADD ? d : -d;
+      if (direct) {
+        *out_off = irop_get_stack_offset(src) + acc;
+        *out_slot_vr = irop_get_vreg(src);
+        return 1;
+      }
+      if (copy) {
+        vr = irop_get_vreg(src);
+        continue;
+      }
+      return 0;
+    }
+    return 0;
+  }
+  return 0;
+}
+
+int ssa_opt_stack_deref_fold(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  int changes = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    int op = q->op;
+    if (op != TCCIR_OP_STORE && op != TCCIR_OP_LOAD && op != TCCIR_OP_STORE_INDEXED && op != TCCIR_OP_LOAD_INDEXED)
+      continue;
+    int is_store = op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED;
+    int indexed = op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_LOAD_INDEXED;
+    IROperand base = is_store ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+    if (irop_get_tag(base) != IROP_TAG_VREG || base.is_local || base.is_llocal || base.is_lval == indexed)
+      continue;
+    int32_t bvr = irop_get_vreg(base), slot_vr;
+    int off;
+    if (!sdf_resolve(ctx, bvr, &off, &slot_vr))
+      continue;
+
+    /* The access's width and sign: the deref operand for a plain access, the
+     * value (store) or result (load) for an indexed one, whose marks were
+     * moved onto the base when it was fused. */
+    IROperand acc = base;
+    if (indexed) {
+      IROperand idx = tcc_ir_op_get_src2(ir, q);
+      IROperand scale = tcc_ir_op_get_scale(ir, q);
+      if (irop_get_tag(idx) != IROP_TAG_IMM32 || idx.is_lval ||
+          (!irop_is_none(scale) && (irop_get_tag(scale) != IROP_TAG_IMM32 || irop_get_imm32(scale) != 0)))
+        continue;
+      off += irop_get_imm32(idx);
+      acc = is_store ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
+      acc.aux = base.aux;
+      if (irop_is_64bit(acc))
+        continue;
+    }
+    if (irop_get_btype(acc) == IROP_BTYPE_STRUCT || acc.is_complex || tcc_ir_access_is_volatile(ir, acc))
+      continue;
+
+    /* Keep the slot's own identity: a frontend temporary slot carries a
+     * negative vreg (VR_TEMP_LOCAL), which passes match its accesses by. */
+    IROperand slot = irop_make_stackoff(slot_vr, off, 1, 0, 0, irop_get_btype(acc));
+    slot.is_unsigned = acc.is_unsigned;
+    slot.aux = acc.aux;
+    if (indexed)
+      q->op = is_store ? TCCIR_OP_STORE : TCCIR_OP_LOAD;
+    if (is_store)
+      tcc_ir_set_dest(ir, i, slot);
+    else
+      tcc_ir_set_src1(ir, i, slot);
+
+    /* The pointer is no longer used here unless another operand names it. */
+    int still = 0;
+    if (irop_config[q->op].has_dest)
+      still |= irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == bvr;
+    if (irop_config[q->op].has_src1)
+      still |= irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == bvr;
+    if (irop_config[q->op].has_src2)
+      still |= irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == bvr;
+    if (!still)
+      ssa_opt_remove_use_instr(ssa_opt_vinfo(ctx, bvr), i);
+    changes++;
+  }
+  return changes;
+}

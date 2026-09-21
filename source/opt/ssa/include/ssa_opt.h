@@ -289,6 +289,9 @@ int ssa_opt_resolve_temp_to_base_off(IRSSAOptCtx *ctx, int32_t vr,
  * dest is not TEMP-DEREF or the LEA chain does not resolve, or the index
  * is not a constant with scale 0. */
 int ssa_opt_indirect_stack_offset(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side);
+/* Loads and stores through a TEMP holding a constant frame address become
+ * direct StackLoc accesses (stack_resolve.c). */
+int ssa_opt_stack_deref_fold(IRSSAOptCtx *ctx);
 /* Variant that also reports the resolved address identity via *out_base_var
  * (see ssa_opt_resolve_lea_stackloc_ex for the -1 / >=0 contract). */
 int ssa_opt_indirect_stack_offset_ex(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side,

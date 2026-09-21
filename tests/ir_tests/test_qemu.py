@@ -206,6 +206,9 @@ TEST_FILES = [
     ("test_dse_object_ranges.c", 0),
     ("test_dse_wide.c", 0),
 
+    # loads/stores through a pointer to a frame object become direct slots
+    ("test_stack_deref_fold.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
 
