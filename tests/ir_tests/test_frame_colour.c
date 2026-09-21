@@ -160,6 +160,78 @@ __attribute__((noinline)) static int switch_loop(int n)
   return s + sum_blk(carried);
 }
 
+/* memcpy and strchr keep no pointer, but their results point into their
+ * first argument: that object lives as long as the result is used. */
+__attribute__((noinline)) static int through_libcalls(int k)
+{
+  struct blk src = mk(k);
+  struct blk dst;
+  int *p = memcpy(&dst, &src, sizeof dst);
+  struct name n = nm("abc:def");
+  char *colon = strchr(n.s, ':');
+  struct blk later = mk(k + 5);
+  struct name other = nm("zzzzzzzzzzzz");
+  return p[3] + later.v[1] + (int)(colon - n.s) * 1000 + colon[1] + other.s[0];
+}
+
+/* Blocks laid out A, C, B where B jumps back to C: x is written in A and read
+ * in C after y was used in B, so they must not share although C comes before
+ * B in the source. */
+__attribute__((noinline)) static int layout_order(int k)
+{
+  struct blk x, y;
+  int r = 0, s = 0;
+  if (k)
+    goto A;
+  goto end;
+A:
+  x = mk(k);
+  goto B;
+C:
+  r = x.v[3];
+  goto end;
+B:
+  y = mk(k + 1);
+  s = y.v[4];
+  goto C;
+end:
+  return r + s;
+}
+
+/* Objects in different cases of a switch may share; the result must not. */
+__attribute__((noinline)) static int switch_cases(int sel)
+{
+  struct blk res;
+  switch (sel)
+  {
+  case 0:
+  {
+    struct blk a = mk(1);
+    res = a;
+    break;
+  }
+  case 1:
+  {
+    struct blk b = mk(2);
+    b.v[0] += 5;
+    res = b;
+    break;
+  }
+  case 2:
+  {
+    struct blk c = mk(3);
+    struct blk d = mk(4);
+    c.v[0] += d.v[0];
+    res = c;
+    break;
+  }
+  default:
+    res = mk(9);
+    break;
+  }
+  return res.v[0] + res.v[11];
+}
+
 static jmp_buf env;
 __attribute__((noinline)) static void jump(int v)
 {
@@ -190,5 +262,8 @@ int main(void)
   printf("%d\n", goto_loop(15));
   printf("%d\n", switch_loop(23));
   printf("%d\n", with_setjmp(2));
+  printf("%d\n", through_libcalls(4));
+  printf("%d %d\n", layout_order(3), layout_order(0));
+  printf("%d %d %d %d\n", switch_cases(0), switch_cases(1), switch_cases(2), switch_cases(7));
   return 0;
 }
