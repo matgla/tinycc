@@ -6224,6 +6224,12 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
   memset(&alive, 0, sizeof alive);
   if (ra_alive_worth_building(ir, intervals, interval_count))
     ra_alive_build(ir, &alive, max_vreg_pos);
+  /* Drop the frame objects nothing references any more so spills go right
+   * below the live ones (frame.c).  Here, after the SSA passes: some of them
+   * add direct frame references (loop_const_sim's residual stores), and the
+   * layout must see every reference the code will make. */
+  if (tcc_state && tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("frame_relayout"))
+    tcc_ir_frame_relayout(ir, &spill_base);
   ra_linear_scan(ir, intervals, interval_count, target, spill_base, &dirty_int, &dirty_fp,
                  max_vreg_pos, has_call, &alive);
   ra_alive_free(&alive);

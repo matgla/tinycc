@@ -188,6 +188,9 @@ TEST_FILES = [
     # spill slots reused after their interval expires (incl. eviction victims)
     ("test_spill_slot_reuse.c", 0),
 
+    # frame objects left unreferenced are dropped, live ones packed (frame.c)
+    ("test_frame_relayout.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
 

@@ -182,7 +182,7 @@ void gfunc_param_typed(Sym *func, Sym *arg)
         }
         else
         {
-          loc = (loc - size) & -align;
+          loc = tcc_ir_frame_alloc(loc, size, -align);
           tmp_loc = loc;
         }
 
@@ -284,7 +284,7 @@ void gfunc_param_typed(Sym *func, Sym *arg)
          * vstack, causing get_temp_local_var() to reuse the same slot for
          * a subsequent struct argument in the same call.  This would make
          * both struct copies alias the same memory.  (See GCC PR 67226.) */
-        loc = (loc - size) & -align;
+        loc = tcc_ir_frame_alloc(loc, size, -align);
         int tmp_loc = loc;
 
         /* Store the source struct into the temporary destination.

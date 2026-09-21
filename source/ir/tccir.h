@@ -505,6 +505,10 @@ typedef struct TCCIRState
   int32_t captured_count;            /* number of captured variables */
   int32_t loc;
   int32_t parent_loc; /* parent's loc value (for nested function offset validation) */
+  /* Frontend stack objects as (frame offset, size incl. alignment padding)
+   * pairs, for frame relayout (frame.c).  Filled while the body is parsed. */
+  int32_t *frame_objs;
+  int frame_obj_count, frame_obj_cap;
 
   /* Nested function tracking (for parent functions that contain nested functions) */
   NestedFunc **nested_funcs;     /* array of pointers to nested function descriptors */
@@ -764,6 +768,11 @@ int tcc_ir_get_vreg_static_chain(TCCIRState *ir);
 void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double);
 void tcc_ir_set_llong_type(TCCIRState *ir, int vreg);
 void tcc_ir_set_original_offset(TCCIRState *ir, int vreg, int offset);
+/* frame.c */
+/* `(loc - size) & mask`, recording the object in the current function's IR
+ * for tcc_ir_frame_relayout. */
+int tcc_ir_frame_alloc(int loc, int size, int mask);
+int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc);
 int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
 
 void tcc_ir_register_allocation_params(TCCIRState *ir);

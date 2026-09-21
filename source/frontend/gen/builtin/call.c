@@ -260,7 +260,7 @@ void unary_funcall(void)
       }
       else
       {
-        loc = (loc - size) & -align;
+        loc = tcc_ir_frame_alloc(loc, size, -align);
         sret_loc = loc;
       }
       ret.type = s->type;
@@ -1816,7 +1816,7 @@ va_arg_pack_done:
           psize = 4;
         if (palign < 4)
           palign = 4;
-        loc = (loc - psize) & -palign;
+        loc = tcc_ir_frame_alloc(loc, psize, -palign);
 
         /* Push parameter symbol FIRST so it gets a vreg assigned.
          * Unnamed parameters (v == 0) would crash sym_push because
@@ -1956,7 +1956,7 @@ va_arg_pack_done:
             rsize = 4;
           if (ralign < 4)
             ralign = 4;
-          loc = (loc - rsize) & -ralign;
+          loc = tcc_ir_frame_alloc(loc, rsize, -ralign);
           inline_ret_loc = loc;
         }
 
@@ -2214,7 +2214,7 @@ va_arg_pack_done:
         size = (size + regsize - 1) & -regsize;
         if (ret_align > align)
           align = ret_align;
-        loc = (loc - size) & -align;
+        loc = tcc_ir_frame_alloc(loc, size, -align);
         addr = loc;
         offset = 0;
         for (;;)

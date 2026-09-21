@@ -40,6 +40,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/ir/cfg.c",
     "source/ir/codegen.c",
     "source/ir/dump.c",
+    "source/ir/frame.c",
     "source/ir/machine_op.c",
     "source/ir/pool.c",
     "source/ir/regalloc.c",

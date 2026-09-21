@@ -158,6 +158,11 @@ void tcc_ir_set_original_offset(TCCIRState *ir, int vreg, int offset)
   (void)offset;
 }
 
+int tcc_ir_frame_alloc(int loc, int size, int mask)
+{
+  return (loc - size) & mask;
+}
+
 void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double)
 {
   (void)ir;

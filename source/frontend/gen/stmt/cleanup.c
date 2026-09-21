@@ -151,7 +151,7 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
     psize = 4;
   if (palign < 4)
     palign = 4;
-  loc = (loc - psize) & -palign;
+  loc = tcc_ir_frame_alloc(loc, psize, -palign);
 
   int pv = param_sym->v & ~SYM_FIELD;
   if (pv == 0)

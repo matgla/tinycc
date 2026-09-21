@@ -607,7 +607,7 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
         int slot_align = align;
         if (size >= 4 && slot_align < 4 && (type->t & VT_BTYPE) == VT_STRUCT)
           slot_align = 4;
-        loc = (loc - size) & -slot_align;
+        loc = tcc_ir_frame_alloc(loc, size, -slot_align);
       }
     }
     addr = loc;

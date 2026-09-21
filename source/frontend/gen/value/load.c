@@ -60,7 +60,7 @@ int get_temp_local_var(int size, int align, int *vr_out)
       return temp_var->location;
     }
   }
-  loc = (loc - size) & -align;
+  loc = tcc_ir_frame_alloc(loc, size, -align);
   if (nb_temp_local_vars < MAX_TEMP_LOCAL_VARIABLE_NUMBER)
   {
     temp_var = &arr_temp_local_vars[nb_temp_local_vars];

@@ -90,7 +90,7 @@ void gfunc_return(CType *func_type)
           /* Source is an rvalue (register pair) — spill to temp local.
            * This path handles _Complex float/int (8 bytes) which can fit
            * in a register pair and be stored via a single 64-bit STORE. */
-          loc = (loc - complex_size) & -complex_align;
+          loc = tcc_ir_frame_alloc(loc, complex_size, -complex_align);
           int tmp_loc = loc;
 
           SValue tmp_dst;
@@ -450,7 +450,7 @@ void gfunc_return(CType *func_type)
           (align & (ret_align - 1)) && ((vtop->r & VT_VALMASK) < VT_CONST /* pointer to struct */
                                         || (vtop->c.i & (ret_align - 1))))
       {
-        loc = (loc - size) & -ret_align;
+        loc = tcc_ir_frame_alloc(loc, size, -ret_align);
         addr = loc;
         type = *func_type;
         vset(&type, VT_LOCAL | VT_LVAL, addr);

@@ -165,6 +165,12 @@ void tcc_ir_free(TCCIRState *ir)
     tcc_free(ir->active_set);
   }
 
+  if (ir->frame_objs)
+  {
+    tcc_free(ir->frame_objs);
+    ir->frame_objs = NULL;
+  }
+
   if (ir->ir_to_code_mapping)
   {
     tcc_free(ir->ir_to_code_mapping);
