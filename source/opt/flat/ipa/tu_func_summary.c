@@ -287,9 +287,11 @@ static int tu_modref_walk(Sym *callee, MemLoc L)
     TuFuncSummary *s = tu_summary_lookup(f);
     if (!s)
     {
-      /* No summary.  A block-copy helper's effect was already resolved into the
-       * CALLER's summary from its destination argument, so it is not an unknown
-       * here; anything else (external, or not yet compiled) is. */
+      /* No summary.  A block-copy helper reached through a callee had its effect
+       * resolved into that callee's summary from its destination argument, so it
+       * is not an unknown here; anything else (external, or not yet compiled) is.
+       * A DIRECT block-copy call never gets here: tcc_ir_call_may_write resolves
+       * its destination at the call site. */
       if (tu_is_block_copy_helper(get_tok_str(f->v, NULL)))
         continue;
       return 1;
@@ -323,6 +325,34 @@ int tcc_ir_call_may_write(TCCIRState *ir, int call_idx, MemLoc L)
   Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
   if (!callee)
     return 1; /* indirect call */
+  /* A DIRECT block-copy/fill call writes its destination range, and that has to
+   * be resolved here, at the call site.  tu_modref_walk skips these helpers
+   * because, reached through a callee, their effect is already folded into that
+   * callee's summary -- but for a direct call the calling function is the one
+   * being optimized, whose summary is never consulted.  Skipping it here said
+   * `g = make()` (a memmove into g) does not write g, and copy-source forwarding
+   * then answered a read of an earlier copy of g with g's new value. */
+  const char *cname = get_tok_str(callee->v, NULL);
+  if (tu_is_block_copy_helper(cname))
+  {
+    IROperand dst, len;
+    if (!ir_opt_get_call_param_operand(ir, call_idx, 0, &dst))
+      return 1;
+    MemLoc D = memloc_of_pointer(ir, dst, call_idx);
+    if (D.kind != MEMLOC_GLOBAL && D.kind != MEMLOC_FRAME)
+      return 1;
+    /* Length: (dst, src, n) for the copies and memset; (dst, n[, c]) for the
+     * AEABI set/clear helpers.  Unknown -> everything from dst onwards. */
+    int len_idx = (!strncmp(cname, "__aeabi_memset", 14) || !strncmp(cname, "__aeabi_memclr", 14)) ? 1 : 2;
+    D.size = 1 << 30;
+    if (ir_opt_get_call_param_operand(ir, call_idx, len_idx, &len) && irop_is_immediate(len))
+    {
+      int64_t n = irop_get_imm64_ex(ir, len);
+      if (n > 0 && n < (1 << 30))
+        D.size = (int)n;
+    }
+    return mem_may_alias(D, L);
+  }
   return tu_modref_walk(callee, L);
 }
 

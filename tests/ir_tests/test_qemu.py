@@ -178,6 +178,10 @@ TEST_FILES = [
     # keeps its width -- Zig's 2-byte `!void` error union test
     ("bug_narrow_local_slot_width.c", 0),
 
+    # a direct memmove into a global writes it: mod-ref must resolve the
+    # destination at the call site (copy-source forwarding read the new value)
+    ("bug_modref_direct_block_copy.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
 
