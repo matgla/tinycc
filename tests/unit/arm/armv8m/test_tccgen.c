@@ -163,6 +163,21 @@ int tcc_ir_frame_alloc(int loc, int size, int mask)
   return (loc - size) & mask;
 }
 
+int tcc_ir_frame_alloc_arg_copy(int loc, int size, int mask)
+{
+  return (loc - size) & mask;
+}
+
+int tcc_ir_frame_alloc_ret_temp(int loc, int size, int mask)
+{
+  return (loc - size) & mask;
+}
+
+void tcc_ir_frame_note_sret_call(int call_id)
+{
+  (void)call_id;
+}
+
 void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double)
 {
   (void)ir;

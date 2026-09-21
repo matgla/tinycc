@@ -165,7 +165,7 @@ int get_arg_struct_temp(int size, int align)
       return arg_struct_temps[i].location;
     }
   }
-  loc = tcc_ir_frame_alloc(loc, size, -align);
+  loc = tcc_ir_frame_alloc_arg_copy(loc, size, -align);
   if (nb_arg_struct_temps < MAX_ARG_STRUCT_TEMPS)
   {
     int i = nb_arg_struct_temps++;

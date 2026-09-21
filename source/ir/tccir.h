@@ -505,10 +505,14 @@ typedef struct TCCIRState
   int32_t captured_count;            /* number of captured variables */
   int32_t loc;
   int32_t parent_loc; /* parent's loc value (for nested function offset validation) */
-  /* Frontend stack objects as (frame offset, size incl. alignment padding)
-   * pairs, for frame relayout (frame.c).  Filled while the body is parsed. */
+  /* Frontend stack objects as (frame offset, size incl. alignment padding,
+   * FRAME_OBJ_* flags) triples, for frame relayout (frame.c).  Filled while
+   * the body is parsed. */
   int32_t *frame_objs;
   int frame_obj_count, frame_obj_cap;
+  /* Call ids whose parameter 0 is the struct-return buffer (frame.c). */
+  uint8_t *sret_calls;
+  int sret_calls_size;
 
   /* Nested function tracking (for parent functions that contain nested functions) */
   NestedFunc **nested_funcs;     /* array of pointers to nested function descriptors */
@@ -772,7 +776,18 @@ void tcc_ir_set_original_offset(TCCIRState *ir, int vreg, int offset);
 /* `(loc - size) & mask`, recording the object in the current function's IR
  * for tcc_ir_frame_relayout. */
 int tcc_ir_frame_alloc(int loc, int size, int mask);
+/* The same for the temporaries that carry a struct into or out of a call: its
+ * address reaching the call does not let the callee keep it.  An argument's
+ * copy is never visible to the program; a call's struct result is, through
+ * an array member (`f().arr`), until the end of the full expression. */
+int tcc_ir_frame_alloc_arg_copy(int loc, int size, int mask);
+int tcc_ir_frame_alloc_ret_temp(int loc, int size, int mask);
+/* Parameter 0 of call `call_id` is the struct-return buffer. */
+void tcc_ir_frame_note_sret_call(int call_id);
 int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc);
+/* The function calls setjmp, vfork or another function that returns twice, so
+ * a frame slot live only on one return may still be read on the other. */
+int tcc_ir_calls_returns_twice(TCCIRState *ir);
 int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
 
 void tcc_ir_register_allocation_params(TCCIRState *ir);

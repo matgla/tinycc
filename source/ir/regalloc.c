@@ -2194,6 +2194,9 @@ typedef struct
   RaActiveSpill *active; /* spilled intervals still live */
   int active_count;
   uint32_t active_min_end;
+  /* No reuse when the function calls setjmp, vfork, ...: a slot whose interval
+   * ended on one return may still be read on the other. */
+  int no_reuse;
 } RaSpillPool;
 
 static void ra_spill_pool_expire(RaSpillPool *p, uint32_t pos)
@@ -2227,7 +2230,7 @@ static void ra_spill_pool_expire(RaSpillPool *p, uint32_t pos)
 static void ra_spill_pool_assign(RaSpillPool *p, SSAInterval *iv, int size, int *spill_loc)
 {
   int off = 0, found = 0;
-  if (!ra_no_spill_reuse())
+  if (!p->no_reuse)
     for (int k = p->free_count - 1; k >= 0; k--)
       if (p->free_slots[k].size == size && p->free_slots[k].released < iv->start)
       {
@@ -2366,6 +2369,7 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   spool.free_slots = tcc_malloc(sizeof(RaFreeSpillSlot) * count);
   spool.active = tcc_malloc(sizeof(RaActiveSpill) * count);
   spool.active_min_end = UINT32_MAX;
+  spool.no_reuse = ra_no_spill_reuse() || tcc_ir_calls_returns_twice(ir);
 
   for (int i = 0; i < count; i++) {
     SSAInterval *cur = &intervals[i];
@@ -2457,7 +2461,7 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
      * A volatile local is forced to memory the same way: every access must
      * be a real ldr/str, so it must never occupy a register. */
     if (cur->addrtaken || cur->is_volatile) {
-      if (free_slots_4_count > 0) {
+      if (free_slots_4_count > 0 && !spool.no_reuse) {
         cur->stack_location = free_slots_4[--free_slots_4_count];
       } else {
         spill_loc -= 4;

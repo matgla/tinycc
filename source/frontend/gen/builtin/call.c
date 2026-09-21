@@ -260,7 +260,7 @@ void unary_funcall(void)
       }
       else
       {
-        loc = tcc_ir_frame_alloc(loc, size, -align);
+        loc = tcc_ir_frame_alloc_ret_temp(loc, size, -align);
         sret_loc = loc;
       }
       ret.type = s->type;
@@ -321,6 +321,7 @@ void unary_funcall(void)
           LOG_CODEGEN("FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
                       TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+          tcc_ir_frame_note_sret_call(call_id);
         }
         vtop--;
         nb_args++;
@@ -2214,7 +2215,7 @@ va_arg_pack_done:
         size = (size + regsize - 1) & -regsize;
         if (ret_align > align)
           align = ret_align;
-        loc = tcc_ir_frame_alloc(loc, size, -align);
+        loc = tcc_ir_frame_alloc_ret_temp(loc, size, -align);
         addr = loc;
         offset = 0;
         for (;;)
