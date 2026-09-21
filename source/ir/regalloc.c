@@ -6678,10 +6678,14 @@ static int ra_dfs_width(IROperand op)
   }
 }
 
-/* A plain frame slot operand: `StackLoc[off]` naming memory directly. */
+/* A plain frame slot operand: `StackLoc[off]` naming memory directly -- the
+ * frontend's temporary slots included, which carry a negative vreg
+ * (VR_TEMP_LOCAL).  Excluding those hid `Addr[temporary]` from the escape
+ * check below, and a store to the same slot through a -1 operand (lea_fold
+ * makes those) was deleted although a call read the slot. */
 static int ra_dfs_is_slot(IROperand op)
 {
-  return op.tag == IROP_TAG_STACKOFF && !op.is_sym && irop_get_vreg(op) == -1;
+  return op.tag == IROP_TAG_STACKOFF && !op.is_sym && irop_get_vreg(op) < 0;
 }
 
 #define RA_DFS_MAX_READS 256
