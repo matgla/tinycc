@@ -513,6 +513,11 @@ typedef struct TCCIRState
   /* Call ids whose parameter 0 is the struct-return buffer (frame.c). */
   uint8_t *sret_calls;
   int sret_calls_size;
+  /* Sorted, merged [start, end) extents of frame_objs for lookups, built for
+   * frame_obj_count objects; frame_relaid once relayout moved them. */
+  int32_t *frame_index;
+  int frame_index_n, frame_index_objs;
+  uint8_t frame_relaid;
 
   /* Nested function tracking (for parent functions that contain nested functions) */
   NestedFunc **nested_funcs;     /* array of pointers to nested function descriptors */
@@ -784,6 +789,9 @@ int tcc_ir_frame_alloc_arg_copy(int loc, int size, int mask);
 int tcc_ir_frame_alloc_ret_temp(int loc, int size, int mask);
 /* Parameter 0 of call `call_id` is the struct-return buffer. */
 void tcc_ir_frame_note_sret_call(int call_id);
+/* The frontend object containing frame offset `off`, as [*lo, *hi), while the
+ * frame still has the frontend's layout.  0 when unknown. */
+int tcc_ir_frame_object_at(TCCIRState *ir, int off, int *lo, int *hi);
 int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc);
 /* The function calls setjmp, vfork or another function that returns twice, so
  * a frame slot live only on one return may still be read on the other. */

@@ -120,6 +120,62 @@ void tcc_ir_frame_note_sret_call(int call_id)
   ir->sret_calls[call_id] = 1;
 }
 
+static int frame_idx_cmp(const void *a, const void *b)
+{
+  const int32_t *x = a, *y = b;
+  return x[0] < y[0] ? -1 : x[0] > y[0];
+}
+
+int tcc_ir_frame_object_at(TCCIRState *ir, int off, int *lo, int *hi)
+{
+  if (!ir || ir->frame_relaid || !ir->frame_obj_count)
+    return 0;
+  if (ir->frame_index_objs != ir->frame_obj_count)
+  {
+    /* Rebuild: extents sorted by start, overlapping ones merged. */
+    int n = ir->frame_obj_count, m = 0;
+    int32_t *e = tcc_malloc(sizeof(int32_t) * 2 * n);
+    for (int k = 0; k < n; k++)
+    {
+      e[2 * k] = ir->frame_objs[4 * k];
+      e[2 * k + 1] = ir->frame_objs[4 * k] + ir->frame_objs[4 * k + 1];
+    }
+    qsort(e, n, sizeof(int32_t) * 2, frame_idx_cmp);
+    for (int k = 0; k < n; k++)
+    {
+      if (m && e[2 * k] < e[2 * m - 1])
+      {
+        if (e[2 * k + 1] > e[2 * m - 1])
+          e[2 * m - 1] = e[2 * k + 1];
+        continue;
+      }
+      e[2 * m] = e[2 * k];
+      e[2 * m + 1] = e[2 * k + 1];
+      m++;
+    }
+    tcc_free(ir->frame_index);
+    ir->frame_index = e;
+    ir->frame_index_n = m;
+    ir->frame_index_objs = n;
+  }
+  int a = 0, b = ir->frame_index_n - 1;
+  while (a <= b)
+  {
+    int mid = (a + b) / 2;
+    if (off < ir->frame_index[2 * mid])
+      b = mid - 1;
+    else if (off >= ir->frame_index[2 * mid + 1])
+      a = mid + 1;
+    else
+    {
+      *lo = ir->frame_index[2 * mid];
+      *hi = ir->frame_index[2 * mid + 1];
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /* GCC's list (special_function_p), leading underscores ignored. */
 static int frame_name_returns_twice(const char *name)
 {
@@ -1135,8 +1191,10 @@ static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom)
 int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
 {
   const int bottom = *ploc;
-  if (!ir || bottom >= 0 || ir->frame_obj_count == 0 || !frame_function_eligible(ir))
+  /* Once only: after it, the operands no longer match frame_objs. */
+  if (!ir || ir->frame_relaid || bottom >= 0 || ir->frame_obj_count == 0 || !frame_function_eligible(ir))
     return 0;
+  ir->frame_relaid = 1;
 
   /* Objects -> disjoint segments tiling [bottom, 0), gaps included. */
   int nobj = ir->frame_obj_count;

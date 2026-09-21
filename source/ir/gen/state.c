@@ -175,6 +175,11 @@ void tcc_ir_free(TCCIRState *ir)
     tcc_free(ir->sret_calls);
     ir->sret_calls = NULL;
   }
+  if (ir->frame_index)
+  {
+    tcc_free(ir->frame_index);
+    ir->frame_index = NULL;
+  }
 
   if (ir->ir_to_code_mapping)
   {

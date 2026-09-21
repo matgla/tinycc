@@ -202,6 +202,9 @@ TEST_FILES = [
     # an array's address stored into memory keeps the array's initializer
     ("bug_dse_indexed_store_escape.c", 0),
 
+    # dead-store elimination bounds reads through an address by its object
+    ("test_dse_object_ranges.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
 
