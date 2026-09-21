@@ -1721,6 +1721,13 @@ static void parse_asm_operands(ASMOperand *operands, int *nb_operands_ptr, int i
       skip('(');
       gexpr();
       maybe_substitute_inline_const_arg(vtop);
+      /* Record a local register variable's register now, while its Sym is in
+       * scope: by the time the IR lowers the asm the value may live in any
+       * register (or be spilled) and the function's locals have been popped. */
+      op->regvar = 0;
+      if (vtop->sym && (vtop->r & (VT_VALMASK | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && !(vtop->sym->r & VT_PARAM) &&
+          (vtop->sym->r & VT_VALMASK) < VT_CONST)
+        op->regvar = 1 + (vtop->sym->r & VT_VALMASK);
       if (is_output)
       {
         if (!(vtop->type.t & VT_ARRAY))

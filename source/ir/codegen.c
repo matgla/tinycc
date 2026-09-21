@@ -1004,7 +1004,8 @@ static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
        * not the value.  That pointer is read by both prolog load and epilog
        * store, so it must survive across the asm body.  Keep lvalue-operand
        * registers reserved so the value gets a distinct register. */
-      if (vals[i].r & VT_LVAL)
+      /* A register variable's operand is a local's value, not an address. */
+      if ((vals[i].r & VT_LVAL) && !ops[i].regvar)
         continue;
       if (!vals[i].pr0_spilled && vals[i].pr0_reg != PREG_REG_NONE && vals[i].pr0_reg < NB_ASM_REGS)
         reserved_regs[vals[i].pr0_reg] = 0;

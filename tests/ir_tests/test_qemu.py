@@ -163,6 +163,13 @@ TEST_FILES = [
     # inline asm operands may reuse their own live registers in IR mode
     ("bug_inline_asm_reserved_regs.c", 0),
 
+    # `register T x __asm("rN")` locals get a vreg (they aliased the previous
+    # local's stack slot) -- the shape of Zig's C-backend syscall wrappers
+    ("bug_asm_regvar_local.c", 0),
+
+    # values live across inline asm survive its clobbers and pinned operands
+    ("bug_asm_clobber_live_values.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
 

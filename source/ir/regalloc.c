@@ -207,6 +207,25 @@ static int ra_has_switch_in_range(const int *prefix, int start, int end, int n)
   return (prefix[end + 1] - prefix[start + 1]) != 0;
 }
 
+/* Prefix sum of INLINE_ASM statements.  The allocator does not see an asm
+ * statement's register effects: its clobber list, and the registers the
+ * constraint solver picks for operands (r0-r8, or the one a `register ...
+ * __asm("rN")` variable names), are only known when the backend emits it.
+ * asm_gen_code preserves callee-saved r4-r11 around the statement but not
+ * r0-r3/r12, so a value live across an asm must not sit in a caller-saved
+ * register -- the same constraint a call imposes. */
+static int *ra_build_asm_prefix(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  if (n <= 0)
+    return NULL;
+  int *prefix = tcc_malloc(sizeof(int) * (n + 1));
+  prefix[0] = 0;
+  for (int i = 0; i < n; i++)
+    prefix[i + 1] = prefix[i] + (ir->compact_instructions[i].op == TCCIR_OP_INLINE_ASM);
+  return prefix;
+}
+
 static const char *ra_vreg_type_char(int type)
 {
   switch (type) {
@@ -242,6 +261,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   /* SWITCH_TABLE/SWITCH_LOAD dispatch clobbers R_IP (R12); see
    * ra_has_switch_in_range below. */
   int *switch_prefix = ra_build_switch_prefix(ir);
+  int *asm_prefix = ra_build_asm_prefix(ir);
   int *real_call_prefix = ra_build_real_call_prefix(ir);
 
   /* Allocate per-vreg start/end tracking indexed by encoded vreg.
@@ -991,6 +1011,12 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       if (!iv->crosses_call)
         iv->crosses_call = ra_has_switch_in_range(switch_prefix, iv->start, iv->end, n);
 
+      /* Asm crossing: see ra_build_asm_prefix.  Same inclusive-end range test
+       * as the switch case, since a back-edge extension can end an interval
+       * exactly at the asm statement it is live across. */
+      if (!iv->crosses_call)
+        iv->crosses_call = ra_has_switch_in_range(asm_prefix, iv->start, iv->end, n);
+
       /* Params: start at 0, precolor if in register.
        * Do NOT bump end past its last actual use — the pref_reg boundary
        * eviction (a->end == cur->start) relies on the param expiring at
@@ -1046,6 +1072,7 @@ static void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   if (out_max_vreg_pos)
     *out_max_vreg_pos = max_vreg_pos;
   if (switch_prefix) tcc_free(switch_prefix);
+  if (asm_prefix) tcc_free(asm_prefix);
   if (real_call_prefix) tcc_free(real_call_prefix);
   #undef VREG_IDX
 }

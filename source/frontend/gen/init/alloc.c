@@ -622,16 +622,22 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
     if (v)
     {
       /* local variable */
+      sym = sym_push(v, type, r, addr);
+      vreg = sym->vreg;
 #ifdef CONFIG_TCC_ASM
+      /* `register T x __asm("rN")`: x is an ordinary local whose value is
+       * placed in rN only where it is an asm operand.  Record rN in sym->r
+       * after sym_push, which gives register-candidate locals their vreg only
+       * while the value mask still says VT_LOCAL -- recording it before left x
+       * without a vreg, so its uses went to a stack slot that was never
+       * allocated and aliased the previous local. */
       if (ad->asm_label)
       {
         int reg = asm_parse_regvar(ad->asm_label);
         if (reg >= 0)
-          r = (r & ~VT_VALMASK) | reg;
+          sym->r = (sym->r & ~VT_VALMASK) | reg;
       }
 #endif
-      sym = sym_push(v, type, r, addr);
-      vreg = sym->vreg;
       if (ad->cleanup_func)
       {
         Sym *cls = sym_push2(&all_cleanups, SYM_FIELD | ++cur_scope->cl.n, 0, 0);

@@ -650,10 +650,10 @@ instruction
       operands[k].input_index = i;
       op->priority = 5;
     }
-    else if ((op->vt->r & VT_VALMASK) == VT_LOCAL && op->vt->sym && (reg = op->vt->sym->r & VT_VALMASK) < VT_CONST)
+    else if (op->regvar)
     {
       op->priority = 1;
-      op->reg = reg;
+      op->reg = op->regvar - 1;
     }
     else
     {

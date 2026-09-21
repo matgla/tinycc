@@ -992,6 +992,8 @@ typedef struct ASMOperand
   int input_index;  /* if >= 0, gives reference to an input constraint */
   int priority;     /* priority, used to assign registers */
   int reg;          /* if >= 0, register number used for this operand */
+  int regvar;       /* 1 + register a `register T x __asm("rN")` operand names;
+                       0 (what zero-initialisation gives) means none */
   int is_llong;     /* true if double register value */
   int is_memory;    /* true if memory operand */
   int is_rw;        /* for '+' modifier */
