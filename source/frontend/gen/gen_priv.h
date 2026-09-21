@@ -562,6 +562,11 @@ int struct_is_single_1byte_scalar_member(const CType *type);
 int struct_is_single_2byte_scalar_member(const CType *type);
 int struct_is_small_bitfield_word(const CType *type);
 int struct_member_copy_safe(const CType *type);
+#define SMALL_AGGREGATE_COPY_MAX 16
+int small_aggregate_copy_plan(const CType *stype, int size, int align, int src_off, int dst_off, int *w_out,
+                              unsigned char *covered);
+void ir_emit_small_aggregate_copy(const SValue *src, int src_deref, const SValue *dst, int dst_deref, int size,
+                                  int w, const unsigned char *covered);
 
 /* --- sym/attr_merge.c --- */
 void apply_alias_attribute(Sym *alias_sym, int target_tok);

@@ -182,6 +182,9 @@ TEST_FILES = [
     # destination at the call site (copy-source forwarding read the new value)
     ("bug_modref_direct_block_copy.c", 0),
 
+    # small aggregates copied as LOAD/STORE chunks instead of __aeabi_memmove
+    ("test_small_aggregate_copy.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
 

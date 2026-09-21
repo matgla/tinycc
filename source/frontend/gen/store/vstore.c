@@ -23,6 +23,13 @@
 
 #include "gen_priv.h"
 
+/* Most chunks a small aggregate copy may take inline before it stays a
+ * __aeabi_memmove call (see small_aggregate_copy_plan).  Measured on the Zig
+ * compiler's C (-O1, 70 MB): at 1 .text drops 8.50 -> 8.16 MB, 2 costs 1 KB
+ * more but removes another 2,462 calls, and 3-4 give size back -- a word
+ * LOAD/STORE pair per chunk outgrows the ~10-byte call sequence. */
+TCC_DBG_ENV_INT(small_aggregate_copy_max_chunks, "TCC_SMALL_COPY_CHUNKS", 2)
+
 /* store vtop in lvalue pushed on stack */
 ST_FUNC void vstore(void)
 {
@@ -989,6 +996,33 @@ ST_FUNC void vstore(void)
       ir_emit_struct_unit_copy(&src, &dst, &saved_struct_type, size);
       vtop->type = saved_struct_type;
       goto vstore_done;
+    }
+    /* Any other small aggregate between frame slots, globals and register
+     * derefs: copy it as width-uniform LOAD/STORE chunks rather than a
+     * __aeabi_memmove call (see small_aggregate_copy_plan).  Zig's C backend is
+     * the heavy user -- every `!void` result is a 2-byte struct copied through
+     * a local, and error unions and slices are written through out-pointers. */
+    if (tcc_state->ir && !has_vla && !NOEVAL_WANTED && size > 0 && size <= SMALL_AGGREGATE_COPY_MAX)
+    {
+      int src_deref = IS_REG_DEREF_LVAL(vtop[0].r) && vtop[0].vr >= 0 && vtop[0].c.i == 0;
+      int dst_deref = IS_REG_DEREF_LVAL(vtop[-1].r) && vtop[-1].vr >= 0 && vtop[-1].c.i == 0;
+      int src_slot = IS_LOCAL_LVAL(vtop[0].r) || IS_GLOBAL_LVAL(vtop[0].r);
+      int dst_slot = IS_LOCAL_LVAL(vtop[-1].r) || IS_GLOBAL_LVAL(vtop[-1].r);
+      unsigned char covered[SMALL_AGGREGATE_COPY_MAX];
+      int w = 0, chunks = 0;
+      if ((src_deref || src_slot) && (dst_deref || dst_slot))
+        chunks = small_aggregate_copy_plan(&saved_struct_type, size, align, src_slot ? (int)vtop[0].c.i : -1,
+                                           dst_slot ? (int)vtop[-1].c.i : -1, &w, covered);
+      if (chunks > 0 && chunks <= small_aggregate_copy_max_chunks())
+      {
+        SValue src = vtop[0];
+        SValue dst = vtop[-1];
+        vtop--; /* pop src; vtop = dst (kept as result lvalue) */
+        if (!(IS_LOCAL_LVAL(src.r) && IS_LOCAL_LVAL(dst.r) && src.c.i == dst.c.i))
+          ir_emit_small_aggregate_copy(&src, src_deref, &dst, dst_deref, size, w, covered);
+        vtop->type = saved_struct_type;
+        goto vstore_done;
+      }
     }
 #undef IS_REG_DEREF_LVAL
 #undef IS_LOCAL_LVAL
