@@ -433,6 +433,9 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
   /* Initial min-local-offset scan */
   {
     int min_local_offset = 0;
+    /* Nested functions reach a parent's captured locals by their frontend
+     * offsets, so there every offset counts; relayout skips those frames. */
+    const int nested = ir->has_static_chain || tcc_state->nb_nested_funcs > 0;
     (void)0; /* stackoff_count removed — was diagnostic only */
     for (int i = 0; i < ir->next_instruction_index; i++)
     {
@@ -447,7 +450,10 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
       {
         if (irop_is_none(ops[j]))
           continue;
-        if (irop_get_tag(ops[j]) == IROP_TAG_STACKOFF)
+        /* A vreg-backed operand's offset is the frontend's watermark, not a
+         * slot the code addresses; counting it would keep the spills below
+         * frame objects that relayout has moved up (frame.c). */
+        if (irop_get_tag(ops[j]) == IROP_TAG_STACKOFF && (nested || irop_get_vreg(ops[j]) < 0))
         {
           int32_t off = irop_get_stack_offset(ops[j]);
           if (off < min_local_offset)
@@ -568,6 +574,10 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
                 continue;
               }
             }
+            /* Without a slot the operand's offset is only the frontend's
+             * creation-time watermark: machine_op_from_ir never addresses it
+             * (it uses the allocation), so it must not size the frame. */
+            continue;
           }
           int off = (int)irop_get_stack_offset(*o);
           if (off < min_op_offset)
@@ -638,6 +648,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
                 continue;
               }
             }
+            continue; /* a frontend watermark, never addressed (see above) */
           }
           int off = (int)irop_get_stack_offset(*o);
           if (off < post_min_op_offset)
