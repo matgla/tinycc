@@ -174,6 +174,10 @@ TEST_FILES = [
     # and refuses ranges holding inline asm
     ("bug_branch_narrow_rehearsal.c", 0),
 
+    # a byte/halfword local read through its own stack slot (after lea_fold)
+    # keeps its width -- Zig's 2-byte `!void` error union test
+    ("bug_narrow_local_slot_width.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
 

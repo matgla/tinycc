@@ -348,6 +348,8 @@ static ScratchRegAlloc get_scratch_reg_for_sym_addr(Sym *raw_sym, int64_t imm, u
 static ScratchRegAlloc get_scratch_reg_for_const(int64_t value, uint32_t exclude_regs);
 static void restore_scratch_reg(ScratchRegAlloc *alloc);
 static void load_from_base(int r, int r1, int irop_btype, int is_unsigned, int fc, int sign, uint32_t base);
+static void th_store8_imm_or_reg(int src_reg, uint32_t base_reg, int abs_off, int sign);
+static void th_store16_imm_or_reg(int src_reg, uint32_t base_reg, int abs_off, int sign);
 static void th_store32_imm_or_reg_ex(int src_reg, uint32_t base_reg, int abs_off, int sign, uint32_t extra_exclude);
 
 /* Resolve the base register for a captured variable access.
@@ -545,6 +547,51 @@ static void mach_release_all(MachineCodegenContext *ctx)
  * necessary load instructions, and returns the scratch register.
  *
  * excl: bitmask of registers that must not be used for any scratch. */
+/* A MACH_OP_SPILL operand with vreg < 0 is a local's own stack slot
+ * (machine_op_from_ir, "concrete stack slots"), holding an object exactly as
+ * wide as its btype; with a vreg it is that vreg's spill slot, a full register
+ * image a word store wrote.  lea_fold turns `T = &local; ... *T` into such a
+ * local slot, so a byte or halfword local reaches the value paths below.  Read
+ * as a word, a u16 picked up its neighbour's bytes (Zig's `if (err.error)` on a
+ * 2-byte error union took the wrong branch); written as a word, it would
+ * clobber them. */
+static int mach_is_narrow_local_slot(const MachineOperand *op)
+{
+  return op->kind == MACH_OP_SPILL && !op->needs_deref && op->vreg < 0 &&
+         (op->btype == IROP_BTYPE_INT8 || op->btype == IROP_BTYPE_INT16);
+}
+
+/* Load a MACH_OP_SPILL slot's value (the slot itself, not through it). */
+static void mach_load_slot(int dest_reg, const MachineOperand *op)
+{
+  if (!mach_is_narrow_local_slot(op))
+  {
+    tcc_machine_load_spill_slot(dest_reg, op->u.spill.offset);
+    return;
+  }
+  const int adj = fp_adjust_local_offset(op->u.spill.offset, 0);
+  const int sign = (adj < 0), abs_off = sign ? -adj : adj;
+  const uint32_t base = (uint32_t)(tcc_state->need_frame_pointer ? R_FP : R_SP);
+  load_from_base(dest_reg, PREG_REG_NONE, op->btype, (int)op->is_unsigned, abs_off, sign, base);
+}
+
+/* Store a value into a MACH_OP_SPILL slot (the slot itself, not through it). */
+static void mach_store_slot(int src_reg, const MachineOperand *op)
+{
+  if (!mach_is_narrow_local_slot(op))
+  {
+    tcc_machine_store_spill_slot(src_reg, op->u.spill.offset);
+    return;
+  }
+  const int adj = fp_adjust_local_offset(op->u.spill.offset, 0);
+  const int sign = (adj < 0), abs_off = sign ? -adj : adj;
+  const uint32_t base = (uint32_t)(tcc_state->need_frame_pointer ? R_FP : R_SP);
+  if (op->btype == IROP_BTYPE_INT8)
+    th_store8_imm_or_reg(src_reg, base, abs_off, sign);
+  else
+    th_store16_imm_or_reg(src_reg, base, abs_off, sign);
+}
+
 static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *op, uint32_t excl)
 {
   switch (op->kind)
@@ -580,9 +627,9 @@ static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *
   case MACH_OP_SPILL:
     if (!op->needs_deref)
     {
-      /* Simple spill: load the word-sized register value from the spill slot. */
+      /* Simple spill (or a local's own slot): load the value. */
       int r = mach_alloc_scratch(ctx, excl);
-      tcc_machine_load_spill_slot(r, op->u.spill.offset);
+      mach_load_slot(r, op);
       return r;
     }
     else
@@ -774,7 +821,7 @@ static void mach_writeback_dest(const MachineOperand *op, int reg)
     break;
 
   case MACH_OP_SPILL:
-    tcc_machine_store_spill_slot(reg, op->u.spill.offset);
+    mach_store_slot(reg, op);
     break;
 
   case MACH_OP_FRAME_ADDR:
@@ -860,7 +907,7 @@ void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op)
   case MACH_OP_SPILL:
     if (!op->needs_deref)
     {
-      tcc_machine_load_spill_slot(dest_reg, op->u.spill.offset);
+      mach_load_slot(dest_reg, op);
       return;
     }
     else
@@ -8754,7 +8801,7 @@ ST_FUNC void tcc_gen_machine_assign_mop_ex(MachineOperand src, MachineOperand de
     break;
 
   case MACH_OP_SPILL:
-    tcc_machine_load_spill_slot(dest_reg, src.u.spill.offset);
+    mach_load_slot(dest_reg, &src);
     if (src.needs_deref)
     {
       /* Double indirection: dest_reg now holds a pointer; dereference it. */
@@ -12978,7 +13025,7 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
       case MACH_OP_SPILL:
         if (!mop->needs_deref)
         {
-          tcc_machine_load_spill_slot(dst, mop->u.spill.offset);
+          mach_load_slot(dst, mop);
         }
         else
         {
@@ -15272,7 +15319,7 @@ static void select_emit_inline(MachineCodegenContext *ctx, const MachineOperand 
     break;
   }
   case MACH_OP_SPILL:
-    tcc_machine_load_spill_slot(reg, op->u.spill.offset);
+    mach_load_slot(reg, op);
     break;
   case MACH_OP_FRAME_ADDR:
     tcc_machine_addr_of_stack_slot(reg, op->u.frame.offset, 0);
