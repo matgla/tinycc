@@ -292,11 +292,19 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
   if (prior_dest_vr < 0)
     return 0;
 
+  /* A plain register read of the TEMP: a STACKOFF source's tag and offset must
+   * not survive, or the offset (V's frontend watermark) is taken for a spot in
+   * the TEMP's own spill slot and sizes the frame. */
   IROperand new_src = src;
   irop_set_vreg(&new_src, prior_dest_vr);
+  new_src.tag = IROP_TAG_VREG;
   new_src.is_lval = 0;
   new_src.is_local = 0;
   new_src.is_llocal = 0;
+  if (new_src.btype == IROP_BTYPE_STRUCT)
+    new_src.u.s.aux_data = 0;
+  else
+    new_src.u.imm32 = 0;
 
   /* Move the use edge from src_vr to prior_dest_vr. */
   IRSSAVregInfo *svi = ssa_opt_vinfo(ctx, src_vr);
