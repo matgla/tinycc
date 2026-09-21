@@ -190,6 +190,8 @@ TEST_FILES = [
 
     # frame objects left unreferenced are dropped, live ones packed (frame.c)
     ("test_frame_relayout.c", 0),
+    # an array of structs with a VLA member is itself a VLA
+    ("bug_vla_struct_array.c", 0),
 
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
