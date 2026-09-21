@@ -170,6 +170,10 @@ TEST_FILES = [
     # values live across inline asm survive its clobbers and pinned operands
     ("bug_asm_clobber_live_values.c", 0),
 
+    # branch narrowing / CBZ fusion: the rehearsal models mid-function returns
+    # and refuses ranges holding inline asm
+    ("bug_branch_narrow_rehearsal.c", 0),
+
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
 

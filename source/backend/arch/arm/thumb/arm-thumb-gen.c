@@ -14766,10 +14766,26 @@ static int rehearsal_max_shrink_between(TCCIRState *ir, int from_ir, int to_ir)
   for (int k = from_ir + 1; k < to_ir; k++)
   {
     TccIrOp op = (TccIrOp)ir->compact_instructions[k].op;
-    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
+    /* A return's jump to the epilogue is a branch too (narrowable 4 -> 2). */
+    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF || op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID)
       branches++;
   }
   return branches * 4;
+}
+
+/* Does the range between two IR instructions (exclusive of from_ir, inclusive
+ * of to_ir) hold an inline asm statement?  The dry passes never assemble the
+ * body, so the rehearsal lays it out as zero bytes and no distance measured
+ * across it bounds the real one: a CBZ over 144 bytes of asm was fused at a
+ * modelled offset of a few bytes.  Narrowing checks refuse such ranges. */
+static int rehearsal_range_has_asm(TCCIRState *ir, int from_ir, int to_ir)
+{
+  if (ir->inline_asm_count == 0)
+    return 0;
+  for (int k = from_ir + 1; k <= to_ir && k < ir->next_instruction_index; k++)
+    if (ir->compact_instructions[k].op == TCCIR_OP_INLINE_ASM)
+      return 1;
+  return 0;
 }
 
 /* Can `CMP rN,#0; B<eq|ne> target` at current_ir_idx be fused into a single
@@ -14804,6 +14820,8 @@ ST_FUNC int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx
   int max_offset = dry_dist - 8;
   int min_offset = max_offset - rehearsal_max_shrink_between(ir, current_ir_idx, target_ir);
   if (min_offset < 0 || max_offset > 126)
+    return 0;
+  if (rehearsal_range_has_asm(ir, current_ir_idx, target_ir))
     return 0;
 
   /* A pool flush anywhere in the range would push the branch out of its 126-byte
@@ -14855,6 +14873,8 @@ static int can_narrow_epilogue_branch(int32_t target_ir, int current_ir_idx)
     return 0;
   if (!branch_fits_t2(dry_dist - 4))
     return 0;
+  if (rehearsal_range_has_asm(ir, current_ir_idx, ir->next_instruction_index - 1))
+    return 0;
 
   if (th_literal_pool_would_flush_for(2))
     return 0;
@@ -14894,6 +14914,8 @@ static int can_narrow_forward_branch(int32_t target_ir, int is_conditional, int 
    * the 4-byte Thumb pipeline bias keeps the estimate conservative. */
   int est_offset = dry_dist - 4;
   if (!(is_conditional ? branch_fits_t1(est_offset) : branch_fits_t2(est_offset)))
+    return 0;
+  if (rehearsal_range_has_asm(ir, current_ir_idx, target_ir))
     return 0;
 
   /* A flush scheduled at this very point would move the branch itself. */

@@ -4207,8 +4207,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       }
       /* fall through to RETURNVOID */
       case TCCIR_OP_RETURNVOID:
-        /* Real-run: emit jump to epilogue (backpatched later).
-         * Dry-run: no-op (we don't track return_jump_addrs).
+        /* Emit the jump to the epilogue (backpatched later) in every pass.
+         * The dry passes only size it -- tcc_gen_machine_jump_mop emits the
+         * same 4-byte placeholder as for any branch -- but they must: the
+         * rehearsal's layout bounds the real offsets that CBZ fusion and
+         * branch narrowing commit to, and a return missing from it made a
+         * range 2-4 bytes longer than modelled (a fused CBZ landed at 128).
          * Skip the jump if all remaining instructions are NOPs —
          * the epilogue immediately follows, so the branch is a no-op. */
         {
@@ -4221,12 +4225,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               break;
             }
           }
-          if (!is_dry_run && has_trailing_code)
+          if (has_trailing_code)
           {
             /* Target -1 means "the epilogue", which is not an IR index.  The
              * emitter sizes it from the rehearsal's end-of-body address. */
             int ret_branch_size = tcc_gen_machine_jump_mop(cq->op, -1, i);
-            return_jump_addrs[num_return_jumps++] = ind - ret_branch_size;
+            if (!is_dry_run)
+              return_jump_addrs[num_return_jumps++] = ind - ret_branch_size;
           }
         }
         break;
