@@ -204,6 +204,7 @@ TEST_FILES = [
 
     # dead-store elimination bounds reads through an address by its object
     ("test_dse_object_ranges.c", 0),
+    ("test_dse_wide.c", 0),
 
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),

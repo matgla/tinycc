@@ -72,11 +72,6 @@ static int dse_defines_dest(const IRQuadCompact *q, IROperand dest)
   }
 }
 
-static int dse_operand_is_wide(IROperand op)
-{
-  return op.btype == IROP_BTYPE_INT64 || op.btype == IROP_BTYPE_FLOAT64;
-}
-
 /* Pull (sym, off) out of a local StackLoc operand: SYMREF carries sym+addend, else a bare stack offset. */
 static void dse_stackloc_sym_off(TCCIRState *ir, IROperand op, const Sym **sym, int64_t *off)
 {
@@ -99,20 +94,6 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    if (irop_config[q->op].has_dest && dse_operand_is_wide(tcc_ir_op_get_dest(ir, q)))
-      return 0;
-    if (irop_config[q->op].has_src1 && dse_operand_is_wide(tcc_ir_op_get_src1(ir, q)))
-      return 0;
-    if (irop_config[q->op].has_src2 && dse_operand_is_wide(tcc_ir_op_get_src2(ir, q)))
-      return 0;
-    if (q->op == TCCIR_OP_MLA && dse_operand_is_wide(tcc_ir_op_get_accum(ir, q)))
-      return 0;
-  }
 
   /* NOP orphaned FUNCPARAM whose call_id has no matching FUNCCALL (left by inlining). */
   {
