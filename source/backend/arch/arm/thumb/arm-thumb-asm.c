@@ -456,6 +456,15 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
   }
   else
   { // epilog
+    /* The asm body was emitted without passing through ot(), so no register-
+     * content cache saw what it wrote.  Forget them before storing outputs:
+     * with a stale `mov` equivalence the store of a "+r" operand back to its
+     * variable (`mov r4, r0` after the body incremented r0) is elided as a
+     * copy between registers the cache still believes equal. */
+    tcc_gen_machine_imm_cache_reset();
+    tcc_gen_machine_mov_equiv_reset();
+    tcc_gen_machine_strldr_cache_reset();
+
     /* generate save code */
     for (i = 0; i < nb_outputs; i++)
     {

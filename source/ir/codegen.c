@@ -4563,6 +4563,14 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           tcc_error("inline asm not supported");
 #endif
         }
+        /* The asm body writes registers without passing through ot(), so no
+         * register-content cache saw those writes: an imm_cache entry naming
+         * an operand register (e.g. "r0 = sp" from materializing &local) would
+         * be reused after the asm overwrote it.  Drop them all, in the dry run
+         * too, so both passes leave the statement with the same cache state. */
+        tcc_gen_machine_imm_cache_reset();
+        tcc_gen_machine_mov_equiv_reset();
+        tcc_gen_machine_strldr_cache_reset();
         break;
       case TCCIR_OP_BLOCK_COPY:
       {
