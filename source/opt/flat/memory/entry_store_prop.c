@@ -497,8 +497,11 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   } SimpleLeaEntry;
 
   /* Definition counts, used only to set `maybe` above.  A write *through* a
-     pointer (`T***DEREF*** <-- v`) is not a definition of the pointer, hence the
-     is_lval test. */
+     pointer (`T***DEREF*** <-- v`) is not a definition of the pointer; a VAR
+     itself as the destination is (a STACKOFF lvalue).  Testing is_lval alone
+     dropped the latter: `for (p = y; p != e; p++) s += *p` counted one of p's
+     two definitions, and the walk got the last element's value forwarded into
+     every iteration. */
   uint8_t *tmp_defs = tcc_mallocz(max_tmp + 1);
   uint8_t *var_defs = tcc_mallocz(max_var + 1);
   for (int i = 0; i < n; i++)
@@ -508,7 +511,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       continue;
     IROperand d = tcc_ir_op_get_dest(ir, q);
     int32_t vr = irop_get_vreg(d);
-    if (vr < 0 || d.is_lval)
+    if (!irop_dest_defines_vreg(d))
       continue;
     int p = TCCIR_DECODE_VREG_POSITION(vr);
     if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && p <= max_tmp && tmp_defs[p] < 2)
