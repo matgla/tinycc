@@ -15870,6 +15870,122 @@ ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROp
   restore_scratch_reg(&src_scratch);
 }
 
+/* Size of copying `nwords` words base+src -> base+dst in chunks through data
+ * registers regs[0..k) (the LDM's base the highest low one) with STM base rb;
+ * emits the code when `emit`.  -1 when some chunk would hold a lone word or an
+ * address does not encode. */
+static int spill_block_copy_plan(int base, int src, int dst, int nwords, const int *regs, int k, int rb, int emit)
+{
+  int all_low = rb <= R7;
+  for (int i = 0; i < k; i++)
+    all_low &= regs[i] <= R7;
+  /* Words spread evenly over the chunks, so none is left with a lone word. */
+  const int nchunks = (nwords + k - 1) / k;
+  int size = 0, w = 0;
+  for (int chunk = 0; chunk < nchunks; chunk++)
+  {
+    const int n = (nwords - w) / (nchunks - chunk);
+    if (n < 2)
+      return -1;
+    uint32_t l = 0;
+    int la = -1;
+    for (int i = 0; i < n; i++)
+    {
+      l |= 1u << (uint32_t)regs[i];
+      if (regs[i] <= R7 && regs[i] > la)
+        la = regs[i];
+    }
+    if (la < 0)
+      la = regs[0];
+    const int so = src + 4 * w;
+    thumb_opcode a = so < 0 ? th_sub_imm(la, base, -so, flags_safe(), ENFORCE_ENCODING_NONE)
+                            : th_add_imm(la, base, so, flags_safe(), ENFORCE_ENCODING_NONE);
+    thumb_opcode b = {0};
+    if (chunk == 0)
+      b = dst < 0 ? th_sub_imm(rb, base, -dst, flags_safe(), ENFORCE_ENCODING_NONE)
+                  : th_add_imm(rb, base, dst, flags_safe(), ENFORCE_ENCODING_NONE);
+    if (!a.size || (chunk == 0 && !b.size))
+      return -1;
+    const thumb_opcode ldm = all_low ? (thumb_opcode){.size = 2, .opcode = 0xC800u | ((uint32_t)la << 8) | l}
+                                     : (thumb_opcode){.size = 4, .opcode = ((0xE890u | (uint32_t)la) << 16) | l};
+    const thumb_opcode stm = all_low ? (thumb_opcode){.size = 2, .opcode = 0xC000u | ((uint32_t)rb << 8) | l}
+                                     : (thumb_opcode){.size = 4, .opcode = ((0xE8A0u | (uint32_t)rb) << 16) | l};
+    size += a.size + ldm.size + b.size + stm.size;
+    if (emit)
+    {
+      ot_check(a);
+      ot_check(ldm);
+      if (chunk == 0)
+        ot_check(b);
+      ot_check(stm);
+    }
+    w += n;
+  }
+  return size;
+}
+
+/* Copy `nwords` words between two frame slots with registers that are free at
+ * this instruction (plus `also_free`), never pushing: chunks of
+ *   add rA, sp, #src; ldm rA, {..}  (rA one of the loaded registers)
+ *   add rB, sp, #dst; stmia rB!, {..}   (rB outside the list; first chunk)
+ * Registers load and store in ascending order, so any set keeps the words in
+ * place.  Of the all-low (16-bit) and the widest plan, the shorter is taken;
+ * returns 0, having emitted nothing, when neither beats one LDR/STR pair per
+ * word. */
+ST_FUNC int tcc_gen_machine_spill_block_copy_free(int32_t src_spill_off, int32_t dst_spill_off, int nwords,
+                                                  uint32_t also_free)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir || nwords < 3)
+    return 0;
+  const int base = tcc_state->need_frame_pointer ? R_FP : R_SP;
+  const int src = fp_adjust_local_offset(src_spill_off, 0), dst = fp_adjust_local_offset(dst_spill_off, 0);
+  if ((src & 3) || (dst & 3))
+    return 0;
+  uint32_t excl = (1u << (uint32_t)base) | (1u << R_SP) | (1u << R_PC) | scratch_global_exclude;
+  uint32_t freeset = also_free & ~excl & 0x100Fu; /* r0-r3, ip */
+  for (;;)
+  {
+    int r = tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, excl | freeset, ir->leaffunc);
+    if (r < 0 || r == PREG_NONE || r >= 16 || ((excl | freeset) & (1u << (uint32_t)r)))
+      break;
+    freeset |= 1u << (uint32_t)r;
+  }
+  if (__builtin_popcount(freeset) < 3)
+    return 0;
+  /* The STM base: the lowest free register; data registers low first. */
+  const int rb = __builtin_ctz(freeset);
+  int all[6], nall = 0, low[6], nlow = 0;
+  for (int r = 0; r < 16 && nall < 5; r++)
+    if (r != rb && (freeset & (1u << (uint32_t)r)))
+    {
+      all[nall++] = r;
+      if (r <= R7)
+        low[nlow++] = r;
+    }
+
+  int plain = 0;
+  for (int w = 0; w < nwords; w++)
+  {
+    const int so = src + 4 * w, d = dst + 4 * w;
+    thumb_opcode l = th_ldr_imm(R0, base, so < 0 ? -so : so, so < 0 ? 4 : 6, ENFORCE_ENCODING_NONE);
+    thumb_opcode st = th_str_imm(R0, base, d < 0 ? -d : d, d < 0 ? 4 : 6, ENFORCE_ENCODING_NONE);
+    if (!l.size || !st.size)
+      return 0;
+    plain += l.size + st.size;
+  }
+  const int kl = nlow < 4 ? nlow : 4, ka = nall < 4 ? nall : 4;
+  const int cost_low = kl >= 2 ? spill_block_copy_plan(base, src, dst, nwords, low, kl, rb, 0) : -1;
+  const int cost_all = ka >= 2 ? spill_block_copy_plan(base, src, dst, nwords, all, ka, rb, 0) : -1;
+  if (cost_low > 0 && cost_low < plain && (cost_all < 0 || cost_low <= cost_all))
+    spill_block_copy_plan(base, src, dst, nwords, low, kl, rb, 1);
+  else if (cost_all > 0 && cost_all < plain)
+    spill_block_copy_plan(base, src, dst, nwords, all, ka, rb, 1);
+  else
+    return 0;
+  return 1;
+}
+
 ST_FUNC void tcc_gen_machine_spill_block_copy(int32_t src_spill_off, int32_t dst_spill_off, int nwords)
 {
   ScratchRegAlloc src_scratch = get_scratch_reg_with_save(0);

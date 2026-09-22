@@ -437,6 +437,16 @@ void tcc_gen_machine_spill_block_copy(int32_t src_spill_off, int32_t dst_spill_o
   cgstub_push("spill_block_copy", (TccIrOp)-1, MACH_OP_NONE, -1, MACH_OP_NONE, -1, MACH_OP_NONE, -1, nwords, 0);
 }
 
+/* No free-register plan in the stub: callers fall back to their other paths. */
+int tcc_gen_machine_spill_block_copy_free(int32_t src_spill_off, int32_t dst_spill_off, int nwords, uint32_t also_free)
+{
+  (void)src_spill_off;
+  (void)dst_spill_off;
+  (void)nwords;
+  (void)also_free;
+  return 0;
+}
+
 /* ============================================================================
  * Control flow / jumps / switch
  * ============================================================================ */

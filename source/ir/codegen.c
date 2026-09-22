@@ -2134,6 +2134,39 @@ static inline MopArgs ir_decode_cached(int is_dry_run, int use_mop_cache, MopArg
  * UT_COVERAGE_ONLY_SRCS), so a definition over there fails to link `ut`. */
 unsigned long tcc_dryreason[8];
 
+/* Operand slots naming each TEMP vreg, by position: a copy peephole may drop a
+ * loaded temporary only when its STORE is its one use. */
+static int *ir_codegen_temp_uses(TCCIRState *ir, int *count)
+{
+  int n = ir->next_temporary_variable > 0 ? ir->next_temporary_variable : 1;
+  int *uses = tcc_mallocz(sizeof(int) * n);
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    int nops = irop_config[q->op].has_dest + irop_config[q->op].has_src1 + irop_config[q->op].has_src2;
+    if (q->op == TCCIR_OP_MLA || q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_SELECT)
+      nops++;
+    for (int k = 0; k < nops; k++)
+    {
+      int32_t vr = irop_get_vreg(ir->iroperand_pool[q->operand_base + k]);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && TCCIR_DECODE_VREG_POSITION(vr) < n)
+        uses[TCCIR_DECODE_VREG_POSITION(vr)]++;
+    }
+  }
+  *count = n;
+  return uses;
+}
+
+/* A loaded TEMP whose only other mention is the STORE that takes it. */
+static int ir_codegen_temp_dies_at_store(const int *uses, int nuses, int32_t vr)
+{
+  return uses && vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
+         TCCIR_DECODE_VREG_POSITION(vr) < nuses && uses[TCCIR_DECODE_VREG_POSITION(vr)] == 2;
+}
+
 void tcc_ir_codegen_generate(TCCIRState *ir)
 {
   IRQuadCompact *cq;
@@ -2785,6 +2818,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
      this decision was priced with). */
   int cg_skip_rehearsal = tcc_state->optimize == 0 || cg_no_rehearsal();
   TCCPassTimer cg_pt = {0};
+  int temp_uses_n = 0;
+  int *temp_uses = tcc_state->optimize > 0 ? ir_codegen_temp_uses(ir, &temp_uses_n) : NULL;
   for (int pass = pass_start; pass < 3; pass++)
   {
     if (pass == 1 && cg_skip_rehearsal)
@@ -3497,9 +3532,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         if (a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
             a.src1.kind == MACH_OP_SPILL && !a.src1.needs_deref && !a.src1.is_64bit &&
             (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32) &&
-            (a.src1.u.spill.offset & 3) == 0)
+            (a.src1.u.spill.offset & 3) == 0 && !tcc_ir_access_is_volatile(ir, src1_ir))
         {
           int first_load_reg = a.dest.u.reg.r0;
+          int32_t first_load_vr = irop_get_vreg(dest_ir);
           int store_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
           if (store_i >= 0 && ir->compact_instructions[store_i].op == TCCIR_OP_STORE &&
               !ir->compact_instructions[store_i].is_jump_target)
@@ -3512,11 +3548,17 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                                           &s_src1, &s_src2, &s_dest,
                                           (MopSpec){.dest = 1, .src1 = 2});
 
+            /* Each loaded value must die at its store: proven when it is a
+             * TEMP the store is the one use of, or when every load of the run
+             * reuses one register (each overwrites the last). */
+            int all_one_reg = 1;
             if (sa.dest.kind == MACH_OP_SPILL && !sa.dest.needs_deref && !sa.src1.is_64bit &&
                 sa.src1.kind == MACH_OP_REG && sa.src1.u.reg.r0 == first_load_reg &&
+                irop_get_vreg(s_src1) == first_load_vr &&
                 (sa.dest.btype == IROP_BTYPE_INT32 || sa.dest.btype == IROP_BTYPE_FLOAT32) &&
-                (sa.dest.u.spill.offset & 3) == 0)
+                (sa.dest.u.spill.offset & 3) == 0 && !tcc_ir_access_is_volatile(ir, s_dest))
             {
+              int dies = ir_codegen_temp_dies_at_store(temp_uses, temp_uses_n, first_load_vr);
               int32_t src_base = a.src1.u.spill.offset;
               int32_t dst_base = sa.dest.u.spill.offset;
               int count = 1;
@@ -3539,10 +3581,16 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
                 if (la.src1.kind != MACH_OP_SPILL || la.src1.needs_deref || la.src1.is_64bit ||
                     la.src1.u.spill.offset != src_base + count * 4 ||
-                    (la.src1.btype != IROP_BTYPE_INT32 && la.src1.btype != IROP_BTYPE_FLOAT32))
+                    (la.src1.btype != IROP_BTYPE_INT32 && la.src1.btype != IROP_BTYPE_FLOAT32) ||
+                    tcc_ir_access_is_volatile(ir, l_src1))
                   break;
 
-                if (la.dest.kind != MACH_OP_REG || la.dest.u.reg.r0 != first_load_reg)
+                int32_t load_vr = irop_get_vreg(l_dest);
+                if (la.dest.kind != MACH_OP_REG || la.dest.needs_deref)
+                  break;
+                int same_reg = la.dest.u.reg.r0 == first_load_reg;
+                int this_dies = ir_codegen_temp_dies_at_store(temp_uses, temp_uses_n, load_vr);
+                if (!same_reg && !this_dies)
                   break;
 
                 int next_store_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, next_load_i);
@@ -3560,15 +3608,36 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
                 if (sa2.dest.kind != MACH_OP_SPILL || sa2.dest.needs_deref || sa2.src1.is_64bit ||
                     sa2.dest.u.spill.offset != dst_base + count * 4 ||
-                    sa2.src1.kind != MACH_OP_REG || sa2.src1.u.reg.r0 != first_load_reg ||
-                    (sa2.dest.btype != IROP_BTYPE_INT32 && sa2.dest.btype != IROP_BTYPE_FLOAT32))
+                    sa2.src1.kind != MACH_OP_REG || sa2.src1.u.reg.r0 != la.dest.u.reg.r0 ||
+                    irop_get_vreg(s2_src1) != load_vr ||
+                    (sa2.dest.btype != IROP_BTYPE_INT32 && sa2.dest.btype != IROP_BTYPE_FLOAT32) ||
+                    tcc_ir_access_is_volatile(ir, s2_dest))
                   break;
 
+                all_one_reg &= same_reg;
+                dies &= this_dies;
                 count++;
                 last_i = next_store_i;
               }
 
-              if (count >= 8)
+              /* Loading a whole chunk before storing it matches the pairwise
+               * order only when the ranges do not overlap. */
+              const int apart = dst_base + count * 4 <= src_base || src_base + count * 4 <= dst_base;
+              if (apart && (dies || all_one_reg) && count >= 3)
+              {
+                int done = 0;
+                /* The first load's register holds only that temporary. */
+                uint32_t also_free = dies && first_load_reg >= 0 && first_load_reg < 16 ? 1u << first_load_reg : 0;
+                SCRATCH_WRAP(done = tcc_gen_machine_spill_block_copy_free(src_base, dst_base, count, also_free));
+                if (done)
+                {
+                  tcc_ir_spill_cache_clear(&ir->spill_cache);
+                  tcc_gen_machine_imm_cache_reset();
+                  i = last_i;
+                  break;
+                }
+              }
+              if (apart && all_one_reg && count >= 8)
               {
                 SCRATCH_WRAP(tcc_gen_machine_spill_block_copy(src_base, dst_base, count));
                 i = last_i;
@@ -5032,6 +5101,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
   ir->codegen_dry_insn_saves = NULL;
   tcc_free(dry_insn_scratch);
   ir->codegen_dry_insn_scratch = NULL;
+  tcc_free(temp_uses);
 }
 
 /* ============================================================================

@@ -2916,6 +2916,8 @@ ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROp
 
 /* Block copy between spill slots using LDM/STM (peephole for consecutive LOAD+STORE pairs) */
 ST_FUNC void tcc_gen_machine_spill_block_copy(int32_t src_spill_off, int32_t dst_spill_off, int nwords);
+ST_FUNC int tcc_gen_machine_spill_block_copy_free(int32_t src_spill_off, int32_t dst_spill_off, int nwords,
+                                                  uint32_t also_free);
 
 /* Conditional select: dest = (cond) ? then_val : else_val (ITE on ARM) */
 ST_FUNC void tcc_gen_machine_select_mop(MachineOperand then_val, MachineOperand else_val, MachineOperand dest,
