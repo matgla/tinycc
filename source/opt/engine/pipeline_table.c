@@ -110,6 +110,8 @@ static const IROptPass propagation_passes[] = {
   PASS_GATED("uninit_ub",        tcc_ir_opt_uninit_local_ub_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
   PASS_GATED("uninit_dom_ret",   tcc_ir_opt_uninit_dominates_return_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
   PASS_GATED("dce",              tcc_ir_opt_dce_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
+  /* A local filled by a whole copy of a by-value struct parameter becomes the parameter's own memory. */
+  PASS_GATED("param_copy_alias", tcc_ir_opt_param_copy_alias_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
   /* Resolves derefs through single-def &local pointers before the const/forwarding cluster below sees them. */
   PASS_GATED("ptr_local_fwd",    tcc_ir_opt_ptr_local_fwd_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_store_load_fwd)),
   /* Must follow dce: its prologue clears stale `addrtaken` flags on VARs whose LEA was just DCE-ed. */

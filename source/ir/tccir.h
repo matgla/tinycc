@@ -797,6 +797,9 @@ void tcc_ir_frame_note_sret_call(int call_id);
 /* The frontend object containing frame offset `off`, as [*lo, *hi), while the
  * frame still has the frontend's layout.  0 when unknown. */
 int tcc_ir_frame_object_at(TCCIRState *ir, int off, int *lo, int *hi);
+/* Recorded size of the frame object starting exactly at `start`, or -1
+ * (before frame relayout only). */
+int tcc_ir_frame_object_size_at(TCCIRState *ir, int start);
 int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc);
 /* The function calls setjmp, vfork or another function that returns twice, so
  * a frame slot live only on one return may still be read on the other. */

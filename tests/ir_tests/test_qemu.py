@@ -216,6 +216,8 @@ TEST_FILES = [
     ("test_complex_param_parts.c", 0),
     # a by-value struct parameter passed on by value (memcpy source bias)
     ("test_struct_param_pass_on.c", 0),
+    # a local filled by a whole copy of a by-value struct parameter aliases it
+    ("test_param_copy_alias.c", 0),
     ("test_sra.c", 0),
     ("test_narrow_call_ext.c", 0),
     ("test_cross_jump.c", 0),

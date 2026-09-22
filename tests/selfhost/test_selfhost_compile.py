@@ -291,6 +291,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/flat/memory/mem_inline.c",
     "source/opt/flat/memory/memmove_to_indexed_stores.c",
     "source/opt/flat/memory/ptr_local_fwd.c",
+    "source/opt/flat/memory/param_copy_alias.c",
     "source/opt/flat/memory/sra.c",
     "source/opt/flat/memory/rmw_byte_clear.c",
     "source/opt/flat/memory/sl_forward.c",

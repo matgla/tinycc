@@ -126,6 +126,16 @@ static int frame_idx_cmp(const void *a, const void *b)
   return x[0] < y[0] ? -1 : x[0] > y[0];
 }
 
+int tcc_ir_frame_object_size_at(TCCIRState *ir, int start)
+{
+  if (!ir || ir->frame_relaid)
+    return -1;
+  for (int k = 0; k < ir->frame_obj_count; k++)
+    if (ir->frame_objs[4 * k] == start)
+      return ir->frame_objs[4 * k + 2];
+  return -1;
+}
+
 int tcc_ir_frame_object_at(TCCIRState *ir, int off, int *lo, int *hi)
 {
   if (!ir || ir->frame_relaid || !ir->frame_obj_count)
