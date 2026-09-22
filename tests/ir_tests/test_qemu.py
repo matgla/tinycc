@@ -14,13 +14,17 @@ _FLOAT_CAPTURE_RE = rf"({_FLOAT_RE})"
 
 
 def _expect_line(sut, expected_line: str, *, timeout: int = 1, float_tol: float = 1e-5):
-    """Expect a line from QEMU output.
+    """Expect a line from QEMU output: a whole output line, not text inside one.
+
+    A substring search let test_frame_relayout's wrong "11" pass: its
+    expected "10" was found inside the next line, 2000000031000000121.
 
     If the expected line ends with a float literal (e.g. "sum=3.500000"),
     capture the actual float and compare within tolerance.
     """
     if expected_line is None:
         return
+    expected_line = expected_line.rstrip()
 
     float_matches = list(re.finditer(_FLOAT_RE, expected_line))
     if float_matches:
@@ -35,7 +39,7 @@ def _expect_line(sut, expected_line: str, *, timeout: int = 1, float_tol: float 
             expected_values.append(float(fm.group(0)))
             last_end = fm.end()
         parts.append(re.escape(expected_line[last_end:]))
-        pattern = "".join(parts)
+        pattern = _whole_line("".join(parts))
 
         sut.expect(pattern, timeout=timeout)
         actual_values = [float(sut.match.group(i + 1)) for i in range(len(expected_values))]
@@ -46,7 +50,7 @@ def _expect_line(sut, expected_line: str, *, timeout: int = 1, float_tol: float 
                 )
         return
 
-    sut.expect(_escape_regex(expected_line), timeout=timeout)
+    sut.expect(_whole_line(_escape_regex(expected_line)), timeout=timeout)
 
 MACHINE = "mps2-an505"
 CURRENT_DIR = Path(__file__).parent
@@ -1674,6 +1678,14 @@ def _strip_compiler_output(expected_lines, loglines):
 def _escape_regex(line):
     """Escape regex special characters in a line so it's treated literally."""
     return re.escape(line)
+
+
+def _whole_line(pattern):
+    """Anchor a pattern to one whole output line (the stream is consumed up
+    to each match, so the next line starts right after its newline).  Trailing
+    blanks do not count, as in the upstream tests2 harness: several of those
+    programs print a space before each newline their .expect files omit."""
+    return r"(?m)^" + pattern + r"[ \t]*\r?\n"
 
 
 def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10,

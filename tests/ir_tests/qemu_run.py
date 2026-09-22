@@ -201,6 +201,9 @@ class SubprocessSUT:
                         self._append_output(chunk)
                 except OSError:
                     pass
+                # A last line printed without a newline still ends here.
+                if self._buffer and not self._buffer.endswith("\n"):
+                    self._buffer += "\n"
                 m = regex.search(self._buffer)
                 if m is not None:
                     self.match = m
