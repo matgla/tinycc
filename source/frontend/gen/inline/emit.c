@@ -355,7 +355,10 @@ Section *function_text_section(TCCState *s1, Sym *sym)
   return sec;
 }
 
-void gen_inline_functions(TCCState *s)
+/* Generate the saved bodies the TU still owes: those referenced (sym->c) or
+ * not internal.  With OWED_ONLY, just the `static inline` bodies referenced so
+ * far that were never compiled at all -- see gen_owed_inline_functions. */
+static void emit_inline_functions(TCCState *s, int owed_only)
 {
   Sym *sym;
   int inline_generated, i;
@@ -398,6 +401,9 @@ void gen_inline_functions(TCCState *s)
                 sym ? get_tok_str(sym->v & ~SYM_FIELD, NULL) : "<null>", sym ? sym->c : -1,
                 sym ? !!(sym->type.t & VT_INLINE) : -1, (sym && sym->a.addrtaken) ? 1 : 0,
                 (sym && sym->type.ref && sym->type.ref->f.func_auto_inline) ? 1 : 0);
+      if (owed_only && (!sym || !(sym->type.t & VT_INLINE) || !sym->c || !elfsym(sym) ||
+                        elfsym(sym)->st_shndx != SHN_UNDEF))
+        continue;
       if (sym && (sym->c || !(sym->type.t & VT_INLINE)))
       {
         /* Skip original va_arg_pack functions - only their clones get compiled */
@@ -418,6 +424,25 @@ void gen_inline_functions(TCCState *s)
     }
   } while (inline_generated);
   tcc_close();
+}
+
+void gen_inline_functions(TCCState *s)
+{
+  emit_inline_functions(s, 0);
+}
+
+/* The end-of-TU analyses read facts that parsing a body records: a static's
+ * possibly_written/addrtaken (the late_reopt global_init fold) and its readers
+ * and writers (tcc_ir_tu_analyze_dead_statics).  A `static inline` body a call
+ * site did not expand -- address taken, or a call the inliner declined -- is
+ * parsed only when gen_inline_functions emits it, which used to be after both:
+ * a static written only there folded to its initializer, and a store read only
+ * there was dropped as dead.  Emit those bodies first.  Whether one is owed is
+ * already settled by sym->c; a body still undefined in the symbol table was
+ * never compiled, unlike the kept-for-reopt entries sharing inline_fns. */
+void gen_owed_inline_functions(TCCState *s)
+{
+  emit_inline_functions(s, 1);
 }
 
 void free_inline_functions(TCCState *s)

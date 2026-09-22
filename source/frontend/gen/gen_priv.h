@@ -484,6 +484,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args);
 void free_inline_functions(TCCState *s);
 Section *function_text_section(TCCState *s1, Sym *sym);
 void gen_inline_functions(TCCState *s);
+void gen_owed_inline_functions(TCCState *s);
 void gen_late_reopt_functions(TCCState *s);
 void ir_inline_stash_flush(TCCState *s1);
 

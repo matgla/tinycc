@@ -1209,6 +1209,11 @@ TEST_FILES = [
     # no-overflow assumption: `(int)(x + 1U) + 1 < (int)x` folded to false.
     ("473_reassoc_unsigned_into_signed.c", 0),
 
+    # static inline bodies a call site did not expand were parsed after the
+    # end-of-TU late_reopt fold and dead-static analysis: a static written only
+    # there folded to 0, a store read only there was dropped.
+    ("474_late_reopt_owed_inline_bodies.c", 0),
+
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
     # ssa:first_iter_exit migration.

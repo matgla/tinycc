@@ -225,6 +225,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
   next();
   decl(VT_CONST);
+  gen_owed_inline_functions(s1);
   /* End-of-TU analysis: compute call-graph reachability and the set of
    * static globals with no reachable readers.  Must run before
    * gen_late_reopt_functions so newly-flagged writer functions get picked
