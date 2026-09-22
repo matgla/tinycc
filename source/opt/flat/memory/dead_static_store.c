@@ -30,8 +30,13 @@ static Sym *dss_symref_sym(TCCIRState *ir, IROperand op)
   return ref ? ref->sym : NULL;
 }
 
-/* vreg->sym forward-trace map: resolves STORE dests reached through temps. */
+/* vreg->sym forward-trace map: resolves STORE dests reached through temps.
+ * Flow-insensitive, so a vreg maps to a symbol only while EVERY definition of
+ * it derives that symbol: one that derives another, or none, poisons the
+ * entry for good (the last definition in instruction order is not the one
+ * reaching a use in a loop).  A map that fills up answers nothing. */
 #define DSS_VREG_MAP_MAX 128
+#define DSS_VREG_MAP_OVERFLOW (DSS_VREG_MAP_MAX + 1)
 typedef struct
 {
   int32_t vreg;
@@ -40,19 +45,25 @@ typedef struct
 
 static Sym *dss_vreg_map_lookup(const DssVregEntry *map, int count, int32_t vr)
 {
+  if (count == DSS_VREG_MAP_OVERFLOW)
+    return NULL;
   for (int i = 0; i < count; i++)
     if (map[i].vreg == vr)
       return map[i].sym;
   return NULL;
 }
 
-static void dss_vreg_map_set(DssVregEntry *map, int *count, int32_t vr, Sym *sym)
+/* Record one definition of vr, deriving sym (NULL: none). */
+static void dss_vreg_map_def(DssVregEntry *map, int *count, int32_t vr, Sym *sym)
 {
+  if (*count == DSS_VREG_MAP_OVERFLOW)
+    return;
   for (int i = 0; i < *count; i++)
   {
     if (map[i].vreg == vr)
     {
-      map[i].sym = sym;
+      if (map[i].sym != sym)
+        map[i].sym = NULL; /* poisoned: NULL never matches a later sym */
       return;
     }
   }
@@ -62,18 +73,8 @@ static void dss_vreg_map_set(DssVregEntry *map, int *count, int32_t vr, Sym *sym
     map[*count].sym = sym;
     (*count)++;
   }
-}
-
-static void dss_vreg_map_clear(DssVregEntry *map, int *count, int32_t vr)
-{
-  for (int i = 0; i < *count; i++)
-  {
-    if (map[i].vreg == vr)
-    {
-      map[i].sym = NULL;
-      return;
-    }
-  }
+  else
+    *count = DSS_VREG_MAP_OVERFLOW;
 }
 
 static void dss_build_vreg_map(TCCIRState *ir, DssVregEntry *map, int *count)
@@ -85,16 +86,23 @@ static void dss_build_vreg_map(TCCIRState *ir, DssVregEntry *map, int *count)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if (!irop_config[q->op].has_dest)
+    /* A post-increment moves its base pointer: a definition deriving nothing. */
+    if (q->op == TCCIR_OP_LOAD_POSTINC)
+      dss_vreg_map_def(map, count, irop_get_vreg(tcc_ir_op_get_src1(ir, q)), NULL);
+    if (!irop_config[q->op].has_dest || q->op == TCCIR_OP_STORE_INDEXED)
       continue;
-    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
-        q->op == TCCIR_OP_STORE_POSTINC)
+    if (q->op == TCCIR_OP_STORE_POSTINC)
+    {
+      dss_vreg_map_def(map, count, irop_get_vreg(tcc_ir_op_get_dest(ir, q)), NULL);
       continue;
+    }
 
+    /* A store through a pointer defines nothing; a VAR stored as itself (a
+     * STACKOFF lvalue, `V <- &s [STORE]`) is a definition like any other. */
     IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t dvr = irop_get_vreg(dest);
-    if (dvr < 0 || dest.is_lval)
+    if (!irop_dest_defines_vreg(dest))
       continue;
+    int32_t dvr = irop_get_vreg(dest);
 
     Sym *derived_sym = NULL;
     if (irop_config[q->op].has_src1)
@@ -129,10 +137,7 @@ static void dss_build_vreg_map(TCCIRState *ir, DssVregEntry *map, int *count)
         derived_sym = dss_vreg_map_lookup(map, *count, avr);
     }
 
-    if (derived_sym)
-      dss_vreg_map_set(map, count, dvr, derived_sym);
-    else
-      dss_vreg_map_clear(map, count, dvr);
+    dss_vreg_map_def(map, count, dvr, derived_sym);
   }
 }
 

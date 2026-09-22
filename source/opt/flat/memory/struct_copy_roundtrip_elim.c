@@ -91,11 +91,12 @@ static int scre_resolve_slot_addr(TCCIRState *ir, IROperand op, int before_idx, 
       IRQuadCompact *oq = &ir->compact_instructions[o];
       if (oq->op == TCCIR_OP_NOP || !irop_config[oq->op].has_dest)
         continue;
-      if (oq->op == TCCIR_OP_STORE || oq->op == TCCIR_OP_STORE_INDEXED ||
-          oq->op == TCCIR_OP_STORE_POSTINC)
-        continue; /* store dest is an address use, not a def */
+      if (oq->op == TCCIR_OP_STORE_INDEXED)
+        continue; /* its destination is the base address */
+      /* A store through a pointer is an address use, not a def; a VAR or
+       * PARAM stored as itself (a STACKOFF lvalue) is redefined. */
       IROperand od = tcc_ir_op_get_dest(ir, oq);
-      if (irop_has_vreg(od) && irop_get_vreg(od) == vr && !od.is_lval)
+      if (irop_get_vreg(od) == vr && irop_dest_defines_vreg(od))
         return 0;
     }
     if (dq->op != TCCIR_OP_LEA && dq->op != TCCIR_OP_ASSIGN)

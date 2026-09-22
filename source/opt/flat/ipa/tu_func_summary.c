@@ -108,7 +108,13 @@ static int tu_is_static_global_candidate(const Sym *sym)
   return 1;
 }
 
+/* vreg -> static symbol map.  Flow-insensitive, so a vreg maps to a symbol
+ * only while EVERY definition of it derives that symbol: one that derives
+ * another, or none, poisons the entry for good (the last definition in
+ * instruction order is not the one reaching a use in a loop).  A map that
+ * fills up answers nothing. */
 #define TU_VREG_MAP_MAX 128
+#define TU_VREG_MAP_OVERFLOW (TU_VREG_MAP_MAX + 1)
 typedef struct
 {
   int32_t vreg;
@@ -117,19 +123,25 @@ typedef struct
 
 static Sym *tu_vreg_map_lookup(const TuVregSymEntry *map, int count, int32_t vr)
 {
+  if (count == TU_VREG_MAP_OVERFLOW)
+    return NULL;
   for (int i = 0; i < count; i++)
     if (map[i].vreg == vr)
       return map[i].sym;
   return NULL;
 }
 
-static void tu_vreg_map_set(TuVregSymEntry *map, int *count, int32_t vr, Sym *sym)
+/* Record one definition of vr, deriving sym (NULL: none). */
+static void tu_vreg_map_def(TuVregSymEntry *map, int *count, int32_t vr, Sym *sym)
 {
+  if (vr < 0 || *count == TU_VREG_MAP_OVERFLOW)
+    return;
   for (int i = 0; i < *count; i++)
   {
     if (map[i].vreg == vr)
     {
-      map[i].sym = sym;
+      if (map[i].sym != sym)
+        map[i].sym = NULL; /* poisoned: NULL never matches a later sym */
       return;
     }
   }
@@ -139,18 +151,29 @@ static void tu_vreg_map_set(TuVregSymEntry *map, int *count, int32_t vr, Sym *sy
     map[*count].sym = sym;
     (*count)++;
   }
+  else
+    *count = TU_VREG_MAP_OVERFLOW;
 }
 
-static void tu_vreg_map_clear(TuVregSymEntry *map, int *count, int32_t vr)
+/* The vreg an instruction (re)defines through its destination, or -1: a
+ * plain value, or a VAR stored as itself (a STACKOFF lvalue,
+ * `V <- &s [STORE]`) -- not a store through a pointer, nor an indexed store's
+ * base.  A post-increment's base is moved: tu_note_postinc_def. */
+static int32_t tu_dest_def(TCCIRState *ir, IRQuadCompact *q)
 {
-  for (int i = 0; i < *count; i++)
-  {
-    if (map[i].vreg == vr)
-    {
-      map[i].sym = NULL;
-      return;
-    }
-  }
+  if (!irop_config[q->op].has_dest || q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC)
+    return -1;
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  return irop_dest_defines_vreg(dest) ? irop_get_vreg(dest) : -1;
+}
+
+/* A post-increment moves its base pointer: a definition deriving nothing. */
+static void tu_note_postinc_def(TCCIRState *ir, IRQuadCompact *q, TuVregSymEntry *map, int *count)
+{
+  if (q->op == TCCIR_OP_LOAD_POSTINC)
+    tu_vreg_map_def(map, count, irop_get_vreg(tcc_ir_op_get_src1(ir, q)), NULL);
+  else if (q->op == TCCIR_OP_STORE_POSTINC)
+    tu_vreg_map_def(map, count, irop_get_vreg(tcc_ir_op_get_dest(ir, q)), NULL);
 }
 
 /* Any pre-opt value read or unrecognized address use of a static blocks tu_no_readers; store-address plumbing `T=&g+i; *T=v` does not. */
@@ -165,8 +188,6 @@ void tcc_ir_collect_tu_static_reads_preopt(TCCIRState *ir)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    int is_store = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
-                    q->op == TCCIR_OP_STORE_POSTINC);
     int is_load = (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_LOAD_INDEXED ||
                    q->op == TCCIR_OP_LOAD_POSTINC);
     int is_addr_derive = (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_ADD ||
@@ -200,11 +221,10 @@ void tcc_ir_collect_tu_static_reads_preopt(TCCIRState *ir)
         tu_symset_add(&tu_source_reads, sym);
     }
 
-    if (irop_config[q->op].has_dest && !is_store)
+    tu_note_postinc_def(ir, q, map, &mc);
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(dest);
-      if (dvr >= 0 && !dest.is_lval)
+      int32_t dvr = tu_dest_def(ir, q);
+      if (dvr >= 0)
       {
         Sym *derived = NULL;
         if (is_addr_derive && irop_config[q->op].has_src1)
@@ -223,10 +243,7 @@ void tcc_ir_collect_tu_static_reads_preopt(TCCIRState *ir)
           else if (!acc.is_sym && !acc.is_lval && irop_get_vreg(acc) >= 0)
             derived = tu_vreg_map_lookup(map, mc, irop_get_vreg(acc));
         }
-        if (derived && tu_is_static_global_candidate(derived))
-          tu_vreg_map_set(map, &mc, dvr, derived);
-        else
-          tu_vreg_map_clear(map, &mc, dvr);
+        tu_vreg_map_def(map, &mc, dvr, derived && tu_is_static_global_candidate(derived) ? derived : NULL);
       }
     }
   }
@@ -384,14 +401,12 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    /* A STORE dest is an address operand, not a value definition, so it must not disturb the map. */
-    if (irop_config[q->op].has_dest &&
-        q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
-        q->op != TCCIR_OP_STORE_POSTINC)
+    /* A store through a pointer is an address use, not a definition; a VAR
+     * stored as itself is one (tu_dest_def). */
+    tu_note_postinc_def(ir, q, vreg_map, &vreg_map_count);
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(dest);
-      if (dvr >= 0 && !dest.is_lval)
+      int32_t dvr = tu_dest_def(ir, q);
+      if (dvr >= 0)
       {
         Sym *derived_sym = NULL;
 
@@ -437,10 +452,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
             derived_sym = tu_vreg_map_lookup(vreg_map, vreg_map_count, avr);
         }
 
-        if (derived_sym)
-          tu_vreg_map_set(vreg_map, &vreg_map_count, dvr, derived_sym);
-        else
-          tu_vreg_map_clear(vreg_map, &vreg_map_count, dvr);
+        tu_vreg_map_def(vreg_map, &vreg_map_count, dvr, derived_sym);
       }
     }
 

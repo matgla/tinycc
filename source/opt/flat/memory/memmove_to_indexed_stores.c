@@ -124,8 +124,10 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
           break;
         if (!irop_config[lq->op].has_dest)
           continue;
+        /* A VAR written as itself is a STACKOFF lvalue: still a definition
+         * (irop_dest_defines_vreg), not one to search past. */
         IROperand ld = tcc_ir_op_get_dest(ir, lq);
-        if (!irop_has_vreg(ld) || irop_get_vreg(ld) != src_vr || ld.is_lval)
+        if (irop_get_vreg(ld) != src_vr || !irop_dest_defines_vreg(ld))
           continue;
         /* The op writing our vreg must be a LEA/ASSIGN from Addr[StackLoc[X]]. */
         if (lq->op != TCCIR_OP_LEA && lq->op != TCCIR_OP_ASSIGN)
@@ -196,7 +198,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
           if (!irop_config[lq->op].has_dest)
             continue;
           IROperand ld = tcc_ir_op_get_dest(ir, lq);
-          if (!irop_has_vreg(ld) || irop_get_vreg(ld) != trace_vr || ld.is_lval)
+          if (irop_get_vreg(ld) != trace_vr || !irop_dest_defines_vreg(ld))
             continue;
           trace_depth++;
           if (lq->op == TCCIR_OP_LEA || lq->op == TCCIR_OP_ASSIGN)
@@ -421,7 +423,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
               if (kq->op == TCCIR_OP_JUMP || kq->op == TCCIR_OP_JUMPIF || kq->op == TCCIR_OP_IJUMP) break;
               if (!irop_config[kq->op].has_dest) continue;
               IROperand kd = tcc_ir_op_get_dest(ir, kq);
-              if (!irop_has_vreg(kd) || irop_get_vreg(kd) != trace_vr || kd.is_lval) continue;
+              if (irop_get_vreg(kd) != trace_vr || !irop_dest_defines_vreg(kd)) continue;
               trace_depth++;
               if (kq->op == TCCIR_OP_ADD)
               {
@@ -473,7 +475,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
                 if (kq->op == TCCIR_OP_JUMP || kq->op == TCCIR_OP_JUMPIF || kq->op == TCCIR_OP_IJUMP) break;
                 if (!irop_config[kq->op].has_dest) continue;
                 IROperand kd = tcc_ir_op_get_dest(ir, kq);
-                if (!irop_has_vreg(kd) || irop_get_vreg(kd) != trace_vr || kd.is_lval) continue;
+                if (irop_get_vreg(kd) != trace_vr || !irop_dest_defines_vreg(kd)) continue;
                 trace_depth++;
                 if (kq->op == TCCIR_OP_ADD)
                 {
@@ -679,7 +681,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         if (!irop_config[sq->op].has_dest)
           continue;
         IROperand d = tcc_ir_op_get_dest(ir, sq);
-        if (irop_has_vreg(d) && irop_get_vreg(d) == dst_vr && !d.is_lval)
+        if (irop_get_vreg(d) == dst_vr && irop_dest_defines_vreg(d))
         {
           dst_def_idx = j;
           break;
