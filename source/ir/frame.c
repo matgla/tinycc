@@ -387,6 +387,10 @@ typedef struct
   int32_t *taint[4]; /* by vreg type: VAR, TEMP, PARAM */
   int taint_size[4];
   uint8_t *var_addr_taken[4];
+  /* A vreg defined once, to a known address inside a frame object: the object
+   * (vseg, -1 if not known) and the offset in it (vrel). */
+  int32_t *vseg[4], *vrel[4];
+  uint8_t *vdefs[4];
   int changed, bad;
 } FrameLive;
 
@@ -596,13 +600,6 @@ static int frame_callee_nocapture(TCCIRState *ir, IRQuadCompact *call)
   return 0;
 }
 
-/* Positions of the instructions in reverse post-order of the control-flow
- * graph, and its back edges as (target, source) position pairs.  In RPO every
- * edge that is not a back edge goes forward, so a path can only return to an
- * earlier position across a back edge -- which the lifetime widening needs.
- * Source order would not do: a switch's dispatch follows its cases, and its
- * forward jumps into them would all look like loops.  Returns 0 on a switch the
- * graph cannot follow.  Unreachable blocks go last, in source order. */
 /* The basic blocks frame_rpo found, kept for frame_precise_lifetimes. */
 typedef struct
 {
@@ -627,6 +624,39 @@ static void frame_cfg_free(FrameCFG *cfg)
   memset(cfg, 0, sizeof *cfg);
 }
 
+/* For a C library call that overwrites what its argument 0 points to -- the
+ * memcpy, memmove and memset families -- the index of the argument holding
+ * the byte count; else -1. */
+static int frame_callee_arg0_size_index(TCCIRState *ir, IRQuadCompact *call)
+{
+  static const char *const size2[] = {"memcpy",           "memmove",          "memset",
+                                      "__aeabi_memcpy",   "__aeabi_memcpy4",  "__aeabi_memcpy8",
+                                      "__aeabi_memmove",  "__aeabi_memmove4", "__aeabi_memmove8"};
+  static const char *const size1[] = {"__aeabi_memset", "__aeabi_memset4", "__aeabi_memset8",
+                                      "__aeabi_memclr", "__aeabi_memclr4", "__aeabi_memclr8"};
+  IROperand callee = tcc_ir_op_get_src1(ir, call);
+  if (irop_get_tag(callee) != IROP_TAG_SYMREF)
+    return -1;
+  Sym *sym = irop_get_sym_ex(ir, callee);
+  const char *name = sym ? get_tok_str(sym->v, NULL) : NULL;
+  if (!name)
+    return -1;
+  for (unsigned k = 0; k < sizeof size2 / sizeof size2[0]; k++)
+    if (!strcmp(name, size2[k]))
+      return 2;
+  for (unsigned k = 0; k < sizeof size1 / sizeof size1[0]; k++)
+    if (!strcmp(name, size1[k]))
+      return 1;
+  return -1;
+}
+
+/* Positions of the instructions in reverse post-order of the control-flow
+ * graph, and its back edges as (target, source) position pairs.  In RPO every
+ * edge that is not a back edge goes forward, so a path can only return to an
+ * earlier position across a back edge -- which the lifetime widening needs.
+ * Source order would not do: a switch's dispatch follows its cases, and its
+ * forward jumps into them would all look like loops.  Returns 0 on a switch the
+ * graph cannot follow.  Unreachable blocks go last, in source order. */
 static int frame_rpo(TCCIRState *ir, int n, int *pos, int **be_out, int *nbe_out, int **sbe_out, int *nsbe_out,
                      FrameCFG *cfg)
 {
@@ -904,32 +934,42 @@ static int frame_btype_width(IROperand op)
   }
 }
 
-/* The event for operand `op` (classified `kind`, naming segment `t`) of
+/* The event for operand `opnd` (classified `kind`, naming segment `t`) of
  * instruction `i`; role 0 is the destination.  `call` is the call reading a
- * FUNCPARAMVAL, and `sret` the struct size it writes through parameter 0. */
+ * FUNCPARAMVAL, and `writes` the bytes that call stores through it (a struct
+ * result, a memcpy/memset destination) or 0.  A USE records the bytes it
+ * reads when known, width 0 when not. */
 static void frame_ev_operand(FrameLive *fl, FrameEvents *ev, int i, int op, int role, int kind, IROperand opnd, int t,
-                             int call, int sret)
+                             int call, int writes)
 {
-  int off = 0, rel = -1;
+  /* Where in object t the operand points: a direct frame operand, or a
+   * pointer vreg with one definition to a known address in it. */
+  int rel = -1, off;
   if ((kind == FOP_MEM || kind == FOP_ADDR) && frame_operand_offset(opnd, fl->bottom, &off))
     rel = off - fl->seg[t].start;
-  if (kind == FOP_MEM)
+  else if (kind == FOP_VAL || kind == FOP_DEREF)
   {
-    if (role == 0 && (op == TCCIR_OP_STORE || op == TCCIR_OP_ASSIGN || op == TCCIR_OP_VLA_SP_SAVE))
+    int32_t vr = irop_get_vreg(opnd);
+    int ty = TCCIR_DECODE_VREG_TYPE(vr), ps = TCCIR_DECODE_VREG_POSITION(vr);
+    if (vr >= 0 && ty >= 1 && ty <= 3 && ps < fl->taint_size[ty] && fl->vseg[ty][ps] == t)
+      rel = fl->vrel[ty][ps];
+  }
+  if (kind == FOP_MEM || kind == FOP_DEREF)
+  {
+    /* The bytes at rel: directly, or through the pointer. */
+    int w = op == TCCIR_OP_VLA_SP_SAVE ? 4 : frame_btype_width(opnd);
+    if (op == TCCIR_OP_BLOCK_COPY)
     {
-      int w = op == TCCIR_OP_VLA_SP_SAVE ? 4 : frame_btype_width(opnd);
-      frame_ev_add(ev, i, t, w > 0 && rel >= 0 ? FEV_WRITE : FEV_USE, rel, w);
-      return;
+      IROperand size = tcc_ir_op_get_src2(fl->ir, &fl->ir->compact_instructions[i]);
+      w = irop_is_immediate(size) ? (int)irop_get_imm64_ex(fl->ir, size) : 0;
     }
-    if (role == 0 && op == TCCIR_OP_BLOCK_COPY)
-    {
-      IRQuadCompact *q = &fl->ir->compact_instructions[i];
-      IROperand size = tcc_ir_op_get_src2(fl->ir, q);
-      int w = irop_is_immediate(size) ? (int)irop_get_imm64_ex(fl->ir, size) : 0;
-      frame_ev_add(ev, i, t, w > 0 && rel >= 0 ? FEV_WRITE : FEV_USE, rel, w);
-      return;
-    }
-    frame_ev_add(ev, i, t, FEV_USE, 0, 0);
+    if (rel < 0 || w <= 0)
+      rel = 0, w = 0;
+    if (role == 0 && (op == TCCIR_OP_STORE || op == TCCIR_OP_ASSIGN || op == TCCIR_OP_VLA_SP_SAVE ||
+                      op == TCCIR_OP_BLOCK_COPY))
+      frame_ev_add(ev, i, t, w > 0 ? FEV_WRITE : FEV_USE, rel, w);
+    else
+      frame_ev_add(ev, i, t, FEV_USE, rel, w);
     return;
   }
   if (kind == FOP_ADDR || kind == FOP_VAL)
@@ -937,15 +977,15 @@ static void frame_ev_operand(FrameLive *fl, FrameEvents *ev, int i, int op, int 
     if (op == TCCIR_OP_FUNCPARAMVAL)
     {
       frame_ev_add(ev, i, t, FEV_REF, 0, 0);
-      if (sret > 0 && kind == FOP_ADDR && rel >= 0)
-        frame_ev_add(ev, call, t, FEV_WRITE, rel, sret);
+      if (writes > 0 && rel >= 0)
+        frame_ev_add(ev, call, t, FEV_WRITE, rel, writes);
       else
         frame_ev_add(ev, call, t, FEV_USE, 0, 0);
       return;
     }
-    if (role == 0 && op == TCCIR_OP_BLOCK_COPY && kind == FOP_ADDR)
+    if (role == 0 && op == TCCIR_OP_BLOCK_COPY)
     {
-      frame_ev_operand(fl, ev, i, op, role, FOP_MEM, opnd, t, call, sret);
+      frame_ev_operand(fl, ev, i, op, role, FOP_MEM, opnd, t, call, writes);
       return;
     }
     if (frame_op_passes_value(op) || op == TCCIR_OP_CMP || op == TCCIR_OP_TEST_ZERO)
@@ -1016,8 +1056,26 @@ static void frame_precise_lifetimes(FrameLive *fl, FrameCFG *cfg, const int *pos
   uint8_t *bad = tcc_mallocz(K), *killed = tcc_mallocz(K), *closed = tcc_mallocz(K);
   int *stamp = tcc_malloc(sizeof(int) * K);
   uint64_t *cover = tcc_malloc(sizeof(uint64_t) * K);
+  /* The bytes of each object ever read (up to 64 bytes; beyond, all): only
+   * those need covering for a kill -- a byte nothing reads carries nothing. */
+  uint64_t *rmask = tcc_mallocz(sizeof(uint64_t) * K);
   for (int k = 0; k < K; k++)
     stamp[k] = -1;
+  for (int x = 0; x < ev->n; x++)
+  {
+    const FrameEv *e = &ev->v[x];
+    int k = cand[e->s];
+    if (k < 0 || e->kind != FEV_USE)
+      continue;
+    const int size = fl->seg[e->s].size;
+    if (size > 64 || e->width <= 0 || e->off < 0 || e->off >= size)
+      rmask[k] = ~0ull;
+    else
+    {
+      int hi = e->off + e->width < size ? e->off + e->width : size;
+      rmask[k] |= (hi - e->off >= 64 ? ~0ull : ((1ull << (hi - e->off)) - 1)) << e->off;
+    }
+  }
 
   for (int x = 0; x < ev->n; x++)
   {
@@ -1054,7 +1112,7 @@ static void frame_precise_lifetimes(FrameLive *fl, FrameCFG *cfg, const int *pos
       {
         int hi = e->off + e->width < size ? e->off + e->width : size;
         uint64_t m = (hi - e->off >= 64 ? ~0ull : ((1ull << (hi - e->off)) - 1)) << e->off;
-        uint64_t full = size >= 64 ? ~0ull : (1ull << size) - 1;
+        uint64_t full = (size >= 64 ? ~0ull : (1ull << size) - 1) & rmask[k];
         cover[k] |= m;
         if ((cover[k] & full) == full)
           goto kill_it;
@@ -1134,6 +1192,7 @@ static void frame_precise_lifetimes(FrameLive *fl, FrameCFG *cfg, const int *pos
   tcc_free(closed);
   tcc_free(stamp);
   tcc_free(cover);
+  tcc_free(rmask);
 }
 
 /* Lifetimes of the live segments.  Returns 0 if they cannot be computed. */
@@ -1255,6 +1314,71 @@ static int frame_lifetimes(FrameLive *fl)
   if (fl->bad)
     goto out;
 
+  /* Pointers defined once, to a known place in a frame object: the address
+   * itself, or one such pointer moved or offset by a constant.  A store
+   * through one writes known bytes (frame_ev_operand). */
+  for (int k = 0; k < 3; k++)
+  {
+    int t = types[k], sz = fl->taint_size[t] > 0 ? fl->taint_size[t] : 1;
+    fl->vseg[t] = tcc_malloc(sizeof(int32_t) * sz);
+    fl->vrel[t] = tcc_malloc(sizeof(int32_t) * sz);
+    fl->vdefs[t] = tcc_mallocz(sz);
+    for (int j = 0; j < sz; j++)
+      fl->vseg[t][j] = -1;
+  }
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t vr = irop_get_vreg(d);
+    int ty = TCCIR_DECODE_VREG_TYPE(vr), ps = TCCIR_DECODE_VREG_POSITION(vr);
+    if (irop_dest_defines_vreg(d) && ty >= 1 && ty <= 3 && ps < fl->taint_size[ty] && fl->vdefs[ty][ps] < 2)
+      fl->vdefs[ty][ps]++;
+  }
+  for (int round = 0; round < 3; round++)
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int op = q->op;
+      if (op != TCCIR_OP_LEA && op != TCCIR_OP_ASSIGN && op != TCCIR_OP_ADD && op != TCCIR_OP_SUB)
+        continue;
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      int32_t vr = irop_get_vreg(d);
+      int ty = TCCIR_DECODE_VREG_TYPE(vr), ps = TCCIR_DECODE_VREG_POSITION(vr);
+      /* A PARAM also arrives defined, and a VAR whose address is taken may
+       * be written through it: one IR definition says nothing for those. */
+      if (vr < 0 || irop_get_tag(d) != IROP_TAG_VREG || d.is_lval ||
+          (ty != TCCIR_VREG_TYPE_TEMP && ty != TCCIR_VREG_TYPE_VAR) || ps >= fl->taint_size[ty] ||
+          fl->vdefs[ty][ps] != 1 || fl->vseg[ty][ps] >= 0 || fl->var_addr_taken[ty][ps])
+        continue;
+      IROperand a = tcc_ir_op_get_src1(ir, q);
+      int id, kind = frame_classify(fl, a, &id), seg = -1, rel = 0, off;
+      if (kind == FOP_ADDR && frame_operand_offset(a, fl->bottom, &off))
+        seg = id, rel = off - fl->seg[id].start;
+      else if (kind == FOP_VAL && irop_get_tag(a) == IROP_TAG_VREG)
+      {
+        int aty = TCCIR_DECODE_VREG_TYPE(id), aps = TCCIR_DECODE_VREG_POSITION(id);
+        if (fl->vseg[aty][aps] >= 0)
+          seg = fl->vseg[aty][aps], rel = fl->vrel[aty][aps];
+      }
+      if (seg < 0)
+        continue;
+      if (op == TCCIR_OP_ADD || op == TCCIR_OP_SUB)
+      {
+        IROperand b = tcc_ir_op_get_src2(ir, q);
+        if (!irop_is_immediate(b))
+          continue;
+        int64_t c = irop_get_imm64_ex(ir, b);
+        rel += op == TCCIR_OP_SUB ? -(int)c : (int)c;
+      }
+      else if (irop_config[op].has_src2 && !irop_is_none(tcc_ir_op_get_src2(ir, q)))
+        continue;
+      fl->vseg[ty][ps] = seg;
+      fl->vrel[ty][ps] = rel;
+    }
+
   /* References and escapes.  Pool entries no instruction operand covers are
    * orphans a pass replaced; they are never executed. */
   for (int i = 0; i < n; i++)
@@ -1280,13 +1404,26 @@ static int frame_lifetimes(FrameLive *fl)
       {
         fl->seg[t].refs++;
         int sret = 0;
-        if (op == TCCIR_OP_FUNCPARAMVAL)
+        if (op == TCCIR_OP_FUNCPARAMVAL && k == 0)
         {
           IROperand enc = tcc_ir_op_get_src2(ir, q);
           int c = frame_call_id(ir, enc);
-          if (TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, enc)) == 0 && c >= 0 &&
-              c < ir->sret_calls_size)
-            sret = ir->sret_calls[c];
+          if (TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, enc)) == 0)
+          {
+            int ci = param_call[i];
+            int size_idx = ci != i ? frame_callee_arg0_size_index(ir, &ir->compact_instructions[ci]) : -1;
+            if (c >= 0 && c < ir->sret_calls_size && ir->sret_calls[c])
+              sret = ir->sret_calls[c];
+            else if (size_idx >= 0)
+              for (int pp = call_params[ci]; pp >= 0; pp = param_next[pp])
+              {
+                IRQuadCompact *pq = &ir->compact_instructions[pp];
+                IROperand pe = tcc_ir_op_get_src2(ir, pq), pv = tcc_ir_op_get_src1(ir, pq);
+                if (TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, pe)) == size_idx &&
+                    irop_is_immediate(pv))
+                  sret = (int)irop_get_imm64_ex(ir, pv);
+              }
+          }
         }
         int has_dest = irop_config[op].has_dest;
         frame_ev_operand(fl, &ev, i, op, has_dest && k == 0 ? 0 : 1, kind, ir->iroperand_pool[pi], t,
@@ -1389,6 +1526,9 @@ out:
   {
     tcc_free(fl->taint[types[k]]);
     tcc_free(fl->var_addr_taken[types[k]]);
+    tcc_free(fl->vseg[types[k]]);
+    tcc_free(fl->vrel[types[k]]);
+    tcc_free(fl->vdefs[types[k]]);
   }
   tcc_free(param_call);
   tcc_free(nocapture);
