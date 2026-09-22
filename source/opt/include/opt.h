@@ -200,6 +200,7 @@ int tcc_ir_opt_addrof_var_fwd(struct TCCIRState *ir);
 
 /* Rewrites derefs through single-def entry-block `P = &V` pointer VARs (and their TEMP copies) to direct V accesses. */
 int tcc_ir_opt_ptr_local_fwd(struct TCCIRState *ir);
+int tcc_ir_opt_sra(struct TCCIRState *ir);
 int tcc_ir_opt_ptr_local_fwd_ex(struct IROptCtx *ctx);
 
 /* Forwards a load of a copied local field (`x=G; ... x.field`) to the source global `G.field`. */

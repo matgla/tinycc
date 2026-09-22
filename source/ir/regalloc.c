@@ -5788,6 +5788,14 @@ void tcc_ir_ssa_regalloc(TCCIRState *ir, const RegAllocTarget *target, int spill
    * here with NOPs in the stream. */
   tcc_ir_opt_compact_nops(ir);
 
+  /* Small frame objects touched only a word at a time become VARs, which the
+   * SSA construction below renames like any other scalar. */
+  if (tcc_state && tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("sra"))
+  {
+    tcc_ir_opt_sra(ir);
+    tcc_ir_dump_after_pass(ir, "sra");
+  }
+
   /* Build CFG + dominators */
   TCCPassTimer ra2_pt;
   tcc_pass_timing_begin(&ra2_pt, "ra2:cfg_ssa");
