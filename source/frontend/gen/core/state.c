@@ -42,8 +42,6 @@ ST_DATA Sym *global_stack;
 ST_DATA Sym *local_stack;
 ST_DATA Sym *define_stack;
 
-unsigned char *aapcs_last_const_init;
-int aapcs_last_const_init_size;
 ST_DATA Sym *global_label_stack;
 ST_DATA Sym *local_label_stack;
 
@@ -130,53 +128,6 @@ struct switch_t *cur_switch; /* current switch */
 struct temp_local_variable arr_temp_local_vars[MAX_TEMP_LOCAL_VARIABLE_NUMBER];
 int nb_temp_local_vars;
 
-/* Reusable stack slots for by-value struct arguments passed to variadic
- * functions (the invisible-copy the AAPCS requires for structs > 16 bytes).
- * Unlike get_temp_local_var()'s vstack-based tracking, these slots must stay
- * reserved until the whole call is emitted — each argument is lowered to a
- * FUNCPARAMVAL and popped off the vstack before the next argument is built,
- * so the vstack can no longer witness that the slot is in use.
- *
- * Instead a busy bitmask tracks live slots, and block() saves/restores it
- * around every statement.  Two struct-arg copies that are live at the same
- * time (e.g. f(a, b, a) — three copies, all read by the one call) therefore
- * get distinct slots, while copies from statements that have fully completed
- * are reclaimed.  GNU statement-expressions used as arguments enter a nested
- * block() whose save/restore leaves the enclosing call's reserved slots
- * untouched, so they cannot be aliased. */
-#define MAX_ARG_STRUCT_TEMPS 64
-static struct arg_struct_temp
-{
-  int location;
-  int size;
-  int align;
-} arg_struct_temps[MAX_ARG_STRUCT_TEMPS];
-int nb_arg_struct_temps;
-uint64_t arg_struct_temp_busy;
-
-int get_arg_struct_temp(int size, int align)
-{
-  for (int i = 0; i < nb_arg_struct_temps; i++)
-  {
-    if (!(arg_struct_temp_busy & ((uint64_t)1 << i)) &&
-        arg_struct_temps[i].size >= size && arg_struct_temps[i].align >= align)
-    {
-      arg_struct_temp_busy |= (uint64_t)1 << i;
-      return arg_struct_temps[i].location;
-    }
-  }
-  loc = tcc_ir_frame_alloc_arg_copy(loc, size, -align);
-  if (nb_arg_struct_temps < MAX_ARG_STRUCT_TEMPS)
-  {
-    int i = nb_arg_struct_temps++;
-    arg_struct_temps[i].location = loc;
-    arg_struct_temps[i].size = size;
-    arg_struct_temps[i].align = align;
-    arg_struct_temp_busy |= (uint64_t)1 << i;
-  }
-  /* Pool exhausted: a fresh never-reused slot is always correct. */
-  return loc;
-}
 
 struct scope *cur_scope, *loop_scope, *root_scope;
 
@@ -453,8 +404,6 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   all_cleanups = NULL;
   pending_gotos = NULL;
   nb_temp_local_vars = 0;
-  nb_arg_struct_temps = 0;
-  arg_struct_temp_busy = 0;
   global_label_stack = NULL;
   local_label_stack = NULL;
   cur_text_section = NULL;

@@ -83,6 +83,8 @@ NEWLIB_LIBC_G = $(NEWLIB_DIR)/libc_g.a
 NEWLIB_LIBM_G = $(NEWLIB_DIR)/libm_g.a
 
 EXTRA_CFLAGS ?=
+# Prebuilt objects linked into the test (e.g. gcc-compiled, for ABI interop).
+EXTRA_OBJS ?=
 CFLAGS += -nostdlib -fvisibility=hidden $(GCC_ABI_FLAGS) -ffunction-sections $(EXTRA_CFLAGS)
 
 # Two-phase compilation support (reduces memory usage)
@@ -166,7 +168,7 @@ $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.S | $(OUTPUT)
 	$(CC_WRAPPER) $(CC) $(CFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJS) $(if $(filter 1,$(USE_NEWLIB_BUILD)),$(NEWLIB_DIR)/libc.a)
-	$(CC_WRAPPER) $(CC) $(CFLAGS) $(OBJS) $(CRT_LIBS) -o $@ $(LDFLAGS)
+	$(CC_WRAPPER) $(CC) $(CFLAGS) $(OBJS) $(EXTRA_OBJS) $(CRT_LIBS) -o $@ $(LDFLAGS)
 
 # Build newlib from source if not already built (soft ABI by default; other
 # ABIs normally use the toolchain multilib instead — see USE_NEWLIB_BUILD).

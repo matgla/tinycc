@@ -143,22 +143,7 @@ static void lblock(int *bsym, int *csym)
   }
 }
 
-static void block_1(int flags);
-
-/* Wrapper that scopes the variadic struct-argument temp pool to one
- * statement.  Slots reserved while parsing this statement (and its
- * sub-expressions) are released on exit so sibling statements reuse them,
- * but a nested block() — e.g. a GNU statement-expression used as a call
- * argument — saves/restores the mask and so cannot recycle a slot the
- * enclosing call still has in flight. */
 void block(int flags)
-{
-  uint64_t saved_arg_struct_busy = arg_struct_temp_busy;
-  block_1(flags);
-  arg_struct_temp_busy = saved_arg_struct_busy;
-}
-
-static void block_1(int flags)
 {
   int a, b, c, d, e, t;
   struct scope o;

@@ -281,6 +281,11 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
       continue;
     if (irop_get_vreg(ps) != src_vr)
       continue;
+    /* A vreg-backed slot names memory by vreg AND offset: two fields of one
+     * stack-resident struct parameter share the vreg. */
+    if (ps.tag == IROP_TAG_STACKOFF &&
+        (irop_get_stack_offset(ps) != irop_get_stack_offset(src) || ps.btype != src.btype))
+      continue;
     IROperand pd = tcc_ir_op_get_dest(ir, pq);
     int32_t pd_vr = irop_get_vreg(pd);
     if (pd_vr < 0 || TCCIR_DECODE_VREG_TYPE(pd_vr) != TCCIR_VREG_TYPE_TEMP)

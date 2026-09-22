@@ -144,7 +144,7 @@ void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
     }
   }
 
-  if (call_count == 1 && !has_complex_fp && !func_var && !ir->has_static_chain && call_idx >= 0)
+  if (call_count == 1 && !has_complex_fp && !func_var && !ir->push_arg_regs && !ir->has_static_chain && call_idx >= 0)
   {
     if (ir_call_is_tail_positioned(ir, call_idx) && !ir_tail_call_returns_hard_float(ir, call_idx))
     {
@@ -568,7 +568,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
                   li->allocation.offset == 0)
                 continue; /* vreg is register-only; stack slot unused */
               if (li->allocation.offset != 0) {
-                int off = li->allocation.offset + ((int)o->u.imm32 - li->original_offset);
+                int off = li->allocation.offset + (irop_get_stack_offset(*o) - li->original_offset);
                 if (off < min_op_offset)
                   min_op_offset = off;
                 continue;
@@ -642,7 +642,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
                   li->allocation.offset == 0)
                 continue; /* register-only vreg; stack slot unused */
               if (li->allocation.offset != 0) {
-                int off = li->allocation.offset + ((int)o->u.imm32 - li->original_offset);
+                int off = li->allocation.offset + (irop_get_stack_offset(*o) - li->original_offset);
                 if (off < post_min_op_offset)
                   post_min_op_offset = off;
                 continue;
@@ -839,7 +839,7 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
    * f2d/d2f conversion calls around a math libcall — which the early
    * analysis could not yet see.  The frame/stack guards in codegen still
    * veto ineligible functions afterwards. */
-  if (!ir->tail_call_only && !ir->has_static_chain && sym && sym->type.ref &&
+  if (!ir->tail_call_only && !ir->has_static_chain && !ir->push_arg_regs && sym && sym->type.ref &&
       sym->type.ref->f.func_type != FUNC_ELLIPSIS)
   {
     int call_count = 0, call_idx = -1, has_complex_fp = 0;

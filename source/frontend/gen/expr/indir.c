@@ -132,8 +132,6 @@ void gfunc_param_typed(Sym *func, Sym *arg)
     /* Handle struct/union arguments for unprototyped/variadic calls. */
     if ((vtop->type.t & VT_BTYPE) == VT_STRUCT)
     {
-      int align, size = type_size(&vtop->type, &align);
-
       /* VLA structs have runtime-determined size (type_size returns 0).
        * Pass by invisible reference: the VLA struct's stack slot already
        * contains a pointer to the VLA-allocated data.  Load that pointer
@@ -150,71 +148,9 @@ void gfunc_param_typed(Sym *func, Sym *arg)
         return;
       }
 
-      if (size > 16)
-      {
-        if (nocode_wanted)
-          return;
-
-        if (!(vtop->r & VT_LVAL))
-        {
-          tcc_error("cannot pass large struct by value");
-        }
-
-        /* Allocate a stack slot for the struct copy.
-         *
-         * For a non-variadic argument the slot is converted to a pointer by
-         * the gaddrof() below, which drops the VR_TEMP_LOCAL marker from the
-         * vstack — so get_temp_local_var() could reuse the same slot for a
-         * sibling struct argument in the same call, aliasing the two copies
-         * (GCC PR 67226).  Those keep a fresh, never-reused slot.
-         *
-         * A variadic anonymous argument instead stays a struct lvalue (no
-         * gaddrof — see the FUNC_ELLIPSIS return below), so it is safe to draw
-         * its copy from the call-scoped arg-struct temp pool: that pool keeps
-         * concurrently-live copies in distinct slots while reclaiming slots
-         * from completed statements, collapsing the one-copy-per-call-site
-         * stack growth seen when marshaling many large by-value variadic
-         * structs. */
-        int tmp_loc;
-        if (func_type == FUNC_ELLIPSIS)
-        {
-          tmp_loc = get_arg_struct_temp(size, align);
-        }
-        else
-        {
-          loc = tcc_ir_frame_alloc_arg_copy(loc, size, -align);
-          tmp_loc = loc;
-        }
-
-        /* Store the source struct into the temporary destination.
-         * vstore() will emit a memmove() for struct types. */
-        {
-          SValue dst;
-          memset(&dst, 0, sizeof(dst));
-          dst.type = vtop->type;
-          dst.r = VT_LOCAL | VT_LVAL;
-          dst.vr = -1;
-          dst.c.i = tmp_loc;
-          vpushv(&dst);
-          vswap();
-          vstore();
-        }
-
-        if (func_type == FUNC_ELLIPSIS)
-        {
-          /* Variadic anonymous argument: keep as struct lvalue so the
-           * backend decomposes it into words for register/stack placement.
-           * va_arg reads the raw data from the va area, not a pointer. */
-          return;
-        }
-
-        /* Unprototyped (FUNC_OLD) call: the callee may have been compiled
-         * with a prototype and expect invisible reference (pointer) for
-         * structs > 16 bytes.  Convert the temp copy to a pointer arg. */
-        mk_pointer(&vtop->type);
-        gaddrof();
-        return;
-      }
+      /* Any other struct goes by value whatever its size: AAPCS32 places it
+       * in the free core registers and then on the stack, like a prototyped
+       * argument (a variadic one is read back by value by va_arg). */
     }
 
     /* default casting : only need to convert float to double */
@@ -255,65 +191,10 @@ void gfunc_param_typed(Sym *func, Sym *arg)
       }
     }
 
-    /* ARM EABI AAPCS: Composite types (struct/union) larger than 4 words (16 bytes)
-     * must be passed by invisible reference - the caller passes a pointer.
-     * Check if this is a large struct that should be passed by reference. */
-    if ((type.t & VT_BTYPE) == VT_STRUCT)
-    {
-      int align, size = type_size(&type, &align);
-      if (size > 16)
-      {
-        /* Pass by invisible reference: caller must allocate a temporary copy
-         * and pass a pointer to that copy (AAPCS). Passing the original object's
-         * address would break C's by-value semantics.
-         */
-        if (nocode_wanted)
-          return;
-
-        if (!(vtop->r & VT_LVAL))
-        {
-          /* For now we require an lvalue source; most struct expressions in TCC
-           * are materialized as lvalues already.
-           */
-          tcc_error("cannot pass large struct by value");
-        }
-
-        /* Always allocate a fresh stack slot for the struct copy.
-         * Do NOT use get_temp_local_var() here: after gaddrof() converts
-         * the lvalue to a pointer, the VR_TEMP_LOCAL marker is lost from
-         * vstack, causing get_temp_local_var() to reuse the same slot for
-         * a subsequent struct argument in the same call.  This would make
-         * both struct copies alias the same memory.  (See GCC PR 67226.) */
-        loc = tcc_ir_frame_alloc_arg_copy(loc, size, -align);
-        int tmp_loc = loc;
-
-        /* Store the source struct into the temporary destination.
-         * vstore() will emit a memmove() for struct types.
-         */
-        {
-          SValue dst;
-          memset(&dst, 0, sizeof(dst));
-          dst.type = type;
-          dst.r = VT_LOCAL | VT_LVAL;
-          dst.vr = -1;
-          dst.c.i = tmp_loc;
-          vpushv(&dst);
-          vswap();
-          vstore();
-        }
-
-        /* Save const_init_data before gaddrof invalidates it — the
-         * inline expansion needs it for compile-time vector folding. */
-        aapcs_last_const_init = find_sv_const_init(vtop, size);
-        aapcs_last_const_init_size = aapcs_last_const_init ? size : 0;
-
-        /* Convert the temp lvalue to a pointer argument. */
-        mk_pointer(&vtop->type);
-        gaddrof();
-        return;
-      }
-    }
-
+    /* A struct or union of any size is passed by value (AAPCS32): the call
+     * lowering copies it into the argument registers and stack, so no
+     * temporary copy is made here.  (A pointer to a copy for composites over
+     * 16 bytes is the AArch64 rule.) */
     gen_assign_cast(&type);
   }
 }

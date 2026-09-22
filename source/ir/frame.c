@@ -1190,7 +1190,7 @@ static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom)
 
 int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
 {
-  const int bottom = *ploc;
+  int bottom = *ploc;
   /* Once only: after it, the operands no longer match frame_objs. */
   if (!ir || ir->frame_relaid || bottom >= 0 || ir->frame_obj_count == 0 || !frame_function_eligible(ir))
     return 0;
@@ -1199,6 +1199,14 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
   /* Objects -> disjoint segments tiling [bottom, 0), gaps included. */
   int nobj = ir->frame_obj_count;
   qsort(ir->frame_objs, nobj, sizeof(int32_t) * 4, frame_obj_cmp);
+  /* `bottom` is the lowest offset an operand still names (compute_min_stack_ref),
+   * so an object whose low words lost their last reference -- a dead store
+   * removed -- starts below it.  Measure the frame from that object instead:
+   * otherwise it is pinned in place at the bottom and nothing above it can
+   * pack (a single 8-byte temporary kept a 43 KB frame from colouring down
+   * to 8.7 KB).  Its unreferenced low bytes simply move with it. */
+  if (ir->frame_objs[0] < bottom)
+    bottom = ir->frame_objs[0];
   FrameSeg *seg = tcc_mallocz(sizeof(FrameSeg) * (2 * nobj + 2));
   int nseg = 0, cur = bottom;
   for (int k = 0; k < nobj; k++)

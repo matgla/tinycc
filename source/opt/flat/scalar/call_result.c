@@ -184,6 +184,8 @@ OPT_GEN_FLAT(fold_call_result_store, TCCIR_OP_FUNCCALLVAL)
       irop_get_tag(call_dest) != IROP_TAG_STACKOFF)
     return 0;
   int64_t call_dest_off = irop_get_imm64_ex(ir, call_dest);
+  const int call_dest_64 = irop_is_64bit(call_dest);
+  const int call_sz = call_dest_64 ? 8 : 4;
 
   int load_idx = -1;
   int32_t load_dest_vr = -1;
@@ -201,9 +203,15 @@ OPT_GEN_FLAT(fold_call_result_store, TCCIR_OP_FUNCCALLVAL)
         continue;
       if (irop_get_tag(ops[k]) != IROP_TAG_STACKOFF)
         continue;
-      if (irop_get_imm64_ex(ir, ops[k]) != call_dest_off)
+      if (irop_get_imm64_ex(ir, ops[k]) != call_dest_off) {
+        /* Another access overlapping what the call writes -- a word copy's
+         * read of a 64-bit result's high half -- is a second use. */
+        int64_t o = irop_get_imm64_ex(ir, ops[k]);
+        if (o > call_dest_off - 8 && o < call_dest_off + call_sz)
+          multi_use = 1;
         continue;
-      if (p->op == TCCIR_OP_LOAD && k == 1 && load_idx < 0) {
+      }
+      if (p->op == TCCIR_OP_LOAD && k == 1 && load_idx < 0 && irop_is_64bit(ops[k]) == call_dest_64) {
         load_idx = j;
         load_dest_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, p));
       } else {

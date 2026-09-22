@@ -426,35 +426,37 @@ UT_TEST(test_classify_large_struct_no_arg_flags_stays_by_value)
   return 0;
 }
 
-UT_TEST(test_classify_large_struct_with_arg_flags_uses_invisible_ref_in_reg)
+/* AAPCS32 passes a composite of any size by value, split between the core
+ * registers and the stack (C.5); a pointer to a copy is the AArch64 rule.  The
+ * callee (arg_flags allocated) classifies exactly as the caller does. */
+UT_TEST(test_classify_large_struct_with_arg_flags_splits_by_value)
 {
   TCCAbiCallLayout layout;
   layout_init(&layout);
-  tcc_abi_call_layout_ensure_capacity(&layout, 1);
+  tcc_abi_call_layout_ensure_capacity(&layout, 2);
   UT_ASSERT(layout.arg_flags != NULL);
 
   TCCAbiArgDesc d = desc_struct(24, 8);
   TCCAbiArgLoc loc = tcc_abi_classify_argument(&layout, 0, &d);
 
-  UT_ASSERT_EQ(loc.kind, TCC_ABI_LOC_REG);
+  UT_ASSERT_EQ(loc.kind, TCC_ABI_LOC_REG_STACK);
   UT_ASSERT_EQ(loc.reg_base, 0);
-  UT_ASSERT_EQ(loc.reg_count, 1);
-  UT_ASSERT_EQ(loc.size, 4);
-  UT_ASSERT_EQ(layout.next_reg, 1);
-  UT_ASSERT_EQ(layout.arg_flags[0] & TCC_ABI_ARG_FLAG_INVISIBLE_REF,
-               TCC_ABI_ARG_FLAG_INVISIBLE_REF);
+  UT_ASSERT_EQ(loc.reg_count, 4);
+  UT_ASSERT_EQ(loc.stack_off, 0);
+  UT_ASSERT_EQ(loc.stack_size, 8);
+  UT_ASSERT_EQ(layout.next_reg, 4);
+  UT_ASSERT_EQ(layout.next_stack_off, 8);
+  UT_ASSERT_EQ(layout.arg_flags[0], 0) /* passed by value: no lowering flag */;
 
-  /* The 8-byte natural alignment must NOT force even-register rounding
-   * for an invisible reference (it's just a 4-byte pointer) -- confirmed
-   * by reg_base==0 above (no skip) and by a following scalar32 landing at
-   * r1, not r2. */
+  /* The next argument goes on the stack after the struct's tail. */
   TCCAbiArgDesc d32 = desc_scalar32();
   TCCAbiArgLoc loc2 = tcc_abi_classify_argument(&layout, 1, &d32);
-  UT_ASSERT_EQ(loc2.reg_base, 1);
+  UT_ASSERT_EQ(loc2.kind, TCC_ABI_LOC_STACK);
+  UT_ASSERT_EQ(loc2.stack_off, 8);
   return 0;
 }
 
-UT_TEST(test_classify_large_struct_with_arg_flags_invisible_ref_spills_to_stack)
+UT_TEST(test_classify_large_struct_after_four_regs_goes_on_stack_by_value)
 {
   TCCAbiCallLayout layout;
   layout_init(&layout);
@@ -469,10 +471,51 @@ UT_TEST(test_classify_large_struct_with_arg_flags_invisible_ref_spills_to_stack)
   TCCAbiArgLoc loc = tcc_abi_classify_argument(&layout, 4, &dbig);
   UT_ASSERT_EQ(loc.kind, TCC_ABI_LOC_STACK);
   UT_ASSERT_EQ(loc.stack_off, 0);
-  UT_ASSERT_EQ(loc.size, 4);
+  UT_ASSERT_EQ(loc.size, 32);
+  UT_ASSERT_EQ(layout.next_stack_off, 32);
+  UT_ASSERT_EQ(layout.arg_flags[4], 0) /* passed by value: no lowering flag */;
+  return 0;
+}
+
+UT_TEST(test_classify_8_aligned_struct_after_three_regs_skips_r3)
+{
+  /* NCRN 3 is odd: an 8-aligned composite starts at an even register, so r3
+   * is skipped and, with no pair left, the whole struct goes on the stack. */
+  TCCAbiCallLayout layout;
+  layout_init(&layout);
+  tcc_abi_call_layout_ensure_capacity(&layout, 5);
+  TCCAbiArgDesc d32 = desc_scalar32();
+  TCCAbiArgDesc d = desc_struct(24, 8);
+  for (int i = 0; i < 3; i++)
+    tcc_abi_classify_argument(&layout, i, &d32);
+
+  TCCAbiArgLoc loc = tcc_abi_classify_argument(&layout, 3, &d);
+  UT_ASSERT_EQ(loc.kind, TCC_ABI_LOC_STACK);
+  UT_ASSERT_EQ(loc.stack_off, 0);
+  UT_ASSERT_EQ(layout.next_reg, 4);
+  UT_ASSERT_EQ(layout.next_stack_off, 24);
+
+  TCCAbiArgLoc loc2 = tcc_abi_classify_argument(&layout, 4, &d32);
+  UT_ASSERT_EQ(loc2.kind, TCC_ABI_LOC_STACK);
+  UT_ASSERT_EQ(loc2.stack_off, 24);
+  return 0;
+}
+
+UT_TEST(test_classify_overaligned_struct_stack_slot_aligned_to_8)
+{
+  /* C.4 rounds the NSAA up to the composite's alignment, capped at 8. */
+  TCCAbiCallLayout layout;
+  layout_init(&layout);
+  tcc_abi_call_layout_ensure_capacity(&layout, 6);
+  TCCAbiArgDesc d32 = desc_scalar32();
+  TCCAbiArgDesc d = desc_struct(32, 16);
+  for (int i = 0; i < 5; i++)
+    tcc_abi_classify_argument(&layout, i, &d32);
   UT_ASSERT_EQ(layout.next_stack_off, 4);
-  UT_ASSERT_EQ(layout.arg_flags[4] & TCC_ABI_ARG_FLAG_INVISIBLE_REF,
-               TCC_ABI_ARG_FLAG_INVISIBLE_REF);
+
+  TCCAbiArgLoc loc = tcc_abi_classify_argument(&layout, 5, &d);
+  UT_ASSERT_EQ(loc.kind, TCC_ABI_LOC_STACK);
+  UT_ASSERT_EQ(loc.stack_off, 8);
   return 0;
 }
 
@@ -488,7 +531,7 @@ UT_TEST(test_classify_struct_exactly_16_bytes_not_invisible_ref)
   TCCAbiArgLoc loc = tcc_abi_classify_argument(&layout, 0, &d);
   UT_ASSERT_EQ(loc.kind, TCC_ABI_LOC_REG);
   UT_ASSERT_EQ(loc.reg_count, 4);
-  UT_ASSERT_EQ(layout.arg_flags[0] & TCC_ABI_ARG_FLAG_INVISIBLE_REF, 0);
+  UT_ASSERT_EQ(layout.arg_flags[0], 0) /* passed by value: no lowering flag */;
   return 0;
 }
 
@@ -649,7 +692,7 @@ UT_TEST(test_ensure_capacity_grow_preserves_existing_data_and_zeros_tail)
 
   layout.locs[1].kind = TCC_ABI_LOC_STACK;
   layout.locs[1].stack_off = 42;
-  layout.arg_flags[1] = TCC_ABI_ARG_FLAG_INVISIBLE_REF;
+  layout.arg_flags[1] = 0x5a;
   layout.args_original[1].size = 99;
   layout.args_effective[1].size = 77;
 
@@ -659,7 +702,7 @@ UT_TEST(test_ensure_capacity_grow_preserves_existing_data_and_zeros_tail)
   /* Old data at index 1 survived the realloc. */
   UT_ASSERT_EQ(layout.locs[1].kind, TCC_ABI_LOC_STACK);
   UT_ASSERT_EQ(layout.locs[1].stack_off, 42);
-  UT_ASSERT_EQ(layout.arg_flags[1], TCC_ABI_ARG_FLAG_INVISIBLE_REF);
+  UT_ASSERT_EQ(layout.arg_flags[1], 0x5a);
   UT_ASSERT_EQ(layout.args_original[1].size, 99);
   UT_ASSERT_EQ(layout.args_effective[1].size, 77);
 

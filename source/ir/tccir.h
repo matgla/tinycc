@@ -332,6 +332,7 @@ typedef struct IRLiveInterval
   uint8_t is_volatile : 1;  // whether the source object has volatile-qualified type
   uint8_t crosses_call : 1; // whether interval spans a function call
   uint8_t phi_pinned : 1;   // register relied upon by identity phi — do not reassign
+  uint8_t incoming_stack : 1; // param the ABI placed wholly on the caller's stack (incoming_reg0 < 0 is also "unset")
   uint32_t start;           // start instruction index
   uint32_t end;             // end instruction index
   IRVregReplacement allocation;
@@ -481,6 +482,10 @@ typedef struct TCCIRState
   int named_arg_stack_bytes;
 
   uint8_t is_variadic : 1;
+  /* A parameter straddles r3 and the stack: the prologue pushes r0-r3 below
+   * the stack arguments, as for a variadic function, so it lies contiguous in
+   * memory and is used in place. */
+  uint8_t push_arg_regs : 1;
   uint8_t leaffunc : 1;
   uint8_t tail_call_only : 1;
   uint8_t naked : 1;

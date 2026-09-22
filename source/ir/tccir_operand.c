@@ -579,6 +579,10 @@ done:
     {
       /* Stack offset: store directly in aux_data (±32KB range) */
       int32_t offset = result.u.imm32;
+      /* tcc_ir_put names far struct sources through a pointer; anything
+       * still out of range here would be silently truncated. */
+      if (offset < -32768 || offset > 32767)
+        tcc_error("internal: struct stack operand at offset %d is out of the 16-bit encoding range", offset);
       result.u.s.ctype_idx = (uint16_t)ctype_idx;
       result.u.s.aux_data = (int16_t)offset; /* store offset directly, no alignment assumption */
     }

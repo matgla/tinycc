@@ -268,6 +268,20 @@ static inline int fp_adjust_local_offset(int frame_offset, int is_param)
   return frame_offset;
 }
 
+/* Offset from the frame base register (FP, or SP when there is none) of byte
+ * `param_off` of the incoming stack parameters, which sit above the saved
+ * registers (offset_to_args).  Off SP, a scratch PUSH active in the current
+ * instruction has moved SP down, exactly as for a local (fp_adjust_local_offset):
+ * without the bias a by-value parameter passed on through the memcpy path of
+ * place_stack_arg_struct was copied from 24 bytes too low. */
+static int param_frame_offset(int param_off)
+{
+  int off = param_off + offset_to_args;
+  if (!tcc_state->need_frame_pointer)
+    off += scratch_push_sp_bias();
+  return off;
+}
+
 /* Additional scratch register exclusions (e.g. to protect argument registers
  * while materializing an indirect call target). Applied on top of per-call
  * exclude masks. */
@@ -700,7 +714,7 @@ static int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *
      * for 64-bit split operands), but the load is still required — needs_deref=false
      * in this context means "not a pointer-to-follow", not "compute address". */
     int r = mach_alloc_scratch(ctx, excl);
-    const int adjusted = op->u.param.offset + offset_to_args;
+    const int adjusted = param_frame_offset(op->u.param.offset);
     const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
     const int sign = (adjusted < 0);
     const int abs_off = sign ? -adjusted : adjusted;
@@ -952,7 +966,7 @@ void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op)
 
   case MACH_OP_PARAM_STACK:
   {
-    const int adjusted = op->u.param.offset + offset_to_args;
+    const int adjusted = param_frame_offset(op->u.param.offset);
     const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
     const int sign = (adjusted < 0);
     const int abs_off = sign ? -adjusted : adjusted;
@@ -1048,11 +1062,16 @@ static void map_sym_t(void)
  * steady-state position.  Derived from the push bookkeeping so it can never
  * drift from the actual PUSH/POP pairing (including deferred pops).  The dry
  * run never emits pushes, so its bias is always 0. */
+/* Bytes an explicit register save around a helper call has moved SP (see
+ * place_stack_arg_struct's memcpy path).  Emitted, and so counted, in the dry
+ * run as in the real one. */
+static int helper_call_sp_bias;
+
 static int scratch_push_sp_bias(void)
 {
+  int bias = helper_call_sp_bias;
   if (dry_run_state.active)
-    return 0;
-  int bias = 0;
+    return bias;
   for (int i = 0; i < scratch_push_count; i++)
     if (scratch_push_type[i] == 1)
       bias += 4;
@@ -4744,7 +4763,7 @@ ST_FUNC int tcc_machine_can_encode_stack_offset_with_param_adj(int frame_offset,
    * Stack parameters need offset_to_args adjustment (prologue push size). */
   int offset = frame_offset;
   if (is_param)
-    offset += offset_to_args;
+    offset = param_frame_offset(offset);
   return tcc_machine_can_encode_stack_offset_for_reg(offset, dest_reg);
 }
 
@@ -4837,7 +4856,7 @@ ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset)
  * the store targets the correct caller-stack location above FP. */
 ST_FUNC void tcc_machine_store_param_slot(int src_reg, int frame_offset)
 {
-  tcc_machine_store_spill_slot(src_reg, frame_offset + offset_to_args);
+  tcc_machine_store_spill_slot(src_reg, param_frame_offset(frame_offset));
 }
 
 static int unalias_ldbl(int btype)
@@ -5427,7 +5446,7 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
    * When computing their address, fold in offset_to_args (prologue push size).
    * Locals/spills need callee-saved gap adjustment. */
   if (is_param)
-    frame_offset += offset_to_args;
+    frame_offset = param_frame_offset(frame_offset);
   else
     frame_offset = fp_adjust_local_offset(frame_offset, 0);
 
@@ -8875,7 +8894,7 @@ ST_FUNC void tcc_gen_machine_assign_mop_ex(MachineOperand src, MachineOperand de
 
   case MACH_OP_PARAM_STACK:
   {
-    const int adjusted = src.u.param.offset + offset_to_args;
+    const int adjusted = param_frame_offset(src.u.param.offset);
     const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
     const int sign = (adjusted < 0);
     const int abs_off = sign ? -adjusted : adjusted;
@@ -9236,7 +9255,7 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
 
   case MACH_OP_PARAM_STACK:
   {
-    const int adj = src.u.param.offset + offset_to_args;
+    const int adj = param_frame_offset(src.u.param.offset);
     const int sign = (adj < 0), abs_off = sign ? -adj : adj;
     const uint32_t base = (uint32_t)(tcc_state->need_frame_pointer ? R_FP : R_SP);
     load_from_base(dest_reg, dest_r1, btype, is_unsigned, abs_off, sign, base);
@@ -9531,7 +9550,7 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
 
     case MACH_OP_PARAM_STACK:
     {
-      const int adj = dest.u.param.offset + offset_to_args;
+      const int adj = param_frame_offset(dest.u.param.offset);
       const int adj_hi = adj + 4;
       const uint32_t base = (uint32_t)(tcc_state->need_frame_pointer ? R_FP : R_SP);
       const int sign = (adj < 0), abs_off = sign ? -adj : adj;
@@ -9698,7 +9717,7 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
 
   case MACH_OP_PARAM_STACK:
   {
-    const int adj = dest.u.param.offset + offset_to_args;
+    const int adj = param_frame_offset(dest.u.param.offset);
     const int sign = (adj < 0), abs_off = sign ? -adj : adj;
     const uint32_t base = (uint32_t)(tcc_state->need_frame_pointer ? R_FP : R_SP);
     if (btype == IROP_BTYPE_INT8)
@@ -10307,7 +10326,7 @@ static void fp_mop_load_arg(int target_reg, const MachineOperand *op)
     return;
   case MACH_OP_PARAM_STACK:
   {
-    const int adjusted = op->u.param.offset + offset_to_args;
+    const int adjusted = param_frame_offset(op->u.param.offset);
     const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
     const int sign = (adjusted < 0);
     const int abs_off = sign ? -adjusted : adjusted;
@@ -11729,9 +11748,10 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
     map_sym_t();
 
-    /* Variadic: push r0-r3 FIRST so they are contiguous with stack args */
+    /* Variadic, or a parameter straddling r3 and the stack: push r0-r3 FIRST
+     * so they are contiguous with the stack args. */
     vararg_push_size = 0;
-    if (func_var)
+    if (func_var || (ir && ir->push_arg_regs))
     {
       ot_check(th_push((1 << R0) | (1 << R1) | (1 << R2) | (1 << R3)));
       vararg_push_size = 16;
@@ -11753,7 +11773,9 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
     callee_push_size = callee_count * 4;
     callee_saved_regs = callee_regs_local;
-    offset_to_args = frame_count * 4 + vararg_push_size;
+    /* Parameter offsets count from the stack arguments, or from the pushed r0
+     * for an in-place split struct (tcc_ir_params_process_struct). */
+    offset_to_args = frame_count * 4 + (func_var ? vararg_push_size : 0);
     pushed_registers = frame_regs | callee_regs_local;
   }
   else
@@ -11795,15 +11817,16 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
     map_sym_t();
 
-    /* Variadic: push r0-r3 FIRST so they are contiguous with stack args */
+    /* Variadic, or a parameter straddling r3 and the stack: push r0-r3 FIRST
+     * so they are contiguous with the stack args. */
     vararg_push_size = 0;
-    if (func_var)
+    if (func_var || (ir && ir->push_arg_regs))
     {
       ot_check(th_push((1 << R0) | (1 << R1) | (1 << R2) | (1 << R3)));
       vararg_push_size = 16;
     }
 
-    offset_to_args = registers_count * 4 + vararg_push_size;
+    offset_to_args = registers_count * 4 + (func_var ? vararg_push_size : 0);
 
     if (registers_count > 0)
       ot_check(th_push(registers_to_push));
@@ -12290,6 +12313,20 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     ot_check_ldr_imm(rodata_anchor_reg, R9, YAFF_RODATA_ANCHOR_GOT_OFFSET, 6, ENFORCE_ENCODING_NONE);
 }
 
+/* Return through the saved LR while dropping the r0-r3 pushed below the saved
+ * registers (variadic, push_arg_regs): pop the rest, then one post-indexed LDR
+ * loads LR's slot into PC and steps SP past it and the argument area.  Two
+ * bytes shorter than `pop {.., lr}; add sp; bx lr`, as a 16-bit POP cannot
+ * name LR. */
+static void epilogue_return_over_pushed_args(uint32_t saved_with_lr)
+{
+  uint32_t rest = saved_with_lr & ~(1u << R_LR);
+  if (rest)
+    ot_check(th_pop(rest));
+  ot_check(th_ldr_imm(R_PC, R_SP, 4 + vararg_push_size, 3 /* post-indexed, add, writeback */,
+                      ENFORCE_ENCODING_32BIT));
+}
+
 ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
 {
   TRACE("'tcc_gen_machine_epilog'");
@@ -12309,9 +12346,7 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
     if (vararg_push_size > 0 && lr_saved)
     {
       /* Variadic: pop FP+LR, then skip over the pushed r0-r3 area */
-      ot_check(th_pop((1 << R_FP) | (1 << R_LR)));
-      gadd_sp_ex(vararg_push_size, R3);
-      ot_check(th_bx_reg(R_LR));
+      epilogue_return_over_pushed_args((1 << R_FP) | (1 << R_LR));
     }
     else if (lr_saved)
     {
@@ -12332,9 +12367,7 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
     if (vararg_push_size > 0 && lr_saved)
     {
       /* Variadic: pop all regs with LR (not PC), then skip pushed r0-r3 */
-      ot_check(th_pop(pushed_registers));
-      gadd_sp_ex(vararg_push_size, R3);
-      ot_check(th_bx_reg(R_LR));
+      epilogue_return_over_pushed_args(pushed_registers);
     }
     else if (lr_saved)
     {
@@ -12356,7 +12389,19 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
     /* ── No frame pointer ── */
     if (epilogue_stack_dealloc > 0)
       gadd_sp_ex(epilogue_stack_dealloc, R3);
-    if (lr_saved)
+    if (vararg_push_size > 0 && lr_saved)
+    {
+      /* r0-r3 were pushed below the stack arguments (push_arg_regs). */
+      epilogue_return_over_pushed_args(pushed_registers);
+    }
+    else if (vararg_push_size > 0)
+    {
+      if (pushed_registers > 0)
+        ot_check(th_pop(pushed_registers));
+      gadd_sp_ex(vararg_push_size, R3);
+      ot_check(th_bx_reg(R_LR));
+    }
+    else if (lr_saved)
     {
       pushed_registers |= 1 << R_PC;
       pushed_registers &= ~(1 << R_LR);
@@ -12798,7 +12843,7 @@ static bool struct_src_addr_aligned4(const ThumbArgMove *m)
   case MACH_OP_FRAME_ADDR:
     return (m->mop.u.frame.offset & 3) == 0;
   case MACH_OP_PARAM_STACK:
-    return ((m->mop.u.param.offset + offset_to_args) & 3) == 0;
+    return ((param_frame_offset(m->mop.u.param.offset)) & 3) == 0;
   default:
     return false;
   }
@@ -12842,7 +12887,7 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
         (m->mop.kind == MACH_OP_SPILL || m->mop.kind == MACH_OP_PARAM_STACK))
     {
       int raw_off =
-          (m->mop.kind == MACH_OP_SPILL) ? m->mop.u.spill.offset : m->mop.u.param.offset + offset_to_args;
+          (m->mop.kind == MACH_OP_SPILL) ? m->mop.u.spill.offset : param_frame_offset(m->mop.u.param.offset);
       int adjusted = (m->mop.kind == MACH_OP_SPILL) ? fp_adjust_local_offset(raw_off, 0) : raw_off;
       int ldrd_base = tcc_state->need_frame_pointer ? R_FP : R_SP;
       int ldrd_sign = (adjusted < 0);
@@ -12866,7 +12911,7 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
     {
       int off;
       if (m->mop.kind == MACH_OP_PARAM_STACK)
-        off = m->mop.u.param.offset + offset_to_args;
+        off = param_frame_offset(m->mop.u.param.offset);
       else
         off = fp_adjust_local_offset(m->mop.kind == MACH_OP_SPILL ? m->mop.u.spill.offset : m->mop.u.frame.offset, 0);
       int base = tcc_state->need_frame_pointer ? R_FP : R_SP;
@@ -12879,6 +12924,24 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
                                                       ENFORCE_ENCODING_NONE)
                                                .size;
         bytes = size ? bytes + size : -1;
+      }
+      /* Three or more low registers: build the address in the last of them
+       * and load the run with a 16-bit LDM, which does no writeback when its
+       * base is in the list -- `add r3, sp, #N; ldm r3, {r0-r3}`, 4 bytes where
+       * four LDRs take 8. */
+      const int last = base_dst + word_count - 1;
+      if (word_count >= 3 && last <= R7 && !(base >= base_dst && base <= last) && (off & 3) == 0 &&
+          struct_src_addr_aligned4(m))
+      {
+        thumb_opcode addr = off < 0 ? th_sub_imm(last, base, -off, flags_safe(), ENFORCE_ENCODING_NONE)
+                                    : th_add_imm(last, base, off, flags_safe(), ENFORCE_ENCODING_NONE);
+        if (addr.size && (bytes < 0 || addr.size + 2 < bytes))
+        {
+          ot_check(addr);
+          const uint32_t regs = ((1u << word_count) - 1u) << base_dst;
+          ot_check((thumb_opcode){.size = 2, .opcode = 0xC800u | ((uint32_t)last << 8) | regs});
+          return;
+        }
       }
       if (bytes > 0 && (word_count <= 2 || bytes <= 8))
       {
@@ -13019,7 +13082,7 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
         int ldrd_ok = 0;
         if (!m->mop.needs_deref && (m->mop.kind == MACH_OP_SPILL || m->mop.kind == MACH_OP_PARAM_STACK))
         {
-          int raw_off = (m->mop.kind == MACH_OP_SPILL) ? m->mop.u.spill.offset : m->mop.u.param.offset + offset_to_args;
+          int raw_off = (m->mop.kind == MACH_OP_SPILL) ? m->mop.u.spill.offset : param_frame_offset(m->mop.u.param.offset);
           int adjusted = (m->mop.kind == MACH_OP_SPILL) ? fp_adjust_local_offset(raw_off, 0) : raw_off;
           ldrd_base = tcc_state->need_frame_pointer ? R_FP : R_SP;
           ldrd_sign = (adjusted < 0);
@@ -13098,7 +13161,7 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
 
       case MACH_OP_PARAM_STACK:
       {
-        const int adjusted = mop->u.param.offset + offset_to_args;
+        const int adjusted = param_frame_offset(mop->u.param.offset);
         const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
         const int sign = (adjusted < 0);
         const int abs_off = sign ? -adjusted : adjusted;
@@ -13302,28 +13365,30 @@ static void thumb_emit_parallel_arg_moves(ThumbArgMove *moves, int move_count)
  * Helper functions for call argument handling
  * ======================================================================== */
 
-/* Store a word to stack with large offset fallback */
-static void store_word_to_stack(int src_reg, int stack_offset)
+/* Store a word to stack with large offset fallback.  An offset out of the
+ * immediate's reach goes through a scratch register, which must not be one
+ * in `keep`: the other half of a pair still to be stored, a struct base. */
+static void store_word_to_stack_keep(int src_reg, int stack_offset, uint32_t keep)
 {
   if (!store_word_to_base(src_reg, ARM_SP, stack_offset, 0))
   {
-    ScratchRegAlloc sc = get_scratch_reg_with_save((1u << src_reg));
-    load_immediate(sc.reg, stack_offset, NULL, false);
+    ScratchRegAlloc sc = get_scratch_reg_with_save((1u << src_reg) | keep);
+    /* A scratch saved by PUSH has moved SP down a word under the store. */
+    load_immediate(sc.reg, stack_offset + (sc.saved == 1 ? 4 : 0), NULL, false);
     ot_check(th_str_reg(src_reg, ARM_SP, sc.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&sc);
   }
 }
 
-/* Store a word to stack, preserving R0 if needed as scratch */
+static void store_word_to_stack(int src_reg, int stack_offset)
+{
+  store_word_to_stack_keep(src_reg, stack_offset, 0);
+}
+
+/* Store a word to stack, keeping the struct base register intact */
 static void store_word_to_stack_safe(int src_reg, int stack_offset, int base_addr_reg)
 {
-  if (!store_word_to_base(src_reg, ARM_SP, stack_offset, 0))
-  {
-    ScratchRegAlloc sc = get_scratch_reg_with_save((1u << src_reg) | (1u << base_addr_reg));
-    load_immediate(sc.reg, stack_offset, NULL, false);
-    ot_check(th_str_reg(src_reg, ARM_SP, sc.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
-    restore_scratch_reg(&sc);
-  }
+  store_word_to_stack_keep(src_reg, stack_offset, 1u << base_addr_reg);
 }
 
 /* Get struct base address into a register (MOP path).
@@ -13511,6 +13576,12 @@ static void load_struct_word_into(int reg, int base_addr_reg, int off)
  * alignment-safe.  LDRD additionally requires the *source* address to be
  * 4-byte aligned, which holds exactly when the struct's natural alignment is
  * >= 4 (the stack portion starts at base + words_in_regs*4, a word multiple). */
+/* Stack-passed struct arguments at least this many words are copied by memcpy
+ * (~20 bytes of call setup against ~4 bytes a word inline).  On zig.c .text:
+ * 32 words 5,822,056; 8 words 5,754,812; 6 words 5,751,108; 4 words
+ * 5,772,344 -- 8 keeps 6- and 7-word structs on the faster inline copy. */
+#define STACK_ARG_MEMCPY_MIN_WORDS 8
+
 static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc *loc, int stack_offset,
                                    int src_align)
 {
@@ -13518,6 +13589,38 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
   int struct_src_offset = words_in_regs * 4;
   int struct_size = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->stack_size : loc->size;
   int words = (struct_size + 3) / 4;
+
+  /* A large struct (AAPCS32 passes any size by value) is copied by memcpy
+   * rather than a word per load/store pair.  The argument registers, IP and
+   * LR may hold values the rest of the call setup still needs, and memcpy may
+   * clobber exactly those, so they are saved around it; the 24 bytes pushed
+   * enter every SP-relative address computed meanwhile. */
+  if (words >= STACK_ARG_MEMCPY_MIN_WORDS)
+  {
+    const uint16_t saved = (uint16_t)((1u << R0) | (1u << R1) | (1u << R2) | (1u << R3) | (1u << R12) | (1u << ARM_LR));
+    ot_check(th_push(saved));
+    helper_call_sp_bias += 24;
+    int src = get_struct_base_addr_mop(mop, R1);
+    if (src != R1)
+      ot_check_mov_reg(R1, (uint32_t)src, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    if (struct_src_offset)
+      ot_check(th_add_imm(R1, R1, (uint32_t)struct_src_offset, flags_safe(), ENFORCE_ENCODING_NONE));
+    load_immediate(R0, stack_offset + scratch_push_sp_bias(), NULL, false);
+    ot_check(th_add_reg(R0, R0, ARM_SP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    load_immediate(R2, words * 4, NULL, false);
+    Sym *memcpy_sym = external_global_sym(tok_alloc_const("memcpy"), &func_old_type);
+    MachineOperand func_mop = {0};
+    func_mop.kind = MACH_OP_SYMBOL;
+    func_mop.u.sym.sym = memcpy_sym;
+    if (text_and_data_separation)
+      ot_check(th_push((uint16_t)((1 << R9) | (1 << R12))));
+    gcall_or_jump_mop(0, func_mop);
+    if (text_and_data_separation)
+      ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));
+    ot_check(th_pop(saved));
+    helper_call_sp_bias -= 24;
+    return;
+  }
 
   /* A frame-resident source needs no base register: LDR/LDRD carry the frame
    * offset in their own immediate field, so the `add rX, sp, #off` that
@@ -13539,6 +13642,11 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
     frame_raw = mop->u.frame.offset;
     src_is_frame = true;
   }
+  else if (mop->kind == MACH_OP_PARAM_STACK)
+  {
+    /* A by-value parameter passed on: in the incoming argument area. */
+    src_is_frame = true;
+  }
 
   int base_bias = 0;
   int base_addr_reg;
@@ -13547,7 +13655,8 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
 
   if (src_is_frame)
   {
-    const int adj = fp_adjust_local_offset(frame_raw, 0);
+    const int adj = mop->kind == MACH_OP_PARAM_STACK ? param_frame_offset(mop->u.param.offset)
+                                                     : fp_adjust_local_offset(frame_raw, 0);
     const int first = adj + struct_src_offset;
     const int last = first + (words > 0 ? (words - 1) * 4 : 0);
     if ((adj & 3) == 0 && first >= 0 && last <= 1020)
@@ -13589,7 +13698,7 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
       }
       if (!tcc_gen_machine_try_strd_base(ARM_LR, data2, ARM_SP, dst_off))
       {
-        store_word_to_stack_safe(ARM_LR, dst_off, base_addr_reg);
+        store_word_to_stack_keep(ARM_LR, dst_off, (1u << base_addr_reg) | (1u << data2));
         store_word_to_stack_safe(data2, dst_off + 4, base_addr_reg);
       }
     }
@@ -13691,7 +13800,7 @@ static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, T
      * word-multiple offset, SP 8-aligned.) */
     if (!tcc_gen_machine_try_strd_base(mop->u.reg.r0, mop->u.reg.r1, ARM_SP, lo_offset))
     {
-      store_word_to_stack(mop->u.reg.r0, lo_offset);
+      store_word_to_stack_keep(mop->u.reg.r0, lo_offset, 1u << mop->u.reg.r1);
       store_word_to_stack(mop->u.reg.r1, hi_offset);
     }
   }
@@ -13725,7 +13834,7 @@ static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, T
 
     if (!tcc_gen_machine_try_strd_base(scr, hi_scr, ARM_SP, lo_offset))
     {
-      store_word_to_stack(scr, lo_offset);
+      store_word_to_stack_keep(scr, lo_offset, 1u << hi_scr);
       store_word_to_stack(hi_scr, hi_offset);
     }
   }
@@ -13762,7 +13871,7 @@ static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, T
       need_release = true;
     }
     load_from_base(scr, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 0, 0, (uint32_t)base);
-    store_word_to_stack(scr, lo_offset);
+    store_word_to_stack_keep(scr, lo_offset, 1u << base);
     load_from_base(scr, PREG_REG_NONE, IROP_BTYPE_INT32, 0, 4, 0, (uint32_t)base);
     store_word_to_stack(scr, hi_offset);
     if (need_release)

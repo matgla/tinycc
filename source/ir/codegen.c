@@ -230,6 +230,18 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
         continue;
       }
     }
+    /* Placed on the caller's stack by the ABI (see params_mark_stack): every
+     * core register is used or skipped by now. */
+    if (interval && interval->incoming_stack)
+    {
+      interval->incoming_reg0 = -1;
+      interval->incoming_reg1 = -1;
+      interval->allocation.r0 = PREG_NONE;
+      interval->allocation.r1 = PREG_NONE;
+      interval->allocation.offset = 0;
+      argno = 4;
+      continue;
+    }
     /* is_double for soft-float (LS_REG_TYPE_DOUBLE_SOFT) or is_llong for 64-bit
      */
     int is_64bit = interval && (interval->is_double || interval->is_llong || interval->is_complex);
@@ -468,6 +480,12 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
       continue;
     }
 
+    if (interval->incoming_stack)
+    {
+      is_stack_passed[vreg] = 1;
+      argno = 4;
+      continue;
+    }
     const int is_64bit = interval->is_double || interval->is_llong;
     if (is_64bit && (argno & 1))
       argno++; /* align 64-bit to even reg pair */

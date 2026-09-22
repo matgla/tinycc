@@ -258,7 +258,6 @@ extern int nb_temp_local_vars;
  * block() saves/restores it around every statement so two call expressions
  * that are lexically nested (e.g. inside a GNU statement expression used as
  * an argument) do not alias each other's reserved slots. */
-extern uint64_t arg_struct_temp_busy;
 
 /* sym_push()'s bump allocator.  Producer/owner: sym/symtab.c. */
 extern Sym *sym_free_first;
@@ -273,8 +272,6 @@ extern FuncallScratch *funcall_scratch_stack;
 /* AAPCS invisible-copy handshake: set while typing a call's formal
  * parameters (expr/indir.c's gfunc_param_typed()), consumed while lowering
  * the actual arguments (builtin/call.c's unary_funcall()). */
-extern unsigned char *aapcs_last_const_init;
-extern int aapcs_last_const_init_size;
 
 /* Producer/consumer: decl/declarator.c's post_type() alone; kept here (not
  * file-local) only because promoting it cost nothing once str_lit_pool
@@ -389,7 +386,6 @@ int is_integer_btype(int bt);
 /* --- core/state.c --- */
 Sym *find_local_scalar_sym_by_offset(int offset);
 void funcall_scratch_pop_free(FuncallScratch *fs);
-int get_arg_struct_temp(int size, int align);
 
 /* --- core/suppress.c --- */
 int gind();

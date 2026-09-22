@@ -210,6 +210,12 @@ TEST_FILES = [
     ("test_stack_deref_fold.c", 0),
     ("test_ptr_local_fwd.c", 0),
     ("test_struct_arg_stack.c", 0),
+    # struct values more than 32 KiB from the frame base (16-bit operand offset)
+    ("test_struct_far_frame.c", 0),
+    # __imag__ x = ... on a complex parameter passed on the stack or split
+    ("test_complex_param_parts.c", 0),
+    # a by-value struct parameter passed on by value (memcpy source bias)
+    ("test_struct_param_pass_on.c", 0),
     ("test_sra.c", 0),
     ("test_narrow_call_ext.c", 0),
     ("test_cross_jump.c", 0),
@@ -1636,7 +1642,7 @@ def _escape_regex(line):
 
 
 def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10,
-                   float_abi=None):
+                   float_abi=None, extra_objs=None):
     expected_lines, expect_exit = load_expect_file(test_file)
     if expect_exit is not None:
         expected_exit_code = expect_exit
@@ -1644,7 +1650,7 @@ def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_l
     if float_abi:
         opt_suffix += f"_{float_abi}"
     config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir,
-                           float_abi=float_abi)
+                           float_abi=float_abi, extra_objs=extra_objs)
     sut, loglines = run_test(test_file, MACHINE, args, defines=defines, config=config)
     expected_lines = _strip_compiler_output(expected_lines, loglines)
     try:
@@ -1827,6 +1833,25 @@ _LIBM_ABI_PARAMS = [
 def test_libm_float_abi(float_abi, opt_level, tmp_path):
     _run_qemu_test("fp_libm_exec.c", 1, opt_level=opt_level, output_dir=tmp_path,
                    float_abi=float_abi)
+
+
+# AAPCS32 interop with gcc-built code: abi_mix_b.c is compiled by
+# arm-none-eabi-gcc, main and abi_mix_a.c by tcc, and each side calls the
+# other with structs of 17-36 bytes in registers, split and on the stack
+# (see abi_mix.h).  Built for the suite's float ABI so the objects link.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"abi_gcc_interop{o}" for o in OPT_LEVELS])
+def test_abi_gcc_interop(opt_level, tmp_path):
+    import subprocess
+    from qemu_run import DEFAULT_FLOAT_ABI, DEFAULT_FPU
+    (tmp_path / "gcc").mkdir()
+    gcc_obj = tmp_path / "gcc" / "abi_mix_b_gcc.o"  # outside the build dir `make clean` removes
+    fp = [f"-mfloat-abi={DEFAULT_FLOAT_ABI}"] + ([] if DEFAULT_FLOAT_ABI == "soft" else [f"-mfpu={DEFAULT_FPU}"])
+    r = subprocess.run(["arm-none-eabi-gcc", "-mcpu=cortex-m33", "-mthumb", *fp, "-O2", "-ffunction-sections",
+                        "-c", str(CURRENT_DIR / "abi_mix_b.c"), "-o", str(gcc_obj)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    _run_qemu_test(["abi_mix_main.c", "abi_mix_a.c"], 0, opt_level=opt_level, output_dir=tmp_path / "build",
+                   extra_objs=[gcc_obj])
 
 
 # Nested function xfail tests (not yet implemented)

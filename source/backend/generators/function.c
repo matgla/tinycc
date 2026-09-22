@@ -52,8 +52,6 @@ extern int func_has_label_addr;
 extern int local_scope;
 extern int loc;
 extern int nb_temp_local_vars;
-extern int nb_arg_struct_temps;
-extern uint64_t arg_struct_temp_busy;
 extern int rsym;
 extern void vpush_type_size(CType *type, int *a);
 
@@ -184,8 +182,6 @@ void gen_function(Sym *sym)
   if (ir->has_static_chain)
     loc -= 4;
   nb_temp_local_vars = 0;
-  nb_arg_struct_temps = 0;
-  arg_struct_temp_busy = 0;
 
   local_scope = 0;
   rsym = -1;

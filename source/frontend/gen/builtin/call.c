@@ -849,19 +849,8 @@ va_arg_pack_done:
             saved_arg_count < saved_args_cap && !NOEVAL_WANTED)
         {
           saved_args[saved_arg_count] = *vtop;
-          if (aapcs_last_const_init)
-          {
-            saved_args_cid[saved_arg_count] = tcc_malloc(aapcs_last_const_init_size);
-            memcpy(saved_args_cid[saved_arg_count], aapcs_last_const_init, aapcs_last_const_init_size);
-            saved_args_cid_size[saved_arg_count] = aapcs_last_const_init_size;
-            aapcs_last_const_init = NULL;
-          }
           saved_arg_count++;
           saved_scratch->saved_arg_count = saved_arg_count;
-        }
-        else
-        {
-          aapcs_last_const_init = NULL;
         }
 
         /* Materialize constant complex double/ldouble to a temp local.
@@ -1864,20 +1853,13 @@ va_arg_pack_done:
         store_dst.c.i = loc;
         if ((param_sym->type.t & VT_BTYPE) == VT_STRUCT && !(param_sym->type.t & VT_VECTOR))
         {
-          int psz, pal;
-          psz = type_size(&param_sym->type, &pal);
-          if (psz <= 16)
-          {
-            vset(&store_dst.type, store_dst.r, store_dst.c.i);
-            vtop->vr = store_dst.vr;
-            vpushv(&arg_val);
-            vstore();
-            vtop--;
-          }
-          else
-          {
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &arg_val, NULL, &store_dst);
-          }
+          /* A struct argument of any size is the struct itself (AAPCS32 by
+           * value): copy it into the parameter's slot. */
+          vset(&store_dst.type, store_dst.r, store_dst.c.i);
+          vtop->vr = store_dst.vr;
+          vpushv(&arg_val);
+          vstore();
+          vtop--;
         }
         else
         {
