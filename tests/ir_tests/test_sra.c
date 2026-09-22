@@ -1,9 +1,12 @@
-/* Small struct locals touched only a word at a time live in registers (sra).
- * The shapes it meets: one-word wrappers passed and returned by value,
- * multi-word values copied between locals and carried round a loop, merged
- * from two paths.  Objects that must stay in memory -- a float member passed
- * by value, a byte field, a volatile struct, one whose address escapes -- keep
- * their exact behaviour. */
+/* Small struct locals whose fields are only read and written whole live in
+ * registers (sra).  The shapes it meets: one-word wrappers passed and returned
+ * by value, multi-word values copied between locals and carried round a loop,
+ * merged from two paths, and narrow fields -- an error union's u16 code,
+ * bool and u8 tags, a signed short -- which must truncate on store and extend
+ * on load exactly as memory does.  Objects that must stay in memory -- a float
+ * member passed by value, a volatile struct, one whose address escapes, a
+ * union read through overlapping or differently signed fields -- keep their
+ * exact behaviour. */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -85,11 +88,68 @@ __attribute__((noinline)) static uint32_t stay(uint32_t k)
   return (uint32_t)(half(f) * 4.0f) + tagv(t) * 10 + v.v * 100 + e.v;
 }
 
+struct ErrU { uint32_t payload; uint16_t err; };
+struct Tags { uint8_t ok; int8_t delta; int16_t shift; uint16_t code; };
+union Pun { uint32_t w; uint8_t b[4]; int8_t s[4]; };
+
+__attribute__((noinline)) static uint32_t fetch(uint32_t k) { return k * 2654435761u; }
+
+/* An error union built on two paths and checked in a loop. */
+__attribute__((noinline)) static uint32_t err_union(uint32_t n)
+{
+  struct ErrU e;
+  uint32_t acc = 0;
+  for (uint32_t i = 0; i < n; i++)
+  {
+    if (fetch(i) & 1)
+    {
+      e.payload = 0xaaaaaaaau;
+      e.err = (uint16_t)(0x10000 + i); /* truncated to i */
+    }
+    else
+    {
+      e.payload = fetch(i) >> 8;
+      e.err = 0;
+    }
+    if (e.err != 0)
+      acc += e.err * 3;
+    else
+      acc ^= e.payload;
+  }
+  return acc;
+}
+
+/* Narrow fields must truncate on store and extend on load. */
+__attribute__((noinline)) static int32_t tags(int32_t k)
+{
+  struct Tags t;
+  t.ok = (uint8_t)(k + 250);   /* wraps */
+  t.delta = (int8_t)(k * 50);  /* sign-extends on read */
+  t.shift = (int16_t)(k * 3000);
+  t.code = (uint16_t)(-k);
+  int32_t r = t.ok + t.delta + t.shift + t.code;
+  t.delta = (int8_t)(t.delta - 100);
+  return r * 7 + t.delta;
+}
+
+/* Read through overlapping or differently signed fields: stays in memory. */
+__attribute__((noinline)) static int32_t pun(uint32_t k)
+{
+  union Pun p;
+  p.w = k * 0x01010101u + 0x80;
+  int32_t r = p.b[0] + p.s[0] + p.b[1];
+  p.b[2] = 0xfe;
+  return r * 1000 + (int32_t)(p.w >> 16) + p.s[2];
+}
+
 int main(void)
 {
   printf("%u %u\n", chain(1), chain(40));
   printf("%u %u %u\n", loop(0), loop(5), loop(12));
   printf("%u %u\n", quad(3), quad(100));
   printf("%u %u\n", stay(2), stay(250));
+  printf("%u %u\n", err_union(10), err_union(33));
+  printf("%d %d %d\n", tags(1), tags(3), tags(-7));
+  printf("%d %d\n", pun(1), pun(200));
   return 0;
 }
