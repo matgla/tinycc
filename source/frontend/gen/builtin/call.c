@@ -783,10 +783,17 @@ void unary_funcall(void)
 
       /* Register clone as inline function */
       struct InlineFunc *clone_fn;
-      clone_fn = tcc_malloc(sizeof *clone_fn + strlen(orig_fn->filename));
+      clone_fn = tcc_mallocz(sizeof *clone_fn + strlen(orig_fn->filename));
       strcpy(clone_fn->filename, orig_fn->filename);
       clone_fn->sym = clone_sym;
       clone_fn->func_str = clone_body;
+      /* the clone replays the original's body: same #pragma pack state */
+      if (orig_fn->pack)
+      {
+        size_t pack_size = sizeof(int) * (orig_fn->pack[0] + 2);
+        clone_fn->pack = tcc_malloc(pack_size);
+        memcpy(clone_fn->pack, orig_fn->pack, pack_size);
+      }
       dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, clone_fn);
 
       /* Mark the clone as used so gen_inline_functions compiles it */
@@ -1541,14 +1548,7 @@ va_arg_pack_done:
     int force_always_inline = 0;
     int has_addr_of_label = 0;
     int has_inline_asm = 0;
-    for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
-    {
-      if (tcc_state->inline_fns[fi]->sym == call_func_sym)
-      {
-        inline_fn = tcc_state->inline_fns[fi];
-        break;
-      }
-    }
+    inline_fn = inline_fn_lookup(tcc_state, call_func_sym);
     if (inline_fn && inline_fn->func_str)
       inline_scan_body_features(inline_fn->func_str, &has_addr_of_label, &has_inline_asm);
     if (call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl &&
@@ -1683,8 +1683,14 @@ va_arg_pack_done:
                                             tcc_state->current_nested_func)) &&
         /* Only inline functions whose signature is safe: scalar/pointer params
          * that fit in 32-bit registers, and scalar or struct return types.
-         * 64-bit types and struct *parameters* are not handled. */
-        auto_inline_sig_ok(call_func_sym) &&
+         * 64-bit types and struct *parameters* are not handled.  A called-once
+         * function was already vetted by called_once_body_ok and binds any
+         * parameter type the expansion supports; nesting is bounded so a deep
+         * chain of them cannot exhaust the parser's stack, and the caller's
+         * growth by the called_once_budget. */
+        (call_func_sym->type.ref->f.func_called_once
+             ? tcc_state->inline_expansion_depth < 32 && inline_fn->func_str->len <= tcc_state->called_once_budget
+             : auto_inline_sig_ok(call_func_sym)) &&
         /* Don't inline if call-site argument count doesn't match the function's
          * actual parameter count.  This can happen when calling through a cast
          * to an incompatible function pointer type (e.g. ((int(*)(int))bar)(x)
@@ -1724,6 +1730,8 @@ va_arg_pack_done:
         force_always_inline = 1;
         if (call_func_sym->type.ref->f.func_inline_call_heavy)
           inline_fn->inline_count++;
+        if (call_func_sym->type.ref->f.func_called_once)
+          tcc_state->called_once_budget -= inline_fn->func_str->len;
       }
       else if (TCC_LOG_INLINE_STRUCT)
       {
@@ -1998,10 +2006,13 @@ va_arg_pack_done:
       inline_ts->data.str = tok_str_buf(inline_fn->func_str);
       inline_ts->allocated_len = 1;
       inline_ts->len = inline_fn->func_str->len;
+      int saved_pack[PACK_STACK_SIZE + 1];
+      pp_pack_enter(tcc_state, inline_fn->pack, saved_pack);
       begin_macro(inline_ts, 2);
       next();
       block(0);
       end_macro();
+      pp_pack_leave(tcc_state, saved_pack);
       inline_restore_label_bindings(inline_label_tokens, saved_inline_labels, nb_inline_label_tokens);
 
       tok = saved_tok;

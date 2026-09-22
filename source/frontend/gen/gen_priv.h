@@ -485,6 +485,12 @@ void free_inline_functions(TCCState *s);
 Section *function_text_section(TCCState *s1, Sym *sym);
 void gen_inline_functions(TCCState *s);
 void gen_owed_inline_functions(TCCState *s);
+InlineFunc *inline_fn_lookup(TCCState *s, Sym *sym);
+void gen_deferred_function_bodies(TCCState *s);
+void free_deferred_functions(TCCState *s);
+void define_deferred_function(DeferredFunc *d);
+int called_once_budget_begin(int own_len);
+void called_once_budget_end(int saved);
 void gen_late_reopt_functions(TCCState *s);
 void ir_inline_stash_flush(TCCState *s1);
 

@@ -43,6 +43,665 @@ void do_Static_assert(void)
   skip(';');
 }
 
+/* Save a function body for replay away from its definition, together with
+ * the #pragma pack state it is defined under (see pp_pack_snapshot).  When
+ * nothing compiles the body here (!COMPILED_NOW), its own pack directives are
+ * applied to the live state now too: they sit at this point of the file, and
+ * the declarations after the body must see them. */
+static void save_function_body(TokenString **str, int **pack, int compiled_now)
+{
+  int captures = pp_pack_captures;
+  *pack = pp_pack_snapshot(tcc_state);
+  skip_or_save_block(str);
+  if (!compiled_now && pp_pack_captures != captures)
+  {
+    const int *buf = tok_str_buf(*str);
+    pp_apply_pack_replays(tcc_state, buf, buf + (*str)->len);
+  }
+}
+
+/* A file-scope function definition's body, from its opening '{' in the
+ * current token stream: record a static inline as a deferred body, register an
+ * auto-inline candidate, or generate the code.  Called at the definition
+ * itself, or at the end of the TU for a body gen_deferred_function_bodies
+ * replays. */
+static void define_global_function(Sym *sym, Section *ad_section)
+{
+  /* static inline functions are just recorded as a kind
+     of macro. Their code will be emitted at the end of
+     the compilation unit only if they are used */
+  if (sym->type.t & VT_INLINE)
+  {
+    struct InlineFunc *fn;
+    fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
+    strcpy(fn->filename, file->filename);
+    fn->sym = sym;
+    dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+    save_function_body(&fn->func_str, &fn->pack, 0);
+
+    /* An explicit `inline` used to *disable* the inliner: this branch
+     * saved the body and deferred emission, but never set
+     * func_auto_inline, so every call site emitted a plain call.  Only
+     * functions the user did NOT mark inline reached the auto-inline
+     * path below.  That is backwards, and it costs the most in exactly
+     * the code that relies on the idiom -- header-defined `static
+     * inline` helpers.  lib/fp/soft is the extreme case: every helper in
+     * soft_common.h is `static inline`, so __aeabi_dadd made 18 calls to
+     * one-shift accessors that gcc folds into the body (3.76x on the
+     * double benchmarks).
+     *
+     * Apply the same eligibility test the auto path uses and set the
+     * flag so call sites replay the body.  Deferred emission is a
+     * strict win over the auto path here: if every call site inlines
+     * and the address is never taken, gen_inline_functions emits no
+     * standalone copy at all.
+     *
+     * The gate must be token-length based.  gen_function's post-opt
+     * revoke (IR > 8 / call-heavy) cannot help a deferred body -- it
+     * compiles after the call sites have already been decided.
+     *
+     * STATIC ONLY.  A non-static `inline` is a C99 inline *definition*
+     * (and gnu89 `extern inline` another rule again): the standalone
+     * body is emitted on different terms, and marking it auto_inline
+     * makes gen_inline_functions skip emission while some call site
+     * still needs the symbol -- "undefined symbol 'add1_inline'".
+     * Static inline has internal linkage, so dropping the standalone
+     * copy once every site inlined is safe, and it is the idiom that
+     * matters here (all of soft_common.h). */
+    if (sym->type.ref && (sym->type.t & VT_STATIC) &&
+        sym->type.ref->f.func_type != FUNC_ELLIPSIS &&
+        !sym->type.ref->f.func_alwinl && !sym->type.ref->f.func_noinline &&
+        (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
+        tcc_state->nb_vla_param_exprs == 0 && fn->func_str)
+    {
+      int sig = auto_inline_sig_ok(sym);
+      int thr = tcc_state->opt_inline_limit > 0 ? tcc_state->opt_inline_limit
+                                                : (tcc_state->opt_inline_functions ? 60 : 30);
+      /* Void-returning with 64-bit params: same narrow cap as the auto
+       * path (longer bodies trip an IR coalescing bug on narrowed locals). */
+      if (sig == 2)
+        thr = 15;
+      if (sig && fn->func_str->len <= thr && !inline_body_has_apply_args(fn->func_str) &&
+          !inline_body_has_unsafe_loops(fn->func_str) && !inline_body_has_static_local(fn->func_str))
+      {
+        sym->type.ref->f.func_auto_inline = 1;
+        /* Body is still owed to gen_inline_functions, unlike the auto
+         * path below which compiles the standalone copy right here. */
+        sym->type.ref->f.func_deferred_inline = 1;
+      }
+    }
+
+    /* Scan saved token stream for __builtin_va_arg_pack() usage.
+     * If found, mark the function so call sites can expand it. */
+    if (fn->func_str && sym->type.ref)
+    {
+      const int *p = tok_str_buf(fn->func_str);
+      while (*p != TOK_EOF && *p != 0)
+      {
+        if (*p == TOK_builtin_va_arg_pack)
+        {
+          sym->type.ref->f.func_va_arg_pack = 1;
+          break;
+        }
+        /* Skip token payload */
+        int t = *p++;
+        switch (t)
+        {
+        case TOK_CINT:
+        case TOK_CUINT:
+        case TOK_CCHAR:
+        case TOK_LCHAR:
+        case TOK_CFLOAT:
+        case TOK_CFLOAT_I:
+        case TOK_CINT_I:
+        case TOK_LINENUM:
+        case TOK_PACK_REPLAY:
+#if LONG_SIZE == 4
+        case TOK_CLONG:
+        case TOK_CULONG:
+#endif
+          p++;
+          break;
+        case TOK_CDOUBLE:
+        case TOK_CDOUBLE_I:
+        case TOK_CLLONG:
+        case TOK_CULLONG:
+#if LONG_SIZE == 8
+        case TOK_CLONG:
+        case TOK_CULONG:
+#endif
+          p += 2;
+          break;
+        case TOK_CLDOUBLE:
+        case TOK_CLDOUBLE_I:
+#if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
+          p += 2;
+#elif LDOUBLE_SIZE == 12
+          p += 3;
+#elif LDOUBLE_SIZE == 16
+          p += 4;
+#endif
+          break;
+        case TOK_STR:
+        case TOK_LSTR:
+        case TOK_PPNUM:
+        case TOK_PPSTR:
+        {
+          int sz = *p++;
+          p += (sz + sizeof(int) - 1) / sizeof(int);
+          break;
+        }
+        default:
+          break;
+        }
+      }
+    }
+  }
+  else if (sym->type.ref && sym->type.ref->f.func_type != FUNC_ELLIPSIS && !sym->type.ref->f.func_alwinl &&
+           !sym->type.ref->f.func_noinline &&
+           /* Only auto-inline functions whose signature is safe: scalar/pointer
+            * params that fit in 32-bit registers, and scalar or struct return
+            * types.  64-bit types and struct *parameters* are not handled.
+            * Returns 2 for void+llong signatures (body-length gated below). */
+           auto_inline_sig_ok(sym) && (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
+           /* Don't auto-inline functions with VLA parameters: the VLA size
+            * expressions (which may have side effects like i++) are evaluated
+            * during function prolog, outside the saved body token stream.
+            * Inlining would replay only the body, losing those side effects. */
+           tcc_state->nb_vla_param_exprs == 0)
+  {
+    /* Auto-inline candidate: save the body as a token stream so call
+     * sites within this TU can replay it.
+     *
+     * Static functions: defer standalone compilation; suppress it entirely
+     *   if all call sites are inlined and address not taken. We set
+     *   VT_INLINE so gen_inline_functions handles deferred emission.
+     *
+     * Non-static functions: MUST always have a globally-visible symbol for
+     *   other TUs. We compile the standalone definition immediately via
+     *   token-stream replay (same mechanism as gen_inline_functions), then
+     *   keep the token stream in inline_fns for call-site inlining within
+     *   this TU. VT_INLINE is NOT set so ELF linkage stays global. */
+    struct InlineFunc *fn;
+    fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
+    strcpy(fn->filename, file->filename);
+    fn->sym = sym;
+    fn->func_str = NULL;
+    save_function_body(&fn->func_str, &fn->pack, 1);
+
+    int threshold = tcc_state->opt_inline_limit > 0 ? tcc_state->opt_inline_limit
+                                                    : (tcc_state->opt_inline_functions ? 60 : 30);
+    int is_static = !!(sym->type.t & VT_STATIC);
+    int body_len = fn->func_str ? fn->func_str->len : 0;
+
+    if (TCC_LOG_INLINE_STRUCT)
+      fprintf(stderr, "[auto-inline] candidate: %s  static=%d  len=%d  threshold=%d\n",
+              get_tok_str(sym->v & ~SYM_FIELD, NULL), is_static, body_len, threshold);
+    LOG_INLINE_STRUCT("[auto-inline] candidate: %s  static=%d  len=%d  threshold=%d  ret_btype=%d",
+                      get_tok_str(sym->v & ~SYM_FIELD, NULL), is_static, body_len, threshold,
+                      sym->type.ref ? (sym->type.ref->type.t & VT_BTYPE) : -1);
+
+    Section *saved_text = cur_text_section;
+    cur_text_section = ad_section ? ad_section : function_text_section(tcc_state, sym);
+    if (cur_text_section->sh_num > bss_section->sh_num)
+      cur_text_section->sh_flags = text_section->sh_flags;
+
+    /* Void-returning functions with 64-bit params: only inline very
+     * short bodies (≤ 15 tokens) — longer bodies may trigger an IR
+     * coalescing bug with narrowed locals. */
+    int void_llong_limit = (auto_inline_sig_ok(sym) == 2) ? 15 : threshold;
+    if (fn->func_str && body_len <= void_llong_limit && !inline_body_has_apply_args(fn->func_str) &&
+        !inline_body_has_unsafe_loops(fn->func_str))
+    {
+      if (TCC_LOG_INLINE_STRUCT)
+        fprintf(stderr, "[auto-inline] SMALL: registering %s as inline candidate\n",
+                get_tok_str(sym->v & ~SYM_FIELD, NULL));
+
+      /* Small enough: register as inline candidate for call-site replay.
+       *
+       * We compile the standalone definition immediately for BOTH static
+       * and non-static functions.  We deliberately do NOT set VT_INLINE:
+       *   - Setting VT_INLINE would defer compilation to gen_inline_functions,
+       *     but alias attributes and other code may reference sym->c before
+       *     gen_inline_functions runs, causing "aliased to undefined symbol"
+       *     errors and similar failures.
+       *   - The standalone definition is always emitted.  Under
+       *     -ffunction-sections it lands in its own .text.<name>
+       *     section, and the linker's gc_sections() drops it when
+       *     every call site was inlined and the address never taken.
+       *     (Before function-sections was real, this sentence claimed
+       *     --gc-sections would collect it out of the monolithic
+       *     .text, which was never true -- section-granularity GC
+       *     cannot drop a function from a section it shares.)
+       *
+       * fn->func_str is preserved (not consumed) so call-site replay
+       * can still inline the body later.  The compilation uses an owning
+       * COPY of the token stream.
+       *
+       * Save/restore tok+tokc: the replay leaves tok=TOK_EOF which would
+       * cause the outer decl() loop to stop parsing prematurely. */
+      sym->type.ref->f.func_auto_inline = 1;
+      /* Set VT_INLINE for static functions so can_inline_eval=1 at call sites.
+       * Non-static functions must NOT get VT_INLINE — their standalone definition
+       * must remain globally visible for other translation units. */
+      if (is_static)
+        sym->type.t |= VT_INLINE;
+      dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+
+      TokenString *compile_ts = tok_str_alloc();
+      if (body_len > 0)
+      {
+        int *buf = tcc_malloc(body_len * sizeof(int));
+        memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
+        compile_ts->data.str = buf;
+        compile_ts->allocated_len = body_len;
+        compile_ts->len = body_len;
+      }
+      int saved_outer_tok = tok;
+      CValue saved_outer_tokc = tokc;
+      if (TCC_LOG_INLINE_STRUCT)
+        fprintf(stderr, "[auto-inline] SMALL: compiling standalone for %s\n",
+                get_tok_str(sym->v & ~SYM_FIELD, NULL));
+      tcc_state->had_nested_funcs = 0;
+      begin_macro(compile_ts, 1); /* owning: compile_ts freed on end_macro */
+      next();
+      gen_function(sym);
+      end_macro();
+      tok = saved_outer_tok;
+      tokc = saved_outer_tokc;
+      /* Revoke auto-inline for functions that contain nested function
+       * definitions — their closure/trampoline semantics cannot be
+       * replicated by token-replay inline expansion. */
+      if (tcc_state->had_nested_funcs)
+      {
+        sym->type.ref->f.func_auto_inline = 0;
+        if (is_static)
+          sym->type.t &= ~VT_INLINE;
+      }
+      /* gen_function's post-opt check will revoke auto_inline
+       * if the compiled IR exceeds 8 instructions. */
+      /* If auto_inline was revoked (either by had_nested_funcs above or
+       * by gen_function's post-opt size/call-count check), the function
+       * is already compiled standalone and won't be inlined at any
+       * callsite.  If the body is pure and within the eval-only cap,
+       * promote to func_eval_only_inline so try_inline_const_eval can
+       * still fold all-constant calls (mirrors the TOO-LARGE branch's
+       * retroactive promotion below).  Otherwise free the token stream
+       * so gen_inline_functions doesn't re-emit a duplicate body.
+       * Skip the promotion path when nested funcs revoked: token-replay
+       * cannot reproduce closure/trampoline semantics. */
+      if (!sym->type.ref->f.func_auto_inline)
+      {
+        /* A register-only loop body (func_const_arg_loop, set from the
+         * optimized IR) is exempt from the no-side-effects rule: the
+         * counter and accumulator updates that trip it (`i++`, `n += x`)
+         * are exactly what a loop is made of, and the loop is why the
+         * body was demoted.  CTFE re-checks side effects before it
+         * evaluates, so only the all-constant-argument replay path gains
+         * these — where ssa:loop_const_sim collapses the expanded loop to
+         * its final value. */
+        int loop_helper = sym->type.ref->f.func_const_arg_loop;
+        int promote_eval_only = !tcc_state->had_nested_funcs && fn->func_str && body_len <= 160 &&
+                                !inline_body_has_apply_args(fn->func_str) &&
+                                (loop_helper || !inline_body_has_side_effects(fn->func_str));
+        if (promote_eval_only)
+        {
+          sym->type.ref->f.func_eval_only_inline = 1;
+          /* VT_INLINE already set above for static; keep it set so
+           * gen_inline_functions' eval-only skip branch catches us. */
+        }
+        else if (sym->type.ref->f.func_late_reopt ||
+                 sym->type.ref->f.func_keep_tokens_for_noreturn)
+        {
+          /* Keep tokens — end-of-TU late_reopt may re-compile (either
+           * already flagged, or pending noreturn-propagation decision). */
+        }
+        else if (sym->type.ref->f.tu_static_writer)
+        {
+          /* Keep tokens — function writes >=1 non-const static global;
+           * end-of-TU TU-wide DSE analysis may decide to re-compile via
+           * late_reopt to eliminate dead static stores. */
+        }
+        else
+        {
+          if (is_static)
+            sym->type.t &= ~VT_INLINE;
+          if (fn->func_str)
+          {
+            tok_str_free(fn->func_str);
+            fn->func_str = NULL;
+          }
+          fn->sym = NULL;
+        }
+      }
+      if (TCC_LOG_INLINE_STRUCT)
+        fprintf(stderr, "[auto-inline] SMALL: done compiling %s sym->c=%d\n",
+                get_tok_str(sym->v & ~SYM_FIELD, NULL), sym->c);
+    }
+    else
+    {
+      /* Too large to inline-expand, but if the body is pure and under
+       * a higher eval-only cap, keep the token stream so
+       * try_inline_const_eval can still fold all-constant calls.
+       * Regular inline-expansion paths skip functions tagged
+       * func_eval_only_inline. */
+      const int eval_only_cap = 160;
+      int has_apply = fn->func_str ? inline_body_has_apply_args(fn->func_str) : 0;
+      int has_side = fn->func_str ? inline_body_has_side_effects(fn->func_str) : 1;
+      int eval_only_candidate = fn->func_str && body_len <= eval_only_cap && !has_apply && !has_side;
+
+      if (TCC_LOG_INLINE_STRUCT)
+        fprintf(
+            stderr,
+            "[auto-inline] TOO LARGE: compiling %s normally (len=%d > threshold=%d) cap=%d apply=%d side=%d%s\n",
+            get_tok_str(sym->v & ~SYM_FIELD, NULL), body_len, threshold, eval_only_cap, has_apply, has_side,
+            eval_only_candidate ? " (eval-only retained)" : "");
+
+      if (eval_only_candidate)
+      {
+        sym->type.ref->f.func_eval_only_inline = 1;
+        if (is_static)
+          sym->type.t |= VT_INLINE;
+        dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+
+        TokenString *compile_ts = tok_str_alloc();
+        int *buf = tcc_malloc(body_len * sizeof(int));
+        memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
+        compile_ts->data.str = buf;
+        compile_ts->allocated_len = body_len;
+        compile_ts->len = body_len;
+
+        int saved_outer_tok = tok;
+        CValue saved_outer_tokc = tokc;
+        begin_macro(compile_ts, 1);
+        next();
+        gen_function(sym);
+        end_macro();
+        tok = saved_outer_tok;
+        tokc = saved_outer_tokc;
+      }
+      else if (fn->func_str)
+      {
+        int saved_outer_tok = tok;
+        CValue saved_outer_tokc = tokc;
+        const int post_opt_inline_cap = 512;
+        if (body_len <= post_opt_inline_cap)
+        {
+          /* Preserve token stream for post-optimization re-inlining.
+           * Compile from a copy (same pattern as the small-function path). */
+          dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+          TokenString *compile_ts = tok_str_alloc();
+          int *buf = tcc_malloc(body_len * sizeof(int));
+          memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
+          compile_ts->data.str = buf;
+          compile_ts->allocated_len = body_len;
+          compile_ts->len = body_len;
+          begin_macro(compile_ts, 1);
+          next();
+          gen_function(sym);
+          end_macro();
+          if (sym->type.ref->f.func_auto_inline) {
+            /* Retroactively promoted: convert to eval-only so callsite
+             * inlining only fires when ALL args are compile-time constants.
+             * The original body is too large for unconditional inlining. */
+            sym->type.ref->f.func_auto_inline = 0;
+            sym->type.ref->f.func_eval_only_inline = 1;
+          } else if (sym->type.ref->f.func_late_reopt ||
+                     sym->type.ref->f.func_keep_tokens_for_noreturn) {
+            /* Keep tokens — end-of-TU late_reopt may re-compile. */
+          } else if (sym->type.ref->f.tu_static_writer) {
+            /* Keep tokens — TU-wide DSE may flag this for re-compile. */
+          } else {
+            /* Not promoted: prevent gen_inline_functions re-compilation. */
+            tok_str_free(fn->func_str);
+            fn->func_str = NULL;
+            fn->sym = NULL;
+          }
+        }
+        else
+        {
+          /* Body exceeds post_opt_inline_cap.  If the function writes a
+           * non-const static, we still need its tokens for end-of-TU
+           * re-compilation; preserve them by going through the same
+           * inline_fns path used for the smaller-body case. */
+          if (tcc_state->opt_dead_store) {
+            TokenString *compile_ts = tok_str_alloc();
+            int *buf = tcc_malloc(body_len * sizeof(int));
+            memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
+            compile_ts->data.str = buf;
+            compile_ts->allocated_len = body_len;
+            compile_ts->len = body_len;
+            dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+            begin_macro(compile_ts, 1);
+            next();
+            gen_function(sym);
+            end_macro();
+            if (!sym->type.ref->f.tu_static_writer &&
+                !sym->type.ref->f.func_late_reopt &&
+                !sym->type.ref->f.func_keep_tokens_for_noreturn) {
+              /* Not a static writer — discard tokens to save memory. */
+              tok_str_free(fn->func_str);
+              fn->func_str = NULL;
+              fn->sym = NULL;
+            }
+          } else {
+            TokenString *ts = fn->func_str;
+            fn->func_str = NULL;
+            begin_macro(ts, 1);
+            next();
+            gen_function(sym);
+            end_macro();
+            tcc_free(fn->pack);
+            tcc_free(fn);
+          }
+        }
+        tok = saved_outer_tok;
+        tokc = saved_outer_tokc;
+      }
+      else
+      {
+        tcc_free(fn->pack);
+        tcc_free(fn);
+      }
+    }
+
+    cur_text_section = saved_text;
+  }
+  else
+  {
+    /* compute text section */
+    cur_text_section = ad_section;
+    if (!cur_text_section)
+      cur_text_section = function_text_section(tcc_state, sym);
+    else if (cur_text_section->sh_num > bss_section->sh_num)
+      cur_text_section->sh_flags = text_section->sh_flags;
+    /* When -fdead-store-elimination is enabled, save the body as a
+     * token stream so the end-of-TU late_reopt pass can re-compile
+     * this function if TU-wide analysis flags it as a writer of a
+     * static global with no reachable readers.  This path covers
+     * functions that auto_inline_sig_ok rejects (e.g., double/long
+     * double params), which would otherwise never reach gen_late_reopt
+     * because they are not in inline_fns.  Bound the saved body
+     * length so very large functions don't pin extra memory. */
+    const int late_reopt_cap = 512;
+    if (tcc_state->opt_dead_store)
+    {
+      struct InlineFunc *fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
+      strcpy(fn->filename, file->filename);
+      fn->sym = sym;
+      fn->func_str = NULL;
+      save_function_body(&fn->func_str, &fn->pack, 1);
+      int body_len = fn->func_str ? fn->func_str->len : 0;
+      if (fn->func_str && body_len > 0 && body_len <= late_reopt_cap)
+      {
+        dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+        TokenString *compile_ts = tok_str_alloc();
+        int *buf = tcc_malloc(body_len * sizeof(int));
+        memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
+        compile_ts->data.str = buf;
+        compile_ts->allocated_len = body_len;
+        compile_ts->len = body_len;
+        int saved_outer_tok = tok;
+        CValue saved_outer_tokc = tokc;
+        tcc_state->had_nested_funcs = 0;
+        begin_macro(compile_ts, 1);
+        next();
+        gen_function(sym);
+        end_macro();
+        tok = saved_outer_tok;
+        tokc = saved_outer_tokc;
+        /* Token-replay cannot reproduce nested function closure
+         * semantics during re-compile; drop tokens in that case.
+         * Otherwise keep only bodies that either write statics for
+         * TU-wide DSE or were speculatively preserved for call-fact
+         * late reopt. */
+        if (tcc_state->had_nested_funcs ||
+            (!sym->type.ref->f.tu_static_writer &&
+             !sym->type.ref->f.func_keep_tokens_for_noreturn &&
+             !sym->type.ref->f.func_late_reopt))
+        {
+          tok_str_free(fn->func_str);
+          fn->func_str = NULL;
+          fn->sym = NULL;
+        }
+      }
+      else
+      {
+        /* Body empty or exceeds the cap: compile via replay (if we
+         * have a saved stream) without inline_fns preservation. */
+        if (fn->func_str)
+        {
+          int saved_outer_tok2 = tok;
+          CValue saved_outer_tokc2 = tokc;
+          TokenString *ts = fn->func_str;
+          fn->func_str = NULL;
+          begin_macro(ts, 1);
+          next();
+          gen_function(sym);
+          end_macro();
+          tok = saved_outer_tok2;
+          tokc = saved_outer_tokc2;
+        }
+        else
+        {
+          gen_function(sym);
+        }
+        tcc_free(fn->pack);
+        tcc_free(fn);
+      }
+    }
+    else
+    {
+      gen_function(sym);
+    }
+    /* Nested functions are now compiled inside gen_function,
+     * before pop_local_syms, so parent locals are still accessible. */
+  }
+}
+
+/* -finline-functions-called-once: save a function's body instead of
+ * generating it, so the end of the TU (gen_deferred_function_bodies) knows
+ * every body -- and every call site -- before it generates any of them.  A
+ * non-static function is deferred too: it is always emitted, but a caller
+ * compiled at its definition could inline nothing defined further down.  A
+ * static inline, an old-style or variadic definition, and one whose VLA
+ * parameters evaluate expressions at the definition are left alone. */
+/* Whether BODY calls a function that has no prototype here: an identifier
+ * with no declaration in scope (an implicit declaration), or one declared
+ * without a prototype.  Replayed at the end of the TU, the call would be
+ * checked against a prototype that only appears further down -- pr47428's
+ * `fn (0)` became "too few arguments".  Token replay cannot restore the scope
+ * as of the definition, so such a body is generated here instead.  An
+ * identifier that is a parameter, or that the body mentioned before (a local
+ * function pointer), is not a file-scope reference; nor is a predefined token
+ * (a builtin unary() expands itself, or a library name like memcpy). */
+static int body_calls_unprototyped(Sym *sym, TokenString *body)
+{
+  const int *start = tok_str_buf(body), *p = start, *end = start + body->len;
+  int prev = 0;
+  CValue cv;
+  while (p < end)
+  {
+    int t;
+    const int *at = p, *next_tok;
+    tok_get(&t, &p, &cv);
+    for (next_tok = p; next_tok < end && *next_tok == TOK_LINENUM;)
+      next_tok += 2;
+    if (t >= TOK_UIDENT && prev != '.' && prev != TOK_ARROW && next_tok < end && *next_tok == '(')
+    {
+      Sym *s = sym_find(t);
+      if (s && !IS_ASM_SYM(s))
+      {
+        if ((s->type.t & VT_BTYPE) == VT_FUNC && s->type.ref->f.func_type == FUNC_OLD)
+          return 1;
+      }
+      else if (t >= TOK_BUILTIN_END)
+      {
+        int local = 0;
+        for (Sym *param = sym->type.ref->next; param && !local; param = param->next)
+          local = (param->v & ~SYM_FIELD) == t;
+        for (const int *q = start; q < at && !local;)
+        {
+          int u;
+          CValue ucv;
+          tok_get(&u, &q, &ucv);
+          local = u == t;
+        }
+        if (!local)
+          return 1;
+      }
+    }
+    if (t != TOK_LINENUM)
+      prev = t;
+  }
+  return 0;
+}
+
+static int defer_function_body(Sym *sym, Section *section)
+{
+  if (!tcc_state->opt_inline_called_once || tcc_state->nb_vla_param_exprs ||
+      (sym->type.t & VT_INLINE) || !sym->type.ref || sym->type.ref->f.func_type != FUNC_NEW || sym->a.nested_func)
+    return 0;
+  DeferredFunc *d = tcc_mallocz(sizeof *d + strlen(file->filename));
+  strcpy(d->filename, file->filename);
+  d->sym = sym;
+  d->section = section;
+  save_function_body(&d->body, &d->pack, 0);
+  if (body_calls_unprototyped(sym, d->body))
+  {
+    /* Generate it now, from the saved tokens, as if never deferred. */
+    int saved_tok = tok, saved_line = file->line_num;
+    CValue saved_tokc = tokc;
+    define_deferred_function(d);
+    tok = saved_tok;
+    tokc = saved_tokc;
+    file->line_num = saved_line;
+    tcc_free(d->pack);
+    tcc_free(d);
+    return 1;
+  }
+  dynarray_add(&tcc_state->deferred_fns, &tcc_state->nb_deferred_fns, d);
+  return 1;
+}
+
+/* Generate a body defer_function_body saved: replay its tokens through the
+ * definition path it skipped. */
+void define_deferred_function(DeferredFunc *d)
+{
+  TokenString *body = d->body;
+  int saved_pack[PACK_STACK_SIZE + 1];
+  int saved_budget = called_once_budget_begin(body->len);
+  d->body = NULL;
+  tccpp_putfile(d->filename);
+  pp_pack_enter(tcc_state, d->pack, saved_pack);
+  begin_macro(body, 1);
+  next();
+  define_global_function(d->sym, d->section);
+  end_macro();
+  pp_pack_leave(tcc_state, saved_pack);
+  called_once_budget_end(saved_budget);
+}
+
 /* 'l' is VT_LOCAL or VT_CONST to define default storage type
    or VT_CMP if parsing old style parameter list
    or VT_JMP if parsing c99 for decl: for (int i = 0, ...) */
@@ -501,534 +1160,8 @@ int decl(int l)
         /* put function symbol */
         type.t &= ~VT_EXTERN;
         sym = external_sym(v, &type, 0, &ad);
-
-        /* static inline functions are just recorded as a kind
-           of macro. Their code will be emitted at the end of
-           the compilation unit only if they are used */
-        if (sym->type.t & VT_INLINE)
-        {
-          struct InlineFunc *fn;
-          fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
-          strcpy(fn->filename, file->filename);
-          fn->sym = sym;
-          dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
-          skip_or_save_block(&fn->func_str);
-
-          /* An explicit `inline` used to *disable* the inliner: this branch
-           * saved the body and deferred emission, but never set
-           * func_auto_inline, so every call site emitted a plain call.  Only
-           * functions the user did NOT mark inline reached the auto-inline
-           * path below.  That is backwards, and it costs the most in exactly
-           * the code that relies on the idiom -- header-defined `static
-           * inline` helpers.  lib/fp/soft is the extreme case: every helper in
-           * soft_common.h is `static inline`, so __aeabi_dadd made 18 calls to
-           * one-shift accessors that gcc folds into the body (3.76x on the
-           * double benchmarks).
-           *
-           * Apply the same eligibility test the auto path uses and set the
-           * flag so call sites replay the body.  Deferred emission is a
-           * strict win over the auto path here: if every call site inlines
-           * and the address is never taken, gen_inline_functions emits no
-           * standalone copy at all.
-           *
-           * The gate must be token-length based.  gen_function's post-opt
-           * revoke (IR > 8 / call-heavy) cannot help a deferred body -- it
-           * compiles after the call sites have already been decided.
-           *
-           * STATIC ONLY.  A non-static `inline` is a C99 inline *definition*
-           * (and gnu89 `extern inline` another rule again): the standalone
-           * body is emitted on different terms, and marking it auto_inline
-           * makes gen_inline_functions skip emission while some call site
-           * still needs the symbol -- "undefined symbol 'add1_inline'".
-           * Static inline has internal linkage, so dropping the standalone
-           * copy once every site inlined is safe, and it is the idiom that
-           * matters here (all of soft_common.h). */
-          if (sym->type.ref && (sym->type.t & VT_STATIC) &&
-              sym->type.ref->f.func_type != FUNC_ELLIPSIS &&
-              !sym->type.ref->f.func_alwinl && !sym->type.ref->f.func_noinline &&
-              (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
-              tcc_state->nb_vla_param_exprs == 0 && fn->func_str)
-          {
-            int sig = auto_inline_sig_ok(sym);
-            int thr = tcc_state->opt_inline_limit > 0 ? tcc_state->opt_inline_limit
-                                                      : (tcc_state->opt_inline_functions ? 60 : 30);
-            /* Void-returning with 64-bit params: same narrow cap as the auto
-             * path (longer bodies trip an IR coalescing bug on narrowed locals). */
-            if (sig == 2)
-              thr = 15;
-            if (sig && fn->func_str->len <= thr && !inline_body_has_apply_args(fn->func_str) &&
-                !inline_body_has_unsafe_loops(fn->func_str) && !inline_body_has_static_local(fn->func_str))
-            {
-              sym->type.ref->f.func_auto_inline = 1;
-              /* Body is still owed to gen_inline_functions, unlike the auto
-               * path below which compiles the standalone copy right here. */
-              sym->type.ref->f.func_deferred_inline = 1;
-            }
-          }
-
-          /* Scan saved token stream for __builtin_va_arg_pack() usage.
-           * If found, mark the function so call sites can expand it. */
-          if (fn->func_str && sym->type.ref)
-          {
-            const int *p = tok_str_buf(fn->func_str);
-            while (*p != TOK_EOF && *p != 0)
-            {
-              if (*p == TOK_builtin_va_arg_pack)
-              {
-                sym->type.ref->f.func_va_arg_pack = 1;
-                break;
-              }
-              /* Skip token payload */
-              int t = *p++;
-              switch (t)
-              {
-              case TOK_CINT:
-              case TOK_CUINT:
-              case TOK_CCHAR:
-              case TOK_LCHAR:
-              case TOK_CFLOAT:
-              case TOK_CFLOAT_I:
-              case TOK_CINT_I:
-              case TOK_LINENUM:
-              case TOK_PACK_REPLAY:
-#if LONG_SIZE == 4
-              case TOK_CLONG:
-              case TOK_CULONG:
-#endif
-                p++;
-                break;
-              case TOK_CDOUBLE:
-              case TOK_CDOUBLE_I:
-              case TOK_CLLONG:
-              case TOK_CULLONG:
-#if LONG_SIZE == 8
-              case TOK_CLONG:
-              case TOK_CULONG:
-#endif
-                p += 2;
-                break;
-              case TOK_CLDOUBLE:
-              case TOK_CLDOUBLE_I:
-#if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
-                p += 2;
-#elif LDOUBLE_SIZE == 12
-                p += 3;
-#elif LDOUBLE_SIZE == 16
-                p += 4;
-#endif
-                break;
-              case TOK_STR:
-              case TOK_LSTR:
-              case TOK_PPNUM:
-              case TOK_PPSTR:
-              {
-                int sz = *p++;
-                p += (sz + sizeof(int) - 1) / sizeof(int);
-                break;
-              }
-              default:
-                break;
-              }
-            }
-          }
-        }
-        else if (sym->type.ref && sym->type.ref->f.func_type != FUNC_ELLIPSIS && !sym->type.ref->f.func_alwinl &&
-                 !sym->type.ref->f.func_noinline &&
-                 /* Only auto-inline functions whose signature is safe: scalar/pointer
-                  * params that fit in 32-bit registers, and scalar or struct return
-                  * types.  64-bit types and struct *parameters* are not handled.
-                  * Returns 2 for void+llong signatures (body-length gated below). */
-                 auto_inline_sig_ok(sym) && (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
-                 /* Don't auto-inline functions with VLA parameters: the VLA size
-                  * expressions (which may have side effects like i++) are evaluated
-                  * during function prolog, outside the saved body token stream.
-                  * Inlining would replay only the body, losing those side effects. */
-                 tcc_state->nb_vla_param_exprs == 0)
-        {
-          /* Auto-inline candidate: save the body as a token stream so call
-           * sites within this TU can replay it.
-           *
-           * Static functions: defer standalone compilation; suppress it entirely
-           *   if all call sites are inlined and address not taken. We set
-           *   VT_INLINE so gen_inline_functions handles deferred emission.
-           *
-           * Non-static functions: MUST always have a globally-visible symbol for
-           *   other TUs. We compile the standalone definition immediately via
-           *   token-stream replay (same mechanism as gen_inline_functions), then
-           *   keep the token stream in inline_fns for call-site inlining within
-           *   this TU. VT_INLINE is NOT set so ELF linkage stays global. */
-          struct InlineFunc *fn;
-          fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
-          strcpy(fn->filename, file->filename);
-          fn->sym = sym;
-          fn->func_str = NULL;
-          skip_or_save_block(&fn->func_str);
-
-          int threshold = tcc_state->opt_inline_limit > 0 ? tcc_state->opt_inline_limit
-                                                          : (tcc_state->opt_inline_functions ? 60 : 30);
-          int is_static = !!(sym->type.t & VT_STATIC);
-          int body_len = fn->func_str ? fn->func_str->len : 0;
-
-          if (TCC_LOG_INLINE_STRUCT)
-            fprintf(stderr, "[auto-inline] candidate: %s  static=%d  len=%d  threshold=%d\n",
-                    get_tok_str(sym->v & ~SYM_FIELD, NULL), is_static, body_len, threshold);
-          LOG_INLINE_STRUCT("[auto-inline] candidate: %s  static=%d  len=%d  threshold=%d  ret_btype=%d",
-                            get_tok_str(sym->v & ~SYM_FIELD, NULL), is_static, body_len, threshold,
-                            sym->type.ref ? (sym->type.ref->type.t & VT_BTYPE) : -1);
-
-          Section *saved_text = cur_text_section;
-          cur_text_section = ad.section ? ad.section : function_text_section(tcc_state, sym);
-          if (cur_text_section->sh_num > bss_section->sh_num)
-            cur_text_section->sh_flags = text_section->sh_flags;
-
-          /* Void-returning functions with 64-bit params: only inline very
-           * short bodies (≤ 15 tokens) — longer bodies may trigger an IR
-           * coalescing bug with narrowed locals. */
-          int void_llong_limit = (auto_inline_sig_ok(sym) == 2) ? 15 : threshold;
-          if (fn->func_str && body_len <= void_llong_limit && !inline_body_has_apply_args(fn->func_str) &&
-              !inline_body_has_unsafe_loops(fn->func_str))
-          {
-            if (TCC_LOG_INLINE_STRUCT)
-              fprintf(stderr, "[auto-inline] SMALL: registering %s as inline candidate\n",
-                      get_tok_str(sym->v & ~SYM_FIELD, NULL));
-
-            /* Small enough: register as inline candidate for call-site replay.
-             *
-             * We compile the standalone definition immediately for BOTH static
-             * and non-static functions.  We deliberately do NOT set VT_INLINE:
-             *   - Setting VT_INLINE would defer compilation to gen_inline_functions,
-             *     but alias attributes and other code may reference sym->c before
-             *     gen_inline_functions runs, causing "aliased to undefined symbol"
-             *     errors and similar failures.
-             *   - The standalone definition is always emitted.  Under
-             *     -ffunction-sections it lands in its own .text.<name>
-             *     section, and the linker's gc_sections() drops it when
-             *     every call site was inlined and the address never taken.
-             *     (Before function-sections was real, this sentence claimed
-             *     --gc-sections would collect it out of the monolithic
-             *     .text, which was never true -- section-granularity GC
-             *     cannot drop a function from a section it shares.)
-             *
-             * fn->func_str is preserved (not consumed) so call-site replay
-             * can still inline the body later.  The compilation uses an owning
-             * COPY of the token stream.
-             *
-             * Save/restore tok+tokc: the replay leaves tok=TOK_EOF which would
-             * cause the outer decl() loop to stop parsing prematurely. */
-            sym->type.ref->f.func_auto_inline = 1;
-            /* Set VT_INLINE for static functions so can_inline_eval=1 at call sites.
-             * Non-static functions must NOT get VT_INLINE — their standalone definition
-             * must remain globally visible for other translation units. */
-            if (is_static)
-              sym->type.t |= VT_INLINE;
-            dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
-
-            TokenString *compile_ts = tok_str_alloc();
-            if (body_len > 0)
-            {
-              int *buf = tcc_malloc(body_len * sizeof(int));
-              memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
-              compile_ts->data.str = buf;
-              compile_ts->allocated_len = body_len;
-              compile_ts->len = body_len;
-            }
-            int saved_outer_tok = tok;
-            CValue saved_outer_tokc = tokc;
-            if (TCC_LOG_INLINE_STRUCT)
-              fprintf(stderr, "[auto-inline] SMALL: compiling standalone for %s\n",
-                      get_tok_str(sym->v & ~SYM_FIELD, NULL));
-            tcc_state->had_nested_funcs = 0;
-            begin_macro(compile_ts, 1); /* owning: compile_ts freed on end_macro */
-            next();
-            gen_function(sym);
-            end_macro();
-            tok = saved_outer_tok;
-            tokc = saved_outer_tokc;
-            /* Revoke auto-inline for functions that contain nested function
-             * definitions — their closure/trampoline semantics cannot be
-             * replicated by token-replay inline expansion. */
-            if (tcc_state->had_nested_funcs)
-            {
-              sym->type.ref->f.func_auto_inline = 0;
-              if (is_static)
-                sym->type.t &= ~VT_INLINE;
-            }
-            /* gen_function's post-opt check will revoke auto_inline
-             * if the compiled IR exceeds 8 instructions. */
-            /* If auto_inline was revoked (either by had_nested_funcs above or
-             * by gen_function's post-opt size/call-count check), the function
-             * is already compiled standalone and won't be inlined at any
-             * callsite.  If the body is pure and within the eval-only cap,
-             * promote to func_eval_only_inline so try_inline_const_eval can
-             * still fold all-constant calls (mirrors the TOO-LARGE branch's
-             * retroactive promotion below).  Otherwise free the token stream
-             * so gen_inline_functions doesn't re-emit a duplicate body.
-             * Skip the promotion path when nested funcs revoked: token-replay
-             * cannot reproduce closure/trampoline semantics. */
-            if (!sym->type.ref->f.func_auto_inline)
-            {
-              /* A register-only loop body (func_const_arg_loop, set from the
-               * optimized IR) is exempt from the no-side-effects rule: the
-               * counter and accumulator updates that trip it (`i++`, `n += x`)
-               * are exactly what a loop is made of, and the loop is why the
-               * body was demoted.  CTFE re-checks side effects before it
-               * evaluates, so only the all-constant-argument replay path gains
-               * these — where ssa:loop_const_sim collapses the expanded loop to
-               * its final value. */
-              int loop_helper = sym->type.ref->f.func_const_arg_loop;
-              int promote_eval_only = !tcc_state->had_nested_funcs && fn->func_str && body_len <= 160 &&
-                                      !inline_body_has_apply_args(fn->func_str) &&
-                                      (loop_helper || !inline_body_has_side_effects(fn->func_str));
-              if (promote_eval_only)
-              {
-                sym->type.ref->f.func_eval_only_inline = 1;
-                /* VT_INLINE already set above for static; keep it set so
-                 * gen_inline_functions' eval-only skip branch catches us. */
-              }
-              else if (sym->type.ref->f.func_late_reopt ||
-                       sym->type.ref->f.func_keep_tokens_for_noreturn)
-              {
-                /* Keep tokens — end-of-TU late_reopt may re-compile (either
-                 * already flagged, or pending noreturn-propagation decision). */
-              }
-              else if (sym->type.ref->f.tu_static_writer)
-              {
-                /* Keep tokens — function writes >=1 non-const static global;
-                 * end-of-TU TU-wide DSE analysis may decide to re-compile via
-                 * late_reopt to eliminate dead static stores. */
-              }
-              else
-              {
-                if (is_static)
-                  sym->type.t &= ~VT_INLINE;
-                if (fn->func_str)
-                {
-                  tok_str_free(fn->func_str);
-                  fn->func_str = NULL;
-                }
-                fn->sym = NULL;
-              }
-            }
-            if (TCC_LOG_INLINE_STRUCT)
-              fprintf(stderr, "[auto-inline] SMALL: done compiling %s sym->c=%d\n",
-                      get_tok_str(sym->v & ~SYM_FIELD, NULL), sym->c);
-          }
-          else
-          {
-            /* Too large to inline-expand, but if the body is pure and under
-             * a higher eval-only cap, keep the token stream so
-             * try_inline_const_eval can still fold all-constant calls.
-             * Regular inline-expansion paths skip functions tagged
-             * func_eval_only_inline. */
-            const int eval_only_cap = 160;
-            int has_apply = fn->func_str ? inline_body_has_apply_args(fn->func_str) : 0;
-            int has_side = fn->func_str ? inline_body_has_side_effects(fn->func_str) : 1;
-            int eval_only_candidate = fn->func_str && body_len <= eval_only_cap && !has_apply && !has_side;
-
-            if (TCC_LOG_INLINE_STRUCT)
-              fprintf(
-                  stderr,
-                  "[auto-inline] TOO LARGE: compiling %s normally (len=%d > threshold=%d) cap=%d apply=%d side=%d%s\n",
-                  get_tok_str(sym->v & ~SYM_FIELD, NULL), body_len, threshold, eval_only_cap, has_apply, has_side,
-                  eval_only_candidate ? " (eval-only retained)" : "");
-
-            if (eval_only_candidate)
-            {
-              sym->type.ref->f.func_eval_only_inline = 1;
-              if (is_static)
-                sym->type.t |= VT_INLINE;
-              dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
-
-              TokenString *compile_ts = tok_str_alloc();
-              int *buf = tcc_malloc(body_len * sizeof(int));
-              memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
-              compile_ts->data.str = buf;
-              compile_ts->allocated_len = body_len;
-              compile_ts->len = body_len;
-
-              int saved_outer_tok = tok;
-              CValue saved_outer_tokc = tokc;
-              begin_macro(compile_ts, 1);
-              next();
-              gen_function(sym);
-              end_macro();
-              tok = saved_outer_tok;
-              tokc = saved_outer_tokc;
-            }
-            else if (fn->func_str)
-            {
-              int saved_outer_tok = tok;
-              CValue saved_outer_tokc = tokc;
-              const int post_opt_inline_cap = 512;
-              if (body_len <= post_opt_inline_cap)
-              {
-                /* Preserve token stream for post-optimization re-inlining.
-                 * Compile from a copy (same pattern as the small-function path). */
-                dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
-                TokenString *compile_ts = tok_str_alloc();
-                int *buf = tcc_malloc(body_len * sizeof(int));
-                memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
-                compile_ts->data.str = buf;
-                compile_ts->allocated_len = body_len;
-                compile_ts->len = body_len;
-                begin_macro(compile_ts, 1);
-                next();
-                gen_function(sym);
-                end_macro();
-                if (sym->type.ref->f.func_auto_inline) {
-                  /* Retroactively promoted: convert to eval-only so callsite
-                   * inlining only fires when ALL args are compile-time constants.
-                   * The original body is too large for unconditional inlining. */
-                  sym->type.ref->f.func_auto_inline = 0;
-                  sym->type.ref->f.func_eval_only_inline = 1;
-                } else if (sym->type.ref->f.func_late_reopt ||
-                           sym->type.ref->f.func_keep_tokens_for_noreturn) {
-                  /* Keep tokens — end-of-TU late_reopt may re-compile. */
-                } else if (sym->type.ref->f.tu_static_writer) {
-                  /* Keep tokens — TU-wide DSE may flag this for re-compile. */
-                } else {
-                  /* Not promoted: prevent gen_inline_functions re-compilation. */
-                  tok_str_free(fn->func_str);
-                  fn->func_str = NULL;
-                  fn->sym = NULL;
-                }
-              }
-              else
-              {
-                /* Body exceeds post_opt_inline_cap.  If the function writes a
-                 * non-const static, we still need its tokens for end-of-TU
-                 * re-compilation; preserve them by going through the same
-                 * inline_fns path used for the smaller-body case. */
-                if (tcc_state->opt_dead_store) {
-                  TokenString *compile_ts = tok_str_alloc();
-                  int *buf = tcc_malloc(body_len * sizeof(int));
-                  memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
-                  compile_ts->data.str = buf;
-                  compile_ts->allocated_len = body_len;
-                  compile_ts->len = body_len;
-                  dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
-                  begin_macro(compile_ts, 1);
-                  next();
-                  gen_function(sym);
-                  end_macro();
-                  if (!sym->type.ref->f.tu_static_writer &&
-                      !sym->type.ref->f.func_late_reopt &&
-                      !sym->type.ref->f.func_keep_tokens_for_noreturn) {
-                    /* Not a static writer — discard tokens to save memory. */
-                    tok_str_free(fn->func_str);
-                    fn->func_str = NULL;
-                    fn->sym = NULL;
-                  }
-                } else {
-                  TokenString *ts = fn->func_str;
-                  fn->func_str = NULL;
-                  begin_macro(ts, 1);
-                  next();
-                  gen_function(sym);
-                  end_macro();
-                  tcc_free(fn);
-                }
-              }
-              tok = saved_outer_tok;
-              tokc = saved_outer_tokc;
-            }
-            else
-            {
-              tcc_free(fn);
-            }
-          }
-
-          cur_text_section = saved_text;
-        }
-        else
-        {
-          /* compute text section */
-          cur_text_section = ad.section;
-          if (!cur_text_section)
-            cur_text_section = function_text_section(tcc_state, sym);
-          else if (cur_text_section->sh_num > bss_section->sh_num)
-            cur_text_section->sh_flags = text_section->sh_flags;
-          /* When -fdead-store-elimination is enabled, save the body as a
-           * token stream so the end-of-TU late_reopt pass can re-compile
-           * this function if TU-wide analysis flags it as a writer of a
-           * static global with no reachable readers.  This path covers
-           * functions that auto_inline_sig_ok rejects (e.g., double/long
-           * double params), which would otherwise never reach gen_late_reopt
-           * because they are not in inline_fns.  Bound the saved body
-           * length so very large functions don't pin extra memory. */
-          const int late_reopt_cap = 512;
-          if (tcc_state->opt_dead_store)
-          {
-            struct InlineFunc *fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
-            strcpy(fn->filename, file->filename);
-            fn->sym = sym;
-            fn->func_str = NULL;
-            skip_or_save_block(&fn->func_str);
-            int body_len = fn->func_str ? fn->func_str->len : 0;
-            if (fn->func_str && body_len > 0 && body_len <= late_reopt_cap)
-            {
-              dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
-              TokenString *compile_ts = tok_str_alloc();
-              int *buf = tcc_malloc(body_len * sizeof(int));
-              memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
-              compile_ts->data.str = buf;
-              compile_ts->allocated_len = body_len;
-              compile_ts->len = body_len;
-              int saved_outer_tok = tok;
-              CValue saved_outer_tokc = tokc;
-              tcc_state->had_nested_funcs = 0;
-              begin_macro(compile_ts, 1);
-              next();
-              gen_function(sym);
-              end_macro();
-              tok = saved_outer_tok;
-              tokc = saved_outer_tokc;
-              /* Token-replay cannot reproduce nested function closure
-               * semantics during re-compile; drop tokens in that case.
-               * Otherwise keep only bodies that either write statics for
-               * TU-wide DSE or were speculatively preserved for call-fact
-               * late reopt. */
-              if (tcc_state->had_nested_funcs ||
-                  (!sym->type.ref->f.tu_static_writer &&
-                   !sym->type.ref->f.func_keep_tokens_for_noreturn &&
-                   !sym->type.ref->f.func_late_reopt))
-              {
-                tok_str_free(fn->func_str);
-                fn->func_str = NULL;
-                fn->sym = NULL;
-              }
-            }
-            else
-            {
-              /* Body empty or exceeds the cap: compile via replay (if we
-               * have a saved stream) without inline_fns preservation. */
-              if (fn->func_str)
-              {
-                int saved_outer_tok2 = tok;
-                CValue saved_outer_tokc2 = tokc;
-                TokenString *ts = fn->func_str;
-                fn->func_str = NULL;
-                begin_macro(ts, 1);
-                next();
-                gen_function(sym);
-                end_macro();
-                tok = saved_outer_tok2;
-                tokc = saved_outer_tokc2;
-              }
-              else
-              {
-                gen_function(sym);
-              }
-              tcc_free(fn);
-            }
-          }
-          else
-          {
-            gen_function(sym);
-          }
-          /* Nested functions are now compiled inside gen_function,
-           * before pop_local_syms, so parent locals are still accessible. */
-        }
+        if (!defer_function_body(sym, ad.section))
+          define_global_function(sym, ad.section);
         break;
       }
       else

@@ -42,6 +42,7 @@ ST_DATA CValue tokc;
 ST_DATA const int *macro_ptr;
 ST_DATA CString tokcstr; /* current parsed string, if any */
 ST_DATA TokenString *pp_pragma_capture; /* see tcc.h */
+ST_DATA int pp_pack_captures;           /* see tcc.h */
 
 /* display benchmark infos */
 ST_DATA int tok_ident;
@@ -1912,6 +1913,64 @@ ST_FUNC void pp_apply_pack_replay(TCCState *s1, int code)
   }
 }
 
+/* Apply every deferred #pragma pack action in the saved tokens [P, END) to the
+   live pack state. */
+ST_FUNC void pp_apply_pack_replays(TCCState *s1, const int *p, const int *end)
+{
+  while (p < end)
+  {
+    int t;
+    CValue cv;
+    tok_get(&t, &p, &cv);
+    if (t == TOK_PACK_REPLAY)
+      pp_apply_pack_replay(s1, cv.i);
+  }
+}
+
+/* The #pragma pack state as {depth, stack[0..depth]}.  A saved function body
+   replayed away from its definition (at a call site, or at the end of the TU)
+   lays out its structs under the state it was defined in, not the state around
+   the replay.  pp_pack_snapshot returns a heap copy, or NULL for the default
+   state (the case for nearly every function); pp_pack_enter saves the live
+   state into SAVED (PACK_STACK_SIZE + 1 ints) and installs SNAP, and
+   pp_pack_leave puts SAVED back, so directives inside the body do not leak
+   past the replay. */
+static void pp_pack_install(TCCState *s1, const int *snap)
+{
+  if (!snap)
+  {
+    s1->pack_stack[0] = 0;
+    s1->pack_stack_ptr = s1->pack_stack;
+    return;
+  }
+  memcpy(s1->pack_stack, snap + 1, sizeof(int) * (snap[0] + 1));
+  s1->pack_stack_ptr = s1->pack_stack + snap[0];
+}
+
+ST_FUNC int *pp_pack_snapshot(TCCState *s1)
+{
+  int depth = s1->pack_stack_ptr - s1->pack_stack;
+  if (depth == 0 && s1->pack_stack[0] == 0)
+    return NULL;
+  int *snap = tcc_malloc(sizeof(int) * (depth + 2));
+  snap[0] = depth;
+  memcpy(snap + 1, s1->pack_stack, sizeof(int) * (depth + 1));
+  return snap;
+}
+
+ST_FUNC void pp_pack_enter(TCCState *s1, const int *snap, int *saved)
+{
+  int depth = s1->pack_stack_ptr - s1->pack_stack;
+  saved[0] = depth;
+  memcpy(saved + 1, s1->pack_stack, sizeof(int) * (depth + 1));
+  pp_pack_install(s1, snap);
+}
+
+ST_FUNC void pp_pack_leave(TCCState *s1, const int *saved)
+{
+  pp_pack_install(s1, saved);
+}
+
 #if 0
 #define TOK_GET(t, p, c) tok_get(t, p, c)
 #else
@@ -2599,6 +2658,7 @@ static int pragma_parse(TCCState *s1)
       CValue cv;
       cv.i = ((unsigned)rec_kind << 16) | (rec_value & 0xffff);
       tok_str_add2(pp_pragma_capture, TOK_PACK_REPLAY, &cv);
+      pp_pack_captures++;
     }
   }
   else if (tok == TOK_comment)
@@ -4948,8 +5008,16 @@ restart:
       if (t == TOK_PACK_REPLAY)
       {
         /* deferred #pragma pack action: apply it and stay invisible to the
-           parser by fetching the next real token. */
-        pp_apply_pack_replay(s1, tokc.i);
+           parser by fetching the next real token.  While a replayed body is
+           itself being saved again (skip_or_save_block), keep the action in
+           the new stream instead, as for a directive read from the file. */
+        if (pp_pragma_capture)
+        {
+          tok_str_add2(pp_pragma_capture, TOK_PACK_REPLAY, &tokc);
+          pp_pack_captures++;
+        }
+        else
+          pp_apply_pack_replay(s1, tokc.i);
         goto redo;
       }
       goto convert;

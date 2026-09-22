@@ -1886,6 +1886,7 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_float_narrow), 0, "float-narrow"},
                                     {offsetof(TCCState, opt_inline_functions), 0, "inline-functions"},
                                     {offsetof(TCCState, opt_inline_small), 0, "inline-small-functions"},
+                                    {offsetof(TCCState, opt_inline_called_once), 0, "inline-functions-called-once"},
                                     {offsetof(TCCState, instrument_functions), 0, "instrument-functions"},
                                     {0, 0, NULL}};
 
@@ -2492,6 +2493,7 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_float_narrow = 1;    /* Narrow double math to float when safe */
         s->opt_jump_threading = 1;  /* Jump threading optimization */
         s->opt_inline_small = 1;    /* Inline tiny static/inline functions (≤30 words) */
+        s->opt_inline_called_once = 1; /* Inline static functions called from one place, bodies deferred to TU end */
         if (!s->opt_inline_limit_user)
           s->opt_inline_limit = 30;
       }

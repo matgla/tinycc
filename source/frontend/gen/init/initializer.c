@@ -41,6 +41,8 @@ void skip_or_save_block(TokenString **str)
     *str = tok_str_alloc();
   pp_pragma_capture = str ? *str : saved_capture;
 
+  int recorded_len = 0;
+
   while (1)
   {
     int t = tok;
@@ -57,7 +59,10 @@ void skip_or_save_block(TokenString **str)
         break;
     }
     if (str)
+    {
       tok_str_add_tok(*str);
+      recorded_len = (*str)->len;
+    }
     next();
     if (t == '{' || t == '(' || t == '[')
     {
@@ -72,7 +77,21 @@ void skip_or_save_block(TokenString **str)
   }
   pp_pragma_capture = saved_capture;
   if (str)
+  {
+    /* The lookahead read after the last recorded token (the token after a
+       body's closing brace, or the terminator) ran any #pragma pack in
+       between with capture still on.  Those directives are outside the saved
+       tokens: apply them now, in file order, and drop them from the stream.
+       Left in, `f(){...} #pragma pack(1) struct S {...};` laid S out unpacked
+       and replayed pack(1) whenever f's body was. */
+    if ((*str)->len > recorded_len)
+    {
+      const int *buf = tok_str_buf(*str);
+      pp_apply_pack_replays(tcc_state, buf + recorded_len, buf + (*str)->len);
+      (*str)->len = recorded_len;
+    }
     tok_str_add(*str, TOK_EOF);
+  }
 }
 
 #define EXPR_CONST 1

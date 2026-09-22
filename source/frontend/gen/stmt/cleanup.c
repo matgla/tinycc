@@ -210,10 +210,13 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   inline_ts->data.str = tok_str_buf(inline_fn->func_str);
   inline_ts->allocated_len = 1;
   inline_ts->len = inline_fn->func_str->len;
+  int saved_pack[PACK_STACK_SIZE + 1];
+  pp_pack_enter(tcc_state, inline_fn->pack, saved_pack);
   begin_macro(inline_ts, 2);
   next();
   block(0);
   end_macro();
+  pp_pack_leave(tcc_state, saved_pack);
   inline_restore_label_bindings(inline_label_tokens, saved_inline_labels, nb_inline_label_tokens);
 
   tok = saved_tok;

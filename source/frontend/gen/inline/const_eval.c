@@ -87,6 +87,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
   int success = 0;
   jmp_buf saved_jmp_buf;
   int saved_nb_errors;
+  int saved_pack[PACK_STACK_SIZE + 1];
   void (*saved_error_func)(void *opaque, const char *msg);
   void *saved_error_opaque;
   int saved_overlay_n;
@@ -372,6 +373,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
   ts->data.str = tok_str_buf(fn->func_str);
   ts->allocated_len = 1; /* pretend heap so tok_str_buf returns data.str */
   ts->len = fn->func_str->len;
+  pp_pack_enter(tcc_state, fn->pack, saved_pack);
   begin_macro(ts, 2);
 
   /* Set up error recovery: expressions like x++ on a constant parameter
@@ -600,6 +602,7 @@ cleanup:
    * (e.g. string literals via decl_initializer_alloc) may push extra macro
    * stack entries (unget_tok) that aren't popped before we reach cleanup. */
   end_macro_to(ts);
+  pp_pack_leave(tcc_state, saved_pack);
 
   /* Restore state */
   nocode_wanted = saved_nocode_wanted;

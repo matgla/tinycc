@@ -224,6 +224,8 @@ TEST_FILES = [
     ("test_pure_forward.c", 0),
     # struct stack parts of 3-7 words copied by LDM/STM
     ("test_struct_stack_ldm.c", 0),
+    # static functions with a single call site expand at it (bodies deferred to TU end)
+    ("test_inline_called_once.c", 0),
     # word copies between frame slots fused into LDM/STM chunks
     ("test_frame_block_copy.c", 0),
     ("test_sra.c", 0),
@@ -1204,6 +1206,12 @@ TEST_FILES = [
 
     # C11 _Pragma operator: pack layout via literal + DO_PRAGMA macro idiom.
     ("343_pragma_operator.c", 5),
+
+    # #pragma pack around bodies saved as tokens (static inline, -O1 deferred
+    # and called-once bodies): the token after a body's '}' was read with the
+    # body still capturing, so `f(){} #pragma pack(1) struct S` laid S out
+    # unpacked; replays now use the pack state at the body's definition.
+    ("472_pragma_pack_saved_bodies.c", 0),
 
     # A signed add that absorbed an unsigned (wrapping) inner add kept the
     # no-overflow assumption: `(int)(x + 1U) + 1 < (int)x` folded to false.

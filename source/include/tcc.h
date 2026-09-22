@@ -602,9 +602,11 @@ struct FuncAttr
       func_compiled : 1,                /* gen_function has completed for this sym at least once — distinguishes
                                            forward-declared-not-yet-defined functions from already-emitted ones,
                                            used by late_reopt triggering for inter-procedural noreturn propagation */
-      func_keep_tokens_for_noreturn : 1; /* tokens preserved so end-of-TU noreturn propagation can decide whether to
+      func_keep_tokens_for_noreturn : 1, /* tokens preserved so end-of-TU noreturn propagation can decide whether to
                                             re-emit — separate from func_late_reopt so we don't trigger unnecessary
                                             re-emit before we know if any callee turned out to be noreturn */
+      func_called_once : 1;              /* static, one call site in the TU, address never taken: that site inlines it
+                                            whatever its size (-finline-functions-called-once) */
 };
 
 /* symbol management */
@@ -895,9 +897,22 @@ typedef struct InlineFunc
 {
   TokenString *func_str;
   Sym *sym;
+  int *pack;        /* #pragma pack state at the body (pp_pack_snapshot), NULL = default */
   int inline_count; /* number of auto-inline expansions performed so far (call-heavy budget) */
   char filename[1];
 } InlineFunc;
+
+/* A file-scope function definition whose body is generated at the end of the
+ * TU (gen_deferred_function_bodies): its tokens from the opening '{', and the
+ * section attribute the definition carried. */
+typedef struct DeferredFunc
+{
+  Sym *sym;
+  Section *section;
+  TokenString *body;
+  int *pack; /* #pragma pack state at the body (pp_pack_snapshot), NULL = default */
+  char filename[1];
+} DeferredFunc;
 
 /* nested functions */
 #define MAX_CAPTURED_VARS 32
@@ -1147,6 +1162,8 @@ struct TCCState
   int const_loop_inline_used;
   unsigned char opt_inline_functions; /* -finline-functions: auto-inline small functions at -O2 */
   unsigned char opt_inline_small;     /* -finline-small-functions: auto-inline tiny functions at -O1 */
+  unsigned char opt_inline_called_once; /* -finline-functions-called-once: defer function bodies to the end of the
+                                           TU and inline each static function called from one place there */
   unsigned char opt_ipc;              /* interprocedural constant propagation */
   int opt_inline_limit;               /* -finline-limit=N: token-stream word threshold (default 0=use level default) */
   unsigned char opt_inline_limit_user; /* -finline-limit=N given explicitly: -O levels must not override it */
@@ -1315,6 +1332,18 @@ struct TCCState
      only if referenced */
   struct InlineFunc **inline_fns;
   int nb_inline_fns;
+  /* inline_fns by symbol token, so a call site finds its callee's body without
+   * scanning every entry (inline_fn_lookup). */
+  struct InlineFunc **inline_fn_by_tok;
+  int inline_fn_by_tok_size;
+  int inline_fn_indexed; /* inline_fns entries already in inline_fn_by_tok */
+  /* Function bodies saved at their definition for end-of-TU generation
+   * (-finline-functions-called-once, gen_deferred_function_bodies). */
+  struct DeferredFunc **deferred_fns;
+  int nb_deferred_fns;
+  /* Body length (saved-token ints) the function being generated may still
+   * absorb by expanding called-once functions (called_once_budget_begin). */
+  int called_once_budget;
 
   /* Current function symbol being compiled.  Set by gen_function so IR opt
    * passes can mark the function for end-of-TU re-optimization. */
@@ -2162,6 +2191,9 @@ ST_DATA CString tokcstr; /* current parsed string, if any */
    pack state is applied at the struct's position during replay, not eagerly
    during the recording scan. */
 ST_DATA TokenString *pp_pragma_capture;
+/* Count of #pragma pack actions ever added to a pp_pragma_capture stream: lets
+   a caller of skip_or_save_block tell whether the saved tokens hold any. */
+ST_DATA int pp_pack_captures;
 
 /* display benchmark infos */
 ST_DATA int tok_ident;
@@ -2216,6 +2248,10 @@ ST_FUNC void tok_str_add2(TokenString *s, int t, CValue *cv);
 ST_FUNC void tok_str_add_tok(TokenString *s);
 ST_FUNC void tok_get(int *t, const int **pp, CValue *cv);
 ST_FUNC void pp_apply_pack_replay(TCCState *s1, int code);
+ST_FUNC void pp_apply_pack_replays(TCCState *s1, const int *p, const int *end);
+ST_FUNC int *pp_pack_snapshot(TCCState *s1);
+ST_FUNC void pp_pack_enter(TCCState *s1, const int *snap, int *saved);
+ST_FUNC void pp_pack_leave(TCCState *s1, const int *saved);
 ST_INLN void define_push(int v, int macro_type, int *str, Sym *first_arg);
 ST_FUNC void define_undef(Sym *s);
 ST_INLN Sym *define_find(int v);
