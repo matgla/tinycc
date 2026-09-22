@@ -2097,7 +2097,7 @@ static void ra_alive_build(TCCIRState *ir, RaAliveInfo *info, int max_vreg_pos)
 
 static int ra_may_need_frame_pointer(const TCCIRState *ir)
 {
-  if (tcc_state->force_frame_pointer || tcc_state->force_lr_save)
+  if (tcc_state->force_frame_pointer)
     return 1;
   if (func_var)
     return 1;

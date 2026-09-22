@@ -2352,6 +2352,7 @@ ST_FUNC Sym *global_identifier_push(int v, int t, int c);
 ST_FUNC Sym *external_global_sym(int v, CType *type);
 ST_FUNC Sym *external_helper_sym(int v);
 ST_FUNC void vpush_helper_func(int v);
+ST_FUNC void vpush_return_address(void);
 ST_FUNC void vpush_typed_helper_func(int v, CType *type);
 ST_FUNC void vset(CType *type, int r, int v);
 ST_FUNC void vset_VT_CMP(int op);
@@ -2955,6 +2956,7 @@ ST_FUNC void tcc_gen_machine_nl_longjmp_mop(MachineOperand buf);
 
 /* __builtin_apply_args / __builtin_apply instruction generation */
 ST_FUNC void tcc_gen_machine_builtin_apply_args_mop(MachineOperand dest);
+ST_FUNC void tcc_gen_machine_return_address_mop(MachineOperand dest);
 ST_FUNC void tcc_gen_machine_builtin_apply_mop(MachineOperand fn, MachineOperand args, MachineOperand dest);
 
 /* Block copy from const data to stack (LDM/STM on ARM) */

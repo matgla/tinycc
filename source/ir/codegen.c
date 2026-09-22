@@ -4627,6 +4627,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         SCRATCH_WRAP(tcc_gen_machine_builtin_apply_args_mop(a.dest));
         break;
       }
+      case TCCIR_OP_RETURN_ADDRESS:
+      {
+        MopArgs a = DECODE(.dest = 1);
+        SCRATCH_WRAP(tcc_gen_machine_return_address_mop(a.dest));
+        break;
+      }
       case TCCIR_OP_BUILTIN_APPLY:
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);

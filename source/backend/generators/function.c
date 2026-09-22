@@ -189,8 +189,6 @@ void gen_function(Sym *sym)
   /* -finstrument-functions: emit entry hook call before function body */
   if (tcc_state->instrument_functions && !sym->type.ref->f.func_no_instrument)
   {
-    tcc_state->force_frame_pointer = 1;
-    tcc_state->force_lr_save = 1;
     gen_instrument_call(sym, "__cyg_profile_func_enter");
   }
 
@@ -652,17 +650,8 @@ static void gen_instrument_call(Sym *cur_func_sym, const char *hook_name)
   /* arg0: address of current function */
   vpushsym(&void_ptr_type, cur_func_sym);
 
-  /* arg1: return address (call site) = __builtin_return_address(0)
-   * LR is saved at [FP + PTR_SIZE] in the standard frame record */
-  CType ptr_type;
-  ptr_type.t = VT_VOID;
-  ptr_type.ref = NULL;
-  mk_pointer(&ptr_type);
-  vset(&ptr_type, VT_LOCAL, 0); /* FP value */
-  vpushi(PTR_SIZE);
-  gen_op('+');
-  mk_pointer(&vtop->type);
-  indir();
+  /* arg1: return address (call site) = __builtin_return_address(0) */
+  vpush_return_address();
 
   /* Push the hook function */
   vpush_helper_func(tok_alloc_const(hook_name));

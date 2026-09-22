@@ -859,6 +859,11 @@ void tcc_gen_machine_builtin_apply_args_mop(MachineOperand dest)
   cgstub_record("builtin_apply_args_mop", (TccIrOp)-1, dest, CGSTUB_NO_OP, CGSTUB_NO_OP);
 }
 
+void tcc_gen_machine_return_address_mop(MachineOperand dest)
+{
+  cgstub_record("return_address_mop", (TccIrOp)-1, dest, CGSTUB_NO_OP, CGSTUB_NO_OP);
+}
+
 void tcc_gen_machine_builtin_apply_mop(MachineOperand fn, MachineOperand args, MachineOperand dest)
 {
   cgstub_record("builtin_apply_mop", (TccIrOp)-1, dest, fn, args);

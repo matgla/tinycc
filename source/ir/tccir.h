@@ -242,6 +242,11 @@ typedef enum TccIrOp
   TCCIR_OP_RBIT,  /* reverse bit order (rbit) */
   TCCIR_OP_REV,   /* reverse byte order in a word (rev)  == bswap32 */
   TCCIR_OP_REV16, /* reverse byte order in each halfword (rev16) */
+  /* dest = this function's return address: __builtin_return_address(0).  Read
+   * from the slot the prologue saved LR to, SP-relative, so it needs no frame
+   * pointer.  No sources; its value depends on the call site, so a function
+   * using it is never pure. */
+  TCCIR_OP_RETURN_ADDRESS,
 } TccIrOp;
 
 /* Size (in bytes) at or above which the backend lowers a TCCIR_OP_BLOCK_COPY to

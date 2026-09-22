@@ -1051,6 +1051,7 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
     case TCCIR_OP_BUILTIN_APPLY_ARGS:
     case TCCIR_OP_BUILTIN_APPLY:
     case TCCIR_OP_BUILTIN_RETURN:
+    case TCCIR_OP_RETURN_ADDRESS:
     case TCCIR_OP_VLA_ALLOC:
     case TCCIR_OP_VLA_SP_SAVE:
     case TCCIR_OP_VLA_SP_RESTORE:

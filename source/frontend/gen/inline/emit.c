@@ -531,8 +531,8 @@ InlineFunc *inline_fn_lookup(TCCState *s, Sym *sym)
  * sees every small callee's body before its callers are compiled. */
 
 /* Whether BODY forces a frame pointer on whatever function it ends up in:
- * __builtin_return_address/__builtin_frame_address read the frame record,
- * and alloca moves SP under the locals. */
+ * __builtin_frame_address returns it, and alloca moves SP under the locals.
+ * (__builtin_return_address(0) reads the saved LR off SP and does not.) */
 static int body_forces_frame_pointer(TokenString *body)
 {
   const int *p = tok_str_buf(body), *end = p + body->len;
@@ -541,8 +541,7 @@ static int body_forces_frame_pointer(TokenString *body)
     int t;
     CValue cv;
     tok_get(&t, &p, &cv);
-    if (t == TOK_builtin_return_address || t == TOK_builtin_frame_address || t == TOK_alloca ||
-        t == TOK_builtin_alloca)
+    if (t == TOK_builtin_frame_address || t == TOK_alloca || t == TOK_builtin_alloca)
       return 1;
   }
   return 0;
@@ -552,12 +551,11 @@ static int body_forces_frame_pointer(TokenString *body)
  * it no worse than the call?  The one cost rule: a body that forces a frame
  * pointer would force it on the caller, and a Thumb frame-pointer function
  * addresses its locals at negative offsets from r7, where a load or store
- * only encodes -255..0 -- every other access becomes movw + rsb + ldr.
- * Zig's allocator helpers each read @returnAddress(); expanded into the large
- * functions calling them, they cost zig.c 289 KB of .text, more than all
- * called-once inlining saved.  Lift this once return addresses no longer need
- * a frame pointer (the saved LR sits at a fixed SP offset) and the frame
- * pointer addresses the frame from its bottom, as gcc's does. */
+ * only encodes -255..0 -- every other access becomes movw + rsb + ldr.  When
+ * __builtin_return_address still forced one, zig's allocator helpers
+ * (@returnAddress()) expanded into large callers cost zig.c 289 KB of .text,
+ * more than all called-once inlining saved.  Lift this once the frame pointer
+ * addresses the frame from its bottom, as gcc's does. */
 static int called_once_body_ok(Sym *sym, TokenString *body)
 {
   Sym *ref = sym->type.ref;

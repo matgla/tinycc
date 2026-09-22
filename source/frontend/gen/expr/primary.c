@@ -1103,21 +1103,16 @@ tok_next:
       vpushi(0);
       vtop->type = type;
     }
+    else if (tok1 == TOK_builtin_return_address)
+    {
+      /* level 0: the LR the prologue saved, read off SP */
+      vpush_return_address();
+    }
     else
     {
-      /* level == 0: force standard frame record {FP, LR} */
+      /* __builtin_frame_address(0) is the frame pointer itself */
       tcc_state->force_frame_pointer = 1;
-      if (tok1 == TOK_builtin_return_address)
-        tcc_state->force_lr_save = 1;
       vset(&type, VT_LOCAL, 0); /* FP value */
-      if (tok1 == TOK_builtin_return_address)
-      {
-        /* LR is at [FP + PTR_SIZE] in the standard frame record */
-        vpushi(PTR_SIZE);
-        gen_op('+');
-        mk_pointer(&vtop->type);
-        indir();
-      }
     }
 #else
     /* Non-ARM targets: original chain-walking implementation */

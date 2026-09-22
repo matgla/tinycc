@@ -61,6 +61,8 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "REV";
   case TCCIR_OP_REV16:
     return "REV16";
+  case TCCIR_OP_RETURN_ADDRESS:
+    return "RETURN_ADDRESS";
   case TCCIR_OP_PDIV:
     return "PDIV";
   case TCCIR_OP_UDIV:

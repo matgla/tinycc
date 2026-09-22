@@ -11694,15 +11694,11 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   if (func_var)
     tcc_state->need_frame_pointer = 1;
 
-  /* Also force FP when force_lr_save is set (builtin_return_address). */
-  if (tcc_state->force_lr_save)
-    tcc_state->need_frame_pointer = 1;
-
   const int need_fp = (tcc_state->force_frame_pointer || tcc_state->need_frame_pointer);
   tcc_state->need_frame_pointer = need_fp;
 
-  /* Use two-phase push (standard frame record) when __builtin_return_address
-   * needs a predictable {FP, LR} layout at [FP+0] and [FP+4]. */
+  /* Two-phase push (standard frame record {FP, LR} at [FP+0] and [FP+4]) when
+   * a frame-pointer function also saves LR for __builtin_return_address. */
   const int standard_frame_record = need_fp && tcc_state->force_lr_save;
 
   /* The allocator hands out R7 only when ra_may_need_frame_pointer predicted
@@ -14955,11 +14951,15 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     }
     if (epilogue_stack_dealloc > 0)
       gadd_sp_ex(epilogue_stack_dealloc, R_IP);
-    /* Only pop true callee-saved registers (R4-R11).  R0-R3 may be pushed
-     * for alignment but now hold call arguments — popping them would clobber
-     * the prepared args.  Skip non-callee slots FIRST (they sit at lower
-     * addresses after push), then pop callee-saved from correct position. */
-    uint32_t callee_pop = pushed_registers & 0x0FF0u; /* R4-R11 only */
+    /* Only pop true callee-saved registers (R4-R11), and LR when the prologue
+     * saved it (__builtin_return_address, or LR taken as a scratch): the
+     * callee returns straight to our caller, so LR must hold our return
+     * address again and SP must be back where our caller left it.  R0-R3 may
+     * be pushed for alignment but now hold call arguments — popping them
+     * would clobber the prepared args.  Skip non-callee slots FIRST (they sit
+     * at lower addresses after push), then pop callee-saved from correct
+     * position. */
+    uint32_t callee_pop = pushed_registers & (0x0FF0u | (1u << R_LR));
     uint32_t non_callee = pushed_registers & ~callee_pop & ~(1u << R_LR) & ~(1u << R_PC);
     int non_callee_bytes = __builtin_popcount(non_callee) * 4;
     if (non_callee_bytes > 0)
@@ -16521,6 +16521,27 @@ ST_FUNC void tcc_gen_machine_builtin_apply_args_mop(MachineOperand dest)
   tcc_machine_addr_of_stack_slot(dest_reg, offset, 0 /* not param */);
 
   mach_writeback_dest(&dest, dest_reg);
+  mach_release_all(&ctx);
+}
+
+/* __builtin_return_address(0).  force_lr_save makes every prologue save LR,
+ * and LR is the highest register of its register push, so it sits in the word
+ * just below the argument base: param offset 0 is the pushed r0 of a function
+ * whose r0-r3 are saved first (split struct), else the first stack argument.
+ * A variadic function's offset_to_args also spans its r0-r3 save.  The same
+ * holds for the two-phase {r7, lr} frame record.  Reading the slot off SP
+ * needs no frame pointer, which used to be forced here: a Thumb r7 frame
+ * addresses locals at -255..0, so every other access of a large function
+ * cost movw + rsb + ldr (zig's allocator helpers read @returnAddress()). */
+ST_FUNC void tcc_gen_machine_return_address_mop(MachineOperand dest)
+{
+  MachineCodegenContext ctx = {0};
+  int rd = mach_get_dest_reg(&ctx, &dest, 0);
+  const int adjusted = param_frame_offset(-4 - (func_var ? vararg_push_size : 0));
+  const int base_reg = tcc_state->need_frame_pointer ? R_FP : R_SP;
+  const int sign = adjusted < 0;
+  load_from_base(rd, PREG_REG_NONE, IROP_BTYPE_INT32, 0, sign ? -adjusted : adjusted, sign, (uint32_t)base_reg);
+  mach_writeback_dest(&dest, rd);
   mach_release_all(&ctx);
 }
 
