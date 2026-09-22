@@ -630,6 +630,63 @@ static void run_register_coalescing(TCCIRState *ir)
   }
 }
 
+/* A vreg's index in one array covering VARs, TEMPs and PARAMs, or -1. */
+static int spill_slot_ref_index(const TCCIRState *ir, int32_t vr)
+{
+  if (vr < 0)
+    return -1;
+  const int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  switch (TCCIR_DECODE_VREG_TYPE(vr))
+  {
+  case TCCIR_VREG_TYPE_VAR:
+    return pos < ir->next_local_variable ? pos : -1;
+  case TCCIR_VREG_TYPE_TEMP:
+    return pos < ir->next_temporary_variable ? ir->next_local_variable + pos : -1;
+  case TCCIR_VREG_TYPE_PARAM:
+    return pos < ir->next_parameter ? ir->next_local_variable + ir->next_temporary_variable + pos : -1;
+  default:
+    return -1;
+  }
+}
+
+/* Static references to each linear-scan interval's vreg: every one of a
+ * spilled vreg is a load or store of its slot. */
+static uint32_t *spill_slot_weights(TCCIRState *ir)
+{
+  const int nv = ir->next_local_variable, nt = ir->next_temporary_variable, np = ir->next_parameter;
+  uint32_t *refs = tcc_mallocz(sizeof(uint32_t) * (size_t)(nv + nt + np + 1));
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    const IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    IROperand ops[4];
+    int n = 0;
+    if (irop_config[q->op].has_dest)
+      ops[n++] = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_src1)
+      ops[n++] = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2)
+      ops[n++] = tcc_ir_op_get_src2(ir, q);
+    if (q->op == TCCIR_OP_MLA)
+      ops[n++] = tcc_ir_op_get_accum(ir, q);
+    for (int k = 0; k < n; k++)
+    {
+      const int idx = spill_slot_ref_index(ir, irop_get_vreg(ops[k]));
+      if (idx >= 0)
+        refs[idx]++;
+    }
+  }
+  uint32_t *weights = tcc_malloc(sizeof(uint32_t) * (size_t)(ir->ls.next_interval_index + 1));
+  for (int i = 0; i < ir->ls.next_interval_index; i++)
+  {
+    const int idx = spill_slot_ref_index(ir, (int)ir->ls.intervals[i].vreg);
+    weights[i] = idx >= 0 ? refs[idx] : 0;
+  }
+  tcc_free(refs);
+  return weights;
+}
+
 /* ================================================================== */
 /*  Compute final stack layout: min offsets, compact, move coalescing */
 /* ================================================================== */
@@ -677,7 +734,11 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
       loc = -28;
   }
 
-  tcc_ls_compact_stack_locations(&ir->ls, loc);
+  {
+    uint32_t *weights = spill_slot_weights(ir);
+    tcc_ls_compact_stack_locations_weighted(&ir->ls, loc, weights);
+    tcc_free(weights);
+  }
 
   /* Nested-chain detection + live vreg bitmap + min_stack_loc */
   {

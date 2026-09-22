@@ -145,6 +145,33 @@ static int tcc_ls_reg_type_stack_size(int reg_type)
 
 void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base)
 {
+  tcc_ls_compact_stack_locations_weighted(ls, spill_base, NULL);
+}
+
+typedef struct
+{
+  int old_offset;
+  int size;
+  int new_offset;
+  uint32_t weight;
+} SlotMapEntry;
+
+static const SlotMapEntry *slot_order_map;
+
+/* Coldest per byte first, so the hottest end up lowest: nearest SP.  Ties
+ * keep the order the slots were first met in. */
+static int slot_cold_first(const void *a, const void *b)
+{
+  const int i = *(const int *)a, j = *(const int *)b;
+  const SlotMapEntry *x = &slot_order_map[i], *y = &slot_order_map[j];
+  const uint64_t lx = (uint64_t)x->weight * (uint32_t)y->size, ly = (uint64_t)y->weight * (uint32_t)x->size;
+  if (lx != ly)
+    return lx < ly ? -1 : 1;
+  return i < j ? -1 : i > j;
+}
+
+void tcc_ls_compact_stack_locations_weighted(LSLiveIntervalState *ls, int spill_base, const uint32_t *weights)
+{
   if (!ls)
     return;
 
@@ -159,13 +186,6 @@ void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base)
    * multiple intervals sharing a slot (from regalloc slot reuse) continue
    * to share after compaction.  Without this mapping, each interval would
    * be assigned a fresh slot here, undoing addrtaken slot coalescing. */
-  typedef struct
-  {
-    int old_offset;
-    int size;
-    int new_offset;
-  } SlotMapEntry;
-
   SlotMapEntry *map = tcc_malloc(sizeof(SlotMapEntry) * n);
   int map_count = 0;
 
@@ -177,9 +197,9 @@ void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base)
     ht[i] = -1;
 #define SLOT_HASH(off) (((uint32_t)(off) * 2654435761u) & (ht_size - 1))
 
-  /* Pass 1: collect distinct old offsets in first-encounter order (pass 2
-   * assigns new offsets in that order) and track the max size required at
-   * each (so a slot shared by a 4-byte and an 8-byte interval gets 8). */
+  /* Pass 1: collect distinct old offsets in first-encounter order, the max
+   * size required at each (so a slot shared by a 4-byte and an 8-byte
+   * interval gets 8) and the summed weight. */
   for (int i = 0; i < n; ++i)
   {
     LSLiveInterval *it = &ls->intervals[i];
@@ -190,33 +210,46 @@ void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base)
     unsigned h = SLOT_HASH(it->stack_location);
     while (ht[h] >= 0 && map[ht[h]].old_offset != (int)it->stack_location)
       h = (h + 1) & (ht_size - 1);
-    if (ht[h] >= 0)
-    {
-      if (size > map[ht[h]].size)
-        map[ht[h]].size = size;
-    }
-    else
+    if (ht[h] < 0)
     {
       map[map_count].old_offset = it->stack_location;
       map[map_count].size = size;
       map[map_count].new_offset = 0;
+      map[map_count].weight = 0;
       ht[h] = map_count;
       map_count++;
     }
+    SlotMapEntry *e = &map[ht[h]];
+    if (size > e->size)
+      e->size = size;
+    if (weights)
+      e->weight += weights[i];
   }
 
-  /* Pass 2: assign new offsets in the same order as old offsets were
-   * encountered.  This preserves any relative ordering the codegen
-   * relied on (e.g. adjacent spill slots for LDRD pairs). */
-  int loc = spill_base;
+  /* Pass 2: assign new offsets downwards from spill_base.  Unweighted, in
+   * the order the slots were met; weighted, coldest per byte first, so the
+   * most-used slots sit nearest SP, where [sp, #imm] has its 16-bit form (up
+   * to 1020).  The STRD/LDRD spill-pair peepholes test adjacency themselves. */
+  int *order = tcc_malloc(sizeof(int) * (map_count > 0 ? map_count : 1));
   for (int j = 0; j < map_count; ++j)
+    order[j] = j;
+  if (weights)
   {
-    const int size = map[j].size;
+    slot_order_map = map;
+    qsort(order, map_count, sizeof(int), slot_cold_first);
+    slot_order_map = NULL;
+  }
+  int loc = spill_base;
+  for (int k = 0; k < map_count; ++k)
+  {
+    SlotMapEntry *e = &map[order[k]];
+    const int size = e->size;
     loc = (loc - size) & -size;
     if (loc == 0)
       loc = -size;
-    map[j].new_offset = loc;
+    e->new_offset = loc;
   }
+  tcc_free(order);
 
   /* Pass 3: rewrite each interval's stack_location through the map. */
   for (int i = 0; i < n; ++i)
