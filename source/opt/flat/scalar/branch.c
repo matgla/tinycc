@@ -650,6 +650,146 @@ const IROptGen branch_gens[] = {
 
 const int branch_gens_count = sizeof(branch_gens) / sizeof(branch_gens[0]);
 
+/* Index of a VAR or TEMP in one array covering both, or -1. */
+static int paired_index(const TCCIRState *ir, int32_t vr)
+{
+  if (vr < 0)
+    return -1;
+  const int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+    return pos < ir->next_local_variable ? pos : -1;
+  if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+    return pos < ir->next_temporary_variable ? ir->next_local_variable + pos : -1;
+  return -1;
+}
+
+/* Previous non-NOP instruction, or -1 when there is none or a jump lands
+ * on or between them. */
+static int paired_prev(const TCCIRState *ir, int i)
+{
+  if (ir->compact_instructions[i].is_jump_target)
+    return -1;
+  for (int p = i - 1; p >= 0; p--)
+  {
+    const IRQuadCompact *q = &ir->compact_instructions[p];
+    if (q->op != TCCIR_OP_NOP)
+      return p;
+    if (q->is_jump_target)
+      return -1;
+  }
+  return -1;
+}
+
+/* Whether operand `k` of instruction `u` is a zero test of `vr` (TEST_ZERO,
+ * or CMP against #0) right after an instruction defining `vr`. */
+static int paired_zero_test(const TCCIRState *ir, int u, int k, IROperand op, int32_t vr)
+{
+  const IRQuadCompact *q = &ir->compact_instructions[u];
+  if (k != 1 || irop_get_vreg(op) != vr || !irop_dest_defines_vreg(op) || irop_get_btype(op) == IROP_BTYPE_INT64)
+    return 0;
+  if (q->op == TCCIR_OP_CMP)
+  {
+    IROperand s2 = tcc_ir_op_get_src2(ir, q);
+    if (!irop_is_plain_imm(s2) || irop_get_imm64_ex(ir, s2) != 0)
+      return 0;
+  }
+  else if (q->op != TCCIR_OP_TEST_ZERO)
+    return 0;
+  const int p = paired_prev(ir, u);
+  if (p < 0 || !irop_config[ir->compact_instructions[p].op].has_dest)
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, &ir->compact_instructions[p]);
+  return irop_get_vreg(d) == vr && irop_dest_defines_vreg(d);
+}
+
+/* One `bool t;` for every check of a function, as the Zig C backend writes
+ * them, is read by each check's own zero test right after the SETIF that sets
+ * it: `CMP a,b; t <- SETIF; TEST_ZERO t; JUMPIF`.  setif_branch_fuse wants the
+ * SETIF result read once in the whole function.  Enough is that every read of
+ * t is a zero test right after an instruction defining t (no jump landing in
+ * between): each definition then reaches its own test alone.  Fusing a
+ * quartet removes one definition with its read, so what the table records
+ * holds to the end of the pass. */
+static int setif_paired_fuse(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  const int nv = ir->next_local_variable, nt = ir->next_temporary_variable;
+  uint8_t *unpaired = tcc_mallocz((size_t)(nv + nt + 1));
+  for (int u = 0; u < n; u++)
+  {
+    const IRQuadCompact *q = &ir->compact_instructions[u];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (irop_config[q->op].has_dest)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      const int di = paired_index(ir, irop_get_vreg(d));
+      if (di >= 0 && !irop_dest_defines_vreg(d))
+        unpaired[di] = 1; /* written through: its value is an address */
+    }
+    for (int k = 1; k <= 3; k++)
+    {
+      if ((k == 1 && !irop_config[q->op].has_src1) || (k == 2 && !irop_config[q->op].has_src2) ||
+          (k == 3 && q->op != TCCIR_OP_MLA))
+        continue;
+      IROperand op = k == 1 ? tcc_ir_op_get_src1(ir, q) : k == 2 ? tcc_ir_op_get_src2(ir, q)
+                                                                 : tcc_ir_op_get_accum(ir, q);
+      const int32_t vr = irop_get_vreg(op);
+      const int idx = paired_index(ir, vr);
+      if (idx >= 0 && !paired_zero_test(ir, u, k, op, vr))
+        unpaired[idx] = 1;
+    }
+  }
+
+  int changes = 0;
+  for (int i = 0; i < n; i++)
+  {
+    if (ir->compact_instructions[i].op != TCCIR_OP_CMP)
+      continue;
+    const int si = ir_skip_nops_forward(ir, i + 1, n);
+    const int ti = si < n ? ir_skip_nops_forward(ir, si + 1, n) : n;
+    const int ji = ti < n ? ir_skip_nops_forward(ir, ti + 1, n) : n;
+    if (ji >= n)
+      continue;
+    IRQuadCompact *setif_q = &ir->compact_instructions[si];
+    IRQuadCompact *test_q = &ir->compact_instructions[ti];
+    IRQuadCompact *jump_q = &ir->compact_instructions[ji];
+    if (setif_q->op != TCCIR_OP_SETIF || jump_q->op != TCCIR_OP_JUMPIF || setif_q->is_jump_target ||
+        paired_prev(ir, ji) != ti)
+      continue;
+    IROperand sd = tcc_ir_op_get_dest(ir, setif_q);
+    const int32_t vr = irop_get_vreg(sd);
+    const int idx = paired_index(ir, vr);
+    if (idx < 0 || unpaired[idx] || !irop_dest_defines_vreg(sd))
+      continue;
+    /* The test must be this SETIF's own. */
+    if (!paired_zero_test(ir, ti, 1, tcc_ir_op_get_src1(ir, test_q), vr) || paired_prev(ir, ti) != si)
+      continue;
+    IRLiveInterval *li = tcc_ir_get_live_interval(ir, vr);
+    if (!li || li->addrtaken || li->is_volatile)
+      continue;
+
+    IROperand jump_src1 = tcc_ir_op_get_src1(ir, jump_q);
+    const int setif_tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, setif_q));
+    const int jump_tok = (int)irop_get_imm64_ex(ir, jump_src1);
+    int new_tok;
+    if (jump_tok == 0x94)
+      new_tok = invert_cond_token(setif_tok);
+    else if (jump_tok == 0x95)
+      new_tok = setif_tok;
+    else
+      continue;
+    if (new_tok < 0)
+      continue;
+    tcc_ir_set_src1(ir, ji, irop_make_imm32(-1, new_tok, irop_get_btype(jump_src1)));
+    setif_q->op = TCCIR_OP_NOP;
+    test_q->op = TCCIR_OP_NOP;
+    changes++;
+  }
+  tcc_free(unpaired);
+  return changes;
+}
+
 int tcc_ir_opt_setif_branch_fuse(TCCIRState *ir)
 {
   if (ir->next_instruction_index < 4)
@@ -658,6 +798,7 @@ int tcc_ir_opt_setif_branch_fuse(TCCIRState *ir)
   tcc_ir_opt_ctx_init(&ctx, ir);
   int changes = tcc_ir_opt_run_gens(&ctx, branch_gens, branch_gens_count);
   tcc_ir_opt_ctx_free(&ctx);
+  changes += setif_paired_fuse(ir);
   return changes;
 }
 

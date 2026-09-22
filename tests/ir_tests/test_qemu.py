@@ -242,6 +242,8 @@ TEST_FILES = [
     ("test_stack_params_in_regs.c", 0),
     # objects declared first and defined later are laid out once; their bytes are not folded early
     ("test_tentative_definitions.c", 0),
+    # a small struct returned in r0 is read back masked, and one bool per check fuses into the branch
+    ("test_errunion_bool_checks.c", 0),
     # word copies between frame slots fused into LDM/STM chunks
     ("test_frame_block_copy.c", 0),
     ("test_sra.c", 0),

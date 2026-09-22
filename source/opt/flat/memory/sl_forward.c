@@ -1460,6 +1460,41 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                 break;
               }
             }
+            /* The same when a use needs the narrow value itself: forward the
+             * stored value zero-extended, `dest <- value AND #mask`.  Unsigned
+             * loads only (every such one in Zig's C: a struct of at most a
+             * word returned in r0, an error union `{ uint16_t error; }`, is
+             * stored to its return slot and read back as its field).  The
+             * bits of r0 above such a result are unspecified (AAPCS), so the
+             * mask is needed anyway. */
+            if (store_bits > 0 && load_bits > 0 && store_bits > load_bits && store_bits <= 32 &&
+                (e->store_btype == IROP_BTYPE_INT32 || e->store_btype == IROP_BTYPE_INT16) &&
+                (src1.btype == IROP_BTYPE_INT16 || src1.btype == IROP_BTYPE_INT8) && src1.is_unsigned &&
+                q->op == TCCIR_OP_LOAD && irop_get_vreg(e->stored_value) >= 0 &&
+                !irop_op_is_lval(e->stored_value) && irop_get_vreg(tcc_ir_op_get_dest(ir, q)) >= 0)
+            {
+              LOG_SL_FWD("LOAD@i=%d FORWARD-NARROW-MASK: store@i=%d store_bits=%d load_bits=%d", i,
+                         e->instruction_idx, store_bits, load_bits);
+              IROperand load_dest = tcc_ir_op_get_dest(ir, q);
+              IROperand value = e->stored_value;
+              tcc_ir_pool_ensure(ir, 3);
+              int base = ir->iroperand_pool_count;
+              tcc_ir_pool_add(ir, load_dest);
+              tcc_ir_pool_add(ir, value);
+              tcc_ir_pool_add(ir, irop_make_imm32(-1, (int32_t)((1u << load_bits) - 1), IROP_BTYPE_INT32));
+              q->op = TCCIR_OP_AND;
+              q->operand_base = base;
+              if (fwd_store_count < SL_FWD_MAX_DEAD_STORES && !e->addr_addrtaken &&
+                  irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[e->instruction_idx])) < 0)
+              {
+                fwd_stores[fwd_store_count].store_idx = e->instruction_idx;
+                fwd_stores[fwd_store_count].offset = e->local_offset;
+                fwd_stores[fwd_store_count].sym = e->local_sym;
+                fwd_store_count++;
+              }
+              changes++;
+              break;
+            }
             LOG_SL_FWD("LOAD@i=%d REJECT width: store btype=%d vs load btype=%d (store at i=%d)", i,
                        (int)e->store_btype, (int)src1.btype, e->instruction_idx);
             rejected_width++;
@@ -2944,6 +2979,12 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
     /* Check if the store was already NOP'd (e.g. by a later store overwrite) */
     if (ir->compact_instructions[store_idx].op == TCCIR_OP_NOP)
       continue;
+    /* Bytes the store writes: a reader starting inside them still reads it
+     * (the high half of a word, forwarded only in its low half). */
+    int store_w = ir_opt_store_btype_size_bytes(
+        irop_get_btype(tcc_ir_op_get_dest(ir, &ir->compact_instructions[store_idx])));
+    if (store_w <= 0)
+      store_w = 1024;
 
     for (int j = 0; j < n && !still_read; j++)
     {
@@ -2970,6 +3011,8 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
     if ((op).is_local && irop_get_sym_ex(ir, (op)) == sym)                                                             \
     {                                                                                                                  \
       int64_t _roff = irop_get_imm64_ex(ir, (op));                                                                     \
+      if (_roff > off && _roff < off + store_w)                                                                        \
+        still_read = 1;                                                                                                \
       if (_roff != off && _roff <= off)                                                                                \
       {                                                                                                                \
         int _w = 4;                                                                                                    \
