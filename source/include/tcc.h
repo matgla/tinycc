@@ -562,9 +562,14 @@ struct SymAttr
                                      by tcc_ir_tu_analyze_dead_statics; read
                                      by dead-static-store-elim during the
                                      end-of-TU late_reopt phase. */
-      param_volatile : 1;         /* original parameter declaration was volatile
+      param_volatile : 1,         /* original parameter declaration was volatile
                                      before function-type normalization stripped
                                      top-level qualifiers. */
+      tentative : 1;              /* file-scope object declared without an
+                                     initializer, whose definition may still
+                                     follow: its bytes are not its value yet.
+                                     Cleared by the definition or at the end
+                                     of the TU (finalize_tentative_definitions). */
 };
 
 /* function attributes or temporary attributes for parsing */
@@ -1341,6 +1346,10 @@ struct TCCState
    * (-finline-functions-called-once, gen_deferred_function_bodies). */
   struct DeferredFunc **deferred_fns;
   int nb_deferred_fns;
+  /* Objects declared without an initializer at file scope, settled at the end
+   * of the TU (finalize_tentative_definitions). */
+  struct Sym **tentative_syms;
+  int nb_tentative_syms;
   /* Body length (saved-token ints) the function being generated may still
    * absorb by expanding called-once functions (called_once_budget_begin). */
   int called_once_budget;

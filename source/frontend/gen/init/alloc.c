@@ -427,6 +427,56 @@ static int type_contains_pointer(CType *type)
    are parsed. If 'v' is zero, then a reference to the new object
    is put in the value stack. If 'has_init' is 2, a special parsing
    is done to handle string constants. */
+/* A definition's storage: the bytes its tentative declaration already took,
+ * when they fit -- same section, same size, suitably aligned.  Zig's C
+ * declares every static first and defines it further down, so without this
+ * each object is laid out twice. */
+static int tentative_storage_reuse(Sym *sym, int has_init, Section *sec, int size, int align, int *addr)
+{
+  if (!sym || !has_init || !sym->a.tentative || !sym->c)
+    return 0;
+  ElfSym *esym = elfsym(sym);
+  if (!esym || esym->st_shndx != sec->sh_num || esym->st_size != (addr_t)size || (esym->st_value & (align - 1)))
+    return 0;
+  *addr = (int)esym->st_value;
+  return 1;
+}
+
+/* The end of the TU: every definition has been seen.  A tentative definition
+ * none of them initialized is a zero-filled one (C11 6.9.2p2); if it waits in
+ * COMMON it is placed in .bss, unless a non-static object may stay common
+ * (-fcommon).  Runs before the deferred bodies are generated, so they see
+ * every object where it stays. */
+ST_FUNC void finalize_tentative_definitions(TCCState *s1)
+{
+  /* File scope, whatever the last body generated here left behind (a body
+   * ending in unreachable code leaves code, and so data, switched off). */
+  const int saved_nocode_wanted = nocode_wanted;
+  nocode_wanted = DATA_ONLY_WANTED;
+  for (int i = 0; i < s1->nb_tentative_syms; i++)
+  {
+    Sym *sym = s1->tentative_syms[i];
+    sym->a.tentative = 0;
+    ElfSym *esym = sym->c ? elfsym(sym) : NULL;
+    if (!esym || esym->st_shndx != SHN_COMMON)
+      continue;
+    if (!(sym->type.t & VT_STATIC) && !s1->nocommon)
+      continue;
+    const unsigned long size = esym->st_size;
+    const int align = (int)esym->st_value;
+    put_extern_sym(sym, bss_section, section_add(bss_section, size, align), size);
+  }
+  nocode_wanted = saved_nocode_wanted;
+  free_tentative_definitions(s1);
+}
+
+ST_FUNC void free_tentative_definitions(TCCState *s1)
+{
+  tcc_free(s1->tentative_syms);
+  s1->tentative_syms = NULL;
+  s1->nb_tentative_syms = 0;
+}
+
 void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, int v, int global)
 {
   int size, align, addr;
@@ -687,6 +737,14 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
   else
   {
     sym = NULL;
+    /* A file-scope object without an initializer is a tentative definition
+     * (C11 6.9.2): the definition may still follow, or it is zero-filled at
+     * the end of the TU (finalize_tentative_definitions). */
+    const int tentative = v && global && !has_init
+#ifdef CONFIG_TCC_BCHECK
+                          && !bcheck
+#endif
+        ;
     if (v && global)
     {
       /* see if the symbol was already defined */
@@ -736,13 +794,16 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
         /*if (tcc_state->g_debug & 4)
             tcc_warning("rw data: %s", get_tok_str(v, 0));*/
       }
-      else if (tcc_state->nocommon)
+      /* A tentative one waits in COMMON: its definition would move it to
+       * .data, leaving the .bss bytes it took unused. */
+      else if (tcc_state->nocommon && !tentative)
         sec = bss_section;
     }
 
     if (sec)
     {
-      addr = section_add(sec, size, align);
+      if (!tentative_storage_reuse(sym, has_init, sec, size, align, &addr))
+        addr = section_add(sec, size, align);
 #ifdef CONFIG_TCC_BCHECK
       /* add padding if bound check */
       if (bcheck)
@@ -765,6 +826,13 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
       }
       /* update symbol definition */
       put_extern_sym(sym, sec, addr, size);
+      if (tentative && !sym->a.tentative)
+      {
+        sym->a.tentative = 1;
+        dynarray_add(&tcc_state->tentative_syms, &tcc_state->nb_tentative_syms, sym);
+      }
+      else if (!tentative)
+        sym->a.tentative = 0;
     }
     else
     {

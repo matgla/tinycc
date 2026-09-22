@@ -271,8 +271,8 @@ const char *ir_opt_get_constant_string_from_symref(TCCIRState *ir, IROperand op)
     return NULL;
 
   sym = symref->sym;
-  if (!sym)
-    return NULL;
+  if (!sym || sym->a.tentative)
+    return NULL; /* a tentative definition's bytes are not its value yet */
 
   esym = elfsym(sym);
   if (!esym)

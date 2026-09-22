@@ -37,8 +37,8 @@ static const uint8_t *ir_opt_get_rodata_bytes(TCCIRState *ir, IROperand op, size
     return NULL;
 
   sym = symref->sym;
-  if (!sym)
-    return NULL;
+  if (!sym || sym->a.tentative)
+    return NULL; /* a tentative definition's bytes are not its value yet */
 
   esym = elfsym(sym);
   if (!esym)

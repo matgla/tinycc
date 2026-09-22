@@ -443,6 +443,8 @@ int unary_paren(void);
 /* --- init/alloc.c --- */
 void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, int vreg);
 void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, int v, int global);
+ST_FUNC void finalize_tentative_definitions(TCCState *s1);
+ST_FUNC void free_tentative_definitions(TCCState *s1);
 
 /* --- init/initializer.c --- */
 void decl_design_flex(init_params *p, Sym *ref, int index);

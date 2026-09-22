@@ -124,7 +124,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
      * are typically zero with a pending relocation (e.g. static T *p = &x),
      * so reading raw bytes would yield a bogus null value. */
     if ((args[i].r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM | VT_LVAL) && args[i].sym &&
-        !args[i].sym->a.possibly_written && !(args[i].type.t & (VT_ARRAY | VT_VLA)))
+        !args[i].sym->a.possibly_written && !args[i].sym->a.tentative && !(args[i].type.t & (VT_ARRAY | VT_VLA)))
     {
       int btype = args[i].type.t & VT_BTYPE;
       if (btype == VT_BYTE || btype == VT_SHORT || btype == VT_INT || btype == VT_LLONG || btype == VT_BOOL)

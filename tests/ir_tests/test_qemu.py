@@ -240,6 +240,8 @@ TEST_FILES = [
     ("test_entry_store_var_walk.c", 0),
     # stack-passed parameters read more than once are loaded into registers by the prologue
     ("test_stack_params_in_regs.c", 0),
+    # objects declared first and defined later are laid out once; their bytes are not folded early
+    ("test_tentative_definitions.c", 0),
     # word copies between frame slots fused into LDM/STM chunks
     ("test_frame_block_copy.c", 0),
     ("test_sra.c", 0),

@@ -225,6 +225,9 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
   next();
   decl(VT_CONST);
+  /* Every definition has been seen: settle the tentative ones before any
+   * deferred body addresses them. */
+  finalize_tentative_definitions(s1);
   /* Bodies saved for -finline-functions-called-once: generate them now that
    * every call site in the TU is known. */
   gen_deferred_function_bodies(s1);
@@ -330,6 +333,7 @@ ST_FUNC void tccgen_finish(TCCState *s1)
      would have freed. */
   inline_release_hidden_label_bindings();
   free_deferred_functions(s1);
+  free_tentative_definitions(s1);
 
   str_lit_pool_free();
 

@@ -534,7 +534,8 @@ tok_next:
     /* Recognize compile-time-constant lvalue accesses to read-only data.
      * For example, string literal subscript "hi"[0] is a compile-time
      * constant even though it presents as an lvalue (VT_LVAL set). */
-    if (n == 0 && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_LVAL | VT_SYM) && vtop->sym)
+    if (n == 0 && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_LVAL | VT_SYM) && vtop->sym &&
+        !vtop->sym->a.tentative)
     {
       ElfSym *esym = elfsym(vtop->sym);
       if (esym && esym->st_shndx > 0 && esym->st_shndx < tcc_state->nb_sections)
@@ -1805,7 +1806,7 @@ tok_next:
        * initializers. */
       if ((s->type.t & VT_CONSTANT) && !(s->type.t & VT_VOLATILE) && !(s->type.t & VT_ARRAY) && !(s->type.t & VT_VLA) &&
           (s->type.t & VT_BTYPE) != VT_FUNC && (s->type.t & VT_BTYPE) != VT_STRUCT &&
-          (s->type.t & VT_BTYPE) != VT_PTR && s->c > 0)
+          (s->type.t & VT_BTYPE) != VT_PTR && s->c > 0 && !s->a.tentative)
       {
         ElfSym *esym = elfsym(s);
         if (esym && esym->st_shndx != SHN_UNDEF && esym->st_shndx != SHN_COMMON &&

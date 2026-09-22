@@ -72,7 +72,7 @@ ST_FUNC void indir(void)
    * only under nocode_wanted (speculative try_inline_const_eval) so regular
    * code generation is unaffected. */
   if (nocode_wanted && (vtop->r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM | VT_LVAL) && vtop->sym &&
-      !vtop->sym->a.possibly_written && !(vtop->type.t & (VT_ARRAY | VT_VLA)))
+      !vtop->sym->a.possibly_written && !vtop->sym->a.tentative && !(vtop->type.t & (VT_ARRAY | VT_VLA)))
   {
     int btype = vtop->type.t & VT_BTYPE;
     if (btype == VT_BYTE || btype == VT_SHORT || btype == VT_INT || btype == VT_LLONG || btype == VT_BOOL ||
