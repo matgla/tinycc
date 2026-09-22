@@ -437,6 +437,13 @@ void tcc_gen_machine_spill_block_copy(int32_t src_spill_off, int32_t dst_spill_o
   cgstub_push("spill_block_copy", (TccIrOp)-1, MACH_OP_NONE, -1, MACH_OP_NONE, -1, MACH_OP_NONE, -1, nwords, 0);
 }
 
+/* Conservative: every call reloads R9, as before the reload analysis. */
+int tcc_gen_machine_calls_reload_r9(struct TCCIRState *ir)
+{
+  (void)ir;
+  return 1;
+}
+
 /* No free-register plan in the stub: callers fall back to their other paths. */
 int tcc_gen_machine_spill_block_copy_free(int32_t src_spill_off, int32_t dst_spill_off, int nwords, uint32_t also_free)
 {

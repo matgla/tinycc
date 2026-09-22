@@ -2393,9 +2393,9 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         save_regs++; /* R9 */
       ir->call_nested_save_size = save_regs * 4;
     }
-    else if (call_count >= 1 && tcc_state->text_and_data_separation)
+    else if (call_count >= 1 && tcc_state->text_and_data_separation && tcc_gen_machine_calls_reload_r9(ir))
     {
-      ir->call_nested_save_size = 4; /* R9 only */
+      ir->call_nested_save_size = 4; /* R9 only: its one reader is a call's reload */
     }
     else
     {

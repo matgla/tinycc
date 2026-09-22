@@ -2926,6 +2926,7 @@ ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROp
 
 /* Block copy between spill slots using LDM/STM (peephole for consecutive LOAD+STORE pairs) */
 ST_FUNC void tcc_gen_machine_spill_block_copy(int32_t src_spill_off, int32_t dst_spill_off, int nwords);
+ST_FUNC int tcc_gen_machine_calls_reload_r9(struct TCCIRState *ir);
 ST_FUNC int tcc_gen_machine_spill_block_copy_free(int32_t src_spill_off, int32_t dst_spill_off, int nwords,
                                                   uint32_t also_free);
 

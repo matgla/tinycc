@@ -11644,6 +11644,29 @@ ST_FUNC void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op)
   mach_release_all(&ctx);
 }
 
+static int thumb_callee_in_this_module(const MachineOperand *func_mop);
+
+/* Does some call of the function reload R9 from its save slot afterwards --
+ * the only reader of the slot the prologue stores it to: one through a
+ * pointer, a __builtin_apply, or a direct call to a callee not known to be in
+ * this module (restore_r9 at the call site). */
+ST_FUNC int tcc_gen_machine_calls_reload_r9(TCCIRState *ir)
+{
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_BUILTIN_APPLY)
+      return 1;
+    if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+      continue;
+    IROperand fn = tcc_ir_op_get_src1(ir, q);
+    MachineOperand m = machine_op_from_ir(ir, &fn);
+    if (!thumb_callee_in_this_module(&m))
+      return 1;
+  }
+  return 0;
+}
+
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size, uint32_t extra_prologue_regs)
 {
   thumb_gen_state.function_argument_count = 0;
@@ -11920,7 +11943,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    * one call under text_and_data_separation (ir/codegen.c, where the area is
    * sized), so it is the same guard in both codegen passes — and R9 is saved
    * at every one of those call sites, so slot 0 is always reserved for it. */
-  if (tcc_state->text_and_data_separation && ir && ir->call_nested_save_size > 0)
+  if (tcc_state->text_and_data_separation && ir && ir->call_nested_save_size > 0 && tcc_gen_machine_calls_reload_r9(ir))
   {
     const int r9_slot_offset = ir->call_outgoing_size;
     if (tcc_state->func_dynamic_sp)
