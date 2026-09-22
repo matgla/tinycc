@@ -227,45 +227,36 @@ uint32_t caller_saved_registers;
 uint32_t pushed_registers;
 int allocated_stack_size;
 int epilogue_stack_dealloc;     /* total SUB SP amount to restore in epilogue (includes alignment pad) */
-int callee_push_size = 0;       /* bytes pushed BELOW FP in two-phase push */
-uint32_t callee_saved_regs = 0; /* register mask for second push (below FP) */
 int vararg_push_size = 0;       /* bytes pushed for variadic r0-r3 save (16 or 0) */
 
-/* Adjust a local/spill frame offset.
- *
- * When FP is used with two-phase push: adjusts by callee_push_size (regs
- * pushed below FP).
- *
- * When FP is omitted: converts FP-relative negative offsets to SP-relative
- * positive offsets.  The alignment pad sits at the top of the SUB SP region
- * (right below pushed regs), so locals are addressed relative to
- * allocated_stack_size (without pad):
- * FP + frame_offset = SP + allocated_stack_size + frame_offset. */
 /* Bytes the real run's scratch PUSHes have currently moved SP below its
  * steady-state position (see get_scratch_reg_with_save).  Defined after the
  * scratch bookkeeping state below. */
 static int scratch_push_sp_bias(void);
 
+/* Convert a local/spill frame offset (IR view: negative, counted down from
+ * the top of the frame) into an offset from the frame base register.
+ *
+ * The base is SP, or the frame pointer, which the prologue sets to the SP it
+ * leaves (the bottom of the frame, as gcc's r7 does) -- so the two agree:
+ * locals occupy base+0 .. base+allocated_stack_size-1, and the alignment pad
+ * sits above them, below the pushed registers:
+ *     top + frame_offset = base + allocated_stack_size + frame_offset.
+ * Offsets off the frame pointer are positive, so a Thumb load/store encodes
+ * them directly up to 4095 (16-bit to 124).  A frame pointer at the top of
+ * the frame, as before, only reached -255 without movw + rsb.  Off SP, a
+ * scratch PUSH inside the current instruction has moved SP down: without the
+ * bias every access in the push window reads/writes 4 bytes low per active
+ * push (struct_byval fuzz seed 6105: LDR of a by-value field between
+ * push {r0} and pop {r0}). */
 static inline int fp_adjust_local_offset(int frame_offset, int is_param)
 {
-  if (is_param)
+  if (is_param || frame_offset > 0)
     return frame_offset;
-
-  if (!tcc_state->need_frame_pointer && frame_offset <= 0)
-  {
-    /* Convert FP-relative (negative) to SP-relative (positive).
-     * FP + frame_offset = SP + allocated_stack_size + frame_offset.
-     * A scratch PUSH inside the current instruction has moved SP down;
-     * without the bias every access in the push window reads/writes 4
-     * bytes low per active push (struct_byval fuzz seed 6105: LDR of a
-     * by-value field between push {r0} and pop {r0}). */
-    return allocated_stack_size + scratch_push_sp_bias() + frame_offset;
-  }
-
-  if (frame_offset < 0 && callee_push_size > 0)
-    return frame_offset - callee_push_size;
-
-  return frame_offset;
+  int off = allocated_stack_size + frame_offset;
+  if (!tcc_state->need_frame_pointer)
+    off += scratch_push_sp_bias();
+  return off;
 }
 
 /* Offset from the frame base register (FP, or SP when there is none) of byte
@@ -382,11 +373,12 @@ static int resolve_chain_base(TCCIRState *ir, int ci, uint32_t exclude_regs, Scr
   }
 
   /* Multi-hop: follow chain through (depth - 1) intermediate frames.
-   * Each frame saves its incoming R10 at [FP - 4] (CHAIN_SLOT_OFFSET). */
+   * Each frame saves its incoming R10 at frame offset -4 (CHAIN_SLOT_OFFSET),
+   * i.e. 4 below the frame top that the chain points at. */
   *out_scratch = get_scratch_reg_with_save(exclude_regs);
   *used_scratch = 1;
 
-  /* Start from R10 (points to immediate parent's FP) */
+  /* Start from R10 (points to immediate parent's frame top) */
   thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
   ot_check_mov_reg(out_scratch->reg, architecture_config.static_chain_reg, flags_safe(), no_shift,
                    ENFORCE_ENCODING_NONE, false);
@@ -11697,10 +11689,6 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   const int need_fp = (tcc_state->force_frame_pointer || tcc_state->need_frame_pointer);
   tcc_state->need_frame_pointer = need_fp;
 
-  /* Two-phase push (standard frame record {FP, LR} at [FP+0] and [FP+4]) when
-   * a frame-pointer function also saves LR for __builtin_return_address. */
-  const int standard_frame_record = need_fp && tcc_state->force_lr_save;
-
   /* The allocator hands out R7 only when ra_may_need_frame_pointer predicted
    * no frame pointer; a function that reaches here needing FP with R7
    * allocated means the prediction missed a forcing condition, and silently
@@ -11717,7 +11705,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
     if (tcc_state->text_and_data_separation && i == R9)
       continue;
     if (i == R_FP && need_fp)
-      continue; /* r7 is the frame base; pushed via frame_regs instead */
+      continue; /* r7 is the frame base; pushed below with LR */
     if (used_registers & (1ULL << i))
     {
       callee_regs_local |= (1 << i);
@@ -11743,117 +11731,55 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
   int push_align_pad = 0; /* 4 if push count is odd, absorbed into SUB SP */
 
-  if (standard_frame_record)
-  {
-    /* ── Two-phase push: frame record {r7, lr} then callee-saved ──
-     * Layout: [FP+0]=old_FP, [FP+4]=LR, callee-saved below FP. */
-    uint16_t frame_regs = (1 << R_FP);
-    int frame_count = 1;
-    if (save_lr)
-    {
-      frame_regs |= (1 << R_LR);
-      frame_count++;
-    }
+  uint16_t registers_to_push = callee_regs_local;
+  int registers_count = callee_count;
 
-    /* Pad total to even count for 8-byte alignment (AAPCS).
-     * Standard frame record uses FP-relative negative offsets (e.g. static
-     * chain at [FP-4]), so the alignment gap must stay as SUB SP space
-     * below FP — cannot use a dummy push register here. */
-    int total = frame_count + callee_count;
-    if (total % 2 != 0)
+  if (save_lr)
+  {
+    registers_to_push |= (1 << R_LR);
+    registers_count++;
+  }
+  if (need_fp)
+  {
+    registers_to_push |= (1 << R_FP);
+    registers_count++;
+  }
+
+  /* Keep the total push size 8-byte aligned (AAPCS).
+   * When there are no locals (stack_size == 0), pad by pushing a dummy low
+   * register (R3) — avoids SUB SP + ADD SP, saving 2 insns.  When locals
+   * exist, absorb the gap into SUB SP instead, keeping PUSH in 16-bit
+   * encoding (no high regs like R12). */
+  if (registers_count % 2 != 0)
+  {
+    if (stack_size == 0)
+    {
+      registers_to_push |= (1 << R3);
+      registers_count++;
+    }
+    else
     {
       push_align_pad = 4;
     }
-
-    map_sym_t();
-
-    /* Variadic, or a parameter straddling r3 and the stack: push r0-r3 FIRST
-     * so they are contiguous with the stack args. */
-    vararg_push_size = 0;
-    if (func_var || (ir && ir->push_arg_regs))
-    {
-      ot_check(th_push((1 << R0) | (1 << R1) | (1 << R2) | (1 << R3)));
-      vararg_push_size = 16;
-    }
-
-    /* Phase A: push frame record */
-    ot_check(th_push(frame_regs));
-
-    /* MOV r7, sp — FP points at the frame record */
-    if (!ot(th_add_imm(R_FP, R_SP, 0, flags_safe(), ENFORCE_ENCODING_NONE)))
-    {
-      fprintf(stderr, "compiler_error: prolog frame pointer setup failed\n");
-      exit(1);
-    }
-
-    /* Phase B: push callee-saved regs (below FP) */
-    if (callee_count > 0)
-      ot_check(th_push(callee_regs_local));
-
-    callee_push_size = callee_count * 4;
-    callee_saved_regs = callee_regs_local;
-    /* Parameter offsets count from the stack arguments, or from the pushed r0
-     * for an in-place split struct (tcc_ir_params_process_struct). */
-    offset_to_args = frame_count * 4 + (func_var ? vararg_push_size : 0);
-    pushed_registers = frame_regs | callee_regs_local;
   }
-  else
+
+  map_sym_t();
+
+  /* Variadic, or a parameter straddling r3 and the stack: push r0-r3 FIRST
+   * so they are contiguous with the stack args. */
+  vararg_push_size = 0;
+  if (func_var || (ir && ir->push_arg_regs))
   {
-    /* ── Original single-push layout ── */
-    uint16_t registers_to_push = callee_regs_local;
-    int registers_count = callee_count;
-
-    if (save_lr)
-    {
-      registers_to_push |= (1 << R_LR);
-      registers_count++;
-    }
-    if (need_fp)
-    {
-      registers_to_push |= (1 << R_FP);
-      registers_count++;
-    }
-
-    /* Keep the total push size 8-byte aligned (AAPCS).
-     * When no locals/FP (stack_size == 0, no frame pointer), pad by pushing
-     * a dummy low register (R3) — avoids SUB SP + ADD SP, saving 2 insns.
-     * When FP is used, alignment pad must stay as SUB SP space because
-     * FP-relative negative offsets may address that area.
-     * When locals exist, absorb the gap into SUB SP instead, keeping
-     * PUSH in 16-bit encoding (no high regs like R12). */
-    if (registers_count % 2 != 0)
-    {
-      if (stack_size == 0 && !need_fp)
-      {
-        registers_to_push |= (1 << R3);
-        registers_count++;
-      }
-      else
-      {
-        push_align_pad = 4;
-      }
-    }
-
-    map_sym_t();
-
-    /* Variadic, or a parameter straddling r3 and the stack: push r0-r3 FIRST
-     * so they are contiguous with the stack args. */
-    vararg_push_size = 0;
-    if (func_var || (ir && ir->push_arg_regs))
-    {
-      ot_check(th_push((1 << R0) | (1 << R1) | (1 << R2) | (1 << R3)));
-      vararg_push_size = 16;
-    }
-
-    offset_to_args = registers_count * 4 + (func_var ? vararg_push_size : 0);
-
-    if (registers_count > 0)
-      ot_check(th_push(registers_to_push));
-
-    pushed_registers = registers_to_push;
-    callee_push_size = 0;
-    callee_saved_regs = 0;
+    ot_check(th_push((1 << R0) | (1 << R1) | (1 << R2) | (1 << R3)));
+    vararg_push_size = 16;
   }
+
+  offset_to_args = registers_count * 4 + (func_var ? vararg_push_size : 0);
+
+  if (registers_count > 0)
+    ot_check(th_push(registers_to_push));
+
+  pushed_registers = registers_to_push;
 
   // allocate stack space for local variables
   /* Variadic save area is reserved in the IR stack layout (loc bias). */
@@ -11874,32 +11800,30 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   int total_stack_dealloc = stack_size + push_align_pad;
   epilogue_stack_dealloc = total_stack_dealloc;
   stack_size = total_stack_dealloc;
-  if (tcc_state->need_frame_pointer && !standard_frame_record)
-  {
-    if (!ot(th_add_imm(R_FP, R_SP, 0, flags_safe(), ENFORCE_ENCODING_NONE)))
-    {
-      // todo mov fp, sp
-      // load r12 immediate
-      // add fp, sp, r12
-      fprintf(stderr, "compiler_error: prolog frame pointer setup failed\n");
-      exit(1);
-    }
-  }
   if (stack_size > 0)
   {
     gadd_sp(-stack_size);
   }
 
-  /* When FP is omitted, SP is lower by the full SUB SP amount (locals +
-   * alignment pad).  Adjust offset_to_args so incoming stack parameters
-   * are found at the correct SP-relative position. */
-  if (!need_fp)
-    offset_to_args += epilogue_stack_dealloc;
+  /* The frame pointer is the SP left here, the bottom of the frame: locals
+   * and incoming parameters sit at the same positive offsets from it as from
+   * SP (see fp_adjust_local_offset).  SP moves only for VLA/alloca, and for
+   * the soft-float helpers' and scratch pushes' balanced windows. */
+  if (need_fp)
+  {
+    if (!ot(th_add_imm(R_FP, R_SP, 0, flags_safe(), ENFORCE_ENCODING_NONE)))
+    {
+      fprintf(stderr, "compiler_error: prolog frame pointer setup failed\n");
+      exit(1);
+    }
+  }
 
-  /* However, local addressing uses allocated_stack_size (without pad).
-   * The pad sits at the top of the SUB SP region, right below pushed regs,
-   * so locals occupy SP+0 .. SP+allocated_stack_size-1, matching the same
-   * addresses as the old push-IP-for-alignment approach. */
+  /* SP (and the frame pointer) is lower by the full SUB SP amount (locals +
+   * alignment pad): incoming stack parameters are that much further up.
+   * Local addressing uses allocated_stack_size (without pad): the pad sits at
+   * the top of the SUB SP region, right below the pushed registers, so
+   * locals occupy base+0 .. base+allocated_stack_size-1. */
+  offset_to_args += epilogue_stack_dealloc;
 
   /* Everything from here to the parameter shuffle below runs before a single
    * incoming value has been moved to its allocated home, so these registers
@@ -11942,43 +11866,37 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   if (tcc_state->text_and_data_separation && ir && ir->call_nested_save_size > 0 && tcc_gen_machine_calls_reload_r9(ir))
   {
     const int r9_slot_offset = ir->call_outgoing_size;
-    if (tcc_state->func_dynamic_sp)
-      /* VLA/alloca: the runtime SP has moved, so the call sites address these
-       * slots FP-relative with this bias.  Match it. */
-      tcc_gen_machine_store_to_stack_ex(ARM_R9, r9_slot_offset - (callee_push_size + epilogue_stack_dealloc),
-                                        prologue_incoming_mask);
-    else
-      /* Plain SP-relative, matching the store_word_to_stack() the call sites
-       * used: these slots are always addressed off SP when the frame is
-       * static, even in functions that also keep a frame pointer. */
-      tcc_gen_machine_store_to_sp_ex(ARM_R9, r9_slot_offset, prologue_incoming_mask);
+    /* SP-relative, like the store_word_to_stack() of the call sites.  A
+     * VLA/alloca function addresses the slots off the frame pointer instead,
+     * at the same offset: here, before any dynamic allocation, both are the
+     * bottom of the frame. */
+    tcc_gen_machine_store_to_sp_ex(ARM_R9, r9_slot_offset, prologue_incoming_mask);
   }
 
-  /* Save incoming static chain (R10) at fixed chain slot.
-   * With two-phase push, callee-saved regs are below FP, so the chain
-   * slot is at [FP - callee_push_size - 4] instead of [FP - 4].
-   * The body reads via offset -4 which gets fp_adjust_local_offset applied. */
+  /* Save incoming static chain (R10) at its fixed slot, frame offset -4
+   * (CHAIN_SLOT_OFFSET), where the body and tcc_gen_machine_restore_chain
+   * read it back. */
   if (ir && ir->has_static_chain)
   {
-    tcc_gen_machine_store_to_stack_ex(architecture_config.static_chain_reg, -(callee_push_size + 4),
+    tcc_gen_machine_store_to_stack_ex(architecture_config.static_chain_reg, fp_adjust_local_offset(-4, 0),
                                       prologue_incoming_mask);
   }
 
-  /* For variadic functions, save incoming r0-r3 in a fixed area at FP-16..FP-4
-   * (for named parameter access) and store __gr_top at FP-20.
+  /* For variadic functions, save incoming r0-r3 in a fixed area at frame
+   * offsets -16..-4 (for named parameter access).
    * The PUSH {r0-r3} at function entry already creates a contiguous register
    * save area above the callee-saved pushes, adjacent to the stack arguments.
    * __gr_top points to the end of that area (= start of stack args).
    */
   if (func_var)
   {
-    /* Store r0-r3 at FP-16..FP-4 for named parameter access.
+    /* Store r0-r3 at frame offsets -16..-4 for named parameter access.
      * (The contiguous PUSH'd copy is at FP+offset_to_args-16..FP+offset_to_args-4
      * and is used by va_arg for anonymous argument traversal.) */
-    tcc_gen_machine_store_to_stack_ex(R0, -(callee_push_size + 16), prologue_incoming_mask);
-    tcc_gen_machine_store_to_stack_ex(R1, -(callee_push_size + 12), prologue_incoming_mask);
-    tcc_gen_machine_store_to_stack_ex(R2, -(callee_push_size + 8), prologue_incoming_mask);
-    tcc_gen_machine_store_to_stack_ex(R3, -(callee_push_size + 4), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R0, fp_adjust_local_offset(-16, 0), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R1, fp_adjust_local_offset(-12, 0), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R2, fp_adjust_local_offset(-8, 0), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R3, fp_adjust_local_offset(-4, 0), prologue_incoming_mask);
 
     /* The frame-metadata triple that used to live at FP-20/-24/-28 (__gr_top,
      * named_arg_reg_bytes, named_arg_stack_bytes) is gone: it existed purely so
@@ -11993,11 +11911,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    * Layout at apply_args_offset: [stack_args_ptr, r0, r1, r2, r3]. */
   if (tcc_state->func_save_apply_args && ir)
   {
-    int base_off = tcc_state->apply_args_offset;
-    /* Adjust for callee push gap (same adjustment as fp_adjust_local_offset) */
-    int adj = base_off;
-    if (adj < 0 && callee_push_size > 0)
-      adj -= callee_push_size;
+    int adj = fp_adjust_local_offset(tcc_state->apply_args_offset, 0);
 
     /* Store stack args pointer (FP + offset_to_args = start of stack args area) */
     {
@@ -12352,86 +12266,37 @@ ST_FUNC void tcc_gen_machine_epilog(int leaffunc)
 
   int lr_saved = pushed_registers & (1 << R_LR);
 
-  if (tcc_state->need_frame_pointer && callee_saved_regs)
-  {
-    /* ── Two-phase pop (mirrors two-phase push) ── */
-    /* Restore SP from FP (works even with alloca/VLA since FP is stable) */
+  /* Where SP may have moved at run time -- VLA, alloca, a call to the
+   * library alloca() -- restore it from the frame pointer, which is the SP
+   * the prologue left; then leave as a frame without one does (the pushed
+   * registers include r7). */
+  if (tcc_state->need_frame_pointer && (tcc_state->func_dynamic_sp || tcc_state->force_frame_pointer))
     ot_check_mov_reg(R_SP, R_FP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
-    /* SP = FP; callee-saved regs are below FP. Adjust SP down.
-     * R3 is free in the epilogue (not used for return values). */
-    gadd_sp_ex(-callee_push_size, R3);
-    ot_check(th_pop(callee_saved_regs));
-    /* SP is now at FP (pointing at frame record {r7, [lr]}) */
-    if (vararg_push_size > 0 && lr_saved)
-    {
-      /* Variadic: pop FP+LR, then skip over the pushed r0-r3 area */
-      epilogue_return_over_pushed_args((1 << R_FP) | (1 << R_LR));
-    }
-    else if (lr_saved)
-    {
-      ot_check(th_pop((1 << R_FP) | (1 << R_PC)));
-    }
-    else
-    {
-      ot_check(th_pop(1 << R_FP));
-      if (vararg_push_size > 0)
-        gadd_sp_ex(vararg_push_size, R3);
-      ot_check(th_bx_reg(R_LR));
-    }
+  if (epilogue_stack_dealloc > 0)
+    gadd_sp_ex(epilogue_stack_dealloc, R3);
+  if (vararg_push_size > 0 && lr_saved)
+  {
+    /* r0-r3 were pushed below the stack arguments (push_arg_regs). */
+    epilogue_return_over_pushed_args(pushed_registers);
   }
-  else if (tcc_state->need_frame_pointer)
+  else if (vararg_push_size > 0)
   {
-    /* ── Original single-push with FP: restore SP from FP, then pop all ── */
-    ot_check_mov_reg(R_SP, R_FP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
-    if (vararg_push_size > 0 && lr_saved)
-    {
-      /* Variadic: pop all regs with LR (not PC), then skip pushed r0-r3 */
-      epilogue_return_over_pushed_args(pushed_registers);
-    }
-    else if (lr_saved)
-    {
-      pushed_registers |= 1 << R_PC;
-      pushed_registers &= ~(1 << R_LR);
+    if (pushed_registers > 0)
       ot_check(th_pop(pushed_registers));
-    }
-    else
-    {
-      if (pushed_registers > 0)
-        ot_check(th_pop(pushed_registers));
-      if (vararg_push_size > 0)
-        gadd_sp_ex(vararg_push_size, R3);
-      ot_check(th_bx_reg(R_LR));
-    }
+    gadd_sp_ex(vararg_push_size, R3);
+    ot_check(th_bx_reg(R_LR));
+  }
+  else if (lr_saved)
+  {
+    pushed_registers |= 1 << R_PC;
+    pushed_registers &= ~(1 << R_LR);
+    ot_check(th_pop(pushed_registers));
   }
   else
   {
-    /* ── No frame pointer ── */
-    if (epilogue_stack_dealloc > 0)
-      gadd_sp_ex(epilogue_stack_dealloc, R3);
-    if (vararg_push_size > 0 && lr_saved)
-    {
-      /* r0-r3 were pushed below the stack arguments (push_arg_regs). */
-      epilogue_return_over_pushed_args(pushed_registers);
-    }
-    else if (vararg_push_size > 0)
-    {
-      if (pushed_registers > 0)
-        ot_check(th_pop(pushed_registers));
-      gadd_sp_ex(vararg_push_size, R3);
-      ot_check(th_bx_reg(R_LR));
-    }
-    else if (lr_saved)
-    {
-      pushed_registers |= 1 << R_PC;
-      pushed_registers &= ~(1 << R_LR);
+    if (pushed_registers > 0)
       ot_check(th_pop(pushed_registers));
-    }
-    else
-    {
-      if (pushed_registers > 0)
-        ot_check(th_pop(pushed_registers));
-      ot_check(th_bx_reg(R_LR));
-    }
+    ot_check(th_bx_reg(R_LR));
   }
 
   thumb_gen_state.generating_function = 0;
@@ -12840,8 +12705,8 @@ typedef struct CallGenContext
  *
  * Only the low two bits matter, and they survive the frame bias: SP is 8-byte
  * aligned and FP 4-byte aligned at steady state, and every term
- * fp_adjust_local_offset() adds (allocated_stack_size, callee_push_size,
- * scratch_push_sp_bias) is a multiple of 4.  Testing the RAW offset therefore
+ * fp_adjust_local_offset() adds (allocated_stack_size, scratch_push_sp_bias)
+ * is a multiple of 4.  Testing the RAW offset therefore
  * gives the same answer as testing the adjusted one, and — unlike the adjusted
  * one, whose scratch_push_sp_bias() term is dry-run gated — it reads the same
  * in the rehearsal and the real pass, so it cannot desync the two code sizes.
@@ -14796,12 +14661,9 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
    * In functions with VLA/alloca the runtime SP has moved below the static
    * frame, so [SP + off] would land inside the dynamically allocated memory
    * (the callee then overwrites the saved R9/GOT base with user data).
-   * Address the slots FP-relative instead: the static SP equals
-   * FP - callee_push_size - epilogue_stack_dealloc. */
+   * Address the slots FP-relative instead, at the same offsets: the frame
+   * pointer is the static SP. */
   int nested_save_sp_offset = ir ? ir->call_outgoing_size : 0;
-  int nested_save_fp_bias = tcc_state->func_dynamic_sp
-                                ? -(callee_push_size + epilogue_stack_dealloc)
-                                : 0;
   int nested_save_count = 0;
   if (arg_regs_save_mask)
   {
@@ -14826,7 +14688,7 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
       {
         if (tcc_state->func_dynamic_sp)
           tcc_gen_machine_store_to_stack_ex(
-              r, nested_save_sp_offset + nested_save_count * 4 + nested_save_fp_bias,
+              r, nested_save_sp_offset + nested_save_count * 4,
               arg_regs_save_mask);
         else
           store_word_to_stack(r, nested_save_sp_offset + nested_save_count * 4);
@@ -14997,7 +14859,7 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
       if (arg_regs_save_mask & (1 << r))
       {
         int slot = (r == ARM_R9) ? 0 : restore_idx;
-        int off = nested_save_sp_offset + slot * 4 + nested_save_fp_bias;
+        int off = nested_save_sp_offset + slot * 4;
         int sign = (off < 0);
         int abs_off = sign ? -off : off;
         /* R9 restore in text_and_data_separation mode needs the write guard
@@ -15330,33 +15192,57 @@ ST_FUNC int tcc_gen_machine_cbz_jump_mop(int rn, int nonzero, int32_t target_ir,
   return 2;
 }
 
-/* Set static chain register: MOV R10, R7 (FP) */
-ST_FUNC void tcc_gen_machine_set_chain(void)
+/* reg = this frame's top: the frame pointer plus the frame size.  That is
+ * the static chain a nested function receives: it addresses its parent's
+ * captured variables at their IR frame offsets from it (MACH_OP_CHAIN_REL,
+ * negative, counted down from the top), and the parent's own saved chain at
+ * -4 (resolve_chain_base) -- the frame pointer itself is the frame's bottom. */
+static void emit_frame_top(int reg)
 {
-  int chain_reg = architecture_config.static_chain_reg;
-  thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
-  /* MOV chain_reg, R_FP (R7 on ARM Thumb) */
-  ot_check_mov_reg(chain_reg, R_FP, flags_safe(), no_shift, ENFORCE_ENCODING_NONE, false);
+  if (allocated_stack_size == 0)
+  {
+    ot_check_mov_reg(reg, R_FP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    return;
+  }
+  if (!ot(th_add_imm(reg, R_FP, allocated_stack_size, flags_safe(), ENFORCE_ENCODING_NONE)))
+  {
+    load_full_const(reg, PREG_NONE, LFC_SPLIT(allocated_stack_size));
+    ot_check(th_add_reg(reg, reg, R_FP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  }
 }
 
-/* Reload static chain register from the chain save slot at [FP - 4].
+/* Offset of this frame's top above the frame pointer: DWARF's frame base for
+ * a frame-pointer function, where variables sit at their IR frame offsets. */
+ST_FUNC int tcc_gen_machine_frame_top_offset(void)
+{
+  return allocated_stack_size;
+}
+
+/* Set static chain register: R10 = this frame's top (emit_frame_top). */
+ST_FUNC void tcc_gen_machine_set_chain(void)
+{
+  emit_frame_top(architecture_config.static_chain_reg);
+}
+
+/* Reload static chain register from the chain save slot (frame offset -4).
  * Called after function calls in nested functions with has_static_chain,
  * because trampoline calls can clobber R10. */
 ST_FUNC void tcc_gen_machine_restore_chain(void)
 {
   int chain_reg = architecture_config.static_chain_reg;
-  /* LDR chain_reg, [FP, #-4] */
-  if (!load_word_from_base(chain_reg, R_FP, 4, 1))
+  const int off = fp_adjust_local_offset(-4, 0);
+  const int sign = off < 0;
+  const int abs_off = sign ? -off : off;
+  if (!load_word_from_base(chain_reg, R_FP, abs_off, sign))
   {
-    /* Fallback for large offset (should not happen for -4) */
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(4, 1, (1u << chain_reg) | (1u << R_FP));
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, (1u << chain_reg) | (1u << R_FP));
     int rr = rr_alloc.reg;
     ot_check(th_ldr_reg(chain_reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
   }
 }
 
-/* Store parent FP (R7) into chain slot in .data for nested function trampoline.
+/* Store this frame's top into chain slot in .data for nested function trampoline.
  * src1 carries the chain slot symbol via SYMREF so we can emit a relocation. */
 ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1)
 {
@@ -15372,10 +15258,14 @@ ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1)
   _lfc_sym = chain_sym;
   load_full_const(scratch.reg, PREG_NONE, 0, 0);
 
-  /* STR R7, [scratch, #0] — store frame pointer into chain slot */
-  ot_check_str_imm(R_FP, scratch.reg, 0, 6, ENFORCE_ENCODING_NONE);
+  /* STR top, [scratch, #0] — store this frame's top (the static chain the
+   * trampoline hands the nested function, emit_frame_top) into the slot */
+  ScratchRegAlloc top = get_scratch_reg_with_save(1u << scratch.reg);
+  emit_frame_top(top.reg);
+  ot_check_str_imm(top.reg, scratch.reg, 0, 6, ENFORCE_ENCODING_NONE);
 
-  /* Restore scratch register */
+  /* Restore scratch registers */
+  restore_scratch_reg(&top);
   restore_scratch_reg(&scratch);
 }
 
@@ -15405,8 +15295,8 @@ ST_FUNC void tcc_gen_machine_end_instruction(void)
  * yields the block rather than the argument area beneath it.
  *
  * The nested-call R9/argument save slots need no equivalent: in a dynamic-SP
- * function they are already addressed FP-relative (see gfunc_prolog and the
- * call-site nested_save_fp_bias). */
+ * function they are addressed FP-relative (the frame pointer is the static
+ * SP; see the call-site save block). */
 static int vla_outgoing_reserve(void)
 {
   TCCIRState *ir = tcc_state->ir;
@@ -16169,20 +16059,22 @@ ST_FUNC void tcc_gen_machine_prefetch_mop(MachineOperand addr, int rw)
   }
   case MACH_OP_FRAME_ADDR:
   {
-    /* Frame address: FP + offset */
-    int32_t offset = addr.u.frame.offset;
+    /* Frame address: frame base + the frame offset, adjusted like any local
+     * (this used to add the raw IR offset to r7, frame pointer or not). */
+    int32_t offset = fp_adjust_local_offset(addr.u.frame.offset, 0);
+    const int base = tcc_state->need_frame_pointer ? R_FP : R_SP;
     if (offset != 0)
     {
       ScratchRegAlloc scr = get_scratch_reg_with_save(0);
       load_full_const(scr.reg, PREG_NONE, LFC_SPLIT(offset));
-      ot_check(th_add_reg(scr.reg, R_FP, scr.reg, flags_safe(), THUMB_SHIFT_DEFAULT,
+      ot_check(th_add_reg(scr.reg, base, scr.reg, flags_safe(), THUMB_SHIFT_DEFAULT,
                           ENFORCE_ENCODING_NONE));
       ot_check(th_pld_imm(scr.reg, 0, 0));
       restore_scratch_reg(&scr);
     }
     else
     {
-      ot_check(th_pld_imm(R_FP, 0, 0));
+      ot_check(th_pld_imm(base, 0, 0));
     }
     break;
   }

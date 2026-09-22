@@ -2896,6 +2896,7 @@ ST_FUNC int tcc_gen_machine_switch_load_dry_run_size(int num_entries);
 ST_FUNC void tcc_gen_machine_switch_load_mop(MachineOperand src, MachineOperand dest,
                                              struct TCCIRSwitchValueTable *vtab, struct TCCIRState *ir, int ir_idx);
 ST_FUNC void tcc_gen_machine_set_chain(void);
+ST_FUNC int tcc_gen_machine_frame_top_offset(void);
 ST_FUNC void tcc_gen_machine_restore_chain(void);
 ST_FUNC void tcc_gen_machine_init_chain_slot(IROperand src1);
 ST_FUNC void tcc_gen_machine_backpatch_jump(int address, int offset);

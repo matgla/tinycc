@@ -3037,16 +3037,29 @@ ST_FUNC void tcc_debug_funcend(TCCState *s1, int size)
 #endif
     func_sib = dwarf_info_section->data_offset;
     dwarf_data4(dwarf_info_section, 0); // sibling
+#if defined TCC_TARGET_ARM_THUMB
+    if (s1->need_frame_pointer)
+    {
+      /* r7 is the frame's bottom; variables sit at their (negative) frame
+       * offsets from its top. */
+      int top = tcc_gen_machine_frame_top_offset();
+      dwarf_data1(dwarf_info_section, 1 + dwarf_sleb128_size(top));
+      dwarf_data1(dwarf_info_section, DW_OP_breg7);
+      dwarf_sleb128(dwarf_info_section, top);
+    }
+    else
+    {
+      dwarf_data1(dwarf_info_section, 1);
+      dwarf_data1(dwarf_info_section, DW_OP_call_frame_cfa);
+    }
+#else
     dwarf_data1(dwarf_info_section, 1);
+#endif
 #if defined(TCC_TARGET_I386)
     dwarf_data1(dwarf_info_section, DW_OP_reg5); // ebp
 #elif defined(TCC_TARGET_X86_64)
     dwarf_data1(dwarf_info_section, DW_OP_reg6); // rbp
 #elif defined TCC_TARGET_ARM_THUMB
-    if (s1->need_frame_pointer)
-      dwarf_data1(dwarf_info_section, DW_OP_reg7);
-    else
-      dwarf_data1(dwarf_info_section, DW_OP_call_frame_cfa);
 #elif defined TCC_TARGET_ARM
     dwarf_data1(dwarf_info_section, DW_OP_reg13); // sp
 #elif defined TCC_TARGET_ARM64
