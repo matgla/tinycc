@@ -530,10 +530,13 @@ InlineFunc *inline_fn_lookup(TCCState *s, Sym *sym)
  * generated here, callees before callers, so the size-gated auto-inliner also
  * sees every small callee's body before its callers are compiled. */
 
-/* Whether BODY forces a frame pointer on whatever function it ends up in:
- * __builtin_frame_address returns it, and alloca moves SP under the locals.
- * (__builtin_return_address(0) reads the saved LR off SP and does not.) */
-static int body_forces_frame_pointer(TokenString *body)
+/* Whether BODY uses alloca or __builtin_frame_address.  alloca memory lives
+ * until the function returns: expanded into a caller, a block freed at each
+ * return of the callee would pile up in the caller's frame -- every
+ * iteration of a loop around the call -- which is why gcc does not inline
+ * such functions either.  The frame address would be the caller's.  Both
+ * also force a frame pointer on the caller, which loses r7 to allocation. */
+static int body_uses_frame_builtins(TokenString *body)
 {
   const int *p = tok_str_buf(body), *end = p + body->len;
   while (p < end)
@@ -547,15 +550,9 @@ static int body_forces_frame_pointer(TokenString *body)
   return 0;
 }
 
-/* Can the token-replay inliner express a called-once body, and is expanding
- * it no worse than the call?  The one cost rule: a body that forces a frame
- * pointer would force it on the caller, and a Thumb frame-pointer function
- * addresses its locals at negative offsets from r7, where a load or store
- * only encodes -255..0 -- every other access becomes movw + rsb + ldr.  When
- * __builtin_return_address still forced one, zig's allocator helpers
- * (@returnAddress()) expanded into large callers cost zig.c 289 KB of .text,
- * more than all called-once inlining saved.  Lift this once the frame pointer
- * addresses the frame from its bottom, as gcc's does. */
+/* Can the token-replay inliner express a called-once body?  (Constructs it
+ * cannot reproduce, or whose meaning would change in the caller -- not a
+ * size or benefit judgement.) */
 static int called_once_body_ok(Sym *sym, TokenString *body)
 {
   Sym *ref = sym->type.ref;
@@ -571,7 +568,7 @@ static int called_once_body_ok(Sym *sym, TokenString *body)
     return 0;
   if ((ref->type.t & VT_BTYPE) != VT_VOID && !inline_body_has_return_stmt(body))
     return 0;
-  if (body_forces_frame_pointer(body))
+  if (body_uses_frame_builtins(body))
     return 0;
   return 1;
 }
