@@ -7424,6 +7424,18 @@ void tcc_gen_machine_ubfx_mop(MachineOperand src1, MachineOperand src2, MachineO
   int width = (param >> 5) & 0x1F;
   if (width == 0)
     width = 8;
+  /* A low byte or halfword is UXTB / UXTH, which has a 16-bit form for low
+   * registers; UBFX is always 32 bits. */
+  if (lsb == 0 && (width == 8 || width == 16))
+  {
+    if (width == 8)
+      ot_check(th_uxtb((uint32_t)rd, (uint32_t)rn, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_uxth((uint32_t)rd, (uint32_t)rn, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    mach_writeback_dest(&dest, rd);
+    mach_release_all(&ctx);
+    return;
+  }
   int widthm1 = width - 1;
   int imm3 = (lsb >> 2) & 0x7;
   int imm2 = lsb & 0x3;
@@ -7488,6 +7500,17 @@ void tcc_gen_machine_sbfx_mop(MachineOperand src1, MachineOperand src2, MachineO
   int width = (param >> 5) & 0x1F;
   if (width == 0)
     width = 8;
+  /* SXTB / SXTH: 16 bits for low registers, like UXTB / UXTH above. */
+  if (lsb == 0 && (width == 8 || width == 16))
+  {
+    if (width == 8)
+      ot_check(th_sxtb((uint32_t)rd, (uint32_t)rn, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_sxth((uint32_t)rd, (uint32_t)rn, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    mach_writeback_dest(&dest, rd);
+    mach_release_all(&ctx);
+    return;
+  }
   int widthm1 = width - 1;
   int imm3 = (lsb >> 2) & 0x7;
   int imm2 = lsb & 0x3;
