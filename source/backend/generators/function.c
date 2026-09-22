@@ -348,6 +348,10 @@ void gen_function(Sym *sym)
   tcc_ir_backend_regalloc_pipeline(ir, sym, func_var, &phase_start, funcname,
                                    global_label_stack_start);
 
+  /* Identical block tails jumping to the same place share one copy. */
+  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("cross_jump") && tcc_ir_cross_jump(ir))
+    tcc_ir_dump_after_pass(ir, "cross_jump");
+
   tcc_ir_codegen_generate(ir);
 
   if (ir->barrel_shifts) {

@@ -14,6 +14,7 @@ IR_SRC = \
 	source/ir/vreg.c \
 	source/ir/stack.c \
 	source/ir/frame.c \
+	source/ir/cross_jump.c \
 	source/ir/dump.c \
 	source/ir/codegen.c \
 	source/ir/cfg.c \

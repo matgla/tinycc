@@ -273,6 +273,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/engine/gen_adapters.c \
 		$(TOP)/source/ir/regalloc.c \
 		$(TOP)/source/ir/frame.c \
+		$(TOP)/source/ir/cross_jump.c \
 		$(TOP)/source/opt/ra/const_branch_fold.c \
 		$(TOP)/source/opt/ra/incomplete_calls.c \
 		$(TOP)/source/opt/ra/phi_const_chain.c \

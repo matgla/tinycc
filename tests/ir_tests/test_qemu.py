@@ -212,6 +212,7 @@ TEST_FILES = [
     ("test_struct_arg_stack.c", 0),
     ("test_sra.c", 0),
     ("test_narrow_call_ext.c", 0),
+    ("test_cross_jump.c", 0),
 
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),

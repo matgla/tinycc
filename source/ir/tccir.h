@@ -796,6 +796,7 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc);
 /* The function calls setjmp, vfork or another function that returns twice, so
  * a frame slot live only on one return may still be read on the other. */
 int tcc_ir_calls_returns_twice(TCCIRState *ir);
+int tcc_ir_cross_jump(TCCIRState *ir);
 int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
 
 void tcc_ir_register_allocation_params(TCCIRState *ir);
