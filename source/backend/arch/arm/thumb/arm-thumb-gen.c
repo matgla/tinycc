@@ -15414,6 +15414,18 @@ static int vla_outgoing_reserve(void)
   return (k + 7) & ~7;
 }
 
+/* Whether the value in register `reg` is last used by the current
+ * instruction, so the instruction may overwrite it.  Without liveness (no IR)
+ * nothing is known to outlive it. */
+static int reg_value_dies_here(int reg)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir)
+    return 1;
+  int holder = tcc_ls_find_int_reg_holder(&ir->ls, reg, ir->codegen_instruction_idx);
+  return holder >= 0 && (int)ir->ls.intervals[holder].end <= ir->codegen_instruction_idx;
+}
+
 /* tcc_gen_machine_vla_mop: MachineOperand-based entry point for VLA operations.
  *
  *   VLA_ALLOC:      src1=size(bytes), src2=alignment(IMM bytes), dest unused
@@ -15436,15 +15448,28 @@ ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, M
     if (align & (align - 1))
       tcc_error("alignment is not a power of 2: %i", align);
 
-    /* Load size into a working register — it's dead after this op. */
-    int r = mach_ensure_in_reg(&ctx, &src1, 0);
+    /* The new top is built in a working register: the size's own register
+     * when this is its last use (a VLA's byte count), else a scratch.  A size
+     * that stays live -- alloca(n) with n used afterwards -- had its register
+     * overwritten by the new SP.  The scratch must not be one saved on the
+     * stack: its restore would read from the moved SP.  The dry run records
+     * such a save and the fixup frees a register for the real run. */
+    int size_reg = mach_ensure_in_reg(&ctx, &src1, 0);
+    int r = size_reg;
+    if (src1.kind == MACH_OP_REG && !src1.needs_deref && !reg_value_dies_here(size_reg))
+    {
+      r = mach_alloc_scratch(&ctx, 1u << (uint32_t)size_reg);
+      if (ctx.scratches[ctx.n_scratch - 1].would_save && !dry_run_state.active)
+        tcc_error("compiler_error: alloca/VLA size stays live and no register is free "
+                  "to compute the new stack top");
+    }
     if (r == R_SP)
       tcc_error("compiler_error: VLA alloc picked SP as temp");
 
     const int vla_reserve = vla_outgoing_reserve();
 
-    /* r = SP - r  (subtract size from stack pointer) */
-    ot_check(th_sub_reg(r, R_SP, r, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    /* r = SP - size */
+    ot_check(th_sub_reg(r, R_SP, size_reg, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
 
     /* ... and back up to the logical top, so the block is carved above the
      * outgoing-argument area rather than on top of it. */

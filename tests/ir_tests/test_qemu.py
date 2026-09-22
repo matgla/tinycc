@@ -226,6 +226,8 @@ TEST_FILES = [
     ("test_struct_stack_ldm.c", 0),
     # static functions with a single call site expand at it (bodies deferred to TU end)
     ("test_inline_called_once.c", 0),
+    # alloca's size stays live after the allocation
+    ("test_alloca_live_size.c", 0),
     # word copies between frame slots fused into LDM/STM chunks
     ("test_frame_block_copy.c", 0),
     ("test_sra.c", 0),
