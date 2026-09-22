@@ -228,6 +228,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/memory/addrof_var_fwd.c \
 	$(TOP)/source/opt/flat/memory/ptr_local_fwd.c \
 	$(TOP)/source/opt/flat/memory/param_copy_alias.c \
+	$(TOP)/source/opt/flat/memory/slot_const_store_fold.c \
 	$(TOP)/source/opt/flat/memory/sra.c \
 	$(TOP)/source/opt/flat/memory/invariant_global_load_hoist.c \
 	$(TOP)/source/opt/flat/memory/invariant_temp_deref_hoist.c \

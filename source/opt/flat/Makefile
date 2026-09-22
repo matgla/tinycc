@@ -143,6 +143,7 @@ FLAT_OPT_SRC = \
 	source/opt/flat/memory/addrof_var_fwd.c \
 	source/opt/flat/memory/ptr_local_fwd.c \
 	source/opt/flat/memory/param_copy_alias.c \
+	source/opt/flat/memory/slot_const_store_fold.c \
 	source/opt/flat/memory/sra.c \
 	source/opt/flat/memory/memmove_to_indexed_stores.c
 

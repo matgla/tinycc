@@ -218,6 +218,8 @@ TEST_FILES = [
     ("test_struct_param_pass_on.c", 0),
     # a local filled by a whole copy of a by-value struct parameter aliases it
     ("test_param_copy_alias.c", 0),
+    # byte/halfword field stores over a zero-filled local word fold into it
+    ("test_slot_const_store_fold.c", 0),
     ("test_sra.c", 0),
     ("test_narrow_call_ext.c", 0),
     ("test_cross_jump.c", 0),

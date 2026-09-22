@@ -202,6 +202,8 @@ int tcc_ir_opt_addrof_var_fwd(struct TCCIRState *ir);
 int tcc_ir_opt_ptr_local_fwd(struct TCCIRState *ir);
 int tcc_ir_opt_param_copy_alias(struct TCCIRState *ir);
 int tcc_ir_opt_param_copy_alias_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_slot_const_store_fold(struct TCCIRState *ir);
+int tcc_ir_opt_slot_const_store_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_sra(struct TCCIRState *ir);
 int tcc_ir_opt_ptr_local_fwd_ex(struct IROptCtx *ctx);
 

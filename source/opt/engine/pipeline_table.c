@@ -197,6 +197,8 @@ static const IROptPass late_cleanup_passes[] = {
   /* VLA_ALLOC(size=0) -> NOP, so dead_lea_store (which bails on any VLA_ALLOC) can clean the stack scaffolding. */
   PASS_GATED("zero_vla",         tcc_ir_opt_zero_vla_elim_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dead_store)),
   PASS_GATED("byte_store_merge", tcc_ir_opt_byte_store_merge_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
+  /* Byte/halfword field stores over a zero-filled local word fold into its word store. */
+  PASS_GATED("slot_const_store_fold", tcc_ir_opt_slot_const_store_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
   PASS_GATED("dse",              tcc_ir_opt_dse_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   /* Only fires with ir_late_reopt_phase + sym->a.tu_no_readers; must precede the DCE cascade that frees its RHS. */
   PASS_GATED("dead_static_store", tcc_ir_opt_dead_static_store_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
