@@ -2345,7 +2345,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
      * text_and_data_separation requires R9 save/restore around the call.
      * With stack args, the pre-reserved outgoing area would need to be set up
      * before the branch, complicating frame teardown. */
-    if (ir->tail_call_only && (max_outgoing > 0 || tcc_state->text_and_data_separation))
+    if (ir->tail_call_only && (max_outgoing > 0 || (tcc_state->text_and_data_separation && !ir->pure_forward)))
     {
       ir->tail_call_only = 0;
       ir->leaffunc = 0;

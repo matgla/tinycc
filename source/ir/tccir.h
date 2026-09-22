@@ -473,10 +473,25 @@ extern const IRRegistersConfig irop_config[];
 /* Forward declaration for FP materialization cache */
 typedef struct TCCFPMatCache TCCFPMatCache;
 
+/* How a parameter reaches the function body (pure-forwarder detection). */
+typedef struct IRParamForm
+{
+  uint8_t kind;    /* IR_PF_* */
+  int8_t reg_base; /* IR_PF_HOME: first argument register */
+  int32_t vreg;    /* IR_PF_REG / IR_PF_MEM: the PARAM vreg */
+  int32_t off;     /* IR_PF_MEM: parameter offset; IR_PF_HOME: home slot */
+  int32_t words;   /* IR_PF_HOME: words stored into the home slot */
+} IRParamForm;
+#define IR_PF_NONE 0 /* unknown: never forwarded untouched */
+#define IR_PF_REG 1  /* a value in the PARAM vreg */
+#define IR_PF_MEM 2  /* memory at a parameter offset (stack scalar, in-place struct) */
+#define IR_PF_HOME 3 /* a register-passed struct the prologue stores into a home slot */
+
 typedef struct TCCIRState
 {
   // number of function parameters
   int8_t parameters_count;
+  IRParamForm *param_forms; /* [parameters_count] */
   /* Named-argument usage for variadic prolog (AAPCS). */
   int named_arg_reg_bytes;
   int named_arg_stack_bytes;
@@ -486,6 +501,9 @@ typedef struct TCCIRState
    * the stack arguments, as for a variadic function, so it lies contiguous in
    * memory and is used in place. */
   uint8_t push_arg_regs : 1;
+  /* The body only forwards its parameters, untouched, to one call of the same
+   * signature: emitted as a branch to it (tcc_ir_backend_fold_pure_forward). */
+  uint8_t pure_forward : 1;
   uint8_t leaffunc : 1;
   uint8_t tail_call_only : 1;
   uint8_t naked : 1;

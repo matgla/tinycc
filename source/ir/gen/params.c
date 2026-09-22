@@ -11,6 +11,10 @@
 #define USING_GLOBALS
 #include "ir.h"
 
+/* The form the parameter being processed takes in the body, when it can be
+ * described (see IRParamForm); NULL when not recording. */
+static IRParamForm *pf_cur;
+
 /* Forward declarations for internal helpers */
 static void tcc_ir_params_add_hidden_sret(TCCIRState *ir, CType *func_type);
 static void tcc_ir_params_process_arguments(TCCIRState *ir, Sym *param_list, TCCAbiCallLayout *call_layout);
@@ -105,12 +109,16 @@ static void tcc_ir_params_process_arguments(TCCIRState *ir, Sym *param_list, TCC
     ir->parameters_count = (int8_t)arg_count;
     ir->named_arg_reg_bytes = 0;
     ir->named_arg_stack_bytes = 0;
+    tcc_free(ir->param_forms);
+    ir->param_forms = arg_count > 0 ? tcc_mallocz(sizeof(IRParamForm) * arg_count) : NULL;
   }
 
   /* Process each parameter */
   for (sym = param_list; sym; sym = sym->next, ++arg_index)
   {
+    pf_cur = ir && ir->param_forms && arg_index < 127 ? &ir->param_forms[arg_index] : NULL;
     tcc_ir_params_process_single(ir, sym, arg_index, call_layout);
+    pf_cur = NULL;
   }
 }
 
@@ -287,6 +295,9 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
         v = anon_sym++;
       sym_push(v, type, flags, addr);
     }
+    if (pf_cur)
+      *pf_cur = (IRParamForm){.kind = IR_PF_HOME, .reg_base = (int8_t)loc_info->reg_base, .off = struct_slot,
+                              .words = word_count};
     return;
   }
 
@@ -304,7 +315,10 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
     int v = sym->v & ~SYM_FIELD;
     if (!v)
       v = anon_sym++;
-    params_mark_stack(ir, sym_push(v, type, VT_PARAM | VT_LVAL | VT_LOCAL, loc_info->reg_base * 4));
+    Sym *ps = sym_push(v, type, VT_PARAM | VT_LVAL | VT_LOCAL, loc_info->reg_base * 4);
+    params_mark_stack(ir, ps);
+    if (pf_cur && ps->vreg >= 0)
+      *pf_cur = (IRParamForm){.kind = IR_PF_MEM, .vreg = ps->vreg, .off = loc_info->reg_base * 4};
     return;
   }
 
@@ -393,7 +407,10 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
     int v = sym->v & ~SYM_FIELD;
     if (!v)
       v = anon_sym++;
-    params_mark_stack(ir, sym_push(v, type, flags, addr));
+    Sym *ps = sym_push(v, type, flags, addr);
+    params_mark_stack(ir, ps);
+    if (pf_cur && ps->vreg >= 0)
+      *pf_cur = (IRParamForm){.kind = IR_PF_MEM, .vreg = ps->vreg, .off = addr};
   }
 }
 
@@ -436,6 +453,9 @@ void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiA
   Sym *ps = sym_push(v, &pushed_type, flags, addr);
   if (loc_info->kind == TCC_ABI_LOC_STACK)
     params_mark_stack(ir, ps);
+  if (pf_cur && ps->vreg >= 0 && !variadic)
+    *pf_cur = (IRParamForm){.kind = loc_info->kind == TCC_ABI_LOC_STACK ? IR_PF_MEM : IR_PF_REG, .vreg = ps->vreg,
+                            .off = addr};
 }
 
 int tcc_ir_local_add(TCCIRState *ir, Sym *sym, int stack_offset)

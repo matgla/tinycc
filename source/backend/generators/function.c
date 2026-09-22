@@ -331,6 +331,7 @@ void gen_function(Sym *sym)
   int nonstatic_global_copier = 0;
   tcc_ir_opt_run_function_pipeline(ir, sym, func_var, &nonstatic_global_copier);
 
+  tcc_ir_backend_fold_pure_forward(ir, sym);
   tcc_ir_backend_analyze_leaf_and_tail_calls(ir, func_var);
 
   if (tcc_state->do_bench)

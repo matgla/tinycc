@@ -165,6 +165,8 @@ void tcc_ir_free(TCCIRState *ir)
     tcc_free(ir->active_set);
   }
 
+  tcc_free(ir->param_forms);
+  ir->param_forms = NULL;
   if (ir->frame_objs)
   {
     tcc_free(ir->frame_objs);

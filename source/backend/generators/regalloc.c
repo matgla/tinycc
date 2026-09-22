@@ -112,6 +112,207 @@ static int ir_call_is_tail_positioned(TCCIRState *ir, int call_idx)
   return is_tail;
 }
 
+/* ABI-identical parameter or return types: an argument then lands where the
+ * callee expects it exactly when it lands where this function received it. */
+static int pf_abi_same(CType *a, CType *b)
+{
+  const int ba = a->t & VT_BTYPE, bb = b->t & VT_BTYPE;
+  if ((a->t & VT_COMPLEX) != (b->t & VT_COMPLEX))
+    return 0;
+  if (ba == VT_STRUCT || bb == VT_STRUCT)
+    return ba == bb && a->ref == b->ref;
+  if (ba == VT_VOID || bb == VT_VOID)
+    return ba == bb;
+  if (is_float(a->t) || is_float(b->t))
+    return ba == bb;
+  int aa, ab;
+  return type_size(a, &aa) == type_size(b, &ab);
+}
+
+/* Does FUNCPARAMVAL source `op` hand on parameter `f` exactly as received? */
+static int pf_arg_is_param(IROperand op, const IRParamForm *f)
+{
+  switch (f->kind)
+  {
+  case IR_PF_REG:
+    return irop_get_tag(op) == IROP_TAG_VREG && irop_get_vreg(op) == f->vreg && !op.is_lval;
+  case IR_PF_MEM:
+    return irop_get_tag(op) == IROP_TAG_STACKOFF && irop_get_vreg(op) == f->vreg && op.is_lval && op.is_param &&
+           irop_get_stack_offset(op) == f->off;
+  case IR_PF_HOME:
+    return irop_get_tag(op) == IROP_TAG_STACKOFF && irop_get_vreg(op) < 0 && op.is_lval && !op.is_param &&
+           op.is_local && op.btype == IROP_BTYPE_STRUCT && irop_get_stack_offset(op) == f->off;
+  default:
+    return 0;
+  }
+}
+
+/* A function whose body only hands its parameters, untouched, to one direct
+ * call of an ABI-identical signature and returns what it returns -- the Zig C
+ * backend's forwarding wrappers, `f(a0) { g(a0); }` -- finds every argument
+ * already where the callee expects it: r0-r3 as received, the stack arguments
+ * in the caller's outgoing area.  Its parameters are dropped from the call and
+ * the call becomes the whole function: a branch (tail_call_only).  The one
+ * body instruction besides the parameters, the call and the return that may
+ * appear is the prologue's store of a register-passed struct into its home
+ * slot, from the very registers the callee expects it in. */
+void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
+{
+  if (!ir || !sym || !sym->type.ref || tcc_state->optimize <= 0 || tcc_ir_opt_pass_disabled("pure_forward"))
+    return;
+  Sym *fref = sym->type.ref;
+  if (fref->f.func_type != FUNC_NEW || ir->has_static_chain || ir->captured_count > 0 || ir->naked ||
+      tcc_state->do_debug || tcc_state->do_bounds_check || tcc_state->instrument_functions)
+    return;
+  if ((fref->type.t & VT_BTYPE) == VT_STRUCT || (fref->type.t & VT_COMPLEX))
+    return; /* an sret pointer the call would get a fresh temporary for */
+  const int np = ir->parameters_count;
+  if (np < 0 || (np > 0 && !ir->param_forms))
+    return;
+
+  const int n = ir->next_instruction_index;
+  int call = -1, ret = -1, nparams = 0, nstores = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    switch (q->op)
+    {
+    case TCCIR_OP_NOP:
+      break;
+    case TCCIR_OP_FUNCPARAMVAL:
+      nparams++;
+      break;
+    case TCCIR_OP_FUNCPARAMVOID:
+      break;
+    case TCCIR_OP_STORE:
+      nstores++;
+      break;
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+      if (call >= 0)
+        return;
+      call = i;
+      break;
+    case TCCIR_OP_RETURNVALUE:
+    case TCCIR_OP_RETURNVOID:
+      if (ret >= 0)
+        return;
+      ret = i;
+      break;
+    default:
+      return;
+    }
+  }
+  if (call < 0 || (ret >= 0 && ret < call) || nparams != np)
+    return;
+  IRQuadCompact *cq = &ir->compact_instructions[call];
+  if (ret >= 0 && ir->compact_instructions[ret].op == TCCIR_OP_RETURNVALUE &&
+      (cq->op != TCCIR_OP_FUNCCALLVAL ||
+       irop_get_vreg(tcc_ir_op_get_src1(ir, &ir->compact_instructions[ret])) !=
+           irop_get_vreg(tcc_ir_op_get_dest(ir, cq))))
+    return;
+
+  /* The callee: a direct function of an ABI-identical signature. */
+  IROperand fn = tcc_ir_op_get_src1(ir, cq);
+  if (fn.is_lval || irop_get_vreg(fn) >= 0)
+    return;
+  Sym *callee = irop_get_sym_ex(ir, fn);
+  if (!callee || (callee->type.t & VT_BTYPE) != VT_FUNC || !callee->type.ref)
+    return;
+  Sym *cref = callee->type.ref;
+  if (cref->f.func_type != FUNC_NEW || cref->f.func_call != fref->f.func_call || !pf_abi_same(&fref->type, &cref->type))
+    return;
+  Sym *pa = fref->next, *pb = cref->next;
+  for (; pa && pb; pa = pa->next, pb = pb->next)
+    if (!pf_abi_same(&pa->type, &pb->type))
+      return;
+  if (pa || pb)
+    return;
+  /* A callee in another module is reached through a thunk that swaps in its
+   * own R9 and does not restore ours: it must return here. */
+  if (tcc_state->text_and_data_separation && !(callee->type.t & VT_STATIC))
+    return;
+
+  /* Every argument is the parameter of its position, as received. */
+  const int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, cq)));
+  uint32_t seen = 0;
+  if (np > 32)
+    return;
+  for (int i = 0; i < call; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCPARAMVAL)
+      continue;
+    uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+    int k = TCCIR_DECODE_PARAM_IDX(enc);
+    if (TCCIR_DECODE_CALL_ID(enc) != call_id || k >= np || (seen & (1u << k)) ||
+        !pf_arg_is_param(tcc_ir_op_get_src1(ir, q), &ir->param_forms[k]))
+      return;
+    seen |= 1u << k;
+  }
+  /* Stores: a register-passed struct's words into its home, each from the
+   * PARAM vreg that arrived in the register the callee reads it from. */
+  int home_words = 0;
+  for (int k = 0; k < np; k++)
+    if (ir->param_forms[k].kind == IR_PF_HOME)
+      home_words += ir->param_forms[k].words;
+  if (nstores != home_words)
+    return;
+  for (int i = 0; i < call; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_STORE)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q), v = tcc_ir_op_get_src1(ir, q);
+    int32_t vr = irop_get_vreg(v);
+    if (irop_get_tag(d) != IROP_TAG_STACKOFF || irop_get_vreg(d) >= 0 || !d.is_lval || d.is_param ||
+        d.btype != IROP_BTYPE_INT32 || irop_get_tag(v) != IROP_TAG_VREG || v.is_lval || vr < 0 ||
+        TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_PARAM)
+      return;
+    IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, vr);
+    int32_t off = irop_get_stack_offset(d), ok = 0;
+    for (int k = 0; k < np && !ok; k++)
+    {
+      const IRParamForm *f = &ir->param_forms[k];
+      int w = (off - f->off) / 4;
+      ok = f->kind == IR_PF_HOME && off >= f->off && !((off - f->off) & 3) && w < f->words && iv &&
+           iv->incoming_reg0 == f->reg_base + w;
+    }
+    if (!ok)
+      return;
+  }
+
+  IROperand enc = tcc_ir_op_get_src2(ir, cq);
+  if (irop_get_tag(enc) != IROP_TAG_IMM32)
+    return;
+  enc.u.imm32 = (int32_t)TCCIR_ENCODE_CALL(call_id, 0);
+  tcc_ir_op_set_src2(ir, cq, enc);
+  /* The call keeps one FUNCPARAMVOID, as a call without arguments has: the
+   * backend builds its call sites from them. */
+  int marker = 0;
+  for (int i = 0; i < call; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_FUNCPARAMVAL && !marker)
+    {
+      q->op = TCCIR_OP_FUNCPARAMVOID;
+      tcc_ir_op_set_src2(ir, q, enc);
+      marker = 1;
+    }
+    else if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_STORE)
+      q->op = TCCIR_OP_NOP;
+  }
+  if (!marker)
+  {
+    /* No argument to turn into the marker: a call without parameters is
+     * already one FUNCPARAMVOID and a call; nothing to rewrite. */
+    ir->pure_forward = 0;
+    return;
+  }
+  ir->push_arg_regs = 0;
+  ir->pure_forward = 1;
+}
+
 void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
 {
   ir->leaffunc = 1;
@@ -142,6 +343,13 @@ void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
         has_complex_fp = 1;
       }
     }
+  }
+
+  if (ir->pure_forward && call_count == 1)
+  {
+    ir->tail_call_only = 1;
+    ir->leaffunc = 1;
+    return;
   }
 
   if (call_count == 1 && !has_complex_fp && !func_var && !ir->push_arg_regs && !ir->has_static_chain && call_idx >= 0)
