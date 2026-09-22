@@ -63,7 +63,7 @@ static int frame_record(int loc, int size, int mask, int flags)
   /* When the layout may be recoloured, a guard byte above the object keeps its
    * one-past-end address inside its own record: otherwise it would equal the
    * start of the object allocated before it, and could not be told apart. */
-  int guard = ir && tcc_state->optimize > 0 && !tcc_state->do_debug && !tcc_state->do_bounds_check;
+  int guard = ir && tcc_state->optimize > 0 && !tcc_state->do_debug && !tcc_bounds_checking(tcc_state);
   /* The guard must not cost an object the word alignment it would otherwise
    * have had: inline copies into a char array use LDM/STM, which fault on an
    * unaligned address. */
@@ -285,7 +285,7 @@ static int frame_operand_offset(IROperand op, int bottom, int *off)
 
 static int frame_function_eligible(TCCIRState *ir)
 {
-  if (tcc_state->do_debug || tcc_state->do_bounds_check)
+  if (tcc_state->do_debug || tcc_bounds_checking(tcc_state))
     return 0;
   if (ir->is_variadic || ir->has_static_chain || ir->captured_count > 0 || tcc_state->nb_nested_funcs > 0)
     return 0;

@@ -162,7 +162,7 @@ void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
     return;
   Sym *fref = sym->type.ref;
   if (fref->f.func_type != FUNC_NEW || ir->has_static_chain || ir->captured_count > 0 || ir->naked ||
-      tcc_state->do_debug || tcc_state->do_bounds_check || tcc_state->instrument_functions)
+      tcc_state->do_debug || tcc_bounds_checking(tcc_state) || tcc_state->instrument_functions)
     return;
   if ((fref->type.t & VT_BTYPE) == VT_STRUCT || (fref->type.t & VT_COMPLEX))
     return; /* an sret pointer the call would get a fresh temporary for */

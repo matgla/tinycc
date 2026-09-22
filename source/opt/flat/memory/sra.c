@@ -194,7 +194,7 @@ static IROperand sra_operand(TCCIRState *ir, IRQuadCompact *q, int s)
 
 static int sra_function_eligible(TCCIRState *ir)
 {
-  if (tcc_state->do_debug || tcc_state->do_bounds_check)
+  if (tcc_state->do_debug || tcc_bounds_checking(tcc_state))
     return 0;
   if (ir->has_static_chain || ir->captured_count > 0 || tcc_state->nb_nested_funcs > 0)
     return 0;

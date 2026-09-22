@@ -1603,6 +1603,16 @@ struct TCCState
   struct LabelDiffFixup *label_diff_fixups;
 };
 
+
+/* Whether built-in bound checking is on; constant 0 in a compiler built
+ * without it (CONFIG_TCC_BCHECK=0, as the YasOS cross is), where the
+ * do_bounds_check member does not exist. */
+#ifdef CONFIG_TCC_BCHECK
+#define tcc_bounds_checking(s) ((s)->do_bounds_check)
+#else
+#define tcc_bounds_checking(s) 0
+#endif
+
 /* String/memory builtin IDs for table-driven dispatch.
  * Used by tccgen.c and ir/opt.c to avoid repeated strcmp. */
 enum StrBuiltinId

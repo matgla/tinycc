@@ -336,7 +336,7 @@ static int pca_try(TCCIRState *ir, PcaCopy *c)
 
 int tcc_ir_opt_param_copy_alias(TCCIRState *ir)
 {
-  if (!ir || !tcc_state || tcc_state->do_debug || tcc_state->do_bounds_check || ir->has_static_chain ||
+  if (!ir || !tcc_state || tcc_state->do_debug || tcc_bounds_checking(tcc_state) || ir->has_static_chain ||
       ir->captured_count > 0 || tcc_state->nb_nested_funcs > 0 || ir->func_has_label_addr)
     return 0;
   const int n = ir->next_instruction_index;
