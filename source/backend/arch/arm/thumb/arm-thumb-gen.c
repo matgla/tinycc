@@ -13583,7 +13583,7 @@ static void load_struct_word_into(int reg, int base_addr_reg, int off)
 #define STACK_ARG_MEMCPY_MIN_WORDS 8
 
 static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc *loc, int stack_offset,
-                                   int src_align)
+                                   int src_align, uint32_t arg_move_dst_mask)
 {
   int words_in_regs = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->reg_count : 0;
   int struct_src_offset = words_in_regs * 4;
@@ -13684,6 +13684,92 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
   bool src_aligned = (src_align >= 4);
 
   int w = 0;
+
+  /* Runs of three or four words from a frame source move by LDM/STM:
+   * `add rA, sp, #src; ldm rA, {..}` then `stmia.w sp, {..}` for the bottom of
+   * the outgoing area, else `add rB, sp, #dst; stmia rB!, {..}` -- 8 or 10
+   * bytes where LDRD/STRD pairs take 12-16 -- as long as it comes out shorter
+   * with the registers free here.  The LDM's base is one of its own
+   * destinations (no writeback then).  Registers load and store in ascending
+   * order, so any set keeps the words in place. */
+  if (src_is_frame && src_aligned && !((base_bias + struct_src_offset) & 3))
+  {
+    while (words - w >= 3)
+    {
+      const int src_off = base_bias + struct_src_offset + w * 4, dst_off = stack_offset + w * 4;
+      const int direct_sp = dst_off == 0;
+      uint32_t excl = (1u << (uint32_t)base_addr_reg) | (1u << R_SP) | (1u << R_PC);
+      int regs[6], got = 0;
+      int want = (words - w >= 4 ? 4 : 3) + !direct_sp;
+      /* LR is free at a call's argument setup: the call clobbers it. */
+      regs[got++] = ARM_LR;
+      excl |= 1u << ARM_LR;
+      while (got < want)
+      {
+        int r = find_call_scratch(excl, arg_move_dst_mask);
+        if (r < 0 || r == R_SP || r == R_PC || (excl & (1u << (uint32_t)r)) ||
+            (r == R_FP && tcc_state->need_frame_pointer))
+          break;
+        regs[got++] = r;
+        excl |= 1u << (uint32_t)r;
+      }
+      int rb = -1;
+      if (!direct_sp)
+      {
+        /* The STM base: the lowest register, left out of the list. */
+        int bi = 0;
+        for (int i = 1; i < got; i++)
+          if (regs[i] < regs[bi])
+            bi = i;
+        if (got < 4)
+          break;
+        rb = regs[bi];
+        regs[bi] = regs[--got];
+      }
+      const int k = got < 4 ? got : 4;
+      if (k < 3)
+        break;
+      uint32_t list = 0;
+      int ra = -1, all_low = 1;
+      for (int i = 0; i < k; i++)
+      {
+        list |= 1u << (uint32_t)regs[i];
+        all_low &= regs[i] <= R7;
+        if (regs[i] <= R7 && regs[i] > ra)
+          ra = regs[i];
+      }
+      if (ra < 0)
+        ra = regs[0];
+      thumb_opcode addr_a = src_off < 0
+                                ? th_sub_imm(ra, base_addr_reg, -src_off, flags_safe(), ENFORCE_ENCODING_NONE)
+                                : th_add_imm(ra, base_addr_reg, src_off, flags_safe(), ENFORCE_ENCODING_NONE);
+      thumb_opcode addr_b = {0};
+      if (!direct_sp)
+        addr_b = th_add_imm(rb, ARM_SP, dst_off, flags_safe(), ENFORCE_ENCODING_NONE);
+      const int ldm_size = all_low && ra <= R7 ? 2 : 4;
+      const int stm_size = !direct_sp && all_low && rb <= R7 ? 2 : 4;
+      if (!addr_a.size || (!direct_sp && !addr_b.size) ||
+          addr_a.size + ldm_size + addr_b.size + stm_size >= 4 * k)
+        break;
+      ot_check(addr_a);
+      if (ldm_size == 2)
+        ot_check((thumb_opcode){.size = 2, .opcode = 0xC800u | ((uint32_t)ra << 8) | list});
+      else
+        ot_check((thumb_opcode){.size = 4, .opcode = ((0xE890u | (uint32_t)ra) << 16) | list});
+      if (direct_sp)
+        ot_check((thumb_opcode){.size = 4, .opcode = ((0xE880u | (uint32_t)R_SP) << 16) | list});
+      else
+      {
+        ot_check(addr_b);
+        if (stm_size == 2)
+          ot_check((thumb_opcode){.size = 2, .opcode = 0xC000u | ((uint32_t)rb << 8) | list});
+        else
+          ot_check((thumb_opcode){.size = 4, .opcode = ((0xE8A0u | (uint32_t)rb) << 16) | list});
+      }
+      w += k;
+    }
+  }
+
   if (can_pair)
   {
     for (; w + 1 < words; w += 2)
@@ -14257,7 +14343,7 @@ static void place_one_stack_arg(CallGenContext *ctx, const TCCAbiArgLoc *loc, co
         if (a > 0)
           src_align = a;
       }
-      place_stack_arg_struct(mop, loc, stack_offset, src_align);
+      place_stack_arg_struct(mop, loc, stack_offset, src_align, ctx->arg_move_dst_mask);
     }
   }
   else if (mop->is_64bit)

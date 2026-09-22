@@ -222,6 +222,8 @@ TEST_FILES = [
     ("test_slot_const_store_fold.c", 0),
     # a function only forwarding its parameters becomes a branch to the callee
     ("test_pure_forward.c", 0),
+    # struct stack parts of 3-7 words copied by LDM/STM
+    ("test_struct_stack_ldm.c", 0),
     ("test_sra.c", 0),
     ("test_narrow_call_ext.c", 0),
     ("test_cross_jump.c", 0),
