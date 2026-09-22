@@ -1205,6 +1205,10 @@ TEST_FILES = [
     # C11 _Pragma operator: pack layout via literal + DO_PRAGMA macro idiom.
     ("343_pragma_operator.c", 5),
 
+    # A signed add that absorbed an unsigned (wrapping) inner add kept the
+    # no-overflow assumption: `(int)(x + 1U) + 1 < (int)x` folded to false.
+    ("473_reassoc_unsigned_into_signed.c", 0),
+
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
     # ssa:first_iter_exit migration.
