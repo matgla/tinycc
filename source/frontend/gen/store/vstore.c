@@ -24,11 +24,14 @@
 #include "gen_priv.h"
 
 /* Most chunks a small aggregate copy may take inline before it stays a
- * __aeabi_memmove call (see small_aggregate_copy_plan).  Measured on the Zig
- * compiler's C (-O1, 70 MB): at 1 .text drops 8.50 -> 8.16 MB, 2 costs 1 KB
- * more but removes another 2,462 calls, and 3-4 give size back -- a word
- * LOAD/STORE pair per chunk outgrows the ~10-byte call sequence. */
-TCC_DBG_ENV_INT(small_aggregate_copy_max_chunks, "TCC_SMALL_COPY_CHUNKS", 2)
+ * __aeabi_memmove call (see small_aggregate_copy_plan).  Re-measured on the
+ * Zig compiler's C (70 MB) once codegen began fusing frame-slot word copies
+ * into LDM/STM (94b95514), which the 2 this was first measured at predates:
+ * -O2 .text 5,194,592 at 2, 5,171,632 at 3, 5,169,236 at 4 and 5,169,572 at
+ * 6; -O1 5,157,884 -> 5,133,380 at 4.  Over tinycc's own 360 translation
+ * units it is a wash (1,329,510 -> 1,329,470), so 4 costs nothing where the
+ * copies are few and pays where they are not. */
+TCC_DBG_ENV_INT(small_aggregate_copy_max_chunks, "TCC_SMALL_COPY_CHUNKS", 4)
 
 /* store vtop in lvalue pushed on stack */
 ST_FUNC void vstore(void)
