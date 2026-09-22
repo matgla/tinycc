@@ -103,7 +103,7 @@ int tcc_ir_frame_alloc_ret_temp(int loc, int size, int mask)
   return frame_record(loc, size, mask, FRAME_OBJ_RET_TEMP);
 }
 
-void tcc_ir_frame_note_sret_call(int call_id)
+void tcc_ir_frame_note_sret_call(int call_id, int size)
 {
   TCCIRState *ir = tcc_state ? tcc_state->ir : NULL;
   if (!ir || call_id < 0)
@@ -113,11 +113,11 @@ void tcc_ir_frame_note_sret_call(int call_id)
     int n = ir->sret_calls_size ? ir->sret_calls_size : 64;
     while (n <= call_id)
       n *= 2;
-    ir->sret_calls = tcc_realloc(ir->sret_calls, n);
-    memset(ir->sret_calls + ir->sret_calls_size, 0, n - ir->sret_calls_size);
+    ir->sret_calls = tcc_realloc(ir->sret_calls, sizeof(int32_t) * n);
+    memset(ir->sret_calls + ir->sret_calls_size, 0, sizeof(int32_t) * (n - ir->sret_calls_size));
     ir->sret_calls_size = n;
   }
-  ir->sret_calls[call_id] = 1;
+  ir->sret_calls[call_id] = size > 0 ? size : 1;
 }
 
 static int frame_idx_cmp(const void *a, const void *b)
@@ -226,6 +226,7 @@ typedef struct
   uint8_t pinned;  /* a gap: some untracked allocation, never dropped or moved */
   uint8_t kind;    /* FRAME_OBJ_* */
   uint8_t escaped; /* its address may be used anywhere after it is taken */
+  uint8_t precise; /* lifetime from liveness (frame_precise_lifetimes) */
   int first[2], last[2]; /* lifetime in source order and in RPO (frame_rpo);
                           * first > last if none */
   int refs;        /* instructions referencing it: how hot it is */
@@ -602,7 +603,32 @@ static int frame_callee_nocapture(TCCIRState *ir, IRQuadCompact *call)
  * Source order would not do: a switch's dispatch follows its cases, and its
  * forward jumps into them would all look like loops.  Returns 0 on a switch the
  * graph cannot follow.  Unreachable blocks go last, in source order. */
-static int frame_rpo(TCCIRState *ir, int n, int *pos, int **be_out, int *nbe_out, int **sbe_out, int *nsbe_out)
+/* The basic blocks frame_rpo found, kept for frame_precise_lifetimes. */
+typedef struct
+{
+  int nb;
+  int *bstart;    /* nb + 1: first instruction of each block, then n */
+  int *block_of;  /* n: the block of each instruction */
+  int *succ_at;   /* nb + 1: successors of b are succ[succ_at[b] .. succ_at[b+1]) */
+  int *succ;
+  int *post;      /* the reachable blocks in DFS post-order */
+  int npost;
+  uint8_t *seen;  /* nb: reachable from the entry */
+} FrameCFG;
+
+static void frame_cfg_free(FrameCFG *cfg)
+{
+  tcc_free(cfg->bstart);
+  tcc_free(cfg->block_of);
+  tcc_free(cfg->succ_at);
+  tcc_free(cfg->succ);
+  tcc_free(cfg->post);
+  tcc_free(cfg->seen);
+  memset(cfg, 0, sizeof *cfg);
+}
+
+static int frame_rpo(TCCIRState *ir, int n, int *pos, int **be_out, int *nbe_out, int **sbe_out, int *nsbe_out,
+                     FrameCFG *cfg)
 {
   uint8_t *leader = tcc_mallocz(n + 1);
   int *block_of = tcc_malloc(sizeof(int) * n);
@@ -773,6 +799,16 @@ static int frame_rpo(TCCIRState *ir, int n, int *pos, int **be_out, int *nbe_out
     }
   }
   ok = 1;
+  cfg->nb = nb;
+  cfg->bstart = bstart;
+  cfg->block_of = block_of;
+  cfg->succ_at = succ_at;
+  cfg->succ = succ;
+  cfg->post = post;
+  cfg->npost = npost;
+  cfg->seen = seen;
+  bstart = block_of = succ_at = succ = post = NULL;
+  seen = NULL;
 
 done:
   tcc_free(leader);
@@ -795,6 +831,309 @@ done:
   *sbe_out = sbe;
   *nsbe_out = nsbe;
   return ok;
+}
+
+/* ---- Liveness with kills (frame_precise_lifetimes) ----
+ *
+ * The ranges above take an object to be live from its first to its last
+ * reference and then widen them over every loop they touch: a value may be
+ * carried around the back edge.  For an object whose uses inside the loop
+ * are all preceded by a full write, nothing is carried, and the widening
+ * makes every such object -- the locals of each case of a loop around a
+ * switch, of each called-once body inlined into one -- live across the
+ * whole loop, so none of them share bytes.
+ *
+ * Each reference is recorded as an event: a USE may read the object, a REF
+ * only takes its address (the pointer's later uses are events of their own),
+ * a WRITE stores bytes [off, off + width) of it, and a KILL overwrites all of
+ * it.  Per block, the first USE before the object is fully overwritten makes
+ * it live on entry; writes that cover it first -- one store, a struct result,
+ * a block copy, or several stores between them -- kill it.  Backward liveness
+ * over the CFG then gives the blocks it is live through, and its lifetime is
+ * the hull of those blocks and its references, in each order: two objects
+ * whose hulls are disjoint in an order are never live at the same point.  No
+ * widening is needed, the liveness already follows the back edges. */
+enum
+{
+  FEV_USE,
+  FEV_REF,
+  FEV_WRITE,
+  FEV_KILL
+};
+
+typedef struct
+{
+  int i, s, kind, off, width;
+} FrameEv;
+
+typedef struct
+{
+  FrameEv *v;
+  int n, cap;
+} FrameEvents;
+
+static void frame_ev_add(FrameEvents *ev, int i, int s, int kind, int off, int width)
+{
+  if (s < 0 || i < 0)
+    return;
+  if (ev->n == ev->cap)
+  {
+    ev->cap = ev->cap ? ev->cap * 2 : 256;
+    ev->v = tcc_realloc(ev->v, sizeof(FrameEv) * ev->cap);
+  }
+  ev->v[ev->n++] = (FrameEv){i, s, kind, off, width};
+}
+
+/* Bytes an access of this operand's type moves, or 0 if unknown. */
+static int frame_btype_width(IROperand op)
+{
+  switch (irop_get_btype(op))
+  {
+  case IROP_BTYPE_INT8:
+    return 1;
+  case IROP_BTYPE_INT16:
+    return 2;
+  case IROP_BTYPE_INT32:
+  case IROP_BTYPE_FLOAT32:
+    return 4;
+  case IROP_BTYPE_INT64:
+  case IROP_BTYPE_FLOAT64:
+    return 8;
+  default:
+    return 0;
+  }
+}
+
+/* The event for operand `op` (classified `kind`, naming segment `t`) of
+ * instruction `i`; role 0 is the destination.  `call` is the call reading a
+ * FUNCPARAMVAL, and `sret` the struct size it writes through parameter 0. */
+static void frame_ev_operand(FrameLive *fl, FrameEvents *ev, int i, int op, int role, int kind, IROperand opnd, int t,
+                             int call, int sret)
+{
+  int off = 0, rel = -1;
+  if ((kind == FOP_MEM || kind == FOP_ADDR) && frame_operand_offset(opnd, fl->bottom, &off))
+    rel = off - fl->seg[t].start;
+  if (kind == FOP_MEM)
+  {
+    if (role == 0 && (op == TCCIR_OP_STORE || op == TCCIR_OP_ASSIGN || op == TCCIR_OP_VLA_SP_SAVE))
+    {
+      int w = op == TCCIR_OP_VLA_SP_SAVE ? 4 : frame_btype_width(opnd);
+      frame_ev_add(ev, i, t, w > 0 && rel >= 0 ? FEV_WRITE : FEV_USE, rel, w);
+      return;
+    }
+    if (role == 0 && op == TCCIR_OP_BLOCK_COPY)
+    {
+      IRQuadCompact *q = &fl->ir->compact_instructions[i];
+      IROperand size = tcc_ir_op_get_src2(fl->ir, q);
+      int w = irop_is_immediate(size) ? (int)irop_get_imm64_ex(fl->ir, size) : 0;
+      frame_ev_add(ev, i, t, w > 0 && rel >= 0 ? FEV_WRITE : FEV_USE, rel, w);
+      return;
+    }
+    frame_ev_add(ev, i, t, FEV_USE, 0, 0);
+    return;
+  }
+  if (kind == FOP_ADDR || kind == FOP_VAL)
+  {
+    if (op == TCCIR_OP_FUNCPARAMVAL)
+    {
+      frame_ev_add(ev, i, t, FEV_REF, 0, 0);
+      if (sret > 0 && kind == FOP_ADDR && rel >= 0)
+        frame_ev_add(ev, call, t, FEV_WRITE, rel, sret);
+      else
+        frame_ev_add(ev, call, t, FEV_USE, 0, 0);
+      return;
+    }
+    if (role == 0 && op == TCCIR_OP_BLOCK_COPY && kind == FOP_ADDR)
+    {
+      frame_ev_operand(fl, ev, i, op, role, FOP_MEM, opnd, t, call, sret);
+      return;
+    }
+    if (frame_op_passes_value(op) || op == TCCIR_OP_CMP || op == TCCIR_OP_TEST_ZERO)
+    {
+      frame_ev_add(ev, i, t, FEV_REF, 0, 0);
+      return;
+    }
+  }
+  frame_ev_add(ev, i, t, FEV_USE, 0, 0);
+}
+
+static int frame_ev_cmp(const void *a, const void *b)
+{
+  const FrameEv *x = a, *y = b;
+  if (x->i != y->i)
+    return x->i < y->i ? -1 : 1;
+  /* Within one instruction the sources are read before the result is
+   * written: a use first. */
+  int ux = x->kind == FEV_USE, uy = y->kind == FEV_USE;
+  return uy - ux;
+}
+
+/* Cap on each liveness bit array (words): beyond it the widened ranges
+ * stand, rather than spend the memory. */
+#define FRAME_LIVE_MAX_WORDS (1 << 21)
+
+static void frame_precise_lifetimes(FrameLive *fl, FrameCFG *cfg, const int *pos, FrameEvents *ev, const int *be,
+                                    int nbe, const int *sbe, int nsbe)
+{
+  const int nseg = fl->nseg, nb = cfg->nb;
+  if (nb <= 0 || ev->n == 0)
+    return;
+
+  /* Candidates: objects the widening would grow -- live, never escaping
+   * (a pointer to an escaped one may read it anywhere). */
+  int *cand = tcc_malloc(sizeof(int) * (nseg > 0 ? nseg : 1));
+  int K = 0;
+  for (int s = 0; s < nseg; s++)
+  {
+    FrameSeg *g = &fl->seg[s];
+    cand[s] = -1;
+    if (!g->live || g->escaped || g->pinned || g->first[0] > g->last[0])
+      continue;
+    int loopy = 0;
+    for (int o = 0; o < 2 && !loopy; o++)
+    {
+      const int *e = o ? be : sbe;
+      const int ne = o ? nbe : nsbe;
+      for (int k = 0; k < ne && !loopy; k++)
+        loopy = g->first[o] <= e[2 * k + 1] && g->last[o] >= e[2 * k];
+    }
+    if (loopy)
+      cand[s] = K++;
+  }
+  const int W = (K + 31) / 32;
+  if (K == 0 || (int64_t)nb * W > FRAME_LIVE_MAX_WORDS)
+  {
+    tcc_free(cand);
+    return;
+  }
+
+  qsort(ev->v, ev->n, sizeof(FrameEv), frame_ev_cmp);
+  uint32_t *gen = tcc_mallocz(sizeof(uint32_t) * nb * W);
+  uint32_t *kill = tcc_mallocz(sizeof(uint32_t) * nb * W);
+  uint32_t *in = tcc_mallocz(sizeof(uint32_t) * nb * W);
+  uint32_t *out = tcc_mallocz(sizeof(uint32_t) * nb * W);
+  uint32_t *acc = tcc_mallocz(sizeof(uint32_t) * W);
+  uint8_t *bad = tcc_mallocz(K), *killed = tcc_mallocz(K), *closed = tcc_mallocz(K);
+  int *stamp = tcc_malloc(sizeof(int) * K);
+  uint64_t *cover = tcc_malloc(sizeof(uint64_t) * K);
+  for (int k = 0; k < K; k++)
+    stamp[k] = -1;
+
+  for (int x = 0; x < ev->n; x++)
+  {
+    const FrameEv *e = &ev->v[x];
+    int k = cand[e->s];
+    if (k < 0)
+      continue;
+    int b = cfg->block_of[e->i];
+    if (!cfg->seen[b])
+    {
+      bad[k] = 1; /* in a block the CFG does not reach: leave it widened */
+      continue;
+    }
+    if (stamp[k] != b)
+    {
+      stamp[k] = b;
+      closed[k] = 0;
+      cover[k] = 0;
+    }
+    if (closed[k])
+      continue;
+    const int size = fl->seg[e->s].size;
+    uint32_t bit = 1u << (k & 31);
+    switch (e->kind)
+    {
+    case FEV_USE:
+      gen[b * W + k / 32] |= bit;
+      closed[k] = 1;
+      break;
+    case FEV_WRITE:
+      if (e->off <= 0 && e->off + e->width >= size)
+        goto kill_it;
+      if (size <= 64 && e->off >= 0 && e->off < size)
+      {
+        int hi = e->off + e->width < size ? e->off + e->width : size;
+        uint64_t m = (hi - e->off >= 64 ? ~0ull : ((1ull << (hi - e->off)) - 1)) << e->off;
+        uint64_t full = size >= 64 ? ~0ull : (1ull << size) - 1;
+        cover[k] |= m;
+        if ((cover[k] & full) == full)
+          goto kill_it;
+      }
+      break;
+    case FEV_KILL:
+    kill_it:
+      kill[b * W + k / 32] |= bit;
+      killed[k] = 1;
+      closed[k] = 1;
+      break;
+    default:
+      break;
+    }
+  }
+
+  /* Backward liveness, blocks in post-order, to a fixpoint. */
+  int changed;
+  do
+  {
+    changed = 0;
+    for (int x = 0; x < cfg->npost; x++)
+    {
+      int b = cfg->post[x];
+      memset(acc, 0, sizeof(uint32_t) * W);
+      for (int j = cfg->succ_at[b]; j < cfg->succ_at[b + 1]; j++)
+      {
+        const uint32_t *si = &in[cfg->succ[j] * W];
+        for (int w = 0; w < W; w++)
+          acc[w] |= si[w];
+      }
+      uint32_t *bo = &out[b * W], *bi = &in[b * W];
+      const uint32_t *bg = &gen[b * W], *bk = &kill[b * W];
+      for (int w = 0; w < W; w++)
+      {
+        uint32_t ni = bg[w] | (acc[w] & ~bk[w]);
+        if (ni != bi[w])
+          bi[w] = ni, changed = 1;
+        bo[w] = acc[w];
+      }
+    }
+  } while (changed);
+
+  /* Lifetime = hull of the references and of the blocks live through. */
+  for (int s = 0; s < nseg; s++)
+  {
+    int k = cand[s];
+    if (k < 0 || bad[k] || !killed[k])
+      continue;
+    FrameSeg *g = &fl->seg[s];
+    uint32_t bit = 1u << (k & 31);
+    for (int b = 0; b < nb; b++)
+    {
+      if (!cfg->seen[b] || !((in[b * W + k / 32] | out[b * W + k / 32]) & bit))
+        continue;
+      int lo = cfg->bstart[b], hi = cfg->bstart[b + 1] - 1;
+      if (lo < g->first[0])
+        g->first[0] = lo;
+      if (hi > g->last[0])
+        g->last[0] = hi;
+      if (pos[lo] < g->first[1])
+        g->first[1] = pos[lo];
+      if (pos[hi] > g->last[1])
+        g->last[1] = pos[hi];
+    }
+    g->precise = 1;
+  }
+
+  tcc_free(cand);
+  tcc_free(gen);
+  tcc_free(kill);
+  tcc_free(in);
+  tcc_free(out);
+  tcc_free(acc);
+  tcc_free(bad);
+  tcc_free(killed);
+  tcc_free(closed);
+  tcc_free(stamp);
+  tcc_free(cover);
 }
 
 /* Lifetimes of the live segments.  Returns 0 if they cannot be computed. */
@@ -826,9 +1165,11 @@ static int frame_lifetimes(FrameLive *fl)
   uint8_t *nocapture = tcc_mallocz(n > 0 ? n : 1);
   int *pos = tcc_malloc(sizeof(int) * (n > 0 ? n : 1));
   int *be = NULL, nbe = 0, *sbe = NULL, nsbe = 0;
+  FrameCFG cfg = {0};
+  FrameEvents ev = {0};
   for (int c = 0; c < ncall; c++)
     call_at[c] = -1;
-  if (!frame_rpo(ir, n, pos, &be, &nbe, &sbe, &nsbe))
+  if (!frame_rpo(ir, n, pos, &be, &nbe, &sbe, &nsbe, &cfg))
     goto out;
   for (int i = n - 1; i >= 0; i--)
   {
@@ -936,7 +1277,21 @@ static int frame_lifetimes(FrameLive *fl)
         t = *frame_taint_ref(fl, id);
       frame_use(fl, t, i, pos[i]);
       if (t >= 0)
+      {
         fl->seg[t].refs++;
+        int sret = 0;
+        if (op == TCCIR_OP_FUNCPARAMVAL)
+        {
+          IROperand enc = tcc_ir_op_get_src2(ir, q);
+          int c = frame_call_id(ir, enc);
+          if (TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, enc)) == 0 && c >= 0 &&
+              c < ir->sret_calls_size)
+            sret = ir->sret_calls[c];
+        }
+        int has_dest = irop_config[op].has_dest;
+        frame_ev_operand(fl, &ev, i, op, has_dest && k == 0 ? 0 : 1, kind, ir->iroperand_pool[pi], t,
+                         op == TCCIR_OP_FUNCPARAMVAL ? param_call[i] : i, sret);
+      }
       /* A parameter is read by its call. */
       if (op == TCCIR_OP_FUNCPARAMVAL)
         frame_use(fl, t, param_call[i], pos[param_call[i]]);
@@ -995,7 +1350,9 @@ static int frame_lifetimes(FrameLive *fl)
     if (fl->seg[s].escaped && fl->seg[s].first[0] <= fl->seg[s].last[0])
       fl->seg[s].last[0] = fl->seg[s].last[1] = n - 1;
 
-  /* Widen every range over the loops it intersects, in each order. */
+  frame_precise_lifetimes(fl, &cfg, pos, &ev, be, nbe, sbe, nsbe);
+
+  /* Widen every other range over the loops it intersects, in each order. */
   for (int o = 0; o < 2; o++)
   {
     const int *e = o ? be : sbe;
@@ -1003,7 +1360,7 @@ static int frame_lifetimes(FrameLive *fl)
     for (int s = 0; s < fl->nseg; s++)
     {
       FrameSeg *g = &fl->seg[s];
-      if (g->first[o] > g->last[o])
+      if (g->first[o] > g->last[o] || g->precise)
         continue;
       int grew;
       do
@@ -1023,6 +1380,8 @@ static int frame_lifetimes(FrameLive *fl)
   ok = 1;
 
 out:
+  frame_cfg_free(&cfg);
+  tcc_free(ev.v);
   tcc_free(be);
   tcc_free(sbe);
   tcc_free(pos);

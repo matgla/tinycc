@@ -321,7 +321,7 @@ void unary_funcall(void)
           LOG_CODEGEN("FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
                       TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
-          tcc_ir_frame_note_sret_call(call_id);
+          tcc_ir_frame_note_sret_call(call_id, size);
         }
         vtop--;
         nb_args++;

@@ -230,6 +230,8 @@ TEST_FILES = [
     ("test_return_address.c", 0),
     # alloca's size stays live after the allocation
     ("test_alloca_live_size.c", 0),
+    # frame objects fully rewritten in each loop iteration share bytes; carried ones do not
+    ("test_frame_loop_lifetimes.c", 0),
     # word copies between frame slots fused into LDM/STM chunks
     ("test_frame_block_copy.c", 0),
     ("test_sra.c", 0),

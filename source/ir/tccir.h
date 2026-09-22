@@ -538,8 +538,9 @@ typedef struct TCCIRState
    * the body is parsed. */
   int32_t *frame_objs;
   int frame_obj_count, frame_obj_cap;
-  /* Call ids whose parameter 0 is the struct-return buffer (frame.c). */
-  uint8_t *sret_calls;
+  /* By call id: the size of the struct written through parameter 0, the
+   * struct-return buffer, or 0 (frame.c). */
+  int32_t *sret_calls;
   int sret_calls_size;
   /* Sorted, merged [start, end) extents of frame_objs for lookups, built for
    * frame_obj_count objects; frame_relaid once relayout moved them. */
@@ -816,7 +817,7 @@ int tcc_ir_frame_alloc(int loc, int size, int mask);
 int tcc_ir_frame_alloc_arg_copy(int loc, int size, int mask);
 int tcc_ir_frame_alloc_ret_temp(int loc, int size, int mask);
 /* Parameter 0 of call `call_id` is the struct-return buffer. */
-void tcc_ir_frame_note_sret_call(int call_id);
+void tcc_ir_frame_note_sret_call(int call_id, int size);
 /* The frontend object containing frame offset `off`, as [*lo, *hi), while the
  * frame still has the frontend's layout.  0 when unknown. */
 int tcc_ir_frame_object_at(TCCIRState *ir, int off, int *lo, int *hi);
