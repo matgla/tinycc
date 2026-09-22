@@ -185,6 +185,18 @@ static int ir_codegen_op_touches_volatile(TCCIRState *ir, IRQuadCompact *q)
  * Parameter Register Allocation
  * ============================================================================ */
 
+/* A stack-passed parameter is read from the caller's argument area, unless
+ * tcc_ir_avoid_spilling_stack_passed_params left it the core registers linear
+ * scan gave it; the prologue loads those. */
+static void stack_param_home(IRLiveInterval *interval)
+{
+  if (interval->allocation.r0 <= 12 && interval->allocation.offset == 0)
+    return;
+  interval->allocation.r0 = PREG_NONE;
+  interval->allocation.r1 = PREG_NONE;
+  interval->allocation.offset = 0;
+}
+
 void tcc_ir_register_allocation_params(TCCIRState *ir)
 {
   /* For leaf functions: parameters can stay in registers r0-r3, UNLESS
@@ -236,9 +248,7 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
     {
       interval->incoming_reg0 = -1;
       interval->incoming_reg1 = -1;
-      interval->allocation.r0 = PREG_NONE;
-      interval->allocation.r1 = PREG_NONE;
-      interval->allocation.offset = 0;
+      stack_param_home(interval);
       argno = 4;
       continue;
     }
@@ -295,11 +305,7 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
          */
         if (interval->original_offset == 0)
           interval->original_offset = (argno - 4) * 4;
-        /* Don't overwrite allocator spill slots with caller-stack offsets.
-         */
-        interval->allocation.r0 = PREG_NONE;
-        interval->allocation.r1 = PREG_NONE;
-        interval->allocation.offset = 0;
+        stack_param_home(interval);
       }
       argno += 2;
     }
@@ -321,11 +327,7 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
          */
         if (interval->original_offset == 0)
           interval->original_offset = (argno - 4) * 4;
-        /* Don't overwrite allocator spill slots with caller-stack offsets.
-         */
-        interval->allocation.r0 = PREG_NONE;
-        interval->allocation.r1 = PREG_NONE;
-        interval->allocation.offset = 0;
+        stack_param_home(interval);
       }
       argno++;
     }
@@ -432,6 +434,53 @@ void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir)
   }
 }
 
+static int ls_gpr(int r)
+{
+  return r >= 0 && r <= 12;
+}
+
+/* Whether stack-passed parameter `ls` may stay in the core register(s) linear
+ * scan assigned it.  Its value exists before instruction 0, so no other value
+ * live at entry may share them: the boundary rules that let an interval take
+ * a register at the instruction where another one's last use sits do not hold
+ * for the prologue's load, which happens before either. */
+static int stack_param_keeps_register(TCCIRState *ir, const LSLiveInterval *ls)
+{
+  if (ls->addrtaken || ls->stack_location != 0 || !ls_gpr(ls->r0))
+    return 0;
+  if (ls->reg_type == LS_REG_TYPE_LLONG || ls->reg_type == LS_REG_TYPE_DOUBLE_SOFT)
+  {
+    if (!ls_gpr(ls->r1) || ls->r1 == ls->r0)
+      return 0;
+  }
+  else if (ls->reg_type != LS_REG_TYPE_INT || ls->r1 >= 0)
+    return 0;
+  IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, (int)ls->vreg);
+  if (!iv || iv->addrtaken || iv->is_struct || iv->is_complex || iv->use_vfp || iv->is_volatile)
+    return 0;
+  if ((iv->is_double || iv->is_llong) != (ls->r1 >= 0))
+    return 0;
+  const uint32_t mine = (1u << ls->r0) | (ls->r1 >= 0 ? 1u << ls->r1 : 0);
+  for (int k = 0; k < ir->ls.next_interval_index; ++k)
+  {
+    const LSLiveInterval *o = &ir->ls.intervals[k];
+    if (o == ls)
+      continue;
+    const int at_entry = TCCIR_DECODE_VREG_TYPE((int)o->vreg) == TCCIR_VREG_TYPE_PARAM ||
+                         (ir->has_static_chain && (int)o->vreg == ir->static_chain_vreg);
+    if (!at_entry || o->stack_location != 0)
+      continue;
+    uint32_t theirs = 0;
+    if (ls_gpr(o->r0))
+      theirs |= 1u << o->r0;
+    if (ls_gpr(o->r1))
+      theirs |= 1u << o->r1;
+    if (theirs & mine)
+      return 0;
+  }
+  return 1;
+}
+
 void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
 {
   if (!ir)
@@ -497,6 +546,34 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
     argno += is_64bit ? 2 : 1;
   }
 
+  /* Static references to each parameter, reads and writes alike. */
+  uint16_t *refs = tcc_mallocz(sizeof(uint16_t) * (size_t)param_count);
+  for (int i = 0; i < ir->next_instruction_index; ++i)
+  {
+    const IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    IROperand ops[4];
+    int n = 0;
+    if (irop_config[q->op].has_dest)
+      ops[n++] = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_src1)
+      ops[n++] = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2)
+      ops[n++] = tcc_ir_op_get_src2(ir, q);
+    if (q->op == TCCIR_OP_MLA)
+      ops[n++] = tcc_ir_op_get_accum(ir, q);
+    for (int k = 0; k < n; ++k)
+    {
+      const int32_t vr = irop_get_vreg(ops[k]);
+      if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_PARAM)
+        continue;
+      const int p = TCCIR_DECODE_VREG_POSITION(vr);
+      if (p < param_count && refs[p] < UINT16_MAX)
+        refs[p]++;
+    }
+  }
+
   /* Rewrite linear-scan results: stack-passed params already have a memory
    * home (caller arg area), so drop any local spill slot.  Also force
    * address-taken stack params to remain in memory. */
@@ -511,14 +588,19 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
     if (!is_stack_passed[pidx])
       continue;
 
-    /* Stack-passed params live in the caller's argument area.  If linear-scan
-     * assigned them a register (without spilling), the prolog won't load
-     * them — always reset r0/r1 to force use of the incoming stack location. */
+    /* A parameter the allocator gave core registers keeps them: the prologue
+     * loads it once (tcc_gen_machine_prolog), where every use would otherwise
+     * load it from the caller's area, a far access in a big frame.  Read
+     * once, it is better left there: the one use loads it straight where it
+     * is needed, while the prologue's copy would still have to be moved. */
+    if (refs[pidx] >= 2 && stack_param_keeps_register(ir, ls))
+      continue;
     ls->r0 = PREG_NONE;
     ls->r1 = PREG_NONE;
     ls->stack_location = 0;
   }
 
+  tcc_free(refs);
   tcc_free(is_stack_passed);
 }
 
@@ -1296,6 +1378,11 @@ TCC_DBG_ENV_FLAG(cg_dump_ir_cg, "DUMP_IR_CG")
 TCC_DBG_ENV_FLAG(cg_keep_fwd_dry, "TCC_KEEP_FWD_DRY")
 TCC_DBG_ENV_FLAG(cg_no_rehearsal, "TCC_NO_REHEARSAL")
 
+static int demote_to_param_home(const IRLiveInterval *ir_iv, int32_t vreg)
+{
+  return TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM && ir_iv->incoming_reg0 < 0;
+}
+
 static int try_demote_scratch_conflict(TCCIRState *ir, int r, int insn_i, const uint16_t *dry_insn_saves,
                                        const int *dry_insn_scratch, int n_insns, int32_t **ref_cache)
 {
@@ -1408,12 +1495,23 @@ static int try_demote_scratch_conflict(TCCIRState *ir, int r, int insn_i, const 
     fprintf(stderr, "[phase3-demote] insn=%d vreg=%d R%d -> memory (blocked=%d refs=%d range=%d..%d)\n", insn_i,
             (int)ls_iv->vreg, r, blocked, refs, start, end);
 
-  /* --- Apply the demotion.  The real slot is assigned by the caller. --- */
+  /* --- Apply the demotion.  The real slot is assigned by the caller, except
+   * for a stack-passed parameter: it goes back to the caller's argument area,
+   * which already holds it (the prologue loads only register-resident ones). */
   ls_iv->r0 = -1;
-  ls_iv->stack_location = DEMOTE_PENDING_SLOT;
-  ir_iv->allocation.r0 = PREG_SPILLED | PREG_REG_NONE;
-  ir_iv->allocation.r1 = PREG_NONE;
-  ir_iv->allocation.offset = DEMOTE_PENDING_SLOT;
+  if (demote_to_param_home(ir_iv, vreg))
+  {
+    ir_iv->allocation.r0 = PREG_NONE;
+    ir_iv->allocation.r1 = PREG_NONE;
+    ir_iv->allocation.offset = 0;
+  }
+  else
+  {
+    ls_iv->stack_location = DEMOTE_PENDING_SLOT;
+    ir_iv->allocation.r0 = PREG_SPILLED | PREG_REG_NONE;
+    ir_iv->allocation.r1 = PREG_NONE;
+    ir_iv->allocation.offset = DEMOTE_PENDING_SLOT;
+  }
 
   /* No other interval claims r over [start, end] (checked above), so the whole
    * window can be released unconditionally. */
@@ -4891,7 +4989,9 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                                                      ir->next_instruction_index, &demote_ref_cache);
                 if (dv >= 0)
                 {
-                  demoted_vregs[demoted_count++] = dv;
+                  IRLiveInterval *dli = tcc_ir_get_live_interval(ir, dv);
+                  if (!dli || !demote_to_param_home(dli, dv))
+                    demoted_vregs[demoted_count++] = dv;
                   any_fixup = 1;
                   alt_fixed = 1;
                 }

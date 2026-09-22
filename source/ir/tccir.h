@@ -338,6 +338,7 @@ typedef struct IRLiveInterval
   uint8_t crosses_call : 1; // whether interval spans a function call
   uint8_t phi_pinned : 1;   // register relied upon by identity phi — do not reassign
   uint8_t incoming_stack : 1; // param the ABI placed wholly on the caller's stack (incoming_reg0 < 0 is also "unset")
+  uint8_t is_struct : 1;      // param of struct type: its vreg names memory, never a value
   uint32_t start;           // start instruction index
   uint32_t end;             // end instruction index
   IRVregReplacement allocation;

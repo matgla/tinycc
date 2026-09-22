@@ -11659,6 +11659,35 @@ ST_FUNC int tcc_gen_machine_calls_reload_r9(TCCIRState *ir)
   return 0;
 }
 
+/* Load the stack-passed parameter at parameter offset `off` into the core
+ * register(s) the allocator kept it in.  An offset beyond the immediate forms
+ * is built in the destination itself: in the prologue no other register is
+ * known to be free, as any may hold a parameter. */
+static void prologue_load_stack_param(int lo, int hi, int off)
+{
+  const int base = tcc_state->need_frame_pointer ? R_FP : R_SP;
+  const int adj = param_frame_offset(off);
+  if (hi < 0)
+  {
+    if (load_word_from_base(lo, base, adj, 0))
+      return;
+    if (!ot(th_generic_mov_imm(lo, adj)))
+      load_full_const(lo, PREG_NONE, LFC_SPLIT(adj));
+    ot_check(th_ldr_reg(lo, base, lo, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    return;
+  }
+  if (adj + 4 <= 4095)
+  {
+    load_from_base(lo, hi, IROP_BTYPE_INT64, 0, adj, 0, base);
+    return;
+  }
+  if (!ot(th_generic_mov_imm(lo, adj)))
+    load_full_const(lo, PREG_NONE, LFC_SPLIT(adj));
+  ot_check(th_add_reg(lo, base, lo, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(hi, lo, 4, 6, ENFORCE_ENCODING_NONE));
+  ot_check(th_ldr_imm(lo, lo, 0, 6, ENFORCE_ENCODING_NONE));
+}
+
 ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_size, uint32_t extra_prologue_regs)
 {
   thumb_gen_state.function_argument_count = 0;
@@ -11944,6 +11973,16 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
      * 3) Then load stack-passed params into their allocated registers.
      */
 
+    /* Stack-passed parameters the allocator kept in core registers
+     * (tcc_ir_avoid_spilling_stack_passed_params).  Loaded last: a load may
+     * target a register an incoming argument still occupies until step 2. */
+    typedef struct StackParamLoad
+    {
+      int lo, hi, off;
+    } StackParamLoad;
+    StackParamLoad *stack_loads = tcc_malloc(sizeof(StackParamLoad) * (ir->next_parameter + 1));
+    int stack_load_count = 0;
+
     typedef struct ParamMove
     {
       int dst;
@@ -12007,9 +12046,15 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
       if (incoming_r0 < 0)
       {
-        /* Stack-passed parameters live permanently in the caller's argument
-         * area. Leave their allocations empty so IR materialization can treat
-         * them as VT_PARAM lvalues and load directly when needed. */
+        if (interval->allocation.offset == 0 && alloc_r0 <= R12)
+        {
+          stack_loads[stack_load_count++] =
+              (StackParamLoad){.lo = alloc_r0, .hi = is_64bit ? alloc_r1 : -1, .off = interval->original_offset};
+          continue;
+        }
+        /* Otherwise it lives in the caller's argument area.  Leave the
+         * allocation empty so IR materialization treats it as a VT_PARAM
+         * lvalue and loads it where it is used. */
         interval->allocation.r0 = PREG_NONE;
         interval->allocation.r1 = PREG_NONE;
         interval->allocation.offset = 0;
@@ -12235,6 +12280,10 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       ot_check(th_vmov_2gp_dp((uint16_t)dbl_unpack[i].lo, (uint16_t)dbl_unpack[i].hi,
                               (uint16_t)dbl_unpack[i].dreg, 1));
 
+    for (int i = 0; i < stack_load_count; ++i)
+      prologue_load_stack_param(stack_loads[i].lo, stack_loads[i].hi, stack_loads[i].off);
+
+    tcc_free(stack_loads);
     tcc_free(moves);
   }
 

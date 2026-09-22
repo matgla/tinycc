@@ -184,7 +184,10 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
     {
       IRLiveInterval *iv = tcc_ir_vreg_live_interval(tcc_state->ir, vreg);
       if (iv)
+      {
         iv->is_volatile = (type->t & VT_VOLATILE) != 0;
+        iv->is_struct = (type->t & VT_BTYPE) == VT_STRUCT;
+      }
     }
     /* For stack-passed params (VT_LOCAL), c is the stack offset;
      * for register params, c is the parameter index */

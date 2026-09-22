@@ -238,6 +238,8 @@ TEST_FILES = [
     ("test_frame_loop_lifetimes.c", 0),
     # a pointer VAR walking a local array has two definitions: nothing is forwarded through it
     ("test_entry_store_var_walk.c", 0),
+    # stack-passed parameters read more than once are loaded into registers by the prologue
+    ("test_stack_params_in_regs.c", 0),
     # word copies between frame slots fused into LDM/STM chunks
     ("test_frame_block_copy.c", 0),
     ("test_sra.c", 0),
