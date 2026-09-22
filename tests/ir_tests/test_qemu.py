@@ -2080,6 +2080,9 @@ PIC_TEXT_DATA_SEP_TEST_FILES = [
     # set → th_push returns {0,0}.
     ("bug_struct_mask_copy.c", 0),
     ("bug_mask_copy_noloop.c", 0),
+
+    # A call to a static function defined further down skips the R9 reload.
+    ("test_r9_static_forward_call.c", 0),
 ]
 
 
