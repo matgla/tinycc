@@ -156,8 +156,9 @@ OPT_GEN_SSA(narrow_and, TCCIR_OP_AND) {
 
 /* UBFX(x, #0, #w) of an x that already fits in w bits is a copy: a narrower
  * or equal UBFX, an AND with a mask below 1<<w, an unsigned byte or halfword
- * load, or a 0/1 truth value.  The C backend's casts extend what a load or a
- * previous cast just extended (`ldrh; ubfx #0,#16; ubfx #0,#16`). */
+ * load, a 0/1 truth value, or the result of a call returning an unsigned
+ * narrow type.  The C backend's casts extend what a load or a previous cast
+ * just extended (`ldrh; ubfx #0,#16; ubfx #0,#16`). */
 OPT_GEN_SSA(narrow_ubfx_noop, TCCIR_OP_UBFX) {
   PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = -1);
@@ -183,6 +184,18 @@ OPT_GEN_SSA(narrow_ubfx_noop, TCCIR_OP_UBFX) {
     fits = (bt == IROP_BTYPE_INT8 && width >= 8) || (bt == IROP_BTYPE_INT16 && width >= 16);
   } else if (pop == TCCIR_OP_SETIF || pop == TCCIR_OP_BOOL_OR || pop == TCCIR_OP_BOOL_AND) {
     fits = 1;
+  } else if (pop == TCCIR_OP_FUNCCALLVAL && irop_get_tag(psrc1) == IROP_TAG_SYMREF) {
+    /* The AAPCS has the callee extend a narrow result to a word -- tcc's
+     * return path does, and gcc and LLVM callers rely on it -- so a direct
+     * call declared to return bool or an unsigned byte or halfword already
+     * fits.  (A narrow local that receives the result re-extends it on every
+     * read otherwise.) */
+    Sym *fs = irop_get_sym_ex(ir, psrc1);
+    if (fs && (fs->type.t & VT_BTYPE) == VT_FUNC && fs->type.ref) {
+      int rt = fs->type.ref->type.t, rbt = rt & VT_BTYPE;
+      int rw = rbt == VT_BOOL ? 1 : rbt == VT_BYTE ? 8 : rbt == VT_SHORT ? 16 : 0;
+      fits = rw && (rbt == VT_BOOL || (rt & VT_UNSIGNED)) && rw <= width;
+    }
   }
   GUARD(when(fits));
 
