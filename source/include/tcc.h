@@ -2988,6 +2988,16 @@ ST_FUNC int tcc_gen_machine_calls_reload_r9(struct TCCIRState *ir);
 ST_FUNC int tcc_gen_machine_spill_block_copy_free(int32_t src_spill_off, int32_t dst_spill_off, int nwords,
                                                   uint32_t also_free);
 
+/* A side of tcc_gen_machine_reg_block_copy that is a frame slot rather than a
+ * base register: its offset is a spill-slot offset, to be taken from whichever
+ * register the frame is addressed through. */
+#define MACH_BLOCK_COPY_FRAME (-1)
+
+/* Block copy of `nwords` words between two addresses, each a base register (a
+ * pointer deref) or MACH_BLOCK_COPY_FRAME, through registers the caller owns */
+ST_FUNC int tcc_gen_machine_reg_block_copy(int src_base, int32_t src_off, int dst_base, int32_t dst_off,
+                                           const int *regs, int nwords, int end_idx);
+
 /* Conditional select: dest = (cond) ? then_val : else_val (ITE on ARM) */
 ST_FUNC void tcc_gen_machine_select_mop(MachineOperand then_val, MachineOperand else_val, MachineOperand dest,
                                         int cond_code);

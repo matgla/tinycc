@@ -769,6 +769,13 @@ def main(argv=None) -> int:
             # len(gvals) == 0: gcc built for no level -> nothing to compare, skip.
     divergent = sorted(set(olevels_bad) | set(vsgcc_bad))
 
+    # Each divergent seed's per-level result, so triage starts from "which level
+    # is the odd one out" instead of a second sweep.  Progress channel, so the
+    # stdout contract callers parse is untouched.
+    for s in divergent + gcc_inconsistent:
+        progress("  seed %d: %s" % (s, "  ".join(
+            "%s=%s" % (o, signatures[s].get(o, "?")) for o in olevels)))
+
     if gcc_levels:
         progress(f"\nswept {len(seeds)} seeds — {len(divergent)} divergent "
                  f"(olevels={len(olevels_bad)}, vsgcc-only={len(vsgcc_bad)}, "

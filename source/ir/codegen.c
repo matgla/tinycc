@@ -2265,6 +2265,156 @@ static int ir_codegen_temp_dies_at_store(const int *uses, int nuses, int32_t vr)
          TCCIR_DECODE_VREG_POSITION(vr) < nuses && uses[TCCIR_DECODE_VREG_POSITION(vr)] == 2;
 }
 
+/* Most words one LDM/STM pair of a batched aggregate copy may carry. */
+#define MACH_BLOCK_COPY_MAX_WORDS 8
+
+typedef struct
+{
+  int src_base, dst_base; /* a register, or MACH_BLOCK_COPY_FRAME */
+  int32_t src_off, dst_off;
+  int regs[MACH_BLOCK_COPY_MAX_WORDS];
+  int nwords;
+  int last_i; /* the run's last store */
+} BatchedWordCopy;
+
+/* One word of a batched aggregate copy: the address it touches and the register
+ * the word passes through.  `base` is a physical register, or
+ * MACH_BLOCK_COPY_FRAME for a frame slot whose offset the backend resolves. */
+typedef struct
+{
+  int base;
+  int32_t off;
+  int reg;
+  int32_t vr;
+} CopyWordAccess;
+
+/* Read instruction `idx` as one 32-bit word load (or store, `is_load` 0) of
+ * such a copy: a frame slot, a plain pointer deref, or a pointer deref with a
+ * constant displacement.  Anything wider, narrower, volatile, scaled or landed
+ * on by a jump is not one. */
+static int ir_codegen_copy_word_access(TCCIRState *ir, const uint8_t *branch_target_reset, int idx, int is_load,
+                                       int is_dry_run, CopyWordAccess *w)
+{
+  if (idx < 0 || idx >= ir->next_instruction_index)
+    return 0;
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  if (q->is_jump_target || (branch_target_reset && branch_target_reset[idx]))
+    return 0;
+  const int op = q->op;
+  const int indexed = op == (is_load ? TCCIR_OP_LOAD_INDEXED : TCCIR_OP_STORE_INDEXED);
+  if (!indexed && op != (is_load ? TCCIR_OP_LOAD : TCCIR_OP_STORE))
+    return 0;
+
+  IROperand src1_ir = tcc_ir_op_get_src1(ir, q);
+  IROperand src2_ir = tcc_ir_op_get_src2(ir, q);
+  IROperand dest_ir = tcc_ir_op_get_dest(ir, q);
+  const MopSpec spec = indexed ? (is_load ? (MopSpec){.dest = 2, .src1 = 1, .src2 = 1, .scale = 1}
+                                          : (MopSpec){.dest = 1, .src1 = 1, .src2 = 1, .scale = 1})
+                               : (MopSpec){.dest = 1, .src1 = 2};
+  MopArgs a = ir_decode_cached(is_dry_run, 0, NULL, idx, ir, q, &src1_ir, &src2_ir, &dest_ir, spec);
+
+  /* The word itself: the load's destination, the store's source. */
+  const MachineOperand *val = is_load ? &a.dest : &a.src1;
+  const IROperand *val_ir = is_load ? &dest_ir : &src1_ir;
+  if (val->kind != MACH_OP_REG || val->needs_deref || val->is_64bit ||
+      (val->btype != IROP_BTYPE_INT32 && val->btype != IROP_BTYPE_FLOAT32))
+    return 0;
+  w->reg = val->u.reg.r0;
+  w->vr = irop_get_vreg(*val_ir);
+
+  /* The address: the load's source, the store's destination. */
+  const MachineOperand *adr = is_load ? &a.src1 : &a.dest;
+  const IROperand *adr_ir = is_load ? &src1_ir : &dest_ir;
+  if (tcc_ir_access_is_volatile(ir, *adr_ir) || adr->underalign_hint || val->underalign_hint)
+    return 0;
+  if (indexed)
+  {
+    if (adr->kind != MACH_OP_REG || adr->needs_deref || a.scale.kind != MACH_OP_IMM || a.scale.u.imm.val != 0 ||
+        a.src2.kind != MACH_OP_IMM)
+      return 0;
+    w->base = adr->u.reg.r0;
+    w->off = (int32_t)a.src2.u.imm.val;
+    return 1;
+  }
+  if (adr->kind == MACH_OP_SPILL && !adr->needs_deref)
+  {
+    w->base = MACH_BLOCK_COPY_FRAME;
+    w->off = adr->u.spill.offset;
+    return 1;
+  }
+  if (adr->kind == MACH_OP_REG && adr->needs_deref)
+  {
+    w->base = adr->u.reg.r0;
+    w->off = 0;
+    return 1;
+  }
+  return 0;
+}
+
+/* A small aggregate copied through a register deref comes out of the frontend
+ * batched -- every word loaded, then every word stored, so an overlapping copy
+ * keeps memmove semantics (ir_emit_small_aggregate_copy).  Match the whole run
+ * here: the loads walk one base upwards, the stores walk another in the same
+ * order, and each word dies at its store, so the registers regalloc gave the
+ * loads are free for one LDM and one STM.  Fills `out` and returns the index of
+ * the last store, or 0 when the run is not one. */
+static int ir_codegen_scan_batched_word_copy(TCCIRState *ir, const uint8_t *branch_target_reset, int start_i,
+                                             const int *temp_uses, int temp_uses_n, int is_dry_run,
+                                             BatchedWordCopy *out)
+{
+  CopyWordAccess w;
+  if (!ir_codegen_copy_word_access(ir, branch_target_reset, start_i, 1, is_dry_run, &w))
+    return 0;
+
+  int32_t vrs[MACH_BLOCK_COPY_MAX_WORDS];
+  int n = 0, last = start_i;
+  out->src_base = w.base;
+  out->src_off = w.off;
+  for (;;)
+  {
+    if (!ir_codegen_temp_dies_at_store(temp_uses, temp_uses_n, w.vr))
+      return 0;
+    for (int k = 0; k < n; k++)
+      if (out->regs[k] == w.reg)
+        return 0; /* two live words in one register: not this shape */
+    out->regs[n] = w.reg;
+    vrs[n] = w.vr;
+    n++;
+    if (n == MACH_BLOCK_COPY_MAX_WORDS)
+      break;
+    const int next = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, last);
+    CopyWordAccess nw;
+    if (!ir_codegen_copy_word_access(ir, branch_target_reset, next, 1, is_dry_run, &nw) || nw.base != out->src_base ||
+        nw.off != out->src_off + 4 * n)
+      break;
+    last = next;
+    w = nw;
+  }
+  if (n < 3)
+    return 0;
+
+  /* The stores, in the order the words were loaded. */
+  for (int k = 0; k < n; k++)
+  {
+    const int next = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, last);
+    CopyWordAccess sw;
+    if (!ir_codegen_copy_word_access(ir, branch_target_reset, next, 0, is_dry_run, &sw) || sw.vr != vrs[k] ||
+        sw.reg != out->regs[k])
+      return 0;
+    if (k == 0)
+    {
+      out->dst_base = sw.base;
+      out->dst_off = sw.off;
+    }
+    else if (sw.base != out->dst_base || sw.off != out->dst_off + 4 * k)
+      return 0;
+    last = next;
+  }
+  out->nwords = n;
+  out->last_i = last;
+  return 1;
+}
+
 void tcc_ir_codegen_generate(TCCIRState *ir)
 {
   IRQuadCompact *cq;
@@ -3622,6 +3772,26 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           tcc_error("compiler_error: LOAD operand produced MACH_OP_NONE (i=%d dest_kind=%d src_kind=%d)", i,
                     a.dest.kind, a.src1.kind);
 
+        /* A small aggregate copied through a pointer arrives batched -- every
+         * word loaded, then every word stored -- so it fuses into one LDM and
+         * one STM whatever either side is addressed through. */
+        {
+          BatchedWordCopy bc;
+          if (ir_codegen_scan_batched_word_copy(ir, branch_target_reset, i, temp_uses, temp_uses_n, is_dry_run, &bc))
+          {
+            int done = 0;
+            SCRATCH_WRAP(done = tcc_gen_machine_reg_block_copy(bc.src_base, bc.src_off, bc.dst_base, bc.dst_off,
+                                                               bc.regs, bc.nwords, bc.last_i));
+            if (done)
+            {
+              tcc_ir_spill_cache_clear(&ir->spill_cache);
+              tcc_gen_machine_imm_cache_reset();
+              i = bc.last_i;
+              break;
+            }
+          }
+        }
+
         /* Block copy peephole: consecutive LOAD-from-spill + STORE-to-spill pairs
          * with sequential offsets → single LDM/STM block copy.
          * Safety: all loads must use the same destination register, proving each
@@ -4006,6 +4176,26 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       case TCCIR_OP_LOAD_INDEXED:
       {
         MopArgs a = DECODE(.dest = 2, .src1 = 1, .src2 = 1, .scale = 1);
+
+        /* A small aggregate copied through a pointer arrives batched -- every
+         * word loaded, then every word stored -- so it fuses into one LDM and
+         * one STM whatever either side is addressed through. */
+        {
+          BatchedWordCopy bc;
+          if (ir_codegen_scan_batched_word_copy(ir, branch_target_reset, i, temp_uses, temp_uses_n, is_dry_run, &bc))
+          {
+            int done = 0;
+            SCRATCH_WRAP(done = tcc_gen_machine_reg_block_copy(bc.src_base, bc.src_off, bc.dst_base, bc.dst_off,
+                                                               bc.regs, bc.nwords, bc.last_i));
+            if (done)
+            {
+              tcc_ir_spill_cache_clear(&ir->spill_cache);
+              tcc_gen_machine_imm_cache_reset();
+              i = bc.last_i;
+              break;
+            }
+          }
+        }
 
         /* LDRD pairing: two adjacent 32-bit LOAD_INDEXED ops with the same
          * base register, scale=0, and constant offsets differing by 4 can

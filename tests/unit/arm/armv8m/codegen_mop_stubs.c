@@ -454,6 +454,20 @@ int tcc_gen_machine_spill_block_copy_free(int32_t src_spill_off, int32_t dst_spi
   return 0;
 }
 
+/* Likewise: the stub never fuses, so the individual accesses are emitted. */
+int tcc_gen_machine_reg_block_copy(int src_base, int32_t src_off, int dst_base, int32_t dst_off, const int *regs,
+                                   int nwords, int end_idx)
+{
+  (void)end_idx;
+  (void)src_base;
+  (void)src_off;
+  (void)dst_base;
+  (void)dst_off;
+  (void)regs;
+  (void)nwords;
+  return 0;
+}
+
 /* ============================================================================
  * Control flow / jumps / switch
  * ============================================================================ */

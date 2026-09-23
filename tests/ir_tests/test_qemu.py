@@ -248,6 +248,10 @@ TEST_FILES = [
     ("test_icf_folding.c", 0),
     # a local copied from a call's own struct buffer is that buffer, anywhere in the function
     ("test_call_buffer_copy_alias.c", 0),
+    ("test_ldm_block_copy.c", 0),
+    ("bug_addr_temp_reuse_before_def.c", 0),
+    ("bug_sra_narrow_field_undefined.c", 0),
+    ("bug_narrow_field_store_forward.c", 0),
     # word copies between frame slots fused into LDM/STM chunks
     ("test_frame_block_copy.c", 0),
     ("test_sra.c", 0),

@@ -15979,6 +15979,144 @@ ST_FUNC int tcc_gen_machine_spill_block_copy_free(int32_t src_spill_off, int32_t
   return 1;
 }
 
+/* Size of one word access `reg <- [base, #off]` (or the store), as the encoder
+ * would lay it out; 0 when the offset does not encode. */
+static int block_copy_word_size(int reg, int base, int32_t off, int is_store)
+{
+  const int neg = off < 0;
+  const uint32_t a = neg ? (uint32_t)-off : (uint32_t)off;
+  const thumb_opcode o = is_store ? th_str_imm(reg, base, a, neg ? 4 : 6, ENFORCE_ENCODING_NONE)
+                                  : th_ldr_imm(reg, base, a, neg ? 4 : 6, ENFORCE_ENCODING_NONE);
+  return o.size;
+}
+
+/* Copy `nwords` words from src_base+src_off to dst_base+dst_off as one LDM and
+ * one STM through `regs`, which the caller owns: each holds one word of the
+ * copy and dies at its store.  Which register takes which word does not matter
+ * -- LDM and STM both run in ascending register order, so the same list on both
+ * sides keeps the words in place.  Unlike the frame-slot copier above, either
+ * side may be a general base register (a pointer deref), and the whole copy is
+ * one LDM followed by one STM, so it holds for overlapping ranges exactly as
+ * the loads-then-stores it replaces does.  Returns 0, having emitted nothing,
+ * when an address does not encode, no register is free to hold a destination
+ * address that needs computing, or the pair is no smaller than the individual
+ * accesses. */
+ST_FUNC int tcc_gen_machine_reg_block_copy(int src_base, int32_t src_off, int dst_base, int32_t dst_off,
+                                           const int *regs, int nwords, int end_idx)
+{
+  TCCIRState *ir = tcc_state->ir;
+  if (!ir || nwords < 3 || nwords > 8)
+    return 0;
+
+  const int frame = tcc_state->need_frame_pointer ? R_FP : R_SP;
+  if (src_base == MACH_BLOCK_COPY_FRAME)
+  {
+    src_base = frame;
+    src_off = fp_adjust_local_offset(src_off, 0);
+  }
+  if (dst_base == MACH_BLOCK_COPY_FRAME)
+  {
+    dst_base = frame;
+    dst_off = fp_adjust_local_offset(dst_off, 0);
+  }
+  if (src_base < 0 || src_base >= 16 || dst_base < 0 || dst_base >= 16)
+    return 0;
+  if ((src_off & 3) || (dst_off & 3))
+    return 0;
+
+  uint32_t list = 0;
+  int all_low = 1, top_low = -1;
+  for (int k = 0; k < nwords; k++)
+  {
+    const int r = regs[k];
+    if (r < 0 || r >= 16 || r == R_SP || r == R_PC || (list & (1u << (uint32_t)r)))
+      return 0;
+    list |= 1u << (uint32_t)r;
+    if (r > R7)
+      all_low = 0;
+    else if (r > top_low)
+      top_low = r;
+  }
+  /* The LDM would overwrite the destination address before the STM reads it. */
+  if (list & (1u << (uint32_t)dst_base))
+    return 0;
+
+  /* The LDM's base.  With an offset it goes into one of the loaded registers,
+   * which the LDM then overwrites -- that is what makes it free.  At offset 0
+   * the source register itself is the base, and since it is then not
+   * necessarily in the list the wide (no-writeback) LDM has to carry it: the
+   * narrow one writes back whenever its base is outside the list. */
+  int ra = src_base;
+  thumb_opcode add_src = {0};
+  if (src_off != 0)
+  {
+    ra = top_low >= 0 ? top_low : regs[0];
+    add_src = src_off < 0 ? th_sub_imm(ra, src_base, (uint32_t)-src_off, flags_safe(), ENFORCE_ENCODING_NONE)
+                          : th_add_imm(ra, src_base, (uint32_t)src_off, flags_safe(), ENFORCE_ENCODING_NONE);
+    if (!add_src.size)
+      return 0;
+  }
+  const int ldm_narrow = all_low && ra <= R7 && (list & (1u << (uint32_t)ra));
+  const thumb_opcode ldm = ldm_narrow ? (thumb_opcode){.size = 2, .opcode = 0xC800u | ((uint32_t)ra << 8) | list}
+                                      : (thumb_opcode){.size = 4, .opcode = ((0xE890u | (uint32_t)ra) << 16) | list};
+
+  /* The STM's base.  A computed destination address is ours to destroy, so it
+   * may take the narrow (writeback) form; the destination register itself must
+   * survive, so it takes the wide one with the writeback bit clear. */
+  int rb = dst_base;
+  thumb_opcode add_dst = {0};
+  if (dst_off != 0)
+  {
+    /* Free at the run's LAST instruction, not its first: the destination
+     * address is computed after the LDM has read everything it needs, so a
+     * register the copy itself was using -- the source pointer above all -- is
+     * as good as one that was free all along.  Nothing inside the run reads any
+     * other register, so no value can end between the two points. */
+    const uint32_t excl = list | (1u << (uint32_t)R_SP) | (1u << R_PC) | (1u << (uint32_t)dst_base) |
+                          scratch_global_exclude;
+    rb = tcc_ls_find_free_scratch_reg(&ir->ls, end_idx, excl, ir->leaffunc);
+    if (rb < 0 || rb == PREG_NONE || rb >= 16 || (excl & (1u << (uint32_t)rb)))
+      return 0;
+    add_dst = dst_off < 0 ? th_sub_imm(rb, dst_base, (uint32_t)-dst_off, flags_safe(), ENFORCE_ENCODING_NONE)
+                          : th_add_imm(rb, dst_base, (uint32_t)dst_off, flags_safe(), ENFORCE_ENCODING_NONE);
+    if (!add_dst.size)
+      return 0;
+  }
+  const int stm_narrow = all_low && rb <= R7 && dst_off != 0;
+  const thumb_opcode stm = stm_narrow ? (thumb_opcode){.size = 2, .opcode = 0xC000u | ((uint32_t)rb << 8) | list}
+                                      : (thumb_opcode){.size = 4, .opcode = ((0xE880u | (uint32_t)rb) << 16) | list};
+
+  /* Against the loads and stores themselves, paired into LDRD/STRD where the
+   * peepholes downstream would pair them. */
+  int plain = 0;
+  for (int k = 0; k < nwords; k++)
+  {
+    const int l = block_copy_word_size(regs[k], src_base, src_off + 4 * k, 0);
+    const int s = block_copy_word_size(regs[k], dst_base, dst_off + 4 * k, 1);
+    if (!l || !s)
+      return 0;
+    plain += l + s;
+  }
+  for (int k = 0; k + 1 < nwords; k += 2)
+  {
+    const int l = block_copy_word_size(regs[k], src_base, src_off + 4 * k, 0) +
+                  block_copy_word_size(regs[k + 1], src_base, src_off + 4 * k + 4, 0);
+    const int s = block_copy_word_size(regs[k], dst_base, dst_off + 4 * k, 1) +
+                  block_copy_word_size(regs[k + 1], dst_base, dst_off + 4 * k + 4, 1);
+    plain -= (l > 4 ? l - 4 : 0) + (s > 4 ? s - 4 : 0);
+  }
+  if (add_src.size + ldm.size + add_dst.size + stm.size >= plain)
+    return 0;
+
+  if (add_src.size)
+    ot_check(add_src);
+  ot_check(ldm);
+  if (add_dst.size)
+    ot_check(add_dst);
+  ot_check(stm);
+  return 1;
+}
+
 ST_FUNC void tcc_gen_machine_spill_block_copy(int32_t src_spill_off, int32_t dst_spill_off, int nwords)
 {
   ScratchRegAlloc src_scratch = get_scratch_reg_with_save(0);

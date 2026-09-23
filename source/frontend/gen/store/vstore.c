@@ -30,7 +30,12 @@
  * -O2 .text 5,194,592 at 2, 5,171,632 at 3, 5,169,236 at 4 and 5,169,572 at
  * 6; -O1 5,157,884 -> 5,133,380 at 4.  Over tinycc's own 360 translation
  * units it is a wash (1,329,510 -> 1,329,470), so 4 costs nothing where the
- * copies are few and pays where they are not. */
+ * copies are few and pays where they are not.  Swept again once the codegen
+ * began fusing these batched runs into LDM/STM too (2e7508a0), in case that
+ * was what held the ceiling down: it is not.  zig.c -O2 .text 5,015,252 at 4,
+ * 5,015,268 at 5, 5,015,576 at 6, 5,018,536 at 8 -- past four words the run
+ * rarely finds that many free registers, and the loads and stores it falls
+ * back to are bigger than the call they replaced. */
 TCC_DBG_ENV_INT(small_aggregate_copy_max_chunks, "TCC_SMALL_COPY_CHUNKS", 4)
 
 /* store vtop in lvalue pushed on stack */
