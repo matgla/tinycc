@@ -252,6 +252,7 @@ TEST_FILES = [
     ("bug_addr_temp_reuse_before_def.c", 0),
     ("bug_sra_narrow_field_undefined.c", 0),
     ("bug_narrow_field_store_forward.c", 0),
+    ("bug_alive_share_evicted_owner.c", 0),
     # word copies between frame slots fused into LDM/STM chunks
     ("test_frame_block_copy.c", 0),
     ("test_sra.c", 0),

@@ -3137,6 +3137,26 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
          * (its absorbed partner's uses still read this register across the loop
          * body) and spilling it here would not reload those uses. */
         if (a->loop_phi_locked) continue;
+        /* Its register has to be ITS ALONE.  alive_share puts a second live
+         * holder on a register the allocator still shows as taken by the first,
+         * so spilling the one we picked does NOT free it -- the other is still
+         * living there, and handing the register to cur destroys its value.
+         * The expire path states the same invariant ("only free a register when
+         * no surviving interval still holds it"); eviction had no equivalent.
+         *
+         * Measured: alive_share lends R12 to T509 over [105,122] while T411 owns
+         * it across [102,126]; eviction then spills T411 and gives R12 to T510
+         * over [115,119], overwriting T509 between its def and its use.  fuzz
+         * longlong 197 and 1449 at -O2, combo_num 1103 at -O1. */
+        {
+          int co_held = 0;
+          for (int k = 0; k < active_count; k++) {
+            SSAInterval *b = active[k];
+            if (b != a && b != cur && b->stack_location == 0 &&
+                (b->r0 == a->r0 || b->r1 == a->r0)) { co_held = 1; break; }
+          }
+          if (co_held) continue;
+        }
         if (a->use_count < victim_uses ||
             (a->use_count == victim_uses && victim && a->end > victim->end)) {
           victim_uses = a->use_count;
