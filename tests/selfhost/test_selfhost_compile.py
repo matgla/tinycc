@@ -110,6 +110,7 @@ SELFHOST_COMPILE_SOURCES = [
     # source/backend/generators/
     "source/backend/generators/function.c",
     "source/backend/generators/regalloc.c",
+    "source/backend/generators/icf.c",
     # source/frontend/gen/builtin/
     "source/frontend/gen/builtin/call.c",
     "source/frontend/gen/builtin/chk.c",

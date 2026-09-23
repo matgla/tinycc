@@ -8,7 +8,8 @@ BACKEND_GENERATORS_CC = $(CC) $(CFLAGS) $(DEFINES) $(BACKEND_GENERATORS_INC)
 
 # Object files for the backend generator TUs.
 BACKEND_GENERATORS_SRC = source/backend/generators/function.c \
-	source/backend/generators/regalloc.c
+	source/backend/generators/regalloc.c \
+	source/backend/generators/icf.c
 
 BACKEND_GENERATORS_OBJ = $(patsubst %.c,$(X)%.o,$(BACKEND_GENERATORS_SRC))
 
@@ -35,6 +36,13 @@ $(X)source/backend/generators/regalloc.o: \
 	source/ir/cfg.h source/ir/codegen.h source/ir/core.h source/opt/include/licm.h \
 	source/backend/arch/arm/arm_regalloc.h \
 	$(TCC_CORE_DEPS)
+	@mkdir -p $(dir $@)
+	$(BACKEND_GENERATORS_CC) -c $< -o $@
+
+# Identical code folding: drops a generated body equal to one already emitted.
+$(X)source/backend/generators/icf.o: \
+	source/backend/generators/icf.c \
+	source/include/tcc.h $(TCC_CORE_DEPS)
 	@mkdir -p $(dir $@)
 	$(BACKEND_GENERATORS_CC) -c $< -o $@
 

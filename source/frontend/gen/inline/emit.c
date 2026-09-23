@@ -68,6 +68,10 @@ static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t siz
   if (shift == 0)
     return;
 
+  /* What identical code folding recorded about this section describes
+   * addresses that are about to move. */
+  tcc_icf_section_changed(sec);
+
   /* Shift the section's tail data down (by `shift`, not `size`). */
   size_t tail_offset = (size_t)(start + size);
   size_t tail_len = sec->data_offset - tail_offset;
@@ -255,6 +259,10 @@ void gen_late_reopt_functions(TCCState *s)
     if (!sym || !sym->type.ref)
       continue;
     if (!sym->type.ref->f.func_late_reopt)
+      continue;
+    /* Its body is another function's now (tcc_icf_try_fold); re-emitting
+     * would erase that one's range and orphan every other caller. */
+    if (sym->type.ref->f.func_icf_folded)
       continue;
     /* Must still have saved tokens (the auto-inline post-emit path
      * preserves them when func_late_reopt is set). */

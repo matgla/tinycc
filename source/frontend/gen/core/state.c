@@ -228,6 +228,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   /* Every definition has been seen: settle the tentative ones before any
    * deferred body addresses them. */
   finalize_tentative_definitions(s1);
+  s1->tu_parsed = 1;
   /* Bodies saved for -finline-functions-called-once: generate them now that
    * every call site in the TU is known. */
   gen_deferred_function_bodies(s1);
@@ -334,6 +335,7 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   inline_release_hidden_label_bindings();
   free_deferred_functions(s1);
   free_tentative_definitions(s1);
+  tcc_icf_reset();
 
   str_lit_pool_free();
 

@@ -133,6 +133,9 @@ void gen_function(Sym *sym)
 
   funcname = get_tok_str(sym->v, NULL);
   func_ind = ind;
+  /* Where this body's relocations begin, for tcc_icf_try_fold. */
+  const size_t func_reloc_mark =
+      cur_text_section->reloc ? cur_text_section->reloc->data_offset : 0;
   func_vt = sym->type.ref->type;
   func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
   func_has_label_addr = 0;
@@ -573,6 +576,10 @@ void gen_function(Sym *sym)
   elfsym(sym)->st_size = ind - func_ind;
 
   cur_text_section->data_offset = ind;
+  /* An identical body was generated already: drop this one and let the
+   * symbol point at it (identical code folding). */
+  if (tcc_icf_try_fold(tcc_state, sym, cur_text_section, func_ind, ind - func_ind, func_reloc_mark))
+    ind = func_ind;
   local_scope = 0;
   label_pop(&global_label_stack, global_label_stack_start, 0);
 

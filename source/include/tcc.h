@@ -590,6 +590,7 @@ struct FuncAttr
       func_rewritten_extern_inline : 1, /* extern inline rewritten to non-extern inline-only def */
       func_outofline_needed : 1,        /* always_inline call could not stay call-site-only */
       func_auto_inline : 1,             /* compiler-selected auto-inline candidate (small func) */
+      func_icf_folded : 1,              /* body dropped: the symbol points at an identical one (tcc_icf_try_fold) */
       func_deferred_inline : 1,         /* auto-inline candidate that was NOT compiled at definition time:
                                            a `static inline` whose body gen_inline_functions still owes the
                                            TU.  Emit it there iff some call site fell back to a real call
@@ -1350,6 +1351,9 @@ struct TCCState
    * of the TU (finalize_tentative_definitions). */
   struct Sym **tentative_syms;
   int nb_tentative_syms;
+  /* The whole TU has been parsed: what is generated from here on (deferred
+   * bodies, owed inline bodies) sees every declaration and every use. */
+  int tu_parsed;
   /* Body length (saved-token ints) the function being generated may still
    * absorb by expanding called-once functions (called_once_budget_begin). */
   int called_once_budget;
@@ -2341,6 +2345,12 @@ ST_FUNC ElfSym *elfsym(Sym *);
 ST_FUNC void update_storage(Sym *sym);
 ST_FUNC void put_extern_sym2(Sym *sym, int sh_num, addr_t value, unsigned long size, int can_add_underscore);
 ST_FUNC void put_extern_sym(Sym *sym, Section *section, addr_t value, unsigned long size);
+
+/* Identical code folding: a generated body equal to one already emitted is
+ * dropped and its symbol points at the survivor (backend/generators/icf.c). */
+int tcc_icf_try_fold(TCCState *s1, Sym *sym, Section *sec, addr_t start, addr_t size, size_t reloc_mark);
+void tcc_icf_reset(void);
+void tcc_icf_section_changed(Section *sec);
 #if PTR_SIZE == 4
 ST_FUNC void greloc(Section *s, Sym *sym, unsigned long offset, int type);
 #endif
