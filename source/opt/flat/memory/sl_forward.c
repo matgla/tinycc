@@ -1221,9 +1221,13 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
 
       /* A volatile read must be performed, not answered from a tracked store
        * (`volatile int x; x = 1; x = 2;` — the reads are what keep both
-       * stores alive). */
+       * stores alive).
+       *
+       * `goto`, not `continue`: giving up on forwarding INTO this load must
+       * not also skip the bookkeeping its DESTINATION owes (see
+       * skip_load_fwd). */
       if (tcc_ir_access_is_volatile(ir, src1))
-        continue;
+        goto skip_load_fwd;
 
       /* Only forward for stack locals or LEA-resolvable non-locals. */
       int load_via_lea = 0;
@@ -1253,7 +1257,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         {
           LOG_SL_FWD("LOAD@i=%d SKIP: src1 not is_local and not is_lval", i);
         }
-        continue;
+        goto skip_load_fwd;
       }
 
       /* Skip if address taken (may alias through a pointer). */
@@ -1263,7 +1267,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         if (interval && interval->addrtaken)
         {
           LOG_SL_FWD("LOAD@i=%d SKIP: addr vreg:%d addrtaken", i, addr_vr);
-          continue;
+          goto skip_load_fwd;
         }
       }
 
@@ -1958,6 +1962,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                    (const void *)addr_sym, (long long)addr_offset, matched_any, rejected_width, rejected_stale_tracker,
                    rejected_invalid);
       }
+    skip_load_fwd:;
     }
     /* LOAD_INDEXED with LEA-mapped base + const index: resolve to base_offset+imm and forward. */
     else if (q->op == TCCIR_OP_LOAD_INDEXED)
