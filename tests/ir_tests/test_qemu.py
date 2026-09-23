@@ -718,6 +718,7 @@ TEST_FILES = [
     ("nested_capture_64bit.c", 0),
     ("nested_capture_two_level.c", 0),
     ("sl_forward_load_redefines_var.c", 0),
+    ("466_alive_share_boundary_coholder.c", 0),
     ("nested_direct_call_args.c", 0),
     ("nested_struct_return.c", 0),
     ("nested_shadowing.c", 0),

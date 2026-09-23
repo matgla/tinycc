@@ -86,6 +86,27 @@ typedef struct SSAInterval {
   uint8_t co_member;   /* 1 if part of a graph-coalesced class (rep or member) — the in-scan transfer must leave it alone */
 } SSAInterval;
 
+/* ra_alive_share deliberately leaves a SECOND live holder on a register the
+ * allocator still shows as owned by the first, so every site that frees a
+ * register or hands it on has to ask whether anyone else is still living
+ * there.  The expire path asks it with survivor_int; eviction learned to ask
+ * it in 030e6fa7.  True when some active interval OTHER than `skip` holds hr. */
+static int ra_reg_has_other_holder(SSAInterval **active, int active_count,
+                                   const SSAInterval *skip, int hr)
+{
+  if (hr < 0)
+    return 0;
+  for (int k = 0; k < active_count; k++)
+  {
+    const SSAInterval *a = active[k];
+    if (a == skip)
+      continue;
+    if (a->r0 == hr || a->r1 == hr)
+      return 1;
+  }
+  return 0;
+}
+
 /* ============================================================================
  * Call-site prefix sum (reused from ir/live.c pattern)
  * ============================================================================ */
@@ -2583,6 +2604,11 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
           SSAInterval *a = active[k];
           if (a->stack_location != 0 || a->end != cur->start)
             continue;
+          /* Same co-holder rule: an interval whose registers someone else
+           * still holds is not a victim — freeing them frees nothing. */
+          if (ra_reg_has_other_holder(active, active_count, a, a->r0) ||
+              (a->r1 >= 0 && ra_reg_has_other_holder(active, active_count, a, a->r1)))
+            continue;
           if (!avail0 && (a->r0 == want0 || a->r1 == want0)) { evict0 = k; avail0 = 1; }
           if (!avail1 && (a->r0 == want1 || a->r1 == want1)) { evict1 = k; avail1 = 1; }
         }
@@ -2854,6 +2880,12 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
           int boundary = !hr_free && partner->end == cur->start &&
                          cur->reg_type == LS_REG_TYPE_INT &&
                          partner->reg_type == LS_REG_TYPE_INT;
+          /* Partner expiring at cur->start does NOT free hr while an
+           * alive_share borrower's interval runs past it: taking hr here
+           * would clobber the borrower, and marking it free would let the
+           * next allocation clobber it again. */
+          if (boundary && ra_reg_has_other_holder(active, active_count, partner, hr))
+            boundary = 0;
           if ((hr_free || boundary) &&
               hr < tcc_state->registers_for_allocator) {
             int ok = 1;
@@ -2968,7 +3000,8 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
             for (int k = 0; k < active_count; k++) {
               SSAInterval *a = active[k];
               if (a->r0 == hr && a->r1 < 0 && a->end == cur->start &&
-                  a->stack_location == 0 && a->reg_type == LS_REG_TYPE_INT) {
+                  a->stack_location == 0 && a->reg_type == LS_REG_TYPE_INT &&
+                  !ra_reg_has_other_holder(active, active_count, a, hr)) {
                 int_free |= (1ull << hr);
                 active[k] = active[--active_count];
                 reg = hr;
