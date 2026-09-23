@@ -74,6 +74,7 @@ typedef struct SSAInterval {
   uint8_t is_volatile : 1; /* volatile-qualified local: force to a stack slot so every access is a real ldr/str */
   uint8_t is_param : 1;
   uint8_t reg_shared : 1; /* cur shares hr with another active interval (return-block tail); skip expire-free and active push */
+  uint8_t alive_shared : 1; /* holds a pair BORROWED from a still-live owner (ra_alive_reg_shareable proved the owner dead only across THIS interval's range) — must not be passed on */
   uint8_t loop_phi_locked : 1; /* absorbed a loop-phi partner (carries a loop-carried value across the whole loop body); must not be evicted — spilling it mid-loop would not reload the partner's uses and corrupts the IV */
   uint8_t reg_type;
   uint16_t use_count;
@@ -2743,6 +2744,20 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
               continue;
             if (p->co_member || cur->co_member || p->loop_phi_locked)
               continue;
+            /* A pair the donor itself only BORROWED is not the donor's to pass
+             * on.  ra_alive_reg_shareable proved the real owner dead across the
+             * DONOR's range and no further, so inheriting the pair here extends
+             * the loan over a range nothing has checked -- and the owner, still
+             * live, finds its register rewritten under it.
+             *
+             * __aeabi_dadd built exactly that chain: alive_share lent r4:r5 to
+             * a temp over [140,148] while the aligned-mantissa phi owned them
+             * across [131,180], boundary reuse passed them to [148,149] and
+             * then to the sticky-bit value over [149,160], and the phi's
+             * mantissa came back as the other operand's.  1.0 + 12.0 returned
+             * 24.0. */
+            if (p->alive_shared)
+              continue;
             if (p->r0 >= tcc_state->registers_for_allocator ||
                 p->r1 >= tcc_state->registers_for_allocator)
               continue;
@@ -2786,6 +2801,7 @@ static void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
             dirty_int |= ((1ull << p0) | (1ull << p1));
             cur->r0 = p0;
             cur->r1 = p1;
+            cur->alive_shared = 1;
             alive_shared_used = 1;
             active[active_count++] = cur;
             RA_DBG("  alive_share pair T%d [%u,%u] -> R%d:R%d",
