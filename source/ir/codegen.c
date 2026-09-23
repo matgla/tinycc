@@ -125,7 +125,7 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
        * (negative FP offset), not the caller's argument area, so VT_PARAM
        * would incorrectly add offset_to_args. */
       int spilled_param_flag = 0;
-      if ((old_r & VT_PARAM) && interval->incoming_reg0 < 0)
+      if ((old_r & VT_PARAM) && interval->incoming_reg0 < 0 && !interval->nested_home)
       {
         spilled_param_flag = VT_PARAM;
       }
@@ -190,6 +190,10 @@ static int ir_codegen_op_touches_volatile(TCCIRState *ir, IRQuadCompact *q)
  * scan gave it; the prologue loads those. */
 static void stack_param_home(IRLiveInterval *interval)
 {
+  /* A parameter a nested function captures keeps its frame slot: that slot is
+   * the capture's target, and the prologue homes the incoming value into it. */
+  if (interval->nested_home && interval->allocation.offset != 0)
+    return;
   if (interval->allocation.r0 <= 12 && interval->allocation.offset == 0)
     return;
   interval->allocation.r0 = PREG_NONE;
@@ -481,6 +485,62 @@ static int stack_param_keeps_register(TCCIRState *ir, const LSLiveInterval *ls)
   return 1;
 }
 
+/* GNU nested functions capture the enclosing function's variables BY REFERENCE,
+ * through a static chain pointing at the parent's frame.  A captured variable
+ * must therefore have a stable home at a fixed offset in that frame, and every
+ * parent access must go through it.  Locals get one for free: the capture marks
+ * them address-taken and linear scan spills them.  Parameters do not — a
+ * register-passed one lives in a register, and a stack-passed one lives in the
+ * CALLER's argument area, at an offset_to_args-relative position the child
+ * cannot name (the children are compiled from finalize_nested_functions, before
+ * the parent's prologue fixes offset_to_args).
+ *
+ * True when `vreg` is a parameter of the function currently being compiled and
+ * some nested function of THAT function captures it.  The parent_nf filter is
+ * what keeps a child's own PARAM 0 from matching its parent's captured PARAM 0:
+ * when the parent is being compiled current_nested_func is NULL, when child C
+ * is being compiled it is C, and a capture belongs to whichever function
+ * declared it.  Stateless — derived from the live nested_funcs table, which is
+ * cleared only at the end of compile_nested_functions — so it is immune to the
+ * addrtaken resets that run between parsing and register allocation. */
+int tcc_ir_param_is_captured_by_nested(int vreg)
+{
+  if (!tcc_state || tcc_state->nb_nested_funcs == 0)
+    return 0;
+  if (TCCIR_DECODE_VREG_TYPE(vreg) != TCCIR_VREG_TYPE_PARAM)
+    return 0;
+  for (int i = 0; i < tcc_state->nb_nested_funcs; i++)
+  {
+    const NestedFunc *nf = &tcc_state->nested_funcs[i];
+    if (nf->parent_nf != tcc_state->current_nested_func)
+      continue;
+    for (int j = 0; j < nf->nb_captured; j++)
+      if (nf->captured_vregs[j] == vreg)
+        return 1;
+  }
+  return 0;
+}
+
+/* Decide, once and for the whole function, which parameters need a parent-frame
+ * home because a nested function captures them.  `addrtaken` carries the rest
+ * of the decision: prescan_captured_vars sets it for every capture, and
+ * gen_function clears it again for the nested functions that were inlined at
+ * every call site — those need no chain, so their captures need no home.  Run
+ * before compute_stack_layout so the three places that would otherwise reset a
+ * parameter to its caller-side home can see the flag. */
+void tcc_ir_mark_nested_captured_params(TCCIRState *ir)
+{
+  if (!ir || !tcc_state || tcc_state->nb_nested_funcs == 0)
+    return;
+  for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
+  {
+    const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
+    IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, encoded_vreg);
+    if (interval && interval->addrtaken && tcc_ir_param_is_captured_by_nested(encoded_vreg))
+      interval->nested_home = 1;
+  }
+}
+
 void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
 {
   if (!ir)
@@ -593,6 +653,15 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
      * load it from the caller's area, a far access in a big frame.  Read
      * once, it is better left there: the one use loads it straight where it
      * is needed, while the prologue's copy would still have to be moved. */
+    /* Captured by a nested function: the linear-scan slot IS its home, and
+     * the prologue copies the incoming value into it.  Resetting it here
+     * would send the parent back to the caller's argument area and leave the
+     * capture resolving to chain offset 0. */
+    {
+      IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, (int)ls->vreg);
+      if (li && li->nested_home && ls->stack_location != 0)
+        continue;
+    }
     if (refs[pidx] >= 2 && stack_param_keeps_register(ir, ls))
       continue;
     ls->r0 = PREG_NONE;

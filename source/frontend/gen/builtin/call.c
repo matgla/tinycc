@@ -137,24 +137,32 @@ void unary_funcall(void)
    * correct chain pointer from our own incoming chain — emitting SET_CHAIN
    * would clobber it with R7 which may be an unrelated frame pointer. */
   int set_chain_ir_idx = -1;
+  /* The nested function this call targets, if any.  Its nb_real_calls counts
+   * the call sites that actually emitted a call: incremented here, decremented
+   * again below wherever the body is inlined instead.  gen_function needs the
+   * exact count — "the callee is marked auto_inline" is not the same thing as
+   * "every call site inlined it", and clearing a capture's addrtaken on that
+   * guess leaves the surviving call reading chain offset 0. */
+  NestedFunc *call_nf = NULL;
   if (tcc_state->ir && call_func_sym && call_func_sym->a.nested_func)
   {
     int emit_set_chain = 1;
+    for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
+    {
+      if (tcc_state->nested_funcs[ni].sym == call_func_sym)
+      {
+        call_nf = &tcc_state->nested_funcs[ni];
+        break;
+      }
+    }
+    if (call_nf)
+      call_nf->nb_real_calls++;
     if (tcc_state->current_nested_func)
     {
       /* Caller is a nested function.  Determine if callee is our child
        * (defined inside our body) or a sibling (defined in the same parent
        * scope).  Only emit SET_CHAIN for child calls. */
-      NestedFunc *callee_nf = NULL;
-      for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
-      {
-        if (tcc_state->nested_funcs[ni].sym == call_func_sym)
-        {
-          callee_nf = &tcc_state->nested_funcs[ni];
-          break;
-        }
-      }
-      if (callee_nf && callee_nf->parent_nf != tcc_state->current_nested_func)
+      if (call_nf && call_nf->parent_nf != tcc_state->current_nested_func)
       {
         /* Sibling call: R10 already has the correct parent FP */
         emit_set_chain = 0;
@@ -1069,6 +1077,8 @@ va_arg_pack_done:
       tcc_state->ir->next_instruction_index = ir_idx_before_args;
       if (set_chain_ir_idx >= 0 && tcc_state->ir)
         tcc_state->ir->compact_instructions[set_chain_ir_idx].op = TCCIR_OP_NOP;
+      if (call_nf && call_nf->nb_real_calls > 0)
+        call_nf->nb_real_calls--;
       inline_evaled = 1;
     }
   }
@@ -1798,6 +1808,8 @@ va_arg_pack_done:
        * the inlined body accesses parent variables directly. */
       if (set_chain_ir_idx >= 0 && tcc_state->ir)
         tcc_state->ir->compact_instructions[set_chain_ir_idx].op = TCCIR_OP_NOP;
+      if (call_nf && call_nf->nb_real_calls > 0)
+        call_nf->nb_real_calls--;
 
       /* --- 2. Create parameter locals and store arguments --- */
       Sym *saved_local = local_stack;

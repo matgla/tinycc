@@ -339,6 +339,7 @@ typedef struct IRLiveInterval
   uint8_t phi_pinned : 1;   // register relied upon by identity phi — do not reassign
   uint8_t incoming_stack : 1; // param the ABI placed wholly on the caller's stack (incoming_reg0 < 0 is also "unset")
   uint8_t is_struct : 1;      // param of struct type: its vreg names memory, never a value
+  uint8_t nested_home : 1;    // param captured by a nested function: it keeps a parent-frame home
   uint32_t start;           // start instruction index
   uint32_t end;             // end instruction index
   IRVregReplacement allocation;
@@ -838,6 +839,8 @@ void tcc_ir_register_allocation_params(TCCIRState *ir);
  * incoming stack home for the duration of the call. */
 void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir);
 void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir);
+int tcc_ir_param_is_captured_by_nested(int vreg);
+void tcc_ir_mark_nested_captured_params(TCCIRState *ir);
 void tcc_ir_build_stack_layout(TCCIRState *ir);
 const TCCStackSlot *tcc_ir_stack_slot_by_vreg(const TCCIRState *ir, int vreg);
 const TCCStackSlot *tcc_ir_stack_slot_by_offset(const TCCIRState *ir, int frame_offset);

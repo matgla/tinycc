@@ -234,6 +234,11 @@ void gen_function(Sym *sym)
         continue;
       if (nf->trampoline_needed || nf->nb_captured == 0)
         continue;
+      /* Marked auto_inline is a hope, not a fact: a call site can decline for
+       * reasons of its own, and the surviving call still reads the captures
+       * through the static chain.  nb_real_calls is the fact. */
+      if (nf->nb_real_calls > 0)
+        continue;
       int called_by_sibling = 0;
       int func_tok = nf->sym->v & ~SYM_FIELD;
       for (int si = 0; si < tcc_state->nb_nested_funcs && !called_by_sibling; si++) {

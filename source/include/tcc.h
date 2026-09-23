@@ -942,6 +942,7 @@ typedef struct NestedFunc
   int needs_chain_save;                        /* 1 if a child func needs multi-hop chain (depth>1) */
   int compiled;                                /* number of captured parent variables */
   int trampoline_needed;                       /* address of this nested function was taken */
+  int nb_real_calls;                           /* call sites that emitted a real call (were not inlined) */
   Sym *trampoline_tcc_sym;                     /* TCC symbol for trampoline code (.text) */
   Sym *chain_slot_tcc_sym;                     /* TCC symbol for chain slot (.data) */
   /* Non-local goto support: nested function does 'goto label' targeting parent __label__ */

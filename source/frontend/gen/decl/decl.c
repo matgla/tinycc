@@ -965,6 +965,7 @@ int decl(int l)
            * address-taken).  Write captures produce VAR-to-VAR IR patterns
            * the optimizer can mishandle after inlining. */
           if (tcc_state->ir && nf->func_str &&
+              !nf->sym->type.ref->f.func_noinline &&
               (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
               auto_inline_sig_ok(nf->sym) && nf->nb_nlgotos == 0 &&
               nf->nb_addr_labels == 0 &&

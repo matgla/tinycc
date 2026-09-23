@@ -693,6 +693,7 @@ static uint32_t *spill_slot_weights(TCCIRState *ir)
 static void compute_stack_layout(TCCIRState *ir, int func_var)
 {
   tcc_ls_reset_scratch_cache(&ir->ls);
+  tcc_ir_mark_nested_captured_params(ir);
   tcc_ir_avoid_spilling_stack_passed_params(ir);
 
   /* Initial min-local-offset scan */
@@ -730,6 +731,14 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
     {
       loc = min_local_offset;
     }
+    /* The incoming static chain is saved at frame offset -4, and that slot is
+     * not an IR operand — nothing in the scan above can see it.  A nested
+     * function that only forwards the chain to a child of its own (no locals,
+     * no spills) would otherwise have loc raised to 0 here, and its prologue
+     * would store the chain below its own SP, where the child's push lands on
+     * it.  gen_function already reserved these four bytes; keep them. */
+    if (ir->has_static_chain && loc > -4)
+      loc = -4;
     if (func_var && loc > -28)
       loc = -28;
   }
@@ -949,6 +958,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
   tcc_ir_register_allocation_params(ir);
   tcc_ir_build_stack_layout(ir);
 }
+
 
 /* ================================================================== */
 /*  Compile nested functions and update symbol info                   */

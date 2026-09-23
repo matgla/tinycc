@@ -290,9 +290,14 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
       use_llocal = 1;
     }
 
-    /* Only preserve is_param for stack-passed parameters (incoming_reg0 < 0). */
+    /* Only preserve is_param for stack-passed parameters (incoming_reg0 < 0)
+     * that still live in the caller's argument area.  One a nested function
+     * captures was given a home in THIS frame (nested_home, see
+     * tcc_ir_mark_nested_captured_params) and the prologue copied the incoming
+     * value into it: reading it as a param would add offset_to_args to an
+     * offset that is already frame-relative. */
     int spilled_param = 0;
-    if (op->is_param && interval->incoming_reg0 < 0)
+    if (op->is_param && interval->incoming_reg0 < 0 && !interval->nested_home)
     {
       spilled_param = 1;
     }

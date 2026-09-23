@@ -5997,6 +5997,18 @@ static thumb_opcode thumb_udiv_regonly(uint32_t rd, uint32_t rn, uint32_t rm)
 
 typedef thumb_opcode (*thumb_longmul_handler_t)(uint32_t rdlo, uint32_t rdhi, uint32_t rn, uint32_t rm);
 
+/* A 64-bit operand whose needs_deref came from is_lval NAMES memory: the value
+ * sits at that address, it is not a pointer to follow.  Two kinds are of that
+ * sort — PARAM_STACK (the caller's argument area) and CHAIN_REL (a variable
+ * captured from a parent frame, reached through the static chain).  Splitting
+ * either into halves steps the OFFSET by 4, which is right; following it as a
+ * pointer reads the low word and dereferences that.  MACH_OP_SPILL is not in
+ * the set: its needs_deref comes from is_llocal, which really is a pointer. */
+static inline bool mach_op_64_names_memory(const MachineOperand *op)
+{
+  return op->kind == MACH_OP_PARAM_STACK || op->kind == MACH_OP_CHAIN_REL;
+}
+
 /* ============================================================
  * mach_resolve_deref_64
  * ============================================================
@@ -6018,10 +6030,9 @@ static MachineOperand mach_resolve_deref_64(MachineCodegenContext *mctx, const M
   if (!op->needs_deref)
     return *op;
 
-  /* PARAM_STACK with needs_deref (is_lval): the 64-bit value IS directly
-   * at [fp+offset], NOT a pointer to follow.  Clear needs_deref and let
-   * the normal mach_make_lo_half / mach_make_hi_half path handle it. */
-  if (op->kind == MACH_OP_PARAM_STACK)
+  /* The value is directly at [fp+offset] / [chain+offset]: clear needs_deref
+   * and let the normal mach_make_lo_half / mach_make_hi_half path handle it. */
+  if (mach_op_64_names_memory(op))
   {
     MachineOperand result = *op;
     result.needs_deref = false;
@@ -8674,10 +8685,11 @@ ST_FUNC void tcc_gen_machine_assign_mop_ex(MachineOperand src, MachineOperand de
    * splitting registers via mach_make_hi_half would create a bogus base
    * address. Instead, load both halves from [base+0] and [base+4].
    *
-   * Exception: PARAM_STACK with needs_deref means the 64-bit value IS
-   * directly at [fp+offset], not a pointer to follow. Clear needs_deref
-   * so it falls through to the normal lo/hi split path. */
-  if (src.needs_deref && src.is_64bit && src.kind == MACH_OP_PARAM_STACK)
+   * Exception: PARAM_STACK and CHAIN_REL with needs_deref mean the 64-bit
+   * value IS directly at [fp+offset] / [chain+offset], not a pointer to
+   * follow (mach_op_64_names_memory). Clear needs_deref so it falls through
+   * to the normal lo/hi split path. */
+  if (src.needs_deref && src.is_64bit && mach_op_64_names_memory(&src))
     src.needs_deref = false;
 
   if (dest.is_64bit)
@@ -12052,6 +12064,25 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
               (StackParamLoad){.lo = alloc_r0, .hi = is_64bit ? alloc_r1 : -1, .off = interval->original_offset};
           continue;
         }
+        /* Captured by a nested function: the caller's argument area is not a
+         * home the child can name, so this parameter was given a slot in OUR
+         * frame.  Copy the incoming value into it — the child reads the slot
+         * chain-relative, and every parent access goes through it too, which
+         * is what keeps the by-reference semantics. */
+        if (interval->nested_home && interval->allocation.offset != 0)
+        {
+          const int dst = fp_adjust_local_offset(interval->allocation.offset, 0);
+          ScratchRegAlloc sc = get_scratch_reg_with_save(incoming_arg_regs_mask);
+          prologue_load_stack_param(sc.reg, -1, interval->original_offset);
+          tcc_gen_machine_store_to_stack_ex(sc.reg, dst, incoming_arg_regs_mask);
+          if (is_64bit)
+          {
+            prologue_load_stack_param(sc.reg, -1, interval->original_offset + 4);
+            tcc_gen_machine_store_to_stack_ex(sc.reg, dst + 4, incoming_arg_regs_mask);
+          }
+          restore_scratch_reg(&sc);
+          continue;
+        }
         /* Otherwise it lives in the caller's argument area.  Leave the
          * allocation empty so IR materialization treats it as a VT_PARAM
          * lvalue and loads it where it is used. */
@@ -12966,16 +12997,17 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
     MachineCodegenContext mctx = {0};
     if (m->mop.is_64bit && m->dst_reg_hi != 0 && m->dst_reg_hi != PREG_REG_NONE)
     {
-      if (m->mop.needs_deref && m->mop.kind != MACH_OP_PARAM_STACK)
+      if (m->mop.needs_deref && !mach_op_64_names_memory(&m->mop))
       {
         /* The operand holds a pointer (in reg, spill, etc.).  Load the
          * pointer into a register, then fetch lo/hi from [ptr+0]/[ptr+4].
          * mach_make_hi_half cannot handle this because it adjusts the
          * storage location (e.g. spill offset) instead of the deref offset.
          *
-         * PARAM_STACK is excluded: mach_ensure_in_reg for PARAM_STACK
-         * always loads directly from the caller's argument area, so the
-         * mach_make_lo/hi_half path handles it correctly. */
+         * PARAM_STACK and CHAIN_REL are excluded (mach_op_64_names_memory):
+         * mach_ensure_in_reg loads those directly from the caller's argument
+         * area / the parent frame, so the mach_make_lo/hi_half path handles
+         * them correctly. */
         int base;
         if (m->mop.kind == MACH_OP_REG)
         {
@@ -13857,7 +13889,7 @@ static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, T
       store_word_to_stack(hi_scr, hi_offset);
     }
   }
-  else if (mop->needs_deref && mop->kind != MACH_OP_PARAM_STACK)
+  else if (mop->needs_deref && !mach_op_64_names_memory(mop))
   {
     /* The operand holds a pointer (in reg, spill, etc.), not the 64-bit
      * value itself.  Load the pointer into a register, then fetch the
@@ -13865,9 +13897,10 @@ static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, T
      * mach_make_hi_half would incorrectly adjust the storage location
      * (e.g. spill offset) instead of the dereference offset.
      *
-     * PARAM_STACK is excluded: mach_ensure_in_reg for PARAM_STACK always
-     * loads directly from the caller's argument area (ignores needs_deref),
-     * so the else path with mach_make_lo/hi_half handles it correctly.
+     * PARAM_STACK and CHAIN_REL are excluded (mach_op_64_names_memory):
+     * mach_ensure_in_reg loads those directly from the caller's argument
+     * area / the parent frame (ignoring needs_deref), so the else path with
+     * mach_make_lo/hi_half handles them correctly.
      *
      * The base register must NOT be the scratch because both halves are
      * loaded into the scratch.  If base == scratch the first load would
