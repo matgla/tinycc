@@ -332,6 +332,29 @@ ST_FUNC void tcc_yaff_libs_free(TCCState *s1)
   s1->nb_yaff_libs = 0;
 }
 
+/* Offset of a linked address inside the module's data region.
+ *
+ * The loader lays that region out as [rodata][padding][data][padding][bss]
+ * [padding][got] and reproduces the linker's own distances: header.data_length
+ * is computed as rodata + rd_padding + data, and header.bss_length carries the
+ * padding on either side of .bss (see tcc_output_yaff). So every address from
+ * .rodata's base to the end of the GOT converts with a single subtraction.
+ *
+ * It has to be done this way rather than per section: rebasing as
+ * `addr - data_section->sh_addr + rodata_section->sh_size` silently drops
+ * whatever alignment padding the linker left between .rodata and .data. That
+ * padding is usually zero, which is why it went unnoticed -- but an image with
+ * a page-aligned object in .data gets a real gap (336 bytes on the Zig
+ * compiler, whose .data is 4096-aligned), and then every relocation whose patch
+ * site is in .data lands that many bytes short: it overwrites the first word of
+ * a neighbouring object and leaves the pointer that actually needed relocating
+ * holding its link-time value. The symptom is a function pointer in a vtable
+ * reading back as a string address. */
+static addr_t tcc_yaff_data_region_offset(TCCState *s1, addr_t address)
+{
+  return address - rodata_section->sh_addr;
+}
+
 /* Write local relocations for GOT entries that reference local symbols.
  *
  * When a local (STB_LOCAL) symbol's address is taken, put_got_entry()
@@ -398,12 +421,12 @@ static int tcc_yaff_write_local_relocations(TCCState *s1, FILE *f)
     else if (sym_value >= data_section->sh_addr && sym_value < data_section->sh_addr + data_section->sh_size)
     {
       section = YAFF_SECTION_DATA;
-      target_offset = sym_value - data_section->sh_addr + rodata_section->sh_size;
+      target_offset = tcc_yaff_data_region_offset(s1, sym_value);
     }
     else if (sym_value >= bss_section->sh_addr && sym_value < bss_section->sh_addr + bss_section->sh_size)
     {
       section = YAFF_SECTION_DATA;
-      target_offset = sym_value - bss_section->sh_addr + rodata_section->sh_size + data_section->sh_size;
+      target_offset = tcc_yaff_data_region_offset(s1, sym_value);
     }
     else
     {
@@ -520,18 +543,7 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
                     Section *target_sec = s1->sections[s->sh_info];
                     imp_to += target_sec->sh_addr;
                   }
-                  if (imp_to >= data_section->sh_addr && imp_to < data_section->sh_addr + data_section->sh_size)
-                  {
-                    imp_to = (imp_to - data_section->sh_addr) + rodata_section->sh_size;
-                  }
-                  else if (imp_to >= bss_section->sh_addr && imp_to < bss_section->sh_addr + bss_section->sh_size)
-                  {
-                    imp_to = (imp_to - bss_section->sh_addr) + rodata_section->sh_size + data_section->sh_size;
-                  }
-                  else
-                  {
-                    imp_to -= rodata_section->sh_addr;
-                  }
+                  imp_to = tcc_yaff_data_region_offset(s1, imp_to);
 
                   struct sym_attr *attr = get_sym_attr(s1, sym_idx, 0);
                   uint32_t got_offset = 0;
@@ -579,7 +591,7 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
             else if (abs_from_address >= data_section->sh_addr && abs_from_address < data_section->sh_addr + data_section->sh_size)
             {
               original_offset = *(uint32_t *)(data_section->data + (abs_from_address - data_section->sh_addr));
-              from_address = (abs_from_address - data_section->sh_addr) + rodata_section->sh_size;
+              from_address = tcc_yaff_data_region_offset(s1, abs_from_address);
             }
             else if (abs_from_address >= bss_section->sh_addr && abs_from_address < bss_section->sh_addr + bss_section->sh_size)
             {
@@ -606,18 +618,7 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
             towards_code = original_offset < rodata_section->sh_addr;
             if (!towards_code)
             {
-              if (original_offset >= bss_section->sh_addr && original_offset < bss_section->sh_addr + bss_section->sh_size)
-              {
-                original_offset = (original_offset - bss_section->sh_addr) + rodata_section->sh_size + data_section->sh_size;
-              }
-              else if (original_offset >= data_section->sh_addr && original_offset < data_section->sh_addr + data_section->sh_size)
-              {
-                original_offset = (original_offset - data_section->sh_addr) + rodata_section->sh_size;
-              }
-              else
-              {
-                original_offset -= rodata_section->sh_addr;
-              }
+              original_offset = tcc_yaff_data_region_offset(s1, original_offset);
             }
 
             entry = (YaffDataRelocationEntry){
@@ -915,18 +916,7 @@ static int tcc_yaff_write_exported_symbols(TCCState *s1, FILE *f, YaffHeader *h)
     offset = sym->st_value;
     if (section_code == YAFF_SECTION_DATA)
     {
-      if (sym->st_shndx == bss_section->sh_num)
-      {
-        offset = (offset - bss_section->sh_addr) + rodata_section->sh_size + data_section->sh_size;
-      }
-      else if (sym->st_shndx == data_section->sh_num)
-      {
-        offset = (offset - data_section->sh_addr) + rodata_section->sh_size;
-      }
-      else
-      {
-        offset -= rodata_section->sh_addr;
-      }
+      offset = tcc_yaff_data_region_offset(s1, offset);
     }
     entry = (YaffSymbolEntry){
         .section = section_code,
@@ -985,6 +975,14 @@ static void tcc_yaff_write_imported_symbols_lookup(TCCState *s1, FILE *f, YaffHe
     name_len = strlen(name) + 1;
     aligned_name_len = tcc_yaff_align(h, name_len);
     current_offset += sizeof(uint32_t) + aligned_name_len;
+    /* YaffLookupEntry.symbol_offset is still 16 bits, so the symbol NAME table
+     * is capped at 64 KiB even though the header offsets around it are not
+     * (YAFF_VERSION 3). Say so rather than wrapping: a wrapped lookup entry
+     * resolves imports to the wrong name, which is a far worse failure than a
+     * refused link. */
+    if (current_offset > 0xFFFF)
+      tcc_error_noabort("imported symbol table exceeds 64 KiB, which "
+                        "YaffLookupEntry cannot address");
     fwrite(&entry, sizeof(entry), 1, f);
   }
 }
@@ -1021,6 +1019,10 @@ static void tcc_yaff_write_exported_symbols_lookup(TCCState *s1, FILE *f, YaffHe
     name_len = strlen(name) + 1;
     aligned_name_len = tcc_yaff_align(h, name_len);
     current_offset += sizeof(uint32_t) + aligned_name_len;
+    /* See the imported lookup above: 16-bit entry, 64 KiB of names. */
+    if (current_offset > 0xFFFF)
+      tcc_error_noabort("exported symbol table exceeds 64 KiB, which "
+                        "YaffLookupEntry cannot address");
     fwrite(&entry, sizeof(entry), 1, f);
   }
 }
