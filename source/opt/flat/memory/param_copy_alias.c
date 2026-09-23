@@ -38,6 +38,7 @@ typedef struct PcaCopy
   int32_t src;       /* source offset */
   IROperand tmpl;    /* a source operand: the parameter's encoding */
   int nins;
+  int entry_only; /* the copy sits in the entry block, where any shape is safe */
   int ins[3 * PCA_MAX_WORDS + 8]; /* instructions the copy consists of */
 } PcaCopy;
 
@@ -244,6 +245,61 @@ static int pca_is_copy_ins(const PcaCopy *c, int i)
   return 0;
 }
 
+/* Operand `k` of `q` is the hidden pointer a struct-returning call writes its
+ * result through, and it points at the copy's source: the call fills exactly
+ * those bytes, which is what the copy then reads.  The pointer is the call's
+ * parameter 0 and never outlives the call (tcc_ir_frame_note_sret_call
+ * records which calls have one, and frame.c already treats such a buffer's
+ * address as not escaping). */
+static int pca_is_sret_buffer_arg(TCCIRState *ir, IRQuadCompact *q, int k, IROperand op, const PcaCopy *c)
+{
+  if (q->op != TCCIR_OP_FUNCPARAMVAL || k != 0 || op.is_lval || op.is_llocal)
+    return 0;
+  if (irop_get_stack_offset(op) != c->src)
+    return 0;
+  const uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+  if (TCCIR_DECODE_PARAM_IDX(enc) != 0)
+    return 0;
+  const int call_id = TCCIR_DECODE_CALL_ID(enc);
+  if (call_id < 0 || call_id >= ir->sret_calls_size)
+    return 0;
+  return ir->sret_calls[call_id] == c->size;
+}
+
+/* The copy reads a buffer the call right before it filled, and that call is
+ * the only thing that writes it: the instructions between the hidden pointer
+ * and the copy are that call and its own arguments.  Then the source and the
+ * destination hold the same bytes at every point after the copy, whatever the
+ * control flow around them -- each is written once, next to the other -- so
+ * the destination's references may be renamed onto the source wherever they
+ * are, not only in the entry block.  Reading the destination before the copy
+ * has run reads an uninitialised object either way. */
+static int pca_sret_copy_follows_its_call(TCCIRState *ir, const PcaCopy *c, int arg_idx)
+{
+  const uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, &ir->compact_instructions[arg_idx]));
+  const int call_id = TCCIR_DECODE_CALL_ID(enc);
+  int saw_call = 0;
+  for (int i = arg_idx + 1; i < c->first; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID || q->op == TCCIR_OP_FUNCCALLVAL ||
+        q->op == TCCIR_OP_FUNCCALLVOID)
+    {
+      IROperand enc_op = q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID
+                             ? tcc_ir_op_get_src2(ir, q)
+                             : tcc_ir_op_get_src2(ir, q);
+      if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, enc_op)) != call_id)
+        return 0;
+      saw_call |= q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID;
+      continue;
+    }
+    return 0;
+  }
+  return saw_call;
+}
+
 static int pca_try(TCCIRState *ir, PcaCopy *c)
 {
   const int n = ir->next_instruction_index;
@@ -263,6 +319,7 @@ static int pca_try(TCCIRState *ir, PcaCopy *c)
   else if (c->tmpl.btype == IROP_BTYPE_STRUCT || c->src < 0 || c->src + c->size > 32767)
     return 0;
 
+  int sret_src = 0;
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -275,23 +332,40 @@ static int pca_try(TCCIRState *ir, PcaCopy *c)
       int32_t off;
       if (pca_is_src_ref(op, c))
       {
-        /* A local source may be written before the copy (the prologue storing
-         * register-passed words into it); nothing else may touch it. */
-        if (c->tmpl.is_param || i > c->first || q->op != TCCIR_OP_STORE || k != 0 || !op.is_lval)
+        /* A local source may be written before the copy: the prologue storing
+         * register-passed words into it, or the call that returned it, which
+         * fills it whole through the hidden pointer it is handed (Zig's C
+         * copies a call's result into a second local before reading it).
+         * Nothing else may touch it. */
+        if (c->tmpl.is_param || i > c->first)
           return 0;
-        continue;
+        if (q->op == TCCIR_OP_STORE && k == 0 && op.is_lval)
+          continue;
+        if (pca_is_sret_buffer_arg(ir, q, k, op, c) && pca_sret_copy_follows_its_call(ir, c, i))
+        {
+          sret_src = 1;
+          continue;
+        }
+        return 0;
       }
       /* A vreg-backed operand's offset is only the frontend's watermark (see
        * compute_stack_layout); concrete slots are what can name the local. */
       if (irop_get_tag(op) == IROP_TAG_STACKOFF && op.is_local && !op.is_param && irop_get_vreg(op) < 0 &&
           pca_in(irop_get_stack_offset(op), c->dst, c->size))
       {
-        /* The destination: only after the copy, and only as a plain slot. */
-        if (i < c->first || !pca_is_local_slot(op, &off) || op.is_llocal)
+        /* The destination: only as a plain slot, and -- unless the source is
+         * the call's own buffer, where the two agree from the copy onwards
+         * whatever the control flow -- only after the copy. */
+        if ((i < c->first && !sret_src) || !pca_is_local_slot(op, &off) || op.is_llocal)
           return 0;
+        if (q->op == TCCIR_OP_STORE && k == 0 && op.is_lval && sret_src)
+          return 0; /* written by something other than the copy */
       }
     }
   }
+
+  if (!c->entry_only && !sret_src)
+    return 0;
 
   /* Rename every destination reference onto the source. */
   for (int i = 0; i < n; i++)
@@ -364,17 +438,21 @@ int tcc_ir_opt_param_copy_alias(TCCIRState *ir)
 
   int changes = 0;
   PcaCopy *c = tcc_malloc(sizeof(PcaCopy));
-  for (int i = 0; i < entry_end; i++)
+  for (int i = 0; i < n; i++)
   {
     if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
       continue;
     memset(c, 0, sizeof(*c));
-    if (!pca_match_chain(ir, i, entry_end, c))
+    /* Beyond the entry block only the call-buffer shape qualifies; pca_try
+     * rejects the rest, which the entry-block limit used to keep out. */
+    const int limit = i < entry_end ? entry_end : n;
+    if (!pca_match_chain(ir, i, limit, c))
     {
       memset(c, 0, sizeof(*c));
-      if (!pca_match_call(ir, i, entry_end, c))
+      if (!pca_match_call(ir, i, limit, c))
         continue;
     }
+    c->entry_only = i < entry_end;
     if (pca_try(ir, c))
     {
       changes++;

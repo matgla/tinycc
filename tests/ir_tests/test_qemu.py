@@ -246,6 +246,8 @@ TEST_FILES = [
     ("test_errunion_bool_checks.c", 0),
     # a static function identical to one already generated is dropped for it, unless its address is taken
     ("test_icf_folding.c", 0),
+    # a local copied from a call's own struct buffer is that buffer, anywhere in the function
+    ("test_call_buffer_copy_alias.c", 0),
     # word copies between frame slots fused into LDM/STM chunks
     ("test_frame_block_copy.c", 0),
     ("test_sra.c", 0),
