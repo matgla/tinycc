@@ -1272,6 +1272,10 @@ TEST_FILES = [
     # source read later or a destination live before must keep theirs.
     ("477_frame_copy_coalescing.c", 0),
 
+    # __atomic_load/__atomic_store of 1/2/4 bytes are inline LDR/STR with a
+    # DMB per the memory order -- no runtime helper (libtcc1 has none).
+    ("478_inline_atomic_load_store.c", 0),
+
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
     # ssa:first_iter_exit migration.

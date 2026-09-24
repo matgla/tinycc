@@ -14671,6 +14671,16 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   const int call_id = TCCIR_DECODE_CALL_ID(call_id_op.u.imm32);
   const int argc_hint = TCCIR_DECODE_CALL_ARGC(call_id_op.u.imm32);
 
+  /* The memory barrier of an inline atomic (parse_atomic): a call everywhere
+   * before this point, so every pass treats it as touching all memory, and
+   * one DMB here.  On M-profile every DMB option behaves as SY. */
+  if (func_mop.kind == MACH_OP_SYMBOL && func_mop.u.sym.sym &&
+      !strcmp(get_tok_str(func_mop.u.sym.sym->v, NULL), "__tcc_dmb"))
+  {
+    ot_check(th_dmb(0xf));
+    return;
+  }
+
   ThumbGenCallSite *call_site = thumb_get_call_site_for_id(call_id);
   if (!call_site)
     tcc_error("compiler_error: no call site found for call_id=%d", call_id);
