@@ -94,6 +94,17 @@ int redirect_call_to_tcc_helper(SValue *saved_args, int nargs, const char *helpe
  * function, those locals only exist on the stack when actually processing
  * a call expression, not during every recursive unary() invocation.
  * This saves ~3000+ bytes per unary() stack frame. */
+/* Whether SYM's body is already being expanded further out: expanding it
+ * again is recursion, which token replay would unroll without end. */
+static int inline_expansion_in_progress(Sym *sym)
+{
+  int depth = tcc_state->inline_expansion_depth < INLINE_NEST_MAX ? tcc_state->inline_expansion_depth : INLINE_NEST_MAX;
+  for (int i = 0; i < depth; i++)
+    if (tcc_state->inline_expansion_syms[i] == sym)
+      return 1;
+  return 0;
+}
+
 void unary_funcall(void)
 {
   int n, t, r, size, align;
@@ -1538,13 +1549,18 @@ va_arg_pack_done:
             * every depth but 0, so the nested attempt never starts. */
            (call_func_sym != tcc_state->cur_func_sym || self_inline_ok) &&
            /* Allow nested inlining under controlled conditions:
-            * - Void/struct/integer return: safe at depth < 3.
+            * - Void/struct/integer return, never a function already being
+            *   expanded (mutual recursion, pr22379), up to INLINE_NEST_MAX
+            *   deep: zig.h's integer helpers nest five deep (saturating sub ->
+            *   overflow sub -> truncate -> shift), under called-once bodies
+            *   that nest as deep as zig's call chains, and a cap of 3 left the
+            *   innermost helpers as calls in every caller.
             * - Pointer return: still gated to depth<1 to avoid the
-            *   store-then-load-through-return-slot phi pattern (930725-1).
-            * - Depth cap prevents mutual-recursion expansion (pr22379). */
+            *   store-then-load-through-return-slot phi pattern (930725-1). */
            (!tcc_state->in_inline_expansion ||
             call_func_sym->a.nested_func ||
-            (tcc_state->inline_expansion_depth < 3 &&
+            (tcc_state->inline_expansion_depth < INLINE_NEST_MAX &&
+             !inline_expansion_in_progress(call_func_sym) &&
              call_func_sym->type.ref &&
              ((call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID ||
               (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_STRUCT ||
@@ -1704,7 +1720,10 @@ va_arg_pack_done:
          * growth by the called_once_budget. */
         (call_func_sym->type.ref->f.func_called_once
              ? tcc_state->inline_expansion_depth < 32 && inline_fn->func_str->len <= tcc_state->called_once_budget
-             : auto_inline_sig_ok(call_func_sym)) &&
+             : auto_inline_sig_ok(call_func_sym) &&
+                   /* below the first level, within the caller's budget */
+                   (!tcc_state->in_inline_expansion || inline_fn->func_str->len <= TINY_INLINE_TOKENS ||
+                    inline_fn->func_str->len <= tcc_state->nested_inline_budget)) &&
         /* Don't inline if call-site argument count doesn't match the function's
          * actual parameter count.  This can happen when calling through a cast
          * to an incompatible function pointer type (e.g. ((int(*)(int))bar)(x)
@@ -1746,6 +1765,8 @@ va_arg_pack_done:
           inline_fn->inline_count++;
         if (call_func_sym->type.ref->f.func_called_once)
           tcc_state->called_once_budget -= inline_fn->func_str->len;
+        else if (tcc_state->in_inline_expansion && inline_fn->func_str->len > TINY_INLINE_TOKENS)
+          tcc_state->nested_inline_budget -= inline_fn->func_str->len;
       }
       else if (TCC_LOG_INLINE_STRUCT)
       {
@@ -2007,6 +2028,8 @@ va_arg_pack_done:
       tcc_state->inline_return_loc = inline_ret_loc;
       tcc_state->inline_return_vr = inline_ret_vr;
       tcc_state->inline_return_redirected = 0;
+      if (tcc_state->inline_expansion_depth < INLINE_NEST_MAX)
+        tcc_state->inline_expansion_syms[tcc_state->inline_expansion_depth] = call_func_sym;
       tcc_state->inline_expansion_depth++;
       root_scope = cur_scope;
 

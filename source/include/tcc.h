@@ -435,6 +435,13 @@ typedef struct Sym Sym;
                            ~10 KiB .bss (513->257 * 40 B SValue). Clean tcc_error on overflow. */
 #define STRING_MAX_SIZE 1024
 #define TOKSTR_MAX_SIZE 256
+/* Nested auto-inline expansion: how deep, and how many body tokens one
+ * function may take in through expansions below the first level.  A body of
+ * at most TINY_INLINE_TOKENS is smaller than the call it replaces and costs
+ * nothing from the budget. */
+#define INLINE_NEST_MAX 32
+#define NESTED_INLINE_BUDGET 4096
+#define TINY_INLINE_TOKENS 24
 #define PACK_STACK_SIZE 8
 
 #define TOK_HASH_SIZE 2048 /* must be a power of two. YASOS: 4096 -> 2048 saves 8 KiB
@@ -1616,6 +1623,12 @@ struct TCCState
      stream at a call site, these track the return value destination. */
   uint8_t in_inline_expansion; /* nonzero while expanding inline body */
   uint8_t inline_expansion_depth; /* nested expansion depth, capped to bound work */
+  /* The functions whose bodies are being expanded, outermost first: a callee
+   * already here is recursion, never expanded again. */
+  struct Sym *inline_expansion_syms[INLINE_NEST_MAX];
+  /* Tokens nested auto-inline expansions may still add to the function being
+   * compiled (reset by gen_function): helpers calling helpers can fan out. */
+  int nested_inline_budget;
   int inline_return_loc;       /* stack offset for storing return value */
   int inline_return_vr;        /* vreg bound to that slot for scalar returns,
                                 * -1 when the return goes through memory only.
