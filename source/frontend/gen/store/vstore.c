@@ -796,34 +796,20 @@ ST_FUNC void vstore(void)
      * assignments. */
 #define IS_REG_DEREF_LVAL(r) \
   (((r) & VT_LVAL) && ((r) & VT_VALMASK) < VT_CONST)
-    /* Cap at 8 bytes: see same-named cap in gfunc_return's struct path
-     * — store-forwarding width-mismatch in the optimizer would feed stale
-     * zero-init bytes to the LOADs we emit otherwise.
-     *
-     * That hazard needs a LOCAL/GLOBAL source: it is an earlier store to the
-     * source's own storage, at a different width than our LOAD, that the
-     * forwarder mis-narrows (pr92618's 16-byte vector literal built from
-     * scalar components).  When BOTH sides are register-deref pointers the
-     * source is opaque memory with no such store in view, so the plain
-     * `*d = *s` shape — the common one, and the one that otherwise costs a
-     * __aeabi_memmove4 call — is allowed up to 16 bytes.  Sixteen is also the
-     * point where an LDM/STM pair stops fitting the scratch budget. */
-    /* The same reasoning admits the MIRROR shape, `local = *p` / `local =
-     * arr[i]` — a register-deref SOURCE read into a frame slot.  It is the
-     * commonest struct-copy idiom in C and the one the size-tuned mixed-copy
-     * cap above (4 bytes) sends to __aeabi_memmove4: mibench_dijkstra's
-     * `item_t current = queue[head++]` is 12 bytes, so it paid a ~110-cycle
-     * call 20,042 times per benchmark run where gcc emits two loads.  The
-     * width-mismatch hazard is a property of the SOURCE, and an opaque
-     * pointer deref has no store to mis-narrow, so this direction gets the
-     * same 16-byte ceiling as the both-reg-deref case. */
+    /* Up to 16 bytes, the point where an LDM/STM pair stops fitting the
+     * scratch budget, for every shape.  A frame-slot or global SOURCE into a
+     * register-deref destination used to stop at 8: an earlier store to the
+     * source's own storage, at a different width than these LOADs, was
+     * mis-narrowed by store forwarding (pr92618's 16-byte vector literal
+     * built from scalar components) and fed stale zero-init bytes to the
+     * copy.  pr92618 passes at 16 now, and the shape is zig's commonest copy:
+     * `return t;` of a local 12-byte error union into the caller's sret
+     * buffer, 146 __aeabi_memmove4 calls in a std.debug.print hello. */
     int src_reg_deref_lval = IS_REG_DEREF_LVAL(vtop[0].r);
     int dst_reg_deref_lval = IS_REG_DEREF_LVAL(vtop[-1].r);
     int dst_slot_lval = IS_LOCAL_LVAL(vtop[-1].r) || IS_GLOBAL_LVAL(vtop[-1].r);
-    int both_reg_deref = dst_reg_deref_lval && src_reg_deref_lval;
     int slot_from_deref = dst_slot_lval && src_reg_deref_lval;
-    int inline_copy_max = (both_reg_deref || slot_from_deref) ? 16 : 8;
-    if (tcc_state->ir && !has_vla && size > 0 && size <= inline_copy_max &&
+    if (tcc_state->ir && !has_vla && size > 0 && size <= 16 &&
         !(size & 3) && !(align & 3) && !NOEVAL_WANTED &&
         ((dst_reg_deref_lval &&
           (IS_LOCAL_LVAL(vtop[0].r) || IS_GLOBAL_LVAL(vtop[0].r) ||

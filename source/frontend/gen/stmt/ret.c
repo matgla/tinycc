@@ -290,14 +290,13 @@ void gfunc_return(CType *func_type)
         int s_size, s_align;
         s_size = type_size(func_type, &s_align);
         int has_struct_vla = struct_has_vla_member(func_type);
-        /* Cap at 8 bytes to avoid a store-forwarding width-mismatch issue
-         * in the IR optimizer: a 4-byte LOAD that should see an earlier
-         * wider STORE can incorrectly forward from a stale narrow STORE at
-         * the same address.  Triggers on 16-byte vector literals built from
-         * scalar components (e.g. (__m128i){a, b} — zero-init + 8-byte
-         * stores), pr92618. */
+        /* Up to 16 bytes.  This stopped at 8 while store forwarding could
+         * feed a 4-byte LOAD from a stale narrow STORE where an earlier wider
+         * one covered the address (pr92618's 16-byte vector literal built
+         * from scalar components: zero-init + 8-byte stores); pr92618 passes
+         * at 16 now, as vstore's same cap does. */
         if (tcc_state->ir && !has_struct_vla && (vtop->r & VT_LVAL) && s_size > 0 &&
-            s_size <= 8 && !(s_size & 3) && !(s_align & 3) && !NOEVAL_WANTED)
+            s_size <= 16 && !(s_size & 3) && !(s_align & 3) && !NOEVAL_WANTED)
         {
           SValue src_mem = *vtop;
 
