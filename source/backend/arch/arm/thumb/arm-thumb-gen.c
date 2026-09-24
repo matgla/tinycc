@@ -14844,8 +14844,19 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
    *   value (no move entry created).  These MUST be protected from clobbering. */
   {
     uint32_t arg_move_dst_mask = 0;
+    /* Registers the pending moves still have to READ.  A register can be both:
+     * `mov r1, r0` reads r0 while another move writes r0 (`add r0, sp, #52`),
+     * which put r0 in arg_move_dst_mask and so offered it as scratch -- and
+     * the stack-arg placement that took it destroyed the value the first move
+     * was about to copy.  The parallel-move scheduler below already respects
+     * this (see the src_set it builds); placement, which runs first, did not. */
+    uint32_t arg_move_src_mask = 0;
     for (int i = 0; i < reg_move_count; i++)
+    {
       arg_move_dst_mask |= arg_move_write_set(&reg_moves[i]);
+      if (reg_moves[i].kind == THUMB_ARG_MOVE_REG)
+        arg_move_src_mask |= (1u << reg_moves[i].src_reg);
+    }
 
     /* Compute all register-arg destination registers from the ABI layout. */
     uint32_t all_reg_arg_dst = 0;
@@ -14864,7 +14875,13 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     uint32_t identity_mask = all_reg_arg_dst & ~arg_move_dst_mask;
     scratch_global_exclude |= identity_mask;
 
-    ctx.arg_move_dst_mask = arg_move_dst_mask;
+    /* ...and every register a pending move reads, on every scratch path, not
+     * just the arg_move_dst_mask one: the value sitting there may have been
+     * materialised by the argument lowering itself and so have no live
+     * interval for the liveness query to find. */
+    scratch_global_exclude |= arg_move_src_mask;
+
+    ctx.arg_move_dst_mask = arg_move_dst_mask & ~arg_move_src_mask;
   }
 
   /* Pre-save stack args sourcing from R0-R3 before register shuffle */
