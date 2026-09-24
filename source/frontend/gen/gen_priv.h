@@ -502,6 +502,7 @@ void define_deferred_data(DeferredData *d);
 void check_dropped_deferred_data(DeferredData *d, TokenString *init);
 void check_dropped_function(DeferredFunc *d, TokenString *body);
 void check_dropped_statics(TCCState *s);
+void gc_unreferenced_statics(TCCState *s);
 void free_dropped_statics(TCCState *s);
 void gen_function_check_only(Sym *sym);
 TokenString *tok_str_clone(TokenString *str);

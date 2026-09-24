@@ -1262,6 +1262,11 @@ TEST_FILES = [
     # and alias targets -- all deferred to the end of the TU and still defined.
     ("475_drop_unused_statics.c", 0),
 
+    # Write-only statics lose their stores and their bytes, but only when no
+    # path reads them: through a call, a data pointer, a function table, or a
+    # struct copy.  Stores the frontend's addrtaken used to protect.
+    ("476_write_only_statics.c", 0),
+
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
     # ssa:first_iter_exit migration.

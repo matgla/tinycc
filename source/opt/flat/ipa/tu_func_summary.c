@@ -177,8 +177,51 @@ static void tu_note_postinc_def(TCCIRState *ir, IRQuadCompact *q, TuVregSymEntry
 }
 
 /* Any pre-opt value read or unrecognized address use of a static blocks tu_no_readers; store-address plumbing `T=&g+i; *T=v` does not. */
+/* Which call ids call a block-copy/fill helper (memcpy, memmove, memset and
+ * their __aeabi_ forms): argument 0 of such a call is the destination the
+ * helper writes through, so a static's address there is a write -- the
+ * shape of a struct assignment into it -- not an escape. */
+static uint8_t *tu_block_copy_call_ids(TCCIRState *ir, int *count)
+{
+  int max_id = -1;
+  const int n = ir->next_instruction_index;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+      continue;
+    int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+    if (cid > max_id)
+      max_id = cid;
+  }
+  *count = max_id + 1;
+  uint8_t *ids = tcc_mallocz(*count ? *count : 1);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+      continue;
+    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+    if (callee && cid >= 0 && tu_is_block_copy_helper(get_tok_str(callee->v, NULL)))
+      ids[cid] = 1;
+  }
+  return ids;
+}
+
+static int tu_is_block_copy_dest_param(TCCIRState *ir, IRQuadCompact *q, const uint8_t *ids, int count)
+{
+  if (q->op != TCCIR_OP_FUNCPARAMVAL)
+    return 0;
+  int32_t enc = (int32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+  int cid = TCCIR_DECODE_CALL_ID(enc);
+  return TCCIR_DECODE_PARAM_IDX(enc) == 0 && cid >= 0 && cid < count && ids[cid];
+}
+
 void tcc_ir_collect_tu_static_reads_preopt(TCCIRState *ir)
 {
+  int nids;
+  uint8_t *copy_ids = tu_block_copy_call_ids(ir, &nids);
   TuVregSymEntry map[TU_VREG_MAP_MAX];
   int mc = 0;
   const int n = ir->next_instruction_index;
@@ -212,6 +255,8 @@ void tcc_ir_collect_tu_static_reads_preopt(TCCIRState *ir)
         sym = tu_vreg_map_lookup(map, mc, irop_get_vreg(op));
       if (!sym || !tu_is_static_global_candidate(sym))
         continue;
+      if (oi == 0 && !op.is_lval && tu_is_block_copy_dest_param(ir, q, copy_ids, nids))
+        continue; /* written through by the helper */
       if (op.is_lval || is_load) {
         tu_symset_add(&tu_source_reads, sym);
         continue;
@@ -247,12 +292,13 @@ void tcc_ir_collect_tu_static_reads_preopt(TCCIRState *ir)
       }
     }
   }
+  tcc_free(copy_ids);
 }
 
 /* Block-copy / fill helpers whose only memory effect is through the destination
  * pointer (argument 0).  Callers resolve that pointer at the call site, so the
  * mod-ref walk may skip these even though they have no TU summary. */
-static int tu_is_block_copy_helper(const char *nm)
+int tu_is_block_copy_helper(const char *nm)
 {
   if (!nm)
     return 0;
@@ -394,6 +440,8 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
   int vreg_map_count = 0;
   TuSymSet addr_only_syms = {0}; /* statics referenced only by address (non-lval) */
   TuSymSet escaped_syms = {0};   /* address-of refs that escaped (call/store-as-value) */
+  int ncopy_ids;
+  uint8_t *copy_ids = tu_block_copy_call_ids(ir, &ncopy_ids);
 
   for (int i = 0; i < n; i++)
   {
@@ -490,8 +538,9 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
       }
     }
 
-    /* A static address passed as a call argument escapes. */
-    if (q->op == TCCIR_OP_FUNCPARAMVAL)
+    /* A static address passed as a call argument escapes -- except as the
+     * destination of a block-copy helper, which only writes through it. */
+    if (q->op == TCCIR_OP_FUNCPARAMVAL && !tu_is_block_copy_dest_param(ir, q, copy_ids, ncopy_ids))
     {
       if (irop_config[q->op].has_src1)
       {
@@ -594,7 +643,14 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
         {
           MemLoc dl = memloc_of_pointer(ir, p0, i);
           if (dl.kind == MEMLOC_GLOBAL && dl.sym)
+          {
             tu_symset_add(&s->global_writes, dl.sym);
+            if (tu_is_static_global_candidate(dl.sym))
+            {
+              tu_symset_add(&s->static_writes, dl.sym);
+              writes_any_static = 1;
+            }
+          }
           else if (dl.kind != MEMLOC_FRAME)
             s->writes_unknown = 1;
         }
@@ -760,6 +816,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
 
   tu_symset_free(&addr_only_syms);
   tu_symset_free(&escaped_syms);
+  tcc_free(copy_ids);
 
   if (writes_any_static && func_sym->type.ref)
     func_sym->type.ref->f.tu_static_writer = 1;

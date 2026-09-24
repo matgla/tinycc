@@ -309,6 +309,8 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   }
   /* The statics dropped as unused are still checked for errors. */
   check_dropped_statics(s1);
+  /* What the optimizer left unreferenced goes too. */
+  gc_unreferenced_statics(s1);
   resolve_pending_aliases();
   check_vstack();
   /* end of translation unit info */

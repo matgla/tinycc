@@ -41,17 +41,19 @@ void ir_inline_stash_flush(TCCState *s1)
 }
 
 /* Remove [start, start+size) bytes from `sec`, shifting trailing data
- * down.  Updates symbol values and relocation offsets accordingly so
+ * down by a multiple of `unit` (a power of two: the alignment the tail must
+ * keep).  Updates symbol values and relocation offsets accordingly so
  * the section stays self-consistent.  Used by gen_late_reopt_functions
  * to reclaim the original code range of a function that is about to be
- * re-emitted.  Cross-section relocations resolve via symbol indices, so
+ * re-emitted, and by gc_unreferenced_statics.  Cross-section relocations resolve via symbol indices, so
  * only this section's own reloc table needs r_offset adjustment — except
  * debug info (DWARF), which records text PCs as section symbol +
  * IN-PLACE addend: those addends are rewritten here (shifted past the
  * erased range, tombstoned inside it), so the erase is safe under -g. */
-static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t size)
+static void erase_section_range(TCCState *s, Section *sec, addr_t start, addr_t size, addr_t unit)
 {
-  if (size == 0 || !sec || !sec->data)
+  const int nobits = sec && sec->sh_type == SHT_NOBITS;
+  if (size == 0 || !sec || (!sec->data && !nobits))
     return;
   if (start + size > sec->data_offset)
     return;
@@ -65,7 +67,7 @@ static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t siz
    * misaligned its `&al` pool entry).  Function code is halfword-granular, so
    * `size` is even but may be 2 (mod 4); reclaim only a multiple-of-4 span and
    * leave up to 2 dead filler bytes so the tail's alignment is preserved. */
-  addr_t shift = size & ~(addr_t)3;
+  addr_t shift = size & ~(unit - 1);
   if (shift == 0)
     return;
 
@@ -76,7 +78,7 @@ static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t siz
   /* Shift the section's tail data down (by `shift`, not `size`). */
   size_t tail_offset = (size_t)(start + size);
   size_t tail_len = sec->data_offset - tail_offset;
-  if (tail_len > 0)
+  if (tail_len > 0 && !nobits)
     memmove(sec->data + (tail_offset - shift), sec->data + tail_offset, tail_len);
   sec->data_offset -= shift;
 
@@ -222,6 +224,12 @@ static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t siz
       tomb = put_elf_sym(symtab, 0xFF000000, 0, ELFW(ST_INFO)(STB_LOCAL, STT_NOTYPE), 0, SHN_ABS, NULL);
     tcc_debug_line_erase_range(s, sec, start, size, shift, tomb);
   }
+}
+
+/* Code: the shift keeps the tail's 4-byte alignment (see above). */
+static void erase_text_range(TCCState *s, Section *sec, addr_t start, addr_t size)
+{
+  erase_section_range(s, sec, start, size, 4);
 }
 
 /* End-of-TU re-optimization pass.  Functions whose IR contained a
@@ -876,6 +884,253 @@ define_all:
     tcc_close();
     nocode_wanted = saved_nocode_wanted;
   }
+}
+
+/* ---- end-of-TU garbage collection ------------------------------------
+ *
+ * prune_unused_statics decides from the source; what the optimizer does
+ * afterwards can leave more behind: a static function whose every call was
+ * inlined, an object whose stores dead_static_store removed, and whatever
+ * only those referred to.  Here the generated object itself is collected,
+ * the way --gc-sections would at link time but per static: each local
+ * function or object symbol is a node (symbols whose ranges overlap -- ICF
+ * aliases -- share one), relocations are the edges, and the roots are
+ * everything else: code or data outside any node, global and weak symbols,
+ * statics marked used or aliased.  A relocation against a section symbol
+ * names no node, so it pins its whole target section.  The unreachable
+ * nodes are erased with erase_section_range, which keeps symbols,
+ * relocations and debug addends consistent, their symbols tombstoned.  An
+ * undefined global nothing refers to any more -- its callers erased here,
+ * or rewritten by dead_static_store or late reopt -- becomes weak, so the
+ * link does not go looking for what nothing uses. */
+
+typedef struct GcNode
+{
+  int sec;
+  addr_t start, end;
+} GcNode;
+
+static int gc_node_cmp(const void *a, const void *b)
+{
+  const GcNode *x = a, *y = b;
+  if (x->sec != y->sec)
+    return x->sec < y->sec ? -1 : 1;
+  if (x->start != y->start)
+    return x->start < y->start ? -1 : 1;
+  return (x->end > y->end) - (x->end < y->end);
+}
+
+/* The node of section `sec` containing `addr`, or -1.  Nodes are sorted and
+ * disjoint; sec_first/sec_count index each section's run. */
+static int gc_node_at(const GcNode *nodes, const int *sec_first, const int *sec_count, int sec, addr_t addr)
+{
+  int lo = sec_first[sec], hi = lo + sec_count[sec] - 1;
+  while (lo <= hi)
+  {
+    int mid = (lo + hi) / 2;
+    if (addr < nodes[mid].start)
+      hi = mid - 1;
+    else if (addr >= nodes[mid].end)
+      lo = mid + 1;
+    else
+      return mid;
+  }
+  return -1;
+}
+
+void gc_unreferenced_statics(TCCState *s)
+{
+  if (!s->opt_drop_unused_statics || s->test_coverage || !symtab_section || !symtab_section->data)
+    return;
+  const int nsyms = symtab_section->data_offset / sizeof(ElfW(Sym));
+  const int nsec = s->nb_sections;
+  ElfW(Sym) *syms = (ElfW(Sym) *)symtab_section->data;
+
+  /* Candidate ranges: local functions and objects with a size, in an
+   * allocated section. */
+  GcNode *nodes = tcc_malloc(sizeof(GcNode) * (nsyms ? nsyms : 1));
+  int nn = 0;
+  for (int i = 1; i < nsyms; i++)
+  {
+    ElfW(Sym) *e = &syms[i];
+    int type = ELFW(ST_TYPE)(e->st_info);
+    if (ELFW(ST_BIND)(e->st_info) != STB_LOCAL || (type != STT_FUNC && type != STT_OBJECT) || !e->st_size)
+      continue;
+    if (e->st_shndx == SHN_UNDEF || e->st_shndx >= nsec || !s->sections[e->st_shndx] ||
+        !(s->sections[e->st_shndx]->sh_flags & SHF_ALLOC))
+      continue;
+    addr_t start = e->st_value & ~(addr_t)1; /* Thumb bit */
+    nodes[nn].sec = e->st_shndx;
+    nodes[nn].start = start;
+    nodes[nn].end = start + e->st_size;
+    nn++;
+  }
+  if (!nn)
+  {
+    tcc_free(nodes);
+    return;
+  }
+  qsort(nodes, nn, sizeof *nodes, gc_node_cmp);
+  /* Merge overlapping ranges (ICF aliases, a symbol inside another). */
+  int m = 0;
+  for (int i = 0; i < nn; i++)
+  {
+    if (m && nodes[m - 1].sec == nodes[i].sec && nodes[i].start < nodes[m - 1].end)
+    {
+      if (nodes[i].end > nodes[m - 1].end)
+        nodes[m - 1].end = nodes[i].end;
+    }
+    else
+      nodes[m++] = nodes[i];
+  }
+  nn = m;
+  int *sec_first = tcc_mallocz(sizeof(int) * nsec), *sec_count = tcc_mallocz(sizeof(int) * nsec);
+  for (int i = nn - 1; i >= 0; i--)
+    sec_first[nodes[i].sec] = i, sec_count[nodes[i].sec]++;
+
+  uint8_t *live = tcc_mallocz(nn), *pinned = tcc_mallocz(nsec);
+  int *edge_count = tcc_mallocz(sizeof(int) * (nn + 1));
+  /* A relocation: from the node containing its offset (or a root, -1) to
+   * the node containing its target (or nothing, -1). */
+  int nrel_total = 0;
+  for (int sh = 1; sh < nsec; sh++)
+  {
+    Section *sec = s->sections[sh];
+    if (sec && (sec->sh_flags & SHF_ALLOC) && sec->reloc)
+      nrel_total += sec->reloc->data_offset / sizeof(ElfW_Rel);
+  }
+  int *rel_from = tcc_malloc(sizeof(int) * (nrel_total ? nrel_total : 1));
+  int *rel_to = tcc_malloc(sizeof(int) * (nrel_total ? nrel_total : 1));
+  int nr = 0;
+  for (int sh = 1; sh < nsec; sh++)
+  {
+    Section *sec = s->sections[sh];
+    if (!sec || !(sec->sh_flags & SHF_ALLOC) || !sec->reloc)
+      continue;
+    ElfW_Rel *rel = (ElfW_Rel *)sec->reloc->data, *rel_end = (ElfW_Rel *)(sec->reloc->data + sec->reloc->data_offset);
+    for (; rel < rel_end; rel++)
+    {
+      int t = ELFW(R_SYM)(rel->r_info);
+      if (t <= 0 || t >= nsyms)
+        continue;
+      ElfW(Sym) *e = &syms[t];
+      if (e->st_shndx == SHN_UNDEF || e->st_shndx >= nsec)
+        continue;
+      if (ELFW(ST_TYPE)(e->st_info) == STT_SECTION)
+      {
+        pinned[e->st_shndx] = 1;
+        continue;
+      }
+      int to = gc_node_at(nodes, sec_first, sec_count, e->st_shndx, e->st_value & ~(addr_t)1);
+      if (to < 0)
+        continue;
+      int from = gc_node_at(nodes, sec_first, sec_count, sh, rel->r_offset);
+      rel_from[nr] = from;
+      rel_to[nr] = to;
+      nr++;
+      if (from >= 0)
+        edge_count[from]++;
+    }
+  }
+  /* Edges by source node (CSR). */
+  int *edge_start = tcc_mallocz(sizeof(int) * (nn + 1));
+  for (int i = 0; i < nn; i++)
+    edge_start[i + 1] = edge_start[i] + edge_count[i];
+  int *edges = tcc_malloc(sizeof(int) * (edge_start[nn] ? edge_start[nn] : 1));
+  memset(edge_count, 0, sizeof(int) * (nn + 1));
+  int *work = tcc_malloc(sizeof(int) * nn), nw = 0;
+#define GC_MARK(n)                                                                                                     \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    int gc_n_ = (n);                                                                                                   \
+    if (gc_n_ >= 0 && !live[gc_n_])                                                                                    \
+      live[gc_n_] = 1, work[nw++] = gc_n_;                                                                             \
+  } while (0)
+  for (int r = 0; r < nr; r++)
+  {
+    if (rel_from[r] < 0)
+      GC_MARK(rel_to[r]);
+    else
+      edges[edge_start[rel_from[r]] + edge_count[rel_from[r]]++] = rel_to[r];
+  }
+  /* Roots: pinned sections, global and weak symbols, used statics. */
+  for (int i = 0; i < nn; i++)
+    if (pinned[nodes[i].sec])
+      GC_MARK(i);
+  for (int i = 1; i < nsyms; i++)
+  {
+    ElfW(Sym) *e = &syms[i];
+    if (ELFW(ST_BIND)(e->st_info) != STB_LOCAL && e->st_shndx != SHN_UNDEF && e->st_shndx < nsec)
+      GC_MARK(gc_node_at(nodes, sec_first, sec_count, e->st_shndx, e->st_value & ~(addr_t)1));
+  }
+  for (Sym *g = global_stack; g; g = g->prev)
+    if (g->a.used && g->c > 0 && g->c < nsyms && syms[g->c].st_shndx < nsec)
+      GC_MARK(gc_node_at(nodes, sec_first, sec_count, syms[g->c].st_shndx, syms[g->c].st_value & ~(addr_t)1));
+  while (nw)
+  {
+    int n = work[--nw];
+    for (int k = edge_start[n]; k < edge_start[n + 1]; k++)
+      GC_MARK(edges[k]);
+  }
+#undef GC_MARK
+
+  /* Erase the dead nodes, highest address first so the lower ones stay put.
+   * Their symbols go first: erase_section_range leaves symbols inside the
+   * range where they were. */
+  for (int i = nn - 1; i >= 0; i--)
+  {
+    if (live[i])
+      continue;
+    Section *sec = s->sections[nodes[i].sec];
+    for (int k = 1; k < nsyms; k++)
+    {
+      ElfW(Sym) *e = &syms[k];
+      int type = ELFW(ST_TYPE)(e->st_info);
+      if (e->st_shndx != nodes[i].sec || type == STT_SECTION || type == STT_FILE)
+        continue;
+      addr_t v = e->st_value & ~(addr_t)1;
+      if (v < nodes[i].start || v >= nodes[i].end)
+        continue;
+      const char *nm = symtab_section->link ? (const char *)symtab_section->link->data + e->st_name : "";
+      if (nm[0] == '$' && (nm[1] == 't' || nm[1] == 'd') && nm[2] == 0)
+        continue; /* mapping markers: erase_section_range retargets them */
+      e->st_shndx = SHN_ABS;
+      e->st_value = 0;
+      e->st_size = 0;
+    }
+    addr_t unit = sec->sh_addralign > 0 ? sec->sh_addralign : 1;
+    if ((sec->sh_flags & SHF_EXECINSTR) && unit < 4)
+      unit = 4;
+    erase_section_range(s, sec, nodes[i].start, nodes[i].end - nodes[i].start, unit);
+  }
+
+  /* Undefined globals nothing refers to any more. */
+  int *refs_after = tcc_mallocz(sizeof(int) * nsyms);
+  for (int sh = 1; sh < nsec; sh++)
+  {
+    Section *sr = s->sections[sh];
+    if (!sr || sr->sh_type != SHT_RELX || sr->link != symtab_section || !sr->data)
+      continue;
+    for (ElfW_Rel *rel = (ElfW_Rel *)sr->data; (unsigned char *)rel < sr->data + sr->data_offset; rel++)
+      if (ELFW(R_SYM)(rel->r_info) < (unsigned)nsyms)
+        refs_after[ELFW(R_SYM)(rel->r_info)]++;
+  }
+  for (int i = 1; i < nsyms; i++)
+    if (syms[i].st_shndx == SHN_UNDEF && ELFW(ST_BIND)(syms[i].st_info) == STB_GLOBAL && !refs_after[i])
+      syms[i].st_info = ELFW(ST_INFO)(STB_WEAK, ELFW(ST_TYPE)(syms[i].st_info));
+  tcc_free(refs_after);
+
+  tcc_free(work);
+  tcc_free(edges);
+  tcc_free(edge_start);
+  tcc_free(rel_to);
+  tcc_free(rel_from);
+  tcc_free(edge_count);
+  tcc_free(pinned);
+  tcc_free(live);
+  tcc_free(sec_count);
+  tcc_free(sec_first);
+  tcc_free(nodes);
 }
 
 /* Parse the statics prune_unused_statics dropped, for their diagnostics

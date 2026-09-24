@@ -169,3 +169,30 @@ int main(void) { return 0; }
         if cols and cols[0] in (".data", ".rodata", ".bss"):
             assert cols[1] == "0", line
 
+
+# What the optimizer leaves unreferenced is collected from the object
+# (gc_unreferenced_statics): a write-only static, once dead_static_store has
+# removed its stores -- including zig's `*(&((T *)&x)->f) = v` field stores
+# and struct copies into it -- goes, with the functions only it pointed to.
+
+def test_write_only_static_and_its_closure_are_collected(tmp_path):
+    source = r"""
+struct big { int v[12]; };
+extern struct big get(void);
+static void only_in_initializer(void) {}
+struct holder { int a; struct big b; void (*f)(void); };
+static struct holder write_only = {1, {{0}}, only_in_initializer};
+int main(void)
+{
+  (*(&((struct holder *)&write_only)->a)) = 7;
+  (*(&((struct holder *)&write_only)->b)) = get();
+  return 0;
+}
+"""
+    proc, obj = _compile(tmp_path, source, "-O2")
+    assert proc.returncode == 0, proc.stderr
+    out = subprocess.run([READELF, "-sW", str(obj)], capture_output=True, text=True, check=True).stdout
+    defined = [cols[7] for cols in (line.split() for line in out.splitlines())
+               if len(cols) == 8 and cols[0][:-1].isdigit() and cols[6].isdigit()]
+    assert "write_only" not in defined and "only_in_initializer" not in defined, defined
+    assert "main" in defined

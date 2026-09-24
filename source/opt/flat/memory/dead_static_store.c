@@ -20,6 +20,8 @@
 #include "opt_utils.h"
 #include "opt_alias.h"
 #include "opt_loop_utils.h"
+#include "memref.h"
+#include "../ipa/tu_summary.h"
 
 
 /* Eliminate stores to file-scope statics with no TU readers (late_reopt only). */
@@ -227,6 +229,24 @@ int tcc_ir_opt_dead_static_store_elim(TCCIRState *ir)
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
+    /* A struct assignment into the static: a block-copy helper call that
+     * writes only through its destination argument. */
+    if (q->op == TCCIR_OP_FUNCCALLVOID)
+    {
+      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      IROperand dst;
+      if (!callee || !tu_is_block_copy_helper(get_tok_str(callee->v, NULL)) ||
+          !ir_opt_get_call_param_operand(ir, i, 0, &dst))
+        continue;
+      MemLoc dl = memloc_of_pointer(ir, dst, i);
+      if (dl.kind != MEMLOC_GLOBAL || !dl.sym || !dl.sym->a.tu_no_readers || (dl.sym->type.t & VT_VOLATILE))
+        continue;
+      LOG_IR_GEN("DEAD_STATIC_STORE: NOPed block copy at i=%d -> %s", i, get_tok_str(dl.sym->v & ~SYM_FIELD, NULL));
+      ir_opt_nop_call_params(ir, i);
+      q->op = TCCIR_OP_NOP;
+      changes++;
+      continue;
+    }
     if (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
         q->op != TCCIR_OP_STORE_POSTINC)
       continue;
@@ -234,9 +254,9 @@ int tcc_ir_opt_dead_static_store_elim(TCCIRState *ir)
     Sym *sym = dss_resolve_store_dest_sym(ir, q, i, vreg_map, vreg_map_count);
     if (!sym)
       continue;
+    /* tu_no_readers is set only for a static whose address escapes nowhere
+     * (tcc_ir_tu_analyze_dead_statics). */
     if (!sym->a.tu_no_readers)
-      continue;
-    if (sym->a.addrtaken)
       continue;
     /* Volatile stores stay observable even with no C-level reader. */
     if (sym->type.t & VT_VOLATILE)
