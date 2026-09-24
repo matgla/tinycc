@@ -804,12 +804,16 @@ ST_FUNC void vstore(void)
      * built from scalar components) and fed stale zero-init bytes to the
      * copy.  pr92618 passes at 16 now, and the shape is zig's commonest copy:
      * `return t;` of a local 12-byte error union into the caller's sret
-     * buffer, 146 __aeabi_memmove4 calls in a std.debug.print hello. */
+     * buffer, 146 __aeabi_memmove4 calls in a std.debug.print hello.
+     * Only when optimizing: the word LOAD/STOREs pay off because forwarding
+     * folds them; at -O0 they stay, and three of them plus their address
+     * arithmetic outweigh the call (zig.c at -O0 grew 118 KB). */
     int src_reg_deref_lval = IS_REG_DEREF_LVAL(vtop[0].r);
     int dst_reg_deref_lval = IS_REG_DEREF_LVAL(vtop[-1].r);
     int dst_slot_lval = IS_LOCAL_LVAL(vtop[-1].r) || IS_GLOBAL_LVAL(vtop[-1].r);
     int slot_from_deref = dst_slot_lval && src_reg_deref_lval;
-    if (tcc_state->ir && !has_vla && size > 0 && size <= 16 &&
+    int inline_copy_max = (tcc_state->optimize > 0 || (dst_reg_deref_lval && src_reg_deref_lval) || slot_from_deref) ? 16 : 8;
+    if (tcc_state->ir && !has_vla && size > 0 && size <= inline_copy_max &&
         !(size & 3) && !(align & 3) && !NOEVAL_WANTED &&
         ((dst_reg_deref_lval &&
           (IS_LOCAL_LVAL(vtop[0].r) || IS_GLOBAL_LVAL(vtop[0].r) ||

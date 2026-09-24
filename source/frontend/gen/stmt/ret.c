@@ -294,9 +294,10 @@ void gfunc_return(CType *func_type)
          * feed a 4-byte LOAD from a stale narrow STORE where an earlier wider
          * one covered the address (pr92618's 16-byte vector literal built
          * from scalar components: zero-init + 8-byte stores); pr92618 passes
-         * at 16 now, as vstore's same cap does. */
+         * at 16 now, as vstore's same cap does -- and like it, only when
+         * optimizing, where the word copies fold. */
         if (tcc_state->ir && !has_struct_vla && (vtop->r & VT_LVAL) && s_size > 0 &&
-            s_size <= 16 && !(s_size & 3) && !(s_align & 3) && !NOEVAL_WANTED)
+            s_size <= (tcc_state->optimize > 0 ? 16 : 8) && !(s_size & 3) && !(s_align & 3) && !NOEVAL_WANTED)
         {
           SValue src_mem = *vtop;
 
