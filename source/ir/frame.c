@@ -52,6 +52,7 @@
 
 #define USING_GLOBALS
 #include "ir.h"
+#include "opt_utils.h"
 #include <limits.h>
 
 #define FRAME_OBJ_ARG_COPY 1 /* a by-value argument's copy, never user-visible */
@@ -390,8 +391,13 @@ typedef struct
   /* A vreg defined once, to a known address inside a frame object: the object
    * (vseg, -1 if not known) and the offset in it (vrel). */
   int32_t *vseg[4], *vrel[4];
+  int32_t *vdef_at[4]; /* the instruction defining such a pointer */
   uint8_t *vdefs[4];
   int changed, bad;
+  /* Whole-object copies `memmove(&D, &S, size)` at which S's lifetime ends
+   * and D's begins (frame_find_copies): the call instruction and the two
+   * segments.  frame_colour gives them the same bytes, and the copy goes. */
+  int *copy_at, *copy_pos, *copy_from, *copy_from_pos, *copy_dst, *copy_src, ncopy;
 } FrameLive;
 
 static int frame_classify(FrameLive *fl, IROperand op, int *id)
@@ -1196,6 +1202,148 @@ static void frame_precise_lifetimes(FrameLive *fl, FrameCFG *cfg, const int *pos
 }
 
 /* Lifetimes of the live segments.  Returns 0 if they cannot be computed. */
+/* The block-copy helpers whose arguments are (dst, src, n). */
+static int frame_is_copy_helper(TCCIRState *ir, IRQuadCompact *call)
+{
+  static const char *const names[] = {"memcpy",          "memmove",          "__aeabi_memcpy",
+                                      "__aeabi_memcpy4", "__aeabi_memcpy8",  "__aeabi_memmove",
+                                      "__aeabi_memmove4", "__aeabi_memmove8"};
+  IROperand callee = tcc_ir_op_get_src1(ir, call);
+  if (irop_get_tag(callee) != IROP_TAG_SYMREF)
+    return 0;
+  Sym *sym = irop_get_sym_ex(ir, callee);
+  const char *name = sym ? get_tok_str(sym->v, NULL) : NULL;
+  for (unsigned k = 0; name && k < sizeof names / sizeof names[0]; k++)
+    if (!strcmp(name, names[k]))
+      return 1;
+  return 0;
+}
+
+/* Record the copies that could share their objects' bytes: a whole-object
+ * block copy between two frame objects, where the call is the source's last
+ * use and the destination's first.  frame_use attributes an argument to its
+ * call, so a source passed by its address, or by a pointer defined once to
+ * its start, ends there.  The destination's first use is the call too when it
+ * is passed by its address; when it is passed by such a pointer (the usual
+ * shape), it is the instruction that defines the pointer, which must then be
+ * in the call's block with nothing between them touching the destination.
+ * zig's C copies structs from temporary to temporary this way, one call each
+ * (`t5 = t4;`). */
+static int frame_ptr_to_start(FrameLive *fl, IROperand a, int kind, int id, int *def)
+{
+  int off;
+  *def = -1;
+  if (kind == FOP_ADDR && frame_operand_offset(a, fl->bottom, &off) && off == fl->seg[id].start)
+    return id;
+  if (kind == FOP_VAL && irop_get_tag(a) == IROP_TAG_VREG)
+  {
+    int ty = TCCIR_DECODE_VREG_TYPE(id), ps = TCCIR_DECODE_VREG_POSITION(id);
+    if (fl->vseg[ty][ps] >= 0 && fl->vrel[ty][ps] == 0)
+    {
+      *def = fl->vdef_at[ty][ps];
+      return fl->vseg[ty][ps];
+    }
+  }
+  return -1;
+}
+
+/* Whether instruction j touches segment d other than as an argument of call
+ * i: by its address, its bytes, or a pointer frame_lifetimes traced into it. */
+static int frame_insn_touches(FrameLive *fl, int j, int d, int call, const int *param_call)
+{
+  TCCIRState *ir = fl->ir;
+  IRQuadCompact *q = &ir->compact_instructions[j];
+  if (q->op == TCCIR_OP_NOP || (q->op == TCCIR_OP_FUNCPARAMVAL && param_call[j] == call))
+    return 0;
+  int nops = irop_config[q->op].has_dest + irop_config[q->op].has_src1 + irop_config[q->op].has_src2 +
+             frame_op_has_slot3(q->op);
+  for (int k = 0; k < nops; k++)
+  {
+    uint32_t pi = q->operand_base + k;
+    if (pi >= (uint32_t)ir->iroperand_pool_count)
+      continue;
+    int id, kind = frame_classify(fl, ir->iroperand_pool[pi], &id);
+    if ((kind == FOP_ADDR || kind == FOP_MEM) && id == d)
+      return 1;
+    if ((kind == FOP_VAL || kind == FOP_DEREF) && irop_get_vreg(ir->iroperand_pool[pi]) >= 0)
+    {
+      int ty = TCCIR_DECODE_VREG_TYPE(id), ps = TCCIR_DECODE_VREG_POSITION(id);
+      if (fl->vseg[ty][ps] == d || fl->taint[ty][ps] == d)
+        return 1;
+    }
+  }
+  return 0;
+}
+
+static void frame_find_copies(FrameLive *fl, const int *call_params, const int *param_next, const int *param_call,
+                              const int *pos, const FrameCFG *cfg)
+{
+  TCCIRState *ir = fl->ir;
+  for (int i = 0; i < fl->n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCCALLVOID || call_params[i] < 0 || !frame_is_copy_helper(ir, q))
+      continue;
+    int d = -1, s = -1, ddef = -1, sdef, id;
+    int64_t len = -1;
+    for (int p = call_params[i]; p >= 0; p = param_next[p])
+    {
+      IRQuadCompact *pq = &ir->compact_instructions[p];
+      IROperand a = tcc_ir_op_get_src1(ir, pq);
+      int idx = TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, pq)));
+      int kind = frame_classify(fl, a, &id);
+      if (idx == 0)
+        d = frame_ptr_to_start(fl, a, kind, id, &ddef);
+      else if (idx == 1)
+        s = frame_ptr_to_start(fl, a, kind, id, &sdef);
+      else if (idx == 2 && irop_is_immediate(a))
+        len = irop_get_imm64_ex(ir, a);
+    }
+    if (d < 0 || s < 0 || d == s)
+      continue;
+    FrameSeg *gd = &fl->seg[d], *gs = &fl->seg[s];
+    /* Only [0, len) is copied, and it becomes the same bytes of both: the
+     * destination may be bigger (a value stored into the head of a larger
+     * object) or the source (the head of a larger object taken out). */
+    if (gd->pinned || gs->pinned || gd->escaped || gs->escaped || len <= 0 || len > gd->size || len > gs->size)
+      continue;
+    if (gs->last[0] != i || gs->last[1] != pos[i])
+      continue;
+    int from = i;
+    if (ddef >= 0)
+    {
+      /* The pointer's definition opens the destination's lifetime. */
+      if (ddef > i || cfg->block_of[ddef] != cfg->block_of[i])
+        continue;
+      int clear = 1;
+      for (int j = ddef + 1; j < i && clear; j++)
+        clear = !frame_insn_touches(fl, j, d, i, param_call);
+      if (!clear)
+        continue;
+      from = ddef;
+    }
+    if (gd->first[0] != from || gd->first[1] != pos[from])
+      continue;
+    if (fl->ncopy % 64 == 0)
+    {
+      int cap = fl->ncopy + 64;
+      fl->copy_at = tcc_realloc(fl->copy_at, sizeof(int) * cap);
+      fl->copy_pos = tcc_realloc(fl->copy_pos, sizeof(int) * cap);
+      fl->copy_from = tcc_realloc(fl->copy_from, sizeof(int) * cap);
+      fl->copy_from_pos = tcc_realloc(fl->copy_from_pos, sizeof(int) * cap);
+      fl->copy_dst = tcc_realloc(fl->copy_dst, sizeof(int) * cap);
+      fl->copy_src = tcc_realloc(fl->copy_src, sizeof(int) * cap);
+    }
+    fl->copy_at[fl->ncopy] = i;
+    fl->copy_pos[fl->ncopy] = pos[i];
+    fl->copy_from[fl->ncopy] = from;
+    fl->copy_from_pos[fl->ncopy] = pos[from];
+    fl->copy_dst[fl->ncopy] = d;
+    fl->copy_src[fl->ncopy] = s;
+    fl->ncopy++;
+  }
+}
+
 static int frame_lifetimes(FrameLive *fl)
 {
   TCCIRState *ir = fl->ir;
@@ -1322,6 +1470,7 @@ static int frame_lifetimes(FrameLive *fl)
     int t = types[k], sz = fl->taint_size[t] > 0 ? fl->taint_size[t] : 1;
     fl->vseg[t] = tcc_malloc(sizeof(int32_t) * sz);
     fl->vrel[t] = tcc_malloc(sizeof(int32_t) * sz);
+    fl->vdef_at[t] = tcc_malloc(sizeof(int32_t) * sz);
     fl->vdefs[t] = tcc_mallocz(sz);
     for (int j = 0; j < sz; j++)
       fl->vseg[t][j] = -1;
@@ -1377,6 +1526,7 @@ static int frame_lifetimes(FrameLive *fl)
         continue;
       fl->vseg[ty][ps] = seg;
       fl->vrel[ty][ps] = rel;
+      fl->vdef_at[ty][ps] = i;
     }
 
   /* References and escapes.  Pool entries no instruction operand covers are
@@ -1514,6 +1664,7 @@ static int frame_lifetimes(FrameLive *fl)
       } while (grew);
     }
   }
+  frame_find_copies(fl, call_params, param_next, param_call, pos, &cfg);
   ok = 1;
 
 out:
@@ -1528,6 +1679,7 @@ out:
     tcc_free(fl->var_addr_taken[types[k]]);
     tcc_free(fl->vseg[types[k]]);
     tcc_free(fl->vrel[types[k]]);
+    tcc_free(fl->vdef_at[types[k]]);
     tcc_free(fl->vdefs[types[k]]);
   }
   tcc_free(param_call);
@@ -1627,6 +1779,25 @@ static int frame_unit_hot_first(const void *a, const void *b)
   return x->start < y->start ? -1 : x->start > y->start;
 }
 
+static int frame_grp_find(int *grp, int s)
+{
+  while (grp[s] != s)
+    s = grp[s] = grp[grp[s]];
+  return s;
+}
+
+static void frame_copies_free(FrameLive *fl)
+{
+  tcc_free(fl->copy_at);
+  tcc_free(fl->copy_pos);
+  tcc_free(fl->copy_from);
+  tcc_free(fl->copy_from_pos);
+  tcc_free(fl->copy_dst);
+  tcc_free(fl->copy_src);
+  fl->copy_at = fl->copy_pos = fl->copy_from = fl->copy_from_pos = fl->copy_dst = fl->copy_src = NULL;
+  fl->ncopy = 0;
+}
+
 /* Colour the live segments.  Returns the new bottom, or 1 when colouring does
  * not apply or does worse than packing. */
 static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom)
@@ -1643,7 +1814,49 @@ static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom)
     seg[s].last[0] = seg[s].last[1] = -1;
   }
   if (!frame_lifetimes(&fl))
+  {
+    frame_copies_free(&fl);
     return 1;
+  }
+
+  /* Copy coalescing: the two objects of a copy frame_find_copies recorded
+   * become one colouring unit, so they get the same bytes and the copy
+   * copies them onto themselves.  Chains (`t5 = t4; t6 = t5;`) merge through
+   * the groups, each merge re-checked against the group's whole lifetime; a
+   * group is as big as its biggest object, all of them at its start.  The
+   * group keeps the start whose alignment is the stricter; the other object
+   * must sit at the same offset modulo its own alignment. */
+  int *grp = tcc_malloc(sizeof(int) * (nseg > 0 ? nseg : 1));
+  uint8_t *merged = tcc_mallocz(fl.ncopy > 0 ? fl.ncopy : 1);
+  for (int s = 0; s < nseg; s++)
+    grp[s] = s;
+  for (int c = 0; c < fl.ncopy; c++)
+  {
+    int rd = frame_grp_find(grp, fl.copy_dst[c]), rs = frame_grp_find(grp, fl.copy_src[c]);
+    if (rd == rs)
+      continue;
+    /* The source group ends at the call, the destination group starts no
+     * earlier than the copy (the call, or its destination pointer). */
+    if (seg[rs].last[0] > fl.copy_at[c] || seg[rs].last[1] > fl.copy_pos[c] || seg[rd].first[0] < fl.copy_from[c] ||
+        seg[rd].first[1] < fl.copy_from_pos[c])
+      continue;
+    int keep = frame_offset_align(seg[rd].start) >= frame_offset_align(seg[rs].start) ? rd : rs;
+    int other = keep == rd ? rs : rd, oa = frame_offset_align(seg[other].start);
+    if (((seg[other].start - seg[keep].start) % oa + oa) % oa)
+      continue;
+    grp[other] = keep;
+    if (seg[other].size > seg[keep].size)
+      seg[keep].size = seg[other].size;
+    for (int o = 0; o < 2; o++)
+    {
+      if (seg[other].first[o] < seg[keep].first[o])
+        seg[keep].first[o] = seg[other].first[o];
+      if (seg[other].last[o] > seg[keep].last[o])
+        seg[keep].last[o] = seg[other].last[o];
+    }
+    seg[keep].refs += seg[other].refs;
+    merged[c] = 1;
+  }
 
   FrameUnit *u = tcc_malloc(sizeof(FrameUnit) * (nseg > 0 ? nseg : 1));
   int nu = 0;
@@ -1651,7 +1864,7 @@ static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom)
   {
     FrameSeg *g = &seg[s];
     g->unit = -1;
-    if (!g->live || (!g->pinned && g->first[0] > g->last[0]))
+    if (!g->live || (!g->pinned && g->first[0] > g->last[0]) || frame_grp_find(grp, s) != s)
       continue;
     FrameUnit *x = &u[nu];
     g->unit = nu++;
@@ -1667,6 +1880,9 @@ static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom)
     x->refs = g->refs;
     x->new_start = 1;
   }
+  for (int s = 0; s < nseg; s++)
+    if (frame_grp_find(grp, s) != s && seg[s].live)
+      seg[s].unit = seg[frame_grp_find(grp, s)].unit;
 
   int *order = tcc_malloc(sizeof(int) * (nu > 0 ? nu : 1));
   FrameSpan *spans = tcc_malloc(sizeof(FrameSpan) * (nu > 0 ? nu : 1));
@@ -1688,9 +1904,19 @@ static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom)
   if (placed >= packed)
   {
     for (int s = 0; s < nseg; s++)
-      seg[s].delta = seg[s].unit >= 0 ? u[seg[s].unit].new_start - u[seg[s].unit].start : 0;
+      seg[s].delta = seg[s].unit >= 0 ? u[seg[s].unit].new_start - seg[s].start : 0;
     result = placed;
+    /* The merged copies now copy an object onto itself. */
+    for (int c = 0; c < fl.ncopy; c++)
+      if (merged[c])
+      {
+        ir_opt_nop_call_params(ir, fl.copy_at[c]);
+        ir->compact_instructions[fl.copy_at[c]].op = TCCIR_OP_NOP;
+      }
   }
+  tcc_free(grp);
+  tcc_free(merged);
+  frame_copies_free(&fl);
   tcc_free(order);
   tcc_free(spans);
   tcc_free(u);

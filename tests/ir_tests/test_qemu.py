@@ -1267,6 +1267,11 @@ TEST_FILES = [
     # struct copy.  Stores the frontend's addrtaken used to protect.
     ("476_write_only_statics.c", 0),
 
+    # Frame copy coalescing: a struct copy whose source dies and whose
+    # destination is born at the copy shares one slot and the copy goes; a
+    # source read later or a destination live before must keep theirs.
+    ("477_frame_copy_coalescing.c", 0),
+
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
     # ssa:first_iter_exit migration.
