@@ -565,11 +565,15 @@ struct SymAttr
       param_volatile : 1,         /* original parameter declaration was volatile
                                      before function-type normalization stripped
                                      top-level qualifiers. */
-      tentative : 1;              /* file-scope object declared without an
+      tentative : 1,              /* file-scope object declared without an
                                      initializer, whose definition may still
                                      follow: its bytes are not its value yet.
                                      Cleared by the definition or at the end
                                      of the TU (finalize_tentative_definitions). */
+      used : 1,                   /* __attribute__((used)): emitted even when
+                                     nothing in the TU refers to it. */
+      tu_unused : 1;              /* a static nothing live in the TU refers to
+                                     (prune_unused_statics): never emitted. */
 };
 
 /* function attributes or temporary attributes for parsing */
@@ -920,6 +924,19 @@ typedef struct DeferredFunc
   char filename[1];
 } DeferredFunc;
 
+/* A file-scope static object whose initializer is parsed at the end of the TU
+ * (prune_unused_statics), and only if something live refers to it: its tokens
+ * from the first after '=', and the declaration they initialize. */
+typedef struct DeferredData
+{
+  Sym *sym;
+  CType type;
+  AttributeDef ad;
+  int r;
+  TokenString *init;
+  char filename[1];
+} DeferredData;
+
 /* nested functions */
 #define MAX_CAPTURED_VARS 32
 #define MAX_NONLOCAL_GOTOS 8
@@ -1171,6 +1188,8 @@ struct TCCState
   unsigned char opt_inline_small;     /* -finline-small-functions: auto-inline tiny functions at -O1 */
   unsigned char opt_inline_called_once; /* -finline-functions-called-once: defer function bodies to the end of the
                                            TU and inline each static function called from one place there */
+  unsigned char opt_drop_unused_statics; /* -fdrop-unused-statics: defer static functions and initialized static
+                                            objects to the end of the TU and emit only those something live refers to */
   unsigned char opt_ipc;              /* interprocedural constant propagation */
   int opt_inline_limit;               /* -finline-limit=N: token-stream word threshold (default 0=use level default) */
   unsigned char opt_inline_limit_user; /* -finline-limit=N given explicitly: -O levels must not override it */
@@ -1348,6 +1367,21 @@ struct TCCState
    * (-finline-functions-called-once, gen_deferred_function_bodies). */
   struct DeferredFunc **deferred_fns;
   int nb_deferred_fns;
+  /* Initialized static objects saved for -fdrop-unused-statics. */
+  struct DeferredData **deferred_data;
+  int nb_deferred_data;
+  /* The statics prune_unused_statics dropped: parsed at the end of the TU for
+   * their diagnostics only (check_dropped_statics), never emitted. */
+  struct DeferredFunc **dropped_fns;
+  int nb_dropped_fns;
+  struct DeferredData **dropped_data;
+  int nb_dropped_data;
+  /* > 0 while a dropped static is parsed for its diagnostics: nothing it
+   * produces may reach the object -- no data (NODATA_WANTED), no symbol
+   * (put_extern_sym, get_sym_ref), no relocation (greloca).  Its code goes to
+   * an IR that is freed, its static objects to check_scratch. */
+  int check_only;
+  struct Section *check_scratch;
   /* Objects declared without an initializer at file scope, settled at the end
    * of the TU (finalize_tentative_definitions). */
   struct Sym **tentative_syms;

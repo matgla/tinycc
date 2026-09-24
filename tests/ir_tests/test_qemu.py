@@ -1257,6 +1257,11 @@ TEST_FILES = [
     # there folded to 0, a store read only there was dropped.
     ("474_late_reopt_owed_inline_bodies.c", 0),
 
+    # -fdrop-unused-statics: forward-declared const objects, unsized arrays,
+    # liveness through function-pointer tables, block-scope prototypes, used
+    # and alias targets -- all deferred to the end of the TU and still defined.
+    ("475_drop_unused_statics.c", 0),
+
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
     # ssa:first_iter_exit migration.

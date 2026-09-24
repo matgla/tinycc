@@ -397,7 +397,8 @@ ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep)
            codegen, so orig_ir_to_code_mapping is NULL.  Defer resolution of
            addr-taken labels by moving them to global_label_stack, which is
            popped AFTER codegen when the mapping is available. */
-        if (addr_taken && tcc_state->ir && !tcc_state->ir->orig_ir_to_code_mapping && ptop != &global_label_stack)
+        if (addr_taken && tcc_state->ir && !tcc_state->ir->orig_ir_to_code_mapping && ptop != &global_label_stack &&
+            !tcc_state->check_only) /* a checked-only body has no codegen to wait for */
         {
           /* Unlink from table_ident now (function scope is ending) */
           if (s->r != LABEL_GONE)

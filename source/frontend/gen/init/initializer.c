@@ -127,7 +127,7 @@ void parse_init_elem(int expr_type)
 #if 1
 void init_assert(init_params *p, int offset)
 {
-  if (p->sec ? !NODATA_WANTED && offset > p->sec->data_offset : !nocode_wanted && offset > p->local_offset)
+  if (p->sec ? !NOSTATIC_WANTED && offset > p->sec->data_offset : !nocode_wanted && offset > p->local_offset)
     tcc_internal_error("initializer overflow");
 }
 #else
@@ -531,7 +531,7 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
         !((vtop->r & VT_CONST) && vtop->sym->v >= SYM_FIRST_ANOM))
       tcc_error("initializer element is not computable at load time");
 
-    if (NODATA_WANTED)
+    if (NOSTATIC_WANTED)
     {
       vtop--;
       print_vstack("init_putv");

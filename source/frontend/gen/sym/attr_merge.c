@@ -43,6 +43,7 @@ void merge_symattr(struct SymAttr *sa, struct SymAttr *sa1)
   sa->dllimport |= sa1->dllimport;
   sa->naked |= sa1->naked;
   sa->transparent_union |= sa1->transparent_union;
+  sa->used |= sa1->used;
 }
 
 /* Merge function attributes.  */
@@ -353,6 +354,18 @@ void apply_alias_attribute(Sym *alias_sym, int target_tok)
 {
   if (!resolve_alias_symbol(alias_sym, target_tok, 0))
     queue_alias_symbol(alias_sym, target_tok);
+}
+
+/* An alias target is emitted whether or not anything else refers to it
+ * (prune_unused_statics runs before the pending aliases are resolved). */
+void mark_pending_alias_targets_used(void)
+{
+  for (int i = 0; i < nb_pending_aliases; i++)
+  {
+    Sym *target = find_global_alias_target_sym(pending_aliases[i].target_tok);
+    if (target)
+      target->a.used = 1;
+  }
 }
 
 void resolve_pending_aliases(void)

@@ -513,7 +513,7 @@ ST_FUNC int gv(int rc)
       init_params p = {rodata_section};
       unsigned long offset;
       size = type_size(&vtop->type, &align);
-      if (NODATA_WANTED)
+      if (NOSTATIC_WANTED)
         size = 0, align = 1;
       offset = section_add(p.sec, size, align);
       vpush_ref(&vtop->type, p.sec, offset, size);

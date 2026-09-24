@@ -78,6 +78,13 @@ int gjmp_addr_acs(int a);
 #define vstack (_vstack + 1)
 
 #define NODATA_WANTED (nocode_wanted > 0) /* no static data output wanted either */
+/* No static-storage bytes wanted: NODATA_WANTED, or a dropped static is being
+ * parsed for its diagnostics only (check_only).  That cannot be a nocode_wanted
+ * bit: its initializers need DATA_ONLY_WANTED (the sign bit) to fold as static
+ * initializers do, and its function bodies generate code (into an IR that is
+ * freed) -- so locals are laid out as ever, and only what would land in a
+ * section is held back. */
+#define NOSTATIC_WANTED (NODATA_WANTED || tcc_state->check_only)
 #define DATA_ONLY_WANTED 0x80000000       /* ON outside of functions and for static initializers */
 
 /* no code output after unconditional jumps such as with if (tcc_state->optimize > 0) ... */
@@ -491,6 +498,14 @@ InlineFunc *inline_fn_lookup(TCCState *s, Sym *sym);
 void gen_deferred_function_bodies(TCCState *s);
 void free_deferred_functions(TCCState *s);
 void define_deferred_function(DeferredFunc *d);
+void define_deferred_data(DeferredData *d);
+void check_dropped_deferred_data(DeferredData *d, TokenString *init);
+void check_dropped_function(DeferredFunc *d, TokenString *body);
+void check_dropped_statics(TCCState *s);
+void free_dropped_statics(TCCState *s);
+void gen_function_check_only(Sym *sym);
+TokenString *tok_str_clone(TokenString *str);
+void prune_unused_statics(TCCState *s);
 int called_once_budget_begin(int own_len);
 void called_once_budget_end(int saved);
 void gen_late_reopt_functions(TCCState *s);
@@ -581,6 +596,7 @@ void merge_funcattr(struct FuncAttr *fa, struct FuncAttr *fa1);
 void merge_symattr(struct SymAttr *sa, struct SymAttr *sa1);
 void patch_storage(Sym *sym, AttributeDef *ad, CType *type);
 void resolve_pending_aliases(void);
+void mark_pending_alias_targets_used(void);
 void sym_copy_ref(Sym *s, Sym **ps);
 
 /* --- sym/symtab.c --- */

@@ -546,7 +546,7 @@ void unary_funcall(void)
    * 7. Replay only the fixed arg tokens for normal call parsing
    */
   if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_va_arg_pack &&
-      (call_func_sym->type.t & VT_INLINE))
+      (call_func_sym->type.t & VT_INLINE) && !tcc_state->check_only)
   {
     /* Find the InlineFunc for this symbol */
     struct InlineFunc *orig_fn = NULL;
@@ -1067,7 +1067,8 @@ va_arg_pack_done:
    *   int g(void) { return f(1); }  // returns 1 at -O1
    */
   int inline_evaled = 0;
-  if (!folded && !inlined && call_func_sym && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
+  if (!folded && !inlined && call_func_sym && saved_arg_count == nb_real_args && !NOEVAL_WANTED &&
+      !tcc_state->check_only)
   {
     if (try_inline_const_eval(call_func_sym, saved_args, saved_arg_count))
     {
@@ -1558,7 +1559,10 @@ va_arg_pack_done:
     int force_always_inline = 0;
     int has_addr_of_label = 0;
     int has_inline_asm = 0;
-    inline_fn = inline_fn_lookup(tcc_state, call_func_sym);
+    /* A body parsed for its diagnostics only expands nothing: the call is
+     * enough to check, and an expansion could consume a body a live call
+     * site still owes. */
+    inline_fn = tcc_state->check_only ? NULL : inline_fn_lookup(tcc_state, call_func_sym);
     if (inline_fn && inline_fn->func_str)
       inline_scan_body_features(inline_fn->func_str, &has_addr_of_label, &has_inline_asm);
     if (call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl &&

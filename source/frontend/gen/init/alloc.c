@@ -154,10 +154,10 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
         if (p->sec && size1 == 1)
         {
           init_assert(p, c + nb);
-          if (!NODATA_WANTED)
+          if (!NOSTATIC_WANTED)
             memcpy(p->sec->data + c, initstr.data, nb);
         }
-        else if (tcc_state->ir && size1 == 1 && nb >= 8 && !NODATA_WANTED)
+        else if (tcc_state->ir && size1 == 1 && nb >= 8 && !NOSTATIC_WANTED)
         {
           /* Bulk copy string literal from .rodata instead of byte-by-byte stores.
            * Matches GCC: memcpy(dest, .rodata, str_len) + memset(trailing, 0, rem) */
@@ -458,7 +458,7 @@ ST_FUNC void finalize_tentative_definitions(TCCState *s1)
     Sym *sym = s1->tentative_syms[i];
     sym->a.tentative = 0;
     ElfSym *esym = sym->c ? elfsym(sym) : NULL;
-    if (!esym || esym->st_shndx != SHN_COMMON)
+    if (!esym || esym->st_shndx != SHN_COMMON || sym->a.tu_unused)
       continue;
     if (!(sym->type.t & VT_STATIC) && !s1->nocommon)
       continue;
@@ -607,7 +607,7 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
     align = 1;
   }
 
-  if (!v && NODATA_WANTED)
+  if (!v && (NODATA_WANTED || (tcc_state->check_only && (r & VT_VALMASK) == VT_CONST)))
   {
     size = 0, align = 1;
   }
@@ -773,7 +773,10 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
       CType *tp = type;
       while ((tp->t & (VT_BTYPE | VT_ARRAY)) == (VT_PTR | VT_ARRAY))
         tp = &tp->ref->type;
-      if (tp->t & VT_CONSTANT)
+      /* A tentative one waits in COMMON, const or not (below): the
+       * definition that may follow is placed where it belongs, and one
+       * nothing refers to is dropped (prune_unused_statics). */
+      if ((tp->t & VT_CONSTANT) && !tentative)
       {
         /* RELRO: with -share-rodata, a const object whose type contains a
            pointer can hold a relocation, so it must live in the writable
@@ -800,6 +803,9 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
         sec = bss_section;
     }
 
+    /* A static object of a function parsed for its diagnostics only. */
+    if (sec && tcc_state->check_only)
+      sec = tcc_state->check_scratch;
     if (sec)
     {
       if (!tentative_storage_reuse(sym, has_init, sec, size, align, &addr))
@@ -1019,7 +1025,7 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
      * is entirely load-time-constant do we emit the memcpy and skip the
      * per-element path.  Otherwise rewind and fall through to normal init. */
     int templated = 0;
-    if (!sec && tcc_state->ir && has_init && !NODATA_WANTED && (type->t & VT_ARRAY) && !(type->t & VT_VLA) &&
+    if (!sec && tcc_state->ir && has_init && !NOSTATIC_WANTED && (type->t & VT_ARRAY) && !(type->t & VT_VLA) &&
         !(type->t & VT_COMPLEX) && size > 256)
     {
       /* Both paths leave the live token at the start of the initializer:

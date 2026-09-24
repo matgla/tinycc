@@ -43,7 +43,9 @@ static NestedFunc *find_nested_func_by_sym(Sym *sym)
 void setup_nested_func_trampoline(Sym *s)
 {
   NestedFunc *nf = find_nested_func_by_sym(s);
-  if (!nf)
+  /* A body parsed for its diagnostics only (check_only) has no code to need
+   * a trampoline, and the chain slot and trampoline symbols would outlive it. */
+  if (!nf || tcc_state->check_only)
     return;
 
   nf->trampoline_needed = 1;

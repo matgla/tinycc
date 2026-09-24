@@ -606,6 +606,26 @@ static void define_global_function(Sym *sym, Section *ad_section)
  * compiled at its definition could inline nothing defined further down.  A
  * static inline, an old-style or variadic definition, and one whose VLA
  * parameters evaluate expressions at the definition are left alone. */
+/* Whether T, the token before a name followed by '(', ends the declaration
+ * specifiers of a block-scope declaration (`zig_extern zig_i128 __divti3(...);`
+ * in zig.h): a type keyword or a typedef name.  The name is being declared,
+ * with its prototype, not called. */
+static int tok_ends_decl_specifiers(int t)
+{
+  switch (t)
+  {
+  case TOK_VOID: case TOK_CHAR: case TOK_INT: case TOK_FLOAT: case TOK_DOUBLE: case TOK_BOOL:
+  case TOK_SHORT: case TOK_LONG: case TOK_UNSIGNED: case TOK_SIGNED1: case TOK_SIGNED2: case TOK_SIGNED3:
+  case TOK_CONST1: case TOK_CONST2: case TOK_CONST3:
+  case TOK_VOLATILE1: case TOK_VOLATILE2: case TOK_VOLATILE3:
+    return 1;
+  }
+  if (t < TOK_UIDENT)
+    return 0;
+  Sym *s = sym_find(t);
+  return s && (s->type.t & VT_TYPEDEF);
+}
+
 /* Whether BODY calls a function that has no prototype here: an identifier
  * with no declaration in scope (an implicit declaration), or one declared
  * without a prototype.  Replayed at the end of the TU, the call would be
@@ -637,7 +657,7 @@ static int body_calls_unprototyped(Sym *sym, TokenString *body)
       }
       else if (t >= TOK_BUILTIN_END)
       {
-        int local = 0;
+        int local = tok_ends_decl_specifiers(prev);
         for (Sym *param = sym->type.ref->next; param && !local; param = param->next)
           local = (param->v & ~SYM_FIELD) == t;
         for (const int *q = start; q < at && !local;)
@@ -659,7 +679,7 @@ static int body_calls_unprototyped(Sym *sym, TokenString *body)
 
 static int defer_function_body(Sym *sym, Section *section)
 {
-  if (!tcc_state->opt_inline_called_once || tcc_state->nb_vla_param_exprs ||
+  if (!(tcc_state->opt_inline_called_once || tcc_state->opt_drop_unused_statics) || tcc_state->nb_vla_param_exprs ||
       (sym->type.t & VT_INLINE) || !sym->type.ref || sym->type.ref->f.func_type != FUNC_NEW || sym->a.nested_func)
     return 0;
   DeferredFunc *d = tcc_mallocz(sizeof *d + strlen(file->filename));
@@ -700,6 +720,156 @@ void define_deferred_function(DeferredFunc *d)
   end_macro();
   pp_pack_leave(tcc_state, saved_pack);
   called_once_budget_end(saved_budget);
+}
+
+/* A copy of STR, to replay without consuming it. */
+TokenString *tok_str_clone(TokenString *str)
+{
+  TokenString *copy = tok_str_alloc();
+  for (const int *p = tok_str_buf(str), *end = p + str->len; p < end; p++)
+    tok_str_add(copy, *p);
+  return copy;
+}
+
+/* Complete TYPE, an array whose size its initializer decides, from the saved
+ * tokens INIT: the size-only pass decl_initializer_alloc runs first, over a
+ * copy, so INIT stays whole for the replay. */
+static void size_array_from_saved_init(CType *type, TokenString *init)
+{
+  TokenString *copy = tok_str_clone(init);
+  int saved_tok = tok, saved_line = file->line_num, saved_nocode_wanted = nocode_wanted;
+  CValue saved_tokc = tokc;
+  init_params ip = {0};
+  /* Unshare the size-holding ref, as decl_initializer_alloc does: a typedef
+   * of an unsized array keeps its own. */
+  type->ref = sym_push(SYM_FIELD, &type->ref->type, 0, type->ref->c);
+  ip.flex_array_ref = type->ref;
+  nocode_wanted |= DATA_ONLY_WANTED;
+  begin_macro(copy, 1);
+  next();
+  decl_initializer(&ip, type, 0, DIF_FIRST | DIF_SIZE_ONLY, -1);
+  end_macro();
+  nocode_wanted = saved_nocode_wanted;
+  tok = saved_tok;
+  tokc = saved_tokc;
+  file->line_num = saved_line;
+}
+
+/* -fdrop-unused-statics: save the initializer of a file-scope static object
+ * instead of parsing it, so the end of the TU (prune_unused_statics) emits it
+ * only if something live refers to it.  The symbol is declared now, with its
+ * complete type, so every later mention resolves; until it is defined it is
+ * undefined (or still tentative), which no initializer-reading fold trusts.
+ * An object whose size its initializer decides, or that carries attributes
+ * about where or whether it is emitted, is defined here as before. */
+static int defer_static_data(CType *type, AttributeDef *ad, int r, int v)
+{
+  int align;
+  if (!tcc_state->opt_drop_unused_statics || !(type->t & VT_STATIC) || (type->t & VT_EXTERN) || ad->section ||
+      ad->a.used || ad->alias_target || ad->asm_label || ad->cleanup_func)
+    return 0;
+  const int unsized = type_size(type, &align) < 0;
+  if (unsized && (!(type->t & VT_ARRAY) || type_size(&type->ref->type, &align) < 0))
+    return 0;
+#ifdef CONFIG_TCC_BCHECK
+  if (tcc_state->do_bounds_check)
+    return 0;
+#endif
+  if ((type->t & VT_BTYPE) == VT_STRUCT)
+  {
+    Sym *field = type->ref->next;
+    while (field && field->next)
+      field = field->next;
+    if (field && (field->type.t & VT_ARRAY) && field->type.ref->c < 0)
+      return 0; /* a flexible array member: the initializer sizes it */
+  }
+  Sym *sym = sym_find(v);
+  if (sym)
+  {
+    ElfSym *esym = sym->c ? elfsym(sym) : NULL;
+    if (!(sym->type.t & VT_EXTERN) || (esym && esym->st_shndx != SHN_UNDEF && esym->st_shndx != SHN_COMMON))
+      return 0; /* already defined: let the definition path report it */
+  }
+  TokenString *init;
+  skip_or_save_block(&init);
+  if (unsized)
+  {
+    size_array_from_saved_init(type, init);
+    if (type_size(type, &align) < 0)
+      tcc_error("unknown type size");
+  }
+  /* Declared, not defined, until the replay: the way a tentative static
+   * is (decl() marks an uninitialized one VT_EXTERN). */
+  CType declared = *type;
+  declared.t |= VT_EXTERN;
+  if (sym)
+    patch_storage(sym, ad, &declared);
+  else
+  {
+    sym = sym_push(v, &declared, r | VT_SYM, 0);
+    patch_storage(sym, ad, NULL);
+  }
+  DeferredData *d = tcc_mallocz(sizeof *d + strlen(file->filename));
+  strcpy(d->filename, file->filename);
+  d->sym = sym;
+  d->type = *type;
+  d->ad = *ad;
+  d->r = r;
+  d->init = init;
+  dynarray_add(&tcc_state->deferred_data, &tcc_state->nb_deferred_data, d);
+  return 1;
+}
+
+/* Define an object defer_static_data saved: replay its initializer through
+ * the allocation it skipped. */
+void define_deferred_data(DeferredData *d)
+{
+  TokenString *init = d->init;
+  d->init = NULL;
+  tccpp_putfile(d->filename);
+  begin_macro(init, 1);
+  next();
+  decl_initializer_alloc(&d->type, &d->ad, d->r, 1, d->sym->v, 1);
+  if (tok != TOK_EOF)
+    expect("';'");
+  end_macro();
+}
+
+/* Parse the initializer of an object prune_unused_statics dropped, for its
+ * diagnostics only: an invalid initializer is an error whether or not the
+ * object is used (96_nodata_wanted).  Under check_only nothing reaches the
+ * object file; the initializer is laid out in check_scratch. */
+void check_dropped_deferred_data(DeferredData *d, TokenString *init)
+{
+  int align, size = type_size(&d->type, &align);
+  init_params p = {0};
+  p.sec = tcc_state->check_scratch;
+  const unsigned long addr = section_add(p.sec, size > 0 ? size : 0, align > 0 ? align : 1);
+  const int saved_nocode_wanted = nocode_wanted;
+  nocode_wanted = DATA_ONLY_WANTED;
+  tcc_state->check_only++;
+  tccpp_putfile(d->filename);
+  begin_macro(init, 1);
+  next();
+  decl_initializer(&p, &d->type, addr, DIF_FIRST, -1);
+  if (tok != TOK_EOF)
+    expect("';'");
+  end_macro();
+  tcc_state->check_only--;
+  nocode_wanted = saved_nocode_wanted;
+}
+
+/* The same for a function body (gen_function_check_only). */
+void check_dropped_function(DeferredFunc *d, TokenString *body)
+{
+  int saved_pack[PACK_STACK_SIZE + 1];
+  tccpp_putfile(d->filename);
+  pp_pack_enter(tcc_state, d->pack, saved_pack);
+  begin_macro(body, 1);
+  next();
+  gen_function_check_only(d->sym);
+  end_macro();
+  pp_pack_leave(tcc_state, saved_pack);
 }
 
 /* 'l' is VT_LOCAL or VT_CONST to define default storage type
@@ -1269,7 +1439,8 @@ int decl(int l)
             else if (l == VT_CONST)
               /* uninitialized global variables may be overridden */
               type.t |= VT_EXTERN;
-            decl_initializer_alloc(&type, &ad, r, has_init, v, l == VT_CONST);
+            if (!(has_init && l == VT_CONST && defer_static_data(&type, &ad, r, v)))
+              decl_initializer_alloc(&type, &ad, r, has_init, v, l == VT_CONST);
           }
 
           if (ad.alias_target && l == VT_CONST)

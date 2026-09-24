@@ -292,10 +292,12 @@ redo:
     case TOK_NODEBUG2:
       ad->a.nodebug = 1;
       break;
+    case TOK_USED1:
+    case TOK_USED2:
+      ad->a.used = 1;
+      break;
     case TOK_UNUSED1:
     case TOK_UNUSED2:
-      /* currently, no need to handle it because tcc does not
-         track unused objects */
       break;
     case TOK_NORETURN1:
     case TOK_NORETURN2:

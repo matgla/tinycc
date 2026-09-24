@@ -18,7 +18,7 @@ static void ir_ensure_sym_registered(SValue *sv)
   {
     Sym *sym = sv->sym;
     /* Check if this is an anonymous symbol that hasn't been registered yet */
-    if ((sym->v & ~0x0FFFFFFF) == SYM_FIRST_ANOM && sym->c == 0)
+    if ((sym->v & ~0x0FFFFFFF) == SYM_FIRST_ANOM && sym->c == 0 && !tcc_state->check_only)
     {
       /* Use put_extern_sym2 directly to bypass nocode_wanted check.
        * We need the symbol registered in ELF even if we're in a "nocode" section

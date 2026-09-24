@@ -644,6 +644,79 @@ void gen_function(Sym *sym)
     sym->type.ref->f.func_compiled = 1;
 }
 
+/* Parse SYM's body, the current token stream from its '{', for the
+ * diagnostics it raises and nothing else: prune_unused_statics dropped the
+ * function, but an error in it is still an error (gcc reports it too).
+ * The frontend runs as for gen_function -- parameters in scope, code on --
+ * into an IR that is freed afterwards, with tcc_state->check_only keeping
+ * every other product out of the object (see its comment in tcc.h).  No
+ * optimization, no codegen.  Nested function bodies are saved by the parse
+ * and generated only by codegen, so they are not checked. */
+void gen_function_check_only(Sym *sym)
+{
+  struct scope f = {0};
+  Sym *global_label_stack_start = global_label_stack;
+  LabelDiffFixup *fixups_start = tcc_state->label_diff_fixups;
+  const int nested_start = tcc_state->nb_nested_funcs;
+  Section *saved_text = cur_text_section;
+
+  tcc_state->check_only++;
+  cur_scope = root_scope = &f;
+  nocode_wanted = 0;
+  cur_text_section = tcc_state->check_scratch;
+  ind = 0;
+  funcname = get_tok_str(sym->v, NULL);
+  func_ind = 0;
+  func_vt = sym->type.ref->type;
+  func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
+  func_has_label_addr = 0;
+  tcc_state->cur_func_sym = sym;
+  tcc_state->const_loop_inline_used = 0;
+
+  sym_push2(&local_stack, SYM_FIELD, 0, 0);
+  TCCIRState *ir = tcc_ir_alloc();
+  tcc_state->ir = ir;
+  gen_op_vector_reset();
+  ir->is_variadic = func_var;
+  local_scope = 1;
+  tcc_ir_params_add(ir, &sym->type);
+  nb_temp_local_vars = 0;
+  local_scope = 0;
+  rsym = -1;
+  block(0);
+
+  sym_pop(&local_stack, NULL, 0);
+  sym_pop(&all_cleanups, NULL, 0);
+  label_pop(&global_label_stack, global_label_stack_start, 0);
+  while (tcc_state->label_diff_fixups && tcc_state->label_diff_fixups != fixups_start)
+  {
+    LabelDiffFixup *next = tcc_state->label_diff_fixups->next;
+    tcc_free(tcc_state->label_diff_fixups);
+    tcc_state->label_diff_fixups = next;
+  }
+  for (int i = nested_start; i < tcc_state->nb_nested_funcs; i++)
+    if (tcc_state->nested_funcs[i].func_str)
+    {
+      tok_str_free(tcc_state->nested_funcs[i].func_str);
+      tcc_state->nested_funcs[i].func_str = NULL;
+    }
+  tcc_state->nb_nested_funcs = nested_start;
+
+  cur_text_section = saved_text;
+  funcname = "";
+  func_vt.t = VT_VOID;
+  func_var = 0;
+  ind = 0;
+  func_ind = -1;
+  tcc_state->cur_func_sym = NULL;
+  nocode_wanted = DATA_ONLY_WANTED;
+  check_vstack();
+  next();
+  tcc_ir_free(ir);
+  tcc_state->ir = NULL;
+  tcc_state->check_only--;
+}
+
 /* ------------------------------------------------------------------ */
 /* Helpers that were extracted from tccgen.c because they are only
  * called from gen_function().  Keeping them here avoids orphaned-static

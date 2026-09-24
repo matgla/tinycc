@@ -225,6 +225,9 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
   next();
   decl(VT_CONST);
+  /* Drop the statics nothing live refers to, and define the objects whose
+   * initializers were saved (-fdrop-unused-statics). */
+  prune_unused_statics(s1);
   /* Every definition has been seen: settle the tentative ones before any
    * deferred body addresses them. */
   finalize_tentative_definitions(s1);
@@ -304,6 +307,8 @@ ST_FUNC int tccgen_compile(TCCState *s1)
       ifn->sym = NULL;
     }
   }
+  /* The statics dropped as unused are still checked for errors. */
+  check_dropped_statics(s1);
   resolve_pending_aliases();
   check_vstack();
   /* end of translation unit info */
@@ -334,6 +339,7 @@ ST_FUNC void tccgen_finish(TCCState *s1)
      would have freed. */
   inline_release_hidden_label_bindings();
   free_deferred_functions(s1);
+  free_dropped_statics(s1);
   free_tentative_definitions(s1);
   tcc_icf_reset();
 

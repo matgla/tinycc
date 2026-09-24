@@ -1,0 +1,5 @@
+fwd_const=42
+greeting=deferred len=9 sq=16 n=5
+vtable=25
+local_decl=9
+used=11 aliased=99 counter=6

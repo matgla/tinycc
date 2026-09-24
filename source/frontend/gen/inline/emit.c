@@ -22,6 +22,7 @@
  * Split out of tccgen.c; see docs/plan_tccgen_split.md. */
 
 #include "gen_priv.h"
+#include "tccdbgenv.h"
 
 /* parse a function defined by symbol 'sym' and generate its code in
    'cur_text_section' */
@@ -629,11 +630,306 @@ void free_deferred_functions(TCCState *s)
     tcc_free(s->deferred_fns[i]->pack);
   }
   dynarray_reset(&s->deferred_fns, &s->nb_deferred_fns); /* frees the entries too */
+  for (int i = 0; i < s->nb_deferred_data; i++)
+    if (s->deferred_data[i]->init)
+      tok_str_free(s->deferred_data[i]->init);
+  dynarray_reset(&s->deferred_data, &s->nb_deferred_data);
   for (int i = 0; i < nb_deferred_scratch; i++)
     tcc_free(deferred_scratch[i]);
   tcc_free(deferred_scratch);
   deferred_scratch = NULL;
   nb_deferred_scratch = 0;
+}
+
+/* ---- -fdrop-unused-statics -------------------------------------------
+ *
+ * At the end of parsing, a static function or initialized static object
+ * nothing live refers to is dropped, as gcc does at -O1: generated C
+ * (zig's) defines every helper and table it might need, and a program keeps
+ * few of them.  The candidates are the saved bodies (defer_function_body),
+ * the saved initializers (defer_static_data), the static inline bodies
+ * waiting to be emitted, and the static tentative definitions.  Roots are
+ * what must be emitted anyway: a non-static function, one marked used,
+ * weak, constructor/destructor or placed in a section, an alias target, and
+ * any candidate a relocation of already emitted code or data refers to.
+ * Liveness then flows along identifier mentions in the saved tokens -- a
+ * name is a reference however it is used (called, address taken, sizeof),
+ * which can only keep too much.  The live objects are defined here, in
+ * declaration order, before the tentative definitions are settled and before
+ * any body is generated, so every fold of an initializer sees its bytes. */
+
+static void tombstone_unused_static(Sym *sym)
+{
+  sym->a.tu_unused = 1;
+  ElfSym *esym = sym->c ? elfsym(sym) : NULL;
+  if (esym && (esym->st_shndx == SHN_UNDEF || esym->st_shndx == SHN_COMMON))
+  {
+    esym->st_shndx = SHN_ABS;
+    esym->st_value = 0;
+    esym->st_size = 0;
+  }
+}
+
+/* A scratch section for what a check-only parse lays out (check_only in
+ * tcc.h): never registered with the TU, so nothing in it is output. */
+static void check_scratch_begin(TCCState *s)
+{
+  if (s->check_scratch)
+    return;
+  s->check_scratch = tcc_mallocz(sizeof(Section) + 16);
+  s->check_scratch->s1 = s;
+  s->check_scratch->sh_type = SHT_PROGBITS;
+  s->check_scratch->sh_addralign = 1;
+}
+
+/* TCC_CHECK_ALL_STATICS: also run the check-only parse over every live
+ * deferred body and initializer, just before it is generated -- a stress
+ * mode that puts check_only through the whole test corpus. */
+TCC_DBG_ENV_FLAG(check_every_static, "TCC_CHECK_ALL_STATICS")
+
+void prune_unused_statics(TCCState *s)
+{
+  const int nf = s->nb_deferred_fns, nd = s->nb_deferred_data;
+  if (!s->opt_drop_unused_statics || (!nf && !nd))
+    goto define_all;
+
+  /* Nodes: deferred functions, deferred objects, static inline bodies,
+   * static tentative definitions -- in that order. */
+  const int ni = s->nb_inline_fns, nt = s->nb_tentative_syms;
+  const int cap = nf + nd + ni + nt;
+  Sym **node_sym = deferred_alloc(sizeof(Sym *) * cap);
+  TokenString **node_toks = deferred_alloc(sizeof(TokenString *) * cap);
+  uint8_t *root = deferred_alloc(cap), *live = deferred_alloc(cap);
+  int n = 0;
+  for (int i = 0; i < nf; i++)
+  {
+    DeferredFunc *d = s->deferred_fns[i];
+    Sym *sym = d->sym;
+    node_sym[n] = sym;
+    node_toks[n] = d->body;
+    root[n] = !(sym->type.t & VT_STATIC) || sym->a.used || sym->a.weak || d->section ||
+              (sym->type.ref && (sym->type.ref->f.func_ctor || sym->type.ref->f.func_dtor));
+    n++;
+  }
+  for (int i = 0; i < nd; i++)
+  {
+    node_sym[n] = s->deferred_data[i]->sym;
+    node_toks[n] = s->deferred_data[i]->init;
+    root[n] = node_sym[n]->a.used;
+    n++;
+  }
+  for (int i = 0; i < ni; i++)
+  {
+    InlineFunc *fn = s->inline_fns[i];
+    if (!fn || !fn->sym || !fn->func_str)
+      continue;
+    Sym *sym = fn->sym;
+    ElfSym *esym = sym->c ? elfsym(sym) : NULL;
+    node_sym[n] = sym;
+    node_toks[n] = fn->func_str;
+    /* Already compiled (a body kept for re-optimization): what it refers
+     * to stays referred to. */
+    root[n] = !(sym->type.t & VT_STATIC) || sym->a.used || (esym && esym->st_shndx != SHN_UNDEF);
+    n++;
+  }
+  const int tent_base = n;
+  for (int i = 0; i < nt; i++)
+  {
+    Sym *sym = s->tentative_syms[i];
+    if (!(sym->type.t & VT_STATIC) || !sym->a.tentative)
+      continue;
+    node_sym[n] = sym;
+    node_toks[n] = NULL;
+    root[n] = sym->a.used;
+    n++;
+  }
+
+  /* Names -> nodes (a chain per name; an object with a deferred definition
+   * is also a tentative node, harmlessly). */
+  const int ntok = tok_ident - TOK_IDENT;
+  int *head = deferred_alloc(sizeof(int) * (ntok > 0 ? ntok : 1));
+  int *next_same = deferred_alloc(sizeof(int) * (n ? n : 1));
+  for (int k = 0; k < ntok; k++)
+    head[k] = -1;
+  for (int i = 0; i < n; i++)
+  {
+    int k = (node_sym[i]->v & ~SYM_FIELD) - TOK_IDENT;
+    next_same[i] = -1;
+    if (k >= 0 && k < ntok)
+    {
+      next_same[i] = head[k];
+      head[k] = i;
+    }
+  }
+
+  /* Relocations of what is already emitted, and alias targets. */
+  const int nelf = symtab_section->data_offset / sizeof(ElfW(Sym));
+  int *by_elf = deferred_alloc(sizeof(int) * (nelf ? nelf : 1));
+  for (int e = 0; e < nelf; e++)
+    by_elf[e] = -1;
+  for (int i = 0; i < n; i++)
+    if (node_sym[i]->c > 0 && node_sym[i]->c < nelf)
+      by_elf[node_sym[i]->c] = i;
+  for (int sh = 1; sh < s->nb_sections; sh++)
+  {
+    Section *sec = s->sections[sh];
+    if (!sec || !(sec->sh_flags & SHF_ALLOC) || !sec->reloc)
+      continue;
+    ElfW_Rel *rel = (ElfW_Rel *)sec->reloc->data, *rel_end = (ElfW_Rel *)(sec->reloc->data + sec->reloc->data_offset);
+    for (; rel < rel_end; rel++)
+    {
+      int e = ELFW(R_SYM)(rel->r_info);
+      if (e > 0 && e < nelf && by_elf[e] >= 0)
+        root[by_elf[e]] = 1;
+    }
+  }
+  mark_pending_alias_targets_used();
+  for (int i = 0; i < n; i++)
+    if (node_sym[i]->a.used)
+      root[i] = 1;
+
+  /* Mentions, breadth first from the roots.  A name after '.' or '->' is a
+   * member, not a reference. */
+  int *work = deferred_alloc(sizeof(int) * (n ? n : 1)), nw = 0;
+  for (int i = 0; i < n; i++)
+    if (root[i])
+      live[i] = 1, work[nw++] = i;
+  while (nw)
+  {
+    TokenString *str = node_toks[work[--nw]];
+    if (!str)
+      continue;
+    const int *p = tok_str_buf(str), *end = p + str->len;
+    int prev = 0;
+    while (p < end)
+    {
+      int t;
+      CValue cv;
+      tok_get(&t, &p, &cv);
+      if (t >= TOK_IDENT && t - TOK_IDENT < ntok && prev != '.' && prev != TOK_ARROW)
+        for (int j = head[t - TOK_IDENT]; j >= 0; j = next_same[j])
+          if (!live[j])
+            live[j] = 1, work[nw++] = j;
+      if (t != TOK_LINENUM)
+        prev = t;
+    }
+  }
+
+  /* A symbol reached under any of its nodes is live under all of them. */
+  for (int i = 0; i < n; i++)
+  {
+    int k = (node_sym[i]->v & ~SYM_FIELD) - TOK_IDENT;
+    if (live[i] && k >= 0 && k < ntok)
+      for (int j = head[k]; j >= 0; j = next_same[j])
+        if (node_sym[j] == node_sym[i])
+          live[j] = 1;
+  }
+
+  /* The dropped ones move to their own lists: check_dropped_statics parses
+   * them for their diagnostics once everything live is generated. */
+  int kept = 0;
+  for (int i = 0; i < nf; i++)
+  {
+    DeferredFunc *d = s->deferred_fns[i];
+    if (live[i])
+      s->deferred_fns[kept++] = d;
+    else
+    {
+      dynarray_add(&s->dropped_fns, &s->nb_dropped_fns, d);
+      tombstone_unused_static(d->sym);
+    }
+  }
+  s->nb_deferred_fns = kept;
+  kept = 0;
+  for (int i = 0; i < nd; i++)
+  {
+    DeferredData *d = s->deferred_data[i];
+    if (live[nf + i])
+      s->deferred_data[kept++] = d;
+    else
+    {
+      dynarray_add(&s->dropped_data, &s->nb_dropped_data, d);
+      tombstone_unused_static(d->sym);
+    }
+  }
+  s->nb_deferred_data = kept;
+  for (int i = tent_base; i < n; i++)
+    if (!live[i])
+      tombstone_unused_static(node_sym[i]);
+
+define_all:
+  if (s->nb_deferred_data)
+  {
+    const int saved_nocode_wanted = nocode_wanted;
+    nocode_wanted = DATA_ONLY_WANTED;
+    tcc_open_bf(s, ":deferred:", 0);
+    for (int i = 0; i < s->nb_deferred_data; i++)
+    {
+      DeferredData *d = s->deferred_data[i];
+      if (check_every_static())
+      {
+        check_scratch_begin(s);
+        check_dropped_deferred_data(d, tok_str_clone(d->init));
+      }
+      define_deferred_data(d);
+    }
+    tcc_close();
+    nocode_wanted = saved_nocode_wanted;
+  }
+}
+
+/* Parse the statics prune_unused_statics dropped, for their diagnostics
+ * only, after everything live has been generated -- so what the parse
+ * records on symbols (possibly_written, addrtaken) cannot pessimize code.
+ * Debug output is off: no line table or DIE may describe them. */
+void check_dropped_statics(TCCState *s)
+{
+  if (!s->nb_dropped_fns && !s->nb_dropped_data)
+    return;
+  check_scratch_begin(s);
+  const char saved_debug_modes = debug_modes;
+  debug_modes = 0;
+  tcc_open_bf(s, ":dropped:", 0);
+  for (int i = 0; i < s->nb_dropped_data; i++)
+  {
+    DeferredData *d = s->dropped_data[i];
+    TokenString *init = d->init;
+    d->init = NULL;
+    check_dropped_deferred_data(d, init);
+  }
+  for (int i = 0; i < s->nb_dropped_fns; i++)
+  {
+    DeferredFunc *d = s->dropped_fns[i];
+    TokenString *body = d->body;
+    d->body = NULL;
+    check_dropped_function(d, body);
+  }
+  tcc_close();
+  debug_modes = saved_debug_modes;
+  free_dropped_statics(s);
+}
+
+/* Also on every exit, an error's included (tccgen_finish). */
+void free_dropped_statics(TCCState *s)
+{
+  for (int i = 0; i < s->nb_dropped_fns; i++)
+  {
+    if (s->dropped_fns[i]->body)
+      tok_str_free(s->dropped_fns[i]->body);
+    tcc_free(s->dropped_fns[i]->pack);
+  }
+  dynarray_reset(&s->dropped_fns, &s->nb_dropped_fns);
+  for (int i = 0; i < s->nb_dropped_data; i++)
+    if (s->dropped_data[i]->init)
+      tok_str_free(s->dropped_data[i]->init);
+  dynarray_reset(&s->dropped_data, &s->nb_dropped_data);
+  if (s->check_scratch)
+  {
+    tcc_free(s->check_scratch->data);
+    tcc_free(s->check_scratch);
+    s->check_scratch = NULL;
+  }
+  s->check_only = 0;
 }
 
 void gen_deferred_function_bodies(TCCState *s)
@@ -703,8 +999,8 @@ void gen_deferred_function_bodies(TCCState *s)
   {
     DeferredFunc *d = s->deferred_fns[j];
     Sym *sym = d->sym;
-    if (!(sym->type.t & VT_STATIC) || calls[j] != 1 || mentions[j] || caller[j] == j || sym->c ||
-        sym->a.addrtaken || !d->body || !called_once_body_ok(sym, d->body))
+    if (!s->opt_inline_called_once || !(sym->type.t & VT_STATIC) || calls[j] != 1 || mentions[j] ||
+        caller[j] == j || sym->c || sym->a.addrtaken || !d->body || !called_once_body_ok(sym, d->body))
       continue;
     once[j] = 1;
     /* A deferred inline body: the call site replays it, gen_inline_functions
@@ -753,7 +1049,14 @@ void gen_deferred_function_bodies(TCCState *s)
       sp -= 2;
       state[i] = 2;
       if (!once[i] && s->deferred_fns[i]->body)
+      {
+        if (check_every_static())
+        {
+          check_scratch_begin(s);
+          check_dropped_function(s->deferred_fns[i], tok_str_clone(s->deferred_fns[i]->body));
+        }
         define_deferred_function(s->deferred_fns[i]);
+      }
     }
   }
   tcc_close();

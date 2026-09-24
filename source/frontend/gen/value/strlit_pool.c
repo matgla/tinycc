@@ -91,7 +91,7 @@ void str_lit_pool_merge(addr_t pre_off)
   if (tcc_state->do_bounds_check)
     return; /* bound-check padding breaks the tail-append invariant */
 #endif
-  if (NODATA_WANTED)
+  if (NOSTATIC_WANTED)
     return;
   if (!vtop->sym || vtop->c.i != 0)
     return;
