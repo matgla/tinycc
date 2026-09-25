@@ -81,6 +81,13 @@ static void erase_section_range(TCCState *s, Section *sec, addr_t start, addr_t 
   if (tail_len > 0 && !nobits)
     memmove(sec->data + (tail_offset - shift), sec->data + tail_offset, tail_len);
   sec->data_offset -= shift;
+  /* Zero the vacated tail.  The next thing appended here takes it as grown
+   * section memory, and a string literal relies on that being zero for its
+   * terminator: with the old bytes left in place, the second file of a
+   * two-file compile (120_alias at -O1) got "in unit2:\n" ending in the tail
+   * of the first file's format string instead of a NUL. */
+  if (!nobits)
+    memset(sec->data + sec->data_offset, 0, shift);
 
   /* Adjust symbols that point into this section. */
   Section *symtab = s->symtab; /* union alias of symtab_section */
