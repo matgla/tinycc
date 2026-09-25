@@ -394,6 +394,7 @@ void unary_funcall(void)
   int can_inline_builtin = 0;
   int can_inline_eval = 0;
   int can_optimize_string_builtin = 0;
+  int can_optimize_fputs_family = 0;
   const char *func_name = NULL;
 
   /* Check if we have a named function that might be foldable */
@@ -421,6 +422,15 @@ void unary_funcall(void)
     }
 
     can_optimize_string_builtin = resolve_str_builtin_id(call_func_sym->v, func_name) != STRBI_UNKNOWN;
+
+    /* The fputs lowering below needs the arguments saved.  can_try_fold's
+     * first-letter screen passes fputs and fputs_unlocked but not
+     * __builtin_fputs_unlocked, which is a lazily declared prototype that
+     * keeps its own name -- so that one was never lowered, and with a
+     * user-supplied fputs that aborts inside main (gcc_execute
+     * builtins/fputs) the call reached it. */
+    can_optimize_fputs_family = func_name && (strcmp(func_name, "fputs") == 0 || strcmp(func_name, "fputs_unlocked") == 0 ||
+                                              strcmp(func_name, "__builtin_fputs_unlocked") == 0);
   }
 
   /* Check if the callee is a small inline function we might evaluate.
@@ -880,7 +890,7 @@ va_arg_pack_done:
          * This must happen BEFORE the double-complex materialization below,
          * which converts VT_CONST to VT_LOCAL. */
         if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family ||
-             can_optimize_string_builtin) &&
+             can_optimize_string_builtin || can_optimize_fputs_family) &&
             saved_arg_count < saved_args_cap && !NOEVAL_WANTED)
         {
           saved_args[saved_arg_count] = *vtop;
@@ -1439,8 +1449,7 @@ va_arg_pack_done:
   int fputs_family_optimized = 0;
   if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && !printf_family_optimized && func_name &&
       saved_arg_count == nb_real_args && nb_args >= 2 && !nocode_wanted && call_result_discarded() &&
-      (strcmp(func_name, "fputs") == 0 || strcmp(func_name, "fputs_unlocked") == 0 ||
-       strcmp(func_name, "__builtin_fputs_unlocked") == 0))
+      can_optimize_fputs_family)
   {
     if (ir_idx_before_first_param >= 0)
     {
