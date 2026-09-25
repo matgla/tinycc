@@ -4,8 +4,10 @@
  * stack (r0-r3 pushed first), variadic (r0-r3 save + frame pointer), alloca
  * (frame-record layout), a frame past 4 KB, a read after a call, and a tail
  * call (its teardown must pop the LR the builtin made it save).  Each
- * returns its return address; its caller checks that it lands just past the
- * caller's own entry, and two call sites must differ. */
+ * returns its return address; its caller checks that it lands a little past
+ * the caller's own PC, read just before the call, and two call sites must
+ * differ.  The PC is read with inline asm, not taken from `&caller`: on YasOS a
+ * function pointer is the loader's r9-setting thunk, not the code address. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -93,29 +95,62 @@ NOINLINE static void *tail_call(void)
   return pass(__builtin_return_address(0));
 }
 
-/* A return address lands inside its caller, a little past the entry. */
-static int near(void *ra, void (*fn)(void))
+/* A code address in the caller: the PC, which reads 4 past the mov. */
+#define HERE() ({ void *here_; __asm__ volatile("mov %0, pc" : "=r"(here_)); here_; })
+
+/* A return address lands inside its caller, a little past `here`. */
+static int near(void *ra, void *here)
 {
-  unsigned long d = (unsigned long)ra - (unsigned long)fn;
+  unsigned long d = (unsigned long)ra - (unsigned long)here;
   return d > 0 && d < 256;
 }
 
-NOINLINE static int call_leaf(void) { return near(leaf(), (void (*)(void))call_leaf); }
-NOINLINE static int call_nonleaf(void) { return near(nonleaf(3), (void (*)(void))call_nonleaf); }
+NOINLINE static int call_leaf(void)
+{
+  void *here = HERE();
+  return near(leaf(), here);
+}
+NOINLINE static int call_nonleaf(void)
+{
+  void *here = HERE();
+  return near(nonleaf(3), here);
+}
 NOINLINE static int call_stack_args(void)
 {
-  return near(stack_args(1, 2, 3, 4, 5, 6), (void (*)(void))call_stack_args);
+  void *here = HERE();
+  return near(stack_args(1, 2, 3, 4, 5, 6), here);
 }
 NOINLINE static int call_split_struct(void)
 {
   struct five s = {{1, 2, 3, 4, 5}};
-  return near(split_struct(7, 8, 9, s), (void (*)(void))call_split_struct);
+  void *here = HERE();
+  return near(split_struct(7, 8, 9, s), here);
 }
-NOINLINE static int call_variadic(void) { return near(variadic(3, 1, 2, 3), (void (*)(void))call_variadic); }
-NOINLINE static int call_with_alloca(void) { return near(with_alloca(40), (void (*)(void))call_with_alloca); }
-NOINLINE static int call_big_frame(void) { return near(big_frame(5000), (void (*)(void))call_big_frame); }
-NOINLINE static int call_after_call(void) { return near(after_call(), (void (*)(void))call_after_call); }
-NOINLINE static int call_tail_call(void) { return near(tail_call(), (void (*)(void))call_tail_call); }
+NOINLINE static int call_variadic(void)
+{
+  void *here = HERE();
+  return near(variadic(3, 1, 2, 3), here);
+}
+NOINLINE static int call_with_alloca(void)
+{
+  void *here = HERE();
+  return near(with_alloca(40), here);
+}
+NOINLINE static int call_big_frame(void)
+{
+  void *here = HERE();
+  return near(big_frame(5000), here);
+}
+NOINLINE static int call_after_call(void)
+{
+  void *here = HERE();
+  return near(after_call(), here);
+}
+NOINLINE static int call_tail_call(void)
+{
+  void *here = HERE();
+  return near(tail_call(), here);
+}
 
 NOINLINE static int two_sites(void)
 {
