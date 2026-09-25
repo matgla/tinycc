@@ -1276,6 +1276,11 @@ TEST_FILES = [
     # DMB per the memory order -- no runtime helper (libtcc1 has none).
     ("478_inline_atomic_load_store.c", 0),
 
+    # DSE: a copy of a temp holding one of two stack addresses is still an
+    # address; loads through it keep the stores that filled both objects
+    # (self-hosted tcc crashed on every 64-bit op in data_processing_mop_impl).
+    ("479_dse_ambiguous_addr_copy.c", 0),
+
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
     # ssa:first_iter_exit migration.

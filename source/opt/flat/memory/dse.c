@@ -689,7 +689,9 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
                    dpos <= max_tmp_stackloc)
             origin = prop_tmp[spos];
 
-          if (origin < 0)
+          /* -2 travels on: a copy of an ambiguous address is still an address,
+           * and the loads through it must reach MARK_ORIGIN_READ. */
+          if (origin == -1)
             continue;
 
           if (dtype == TCCIR_VREG_TYPE_TEMP && dpos <= max_tmp_stackloc)
