@@ -1725,6 +1725,7 @@ enum
   TCC_OPTION_sb_relative_got,
   TCC_OPTION_no_sb_relative_got,
   TCC_OPTION_fpic,
+  TCC_OPTION_fno_pic,
   TCC_OPTION_fpie,
   TCC_OPTION_no_pie,
   TCC_OPTION_T,
@@ -1777,6 +1778,7 @@ static const TCCOption tcc_options[] = {
     {"O", TCC_OPTION_O, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"fpie", TCC_OPTION_fpie, 0},
     {"fpic", TCC_OPTION_fpic, 0},
+    {"fno-pic", TCC_OPTION_fno_pic, 0},
     {"no-pie", TCC_OPTION_no_pie, 0},
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     {"mfloat-abi=", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
@@ -2253,6 +2255,15 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
       break;
     case TCC_OPTION_no_pie:
       s->no_pie = 1;
+      break;
+    case TCC_OPTION_fno_pic:
+      /* Position-dependent code with absolute addressing, for code that is
+       * linked at a fixed address (a kernel): no GOT, no r9 data base, and r9
+       * becomes an ordinary allocatable register. */
+      s->pic = 0;
+      s->text_and_data_separation = 0;
+      s->sb_relative_got = 0;
+      s->share_rodata = 0;
       break;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     case TCC_OPTION_mfloat_abi:
