@@ -1289,6 +1289,15 @@ TEST_FILES = [
     # or to a char/short parameter) is read from its home at its own width,
     # not as a word with the slot's stale upper bytes.
     ("481_narrow_local_arg_width.c", 0),
+    # `s = f(s)` with `s` a by-value struct parameter in the argument area:
+    # the sret pointer is &s, not the struct's first word.
+    ("482_sret_into_struct_param.c", 0),
+    # A u8/u16 temporary the allocator spills is stored as a word: its reload
+    # is a word load, and a byte store left stale bytes for it (pr82524).
+    ("483_narrow_temp_spill_word.c", 0),
+    # `f(c ? g() : h())` with a struct result: every word of the selected
+    # struct reaches f, not just the first (dead_temp_local).
+    ("484_struct_ternary_arg_copy.c", 0),
 
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
