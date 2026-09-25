@@ -568,15 +568,21 @@ static int mach_is_narrow_local_slot(const MachineOperand *op)
 }
 
 /* Load a MACH_OP_SPILL slot's value (the slot itself, not through it).
- * A narrow value is read at its width whether or not the slot has a vreg,
- * as the LOAD handler reads it: a VAR whose address is taken keeps its vreg
- * but lives in its home, which a store through the pointer wrote a byte or
- * halfword of -- read as a word, the rest came from whatever was there
- * before (a u8 passed to printf printed as aaaaaaa5).  Reading a register
- * image at its width gives the same value, extended again by its type. */
+ * A narrow local slot, or a VAR's, is read at its width, as the LOAD handler
+ * reads it: a VAR whose address is taken keeps its vreg but lives in its
+ * home, which a store through the pointer wrote a byte or halfword of --
+ * read as a word, the rest came from whatever was there before (a u8 passed
+ * to printf printed as aaaaaaa5).  A TEMP's or PARAM's slot only ever holds
+ * a register image written as a word, and a word load is exact for it; its
+ * operand's narrow type need not say how that image was extended.  A copy
+ * into a loop temp first defined from a plain `char` keeps the char type
+ * after `(unsigned)c` (a no-op in the IR), and reading the spilled
+ * `cond * (unsigned)c` back with LDRSB turned 0xaf into 0xffffffaf
+ * (212_fuzz_cprop_copy_into_loop_phi at -O0). */
 static void mach_load_slot(int dest_reg, const MachineOperand *op)
 {
-  if (op->needs_deref || (op->btype != IROP_BTYPE_INT8 && op->btype != IROP_BTYPE_INT16))
+  if (op->needs_deref || (op->btype != IROP_BTYPE_INT8 && op->btype != IROP_BTYPE_INT16) ||
+      (op->vreg >= 0 && TCCIR_DECODE_VREG_TYPE(op->vreg) != TCCIR_VREG_TYPE_VAR))
   {
     tcc_machine_load_spill_slot(dest_reg, op->u.spill.offset);
     return;
