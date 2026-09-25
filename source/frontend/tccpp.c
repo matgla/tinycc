@@ -2293,6 +2293,16 @@ static void pp_parse_assertion(void)
   tokc.i = pp_assertion_value(kind_tok, value_tok);
 }
 
+/* The next preprocessor-expression token, never macro-expanded: from the
+ * current substitution result when there is one, else from the file. */
+static void pp_next_nosubst(void)
+{
+  if (macro_ptr)
+    next();
+  else
+    next_nomacro();
+}
+
 /* eval an expression for #if/#elif */
 static int expr_preprocess(TCCState *s1)
 {
@@ -2329,7 +2339,8 @@ static int expr_preprocess(TCCState *s1)
       if (s1->run_test)
         maybe_run_test(s1);
       c = 0;
-      if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT)
+      if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT ||
+          tok == TOK___HAS_ATTRIBUTE)
         c = 1;
       if (t == '(')
       {
@@ -2337,6 +2348,25 @@ static int expr_preprocess(TCCState *s1)
         if (tok != ')')
           expect("')'");
       }
+      tok = TOK_CINT;
+      tokc.i = c;
+    }
+    else if (tok == TOK___HAS_ATTRIBUTE)
+    {
+      /* Usually reached through a macro (zig.h's zig_has_attribute), so the
+       * operand is still in the substituted stream, which only next() reads;
+       * the operand was kept unexpanded there (see macro_subst). Read straight
+       * from the file, next() would expand it, so use the raw lexer. */
+      pp_next_nosubst();
+      if (tok != '(')
+        expect("'(' after __has_attribute");
+      pp_next_nosubst();
+      if (tok < TOK_IDENT)
+        expect("attribute name in __has_attribute");
+      c = tcc_attribute_supported(tok);
+      pp_next_nosubst();
+      if (tok != ')')
+        expect("')'");
       tok = TOK_CINT;
       tokc.i = c;
     }
@@ -2782,7 +2812,8 @@ redo:
         file->ifndef_macro = tok;
       }
     }
-    if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT)
+    if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT ||
+        tok == TOK___HAS_ATTRIBUTE)
       c ^= 1;
     next_nomacro();
   do_if:
@@ -4859,8 +4890,10 @@ static int macro_subst(TokenString *tok_str, Sym **nested_list, const int *macro
       tok_str_add2_spc(tok_str, t, &cval);
       if (nosubst && t != '(')
         nosubst = 0;
-      /* GCC supports 'defined' as result of a macro substitution */
-      if (t == TOK_DEFINED && pp_expr)
+      /* GCC supports 'defined' as result of a macro substitution; the
+         operand of __has_attribute is likewise an attribute name, not a
+         macro to expand. */
+      if ((t == TOK_DEFINED || t == TOK___HAS_ATTRIBUTE) && pp_expr)
         nosubst = 1;
     }
   }

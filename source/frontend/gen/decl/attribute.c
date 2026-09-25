@@ -170,6 +170,73 @@ int parse_c23_attribute(AttributeDef *ad)
   return found;
 }
 
+/* __has_attribute(name): 1 when parse_attribute() gives `name` its meaning,
+ * 0 when it would ignore it with a warning. Headers use this to choose between
+ * an attribute and a fallback (zig.h poisons `naked` and `noinline` outright
+ * when told they are missing), so the answer has to match the parser below --
+ * keep the two lists in step. Calling conventions and the PE-only
+ * dllexport/dllimport/nodecorate are parsed but mean nothing on this target,
+ * so they report 0, as gcc does on ARM. */
+ST_FUNC int tcc_attribute_supported(int t)
+{
+  switch (t)
+  {
+  case TOK_CLEANUP1:
+  case TOK_CLEANUP2:
+  case TOK_CONSTRUCTOR1:
+  case TOK_CONSTRUCTOR2:
+  case TOK_DESTRUCTOR1:
+  case TOK_DESTRUCTOR2:
+  case TOK_ALWAYS_INLINE1:
+  case TOK_ALWAYS_INLINE2:
+  case TOK_NOINLINE1:
+  case TOK_NOINLINE2:
+  case TOK_NOIPA1:
+  case TOK_NOIPA2:
+  case TOK_SECTION1:
+  case TOK_SECTION2:
+  case TOK_ALIAS1:
+  case TOK_ALIAS2:
+  case TOK_VISIBILITY1:
+  case TOK_VISIBILITY2:
+  case TOK_ALIGNED1:
+  case TOK_ALIGNED2:
+  case TOK_PACKED1:
+  case TOK_PACKED2:
+  case TOK_WEAK1:
+  case TOK_WEAK2:
+  case TOK_NAKED1:
+  case TOK_NODEBUG1:
+  case TOK_NODEBUG2:
+  case TOK_USED1:
+  case TOK_USED2:
+  case TOK_UNUSED1:
+  case TOK_UNUSED2:
+  case TOK_NORETURN1:
+  case TOK_NORETURN2:
+  case TOK_NOINSTRUMENT1:
+  case TOK_NOINSTRUMENT2:
+  case TOK_PURE1:
+  case TOK_PURE2:
+  case TOK_CONST2:
+  case TOK_CONST3:
+  case TOK_VECTOR_SIZE1:
+  case TOK_VECTOR_SIZE2:
+  case TOK_MODE1:
+  case TOK_MODE2:
+  case TOK_SCALAR_STORAGE_ORDER1:
+  case TOK_SCALAR_STORAGE_ORDER2:
+    return 1;
+  default:
+    if (t >= TOK_IDENT)
+    {
+      const char *attr = get_tok_str(t, NULL);
+      return !strcmp(attr, "transparent_union") || !strcmp(attr, "__transparent_union__");
+    }
+    return 0;
+  }
+}
+
 /* Parse __attribute__((...)) GNUC extension. */
 void parse_attribute(AttributeDef *ad)
 {

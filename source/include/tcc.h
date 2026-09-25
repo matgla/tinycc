@@ -2354,6 +2354,10 @@ static inline int toup(int c)
   return (c >= 'a' && c <= 'z') ? c - 'a' + 'A' : c;
 }
 
+/* Whether parse_attribute() acts on the attribute spelled by token `t`
+ * (backs the __has_attribute preprocessor operator). */
+ST_FUNC int tcc_attribute_supported(int t);
+
 /* ------------ tccgen.c ------------ */
 
 #define SYM_POOL_NB (8192 / sizeof(Sym))
