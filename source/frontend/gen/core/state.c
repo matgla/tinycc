@@ -107,6 +107,7 @@ ST_DATA SValue *vtop;
 ST_DATA SValue _vstack[1 + VSTACK_SIZE];
 
 ST_DATA int nocode_wanted; /* no code generation wanted */
+ST_DATA SValue *discarded_call_vtop;
 
 ST_DATA int global_expr; /* true if compound literals must be allocated globally
                             (used during initializers parsing */
@@ -198,6 +199,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   pending_aliases = NULL;
   nb_pending_aliases = 0;
   nocode_wanted = DATA_ONLY_WANTED; /* no code outside of functions */
+  discarded_call_vtop = NULL;
   debug_modes = (s1->do_debug ? 1 : 0) | s1->test_coverage << 1;
 
   tcc_debug_start(s1);

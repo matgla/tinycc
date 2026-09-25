@@ -105,6 +105,15 @@ static int inline_expansion_in_progress(Sym *sym)
   return 0;
 }
 
+/* Whether the call whose callee sits at vtop is a whole expression statement,
+ * so nothing reads its value.  `;` after the call is not enough: `x = f();` and
+ * `int r = f();` end the same way.  The callee must sit directly on the
+ * statement's base; an assignment's lvalue would be between them. */
+static int call_result_discarded(void)
+{
+  return tok == ';' && discarded_call_vtop != NULL && vtop - 1 == discarded_call_vtop;
+}
+
 void unary_funcall(void)
 {
   int n, t, r, size, align;
@@ -1162,10 +1171,10 @@ va_arg_pack_done:
    *   printf/fprintf("%c", ch)       → putchar/fputc
    *   printf("%s\n", str)            → puts(str)
    * Also handles __printf_chk/__fprintf_chk (extra flag argument).
-   * Only optimize in void context (next token is ';'). */
+   * Only optimize when the call is a whole expression statement. */
   int printf_family_optimized = 0;
   if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && can_optimize_printf_family &&
-      saved_arg_count == nb_real_args && nb_args >= pf_min_args && !nocode_wanted && tok == ';')
+      saved_arg_count == nb_real_args && nb_args >= pf_min_args && !nocode_wanted && call_result_discarded())
   {
     int fmt_len = 0;
     const char *fmt = try_get_constant_string(&saved_args[pf_fmt_idx], &fmt_len);
@@ -1429,7 +1438,7 @@ va_arg_pack_done:
    * or fputc, but the generic lowering is sufficient and correct here. */
   int fputs_family_optimized = 0;
   if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && !printf_family_optimized && func_name &&
-      saved_arg_count == nb_real_args && nb_args >= 2 && !nocode_wanted && tok == ';' &&
+      saved_arg_count == nb_real_args && nb_args >= 2 && !nocode_wanted && call_result_discarded() &&
       (strcmp(func_name, "fputs") == 0 || strcmp(func_name, "fputs_unlocked") == 0 ||
        strcmp(func_name, "__builtin_fputs_unlocked") == 0))
   {

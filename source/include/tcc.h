@@ -2373,6 +2373,8 @@ ST_DATA int rsym, anon_sym, ind, loc;
 ST_DATA char debug_modes;
 
 ST_DATA int nocode_wanted; /* true if no code generation wanted for an expression */
+ST_DATA SValue *discarded_call_vtop; /* vtop where an expression statement began, while its
+                                       value is being thrown away; NULL anywhere else */
 ST_DATA int global_expr;   /* true if compound literals must be allocated globally
                               (used during initializers parsing */
 ST_DATA CType func_vt;     /* current function return type (used by return instruction) */

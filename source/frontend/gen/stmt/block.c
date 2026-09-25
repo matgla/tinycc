@@ -157,6 +157,10 @@ void block(int flags)
   }
 
 again:
+  /* Only the expression statement below discards a value; every other
+   * statement (a declaration's initializer, a nested one inside a
+   * statement expression) uses it. */
+  discarded_call_vtop = NULL;
   t = tok;
   /* If the token carries a value, next() might destroy it. Only with
      invalid code such as f(){"123"4;} */
@@ -892,7 +896,9 @@ again:
         }
         else
         {
+          discarded_call_vtop = vtop;
           gexpr();
+          discarded_call_vtop = NULL;
           tcc_ir_codegen_drop_return(tcc_state->ir);
           gv_discarded_volatile();
           vpop();

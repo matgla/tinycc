@@ -1281,6 +1281,11 @@ TEST_FILES = [
     # (self-hosted tcc crashed on every 64-bit op in data_processing_mop_impl).
     ("479_dse_ambiguous_addr_copy.c", 0),
 
+    # fputs/printf lowering (fwrite, puts) only when the call is a whole
+    # expression statement: `x = printf(...)` and `int r = fputs(...)` keep
+    # their value (YasOS libc puts returned 1 for every string).
+    ("480_fputs_printf_result_used.c", 0),
+
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
     # ssa:first_iter_exit migration.
