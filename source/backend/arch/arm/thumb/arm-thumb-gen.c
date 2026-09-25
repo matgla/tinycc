@@ -5064,7 +5064,19 @@ static int th_pic_reloc_for_sym(Sym *sym, int sym_off)
   }
   if (tcc_state->share_rodata && (sym->type.t & VT_STATIC) && sym_off != SHN_UNDEF && sym_in_rodata)
     return R_ARM_RODATA_OFF;
-  /* sym_off == SHN_UNDEF: forward-declared, section unknown — GOT32 is safe. */
+  /* sym_off == SHN_UNDEF: forward-declared, section unknown — GOT32 is safe.
+   * So is a constant still waiting in COMMON (a tentative `static const T x;`
+   * whose definition follows): the definition may place it in .rodata, which
+   * r9 does not reach -- a variadic body reading it where it stands loaded
+   * zeros through GOTOFF.  Anything else in COMMON ends in .data or .bss. */
+  if (sym_off == SHN_COMMON && tcc_state->share_rodata)
+  {
+    const CType *tp = &sym->type;
+    while ((tp->t & (VT_BTYPE | VT_ARRAY)) == (VT_PTR | VT_ARRAY))
+      tp = &tp->ref->type;
+    if (tp->t & VT_CONSTANT)
+      return R_ARM_GOT32;
+  }
   if ((sym->type.t & VT_STATIC) && sym_off != SHN_UNDEF && sym_off != cur_text_section->sh_num &&
       !sym_in_code_section)
     return R_ARM_GOTOFF;
