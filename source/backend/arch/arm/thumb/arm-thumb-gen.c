@@ -567,10 +567,16 @@ static int mach_is_narrow_local_slot(const MachineOperand *op)
          (op->btype == IROP_BTYPE_INT8 || op->btype == IROP_BTYPE_INT16);
 }
 
-/* Load a MACH_OP_SPILL slot's value (the slot itself, not through it). */
+/* Load a MACH_OP_SPILL slot's value (the slot itself, not through it).
+ * A narrow value is read at its width whether or not the slot has a vreg,
+ * as the LOAD handler reads it: a VAR whose address is taken keeps its vreg
+ * but lives in its home, which a store through the pointer wrote a byte or
+ * halfword of -- read as a word, the rest came from whatever was there
+ * before (a u8 passed to printf printed as aaaaaaa5).  Reading a register
+ * image at its width gives the same value, extended again by its type. */
 static void mach_load_slot(int dest_reg, const MachineOperand *op)
 {
-  if (!mach_is_narrow_local_slot(op))
+  if (op->needs_deref || (op->btype != IROP_BTYPE_INT8 && op->btype != IROP_BTYPE_INT16))
   {
     tcc_machine_load_spill_slot(dest_reg, op->u.spill.offset);
     return;

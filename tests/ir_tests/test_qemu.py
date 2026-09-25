@@ -1285,6 +1285,10 @@ TEST_FILES = [
     # expression statement: `x = printf(...)` and `int r = fputs(...)` keep
     # their value (YasOS libc puts returned 1 for every string).
     ("480_fputs_printf_result_used.c", 0),
+    # An address-taken char/short local passed with no promotion (variadic,
+    # or to a char/short parameter) is read from its home at its own width,
+    # not as a word with the slot's stale upper bytes.
+    ("481_narrow_local_arg_width.c", 0),
 
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
