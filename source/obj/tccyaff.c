@@ -241,6 +241,10 @@ ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename, int level)
   full_read(fd, &header, sizeof(YaffHeader));
   if (memcmp(header.magic, "YAFF", 4) != 0)
     return tcc_error_noabort("not a valid YAFF file");
+  /* The loader refuses it, so linking against it would only move the error. */
+  if (header.yaff_version != YAFF_VERSION)
+    return tcc_error_noabort("'%s': YAFF version %d, this toolchain writes %d; rebuild it", filename,
+                             header.yaff_version, YAFF_VERSION);
 
   if (header.exported_symbols_amount > 0)
   {
@@ -1319,6 +1323,27 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
    * (rodata_size when -share-rodata, else 0). */
   if (!s1->share_rodata)
     header.const_rodata_length = 0;
+  /* The per-process region is the linked range from .rodata's base plus the
+   * shared prefix to the end of the GOT, mapped with one subtraction
+   * (tcc_yaff_data_region_offset).  Its alignment is the largest any section
+   * in it asked for, and the loader has to start it at the same phase. */
+  {
+    addr_t region_start = rodata_section->sh_addr + header.const_rodata_length;
+    addr_t region_end = s1->got->sh_addr + s1->got->sh_size;
+    addr_t align = 1;
+    for (i = 1; i < s1->nb_sections; i++)
+    {
+      Section *s = s1->sections[i];
+      if (!(s->sh_flags & SHF_ALLOC) || (s->sh_flags & SHF_EXECINSTR) || !s->sh_size)
+        continue;
+      if (s->sh_addr < region_start || s->sh_addr >= region_end)
+        continue;
+      if ((addr_t)s->sh_addralign > align)
+        align = s->sh_addralign;
+    }
+    header.data_alignment = (uint32_t)align;
+    header.data_alignment_offset = (uint32_t)(region_start & (align - 1));
+  }
 
   fwrite(&header, 1, sizeof(YaffHeader), f);
   aligned_name_len = strlen(name) + 1;

@@ -17,8 +17,13 @@
  *        and the loader read its "code" out of the middle of the relocation
  *        table. Nothing reported it -- the link succeeded and the image was
  *        garbage. Found on a 5 MB module (the Zig compiler) whose pre-text
- *        tables came to 105,440 bytes and whose text_offset read back 39,904. */
-#define YAFF_VERSION 3
+ *        tables came to 105,440 bytes and whose text_offset read back 39,904.
+ *   4 -- data_alignment and data_alignment_offset: where the per-process data
+ *        region has to start. The loader put it wherever its allocator
+ *        returned, so an object aligned past that -- `static int buf[4]
+ *        __attribute__((aligned(64)))` -- was aligned only against a base the
+ *        linker assumed and nothing reproduced. */
+#define YAFF_VERSION 4
 
 typedef struct {
   uint32_t nbucket;
@@ -165,6 +170,14 @@ typedef struct __attribute__((packed)) YaffHeader {
    * behaviour). When >0, the loader maps it once (XIP, ref-counted) and code
    * reaches it via the rodata anchor GOT slot + R_ARM_RODATA_OFF offsets. */
   uint32_t const_rodata_length;
+  /* Placement of the per-process data region ([data][bss][got], and .rodata
+   * too when it is not shared): the loader starts it at an address A with
+   * A % data_alignment == data_alignment_offset.  data_alignment is the
+   * largest alignment any section in the region asked for (a power of two);
+   * the offset is the region's linked start modulo it, so every object keeps
+   * the alignment it had at link time. */
+  uint32_t data_alignment;
+  uint32_t data_alignment_offset;
 } YaffHeader;
 
 typedef enum YaffSectionCode {
