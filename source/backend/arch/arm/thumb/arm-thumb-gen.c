@@ -13528,6 +13528,23 @@ static int build_reg_move_32bit(ThumbArgMove *moves, int move_count, const Machi
                                          .local_is_param = 0};
     break;
 
+  case MACH_OP_PARAM_STACK:
+    /* `&P` of a parameter in the caller's argument area -- the sret pointer of
+     * `s = f(s)` when `s` is a by-value struct parameter split across r0-r3
+     * and the stack.  The generic MOP load below always reads the slot, so it
+     * passed the struct's first word as the pointer.  A value read (is_lval,
+     * or a PARAM vreg) still loads. */
+    if (arg && arg->is_local && !arg->is_lval && !arg->is_llocal && !mop->needs_deref)
+    {
+      moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_LOCAL_ADDR,
+                                           .dst_reg = base_reg,
+                                           .local_offset = mop->u.param.offset,
+                                           .local_is_param = 1};
+      break;
+    }
+    moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_MOP, .dst_reg = base_reg, .mop = *mop};
+    break;
+
   default:
     /* SPILL, PARAM_STACK, CHAIN_REL, etc.: generic MOP load at emit time. */
     moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_MOP, .dst_reg = base_reg, .mop = *mop};
