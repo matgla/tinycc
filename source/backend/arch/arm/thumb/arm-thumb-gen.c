@@ -9725,6 +9725,28 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
         th_store32_imm_or_reg_ex(src_reg, (uint32_t)ptr_r, 0, 0,
                                  (uint32_t)1u << (uint32_t)src_reg | (1u << (uint32_t)ptr_r));
     }
+    else if ((btype == IROP_BTYPE_INT8 || btype == IROP_BTYPE_INT16) && dest.vreg >= 0 &&
+             TCCIR_DECODE_VREG_TYPE(dest.vreg) == TCCIR_VREG_TYPE_TEMP)
+    {
+      /* A temporary's spill slot holds a register image, and every reload of
+       * it is a word load (mach_load_slot reads narrow only for a narrow
+       * operand, and a use such as `T ADD #1` is not one).  A byte store left
+       * three stale bytes for that load to pick up: pr82524's
+       * `foo(y->c.b, w)` spilled both u8 operands and multiplied garbage.
+       * Store the value extended to a word, the truncation the narrow store
+       * gave included.  A VAR's slot may be its narrow home, whose
+       * neighbours a word store would clobber -- that stays narrow. */
+      const int ext = mach_alloc_scratch(&ctx, (uint32_t)1u << (uint32_t)src_reg);
+      if (btype == IROP_BTYPE_INT8)
+        ot_check(dest.is_unsigned
+                     ? th_uxtb((uint32_t)ext, (uint32_t)src_reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE)
+                     : th_sxtb((uint32_t)ext, (uint32_t)src_reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      else
+        ot_check(dest.is_unsigned
+                     ? th_uxth((uint32_t)ext, (uint32_t)src_reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE)
+                     : th_sxth((uint32_t)ext, (uint32_t)src_reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+      th_store32_imm_or_reg_ex(ext, base, abs_off, sign, (uint32_t)1u << (uint32_t)ext);
+    }
     else
     {
       if (btype == IROP_BTYPE_INT8)
