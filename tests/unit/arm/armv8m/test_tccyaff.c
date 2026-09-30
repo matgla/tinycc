@@ -247,6 +247,7 @@ static uint8_t *ut_build_yaff(const char *objname, const char *symname, uint32_t
 {
   YaffHeader h = {0};
   memcpy(h.magic, "YAFF", 4);
+  h.yaff_version = YAFF_VERSION;
   h.alignment = 4;
   h.exported_symbols_amount = 2; /* sentinel at index 0 + one real symbol */
 
@@ -395,6 +396,32 @@ UT_TEST(test_load_yaff_rejects_bad_magic)
 
   close(fd);
   unlink(path);
+  return 0;
+}
+
+/* A library from an older toolchain: the loader would refuse it at run time,
+ * so the link refuses it now. */
+UT_TEST(test_load_yaff_rejects_other_version)
+{
+  size_t size;
+  uint8_t *buf = ut_build_yaff("libold.yaff", "exported_fn", 0x1234, &size);
+  UT_ASSERT(buf != NULL);
+  ((YaffHeader *)buf)->yaff_version = YAFF_VERSION - 1;
+
+  char path[] = "/tmp/tccyaff_ut_oldver_XXXXXX";
+  int fd = mkstemp(path);
+  UT_ASSERT(fd >= 0);
+  UT_ASSERT_EQ(write(fd, buf, size), (ssize_t)size);
+  lseek(fd, 0, SEEK_SET);
+
+  memset(tcc_state, 0, sizeof(TCCState));
+  tcc_state->dynsymtab_section = ut_make_dynsymtab(tcc_state);
+  UT_ASSERT(tcc_load_yaff(tcc_state, fd, path, 0) != 0);
+  UT_ASSERT_EQ(tcc_state->nb_yaff_libs, 0);
+
+  close(fd);
+  unlink(path);
+  tcc_free(buf);
   return 0;
 }
 
@@ -590,12 +617,44 @@ UT_TEST(test_output_yaff_minimal_header)
   UT_ASSERT_EQ(h.version_minor, 0u);
   UT_ASSERT_EQ(h.stack_size, 0xFFFFFFFFu);
   UT_ASSERT_EQ(h.heap_size, 0xFFFFFFFFu);
+  UT_ASSERT_EQ(h.data_alignment, 8u); /* sections default to 8 */
+  UT_ASSERT_EQ(h.data_alignment_offset, 0u);
 
   /* Object name follows the header immediately. */
   char name[32];
   fseek(f, sizeof(YaffHeader), SEEK_SET);
   UT_ASSERT_EQ(fread(name, 1, sizeof("minimal.yaff"), f), sizeof("minimal.yaff"));
   UT_ASSERT_STREQ(name, "minimal.yaff");
+
+  fclose(f);
+  unlink(path);
+  ut_yaff_teardown_output_state();
+  return 0;
+}
+
+/* The per-process region starts after the shared .rodata prefix (0x1108) and
+ * holds a 64-aligned .bss: the loader must start it 8 bytes past a multiple of
+ * 64, or the .bss object lands where the linker did not put it. */
+UT_TEST(test_output_yaff_data_alignment)
+{
+  ut_yaff_setup_minimal_output_state();
+  tcc_state->share_rodata = 1;
+  bss_section->sh_addr = 0x1140;
+  bss_section->sh_size = 16;
+  bss_section->sh_addralign = 64;
+  tcc_state->got->sh_addr = 0x1150;
+  tcc_state->plt->sh_addr = 0x1190;
+
+  char path[] = "/tmp/tccyaff_ut_out_align_XXXXXX";
+  FILE *f = ut_yaff_open_temp(path);
+
+  UT_ASSERT_EQ(tcc_output_yaff(tcc_state, f, "align.yaff"), 0);
+
+  YaffHeader h;
+  ut_yaff_read_header(f, &h);
+  UT_ASSERT_EQ(h.const_rodata_length, 8u);
+  UT_ASSERT_EQ(h.data_alignment, 64u);
+  UT_ASSERT_EQ(h.data_alignment_offset, 8u);
 
   fclose(f);
   unlink(path);

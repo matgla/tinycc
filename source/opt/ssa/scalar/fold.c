@@ -170,9 +170,55 @@ static uint32_t fold_maybe_set_bits(IRSSAOptCtx *ctx, IROperand op, int at_idx,
   case TCCIR_OP_SETIF:
     /* Materialises its condition as 0 or 1. */
     return 1u;
+  case TCCIR_OP_LOAD:
+    /* The emitter picks LDRB/LDRH from the source's type and signedness: an
+     * unsigned narrow load zero-extends. */
+    if (s1.is_lval && s1.is_unsigned) {
+      if (irop_get_btype(s1) == IROP_BTYPE_INT8)
+        return 0xFFu;
+      if (irop_get_btype(s1) == IROP_BTYPE_INT16)
+        return 0xFFFFu;
+    }
+    return 0xFFFFFFFFu;
+  case TCCIR_OP_UBFX: {
+    int32_t f;
+    if (bs || !fold_read_imm32(ir, s2, &f) || (f & UBFX_HI_HALF))
+      return 0xFFFFFFFFu;
+    int width = (f >> 5) & 0x1F;
+    return (width > 0 && width < 32) ? (1u << width) - 1u : 0xFFFFFFFFu;
+  }
+  case TCCIR_OP_STORE:
+    /* A non-lval STORE into a TEMP is a register copy of the source (MOV, or
+     * a word store of the extended value when spilled): the same bits. */
+    if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dd)) == TCCIR_VREG_TYPE_TEMP && !dd.is_local &&
+        !s1.is_lval && !irop_is_64bit(s1))
+      return fold_maybe_set_bits(ctx, s1, d_idx, depth - 1, budget);
+    return 0xFFFFFFFFu;
   default:
     return 0xFFFFFFFFu;
   }
+}
+
+/* `X AND M` / `UBFX X,#0,#w` is a copy of X when X cannot have a bit outside
+ * the mask.  A TEMP read at the dest's width: its register (or spill slot) is
+ * always a whole word, so a narrow-typed TEMP read as a word is the same
+ * value.  A VAR may live in a narrow home slot, so it keeps its own width. */
+static int fold_mask_is_copy(IRSSAOptCtx *ctx, IROperand dest, IROperand src, int i, uint32_t mask,
+                             IROperand *out)
+{
+  if (src.tag != IROP_TAG_VREG || src.is_lval || irop_is_64bit(src) || irop_is_64bit(dest))
+    return 0;
+  int budget = 4096;
+  if (fold_maybe_set_bits(ctx, src, i, 24, &budget) & ~mask)
+    return 0;
+  *out = src;
+  if (irop_get_btype(src) == irop_get_btype(dest))
+    return 1;
+  if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(src)) != TCCIR_VREG_TYPE_TEMP ||
+      irop_get_btype(dest) != IROP_BTYPE_INT32)
+    return 0;
+  out->btype = IROP_BTYPE_INT32;
+  return 1;
 }
 
 /* Barrel-shift-annotated op: fold only the all-constant case, peek-only —
@@ -312,6 +358,9 @@ OPT_GEN_SSA(fold_const_eval, -1) {
     case TCCIR_OP_ADD: result = (int64_t)((uint64_t)v1 + (uint64_t)v2); break;
     case TCCIR_OP_SUB: result = (int64_t)((uint64_t)v1 - (uint64_t)v2); break;
     case TCCIR_OP_MUL: result = (int64_t)((uint64_t)v1 * (uint64_t)v2); break;
+    /* Widening multiplies read only the low word of each operand. */
+    case TCCIR_OP_UMULL: result = (int64_t)((uint64_t)(uint32_t)val1 * (uint32_t)val2); break;
+    case TCCIR_OP_SMULL: result = (int64_t)val1 * val2; break;
     case TCCIR_OP_AND: result = v1 & v2; break;
     case TCCIR_OP_OR:  result = v1 | v2; break;
     case TCCIR_OP_XOR: result = v1 ^ v2; break;
@@ -708,6 +757,10 @@ OPT_GEN_SSA(fold_identity_src2, -1) {
   case TCCIR_OP_ROR: is_identity = (v2 == 0); break;
   case TCCIR_OP_OR:  is_identity = (v2 == 0); is_absorb = (v2 == -1); absorb_val = -1; break;
   case TCCIR_OP_MUL: is_identity = (v2 == 1); is_absorb = (v2 == 0); break;
+  /* A widening multiply by 0 is a 64-bit 0 (a u64 widened to u128 has a
+   * constant-zero high half, so zig.h's cross terms are these). */
+  case TCCIR_OP_UMULL:
+  case TCCIR_OP_SMULL: is_absorb = (v2 == 0); break;
   case TCCIR_OP_AND: is_identity = (v2 == -1); is_absorb = (v2 == 0); break;
   case TCCIR_OP_DIV:
   case TCCIR_OP_UDIV: is_identity = (v2 == 1); break;
@@ -773,6 +826,8 @@ OPT_GEN_SSA(fold_identity_src1, -1) {
   case TCCIR_OP_XOR: is_identity = (v1 == 0); break;
   case TCCIR_OP_OR:  is_identity = (v1 == 0); is_absorb = (v1 == -1); absorb_val = -1; break;
   case TCCIR_OP_MUL: is_identity = (v1 == 1); is_absorb = (v1 == 0); break;
+  case TCCIR_OP_UMULL:
+  case TCCIR_OP_SMULL: is_absorb = (v1 == 0); break;
   case TCCIR_OP_AND: is_identity = (v1 == -1); is_absorb = (v1 == 0); break;
   case TCCIR_OP_SHL:
   case TCCIR_OP_SHR:
@@ -816,6 +871,9 @@ OPT_GEN_SSA(fold_and_masked, TCCIR_OP_AND) {
     if ((maybe & ~(uint32_t)M) == 0 &&
         irop_get_btype(src1) == irop_get_btype(dest))
       REWRITE(.new_op = TCCIR_OP_ASSIGN);
+    IROperand w;
+    if (fold_mask_is_copy(ctx, dest, src1, i, (uint32_t)M, &w))
+      REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = w);
   }
   IRQuadCompact *dq = fold_single_dom_def(ctx, src1, i);
   if (!dq || tcc_ir_barrel_shift_at(ir, dq))
@@ -966,6 +1024,15 @@ OPT_GEN_SSA(fold_ubfx, TCCIR_OP_UBFX) {
   /* fold_bfx_value extracts from the source's LOW word; UBFX_HI_HALF does not
    * name that word.  See source/opt/flat/fusion/shift64_extract_ubfx.c. */
   GUARD(when(!(is_imm32(src2) && ((int32_t)imm(src2) & UBFX_HI_HALF))));
+  /* A field starting at bit 0 that covers every bit the source can hold. */
+  {
+    int32_t f = (int32_t)imm(src2);
+    int width = (f >> 5) & 0x1F;
+    IROperand w;
+    if ((f & 0x1F) == 0 && width > 0 && width < 32 && !tcc_ir_barrel_shift_at(ir, q) &&
+        fold_mask_is_copy(ctx, dest, src1, i, (1u << width) - 1u, &w))
+      REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = w);
+  }
   GUARD(when(fold_bfx_value(ctx, i, 0, &result)));
   REWRITE(.new_op = TCCIR_OP_ASSIGN,
           .src1 = mk_imm_bt(result, irop_get_btype(dest)));
@@ -1014,6 +1081,141 @@ OPT_GEN_SSA(fold_bitop1, -1) {
           .src1 = mk_imm_bt(result, irop_get_btype(dest)));
 }
 
+/* ---- A 64-bit value taken apart and put back together ----------------------
+ *
+ * A 64-bit value the frontend or SRA keeps as two words is joined by PACK64
+ * (dest_lo = src1, dest_hi = src2) and taken apart by an ASSIGN to a word --
+ * which keeps the low word, like the backend's copy -- and by `SHR #32`.  The
+ * Zig C backend's zig_u128 is a struct of two uint64_t, so every one of its
+ * helpers repacks, and SRA splits each such doubleword into word VARs
+ * (source/opt/flat/memory/sra.c): the chains below are all that is left once
+ * SSA has renamed them, and they cancel. */
+
+/* The single dominating def of `op` at instruction `at` if it is `op_want`. */
+static IRQuadCompact *fold_def_if(IRSSAOptCtx *ctx, IROperand op, int at, int op_want)
+{
+  IRQuadCompact *dq = fold_single_dom_def(ctx, op, at);
+  if (!dq || dq->op != op_want || tcc_ir_barrel_shift_at(ctx->ir, dq))
+    return NULL;
+  return dq;
+}
+
+static int fold_def_index(IRSSAOptCtx *ctx, IRQuadCompact *dq)
+{
+  return (int)(dq - ctx->ir->compact_instructions);
+}
+
+/* A word operand that means the same thing wherever the PACK64 it came from
+ * is visible: a single-def TEMP or an inline constant. */
+static int fold_word_stable(IRSSAOptCtx *ctx, IROperand w)
+{
+  if (w.is_lval || w.is_local || w.is_llocal || w.is_sym || irop_is_64bit(w))
+    return 0;
+  return w.tag == IROP_TAG_IMM32 || fold_single_def_temp(ctx, w);
+}
+
+/* `x SHR #32` of a 64-bit x: the immediate test the rules below share. */
+static int fold_is_hi_shift(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (q->op != TCCIR_OP_SHR)
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q), c = tcc_ir_op_get_src2(ir, q);
+  return irop_get_btype(d) == IROP_BTYPE_INT64 && is_imm32(c) && !c.is_lval && c.u.imm32 == 32;
+}
+
+/* Replace src1 of instruction i by `w`, keeping the use lists right. */
+static void fold_retarget_src1(IRSSAOptCtx *ctx, int i, IROperand old, IROperand w)
+{
+  opt_dsl_drop_use(ctx, old, i);
+  tcc_ir_set_src1(ctx->ir, i, w);
+  opt_dsl_add_use(ctx, w, i);
+}
+
+/* `d <- (PACK64 a b) [ASSIGN]` into a word is `d <- a`. */
+static int fold_assign_lo_word(IRSSAOptCtx *ctx, int i)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  IROperand src = tcc_ir_op_get_src1(ir, q);
+  if (!is_value_dest(dest) || irop_get_btype(dest) != IROP_BTYPE_INT32 || src.is_lval ||
+      irop_get_btype(src) != IROP_BTYPE_INT64)
+    return 0;
+  IRQuadCompact *pq = fold_def_if(ctx, src, i, TCCIR_OP_PACK64);
+  if (!pq)
+    return 0;
+  IROperand lo = tcc_ir_op_get_src1(ir, pq);
+  if (!fold_word_stable(ctx, lo))
+    return 0;
+  fold_retarget_src1(ctx, i, src, lo);
+  return 1;
+}
+
+/* `(PACK64 a b) SHR #32` is `PACK64 b #0`. */
+static int fold_shr_pack64(IRSSAOptCtx *ctx, int i)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  if (!fold_is_hi_shift(ir, q))
+    return 0;
+  IROperand src = tcc_ir_op_get_src1(ir, q);
+  if (src.is_lval)
+    return 0;
+  IRQuadCompact *pq = fold_def_if(ctx, src, i, TCCIR_OP_PACK64);
+  if (!pq)
+    return 0;
+  IROperand hi = tcc_ir_op_get_src2(ir, pq);
+  if (!fold_word_stable(ctx, hi))
+    return 0;
+  q->op = TCCIR_OP_PACK64;
+  fold_retarget_src1(ctx, i, src, hi);
+  tcc_ir_set_src2(ir, i, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
+  return 1;
+}
+
+/* `PACK64 (x [ASSIGN] to a word) ((x SHR #32) [ASSIGN] to a word)` is x, and
+ * a PACK64 of two constants -- which cprop can leave behind after ssa:sccp has
+ * run -- is their doubleword. */
+static int fold_pack64_of_halves(IRSSAOptCtx *ctx, int i)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  IROperand a = tcc_ir_op_get_src1(ir, q), b = tcc_ir_op_get_src2(ir, q);
+  if (!is_value_dest(dest) || irop_get_btype(dest) != IROP_BTYPE_INT64 || a.is_lval || b.is_lval)
+    return 0;
+  int32_t ca, cb;
+  if (fold_read_imm32(ir, a, &ca) && fold_read_imm32(ir, b, &cb))
+  {
+    int64_t v = (int64_t)(((uint64_t)(uint32_t)cb << 32) | (uint32_t)ca);
+    IROperand imm = v == (int64_t)(int32_t)v ? irop_make_imm32(-1, (int32_t)v, IROP_BTYPE_INT64)
+                                             : irop_make_i64(-1, tcc_ir_pool_add_i64(ir, v), IROP_BTYPE_INT64);
+    imm.is_unsigned = dest.is_unsigned;
+    q->op = TCCIR_OP_ASSIGN;
+    tcc_ir_set_src1(ir, i, imm);
+    tcc_ir_set_src2(ir, i, IROP_NONE);
+    return 1;
+  }
+  IRQuadCompact *da = fold_def_if(ctx, a, i, TCCIR_OP_ASSIGN);
+  IRQuadCompact *db = fold_def_if(ctx, b, i, TCCIR_OP_ASSIGN);
+  if (!da || !db || irop_get_btype(tcc_ir_op_get_dest(ir, da)) != IROP_BTYPE_INT32 ||
+      irop_get_btype(tcc_ir_op_get_dest(ir, db)) != IROP_BTYPE_INT32)
+    return 0;
+  IROperand x = tcc_ir_op_get_src1(ir, da), y = tcc_ir_op_get_src1(ir, db);
+  if (x.is_lval || y.is_lval || irop_get_btype(x) != IROP_BTYPE_INT64 || !fold_single_def_temp(ctx, x))
+    return 0;
+  IRQuadCompact *sq = fold_def_if(ctx, y, fold_def_index(ctx, db), TCCIR_OP_SHR);
+  if (!sq || !fold_is_hi_shift(ir, sq))
+    return 0;
+  IROperand sx = tcc_ir_op_get_src1(ir, sq);
+  if (sx.is_lval || irop_get_vreg(sx) != irop_get_vreg(x))
+    return 0;
+  opt_dsl_drop_use(ctx, b, i);
+  q->op = TCCIR_OP_ASSIGN;
+  fold_retarget_src1(ctx, i, a, x);
+  return 1;
+}
+
 /* Rule order matches the original monolith. */
 static const OptDslSSARule fold_binary_rules[] = {
   opt_dsl_dispatch_fold_symref_addend,
@@ -1032,6 +1234,7 @@ static const OptDslSSARule fold_binary_rules[] = {
   opt_dsl_dispatch_fold_identity_src2,
   opt_dsl_dispatch_fold_double_neg,
   opt_dsl_dispatch_fold_identity_src1,
+  fold_shr_pack64,
 };
 
 /* A barrel-annotated op folds only all-constant (or nothing at all). */
@@ -1073,9 +1276,13 @@ static const IRSSAOptGen fold_gens[] = {
   OPT_GEN_ENTRY(fold_ubfx, TCCIR_OP_UBFX),
   OPT_GEN_ENTRY(fold_sbfx, TCCIR_OP_SBFX),
   { TCCIR_OP_SELECT, fold_select_entry, "fold_select" },
+  { TCCIR_OP_ASSIGN, fold_assign_lo_word, "fold_assign_lo_word" },
+  { TCCIR_OP_PACK64, fold_pack64_of_halves, "fold_pack64_halves" },
   { TCCIR_OP_ADD,  fold_binary,    "fold_add" },
   { TCCIR_OP_SUB,  fold_binary,    "fold_sub" },
   { TCCIR_OP_MUL,  fold_binary,    "fold_mul" },
+  { TCCIR_OP_UMULL, fold_binary,   "fold_umull" },
+  { TCCIR_OP_SMULL, fold_binary,   "fold_smull" },
   { TCCIR_OP_DIV,  fold_binary,    "fold_div" },
   { TCCIR_OP_UDIV, fold_binary,    "fold_udiv" },
   { TCCIR_OP_IMOD, fold_binary,    "fold_mod" },

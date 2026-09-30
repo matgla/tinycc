@@ -18,6 +18,10 @@
 #define UNROLL_MAX_TRIP_COUNT 16
 #define UNROLL_MAX_BODY_INSNS 32
 #define UNROLL_MAX_TOTAL_INSNS 128
+/* A body that loads or stores is capped by what survives constant folding of
+ * the unrolled copies (unroll_residual_insns), and by a raw ceiling. */
+#define UNROLL_MAX_TOTAL_MEM_INSNS 96
+#define UNROLL_MAX_RAW_MEM_INSNS 256
 
 typedef struct InductionVar
 {
@@ -37,6 +41,16 @@ typedef struct DerivedIV
   int use_idx;
   int shl_idx;
   int share_with;
+  /* INDEXED-DIV whose index is `iv + k` / `iv - k`: the access sits `offset`
+   * bytes from base + iv*stride, and off_idx is the ADD/SUB that computes the
+   * index (single-use, NOPed once the access reads through the pointer).
+   * 0 / -1 for a plain `base[iv]`. */
+  int offset;
+  int off_idx;
+  /* Set by the driver on a group primary: the byte offset the shared pointer
+   * is aimed at (the group's smallest `offset`), so every member's access is
+   * a non-negative immediate off one pointer.  0 when nothing is shared. */
+  int origin;
 } DerivedIV;
 
 /* IV analysis */
@@ -46,6 +60,17 @@ int find_induction_vars_ex(struct TCCIRState *ir, struct IRLoop *loop,
 int find_derived_ivs(struct TCCIRState *ir, struct IRLoop *loop,
                      InductionVar *ivs, int num_ivs,
                      DerivedIV *divs, int max_divs);
+
+/* 1 when a read of `iv_vr` outside the loop can observe the value the loop
+ * leaves in it: reachable from a loop exit without passing a redefinition.
+ * Conservative (1) on indirect jumps, switch tables, an address-taken IV, or
+ * a path that re-enters the loop. */
+int iv_read_reachable_outside(struct TCCIRState *ir, struct IRLoop *loop, int32_t iv_vr);
+
+/* Same base object, looking through a single-def ASSIGN of an address (a
+ * `T <- Addr[StackLoc[k]]` copy the loads may use directly and the stores
+ * through the temp, or vice versa). */
+int iv_same_base(struct TCCIRState *ir, IROperand a, IROperand b);
 
 int transform_derived_iv(struct TCCIRState *ir, struct IRLoop *loop,
                          InductionVar *iv, DerivedIV *div,
@@ -77,9 +102,10 @@ int compute_trip_count(int init_val, int limit, int step, int cond_token);
 
 int collect_body_instructions(struct TCCIRState *ir, struct IRLoop *loop,
                               int iv_vreg, int cmp_idx, int jmpif_idx,
-                              int iv_def_idx, int *body_indices, int max_body);
+                              int iv_def_idx, int *body_indices, int max_body, int *out_has_memory);
 
 /* NOP-slot writers */
+void tcc_ir_copy_orig_annotations(struct TCCIRState *ir, int from, int to);
 void write_instr_at_nop(struct TCCIRState *ir, int pos, TccIrOp op,
                         IROperand dest, IROperand src1, IROperand src2);
 

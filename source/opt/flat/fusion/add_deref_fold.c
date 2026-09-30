@@ -97,6 +97,20 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
       int32_t cs1_vr = irop_get_vreg(cs1);
       if (cs1_vr < 0 || TCCIR_DECODE_VREG_TYPE(cs1_vr) != TCCIR_VREG_TYPE_PARAM)
         continue;
+      /* The load moves to the ADD and reads through the PARAM there: the
+       * PARAM must still hold what was copied (`q = p; p++; q[2]`). */
+      int param_redefined = 0;
+      for (int j = copy_idx + 1; j < i && !param_redefined; j++)
+      {
+        IRQuadCompact *rq = &ir->compact_instructions[j];
+        if (rq->op != TCCIR_OP_NOP && irop_config[rq->op].has_dest)
+        {
+          IROperand rd = tcc_ir_op_get_dest(ir, rq);
+          param_redefined = irop_get_vreg(rd) == cs1_vr && irop_dest_defines_vreg(rd);
+        }
+      }
+      if (param_redefined)
+        continue;
       /* Use the PARAM source as base; leave the copy for DCE. Extra readers
        * of the TEMP base are fine since the copy stays put. */
       src1 = cs1;

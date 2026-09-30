@@ -181,6 +181,8 @@ int dce_dead_var_stores(IRSSAOptCtx *ctx)
       continue;
     if (var_used[pos / 8] & (1 << (pos % 8)))
       continue;
+    if (dce_instr_reads_volatile(ir, q))
+      continue;
 
     ssa_opt_nop_instr(ctx, i);
     changes++;
@@ -215,6 +217,13 @@ int dce_dead_var_stores(IRSSAOptCtx *ctx)
       continue;
     IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, dvr);
     if (!vi)
+      continue;
+    int keeps_volatile = 0;
+    for (int u = 0; u < vi->use_count; u++)
+      if (vi->uses[u].kind == SSA_USE_INSTR &&
+          dce_instr_reads_volatile(ir, &ir->compact_instructions[vi->uses[u].idx]))
+        keeps_volatile = 1;
+    if (keeps_volatile)
       continue;
     for (int u = vi->use_count - 1; u >= 0; u--) {
       if (vi->uses[u].kind != SSA_USE_INSTR)

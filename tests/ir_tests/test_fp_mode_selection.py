@@ -158,9 +158,11 @@ def test_fp_lib_static_binds_an_archive(tmp_path):
 # where it put the section, and a writer that moves it moves this too.
 
 # Byte offset of YaffHeader.arch_section_offset, counted through the packed
-# fields ahead of it.  Cross-checked by test_header_layout_is_still_what_this
-# _test_assumes below, which reads a value no misaligned read would produce.
-ARCH_SECTION_OFFSET_FIELD = 60
+# fields ahead of it: a u32 at 72 since YAFF_VERSION 3 widened the counts
+# (a u16 at 60 before; 60 is got_length now).  Cross-checked by
+# test_header_layout_is_still_what_this_test_assumes below, which reads a
+# value no misaligned read would produce.
+ARCH_SECTION_OFFSET_FIELD = 72
 
 # YaffArchSection: u16 size, u8 arch, u8 fpu, u8 float_abi, u8 reserved_[3],
 # u32 required_features.
@@ -180,7 +182,7 @@ YAFF_FLOAT_ABI_SOFTFP = 1
 def _yaff_arch_section(path):
     data = path.read_bytes()
     assert data[:4] == b"YAFF", "not a YAFF module"
-    offset = struct.unpack_from("<H", data, ARCH_SECTION_OFFSET_FIELD)[0]
+    offset = struct.unpack_from("<I", data, ARCH_SECTION_OFFSET_FIELD)[0]
     assert offset != 0, "no architecture section (YAFF version 1 image?)"
     size, _arch, fpu, float_abi, required = struct.unpack_from(
         ARCH_SECTION_FORMAT, data, offset

@@ -112,6 +112,9 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
     tcc_free(loops);
     return NULL;
   }
+  loops->ramp = tcc_malloc(sizeof(int) * ir->next_instruction_index);
+  for (int k = 0; k < ir->next_instruction_index; k++)
+    loops->ramp[k] = k;
 
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
@@ -152,14 +155,10 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
 
         int body_size = i - target + 1;
         loop->body_instrs_capacity = body_size;
-        loop->body_instrs = tcc_mallocz(sizeof(int) * body_size);
+        loop->body_instrs = loops->ramp + target;
+        loop->num_body_instrs = body_size;
 
-        if (loop->body_instrs)
         {
-          for (int j = target; j <= i; j++)
-          {
-            loop->body_instrs[loop->num_body_instrs++] = j;
-          }
 
           /* Forward jumps out of [target, i] can still land in the body; extend the range. */
           int max_idx = i;
@@ -184,14 +183,8 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
           if (max_idx > i)
           {
             int new_body_size = max_idx - target + 1;
-            tcc_free(loop->body_instrs);
-            loop->body_instrs = tcc_mallocz(sizeof(int) * new_body_size);
             loop->body_instrs_capacity = new_body_size;
-            loop->num_body_instrs = 0;
-            for (int j = target; j <= max_idx; j++)
-            {
-              loop->body_instrs[loop->num_body_instrs++] = j;
-            }
+            loop->num_body_instrs = new_body_size;
           }
 
           loops->num_loops++;
@@ -211,7 +204,6 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
       IRLoop *lj = &loops->loops[j];
       if (li->header_idx == lj->header_idx && li->end_idx < lj->end_idx)
       {
-        tcc_free(li->body_instrs);
         li->body_instrs = NULL;
         li->num_body_instrs = 0;
         li->header_idx = -1; /* sentinel: removed */
@@ -271,15 +263,8 @@ void tcc_ir_free_loops(IRLoops *loops)
   if (!loops)
     return;
 
-  if (loops->loops)
-  {
-    for (int i = 0; i < loops->num_loops; i++)
-    {
-      if (loops->loops[i].body_instrs)
-        tcc_free(loops->loops[i].body_instrs);
-    }
-    tcc_free(loops->loops);
-  }
+  tcc_free(loops->loops);
+  tcc_free(loops->ramp);
 
   tcc_free(loops);
 }

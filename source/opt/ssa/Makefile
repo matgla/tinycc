@@ -64,6 +64,7 @@ SSA_OPT_SRC = \
 	source/opt/ssa/loop/loop_unroll.c \
 	source/opt/ssa/loop/iv_strength_reduction.c \
 	source/opt/ssa/loop/decrement_to_zero.c \
+	source/opt/ssa/loop/loop_bottom_test.c \
 	source/opt/ssa/loop/dead_loop.c \
 	source/opt/ssa/scalar/sccp.c \
 	source/opt/ssa/memory/global_store_dse.c \

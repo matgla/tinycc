@@ -39,6 +39,11 @@ int dce_temp_worklist(IRSSAOptCtx *ctx)
     IRQuadCompact *q = &ctx->ir->compact_instructions[def];
     if (q->op == TCCIR_OP_NOP)
       continue;
+    /* Only ever delete this vreg's own definition: a stale def_instr must not
+     * take an unrelated instruction with it. */
+    if (!irop_config[q->op].has_dest ||
+        irop_get_vreg(tcc_ir_op_get_dest(ctx->ir, q)) != TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, pos))
+      continue;
     /* A write to a volatile slot is a mandated side effect even if never read. */
     if (irop_config[q->op].has_dest) {
       int32_t dvr = irop_get_vreg(tcc_ir_op_get_dest(ctx->ir, q));

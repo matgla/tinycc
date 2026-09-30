@@ -37,8 +37,8 @@ static const uint8_t *ir_opt_get_rodata_bytes(TCCIRState *ir, IROperand op, size
     return NULL;
 
   sym = symref->sym;
-  if (!sym)
-    return NULL;
+  if (!sym || sym->a.tentative)
+    return NULL; /* a tentative definition's bytes are not its value yet */
 
   esym = elfsym(sym);
   if (!esym)
@@ -497,8 +497,11 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   } SimpleLeaEntry;
 
   /* Definition counts, used only to set `maybe` above.  A write *through* a
-     pointer (`T***DEREF*** <-- v`) is not a definition of the pointer, hence the
-     is_lval test. */
+     pointer (`T***DEREF*** <-- v`) is not a definition of the pointer; a VAR
+     itself as the destination is (a STACKOFF lvalue).  Testing is_lval alone
+     dropped the latter: `for (p = y; p != e; p++) s += *p` counted one of p's
+     two definitions, and the walk got the last element's value forwarded into
+     every iteration. */
   uint8_t *tmp_defs = tcc_mallocz(max_tmp + 1);
   uint8_t *var_defs = tcc_mallocz(max_var + 1);
   for (int i = 0; i < n; i++)
@@ -508,7 +511,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       continue;
     IROperand d = tcc_ir_op_get_dest(ir, q);
     int32_t vr = irop_get_vreg(d);
-    if (vr < 0 || d.is_lval)
+    if (!irop_dest_defines_vreg(d))
       continue;
     int p = TCCIR_DECODE_VREG_POSITION(vr);
     if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && p <= max_tmp && tmp_defs[p] < 2)
@@ -1210,3 +1213,168 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
   return changes;
 }
 int tcc_ir_opt_entry_store_prop_ex(IROptCtx *ctx) { return tcc_ir_opt_entry_store_prop(ctx->ir); }
+
+/* A by-value struct parameter lives in a frame home the entry block fills a
+ * word at a time, `StackLoc[h] <-- Pn [STORE]`, and field reads load it.  SRA
+ * splits the copies Zig makes of it (`t0 = a0; t1 = &t0`) but not the home,
+ * which is no frame object, and the reads lea folding turned into direct slot
+ * loads -- `a0.len` as `StackLoc[h+4] [LOAD]`, `a0.ptr[i]` as `StackLoc[h] ADD
+ * i` -- reloaded it on every loop turn (Zig's StaticStringMap.defaultEql kept
+ * both slices in memory with three free registers).  When nothing but the entry
+ * store writes a home word and no address inside the homes is taken, every
+ * word read of it is Pn.  The store stays; with no reads left DSE drops it. */
+#define PHF_MAX 32
+int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  if (n == 0 || ir->inline_asm_count || ir->func_has_label_addr || tcc_ir_calls_returns_twice(ir))
+    return 0;
+  /* Leaf functions only.  Across a call the parameter needs a callee-saved
+   * register or a slot of its own, and the home was that slot already:
+   * forwarded, Wyhash.hash spent a callee-saved register on its key slice
+   * through the u128 loop and ran 2% slower. */
+  for (int i = 0; i < n; i++)
+    if (ir->compact_instructions[i].op == TCCIR_OP_FUNCCALLVOID || ir->compact_instructions[i].op == TCCIR_OP_FUNCCALLVAL)
+      return 0;
+
+  struct PhfHome
+  {
+    int off, idx, bad;
+    IROperand p;
+  } h[PHF_MAX];
+  int nh = 0;
+  for (int i = 0; i < n && nh < PHF_MAX; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->is_jump_target && i > 0)
+      break;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP ||
+        q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+      break;
+    if (q->op != TCCIR_OP_STORE)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q), s = tcc_ir_op_get_src1(ir, q);
+    if (irop_get_tag(d) != IROP_TAG_STACKOFF || !d.is_local || !d.is_lval || d.is_llocal ||
+        irop_get_vreg(d) >= 0 || irop_get_btype(d) != IROP_BTYPE_INT32 || irop_is_64bit(d) ||
+        tcc_ir_access_is_volatile(ir, d))
+      continue;
+    int32_t pv = irop_get_vreg(s);
+    if (pv < 0 || TCCIR_DECODE_VREG_TYPE(pv) != TCCIR_VREG_TYPE_PARAM || s.is_lval || s.is_local || s.is_llocal ||
+        irop_get_btype(s) != IROP_BTYPE_INT32 || irop_is_64bit(s))
+      continue;
+    const int off = irop_get_stack_offset(d);
+    if (off & 3)
+      continue;
+    int dup = 0;
+    for (int k = 0; k < nh; k++)
+      if (h[k].off == off)
+        dup = h[k].bad = 1;
+    if (!dup)
+      h[nh++] = (struct PhfHome){.off = off, .idx = i, .bad = 0, .p = s};
+  }
+  if (!nh)
+    return 0;
+  int lo = h[0].off, hi = h[0].off + 4;
+  for (int k = 1; k < nh; k++)
+  {
+    if (h[k].off < lo)
+      lo = h[k].off;
+    if (h[k].off + 4 > hi)
+      hi = h[k].off + 4;
+  }
+
+  /* Every other reference to the home area. */
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    int entry = 0;
+    for (int k = 0; k < nh; k++)
+      entry |= h[k].idx == i;
+    if (entry)
+      continue;
+    const int store_class = q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
+                            q->op == TCCIR_OP_STORE_POSTINC;
+    for (int s = 0; s < 4; s++)
+    {
+      IROperand op;
+      if (s == 0) { if (!irop_config[q->op].has_dest) continue; op = tcc_ir_op_get_dest(ir, q); }
+      else if (s == 1) { if (!irop_config[q->op].has_src1) continue; op = tcc_ir_op_get_src1(ir, q); }
+      else if (s == 2) { if (!irop_config[q->op].has_src2) continue; op = tcc_ir_op_get_src2(ir, q); }
+      else { if (!tcc_ir_op_is_mac(q->op)) continue; op = tcc_ir_op_get_accum(ir, q); }
+      /* A parameter vreg written anywhere is not the entry value. */
+      int32_t vr = irop_get_vreg(op);
+      if (s == 0 && vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM &&
+          q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID)
+        for (int k = 0; k < nh; k++)
+          if (irop_get_vreg(h[k].p) == vr)
+            h[k].bad = 1;
+      if (irop_get_tag(op) != IROP_TAG_STACKOFF || !op.is_local || op.is_llocal || vr >= 0)
+        continue;
+      const int o = irop_get_stack_offset(op);
+      if (!op.is_lval)
+      {
+        /* its address: anything could be done through it */
+        if (o >= lo && o < hi)
+          return 0;
+        continue;
+      }
+      int w = irop_is_64bit(op) ? 8 : ir_opt_store_btype_size_bytes(irop_get_btype(op));
+      if (w <= 0)
+        w = irop_get_btype(op) == IROP_BTYPE_STRUCT ? hi - lo : 4;
+      if (o + w <= lo || o >= hi)
+        continue;
+      if (s == 0 && (store_class || q->op == TCCIR_OP_BLOCK_COPY))
+      {
+        if (q->op != TCCIR_OP_STORE)
+          return 0; /* an indexed or block write into the homes */
+        for (int k = 0; k < nh; k++)
+          if (o < h[k].off + 4 && o + w > h[k].off)
+            h[k].bad = 1;
+      }
+      else if (s == 0)
+        return 0; /* some other write of the slot */
+    }
+  }
+
+  int changes = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    int entry = 0;
+    for (int k = 0; k < nh; k++)
+      entry |= h[k].idx == i;
+    if (entry)
+      continue;
+    for (int s = 1; s < 4; s++)
+    {
+      IROperand op;
+      if (s == 1) { if (!irop_config[q->op].has_src1) continue; op = tcc_ir_op_get_src1(ir, q); }
+      else if (s == 2) { if (!irop_config[q->op].has_src2) continue; op = tcc_ir_op_get_src2(ir, q); }
+      else { if (!tcc_ir_op_is_mac(q->op)) continue; op = tcc_ir_op_get_accum(ir, q); }
+      if (irop_get_tag(op) != IROP_TAG_STACKOFF || !op.is_local || !op.is_lval || op.is_llocal ||
+          irop_get_vreg(op) >= 0 || irop_get_btype(op) != IROP_BTYPE_INT32 || irop_is_64bit(op) ||
+          tcc_ir_access_is_volatile(ir, op))
+        continue;
+      const int o = irop_get_stack_offset(op);
+      for (int k = 0; k < nh; k++)
+      {
+        if (h[k].bad || h[k].off != o)
+          continue;
+        IROperand p = h[k].p;
+        if (s == 1)
+          tcc_ir_op_set_src1(ir, q, p);
+        else if (s == 2)
+          tcc_ir_op_set_src2(ir, q, p);
+        else
+          tcc_ir_op_set_accum(ir, q, p);
+        changes++;
+        break;
+      }
+    }
+  }
+  return changes;
+}

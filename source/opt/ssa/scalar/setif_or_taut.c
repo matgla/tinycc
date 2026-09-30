@@ -72,8 +72,9 @@ static int so_vreg_ever_written(TCCIRState *ir, int32_t vr)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
+    /* A PARAM written as itself is a STACKOFF lvalue: a write all the same. */
     IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (!d.is_lval && irop_get_vreg(d) == vr)
+    if (irop_get_vreg(d) == vr && irop_dest_defines_vreg(d))
       return 1;
   }
   return 0;

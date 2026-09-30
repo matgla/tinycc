@@ -111,8 +111,10 @@ static int s64_mark_dead_hi(TCCIRState *ir, int n)
     if (q->orig_index < 0 || q->orig_index > ir->max_orig_index)
       continue;
     /* Single use keeps the consumer unambiguous (and rejects the MLA-accumulator
-     * blind spot, which tcc_ir_vreg_has_single_use reports as multi-use). */
-    if (!tcc_ir_vreg_has_single_use(ir, dv, i))
+     * blind spot, which tcc_ir_vreg_has_single_use reports as multi-use).  A
+     * graph-coalesced value is also read under its class members' names, which
+     * no use count of its own sees (tcc_ir_vreg_coalesced). */
+    if (!tcc_ir_vreg_has_single_use(ir, dv, i) || tcc_ir_vreg_coalesced(ir, dv))
       continue;
 
     int low_only = 0;
@@ -230,7 +232,7 @@ int tcc_ir_opt_shift64_dead_half(TCCIRState *ir)
       continue;
     if (irop_get_btype(tcc_ir_op_get_dest(ir, def)) != IROP_BTYPE_INT64)
       continue;
-    if (!tcc_ir_vreg_has_single_use(ir, s1_vr, dpos))
+    if (!tcc_ir_vreg_has_single_use(ir, s1_vr, dpos) || tcc_ir_vreg_coalesced(ir, s1_vr))
       continue;
 
     if (!ir->shift64_dead_half) {

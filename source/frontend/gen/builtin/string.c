@@ -41,8 +41,8 @@ const char *try_get_constant_string(SValue *sv, int *out_len)
   if ((sv->r & (VT_VALMASK | VT_SYM | VT_LVAL)) != (VT_CONST | VT_SYM) &&
       (sv->r & (VT_VALMASK | VT_SYM | VT_LVAL)) != (VT_CONST | VT_SYM | VT_LVAL))
     return NULL;
-  if (!sv->sym)
-    return NULL;
+  if (!sv->sym || sv->sym->a.tentative)
+    return NULL; /* a tentative definition's bytes are not its value yet */
 
   esym = elfsym(sv->sym);
   if (!esym)

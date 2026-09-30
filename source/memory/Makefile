@@ -19,7 +19,7 @@ $(X)source/memory/%.o: source/memory/%.c $(MEMORY_HDRS) $(TCC_CORE_DEPS)
 	@mkdir -p $(dir $@)
 	$S$(CC) -o $@ -c $< $(addsuffix ,$(DEFINES) $(CFLAGS))
 
-MEMORY_OBJ = $(patsubst %.c,$(X)%.o,$(MEMORY_SRC))
+MEMORY_OBJ = $(call lib-objs,memory,$(MEMORY_SRC))
 MEMORY_LIB = $(X)source/memory/libmemory.a
 
 $(MEMORY_LIB): $(MEMORY_OBJ)

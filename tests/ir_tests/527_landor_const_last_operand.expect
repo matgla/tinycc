@@ -1,0 +1,6 @@
+guard 96
+a=0 x=0 and=0 or=1
+a=0 x=1 and=0 or=0
+a=1 x=0 and=1 or=1
+a=1 x=1 and=0 or=1
+fails 0

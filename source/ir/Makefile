@@ -13,11 +13,19 @@ IR_SRC = \
 	source/ir/pool.c \
 	source/ir/vreg.c \
 	source/ir/stack.c \
+	source/ir/frame.c \
+	source/ir/cross_jump.c \
+	source/ir/self_store.c \
+	source/ir/dead_def.c \
 	source/ir/dump.c \
 	source/ir/codegen.c \
 	source/ir/cfg.c \
 	source/ir/ssa.c \
 	source/ir/regalloc.c \
+	source/ir/regalloc_scan.c \
+	source/ir/regalloc_phi.c \
+	source/ir/regalloc_entry.c \
+	source/ir/regalloc_post.c \
 	source/ir/machine_op.c \
 	source/ir/tccir_operand.c
 
@@ -25,7 +33,7 @@ IR_HDRS = $(wildcard source/ir/*.h)
 
 # $(IR_GEN_FILES) comes from source/ir/gen/Makefile, included first by the
 # top-level Makefile.
-IR_OBJ = $(patsubst %.c,$(X)%.o,$(IR_SRC) $(IR_GEN_FILES))
+IR_OBJ = $(call lib-objs,ir,$(IR_SRC) $(IR_GEN_FILES))
 IR_LIB = $(X)source/ir/libir.a
 
 $(X)source/ir/%.o: source/ir/%.c $(IR_HDRS) $(TCC_CORE_DEPS)

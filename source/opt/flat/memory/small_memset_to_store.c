@@ -129,8 +129,10 @@ int tcc_ir_opt_small_memset_to_store(TCCIRState *ir)
     ir_opt_nop_call_params(ir, i);
 
     /* STORE pool layout is [dest, src1]. */
+    /* A memset is no volatile access, whatever the object's type. */
     IROperand st_dest0 = irop_make_stackoff(-1, chunk_off[0], /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0,
                                             chunk_btype[0]);
+    st_dest0.aux |= IROP_AUX_NONVOLATILE;
     IROperand st_src0 = irop_make_imm32(-1, 0, chunk_btype[0]);
     int pool_base0 = tcc_ir_iroperand_pool_add(ir, st_dest0);
     tcc_ir_iroperand_pool_add(ir, st_src0);
@@ -141,6 +143,7 @@ int tcc_ir_opt_small_memset_to_store(TCCIRState *ir)
     {
       IROperand st_dest1 = irop_make_stackoff(-1, chunk_off[1], /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0,
                                               chunk_btype[1]);
+      st_dest1.aux |= IROP_AUX_NONVOLATILE;
       IROperand st_src1 = irop_make_imm32(-1, 0, chunk_btype[1]);
       int pool_base1 = tcc_ir_iroperand_pool_add(ir, st_dest1);
       tcc_ir_iroperand_pool_add(ir, st_src1);

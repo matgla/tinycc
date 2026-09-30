@@ -688,18 +688,23 @@ UT_TEST(test_cbnz_jump_mop_emits_cbnz)
 
 /* ------------------------------------------------------------------ chain helpers */
 
+extern int allocated_stack_size;
+
 UT_TEST(test_restore_chain_loads_from_chain_slot)
 {
   setup_gen();
   tcc_state->need_frame_pointer = 1;
+  allocated_stack_size = 16;
 
   tcc_gen_machine_restore_chain();
 
-  /* The static chain register is R10 (a high register), so the LDR from
-   * [FP, #-4] uses the 32-bit T3 encoding (4 bytes). */
+  /* The chain slot is frame offset -4, and the frame pointer is the frame's
+   * bottom: [FP, #16 - 4].  R10 is a high register, so the LDR uses the
+   * 32-bit encoding (4 bytes). */
   UT_ASSERT_EQ(ind, 4);
-  UT_ASSERT(bytes_match_opcode(ind, th_ldr_imm(R10, R_FP, 4, 4 /* subtract */, ENFORCE_ENCODING_NONE)));
+  UT_ASSERT(bytes_match_opcode(ind, th_ldr_imm(R10, R_FP, 12, 6 /* add */, ENFORCE_ENCODING_NONE)));
 
+  allocated_stack_size = 0;
   return 0;
 }
 
@@ -844,12 +849,29 @@ UT_TEST(test_pending_pool_size_empty_returns_zero)
 UT_TEST(test_set_chain_emits_mov_r10_fp)
 {
   setup_gen();
+  allocated_stack_size = 0;
 
+  /* An empty frame's top is the frame pointer itself. */
   tcc_gen_machine_set_chain();
   UT_ASSERT_EQ(ind, 2);
   UT_ASSERT(bytes_match_opcode(ind, th_mov_reg(R10, R_FP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                                                ENFORCE_ENCODING_NONE, false)));
 
+  return 0;
+}
+
+UT_TEST(test_set_chain_passes_frame_top)
+{
+  setup_gen();
+  allocated_stack_size = 24;
+
+  /* The chain is the frame's top, FP + frame size: nested functions address
+   * captured variables at their (negative) frame offsets from it. */
+  tcc_gen_machine_set_chain();
+  UT_ASSERT_EQ(ind, 4);
+  UT_ASSERT(bytes_match_opcode(ind, th_add_imm(R10, R_FP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)));
+
+  allocated_stack_size = 0;
   return 0;
 }
 

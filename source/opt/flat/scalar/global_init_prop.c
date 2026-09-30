@@ -44,8 +44,9 @@ int tcc_ir_opt_global_init_prop(TCCIRState *ir)
         continue;
       Sym *sym = ref->sym;
 
-      /* Linkage / attribute gates. */
-      if (sym->a.weak || sym->a.dllimport)
+      /* Linkage / attribute gates.  A tentative definition's bytes are not
+       * its value while its definition may still follow. */
+      if (sym->a.weak || sym->a.dllimport || sym->a.tentative)
         continue;
 
       const int ttype = sym->type.t;

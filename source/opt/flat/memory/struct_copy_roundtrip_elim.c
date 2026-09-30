@@ -91,11 +91,12 @@ static int scre_resolve_slot_addr(TCCIRState *ir, IROperand op, int before_idx, 
       IRQuadCompact *oq = &ir->compact_instructions[o];
       if (oq->op == TCCIR_OP_NOP || !irop_config[oq->op].has_dest)
         continue;
-      if (oq->op == TCCIR_OP_STORE || oq->op == TCCIR_OP_STORE_INDEXED ||
-          oq->op == TCCIR_OP_STORE_POSTINC)
-        continue; /* store dest is an address use, not a def */
+      if (oq->op == TCCIR_OP_STORE_INDEXED)
+        continue; /* its destination is the base address */
+      /* A store through a pointer is an address use, not a def; a VAR or
+       * PARAM stored as itself (a STACKOFF lvalue) is redefined. */
       IROperand od = tcc_ir_op_get_dest(ir, oq);
-      if (irop_has_vreg(od) && irop_get_vreg(od) == vr && !od.is_lval)
+      if (irop_get_vreg(od) == vr && irop_dest_defines_vreg(od))
         return 0;
     }
     if (dq->op != TCCIR_OP_LEA && dq->op != TCCIR_OP_ASSIGN)
@@ -173,6 +174,58 @@ static int scre_touches_region(TCCIRState *ir, IRQuadCompact *q, int32_t lo, int
     }
   }
   return touched;
+}
+
+static int scre_call_id(TCCIRState *ir, IRQuadCompact *q)
+{
+  return TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+}
+
+/* Instruction `k` touches region B: is it only plumbing for the two copies?
+ * That is a FUNCPARAM of C1 or C2, or an address-of B (never a read of its
+ * contents) into a TEMP that nothing but those FUNCPARAMs reads.  An address
+ * of B going anywhere else -- `p = &t40.field` read through later, `f(&t40)`
+ * -- is a use of B's contents that the pair's removal would leave unwritten. */
+static int scre_is_copy_plumbing(TCCIRState *ir, int k, int cid1, int cid2)
+{
+  IRQuadCompact *q = &ir->compact_instructions[k];
+  if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
+  {
+    int cid = scre_call_id(ir, q);
+    return cid == cid1 || cid == cid2;
+  }
+  if (q->op != TCCIR_OP_LEA && q->op != TCCIR_OP_ASSIGN)
+    return 0;
+  IROperand s1 = tcc_ir_op_get_src1(ir, q);
+  if (irop_get_tag(s1) != IROP_TAG_STACKOFF || s1.is_lval)
+    return 0;
+  if (q->op == TCCIR_OP_ASSIGN && !irop_is_none(tcc_ir_op_get_src2(ir, q)))
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  int32_t dv = irop_get_vreg(d);
+  if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP || d.is_lval)
+    return 0;
+  for (int u = 0; u < ir->next_instruction_index; u++)
+  {
+    IRQuadCompact *uq = &ir->compact_instructions[u];
+    if (u == k || uq->op == TCCIR_OP_NOP)
+      continue;
+    const IRRegistersConfig *cfg = &irop_config[uq->op];
+    int reads = (cfg->has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == dv) ||
+                (cfg->has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == dv) ||
+                (uq->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, uq)) == dv);
+    /* A store through it, or a write-back of it, is a use as well. */
+    if (!reads && cfg->has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == dv)
+      reads = 1;
+    if (!reads)
+      continue;
+    if (uq->op != TCCIR_OP_FUNCPARAMVAL && uq->op != TCCIR_OP_FUNCPARAMVOID)
+      return 0;
+    int cid = scre_call_id(ir, uq);
+    if (cid != cid1 && cid != cid2)
+      return 0;
+  }
+  return 1;
 }
 
 int tcc_ir_opt_struct_copy_roundtrip_elim(TCCIRState *ir)
@@ -282,6 +335,7 @@ int tcc_ir_opt_struct_copy_roundtrip_elim(TCCIRState *ir)
      * dst-addr and C2's src-addr (and their param/LEA setup), nowhere else.
      * Any other read/write/addr-of of B is disqualifying. */
     int b_ok = 1;
+    const int cid1 = scre_call_id(ir, c1), cid2 = scre_call_id(ir, c2);
     for (int k = 0; k < n && b_ok; k++)
     {
       if (k == i1 || k == i2)
@@ -298,8 +352,7 @@ int tcc_ir_opt_struct_copy_roundtrip_elim(TCCIRState *ir)
       int is_w;
       if (!scre_touches_region(ir, q, b_off, sz1, &is_w))
         continue;
-      if (q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_ASSIGN ||
-          q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
+      if (scre_is_copy_plumbing(ir, k, cid1, cid2))
         continue; /* address-of / param plumbing for the two copies */
       b_ok = 0;
     }

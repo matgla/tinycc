@@ -10,6 +10,11 @@
  *
  * Implement the public symbols in assembly and delegate the computation to C
  * helpers that write results to memory.
+ *
+ * When both high words are zero (and the divisor is not), the operands are
+ * 32-bit values that the hardware divider takes directly, signed or not: a
+ * zero high word means non-negative.  That path returns without the call
+ * (only where the core has UDIV).
  */
 
 .syntax unified
@@ -26,6 +31,18 @@
 .global __aeabi_uldivmod
 .type __aeabi_uldivmod, %function
 __aeabi_uldivmod:
+#ifdef __ARM_ARCH_EXT_IDIV__
+    orrs    ip, r1, r3
+    bne     .Luldivmod_call
+    cmp     r2, #0
+    beq     .Luldivmod_call
+    udiv    ip, r0, r2
+    mls     r2, ip, r2, r0       /* remainder */
+    mov     r0, ip
+    movs    r3, #0
+    bx      lr
+#endif
+.Luldivmod_call:
     push    {r4, r5, r6, lr}
     sub     sp, sp, #16          /* output slots: qlo,qhi,rlo,rhi */
     mov     r6, sp               /* r6 = &out[0] */
@@ -59,6 +76,18 @@ __aeabi_uldivmod:
 .global __aeabi_ldivmod
 .type __aeabi_ldivmod, %function
 __aeabi_ldivmod:
+#ifdef __ARM_ARCH_EXT_IDIV__
+    orrs    ip, r1, r3
+    bne     .Lldivmod_call
+    cmp     r2, #0
+    beq     .Lldivmod_call
+    udiv    ip, r0, r2
+    mls     r2, ip, r2, r0       /* remainder */
+    mov     r0, ip
+    movs    r3, #0
+    bx      lr
+#endif
+.Lldivmod_call:
     push    {r4, r5, r6, lr}
     sub     sp, sp, #16          /* output slots: qlo,qhi,rlo,rhi */
     mov     r6, sp               /* r6 = &out[0] */
@@ -92,6 +121,16 @@ __aeabi_ldivmod:
 .global __aeabi_ulmod
 .type __aeabi_ulmod, %function
 __aeabi_ulmod:
+#ifdef __ARM_ARCH_EXT_IDIV__
+    orrs    ip, r1, r3
+    bne     .Lulmod_call
+    cmp     r2, #0
+    beq     .Lulmod_call
+    udiv    ip, r0, r2
+    mls     r0, ip, r2, r0       /* remainder */
+    bx      lr
+#endif
+.Lulmod_call:
     push    {r4, r5, r6, lr}
     sub     sp, sp, #16          /* output slots: qlo,qhi,rlo,rhi */
     mov     r6, sp               /* r6 = &out[0] */
@@ -123,6 +162,16 @@ __aeabi_ulmod:
 .global __aeabi_lmod
 .type __aeabi_lmod, %function
 __aeabi_lmod:
+#ifdef __ARM_ARCH_EXT_IDIV__
+    orrs    ip, r1, r3
+    bne     .Llmod_call
+    cmp     r2, #0
+    beq     .Llmod_call
+    udiv    ip, r0, r2
+    mls     r0, ip, r2, r0       /* remainder */
+    bx      lr
+#endif
+.Llmod_call:
     push    {r4, r5, r6, lr}
     sub     sp, sp, #16          /* output slots: qlo,qhi,rlo,rhi */
     mov     r6, sp               /* r6 = &out[0] */

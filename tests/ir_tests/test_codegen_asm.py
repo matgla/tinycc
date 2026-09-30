@@ -212,8 +212,9 @@ def test_struct_packed_9byte_by_value():
     load_mnems = {"ldr", "ldr.w", "ldrh", "ldrsh", "ldrsh.w", "ldrb", "ldrsb"}
     load_count = sum(_count_mnem(consume, m) for m in load_mnems)
 
-    # Caller currently copies the by-value struct with __aeabi_memmove.
-    assert any("__aeabi_memmove" in ops for _, ops in caller), "caller missing __aeabi_memmove copy"
+    # `struct S s = make();` returns into s's own slot; the store of s onto
+    # itself used to be an __aeabi_memmove and is now skipped.
+    assert not any("__aeabi_memmove" in ops for _, ops in caller), "caller copies s onto itself"
     # Callee loads unaligned packed fields.
     assert load_count >= 2, f"consume expected at least 2 loads, got {load_count}"
     # No undefined/breakpoint instructions (i.e. no obviously broken encoding).
@@ -368,17 +369,158 @@ def test_size_flags_alias_o2():
 
     `s->optimize = atoi(optarg)` turned both into 0, so -Os meant "no
     optimization" -- and since -O is a plain option scan, `-O2 ... -Os` (which
-    is what toybox passes) threw the -O2 away.  They alias -O2 until there is
-    an actual size tier to point them at.
+    is what toybox passes) threw the -O2 away.  They run the -O2 pipeline
+    (test_size_tier covers where they part from it), and -Oz is -Os.
     """
     o0 = _disassemble(_compile("dead_loop_rotated", extra_cflags=["-O0"]))
-    o2 = _disassemble(_compile("dead_loop_rotated", extra_cflags=["-O2"]))
     os_ = _disassemble(_compile("dead_loop_rotated", extra_cflags=["-Os"]))
     oz = _disassemble(_compile("dead_loop_rotated", extra_cflags=["-Oz"]))
+    o2_os = _disassemble(_compile("dead_loop_rotated", extra_cflags=["-O2", "-Os"]))
 
-    assert os_ == o2, "-Os should select the same tier as -O2"
-    assert oz == o2, "-Oz should select the same tier as -O2"
+    assert oz == os_, "-Oz should select the same tier as -Os"
+    assert o2_os == os_, "a later -Os should win over an earlier -O2"
     assert os_ != o0, "-Os is still a silent -O0"
+
+
+def test_size_tier():
+    """-Os: where a choice trades code size for speed, the smaller code.
+
+    - no word-alignment NOPs before loop heads and in-loop joins (-O2 pads
+      them for the M33's fetch; 72 KB of zig.c),
+    - an aligned block copy longer than the largest copy stub stays a
+      memmove call instead of an inline LDM/STM loop,
+    - __OPTIMIZE_SIZE__ is defined, as gcc does.
+    """
+    o2 = _disassemble(_compile("size_tier", extra_cflags=["-O2"]))
+    os_ = _disassemble(_compile("size_tier", extra_cflags=["-Os"]))
+
+    pads_o2 = sum(_count_mnem_regex(fn, r"^nop") for fn in o2.values())
+    pads_os = sum(_count_mnem_regex(fn, r"^nop") for fn in os_.values())
+    assert pads_o2 > 0, "the -O2 build should pad some loop head (case no longer exercises alignment)"
+    assert pads_os == 0, f"-Os padded {pads_os} branch targets"
+
+    assert _count_mnem_regex(o2["copy_big"], r"^ldmia") > 0, "-O2 should copy 160 bytes inline"
+    assert _count_mnem_regex(os_["copy_big"], r"^bl\b") == 1, f"-Os should call memmove: {os_['copy_big']}"
+    assert _count_mnem_regex(os_["copy_big"], r"^ldm") == 0, "-Os still copies inline"
+
+    assert os_["size_macro"][0] == ("movs", "r0, #1"), "__OPTIMIZE_SIZE__ not defined at -Os"
+    assert o2["size_macro"][0] == ("movs", "r0, #0"), "__OPTIMIZE_SIZE__ defined at -O2"
+
+
+def test_branch_over_pool_window_narrows():
+    """A forward B over more than a literal-pool window is 16-bit if it fits.
+
+    The then-arm's jump over the 1 KB else-arm used to stay B.W because a pool
+    dump could land inside the range -- and one does (the arm's second B.W is
+    that dump's skip branch).  A 16-bit B is safe whenever its offset fits with
+    every dump the range can take; 7,900 branches in zig.c.
+    """
+    fn = _disassemble(_compile("branch_over_pool_window"))["over_pool_window"]
+    branches = [(m, o) for m, o in fn if re.match(r"^b(\.[nw])?$", m)]
+    assert branches and branches[0][0] == "b.n", f"jump over the else-arm is wide: {branches[:2]}"
+    assert any(m == "b.w" for m, _ in branches[1:]), "no pool dump inside the range any more"
+
+
+def test_cmp_negative_small_is_adds():
+    """CMP Rn, #-k (k = 1..7, Rn low) is ADDS Rt, Rn, #k into a free low register.
+
+    Rn - (-k) and Rn + k are one sum with one carry and one overflow, so the
+    flags match, in 16 bits where the compare needs CMP.W (Zig compares
+    against maxInt(u32), its `none` index, 1,800 times in zig.c).
+    """
+    funcs = _disassemble(_compile("cmp_neg_small"))
+    for name, k in (("is_none", 1), ("below_minus3", 3)):
+        fn = funcs[name]
+        assert _count_mnem_regex(fn, r"^(cmp|cmn)") == 0, f"{name} still compares: {fn}"
+        assert _count_mnem_regex(fn, rf"^adds r[0-7], r0, #{k}$") == 1, f"{name}: {fn}"
+
+
+def test_literal_body_word_aligned():
+    """A body that reads its literal pool starts word-aligned.
+
+    A literal load's offset and the pad before a pool dump depend on the
+    address mod 4, so the same function at a 2 mod 4 start is different
+    machine code, and identical code folding compares machine code: lit_b
+    only folds onto lit_a when both start aligned.
+    """
+    obj = _compile("func_align_literal", extra_cflags=["-fno-function-sections"])
+    syms = {}
+    out = subprocess.run(["arm-none-eabi-nm", str(obj)], stdout=subprocess.PIPE, text=True).stdout
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 3:
+            syms[parts[2]] = int(parts[0], 16)
+    assert syms["pad_before"] == 0 and syms["lit_a"] % 4 == 0, f"lit_a not word-aligned: {syms}"
+    assert syms["lit_b"] == syms["lit_a"], f"identical lit_b was not folded onto lit_a: {syms}"
+
+
+def test_hi_callee_pref():
+    """More call-crossing values than r4-r7: the compared one keeps a low register.
+
+    Five pointers are only passed from call to call; `k` is compared with a
+    constant after each.  First come first served gave the pointers r4-r7 and
+    `k` a high register, so every compare was CMP.W; ra:hi_callee_pref gives
+    values at most one 16-bit-capable op touches r8-r11 first.
+    """
+    fn = _disassemble(_compile("hi_callee_pref"))["keep_low"]
+    cmps = [(m, o) for m, o in fn if m.startswith("cmp")]
+    assert len(cmps) == 4, f"expected four compares: {fn}"
+    assert all(m == "cmp" and re.match(r"r[0-7], #", o) for m, o in cmps), f"a compare is wide: {cmps}"
+
+
+def test_has_builtin():
+    """__has_builtin answers for the builtins tcc implements.
+
+    It was `#define __has_builtin(x) 0`, so zig.h built its byte swaps from
+    shifts and ORs.  It must also expand outside #if: zig.h pastes the 0/1
+    answer into a name to choose a libm import.
+    """
+    funcs = _disassemble(_compile("has_builtin", extra_cflags=["-nostdinc", f"-I{ROOT / 'include'}"]))
+    assert _count_mnem_regex(funcs["swap16"], r"^rev16") == 1, f"swap16: {funcs['swap16']}"
+    assert _count_mnem_regex(funcs["swap32"], r"^rev ") == 1, f"swap32: {funcs['swap32']}"
+    assert ("movs", "r0, #10") in funcs["answers"], f"answers: {funcs['answers']}"
+
+
+def test_shift64_var_os_calls_helper():
+    """-Os: a 64-bit shift by a variable count is the __aeabi_* helper call.
+
+    Inline it is eight instructions at every site (440 of them in zig.c);
+    -O2 keeps that, -Os takes the call.  A constant count stays inline.
+    """
+    o2 = _disassemble(_compile("shift64_var", extra_cflags=["-O2"]))
+    os_ = _disassemble(_compile("shift64_var", extra_cflags=["-Os"]))
+    for name, helper in (("shl", "__aeabi_llsl"), ("shr", "__aeabi_llsr"), ("sar", "__aeabi_lasr")):
+        assert _count_mnem_regex(o2[name], helper) == 0, f"-O2 {name} calls {helper}"
+        assert _count_mnem_regex(os_[name], helper) == 1, f"-Os {name}: {os_[name]}"
+    assert _count_mnem_regex(os_["shl_const"], r"__aeabi") == 0, "a constant shift became a call"
+
+
+def test_cmp_type_extreme_folds():
+    """A compare against an end of its operand's own range is constant.
+
+    `x > 0xFFFFFFFFu` and `x < INT32_MIN` hold for no x: VRP folds the
+    CMP whether written directly or made so by inlining -- zig.h's overflow
+    wrappers check every result against zig_minInt/zig_maxInt of its full
+    width that way.  (A frontend gen_opic fold of the same compares broke
+    the self-hosted tcc on the device; see the commit.)
+    """
+    funcs = _disassemble(_compile("cmp_type_extreme",
+                                  extra_cflags=["-nostdinc", f"-I{ROOT / 'include'}",
+                                                f"-I{Path(__file__).parent / 'libc_includes' / 'newlib'}"]))
+    for name in ("u_above_max", "s_below_min", "inlined"):
+        assert _count_mnem_regex(funcs[name], r"^cmp") == 0, f"{name} still compares: {funcs[name]}"
+
+
+def test_it_mov_narrow():
+    """A small constant moved inside an IT block uses the 16-bit encoding.
+
+    Inside an IT block MOV #imm8 sets no flags, so SELECT arms and the
+    BOOL_AND/BOOL_OR result need not be the flag-preserving MOV.W.
+    """
+    funcs = _disassemble(_compile("it_mov_narrow"))
+    for name, fn in funcs.items():
+        wide = [(m, o) for m, o in fn if re.match(r"^mov(eq|ne|lt|ge|gt|le|cc|cs|hi|ls)\.w$", m) and re.match(r"r[0-7], #", o)]
+        assert not wide, f"{name} has a wide conditional move: {fn}"
 
 
 def test_switch_const_selector_folds():

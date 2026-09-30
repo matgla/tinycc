@@ -19,7 +19,7 @@ DRIVER_SRC = \
 DRIVER_HDRS = \
 	source/driver/libtcc.h
 
-DRIVER_OBJ = $(patsubst %.c,$(X)%.o,$(DRIVER_SRC))
+DRIVER_OBJ = $(call lib-objs,driver,$(DRIVER_SRC))
 DRIVER_MAIN_OBJ = $(patsubst %.c,$(X)%.o,$(DRIVER_MAIN_SRC))
 DRIVER_LIB = $(X)source/driver/libtccdriver.a
 

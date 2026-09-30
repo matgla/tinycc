@@ -145,6 +145,25 @@ static int sccp_get_operand_value(SCCPState *s, IROperand op, int64_t *out)
 static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
                                    int instr_idx, int64_t *out, int *dep_pos);
 
+/* The frame slot a TEMP address names, or INT_MIN.  `&VAR` resolves to the
+ * VAR's spill placeholder, an offset it shares with unrelated anonymous
+ * StackLocs (ssa_opt.h): matched as a slot, a memset through `&t0` read as a
+ * store of 0 to the by-value struct parameter spilled at the same offset, and
+ * Zig's InternPool.AnalUnit.wrap lost its payload.  Here it is no slot. */
+static int sccp_lea_slot(IRSSAOptCtx *ctx, int32_t vr)
+{
+  int32_t base_var;
+  int off = ssa_opt_resolve_lea_stackloc_ex(ctx, vr, &base_var);
+  return base_var >= 0 ? INT_MIN : off;
+}
+
+static int sccp_indirect_slot(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side)
+{
+  int32_t base_var;
+  int off = ssa_opt_indirect_stack_offset_ex(ctx, q, side, &base_var);
+  return base_var >= 0 ? INT_MIN : off;
+}
+
 static int sccp_get_store_src_value(SCCPState *s, IROperand src, int64_t *out,
                                     int *src_pos_out)
 {
@@ -186,7 +205,7 @@ static int sccp_get_store_src_value_ex(SCCPState *s, IROperand src,
       !src.is_local) {
     int32_t svr = irop_get_vreg(src);
     if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
-      load_off = ssa_opt_resolve_lea_stackloc(s->ctx, svr);
+      load_off = sccp_lea_slot(s->ctx, svr);
   }
 
   if (load_off != INT_MIN) {
@@ -225,16 +244,25 @@ static int sccp_store_target_off(IRSSAOptCtx *ctx, IRQuadCompact *sq,
   IROperand sd = tcc_ir_op_get_dest(ir, sq);
   if (sq->op == TCCIR_OP_STORE) {
     if (sd.tag == IROP_TAG_STACKOFF && sd.is_lval && sd.is_local) {
+      /* A store to a VAR carries the VAR's spill placeholder, not a frame
+       * slot: every load site already refuses to match a VAR operand by its
+       * offset, and the store side must too.  Zig's CaptureValue.wrap zeroes
+       * its result local (`V8 <-- #0`) and the placeholder equalled the slot
+       * the by-value parameter is spilled to, so the load of a0.payload in
+       * case 0 folded to 0. */
+      int32_t dvr = irop_get_vreg(sd);
+      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR)
+        return INT_MIN;
       if (out_btype) *out_btype = irop_get_btype(sd);
       return irop_get_stack_offset(sd);
     }
-    int off = ssa_opt_indirect_stack_offset(ctx, sq, SSA_OPT_INDIRECT_DEST);
+    int off = sccp_indirect_slot(ctx, sq, SSA_OPT_INDIRECT_DEST);
     if (off != INT_MIN && out_btype)
       *out_btype = irop_get_btype(sd);
     return off;
   }
   if (sq->op == TCCIR_OP_STORE_INDEXED) {
-    int off = ssa_opt_indirect_stack_offset(ctx, sq, SSA_OPT_INDIRECT_DEST);
+    int off = sccp_indirect_slot(ctx, sq, SSA_OPT_INDIRECT_DEST);
     if (off != INT_MIN && out_btype)
       *out_btype = irop_get_btype(sd);
     return off;
@@ -251,7 +279,7 @@ static int sccp_store_may_escape(IRSSAOptCtx *ctx, IRQuadCompact *sq)
   if (sd.tag == IROP_TAG_STACKOFF && sd.is_lval && sd.is_local)
     return 0;
   if (sd.tag == IROP_TAG_VREG && sd.is_lval && !sd.is_local) {
-    int off = ssa_opt_indirect_stack_offset(ctx, sq, SSA_OPT_INDIRECT_DEST);
+    int off = sccp_indirect_slot(ctx, sq, SSA_OPT_INDIRECT_DEST);
     if (off != INT_MIN)
       return 0;
   }
@@ -556,7 +584,7 @@ static int sccp_store_indexed_base_off(IRSSAOptCtx *ctx, IRQuadCompact *q)
   int32_t bvr = irop_get_vreg(base);
   if (bvr < 0 || TCCIR_DECODE_VREG_TYPE(bvr) != TCCIR_VREG_TYPE_TEMP)
     return INT_MIN;
-  return ssa_opt_resolve_lea_stackloc(ctx, bvr);
+  return sccp_lea_slot(ctx, bvr);
 }
 
 /* Any store-to-load path is a subset of the linear IR range, so scanning it is sound. */
@@ -623,12 +651,15 @@ static int sccp_indexed_store_base_off(IRSSAOptCtx *ctx, IRQuadCompact *q)
   if (base.tag == IROP_TAG_VREG && !base.is_local) {
     int32_t bvr = irop_get_vreg(base);
     if (bvr >= 0 && TCCIR_DECODE_VREG_TYPE(bvr) == TCCIR_VREG_TYPE_TEMP)
-      return ssa_opt_resolve_lea_stackloc(ctx, bvr);
+      return sccp_lea_slot(ctx, bvr);
   }
   return INT_MIN;
 }
 
-/* Narrower than sccp_no_aliasing_between: calls are not barriers here. */
+/* Narrower than sccp_no_aliasing_between: an unresolved pointer store only
+ * clobbers when it may escape, and a call only when the slot's address
+ * escaped.  Without the call check, `struct d x = {0}; f(&x); if (!x.p)`
+ * kept the initializer's 0 across f (ctags lregex choose_backend). */
 static int sccp_resolved_stack_write_between(SCCPState *s, int store_idx, int load_idx,
                                              int soff, int load_btype)
 {
@@ -639,6 +670,9 @@ static int sccp_resolved_stack_write_between(SCCPState *s, int store_idx, int lo
   for (int i = store_idx + 1; i < load_idx; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (sccp_var_def_clobbers_slot(s, q, load_lo, load_hi))
+      return 1;
+    if ((q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL) &&
+        sccp_slot_addr_escapes(s, load_lo, load_hi))
       return 1;
     if (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
         q->op != TCCIR_OP_STORE_POSTINC)
@@ -769,7 +803,7 @@ static int sccp_loop_writes_slot_between(SCCPState *s, int from_idx, int to_idx,
           else {
             int32_t pvr = irop_get_vreg(p);
             if (pvr >= 0)
-              aoff = ssa_opt_resolve_lea_stackloc(s->ctx, pvr);
+              aoff = sccp_lea_slot(s->ctx, pvr);
           }
           const int SCCP_OBJ_BOUND = 4096;
           if (aoff != INT_MIN && aoff <= load_lo && load_lo - aoff < SCCP_OBJ_BOUND)
@@ -1014,7 +1048,7 @@ static int sccp_get_operand_value_ex(SCCPState *s, IROperand op,
   if (op.tag == IROP_TAG_VREG && op.is_lval && !op.is_local) {
     int32_t tvr = irop_get_vreg(op);
     if (tvr >= 0 && TCCIR_DECODE_VREG_TYPE(tvr) == TCCIR_VREG_TYPE_TEMP) {
-      int load_off = ssa_opt_resolve_lea_stackloc(s->ctx, tvr);
+      int load_off = sccp_lea_slot(s->ctx, tvr);
       if (load_off != INT_MIN) {
         int dep_pos = -1;
         int st = sccp_resolve_stack_load(s, load_off, irop_get_btype(op),
@@ -1072,6 +1106,11 @@ static int sccp_eval_binary(int op, int64_t v1, int64_t v2, int64_t *result,
   case TCCIR_OP_AND: *result = v1 & v2; break;
   case TCCIR_OP_OR:  *result = v1 | v2; break;
   case TCCIR_OP_XOR: *result = v1 ^ v2; break;
+  case TCCIR_OP_PACK64: /* dest_lo = src1, dest_hi = src2 */
+    if (!is_64)
+      return 0;
+    *result = (int64_t)(((uint64_t)(uint32_t)v2 << 32) | (uint32_t)v1);
+    break;
   case TCCIR_OP_SHL: {
     int mask = is_64 ? 63 : 31;
     *result = (int64_t)((uint64_t)v1 << (v2 & mask));
@@ -1307,6 +1346,10 @@ static void sccp_visit_instr(SCCPState *s, int idx)
       int64_t val;
       int st = sccp_get_operand_value(s, src, &val);
       int changed = 0;
+      /* A word dest keeps the low word of a 64-bit value, as the backend's
+       * copy does: the lattice holds 32-bit values sign-extended. */
+      if (st == SCCP_CONST && !is_64)
+        val = (int64_t)(int32_t)(uint32_t)val;
       if (st == SCCP_CONST)
         changed = sccp_meet(dest_cell, val);
       else if (st == SCCP_BOTTOM)
@@ -1387,7 +1430,7 @@ static void sccp_visit_instr(SCCPState *s, int idx)
       }
 
       if (src.tag == IROP_TAG_VREG && src.is_lval && !src.is_local) {
-        int eff_off = ssa_opt_indirect_stack_offset(s->ctx, q, SSA_OPT_INDIRECT_SRC1);
+        int eff_off = sccp_indirect_slot(s->ctx, q, SSA_OPT_INDIRECT_SRC1);
         if (eff_off != INT_MIN) {
           int64_t sval = 0;
           int dep_pos = -1;
@@ -1804,7 +1847,7 @@ static int sccp_apply(SCCPState *s)
       if (src.tag == IROP_TAG_VREG && src.is_lval && !src.is_local) {
         int32_t tvr = irop_get_vreg(src);
         if (tvr >= 0 && TCCIR_DECODE_VREG_TYPE(tvr) == TCCIR_VREG_TYPE_TEMP) {
-          int load_off = ssa_opt_resolve_lea_stackloc(s->ctx, tvr);
+          int load_off = sccp_lea_slot(s->ctx, tvr);
           if (load_off != INT_MIN) {
             int dep_pos = -1;
             int st = sccp_resolve_stack_load(s, load_off, irop_get_btype(src),

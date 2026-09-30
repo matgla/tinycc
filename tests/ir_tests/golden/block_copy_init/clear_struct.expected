@@ -1,9 +1,4 @@
-0000: StackLoc[-16] <-- #0 [STORE]
-0001: StackLoc[-12] <-- #0 [STORE]
-0002: StackLoc[-8] <-- #0 [STORE]
-0003: T0 <-- P0 [ASSIGN]
-0004: T1 <-- Addr[StackLoc[-16]]
-0005: PARAM0[call_0] T0
-0006: PARAM1[call_0] T1
-0007: PARAM2[call_0] #12
-0008: CALL GlobalSym(#0) CALL #3
+0000: T0 <-- P0 [ASSIGN]
+0001: T0***DEREF*** <-- #0 [STORE]
+0002: T0 <-- #0 STORE_INDEXED #4
+0003: T0 <-- #0 STORE_INDEXED #8

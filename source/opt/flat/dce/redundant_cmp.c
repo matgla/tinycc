@@ -70,8 +70,40 @@ static int rcmp_can_drop(TCCIRState *ir, int keep, int del)
     return 0;
   if (tcc_ir_instr_access_is_volatile(ir, qd))
     return 0;
+  /* A 64-bit CMP has no single flag result: the backend lowers it by what its
+   * reader asks -- EQ/NE get `CMP hi; IT EQ; CMPEQ lo` or `ORRS t, lo, hi`,
+   * which leave only Z meaningful, the orderings get `CMP lo; SBCS hi`.  Two
+   * identical 64-bit CMPs read under different conditions produce different
+   * flags (`sr != 0 && (sr < 0) != ...` read ORRS's N as the sign of sr). */
+  IROperand k1 = tcc_ir_op_get_src1(ir, qk), k2 = tcc_ir_op_get_src2(ir, qk);
+  if (irop_is_64bit(k1) || irop_is_64bit(k2))
+    return 0;
   return rcmp_operand_same(tcc_ir_op_get_src1(ir, qk), tcc_ir_op_get_src1(ir, qd)) &&
          rcmp_operand_same(tcc_ir_op_get_src2(ir, qk), tcc_ir_op_get_src2(ir, qd));
+}
+
+/* Would codegen turn the compare at `keep` and its JUMPIF at `jmp` into a
+ * CBZ/CBNZ?  It does for a 32-bit `CMP r, #0` branched on EQ/NE (codegen.c,
+ * TCCIR_OP_CMP), and CBZ sets no flags at all: a compare deleted in favour of
+ * this one would read whatever flags were left before it.  `if (x != 0) { if
+ * (x < 0) ...` compiled to `cbz r0; bge` and took the branch on the caller's
+ * flags.  The compare is refused as a flag source whenever that can happen --
+ * codegen also needs a low register and a short forward branch, but neither
+ * is known here. */
+static int rcmp_may_become_cbz(TCCIRState *ir, int keep, int jmp)
+{
+  IRQuadCompact *qk = &ir->compact_instructions[keep];
+  IROperand a = tcc_ir_op_get_src1(ir, qk), b = tcc_ir_op_get_src2(ir, qk);
+  if (irop_is_64bit(a) || irop_is_64bit(b))
+    return 0;
+  if (!(irop_is_immediate(a) && irop_get_imm64_ex(ir, a) == 0) &&
+      !(irop_is_immediate(b) && irop_get_imm64_ex(ir, b) == 0))
+    return 0;
+  IROperand c = tcc_ir_op_get_src1(ir, &ir->compact_instructions[jmp]);
+  if (!irop_is_immediate(c))
+    return 1;
+  int cond = (int)irop_get_imm64_ex(ir, c);
+  return cond == TOK_EQ || cond == TOK_NE;
 }
 
 /* First index at or after `from` holding something other than a NOP. */
@@ -176,6 +208,8 @@ int tcc_ir_opt_redundant_cmp(TCCIRState *ir)
       if (rcmp_is_entry(entry, k))
         blocked = 1;
     if (blocked)
+      continue;
+    if (rcmp_may_become_cbz(ir, i, j))
       continue;
 
     IROperand tgt = tcc_ir_op_get_dest(ir, &ir->compact_instructions[j]);

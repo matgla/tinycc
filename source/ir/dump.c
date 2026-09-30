@@ -61,6 +61,8 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "REV";
   case TCCIR_OP_REV16:
     return "REV16";
+  case TCCIR_OP_RETURN_ADDRESS:
+    return "RETURN_ADDRESS";
   case TCCIR_OP_PDIV:
     return "PDIV";
   case TCCIR_OP_UDIV:
@@ -168,6 +170,8 @@ const char *tcc_ir_get_op_name(TccIrOp op)
     return "INIT_CHAIN_SLOT";
   case TCCIR_OP_MLA:
     return "MLA";
+  case TCCIR_OP_UMAAL:
+    return "UMAAL";
   case TCCIR_OP_SWITCH_TABLE:
     return "SWITCH_TABLE";
   case TCCIR_OP_SWITCH_LOAD:
@@ -571,6 +575,11 @@ void tcc_ir_dump_compact(TCCIRState *ir, IRQuadCompact *q, int pc, FILE *out)
   IROperand dest = tcc_ir_op_get_dest(ir, q);
 
   fprintf(out, "%04d: ", pc);
+  if (op == TCCIR_OP_TRAP && q->unreachable)
+  {
+    fprintf(out, "UNREACHABLE\n");
+    return;
+  }
   switch (op)
   {
   case TCCIR_OP_NOP:
@@ -601,12 +610,13 @@ void tcc_ir_dump_compact(TCCIRState *ir, IRQuadCompact *q, int pc, FILE *out)
     fprintf(out, "IJMP ");
     break;
   case TCCIR_OP_MLA:
+  case TCCIR_OP_UMAAL:
     tcc_ir_dump_op(ir, dest, out);
     fprintf(out, " <-- ");
     tcc_ir_dump_op(ir, src1, out);
-    fprintf(out, " MLA ");
+    fprintf(out, op == TCCIR_OP_MLA ? " MLA " : " UMAAL ");
     tcc_ir_dump_op(ir, src2, out);
-    fprintf(out, " + ");
+    fprintf(out, op == TCCIR_OP_MLA ? " + " : " + lo+hi ");
     break;
   default:
     tcc_ir_dump_op(ir, dest, out);
@@ -619,7 +629,7 @@ void tcc_ir_dump_compact(TCCIRState *ir, IRQuadCompact *q, int pc, FILE *out)
     {
       fprintf(out, "(cond=0x%lx)", (unsigned long)irop_get_imm64_ex(ir, src1));
     }
-    else if (op != TCCIR_OP_JUMPIF && op != TCCIR_OP_MLA)
+    else if (op != TCCIR_OP_JUMPIF && !tcc_ir_op_is_mac(op))
     {
       tcc_ir_dump_op(ir, src1, out);
     }
@@ -636,6 +646,7 @@ void tcc_ir_dump_compact(TCCIRState *ir, IRQuadCompact *q, int pc, FILE *out)
     case TCCIR_OP_FUNCPARAMVAL:
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_MLA:
+    case TCCIR_OP_UMAAL:
       break;
     default:
       fprintf(out, " %s ", tcc_ir_get_op_name((TccIrOp)op));
@@ -700,7 +711,7 @@ void tcc_ir_dump_compact(TCCIRState *ir, IRQuadCompact *q, int pc, FILE *out)
     }
     fprintf(out, "\"");
   }
-  else if (op == TCCIR_OP_MLA)
+  else if (tcc_ir_op_is_mac(op))
   {
     IROperand accum = tcc_ir_op_get_accum(ir, q);
     tcc_ir_dump_op(ir, accum, out);

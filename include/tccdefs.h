@@ -258,9 +258,7 @@
     #endif
 /* not implemented */
 #define __PRETTY_FUNCTION__ __FUNCTION__
-#define __has_builtin(x) 0
 #define __has_feature(x) 0
-#define __has_attribute(x) 0
 /* C23 Keywords */
 #define _Nonnull
 #define _Nullable

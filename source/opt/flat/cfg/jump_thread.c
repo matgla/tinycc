@@ -202,3 +202,133 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
 }
 
 int tcc_ir_opt_eliminate_fallthrough_ex(IROptCtx *ctx) { return tcc_ir_opt_eliminate_fallthrough(ctx->ir); }
+
+/* ---- Branches into __builtin_unreachable ----
+ *
+ * A TRAP marked `unreachable` (the frontend's __builtin_unreachable) is never
+ * reached, and neither is any instruction from which every path runs into one
+ * without doing anything observable on the way: those are DOOMED.  A
+ * conditional branch with one doomed side therefore always goes the other
+ * way.  It is folded -- dropped when its target is doomed, made unconditional
+ * when its fall-through is -- and the compare, the loop counter or the switch
+ * range check that fed it is left to DCE.  The Zig C backend ends every
+ * exhaustive switch with `default: zig_unreachable();` (3,400 in zig.c) and
+ * bounds loops whose exit is unreachable.
+ *
+ * "Observable" is read conservatively: only register-to-register value
+ * instructions and non-volatile loads are passed over; a store, a call, an
+ * atomic or anything else keeps its path. */
+static int unreach_passes_over(TCCIRState *ir, IRQuadCompact *q)
+{
+  switch (q->op)
+  {
+  case TCCIR_OP_NOP:
+  case TCCIR_OP_ASSIGN:
+  case TCCIR_OP_LEA:
+  case TCCIR_OP_CMP:
+  case TCCIR_OP_TEST_ZERO:
+  case TCCIR_OP_SETIF:
+  case TCCIR_OP_ADD:
+  case TCCIR_OP_SUB:
+  case TCCIR_OP_MUL:
+  case TCCIR_OP_AND:
+  case TCCIR_OP_OR:
+  case TCCIR_OP_XOR:
+  case TCCIR_OP_SHL:
+  case TCCIR_OP_SAR:
+  case TCCIR_OP_SHR:
+  case TCCIR_OP_ROR:
+  case TCCIR_OP_UBFX:
+  case TCCIR_OP_SBFX:
+  case TCCIR_OP_BFI:
+  case TCCIR_OP_ZEXT:
+  case TCCIR_OP_PACK64:
+  case TCCIR_OP_SELECT:
+  case TCCIR_OP_CLZ:
+  case TCCIR_OP_RBIT:
+  case TCCIR_OP_REV:
+  case TCCIR_OP_REV16:
+    break;
+  case TCCIR_OP_LOAD:
+    if (tcc_ir_access_is_volatile(ir, tcc_ir_op_get_src1(ir, q)))
+      return 0;
+    break;
+  default:
+    return 0;
+  }
+  /* The value lands in a register or a VAR: a store through a pointer is no
+   * value instruction. */
+  if (irop_config[q->op].has_dest)
+  {
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (d.is_lval && !d.is_local)
+      return 0;
+  }
+  return 1;
+}
+
+TCC_DBG_ENV_FLAG(unreach_dbg, "TCC_UNREACH_DBG")
+
+int tcc_ir_opt_unreachable_fold(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  int any = 0;
+  for (int i = 0; i < n && !any; i++)
+    any = ir->compact_instructions[i].op == TCCIR_OP_TRAP && ir->compact_instructions[i].unreachable;
+  if (!any)
+    return 0;
+
+  uint8_t *doomed = tcc_mallocz(n + 1); /* doomed[n] = 0: the epilogue */
+  for (int round = 0, changed = 1; changed && round < 64; round++)
+  {
+    changed = 0;
+    for (int p = n - 1; p >= 0; p--)
+    {
+      if (doomed[p])
+        continue;
+      IRQuadCompact *q = &ir->compact_instructions[p];
+      int d = 0;
+      if (q->op == TCCIR_OP_TRAP)
+        d = q->unreachable;
+      else if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+      {
+        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+        d = t >= 0 && t < n && doomed[t] && (q->op == TCCIR_OP_JUMP || doomed[p + 1]);
+      }
+      else if (unreach_passes_over(ir, q))
+        d = doomed[p + 1];
+      if (d)
+        doomed[p] = 1, changed = 1;
+    }
+  }
+
+  int changes = 0;
+  for (int p = 0; p < n; p++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[p];
+    if (q->op != TCCIR_OP_JUMPIF || doomed[p])
+      continue;
+    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    if (t < 0 || t > n)
+      continue;
+    if (doomed[t])
+      q->op = TCCIR_OP_NOP; /* never taken */
+    else if (doomed[p + 1])
+      q->op = TCCIR_OP_JUMP; /* always taken */
+    else
+      continue;
+    changes++;
+    TCC_DBG_BLOCK(unreach_dbg)
+    {
+      extern const char *funcname;
+      fprintf(stderr, "[UNREACH] %s %d %s\n", funcname, p, q->op == TCCIR_OP_NOP ? "never-taken" : "always-taken");
+    }
+  }
+  tcc_free(doomed);
+  return changes;
+}
+
+int tcc_ir_opt_unreachable_fold_ex(IROptCtx *ctx)
+{
+  return tcc_ir_opt_unreachable_fold(ctx->ir);
+}

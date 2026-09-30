@@ -1,0 +1,16 @@
+chain(0) error=0 payload=7
+chain(1) error=41 payload=aaaaaaaa
+chain(2) error=42 payload=aaaaaaaa
+chain(3) error=43 payload=aaaaaaaa
+chain(4) error=0 payload=7
+calls(0)=0 log=0
+calls(1)=1041 log=41
+calls(2)=1042 log=83
+calls(3)=1043 log=126
+calls(4)=0 log=126
+split_args(1)=1114
+split_args(2)=2214
+split_args(3)=3314
+mixed(1)=22 log=147
+mixed(2)=56 log=202
+mixed(3)=19 log=220

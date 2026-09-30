@@ -52,6 +52,16 @@ typedef struct {
   SSABitset *multi_block_def;
   SSABitset *global; /* upward-exposed somewhere: a read may observe a cross-block value */
   SSABitset *nonstore_def; /* has at least one def that is not a slot STORE */
+  SSABitset *value_def;    /* a def names it as a VALUE (is_lval 0): SRA's field definitions, which have
+                            * no memory form -- codegen resolves such a dest as the slot's address -- so
+                            * the VAR must be renamed whatever else the rules say */
+  SSABitset *off_mixed;    /* some operand names it at an offset other than its own */
+  SSABitset *def_outside_entry; /* a definition outside the entry block */
+  SSABitset *dom_def;           /* written exactly once, by a definition that dominates every read */
+  int sra_lo, sra_hi;   /* the field VARs SRA made for this function (ir->sra_var_lo/hi) */
+  int prom_sra;         /* promote SRA's field VARs past the STORE-only rule */
+  int prom_single;      /* promote entry-block-only single-def VARs */
+  int prom_domdef;      /* promote VARs whose one definition dominates every read (dom_def) */
   int *var_btype;
   const uint8_t *store_def_ok; /* per VAR: an INT32 slot STORE covers every read */
   int block_bitset_bytes;
@@ -62,7 +72,17 @@ typedef struct {
  * in-place rename (multi-def temp).  Read once — the callers sit in inner loops. */
 TCC_DBG_ENV_FLAG(ssa_no_store2assign, "TCC_NO_STORE2ASSIGN")
 
-/* A full-width var-SLOT STORE of a plain VALUE completely redefines the
+/* The constant a narrow slot STORE of `c` leaves in a var of dest's type. */
+static int32_t ssa_narrow_store_imm(IROperand d, int32_t c)
+{
+  if (d.btype == IROP_BTYPE_INT8)
+    return d.is_unsigned ? (int32_t)(uint8_t)c : (int32_t)(int8_t)c;
+  if (d.btype == IROP_BTYPE_INT16)
+    return d.is_unsigned ? (int32_t)(uint16_t)c : (int32_t)(int16_t)c;
+  return c;
+}
+
+/* A var-SLOT STORE of a plain VALUE covering every read completely redefines the
  * variable, so the renamer turns it into an ASSIGN with a FRESH SSA name.
  * Phi placement must agree, or a fresh name defined on one arm is lost at the
  * join (wrong code) — hence this single predicate shared by both.  Returns the
@@ -80,14 +100,30 @@ static int ssa_store_slot_def_pos(TCCIRState *ir, IRQuadCompact *q,
   int32_t dvr = irop_get_vreg(d);
   if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_VAR)
     return -1;
-  if (!d.is_local || d.btype != IROP_BTYPE_INT32)
+  /* A word or a 64-bit integer write, covering every read of the var.  An
+   * inlined helper's int64_t parameter is bound with a 64-bit STORE; updated
+   * in place it stayed one multi-def TEMP that no constant reaches.  A narrow
+   * STORE truncates, so it defines the var only when it stores a constant,
+   * which the renamer writes as the var holds it (ssa_narrow_store_imm). */
+  IROperand s = tcc_ir_op_get_src1(ir, q);
+  int bytes = d.btype == IROP_BTYPE_INT32 ? 4 : d.btype == IROP_BTYPE_INT64 ? 8 : 0;
+  if ((d.btype == IROP_BTYPE_INT8 || d.btype == IROP_BTYPE_INT16) &&
+      irop_get_tag(s) == IROP_TAG_IMM32 && !s.is_lval)
+    bytes = d.btype == IROP_BTYPE_INT8 ? 1 : 2;
+  if (!d.is_local || !bytes)
     return -1;
   int pos = TCCIR_DECODE_VREG_POSITION(dvr);
-  if (pos >= num_vars || !store_def_ok[pos])
+  if (pos >= num_vars || store_def_ok[pos] > bytes)
     return -1;
-  IROperand s = tcc_ir_op_get_src1(ir, q);
+  /* A symbol's ADDRESS (a SYMREF without is_lval) is a constant like an
+   * immediate; only an is_lval SYMREF reads the global.  Left a memory write,
+   * the address store kept the SRA field VAR's previous def under the same
+   * TEMP name, and the zero a compound literal's fill stored first reached the
+   * code: `movs r0, #0; ldr r0, =msg` for every Zig panic message slice. */
   int src_is_value = (irop_get_tag(s) == IROP_TAG_VREG && !s.is_lval) ||
-                     irop_get_tag(s) == IROP_TAG_IMM32;
+                     irop_get_tag(s) == IROP_TAG_IMM32 ||
+                     (irop_get_tag(s) == IROP_TAG_I64 && !s.is_lval && bytes == 8) ||
+                     (irop_get_tag(s) == IROP_TAG_SYMREF && !s.is_lval && bytes == 4);
   return src_is_value ? pos : -1;
 }
 
@@ -174,6 +210,8 @@ static int ssa_scan_var_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info)
       continue;
 
     int blk = cfg->instr_to_block[i];
+    if (blk != 0)
+      SSABitset_set(info->def_outside_entry, pos);
     uint8_t *def_bits = &info->def_blocks[pos * bitset_bytes];
     if (SSABitset_test(&has_def, pos)) {
       if (!raw_bitset_test(def_bits, blk))
@@ -183,8 +221,34 @@ static int ssa_scan_var_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info)
     raw_bitset_set(def_bits, blk);
     if (q->op != TCCIR_OP_STORE)
       SSABitset_set(info->nonstore_def, pos);
+    if (q->op != TCCIR_OP_STORE && !dest.is_lval)
+      SSABitset_set(info->value_def, pos);
     if (dest.btype != IROP_BTYPE_INT32)
       info->var_btype[pos] = dest.btype;
+  }
+
+  /* Renaming clears an operand's offset (ssa_rename_use), so a VAR named
+   * anywhere at an offset other than its own home (a _Complex double read at
+   * +0 and +8 -- ieee/cdivchk) must keep its memory under any widened rule. */
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    int nops = irop_config[q->op].has_dest + irop_config[q->op].has_src1 + irop_config[q->op].has_src2;
+    for (int k = 0; k < nops; k++) {
+      uint32_t pi = q->operand_base + k;
+      if (pi >= (uint32_t)ir->iroperand_pool_count)
+        continue;
+      IROperand o = ir->iroperand_pool[pi];
+      int32_t vr = irop_get_vreg(o);
+      if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || irop_get_tag(o) != IROP_TAG_STACKOFF)
+        continue;
+      int pos = TCCIR_DECODE_VREG_POSITION(vr);
+      if (pos >= num_vars || pos >= ir->variables_live_intervals_size)
+        continue;
+      if (o.u.imm32 != ir->variables_live_intervals[pos].original_offset)
+        SSABitset_set(info->off_mixed, pos);
+    }
   }
 
   for (int v = 0; v < num_vars; v++) {
@@ -201,6 +265,88 @@ static int ssa_scan_var_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info)
   }
 
   return 0;
+}
+
+/* dom_def: VARs written by exactly one instruction whose value reaches every
+ * read, because the write dominates it (an earlier instruction of the same
+ * block, or a block dominating the reader's).  Renaming such a VAR places no
+ * phi -- nothing joins -- so it costs no copy, which is what the STORE-only
+ * rule of ssa_var_promotable guards against.  It is the shape of a called-once
+ * function's parameter after inlining (`p = arg;` once, read throughout the
+ * body), of which zig.c kept thousands in memory, reloading each at every use.
+ * Any other write -- a narrow store that only updates the name in place, a
+ * post-increment's write-back -- and any read the write does not dominate (a
+ * loop-carried use, a path that reads it uninitialized, a read by the defining
+ * instruction itself) leaves the VAR to the other rules. */
+static void ssa_scan_dominating_defs(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info)
+{
+  const int n = ir->next_instruction_index, num_vars = info->num_vars;
+  int32_t *def_at = tcc_malloc(sizeof(int32_t) * (num_vars > 0 ? num_vars : 1));
+  for (int v = 0; v < num_vars; v++)
+    def_at[v] = -1; /* -1 none, -2 more than one or not a clean definition */
+#define DD_VAR(o) (irop_get_vreg(o) >= 0 && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(o)) == TCCIR_VREG_TYPE_VAR && \
+                   TCCIR_DECODE_VREG_POSITION(irop_get_vreg(o)) < num_vars ? TCCIR_DECODE_VREG_POSITION(irop_get_vreg(o)) : -1)
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    int v;
+    if (q->op == TCCIR_OP_LOAD_POSTINC && (v = DD_VAR(tcc_ir_op_get_src1(ir, q))) >= 0)
+      def_at[v] = -2; /* its pointer is written back */
+    if (!irop_config[q->op].has_dest || q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if ((v = DD_VAR(d)) < 0)
+      continue;
+    if (q->op == TCCIR_OP_STORE_INDEXED || ((q->op == TCCIR_OP_STORE) && !d.is_local))
+      continue; /* a store THROUGH the VAR's value reads it */
+    int clean = q->op != TCCIR_OP_STORE_POSTINC &&
+                (q->op != TCCIR_OP_STORE || ssa_store_slot_def_pos(ir, q, info->store_def_ok, num_vars) >= 0);
+    def_at[v] = def_at[v] == -1 && clean ? i : -2;
+  }
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    const int ub = cfg->instr_to_block[i];
+    IROperand ops[4];
+    int nops = 0;
+    if (irop_config[q->op].has_dest)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      /* A store through the VAR, a post-increment base, or any dest that is
+       * not the VAR's own definition counts as a read here. */
+      if (DD_VAR(d) >= 0 && def_at[DD_VAR(d)] != i)
+        ops[nops++] = d;
+    }
+    if (irop_config[q->op].has_src1)
+      ops[nops++] = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2)
+      ops[nops++] = tcc_ir_op_get_src2(ir, q);
+    if (tcc_ir_op_is_mac(q->op) || q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_SELECT)
+    {
+      if (q->operand_base + 3 < (uint32_t)ir->iroperand_pool_count)
+        ops[nops++] = ir->iroperand_pool[q->operand_base + 3];
+    }
+    for (int k = 0; k < nops; k++)
+    {
+      int v = DD_VAR(ops[k]);
+      if (v < 0 || def_at[v] < 0)
+        continue;
+      const int d = def_at[v], db = cfg->instr_to_block[d];
+      int ok = ub >= 0 && db >= 0 && (db == ub ? d < i : tcc_ir_cfg_dominates(cfg, db, ub));
+      if (!ok)
+        def_at[v] = -2;
+    }
+  }
+  for (int v = 0; v < num_vars; v++)
+    if (def_at[v] >= 0)
+      SSABitset_set(info->dom_def, v);
+#undef DD_VAR
+  tcc_free(def_at);
 }
 
 /* Briggs semi-pruned SSA: classify each VAR as "global" (upward-exposed —
@@ -521,11 +667,25 @@ static uint8_t *ssa_compute_live_in(TCCIRState *ir, IRCFG *cfg,
  * defined on one arm of a branch and read after the merge is the same shape.
  * Promoting it is always safe: the phi resolver drops undef (vreg<0) operands,
  * so a path that leaves the var genuinely uninitialized is unchanged. */
+/* SRA's field VARs are promoted past the STORE-only rule only in functions
+ * where SRA made at most this many: promoting all 2-4 thousand of Zig's
+ * main_buildOutputType turned a 141 KB function into 206 KB of spills.
+ * Measured on zig.c: 1000 -> -30 KB, 2000 -> -33 KB, 4000 -> +32 KB. */
+TCC_DBG_ENV_INT(ssa_prom_sra_max, "TCC_SSA_PROM_SRA_MAX", 2000)
+
 static int ssa_var_promotable(const SSAVarInfo *info, IRCFG *cfg, int nb, int v,
                               int single_block)
 {
   if (SSABitset_test(info->addrtaken, v))
     return 0;
+  /* One definition that dominates every read: no phi, no copy (dom_def). */
+  if (info->prom_domdef && SSABitset_test(info->dom_def, v) && !SSABitset_test(info->off_mixed, v))
+    return 1;
+  /* SRA's field VARs are defined as values (`&V <- x`); left in memory such a
+   * definition writes nothing (zig.c: an error code built in one block of a
+   * 3000-object function, past the SRA exemption's cap, read back as 0). */
+  if (SSABitset_test(info->value_def, v))
+    return 1;
   /* Block-local (non-global) var: no value ever crosses a CFG edge, so it is
    * renameable with no phis at all — including the single-block-def shape
    * rejected below, which otherwise stays a memory-resident VAR. */
@@ -541,9 +701,23 @@ static int ssa_var_promotable(const SSAVarInfo *info, IRCFG *cfg, int nb, int v,
    * loop-15 +12 insns / +74 cycles, bug_switch_in_loop +122 cycles).  Vars that
    * mix ASSIGN and STORE defs — the shape this whole path exists for — keep
    * being promoted. */
-  if (!SSABitset_test(info->nonstore_def, v))
+  /* SRA's field VARs are exempt: SRA saw every access to the object they
+   * replace, so they are plain scalars whose slot STOREs are all their defs --
+   * not the loop-carried source variables the rule's cycles cost is about.
+   * Promoted, the value passes see through them (zig.c -33 KB). */
+  if (!SSABitset_test(info->nonstore_def, v) &&
+      !(info->prom_sra && v >= info->sra_lo && v < info->sra_hi &&
+        info->sra_hi - info->sra_lo <= ssa_prom_sra_max() && !SSABitset_test(info->off_mixed, v)))
     return 0;
   if (SSABitset_test(info->multi_block_def, v))
+    return 1;
+  /* A VAR defined only in the entry block, which nothing jumps back to,
+   * needs no phi: the entry runs once and dominates every block.  Renamed, the
+   * value passes see through it (zig.c -61 KB).  NOT "its def block has an
+   * empty dominance frontier": the frontier under-reports on the un-rotated
+   * loop shape, and promoting on it dropped a value (gcc-torture pr78675). */
+  if (info->prom_single && !SSABitset_test(info->def_outside_entry, v) && cfg->blocks[0].num_preds == 0 &&
+      !SSABitset_test(info->off_mixed, v))
     return 1;
   /* Single-block-def: promote iff a phi would actually be placed, i.e. some
    * def-block has a non-empty dominance frontier. */
@@ -555,6 +729,19 @@ static int ssa_var_promotable(const SSAVarInfo *info, IRCFG *cfg, int nb, int v,
   return 0;
 }
 
+/* TCC_SSA_PROM_DBG: one line per VAR the promoter refuses, with the reason and
+ * whether SRA made it. */
+TCC_DBG_ENV_FLAG(ssa_prom_dbg, "TCC_SSA_PROM_DBG")
+
+static const char *ssa_refuse_reason(const SSAVarInfo *info, IRCFG *cfg, int nb, int v)
+{
+  if (SSABitset_test(info->addrtaken, v))
+    return "addrtaken";
+  if (!SSABitset_test(info->nonstore_def, v))
+    return "store-only-global";
+  return "single-def-no-df";
+}
+
 static uint8_t *ssa_build_promotable(const SSAVarInfo *info, IRCFG *cfg, int nb,
                                      int *out_count)
 {
@@ -564,6 +751,16 @@ static uint8_t *ssa_build_promotable(const SSAVarInfo *info, IRCFG *cfg, int nb,
   for (int v = 0; v < num_vars; v++) {
     if (ssa_var_promotable(info, cfg, nb, v, single_block))
       count++;
+    else
+      TCC_DBG_BLOCK(ssa_prom_dbg)
+      {
+        extern const char *funcname;
+        int has_def = 0;
+        for (int b = 0; b < info->block_bitset_bytes && !has_def; b++)
+          has_def = info->def_blocks[v * info->block_bitset_bytes + b] != 0;
+        fprintf(stderr, "[PROM] %s v=%d sra=%d defs=%d %s\n", funcname, v,
+                v >= info->sra_lo && v < info->sra_hi, has_def, ssa_refuse_reason(info, cfg, nb, v));
+      }
   }
   *out_count = count;
   if (count == 0)
@@ -654,13 +851,21 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
   dynamic_bitset(SSABitset) multi_block_def = {0};
   dynamic_bitset(SSABitset) global = {0};
   dynamic_bitset(SSABitset) nonstore_def = {0};
+  dynamic_bitset(SSABitset) value_def = {0};
+  dynamic_bitset(SSABitset) off_mixed = {0};
+  dynamic_bitset(SSABitset) def_outside_entry = {0};
+  dynamic_bitset(SSABitset) dom_def = {0};
 
   if (vector_resize(&def_blocks_owner, (size_t)num_vars * bitset_bytes) != 0 ||
       vector_resize(&var_btype_owner, num_vars) != 0 ||
       SSABitset_init(&addrtaken, num_vars) != 0 ||
       SSABitset_init(&multi_block_def, num_vars) != 0 ||
       SSABitset_init(&global, num_vars) != 0 ||
-      SSABitset_init(&nonstore_def, num_vars) != 0)
+      SSABitset_init(&nonstore_def, num_vars) != 0 ||
+      SSABitset_init(&value_def, num_vars) != 0 ||
+      SSABitset_init(&off_mixed, num_vars) != 0 ||
+      SSABitset_init(&def_outside_entry, num_vars) != 0 ||
+      SSABitset_init(&dom_def, num_vars) != 0)
     return NULL;
 
   SSAVarInfo info = {
@@ -669,25 +874,34 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
     .multi_block_def = &multi_block_def,
     .global = &global,
     .nonstore_def = &nonstore_def,
+    .value_def = &value_def,
+    .off_mixed = &off_mixed,
+    .def_outside_entry = &def_outside_entry,
+    .dom_def = &dom_def,
+    .sra_lo = ir->sra_var_lo,
+    .sra_hi = ir->sra_var_hi,
+    .prom_sra = !tcc_ir_opt_pass_disabled("ssa_prom_sra"),
+    .prom_single = !tcc_ir_opt_pass_disabled("ssa_prom_single"),
+    .prom_domdef = !tcc_ir_opt_pass_disabled("ssa_prom_domdef"),
     .var_btype = vector_data(&var_btype_owner),
     .block_bitset_bytes = bitset_bytes,
     .num_vars = num_vars,
   };
   /* Read widths first: whether a slot STORE counts as a fresh definition is a
    * per-var property the def scan below needs, and the upward-exposure scan
-   * does not depend on def_blocks.  Fold the decision into one byte per var —
-   * a 4-byte write must cover every read of the var (the 0xFF non-scalar
-   * sentinel and 64-bit reads fail this). */
+   * does not depend on def_blocks.  One byte per var, its widest read: a
+   * STORE at least that wide covers every read (the 0xFF non-scalar sentinel
+   * fails every width). */
   uint8_t *var_max_read = tcc_mallocz(num_vars);
   ssa_scan_var_global(ir, cfg, &info, var_max_read);
-  for (int v = 0; v < num_vars; v++)
-    var_max_read[v] = (var_max_read[v] <= 4) ? 1 : 0;
   info.store_def_ok = var_max_read;
 
   if (ssa_scan_var_defs(ir, cfg, &info) != 0) {
     tcc_free(var_max_read);
     return NULL;
   }
+  if (info.prom_domdef)
+    ssa_scan_dominating_defs(ir, cfg, &info);
 
   int promotable_count;
   uint8_t *is_promotable = ssa_build_promotable(&info, cfg, nb, &promotable_count);
@@ -748,10 +962,17 @@ IRSSAState *tcc_ir_ssa_construct(TCCIRState *ir, IRCFG *cfg)
  * ============================================================================ */
 
 typedef vector(int32_t) VRegStack;
+/* Undo log for the dominator-tree walk: the variable index of every push, in
+ * order.  A frame remembers only the log length on entry and pops exactly the
+ * pushes made since then on exit -- the same stack contents as snapshotting
+ * every variable's depth per frame, without the nb x num_vars depth table
+ * (8 MB for one function of tinycc's own ir/codegen.c). */
+typedef vector(int) VRegPushLog;
 
-static void vstack_push(VRegStack *s, int32_t v)
+static void vstack_push(VRegStack *stacks, VRegPushLog *log, int pos, int32_t v)
 {
-  vector_push_back(s, v);
+  vector_push_back(&stacks[pos], v);
+  vector_push_back(log, pos);
 }
 
 static int32_t vstack_top(VRegStack *s)
@@ -790,7 +1011,8 @@ static int ssa_rename_use(IROperand *op, int num_vars, const uint8_t *is_promota
   return deref_through_value ? 2 : 1;
 }
 
-static void ssa_rename_phi_defs(IRSSAState *ssa, int b, VRegStack *stacks, int num_vars)
+static void ssa_rename_phi_defs(IRSSAState *ssa, int b, VRegStack *stacks, VRegPushLog *log,
+                                int num_vars)
 {
   for (IRPhiNode *phi = ssa->block_phis[b]; phi; phi = phi->next) {
     int32_t orig = phi->orig_vreg;
@@ -798,12 +1020,13 @@ static void ssa_rename_phi_defs(IRSSAState *ssa, int b, VRegStack *stacks, int n
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(orig);
     if (pos < num_vars && raw_bitset_test(ssa->is_promotable, pos))
-      vstack_push(&stacks[pos], phi->dest_vreg);
+      vstack_push(stacks, log, pos, phi->dest_vreg);
   }
 }
 
 static void ssa_rename_block_instrs(TCCIRState *ir, IRSSAState *ssa, IRBasicBlock *bb,
-                                    VRegStack *stacks, int num_vars, int *next_temp_pos)
+                                    VRegStack *stacks, VRegPushLog *log, int num_vars,
+                                    int *next_temp_pos)
 {
   for (int i = bb->start_idx; i < bb->end_idx; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -844,8 +1067,14 @@ static void ssa_rename_block_instrs(TCCIRState *ir, IRSSAState *ssa, IRBasicBloc
      * allocator's def scan. */
     if (q->op == TCCIR_OP_STORE) {
       int pos = ssa_store_slot_def_pos(ir, q, ssa->var_store_def_ok, num_vars);
-      if (pos >= 0 && raw_bitset_test(ssa->is_promotable, pos))
+      if (pos >= 0 && raw_bitset_test(ssa->is_promotable, pos)) {
         q->op = TCCIR_OP_ASSIGN; /* falls through to fresh-def dest handling */
+        IROperand d = tcc_ir_op_get_dest(ir, q), s = tcc_ir_op_get_src1(ir, q);
+        if (d.btype == IROP_BTYPE_INT8 || d.btype == IROP_BTYPE_INT16) {
+          s.u.imm32 = ssa_narrow_store_imm(d, s.u.imm32);
+          tcc_ir_op_set_src1(ir, q, s);
+        }
+      }
     }
 
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
@@ -864,7 +1093,7 @@ static void ssa_rename_block_instrs(TCCIRState *ir, IRSSAState *ssa, IRBasicBloc
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos < num_vars && raw_bitset_test(ssa->is_promotable, pos)) {
           int32_t new_name = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, (*next_temp_pos)++);
-          vstack_push(&stacks[pos], new_name);
+          vstack_push(stacks, log, pos, new_name);
           irop_set_vreg(&d, new_name);
           d.tag = IROP_TAG_VREG;
           d.is_lval = 0;
@@ -923,36 +1152,32 @@ void tcc_ir_ssa_rename(TCCIRState *ir, IRSSAState *ssa)
   for (int v = 0; v < num_vars; v++) {
     if (raw_bitset_test(ssa->is_promotable, v)) {
       int32_t init_name = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, next_temp_pos++);
-      vstack_push(&stacks[v], init_name);
+      vector_push_back(&stacks[v], init_name); /* below every frame: never popped */
     }
   }
 
-  typedef struct { int block; int child_idx; } DomFrame;
+  typedef struct { int block; int child_idx; int log_mark; } DomFrame;
   scoped_vector(DomFrame) dom_stack_owner = {0};
-  scoped_vector(int) saved_depths_owner = {0};
-  if (vector_resize(&dom_stack_owner, nb) != 0 ||
-      vector_resize(&saved_depths_owner, (size_t)nb * num_vars) != 0) {
+  __attribute__((cleanup(tcc_vector_cleanup_storage))) VRegPushLog push_log_owner = {0};
+  if (vector_resize(&dom_stack_owner, nb) != 0) {
     for (int v = 0; v < num_vars; v++)
       vector_cleanup(&stacks[v]);
     return;
   }
   DomFrame *dom_stack = vector_data(&dom_stack_owner);
-  int *saved_depths = vector_data(&saved_depths_owner);
+  VRegPushLog *push_log = &push_log_owner;
   int dsp = 0;
 
-  dom_stack[dsp++] = (DomFrame){0, 0};
+  dom_stack[dsp++] = (DomFrame){0, 0, 0};
 
   while (dsp > 0) {
     DomFrame *top = &dom_stack[dsp - 1];
     int b = top->block;
 
     if (top->child_idx == 0) {
-      int *frame_depths = &saved_depths[(dsp - 1) * num_vars];
-      for (int v = 0; v < num_vars; v++)
-        frame_depths[v] = stacks[v].size;
-
-      ssa_rename_phi_defs(ssa, b, stacks, num_vars);
-      ssa_rename_block_instrs(ir, ssa, &cfg->blocks[b], stacks, num_vars, &next_temp_pos);
+      top->log_mark = (int)push_log->size;
+      ssa_rename_phi_defs(ssa, b, stacks, push_log, num_vars);
+      ssa_rename_block_instrs(ir, ssa, &cfg->blocks[b], stacks, push_log, num_vars, &next_temp_pos);
       ssa_fill_successor_phis(ssa, cfg, b, stacks, num_vars);
     }
 
@@ -960,12 +1185,11 @@ void tcc_ir_ssa_rename(TCCIRState *ir, IRSSAState *ssa)
     if (top->child_idx < bb->num_dom_children) {
       int child = bb->dom_children[top->child_idx];
       top->child_idx++;
-      dom_stack[dsp++] = (DomFrame){child, 0};
+      dom_stack[dsp++] = (DomFrame){child, 0, 0};
     }
     else {
-      int *frame_depths = &saved_depths[(dsp - 1) * num_vars];
-      for (int v = 0; v < num_vars; v++)
-        stacks[v].size = frame_depths[v];
+      while ((int)push_log->size > top->log_mark)
+        stacks[push_log->data[--push_log->size]].size--;
       dsp--;
     }
   }

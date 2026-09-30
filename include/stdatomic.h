@@ -102,12 +102,10 @@ typedef struct {
 #define atomic_store(object, desired)                                     \
      atomic_store_explicit (object, desired, __ATOMIC_SEQ_CST)
 
+/* The value-returning builtin: `__atomic_load (ptr, &tmp, order)` would take
+ * the address of a local, which keeps it in memory for good. */
 #define atomic_load_explicit(object, order)                               \
-    ({ __typeof__ (object) ptr = (object);                                \
-       __typeof__ (*ptr) tmp;                                             \
-       __atomic_load (ptr, &tmp, (order));                                \
-       tmp;                                                               \
-    })
+    __atomic_load_n ((object), (order))
 #define atomic_load(object) atomic_load_explicit (object, __ATOMIC_SEQ_CST)
 
 #define atomic_exchange_explicit(object, desired, order)                  \

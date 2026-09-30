@@ -1,0 +1,5 @@
+not0=1
+not5=0
+inl not0=1
+inl not2=0
+while-shape t=1

@@ -301,3 +301,11 @@ int normalized_PATHCMP(const char *a, const char *b)
 {
   return strcmp(a, b);
 }
+
+/* __has_attribute asks the attribute parser (frontend/gen/decl/attribute.c),
+   which is not linked here; no test depends on its answer. */
+int tcc_attribute_supported(int t)
+{
+  (void)t;
+  return 0;
+}

@@ -281,6 +281,11 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
       continue;
     if (irop_get_vreg(ps) != src_vr)
       continue;
+    /* A vreg-backed slot names memory by vreg AND offset: two fields of one
+     * stack-resident struct parameter share the vreg. */
+    if (ps.tag == IROP_TAG_STACKOFF &&
+        (irop_get_stack_offset(ps) != irop_get_stack_offset(src) || ps.btype != src.btype))
+      continue;
     IROperand pd = tcc_ir_op_get_dest(ir, pq);
     int32_t pd_vr = irop_get_vreg(pd);
     if (pd_vr < 0 || TCCIR_DECODE_VREG_TYPE(pd_vr) != TCCIR_VREG_TYPE_TEMP)
@@ -292,11 +297,19 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
   if (prior_dest_vr < 0)
     return 0;
 
+  /* A plain register read of the TEMP: a STACKOFF source's tag and offset must
+   * not survive, or the offset (V's frontend watermark) is taken for a spot in
+   * the TEMP's own spill slot and sizes the frame. */
   IROperand new_src = src;
   irop_set_vreg(&new_src, prior_dest_vr);
+  new_src.tag = IROP_TAG_VREG;
   new_src.is_lval = 0;
   new_src.is_local = 0;
   new_src.is_llocal = 0;
+  if (new_src.btype == IROP_BTYPE_STRUCT)
+    new_src.u.s.aux_data = 0;
+  else
+    new_src.u.imm32 = 0;
 
   /* Move the use edge from src_vr to prior_dest_vr. */
   IRSSAVregInfo *svi = ssa_opt_vinfo(ctx, src_vr);
@@ -670,8 +683,39 @@ static int ssa_gen_cprop_load_any(IRSSAOptCtx *ctx, int idx)
   return opt_dsl_dispatch_cprop_load_redundant(ctx, idx);
 }
 
+/* STORE dest=src into a TEMP register (not through it), both TEMPs of one
+ * width: ssa_rename spells a renamed VAR assignment `V3 <- V2` this way, which
+ * is how an inlined helper's result reaches its caller.  With one def of dest
+ * it is a copy like the ASSIGN above; forward src into dest's uses, else the
+ * copy reaches the allocator and becomes a register move. */
+static int ssa_gen_cprop_store_copy(IRSSAOptCtx *ctx, int idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  IROperand src = tcc_ir_op_get_src1(ir, q);
+  if (dest.tag != IROP_TAG_VREG || src.tag != IROP_TAG_VREG)
+    return 0;
+  if (dest.is_lval || dest.is_llocal || dest.is_local || src.is_lval || src.is_llocal || src.is_local)
+    return 0;
+  if (irop_get_btype(dest) != irop_get_btype(src) || irop_is_64bit(dest) != irop_is_64bit(src))
+    return 0;
+  int32_t dest_vr = irop_get_vreg(dest), src_vr = irop_get_vreg(src);
+  if (dest_vr < 0 || src_vr < 0 || dest_vr == src_vr || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP ||
+      TCCIR_DECODE_VREG_TYPE(src_vr) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, dest_vr), *svi = ssa_opt_vinfo(ctx, src_vr);
+  if (!vi || ssa_opt_def_total(vi) > 1 || ssa_opt_def_total(svi) > 1)
+    return 0;
+  for (int u = 0; u < vi->use_count; u++)
+    if (vi->uses[u].kind == SSA_USE_PHI)
+      return 0;
+  return ssa_opt_replace_all_uses(ctx, dest_vr, src_vr) > 0 ? 1 : 0;
+}
+
 static const IRSSAOptGen cprop_gens[] = {
   { TCCIR_OP_ASSIGN, ssa_gen_cprop_assign_any, "cprop_assign_any" },
+  { TCCIR_OP_STORE,  ssa_gen_cprop_store_copy, "cprop_store_copy" },
   { TCCIR_OP_LOAD,   ssa_gen_cprop_load_any,   "cprop_load_any"   },
 };
 

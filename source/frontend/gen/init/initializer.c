@@ -41,6 +41,8 @@ void skip_or_save_block(TokenString **str)
     *str = tok_str_alloc();
   pp_pragma_capture = str ? *str : saved_capture;
 
+  int recorded_len = 0;
+
   while (1)
   {
     int t = tok;
@@ -57,7 +59,10 @@ void skip_or_save_block(TokenString **str)
         break;
     }
     if (str)
+    {
       tok_str_add_tok(*str);
+      recorded_len = (*str)->len;
+    }
     next();
     if (t == '{' || t == '(' || t == '[')
     {
@@ -72,7 +77,21 @@ void skip_or_save_block(TokenString **str)
   }
   pp_pragma_capture = saved_capture;
   if (str)
+  {
+    /* The lookahead read after the last recorded token (the token after a
+       body's closing brace, or the terminator) ran any #pragma pack in
+       between with capture still on.  Those directives are outside the saved
+       tokens: apply them now, in file order, and drop them from the stream.
+       Left in, `f(){...} #pragma pack(1) struct S {...};` laid S out unpacked
+       and replayed pack(1) whenever f's body was. */
+    if ((*str)->len > recorded_len)
+    {
+      const int *buf = tok_str_buf(*str);
+      pp_apply_pack_replays(tcc_state, buf + recorded_len, buf + (*str)->len);
+      (*str)->len = recorded_len;
+    }
     tok_str_add(*str, TOK_EOF);
+  }
 }
 
 #define EXPR_CONST 1
@@ -108,7 +127,7 @@ void parse_init_elem(int expr_type)
 #if 1
 void init_assert(init_params *p, int offset)
 {
-  if (p->sec ? !NODATA_WANTED && offset > p->sec->data_offset : !nocode_wanted && offset > p->local_offset)
+  if (p->sec ? !NOSTATIC_WANTED && offset > p->sec->data_offset : !nocode_wanted && offset > p->local_offset)
     tcc_internal_error("initializer overflow");
 }
 #else
@@ -512,7 +531,7 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
         !((vtop->r & VT_CONST) && vtop->sym->v >= SYM_FIRST_ANOM))
       tcc_error("initializer element is not computable at load time");
 
-    if (NODATA_WANTED)
+    if (NOSTATIC_WANTED)
     {
       vtop--;
       print_vstack("init_putv");
@@ -711,17 +730,17 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
     /* Capture scalar constant into the tracked sym's const_init_data
      * before vstore (which pops the value). Buffer was zeroed at
      * allocation time, so zero values can be silently dropped. */
-    if (p->const_init_sym && p->const_init_sym->const_init_valid)
+    if (p->const_init_sym && p->const_init_sym->facts->const_init_valid)
     {
       int rel_off = (int)c - p->const_init_base;
       int bt = type->t & VT_BTYPE;
-      if (rel_off >= 0 && rel_off + size <= p->const_init_sym->const_init_size && !(type->t & VT_BITFIELD) &&
+      if (rel_off >= 0 && rel_off + size <= p->const_init_sym->facts->const_init_size && !(type->t & VT_BITFIELD) &&
           bt != VT_STRUCT)
       {
         if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
         {
           uint64_t cval = (uint64_t)vtop->c.i;
-          unsigned char *dst = p->const_init_sym->const_init_data + rel_off;
+          unsigned char *dst = p->const_init_sym->facts->const_init_data + rel_off;
           switch (size)
           {
           case 1:
@@ -737,13 +756,13 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
             write64le(dst, cval);
             break;
           default:
-            p->const_init_sym->const_init_valid = 0;
+            p->const_init_sym->facts->const_init_valid = 0;
             break;
           }
         }
         else
         {
-          p->const_init_sym->const_init_valid = 0;
+          p->const_init_sym->facts->const_init_valid = 0;
         }
       }
     }

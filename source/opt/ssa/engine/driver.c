@@ -124,6 +124,8 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
      * belongs to the heavy tier alongside unrolling/LICM/IV-strength-red. */
     SSA_RUN("ssa:dead_loop",
             (tcc_state && tcc_state->optimize >= 2) ? ssa_opt_dead_loop(ctx) : 0);
+    SSA_RUN("ssa:stack_deref_fold",
+            (tcc_state && tcc_state->optimize > 0) ? ssa_opt_stack_deref_fold(ctx) : 0);
     SSA_RUN("ssa:dce", ssa_opt_dce(ctx));
 
     if (target_gens && target_gen_count > 0) {

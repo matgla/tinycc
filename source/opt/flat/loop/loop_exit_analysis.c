@@ -227,9 +227,11 @@ int compute_trip_count(int init_val, int limit, int step, int cond_token)
 
 /* Collect body instructions to clone (excluding loop control flow and IV update). */
 int collect_body_instructions(TCCIRState *ir, IRLoop *loop, int iv_vreg, int cmp_idx, int jmpif_idx,
-                                     int iv_def_idx, int *body_indices, int max_body)
+                                     int iv_def_idx, int *body_indices, int max_body, int *out_has_memory)
 {
   int count = 0;
+  if (out_has_memory)
+    *out_has_memory = 0;
   /* Scan the full [start..end]; truncating the body would unroll wrong code. */
   for (int i = loop->start_idx; i <= loop->end_idx; i++)
   {
@@ -250,13 +252,9 @@ int collect_body_instructions(TCCIRState *ir, IRLoop *loop, int iv_vreg, int cmp
     if (i == iv_def_idx)
       continue;
 
-    /* Skip the ASSIGN saving old IV for post-increment (T = Viv) */
-    if (q->op == TCCIR_OP_ASSIGN && i == iv_def_idx - 1)
-    {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      if (irop_get_vreg(src1) == iv_vreg)
-        continue;
-    }
+    /* The ASSIGN saving the old IV for a post-increment (T = Viv) stays in
+     * the body: every copy makes it `T = #k`, and a body that reads T -- the
+     * `buf[i++] = arg` store of 990525-1 -- needs it (dead copies go to DCE). */
 
     /* Reject bodies with internal branches */
     if (q->op == TCCIR_OP_JUMPIF)
@@ -279,23 +277,43 @@ int collect_body_instructions(TCCIRState *ir, IRLoop *loop, int iv_vreg, int cmp
       return -1;
     }
 
-    /* Reject memory ops: cloned-body aliasing isn't modeled, so keep unroll register-only. */
-    if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_STORE ||
-        q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
-        q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC ||
-        q->op == TCCIR_OP_BLOCK_COPY ||
-        (irop_config[q->op].has_src1 && ir_xform_operand_reads_memory(tcc_ir_op_get_src1(ir, q))) ||
-        (irop_config[q->op].has_src2 && ir_xform_operand_reads_memory(tcc_ir_op_get_src2(ir, q))) ||
-        (q->op == TCCIR_OP_MLA && ir_xform_operand_reads_memory(tcc_ir_op_get_accum(ir, q))))
+    /* Plain loads and stores (and their indexed forms) clone in order, so the
+     * unrolled body touches memory exactly as the loop did; the caller counts
+     * them against a smaller size cap.  Post-increment forms update their
+     * pointer as a side effect and a BLOCK_COPY's size may be a whole object:
+     * those stay loops. */
+    if (q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC || q->op == TCCIR_OP_BLOCK_COPY)
     {
       LOG_LOOP_OPT("collect_body: REJECTED at [%d] memory access op=%d", i, q->op);
       return -1;
     }
+    if (out_has_memory &&
+        (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_LOAD_INDEXED ||
+         q->op == TCCIR_OP_STORE_INDEXED ||
+         (irop_config[q->op].has_src1 && ir_xform_operand_reads_memory(tcc_ir_op_get_src1(ir, q))) ||
+         (irop_config[q->op].has_src2 && ir_xform_operand_reads_memory(tcc_ir_op_get_src2(ir, q))) ||
+         (tcc_ir_op_is_mac(q->op) && ir_xform_operand_reads_memory(tcc_ir_op_get_accum(ir, q)))))
+      *out_has_memory = 1;
 
-    /* Reject 4-operand ops: write_instr_at_nop copies only 3 slots, dropping the 4th. */
-    if (q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
-        q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC ||
-        q->op == TCCIR_OP_MLA || q->op == TCCIR_OP_SELECT)
+    /* `V <- mem [STORE]` (an inlined parameter bound to a load) stays one
+     * in-place-renamed multi-def TEMP in SSA (ssa_store_slot_def_pos), which
+     * is sound for the single copy a loop body has, not for N copies of it in
+     * straight-line code: later SSA folds took every copy's value from the
+     * first (fuzz 308/191/212 family). */
+    if (q->op == TCCIR_OP_STORE)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      int32_t dvr = irop_get_vreg(d);
+      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR && !d.is_llocal &&
+          ir_xform_operand_reads_memory(tcc_ir_op_get_src1(ir, q)))
+      {
+        LOG_LOOP_OPT("collect_body: REJECTED at [%d] memory load bound to a VAR by STORE", i);
+        return -1;
+      }
+    }
+
+    /* A SELECT's 4th slot is its condition token; the others the caller copies. */
+    if (q->op == TCCIR_OP_SELECT)
     {
       LOG_LOOP_OPT("collect_body: REJECTED at [%d] 4-operand op=%d", i, q->op);
       return -1;

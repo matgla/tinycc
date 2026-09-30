@@ -60,6 +60,8 @@ int ir_opt_nonvreg_expr_equal(TCCIRState *ir, IROperand a, IROperand b)
 static int ir_opt_setif_cmp_operand_equal(TCCIRState *ir, IROperand a, IROperand b,
                                           int a_use_idx, int b_use_idx, int depth)
 {
+  if (tcc_ir_operand_names_volatile_var(ir, a) || tcc_ir_operand_names_volatile_var(ir, b))
+    return 0;
   if (ir_opt_pure_expr_equal_impl(ir, a, a_use_idx, b, b_use_idx, depth + 1))
     return 1;
 
@@ -175,6 +177,10 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
   qb = &ir->compact_instructions[b_def_idx];
 
   if (qa->op != qb->op)
+    return 0;
+
+  /* A volatile access is not a pure definition: each one is its own read. */
+  if (tcc_ir_instr_access_is_volatile(ir, qa) || tcc_ir_instr_access_is_volatile(ir, qb))
     return 0;
 
   /* Without this gate a STORE or call between two structurally-identical `*p` loads would fold a stale read. */
@@ -370,6 +376,12 @@ static int ir_opt_pure_expr_equal_impl(TCCIRState *ir, IROperand a, int a_use_id
       return 0;
     return irop_get_imm64_ex(ir, a) == irop_get_imm64_ex(ir, b);
   }
+
+  /* Two reads of a volatile variable -- even the same one -- may differ, and
+   * following its definition would equate it with its initialiser: `volatile
+   * int a = K, b = K; (a < 0) != (b < 0)` folded to 0 and dropped b's read. */
+  if (tcc_ir_operand_names_volatile_var(ir, a) || tcc_ir_operand_names_volatile_var(ir, b))
+    return 0;
 
   a_tag = irop_get_tag(a);
   b_tag = irop_get_tag(b);

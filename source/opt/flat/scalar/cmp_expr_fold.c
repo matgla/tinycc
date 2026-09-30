@@ -380,6 +380,16 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
       }
       else
       {
+        /* Skip address-taken VARs, as the mixed case above does: a store
+         * through a pointer to one -- or a call handed its address -- gives it
+         * a new value without an IR def, so the single def the counts see is
+         * just the initialiser.  `regoff_t so = 0, eo = 0; find(.., &so, &eo);
+         * if (so == eo)` folded to true here and toybox awk read its whole
+         * input as one record. */
+        IRLiveInterval *iv1 = tcc_ir_get_live_interval(ir, vr1);
+        IRLiveInterval *iv2 = tcc_ir_get_live_interval(ir, vr2);
+        if ((iv1 && iv1->addrtaken) || (iv2 && iv2->addrtaken))
+          continue;
         def1 = tcc_ir_find_defining_instruction(ir, vr1, i);
         def2 = tcc_ir_find_defining_instruction(ir, vr2, i);
         if (def1 < 0 || def2 < 0 || def1 == def2)

@@ -204,8 +204,14 @@ static int zh_use_ignores_half(TCCIRState *ir, IRQuadCompact *u, int32_t vreg, i
   IROperand s2 = tcc_ir_op_get_src2(ir, u);
   int m1 = (irop_get_vreg(s1) == vreg) && irop_needs_pair(s1);
   int m2 = (irop_get_vreg(s2) == vreg) && irop_needs_pair(s2);
+  /* A word-typed operand naming the pair reads its LOW register (machine
+   * operands take their width from the operand, not the vreg). */
+  int n1 = (irop_get_vreg(s1) == vreg) && !irop_needs_pair(s1) && !s1.is_lval;
+  int n2 = (irop_get_vreg(s2) == vreg) && !irop_needs_pair(s2) && !s2.is_lval;
+  if ((n1 || n2) && half == ZK_LO)
+    return 0;
   if (!m1 && !m2)
-    return 1; /* named only in a narrow slot, or not at all: reads no half */
+    return 1; /* named only in a narrow slot (low word, handled above), or not at all */
 
   /* Every shortcut below lives in the 64-bit pair lowering.  A narrow
    * destination sends the same opcode to thumb_emit_data_processing_mop32,
@@ -336,6 +342,25 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
       st.ok_t[p] = (uint8_t)(cnt_t[p] == 1);
     for (int p = 0; p <= max_v; p++)
       st.ok_v[p] = (uint8_t)(cnt_v[p] == 1);
+    /* A value in a graph-coalesced class shares its register with the other
+     * members, and the copies between them are gone: their defs write it and
+     * their uses read it under other names.  Its halves are neither known from
+     * its own def nor dead for want of readers of its own name -- expr_preprocess
+     * in tccpp.c lost `c = 0` (an int64 whose only reader, the phi copy into
+     * `c`, had been coalesced away), so `#if defined X` was true for every X
+     * in the native tcc. */
+    for (int k = 0; k < ir->ls.next_interval_index; k++)
+    {
+      const LSLiveInterval *li = &ir->ls.intervals[k];
+      if (!li->co_member)
+        continue;
+      int32_t vr = (int32_t)li->vreg;
+      int t = TCCIR_DECODE_VREG_TYPE(vr), p = TCCIR_DECODE_VREG_POSITION(vr);
+      if (t == TCCIR_VREG_TYPE_TEMP && p >= 0 && p <= max_t)
+        st.ok_t[p] = 0;
+      else if (t == TCCIR_VREG_TYPE_VAR && p >= 0 && p <= max_v)
+        st.ok_v[p] = 0;
+    }
     /* zh_var_addr_taken walks the whole body, so ask it once per local. */
     for (int i = 0; i < n && max_v >= 0; i++)
     {
@@ -471,6 +496,12 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
         IRQuadCompact *u = &ir->compact_instructions[j];
         if (u->op == TCCIR_OP_NOP)
           continue;
+        /* An accumulator (MLA's UMLAL form, UMAAL) is read whole: both words. */
+        if (tcc_ir_op_is_mac(u->op) && irop_get_vreg(tcc_ir_op_get_accum(ir, u)) == dv)
+        {
+          all_ignore = 0;
+          break;
+        }
         if (irop_get_vreg(tcc_ir_op_get_src1(ir, u)) != dv &&
             irop_get_vreg(tcc_ir_op_get_src2(ir, u)) != dv)
           continue;

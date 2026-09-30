@@ -104,6 +104,9 @@ OPT_GEN_SSA(reassoc_bin, 0) {
     and_not(psrc1.is_local);
     and_not(psrc1.is_llocal);
     and_not(tcc_ir_barrel_shift_at(ir, &ir->compact_instructions[pidx]));
+    /* A signed ADD/SUB is taken not to overflow; one that absorbs an unsigned,
+     * wrapping, inner ADD/SUB is not (pr55137, see flat add_reassoc). */
+    and_not((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && pdest.is_unsigned && !dest.is_unsigned);
     and(reassoc_combine(q->op, pop, (int32_t)psrc2.u.imm32,
                         (int32_t)src2.u.imm32, &new_op, &combined)));
   RETIRE_PAIR(psrc1, 0);

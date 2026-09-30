@@ -68,6 +68,7 @@ int tcc_load_yaff(TCCState *s1, int fd, const char *filename, int level)
   return -1;
 }
 void tcc_yaff_libs_free(TCCState *s1) { (void)s1; }
+void tcc_yaff_import_set_free(TCCState *s1) { (void)s1; }
 int tcc_assemble(TCCState *s1, int do_preprocess) { (void)s1; (void)do_preprocess; return -1; }
 void ld_script_cleanup(LDScript *ld) { (void)ld; }
 void arm_deinit(struct TCCState *s) { (void)s; }

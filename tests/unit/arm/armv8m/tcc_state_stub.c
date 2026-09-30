@@ -33,6 +33,50 @@
 static TCCState ut_tcc_state_storage;
 TCCState *tcc_state = &ut_tcc_state_storage;
 
+/* Symbols of TUs these binaries do not link, reached from ones they do:
+ * tccyaff.c's import set reads archives through tccelf.c, sret_nrvo.c
+ * reads tccgen's current-function type, and the thumb backend names
+ * helper symbols through strlit_pool.c.  Weak, so a binary that links the
+ * real TU (build_tccelf's tccelf.c) keeps it. */
+__attribute__((weak)) CType func_vt;
+__attribute__((weak)) int func_vc;
+__attribute__((weak)) ssize_t full_read(int fd, void *buf, size_t count)
+{
+  (void)fd; (void)buf; (void)count;
+  return -1;
+}
+__attribute__((weak)) int tcc_archive_index_load(TCCState *s1, const char *path)
+{
+  (void)s1; (void)path;
+  return -1;
+}
+__attribute__((weak)) int tcc_archive_index_has(TCCState *s1, const char *path, const char *name)
+{
+  (void)s1; (void)path; (void)name;
+  return 0;
+}
+__attribute__((weak)) int tccelf_arm_fp_lib_is_shared(TCCState *s1)
+{
+  (void)s1;
+  return 0;
+}
+__attribute__((weak)) const char *tccelf_get_fp_lib_name(TCCState *s1)
+{
+  (void)s1;
+  return NULL;
+}
+__attribute__((weak)) Sym *external_helper_sym(int v)
+{
+  (void)v;
+  return NULL;
+}
+/* codegen.c's word-aligned body start (cg_word_align_start). */
+__attribute__((weak)) int func_align_pad;
+__attribute__((weak)) void gen_fill_nops(int bytes)
+{
+  (void)bytes;
+}
+
 #else /* UT_SSA_OPT_REAL — build_ssaopt (UT11) ===================== */
 /*
  *  tcc_state_stub.c - stubs for TCC state initialization

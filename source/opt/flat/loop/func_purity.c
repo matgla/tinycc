@@ -279,6 +279,11 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
       LOG_LICM("PURITY: Function '%s' is IMPURE: VLA allocation", func_name);
       return TCC_FUNC_PURITY_IMPURE;
 
+    case TCCIR_OP_RETURN_ADDRESS:
+      /* Same arguments, different call site, different result. */
+      LOG_LICM("PURITY: Function '%s' is IMPURE: reads its return address", func_name);
+      return TCC_FUNC_PURITY_IMPURE;
+
     default:
       break;
     }

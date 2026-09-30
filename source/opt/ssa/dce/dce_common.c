@@ -13,6 +13,18 @@
 #include "ssa_opt.h"
 #include "dce_common.h"
 
+#include "opt_utils.h"
+
+int dce_instr_reads_volatile(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (tcc_ir_instr_access_is_volatile(ir, q))
+    return 1;
+  if (irop_config[q->op].has_src1 && tcc_ir_operand_names_volatile_var(ir, tcc_ir_op_get_src1(ir, q)))
+    return 1;
+  if (irop_config[q->op].has_src2 && tcc_ir_operand_names_volatile_var(ir, tcc_ir_op_get_src2(ir, q)))
+    return 1;
+  return 0;
+}
 
 int sl_temp_has_live_uses(IRSSAOptCtx *ctx, int32_t vreg)
 {

@@ -154,10 +154,10 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
         if (p->sec && size1 == 1)
         {
           init_assert(p, c + nb);
-          if (!NODATA_WANTED)
+          if (!NOSTATIC_WANTED)
             memcpy(p->sec->data + c, initstr.data, nb);
         }
-        else if (tcc_state->ir && size1 == 1 && nb >= 8 && !NODATA_WANTED)
+        else if (tcc_state->ir && size1 == 1 && nb >= 8 && !NOSTATIC_WANTED)
         {
           /* Bulk copy string literal from .rodata instead of byte-by-byte stores.
            * Matches GCC: memcpy(dest, .rodata, str_len) + memset(trailing, 0, rem) */
@@ -427,6 +427,56 @@ static int type_contains_pointer(CType *type)
    are parsed. If 'v' is zero, then a reference to the new object
    is put in the value stack. If 'has_init' is 2, a special parsing
    is done to handle string constants. */
+/* A definition's storage: the bytes its tentative declaration already took,
+ * when they fit -- same section, same size, suitably aligned.  Zig's C
+ * declares every static first and defines it further down, so without this
+ * each object is laid out twice. */
+static int tentative_storage_reuse(Sym *sym, int has_init, Section *sec, int size, int align, int *addr)
+{
+  if (!sym || !has_init || !sym->a.tentative || !sym->c)
+    return 0;
+  ElfSym *esym = elfsym(sym);
+  if (!esym || esym->st_shndx != sec->sh_num || esym->st_size != (addr_t)size || (esym->st_value & (align - 1)))
+    return 0;
+  *addr = (int)esym->st_value;
+  return 1;
+}
+
+/* The end of the TU: every definition has been seen.  A tentative definition
+ * none of them initialized is a zero-filled one (C11 6.9.2p2); if it waits in
+ * COMMON it is placed in .bss, unless a non-static object may stay common
+ * (-fcommon).  Runs before the deferred bodies are generated, so they see
+ * every object where it stays. */
+ST_FUNC void finalize_tentative_definitions(TCCState *s1)
+{
+  /* File scope, whatever the last body generated here left behind (a body
+   * ending in unreachable code leaves code, and so data, switched off). */
+  const int saved_nocode_wanted = nocode_wanted;
+  nocode_wanted = DATA_ONLY_WANTED;
+  for (int i = 0; i < s1->nb_tentative_syms; i++)
+  {
+    Sym *sym = s1->tentative_syms[i];
+    sym->a.tentative = 0;
+    ElfSym *esym = sym->c ? elfsym(sym) : NULL;
+    if (!esym || esym->st_shndx != SHN_COMMON || sym->a.tu_unused)
+      continue;
+    if (!(sym->type.t & VT_STATIC) && !s1->nocommon)
+      continue;
+    const unsigned long size = esym->st_size;
+    const int align = (int)esym->st_value;
+    put_extern_sym(sym, bss_section, section_add(bss_section, size, align), size);
+  }
+  nocode_wanted = saved_nocode_wanted;
+  free_tentative_definitions(s1);
+}
+
+ST_FUNC void free_tentative_definitions(TCCState *s1)
+{
+  tcc_free(s1->tentative_syms);
+  s1->tentative_syms = NULL;
+  s1->nb_tentative_syms = 0;
+}
+
 void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, int v, int global)
 {
   int size, align, addr;
@@ -557,7 +607,7 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
     align = 1;
   }
 
-  if (!v && NODATA_WANTED)
+  if (!v && (NODATA_WANTED || (tcc_state->check_only && (r & VT_VALMASK) == VT_CONST)))
   {
     size = 0, align = 1;
   }
@@ -607,7 +657,8 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
         int slot_align = align;
         if (size >= 4 && slot_align < 4 && (type->t & VT_BTYPE) == VT_STRUCT)
           slot_align = 4;
-        loc = (loc - size) & -slot_align;
+        loc = tcc_ir_frame_alloc(loc, size, -slot_align);
+        tcc_ir_frame_note_type(loc, type);
       }
     }
     addr = loc;
@@ -622,16 +673,22 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
     if (v)
     {
       /* local variable */
+      sym = sym_push(v, type, r, addr);
+      vreg = sym->vreg;
 #ifdef CONFIG_TCC_ASM
+      /* `register T x __asm("rN")`: x is an ordinary local whose value is
+       * placed in rN only where it is an asm operand.  Record rN in sym->r
+       * after sym_push, which gives register-candidate locals their vreg only
+       * while the value mask still says VT_LOCAL -- recording it before left x
+       * without a vreg, so its uses went to a stack slot that was never
+       * allocated and aliased the previous local. */
       if (ad->asm_label)
       {
         int reg = asm_parse_regvar(ad->asm_label);
         if (reg >= 0)
-          r = (r & ~VT_VALMASK) | reg;
+          sym->r = (sym->r & ~VT_VALMASK) | reg;
       }
 #endif
-      sym = sym_push(v, type, r, addr);
-      vreg = sym->vreg;
       if (ad->cleanup_func)
       {
         Sym *cls = sym_push2(&all_cleanups, SYM_FIELD | ++cur_scope->cl.n, 0, 0);
@@ -650,10 +707,11 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
       if (has_init && size > 0 && size <= 256 && ((type->t & VT_ARRAY) || (type->t & VT_VECTOR)) &&
           !(type->t & VT_VLA))
       {
-        sym->const_init_data = tcc_mallocz(size);
-        sym->const_init_size = size;
-        sym->const_init_valid = 1;
-        sym->const_init_in_progress = 1;
+        SymLocalFacts *f = sym_facts(sym);
+        f->const_init_data = tcc_mallocz(size);
+        f->const_init_size = size;
+        f->const_init_valid = 1;
+        f->const_init_in_progress = 1;
         p.const_init_sym = sym;
         p.const_init_base = addr;
       }
@@ -669,10 +727,11 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
       {
         Sym *anon = sym_push2(&local_stack, SYM_FIRST_ANOM, type->t, addr);
         anon->type.ref = type->ref;
-        anon->const_init_data = tcc_mallocz(size);
-        anon->const_init_size = size;
-        anon->const_init_valid = 1;
-        anon->const_init_in_progress = 1;
+        SymLocalFacts *f = sym_facts(anon);
+        f->const_init_data = tcc_mallocz(size);
+        f->const_init_size = size;
+        f->const_init_valid = 1;
+        f->const_init_in_progress = 1;
         p.const_init_sym = anon;
         p.const_init_base = addr;
       }
@@ -681,6 +740,14 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
   else
   {
     sym = NULL;
+    /* A file-scope object without an initializer is a tentative definition
+     * (C11 6.9.2): the definition may still follow, or it is zero-filled at
+     * the end of the TU (finalize_tentative_definitions). */
+    const int tentative = v && global && !has_init
+#ifdef CONFIG_TCC_BCHECK
+                          && !bcheck
+#endif
+        ;
     if (v && global)
     {
       /* see if the symbol was already defined */
@@ -709,7 +776,10 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
       CType *tp = type;
       while ((tp->t & (VT_BTYPE | VT_ARRAY)) == (VT_PTR | VT_ARRAY))
         tp = &tp->ref->type;
-      if (tp->t & VT_CONSTANT)
+      /* A tentative one waits in COMMON, const or not (below): the
+       * definition that may follow is placed where it belongs, and one
+       * nothing refers to is dropped (prune_unused_statics). */
+      if ((tp->t & VT_CONSTANT) && !tentative)
       {
         /* RELRO: with -share-rodata, a const object whose type contains a
            pointer can hold a relocation, so it must live in the writable
@@ -730,13 +800,19 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
         /*if (tcc_state->g_debug & 4)
             tcc_warning("rw data: %s", get_tok_str(v, 0));*/
       }
-      else if (tcc_state->nocommon)
+      /* A tentative one waits in COMMON: its definition would move it to
+       * .data, leaving the .bss bytes it took unused. */
+      else if (tcc_state->nocommon && !tentative)
         sec = bss_section;
     }
 
+    /* A static object of a function parsed for its diagnostics only. */
+    if (sec && tcc_state->check_only)
+      sec = tcc_state->check_scratch;
     if (sec)
     {
-      addr = section_add(sec, size, align);
+      if (!tentative_storage_reuse(sym, has_init, sec, size, align, &addr))
+        addr = section_add(sec, size, align);
 #ifdef CONFIG_TCC_BCHECK
       /* add padding if bound check */
       if (bcheck)
@@ -759,6 +835,13 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
       }
       /* update symbol definition */
       put_extern_sym(sym, sec, addr, size);
+      if (tentative && !sym->a.tentative)
+      {
+        sym->a.tentative = 1;
+        dynarray_add(&tcc_state->tentative_syms, &tcc_state->nb_tentative_syms, sym);
+      }
+      else if (!tentative)
+        sym->a.tentative = 0;
     }
     else
     {
@@ -945,7 +1028,7 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
      * is entirely load-time-constant do we emit the memcpy and skip the
      * per-element path.  Otherwise rewind and fall through to normal init. */
     int templated = 0;
-    if (!sec && tcc_state->ir && has_init && !NODATA_WANTED && (type->t & VT_ARRAY) && !(type->t & VT_VLA) &&
+    if (!sec && tcc_state->ir && has_init && !NOSTATIC_WANTED && (type->t & VT_ARRAY) && !(type->t & VT_VLA) &&
         !(type->t & VT_COMPLEX) && size > 256)
     {
       /* Both paths leave the live token at the start of the initializer:
@@ -1018,7 +1101,14 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
           cargs[2].c.i = size;
           cargs[2].vr = -1;
 
-          gen_ir_void_call_args(cargs, 3, TOK_memcpy);
+          int copy_tok = TOK_memcpy;
+#ifdef TCC_ARM_EABI
+          /* Local and template share the type's alignment: a word-aligned
+           * copy the backend expands inline (thumb_inline_aligned_copy_call). */
+          if (align >= 4 && !(size & 3))
+            copy_tok = TOK_memmove4;
+#endif
+          gen_ir_void_call_args(cargs, 3, copy_tok);
           templated = 1;
         }
         else
@@ -1035,7 +1125,7 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
       decl_initializer(&p, type, addr, DIF_FIRST, vreg);
 
     if (p.const_init_sym)
-      p.const_init_sym->const_init_in_progress = 0;
+      p.const_init_sym->facts->const_init_in_progress = 0;
 
     tcc_state->nrvo_target_ptr_vreg = saved_nrvo_ptr_vreg;
     tcc_state->nrvo_target_active = saved_nrvo_active;

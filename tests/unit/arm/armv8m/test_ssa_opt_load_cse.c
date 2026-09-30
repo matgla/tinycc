@@ -1691,18 +1691,14 @@ UT_TEST(test_sstore_adjacent_narrow_store_survives)
 }
 
 /* ========================================================================
- * Pinned bugs
+ * Pointer-deref store sources
  * ======================================================================== */
 
-/* Regression lock for docs/bugs.md "load_cse: stack store of a pointer-deref
- * source tracks the pointer as the stored value".
- * `StackLoc[0] <- *t1` records t1 (the ADDRESS) in the sstore slot because
- * the tracker at load_cse.c:1031 lacks the !src.is_lval guard its siblings
- * have (load_cse.c:302, :1104, :1181). The later LOAD is then rewritten to
- * `ASSIGN t1` — the pointer, not the pointee. Correct behavior: do not track
- * (load stays a load). This pins the CURRENT (buggy) result; flip the
- * assertions once fixed. */
-UT_TEST(test_stack_store_lval_vreg_src_tracked_bug)
+/* `StackLoc[0] <- *t1` stores what t1 points at.  The direct stack-slot
+ * tracker once recorded t1 itself (the ADDRESS) as the slot's value, and the
+ * later LOAD became `ASSIGN t1` -- the pointer, not the pointee.  The load
+ * must stay a load. */
+UT_TEST(test_stack_store_lval_vreg_src_not_tracked)
 {
   setup_tcc_state();
   ssa_ctx c = ssa_ctx_new(1, 4);
@@ -1718,23 +1714,18 @@ UT_TEST(test_stack_store_lval_vreg_src_tracked_bug)
   ssa_ctx_build_ssa_plain(&c);
   ssa_ctx_rebuild(&c);
 
-  int changed = ssa_opt_load_cse(c.ctx);
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, load_i), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, load_i)), VR_TMP(1));
+  ssa_opt_load_cse(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, load_i), TCCIR_OP_LOAD);
 
   ssa_ctx_free(&c);
   teardown_tcc_state();
   return 0;
 }
 
-/* Regression lock for the same root cause at the twin call site
- * load_cse.c:1076 (TEMP-indir stack store `*T <- val` resolving to
- * LEA(StackLoc[N])): an is_lval source is recorded as the stored value.
- * `t1 = &StackLoc[0]; *t1 = *t0; t2 = LOAD(StackLoc[0])` currently becomes
- * `t2 = t0` (the pointer). Correct behavior: do not track. Pins the CURRENT
- * (buggy) result; flip the assertions once fixed. */
-UT_TEST(test_temp_indir_store_lval_src_tracked_bug)
+/* The twin site, a TEMP-indir stack store `*T <- val` resolving to
+ * LEA(StackLoc[N]): `t1 = &StackLoc[0]; *t1 = *t0; t2 = LOAD(StackLoc[0])`
+ * once became `t2 = t0` (the pointer).  The load must stay a load. */
+UT_TEST(test_temp_indir_store_lval_src_not_tracked)
 {
   setup_tcc_state();
   ssa_ctx c = ssa_ctx_new(1, 4);
@@ -1748,10 +1739,8 @@ UT_TEST(test_temp_indir_store_lval_src_tracked_bug)
   ssa_ctx_build_ssa_plain(&c);
   ssa_ctx_rebuild(&c);
 
-  int changed = ssa_opt_load_cse(c.ctx);
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, load_i), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, load_i)), VR_TMP(0));
+  ssa_opt_load_cse(c.ctx);
+  UT_ASSERT_EQ(utb_op(c.ir, load_i), TCCIR_OP_LOAD);
 
   ssa_ctx_free(&c);
   teardown_tcc_state();

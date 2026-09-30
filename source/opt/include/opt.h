@@ -149,6 +149,7 @@ int tcc_ir_opt_assign_fuse(struct TCCIRState *ir);
 
 /* `CMP T_u64, u64_imm_with_hi_0` -> 32-bit when T's hi half is provably zero (SHR>=32 or ZEXT). */
 int tcc_ir_opt_cmp_narrow_64(struct TCCIRState *ir);
+int tcc_ir_opt_cmp_hi_only(struct TCCIRState *ir);
 
 /* `CMP imm, reg` -> `CMP reg, imm` with the condition mirrored on every flag
  * reader, so the constant reaches `cmp`'s immediate slot instead of a `mov`. */
@@ -179,8 +180,6 @@ int tcc_ir_opt_shift64_extract_ubfx(struct TCCIRState *ir);
 int tcc_ir_opt_reroll(struct TCCIRState *ir);
 
 /* Collapses repeated `T = -T` chains by tracking each TEMP's canonical (base, sign) pair. */
-int tcc_ir_opt_neg_chain_cse(struct TCCIRState *ir);
-int tcc_ir_opt_neg_chain_cse_ex(struct IROptCtx *ctx);
 
 /* `((V<<n) | low) >> n` -> V when low < 2^n and V < 2^(32-n). */
 int tcc_ir_opt_bitfield_insert_extract(struct TCCIRState *ir);
@@ -200,6 +199,15 @@ int tcc_ir_opt_addrof_var_fwd(struct TCCIRState *ir);
 
 /* Rewrites derefs through single-def entry-block `P = &V` pointer VARs (and their TEMP copies) to direct V accesses. */
 int tcc_ir_opt_ptr_local_fwd(struct TCCIRState *ir);
+int tcc_ir_opt_param_copy_alias(struct TCCIRState *ir);
+int tcc_ir_opt_param_copy_alias_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_slot_const_store_fold(struct TCCIRState *ir);
+int tcc_ir_opt_slot_const_store_fold_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_sra(struct TCCIRState *ir);
+/* Word reads of a by-value struct parameter's frame home become the parameter's vreg. */
+int tcc_ir_opt_param_home_fwd(struct TCCIRState *ir);
+/* Build a struct returned through the hidden sret pointer in the caller's buffer. */
+int tcc_ir_opt_sret_nrvo(struct TCCIRState *ir);
 int tcc_ir_opt_ptr_local_fwd_ex(struct IROptCtx *ctx);
 
 /* Forwards a load of a copied local field (`x=G; ... x.field`) to the source global `G.field`. */
@@ -220,8 +228,6 @@ int tcc_ir_opt_deref_operand_cse(struct TCCIRState *ir);
 int tcc_ir_opt_bitfield_unit_narrow(struct TCCIRState *ir);
 
 /* Inserts one `T_v = T***DEREF***` after a singly-defined pointer TEMP and rewrites later derefs to T_v non-lval. */
-int tcc_ir_opt_invariant_temp_deref_hoist(struct TCCIRState *ir);
-int tcc_ir_opt_invariant_temp_deref_hoist_ex(struct IROptCtx *ctx);
 
 /* Collapses the spill/addr/store/reload sequence of `f(int v){ helper(&v); return v; }` after inlining. */
 int tcc_ir_opt_param_addrof_const_fold(struct TCCIRState *ir);
@@ -239,7 +245,6 @@ int tcc_ir_opt_global_init_prop(struct TCCIRState *ir);
 int tcc_ir_opt_symref_const_prop(struct TCCIRState *ir);
 
 /* Packs a constant-initialized _Complex float local used as a single FUNCPARAMVAL into a 64-bit immediate. */
-int tcc_ir_opt_complex_const_param_fold(struct TCCIRState *ir);
 
 /* Sets sym->f.func_pure_via_sret when the only observable effect is writes through the sret-pointer parameter. */
 void tcc_ir_analyze_pure_via_sret(struct TCCIRState *ir, struct Sym *func_sym);
@@ -286,9 +291,7 @@ void tcc_ir_barrel_shift_fusion(struct TCCIRState *ir);
 int tcc_ir_opt_shift_pair_to_ubfx(struct TCCIRState *ir);
 int tcc_ir_opt_stack_addr_cse(struct TCCIRState *ir);
 int tcc_ir_opt_entry_store_prop(struct TCCIRState *ir);
-int tcc_ir_opt_float_branch_fold(struct TCCIRState *ir);
 int tcc_ir_opt_redundant_loop_check(struct TCCIRState *ir);
-int tcc_ir_opt_float_narrowing(struct TCCIRState *ir);
 int tcc_ir_opt_jump_threading(struct TCCIRState *ir);
 int tcc_ir_opt_bool_diamond_branch(struct TCCIRState *ir);
 int tcc_ir_opt_orphan_cmp_elim(struct TCCIRState *ir);
@@ -298,6 +301,20 @@ int tcc_ir_opt_jumpif_invert(struct TCCIRState *ir, int allow_backward);
 
 /* Replaces the memset(0)+stores pattern with a BLOCK_COPY from rodata. */
 int tcc_ir_opt_block_copy_init(struct TCCIRState *ir);
+struct Section;
+struct Sym;
+/* A relocation in a constant image: the address of `sym` + addend at `off`. */
+typedef struct
+{
+  int off;
+  struct Sym *sym;
+  int32_t addend;
+} BciReloc;
+/* A symbol for `size` bytes (plus relocations) in `sec`, shared with any
+ * identical image emitted earlier in this compilation. */
+struct Sym *bci_image_sym(struct Section *sec, const uint8_t *bytes, int size, const BciReloc *rel, int nrel);
+int tcc_ir_opt_const_local_table(struct TCCIRState *ir);
+int tcc_ir_opt_const_local_table_ex(struct IROptCtx *ctx);
 
 /* memset(stack, N<=8, 0) -> one or two direct STORE #0, for when block_copy_init did not fire. */
 int tcc_ir_opt_small_memset_to_store(struct TCCIRState *ir);
@@ -320,7 +337,6 @@ int tcc_ir_opt_backedge_phi_hoist(struct TCCIRState *ir);
 int tcc_ir_opt_abort_tail_merge(struct TCCIRState *ir);
 
 int tcc_ir_opt_const_prop_tmp_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_single_value_tmp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_known_bits_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_lea_store_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_aggregate_fold_ex(struct IROptCtx *ctx);
@@ -338,11 +354,11 @@ int tcc_ir_opt_mem_inline(struct TCCIRState *ir);
 int tcc_ir_opt_mem_inline_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_setif_branch_fuse_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_stack_bool_diamond_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_float_narrowing_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_pack64_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_pack64_tautology_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_pack64_from_stack_stores_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_narrow_64_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_cmp_hi_only_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_cmp_imm_swap_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_and64_narrow_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_sl_forward_ex(struct IROptCtx *ctx);
@@ -354,8 +370,10 @@ int tcc_ir_opt_switch_to_data(struct TCCIRState *ir);
 int tcc_ir_opt_switch_collapse_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_switch_collapse(struct TCCIRState *ir);
 int tcc_ir_opt_redundant_loop_check_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_float_branch_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_eliminate_fallthrough_ex(struct IROptCtx *ctx);
+/* Branches whose one side can only run into __builtin_unreachable fold to the other side. */
+int tcc_ir_opt_unreachable_fold(struct TCCIRState *ir);
+int tcc_ir_opt_unreachable_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_uninit_local_ub(struct TCCIRState *ir);
 int tcc_ir_opt_uninit_local_ub_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_uninit_dominates_return(struct TCCIRState *ir);
@@ -377,28 +395,12 @@ int tcc_ir_opt_byte_store_merge(struct TCCIRState *ir);
 int tcc_ir_opt_byte_store_merge_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_memcpy_to_dest(struct TCCIRState *ir);
 int tcc_ir_opt_const_memcpy_to_dest_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_local_copy_prop(struct TCCIRState *ir);
-int tcc_ir_opt_local_copy_prop_ex(struct IROptCtx *ctx);
 /* Drops a `memmove(B,A,N); memmove(A,B,N)` pair where B is a dead round-trip temp and A is unmodified between. */
 int tcc_ir_opt_struct_copy_roundtrip_elim(struct TCCIRState *ir);
 /* `memmove(local, &global, N)` into a private read-only slot: reads the global directly and drops the copy. */
 int tcc_ir_opt_memmove_global_load_fwd(struct TCCIRState *ir);
 int tcc_ir_opt_addrof_var_fwd_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_global_sl_fwd_ex(struct IROptCtx *ctx);
-
-typedef struct TCCOptStats
-{
-  int dce_removed;
-  int dse_removed;
-  int const_folded;
-  int copies_propagated;
-  int cse_eliminated;
-  int stores_forwarded;
-} TCCOptStats;
-
-void tcc_ir_opt_stats_get(TCCOptStats *stats);
-
-void tcc_ir_opt_stats_reset(void);
 
 void tcc_ir_opt_fp_cache_init(struct TCCIRState *ir);
 
@@ -416,6 +418,12 @@ void tcc_ir_opt_fp_cache_invalidate_reg(struct TCCIRState *ir, int phys_reg);
 int tcc_ir_find_defining_instruction(struct TCCIRState *ir, int32_t vreg, int before_idx);
 
 int tcc_ir_vreg_has_single_use(struct TCCIRState *ir, int32_t vreg, int exclude_idx);
+
+/* Post-RA: 1 when graph coalescing merged `vreg` into a class.  The copies
+ * between the members were erased, so the members' register is also read
+ * and written under the other members' names: no scan of this vreg's own
+ * uses or defs sees all of them. */
+int tcc_ir_vreg_coalesced(struct TCCIRState *ir, int32_t vreg);
 
 /* Inserts a quad before an index, renumbering jump + switch-table targets. */
 int tcc_ir_insert_instruction_before(struct TCCIRState *ir, int before_idx, struct IRQuadCompact *new_q);

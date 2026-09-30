@@ -85,7 +85,7 @@ static inline int is_value_dest(IROperand op)
 
 /* v == 2^s: returns 1 and writes *shift on success, 0 otherwise (v==0 or
  * non-power-of-two). */
-static inline int is_power_of_2(uint32_t v, int *shift)
+static inline int is_power_of_2_shift(uint32_t v, int *shift)
 {
   if (v == 0 || (v & (v - 1)) != 0)
     return 0;

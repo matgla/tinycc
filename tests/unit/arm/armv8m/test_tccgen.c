@@ -158,6 +158,27 @@ void tcc_ir_set_original_offset(TCCIRState *ir, int vreg, int offset)
   (void)offset;
 }
 
+int tcc_ir_frame_alloc(int loc, int size, int mask)
+{
+  return (loc - size) & mask;
+}
+
+int tcc_ir_frame_alloc_arg_copy(int loc, int size, int mask)
+{
+  return (loc - size) & mask;
+}
+
+int tcc_ir_frame_alloc_ret_temp(int loc, int size, int mask)
+{
+  return (loc - size) & mask;
+}
+
+void tcc_ir_frame_note_sret_call(int call_id, int size)
+{
+  (void)call_id;
+  (void)size;
+}
+
 void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double)
 {
   (void)ir;
@@ -1335,10 +1356,10 @@ UT_TEST(test_sym_free)
   reset_symbol_state();
   s = sym_push2(&global_stack, SYM_FIRST_ANOM, VT_INT, 0);
   UT_ASSERT(s != NULL);
-  s->const_init_data = dummy_data;
+  sym_facts(s)->const_init_data = dummy_data;
   sym_free(s);
   global_stack = NULL;
-  UT_ASSERT(s->const_init_data == NULL);
+  UT_ASSERT(s->facts == NULL);
   UT_ASSERT_EQ((unsigned int)s->v, 0xDEADBEEFU);
   return 0;
 }
@@ -2401,15 +2422,18 @@ UT_TEST(test_find_sv_const_init)
 {
   static unsigned char data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
   Sym s;
+  SymLocalFacts sf;
   SValue sv;
 
   reset_symbol_state();
   memset(&s, 0, sizeof(s));
+  memset(&sf, 0, sizeof(sf));
   s.v = TOK_IDENT + 1; /* a named local */
   s.c = 0x20;          /* stack offset */
-  s.const_init_data = data;
-  s.const_init_valid = 1;
-  s.const_init_size = 8;
+  s.facts = &sf;
+  sf.const_init_data = data;
+  sf.const_init_valid = 1;
+  sf.const_init_size = 8;
   s.prev = NULL;
   local_stack = &s;
 
@@ -3533,6 +3557,7 @@ UT_TEST(test_svalue_get_conservative_max_u64)
 {
   SValue sv;
   Sym local;
+  SymLocalFacts lf = {0};
   unsigned long long m;
 
   tcc_state = NULL; /* keep the vreg-fact fallback inert */
@@ -3568,8 +3593,9 @@ UT_TEST(test_svalue_get_conservative_max_u64)
   local.type.t = VT_INT;
   local.v = TOK_IDENT + 1;
   local.c = 0x30;
-  local.objsize_max_valid = 1;
-  local.objsize_max_value = 500;
+  local.facts = &lf;
+  lf.objsize_max_valid = 1;
+  lf.objsize_max_value = 500;
   local.prev = NULL;
   local_stack = &local;
 
@@ -3581,7 +3607,7 @@ UT_TEST(test_svalue_get_conservative_max_u64)
   UT_ASSERT_EQ((int)m, 500);
 
   /* an unbounded local yields nothing */
-  local.objsize_max_valid = 0;
+  lf.objsize_max_valid = 0;
   UT_ASSERT(!svalue_get_conservative_max_u64(&sv, &m));
 
   local_stack = NULL;
@@ -3592,6 +3618,7 @@ UT_TEST(test_svalue_get_conservative_string_bytes_u64)
 {
   SValue sv;
   Sym local;
+  SymLocalFacts lf = {0};
   unsigned long long m;
 
   tcc_state = NULL;
@@ -3603,8 +3630,9 @@ UT_TEST(test_svalue_get_conservative_string_bytes_u64)
   local.type.t = VT_INT;
   local.v = TOK_IDENT + 1;
   local.c = 0x40;
-  local.objsize_strlen_valid = 1;
-  local.objsize_strlen_value = 9;
+  local.facts = &lf;
+  lf.objsize_strlen_valid = 1;
+  lf.objsize_strlen_value = 9;
   local.prev = NULL;
   local_stack = &local;
 
@@ -3616,7 +3644,7 @@ UT_TEST(test_svalue_get_conservative_string_bytes_u64)
   UT_ASSERT_EQ((int)m, 9);
 
   /* without a strlen fact there is no bound */
-  local.objsize_strlen_valid = 0;
+  lf.objsize_strlen_valid = 0;
   UT_ASSERT(!svalue_get_conservative_string_bytes_u64(&sv, &m));
 
   /* a bare (non-local, non-string) constant has no string bound */

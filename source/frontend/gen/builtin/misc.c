@@ -96,6 +96,28 @@ void gen_bitop1(TccIrOp op)
   vtop->c.i = 0; /* Clear c.i to avoid corrupting later operations */
 }
 
+/* Push this function's return address, __builtin_return_address(0), as a
+ * void *.  The prologue must then save LR even in a leaf; the value is read
+ * back from that slot (TCCIR_OP_RETURN_ADDRESS), with no frame pointer. */
+ST_FUNC void vpush_return_address(void)
+{
+  CType type;
+  SValue dest;
+  type.t = VT_VOID;
+  type.ref = NULL;
+  mk_pointer(&type);
+  tcc_state->force_lr_save = 1;
+  svalue_init(&dest);
+  dest.type = type;
+  dest.r = 0;
+  dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_RETURN_ADDRESS, NULL, NULL, &dest);
+  vpush(&type);
+  vtop->vr = dest.vr;
+  vtop->r = 0;
+  vtop->c.i = 0;
+}
+
 /* Emit an IR function call to a library helper for a builtin.
  * Arguments are already on the vstack (1 or 2 args).
  * func_tok: TOK_xxx or tok_alloc_const("name") for the target function

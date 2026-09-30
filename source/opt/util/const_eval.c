@@ -47,6 +47,10 @@ int ir_opt_eval_const_u64(TCCIRState *ir, IROperand op, int use_idx, uint64_t *o
   if (vr < 0)
     return 0;
 
+  /* A volatile variable's initialiser is not the value a later read sees. */
+  if (tcc_ir_operand_names_volatile_var(ir, op))
+    return 0;
+
   if (ir_opt_vreg_address_taken_between(ir, vr, 0, use_idx))
     return 0;
 
@@ -212,6 +216,10 @@ int ir_opt_eval_const_string(TCCIRState *ir, IROperand op, int use_idx, const ch
   if (vr < 0)
     return 0;
 
+  /* A volatile variable's initialiser is not the value a later read sees. */
+  if (tcc_ir_operand_names_volatile_var(ir, op))
+    return 0;
+
   if (ir_opt_vreg_address_taken_between(ir, vr, 0, use_idx))
     return 0;
 
@@ -271,8 +279,8 @@ const char *ir_opt_get_constant_string_from_symref(TCCIRState *ir, IROperand op)
     return NULL;
 
   sym = symref->sym;
-  if (!sym)
-    return NULL;
+  if (!sym || sym->a.tentative)
+    return NULL; /* a tentative definition's bytes are not its value yet */
 
   esym = elfsym(sym);
   if (!esym)

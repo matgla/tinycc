@@ -140,17 +140,188 @@ TCC_DBG_ENV_FLAG(dbg_mlaiv, "TCC_DBG_MLAIV")
  * MLA).  Anything else means try_eliminate_iv_counter will fail and the loop
  * would carry BOTH the index and the new pointer -- pure added work, measured
  * at +14.6% on mibench_dijkstra before this gate existed. */
-static int iv_ctr_eliminable(TCCIRState *ir, int32_t iv_vr, int iv_def_idx, int allow_a, int allow_b)
+static IROperand iv_canon_base(TCCIRState *ir, IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || op.is_lval || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+    return op;
+  if (!tcc_ir_vreg_has_single_def(ir, vr))
+    return op;
+  int def = tcc_ir_find_defining_instruction(ir, vr, ir->next_instruction_index);
+  if (def < 0)
+    return op;
+  IRQuadCompact *dq = &ir->compact_instructions[def];
+  if (dq->op != TCCIR_OP_ASSIGN)
+    return op;
+  IROperand src = tcc_ir_op_get_src1(ir, dq);
+  if (irop_get_vreg(src) >= 0)
+    return op; /* only look through a copy of a constant address */
+  return src;
+}
+
+int iv_same_base(TCCIRState *ir, IROperand a, IROperand b)
+{
+  a = iv_canon_base(ir, a);
+  b = iv_canon_base(ir, b);
+  int tag_a = irop_get_tag(a);
+  int tag_b = irop_get_tag(b);
+  if (tag_a != tag_b || a.is_lval != b.is_lval)
+    return 0;
+  if (tag_a == IROP_TAG_IMM32 || tag_a == IROP_TAG_STACKOFF)
+    return a.u.imm32 == b.u.imm32;
+  if (tag_a == IROP_TAG_VREG)
+  {
+    int32_t va = irop_get_vreg(a);
+    int32_t vb = irop_get_vreg(b);
+    return va >= 0 && va == vb;
+  }
+  return 0;
+}
+
+/* The loop's full index range: start..end plus a detached body (the un-rotated
+ * shape keeps the body past the back-edge). */
+static void iv_loop_range(const IRLoop *loop, int *lo, int *hi)
+{
+  *lo = loop->start_idx;
+  *hi = loop->end_idx;
+  if (loop->num_body_instrs > 0)
+  {
+    if (loop->body_instrs[0] < *lo)
+      *lo = loop->body_instrs[0];
+    if (loop->body_instrs[loop->num_body_instrs - 1] > *hi)
+      *hi = loop->body_instrs[loop->num_body_instrs - 1];
+  }
+}
+
+int iv_read_reachable_outside(TCCIRState *ir, IRLoop *loop, int32_t iv_vr)
+{
+  const int n = ir->next_instruction_index;
+  int lo, hi;
+  iv_loop_range(loop, &lo, &hi);
+  if (ir_opt_vreg_address_taken_between(ir, iv_vr, 0, n - 1))
+    return 1;
+
+  uint8_t *seen = tcc_mallocz((size_t)n + 1);
+  int *wl = tcc_malloc(sizeof(int) * ((size_t)n + 2));
+  int nwl = 0;
+  int result = 0;
+
+  /* Every way out of the loop: a branch from inside to outside, and the fall
+   * through past its last instruction when that is not an unconditional jump. */
+  for (int j = lo; j <= hi && j < n; j++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE)
+    {
+      result = 1;
+      break;
+    }
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      if (t < lo || t > hi)
+        wl[nwl++] = t;
+    }
+  }
+  if (!result && hi + 1 < n && ir->compact_instructions[hi].op != TCCIR_OP_JUMP)
+    wl[nwl++] = hi + 1;
+
+  while (!result && nwl > 0)
+  {
+    int k = wl[--nwl];
+    if (k < 0 || k >= n || seen[k])
+      continue;
+    seen[k] = 1;
+    if (k >= lo && k <= hi)
+    {
+      result = 1; /* a path back into the loop that is not its own back-edge */
+      break;
+    }
+    IRQuadCompact *q = &ir->compact_instructions[k];
+    if (q->op == TCCIR_OP_NOP)
+    {
+      wl[nwl++] = k + 1;
+      continue;
+    }
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE)
+    {
+      result = 1;
+      break;
+    }
+    /* reads */
+    if ((irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == iv_vr) ||
+        (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == iv_vr) ||
+        (q->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, q)) == iv_vr))
+    {
+      result = 1;
+      break;
+    }
+    if (irop_config[q->op].has_dest)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      if (irop_get_vreg(d) == iv_vr)
+      {
+        int direct = !d.is_lval || (TCCIR_DECODE_VREG_TYPE(iv_vr) == TCCIR_VREG_TYPE_VAR && d.is_local);
+        if (!direct)
+        {
+          result = 1; /* the IV used as an address */
+          break;
+        }
+        continue; /* redefined: nothing past here sees the loop's value */
+      }
+    }
+    if (q->op == TCCIR_OP_RETURNVOID || q->op == TCCIR_OP_RETURNVALUE)
+      continue;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      wl[nwl++] = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      if (q->op == TCCIR_OP_JUMPIF)
+        wl[nwl++] = k + 1;
+      continue;
+    }
+    wl[nwl++] = k + 1;
+  }
+  tcc_free(seen);
+  tcc_free(wl);
+  return result;
+}
+
+/* `allow` lists instructions that read the IV only to compute an address this
+ * transform is about to take over -- a DIV's SHL/MUL, or the `iv - k` of every
+ * affine INDEXED-DIV in the loop.  A loop like SHA-1's message expansion reads
+ * its counter in four such subtractions per iteration, so a fixed two-slot
+ * whitelist could never admit it.
+ *
+ * With `loop` given, reads are judged INSIDE the loop by the rules below and
+ * OUTSIDE it by reachability: SHA-1's six loops share one `i`, each starting
+ * from a literal, and a whole-function scan called every one of them
+ * non-eliminable because the next loop's `i = i + 1` was a read. */
+static int iv_ctr_eliminable_list(TCCIRState *ir, IRLoop *loop, int32_t iv_vr, int iv_def_idx,
+                                  const int *allow, int nallow)
 {
   int safe = 1;
   int cmp_count = 0;
-  for (int j = 0; j < ir->next_instruction_index && safe; j++)
+  int lo = 0, hi = ir->next_instruction_index - 1;
+  if (loop)
+  {
+    iv_loop_range(loop, &lo, &hi);
+    if (iv_read_reachable_outside(ir, loop, iv_vr))
+      return 0;
+  }
+  for (int j = lo; j <= hi && safe; j++)
   {
     IRQuadCompact *uq = &ir->compact_instructions[j];
     if (uq->op == TCCIR_OP_NOP)
       continue;
-    if (j == iv_def_idx || j == allow_a || j == allow_b)
+    if (j == iv_def_idx)
       continue;
+    {
+      int allowed = 0;
+      for (int a = 0; a < nallow && !allowed; a++)
+        allowed = (allow[a] == j);
+      if (allowed)
+        continue;
+    }
 
     if (uq->op == TCCIR_OP_LOAD_INDEXED || uq->op == TCCIR_OP_STORE_INDEXED)
     {
@@ -181,6 +352,17 @@ static int iv_ctr_eliminable(TCCIRState *ir, int32_t iv_vr, int iv_def_idx, int 
       safe = 0;
   }
   return safe && cmp_count > 0;
+}
+
+static int iv_ctr_eliminable(TCCIRState *ir, int32_t iv_vr, int iv_def_idx, int allow_a, int allow_b)
+{
+  int allow[2];
+  int n = 0;
+  if (allow_a >= 0)
+    allow[n++] = allow_a;
+  if (allow_b >= 0)
+    allow[n++] = allow_b;
+  return iv_ctr_eliminable_list(ir, NULL, iv_vr, iv_def_idx, allow, n);
 }
 
 /* Does this derived address value reach a real memory access (rather than
@@ -289,7 +471,15 @@ static int iv_scaled_deref_postinc_viable(TCCIRState *ir, IRLoop *loop, int32_t 
   if (!in_loop_access)
     return 0;
 
-  return iv_ctr_eliminable(ir, iv->vreg, iv->def_idx, allow_a, allow_b);
+  {
+    int allow[2];
+    int n = 0;
+    if (allow_a >= 0)
+      allow[n++] = allow_a;
+    if (allow_b >= 0)
+      allow[n++] = allow_b;
+    return iv_ctr_eliminable_list(ir, loop, iv->vreg, iv->def_idx, allow, n);
+  }
 }
 
 int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_ivs, DerivedIV *divs, int max_divs)
@@ -327,6 +517,73 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
       fprintf(stderr, " %d", loop->body_instrs[bi]);
     fprintf(stderr, " (MLA scan range: [%d..%d])\n", mla_scan_start, mla_scan_end);
   }
+
+  /* Affine INDEXED-DIV candidates, found before anything else because two of
+   * the passes below consult them: `T = iv +/- k` (a single-use temp) feeding
+   * the index of an indexed access in this loop.  SHA-1's message expansion,
+   * `W[i] = W[i-3] ^ W[i-8] ^ W[i-14] ^ W[i-16]`, reached codegen as four
+   * `subs r3, r2, #k` and four scaled-index loads per iteration, because only
+   * `W[i]` itself was a DIV and the subtractions then counted as extra reads
+   * of the counter that made it non-eliminable -- so even that one was
+   * refused.  Recognising the offset accesses as DIVs on the SAME base and
+   * stride lets the driver walk one pointer for all of them, each access an
+   * immediate off it (gcc's `ldr r0, [r3, #32]`), with the subtractions and
+   * the counter gone.  On the M33 an immediate offset is also a cycle cheaper
+   * than a scaled register index. */
+#define IV_AFFINE_MAX 16
+  int affine_def[IV_AFFINE_MAX];
+  IROperand affine_base[IV_AFFINE_MAX];
+  int affine_stride[IV_AFFINE_MAX];
+  int naffine = 0;
+  for (int bi = 0; bi < loop->num_body_instrs && naffine < IV_AFFINE_MAX; bi++)
+  {
+    int i = loop->body_instrs[bi];
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    int32_t dv = irop_get_vreg(d);
+    if (dv < 0 || d.is_lval || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+    IROperand a = tcc_ir_op_get_src1(ir, q);
+    IROperand k = tcc_ir_op_get_src2(ir, q);
+    if (!irop_is_immediate(k) || irop_get_vreg(a) < 0)
+      continue;
+    int iv_k = -1;
+    for (int v = 0; v < num_ivs && iv_k < 0; v++)
+      if (ivs[v].vreg == irop_get_vreg(a))
+        iv_k = v;
+    if (iv_k < 0)
+      continue;
+    if (!tcc_ir_vreg_has_single_use(ir, dv, -1))
+      continue;
+    /* The one use must be an indexed access's INDEX slot inside this loop. */
+    for (int bj = 0; bj < loop->num_body_instrs; bj++)
+    {
+      IRQuadCompact *uq = &ir->compact_instructions[loop->body_instrs[bj]];
+      if ((uq->op != TCCIR_OP_LOAD_INDEXED && uq->op != TCCIR_OP_STORE_INDEXED) ||
+          irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) != dv)
+        continue;
+      IROperand sc = tcc_ir_op_get_scale(ir, uq);
+      if (!irop_is_immediate(sc))
+        break;
+      int scale = (int)irop_get_imm64_ex(ir, sc);
+      if (scale < 0 || scale > 3)
+        break;
+      affine_def[naffine] = i;
+      affine_base[naffine] = (uq->op == TCCIR_OP_LOAD_INDEXED) ? tcc_ir_op_get_src1(ir, uq)
+                                                                : tcc_ir_op_get_dest(ir, uq);
+      affine_stride[naffine] = ivs[iv_k].step * (1 << scale);
+      naffine++;
+      break;
+    }
+  }
+  /* The SHL of every deref-form DIV admitted into a group below joins the
+   * allow list, so the group's eliminability check sees all of its own reads. */
+  int group_allow[IV_AFFINE_MAX + 8];
+  int ngroup_allow = 0;
+  for (int a = 0; a < naffine; a++)
+    group_allow[ngroup_allow++] = affine_def[a];
 
   /* Scan the extended body for ADD instructions (DIV computation) */
   for (int bi = 0; bi < loop->num_body_instrs && num_divs < max_divs; bi++)
@@ -551,7 +808,31 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
      * The unscaled case is different and is handled by the fourth pass below:
      * there the address computation genuinely stays in the loop, because a
      * byte access off a stack base never gets folded. */
+    int joins_group = 0;
     if (iv_div_addr_is_dereffed(ir, dest_vr) &&
+        !iv_scaled_deref_postinc_viable(ir, loop, dest_vr, stride, &ivs[iv_idx], shl_idx, -1))
+    {
+      /* Not worth a walk on its own -- but as a member of an affine group on
+       * the same base it reads through the group's pointer at an immediate,
+       * and the group is a win whether or not its own access post-increments
+       * (the offset subtractions and the scaled indexes go regardless). */
+      IROperand base_here = tcc_ir_op_get_src1(ir, q);
+      for (int a = 0; a < naffine && !joins_group; a++)
+        if (affine_stride[a] == stride && iv_same_base(ir, affine_base[a], base_here))
+          joins_group = 1;
+      if (joins_group && ngroup_allow < IV_AFFINE_MAX + 8)
+      {
+        int allow_tmp[IV_AFFINE_MAX + 8];
+        int nt = ngroup_allow;
+        memcpy(allow_tmp, group_allow, sizeof(int) * (size_t)ngroup_allow);
+        allow_tmp[nt++] = shl_idx;
+        if (!iv_ctr_eliminable_list(ir, loop, ivs[iv_idx].vreg, ivs[iv_idx].def_idx, allow_tmp, nt))
+          joins_group = 0;
+        else
+          group_allow[ngroup_allow++] = shl_idx;
+      }
+    }
+    if (iv_div_addr_is_dereffed(ir, dest_vr) && !joins_group &&
         !iv_scaled_deref_postinc_viable(ir, loop, dest_vr, stride, &ivs[iv_idx], shl_idx, -1))
     {
       LOG_IV_SR("IV_SR: Skipping scaled deref DIV at idx=%d — address folds into the addressing mode anyway", i);
@@ -565,6 +846,9 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     divs[num_divs].use_idx = i;
     divs[num_divs].shl_idx = shl_idx;
     divs[num_divs].share_with = -1;
+    divs[num_divs].offset = 0;
+    divs[num_divs].off_idx = -1;
+    divs[num_divs].origin = 0;
     num_divs++;
 
     LOG_IV_SR("IV_SR: Found DIV base+%d*VAR%d at ADD idx=%d (SHL idx=%d)", stride, TCCIR_DECODE_VREG_POSITION(iv_vr), i,
@@ -702,6 +986,9 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     divs[num_divs].use_idx = i;
     divs[num_divs].shl_idx = -1; /* fused into MLA — nothing to NOP */
     divs[num_divs].share_with = -1;
+    divs[num_divs].offset = 0;
+    divs[num_divs].off_idx = -1;
+    divs[num_divs].origin = 0;
     num_divs++;
 
     if (dbg_mlaiv())
@@ -709,7 +996,19 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     LOG_IV_SR("IV_SR: Found MLA-DIV base+%d*VAR%d at MLA idx=%d (fused)", stride, TCCIR_DECODE_VREG_POSITION(iv_vr), i);
   }
 
-  /* Third pass: LOAD_INDEXED/STORE_INDEXED DIV — index is a BIV, stride = iv.step*(1<<scale) */
+  /* Third pass: LOAD_INDEXED/STORE_INDEXED DIV — index is a BIV, or a single-use
+   * `BIV + k` / `BIV - k`; stride = iv.step*(1<<scale).
+   *
+   * The affine form is what a sliding window compiles to.  SHA-1's message
+   * expansion, `W[i] = W[i-3] ^ W[i-8] ^ W[i-14] ^ W[i-16]`, reached codegen as
+   * four `subs r3, r2, #k` and four scaled-index loads per iteration, because
+   * only `W[i]` itself was a DIV and the four subtractions then counted as
+   * extra reads of the counter that made it non-eliminable -- so even that one
+   * was refused.  Recognising the offset accesses as DIVs on the SAME base and
+   * stride lets the driver walk one pointer for all of them, each access an
+   * immediate off it (gcc's `ldr r0, [r3, #32]`), with the subtractions and the
+   * counter gone.  Measured on the M33 an immediate offset is also a cycle
+   * cheaper than a scaled register index. */
   for (int bi = 0; bi < loop->num_body_instrs && num_divs < max_divs; bi++)
   {
     int i = loop->body_instrs[bi];
@@ -718,6 +1017,10 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     int is_load = (q->op == TCCIR_OP_LOAD_INDEXED);
     int is_store = (q->op == TCCIR_OP_STORE_INDEXED);
     if (!is_load && !is_store)
+      continue;
+    /* A fused-shift annotation on the index would be lost by substituting an
+     * immediate for it (tccir_operand.c refuses exactly that). */
+    if (tcc_ir_barrel_shift_at(ir, q))
       continue;
 
     IROperand base_op = is_load ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
@@ -746,7 +1049,9 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
       }
     }
 
-    /* Copy-through chase */
+    int aff_off_idx = -1;
+    int aff_k = 0; /* index units; scaled into bytes once the scale is known */
+    /* Copy-through chase, then the affine `iv +/- k` chase */
     if (iv_idx < 0)
     {
       int def = tcc_ir_find_defining_instruction(ir, iv_vr, i);
@@ -763,6 +1068,32 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
               iv_idx = k;
               break;
             }
+          }
+        }
+        else if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB)
+        {
+          int listed = 0;
+          for (int a = 0; a < naffine && !listed; a++)
+            listed = (affine_def[a] == def);
+          if (listed)
+          {
+            int32_t src = irop_get_vreg(tcc_ir_op_get_src1(ir, dq));
+            int64_t k = irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, dq));
+            for (int v = 0; v < num_ivs; v++)
+            {
+              if (ivs[v].vreg == src)
+              {
+                iv_idx = v;
+                break;
+              }
+            }
+            if (iv_idx >= 0 && k >= -1024 && k <= 1024)
+            {
+              aff_off_idx = def;
+              aff_k = (dq->op == TCCIR_OP_SUB) ? -(int)k : (int)k;
+            }
+            else
+              iv_idx = -1;
           }
         }
       }
@@ -801,12 +1132,24 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     if (scale < 0 || scale > 3)
       continue;
     int stride = ivs[iv_idx].step * (1 << scale);
+    int byte_offset = aff_k * (1 << scale);
+    if (byte_offset < -4095 || byte_offset > 4095)
+      continue; /* not an LDR/STR immediate on this target */
 
-    /* Eliminability gate (see iv_ctr_eliminable). */
-    if (!iv_ctr_eliminable(ir, iv_vr, ivs[iv_idx].def_idx, -1, -1))
+    /* Eliminability gate.  With no affine `iv +/- k` access in the loop this is
+     * exactly the historical whole-function, no-whitelist check -- so plain
+     * `a[j]` walks (including one read twice, or under a `break`) behave as
+     * before.  Only when the loop really has the sliding-window shape do the
+     * affine offset computations and group members' SHLs join the whitelist. */
+    int elig;
+    if (naffine > 0)
+      elig = iv_ctr_eliminable_list(ir, loop, ivs[iv_idx].vreg, ivs[iv_idx].def_idx, group_allow, ngroup_allow);
+    else
+      elig = iv_ctr_eliminable(ir, ivs[iv_idx].vreg, ivs[iv_idx].def_idx, -1, -1);
+    if (!elig)
     {
       LOG_IV_SR("IV_SR: Skipping INDEXED-DIV at idx=%d — IV VAR%d not eliminable", i,
-                TCCIR_DECODE_VREG_POSITION(iv_vr));
+                TCCIR_DECODE_VREG_POSITION(ivs[iv_idx].vreg));
       continue;
     }
 
@@ -817,6 +1160,9 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     divs[num_divs].use_idx = i;
     divs[num_divs].shl_idx = -1; /* shift is encoded in the scale field */
     divs[num_divs].share_with = -1;
+    divs[num_divs].offset = byte_offset;
+    divs[num_divs].off_idx = aff_off_idx;
+    divs[num_divs].origin = 0;
     num_divs++;
 
     LOG_IV_SR("IV_SR: Found INDEXED-DIV base+%d*VAR%d at %s idx=%d (scale=%d, stride=%d)", stride,
@@ -930,6 +1276,9 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     divs[num_divs].use_idx = i;
     divs[num_divs].shl_idx = -1; /* no shift to NOP */
     divs[num_divs].share_with = -1;
+    divs[num_divs].offset = 0;
+    divs[num_divs].off_idx = -1;
+    divs[num_divs].origin = 0;
     num_divs++;
 
     LOG_IV_SR("IV_SR: Found unscaled DIV base+%d*VAR%d at ADD idx=%d", ivs[iv_idx].step,

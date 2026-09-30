@@ -17,9 +17,12 @@
 #include "opt_utils.h"
 #include "opt_du.h"
 
-/* A pointer VAR P written exactly once, in the entry block, by `LEA P <-- &V`
- * (V a non-volatile local VAR), and whose own address is never taken, holds &V
- * at every use.  Every deref through P -- or through any TEMP whose defs all
+/* A pointer VAR P whose every definition is `LEA P <-- &V` for the same V (a
+ * non-volatile local VAR), and whose own address is never taken, holds &V at
+ * every use: a use no definition reaches would read an uninitialized local,
+ * which C leaves undefined anyway.  (The Zig C backend reuses one C local per
+ * type, so `t1 = &t0` recurs, and it sets them in every block, not just the
+ * entry.)  Every deref through P -- or through any TEMP whose defs all
  * copy P's value -- therefore denotes V's slot and is rewritten to a direct VAR
  * access.  Valid regardless of escapes: while any LEA of V survives, V stays
  * memory-resident, so *P and the direct access read/write the same storage.
@@ -29,7 +32,8 @@
  *
  * The rewrite reuses a "template" operand cloned from an existing direct lval
  * access of V, so every encoding convention (tag/flags/aux) is preserved
- * exactly; vars with no direct access are skipped. */
+ * exactly.  A V with no such access -- only ever set by a call, say -- gets
+ * the canonical slot form of a 32-bit VAR read instead. */
 
 #define PLF_UNKNOWN (-1)
 #define PLF_CONFLICT (-2)
@@ -59,39 +63,19 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
 
   if (n < 4 || nvar <= 0)
     return 0;
-
-  int dc_stride = 0;
-  uint8_t *dc = ir_opt_build_def_count(ir, n, &dc_stride);
-
-  /* Entry block: everything before the first label or control transfer
-   * dominates the whole function (calls do not end the block). */
-  int entry_end = n;
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    if (i > 0 && q->is_jump_target)
-    {
-      entry_end = i;
-      break;
-    }
-    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP ||
-        q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_RETURNVALUE ||
-        q->op == TCCIR_OP_RETURNVOID)
-    {
-      entry_end = i;
-      break;
-    }
-  }
+  /* A nested function writes a captured P through the static chain, a def
+   * this body never shows. */
+  if ((tcc_state && tcc_state->nb_nested_funcs > 0) || ir->captured_count > 0)
+    return 0;
 
   /* ptr_target[pos(P)] = composite vreg of V, or PLF_UNKNOWN. */
   int32_t *ptr_target = tcc_malloc(nvar * sizeof(int32_t));
   for (int i = 0; i < nvar; i++)
     ptr_target[i] = PLF_UNKNOWN;
 
+  /* Every `LEA P <-- &V` must name the same V... */
   int candidates = 0;
-  for (int i = 0; i < entry_end; i++)
+  for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_LEA || irop_config[q->op].has_src2)
@@ -102,23 +86,39 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
     int32_t v_vr = irop_get_vreg(src);
     if (p_vr < 0 || TCCIR_DECODE_VREG_TYPE(p_vr) != TCCIR_VREG_TYPE_VAR)
       continue;
-    if (v_vr < 0 || TCCIR_DECODE_VREG_TYPE(v_vr) != TCCIR_VREG_TYPE_VAR || src.is_lval)
-      continue;
-    if (!DC_IS_SINGLE_DEF(dc, dc_stride, p_vr))
-      continue;
-    if (plf_vreg_is_volatile(ir, p_vr) || plf_vreg_is_volatile(ir, v_vr))
-      continue;
     int p_pos = TCCIR_DECODE_VREG_POSITION(p_vr);
     if (p_pos >= nvar)
       continue;
-    ptr_target[p_pos] = v_vr;
-    candidates++;
+    int ok = v_vr >= 0 && TCCIR_DECODE_VREG_TYPE(v_vr) == TCCIR_VREG_TYPE_VAR && !src.is_lval &&
+             !plf_vreg_is_volatile(ir, p_vr) && !plf_vreg_is_volatile(ir, v_vr);
+    if (!ok)
+      ptr_target[p_pos] = PLF_CONFLICT;
+    else if (ptr_target[p_pos] == PLF_UNKNOWN)
+      ptr_target[p_pos] = v_vr, candidates++;
+    else if (ptr_target[p_pos] != v_vr)
+      ptr_target[p_pos] = PLF_CONFLICT;
+  }
+  /* ...and P may have no other definition. */
+  for (int i = 0; i < n && candidates; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_LEA || !irop_config[q->op].has_dest)
+      continue;
+    int32_t dvr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR && TCCIR_DECODE_VREG_POSITION(dvr) < nvar)
+      ptr_target[TCCIR_DECODE_VREG_POSITION(dvr)] = PLF_CONFLICT;
+  }
+  candidates = 0;
+  for (int i = 0; i < nvar; i++)
+  {
+    if (ptr_target[i] == PLF_CONFLICT)
+      ptr_target[i] = PLF_UNKNOWN;
+    candidates += ptr_target[i] != PLF_UNKNOWN;
   }
 
   if (!candidates)
   {
     tcc_free(ptr_target);
-    tcc_free(dc);
     return 0;
   }
 
@@ -169,7 +169,6 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
   if (!candidates)
   {
     tcc_free(ptr_target);
-    tcc_free(dc);
     return 0;
   }
 
@@ -193,6 +192,52 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
       continue;
     tmpl[pos] = d;
     tmpl_ok[pos] = 1;
+  }
+  /* A V without one -- set only by a call's result, say -- gets the canonical
+   * slot form of a VAR read, when every operand naming it is 32 bits wide. */
+  {
+    int8_t *vw = tcc_mallocz(nvar); /* 0 unseen, 1 all 32-bit, -1 mixed */
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_NOP || q->op == TCCIR_OP_LEA)
+        continue;
+      for (int s = 0; s < 3; s++)
+      {
+        IROperand o;
+        if (s == 0 && irop_config[q->op].has_dest)
+          o = tcc_ir_op_get_dest(ir, q);
+        else if (s == 1 && irop_config[q->op].has_src1)
+          o = tcc_ir_op_get_src1(ir, q);
+        else if (s == 2 && irop_config[q->op].has_src2)
+          o = tcc_ir_op_get_src2(ir, q);
+        else
+          continue;
+        int32_t vr = irop_get_vreg(o);
+        if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || TCCIR_DECODE_VREG_POSITION(vr) >= nvar)
+          continue;
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        int w32 = irop_get_btype(o) == IROP_BTYPE_INT32 && !o.is_llocal && !o.is_complex;
+        if (vw[pos] == 0)
+          vw[pos] = w32 ? 1 : -1;
+        else if (!w32)
+          vw[pos] = -1;
+      }
+    }
+    for (int pos = 0; pos < nvar; pos++)
+    {
+      if (tmpl_ok[pos] || vw[pos] != 1)
+        continue;
+      int32_t v_vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, pos);
+      if (!tcc_ir_vreg_is_valid(ir, v_vr) || plf_vreg_is_volatile(ir, v_vr))
+        continue;
+      IRLiveInterval *iv = tcc_ir_get_live_interval(ir, v_vr);
+      if (!iv)
+        continue;
+      tmpl[pos] = irop_make_stackoff(v_vr, iv->original_offset, 1, 0, 0, IROP_BTYPE_INT32);
+      tmpl_ok[pos] = 2; /* synthesized: take the access marks from each use */
+    }
+    tcc_free(vw);
   }
 
   /* temp_val[pos(T)]: composite vreg of the V whose address every def of T
@@ -320,6 +365,8 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
 
       IROperand rep = tmpl[v_pos];
       rep.is_unsigned = o.is_unsigned;
+      if (tmpl_ok[v_pos] == 2)
+        rep.aux = o.aux;
       if (s == 0)
         tcc_ir_set_src1(ir, i, rep);
       else if (s == 1)
@@ -419,7 +466,6 @@ int tcc_ir_opt_ptr_local_fwd(TCCIRState *ir)
   tcc_free(tmpl_ok);
   tcc_free(tmpl);
   tcc_free(ptr_target);
-  tcc_free(dc);
   return changes;
 }
 

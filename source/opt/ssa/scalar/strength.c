@@ -20,7 +20,7 @@
  *   UDIV x, 2^n  -> SHR x, n
  *   UMOD x, 2^n  -> AND x, 2^n - 1
  * Multi-instruction patterns (2^n+-1) stay in the pre-SSA pass.
- * is_imm32 / is_power_of_2 come from ssa_opt_helpers.h. */
+ * is_imm32 / is_power_of_2_shift come from ssa_opt_helpers.h. */
 
 static int mul_pick_imm(IROperand src1, IROperand src2,
                         IROperand *val, IROperand *imm)
@@ -36,7 +36,7 @@ OPT_GEN_SSA(sr_mul, TCCIR_OP_MUL) {
   PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
   GUARD(
     when(mul_pick_imm(src1, src2, &val_op, &imm_op));
-    and(is_power_of_2((uint32_t)imm_op.u.imm32, &shift)));
+    and(is_power_of_2_shift((uint32_t)imm_op.u.imm32, &shift)));
   REWRITE(
     .new_op = TCCIR_OP_SHL,
     .src1   = val_op,
@@ -48,7 +48,7 @@ OPT_GEN_SSA(sr_udiv, TCCIR_OP_UDIV) {
   PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
   GUARD(
     when(is_imm32(src2));
-    and(is_power_of_2((uint32_t)src2.u.imm32, &shift)));
+    and(is_power_of_2_shift((uint32_t)src2.u.imm32, &shift)));
   REWRITE(
     .new_op = TCCIR_OP_SHR,
     .src2   = mk_imm(shift));
@@ -59,7 +59,7 @@ OPT_GEN_SSA(sr_umod, TCCIR_OP_UMOD) {
   PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
   GUARD(
     when(is_imm32(src2));
-    and(is_power_of_2((uint32_t)src2.u.imm32, &shift)));
+    and(is_power_of_2_shift((uint32_t)src2.u.imm32, &shift)));
   REWRITE(
     .new_op = TCCIR_OP_AND,
     .src2   = mk_imm((uint32_t)src2.u.imm32 - 1u));

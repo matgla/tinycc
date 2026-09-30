@@ -49,7 +49,7 @@
 
 /* Build a SYMREF callee operand whose token is `tok` (utb_set_tok_str maps
  * `tok` to a name for get_tok_str()-gated logic).  Caller must have called
- * utb_pools_init(ir) first.  Same pattern as test_opt_float_branch.c /
+ * utb_pools_init(ir) first.  Same pattern as
  * test_opt_promote_extra.c. */
 static IROperand utb_callee_named(TCCIRState *ir, Sym *sym, int tok)
 {
@@ -1679,8 +1679,7 @@ UT_TEST(test_get_constant_string_from_symref_negative_addend_returns_null)
  * NOTE ON TESTABILITY: both call sym_push2() / external_global_sym(), which
  * are link stubs in stubs.c that unconditionally return NULL (documented at
  * their definition and already noted by test_opt_constfold.c's
- * float_narrowing / const_string_calls suspected-bug writeups for the SAME
- * root cause).  change_callee_sym() NULL-checks sym_push2()'s result
+ * const_string_calls suspected-bug writeups for the SAME root cause).  change_callee_sym() NULL-checks sym_push2()'s result
  * (if (!ftype.ref) return 0;) so its "always returns 0 under this stub"
  * behavior IS itself a deterministic, sound oracle -- assert it explicitly
  * here so a change to that guard (e.g. losing the NULL check) is caught.

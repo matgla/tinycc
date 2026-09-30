@@ -14,13 +14,17 @@ _FLOAT_CAPTURE_RE = rf"({_FLOAT_RE})"
 
 
 def _expect_line(sut, expected_line: str, *, timeout: int = 1, float_tol: float = 1e-5):
-    """Expect a line from QEMU output.
+    """Expect a line from QEMU output: a whole output line, not text inside one.
+
+    A substring search let test_frame_relayout's wrong "11" pass: its
+    expected "10" was found inside the next line, 2000000031000000121.
 
     If the expected line ends with a float literal (e.g. "sum=3.500000"),
     capture the actual float and compare within tolerance.
     """
     if expected_line is None:
         return
+    expected_line = expected_line.rstrip()
 
     float_matches = list(re.finditer(_FLOAT_RE, expected_line))
     if float_matches:
@@ -35,7 +39,7 @@ def _expect_line(sut, expected_line: str, *, timeout: int = 1, float_tol: float 
             expected_values.append(float(fm.group(0)))
             last_end = fm.end()
         parts.append(re.escape(expected_line[last_end:]))
-        pattern = "".join(parts)
+        pattern = _whole_line("".join(parts))
 
         sut.expect(pattern, timeout=timeout)
         actual_values = [float(sut.match.group(i + 1)) for i in range(len(expected_values))]
@@ -46,7 +50,7 @@ def _expect_line(sut, expected_line: str, *, timeout: int = 1, float_tol: float 
                 )
         return
 
-    sut.expect(_escape_regex(expected_line), timeout=timeout)
+    sut.expect(_whole_line(_escape_regex(expected_line)), timeout=timeout)
 
 MACHINE = "mps2-an505"
 CURRENT_DIR = Path(__file__).parent
@@ -162,6 +166,100 @@ TEST_FILES = [
 
     # inline asm operands may reuse their own live registers in IR mode
     ("bug_inline_asm_reserved_regs.c", 0),
+
+    # `register T x __asm("rN")` locals get a vreg (they aliased the previous
+    # local's stack slot) -- the shape of Zig's C-backend syscall wrappers
+    ("bug_asm_regvar_local.c", 0),
+
+    # values live across inline asm survive its clobbers and pinned operands
+    ("bug_asm_clobber_live_values.c", 0),
+
+    # branch narrowing / CBZ fusion: the rehearsal models mid-function returns
+    # and refuses ranges holding inline asm
+    ("bug_branch_narrow_rehearsal.c", 0),
+
+    # a byte/halfword local read through its own stack slot (after lea_fold)
+    # keeps its width -- Zig's 2-byte `!void` error union test
+    ("bug_narrow_local_slot_width.c", 0),
+
+    # a direct memmove into a global writes it: mod-ref must resolve the
+    # destination at the call site (copy-source forwarding read the new value)
+    ("bug_modref_direct_block_copy.c", 0),
+
+    # small aggregates copied as LOAD/STORE chunks instead of __aeabi_memmove
+    ("test_small_aggregate_copy.c", 0),
+
+    # spill slots reused after their interval expires (incl. eviction victims)
+    ("test_spill_slot_reuse.c", 0),
+
+    # frame objects left unreferenced are dropped, live ones packed (frame.c)
+    ("test_frame_relayout.c", 0),
+    # frame objects with disjoint lifetimes share bytes (frame.c colouring)
+    ("test_frame_colour.c", 0),
+
+    # an array of structs with a VLA member is itself a VLA
+    ("bug_vla_struct_array.c", 0),
+
+    # a constant initializer copied from .rodata keeps its narrow fields narrow
+    ("bug_block_copy_init_narrow.c", 0),
+
+    # an array's address stored into memory keeps the array's initializer
+    ("bug_dse_indexed_store_escape.c", 0),
+
+    # dead-store elimination bounds reads through an address by its object
+    ("test_dse_object_ranges.c", 0),
+    ("test_dse_wide.c", 0),
+
+    # loads/stores through a pointer to a frame object become direct slots
+    ("test_stack_deref_fold.c", 0),
+    ("test_ptr_local_fwd.c", 0),
+    ("test_struct_arg_stack.c", 0),
+    # struct values more than 32 KiB from the frame base (16-bit operand offset)
+    ("test_struct_far_frame.c", 0),
+    # __imag__ x = ... on a complex parameter passed on the stack or split
+    ("test_complex_param_parts.c", 0),
+    # a by-value struct parameter passed on by value (memcpy source bias)
+    ("test_struct_param_pass_on.c", 0),
+    # a local filled by a whole copy of a by-value struct parameter aliases it
+    ("test_param_copy_alias.c", 0),
+    # byte/halfword field stores over a zero-filled local word fold into it
+    ("test_slot_const_store_fold.c", 0),
+    # a function only forwarding its parameters becomes a branch to the callee
+    ("test_pure_forward.c", 0),
+    # struct stack parts of 3-7 words copied by LDM/STM
+    ("test_struct_stack_ldm.c", 0),
+    # static functions with a single call site expand at it (bodies deferred to TU end)
+    ("test_inline_called_once.c", 0),
+    # __builtin_return_address(0) off SP, no frame pointer, in every prologue shape
+    ("test_return_address.c", 0),
+    # alloca's size stays live after the allocation
+    ("test_alloca_live_size.c", 0),
+    # frame objects fully rewritten in each loop iteration share bytes; carried ones do not
+    ("test_frame_loop_lifetimes.c", 0),
+    # a pointer VAR walking a local array has two definitions: nothing is forwarded through it
+    ("test_entry_store_var_walk.c", 0),
+    # stack-passed parameters read more than once are loaded into registers by the prologue
+    ("test_stack_params_in_regs.c", 0),
+    # objects declared first and defined later are laid out once; their bytes are not folded early
+    ("test_tentative_definitions.c", 0),
+    # a small struct returned in r0 is read back masked, and one bool per check fuses into the branch
+    ("test_errunion_bool_checks.c", 0),
+    # a static function identical to one already generated is dropped for it, unless its address is taken
+    ("test_icf_folding.c", 0),
+    # a local copied from a call's own struct buffer is that buffer, anywhere in the function
+    ("test_call_buffer_copy_alias.c", 0),
+    ("test_ldm_block_copy.c", 0),
+    ("bug_addr_temp_reuse_before_def.c", 0),
+    ("bug_sra_narrow_field_undefined.c", 0),
+    ("bug_narrow_field_store_forward.c", 0),
+    ("bug_alive_share_evicted_owner.c", 0),
+    # word copies between frame slots fused into LDM/STM chunks
+    ("test_frame_block_copy.c", 0),
+    ("test_sra.c", 0),
+    ("test_narrow_call_ext.c", 0),
+    ("test_cross_jump.c", 0),
+    ("test_switch_case_merge.c", 0),
+    ("test_self_store.c", 0),
 
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
@@ -575,6 +673,16 @@ TEST_FILES = [
     # loops that should have run (74 of 78 QEMU failures, 2026-08-23).
     ("471_deref_cse_nop_join.c", 0),
 
+    # A 64-bit compare against a constant whose low half is zero compares only
+    # the high words -- one CMP instead of a CMP and a borrow-folding SBCS.
+    # Exact for strict order only, so the test carries the refusals (>, <=,
+    # ==/!=, a non-zero low half, the constant on the left) beside the wins,
+    # and ties -- equal high words, non-zero low word -- in every seed.
+    ("525_cmp_hi_only.c", 0),
+    ("526_bottom_test_ptr_walk.c", 0),
+    # &&/|| whose last operand is a constant: the chain decides, no stale flags
+    ("527_landor_const_last_operand.c", 0),
+
     # Compile-time strlen constant folding
     ("171_strlen_constfold.c", 0),
 
@@ -615,6 +723,14 @@ TEST_FILES = [
     ("nested_capture_array.c", 0),
     ("nested_capture_read.c", 0),
     ("nested_capture_write.c", 0),
+    ("nested_capture_param_stack.c", 0),
+    ("nested_capture_param_reg_noinline.c", 0),
+    ("nested_capture_param_byref.c", 0),
+    ("nested_capture_param_mixed.c", 0),
+    ("nested_capture_64bit.c", 0),
+    ("nested_capture_two_level.c", 0),
+    ("sl_forward_load_redefines_var.c", 0),
+    ("466_alive_share_boundary_coholder.c", 0),
     ("nested_direct_call_args.c", 0),
     ("nested_struct_return.c", 0),
     ("nested_shadowing.c", 0),
@@ -1138,6 +1254,204 @@ TEST_FILES = [
     # C11 _Pragma operator: pack layout via literal + DO_PRAGMA macro idiom.
     ("343_pragma_operator.c", 5),
 
+    # #pragma pack around bodies saved as tokens (static inline, -O1 deferred
+    # and called-once bodies): the token after a body's '}' was read with the
+    # body still capturing, so `f(){} #pragma pack(1) struct S` laid S out
+    # unpacked; replays now use the pack state at the body's definition.
+    ("472_pragma_pack_saved_bodies.c", 0),
+
+    # A signed add that absorbed an unsigned (wrapping) inner add kept the
+    # no-overflow assumption: `(int)(x + 1U) + 1 < (int)x` folded to false.
+    ("473_reassoc_unsigned_into_signed.c", 0),
+
+    # static inline bodies a call site did not expand were parsed after the
+    # end-of-TU late_reopt fold and dead-static analysis: a static written only
+    # there folded to 0, a store read only there was dropped.
+    ("474_late_reopt_owed_inline_bodies.c", 0),
+
+    # -fdrop-unused-statics: forward-declared const objects, unsized arrays,
+    # liveness through function-pointer tables, block-scope prototypes, used
+    # and alias targets -- all deferred to the end of the TU and still defined.
+    ("475_drop_unused_statics.c", 0),
+
+    # Write-only statics lose their stores and their bytes, but only when no
+    # path reads them: through a call, a data pointer, a function table, or a
+    # struct copy.  Stores the frontend's addrtaken used to protect.
+    ("476_write_only_statics.c", 0),
+
+    # Frame copy coalescing: a struct copy whose source dies and whose
+    # destination is born at the copy shares one slot and the copy goes; a
+    # source read later or a destination live before must keep theirs.
+    ("477_frame_copy_coalescing.c", 0),
+
+    # __atomic_load/__atomic_store of 1/2/4 bytes are inline LDR/STR with a
+    # DMB per the memory order -- no runtime helper (libtcc1 has none).
+    ("478_inline_atomic_load_store.c", 0),
+
+    # DSE: a copy of a temp holding one of two stack addresses is still an
+    # address; loads through it keep the stores that filled both objects
+    # (self-hosted tcc crashed on every 64-bit op in data_processing_mop_impl).
+    ("479_dse_ambiguous_addr_copy.c", 0),
+
+    # fputs/printf lowering (fwrite, puts) only when the call is a whole
+    # expression statement: `x = printf(...)` and `int r = fputs(...)` keep
+    # their value (YasOS libc puts returned 1 for every string).
+    ("480_fputs_printf_result_used.c", 0),
+    # An address-taken char/short local passed with no promotion (variadic,
+    # or to a char/short parameter) is read from its home at its own width,
+    # not as a word with the slot's stale upper bytes.
+    ("481_narrow_local_arg_width.c", 0),
+    # `s = f(s)` with `s` a by-value struct parameter in the argument area:
+    # the sret pointer is &s, not the struct's first word.
+    ("482_sret_into_struct_param.c", 0),
+    # A u8/u16 temporary the allocator spills is stored as a word: its reload
+    # is a word load, and a byte store left stale bytes for it (pr82524).
+    ("483_narrow_temp_spill_word.c", 0),
+    # `f(c ? g() : h())` with a struct result: every word of the selected
+    # struct reaches f, not just the first (dead_temp_local).
+    ("484_struct_ternary_arg_copy.c", 0),
+    # A frame over 32 KiB: colouring keeps an object a struct operand names
+    # where it is, since the operand's 16-bit offset would wrap below -32768.
+    ("485_frame_colour_struct_far.c", 0),
+    # An address-taken local whose address leaves through a call result or a
+    # store keeps its slot to the function end (Zig autoHash of a u8, -O0).
+    ("486_addrtaken_escape_slot.c", 0),
+    # A tail-call-only function with an earlier return still gets its epilogue
+    # (InternPool.Alignment.max ran into the next function).
+    ("487_tail_call_early_return.c", 0),
+    # SCCP does not take `&VAR`'s spill placeholder for a frame slot: a memset
+    # through &t0 read as a 0 stored to the spilled by-value parameter.
+    ("488_sccp_var_addr_not_slot.c", 0),
+    # Post-RA reload elimination pins the dropped load's destination and the
+    # stored value together; codegen's scratch fixup moved one of them away.
+    ("489_reload_elim_pins_regs.c", 0),
+    # dse follows a frame object's address through pointer arithmetic into a
+    # VAR; the stores filling the object died while it was read through it.
+    ("490_dse_addr_through_var_add.c", 0),
+    # A frame word-copy run whose loads share one register is not proof the
+    # last word dies: it was read again after the LDM/STM block copy.
+    ("491_block_copy_last_word_live.c", 0),
+    # A struct-copy round trip whose temporary is also read through its
+    # address elsewhere is not a private round trip.
+    ("492_struct_roundtrip_addr_escape.c", 0),
+    # SCCP does not take a direct VAR store's spill placeholder for a frame
+    # slot either (CaptureValue.wrap's case 0 payload folded to 0).
+    ("493_sccp_var_store_not_slot.c", 0),
+    # dead_addrvar deletes STORE_INDEXEDs through a dead local's LEA along
+    # with the LEA; left behind they stored through an undefined register.
+    ("494_dead_addrvar_store_indexed.c", 0),
+    # A stack-copied struct argument whose base scratch is LR loads its words
+    # through another register, and not through a live IP.
+    ("495_stack_struct_arg_base_in_lr.c", 0),
+    # frame_colour follows a frame address through `T <-- V [LOAD]` (a VAR's
+    # value), so storing it escapes the object it points into.
+    ("496_frame_colour_ptr_via_var_load.c", 0),
+    # The ARMv8-M runtime: arm_mem.S's memcpy/memmove/memset at every
+    # alignment, tail length and overlap, and the 64-bit division.
+    ("498_aeabi_mem_div_runtime.c", 0),
+    # ra:redundant_cmp takes no flags from a compare codegen makes a CBZ (sets
+    # none) or from a 64-bit compare (lowered per reader: ORRS for != 0).
+    ("499_redundant_cmp_cbz_i64_flags.c", 0),
+    # An asm statement clobbering LR (a `bl` in it) makes its function save LR.
+    ("500_asm_lr_clobber_is_a_call.c", 0),
+    # Small aggregates copied through a pointer held in a local go inline;
+    # a struct returned into a local is not copied onto itself.
+    ("501_struct_copy_through_pointer_local.c", 0),
+    # ssa:dead_loop's vinfo growth left spare entries claiming instruction 0 as
+    # their definition; ssa:dce deleted it (a loop counter's initial value).
+    ("502_dead_loop_vinfo_grow_def_instr.c", 0),
+    # run_register_coalescing's swap left the per-vreg allocation stale;
+    # ra:reload_elim deleted a reload into a register the swap had moved.
+    ("503_coalesce_swap_stale_allocation.c", 0),
+    # sra: 64-bit fields become VARs, a doubleword also touched a word at a
+    # time two word VARs (PACK64 to read it whole, split stores); sccp folds a
+    # PACK64 of constants and ssa:fold cancels pack/split chains.
+    ("504_sra_wide_doubleword_fields.c", 0),
+    # 64-bit and narrow-constant slot STOREs are SSA defs; a local only ever
+    # stored one constant reads as it (inlined `bits`, int64_t parameters).
+    ("505_const_store_var_forward.c", 0),
+    # A constant-size __aeabi_memmove4/8 struct copy of up to 128 bytes is
+    # emitted inline as LDM/STM; a packed-member copy names plain memmove.
+    ("506_inline_aligned_struct_copy.c", 0),
+    # UMULL/SMULL fold like MUL: by 0 to 0, both-constant to the product (low
+    # words, zero-/sign-extended); zig.h's u128 cross terms on a widened u64.
+    ("507_widening_mul_fold.c", 0),
+    # UMULL + zero-extended words -> UMAAL before RA (opt/ra/umaal_fusion.c):
+    # one/two addends, word views of pairs, loads, bignum row, pair pressure.
+    ("508_umaal_fusion.c", 0),
+    # A byte/halfword STORE into a register temp is a whole def (MOV, or a
+    # word store of the extended value when spilled): not live from entry.
+    ("509_narrow_temp_store_def.c", 0),
+    # x & M / UBFX x,#0,#w is a copy when x cannot hold a bit outside M:
+    # unsigned narrow loads, UBFX fields, temp STORE copies; signed keeps it.
+    ("510_known_zero_extend_fold.c", 0),
+    # SETIF+TEST_ZERO+JUMPIF fused again after phi resolution: the Zig CBE's
+    # one reused `bool t` becomes one single-use temp per check under SSA.
+    ("511_late_setif_branch_fuse.c", 0),
+    # Pointer-returning helpers inline inside another expansion (Zig CBE
+    # header()/acquire() under view()); 930725-1's ternary shape, nested.
+    ("512_nested_inline_ptr_return.c", 0),
+    ("513_param_across_block_copy.c", 0),
+    ("514_inline_large_copies.c", 0),
+    ("515_const_local_table_rodata.c", 0),
+    ("516_symref_struct_arg_from_table.c", 0),
+    ("517_sra_pointer_var_roots.c", 0),
+    ("518_ssa_promote_entry_and_sra_fields.c", 0),
+    ("519_sra_struct_arg_words.c", 0),
+    ("520_sra_copy_and_result_buffer.c", 0),
+    ("521_sra_struct_arg_words_large.c", 0),
+    ("522_unroll_zig_loop_tables.c", 0),
+    ("523_zig_accessor_chain_collapse.c", 0),
+    ("522_sra_narrow_field_read_wider.c", 0),
+    ("524_sra_far_struct_arg.c", 0),
+    ("528_sra_partial_fields.c", 0),
+    ("529_sra_pair_copy.c", 0),
+    ("530_cbz_over_aligned_branch_target.c", 0),
+    ("531_dyn_arg_window.c", 0),
+    ("532_unreachable_branches.c", 0),
+    ("533_inline_scope_caller_object.c", 0),
+    ("534_sccp_entry_store_escaped_call.c", 0),
+    ("535_inline_big_struct_param.c", 0),
+    ("536_frame_relayout_retry_keeps_copies.c", 0),
+    ("537_indexed_chain_deref_base.c", 0),
+    ("538_const_local_table_zero_fill.c", 0),
+    ("539_cprop_store_copy_inline_helper.c", 0),
+    ("540_coalesce_high_pressure_latch.c", 0),
+    ("541_param_home_fwd.c", 0),
+    ("542_sret_nrvo.c", 0),
+    ("543_dead_def_cbz_narrow_ext.c", 0),
+    ("544_frame_word_pair_slot_copy.c", 0),
+    ("545_cross_jump_alloc.c", 0),
+    ("546_ssa_symref_store_def.c", 0),
+    ("548_store_imm_scratch_not_base.c", 0),
+    # Word-aligned copies of 3..32 words call libtcc1's __tcc_wcopy_N: struct
+    # assignment, aligned memcpy, by-value stack arguments (tail call too) and
+    # initialiser images in a leaf; every chain entry, guards around the copy.
+    ("549_copy_stub_calls.c", 0),
+    # SRA: a u16 stored into a word field whose other half is struct padding is
+    # a plain move (Zig error unions), not a read of the old word and a BFI.
+    ("600_sra_padded_partial_store.c", 0),
+    # __builtin_{add,sub,mul}_overflow on 8/16/32-bit results: the 32-bit
+    # add/sub checks and the int-width narrow path, against 64-bit reference.
+    ("601_overflow_builtins_narrow.c", 0),
+    # -Os machine outliner: one template instantiated eight times; its windows
+    # (a jump target at the start, a compare feeding the branch after it, an
+    # IT block inside) become shared bodies called with BL.
+    ("602_outline_shared_windows.c", 0),
+    # awk's record reader: a static helper's out-parameter writes to the
+    # caller's locals were lost at -O1+, so the whole input was one record
+    ("603_inline_outparam_record_split.c", 0),
+    # toysh's expand_arg_nobrace: "if (!ant) ant = &deck;" with the deck
+    # passed as a stack parameter; "ant != &deck" folded to equal
+    ("606_param_ne_local_address.c", 0),
+    # toybox awk's logical NOT, "STKP->num = ! get_set_logical();": a
+    # comparison still in the flags was converted as its compared operand
+    ("607_assign_not_of_call_writing_lhs.c", 0),
+    # toysh's wildcard_matchlen against literal case patterns, and strchr
+    # finding the NUL terminator: device-only shapes, pinned
+    ("604_toysh_wildcard_literal.c", 0),
+    ("605_strchr_nul_terminator.c", 0),
+
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
     # ssa:first_iter_exit migration.
@@ -1449,6 +1763,11 @@ TCC_BUG_TEST_FILES = [
     # ifdef_stack overflow check -> the first `#if` in the predefs reported
     # "memory full (ifdef)" and the self-hosted compiler couldn't preprocess.
     ("bug_cmp_ptr_array_alias.c", 0),
+    # Bug: ra:load_postinc folded `++p` into the first `*p` load while an
+    # outer call still read *p -- its FUNCPARAMVAL sits above the load, but
+    # the value is read at the CALL, below it.  printf got p+1 (FatFs
+    # f_setlabel -> FR_INVALID_NAME in sdformat).
+    ("bug_postinc_call_arg_deref.c", 0),
 
 
 ]
@@ -1584,8 +1903,16 @@ def _escape_regex(line):
     return re.escape(line)
 
 
+def _whole_line(pattern):
+    """Anchor a pattern to one whole output line (the stream is consumed up
+    to each match, so the next line starts right after its newline).  Trailing
+    blanks do not count, as in the upstream tests2 harness: several of those
+    programs print a space before each newline their .expect files omit."""
+    return r"(?m)^" + pattern + r"[ \t]*\r?\n"
+
+
 def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_level="-O0", output_dir=None, timeout=10,
-                   float_abi=None):
+                   float_abi=None, extra_objs=None):
     expected_lines, expect_exit = load_expect_file(test_file)
     if expect_exit is not None:
         expected_exit_code = expect_exit
@@ -1593,7 +1920,7 @@ def _run_qemu_test(test_file, expected_exit_code, args=None, defines=None, opt_l
     if float_abi:
         opt_suffix += f"_{float_abi}"
     config = CompileConfig(extra_cflags=opt_level, output_suffix=opt_suffix, output_dir=output_dir,
-                           float_abi=float_abi)
+                           float_abi=float_abi, extra_objs=extra_objs)
     sut, loglines = run_test(test_file, MACHINE, args, defines=defines, config=config)
     expected_lines = _strip_compiler_output(expected_lines, loglines)
     try:
@@ -1778,6 +2105,25 @@ def test_libm_float_abi(float_abi, opt_level, tmp_path):
                    float_abi=float_abi)
 
 
+# AAPCS32 interop with gcc-built code: abi_mix_b.c is compiled by
+# arm-none-eabi-gcc, main and abi_mix_a.c by tcc, and each side calls the
+# other with structs of 17-36 bytes in registers, split and on the stack
+# (see abi_mix.h).  Built for the suite's float ABI so the objects link.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"abi_gcc_interop{o}" for o in OPT_LEVELS])
+def test_abi_gcc_interop(opt_level, tmp_path):
+    import subprocess
+    from qemu_run import DEFAULT_FLOAT_ABI, DEFAULT_FPU
+    (tmp_path / "gcc").mkdir()
+    gcc_obj = tmp_path / "gcc" / "abi_mix_b_gcc.o"  # outside the build dir `make clean` removes
+    fp = [f"-mfloat-abi={DEFAULT_FLOAT_ABI}"] + ([] if DEFAULT_FLOAT_ABI == "soft" else [f"-mfpu={DEFAULT_FPU}"])
+    r = subprocess.run(["arm-none-eabi-gcc", "-mcpu=cortex-m33", "-mthumb", *fp, "-O2", "-ffunction-sections",
+                        "-c", str(CURRENT_DIR / "abi_mix_b.c"), "-o", str(gcc_obj)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    _run_qemu_test(["abi_mix_main.c", "abi_mix_a.c"], 0, opt_level=opt_level, output_dir=tmp_path / "build",
+                   extra_objs=[gcc_obj])
+
+
 # Nested function xfail tests (not yet implemented)
 def _generate_nested_xfail_params():
     params = []
@@ -1942,6 +2288,45 @@ def test_function_sections_bugs(test_file, expected_exit_code, opt_level, tmp_pa
 
 
 # ---------------------------------------------------------------------------
+# Tests requiring every function in one .text (-fno-function-sections)
+# ---------------------------------------------------------------------------
+
+NO_FUNCTION_SECTIONS_TEST_FILES = [
+    # Late reopt re-emitting a function takes the statics folded onto it
+    # (identical code folding) along to its new body.  With a section per
+    # function the erased body leaves its section empty and the new one lands
+    # where the stale alias still points, so the bug needs one shared .text.
+    ("497_late_reopt_keeps_icf_alias.c", 0),
+]
+
+
+def _generate_no_func_sections_params():
+    params = []
+    ids = []
+    for test_file, expected in NO_FUNCTION_SECTIONS_TEST_FILES:
+        for opt in OPT_LEVELS:
+            params.append((test_file, expected, opt))
+            ids.append(f"{_test_id(test_file)}{opt}")
+    return params, ids
+
+
+_NO_FUNC_SECTIONS_PARAMS, _NO_FUNC_SECTIONS_IDS = (
+    _generate_no_func_sections_params() if NO_FUNCTION_SECTIONS_TEST_FILES else ([], []))
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _NO_FUNC_SECTIONS_PARAMS,
+                         ids=_NO_FUNC_SECTIONS_IDS)
+def test_no_function_sections_bugs(test_file, expected_exit_code, opt_level, tmp_path):
+    """Tests compiled into one .text: the harness Makefile passes
+    -ffunction-sections, and the -fno- form after it wins."""
+    if test_file is None:
+        pytest.fail("test_file is None")
+
+    cflags = f"{opt_level} -fno-function-sections"
+    _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # Tests requiring -fgnu89-inline
 # ---------------------------------------------------------------------------
 
@@ -1994,6 +2379,9 @@ PIC_TEXT_DATA_SEP_TEST_FILES = [
     # set → th_push returns {0,0}.
     ("bug_struct_mask_copy.c", 0),
     ("bug_mask_copy_noloop.c", 0),
+
+    # A call to a static function defined further down skips the R9 reload.
+    ("test_r9_static_forward_call.c", 0),
 ]
 
 

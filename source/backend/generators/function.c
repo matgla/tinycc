@@ -52,8 +52,6 @@ extern int func_has_label_addr;
 extern int local_scope;
 extern int loc;
 extern int nb_temp_local_vars;
-extern int nb_arg_struct_temps;
-extern uint64_t arg_struct_temp_busy;
 extern int rsym;
 extern void vpush_type_size(CType *type, int *a);
 
@@ -66,8 +64,6 @@ extern void vpush_type_size(CType *type, int *a);
 static void gen_instrument_call(Sym *cur_func_sym, const char *hook_name);
 static void func_vla_arg_code(Sym *arg);
 static void func_vla_arg(Sym *sym);
-static int  ir_inline_stash_eligible(Sym *sym, TCCIRState *ir);
-static void ir_inline_stash_add(TCCState *s1, Sym *sym, TCCIRState *ir);
 
 /* A `V` operand (VAR vreg, is_local + is_lval) names a register-resident scalar;
  * every other lval — a stack slot, a symbol, a pointer deref — is real memory,
@@ -107,6 +103,37 @@ static int ir_body_is_register_only(TCCIRState *ir)
   return 1;
 }
 
+/* A static function whose optimized body is at most this many real ops of
+ * straight-line code (see ir_body_is_straight_leaf) is inlined at every call
+ * site, whatever its token length.  The token gate at registration counts
+ * source, and Zig's C backend spells one rotate as ten zig.h helper calls:
+ * math.rotr is 122 tokens, compiles to 20 ops standalone and to two shifts
+ * and an OR once its constant shift amount arrives, and the Zig compiler
+ * called it 10.6M times from BLAKE3.  Swept on that compiler: 16 ops -3.1%
+ * instructions, 24 -9.2%, 32 -9.4%. */
+#define SMALL_LEAF_INLINE_OPS 24
+
+/* Straight-line leaf: no call, no inline asm, no backward jump. */
+static int ir_body_is_straight_leaf(TCCIRState *ir)
+{
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_INLINE_ASM ||
+        q->op == TCCIR_OP_BUILTIN_APPLY || q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_VLA_ALLOC)
+      return 0;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      IROperand jd = tcc_ir_op_get_dest(ir, q);
+      if ((int)irop_get_imm64_ex(ir, jd) <= i)
+        return 0;
+    }
+  }
+  return 1;
+}
+
+TCC_DBG_ENV_STR(dbg_dump_func, "TCC_DUMP_FUNC")
+
 void gen_function(Sym *sym)
 {
   struct scope f = {0};
@@ -133,14 +160,31 @@ void gen_function(Sym *sym)
     gen_fill_nops(newoff - ind);
   }
 
+  func_align_pad = 0;
   funcname = get_tok_str(sym->v, NULL);
   func_ind = ind;
+#ifdef CONFIG_TCC_DEBUG
+  /* TCC_DUMP_FUNC=<name>: -dump-ir / -dump-ir-passes print this function only,
+   * so a whole-TU compile (whose inlining and summaries a cut-down TU does not
+   * reproduce) can still be dumped for the one function that matters. */
+  const int saved_dump_ir = tcc_state->dump_ir;
+  char *const saved_dump_ir_passes = tcc_state->dump_ir_passes;
+  if (dbg_dump_func() && strcmp(dbg_dump_func(), funcname))
+  {
+    tcc_state->dump_ir = 0;
+    tcc_state->dump_ir_passes = NULL;
+  }
+#endif
+  /* Where this body's relocations begin, for tcc_icf_try_fold. */
+  const size_t func_reloc_mark =
+      cur_text_section->reloc ? cur_text_section->reloc->data_offset : 0;
   func_vt = sym->type.ref->type;
   func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
   func_has_label_addr = 0;
   tcc_state->cur_func_sym = sym;
   /* Per-caller budget: see CONST_LOOP_INLINE_BUDGET in gen/builtin/call.c. */
   tcc_state->const_loop_inline_used = 0;
+  tcc_state->nested_inline_budget = NESTED_INLINE_BUDGET;
 
   /* NOTE: we patch the symbol size later */
   put_extern_sym(sym, cur_text_section, ind + 1, 0);
@@ -184,8 +228,6 @@ void gen_function(Sym *sym)
   if (ir->has_static_chain)
     loc -= 4;
   nb_temp_local_vars = 0;
-  nb_arg_struct_temps = 0;
-  arg_struct_temp_busy = 0;
 
   local_scope = 0;
   rsym = -1;
@@ -193,8 +235,6 @@ void gen_function(Sym *sym)
   /* -finstrument-functions: emit entry hook call before function body */
   if (tcc_state->instrument_functions && !sym->type.ref->f.func_no_instrument)
   {
-    tcc_state->force_frame_pointer = 1;
-    tcc_state->force_lr_save = 1;
     gen_instrument_call(sym, "__cyg_profile_func_enter");
   }
 
@@ -236,6 +276,11 @@ void gen_function(Sym *sym)
       if (!nf->sym || !nf->sym->type.ref || !nf->sym->type.ref->f.func_auto_inline)
         continue;
       if (nf->trampoline_needed || nf->nb_captured == 0)
+        continue;
+      /* Marked auto_inline is a hope, not a fact: a call site can decline for
+       * reasons of its own, and the surviving call still reads the captures
+       * through the static chain.  nb_real_calls is the fact. */
+      if (nf->nb_real_calls > 0)
         continue;
       int called_by_sibling = 0;
       int func_tok = nf->sym->v & ~SYM_FIELD;
@@ -335,6 +380,7 @@ void gen_function(Sym *sym)
   int nonstatic_global_copier = 0;
   tcc_ir_opt_run_function_pipeline(ir, sym, func_var, &nonstatic_global_copier);
 
+  tcc_ir_backend_fold_pure_forward(ir, sym);
   tcc_ir_backend_analyze_leaf_and_tail_calls(ir, func_var);
 
   if (tcc_state->do_bench)
@@ -347,6 +393,19 @@ void gen_function(Sym *sym)
 
   tcc_ir_backend_regalloc_pipeline(ir, sym, func_var, &phase_start, funcname,
                                    global_label_stack_start);
+
+  /* Stores writing back what was just loaded from the same frame bytes:
+   * copies between objects frame relayout placed on the same slot. */
+  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("self_store") && tcc_ir_self_store(ir))
+    tcc_ir_dump_after_pass(ir, "self_store");
+
+  /* Repeated single-entry regions (switch case bodies) share one copy. */
+  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("region_merge") && tcc_ir_region_merge(ir))
+    tcc_ir_dump_after_pass(ir, "region_merge");
+
+  /* Identical block tails jumping to the same place share one copy. */
+  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("cross_jump") && tcc_ir_cross_jump(ir))
+    tcc_ir_dump_after_pass(ir, "cross_jump");
 
   tcc_ir_codegen_generate(ir);
 
@@ -446,6 +505,11 @@ void gen_function(Sym *sym)
         real_ops++;
     if (ir->next_instruction_index <= 8 || real_ops == 0)
       sym->type.ref->f.func_auto_inline = 1;
+    else if ((sym->type.t & VT_STATIC) && real_ops <= SMALL_LEAF_INLINE_OPS && ir_body_is_straight_leaf(ir))
+    {
+      sym->type.ref->f.func_auto_inline = 1;
+      sym->type.ref->f.func_small_leaf = 1;
+    }
   }
 
   /* Keep a non-static global-aggregate-copier with a parameter (the fn1/fn2
@@ -535,8 +599,8 @@ void gen_function(Sym *sym)
      * The ≤12 floor keeps tiny loop helpers inlinable for the constant-arg
      * path, where loop_const_sim can still fold the whole thing. */
     int loop_body = has_loop && real_ops > 12;
-    if (call_ops >= 3 || (!naturally_small && ir->next_instruction_index > 24) ||
-        nonstatic_bloat || loop_body)
+    if (!sym->type.ref->f.func_small_leaf &&
+        (call_ops >= 3 || (!naturally_small && ir->next_instruction_index > 24) || nonstatic_bloat || loop_body))
     {
       sym->type.ref->f.func_auto_inline = 0;
     }
@@ -569,11 +633,40 @@ void gen_function(Sym *sym)
     }
   }
 
+  /* TCC_INL_DBG: the post-optimization inline classification of every function (with [INLSITE] lines from
+   * the call sites that expand one). */
+  {
+    static int dbg = -1;
+    if (dbg < 0)
+      dbg = getenv("TCC_INL_DBG") != NULL;
+    if (dbg && ir && sym)
+    {
+      int ro = 0, calls = 0;
+      for (int ii = 0; ii < ir->next_instruction_index; ii++)
+      {
+        int op = ir->compact_instructions[ii].op;
+        ro += op != TCCIR_OP_NOP;
+        calls += op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID;
+      }
+      fprintf(stderr, "[INL] %s slots=%d ops=%d calls=%d auto=%d leaf=%d evalonly=%d heavy=%d bytes=%d\n",
+              get_tok_str(sym->v, NULL), ir->next_instruction_index, ro, calls, sym->type.ref->f.func_auto_inline,
+              sym->type.ref->f.func_small_leaf, sym->type.ref->f.func_eval_only_inline,
+              sym->type.ref->f.func_inline_call_heavy, ind - func_ind);
+    }
+  }
   tcc_debug_funcend(tcc_state, ind - func_ind);
 
   elfsym(sym)->st_size = ind - func_ind;
 
   cur_text_section->data_offset = ind;
+  /* An identical body was generated already: drop this one and let the
+   * symbol point at it (identical code folding). */
+  if (tcc_icf_try_fold(tcc_state, sym, cur_text_section, func_ind, ind - func_ind, func_reloc_mark))
+  {
+    /* The word-alignment pad codegen put in front of the body goes with it. */
+    ind = func_ind - func_align_pad;
+    cur_text_section->data_offset = ind;
+  }
   local_scope = 0;
   label_pop(&global_label_stack, global_label_stack_start, 0);
 
@@ -605,6 +698,10 @@ void gen_function(Sym *sym)
 
   /* It's better to crash than to generate wrong code */
   cur_text_section = NULL;
+#ifdef CONFIG_TCC_DEBUG
+  tcc_state->dump_ir = saved_dump_ir;
+  tcc_state->dump_ir_passes = saved_dump_ir_passes;
+#endif
   funcname = "";       /* for safety */
   func_vt.t = VT_VOID; /* for safety */
   func_var = 0;        /* for safety */
@@ -616,14 +713,7 @@ void gen_function(Sym *sym)
 
   /* do this after funcend debug info */
   next();
-  if (ir_inline_stash_eligible(sym, ir))
-  {
-    ir_inline_stash_add(tcc_state, sym, ir);
-  }
-  else
-  {
-    tcc_ir_free(ir);
-  }
+  tcc_ir_free(ir);
   tcc_state->ir = NULL;
 
   /* Publish the fact that this function's body has been compiled in this
@@ -631,6 +721,79 @@ void gen_function(Sym *sym)
    * callers (and by the inter-procedural noreturn propagation in general). */
   if (sym && sym->type.ref)
     sym->type.ref->f.func_compiled = 1;
+}
+
+/* Parse SYM's body, the current token stream from its '{', for the
+ * diagnostics it raises and nothing else: prune_unused_statics dropped the
+ * function, but an error in it is still an error (gcc reports it too).
+ * The frontend runs as for gen_function -- parameters in scope, code on --
+ * into an IR that is freed afterwards, with tcc_state->check_only keeping
+ * every other product out of the object (see its comment in tcc.h).  No
+ * optimization, no codegen.  Nested function bodies are saved by the parse
+ * and generated only by codegen, so they are not checked. */
+void gen_function_check_only(Sym *sym)
+{
+  struct scope f = {0};
+  Sym *global_label_stack_start = global_label_stack;
+  LabelDiffFixup *fixups_start = tcc_state->label_diff_fixups;
+  const int nested_start = tcc_state->nb_nested_funcs;
+  Section *saved_text = cur_text_section;
+
+  tcc_state->check_only++;
+  cur_scope = root_scope = &f;
+  nocode_wanted = 0;
+  cur_text_section = tcc_state->check_scratch;
+  ind = 0;
+  funcname = get_tok_str(sym->v, NULL);
+  func_ind = 0;
+  func_vt = sym->type.ref->type;
+  func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
+  func_has_label_addr = 0;
+  tcc_state->cur_func_sym = sym;
+  tcc_state->const_loop_inline_used = 0;
+
+  sym_push2(&local_stack, SYM_FIELD, 0, 0);
+  TCCIRState *ir = tcc_ir_alloc();
+  tcc_state->ir = ir;
+  gen_op_vector_reset();
+  ir->is_variadic = func_var;
+  local_scope = 1;
+  tcc_ir_params_add(ir, &sym->type);
+  nb_temp_local_vars = 0;
+  local_scope = 0;
+  rsym = -1;
+  block(0);
+
+  sym_pop(&local_stack, NULL, 0);
+  sym_pop(&all_cleanups, NULL, 0);
+  label_pop(&global_label_stack, global_label_stack_start, 0);
+  while (tcc_state->label_diff_fixups && tcc_state->label_diff_fixups != fixups_start)
+  {
+    LabelDiffFixup *next = tcc_state->label_diff_fixups->next;
+    tcc_free(tcc_state->label_diff_fixups);
+    tcc_state->label_diff_fixups = next;
+  }
+  for (int i = nested_start; i < tcc_state->nb_nested_funcs; i++)
+    if (tcc_state->nested_funcs[i].func_str)
+    {
+      tok_str_free(tcc_state->nested_funcs[i].func_str);
+      tcc_state->nested_funcs[i].func_str = NULL;
+    }
+  tcc_state->nb_nested_funcs = nested_start;
+
+  cur_text_section = saved_text;
+  funcname = "";
+  func_vt.t = VT_VOID;
+  func_var = 0;
+  ind = 0;
+  func_ind = -1;
+  tcc_state->cur_func_sym = NULL;
+  nocode_wanted = DATA_ONLY_WANTED;
+  check_vstack();
+  next();
+  tcc_ir_free(ir);
+  tcc_state->ir = NULL;
+  tcc_state->check_only--;
 }
 
 /* ------------------------------------------------------------------ */
@@ -651,17 +814,8 @@ static void gen_instrument_call(Sym *cur_func_sym, const char *hook_name)
   /* arg0: address of current function */
   vpushsym(&void_ptr_type, cur_func_sym);
 
-  /* arg1: return address (call site) = __builtin_return_address(0)
-   * LR is saved at [FP + PTR_SIZE] in the standard frame record */
-  CType ptr_type;
-  ptr_type.t = VT_VOID;
-  ptr_type.ref = NULL;
-  mk_pointer(&ptr_type);
-  vset(&ptr_type, VT_LOCAL, 0); /* FP value */
-  vpushi(PTR_SIZE);
-  gen_op('+');
-  mk_pointer(&vtop->type);
-  indir();
+  /* arg1: return address (call site) = __builtin_return_address(0) */
+  vpush_return_address();
 
   /* Push the hook function */
   vpush_helper_func(tok_alloc_const(hook_name));
@@ -760,50 +914,4 @@ static void func_vla_arg(Sym *sym)
     tcc_state->vla_param_exprs = NULL;
     tcc_state->nb_vla_param_exprs = 0;
   }
-}
-
-/* Phase 0 inliner stash: keep optimized IR of eligible `static` functions
- * alive past gen_function() so a future inliner pass can splice it into
- * callers. Today there are no consumers — this exists to validate the
- * lifecycle change (no leaks, no regressions) before the splice logic lands. */
-#ifndef IR_INLINE_STASH_SIZE_BUDGET
-#define IR_INLINE_STASH_SIZE_BUDGET 200
-#endif
-
-static int ir_inline_stash_eligible(Sym *sym, TCCIRState *ir)
-{
-  if (!sym || !ir)
-    return 0;
-  if (!(sym->type.t & VT_STATIC))
-    return 0;
-  if (sym->a.addrtaken)
-    return 0;
-  if (!sym->type.ref || sym->type.ref->f.func_type == FUNC_ELLIPSIS)
-    return 0;
-  if (ir->has_static_chain)
-    return 0;
-  if (ir->nb_nested_funcs > 0)
-    return 0;
-  if (ir->naked)
-    return 0;
-#ifdef CONFIG_TCC_ASM
-  if (ir->inline_asm_count > 0)
-    return 0;
-#endif
-  if (ir->next_instruction_index > IR_INLINE_STASH_SIZE_BUDGET)
-    return 0;
-  return 1;
-}
-
-static void ir_inline_stash_add(TCCState *s1, Sym *sym, TCCIRState *ir)
-{
-  if (s1->nb_stashed_func_irs >= s1->stashed_func_irs_capacity)
-  {
-    s1->stashed_func_irs_capacity = s1->stashed_func_irs_capacity ? s1->stashed_func_irs_capacity * 2 : 4;
-    s1->stashed_func_irs =
-        tcc_realloc(s1->stashed_func_irs, s1->stashed_func_irs_capacity * sizeof(StashedFuncIR));
-  }
-  s1->stashed_func_irs[s1->nb_stashed_func_irs].sym = sym;
-  s1->stashed_func_irs[s1->nb_stashed_func_irs].ir = ir;
-  s1->nb_stashed_func_irs++;
 }

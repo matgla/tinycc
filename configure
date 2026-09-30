@@ -176,6 +176,10 @@ for opt do
   ;;
   --enable-ubsan) confvars_set ubsan
   ;;
+  --enable-unity) confvars_set unity
+  ;;
+  --disable-unity) confvars_set unity=no
+  ;;
   --enable-lsan) confvars_set lsan
   ;;
   --with-libgcc) confvars_set libgcc
@@ -197,10 +201,10 @@ for opt do
   esac
 done
 
-# AddressSanitizer is enabled by default for this fork; opt out with
-# --disable-asan (e.g. for fast production / firmware builds).
-if test "$asan_disabled" != "yes"; then
-  confvars_has asan || confvars_set asan
+# AddressSanitizer is opt-in (--enable-asan); --disable-asan, the default,
+# wins over an earlier --enable-asan.
+if test "$asan_disabled" = "yes"; then
+  confvars=$(echo " $confvars " | sed 's/ asan / /g')
 fi
 
 show_help() {
@@ -231,9 +235,12 @@ Advanced options (experts only):
   --extra-ldflags=         specify linker options [$LDFLAGS]
 
   --debug                  include debug info with resulting binaries
-  --enable-asan            enable AddressSanitizer (ASan) [default]
-  --disable-asan           disable AddressSanitizer (ASan)
+  --enable-asan            enable AddressSanitizer (ASan)
+  --disable-asan           disable AddressSanitizer (ASan) [default]
   --enable-ubsan           enable UndefinedBehaviorSanitizer (UBSan)
+  --enable-unity           compile the tcc sources as the grouped TUs listed
+                           in source/unity/unity.mk [default]
+  --disable-unity          compile every tcc source file as its own TU
   --enable-lsan            enable LeakSanitizer (LSan)
   --enable-O0              disable optimizations (GCC -O0)
   --enable-O1              basic optimizations (GCC -O1)

@@ -102,10 +102,33 @@ void __attribute__((noinline)) unary_builtin_overflow(void)
       break;
     }
 
-    if (res_bt == VT_LLONG)
+    /* A 32-bit add or subtract whose operands both convert to the result type
+     * unchanged takes the same arithmetic checks as the 64-bit case, in 32
+     * bits: `r < a` and the sign of `(a ^ r) & (b ^ r)` instead of a 64-bit
+     * sum truncated and compared back (36-46 bytes per check; Zig's
+     * @addWithOverflow is one of these on every u32/i32/usize). */
+    int fits32 = 0;
+    if (res_bt == VT_INT && arith_tok != '*')
+    {
+      fits32 = 1;
+      for (int k = -2; k <= -1; k++)
+      {
+        CType *ot = &vtop[k].type;
+        int obt = ot->t & VT_BTYPE, ouns = (ot->t & VT_UNSIGNED) != 0;
+        if (obt == VT_INT)
+          fits32 &= ouns == is_unsigned;
+        else if (obt == VT_SHORT || obt == VT_BYTE || obt == VT_BOOL)
+          fits32 &= ouns || !is_unsigned;
+        else
+          fits32 = 0;
+      }
+    }
+
+    if (res_bt == VT_LLONG || fits32)
     {
       /* 64-bit result: can't widen further on 32-bit target.
-       * Use arithmetic overflow checks instead. */
+       * Use arithmetic overflow checks instead (and a 32-bit add or
+       * subtract, fits32, the same way at its own width). */
 
       /* Stack: a  b  res_ptr → res_ptr  a  b */
       vrott(3);
@@ -124,7 +147,9 @@ void __attribute__((noinline)) unary_builtin_overflow(void)
 
       CType ll_type;
       ll_type.ref = NULL;
-      if (signed_to_unsigned_mul)
+      if (fits32)
+        ll_type.t = is_unsigned ? (VT_INT | VT_UNSIGNED) : VT_INT;
+      else if (signed_to_unsigned_mul)
         ll_type.t = VT_LLONG; /* signed — preserve sign for overflow check */
       else
         ll_type.t = is_unsigned ? (VT_LLONG | VT_UNSIGNED) : VT_LLONG;
@@ -133,6 +158,17 @@ void __attribute__((noinline)) unary_builtin_overflow(void)
       gen_cast(&ll_type); /* cast a */
       vswap();
       /* Stack: res_ptr  a  b */
+      /* The checks below read a and b again AFTER the store through res_ptr,
+       * which may point at either (`__builtin_add_overflow(a, b, &a)`, gcc
+       * PR85095/PR108789).  Widening to long long loaded them; a cast to the
+       * same 32-bit type does not, so load them here. */
+      if (fits32)
+      {
+        gv(RC_INT);
+        vswap();
+        gv(RC_INT);
+        vswap();
+      }
 
       /* Save copies of a and b for the overflow check. */
       vpushv(vtop);     /* Stack: res_ptr  a  b  b2 */
@@ -433,19 +469,41 @@ void __attribute__((noinline)) unary_builtin_overflow(void)
       break;
     }
 
-    /* 32-bit or smaller result: widen to long long, compute, truncate, compare */
+    /* 32-bit or smaller result: widen, compute, truncate, compare.  When
+     * the result and both operands are 16 bits or narrower the exact result
+     * fits a 32-bit int -- an unsigned one for u16 * u16 -- so there is no
+     * need for long long. */
+    int narrow_all = res_bt == VT_SHORT || res_bt == VT_BYTE || res_bt == VT_BOOL;
+    int ops_unsigned = 1;
+    for (int k = -2; k <= -1; k++)
+    {
+      int obt = vtop[k].type.t & VT_BTYPE;
+      narrow_all &= obt == VT_SHORT || obt == VT_BYTE || obt == VT_BOOL;
+      ops_unsigned &= (vtop[k].type.t & VT_UNSIGNED) != 0;
+    }
     vrott(3); /* → res_ptr  a  b */
 
-    /* Widen both operands to (unsigned) long long */
+    /* Widen both operands to (unsigned) long long, or to int */
     CType wide_type;
     wide_type.ref = NULL;
-    wide_type.t = is_unsigned ? (VT_LLONG | VT_UNSIGNED) : VT_LLONG;
+    if (narrow_all)
+      wide_type.t = (arith_tok == '*' && ops_unsigned) ? (VT_INT | VT_UNSIGNED) : VT_INT;
+    else
+      wide_type.t = is_unsigned ? (VT_LLONG | VT_UNSIGNED) : VT_LLONG;
 
     gen_cast(&wide_type); /* cast b */
     vswap();
     gen_cast(&wide_type); /* cast a */
     vswap();
     /* Stack: res_ptr  a_wide  b_wide */
+    if (narrow_all)
+    {
+      /* As in the fits32 path: loaded before the store through res_ptr. */
+      gv(RC_INT);
+      vswap();
+      gv(RC_INT);
+      vswap();
+    }
 
     gen_op(arith_tok);
     /* Stack: res_ptr  wide_result */

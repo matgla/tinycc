@@ -109,7 +109,13 @@ static const IROptPass propagation_passes[] = {
   /* Runs first so later passes don't work on a body that is about to collapse. */
   PASS_GATED("uninit_ub",        tcc_ir_opt_uninit_local_ub_ex,  0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
   PASS_GATED("uninit_dom_ret",   tcc_ir_opt_uninit_dominates_return_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dce)),
+  /* Before dce, which then takes the compares and counters the folded branches read. */
+  PASS_GATED("unreachable_fold", tcc_ir_opt_unreachable_fold_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_jump_threading)),
   PASS_GATED("dce",              tcc_ir_opt_dce_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dce)),
+  /* A constant local table only read through its address is read from .rodata instead. */
+  PASS_GATED("const_local_table", tcc_ir_opt_const_local_table_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_const_prop)),
+  /* A local filled by a whole copy of a by-value struct parameter becomes the parameter's own memory. */
+  PASS_GATED("param_copy_alias", tcc_ir_opt_param_copy_alias_ex, 0, IR_PASS_INVALIDATES_ALL, FLAG(opt_store_load_fwd)),
   /* Resolves derefs through single-def &local pointers before the const/forwarding cluster below sees them. */
   PASS_GATED("ptr_local_fwd",    tcc_ir_opt_ptr_local_fwd_ex,    0, IR_PASS_INVALIDATES_DU, FLAG(opt_store_load_fwd)),
   /* Must follow dce: its prologue clears stale `addrtaken` flags on VARs whose LEA was just DCE-ed. */
@@ -195,6 +201,8 @@ static const IROptPass late_cleanup_passes[] = {
   /* VLA_ALLOC(size=0) -> NOP, so dead_lea_store (which bails on any VLA_ALLOC) can clean the stack scaffolding. */
   PASS_GATED("zero_vla",         tcc_ir_opt_zero_vla_elim_ex,    0, IR_PASS_INVALIDATES_ALL, FLAG(opt_dead_store)),
   PASS_GATED("byte_store_merge", tcc_ir_opt_byte_store_merge_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
+  /* Byte/halfword field stores over a zero-filled local word fold into its word store. */
+  PASS_GATED("slot_const_store_fold", tcc_ir_opt_slot_const_store_fold_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_redundant_store)),
   PASS_GATED("dse",              tcc_ir_opt_dse_ex,              0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),
   /* Only fires with ir_late_reopt_phase + sym->a.tu_no_readers; must precede the DCE cascade that frees its RHS. */
   PASS_GATED("dead_static_store", tcc_ir_opt_dead_static_store_elim_ex, 0, IR_PASS_INVALIDATES_DU, FLAG(opt_dead_store)),

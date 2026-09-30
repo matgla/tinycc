@@ -7,8 +7,10 @@ MEMORY
 
 ENTRY (Reset_Handler)
 
-__stack_size__ = 0x20000;  /* 8KB stack */
-__heap_size__  = 0x100000; /* 64KB heap */
+/* 1 MiB: gcc torture tests declare up to 0x80100 bytes (dg-require-stack-size),
+ * e.g. pr28982b passes a 256 KiB struct by value next to a 256 KiB local. */
+__stack_size__ = 0x100000; /* 1 MiB stack */
+__heap_size__  = 0x100000; /* 1 MiB heap */
 
 
 SECTIONS

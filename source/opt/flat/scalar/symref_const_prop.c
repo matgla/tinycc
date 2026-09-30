@@ -11,6 +11,8 @@
 
 #define USING_GLOBALS
 
+#include <stdint.h>
+
 #include "ir.h"
 #include "opt.h"
 #include "opt_engine.h"
@@ -102,10 +104,28 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
       if (pos > max_tmp_pos || map[pos].gen != current_gen)
         continue;
 
-      /* Replace with a fresh symref operand carrying use-site flags. */
+      /* Replace with a fresh symref operand carrying use-site flags.  A
+       * STRUCT operand (a by-value struct argument read through the pointer)
+       * keeps its type in u.s.ctype_idx and the symref index in u.s.aux_data
+       * (irop_get_symref_ex); written to u.pool_idx, the index overlaid the
+       * ctype and aux_data named whatever symbol was there before. */
+      const int use_btype = irop_get_btype(opnd);
+      if (use_btype == IROP_BTYPE_STRUCT && map[pos].pool_idx > INT16_MAX)
+        continue;
       IROperand new_opnd = irop_make_symref(-1, map[pos].pool_idx, opnd.is_lval, map[pos].is_local,
-                                            map[pos].is_const, irop_get_btype(opnd));
+                                            map[pos].is_const, use_btype);
+      if (use_btype == IROP_BTYPE_STRUCT)
+      {
+        new_opnd.u.s.ctype_idx = opnd.u.s.ctype_idx;
+        new_opnd.u.s.aux_data = (int16_t)map[pos].pool_idx;
+      }
       new_opnd.is_unsigned = opnd.is_unsigned;
+      /* Same access, its address spelled as the symbol: keep what is proven
+       * about it (not volatile, alignment).  Without NONVOLATILE the load
+       * counts as possibly volatile in any function with a volatile or atomic
+       * access, and global_init will not fold a const table read through it. */
+      if (opnd.is_lval)
+        new_opnd.aux = opnd.aux;
 
       if (slot == 0)
         tcc_ir_set_src1(ir, i, new_opnd);
@@ -129,7 +149,8 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
           if (src1.is_sym && !src1.is_lval && pos <= max_tmp_pos)
           {
             map[pos].gen = current_gen;
-            map[pos].pool_idx = (uint32_t)src1.u.pool_idx;
+            map[pos].pool_idx = irop_get_btype(src1) == IROP_BTYPE_STRUCT ? (uint32_t)(uint16_t)src1.u.s.aux_data
+                                                                          : (uint32_t)src1.u.pool_idx;
             map[pos].btype = irop_get_btype(src1);
             map[pos].is_local = src1.is_local;
             map[pos].is_const = src1.is_const;

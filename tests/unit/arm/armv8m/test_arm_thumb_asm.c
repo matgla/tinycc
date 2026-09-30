@@ -248,8 +248,9 @@ static void make_asm_operand(ASMOperand *op, SValue *sv, const char *constraint,
   sv->r = r_location;
 }
 
-/* Variant for the specific-register path: VT_LOCAL + a Sym whose r field
- * encodes the requested physical register. */
+/* Variant for the specific-register path: a `register T x __asm("rN")`
+ * operand, which parse_asm_operands records in op->regvar (VT_LOCAL + a Sym
+ * whose r field names the register is the parse-time shape it comes from). */
 static void make_asm_operand_with_local_sym(ASMOperand *op, SValue *sv, Sym *sym, const char *constraint,
                                             int forced_reg)
 {
@@ -262,6 +263,7 @@ static void make_asm_operand_with_local_sym(ASMOperand *op, SValue *sv, Sym *sym
   sv->r = VT_LOCAL;
   sv->sym = sym;
   sym->r = (unsigned short)forced_reg;
+  op->regvar = 1 + forced_reg;
 }
 
 /* Minimal in-memory section setup for g()/gen_le*() tests. */

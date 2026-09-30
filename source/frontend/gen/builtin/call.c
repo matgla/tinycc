@@ -94,6 +94,26 @@ int redirect_call_to_tcc_helper(SValue *saved_args, int nargs, const char *helpe
  * function, those locals only exist on the stack when actually processing
  * a call expression, not during every recursive unary() invocation.
  * This saves ~3000+ bytes per unary() stack frame. */
+/* Whether SYM's body is already being expanded further out: expanding it
+ * again is recursion, which token replay would unroll without end. */
+static int inline_expansion_in_progress(Sym *sym)
+{
+  int depth = tcc_state->inline_expansion_depth < INLINE_NEST_MAX ? tcc_state->inline_expansion_depth : INLINE_NEST_MAX;
+  for (int i = 0; i < depth; i++)
+    if (tcc_state->inline_expansion_syms[i] == sym)
+      return 1;
+  return 0;
+}
+
+/* Whether the call whose callee sits at vtop is a whole expression statement,
+ * so nothing reads its value.  `;` after the call is not enough: `x = f();` and
+ * `int r = f();` end the same way.  The callee must sit directly on the
+ * statement's base; an assignment's lvalue would be between them. */
+static int call_result_discarded(void)
+{
+  return tok == ';' && discarded_call_vtop != NULL && vtop - 1 == discarded_call_vtop;
+}
+
 void unary_funcall(void)
 {
   int n, t, r, size, align;
@@ -137,24 +157,32 @@ void unary_funcall(void)
    * correct chain pointer from our own incoming chain — emitting SET_CHAIN
    * would clobber it with R7 which may be an unrelated frame pointer. */
   int set_chain_ir_idx = -1;
+  /* The nested function this call targets, if any.  Its nb_real_calls counts
+   * the call sites that actually emitted a call: incremented here, decremented
+   * again below wherever the body is inlined instead.  gen_function needs the
+   * exact count — "the callee is marked auto_inline" is not the same thing as
+   * "every call site inlined it", and clearing a capture's addrtaken on that
+   * guess leaves the surviving call reading chain offset 0. */
+  NestedFunc *call_nf = NULL;
   if (tcc_state->ir && call_func_sym && call_func_sym->a.nested_func)
   {
     int emit_set_chain = 1;
+    for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
+    {
+      if (tcc_state->nested_funcs[ni].sym == call_func_sym)
+      {
+        call_nf = &tcc_state->nested_funcs[ni];
+        break;
+      }
+    }
+    if (call_nf)
+      call_nf->nb_real_calls++;
     if (tcc_state->current_nested_func)
     {
       /* Caller is a nested function.  Determine if callee is our child
        * (defined inside our body) or a sibling (defined in the same parent
        * scope).  Only emit SET_CHAIN for child calls. */
-      NestedFunc *callee_nf = NULL;
-      for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
-      {
-        if (tcc_state->nested_funcs[ni].sym == call_func_sym)
-        {
-          callee_nf = &tcc_state->nested_funcs[ni];
-          break;
-        }
-      }
-      if (callee_nf && callee_nf->parent_nf != tcc_state->current_nested_func)
+      if (call_nf && call_nf->parent_nf != tcc_state->current_nested_func)
       {
         /* Sibling call: R10 already has the correct parent FP */
         emit_set_chain = 0;
@@ -260,7 +288,8 @@ void unary_funcall(void)
       }
       else
       {
-        loc = (loc - size) & -align;
+        loc = tcc_ir_frame_alloc_ret_temp(loc, size, -align);
+        tcc_ir_frame_note_type(loc, &s->type);
         sret_loc = loc;
       }
       ret.type = s->type;
@@ -321,6 +350,7 @@ void unary_funcall(void)
           LOG_CODEGEN("FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
                       TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+          tcc_ir_frame_note_sret_call(call_id, size);
         }
         vtop--;
         nb_args++;
@@ -365,7 +395,9 @@ void unary_funcall(void)
   int can_inline_builtin = 0;
   int can_inline_eval = 0;
   int can_optimize_string_builtin = 0;
+  int can_optimize_fputs_family = 0;
   const char *func_name = NULL;
+  int inl_first_obj = 0; /* frame objects of an inline expansion start here (tcc_ir_frame_scope_end) */
 
   /* Check if we have a named function that might be foldable */
   if (call_func_sym && call_func_sym->v >= TOK_IDENT)
@@ -392,6 +424,15 @@ void unary_funcall(void)
     }
 
     can_optimize_string_builtin = resolve_str_builtin_id(call_func_sym->v, func_name) != STRBI_UNKNOWN;
+
+    /* The fputs lowering below needs the arguments saved.  can_try_fold's
+     * first-letter screen passes fputs and fputs_unlocked but not
+     * __builtin_fputs_unlocked, which is a lazily declared prototype that
+     * keeps its own name -- so that one was never lowered, and with a
+     * user-supplied fputs that aborts inside main (gcc_execute
+     * builtins/fputs) the call reached it. */
+    can_optimize_fputs_family = func_name && (strcmp(func_name, "fputs") == 0 || strcmp(func_name, "fputs_unlocked") == 0 ||
+                                              strcmp(func_name, "__builtin_fputs_unlocked") == 0);
   }
 
   /* Check if the callee is a small inline function we might evaluate.
@@ -537,7 +578,7 @@ void unary_funcall(void)
    * 7. Replay only the fixed arg tokens for normal call parsing
    */
   if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_va_arg_pack &&
-      (call_func_sym->type.t & VT_INLINE))
+      (call_func_sym->type.t & VT_INLINE) && !tcc_state->check_only)
   {
     /* Find the InlineFunc for this symbol */
     struct InlineFunc *orig_fn = NULL;
@@ -782,10 +823,17 @@ void unary_funcall(void)
 
       /* Register clone as inline function */
       struct InlineFunc *clone_fn;
-      clone_fn = tcc_malloc(sizeof *clone_fn + strlen(orig_fn->filename));
+      clone_fn = tcc_mallocz(sizeof *clone_fn + strlen(orig_fn->filename));
       strcpy(clone_fn->filename, orig_fn->filename);
       clone_fn->sym = clone_sym;
       clone_fn->func_str = clone_body;
+      /* the clone replays the original's body: same #pragma pack state */
+      if (orig_fn->pack)
+      {
+        size_t pack_size = sizeof(int) * (orig_fn->pack[0] + 2);
+        clone_fn->pack = tcc_malloc(pack_size);
+        memcpy(clone_fn->pack, orig_fn->pack, pack_size);
+      }
       dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, clone_fn);
 
       /* Mark the clone as used so gen_inline_functions compiles it */
@@ -844,23 +892,12 @@ va_arg_pack_done:
          * This must happen BEFORE the double-complex materialization below,
          * which converts VT_CONST to VT_LOCAL. */
         if ((can_try_fold || can_inline_builtin || can_inline_eval || can_optimize_printf_family ||
-             can_optimize_string_builtin) &&
+             can_optimize_string_builtin || can_optimize_fputs_family) &&
             saved_arg_count < saved_args_cap && !NOEVAL_WANTED)
         {
           saved_args[saved_arg_count] = *vtop;
-          if (aapcs_last_const_init)
-          {
-            saved_args_cid[saved_arg_count] = tcc_malloc(aapcs_last_const_init_size);
-            memcpy(saved_args_cid[saved_arg_count], aapcs_last_const_init, aapcs_last_const_init_size);
-            saved_args_cid_size[saved_arg_count] = aapcs_last_const_init_size;
-            aapcs_last_const_init = NULL;
-          }
           saved_arg_count++;
           saved_scratch->saved_arg_count = saved_arg_count;
-        }
-        else
-        {
-          aapcs_last_const_init = NULL;
         }
 
         /* Materialize constant complex double/ldouble to a temp local.
@@ -1062,7 +1099,8 @@ va_arg_pack_done:
    *   int g(void) { return f(1); }  // returns 1 at -O1
    */
   int inline_evaled = 0;
-  if (!folded && !inlined && call_func_sym && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
+  if (!folded && !inlined && call_func_sym && saved_arg_count == nb_real_args && !NOEVAL_WANTED &&
+      !tcc_state->check_only)
   {
     if (try_inline_const_eval(call_func_sym, saved_args, saved_arg_count))
     {
@@ -1072,6 +1110,8 @@ va_arg_pack_done:
       tcc_state->ir->next_instruction_index = ir_idx_before_args;
       if (set_chain_ir_idx >= 0 && tcc_state->ir)
         tcc_state->ir->compact_instructions[set_chain_ir_idx].op = TCCIR_OP_NOP;
+      if (call_nf && call_nf->nb_real_calls > 0)
+        call_nf->nb_real_calls--;
       inline_evaled = 1;
     }
   }
@@ -1143,10 +1183,10 @@ va_arg_pack_done:
    *   printf/fprintf("%c", ch)       → putchar/fputc
    *   printf("%s\n", str)            → puts(str)
    * Also handles __printf_chk/__fprintf_chk (extra flag argument).
-   * Only optimize in void context (next token is ';'). */
+   * Only optimize when the call is a whole expression statement. */
   int printf_family_optimized = 0;
   if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && can_optimize_printf_family &&
-      saved_arg_count == nb_real_args && nb_args >= pf_min_args && !nocode_wanted && tok == ';')
+      saved_arg_count == nb_real_args && nb_args >= pf_min_args && !nocode_wanted && call_result_discarded())
   {
     int fmt_len = 0;
     const char *fmt = try_get_constant_string(&saved_args[pf_fmt_idx], &fmt_len);
@@ -1410,9 +1450,8 @@ va_arg_pack_done:
    * or fputc, but the generic lowering is sufficient and correct here. */
   int fputs_family_optimized = 0;
   if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && !printf_family_optimized && func_name &&
-      saved_arg_count == nb_real_args && nb_args >= 2 && !nocode_wanted && tok == ';' &&
-      (strcmp(func_name, "fputs") == 0 || strcmp(func_name, "fputs_unlocked") == 0 ||
-       strcmp(func_name, "__builtin_fputs_unlocked") == 0))
+      saved_arg_count == nb_real_args && nb_args >= 2 && !nocode_wanted && call_result_discarded() &&
+      can_optimize_fputs_family)
   {
     if (ir_idx_before_first_param >= 0)
     {
@@ -1530,16 +1569,25 @@ va_arg_pack_done:
             * every depth but 0, so the nested attempt never starts. */
            (call_func_sym != tcc_state->cur_func_sym || self_inline_ok) &&
            /* Allow nested inlining under controlled conditions:
-            * - Void/struct/integer return: safe at depth < 3.
-            * - Pointer return: still gated to depth<1 to avoid the
-            *   store-then-load-through-return-slot phi pattern (930725-1).
-            * - Depth cap prevents mutual-recursion expansion (pr22379). */
+            * - Void/struct/integer return, never a function already being
+            *   expanded (mutual recursion, pr22379), up to INLINE_NEST_MAX
+            *   deep: zig.h's integer helpers nest five deep (saturating sub ->
+            *   overflow sub -> truncate -> shift), under called-once bodies
+            *   that nest as deep as zig's call chains, and a cap of 3 left the
+            *   innermost helpers as calls in every caller.
+            * - Pointer returns too: the depth<1 gate once kept out the
+            *   store-then-load-through-return-slot phi pattern of 930725-1,
+            *   which no longer reproduces nested (test 512), and it left
+            *   every Zig CBE accessor (`header()`, `acquire()`) called from
+            *   `view()`/`itemPtr()` expansions as a real call. */
            (!tcc_state->in_inline_expansion ||
             call_func_sym->a.nested_func ||
-            (tcc_state->inline_expansion_depth < 3 &&
+            (tcc_state->inline_expansion_depth < INLINE_NEST_MAX &&
+             !inline_expansion_in_progress(call_func_sym) &&
              call_func_sym->type.ref &&
              ((call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID ||
               (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_STRUCT ||
+              (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_PTR ||
               ((call_func_sym->type.ref->type.t & VT_BTYPE) <= VT_LLONG)))))
   {
     /* ---- Token-level inline expansion ----
@@ -1551,14 +1599,10 @@ va_arg_pack_done:
     int force_always_inline = 0;
     int has_addr_of_label = 0;
     int has_inline_asm = 0;
-    for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
-    {
-      if (tcc_state->inline_fns[fi]->sym == call_func_sym)
-      {
-        inline_fn = tcc_state->inline_fns[fi];
-        break;
-      }
-    }
+    /* A body parsed for its diagnostics only expands nothing: the call is
+     * enough to check, and an expansion could consume a body a live call
+     * site still owes. */
+    inline_fn = tcc_state->check_only ? NULL : inline_fn_lookup(tcc_state, call_func_sym);
     if (inline_fn && inline_fn->func_str)
       inline_scan_body_features(inline_fn->func_str, &has_addr_of_label, &has_inline_asm);
     if (call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl &&
@@ -1668,6 +1712,23 @@ va_arg_pack_done:
         skip_ipc_cached = 1;
     }
 
+    /* TCC_CALLED_ONCE_DBG: a called-once callee the site declines (budget, depth, asm...). */
+    {
+      static int dbg = -1;
+      if (dbg < 0)
+        dbg = getenv("TCC_CALLED_ONCE_DBG") != NULL;
+      if (dbg && inline_fn && inline_fn->func_str && call_func_sym->type.ref && call_func_sym->type.ref->f.func_called_once &&
+          !(tcc_state->inline_expansion_depth < 32 && inline_fn->func_str->len <= tcc_state->called_once_budget &&
+            !has_addr_of_label && !has_inline_asm && !func_has_label_addr && !skip_ipc_cached))
+      {
+        extern const char *funcname;
+        fprintf(stderr, "[ONCE] %s len=%d decline=%s budget=%d depth=%d caller=%s\n", func_name, inline_fn->func_str->len,
+                inline_fn->func_str->len > tcc_state->called_once_budget ? "budget"
+                : tcc_state->inline_expansion_depth >= 32                  ? "depth"
+                                                                           : "site",
+                tcc_state->called_once_budget, tcc_state->inline_expansion_depth, funcname ? funcname : "?");
+      }
+    }
     /* Auto-inline: expand small static/inline functions at -O1/-O2 when safe.
      * Don't auto-inline into functions that use computed gotos (&&label):
      * inlining increases register pressure which can force the IJMP codegen
@@ -1693,8 +1754,17 @@ va_arg_pack_done:
                                             tcc_state->current_nested_func)) &&
         /* Only inline functions whose signature is safe: scalar/pointer params
          * that fit in 32-bit registers, and scalar or struct return types.
-         * 64-bit types and struct *parameters* are not handled. */
-        auto_inline_sig_ok(call_func_sym) &&
+         * 64-bit types and struct *parameters* are not handled.  A called-once
+         * function was already vetted by called_once_body_ok and binds any
+         * parameter type the expansion supports; nesting is bounded so a deep
+         * chain of them cannot exhaust the parser's stack, and the caller's
+         * growth by the called_once_budget. */
+        (call_func_sym->type.ref->f.func_called_once
+             ? tcc_state->inline_expansion_depth < 32 && inline_fn->func_str->len <= tcc_state->called_once_budget
+             : auto_inline_sig_ok(call_func_sym) &&
+                   /* below the first level, within the caller's budget */
+                   (!tcc_state->in_inline_expansion || inline_fn->func_str->len <= TINY_INLINE_TOKENS ||
+                    inline_fn->func_str->len <= tcc_state->nested_inline_budget)) &&
         /* Don't inline if call-site argument count doesn't match the function's
          * actual parameter count.  This can happen when calling through a cast
          * to an incompatible function pointer type (e.g. ((int(*)(int))bar)(x)
@@ -1725,6 +1795,17 @@ va_arg_pack_done:
           !inline_body_has_apply_args(inline_fn->func_str) &&
           auto_inline_nonstatic_struct_body_ok(call_func_sym, inline_fn->func_str))
       {
+        {
+          static int dbg = -1;
+          if (dbg < 0)
+            dbg = getenv("TCC_INL_DBG") != NULL;
+          if (dbg)
+          {
+            extern const char *funcname;
+            fprintf(stderr, "[INLSITE] %s into %s depth=%d len=%d\n", get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL),
+                    funcname ? funcname : "?", tcc_state->inline_expansion_depth, inline_fn->func_str->len);
+          }
+        }
         if (TCC_LOG_INLINE_STRUCT)
           fprintf(stderr, "[auto-inline] callsite: inlining %s\n", get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL));
         LOG_INLINE_STRUCT("[auto-inline] callsite: INLINING %s (ret_btype=%d nb_args=%d nb_implicit=%d)",
@@ -1734,6 +1815,10 @@ va_arg_pack_done:
         force_always_inline = 1;
         if (call_func_sym->type.ref->f.func_inline_call_heavy)
           inline_fn->inline_count++;
+        if (call_func_sym->type.ref->f.func_called_once)
+          tcc_state->called_once_budget -= inline_fn->func_str->len;
+        else if (tcc_state->in_inline_expansion && inline_fn->func_str->len > TINY_INLINE_TOKENS)
+          tcc_state->nested_inline_budget -= inline_fn->func_str->len;
       }
       else if (TCC_LOG_INLINE_STRUCT)
       {
@@ -1776,6 +1861,14 @@ va_arg_pack_done:
     }
     if (inline_fn && inline_fn->func_str && (has_addr_of_label || force_always_inline))
     {
+      /* The frame objects this expansion allocates, its parameter copies
+       * first, die with it (tcc_ir_frame_scope_end). Taken here, where every
+       * route into the expansion meets: set only on the auto-inline route it
+       * stayed 0 for an always_inline or `inline` callee, and the scope end
+       * then cut the lifetime of every object of the caller -- GNU make's
+       * target_environment laid its locals over its live hash table and
+       * corrupted the heap. */
+      inl_first_obj = tcc_state->ir ? tcc_state->ir->frame_obj_count : 0;
       /* --- 1. NOP out FUNCPARAMVALs for this call --- */
       if (ir_idx_before_first_param >= 0)
       {
@@ -1800,6 +1893,8 @@ va_arg_pack_done:
        * the inlined body accesses parent variables directly. */
       if (set_chain_ir_idx >= 0 && tcc_state->ir)
         tcc_state->ir->compact_instructions[set_chain_ir_idx].op = TCCIR_OP_NOP;
+      if (call_nf && call_nf->nb_real_calls > 0)
+        call_nf->nb_real_calls--;
 
       /* --- 2. Create parameter locals and store arguments --- */
       Sym *saved_local = local_stack;
@@ -1816,7 +1911,7 @@ va_arg_pack_done:
           psize = 4;
         if (palign < 4)
           palign = 4;
-        loc = (loc - psize) & -palign;
+        loc = tcc_ir_frame_alloc(loc, psize, -palign);
 
         /* Push parameter symbol FIRST so it gets a vreg assigned.
          * Unnamed parameters (v == 0) would crash sym_push because
@@ -1863,20 +1958,13 @@ va_arg_pack_done:
         store_dst.c.i = loc;
         if ((param_sym->type.t & VT_BTYPE) == VT_STRUCT && !(param_sym->type.t & VT_VECTOR))
         {
-          int psz, pal;
-          psz = type_size(&param_sym->type, &pal);
-          if (psz <= 16)
-          {
-            vset(&store_dst.type, store_dst.r, store_dst.c.i);
-            vtop->vr = store_dst.vr;
-            vpushv(&arg_val);
-            vstore();
-            vtop--;
-          }
-          else
-          {
-            tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &arg_val, NULL, &store_dst);
-          }
+          /* A struct argument of any size is the struct itself (AAPCS32 by
+           * value): copy it into the parameter's slot. */
+          vset(&store_dst.type, store_dst.r, store_dst.c.i);
+          vtop->vr = store_dst.vr;
+          vpushv(&arg_val);
+          vstore();
+          vtop--;
         }
         else
         {
@@ -1893,10 +1981,11 @@ va_arg_pack_done:
             arg_data = saved_args_cid[pi];
           if (arg_data)
           {
-            psym->const_init_data = tcc_malloc(psize);
-            memcpy(psym->const_init_data, arg_data, psize);
-            psym->const_init_size = psize;
-            psym->const_init_valid = 1;
+            SymLocalFacts *f = sym_facts(psym);
+            f->const_init_data = tcc_malloc(psize);
+            memcpy(f->const_init_data, arg_data, psize);
+            f->const_init_size = psize;
+            f->const_init_valid = 1;
           }
         }
       }
@@ -1956,7 +2045,7 @@ va_arg_pack_done:
             rsize = 4;
           if (ralign < 4)
             ralign = 4;
-          loc = (loc - rsize) & -ralign;
+          loc = tcc_ir_frame_alloc(loc, rsize, -ralign);
           inline_ret_loc = loc;
         }
 
@@ -2000,6 +2089,8 @@ va_arg_pack_done:
       tcc_state->inline_return_loc = inline_ret_loc;
       tcc_state->inline_return_vr = inline_ret_vr;
       tcc_state->inline_return_redirected = 0;
+      if (tcc_state->inline_expansion_depth < INLINE_NEST_MAX)
+        tcc_state->inline_expansion_syms[tcc_state->inline_expansion_depth] = call_func_sym;
       tcc_state->inline_expansion_depth++;
       root_scope = cur_scope;
 
@@ -2015,10 +2106,13 @@ va_arg_pack_done:
       inline_ts->data.str = tok_str_buf(inline_fn->func_str);
       inline_ts->allocated_len = 1;
       inline_ts->len = inline_fn->func_str->len;
+      int saved_pack[PACK_STACK_SIZE + 1];
+      pp_pack_enter(tcc_state, inline_fn->pack, saved_pack);
       begin_macro(inline_ts, 2);
       next();
       block(0);
       end_macro();
+      pp_pack_leave(tcc_state, saved_pack);
       inline_restore_label_bindings(inline_label_tokens, saved_inline_labels, nb_inline_label_tokens);
 
       tok = saved_tok;
@@ -2031,6 +2125,11 @@ va_arg_pack_done:
       /* Read back inline_return_loc: the struct return handler may have
        * redirected it to point at the source local (skipping a memmove). */
       inline_ret_loc = tcc_state->inline_return_loc;
+      /* The callee's objects die here; the local its return was redirected
+       * into (inline_return_redirected) is the caller's value and lives on. */
+      if (tcc_state->ir)
+        tcc_ir_frame_scope_end(tcc_state->ir, inl_first_obj, tcc_state->ir->next_instruction_index,
+                               tcc_state->inline_return_redirected ? inline_ret_loc : 1);
       tcc_state->in_inline_expansion = saved_in_inline_expansion;
       tcc_state->inline_return_loc = saved_inline_return_loc;
       tcc_state->inline_return_vr = saved_inline_return_vr;
@@ -2214,7 +2313,8 @@ va_arg_pack_done:
         size = (size + regsize - 1) & -regsize;
         if (ret_align > align)
           align = ret_align;
-        loc = (loc - size) & -align;
+        loc = tcc_ir_frame_alloc_ret_temp(loc, size, -align);
+        tcc_ir_frame_note_type(loc, &s->type);
         addr = loc;
         offset = 0;
         for (;;)

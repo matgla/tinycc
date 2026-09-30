@@ -10,8 +10,20 @@
  *   1 -- initial layout.
  *   2 -- architecture section (YaffArchSection) between the module name and
  *        the imported-library table; YaffHeader.arch carries a real YaffArch
- *        instead of a constant 1. */
-#define YAFF_VERSION 2
+ *        instead of a constant 1.
+ *   3 -- the table offsets and the relocation/symbol counts are 32-bit. They
+ *        were 16-bit, which silently capped everything ahead of the code at
+ *        64 KiB: a module with more than ~8k relocations wrapped text_offset
+ *        and the loader read its "code" out of the middle of the relocation
+ *        table. Nothing reported it -- the link succeeded and the image was
+ *        garbage. Found on a 5 MB module (the Zig compiler) whose pre-text
+ *        tables came to 105,440 bytes and whose text_offset read back 39,904.
+ *   4 -- data_alignment and data_alignment_offset: where the per-process data
+ *        region has to start. The loader put it wherever its allocator
+ *        returned, so an object aligned past that -- `static int buf[4]
+ *        __attribute__((aligned(64)))` -- was aligned only against a base the
+ *        linker assumed and nothing reproduced. */
+#define YAFF_VERSION 4
 
 typedef struct {
   uint32_t nbucket;
@@ -118,27 +130,32 @@ typedef struct __attribute__((packed)) YaffHeader {
   uint8_t text_and_data_separation;
   uint16_t version_major;
   uint16_t version_minor;
-  uint16_t symbol_table_relocations_amount;
-  uint16_t local_relocations_amount;
-  uint16_t data_relocations_amount;
-  uint16_t copy_relocations_amount;
-  uint16_t exported_symbols_amount;
-  uint16_t imported_symbols_amount;
+  /* 32-bit since YAFF_VERSION 3: a multi-megabyte module has far more than
+   * 65,535 data relocations, and the old 16-bit counts wrapped in silence. */
+  uint32_t symbol_table_relocations_amount;
+  uint32_t local_relocations_amount;
+  uint32_t data_relocations_amount;
+  uint32_t copy_relocations_amount;
+  uint32_t exported_symbols_amount;
+  uint32_t imported_symbols_amount;
   uint32_t got_length;
   uint32_t got_plt_length;
   uint32_t plt_length;
   /* Offset of the YaffArchSection, which sits between the module name and the
    * imported-library table. Never 0 from YAFF_VERSION 2 on. */
-  uint16_t arch_section_offset;
-  uint16_t imported_libraries_offset;
-  uint16_t relocations_offset;
-  uint16_t imported_symbols_offset;
-  uint16_t exported_symbols_offset;
-  uint16_t text_offset;
-  uint16_t imported_symbols_lookup_offset;
-  uint16_t exported_symbols_lookup_offset;
-  uint16_t imported_symbols_hash_table_offset;
-  uint16_t exported_symbols_hash_table_offset;
+  uint32_t arch_section_offset;
+  uint32_t imported_libraries_offset;
+  uint32_t relocations_offset;
+  uint32_t imported_symbols_offset;
+  uint32_t exported_symbols_offset;
+  /* Where the code starts in the file. This is the field the 16-bit layout
+   * broke on first: it sits behind every table above, so it is the largest
+   * offset in the header and the first one to pass 64 KiB. */
+  uint32_t text_offset;
+  uint32_t imported_symbols_lookup_offset;
+  uint32_t exported_symbols_lookup_offset;
+  uint32_t imported_symbols_hash_table_offset;
+  uint32_t exported_symbols_hash_table_offset;
   /* Per-image stack/heap profile in bytes. 0xFFFFFFFF = use the OS default
    * (kernel-driven stack size; heap free to grow in the shared paged pool).
    * A concrete value lets a program declare its footprint (e.g. shell applets
@@ -153,6 +170,14 @@ typedef struct __attribute__((packed)) YaffHeader {
    * behaviour). When >0, the loader maps it once (XIP, ref-counted) and code
    * reaches it via the rodata anchor GOT slot + R_ARM_RODATA_OFF offsets. */
   uint32_t const_rodata_length;
+  /* Placement of the per-process data region ([data][bss][got], and .rodata
+   * too when it is not shared): the loader starts it at an address A with
+   * A % data_alignment == data_alignment_offset.  data_alignment is the
+   * largest alignment any section in the region asked for (a power of two);
+   * the offset is the region's linked start modulo it, so every object keeps
+   * the alignment it had at link time. */
+  uint32_t data_alignment;
+  uint32_t data_alignment_offset;
 } YaffHeader;
 
 typedef enum YaffSectionCode {

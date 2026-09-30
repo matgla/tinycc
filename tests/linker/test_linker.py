@@ -659,11 +659,12 @@ def test_yaff_output_structure(tinycc_root):
         # tccyaff.h) instead of the "this is ARM" constant format 1 wrote, and
         # backs it with the YaffArchSection at arch_section_offset.
         assert arch == 4  # YAFF_ARCH_ARMV8_M
-        assert yaff_version == 2
+        assert yaff_version == 4
 
-        # YaffArchSection sits at arch_section_offset (u16 at 60) and starts
-        # with its own size, so a loader can read the prefix it understands.
-        arch_section_offset = unpack_from("<H", data, 60)[0]
+        # YaffArchSection sits at arch_section_offset (u32 at 72 since format
+        # 3) and starts with its own size, so a loader can read the prefix it
+        # understands.
+        arch_section_offset = unpack_from("<I", data, 72)[0]
         assert arch_section_offset != 0  # never 0 from format 2 on
         section_size, section_arch = unpack_from("<HB", data, arch_section_offset)
         assert section_size >= 12
@@ -673,6 +674,11 @@ def test_yaff_output_structure(tinycc_root):
         data_length = unpack_from("<I", data, 16)[0]
         bss_length = unpack_from("<I", data, 20)[0]
         entry = unpack_from("<I", data, 24)[0]
+
+        # Format 4: where the loader starts the per-process data region.
+        data_alignment, data_alignment_offset = unpack_from("<II", data, 124)
+        assert data_alignment and data_alignment & (data_alignment - 1) == 0
+        assert data_alignment_offset < data_alignment
 
         # The test program has non-empty code, data, and an entry point.
         assert code_length > 0

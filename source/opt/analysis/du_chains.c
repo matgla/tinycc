@@ -113,7 +113,7 @@ void ir_opt_du_build_mode(TCCIRState *ir, IROptDU *du, uint8_t mode)
         du->use[idx]++;
     }
     /* MLA's 4th accumulator operand is a use; missing it makes its result look dead (seed 4274). */
-    if (q->op == TCCIR_OP_MLA)
+    if (tcc_ir_op_is_mac(q->op))
     {
       int idx = ir_opt_du_idx(du, irop_get_vreg(tcc_ir_op_get_accum(ir, q)));
       if (idx >= 0 && du->use[idx] < 2)

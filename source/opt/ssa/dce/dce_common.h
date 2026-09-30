@@ -14,6 +14,14 @@
 
 struct IRSSAOptCtx;
 
+/* Every dead-store killer: does deleting this instruction delete a volatile
+ * access?  A memory operand marked volatile, or a source naming a volatile
+ * variable -- a fused `STORE dead <- lval(V)` embodies the read of V, and C
+ * requires that read even when the stored-to slot is never read. */
+struct TCCIRState;
+struct IRQuadCompact;
+int dce_instr_reads_volatile(struct TCCIRState *ir, struct IRQuadCompact *q);
+
 /* dead_var_stores + stackloc_stores */
 int sl_temp_has_live_uses(struct IRSSAOptCtx *ctx, int32_t vreg);
 

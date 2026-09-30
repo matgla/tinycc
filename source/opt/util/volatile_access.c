@@ -19,6 +19,18 @@
  * An ordinary ALU op can also embed a deref operand, so every source is
  * checked — but only lvalue ones, so a function that touches volatile memory
  * once does not turn its whole body unremovable. */
+/* Does `op` name a volatile variable (a VAR/PARAM whose live interval carries
+ * is_volatile)?  Its value is whatever the next read returns: two reads are
+ * never provably equal and its initialiser is not its value. */
+int tcc_ir_operand_names_volatile_var(const TCCIRState *ir, IROperand op)
+{
+  int32_t v = irop_get_vreg(op);
+  if (v < 0 || !tcc_ir_vreg_is_valid((TCCIRState *)ir, v))
+    return 0;
+  IRLiveInterval *iv = tcc_ir_get_live_interval((TCCIRState *)ir, v);
+  return iv && iv->is_volatile;
+}
+
 int tcc_ir_instr_access_is_volatile(const TCCIRState *ir, const IRQuadCompact *q)
 {
   if (!ir->func_has_volatile_access)

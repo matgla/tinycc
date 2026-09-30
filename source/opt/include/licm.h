@@ -24,7 +24,9 @@ typedef struct IRLoop
   int start_idx;            /* First instruction in loop */
   int end_idx;              /* Last instruction in loop */
   int preheader_idx;        /* Where to insert hoisted code (-1 if none) */
-  int *body_instrs;         /* Array of instruction indices in loop body */
+  int *body_instrs;         /* Instruction indices in the loop body: a contiguous range, so a
+                               detected loop points into its IRLoops' shared ramp (never
+                               freed per loop) */
   int num_body_instrs;      /* Number of instructions in loop body */
   int body_instrs_capacity; /* Capacity of body_instrs array */
   int depth;                /* Nesting depth */
@@ -35,6 +37,9 @@ typedef struct IRLoops
   IRLoop *loops; /* Array of loops */
   int num_loops; /* Number of loops found */
   int capacity;  /* Capacity of loops array */
+  int *ramp;     /* ramp[k] == k for every instruction; each loop's body_instrs is a
+                    window of it.  One array per detection instead of one copy of every
+                    body -- nested loops in a big function summed to megabytes. */
 } IRLoops;
 
 typedef enum TCCFuncPurity

@@ -165,6 +165,32 @@ void tcc_ir_free(TCCIRState *ir)
     tcc_free(ir->active_set);
   }
 
+  tcc_free(ir->param_forms);
+  ir->param_forms = NULL;
+  if (ir->frame_objs)
+  {
+    tcc_free(ir->frame_objs);
+    ir->frame_objs = NULL;
+  }
+  tcc_free(ir->frame_pads);
+  ir->frame_pads = NULL;
+  if (ir->sret_calls)
+  {
+    tcc_free(ir->sret_calls);
+    ir->sret_calls = NULL;
+  }
+  if (ir->call_dyn_extra)
+  {
+    tcc_free(ir->call_dyn_extra);
+    ir->call_dyn_extra = NULL;
+  }
+  ir->call_dyn_extra_size = 0;
+  if (ir->frame_index)
+  {
+    tcc_free(ir->frame_index);
+    ir->frame_index = NULL;
+  }
+
   if (ir->ir_to_code_mapping)
   {
     tcc_free(ir->ir_to_code_mapping);
@@ -259,7 +285,7 @@ void tcc_ir_free(TCCIRState *ir)
   ir->codegen_dry_insn_scratch = NULL;
   tcc_free(ir->codegen_dry_insn_saves);
   ir->codegen_dry_insn_saves = NULL;
-  tcc_free(ir->codegen_mop_cache);
+  tcc_ir_mop_cache_free(ir->codegen_mop_cache);
   ir->codegen_mop_cache = NULL;
   tcc_free(ir->codegen_cbz_dry_mapping);
   ir->codegen_cbz_dry_mapping = NULL;

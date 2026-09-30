@@ -91,6 +91,9 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
                               int reg_type, int lvalue, int precolored_reg);
 
 void tcc_ls_compact_stack_locations(LSLiveIntervalState *ls, int spill_base);
+/* The same, with the slots ordered by weights[i] (per interval, summed over
+ * the intervals sharing a slot) per byte: the heaviest nearest SP. */
+void tcc_ls_compact_stack_locations_weighted(LSLiveIntervalState *ls, int spill_base, const uint32_t *weights);
 
 void tcc_ls_reset_scratch_cache(LSLiveIntervalState *ls);
 

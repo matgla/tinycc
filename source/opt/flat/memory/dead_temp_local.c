@@ -55,6 +55,11 @@ int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir)
     int32_t dest_vr = irop_get_vreg(dest);
     if (dest_vr > -2 || dest_vr < -9)
       continue;
+    /* A struct operand does not carry its width (dead_local_slot poisons such
+     * a slot for the same reason); the 4 bytes assumed below could drop a
+     * write whose tail is read. */
+    if (irop_get_btype(dest) == IROP_BTYPE_STRUCT)
+      continue;
     int my_off = irop_get_stack_offset(dest);
     int my_w = ir_opt_store_btype_size_bytes(irop_get_btype(dest));
     if (my_w <= 0) my_w = irop_is_64bit(dest) ? 8 : 4;
@@ -72,6 +77,16 @@ int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir)
         IROperand po;
         if (!dtl_read_operand(ir, p, k, &po)) continue;
         if (irop_get_vreg(po) != dest_vr) continue;
+        /* A struct-typed read of the slot -- a by-value struct argument, `PARAM
+         * ?slot` -- covers the whole struct, but its width is not in the
+         * operand, and taking it as 4 bytes dropped the store of every later
+         * word: `f(c ? g() : h())` with an 8-byte struct passed only its first
+         * word (the self-hosted tcc emitted 0x0000 for `cond ? th_uxtb(..) :
+         * th_sxtb(..)`).  Count it as a read of all of it. */
+        if (k != 0 && irop_get_btype(po) == IROP_BTYPE_STRUCT) {
+          alive = 1;
+          continue;
+        }
         int po_off = irop_get_stack_offset(po);
         int po_w = ir_opt_store_btype_size_bytes(irop_get_btype(po));
         if (po_w <= 0) po_w = irop_is_64bit(po) ? 8 : 4;

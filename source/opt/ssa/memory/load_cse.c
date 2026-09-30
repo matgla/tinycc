@@ -1165,7 +1165,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
           int store_btype = irop_get_btype(dest);
           /* dest vreg -1 = real slot (offset is identity); else VAR vreg = named local (placeholder offset) */
           int32_t dest_base = irop_get_vreg(dest);
-          if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
+          /* `StackLoc <- *T` (a fused memory copy) stores what T points at, not
+           * T: only a plain value source is the slot's new contents -- as the
+           * vslot/tvstore/gstore trackers already require. */
+          if (svr >= 0 && src.tag == IROP_TAG_VREG && !src.is_lval &&
+              TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
             sstore_track_vr(st, irop_get_stack_offset(dest), store_btype, svr, dest_base);
           else if (irop_is_immediate(src))
             sstore_track_imm(st, irop_get_stack_offset(dest), store_btype, src, dest_base);
@@ -1210,7 +1214,9 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
             IROperand src = tcc_ir_op_get_src1(ir, q);
             int store_btype = irop_get_btype(dest);
             int32_t svr = irop_get_vreg(src);
-            if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
+            /* Plain value sources only, as above: `*T <- *U` stores *U. */
+            if (svr >= 0 && src.tag == IROP_TAG_VREG && !src.is_lval &&
+                TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_TEMP)
               sstore_track_vr(st, eff_off, store_btype, svr, store_base);
             else if (irop_is_immediate(src))
               sstore_track_imm(st, eff_off, store_btype, src, store_base);

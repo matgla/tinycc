@@ -173,6 +173,25 @@ void tcc_ir_ssa_opt_init(IRSSAOptCtx *ctx, TCCIRState *ir,
   ssa_opt_build_chains(ctx);
 }
 
+/* Grow vinfo to at least `new_cap` entries.  A new entry must read as "no
+ * definition": zero-filled it claimed def_instr 0, and dce_temp_worklist,
+ * seeing a def with no uses, deleted instruction 0 -- whatever it defined.
+ * dead_loop grew vinfo with 16 spare entries that way, and the entry block's
+ * `T31 <- #-5`, a loop counter's initial value, went (test 451). */
+void ssa_opt_vinfo_grow(IRSSAOptCtx *ctx, int new_cap)
+{
+  if (new_cap <= ctx->vinfo_cap)
+    return;
+  ctx->vinfo = tcc_realloc(ctx->vinfo, new_cap * sizeof(IRSSAVregInfo));
+  memset(&ctx->vinfo[ctx->vinfo_cap], 0, (new_cap - ctx->vinfo_cap) * sizeof(IRSSAVregInfo));
+  for (int i = ctx->vinfo_cap; i < new_cap; i++)
+  {
+    ctx->vinfo[i].def_instr = -1;
+    ctx->vinfo[i].def_phi_block = -1;
+  }
+  ctx->vinfo_cap = new_cap;
+}
+
 void tcc_ir_ssa_opt_rebuild(IRSSAOptCtx *ctx)
 {
   for (int i = 0; i < ctx->vinfo_cap; i++) {
@@ -182,13 +201,7 @@ void tcc_ir_ssa_opt_rebuild(IRSSAOptCtx *ctx)
     ctx->vinfo[i].use_cap = 0;
   }
 
-  int new_cap = ctx->ir->next_temporary_variable;
-  if (new_cap > ctx->vinfo_cap) {
-    ctx->vinfo = tcc_realloc(ctx->vinfo, new_cap * sizeof(IRSSAVregInfo));
-    memset(&ctx->vinfo[ctx->vinfo_cap], 0,
-           (new_cap - ctx->vinfo_cap) * sizeof(IRSSAVregInfo));
-    ctx->vinfo_cap = new_cap;
-  }
+  ssa_opt_vinfo_grow(ctx, ctx->ir->next_temporary_variable);
 
   ssa_opt_build_chains(ctx);
 }

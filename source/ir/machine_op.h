@@ -66,22 +66,26 @@ typedef enum
                         * register file from the GPRs of MACH_OP_REG. */
 } MachineOperandKind;
 
+/* Packed to 16 bytes on 32-bit hosts (was 32): codegen keeps five of these per
+ * IR instruction for the whole function (the dry-run MopArgs cache), which was
+ * the peak of compiling a big function on the device.  The flags are 1-bit, so
+ * only ever assign them 0/1 values (compare results, (bool) casts). */
 typedef struct MachineOperand
 {
-  MachineOperandKind kind; /* How to materialize this operand */
-  int btype;               /* IROP_BTYPE_* — compressed base type */
-  int vreg;                /* Original vreg (for debug / liveness queries) */
-  bool needs_deref;        /* Emit a load through this address (VT_LVAL) */
-  bool is_64bit;           /* Two-register value (INT64 or FLOAT64) */
-  bool is_unsigned;        /* Unsigned type (VT_UNSIGNED) */
-  bool is_complex;         /* Complex type (VT_COMPLEX) */
-  bool align4;             /* 64-bit deref only: the accessed address is proven
-                            * >= 4-byte aligned, so LDRD/STRD may be used through
-                            * a general base register (IROperand.align4_ok). */
-  bool underalign_hint;    /* Base of an indexed access whose chain crossed a
-                            * packed member: address may be < 4-byte aligned, so
-                            * the 64-bit indexed lowering must avoid LDRD/STRD
-                            * (IROperand.underalign_hint). */
+  uint8_t kind;                /* MachineOperandKind: how to materialize this operand */
+  uint8_t btype;               /* IROP_BTYPE_* — compressed base type */
+  uint8_t needs_deref : 1;     /* Emit a load through this address (VT_LVAL) */
+  uint8_t is_64bit : 1;        /* Two-register value (INT64 or FLOAT64) */
+  uint8_t is_unsigned : 1;     /* Unsigned type (VT_UNSIGNED) */
+  uint8_t is_complex : 1;      /* Complex type (VT_COMPLEX) */
+  uint8_t align4 : 1;          /* 64-bit deref only: the accessed address is proven
+                                * >= 4-byte aligned, so LDRD/STRD may be used through
+                                * a general base register (IROperand.align4_ok). */
+  uint8_t underalign_hint : 1; /* Base of an indexed access whose chain crossed a
+                                * packed member: address may be < 4-byte aligned, so
+                                * the 64-bit indexed lowering must avoid LDRD/STRD
+                                * (IROperand.underalign_hint). */
+  int vreg;                    /* Original vreg (for debug / liveness queries) */
   union
   {
     struct

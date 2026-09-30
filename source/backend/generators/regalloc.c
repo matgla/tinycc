@@ -112,6 +112,221 @@ static int ir_call_is_tail_positioned(TCCIRState *ir, int call_idx)
   return is_tail;
 }
 
+/* ABI-identical parameter or return types: an argument then lands where the
+ * callee expects it exactly when it lands where this function received it. */
+static int pf_abi_same(CType *a, CType *b)
+{
+  const int ba = a->t & VT_BTYPE, bb = b->t & VT_BTYPE;
+  if ((a->t & VT_COMPLEX) != (b->t & VT_COMPLEX))
+    return 0;
+  if (ba == VT_STRUCT || bb == VT_STRUCT)
+    return ba == bb && a->ref == b->ref;
+  if (ba == VT_VOID || bb == VT_VOID)
+    return ba == bb;
+  if (is_float(a->t) || is_float(b->t))
+    return ba == bb;
+  int aa, ab;
+  return type_size(a, &aa) == type_size(b, &ab);
+}
+
+/* Does FUNCPARAMVAL source `op` hand on parameter `f` exactly as received? */
+static int pf_arg_is_param(IROperand op, const IRParamForm *f)
+{
+  switch (f->kind)
+  {
+  case IR_PF_REG:
+    return irop_get_tag(op) == IROP_TAG_VREG && irop_get_vreg(op) == f->vreg && !op.is_lval;
+  case IR_PF_MEM:
+    return irop_get_tag(op) == IROP_TAG_STACKOFF && irop_get_vreg(op) == f->vreg && op.is_lval && op.is_param &&
+           irop_get_stack_offset(op) == f->off;
+  case IR_PF_HOME:
+    return irop_get_tag(op) == IROP_TAG_STACKOFF && irop_get_vreg(op) < 0 && op.is_lval && !op.is_param &&
+           op.is_local && op.btype == IROP_BTYPE_STRUCT && irop_get_stack_offset(op) == f->off;
+  default:
+    return 0;
+  }
+}
+
+/* A function whose body only hands its parameters, untouched, to one direct
+ * call of an ABI-identical signature and returns what it returns -- the Zig C
+ * backend's forwarding wrappers, `f(a0) { g(a0); }` -- finds every argument
+ * already where the callee expects it: r0-r3 as received, the stack arguments
+ * in the caller's outgoing area.  Its parameters are dropped from the call and
+ * the call becomes the whole function: a branch (tail_call_only).  The one
+ * body instruction besides the parameters, the call and the return that may
+ * appear is the prologue's store of a register-passed struct into its home
+ * slot, from the very registers the callee expects it in. */
+void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
+{
+  if (!ir || !sym || !sym->type.ref || tcc_state->optimize <= 0 || tcc_ir_opt_pass_disabled("pure_forward"))
+    return;
+  Sym *fref = sym->type.ref;
+  if (fref->f.func_type != FUNC_NEW || ir->has_static_chain || ir->captured_count > 0 || ir->naked ||
+      tcc_state->do_debug || tcc_bounds_checking(tcc_state) || tcc_state->instrument_functions)
+    return;
+  if ((fref->type.t & VT_BTYPE) == VT_STRUCT || (fref->type.t & VT_COMPLEX))
+    return; /* an sret pointer the call would get a fresh temporary for */
+  const int np = ir->parameters_count;
+  if (np < 0 || (np > 0 && !ir->param_forms))
+    return;
+
+  const int n = ir->next_instruction_index;
+  int call = -1, ret = -1, nparams = 0, nstores = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    switch (q->op)
+    {
+    case TCCIR_OP_NOP:
+      break;
+    case TCCIR_OP_FUNCPARAMVAL:
+      nparams++;
+      break;
+    case TCCIR_OP_FUNCPARAMVOID:
+      break;
+    case TCCIR_OP_STORE:
+      nstores++;
+      break;
+    case TCCIR_OP_FUNCCALLVAL:
+    case TCCIR_OP_FUNCCALLVOID:
+      if (call >= 0)
+        return;
+      call = i;
+      break;
+    case TCCIR_OP_RETURNVALUE:
+    case TCCIR_OP_RETURNVOID:
+      if (ret >= 0)
+        return;
+      ret = i;
+      break;
+    default:
+      return;
+    }
+  }
+  if (call < 0 || (ret >= 0 && ret < call) || nparams != np)
+    return;
+  IRQuadCompact *cq = &ir->compact_instructions[call];
+  if (ret >= 0 && ir->compact_instructions[ret].op == TCCIR_OP_RETURNVALUE &&
+      (cq->op != TCCIR_OP_FUNCCALLVAL ||
+       irop_get_vreg(tcc_ir_op_get_src1(ir, &ir->compact_instructions[ret])) !=
+           irop_get_vreg(tcc_ir_op_get_dest(ir, cq))))
+    return;
+
+  /* The callee: a direct function of an ABI-identical signature. */
+  IROperand fn = tcc_ir_op_get_src1(ir, cq);
+  if (fn.is_lval || irop_get_vreg(fn) >= 0)
+    return;
+  Sym *callee = irop_get_sym_ex(ir, fn);
+  if (!callee || (callee->type.t & VT_BTYPE) != VT_FUNC || !callee->type.ref)
+    return;
+  Sym *cref = callee->type.ref;
+  if (cref->f.func_type != FUNC_NEW || cref->f.func_call != fref->f.func_call || !pf_abi_same(&fref->type, &cref->type))
+    return;
+  Sym *pa = fref->next, *pb = cref->next;
+  for (; pa && pb; pa = pa->next, pb = pb->next)
+    if (!pf_abi_same(&pa->type, &pb->type))
+      return;
+  if (pa || pb)
+    return;
+  /* A callee in another module is reached through a thunk that swaps in its
+   * own R9 and does not restore ours: it must return here. */
+  if (tcc_state->text_and_data_separation && !tcc_gen_machine_callee_in_this_module(callee))
+    return;
+
+  /* Every argument is the parameter of its position, as received. */
+  const int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, cq)));
+  uint32_t seen = 0;
+  if (np > 32)
+    return;
+  for (int i = 0; i < call; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCPARAMVAL)
+      continue;
+    uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+    int k = TCCIR_DECODE_PARAM_IDX(enc);
+    if (TCCIR_DECODE_CALL_ID(enc) != call_id || k >= np || (seen & (1u << k)) ||
+        !pf_arg_is_param(tcc_ir_op_get_src1(ir, q), &ir->param_forms[k]))
+      return;
+    seen |= 1u << k;
+  }
+  /* Stores: a register-passed struct's words into its home, each from the
+   * PARAM vreg that arrived in the register the callee reads it from. */
+  int home_words = 0;
+  for (int k = 0; k < np; k++)
+    if (ir->param_forms[k].kind == IR_PF_HOME)
+      home_words += ir->param_forms[k].words;
+  if (nstores != home_words)
+    return;
+  for (int i = 0; i < call; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_STORE)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q), v = tcc_ir_op_get_src1(ir, q);
+    int32_t vr = irop_get_vreg(v);
+    if (irop_get_tag(d) != IROP_TAG_STACKOFF || irop_get_vreg(d) >= 0 || !d.is_lval || d.is_param ||
+        d.btype != IROP_BTYPE_INT32 || irop_get_tag(v) != IROP_TAG_VREG || v.is_lval || vr < 0 ||
+        TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_PARAM)
+      return;
+    IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, vr);
+    int32_t off = irop_get_stack_offset(d), ok = 0;
+    for (int k = 0; k < np && !ok; k++)
+    {
+      const IRParamForm *f = &ir->param_forms[k];
+      int w = (off - f->off) / 4;
+      ok = f->kind == IR_PF_HOME && off >= f->off && !((off - f->off) & 3) && w < f->words && iv &&
+           iv->incoming_reg0 == f->reg_base + w;
+    }
+    if (!ok)
+      return;
+  }
+
+  IROperand enc = tcc_ir_op_get_src2(ir, cq);
+  if (irop_get_tag(enc) != IROP_TAG_IMM32)
+    return;
+  enc.u.imm32 = (int32_t)TCCIR_ENCODE_CALL(call_id, 0);
+  tcc_ir_op_set_src2(ir, cq, enc);
+  /* The call keeps one FUNCPARAMVOID, as a call without arguments has: the
+   * backend builds its call sites from them. */
+  int marker = 0;
+  for (int i = 0; i < call; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_FUNCPARAMVAL && !marker)
+    {
+      q->op = TCCIR_OP_FUNCPARAMVOID;
+      tcc_ir_op_set_src2(ir, q, enc);
+      marker = 1;
+    }
+    else if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_STORE)
+      q->op = TCCIR_OP_NOP;
+  }
+  if (!marker)
+  {
+    /* No argument to turn into the marker: a call without parameters is
+     * already one FUNCPARAMVOID and a call; nothing to rewrite. */
+    ir->pure_forward = 0;
+    return;
+  }
+  ir->push_arg_regs = 0;
+  ir->pure_forward = 1;
+}
+
+/* Does an asm statement in this function clobber LR (a `bl` in its body)?
+ * Then LR needs saving like a call does: asm_gen_code saves only r4-r11
+ * around the statement, so a leaf function returned through the LR the asm
+ * left -- into itself.  Counted as a call that is never a tail call. */
+static int ir_asm_clobbers_lr(TCCIRState *ir)
+{
+#ifdef CONFIG_TCC_ASM
+  for (int a = 0; a < ir->inline_asm_count; ++a)
+    if (ir->inline_asms[a].asm_str && ir->inline_asms[a].clobber_regs[14])
+      return 1;
+#endif
+  return 0;
+}
+
 void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
 {
   ir->leaffunc = 1;
@@ -144,7 +359,20 @@ void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
     }
   }
 
-  if (call_count == 1 && !has_complex_fp && !func_var && !ir->has_static_chain && call_idx >= 0)
+  if (ir_asm_clobbers_lr(ir))
+  {
+    ir->leaffunc = 0;
+    call_count = 99;
+  }
+
+  if (ir->pure_forward && call_count == 1)
+  {
+    ir->tail_call_only = 1;
+    ir->leaffunc = 1;
+    return;
+  }
+
+  if (call_count == 1 && !has_complex_fp && !func_var && !ir->push_arg_regs && !ir->has_static_chain && call_idx >= 0)
   {
     if (ir_call_is_tail_positioned(ir, call_idx) && !ir_tail_call_returns_hard_float(ir, call_idx))
     {
@@ -400,6 +628,14 @@ static void run_register_coalescing(TCCIRState *ir)
 
     hint_li->r0 = wanted_reg;
     blocker->r0 = have_reg;
+    /* The post-RA passes still to run before compute_stack_layout copies every
+     * interval into its IRLiveInterval read the registers from there, not from
+     * ls.intervals.  Left stale, ra:reload_elim saw `StackLoc <- R0(P0)` then
+     * `R0(T) <- StackLoc` with T still in the R0 this swap had just taken from
+     * it, deleted the reload as a no-op, and T's new register was never
+     * written. */
+    tcc_ir_stack_reg_assign(ir, hint_li->vreg, hint_li->stack_location, hint_li->r0, hint_li->r1);
+    tcc_ir_stack_reg_assign(ir, blocker->vreg, blocker->stack_location, blocker->r0, blocker->r1);
     ir->ls.dirty_registers |= (1ull << wanted_reg) | (1ull << have_reg);
 
     if (ir->ls.live_regs_by_instruction)
@@ -422,17 +658,78 @@ static void run_register_coalescing(TCCIRState *ir)
   }
 }
 
+/* A vreg's index in one array covering VARs, TEMPs and PARAMs, or -1. */
+static int spill_slot_ref_index(const TCCIRState *ir, int32_t vr)
+{
+  if (vr < 0)
+    return -1;
+  const int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  switch (TCCIR_DECODE_VREG_TYPE(vr))
+  {
+  case TCCIR_VREG_TYPE_VAR:
+    return pos < ir->next_local_variable ? pos : -1;
+  case TCCIR_VREG_TYPE_TEMP:
+    return pos < ir->next_temporary_variable ? ir->next_local_variable + pos : -1;
+  case TCCIR_VREG_TYPE_PARAM:
+    return pos < ir->next_parameter ? ir->next_local_variable + ir->next_temporary_variable + pos : -1;
+  default:
+    return -1;
+  }
+}
+
+/* Static references to each linear-scan interval's vreg: every one of a
+ * spilled vreg is a load or store of its slot. */
+static uint32_t *spill_slot_weights(TCCIRState *ir)
+{
+  const int nv = ir->next_local_variable, nt = ir->next_temporary_variable, np = ir->next_parameter;
+  uint32_t *refs = tcc_mallocz(sizeof(uint32_t) * (size_t)(nv + nt + np + 1));
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    const IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    IROperand ops[4];
+    int n = 0;
+    if (irop_config[q->op].has_dest)
+      ops[n++] = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_src1)
+      ops[n++] = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2)
+      ops[n++] = tcc_ir_op_get_src2(ir, q);
+    if (tcc_ir_op_is_mac(q->op))
+      ops[n++] = tcc_ir_op_get_accum(ir, q);
+    for (int k = 0; k < n; k++)
+    {
+      const int idx = spill_slot_ref_index(ir, irop_get_vreg(ops[k]));
+      if (idx >= 0)
+        refs[idx]++;
+    }
+  }
+  uint32_t *weights = tcc_malloc(sizeof(uint32_t) * (size_t)(ir->ls.next_interval_index + 1));
+  for (int i = 0; i < ir->ls.next_interval_index; i++)
+  {
+    const int idx = spill_slot_ref_index(ir, (int)ir->ls.intervals[i].vreg);
+    weights[i] = idx >= 0 ? refs[idx] : 0;
+  }
+  tcc_free(refs);
+  return weights;
+}
+
 /* ================================================================== */
 /*  Compute final stack layout: min offsets, compact, move coalescing */
 /* ================================================================== */
 static void compute_stack_layout(TCCIRState *ir, int func_var)
 {
   tcc_ls_reset_scratch_cache(&ir->ls);
+  tcc_ir_mark_nested_captured_params(ir);
   tcc_ir_avoid_spilling_stack_passed_params(ir);
 
   /* Initial min-local-offset scan */
   {
     int min_local_offset = 0;
+    /* Nested functions reach a parent's captured locals by their frontend
+     * offsets, so there every offset counts; relayout skips those frames. */
+    const int nested = ir->has_static_chain || tcc_state->nb_nested_funcs > 0;
     (void)0; /* stackoff_count removed — was diagnostic only */
     for (int i = 0; i < ir->next_instruction_index; i++)
     {
@@ -447,7 +744,10 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
       {
         if (irop_is_none(ops[j]))
           continue;
-        if (irop_get_tag(ops[j]) == IROP_TAG_STACKOFF)
+        /* A vreg-backed operand's offset is the frontend's watermark, not a
+         * slot the code addresses; counting it would keep the spills below
+         * frame objects that relayout has moved up (frame.c). */
+        if (irop_get_tag(ops[j]) == IROP_TAG_STACKOFF && (nested || irop_get_vreg(ops[j]) < 0))
         {
           int32_t off = irop_get_stack_offset(ops[j]);
           if (off < min_local_offset)
@@ -459,11 +759,23 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
     {
       loc = min_local_offset;
     }
+    /* The incoming static chain is saved at frame offset -4, and that slot is
+     * not an IR operand — nothing in the scan above can see it.  A nested
+     * function that only forwards the chain to a child of its own (no locals,
+     * no spills) would otherwise have loc raised to 0 here, and its prologue
+     * would store the chain below its own SP, where the child's push lands on
+     * it.  gen_function already reserved these four bytes; keep them. */
+    if (ir->has_static_chain && loc > -4)
+      loc = -4;
     if (func_var && loc > -28)
       loc = -28;
   }
 
-  tcc_ls_compact_stack_locations(&ir->ls, loc);
+  {
+    uint32_t *weights = spill_slot_weights(ir);
+    tcc_ls_compact_stack_locations_weighted(&ir->ls, loc, weights);
+    tcc_free(weights);
+  }
 
   /* Nested-chain detection + live vreg bitmap + min_stack_loc */
   {
@@ -505,7 +817,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
         if (p <= max_vreg_pos)
           live_vregs[p / 8] |= (1 << (p % 8));
       }
-      if (q->op == TCCIR_OP_MLA || q->op == TCCIR_OP_LOAD_INDEXED ||
+      if (tcc_ir_op_is_mac(q->op) || q->op == TCCIR_OP_LOAD_INDEXED ||
           q->op == TCCIR_OP_STORE_INDEXED) {
         int32_t av = irop_get_vreg(tcc_ir_op_get_accum(ir, q));
         if (av >= 0 && TCCIR_DECODE_VREG_TYPE(av) != 0) {
@@ -562,12 +874,16 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
                   li->allocation.offset == 0)
                 continue; /* vreg is register-only; stack slot unused */
               if (li->allocation.offset != 0) {
-                int off = li->allocation.offset + ((int)o->u.imm32 - li->original_offset);
+                int off = li->allocation.offset + (irop_get_stack_offset(*o) - li->original_offset);
                 if (off < min_op_offset)
                   min_op_offset = off;
                 continue;
               }
             }
+            /* Without a slot the operand's offset is only the frontend's
+             * creation-time watermark: machine_op_from_ir never addresses it
+             * (it uses the allocation), so it must not size the frame. */
+            continue;
           }
           int off = (int)irop_get_stack_offset(*o);
           if (off < min_op_offset)
@@ -632,12 +948,13 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
                   li->allocation.offset == 0)
                 continue; /* register-only vreg; stack slot unused */
               if (li->allocation.offset != 0) {
-                int off = li->allocation.offset + ((int)o->u.imm32 - li->original_offset);
+                int off = li->allocation.offset + (irop_get_stack_offset(*o) - li->original_offset);
                 if (off < post_min_op_offset)
                   post_min_op_offset = off;
                 continue;
               }
             }
+            continue; /* a frontend watermark, never addressed (see above) */
           }
           int off = (int)irop_get_stack_offset(*o);
           if (off < post_min_op_offset)
@@ -669,6 +986,7 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
   tcc_ir_register_allocation_params(ir);
   tcc_ir_build_stack_layout(ir);
 }
+
 
 /* ================================================================== */
 /*  Compile nested functions and update symbol info                   */
@@ -807,7 +1125,7 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
   /* Re-check leaf status after all optimizations */
   if (!ir->leaffunc)
   {
-    int still_has_call = 0;
+    int still_has_call = ir_asm_clobbers_lr(ir);
     for (int i = 0; i < ir->next_instruction_index; ++i)
     {
       int op = ir->compact_instructions[i].op;
@@ -828,7 +1146,8 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
    * f2d/d2f conversion calls around a math libcall — which the early
    * analysis could not yet see.  The frame/stack guards in codegen still
    * veto ineligible functions afterwards. */
-  if (!ir->tail_call_only && !ir->has_static_chain && sym && sym->type.ref &&
+  if (!ir->tail_call_only && !ir->has_static_chain && !ir->push_arg_regs && !ir_asm_clobbers_lr(ir) &&
+      sym && sym->type.ref &&
       sym->type.ref->f.func_type != FUNC_ELLIPSIS)
   {
     int call_count = 0, call_idx = -1, has_complex_fp = 0;
@@ -919,6 +1238,13 @@ void tcc_ir_backend_regalloc_pipeline(TCCIRState *ir, Sym *sym, int func_var,
   tcc_pass_timing_begin(&ra_pt, "ra:zero_half64");
   if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("zero_half64"))
     tcc_ir_opt_zero_half64(ir);
+  tcc_pass_timing_end(&ra_pt, -1);
+
+  /* After zero_half64, which clears the side table both passes write to, and
+   * under the same "nothing below rewrites operands" requirement. */
+  tcc_pass_timing_begin(&ra_pt, "ra:cmp_hi_only");
+  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("cmp_hi_only"))
+    tcc_ir_opt_cmp_hi_only(ir);
   tcc_pass_timing_end(&ra_pt, -1);
 
   tcc_pass_timing_begin(&ra_pt, "ra:stack_layout");

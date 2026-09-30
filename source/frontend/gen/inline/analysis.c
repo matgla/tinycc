@@ -98,19 +98,25 @@ int auto_inline_sig_ok(Sym *func_sym)
       return 0;
     if (p->type.t & VT_COMPLEX)
       return 0;
-    /* Only inline small plain structs (≤16 bytes).  Non-static functions with
-     * struct params carrying pointer members can have complex aliasing (a
-     * pointer member aliasing another param) that the optimizer mishandles
-     * after inlining — so for non-static functions require the struct to be
-     * pure scalar/bitfield data.  Vector types and large structs are always
-     * rejected. */
+    /* Struct parameters: a non-static function takes only small plain
+     * structs (<=16 bytes, pure scalar/bitfield data -- a pointer member
+     * aliasing another param is mishandled after inlining).  A static one
+     * takes any size: the expansion binds the argument by the same copy the
+     * call would make, and the copy is what inlining removes -- Zig passes
+     * whole structs by value to accessors that read one field of them
+     * (Sema.Block.src reads src_base_inst of a 100+ byte Block; the slice
+     * accessors take a 20-byte MultiArrayList.Slice).  zig.c -O2 .text -47 KB;
+     * 64 bytes took -38 KB of it.  Vector types are always rejected. */
     if ((p->type.t & VT_BTYPE) == VT_STRUCT)
     {
       if (p->type.t & VT_VECTOR)
         return 0;
       int sz, al;
       sz = type_size(&p->type, &al);
-      if (sz > 16)
+      static int small_only = -1; /* TCC_INLINE_STRUCT_SMALL: the old 16-byte limit for static ones too */
+      if (small_only < 0)
+        small_only = getenv("TCC_INLINE_STRUCT_SMALL") != NULL;
+      if (sz > 16 && (small_only || !(func_sym->type.t & VT_STATIC)))
         return 0;
       if (!(func_sym->type.t & VT_STATIC) && struct_has_pointer_member(&p->type))
         return 0;

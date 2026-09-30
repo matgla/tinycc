@@ -115,6 +115,49 @@ void write_instr_at_nop(TCCIRState *ir, int pos, TccIrOp op, IROperand dest, IRO
   q->operand_base = base;
 }
 
+/* Grow a side table keyed by orig_index to hold index `idx`. */
+static void *orig_table_grow(void *tab, int *len, int idx, size_t elem)
+{
+  if (idx < *len)
+    return tab;
+  int nlen = idx + 1 > 2 * *len ? idx + 1 : 2 * *len;
+  tab = tcc_realloc(tab, (size_t)nlen * elem);
+  memset((char *)tab + (size_t)*len * elem, 0, (size_t)(nlen - *len) * elem);
+  *len = nlen;
+  return tab;
+}
+
+/* Give instruction orig_index `to` the codegen annotations of `from`: the
+ * side tables the backend reads just before codegen (barrel_shifts,
+ * shift64_dead_half, zero_half64, bfi_params) are keyed by orig_index, and a
+ * clone stamped with a fresh index by write_instr_at_nop has none -- an
+ * unrolled `add rd, rn, rm lsl #4` came back as a plain add. */
+void tcc_ir_copy_orig_annotations(TCCIRState *ir, int from, int to)
+{
+  if (from < 0 || to < 0 || from == to)
+    return;
+  if (ir->barrel_shifts && from < ir->barrel_shifts_len && ir->barrel_shifts[from])
+  {
+    ir->barrel_shifts = orig_table_grow(ir->barrel_shifts, &ir->barrel_shifts_len, to, 1);
+    ir->barrel_shifts[to] = ir->barrel_shifts[from];
+  }
+  if (ir->shift64_dead_half && from < ir->shift64_dead_half_len && ir->shift64_dead_half[from])
+  {
+    ir->shift64_dead_half = orig_table_grow(ir->shift64_dead_half, &ir->shift64_dead_half_len, to, 1);
+    ir->shift64_dead_half[to] = ir->shift64_dead_half[from];
+  }
+  if (ir->zero_half64 && from < ir->zero_half64_len && ir->zero_half64[from])
+  {
+    ir->zero_half64 = orig_table_grow(ir->zero_half64, &ir->zero_half64_len, to, 1);
+    ir->zero_half64[to] = ir->zero_half64[from];
+  }
+  if (ir->bfi_params && from < ir->bfi_params_len && ir->bfi_params[from])
+  {
+    ir->bfi_params = orig_table_grow(ir->bfi_params, &ir->bfi_params_len, to, sizeof(uint16_t));
+    ir->bfi_params[to] = ir->bfi_params[from];
+  }
+}
+
 /* Write a SELECT into a NOP slot; 4 pool entries: dest, then, else, cond at base+3. */
 void write_select_at_nop(TCCIRState *ir, int pos, IROperand dest, IROperand then_val,
                                 IROperand else_val, int cond_tok)

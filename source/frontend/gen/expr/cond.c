@@ -90,34 +90,37 @@ void expr_landor(int op)
     }
     nocode_wanted -= f;
   }
-  else if (tcc_state->ir != NULL && i == 0 && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+  else if (tcc_state->ir != NULL && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
   {
-    /* IR mode, || only: the last operand is a compile-time constant false
-     * but earlier operands were runtime values (cc=0, f=0).
+    /* IR mode: the last operand is a compile-time constant but earlier
+     * operands were runtime values (cc=0, f=0).
      *
-     * gvtst_set() would create a synthetic VT_CMP(TOK_EQ) with no real
-     * CMP instruction, causing the next JUMPIF to reuse stale condition
-     * flags from a prior comparison — producing the wrong branch direction.
+     * gvtst_set() would create a synthetic VT_CMP with no real CMP
+     * instruction, so whatever reads it -- a SETIF materialising the value
+     * or the next JUMPIF -- takes stale flags from a prior comparison.
      *
-     * For ||, the chain 't' holds "jump-when-true" entries.  A constant-
-     * false last operand means the overall result depends solely on
-     * whether a prior operand was true → encode as VT_JMP with chain t.
+     * The constant is the operator's neutral element here (a false one
+     * sets f above), so the result is decided by the chain alone:
+     *   ||  't' holds "jump-when-true" entries  -> VT_JMP
+     *   &&  't' holds "jump-when-false" entries -> VT_JMPI
      *
-     * (For &&, i==1, the synthetic VT_CMP(TOK_NE) from gvtst_set happens
-     * to match the stale flags correctly on the fallthrough path, so the
-     * original codepath is valid and must not be replaced.)
+     * && used to go through gvtst_set on the theory that the stale flags
+     * happen to say "true" on the fallthrough path.  They do only when the
+     * previous operand's jump was on EQ: after `!x`, whose jump is on NE,
+     * the fallthrough flags say EQ and `a && !x && 1` came out 0.  The
+     * self-hosted tcc hit it in frame_record's `guard` (tcc_bounds_checking
+     * is the constant 0), dropping the guard byte from every frame object.
      */
     int const_val = (vtop->c.i != 0);
     vpop();
-    if (const_val == 0)
+    if (const_val == i)
     {
-      /* false || … — outcome depends on chain only. */
-      vseti(VT_JMP, t);
+      vseti(i ? VT_JMPI : VT_JMP, t);
     }
     else
     {
-      /* true || … — always true. */
-      vpushi(1);
+      /* Not reached: a constant that decides the result sets f. */
+      vpushi(const_val);
       tcc_ir_backpatch_to_here(tcc_state->ir, t);
     }
   }

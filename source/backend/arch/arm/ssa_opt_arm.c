@@ -85,7 +85,7 @@ int ssa_gen_arm_fuse_mul_add_to_mla(IRSSAOptCtx *ctx, int instr_idx)
    * original SHR def is now a NOP, so the def_op check above doesn't
    * fire — without this guard the MLA fusion would drop the shift. */
   if (ir->barrel_shifts && add_q->orig_index >= 0 &&
-      add_q->orig_index <= ir->max_orig_index &&
+      add_q->orig_index < ir->barrel_shifts_len &&
       ir->barrel_shifts[add_q->orig_index] != 0)
     return 0;
 

@@ -28,3 +28,9 @@ const char *tcc_get_abi_softcall_name(struct SValue *src1, struct SValue *src2,
   (void)src1; (void)src2; (void)dest; (void)op;
   return NULL;
 }
+
+/* From arm-thumb-gen.c — DWARF frame base of a frame-pointer function. */
+int tcc_gen_machine_frame_top_offset(void)
+{
+  return 0;
+}

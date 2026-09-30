@@ -242,7 +242,27 @@ typedef enum TccIrOp
   TCCIR_OP_RBIT,  /* reverse bit order (rbit) */
   TCCIR_OP_REV,   /* reverse byte order in a word (rev)  == bswap32 */
   TCCIR_OP_REV16, /* reverse byte order in each halfword (rev16) */
+  /* dest = this function's return address: __builtin_return_address(0).  Read
+   * from the slot the prologue saved LR to, SP-relative, so it needs no frame
+   * pointer.  No sources; its value depends on the call site, so a function
+   * using it is never pure. */
+  TCCIR_OP_RETURN_ADDRESS,
+  /* Unsigned multiply accumulate-accumulate (ARM UMAAL), 64-bit dest:
+   *   dest = (uint32)src1 * (uint32)src2 + lo32(accum) + hi32(accum)
+   * accum is pool[operand_base+3] like MLA's: a 64-bit value whose two words
+   * are the two 32-bit addends (the sum cannot overflow 64 bits).  Created
+   * only by the late umaal fusion right before register allocation, so only
+   * the allocator, the post-RA passes and codegen see it; everything that
+   * reads MLA's fourth operand reads this one via tcc_ir_op_is_mac(). */
+  TCCIR_OP_UMAAL,
 } TccIrOp;
+
+/* Ops with a fourth (accumulator) operand at pool[operand_base+3] that is a
+ * value read by the instruction. */
+static inline int tcc_ir_op_is_mac(int op)
+{
+  return op == TCCIR_OP_MLA || op == TCCIR_OP_UMAAL;
+}
 
 /* Size (in bytes) at or above which the backend lowers a TCCIR_OP_BLOCK_COPY to
  * a real memcpy() call instead of an inline LDM/STM sequence (see
@@ -332,6 +352,9 @@ typedef struct IRLiveInterval
   uint8_t is_volatile : 1;  // whether the source object has volatile-qualified type
   uint8_t crosses_call : 1; // whether interval spans a function call
   uint8_t phi_pinned : 1;   // register relied upon by identity phi — do not reassign
+  uint8_t incoming_stack : 1; // param the ABI placed wholly on the caller's stack (incoming_reg0 < 0 is also "unset")
+  uint8_t is_struct : 1;      // param of struct type: its vreg names memory, never a value
+  uint8_t nested_home : 1;    // param captured by a nested function: it keeps a parent-frame home
   uint32_t start;           // start instruction index
   uint32_t end;             // end instruction index
   IRVregReplacement allocation;
@@ -454,9 +477,30 @@ typedef struct IRQuadCompact
   int orig_index;               /* Original IR index (stable across DCE) */
   TccIrOp op;                   /* Operation code */
   uint32_t operand_base;        /* Index into svalue_pool */
-  uint32_t line_num : 30;       /* Source line for debug info (non-negative, 30 bits = up to 1B lines) */
+  uint32_t line_num : 28;       /* Source line for debug info (non-negative, 28 bits = up to 268M lines) */
+  /* TRAP only: __builtin_unreachable().  Emits no code, and a path that can
+   * only end here may be assumed never taken (tcc_ir_opt_unreachable_fold).
+   * Every other pass sees an ordinary TRAP -- a terminator with no successor
+   * and a side effect -- which is the conservative reading. */
+  uint32_t unreachable : 1;
   uint32_t is_jump_target : 1;  /* Set when at least one JUMP/JUMPIF targets this instruction */
   uint32_t no_unroll : 1;       /* Set on rerolled back-edges to prevent re-unrolling */
+  /* Emit a 2-byte NOP ahead of this instruction when the code offset is not
+   * 4-aligned.  Measured on RP2350 silicon: a BACKWARD-branch target at
+   * `addr % 4 == 2` costs about a cycle per iteration, because the M33 fetches
+   * a word at a time and the first fetch after the refill then delivers half as
+   * much.  It turned bench_memcpy's one-instruction-shorter checksum loop into
+   * a 13.8% LOSS and handed it back in full (2,066,226 -> 1,812,226) once the
+   * head was word-aligned.
+   *
+   * The head's WIDTH is irrelevant and must not be filtered on: 16-bit heads
+   * benefit just as much (all six of mibench_sha's are `cmp`, worth -4.98% on
+   * their own), and filtering to 32-bit heads took the rig set win from
+   * -0.944% to -0.059%.
+   *
+   * Set by ssa:loop_bottom_test on the heads it makes bottom-tested, and by
+   * tcc_ir_codegen_generate on every backward-branch target (TCC_ALIGN_LOOPS). */
+  uint32_t align_target : 1;
 } IRQuadCompact;
 
 /* Per-operation operand configuration (defined in tccir.c) */
@@ -472,15 +516,37 @@ extern const IRRegistersConfig irop_config[];
 /* Forward declaration for FP materialization cache */
 typedef struct TCCFPMatCache TCCFPMatCache;
 
+/* How a parameter reaches the function body (pure-forwarder detection). */
+typedef struct IRParamForm
+{
+  uint8_t kind;    /* IR_PF_* */
+  int8_t reg_base; /* IR_PF_HOME: first argument register */
+  int32_t vreg;    /* IR_PF_REG / IR_PF_MEM: the PARAM vreg */
+  int32_t off;     /* IR_PF_MEM: parameter offset; IR_PF_HOME: home slot */
+  int32_t words;   /* IR_PF_HOME: words stored into the home slot */
+} IRParamForm;
+#define IR_PF_NONE 0 /* unknown: never forwarded untouched */
+#define IR_PF_REG 1  /* a value in the PARAM vreg */
+#define IR_PF_MEM 2  /* memory at a parameter offset (stack scalar, in-place struct) */
+#define IR_PF_HOME 3 /* a register-passed struct the prologue stores into a home slot */
+
 typedef struct TCCIRState
 {
   // number of function parameters
   int8_t parameters_count;
+  IRParamForm *param_forms; /* [parameters_count] */
   /* Named-argument usage for variadic prolog (AAPCS). */
   int named_arg_reg_bytes;
   int named_arg_stack_bytes;
 
   uint8_t is_variadic : 1;
+  /* A parameter straddles r3 and the stack: the prologue pushes r0-r3 below
+   * the stack arguments, as for a variadic function, so it lies contiguous in
+   * memory and is used in place. */
+  uint8_t push_arg_regs : 1;
+  /* The body only forwards its parameters, untouched, to one call of the same
+   * signature: emitted as a branch to it (tcc_ir_backend_fold_pure_forward). */
+  uint8_t pure_forward : 1;
   uint8_t leaffunc : 1;
   uint8_t tail_call_only : 1;
   uint8_t naked : 1;
@@ -505,6 +571,28 @@ typedef struct TCCIRState
   int32_t captured_count;            /* number of captured variables */
   int32_t loc;
   int32_t parent_loc; /* parent's loc value (for nested function offset validation) */
+  /* Frontend stack objects as (frame offset, size incl. alignment padding,
+   * FRAME_OBJ_* flags) triples, for frame relayout (frame.c).  Filled while
+   * the body is parsed. */
+  int32_t *frame_objs;
+  int frame_obj_count, frame_obj_cap;
+  /* Padding of the frame objects whose type the frontend knew, as (start,
+   * low word, high word) triples of a byte mask: bit b = byte b of the object
+   * is no member's (tcc_ir_frame_note_type). */
+  int32_t *frame_pads;
+  int frame_pad_count, frame_pad_cap;
+  /* By call id: the size of the struct written through parameter 0, the
+   * struct-return buffer, or 0 (frame.c). */
+  int32_t *sret_calls;
+  int sret_calls_size;
+  /* Sorted, merged [start, end) extents of frame_objs for lookups, built for
+   * frame_obj_count objects; frame_relaid once relayout moved them. */
+  int32_t *frame_index;
+  int frame_index_n, frame_index_objs;
+  uint8_t frame_relaid;
+  /* ssa:loop_unroll copied loads from a const table with the IV as index:
+   * the constant-index loads it left fold (ssa:unroll_cascade). */
+  uint8_t unrolled_table_loads;
 
   /* Nested function tracking (for parent functions that contain nested functions) */
   NestedFunc **nested_funcs;     /* array of pointers to nested function descriptors */
@@ -567,6 +655,9 @@ typedef struct TCCIRState
    * 0 means "legacy/unknown" and falls back to nested-scan binding.
    */
   int next_call_id;
+  /* The VARs the last SRA run on this function created, [lo, hi); -1 when it
+   * made none or did not run.  ssa_var_promotable relaxes its rules for them. */
+  int sra_var_lo, sra_var_hi;
 
   /* Current instruction index during code generation - used for scratch register allocation */
   int codegen_instruction_idx;
@@ -576,6 +667,11 @@ typedef struct TCCIRState
    */
   int call_outgoing_base; /* frame offset (typically negative) */
   int call_outgoing_size; /* bytes reserved (may include alignment padding) */
+  /* Calls whose stack arguments do not fit the reserved area: per call id, the
+   * bytes SP drops below it around that call alone (a `sub sp` ... `add sp`
+   * window, see ir/codegen.c).  NULL when no call needs one. */
+  int32_t *call_dyn_extra;
+  int call_dyn_extra_size;
 
   /* Nested-call register save area: reserved in the frame for saving R0-R3
    * (and R9/R12 for alignment) across nested function calls without PUSH/POP.
@@ -764,6 +860,41 @@ int tcc_ir_get_vreg_static_chain(TCCIRState *ir);
 void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double);
 void tcc_ir_set_llong_type(TCCIRState *ir, int vreg);
 void tcc_ir_set_original_offset(TCCIRState *ir, int vreg, int offset);
+/* frame.c */
+/* `(loc - size) & mask`, recording the object in the current function's IR
+ * for tcc_ir_frame_relayout. */
+int tcc_ir_frame_alloc(int loc, int size, int mask);
+void tcc_ir_frame_scope_end(struct TCCIRState *ir, int first_obj, int insn, int keep);
+/* The same for the temporaries that carry a struct into or out of a call: its
+ * address reaching the call does not let the callee keep it.  An argument's
+ * copy is never visible to the program; a call's struct result is, through
+ * an array member (`f().arr`), until the end of the full expression. */
+int tcc_ir_frame_alloc_arg_copy(int loc, int size, int mask);
+int tcc_ir_frame_alloc_ret_temp(int loc, int size, int mask);
+/* Parameter 0 of call `call_id` is the struct-return buffer. */
+void tcc_ir_frame_note_sret_call(int call_id, int size);
+/* The frontend object containing frame offset `off`, as [*lo, *hi), while the
+ * frame still has the frontend's layout.  0 when unknown. */
+int tcc_ir_frame_object_at(TCCIRState *ir, int off, int *lo, int *hi);
+/* Recorded size of the frame object starting exactly at `start`, or -1
+ * (before frame relayout only). */
+int tcc_ir_frame_object_size_at(TCCIRState *ir, int start);
+/* The object just allocated at `off` has C type `type`: note the bytes of it
+ * no member covers. */
+void tcc_ir_frame_note_type(int off, CType *type);
+/* Bytes of [lo, hi) that are padding in every object recorded there, bit b =
+ * byte lo + b; 0 when any object overlapping it has no noted type or starts
+ * elsewhere (before frame relayout only). */
+uint64_t tcc_ir_frame_padding(TCCIRState *ir, int lo, int hi);
+int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc);
+/* The function calls setjmp, vfork or another function that returns twice, so
+ * a frame slot live only on one return may still be read on the other. */
+int tcc_ir_calls_returns_twice(TCCIRState *ir);
+int tcc_ir_cross_jump(TCCIRState *ir);
+int tcc_ir_cross_jump_alloc(TCCIRState *ir);
+int tcc_ir_region_merge(TCCIRState *ir);
+int tcc_ir_self_store(TCCIRState *ir);
+int tcc_ir_dead_def(TCCIRState *ir);
 int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
 
 void tcc_ir_register_allocation_params(TCCIRState *ir);
@@ -772,6 +903,8 @@ void tcc_ir_register_allocation_params(TCCIRState *ir);
  * incoming stack home for the duration of the call. */
 void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir);
 void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir);
+int tcc_ir_param_is_captured_by_nested(int vreg);
+void tcc_ir_mark_nested_captured_params(TCCIRState *ir);
 void tcc_ir_build_stack_layout(TCCIRState *ir);
 const TCCStackSlot *tcc_ir_stack_slot_by_vreg(const TCCIRState *ir, int vreg);
 const TCCStackSlot *tcc_ir_stack_slot_by_offset(const TCCIRState *ir, int frame_offset);

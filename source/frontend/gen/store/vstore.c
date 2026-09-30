@@ -23,12 +23,32 @@
 
 #include "gen_priv.h"
 
+/* Most chunks a small aggregate copy may take inline before it stays a
+ * __aeabi_memmove call (see small_aggregate_copy_plan).  Re-measured on the
+ * Zig compiler's C (70 MB) once codegen began fusing frame-slot word copies
+ * into LDM/STM (94b95514), which the 2 this was first measured at predates:
+ * -O2 .text 5,194,592 at 2, 5,171,632 at 3, 5,169,236 at 4 and 5,169,572 at
+ * 6; -O1 5,157,884 -> 5,133,380 at 4.  Over tinycc's own 360 translation
+ * units it is a wash (1,329,510 -> 1,329,470), so 4 costs nothing where the
+ * copies are few and pays where they are not.  Swept again once the codegen
+ * began fusing these batched runs into LDM/STM too (2e7508a0), in case that
+ * was what held the ceiling down: it is not.  zig.c -O2 .text 5,015,252 at 4,
+ * 5,015,268 at 5, 5,015,576 at 6, 5,018,536 at 8 -- past four words the run
+ * rarely finds that many free registers, and the loads and stores it falls
+ * back to are bigger than the call they replaced. */
+TCC_DBG_ENV_INT(small_aggregate_copy_max_chunks, "TCC_SMALL_COPY_CHUNKS", 4)
+
 /* store vtop in lvalue pushed on stack */
 ST_FUNC void vstore(void)
 {
   int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
   SValue orig_src = *vtop;
   SValue orig_dst = vtop[-1];
+  /* Either side reached through a packed member (or a misaligned offset) may
+   * sit at any address, whatever its type's alignment says: such a copy must
+   * not name the word-aligned __aeabi_memmove4/8, whose contract -- and the
+   * backend's inline LDM/STM expansion of it -- needs aligned pointers. */
+  const int copy_underaligned = orig_src.underaligned || orig_dst.underaligned;
 
   /* Eagerly snapshot source const_init_data before gaddrof in the memmove
    * path invalidates it.  Used at vstore_done to propagate through struct
@@ -70,14 +90,14 @@ ST_FUNC void vstore(void)
     Sym *s;
     for (s = local_stack; s; s = s->prev)
     {
-      if (!s->const_init_data || !s->const_init_valid)
+      if (!s->facts || !s->facts->const_init_data || !s->facts->const_init_valid)
         continue;
-      if (s->const_init_in_progress)
+      if (s->facts->const_init_in_progress)
         continue;
       int base = (int)s->c;
-      if (dst_off + dst_size > base && dst_off < base + s->const_init_size)
+      if (dst_off + dst_size > base && dst_off < base + s->facts->const_init_size)
       {
-        s->const_init_valid = 0;
+        s->facts->const_init_valid = 0;
       }
     }
   }
@@ -524,7 +544,7 @@ ST_FUNC void vstore(void)
       /* size */
       vpushi(complex_size);
 #ifdef TCC_ARM_EABI
-      if (!(complex_align & 3))
+      if (!(complex_align & 3) && !copy_underaligned)
         vpush_helper_func(TOK_memmove4);
       else
 #endif
@@ -781,33 +801,29 @@ ST_FUNC void vstore(void)
      * assignments. */
 #define IS_REG_DEREF_LVAL(r) \
   (((r) & VT_LVAL) && ((r) & VT_VALMASK) < VT_CONST)
-    /* Cap at 8 bytes: see same-named cap in gfunc_return's struct path
-     * — store-forwarding width-mismatch in the optimizer would feed stale
-     * zero-init bytes to the LOADs we emit otherwise.
-     *
-     * That hazard needs a LOCAL/GLOBAL source: it is an earlier store to the
-     * source's own storage, at a different width than our LOAD, that the
-     * forwarder mis-narrows (pr92618's 16-byte vector literal built from
-     * scalar components).  When BOTH sides are register-deref pointers the
-     * source is opaque memory with no such store in view, so the plain
-     * `*d = *s` shape — the common one, and the one that otherwise costs a
-     * __aeabi_memmove4 call — is allowed up to 16 bytes.  Sixteen is also the
-     * point where an LDM/STM pair stops fitting the scratch budget. */
-    /* The same reasoning admits the MIRROR shape, `local = *p` / `local =
-     * arr[i]` — a register-deref SOURCE read into a frame slot.  It is the
-     * commonest struct-copy idiom in C and the one the size-tuned mixed-copy
-     * cap above (4 bytes) sends to __aeabi_memmove4: mibench_dijkstra's
-     * `item_t current = queue[head++]` is 12 bytes, so it paid a ~110-cycle
-     * call 20,042 times per benchmark run where gcc emits two loads.  The
-     * width-mismatch hazard is a property of the SOURCE, and an opaque
-     * pointer deref has no store to mis-narrow, so this direction gets the
-     * same 16-byte ceiling as the both-reg-deref case. */
+/* A register deref's address is its vreg alone: svalue_to_iroperand drops
+ * c.i for a vreg lvalue, as the memmove path below does.  c.i may be nonzero
+ * all the same -- `*p` for a pointer loaded from a local keeps that local's
+ * frame offset -- which is no displacement, so it does not keep such a copy
+ * off the chunked path.  Zig's C backend reads every array through a pointer
+ * local (`t20 = (T *)p; t21 = *t20;`, a [4]u8 per std.mem.readInt). */
+    /* Up to 16 bytes, the point where an LDM/STM pair stops fitting the
+     * scratch budget, for every shape.  A frame-slot or global SOURCE into a
+     * register-deref destination used to stop at 8: an earlier store to the
+     * source's own storage, at a different width than these LOADs, was
+     * mis-narrowed by store forwarding (pr92618's 16-byte vector literal
+     * built from scalar components) and fed stale zero-init bytes to the
+     * copy.  pr92618 passes at 16 now, and the shape is zig's commonest copy:
+     * `return t;` of a local 12-byte error union into the caller's sret
+     * buffer, 146 __aeabi_memmove4 calls in a std.debug.print hello.
+     * Only when optimizing: the word LOAD/STOREs pay off because forwarding
+     * folds them; at -O0 they stay, and three of them plus their address
+     * arithmetic outweigh the call (zig.c at -O0 grew 118 KB). */
     int src_reg_deref_lval = IS_REG_DEREF_LVAL(vtop[0].r);
     int dst_reg_deref_lval = IS_REG_DEREF_LVAL(vtop[-1].r);
     int dst_slot_lval = IS_LOCAL_LVAL(vtop[-1].r) || IS_GLOBAL_LVAL(vtop[-1].r);
-    int both_reg_deref = dst_reg_deref_lval && src_reg_deref_lval;
     int slot_from_deref = dst_slot_lval && src_reg_deref_lval;
-    int inline_copy_max = (both_reg_deref || slot_from_deref) ? 16 : 8;
+    int inline_copy_max = (tcc_state->optimize > 0 || (dst_reg_deref_lval && src_reg_deref_lval) || slot_from_deref) ? 16 : 8;
     if (tcc_state->ir && !has_vla && size > 0 && size <= inline_copy_max &&
         !(size & 3) && !(align & 3) && !NOEVAL_WANTED &&
         ((dst_reg_deref_lval &&
@@ -990,6 +1006,44 @@ ST_FUNC void vstore(void)
       vtop->type = saved_struct_type;
       goto vstore_done;
     }
+    /* Any other small aggregate between frame slots, globals and register
+     * derefs: copy it as width-uniform LOAD/STORE chunks rather than a
+     * __aeabi_memmove call (see small_aggregate_copy_plan).  Zig's C backend is
+     * the heavy user -- every `!void` result is a 2-byte struct copied through
+     * a local, and error unions and slices are written through out-pointers. */
+    if (tcc_state->ir && !has_vla && !NOEVAL_WANTED && size > 0 && size <= SMALL_AGGREGATE_COPY_MAX)
+    {
+      int src_deref = IS_REG_DEREF_LVAL(vtop[0].r) && vtop[0].vr >= 0;
+      int dst_deref = IS_REG_DEREF_LVAL(vtop[-1].r) && vtop[-1].vr >= 0;
+      int src_slot = IS_LOCAL_LVAL(vtop[0].r) || IS_GLOBAL_LVAL(vtop[0].r);
+      int dst_slot = IS_LOCAL_LVAL(vtop[-1].r) || IS_GLOBAL_LVAL(vtop[-1].r);
+      unsigned char covered[SMALL_AGGREGATE_COPY_MAX];
+      int w = 0, chunks = 0;
+      if ((src_deref || src_slot) && (dst_deref || dst_slot))
+        chunks = small_aggregate_copy_plan(&saved_struct_type, size, align, src_slot ? (int)vtop[0].c.i : -1,
+                                           dst_slot ? (int)vtop[-1].c.i : -1, &w, covered);
+      if (chunks > 0 && chunks <= small_aggregate_copy_max_chunks())
+      {
+        SValue src = vtop[0];
+        SValue dst = vtop[-1];
+        vtop--; /* pop src; vtop = dst (kept as result lvalue) */
+        if (!(IS_LOCAL_LVAL(src.r) && IS_LOCAL_LVAL(dst.r) && src.c.i == dst.c.i))
+          ir_emit_small_aggregate_copy(&src, src_deref, &dst, dst_deref, size, w, covered);
+        vtop->type = saved_struct_type;
+        goto vstore_done;
+      }
+    }
+    /* A copy of a frame slot onto itself: `t = f();` returns f's struct through
+     * the hidden result pointer straight into t's slot, then the store copies
+     * t onto t -- a 96-byte __aeabi_memmove per Wyhash.hash call in Zig's
+     * compiler.  The small-aggregate path above already skips this. */
+    if (tcc_state->ir && !has_vla && IS_LOCAL_LVAL(vtop[0].r) && IS_LOCAL_LVAL(vtop[-1].r) &&
+        vtop[0].c.i == vtop[-1].c.i && vtop[0].vr == vtop[-1].vr)
+    {
+      vtop--; /* pop src; vtop = dst (kept as result lvalue) */
+      vtop->type = saved_struct_type;
+      goto vstore_done;
+    }
 #undef IS_REG_DEREF_LVAL
 #undef IS_LOCAL_LVAL
 #undef IS_GLOBAL_LVAL
@@ -1051,9 +1105,9 @@ ST_FUNC void vstore(void)
         vpushi(size);
       /* Use memmove, rather than memcpy, as dest and src may be same: */
 #ifdef TCC_ARM_EABI
-      if (!(align & 7))
+      if (!(align & 7) && !copy_underaligned)
         vpush_helper_func(TOK_memmove8);
-      else if (!(align & 3))
+      else if (!(align & 3) && !copy_underaligned)
         vpush_helper_func(TOK_memmove4);
       else
 #endif
@@ -1094,7 +1148,7 @@ ST_FUNC void vstore(void)
       Sym *dst_sym = NULL;
       for (Sym *s = local_stack; s; s = s->prev)
       {
-        if ((int)s->c == dst_addr && s->const_init_size >= size)
+        if ((int)s->c == dst_addr && SYM_FACTS(s)->const_init_size >= size)
         {
           dst_sym = s;
           break;
@@ -1102,11 +1156,12 @@ ST_FUNC void vstore(void)
       }
       if (dst_sym)
       {
-        if (!dst_sym->const_init_data)
-          dst_sym->const_init_data = tcc_malloc(vstore_src_cid_size);
-        memcpy(dst_sym->const_init_data, vstore_src_cid, vstore_src_cid_size);
-        dst_sym->const_init_size = vstore_src_cid_size;
-        dst_sym->const_init_valid = 1;
+        SymLocalFacts *f = sym_facts(dst_sym);
+        if (!f->const_init_data)
+          f->const_init_data = tcc_malloc(vstore_src_cid_size);
+        memcpy(f->const_init_data, vstore_src_cid, vstore_src_cid_size);
+        f->const_init_size = vstore_src_cid_size;
+        f->const_init_valid = 1;
       }
       else
       {

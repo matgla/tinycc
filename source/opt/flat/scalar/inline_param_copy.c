@@ -147,42 +147,134 @@ static int ipc_var_ok(TCCIRState *ir, int32_t vr)
  * directly: control can only enter (store_idx, last_use] from outside by a jump
  * that lands strictly inside it.  If no such edge exists, every path reaching a
  * use ran through the store.  Unknowable targets (computed jumps, switch
- * tables) anywhere in the function force a bail. */
-static int ipc_store_dominates_window(TCCIRState *ir, int n, int store_idx, int last_use)
+ * tables) anywhere in the function force a bail.
+ *
+ * The pass only ever turns STOREs into NOPs, so the function's jumps are
+ * gathered once, sorted by target: a window then looks only at the jumps that
+ * land inside it instead of walking the whole function. */
+typedef struct IpcJump
 {
+  int target, from;
+} IpcJump;
+
+typedef struct IpcJumps
+{
+  IpcJump *j;
+  int n;
+  int unknown; /* an IJUMP or SWITCH_TABLE: targets unknowable */
+} IpcJumps;
+
+static int ipc_jump_cmp(const void *a, const void *b)
+{
+  const IpcJump *x = a, *y = b;
+  if (x->target != y->target)
+    return x->target < y->target ? -1 : 1;
+  return x->from < y->from ? -1 : x->from > y->from;
+}
+
+static void ipc_collect_jumps(TCCIRState *ir, int n, IpcJumps *js)
+{
+  js->j = tcc_malloc(sizeof(IpcJump) * (n + 1));
+  js->n = 0;
+  js->unknown = 0;
   for (int k = 0; k < n; k++)
   {
     IRQuadCompact *q = &ir->compact_instructions[k];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
     if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE)
-      return 0; /* target set unknown */
+      js->unknown = 1;
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    if (k >= store_idx && k <= last_use)
-      continue; /* an edge from inside the window cannot bypass the store */
-    IROperand jd = tcc_ir_op_get_dest(ir, q);
-    int jt = (int)jd.u.imm32;
-    if (jt > store_idx && jt <= last_use)
-      return 0; /* entry that skips the store */
+    js->j[js->n].target = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+    js->j[js->n].from = k;
+    js->n++;
   }
+  qsort(js->j, js->n, sizeof(IpcJump), ipc_jump_cmp);
+}
+
+static int ipc_store_dominates_window(const IpcJumps *js, int store_idx, int last_use)
+{
+  if (js->unknown)
+    return 0; /* target set unknown */
+  int lo = 0, hi = js->n; /* first jump with target > store_idx */
+  while (lo < hi)
+  {
+    int mid = (lo + hi) / 2;
+    if (js->j[mid].target <= store_idx)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  for (int k = lo; k < js->n && js->j[k].target <= last_use; k++)
+    if (js->j[k].from < store_idx || js->j[k].from > last_use)
+      return 0; /* entry that skips the store */
   return 1;
 }
 
-/* Last index at which `vr` is read, or -1. */
-static int ipc_last_use(TCCIRState *ir, int n, int32_t vr)
+/* Where a VAR can be read: every src1/src2 naming it sits in [lo, hi].  The
+ * span only widens -- when a rewrite makes an instruction read the VAR -- so it
+ * stays a superset of the reads, and the scans for a VAR's reads need look
+ * nowhere else.  Whole-function scans per candidate made this pass quadratic:
+ * Zig's zig.c spent 1.6 G iterations here. */
+typedef struct IpcSpan
 {
-  int last = -1;
+  int lo, hi; /* lo > hi: never read */
+} IpcSpan;
+
+static int ipc_var_pos(int32_t vr, int max_var)
+{
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
+    return -1;
+  int p = TCCIR_DECODE_VREG_POSITION(vr);
+  if (vr != TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, p) || p > max_var)
+    return -1;
+  return p;
+}
+
+static void ipc_span_note(IpcSpan *span, int max_var, int32_t vr, int idx)
+{
+  int p = ipc_var_pos(vr, max_var);
+  if (p < 0)
+    return;
+  if (idx < span[p].lo)
+    span[p].lo = idx;
+  if (idx > span[p].hi)
+    span[p].hi = idx;
+}
+
+static IpcSpan *ipc_collect_spans(TCCIRState *ir, int n, int max_var)
+{
+  IpcSpan *span = tcc_malloc(sizeof(IpcSpan) * (max_var + 1));
+  for (int p = 0; p <= max_var; p++)
+  {
+    span[p].lo = n;
+    span[p].hi = -1;
+  }
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if ((irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vr) ||
-        (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vr))
-      last = i;
+    if (irop_config[q->op].has_src1)
+      ipc_span_note(span, max_var, irop_get_vreg(tcc_ir_op_get_src1(ir, q)), i);
+    if (irop_config[q->op].has_src2)
+      ipc_span_note(span, max_var, irop_get_vreg(tcc_ir_op_get_src2(ir, q)), i);
   }
-  return last;
+  return span;
+}
+
+static int ipc_reads(TCCIRState *ir, IRQuadCompact *q, int32_t vr)
+{
+  return q->op != TCCIR_OP_NOP && ((irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vr) ||
+                                   (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vr));
+}
+
+/* Last index in [lo, hi] at which `vr` is read, or -1. */
+static int ipc_last_use(TCCIRState *ir, int lo, int hi, int32_t vr)
+{
+  for (int i = hi; i >= lo; i--)
+    if (ipc_reads(ir, &ir->compact_instructions[i], vr))
+      return i;
+  return -1;
 }
 
 int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
@@ -199,6 +291,9 @@ int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
   if (!ipc_collect_var_defs(ir, n, &var_def, &max_var))
     return 0;
   ipc_collect_tmp_defs(ir, n, &tmp_def, &max_tmp);
+  IpcSpan *span = ipc_collect_spans(ir, n, max_var);
+  IpcJumps jumps;
+  ipc_collect_jumps(ir, n, &jumps);
 
   for (int i = 0; i < n; i++)
   {
@@ -264,9 +359,11 @@ int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
         }
       }
     }
+    /* dst_vr's reads: dst_vr is a VAR defined here, so it has a span. */
+    const IpcSpan dspan = span[dpos];
     if (!matched_var)
     {
-      int lu = ipc_last_use(ir, n, dst_vr);
+      int lu = ipc_last_use(ir, dspan.lo, dspan.hi, dst_vr);
       if (lu < 0)
         continue;
       /* A use at a LOWER index than the store can still execute AFTER it: a
@@ -276,18 +373,11 @@ int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
        * window is provably covered, so require the whole live range to sit in
        * it. */
       int used_before = 0;
-      for (int b = 0; b < i && !used_before; b++)
-      {
-        IRQuadCompact *bq = &ir->compact_instructions[b];
-        if (bq->op == TCCIR_OP_NOP)
-          continue;
-        if ((irop_config[bq->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, bq)) == dst_vr) ||
-            (irop_config[bq->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, bq)) == dst_vr))
-          used_before = 1;
-      }
+      for (int b = dspan.lo; b < i && !used_before; b++)
+        used_before = ipc_reads(ir, &ir->compact_instructions[b], dst_vr);
       if (used_before)
         continue;
-      if (!ipc_store_dominates_window(ir, n, i, lu))
+      if (!ipc_store_dominates_window(&jumps, i, lu))
         continue;
       lsrc = src; /* the stored temp */
       src_vr = t_vr;
@@ -306,7 +396,11 @@ int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
      * would read a slot nothing writes any more. */
     int rewrote = 0;
     int left_behind = 0;
-    for (int j = i + 1; j < n; j++)
+    /* Past dspan.hi nothing reads dst_vr, and neither variable is written
+     * after i -- each has its one def at or before i, and the pass adds none --
+     * so the rest of the function has nothing to rewrite or stop at. */
+    const int j_end = dspan.hi < n - 1 ? dspan.hi + 1 : n;
+    for (int j = i + 1; j < j_end; j++)
     {
       IRQuadCompact *u = &ir->compact_instructions[j];
       if (u->op == TCCIR_OP_NOP)
@@ -348,6 +442,7 @@ int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
               !s.is_llocal)
           {
             tcc_ir_set_src1(ir, j, lsrc);
+            ipc_span_note(span, max_var, src_vr, j);
             rewrote++;
           }
           else
@@ -362,6 +457,7 @@ int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
             !s.is_llocal)
         {
           tcc_ir_set_src2(ir, j, lsrc);
+          ipc_span_note(span, max_var, src_vr, j);
           rewrote++;
         }
         else if (irop_get_vreg(s) == dst_vr)
@@ -380,6 +476,8 @@ int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
 
   tcc_free(var_def);
   tcc_free(tmp_def);
+  tcc_free(span);
+  tcc_free(jumps.j);
   return changes;
 }
 

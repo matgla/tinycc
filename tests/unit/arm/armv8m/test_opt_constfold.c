@@ -1,24 +1,17 @@
 /*
  *  test_opt_constfold.c - suite for ir/opt_constfold.c
  *
- *  Covers two name-gated call-folding passes from ir/opt_constfold.c:
+ *  Covers the name-gated call-folding pass from ir/opt_constfold.c:
  *
  *    - tcc_ir_opt_self_copy_elim   : NOPs a memcpy/memmove (or AAPCS aligned
  *      variant) call whose dst and src arguments are the same pure expression
  *      (a self-copy).  FUNCCALLVAL is rewritten to `ASSIGN dst`, FUNCCALLVOID
  *      to NOP, and the param marshalling is NOP'd.
- *    - tcc_ir_opt_float_narrowing  : collects __aeabi_f2d / __aeabi_d2f
- *      conversion calls and narrows floor()/ceil()/fabs()/... double helpers to
- *      their float variant when an argument is an f2d result.
  *
  *  HARNESS NOTES:
- *  Both passes are name-gated via get_tok_str(callee->v).  The unit-test harness
- *  now provides a settable token->name table (utb_set_tok_str), so self_copy_elim
- *  can be driven to its positive fold.  float_narrowing still cannot complete a
- *  true positive fold in isolation because change_callee_sym() calls
- *  external_global_sym(), which is a stubs.c link stub that returns NULL; the
- *  production pass does not check the return value of change_callee_sym(), so the
- *  transform is applied partially and is recorded as a suspected bug.
+ *  The pass is name-gated via get_tok_str(callee->v).  The unit-test harness
+ *  provides a settable token->name table (utb_set_tok_str), so self_copy_elim
+ *  can be driven to its positive fold.
  *
  *  These are isolated tests: a hand-built IR sequence is run through the bare
  *  pass entry point and the resulting instructions are inspected directly.
@@ -31,7 +24,6 @@
 /* Pass entry points (declared in ir/opt.h; forward-declared to avoid pulling in
  * the optimizer engine headers). */
 int tcc_ir_opt_self_copy_elim(TCCIRState *ir);
-int tcc_ir_opt_float_narrowing(TCCIRState *ir);
 int tcc_ir_opt_const_string_calls(TCCIRState *ir);
 int tcc_ir_opt_const_call_replace(TCCIRState *ir);
 int tcc_ir_opt_switch_call_replace(TCCIRState *ir);
@@ -40,8 +32,7 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir);
 
 /* Frontend link stubs (sym_push2 / external_global_sym / tok_alloc_const /
  * global_stack / elfsym) now live in stubs.c so the combined unit-test link
- * has a single definition.  external_global_sym() returning NULL prevents
- * float_narrowing from completing its callee swap in isolation. */
+ * has a single definition. */
 
 #define I32 IROP_BTYPE_INT32
 #define I64 IROP_BTYPE_INT64
@@ -435,295 +426,6 @@ UT_TEST(test_self_copy_elim_idempotent)
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
 
   utb_set_tok_str(callee_sym.v, NULL);
-  utb_free(ir);
-  return 0;
-}
-
-/* ---------------------------------------------------- float_narrowing tests */
-
-/* GUARD (would-narrow-if-names-matched): a textbook f2d -> floor -> d2f chain
- * (the exact Case-1 shape tcc_ir_opt_float_narrowing rewrites).  Phase 1 scans
- * for __aeabi_f2d / __aeabi_d2f by name; under the "?" stub it finds none, so
- * num_f2d == 0 and the pass returns 0 at the early-out, leaving every call and
- * param intact.  If the f2d/d2f name gate were dropped, the floor call would be
- * narrowed and the f2d/d2f calls NOP'd, failing these assertions.
- *
- *   FUNCPARAMVAL  Tf(float), param0   (call_id 1)
- *   Td = FUNCCALLVAL <sym "?">         (would be __aeabi_f2d: float->double)
- *   FUNCPARAMVAL  Td(double), param0  (call_id 2)
- *   Tr = FUNCCALLVAL <sym "?">         (would be floor: double->double)
- *   FUNCPARAMVAL  Tr(double), param0  (call_id 3)
- *   Tf2 = FUNCCALLVAL <sym "?">        (would be __aeabi_d2f: double->float) */
-UT_TEST(test_float_narrowing_unmatched_names_no_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym f2d_sym, floor_sym, d2f_sym;
-  IROperand f2d_callee = utb_callee(ir, &f2d_sym);
-  IROperand floor_callee = utb_callee(ir, &floor_sym);
-  IROperand d2f_callee = utb_callee(ir, &d2f_sym);
-
-  /* f2d: float Tf(0) -> double Td(1) */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, F32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_f2d = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(1, F64), f2d_callee,
-                       utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-  /* floor: double Td(1) -> double Tr(2) */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, F64),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(2, 0), I32));
-  int i_floor = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(2, F64), floor_callee,
-                         utb_imm((int32_t)TCCIR_ENCODE_CALL(2, 1), I32));
-  /* d2f: double Tr(2) -> float Tf2(3) */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(2, F64),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(3, 0), I32));
-  int i_d2f = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(3, F32), d2f_callee,
-                       utb_imm((int32_t)TCCIR_ENCODE_CALL(3, 1), I32));
-
-  int changes = tcc_ir_opt_float_narrowing(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, i_f2d), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_op(ir, i_floor), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_op(ir, i_d2f), TCCIR_OP_FUNCCALLVAL);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD: too few instructions.  tcc_ir_opt_float_narrowing requires at least 4
- * instructions (n < 4 -> return 0) before doing any scanning.  A 2-instruction
- * f2d-shaped pair must short-circuit to 0 with the IR untouched. */
-UT_TEST(test_float_narrowing_too_few_instructions_no_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym f2d_sym;
-  IROperand f2d_callee = utb_callee(ir, &f2d_sym);
-
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, F32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_call = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(1, F64), f2d_callee,
-                        utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-
-  int changes = tcc_ir_opt_float_narrowing(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, i_call), TCCIR_OP_FUNCCALLVAL);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NOTE: a real f2d -> floor -> d2f narrowing positive cannot be tested in this
- * isolated harness.  Once Phase 2 matches the narrowable middle function it
- * calls change_callee_sym(), which calls sym_push2() / external_global_sym();
- * both are stubs in tests/unit/arm/armv8m/stubs.c that return NULL, and
- * change_callee_sym() dereferences the NULL sym_push2() result before it can
- * report failure.  In a real compilation the helper exists and the transform
- * completes.  This limitation is recorded in the agent conclusion. */
-
-/* Negative: f2d and d2f names match but the middle function is not in the
- * narrowable table, so Phase 2 never triggers. */
-UT_TEST(test_float_narrowing_non_narrowable_middle_no_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym f2d_sym, middle_sym, d2f_sym;
-  IROperand f2d_callee = utb_callee_named(ir, &f2d_sym, 20);
-  IROperand middle_callee = utb_callee_named(ir, &middle_sym, 21);
-  IROperand d2f_callee = utb_callee_named(ir, &d2f_sym, 22);
-
-  utb_set_tok_str(20, "__aeabi_f2d");
-  utb_set_tok_str(21, "some_non_narrowable_func");
-  utb_set_tok_str(22, "__aeabi_d2f");
-
-  /* f2d: T0 -> T1, call_id 1 */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, F32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_f2d = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(1, F64), f2d_callee,
-                       utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-  /* middle: T1 -> T2, call_id 2 */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, F64),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(2, 0), I32));
-  int i_middle = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(2, F64), middle_callee,
-                          utb_imm((int32_t)TCCIR_ENCODE_CALL(2, 1), I32));
-  /* d2f: T2 -> T3, call_id 3 */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(2, F64),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(3, 0), I32));
-  int i_d2f = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(3, F32), d2f_callee,
-                       utb_imm((int32_t)TCCIR_ENCODE_CALL(3, 1), I32));
-
-  int changes = tcc_ir_opt_float_narrowing(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, i_f2d), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_op(ir, i_middle), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_op(ir, i_d2f), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_set_tok_str(20, NULL);
-  utb_set_tok_str(21, NULL);
-  utb_set_tok_str(22, NULL);
-  utb_free(ir);
-  return 0;
-}
-
-/* Negative: f2d -> func shape with no trailing d2f.  The middle function name
- * is not set, so the pass declines even though an f2d call is present. */
-UT_TEST(test_float_narrowing_missing_d2f_no_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym f2d_sym, floor_sym;
-  IROperand f2d_callee = utb_callee_named(ir, &f2d_sym, 30);
-  IROperand floor_callee = utb_callee_named(ir, &floor_sym, 31);
-
-  utb_set_tok_str(30, "__aeabi_f2d");
-  /* leave floor name as "?" so it does not match the narrowable table */
-
-  /* f2d: T0 -> T1, call_id 1 */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, F32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_f2d = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(1, F64), f2d_callee,
-                       utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-  /* floor: T1 -> T2, call_id 2 */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, F64),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(2, 0), I32));
-  int i_floor = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(2, F64), floor_callee,
-                         utb_imm((int32_t)TCCIR_ENCODE_CALL(2, 1), I32));
-
-  int changes = tcc_ir_opt_float_narrowing(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, i_f2d), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_op(ir, i_floor), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_set_tok_str(30, NULL);
-  utb_free(ir);
-  return 0;
-}
-
-/* Negative: the narrowable function's param0 is not the f2d result, so no
- * narrowing candidate is found. */
-UT_TEST(test_float_narrowing_f2d_not_consumed_no_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym f2d_sym, floor_sym, d2f_sym;
-  IROperand f2d_callee = utb_callee_named(ir, &f2d_sym, 40);
-  IROperand floor_callee = utb_callee_named(ir, &floor_sym, 41);
-  IROperand d2f_callee = utb_callee_named(ir, &d2f_sym, 42);
-
-  utb_set_tok_str(40, "__aeabi_f2d");
-  utb_set_tok_str(41, "floor");
-  utb_set_tok_str(42, "__aeabi_d2f");
-
-  /* f2d: T0 -> T1, call_id 1 (result T1 is unused by floor) */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, F32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_f2d = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(1, F64), f2d_callee,
-                       utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-  /* floor: T4 -> T2, call_id 2 (param0 is T4, not T1) */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(4, F64),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(2, 0), I32));
-  int i_floor = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(2, F64), floor_callee,
-                         utb_imm((int32_t)TCCIR_ENCODE_CALL(2, 1), I32));
-  /* d2f: T2 -> T3, call_id 3 */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(2, F64),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(3, 0), I32));
-  int i_d2f = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(3, F32), d2f_callee,
-                       utb_imm((int32_t)TCCIR_ENCODE_CALL(3, 1), I32));
-
-  int changes = tcc_ir_opt_float_narrowing(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, i_f2d), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_op(ir, i_floor), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_op(ir, i_d2f), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_set_tok_str(40, NULL);
-  utb_set_tok_str(41, NULL);
-  utb_set_tok_str(42, NULL);
-  utb_free(ir);
-  return 0;
-}
-
-/* Negative: no f2d call at all -> num_f2d == 0 and the pass early-outs. */
-UT_TEST(test_float_narrowing_no_f2d_no_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym floor_sym, d2f_sym;
-  IROperand floor_callee = utb_callee_named(ir, &floor_sym, 50);
-  IROperand d2f_callee = utb_callee_named(ir, &d2f_sym, 51);
-
-  utb_set_tok_str(50, "floor");
-  utb_set_tok_str(51, "__aeabi_d2f");
-
-  /* floor: T0 -> T1, call_id 1 */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, F64),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  int i_floor = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(1, F64), floor_callee,
-                         utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-  /* d2f: T1 -> T2, call_id 2 */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, F64),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(2, 0), I32));
-  int i_d2f = utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(2, F32), d2f_callee,
-                       utb_imm((int32_t)TCCIR_ENCODE_CALL(2, 1), I32));
-
-  int changes = tcc_ir_opt_float_narrowing(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, i_floor), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_op(ir, i_d2f), TCCIR_OP_FUNCCALLVAL);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
-  utb_set_tok_str(50, NULL);
-  utb_set_tok_str(51, NULL);
-  utb_free(ir);
-  return 0;
-}
-
-/* Idempotence: the pass converges on a chain that does not match. */
-UT_TEST(test_float_narrowing_idempotent)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  static Sym f2d_sym, floor_sym, d2f_sym;
-  IROperand f2d_callee = utb_callee(ir, &f2d_sym);
-  IROperand floor_callee = utb_callee(ir, &floor_sym);
-  IROperand d2f_callee = utb_callee(ir, &d2f_sym);
-
-  /* f2d: T0 -> T1, call_id 1 */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(0, F32),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-  utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(1, F64), f2d_callee,
-           utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 1), I32));
-  /* floor: T1 -> T2, call_id 2 */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, F64),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(2, 0), I32));
-  utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(2, F64), floor_callee,
-           utb_imm((int32_t)TCCIR_ENCODE_CALL(2, 1), I32));
-  /* d2f: T2 -> T3, call_id 3 */
-  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(2, F64),
-           utb_imm((int32_t)TCCIR_ENCODE_PARAM(3, 0), I32));
-  utb_emit(ir, TCCIR_OP_FUNCCALLVAL, utb_temp(3, F32), d2f_callee,
-           utb_imm((int32_t)TCCIR_ENCODE_CALL(3, 1), I32));
-
-  int total = utb_run_to_fixpoint(ir, tcc_ir_opt_float_narrowing, 10);
-
-  UT_ASSERT_EQ(total, 0);
-  UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
-
   utb_free(ir);
   return 0;
 }
@@ -2098,7 +1800,6 @@ UT_TEST(test_local_addrof_64bit_store_value_no_fold)
 }
 
 UT_COVERS("self_copy_elim");
-UT_COVERS("float_narrowing");
 UT_COVERS("const_string_calls");
 UT_COVERS("const_call_replace");
 UT_COVERS("switch_call_replace");

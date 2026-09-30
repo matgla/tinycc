@@ -60,6 +60,7 @@ int32_t ir_opt_mla_accum_vreg(const struct TCCIRState *ir, const struct IRQuadCo
  * Answers 0 for every instruction of a function that never touches volatile
  * memory — see TCCIRState.func_has_volatile_access. */
 int tcc_ir_instr_access_is_volatile(const struct TCCIRState *ir, const struct IRQuadCompact *q);
+int tcc_ir_operand_names_volatile_var(const struct TCCIRState *ir, IROperand op);
 
 int is_power_of_2(int64_t n);
 

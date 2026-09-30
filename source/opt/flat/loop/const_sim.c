@@ -1624,11 +1624,14 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
       }
     }
 
-    if (irop_config[q->op].has_dest)
+    /* Any definition -- a VAR written as itself is a STACKOFF lvalue -- that
+     * stores a stack address marks the vreg for good: the flag is read
+     * flow-insensitively, so a later definition must not clear it. */
+    if (irop_config[q->op].has_dest && q->op != TCCIR_OP_STORE_INDEXED)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int32_t dvr = irop_get_vreg(dest);
-      if (dvr >= 0 && !dest.is_lval)
+      if (irop_dest_defines_vreg(dest))
       {
         int vt = TCCIR_DECODE_VREG_TYPE(dvr);
         int pos = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -1646,7 +1649,8 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
                           q->op == TCCIR_OP_LOAD) &&
                          src1.is_local && !src1.is_lval &&
                          irop_get_tag(src1) == IROP_TAG_STACKOFF;
-          *slot = addr_def ? 1 : 0;
+          if (addr_def)
+            *slot = 1;
         }
       }
     }

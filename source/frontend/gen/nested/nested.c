@@ -43,7 +43,9 @@ static NestedFunc *find_nested_func_by_sym(Sym *sym)
 void setup_nested_func_trampoline(Sym *s)
 {
   NestedFunc *nf = find_nested_func_by_sym(s);
-  if (!nf)
+  /* A body parsed for its diagnostics only (check_only) has no code to need
+   * a trampoline, and the chain slot and trampoline symbols would outlive it. */
+  if (!nf || tcc_state->check_only)
     return;
 
   nf->trampoline_needed = 1;
@@ -157,6 +159,7 @@ typedef struct
   int ind;
   int rsym;
   int func_ind;
+  int func_align_pad;
   const char *funcname;
   CType func_vt;
   int func_var;
@@ -199,6 +202,7 @@ void compile_nested_functions(Sym *parent_sym)
   saved.ind = ind;
   saved.rsym = rsym;
   saved.func_ind = func_ind;
+  saved.func_align_pad = func_align_pad;
   saved.funcname = funcname;
   saved.func_vt = func_vt;
   saved.func_var = func_var;
@@ -383,6 +387,7 @@ void compile_nested_functions(Sym *parent_sym)
      the parent's codegen will emit at the CURRENT ind (after nested funcs) */
   rsym = saved.rsym;
   func_ind = saved.func_ind;
+  func_align_pad = saved.func_align_pad;
   funcname = saved.funcname;
   func_vt = saved.func_vt;
   func_var = saved.func_var;

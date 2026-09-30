@@ -42,8 +42,6 @@ ST_DATA Sym *global_stack;
 ST_DATA Sym *local_stack;
 ST_DATA Sym *define_stack;
 
-unsigned char *aapcs_last_const_init;
-int aapcs_last_const_init_size;
 ST_DATA Sym *global_label_stack;
 ST_DATA Sym *local_label_stack;
 
@@ -109,6 +107,7 @@ ST_DATA SValue *vtop;
 ST_DATA SValue _vstack[1 + VSTACK_SIZE];
 
 ST_DATA int nocode_wanted; /* no code generation wanted */
+ST_DATA SValue *discarded_call_vtop;
 
 ST_DATA int global_expr; /* true if compound literals must be allocated globally
                             (used during initializers parsing */
@@ -117,6 +116,7 @@ ST_DATA int func_var;    /* true if current function is variadic (used by return
                             instruction) */
 ST_DATA int func_vc;
 ST_DATA int func_ind;
+ST_DATA int func_align_pad;
 ST_DATA int func_has_label_addr;
 ST_DATA const char *funcname;
 ST_DATA CType int_type, func_old_type, func_old_void_type, func_old_char_pointer_type, func_old_void_pointer_type,
@@ -130,53 +130,6 @@ struct switch_t *cur_switch; /* current switch */
 struct temp_local_variable arr_temp_local_vars[MAX_TEMP_LOCAL_VARIABLE_NUMBER];
 int nb_temp_local_vars;
 
-/* Reusable stack slots for by-value struct arguments passed to variadic
- * functions (the invisible-copy the AAPCS requires for structs > 16 bytes).
- * Unlike get_temp_local_var()'s vstack-based tracking, these slots must stay
- * reserved until the whole call is emitted — each argument is lowered to a
- * FUNCPARAMVAL and popped off the vstack before the next argument is built,
- * so the vstack can no longer witness that the slot is in use.
- *
- * Instead a busy bitmask tracks live slots, and block() saves/restores it
- * around every statement.  Two struct-arg copies that are live at the same
- * time (e.g. f(a, b, a) — three copies, all read by the one call) therefore
- * get distinct slots, while copies from statements that have fully completed
- * are reclaimed.  GNU statement-expressions used as arguments enter a nested
- * block() whose save/restore leaves the enclosing call's reserved slots
- * untouched, so they cannot be aliased. */
-#define MAX_ARG_STRUCT_TEMPS 64
-static struct arg_struct_temp
-{
-  int location;
-  int size;
-  int align;
-} arg_struct_temps[MAX_ARG_STRUCT_TEMPS];
-int nb_arg_struct_temps;
-uint64_t arg_struct_temp_busy;
-
-int get_arg_struct_temp(int size, int align)
-{
-  for (int i = 0; i < nb_arg_struct_temps; i++)
-  {
-    if (!(arg_struct_temp_busy & ((uint64_t)1 << i)) &&
-        arg_struct_temps[i].size >= size && arg_struct_temps[i].align >= align)
-    {
-      arg_struct_temp_busy |= (uint64_t)1 << i;
-      return arg_struct_temps[i].location;
-    }
-  }
-  loc = (loc - size) & -align;
-  if (nb_arg_struct_temps < MAX_ARG_STRUCT_TEMPS)
-  {
-    int i = nb_arg_struct_temps++;
-    arg_struct_temps[i].location = loc;
-    arg_struct_temps[i].size = size;
-    arg_struct_temps[i].align = align;
-    arg_struct_temp_busy |= (uint64_t)1 << i;
-  }
-  /* Pool exhausted: a fresh never-reused slot is always correct. */
-  return loc;
-}
 
 struct scope *cur_scope, *loop_scope, *root_scope;
 
@@ -247,6 +200,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   pending_aliases = NULL;
   nb_pending_aliases = 0;
   nocode_wanted = DATA_ONLY_WANTED; /* no code outside of functions */
+  discarded_call_vtop = NULL;
   debug_modes = (s1->do_debug ? 1 : 0) | s1->test_coverage << 1;
 
   tcc_debug_start(s1);
@@ -274,6 +228,17 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   parse_flags = PARSE_FLAG_PREPROCESS | PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
   next();
   decl(VT_CONST);
+  /* Drop the statics nothing live refers to, and define the objects whose
+   * initializers were saved (-fdrop-unused-statics). */
+  prune_unused_statics(s1);
+  /* Every definition has been seen: settle the tentative ones before any
+   * deferred body addresses them. */
+  finalize_tentative_definitions(s1);
+  s1->tu_parsed = 1;
+  /* Bodies saved for -finline-functions-called-once: generate them now that
+   * every call site in the TU is known. */
+  gen_deferred_function_bodies(s1);
+  gen_owed_inline_functions(s1);
   /* End-of-TU analysis: compute call-graph reachability and the set of
    * static globals with no reachable readers.  Must run before
    * gen_late_reopt_functions so newly-flagged writer functions get picked
@@ -345,6 +310,10 @@ ST_FUNC int tccgen_compile(TCCState *s1)
       ifn->sym = NULL;
     }
   }
+  /* The statics dropped as unused are still checked for errors. */
+  check_dropped_statics(s1);
+  /* What the optimizer left unreferenced goes too. */
+  gc_unreferenced_statics(s1);
   resolve_pending_aliases();
   check_vstack();
   /* end of translation unit info */
@@ -374,6 +343,11 @@ ST_FUNC void tccgen_finish(TCCState *s1)
      past inline_restore_label_bindings(), stranding the token/label arrays it
      would have freed. */
   inline_release_hidden_label_bindings();
+  free_deferred_functions(s1);
+  free_dropped_statics(s1);
+  free_tentative_definitions(s1);
+  tcc_icf_reset();
+  tcc_gen_machine_outline_reset();
 
   str_lit_pool_free();
 
@@ -431,8 +405,6 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   }
 
   free_inline_functions(s1);
-  /* Flush stashed static-function IR before sym_pop drops the Sym* keys. */
-  ir_inline_stash_flush(s1);
   sym_pop(&global_stack, NULL, 0);
   sym_pop(&local_stack, NULL, 0);
   /* free nested functions array */
@@ -453,8 +425,6 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   all_cleanups = NULL;
   pending_gotos = NULL;
   nb_temp_local_vars = 0;
-  nb_arg_struct_temps = 0;
-  arg_struct_temp_busy = 0;
   global_label_stack = NULL;
   local_label_stack = NULL;
   cur_text_section = NULL;

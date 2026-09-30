@@ -471,3 +471,40 @@ UT_TEST(test_store_mop_spill_halfword_emits_strh)
 
   return 0;
 }
+
+/* A store is as wide as its destination: a 64-bit integer stored into a word
+ * is a truncation, and only the low half may go anywhere.  The pair path
+ * wrote the high half as well -- for a plain register destination into its
+ * absent second register, r1 == -1, which encodes as pc (`mov pc, r7`; the
+ * tcc-built Zig compiler's InternPool.Key.eql truncating a u64 length). */
+static MachineOperand mop_reg_pair64(int lo, int hi)
+{
+  MachineOperand m = mop_reg(lo, IROP_BTYPE_INT64);
+  m.u.reg.r1 = hi;
+  m.is_64bit = 1;
+  return m;
+}
+
+UT_TEST(test_store_mop_i64_into_word_reg_moves_low_half_only)
+{
+  setup_gen();
+
+  tcc_gen_machine_store_mop(mop_reg(R0, IROP_BTYPE_INT32), mop_reg_pair64(R6, R7), TCCIR_OP_STORE);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_mov_reg(R0, R6, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
+                                               ENFORCE_ENCODING_NONE, false)));
+
+  return 0;
+}
+
+UT_TEST(test_store_mop_i64_into_word_slot_stores_one_word)
+{
+  setup_gen();
+  tcc_state->need_frame_pointer = 1;
+
+  tcc_gen_machine_store_mop(mop_spill(-12, IROP_BTYPE_INT32), mop_reg_pair64(R2, R3), TCCIR_OP_STORE);
+
+  UT_ASSERT(bytes_match_opcode(ind, th_str_imm(R2, R_FP, 12, 4 /* subtract */, ENFORCE_ENCODING_NONE)));
+
+  return 0;
+}

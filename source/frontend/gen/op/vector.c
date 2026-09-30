@@ -71,8 +71,9 @@ unsigned char *find_sv_const_init(const SValue *sv, int min_size)
   Sym *s;
   for (s = local_stack; s; s = s->prev)
   {
-    if (s->const_init_data && s->const_init_valid && (int)s->c == addr && s->const_init_size >= min_size)
-      return s->const_init_data;
+    const SymLocalFacts *f = SYM_FACTS(s);
+    if (f->const_init_data && f->const_init_valid && (int)s->c == addr && f->const_init_size >= min_size)
+      return f->const_init_data;
   }
   return NULL;
 }
@@ -98,9 +99,10 @@ unsigned char *find_sv_vec_literal_init(const SValue *sv, int min_size)
   Sym *s;
   for (s = local_stack; s; s = s->prev)
   {
-    if (s->const_init_data && s->const_init_valid && s->v >= SYM_FIRST_ANOM && (int)s->c == addr &&
-        s->const_init_size >= min_size)
-      return s->const_init_data;
+    const SymLocalFacts *f = SYM_FACTS(s);
+    if (f->const_init_data && f->const_init_valid && s->v >= SYM_FIRST_ANOM && (int)s->c == addr &&
+        f->const_init_size >= min_size)
+      return f->const_init_data;
   }
   return NULL;
 }
@@ -197,10 +199,11 @@ static int64_t eval_vec_const_op(int op, int64_t a, int64_t b, int is_unsigned)
 void attach_const_init_to_temp(int frame_offset, int size, const unsigned char *data)
 {
   Sym *s = sym_push2(&local_stack, SYM_FIRST_ANOM, VT_INT, frame_offset);
-  s->const_init_data = tcc_malloc(size);
-  memcpy(s->const_init_data, data, size);
-  s->const_init_size = size;
-  s->const_init_valid = 1;
+  SymLocalFacts *f = sym_facts(s);
+  f->const_init_data = tcc_malloc(size);
+  memcpy(f->const_init_data, data, size);
+  f->const_init_size = size;
+  f->const_init_valid = 1;
 }
 
 /* ---- element-major fusion of chained vector expressions ------------------

@@ -456,6 +456,15 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
   }
   else
   { // epilog
+    /* The asm body was emitted without passing through ot(), so no register-
+     * content cache saw what it wrote.  Forget them before storing outputs:
+     * with a stale `mov` equivalence the store of a "+r" operand back to its
+     * variable (`mov r4, r0` after the body incremented r0) is elided as a
+     * copy between registers the cache still believes equal. */
+    tcc_gen_machine_imm_cache_reset();
+    tcc_gen_machine_mov_equiv_reset();
+    tcc_gen_machine_strldr_cache_reset();
+
     /* generate save code */
     for (i = 0; i < nb_outputs; i++)
     {
@@ -641,10 +650,10 @@ instruction
       operands[k].input_index = i;
       op->priority = 5;
     }
-    else if ((op->vt->r & VT_VALMASK) == VT_LOCAL && op->vt->sym && (reg = op->vt->sym->r & VT_VALMASK) < VT_CONST)
+    else if (op->regvar)
     {
       op->priority = 1;
-      op->reg = reg;
+      op->reg = op->regvar - 1;
     }
     else
     {
@@ -2998,6 +3007,8 @@ static thumb_opcode thumb_math_opcode(TCCState *s1, int token)
     return th_smull(ops[0].reg, ops[1].reg, ops[2].reg, ops[3].reg);
   case TOK_ASM_umlal:
     return th_umlal(ops[0].reg, ops[1].reg, ops[2].reg, ops[3].reg);
+  case TOK_ASM_umaal:
+    return th_umaal(ops[0].reg, ops[1].reg, ops[2].reg, ops[3].reg);
   case TOK_ASM_umull:
     return th_umull(ops[0].reg, ops[1].reg, ops[2].reg, ops[3].reg);
   }
@@ -3772,6 +3783,7 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
   case TOK_ASM_smlal:
   case TOK_ASM_smull:
   case TOK_ASM_umlal:
+  case TOK_ASM_umaal:
   case TOK_ASM_mls:
   case TOK_ASM_umull:
     return thumb_emit_opcode(thumb_math_opcode(s1, token));

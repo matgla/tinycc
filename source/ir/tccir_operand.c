@@ -579,6 +579,10 @@ done:
     {
       /* Stack offset: store directly in aux_data (±32KB range) */
       int32_t offset = result.u.imm32;
+      /* tcc_ir_put names far struct sources through a pointer; anything
+       * still out of range here would be silently truncated. */
+      if (offset < -32768 || offset > 32767)
+        tcc_error("internal: struct stack operand at offset %d is out of the 16-bit encoding range", offset);
       result.u.s.ctype_idx = (uint16_t)ctype_idx;
       result.u.s.aux_data = (int16_t)offset; /* store offset directly, no alignment assumption */
     }
@@ -1073,6 +1077,10 @@ static int compute_aapcs_member_alignment(CType *ct)
      * alignment is 1 (packed overrides natural alignment). */
     if (f->a.packed || s->a.packed)
       member_align = 1;
+    /* An alignment given on the member itself counts, packed or not -- see
+     * compute_aapcs_natural_alignment, which this mirrors. */
+    if (f->a.aligned && (1 << (f->a.aligned - 1)) > member_align)
+      member_align = 1 << (f->a.aligned - 1);
     if (member_align > max_align)
       max_align = member_align;
     f = next;

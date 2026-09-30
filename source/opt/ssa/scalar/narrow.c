@@ -15,17 +15,8 @@
 #include "opt_dsl_ssa.h"
 #include "opt/ssa/narrow.h"
 #include "opt/ssa/ssa_opt_helpers.h"
+#include "opt_utils.h"
 #include <string.h>
-
-/* Call-param helpers from ir/opt_utils.c, declared locally: opt_utils.h's
- * is_power_of_2() prototype conflicts with the static inline in
- * ssa_opt_helpers.h, so the header cannot be included here. */
-int ir_opt_get_call_param_operand(struct TCCIRState *ir, int call_idx,
-                                  int param_idx, IROperand *out);
-int ir_opt_get_call_param_index(struct TCCIRState *ir, int call_idx,
-                                int param_idx);
-void ir_opt_nop_call_params(struct TCCIRState *ir, int call_idx);
-int change_callee_sym(struct TCCIRState *ir, int instr_idx, const char *new_name, int ret_btype);
 
 static IROperand narrow_copy_src(IROperand dest, int32_t vr)
 {
@@ -154,6 +145,54 @@ OPT_GEN_SSA(narrow_and, TCCIR_OP_AND) {
   return 0;
 }
 
+/* UBFX(x, #0, #w) of an x that already fits in w bits is a copy: a narrower
+ * or equal UBFX, an AND with a mask below 1<<w, an unsigned byte or halfword
+ * load, a 0/1 truth value, or the result of a call returning an unsigned
+ * narrow type.  The C backend's casts extend what a load or a previous cast
+ * just extended (`ldrh; ubfx #0,#16; ubfx #0,#16`). */
+OPT_GEN_SSA(narrow_ubfx_noop, TCCIR_OP_UBFX) {
+  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = -1);
+  GUARD(when(is_imm32(src2)));
+
+  int32_t param = (int32_t)imm(src2);
+  int lsb = param & 31, width = (param >> 5) & 63;
+  GUARD(
+    when(!(param & UBFX_HI_HALF));
+    and(lsb == 0 && width > 0 && width < 32);
+    and_not(irop_is_64bit(dest) || irop_is_64bit(src1) || irop_is_64bit(pdest)));
+
+  int fits = 0;
+  if (pop == TCCIR_OP_UBFX && is_imm32(psrc2)) {
+    int32_t pparam = (int32_t)imm(psrc2);
+    int pwidth = (pparam >> 5) & 63;
+    fits = !(pparam & UBFX_HI_HALF) && pwidth > 0 && pwidth <= width;
+  } else if (pop == TCCIR_OP_AND && is_imm32(psrc2) && !irop_is_64bit(psrc1)) {
+    fits = (uint32_t)imm(psrc2) < (1u << width);
+  } else if ((pop == TCCIR_OP_LOAD || pop == TCCIR_OP_ASSIGN) && psrc1.is_lval && !psrc1.is_llocal &&
+             psrc1.is_unsigned) {
+    int bt = irop_get_btype(psrc1);
+    fits = (bt == IROP_BTYPE_INT8 && width >= 8) || (bt == IROP_BTYPE_INT16 && width >= 16);
+  } else if (pop == TCCIR_OP_SETIF || pop == TCCIR_OP_BOOL_OR || pop == TCCIR_OP_BOOL_AND) {
+    fits = 1;
+  } else if (pop == TCCIR_OP_FUNCCALLVAL && irop_get_tag(psrc1) == IROP_TAG_SYMREF) {
+    /* The AAPCS has the callee extend a narrow result to a word -- tcc's
+     * return path does, and gcc and LLVM callers rely on it -- so a direct
+     * call declared to return bool or an unsigned byte or halfword already
+     * fits.  (A narrow local that receives the result re-extends it on every
+     * read otherwise.) */
+    Sym *fs = irop_get_sym_ex(ir, psrc1);
+    if (fs && (fs->type.t & VT_BTYPE) == VT_FUNC && fs->type.ref) {
+      int rt = fs->type.ref->type.t, rbt = rt & VT_BTYPE;
+      int rw = rbt == VT_BOOL ? 1 : rbt == VT_BYTE ? 8 : rbt == VT_SHORT ? 16 : 0;
+      fits = rw && (rbt == VT_BOOL || (rt & VT_UNSIGNED)) && rw <= width;
+    }
+  }
+  GUARD(when(fits));
+
+  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = narrow_copy_src(dest, vreg(src1)));
+}
+
 /* (x SHR #n) fed into UBFX(#lsb,#w) -> UBFX(x, #(lsb+n), #w) when the SHR dies. */
 OPT_GEN_SSA(narrow_ubfx, TCCIR_OP_UBFX) {
   PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
@@ -181,6 +220,7 @@ OPT_GEN_SSA(narrow_ubfx, TCCIR_OP_UBFX) {
 static const IRSSAOptGen narrow_gens[] = {
   OPT_GEN_ENTRY(narrow_shr,  TCCIR_OP_SHR),
   OPT_GEN_ENTRY(narrow_and,  TCCIR_OP_AND),
+  OPT_GEN_ENTRY(narrow_ubfx_noop, TCCIR_OP_UBFX),
   OPT_GEN_ENTRY(narrow_ubfx, TCCIR_OP_UBFX),
 };
 

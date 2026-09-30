@@ -30,6 +30,16 @@ int tcc_ir_find_defining_instruction(TCCIRState *ir, int32_t vreg, int before_id
   return -1;
 }
 
+int tcc_ir_vreg_coalesced(TCCIRState *ir, int32_t vreg)
+{
+  if (!ir || vreg < 0)
+    return 0;
+  for (int k = 0; k < ir->ls.next_interval_index; k++)
+    if (ir->ls.intervals[k].vreg == (uint32_t)vreg)
+      return ir->ls.intervals[k].co_member != 0;
+  return 0;
+}
+
 int tcc_ir_vreg_has_single_use(TCCIRState *ir, int32_t vreg, int exclude_idx)
 {
   if (!ir || vreg < 0)
@@ -53,7 +63,7 @@ int tcc_ir_vreg_has_single_use(TCCIRState *ir, int32_t vreg, int exclude_idx)
      * counting it: counting would newly admit the accumulator-only case, which
      * today bails (use_count 0).  Same blind spot as the ssa:sccp phi
      * materialization fixed for fuzz seeds volatile:82433 / bitfield:88932. */
-    if (q->op == TCCIR_OP_MLA &&
+    if (tcc_ir_op_is_mac(q->op) &&
         irop_get_vreg(tcc_ir_op_get_accum(ir, q)) == vreg)
       return 0;
 

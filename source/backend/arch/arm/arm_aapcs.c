@@ -138,46 +138,17 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
     const int slot_sz = tcc_abi_align_up_int(size, 4);
     const int regs_needed = (slot_sz + 3) / 4;
 
-    /* Invisible reference for large composites (> 16 bytes).
-     *
-     * This is used only on the callee side (where arg_flags is allocated
-     * by tcc_abi_call_layout_ensure_capacity).  On the caller/call-site
-     * side, arg_flags is NULL and large structs are classified as normal
-     * by-value composites — the frontend (gfunc_param_typed) handles the
-     * invisible-reference conversion for prototyped calls, while variadic
-     * anonymous arguments must be passed by value for va_arg to work.
-     *
-     * NOTE: The invisible-reference check must come BEFORE the 8-byte
-     * alignment padding below.  When passed by invisible reference the
-     * argument is a 4-byte pointer, so the struct's natural alignment
-     * is irrelevant for register assignment and must not cause the NCRN
-     * to skip a register. */
-    if (size > 16 && layout->arg_flags)
-    {
-      layout->arg_flags[arg_index] |= TCC_ABI_ARG_FLAG_INVISIBLE_REF;
-      /* Pass the pointer in a register (like a scalar) */
-      if (layout->next_reg <= 3)
-      {
-        loc.kind = TCC_ABI_LOC_REG;
-        loc.reg_base = layout->next_reg;
-        loc.reg_count = 1;
-        loc.size = 4; /* pointer size */
-        layout->next_reg++;
-      }
-      else
-      {
-        loc.kind = TCC_ABI_LOC_STACK;
-        loc.stack_off = layout->next_stack_off;
-        loc.size = 4; /* pointer size */
-        layout->next_stack_off += 4;
-      }
-    }
-    else
+    /* AAPCS32 passes a composite of any size by value: in the core registers
+     * from the NCRN, then on the stack, split between the two when it
+     * straddles r3 (rule C.5).  (Passing one larger than 16 bytes by a pointer
+     * to a copy is the AArch64 rule, not this one.) */
     {
       /* AAPCS: Composite types with 8-byte natural alignment require
        * double-word alignment — the NCRN must be rounded up to the
-       * next even register number before allocation.  This only applies
-       * to by-value composites, not invisible references (handled above). */
+       * next even register number before allocation.  A stack slot is
+       * aligned to at most 8 (C.4 caps the NSAA rounding at 8), whatever
+       * the composite's own alignment. */
+      const int stack_align = align > 8 ? 8 : align;
       if (align >= 8 && (layout->next_reg & 1))
         layout->next_reg++;
 
@@ -197,7 +168,7 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
         loc.kind = TCC_ABI_LOC_REG_STACK;
         loc.reg_base = layout->next_reg;
         loc.reg_count = (uint8_t)regs_avail;
-        layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, align);
+        layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, stack_align);
         loc.stack_off = layout->next_stack_off;
         loc.stack_size = (uint32_t)(words_on_stack * 4);
         layout->next_stack_off += words_on_stack * 4;
@@ -205,7 +176,7 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
       }
       else
       {
-        layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, align);
+        layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, stack_align);
         loc.kind = TCC_ABI_LOC_STACK;
         loc.stack_off = layout->next_stack_off;
         layout->next_stack_off += slot_sz;

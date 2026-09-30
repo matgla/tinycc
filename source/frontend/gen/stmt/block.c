@@ -143,22 +143,7 @@ static void lblock(int *bsym, int *csym)
   }
 }
 
-static void block_1(int flags);
-
-/* Wrapper that scopes the variadic struct-argument temp pool to one
- * statement.  Slots reserved while parsing this statement (and its
- * sub-expressions) are released on exit so sibling statements reuse them,
- * but a nested block() — e.g. a GNU statement-expression used as a call
- * argument — saves/restores the mask and so cannot recycle a slot the
- * enclosing call still has in flight. */
 void block(int flags)
-{
-  uint64_t saved_arg_struct_busy = arg_struct_temp_busy;
-  block_1(flags);
-  arg_struct_temp_busy = saved_arg_struct_busy;
-}
-
-static void block_1(int flags)
 {
   int a, b, c, d, e, t;
   struct scope o;
@@ -172,6 +157,10 @@ static void block_1(int flags)
   }
 
 again:
+  /* Only the expression statement below discards a value; every other
+   * statement (a declaration's initializer, a nested one inside a
+   * statement expression) uses it. */
+  discarded_call_vtop = NULL;
   t = tok;
   /* If the token carries a value, next() might destroy it. Only with
      invalid code such as f(){"123"4;} */
@@ -907,7 +896,9 @@ again:
         }
         else
         {
+          discarded_call_vtop = vtop;
           gexpr();
+          discarded_call_vtop = NULL;
           tcc_ir_codegen_drop_return(tcc_state->ir);
           gv_discarded_volatile();
           vpop();

@@ -71,7 +71,7 @@ Raw pointers are acceptable only at existing shared ABI/layout boundaries that c
 ## Conventions for Changes
 
 - **Never commit without a regression test** for a bug fix — verbatim or reduced repro under `tests/ir_tests/`, expected output in a `.expect` file.
-- New IR opcode → lowering in `arm-thumb-gen.c` + test.
+- New IR opcode → lowering in the matching `arm-thumb-{alu,mem,fp,frame,call}.c` + test.
 - New asm instruction → builder in `arm-thumb-opcodes.c` + token + parser + test.
 - Don't commit the temporary `TCC_SKIP_SSA*` env-var bisection gates — they are investigation-only scaffolding.
 
