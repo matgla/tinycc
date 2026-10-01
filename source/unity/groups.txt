@@ -1,0 +1,61 @@
+# Unity groups that are not simply "one per directory".  Hand-written; read by
+# scripts/gen_unity.py, which generates the rest of source/unity/ from it.
+#
+# Every library source joins the group of its directory (source/opt/flat/cfg/*.c
+# -> opt_flat_cfg), unless a line below claims it first.  Lines are
+#     group: pattern [pattern ...]
+# with shell globs relative to source/; the first line that matches a source
+# wins.  A directory too big for one TU (the device compiles each group in
+# a few MB of heap) is cut here into named pieces; its remaining files keep the
+# directory's own group.  A source the rules keep apart (see gen_unity.py)
+# builds as its own TU wherever it is listed, and members that do not use
+# USING_GLOBALS (state through s1->, not tcc_state->) cannot share a TU with
+# those that do: they get the group's name plus "_s1".
+
+# source/ir: the code generator and the register allocator stand on their own.
+ir_codegen: ir/codegen.c
+ir_regalloc: ir/regalloc.c ir/regalloc_scan.c ir/regalloc_post.c
+ir_regalloc_ssa: ir/regalloc_phi.c ir/regalloc_entry.c
+
+# source/backend/arch/arm/thumb
+arm_thumb_gen: backend/arch/arm/thumb/arm-thumb-gen.c backend/arch/arm/thumb/arm-thumb-alu.c
+arm_thumb_asm: backend/arch/arm/thumb/arm-thumb-asm.c
+arm_thumb_call: backend/arch/arm/thumb/arm-thumb-call*.c
+arm_thumb_emit: backend/arch/arm/thumb/arm-thumb-*.c
+
+# source/obj: the ELF writer/linker apart from debug info, ld scripts and YAFF.
+obj_elf: obj/tccelf*.c
+
+# source/opt/flat/memory
+opt_flat_memory_fwd: opt/flat/memory/sl_forward.c opt/flat/memory/copy_source_load_fwd.c
+    opt/flat/memory/entry_store_prop.c opt/flat/memory/addrof_var_fwd.c
+    opt/flat/memory/ptr_local_fwd.c opt/flat/memory/param_copy_alias.c
+opt_flat_memory_dse: opt/flat/memory/dse.c opt/flat/memory/dead_*.c
+    opt/flat/memory/var_store_elim.c opt/flat/memory/byte_store_merge.c
+    opt/flat/memory/rmw_byte_clear.c opt/flat/memory/store_inplace_arith.c
+    opt/flat/memory/slot_const_store_fold.c opt/flat/memory/bitfield_unit_narrow.c
+opt_flat_memory_cse: opt/flat/memory/*_cse.c opt/flat/memory/global_base_share.c
+    opt/flat/memory/invariant_global_load_hoist.c
+
+# source/opt/flat/scalar
+opt_flat_scalar_const: opt/flat/scalar/const_*.c opt/flat/scalar/addrof_const_fold.c
+    opt/flat/scalar/cmp_expr_fold.c opt/flat/scalar/symref_const_prop.c
+    opt/flat/scalar/global_init_prop.c opt/flat/scalar/stack_addr_fold.c
+    opt/flat/scalar/switch_collapse.c
+opt_flat_scalar_known: opt/flat/scalar/known_bits.c opt/flat/scalar/value_tracking.c
+    opt/flat/scalar/branch.c opt/flat/scalar/redundant_loop_check.c
+
+# source/opt/flat/loop: induction variables and invariant code motion.
+opt_flat_loop_iv: opt/flat/loop/iv_*.c opt/flat/loop/licm.c
+    opt/flat/loop/decrement_to_zero.c opt/flat/loop/backedge_phi_hoist.c
+    opt/flat/loop/stack_param_promote.c
+
+# source/opt/ssa/cfg: its file-local branch_gens is a name the other members'
+# headers declare.
+opt_ssa_cfg_or_bool: opt/ssa/cfg/or_bool_diamond.c
+
+# source/ir: frame layout and cross-jumping apart from the IR core.
+ir_frame: ir/frame.c ir/cross_jump.c
+
+# source/opt/ssa/scalar: the propagation engines apart from the folds.
+opt_ssa_scalar_prop: opt/ssa/scalar/sccp.c opt/ssa/scalar/cprop.c

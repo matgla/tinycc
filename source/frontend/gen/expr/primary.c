@@ -1762,6 +1762,7 @@ tok_next:
             s->c = nf->captured_offsets[i];  /* Parent's FP offset */
             s->vreg = -1;                    /* No vreg in nested function's IR — pure stack offset via chain */
             s->sym_scope = 0;
+            nested_track_captured_sym(s);
             goto found_captured_var;
           }
         }

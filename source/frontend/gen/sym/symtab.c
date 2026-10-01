@@ -69,7 +69,7 @@ SymLocalFacts *sym_facts(Sym *s)
   return s->facts;
 }
 
-static void sym_free_facts(Sym *s)
+void sym_free_facts(Sym *s)
 {
   if (s->facts)
   {
@@ -332,24 +332,20 @@ ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep)
         ps = &ts->sym_identifier;
       *ps = s->prev_tok;
     }
-    if (!keep && s->facts && s->facts->const_init_data)
-    {
-      tcc_free(s->facts->const_init_data);
-      s->facts->const_init_data = NULL;
-    }
     /* Don't free symbols that have been exported to ELF (sym->c != 0)
        as they may still be referenced by IR instructions */
-    if (!keep && s->c == 0)
-    {
-      /* In IR mode the backend may still need Sym pointers (notably for
-       * VT_SYM address materialization and relocations). Block-scope extern
-       * declarations create temporary Sym copies that can be referenced by IR
-       * after the scope ends; freeing them here can lead to missing relocations
-       * and loads/stores from address 0 at runtime.
-       */
-      if (!(tcc_state->ir && (s->r & VT_SYM)))
-        sym_free(s);
-    }
+    /* In IR mode the backend may still need Sym pointers (notably for
+     * VT_SYM address materialization and relocations). Block-scope extern
+     * declarations create temporary Sym copies that can be referenced by IR
+     * after the scope ends; freeing them here can lead to missing relocations
+     * and loads/stores from address 0 at runtime.
+     */
+    if (!keep && s->c == 0 && !(tcc_state->ir && (s->r & VT_SYM)))
+      sym_free(s);
+    else if (!keep)
+      /* The Sym outlives its scope (a local's c is its frame offset); its
+       * facts do not, and nothing frees them later. */
+      sym_free_facts(s);
     s = ss;
   }
   if (!keep)

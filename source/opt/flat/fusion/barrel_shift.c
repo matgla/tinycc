@@ -48,7 +48,49 @@
  * This pass used to refuse that case; the refusal cost an instruction every
  * time and protected nothing (87 such fusions appear across an exhaustive
  * op x shift-kind x amount matrix, all matching gcc's answers).
+ *
+ * Despite running from run_post_ra_optimizations, this sees the flat IR
+ * BEFORE tcc_ir_ssa_regalloc: a VAR may still have a def per branch, and
+ * du.def names only the last one.  So the shift must be its result's only
+ * def, and no path may enter between the shift and the consumer: a join there
+ * reaches the consumer without the shift (ctags' isTagExtraBitMarked computed
+ * `index` in both arms of an if, and the join read the else arm's value on
+ * the then path), and a back edge there re-reads a shift source the shift
+ * read once.
  */
+
+/* Every JUMP/JUMPIF/switch target, plus anything already flagged. */
+static uint8_t *barrel_build_target_map(TCCIRState *ir, int n)
+{
+  uint8_t *map = tcc_mallocz((size_t)n);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->is_jump_target)
+      map[i] = 1;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      if (t >= 0 && t < n)
+        map[t] = 1;
+    }
+    else if (q->op == TCCIR_OP_SWITCH_TABLE)
+    {
+      int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      if (table_id >= 0 && table_id < ir->num_switch_tables)
+      {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        for (int j = 0; j < table->num_entries; j++)
+          if (table->targets[j] >= 0 && table->targets[j] < n)
+            map[table->targets[j]] = 1;
+        if (table->default_target >= 0 && table->default_target < n)
+          map[table->default_target] = 1;
+      }
+    }
+  }
+  return map;
+}
+
 void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -60,6 +102,7 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
 
   IROptDU du;
   ir_opt_du_build(ir, &du);
+  uint8_t *is_target = barrel_build_target_map(ir, n);
 
   /* Vregs that reach a memory operation's address: an is_lval operand (a real
    * pointer -- is_local/is_llocal reads a stack variable's value, not an
@@ -144,7 +187,7 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
       default: continue;
       }
 
-      if (ir_opt_du_uses(&du, vr2) != 1)
+      if (ir_opt_du_uses(&du, vr2) != 1 || !ir_opt_du_is_single_def(&du, vr2))
         continue;
 
       IROperand shift_dest = tcc_ir_op_get_dest(ir, sq);
@@ -196,11 +239,13 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
       if (!irop_has_vreg(other))
         continue;
 
-      int safe = 1;
+      int safe = !is_target[i];
       for (int j = shift_idx + 1; j < i && safe; j++)
       {
         IRQuadCompact *jq = &ir->compact_instructions[j];
         TccIrOp bop = jq->op;
+        if (is_target[j])
+          safe = 0;
         if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF)
           safe = 0;
         if (bop == TCCIR_OP_NOP)
@@ -227,6 +272,7 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
     }
   }
 
+  tcc_free(is_target);
   tcc_free(deref_base);
   tcc_free(du.def);
 }

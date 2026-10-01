@@ -1447,6 +1447,8 @@ TEST_FILES = [
     # toybox awk's logical NOT, "STKP->num = ! get_set_logical();": a
     # comparison still in the flags was converted as its compared operand
     ("607_assign_not_of_call_writing_lhs.c", 0),
+    # barrel-shift fusion across a join: a VAR with a def per arm
+    ("608_barrel_shift_join_multidef.c", 0),
     # toysh's wildcard_matchlen against literal case patterns, and strchr
     # finding the NUL terminator: device-only shapes, pinned
     ("604_toysh_wildcard_literal.c", 0),

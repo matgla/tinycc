@@ -328,6 +328,7 @@ extern CType func_old_size_t_type;
  * caller lived in the same TU. */
 void vpush_type_size(CType *type, int *a);
 void compile_nested_functions(Sym *parent_sym);
+void nested_track_captured_sym(Sym *s);
 void pop_local_syms(Sym *b, int keep);
 
 /* combine_types() operator classes, shared with op/op.c's gen_op_impl(). */

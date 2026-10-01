@@ -708,6 +708,7 @@ typedef struct SymLocalFacts
 extern const SymLocalFacts sym_no_facts;
 #define SYM_FACTS(s) ((const SymLocalFacts *)((s)->facts ? (s)->facts : &sym_no_facts))
 SymLocalFacts *sym_facts(struct Sym *s);
+void sym_free_facts(struct Sym *s);
 
 #include "source/ir/machine_op.h"
 #include "source/ir/tccir.h"

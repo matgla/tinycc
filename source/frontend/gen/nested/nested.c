@@ -180,6 +180,25 @@ typedef struct
   struct temp_local_variable tmp_vars[MAX_TEMP_LOCAL_VARIABLE_NUMBER];
 } ParentSavedState;
 
+/* The stand-in Syms tok_identifier makes for each reference to a captured
+ * variable sit on no scope stack, so no sym_pop frees the facts a store
+ * records on them.  Chained through prev (unused off a stack) and dropped once
+ * the body is compiled; the Syms stay, IR may still point at them. */
+static Sym *captured_var_syms;
+
+void nested_track_captured_sym(Sym *s)
+{
+  s->prev = captured_var_syms;
+  captured_var_syms = s;
+}
+
+static void free_captured_sym_facts(void)
+{
+  for (Sym *s = captured_var_syms; s; s = s->prev)
+    sym_free_facts(s);
+  captured_var_syms = NULL;
+}
+
 /* Compile all nested functions defined inside a parent function */
 void compile_nested_functions(Sym *parent_sym)
 {
@@ -320,6 +339,7 @@ void compile_nested_functions(Sym *parent_sym)
     }
 
     gen_function(nf->sym);
+    free_captured_sym_facts();
 
     /* Remove parent addr-taken labels from hash table after compilation. */
     for (int j = 0; j < nf->nb_addr_labels; j++)

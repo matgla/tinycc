@@ -25,8 +25,15 @@ came from):
   * tcc.h picks TCC_STATE_VAR / TCC_SET_STATE / _tcc_error by whether the
     includer defined USING_GLOBALS first; a later member cannot change that, so
     sources only share a group when they agree on it.
-  * Groups stay within one library and under --max-lines source lines, and a
-    source bigger than that stands alone.
+  * Groups stay within one library.
+
+Which sources share a group is decided by hand, not packed by size: every source
+joins the group of its directory (source/opt/flat/cfg/*.c -> opt_flat_cfg) unless
+source/unity/groups.txt names it for another group, which is how a directory too
+big for one TU is cut into logical pieces.  So a file growing or a new file
+arriving never moves any other file between groups.  A source the macro rules or
+the proof below keep apart builds as its own TU; a clash of file-local names
+between two members of one group is an error to resolve in groups.txt.
 
 Usage (in a configured tree):
     scripts/gen_unity.py            # rewrite source/unity/
@@ -37,6 +44,7 @@ import argparse
 import collections
 import concurrent.futures
 import difflib
+import fnmatch
 import os
 import re
 import shlex
@@ -46,6 +54,7 @@ import sys
 
 TOP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UNITY_DIR = os.path.join('source', 'unity')
+MANIFEST = os.path.join(UNITY_DIR, 'groups.txt')
 
 # Macros whose effect the grouping key already captures (see mode_key).  tcc.h
 # consumes USING_GLOBALS and #undefs it, so it is local to the includer.
@@ -288,52 +297,114 @@ def analyse(src, flags):
     )
 
 
-def plan(libs, info, max_lines, ungroupable=()):
+def read_manifest():
+    """[(group, [glob, ...])] from groups.txt, in file order."""
+    rules, cur = [], None
+    with open(os.path.join(TOP, MANIFEST)) as f:
+        for n, line in enumerate(f, 1):
+            text = line.split('#', 1)[0].rstrip()
+            if not text:
+                continue
+            if text[0].isspace():
+                if cur is None:
+                    sys.exit('gen_unity: %s:%d: continuation without a group' % (MANIFEST, n))
+                cur[1].extend(text.split())
+                continue
+            name, sep, pats = text.partition(':')
+            name = name.strip()
+            if not sep or not re.fullmatch(r'\w+', name):
+                sys.exit('gen_unity: %s:%d: expected "group: pattern ..."' % (MANIFEST, n))
+            cur = (name, pats.split())
+            rules.append(cur)
+    return rules
+
+
+def group_of(src, rules, used):
+    rel = os.path.relpath(src, 'source')
+    for name, pats in rules:
+        for pat in pats:
+            if fnmatch.fnmatchcase(rel, pat):
+                used.add((name, pat))
+                return name
+    d = os.path.dirname(rel)
+    if d.startswith('backend/arch/'):
+        d = d[len('backend/arch/'):]
+    return d.replace('/', '_').replace('-', '_') or 'source'
+
+
+def clashes(i, ch):
+    """Why source info *i* cannot join the members accumulated in *ch*."""
+    local = (i['local_defs'] | i['local_undefs']) - MODE_MACROS
+    own, hdr = i['names'], i['hdr_names']
+    loose = own - hdr
+    why = []
+    if ch['mode'] is not None and i['mode'] != ch['mode']:
+        why.append('USING_GLOBALS differs')
+    for what, names in (('both define', own & ch['names']),
+                        ('declared by the other\'s headers', (loose & ch['hdr']) | (ch['loose'] & hdr)),
+                        ('macros the other\'s headers define', (local & ch['hdr_macros'])
+                         | (ch['local'] & i['hdr_macros']))):
+        if names:
+            why.append('%s %s' % (what, ' '.join(sorted(names)[:6])))
+    return why
+
+
+def plan(libs, info, ungroupable=()):
+    rules = read_manifest()
+    used = set()
     kept_apart = {}
-    groups = collections.OrderedDict()
+    errors = []
+    found = collections.OrderedDict()        # group -> (lib, [members])
     for lib, srcs in libs.items():
-        chunks = collections.defaultdict(list)      # mode -> [chunk]
         for src in srcs:
             i = info[src]
-            # A file that redefines a macro one of its own headers defines stays
-            # alone; otherwise it only has to avoid the headers of its group.
             local = (i['local_defs'] | i['local_undefs']) - MODE_MACROS
             clash = local & i['hdr_macros']
             if clash:
+                # #undef'ing it would take a header's definition from the
+                # members after it, and the guarded header would not restore it.
                 kept_apart[src] = 'redefines header macros ' + ' '.join(sorted(clash))
                 continue
             if src in ungroupable:
                 kept_apart[src] = 'expands differently inside a group'
                 continue
-            if i['lines'] > max_lines:
-                kept_apart[src] = '%d lines' % i['lines']
+            g = group_of(src, rules, used)
+            # A file's USING_GLOBALS choice is its own and fixed, so splitting a
+            # group by it keeps membership stable.  (The group checks below
+            # still compare the mode, in case the analysis ever disagrees.)
+            # (Whether it does is read from what tcc.h settled on, since a
+            # header may define USING_GLOBALS for it.)  Most sources do.
+            if 'tcc_state' not in (i['mode'][0] or ''):
+                g += '_s1'
+            if g in found and found[g][0] != lib:
+                errors.append('group %s mixes libraries %s and %s (%s)' % (g, found[g][0], lib, src))
                 continue
-            # A file-local name clashes with another member's file-local names,
-            # and with anything the headers of another member declare -- unless
-            # this file's own headers declare it too, which it already agrees with.
-            own, hdr = i['names'], i['hdr_names']
-            loose = own - hdr
-            for ch in chunks[i['mode']]:
-                if (ch['lines'] + i['lines'] <= max_lines and not (own & ch['names'])
-                        and not (loose & ch['hdr']) and not (ch['loose'] & hdr)
-                        and not (local & ch['hdr_macros']) and not (ch['local'] & i['hdr_macros'])):
-                    break
-            else:
-                ch = dict(lines=0, names=set(), hdr=set(), loose=set(), members=[],
-                          local=set(), hdr_macros=set())
-                chunks[i['mode']].append(ch)
+            found.setdefault(g, (lib, []))[1].append(src)
+    groups = collections.OrderedDict()
+    for g in sorted(found):
+        lib, members = found[g]
+        members.sort()
+        ch = dict(mode=None, names=set(), hdr=set(), loose=set(), local=set(), hdr_macros=set())
+        for src in members:
+            i = info[src]
+            why = clashes(i, ch)
+            if why:
+                errors.append('group %s: %s clashes with an earlier member: %s' % (g, src, '; '.join(why)))
+            local = (i['local_defs'] | i['local_undefs']) - MODE_MACROS
+            ch['mode'] = i['mode']
+            ch['names'] |= i['names']
+            ch['hdr'] |= i['hdr_names']
+            ch['loose'] |= i['names'] - i['hdr_names']
             ch['local'] |= local
             ch['hdr_macros'] |= i['hdr_macros']
-            ch['lines'] += i['lines']
-            ch['names'] |= own
-            ch['hdr'] |= hdr
-            ch['loose'] |= loose
-            ch['members'].append(src)
-        # number the groups in source order, so the output is stable
-        found = [ch for cs in chunks.values() for ch in cs if len(ch['members']) > 1]
-        found.sort(key=lambda ch: srcs.index(ch['members'][0]))
-        for k, ch in enumerate(found):
-            groups['%s_%02d' % (lib, k + 1)] = (lib, ch['members'])
+        if len(members) > 1:
+            groups[g] = (lib, members)
+    for name, pats in rules:
+        for pat in pats:
+            if (name, pat) not in used:
+                errors.append('%s: %s: %s matches no library source' % (MANIFEST, name, pat))
+    if errors:
+        sys.exit('gen_unity: fix source/unity/groups.txt:\n  ' + '\n  '.join(errors))
     return groups, kept_apart
 
 
@@ -407,11 +478,11 @@ def verify(groups, info, lib_flags):
         return set().union(*ex.map(run, jobs)) if jobs else set()
 
 
-def render(groups, kept_apart, info, max_lines):
+def render(groups, kept_apart, info):
     files = {}
     mk = [HEADER.replace('/*', '#').replace(' */', ''),
           '# Unity-build groups: see the "Unity build" block in the Makefile.\n',
-          '# Budget %d source lines per group.\n' % max_lines]
+          '# Membership comes from source/unity/groups.txt.\n']
     for src in sorted(kept_apart):
         mk.append('# own TU: %s (%s)\n' % (src, kept_apart[src]))
     by_lib = collections.OrderedDict()
@@ -431,8 +502,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('--check', action='store_true',
                     help='report whether source/unity/ is up to date; write nothing')
-    ap.add_argument('--max-lines', type=int, default=6000,
-                    help='source-line budget per group (default %(default)s)')
     ap.add_argument('--target', default='armv8m', help='CROSS_TARGET to ask make about')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args()
@@ -456,18 +525,20 @@ def main():
     # and keep out any member whose own code expands differently than alone.
     ungroupable = set()
     while True:
-        groups, kept_apart = plan(libs, info, args.max_lines, ungroupable)
+        groups, kept_apart = plan(libs, info, ungroupable)
         bad = verify(groups, info, lib_flags)
         if not bad:
             break
         ungroupable |= bad
-    files = render(groups, kept_apart, info, args.max_lines)
+    files = render(groups, kept_apart, info)
 
     old = {}
     udir = os.path.join(TOP, UNITY_DIR)
     if os.path.isdir(udir):
         for f in os.listdir(udir):
             p = os.path.join(UNITY_DIR, f)
+            if p == MANIFEST:
+                continue
             with open(os.path.join(TOP, p)) as fh:
                 old[p] = fh.read()
     stale = sorted(p for p in set(old) | set(files) if old.get(p) != files.get(p))
