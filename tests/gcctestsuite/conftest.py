@@ -444,7 +444,7 @@ def discover_gcc_compile_tests() -> List[GCCTestCase]:
             tests.append(GCCTestCase(
                 source=c_file,
                 category="gcc_compile",
-                timeout=30,
+                timeout=30 * ASAN_TIMEOUT_MULTIPLIER,
                 dg_options=parse_dg_options(c_file),
                 expected_compile_failure=bool(dg_errors),
                 expected_error_patterns=dg_errors,
@@ -474,7 +474,7 @@ def discover_gcc_execute_tests() -> List[GCCTestCase]:
         tests.append(GCCTestCase(
             source=c_file,
             category="gcc_execute",
-            timeout=30,
+            timeout=30 * ASAN_TIMEOUT_MULTIPLIER,
             dg_options=parse_dg_options(c_file)
         ))
 
@@ -485,7 +485,7 @@ def discover_gcc_execute_tests() -> List[GCCTestCase]:
             tests.append(GCCTestCase(
                 source=c_file,
                 category="gcc_execute",
-                timeout=30,
+                timeout=30 * ASAN_TIMEOUT_MULTIPLIER,
                 dg_options=parse_dg_options(c_file)
             ))
 
@@ -516,7 +516,7 @@ def discover_gcc_execute_tests() -> List[GCCTestCase]:
             tests.append(GCCTestCase(
                 source=c_file,
                 category="gcc_execute",
-                timeout=30,
+                timeout=30 * ASAN_TIMEOUT_MULTIPLIER,
                 dg_options=parse_dg_options(c_file),
                 extra_sources=extra
             ))
