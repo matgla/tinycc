@@ -21,7 +21,7 @@ FRONTEND_HDRS = \
 
 # $(GEN_SRC) comes from source/frontend/gen/Makefile, included first by the
 # top-level Makefile.
-FRONTEND_OBJ = $(patsubst %.c,$(X)%.o,$(FRONTEND_SRC) $(GEN_SRC))
+FRONTEND_OBJ = $(call lib-objs,frontend,$(FRONTEND_SRC) $(GEN_SRC))
 FRONTEND_LIB = $(X)source/frontend/libfrontend.a
 
 $(X)source/frontend/%.o: source/frontend/%.c $(FRONTEND_HDRS) $(TCC_CORE_DEPS)

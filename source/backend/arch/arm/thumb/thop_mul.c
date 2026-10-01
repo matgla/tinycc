@@ -88,6 +88,19 @@ TH_TABLE(TH_UMLAL, "umlal", {&SHAPE_LONG_MUL, 0xfbe00000, long_mul_emit});
 TH_TABLE(TH_SMULL, "smull", {&SHAPE_LONG_MUL, 0xfb800000, long_mul_emit});
 TH_TABLE(TH_SMLAL, "smlal", {&SHAPE_LONG_MUL, 0xfbc00000, long_mul_emit});
 
+/* UMAAL: {RdHi:RdLo} = Rn * Rm + RdLo + RdHi.  Part of the DSP extension
+ * (ARMv7E-M, ARMv8-M Mainline with DSP), unlike the four above. */
+static const thop_variant_shape SHAPE_LONG_MUL_DSP = {
+    .size = THOP_VARIANT_T32,
+    .rd_place = {8, 4},
+    .rn_place = {0, 4},
+    .rm_place = {16, 4},
+    .ra_place = {12, 4},
+    .feat = {.t32 = 1, .dsp = 1},
+};
+
+TH_TABLE(TH_UMAAL, "umaal", {&SHAPE_LONG_MUL_DSP, 0xfbe00060, long_mul_emit});
+
 /* ───── SDIV / UDIV (T32 only) ───── */
 
 static const thop_variant_shape SHAPE_DIV = {
@@ -146,6 +159,12 @@ thumb_opcode th_umull(uint32_t rdlo, uint32_t rdhi, uint32_t rn, uint32_t rm)
 thumb_opcode th_umlal(uint32_t rdlo, uint32_t rdhi, uint32_t rn, uint32_t rm)
 {
   return thop_emit(TH_UMLAL.name, TH_UMLAL.variants, TH_UMLAL.variant_count,
+                   (thop_args){.rd = rdhi, .rn = rn, .rm = rm, .ra = rdlo});
+}
+
+thumb_opcode th_umaal(uint32_t rdlo, uint32_t rdhi, uint32_t rn, uint32_t rm)
+{
+  return thop_emit(TH_UMAAL.name, TH_UMAAL.variants, TH_UMAAL.variant_count,
                    (thop_args){.rd = rdhi, .rn = rn, .rm = rm, .ra = rdlo});
 }
 

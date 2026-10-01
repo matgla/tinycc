@@ -44,6 +44,10 @@ FPU_SRCS = fpv5-sp-d16.c fpv5-d16.c rp2350-dcp.c
 FPU_OBJS = $(addprefix $(BUILD_DIR)/fpu-, $(FPU_SRCS:.c=.o))
 OBJS += $(FPU_OBJS)
 
+UNITY_LIB = arm
+UNITY_SRC_DIR = source/backend/arch/arm
+include $(TOP)/source/backend/arch/unity.mk
+
 $(BUILD_DIR)/fpu-%.o: $(TOP)/source/backend/arch/fpu/arm/%.c $(CORE_HDRS)
 	@mkdir -p $(dir $@)
 	$(CC) -o $@ -c $< $(CFLAGS) $(DEFINES) -I$(TOP) -I$(TOP)/source/ir 

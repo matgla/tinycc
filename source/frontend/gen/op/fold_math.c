@@ -163,9 +163,9 @@ int svalue_get_conservative_max_u64(SValue *sv, unsigned long long *out_max)
   {
     Sym *sym = find_local_scalar_sym_for_svalue(sv);
 
-    if (sym && sym->objsize_max_valid)
+    if (sym && SYM_FACTS(sym)->objsize_max_valid)
     {
-      *out_max = sym->objsize_max_value;
+      *out_max = SYM_FACTS(sym)->objsize_max_value;
       return 1;
     }
   }
@@ -190,9 +190,9 @@ int svalue_get_conservative_string_bytes_u64(SValue *sv, unsigned long long *out
   {
     Sym *sym = find_local_scalar_sym_for_svalue(sv);
 
-    if (sym && sym->objsize_strlen_valid)
+    if (sym && SYM_FACTS(sym)->objsize_strlen_valid)
     {
-      *out_max = sym->objsize_strlen_value;
+      *out_max = SYM_FACTS(sym)->objsize_strlen_value;
       return 1;
     }
   }
@@ -233,8 +233,10 @@ int chk_get_conservative_sprintf_bytes(int tok, int fmt_idx, SValue *all_args, i
 void update_local_scalar_max_bound(SValue *dst, SValue *src)
 {
   Sym *sym;
+  SymLocalFacts *f;
   unsigned long long max_value;
   unsigned long long max_strlen;
+  int have_max, have_strlen;
 
   if ((dst->r & VT_VALMASK) != VT_LOCAL)
     return;
@@ -242,29 +244,35 @@ void update_local_scalar_max_bound(SValue *dst, SValue *src)
   if (!sym)
     return;
 
-  if (!svalue_get_conservative_max_u64(src, &max_value))
-  {
-    sym->objsize_max_valid = 0;
-    sym->objsize_max_value = 0;
-  }
+  have_max = svalue_get_conservative_max_u64(src, &max_value);
+  have_strlen = svalue_get_conservative_string_bytes_u64(src, &max_strlen);
+  /* Nothing known and nothing recorded: clearing would only allocate zeroes. */
+  if (!have_max && !have_strlen && !sym->facts)
+    return;
+  f = sym_facts(sym);
 
-  if (svalue_get_conservative_max_u64(src, &max_value))
+  if (!have_max)
   {
-    if (!sym->objsize_max_valid || max_value > sym->objsize_max_value)
-      sym->objsize_max_value = max_value;
-    sym->objsize_max_valid = 1;
-  }
-
-  if (svalue_get_conservative_string_bytes_u64(src, &max_strlen))
-  {
-    if (!sym->objsize_strlen_valid || max_strlen > sym->objsize_strlen_value)
-      sym->objsize_strlen_value = max_strlen;
-    sym->objsize_strlen_valid = 1;
+    f->objsize_max_valid = 0;
+    f->objsize_max_value = 0;
   }
   else
   {
-    sym->objsize_strlen_valid = 0;
-    sym->objsize_strlen_value = 0;
+    if (!f->objsize_max_valid || max_value > f->objsize_max_value)
+      f->objsize_max_value = max_value;
+    f->objsize_max_valid = 1;
+  }
+
+  if (have_strlen)
+  {
+    if (!f->objsize_strlen_valid || max_strlen > f->objsize_strlen_value)
+      f->objsize_strlen_value = max_strlen;
+    f->objsize_strlen_valid = 1;
+  }
+  else
+  {
+    f->objsize_strlen_valid = 0;
+    f->objsize_strlen_value = 0;
   }
 }
 /* ============================================================================

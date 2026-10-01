@@ -513,6 +513,27 @@ int __tcc_memcmp1(const void *lhs, const void *rhs)
   return (int)a[0] - (int)b[0];
 }
 
+/* memcmp for calls the compiler binds here instead of libc's (see
+ * thumb_local_libc_helper): word steps while both sides are word-aligned and
+ * equal, bytes to find the first difference. */
+int __tcc_memcmp(const void *lhs, const void *rhs, unsigned long n)
+{
+  const unsigned char *a = (const unsigned char *)lhs;
+  const unsigned char *b = (const unsigned char *)rhs;
+
+  if ((((unsigned long)a | (unsigned long)b) & 3) == 0)
+    while (n >= 4 && *(const unsigned *)a == *(const unsigned *)b)
+    {
+      a += 4;
+      b += 4;
+      n -= 4;
+    }
+  for (; n > 0; n--, a++, b++)
+    if (*a != *b)
+      return (int)*a - (int)*b;
+  return 0;
+}
+
 int __tcc_strncmp(const char *lhs, const char *rhs, unsigned long n)
 {
   const unsigned char *a = (const unsigned char *)lhs;

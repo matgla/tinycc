@@ -204,10 +204,11 @@ static int bfun_sole_def(TCCIRState *ir, int32_t vr)
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest || q->op == TCCIR_OP_STORE_INDEXED)
       continue;
+    /* A VAR written as itself is a STACKOFF lvalue: still a definition. */
     IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(d) != vr || d.is_lval)
+    if (irop_get_vreg(d) != vr || !irop_dest_defines_vreg(d))
       continue;
     if (found >= 0)
       return -1;

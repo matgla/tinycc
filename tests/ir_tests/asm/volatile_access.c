@@ -252,6 +252,16 @@ int v64_1_0(void) { struct VW t = mgw; return t.a; }
 int v65_2_0(void) { struct VW x = mgw; struct VW y = mgw; return x.a + y.a; }
 int v66_1_0(void) { struct VW t = mgw; mdead = t.a; return 0; }
 
+/* --- two volatile locals with the same initialiser ----------------------
+ * The expression-equality helper and the constant evaluator followed a
+ * volatile VAR to its definition, so `(a < 0) != (b < 0)` compared two copies
+ * of the initialiser: cmp_expr_fold folded it to 0 and deleted b's read, and
+ * frame colouring then gave both objects one slot. */
+int v67_2_2(void) { volatile int a = 5, b = 5; int x = a; return (x < 0) != (b < 0); }
+int v68_2_2(void) { volatile long long a = 5, b = 5; long long x = a; return (x < 0) != (b < 0); }
+/* a volatile read copied into a local nobody reads is still a read */
+int v69_1_1(void) { volatile int a = 7; int t = a; (void)t; return 0; }
+
 /* --- controls: the same shapes without volatile -------------------------- */
 int c01_1_0(int *p) { return *p + *p; }
 int c02_1_0(int *p) { return p[1] + p[1]; }

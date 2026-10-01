@@ -15,9 +15,7 @@
  *
  *    - addrof_var_fwd            (tcc_ir_opt_addrof_var_fwd)
  *    - invariant_global_load_hoist (tcc_ir_opt_invariant_global_load_hoist)
- *    - invariant_temp_deref_hoist  (tcc_ir_opt_invariant_temp_deref_hoist)
  *    - rmw_byte_clear            (tcc_ir_opt_rmw_byte_clear)
- *    - local_copy_prop           (tcc_ir_opt_local_copy_prop)
  *    - struct_copy_roundtrip_elim (tcc_ir_opt_struct_copy_roundtrip_elim)
  *    - const_memcpy_to_dest      (tcc_ir_opt_const_memcpy_to_dest)
  *
@@ -42,9 +40,7 @@
  * avoid pulling in the optimizer engine headers). */
 int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir);
 int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir);
-int tcc_ir_opt_invariant_temp_deref_hoist(TCCIRState *ir);
 int tcc_ir_opt_rmw_byte_clear(TCCIRState *ir);
-int tcc_ir_opt_local_copy_prop(TCCIRState *ir);
 int tcc_ir_opt_struct_copy_roundtrip_elim(TCCIRState *ir);
 int tcc_ir_opt_const_memcpy_to_dest(TCCIRState *ir);
 int tcc_ir_opt_deref_operand_cse(TCCIRState *ir);
@@ -93,7 +89,7 @@ static IROperand utb_callee(TCCIRState *ir, Sym *sym, int tok)
   return irop_make_symref(0, sidx, 0, 0, 0, I32);
 }
 
-/* tcc_ir_opt_invariant_temp_deref_hoist inserts a new ASSIGN (tcc_ir_pool_add
+/* tcc_ir_opt_deref_operand_cse inserts a new ASSIGN (tcc_ir_pool_add
  * / gsym_cse_insert_before) and allocates a fresh TEMP vreg
  * (tcc_ir_vreg_alloc_temp). utb_new() leaves iroperand_pool_capacity,
  * temporary_variables_live_intervals_size and compact_instructions_size at 0;
@@ -237,131 +233,6 @@ UT_TEST(test_invariant_global_load_hoist_written_global_kept)
 
   UT_ASSERT_EQ(changes, 0);
   UT_ASSERT_EQ(utb_op(ir, load2), TCCIR_OP_LOAD);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* ================================================================ invariant_temp_deref_hoist */
-
-/* POSITIVE: T0 is defined by a LOAD from a stack slot (a "loaded pointer") and
- * dereferenced twice with only a pure ALU op between the two derefs and no
- * clobber -- a fresh hoisted TEMP is inserted right after T0's def, and BOTH
- * deref uses are rewritten to read it instead of re-dereferencing T0.
- * (The insertion shifts every instruction from T0's def onward by one slot,
- * so this test locates use1/use2 post-pass by their distinguishing dest
- * vreg (T1/T2) rather than by a pre-pass instruction index.) */
-UT_TEST(test_invariant_temp_deref_hoist_two_derefs_hoisted)
-{
-  TCCIRState *ir = utb_hoist_new(3); /* T0..T2 used by hand below */
-
-  int tdef = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(0, I32), utb_slot_lval(-8, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp(0, I32), utb_imm(1, I32));
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_deref_temp(0, I32), utb_imm(2, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_invariant_temp_deref_hoist(ir);
-
-  UT_ASSERT(changes > 0);
-  UT_ASSERT_EQ(utb_op(ir, tdef), TCCIR_OP_LOAD); /* the original def is untouched */
-
-  /* Locate the two ADDs post-pass by their (unaffected) dest vreg. */
-  int use1 = -1, use2 = -1;
-  for (int i = 0; i < ir->next_instruction_index; i++)
-  {
-    if (utb_op(ir, i) != TCCIR_OP_ADD)
-      continue;
-    int32_t dv = utb_vreg(utb_dest(ir, i));
-    if (dv == utb_vreg(utb_temp(1, I32)))
-      use1 = i;
-    else if (dv == utb_vreg(utb_temp(2, I32)))
-      use2 = i;
-  }
-  UT_ASSERT(use1 >= 0);
-  UT_ASSERT(use2 >= 0);
-
-  /* Oracle: neither ADD still dereferences T0 (vreg 0); both read the same
-   * non-lval hoisted TEMP instead. */
-  IROperand s1_use1 = utb_src1(ir, use1);
-  IROperand s1_use2 = utb_src1(ir, use2);
-  UT_ASSERT(!s1_use1.is_lval || utb_vreg(s1_use1) != utb_vreg(utb_temp(0, I32)));
-  UT_ASSERT(!s1_use2.is_lval || utb_vreg(s1_use2) != utb_vreg(utb_temp(0, I32)));
-  UT_ASSERT_EQ(utb_vreg(s1_use1), utb_vreg(s1_use2));
-
-  utb_free(ir);
-  return 0;
-}
-
-UT_TEST(test_invariant_temp_deref_hoist_copy_chain_hoisted)
-{
-  TCCIRState *ir = utb_hoist_new(5); /* T0..T4 used by hand below */
-
-  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(0, I32), utb_slot_lval(-8, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_temp(0, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_temp(1, I32), UTB_NONE);
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(3, I32), utb_deref_temp(1, I32), utb_imm(1, I32));
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(4, I32), utb_deref_temp(2, I32), utb_imm(2, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(4, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_invariant_temp_deref_hoist(ir);
-
-  UT_ASSERT(changes > 0);
-
-  int use1 = -1, use2 = -1;
-  for (int i = 0; i < ir->next_instruction_index; i++)
-  {
-    if (utb_op(ir, i) != TCCIR_OP_ADD)
-      continue;
-    int32_t dv = utb_vreg(utb_dest(ir, i));
-    if (dv == utb_vreg(utb_temp(3, I32)))
-      use1 = i;
-    else if (dv == utb_vreg(utb_temp(4, I32)))
-      use2 = i;
-  }
-  UT_ASSERT(use1 >= 0);
-  UT_ASSERT(use2 >= 0);
-
-  IROperand s1_use1 = utb_src1(ir, use1);
-  IROperand s1_use2 = utb_src1(ir, use2);
-  UT_ASSERT(!s1_use1.is_lval);
-  UT_ASSERT(!s1_use2.is_lval);
-  UT_ASSERT_EQ(utb_vreg(s1_use1), utb_vreg(s1_use2));
-  UT_ASSERT(utb_vreg(s1_use1) != utb_vreg(utb_temp(1, I32)));
-  UT_ASSERT(utb_vreg(s1_use2) != utb_vreg(utb_temp(2, I32)));
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): a FUNCCALLVOID sits between the two derefs -- the callee
- * may write through T0's address, so no hoist may happen across it. */
-UT_TEST(test_invariant_temp_deref_hoist_intervening_call_blocks)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir); /* iroperand_pool starts small but tcc_ir_pool_ensure
-                        * grows it via realloc, since capacity is nonzero. */
-  ir->temporary_variables_live_intervals_size = 64;
-  ir->temporary_variables_live_intervals = (IRLiveInterval *)tcc_mallocz(sizeof(IRLiveInterval) * 64);
-  ir->next_temporary_variable = 3; /* T0..T2 used by hand below */
-  ir->compact_instructions_size = UTB_MAX_INSTR;
-
-  static Sym callee_sym;
-  utb_set_tok_str(TOK_FOO, "foo");
-  IROperand callee = utb_callee(ir, &callee_sym, TOK_FOO);
-
-  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(0, I32), utb_slot_lval(-8, I32), UTB_NONE);
-  int use1 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_deref_temp(0, I32), utb_imm(1, I32));
-  utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, callee, utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 0), I32));
-  int use2 = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_deref_temp(0, I32), utb_imm(2, I32));
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(2, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_invariant_temp_deref_hoist(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, use1)), utb_vreg(utb_temp(0, I32)));
-  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, use2)), utb_vreg(utb_temp(0, I32)));
-  UT_ASSERT(utb_src1(ir, use1).is_lval);
-  UT_ASSERT(utb_src1(ir, use2).is_lval);
 
   utb_free(ir);
   return 0;
@@ -578,61 +449,6 @@ UT_TEST(test_rmw_byte_clear_multi_use_and_result_kept)
   UT_ASSERT_EQ(utb_op(ir, and_i), TCCIR_OP_AND);
   UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
   UT_ASSERT_EQ(utb_vreg(utb_src1(ir, store)), utb_vreg(utb_temp(1, I32)));
-
-  utb_free(ir);
-  return 0;
-}
-
-/* ================================================================ local_copy_prop */
-
-/* POSITIVE: 4 consecutive LOAD(A[k*4])+STORE(B[k*4]) pairs (A at 100, B at
- * 200, stride 4) with nothing else touching A -- the pass redirects the
- * writes from A to B and NOPs the whole copy chain. */
-UT_TEST(test_local_copy_prop_four_pairs_redirect_writes)
-{
-  TCCIRState *ir = utb_new();
-
-  int idx[8];
-  int k = 0;
-  for (int i = 0; i < 4; i++)
-  {
-    idx[k++] = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(i, I32), utb_slot_lval(100 + i * 4, I32), UTB_NONE);
-    idx[k++] = utb_emit(ir, TCCIR_OP_STORE, utb_slot_lval(200 + i * 4, I32), utb_temp(i, I32), UTB_NONE);
-  }
-  /* B[0] is read afterwards (the copy's destination is actually used); A is
-   * never referenced again outside the chain itself. */
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_slot_lval(200, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_local_copy_prop(ir);
-
-  UT_ASSERT_EQ(changes, 4);
-  for (int i = 0; i < 8; i++)
-    UT_ASSERT_EQ(utb_op(ir, idx[i]), TCCIR_OP_NOP);
-
-  utb_free(ir);
-  return 0;
-}
-
-/* NEGATIVE (guard): only 3 consecutive pairs (below the count>=4 threshold)
- * -- the chain is left completely untouched. */
-UT_TEST(test_local_copy_prop_three_pairs_kept)
-{
-  TCCIRState *ir = utb_new();
-
-  int idx[6];
-  int k = 0;
-  for (int i = 0; i < 3; i++)
-  {
-    idx[k++] = utb_emit(ir, TCCIR_OP_LOAD, utb_temp(i, I32), utb_slot_lval(100 + i * 4, I32), UTB_NONE);
-    idx[k++] = utb_emit(ir, TCCIR_OP_STORE, utb_slot_lval(200 + i * 4, I32), utb_temp(i, I32), UTB_NONE);
-  }
-  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
-
-  int changes = tcc_ir_opt_local_copy_prop(ir);
-
-  UT_ASSERT_EQ(changes, 0);
-  for (int i = 0; i < 6; i++)
-    UT_ASSERT_EQ(utb_op(ir, idx[i]), (i % 2 == 0) ? TCCIR_OP_LOAD : TCCIR_OP_STORE);
 
   utb_free(ir);
   return 0;

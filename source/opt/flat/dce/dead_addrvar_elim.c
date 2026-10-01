@@ -162,6 +162,18 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
           var_bit_set(var_read, pos);
       }
     }
+
+    /* MLA accumulator is a read the src1/src2 helpers above don't cover. */
+    if (q->op == TCCIR_OP_MLA)
+    {
+      int32_t vr = irop_get_vreg(tcc_ir_op_get_accum(ir, q));
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos <= max_var)
+          var_bit_set(var_read, pos);
+      }
+    }
   }
 
   /* Pass 2: mark VARs whose LEA pointer escapes (used outside a STORE ptr-copy dest). */
@@ -212,6 +224,22 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
             var_bit_set(var_read, var_pos);
         }
       }
+    }
+
+    /* Uses outside src1/src2: an MLA accumulator, and the base of a
+     * STORE_POSTINC, which Pass 3 keeps (it also advances the pointer) and so
+     * must keep the LEA defining it.  STORE_INDEXED's base is a store through
+     * the LEA like STORE's and dies with it in Pass 3. */
+    int32_t use_vr = -1;
+    if (q->op == TCCIR_OP_MLA)
+      use_vr = irop_get_vreg(tcc_ir_op_get_accum(ir, q));
+    else if (q->op == TCCIR_OP_STORE_POSTINC)
+      use_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    if (use_vr >= 0 && TCCIR_DECODE_VREG_TYPE(use_vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int tmp_pos = TCCIR_DECODE_VREG_POSITION(use_vr);
+      if (tmp_pos <= max_tmp && lea_map[tmp_pos] >= 0 && lea_map[tmp_pos] <= max_var)
+        var_bit_set(var_read, lea_map[tmp_pos]);
     }
   }
 
@@ -290,8 +318,12 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
       }
     }
 
-    /* STORE through LEA to dead VAR -> NOP */
-    if (q->op == TCCIR_OP_STORE)
+    /* STORE through LEA to dead VAR -> NOP.  STORE_INDEXED too: it carries the
+     * base in a plain dest, and left behind it would store through the TEMP
+     * whose LEA was just deleted -- through whatever register the allocator
+     * gave it (Zig's meta.eql zeroed a u64 local with a memset lowered to two
+     * STORE_INDEXEDs, and wrote the zeros through its caller's r4 and r5). */
+    if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       int32_t vr = irop_get_vreg(dest);

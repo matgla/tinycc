@@ -180,6 +180,59 @@ static int sl_fwd_narrow_demand_only(TCCIRState *ir, int32_t target_vr, int star
   return found_use ? 1 : 0;
 }
 
+/* Are the bits of `op` at or above `bits` already zero, so that a store that
+ * truncated it to `bits` stored the value whole?
+ *
+ * NOT decided from the operand's own btype: a STORE's source operand carries
+ * the STORE's width, so a byte store of a word makes its source look like a
+ * byte.  It is the value's DEFINITION that has to say so -- a mask by a subset
+ * of `bits`, a shift that leaves at most that many bits, or a narrower
+ * unsigned load. */
+static int sl_fwd_value_within_bits(TCCIRState *ir, IROperand op, int bits)
+{
+  if (bits <= 0 || bits >= 32 || irop_is_64bit(op))
+    return 0;
+  const uint32_t lim = (1u << bits) - 1;
+  if (irop_is_immediate(op) && !op.is_sym)
+    return ((uint64_t)(uint32_t)(int32_t)irop_get_imm64_ex(ir, op) & ~(uint64_t)lim) == 0;
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || op.is_lval)
+    return 0;
+  IRQuadCompact *def = NULL;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (d.is_lval || irop_get_vreg(d) != vr)
+      continue;
+    if (def)
+      return 0; /* more than one definition */
+    def = q;
+  }
+  if (!def)
+    return 0;
+  if (def->op == TCCIR_OP_AND)
+  {
+    IROperand a = tcc_ir_op_get_src1(ir, def), b = tcc_ir_op_get_src2(ir, def);
+    if (irop_is_immediate(b) && !b.is_sym &&
+        ((uint64_t)(uint32_t)(int32_t)irop_get_imm64_ex(ir, b) & ~(uint64_t)lim) == 0)
+      return 1;
+    return irop_is_immediate(a) && !a.is_sym &&
+           ((uint64_t)(uint32_t)(int32_t)irop_get_imm64_ex(ir, a) & ~(uint64_t)lim) == 0;
+  }
+  if (def->op == TCCIR_OP_LOAD || def->op == TCCIR_OP_ASSIGN)
+  {
+    IROperand a = tcc_ir_op_get_src1(ir, def);
+    if (irop_is_64bit(a) || !a.is_unsigned)
+      return 0;
+    int ab = irop_get_btype(a) == IROP_BTYPE_INT8 ? 8 : irop_get_btype(a) == IROP_BTYPE_INT16 ? 16 : 32;
+    return ab <= bits;
+  }
+  return 0;
+}
+
 /* Returns 1 iff EVERY read of value_vr anywhere in the function is "self-narrowing":
  * an AND with an immediate mask that fits in load_bits, or a 32-bit SHL by at least
  * (32 - load_bits).  Both produce a result that does not depend on value_vr's bits at
@@ -1168,9 +1221,13 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
 
       /* A volatile read must be performed, not answered from a tracked store
        * (`volatile int x; x = 1; x = 2;` — the reads are what keep both
-       * stores alive). */
+       * stores alive).
+       *
+       * `goto`, not `continue`: giving up on forwarding INTO this load must
+       * not also skip the bookkeeping its DESTINATION owes (see
+       * skip_load_fwd). */
       if (tcc_ir_access_is_volatile(ir, src1))
-        continue;
+        goto skip_load_fwd;
 
       /* Only forward for stack locals or LEA-resolvable non-locals. */
       int load_via_lea = 0;
@@ -1200,7 +1257,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         {
           LOG_SL_FWD("LOAD@i=%d SKIP: src1 not is_local and not is_lval", i);
         }
-        continue;
+        goto skip_load_fwd;
       }
 
       /* Skip if address taken (may alias through a pointer). */
@@ -1210,7 +1267,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
         if (interval && interval->addrtaken)
         {
           LOG_SL_FWD("LOAD@i=%d SKIP: addr vreg:%d addrtaken", i, addr_vr);
-          continue;
+          goto skip_load_fwd;
         }
       }
 
@@ -1460,6 +1517,41 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                 break;
               }
             }
+            /* The same when a use needs the narrow value itself: forward the
+             * stored value zero-extended, `dest <- value AND #mask`.  Unsigned
+             * loads only (every such one in Zig's C: a struct of at most a
+             * word returned in r0, an error union `{ uint16_t error; }`, is
+             * stored to its return slot and read back as its field).  The
+             * bits of r0 above such a result are unspecified (AAPCS), so the
+             * mask is needed anyway. */
+            if (store_bits > 0 && load_bits > 0 && store_bits > load_bits && store_bits <= 32 &&
+                (e->store_btype == IROP_BTYPE_INT32 || e->store_btype == IROP_BTYPE_INT16) &&
+                (src1.btype == IROP_BTYPE_INT16 || src1.btype == IROP_BTYPE_INT8) && src1.is_unsigned &&
+                q->op == TCCIR_OP_LOAD && irop_get_vreg(e->stored_value) >= 0 &&
+                !irop_op_is_lval(e->stored_value) && irop_get_vreg(tcc_ir_op_get_dest(ir, q)) >= 0)
+            {
+              LOG_SL_FWD("LOAD@i=%d FORWARD-NARROW-MASK: store@i=%d store_bits=%d load_bits=%d", i,
+                         e->instruction_idx, store_bits, load_bits);
+              IROperand load_dest = tcc_ir_op_get_dest(ir, q);
+              IROperand value = e->stored_value;
+              tcc_ir_pool_ensure(ir, 3);
+              int base = ir->iroperand_pool_count;
+              tcc_ir_pool_add(ir, load_dest);
+              tcc_ir_pool_add(ir, value);
+              tcc_ir_pool_add(ir, irop_make_imm32(-1, (int32_t)((1u << load_bits) - 1), IROP_BTYPE_INT32));
+              q->op = TCCIR_OP_AND;
+              q->operand_base = base;
+              if (fwd_store_count < SL_FWD_MAX_DEAD_STORES && !e->addr_addrtaken &&
+                  irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[e->instruction_idx])) < 0)
+              {
+                fwd_stores[fwd_store_count].store_idx = e->instruction_idx;
+                fwd_stores[fwd_store_count].offset = e->local_offset;
+                fwd_stores[fwd_store_count].sym = e->local_sym;
+                fwd_store_count++;
+              }
+              changes++;
+              break;
+            }
             LOG_SL_FWD("LOAD@i=%d REJECT width: store btype=%d vs load btype=%d (store at i=%d)", i,
                        (int)e->store_btype, (int)src1.btype, e->instruction_idx);
             rejected_width++;
@@ -1530,6 +1622,49 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                 }
               }
             }
+          }
+
+          /* Sub-32-bit same-width forward of a VALUE: the store truncated it
+           * to the field's width, so what the load reads is the low bits --
+           * handing on the register whole passes bits the store dropped.  The
+           * frontend truncates ahead of a narrow store to a LOCAL but not to a
+           * struct FIELD (`s.a = x` stores x and lets the width cut it), so
+           * `s.a = x + i; use(s.a)` read x + i unmasked from -O1 up.  Forward
+           * it masked instead.  A signed field would need a sign-extend, and
+           * an ASSIGN has no room to emit one, so it keeps its load. */
+          if (!irop_is_immediate(e->stored_value) &&
+              (src1.btype == IROP_BTYPE_INT8 || src1.btype == IROP_BTYPE_INT16) &&
+              !sl_fwd_value_within_bits(ir, e->stored_value, src1.btype == IROP_BTYPE_INT8 ? 8 : 16))
+          {
+            const int nbits = src1.btype == IROP_BTYPE_INT8 ? 8 : 16;
+            if (q->op != TCCIR_OP_LOAD || !src1.is_unsigned || irop_get_vreg(e->stored_value) < 0 ||
+                irop_op_is_lval(e->stored_value) || irop_get_vreg(tcc_ir_op_get_dest(ir, q)) < 0)
+            {
+              LOG_SL_FWD("LOAD@i=%d REJECT narrow store not truncated: store@i=%d bits=%d", i,
+                         e->instruction_idx, nbits);
+              rejected_width++;
+              continue;
+            }
+            LOG_SL_FWD("LOAD@i=%d FORWARD-SAME-WIDTH-MASK: store@i=%d bits=%d", i, e->instruction_idx, nbits);
+            IROperand load_dest = tcc_ir_op_get_dest(ir, q);
+            IROperand value = e->stored_value;
+            tcc_ir_pool_ensure(ir, 3);
+            int base = ir->iroperand_pool_count;
+            tcc_ir_pool_add(ir, load_dest);
+            tcc_ir_pool_add(ir, value);
+            tcc_ir_pool_add(ir, irop_make_imm32(-1, (int32_t)((1u << nbits) - 1), IROP_BTYPE_INT32));
+            q->op = TCCIR_OP_AND;
+            q->operand_base = base;
+            if (fwd_store_count < SL_FWD_MAX_DEAD_STORES && !e->addr_addrtaken &&
+                irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[e->instruction_idx])) < 0)
+            {
+              fwd_stores[fwd_store_count].store_idx = e->instruction_idx;
+              fwd_stores[fwd_store_count].offset = e->local_offset;
+              fwd_stores[fwd_store_count].sym = e->local_sym;
+              fwd_store_count++;
+            }
+            changes++;
+            break;
           }
 
           /* Stale check: skip if the LOAD's address vreg was written after the store (unless LEA-resolved). */
@@ -1827,6 +1962,7 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
                    (const void *)addr_sym, (long long)addr_offset, matched_any, rejected_width, rejected_stale_tracker,
                    rejected_invalid);
       }
+    skip_load_fwd:;
     }
     /* LOAD_INDEXED with LEA-mapped base + const index: resolve to base_offset+imm and forward. */
     else if (q->op == TCCIR_OP_LOAD_INDEXED)
@@ -2944,6 +3080,12 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
     /* Check if the store was already NOP'd (e.g. by a later store overwrite) */
     if (ir->compact_instructions[store_idx].op == TCCIR_OP_NOP)
       continue;
+    /* Bytes the store writes: a reader starting inside them still reads it
+     * (the high half of a word, forwarded only in its low half). */
+    int store_w = ir_opt_store_btype_size_bytes(
+        irop_get_btype(tcc_ir_op_get_dest(ir, &ir->compact_instructions[store_idx])));
+    if (store_w <= 0)
+      store_w = 1024;
 
     for (int j = 0; j < n && !still_read; j++)
     {
@@ -2970,6 +3112,8 @@ static int tcc_ir_opt_sl_forward__timed(TCCIRState *ir)
     if ((op).is_local && irop_get_sym_ex(ir, (op)) == sym)                                                             \
     {                                                                                                                  \
       int64_t _roff = irop_get_imm64_ex(ir, (op));                                                                     \
+      if (_roff > off && _roff < off + store_w)                                                                        \
+        still_read = 1;                                                                                                \
       if (_roff != off && _roff <= off)                                                                                \
       {                                                                                                                \
         int _w = 4;                                                                                                    \

@@ -61,4 +61,5 @@ int tcc_ir_move_coalescing(struct TCCIRState *ir);
 int ra_repair_incomplete_calls(struct TCCIRState *ir);
 int ra_fold_const_branches(struct TCCIRState *ir);
 int ra_fold_phi_const_chain(struct TCCIRState *ir);
+int ra_fuse_umaal(struct TCCIRState *ir);
 

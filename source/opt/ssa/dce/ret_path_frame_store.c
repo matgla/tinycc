@@ -12,6 +12,7 @@
 #include "ir.h"
 #include "ssa_opt.h"
 #include "dce_passes.h"
+#include "dce_common.h"
 #include <limits.h>
 
 
@@ -86,7 +87,7 @@ int dce_ret_path_frame_store(IRSSAOptCtx *ctx)
       if (jq->op == TCCIR_OP_MLA && !dce_ret_op_is_pure_read(ir, tcc_ir_op_get_accum(ir, jq)))
         break;
     }
-    if (dead) {
+    if (dead && !dce_instr_reads_volatile(ir, q)) {
       ssa_opt_nop_instr(ctx, i);
       changes++;
     }

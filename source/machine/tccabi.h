@@ -68,8 +68,6 @@ typedef struct TCCAbiCallLayout
   TCCAbiArgDesc *args_effective;
   uint8_t *arg_flags;
 
-/* arg_flags bits */
-#define TCC_ABI_ARG_FLAG_INVISIBLE_REF 0x01 /* large composite passed as hidden pointer */
   /* Optional per-argument descriptors recorded as classification happens.
    * Useful for debugging and for re-running ABI decisions later. */
   TCCAbiArgDesc *args;

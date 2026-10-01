@@ -420,6 +420,24 @@ uint32_t irop_get_pool_idx(const IROperand op);
 /* Check if operand is an lvalue (needs dereference) - uses bitfield */
 int irop_op_is_lval(const IROperand op);
 
+/* Whether an instruction's destination operand (re)defines its vreg.  A VREG
+ * defines it as a plain value; as an lvalue (`T***DEREF*** <-- v`) it is a
+ * write through the pointer it holds.  A VAR or PARAM lives in a stack slot
+ * and appears as a STACKOFF lvalue naming the variable itself -- a definition,
+ * whatever the op (an inlined pointer parameter lands as `V <-- x [STORE]`) --
+ * or, is_llocal, as a write through the pointer it holds. */
+static inline int irop_dest_defines_vreg(IROperand d)
+{
+  if (irop_get_vreg(d) < 0)
+    return 0;
+  int tag = irop_get_tag(d);
+  if (tag == IROP_TAG_VREG)
+    return !d.is_lval;
+  if (tag == IROP_TAG_STACKOFF)
+    return d.is_lval && !d.is_llocal;
+  return 0;
+}
+
 /* Check if operand has VT_LOCAL semantics - uses bitfield */
 int irop_op_is_local(const IROperand op);
 

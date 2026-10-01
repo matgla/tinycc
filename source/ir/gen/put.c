@@ -18,7 +18,7 @@ static void ir_ensure_sym_registered(SValue *sv)
   {
     Sym *sym = sv->sym;
     /* Check if this is an anonymous symbol that hasn't been registered yet */
-    if ((sym->v & ~0x0FFFFFFF) == SYM_FIRST_ANOM && sym->c == 0)
+    if ((sym->v & ~0x0FFFFFFF) == SYM_FIRST_ANOM && sym->c == 0 && !tcc_state->check_only)
     {
       /* Use put_extern_sym2 directly to bypass nocode_wanted check.
        * We need the symbol registered in ELF even if we're in a "nocode" section
@@ -37,6 +37,41 @@ static int ir_operand_is_stack_addr(const SValue *sv)
   if ((val_kind == VT_LOCAL || val_kind == VT_LLOCAL) && !(sv->r & VT_LVAL) && sv->vr == -1)
     return 1;
   return 0;
+}
+
+/* A STRUCT-typed stack operand keeps its frame offset in the int16_t
+ * u.s.aux_data half of the split encoding (tccir_operand.c), so a struct more
+ * than 32 KiB from the frame base -- a local behind a big array, a by-value
+ * parameter behind a big one -- cannot be named directly: the offset would be
+ * truncated (pr28982b: a 256 KiB local at FP-0x40004 became FP-4).  Name it
+ * through its address instead.  An address-of (no VT_LVAL) only needs a
+ * scalar type, whose STACKOFF carries a full imm32; a struct value gets that
+ * address LEA'd into a TEMP and is read through the pointer. */
+static SValue *ir_put_far_struct(TCCIRState *ir, SValue *sv, SValue *tmp)
+{
+  if (!sv || (sv->type.t & VT_BTYPE) != VT_STRUCT || (sv->r & VT_SYM) || (sv->r & VT_VALMASK) != VT_LOCAL ||
+      ((int32_t)sv->c.i >= -32768 && (int32_t)sv->c.i <= 32767))
+    return sv;
+  *tmp = *sv;
+  if (!(sv->r & VT_LVAL))
+  {
+    tmp->type.t = VT_PTR;
+    tmp->type.ref = NULL;
+    return tmp;
+  }
+  SValue src = *sv;
+  src.r &= ~VT_LVAL;
+  src.type.t = VT_PTR;
+  src.type.ref = NULL;
+  SValue addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.type.t = VT_PTR;
+  addr.vr = tcc_ir_get_vreg_temp(ir);
+  tcc_ir_put(ir, TCCIR_OP_LEA, &src, NULL, &addr);
+  tmp->r = VT_LVAL;
+  tmp->vr = addr.vr;
+  tmp->c.i = 0;
+  return tmp;
 }
 
 /* Defined in ir/gen/softfloat.c */
@@ -63,6 +98,12 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   ir_ensure_sym_registered(src1);
   ir_ensure_sym_registered(src2);
   ir_ensure_sym_registered(dest);
+
+  SValue far_src1, far_src2;
+  if (irop_config[op].has_src1 == 1)
+    src1 = ir_put_far_struct(ir, src1, &far_src1);
+  if (irop_config[op].has_src2 == 1)
+    src2 = ir_put_far_struct(ir, src2, &far_src2);
 
   /* Check if we need to use soft-float call instead of native FPU instruction.
    * Skip this for complex operations - they need special handling in the code generator. */
@@ -245,7 +286,16 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
     const int prev_is_64bit = irop_is_64bit(prev_dest_irop);
     const int new_is_64bit = irop_is_64bit(dest_irop);
     const int width_match = (prev_is_64bit == new_is_64bit);
-    const int can_coalesce = (!ir->prevent_coalescing) && width_match &&
+    /* A vreg-backed slot written at a sub-offset (`__imag__ x = ...` on a
+     * complex parameter or local: StackLoc[orig + 8] backed by x's vreg) keeps
+     * that offset only in the STACKOFF operand.  Renaming the previous
+     * instruction's TEMP dest to the bare vreg would write the real half. */
+    const int dest_vr = irop_get_vreg(dest_irop);
+    IRLiveInterval *dest_iv = (irop_get_tag(dest_irop) == IROP_TAG_STACKOFF && tcc_ir_vreg_is_valid(ir, dest_vr))
+                                  ? tcc_ir_vreg_live_interval(ir, dest_vr)
+                                  : NULL;
+    const int dest_subslot = dest_iv && irop_get_stack_offset(dest_irop) != dest_iv->original_offset;
+    const int can_coalesce = (!ir->prevent_coalescing) && width_match && !dest_subslot &&
                              (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(src1_irop)) == TCCIR_VREG_TYPE_TEMP) &&
                              !src1_irop.is_lval && (irop_get_vreg(src1_irop) == prev_dest_vr);
     if (can_coalesce)

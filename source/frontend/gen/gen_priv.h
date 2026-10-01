@@ -78,6 +78,13 @@ int gjmp_addr_acs(int a);
 #define vstack (_vstack + 1)
 
 #define NODATA_WANTED (nocode_wanted > 0) /* no static data output wanted either */
+/* No static-storage bytes wanted: NODATA_WANTED, or a dropped static is being
+ * parsed for its diagnostics only (check_only).  That cannot be a nocode_wanted
+ * bit: its initializers need DATA_ONLY_WANTED (the sign bit) to fold as static
+ * initializers do, and its function bodies generate code (into an IR that is
+ * freed) -- so locals are laid out as ever, and only what would land in a
+ * section is held back. */
+#define NOSTATIC_WANTED (NODATA_WANTED || tcc_state->check_only)
 #define DATA_ONLY_WANTED 0x80000000       /* ON outside of functions and for static initializers */
 
 /* no code output after unconditional jumps such as with if (tcc_state->optimize > 0) ... */
@@ -258,7 +265,6 @@ extern int nb_temp_local_vars;
  * block() saves/restores it around every statement so two call expressions
  * that are lexically nested (e.g. inside a GNU statement expression used as
  * an argument) do not alias each other's reserved slots. */
-extern uint64_t arg_struct_temp_busy;
 
 /* sym_push()'s bump allocator.  Producer/owner: sym/symtab.c. */
 extern Sym *sym_free_first;
@@ -273,8 +279,6 @@ extern FuncallScratch *funcall_scratch_stack;
 /* AAPCS invisible-copy handshake: set while typing a call's formal
  * parameters (expr/indir.c's gfunc_param_typed()), consumed while lowering
  * the actual arguments (builtin/call.c's unary_funcall()). */
-extern unsigned char *aapcs_last_const_init;
-extern int aapcs_last_const_init_size;
 
 /* Producer/consumer: decl/declarator.c's post_type() alone; kept here (not
  * file-local) only because promoting it cost nothing once str_lit_pool
@@ -324,6 +328,7 @@ extern CType func_old_size_t_type;
  * caller lived in the same TU. */
 void vpush_type_size(CType *type, int *a);
 void compile_nested_functions(Sym *parent_sym);
+void nested_track_captured_sym(Sym *s);
 void pop_local_syms(Sym *b, int keep);
 
 /* combine_types() operator classes, shared with op/op.c's gen_op_impl(). */
@@ -389,7 +394,6 @@ int is_integer_btype(int bt);
 /* --- core/state.c --- */
 Sym *find_local_scalar_sym_by_offset(int offset);
 void funcall_scratch_pop_free(FuncallScratch *fs);
-int get_arg_struct_temp(int size, int align);
 
 /* --- core/suppress.c --- */
 int gind();
@@ -447,6 +451,8 @@ int unary_paren(void);
 /* --- init/alloc.c --- */
 void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, int vreg);
 void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, int v, int global);
+ST_FUNC void finalize_tentative_definitions(TCCState *s1);
+ST_FUNC void free_tentative_definitions(TCCState *s1);
 
 /* --- init/initializer.c --- */
 void decl_design_flex(init_params *p, Sym *ref, int index);
@@ -488,8 +494,23 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args);
 void free_inline_functions(TCCState *s);
 Section *function_text_section(TCCState *s1, Sym *sym);
 void gen_inline_functions(TCCState *s);
+void gen_owed_inline_functions(TCCState *s);
+InlineFunc *inline_fn_lookup(TCCState *s, Sym *sym);
+void gen_deferred_function_bodies(TCCState *s);
+void free_deferred_functions(TCCState *s);
+void define_deferred_function(DeferredFunc *d);
+void define_deferred_data(DeferredData *d);
+void check_dropped_deferred_data(DeferredData *d, TokenString *init);
+void check_dropped_function(DeferredFunc *d, TokenString *body);
+void check_dropped_statics(TCCState *s);
+void gc_unreferenced_statics(TCCState *s);
+void free_dropped_statics(TCCState *s);
+void gen_function_check_only(Sym *sym);
+TokenString *tok_str_clone(TokenString *str);
+void prune_unused_statics(TCCState *s);
+int called_once_budget_begin(int own_len);
+void called_once_budget_end(int saved);
 void gen_late_reopt_functions(TCCState *s);
-void ir_inline_stash_flush(TCCState *s1);
 
 /* --- nested/nested.c --- */
 void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, NestedFunc *explicit_parent_nf);
@@ -562,6 +583,11 @@ int struct_is_single_1byte_scalar_member(const CType *type);
 int struct_is_single_2byte_scalar_member(const CType *type);
 int struct_is_small_bitfield_word(const CType *type);
 int struct_member_copy_safe(const CType *type);
+#define SMALL_AGGREGATE_COPY_MAX 16
+int small_aggregate_copy_plan(const CType *stype, int size, int align, int src_off, int dst_off, int *w_out,
+                              unsigned char *covered);
+void ir_emit_small_aggregate_copy(const SValue *src, int src_deref, const SValue *dst, int dst_deref, int size,
+                                  int w, const unsigned char *covered);
 
 /* --- sym/attr_merge.c --- */
 void apply_alias_attribute(Sym *alias_sym, int target_tok);
@@ -571,6 +597,7 @@ void merge_funcattr(struct FuncAttr *fa, struct FuncAttr *fa1);
 void merge_symattr(struct SymAttr *sa, struct SymAttr *sa1);
 void patch_storage(Sym *sym, AttributeDef *ad, CType *type);
 void resolve_pending_aliases(void);
+void mark_pending_alias_targets_used(void);
 void sym_copy_ref(Sym *s, Sym **ps);
 
 /* --- sym/symtab.c --- */

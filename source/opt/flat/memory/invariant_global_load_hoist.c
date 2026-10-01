@@ -190,26 +190,26 @@ int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir)
         is_load_like = 1;
     }
 
-    if (!is_load_like)
+    /* An op that (re)defines a vreg -- including a VAR written as itself, a
+     * STACKOFF lvalue, and a load into a vreg an entry already names --
+     * leaves every entry holding that vreg as some global's value stale. */
+    if (irop_config[q->op].has_dest)
     {
-      /* If this op redefines a tracked vreg, drop that entry. */
-      if (irop_config[q->op].has_dest)
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      if (irop_dest_defines_vreg(d))
       {
-        IROperand d = tcc_ir_op_get_dest(ir, q);
         int32_t dvr = irop_get_vreg(d);
-        if (dvr >= 0 && !d.is_lval)
+        for (int k = 0; k < num_tracked;)
         {
-          for (int k = 0; k < num_tracked;)
-          {
-            if (tracked[k].result_vr == dvr)
-              tracked[k] = tracked[--num_tracked];
-            else
-              k++;
-          }
+          if (tracked[k].result_vr == dvr)
+            tracked[k] = tracked[--num_tracked];
+          else
+            k++;
         }
       }
-      continue;
     }
+    if (!is_load_like)
+      continue;
 
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
     IROperand dest = tcc_ir_op_get_dest(ir, q);

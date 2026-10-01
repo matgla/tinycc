@@ -25,9 +25,51 @@ int tcc_ir_opt_dse(TCCIRState *ir)
   return r;
 }
 
-static int dse_operand_is_wide(IROperand op)
+/* A span of an anonymous stack object that may be read: [lo, hi). */
+typedef struct
 {
-  return op.btype == IROP_BTYPE_INT64 || op.btype == IROP_BTYPE_FLOAT64;
+  const Sym *sym;
+  int64_t lo, hi;
+} DseRange;
+
+static void dse_add_range(DseRange **r, int *n, int *cap, const Sym *sym, int64_t lo, int64_t hi)
+{
+  if (hi <= lo)
+    return;
+  if (*n == *cap)
+  {
+    *cap = *cap ? *cap * 2 : 32;
+    *r = tcc_realloc(*r, sizeof(DseRange) * *cap);
+  }
+  (*r)[*n].sym = sym;
+  (*r)[*n].lo = lo;
+  (*r)[*n].hi = hi;
+  (*n)++;
+}
+
+static int dse_ranges_overlap(const DseRange *r, int n, const Sym *sym, int64_t lo, int64_t hi)
+{
+  for (int k = 0; k < n; k++)
+    if (r[k].sym == sym && r[k].lo < hi && lo < r[k].hi)
+      return 1;
+  return 0;
+}
+
+/* Whether `q` assigns its dest from its sources.  The stores do not: their
+ * dest is the address written through (or, for STORE_INDEXED/POSTINC, the
+ * base pointer), and an address in src1 is a value leaving for memory. */
+static int dse_defines_dest(const IRQuadCompact *q, IROperand dest)
+{
+  switch (q->op)
+  {
+  case TCCIR_OP_STORE_INDEXED:
+  case TCCIR_OP_STORE_POSTINC:
+    return 0;
+  case TCCIR_OP_STORE:
+    return !dest.is_lval;
+  default:
+    return 1;
+  }
 }
 
 /* Pull (sym, off) out of a local StackLoc operand: SYMREF carries sym+addend, else a bare stack offset. */
@@ -52,20 +94,6 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    if (irop_config[q->op].has_dest && dse_operand_is_wide(tcc_ir_op_get_dest(ir, q)))
-      return 0;
-    if (irop_config[q->op].has_src1 && dse_operand_is_wide(tcc_ir_op_get_src1(ir, q)))
-      return 0;
-    if (irop_config[q->op].has_src2 && dse_operand_is_wide(tcc_ir_op_get_src2(ir, q)))
-      return 0;
-    if (q->op == TCCIR_OP_MLA && dse_operand_is_wide(tcc_ir_op_get_accum(ir, q)))
-      return 0;
-  }
 
   /* NOP orphaned FUNCPARAM whose call_id has no matching FUNCCALL (left by inlining). */
   {
@@ -515,6 +543,13 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
 #define STACKLOC_HASH_SIZE 256
     uint8_t stackloc_read[STACKLOC_HASH_SIZE];
     memset(stackloc_read, 0, sizeof(stackloc_read));
+    /* Spans read through an address or as a struct: bounded by the object
+     * holding the offset when the frame still has the frontend's layout (C
+     * does not let a pointer leave its object), else up to the highest
+     * store.  Kept as spans, not hashed bytes, so a big object does not mark
+     * everything read. */
+    DseRange *ranges = NULL;
+    int nranges = 0, ranges_cap = 0;
 
     /* Max StackLoc STORE offset — bounds how far an address-of range extends. */
     int64_t max_stackloc_off = 0;
@@ -594,7 +629,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
           {
             IROperand d = tcc_ir_op_get_dest(ir, q);
             int32_t dvr = irop_get_vreg(d);
-            if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
+            if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && dse_defines_dest(q, d))
             {
               int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
               if (dpos <= max_tmp_stackloc)
@@ -653,8 +688,26 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
                    stype == TCCIR_VREG_TYPE_TEMP && dtype == TCCIR_VREG_TYPE_TEMP && spos <= max_tmp_stackloc &&
                    dpos <= max_tmp_stackloc)
             origin = prop_tmp[spos];
+          /* Pointer arithmetic into or out of a VAR carries the address as
+           * well: Phase 3 counts every ADD/SUB of an address as safe, so one
+           * whose result is not followed hides the reads through it.  Zig's
+           * `t11 = &t4.path; t12 = *t11` is `V3 <-- T33 ADD #8`, and the
+           * stores filling t4 died although the path was read through V3. */
+          else if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) &&
+                   (stype == TCCIR_VREG_TYPE_VAR || dtype == TCCIR_VREG_TYPE_VAR))
+          {
+            if (stype == TCCIR_VREG_TYPE_TEMP && spos <= max_tmp_stackloc)
+              origin = prop_tmp[spos];
+            else if (stype == TCCIR_VREG_TYPE_VAR && prop_var && spos <= max_var_stackloc)
+              origin = prop_var[spos];
+            if ((dtype == TCCIR_VREG_TYPE_TEMP && dpos > max_tmp_stackloc) ||
+                (dtype == TCCIR_VREG_TYPE_VAR && (!prop_var || dpos > max_var_stackloc)))
+              origin = -1;
+          }
 
-          if (origin < 0)
+          /* -2 travels on: a copy of an ambiguous address is still an address,
+           * and the loads through it must reach MARK_ORIGIN_READ. */
+          if (origin == -1)
             continue;
 
           if (dtype == TCCIR_VREG_TYPE_TEMP && dpos <= max_tmp_stackloc)
@@ -827,10 +880,12 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
           break;                                                                                                       \
         case IROP_BTYPE_STRUCT:                                                                                        \
         {                                                                                                              \
-          /* Struct access — conservatively mark range up to max store offset */                                       \
-          int64_t _send = max_stackloc_off + 4;                                                                        \
-          for (int64_t _s = _off; _s <= _send; _s++)                                                                   \
-            STACKLOC_SET(_sym, _s);                                                                                    \
+          /* Struct access: to the end of its object, else up to the max store offset */                               \
+          int64_t _shi = max_stackloc_off + 5;                                                                         \
+          int _olo, _ohi;                                                                                              \
+          if (!_sym && tcc_ir_frame_object_at(ir, (int)_off, &_olo, &_ohi))                                            \
+            _shi = _ohi;                                                                                               \
+          dse_add_range(&ranges, &nranges, &ranges_cap, _sym, _off, _shi);                                             \
           _width = 0; /* already handled */                                                                            \
           break;                                                                                                       \
         }                                                                                                              \
@@ -845,17 +900,12 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       }                                                                                                                \
       else                                                                                                             \
       {                                                                                                                \
-        int64_t _range_end = max_stackloc_off + 4;                                                                     \
-        int64_t _range_len = _range_end - _off + 1;                                                                    \
-        if (_range_len > STACKLOC_HASH_SIZE * 8)                                                                       \
-        {                                                                                                              \
-          memset(stackloc_read, 0xFF, sizeof(stackloc_read));                                                          \
-        }                                                                                                              \
-        else if (_range_len > 0)                                                                                       \
-        {                                                                                                              \
-          for (int64_t _k = _off; _k <= _range_end; _k++)                                                              \
-            STACKLOC_SET(_sym, _k);                                                                                    \
-        }                                                                                                              \
+        /* Address taken: its whole object, else up to the max store offset */                                         \
+        int64_t _rlo = _off, _rhi = max_stackloc_off + 5;                                                              \
+        int _olo, _ohi;                                                                                                \
+        if (!_sym && tcc_ir_frame_object_at(ir, (int)_off, &_olo, &_ohi))                                              \
+          _rlo = _olo, _rhi = _ohi;                                                                                    \
+        dse_add_range(&ranges, &nranges, &ranges_cap, _sym, _rlo, _rhi);                                               \
       }                                                                                                                \
     }                                                                                                                  \
   } while (0)
@@ -865,7 +915,8 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       {
         IROperand s = tcc_ir_op_get_src1(ir, q);
         /* Skip range marking for address-of feeding a write-only TMP (writes only, no read). */
-        if (s.is_local && !s.is_lval && irop_get_vreg(s) < 0 && addr_tmp != NULL)
+        if (s.is_local && !s.is_lval && irop_get_vreg(s) < 0 && addr_tmp != NULL &&
+            dse_defines_dest(q, tcc_ir_op_get_dest(ir, q)))
         {
           IROperand d = tcc_ir_op_get_dest(ir, q);
           int32_t dvr = irop_get_vreg(d);
@@ -961,7 +1012,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
         swidth = -1; /* unknown extent: keep the store */
       else if (dest.is_complex)
         swidth *= 2;
-      int live = (swidth < 0);
+      int live = (swidth < 0) || dse_ranges_overlap(ranges, nranges, sym, off, off + swidth);
       for (int b = 0; !live && b < swidth; b++)
         if (STACKLOC_TEST(sym, off + b))
           live = 1;
@@ -1027,7 +1078,8 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
         int range_is_read = 0;
         int64_t range_end = max_stackloc_off + 4;
         int64_t range_len = range_end - addr_off + 1;
-        if (range_len > STACKLOC_HASH_SIZE * 8)
+        if (range_len > STACKLOC_HASH_SIZE * 8 ||
+            dse_ranges_overlap(ranges, nranges, addr_sym, addr_off, range_end + 1))
         {
           range_is_read = 1; /* Too large — conservatively assume read */
         }
@@ -1129,6 +1181,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       tcc_free(addr_tmp);
     if (addr_tmp_read)
       tcc_free(addr_tmp_read);
+    tcc_free(ranges);
 
 #undef STACKLOC_HASH_SIZE
 #undef STACKLOC_HASH

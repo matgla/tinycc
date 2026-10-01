@@ -117,6 +117,38 @@ UT_TEST(test_compact_stack_locations_keeps_negative_spill_base)
   return 0;
 }
 
+UT_TEST(test_compact_stack_locations_weighted_puts_hottest_nearest_sp)
+{
+  LSLiveIntervalState ls;
+  ls_init(&ls);
+
+  tcc_ls_add_live_interval(&ls, VR_TMP(0), 0, 1, 0, 0, LS_REG_TYPE_INT, 0, -1);
+  tcc_ls_add_live_interval(&ls, VR_TMP(1), 0, 1, 0, 0, LS_REG_TYPE_INT, 0, -1);
+  tcc_ls_add_live_interval(&ls, VR_TMP(2), 0, 1, 0, 0, LS_REG_TYPE_INT, 0, -1);
+  tcc_ls_add_live_interval(&ls, VR_TMP(3), 0, 1, 0, 0, LS_REG_TYPE_INT, 0, -1);
+  tcc_ls_add_live_interval(&ls, VR_TMP(4), 0, 1, 0, 0, LS_REG_TYPE_LLONG, 0, -1);
+
+  ls.intervals[0].stack_location = 100;
+  ls.intervals[1].stack_location = 200;
+  ls.intervals[2].stack_location = 300;
+  ls.intervals[3].stack_location = 200; /* shares a slot: weights add up */
+  ls.intervals[4].stack_location = 400;
+  const uint32_t weights[] = {1, 10, 5, 3, 20};
+
+  tcc_ls_compact_stack_locations_weighted(&ls, 0, weights);
+
+  /* Per byte, coldest placed first: slot 100 = 1/4, 300 = 5/4, 400 = 20/8,
+   * 200 = 13/4. */
+  UT_ASSERT_EQ((int)ls.intervals[0].stack_location, -4);
+  UT_ASSERT_EQ((int)ls.intervals[2].stack_location, -8);
+  UT_ASSERT_EQ((int)ls.intervals[4].stack_location, -16);
+  UT_ASSERT_EQ((int)ls.intervals[1].stack_location, -20);
+  UT_ASSERT_EQ((int)ls.intervals[3].stack_location, -20);
+
+  tcc_ls_deinitialize(&ls);
+  return 0;
+}
+
 /* -------------------------------------------------------------- liveness */
 
 UT_TEST(test_compute_live_regs_counts_integer_intervals_only)

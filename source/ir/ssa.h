@@ -28,13 +28,13 @@ typedef struct IRSSAState
   IRPhiNode **block_phis; /* array[num_blocks]: linked list of phis per block */
   int32_t next_ssa_vreg;  /* next available SSA vreg position (TEMP type) */
   uint8_t *is_promotable; /* bitset indexed by VAR position */
-  uint8_t *var_store_def_ok; /* per VAR: 1 = a full-width INT32 slot STORE of
-                              * this var may be rewritten to a fresh-name
-                              * ASSIGN def during rename.  Requires every read
-                              * to be ≤ 4 bytes so the write covers it; phi
-                              * placement consults the same flag, so an
+  uint8_t *var_store_def_ok; /* per VAR: its widest read in bytes (0xFF for a
+                              * non-scalar access).  An INT32 or INT64 slot
+                              * STORE at least that wide covers every read, so
+                              * rename rewrites it to a fresh-name ASSIGN def;
+                              * phi placement consults the same test, so an
                               * upward-exposed (global) var gets phis for its
-                              * STORE defs too. */
+                              * STORE defs too (ssa_store_slot_def_pos). */
   int num_vars;           /* size of VAR namespace at construct time */
 } IRSSAState;
 

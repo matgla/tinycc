@@ -44,6 +44,159 @@ extern int gsym_cse_insert_before(TCCIRState *ir, int before_idx, IRQuadCompact 
  * STORE dest through the pointer (indistinguishable from a direct stack store).
  */
 
+/* Where each TEMP occurs (as dest, src1 or src2), for the pass's use scans.
+ * The fold only ever takes vregs out of instructions -- it NOPs the LEA and
+ * the ADD and replaces the consumer's operand with a StackLoc -- so a TEMP can
+ * appear nowhere but the instructions listed here when the pass starts, and
+ * walking the list with the scans' own per-instruction tests gives exactly
+ * what walking every instruction did.  Walking to the end of the function to
+ * prove a LEA's result has one use made the pass quadratic: 2.8 G operand
+ * checks on Zig's zig.c at -O2. */
+typedef struct LfOcc
+{
+  int *start; /* per TEMP position: its instructions are idx[start[p] .. start[p + 1]) */
+  int *idx;
+  int npos;
+  int *jumps; /* jumps[k]: non-NOP JUMP/JUMPIF before k (the pass keeps them all) */
+} LfOcc;
+
+static int lf_temp_pos(int32_t vr, int npos)
+{
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+    return -1;
+  int p = TCCIR_DECODE_VREG_POSITION(vr);
+  if (vr != TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, p) || p >= npos)
+    return -1;
+  return p;
+}
+
+/* The TEMP positions instruction `q` names, at most three. */
+static int lf_insn_temps(TCCIRState *ir, IRQuadCompact *q, int npos, int out[3])
+{
+  const IRRegistersConfig *cfg = &irop_config[q->op];
+  int32_t v[3] = {-1, -1, -1};
+  int m = 0;
+  if (cfg->has_src1)
+    v[0] = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+  if (cfg->has_src2)
+    v[1] = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+  if (cfg->has_dest)
+    v[2] = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+  for (int k = 0; k < 3; k++)
+  {
+    int p = lf_temp_pos(v[k], npos);
+    if (p < 0)
+      continue;
+    int dup = 0;
+    for (int e = 0; e < m; e++)
+      dup |= out[e] == p;
+    if (!dup)
+      out[m++] = p;
+  }
+  return m;
+}
+
+static void lf_occ_build(TCCIRState *ir, int n, LfOcc *o)
+{
+  int npos = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    const IRRegistersConfig *cfg = &irop_config[q->op];
+    int32_t v[3] = {cfg->has_src1 ? irop_get_vreg(tcc_ir_op_get_src1(ir, q)) : -1,
+                    cfg->has_src2 ? irop_get_vreg(tcc_ir_op_get_src2(ir, q)) : -1,
+                    cfg->has_dest ? irop_get_vreg(tcc_ir_op_get_dest(ir, q)) : -1};
+    for (int k = 0; k < 3; k++)
+      if (v[k] >= 0 && TCCIR_DECODE_VREG_TYPE(v[k]) == TCCIR_VREG_TYPE_TEMP &&
+          TCCIR_DECODE_VREG_POSITION(v[k]) >= npos)
+        npos = TCCIR_DECODE_VREG_POSITION(v[k]) + 1;
+  }
+  o->npos = npos;
+  o->start = tcc_mallocz(sizeof(int) * (npos + 1));
+  o->jumps = tcc_malloc(sizeof(int) * (n + 1));
+  int t[3];
+  o->jumps[0] = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    o->jumps[i + 1] = o->jumps[i] + (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF);
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    int m = lf_insn_temps(ir, q, npos, t);
+    for (int k = 0; k < m; k++)
+      o->start[t[k] + 1]++;
+  }
+  for (int p = 0; p < npos; p++)
+    o->start[p + 1] += o->start[p];
+  o->idx = tcc_malloc(sizeof(int) * (o->start[npos] + 1));
+  int *fill = tcc_malloc(sizeof(int) * (npos + 1));
+  memcpy(fill, o->start, sizeof(int) * (npos + 1));
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    int m = lf_insn_temps(ir, q, npos, t);
+    for (int k = 0; k < m; k++)
+      o->idx[fill[t[k]]++] = i;
+  }
+  tcc_free(fill);
+}
+
+static void lf_occ_free(LfOcc *o)
+{
+  tcc_free(o->start);
+  tcc_free(o->idx);
+  tcc_free(o->jumps);
+}
+
+/* Instructions after `after` that may name `vr`, in order: its listed ones, or
+ * every instruction for a vreg the index does not cover. */
+typedef struct LfCursor
+{
+  const int *p, *end; /* listed: the remaining entries */
+  int k, n;           /* unlisted: the next index and the bound */
+} LfCursor;
+
+static void lf_cursor_init(LfCursor *c, const LfOcc *o, int32_t vr, int after, int n)
+{
+  int pos = lf_temp_pos(vr, o->npos);
+  if (pos < 0)
+  {
+    c->p = c->end = NULL;
+    c->k = after + 1;
+    c->n = n;
+    return;
+  }
+  int lo = o->start[pos], hi = o->start[pos + 1];
+  while (lo < hi)
+  {
+    int mid = (lo + hi) / 2;
+    if (o->idx[mid] <= after)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  c->p = o->idx + lo;
+  c->end = o->idx + o->start[pos + 1];
+  c->k = c->n = 0;
+}
+
+static int lf_cursor_next(LfCursor *c)
+{
+  if (c->p)
+    return c->p < c->end ? *c->p++ : -1;
+  return c->k < c->n ? c->k++ : -1;
+}
+
+/* A JUMP or JUMPIF strictly between `a` and `b`. */
+static int lf_jump_between(const LfOcc *o, int a, int b)
+{
+  return b > a + 1 && o->jumps[b] - o->jumps[a + 1] > 0;
+}
+
 int tcc_ir_opt_lea_fold(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -54,6 +207,8 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
 
   IROptDU du;
   ir_opt_du_build(ir, &du);
+  LfOcc occ;
+  lf_occ_build(ir, n, &occ);
 
   LOG_IR_GEN("=== LEA FOLD START (n=%d) ===", n);
 
@@ -106,7 +261,9 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
      * explicit linear scan that treats is_lval=1 dest positions as uses. */
     {
       int total_uses = 0;
-      for (int k = i + 1; k < n && total_uses < 2; k++)
+      LfCursor cur;
+      lf_cursor_init(&cur, &occ, lea_vr, i, n);
+      for (int k = lf_cursor_next(&cur); k >= 0 && total_uses < 2; k = lf_cursor_next(&cur))
       {
         IRQuadCompact *uq = &ir->compact_instructions[k];
         if (uq->op == TCCIR_OP_NOP)
@@ -153,12 +310,16 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
 
     /* Find the single use of the LEA result. */
     int cur_idx = -1;
-    for (int j = i + 1; j < n; j++)
+    LfCursor ucur;
+    lf_cursor_init(&ucur, &occ, lea_vr, i, n);
+    for (int j = lf_cursor_next(&ucur); j >= 0; j = lf_cursor_next(&ucur))
     {
       IRQuadCompact *uq = &ir->compact_instructions[j];
+      /* Same-block check: the use must precede any control-flow edge. */
+      if (lf_jump_between(&occ, i, j))
+        break;
       if (uq->op == TCCIR_OP_NOP)
         continue;
-      /* Same-block check: the use must precede any control-flow edge. */
       if (uq->op == TCCIR_OP_JUMP || uq->op == TCCIR_OP_JUMPIF)
         break;
       const IRRegistersConfig *cfg = &irop_config[uq->op];
@@ -221,7 +382,9 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
         int add_uses_real = 0;
         if (add_vr >= 0 && TCCIR_DECODE_VREG_TYPE(add_vr) == TCCIR_VREG_TYPE_TEMP)
         {
-          for (int k = cur_idx + 1; k < n && add_uses_real < 2; k++)
+          LfCursor acur;
+          lf_cursor_init(&acur, &occ, add_vr, cur_idx, n);
+          for (int k = lf_cursor_next(&acur); k >= 0 && add_uses_real < 2; k = lf_cursor_next(&acur))
           {
             IRQuadCompact *uq2 = &ir->compact_instructions[k];
             if (uq2->op == TCCIR_OP_NOP)
@@ -261,9 +424,13 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
 
           /* Find the consumer of add_vr in the same block. */
           int cons_idx = -1;
-          for (int k = add_idx + 1; k < n; k++)
+          LfCursor ccur;
+          lf_cursor_init(&ccur, &occ, add_vr, add_idx, n);
+          for (int k = lf_cursor_next(&ccur); k >= 0; k = lf_cursor_next(&ccur))
           {
             IRQuadCompact *ck = &ir->compact_instructions[k];
+            if (lf_jump_between(&occ, add_idx, k))
+              break;
             if (ck->op == TCCIR_OP_NOP)
               continue;
             if (ck->op == TCCIR_OP_JUMP || ck->op == TCCIR_OP_JUMPIF)
@@ -332,6 +499,8 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
                                                      width_op.btype);
               stack_op.is_unsigned = width_op.is_unsigned;
               stack_op.is_static = lea_src.is_static;
+              /* An indexed access keeps its marks on the base operand. */
+              irop_carry_access_marks(&stack_op, base);
 
               IROperand orig_dest = tcc_ir_op_get_dest(ir, cq);
               cq->op = TCCIR_OP_LOAD;
@@ -415,6 +584,10 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
                                   /*is_param_flag*/ (int)lea_src.is_param, old_op.btype);
       new_op.is_unsigned = old_op.is_unsigned;
       new_op.is_static = lea_src.is_static;
+      /* The access is the same one: its volatility and alignment marks go
+       * with it.  Left unmarked, it reads as volatile in any function that
+       * touches volatile memory at all (tcc_ir_access_is_volatile). */
+      irop_carry_access_marks(&new_op, old_op);
     }
 
     if (which == 1)
@@ -436,5 +609,6 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
   LOG_IR_GEN("=== LEA FOLD END: %d folds ===", changes);
 
   tcc_free(du.def);
+  lf_occ_free(&occ);
   return changes;
 }

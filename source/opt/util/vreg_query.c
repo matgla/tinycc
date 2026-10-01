@@ -78,7 +78,7 @@ int tcc_ir_vreg_has_multi_def(TCCIRState *ir, int32_t vreg)
 /* MLA's 4th (accumulator) pool operand is a real vreg USE invisible to has_src1/2; use-scans must count it or the def is wrongly killed. Returns -1 if none. */
 int32_t ir_opt_mla_accum_vreg(const TCCIRState *ir, const IRQuadCompact *q)
 {
-  if (q->op != TCCIR_OP_MLA)
+  if (!tcc_ir_op_is_mac(q->op))
     return -1;
   return irop_get_vreg(tcc_ir_op_get_accum(ir, q));
 }

@@ -89,6 +89,8 @@ static const char help[] = "Tiny C Compiler " TCC_VERSION " - Copyright (C) 2001
                            "  -mfpu=type                        specify FPU type for ARM hard float\n"
                            "  -mno-pic-data-is-text-relative    separate .text and .data with base "
                            "register addressing instead of PC-relative\n"
+                           "  -fno-pic                          position-dependent code at a fixed address "
+                           "(kernels): absolute data, no GOT, r9 allocatable\n"
 #endif
                            "Tools:\n"
                            "  create library  : tcc -ar [crstvx] lib [files]\n"

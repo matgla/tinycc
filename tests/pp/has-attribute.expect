@@ -1,0 +1,10 @@
+defined_yes
+ifdef_yes
+naked_yes
+noinline_yes
+aligned_section_visibility_yes
+transparent_union_yes
+musttail_no
+stdcall_no
+through_macro_yes
+operand_not_expanded_yes

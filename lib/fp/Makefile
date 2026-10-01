@@ -114,6 +114,7 @@ endif
 # armeabi.c is compiled and linked in because yasld symbol resolution only
 # searches self + children (not parent modules), so __aeabi_memset,
 # __aeabi_lcmp, etc. must be statically included in the shared library.
+# arm_mem.S carries the __aeabi_mem* entry points armeabi.c leaves to it.
 build-shared:
 	@echo "Building shared FP library for $(FPU)..."
 	@mkdir -p $(BUILD_DIR)/$(FPU)-pic
@@ -121,6 +122,8 @@ build-shared:
 		FP_CC="$(FP_CC)" FP_CFLAGS="$(FP_CFLAGS) -I$(CURDIR)/../../include -fPIC -fpic"
 	$(FP_CC) $(FP_CFLAGS) -I$(CURDIR)/../../include -fPIC -fpic \
 		-c $(CURDIR)/../armeabi.c -o $(BUILD_DIR)/$(FPU)-pic/armeabi.o
+	$(FP_CC) $(FP_CFLAGS) -I$(CURDIR)/../../include -fPIC -fpic \
+		-c $(CURDIR)/../arm_mem.S -o $(BUILD_DIR)/$(FPU)-pic/arm_mem.o
 	$(FP_CC) -shared -fPIC -nodefaultlibs -Wl,-Ttext=0x0 -Wl,-section-alignment=0x4 \
 		-Wl,-oformat=elf32-littlearm \
 		-o $(TARGET_SO).elf $(BUILD_DIR)/$(FPU)-pic/*.o

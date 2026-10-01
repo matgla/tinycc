@@ -1902,17 +1902,15 @@ UT_TEST(test_dce_var_liveness_struct_and_llong_defs_kept)
 }
 
 /* ========================================================================
- * BUG PIN: store to a dead VAR slot with a volatile lval source
+ * Store to a dead VAR slot with a volatile lval source
  *
  * The fused mem-to-mem copy `STORE lval(V0slot) <- lval(V1)` embodies a
  * READ of V1. When V1 is volatile, that read is a mandated side effect, so
- * the store must survive even though V0 is never read. var_liveness has the
- * guard (vl_removable rejects volatile sources); dce_dead_var_stores does
- * not, and runs first. This test pins the CURRENT (buggy) outcome; flip the
- * assertions to "store kept" once fixed. See docs/bugs/.
+ * the store must survive even though V0 is never read (dce_instr_reads_volatile
+ * in every dead-store killer, as vl_removable already did for var_liveness).
  * ======================================================================== */
 
-UT_TEST(test_dce_dead_var_store_volatile_lval_src_bug)
+UT_TEST(test_dce_dead_var_store_volatile_lval_src)
 {
   ssa_ctx c = ssa_ctx_new(/*blocks=*/1, /*temps=*/1);
   ssa_ctx_init_manual(&c);
@@ -1926,10 +1924,8 @@ UT_TEST(test_dce_dead_var_store_volatile_lval_src_bug)
   tcc_ir_ssa_opt_init(c.ctx, c.ir, c.ssa, c.cfg);
 
   int changed = run_dce_with_opt(c.ctx);
-  /* Buggy behavior: the store (and with it the volatile read of V1) is
-   * eliminated. Correct behavior: changed == 0, store kept. */
-  UT_ASSERT(changed >= 1);
-  UT_ASSERT_EQ(utb_op(c.ir, store_i), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(utb_op(c.ir, store_i), TCCIR_OP_STORE);
 
   ssa_ctx_free(&c);
   return 0;

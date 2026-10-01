@@ -113,8 +113,14 @@ static void sav_build_def_map(TCCIRState *ir)
     sav_def_present[k] = 1;
     /* A write THROUGH the vreg is a use, but so is `has_dest` with is_lval --
      * it is not a def of the vreg, and counting it as one would let a second
-     * def slip past the uniqueness test. */
-    sav_def_only[k] = d.is_lval ? -2 : (sav_def_only[k] == -1 ? j : -2);
+     * def slip past the uniqueness test.  A parameter also arrives with its
+     * argument, a def no instruction shows (a stack-passed one has not even an
+     * entry copy), so any def written here is at least its second: toysh's
+     * "if (!ant) ant = &deck;" made every later "ant != &deck" fold to equal. */
+    if (d.is_lval || type == TCCIR_VREG_TYPE_PARAM)
+      sav_def_only[k] = -2;
+    else
+      sav_def_only[k] = sav_def_only[k] == -1 ? j : -2;
   }
 }
 
@@ -289,6 +295,7 @@ int tcc_ir_opt_stack_addr_simplify(TCCIRState *ir)
         {
           IROperand direct = irop_make_stackoff(-1, addr.off, 1, 0, addr.is_param, irop_get_btype(dest));
           direct.is_unsigned = dest.is_unsigned;
+          irop_carry_access_marks(&direct, dest); /* same access: same volatility */
           tcc_ir_set_dest(ir, i, direct);
           changes++;
         }
@@ -307,6 +314,7 @@ int tcc_ir_opt_stack_addr_simplify(TCCIRState *ir)
         {
           IROperand direct = irop_make_stackoff(-1, addr.off, 1, 0, addr.is_param, irop_get_btype(src));
           direct.is_unsigned = src.is_unsigned;
+          irop_carry_access_marks(&direct, src); /* same access: same volatility */
           tcc_ir_set_src1(ir, i, direct);
           changes++;
         }

@@ -58,6 +58,13 @@ int compute_aapcs_natural_alignment(const CType *type)
       type_size(&f->type, &member_align);
     if (f->a.packed || s->a.packed)
       member_align = 1;
+    /* An alignment given on the member itself (_Alignas, aligned) counts,
+     * packed or not: gcc's doubleword test reads each field's DECL_ALIGN,
+     * which includes it.  Zig's C backend emits exactly that shape --
+     * `zig_align(8) zig_packed(union {...}) payload` -- and gcc passed such
+     * a struct from an even register while tcc used the next free one. */
+    if (f->a.aligned && (1 << (f->a.aligned - 1)) > member_align)
+      member_align = 1 << (f->a.aligned - 1);
     if (member_align > max_align)
       max_align = member_align;
   }

@@ -148,6 +148,37 @@ static int sr_div_value_stays_in_regs(TCCIRState *ir, int lo, int hi, int32_t se
   return 1;
 }
 
+/* Point an indexed access at the walked pointer: same op, base = ptr, index =
+ * the byte immediate `rel`, scale 0 -- the shape the emitter's constant-
+ * displacement fast path turns into `ldr rd, [ptr, #rel]`.  Rebuilt as a fresh
+ * four-slot pool entry the way symaddr_cse does it; the old base's access marks
+ * (volatile, underalignment) ride along on the new one. */
+static void sr_rewrite_indexed_through(TCCIRState *ir, IRQuadCompact *q, IROperand ptr_op, int rel)
+{
+  int is_load = (q->op == TCCIR_OP_LOAD_INDEXED);
+  IROperand old_base = is_load ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
+  IROperand value = is_load ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+  IROperand new_base = ptr_op;
+  new_base.is_lval = old_base.is_lval;
+  irop_carry_access_marks(&new_base, old_base);
+  new_base.aux |= old_base.aux;
+  tcc_ir_pool_ensure(ir, 4);
+  int operand_base = ir->iroperand_pool_count;
+  if (is_load)
+  {
+    tcc_ir_pool_add(ir, value);
+    tcc_ir_pool_add(ir, new_base);
+  }
+  else
+  {
+    tcc_ir_pool_add(ir, new_base);
+    tcc_ir_pool_add(ir, value);
+  }
+  tcc_ir_pool_add(ir, irop_make_imm32(-1, rel, IROP_BTYPE_INT32));
+  tcc_ir_pool_add(ir, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
+  q->operand_base = operand_base;
+}
+
 int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, DerivedIV *div, int *out_ptr_vreg,
                                 int *out_idx_shift, int *out_postnop_origpos, int *out_stride_pos, int shared_ptr_vreg)
 {
@@ -235,7 +266,7 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
   /* Don't split a CMP→JUMPIF pair: an inserted ADD (init_offset != 0) would clobber the flags. */
   {
     int element_size_check = div->stride / iv->step;
-    int init_offset_check = iv->init_val * element_size_check;
+    int init_offset_check = iv->init_val * element_size_check + div->origin;
     if (init_offset_check != 0 && insert_pos > 0 && ir->compact_instructions[insert_pos - 1].op == TCCIR_OP_CMP &&
         insert_pos < ir->next_instruction_index && ir->compact_instructions[insert_pos].op == TCCIR_OP_JUMPIF)
     {
@@ -301,9 +332,11 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
 
   int idx_shift = 0;
 
-  /* element_size = stride/step; init_offset = init_val*element_size (NOT init_val*stride when step != 1). */
+  /* element_size = stride/step; init_offset = init_val*element_size (NOT init_val*stride when step != 1).
+   * A group primary aims the pointer at the group's smallest offset (origin)
+   * so every member reads at a non-negative immediate off it. */
   int element_size = div->stride / iv->step;
-  int init_offset = iv->init_val * element_size;
+  int init_offset = iv->init_val * element_size + div->origin;
 
   if (init_offset == 0)
   {
@@ -334,14 +367,23 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
   /* Insertion shifted all indices >= insert_pos; update our tracked indices. */
   int new_use_idx = div->use_idx + idx_shift;
   int new_shl_idx = (div->shl_idx >= 0) ? div->shl_idx + idx_shift : -1;
+  int new_off_idx = (div->off_idx >= 0) ? div->off_idx + idx_shift : -1;
   int new_iv_def_idx = iv->def_idx;
   if (iv->def_idx >= insert_pos)
     new_iv_def_idx += idx_shift;
 
-  /* Step 2: rewrite the use site to consume ptr — ADD/MLA→ASSIGN, LOAD_INDEXED→LOAD, STORE_INDEXED→STORE. */
+  /* Step 2: rewrite the use site to consume ptr — ADD/MLA→ASSIGN, LOAD_INDEXED→LOAD, STORE_INDEXED→STORE.
+   * An access that sits `rel` bytes from where the pointer points stays indexed,
+   * with the immediate as its index. */
   IRQuadCompact *add_q = &ir->compact_instructions[new_use_idx];
   int rewrote_to_load_or_store = 0;
-  if (add_q->op == TCCIR_OP_LOAD_INDEXED)
+  int rel = div->offset - div->origin;
+  if ((add_q->op == TCCIR_OP_LOAD_INDEXED || add_q->op == TCCIR_OP_STORE_INDEXED) && rel != 0)
+  {
+    sr_rewrite_indexed_through(ir, add_q, ptr_op, rel);
+    rewrote_to_load_or_store = 1;
+  }
+  else if (add_q->op == TCCIR_OP_LOAD_INDEXED)
   {
     IROperand ptr_lval = ptr_op;
     ptr_lval.is_lval = 1;
@@ -358,6 +400,14 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
     tcc_ir_op_set_dest(ir, add_q, ptr_lval);
     rewrote_to_load_or_store = 1;
     /* src1 (value to store) is preserved at slot 1. */
+  }
+  else if (rel != 0)
+  {
+    /* A deref-form member of a group: its address temp is the group pointer
+     * plus this access's distance from the pointer's origin. */
+    add_q->op = TCCIR_OP_ADD;
+    tcc_ir_op_set_src1(ir, add_q, ptr_op);
+    tcc_ir_op_set_src2(ir, add_q, irop_make_imm32(-1, rel, IROP_BTYPE_INT32));
   }
   else
   {
@@ -384,11 +434,24 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
     }
   }
 
-  /* Step 3: NOP the SHL/MUL (skipped for fused MLA — no separate multiply instr). */
+  /* Step 3: NOP the SHL/MUL (skipped for fused MLA — no separate multiply instr),
+   * and the `iv +/- k` an affine INDEXED-DIV used to compute its index. */
   if (new_shl_idx >= 0)
   {
     IRQuadCompact *shl_q = &ir->compact_instructions[new_shl_idx];
     shl_q->op = TCCIR_OP_NOP;
+  }
+  if (new_off_idx >= 0)
+  {
+    if (postnop_inserted && new_off_idx > new_use_idx)
+      new_off_idx++;
+    /* Only ever the `iv +/- k` this DIV recorded -- guard against a DerivedIV
+     * that reached here with off_idx defaulted to 0 rather than -1 (a
+     * hand-built or memset-zeroed struct), which would otherwise blank the
+     * init ASSIGN at index 0/1. */
+    int oop = ir->compact_instructions[new_off_idx].op;
+    if (oop == TCCIR_OP_ADD || oop == TCCIR_OP_SUB)
+      ir->compact_instructions[new_off_idx].op = TCCIR_OP_NOP;
   }
 
   /* Step 4: insert ptr += stride after the IV increment, pushed past all uses of the derived address (copy-prop/coalescing can merge ptr with the address temp). */
@@ -709,6 +772,10 @@ int try_eliminate_iv_counter(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Der
    * end_value = limit * element_size */
   int element_size = div->stride / iv->step;
   int end_offset = limit_val * element_size;
+  /* end is built from ptr when ptr still equals base + origin (init 0), and
+   * from base otherwise -- only the latter still owes the origin. */
+  if (iv->init_val != 0)
+    end_offset += div->origin;
 
   /* Allocate a vreg for end_ptr */
   int end_vreg = tcc_ir_vreg_alloc_temp(ir);
@@ -967,23 +1034,11 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
           continue; /* only chain to primaries */
         if (divs[dj].iv_idx != divs[dk].iv_idx || divs[dj].stride != divs[dk].stride)
           continue;
-        /* Compare base operands: same vreg, or same immediate value, or same stack offset. */
-        IROperand a = divs[dj].base_op;
-        IROperand b = divs[dk].base_op;
-        int tag_a = irop_get_tag(a);
-        int tag_b = irop_get_tag(b);
-        if (tag_a != tag_b)
-          continue;
-        int eq = 0;
-        if (tag_a == IROP_TAG_IMM32 || tag_a == IROP_TAG_STACKOFF)
-          eq = (a.u.imm32 == b.u.imm32 && a.is_lval == b.is_lval);
-        else if (tag_a == IROP_TAG_VREG)
-        {
-          int32_t va = irop_get_vreg(a);
-          int32_t vb = irop_get_vreg(b);
-          if (va >= 0 && va == vb && a.is_lval == b.is_lval)
-            eq = 1;
-        }
+        /* Compare base operands: same vreg, or same immediate value, or same
+         * stack offset -- looking through a single-def copy of an address, so
+         * loads off `Addr[StackLoc[k]]` and a store through `T <- Addr[...]`
+         * are one base. */
+        int eq = iv_same_base(ir, divs[dj].base_op, divs[dk].base_op);
         if (eq)
         {
           divs[dj].share_with = dk;
@@ -1020,6 +1075,39 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
           LOG_IV_SR("IV_SR: skipping shared DIV %d — primary %d not transformed", di, divs[di].share_with);
           continue;
         }
+      }
+      /* A group is a primary INDEXED-DIV plus every INDEXED-DIV sharing its
+       * (iv, stride, base).  Aim the one pointer at the group's smallest
+       * offset: every member then reads at a non-negative immediate, which
+       * the 16-bit `ldr rd, [rn, #imm5*4]` encoding covers up to 124 and the
+       * wide form up to 4095.  A non-indexed primary (an ADD-form address
+       * temp) must keep the pointer at offset 0 -- its temp IS the address. */
+      /* A group is worth walking through one pointer only when it has the
+       * sliding-window shape -- at least one `base[iv +/- k]` member.  Without
+       * that (a plain `a[j]` read twice, a scaled address the fusion already
+       * handles) the members keep their own paths, exactly as before. */
+      int group_affine = (divs[di].off_idx >= 0);
+      for (int dj = di + 1; dj < num_divs && !group_affine; dj++)
+        if (divs[dj].share_with == di && divs[dj].off_idx >= 0)
+          group_affine = 1;
+      divs[di].origin = 0;
+      if (shared < 0 && group_affine &&
+          (ir->compact_instructions[divs[di].use_idx].op == TCCIR_OP_LOAD_INDEXED ||
+           ir->compact_instructions[divs[di].use_idx].op == TCCIR_OP_STORE_INDEXED ||
+           ir->compact_instructions[divs[di].use_idx].op == TCCIR_OP_ADD))
+      {
+        int origin = divs[di].offset;
+        for (int dj = di + 1; dj < num_divs; dj++)
+        {
+          if (divs[dj].share_with != di)
+            continue;
+          int uop = ir->compact_instructions[divs[dj].use_idx].op;
+          if (uop != TCCIR_OP_LOAD_INDEXED && uop != TCCIR_OP_STORE_INDEXED)
+            continue;
+          if (divs[dj].offset < origin)
+            origin = divs[dj].offset;
+        }
+        divs[di].origin = origin;
       }
       int changes =
           transform_derived_iv(ir, loop, &ivs[divs[di].iv_idx], &divs[di], &sr_ptr_vreg, &sr_idx_shift,
@@ -1080,6 +1168,8 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
         {
           APPLY_SHIFT(divs[dj].use_idx);
           APPLY_SHIFT(divs[dj].shl_idx);
+          if (divs[dj].off_idx >= 0)
+            APPLY_SHIFT(divs[dj].off_idx);
         }
         for (int ij = 0; ij < num_ivs; ij++)
         {
@@ -1097,6 +1187,39 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
           APPLY_SHIFT(loop->body_instrs[bi]);
 
 #undef APPLY_SHIFT
+
+        /* Members of this primary's group read through its pointer.  An
+         * in-place rewrite inserts nothing, so the index bookkeeping above is
+         * all that is needed; a member is only taken when it will have run
+         * before the bump (the stride ADD lands after every access of the
+         * iteration -- in the latch, or pushed past the primary's own use),
+         * and the `iv +/- k` that fed its index is NOPed with it.  A member
+         * left alone keeps its counter read and the elimination below then
+         * declines, which is the same code as before. */
+        if (changes >= 3 && sr_ptr_vreg >= 0 && group_affine)
+        {
+          IROperand ptr_op = irop_make_vreg(sr_ptr_vreg, IROP_BTYPE_INT32);
+          for (int dj = di + 1; dj < num_divs; dj++)
+          {
+            if (divs[dj].share_with != di)
+              continue;
+            IRQuadCompact *uq = &ir->compact_instructions[divs[dj].use_idx];
+            if (uq->op != TCCIR_OP_LOAD_INDEXED && uq->op != TCCIR_OP_STORE_INDEXED)
+              continue;
+            if (stride_pos >= 0 && divs[dj].use_idx >= stride_pos)
+              continue;
+            int rel = divs[dj].offset - divs[di].origin;
+            if (rel < 0 || rel > 4095)
+              continue;
+            sr_rewrite_indexed_through(ir, uq, ptr_op, rel);
+            if (divs[dj].off_idx >= 0)
+              ir->compact_instructions[divs[dj].off_idx].op = TCCIR_OP_NOP;
+            div_ptr_vregs[dj] = sr_ptr_vreg;
+            div_changes[dj] = 0; /* not an elimination candidate of its own */
+            total_changes++;
+            LOG_IV_SR("IV_SR: DIV %d reads through DIV %d's pointer at +%d", dj, di, rel);
+          }
+        }
 
         /* Transform only ONE derived IV per loop per call, then bail to IV
          * elimination.  Processing several DIVs in one call requires shifting

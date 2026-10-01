@@ -1,0 +1,2 @@
+variadic: u8=5a s8=-5 u16=beef s16=-2
+narrow param: zero-extended

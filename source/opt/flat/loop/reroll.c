@@ -123,6 +123,7 @@ static int op_is_unsafe_for_reroll(TccIrOp op)
     case TCCIR_OP_BUILTIN_APPLY_ARGS:
     case TCCIR_OP_BUILTIN_APPLY:
     case TCCIR_OP_BUILTIN_RETURN:
+    case TCCIR_OP_RETURN_ADDRESS:
     case TCCIR_OP_ASM_INPUT:
     case TCCIR_OP_INLINE_ASM:
     case TCCIR_OP_ASM_OUTPUT:

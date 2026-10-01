@@ -47,7 +47,12 @@ jobs:
       - name: Configure
         # --debug enables CONFIG_TCC_DEBUG so the compiler supports -dump-ir;
         # without it the frontend types/ tests skip (they need IR dumps).
-        run: ./configure --enable-cross --enable-O2 --debug
+        run: ./configure --enable-cross --enable-O2 --debug --enable-asan
+
+      - name: Unity groups are current
+        # source/unity/ must match the source lists (see scripts/gen_unity.py);
+        # a stale manifest still builds, but slower and without the checks.
+        run: python3 scripts/gen_unity.py --check
 
       - name: Build and test
         shell: bash
@@ -148,7 +153,7 @@ jobs:
       - name: Build cross compiler
         # --enable-O2/--debug only affect tcc's own binary, not the code it
         # emits, so the codesize numbers are unaffected by this config.
-        run: ./configure --enable-cross --enable-O2 --debug && make cross -j$(nproc)
+        run: ./configure --enable-cross --enable-O2 --debug --enable-asan && make cross -j$(nproc)
 
       - name: Set up test venv
         # record.py's codesize child (regression_disasm.py --csv) imports the
@@ -223,7 +228,13 @@ jobs:
         # the shell would fall back to interpreting it: "Syntax error: )
         # unexpected"). Needed here because run_benchmark.py builds the RP2350
         # perf firmware with this freshly built armv8m-tcc.
-        run: ./configure --enable-cross --enable-O2 --debug && make cross -j$(nproc)
+        #
+        # No --debug / --enable-asan here: the cloud jobs already run the tests
+        # under ASan, this compiler only builds benchmark firmware (its output
+        # does not depend on either), and on the Pi's four cores ASan + -g cost
+        # 2.3x the CPU of the build (182 s vs 79 s measured on x86) and slow
+        # every benchmark compile after it.
+        run: ./configure --enable-cross --enable-O2 && make cross -j$(nproc)
 
       - name: Download cloud codesize db
         uses: actions/download-artifact@v4

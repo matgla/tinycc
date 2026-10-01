@@ -199,7 +199,7 @@ int dce_dead_stackloc_stores(IRSSAOptCtx *ctx)
         break;
       }
     }
-    if (!any_read) {
+    if (!any_read && !dce_instr_reads_volatile(ir, q)) {
       ssa_opt_nop_instr(ctx, i);
       changes++;
     }

@@ -11,6 +11,10 @@
 #define USING_GLOBALS
 #include "ir.h"
 
+/* The form the parameter being processed takes in the body, when it can be
+ * described (see IRParamForm); NULL when not recording. */
+static IRParamForm *pf_cur;
+
 /* Forward declarations for internal helpers */
 static void tcc_ir_params_add_hidden_sret(TCCIRState *ir, CType *func_type);
 static void tcc_ir_params_process_arguments(TCCIRState *ir, Sym *param_list, TCCAbiCallLayout *call_layout);
@@ -67,7 +71,14 @@ static void tcc_ir_params_add_hidden_sret(TCCIRState *ir, CType *func_type)
     /* Struct returned via hidden pointer in first parameter (r0) */
     SValue src, dst;
 
-    loc = (loc - PTR_SIZE) & -PTR_SIZE;
+    /* A frame OBJECT, not a raw slot: SRA then treats the pointer like any
+     * other word-sized local and promotes it, so the returns read a register
+     * instead of reloading the slot (zig.c: every struct-returning function
+     * reloaded it at each `return`). */
+    if (getenv("TCC_SRET_HOME_SLOT")) /* the old raw slot, for experiments */
+      loc = (loc - PTR_SIZE) & -PTR_SIZE;
+    else
+      loc = tcc_ir_frame_alloc(loc, PTR_SIZE, -PTR_SIZE);
     func_vc = loc;
 
     /* Consume a PARAM vreg for the hidden sret pointer */
@@ -105,12 +116,16 @@ static void tcc_ir_params_process_arguments(TCCIRState *ir, Sym *param_list, TCC
     ir->parameters_count = (int8_t)arg_count;
     ir->named_arg_reg_bytes = 0;
     ir->named_arg_stack_bytes = 0;
+    tcc_free(ir->param_forms);
+    ir->param_forms = arg_count > 0 ? tcc_mallocz(sizeof(IRParamForm) * arg_count) : NULL;
   }
 
   /* Process each parameter */
   for (sym = param_list; sym; sym = sym->next, ++arg_index)
   {
+    pf_cur = ir && ir->param_forms && arg_index < 127 ? &ir->param_forms[arg_index] : NULL;
     tcc_ir_params_process_single(ir, sym, arg_index, call_layout);
+    pf_cur = NULL;
   }
 }
 
@@ -176,6 +191,27 @@ void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAb
   }
 }
 
+/* A parameter the ABI placed wholly on the caller's stack.  Recorded on its
+ * PARAM vreg because tcc_ir_register_allocation_params re-derives register
+ * placement by counting, and cannot tell a register an 8-aligned struct
+ * skipped (r3 before a stack-passed S24L) from one still free. */
+static void params_mark_stack(TCCIRState *ir, Sym *ps)
+{
+  if (!ir || !ps || ps->vreg < 0 || TCCIR_DECODE_VREG_TYPE(ps->vreg) != TCCIR_VREG_TYPE_PARAM)
+    return;
+  IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, ps->vreg);
+  if (iv)
+    iv->incoming_stack = 1;
+}
+
+/* Offset of a stack-passed parameter as the IR names it: from the first stack
+ * argument, or from the pushed r0 when the prologue pushes r0-r3 for an
+ * in-place split struct (see tcc_ir_params_process_struct). */
+static int param_stack_off(const TCCIRState *ir, const TCCAbiArgLoc *loc_info)
+{
+  return loc_info->stack_off + (ir && ir->push_arg_regs ? 16 : 0);
+}
+
 void tcc_ir_params_update_tracking(TCCIRState *ir, TCCAbiArgLoc loc_info, TCCAbiCallLayout *layout)
 {
   if (!ir)
@@ -198,7 +234,8 @@ void tcc_ir_params_update_tracking(TCCIRState *ir, TCCAbiArgLoc loc_info, TCCAbi
   }
   else
   {
-    int end = loc_info.stack_off + loc_info.size;
+    /* A stack slot is a whole number of words (a 17-byte struct takes 20). */
+    int end = loc_info.stack_off + ((loc_info.size + 3) & ~3);
     if (end > ir->named_arg_stack_bytes)
       ir->named_arg_stack_bytes = end;
   }
@@ -219,62 +256,8 @@ void tcc_ir_params_update_tracking(TCCIRState *ir, TCCAbiArgLoc loc_info, TCCAbi
 void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int size, int align, TCCAbiArgLoc *loc_info,
                                   TCCAbiCallLayout *call_layout, int arg_index)
 {
-  const int invisible_ref =
-      (call_layout->arg_flags && (call_layout->arg_flags[arg_index] & TCC_ABI_ARG_FLAG_INVISIBLE_REF));
   int slot_align = align < 4 ? 4 : align;
   int flags = 0, addr = 0;
-
-  if (invisible_ref)
-  {
-    /* Large struct passed as hidden pointer */
-    loc = (loc - PTR_SIZE) & -PTR_SIZE;
-    const int ptr_slot = loc;
-    const int ptr_param_vr = tcc_ir_get_vreg_param(ir);
-
-    IRLiveInterval *ptr_iv = tcc_ir_vreg_live_interval(ir, ptr_param_vr);
-    if (ptr_iv)
-    {
-      if (loc_info->kind == TCC_ABI_LOC_REG)
-      {
-        /* Invisible-ref pointer passed in a register.
-         * Set incoming register so tcc_ir_mark_param_incoming_regs skips
-         * this vreg and doesn't re-assign it based on sequential argno. */
-        ptr_iv->incoming_reg0 = loc_info->reg_base;
-        ptr_iv->incoming_reg1 = -1;
-      }
-      else
-      {
-        /* Invisible-ref pointer passed on the stack (all argument registers
-         * exhausted).  Mark as stack-passed and record the caller-frame
-         * offset so PARAM_STACK materialisation picks it up correctly. */
-        ptr_iv->incoming_reg0 = -1;
-        ptr_iv->incoming_reg1 = -1;
-        tcc_ir_set_original_offset(ir, ptr_param_vr, loc_info->stack_off);
-      }
-    }
-
-    SValue src, dst;
-    memset(&src, 0, sizeof(src));
-    memset(&dst, 0, sizeof(dst));
-    src.type.t = VT_PTR;
-    src.r = 0;
-    src.vr = ptr_param_vr;
-    dst.type.t = VT_PTR;
-    dst.r = VT_LOCAL | VT_LVAL;
-    dst.vr = -1;
-    dst.c.i = ptr_slot;
-    tcc_ir_put(ir, TCCIR_OP_STORE, &src, NULL, &dst);
-
-    flags = VT_LVAL | VT_LLOCAL;
-    addr = ptr_slot;
-    {
-      int v = sym->v & ~SYM_FIELD;
-      if (!v)
-        v = anon_sym++;
-      sym_push(v, type, flags, addr);
-    }
-    return;
-  }
 
   if (loc_info->kind == TCC_ABI_LOC_REG)
   {
@@ -319,12 +302,37 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
         v = anon_sym++;
       sym_push(v, type, flags, addr);
     }
+    if (pf_cur)
+      *pf_cur = (IRParamForm){.kind = IR_PF_HOME, .reg_base = (int8_t)loc_info->reg_base, .off = struct_slot,
+                              .words = word_count};
+    return;
+  }
+
+  if (loc_info->kind == TCC_ABI_LOC_REG_STACK && loc_info->stack_off == 0 && !call_layout->is_variadic)
+  {
+    /* Struct straddles r3 and the stack.  The prologue pushes r0-r3 right
+     * below the stack arguments (push_arg_regs), which makes it contiguous in
+     * memory: use it in place from its first register's slot instead of
+     * copying it word by word into the frame.  Parameter offsets are then
+     * measured from the pushed r0 (offset_to_args stops there), so they stay
+     * non-negative -- disjoint from the frame's negative local offsets, which
+     * passes comparing slot offsets rely on -- and every stack parameter
+     * after this one sits 16 bytes further up (param_stack_off). */
+    ir->push_arg_regs = 1;
+    int v = sym->v & ~SYM_FIELD;
+    if (!v)
+      v = anon_sym++;
+    Sym *ps = sym_push(v, type, VT_PARAM | VT_LVAL | VT_LOCAL, loc_info->reg_base * 4);
+    params_mark_stack(ir, ps);
+    if (pf_cur && ps->vreg >= 0)
+      *pf_cur = (IRParamForm){.kind = IR_PF_MEM, .vreg = ps->vreg, .off = loc_info->reg_base * 4};
     return;
   }
 
   if (loc_info->kind == TCC_ABI_LOC_REG_STACK)
   {
-    /* Struct straddles registers and stack */
+    /* Struct straddles registers and stack, the stack part not first on the
+     * stack (only under hard-float, after VFP arguments spilled): copy it. */
     int slot_size = tcc_abi_align_up_int(size, 4);
     loc = (loc - slot_size) & -slot_align;
     const int struct_slot = loc;
@@ -401,12 +409,15 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
 
   /* Struct passed on stack */
   flags = VT_PARAM | VT_LVAL | VT_LOCAL;
-  addr = loc_info->stack_off;
+  addr = param_stack_off(ir, loc_info);
   {
     int v = sym->v & ~SYM_FIELD;
     if (!v)
       v = anon_sym++;
-    sym_push(v, type, flags, addr);
+    Sym *ps = sym_push(v, type, flags, addr);
+    params_mark_stack(ir, ps);
+    if (pf_cur && ps->vreg >= 0)
+      *pf_cur = (IRParamForm){.kind = IR_PF_MEM, .vreg = ps->vreg, .off = addr};
   }
 }
 
@@ -438,7 +449,7 @@ void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiA
   else
   {
     flags = VT_PARAM | VT_LVAL | VT_LOCAL;
-    addr = loc_info->stack_off;
+    addr = param_stack_off(ir, loc_info);
   }
 
   sym->r |= ~(VT_LVAL | VT_LLOCAL);
@@ -446,7 +457,12 @@ void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiA
   int v = sym->v & ~SYM_FIELD;
   if (!v)
     v = anon_sym++;
-  sym_push(v, &pushed_type, flags, addr);
+  Sym *ps = sym_push(v, &pushed_type, flags, addr);
+  if (loc_info->kind == TCC_ABI_LOC_STACK)
+    params_mark_stack(ir, ps);
+  if (pf_cur && ps->vreg >= 0 && !variadic)
+    *pf_cur = (IRParamForm){.kind = loc_info->kind == TCC_ABI_LOC_STACK ? IR_PF_MEM : IR_PF_REG, .vreg = ps->vreg,
+                            .off = addr};
 }
 
 int tcc_ir_local_add(TCCIRState *ir, Sym *sym, int stack_offset)

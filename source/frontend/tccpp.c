@@ -42,6 +42,7 @@ ST_DATA CValue tokc;
 ST_DATA const int *macro_ptr;
 ST_DATA CString tokcstr; /* current parsed string, if any */
 ST_DATA TokenString *pp_pragma_capture; /* see tcc.h */
+ST_DATA int pp_pack_captures;           /* see tcc.h */
 
 /* display benchmark infos */
 ST_DATA int tok_ident;
@@ -1912,6 +1913,64 @@ ST_FUNC void pp_apply_pack_replay(TCCState *s1, int code)
   }
 }
 
+/* Apply every deferred #pragma pack action in the saved tokens [P, END) to the
+   live pack state. */
+ST_FUNC void pp_apply_pack_replays(TCCState *s1, const int *p, const int *end)
+{
+  while (p < end)
+  {
+    int t;
+    CValue cv;
+    tok_get(&t, &p, &cv);
+    if (t == TOK_PACK_REPLAY)
+      pp_apply_pack_replay(s1, cv.i);
+  }
+}
+
+/* The #pragma pack state as {depth, stack[0..depth]}.  A saved function body
+   replayed away from its definition (at a call site, or at the end of the TU)
+   lays out its structs under the state it was defined in, not the state around
+   the replay.  pp_pack_snapshot returns a heap copy, or NULL for the default
+   state (the case for nearly every function); pp_pack_enter saves the live
+   state into SAVED (PACK_STACK_SIZE + 1 ints) and installs SNAP, and
+   pp_pack_leave puts SAVED back, so directives inside the body do not leak
+   past the replay. */
+static void pp_pack_install(TCCState *s1, const int *snap)
+{
+  if (!snap)
+  {
+    s1->pack_stack[0] = 0;
+    s1->pack_stack_ptr = s1->pack_stack;
+    return;
+  }
+  memcpy(s1->pack_stack, snap + 1, sizeof(int) * (snap[0] + 1));
+  s1->pack_stack_ptr = s1->pack_stack + snap[0];
+}
+
+ST_FUNC int *pp_pack_snapshot(TCCState *s1)
+{
+  int depth = s1->pack_stack_ptr - s1->pack_stack;
+  if (depth == 0 && s1->pack_stack[0] == 0)
+    return NULL;
+  int *snap = tcc_malloc(sizeof(int) * (depth + 2));
+  snap[0] = depth;
+  memcpy(snap + 1, s1->pack_stack, sizeof(int) * (depth + 1));
+  return snap;
+}
+
+ST_FUNC void pp_pack_enter(TCCState *s1, const int *snap, int *saved)
+{
+  int depth = s1->pack_stack_ptr - s1->pack_stack;
+  saved[0] = depth;
+  memcpy(saved + 1, s1->pack_stack, sizeof(int) * (depth + 1));
+  pp_pack_install(s1, snap);
+}
+
+ST_FUNC void pp_pack_leave(TCCState *s1, const int *saved)
+{
+  pp_pack_install(s1, saved);
+}
+
 #if 0
 #define TOK_GET(t, p, c) tok_get(t, p, c)
 #else
@@ -2234,6 +2293,16 @@ static void pp_parse_assertion(void)
   tokc.i = pp_assertion_value(kind_tok, value_tok);
 }
 
+/* The next preprocessor-expression token, never macro-expanded: from the
+ * current substitution result when there is one, else from the file. */
+static void pp_next_nosubst(void)
+{
+  if (macro_ptr)
+    next();
+  else
+    next_nomacro();
+}
+
 /* eval an expression for #if/#elif */
 static int expr_preprocess(TCCState *s1)
 {
@@ -2270,7 +2339,8 @@ static int expr_preprocess(TCCState *s1)
       if (s1->run_test)
         maybe_run_test(s1);
       c = 0;
-      if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT)
+      if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT ||
+          tok == TOK___HAS_ATTRIBUTE)
         c = 1;
       if (t == '(')
       {
@@ -2278,6 +2348,25 @@ static int expr_preprocess(TCCState *s1)
         if (tok != ')')
           expect("')'");
       }
+      tok = TOK_CINT;
+      tokc.i = c;
+    }
+    else if (tok == TOK___HAS_ATTRIBUTE)
+    {
+      /* Usually reached through a macro (zig.h's zig_has_attribute), so the
+       * operand is still in the substituted stream, which only next() reads;
+       * the operand was kept unexpanded there (see macro_subst). Read straight
+       * from the file, next() would expand it, so use the raw lexer. */
+      pp_next_nosubst();
+      if (tok != '(')
+        expect("'(' after __has_attribute");
+      pp_next_nosubst();
+      if (tok < TOK_IDENT)
+        expect("attribute name in __has_attribute");
+      c = tcc_attribute_supported(tok);
+      pp_next_nosubst();
+      if (tok != ')')
+        expect("')'");
       tok = TOK_CINT;
       tokc.i = c;
     }
@@ -2316,6 +2405,36 @@ static int expr_preprocess(TCCState *s1)
   end_macro();
   tok = t; /* restore LF or EOF */
   return c != 0;
+}
+
+/* __has_builtin: builtins parse_builtin and friends implement.  A "no" sends a
+ * header to its portable C fallback: zig.h built its byte swaps from shifts
+ * and ORs (five instructions a u16) while REV16 was there.
+ *
+ * The __builtin_*_overflow family is implemented but answered "no": zig.h's
+ * builtin branch takes the result's address (`&full_res`, which then lives
+ * in memory) and ORs the flag with range checks, and that costs more than its
+ * fallback's `*res < lhs` -- zig.c -Os +7 KB.  Answer "yes" once both of
+ * those compile as well as the fallback does. */
+static const char *const tcc_builtins_supported[] = {
+    "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
+    "__builtin_clz", "__builtin_clzl", "__builtin_clzll", "__builtin_ctz", "__builtin_ctzl", "__builtin_ctzll",
+    "__builtin_popcount", "__builtin_popcountl", "__builtin_popcountll",
+    "__builtin_unreachable", "__builtin_trap", "__builtin_expect", "__builtin_frame_address",
+    "__builtin_return_address", "__builtin_prefetch", "__builtin_nan", "__builtin_inf",
+    "__builtin_constant_p", "__builtin_types_compatible_p", "__builtin_choose_expr",
+    "__builtin_memcpy", "__builtin_memmove", "__builtin_memset", "__builtin_memcmp", "__builtin_strlen",
+    "__builtin_abs", "__builtin_labs", "__builtin_llabs", "__builtin_alloca", "__builtin_offsetof",
+    "__builtin_va_start", "__builtin_va_end", "__builtin_va_arg", "__builtin_va_copy",
+    NULL};
+
+ST_FUNC int tcc_builtin_supported(int t)
+{
+  const char *name = get_tok_str(t, NULL);
+  for (int i = 0; tcc_builtins_supported[i]; i++)
+    if (!strcmp(name, tcc_builtins_supported[i]))
+      return 1;
+  return 0;
 }
 
 ST_FUNC void pp_error(CString *cs)
@@ -2599,6 +2718,7 @@ static int pragma_parse(TCCState *s1)
       CValue cv;
       cv.i = ((unsigned)rec_kind << 16) | (rec_value & 0xffff);
       tok_str_add2(pp_pragma_capture, TOK_PACK_REPLAY, &cv);
+      pp_pack_captures++;
     }
   }
   else if (tok == TOK_comment)
@@ -2722,7 +2842,8 @@ redo:
         file->ifndef_macro = tok;
       }
     }
-    if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT)
+    if (define_find(tok) || tok == TOK___HAS_INCLUDE || tok == TOK___HAS_INCLUDE_NEXT ||
+        tok == TOK___HAS_ATTRIBUTE)
       c ^= 1;
     next_nomacro();
   do_if:
@@ -4701,7 +4822,32 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
     char buf[32], *cstrval = buf;
 
     /* special macros */
-    if (v == TOK___LINE__ || v == TOK___COUNTER__)
+    if (v == TOK___HAS_BUILTIN)
+    {
+      /* Anywhere, not only in #if: zig.h pastes the 0/1 answer into a name
+       * (zig_expand_import_##has) to choose a libm import. */
+      int saved_parse_flags = parse_flags, name;
+      parse_flags |= PARSE_FLAG_SPACES | PARSE_FLAG_LINEFEED | PARSE_FLAG_ACCEPT_STRAYS;
+      do
+        t = next_argstream(nested_list, NULL);
+      while (t == ' ' || t == TOK_LINEFEED);
+      if (t != '(')
+        expect("'(' after __has_builtin");
+      do
+        t = next_argstream(nested_list, NULL);
+      while (t == ' ' || t == TOK_LINEFEED);
+      name = t;
+      do
+        t = next_argstream(nested_list, NULL);
+      while (t == ' ' || t == TOK_LINEFEED);
+      parse_flags = saved_parse_flags;
+      if (t != ')')
+        expect("')' after the __has_builtin operand");
+      snprintf(buf, sizeof(buf), "%d", name >= TOK_IDENT && tcc_builtin_supported(name));
+      t = TOK_PPNUM;
+      goto add_cstr1;
+    }
+    else if (v == TOK___LINE__ || v == TOK___COUNTER__)
     {
       t = v == TOK___LINE__ ? file->line_num : pp_counter++;
       snprintf(buf, sizeof(buf), "%d", t);
@@ -4799,8 +4945,10 @@ static int macro_subst(TokenString *tok_str, Sym **nested_list, const int *macro
       tok_str_add2_spc(tok_str, t, &cval);
       if (nosubst && t != '(')
         nosubst = 0;
-      /* GCC supports 'defined' as result of a macro substitution */
-      if (t == TOK_DEFINED && pp_expr)
+      /* GCC supports 'defined' as result of a macro substitution; the
+         operand of __has_attribute is likewise an attribute name, not a
+         macro to expand. */
+      if ((t == TOK_DEFINED || t == TOK___HAS_ATTRIBUTE) && pp_expr)
         nosubst = 1;
     }
   }
@@ -4948,8 +5096,16 @@ restart:
       if (t == TOK_PACK_REPLAY)
       {
         /* deferred #pragma pack action: apply it and stay invisible to the
-           parser by fetching the next real token. */
-        pp_apply_pack_replay(s1, tokc.i);
+           parser by fetching the next real token.  While a replayed body is
+           itself being saved again (skip_or_save_block), keep the action in
+           the new stream instead, as for a directive read from the file. */
+        if (pp_pragma_capture)
+        {
+          tok_str_add2(pp_pragma_capture, TOK_PACK_REPLAY, &tokc);
+          pp_pack_captures++;
+        }
+        else
+          pp_apply_pack_replay(s1, tokc.i);
         goto redo;
       }
       goto convert;
@@ -5404,6 +5560,8 @@ static void tcc_predefs_base(TCCState *s1, CString *cs, int is_asm, int include_
     putdef(cs, "__CHAR_UNSIGNED__");
   if (s1->optimize > 0)
     putdef(cs, "__OPTIMIZE__");
+  if (s1->optimize_size)
+    putdef(cs, "__OPTIMIZE_SIZE__");
   if (s1->option_pthread)
     putdef(cs, "_REENTRANT");
   if (s1->leading_underscore)
@@ -5622,6 +5780,7 @@ ST_FUNC void tccpp_new(TCCState *s)
   define_push(TOK___DATE__, MACRO_OBJ, NULL, NULL);
   define_push(TOK___TIME__, MACRO_OBJ, NULL, NULL);
   define_push(TOK___COUNTER__, MACRO_OBJ, NULL, NULL);
+  define_push(TOK___HAS_BUILTIN, MACRO_OBJ, NULL, NULL);
 }
 
 ST_FUNC void tccpp_delete(TCCState *s)

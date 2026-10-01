@@ -26,6 +26,8 @@ struct TCCIRState *tcc_ir_alloc(void);
 
 /* Free IR block and all associated memory */
 void tcc_ir_free(struct TCCIRState *ir);
+/* Free codegen's dry-run operand cache (TCCIRState.codegen_mop_cache). */
+void tcc_ir_mop_cache_free(void *cache);
 
 /* Reset IR block for reuse (keeps allocations) */
 void tcc_ir_reset(struct TCCIRState *ir);

@@ -47,4 +47,8 @@ void tu_symset_add(TuSymSet *s, Sym *sym);
 int tu_symset_contains(const TuSymSet *s, const Sym *sym);
 void tu_symset_free(TuSymSet *s);
 
+/* memcpy/memmove/memset and their __aeabi_ forms: write only through
+ * argument 0. */
+int tu_is_block_copy_helper(const char *nm);
+
 #endif

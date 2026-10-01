@@ -22,13 +22,14 @@ TCC = TCC_TOP / "armv8m-tcc"
 
 pytestmark = pytest.mark.skipif(not TCC.exists(), reason="needs armv8m-tcc")
 
-# YaffHeader (source/obj/tccyaff.h) is packed; offsets of the fields read here.
+# YaffHeader (source/obj/tccyaff.h) is packed; offsets of the fields read here,
+# all u32 since YAFF_VERSION 3 widened the relocation counts and the offsets.
 CODE_LENGTH = 8
 DATA_LENGTH = 16
-GOT_LENGTH = 48
-PLT_LENGTH = 56
-ARCH_SECTION_OFFSET = 60
-TEXT_OFFSET = 70
+GOT_LENGTH = 60
+PLT_LENGTH = 68
+ARCH_SECTION_OFFSET = 72
+TEXT_OFFSET = 92
 
 SOURCES = {
     # Small .data, far below a page: the case that overflowed.
@@ -74,12 +75,12 @@ def test_default_page_layout_links_and_matches_its_header(tmp_path, name):
     assert data[:4] == b"YAFF"
     # Rewritten at the very end of tcc_output_yaff; still 0 if the writer
     # stopped before it.
-    assert struct.unpack_from("<H", data, ARCH_SECTION_OFFSET)[0] != 0
+    assert struct.unpack_from("<I", data, ARCH_SECTION_OFFSET)[0] != 0
 
     # text, plt, rodata+data (data_length) and got are the last things written,
     # back to back, so the file ends exactly where the header says the image
     # does.  A writer that emitted the padded sizes short, or long, fails here.
-    (text_offset,) = struct.unpack_from("<H", data, TEXT_OFFSET)
+    (text_offset,) = struct.unpack_from("<I", data, TEXT_OFFSET)
     (code_length,) = struct.unpack_from("<I", data, CODE_LENGTH)
     (data_length,) = struct.unpack_from("<I", data, DATA_LENGTH)
     (got_length,) = struct.unpack_from("<I", data, GOT_LENGTH)

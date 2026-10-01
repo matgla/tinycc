@@ -705,7 +705,11 @@ void gen_opl(int op)
   case TOK_SAR:
   case TOK_SHR:
   case TOK_SHL:
-    if (tcc_state->ir)
+    /* -Os keeps the helper call for a variable count: the call is a BL and
+     * the argument moves, the inline sequence eight instructions (~22 bytes)
+     * at every site -- 440 of them in zig.c. */
+    if (tcc_state->ir &&
+        ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST || !tcc_state->optimize_size))
     {
       /* IR mode: generate a single 64-bit shift instruction directly.
        * The lexpand/lbuild decomposition produces intermediate 32-bit values

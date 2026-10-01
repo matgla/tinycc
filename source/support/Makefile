@@ -16,7 +16,7 @@ SUPPORT_HDRS = \
 	source/support/tccdbgenv.h \
 	source/support/tccdebug.h
 
-SUPPORT_OBJ = $(patsubst %.c,$(X)%.o,$(SUPPORT_SRC))
+SUPPORT_OBJ = $(call lib-objs,support,$(SUPPORT_SRC))
 SUPPORT_LIB = $(X)source/support/libsupport.a
 
 $(X)source/support/%.o: source/support/%.c $(SUPPORT_HDRS) $(TCC_CORE_DEPS)

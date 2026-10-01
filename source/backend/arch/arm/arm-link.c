@@ -46,6 +46,7 @@ ST_FUNC int code_reloc(int reloc_type)
   case R_ARM_THM_JUMP6:
   case R_ARM_THM_PC12:
   case R_ARM_THM_PC8:
+  case R_ARM_YASOS_LOCAL_CALL:
     return 1;
   }
   return -1;
@@ -62,6 +63,7 @@ ST_FUNC int gotplt_entry_type(int reloc_type)
   case R_ARM_COPY:
   case R_ARM_GLOB_DAT:
   case R_ARM_JUMP_SLOT:
+  case R_ARM_YASOS_LOCAL_CALL: /* a check on the BL beside it, which owns the PLT decision */
     return NO_GOTPLT_ENTRY;
 
   case R_ARM_PC24:
@@ -487,6 +489,23 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     imm11 = (x >> 1) & 0x7ff;
     (*(uint16_t *)ptr) = (uint16_t)((hi & 0xf800) | (s << 10) | imm10);
     (*(uint16_t *)(ptr + 2)) = (uint16_t)((lo & 0xd000) | (j1 << 13) | blx_bit | (j2 << 11) | imm11);
+  }
+    return;
+  case R_ARM_YASOS_LOCAL_CALL:
+  {
+    /* The compiler dropped the R9 reload after the BL at this offset because
+       -fmodule-local-calls classified the callee as module-local (no shared
+       library in the library paths exported it).  If the call binds to the
+       PLT after all, the callee returns with its own R9 and this function
+       carries on addressing its data through the wrong GOT: refuse the link
+       rather than produce that. */
+    int to_plt = s1->plt && val >= s1->plt->sh_addr && val < s1->plt->sh_addr + s1->plt->data_offset;
+    if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
+      return; /* an unresolved weak callee is the caller's problem, as for the BL */
+    if (to_plt || sym->st_shndx == SHN_UNDEF)
+      tcc_error_noabort("call to '%s' at %x was compiled as module-local (its R9 reload dropped) but binds "
+                        "to an import; compile with the library's -L path or with -fno-module-local-calls",
+                        (char *)symtab_section->link->data + sym->st_name, (unsigned)addr);
   }
     return;
   case R_ARM_MOVT_ABS:

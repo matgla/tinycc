@@ -775,6 +775,19 @@ static int sv_cmp_verdict(SVState *s, int cmp_idx, int tok, SVCmp *cmp, int32_t 
       if (tok == VRP_TOK_UGE) verdict = 1;
       else if (tok == VRP_TOK_ULT) verdict = 0;
     }
+    /* ... and vs the other ends of the 32-bit compare: nothing is above
+     * 0xFFFFFFFF unsigned, below INT32_MIN or above INT32_MAX signed.  zig.h
+     * checks every __builtin_*_overflow result against zig_minInt/zig_maxInt
+     * of its width, which inlining makes exactly these at full width. */
+    if (verdict < 0 && cmp->c_ok && cmp->x.btype != IROP_BTYPE_INT64)
+    {
+      if (cmp->c == -1 && (tok == VRP_TOK_UGT || tok == VRP_TOK_ULE))
+        verdict = tok == VRP_TOK_ULE;
+      else if (cmp->c == INT32_MIN && (tok == VRP_TOK_LT || tok == VRP_TOK_GE))
+        verdict = tok == VRP_TOK_GE;
+      else if (cmp->c == INT32_MAX && (tok == VRP_TOK_GT || tok == VRP_TOK_LE))
+        verdict = tok == VRP_TOK_LE;
+    }
     if (verdict < 0 && cmp->slot >= 0 && s->ranges[cmp->slot].valid && cmp->c_ok)
       verdict = sv_range_verdict(s->ranges[cmp->slot].lo, s->ranges[cmp->slot].hi, cmp->c, tok);
     /* A phi whose operands all exclude c decides `x == c` even when the interval hull cannot. */

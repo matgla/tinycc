@@ -961,6 +961,10 @@ LIBTCCAPI TCCState *tcc_new(void)
   /* SB-relative GOT addressing is on by default for YASOS; disable per build
    * with -mno-sb-relative-got when a module's GOT exceeds 4096 bytes. */
   s->sb_relative_got = 1;
+  /* Calls to undefined functions that no library in the library paths exports
+   * keep R9 (no reload after the call); -fno-module-local-calls restores the
+   * reload after every call out of the translation unit. */
+  s->module_local_calls = 1;
 #else
   s->text_and_data_separation = 0;
 #endif
@@ -988,6 +992,10 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
 
   /* free lazy object files (Phase 2 GC) */
   tcc_free_lazy_objfiles(s1);
+
+  /* free the -fmodule-local-calls import set (its libtcc1 index lives in the
+     archive cache freed next) */
+  tcc_yaff_import_set_free(s1);
 
   /* free cached archive symbol tables */
   tcc_archive_cache_free(s1);
@@ -1080,14 +1088,16 @@ LIBTCCAPI int tcc_set_output_type(TCCState *s, int output_type)
   /* add sections */
   tccelf_new(s);
 
+  /* Objects need the library paths too: -fmodule-local-calls reads the
+   * export tables of the shared libraries found there while compiling. */
+  tcc_add_library_path(s, CONFIG_TCC_LIBPATHS);
+
   if (output_type == TCC_OUTPUT_OBJ)
   {
     /* always elf for objects */
     s->output_format = TCC_OUTPUT_FORMAT_ELF;
     return 0;
   }
-
-  tcc_add_library_path(s, CONFIG_TCC_LIBPATHS);
 
   /* paths for crt objects */
   tcc_split_path(s, &s->crt_paths, &s->nb_crt_paths, CONFIG_TCC_CRTPREFIX);
@@ -1725,6 +1735,7 @@ enum
   TCC_OPTION_sb_relative_got,
   TCC_OPTION_no_sb_relative_got,
   TCC_OPTION_fpic,
+  TCC_OPTION_fno_pic,
   TCC_OPTION_fpie,
   TCC_OPTION_no_pie,
   TCC_OPTION_T,
@@ -1777,6 +1788,7 @@ static const TCCOption tcc_options[] = {
     {"O", TCC_OPTION_O, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
     {"fpie", TCC_OPTION_fpie, 0},
     {"fpic", TCC_OPTION_fpic, 0},
+    {"fno-pic", TCC_OPTION_fno_pic, 0},
     {"no-pie", TCC_OPTION_no_pie, 0},
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     {"mfloat-abi=", TCC_OPTION_mfloat_abi, TCC_OPTION_HAS_ARG | TCC_OPTION_NOSEP},
@@ -1886,7 +1898,10 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, opt_float_narrow), 0, "float-narrow"},
                                     {offsetof(TCCState, opt_inline_functions), 0, "inline-functions"},
                                     {offsetof(TCCState, opt_inline_small), 0, "inline-small-functions"},
+                                    {offsetof(TCCState, opt_inline_called_once), 0, "inline-functions-called-once"},
+                                    {offsetof(TCCState, opt_drop_unused_statics), 0, "drop-unused-statics"},
                                     {offsetof(TCCState, instrument_functions), 0, "instrument-functions"},
+                                    {offsetof(TCCState, module_local_calls), 0, "module-local-calls"},
                                     {0, 0, NULL}};
 
 static const FlagDef options_m[] = {{offsetof(TCCState, ms_bitfields), 0, "ms-bitfields"}, {0, 0, NULL}};
@@ -2252,6 +2267,15 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
     case TCC_OPTION_no_pie:
       s->no_pie = 1;
       break;
+    case TCC_OPTION_fno_pic:
+      /* Position-dependent code with absolute addressing, for code that is
+       * linked at a fixed address (a kernel): no GOT, no r9 data base, and r9
+       * becomes an ordinary allocatable register. */
+      s->pic = 0;
+      s->text_and_data_separation = 0;
+      s->sb_relative_got = 0;
+      s->share_rodata = 0;
+      break;
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
     case TCC_OPTION_mfloat_abi:
       if (!strcmp(optarg, "soft"))
@@ -2454,18 +2478,23 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
        * -O0 -- and because -O comes from a plain option scan, a command line
        * of `-O2 ... -Os` (toybox's) reset an explicit -O2 back to nothing.
        *
-       * They alias -O2.  There is no size tier yet: nothing in the pipeline
-       * trades speed for size, so the honest meaning of "optimize for size" is
-       * "everything we have", and the alias is where the size-preferring
-       * decisions get hung when they arrive.  Note that on today's numbers -O2
-       * is not the smallest output -- over tests/ir_tests -O1 is 511,724 bytes
-       * of .text against -O2's 540,146, because -O2 spends the difference on
-       * unrolling and full inlining -- so the first real -Os work is teaching
-       * this tier to skip those two. */
+       * They run the -O2 pipeline and set optimize_size, which the choices
+       * that trade code size for speed read: no word-alignment pads on branch
+       * targets, and a block copy past the largest copy stub stays a call.
+       * -Oz is -Os.  Inlining and unrolling are NOT cut back: on Zig's C both
+       * shrink the code (a lower -finline-limit, -fno-loop-unroll and -O1 are
+       * all larger), and gcc's own -O2 -> -Os gap there is mostly inlining
+       * tcc already does not do. */
       if (optarg[0] == 's' || optarg[0] == 'z')
+      {
         s->optimize = 2;
+        s->optimize_size = optarg[0] == 'z' ? 2 : 1;
+      }
       else
+      {
         s->optimize = atoi(optarg);
+        s->optimize_size = 0;
+      }
       /* -O1: scalar cleanup, cheap ARM addressing-mode fusion, constant/range
        * folding, loop rotation, and light inlining of explicitly-inline / tiny
        * functions — the same class of work GCC does at -O1.  The heavy tier
@@ -2492,6 +2521,8 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_float_narrow = 1;    /* Narrow double math to float when safe */
         s->opt_jump_threading = 1;  /* Jump threading optimization */
         s->opt_inline_small = 1;    /* Inline tiny static/inline functions (≤30 words) */
+        s->opt_inline_called_once = 1; /* Inline static functions called from one place, bodies deferred to TU end */
+        s->opt_drop_unused_statics = 1; /* Emit only the statics something live refers to */
         if (!s->opt_inline_limit_user)
           s->opt_inline_limit = 30;
       }

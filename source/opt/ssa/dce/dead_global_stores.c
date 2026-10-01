@@ -384,8 +384,11 @@ int dce_dead_global_stores(IRSSAOptCtx *ctx)
             pending[p].ref.off == r.off &&
             pending[p].ref.has_addr == r.has_addr &&
             (r.has_addr ? pending[p].ref.shndx == r.shndx : pending[p].ref.sym == r.sym)) {
-          ssa_opt_nop_instr(ctx, pending[p].idx);
-          changes++;
+          /* The overwritten store's value may be a volatile read. */
+          if (!dce_instr_reads_volatile(ir, &ir->compact_instructions[pending[p].idx])) {
+            ssa_opt_nop_instr(ctx, pending[p].idx);
+            changes++;
+          }
           pending[p] = pending[--npending];
         } else if (gs_overlaps(&pending[p].ref, &r)) {
           pending[p] = pending[--npending];

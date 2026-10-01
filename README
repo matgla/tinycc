@@ -158,13 +158,13 @@ Frequently used `./configure` options:
 |------|-------------|
 | `--enable-cross` | Build the ARMv8-M cross compiler (`armv8m-tcc`) |
 | `--enable-O0` … `--enable-O3`, `--enable-Os`, `--enable-Og` | Optimization level TCC itself is built with (`-O2` default) |
-| `--disable-asan` | **AddressSanitizer is ON by default**; disable it for fast or production builds |
+| `--enable-asan` | Build TinyCC with AddressSanitizer (off by default) |
 | `--enable-ubsan`, `--enable-lsan` | Additional sanitizers |
 | `--debug` | Include debug info in the resulting binaries |
 
 Example:
 ```bash
-./configure --enable-cross --disable-asan
+./configure --enable-cross
 make cross
 ```
 

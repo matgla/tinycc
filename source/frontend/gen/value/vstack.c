@@ -347,7 +347,8 @@ ST_FUNC Sym *get_sym_ref(CType *type, Section *sec, unsigned long offset, unsign
    * them.  Those IR instructions are later removed by DCE, but the
    * symbol must exist during compilation.  Under NODATA_WANTED the
    * caller passes size=0, so no section data is wasted. */
-  put_extern_sym2(sym, sec ? sec->sh_num : SHN_UNDEF, offset, size, 1);
+  if (!tcc_state->check_only) /* its IR is freed: nothing may name it */
+    put_extern_sym2(sym, sec ? sec->sh_num : SHN_UNDEF, offset, size, 1);
   return sym;
 }
 

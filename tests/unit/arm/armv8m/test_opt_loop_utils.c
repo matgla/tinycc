@@ -484,32 +484,46 @@ UT_TEST(test_unroll_register_body_three_iters)
   return 0;
 }
 
-/* A memory-carrying body (STORE [100]=V0) is no longer unrolled: cloning
- * stack/aggregate accesses could expose stale initializer values through the
- * later forwarding passes (bitfield packed-RMW fuzz class, seed 163176), so
- * collect_body_instructions rejects any memory op and the loop is left intact. */
-UT_TEST(test_unroll_store_body_blocks_unroll)
+/* STOREs "[100] = #imm" in order; fill vals[].  Returns the count. */
+static int collect_store_imm_values(TCCIRState *ir, int *vals, int max)
+{
+  int n = 0;
+  for (int i = 0; i < ir->next_instruction_index && n < max; i++)
+  {
+    if (utb_op(ir, i) != TCCIR_OP_STORE)
+      continue;
+    IROperand s = utb_src1(ir, i);
+    if (!irop_is_immediate(s))
+      continue;
+    vals[n++] = (int)irop_get_imm64_ex(ir, s);
+  }
+  return n;
+}
+
+/* A body that stores (STORE [100]=V0) unrolls: the copies write memory in
+ * the loop's order, the IV a constant in each. */
+UT_TEST(test_unroll_store_body_clones_in_order)
 {
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
   emit_unrollable_loop(ir, 0, 3, 1, utb_var(0, I32));
   IRLoop L = utb_loop(1, 1, 5, 0);
 
-  UT_ASSERT_EQ(try_unroll_loop_ex(ir, &L, NULL, 0), 0);
+  UT_ASSERT_EQ(try_unroll_loop_ex(ir, &L, NULL, 0), 1);
 
-  /* Loop control and the store body are untouched (no clones written). */
-  UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_ASSIGN); /* IV init */
-  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
-  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, 5), TCCIR_OP_JUMP);   /* back-edge intact */
+  int vals[8];
+  int n = collect_store_imm_values(ir, vals, 8);
+  UT_ASSERT_EQ(n, 3);
+  UT_ASSERT_EQ(vals[0], 0);
+  UT_ASSERT_EQ(vals[1], 1);
+  UT_ASSERT_EQ(vals[2], 2);
   utb_free(ir);
   return 0;
 }
 
-UT_TEST(test_unroll_store_body_used_after_blocks_unroll)
+UT_TEST(test_unroll_store_body_used_after_sets_final_iv)
 {
-  /* Even with a post-loop reader of V0, the memory body blocks the unroll --
-   * no clones, and no synthesized final-value ASSIGN V0=#3. */
+  /* A post-loop reader of V0 gets the final value ASSIGN V0=#3. */
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
   emit_unrollable_loop(ir, 0, 3, 1, utb_var(0, I32));
@@ -517,10 +531,8 @@ UT_TEST(test_unroll_store_body_used_after_blocks_unroll)
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_var(0, I32), UTB_NONE); /* 7 reads V0 */
   IRLoop L = utb_loop(1, 1, 5, 0);
 
-  UT_ASSERT_EQ(try_unroll_loop_ex(ir, &L, NULL, 0), 0);
+  UT_ASSERT_EQ(try_unroll_loop_ex(ir, &L, NULL, 0), 1);
 
-  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
-  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
   int found_final = 0;
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
@@ -532,22 +544,48 @@ UT_TEST(test_unroll_store_body_used_after_blocks_unroll)
         (int)irop_get_imm64_ex(ir, utb_src1(ir, i)) == 3)
       found_final = 1;
   }
-  UT_ASSERT(!found_final);
+  UT_ASSERT(found_final);
   utb_free(ir);
   return 0;
 }
 
-UT_TEST(test_unroll_store_body_single_iter_blocks_unroll)
+UT_TEST(test_unroll_store_body_single_iter)
 {
-  /* trip_count = 1 is irrelevant once the body carries memory -- still blocked. */
+  /* init=7, limit=8 -> 1 trip: one copy storing #7. */
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
-  emit_unrollable_loop(ir, 7, 8, 1, utb_var(0, I32)); /* init=7, limit=8 -> 1 trip */
+  emit_unrollable_loop(ir, 7, 8, 1, utb_var(0, I32));
+  IRLoop L = utb_loop(1, 1, 5, 0);
+
+  UT_ASSERT_EQ(try_unroll_loop_ex(ir, &L, NULL, 0), 1);
+  int vals[4];
+  UT_ASSERT_EQ(collect_store_imm_values(ir, vals, 4), 1);
+  UT_ASSERT_EQ(vals[0], 7);
+  utb_free(ir);
+  return 0;
+}
+
+/* A load bound to a VAR by STORE (`V1 <- T0*** [STORE]`, an inlined
+ * parameter) stays one multi-def TEMP in SSA: sound for one loop body, not
+ * for N straight-line copies (fuzz 308), so such a body keeps its loop. */
+UT_TEST(test_unroll_var_bound_load_blocks_unroll)
+{
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(0, I32), UTB_NONE);     /* 0 */
+  utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_var(0, I32), utb_imm(3, I32));        /* 1 */
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(6, I32), utb_imm(UT_GE, I32), UTB_NONE); /* 2 exit=6 */
+  IROperand deref = utb_temp(0, I32);
+  deref.is_lval = 1;
+  utb_emit(ir, TCCIR_OP_STORE, utb_var(1, I32), deref, UTB_NONE);                /* 3 V1 <- *T0 */
+  utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), utb_var(0, I32), utb_imm(1, I32)); /* 4 */
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE, UTB_NONE);              /* 5 */
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);               /* 6 */
   IRLoop L = utb_loop(1, 1, 5, 0);
 
   UT_ASSERT_EQ(try_unroll_loop_ex(ir, &L, NULL, 0), 0);
-  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_CMP);
   UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, 5), TCCIR_OP_JUMP);
   utb_free(ir);
   return 0;
 }
@@ -730,6 +768,7 @@ UT_TEST(test_transform_derived_iv_allows_address_slot_deref)
   div.use_idx = 4;
   div.shl_idx = 3;
   div.share_with = -1;
+  div.off_idx = -1;
 
   int out_ptr_vreg = 12345, out_idx_shift = 12345, out_postnop = 12345, out_stride_pos = 12345;
   int n_before = ir->next_instruction_index;
@@ -793,6 +832,7 @@ UT_TEST(test_transform_derived_iv_reduces_register_only_div)
   div.use_idx = 4;
   div.shl_idx = 3;
   div.share_with = -1;
+  div.off_idx = -1;
 
   int out_ptr_vreg = 12345, out_idx_shift = 12345, out_postnop = 12345, out_stride_pos = 12345;
 
@@ -858,6 +898,7 @@ UT_TEST(test_transform_derived_iv_shared_path_refused)
   div.use_idx = 0;
   div.shl_idx = -1;
   div.share_with = -1;
+  div.off_idx = -1;
 
   int ret = transform_derived_iv(ir, &L, &iv, &div, NULL, NULL, NULL, NULL, /*shared_ptr_vreg=*/5);
   UT_ASSERT_EQ(ret, 0);
@@ -1648,6 +1689,7 @@ UT_TEST(test_eliminate_iv_counter_pretest_only_rewrites_to_ptr_cmp)
   memset(&div, 0, sizeof div);
   div.stride = 4;
   div.share_with = -1;
+  div.off_idx = -1;
 
   int ptr_vreg = VR_TEMP(0);
   int ret = try_eliminate_iv_counter(ir, &L, &iv, &div, ptr_vreg, /*idx_shift=*/0);
@@ -1707,6 +1749,7 @@ UT_TEST(test_eliminate_iv_counter_other_use_blocks_elimination)
   memset(&div, 0, sizeof div);
   div.stride = 4;
   div.share_with = -1;
+  div.off_idx = -1;
 
   int n_before = ir->next_instruction_index;
   UT_ASSERT_EQ(try_eliminate_iv_counter(ir, &L, &iv, &div, VR_TEMP(0), 0), 0);
@@ -1742,6 +1785,7 @@ UT_TEST(test_eliminate_iv_counter_no_cmp_found_declines)
   memset(&div, 0, sizeof div);
   div.stride = 4;
   div.share_with = -1;
+  div.off_idx = -1;
 
   UT_ASSERT_EQ(try_eliminate_iv_counter(ir, &L, &iv, &div, VR_TEMP(0), 0), 0);
   utb_free(ir);

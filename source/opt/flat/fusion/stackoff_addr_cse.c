@@ -174,8 +174,11 @@ int tcc_ir_opt_stackoff_addr_cse(TCCIRState *ir)
  * ------------------------------------------------------------------------- */
 /* A prologue `ASSIGN Tn <- Addr[StackLoc[off]]` whose Tn is never redefined,
  * or -1.  The single-definition scan covers the whole function, not just the
- * prologue: a later write to Tn would make the reuse read a different address. */
-static int32_t sib_find_prologue_addr_temp(TCCIRState *ir, int prologue_end, int32_t off)
+ * prologue: a later write to Tn would make the reuse read a different address.
+ * `*def_idx` receives the ASSIGN's index -- the prologue dominates the whole
+ * function, but only from that point on, so a use AHEAD of it in the prologue
+ * is not covered and the caller must leave it alone. */
+static int32_t sib_find_prologue_addr_temp(TCCIRState *ir, int prologue_end, int32_t off, int *def_idx)
 {
   int n = ir->next_instruction_index;
   for (int i = 0; i < prologue_end; i++)
@@ -212,7 +215,10 @@ static int32_t sib_find_prologue_addr_temp(TCCIRState *ir, int prologue_end, int
         defs++;
     }
     if (defs == 1)
+    {
+      *def_idx = i;
       return vr;
+    }
   }
   return -1;
 }
@@ -229,6 +235,7 @@ int tcc_ir_opt_stackoff_indexed_base_cse(TCCIRState *ir)
     int count;
     int32_t hoisted_vreg;
     int32_t existing_vreg;   /* prologue TEMP already holding this address, or -1 */
+    int existing_def;        /* index of that TEMP's ASSIGN; uses before it stay raw */
     IROperand sample;
   } slots[SIB_MAX_OFFSETS];
   int nslots = 0;
@@ -280,7 +287,9 @@ int tcc_ir_opt_stackoff_indexed_base_cse(TCCIRState *ir)
       slots[slot].offset = off;
       slots[slot].count = 0;
       slots[slot].hoisted_vreg = -1;
-      slots[slot].existing_vreg = sib_find_prologue_addr_temp(ir, prologue_end, off);
+      slots[slot].existing_def = -1;
+      slots[slot].existing_vreg =
+          sib_find_prologue_addr_temp(ir, prologue_end, off, &slots[slot].existing_def);
       slots[slot].sample = base;
     }
     slots[slot].count++;
@@ -323,6 +332,14 @@ int tcc_ir_opt_stackoff_indexed_base_cse(TCCIRState *ir)
     for (int s = 0; s < nslots; s++)
       if (slots[s].offset == base.u.imm32) { slot = s; break; }
     if (slot < 0 || slots[slot].hoisted_vreg < 0)
+      continue;
+    /* A reused prologue temp is only defined from its ASSIGN onwards.  The
+     * prologue is one straight-line block, so an access EARLIER in it would
+     * read the temp before anything wrote it -- it keeps its own raw base
+     * (agg_deep fuzz seed 1637: `arr[i]` read at 0054 rewritten to a temp
+     * assigned at 0071, which at -O2 loaded through whatever the caller left
+     * in r4). */
+    if (slots[slot].existing_vreg >= 0 && i < slots[slot].existing_def)
       continue;
     IROperand rep = irop_make_vreg(slots[slot].hoisted_vreg, base.btype);
     rep.is_unsigned = base.is_unsigned;

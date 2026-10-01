@@ -60,7 +60,7 @@ int get_temp_local_var(int size, int align, int *vr_out)
       return temp_var->location;
     }
   }
-  loc = (loc - size) & -align;
+  loc = tcc_ir_frame_alloc(loc, size, -align);
   if (nb_temp_local_vars < MAX_TEMP_LOCAL_VARIABLE_NUMBER)
   {
     temp_var = &arr_temp_local_vars[nb_temp_local_vars];
@@ -98,13 +98,13 @@ ST_FUNC void gaddrof(void)
     Sym *s;
     for (s = local_stack; s; s = s->prev)
     {
-      if (!s->const_init_data || !s->const_init_valid)
+      if (!s->facts || !s->facts->const_init_data || !s->facts->const_init_valid)
         continue;
-      if (s->const_init_in_progress)
+      if (s->facts->const_init_in_progress)
         continue;
       if ((int)s->c == off)
       {
-        s->const_init_valid = 0;
+        s->facts->const_init_valid = 0;
         break;
       }
     }
@@ -513,7 +513,7 @@ ST_FUNC int gv(int rc)
       init_params p = {rodata_section};
       unsigned long offset;
       size = type_size(&vtop->type, &align);
-      if (NODATA_WANTED)
+      if (NOSTATIC_WANTED)
         size = 0, align = 1;
       offset = section_add(p.sec, size, align);
       vpush_ref(&vtop->type, p.sec, offset, size);

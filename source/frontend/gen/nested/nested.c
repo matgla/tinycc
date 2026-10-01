@@ -43,7 +43,9 @@ static NestedFunc *find_nested_func_by_sym(Sym *sym)
 void setup_nested_func_trampoline(Sym *s)
 {
   NestedFunc *nf = find_nested_func_by_sym(s);
-  if (!nf)
+  /* A body parsed for its diagnostics only (check_only) has no code to need
+   * a trampoline, and the chain slot and trampoline symbols would outlive it. */
+  if (!nf || tcc_state->check_only)
     return;
 
   nf->trampoline_needed = 1;
@@ -157,6 +159,7 @@ typedef struct
   int ind;
   int rsym;
   int func_ind;
+  int func_align_pad;
   const char *funcname;
   CType func_vt;
   int func_var;
@@ -176,6 +179,25 @@ typedef struct
   /* Temp local vars array */
   struct temp_local_variable tmp_vars[MAX_TEMP_LOCAL_VARIABLE_NUMBER];
 } ParentSavedState;
+
+/* The stand-in Syms tok_identifier makes for each reference to a captured
+ * variable sit on no scope stack, so no sym_pop frees the facts a store
+ * records on them.  Chained through prev (unused off a stack) and dropped once
+ * the body is compiled; the Syms stay, IR may still point at them. */
+static Sym *captured_var_syms;
+
+void nested_track_captured_sym(Sym *s)
+{
+  s->prev = captured_var_syms;
+  captured_var_syms = s;
+}
+
+static void free_captured_sym_facts(void)
+{
+  for (Sym *s = captured_var_syms; s; s = s->prev)
+    sym_free_facts(s);
+  captured_var_syms = NULL;
+}
 
 /* Compile all nested functions defined inside a parent function */
 void compile_nested_functions(Sym *parent_sym)
@@ -199,6 +221,7 @@ void compile_nested_functions(Sym *parent_sym)
   saved.ind = ind;
   saved.rsym = rsym;
   saved.func_ind = func_ind;
+  saved.func_align_pad = func_align_pad;
   saved.funcname = funcname;
   saved.func_vt = func_vt;
   saved.func_var = func_var;
@@ -316,6 +339,7 @@ void compile_nested_functions(Sym *parent_sym)
     }
 
     gen_function(nf->sym);
+    free_captured_sym_facts();
 
     /* Remove parent addr-taken labels from hash table after compilation. */
     for (int j = 0; j < nf->nb_addr_labels; j++)
@@ -383,6 +407,7 @@ void compile_nested_functions(Sym *parent_sym)
      the parent's codegen will emit at the CURRENT ind (after nested funcs) */
   rsym = saved.rsym;
   func_ind = saved.func_ind;
+  func_align_pad = saved.func_align_pad;
   funcname = saved.funcname;
   func_vt = saved.func_vt;
   func_var = saved.func_var;

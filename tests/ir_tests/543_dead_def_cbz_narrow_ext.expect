@@ -1,0 +1,16 @@
+two 299566379 299892248 1383526589
+u8[0] sb=127 sh=127 ub=127
+u8[1] sb=-128 sh=128 ub=128
+u8[2] sb=-1 sh=255 ub=255
+u8[3] sb=1 sh=1 ub=1
+s16[0] uh=65534 sb=-2 sh=-2
+s16[1] uh=4660 sb=52 sh=4660
+s16[2] uh=32768 sb=0 sh=-32768
+u16[0] ub=128
+u16[1] ub=127
+chain(0) = 0 calls=0
+chain(1) = 107 calls=0
+chain(2) = 7 calls=1
+chain(3) = 7 calls=0
+chain(4) = 9 calls=1
+chain(5) = 9 calls=0

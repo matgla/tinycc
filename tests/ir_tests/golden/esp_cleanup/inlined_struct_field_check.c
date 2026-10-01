@@ -15,7 +15,12 @@
  * a foldable consumer -- the original `return x->i == 0 && x->j == 5;` -- the
  * earlier propagation group collapses the whole diamond to `return 1` and
  * entry_store arrives with nothing left to forward, so the pass under test
- * never executes.  An opaque sink keeps the struct reads alive that far. */
+ * never executes.  An opaque sink keeps the struct reads alive that far.
+ *
+ * The re-store of `a.i` keeps `a` a stack object.  A local initialised with
+ * constants and never written again is promoted to a read-only table
+ * (const_local_table), after which the reads fold to #8 before entry_store
+ * runs -- and the pass under test never executes either. */
 struct A { int i; int j; };
 
 extern int sink(int);
@@ -26,5 +31,6 @@ static int add_fields(struct A *x) {
 
 int main(void) {
     struct A a = { .i = 3, .j = 5 };
+    a.i = 3;
     return sink(add_fields(&a));
 }

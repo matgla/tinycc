@@ -301,6 +301,18 @@ void tcc_gen_machine_smull_mop(MachineOperand src1, MachineOperand src2, Machine
   cgstub_record("smull_mop", (TccIrOp)-1, dest, src1, src2);
 }
 
+/* 0: the unit build never fuses UMAAL, so its IR expectations stay put. */
+int tcc_machine_has_umaal(void)
+{
+  return 0;
+}
+
+void tcc_gen_machine_umaal_mop(MachineOperand src1, MachineOperand src2, MachineOperand accum, MachineOperand dest)
+{
+  (void)accum;
+  cgstub_record("umaal_mop", (TccIrOp)-1, dest, src1, src2);
+}
+
 int tcc_gen_machine_mlal_accum_mop(MachineOperand src1, MachineOperand src2, MachineOperand accum,
                                    MachineOperand dest, int is_signed)
 {
@@ -437,6 +449,37 @@ void tcc_gen_machine_spill_block_copy(int32_t src_spill_off, int32_t dst_spill_o
   cgstub_push("spill_block_copy", (TccIrOp)-1, MACH_OP_NONE, -1, MACH_OP_NONE, -1, MACH_OP_NONE, -1, nwords, 0);
 }
 
+/* Conservative: every call reloads R9, as before the reload analysis. */
+int tcc_gen_machine_calls_reload_r9(struct TCCIRState *ir)
+{
+  (void)ir;
+  return 1;
+}
+
+/* No free-register plan in the stub: callers fall back to their other paths. */
+int tcc_gen_machine_spill_block_copy_free(int32_t src_spill_off, int32_t dst_spill_off, int nwords, uint32_t also_free)
+{
+  (void)src_spill_off;
+  (void)dst_spill_off;
+  (void)nwords;
+  (void)also_free;
+  return 0;
+}
+
+/* Likewise: the stub never fuses, so the individual accesses are emitted. */
+int tcc_gen_machine_reg_block_copy(int src_base, int32_t src_off, int dst_base, int32_t dst_off, const int *regs,
+                                   int nwords, int end_idx)
+{
+  (void)end_idx;
+  (void)src_base;
+  (void)src_off;
+  (void)dst_base;
+  (void)dst_off;
+  (void)regs;
+  (void)nwords;
+  return 0;
+}
+
 /* ============================================================================
  * Control flow / jumps / switch
  * ============================================================================ */
@@ -475,6 +518,12 @@ int tcc_gen_machine_pool_flushes_total(void)
 int tcc_gen_machine_pool_entries_total(void)
 {
   return 0;
+}
+
+void tcc_gen_machine_align_branch_target(int align)
+{
+  (void)align;
+  /* No instruction stream here, so nothing to pad. */
 }
 
 int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx)
@@ -629,6 +678,44 @@ void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int stack_siz
   cgstub_push("prolog", (TccIrOp)-1, MACH_OP_NONE, -1, MACH_OP_NONE, -1, MACH_OP_NONE, -1, leaffunc, stack_size);
 }
 
+/* -Os outliner (thumb-outline.c): never on here. */
+int tcc_gen_machine_prolog_saved_lr(void)
+{
+  return 0;
+}
+int tcc_gen_machine_outline_enabled(void)
+{
+  return 0;
+}
+void tcc_gen_machine_outline_capture_begin(void)
+{
+}
+void tcc_gen_machine_outline_capture_end(void)
+{
+}
+int tcc_gen_machine_outline_analyze(struct TCCIRState *ir, const uint32_t *map, int end)
+{
+  (void)ir;
+  (void)map;
+  (void)end;
+  return 0;
+}
+void tcc_gen_machine_outline_op_end(int i)
+{
+  (void)i;
+}
+void tcc_gen_machine_outline_op_start(int i)
+{
+  (void)i;
+}
+int tcc_gen_machine_outline_suppressing(void)
+{
+  return 0;
+}
+void tcc_gen_machine_outline_function_end(void)
+{
+}
+
 void tcc_gen_machine_epilog(int leaffunc)
 {
   cgstub_push("epilog", (TccIrOp)-1, MACH_OP_NONE, -1, MACH_OP_NONE, -1, MACH_OP_NONE, -1, leaffunc, 0);
@@ -772,6 +859,21 @@ void tcc_gen_machine_strldr_cache_set_enabled(int enabled)
   cgstub_record("strldr_cache_set_enabled", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
 }
 
+void tcc_gen_machine_str_elide_set_enabled(int enabled)
+{
+  (void)enabled;
+}
+
+void tcc_gen_machine_slot_self_copy_set_enabled(int enabled)
+{
+  (void)enabled;
+}
+
+void tcc_gen_machine_frame_word_pair_set_enabled(int enabled)
+{
+  (void)enabled;
+}
+
 void tcc_gen_machine_imm_cache_reset(void)
 {
   cgstub_record("imm_cache_reset", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
@@ -840,6 +942,11 @@ void tcc_gen_machine_nl_longjmp_mop(MachineOperand buf)
 void tcc_gen_machine_builtin_apply_args_mop(MachineOperand dest)
 {
   cgstub_record("builtin_apply_args_mop", (TccIrOp)-1, dest, CGSTUB_NO_OP, CGSTUB_NO_OP);
+}
+
+void tcc_gen_machine_return_address_mop(MachineOperand dest)
+{
+  cgstub_record("return_address_mop", (TccIrOp)-1, dest, CGSTUB_NO_OP, CGSTUB_NO_OP);
 }
 
 void tcc_gen_machine_builtin_apply_mop(MachineOperand fn, MachineOperand args, MachineOperand dest)

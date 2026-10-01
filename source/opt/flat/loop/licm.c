@@ -1377,7 +1377,98 @@ static void licm_move_jump_target_off_nop(TCCIRState *ir, int nop_pos)
   ir->compact_instructions[nop_pos].is_jump_target = 0;
 }
 
-static int licm_is_direct_var_read(TCCIRState *ir, IROperand op)
+/* A set of vregs, one bit per (type, position), for facts the dom-LICM
+ * detection phase asks about again and again while the IR stands still: which
+ * variables have their address taken anywhere, which vregs are written outside
+ * the loop.  Each was a walk of the function per candidate -- 1.7 G
+ * instructions of address-taken scans on Zig's zig.c at -O2.  A set is built
+ * on first use for a loop and dropped with it; the hoisting that follows
+ * detection is what changes the IR. */
+typedef struct LicmVregSet
+{
+  uint8_t *bits; /* NULL until built */
+  int stride;    /* positions per type */
+} LicmVregSet;
+
+/* Index of an ordinary (type << 28 | position) vreg in a set of `stride`, or
+ * -1 for any other encoding, which the caller answers the slow way. */
+static int licm_vset_key(int32_t vr, int stride)
+{
+  if (vr < 0)
+    return -1;
+  int t = TCCIR_DECODE_VREG_TYPE(vr), p = TCCIR_DECODE_VREG_POSITION(vr);
+  if (t < 0 || t > 3 || vr != TCCIR_ENCODE_VREG(t, p) || p >= stride)
+    return -1;
+  return t * stride + p;
+}
+
+static int licm_max_vreg_pos(TCCIRState *ir)
+{
+  int max = -1;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    IROperand ops[4];
+    int m = 0;
+    if (irop_config[q->op].has_dest)
+      ops[m++] = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_src1)
+      ops[m++] = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2)
+      ops[m++] = tcc_ir_op_get_src2(ir, q);
+    if (q->op == TCCIR_OP_MLA)
+      ops[m++] = tcc_ir_op_get_accum(ir, q);
+    for (int k = 0; k < m; k++)
+    {
+      int32_t vr = irop_get_vreg(ops[k]);
+      if (vr >= 0 && TCCIR_DECODE_VREG_POSITION(vr) > max)
+        max = TCCIR_DECODE_VREG_POSITION(vr);
+    }
+  }
+  return max;
+}
+
+/* vreg_addr_taken_anywhere() for every vreg at once. */
+static void licm_addr_taken_set_build(TCCIRState *ir, LicmVregSet *set)
+{
+  set->stride = licm_max_vreg_pos(ir) + 1;
+  set->bits = tcc_mallocz((size_t)4 * set->stride + 1);
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    IROperand srcs[3];
+    int nsrcs = 0;
+    if (irop_config[q->op].has_src1)
+      srcs[nsrcs++] = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2)
+      srcs[nsrcs++] = tcc_ir_op_get_src2(ir, q);
+    if (q->op == TCCIR_OP_MLA)
+      srcs[nsrcs++] = tcc_ir_op_get_accum(ir, q);
+    for (int k = 0; k < nsrcs; k++)
+    {
+      int key;
+      if (irop_get_tag(srcs[k]) == IROP_TAG_STACKOFF && !srcs[k].is_lval &&
+          (key = licm_vset_key(irop_get_vreg(srcs[k]), set->stride)) >= 0)
+        set->bits[key] = 1;
+    }
+  }
+}
+
+static int licm_addr_taken(TCCIRState *ir, LicmVregSet *set, int32_t vr)
+{
+  if (!set->bits)
+    licm_addr_taken_set_build(ir, set);
+  int key = licm_vset_key(vr, set->stride);
+  if (key < 0)
+    return vreg_addr_taken_anywhere(ir, vr);
+  return set->bits[key];
+}
+
+static int licm_is_direct_var_read(TCCIRState *ir, LicmVregSet *addr_taken, IROperand op)
 {
   int32_t vr = irop_get_vreg(op);
   if (vr < 0 || !op.is_local || op.is_llocal)
@@ -1386,7 +1477,28 @@ static int licm_is_direct_var_read(TCCIRState *ir, IROperand op)
     return 0;
   if (irop_access_is_volatile(op))
     return 0;
-  return !vreg_addr_taken_anywhere(ir, vr);
+  return !licm_addr_taken(ir, addr_taken, vr);
+}
+
+/* The dests of every instruction in the blocks outside the loop. */
+static void licm_outside_defs_build(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop, LicmVregSet *set)
+{
+  set->stride = licm_max_vreg_pos(ir) + 1;
+  set->bits = tcc_mallocz((size_t)4 * set->stride + 1);
+  for (int obi = 0; obi < cfg->num_blocks; obi++)
+  {
+    if (in_loop[obi])
+      continue;
+    for (int oi2 = cfg->blocks[obi].start_idx; oi2 < cfg->blocks[obi].end_idx; oi2++)
+    {
+      IRQuadCompact *oq = &ir->compact_instructions[oi2];
+      if (oq->op == TCCIR_OP_NOP || !irop_config[oq->op].has_dest)
+        continue;
+      int key = licm_vset_key(irop_get_vreg(tcc_ir_op_get_dest(ir, oq)), set->stride);
+      if (key >= 0)
+        set->bits[key] = 1;
+    }
+  }
 }
 
 /* A direct read of a named local's slot.  `Addr[StackLoc[off]]` (is_lval == 0)
@@ -2016,6 +2128,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
 
           uint8_t *is_invariant = tcc_mallocz(ir->next_instruction_index);
           LicmSlotCtx slot_ctx;
+          LicmVregSet addr_taken = {0}, outside_defs = {0};
           int inv_changed = 1;
           slot_ctx.writes_frame = -1;
           slot_ctx.n = 0;
@@ -2052,7 +2165,12 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                       continue;
                     /* Check if vreg is also defined outside the loop */
                     int outside_def = 0;
-                    for (int obi = 0; obi < cfg->num_blocks && !outside_def; obi++) {
+                    if (!outside_defs.bits)
+                      licm_outside_defs_build(ir, cfg, in_loop, &outside_defs);
+                    int od_key = licm_vset_key(dvr, outside_defs.stride);
+                    if (od_key >= 0)
+                      outside_def = outside_defs.bits[od_key];
+                    for (int obi = 0; od_key < 0 && obi < cfg->num_blocks && !outside_def; obi++) {
                       if (in_loop[obi])
                         continue;
                       for (int oi2 = cfg->blocks[obi].start_idx; oi2 < cfg->blocks[obi].end_idx; oi2++) {
@@ -2076,7 +2194,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                      * side effect across iterations.  This mirrors the guard
                      * is_operand_loop_invariant_ex already applies on the READ
                      * side (docs/bugs.md #7). */
-                    if (vreg_addr_taken_anywhere(ir, dvr) &&
+                    if (licm_addr_taken(ir, &addr_taken, dvr) &&
                         cfg_loop_may_clobber_memory(ir, cfg, in_loop))
                       continue;
                   }
@@ -2097,7 +2215,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                     if (licm_is_direct_slot_read(s) &&
                         licm_slot_read_is_invariant(ir, cfg, in_loop, s, &slot_ctx))
                       continue;
-                    if (licm_is_direct_var_read(ir, s))
+                    if (licm_is_direct_var_read(ir, &addr_taken, s))
                       continue; /* named local, address never taken — def_count covers it */
                     has_deref = 1;
                   }
@@ -2162,6 +2280,9 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               }
             }
           }
+
+          tcc_free(addr_taken.bits);
+          tcc_free(outside_defs.bits);
 
           /* Find exit blocks */
           uint8_t *is_exit = tcc_mallocz(cfg->num_blocks);

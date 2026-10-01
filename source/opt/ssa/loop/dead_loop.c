@@ -667,13 +667,8 @@ static int rewrite_loop_exit_phis_guarded(IRSSAOptCtx *ctx, IRLoop *loop, LoopEn
     int p = TCCIR_DECODE_VREG_POSITION(cands[i].new_vr);
     if (p > max_pos) max_pos = p;
   }
-  if (max_pos >= ctx->vinfo_cap) {
-    int new_cap = max_pos + 16;
-    ctx->vinfo = tcc_realloc(ctx->vinfo, new_cap * sizeof(IRSSAVregInfo));
-    memset(&ctx->vinfo[ctx->vinfo_cap], 0,
-           (new_cap - ctx->vinfo_cap) * sizeof(IRSSAVregInfo));
-    ctx->vinfo_cap = new_cap;
-  }
+  if (max_pos >= ctx->vinfo_cap)
+    ssa_opt_vinfo_grow(ctx, max_pos + 16);
 
   /* Capture the exit target before clobbering the JUMPIF. */
   IRQuadCompact *jpf_q = &ir->compact_instructions[info->jpf_idx];

@@ -70,7 +70,10 @@ OPT_GEN_FLAT(indexed_chain, TCCIR_OP_LOAD_INDEXED)
     return 0;
   }
 
-  if (new_base.is_local || new_base.is_llocal)
+  /* An lval operand is a memory read: `T <- P***DEREF*** ADD #k` adds k to the
+   * value stored at P, not to P.  Folding it would drop that load and address
+   * P + k -- `l.ptr[1].f` became a read of the frame slot `&l + 2096`. */
+  if (new_base.is_local || new_base.is_llocal || new_base.is_lval)
     return 0;
 
   long long imm_total = (long long)imm1 + imm2;
@@ -80,7 +83,6 @@ OPT_GEN_FLAT(indexed_chain, TCCIR_OP_LOAD_INDEXED)
   if (!ir_xform_same_block(ir, add_idx, i))
     return 0;
 
-  new_base.is_lval = 0;
   new_base.btype = base_op.btype;
   /* The chained base addresses the same object: keep its access marks, so the
    * 64-bit lowering stays off LDRD/STRD and a volatile access stays visible. */

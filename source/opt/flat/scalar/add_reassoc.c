@@ -132,6 +132,12 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
       IROperand def_src2 = tcc_ir_op_get_src2(ir, def_q);
       if (!irop_is_immediate(def_src2))
         continue;
+      /* A signed add is taken not to overflow (ssa:cmp_offset_fold folds
+       * `x + K < x` on it).  Absorbing an unsigned, wrapping, inner add would
+       * extend that to the whole sum: pr55137's `(int)(x + 1U) + 1 < (int)x`
+       * became `x + 2 < x`, folded false, yet x = INT_MAX gives true. */
+      if (tcc_ir_op_get_dest(ir, def_q).is_unsigned && !tcc_ir_op_get_dest(ir, q).is_unsigned)
+        continue;
       def_src1 = tcc_ir_op_get_src1(ir, def_q);
       int64_t c1 = irop_get_imm64_ex(ir, def_src2);
       eff_c1 = (def_q->op == TCCIR_OP_SUB) ? -c1 : c1;

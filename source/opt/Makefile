@@ -62,7 +62,8 @@ CORE_OPT_HDRS = \
 RA_OPT_SRC = \
 	source/opt/ra/const_branch_fold.c \
 	source/opt/ra/incomplete_calls.c \
-	source/opt/ra/phi_const_chain.c
+	source/opt/ra/phi_const_chain.c \
+	source/opt/ra/umaal_fusion.c
 
 $(X)source/opt/ra/%.o: source/opt/ra/%.c $(CORE_OPT_HDRS) source/ir/regalloc.h
 	@mkdir -p $(dir $@)
@@ -90,7 +91,7 @@ OPT_SRC = \
 	$(SSA_OPT_SRC) \
 	$(FLAT_OPT_SRC)
 
-OPT_OBJ = $(patsubst %.c,$(X)%.o,$(OPT_SRC))
+OPT_OBJ = $(call lib-objs,opt,$(OPT_SRC))
 OPT_LIB = $(X)source/opt/libopt.a
 
 $(OPT_LIB): $(OPT_OBJ)

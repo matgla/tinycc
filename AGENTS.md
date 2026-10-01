@@ -17,7 +17,7 @@ library).
 
 ```bash
 # One-time setup
-./configure              # AddressSanitizer is ON by default; ./configure --disable-asan for fast/production builds
+./configure              # AddressSanitizer is off; ./configure --enable-asan for a sanitized build
 make download-gcc-tests  # optional: sparse-fetch GCC torture tests (~16 MB, not the full gcc repo)
 
 # Build ARMv8-M cross compiler
@@ -67,9 +67,10 @@ C Source → Preprocessor (source/frontend/tccpp.c)
          → Parser + type checker (source/frontend/gen/)
          → IR generation (source/ir/tccir.h, source/ir/gen/)
          → IR optimizations (source/opt/)
-         → Register allocation (source/machine/tccls.c + source/ir/regalloc.c)
-         → Thumb-2 code gen (source/backend/arch/arm/thumb/arm-thumb-gen.c)
-         → ELF output (source/obj/tccelf.c, source/obj/tccld.c)
+         → Register allocation (source/machine/tccls.c + source/ir/regalloc*.c)
+         → Thumb-2 code gen (source/backend/arch/arm/thumb/arm-thumb-gen.c and
+           arm-thumb-{emit,alu,mem,fp,frame,call}.c, sharing arm-thumb-gen.h)
+         → ELF output (source/obj/tccelf*.c, shared tccelf_priv.h; source/obj/tccld.c)
 ```
 
 ## Source Tree
@@ -96,17 +97,29 @@ libraries into `armv8m-tcc`. The repo root holds only build inputs
 | `source/backend/` | `libarm.a`, `libgenerators.a` | `arch/arm/` (+ `thumb/`, `fpu/`) and the generic `generators/` |
 
 The module libraries are linked `--whole-archive`. That is load-bearing, not
-cosmetic: several TUs are referenced by nothing (the gdb pretty-printers, opt
-passes not yet wired into the pipeline table), and an ordinary archive link
-drops them silently — 53 symbols and 67 KB of `.text` on the first attempt.
+cosmetic: several TUs are referenced by nothing (the gdb pretty-printers, the
+pass registry), and an ordinary archive link drops them silently — 53 symbols and 67 KB of `.text` on the first attempt.
 `ARCH_LIB` deliberately stays outside the group so its orphaned members keep
 being dropped as before.
 
 Adding a module: create `source/<name>/` with a `Makefile` defining
-`<NAME>_INC` / `<NAME>_SRC` / `<NAME>_HDRS`, an object rule, and a
+`<NAME>_INC` / `<NAME>_SRC` / `<NAME>_HDRS`, an object rule,
+`<NAME>_OBJ = $(call lib-objs,<name>,$(<NAME>_SRC))`, and a
 `$(<NAME>_LIB): $(<NAME>_OBJ)` rule whose recipe is `$(ar-lib)`. Then add the
 `include` line and the `_INC` / `_LIB` / `_SRC` references to the top-level
 `Makefile`. Include order matters — see the comment above the include block.
+
+**Unity build (default).** The library sources compile as ~30 grouped TUs
+listed in `source/unity/` (`unity.mk` + one `.c` per group), not one TU per
+file: every file includes `tcc.h`, and re-reading it 360 times was a fifth of an
+-O2 self-compile. `scripts/gen_unity.py` writes those files; it keeps a file
+on its own when grouping could change its meaning (it redefines a header macro,
+or it is over 6000 lines) and never groups files whose file-scope names clash.
+After adding, removing or renaming a `.c` file, or adding a file-scope
+`static`/macro, run `make unity` (CI runs `scripts/gen_unity.py --check`). A
+file the manifest does not know yet still builds, as its own TU; a file it
+lists that no longer builds is a make error. `./configure --disable-unity` or
+`make UNITY=no` goes back to one TU per file.
 
 ## Code Architecture
 
@@ -120,7 +133,7 @@ Public IR interface is `source/ir/tccir.h`.
 | `source/ir/gen/` | IR construction and manipulation (the former `ir/core.c`) |
 | `source/ir/gen/live.c` | Liveness analysis for register allocation |
 | `source/ir/codegen.c` | Central dispatch: unified two-pass loop (dry-run + real-run) routing IR ops to backend `_mop` handlers |
-| `source/ir/regalloc.c` | SSA register allocator, parameterized by `RegAllocTarget` |
+| `source/ir/regalloc*.c` | SSA register allocator, parameterized by `RegAllocTarget` (intervals, `_scan`, `_phi`, `_entry`, `_post`; shared `regalloc_priv.h`) |
 | `source/ir/vreg.c` | Virtual register management |
 | `source/ir/stack.c` | Stack frame layout |
 
@@ -284,7 +297,7 @@ switch) for a real A/B. See "Re-checking only the seeds that failed" in
 
 **New IR instruction:**
 1. Add opcode to `TccIrOp` in `tccir.h`
-2. Add lowering in `arm-thumb-gen.c`
+2. Add lowering in the matching `arm-thumb-{alu,mem,fp,frame,call}.c`
 3. Add test in `tests/ir_tests/`
 
 **New assembly instruction:**

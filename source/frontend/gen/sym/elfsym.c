@@ -181,6 +181,8 @@ ST_FUNC void put_extern_sym2(Sym *sym, int sh_num, addr_t value, unsigned long s
 
 ST_FUNC void put_extern_sym(Sym *sym, Section *s, addr_t value, unsigned long size)
 {
+  if (tcc_state->check_only)
+    return;
   if (nocode_wanted && (NODATA_WANTED || (s && s == cur_text_section)))
     return;
   put_extern_sym2(sym, s ? s->sh_num : SHN_UNDEF, value, size, 1);
@@ -191,7 +193,7 @@ ST_FUNC void greloca(Section *s, Sym *sym, unsigned long offset, int type, addr_
 {
   int c = 0;
 
-  if (nocode_wanted && s == cur_text_section)
+  if (tcc_state->check_only || (nocode_wanted && s == cur_text_section))
     return;
 
   if (sym)

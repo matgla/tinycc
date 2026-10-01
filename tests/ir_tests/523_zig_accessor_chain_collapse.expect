@@ -1,0 +1,10 @@
+slice2 20 0 3 5
+slice1 0 3 5
+fields_seen 3 115
+item 0 3 100
+item 2 5 122
+item 4 7 144
+keys 3413819844
+post_inc_store 126
+clear_pairs 0 0
+loads 45387 37

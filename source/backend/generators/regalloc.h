@@ -26,6 +26,7 @@
  * ir->leaffunc and ir->tail_call_only.  Backend property consumed by
  * prologue/epilogue generation. */
 void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var);
+void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym);
 
 /* Run the full register-allocation + codegen-prep tail: RA setup, SSA
  * regalloc, post-RA micro-opts, jump threading, register coalescing, final

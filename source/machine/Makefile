@@ -17,7 +17,7 @@ MACHINE_HDRS = \
 	source/machine/tccmachine.h \
 	source/machine/tcc_target.h
 
-MACHINE_OBJ = $(patsubst %.c,$(X)%.o,$(MACHINE_SRC))
+MACHINE_OBJ = $(call lib-objs,machine,$(MACHINE_SRC))
 MACHINE_LIB = $(X)source/machine/libmachine.a
 
 $(X)source/machine/%.o: source/machine/%.c $(MACHINE_HDRS) $(TCC_CORE_DEPS)

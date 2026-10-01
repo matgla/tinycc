@@ -87,6 +87,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/ssa/loop/loop_unroll.c \
 	$(TOP)/source/opt/ssa/loop/iv_strength_reduction.c \
 	$(TOP)/source/opt/ssa/loop/decrement_to_zero.c \
+	$(TOP)/source/opt/ssa/loop/loop_bottom_test.c \
 	$(TOP)/source/frontend/svalue.c \
 	$(TOP)/source/backend/arch/arm/arm.c \
 	$(TOP)/source/backend/arch/arm/thumb/thumb.c \
@@ -133,7 +134,6 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/util/vreg_query.c \
 	$(TOP)/source/opt/util/xform.c \
 	$(TOP)/source/opt/util/ir_insert.c \
-	$(TOP)/source/opt/flat/scalar/neg_chain_cse.c \
 	$(TOP)/source/opt/flat/scalar/known_bits.c \
 	$(TOP)/source/opt/flat/scalar/const_prop_tmp.c \
 	$(TOP)/source/opt/flat/scalar/value_tracking.c \
@@ -142,6 +142,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/memory/dse.c \
 	$(TOP)/source/opt/flat/memory/var_store_elim.c \
 	$(TOP)/source/opt/flat/memory/entry_store_prop.c \
+	$(TOP)/source/opt/flat/memory/sret_nrvo.c \
 	$(TOP)/source/opt/flat/memory/sl_forward.c \
 	$(TOP)/source/opt/flat/memory/dead_local_slot.c \
 	$(TOP)/source/opt/flat/memory/dead_temp_local.c \
@@ -150,13 +151,10 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/memory/byte_store_merge.c \
 	$(TOP)/source/opt/flat/memory/mem_inline.c \
 	$(TOP)/source/opt/ssa/memory/diamond_store_fwd.c \
-	$(TOP)/source/opt/flat/scalar/branch_fold.c \
 	$(TOP)/source/opt/flat/scalar/stack_bool_diamond.c \
 	$(TOP)/source/opt/flat/scalar/global_init_prop.c \
 	$(TOP)/source/opt/flat/scalar/symref_const_prop.c \
-	$(TOP)/source/opt/flat/scalar/complex_const_param_fold.c \
 	$(TOP)/source/opt/flat/scalar/stack_addr_fold.c \
-	$(TOP)/source/opt/flat/scalar/single_value_tmp.c \
 	$(TOP)/source/opt/flat/scalar/cmp_field_fuse.c \
 	$(TOP)/source/opt/analysis/du_chains.c \
 	$(TOP)/source/opt/flat/scalar/const_string_calls.c \
@@ -211,7 +209,6 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/loop/reroll.c \
 	$(TOP)/source/opt/flat/scalar/bitfield.c \
 	$(TOP)/source/opt/flat/scalar/cmp_expr_fold.c \
-	$(TOP)/source/opt/flat/scalar/float_narrow.c \
 	$(TOP)/source/opt/flat/scalar/const_aggregate.c \
 	$(TOP)/source/opt/flat/ipa/pure_via_sret.c \
 	$(TOP)/source/opt/flat/ipa/func_write_summary.c \
@@ -221,17 +218,19 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/memory/dead_init_via_call.c \
 	$(TOP)/source/opt/flat/memory/stack_addr_cse.c \
 	$(TOP)/source/opt/flat/memory/block_copy_init.c \
+	$(TOP)/source/opt/flat/memory/const_local_table.c \
 	$(TOP)/source/opt/flat/memory/small_memset_to_store.c \
 	$(TOP)/source/opt/flat/memory/small_global_memset_to_store.c \
 	$(TOP)/source/opt/flat/memory/mem_init.c \
 	$(TOP)/source/opt/flat/memory/memmove_to_indexed_stores.c \
 	$(TOP)/source/opt/flat/memory/addrof_var_fwd.c \
 	$(TOP)/source/opt/flat/memory/ptr_local_fwd.c \
+	$(TOP)/source/opt/flat/memory/param_copy_alias.c \
+	$(TOP)/source/opt/flat/memory/slot_const_store_fold.c \
+	$(TOP)/source/opt/flat/memory/sra.c \
 	$(TOP)/source/opt/flat/memory/invariant_global_load_hoist.c \
-	$(TOP)/source/opt/flat/memory/invariant_temp_deref_hoist.c \
 	$(TOP)/source/opt/flat/memory/deref_operand_cse.c \
 	$(TOP)/source/opt/flat/memory/rmw_byte_clear.c \
-	$(TOP)/source/opt/flat/memory/local_copy_prop.c \
 	$(TOP)/source/opt/flat/memory/struct_copy_roundtrip_elim.c \
 	$(TOP)/source/opt/flat/dce/dead_vla.c \
 	$(TOP)/source/opt/engine/ctx.c \
@@ -271,9 +270,18 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/engine/pipeline_table.c \
 	$(TOP)/source/opt/engine/gen_adapters.c \
 		$(TOP)/source/ir/regalloc.c \
+		$(TOP)/source/ir/regalloc_scan.c \
+		$(TOP)/source/ir/regalloc_phi.c \
+		$(TOP)/source/ir/regalloc_entry.c \
+		$(TOP)/source/ir/regalloc_post.c \
+		$(TOP)/source/ir/frame.c \
+		$(TOP)/source/ir/cross_jump.c \
+		$(TOP)/source/ir/self_store.c \
+		$(TOP)/source/ir/dead_def.c \
 		$(TOP)/source/opt/ra/const_branch_fold.c \
 		$(TOP)/source/opt/ra/incomplete_calls.c \
 		$(TOP)/source/opt/ra/phi_const_chain.c \
+		$(TOP)/source/opt/ra/umaal_fusion.c \
 		$(TOP)/source/ir/codegen.c \
 		$(TOP)/source/ir/machine_op.c \
 		$(TOP)/source/machine/tccls.c \
@@ -319,9 +327,14 @@ UT_MODULE_OBJS := $(filter-out $(BUILD_DIR)/source/backend/arch/arm/thumb/arm-th
 # ra_link_stubs.c, tcc_ir_opt_switch_collapse_ex in stubs.c) were deleted.
 # Trailing entries are cross-build TUs (CORE_FILES / SSA_OPT_SRC / FPU-variant
 # backend) that no unit suite links today — registered at 0% until one does.
+# The Thumb-2 code generator: arm-thumb-gen.c plus the files split out of it.
+THUMB_GEN_SRCS := $(TOP)/source/backend/arch/arm/thumb/arm-thumb-gen.c \
+	$(foreach p,emit alu mem fp frame call,$(TOP)/source/backend/arch/arm/thumb/arm-thumb-$(p).c)
+
 UT_COVERAGE_ONLY_SRCS := \
-	$(TOP)/source/backend/arch/arm/thumb/arm-thumb-gen.c \
+	$(THUMB_GEN_SRCS) \
 	$(TOP)/source/backend/arch/arm/thumb/arm-thumb-callsite.c \
+	$(TOP)/source/backend/arch/arm/thumb/thumb-outline.c \
 	$(TOP)/source/opt/ssa/engine/use_def.c \
 	$(TOP)/source/opt/ssa/engine/rewrite.c \
 	$(TOP)/source/opt/ssa/engine/stack_resolve.c \
@@ -447,7 +460,7 @@ UT_LOCAL_SRCS := \
 	test_arm_aapcs.c \
 	test_arm_link.c \
 	test_ld_script.c \
-	test_opt_neg_chain.c \
+	test_opt_self_store.c \
 	test_opt_knownbits.c \
 	test_opt_symaddr_cse.c \
 	test_opt_cmp_fuse.c \
@@ -487,13 +500,13 @@ UT_LOCAL_SRCS := \
 	test_opt_promote_extra.c \
 	test_opt_fusion.c \
 	test_opt_pipeline_orchestration.c \
-	test_opt_float_branch.c \
 	test_opt_redundant_assign.c \
 	test_opt_uninit.c \
 	test_opt_dead_vla.c \
 	test_opt_xform.c \
 	test_opt_switch_collapse.c \
 	test_opt_switch_to_data.c \
+	test_opt_region_merge_case.c \
 	test_metamorphic.c \
 	test_metamorphic_ssa.c \
 	test_ssa_opt_arm.c \
@@ -718,8 +731,9 @@ $(COV_STAMP2):
 # undefined reference here.
 UT2_MODULE_SRCS := \
 	$(UT_MODULE_SRCS) \
-	$(TOP)/source/backend/arch/arm/thumb/arm-thumb-gen.c \
+	$(THUMB_GEN_SRCS) \
 	$(TOP)/source/backend/arch/arm/thumb/arm-thumb-callsite.c \
+	$(TOP)/source/backend/arch/arm/thumb/thumb-outline.c \
 	$(TOP)/source/backend/arch/fpu/arm/fpv5-sp-d16.c \
 	$(TOP)/source/backend/arch/fpu/arm/fpv5-d16.c \
 	$(TOP)/source/backend/arch/fpu/arm/rp2350-dcp.c
@@ -1038,8 +1052,12 @@ $(COV_STAMP6):
 	@rm -f $(BUILD_DIR6)/.coverage-*
 	@touch $@
 
+# The ELF writer/linker: tccelf.c plus the files split out of it.
+TCCELF_SRCS := $(TOP)/source/obj/tccelf.c \
+	$(foreach p,sym reloc layout output load ld,$(TOP)/source/obj/tccelf_$(p).c)
+
 UT6_MODULE_SRCS := \
-	$(TOP)/source/obj/tccelf.c
+	$(TCCELF_SRCS)
 UT6_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR6)/%.o,$(UT6_MODULE_SRCS))
 
 UT6_LOCAL_SRCS := \
@@ -1271,7 +1289,7 @@ $(COV_STAMP9):
 
 UT9_MODULE_SRCS := \
 	$(TOP)/source/obj/tccyaff.c \
-	$(TOP)/source/obj/tccelf.c \
+	$(TCCELF_SRCS) \
 	$(TOP)/source/memory/unique_ptr.c
 UT9_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR9)/%.o,$(UT9_MODULE_SRCS))
 

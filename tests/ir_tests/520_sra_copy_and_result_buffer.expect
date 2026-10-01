@@ -1,0 +1,9 @@
+copy_in 0 1755
+copy_out 9 18 27 36 45 54
+through 1 2 43 4 5 6
+result 2025
+result_through 30 405 32 66 34 35
+result_member 7104
+wide 1111111222222223 3 4 3333333344444444
+narrow 60200 201 60000 1 2 3 4 5
+pair 107

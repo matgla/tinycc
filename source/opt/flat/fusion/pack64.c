@@ -221,11 +221,13 @@ int tcc_ir_opt_pack64_from_stack_stores(TCCIRState *ir)
           continue;
         if (!irop_config[kq->op].has_dest)
           continue;
-        if (kq->op == TCCIR_OP_STORE || kq->op == TCCIR_OP_STORE_INDEXED ||
-            kq->op == TCCIR_OP_STORE_POSTINC)
-          continue; /* memory store, doesn't redefine vregs */
+        if (kq->op == TCCIR_OP_STORE_INDEXED)
+          continue; /* its destination is the base address */
+        /* A store through a pointer defines nothing, but a VAR stored as
+         * itself (a STACKOFF lvalue) is redefined, and so is a post-increment
+         * store's base. */
         IROperand kd = tcc_ir_op_get_dest(ir, kq);
-        if (kd.is_lval)
+        if (!irop_dest_defines_vreg(kd))
           continue;
         int32_t kdvr = irop_get_vreg(kd);
         if (kdvr < 0)

@@ -283,6 +283,11 @@ int post_type(CType *type, AttributeDef *ad, int storage, int td)
       tcc_error("declaration of an array of incomplete type elements");
 
     t1 |= type->t & VT_VLA;
+    /* An element whose size is only known at run time (a struct with a VLA
+     * member, GNU C) makes the array variable-length too: its fixed-size
+     * frame slot would be overrun by the second element. */
+    if (local_stack && !(storage & VT_STATIC) && struct_has_vla_member(type))
+      t1 |= VT_VLA;
 
     if (t1 & VT_VLA)
     {

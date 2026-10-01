@@ -534,7 +534,8 @@ tok_next:
     /* Recognize compile-time-constant lvalue accesses to read-only data.
      * For example, string literal subscript "hi"[0] is a compile-time
      * constant even though it presents as an lvalue (VT_LVAL set). */
-    if (n == 0 && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_LVAL | VT_SYM) && vtop->sym)
+    if (n == 0 && (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_LVAL | VT_SYM) && vtop->sym &&
+        !vtop->sym->a.tentative)
     {
       ElfSym *esym = elfsym(vtop->sym);
       if (esym && esym->st_shndx > 0 && esym->st_shndx < tcc_state->nb_sections)
@@ -591,6 +592,16 @@ tok_next:
     break;
   case TOK_builtin_unreachable:
     parse_builtin_params(0, ""); /* just skip '()' */
+    /* A marked TRAP: control never gets here, and saying so in the IR lets
+     * the branches that lead here go (tcc_ir_opt_unreachable_fold). */
+    if (tcc_state->ir && !nocode_wanted)
+    {
+      const int before = tcc_state->ir->next_instruction_index;
+      tcc_ir_put(tcc_state->ir, TCCIR_OP_TRAP, NULL, NULL, NULL);
+      if (tcc_state->ir->next_instruction_index > before &&
+          tcc_state->ir->compact_instructions[before].op == TCCIR_OP_TRAP)
+        tcc_state->ir->compact_instructions[before].unreachable = 1;
+    }
     type.t = VT_VOID;
     vpush(&type);
     CODE_OFF();
@@ -1103,21 +1114,16 @@ tok_next:
       vpushi(0);
       vtop->type = type;
     }
+    else if (tok1 == TOK_builtin_return_address)
+    {
+      /* level 0: the LR the prologue saved, read off SP */
+      vpush_return_address();
+    }
     else
     {
-      /* level == 0: force standard frame record {FP, LR} */
+      /* __builtin_frame_address(0) is the frame pointer itself */
       tcc_state->force_frame_pointer = 1;
-      if (tok1 == TOK_builtin_return_address)
-        tcc_state->force_lr_save = 1;
       vset(&type, VT_LOCAL, 0); /* FP value */
-      if (tok1 == TOK_builtin_return_address)
-      {
-        /* LR is at [FP + PTR_SIZE] in the standard frame record */
-        vpushi(PTR_SIZE);
-        gen_op('+');
-        mk_pointer(&vtop->type);
-        indir();
-      }
     }
 #else
     /* Non-ARM targets: original chain-walking implementation */
@@ -1612,6 +1618,7 @@ tok_next:
   /* atomic operations */
   case TOK___atomic_store:
   case TOK___atomic_load:
+  case TOK___atomic_load_n:
   case TOK___atomic_exchange:
   case TOK___atomic_compare_exchange:
   case TOK___atomic_fetch_add:
@@ -1755,6 +1762,7 @@ tok_next:
             s->c = nf->captured_offsets[i];  /* Parent's FP offset */
             s->vreg = -1;                    /* No vreg in nested function's IR — pure stack offset via chain */
             s->sym_scope = 0;
+            nested_track_captured_sym(s);
             goto found_captured_var;
           }
         }
@@ -1810,7 +1818,7 @@ tok_next:
        * initializers. */
       if ((s->type.t & VT_CONSTANT) && !(s->type.t & VT_VOLATILE) && !(s->type.t & VT_ARRAY) && !(s->type.t & VT_VLA) &&
           (s->type.t & VT_BTYPE) != VT_FUNC && (s->type.t & VT_BTYPE) != VT_STRUCT &&
-          (s->type.t & VT_BTYPE) != VT_PTR && s->c > 0)
+          (s->type.t & VT_BTYPE) != VT_PTR && s->c > 0 && !s->a.tentative)
       {
         ElfSym *esym = elfsym(s);
         if (esym && esym->st_shndx != SHN_UNDEF && esym->st_shndx != SHN_COMMON &&

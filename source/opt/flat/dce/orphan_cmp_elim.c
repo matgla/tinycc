@@ -106,7 +106,10 @@ int tcc_ir_opt_orphan_cmp_elim(TCCIRState *ir)
     else if (q->op != TCCIR_OP_CMP && q->op != TCCIR_OP_TEST_ZERO)
       continue;
 
-    if (q->is_jump_target)
+    /* A jump target is no reason to keep a compare nobody reads: the jump
+     * then lands on a NOP.  The helper-call form keeps the old rule -- its
+     * parameters sit ahead of it, where a jump into the middle could land. */
+    if (q->is_jump_target && (is_flag_cmp_call || tcc_ir_opt_pass_disabled("orphan_cmp_target")))
       continue;
 
     /* Nobody reading the flags does not make the comparison free: reaching its

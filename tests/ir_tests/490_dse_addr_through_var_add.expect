@@ -1,0 +1,6 @@
+mkdir a/b/c (h=-100 p=755)
+mkdir a/b (h=-100 p=755)
+mkdir a/b/c (h=-100 p=755)
+-> payload=1 error=0
+mkdir h (h=-100 p=755)
+-> payload=1 error=0

@@ -19,6 +19,145 @@
 #include "opt_loop_utils.h"
 
 
+/* Ops with a 4th pool slot at operand_base+3: a multiply-accumulate's
+ * accumulator, an indexed access's scale. */
+static int unroll_has_op4(int op)
+{
+  return tcc_ir_op_is_mac(op) || op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED;
+}
+
+/* How many of a body's instructions survive once the IV is a constant: an
+ * ALU op or copy computed only from immediates, frame or symbol addresses and
+ * earlier foldable values folds away, and so does a load through a foldable
+ * address into a const-qualified symbol (a table).  Everything else is real
+ * code in every copy. */
+static int unroll_residual_insns(TCCIRState *ir, const int *ops, const IROperand *dests, const IROperand *src1s,
+                                 const IROperand *src2s, int count, int32_t iv_vr, int *table_loads)
+{
+#define UNROLL_MAX_FOLD 64
+  int32_t fold_vr[UNROLL_MAX_FOLD];
+  uint8_t fold_tab[UNROLL_MAX_FOLD]; /* the value addresses a const table */
+  int nfold = 0, residual = 0;
+  for (int b = 0; b < count; b++)
+  {
+    const int op = ops[b];
+    int foldable = 0, tab = 0;
+    const IROperand srcs[2] = {src1s[b], src2s[b]};
+    const int nsrc = irop_config[op].has_src2 ? 2 : 1;
+    if (op == TCCIR_OP_ADD || op == TCCIR_OP_SUB || op == TCCIR_OP_SHL || op == TCCIR_OP_SHR || op == TCCIR_OP_SAR ||
+        op == TCCIR_OP_MUL || op == TCCIR_OP_AND || op == TCCIR_OP_OR || op == TCCIR_OP_XOR ||
+        op == TCCIR_OP_ASSIGN || op == TCCIR_OP_LOAD)
+    {
+      foldable = 1;
+      for (int k = 0; k < nsrc && foldable; k++)
+      {
+        IROperand o = srcs[k];
+        int32_t vr = irop_get_vreg(o);
+        int tag = irop_get_tag(o);
+        if (vr == iv_vr && vr >= 0 && !(o.is_lval && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP))
+          continue;
+        if (vr < 0 && !o.is_lval && (tag == IROP_TAG_IMM32 || tag == IROP_TAG_I64 || tag == IROP_TAG_STACKOFF))
+          continue;
+        if (vr < 0 && !o.is_lval && tag == IROP_TAG_SYMREF)
+        {
+          IRPoolSymref *sr = irop_get_symref_ex(ir, o);
+          if (sr && sr->sym && (sr->sym->type.t & VT_CONSTANT))
+            tab = 1;
+          continue;
+        }
+        int f = -1;
+        for (int j = 0; j < nfold; j++)
+          if (fold_vr[j] == vr)
+            f = j;
+        if (vr < 0 || f < 0)
+        {
+          foldable = 0;
+          break;
+        }
+        if (o.is_lval && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+        {
+          /* A load through a foldable address: folds only from a table. */
+          if (!fold_tab[f] || op != TCCIR_OP_LOAD)
+            foldable = 0;
+          else
+            *table_loads = 1;
+          continue;
+        }
+        tab |= fold_tab[f];
+      }
+    }
+    IROperand d = dests[b];
+    if (foldable && irop_config[op].has_dest && !d.is_lval && irop_get_vreg(d) >= 0 && nfold < UNROLL_MAX_FOLD)
+    {
+      fold_vr[nfold] = irop_get_vreg(d);
+      fold_tab[nfold] = op == TCCIR_OP_LOAD ? 0 : tab;
+      nfold++;
+    }
+    else if ((op == TCCIR_OP_ASSIGN || op == TCCIR_OP_LOAD) && irop_get_vreg(src1s[b]) >= 0 &&
+             !(src1s[b].is_lval && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(src1s[b])) == TCCIR_VREG_TYPE_TEMP) &&
+             !src1s[b].is_llocal)
+      ; /* a register copy: coalesced or a move */
+    else
+      residual++;
+  }
+  return residual;
+#undef UNROLL_MAX_FOLD
+}
+
+/* The fused barrel shift on src2 of the instruction numbered ORIG, or 0. */
+static uint8_t unroll_src2_shift(TCCIRState *ir, int orig)
+{
+  if (!ir->barrel_shifts || orig < 0 || orig >= ir->barrel_shifts_len)
+    return 0;
+  return ir->barrel_shifts[orig];
+}
+
+/* V shifted as barrel_shifts encoding ENC says ((type << 5) | amount, type
+ * 1 LSL, 2 LSR, 3 ASR, 4 ROR), 32-bit.  0 for an encoding it does not know. */
+static int unroll_apply_shift(uint8_t enc, int32_t v, int32_t *out)
+{
+  unsigned amount = enc & 31u;
+  uint32_t x = (uint32_t)v;
+  switch (enc >> 5)
+  {
+  case 1: *out = (int32_t)(x << amount); return 1;
+  case 2: *out = (int32_t)(x >> amount); return 1;
+  case 3: *out = amount ? (int32_t)((int32_t)x >> amount) : v; return 1;
+  case 4: *out = (int32_t)(amount ? (x >> amount) | (x << (32 - amount)) : x); return 1;
+  }
+  return 0;
+}
+
+/* Whether OP is a plain use of a TEMP whose only definition is
+ * `T <- GlobalSym` for a const-qualified symbol; *SYMVAL gets that operand. */
+static int unroll_const_symbol_temp(TCCIRState *ir, IROperand op, IROperand *symval)
+{
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || op.is_lval || op.is_llocal ||
+      irop_get_tag(op) != IROP_TAG_VREG)
+    return 0;
+  int defs = 0;
+  IROperand src = {0};
+  for (int i = 0; i < ir->next_instruction_index && defs < 2; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (irop_get_vreg(d) != vr || !irop_dest_defines_vreg(d))
+      continue;
+    defs++;
+    src = q->op == TCCIR_OP_ASSIGN ? tcc_ir_op_get_src1(ir, q) : (IROperand){0};
+  }
+  if (defs != 1 || irop_get_tag(src) != IROP_TAG_SYMREF || src.is_lval || irop_get_vreg(src) >= 0)
+    return 0;
+  IRPoolSymref *sr = irop_get_symref_ex(ir, src);
+  if (!sr || !sr->sym || !(sr->sym->type.t & VT_CONSTANT) || irop_get_btype(src) != irop_get_btype(op))
+    return 0;
+  *symval = src;
+  return 1;
+}
+
 /* loops/loop_idx let sibling loop records be patched when the IR grows; NULL/0 if unused. */
 int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_idx)
 {
@@ -65,17 +204,20 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
   }
 
   int ret = 0;
-  size_t _usz = UNROLL_MAX_BODY_INSNS * (2 * sizeof(int) + 3 * sizeof(IROperand));
+  size_t _usz = UNROLL_MAX_BODY_INSNS * (3 * sizeof(int) + 4 * sizeof(IROperand));
   char *_ubuf = (char *)tcc_mallocz(_usz);
   char *_up = _ubuf;
   int *body_indices = (int *)_up; _up += UNROLL_MAX_BODY_INSNS * sizeof(int);
   int *body_ops = (int *)_up; _up += UNROLL_MAX_BODY_INSNS * sizeof(int);
+  int *body_origs = (int *)_up; _up += UNROLL_MAX_BODY_INSNS * sizeof(int);
   IROperand *body_dests = (IROperand *)_up; _up += UNROLL_MAX_BODY_INSNS * sizeof(IROperand);
   IROperand *body_src1s = (IROperand *)_up; _up += UNROLL_MAX_BODY_INSNS * sizeof(IROperand);
-  IROperand *body_src2s = (IROperand *)_up;
+  IROperand *body_src2s = (IROperand *)_up; _up += UNROLL_MAX_BODY_INSNS * sizeof(IROperand);
+  IROperand *body_op4s = (IROperand *)_up;
 
+  int has_memory = 0;
   int body_count = collect_body_instructions(ir, loop, iv->vreg, cmp_idx, jmpif_idx, iv->def_idx, body_indices,
-                                             UNROLL_MAX_BODY_INSNS);
+                                             UNROLL_MAX_BODY_INSNS, &has_memory);
   if (body_count <= 0 || body_count > UNROLL_MAX_BODY_INSNS)
   {
     LOG_LOOP_OPT("try_unroll_loop: body_count=%d (invalid or > %d), giving up", body_count, UNROLL_MAX_BODY_INSNS);
@@ -83,7 +225,7 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
   }
 
   int total_insns = trip_count * body_count;
-  if (total_insns > UNROLL_MAX_TOTAL_INSNS)
+  if (total_insns > (has_memory ? UNROLL_MAX_RAW_MEM_INSNS : UNROLL_MAX_TOTAL_INSNS))
   {
     LOG_LOOP_OPT("try_unroll_loop: total_insns=%d > %d, giving up", total_insns, UNROLL_MAX_TOTAL_INSNS);
     goto unroll_cleanup;
@@ -93,15 +235,77 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
     IRQuadCompact *bq = &ir->compact_instructions[body_indices[b]];
     int op = bq->op;
     body_ops[b] = op;
+    body_origs[b] = bq->orig_index;
     body_dests[b] = (IROperand){0};
     body_src1s[b] = (IROperand){0};
     body_src2s[b] = (IROperand){0};
+    body_op4s[b] = (IROperand){0};
+    if (unroll_has_op4(op))
+      body_op4s[b] = ir->iroperand_pool[bq->operand_base + 3];
     if (irop_config[op].has_dest)
       body_dests[b] = ir->iroperand_pool[bq->operand_base];
     if (irop_config[op].has_src1)
       body_src1s[b] = ir->iroperand_pool[bq->operand_base + irop_config[op].has_dest];
     if (irop_config[op].has_src2)
       body_src2s[b] = ir->iroperand_pool[bq->operand_base + irop_config[op].has_dest + irop_config[op].has_src1];
+  }
+
+  /* A constant table's address hoisted out of the loop (`T <- GlobalSym`,
+   * T's only definition) comes back as the symbol in every copy, so the
+   * copies' reads are table reads at constant offsets that fold (Zig's
+   * MultiArrayList.slice inlined into a big caller: the table addresses are
+   * shared, and the loads stayed). */
+  for (int b = 0; b < body_count; b++)
+  {
+    IROperand *srcs[2] = {&body_src1s[b], &body_src2s[b]};
+    for (int k = 0; k < 2; k++)
+    {
+      if (k == 0 ? !irop_config[body_ops[b]].has_src1 : !irop_config[body_ops[b]].has_src2)
+        continue;
+      IROperand symval;
+      /* A src2 carrying a fused barrel shift stays a register. */
+      if (k == 1 && unroll_src2_shift(ir, body_origs[b]))
+        continue;
+      if (unroll_const_symbol_temp(ir, *srcs[k], &symval))
+        *srcs[k] = symval;
+    }
+  }
+
+  int table_loads = 0;
+  if (has_memory &&
+      trip_count * unroll_residual_insns(ir, body_ops, body_dests, body_src1s, body_src2s, body_count, iv->vreg,
+                                         &table_loads) >
+          UNROLL_MAX_TOTAL_MEM_INSNS)
+  {
+    LOG_LOOP_OPT("try_unroll_loop: residual after folding too large, giving up");
+    goto unroll_cleanup;
+  }
+
+  /* The IV is replaced by a constant in every copy: only as a value.  An IV
+   * that is written in the body, or dereferenced as a pointer TEMP, keeps
+   * the loop.  (A VAR IV read by LOAD is a plain read; see below.) */
+  for (int b = 0; b < body_count; b++)
+  {
+    IROperand ops[4] = {body_dests[b], body_src1s[b], body_src2s[b], body_op4s[b]};
+    for (int k = 0; k < 4; k++)
+    {
+      if (k == 0 && !irop_config[body_ops[b]].has_dest)
+        continue;
+      if (irop_get_vreg(ops[k]) != iv->vreg)
+        continue;
+      if (k == 0 || (ops[k].is_lval && TCCIR_DECODE_VREG_TYPE(iv->vreg) == TCCIR_VREG_TYPE_TEMP))
+      {
+        LOG_LOOP_OPT("try_unroll_loop: IV written or dereferenced in body, giving up");
+        goto unroll_cleanup;
+      }
+      int32_t shifted;
+      uint8_t enc = k == 2 ? unroll_src2_shift(ir, body_origs[b]) : 0;
+      if (enc && !unroll_apply_shift(enc, 0, &shifted))
+      {
+        LOG_LOOP_OPT("try_unroll_loop: IV under an unknown barrel shift, giving up");
+        goto unroll_cleanup;
+      }
+    }
   }
 
   /* Use only [start_idx..end_idx]; the extended body_instrs can include post-loop instrs. */
@@ -247,7 +451,7 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op == TCCIR_OP_NOP)
         continue;
-      for (int slot = 0; slot < 3; slot++)
+      for (int slot = 0; slot < 4; slot++)
       {
         IROperand op;
         if (slot == 0)
@@ -259,6 +463,11 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
         {
           if (!irop_config[q->op].has_src1) continue;
           op = tcc_ir_op_get_src1(ir, q);
+        }
+        else if (slot == 3)
+        {
+          if (!unroll_has_op4(q->op)) continue;
+          op = ir->iroperand_pool[q->operand_base + 3];
         }
         else
         {
@@ -289,14 +498,38 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
       IROperand dest = body_dests[b];
       IROperand src1 = body_src1s[b];
       IROperand src2 = body_src2s[b];
+      IROperand op4 = body_op4s[b];
 
       int iv_val = iv->init_val + k * iv->step;
       IROperand iv_const = irop_make_imm32(-1, iv_val, IROP_BTYPE_INT32);
 
       if (irop_get_vreg(src1) == iv->vreg)
+      {
         src1 = iv_const;
+        /* `X <- Viv [LOAD]` reads the IV variable: now a constant. */
+        if (saved_op == TCCIR_OP_LOAD)
+          saved_op = TCCIR_OP_ASSIGN;
+      }
+      /* A fused barrel shift on src2 (barrel_shifts[orig_index]) applies to
+       * the IV there: every consumer ignores a shift on an immediate, so the
+       * copy gets the shifted value and no annotation -- `base + (j << 4)`
+       * came out as `base + j` (pr93434: stores at t2 + 17, 18, ...). */
+      int shift_folded = 0;
       if (irop_get_vreg(src2) == iv->vreg)
+      {
+        uint8_t enc = unroll_src2_shift(ir, body_origs[b]);
         src2 = iv_const;
+        if (enc)
+        {
+          int32_t v;
+          if (!unroll_apply_shift(enc, iv_val, &v))
+            goto unroll_cleanup; /* not reached: checked before the loop went */
+          src2 = irop_make_imm32(-1, v, IROP_BTYPE_INT32);
+          shift_folded = 1;
+        }
+      }
+      if (unroll_has_op4(saved_op) && irop_get_vreg(op4) == iv->vreg)
+        op4 = iv_const;
 
       for (int r = 0; r < rename_count; r++)
       {
@@ -323,6 +556,13 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
               TCCIR_DECODE_VREG_POSITION(vr) == old_pos)
             irop_set_vreg(&src2, new_vr);
         }
+        if (unroll_has_op4(saved_op))
+        {
+          int32_t vr = irop_get_vreg(op4);
+          if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP &&
+              TCCIR_DECODE_VREG_POSITION(vr) == old_pos)
+            irop_set_vreg(&op4, new_vr);
+        }
       }
 
       while (write_pos <= loop_end && ir->compact_instructions[write_pos].op != TCCIR_OP_NOP)
@@ -332,6 +572,10 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
         goto unroll_cleanup; /* should not happen: avail_slots check prevents it */
 
       write_instr_at_nop(ir, write_pos, saved_op, dest, src1, src2);
+      if (unroll_has_op4(saved_op))
+        tcc_ir_pool_add(ir, op4); /* lands at operand_base + 3 */
+      if (!shift_folded)
+        tcc_ir_copy_orig_annotations(ir, body_origs[b], ir->compact_instructions[write_pos].orig_index);
       write_pos++;
     }
   }
@@ -400,6 +644,8 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
   }
 
   ret = 1;
+  if (table_loads)
+    ir->unrolled_table_loads = 1;
 
 unroll_cleanup:
   tcc_free(_ubuf);

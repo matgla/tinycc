@@ -206,7 +206,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
             if (align < 1)
               align = 1;
             arg_descs[param_idx].kind = TCC_ABI_ARG_STRUCT_BYVAL;
-            arg_descs[param_idx].size = (uint16_t)size;
+            arg_descs[param_idx].size = (uint32_t)size;
             /* Use AAPCS natural alignment (based on member types, not
              * __attribute__((aligned)) on the struct). This determines
              * register alignment (even-register rule for 8-byte aligned). */

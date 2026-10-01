@@ -262,8 +262,11 @@ int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
           }
           int po = pending[k].off, pw = pending[k].width;
           if (po == so && pw == sw) {
-            ssa_opt_nop_instr(ctx, pending[k].idx);
-            changes++;
+            /* The overwritten store's value may be a volatile read. */
+            if (!dce_instr_reads_volatile(ir, &ir->compact_instructions[pending[k].idx])) {
+              ssa_opt_nop_instr(ctx, pending[k].idx);
+              changes++;
+            }
             pending[k] = pending[--npending];
           } else if (so < po + pw && so + sw > po) {
             pending[k] = pending[--npending];

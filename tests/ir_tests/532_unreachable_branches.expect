@@ -1,0 +1,18 @@
+0 alpha
+1 beta
+2 gamma
+3 delta
+4 epsilon
+5 zeta
+pick 0 41
+pick 1 123
+pick 2 35
+uleb 0 -> 1: 00 00 00
+uleb 1 -> 1: 01 00 00
+uleb 127 -> 1: 7f 00 00
+uleb 128 -> 2: 80 01 00
+uleb 300 -> 2: ac 02 00
+uleb 16383 -> 2: ff 7f 00
+uleb 16384 -> 3: 80 80 01
+uleb 65535 -> 3: ff ff 03
+total=20583

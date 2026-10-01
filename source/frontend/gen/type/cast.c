@@ -690,6 +690,12 @@ again:
 
     if (sf || df)
     {
+      /* A comparison still in the flags (`(double)!f()`, `d = a < b`) is
+       * only a value once SETIF materialises it: vtop->vr names the
+       * compared operand, so converting it as it stands converted the
+       * operand -- toybox awk's "num = ! get_set_logical()" stored the
+       * un-negated result and every awk loop body was skipped. */
+      tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
       if (sf && df)
       {
         /* convert from fp to fp - emit IR operation */

@@ -13,16 +13,13 @@ FLAT_OPT_INC = -I$(TOP)/source/opt/flat -I$(TOP)/source/opt/flat/include \
 FLAT_OPT_SRC = \
 	source/opt/flat/scalar/bool.c \
 	source/opt/flat/scalar/branch.c \
-	source/opt/flat/scalar/branch_fold.c \
 	source/opt/flat/scalar/stack_bool_diamond.c \
 	source/opt/flat/scalar/const_string_calls.c \
 	source/opt/flat/scalar/const_call_fold.c \
 	source/opt/flat/scalar/addrof_const_fold.c \
 	source/opt/flat/scalar/global_init_prop.c \
 	source/opt/flat/scalar/symref_const_prop.c \
-	source/opt/flat/scalar/complex_const_param_fold.c \
 	source/opt/flat/scalar/stack_addr_fold.c \
-	source/opt/flat/scalar/single_value_tmp.c \
 	source/opt/flat/scalar/call_result.c \
 	source/opt/flat/scalar/self_arith.c \
 	source/opt/flat/scalar/narrow_store.c \
@@ -38,12 +35,12 @@ FLAT_OPT_SRC = \
 	source/opt/flat/scalar/add_reassoc.c \
 	source/opt/flat/scalar/cmp_field_fuse.c \
 	source/opt/flat/scalar/cmp_expr_fold.c \
-	source/opt/flat/scalar/float_narrow.c \
 	source/opt/flat/scalar/bitfield.c \
 	source/opt/flat/memory/symaddr_cse.c \
 	source/opt/flat/memory/dse.c \
 	source/opt/flat/memory/var_store_elim.c \
 	source/opt/flat/memory/entry_store_prop.c \
+	source/opt/flat/memory/sret_nrvo.c \
 	source/opt/flat/memory/sl_forward.c \
 	source/opt/flat/memory/copy_source_load_fwd.c \
 	source/opt/flat/memory/dead_local_slot.c \
@@ -65,6 +62,7 @@ FLAT_OPT_SRC = \
 	source/opt/flat/fusion/pack64.c \
 	source/opt/flat/fusion/pack64_tautology.c \
 	source/opt/flat/fusion/cmp_narrow_64.c \
+	source/opt/flat/fusion/cmp_hi_only.c \
 	source/opt/flat/fusion/cmp_imm_swap.c \
 	source/opt/flat/fusion/and64_narrow.c \
 	source/opt/flat/fusion/shl32_or_chain.c \
@@ -101,7 +99,6 @@ FLAT_OPT_SRC = \
 	source/opt/flat/loop/seq_guard_elim.c \
 	source/opt/flat/loop/decrement_to_zero.c \
 	source/opt/flat/loop/const_sim.c \
-	source/opt/flat/scalar/neg_chain_cse.c \
 	source/opt/flat/loop/reroll.c \
 	source/opt/flat/cfg/switch_to_data.c \
 	source/opt/flat/dce/dead_vla.c \
@@ -117,12 +114,10 @@ FLAT_OPT_SRC = \
 	source/opt/flat/loop/licm.c \
 	source/opt/flat/loop/stack_param_promote.c \
 	source/opt/flat/memory/invariant_global_load_hoist.c \
-	source/opt/flat/memory/invariant_temp_deref_hoist.c \
 	source/opt/flat/memory/global_deref_cse.c \
 	source/opt/flat/memory/deref_operand_cse.c \
 	source/opt/flat/memory/bitfield_unit_narrow.c \
 	source/opt/flat/memory/rmw_byte_clear.c \
-	source/opt/flat/memory/local_copy_prop.c \
 	source/opt/flat/memory/struct_copy_roundtrip_elim.c \
 	source/opt/flat/fusion/barrel_shift.c \
 	source/opt/flat/fusion/shift_pair_ubfx.c \
@@ -137,11 +132,15 @@ FLAT_OPT_SRC = \
 	source/opt/flat/memory/dead_init_via_call.c \
 	source/opt/flat/memory/stack_addr_cse.c \
 	source/opt/flat/memory/block_copy_init.c \
+	source/opt/flat/memory/const_local_table.c \
 	source/opt/flat/memory/small_memset_to_store.c \
 	source/opt/flat/memory/small_global_memset_to_store.c \
 	source/opt/flat/memory/mem_init.c \
 	source/opt/flat/memory/addrof_var_fwd.c \
 	source/opt/flat/memory/ptr_local_fwd.c \
+	source/opt/flat/memory/param_copy_alias.c \
+	source/opt/flat/memory/slot_const_store_fold.c \
+	source/opt/flat/memory/sra.c \
 	source/opt/flat/memory/memmove_to_indexed_stores.c
 
 # Header set the units depend on (force a rebuild on interface edits).

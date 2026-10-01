@@ -127,6 +127,7 @@ int ssa_opt_run_gens(IRSSAOptCtx *ctx, const IRSSAOptGen *gens, int count);
  * ============================================================================ */
 
 IRSSAVregInfo *ssa_opt_vinfo(IRSSAOptCtx *ctx, int32_t vreg);
+void ssa_opt_vinfo_grow(IRSSAOptCtx *ctx, int new_cap);
 void ssa_opt_add_use_instr(IRSSAVregInfo *vi, int instr_idx);
 void ssa_opt_add_use_phi(IRSSAVregInfo *vi, int block, int slot);
 /* Append use-list entries for every vreg `q` (at index i) reads — same rules
@@ -220,6 +221,21 @@ int ssa_opt_loop_unroll(struct TCCIRState *ir);
  * shape provider).  See docs/plan_legacy_loop_decrement_to_zero_ssa.md. */
 int ssa_opt_decrement_to_zero(struct TCCIRState *ir);
 
+/* Bottom-testing for the `while`-shaped loops rotation cannot match
+ * (ssa:loop_bottom_test).  ssa:loop_rotate hard-requires the frontend header
+ * `CMP; JUMPIF exit; JUMP body`; a loop whose body already falls through from
+ * the header -- the shape ssa:cfg_cleanup leaves, and the one
+ * ssa:iv_strength_reduction produces when it eliminates a counter against an
+ * end pointer -- keeps its top test and an unconditional back-edge.  This pass
+ * copies the header CMP in front of the back-edge and turns the back-edge into
+ * the inverted conditional branch, leaving the header pair as the zero-trip
+ * guard: one taken branch less per iteration, one instruction more of code.
+ * Nothing moves, so none of rotation's relocation hazards apply.  Flat IR,
+ * right after ssa_opt_iv_strength_reduction (its shape provider) and before
+ * ssa_opt_decrement_to_zero.  Gated -O1+; level knob TCC_BOTTOM_TEST.
+ * See source/opt/ssa/loop/loop_bottom_test.c. */
+int ssa_opt_loop_bottom_test(struct TCCIRState *ir);
+
 /* Induction-variable strength reduction (ssa:iv_strength_reduction).  Transforms
  * array-indexing recurrences base + i*stride into a maintained stride pointer
  * and optionally eliminates the counter IV against a hoisted end pointer.  Per
@@ -289,6 +305,9 @@ int ssa_opt_resolve_temp_to_base_off(IRSSAOptCtx *ctx, int32_t vr,
  * dest is not TEMP-DEREF or the LEA chain does not resolve, or the index
  * is not a constant with scale 0. */
 int ssa_opt_indirect_stack_offset(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side);
+/* Loads and stores through a TEMP holding a constant frame address become
+ * direct StackLoc accesses (stack_resolve.c). */
+int ssa_opt_stack_deref_fold(IRSSAOptCtx *ctx);
 /* Variant that also reports the resolved address identity via *out_base_var
  * (see ssa_opt_resolve_lea_stackloc_ex for the -1 / >=0 contract). */
 int ssa_opt_indirect_stack_offset_ex(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side,

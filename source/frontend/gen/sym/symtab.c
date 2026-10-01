@@ -60,13 +60,28 @@ Sym *sym_malloc(void)
 #endif
 }
 
+const SymLocalFacts sym_no_facts;
+
+SymLocalFacts *sym_facts(Sym *s)
+{
+  if (!s->facts)
+    s->facts = tcc_mallocz(sizeof(SymLocalFacts));
+  return s->facts;
+}
+
+void sym_free_facts(Sym *s)
+{
+  if (s->facts)
+  {
+    tcc_free(s->facts->const_init_data);
+    tcc_free(s->facts);
+    s->facts = NULL;
+  }
+}
+
 ST_INLN void sym_free(Sym *sym)
 {
-  if (sym->const_init_data)
-  {
-    tcc_free(sym->const_init_data);
-    sym->const_init_data = NULL;
-  }
+  sym_free_facts(sym);
 #ifndef SYM_DEBUG
   /* Poison freed symbols to detect use-after-free */
   sym->v = 0xDEADBEEF;
@@ -184,7 +199,10 @@ ST_FUNC Sym *sym_push(int v, CType *type, int r, int c)
     {
       IRLiveInterval *iv = tcc_ir_vreg_live_interval(tcc_state->ir, vreg);
       if (iv)
+      {
         iv->is_volatile = (type->t & VT_VOLATILE) != 0;
+        iv->is_struct = (type->t & VT_BTYPE) == VT_STRUCT;
+      }
     }
     /* For stack-passed params (VT_LOCAL), c is the stack offset;
      * for register params, c is the parameter index */
@@ -314,24 +332,20 @@ ST_FUNC void sym_pop(Sym **ptop, Sym *b, int keep)
         ps = &ts->sym_identifier;
       *ps = s->prev_tok;
     }
-    if (!keep && s->const_init_data)
-    {
-      tcc_free(s->const_init_data);
-      s->const_init_data = NULL;
-    }
     /* Don't free symbols that have been exported to ELF (sym->c != 0)
        as they may still be referenced by IR instructions */
-    if (!keep && s->c == 0)
-    {
-      /* In IR mode the backend may still need Sym pointers (notably for
-       * VT_SYM address materialization and relocations). Block-scope extern
-       * declarations create temporary Sym copies that can be referenced by IR
-       * after the scope ends; freeing them here can lead to missing relocations
-       * and loads/stores from address 0 at runtime.
-       */
-      if (!(tcc_state->ir && (s->r & VT_SYM)))
-        sym_free(s);
-    }
+    /* In IR mode the backend may still need Sym pointers (notably for
+     * VT_SYM address materialization and relocations). Block-scope extern
+     * declarations create temporary Sym copies that can be referenced by IR
+     * after the scope ends; freeing them here can lead to missing relocations
+     * and loads/stores from address 0 at runtime.
+     */
+    if (!keep && s->c == 0 && !(tcc_state->ir && (s->r & VT_SYM)))
+      sym_free(s);
+    else if (!keep)
+      /* The Sym outlives its scope (a local's c is its frame offset); its
+       * facts do not, and nothing frees them later. */
+      sym_free_facts(s);
     s = ss;
   }
   if (!keep)
@@ -394,7 +408,8 @@ ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep)
            codegen, so orig_ir_to_code_mapping is NULL.  Defer resolution of
            addr-taken labels by moving them to global_label_stack, which is
            popped AFTER codegen when the mapping is available. */
-        if (addr_taken && tcc_state->ir && !tcc_state->ir->orig_ir_to_code_mapping && ptop != &global_label_stack)
+        if (addr_taken && tcc_state->ir && !tcc_state->ir->orig_ir_to_code_mapping && ptop != &global_label_stack &&
+            !tcc_state->check_only) /* a checked-only body has no codegen to wait for */
         {
           /* Unlink from table_ident now (function scope is ending) */
           if (s->r != LABEL_GONE)

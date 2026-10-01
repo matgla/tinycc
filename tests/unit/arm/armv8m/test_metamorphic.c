@@ -37,13 +37,11 @@
 #include <inttypes.h>
 
 /* ── legacy pass entry points (forward-declared; defined in ir/opt_*.c) ── */
-int tcc_ir_opt_neg_chain_cse(TCCIRState *ir);
 int tcc_ir_opt_known_bits(TCCIRState *ir);
 int tcc_ir_opt_const_prop_tmp(TCCIRState *ir);
 int tcc_ir_opt_const_var_prop(TCCIRState *ir);
 int tcc_ir_opt_add_reassoc(TCCIRState *ir);
 int tcc_ir_opt_self_arith_fold(TCCIRState *ir);
-int tcc_ir_opt_single_value_tmp(TCCIRState *ir);
 int tcc_ir_opt_cmp_field_fuse(TCCIRState *ir);
 int tcc_ir_opt_jump_threading(TCCIRState *ir);
 int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir);
@@ -60,13 +58,11 @@ typedef struct PassEntry
 /* The passes exercised by the metamorphic loop.  All are value/structure
  * transforms that must preserve straight-line semantics. */
 static const PassEntry g_passes[] = {
-    {"neg_chain_cse", tcc_ir_opt_neg_chain_cse},
     {"known_bits", tcc_ir_opt_known_bits},
     {"const_prop_tmp", tcc_ir_opt_const_prop_tmp},
     {"const_var_prop", tcc_ir_opt_const_var_prop},
     {"add_reassoc", tcc_ir_opt_add_reassoc},
     {"self_arith_fold", tcc_ir_opt_self_arith_fold},
-    {"single_value_tmp", tcc_ir_opt_single_value_tmp},
     {"cmp_field_fuse", tcc_ir_opt_cmp_field_fuse},
     {"jump_threading", tcc_ir_opt_jump_threading},
     {"dead_lea_store_elim", tcc_ir_opt_dead_lea_store_elim},
@@ -720,7 +716,6 @@ UT_TEST(test_shr_sar_known_bits_correct_cases)
  * ============================================================================
  */
 
-UT_COVERS("neg_chain_cse");
 UT_COVERS("known_bits");
 UT_COVERS("copy_prop");
 UT_COVERS("const_prop");
@@ -728,4 +723,3 @@ UT_COVERS("const_prop_tmp");
 UT_COVERS("const_var_prop");
 UT_COVERS("add_reassoc");
 UT_COVERS("self_arith_fold");
-UT_COVERS("single_value_tmp");

@@ -303,6 +303,9 @@ def test_tst_reg():
 def test_udiv():
     utils.perform_test_for_file("test_udiv.S")
 
+def test_umaal():
+    utils.perform_test_for_file("test_umaal.S")
+
 def test_umlal():
     utils.perform_test_for_file("test_umlal.S")
 

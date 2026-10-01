@@ -22,6 +22,7 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_MUL] = {1, 1, 1},
     [TCCIR_OP_MLA] = {1, 1, 1},  /* MLA has accumulator as extra operand at pool[operand_base+3] */
     [TCCIR_OP_UMULL] = {1, 1, 1},
+    [TCCIR_OP_UMAAL] = {1, 1, 1},  /* accum (both addends) at pool[operand_base+3], as MLA */
     [TCCIR_OP_SMULL] = {1, 1, 1},
     [TCCIR_OP_DIV] = {1, 1, 1},
     [TCCIR_OP_UMOD] = {1, 1, 1},
@@ -126,6 +127,8 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_RBIT] = {1, 1, 0},
     [TCCIR_OP_REV] = {1, 1, 0},
     [TCCIR_OP_REV16] = {1, 1, 0},
+    /* __builtin_return_address(0): dest only */
+    [TCCIR_OP_RETURN_ADDRESS] = {1, 0, 0},
 }
 ;
 // clang-format on

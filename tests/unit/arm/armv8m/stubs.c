@@ -333,7 +333,7 @@ int put_elf_sym(struct Section *s, addr_t value, unsigned long size, int info, i
 }
 
 /* get_tok_str is declared `const char *get_tok_str(int, CValue*)` in tcc.h and
- * used by name-gated optimizer passes (e.g. self_copy_elim, float_narrowing).
+ * used by name-gated optimizer passes (e.g. self_copy_elim).
  * The unit-test harness lets individual tests populate a token→name table so
  * those passes can reach their positive folds.  CValue is opaque here (no tcc.h),
  * hence the void* parameter — the linker resolves by name regardless. */

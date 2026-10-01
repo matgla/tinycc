@@ -9,6 +9,12 @@ OBJ_INC = -I$(TOP)/source/obj
 
 OBJ_SRC = \
 	source/obj/tccelf.c \
+	source/obj/tccelf_sym.c \
+	source/obj/tccelf_reloc.c \
+	source/obj/tccelf_layout.c \
+	source/obj/tccelf_output.c \
+	source/obj/tccelf_load.c \
+	source/obj/tccelf_ld.c \
 	source/obj/tccld.c \
 	source/obj/tccyaff.c \
 	source/obj/tccdbg.c
@@ -24,7 +30,7 @@ OBJ_HDRS = \
 # set even though it is not a .h file.
 OBJ_HDRS += source/obj/stab.def
 
-OBJ_OBJ = $(patsubst %.c,$(X)%.o,$(OBJ_SRC))
+OBJ_OBJ = $(call lib-objs,obj,$(OBJ_SRC))
 OBJ_LIB = $(X)source/obj/libobj.a
 
 $(X)source/obj/%.o: source/obj/%.c $(OBJ_HDRS) $(TCC_CORE_DEPS)

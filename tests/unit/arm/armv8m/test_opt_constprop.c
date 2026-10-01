@@ -52,7 +52,6 @@ int tcc_ir_opt_const_var_prop(TCCIRState *ir);
 int tcc_ir_opt_const_prop_tmp(TCCIRState *ir);
 int tcc_ir_opt_global_init_prop(TCCIRState *ir);
 int tcc_ir_opt_symref_const_prop(TCCIRState *ir);
-int tcc_ir_opt_complex_const_param_fold(TCCIRState *ir);
 int tcc_ir_opt_value_tracking(TCCIRState *ir);
 int tcc_ir_opt_self_arith_fold(TCCIRState *ir);
 
@@ -368,8 +367,6 @@ UT_TEST(test_constvarprop_stackoff_source_not_propagated)
   return 0;
 }
 
-
-
 /* GUARD: a 64-bit immediate assigned into a 32-bit temp must be tracked as the
  * truncated 32-bit value.  This mirrors `(int)(long long)(V2SI){2,2}` after
  * known_bits folds the 64-bit stack load to `0x0000000200000002`: the following
@@ -478,8 +475,6 @@ UT_TEST(test_constproptmp_switch_table_const_index_to_default_jump)
   utb_free(ir);
   return 0;
 }
-
-
 
 /* ============================================================ global_init_prop
  *
@@ -880,148 +875,6 @@ UT_TEST(test_symrefconstprop_idempotent)
   UT_ASSERT(first > 0);
   int second = tcc_ir_opt_symref_const_prop(ir);
   UT_ASSERT_EQ(second, 0);
-  utb_free(ir);
-  return 0;
-}
-
-/* ===================================================== complex_const_param_fold
- *
- * Folds the {real,imag} pair of a _Complex float local — stored to a stack slot
- * as two 4-byte float constants — directly into the FUNCPARAMVAL that passes it
- * by value, packing the two component bit patterns into a 64-bit complex-float
- * immediate and NOP-ing the two component stores. */
-
-/* Build a complex-float lval stack operand at `off` (vreg==-1, F32, is_complex,
- * is_lval, not param) — the FUNCPARAM source shape the fold targets. */
-static IROperand utb_cplx_slot(int32_t off)
-{
-  IROperand op = irop_make_stackoff(0, off, /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0, F32);
-  op.is_complex = 1;
-  return op;
-}
-
-/* Build a plain float lval stack operand at `off` for a component STORE dest
- * (vreg==-1, F32, is_lval, NOT complex, not param). */
-static IROperand utb_f32_slot(int32_t off)
-{
-  return irop_make_stackoff(0, off, /*is_lval*/ 1, /*is_llocal*/ 0, /*is_param*/ 0, F32);
-}
-
-/* POSITIVE: the canonical 3-op pattern folds.
- *   STORE slot[-8] <- #real_bits
- *   STORE slot[-4] <- #imag_bits
- *   FUNCPARAMVAL  slot[-8] (complex lval)
- * -> param src1 becomes a packed complex-float i64 immediate; stores NOP'd. */
-UT_TEST(test_cplxparamfold_packs_and_nops_stores)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-
-  uint32_t real_bits = 0x3f800000u; /* 1.0f */
-  uint32_t imag_bits = 0x40000000u; /* 2.0f */
-
-  int isr = utb_emit(ir, TCCIR_OP_STORE, utb_f32_slot(-8), utb_imm((int32_t)real_bits, F32), UTB_NONE);
-  int isi = utb_emit(ir, TCCIR_OP_STORE, utb_f32_slot(-4), utb_imm((int32_t)imag_bits, F32), UTB_NONE);
-  int ip = utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_cplx_slot(-8),
-                    utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-
-  int changes = tcc_ir_opt_complex_const_param_fold(ir);
-  UT_ASSERT(changes > 0);
-
-  /* Both component stores are dead. */
-  UT_ASSERT_EQ(utb_op(ir, isr), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, isi), TCCIR_OP_NOP);
-
-  /* The param source is now a complex-float immediate carrying packed bits:
-   * real in the low 32 bits, imag in the high 32 bits. */
-  IROperand p = utb_src1(ir, ip);
-  UT_ASSERT_EQ((int)p.is_complex, 1);
-  UT_ASSERT_EQ((int)p.is_lval, 0);
-  UT_ASSERT_EQ(irop_is_immediate(p), 1);
-  uint64_t packed = (uint64_t)real_bits | ((uint64_t)imag_bits << 32);
-  UT_ASSERT_EQ((long long)irop_get_imm64_ex(ir, p), (long long)(int64_t)packed);
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD (non-complex param): a FUNCPARAMVAL whose source slot is NOT is_complex
- * is not a _Complex-by-value pass, so the fold never triggers. */
-UT_TEST(test_cplxparamfold_non_complex_param_no_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-  int isr = utb_emit(ir, TCCIR_OP_STORE, utb_f32_slot(-8), utb_imm(0x3f800000, F32), UTB_NONE);
-  int isi = utb_emit(ir, TCCIR_OP_STORE, utb_f32_slot(-4), utb_imm(0x40000000, F32), UTB_NONE);
-  /* Plain (non-complex) float lval source. */
-  int ip = utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_f32_slot(-8),
-                    utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-
-  int changes = tcc_ir_opt_complex_const_param_fold(ir);
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, isr), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, isi), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, ip), TCCIR_OP_FUNCPARAMVAL);
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD (missing imag store): only the real component is stored, so the 8-byte
- * slot is not fully initialized by constants — fold bails (imag_store_idx<0). */
-UT_TEST(test_cplxparamfold_missing_component_no_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-  int isr = utb_emit(ir, TCCIR_OP_STORE, utb_f32_slot(-8), utb_imm(0x3f800000, F32), UTB_NONE);
-  int ip = utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_cplx_slot(-8),
-                    utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-
-  int changes = tcc_ir_opt_complex_const_param_fold(ir);
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, isr), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, ip), TCCIR_OP_FUNCPARAMVAL);
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD (extra read of the slot): a third instruction that also references the
- * 8-byte slot (an additional LOAD of slot[-8]) disqualifies the fold — the slot
- * is not touched by exactly the three expected ops. */
-UT_TEST(test_cplxparamfold_extra_slot_reference_no_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-  int isr = utb_emit(ir, TCCIR_OP_STORE, utb_f32_slot(-8), utb_imm(0x3f800000, F32), UTB_NONE);
-  int isi = utb_emit(ir, TCCIR_OP_STORE, utb_f32_slot(-4), utb_imm(0x40000000, F32), UTB_NONE);
-  /* An extra read of the real slot through src1 of a LOAD. */
-  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(0, F32), utb_f32_slot(-8), UTB_NONE);
-  int ip = utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_cplx_slot(-8),
-                    utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-
-  int changes = tcc_ir_opt_complex_const_param_fold(ir);
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, isr), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, isi), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, ip), TCCIR_OP_FUNCPARAMVAL);
-  utb_free(ir);
-  return 0;
-}
-
-/* GUARD (non-constant store value): when a component store writes a non-constant
- * value (a vreg, not an immediate/float-bits) the slot can't be packed -> bail. */
-UT_TEST(test_cplxparamfold_nonconst_store_no_fold)
-{
-  TCCIRState *ir = utb_new();
-  utb_pools_init(ir);
-  int isr = utb_emit(ir, TCCIR_OP_STORE, utb_f32_slot(-8), utb_temp(5, F32), UTB_NONE);
-  int isi = utb_emit(ir, TCCIR_OP_STORE, utb_f32_slot(-4), utb_imm(0x40000000, F32), UTB_NONE);
-  int ip = utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_cplx_slot(-8),
-                    utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
-
-  int changes = tcc_ir_opt_complex_const_param_fold(ir);
-  UT_ASSERT_EQ(changes, 0);
-  UT_ASSERT_EQ(utb_op(ir, isr), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, isi), TCCIR_OP_STORE);
-  UT_ASSERT_EQ(utb_op(ir, ip), TCCIR_OP_FUNCPARAMVAL);
   utb_free(ir);
   return 0;
 }
@@ -1748,5 +1601,4 @@ UT_COVERS("const_var_prop");
 UT_COVERS("const_prop_tmp");
 UT_COVERS("global_init_prop");
 UT_COVERS("symref_const_prop");
-UT_COVERS("complex_const_param_fold");
 UT_COVERS("value_tracking");

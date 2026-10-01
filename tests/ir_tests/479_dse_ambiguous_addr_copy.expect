@@ -1,0 +1,7 @@
+wide op=0 n=2: 202 401
+wide op=0 n=5: 105 306
+wide op=1 n=2: 402 401
+wide op=1 n=5: 405 404
+wide op=2 n=2: 102 101
+wide op=2 n=5: 105 104
+narrow op=0 n=7: 207 -1

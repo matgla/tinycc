@@ -128,7 +128,7 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
           if (irop_get_vreg(tcc_ir_op_get_src2(ir, eq)) == adst_vr)
             safe = 0;
         }
-        if (safe && eq->op == TCCIR_OP_MLA) {
+        if (safe && tcc_ir_op_is_mac(eq->op)) {
           if (irop_get_vreg(tcc_ir_op_get_accum(ir, eq)) == adst_vr)
             safe = 0;
         }

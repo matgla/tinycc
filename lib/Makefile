@@ -76,7 +76,7 @@ OBJ-arm-vfp = $(OBJ-arm)
 OBJ-arm-eabi = $(OBJ-arm)
 OBJ-arm-eabihf = $(OBJ-arm)
 OBJ-arm-wince = $(ARM_O) $(WIN_O)
-OBJ-armv8m = libtcc1.o alloca.o armeabi.o armeabi_divmod.o va_list.o builtin.o arm_string.o
+OBJ-armv8m = libtcc1.o alloca.o armeabi.o armeabi_divmod.o va_list.o builtin.o arm_string.o arm_mem.o arm_copystub.o
 OBJ-riscv64 = $(RISCV64_O) $(LIN_O)
 
 OBJ-extra = $(filter $(EXTRA_O),$(OBJ-$T))
@@ -100,6 +100,12 @@ $(TOP)/%.o : %.c $(TCC)
 	$S$(XCC) -c $< -o $@ $(XFLAGS)
 
 $(TOP)/bcheck.o : XFLAGS += $(BFLAGS) -I$(TOP)
+# libtcc1 is linked into modules of every GOT size and its slots come after the
+# module's own, so its one global-reading member must not use the 4 KB-reach
+# `ldr Rt,[r9,#imm12]` form (ctags' 13 KB GOT put chk_calls at offset 13040).
+ifeq ($T,armv8m)
+$(X)builtin.o : XFLAGS += -mno-sb-relative-got
+endif
 # includes tccrun.c, $(TOP) for config.h  (tccrun.c prerequisite via $(TCC))
 $(TOP)/bt-exe.o : XFLAGS += -I$(TOP)
 

@@ -69,7 +69,9 @@ static double aeabi_dneg_impl(double a)
 
 /* ARM EABI required symbols for non-FP operations */
 
-/* Memory functions required by EABI */
+/* Memory functions required by EABI.  ARMv8-M takes them from arm_mem.S
+ * (LDM/STM blocks); these byte/word loops remain for the other ARM targets. */
+#if !defined(__ARM_ARCH_8M__)
 
 /* NOTE: ARM EABI defines __aeabi_memset() argument order as (dest, n, c),
  * i.e. it differs from ISO C memset(dest, c, n).
@@ -200,6 +202,8 @@ void __aeabi_memclr(void *dest, size_t n)
   (void)__aeabi_memset(dest, n, 0);
 }
 
+#endif /* !__ARM_ARCH_8M__ */
+
 /* Division functions */
 
 /* Unsigned 32-bit division */
@@ -256,31 +260,65 @@ typedef struct
   u32 remainder_high;
 } uint64_div_result;
 
-static int u64_ge(u32 a_lo, u32 a_hi, u32 b_lo, u32 b_hi)
+static int armeabi_clz32(u32 x);
+
+/* 32 x 32 -> 64 multiply from 16-bit halves (32-bit operations only). */
+static void umul32(u32 a, u32 b, u32 *lo, u32 *hi)
 {
-  /* Compare 64-bit values: return 1 if a >= b, else 0 */
-  if (a_hi > b_hi)
-    return 1;
-  if (a_hi < b_hi)
-    return 0;
-  /* High words equal, compare low words (unsigned) */
-  if (a_lo > b_lo)
-    return 1;
-  if (a_lo < b_lo)
-    return 0;
-  return 1; /* equal */
+  u32 al = a & 0xFFFFu, ah = a >> 16, bl = b & 0xFFFFu, bh = b >> 16;
+  u32 ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
+  u32 mid = (ll >> 16) + (lh & 0xFFFFu) + (hl & 0xFFFFu);
+  *lo = (ll & 0xFFFFu) | (mid << 16);
+  *hi = hh + (lh >> 16) + (hl >> 16) + (mid >> 16);
 }
 
-static inline void u64_sub(u32 *a_lo, u32 *a_hi, u32 b_lo, u32 b_hi)
+/* (u1:u0) / v for u1 < v: a 32-bit quotient, the remainder in *r.
+ * Hacker's Delight divlu: normalise v, then two 16-bit quotient digits, each
+ * estimated by dividing by v's top 16 bits (UDIV on ARMv8-M) and corrected
+ * at most twice. */
+static u32 divlu(u32 u1, u32 u0, u32 v, u32 *r)
 {
-  const u32 old_lo = *a_lo;
-  *a_lo = old_lo - b_lo;
-  const u32 borrow = (old_lo < b_lo);
-  *a_hi = *a_hi - b_hi - borrow;
+  int s = armeabi_clz32(v);
+  u32 vn1, vn0, un32, un21, un10, un1, un0, q1, q0, rhat;
+
+  v <<= s;
+  vn1 = v >> 16;
+  vn0 = v & 0xFFFFu;
+  un32 = s ? (u1 << s) | (u0 >> (32 - s)) : u1;
+  un10 = u0 << s;
+  un1 = un10 >> 16;
+  un0 = un10 & 0xFFFFu;
+
+  q1 = un32 / vn1;
+  rhat = un32 - q1 * vn1;
+  while (q1 > 0xFFFFu || q1 * vn0 > ((rhat << 16) | un1))
+  {
+    q1--;
+    rhat += vn1;
+    if (rhat > 0xFFFFu)
+      break;
+  }
+  un21 = (un32 << 16) + un1 - q1 * v;
+
+  q0 = un21 / vn1;
+  rhat = un21 - q0 * vn1;
+  while (q0 > 0xFFFFu || q0 * vn0 > ((rhat << 16) | un0))
+  {
+    q0--;
+    rhat += vn1;
+    if (rhat > 0xFFFFu)
+      break;
+  }
+  *r = ((un21 << 16) + un0 - q0 * v) >> s;
+  return (q1 << 16) | q0;
 }
 
+/* 64 / 64 division (Hacker's Delight divdu), dividing by zero gives 0 rem 0.
+ * The bit-at-a-time loop this replaces took ~2,600 instructions a call. */
 static void udivmod_u64(uint64_div_result *out, u32 n_lo, u32 n_hi, u32 d_lo, u32 d_hi)
 {
+  u32 s, v1, q0, junk, p_lo, p_hi, r_lo, r_hi;
+
   out->quotient_low = 0;
   out->quotient_high = 0;
   out->remainder_low = 0;
@@ -289,31 +327,45 @@ static void udivmod_u64(uint64_div_result *out, u32 n_lo, u32 n_hi, u32 d_lo, u3
   if ((d_lo | d_hi) == 0)
     return;
 
-  int debug_count = 0;
-
-  for (int i = 63; i >= 0; --i)
+  if (d_hi == 0)
   {
-    /* r <<= 1 */
-    out->remainder_high = (out->remainder_high << 1) | (out->remainder_low >> 31);
-    out->remainder_low <<= 1;
-
-    /* r |= (n >> i) & 1 */
-    u32 bit;
-    if (i >= 32)
-      bit = (n_hi >> (i - 32)) & 1u;
-    else
-      bit = (n_lo >> i) & 1u;
-    out->remainder_low |= bit;
-
-    if (u64_ge(out->remainder_low, out->remainder_high, d_lo, d_hi))
+    u32 k = n_hi;
+    if (n_hi >= d_lo)
     {
-      u64_sub(&out->remainder_low, &out->remainder_high, d_lo, d_hi);
-      if (i >= 32)
-        out->quotient_high |= (1u << (i - 32));
-      else
-        out->quotient_low |= (1u << i);
+      out->quotient_high = n_hi / d_lo;
+      k = n_hi - out->quotient_high * d_lo;
     }
+    out->quotient_low = divlu(k, n_lo, d_lo, &out->remainder_low);
+    return;
   }
+
+  if (n_hi < d_hi || (n_hi == d_hi && n_lo < d_lo))
+  {
+    out->remainder_low = n_lo;
+    out->remainder_high = n_hi;
+    return;
+  }
+
+  /* d >= 2^32: the quotient fits 32 bits.  Estimate it from n / 2 over the
+   * top 32 bits of d normalised; the estimate is exact or one too big. */
+  s = armeabi_clz32(d_hi);
+  v1 = s ? (d_hi << s) | (d_lo >> (32 - s)) : d_hi;
+  q0 = divlu(n_hi >> 1, (n_lo >> 1) | (n_hi << 31), v1, &junk) >> (31 - s);
+  if (q0 != 0)
+    q0--;
+  umul32(q0, d_lo, &p_lo, &p_hi);
+  p_hi += q0 * d_hi;
+  r_lo = n_lo - p_lo;
+  r_hi = n_hi - p_hi - (n_lo < p_lo);
+  if (r_hi > d_hi || (r_hi == d_hi && r_lo >= d_lo))
+  {
+    q0++;
+    r_hi = r_hi - d_hi - (r_lo < d_lo);
+    r_lo -= d_lo;
+  }
+  out->quotient_low = q0;
+  out->remainder_low = r_lo;
+  out->remainder_high = r_hi;
 }
 
 /* Helpers for __aeabi_{u,}ldivmod wrappers.

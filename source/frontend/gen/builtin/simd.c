@@ -363,10 +363,11 @@ void __attribute__((noinline)) unary_builtin_shuffle(void)
       Sym *s;
       for (s = local_stack; s; s = s->prev)
       {
-        if (s->const_init_data && s->const_init_valid && (int)s->c == mask_addr &&
-            s->const_init_size >= elem_count * mask_elem_size)
+        const SymLocalFacts *f = SYM_FACTS(s);
+        if (f->const_init_data && f->const_init_valid && (int)s->c == mask_addr &&
+            f->const_init_size >= elem_count * mask_elem_size)
         {
-          mask_const = s->const_init_data;
+          mask_const = f->const_init_data;
           break;
         }
       }

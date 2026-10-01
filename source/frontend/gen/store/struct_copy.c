@@ -253,3 +253,165 @@ int struct_is_single_1byte_scalar_member(const CType *type)
     return 0;
   return type_size(&f->type, &align) == 1;
 }
+
+/* Mark the bytes of `t` placed at `base` as covered, rejecting anything the
+ * chunked copy below cannot move without splitting an access: a scalar or
+ * bitfield unit wider than the chunk width `w` (a later read of it would be
+ * wider than the stores that wrote it, which store-load forwarding must not
+ * partial-forward), or one not naturally aligned inside the aggregate. */
+static int small_copy_cover(const CType *t, int base, int w, int size, unsigned char *covered)
+{
+  int align, n;
+
+  if (t->t & VT_ARRAY)
+  {
+    const CType *et = pointed_type((CType *)t);
+    int esize = type_size((CType *)et, &align);
+    if (!t->ref || t->ref->c < 0 || esize <= 0)
+      return 0; /* flexible/incomplete array member */
+    for (int i = 0; i < t->ref->c; i++)
+      if (!small_copy_cover(et, base + i * esize, w, size, covered))
+        return 0;
+    return 1;
+  }
+  if ((t->t & VT_BTYPE) == VT_STRUCT) /* struct or union */
+  {
+    if (!t->ref)
+      return 0;
+    for (Sym *f = t->ref->next; f; f = f->next)
+    {
+      if (f->type.t & VT_BITFIELD)
+      {
+        int bw = bitfield_unit_width(f);
+        int off = base + (f->c & ~(bw - 1));
+        if (bw != 1 && bw != 2 && bw != 4)
+          return 0;
+        if (bw > w || off < 0 || off + bw > size || (off % bw))
+          return 0;
+        for (int k = off; k < off + bw; k++)
+          covered[k] = 1;
+      }
+      else if (!small_copy_cover(&f->type, base + f->c, w, size, covered))
+        return 0;
+    }
+    return 1;
+  }
+  if (t->t & (VT_VECTOR | VT_COMPLEX | VT_VLA))
+    return 0;
+  n = type_size((CType *)t, &align);
+  if (n == 0)
+    return 1; /* zero-sized member */
+  if ((n != 1 && n != 2 && n != 4) || n > w || base < 0 || base + n > size || (base % n))
+    return 0; /* 8-byte scalars keep memmove: a split one would be read wider */
+  for (int k = base; k < base + n; k++)
+    covered[k] = 1;
+  return 1;
+}
+
+/* Plan the copy of a small aggregate for ir_emit_small_aggregate_copy: every
+ * chunk has one width w = min(4, the type's alignment, the alignment of each
+ * frame/global base offset), so each field sits inside a single chunk and no
+ * chunk is narrower than a field it holds.  Returns the number of chunks that
+ * carry data (pure-padding chunks are not copied), or 0 if the type cannot be
+ * tiled that way.  `src_off`/`dst_off` are the c.i of a LOCAL/GLOBAL side, or
+ * -1 for a register-deref side, which is trusted to the type's alignment. */
+int small_aggregate_copy_plan(const CType *stype, int size, int align, int src_off, int dst_off, int *w_out,
+                              unsigned char *covered)
+{
+  int w = align < 4 ? align : 4, chunks = 0;
+  if (size <= 0 || size > SMALL_AGGREGATE_COPY_MAX || w <= 0)
+    return 0;
+  while (w > 1 && ((src_off >= 0 && (src_off % w)) || (dst_off >= 0 && (dst_off % w))))
+    w >>= 1;
+  if (size % w)
+    return 0;
+  memset(covered, 0, SMALL_AGGREGATE_COPY_MAX);
+  if (!small_copy_cover(stype, 0, w, size, covered))
+    return 0;
+  for (int p = 0; p < size; p += w)
+  {
+    int any = 0;
+    for (int k = p; k < p + w; k++)
+      any |= covered[k];
+    chunks += any;
+  }
+  *w_out = w;
+  return chunks;
+}
+
+/* Address `side` + off as an lvalue of type `ct`.  A LOCAL/GLOBAL side takes the
+ * offset in c.i; a register-deref side (whose c.i the codegen does not honour)
+ * gets an explicit ADD, which displacement fusion later folds into the access. */
+static SValue small_copy_lval(const SValue *side, int is_deref, int off, CType ct)
+{
+  SValue v;
+  svalue_init(&v);
+  v.type = ct;
+  if (is_deref && off != 0)
+  {
+    SValue base, imm, ptr;
+    svalue_init(&base);
+    base.type.t = VT_PTR;
+    base.vr = side->vr;
+    base.r = 0;
+    svalue_init(&imm);
+    imm.type.t = VT_INT;
+    imm.r = VT_CONST;
+    imm.vr = -1;
+    imm.c.i = off;
+    svalue_init(&ptr);
+    ptr.type.t = VT_PTR;
+    ptr.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+    ptr.r = 0;
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_ADD, &base, &imm, &ptr);
+    v.r = VT_LVAL;
+    v.vr = ptr.vr;
+    return v;
+  }
+  v.r = side->r;
+  v.vr = side->vr;
+  v.sym = side->sym;
+  v.c.i = side->c.i + off;
+  return v;
+}
+
+/* Copy a small aggregate planned by small_aggregate_copy_plan as w-byte LOAD /
+ * STORE pairs visible to the optimizer, instead of an opaque __aeabi_memmove
+ * call: every LOAD first, then every STORE, so an overlapping copy still has
+ * memmove semantics. */
+void ir_emit_small_aggregate_copy(const SValue *src, int src_deref, const SValue *dst, int dst_deref, int size,
+                                  int w, const unsigned char *covered)
+{
+  int tmp_vr[SMALL_AGGREGATE_COPY_MAX];
+  CType ct;
+  ct.ref = NULL;
+  ct.t = (w == 1 ? (VT_BYTE | VT_UNSIGNED) : w == 2 ? (VT_SHORT | VT_UNSIGNED) : VT_INT);
+
+  for (int p = 0; p < size; p += w)
+  {
+    int any = 0;
+    for (int k = p; k < p + w; k++)
+      any |= covered[k];
+    tmp_vr[p / w] = -1;
+    if (!any)
+      continue; /* padding only */
+    SValue s = small_copy_lval(src, src_deref, p, ct), tmp;
+    svalue_init(&tmp);
+    tmp.type = ct;
+    tmp.r = 0;
+    tmp.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, &s, NULL, &tmp);
+    tmp_vr[p / w] = tmp.vr;
+  }
+  for (int p = 0; p < size; p += w)
+  {
+    if (tmp_vr[p / w] < 0)
+      continue;
+    SValue tmp, d = small_copy_lval(dst, dst_deref, p, ct);
+    svalue_init(&tmp);
+    tmp.type = ct;
+    tmp.r = 0;
+    tmp.vr = tmp_vr[p / w];
+    tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &d);
+  }
+}
