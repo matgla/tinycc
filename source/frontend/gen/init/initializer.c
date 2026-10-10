@@ -91,6 +91,14 @@ void skip_or_save_block(TokenString **str)
       (*str)->len = recorded_len;
     }
     tok_str_add(*str, TOK_EOF);
+    /* A saved block is complete: give back the doubling slack.  At -O2 every
+       function body of the TU waits here as tokens until the end of the TU,
+       a quarter of it unused capacity on average. */
+    if ((*str)->allocated_len > (*str)->len)
+    {
+      (*str)->data.str = tcc_realloc((*str)->data.str, (*str)->len * sizeof(int));
+      (*str)->allocated_len = (*str)->len;
+    }
   }
 }
 
@@ -287,6 +295,8 @@ void decl_design_flex(init_params *p, Sym *ref, int index)
 {
   if (ref == p->flex_array_ref)
   {
+    if (p->flex_array_bounded && index >= p->flex_array_max)
+      tcc_error("initializer of flexible array member does not fit in the union");
     if (index >= ref->c)
       ref->c = index + 1;
   }
@@ -309,6 +319,9 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
   Sym *s, *f;
   int index, index_last, align, l, nb_elems, elem_size;
   unsigned long corig = c;
+  /* an array element keeps the byte order of its array; a member takes its
+     own (big-endian scalar_storage_order marks every member) */
+  int sso_be = p->sso_be;
 
   elem_size = 0;
   nb_elems = 1;
@@ -362,6 +375,7 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
         *cur_field = f;
       type = &f->type;
       c += cumofs;
+      sso_be = f->a.sso_be;
     }
     cur_field = NULL;
   }
@@ -400,6 +414,7 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
         tcc_error("too many initializers");
       type = &f->type;
       c += f->c;
+      sso_be = f->a.sso_be;
     }
   }
 
@@ -415,7 +430,10 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
     flags &= ~DIF_CLEAR; /* mark stack dirty too */
   }
 
+  const int sso_be_outer = p->sso_be;
+  p->sso_be = sso_be;
   decl_initializer(p, type, c, flags & ~DIF_FIRST, -1);
+  p->sso_be = sso_be_outer;
 
   if (!(flags & DIF_SIZE_ONLY) && nb_elems > 1)
   {
@@ -460,6 +478,33 @@ int decl_designator(init_params *p, CType *type, unsigned long c, Sym **cur_fiel
   return al;
 }
 
+/* The value just written at sec+c is `&&lab1 - &&lab0` (vtop carries the label
+ * difference marker): remember to add the label offset difference, in `size`
+ * bytes, once the function's code is laid out. */
+static void label_diff_record(Section *sec, unsigned long c, int size)
+{
+  LabelDiffFixup *fixup = tcc_malloc(sizeof(LabelDiffFixup));
+  fixup->sec = sec;
+  fixup->offset = c;
+  fixup->size = size;
+  fixup->sym_plus = pending_label_diff_plus;
+  fixup->sym_minus = pending_label_diff_minus;
+  fixup->next = tcc_state->label_diff_fixups;
+  tcc_state->label_diff_fixups = fixup;
+  pending_label_diff_plus = NULL;
+  pending_label_diff_minus = NULL;
+}
+
+static void sso_reverse_bytes(unsigned char *b, int n)
+{
+  for (int i = 0; i < n / 2; i++)
+  {
+    unsigned char t = b[i];
+    b[i] = b[n - 1 - i];
+    b[n - 1 - i] = t;
+  }
+}
+
 /* store a value or an expression directly in global data or in local array */
 void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
 {
@@ -472,11 +517,21 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
 
   dtype = *type;
   dtype.t &= ~VT_CONSTANT; /* need to do that to avoid false warning */
+  if (type->t & VT_RODATA_REL)
+  {
+    /* The relocation encodes it (rodata_rel_init); only a static object has
+       one, an automatic one would be filled by a store. */
+    if (!sec)
+      rodata_rel_store_error();
+    dtype.t &= ~VT_RODATA_REL;
+  }
 
   size = type_size(type, &align);
   if (type->t & VT_BITFIELD)
     size = (BIT_POS(type->t) + BIT_SIZE(type->t) + 7) / 8;
   init_assert(p, c + size);
+  /* bytes of a byte-reversed scalar (big-endian scalar_storage_order) */
+  const int sso_size = p->sso_be ? sso_scalar_size(type) : 0;
 
   if (p->const_probe)
   {
@@ -486,8 +541,17 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
      * out-of-range offset) aborts the templating attempt. */
     int pbt = type->t & VT_BTYPE;
     int rel = (int)c - p->const_probe_base;
+    /* Convert to the element type first, as vstore does: a float constant into
+       an int element, or any non-zero constant into a _Bool, must not be
+       written raw.  The probe fails below unless the result is still a plain
+       constant. */
+    if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && !(type->t & VT_BITFIELD) &&
+        !(type->t & VT_COMPLEX) && pbt != VT_STRUCT)
+      gen_assign_cast(&dtype);
     if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && !(type->t & VT_BITFIELD) &&
         !(type->t & VT_COMPLEX) &&
+        (vtop->type.t & VT_BTYPE) != VT_FLOAT && (vtop->type.t & VT_BTYPE) != VT_DOUBLE &&
+        (vtop->type.t & VT_BTYPE) != VT_LDOUBLE &&
         (pbt == VT_BOOL || pbt == VT_BYTE || pbt == VT_SHORT || pbt == VT_INT || pbt == VT_LLONG || pbt == VT_PTR) &&
         rel >= 0 && rel + size <= p->const_probe_size)
     {
@@ -511,6 +575,7 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
         p->const_probe_failed = 1;
         break;
       }
+      sso_reverse_bytes(d, sso_size);
     }
     else
     {
@@ -527,7 +592,11 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
     gen_assign_cast(&dtype);
     bt = type->t & VT_BTYPE;
 
-    if ((vtop->r & VT_SYM) && bt != VT_PTR && (bt != (PTR_SIZE == 8 ? VT_LLONG : VT_INT) || (type->t & VT_BITFIELD)) &&
+    int is_label_diff = (vtop->r & VT_SYM) && vtop->sym == &label_diff_marker;
+    if (is_label_diff && (type->t & VT_BITFIELD || (bt != VT_BYTE && bt != VT_SHORT && bt != VT_INT && bt != VT_PTR)))
+      tcc_error("initializer element is not computable at load time");
+    if (!is_label_diff && (vtop->r & VT_SYM) && bt != VT_PTR &&
+        (bt != (PTR_SIZE == 8 ? VT_LLONG : VT_INT) || (type->t & VT_BITFIELD)) &&
         !((vtop->r & VT_CONST) && vtop->sym->v >= SYM_FIRST_ANOM))
       tcc_error("initializer element is not computable at load time");
 
@@ -561,7 +630,8 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
       ElfW_Rel *rel;
       esym = elfsym(vtop->sym);
       ssec = tcc_state->sections[esym->st_shndx];
-      memmove(ptr, ssec->data + esym->st_value + (int)vtop->c.i, size);
+      const unsigned long base = esym->st_value + (int)vtop->c.i;
+      memmove(ptr, ssec->data + base, size);
       if (ssec->reloc)
       {
         /* We need to copy over all memory contents, and that
@@ -573,11 +643,11 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
         {
           relofs -= sizeof(*rel);
           rel = (ElfW_Rel *)(ssec->reloc->data + relofs);
-          if (rel->r_offset >= esym->st_value + size)
+          if (rel->r_offset >= base + size)
             continue;
-          if (rel->r_offset < esym->st_value)
+          if (rel->r_offset < base)
             break;
-          put_elf_reloca(symtab_section, sec, c + rel->r_offset - esym->st_value, ELFW(R_TYPE)(rel->r_info),
+          put_elf_reloca(symtab_section, sec, c + rel->r_offset - base, ELFW(R_TYPE)(rel->r_info),
                          ELFW(R_SYM)(rel->r_info),
 #if PTR_SIZE == 8
                          rel->r_addend
@@ -594,6 +664,11 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
       {
         int bit_pos, bit_size, bits, n;
         unsigned char *p, v, m;
+        /* a big-endian scalar_storage_order unit: its bit position counts
+           from the LSB of the swapped value */
+        const Sym *bf = type->ref;
+        const int unit = bf && bf->a.sso_be ? bf->r : 0;
+        sso_reverse_bytes(ptr, unit);
         bit_pos = BIT_POS(vtop->type.t);
         bit_size = BIT_SIZE(vtop->type.t);
         p = (unsigned char *)ptr + (bit_pos >> 3);
@@ -608,6 +683,7 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
           *p = (*p & ~m) | (v & m);
           bits += n, bit_size -= n, bit_pos = 0, ++p;
         }
+        sso_reverse_bytes(ptr, unit);
       }
       else if (type->t & VT_COMPLEX)
       {
@@ -632,9 +708,13 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
           break;
         case VT_BYTE:
           *(char *)ptr = val;
+          if (is_label_diff)
+            label_diff_record(sec, c, 1);
           break;
         case VT_SHORT:
           write16le(ptr, val);
+          if (is_label_diff)
+            label_diff_record(sec, c, 2);
           break;
         case VT_FLOAT:
           write32le(ptr, val);
@@ -691,7 +771,18 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
           break;
         case VT_PTR:
         case VT_INT:
-          if (vtop->r & VT_SYM)
+          if (type->t & VT_RODATA_REL)
+          {
+            rodata_rel_init(sec, c);
+            break;
+          }
+          if ((vtop->r & VT_SYM) && vtop->sym == &label_diff_marker)
+          {
+            /* &&lab1 - &&lab0: the value written is the addend difference;
+               the label offsets are added once the function is generated. */
+            label_diff_record(sec, c, 4);
+          }
+          else if (vtop->r & VT_SYM)
           {
             /* Debug check for garbage symbol */
             if (!vtop->sym || vtop->sym->v >= SYM_FIRST_ANOM + 100000)
@@ -702,25 +793,18 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
             greloc(sec, vtop->sym, c, R_DATA_PTR);
           }
           write32le(ptr, val);
-          /* Record deferred label-difference fixup (&&lab1 - &&lab0) if pending */
-          if (pending_label_diff_plus)
-          {
-            LabelDiffFixup *fixup = tcc_malloc(sizeof(LabelDiffFixup));
-            fixup->sec = sec;
-            fixup->offset = c;
-            fixup->sym_plus = pending_label_diff_plus;
-            fixup->sym_minus = pending_label_diff_minus;
-            fixup->next = tcc_state->label_diff_fixups;
-            tcc_state->label_diff_fixups = fixup;
-            pending_label_diff_plus = NULL;
-            pending_label_diff_minus = NULL;
-          }
           break;
 #endif
         default:
           // tcc_internal_error("unexpected type");
           break;
         }
+      if (sso_size)
+      {
+        if (vtop->r & VT_SYM)
+          tcc_error("initializer element is not computable at load time");
+        sso_reverse_bytes(ptr, sso_size);
+      }
     }
     vtop--;
     print_vstack("init_putv(2)");
@@ -730,17 +814,27 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
     /* Capture scalar constant into the tracked sym's const_init_data
      * before vstore (which pops the value). Buffer was zeroed at
      * allocation time, so zero values can be silently dropped. */
-    if (p->const_init_sym && p->const_init_sym->facts->const_init_valid)
+    SymLocalFacts *cf = p->const_init_sym ? sym_facts_peek(p->const_init_sym) : NULL;
+    if (cf && cf->const_init_valid)
     {
       int rel_off = (int)c - p->const_init_base;
       int bt = type->t & VT_BTYPE;
-      if (rel_off >= 0 && rel_off + size <= p->const_init_sym->facts->const_init_size && !(type->t & VT_BITFIELD) &&
+      /* An element the buffer cannot record (a whole struct or vector, a
+       * bitfield) leaves its bytes unknown.  A copy from a source with known
+       * bytes re-validates the buffer in vstore. */
+      if (rel_off + size > 0 && rel_off < cf->const_init_size && ((type->t & VT_BITFIELD) || bt == VT_STRUCT))
+        cf->const_init_valid = 0;
+      if (rel_off >= 0 && rel_off + size <= cf->const_init_size && !(type->t & VT_BITFIELD) &&
           bt != VT_STRUCT)
       {
+        /* Convert to the element type first, as vstore does: the buffer must
+           hold the stored representation, not the source constant's bits. */
+        if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && !(type->t & VT_COMPLEX))
+          gen_assign_cast(&dtype);
         if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
         {
           uint64_t cval = (uint64_t)vtop->c.i;
-          unsigned char *dst = p->const_init_sym->facts->const_init_data + rel_off;
+          unsigned char *dst = cf->const_init_data + rel_off;
           switch (size)
           {
           case 1:
@@ -756,13 +850,14 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
             write64le(dst, cval);
             break;
           default:
-            p->const_init_sym->facts->const_init_valid = 0;
+            cf->const_init_valid = 0;
             break;
           }
+          sso_reverse_bytes(dst, sso_size);
         }
         else
         {
-          p->const_init_sym->facts->const_init_valid = 0;
+          cf->const_init_valid = 0;
         }
       }
     }
@@ -784,123 +879,10 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg)
         tcc_ir_set_llong_type(tcc_state->ir, vtop->vr);
       }
     }
+    vtop->sso_reversed = sso_size != 0;
     vswap();
     vstore();
     vpop();
   }
 }
 
-/* Byte-swap bitfield storage units for big-endian scalar_storage_order structs.
-   Called after all fields have been initialized with LE byte order.
-   Swaps the bytes of each bitfield storage unit to produce BE layout. */
-void sso_swap_struct_init(init_params *p, CType *type, unsigned long c)
-{
-  Sym *s = type->ref;
-  int last_offset = -1;
-  Sym *f;
-
-  for (f = s->next; f; f = f->next)
-  {
-    if (!(f->type.t & VT_BITFIELD) || !f->a.sso_be || BIT_SIZE(f->type.t) == 0)
-      continue;
-    int unit_bytes = f->r;
-    if (unit_bytes <= 1)
-      continue;
-    /* Only swap each storage unit once (skip fields sharing the same offset) */
-    if (f->c == last_offset)
-      continue;
-    last_offset = f->c;
-    unsigned long addr = c + f->c;
-
-    if (p->sec)
-    {
-      /* Section case: directly swap bytes in section data */
-      unsigned char *ptr = p->sec->data + addr;
-      int i;
-      for (i = 0; i < unit_bytes / 2; i++)
-      {
-        unsigned char tmp = ptr[i];
-        ptr[i] = ptr[unit_bytes - 1 - i];
-        ptr[unit_bytes - 1 - i] = tmp;
-      }
-    }
-    else
-    {
-      /* Local variable case: generate code to byte-swap at runtime */
-      if (unit_bytes == 2)
-      {
-        CType ushort_type;
-        ushort_type.t = VT_SHORT | VT_UNSIGNED;
-        ushort_type.ref = NULL;
-
-        /* Load 16-bit value, byte-swap, store back:
-         *(uint16_t*)addr = ((val >> 8) & 0xFF) | ((val & 0xFF) << 8) */
-        vset(&ushort_type, VT_LOCAL | VT_LVAL, addr);
-        vdup();
-        /* (val >> 8) & 0xFF */
-        vpushi(8);
-        gen_op(TOK_SHR);
-        vpushi(0xFF);
-        gen_op('&');
-        vswap();
-        /* (val & 0xFF) << 8 */
-        vpushi(0xFF);
-        gen_op('&');
-        vpushi(8);
-        gen_op(TOK_SHL);
-        /* combine */
-        gen_op('|');
-        /* store back */
-        vset(&ushort_type, VT_LOCAL | VT_LVAL, addr);
-        vswap();
-        vstore();
-        vpop();
-      }
-      else if (unit_bytes == 4)
-      {
-        CType uint_type;
-        uint_type.t = VT_INT | VT_UNSIGNED;
-        uint_type.ref = NULL;
-
-        /* 32-bit byte swap:
-           result = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00)
-                  | ((val << 8) & 0xFF0000) | ((val << 24) & 0xFF000000) */
-        vset(&uint_type, VT_LOCAL | VT_LVAL, addr);
-        /* val >> 24 */
-        vdup();
-        vpushi(24);
-        gen_op(TOK_SHR);
-        vpushi(0xFF);
-        gen_op('&');
-        vswap();
-        /* val >> 8 & 0xFF00 */
-        vdup();
-        vpushi(8);
-        gen_op(TOK_SHR);
-        vpushi(0xFF00);
-        gen_op('&');
-        vrotb(3);
-        gen_op('|');
-        vswap();
-        /* val << 8 & 0xFF0000 */
-        vdup();
-        vpushi(8);
-        gen_op(TOK_SHL);
-        vpushi(0xFF0000);
-        gen_op('&');
-        vrotb(3);
-        gen_op('|');
-        vswap();
-        /* val << 24 */
-        vpushi(24);
-        gen_op(TOK_SHL);
-        gen_op('|');
-        /* store back */
-        vset(&uint_type, VT_LOCAL | VT_LVAL, addr);
-        vswap();
-        vstore();
-        vpop();
-      }
-    }
-  }
-}

@@ -42,11 +42,11 @@ int dce_temp_worklist(IRSSAOptCtx *ctx)
     /* Only ever delete this vreg's own definition: a stale def_instr must not
      * take an unrelated instruction with it. */
     if (!irop_config[q->op].has_dest ||
-        irop_get_vreg(tcc_ir_op_get_dest(ctx->ir, q)) != TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, pos))
+        tcc_ir_op_dest_vreg(ctx->ir, q) != TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, pos))
       continue;
     /* A write to a volatile slot is a mandated side effect even if never read. */
     if (irop_config[q->op].has_dest) {
-      int32_t dvr = irop_get_vreg(tcc_ir_op_get_dest(ctx->ir, q));
+      int32_t dvr = tcc_ir_op_dest_vreg(ctx->ir, q);
       int dt = (dvr >= 0) ? TCCIR_DECODE_VREG_TYPE(dvr) : -1;
       if (dt == TCCIR_VREG_TYPE_VAR || dt == TCCIR_VREG_TYPE_PARAM) {
         IRLiveInterval *div = tcc_ir_get_live_interval(ctx->ir, dvr);
@@ -67,7 +67,7 @@ int dce_temp_worklist(IRSSAOptCtx *ctx)
           killable = 1;
       }
       if (q->op == TCCIR_OP_FUNCCALLVAL) {
-        Sym *callee = irop_get_sym_ex(ctx->ir, tcc_ir_op_get_src1(ctx->ir, q));
+        Sym *callee = tcc_ir_op_src1_sym(ctx->ir, q);
         const char *name = callee ? get_tok_str(callee->v, NULL) : NULL;
         if (name && (tcc_ir_is_pure_aeabi(name) || ir_opt_is_pure_helper_name(name) ||
                      ir_opt_is_readonly_str_helper_name(name)))
@@ -82,16 +82,13 @@ int dce_temp_worklist(IRSSAOptCtx *ctx)
     TCCIRState *ir = ctx->ir;
 
     if (irop_config[q->op].has_src1) {
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      op_vregs[nops++] = irop_get_vreg(s);
+      op_vregs[nops++] = tcc_ir_op_src1_vreg(ir, q);
     }
     if (irop_config[q->op].has_src2) {
-      IROperand s = tcc_ir_op_get_src2(ir, q);
-      op_vregs[nops++] = irop_get_vreg(s);
+      op_vregs[nops++] = tcc_ir_op_src2_vreg(ir, q);
     }
     if (q->op == TCCIR_OP_MLA) {
-      IROperand a = tcc_ir_op_get_accum(ir, q);
-      op_vregs[nops++] = irop_get_vreg(a);
+      op_vregs[nops++] = tcc_ir_op_accum_vreg(ir, q);
     }
 
     ssa_opt_nop_instr(ctx, def);

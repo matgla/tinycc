@@ -50,19 +50,16 @@ static void dump_ir_after_pass(TCCIRState *ir, const char *pass_name)
 /* ================================================================== */
 static void run_propagation_passes(TCCIRState *ir)
 {
-  if (tcc_state->opt_ipc)
+  if (TCC_OPT(tcc_state, opt_ipc))
   {
     tcc_ir_opt_const_call_replace(ir);
     DUMP_IR_AFTER_PASS(ir, "const_call_replace");
   }
 
   {
-    const IRPassGroup *groups;
-    int group_count;
-    tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
     IROptCtx prop_ctx;
     tcc_ir_opt_ctx_init(&prop_ctx, ir);
-    tcc_ir_opt_run_group(&prop_ctx, &groups[0]);
+    tcc_ir_opt_run_group(&prop_ctx, &propagation_group);
     tcc_ir_opt_ctx_free(&prop_ctx);
   }
   dbg_scan_overlap(ir, "P1-after-prop-group");
@@ -71,7 +68,7 @@ static void run_propagation_passes(TCCIRState *ir)
 
   DUMP_IR_AFTER_PASS(ir, "propagation_group");
 
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("symaddr_cse"))
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("symaddr_cse"))
     tcc_ir_opt_symaddr_cse(ir);
 
   tcc_ir_opt_compact_nops(ir);
@@ -86,37 +83,37 @@ static void run_opt_pipeline(TCCIRState *ir)
   IROptCtx pipeline_ctx;
   tcc_ir_opt_ctx_init(&pipeline_ctx, ir);
 
-  if (tcc_state->optimize > 0)
+  if (TCC_OPT(tcc_state, optimize) > 0)
     tcc_ir_opt_gens_fusion_ex(&pipeline_ctx);
 
-  if (tcc_state->opt_indexed_memory)
+  if (TCC_OPT(tcc_state, opt_indexed_memory))
     tcc_ir_opt_gens_deref_indexed_ex(&pipeline_ctx);
 
-  if (tcc_state->opt_disp_fusion)
+  if (TCC_OPT(tcc_state, opt_disp_fusion))
     tcc_ir_opt_gens_disp_ex(&pipeline_ctx);
 
-  if (tcc_state->opt_disp_fusion)
+  if (TCC_OPT(tcc_state, opt_disp_fusion))
     tcc_ir_opt_add_deref_fold(ir);
 
-  if (tcc_state->opt_disp_fusion) {
+  if (TCC_OPT(tcc_state, opt_disp_fusion)) {
     tcc_ir_opt_ctx_invalidate(&pipeline_ctx);
     tcc_ir_opt_gens_chain_ex(&pipeline_ctx);
     tcc_ir_opt_gens_pair_reorder_ex(&pipeline_ctx);
   }
 
-  if (tcc_state->optimize >= 1)
+  if (TCC_OPT(tcc_state, optimize) >= 1)
     tcc_ir_opt_call_chain_rename(ir);
 
-  if (tcc_state->optimize >= 1)
+  if (TCC_OPT(tcc_state, optimize) >= 1)
     tcc_ir_opt_stackoff_addr_cse(ir);
 
-  if (tcc_state->opt_lea_fold)
+  if (TCC_OPT(tcc_state, opt_lea_fold))
     tcc_ir_opt_lea_fold(ir);
 
-  if (tcc_state->opt_lea_fold)
+  if (TCC_OPT(tcc_state, opt_lea_fold))
     tcc_ir_opt_lea_rmw_fold(ir);
 
-  if (tcc_state->opt_bool_idempotent) {
+  if (TCC_OPT(tcc_state, opt_bool_idempotent)) {
     tcc_ir_opt_ctx_invalidate(&pipeline_ctx);
     tcc_ir_opt_gens_bool_ex(&pipeline_ctx);
   }
@@ -136,13 +133,13 @@ static void run_store_load_fwd_passes(TCCIRState *ir)
   /* Redirect copied-local-field loads to their source global BEFORE store-load
    * forwarding collapses the copy field-stores; the redirected global loads then
    * CSE with the independent source loads and the self-comparisons fold. */
-  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
+  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !ir->has_static_chain)
   {
     if (tcc_ir_opt_copy_source_load_fwd(ir))
       tcc_ir_opt_cmp_expr_fold(ir);
     DUMP_IR_AFTER_PASS(ir, "ZZ_csfwd");
   }
-  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
+  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !ir->has_static_chain)
   {
     IROptCtx esp_ctx;
     tcc_ir_opt_ctx_init(&esp_ctx, ir);
@@ -151,36 +148,33 @@ static void run_store_load_fwd_passes(TCCIRState *ir)
   }
   DUMP_IR_AFTER_PASS(ir, "entry_store_group");
 
-  if (tcc_state->opt_redundant_store)
+  if (TCC_OPT(tcc_state, opt_redundant_store))
   {
     tcc_ir_opt_struct_copy_roundtrip_elim(ir);
   }
 
-  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
+  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !ir->has_static_chain)
   {
-    const IRPassGroup *groups;
-    int group_count;
-    tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
     IROptCtx sl_ctx;
     tcc_ir_opt_ctx_init(&sl_ctx, ir);
-    tcc_ir_opt_run_group(&sl_ctx, &groups[1]);
+    tcc_ir_opt_run_group(&sl_ctx, &memory_group);
     tcc_ir_opt_ctx_free(&sl_ctx);
   }
   DUMP_IR_AFTER_PASS(ir, "memory_group");
 
-  if (tcc_state->opt_store_load_fwd && !ir->has_static_chain)
+  if (TCC_OPT(tcc_state, opt_store_load_fwd) && !ir->has_static_chain)
   {
     tcc_ir_opt_param_addrof_const_fold(ir);
     DUMP_IR_AFTER_PASS(ir, "ZZ_padrof");
     tcc_ir_opt_local_addrof_const_fold(ir);
     DUMP_IR_AFTER_PASS(ir, "ZZ_ladrof");
-    if (tcc_state->opt_const_prop)
+    if (TCC_OPT(tcc_state, opt_const_prop))
       tcc_ir_opt_addrof_var_fwd(ir);
     DUMP_IR_AFTER_PASS(ir, "ZZ_aofvar");
-    if (tcc_state->opt_store_load_fwd)
+    if (TCC_OPT(tcc_state, opt_store_load_fwd))
       tcc_ir_opt_global_sl_fwd(ir);
     DUMP_IR_AFTER_PASS(ir, "ZZ_gslfwd");
-    if (tcc_state->opt_store_load_fwd)
+    if (TCC_OPT(tcc_state, opt_store_load_fwd))
       tcc_ir_opt_invariant_global_load_hoist(ir);
     DUMP_IR_AFTER_PASS(ir, "ZZ_iglh");
   }
@@ -194,27 +188,24 @@ static void run_dead_store_and_cleanup(TCCIRState *ir)
   {
     IROptCtx cr_ctx;
     tcc_ir_opt_ctx_init(&cr_ctx, ir);
-    if (tcc_state->opt_dead_store)
+    if (TCC_OPT(tcc_state, opt_dead_store))
       tcc_ir_opt_gens_call_result_ex(&cr_ctx);
     tcc_ir_opt_ctx_free(&cr_ctx);
   }
 
-  if (tcc_state->opt_dead_store)
+  if (TCC_OPT(tcc_state, opt_dead_store))
     tcc_ir_opt_dead_init_via_call(ir);
   DUMP_IR_AFTER_PASS(ir, "ZZ_dead_init_via_call");
 
   {
-    const IRPassGroup *groups;
-    int group_count;
-    tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &group_count);
-    const IRPassGroup *cleanup_group = &groups[group_count - 1];
+    const IRPassGroup *cleanup_group = &late_cleanup_group;
     IROptCtx cleanup_ctx;
     tcc_ir_opt_ctx_init(&cleanup_ctx, ir);
     tcc_ir_opt_run_group(&cleanup_ctx, cleanup_group);
     tcc_ir_opt_ctx_free(&cleanup_ctx);
     DUMP_IR_AFTER_PASS(ir, "ZZ_late_cleanup_1");
 
-    if (tcc_state->opt_dead_store) {
+    if (TCC_OPT(tcc_state, opt_dead_store)) {
       for (int iter = 0; iter < 4; iter++) {
         IROptCtx ctx_cr;
         tcc_ir_opt_ctx_init(&ctx_cr, ir);
@@ -230,19 +221,20 @@ static void run_dead_store_and_cleanup(TCCIRState *ir)
     }
   }
 
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("memmove_to_indexed_stores"))
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("memmove_to_indexed_stores"))
     tcc_ir_opt_memmove_to_indexed_stores(ir);
+  DUMP_IR_AFTER_PASS(ir, "memmove_to_indexed_stores");
   tcc_ir_opt_compact_nops(ir);
 
   /* Late, for the reason spelled out below: an early run would hide the reads
    * from the interprocedural const cascades.  Unlike the address CSE it keeps
    * one direct SYMREF lvalue read in the IR, so the post-codegen reader
    * analyses stay sound. */
-  if (tcc_state->optimize >= 1)
+  if (TCC_OPT(tcc_state, optimize) >= 1)
     tcc_ir_opt_global_deref_cse(ir);
 
   /* Runs on the single-load shape global_deref_cse produces. */
-  if (tcc_state->optimize >= 1 && tcc_ir_opt_bitfield_unit_narrow(ir) > 0)
+  if (TCC_OPT(tcc_state, optimize) >= 1 && tcc_ir_opt_bitfield_unit_narrow(ir) > 0)
     tcc_ir_opt_compact_nops(ir);
 
   /* NOTE: a "late" symbol-address CSE run (lval loads/stores and symref
@@ -283,55 +275,56 @@ static void run_post_pipeline_passes(TCCIRState *ir)
    * without it), i.e. it currently masks a latent 64-bit bitfield bug in the
    * unoptimized path.  Gating it would expose that bug at -O0; it needs a
    * real fix in the OR/SHL lowering first. */
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("memmove_to_indexed_stores") &&
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("memmove_to_indexed_stores") &&
       tcc_ir_opt_memmove_to_indexed_stores(ir) > 0)
   {
+    DUMP_IR_AFTER_PASS(ir, "memmove_to_indexed_stores_post");
     tcc_ir_opt_compact_nops(ir);
   }
 
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("pack64"))
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("pack64"))
     tcc_ir_opt_pack64(ir);
   if (!tcc_ir_opt_pass_disabled("pack64_implicit"))
     tcc_ir_opt_pack64_implicit(ir); /* ungated on purpose -- see note above */
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("pack64_from_stack_stores"))
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("pack64_from_stack_stores"))
     tcc_ir_opt_pack64_from_stack_stores(ir);
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("shl32_or_chain"))
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("shl32_or_chain"))
     tcc_ir_opt_shl32_or_chain(ir);
 
   DUMP_IR_AFTER_PASS(ir, "ZZ2_shl32");
 
   /* After the const folders, so a constant dividend still collapses to one
    * immediate instead of a three-op shift chain. */
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("sdiv_pow2"))
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("sdiv_pow2"))
     tcc_ir_opt_sdiv_pow2(ir);
 
   DUMP_IR_AFTER_PASS(ir, "ZZ2_sdivp2");
 
-  if (tcc_state->opt_stack_addr_cse)
+  if (TCC_OPT(tcc_state, opt_stack_addr_cse))
     tcc_ir_opt_stack_addr_cse(ir);
 
   DUMP_IR_AFTER_PASS(ir, "ZZ2_paf");
 
-  if (tcc_state->opt_const_prop)
+  if (TCC_OPT(tcc_state, opt_const_prop))
   {
     tcc_ir_opt_cmp_stack_addr_fold(ir);
   }
 
   DUMP_IR_AFTER_PASS(ir, "ZZ2_dle1");
 
-  if (tcc_state->opt_jump_threading)
+  if (TCC_OPT(tcc_state, opt_jump_threading))
     tcc_ir_opt_eliminate_fallthrough(ir);
 
-  if (tcc_state->opt_copy_prop)
+  if (TCC_OPT(tcc_state, opt_copy_prop))
   {
     tcc_ir_opt_var_tmp_fwd(ir);
   }
   DUMP_IR_AFTER_PASS(ir, "ZZ2_vtf");
 
   dbg_scan_overlap(ir, "R1-before-pack64_taut");
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("pack64_tautology") && tcc_ir_opt_pack64_tautology(ir) > 0)
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("pack64_tautology") && tcc_ir_opt_pack64_tautology(ir) > 0)
   {
-    if (tcc_state->opt_copy_prop)
+    if (TCC_OPT(tcc_state, opt_copy_prop))
     {
       tcc_ir_opt_var_tmp_fwd(ir);
     }
@@ -341,23 +334,23 @@ static void run_post_pipeline_passes(TCCIRState *ir)
   dbg_scan_overlap(ir, "P3-before-cmp_narrow_64");
   dbg_scan_overlap(ir, "R4-just-before-cmp_narrow");
   DUMP_IR_AFTER_PASS(ir, "ZZ2_lge");
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("cmp_narrow_64"))
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("cmp_narrow_64"))
     tcc_ir_opt_cmp_narrow_64(ir);
 
   /* Must precede tcc_ir_opt_shift64_dead_half (run from regalloc): narrowing the
    * AND is what makes it a low-only consumer, which is the precondition that
    * pass tests before it can mark the feeding SHR's high half dead. */
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("and64_narrow"))
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("and64_narrow"))
     tcc_ir_opt_and64_narrow(ir);
 
   /* After the mask narrowing above, before shift64_dead_half in regalloc: the
    * shift this folds away is the one that pass would have annotated. */
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("shift64_extract_ubfx"))
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("shift64_extract_ubfx"))
     tcc_ir_opt_shift64_extract_ubfx(ir);
   DUMP_IR_AFTER_PASS(ir, "ZZ2_a64n");
 
   dbg_scan_overlap(ir, "P4-before-assign_fuse");
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("assign_fuse"))
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("assign_fuse"))
     tcc_ir_opt_assign_fuse(ir);
   dbg_scan_overlap(ir, "P4b-after-assign_fuse");
   DUMP_IR_AFTER_PASS(ir, "ZZ2_af");
@@ -370,7 +363,7 @@ static void run_post_pipeline_passes(TCCIRState *ir)
     tcc_ir_opt_select(ir);
   dbg_scan_overlap(ir, "P5-after-select");
 
-  if (tcc_state->optimize > 0)
+  if (TCC_OPT(tcc_state, optimize) > 0)
     tcc_ir_opt_setif_neg_to_select(ir);
   DUMP_IR_AFTER_PASS(ir, "ZZ2_sel");
 }
@@ -394,7 +387,7 @@ static void analyze_function_properties(TCCIRState *ir, Sym *sym, int func_var,
       IRQuadCompact *q = &ir->compact_instructions[ii];
       if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
       {
-        Sym *cs = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+        Sym *cs = tcc_ir_op_src1_sym(ir, q);
         const char *cn = cs ? get_tok_str(cs->v, NULL) : NULL;
         if (cn && (strstr(cn, "memmove") || strstr(cn, "memcpy")))
           had_aggr_copy = 1;
@@ -441,8 +434,14 @@ void tcc_ir_opt_run_function_pipeline(TCCIRState *ir, Sym *sym, int func_var,
   }
 #endif
 
-  if (tcc_state->opt_dead_store && !tcc_state->ir_late_reopt_phase)
+  if (TCC_OPT(tcc_state, opt_dead_store) && !tcc_state->ir_late_reopt_phase)
     tcc_ir_collect_tu_static_reads_preopt(ir);
+
+  /* Each switch's dispatch in front of its case bodies, before any pass
+   * reads the layout. */
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("switch_head") && tcc_ir_opt_switch_head(ir))
+    DUMP_IR_AFTER_PASS(ir, "switch_head");
+  ir->switch_heads_n = 0;
 
   run_propagation_passes(ir);
   run_opt_pipeline(ir);
@@ -452,7 +451,7 @@ void tcc_ir_opt_run_function_pipeline(TCCIRState *ir, Sym *sym, int func_var,
 
   analyze_function_properties(ir, sym, func_var, nonstatic_global_copier_out);
 
-  if (tcc_state->optimize > 0 && tcc_state->opt_redundant_store)
+  if (TCC_OPT(tcc_state, optimize) > 0 && TCC_OPT(tcc_state, opt_redundant_store))
   {
     tcc_ir_opt_memmove_global_load_fwd(ir);
   }

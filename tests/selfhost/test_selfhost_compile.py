@@ -47,10 +47,13 @@ SELFHOST_COMPILE_SOURCES = [
     "source/ir/codegen.c",
     "source/ir/dump.c",
     "source/ir/frame.c",
+    "source/ir/frame_dfe.c",
     "source/ir/cross_jump.c",
     "source/ir/self_store.c",
     "source/ir/dead_def.c",
+    "source/ir/known_ext.c",
     "source/ir/machine_op.c",
+    "source/ir/op_props.c",
     "source/ir/pool.c",
     "source/ir/regalloc.c",
     "source/ir/regalloc_entry.c",
@@ -193,9 +196,11 @@ SELFHOST_COMPILE_SOURCES = [
     # source/frontend/gen/value/
     "source/frontend/gen/value/load.c",
     "source/frontend/gen/value/longlong.c",
+    "source/frontend/gen/value/rodata_rel.c",
     "source/frontend/gen/value/strlit_pool.c",
     "source/frontend/gen/value/vstack.c",
     # source/memory/
+    "source/memory/sort.c",
     "source/memory/unique_ptr.c",
     "source/memory/vector.c",
     # source/opt/
@@ -210,7 +215,6 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/engine/fp_cache_shim.c",
     "source/opt/engine/fp_mat_cache.c",
     "source/opt/engine/gen_adapters.c",
-    "source/opt/engine/pass_registry.c",
     "source/opt/engine/pass_timing.c",
     "source/opt/engine/pipeline_run.c",
     "source/opt/engine/pipeline_table.c",
@@ -221,6 +225,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/flat/cfg/jump_thread.c",
     "source/opt/flat/cfg/bool_diamond_branch.c",
     "source/opt/flat/cfg/jumpif_invert.c",
+    "source/opt/flat/cfg/switch_head.c",
     "source/opt/flat/cfg/returnvalue_merge.c",
     "source/opt/flat/cfg/switch_to_data.c",
     # source/opt/flat/dce/
@@ -275,6 +280,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/flat/loop/backedge_phi_hoist.c",
     "source/opt/flat/loop/const_sim.c",
     "source/opt/flat/loop/decrement_to_zero.c",
+    "source/opt/flat/loop/decrement_carry.c",
     "source/opt/flat/loop/func_purity.c",
     "source/opt/flat/loop/iv_analysis.c",
     "source/opt/flat/loop/iv_strength_reduction.c",
@@ -306,6 +312,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/flat/memory/entry_store_prop.c",
     "source/opt/flat/memory/sret_nrvo.c",
     "source/opt/flat/memory/global_base_share.c",
+    "source/opt/flat/memory/escape_copy_call.c",
     "source/opt/flat/memory/global_deref_cse.c",
     "source/opt/flat/memory/invariant_global_load_hoist.c",
     "source/opt/flat/memory/mem_init.c",
@@ -313,6 +320,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/flat/memory/memmove_to_indexed_stores.c",
     "source/opt/flat/memory/ptr_local_fwd.c",
     "source/opt/flat/memory/param_copy_alias.c",
+    "source/opt/flat/memory/struct_arg_split.c",
     "source/opt/flat/memory/slot_const_store_fold.c",
     "source/opt/flat/memory/sra.c",
     "source/opt/flat/memory/rmw_byte_clear.c",
@@ -354,6 +362,8 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/flat/scalar/inline_param_copy.c",
     "source/opt/flat/scalar/var_to_tmp.c",
     # source/opt/ra/
+    "source/opt/ra/branch_thread.c",
+    "source/opt/ra/exit_sink.c",
     "source/opt/ra/const_branch_fold.c",
     "source/opt/ra/incomplete_calls.c",
     "source/opt/ra/phi_const_chain.c",
@@ -387,6 +397,7 @@ SELFHOST_COMPILE_SOURCES = [
     # source/opt/ssa/loop/
     "source/opt/ssa/loop/dead_loop.c",
     "source/opt/ssa/loop/decrement_to_zero.c",
+    "source/opt/ssa/loop/decrement_carry.c",
     "source/opt/ssa/loop/first_iter_exit.c",
     "source/opt/ssa/loop/iv_strength_reduction.c",
     "source/opt/ssa/loop/loop_cand.c",
@@ -399,8 +410,10 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/ssa/memory/diamond_store_fwd.c",
     "source/opt/ssa/memory/global_addr_hoist.c",
     "source/opt/ssa/memory/global_store_dse.c",
+    "source/opt/ssa/memory/load_combine.c",
     "source/opt/ssa/memory/load_cse.c",
     "source/opt/ssa/memory/ptr_store_dse.c",
+    "source/opt/ssa/memory/copy_fwd.c",
     # source/opt/ssa/scalar/
     "source/opt/ssa/scalar/bitop_const_fold.c",
     "source/opt/ssa/scalar/bool_norm.c",
@@ -438,6 +451,7 @@ SELFHOST_COMPILE_SOURCES = [
     "source/opt/util/vreg_def_use.c",
     "source/opt/util/vreg_query.c",
     "source/opt/util/xform.c",
+    "source/opt/util/range.c",
 ]
 
 

@@ -50,8 +50,7 @@ int tcc_ir_opt_stack_addr_cse(TCCIRState *ir)
     if (irop_get_tag(src1) != IROP_TAG_STACKOFF || src1.is_lval)
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t vreg = irop_get_vreg(dest);
+    int32_t vreg = tcc_ir_op_dest_vreg(ir, q);
     int32_t stack_off = src1.u.imm32;
     int64_t add_const = 0;
     int add_idx = -1;
@@ -62,15 +61,12 @@ int tcc_ir_opt_stack_addr_cse(TCCIRState *ir)
       IRQuadCompact *qnext = &ir->compact_instructions[i + 1];
       if (qnext->op == TCCIR_OP_ADD)
       {
-        IROperand nd = tcc_ir_op_get_dest(ir, qnext);
-        IROperand ns1 = tcc_ir_op_get_src1(ir, qnext);
-        IROperand ns2 = tcc_ir_op_get_src2(ir, qnext);
-        int32_t nd_vr = irop_get_vreg(nd);
-        int32_t ns1_vr = irop_get_vreg(ns1);
+        int32_t nd_vr = tcc_ir_op_dest_vreg(ir, qnext);
+        int32_t ns1_vr = tcc_ir_op_src1_vreg(ir, qnext);
 
-        if (nd_vr == vreg && ns1_vr == vreg && irop_is_immediate(ns2))
+        if (nd_vr == vreg && ns1_vr == vreg && tcc_ir_op_src2_is_imm(ir, qnext))
         {
-          add_const = irop_get_imm64_ex(ir, ns2);
+          add_const = tcc_ir_op_src2_imm(ir, qnext);
           add_idx = i + 1;
           final_vreg = nd_vr;
         }
@@ -147,8 +143,7 @@ int tcc_ir_opt_stack_addr_cse(TCCIRState *ir)
           continue;
         if (!irop_config[qk->op].has_dest)
           continue;
-        IROperand dk = tcc_ir_op_get_dest(ir, qk);
-        if (irop_get_vreg(dk) == seqs[i].result_vreg)
+        if (tcc_ir_op_dest_vreg(ir, qk) == seqs[i].result_vreg)
         {
           redefined = 1;
           break;

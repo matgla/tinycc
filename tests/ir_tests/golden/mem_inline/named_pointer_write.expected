@@ -1,0 +1,18 @@
+0000: V0 <-- #0 [ASSIGN]
+0001: CMP V0,P2
+0002: JMP to 4  if "<U"
+0003: JMP to 18
+0004: PARAM0[call_0] P0
+0005: PARAM1[call_0] V0
+0006: CALL GlobalSym(#0) --> V1
+0007: T1 <-- V0 SHL #2
+0008: T2 <-- P1 ADD T1
+0009: V2 <-- T2***DEREF*** ADD #3
+0010: PARAM0[call_1] V1
+0011: T4 <-- &V2
+0012: PARAM1[call_1] T4
+0013: PARAM2[call_1] #4
+0014: CALL GlobalSym(#1) --> VReg?
+0015: V0 <-- V0 ADD #1
+0016: T7 <-- V0 [LOAD]
+0017: JMP to 1

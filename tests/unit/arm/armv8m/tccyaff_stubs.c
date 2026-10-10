@@ -122,6 +122,17 @@ void _tcc_error(const char *fmt, ...)
   abort();
 }
 
+void _tcc_ice(const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  fprintf(stderr, "[test stub] _tcc_ice: ");
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+  abort();
+}
+
 void _tcc_warning(const char *fmt, ...)
 {
   va_list ap;

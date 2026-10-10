@@ -1,0 +1,2 @@
+error:
+a __rodata_relative pointer must point to read-only data; 'buf' is writable

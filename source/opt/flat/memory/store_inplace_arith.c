@@ -62,11 +62,10 @@ int tcc_ir_opt_store_inplace_arith(TCCIRState *ir)
     if (sq->op != TCCIR_OP_STORE) continue;
 
     IROperand store_dest = tcc_ir_op_get_dest(ir, sq);
-    IROperand store_src = tcc_ir_op_get_src1(ir, sq);
 
     /* STORE must read T and write a register-promoted vreg V. */
-    if (store_src.is_lval) continue;
-    if (irop_get_vreg(store_src) != t_vr) continue;
+    if (tcc_ir_op_src1_is_lval(ir, sq)) continue;
+    if (tcc_ir_op_src1_vreg(ir, sq) != t_vr) continue;
 
     int32_t v_vr = irop_get_vreg(store_dest);
     if (v_vr < 0 || !tcc_ir_vreg_is_valid(ir, v_vr)) continue;
@@ -92,18 +91,15 @@ int tcc_ir_opt_store_inplace_arith(TCCIRState *ir)
       int is_store_op = (kq->op == TCCIR_OP_STORE || kq->op == TCCIR_OP_STORE_INDEXED ||
                          kq->op == TCCIR_OP_STORE_POSTINC);
       if (irop_config[kq->op].has_dest) {
-        IROperand kd = tcc_ir_op_get_dest(ir, kq);
         /* STORE-class dest is an address/base read, so it counts as a use. */
-        if (irop_has_vreg(kd) && irop_get_vreg(kd) == t_vr &&
-            (is_store_op || kd.is_lval)) { extra_uses = 1; break; }
+        if (tcc_ir_op_dest_has_vreg(ir, kq) && tcc_ir_op_dest_vreg(ir, kq) == t_vr &&
+            (is_store_op || tcc_ir_op_dest_is_lval(ir, kq))) { extra_uses = 1; break; }
       }
       if (irop_config[kq->op].has_src1) {
-        IROperand s1 = tcc_ir_op_get_src1(ir, kq);
-        if (irop_has_vreg(s1) && irop_get_vreg(s1) == t_vr) { extra_uses = 1; break; }
+        if (tcc_ir_op_src1_has_vreg(ir, kq) && tcc_ir_op_src1_vreg(ir, kq) == t_vr) { extra_uses = 1; break; }
       }
       if (irop_config[kq->op].has_src2) {
-        IROperand s2 = tcc_ir_op_get_src2(ir, kq);
-        if (irop_has_vreg(s2) && irop_get_vreg(s2) == t_vr) { extra_uses = 1; break; }
+        if (tcc_ir_op_src2_has_vreg(ir, kq) && tcc_ir_op_src2_vreg(ir, kq) == t_vr) { extra_uses = 1; break; }
       }
     }
     if (extra_uses) continue;
@@ -123,9 +119,4 @@ int tcc_ir_opt_store_inplace_arith(TCCIRState *ir)
   }
 
   return changes;
-}
-
-int tcc_ir_opt_store_inplace_arith_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_store_inplace_arith(ctx->ir);
 }

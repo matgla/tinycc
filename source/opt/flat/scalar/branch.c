@@ -72,7 +72,8 @@ static int ir_branch_eval_const_cmp(int64_t val1, int64_t val2, int cond,
 
 OPT_GEN_FLAT(branch_fold_test_zero, TCCIR_OP_TEST_ZERO)
 {
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
 
   if (!irop_is_immediate(src1))
     return 0;
@@ -135,7 +136,9 @@ OPT_GEN_FLAT(branch_fold_test_zero, TCCIR_OP_TEST_ZERO)
 
 OPT_GEN_FLAT(branch_fold_cmp, TCCIR_OP_CMP)
 {
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY, .src2 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
+  BIND(src2);
 
   if (!irop_is_immediate(src1) || !irop_is_immediate(src2))
     return 0;
@@ -171,7 +174,7 @@ OPT_GEN_FLAT(branch_fold_cmp, TCCIR_OP_CMP)
 
 OPT_GEN_FLAT(setif_branch_fuse, TCCIR_OP_CMP)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
 
   int n = ir->next_instruction_index;
   /* NOP-tolerant: passes leave NOP holes between the four ops (the inlined
@@ -322,6 +325,22 @@ OPT_GEN_FLAT(setif_branch_fuse, TCCIR_OP_CMP)
   return 1;
 }
 
+/* Side-table annotations keyed by orig_index change what a CMP compares: a
+ * barrel shift folded into src2 (`cmp.w r4, ip, lsr #24`), a 64-bit zero-half
+ * or dead-half verdict.  They stay with the instruction, not the operands, so
+ * the comparison re-emitted at a distant branch under that branch's orig_index
+ * compared the unshifted register.  An annotated compare is not rematerialized,
+ * and neither is one written over an annotated test (its annotation would
+ * describe the old test).  TCC_DISABLE_PASS=setif_remat_annot_guard drops
+ * this check (A/B only: unsound). */
+static int remat_annotated(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (tcc_ir_opt_pass_disabled("setif_remat_annot_guard"))
+    return 0;
+  return tcc_ir_barrel_shift_at(ir, q) != 0 || tcc_ir_shift64_dead_half_at(ir, q) != 0 ||
+         tcc_ir_zero_half64_at(ir, q) != 0 || tcc_ir_bfi_params_at(ir, q) != 0;
+}
+
 /* CMP a,b; SETIF cond -> T, where every use of T is a branch test
  *      ->  the comparison redone at each branch, and the quartet deleted.
  *
@@ -351,7 +370,9 @@ OPT_GEN_FLAT(setif_branch_fuse, TCCIR_OP_CMP)
  */
 OPT_GEN_FLAT(setif_branch_remat, TCCIR_OP_CMP)
 {
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY, .src2 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
+  BIND(src2);
 
   const int n = ir->next_instruction_index;
   int si = ir_skip_nops_forward(ir, i + 1, n);
@@ -360,6 +381,8 @@ OPT_GEN_FLAT(setif_branch_remat, TCCIR_OP_CMP)
 
   IRQuadCompact *setif_q = &ir->compact_instructions[si];
   if (setif_q->op != TCCIR_OP_SETIF)
+    return 0;
+  if (remat_annotated(ir, q))
     return 0;
   /* A label anywhere between means the SETIF is reachable without the CMP. */
   for (int j = i + 1; j <= si; j++)
@@ -384,7 +407,7 @@ OPT_GEN_FLAT(setif_branch_remat, TCCIR_OP_CMP)
    * which turns down any other instruction writing sv. */
 
   int nregs = 0;
-  int32_t reg_vr = -1;
+  int32_t reg_vr[2] = {-1, -1};
   for (int k = 0; k < 2; k++)
   {
     IROperand o = k ? src2 : src1;
@@ -401,9 +424,7 @@ OPT_GEN_FLAT(setif_branch_remat, TCCIR_OP_CMP)
      * would compare the NEW value: the f2 case in tests2 pins that.) */
     if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
       return 0;
-    reg_vr = vr; /* its single definition is counted in the use scan below */
-    if (++nregs > 1)
-      return 0;
+    reg_vr[nregs++] = vr; /* single definitions counted in the use scan below */
   }
   if (nregs == 0)
     return 0; /* constant folding owns this shape */
@@ -418,17 +439,20 @@ OPT_GEN_FLAT(setif_branch_remat, TCCIR_OP_CMP)
   int nuses = 0;
 
   /* One walk for three facts: the uses of sv, that nothing but the SETIF
-   * writes sv, and that the compared register has exactly one definition --
+   * writes sv, and that each compared register has exactly one definition --
    * each was a walk of the whole function per CMP, and Zig's C backend emits
    * a CMP + SETIF for nearly every condition. */
-  int reg_defs = 0;
+  int reg_defs[2] = {0, 0};
   for (int u = 0; u < n; u++)
   {
     IRQuadCompact *uq = &ir->compact_instructions[u];
     if (uq->op == TCCIR_OP_NOP)
       continue;
-    if (irop_config[uq->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == reg_vr && ++reg_defs > 1)
-      return 0;
+    if (irop_config[uq->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == reg_vr[0])
+      reg_defs[0]++;
+    if (nregs == 2 && irop_config[uq->op].has_dest &&
+        irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == reg_vr[1])
+      reg_defs[1]++;
     if (u == si)
       continue;
     if (irop_config[uq->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == sv)
@@ -446,6 +470,8 @@ OPT_GEN_FLAT(setif_branch_remat, TCCIR_OP_CMP)
     if (!reads)
       continue;
     if (u < si || nuses >= REMAT_MAX_USES)
+      return 0;
+    if (remat_annotated(ir, uq))
       return 0;
 
     /* 64-bit EQ/NE emits `CMP T,#0` where the 32-bit form emits TEST_ZERO;
@@ -492,7 +518,7 @@ OPT_GEN_FLAT(setif_branch_remat, TCCIR_OP_CMP)
     new_tok[nuses] = nt;
     nuses++;
   }
-  if (nuses == 0 || reg_defs != 1)
+  if (nuses == 0 || reg_defs[0] != 1 || (nregs == 2 && reg_defs[1] != 1))
     return 0;
 
   /* TEST_ZERO owns ONE operand slot and CMP needs two, so the comparison
@@ -530,7 +556,10 @@ OPT_GEN_FLAT(setif_branch_remat, TCCIR_OP_CMP)
  * `((x != k) ^ const_b)` chains of inlined bool checks into setif_branch_fuse. */
 OPT_GEN_FLAT(setif_xor_invert, TCCIR_OP_XOR)
 {
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY, .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
 
   int64_t mask;
   if (!irop_is_plain_imm(src2))
@@ -600,7 +629,9 @@ OPT_GEN_FLAT(setif_xor_invert, TCCIR_OP_XOR)
  * elimination removes it once no flag consumer is left. */
 OPT_GEN_FLAT(bool_call_norm, TCCIR_OP_CMP)
 {
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY, .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(src1);
+  BIND(src2);
 
   if (!irop_is_plain_imm(src2) || irop_get_imm64_ex(ir, src2) != 0)
     return 0;
@@ -764,7 +795,7 @@ static int setif_paired_fuse(TCCIRState *ir)
     IRQuadCompact *test_q = &ir->compact_instructions[ti];
     IRQuadCompact *jump_q = &ir->compact_instructions[ji];
     if (setif_q->op != TCCIR_OP_SETIF || jump_q->op != TCCIR_OP_JUMPIF || setif_q->is_jump_target ||
-        paired_prev(ir, ji) != ti)
+        jump_q->is_jump_target || paired_prev(ir, ji) != ti)
       continue;
     IROperand sd = tcc_ir_op_get_dest(ir, setif_q);
     const int32_t vr = irop_get_vreg(sd);
@@ -799,6 +830,273 @@ static int setif_paired_fuse(TCCIRState *ir)
   return changes;
 }
 
+/* An instruction that may sit between the SETIF and its zero test without
+ * disturbing the quartet: no flags of its own, no control flow, no calls,
+ * no asm.  The backend keeps such a window flag-free on its own — after a
+ * CMP it marks the flags live until the next branch and picks encodings
+ * that leave them alone (codegen_flags_live / flags_safe()) — so a STORE
+ * of an unrelated value or a plain copy between the SETIF and its test
+ * costs the branch nothing.  This is the shape the Zig C backend's struct
+ * copies leave everywhere: `t14 = (*t1)` bounds-check quartets carry the
+ * copy's STOREs between the SETIF and the TEST_ZERO. */
+static int setif_window_op_ok(const IRQuadCompact *q)
+{
+  if (q->is_jump_target)
+    return 0;
+  TccIrOp op = q->op;
+  /* BLOCK_COPY lowers to a helper call that clobbers the flags; SWITCH_LOAD
+   * only ever feeds a SWITCH_TABLE dispatch. */
+  if (op == TCCIR_OP_BLOCK_COPY || op == TCCIR_OP_SWITCH_LOAD)
+    return 0;
+  if (ir_op_has(op, IR_HZ_FLAGS_SET) || ir_op_has(op, IR_HZ_FLAGS_READ) ||
+      ir_op_has(op, IR_HZ_BRANCH) || ir_op_has(op, IR_HZ_RETURN) ||
+      ir_op_has(op, IR_HZ_CALL) || ir_op_has(op, IR_HZ_CALL_PARAM) ||
+      ir_op_has(op, IR_HZ_CALL_SEQ) || ir_op_has(op, IR_HZ_ASM) ||
+      ir_op_has(op, IR_HZ_VLA) || ir_op_has(op, IR_HZ_NONLOCAL) ||
+      ir_op_has(op, IR_HZ_CHAIN) || ir_op_has(op, IR_HZ_TRAP) ||
+      ir_op_has(op, IR_HZ_UPDATES_SRC) || ir_op_has(op, IR_HZ_HINT))
+    return 0;
+  return 1;
+}
+
+/* `CMP; SETIF; <window + single-use bool copies>; TEST_ZERO; JUMPIF` ->
+ * `CMP; <window>; JUMPIF` — setif_paired_fuse with the adjacency relaxed.
+ * Two residues of the Zig C backend's output need that: phi resolution
+ * leaves copy chains behind the SETIF (`T1710 <- SETIF; T1711 <- T1710;
+ * T1245 <- T1711; TEST_ZERO T1245`), and the struct copies interleaved
+ * with bounds checks put STOREs between the SETIF and its test.  Every
+ * carrier (the SETIF result and each copy) must be touched as a value
+ * exactly once — by the next link or the test — and nothing may branch
+ * into the window, or the branch would read flags somebody else left.
+ * Per-vreg mention counts are taken once up front: fusing only NOPs
+ * instructions, so the counts stay at or above the truth and later
+ * candidates err on the side of declining. */
+typedef struct {
+  uint8_t *touches;   /* src-slot mentions (any operand form) */
+  uint16_t *plain_defs; /* dests that define the vreg as a value */
+  uint16_t *bad_defs; /* dests naming the vreg in any other form (write-through, ...) */
+} SetifWindowCounts;
+
+static void setif_window_count(TCCIRState *ir, SetifWindowCounts *c)
+{
+  const int n = ir->next_instruction_index;
+  const int nv = ir->next_local_variable + ir->next_temporary_variable + 1;
+  c->touches = tcc_mallocz(nv);
+  c->plain_defs = tcc_mallocz(nv * sizeof(uint16_t));
+  c->bad_defs = tcc_mallocz(nv * sizeof(uint16_t));
+  for (int u = 0; u < n; u++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[u];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (irop_config[q->op].has_dest)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      int di = paired_index(ir, irop_get_vreg(d));
+      if (di >= 0)
+      {
+        if (irop_dest_defines_vreg(d))
+          c->plain_defs[di]++;
+        else
+          c->bad_defs[di]++;
+      }
+    }
+    for (int s = 1; s <= 2; s++)
+    {
+      if ((s == 1 && !irop_config[q->op].has_src1) || (s == 2 && !irop_config[q->op].has_src2))
+        continue;
+      IROperand o = s == 1 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      int oi = paired_index(ir, irop_get_vreg(o));
+      if (oi >= 0)
+        c->touches[oi]++;
+    }
+    if (ir_op_has(q->op, IROP_A_SLOT3) && q->operand_base + 3 < (uint32_t)ir->iroperand_pool_count)
+    {
+      int oi = paired_index(ir, irop_get_vreg(ir->iroperand_pool[q->operand_base + 3]));
+      if (oi >= 0)
+        c->touches[oi]++;
+    }
+  }
+}
+
+static void setif_window_count_free(SetifWindowCounts *c)
+{
+  tcc_free(c->touches);
+  tcc_free(c->plain_defs);
+  tcc_free(c->bad_defs);
+}
+
+static int setif_window_condition(TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (q->op == TCCIR_OP_SETIF)
+    return (int)tcc_ir_op_src1_imm(ir, q);
+  if (q->op != TCCIR_OP_SELECT)
+    return -1;
+  IROperand yes = tcc_ir_op_get_src1(ir, q), no = tcc_ir_op_get_src2(ir, q);
+  if (!irop_is_plain_imm(yes) || !irop_is_plain_imm(no))
+    return -1;
+  int64_t y = irop_get_imm64_ex(ir, yes), n = irop_get_imm64_ex(ir, no);
+  int cond = (int)tcc_ir_op_cond_imm(ir, q);
+  if (y == 1 && n == 0)
+    return cond;
+  if (y == 0 && n == 1)
+    return invert_cond_token(cond);
+  return -1;
+}
+
+static int setif_window_fuse(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  int changes = 0;
+  SetifWindowCounts cnt = {NULL, NULL, NULL};
+  int counts_ready = 0;
+  for (int i = 0; i + 1 < n; i++)
+  {
+    if (ir->compact_instructions[i].op != TCCIR_OP_CMP)
+      continue;
+    int si = ir_skip_nops_forward(ir, i + 1, n);
+    if (si >= n)
+      continue;
+    /* A jump may land on the CMP itself (it re-runs), never inside. */
+    for (int k = i + 1; k <= si; k++)
+      if (ir->compact_instructions[k].is_jump_target)
+        si = n;
+    if (si >= n)
+      continue;
+    IRQuadCompact *setif_q = &ir->compact_instructions[si];
+    int setif_tok = setif_window_condition(ir, setif_q);
+    if (setif_tok < 0)
+      continue;
+    IROperand sd = tcc_ir_op_get_dest(ir, setif_q);
+    if (!irop_dest_defines_vreg(sd) || irop_get_vreg(sd) < 0 ||
+        irop_get_btype(sd) == IROP_BTYPE_INT64)
+      continue;
+    int32_t vrs[9];
+    int links[8], nlinks = 0, ti = -1, seen = 0;
+    vrs[0] = irop_get_vreg(sd);
+    int ok = 1;
+    for (int k = si + 1; k < n; k++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[k];
+      if (q->is_jump_target)
+        break;
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      /* The windows that occur are a handful of instructions; a cap keeps a
+       * SETIF whose test never comes from walking the whole function. */
+      if (++seen > 32)
+        break;
+      if (q->op == TCCIR_OP_TEST_ZERO || q->op == TCCIR_OP_CMP)
+      {
+        IROperand s1 = tcc_ir_op_get_src1(ir, q);
+        if (q->op == TCCIR_OP_CMP)
+        {
+          IROperand s2 = tcc_ir_op_get_src2(ir, q);
+          if (!irop_is_plain_imm(s2) || irop_get_imm64_ex(ir, s2) != 0)
+            break;
+        }
+        if (irop_get_vreg(s1) != vrs[nlinks] || s1.is_lval || s1.is_llocal ||
+            irop_get_btype(s1) == IROP_BTYPE_INT64)
+          break;
+        ti = k;
+        break;
+      }
+      if (q->op == TCCIR_OP_ASSIGN && nlinks < 8)
+      {
+        IROperand s1 = tcc_ir_op_get_src1(ir, q);
+        IROperand d = tcc_ir_op_get_dest(ir, q);
+        if (irop_get_vreg(s1) == vrs[nlinks] && !s1.is_lval && !s1.is_llocal &&
+            irop_get_btype(s1) != IROP_BTYPE_INT64 && irop_dest_defines_vreg(d) &&
+            irop_get_vreg(d) >= 0 && irop_get_vreg(d) != vrs[nlinks] &&
+            irop_get_btype(d) != IROP_BTYPE_INT64)
+        {
+          links[nlinks] = k;
+          vrs[++nlinks] = irop_get_vreg(d);
+          continue;
+        }
+      }
+      /* A window instruction that defines a carrier (a dead store into the
+       * link's vreg between the link and the test) would change what the
+       * test reads; the mention counts cannot see where a definition sits. */
+      if (irop_config[q->op].has_dest)
+      {
+        int32_t d = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+        for (int v = 0; v <= nlinks; v++)
+          if (d == vrs[v])
+            ok = 0;
+      }
+      if (!ok || !setif_window_op_ok(q))
+        break;
+    }
+    if (!ok || ti < 0)
+      continue;
+    int ji = ir_skip_nops_forward(ir, ti + 1, n);
+    if (ji >= n)
+      continue;
+    for (int k = ti + 1; k <= ji; k++)
+      if (ir->compact_instructions[k].is_jump_target)
+        ji = n;
+    if (ji >= n)
+      continue;
+    IRQuadCompact *jump_q = &ir->compact_instructions[ji];
+    if (jump_q->op != TCCIR_OP_JUMPIF)
+      continue;
+
+    /* Only now, with a walked candidate in hand, pay for the mention counts:
+     * most pipeline rounds find no candidate and cost nothing. */
+    if (!counts_ready)
+    {
+      setif_window_count(ir, &cnt);
+      counts_ready = 1;
+    }
+
+    for (int v = 0; v <= nlinks && ok; v++)
+    {
+      /* Soft probe: hand-built unit-test IR has no interval arrays, and the
+       * candidate must simply decline there (like a write-through carrier). */
+      IRLiveInterval *li = tcc_ir_try_get_live_interval(ir, vrs[v]);
+      int ci = paired_index(ir, vrs[v]);
+      if (!li || li->addrtaken || li->is_volatile || ci < 0)
+        ok = 0;
+      /* Exactly the one witnessed value read; no write through its address.
+       * The SETIF result is defined exactly once; a link may carry other
+       * plain definitions (a phi merge wrote a constant into the same vreg)
+       * that no path can carry into this test: those sit outside the
+       * window — before the SETIF (overridden on the way) or after the
+       * test — because nothing defining a carrier may sit inside. */
+      else if (cnt.touches[ci] != 1 || cnt.bad_defs[ci] != 0 ||
+               (v == 0 ? cnt.plain_defs[ci] != 1 : cnt.plain_defs[ci] < 1))
+        ok = 0;
+    }
+    if (!ok)
+      continue;
+
+    IROperand jump_src1 = tcc_ir_op_get_src1(ir, jump_q);
+    if (!irop_is_immediate(jump_src1))
+      continue;
+    const int jump_tok = (int)irop_get_imm64_ex(ir, jump_src1);
+    int new_tok;
+    if (jump_tok == 0x94)
+      new_tok = invert_cond_token(setif_tok);
+    else if (jump_tok == 0x95)
+      new_tok = setif_tok;
+    else
+      continue;
+    if (new_tok < 0)
+      continue;
+
+    tcc_ir_set_src1(ir, ji, irop_make_imm32(-1, new_tok, irop_get_btype(jump_src1)));
+    setif_q->op = TCCIR_OP_NOP;
+    ir->compact_instructions[ti].op = TCCIR_OP_NOP;
+    for (int c = 0; c < nlinks; c++)
+      ir->compact_instructions[links[c]].op = TCCIR_OP_NOP;
+    changes++;
+  }
+  if (counts_ready)
+    setif_window_count_free(&cnt);
+  return changes;
+}
+
 int tcc_ir_opt_setif_branch_fuse(TCCIRState *ir)
 {
   if (ir->next_instruction_index < 4)
@@ -808,7 +1106,6 @@ int tcc_ir_opt_setif_branch_fuse(TCCIRState *ir)
   int changes = tcc_ir_opt_run_gens(&ctx, branch_gens, branch_gens_count);
   tcc_ir_opt_ctx_free(&ctx);
   changes += setif_paired_fuse(ir);
+  changes += setif_window_fuse(ir);
   return changes;
 }
-
-int tcc_ir_opt_setif_branch_fuse_ex(IROptCtx *ctx) { return tcc_ir_opt_setif_branch_fuse(ctx->ir); }

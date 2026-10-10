@@ -22,14 +22,12 @@ static int ir_gen_rotate_fusion(IROptCtx *ctx, int i)
   const IROptDU *du = &ctx->du;
   IRQuadCompact *q = &ir->compact_instructions[i];
 
-  IROperand or_src1 = tcc_ir_op_get_src1(ir, q);
-  IROperand or_src2 = tcc_ir_op_get_src2(ir, q);
 
-  if (!irop_has_vreg(or_src1) || !irop_has_vreg(or_src2))
+  if (!tcc_ir_op_src1_has_vreg(ir, q) || !tcc_ir_op_src2_has_vreg(ir, q))
     return 0;
 
-  int32_t vr1 = irop_get_vreg(or_src1);
-  int32_t vr2 = irop_get_vreg(or_src2);
+  int32_t vr1 = tcc_ir_op_src1_vreg(ir, q);
+  int32_t vr2 = tcc_ir_op_src2_vreg(ir, q);
 
   int idx1 = ir_opt_du_def(du, vr1, i);
   int idx2 = ir_opt_du_def(du, vr2, i);
@@ -58,15 +56,13 @@ static int ir_gen_rotate_fusion(IROptCtx *ctx, int i)
   if (ir_opt_du_uses(du, shl_vr) != 1 || ir_opt_du_uses(du, shr_vr) != 1)
     return 0;
 
-  IROperand shl_src1 = tcc_ir_op_get_src1(ir, shl_q);
-  IROperand shl_src2 = tcc_ir_op_get_src2(ir, shl_q);
   IROperand shr_src1 = tcc_ir_op_get_src1(ir, shr_q);
   IROperand shr_src2 = tcc_ir_op_get_src2(ir, shr_q);
 
-  if (!irop_is_immediate(shl_src2) || !irop_is_immediate(shr_src2))
+  if (!tcc_ir_op_src2_is_imm(ir, shl_q) || !irop_is_immediate(shr_src2))
     return 0;
 
-  int64_t shl_amt = irop_get_imm64_ex(ir, shl_src2);
+  int64_t shl_amt = tcc_ir_op_src2_imm(ir, shl_q);
   int64_t shr_amt = irop_get_imm64_ex(ir, shr_src2);
 
   if (shl_amt <= 0 || shl_amt >= 32 || shr_amt <= 0 || shr_amt >= 32)
@@ -74,10 +70,24 @@ static int ir_gen_rotate_fusion(IROptCtx *ctx, int i)
   if (shl_amt + shr_amt != 32)
     return 0;
 
-  if (!irop_has_vreg(shl_src1) || !irop_has_vreg(shr_src1))
+  if (!tcc_ir_op_src1_has_vreg(ir, shl_q) || !irop_has_vreg(shr_src1))
     return 0;
-  if (irop_get_vreg(shl_src1) != irop_get_vreg(shr_src1))
+  if (tcc_ir_op_src1_vreg(ir, shl_q) != irop_get_vreg(shr_src1))
     return 0;
+  /* a + b == 32 is a rotate only for 32-bit values, and only if both shifts
+   * read the same value (not one a deref of it). */
+  IROperand shl_src1 = tcc_ir_op_get_src1(ir, shl_q);
+  if (shl_src1.is_lval || shr_src1.is_lval || shl_src1.is_local != shr_src1.is_local ||
+      shl_src1.is_llocal != shr_src1.is_llocal)
+    return 0;
+  {
+    IROperand or_d = tcc_ir_op_get_dest(ir, q);
+    IROperand shl_d = tcc_ir_op_get_dest(ir, shl_q);
+    IROperand shr_d = tcc_ir_op_get_dest(ir, shr_q);
+    if (irop_is_64bit(or_d) || irop_is_64bit(shl_d) || irop_is_64bit(shr_d) || irop_is_64bit(shl_src1) ||
+        irop_is_64bit(shr_src1))
+      return 0;
+  }
 
   int min_idx = shl_idx < shr_idx ? shl_idx : shr_idx;
   if (!ir_xform_same_block(ir, min_idx, i))
@@ -171,7 +181,7 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
   TCCIRState *ir = ctx->ir;
   const IROptDU *du = &ctx->du;
 
-  if (!tcc_state->opt_mla_fusion)
+  if (!TCC_OPT(tcc_state, opt_mla_fusion))
     return 0;
 
   IRQuadCompact *q = &ir->compact_instructions[i];
@@ -232,11 +242,10 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
         IRQuadCompact *kq = &ir->compact_instructions[k];
         if (kq->op != TCCIR_OP_MUL)
           continue;
-        IROperand ks1 = tcc_ir_op_get_src1(ir, kq);
         IROperand ks2 = tcc_ir_op_get_src2(ir, kq);
-        if (((irop_get_vreg(ks1) == ms1_vr && irop_get_vreg(ks2) == ms2_vr) ||
-             (irop_get_vreg(ks1) == ms2_vr && irop_get_vreg(ks2) == ms1_vr)) &&
-            !ks1.is_lval && !ks2.is_lval)
+        if (((tcc_ir_op_src1_vreg(ir, kq) == ms1_vr && irop_get_vreg(ks2) == ms2_vr) ||
+             (tcc_ir_op_src1_vreg(ir, kq) == ms2_vr && irop_get_vreg(ks2) == ms1_vr)) &&
+            !tcc_ir_op_src1_is_lval(ir, kq) && !ks2.is_lval)
           dup_mul = 1;
       }
     }
@@ -281,9 +290,8 @@ static int ir_gen_mla_fusion(IROptCtx *ctx, int i)
     if (next < ir->next_instruction_index && ir->compact_instructions[next].op == TCCIR_OP_STORE &&
         !ir->compact_instructions[next].is_jump_target && ir_xform_same_block(ir, i, next)) {
       IRQuadCompact *sq = &ir->compact_instructions[next];
-      IROperand st_src = tcc_ir_op_get_src1(ir, sq);
       IROperand st_dest = tcc_ir_op_get_dest(ir, sq);
-      if (irop_get_vreg(st_src) == irop_get_vreg(add_dest) && irop_get_vreg(st_dest) == accum_vr) {
+      if (tcc_ir_op_src1_vreg(ir, sq) == irop_get_vreg(add_dest) && irop_get_vreg(st_dest) == accum_vr) {
         final_dest = st_dest;
         store_idx = next;
       }
@@ -332,13 +340,13 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
   TCCIRState *ir = ctx->ir;
   const IROptDU *du = &ctx->du;
 
-  if (!tcc_state->opt_indexed_memory)
+  if (!TCC_OPT(tcc_state, opt_indexed_memory))
     return 0;
 
   IRQuadCompact *q = &ir->compact_instructions[i];
 
   int is_store = (q->op == TCCIR_OP_STORE);
-  IROperand addr_op = is_store ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+  IROperand addr_op = tcc_ir_op_get_dest_or_src1(ir, q, !is_store);
 
   if (!irop_has_vreg(addr_op))
     return 0;
@@ -407,10 +415,21 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
     if (base_op.is_llocal || base_op.is_lval)
       return 0;
 
+    /* The fused access reads index and base at the memory op, not at the SHL /
+     * ADD: neither may be redefined in between (a reassigned parameter is the
+     * same vreg under a new value), as in the unscaled path below. */
+    int32_t sbase_vr = irop_has_vreg(base_op) ? irop_get_vreg(base_op) : -1;
+    int32_t sindex_vr = irop_has_vreg(index_op) ? irop_get_vreg(index_op) : -1;
     for (int j = shl_idx + 1; j < i; j++) {
-      TccIrOp bop = ir->compact_instructions[j].op;
-      if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF || bop == TCCIR_OP_NOP)
+      IRQuadCompact *bq = &ir->compact_instructions[j];
+      if (bq->op == TCCIR_OP_JUMP || bq->op == TCCIR_OP_JUMPIF || bq->op == TCCIR_OP_NOP)
         return 0;
+      IROperand bd = tcc_ir_op_get_dest(ir, bq);
+      if (irop_has_vreg(bd)) {
+        int32_t dvr = irop_get_vreg(bd);
+        if ((sbase_vr >= 0 && dvr == sbase_vr) || (sindex_vr >= 0 && dvr == sindex_vr))
+          return 0;
+      }
     }
   } else {
     /* Unscaled register index: base + index (scale 0), folded into
@@ -461,9 +480,8 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
       IRQuadCompact *bq = &ir->compact_instructions[j];
       if (bq->op == TCCIR_OP_JUMP || bq->op == TCCIR_OP_JUMPIF || bq->op == TCCIR_OP_NOP)
         return 0;
-      IROperand bd = tcc_ir_op_get_dest(ir, bq);
-      if (irop_has_vreg(bd)) {
-        int32_t dvr = irop_get_vreg(bd);
+      if (tcc_ir_op_dest_has_vreg(ir, bq)) {
+        int32_t dvr = tcc_ir_op_dest_vreg(ir, bq);
         if ((base_vr >= 0 && dvr == base_vr) || dvr == index_vr)
           return 0;
       }
@@ -472,6 +490,9 @@ static int ir_gen_indexed_memory_fusion(IROptCtx *ctx, int i)
 
   IROperand orig_dest = tcc_ir_op_get_dest(ir, q);
   IROperand orig_src1 = tcc_ir_op_get_src1(ir, q);
+  /* LOAD_INDEXED takes its width from the dest; a LOAD's is its deref's. */
+  if (!is_store && q->op == TCCIR_OP_LOAD && !irop_indexed_load_dest(&orig_dest, orig_src1))
+    return 0;
 
   q->op = is_store ? TCCIR_OP_STORE_INDEXED : TCCIR_OP_LOAD_INDEXED;
 
@@ -529,7 +550,7 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
   TCCIRState *ir = ctx->ir;
   const IROptDU *du = &ctx->du;
 
-  if (!tcc_state->opt_indexed_memory)
+  if (!TCC_OPT(tcc_state, opt_indexed_memory))
     return 0;
 
   IRQuadCompact *q = &ir->compact_instructions[i];
@@ -573,7 +594,7 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
   int total_changes = 0;
   for (int d = 0; d < num_deref; d++) {
     int src_pos = operand_positions[d];
-    IROperand deref_op = (src_pos == 1) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+    IROperand deref_op = tcc_ir_op_get_src1_or_2(ir, q, src_pos != 1);
 
     int32_t addr_vr = irop_get_vreg(deref_op);
     if (addr_vr < 0)
@@ -639,7 +660,7 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
       /* Constant displacement: base + #imm -> LOAD_INDEXED [base, #imm].  Here
        * the load is a deref embedded as an arithmetic operand (e.g. `*(p+4) & 1`),
        * so no explicit LOAD op exists for the standalone disp-fusion pass. */
-      if (!tcc_state->opt_disp_fusion)
+      if (!TCC_OPT(tcc_state, opt_disp_fusion))
         continue;
 
       int imm_disp;
@@ -678,8 +699,7 @@ static int ir_gen_deref_indexed_fusion(IROptCtx *ctx, int i)
         int redef = 0;
         for (int j = add_idx + 1; j < i; j++) {
           IRQuadCompact *bq = &ir->compact_instructions[j];
-          IROperand bd = tcc_ir_op_get_dest(ir, bq);
-          if (irop_has_vreg(bd) && irop_get_vreg(bd) == base_vr) {
+          if (tcc_ir_op_dest_has_vreg(ir, bq) && tcc_ir_op_dest_vreg(ir, bq) == base_vr) {
             redef = 1;
             break;
           }

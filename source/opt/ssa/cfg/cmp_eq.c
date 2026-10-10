@@ -105,13 +105,11 @@ static int try_push_edge_fact(IRSSAOptCtx *ctx, CmpEqState *st,
   if (!extract_eq_operand(cs1, &a_vr) || !extract_eq_operand(cs2, &b_vr))
     return 0;
 
-  IROperand cond_op = tcc_ir_op_get_src1(ir, jq);
-  int tok = (int)irop_get_imm64_ex(ir, cond_op);
+  int tok = (int)tcc_ir_op_src1_imm(ir, jq);
   if (tok != TOK_EQ && tok != TOK_NE)
     return 0;
 
-  IROperand jdst = tcc_ir_op_get_dest(ir, jq);
-  int target_instr = (int)jdst.u.imm32;
+  int target_instr = (int)tcc_ir_op_dest_u_imm32(ir, jq);
   if (target_instr < 0 || target_instr >= cfg->num_instrs)
     return 0;
   int target_block = cfg->instr_to_block[target_instr];
@@ -149,8 +147,7 @@ static int try_fold_cmp(IRSSAOptCtx *ctx, CmpEqState *st,
   if (!extract_eq_operand(cs1, &a_vr) || !extract_eq_operand(cs2, &b_vr))
     return 0;
 
-  IROperand cond_op = tcc_ir_op_get_src1(ir, jq);
-  int tok = (int)irop_get_imm64_ex(ir, cond_op);
+  int tok = (int)tcc_ir_op_src1_imm(ir, jq);
   if (tok != TOK_EQ && tok != TOK_NE)
     return 0;
 

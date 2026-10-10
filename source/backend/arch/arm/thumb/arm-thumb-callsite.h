@@ -20,6 +20,8 @@ enum
 TCC_SMALL_SEQUENCE_DEFINE(ThumbIROperandSequence, IROperand, THUMB_CALL_INLINE_ARGS)
 TCC_SMALL_SEQUENCE_DEFINE(ThumbMachineOperandSequence, MachineOperand, THUMB_CALL_INLINE_ARGS)
 
+int thumb_callee_sym_is_aeabi(struct Sym *sym);
+void thumb_call_layout_abi_flags(TCCAbiCallLayout *layout, struct Sym *sym);
 ST_FUNC int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, int argc_hint,
                                             TCCAbiCallLayout *layout, ThumbIROperandSequence *out_args,
                                             ThumbMachineOperandSequence *out_mops);

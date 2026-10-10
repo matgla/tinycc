@@ -17,6 +17,15 @@
 #include "opt_du.h"
 #include "opt_alias.h"
 
+/* An instruction whose TEMP result is unused may be deleted only when its
+ * opcode does nothing but compute that result: reading memory and the flags is
+ * fine, any other effect (a store, a call, setjmp, __builtin_apply, asm, VLA
+ * growth, ...) keeps it.  LOAD's source operand is checked by the callers. */
+static inline int dse_op_may_die(int op)
+{
+  return !ir_op_has(op, IR_HZ_FROM_OP & ~(IR_HZ_MEM_READ | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ));
+}
+
 static int tcc_ir_opt_dse__timed(TCCIRState *ir);
 int tcc_ir_opt_dse(TCCIRState *ir)
 {
@@ -88,6 +97,219 @@ static void dse_stackloc_sym_off(TCCIRState *ir, IROperand op, const Sym **sym, 
   }
 }
 
+#define STACKLOC_HASH_SIZE 256
+#define STACKLOC_HASH(sym, off) (((uintptr_t)(sym) * 31 + (uint32_t)(off) * 17) % (STACKLOC_HASH_SIZE * 8))
+
+/* The dead-StackLoc scan's read marks: a STACKLOC_HASH_SIZE-byte bit hash of
+ * bytes read, the spans read through an address or as a struct, and the
+ * highest StackLoc store offset that bounds an open-ended span. */
+typedef struct DseStacklocMarks
+{
+  TCCIRState *ir;
+  uint8_t *read;
+  DseRange **ranges;
+  int *nranges, *ranges_cap;
+  int64_t max_stackloc_off;
+} DseStacklocMarks;
+
+/* Mark what operand `op` reads of a StackLoc (or of its object, when its
+ * address is taken). */
+static void dse_mark_stackloc_op(const DseStacklocMarks *m, IROperand op)
+{
+  TCCIRState *ir = m->ir;
+  if (op.is_local && irop_get_vreg(op) < 0)
+  {
+    const Sym *_sym;
+    int64_t _off;
+    dse_stackloc_sym_off(ir, op, &_sym, &_off);
+    if (op.is_lval)
+    {
+      int _width;
+      switch (op.btype)
+      {
+      case IROP_BTYPE_INT8:
+        _width = 1;
+        break;
+      case IROP_BTYPE_INT16:
+        _width = 2;
+        break;
+      case IROP_BTYPE_FLOAT32:
+        _width = 4;
+        break;
+      case IROP_BTYPE_INT64:
+      case IROP_BTYPE_FLOAT64:
+        _width = 8;
+        break;
+      case IROP_BTYPE_STRUCT:
+      {
+        /* Struct access: to the end of its object, else up to the max store offset */
+        int64_t _shi = m->max_stackloc_off + 5;
+        int _olo, _ohi;
+        if (!_sym && tcc_ir_frame_object_at(ir, (int)_off, &_olo, &_ohi))
+          _shi = _ohi;
+        dse_add_range(m->ranges, m->nranges, m->ranges_cap, _sym, _off, _shi);
+        _width = 0; /* already handled */
+        break;
+      }
+      default:
+        _width = 4;
+        break;
+      }
+      if (op.is_complex)
+        _width *= 2;
+      for (int _b = 0; _b < _width; _b++)
+      {
+        uint32_t _h = STACKLOC_HASH(_sym, _off + _b);
+        m->read[_h / 8] |= (1 << (_h % 8));
+      }
+    }
+    else
+    {
+      /* Address taken: its whole object, else up to the max store offset */
+      int64_t _rlo = _off, _rhi = m->max_stackloc_off + 5;
+      int _olo, _ohi;
+      if (!_sym && tcc_ir_frame_object_at(ir, (int)_off, &_olo, &_ohi))
+        _rlo = _olo, _rhi = _ohi;
+      dse_add_range(m->ranges, m->nranges, m->ranges_cap, _sym, _rlo, _rhi);
+    }
+  }
+}
+
+/* Mark VAR vr (if it is one, within max_var_pos) as read. */
+static void dse_mark_var_used(uint8_t *var_used, int max_var_pos, int32_t vr)
+{
+  if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+  {
+    int pos = TCCIR_DECODE_VREG_POSITION(vr);
+    if (pos <= max_var_pos)
+      var_used[pos / 8] |= (1 << (pos % 8));
+  }
+}
+
+/* The dead-TEMP sweep's tables: per-TEMP use counts and last defining
+ * instruction (grown on demand), and the worklist of TEMPs whose count fell
+ * to zero. */
+typedef struct DseTempDce
+{
+  TCCIRState *ir;
+  uint16_t *use_count;
+  int *def_idx;
+  int table_cap;
+  int max_tmp_pos;
+  int *worklist;
+  int wl_top;
+} DseTempDce;
+
+static void dse_ensure_cap(DseTempDce *t, int p)
+{
+  if (p >= t->table_cap)
+  {
+    int new_cap = t->table_cap * 2;
+    while (new_cap <= p)
+      new_cap *= 2;
+    t->use_count = tcc_realloc(t->use_count, new_cap * sizeof(uint16_t));
+    memset(t->use_count + t->table_cap, 0, (new_cap - t->table_cap) * sizeof(uint16_t));
+    t->def_idx = tcc_realloc(t->def_idx, new_cap * sizeof(int));
+    for (int k = t->table_cap; k < new_cap; k++)
+      t->def_idx[k] = -1;
+    t->table_cap = new_cap;
+  }
+  if (p > t->max_tmp_pos)
+    t->max_tmp_pos = p;
+}
+
+static void dse_inc_use(DseTempDce *t, int p)
+{
+  if (p >= 0)
+  {
+    dse_ensure_cap(t, p);
+    if (t->use_count[p] < 0xFFFF)
+      t->use_count[p]++;
+  }
+}
+
+/* Pure CALL: by-value-returning aeabi helper, never uses an sret arg. */
+static int dse_is_pure_call(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+  {
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
+    if (callee)
+    {
+      const char *name = get_tok_str(callee->v, NULL);
+      if (name && tcc_ir_is_pure_aeabi(name))
+        return 1;
+    }
+  }
+  return 0;
+}
+
+/* A volatile access is mandated whether or not its value is wanted, so it is
+ * never dead-eligible however ordinary its source operand looks -- a symref
+ * can name a volatile global.  A LOAD is dead-eligible only when its source is
+ * side-effect-free: immediate, symref, or LOCAL stack slot. */
+static int dse_is_dead_eligible(TCCIRState *ir, IRQuadCompact *q)
+{
+  return !tcc_ir_instr_access_is_volatile(ir, q) &&
+         ((dse_op_may_die(q->op) && q->op != TCCIR_OP_LOAD) ||
+          (q->op == TCCIR_OP_LOAD &&
+           (tcc_ir_op_src1_is_imm(ir, q) || tcc_ir_op_src1_is_sym(ir, q) ||
+            (tcc_ir_op_src1_vreg(ir, q) <= -2 && tcc_ir_op_src1_vreg(ir, q) >= -9) ||
+            (irop_get_tag(tcc_ir_op_get_src1(ir, q)) == IROP_TAG_STACKOFF && tcc_ir_op_src1_is_local(ir, q)))) ||
+          dse_is_pure_call(ir, q));
+}
+
+static void dse_dec_temp(DseTempDce *t, IROperand s)
+{
+  if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(s)) == TCCIR_VREG_TYPE_TEMP)
+  {
+    int p = TCCIR_DECODE_VREG_POSITION(irop_get_vreg(s));
+    if (p >= 0 && p <= t->max_tmp_pos && t->use_count[p] > 0)
+      if (--t->use_count[p] == 0)
+        t->worklist[t->wl_top++] = p;
+  }
+}
+
+static void dse_dec_sources(DseTempDce *t, IRQuadCompact *q)
+{
+  TCCIRState *ir = t->ir;
+  if (irop_config[q->op].has_src1)
+    dse_dec_temp(t, tcc_ir_op_get_src1(ir, q));
+  if (irop_config[q->op].has_src2)
+    dse_dec_temp(t, tcc_ir_op_get_src2(ir, q));
+  if (q->op == TCCIR_OP_MLA)
+    dse_dec_temp(t, tcc_ir_op_get_accum(ir, q));
+}
+
+/* NOP the parameters of the pure call at call_idx, releasing their sources;
+ * returns how many it NOP'd. */
+static int dse_cascade_pure_call_params(DseTempDce *t, int call_idx)
+{
+  TCCIRState *ir = t->ir;
+  int changes = 0;
+  IRQuadCompact *cq = &ir->compact_instructions[call_idx];
+  int cid = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, cq));
+  for (int pi = call_idx - 1; pi >= 0; --pi)
+  {
+    IRQuadCompact *pq = &ir->compact_instructions[pi];
+    if (pq->op == TCCIR_OP_NOP)
+      continue;
+    if (pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID)
+      continue;
+    int pid = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, pq));
+    if (pid != cid)
+      continue;
+    if (irop_config[pq->op].has_src1)
+      dse_dec_temp(t, tcc_ir_op_get_src1(ir, pq));
+    if (pq->op == TCCIR_OP_FUNCPARAMVAL)
+      dse_dec_temp(t, tcc_ir_op_get_dest(ir, pq));
+    LOG_IR_GEN("DCE PURE-CALL: nop PARAM i=%d (call_id=%d)", pi, cid);
+    pq->op = TCCIR_OP_NOP;
+    changes++;
+  }
+  return changes;
+}
+
 static int tcc_ir_opt_dse__timed(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -112,8 +334,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
         continue;
 
       saw_any = 1;
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(ir, src2));
+      int cid = TCCIR_DECODE_CALL_ID((int32_t)tcc_ir_op_src2_imm(ir, q));
       if (cid > max_call_id)
         max_call_id = cid;
 
@@ -140,8 +361,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
         IRQuadCompact *q = &ir->compact_instructions[i];
         if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
         {
-          IROperand src2 = tcc_ir_op_get_src2(ir, q);
-          int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(ir, src2));
+          int cid = TCCIR_DECODE_CALL_ID((int32_t)tcc_ir_op_src2_imm(ir, q));
           int byte_idx = cid / 8;
           int has = (byte_idx < has_call_bytes) && (has_call[byte_idx] & (1 << (cid % 8)));
           if (cid <= max_call_id && !has)
@@ -164,7 +384,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
     /* Only pure by-value helpers; exclude pure user fns — their sret target may be live. */
@@ -179,44 +399,16 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
     pure_call_changes++;
   }
 
-  int max_tmp_pos = 0;
-  int table_cap = 32;
-  uint16_t *use_count = tcc_mallocz(table_cap * sizeof(uint16_t));
-  int *def_idx = tcc_malloc(table_cap * sizeof(int));
-  for (int i = 0; i < table_cap; i++)
-    def_idx[i] = -1;
+  DseTempDce t;
+  t.ir = ir;
+  t.max_tmp_pos = 0;
+  t.table_cap = 32;
+  t.use_count = tcc_mallocz(t.table_cap * sizeof(uint16_t));
+  t.def_idx = tcc_malloc(t.table_cap * sizeof(int));
+  for (int i = 0; i < t.table_cap; i++)
+    t.def_idx[i] = -1;
 
-#define DSE_ENSURE_CAP(_p)                                                                                             \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    int _pp = (_p);                                                                                                    \
-    if (_pp >= table_cap)                                                                                              \
-    {                                                                                                                  \
-      int _new_cap = table_cap * 2;                                                                                    \
-      while (_new_cap <= _pp)                                                                                          \
-        _new_cap *= 2;                                                                                                 \
-      use_count = tcc_realloc(use_count, _new_cap * sizeof(uint16_t));                                                 \
-      memset(use_count + table_cap, 0, (_new_cap - table_cap) * sizeof(uint16_t));                                     \
-      def_idx = tcc_realloc(def_idx, _new_cap * sizeof(int));                                                          \
-      for (int _k = table_cap; _k < _new_cap; _k++)                                                                    \
-        def_idx[_k] = -1;                                                                                              \
-      table_cap = _new_cap;                                                                                            \
-    }                                                                                                                  \
-    if (_pp > max_tmp_pos)                                                                                             \
-      max_tmp_pos = _pp;                                                                                               \
-  } while (0)
 
-#define DSE_INC_USE(_pos)                                                                                              \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    int _p = (_pos);                                                                                                   \
-    if (_p >= 0)                                                                                                       \
-    {                                                                                                                  \
-      DSE_ENSURE_CAP(_p);                                                                                              \
-      if (use_count[_p] < 0xFFFF)                                                                                      \
-        use_count[_p]++;                                                                                               \
-    }                                                                                                                  \
-  } while (0)
 
   for (int i = 0; i < n; i++)
   {
@@ -226,209 +418,126 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
 
     if (irop_config[q->op].has_src1)
     {
-      const IROperand s = tcc_ir_op_get_src1(ir, q);
-      if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(s)) == TCCIR_VREG_TYPE_TEMP)
-        DSE_INC_USE(TCCIR_DECODE_VREG_POSITION(irop_get_vreg(s)));
+      if (TCCIR_DECODE_VREG_TYPE(tcc_ir_op_src1_vreg(ir, q)) == TCCIR_VREG_TYPE_TEMP)
+        dse_inc_use(&t, TCCIR_DECODE_VREG_POSITION(tcc_ir_op_src1_vreg(ir, q)));
     }
     if (irop_config[q->op].has_src2)
     {
-      const IROperand s = tcc_ir_op_get_src2(ir, q);
-      if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(s)) == TCCIR_VREG_TYPE_TEMP)
-        DSE_INC_USE(TCCIR_DECODE_VREG_POSITION(irop_get_vreg(s)));
+      if (TCCIR_DECODE_VREG_TYPE(tcc_ir_op_src2_vreg(ir, q)) == TCCIR_VREG_TYPE_TEMP)
+        dse_inc_use(&t, TCCIR_DECODE_VREG_POSITION(tcc_ir_op_src2_vreg(ir, q)));
     }
 
     const IROperand dest = tcc_ir_op_get_dest(ir, q);
-    /* STORE/STORE_INDEXED dest is a pointer use, not a def */
-    if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) &&
+    /* STORE/STORE_INDEXED dest is a pointer use, not a def -- and so is any
+     * lvalue dest: `ASM_OUTPUT T3***DEREF***` (an asm "=m"(*p)) writes through
+     * T3.  Not counting it deleted `T3 <-- &x`, x stopped being address-taken,
+     * and its stale value was forwarded past the asm. */
+    const int dest_is_lval_use = irop_config[q->op].has_dest && dest.is_lval;
+    if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED || dest_is_lval_use) &&
         TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) == TCCIR_VREG_TYPE_TEMP)
-      DSE_INC_USE(TCCIR_DECODE_VREG_POSITION(irop_get_vreg(dest)));
+      dse_inc_use(&t, TCCIR_DECODE_VREG_POSITION(irop_get_vreg(dest)));
     /* FUNCPARAMVAL dest carries the parameter value — it's a use */
     if (q->op == TCCIR_OP_FUNCPARAMVAL && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) == TCCIR_VREG_TYPE_TEMP)
-      DSE_INC_USE(TCCIR_DECODE_VREG_POSITION(irop_get_vreg(dest)));
+      dse_inc_use(&t, TCCIR_DECODE_VREG_POSITION(irop_get_vreg(dest)));
     /* MLA accumulator is a use */
     if (q->op == TCCIR_OP_MLA)
     {
       const IROperand acc = tcc_ir_op_get_accum(ir, q);
       if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(acc)) == TCCIR_VREG_TYPE_TEMP)
-        DSE_INC_USE(TCCIR_DECODE_VREG_POSITION(irop_get_vreg(acc)));
+        dse_inc_use(&t, TCCIR_DECODE_VREG_POSITION(irop_get_vreg(acc)));
     }
 
     if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) == TCCIR_VREG_TYPE_TEMP &&
-        q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED && q->op != TCCIR_OP_FUNCPARAMVAL)
+        q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED && q->op != TCCIR_OP_FUNCPARAMVAL &&
+        !dest_is_lval_use)
     {
       int pos = TCCIR_DECODE_VREG_POSITION(irop_get_vreg(dest));
       if (pos >= 0)
       {
-        DSE_ENSURE_CAP(pos);
-        def_idx[pos] = i; /* last def wins; OK since we only eliminate when use_count hits 0 */
+        dse_ensure_cap(&t, pos);
+        t.def_idx[pos] = i; /* last def wins; OK since we only eliminate when use_count hits 0 */
       }
     }
   }
 
-  if (max_tmp_pos == 0)
+  if (t.max_tmp_pos == 0)
   {
-    tcc_free(use_count);
-    tcc_free(def_idx);
+    tcc_free(t.use_count);
+    tcc_free(t.def_idx);
     return pure_call_changes;
   }
 
   int changes = pure_call_changes;
   LOG_IR_GEN("=== DEAD STORE ELIMINATION START ===");
 
-  /* Pure CALL: by-value-returning aeabi helper, never uses an sret arg. */
-#define DSE_IS_PURE_CALL(_q)                                                                                           \
-  ({                                                                                                                   \
-    int _pure = 0;                                                                                                     \
-    if ((_q)->op == TCCIR_OP_FUNCCALLVAL || (_q)->op == TCCIR_OP_FUNCCALLVOID)                                         \
-    {                                                                                                                  \
-      Sym *_callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, (_q)));                                                \
-      if (_callee)                                                                                                     \
-      {                                                                                                                \
-        const char *_name = get_tok_str(_callee->v, NULL);                                                             \
-        if (_name && tcc_ir_is_pure_aeabi(_name))                                                                      \
-          _pure = 1;                                                                                                   \
-      }                                                                                                                \
-    }                                                                                                                  \
-    _pure;                                                                                                             \
-  })
 
-  /* A volatile access is mandated whether or not its value is wanted, so it is
-   * never dead-eligible however ordinary its source operand looks -- a symref
-   * can name a volatile global. */
-#define DSE_IS_DEAD_ELIGIBLE(_q) (!tcc_ir_instr_access_is_volatile(ir, (_q)) && DSE_SOURCE_IS_PURE(_q))
 
-  /* A LOAD is dead-eligible only when its source is side-effect-free: immediate, symref, or LOCAL stack slot. */
-#define DSE_SOURCE_IS_PURE(_q)                                                                                         \
-  (((_q)->op != TCCIR_OP_STORE && (_q)->op != TCCIR_OP_STORE_INDEXED && (_q)->op != TCCIR_OP_STORE_POSTINC &&          \
-    (_q)->op != TCCIR_OP_LOAD_POSTINC && (_q)->op != TCCIR_OP_LOAD && (_q)->op != TCCIR_OP_FUNCCALLVAL &&              \
-    (_q)->op != TCCIR_OP_FUNCCALLVOID && (_q)->op != TCCIR_OP_FUNCPARAMVAL && (_q)->op != TCCIR_OP_FUNCPARAMVOID) ||   \
-   ((_q)->op == TCCIR_OP_LOAD &&                                                                                       \
-    (irop_is_immediate(tcc_ir_op_get_src1(ir, (_q))) || tcc_ir_op_get_src1(ir, (_q)).is_sym ||                         \
-     (irop_get_vreg(tcc_ir_op_get_src1(ir, (_q))) <= -2 && irop_get_vreg(tcc_ir_op_get_src1(ir, (_q))) >= -9) ||       \
-     (irop_get_tag(tcc_ir_op_get_src1(ir, (_q))) == IROP_TAG_STACKOFF &&                                               \
-      tcc_ir_op_get_src1(ir, (_q)).is_local))) ||                                                                      \
-   DSE_IS_PURE_CALL(_q))
 
-#define DSE_DEC_TEMP(_op)                                                                                             \
-  do                                                                                                                  \
-  {                                                                                                                   \
-    const IROperand _s = (_op);                                                                                       \
-    if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(_s)) == TCCIR_VREG_TYPE_TEMP)                                            \
-    {                                                                                                                 \
-      int _p = TCCIR_DECODE_VREG_POSITION(irop_get_vreg(_s));                                                         \
-      if (_p >= 0 && _p <= max_tmp_pos && use_count[_p] > 0)                                                          \
-        if (--use_count[_p] == 0)                                                                                     \
-          worklist[wl_top++] = _p;                                                                                    \
-    }                                                                                                                 \
-  } while (0)
 
-#define DSE_DEC_SOURCES(_q)                                                                                           \
-  do                                                                                                                  \
-  {                                                                                                                   \
-    if (irop_config[(_q)->op].has_src1)                                                                               \
-      DSE_DEC_TEMP(tcc_ir_op_get_src1(ir, (_q)));                                                                     \
-    if (irop_config[(_q)->op].has_src2)                                                                               \
-      DSE_DEC_TEMP(tcc_ir_op_get_src2(ir, (_q)));                                                                     \
-    if ((_q)->op == TCCIR_OP_MLA)                                                                                     \
-      DSE_DEC_TEMP(tcc_ir_op_get_accum(ir, (_q)));                                                                    \
-  } while (0)
 
-#define DSE_CASCADE_PURE_CALL_PARAMS(_call_idx)                                                                        \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    int _ci = (_call_idx);                                                                                             \
-    IRQuadCompact *_cq = &ir->compact_instructions[_ci];                                                               \
-    int _cid = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, _cq)));                     \
-    for (int _pi = _ci - 1; _pi >= 0; --_pi)                                                                           \
-    {                                                                                                                  \
-      IRQuadCompact *_pq = &ir->compact_instructions[_pi];                                                             \
-      if (_pq->op == TCCIR_OP_NOP)                                                                                     \
-        continue;                                                                                                      \
-      if (_pq->op != TCCIR_OP_FUNCPARAMVAL && _pq->op != TCCIR_OP_FUNCPARAMVOID)                                       \
-        continue;                                                                                                      \
-      int _pid = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, _pq)));                   \
-      if (_pid != _cid)                                                                                                \
-        continue;                                                                                                      \
-      if (irop_config[_pq->op].has_src1)                                                                               \
-        DSE_DEC_TEMP(tcc_ir_op_get_src1(ir, _pq));                                                                     \
-      if (_pq->op == TCCIR_OP_FUNCPARAMVAL)                                                                            \
-        DSE_DEC_TEMP(tcc_ir_op_get_dest(ir, _pq));                                                                     \
-      LOG_IR_GEN("DCE PURE-CALL: nop PARAM i=%d (call_id=%d)", _pi, _cid);                                             \
-      _pq->op = TCCIR_OP_NOP;                                                                                          \
-      changes++;                                                                                                       \
-    }                                                                                                                  \
-  } while (0)
 
-  int *worklist = tcc_malloc((max_tmp_pos + 1) * sizeof(int));
-  int wl_top = 0;
+  t.worklist = tcc_malloc((t.max_tmp_pos + 1) * sizeof(int));
+  t.wl_top = 0;
 
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    const IROperand dest = tcc_ir_op_get_dest(ir, q);
     if (!irop_config[q->op].has_dest)
       continue;
-    if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) != TCCIR_VREG_TYPE_TEMP)
+    if (TCCIR_DECODE_VREG_TYPE(tcc_ir_op_dest_vreg(ir, q)) != TCCIR_VREG_TYPE_TEMP)
       continue;
-    int pos = TCCIR_DECODE_VREG_POSITION(irop_get_vreg(dest));
-    if (pos > max_tmp_pos || use_count[pos] != 0)
+    int pos = TCCIR_DECODE_VREG_POSITION(tcc_ir_op_dest_vreg(ir, q));
+    if (pos > t.max_tmp_pos || t.use_count[pos] != 0)
       continue;
-    if (!DSE_IS_DEAD_ELIGIBLE(q))
+    if (!dse_is_dead_eligible(ir, q))
       continue;
 
-    DSE_DEC_SOURCES(q);
+    dse_dec_sources(&t, q);
     if (q->op == TCCIR_OP_FUNCCALLVAL)
     {
       LOG_IR_GEN("DCE PURE-CALL: nop CALL at i=%d (result tmp dead)", i);
-      DSE_CASCADE_PURE_CALL_PARAMS(i);
+      changes += dse_cascade_pure_call_params(&t, i);
     }
     q->op = TCCIR_OP_NOP;
-    def_idx[pos] = -1;
+    t.def_idx[pos] = -1;
     changes++;
   }
 
-  while (wl_top > 0)
+  while (t.wl_top > 0)
   {
-    int pos = worklist[--wl_top];
-    int di = def_idx[pos];
+    int pos = t.worklist[--t.wl_top];
+    int di = t.def_idx[pos];
     if (di < 0 || di >= n)
       continue;
     IRQuadCompact *q = &ir->compact_instructions[di];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if (use_count[pos] != 0)
+    if (t.use_count[pos] != 0)
       continue; /* someone used it again via a different def */
-    if (!DSE_IS_DEAD_ELIGIBLE(q))
+    if (!dse_is_dead_eligible(ir, q))
       continue;
-    const IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (!irop_config[q->op].has_dest || TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) != TCCIR_VREG_TYPE_TEMP)
+    if (!irop_config[q->op].has_dest || TCCIR_DECODE_VREG_TYPE(tcc_ir_op_dest_vreg(ir, q)) != TCCIR_VREG_TYPE_TEMP)
       continue;
 
-    DSE_DEC_SOURCES(q);
+    dse_dec_sources(&t, q);
     if (q->op == TCCIR_OP_FUNCCALLVAL)
     {
       LOG_IR_GEN("DCE PURE-CALL: nop CALL at i=%d (cascade)", di);
-      DSE_CASCADE_PURE_CALL_PARAMS(di);
+      changes += dse_cascade_pure_call_params(&t, di);
     }
     q->op = TCCIR_OP_NOP;
-    def_idx[pos] = -1;
+    t.def_idx[pos] = -1;
     changes++;
   }
 
-#undef DSE_INC_USE
-#undef DSE_ENSURE_CAP
-#undef DSE_IS_DEAD_ELIGIBLE
-#undef DSE_IS_PURE_CALL
-#undef DSE_CASCADE_PURE_CALL_PARAMS
-#undef DSE_DEC_TEMP
-#undef DSE_DEC_SOURCES
 
   LOG_IR_GEN("=== DEAD STORE ELIMINATION END (marked %d as NOP) ===", changes);
-  tcc_free(worklist);
-  tcc_free(def_idx);
-  tcc_free(use_count);
+  tcc_free(t.worklist);
+  tcc_free(t.def_idx);
+  tcc_free(t.use_count);
+  const int max_tmp_pos = t.max_tmp_pos;
 
   /* Eliminate VAR defs never used as a source, unless address-taken. */
   {
@@ -438,8 +547,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op == TCCIR_OP_NOP)
         continue;
-      const IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t vr = irop_get_vreg(dest);
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
       if (irop_config[q->op].has_dest && vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -457,17 +565,6 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
         if (ir->variables_live_intervals[p].is_volatile)
           var_used[p / 8] |= (1 << (p % 8));
 
-#define MARK_VAR_USED(_op)                                                                                            \
-  do                                                                                                                  \
-  {                                                                                                                   \
-    int32_t _vr = irop_get_vreg(_op);                                                                                 \
-    if (_vr >= 0 && TCCIR_DECODE_VREG_TYPE(_vr) == TCCIR_VREG_TYPE_VAR)                                               \
-    {                                                                                                                 \
-      int _pos = TCCIR_DECODE_VREG_POSITION(_vr);                                                                     \
-      if (_pos <= max_var_pos)                                                                                        \
-        var_used[_pos / 8] |= (1 << (_pos % 8));                                                                      \
-    }                                                                                                                 \
-  } while (0)
 
       for (int i = 0; i < n; i++)
       {
@@ -476,28 +573,27 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
           continue;
 
         if (irop_config[q->op].has_src1)
-          MARK_VAR_USED(tcc_ir_op_get_src1(ir, q));
+          dse_mark_var_used(var_used, max_var_pos, tcc_ir_op_src1_vreg(ir, q));
 
         if (irop_config[q->op].has_src2)
-          MARK_VAR_USED(tcc_ir_op_get_src2(ir, q));
+          dse_mark_var_used(var_used, max_var_pos, tcc_ir_op_src2_vreg(ir, q));
 
         /* STORE dest is a use only when non-local (deref); STORE_INDEXED dest is always a base-address use. */
         if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED)
         {
           const IROperand d = tcc_ir_op_get_dest(ir, q);
           if (!d.is_local || q->op == TCCIR_OP_STORE_INDEXED)
-            MARK_VAR_USED(d);
+            dse_mark_var_used(var_used, max_var_pos, irop_get_vreg(d));
         }
 
         /* FUNCPARAMVAL dest carries the parameter value — it's a use, not a def */
         if (q->op == TCCIR_OP_FUNCPARAMVAL)
-          MARK_VAR_USED(tcc_ir_op_get_dest(ir, q));
+          dse_mark_var_used(var_used, max_var_pos, tcc_ir_op_dest_vreg(ir, q));
 
         /* MLA accumulator (4th operand) is a use not covered by src1/src2. */
         if (q->op == TCCIR_OP_MLA)
-          MARK_VAR_USED(tcc_ir_op_get_accum(ir, q));
+          dse_mark_var_used(var_used, max_var_pos, tcc_ir_op_accum_vreg(ir, q));
       }
-#undef MARK_VAR_USED
 
       for (int i = 0; i < n; i++)
       {
@@ -540,7 +636,6 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       if (ir->compact_instructions[i].op == TCCIR_OP_SET_CHAIN)
         goto skip_dead_stackloc;
     }
-#define STACKLOC_HASH_SIZE 256
     uint8_t stackloc_read[STACKLOC_HASH_SIZE];
     memset(stackloc_read, 0, sizeof(stackloc_read));
     /* Spans read through an address or as a struct: bounded by the object
@@ -567,14 +662,8 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       if (off > max_stackloc_off)
         max_stackloc_off = off;
     }
+    const DseStacklocMarks slm = {ir, stackloc_read, &ranges, &nranges, &ranges_cap, max_stackloc_off};
 
-#define STACKLOC_HASH(sym, off) (((uintptr_t)(sym) * 31 + (uint32_t)(off) * 17) % (STACKLOC_HASH_SIZE * 8))
-#define STACKLOC_SET(sym, off)                                                                                         \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    uint32_t _h = STACKLOC_HASH(sym, off);                                                                             \
-    stackloc_read[_h / 8] |= (1 << (_h % 8));                                                                          \
-  } while (0)
 #define STACKLOC_TEST(sym, off) (stackloc_read[STACKLOC_HASH(sym, off) / 8] & (1 << (STACKLOC_HASH(sym, off) % 8)))
 
     /* Identify write-only addr-of TEMPs: address used only in the store pipeline; any other use marks it read. */
@@ -624,12 +713,16 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
           continue;
         if (irop_config[q->op].has_src1)
         {
-          IROperand s = tcc_ir_op_get_src1(ir, q);
-          if (s.is_local && !s.is_lval && irop_get_vreg(s) < 0)
+          if (tcc_ir_op_src1_is_local(ir, q) && !tcc_ir_op_src1_is_lval(ir, q) && tcc_ir_op_src1_vreg(ir, q) < 0)
           {
             IROperand d = tcc_ir_op_get_dest(ir, q);
             int32_t dvr = irop_get_vreg(d);
-            if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && dse_defines_dest(q, d))
+            /* A memory read whose address operand is a StackLoc (a LOAD_INDEXED
+             * over a local array) loads the array's CONTENT, it does not define
+             * the array's address: the result is not an addr-TMP, and the array
+             * must stay marked read so its initializer survives. */
+            if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && dse_defines_dest(q, d) &&
+                !ir_op_has(q->op, IR_HZ_MEM_READ))
             {
               int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
               if (dpos <= max_tmp_stackloc)
@@ -662,9 +755,8 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
 
           if (!irop_config[q->op].has_src1 || !irop_config[q->op].has_dest)
             continue;
-          IROperand src = tcc_ir_op_get_src1(ir, q);
           IROperand dest = tcc_ir_op_get_dest(ir, q);
-          int32_t svr = irop_get_vreg(src);
+          int32_t svr = tcc_ir_op_src1_vreg(ir, q);
           int32_t dvr = irop_get_vreg(dest);
           if (svr < 0 || dvr < 0)
             continue;
@@ -681,8 +773,15 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
           else if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) && stype == TCCIR_VREG_TYPE_VAR &&
                    dtype == TCCIR_VREG_TYPE_TEMP && prop_var && spos <= max_var_stackloc && dpos <= max_tmp_stackloc)
             origin = prop_var[spos];
-          else if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) && stype == TCCIR_VREG_TYPE_VAR &&
-                   dtype == TCCIR_VREG_TYPE_VAR && prop_var && spos <= max_var_stackloc && dpos <= max_var_stackloc)
+          /* VAR -> VAR STORE too: an inlined pointer parameter lands as
+           * `V79 <-- V22 [STORE]`, and Phase 3 counts it as a safe copy, so it
+           * must carry the origin.  Zig's `get(&t8 + 28)` stepped back 28
+           * bytes through such a param; the loads went unseen and t8's stores
+           * died. */
+          else if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD ||
+                    (q->op == TCCIR_OP_STORE && irop_dest_defines_vreg(dest))) &&
+                   stype == TCCIR_VREG_TYPE_VAR && dtype == TCCIR_VREG_TYPE_VAR && prop_var &&
+                   spos <= max_var_stackloc && dpos <= max_var_stackloc)
             origin = prop_var[spos];
           else if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB || q->op == TCCIR_OP_ASSIGN) &&
                    stype == TCCIR_VREG_TYPE_TEMP && dtype == TCCIR_VREG_TYPE_TEMP && spos <= max_tmp_stackloc &&
@@ -782,7 +881,10 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
                 /* For TMP src, is_lval=1 = deref read (unsafe); for VAR src it just means load (safe). */
                 IROperand d = tcc_ir_op_get_dest(ir, q);
                 int32_t dvr = irop_get_vreg(d);
-                if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR)
+                /* Only a store that defines the VAR is a copy Phase 2 followed;
+                 * one through the pointer the VAR holds sends the address to
+                 * memory. */
+                if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR && irop_dest_defines_vreg(d))
                   safe = 1;
               }
               else if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
@@ -805,8 +907,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
         /* Check src2: addr-prop as src2 is unusual; conservatively mark read */
         if (irop_config[q->op].has_src2)
         {
-          IROperand s = tcc_ir_op_get_src2(ir, q);
-          int32_t vr = irop_get_vreg(s);
+          int32_t vr = tcc_ir_op_src2_vreg(ir, q);
           if (vr >= 0)
           {
             int origin = GET_ORIGIN(vr);
@@ -834,7 +935,19 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
           }
         }
 
-        /* STORE dest as an addr-prop TMP is a deref write — safe, no marking. */
+        /* STORE dest as an addr-prop TMP is a deref write — safe, no marking,
+         * unless it is a volatile access: that is observable by itself, so the
+         * address and the object stay. */
+        if (irop_config[q->op].has_dest && tcc_ir_instr_access_is_volatile(ir, q))
+        {
+          const int32_t dvr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+          if (dvr >= 0)
+          {
+            const int origin = GET_ORIGIN(dvr);
+            if (origin != -1)
+              MARK_ORIGIN_READ(origin);
+          }
+        }
 
 #undef GET_ORIGIN
 #undef MARK_ORIGIN_READ
@@ -852,63 +965,6 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
         continue;
 
       /* Mark StackLoc operand: is_lval=1 → exact-offset read; is_lval=0 → address-of range; write-only addr-of skipped. */
-#define MARK_STACKLOC_OP(op)                                                                                           \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    if ((op).is_local && irop_get_vreg(op) < 0)                                                                        \
-    {                                                                                                                  \
-      const Sym *_sym;                                                                                                 \
-      int64_t _off;                                                                                                    \
-      dse_stackloc_sym_off(ir, (op), &_sym, &_off);                                                                    \
-      if ((op).is_lval)                                                                                                \
-      {                                                                                                                \
-        int _width;                                                                                                    \
-        switch ((op).btype)                                                                                            \
-        {                                                                                                              \
-        case IROP_BTYPE_INT8:                                                                                          \
-          _width = 1;                                                                                                  \
-          break;                                                                                                       \
-        case IROP_BTYPE_INT16:                                                                                         \
-          _width = 2;                                                                                                  \
-          break;                                                                                                       \
-        case IROP_BTYPE_FLOAT32:                                                                                       \
-          _width = 4;                                                                                                  \
-          break;                                                                                                       \
-        case IROP_BTYPE_INT64:                                                                                         \
-        case IROP_BTYPE_FLOAT64:                                                                                       \
-          _width = 8;                                                                                                  \
-          break;                                                                                                       \
-        case IROP_BTYPE_STRUCT:                                                                                        \
-        {                                                                                                              \
-          /* Struct access: to the end of its object, else up to the max store offset */                               \
-          int64_t _shi = max_stackloc_off + 5;                                                                         \
-          int _olo, _ohi;                                                                                              \
-          if (!_sym && tcc_ir_frame_object_at(ir, (int)_off, &_olo, &_ohi))                                            \
-            _shi = _ohi;                                                                                               \
-          dse_add_range(&ranges, &nranges, &ranges_cap, _sym, _off, _shi);                                             \
-          _width = 0; /* already handled */                                                                            \
-          break;                                                                                                       \
-        }                                                                                                              \
-        default:                                                                                                       \
-          _width = 4;                                                                                                  \
-          break;                                                                                                       \
-        }                                                                                                              \
-        if ((op).is_complex)                                                                                           \
-          _width *= 2;                                                                                                 \
-        for (int _b = 0; _b < _width; _b++)                                                                            \
-          STACKLOC_SET(_sym, _off + _b);                                                                               \
-      }                                                                                                                \
-      else                                                                                                             \
-      {                                                                                                                \
-        /* Address taken: its whole object, else up to the max store offset */                                         \
-        int64_t _rlo = _off, _rhi = max_stackloc_off + 5;                                                              \
-        int _olo, _ohi;                                                                                                \
-        if (!_sym && tcc_ir_frame_object_at(ir, (int)_off, &_olo, &_ohi))                                              \
-          _rlo = _olo, _rhi = _ohi;                                                                                    \
-        dse_add_range(&ranges, &nranges, &ranges_cap, _sym, _rlo, _rhi);                                               \
-      }                                                                                                                \
-    }                                                                                                                  \
-  } while (0)
 
       /* Check all operands for StackLoc reads / address-taken */
       if (irop_config[q->op].has_src1)
@@ -952,11 +1008,11 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
         {
           IROperand s_range = s;
           s_range.is_lval = 0;
-          MARK_STACKLOC_OP(s_range);
+          dse_mark_stackloc_op(&slm, s_range);
         }
         else
         {
-          MARK_STACKLOC_OP(s);
+          dse_mark_stackloc_op(&slm, s);
         }
       after_src1_mark:;
       }
@@ -964,15 +1020,14 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
       {
         IROperand s = tcc_ir_op_get_src2(ir, q);
         LOG_IR_GEN("DSE-SL: MARK src2 at i=%d op=%d is_lval=%d is_local=%d", i, q->op, s.is_lval, s.is_local);
-        MARK_STACKLOC_OP(s);
+        dse_mark_stackloc_op(&slm, s);
       }
       /* MLA accumulator (4th operand) may reference a StackLoc */
       if (q->op == TCCIR_OP_MLA)
       {
         IROperand acc = tcc_ir_op_get_accum(ir, q);
-        MARK_STACKLOC_OP(acc);
+        dse_mark_stackloc_op(&slm, acc);
       }
-#undef MARK_STACKLOC_OP
     }
 
 #if TCC_LOG_IR_GEN
@@ -992,6 +1047,9 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op != TCCIR_OP_STORE)
+        continue;
+      /* a volatile store is observable even into a slot nothing reads */
+      if (tcc_ir_instr_access_is_volatile(ir, q))
         continue;
       IROperand dest = tcc_ir_op_get_dest(ir, q);
       if (!dest.is_local || irop_get_vreg(dest) >= 0)
@@ -1036,8 +1094,7 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
           continue;
         if (irop_config[q->op].has_dest)
         {
-          IROperand d = tcc_ir_op_get_dest(ir, q);
-          int32_t vr = irop_get_vreg(d);
+          int32_t vr = tcc_ir_op_dest_vreg(ir, q);
           if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
           {
             int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -1047,131 +1104,218 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
         }
       }
 
+      /* Deadness is only sound for a vreg whose EVERY definition is dead: a
+       * `?:` result or a reassigned pointer VAR may hold the dead local's
+       * address on one path and a live pointer (a parameter, a load) on
+       * another.  So: count the definitions, and compute the chain on a scratch
+       * `kill` map.  An instruction that survives yet reads a vreg the chain
+       * calls dead would read a deleted definition -- that vreg is tainted and
+       * the chain recomputed without it, until nothing survivor-visible is
+       * dead. */
+      const int ntmp = max_tmp_stackloc + 1, nvar = max_var_pos + 1;
+      int *def_tmp = tcc_mallocz(sizeof(int) * (ntmp > 0 ? ntmp : 1));
+      int *def_var = tcc_mallocz(sizeof(int) * (nvar > 0 ? nvar : 1));
       uint8_t *dead_tmp = tcc_mallocz((max_tmp_stackloc + 8) / 8);
       uint8_t *dead_var = max_var_pos >= 0 ? tcc_mallocz((max_var_pos + 8) / 8) : NULL;
-
-      /* NOP LEA/Addr for write-only addr-TMPs whose StackLoc range is dead. */
+      uint8_t *taint_tmp = tcc_mallocz((max_tmp_stackloc + 8) / 8);
+      uint8_t *taint_var = max_var_pos >= 0 ? tcc_mallocz((max_var_pos + 8) / 8) : NULL;
+      uint8_t *kill = tcc_mallocz(n);
       for (int i = 0; i < n; i++)
       {
         IRQuadCompact *q = &ir->compact_instructions[i];
-        if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_src1)
-          continue;
-        IROperand s = tcc_ir_op_get_src1(ir, q);
-        if (!s.is_local || s.is_lval || irop_get_vreg(s) >= 0)
+        if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
           continue;
         IROperand d = tcc_ir_op_get_dest(ir, q);
-        int32_t dvr = irop_get_vreg(d);
-        if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP)
+        const int32_t dvr = irop_get_vreg(d);
+        if (dvr < 0 || q->op == TCCIR_OP_STORE_INDEXED || !irop_dest_defines_vreg(d))
           continue;
-        int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
-        if (dpos > max_tmp_stackloc)
-          continue;
-        if (!(addr_tmp[dpos / 8] & (1 << (dpos % 8))))
-          continue;
-        if (addr_tmp_read[dpos / 8] & (1 << (dpos % 8)))
-          continue;
-
-        /* Verify range dead: any offset in [base, max+4] still read? Catches mixed read/write-only TMPs to one StackLoc. */
-        const Sym *addr_sym;
-        int64_t addr_off;
-        dse_stackloc_sym_off(ir, s, &addr_sym, &addr_off);
-        int range_is_read = 0;
-        int64_t range_end = max_stackloc_off + 4;
-        int64_t range_len = range_end - addr_off + 1;
-        if (range_len > STACKLOC_HASH_SIZE * 8 ||
-            dse_ranges_overlap(ranges, nranges, addr_sym, addr_off, range_end + 1))
-        {
-          range_is_read = 1; /* Too large — conservatively assume read */
-        }
-        else
-        {
-          for (int64_t k = addr_off; k <= range_end; k++)
-          {
-            if (STACKLOC_TEST(addr_sym, k))
-            {
-              range_is_read = 1;
-              break;
-            }
-          }
-        }
-        if (range_is_read)
-          continue;
-
-        q->op = TCCIR_OP_NOP;
-        changes++;
-        dead_tmp[dpos / 8] |= (1 << (dpos % 8));
+        const int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
+        if (TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && dpos < ntmp)
+          def_tmp[dpos]++;
+        else if (TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR && dpos < nvar)
+          def_var[dpos]++;
       }
+#define DSE_VREG_IN(set_tmp, set_var, vr)                                                                              \
+  ({                                                                                                                   \
+    int _in = 0;                                                                                                       \
+    if ((vr) >= 0)                                                                                                     \
+    {                                                                                                                  \
+      const int _p = TCCIR_DECODE_VREG_POSITION(vr);                                                                   \
+      if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && _p <= max_tmp_stackloc)                                \
+        _in = ((set_tmp)[_p / 8] >> (_p % 8)) & 1;                                                                     \
+      else if ((set_var) && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && _p <= max_var_pos)                   \
+        _in = ((set_var)[_p / 8] >> (_p % 8)) & 1;                                                                     \
+    }                                                                                                                  \
+    _in;                                                                                                               \
+  })
+#define DSE_VREG_SET(set_tmp, set_var, vr)                                                                             \
+  do                                                                                                                   \
+  {                                                                                                                    \
+    const int _p = TCCIR_DECODE_VREG_POSITION(vr);                                                                     \
+    if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && _p <= max_tmp_stackloc)                                  \
+      (set_tmp)[_p / 8] |= (1 << (_p % 8));                                                                            \
+    else if ((set_var) && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && _p <= max_var_pos)                     \
+      (set_var)[_p / 8] |= (1 << (_p % 8));                                                                            \
+  } while (0)
 
-      /* Forward-propagate deadness: NOP instructions whose sources are all dead, then mark their dests dead. */
-      int prop_changed = 1;
-      while (prop_changed)
+      for (;;)
       {
-        prop_changed = 0;
+        memset(dead_tmp, 0, (max_tmp_stackloc + 8) / 8);
+        if (dead_var)
+          memset(dead_var, 0, (max_var_pos + 8) / 8);
+        memset(kill, 0, n);
+
+        /* Seeds: LEA/Addr for write-only addr-TMPs whose StackLoc range is dead. */
         for (int i = 0; i < n; i++)
         {
           IRQuadCompact *q = &ir->compact_instructions[i];
-          if (q->op == TCCIR_OP_NOP)
+          if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_src1)
             continue;
-          /* Only propagate through data-flow instructions */
-          if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP ||
-              q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID ||
-              q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID || q->op == TCCIR_OP_SWITCH_TABLE)
+          IROperand s = tcc_ir_op_get_src1(ir, q);
+          if (!s.is_local || s.is_lval || irop_get_vreg(s) >= 0)
+            continue;
+          IROperand d = tcc_ir_op_get_dest(ir, q);
+          int32_t dvr = irop_get_vreg(d);
+          if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP)
+            continue;
+          int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
+          if (dpos > max_tmp_stackloc || def_tmp[dpos] != 1 || (taint_tmp[dpos / 8] & (1 << (dpos % 8))))
+            continue;
+          if (!(addr_tmp[dpos / 8] & (1 << (dpos % 8))))
+            continue;
+          if (addr_tmp_read[dpos / 8] & (1 << (dpos % 8)))
             continue;
 
-          int has_dead_src = 0;
-
-          if (irop_config[q->op].has_src1)
+          /* Verify range dead: any offset in [base, max+4] still read? Catches mixed read/write-only TMPs to one StackLoc. */
+          const Sym *addr_sym;
+          int64_t addr_off;
+          dse_stackloc_sym_off(ir, s, &addr_sym, &addr_off);
+          int range_is_read = 0;
+          int64_t range_end = max_stackloc_off + 4;
+          int64_t range_len = range_end - addr_off + 1;
+          if (range_len > STACKLOC_HASH_SIZE * 8 ||
+              dse_ranges_overlap(ranges, nranges, addr_sym, addr_off, range_end + 1))
           {
-            IROperand s = tcc_ir_op_get_src1(ir, q);
-            int32_t vr = irop_get_vreg(s);
-            if (vr >= 0)
+            range_is_read = 1; /* Too large — conservatively assume read */
+          }
+          else
+          {
+            for (int64_t k = addr_off; k <= range_end; k++)
             {
-              int pos = TCCIR_DECODE_VREG_POSITION(vr);
-              if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && pos <= max_tmp_stackloc &&
-                  (dead_tmp[pos / 8] & (1 << (pos % 8))))
-                has_dead_src = 1;
-              else if (dead_var && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && pos <= max_var_pos &&
-                       (dead_var[pos / 8] & (1 << (pos % 8))))
-                has_dead_src = 1;
+              if (STACKLOC_TEST(addr_sym, k))
+              {
+                range_is_read = 1;
+                break;
+              }
             }
           }
+          if (range_is_read)
+            continue;
 
-          /* STORE/STORE_INDEXED dest is the pointer base — a dead base kills the store. */
-          if (!has_dead_src && (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED))
+          kill[i] = 1;
+          dead_tmp[dpos / 8] |= (1 << (dpos % 8));
+        }
+
+        /* Forward-propagate deadness: kill instructions whose sources are dead, then mark their dests dead. */
+        int prop_changed = 1;
+        while (prop_changed)
+        {
+          prop_changed = 0;
+          for (int i = 0; i < n; i++)
           {
-            IROperand d = tcc_ir_op_get_dest(ir, q);
-            int32_t vr = irop_get_vreg(d);
-            if (vr >= 0)
+            IRQuadCompact *q = &ir->compact_instructions[i];
+            if (q->op == TCCIR_OP_NOP || kill[i])
+              continue;
+            /* Only propagate through data-flow instructions */
+            if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP ||
+                q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID ||
+                q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID || q->op == TCCIR_OP_SWITCH_TABLE)
+              continue;
+
+            int has_dead_src = 0;
+            if (irop_config[q->op].has_src1)
+              has_dead_src = DSE_VREG_IN(dead_tmp, dead_var, irop_get_vreg(tcc_ir_op_get_src1(ir, q)));
+
+            /* STORE/STORE_INDEXED dest is the pointer base - a dead base kills the store. */
+            if (!has_dead_src && (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED))
             {
-              int pos = TCCIR_DECODE_VREG_POSITION(vr);
-              if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && pos <= max_tmp_stackloc &&
-                  (dead_tmp[pos / 8] & (1 << (pos % 8))))
-                has_dead_src = 1;
+              const int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+              if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+                has_dead_src = DSE_VREG_IN(dead_tmp, dead_var, vr);
             }
-          }
+            if (!has_dead_src)
+              continue;
 
-          if (has_dead_src)
-          {
+            /* The destination turns dead only when this is its sole definition. */
+            int32_t dvr = -1;
             if (irop_config[q->op].has_dest)
             {
               IROperand d = tcc_ir_op_get_dest(ir, q);
-              int32_t dvr = irop_get_vreg(d);
-              if (dvr >= 0)
+              if (irop_get_vreg(d) >= 0 && irop_dest_defines_vreg(d) && q->op != TCCIR_OP_STORE_INDEXED)
               {
-                int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
-                if (TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && dpos <= max_tmp_stackloc)
-                  dead_tmp[dpos / 8] |= (1 << (dpos % 8));
-                else if (dead_var && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR && dpos <= max_var_pos)
-                  dead_var[dpos / 8] |= (1 << (dpos % 8));
+                dvr = irop_get_vreg(d);
+                const int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
+                const int single = TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP
+                                       ? (dpos < ntmp && def_tmp[dpos] == 1 && !(taint_tmp[dpos / 8] & (1 << (dpos % 8))))
+                                       : (TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR && dpos < nvar &&
+                                          def_var[dpos] == 1 && !(taint_var[dpos / 8] & (1 << (dpos % 8))));
+                if (!single)
+                  continue;
               }
             }
-            q->op = TCCIR_OP_NOP;
-            changes++;
+            if (dvr >= 0)
+              DSE_VREG_SET(dead_tmp, dead_var, dvr);
+            kill[i] = 1;
             prop_changed = 1;
           }
         }
-      }
 
+        /* A survivor that reads a dead vreg would read a deleted definition. */
+        int tainted = 0;
+        for (int i = 0; i < n; i++)
+        {
+          IRQuadCompact *q = &ir->compact_instructions[i];
+          if (q->op == TCCIR_OP_NOP || kill[i])
+            continue;
+          int32_t uses[4];
+          int nuse = 0;
+          if (irop_config[q->op].has_src1)
+            uses[nuse++] = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+          if (irop_config[q->op].has_src2)
+            uses[nuse++] = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+          if (q->op == TCCIR_OP_MLA)
+            uses[nuse++] = irop_get_vreg(tcc_ir_op_get_accum(ir, q));
+          if (irop_config[q->op].has_dest)
+          {
+            IROperand d = tcc_ir_op_get_dest(ir, q);
+            if (!irop_dest_defines_vreg(d) || q->op == TCCIR_OP_STORE_POSTINC)
+              uses[nuse++] = irop_get_vreg(d); /* the base a store writes through */
+          }
+          for (int k = 0; k < nuse; k++)
+            if (uses[k] >= 0 && DSE_VREG_IN(dead_tmp, dead_var, uses[k]))
+            {
+              DSE_VREG_SET(taint_tmp, taint_var, uses[k]);
+              tainted = 1;
+            }
+        }
+        if (!tainted)
+          break;
+      }
+#undef DSE_VREG_IN
+#undef DSE_VREG_SET
+
+      for (int i = 0; i < n; i++)
+        if (kill[i])
+        {
+          ir->compact_instructions[i].op = TCCIR_OP_NOP;
+          changes++;
+        }
+      tcc_free(kill);
+      tcc_free(taint_tmp);
+      if (taint_var)
+        tcc_free(taint_var);
+      tcc_free(def_tmp);
+      tcc_free(def_var);
       tcc_free(dead_tmp);
       if (dead_var)
         tcc_free(dead_var);
@@ -1185,7 +1329,6 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
 
 #undef STACKLOC_HASH_SIZE
 #undef STACKLOC_HASH
-#undef STACKLOC_SET
 #undef STACKLOC_TEST
   skip_dead_stackloc:;
   }
@@ -1205,37 +1348,34 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
           continue;
         if (irop_config[q->op].has_src1)
         {
-          const IROperand s = tcc_ir_op_get_src1(ir, q);
-          if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(s)) == TCCIR_VREG_TYPE_TEMP)
+          if (TCCIR_DECODE_VREG_TYPE(tcc_ir_op_src1_vreg(ir, q)) == TCCIR_VREG_TYPE_TEMP)
           {
-            const int pos = TCCIR_DECODE_VREG_POSITION(irop_get_vreg(s));
+            const int pos = TCCIR_DECODE_VREG_POSITION(tcc_ir_op_src1_vreg(ir, q));
             if (pos <= max_tmp_pos)
               used2[pos / 8] |= (1 << (pos % 8));
           }
         }
         if (irop_config[q->op].has_src2)
         {
-          const IROperand s = tcc_ir_op_get_src2(ir, q);
-          if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(s)) == TCCIR_VREG_TYPE_TEMP)
+          if (TCCIR_DECODE_VREG_TYPE(tcc_ir_op_src2_vreg(ir, q)) == TCCIR_VREG_TYPE_TEMP)
           {
-            const int pos = TCCIR_DECODE_VREG_POSITION(irop_get_vreg(s));
+            const int pos = TCCIR_DECODE_VREG_POSITION(tcc_ir_op_src2_vreg(ir, q));
             if (pos <= max_tmp_pos)
               used2[pos / 8] |= (1 << (pos % 8));
           }
         }
         /* STORE/STORE_INDEXED dest is a use (pointer deref) */
         {
-          const IROperand d = tcc_ir_op_get_dest(ir, q);
-          if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) &&
-              TCCIR_DECODE_VREG_TYPE(irop_get_vreg(d)) == TCCIR_VREG_TYPE_TEMP)
+          if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED || tcc_ir_op_dest_is_lval(ir, q)) &&
+              TCCIR_DECODE_VREG_TYPE(tcc_ir_op_dest_vreg(ir, q)) == TCCIR_VREG_TYPE_TEMP)
           {
-            const int pos = TCCIR_DECODE_VREG_POSITION(irop_get_vreg(d));
+            const int pos = TCCIR_DECODE_VREG_POSITION(tcc_ir_op_dest_vreg(ir, q));
             if (pos <= max_tmp_pos)
               used2[pos / 8] |= (1 << (pos % 8));
           }
-          if (q->op == TCCIR_OP_FUNCPARAMVAL && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(d)) == TCCIR_VREG_TYPE_TEMP)
+          if (q->op == TCCIR_OP_FUNCPARAMVAL && TCCIR_DECODE_VREG_TYPE(tcc_ir_op_dest_vreg(ir, q)) == TCCIR_VREG_TYPE_TEMP)
           {
-            const int pos = TCCIR_DECODE_VREG_POSITION(irop_get_vreg(d));
+            const int pos = TCCIR_DECODE_VREG_POSITION(tcc_ir_op_dest_vreg(ir, q));
             if (pos <= max_tmp_pos)
               used2[pos / 8] |= (1 << (pos % 8));
           }
@@ -1258,18 +1398,20 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
         if (q->op == TCCIR_OP_NOP)
           continue;
         const IROperand dest = tcc_ir_op_get_dest(ir, q);
-        if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) == TCCIR_VREG_TYPE_TEMP)
+        if (irop_config[q->op].has_dest && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(dest)) == TCCIR_VREG_TYPE_TEMP &&
+            !dest.is_lval) /* an lvalue dest is a write through the TEMP, never its def */
         {
-          int is_dead_eligible =
-              (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED && q->op != TCCIR_OP_STORE_POSTINC &&
-               q->op != TCCIR_OP_LOAD_POSTINC && q->op != TCCIR_OP_LOAD && q->op != TCCIR_OP_FUNCCALLVAL &&
-               q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID);
+          int is_dead_eligible = dse_op_may_die(q->op) && q->op != TCCIR_OP_LOAD;
           if (!is_dead_eligible && q->op == TCCIR_OP_LOAD)
           {
-            const IROperand src1 = tcc_ir_op_get_src1(ir, q);
-            if (irop_is_immediate(src1))
+            if (tcc_ir_op_src1_is_imm(ir, q))
               is_dead_eligible = 1;
           }
+          /* Same rule as the first sweep (DSE_IS_DEAD_ELIGIBLE): an ALU op can
+           * embed a volatile deref operand -- `(void)(*p + 1)` is one ADD --
+           * and that read is mandated whether or not the sum is wanted. */
+          if (is_dead_eligible && tcc_ir_instr_access_is_volatile(ir, q))
+            is_dead_eligible = 0;
           if (is_dead_eligible)
           {
             const int pos = TCCIR_DECODE_VREG_POSITION(irop_get_vreg(dest));
@@ -1287,9 +1429,4 @@ static int tcc_ir_opt_dse__timed(TCCIRState *ir)
   }
 
   return changes;
-}
-
-int tcc_ir_opt_dse_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_dse(ctx->ir);
 }

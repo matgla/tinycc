@@ -59,7 +59,7 @@ static int s64_use_reads_low_only(TCCIRState *ir, IRQuadCompact *u, int32_t vreg
    * the 64-bit bitfield extract ends in, so without this case the rule below
    * would reject every real candidate. */
   if (u->op == TCCIR_OP_ASSIGN && m1 && !m2 &&
-      !irop_needs_pair(tcc_ir_op_get_dest(ir, u)))
+      !tcc_ir_op_dest_needs_pair(ir, u))
     return 1;
 
   if (m1 && irop_needs_pair(s1))
@@ -84,17 +84,46 @@ static int s64_use_reads_low_only(TCCIRState *ir, IRQuadCompact *u, int32_t vreg
  * Gated on single-use so the analysis stays valid across RA spills, which may
  * store/reload the dead high word as never-read garbage — same reasoning as the
  * skip_lo rule above.  Pure annotation: no IR mutation. */
+/* The first two non-NOP instructions naming each TEMP in src1 or src2, in
+ * program order (-1 when fewer): the single use of a value defined at i is
+ * the first of them that is not i.  Built once, where s64_mark_dead_hi used
+ * to scan the function from the top for every candidate. */
+static void s64_first_uses(TCCIRState *ir, int n, int nt, int *first)
+{
+  for (int p = 0; p < 2 * nt; p++)
+    first[p] = -1;
+  for (int j = 0; j < n; j++)
+  {
+    IRQuadCompact *u = &ir->compact_instructions[j];
+    if (u->op == TCCIR_OP_NOP)
+      continue;
+    int32_t v[2] = {tcc_ir_op_src1_vreg(ir, u), tcc_ir_op_src2_vreg(ir, u)};
+    for (int a = 0; a < 2; a++)
+    {
+      if (v[a] < 0 || TCCIR_DECODE_VREG_TYPE(v[a]) != TCCIR_VREG_TYPE_TEMP || (a == 1 && v[1] == v[0]))
+        continue;
+      int p = TCCIR_DECODE_VREG_POSITION(v[a]);
+      if (p >= nt)
+        continue;
+      if (first[2 * p] < 0)
+        first[2 * p] = j;
+      else if (first[2 * p + 1] < 0)
+        first[2 * p + 1] = j;
+    }
+  }
+}
+
 static int s64_mark_dead_hi(TCCIRState *ir, int n)
 {
   int changes = 0;
+  int *first = NULL, nt = ir->next_temporary_variable;
 
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_SHR && q->op != TCCIR_OP_SAR)
       continue;
-    IROperand s2 = tcc_ir_op_get_src2(ir, q);
-    if (!irop_is_immediate(s2) || irop_get_imm64_ex(ir, s2) < 32)
+    if (!tcc_ir_op_src2_is_imm(ir, q) || tcc_ir_op_src2_imm(ir, q) < 32)
       continue;
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     if (!irop_needs_pair(dest))
@@ -117,21 +146,25 @@ static int s64_mark_dead_hi(TCCIRState *ir, int n)
     if (!tcc_ir_vreg_has_single_use(ir, dv, i) || tcc_ir_vreg_coalesced(ir, dv))
       continue;
 
-    int low_only = 0;
-    for (int j = 0; j < n; j++)
+    int dp = TCCIR_DECODE_VREG_POSITION(dv), j = -1;
+    if (dp < nt)
     {
-      if (j == i)
-        continue;
-      IRQuadCompact *u = &ir->compact_instructions[j];
-      if (u->op == TCCIR_OP_NOP)
-        continue;
-      if (irop_get_vreg(tcc_ir_op_get_src1(ir, u)) != dv &&
-          irop_get_vreg(tcc_ir_op_get_src2(ir, u)) != dv)
-        continue;
-      low_only = s64_use_reads_low_only(ir, u, dv);
-      break;
+      if (!first)
+      {
+        first = tcc_malloc(2 * (nt + 1) * sizeof(int));
+        s64_first_uses(ir, n, nt, first);
+      }
+      j = first[2 * dp] != i ? first[2 * dp] : first[2 * dp + 1];
     }
-    if (!low_only)
+    else
+      for (j = 0; j < n; j++)
+        if (j != i && ir->compact_instructions[j].op != TCCIR_OP_NOP &&
+            (tcc_ir_op_src1_vreg(ir, &ir->compact_instructions[j]) == dv ||
+             tcc_ir_op_src2_vreg(ir, &ir->compact_instructions[j]) == dv))
+          break;
+    if (j >= n)
+      j = -1;
+    if (j < 0 || !s64_use_reads_low_only(ir, &ir->compact_instructions[j], dv))
       continue;
 
     if (!ir->shift64_dead_half)
@@ -143,6 +176,7 @@ static int s64_mark_dead_hi(TCCIRState *ir, int n)
     changes++;
   }
 
+  tcc_free(first);
   return changes;
 }
 
@@ -167,7 +201,7 @@ int tcc_ir_opt_shift64_dead_half(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
     {
       int p = TCCIR_DECODE_VREG_POSITION(vr);
@@ -187,7 +221,7 @@ int tcc_ir_opt_shift64_dead_half(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
     {
       int p = TCCIR_DECODE_VREG_POSITION(vr);
@@ -197,6 +231,9 @@ int tcc_ir_opt_shift64_dead_half(TCCIRState *ir)
   }
 
   int changes = 0;
+  /* Single-use queries per candidate shift.  The pass annotates
+   * shift64_dead_half and never changes the IR, so the counts stay valid. */
+  int vidx = tcc_ir_vreg_index_open(ir);
 
   /* Recompute from scratch.  The table is keyed by orig_index and the rules
    * below only ever OR bits in, so a bit set on an earlier IR state would
@@ -212,13 +249,11 @@ int tcc_ir_opt_shift64_dead_half(TCCIRState *ir)
     /* Consumer: a 64-bit SHR/SAR by >= 32, reading a 64-bit TEMP src1. */
     if (q->op != TCCIR_OP_SHR && q->op != TCCIR_OP_SAR)
       continue;
-    IROperand s2 = tcc_ir_op_get_src2(ir, q);
-    if (!irop_is_immediate(s2) || irop_get_imm64_ex(ir, s2) < 32)
+    if (!tcc_ir_op_src2_is_imm(ir, q) || tcc_ir_op_src2_imm(ir, q) < 32)
       continue;
-    IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    if (irop_get_btype(s1) != IROP_BTYPE_INT64)
+    if (tcc_ir_op_src1_btype(ir, q) != IROP_BTYPE_INT64)
       continue;
-    int32_t s1_vr = irop_get_vreg(s1);
+    int32_t s1_vr = tcc_ir_op_src1_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(s1_vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
     int s1_pos = TCCIR_DECODE_VREG_POSITION(s1_vr);
@@ -230,7 +265,7 @@ int tcc_ir_opt_shift64_dead_half(TCCIRState *ir)
     IRQuadCompact *def = &ir->compact_instructions[dpos];
     if (def->op != TCCIR_OP_SHL)
       continue;
-    if (irop_get_btype(tcc_ir_op_get_dest(ir, def)) != IROP_BTYPE_INT64)
+    if (tcc_ir_op_dest_btype(ir, def) != IROP_BTYPE_INT64)
       continue;
     if (!tcc_ir_vreg_has_single_use(ir, s1_vr, dpos) || tcc_ir_vreg_coalesced(ir, s1_vr))
       continue;
@@ -246,6 +281,7 @@ int tcc_ir_opt_shift64_dead_half(TCCIRState *ir)
   changes += s64_mark_dead_hi(ir, n);
 
   tcc_free(def_idx);
+  tcc_ir_vreg_index_close(ir, vidx);
   return changes;
 }
 

@@ -333,3 +333,25 @@ def test_diagnostics(
             f"Command: {' '.join(cmd)}\n"
             f"Missing substrings:\n" + "\n".join(f"  - {m!r}" for m in missing)
         )
+
+
+@pytest.mark.frontend_pp
+@pytest.mark.parametrize("flag", ["-dM", "-dD"])
+def test_dump_defines_lists_lazy_predefines(flag, frontend_compiler, tmp_path):
+    """-dM / -dD print the table predefines (materialised lazily, never through
+    the #define path the dump hooks) as well as the textual ones."""
+    src = tmp_path / "empty.c"
+    src.write_text("")
+    result = subprocess.run(
+        [str(frontend_compiler), flag, "-E", str(src)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    defined = {
+        line.split()[1].split("(")[0] for line in result.stdout.splitlines() if line.startswith("#define ")
+    }
+    for name in ("__SIZE_TYPE__", "__INT_MAX__", "__CHAR_BIT__", "__BYTE_ORDER__", "__ORDER_LITTLE_ENDIAN__",
+                 "__UINT64_MAX__", "__USER_LABEL_PREFIX__", "__TINYC__"):
+        assert name in defined, f"{name} missing from {flag} output"

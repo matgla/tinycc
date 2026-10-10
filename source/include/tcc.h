@@ -111,7 +111,11 @@ static inline unsigned tcc_getclock_us(void)
 }
 
 #ifndef offsetof
-#define offsetof(type, field) ((size_t)&((type *)0)->field)
+/* The builtin, not &((type *)0)->field: that member access through a null
+ * pointer is undefined, and UBSan reports it on every warning switch and
+ * short-Sym allocation, burying real hits.  tccdefs.h gives tcc itself a
+ * __builtin_offsetof. */
+#define offsetof(type, field) __builtin_offsetof(type, field)
 #endif
 
 #ifndef countof
@@ -401,6 +405,17 @@ static inline unsigned tcc_getclock_us(void)
 #define PUB_FUNC
 #endif
 
+/* A pointer in a constant table of strings: an offset into .rodata when tcc
+   builds tcc for the target, so the table stays in shared flash instead of a
+   relocated per-process copy (docs/rodata_relative.md).  Plain elsewhere. */
+#ifndef TCC_RODATA_REL
+#ifdef __TINYC_RODATA_RELATIVE__
+#define TCC_RODATA_REL __rodata_relative
+#else
+#define TCC_RODATA_REL
+#endif
+#endif
+
 /* Always compile from separate objects */
 #define ST_INLN
 #define ST_FUNC
@@ -435,11 +450,27 @@ typedef struct Sym Sym;
 
 /* -------------------------------------------- */
 
+/* CONFIG_TCC_LOW_MEM: size the compiler's fixed tables and first arenas for
+ * a part whose processes live in a few hundred KB of SRAM (the Pico 2, no
+ * PSRAM).  Growable structures start small and grow in equal steps; fixed
+ * ones are just smaller.  An O0-only compiler is built for exactly such a part,
+ * so it implies this. */
+#if defined CONFIG_TCC_O0_ONLY && !defined CONFIG_TCC_LOW_MEM
+#define CONFIG_TCC_LOW_MEM 1
+#endif
+
 #define INCLUDE_STACK_SIZE 32
 #define IFDEF_STACK_SIZE 64
+#ifdef CONFIG_TCC_LOW_MEM
+/* Not growable: code all over the frontend holds SValue pointers into the
+ * stack across a push, so it cannot move.  128 still takes a 100-argument
+ * call; deeper expressions stop with the same clean error. */
+#define VSTACK_SIZE 128
+#else
 #define VSTACK_SIZE 256 /* YASOS: 512 was an upstream bump for the yarpgen fuzzer's
                            pathological expressions; 256 fits real code and saves
                            ~10 KiB .bss (513->257 * 40 B SValue). Clean tcc_error on overflow. */
+#endif
 #define STRING_MAX_SIZE 1024
 #define TOKSTR_MAX_SIZE 256
 /* Nested auto-inline expansion: how deep, and how many body tokens one
@@ -457,10 +488,21 @@ typedef struct Sym Sym;
 #define NESTED_INLINE_BUDGET 4096
 #define TINY_INLINE_TOKENS 96
 #define PACK_STACK_SIZE 8
+#define VISIBILITY_STACK_SIZE 8
 
+#ifdef CONFIG_TCC_LOW_MEM
+#define TOK_HASH_SIZE 1024 /* must be a power of two */
+#else
 #define TOK_HASH_SIZE 2048 /* must be a power of two. YASOS: 4096 -> 2048 saves 8 KiB
                               .bss; device compiles intern few-hundred symbols so the
                               table stays sparse (lazy-lib interning keeps it sparser). */
+#endif
+/* Identifier hash: shared by tccpp.c and the build-time keyword index
+   (gen_kw_index.c), which must agree on it. */
+#define TOK_HASH_INIT 1
+#define TOK_HASH_FUNC(h, c) ((h) + ((h) << 5) + ((h) >> 27) + (c))
+#define KW_HASH_SIZE 1024 /* keyword index buckets; power of two, > NB_BUILTIN_TOKS */
+#define PREDEF_HASH_SIZE 256 /* predefine name index buckets; power of two, > predefines */
 #define TOK_ALLOC_INCR 256 /* must be a power of two */
 #define TOK_MAX_SIZE 4     /* token max size in int unit when stored in string */
 
@@ -469,9 +511,9 @@ typedef struct TokenSym
 {
   struct TokenSym *hash_next;
   struct Sym *sym_define;     /* direct pointer to define */
-  struct Sym *sym_label;      /* direct pointer to label */
-  struct Sym *sym_struct;     /* direct pointer to structure */
   struct Sym *sym_identifier; /* direct pointer to identifier */
+  /* Struct tags and labels are bound through two small maps instead
+     (sym_tag_head / sym_label_head): few names are ever either. */
   int tok;                    /* token number */
   int len;
   char str[1];
@@ -502,8 +544,12 @@ typedef struct TokenSym
 
 typedef struct TCCPredefMacro
 {
-  const char *name; /* incl. the parameter list for function-like macros */
-  const char *body; /* original spelling; kept for diagnostics and the A/B */
+  /* Offset into tcc_predef_strs[] (generated, like everything here, by
+     gen_predef_table.c; offsets instead of pointers keep the tables out of
+     RAM on YasOS): the name incl. the parameter list for function-like
+     macros, and the length of the bare name before it. */
+  unsigned short name;
+  unsigned char name_len;
   unsigned char flags;
   /* Span into tcc_predef_toks[]: the body pre-tokenised, so materialising a
      macro never has to re-enter the lexer. */
@@ -593,6 +639,10 @@ struct SymAttr
                                      of the TU (finalize_tentative_definitions). */
       used : 1,                   /* __attribute__((used)): emitted even when
                                      nothing in the TU refers to it. */
+      vis_explicit : 1,           /* visibility came from an attribute or a
+                                     #pragma GCC visibility, so -fvisibility=
+                                     does not apply (visibility("default")
+                                     is STV_DEFAULT == 0, like no attribute). */
       tu_unused : 1;              /* a static nothing live in the TU refers to
                                      (prune_unused_statics): never emitted. */
 };
@@ -605,7 +655,15 @@ struct FuncAttr
       func_noreturn : 1,                /* attribute((noreturn)) */
       func_ctor : 1,                    /* attribute((constructor)) */
       func_dtor : 1,                    /* attribute((destructor)) */
+#ifdef TCC_TARGET_PE
       func_args : 8,                    /* PE __stdcall args */
+#else
+      func_args : 1,                    /* PE __stdcall args: only PE reads it (the @N
+                                           decoration), elsewhere it is just written and
+                                           merged.  One bit keeps FuncAttr within 32 bits,
+                                           so Sym's c/f union is 8 bytes, not 16: -8 bytes
+                                           on every Sym (56 -> 48 on ARM). */
+#endif
       func_alwinl : 1,                  /* always_inline */
       func_noinline : 1,                /* noinline — suppress auto-inline */
       func_pure : 1,                    /* attribute((pure)) - no side effects, reads memory */
@@ -638,17 +696,28 @@ struct FuncAttr
                                             re-emit before we know if any callee turned out to be noreturn */
       func_called_once : 1,             /* static, one call site in the TU, address never taken: that site inlines it
                                             whatever its size (-finline-functions-called-once) */
-      func_small_leaf : 1;              /* static leaf whose optimized body is a few straight-line ops: inlined
+      func_inl_wrapper : 1,             /* static acyclic forwarder of a few ops around one call: inlined at most
+                                            INLINE_WRAPPER_PER_CALLER times into one function (gen_function) */
+      func_small_leaf : 1,              /* static leaf whose optimized body is a few straight-line ops: inlined
                                             whatever its token length (see gen_function's post-opt promotion) */
+      func_ret_zext : 2;                /* r0 at every return is zero-extended from 1/8/16 bits (1/2/3), as
+                                           ra:known_ext proved it of the emitted body; a direct call to the
+                                           function then needs no extension of its result, and a recompile
+                                           keeps the promise (gfunc_return masks the value).  See known_ext.c */
 };
 
 /* symbol management */
+/* The fields a macro uses come first: macros, their parameters and the
+   expander's nesting list are allocated only that far (SYM_SHORT_SIZE,
+   sym_push2_short) -- 28 of 44 bytes on ARM.  r fills the hole after v where
+   pointers are 8 bytes, and follows prev where they are 4. */
 struct Sym
 {
-  int v;            /* symbol token */
+  int v; /* symbol token */
+#if defined __SIZEOF_POINTER__ && __SIZEOF_POINTER__ == 8
   unsigned short r; /* associated register or VT_CONST/VT_LOCAL and LVAL type */
-  struct SymAttr a; /* symbol attributes */
-  int vreg;
+#endif
+  CType type; /* associated type */
   union
   {
     struct
@@ -663,12 +732,13 @@ struct Sym
         int auxtype;       /* bitfield access type */
       };
     };
-    long long enum_val; /* enum constant if IS_ENUM_VAL */
-    int *d;             /* define token stream */
+    /* enum constant if IS_ENUM_VAL, a long long read and written through
+       sym_enum_val / sym_set_enum_val: as two ints it does not make Sym
+       8-byte aligned on ARM, which would pad it from 44 to 48 bytes. */
+    int enum_val_w[2];
+    int *d; /* define token stream */
     struct Sym *cleanup_func;
   };
-
-  CType type; /* associated type */
   union
   {
     struct Sym *next;         /* next related symbol (for fields and anoms) */
@@ -677,17 +747,37 @@ struct Sym
     struct Sym *cleanupstate; /* in defined labels */
     int *vla_array_str;       /* vla array code */
   };
-  struct Sym *prev;             /* prev symbol in stack */
-  struct Sym *prev_tok;         /* previous symbol for this token */
-  struct SymLocalFacts *facts;  /* NULL unless a local variable recorded some (SYM_FACTS / sym_facts) */
+  struct Sym *prev; /* prev symbol in stack */
+  /* ---- a short Sym ends here ---- */
+#if !(defined __SIZEOF_POINTER__ && __SIZEOF_POINTER__ == 8)
+  unsigned short r;
+#endif
+  struct SymAttr a; /* symbol attributes */
+  int vreg;
+  struct Sym *prev_tok; /* previous symbol for this token */
 };
+#define SYM_SHORT_SIZE (offsetof(struct Sym, prev) + sizeof(struct Sym *))
+
+static inline long long sym_enum_val(const struct Sym *s)
+{
+  long long v;
+  memcpy(&v, s->enum_val_w, sizeof v);
+  return v;
+}
+
+static inline void sym_set_enum_val(struct Sym *s, long long v)
+{
+  memcpy(s->enum_val_w, &v, sizeof v);
+}
 
 /* Facts a few local variables carry, kept out of Sym so the tens of thousands
  * of prototypes, fields and type nodes a TU creates do not pay for them (Sym
- * was 88 bytes on ARM, 48 without them; the symbol table is the largest part
- * of a compile's memory that lives for the whole TU).  Read through
- * SYM_FACTS(s), which yields an all-zero record when s has none; write through
- * sym_facts(s), which allocates it.  Freed with the Sym (sym_free). */
+ * was 88 bytes on ARM, 44 without them; the symbol table is the largest part
+ * of a compile's memory that lives for the whole TU).  Not even a pointer
+ * stays in Sym: a side map keyed by the Sym holds them.  Read through
+ * SYM_FACTS(s), which yields an all-zero record when s has none, or
+ * sym_facts_peek(s), NULL then; write through sym_facts(s), which allocates
+ * it.  Freed with the Sym (sym_free). */
 typedef struct SymLocalFacts
 {
   unsigned long long objsize_max_value;    /* conservative max scalar value assigned locally */
@@ -699,16 +789,19 @@ typedef struct SymLocalFacts
    * mask loads into constant indices. */
   unsigned char *const_init_data;
   int const_init_size;
+  uint32_t param_nocapture; /* compiled static function: borrowed parameter bits */
   unsigned char objsize_max_valid;
   unsigned char objsize_strlen_valid;
   unsigned char const_init_valid;
   unsigned char const_init_in_progress;
 } SymLocalFacts;
 
-extern const SymLocalFacts sym_no_facts;
-#define SYM_FACTS(s) ((const SymLocalFacts *)((s)->facts ? (s)->facts : &sym_no_facts))
+SymLocalFacts *sym_facts_peek(const struct Sym *s);
+const SymLocalFacts *sym_facts_get(const struct Sym *s);
+#define SYM_FACTS(s) sym_facts_get(s)
 SymLocalFacts *sym_facts(struct Sym *s);
 void sym_free_facts(struct Sym *s);
+void sym_facts_free_all(void);
 
 #include "source/ir/machine_op.h"
 #include "source/ir/tccir.h"
@@ -835,6 +928,20 @@ typedef struct YaffLib
   unsigned int nsyms;   /* exported_symbols_amount (== lookup/chain length) */
 } YaffLib;
 
+/* One library's part of the -fmodule-local-calls import set.  Only names
+   are needed (membership), so the export entries are boiled down to their
+   names, back to back without the 4-byte entry headers and the alignment
+   padding, and the on-disk name hash is kept as u16 when its indices fit. */
+typedef struct YaffImportLib
+{
+  char *names;             /* NUL-terminated names, owned */
+  unsigned short *lookup;  /* symbol index -> offset of its name in names, owned */
+  void *hash;              /* bucket[nbucket] then chain[nchain], u16 or (wide) u32, owned */
+  unsigned int nsyms, nbucket, nchain, names_len;
+  unsigned char wide;
+  unsigned char bias;      /* name i is at names + lookup[i] + bias */
+} YaffImportLib;
+
 /* -------------------------------------------------- */
 
 #define SYM_STRUCT 0x40000000     /* struct/union/enum symbol space */
@@ -873,8 +980,14 @@ typedef struct YaffLib
 #define TYPE_DIRECT 2   /* type with variable */
 #define TYPE_PARAM 4    /* type declares function parameter */
 #define TYPE_NEST 8     /* nested call to post_type */
+#define TYPE_NESTDECL 16 /* nested declarator: the caller applies its suffix to
+                           the target of the first pointer read here */
 
+#ifdef CONFIG_TCC_LOW_MEM
+#define IO_BUF_SIZE 2048 /* one per open file; headers nest */
+#else
 #define IO_BUF_SIZE 8192
+#endif
 
 typedef struct BufferedFile
 {
@@ -909,8 +1022,8 @@ typedef struct TokenString
 {
   char alloc;
   signed char need_spc;         /* space insertion state: -1, 0, 1, 2, 3 */
-  unsigned short last_line_num; /* last recorded line number (0 = none) */
-  unsigned short save_line_num; /* saved line number for macro */
+  int last_line_num; /* last recorded line number (0 = none) */
+  int save_line_num; /* saved line number for macro */
   int allocated_len;            /* 0 = inline, >0 = heap capacity (in ints) */
   int len;                      /* current length in ints */
   /* used to chain token-strings with begin/end_macro() */
@@ -946,6 +1059,7 @@ typedef struct InlineFunc
   Sym *sym;
   int *pack;        /* #pragma pack state at the body (pp_pack_snapshot), NULL = default */
   int inline_count; /* number of auto-inline expansions performed so far (call-heavy budget) */
+  int caller_gen, caller_count; /* expansions into the function being compiled (tcc_state->inline_caller_gen) */
   char filename[1];
 } InlineFunc;
 
@@ -1017,6 +1131,22 @@ typedef struct NestedFunc
   int nb_parent_struct_tags;                      /* count of saved struct tags */
 } NestedFunc;
 
+/* captured_vregs[j] of `nf` names a vreg of the function captured_chain_depth[j]
+ * levels up (NULL = the outermost parent).  The nested_funcs table lists the
+ * whole family, so a lookup of that vreg in some IR is meaningful only while
+ * that function is the one being compiled (`cur`, i.e. current_nested_func). */
+static inline int nested_capture_owned_by(const NestedFunc *nf, int j, const NestedFunc *cur)
+{
+  const NestedFunc *owner = nf;
+  for (int d = nf->captured_chain_depth[j]; d > 0; d--)
+  {
+    if (!owner)
+      return 0;
+    owner = owner->parent_nf;
+  }
+  return owner == cur;
+}
+
 /* include file cache, used to find files faster and also to eliminate
    inclusion if the include file is protected by #ifndef ... #endif */
 typedef struct CachedInclude
@@ -1040,6 +1170,7 @@ enum
   TCC_PCH_REPLAY_PACK_SET,
   TCC_PCH_REPLAY_PACK_PUSH,
   TCC_PCH_REPLAY_PACK_POP,
+  TCC_PCH_REPLAY_PACK_PUSH_DUP, /* bare push: duplicate the top at replay time */
 };
 
 #ifdef CONFIG_TCC_ASM
@@ -1074,6 +1205,8 @@ typedef struct ASMOperand
   int is_memory;    /* true if memory operand */
   int is_rw;        /* for '+' modifier */
   int is_label;     /* for asm goto */
+  int addr_read;    /* IR: a memory output addressed through a register; its
+                       ASM_INPUT marker keeps that address live (tccasm.c) */
 } ASMOperand;
 #endif
 
@@ -1099,8 +1232,8 @@ typedef struct ArchiveSymbolCache
   int nsyms;                          /* number of symbols in index */
   int entrysize;                      /* 4 or 8 (32/64-bit offsets) */
   const char **sym_names;             /* pointers into data */
-  unsigned int *name_hashes;          /* pre-computed elf_hash per symbol */
-  unsigned long long *member_offsets; /* file offsets per symbol */
+  unsigned int *name_hashes;          /* pre-computed archive_name_hash per symbol */
+  const uint8_t *ar_index;            /* member offset table (big-endian, entrysize each) */
   int *ar_ht_buckets;                 /* chained hash table buckets */
   int *ar_ht_next;                    /* chained hash table chain links */
   int ar_ht_mask;                     /* hash table mask (size - 1) */
@@ -1116,6 +1249,8 @@ struct TCCState
   unsigned char nostdlib;          /* if true, no standard libraries are added */
   unsigned char nodefaultlibs;     /* if true, no default libraries at all (incl. compiler-rt) */
   unsigned char nocommon;          /* if true, do not use common symbols for .bss data */
+  unsigned char default_visibility; /* -fvisibility=: STV_* for definitions with no
+                                      visibility attribute or #pragma */
   unsigned char static_link;       /* if true, static linking is performed */
   unsigned char rdynamic;          /* if true, all symbols are exported */
   unsigned char symbolic;          /* if true, resolve symbols in the current module first */
@@ -1143,6 +1278,14 @@ struct TCCState
                                            behave like unnamed */
   unsigned char dollars_in_identifiers; /* allows '$' char in identifiers */
   unsigned char ms_bitfields;           /* if true, emulate MS algorithm for aligning bitfields */
+  unsigned char inline_atomics;         /* -minline-atomics: read-modify-write atomics as LDREX/STREX
+                                           loops instead of runtime calls (parse_atomic) */
+  /* parse_atomic: while set, unary & records the locals whose address it
+   * takes here instead of marking them address-taken (see there). */
+  unsigned char defer_addrtaken;
+  unsigned char nb_deferred_addrtaken;
+  struct Sym *deferred_addrtaken[4];
+  SValue deferred_addr_lval; /* the lvalue the first deferred & took the address of */
   unsigned char reverse_funcargs;       /* if true, evaluate last function arg first */
   unsigned char gnu89_inline;           /* treat 'extern inline' like 'static inline' */
   unsigned char unwind_tables;          /* create eh_frame section */
@@ -1157,6 +1300,7 @@ struct TCCState
 #define NO_BUILTIN_UMAXABS (1u << 6)
 #define NO_BUILTIN_MEMFUNCS (1u << 7) /* keep memcpy/memset/__aeabi_mem* as real calls
                                        * (plain -fno-builtin, or -fno-builtin-mem{cpy,set}) */
+#define NO_BUILTIN_ALL (1u << 8)      /* plain -fno-builtin: no folding/rewriting of libc calls by name */
   unsigned int no_builtin_funcs;
 
   /* warning switches */
@@ -1228,31 +1372,48 @@ struct TCCState
 
   /* Function purity cache for LICM optimization */
   /* Cache stores inferred purity for functions in the current translation unit */
-#define FUNC_PURITY_CACHE_SIZE 256
+#ifdef CONFIG_TCC_O0_ONLY
+#define FUNC_PURITY_CACHE_SIZE 1 /* filled only by the optimizer */
+#else
+#define FUNC_PURITY_CACHE_SIZE (1 << 16)
+#endif
+  /* Heap arrays grown on demand up to the *_CACHE_SIZE caps (here and the
+   * const-result cache below): embedded in TCCState they were 8 KiB that
+   * every compile carried, while a TU fills a few entries of each. */
   struct
   {
-    int token;  /* Function name token (v field of Sym) */
+    int token;  /* Function name token (v field of Sym); 0 = empty slot */
     int purity; /* TCC_FUNC_PURITY_* value */
-  } func_purity_cache[FUNC_PURITY_CACHE_SIZE];
+  } *func_purity_cache; /* hash table of func_purity_cache_cap slots, see func_purity.c */
   int func_purity_cache_count;
+  int func_purity_cache_cap;
 
   /* Constant function result cache for interprocedural constant propagation.
    * After optimization, functions that reduce to "return #const" are cached
    * so callers can replace FUNCCALLVAL with ASSIGN #const. */
+#ifdef CONFIG_TCC_O0_ONLY
+#define FUNC_CONST_RESULT_CACHE_SIZE 1 /* filled only by the optimizer */
+#else
 #define FUNC_CONST_RESULT_CACHE_SIZE 256
+#endif
   struct
   {
     int token;      /* Function name token (v field of Sym) */
     int64_t value;  /* Constant return value */
     int btype;      /* IROP_BTYPE_* of return value */
-  } func_const_result_cache[FUNC_CONST_RESULT_CACHE_SIZE];
+  } *func_const_result_cache;
   int func_const_result_cache_count;
+  int func_const_result_cache_cap;
 
   /* Switch-value function snapshot cache: holds replayable bodies of
    * side-effect-free single-parameter functions whose return value depends on
    * the argument (e.g. `static int f(int x) { switch (x) { case K: return C; } }`).
    * Callers with a constant argument simulate the snapshot to fold the call. */
+#ifdef CONFIG_TCC_O0_ONLY
+#define FUNC_SWITCH_CACHE_SIZE 1 /* filled only by the optimizer */
+#else
 #define FUNC_SWITCH_CACHE_SIZE 64
+#endif
   struct TCCFuncSwitchSnapshot *func_switch_cache[FUNC_SWITCH_CACHE_SIZE];
   int func_switch_cache_count;
 
@@ -1343,8 +1504,9 @@ struct TCCState
      pulled before the shared libraries resolve, so its members win). */
   unsigned char module_local_calls;
   unsigned char import_set_state; /* 0 = not built, 1 = built, 2 = unavailable */
-  YaffLib *import_libs;
+  YaffImportLib *import_libs; /* distinct export tables */
   int nb_import_libs;
+  int nb_import_libs_read;    /* libraries read, duplicates included */
   char *import_libtcc1;           /* path of the libtcc1.a whose index was read, or NULL */
   char *import_fp_archive;       /* fp/lib<runtime>.a when the FP runtime links statically, or NULL */
 
@@ -1397,6 +1559,9 @@ struct TCCState
   /* #pragma pack stack */
   int pack_stack[PACK_STACK_SIZE];
   int *pack_stack_ptr;
+  /* #pragma GCC visibility push/pop: STV_* values, depth 0 when none */
+  unsigned char visibility_stack[VISIBILITY_STACK_SIZE];
+  int visibility_stack_depth;
   char **pragma_libs;
   int nb_pragma_libs;
 
@@ -1405,9 +1570,11 @@ struct TCCState
   struct InlineFunc **inline_fns;
   int nb_inline_fns;
   /* inline_fns by symbol token, so a call site finds its callee's body without
-   * scanning every entry (inline_fn_lookup). */
-  struct InlineFunc **inline_fn_by_tok;
+   * scanning every entry (inline_fn_lookup): an open-addressing table keyed by
+   * token, inline_fn_by_tok_size slots (a power of two), _count in use. */
+  struct InlineFnSlot *inline_fn_by_tok;
   int inline_fn_by_tok_size;
+  int inline_fn_by_tok_count;
   int inline_fn_indexed; /* inline_fns entries already in inline_fn_by_tok */
   /* Function bodies saved at their definition for end-of-TU generation
    * (-finline-functions-called-once, gen_deferred_function_bodies). */
@@ -1438,6 +1605,9 @@ struct TCCState
   /* Body length (saved-token ints) the function being generated may still
    * absorb by expanding called-once functions (called_once_budget_begin). */
   int called_once_budget;
+  /* The function body being compiled: its token length (the giant-caller rule)
+   * and a generation counter that resets per-caller expansion counts. */
+  int inline_caller_len, inline_caller_gen;
 
   /* Current function symbol being compiled.  Set by gen_function so IR opt
    * passes can mark the function for end-of-TU re-optimization. */
@@ -1630,7 +1800,10 @@ struct TCCState
   int thumb_func;
   TCCIRState *ir;
   /* Nested functions - saved token streams for functions defined inside other functions */
-  NestedFunc *nested_funcs;
+  /* Entries are allocated one by one and the slots reused across parents, so
+   * a NestedFunc * (parent_nf, current_nested_func, a caller's local) stays
+   * valid while a nested function registered mid-compilation grows the array. */
+  NestedFunc **nested_funcs;
   int nb_nested_funcs;
   int nested_funcs_capacity;
   int had_nested_funcs;
@@ -1672,6 +1845,7 @@ struct TCCState
                                      * retargeted inline_return_loc; any later
                                      * return in the same body must COPY into
                                      * that slot instead of retargeting again */
+  uint8_t inline_return_copied; /* a struct return already copied into the slot: no later return may retarget it */
   int inline_const_arg_count;  /* constant-like current inline params */
 
   /* Named Return Value Optimization (NRVO) target.
@@ -1726,6 +1900,17 @@ struct TCCState
   struct LabelDiffFixup *label_diff_fixups;
 };
 
+/* Reads of the optimization level and the -f<opt> flags.  A compiler built
+ * with CONFIG_TCC_O0_ONLY (the native tcc for a part with no PSRAM, where only
+ * -O0 fits in memory anyway) sees them all as constant 0: every pass gated on
+ * them folds out of its build and --gc-sections drops the optimizer.  -O0
+ * output is unchanged, since every one of them is 0 at -O0 already. */
+#ifdef CONFIG_TCC_O0_ONLY
+#define TCC_OPT(s, field) 0
+#else
+#define TCC_OPT(s, field) ((s)->field)
+#endif
+
 
 /* Whether built-in bound checking is on; constant 0 in a compiler built
  * without it (CONFIG_TCC_BCHECK=0, as the YasOS cross is), where the
@@ -1776,6 +1961,7 @@ typedef struct LabelDiffFixup
 {
   Section *sec;          /* data section containing the value */
   unsigned long offset;  /* byte offset within sec->data */
+  int size;              /* bytes stored there: 1, 2 or 4 */
   struct Sym *sym_plus;  /* positive label symbol (&&lab1) */
   struct Sym *sym_minus; /* negative label symbol (&&lab0) */
   struct LabelDiffFixup *next;
@@ -1861,7 +2047,8 @@ static inline SValue tcc_ir_svalue_call_id_argc(int call_id, int argc)
 #define VT_INLINE 0x00008000  /* inline definition */
 #define VT_COMPLEX 0x00010000 /* Complex type flag (bit 16) */
 #define VT_VECTOR 0x00020000  /* GCC vector type flag (bit 17): element type in sym->type, total bytes in sym->c */
-/* currently unused: 0x000[48]0000  */
+#define VT_RODATA_REL 0x00040000 /* __rodata_relative pointer: stored as an offset into .rodata (rodata_rel.c) */
+/* currently unused: 0x00080000  */
 
 #define VT_STRUCT_SHIFT 20 /* shift for bitfield shift values (32 - 2*6) */
 #define VT_STRUCT_MASK (((1U << (6 + 6)) - 1) << VT_STRUCT_SHIFT | VT_BITFIELD)
@@ -2005,96 +2192,11 @@ enum tcc_token
 /* keywords: tok >= TOK_IDENT && tok < TOK_UIDENT */
 #define TOK_UIDENT TOK_DEFINE
 
-static inline int resolve_str_builtin_by_tok(int tok)
-{
-  switch (tok)
-  {
-  case TOK_builtin_strlen:
-    return STRBI_STRLEN;
-  case TOK_builtin_strnlen:
-    return STRBI_STRNLEN;
-  case TOK_builtin_strcmp:
-    return STRBI_STRCMP;
-  case TOK_builtin_strncmp:
-    return STRBI_STRNCMP;
-  case TOK_builtin_strcpy:
-    return STRBI_STRCPY;
-  case TOK_builtin_strncpy:
-    return STRBI_STRNCPY;
-  case TOK_builtin_stpcpy:
-    return STRBI_STPCPY;
-  case TOK_builtin_stpncpy:
-    return STRBI_STPNCPY;
-  case TOK_builtin_strcat:
-    return STRBI_STRCAT;
-  case TOK_builtin_strncat:
-    return STRBI_STRNCAT;
-  case TOK_builtin_strchr:
-    return STRBI_STRCHR;
-  case TOK_builtin_strrchr:
-    return STRBI_STRRCHR;
-  case TOK_builtin_strstr:
-    return STRBI_STRSTR;
-  case TOK_builtin_strpbrk:
-    return STRBI_STRPBRK;
-  case TOK_builtin_strcspn:
-    return STRBI_STRCSPN;
-  case TOK_builtin_memcmp:
-    return STRBI_MEMCMP;
-  case TOK_builtin_memcmp_eq:
-    return STRBI_MEMCMP_EQ;
-  case TOK_builtin_memchr:
-    return STRBI_MEMCHR;
-  case TOK_builtin_memmove:
-    return STRBI_MEMMOVE;
-  case TOK_builtin_mempcpy:
-    return STRBI_MEMPCPY;
-  default:
-    return STRBI_UNKNOWN;
-  }
-}
-
-static inline int resolve_str_builtin_id(int tok, const char *name)
-{
-  static const struct
-  {
-    const char *name;
-    int id;
-  } map[] = {{"strlen", STRBI_STRLEN},           {"__tcc_strlen", STRBI_STRLEN},
-             {"strnlen", STRBI_STRNLEN},         {"strcmp", STRBI_STRCMP},
-             {"__tcc_strcmp", STRBI_STRCMP},     {"strncmp", STRBI_STRNCMP},
-             {"__tcc_strncmp", STRBI_STRNCMP},   {"strcpy", STRBI_STRCPY},
-             {"__tcc_strcpy", STRBI_STRCPY},     {"strncpy", STRBI_STRNCPY},
-             {"__tcc_strncpy", STRBI_STRNCPY},   {"stpcpy", STRBI_STPCPY},
-             {"__tcc_stpcpy", STRBI_STPCPY},     {"stpncpy", STRBI_STPNCPY},
-             {"__tcc_stpncpy", STRBI_STPNCPY},   {"strcat", STRBI_STRCAT},
-             {"__tcc_strcat", STRBI_STRCAT},     {"strncat", STRBI_STRNCAT},
-             {"__tcc_strncat", STRBI_STRNCAT},   {"strchr", STRBI_STRCHR},
-             {"__tcc_strchr", STRBI_STRCHR},     {"strrchr", STRBI_STRRCHR},
-             {"__tcc_strrchr", STRBI_STRRCHR},   {"strstr", STRBI_STRSTR},
-             {"__tcc_strstr", STRBI_STRSTR},     {"strpbrk", STRBI_STRPBRK},
-             {"__tcc_strpbrk", STRBI_STRPBRK},   {"strcspn", STRBI_STRCSPN},
-             {"__tcc_strcspn", STRBI_STRCSPN},   {"strspn", STRBI_STRSPN},
-             {"memcmp", STRBI_MEMCMP},
-             {"__builtin_memcmp_eq", STRBI_MEMCMP_EQ},
-             {"memchr", STRBI_MEMCHR},           {"memmove", STRBI_MEMMOVE},
-             {"__tcc_memmove", STRBI_MEMMOVE},   {"bcopy", STRBI_BCOPY},
-             {"__tcc_bcopy", STRBI_BCOPY},       {"mempcpy", STRBI_MEMPCPY},
-             {"__tcc_mempcpy", STRBI_MEMPCPY},   {"index", STRBI_INDEX},
-             {"rindex", STRBI_RINDEX},           {"__builtin_index", STRBI_INDEX},
-             {"__builtin_rindex", STRBI_RINDEX}, {NULL, STRBI_UNKNOWN}};
-  int id = resolve_str_builtin_by_tok(tok);
-  if (id != STRBI_UNKNOWN)
-    return id;
-  if (!name)
-    return STRBI_UNKNOWN;
-  for (int i = 0; map[i].name; i++)
-  {
-    if (strcmp(name, map[i].name) == 0)
-      return map[i].id;
-  }
-  return STRBI_UNKNOWN;
-}
+/* STRBI_* id of a string builtin token / of a call by name (the __tcc_*
+ * redirect names map back); STRBI_UNKNOWN otherwise.  Defined in
+ * source/opt/util/const_string_eval.c. */
+int resolve_str_builtin_by_tok(int tok);
+int resolve_str_builtin_id(int tok, const char *name);
 
 /* Returns 1 if this STRBI id is a "simple redirect" target that the IR
    optimizer will replace with a __tcc_* helper call.  Inlining these
@@ -2183,12 +2285,16 @@ ST_FUNC void libc_free(void *ptr);
 #define strdup(s) use_tcc_strdup(s)
 PUB_FUNC int _tcc_error_noabort(const char *fmt, ...) PRINTF_LIKE(1, 2);
 PUB_FUNC NORETURN void _tcc_error(const char *fmt, ...) PRINTF_LIKE(1, 2);
+PUB_FUNC NORETURN void _tcc_ice(const char *fmt, ...) PRINTF_LIKE(1, 2);
 PUB_FUNC void _tcc_warning(const char *fmt, ...) PRINTF_LIKE(1, 2);
 #define tcc_internal_error(msg) tcc_error("internal compiler error in %s:%d: %s", __FUNCTION__, __LINE__, msg)
 
 /* other utilities */
 ST_FUNC void dynarray_add(void *ptab, int *nb_ptr, void *data);
 ST_FUNC void dynarray_reset(void *pp, int *n);
+ST_FUNC void tcc_qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *));
+/* libc qsort orders ties differently on the host and the device: the self-host objects would differ */
+#define qsort qsort_is_libc_dependent_use_tcc_qsort
 ST_INLN void cstr_ccat(CString *cstr, int ch);
 ST_FUNC void cstr_cat(CString *cstr, const char *str, int len);
 ST_FUNC void cstr_wccat(CString *cstr, int ch);
@@ -2326,6 +2432,7 @@ enum line_macro_output_format
 
 ST_FUNC TokenSym *tok_alloc(const char *str, int len);
 ST_FUNC TokenSym *tok_ensure(int v); /* table_ident[v], materializing a lazy builtin slot */
+ST_FUNC TokenSym *tok_find(const char *str, int len); /* existing token or NULL; interns nothing */
 ST_FUNC int tok_alloc_const(const char *str);
 ST_FUNC const char *get_tok_str(int v, CValue *cv);
 ST_FUNC void begin_macro(TokenString *str, int alloc);
@@ -2337,6 +2444,8 @@ ST_FUNC TokenString *tok_str_alloc(void);
 ST_FUNC void tok_str_free(TokenString *s);
 ST_FUNC void tok_str_free_str(int *str);
 ST_FUNC int *tok_str_ensure_heap(TokenString *s);
+ST_FUNC void tok_str_fit(TokenString *s);
+ST_FUNC TokenString *tok_str_keep(TokenString *s);
 ST_FUNC void tok_str_add(TokenString *s, int t);
 ST_FUNC void tok_str_add2(TokenString *s, int t, CValue *cv);
 ST_FUNC void tok_str_add_tok(TokenString *s);
@@ -2360,6 +2469,7 @@ ST_FUNC void preprocess_end(TCCState *s1);
 ST_FUNC void tccpp_new(TCCState *s);
 ST_FUNC void tccpp_delete(TCCState *s);
 ST_FUNC void tccpp_putfile(const char *filename);
+ST_FUNC void tccpp_setfile(const char *filename);
 ST_FUNC int tcc_preprocess(TCCState *s1);
 ST_FUNC void skip(int c);
 ST_FUNC NORETURN void expect(const char *msg);
@@ -2414,7 +2524,11 @@ ST_FUNC int tcc_gen_machine_prolog_saved_lr(void);
 
 /* ------------ tccgen.c ------------ */
 
+#ifdef CONFIG_TCC_LOW_MEM
+#define SYM_POOL_NB (2048 / sizeof(Sym)) /* pools chain; smaller ones waste less of the last */
+#else
 #define SYM_POOL_NB (8192 / sizeof(Sym))
+#endif
 
 ST_DATA Sym *global_stack;
 ST_DATA Sym *local_stack;
@@ -2427,6 +2541,7 @@ ST_DATA int rsym, anon_sym, ind, loc;
 ST_DATA char debug_modes;
 
 ST_DATA int nocode_wanted; /* true if no code generation wanted for an expression */
+ST_DATA int unevaluated_operand; /* inside the operand of sizeof/typeof/_Generic (expr_type) */
 ST_DATA SValue *discarded_call_vtop; /* vtop where an expression statement began, while its
                                        value is being thrown away; NULL anywhere else */
 ST_DATA int global_expr;   /* true if compound literals must be allocated globally
@@ -2441,7 +2556,29 @@ ST_DATA const char *funcname;
 
 ST_FUNC void tccgen_init(TCCState *s1);
 ST_FUNC int tccgen_compile(TCCState *s1);
-ST_FUNC void tccgen_predef_protos(TCCState *s1);
+/* The builtin alias prototypes are built lazily (predef_protos.c): armed at
+   tccgen_compile start, a name is queued when first interned and its
+   prototype materialised before the next identifier lookup or push. */
+ST_DATA unsigned char tcc_predef_protos_armed;
+ST_DATA unsigned char tcc_predef_protos_queued;
+ST_FUNC void tccgen_predef_protos_arm(void);
+ST_FUNC void tccgen_predef_protos_disarm(void);
+ST_FUNC void tccgen_predef_protos_flush(void);
+ST_FUNC void tccgen_predef_proto_interned(TokenSym *ts);
+ST_FUNC struct Sym *tccgen_predef_proto_find_unseen(int v);
+/* Intern hook: only names spelled __builtin_* can be prototypes. */
+#define TCC_PREDEF_PROTO_INTERNED(ts)                                                   \
+  do                                                                                    \
+  {                                                                                     \
+    if (tcc_predef_protos_armed && (ts)->len > 10 && !memcmp((ts)->str, "__builtin_", 10)) \
+      tccgen_predef_proto_interned(ts);                                                 \
+  } while (0)
+#define TCC_PREDEF_PROTOS_FLUSH()       \
+  do                                    \
+  {                                     \
+    if (tcc_predef_protos_queued)       \
+      tccgen_predef_protos_flush();     \
+  } while (0)
 ST_FUNC void tccgen_finish(TCCState *s1);
 ST_FUNC void check_vstack(void);
 
@@ -2457,9 +2594,21 @@ ST_FUNC void put_extern_sym(Sym *sym, Section *section, addr_t value, unsigned l
 
 /* Identical code folding: a generated body equal to one already emitted is
  * dropped and its symbol points at the survivor (backend/generators/icf.c). */
+#ifdef CONFIG_TCC_O0_ONLY
+/* Folding only runs above -O0: an O0-only compiler leaves out icf.c and its
+ * 16 KB hash table. */
+static inline int tcc_icf_try_fold(TCCState *s1, Sym *sym, Section *sec, addr_t start, addr_t size, size_t reloc_mark)
+{
+  (void)s1; (void)sym; (void)sec; (void)start; (void)size; (void)reloc_mark;
+  return 0;
+}
+static inline void tcc_icf_reset(void) {}
+static inline void tcc_icf_section_changed(Section *sec) { (void)sec; }
+#else
 int tcc_icf_try_fold(TCCState *s1, Sym *sym, Section *sec, addr_t start, addr_t size, size_t reloc_mark);
 void tcc_icf_reset(void);
 void tcc_icf_section_changed(Section *sec);
+#endif
 #if PTR_SIZE == 4
 ST_FUNC void greloc(Section *s, Sym *sym, unsigned long offset, int type);
 #endif
@@ -2475,6 +2624,22 @@ ST_FUNC Sym *label_find(int v);
 ST_FUNC Sym *label_push(Sym **ptop, int v, int flags);
 ST_FUNC void label_pop(Sym **ptop, Sym *slast, int keep);
 ST_INLN Sym *struct_find(int v);
+ST_FUNC Sym *sym_tag_head(int v);
+ST_FUNC void sym_set_tag_head(int v, Sym *s);
+ST_FUNC Sym *sym_label_head(int v);
+ST_FUNC void sym_set_label_head(int v, Sym *s);
+ST_FUNC void sym_heads_free(void);
+ST_FUNC Sym *sym_push2_short(Sym **ps, int v, int t, int c);
+ST_FUNC void sym_free_short(Sym *s);
+ST_FUNC void sym_short_pools_free(void);
+ST_FUNC Sym *sym_pointer_node(CType *type);
+ST_FUNC void sym_pointer_nodes_free(void);
+/* A parked prototype (sym_park_proto): its name's sym_identifier holds the
+   record, tagged in bit 0, until sym_unpark builds the Syms back. */
+#define SYM_IS_PARKED(s) ((uintptr_t)(s) & 1)
+ST_FUNC Sym *sym_unpark(TokenSym *ts);
+ST_FUNC void sym_park_proto(Sym *s, Sym *stack_before);
+ST_FUNC void sym_parked_free_all(void);
 
 ST_FUNC Sym *global_identifier_push(int v, int t, int c);
 ST_FUNC Sym *external_global_sym(int v, CType *type);
@@ -2501,15 +2666,25 @@ ST_FUNC void lexpand(void);
 #endif
 ST_FUNC void gaddrof(void);
 ST_FUNC int gv(int rc);
+ST_FUNC void sso_load_operand(const SValue *sv, SValue *out);
 ST_FUNC void gv2(int rc1, int rc2);
 ST_FUNC void gen_op(int op);
 ST_FUNC void gen_op_vector_reset(void);
 ST_FUNC int type_size(const CType *type, int *a);
 ST_FUNC void mk_pointer(CType *type);
+ST_FUNC void mk_private_pointer(CType *type);
 ST_FUNC void vstore(void);
 ST_FUNC void inc(int post, int c);
 ST_FUNC CString *parse_mult_str(const char *msg);
 ST_FUNC CString *parse_asm_str(void);
+ST_FUNC void gen_internal_call(const char *name, int call_argc, CType *ct);
+/* A call the backend emits as instructions in place of the BL: an inline
+ * atomic (__tcc_ax_*, -minline-atomics) or the system instructions of an asm
+ * statement (__tcc_mc_*).  There is no function to branch to. */
+static inline int tcc_is_inline_machine_call(const char *name)
+{
+  return !strncmp(name, "__tcc_ax_", 9) || !strncmp(name, "__tcc_mc_", 9);
+}
 ST_FUNC void indir(void);
 ST_FUNC void unary(void);
 ST_FUNC void gexpr(void);
@@ -2573,6 +2748,10 @@ ST_FUNC int tcc_yaff_import_set_has(TCCState *s1, const char *name);
 ST_FUNC int tcc_yaff_libtcc1_has(TCCState *s1, const char *name);
 ST_FUNC void tcc_yaff_import_set_free(TCCState *s1);
 ST_FUNC void put_elf_reloc(Section *symtab, Section *s, unsigned long offset, int type, int symbol);
+int ld_section_memory_region(TCCState *s1, const char *name, addr_t *origin);
+#ifdef TCC_TARGET_ARM
+ST_FUNC void arm_add_range_veneers(TCCState *s1);
+#endif
 ST_FUNC void put_elf_reloca(Section *symtab, Section *s, unsigned long offset, int type, int symbol, addr_t addend);
 
 ST_FUNC void resolve_common_syms(TCCState *s1);
@@ -2661,6 +2840,9 @@ ST_DATA const int reg_classes[NB_REGS];
 ST_FUNC void gsym_addr(int t, int a);
 ST_FUNC void gsym(int t);
 ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *align, int *regsize);
+ST_FUNC int gfunc_hfa(CType *type, int *base_size);
+ST_FUNC int gfunc_sret_vfp_words(CType *vt, int variadic);
+ST_FUNC int gen_vfp_ret_transfer(const SValue *ptr, int words, int load);
 ST_FUNC void gfunc_call(int nb_args);
 ST_FUNC void gfunc_prolog(Sym *func_sym);
 ST_FUNC void gfunc_epilog(void);
@@ -2790,15 +2972,14 @@ ST_FUNC void asm_instr(void);
 ST_FUNC void asm_global_instr(void);
 ST_FUNC int tcc_assemble(TCCState *s1, int do_preprocess);
 #ifdef CONFIG_TCC_ASM
+ST_FUNC void tcc_asm_cleanup(void);
 ST_FUNC int find_constraint(ASMOperand *operands, int nb_operands, const char *name, const char **pp);
 ST_FUNC Sym *get_asm_sym(int name, Sym *csym);
 ST_FUNC void asm_expr(TCCState *s1, ExprValue *pe);
 ST_FUNC int asm_int_expr(TCCState *s1);
 /* ------------ i386-asm.c ------------ */
 ST_FUNC void gen_expr32(ExprValue *pe);
-#ifdef TCC_TARGET_X86_64
 ST_FUNC void gen_expr64(ExprValue *pe);
-#endif
 ST_FUNC void asm_opcode(TCCState *s1, int opcode);
 ST_FUNC int asm_parse_regvar(int t);
 ST_FUNC void asm_compute_constraints(ASMOperand *operands, int nb_operands, int nb_outputs, const uint8_t *clobber_regs,
@@ -2807,6 +2988,8 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier);
 ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs, int is_output, uint8_t *clobber_regs,
                           int out_reg);
 ST_FUNC void asm_clobber(uint8_t *clobber_regs, const char *str);
+ST_FUNC int asm_machine_call_name(const char *str, ASMOperand *operands, int nb_operands, int nb_outputs,
+                                  const uint8_t *clobber_regs, char *name, int size);
 #ifdef TCC_TARGET_ARM
 /* `.fpu <name>` directive: enable FP-unit instruction encodings for the rest
    of the translation unit (GNU as compatible). Defined in arm-thumb-asm.c. */
@@ -3267,6 +3450,7 @@ static inline void post_sem(TCCSem *p)
 #define gnu_ext TCC_STATE_VAR(gnu_ext)
 #define tcc_error_noabort TCC_SET_STATE(_tcc_error_noabort)
 #define tcc_error TCC_SET_STATE(_tcc_error)
+#define tcc_ice TCC_SET_STATE(_tcc_ice)
 #define tcc_warning TCC_SET_STATE(_tcc_warning)
 
 #define total_idents TCC_STATE_VAR(total_idents)

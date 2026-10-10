@@ -79,7 +79,7 @@ static int32_t sc_temp_value(IROperand op)
 
 static int sc_has_slot3(int op)
 {
-  return tcc_ir_op_is_mac(op) || op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_SELECT;
+  return ir_op_has(op, IROP_A_SLOT3);
 }
 
 static IROperand sc_slot(TCCIRState *ir, IRQuadCompact *q, int s)
@@ -244,11 +244,10 @@ int tcc_ir_self_store(TCCIRState *ir)
         continue;
       }
       dist++;
-      if (q->op == TCCIR_OP_LOAD && irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == vr)
+      if (q->op == TCCIR_OP_LOAD && tcc_ir_op_dest_vreg(ir, q) == vr)
       {
-        IROperand d = tcc_ir_op_get_dest(ir, q);
         int loff, lwidth;
-        if (!d.is_lval && sc_frame_access(ir, tcc_ir_op_get_src1(ir, q), &loff, &lwidth) && loff == off &&
+        if (!tcc_ir_op_dest_is_lval(ir, q) && sc_frame_access(ir, tcc_ir_op_get_src1(ir, q), &loff, &lwidth) && loff == off &&
             lwidth >= width && !sc_annotated(ir, q))
           ld = j;
         break;
@@ -264,7 +263,12 @@ int tcc_ir_self_store(TCCIRState *ir)
     st->op = TCCIR_OP_NOP;
     removed++;
     occ[pos]--;
-    if (occ[pos] == 1)
+    /* The load's register may still be read under another name: reload
+     * elimination dropped a later reload of this slot because the stored
+     * register already held it, and an elided identity phi copy reads it as
+     * its own.  Both pin the interval (phi_pinned); the load then stays. */
+    IRLiveInterval *li = tcc_ir_vreg_is_valid(ir, vr) ? tcc_ir_vreg_live_interval(ir, vr) : NULL;
+    if (occ[pos] == 1 && !(li && li->phi_pinned))
     {
       ir->compact_instructions[ld].op = TCCIR_OP_NOP;
       occ[pos] = 0;

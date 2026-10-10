@@ -76,8 +76,7 @@ int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir)
       case TCCIR_OP_JUMP:
       case TCCIR_OP_JUMPIF:
       {
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        int target = (int)irop_get_imm64_ex(ir, dest);
+        int target = (int)tcc_ir_op_dest_imm(ir, q);
         if (target <= i)
           return 0; /* backward jump - loop or weirdness */
         break;
@@ -160,7 +159,8 @@ int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir)
   {
     Sym *sym;
     int64_t addend;
-    int btype;
+    int btype; /* ACCESS width: the source operand's btype */
+    int sx;    /* sign-extending narrow read */
     int32_t result_vr;
     int load_idx;
   } tracked[IGLH_MAX_TRACKED];
@@ -249,11 +249,21 @@ int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir)
     }
 
     int dest_btype = irop_get_btype(dest);
+    /* Key on what is READ, not on the dest: a LOAD reads at its source
+     * operand's width and extension, so `g8[0]` (LDRB), `(int8_t)g8[0]`
+     * (LDRSB) and `*(uint32_t *)g8` (LDR) can all have an int dest and are
+     * three different values. */
+    int acc_btype = irop_get_btype(src1);
+    int acc_sx = (acc_btype == IROP_BTYPE_INT8 || acc_btype == IROP_BTYPE_INT16) && !src1.is_unsigned;
+    int acc_wide = acc_btype == IROP_BTYPE_INT64 || acc_btype == IROP_BTYPE_FLOAT64 || acc_btype == IROP_BTYPE_STRUCT;
+    int dest_wide = dest_btype == IROP_BTYPE_INT64 || dest_btype == IROP_BTYPE_FLOAT64 || dest_btype == IROP_BTYPE_STRUCT;
+    if (acc_btype != dest_btype && (acc_wide || dest_wide))
+      continue;
     int found = -1;
     for (int k = 0; k < num_tracked; k++)
     {
       if (tracked[k].sym == ref->sym && tracked[k].addend == ref->addend &&
-          tracked[k].btype == dest_btype)
+          tracked[k].btype == acc_btype && tracked[k].sx == acc_sx)
       {
         found = k;
         break;
@@ -275,8 +285,7 @@ int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir)
         IRQuadCompact *jq = &ir->compact_instructions[j];
         if (jq->op != TCCIR_OP_JUMP && jq->op != TCCIR_OP_JUMPIF)
           continue;
-        IROperand jdest = tcc_ir_op_get_dest(ir, jq);
-        int tgt = (int)irop_get_imm64_ex(ir, jdest);
+        int tgt = (int)tcc_ir_op_dest_imm(ir, jq);
         if (tgt > anchor_idx && tgt <= i)
         {
           safe = 0;
@@ -301,7 +310,8 @@ int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir)
     {
       tracked[num_tracked].sym = ref->sym;
       tracked[num_tracked].addend = ref->addend;
-      tracked[num_tracked].btype = dest_btype;
+      tracked[num_tracked].btype = acc_btype;
+      tracked[num_tracked].sx = acc_sx;
       tracked[num_tracked].result_vr = dest_vr;
       tracked[num_tracked].load_idx = i;
       num_tracked++;
@@ -313,6 +323,4 @@ int tcc_ir_opt_invariant_global_load_hoist(TCCIRState *ir)
 #undef IGLH_MAX_WRITTEN
   return changes;
 }
-
-int tcc_ir_opt_invariant_global_load_hoist_ex(IROptCtx *ctx) { return tcc_ir_opt_invariant_global_load_hoist(ctx->ir); }
 

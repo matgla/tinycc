@@ -211,6 +211,10 @@ int ssa_opt_loop_const_sim(struct TCCIRState *ir);
  * ssa_opt_loop_const_sim.  Gated by opt_loop_unroll (-O2).
  * See docs/plan_legacy_loop_unroll_ssa.md. */
 int ssa_opt_loop_unroll(struct TCCIRState *ir);
+/* Constant-trip unrolling of loops with a mid-body exit (Zig readInt). */
+int ssa_opt_loop_unroll_midexit(struct TCCIRState *ir);
+/* Combine OR-chains of consecutive zero-extended byte loads into one halfword/word load. */
+int ssa_opt_load_combine(IRSSAOptCtx *ctx);
 
 /* Decrement-to-zero (ssa:decrement_to_zero).  Rewrites count-up pure-counter
  * loops with a separate pre-test guard (produced by ssa:loop_rotate, left by
@@ -220,6 +224,19 @@ int ssa_opt_loop_unroll(struct TCCIRState *ir);
  * right after ssa_opt_loop_unroll.  Gated -O1+ (matches ssa:loop_rotate, the
  * shape provider).  See docs/plan_legacy_loop_decrement_to_zero_ssa.md. */
 int ssa_opt_decrement_to_zero(struct TCCIRState *ir);
+
+/* Decrement-to-carry (ssa:decrement_to_carry).  The `for (; n >= K; n -= K)`
+ * family decrement_to_zero cannot take (its countdown bound is the step, not
+ * zero): rewrites the loop so the guard pre-decrements and the latch CMP reads
+ * the body's counter value, making every CMP a comparison of the pre-value
+ * against K -- the same subtraction the flag-setting SUBS performs -- which
+ * the codegen CMP skip then elides (`subs; bcs` latch, `subs; bcc` guard, one
+ * instruction per latch less than `subs; cmp; bcs`).  The counter must be
+ * read nowhere else and dead at every exit (the body sees it one K lower).
+ * Dominance-verified outermost natural loops via the engine dtc_try_region.
+ * Flat IR, right after ssa_opt_decrement_to_zero.  Gated -O1+; knob
+ * TCC_DISABLE_PASS=ssa:decrement_to_carry. */
+int ssa_opt_decrement_to_carry(struct TCCIRState *ir);
 
 /* Bottom-testing for the `while`-shaped loops rotation cannot match
  * (ssa:loop_bottom_test).  ssa:loop_rotate hard-requires the frontend header
@@ -235,6 +252,12 @@ int ssa_opt_decrement_to_zero(struct TCCIRState *ir);
  * ssa_opt_decrement_to_zero.  Gated -O1+; level knob TCC_BOTTOM_TEST.
  * See source/opt/ssa/loop/loop_bottom_test.c. */
 int ssa_opt_loop_bottom_test(struct TCCIRState *ir);
+
+/* General header-duplicating bottom test (ssa:loop_header_dup): the back-edge of an
+ * innermost loop whose exit test sits behind a few pure header instructions is
+ * replaced by a copy of the header and the inverted exit test.  See the comment in
+ * source/opt/ssa/loop/loop_bottom_test.c. */
+int ssa_opt_loop_header_dup(struct TCCIRState *ir);
 
 /* Induction-variable strength reduction (ssa:iv_strength_reduction).  Transforms
  * array-indexing recurrences base + i*stride into a maintained stride pointer
@@ -308,6 +331,9 @@ int ssa_opt_indirect_stack_offset(IRSSAOptCtx *ctx, const IRQuadCompact *q, int 
 /* Loads and stores through a TEMP holding a constant frame address become
  * direct StackLoc accesses (stack_resolve.c). */
 int ssa_opt_stack_deref_fold(IRSSAOptCtx *ctx);
+/* Reads of a struct copy redirected to its source; the copy goes once unread
+ * (copy_fwd.c). */
+int ssa_opt_copy_fwd(IRSSAOptCtx *ctx);
 /* Variant that also reports the resolved address identity via *out_base_var
  * (see ssa_opt_resolve_lea_stackloc_ex for the -1 / >=0 contract). */
 int ssa_opt_indirect_stack_offset_ex(IRSSAOptCtx *ctx, const IRQuadCompact *q, int side,

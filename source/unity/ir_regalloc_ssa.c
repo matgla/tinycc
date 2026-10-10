@@ -14,6 +14,7 @@
 #undef DVIDX
 #undef RA_CO_ADD_USE
 #undef RA_CO_FOR_CALL_PARAM_USES
+#undef RA_CO_FOR_NEIGHBOR
 #undef RA_CO_LIVE_OUT
 #undef RA_CO_NOTE_USE
 #undef RA_DEADCOPY_IDX

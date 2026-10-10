@@ -49,7 +49,7 @@ static int ipc_collect_var_defs(TCCIRState *ir, int n, int **out_def, int *out_m
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    int32_t v = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t v = tcc_ir_op_dest_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_VAR)
       continue;
     int p = TCCIR_DECODE_VREG_POSITION(v);
@@ -67,7 +67,7 @@ static int ipc_collect_var_defs(TCCIRState *ir, int n, int **out_def, int *out_m
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    int32_t v = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t v = tcc_ir_op_dest_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_VAR)
       continue;
     int p = TCCIR_DECODE_VREG_POSITION(v);
@@ -95,7 +95,7 @@ static void ipc_collect_tmp_defs(TCCIRState *ir, int n, int **out_def, int *out_
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    int32_t v = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t v = tcc_ir_op_dest_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_TEMP)
       continue;
     int p = TCCIR_DECODE_VREG_POSITION(v);
@@ -111,7 +111,7 @@ static void ipc_collect_tmp_defs(TCCIRState *ir, int n, int **out_def, int *out_
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    int32_t v = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t v = tcc_ir_op_dest_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_TEMP)
       continue;
     int p = TCCIR_DECODE_VREG_POSITION(v);
@@ -184,11 +184,11 @@ static void ipc_collect_jumps(TCCIRState *ir, int n, IpcJumps *js)
       js->unknown = 1;
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    js->j[js->n].target = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+    js->j[js->n].target = (int)tcc_ir_op_dest_u_imm32(ir, q);
     js->j[js->n].from = k;
     js->n++;
   }
-  qsort(js->j, js->n, sizeof(IpcJump), ipc_jump_cmp);
+  tcc_qsort(js->j, js->n, sizeof(IpcJump), ipc_jump_cmp);
 }
 
 static int ipc_store_dominates_window(const IpcJumps *js, int store_idx, int last_use)
@@ -255,17 +255,17 @@ static IpcSpan *ipc_collect_spans(TCCIRState *ir, int n, int max_var)
     if (q->op == TCCIR_OP_NOP)
       continue;
     if (irop_config[q->op].has_src1)
-      ipc_span_note(span, max_var, irop_get_vreg(tcc_ir_op_get_src1(ir, q)), i);
+      ipc_span_note(span, max_var, tcc_ir_op_src1_vreg(ir, q), i);
     if (irop_config[q->op].has_src2)
-      ipc_span_note(span, max_var, irop_get_vreg(tcc_ir_op_get_src2(ir, q)), i);
+      ipc_span_note(span, max_var, tcc_ir_op_src2_vreg(ir, q), i);
   }
   return span;
 }
 
 static int ipc_reads(TCCIRState *ir, IRQuadCompact *q, int32_t vr)
 {
-  return q->op != TCCIR_OP_NOP && ((irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vr) ||
-                                   (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vr));
+  return q->op != TCCIR_OP_NOP && ((irop_config[q->op].has_src1 && tcc_ir_op_src1_vreg(ir, q) == vr) ||
+                                   (irop_config[q->op].has_src2 && tcc_ir_op_src2_vreg(ir, q) == vr));
 }
 
 /* Last index in [lo, hi] at which `vr` is read, or -1. */
@@ -410,7 +410,7 @@ int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
        * loosens.  Uses beyond it are unexamined, so the copy has to stay. */
       if (irop_config[u->op].has_dest)
       {
-        int32_t dv = irop_get_vreg(tcc_ir_op_get_dest(ir, u));
+        int32_t dv = tcc_ir_op_dest_vreg(ir, u);
         if (dv == dst_vr || dv == src_vr)
         {
           left_behind = 1;
@@ -480,5 +480,3 @@ int tcc_ir_opt_inline_param_copy_elim(TCCIRState *ir)
   tcc_free(jumps.j);
   return changes;
 }
-
-int tcc_ir_opt_inline_param_copy_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_inline_param_copy_elim(ctx->ir); }

@@ -1,0 +1,26 @@
+fp 1 102
+arr 7 8
+ptr 40 41
+tern 1 2 3 4 2 1
+tern2 1 2 3 4 2 1
+deref 1 2 3 4 2 1
+member 3 4 5 6 6 1
+global 4 5 6 7 8 0
+elem 5 6 7 8 10 1
+add 11 22
+mul -55 110
+sub 9 18
+eq 0
+ne 1
+pmul 6 2
+init 3 4 5 6 6 1
+init2 3 4 5 6 6 1
+macro 7 8 9 10 14 1
+comma0 8 9 10 11 16 0
+comma1 9 10 11 12 18 1
+paren 9 10 11 12 18 1
+cond 10 11 12 13 20 0
+self 3 104
+emember 33 33
+eptr 44
+eside 11 22

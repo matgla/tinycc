@@ -95,8 +95,7 @@ int find_deref_use_operand(TCCIRState *ir, int consumer_idx, int32_t vreg, int *
 
   if (cfg->has_src1)
   {
-    IROperand s = tcc_ir_op_get_src1(ir, q);
-    if (s.is_lval && irop_has_vreg(s) && irop_get_vreg(s) == vreg)
+    if (tcc_ir_op_src1_is_lval(ir, q) && tcc_ir_op_src1_has_vreg(ir, q) && tcc_ir_op_src1_vreg(ir, q) == vreg)
     {
       matches++;
       which = 1;
@@ -104,8 +103,7 @@ int find_deref_use_operand(TCCIRState *ir, int consumer_idx, int32_t vreg, int *
   }
   if (cfg->has_src2)
   {
-    IROperand s = tcc_ir_op_get_src2(ir, q);
-    if (s.is_lval && irop_has_vreg(s) && irop_get_vreg(s) == vreg)
+    if (tcc_ir_op_src2_is_lval(ir, q) && tcc_ir_op_src2_has_vreg(ir, q) && tcc_ir_op_src2_vreg(ir, q) == vreg)
     {
       matches++;
       which = 2;
@@ -113,8 +111,7 @@ int find_deref_use_operand(TCCIRState *ir, int consumer_idx, int32_t vreg, int *
   }
   if (cfg->has_dest)
   {
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (d.is_lval && irop_has_vreg(d) && irop_get_vreg(d) == vreg)
+    if (tcc_ir_op_dest_is_lval(ir, q) && tcc_ir_op_dest_has_vreg(ir, q) && tcc_ir_op_dest_vreg(ir, q) == vreg)
     {
       matches++;
       which = 0;

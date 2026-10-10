@@ -43,29 +43,38 @@ static int case_cmp_qs(const void *pa, const void *pb)
 
 void case_sort(struct switch_t *sw)
 {
-  struct case_t **p;
+  struct case_t **p, **out, **end;
   if (sw->n < 2)
     return;
-  qsort(sw->p, sw->n, sizeof *sw->p, case_cmp_qs);
-  p = sw->p;
-  while (p < sw->p + sw->n - 1)
+  tcc_qsort(sw->p, sw->n, sizeof *sw->p, case_cmp_qs);
+  /* One pass with a write cursor: `out` is the last kept range, `p` the next
+   * candidate.  Shifting the whole tail down on every merge, as this used to,
+   * made a run of n consecutive labels cost O(n^2) -- gcc's limits-caselabels
+   * spent 40 G instructions in memmove. */
+  out = sw->p;
+  end = sw->p + sw->n;
+  for (p = sw->p + 1; p < end; p++)
   {
-    if (case_cmp(p[0]->v2, p[1]->v1) >= 0)
+    if (case_cmp((*out)->v2, (*p)->v1) >= 0)
     {
-      int l1 = p[0]->line, l2 = p[1]->line;
+      int l1 = (*out)->line, l2 = (*p)->line;
+      /* Close the gap first: the error path (end_switch) frees sw->p[0..n). */
+      memmove(out + 1, p, (end - p) * sizeof *p);
+      sw->n = (int)(out + 1 - sw->p) + (int)(end - p);
       /* using special format "%i:..." to show specific line */
       tcc_error("%i:duplicate case value", l1 > l2 ? l1 : l2);
     }
-    else if (p[0]->v2 + 1 == p[1]->v1 && p[0]->ind == p[1]->ind)
+    else if ((*out)->v2 + 1 == (*p)->v1 && (*out)->ind == (*p)->ind)
     {
       /* treat "case 1: case 2: case 3:" like "case 1 ... 3: */
-      p[1]->v1 = p[0]->v1;
-      tcc_free(p[0]);
-      memmove(p, p + 1, (--sw->n - (p - sw->p)) * sizeof *p);
+      (*p)->v1 = (*out)->v1;
+      tcc_free(*out);
+      *out = *p;
     }
     else
-      ++p;
+      *++out = *p;
   }
+  sw->n = (int)(out - sw->p) + 1;
 }
 
 /* ============================================================================
@@ -87,7 +96,7 @@ void case_sort(struct switch_t *sw)
 int switch_can_use_jump_table(struct switch_t *sw)
 {
   /* Only use jump tables when optimization is enabled */
-  if (!tcc_state->optimize)
+  if (!TCC_OPT(tcc_state, optimize))
     return 0;
 
   if (sw->n < 4)
@@ -95,7 +104,12 @@ int switch_can_use_jump_table(struct switch_t *sw)
 
   int64_t min_val = sw->p[0]->v1;
   int64_t max_val = sw->p[sw->n - 1]->v2;
-  int64_t range = max_val - min_val + 1;
+  /* 64-bit case values can span more than int64_t holds: subtract unsigned
+   * and give up on anything wider than a TBH table can index anyway. */
+  uint64_t span = (uint64_t)max_val - (uint64_t)min_val;
+  if (span >= 65536)
+    return 0;
+  int64_t range = (int64_t)span + 1;
 
   /* Check density: must be at least 50% filled */
   if (sw->n * 2 < range)

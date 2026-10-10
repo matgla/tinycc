@@ -13,6 +13,8 @@
 #include "ssa_opt.h"
 #include "opt_ssa_domwalk.h"
 #include "opt_utils.h" /* pure-helper predicates + call-parameter accessors */
+#include "opt_range.h"
+#include "licm.h" /* tcc_ir_get_func_purity */
 #include "opt/ssa/gvn.h"
 
 /* ============================================================================
@@ -82,18 +84,7 @@ static int gvn_is_pure_alu(int op)
 
 static int gvn_is_commutative(int op)
 {
-  switch (op) {
-  case TCCIR_OP_ADD:
-  case TCCIR_OP_MUL:
-  case TCCIR_OP_AND:
-  case TCCIR_OP_OR:
-  case TCCIR_OP_XOR:
-  case TCCIR_OP_BOOL_AND:
-  case TCCIR_OP_BOOL_OR:
-    return 1;
-  default:
-    return 0;
-  }
+  return ir_op_has(op, IROP_A_COMMUTATIVE);
 }
 
 static uint32_t gvn_hash(int op, uint8_t s1_tag, int32_t s1, int32_t imm1, Sym *sym1,
@@ -124,6 +115,15 @@ static int gvn_operand_is_volatile_var(TCCIRState *ir, IROperand s)
     return 0;
   IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, v);
   return li && li->is_volatile;
+}
+
+/* An lvalue source that reads memory through a pointer (or a member of a
+ * volatile aggregate) carries its volatility on the operand only, not on a Sym
+ * or a VAR interval: `*p` with `volatile int *p`.  Two such reads are two
+ * mandated accesses and must not be numbered together. */
+static int gvn_operand_is_volatile_deref(TCCIRState *ir, IROperand s)
+{
+  return s.is_lval && tcc_ir_access_is_volatile(ir, s);
 }
 
 /* SYMREF pool entries are never deduplicated, so key them by resolved
@@ -198,17 +198,44 @@ static void gvn_scope_pop_to(int saved_count)
   }
 }
 
-static GVNEntry *entry_pool;
-static int pool_count;
+/* Entry storage.  Every allocated entry is pushed into the table right away
+ * (one undo record each), so pool_count == undo_count, and an entry popped by
+ * gvn_reset is unreachable: the pool is a stack that gvn_reset rewinds with the
+ * scope.  It lives in fixed chunks so table pointers stay valid as it grows.
+ * One GVNEntry per IR instruction up front was the largest allocation of a
+ * big -O2 function (~160 KB on regcomp.c's largest), while the live depth
+ * is a small fraction of that.  pool_allocs keeps the old per-function cap of
+ * n allocations, so an over-budget function still stops numbering at the
+ * same point. */
+#define GVN_POOL_CHUNK 64
+static GVNEntry **pool_chunks;
+static int pool_nchunks;
+static int pool_count;  /* live entries (== undo_count) */
+static int pool_allocs; /* entries handed out in this function */
 static int pool_cap;
 
 static GVNEntry *gvn_alloc_entry(void)
 {
-  if (pool_count >= pool_cap)
+  if (pool_allocs >= pool_cap)
     return NULL;
-  GVNEntry *e = &entry_pool[pool_count++];
+  int c = pool_count / GVN_POOL_CHUNK;
+  if (c == pool_nchunks) {
+    pool_chunks = tcc_realloc(pool_chunks, (pool_nchunks + 1) * sizeof(*pool_chunks));
+    pool_chunks[pool_nchunks++] = tcc_malloc(GVN_POOL_CHUNK * sizeof(GVNEntry));
+  }
+  pool_allocs++;
+  GVNEntry *e = &pool_chunks[c][pool_count++ % GVN_POOL_CHUNK];
   memset(e, 0, sizeof(*e));
   return e;
+}
+
+static void gvn_pool_free(void)
+{
+  for (int c = 0; c < pool_nchunks; c++)
+    tcc_free(pool_chunks[c]);
+  tcc_free(pool_chunks);
+  pool_chunks = NULL;
+  pool_nchunks = 0;
 }
 
 /* PARAM mutation bitmap.  A PARAM that is the dest of any STORE/ASSIGN-write
@@ -262,21 +289,16 @@ static int gvn_src_class(IRSSAOptCtx *ctx, IROperand s)
 
 static int gvn_local_flushes(int op)
 {
-  switch (op) {
-  case TCCIR_OP_JUMP:
-  case TCCIR_OP_JUMPIF:
-  case TCCIR_OP_IJUMP:
-  case TCCIR_OP_SWITCH_TABLE:
-  case TCCIR_OP_RETURNVALUE:
-  case TCCIR_OP_RETURNVOID:
-  case TCCIR_OP_FUNCCALLVAL:
-  case TCCIR_OP_FUNCCALLVOID:
-  case TCCIR_OP_BLOCK_COPY:
-  case TCCIR_OP_INLINE_ASM:
+  /* Stores are invalidated one location at a time (gvn_local_invalidate);
+   * a BLOCK_COPY flushes everything. */
+  if (op == TCCIR_OP_BLOCK_COPY)
     return 1;
-  default:
-    return 0;
-  }
+  /* Everything else that may write memory GVN does not track flushes too:
+   * __builtin_apply / setjmp (an expression over `*p` was reused across an
+   * apply that rewrote *p), asm and its operand markers, VLA SP changes, the
+   * static chain, POSTINC. */
+  return ir_op_has(op, IR_HZ_FROM_OP & ~(IR_HZ_MEM_READ | IR_HZ_MEM_WRITE | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ |
+                                          IR_HZ_HINT | IR_HZ_CALL_PARAM));
 }
 
 static int gvn_local_invalidate(TCCIRState *ir, GVNEntry *lc, int lcount, IRQuadCompact *q)
@@ -288,8 +310,7 @@ static int gvn_local_invalidate(TCCIRState *ir, GVNEntry *lc, int lcount, IRQuad
   int32_t kill = -1;
   int aliases_mem = 0;
   if (irop_config[q->op].has_dest) {
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    kill = irop_get_vreg(d);
+    kill = tcc_ir_op_dest_vreg(ir, q);
     if (kill >= 0) {
       IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, kill);
       if (li && li->addrtaken)
@@ -337,8 +358,7 @@ static int gvn_consumer_would_cse(IRSSAOptCtx *ctx, GVNEntry **table, int use_id
     return 0;
   if (!irop_config[uq->op].has_src1 || !irop_config[uq->op].has_src2)
     return 0;
-  IROperand ud = tcc_ir_op_get_dest(ir, uq);
-  int32_t udv = irop_get_vreg(ud);
+  int32_t udv = tcc_ir_op_dest_vreg(ir, uq);
   if (udv < 0 || TCCIR_DECODE_VREG_TYPE(udv) != TCCIR_VREG_TYPE_TEMP)
     return 0;
   IROperand us1 = tcc_ir_op_get_src1(ir, uq);
@@ -408,7 +428,7 @@ static int gvn_try_lea(IRSSAOptCtx *ctx, GVNEntry **table, int i)
     if (rvi) ssa_opt_add_use_instr(rvi, i);
     q->op = TCCIR_OP_ASSIGN;
     tcc_ir_set_src1(ir, i, new_src);
-    tcc_ir_set_src2(ir, i, IROP_NONE);
+    tcc_ir_set_src2_none(ir, i);
     return 1;
   }
 
@@ -476,10 +496,10 @@ static int gvn_pure_call_args_unchanged(IRSSAOptCtx *ctx, int from, int to,
     return 0;
   for (int k = from + 1; k < to; k++) {
     IRQuadCompact *q = &ir->compact_instructions[k];
+    if (q->is_jump_target) /* before the NOP skip: a NOP can be the join */
+      return 0;
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if (q->is_jump_target)
-      return 0;
     switch (q->op) {
     case TCCIR_OP_STORE:
     case TCCIR_OP_STORE_INDEXED:
@@ -499,8 +519,7 @@ static int gvn_pure_call_args_unchanged(IRSSAOptCtx *ctx, int from, int to,
     default:
       break;
     }
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    int32_t dv = irop_get_vreg(d);
+    int32_t dv = tcc_ir_op_dest_vreg(ir, q);
     if (dv < 0)
       continue;
     for (int a = 0; a < nargs; a++)
@@ -519,9 +538,8 @@ static int gvn_try_pure_call(IRSSAOptCtx *ctx, GVNEntry **table, int i)
   if (!gvn_pure_callee(ir, q, &callee))
     return 0;
 
-  IROperand dest = tcc_ir_op_get_dest(ir, q);
-  int32_t dest_vr = irop_get_vreg(dest);
-  if (dest_vr < 0 || dest.is_lval ||
+  int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
+  if (dest_vr < 0 || tcc_ir_op_dest_is_lval(ir, q) ||
       TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
   IRSSAVregInfo *dvi = ssa_opt_vinfo(ctx, dest_vr);
@@ -555,7 +573,8 @@ static int gvn_try_pure_call(IRSSAOptCtx *ctx, GVNEntry **table, int i)
    * access that must not be elided, however stable the surrounding code is. */
   int args_ssa_stable = 1;
   for (int a = 0; a < nargs; a++) {
-    if (args[a].is_llocal || gvn_operand_is_volatile_var(ir, args[a]))
+    if (args[a].is_llocal || gvn_operand_is_volatile_var(ir, args[a]) ||
+        gvn_operand_is_volatile_deref(ir, args[a]))
       return 0;
     if (args[a].is_lval && irop_get_tag(args[a]) == IROP_TAG_SYMREF) {
       IRPoolSymref *asr = irop_get_symref_ex(ir, args[a]);
@@ -746,7 +765,7 @@ static int gvn_cmp_setif_rewrite(IRSSAOptCtx *ctx, int cmp_idx, int setif_idx,
   if (rvi) ssa_opt_add_use_instr(rvi, setif_idx);
   ir->compact_instructions[setif_idx].op = TCCIR_OP_ASSIGN;
   tcc_ir_set_src1(ir, setif_idx, src_vreg);
-  tcc_ir_set_src2(ir, setif_idx, IROP_NONE);
+  tcc_ir_set_src2_none(ir, setif_idx);
   return 1;
 }
 
@@ -770,15 +789,13 @@ static int gvn_try_cmp_setif(IRSSAOptCtx *ctx, GVNEntry **table, GVNEntry *lcach
     return 0;
   IRQuadCompact *cmp = &ir->compact_instructions[cmp_idx];
 
-  IROperand setif_dest = tcc_ir_op_get_dest(ir, setif);
-  int32_t dest_vr = irop_get_vreg(setif_dest);
-  if (dest_vr < 0 || setif_dest.is_lval)
+  int32_t dest_vr = tcc_ir_op_dest_vreg(ir, setif);
+  if (dest_vr < 0 || tcc_ir_op_dest_is_lval(ir, setif))
     return 0;
 
   IROperand cmp_s1 = tcc_ir_op_get_src1(ir, cmp);
   IROperand cmp_s2 = tcc_ir_op_get_src2(ir, cmp);
-  IROperand cond_op = tcc_ir_op_get_src1(ir, setif);
-  int32_t cond = (int32_t)irop_get_imm64_ex(ir, cond_op);
+  int32_t cond = (int32_t)tcc_ir_op_src1_imm(ir, setif);
   int32_t btkey = (irop_get_btype(cmp_s1) & 0xffff) | ((irop_get_btype(cmp_s2) & 0xffff) << 16);
 
   int c1 = gvn_src_class(ctx, cmp_s1);
@@ -794,7 +811,8 @@ static int gvn_try_cmp_setif(IRSSAOptCtx *ctx, GVNEntry **table, GVNEntry *lcach
   gvn_operand_key(ir, cmp_s2, &s2_tag, &s2_vr, &s2_imm, &s2_sym);
   if ((s1_sym && (s1_sym->type.t & VT_VOLATILE)) ||
       (s2_sym && (s2_sym->type.t & VT_VOLATILE)) ||
-      gvn_operand_is_volatile_var(ir, cmp_s1) || gvn_operand_is_volatile_var(ir, cmp_s2))
+      gvn_operand_is_volatile_var(ir, cmp_s1) || gvn_operand_is_volatile_var(ir, cmp_s2) ||
+      gvn_operand_is_volatile_deref(ir, cmp_s1) || gvn_operand_is_volatile_deref(ir, cmp_s2))
     return 0;
   uint8_t s1_lv = cmp_s1.is_lval, s2_lv = cmp_s2.is_lval;
 
@@ -871,6 +889,7 @@ static void gvn_reset(void *state, int watermark)
 {
   (void)state;
   gvn_scope_pop_to(watermark);
+  pool_count = watermark; /* the popped entries are unreachable: reuse them */
 }
 
 /* Value-number one block, adding availability entries visible to its dominator
@@ -979,7 +998,8 @@ static int gvn_visit(IRSSAOptCtx *ctx, int b, void *state)
       if ((s1_sym && (s1_sym->type.t & VT_VOLATILE)) || (s2_sym && (s2_sym->type.t & VT_VOLATILE)) ||
           (s3_sym && (s3_sym->type.t & VT_VOLATILE)) ||
           gvn_operand_is_volatile_var(ir, src1) || gvn_operand_is_volatile_var(ir, src2) ||
-          (is_mla && gvn_operand_is_volatile_var(ir, accum)))
+          gvn_operand_is_volatile_deref(ir, src1) || gvn_operand_is_volatile_deref(ir, src2) ||
+          (is_mla && (gvn_operand_is_volatile_var(ir, accum) || gvn_operand_is_volatile_deref(ir, accum))))
         continue;
       uint8_t s1_lv = src1.is_lval, s2_lv = src2.is_lval;
       uint8_t s3_lv = is_mla ? accum.is_lval : 0;
@@ -1023,7 +1043,7 @@ static int gvn_visit(IRSSAOptCtx *ctx, int b, void *state)
         if (rvi) ssa_opt_add_use_instr(rvi, i);
         q->op = TCCIR_OP_ASSIGN;
         tcc_ir_set_src1(ir, i, new_src);
-        tcc_ir_set_src2(ir, i, IROP_NONE);
+        tcc_ir_set_src2_none(ir, i);
         changes++;
       } else if (lcount < GVN_LOCAL_MAX) {
         GVNEntry *e = &lcache[lcount++];
@@ -1126,7 +1146,7 @@ static int gvn_visit(IRSSAOptCtx *ctx, int b, void *state)
 
       q->op = TCCIR_OP_ASSIGN;
       tcc_ir_set_src1(ir, i, new_src);
-      tcc_ir_set_src2(ir, i, IROP_NONE);
+      tcc_ir_set_src2_none(ir, i);
       changes++;
       continue;
     }
@@ -1191,10 +1211,20 @@ static void gvn_param_scan(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
+    /* An address-taken PARAM (`&a`) can be written through the pointer by a
+     * store or a callee; no instruction names it as a dest.  Same rule as
+     * VRP's param_stable. */
+    if (q->op == TCCIR_OP_LEA) {
+      int32_t avr = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      if (avr >= 0 && TCCIR_DECODE_VREG_TYPE(avr) == TCCIR_VREG_TYPE_PARAM) {
+        int apos = TCCIR_DECODE_VREG_POSITION(avr);
+        if (apos >= 0 && apos < np)
+          param_mutated[apos / 8] |= (uint8_t)(1u << (apos % 8));
+      }
+    }
     if (!irop_config[q->op].has_dest)
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    int32_t vr = irop_get_vreg(d);
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr < 0)
       continue;
     if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_PARAM)
@@ -1220,8 +1250,8 @@ int ssa_opt_gvn(IRSSAOptCtx *ctx)
   undo_count = 0;
   undo_cap = 0;
   pool_count = 0;
+  pool_allocs = 0;
   pool_cap = n;
-  entry_pool = tcc_mallocz(n * sizeof(GVNEntry));
 
   param_mutated = NULL;
   param_mutated_cap = 0;
@@ -1239,11 +1269,388 @@ int ssa_opt_gvn(IRSSAOptCtx *ctx)
 
   tcc_free(undo_stack);
   undo_stack = NULL;
-  tcc_free(entry_pool);
-  entry_pool = NULL;
+  gvn_pool_free();
   tcc_free(param_mutated);
   param_mutated = NULL;
   param_mutated_cap = 0;
 
+  return changes;
+}
+
+/* Reuse read-only call results only while arguments and observed memory stay unchanged. */
+
+#define PCSE_MAX_ARGS 8
+#define PCSE_MAX_SCAN 64
+
+static int pcse_instr_clean(TCCIRState *ir, int k, int forward)
+{
+  IRQuadCompact *q = &ir->compact_instructions[k];
+  uint32_t hz = ir_q_hazards(ir, q, IR_HZ_ALL & ~(IR_HZ_MEM_READ | IR_HZ_SRC_LVAL | IR_HZ_FLAGS_SET |
+                                                  IR_HZ_FLAGS_READ | IR_HZ_CALL_PARAM | IR_HZ_HINT |
+                                                  (forward ? IR_HZ_JOIN : 0)));
+  if (hz == IR_HZ_CALL)
+  {
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
+    return callee && tcc_ir_get_func_purity(ir, callee) >= TCC_FUNC_PURITY_PURE;
+  }
+  if (hz == IR_HZ_MEM_WRITE && q->op == TCCIR_OP_STORE)
+  {
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    return !d.is_lval && !d.is_llocal && irop_get_tag(d) == IROP_TAG_VREG && irop_get_vreg(d) >= 0;
+  }
+  return hz == 0;
+}
+
+static IROperand pcse_canon(IRSSAOptCtx *ctx, IROperand op, int *pos)
+{
+  TCCIRState *ir = ctx->ir;
+  for (int depth = 0; depth < 8; depth++)
+  {
+    int32_t vr = irop_get_vreg(op);
+    if (op.is_lval || op.is_llocal || irop_get_tag(op) != IROP_TAG_VREG || vr < 0 ||
+        TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+      break;
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+    if (!vi || ssa_opt_def_total(vi) != 1 || vi->def_instr < 0 || vi->def_instr >= *pos)
+      break;
+    IRQuadCompact *d = &ir->compact_instructions[vi->def_instr];
+    if (d->op != TCCIR_OP_ASSIGN && d->op != TCCIR_OP_STORE && d->op != TCCIR_OP_LOAD)
+      break;
+    IROperand dst = tcc_ir_op_get_dest(ir, d);
+    IROperand src = tcc_ir_op_get_src1(ir, d);
+    if (dst.is_lval || dst.is_llocal || src.is_llocal || (d->op == TCCIR_OP_LOAD && !src.is_lval) ||
+        (!src.is_lval && (irop_get_tag(src) != IROP_TAG_VREG || irop_get_vreg(src) < 0)) ||
+        irop_get_btype(dst) != irop_get_btype(src) || (src.is_lval && dst.is_unsigned != src.is_unsigned))
+      break;
+    op = src;
+    *pos = vi->def_instr;
+    if (op.is_lval)
+      break;
+  }
+  return op;
+}
+
+static int pcse_single_temp(IRSSAOptCtx *ctx, int32_t vr)
+{
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+  return vi && ssa_opt_def_total(vi) == 1;
+}
+
+static int pcse_vreg_unchanged(IRSSAOptCtx *ctx, int32_t vr, int a, int b)
+{
+  TCCIRState *ir = ctx->ir;
+  int lo = a < b ? a : b;
+  int hi = a < b ? b : a;
+  for (int block = ctx->cfg->instr_to_block[lo] + 1;
+       block <= ctx->cfg->instr_to_block[hi]; block++)
+    for (IRPhiNode *phi = ctx->ssa->block_phis[block]; phi; phi = phi->next)
+      if (phi->dest_vreg == vr)
+        return 0;
+  for (int k = lo + 1; k < hi; k++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[k];
+    if (q->op != TCCIR_OP_NOP && irop_config[q->op].has_dest && tcc_ir_op_dest_vreg(ir, q) == vr)
+      return 0;
+  }
+  return 1;
+}
+
+static int pcse_same_value(IRSSAOptCtx *ctx, IROperand a, int apos, IROperand b, int bpos, int depth, int *lo)
+{
+  TCCIRState *ir = ctx->ir;
+  if (depth > 2 || a.is_llocal || b.is_llocal || a.is_lval != b.is_lval)
+    return 0;
+  if (tcc_ir_operand_names_volatile_var(ir, a) || tcc_ir_operand_names_volatile_var(ir, b))
+    return 0;
+  int tag = irop_get_tag(a);
+  if (tag != irop_get_tag(b))
+    return 0;
+  if (a.is_lval)
+  {
+    if (tcc_ir_access_is_volatile(ir, a) || tcc_ir_access_is_volatile(ir, b) ||
+        irop_get_btype(a) != irop_get_btype(b) || a.is_unsigned != b.is_unsigned)
+      return 0;
+    if (tag == IROP_TAG_VREG)
+    {
+      int32_t vr = irop_get_vreg(a);
+      if (vr < 0 || vr != irop_get_vreg(b) || !pcse_vreg_unchanged(ctx, vr, apos, bpos))
+        return 0;
+    }
+    else if (!ir_opt_nonvreg_expr_equal(ir, a, b))
+      return 0;
+    if (apos < *lo)
+      *lo = apos;
+    if (bpos < *lo)
+      *lo = bpos;
+    return 1;
+  }
+  if (tag == IROP_TAG_VREG)
+  {
+    int32_t va = irop_get_vreg(a), vb = irop_get_vreg(b);
+    if (va < 0 || vb < 0)
+      return 0;
+    if (va == vb)
+      return pcse_vreg_unchanged(ctx, va, apos, bpos);
+    if (!pcse_single_temp(ctx, va) || !pcse_single_temp(ctx, vb))
+      return 0;
+    int da = ssa_opt_vinfo(ctx, va)->def_instr, db = ssa_opt_vinfo(ctx, vb)->def_instr;
+    if (da < 0 || db < 0)
+      return 0;
+    IRQuadCompact *qa = &ir->compact_instructions[da];
+    IRQuadCompact *qb = &ir->compact_instructions[db];
+    if (!tcc_ir_opt_pass_disabled("ssa:pure_call_cse:forward") &&
+        qa->op == qb->op && (qa->op == TCCIR_OP_ADD || qa->op == TCCIR_OP_SUB) &&
+        irop_get_btype(tcc_ir_op_get_dest(ir, qa)) == irop_get_btype(tcc_ir_op_get_dest(ir, qb)) &&
+        !tcc_ir_instr_access_is_volatile(ir, qa) && !tcc_ir_instr_access_is_volatile(ir, qb))
+    {
+      IROperand x1 = tcc_ir_op_get_src1(ir, qa), x2 = tcc_ir_op_get_src1(ir, qb);
+      IROperand y1 = tcc_ir_op_get_src2(ir, qa), y2 = tcc_ir_op_get_src2(ir, qb);
+      int xa = da, xb = db, ya = da, yb = db;
+      x1 = pcse_canon(ctx, x1, &xa);
+      x2 = pcse_canon(ctx, x2, &xb);
+      y1 = pcse_canon(ctx, y1, &ya);
+      y2 = pcse_canon(ctx, y2, &yb);
+      return pcse_same_value(ctx, x1, xa, x2, xb, depth + 1, lo) &&
+             pcse_same_value(ctx, y1, ya, y2, yb, depth + 1, lo);
+    }
+    if (qa->op != TCCIR_OP_LOAD || qb->op != TCCIR_OP_LOAD || tcc_ir_instr_access_is_volatile(ir, qa) ||
+        tcc_ir_instr_access_is_volatile(ir, qb))
+      return 0;
+    IROperand ra = tcc_ir_op_get_dest(ir, qa), rb = tcc_ir_op_get_dest(ir, qb);
+    if (irop_get_btype(ra) != irop_get_btype(rb) || ra.is_unsigned != rb.is_unsigned)
+      return 0;
+    return pcse_same_value(ctx, tcc_ir_op_get_src1(ir, qa), da, tcc_ir_op_get_src1(ir, qb), db, depth + 1, lo);
+  }
+  if (irop_is_immediate(a))
+    return irop_is_immediate(b) && irop_get_btype(a) == irop_get_btype(b) &&
+           irop_get_imm64_ex(ir, a) == irop_get_imm64_ex(ir, b);
+  return ir_opt_nonvreg_expr_equal(ir, a, b);
+}
+
+/* See docs/inline_readonly_wrappers.md for the bounded forward-region proof. */
+static int pcse_forward_region(IRSSAOptCtx *ctx, int from, int to)
+{
+  IRCFG *cfg = ctx->cfg;
+  TCCIRState *ir = ctx->ir;
+  int first = cfg->instr_to_block[from], last = cfg->instr_to_block[to];
+  if (first < 0 || last <= first || last - first > 32 ||
+      !tcc_ir_cfg_dominates(cfg, first, last))
+    return 0;
+  for (int b = first; b <= last; b++)
+  {
+    IRBasicBlock *bb = &cfg->blocks[b];
+    if (b > first)
+      for (int p = 0; p < bb->num_preds; p++)
+        if (bb->preds[p] < first || bb->preds[p] >= b)
+          return 0;
+    if (b < last)
+      for (int a = 0; a < bb->num_succs; a++)
+        if (bb->succs[a] <= b || bb->succs[a] > last)
+          return 0;
+  }
+  for (int n = from + 1; n < to; n++)
+  {
+    int op = ir->compact_instructions[n].op;
+    if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
+    {
+      int target = (int)tcc_ir_op_dest_u_imm32(ir, &ir->compact_instructions[n]);
+      if (target <= n || target > to)
+        return 0;
+      continue;
+    }
+    if (!pcse_instr_clean(ir, n, 1))
+      return 0;
+  }
+  return 1;
+}
+
+static int pcse_stable_arg(IRSSAOptCtx *ctx, IROperand op)
+{
+  if (op.is_lval || op.is_llocal || tcc_ir_operand_names_volatile_var(ctx->ir, op))
+    return 0;
+  if (irop_get_tag(op) == IROP_TAG_VREG)
+    return pcse_single_temp(ctx, irop_get_vreg(op));
+  return irop_is_immediate(op) || (op.is_sym && op.is_local);
+}
+
+static int pcse_match(IRSSAOptCtx *ctx, int k, int i, int argc, const IROperand *a2, const int *p2)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q1 = &ir->compact_instructions[k];
+  IRQuadCompact *q2 = &ir->compact_instructions[i];
+  if (TCCIR_DECODE_CALL_ARGC((uint32_t)tcc_ir_op_src2_imm(ir, q1)) != argc)
+    return 0;
+
+  int32_t d1 = -1, d2 = -1;
+  if (q2->op == TCCIR_OP_FUNCCALLVAL)
+  {
+    if (q1->op != TCCIR_OP_FUNCCALLVAL || tcc_ir_op_dest_is_lval(ir, q1))
+      return 0;
+    d1 = tcc_ir_op_dest_vreg(ir, q1);
+    d2 = tcc_ir_op_dest_vreg(ir, q2);
+    if (!pcse_single_temp(ctx, d1) || d1 == d2 ||
+        irop_get_btype(tcc_ir_op_get_dest(ir, q1)) != irop_get_btype(tcc_ir_op_get_dest(ir, q2)))
+      return 0;
+  }
+
+  int lo = k;
+  for (int a = 0; a < argc; a++)
+  {
+    IROperand op;
+    int pos = ir_opt_get_call_param_index(ir, k, a);
+    if (pos < 0 || !ir_opt_get_call_param_operand(ir, k, a, &op))
+      return 0;
+    op = pcse_canon(ctx, op, &pos);
+    if (!pcse_same_value(ctx, op, pos, a2[a], p2[a], 0, &lo))
+      return 0;
+    if (pos < lo)
+      lo = pos;
+    if (p2[a] < lo)
+      lo = p2[a];
+  }
+  int across = ctx->cfg->instr_to_block[k] != ctx->cfg->instr_to_block[i];
+  if (across)
+  {
+    if (tcc_ir_opt_pass_disabled("ssa:pure_call_cse:forward") || !pcse_forward_region(ctx, k, i) ||
+        (lo < k && !pcse_forward_region(ctx, lo, i)))
+      return 0;
+    for (int a = 0; a < argc; a++)
+      if (!pcse_stable_arg(ctx, a2[a]))
+        return 0;
+  }
+  for (int j = k; !across && j > lo;)
+  {
+    j = ir_bb_prev(ir, j, lo);
+    if (j < 0)
+      return 0;
+    if (j > lo && !pcse_instr_clean(ir, j, 0))
+      return 0;
+  }
+
+  if (d2 >= 0)
+  {
+    if (!ssa_opt_can_replace_all_uses(ctx, d2))
+      return 0;
+    ssa_opt_replace_all_uses(ctx, d2, d1);
+  }
+  ir_opt_nop_call_params(ir, i);
+  ssa_opt_nop_instr(ctx, i);
+  return 1;
+}
+
+static int pcse_prev(TCCIRState *ir, int i)
+{
+  for (int k = i - 1; k >= 0; k--)
+    if (ir->compact_instructions[k].op != TCCIR_OP_NOP)
+      return k;
+  return -1;
+}
+
+static int pcse_try(IRSSAOptCtx *ctx, int i)
+{
+  TCCIRState *ir = ctx->ir;
+  if (i >= ctx->cfg->num_instrs)
+    return 0;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  Sym *callee = tcc_ir_op_src1_sym(ir, q);
+  if (!callee || tcc_ir_get_func_purity(ir, callee) < TCC_FUNC_PURITY_PURE)
+    return 0;
+  if (q->op == TCCIR_OP_FUNCCALLVAL &&
+      (tcc_ir_op_dest_is_lval(ir, q) || !pcse_single_temp(ctx, tcc_ir_op_dest_vreg(ir, q))))
+    return 0;
+
+  int argc = TCCIR_DECODE_CALL_ARGC((uint32_t)tcc_ir_op_src2_imm(ir, q));
+  if (argc > PCSE_MAX_ARGS)
+    return 0;
+  IROperand a2[PCSE_MAX_ARGS];
+  int p2[PCSE_MAX_ARGS];
+  for (int a = 0; a < argc; a++)
+  {
+    p2[a] = ir_opt_get_call_param_index(ir, i, a);
+    if (p2[a] < 0 || !ir_opt_get_call_param_operand(ir, i, a, &a2[a]))
+      return 0;
+    a2[a] = pcse_canon(ctx, a2[a], &p2[a]);
+  }
+
+  int steps = 0;
+  int forward = !tcc_ir_opt_pass_disabled("ssa:pure_call_cse:forward");
+  for (int k = forward ? pcse_prev(ir, i) : ir_bb_prev(ir, i, 0);
+       k >= 0 && steps < (forward ? 2 * PCSE_MAX_SCAN : PCSE_MAX_SCAN);
+       k = forward ? pcse_prev(ir, k) : ir_bb_prev(ir, k, 0), steps++)
+  {
+    IRQuadCompact *qk = &ir->compact_instructions[k];
+    if ((qk->op == TCCIR_OP_FUNCCALLVAL || qk->op == TCCIR_OP_FUNCCALLVOID) &&
+        tcc_ir_op_src1_sym(ir, qk) == callee && pcse_match(ctx, k, i, argc, a2, p2))
+      return 1;
+    if (!pcse_instr_clean(ir, k, forward) &&
+        !(forward && (qk->op == TCCIR_OP_JUMP || qk->op == TCCIR_OP_JUMPIF)))
+      return 0;
+  }
+  return 0;
+}
+
+int ssa_opt_pure_call_cse(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  int changes = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
+      changes += pcse_try(ctx, i);
+  }
+  return changes;
+}
+
+/* The dominator-tree scoped walk of opt_ssa_domwalk.h (one copy, not one per
+ * including pass; here because the unit-test build links this file). */
+int opt_ssa_domwalk(IRSSAOptCtx *ctx, const OptSSADomWalk *w)
+{
+  IRCFG *cfg = ctx->cfg;
+  if (!cfg || cfg->num_blocks == 0)
+    return 0;
+
+  int changes = 0;
+  int sp = 0, cap = 16;
+  OptSSADomWalkItem *stack = tcc_malloc(sizeof *stack * cap);
+  stack[sp].kind = 0;
+  stack[sp].value = 0;
+  sp++;
+
+  while (sp > 0) {
+    sp--;
+    if (stack[sp].kind == 1) {
+      if (w->reset)
+        w->reset(w->state, stack[sp].value);
+      continue;
+    }
+
+    int b = stack[sp].value;
+    IRBasicBlock *bb = &cfg->blocks[b];
+    int wm = w->mark ? w->mark(w->state) : 0;
+
+    if (w->enter)
+      changes += w->enter(ctx, b, w->state);
+    if (w->visit)
+      changes += w->visit(ctx, b, w->state);
+
+    if (sp + 1 + bb->num_dom_children > cap) {
+      while (sp + 1 + bb->num_dom_children > cap)
+        cap *= 2;
+      stack = tcc_realloc(stack, sizeof *stack * cap);
+    }
+    stack[sp].kind = 1;
+    stack[sp].value = wm;
+    sp++;
+    for (int ci = 0; ci < bb->num_dom_children; ci++) {
+      stack[sp].kind = 0;
+      stack[sp].value = bb->dom_children[ci];
+      sp++;
+    }
+  }
+
+  tcc_free(stack);
   return changes;
 }

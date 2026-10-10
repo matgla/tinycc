@@ -473,7 +473,7 @@ static void sv_jumpif_edges(IRSSAOptCtx *ctx, int jmp_idx, int *target_block, in
   TCCIRState *ir = ctx->ir;
   IRCFG *cfg = ctx->cfg;
   int n = cfg->num_instrs;
-  int target = (int)tcc_ir_op_get_dest(ir, &ir->compact_instructions[jmp_idx]).u.imm32;
+  int target = (int)tcc_ir_op_dest_u_imm32(ir, &ir->compact_instructions[jmp_idx]);
   int ft = ir_skip_nops_forward(ir, jmp_idx + 1, n);
   *target_block = (target >= 0 && target < n) ? cfg->instr_to_block[target] : -1;
   *ft_block = (ft < n) ? cfg->instr_to_block[ft] : -1;
@@ -765,6 +765,10 @@ static int sv_cmp_verdict(SVState *s, int cmp_idx, int tok, SVCmp *cmp, int32_t 
   cmp->xvr = -1;
   if (tok < 0)
     return -1;
+  /* Deciding the compare must not delete the reads it is made of: a volatile access is
+   * mandated however decidable the comparison is (`x >=u 0` still reads x). */
+  if (tcc_ir_instr_access_is_volatile(ir, &ir->compact_instructions[cmp_idx]))
+    return -1;
   /* A deref/sym x yields slot = -1 (the base vreg's range describes the wrong value), which
    * disables only the range fold; the tautology-vs-0 path below holds for any value. */
   if (sv_read_cmp(s, cmp_idx, cmp))
@@ -826,7 +830,7 @@ static int sv_try_fold_jumpif(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int jmp
 {
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *jq = &ir->compact_instructions[jmp_idx];
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, jq);
 
   SVCmp cmp;
   int32_t b_vr;
@@ -860,8 +864,9 @@ static int sv_try_fold_regreg(IRSSAOptCtx *ctx, int block, int cmp_idx, int jmp_
   if (sv_first_real(ir, bb->start_idx, bb->end_idx) != cmp_idx)
     return 0;
 
-  /* Only the pred's JUMPIF runs between the two CMPs — no store — so even lval operands hold
-   * identical values at both, provided the full operand identity (vreg + flags) matches. */
+  /* Only the pred's JUMPIF runs between the two CMPs — no store — so even non-volatile lval
+   * operands hold identical values at both, provided the full operand identity (vreg + flags)
+   * matches. */
   IRQuadCompact *cq = &ir->compact_instructions[cmp_idx];
   IROperand a_op = tcc_ir_op_get_src1(ir, cq), b_op = tcc_ir_op_get_src2(ir, cq);
   int32_t a = irop_get_vreg(a_op);
@@ -878,6 +883,11 @@ static int sv_try_fold_regreg(IRSSAOptCtx *ctx, int block, int cmp_idx, int jmp_
     return 0;
   IRQuadCompact *pcq = &ir->compact_instructions[pcmp];
   IROperand pa_op = tcc_ir_op_get_src1(ir, pcq), pb_op = tcc_ir_op_get_src2(ir, pcq);
+
+  /* Each volatile read is a separate mandated access, so the second CMP does not repeat the
+   * first one's value, and folding it would delete the second read. */
+  if (tcc_ir_instr_access_is_volatile(ir, cq) || tcc_ir_instr_access_is_volatile(ir, pcq))
+    return 0;
 
   int eff = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, &ir->compact_instructions[jmp_idx]));
   if (sv_same_operand(a_op, pa_op) && sv_same_operand(b_op, pb_op))
@@ -896,7 +906,7 @@ static int sv_try_fold_regreg(IRSSAOptCtx *ctx, int block, int cmp_idx, int jmp_
   if (block != ft_block || block == target_block)
     return 0;
 
-  int known = vrp_negate_cmp_tok((int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, pjq)));
+  int known = vrp_negate_cmp_tok((int)tcc_ir_op_src1_imm(ir, pjq));
   if (known < 0)
     return 0;
 
@@ -920,7 +930,7 @@ static int sv_try_fold_setif(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int set_
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *cq = &ir->compact_instructions[cmp_idx];
   IRQuadCompact *sq = &ir->compact_instructions[set_idx];
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, sq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, sq);
 
   SVCmp cmp;
   int32_t b_vr;
@@ -931,7 +941,7 @@ static int sv_try_fold_setif(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int set_
   IROperand set_dest = tcc_ir_op_get_dest(ir, sq);
   cq->op = TCCIR_OP_NOP;
   sq->op = TCCIR_OP_ASSIGN;
-  tcc_ir_set_src1(ir, set_idx, irop_make_imm32(-1, v, IROP_BTYPE_INT32));
+  tcc_ir_set_src1_imm32(ir, set_idx, v, IROP_BTYPE_INT32);
   tcc_ir_op_set_dest(ir, sq, set_dest);
 
   sv_drop_cmp_use(ctx, cmp.xvr, cmp_idx);
@@ -945,7 +955,7 @@ static int sv_try_fold_select(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int sel
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *cq = &ir->compact_instructions[cmp_idx];
   IRQuadCompact *sq = &ir->compact_instructions[sel_idx];
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_cond(ir, sq));
+  int tok = (int)tcc_ir_op_cond_imm(ir, sq);
 
   SVCmp cmp;
   int32_t b_vr;
@@ -953,8 +963,8 @@ static int sv_try_fold_select(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int sel
   if (v < 0 || sv_next_reads_flags(ir, sel_idx))
     return 0;
 
-  IROperand chosen = v ? tcc_ir_op_get_src1(ir, sq) : tcc_ir_op_get_src2(ir, sq);
-  IROperand dropped = v ? tcc_ir_op_get_src2(ir, sq) : tcc_ir_op_get_src1(ir, sq);
+  IROperand chosen = tcc_ir_op_get_src1_or_2(ir, sq, !v);
+  IROperand dropped = tcc_ir_op_get_src1_or_2(ir, sq, v);
   IROperand sel_dest = tcc_ir_op_get_dest(ir, sq);
   cq->op = TCCIR_OP_NOP;
   sq->op = TCCIR_OP_ASSIGN;
@@ -999,7 +1009,7 @@ static int sv_enter(IRSSAOptCtx *ctx, int block, void *state)
   SVCmp cmp;
   if (!sv_read_cmp(s, cmp_idx, &cmp) || !cmp.c_ok)
     return 0;
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, jq);
 
   /* A target past the last instruction is the function exit: this block is then unambiguously
    * the fall-through, which is what we refine on. */
@@ -1111,7 +1121,7 @@ static int sv_visit(IRSSAOptCtx *ctx, int block, void *state)
         if (op2 == TCCIR_OP_JUMPIF)
         {
           int fired = sv_try_fold_jumpif(ctx, s, i, j);
-          if (!fired && q->op == TCCIR_OP_CMP && !irop_is_immediate(tcc_ir_op_get_src2(ir, q)))
+          if (!fired && q->op == TCCIR_OP_CMP && !tcc_ir_op_src2_is_imm(ir, q))
             fired = sv_try_fold_regreg(ctx, block, i, j);
           changes += fired;
         }
@@ -1175,7 +1185,7 @@ int ssa_opt_vrp(IRSSAOptCtx *ctx)
         continue;
       if (q->op == TCCIR_OP_LEA)
       {
-        int32_t avr = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+        int32_t avr = tcc_ir_op_src1_vreg(ir, q);
         if (avr >= 0)
         {
           int at = TCCIR_DECODE_VREG_TYPE(avr), ap = TCCIR_DECODE_VREG_POSITION(avr);
@@ -1187,13 +1197,12 @@ int ssa_opt_vrp(IRSSAOptCtx *ctx)
       }
       if (!irop_config[q->op].has_dest)
         continue;
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(d);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       if (dvr < 0)
         continue;
       {
         int dt = TCCIR_DECODE_VREG_TYPE(dvr), dp = TCCIR_DECODE_VREG_POSITION(dvr);
-        if (pw && dt == TCCIR_VREG_TYPE_PARAM && dp >= 0 && dp < s.param_cap && !d.is_lval)
+        if (pw && dt == TCCIR_VREG_TYPE_PARAM && dp >= 0 && dp < s.param_cap && !tcc_ir_op_dest_is_lval(ir, q))
           pw[dp] = 1;
         if (vw && dt == TCCIR_VREG_TYPE_VAR && dp >= 0 && dp < s.var_cap && vw[dp] < 2)
           vw[dp]++;

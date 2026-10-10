@@ -11,9 +11,12 @@
 #pragma once
 
 struct IRSSAOptCtx;
+struct TCCIRState;
+
+/* Before CFG/SSA construction: expose repeated word reads hidden in CMP operands. */
+int ssa_opt_expose_cmp_loads(struct TCCIRState *ir);
 
 /* Global-load CSE + stack store-load forwarding on SSA-form IR: canonicalizes
  * addresses (LEA/stack-slot resolution) and folds redundant loads / forwards
  * dominating stores to their loads.  See ir/opt/ssa_opt.h for the driver. */
 int ssa_opt_load_cse(struct IRSSAOptCtx *ctx);
-

@@ -70,14 +70,12 @@ int tcc_ir_opt_stack_bool_diamond(TCCIRState *ir)
       continue;
 
     /* q_c's stored value must be an immediate. */
-    IROperand sb = tcc_ir_op_get_src1(ir, q2);
-    if (!irop_is_immediate(sb))
+    if (!tcc_ir_op_src1_is_imm(ir, q2))
       continue;
-    int64_t val_b = irop_get_imm64_ex(ir, sb);
+    int64_t val_b = tcc_ir_op_src1_imm(ir, q2);
 
     /* JUMPIF condition must be EQ or NE. */
-    IROperand q4_cond = tcc_ir_op_get_src1(ir, q4);
-    int cond_tok = (int)irop_get_imm64_ex(ir, q4_cond);
+    int cond_tok = (int)tcc_ir_op_src1_imm(ir, q4);
     if (cond_tok != 0x94 && cond_tok != 0x95)
       continue;
 
@@ -89,7 +87,7 @@ int tcc_ir_opt_stack_bool_diamond(TCCIRState *ir)
       IRQuadCompact *qj = &ir->compact_instructions[j];
       if (qj->op != TCCIR_OP_JUMP && qj->op != TCCIR_OP_JUMPIF)
         continue;
-      int tgt = (int)tcc_ir_op_get_dest(ir, qj).u.imm32;
+      int tgt = (int)tcc_ir_op_dest_u_imm32(ir, qj);
       if (tgt != merge)
         continue;
       if (j == extra_jmp)
@@ -122,10 +120,9 @@ int tcc_ir_opt_stack_bool_diamond(TCCIRState *ir)
     IROperand d0 = tcc_ir_op_get_dest(ir, q0);
     if (!stackoff_same_slot(d0, d2))
       continue;
-    IROperand sa = tcc_ir_op_get_src1(ir, q0);
-    if (!irop_is_immediate(sa))
+    if (!tcc_ir_op_src1_is_imm(ir, q0))
       continue;
-    int64_t val_a = irop_get_imm64_ex(ir, sa);
+    int64_t val_a = tcc_ir_op_src1_imm(ir, q0);
 
     /* Full scan: slot referenced only by q_a/q_c/q_d, and no stray jumps into the diamond. */
     int bail = 0;
@@ -169,7 +166,7 @@ int tcc_ir_opt_stack_bool_diamond(TCCIRState *ir)
 
       if (qj->op == TCCIR_OP_JUMP || qj->op == TCCIR_OP_JUMPIF)
       {
-        int tgt = (int)tcc_ir_op_get_dest(ir, qj).u.imm32;
+        int tgt = (int)tcc_ir_op_dest_u_imm32(ir, qj);
         if (j != q_b_idx && j != extra_jmp && tgt == merge)
         {
           bail = 1;
@@ -238,5 +235,3 @@ int tcc_ir_opt_stack_bool_diamond(TCCIRState *ir)
   LOG_IR_GEN("=== STACK BOOL DIAMOND END: %d fused ===", changes);
   return changes;
 }
-
-int tcc_ir_opt_stack_bool_diamond_ex(IROptCtx *ctx) { return tcc_ir_opt_stack_bool_diamond(ctx->ir); }

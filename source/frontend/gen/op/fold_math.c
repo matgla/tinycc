@@ -53,6 +53,19 @@ static Sym *find_local_scalar_sym_for_svalue(SValue *sv)
   return NULL;
 }
 
+/* The per-Sym objsize facts are a max over the assignments parsed so far,
+ * so they hold at a use only if no later-parsed assignment can execute
+ * before it: a use inside a loop body sees the next trip's back-edge values,
+ * and an address-taken local is written through aliases and callees that
+ * vstore never sees.  Const objects are exempt. */
+static int objsize_sym_fact_usable(const Sym *sym)
+{
+  /* A const-qualified object is only ever initialised, so its fact is exact. */
+  if (sym->type.t & VT_CONSTANT)
+    return 1;
+  return !sym->a.addrtaken && !loop_scope;
+}
+
 typedef struct ObjsizeVregFact
 {
   int vreg;
@@ -163,7 +176,7 @@ int svalue_get_conservative_max_u64(SValue *sv, unsigned long long *out_max)
   {
     Sym *sym = find_local_scalar_sym_for_svalue(sv);
 
-    if (sym && SYM_FACTS(sym)->objsize_max_valid)
+    if (sym && objsize_sym_fact_usable(sym) && SYM_FACTS(sym)->objsize_max_valid)
     {
       *out_max = SYM_FACTS(sym)->objsize_max_value;
       return 1;
@@ -190,7 +203,7 @@ int svalue_get_conservative_string_bytes_u64(SValue *sv, unsigned long long *out
   {
     Sym *sym = find_local_scalar_sym_for_svalue(sv);
 
-    if (sym && SYM_FACTS(sym)->objsize_strlen_valid)
+    if (sym && objsize_sym_fact_usable(sym) && SYM_FACTS(sym)->objsize_strlen_valid)
     {
       *out_max = SYM_FACTS(sym)->objsize_strlen_value;
       return 1;
@@ -247,7 +260,7 @@ void update_local_scalar_max_bound(SValue *dst, SValue *src)
   have_max = svalue_get_conservative_max_u64(src, &max_value);
   have_strlen = svalue_get_conservative_string_bytes_u64(src, &max_strlen);
   /* Nothing known and nothing recorded: clearing would only allocate zeroes. */
-  if (!have_max && !have_strlen && !sym->facts)
+  if (!have_max && !have_strlen && !sym_facts_peek(sym))
     return;
   f = sym_facts(sym);
 
@@ -289,75 +302,121 @@ typedef enum
   FOLD_TYPE_LONG_DOUBLE
 } FoldType;
 
+/* Foldable math functions: name, argument count, precision (D double, F
+ * float; the result has the argument type).  An X-macro so the table below
+ * can stay pointer-free -- a table of names and function pointers needs
+ * load-time relocation and so on YasOS sat in every compiler process's RAM --
+ * while fold_math_fn() still calls each function through its address (never
+ * an inlined builtin, so the folded value is exactly what the library
+ * returns, as before). */
+#define FOLD_MATH_FUNCS(X) \
+  X(sin, 1, D) \
+  X(cos, 1, D) \
+  X(tan, 1, D) \
+  X(asin, 1, D) \
+  X(acos, 1, D) \
+  X(atan, 1, D) \
+  X(atan2, 2, D) \
+  X(sinh, 1, D) \
+  X(cosh, 1, D) \
+  X(tanh, 1, D) \
+  X(exp, 1, D) \
+  X(log, 1, D) \
+  X(log10, 1, D) \
+  X(pow, 2, D) \
+  X(sqrt, 1, D) \
+  X(cbrt, 1, D) \
+  X(ceil, 1, D) \
+  X(floor, 1, D) \
+  X(round, 1, D) \
+  X(trunc, 1, D) \
+  X(fabs, 1, D) \
+  X(fmod, 2, D) \
+  X(remainder, 2, D) \
+  X(copysign, 2, D) \
+  X(sinf, 1, F) \
+  X(cosf, 1, F) \
+  X(tanf, 1, F) \
+  X(asinf, 1, F) \
+  X(acosf, 1, F) \
+  X(atanf, 1, F) \
+  X(atan2f, 2, F) \
+  X(sinhf, 1, F) \
+  X(coshf, 1, F) \
+  X(tanhf, 1, F) \
+  X(expf, 1, F) \
+  X(logf, 1, F) \
+  X(log10f, 1, F) \
+  X(powf, 2, F) \
+  X(sqrtf, 1, F) \
+  X(cbrtf, 1, F) \
+  X(ceilf, 1, F) \
+  X(floorf, 1, F) \
+  X(roundf, 1, F) \
+  X(truncf, 1, F) \
+  X(fabsf, 1, F) \
+  X(fmodf, 2, F) \
+  X(remainderf, 2, F) \
+  X(copysignf, 2, F)
+
 typedef struct
 {
-  const char *name;  /* Function name (e.g., "sin") */
-  int num_args;      /* Number of arguments (1 or 2) */
-  FoldType arg_type; /* Type of arguments */
-  FoldType ret_type; /* Type of return value */
-  union
-  {
-    double (*f1_d)(double);         /* Single-argument double function */
-    double (*f2_d)(double, double); /* Two-argument double function */
-    float (*f1_f)(float);           /* Single-argument float function */
-    float (*f2_f)(float, float);    /* Two-argument float function */
-  } func;
+  char name[11];          /* Function name (e.g., "sin") */
+  unsigned char num_args; /* Number of arguments (1 or 2) */
+  unsigned char arg_type; /* FoldType of arguments and of the return value */
 } FoldableMathFunc;
 
 /* Table of foldable math functions */
 static const FoldableMathFunc foldable_math_funcs[] = {
-    /* Double-precision functions */
-    {"sin", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = sin}},
-    {"cos", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = cos}},
-    {"tan", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = tan}},
-    {"asin", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = asin}},
-    {"acos", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = acos}},
-    {"atan", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = atan}},
-    {"atan2", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = atan2}},
-    {"sinh", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = sinh}},
-    {"cosh", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = cosh}},
-    {"tanh", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = tanh}},
-    {"exp", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = exp}},
-    {"log", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = log}},
-    {"log10", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = log10}},
-    {"pow", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = pow}},
-    {"sqrt", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = sqrt}},
-    {"cbrt", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = cbrt}},
-    {"ceil", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = ceil}},
-    {"floor", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = floor}},
-    {"round", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = round}},
-    {"trunc", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = trunc}},
-    {"fabs", 1, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f1_d = fabs}},
-    {"fmod", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = fmod}},
-    {"remainder", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = remainder}},
-    {"copysign", 2, FOLD_TYPE_DOUBLE, FOLD_TYPE_DOUBLE, {.f2_d = copysign}},
-
-    /* Single-precision functions */
-    {"sinf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = sinf}},
-    {"cosf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = cosf}},
-    {"tanf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = tanf}},
-    {"asinf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = asinf}},
-    {"acosf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = acosf}},
-    {"atanf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = atanf}},
-    {"atan2f", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = atan2f}},
-    {"sinhf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = sinhf}},
-    {"coshf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = coshf}},
-    {"tanhf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = tanhf}},
-    {"expf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = expf}},
-    {"logf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = logf}},
-    {"log10f", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = log10f}},
-    {"powf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = powf}},
-    {"sqrtf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = sqrtf}},
-    {"cbrtf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = cbrtf}},
-    {"ceilf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = ceilf}},
-    {"floorf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = floorf}},
-    {"roundf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = roundf}},
-    {"truncf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = truncf}},
-    {"fabsf", 1, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f1_f = fabsf}},
-    {"fmodf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = fmodf}},
-    {"remainderf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = remainderf}},
-    {"copysignf", 2, FOLD_TYPE_FLOAT, FOLD_TYPE_FLOAT, {.f2_f = copysignf}},
+#define FM_TYPE_D FOLD_TYPE_DOUBLE
+#define FM_TYPE_F FOLD_TYPE_FLOAT
+#define X(fn, n, t) {#fn, n, FM_TYPE_##t},
+    FOLD_MATH_FUNCS(X)
+#undef X
+#undef FM_TYPE_D
+#undef FM_TYPE_F
 };
+
+typedef union
+{
+  double (*f1_d)(double);         /* Single-argument double function */
+  double (*f2_d)(double, double); /* Two-argument double function */
+  float (*f1_f)(float);           /* Single-argument float function */
+  float (*f2_f)(float, float);    /* Two-argument float function */
+} FoldableMathFn;
+
+/* The function of foldable_math_funcs[i]. */
+static FoldableMathFn fold_math_fn(int i)
+{
+  FoldableMathFn fn;
+  enum
+  {
+#define X(f, n, t) FM_##f,
+    FOLD_MATH_FUNCS(X)
+#undef X
+  };
+  fn.f1_d = NULL;
+  switch (i)
+  {
+#define FM_SET_1D(f) fn.f1_d = f
+#define FM_SET_2D(f) fn.f2_d = f
+#define FM_SET_1F(f) fn.f1_f = f
+#define FM_SET_2F(f) fn.f2_f = f
+#define FM_SET(f, n, t) FM_SET_##n##t(f)
+#define X(f, n, t)                                                                                                     \
+  case FM_##f:                                                                                                         \
+    FM_SET(f, n, t);                                                                                                   \
+    break;
+    FOLD_MATH_FUNCS(X)
+#undef X
+#undef FM_SET
+#undef FM_SET_1D
+#undef FM_SET_2D
+#undef FM_SET_1F
+#undef FM_SET_2F
+  }
+  return fn;
+}
 
 #define NUM_FOLDABLE_MATH_FUNCS (sizeof(foldable_math_funcs) / sizeof(foldable_math_funcs[0]))
 
@@ -488,6 +547,7 @@ int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
 
   if (!fmf)
     return 0;
+  FoldableMathFn func = fold_math_fn(i);
 
   /* Check argument count */
   if (nb_args != fmf->num_args)
@@ -509,22 +569,22 @@ int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
     if (fmf->num_args == 1)
     {
       double arg = get_const_double(&args[0]);
-      double res = fmf->func.f1_d(arg);
+      double res = func.f1_d(arg);
 
-      if (fmf->ret_type == FOLD_TYPE_DOUBLE)
+      if (fmf->arg_type == FOLD_TYPE_DOUBLE)
         result.d = res;
-      else if (fmf->ret_type == FOLD_TYPE_FLOAT)
+      else if (fmf->arg_type == FOLD_TYPE_FLOAT)
         result.f = (float)res;
     }
     else
     {
       double arg1 = get_const_double(&args[0]);
       double arg2 = get_const_double(&args[1]);
-      double res = fmf->func.f2_d(arg1, arg2);
+      double res = func.f2_d(arg1, arg2);
 
-      if (fmf->ret_type == FOLD_TYPE_DOUBLE)
+      if (fmf->arg_type == FOLD_TYPE_DOUBLE)
         result.d = res;
-      else if (fmf->ret_type == FOLD_TYPE_FLOAT)
+      else if (fmf->arg_type == FOLD_TYPE_FLOAT)
         result.f = (float)res;
     }
   }
@@ -533,14 +593,14 @@ int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
     if (fmf->num_args == 1)
     {
       float arg = get_const_float(&args[0]);
-      float res = fmf->func.f1_f(arg);
+      float res = func.f1_f(arg);
       result.f = res;
     }
     else
     {
       float arg1 = get_const_float(&args[0]);
       float arg2 = get_const_float(&args[1]);
-      float res = fmf->func.f2_f(arg1, arg2);
+      float res = func.f2_f(arg1, arg2);
       result.f = res;
     }
   }
@@ -549,15 +609,15 @@ int try_fold_math_call(const char *func_name, SValue *args, int nb_args)
   CType result_type;
   result_type.ref = NULL;
 
-  if (fmf->ret_type == FOLD_TYPE_DOUBLE)
+  if (fmf->arg_type == FOLD_TYPE_DOUBLE)
     result_type.t = VT_DOUBLE;
-  else if (fmf->ret_type == FOLD_TYPE_FLOAT)
+  else if (fmf->arg_type == FOLD_TYPE_FLOAT)
     result_type.t = VT_FLOAT;
   else
     result_type.t = VT_LDOUBLE;
 
   /* For C standard compliance: only fold finite results */
-  double res_d = (fmf->ret_type == FOLD_TYPE_DOUBLE) ? result.d : (double)result.f;
+  double res_d = (fmf->arg_type == FOLD_TYPE_DOUBLE) ? result.d : (double)result.f;
   if (!ieee_finite(res_d))
     return 0;
 

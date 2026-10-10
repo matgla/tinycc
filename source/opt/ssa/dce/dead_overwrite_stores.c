@@ -103,7 +103,7 @@ static int sl_resolve_load_offset(IRSSAOptCtx *ctx, int instr_idx,
       *out_unknown = 1;
       return 0;
     }
-    int w = sl_store_byte_width(irop_get_btype(tcc_ir_op_get_dest(ir, q)));
+    int w = sl_store_byte_width(tcc_ir_op_dest_btype(ir, q));
     if (w == 0) {
       *out_unknown = 1;
       return 0;
@@ -136,7 +136,7 @@ static int sl_resolve_load_offset(IRSSAOptCtx *ctx, int instr_idx,
     if (sv >= 0 && TCCIR_DECODE_VREG_TYPE(sv) == TCCIR_VREG_TYPE_TEMP) {
       int eff = ssa_opt_resolve_lea_stackloc(ctx, sv);
       if (eff != INT_MIN) {
-        int w = sl_store_byte_width(irop_get_btype(tcc_ir_op_get_dest(ir, q)));
+        int w = sl_store_byte_width(tcc_ir_op_dest_btype(ir, q));
         if (w == 0) {
           *out_unknown = 1;
           return 0;
@@ -186,6 +186,17 @@ int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
         continue;
       }
 
+      /* Deny by default: every other op with a hazard of its own (inline asm and its
+       * ASM_INPUT/ASM_OUTPUT markers, __builtin_apply, setjmp/longjmp, VLA, chain and
+       * call-sequence ops) may read a slot through an address it was handed or stored
+       * earlier.  Only the load/store forms modelled below are exempt. */
+      if (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED && q->op != TCCIR_OP_LOAD &&
+          q->op != TCCIR_OP_LOAD_INDEXED && q->op != TCCIR_OP_LOAD_POSTINC &&
+          ir_op_has(q->op, IR_HZ_FROM_OP & ~(IR_HZ_MEM_READ | IR_HZ_MEM_WRITE | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ))) {
+        npending = 0;
+        continue;
+      }
+
       /* Any is_lval source is a memory read; an unresolvable one may alias any store. */
       int saw_unresolved_deref = 0;
       for (int side = 0; side < 2; side++) {
@@ -193,7 +204,7 @@ int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
           continue;
         if (side == 1 && !irop_config[q->op].has_src2)
           continue;
-        IROperand s = side ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
+        IROperand s = tcc_ir_op_get_src1_or_2(ir, q, side);
         if (!s.is_lval)
           continue;
         int eff = INT_MIN;
@@ -298,7 +309,14 @@ int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
         if (side == 1 && !irop_config[q->op].has_src2)
           continue;
         IROperand s = side ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
-        if (s.is_lval || s.tag != IROP_TAG_VREG)
+        if (s.is_lval)
+          continue;
+        /* A direct frame address (`Addr[StackLoc[N]]`) handed to a memory reader. */
+        if (s.tag == IROP_TAG_STACKOFF && ir_op_has(q->op, IR_HZ_MEM_READ)) {
+          npending = 0;
+          break;
+        }
+        if (s.tag != IROP_TAG_VREG)
           continue;
         int32_t sv = irop_get_vreg(s);
         if (sv < 0 || TCCIR_DECODE_VREG_TYPE(sv) != TCCIR_VREG_TYPE_TEMP)
@@ -306,7 +324,12 @@ int dce_dead_overwrite_stores(IRSSAOptCtx *ctx)
         int eff = ssa_opt_resolve_lea_stackloc(ctx, sv);
         if (eff == INT_MIN)
           continue;
-        /* Access size is unknown, so evict everything within a conservative window. */
+        /* Access size is unknown: a memory reader (BLOCK_COPY) may span the whole frame. */
+        if (ir_op_has(q->op, IR_HZ_MEM_READ)) {
+          npending = 0;
+          break;
+        }
+        /* Otherwise it is address arithmetic: evict everything within a conservative window. */
         for (int k = 0; k < npending;) {
           int po = pending[k].off, pw = pending[k].width;
           if (po + pw > eff && po < eff + 256)

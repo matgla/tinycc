@@ -15,6 +15,7 @@
 #include "opt_engine.h"
 #include "opt_utils.h"
 #include "opt_du.h"
+#include "opt_range.h"
 
 static int ir_opt_vreg_use_count(TCCIRState *ir, int32_t vreg)
 {
@@ -27,8 +28,8 @@ static int ir_opt_vreg_use_count(TCCIRState *ir, int32_t vreg)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if (irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg ||
-        irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vreg ||
+    if (tcc_ir_op_src1_vreg(ir, q) == vreg ||
+        tcc_ir_op_src2_vreg(ir, q) == vreg ||
         ir_opt_mla_accum_vreg(ir, q) == vreg)
       count++;
   }
@@ -112,27 +113,22 @@ static IRQuadCompact *cef_flag_consumer(TCCIRState *ir, int cmp_idx)
 static int cef_memory_stable_between(TCCIRState *ir, int from, int to, IROperand moved)
 {
   int32_t moved_vr = irop_get_vreg(moved);
+  if (to < from)
+    return 1; /* IR_LEGACY_GAP: an inverted range counts as stable */
+  /* A destination naming memory (lvalue or STACKOFF) mutates it like a STORE. */
+  if (!ir_range_safe_except(ir, from, to,
+                            IR_HZ_ALL & ~(IR_HZ_MEM_READ | IR_HZ_SRC_LVAL | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ |
+                                          IR_HZ_CALL_PARAM | IR_HZ_CALL_SEQ | IR_HZ_UPDATES_SRC | IR_HZ_HINT |
+                                          IR_LEGACY_GAP_HZ(IR_HZ_RETURN | IR_HZ_NONLOCAL | IR_HZ_CHAIN | IR_HZ_TRAP |
+                                                           IR_HZ_VOLATILE | IR_HZ_JOIN_END)),
+                            IR_LEGACY_GAP_OPS(TCCIR_OP_SWITCH_TABLE, TCCIR_OP_ASM_INPUT, TCCIR_OP_ASM_OUTPUT,
+                                              TCCIR_OP_VLA_SP_SAVE, TCCIR_OP_VLA_SP_RESTORE, TCCIR_OP_CALLARG_STACK,
+                                              TCCIR_OP_INIT_CHAIN_SLOT)))
+    return 0;
   for (int k = from + 1; k < to; k++)
   {
     IRQuadCompact *kq = &ir->compact_instructions[k];
-    TccIrOp kop = kq->op;
-    if (kop == TCCIR_OP_NOP)
-      continue;
-    if (kq->is_jump_target)
-      return 0;
-    if (kop == TCCIR_OP_STORE || kop == TCCIR_OP_STORE_INDEXED ||
-        kop == TCCIR_OP_STORE_POSTINC || kop == TCCIR_OP_BLOCK_COPY ||
-        kop == TCCIR_OP_INLINE_ASM || kop == TCCIR_OP_VLA_ALLOC ||
-        kop == TCCIR_OP_FUNCCALLVOID || kop == TCCIR_OP_FUNCCALLVAL ||
-        kop == TCCIR_OP_JUMP || kop == TCCIR_OP_JUMPIF || kop == TCCIR_OP_IJUMP)
-      return 0;
-    if (!irop_config[kop].has_dest)
-      continue;
-    IROperand kd = tcc_ir_op_get_dest(ir, kq);
-    /* A destination naming memory mutates it like a STORE. */
-    if (kd.is_lval || irop_get_tag(kd) == IROP_TAG_STACKOFF)
-      return 0;
-    if (moved_vr >= 0 && irop_get_vreg(kd) == moved_vr)
+    if (moved_vr >= 0 && irop_config[kq->op].has_dest && tcc_ir_op_dest_vreg(ir, kq) == moved_vr)
       return 0;
   }
   return 1;
@@ -219,7 +215,7 @@ static int cef_xor_cancel(TCCIRState *ir, const uint8_t *dc, int dc_stride)
         continue;
 
       tcc_ir_set_src1(ir, i, keep);
-      tcc_ir_set_src2(ir, i, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
+      tcc_ir_set_src2_imm32(ir, i, 0, IROP_BTYPE_INT32);
       changes++;
       LOG_IR_GEN("OPTIMIZE: (x^y) cmp y -> x cmp 0 at i=%d", i);
       break;
@@ -248,7 +244,26 @@ int tcc_ir_opt_cmp_xor_cancel(TCCIRState *ir)
   return changes;
 }
 
-int tcc_ir_opt_cmp_xor_cancel_ex(IROptCtx *ctx) { return tcc_ir_opt_cmp_xor_cancel(ctx->ir); }
+
+/* Pre-SSA: naming a vreg does not mean naming one value.  True only when `vr`
+ * has exactly one definition in this function and that definition precedes
+ * `before`, so every read at or after `before` sees the same value.  A PARAM
+ * carries an implicit entry definition (the caller's argument), which is its only
+ * one when nothing in the body assigns it. */
+static int cef_single_def_reaches(TCCIRState *ir, const uint8_t *dc, int dc_stride,
+                                  int32_t vr, int before)
+{
+  if (vr < 0 || before <= 0)
+    return 0;
+  int typ = TCCIR_DECODE_VREG_TYPE(vr);
+  int pos = TCCIR_DECODE_VREG_POSITION(vr);
+  int cnt = (pos < dc_stride) ? dc[typ * dc_stride + pos] : 0;
+  if (typ == TCCIR_VREG_TYPE_PARAM)
+    return cnt == 0;
+  if (cnt != 1)
+    return 0;
+  return tcc_ir_find_defining_instruction(ir, vr, before) >= 0;
+}
 
 int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
 {
@@ -400,7 +415,10 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
       }
     }
 
-    if (!is_equal)
+    /* The fallback below reads the textually-nearest definitions of vr1/vr2, so
+     * it needs them to be the reaching ones. */
+    if (!is_equal && DC_IS_SINGLE_DEF(dc, dc_stride, vr1) &&
+        DC_IS_SINGLE_DEF(dc, dc_stride, vr2))
     {
       IRQuadCompact *dq1 = &ir->compact_instructions[def1];
       IRQuadCompact *dq2 = &ir->compact_instructions[def2];
@@ -419,8 +437,11 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
           /* Base is_lval must match: *(V) and V differ. */
           if (base1.is_lval == base2.is_lval && bvr1 >= 0 && bvr2 >= 0)
           {
+            /* Same base vreg only proves same value if the base was not
+             * redefined between the two additions. */
             if (bvr1 == bvr2)
-              is_equal = 1;
+              is_equal = cef_single_def_reaches(ir, dc, dc_stride, bvr1,
+                                                def1 < def2 ? def1 : def2);
             if (!is_equal)
             {
               int bd1 = tcc_ir_find_defining_instruction(ir, bvr1, def1);
@@ -436,7 +457,14 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
                   IROperand bs2 = tcc_ir_op_get_src1(ir, bdq2);
                   int32_t bsvr1 = irop_get_vreg(bs1);
                   int32_t bsvr2 = irop_get_vreg(bs2);
-                  if (bsvr1 >= 0 && bsvr1 == bsvr2)
+                  /* Both bases are copies of one source vreg: each base must
+                   * reach its own copy, and the shared source must still hold
+                   * one value at the two copies. */
+                  if (bsvr1 >= 0 && bsvr1 == bsvr2 &&
+                      cef_single_def_reaches(ir, dc, dc_stride, bvr1, def1) &&
+                      cef_single_def_reaches(ir, dc, dc_stride, bvr2, def2) &&
+                      cef_single_def_reaches(ir, dc, dc_stride, bsvr1,
+                                             bd1 < bd2 ? bd1 : bd2))
                     is_equal = 1;
                   if (!is_equal && bsvr1 < 0 && bsvr2 < 0)
                     is_equal = ir_opt_nonvreg_expr_equal(ir, bs1, bs2);
@@ -446,7 +474,8 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
                     IROperand const_side = (bsvr1 >= 0) ? bs2 : bs1;
                     int vreg_def_at = (bsvr1 >= 0) ? bd1 : bd2;
                     int vdef = tcc_ir_find_defining_instruction(ir, vreg_side, vreg_def_at);
-                    if (vdef >= 0)
+                    if (vdef >= 0 &&
+                        cef_single_def_reaches(ir, dc, dc_stride, vreg_side, vreg_def_at))
                     {
                       IRQuadCompact *vdq = &ir->compact_instructions[vdef];
                       if (vdq->op == TCCIR_OP_ASSIGN)
@@ -472,8 +501,7 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
     int folded = 0;
     if (next->op == TCCIR_OP_JUMPIF)
     {
-      IROperand cond = tcc_ir_op_get_src1(ir, next);
-      int tok = (int)irop_get_imm64_ex(ir, cond);
+      int tok = (int)tcc_ir_op_src1_imm(ir, next);
       int result = evaluate_compare_condition(0, 0, tok);
       if (result < 0)
         continue;
@@ -504,14 +532,13 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
       q->op = TCCIR_OP_NOP;
       next->op = TCCIR_OP_ASSIGN;
       tcc_ir_set_src1(ir, i + 1, chosen);
-      tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+      tcc_ir_set_src2_none(ir, i + 1);
       changes++;
       folded = 1;
     }
     else if (next->op == TCCIR_OP_SETIF)
     {
-      IROperand cond = tcc_ir_op_get_src1(ir, next);
-      int tok = (int)irop_get_imm64_ex(ir, cond);
+      int tok = (int)tcc_ir_op_src1_imm(ir, next);
       int result = evaluate_compare_condition(0, 0, tok);
       if (result < 0)
         continue;
@@ -519,8 +546,8 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
       q->op = TCCIR_OP_NOP;
       next->op = TCCIR_OP_ASSIGN;
       tcc_ir_set_dest(ir, i + 1, setif_dest);
-      tcc_ir_set_src1(ir, i + 1, irop_make_imm32(-1, result, irop_get_btype(setif_dest)));
-      tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+      tcc_ir_set_src1_imm32(ir, i + 1, result, irop_get_btype(setif_dest));
+      tcc_ir_set_src2_none(ir, i + 1);
       changes++;
       folded = 1;
     }
@@ -536,4 +563,3 @@ int tcc_ir_opt_cmp_expr_fold(TCCIRState *ir)
 
   return changes;
 }
-int tcc_ir_opt_cmp_expr_fold_ex(IROptCtx *ctx) { return tcc_ir_opt_cmp_expr_fold(ctx->ir); }

@@ -1,7 +1,7 @@
 /*
  *  test_opt_pipeline_orchestration.c - suite for ir/opt_pipeline.c's
  *  orchestration machinery itself (tcc_ir_opt_run_group / run_pipeline /
- *  get_pipeline / run_default / gen_pass_adapter), as opposed to the
+ *  the named groups / run_gens), as opposed to the
  *  individual optimizer passes it drives (already covered per-pass by
  *  test_opt_*.c -- see docs/plan_ut_next_steps.md, 89/89 registered passes)
  *  or the gens_*_ex adapter wrappers already exercised by test_opt_fusion.c.
@@ -33,13 +33,8 @@
 
 /* Pipeline orchestration entry points (ir/opt_pipeline.c) are already
  * declared by opt_pipeline.h, included above: tcc_ir_opt_run_group,
- * tcc_ir_opt_run_pipeline, tcc_ir_opt_get_pipeline, tcc_ir_opt_run_default,
- * tcc_ir_opt_gen_pass_adapter, tcc_ir_opt_gens_call_result_ex,
+ * tcc_ir_opt_run_pipeline, the named groups, tcc_ir_opt_gens_call_result_ex,
  * tcc_ir_opt_gens_branch_ex. */
-
-/* Legacy pass entry used only in a doc comment cross-reference below
- * (tcc_ir_opt_run_default's O0 pipeline calls this internally via its
- * dce_ex wrapper -- not called directly by this suite). */
 
 #define I32 IROP_BTYPE_INT32
 #define TOK_EQ 0x94 /* == */
@@ -71,17 +66,12 @@ static IROperand utb_templocal(int32_t vreg, int32_t off, int is_lval, int btype
   return irop_make_stackoff(vreg, off, is_lval, /*is_llocal*/ 0, /*is_param*/ 0, btype);
 }
 
-/* Run a gens table via the generic tcc_ir_opt_gen_pass_adapter, mirroring
- * how a PASS_GATED entry using tcc_ir_opt_gen_pass_adapter with an
- * IROptGenPassData* would be invoked (the adapter itself is a one-line
- * `return tcc_ir_opt_run_gens(ctx, data->gens, data->count);`, currently
- * 0%-covered since every real pass instead uses a per-table _ex wrapper). */
-static int run_gen_pass_adapter(TCCIRState *ir, const IROptGen *gens, int count)
+/* Runs a gens table through tcc_ir_opt_run_gens with a fresh ctx. */
+static int run_gen_table(TCCIRState *ir, const IROptGen *gens, int count)
 {
   IROptCtx ctx;
   tcc_ir_opt_ctx_init(&ctx, ir);
-  IROptGenPassData data = { gens, count };
-  int changes = tcc_ir_opt_gen_pass_adapter(&ctx, &data);
+  int changes = tcc_ir_opt_run_gens(&ctx, gens, count);
   tcc_ir_opt_ctx_free(&ctx);
   return changes;
 }
@@ -174,8 +164,8 @@ UT_TEST(test_run_group_trigger_nonzero_runs_remaining_passes)
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
   IROptPass passes[] = {
-    { "trigger", fake_trigger, 0, 0, 0 },
-    { "b",       fake_pass_b,  0, 0, 0 },
+    { "trigger", { fake_trigger }, 0, 0 },
+    { "b",       { fake_pass_b },  0, 0 },
   };
   IRPassGroup group = { "grp", passes, 2, /*max_iterations*/ 1, /*compact_after*/ 0, /*trigger_idx*/ 0 };
 
@@ -203,8 +193,8 @@ UT_TEST(test_run_group_trigger_zero_skips_remaining_passes)
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
   IROptPass passes[] = {
-    { "trigger", fake_trigger,     0, 0, 0 },
-    { "never",   fake_pass_never,  0, 0, 0 },
+    { "trigger", { fake_trigger },     0, 0 },
+    { "never",   { fake_pass_never },  0, 0 },
   };
   IRPassGroup group = { "grp", passes, 2, /*max_iterations*/ 3, 0, /*trigger_idx*/ 0 };
 
@@ -234,7 +224,7 @@ UT_TEST(test_run_group_flag_gate_zero_skips_pass)
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
   IROptPass passes[] = {
-    { "gated_b", fake_pass_b, 0, 0, (uint16_t)offsetof(TCCState, opt_dce) },
+    { "gated_b", { fake_pass_b }, 0, (uint16_t)offsetof(TCCState, opt_dce) },
   };
   IRPassGroup group = { "grp", passes, 1, 1, 0, -1 };
 
@@ -259,7 +249,7 @@ UT_TEST(test_run_group_flag_gate_nonzero_runs_pass)
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
   IROptPass passes[] = {
-    { "gated_b", fake_pass_b, 0, 0, (uint16_t)offsetof(TCCState, opt_dce) },
+    { "gated_b", { fake_pass_b }, 0, (uint16_t)offsetof(TCCState, opt_dce) },
   };
   IRPassGroup group = { "grp", passes, 1, 1, 0, -1 };
 
@@ -286,8 +276,8 @@ UT_TEST(test_run_group_gated_trigger_zero_breaks_before_running)
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
   IROptPass passes[] = {
-    { "trigger", fake_trigger, 0, 0, (uint16_t)offsetof(TCCState, opt_const_prop) },
-    { "never",   fake_pass_never, 0, 0, 0 },
+    { "trigger", { fake_trigger }, 0, (uint16_t)offsetof(TCCState, opt_const_prop) },
+    { "never",   { fake_pass_never }, 0, 0 },
   };
   IRPassGroup group = { "grp", passes, 2, 5, 0, 0 };
 
@@ -316,7 +306,7 @@ UT_TEST(test_run_group_converges_before_max_iterations)
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
   IROptPass passes[] = {
-    { "a", fake_pass_a, 0, 0, 0 },
+    { "a", { fake_pass_a }, 0, 0 },
   };
   IRPassGroup group = { "grp", passes, 1, /*max_iterations*/ 5, 0, -1 };
 
@@ -350,7 +340,7 @@ UT_TEST(test_run_group_stops_at_max_iterations_when_never_converging)
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
   IROptPass passes[] = {
-    { "a", fake_pass_always_changes, 0, 0, 0 },
+    { "a", { fake_pass_always_changes }, 0, 0 },
   };
   IRPassGroup group = { "grp", passes, 1, /*max_iterations*/ 4, 0, -1 };
 
@@ -385,8 +375,8 @@ UT_TEST(test_run_group_trigger_present_ignores_zero_round_changes_shortcut)
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
   IROptPass passes[] = {
-    { "trigger", fake_trigger, 0, 0, 0 },
-    { "b",       fake_pass_b,  0, 0, 0 }, /* always 0 changes */
+    { "trigger", { fake_trigger }, 0, 0 },
+    { "b",       { fake_pass_b },  0, 0 }, /* always 0 changes */
   };
   IRPassGroup group = { "grp", passes, 2, /*max_iterations*/ 3, 0, 0 };
 
@@ -417,8 +407,8 @@ UT_TEST(test_run_group_compact_after_shrinks_instruction_count)
   int before_n = ir->next_instruction_index;
 
   IROptPass passes[] = {
-    { "b", fake_pass_b_nops_first_instr, 0, 0, 0 },
-    { "a", fake_pass_a,                  0, 0, 0 }, /* records ctx->ir->next_instruction_index it observes */
+    { "b", { fake_pass_b_nops_first_instr }, 0, 0 },
+    { "a", { fake_pass_a },                  0, 0 }, /* records ctx->ir->next_instruction_index it observes */
   };
   IRPassGroup group = { "grp", passes, 2, /*max_iterations*/ 3, /*compact_after*/ 1, -1 };
 
@@ -450,7 +440,7 @@ UT_TEST(test_run_group_compact_after_skipped_when_no_changes)
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
   IROptPass passes[] = {
-    { "b", fake_pass_b, 0, 0, 0 }, /* always reports 0 changes, never touches the IR */
+    { "b", { fake_pass_b }, 0, 0 }, /* always reports 0 changes, never touches the IR */
   };
   IRPassGroup group = { "grp", passes, 1, 2, /*compact_after*/ 1, -1 };
 
@@ -488,7 +478,7 @@ UT_TEST(test_run_group_requires_du_builds_before_pass_runs)
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(0, I32), UTB_NONE);
 
   IROptPass passes[] = {
-    { "du_check", fake_pass_checks_du, IR_PASS_REQUIRES_DU, 0, 0 },
+    { "du_check", { fake_pass_checks_du }, IR_PASS_REQUIRES_DU, 0 },
   };
   IRPassGroup group = { "grp", passes, 1, 1, 0, -1 };
 
@@ -524,8 +514,8 @@ UT_TEST(test_run_pipeline_runs_groups_in_order_and_sums_changes)
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(1, I32), UTB_NONE); /* [0] */
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);    /* [1] */
 
-  IROptPass passes1[] = { { "a", fake_pass_a, 0, 0, 0 } };            /* 1,1,0 -> 2 changes, 3 calls */
-  IROptPass passes2[] = { { "b_nop", fake_pass_b_nops_first_instr, 0, 0, 0 } }; /* 1 change (NOPs instr 0) */
+  IROptPass passes1[] = { { "a", { fake_pass_a }, 0, 0 } };            /* 1,1,0 -> 2 changes, 3 calls */
+  IROptPass passes2[] = { { "b_nop", { fake_pass_b_nops_first_instr }, 0, 0 } }; /* 1 change (NOPs instr 0) */
   IRPassGroup groups[] = {
     { "g1", passes1, 1, 5, 0, -1 },
     { "g2", passes2, 1, 1, /*compact_after*/ 1, -1 },
@@ -558,83 +548,38 @@ UT_TEST(test_run_pipeline_zero_groups_is_noop)
   return 0;
 }
 
-/* ================================================================== get_pipeline / run_default */
+/* ================================================================== named groups */
 
-/* POSITIVE: tcc_ir_opt_get_pipeline reports the documented (group-table,
- * count) pair per level -- oracle asserts on the exact group names/counts
- * rather than just "non-NULL", since those names/counts are exactly what
- * the O0/O1/O2/Os preset tables promise (ir/opt_pipeline.c:521-548). */
-UT_TEST(test_get_pipeline_level_0_is_single_cleanup_group)
+/* The named groups carry the iteration/compact/trigger shape the callers in
+ * function_pipeline.c and regalloc_entry.c rely on. */
+UT_TEST(test_named_groups_shape)
 {
-  const IRPassGroup *groups;
-  int count;
-  tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_0, &groups, &count);
-  UT_ASSERT_EQ(count, 1);
-  UT_ASSERT_STREQ(groups[0].name, "cleanup");
-  UT_ASSERT_EQ(groups[0].count, 1); /* o0_passes[] has exactly one entry: dce */
+  UT_ASSERT_STREQ(propagation_group.name, "propagation");
+  UT_ASSERT_EQ(propagation_group.max_iterations, 10);
+  UT_ASSERT_EQ(propagation_group.compact_after, 0);
+  UT_ASSERT_EQ(propagation_group.trigger_idx, -1);
+  UT_ASSERT(propagation_group.count > 0);
+
+  UT_ASSERT_STREQ(memory_group.name, "memory");
+  UT_ASSERT_EQ(memory_group.max_iterations, 12);
+  UT_ASSERT_EQ(memory_group.compact_after, 1);
+  UT_ASSERT_EQ(memory_group.trigger_idx, 0);
+  UT_ASSERT_STREQ(memory_group.passes[0].name, "sl_forward");
+
+  UT_ASSERT_STREQ(late_cleanup_group.name, "late_cleanup");
+  UT_ASSERT_EQ(late_cleanup_group.max_iterations, 2);
+  UT_ASSERT_EQ(late_cleanup_group.compact_after, 1);
+  UT_ASSERT_EQ(late_cleanup_group.trigger_idx, -1);
+
+  UT_ASSERT_STREQ(entry_store_group.name, "entry_store_prop");
+  UT_ASSERT_EQ(entry_store_group.max_iterations, 3);
+  UT_ASSERT_EQ(entry_store_group.trigger_idx, 0);
   return 0;
 }
 
-UT_TEST(test_get_pipeline_level_1_is_two_groups)
-{
-  const IRPassGroup *groups;
-  int count;
-  tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_1, &groups, &count);
-  UT_ASSERT_EQ(count, 2);
-  UT_ASSERT_STREQ(groups[0].name, "propagation");
-  UT_ASSERT_STREQ(groups[1].name, "late_cleanup");
-  return 0;
-}
-
-UT_TEST(test_get_pipeline_level_2_is_four_groups)
-{
-  const IRPassGroup *groups;
-  int count;
-  tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_2, &groups, &count);
-  UT_ASSERT_EQ(count, 4);
-  UT_ASSERT_STREQ(groups[0].name, "propagation");
-  UT_ASSERT_STREQ(groups[1].name, "memory");
-  UT_ASSERT_STREQ(groups[2].name, "fusion");
-  UT_ASSERT_STREQ(groups[3].name, "late_cleanup");
-  return 0;
-}
-
-UT_TEST(test_get_pipeline_level_s_is_three_groups_no_fusion)
-{
-  const IRPassGroup *groups;
-  int count;
-  tcc_ir_opt_get_pipeline(IR_OPT_LEVEL_S, &groups, &count);
-  UT_ASSERT_EQ(count, 3);
-  UT_ASSERT_STREQ(groups[0].name, "propagation");
-  UT_ASSERT_STREQ(groups[1].name, "memory");
-  UT_ASSERT_STREQ(groups[2].name, "late_cleanup");
-  /* Os intentionally skips "fusion" (kept smaller code size) -- assert its
-   * absence by name, not just the count above. */
-  for (int i = 0; i < count; i++)
-    UT_ASSERT(strcmp(groups[i].name, "fusion") != 0);
-  return 0;
-}
-
-/* NEGATIVE (guard): an out-of-range level value falls through to the
- * `default:` arm, which is the O2 (4-group) pipeline -- same as passing
- * IR_OPT_LEVEL_2 explicitly. Documents the switch's fallback behavior. */
-UT_TEST(test_get_pipeline_unknown_level_falls_back_to_o2)
-{
-  const IRPassGroup *groups;
-  int count;
-  tcc_ir_opt_get_pipeline((IROptLevel)99, &groups, &count);
-  UT_ASSERT_EQ(count, 4);
-  UT_ASSERT_STREQ(groups[0].name, "propagation");
-  return 0;
-}
-
-/* POSITIVE (integration): tcc_ir_opt_run_default(ir, IR_OPT_LEVEL_0) drives
- * get_pipeline + run_pipeline end-to-end through the *real* (non-fake) O0
- * table -- o0_passes[]'s single "dce" entry has flag_offset==0 (unconditional,
- * not PASS_GATED), so it is reachable without any tcc_state flag setup. DCE
- * on a function with a provably-dead instruction after an unconditional jump
- * over it NOPs the dead one; run_default must report that 1 change. */
-UT_TEST(test_run_default_level_0_runs_real_dce_pass)
+/* POSITIVE (integration): run_pipeline drives a real (non-fake) ungated dce
+ * pass; a provably-dead instruction after an unconditional jump is NOPed. */
+UT_TEST(test_run_pipeline_runs_real_dce_pass)
 {
   TCCIRState *ir = utb_new();
   /* [0] JUMP 2            -- always taken
@@ -644,7 +589,9 @@ UT_TEST(test_run_default_level_0_runs_real_dce_pass)
   int dead = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(99, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
-  int total = tcc_ir_opt_run_default(ir, IR_OPT_LEVEL_0);
+  IROptPass passes[] = { { "dce", { .run_ir = tcc_ir_opt_dce }, 0, 0, 1 } };
+  IRPassGroup group = { "cleanup", passes, 1, 1, 0, -1 };
+  int total = tcc_ir_opt_run_pipeline(ir, &group, 1);
 
   UT_ASSERT(total >= 1);
   UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
@@ -653,18 +600,10 @@ UT_TEST(test_run_default_level_0_runs_real_dce_pass)
   return 0;
 }
 
-/* ================================================================== gen_pass_adapter */
+/* ================================================================== run_gens */
 
-/* POSITIVE: tcc_ir_opt_gen_pass_adapter is a one-line forwarding shim
- * (`return tcc_ir_opt_run_gens(ctx, data->gens, data->count);`) -- exercise
- * it directly with the same branch_gens table the setif_fuse/branch_fold
- * passes already cover via their own dedicated entry points, proving the
- * *adapter* forwards both the table pointer and count correctly (a count
- * transposition bug, e.g., would still "work" for a 1-entry table but not
- * a 3-entry one). Reuses setif fusion's CMP+SETIF+TEST_ZERO+JUMPIF shape
- * from test_opt_branch_cascade.c since it's a real, non-trivial branch_gens
- * transform. */
-UT_TEST(test_gen_pass_adapter_forwards_table_and_count)
+/* POSITIVE: run_gens forwards both the table pointer and its count. */
+UT_TEST(test_run_gens_forwards_table_and_count)
 {
   TCCIRState *ir = utb_pool_new();
   ir->temporary_variables_live_intervals_size = 16;
@@ -678,7 +617,7 @@ UT_TEST(test_gen_pass_adapter_forwards_table_and_count)
   int jumpif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(TOK_EQ, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
-  int changes = run_gen_pass_adapter(ir, branch_gens, branch_gens_count);
+  int changes = run_gen_table(ir, branch_gens, branch_gens_count);
 
   UT_ASSERT(changes > 0);
   UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_NOP);
@@ -690,12 +629,12 @@ UT_TEST(test_gen_pass_adapter_forwards_table_and_count)
 
 /* NEGATIVE (guard): an empty gens table (count=0) is a legal no-op --
  * confirms the adapter doesn't dereference gens[0] when count is 0. */
-UT_TEST(test_gen_pass_adapter_empty_table_is_noop)
+UT_TEST(test_run_gens_empty_table_is_noop)
 {
   TCCIRState *ir = utb_new();
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
-  int changes = run_gen_pass_adapter(ir, NULL, 0);
+  int changes = run_gen_table(ir, NULL, 0);
 
   UT_ASSERT_EQ(changes, 0);
 
@@ -706,7 +645,7 @@ UT_TEST(test_gen_pass_adapter_empty_table_is_noop)
 /* ================================================================== gens_branch_ex */
 
 /* POSITIVE: tcc_ir_opt_gens_branch_ex (the dedicated pipeline adapter, as
- * opposed to the generic gen_pass_adapter exercised above) drives the same
+ * opposed to the bare run_gens call exercised above) drives the same
  * branch_gens table through its own _ex wrapper. Unlike setif_fuse/branch_fold
  * (which call tcc_ir_opt_run_gens(&ctx, branch_gens, ...) directly from
  * ir/opt_branch.c and never touch this adapter), tcc_ir_opt_gens_branch_ex

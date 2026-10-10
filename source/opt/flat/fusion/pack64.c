@@ -30,10 +30,9 @@ int tcc_ir_opt_pack64(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_OR)
       continue;
-    IROperand or_dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_btype(or_dest) != IROP_BTYPE_INT64)
+    if (tcc_ir_op_dest_btype(ir, q) != IROP_BTYPE_INT64)
       continue;
-    if (or_dest.is_lval)
+    if (tcc_ir_op_dest_is_lval(ir, q))
       continue;
 
     IROperand or_src1 = tcc_ir_op_get_src1(ir, q);
@@ -62,11 +61,9 @@ int tcc_ir_opt_pack64(TCCIRState *ir)
       IRQuadCompact *shl_q = &ir->compact_instructions[shl_def];
       if (shl_q->op != TCCIR_OP_SHL)
         continue;
-      IROperand shl_amt = tcc_ir_op_get_src2(ir, shl_q);
-      if (!irop_is_immediate(shl_amt) || irop_get_imm64_ex(ir, shl_amt) != 32)
+      if (!tcc_ir_op_src2_is_imm(ir, shl_q) || tcc_ir_op_src2_imm(ir, shl_q) != 32)
         continue;
-      IROperand shl_input = tcc_ir_op_get_src1(ir, shl_q);
-      int32_t shl_input_vr = irop_get_vreg(shl_input);
+      int32_t shl_input_vr = tcc_ir_op_src1_vreg(ir, shl_q);
       if (TCCIR_DECODE_VREG_TYPE(shl_input_vr) != TCCIR_VREG_TYPE_TEMP)
         continue;
       if (ir_opt_du_uses(&du, shl_input_vr) != 1 || !ir_opt_du_is_single_def(&du, shl_input_vr))
@@ -150,10 +147,10 @@ int tcc_ir_opt_pack64_from_stack_stores(TCCIRState *ir)
     for (int j = i - 1; j >= 0; j--)
     {
       IRQuadCompact *jq = &ir->compact_instructions[j];
+      if (jq->is_jump_target) /* before the NOP skip: a NOP can be the join */
+        break;
       if (jq->op == TCCIR_OP_NOP)
         continue;
-      if (jq->is_jump_target)
-        break;
       if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF || jq->op == TCCIR_OP_IJUMP ||
           jq->op == TCCIR_OP_SWITCH_TABLE)
         break;
@@ -265,8 +262,6 @@ int tcc_ir_opt_pack64_from_stack_stores(TCCIRState *ir)
   return changes;
 }
 
-int tcc_ir_opt_pack64_from_stack_stores_ex(IROptCtx *ctx) { return tcc_ir_opt_pack64_from_stack_stores(ctx->ir); }
-
 /* Return the common immediate written by every STORE/ASSIGN to var_vr, or
  * fail if the writers disagree or any is non-immediate. */
 static int pack64_find_var_const_value(TCCIRState *ir, int n, int before_idx,
@@ -279,13 +274,11 @@ static int pack64_find_var_const_value(TCCIRState *ir, int n, int before_idx,
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_STORE)
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(d) != var_vr)
+    if (tcc_ir_op_dest_vreg(ir, q) != var_vr)
       continue;
-    IROperand s = tcc_ir_op_get_src1(ir, q);
-    if (!irop_is_immediate(s))
+    if (!tcc_ir_op_src1_is_imm(ir, q))
       return 0;
-    int64_t v = irop_get_imm64_ex(ir, s);
+    int64_t v = tcc_ir_op_src1_imm(ir, q);
     if (have_value && v != value)
       return 0;
     value = v;
@@ -327,15 +320,14 @@ static int pack64_operand_resolves_const(TCCIRState *ir, IROptDU *du, int n,
     IRQuadCompact *dq = &ir->compact_instructions[def_idx];
     if (dq->op == TCCIR_OP_SHL || dq->op == TCCIR_OP_SAR || dq->op == TCCIR_OP_SHR)
     {
-      IROperand sh_amt = tcc_ir_op_get_src2(ir, dq);
-      if (!irop_is_immediate(sh_amt))
+      if (!tcc_ir_op_src2_is_imm(ir, dq))
         return 0;
-      int64_t amt = irop_get_imm64_ex(ir, sh_amt);
+      int64_t amt = tcc_ir_op_src2_imm(ir, dq);
       int64_t v;
       if (!pack64_operand_resolves_const(ir, du, n, tcc_ir_op_get_src1(ir, dq),
                                          boundary_idx, budget - 1, &v))
         return 0;
-      int is_64 = (irop_get_btype(tcc_ir_op_get_dest(ir, dq)) == IROP_BTYPE_INT64);
+      int is_64 = (tcc_ir_op_dest_btype(ir, dq) == IROP_BTYPE_INT64);
       int mask = is_64 ? 63 : 31;
       int64_t r;
       if (dq->op == TCCIR_OP_SHL)
@@ -388,8 +380,7 @@ int tcc_ir_opt_pack64_implicit(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_OR)
       continue;
-    IROperand or_dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_btype(or_dest) != IROP_BTYPE_INT64)
+    if (tcc_ir_op_dest_btype(ir, q) != IROP_BTYPE_INT64)
       continue;
 
     IROperand or_src1 = tcc_ir_op_get_src1(ir, q);
@@ -414,11 +405,9 @@ int tcc_ir_opt_pack64_implicit(TCCIRState *ir)
       IRQuadCompact *shl_q = &ir->compact_instructions[shl_def];
       if (shl_q->op != TCCIR_OP_SHL)
         continue;
-      IROperand shl_amt = tcc_ir_op_get_src2(ir, shl_q);
-      if (!irop_is_immediate(shl_amt) || irop_get_imm64_ex(ir, shl_amt) != 32)
+      if (!tcc_ir_op_src2_is_imm(ir, shl_q) || tcc_ir_op_src2_imm(ir, shl_q) != 32)
         continue;
-      IROperand shl_dest = tcc_ir_op_get_dest(ir, shl_q);
-      if (irop_get_btype(shl_dest) != IROP_BTYPE_INT64)
+      if (tcc_ir_op_dest_btype(ir, shl_q) != IROP_BTYPE_INT64)
         continue;
 
       /* SHL input becomes PACK64's hi; must be 32-bit or bits above bit 31
@@ -456,4 +445,3 @@ int tcc_ir_opt_pack64_implicit(TCCIRState *ir)
   tcc_free(du.def);
   return changes;
 }
-int tcc_ir_opt_pack64_ex(IROptCtx *ctx) { return tcc_ir_opt_pack64(ctx->ir); }

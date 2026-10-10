@@ -1751,4 +1751,126 @@ UT_TEST(test_temp_indir_store_lval_src_not_tracked)
  * Suite registration
  * ======================================================================== */
 
+UT_TEST(test_cmp_load_exposed_and_reused_across_branch)
+{
+  setup_tcc_state();
+  ssa_ctx c = ssa_ctx_new_full(3, 5);
+  c.ir->next_parameter = 1;
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_param(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_temp(0, I32));
+  ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_lval(utb_temp(1, I32)), utb_imm(1000, I32));
+  ssa_add_instr3(&c, TCCIR_OP_JUMPIF, utb_imm(5, I32), utb_imm(0, I32), UTB_NONE);
+  ssa_add_instr(&c, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE);
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_temp(0, I32));
+  ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(3, I32), utb_lval(utb_temp(2, I32)), utb_imm(7, I32));
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32));
+
+  UT_ASSERT_EQ(ssa_opt_expose_cmp_loads(c.ir), 1);
+  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_LOAD);
+  UT_ASSERT_EQ(utb_op(c.ir, 3), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_src1(c.ir, 3).is_lval, 0);
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+  UT_ASSERT(ssa_opt_load_cse(c.ctx) > 0);
+  UT_ASSERT_EQ(utb_src1(c.ir, 7).is_lval, 0);
+  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, 7)), utb_vreg(utb_dest(c.ir, 2)));
+  ssa_ctx_free(&c);
+  teardown_tcc_state();
+  return 0;
+}
+
+UT_TEST(test_cmp_load_exposure_rejects_unprofitable_or_volatile_reads)
+{
+  setup_tcc_state();
+  for (int kind = 0; kind < 5; kind++) {
+    ssa_ctx c = ssa_ctx_new_full(1, 4);
+    IROperand src = utb_lval(utb_temp(0, I32));
+    if (kind == 1)
+      c.ir->func_has_volatile_access = 1;
+    if (kind == 2)
+      src.btype = I8;
+    if (kind == 3)
+      src.is_local = 1;
+    if (kind == 4)
+      src.is_llocal = 1;
+    ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, src, utb_imm(1000, I32));
+    if (kind)
+      ssa_add_instr(&c, TCCIR_OP_LOAD, utb_temp(1, I32), src);
+    UT_ASSERT_EQ(ssa_opt_expose_cmp_loads(c.ir), 0);
+    UT_ASSERT_EQ(utb_op(c.ir, 0), TCCIR_OP_CMP);
+    ssa_ctx_free(&c);
+  }
+  teardown_tcc_state();
+  return 0;
+}
+
+UT_TEST(test_cmp_load_exposure_preserves_entry_edges_and_operand_order)
+{
+  setup_tcc_state();
+  ssa_ctx c = ssa_ctx_new_full(1, 4);
+  ssa_add_instr(&c, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE);
+  ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_lval(utb_temp(0, I32)), utb_lval(utb_temp(1, I32)));
+  c.ir->compact_instructions[1].is_jump_target = 1;
+  c.ir->compact_instructions[1].line_num = 42;
+  ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(2, I32), utb_lval(utb_temp(0, I32)), utb_lval(utb_temp(1, I32)));
+  ssa_add_instr(&c, TCCIR_OP_JUMP, utb_imm(1, I32), UTB_NONE);
+  c.ir->num_switch_tables = 1;
+  c.ir->switch_tables = tcc_mallocz(sizeof(TCCIRSwitchTable));
+  c.ir->switch_tables[0].default_target = 1;
+  c.ir->switch_tables[0].num_entries = 1;
+  c.ir->switch_tables[0].targets = tcc_malloc(sizeof(int));
+  c.ir->switch_tables[0].targets[0] = 1;
+  c.ir->label_count = 1;
+  c.ir->label_pos = tcc_malloc(2 * sizeof(int));
+  c.ir->label_pos[0] = 99;
+  c.ir->label_pos[1] = 1;
+
+  UT_ASSERT_EQ(ssa_opt_expose_cmp_loads(c.ir), 2);
+  UT_ASSERT_EQ(utb_op(c.ir, 1), TCCIR_OP_LOAD);
+  UT_ASSERT_EQ(utb_op(c.ir, 2), TCCIR_OP_LOAD);
+  UT_ASSERT_EQ(utb_op(c.ir, 3), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, 1)), VR_TMP(0));
+  UT_ASSERT_EQ(utb_vreg(utb_src1(c.ir, 2)), VR_TMP(1));
+  UT_ASSERT_EQ(tcc_ir_op_dest_imm(c.ir, &c.ir->compact_instructions[0]), 1);
+  UT_ASSERT_EQ(tcc_ir_op_dest_imm(c.ir, &c.ir->compact_instructions[5]), 1);
+  UT_ASSERT_EQ(c.ir->switch_tables[0].default_target, 1);
+  UT_ASSERT_EQ(c.ir->switch_tables[0].targets[0], 1);
+  UT_ASSERT_EQ(c.ir->label_pos[1], 1);
+  UT_ASSERT_EQ(c.ir->compact_instructions[1].is_jump_target, 1);
+  UT_ASSERT_EQ(c.ir->compact_instructions[3].is_jump_target, 0);
+  UT_ASSERT_EQ(c.ir->compact_instructions[1].line_num, 42);
+  UT_ASSERT_EQ(c.ir->compact_instructions[2].line_num, 42);
+  tcc_free(c.ir->switch_tables[0].targets);
+  tcc_free(c.ir->switch_tables);
+  tcc_free(c.ir->label_pos);
+  ssa_ctx_free(&c);
+  teardown_tcc_state();
+  return 0;
+}
+
+UT_TEST(test_cmp_load_not_reused_after_aliasing_store_or_call)
+{
+  setup_tcc_state();
+  for (int call = 0; call < 2; call++) {
+    ssa_ctx c = ssa_ctx_new_full(1, 4);
+    ssa_add_instr3(&c, TCCIR_OP_CMP, UTB_NONE, utb_lval(utb_temp(0, I32)), utb_imm(1000, I32));
+    if (call)
+      ssa_add_instr(&c, TCCIR_OP_FUNCCALLVOID, UTB_NONE, utb_imm(0, I32));
+    else
+      ssa_add_instr(&c, TCCIR_OP_STORE, utb_lval(utb_temp(1, I32)), utb_imm(17, I32));
+    ssa_add_instr3(&c, TCCIR_OP_XOR, utb_temp(2, I32), utb_lval(utb_temp(0, I32)), utb_imm(7, I32));
+    UT_ASSERT_EQ(ssa_opt_expose_cmp_loads(c.ir), 1);
+    ssa_ctx_build_cfg(&c);
+    ssa_ctx_build_ssa_plain(&c);
+    ssa_ctx_rebuild(&c);
+    ssa_opt_load_cse(c.ctx);
+    UT_ASSERT_EQ(utb_src1(c.ir, 3).is_lval, 1);
+    ssa_ctx_free(&c);
+  }
+  teardown_tcc_state();
+  return 0;
+}
+
+UT_COVERS("ssa:cmp_loads");
 UT_COVERS("ssa:load_cse");

@@ -21,8 +21,9 @@ struct TCCIRState;
 /* Allocate a temporary virtual register */
 int tcc_ir_vreg_alloc_temp(struct TCCIRState *ir);
 
-/* Ensure temp live interval array can hold at least `count` entries */
-void tcc_ir_vreg_ensure_temp_capacity(struct TCCIRState *ir, int count);
+/* Size the temp and var live interval arrays once SSA renaming has numbered
+ * `temp_count` temps: grows or trims them (see vreg.c) */
+void tcc_ir_vreg_fit_intervals(struct TCCIRState *ir, int temp_count);
 
 /* Allocate a variable virtual register */
 int tcc_ir_vreg_alloc_var(struct TCCIRState *ir);

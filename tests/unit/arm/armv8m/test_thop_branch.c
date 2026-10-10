@@ -99,12 +99,31 @@ UT_TEST(test_bl_t1_all_bits_set)
 {
   setup_armv7m();
 
-  /* BL with imm=0x1FFCFFC (s=1, imm10=0x3FF, j1=1, j2=1, imm11=0x7FE)
-   * => hi=0xF7FF, lo=0xFFFE => 0xF7FFFFFE
+  /* BL with imm=0x1FFFFFE (s=1, imm10=0x3FF (offset bits 21:12), j1=j2=1,
+   * imm11=0x7FF) => hi=0xF7FF, lo=0xFFFF => 0xF7FFFFFF
    */
-  thumb_opcode op = th_bl_t1(0x1FFCFFC);
+  thumb_opcode op = th_bl_t1((uint32_t)-2);
   UT_ASSERT_EQ(op.size, 4);
-  UT_ASSERT_EQ(op.opcode, 0xF7FFFFFE);
+  UT_ASSERT_EQ(op.opcode, 0xF7FFFFFF);
+
+  return 0;
+}
+
+UT_TEST(test_bl_b_t4_range_check)
+{
+  setup_armv7m();
+
+  /* limits: [-16777216, 16777214], even */
+  UT_ASSERT_EQ(th_bl_t1(16777214u).size, 4);
+  UT_ASSERT_EQ(th_bl_t1((uint32_t)-16777216).size, 4);
+  UT_ASSERT_EQ(th_bl_t1(16777216u).size, 0);
+  UT_ASSERT_EQ(th_bl_t1((uint32_t)-16777218).size, 0);
+  UT_ASSERT_EQ(th_bl_t1(3).size, 0);
+  UT_ASSERT_EQ(th_b_t4(16777214).size, 4);
+  UT_ASSERT_EQ(th_b_t4(-16777216).size, 4);
+  UT_ASSERT_EQ(th_b_t4(16777216).size, 0);
+  UT_ASSERT_EQ(th_b_t4(-16777218).size, 0);
+  UT_ASSERT_EQ(th_b_t4(1).size, 0);
 
   return 0;
 }
@@ -192,6 +211,22 @@ UT_TEST(test_b_t2_basic)
   op = th_b_t2(0x400);
   UT_ASSERT_EQ(op.size, 2);
   UT_ASSERT_EQ(op.opcode, 0xE200);
+
+  return 0;
+}
+
+UT_TEST(test_b_t2_extreme_offsets_encodable)
+{
+  setup_armv7m();
+
+  /* imm11 range is [-1024,1023] halfwords: +2046 and -2048 both fit. */
+  thumb_opcode op = th_b_t2(2046);
+  UT_ASSERT_EQ(op.size, 2);
+  UT_ASSERT_EQ(op.opcode, 0xE3FF);
+
+  op = th_b_t2(-2048);
+  UT_ASSERT_EQ(op.size, 2);
+  UT_ASSERT_EQ(op.opcode, 0xE400);
 
   return 0;
 }

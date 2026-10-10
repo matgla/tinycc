@@ -76,6 +76,12 @@ int auto_inline_sig_ok(Sym *func_sym)
   Sym *p;
   if (!ref)
     return 0;
+  /* A weak definition is a default the link may replace: the body here is not
+   * necessarily the one that runs.  yaslibc's NOOS `sbrk` calls the weak
+   * ENOSYS `_sbrk` beside it, and inlining that made every allocation fail in
+   * a kernel that defines the real `_sbrk`. */
+  if (func_sym->a.weak)
+    return 0;
   /* Allow struct return types: the inline expansion handles them via vstore()
    * which generates a memcpy to the return slot.  Struct *parameters* are
    * still rejected (they need ABI-specific passing that STORE can't handle). */
@@ -441,7 +447,7 @@ int inline_body_has_side_effects(TokenString *func_str)
  * by a local variable in the caller's scope.  Token-replay inline expansion
  * resolves identifiers in the caller's scope, so a local `int i` in the
  * caller would shadow a global `int i` that the callee intended to read. */
-int inline_body_has_shadowed_ident(TokenString *func_str)
+static int inline_body_shadowed_ident(TokenString *func_str, int enum_only)
 {
   const int *tp;
   if (!func_str)
@@ -458,14 +464,47 @@ int inline_body_has_shadowed_ident(TokenString *func_str)
     if (tv >= TOK_IDENT)
     {
       TokenSym *ts = table_ident[tv - TOK_IDENT];
-      if (ts && ts->sym_identifier)
+      if (ts && ts->sym_identifier && !SYM_IS_PARKED(ts->sym_identifier)) /* parked: a global */
       {
         Sym *s = ts->sym_identifier;
         /* If the identifier resolves to a local and there's also a global
          * with the same name, the local shadows the global. */
-        if (sym_scope(s) > 0 && s->prev_tok)
+        /* Anonymous enums record no scope: a chained constant is a local one. */
+        if (enum_only ? IS_ENUM_VAL(s->type.t) && s->prev_tok
+                      : (sym_scope(s) > 0 || IS_ENUM_VAL(s->type.t)) && s->prev_tok)
           return 1;
       }
+    }
+  }
+  return 0;
+}
+
+int inline_body_has_shadowed_ident(TokenString *func_str)
+{
+  return inline_body_shadowed_ident(func_str, 0);
+}
+
+/* Return 1 if a struct/union/enum tag named by the body is re-declared in a
+ * local scope of the caller: `struct S` in the caller would change sizeof,
+ * member offsets and casts of the replayed callee. */
+static int inline_body_has_shadowed_tag(TokenString *func_str)
+{
+  const int *tp;
+  if (!func_str)
+    return 0;
+  tp = tok_str_buf(func_str);
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    if (tv >= TOK_IDENT)
+    {
+      Sym *s = sym_tag_head(tv);
+      if (s && !SYM_IS_PARKED(s) && sym_scope(s) > 0 && s->prev_tok)
+        return 1;
     }
   }
   return 0;
@@ -497,8 +536,12 @@ int inline_body_has_unsafe_shadowed_ident(TokenString *func_str, Sym *call_func_
   /* In nested inline expansion: the outer expansion's locals are in scope
    * and would always shadow globals matching the callee's params/locals.
    * Skip the strict check in that case. */
+  if (inline_body_has_shadowed_tag(func_str))
+    return 1;
+  /* Nested: the outer body's params and locals are expected to shadow, but a
+   * constant of an enum it declares must not replace the callee's. */
   if (tcc_state->in_inline_expansion)
-    return 0;
+    return inline_body_shadowed_ident(func_str, 1);
   return inline_body_has_shadowed_ident(func_str);
 }
 
@@ -528,6 +571,83 @@ int inline_body_has_static_local(TokenString *func_str)
       break;
   }
 
+  return 0;
+}
+
+/* Return 1 if the body declares a local array of at least `limit` bytes, as
+ * far as its tokens tell: `T name[N` with N a constant.  T is a basic type
+ * keyword (its size counts) or a typedef name (counted as 1 byte, so an
+ * unknown element size never inflates the estimate); a pointer element is 4.
+ * gcc's large-stack-frame rule for the same reason: inlined, the array is in
+ * the caller's frame on every path through it, including the one that
+ * recurses or calls on down while the callee's path is never taken (tcc's
+ * own next() carried parse_string's 1000-byte buffer, main()
+ * default_outputfile's 1 KB, into every compile). */
+int inline_body_has_large_local_array(TokenString *func_str, int limit)
+{
+  const int *tp;
+  int prev2 = 0, prev = 0, elem = 0;
+
+  if (!func_str)
+    return 0;
+  tp = tok_str_buf(func_str);
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    if (tv == '[' && prev >= TOK_UIDENT)
+    {
+      /* prev is the declarator name: what came before it is the type. */
+      elem = 0;
+      switch (prev2)
+      {
+      case TOK_CHAR:
+        elem = 1;
+        break;
+      case TOK_SHORT:
+        elem = 2;
+        break;
+      case TOK_INT:
+      case TOK_FLOAT:
+      case TOK_UNSIGNED:
+      case TOK_SIGNED1:
+      case TOK_SIGNED2:
+      case TOK_SIGNED3:
+      case '*':
+        elem = 4;
+        break;
+      case TOK_LONG:
+        elem = 4; /* long long counts 4 too: an underestimate */
+        break;
+      case TOK_DOUBLE:
+        elem = 8;
+        break;
+      default:
+        if (prev2 >= TOK_UIDENT)
+          elem = 1; /* typedef name */
+        break;
+      }
+      if (elem)
+      {
+        int nv;
+        CValue ncv;
+        tok_get(&nv, &tp, &ncv);
+        if ((nv == TOK_CINT || nv == TOK_CUINT || nv == TOK_CLONG || nv == TOK_CULONG) &&
+            (unsigned long long)ncv.i * elem >= (unsigned)limit)
+          return 1;
+        if ((nv == TOK_CLLONG || nv == TOK_CULLONG) && ncv.i >= limit)
+          return 1;
+        prev2 = prev, prev = nv;
+        continue;
+      }
+    }
+    if (tv != TOK_LINENUM)
+      prev2 = prev, prev = tv;
+  }
   return 0;
 }
 
@@ -634,9 +754,8 @@ int inline_body_has_unsafe_loops(TokenString *func_str)
 }
 
 /* Check if a nested function has genuine captures (parent variables that are
- * actually accessed through the static chain, not shadowed by parameters or
- * local declarations).  Returns 1 if any capture is genuine, 0 if all are
- * shadowed.  Safe for inlining only when this returns 0. */
+ * actually accessed through the static chain, not shadowed by parameters).
+ * Returns 1 if any capture is genuine, 0 if all are shadowed.  Safe for inlining only when this returns 0. */
 int nested_has_genuine_capture(NestedFunc *nf)
 {
   if (nf->nb_captured == 0)
@@ -658,31 +777,6 @@ int nested_has_genuine_capture(NestedFunc *nf)
         }
       }
     }
-    if (!shadowed && nf->func_str)
-    {
-      /* Check if the body declares a local with the same name (type keyword
-       * immediately before the captured token).  This detects patterns like
-       * "int x = 99;" where x shadows the parent's captured x. */
-      const int *tp = tok_str_buf(nf->func_str);
-      int prev = 0;
-      while (*tp)
-      {
-        int tv;
-        CValue tcv;
-        tok_get(&tv, &tp, &tcv);
-        if (tv == TOK_EOF || tv == 0)
-          break;
-        if (tv == ctok && (prev == TOK_INT || prev == TOK_CHAR || prev == TOK_SHORT ||
-                           prev == TOK_LONG || prev == TOK_VOID || prev == TOK_FLOAT ||
-                           prev == TOK_DOUBLE || prev == TOK_UNSIGNED || prev == TOK_SIGNED1 ||
-                           prev == TOK_BOOL))
-        {
-          shadowed = 1;
-          break;
-        }
-        prev = tv;
-      }
-    }
     if (!shadowed)
       return 1;
   }
@@ -694,8 +788,8 @@ int nested_has_genuine_capture(NestedFunc *nf)
 int nested_callee_has_genuine_capture(TCCState *s, Sym *call_func_sym)
 {
   for (int ni = 0; ni < s->nb_nested_funcs; ni++) {
-    if (s->nested_funcs[ni].sym == call_func_sym)
-      return nested_has_genuine_capture(&s->nested_funcs[ni]);
+    if (s->nested_funcs[ni]->sym == call_func_sym)
+      return nested_has_genuine_capture(s->nested_funcs[ni]);
   }
   return 0;
 }
@@ -719,8 +813,8 @@ int nested_callee_captures_reachable(TCCState *s, Sym *call_func_sym, NestedFunc
 {
   NestedFunc *callee_nf = NULL;
   for (int ni = 0; ni < s->nb_nested_funcs; ni++) {
-    if (s->nested_funcs[ni].sym == call_func_sym) {
-      callee_nf = &s->nested_funcs[ni];
+    if (s->nested_funcs[ni]->sym == call_func_sym) {
+      callee_nf = s->nested_funcs[ni];
       break;
     }
   }
@@ -778,25 +872,6 @@ int nested_capture_is_read_only(NestedFunc *nf)
         }
       }
     }
-    if (!shadowed && nf->func_str) {
-      const int *tp = tok_str_buf(nf->func_str);
-      int prev = 0;
-      while (*tp) {
-        int tv;
-        CValue tcv;
-        tok_get(&tv, &tp, &tcv);
-        if (tv == TOK_EOF || tv == 0)
-          break;
-        if (tv == ctok && (prev == TOK_INT || prev == TOK_CHAR || prev == TOK_SHORT ||
-                           prev == TOK_LONG || prev == TOK_VOID || prev == TOK_FLOAT ||
-                           prev == TOK_DOUBLE || prev == TOK_UNSIGNED || prev == TOK_SIGNED1 ||
-                           prev == TOK_BOOL)) {
-          shadowed = 1;
-          break;
-        }
-        prev = tv;
-      }
-    }
     if (!shadowed) {
       if (ng >= MAX_CAPTURED_VARS)
         return 0;
@@ -848,6 +923,53 @@ int nested_capture_is_read_only(NestedFunc *nf)
   return 1;
 }
 
+/* Does the body write to (or take the address of) the parameter whose
+ * identifier token is ident_tok?  An always_inline call with a constant
+ * argument must NOT record that parameter in tcc_state->inline_const_args when
+ * the body assigns to it: by the time an inline-asm operand names the
+ * parameter, its slot holds the new value, not the argument, so substituting
+ * the constant would read the original argument instead.  Mirrors the write
+ * detection in nested_capture_is_read_only. */
+int inline_body_writes_ident(TokenString *func_str, int ident_tok)
+{
+  if (!func_str || ident_tok < TOK_UIDENT)
+    return 0;
+  const int *tp = tok_str_buf(func_str);
+  int prev = 0;
+  while (*tp)
+  {
+    int tv;
+    CValue tcv;
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      break;
+    if (tv == ident_tok)
+    {
+      const int *peek = tp;
+      int next_tv = 0;
+      if (*peek)
+      {
+        CValue dummy;
+        tok_get(&next_tv, &peek, &dummy);
+      }
+      /* capture = expr, capture += expr, ... */
+      if (next_tv == '=' || TOK_ASSIGN(next_tv))
+        return 1;
+      /* capture++ capture-- */
+      if (next_tv == TOK_INC || next_tv == TOK_DEC)
+        return 1;
+      /* ++capture --capture */
+      if (prev == TOK_INC || prev == TOK_DEC)
+        return 1;
+      /* &capture (address taken -- could be written indirectly) */
+      if (prev == '&')
+        return 1;
+    }
+    prev = tv;
+  }
+  return 0;
+}
+
 void inline_scan_body_features(TokenString *func_str, int *has_addr_of_label, int *has_inline_asm)
 {
   const int *tp;
@@ -893,6 +1015,107 @@ void inline_scan_body_features(TokenString *func_str, int *has_addr_of_label, in
     prev2_tok_val = prev_tok_val;
     prev_tok_val = tv;
   }
+}
+
+/* Whether every asm statement in FUNC_STR is one asm_machine_call_name turns
+ * into a call -- system instructions, at most one "=r" or "r" operand, no
+ * register clobber, no asm goto -- so that an expansion of the body holds no
+ * asm statement at all.  Such a body may be auto-inlined: none of the reasons
+ * an asm statement keeps a body out of line apply (an "i" operand bound to an
+ * argument, a label defined twice), and none of the passes that give up on a
+ * function holding asm ever see one.  The kernel's interrupt masking and
+ * spin-lock hints are all of this kind.  Operand types are not known here;
+ * an operand the parse then rejects (a 64-bit one) only keeps the asm. */
+int inline_body_asm_is_machine(TokenString *func_str)
+{
+#if defined TCC_TARGET_ARM && defined CONFIG_TCC_ASM
+  const int *tp = tok_str_buf(func_str);
+  int tv;
+  CValue tcv;
+  for (;;)
+  {
+    tok_get(&tv, &tp, &tcv);
+    if (tv == TOK_EOF || tv == 0)
+      return 1;
+    if (tv != TOK_ASM1 && tv != TOK_ASM2 && tv != TOK_ASM3)
+      continue;
+    do
+      tok_get(&tv, &tp, &tcv);
+    while (tv == TOK_VOLATILE1 || tv == TOK_VOLATILE2 || tv == TOK_VOLATILE3 || tv == TOK_INLINE1 ||
+           tv == TOK_INLINE2 || tv == TOK_INLINE3);
+    if (tv != '(')
+      return 0;
+    char tmpl[256];
+    int len = 0;
+    for (tok_get(&tv, &tp, &tcv); tv == TOK_STR; tok_get(&tv, &tp, &tcv))
+    {
+      const int n = tcv.str.size - 1;
+      if (n < 0 || len + n >= (int)sizeof(tmpl))
+        return 0;
+      memcpy(tmpl + len, tcv.str.data, n);
+      len += n;
+    }
+    tmpl[len] = 0;
+    ASMOperand ops[2];
+    uint8_t clobbers[NB_ASM_REGS] = {0};
+    int nops = 0, nouts = 0;
+    memset(ops, 0, sizeof(ops));
+    for (int section = 1; tv == ':'; section++)
+    {
+      tok_get(&tv, &tp, &tcv);
+      if (section > 3)
+        return 0; /* asm goto */
+      while (tv != ':' && tv != ')')
+      {
+        if (section == 3)
+        {
+          if (tv != TOK_STR || (strcmp(tcv.str.data, "memory") && strcmp(tcv.str.data, "cc") &&
+                                strcmp(tcv.str.data, "flags")))
+            return 0;
+          tok_get(&tv, &tp, &tcv);
+        }
+        else
+        {
+          if (nops == 2)
+            return 0;
+          ASMOperand *op = &ops[nops++];
+          nouts += section == 1;
+          if (tv == '[')
+          {
+            tok_get(&tv, &tp, &tcv);
+            op->id = tv;
+            tok_get(&tv, &tp, &tcv);
+            if (tv != ']')
+              return 0;
+            tok_get(&tv, &tp, &tcv);
+          }
+          if (tv != TOK_STR || tcv.str.size > (int)sizeof(op->constraint))
+            return 0;
+          memcpy(op->constraint, tcv.str.data, tcv.str.size);
+          tok_get(&tv, &tp, &tcv);
+          if (tv != '(')
+            return 0;
+          for (int depth = 1; depth;)
+          {
+            tok_get(&tv, &tp, &tcv);
+            if (tv == TOK_EOF || tv == 0)
+              return 0;
+            depth += (tv == '(') - (tv == ')');
+          }
+          tok_get(&tv, &tp, &tcv);
+        }
+        if (tv == ',')
+          tok_get(&tv, &tp, &tcv);
+      }
+    }
+    char name[64];
+    if (tv != ')' || !asm_machine_call_name(tmpl, ops, nops, nouts, clobbers, name, sizeof(name)))
+      return 0;
+  }
+#else
+  (void)func_str;
+  return 0;
+#endif
 }
 
 /* Live hidden-label frames, innermost last.
@@ -1016,9 +1239,8 @@ Sym **inline_hide_label_bindings(TokenString *func_str, int **tokens_out, int *c
   saved_labels = tcc_malloc(count * sizeof(*saved_labels));
   for (int i = 0; i < count; ++i)
   {
-    int ident_idx = tokens[i] - TOK_IDENT;
-    saved_labels[i] = table_ident[ident_idx]->sym_label;
-    table_ident[ident_idx]->sym_label = NULL;
+    saved_labels[i] = sym_label_head(tokens[i]);
+    sym_set_label_head(tokens[i], NULL);
   }
 
   *tokens_out = tokens;
@@ -1032,8 +1254,7 @@ void inline_restore_label_bindings(int *tokens, Sym **saved_labels, int count)
   inline_pop_hidden_label_frame(tokens);
   for (int i = 0; i < count; ++i)
   {
-    int ident_idx = tokens[i] - TOK_IDENT;
-    table_ident[ident_idx]->sym_label = saved_labels[i];
+    sym_set_label_head(tokens[i], saved_labels[i]);
   }
   tcc_free(saved_labels);
   tcc_free(tokens);

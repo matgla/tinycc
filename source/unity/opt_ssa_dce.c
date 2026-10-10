@@ -29,7 +29,6 @@
 #include "../opt/ssa/dce/temp_worklist.c"
 #undef USING_GLOBALS
 #include "../opt/ssa/dce/unreachable.c"
-#undef DCE_MARK
 #undef USING_GLOBALS
 #include "../opt/ssa/dce/var_liveness.c"
 #undef USING_GLOBALS

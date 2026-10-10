@@ -26,6 +26,7 @@ void thumb_free_call_sites(void)
       {
         tcc_free(cs->function_argument_list);
         cs->function_argument_list = NULL;
+        cs->function_argument_capacity = 0;
       }
     }
     tcc_free(thumb_gen_state.call_sites_by_id);
@@ -80,6 +81,31 @@ ThumbGenCallSite *thumb_get_call_site_for_id(int call_id)
   if (call_id >= 0 && call_id < thumb_gen_state.call_sites_by_id_size && thumb_gen_state.call_sites_by_id)
     return &thumb_gen_state.call_sites_by_id[call_id];
   return NULL;
+}
+
+/* True when a call targets a soft-float __aeabi_* runtime helper, which returns
+ * a float in R0 (soft ABI) even under hard-float — as opposed to a user
+ * function, which returns it in s0.  The __aeabi_ namespace is reserved, so the
+ * name is an unambiguous signal. */
+int thumb_callee_sym_is_aeabi(Sym *sym)
+{
+  if (!sym)
+    return 0;
+  const char *name = get_tok_str(sym->v, NULL);
+  return name && strncmp(name, "__aeabi_", 8) == 0;
+}
+
+/* The argument-placement flags of a call to `sym` (NULL: an indirect call).
+ * Hard-float VFP passing applies to non-variadic user functions: soft
+ * __aeabi_* helpers take their float arguments in GPRs regardless, and a
+ * variadic callee receives every argument by the base (GPR) standard.
+ * Indirect calls are assumed non-variadic — function pointers to variadic
+ * functions are rare.  The call emitter and the frame pre-pass (ir/codegen.c),
+ * which sizes the outgoing argument area, must agree, so both ask here. */
+void thumb_call_layout_abi_flags(TCCAbiCallLayout *layout, Sym *sym)
+{
+  layout->hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT) && !thumb_callee_sym_is_aeabi(sym);
+  layout->is_variadic = sym && sym->type.ref && sym->type.ref->f.func_type == FUNC_ELLIPSIS;
 }
 
 /* Build ABI call layout from IR instructions for a given call_id.
@@ -192,7 +218,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
           /* Determine argument type and size */
           if (irop_is_none(src1_irop))
           {
-            tcc_error("compiler_error: FUNCPARAMVAL missing src1 for call_id=%d arg=%d", call_id, param_idx);
+            tcc_ice("FUNCPARAMVAL missing src1 for call_id=%d arg=%d", call_id, param_idx);
             goto cleanup_error;
           }
 
@@ -242,6 +268,20 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
               !src1_irop.is_complex && src1_irop.btype != IROP_BTYPE_STRUCT &&
               (src1_irop.btype == IROP_BTYPE_FLOAT32 || src1_irop.btype == IROP_BTYPE_FLOAT64);
 
+          /* An HFA or _Complex float/double is a VFP candidate as a whole. */
+          if (src1_irop.btype == IROP_BTYPE_STRUCT || src1_irop.is_complex)
+          {
+            CType ct = {.t = src1_irop.btype == IROP_BTYPE_FLOAT64 ? VT_DOUBLE | VT_COMPLEX : VT_FLOAT | VT_COMPLEX};
+            CType *hct = src1_irop.btype == IROP_BTYPE_STRUCT ? irop_get_ctype(src1_irop) : &ct;
+            int hfa_base = 4;
+            const int n = hct && (src1_irop.btype == IROP_BTYPE_STRUCT || src1_irop.btype == IROP_BTYPE_FLOAT32 ||
+                                  src1_irop.btype == IROP_BTYPE_FLOAT64)
+                              ? gfunc_hfa(hct, &hfa_base)
+                              : 0;
+            arg_descs[param_idx].hfa_count = (uint8_t)n;
+            arg_descs[param_idx].hfa_base = (uint8_t)hfa_base;
+          }
+
           found[param_idx] = 1;
           found_count++;
         }
@@ -256,7 +296,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
     LOG_CALLSITE("arg[%d]: found=%d", i, found[i]);
     if (!found[i])
     {
-      tcc_error("compiler_error: missing FUNCPARAMVAL for call_id=%d arg=%d", call_id, i);
+      tcc_ice("missing FUNCPARAMVAL for call_id=%d arg=%d", call_id, i);
       goto cleanup_error;
     }
   }
@@ -267,7 +307,7 @@ int thumb_build_call_layout_from_ir(TCCIRState *ir, int call_idx, int call_id, i
   /* Use target ABI hook to compute register/stack layout */
   if (tcc_gen_machine_abi_assign_call_args(arg_descs, argc, layout) < 0)
   {
-    tcc_error("compiler_error: abi_assign_call_args failed");
+    tcc_ice("abi_assign_call_args failed");
     goto cleanup_error;
   }
 

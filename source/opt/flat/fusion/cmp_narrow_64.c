@@ -33,6 +33,15 @@ static int cn64_hi_is_zero(TCCIRState *ir, const int *def_idx, int max_tmp_pos,
     return 2;
   }
 
+  /* The def lookup below describes the operand's *value* only when the operand
+   * is the vreg itself.  A deref (`T***DEREF***`) loads through the pointer in
+   * T, and its def defines the pointer: nothing about a pointer says anything
+   * about what it points at.  `p & 0x7ffffff8` has a zero high word, the value
+   * behind it need not.  Stack slots and double indirection are the same kind
+   * of indirection, and a symbol reference is a memory read too. */
+  if (!irop_dest_defines_vreg(op))
+    return 0;
+
   int32_t vr = irop_get_vreg(op);
   if (vr < 0)
     return 0;
@@ -124,14 +133,22 @@ int tcc_ir_opt_cmp_narrow_64(TCCIRState *ir)
   int *def_idx = tcc_malloc(stride * sizeof(int));
   for (int i = 0; i < stride; i++)
     def_idx[i] = -1;
-  /* Track VAR STORE definitions: last STORE to V at this position. */
+  /* Track definitions of named locals: a STORE whose destination *is* the
+   * variable (a stack slot named by V, not a write through the pointer V
+   * holds).  A second definition, or an address of V handed to something this
+   * scan cannot follow, makes the value at a given point unknowable. */
   int var_stride = max_var_pos + 1;
   int *var_def_idx = NULL;
+  unsigned char *var_unsure = NULL;
   if (var_stride > 0)
   {
     var_def_idx = tcc_malloc(var_stride * sizeof(int));
+    var_unsure = tcc_malloc(var_stride);
     for (int i = 0; i < var_stride; i++)
+    {
       var_def_idx[i] = -1;
+      var_unsure[i] = 0;
+    }
   }
   for (int i = 0; i < n; i++)
   {
@@ -140,14 +157,36 @@ int tcc_ir_opt_cmp_narrow_64(TCCIRState *ir)
       continue;
     if (q->op == TCCIR_OP_STORE && irop_config[q->op].has_dest)
     {
-      int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+      IROperand dst = tcc_ir_op_get_dest(ir, q);
+      int32_t vr = irop_get_vreg(dst);
       if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && var_def_idx)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos <= max_var_pos)
-          var_def_idx[pos] = i;
+        {
+          if (irop_dest_defines_vreg(dst))
+          {
+            if (var_def_idx[pos] >= 0)
+              var_unsure[pos] = 1; /* a second definition: which one reaches is unknowable */
+            else
+              var_def_idx[pos] = i;
+          }
+          /* A write through V says nothing about V's own value; it is not a
+           * definition and does not replace one. */
+        }
       }
       continue;
+    }
+    if (q->op == TCCIR_OP_LEA && var_unsure)
+    {
+      /* V's address escapes, so a store through it can change V's value. */
+      int32_t vr = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+      {
+        int pos = TCCIR_DECODE_VREG_POSITION(vr);
+        if (pos <= max_var_pos)
+          var_unsure[pos] = 1;
+      }
     }
     if (!irop_config[q->op].has_dest)
       continue;
@@ -206,14 +245,19 @@ int tcc_ir_opt_cmp_narrow_64(TCCIRState *ir)
     int z2 = cn64_hi_is_zero(ir, def_idx, max_tmp_pos, src2, &imm2);
 
     /* A VAR holding a constant only reaches the compare through its STORE --
-     * the shape printf argument locals keep after const-prop. */
+     * the shape printf argument locals keep after const-prop.  Only a store
+     * that *defines* the variable itself qualifies, only when it is the single
+     * one before this compare, and only while nothing this scan cannot follow
+     * (a store through an escaped address) can have written another value. */
     if (!z2 && var_def_idx)
     {
       int32_t s2_vr = irop_get_vreg(src2);
       if (TCCIR_DECODE_VREG_TYPE(s2_vr) == TCCIR_VREG_TYPE_VAR)
       {
         int s2_pos = TCCIR_DECODE_VREG_POSITION(s2_vr);
-        if (s2_pos <= max_var_pos && var_def_idx[s2_pos] >= 0)
+        if (s2_pos <= max_var_pos && var_def_idx[s2_pos] >= 0 &&
+            var_def_idx[s2_pos] < i && !var_unsure[s2_pos] &&
+            irop_dest_defines_vreg(src2))
         {
           IRQuadCompact *q_vdef = &ir->compact_instructions[var_def_idx[s2_pos]];
           if (q_vdef->op == TCCIR_OP_STORE)
@@ -241,14 +285,17 @@ int tcc_ir_opt_cmp_narrow_64(TCCIRState *ir)
     if (swap)
     {
       int ok = 1;
+      int joined = 0; /* passed a jump target -- a NOP one too */
       for (int j = i + 1; j < n; j++)
       {
         IRQuadCompact *qj = &ir->compact_instructions[j];
+        if (qj->is_jump_target)
+          joined = 1;
         if (qj->op == TCCIR_OP_NOP)
           continue;
         if (qj->op != TCCIR_OP_SETIF && qj->op != TCCIR_OP_JUMPIF)
           break;
-        if (qj->is_jump_target)
+        if (joined)
         {
           ok = 0;
           break;
@@ -305,6 +352,8 @@ int tcc_ir_opt_cmp_narrow_64(TCCIRState *ir)
   }
   if (var_def_idx)
     tcc_free(var_def_idx);
+  if (var_unsure)
+    tcc_free(var_unsure);
 
   tcc_free(def_idx);
   return changes;

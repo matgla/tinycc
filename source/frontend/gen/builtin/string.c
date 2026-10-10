@@ -41,6 +41,10 @@ const char *try_get_constant_string(SValue *sv, int *out_len)
   if ((sv->r & (VT_VALMASK | VT_SYM | VT_LVAL)) != (VT_CONST | VT_SYM) &&
       (sv->r & (VT_VALMASK | VT_SYM | VT_LVAL)) != (VT_CONST | VT_SYM | VT_LVAL))
     return NULL;
+  /* An lvalue is the bytes only when it is the character array itself; a
+   * pointer lvalue is the pointer object, not the string it points to. */
+  if ((sv->r & VT_LVAL) && !(sv->type.t & VT_ARRAY))
+    return NULL;
   if (!sv->sym || sv->sym->a.tentative)
     return NULL; /* a tentative definition's bytes are not its value yet */
 

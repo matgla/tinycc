@@ -54,13 +54,16 @@ int tcc_ir_asm_add(TCCIRState *ir, const char *asm_str, int asm_len, int must_su
   ia->nb_operands = nb_operands;
   ia->nb_outputs = nb_outputs;
   ia->nb_labels = nb_labels;
+  if (nb_labels > 0)
+    ir->func_has_asm_goto = 1;
   if (clobber_regs)
     memcpy(ia->clobber_regs, clobber_regs, NB_ASM_REGS);
   else
     memset(ia->clobber_regs, 0, NB_ASM_REGS);
 
   ia->operands = tcc_mallocz(sizeof(ASMOperand) * (nb_operands + nb_labels));
-  memcpy(ia->operands, operands, sizeof(ASMOperand) * (nb_operands + nb_labels));
+  if (nb_operands + nb_labels > 0) /* operands may be NULL for a bare asm */
+    memcpy(ia->operands, operands, sizeof(ASMOperand) * (nb_operands + nb_labels));
 
   ia->values = tcc_mallocz(sizeof(SValue) * nb_operands);
   for (int i = 0; i < nb_operands; ++i)

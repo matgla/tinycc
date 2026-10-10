@@ -30,6 +30,27 @@
 #define USING_GLOBALS
 #include "tcc.h"
 
+/* Optimizer-only binaries do not link the frontend facts map. Weak defaults
+ * leave summaries unknown; suites linking symtab.c use the real map. */
+__attribute__((weak)) const SymLocalFacts *sym_facts_get(const Sym *s)
+{
+  static const SymLocalFacts empty;
+  (void)s;
+  return &empty;
+}
+__attribute__((weak)) SymLocalFacts *sym_facts_peek(const Sym *s)
+{
+  (void)s;
+  return NULL;
+}
+__attribute__((weak)) SymLocalFacts *sym_facts(Sym *s)
+{
+  static SymLocalFacts scratch;
+  (void)s;
+  memset(&scratch, 0, sizeof scratch);
+  return &scratch;
+}
+
 static TCCState ut_tcc_state_storage;
 TCCState *tcc_state = &ut_tcc_state_storage;
 

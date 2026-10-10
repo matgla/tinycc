@@ -60,6 +60,11 @@ int ssa_opt_run_gens(IRSSAOptCtx *ctx, const IRSSAOptGen *gens, int count)
   return changes;
 }
 
+static void ssa_orphan_cmp_nop(void *opaque, int i)
+{
+  ssa_opt_nop_instr(opaque, i);
+}
+
 int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
 {
   int total = 0;
@@ -91,7 +96,7 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     SSA_RUN("ssa:cprop", ssa_opt_cprop(ctx));
     SSA_RUN("ssa:var_to_param_forward", ssa_opt_var_to_param_forward(ctx));
     SSA_RUN("ssa:tmp_block_const",
-            (tcc_state && tcc_state->opt_const_prop) ? ssa_opt_tmp_block_const(ctx) : 0);
+            (tcc_state && TCC_OPT(tcc_state, opt_const_prop)) ? ssa_opt_tmp_block_const(ctx) : 0);
     SSA_RUN("ssa:fold", ssa_opt_fold(ctx));
     SSA_RUN("ssa:cprop", ssa_opt_cprop(ctx));
     SSA_RUN("ssa:var_imm_prop", ssa_opt_var_imm_prop(ctx));
@@ -104,17 +109,18 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
     SSA_RUN("ssa:branch", ssa_opt_branch(ctx));
     SSA_RUN("ssa:switch_fold", ssa_opt_switch_fold(ctx));
     SSA_RUN("ssa:cmp_eq_prop", ssa_opt_cmp_eq_prop(ctx));
-    SSA_RUN("ssa:vrp", (tcc_state && tcc_state->opt_vrp) ? ssa_opt_vrp(ctx) : 0);
+    SSA_RUN("ssa:vrp", (tcc_state && TCC_OPT(tcc_state, opt_vrp)) ? ssa_opt_vrp(ctx) : 0);
     SSA_RUN("ssa:setif_or_taut",
-            (tcc_state && tcc_state->opt_const_prop) ? ssa_opt_setif_or_taut(ctx) : 0);
+            (tcc_state && TCC_OPT(tcc_state, opt_const_prop)) ? ssa_opt_setif_or_taut(ctx) : 0);
     SSA_RUN("ssa:setif_mask_fold",
-            (tcc_state && tcc_state->opt_const_prop) ? ssa_opt_setif_mask_fold(ctx) : 0);
+            (tcc_state && TCC_OPT(tcc_state, opt_const_prop)) ? ssa_opt_setif_mask_fold(ctx) : 0);
     SSA_RUN("ssa:cmp_offset_fold",
-            (tcc_state && tcc_state->opt_const_prop) ? ssa_opt_cmp_offset_fold(ctx) : 0);
+            (tcc_state && TCC_OPT(tcc_state, opt_const_prop)) ? ssa_opt_cmp_offset_fold(ctx) : 0);
     SSA_RUN("ssa:reassoc", ssa_opt_reassoc(ctx));
     SSA_RUN("ssa:strength", ssa_opt_strength(ctx));
     SSA_RUN("ssa:narrow", ssa_opt_narrow(ctx));
     SSA_RUN("ssa:gvn", ssa_opt_gvn(ctx));
+    SSA_RUN("ssa:pure_call_cse", ssa_opt_pure_call_cse(ctx));
     SSA_RUN("ssa:phi_simplify", ssa_opt_phi_simplify(ctx));
     /* -O2, not -O1: gcc deletes a pure counting loop only at -O2 -- its -O1
      * folds the body to a constant but still runs the trip count.  Gating this
@@ -123,9 +129,15 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
      * while gcc -O1 spent 4034 cycles on an empty loop.  Deleting the loop
      * belongs to the heavy tier alongside unrolling/LICM/IV-strength-red. */
     SSA_RUN("ssa:dead_loop",
-            (tcc_state && tcc_state->optimize >= 2) ? ssa_opt_dead_loop(ctx) : 0);
+            (tcc_state && TCC_OPT(tcc_state, optimize) >= 2) ? ssa_opt_dead_loop(ctx) : 0);
     SSA_RUN("ssa:stack_deref_fold",
-            (tcc_state && tcc_state->optimize > 0) ? ssa_opt_stack_deref_fold(ctx) : 0);
+            (tcc_state && TCC_OPT(tcc_state, optimize) > 0) ? ssa_opt_stack_deref_fold(ctx) : 0);
+    /* After stack_deref_fold: a field read through `t1 = &t0` is a StackLoc only now. */
+    SSA_RUN("ssa:copy_fwd",
+            (tcc_state && TCC_OPT(tcc_state, optimize) > 0 && TCC_OPT(tcc_state, opt_store_load_fwd)) ? ssa_opt_copy_fwd(ctx) : 0);
+    SSA_RUN("ssa:load_combine",
+            (tcc_state && TCC_OPT(tcc_state, optimize) >= 2) ? ssa_opt_load_combine(ctx) : 0);
+    SSA_RUN("ssa:orphan_cmp", tcc_ir_opt_orphan_cmp_elim_ex(ctx->ir, ssa_orphan_cmp_nop, ctx));
     SSA_RUN("ssa:dce", ssa_opt_dce(ctx));
 
     if (target_gens && target_gen_count > 0) {
@@ -142,7 +154,7 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
   /* AFTER the main loop, never inside it: bool_norm deletes the `CMP b,#0`
    * that setif_mask_fold matches on, so running the two together lets whichever
    * fires first in an iteration rob the other of its shape. */
-  if (tcc_state && tcc_state->opt_const_prop &&
+  if (tcc_state && TCC_OPT(tcc_state, opt_const_prop) &&
       !tcc_ir_opt_pass_disabled("ssa:bool_norm")) {
     int _c;
     TCC_PASS_TIMED(_c, "ssa:bool_norm", ssa_opt_bool_norm(ctx));
@@ -156,7 +168,7 @@ int tcc_ir_ssa_opt_run(IRSSAOptCtx *ctx)
    * guard_collapse, which is the pipeline terminator. */
   for (int tail = 0; tail < 8 && !tcc_ir_opt_pass_disabled("ssa:late_tail"); tail++) {
     int ch = 0;
-    if (tcc_state && tcc_state->opt_const_prop &&
+    if (tcc_state && TCC_OPT(tcc_state, opt_const_prop) &&
         !tcc_ir_opt_pass_disabled("ssa:tmp_block_const")) {
       int _c;
       TCC_PASS_TIMED(_c, "ssa:tmp_block_const", ssa_opt_tmp_block_const(ctx));

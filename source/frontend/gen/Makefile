@@ -62,6 +62,7 @@ GEN_SRC = \
 	source/frontend/gen/type/size.c \
 	source/frontend/gen/value/load.c \
 	source/frontend/gen/value/longlong.c \
+	source/frontend/gen/value/rodata_rel.c \
 	source/frontend/gen/value/strlit_pool.c \
 	source/frontend/gen/value/vstack.c
 

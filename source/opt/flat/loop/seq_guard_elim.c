@@ -142,7 +142,7 @@ static int seq_branch_target(TCCIRState *ir, int i)
   IRQuadCompact *q = &ir->compact_instructions[i];
   if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
     return -1;
-  return (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+  return (int)tcc_ir_op_dest_imm(ir, q);
 }
 
 /* 1 when the IV's storage can be written behind the walker's back — its
@@ -160,7 +160,7 @@ static int seq_vreg_escapes(TCCIRState *ir, int32_t iv)
       continue;
     int is_call = (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID);
     if (op == TCCIR_OP_LEA && irop_config[op].has_src1 &&
-        irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == iv)
+        tcc_ir_op_src1_vreg(ir, q) == iv)
       return 1; /* &iv taken */
     IROperand ops[4];
     int no = 0;
@@ -230,7 +230,7 @@ static int seq_region_step(TCCIRState *ir, int rs, int re, int32_t iv, int *out_
         if (irop_get_vreg(cd) != src)
           continue;
         if (cq->op == TCCIR_OP_ASSIGN && j < i && seq_dest_is_direct(cd) &&
-            irop_get_vreg(tcc_ir_op_get_src1(ir, cq)) == iv)
+            tcc_ir_op_src1_vreg(ir, cq) == iv)
           copy_defs++;
         else
           other_defs++;
@@ -339,8 +339,8 @@ static int seq_match_loop(TCCIRState *ir, int ci, int ji, SeqLoop *out)
   if (iv_kind != TCCIR_VREG_TYPE_VAR && iv_kind != TCCIR_VREG_TYPE_TEMP)
     return 0;
   int limit = (int)irop_get_imm64_ex(ir, s2);
-  int cond = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jif_q));
-  int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jif_q));
+  int cond = (int)tcc_ir_op_src1_imm(ir, jif_q);
+  int target = (int)tcc_ir_op_dest_imm(ir, jif_q);
   /* target == n is the function end: the last loop of a chain exits there */
   if (target <= ji || target > n)
     return 0;
@@ -387,7 +387,7 @@ static int seq_match_loop(TCCIRState *ir, int ci, int ji, SeqLoop *out)
       return 0;
     if (irop_is_64bit(t1) || irop_is_64bit(t2) || tcc_ir_barrel_shift_at(ir, tcmp))
       return 0;
-    int back_cond = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, back_q));
+    int back_cond = (int)tcc_ir_op_src1_imm(ir, back_q);
     int exit_cond = invert_condition(back_cond);
     if (exit_cond < 0)
       return 0;
@@ -422,7 +422,7 @@ static int seq_loop_exit_value(TCCIRState *ir, const SeqLoop *lp, int64_t entry,
     IROperand g1 = tcc_ir_op_get_src1(ir, gq);
     IROperand g2 = tcc_ir_op_get_src2(ir, gq);
     IRQuadCompact *gj = &ir->compact_instructions[lp->guard_jif];
-    int gcond = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, gj));
+    int gcond = (int)tcc_ir_op_src1_imm(ir, gj);
     int64_t glim = irop_get_imm64_ex(ir, g2);
     if (evaluate_compare_condition_cmp_annotated(ir, gq, entry, glim, gcond, g1, g2) != 0)
       return 0;
@@ -605,8 +605,8 @@ static int seq_walk(TCCIRState *ir, int query_idx, int32_t query_vreg, int64_t *
       if (dv >= 0 && seq_dest_is_direct(d))
       {
         if (op == TCCIR_OP_ASSIGN && !irop_is_64bit(d) &&
-            irop_is_immediate(tcc_ir_op_get_src1(ir, q)))
-          seq_set(&st, dv, irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, q)));
+            tcc_ir_op_src1_is_imm(ir, q))
+          seq_set(&st, dv, tcc_ir_op_src1_imm(ir, q));
         else
           seq_drop(&st, dv);
       }

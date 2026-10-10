@@ -798,11 +798,65 @@ UT_TEST(test_output_yaff_with_exported_symbol)
   UT_ASSERT_EQ(fread(&e, sizeof(YaffSymbolEntry), 1, f), 1u);
   UT_ASSERT_EQ(e.section, (uint32_t)YAFF_SECTION_CODE);
   UT_ASSERT_EQ(e.weak, 0u);
-  UT_ASSERT_EQ(e.offset, 0x1004u);
+  /* YAFF_ARCH_FLAG_EXACT_THUMB: a function's address carries its Thumb bit. */
+  UT_ASSERT_EQ(e.offset, 0x1005u);
 
   char name[32];
   UT_ASSERT_EQ(fread(name, 1, sizeof("exported_fn"), f), sizeof("exported_fn"));
   UT_ASSERT_STREQ(name, "exported_fn");
+
+  fclose(f);
+  unlink(path);
+  ut_yaff_teardown_output_state();
+  return 0;
+}
+
+/* An STT_OBJECT in code keeps the bit its value has: a data object placed in an
+ * executable section is even (bit 0 set made every word copy of it fault), a
+ * `&&label` -- which tcc types STT_OBJECT -- is odd already. */
+UT_TEST(test_output_yaff_exported_object_in_code_keeps_parity)
+{
+  ut_yaff_setup_minimal_output_state();
+
+  set_elf_sym(tcc_state->dynsym, 0x1008, 16, ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), STV_DEFAULT, text_section->sh_num,
+              "data_in_code");
+  set_elf_sym(tcc_state->dynsym, 0x100b, 0, ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), STV_DEFAULT, text_section->sh_num,
+              "label_in_code");
+
+  char path[] = "/tmp/tccyaff_ut_out_obj_XXXXXX";
+  FILE *f = ut_yaff_open_temp(path);
+  UT_ASSERT_EQ(tcc_output_yaff(tcc_state, f, "objcode.yaff"), 0);
+
+  YaffHeader h;
+  ut_yaff_read_header(f, &h);
+  UT_ASSERT_EQ(h.exported_symbols_amount, 3u); /* sentinel + 2 */
+
+  YaffArchSection arch;
+  fseek(f, h.arch_section_offset, SEEK_SET);
+  UT_ASSERT_EQ(fread(&arch, sizeof(arch), 1, f), 1u);
+  UT_ASSERT_EQ(arch.flags & YAFF_ARCH_FLAG_EXACT_THUMB, (unsigned)YAFF_ARCH_FLAG_EXACT_THUMB);
+
+  fseek(f, h.exported_symbols_offset, SEEK_SET);
+  fseek(f, (long)(sizeof(YaffSymbolEntry) + 4), SEEK_CUR); /* sentinel */
+  uint32_t got_data = 0, got_label = 0;
+  for (int k = 0; k < 2; k++)
+  {
+    YaffSymbolEntry e;
+    char name[32] = {0};
+    int len = 0;
+    UT_ASSERT_EQ(fread(&e, sizeof(e), 1, f), 1u);
+    while (len < (int)sizeof(name) - 1 && (name[len] = (char)fgetc(f)) != 0)
+      len++;
+    while ((len + 1) % 4)
+      fgetc(f), len++;
+    UT_ASSERT_EQ(e.section, (uint32_t)YAFF_SECTION_CODE);
+    if (!strcmp(name, "data_in_code"))
+      got_data = e.offset;
+    else if (!strcmp(name, "label_in_code"))
+      got_label = e.offset;
+  }
+  UT_ASSERT_EQ(got_data, 0x1008u);
+  UT_ASSERT_EQ(got_label, 0x100bu);
 
   fclose(f);
   unlink(path);

@@ -33,8 +33,7 @@ int tcc_ir_callee_is_noreturn(Sym *callee)
     return 0;
 
   const char *name = get_tok_str(callee->asm_label ? callee->asm_label : callee->v, NULL);
-  return name && (!strcmp(name, "abort") || !strcmp(name, "exit") || !strcmp(name, "_Exit") ||
-                  !strcmp(name, "quick_exit"));
+  return name && ir_opt_name_in(name, "abort\0exit\0_Exit\0quick_exit\0");
 }
 
 /* Dead Code Elimination pass
@@ -65,53 +64,43 @@ static int tcc_ir_opt_dce__timed(TCCIRState *ir)
     if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
       return 0;
   }
+  /* Likewise for `asm goto`: its labels are edges the IR does not record. */
+  if (ir->func_has_asm_goto)
+    return 0;
 
   uint8_t *reachable = tcc_mallocz((n + 7) / 8);
   int *worklist = tcc_malloc(n * sizeof(int));
-  int worklist_head = 0, worklist_tail = 0;
-
-/* Mark instruction as reachable if not already marked */
-#define MARK_REACHABLE(idx)                                                                                            \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    if ((idx) >= 0 && (idx) < n && !(reachable[(idx) / 8] & (1 << ((idx) % 8))))                                       \
-    {                                                                                                                  \
-      reachable[(idx) / 8] |= (1 << ((idx) % 8));                                                                      \
-      worklist[worklist_tail++] = (idx);                                                                               \
-    }                                                                                                                  \
-  } while (0)
+  IrReachWorklist rw = {reachable, worklist, 0, 0, n};
 
   /* Start from instruction 0 */
-  MARK_REACHABLE(0);
+  ir_opt_reach_mark(&rw, 0);
 
-  while (worklist_head < worklist_tail)
+  while (rw.head < rw.tail)
   {
-    int i = worklist[worklist_head++];
+    int i = worklist[rw.head++];
     IRQuadCompact *q = &ir->compact_instructions[i];
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
     switch (q->op)
     {
     case TCCIR_OP_JUMP:
       /* Unconditional jump - only the target is reachable */
-      MARK_REACHABLE((int)dest.u.imm32);
+      ir_opt_reach_mark(&rw, (int)tcc_ir_op_dest_u_imm32(ir, q));
       break;
     case TCCIR_OP_JUMPIF:
       /* Conditional jump - both target and fall-through are reachable */
-      MARK_REACHABLE((int)dest.u.imm32);
-      MARK_REACHABLE(i + 1);
+      ir_opt_reach_mark(&rw, (int)tcc_ir_op_dest_u_imm32(ir, q));
+      ir_opt_reach_mark(&rw, i + 1);
       break;
     case TCCIR_OP_SWITCH_TABLE:
     {
       /* Switch table - all targets are reachable */
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id >= 0 && table_id < ir->num_switch_tables)
       {
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
         for (int j = 0; j < table->num_entries; j++)
-          MARK_REACHABLE(table->targets[j]);
+          ir_opt_reach_mark(&rw, table->targets[j]);
         /* Also mark the default target */
-        MARK_REACHABLE(table->default_target);
+        ir_opt_reach_mark(&rw, table->default_target);
       }
       /* SWITCH_TABLE is a terminator - no fall-through */
       break;
@@ -123,7 +112,7 @@ static int tcc_ir_opt_dce__timed(TCCIRState *ir)
          function and code continues at/after those labels.
          Conservatively keep fall-through reachable to avoid deleting label
          blocks and subsequent code. */
-      MARK_REACHABLE(i + 1);
+      ir_opt_reach_mark(&rw, i + 1);
       break;
     case TCCIR_OP_RETURNVALUE:
     case TCCIR_OP_RETURNVOID:
@@ -137,20 +126,19 @@ static int tcc_ir_opt_dce__timed(TCCIRState *ir)
        * the inter-procedural noreturn_collapse / infinite_self_recursion /
        * uninit_dom_return passes — they set sym->f.func_noreturn at end of
        * gen_function), the call never returns and code after it is dead. */
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      Sym *callee = tcc_ir_op_src1_sym(ir, q);
       if (tcc_ir_callee_is_noreturn(callee))
         break; /* terminator: no fall-through */
-      MARK_REACHABLE(i + 1);
+      ir_opt_reach_mark(&rw, i + 1);
       break;
     }
     default:
       /* All other instructions fall through to the next */
-      MARK_REACHABLE(i + 1);
+      ir_opt_reach_mark(&rw, i + 1);
       break;
     }
   }
 
-#undef MARK_REACHABLE
 
   /* Mark unreachable instructions as NOP (no array compaction needed).
    * Already-NOP instructions must not count as changes: groups that do not
@@ -172,9 +160,4 @@ static int tcc_ir_opt_dce__timed(TCCIRState *ir)
   tcc_free(worklist);
 
   return changes;
-}
-
-int tcc_ir_opt_dce_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_dce(ctx->ir);
 }

@@ -38,10 +38,46 @@
  * back to are bigger than the call they replaced. */
 TCC_DBG_ENV_INT(small_aggregate_copy_max_chunks, "TCC_SMALL_COPY_CHUNKS", 4)
 
+/* Whether copying an object of type `t` reads or writes volatile memory: the
+ * type itself, or a member or element of it, is volatile-qualified. */
+static int type_has_volatile(CType *t, int depth)
+{
+  if (t->t & VT_VOLATILE)
+    return 1;
+  /* Deeper than any real type (by-value nesting cannot cycle); still errs to
+   * volatile.  It was 8, which Zig's nested types exceed: every such copy then
+   * marked its word accesses volatile and armed the function's volatile gate,
+   * declining LDRD/STRD pairing across whole Sema functions of zig.c. */
+  if (depth > 64)
+    return 1;
+  const int bt = t->t & VT_BTYPE;
+  if (bt == VT_STRUCT && t->ref)
+  {
+    for (Sym *f = t->ref->next; f; f = f->next)
+      if (type_has_volatile(&f->type, depth + 1))
+        return 1;
+    return 0;
+  }
+  if (bt == VT_PTR && (t->t & VT_ARRAY) && t->ref)
+    return type_has_volatile(&t->ref->type, depth + 1);
+  return 0;
+}
+
 /* store vtop in lvalue pushed on stack */
 ST_FUNC void vstore(void)
 {
   int sbt, dbt, ft, r, size, align, bit_size, bit_pos, delayed_cast;
+  if (vtop[-1].type.t & VT_RODATA_REL)
+    rodata_rel_store_error();
+  /* A byte-reversed (big-endian scalar_storage_order) member is read through
+     gv() and written by sso_store_reversed(), never copied as raw memory. */
+  if ((vtop->r & VT_LVAL) && vtop->sso_reversed)
+    gv(RC_TYPE(vtop->type.t));
+  if ((vtop[-1].r & VT_LVAL) && vtop[-1].sso_reversed)
+  {
+    sso_store_reversed();
+    return;
+  }
   SValue orig_src = *vtop;
   SValue orig_dst = vtop[-1];
   /* Either side reached through a packed member (or a misaligned offset) may
@@ -90,14 +126,15 @@ ST_FUNC void vstore(void)
     Sym *s;
     for (s = local_stack; s; s = s->prev)
     {
-      if (!s->facts || !s->facts->const_init_data || !s->facts->const_init_valid)
+      SymLocalFacts *f = sym_facts_peek(s);
+      if (!f || !f->const_init_data || !f->const_init_valid)
         continue;
-      if (s->facts->const_init_in_progress)
+      if (f->const_init_in_progress)
         continue;
       int base = (int)s->c;
-      if (dst_off + dst_size > base && dst_off < base + s->facts->const_init_size)
+      if (dst_off + dst_size > base && dst_off < base + f->const_init_size)
       {
-        s->facts->const_init_valid = 0;
+        f->const_init_valid = 0;
       }
     }
   }
@@ -305,7 +342,10 @@ ST_FUNC void vstore(void)
       uint64_t packed = vtop->c.i;
       uint64_t mask = (src_bt == VT_LLONG) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << shift) - 1);
       int64_t src_real = (int64_t)(packed & mask);
-      int64_t src_imag = (int64_t)((packed >> shift) & mask);
+      /* A 64-bit element's imaginary part is not in the 64-bit packed value
+       * (a real constant converted to complex: it is 0).  `packed >> 64` is UB
+       * and on an x86 host shifted by 0, copying the real part into it. */
+      int64_t src_imag = shift >= 64 ? 0 : (int64_t)((packed >> shift) & mask);
 
       /* Allocate a temp local to hold the complex constant */
       int tmp_vr;
@@ -396,8 +436,10 @@ ST_FUNC void vstore(void)
     /* If base types differ, convert component-wise into a temp first */
     if (src_bt != dst_bt)
     {
-      int src_elem_size = (src_bt == VT_DOUBLE || src_bt == VT_LDOUBLE) ? 8 : 4;
-      int dst_elem_size = (dst_bt == VT_DOUBLE || dst_bt == VT_LDOUBLE) ? 8 : 4;
+      /* Integer complex types have integer-sized parts: a `_Complex short`
+       * destination put its imaginary part at offset 4, past the object. */
+      int src_elem_size = is_float(src_bt) ? ((src_bt == VT_DOUBLE || src_bt == VT_LDOUBLE) ? 8 : 4) : btype_size(src_bt);
+      int dst_elem_size = is_float(dst_bt) ? ((dst_bt == VT_DOUBLE || dst_bt == VT_LDOUBLE) ? 8 : 4) : btype_size(dst_bt);
       int dst_total = dst_elem_size * 2;
 
       CType src_elem_type;
@@ -473,6 +515,14 @@ ST_FUNC void vstore(void)
     {
       int complex_size, complex_align;
       complex_size = type_size(&vtop->type, &complex_align);
+      /* As for structs below: the word copies are typed VT_INT, so a volatile
+       * side reaches them only through the sticky bit. */
+      if (type_has_volatile(&vtop[0].type, 0))
+        vtop[0].volatile_access = 1;
+      if (type_has_volatile(&vtop[-1].type, 0))
+        vtop[-1].volatile_access = 1;
+      if (tcc_state->ir && (vtop[0].volatile_access || vtop[-1].volatile_access))
+        tcc_state->ir->func_has_volatile_access = 1;
 
       /* For small, word-aligned complex copies between stack locals,
        * expand to individual word LOAD/STORE pairs in the IR — mirrors
@@ -512,6 +562,11 @@ ST_FUNC void vstore(void)
           s.r = VT_LOCAL | VT_LVAL;
           s.vr = src.vr;
           s.c.i = src.c.i + off;
+          s.volatile_access = src.volatile_access;
+          /* A chunk typed by the word hides the packed chain the side came
+           * through; without the sticky bit svalue_to_iroperand would re-derive
+           * ALIGN4_OK from the word type and unlock LDRD/STRD/LDM/STM. */
+          s.underaligned = src.underaligned || ((src.c.i + off) & 3);
 
           svalue_init(&tmp);
           tmp.type = word_type;
@@ -525,6 +580,8 @@ ST_FUNC void vstore(void)
           d.r = VT_LOCAL | VT_LVAL;
           d.vr = dst.vr;
           d.c.i = dst.c.i + off;
+          d.volatile_access = dst.volatile_access;
+          d.underaligned = dst.underaligned || ((dst.c.i + off) & 3);
 
           tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &d);
         }
@@ -578,6 +635,20 @@ ST_FUNC void vstore(void)
     int has_vla = struct_has_vla_member(&vtop->type);
     CType saved_struct_type = vtop->type; /* save before gaddrof destroys it */
     size = type_size(&vtop->type, &align);
+    /* The inline copies below lower the struct to word LOADs/STOREs typed by
+     * the WORD, which says nothing about volatility; a volatile side (the
+     * struct qualified, or holding a volatile member) has to reach every one of
+     * them through the sticky bit, or `struct S t = *vs; return t.a;` keeps
+     * only the word it uses.  Copying a volatile object accesses all of it. */
+    if (type_has_volatile(&vtop[0].type, 0))
+      vtop[0].volatile_access = 1;
+    if (type_has_volatile(&vtop[-1].type, 0))
+      vtop[-1].volatile_access = 1;
+    /* A copy that becomes a memmove call has no volatile lvalue operand to arm
+     * the per-function gate (func_has_volatile_access) -- arm it here, or every
+     * pass asking about the call's arguments hears "not volatile". */
+    if (tcc_state->ir && (vtop[0].volatile_access || vtop[-1].volatile_access))
+      tcc_state->ir->func_has_volatile_access = 1;
 
     /* Self-copy elision: source and destination are the same register-deref
      * lvalue (same address vreg, same offset).  This is the post-call copy of
@@ -593,6 +664,14 @@ ST_FUNC void vstore(void)
         vtop[0].c.i == vtop[-1].c.i)
     {
       vtop--; /* pop src; vtop = dst (kept as result lvalue) */
+      vtop->type = saved_struct_type;
+      goto vstore_done;
+    }
+
+    if (tcc_state->ir && !has_vla && !NOEVAL_WANTED &&
+        ir_emit_small_padded_local_copy(&vtop[0], &vtop[-1], &saved_struct_type, size, align))
+    {
+      vtop--;
       vtop->type = saved_struct_type;
       goto vstore_done;
     }
@@ -704,6 +783,7 @@ ST_FUNC void vstore(void)
           s.vr = src.vr;
           s.sym = src.sym;
           s.c.i = src.c.i;
+          s.volatile_access = src.volatile_access;
           tmp.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, &s, NULL, &tmp);
         }
@@ -714,6 +794,7 @@ ST_FUNC void vstore(void)
         d.vr = dst.vr;
         d.sym = dst.sym;
         d.c.i = dst.c.i;
+        d.volatile_access = dst.volatile_access;
 
         tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &d);
       }
@@ -742,6 +823,7 @@ ST_FUNC void vstore(void)
           s.vr = src.vr;
           s.sym = src.sym;
           s.c.i = src.c.i;
+          s.volatile_access = src.volatile_access;
           tmp.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, &s, NULL, &tmp);
         }
@@ -752,6 +834,7 @@ ST_FUNC void vstore(void)
         d.vr = dst.vr;
         d.sym = dst.sym;
         d.c.i = dst.c.i;
+        d.volatile_access = dst.volatile_access;
 
         tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &d);
       }
@@ -770,6 +853,10 @@ ST_FUNC void vstore(void)
           s.vr = src.vr;
           s.sym = src.sym;
           s.c.i = src.c.i + off;
+          s.volatile_access = src.volatile_access;
+          /* Same sticky-mark rule as small_copy_lval: the word-typed chunk must
+           * not let a packed-derived side re-derive ALIGN4_OK by its type. */
+          s.underaligned = src.underaligned || ((src.c.i + off) & 3);
 
           svalue_init(&tmp);
           tmp.type = word_type;
@@ -784,6 +871,8 @@ ST_FUNC void vstore(void)
           d.vr = dst.vr;
           d.sym = dst.sym;
           d.c.i = dst.c.i + off;
+          d.volatile_access = dst.volatile_access;
+          d.underaligned = dst.underaligned || ((dst.c.i + off) & 3);
 
           tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &d);
         }
@@ -823,7 +912,7 @@ ST_FUNC void vstore(void)
     int dst_reg_deref_lval = IS_REG_DEREF_LVAL(vtop[-1].r);
     int dst_slot_lval = IS_LOCAL_LVAL(vtop[-1].r) || IS_GLOBAL_LVAL(vtop[-1].r);
     int slot_from_deref = dst_slot_lval && src_reg_deref_lval;
-    int inline_copy_max = (tcc_state->optimize > 0 || (dst_reg_deref_lval && src_reg_deref_lval) || slot_from_deref) ? 16 : 8;
+    int inline_copy_max = (TCC_OPT(tcc_state, optimize) > 0 || (dst_reg_deref_lval && src_reg_deref_lval) || slot_from_deref) ? 16 : 8;
     if (tcc_state->ir && !has_vla && size > 0 && size <= inline_copy_max &&
         !(size & 3) && !(align & 3) && !NOEVAL_WANTED &&
         ((dst_reg_deref_lval &&
@@ -875,6 +964,7 @@ ST_FUNC void vstore(void)
         SValue s, tmp;
         svalue_init(&s);
         s.type = word_type;
+        s.volatile_access = src.volatile_access;
 
         if (src_is_reg_deref && off != 0)
         {
@@ -897,6 +987,7 @@ ST_FUNC void vstore(void)
 
           s.r = VT_LVAL;
           s.vr = src_ptr.vr;
+          s.underaligned = src.underaligned;
         }
         else
         {
@@ -904,6 +995,7 @@ ST_FUNC void vstore(void)
           s.vr = src.vr;
           s.sym = src.sym;
           s.c.i = src.c.i + off;
+          s.underaligned = src.underaligned || ((src.c.i + off) & 3);
         }
 
         svalue_init(&tmp);
@@ -927,6 +1019,7 @@ ST_FUNC void vstore(void)
         SValue store_dst;
         svalue_init(&store_dst);
         store_dst.type = word_type;
+        store_dst.volatile_access = dst.volatile_access;
 
         if (dst_slot_lval)
         {
@@ -938,6 +1031,7 @@ ST_FUNC void vstore(void)
           store_dst.vr = dst.vr;
           store_dst.sym = dst.sym;
           store_dst.c.i = dst.c.i + off;
+          store_dst.underaligned = dst.underaligned || ((dst.c.i + off) & 3);
         }
         else
         {
@@ -965,6 +1059,7 @@ ST_FUNC void vstore(void)
 
           store_dst.r = VT_LVAL;
           store_dst.vr = dst_ptr.vr;
+          store_dst.underaligned = dst.underaligned;
         }
 
         tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &store_dst);
@@ -1022,7 +1117,21 @@ ST_FUNC void vstore(void)
       if ((src_deref || src_slot) && (dst_deref || dst_slot))
         chunks = small_aggregate_copy_plan(&saved_struct_type, size, align, src_slot ? (int)vtop[0].c.i : -1,
                                            dst_slot ? (int)vtop[-1].c.i : -1, &w, covered);
-      if (chunks > 0 && chunks <= small_aggregate_copy_max_chunks())
+      /* A byte-tiled copy (w == 1, so the type is align(1) and no wider tile
+       * fits) may take up to eight chunks where a word-tiled one stays at the
+       * swept ceiling above: these chunks are the Zig C backend's spelling of
+       * an unaligned load (mem.readInt/eqlBytes, `t29 = (*t27)` on a u8[8]),
+       * a local that exists only to be read back byte-wise.  The pieces are
+       * same-width store-to-load forwardable (slfwd_post_unroll) and then
+       * load_combine fuses the readback into one wide load of the SOURCE --
+       * an opaque __aeabi_memmove call is never forwarded (the SSA copy_fwd
+       * availability walk sees the frame slot reused by every sibling copy
+       * in the loop and declines), and the kernel's streaming Wyhash paid
+       * one call plus a stack round-trip per input word.  The wider ceiling
+       * is still wrong for word tiles: nothing fuses those back (zig.c -O2
+       * .text +4.6k at 8; at 8 bytes the byte tiles instead measured
+       * kernel.c -60 B with 11 of 20 memmove sites dissolved). */
+      if (chunks > 0 && chunks <= (w == 1 ? 8 : small_aggregate_copy_max_chunks()))
       {
         SValue src = vtop[0];
         SValue dst = vtop[-1];
@@ -1048,6 +1157,10 @@ ST_FUNC void vstore(void)
 #undef IS_LOCAL_LVAL
 #undef IS_GLOBAL_LVAL
 
+    /* Neither side volatile: the copy's source operand says so (below), and
+     * ssa:copy_fwd may read the source later than the copy itself did. */
+    const int copy_volatile = vtop[0].volatile_access || vtop[-1].volatile_access ||
+                              type_has_volatile(&vtop[0].type, 0) || type_has_volatile(&vtop[-1].type, 0);
     /* destination, keep on stack() as result */
     vpushv(vtop - 1);
 #ifdef CONFIG_TCC_BCHECK
@@ -1125,11 +1238,24 @@ ST_FUNC void vstore(void)
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
         LOG_CODEGEN("FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
                     TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-3].r, vtop[-3].vr);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
+        const int dst_param = tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-3], &param_num, NULL);
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 1);
         LOG_CODEGEN("FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
                     TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-2].r, vtop[-2].vr);
-        tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
+        const int src_param = tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, &vtop[-2], &param_num, NULL);
+        /* Both sides, so sra may still split a copy-out in a function whose
+         * volatile gate is armed (Zig's relaxed atomics are volatile accesses). */
+        const int copy_params[2] = {dst_param, src_param};
+        for (int k = 0; k < 2 && !copy_volatile; k++)
+        {
+          const int pi = copy_params[k];
+          if (pi < 0 || pi >= tcc_state->ir->next_instruction_index ||
+              tcc_state->ir->compact_instructions[pi].op != TCCIR_OP_FUNCPARAMVAL)
+            continue;
+          IROperand a = tcc_ir_op_get_src1(tcc_state->ir, &tcc_state->ir->compact_instructions[pi]);
+          a.aux |= IROP_AUX_NONVOLATILE;
+          tcc_ir_set_src1(tcc_state->ir, pi, a);
+        }
         param_num.c.i = TCCIR_ENCODE_PARAM(call_id, 2);
         LOG_CODEGEN("FUNCPARAMVAL push: site=memmove call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
                     TCCIR_DECODE_PARAM_IDX((uint32_t)param_num.c.i), vtop[-1].r, vtop[-1].vr);
@@ -1142,30 +1268,23 @@ ST_FUNC void vstore(void)
       }
     }
   vstore_done:
-    if (vstore_src_cid)
+    /* A copy may sit under control flow (or in dead code), so it only
+     * invalidates the destination's const_init_data (the overlap loop above).
+     * The exception is a local's own initializer (`v4 t = a;`), which runs
+     * exactly where it is parsed. */
+    if (vstore_src_cid && !nocode_wanted)
     {
       int dst_addr = (int)orig_dst.c.i;
-      Sym *dst_sym = NULL;
       for (Sym *s = local_stack; s; s = s->prev)
       {
-        if ((int)s->c == dst_addr && SYM_FACTS(s)->const_init_size >= size)
+        SymLocalFacts *f = sym_facts_peek(s);
+        if (f && f->const_init_in_progress && f->const_init_data && (int)s->c == dst_addr &&
+            f->const_init_size == vstore_src_cid_size)
         {
-          dst_sym = s;
+          memcpy(f->const_init_data, vstore_src_cid, vstore_src_cid_size);
+          f->const_init_valid = 1;
           break;
         }
-      }
-      if (dst_sym)
-      {
-        SymLocalFacts *f = sym_facts(dst_sym);
-        if (!f->const_init_data)
-          f->const_init_data = tcc_malloc(vstore_src_cid_size);
-        memcpy(f->const_init_data, vstore_src_cid, vstore_src_cid_size);
-        f->const_init_size = vstore_src_cid_size;
-        f->const_init_valid = 1;
-      }
-      else
-      {
-        attach_const_init_to_temp(dst_addr, vstore_src_cid_size, vstore_src_cid);
       }
       /* vstore_src_cid points at the stack buffer above — no free needed. */
     }
@@ -1175,11 +1294,28 @@ ST_FUNC void vstore(void)
   {
     /* bitfield store handling */
 
-    /* save lvalue as expression result (example: s.b = s.a = n;) */
-    vdup(), vtop[-1] = vtop[-2];
+    /* The value of an assignment is the value stored (C11 6.5.16p3).  For an
+     * ordinary field the lvalue stands in for it -- re-reading the field is
+     * harmless and folds away -- but a volatile field must not be read again:
+     * `REG->f = 3;` is one read-modify-write, and the statement-level discard
+     * (gv_discarded_volatile) would otherwise load the lvalue left here.  Keep
+     * the source instead, evaluated once, and narrow it to the field below. */
+    const int bf_value_from_src =
+        !nocode_wanted && ((ft & VT_VOLATILE) || orig_dst.volatile_access ||
+                           (orig_dst.sym && (orig_dst.sym->type.t & VT_VOLATILE)));
+    if (bf_value_from_src)
+    {
+      if ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST)
+        gv(RC_TYPE(vtop->type.t));
+      vdup(), vrott(3); /* src dst src */
+    }
+    else
+      /* save lvalue as expression result (example: s.b = s.a = n;) */
+      vdup(), vtop[-1] = vtop[-2];
 
     bit_pos = BIT_POS(ft);
     bit_size = BIT_SIZE(ft);
+    const Sym *bf = vtop[-1].type.ref;
     /* remove bit field info to avoid loops */
     vtop[-1].type.t = ft & ~VT_STRUCT_MASK;
 
@@ -1189,6 +1325,10 @@ ST_FUNC void vstore(void)
       vtop[-1].type.t = (vtop[-1].type.t & ~VT_BTYPE) | (VT_BYTE | VT_UNSIGNED);
     }
     r = adjust_bf(vtop - 1, bit_pos, bit_size);
+    /* a big-endian scalar_storage_order unit: the read-modify-write below
+       loads and stores it byte-reversed */
+    if (bf && bf->a.sso_be && sso_scalar_size(&vtop[-1].type))
+      vtop[-1].sso_reversed = 1;
     if (dbt != VT_BOOL)
     {
       gen_cast(&vtop[-1].type);
@@ -1229,6 +1369,28 @@ ST_FUNC void vstore(void)
       /* ... and discard */
       vpop();
     }
+    if (bf_value_from_src)
+    {
+      /* the kept source, as the field holds it: converted, then truncated to
+       * bit_size bits and sign- or zero-extended */
+      if ((ft & VT_BTYPE) == VT_BOOL)
+      {
+        CType bool_type = {.t = VT_BOOL};
+        gen_cast(&bool_type);
+      }
+      else
+      {
+        const int is_ll = (ft & VT_BTYPE) == VT_LLONG;
+        CType value_type = {.t = (is_ll ? VT_LLONG : VT_INT) | (ft & VT_UNSIGNED)};
+        const int sh = (is_ll ? 64 : 32) - bit_size;
+        gen_cast(&value_type);
+        if (sh > 0)
+        {
+          vpushi(sh), gen_op(TOK_SHL);
+          vpushi(sh), gen_op((ft & VT_UNSIGNED) ? TOK_SHR : TOK_SAR);
+        }
+      }
+    }
   }
   else if (dbt == VT_VOID)
   {
@@ -1248,9 +1410,13 @@ ST_FUNC void vstore(void)
       sbt = vtop->type.t & VT_BTYPE;
     }
 
-    /* optimize char/short casts */
+    /* optimize char/short casts.  Only a narrowing one: the delayed cast
+     * later treats the value as an int (force_charshort_cast), which a
+     * narrower source still in memory or in a narrow vreg is not -- a
+     * `unsigned short v = uchar;` read the byte back sign-extended. */
     delayed_cast = 0;
-    if ((dbt == VT_BYTE || dbt == VT_SHORT) && is_integer_btype(sbt))
+    if ((dbt == VT_BYTE || dbt == VT_SHORT) && is_integer_btype(sbt) &&
+        !(tcc_state->ir && btype_size(sbt) < btype_size(dbt)))
     {
       if ((vtop->r & (VT_MUSTCAST | (VT_MUSTCAST << 1))) && btype_size(dbt) > btype_size(sbt))
         force_charshort_cast();

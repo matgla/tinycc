@@ -63,6 +63,8 @@ int ir_opt_eval_const_u64(TCCIRState *ir, IROperand op, int use_idx, uint64_t *o
     return 0;
 
   q = &ir->compact_instructions[def_idx];
+  if (tcc_ir_barrel_shift_at(ir, q))
+    return 0;
   switch (q->op)
   {
   case TCCIR_OP_ASSIGN:
@@ -85,8 +87,7 @@ int ir_opt_eval_const_u64(TCCIRState *ir, IROperand op, int use_idx, uint64_t *o
     if (!ir_opt_eval_const_u64(ir, tcc_ir_op_get_src2(ir, q), def_idx, &v2, depth + 1))
       return 0;
     /* Shifts must be evaluated at the operand width: a 64-bit shift of a sign-extended 32-bit value gives a different result than the runtime op. */
-    IROperand shift_src1 = tcc_ir_op_get_src1(ir, q);
-    int shift_btype = irop_get_btype(shift_src1);
+    int shift_btype = tcc_ir_op_src1_btype(ir, q);
     int shift_is_64 = (shift_btype == IROP_BTYPE_INT64 || shift_btype == IROP_BTYPE_FLOAT64);
     switch (q->op)
     {
@@ -140,8 +141,7 @@ int ir_opt_eval_const_u64(TCCIRState *ir, IROperand op, int use_idx, uint64_t *o
     uint64_t v;
     if (!ir_opt_eval_const_u64(ir, tcc_ir_op_get_src1(ir, q), def_idx, &v, depth + 1))
       return 0;
-    IROperand sop = tcc_ir_op_get_src1(ir, q);
-    int sb = irop_get_btype(sop);
+    int sb = tcc_ir_op_src1_btype(ir, q);
     uint64_t mask;
     switch (sb)
     {
@@ -202,7 +202,10 @@ int ir_opt_eval_const_string(TCCIRState *ir, IROperand op, int use_idx, const ch
   if (!ir || !out || depth > 16)
     return 0;
 
-  if (op.is_lval && op.vreg_type == TCCIR_VREG_TYPE_TEMP)
+  /* An lval operand is the value loaded from the address, never the address of
+   * a string: `GlobalSym(tab)+4***DEREF***` is a pointer out of a rodata table,
+   * and the table slot's own bytes are not the string it points at. */
+  if (op.is_lval)
     return 0;
 
   base = ir_opt_get_constant_string_from_symref(ir, op);
@@ -231,10 +234,11 @@ int ir_opt_eval_const_string(TCCIRState *ir, IROperand op, int use_idx, const ch
     return 0;
 
   q = &ir->compact_instructions[def_idx];
+  if (tcc_ir_barrel_shift_at(ir, q))
+    return 0;
   switch (q->op)
   {
   case TCCIR_OP_ASSIGN:
-  case TCCIR_OP_LOAD:
     return ir_opt_eval_const_string(ir, tcc_ir_op_get_src1(ir, q), def_idx, out, depth + 1);
   case TCCIR_OP_ADD:
   {
@@ -269,8 +273,8 @@ const char *ir_opt_get_constant_string_from_symref(TCCIRState *ir, IROperand op)
   addr_t offset;
   size_t remaining;
 
-  if (!ir || irop_get_tag(op) != IROP_TAG_SYMREF)
-    return NULL;
+  if (!ir || irop_get_tag(op) != IROP_TAG_SYMREF || op.is_lval)
+    return NULL; /* DEREF of the symbol: the bytes there are a pointer, not the string */
 
   symref = irop_get_symref_ex(ir, op);
   if (!symref || symref->addend < 0)
@@ -307,4 +311,17 @@ const char *ir_opt_get_constant_string_from_symref(TCCIRState *ir, IROperand op)
     return NULL;
 
   return str;
+}
+
+int ir_softfp_cmp3(int is_double, int64_t a0, int64_t a1, int *is_nan)
+{
+  if (is_double)
+  {
+    double a = ir_bits_to_d(a0), b = ir_bits_to_d(a1);
+    *is_nan = (a != a) || (b != b);
+    return (a > b) - (a < b);
+  }
+  float a = ir_bits_to_f(a0), b = ir_bits_to_f(a1);
+  *is_nan = (a != a) || (b != b);
+  return (a > b) - (a < b);
 }

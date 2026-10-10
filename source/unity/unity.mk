@@ -123,6 +123,7 @@ UNITY_MEMBERS_frontend_gen_type = \
 UNITY_MEMBERS_frontend_gen_value = \
 	source/frontend/gen/value/load.c \
 	source/frontend/gen/value/longlong.c \
+	source/frontend/gen/value/rodata_rel.c \
 	source/frontend/gen/value/strlit_pool.c \
 	source/frontend/gen/value/vstack.c
 
@@ -131,7 +132,9 @@ UNITY_MEMBERS_ir = \
 	source/ir/cfg.c \
 	source/ir/dead_def.c \
 	source/ir/dump.c \
+	source/ir/known_ext.c \
 	source/ir/machine_op.c \
+	source/ir/op_props.c \
 	source/ir/pool.c \
 	source/ir/self_store.c \
 	source/ir/ssa.c \
@@ -139,7 +142,8 @@ UNITY_MEMBERS_ir = \
 	source/ir/vreg.c
 UNITY_MEMBERS_ir_frame = \
 	source/ir/cross_jump.c \
-	source/ir/frame.c
+	source/ir/frame.c \
+	source/ir/frame_dfe.c
 UNITY_MEMBERS_ir_gen = \
 	source/ir/gen/arith.c \
 	source/ir/gen/asm.c \
@@ -169,6 +173,7 @@ UNITY_MEMBERS_machine_s1 = \
 
 UNITY_GROUPS_memory = memory_s1
 UNITY_MEMBERS_memory_s1 = \
+	source/memory/sort.c \
 	source/memory/unique_ptr.c \
 	source/memory/vector.c
 
@@ -197,7 +202,6 @@ UNITY_MEMBERS_opt_engine = \
 	source/opt/engine/fp_cache_shim.c \
 	source/opt/engine/fp_mat_cache.c \
 	source/opt/engine/gen_adapters.c \
-	source/opt/engine/pass_registry.c \
 	source/opt/engine/pass_timing.c \
 	source/opt/engine/pipeline_run.c \
 	source/opt/engine/pipeline_table.c \
@@ -209,6 +213,7 @@ UNITY_MEMBERS_opt_flat_cfg = \
 	source/opt/flat/cfg/jump_thread.c \
 	source/opt/flat/cfg/jumpif_invert.c \
 	source/opt/flat/cfg/returnvalue_merge.c \
+	source/opt/flat/cfg/switch_head.c \
 	source/opt/flat/cfg/switch_to_data.c
 UNITY_MEMBERS_opt_flat_dce = \
 	source/opt/flat/dce/body_essential.c \
@@ -260,6 +265,7 @@ UNITY_MEMBERS_opt_flat_ipa = \
 	source/opt/flat/ipa/tu_noreturn.c
 UNITY_MEMBERS_opt_flat_loop = \
 	source/opt/flat/loop/const_sim.c \
+	source/opt/flat/loop/decrement_carry.c \
 	source/opt/flat/loop/func_purity.c \
 	source/opt/flat/loop/loop_detect.c \
 	source/opt/flat/loop/loop_eliminate.c \
@@ -280,6 +286,7 @@ UNITY_MEMBERS_opt_flat_loop_iv = \
 UNITY_MEMBERS_opt_flat_memory = \
 	source/opt/flat/memory/block_copy_init.c \
 	source/opt/flat/memory/const_local_table.c \
+	source/opt/flat/memory/escape_copy_call.c \
 	source/opt/flat/memory/mem_init.c \
 	source/opt/flat/memory/mem_inline.c \
 	source/opt/flat/memory/memmove_to_indexed_stores.c \
@@ -287,6 +294,7 @@ UNITY_MEMBERS_opt_flat_memory = \
 	source/opt/flat/memory/small_memset_to_store.c \
 	source/opt/flat/memory/sra.c \
 	source/opt/flat/memory/sret_nrvo.c \
+	source/opt/flat/memory/struct_arg_split.c \
 	source/opt/flat/memory/struct_copy_roundtrip_elim.c
 UNITY_MEMBERS_opt_flat_memory_cse = \
 	source/opt/flat/memory/deref_operand_cse.c \
@@ -347,7 +355,9 @@ UNITY_MEMBERS_opt_flat_scalar_known = \
 	source/opt/flat/scalar/redundant_loop_check.c \
 	source/opt/flat/scalar/value_tracking.c
 UNITY_MEMBERS_opt_ra = \
+	source/opt/ra/branch_thread.c \
 	source/opt/ra/const_branch_fold.c \
+	source/opt/ra/exit_sink.c \
 	source/opt/ra/incomplete_calls.c \
 	source/opt/ra/phi_const_chain.c \
 	source/opt/ra/umaal_fusion.c
@@ -377,6 +387,7 @@ UNITY_MEMBERS_opt_ssa_engine = \
 	source/opt/ssa/engine/use_def.c
 UNITY_MEMBERS_opt_ssa_loop = \
 	source/opt/ssa/loop/dead_loop.c \
+	source/opt/ssa/loop/decrement_carry.c \
 	source/opt/ssa/loop/decrement_to_zero.c \
 	source/opt/ssa/loop/first_iter_exit.c \
 	source/opt/ssa/loop/iv_strength_reduction.c \
@@ -387,9 +398,11 @@ UNITY_MEMBERS_opt_ssa_loop = \
 	source/opt/ssa/loop/loop_unroll.c \
 	source/opt/ssa/loop/ptr_iv_exit_subst.c
 UNITY_MEMBERS_opt_ssa_memory = \
+	source/opt/ssa/memory/copy_fwd.c \
 	source/opt/ssa/memory/diamond_store_fwd.c \
 	source/opt/ssa/memory/global_addr_hoist.c \
 	source/opt/ssa/memory/global_store_dse.c \
+	source/opt/ssa/memory/load_combine.c \
 	source/opt/ssa/memory/load_cse.c \
 	source/opt/ssa/memory/ptr_store_dse.c
 UNITY_MEMBERS_opt_ssa_scalar = \
@@ -426,6 +439,7 @@ UNITY_MEMBERS_opt_util = \
 	source/opt/util/ir_insert.c \
 	source/opt/util/pass_disable.c \
 	source/opt/util/purity.c \
+	source/opt/util/range.c \
 	source/opt/util/volatile_access.c \
 	source/opt/util/vreg_def_use.c \
 	source/opt/util/vreg_query.c \

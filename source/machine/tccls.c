@@ -36,10 +36,8 @@ void tcc_ls_initialize(LSLiveIntervalState *ls)
   ls->intervals_size = LS_LIVE_INTERVAL_INIT_SIZE;
   ls->intervals = (LSLiveInterval *)tcc_malloc(sizeof(LSLiveInterval) * ls->intervals_size);
   ls->next_interval_index = 0;
-
-  ls->active_set = (LSLiveInterval **)tcc_malloc(sizeof(LSLiveInterval *) * LS_LIVE_INTERVAL_INIT_SIZE);
-  ls->next_active_index = 0;
   ls->dirty_registers = 0;
+  ls->spare_scratch_regs = 0;
   ls->dirty_float_registers = 0;
   ls->live_regs_by_instruction = NULL;
   ls->live_regs_by_instruction_size = 0;
@@ -57,7 +55,6 @@ void tcc_ls_initialize(LSLiveIntervalState *ls)
 void tcc_ls_deinitialize(LSLiveIntervalState *ls)
 {
   tcc_free(ls->intervals);
-  tcc_free(ls->active_set);
 
   if (ls->live_regs_by_instruction)
   {
@@ -82,7 +79,7 @@ void tcc_ls_reset_scratch_cache(LSLiveIntervalState *ls)
 void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls)
 {
   ls->next_interval_index = 0;
-  ls->next_active_index = 0;
+  ls->caller_save_count = 0;
   ls->live_sweep_valid = 0;
 
   if (ls->live_regs_by_instruction)
@@ -95,17 +92,24 @@ void tcc_ls_clear_live_intervals(LSLiveIntervalState *ls)
   tcc_ls_reset_scratch_cache(ls);
 }
 
+/* ra_write_results knows how many intervals it will add: sizing the array to
+ * exactly that instead of doubling up from LS_LIVE_INTERVAL_INIT_SIZE avoids
+ * up to 2x dead capacity in the largest function's table. */
+void tcc_ls_reserve(LSLiveIntervalState *ls, int count)
+{
+  if (count <= ls->intervals_size)
+    return;
+  ls->intervals_size = count;
+  ls->intervals = (LSLiveInterval *)tcc_realloc(ls->intervals, sizeof(LSLiveInterval) * ls->intervals_size);
+}
+
 void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int end, int crosses_call, int addrtaken,
                               int reg_type, int lvalue, int precolored_reg)
 {
   LSLiveInterval *interval;
 
   if (ls->next_interval_index >= ls->intervals_size)
-  {
-    ls->intervals_size <<= 1;
-    ls->intervals = (LSLiveInterval *)tcc_realloc(ls->intervals, sizeof(LSLiveInterval) * ls->intervals_size);
-    ls->active_set = (LSLiveInterval **)tcc_realloc(ls->active_set, sizeof(LSLiveInterval *) * ls->intervals_size);
-  }
+    tcc_ls_reserve(ls, ls->intervals_size << 1);
 
   interval = &ls->intervals[ls->next_interval_index];
   interval->vreg = vreg;
@@ -119,10 +123,7 @@ void tcc_ls_add_live_interval(LSLiveIntervalState *ls, int vreg, int start, int 
   interval->reg_type = reg_type;
   interval->lvalue = lvalue;
   interval->co_member = 0;
-  {
-    const int is_param = (TCCIR_DECODE_VREG_TYPE(vreg) == TCCIR_VREG_TYPE_PARAM);
-    interval->sort_key = ((uint64_t)(!is_param) << 33) | ((uint64_t)(uint32_t)end << 1) | (lvalue ? 0u : 1u);
-  }
+  interval->caller_save = 0;
   ls->next_interval_index++;
   ls->live_sweep_valid = 0;
 }
@@ -236,7 +237,7 @@ void tcc_ls_compact_stack_locations_weighted(LSLiveIntervalState *ls, int spill_
   if (weights)
   {
     slot_order_map = map;
-    qsort(order, map_count, sizeof(int), slot_cold_first);
+    tcc_qsort(order, map_count, sizeof(int), slot_cold_first);
     slot_order_map = NULL;
   }
   int loc = spill_base;
@@ -291,7 +292,7 @@ void tcc_ls_recompute_dirty_registers(LSLiveIntervalState *ls)
   uint64_t non_callee = old_dirty & ~callee_mask;
   uint64_t callee_dirty = old_dirty & callee_mask;
   uint64_t callee_used = actually_used & callee_mask;
-  ls->dirty_registers = non_callee | (callee_dirty & callee_used);
+  ls->dirty_registers = non_callee | (callee_dirty & callee_used) | ls->spare_scratch_regs;
 }
 
 static uint32_t ls_interval_live_mask(const LSLiveInterval *interval, uint32_t idx)
@@ -317,8 +318,21 @@ static int ls_sweep_cmp_start(const void *a, const void *b)
   return sa < sb ? -1 : sa > sb;
 }
 
-/* Advance the sweep so live_sweep_active holds exactly the intervals with
- * start <= idx <= end (idx must be >= 0). */
+/* Only an interval in a core register can contribute to either query.  A
+ * register-less one is left out of the active list: 101_cleanup's 65536
+ * address-taken locals each live in a stack slot to the end of main, and
+ * walking them on every scratch query made -O0 codegen quadratic.  Codegen
+ * only ever moves an interval reg->reg or reg->memory; a pass that gives a
+ * register-less interval a register must clear live_sweep_valid. */
+static int ls_sweep_has_core_reg(const LSLiveInterval *iv)
+{
+  if (iv->reg_type != LS_REG_TYPE_INT && iv->reg_type != LS_REG_TYPE_LLONG)
+    return 0;
+  return (iv->r0 >= 0 && iv->r0 < 16) || (iv->r1 >= 0 && iv->r1 < 16);
+}
+
+/* Advance the sweep so live_sweep_active holds exactly the register-holding
+ * intervals with start <= idx <= end (idx must be >= 0). */
 static void ls_sweep_advance(LSLiveIntervalState *ls, uint32_t idx)
 {
   if (!ls->live_sweep_valid) {
@@ -328,7 +342,7 @@ static void ls_sweep_advance(LSLiveIntervalState *ls, uint32_t idx)
     for (int i = 0; i < n; ++i)
       ls->live_sweep_order[i] = i;
     ls_sweep_cmp_intervals = ls->intervals;
-    qsort(ls->live_sweep_order, n, sizeof(int), ls_sweep_cmp_start);
+    tcc_qsort(ls->live_sweep_order, n, sizeof(int), ls_sweep_cmp_start);
     ls->live_sweep_count = n;
     ls->live_sweep_valid = 1;
     ls->live_sweep_pos = 0;
@@ -345,7 +359,7 @@ static void ls_sweep_advance(LSLiveIntervalState *ls, uint32_t idx)
   while (ls->live_sweep_pos < ls->live_sweep_count &&
          ls->intervals[ls->live_sweep_order[ls->live_sweep_pos]].start <= idx) {
     int ii = ls->live_sweep_order[ls->live_sweep_pos++];
-    if (ls->intervals[ii].end >= idx)
+    if (ls->intervals[ii].end >= idx && ls_sweep_has_core_reg(&ls->intervals[ii]))
       ls->live_sweep_active[ls->live_sweep_active_count++] = ii;
   }
 
@@ -426,6 +440,38 @@ int tcc_ls_reg_held_by_other(const LSLiveIntervalState *ls, int reg, int pos, co
   return 0;
 }
 
+/* tcc_ls_reg_held_by_other for every position of [start, end] at once:
+ * held[k - start] is nonzero when another claimant holds `reg` at k (nothing
+ * is held when end < start).  Returns a tcc_malloc'd array for the caller to
+ * free.  A rewriter releasing a register over a whole interval asks this
+ * instead of scanning every interval per position. */
+uint8_t *tcc_ls_reg_held_by_other_range(const LSLiveIntervalState *ls, int reg, int start, int end,
+                                        const LSLiveInterval *skip)
+{
+  int len = start >= 0 && end >= start ? end - start + 1 : 0;
+  int *delta = tcc_mallocz(((size_t)len + 1) * sizeof(int));
+  uint8_t *held = tcc_malloc((size_t)len + 1);
+  for (int i = 0; i < ls->next_interval_index && len > 0; ++i)
+  {
+    const LSLiveInterval *iv = &ls->intervals[i];
+    if (iv == skip || iv->stack_location != 0 || (iv->r0 != reg && iv->r1 != reg))
+      continue;
+    uint32_t lo = iv->start > (uint32_t)start ? iv->start : (uint32_t)start;
+    uint32_t hi = iv->end < (uint32_t)end ? iv->end : (uint32_t)end;
+    if (lo > hi)
+      continue;
+    delta[lo - (uint32_t)start]++;
+    delta[hi - (uint32_t)start + 1]--;
+  }
+  for (int k = 0, c = 0; k < len; k++)
+  {
+    c += delta[k];
+    held[k] = c != 0;
+  }
+  tcc_free(delta);
+  return held;
+}
+
 int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, uint32_t exclude_regs, int is_leaf)
 {
   uint32_t live_regs = exclude_regs;
@@ -481,6 +527,12 @@ int tcc_ls_find_free_scratch_reg(LSLiveIntervalState *ls, int instruction_idx, u
   {
     LS_DBG("    Found scratch register R12 (IP)");
     return 12;
+  }
+
+  if (ls->spare_scratch_regs & ~live_regs)
+  {
+    LS_DBG("    Found spare scratch register");
+    return (int)__builtin_ctz(ls->spare_scratch_regs & ~live_regs);
   }
 
   if (!is_leaf && !(live_regs & (1u << 14)))

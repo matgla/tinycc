@@ -111,9 +111,16 @@ typedef struct __attribute__((packed)) YaffArchSection {
   uint8_t arch;      /* YaffArch; must equal YaffHeader.arch */
   uint8_t fpu;       /* YaffFpu the code was generated for */
   uint8_t float_abi; /* YaffFloatAbi */
-  uint8_t reserved_[3];
+  uint8_t flags;     /* YAFF_ARCH_FLAG_* */
+  uint8_t reserved_[2];
   uint32_t required_features; /* bitmask of YaffArchFeature */
 } YaffArchSection;
+
+/* Every code address the module hands the loader -- an exported symbol, a
+ * data relocation's value -- already carries its Thumb bit exactly: set for
+ * code, clear for a data object placed in an executable section.  Without it
+ * the loader sets bit 0 on every code-section address (older images). */
+#define YAFF_ARCH_FLAG_EXACT_THUMB 0x01
 
 typedef struct __attribute__((packed)) YaffHeader {
   uint8_t magic[4];

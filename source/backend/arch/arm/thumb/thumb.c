@@ -22,6 +22,9 @@
 #include "thumb.h"
 #include "tcc.h"
 
+#include "thop_shapes_def.h"
+#include "thop_customs_def.h"
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Thumb feature profiles, extensions, and FPU bundles
  * ═══════════════════════════════════════════════════════════════════ */
@@ -236,11 +239,17 @@ thop_feat thumb_resolve_fpu(const char *mfpu)
 
 thumb_opcode thop_emit_error(const char *name, const thop_variant *table, size_t n, thop_args a)
 {
+  return thop_emit_error_in(thop_shapes, name, table, n, a);
+}
+
+thumb_opcode thop_emit_error_in(const thop_variant_shape *shapes, const char *name, const thop_variant *table,
+                                size_t n, thop_args a)
+{
   const thop_feat target_feat = arm_target_dependent.feat;
 
   bool has_feat_mismatch = false;
   for (size_t i = 0; i < n; i++) {
-    if (!thop_feat32_subset(table[i].shape->feat, target_feat)) {
+    if (!thop_feat32_subset(shapes[table[i].shape].feat, target_feat)) {
       has_feat_mismatch = true;
       break;
     }
@@ -249,7 +258,7 @@ thumb_opcode thop_emit_error(const char *name, const thop_variant *table, size_t
   if (has_feat_mismatch) {
     fprintf(stderr, "thop_emit: '%s': no variant matched (%zu candidates)\n", name, n);
     for (size_t i = 0; i < n; i++) {
-      const thop_variant_shape *s = table[i].shape;
+      const thop_variant_shape *s = &shapes[table[i].shape];
       if (!thop_feat32_subset(s->feat, target_feat)) {
         char missing[256];
         thop_feat_describe_missing(thop_feat32_widen(s->feat), target_feat, missing, sizeof missing);
@@ -270,7 +279,7 @@ thumb_opcode thop_emit_error(const char *name, const thop_variant *table, size_t
   for (size_t i = 0; i < n; i++)
   {
     const thop_variant *v = &table[i];
-    const thop_variant_shape *s = v->shape;
+    const thop_variant_shape *s = &shapes[v->shape];
 
     THOP_TRACE("  T%d (base=0x%x, %s): REJECT ",
                (int)i + 1, v->base, s->size == THOP_VARIANT_T16 ? "T16" : "T32");
@@ -354,8 +363,12 @@ typedef struct ThPackConstCacheEntry
   uint8_t valid;
 } ThPackConstCacheEntry;
 
+#ifdef CONFIG_TCC_LOW_MEM
+#define TH_PACK_CONST_CACHE_SIZE 16
+#else
 #define TH_PACK_CONST_CACHE_SIZE 64 /* YASOS: 256 -> 64 saves ~2.3 KiB .bss; pure
                                        perf cache (miss => recompute const pack). */
+#endif
 static ThPackConstCacheEntry th_pack_const_cache[TH_PACK_CONST_CACHE_SIZE];
 
 uint32_t th_pack_const(uint32_t imm)
@@ -436,7 +449,7 @@ uint32_t th_encbranch_8(int pos, int addr)
   addr = (addr - pos - 4) >> 1;
   if (addr > 127 || addr < -128)
   {
-    tcc_error("compiler_error: th_encbranch_8 too far address: %i\n", addr);
+    tcc_ice("th_encbranch_8 too far address: %i\n", addr);
     return 0;
   }
   return addr & 0xff;
@@ -445,9 +458,9 @@ uint32_t th_encbranch_8(int pos, int addr)
 uint32_t th_encbranch_11(int pos, int addr)
 {
   addr = (addr - pos - 4) >> 1;
-  if (addr >= 1023 || addr < -1024)
+  if (addr > 1023 || addr < -1024)
   {
-    tcc_error("compiler_error: th_encbranch_11 too far address: %i\n", addr);
+    tcc_ice("th_encbranch_11 too far address: %i\n", addr);
     return 0;
   }
   return addr & 0x7ff;
@@ -473,8 +486,33 @@ uint32_t th_shift_type_to_op(thumb_shift shift)
   case THUMB_SHIFT_ROR:
     return 7;
   default:
-    tcc_error("compiler_error: 'th_shift_type_to_op', unknown shift type %d\n", shift.type);
+    tcc_ice("'th_shift_type_to_op', unknown shift type %d\n", shift.type);
     return 0;
+  }
+}
+
+/* Canonicalise an immediate shift for encoding (DecodeImmShift):
+ *  - LSR/ASR #0 and ROR #0 would be executed as LSR/ASR #32 and RRX; #0 means
+ *    "no shift", so rewrite them to LSL #0 (a plain MOV).
+ *  - LSR/ASR #32 is valid and keeps value 32 (encoders place it as imm5 = 0).
+ *  - Anything out of range (> 32 for LSR/ASR, > 31 for LSL/ROR) is rejected. */
+bool th_shift_imm_normalize(thumb_shift *shift)
+{
+  switch (shift->type)
+  {
+  case THUMB_SHIFT_LSL:
+    return shift->value <= 31;
+  case THUMB_SHIFT_LSR:
+  case THUMB_SHIFT_ASR:
+    if (shift->value == 0)
+      shift->type = THUMB_SHIFT_LSL;
+    return shift->value <= 32;
+  case THUMB_SHIFT_ROR:
+    if (shift->value == 0)
+      shift->type = THUMB_SHIFT_LSL;
+    return shift->value <= 31;
+  default:
+    return true;
   }
 }
 
@@ -509,7 +547,7 @@ thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd, uint3
   /* Guard against invalid register values (e.g., -1 or PREG_SPILLED) */
   if (rd > 15 || rn > 15 || rm > 15)
   {
-    tcc_error("compiler_error: 'th_generic_op_reg_shift_with_status' invalid register: rd=%d, rn=%d, rm=%d (op=0x%x)\n",
+    tcc_ice("'th_generic_op_reg_shift_with_status' invalid register: rd=%d, rn=%d, rm=%d (op=0x%x)\n",
               rd, rn, rm, op);
   }
 
@@ -566,12 +604,18 @@ bool thop_feat32_subset(thop_feat32 sub, thop_feat sup)
 
 thumb_opcode thop_emit(const char *name, const thop_variant *table, size_t n, thop_args a)
 {
+  return thop_emit_in(thop_shapes, name, table, n, a);
+}
+
+thumb_opcode thop_emit_in(const thop_variant_shape *shapes, const char *name, const thop_variant *table, size_t n,
+                          thop_args a)
+{
   const thop_feat target_feat = arm_target_dependent.feat;
 
   for (size_t i = 0; i < n; i++)
   {
     const thop_variant *v = &table[i];
-    const thop_variant_shape *s = v->shape;
+    const thop_variant_shape *s = &shapes[v->shape];
 
     if (!thop_feat32_subset(s->feat, target_feat))
     {
@@ -698,7 +742,7 @@ thumb_opcode thop_emit(const char *name, const thop_variant *table, size_t n, th
 
     if (v->custom)
     {
-      thumb_opcode r = v->custom(v->base, &a);
+      thumb_opcode r = thop_call_custom(v->custom, v->base, &a);
       if (r.size)
       {
         THOP_TRACE("%s: custom T%d base=0x%x → 0x%x\n", name ? name : "?unknown?", (int)i + 1, v->base, r.opcode);
@@ -757,5 +801,13 @@ thumb_opcode thop_emit(const char *name, const thop_variant *table, size_t n, th
   }
 
   THOP_TRACE("%s: ERROR no variant matched! (tried %zu variants)\n", name ? name : "?unknown?", n);
-  return thop_emit_error(name, table, n, a);
+  return thop_emit_error_in(shapes, name, table, n, a);
+}
+
+thumb_opcode thop_emit_table(const thop_table *t, thop_args a)
+{
+  size_t n = 0;
+  while (t->variants[n].shape != THOP_SHAPE_END)
+    n++;
+  return thop_emit(t->name, t->variants, n, a);
 }

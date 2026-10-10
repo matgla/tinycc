@@ -27,55 +27,21 @@
 
 /* ───── LDREX (T32) ───── */
 
-static const thop_variant_shape SHAPE_LDREX = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {12, 4},
-    .rn_place = {16, 4},
-    .imm = {.kind = IMM_RAW, .width = 8},
-    .imm_place = {0, 8},
-    .feat = {.t32 = 1},
-};
-
-TH_TABLE(TH_LDREX, "ldrex", {&SHAPE_LDREX, 0xe8500f00, NULL});
+TH_TABLE(TH_LDREX, "ldrex", {THOP_SHAPE_LDREX, 0xe8500f00, 0});
 
 /* ───── STREX (T32) ───── */
 
-static const thop_variant_shape SHAPE_STREX = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {8, 4},
-    .rn_place = {12, 4},
-    .rm_place = {16, 4},
-    .imm = {.kind = IMM_RAW, .width = 8},
-    .imm_place = {0, 8},
-    .feat = {.t32 = 1},
-};
-
-TH_TABLE(TH_STREX, "strex", {&SHAPE_STREX, 0xe8400000, NULL});
+TH_TABLE(TH_STREX, "strex", {THOP_SHAPE_STREX, 0xe8400000, 0});
 
 /* ───── LDREXB / LDREXH (T32) ───── */
 
-static const thop_variant_shape SHAPE_LDREXB = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {12, 4},
-    .rn_place = {16, 4},
-    .feat = {.t32 = 1},
-};
-
-TH_TABLE(TH_LDREXB, "ldrexb", {&SHAPE_LDREXB, 0xe8d00f4f, NULL});
-TH_TABLE(TH_LDREXH, "ldrexh", {&SHAPE_LDREXB, 0xe8d00f5f, NULL});
+TH_TABLE(TH_LDREXB, "ldrexb", {THOP_SHAPE_LDREXB, 0xe8d00f4f, 0});
+TH_TABLE(TH_LDREXH, "ldrexh", {THOP_SHAPE_LDREXB, 0xe8d00f5f, 0});
 
 /* ───── STREXB / STREXH (T32) ───── */
 
-static const thop_variant_shape SHAPE_STREXB = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {0, 4},
-    .rn_place = {12, 4},
-    .rm_place = {16, 4},
-    .feat = {.t32 = 1},
-};
-
-TH_TABLE(TH_STREXB, "strexb", {&SHAPE_STREXB, 0xe8c00f40, NULL});
-TH_TABLE(TH_STREXH, "strexh", {&SHAPE_STREXB, 0xe8c00f50, NULL});
+TH_TABLE(TH_STREXB, "strexb", {THOP_SHAPE_STREXB, 0xe8c00f40, 0});
+TH_TABLE(TH_STREXH, "strexh", {THOP_SHAPE_STREXB, 0xe8c00f50, 0});
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Public wrappers
@@ -83,36 +49,30 @@ TH_TABLE(TH_STREXH, "strexh", {&SHAPE_STREXB, 0xe8c00f50, NULL});
 
 thumb_opcode th_ldrex(uint32_t rt, uint32_t rn, int imm)
 {
-  return thop_emit(TH_LDREX.name, TH_LDREX.variants, TH_LDREX.variant_count,
-                   (thop_args){.rd = rt, .rn = rn, .imm = (uint32_t)(imm >> 2)});
+  return thop_emit_table(&TH_LDREX, (thop_args){.rd = rt, .rn = rn, .imm = (uint32_t)(imm >> 2)});
 }
 
 thumb_opcode th_strex(uint32_t rd, uint32_t rt, uint32_t rn, int imm)
 {
-  return thop_emit(TH_STREX.name, TH_STREX.variants, TH_STREX.variant_count,
-                   (thop_args){.rd = rd, .rn = rt, .rm = rn, .imm = (uint32_t)(imm >> 2)});
+  return thop_emit_table(&TH_STREX, (thop_args){.rd = rd, .rn = rt, .rm = rn, .imm = (uint32_t)(imm >> 2)});
 }
 
 thumb_opcode th_ldrexb(uint32_t rt, uint32_t rn)
 {
-  return thop_emit(TH_LDREXB.name, TH_LDREXB.variants, TH_LDREXB.variant_count,
-                   (thop_args){.rd = rt, .rn = rn});
+  return thop_emit_table(&TH_LDREXB, (thop_args){.rd = rt, .rn = rn});
 }
 
 thumb_opcode th_ldrexh(uint32_t rt, uint32_t rn)
 {
-  return thop_emit(TH_LDREXH.name, TH_LDREXH.variants, TH_LDREXH.variant_count,
-                   (thop_args){.rd = rt, .rn = rn});
+  return thop_emit_table(&TH_LDREXH, (thop_args){.rd = rt, .rn = rn});
 }
 
 thumb_opcode th_strexb(uint32_t rd, uint32_t rt, uint32_t rn)
 {
-  return thop_emit(TH_STREXB.name, TH_STREXB.variants, TH_STREXB.variant_count,
-                   (thop_args){.rd = rd, .rn = rt, .rm = rn});
+  return thop_emit_table(&TH_STREXB, (thop_args){.rd = rd, .rn = rt, .rm = rn});
 }
 
 thumb_opcode th_strexh(uint32_t rd, uint32_t rt, uint32_t rn)
 {
-  return thop_emit(TH_STREXH.name, TH_STREXH.variants, TH_STREXH.variant_count,
-                   (thop_args){.rd = rd, .rn = rt, .rm = rn});
+  return thop_emit_table(&TH_STREXH, (thop_args){.rd = rd, .rn = rt, .rm = rn});
 }

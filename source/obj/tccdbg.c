@@ -27,7 +27,7 @@ static const struct
   int type;
   int size;
   int encoding;
-  const char *name;
+  const char *TCC_RODATA_REL name;
 } default_debug[] = {
     {VT_INT, 4, DW_ATE_signed, "int:t1=r1;-2147483648;2147483647;"},
     {VT_BYTE, 1, DW_ATE_signed_char, "char:t2=r2;0;127;"},
@@ -1321,7 +1321,7 @@ ST_FUNC void tcc_eh_frame_hdr(TCCState *s1, int final)
     ln += length + 4;
   }
   add32le(eh_frame_hdr_section->data + count_offset, count);
-  qsort(eh_frame_hdr_section->data + tab_offset, count, sizeof(struct eh_search_table), sort_eh_table);
+  tcc_qsort(eh_frame_hdr_section->data + tab_offset, count, sizeof(struct eh_search_table), sort_eh_table);
 }
 #endif
 
@@ -2383,7 +2383,7 @@ static void tcc_get_debug_info(TCCState *s1, Sym *s, CString *result)
       {
         t = t->next;
         cstr_printf(&str, "%s:", (t->v & ~SYM_FIELD) >= SYM_FIRST_ANOM ? "" : get_tok_str(t->v, NULL));
-        cstr_printf(&str, e->type.t & VT_UNSIGNED ? "%u," : "%d,", (int)t->enum_val);
+        cstr_printf(&str, e->type.t & VT_UNSIGNED ? "%u," : "%d,", (int)sym_enum_val(t));
       }
       cstr_printf(&str, ";");
       tcc_debug_stabs(s1, str.data, N_LSYM, 0, NULL, 0, 0, -1, 0);
@@ -2553,9 +2553,9 @@ static int tcc_get_dwarf_info(TCCState *s1, Sym *s)
                     type & VT_UNSIGNED ? DWARF_ABBREV_ENUMERATOR_UNSIGNED : DWARF_ABBREV_ENUMERATOR_SIGNED);
         dwarf_strp(dwarf_info_section, (e->v & ~SYM_FIELD) >= SYM_FIRST_ANOM ? "" : get_tok_str(e->v, NULL));
         if (type & VT_UNSIGNED)
-          dwarf_uleb128(dwarf_info_section, e->enum_val);
+          dwarf_uleb128(dwarf_info_section, sym_enum_val(e));
         else
-          dwarf_sleb128(dwarf_info_section, e->enum_val);
+          dwarf_sleb128(dwarf_info_section, sym_enum_val(e));
       }
       dwarf_data1(dwarf_info_section, 0);
       write32le(dwarf_info_section->data + pos_sib, dwarf_info_section->data_offset - dwarf_info.start);

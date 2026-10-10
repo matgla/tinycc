@@ -8,13 +8,12 @@
 #undef USING_GLOBALS
 #include "../opt/engine/gen_adapters.c"
 #undef USING_GLOBALS
-#include "../opt/engine/pass_registry.c"
-#undef USING_GLOBALS
 #include "../opt/engine/pass_timing.c"
 #undef TCC_PASS_TIMING_MAX
 #undef TCC_PT_STACK_MAX
 #undef USING_GLOBALS
 #include "../opt/engine/pipeline_run.c"
+#undef PIPELINE_FLAG_ON
 #undef PIPELINE_MAX_TRACKED
 #undef USING_GLOBALS
 #include "../opt/engine/pipeline_table.c"
@@ -23,6 +22,7 @@
 #undef FLAG
 #undef PASS
 #undef PASS_GATED
+#undef PASS_GATED_CTX
 #undef USING_GLOBALS
 #include "../opt/engine/run_gens.c"
 #undef USING_GLOBALS

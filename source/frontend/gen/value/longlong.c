@@ -330,21 +330,27 @@ void lbuild(int t)
 #endif
 
 #if PTR_SIZE == 4
-/* Inspect the direct IR producer of a 64-bit vreg to see if it is a 32->64
- * extension emitted by gen_cast.  Returns:
+/* Inspect the direct IR producer of a 64-bit, single-definition TEMP to see if
+ * it is a 32->64 extension emitted by gen_cast.  Returns:
  *   1 for zero-extension via TCCIR_OP_ZEXT (out *out_low_vr is the 32-bit src)
  *   2 for sign-extension via the canonical SHL #32 + OR low pattern
  *   0 otherwise.
  *
  * Intentionally strict: only looks at the direct producer of `vr`, no
- * ASSIGN-chain walking.  gen_cast for 32->64 unsigned emits ZEXT directly into
- * the destination vreg, and the signed path emits OR(SHL(SAR(low,31),32),low)
- * directly.  Anything in between (extra ASSIGNs from gv_dup, etc.) is opaque
- * and we conservatively bail. */
+ * ASSIGN-chain walking, and rejects vregs with more than one definition.
+ * gen_cast for 32->64 unsigned emits ZEXT directly into the destination vreg,
+ * and the signed path emits OR(SHL(SAR(low,31),32),low) directly.  Anything in
+ * between (extra ASSIGNs from gv_dup, etc.) is opaque and we conservatively
+ * bail.  A single-definition TEMP is required because a textual last
+ * definition of a VAR (or a multi-def TEMP) need not be the definition reaching
+ * this use across a branch. */
 static int detect_ll_ext_provenance(int vr, int *out_low_vr)
 {
   TCCIRState *ir = tcc_state->ir;
   if (!ir || vr < 0)
+    return 0;
+  if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP ||
+      !tcc_ir_vreg_has_single_def(ir, vr))
     return 0;
   int n = ir->next_instruction_index;
   if (n <= 0)
@@ -709,7 +715,7 @@ void gen_opl(int op)
      * the argument moves, the inline sequence eight instructions (~22 bytes)
      * at every site -- 440 of them in zig.c. */
     if (tcc_state->ir &&
-        ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST || !tcc_state->optimize_size))
+        ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST || !TCC_OPT(tcc_state, optimize_size)))
     {
       /* IR mode: generate a single 64-bit shift instruction directly.
        * The lexpand/lbuild decomposition produces intermediate 32-bit values

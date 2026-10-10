@@ -116,6 +116,53 @@ unsigned int v43_2_0(void)
 #define REG64 (*(volatile unsigned long long *)0x40000010)
 unsigned long long v44_2_0(void) { return REG64; }
 void v45_0_2(unsigned long long x) { REG64 = x; }
+/* The register's address held in a pointer local -- Zig's C backend writes
+ * pico-sdk's `while (~resets_hw->reset_done & bits)` this way, null check
+ * included.  Once sccp made the pointer temp a constant, const_prop_tmp
+ * substituted it for the dereference and the loop spun on the address. */
+extern void trap(void);
+void v70_1_0(unsigned int bits)
+{
+  const volatile unsigned int *done = (const volatile unsigned int *)0x40020008ul, *p;
+loop:
+  p = done;
+  if (p == 0)
+    trap();
+  if (~*p & bits)
+    goto loop;
+}
+/* A register read handed straight to a call: pico-sdk's SDIO_ERRMSG(...,
+ * SDIO_PIO->sm[0].addr, SDIO_PIO->ctrl) passed the two ADDRESSES (even at -O0)
+ * -- register arguments, a stack argument and a select each had their own
+ * immediate path that ignored the dereference. */
+extern void sink2(unsigned, unsigned);
+extern void sink5(unsigned, unsigned, unsigned, unsigned, unsigned);
+void v71_2_0(void) { sink2(REG, REG2); }
+void v72_1_0(void) { sink5(1, 2, 3, 4, REG); }
+unsigned int v73_1_0(int c) { return c ? REG : 5u; }
+extern void sink64(unsigned long long);
+extern void sink3_64(unsigned, unsigned, unsigned, unsigned long long);
+void v74_1_0(void) { sink64(REG64); } /* one LDRD */
+void v75_2_0(void) { sink3_64(1, 2, 3, REG64); }
+/* pico-sdk's pio_sm_clear_fifos: the same bit written twice to the XOR alias of
+ * a register (FJOIN_RX on, then off).  ptr_store_dse dropped the first store
+ * through the computed alias pointer as overwritten. */
+void v77_0_2(volatile unsigned *reg)
+{
+  *(volatile unsigned *)((unsigned)reg | 0x1000u) = 1u << 31;
+  *(volatile unsigned *)((unsigned)reg | 0x1000u) = 1u << 31;
+}
+/* The controlling expression is assigned to a temp: `T <-- #addr***DEREF***`. */
+int v76_1_0(void)
+{
+  switch (REG)
+  {
+  case 1: return 4;
+  case 2: return 7;
+  case 3: return 9;
+  default: return 0;
+  }
+}
 
 /* --- loop hoisting, GVN across a branch, byte merging, if-conversion ----- */
 struct B

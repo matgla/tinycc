@@ -20,6 +20,7 @@
 
 #include "thop_block.h"
 #include "thumb.h"
+#include "thop_mem_imm.h"
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Block data transfer: PUSH, POP, LDM, STM, LDMDB, STMDB
@@ -27,129 +28,27 @@
 
 /* ───── PUSH ───── */
 
-/* T1 narrow: push {reglist}, [lr]  —  raw reglist in bits [7:0], lr flag at bit 8 */
-static const thop_variant_shape SHAPE_PUSH_T1 = {
-    .size = THOP_VARIANT_T16,
-    .rm_raw_place = {0, 8},           /* raw register list in bits [7:0] */
-    .imm = {.kind = IMM_RAW, .width = 1},
-    .imm_place = {8, 1},              /* LR flag at bit 8 */
-    .rm_con = REG_LOW_REGSET | REG_RM_BITS_NOT_LR_PC,
-    .feat = {.t16 = 1},
-};
-
-/* T2 wide: push {reglist}  —  register list in bits [15:3], SP/PC not allowed */
-static const thop_variant_shape SHAPE_PUSH_T2 = {
-    .size = THOP_VARIANT_T32,
-    .rm_place = {0, 13},              /* register list in bits [12:0] (r0-r12) */
-    .imm = {.kind = IMM_RAW, .width = 1},
-    .imm_place = {14, 1},             /* LR/M flag at bit 14 */
-    .rm_con = REG_RM_BITS_NOT_LR_PC,
-    .feat = {.t32 = 1},
-};
-
-TH_TABLE(TH_PUSH, "push", {&SHAPE_PUSH_T1, 0xb400, NULL}, {&SHAPE_PUSH_T2, 0xe92d0000, NULL});
+TH_TABLE(TH_PUSH, "push", {THOP_SHAPE_PUSH_T1, 0xb400, 0}, {THOP_SHAPE_PUSH_T2, 0xe92d0000, 0});
 
 /* ───── POP ───── */
 
-/* T1 narrow: pop {reglist}, [pc]  —  raw reglist in bits [7:0], pc flag at bit 8 */
-static const thop_variant_shape SHAPE_POP_T1 = {
-    .size = THOP_VARIANT_T16,
-    .rm_raw_place = {0, 8},           /* raw register list in bits [7:0] */
-    .imm = {.kind = IMM_RAW, .width = 1},
-    .imm_place = {8, 1},              /* PC flag at bit 8 */
-    .rm_con = REG_LOW_REGSET | REG_RM_BITS_NOT_LR_PC,
-    .feat = {.t16 = 1},
-};
-
-/* T2 wide: pop {reglist}  —  register list in bits [15:3], SP not allowed */
-static const thop_variant_shape SHAPE_POP_T2 = {
-    .size = THOP_VARIANT_T32,
-    .rm_place = {0, 15},              /* register list in bits [14:0] (r0-r12 + LR) */
-    .imm = {.kind = IMM_RAW, .width = 1},
-    .imm_place = {15, 1},             /* PC/P flag at bit 15 */
-    .rm_con = REG_RM_BIT_NOT_SP,
-    .feat = {.t32 = 1},
-};
-
-TH_TABLE(TH_POP, "pop", {&SHAPE_POP_T1, 0xbc00, NULL}, {&SHAPE_POP_T2, 0xe8bd0000, NULL});
+TH_TABLE(TH_POP, "pop", {THOP_SHAPE_POP_T1, 0xbc00, 0}, {THOP_SHAPE_POP_T2, 0xe8bd0000, 0});
 
 /* ───── LDM ───── */
 
-/* T1 narrow: ldm {rn}, {reglist}!  —  rn in bits [8:5], raw reglist in bits [7:0] */
-static const thop_variant_shape SHAPE_LDM_T1 = {
-    .size = THOP_VARIANT_T16,
-    .rd_place = {8, 3},               /* rn in bits [10:8] */
-    .rd_con = REG_LOW_ONLY,
-    .rm_raw_place = {0, 8},           /* raw register list in bits [7:0] */
-    .rm_con = REG_LOW_REGSET,
-    .feat = {.t16 = 1},
-};
-
-/* T3 wide: ldmia {rn}!, {reglist}  —  rn at [19:16], reglist at [12:0], writeback at [21] */
-static const thop_variant_shape SHAPE_LDM_T3 = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {16, 4},              /* rn in bits [19:16] */
-    .rm_place = {0, 16},              /* register list in bits [15:0] (r0-r12, LR, PC) */
-    .rm_con = REG_RM_BIT_NOT_SP,
-    .imm = {.kind = IMM_RAW, .width = 1},
-    .imm_place = {21, 1},             /* writeback bit at position 21 */
-    .feat = {.t32 = 1},
-};
-
-TH_TABLE(TH_LDM, "ldm", {&SHAPE_LDM_T1, 0xc800, NULL}, {&SHAPE_LDM_T3, 0xe8900000, NULL});
+TH_TABLE(TH_LDM, "ldm", {THOP_SHAPE_LDM_T1, 0xc800, 0}, {THOP_SHAPE_LDM_T3, 0xe8900000, 0});
 
 /* ───── STM ───── */
 
-/* T1 narrow: stm {rn}!, {reglist}  —  rn in bits [8:5], raw reglist in bits [7:0] */
-static const thop_variant_shape SHAPE_STM_T1 = {
-    .size = THOP_VARIANT_T16,
-    .rd_place = {8, 3},               /* rn in bits [10:8] */
-    .rd_con = REG_LOW_ONLY,
-    .rm_raw_place = {0, 8},           /* raw register list in bits [7:0] */
-    .rm_con = REG_LOW_REGSET,
-    .feat = {.t16 = 1},
-};
-
-/* T3 wide: stmia {rn}!, {reglist}  —  rn at [19:16], reglist at [12:0], writeback at [21] */
-static const thop_variant_shape SHAPE_STM_T3 = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {16, 4},              /* rn in bits [19:16] */
-    .rm_place = {0, 15},              /* register list in bits [14:0] (r0-r12, LR) */
-    .rm_con = REG_RM_BIT_NOT_SP,
-    .imm = {.kind = IMM_RAW, .width = 1},
-    .imm_place = {21, 1},             /* writeback bit at position 21 */
-    .feat = {.t32 = 1},
-};
-
-TH_TABLE(TH_STM, "stm", {&SHAPE_STM_T1, 0xc000, NULL}, {&SHAPE_STM_T3, 0xe8800000, NULL});
+TH_TABLE(TH_STM, "stm", {THOP_SHAPE_STM_T1, 0xc000, 0}, {THOP_SHAPE_STM_T3, 0xe8800000, 0});
 
 /* ───── LDMDB (T32) ───── */
 
-static const thop_variant_shape SHAPE_LDMDB = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {16, 4},
-    .rm_place = {0, 16},              /* register list in bits [15:0] (r0-r12, LR, PC) */
-    .rm_con = REG_RM_BIT_NOT_SP,
-    .imm = {.kind = IMM_RAW, .width = 1},
-    .imm_place = {21, 1},
-    .feat = {.t32 = 1},
-};
-
-TH_TABLE(TH_LDMDB, "ldmdb", {&SHAPE_LDMDB, 0xe9100000, NULL});
+TH_TABLE(TH_LDMDB, "ldmdb", {THOP_SHAPE_LDMDB, 0xe9100000, 0});
 
 /* ───── STMDB (T32) ───── */
 
-static const thop_variant_shape SHAPE_STMDB = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {16, 4},
-    .rm_place = {0, 15},              /* register list in bits [14:0] (r0-r12, LR) */
-    .rm_con = REG_RM_BIT_NOT_SP,
-    .imm = {.kind = IMM_RAW, .width = 1},
-    .imm_place = {21, 1},
-    .feat = {.t32 = 1},
-};
-
-TH_TABLE(TH_STMDB, "stmdb", {&SHAPE_STMDB, 0xe9000000, NULL});
+TH_TABLE(TH_STMDB, "stmdb", {THOP_SHAPE_STMDB, 0xe9000000, 0});
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Public wrappers
@@ -159,47 +58,76 @@ thumb_opcode th_push(uint32_t regs)
 {
     uint8_t lr = (regs >> R_LR) & 1;
     regs &= ~((1u << R_LR) | (1u << R_PC));
-    return thop_emit(TH_PUSH.name, TH_PUSH.variants, TH_PUSH.variant_count,
-                     (thop_args){.rm = regs, .imm = lr});
+    /* PUSH T2 (STMDB) with a single register is CONSTRAINED UNPREDICTABLE;
+     * a lone high register uses PUSH T3: STR Rt, [SP, #-4]! (same 4 bytes). */
+    if (regs != 0 && (regs & (regs - 1)) == 0 && !lr && (regs & ~0xffu))
+        return th_str_imm((uint32_t)__builtin_ctz(regs), R_SP, 4, 5 /* pre-indexed, sub, writeback */,
+                          ENFORCE_ENCODING_32BIT);
+    return thop_emit_table(&TH_PUSH, (thop_args){.rm = regs, .imm = lr});
 }
 
 thumb_opcode th_pop(uint16_t regs)
 {
     uint8_t pc = (regs >> R_PC) & 1;
     regs &= ~(1u << R_PC);
-    return thop_emit(TH_POP.name, TH_POP.variants, TH_POP.variant_count,
-                     (thop_args){.rm = regs, .imm = pc});
+    /* POP T2 (LDMIA.W) with a single register is CONSTRAINED UNPREDICTABLE;
+     * a lone high register or LR uses POP T3: LDR Rt, [SP], #4. */
+    if (!pc && regs != 0 && (regs & (regs - 1)) == 0 && (regs & ~0xffu))
+        return th_ldr_imm((uint32_t)__builtin_ctz(regs), R_SP, 4, 3 /* post-indexed, add, writeback */,
+                          ENFORCE_ENCODING_32BIT);
+    return thop_emit_table(&TH_POP, (thop_args){.rm = regs, .imm = pc});
 }
+
+static const thumb_opcode th_block_invalid = {.size = 0, .opcode = 0};
 
 thumb_opcode th_ldm(uint32_t rn, uint32_t regset, uint32_t writeback, thumb_enforce_encoding encoding)
 {
     if (rn == R_SP && writeback && encoding != ENFORCE_ENCODING_32BIT)
         return th_pop(regset);
-    if (!writeback)
+    const uint32_t in_list = (regset >> rn) & 1u;
+    /* Write-back with the base in the list is UNPREDICTABLE: reject. */
+    if (writeback && in_list)
+        return th_block_invalid;
+    /* LDM T1 (16-bit) encodes write-back implicitly: it writes back exactly
+     * when the base is NOT in the list. */
+    if ((!writeback) != (in_list != 0))
+    {
+        if (encoding == ENFORCE_ENCODING_16BIT)
+            return th_block_invalid;
         encoding = ENFORCE_ENCODING_32BIT;
-    regset &= ~(1u << rn);
-    return thop_emit(TH_LDM.name, TH_LDM.variants, TH_LDM.variant_count,
-                     (thop_args){.rd = rn, .rm = regset, .imm = writeback, .enc = encoding});
+    }
+    return thop_emit_table(&TH_LDM, (thop_args){.rd = rn, .rm = regset, .imm = writeback, .enc = encoding});
 }
 
 thumb_opcode th_stm(uint32_t rn, uint32_t regset, uint32_t writeback, thumb_enforce_encoding encoding)
 {
+    const uint32_t in_list = (regset >> rn) & 1u;
     if (!writeback)
+    {
+        /* Only the 32-bit form exists without write-back. */
+        if (encoding == ENFORCE_ENCODING_16BIT)
+            return th_block_invalid;
         encoding = ENFORCE_ENCODING_32BIT;
-    regset &= ~(1u << rn);
-    return thop_emit(TH_STM.name, TH_STM.variants, TH_STM.variant_count,
-                     (thop_args){.rd = rn, .rm = regset, .imm = writeback, .enc = encoding});
+    }
+    else if (in_list)
+    {
+        /* Write-back with the base in the list: only STM T1 and only when the
+         * base is the lowest register (it stores its original value).  The
+         * 32-bit form is UNPREDICTABLE. */
+        const bool t16_ok = rn <= 7 && (regset & ~0xffu) == 0 && (regset & ((1u << rn) - 1u)) == 0;
+        if (!t16_ok || encoding == ENFORCE_ENCODING_32BIT)
+            return th_block_invalid;
+    }
+    return thop_emit_table(&TH_STM, (thop_args){.rd = rn, .rm = regset, .imm = writeback, .enc = encoding});
 }
 
 thumb_opcode th_ldmdb(uint32_t rn, uint32_t reglist, uint32_t w)
 {
-    return thop_emit(TH_LDMDB.name, TH_LDMDB.variants, TH_LDMDB.variant_count,
-                     (thop_args){.rd = rn, .rm = reglist, .imm = w});
+    return thop_emit_table(&TH_LDMDB, (thop_args){.rd = rn, .rm = reglist, .imm = w});
 }
 
 thumb_opcode th_stmdb(uint32_t rn, uint32_t reglist, uint32_t w, thumb_enforce_encoding encoding)
 {
     (void)encoding;
-    return thop_emit(TH_STMDB.name, TH_STMDB.variants, TH_STMDB.variant_count,
-                     (thop_args){.rd = rn, .rm = reglist, .imm = w});
+    return thop_emit_table(&TH_STMDB, (thop_args){.rd = rn, .rm = reglist, .imm = w});
 }

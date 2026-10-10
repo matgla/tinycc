@@ -40,7 +40,10 @@ static int call_result_stackoff_in_range(IROperand op, int32_t base, int32_t siz
 
 OPT_GEN_FLAT(dead_call_result, TCCIR_OP_FUNCCALLVAL)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   const IROptDU *du = &ctx->du;
 
   int32_t dest_vr = irop_get_vreg(dest);
@@ -73,12 +76,15 @@ OPT_GEN_FLAT(dead_call_result, TCCIR_OP_FUNCCALLVAL)
 
   ir->iroperand_pool[q->operand_base + 0] = src1;
   ir->iroperand_pool[q->operand_base + 1] = src2;
-  REWRITE(.new_op = TCCIR_OP_FUNCCALLVOID);
+  REWRITE(set_op(TCCIR_OP_FUNCCALLVOID));
 }
 
 OPT_GEN_FLAT(dead_sret_call, TCCIR_OP_FUNCCALLVAL)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   const IROptDU *du = &ctx->du;
   int n = ir->next_instruction_index;
 
@@ -168,12 +174,13 @@ OPT_GEN_FLAT(dead_sret_call, TCCIR_OP_FUNCCALLVAL)
     return 0;
 
   ir_opt_nop_call_params(ir, i);
-  REWRITE(.new_op = TCCIR_OP_NOP);
+  REWRITE(set_op(TCCIR_OP_NOP));
 }
 
 OPT_GEN_FLAT(fold_call_result_store, TCCIR_OP_FUNCCALLVAL)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
   int n = ir->next_instruction_index;
 
   IROperand call_dest = dest;

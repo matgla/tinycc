@@ -70,6 +70,10 @@ typedef struct LDSectionPattern
   char pattern[128];
   int type; /* LD_PAT_EXACT, LD_PAT_GLOB, LD_PAT_KEEP */
   int keep; /* 1 if KEEP() */
+  int sort; /* 1 inside SORT()/SORT_BY_NAME(): matches are laid out by name */
+  int prefix_len; /* length of the pattern's literal head (before any '*' or
+                     '?'): a name that does not start with it cannot match.
+                     0 claims nothing. */
 } LDSectionPattern;
 
 typedef struct LDOutputSection
@@ -83,6 +87,7 @@ typedef struct LDOutputSection
   int load_memory_region_idx; /* index into memory_regions for LMA, -1 if none */
   int phdr_idx;               /* index into phdrs, -1 if none */
   int has_address;            /* 1 if address explicitly set */
+  int noload;                 /* (NOLOAD): occupies memory, no file contents */
 
   /* Section patterns to include - dynamically allocated */
   LDSectionPattern *patterns;
@@ -101,6 +106,11 @@ typedef struct LDSymbol
   int section_idx;          /* output section index where defined, -1 if absolute */
   int has_loadaddr;         /* 1 if value is LOADADDR of a section */
   int loadaddr_section_idx; /* output section index for LOADADDR */
+  int applied;              /* 1 once ld_apply_symbols has defined it in the ELF symtab */
+  char loadaddr_name[64];   /* LOADADDR(name): resolved after parsing, so a symbol
+                               may name an output section defined later */
+  int patterns_before;      /* input-section statements before it in its output
+                               section: `KEEP(*(.romfs)) __romfs_end__ = .;` */
 } LDSymbol;
 
 typedef struct LDScript
@@ -127,6 +137,8 @@ typedef struct LDScript
 
   /* Computed load addresses (populated by ld_update_symbol_values) */
   addr_t output_section_loadaddrs[LD_MAX_OUTPUT_SECTIONS];
+  addr_t output_section_vmas[LD_MAX_OUTPUT_SECTIONS];     /* lowest input address, 0 if none */
+  addr_t output_section_vma_ends[LD_MAX_OUTPUT_SECTIONS]; /* end of the highest input */
   int has_loadaddrs; /* 1 after LMA computation is done */
 
   /* Current parsing state */
@@ -170,6 +182,11 @@ int ld_section_matches_pattern(const char *section_name, const char *pattern);
 
 /* Check if section should be kept based on KEEP() directives */
 int ld_section_should_keep(LDScript *ld, const char *section_name);
+
+/* The output section the script places input section `name` in, or -1;
+ * *pat_idx gets the index of the matching pattern, or the output section's
+ * pattern count for a plain name match. */
+int ld_find_output_section(LDScript *ld, const char *name, int *pat_idx);
 
 /* Debug: print linker script contents */
 void ld_script_dump(LDScript *ld);

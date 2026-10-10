@@ -352,9 +352,11 @@ UT_TEST(test_phase3_scratch_conflict_reassignment_frees_scratch_register)
    * live interval the fixup mutates in place. */
   IRLiveInterval *li_after = tcc_ir_vreg_live_interval(ir, t[0]);
   UT_ASSERT(li_after != NULL);
-  UT_ASSERT(li_after->allocation.r0 != r0_before);
-  UT_ASSERT(li_after->allocation.r0 >= 4 && li_after->allocation.r0 <= 11);
-  UT_ASSERT(li_after->allocation.r0 != 7); /* R_FP, never reassignable */
+  /* t[0] is copied into the accumulator, so move coalescing made it a class
+   * member sharing its register with the copy's other end. Moving it would
+   * split the class (see 792_scratch_reassign_coalesced_class), so
+   * try_reassign_scratch_conflict must now leave it where it is. */
+  UT_ASSERT_EQ(li_after->allocation.r0, r0_before);
 
   tcc_ir_free(ir);
   return 0;

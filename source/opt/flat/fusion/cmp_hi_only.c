@@ -89,15 +89,13 @@ int tcc_ir_opt_cmp_hi_only(TCCIRState *ir)
     if (q->orig_index < 0)
       continue;
 
-    IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    IROperand s2 = tcc_ir_op_get_src2(ir, q);
-    if (irop_get_btype(s1) != IROP_BTYPE_INT64)
+    if (tcc_ir_op_src1_btype(ir, q) != IROP_BTYPE_INT64)
       continue;
-    if (!irop_is_immediate(s2) || irop_get_btype(s2) != IROP_BTYPE_INT64)
+    if (!tcc_ir_op_src2_is_imm(ir, q) || tcc_ir_op_src2_btype(ir, q) != IROP_BTYPE_INT64)
       continue;
     /* The low half is what makes the transform exact.  Anything else and the
      * low words still decide ties. */
-    if (((uint64_t)irop_get_imm64_ex(ir, s2) & 0xFFFFFFFFull) != 0)
+    if (((uint64_t)tcc_ir_op_src2_imm(ir, q) & 0xFFFFFFFFull) != 0)
       continue;
 
     /* Every condition applied to these flags must be one of the four.  The
@@ -147,5 +145,3 @@ int tcc_ir_opt_cmp_hi_only(TCCIRState *ir)
 
   return changes;
 }
-
-int tcc_ir_opt_cmp_hi_only_ex(IROptCtx *ctx) { return tcc_ir_opt_cmp_hi_only(ctx->ir); }

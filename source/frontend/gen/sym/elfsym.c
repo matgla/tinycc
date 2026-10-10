@@ -176,6 +176,16 @@ ST_FUNC void put_extern_sym2(Sym *sym, int sh_num, addr_t value, unsigned long s
     esym->st_size = size;
     esym->st_shndx = sh_num;
   }
+  /* -fvisibility= covers a C definition that names no visibility of its own.
+     Only C definitions get here with a section: tccasm defines its labels
+     by patching an SHN_UNDEF symbol, so asm-defined symbols keep theirs, as
+     with gcc, whose -fvisibility never reaches the assembler. */
+  if (tcc_state->default_visibility && sh_num != SHN_UNDEF && !sym->a.vis_explicit &&
+      !(sym->type.t & (VT_STATIC | VT_INLINE)) && !IS_ASM_SYM(sym))
+  {
+    esym = elfsym(sym);
+    esym->st_other = (esym->st_other & ~ELFW(ST_VISIBILITY)(-1)) | tcc_state->default_visibility;
+  }
   update_storage(sym);
 }
 

@@ -1,0 +1,2 @@
+error:
+a __rodata_relative pointer must point into .rodata; 'buf' is in .data

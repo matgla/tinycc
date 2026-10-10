@@ -221,6 +221,10 @@ void ir_emit_struct_unit_copy(const SValue *src, const SValue *dst,
       s.vr = src->vr;
       s.sym = src->sym;
       s.c.i = src->c.i + p;
+      s.volatile_access = src->volatile_access;
+      /* The unit-chunk type hides the packed container the side lives in;
+       * same sticky-mark rule as small_copy_lval. */
+      s.underaligned = src->underaligned || (p & 3);
 
       svalue_init(&tmp);
       tmp.type = ct;
@@ -234,6 +238,8 @@ void ir_emit_struct_unit_copy(const SValue *src, const SValue *dst,
       d.vr = dst->vr;
       d.sym = dst->sym;
       d.c.i = dst->c.i + p;
+      d.volatile_access = dst->volatile_access;
+      d.underaligned = dst->underaligned || (p & 3);
       tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &d);
     }
     p += w;
@@ -347,6 +353,10 @@ static SValue small_copy_lval(const SValue *side, int is_deref, int off, CType c
   SValue v;
   svalue_init(&v);
   v.type = ct;
+  v.volatile_access = side->volatile_access;
+  int side_align;
+  type_size(&side->type, &side_align);
+  v.underaligned = side->underaligned || side_align < 4 || (off & 3);
   if (is_deref && off != 0)
   {
     SValue base, imm, ptr;
@@ -375,26 +385,35 @@ static SValue small_copy_lval(const SValue *side, int is_deref, int off, CType c
   return v;
 }
 
-/* Copy a small aggregate planned by small_aggregate_copy_plan as w-byte LOAD /
- * STORE pairs visible to the optimizer, instead of an opaque __aeabi_memmove
- * call: every LOAD first, then every STORE, so an overlapping copy still has
- * memmove semantics. */
-void ir_emit_small_aggregate_copy(const SValue *src, int src_deref, const SValue *dst, int dst_deref, int size,
-                                  int w, const unsigned char *covered)
+static int small_copy_chunk_width(const unsigned char *covered, int p, int w)
+{
+  int end = p + w;
+  while (end > p && !covered[end - 1])
+    end--;
+  if (end == p)
+    return 0;
+  int bytes = 1;
+  while (bytes < end - p)
+    bytes <<= 1;
+  return bytes;
+}
+
+/* Load every chunk before any store; omit padding beyond its last covered byte. */
+static void ir_emit_small_aggregate_chunks(const SValue *src, int src_deref, const SValue *dst, int dst_deref,
+                                           int size, int w, const unsigned char *covered, int narrow_padding)
 {
   int tmp_vr[SMALL_AGGREGATE_COPY_MAX];
   CType ct;
   ct.ref = NULL;
-  ct.t = (w == 1 ? (VT_BYTE | VT_UNSIGNED) : w == 2 ? (VT_SHORT | VT_UNSIGNED) : VT_INT);
-
   for (int p = 0; p < size; p += w)
   {
-    int any = 0;
-    for (int k = p; k < p + w; k++)
-      any |= covered[k];
+    int bytes = small_copy_chunk_width(covered, p, w);
     tmp_vr[p / w] = -1;
-    if (!any)
+    if (!bytes)
       continue; /* padding only */
+    if (!narrow_padding || src->volatile_access || dst->volatile_access)
+      bytes = w;
+    ct.t = (bytes == 1 ? (VT_BYTE | VT_UNSIGNED) : bytes == 2 ? (VT_SHORT | VT_UNSIGNED) : VT_INT);
     SValue s = small_copy_lval(src, src_deref, p, ct), tmp;
     svalue_init(&tmp);
     tmp.type = ct;
@@ -407,6 +426,10 @@ void ir_emit_small_aggregate_copy(const SValue *src, int src_deref, const SValue
   {
     if (tmp_vr[p / w] < 0)
       continue;
+    int bytes = small_copy_chunk_width(covered, p, w);
+    if (!narrow_padding || src->volatile_access || dst->volatile_access)
+      bytes = w;
+    ct.t = (bytes == 1 ? (VT_BYTE | VT_UNSIGNED) : bytes == 2 ? (VT_SHORT | VT_UNSIGNED) : VT_INT);
     SValue tmp, d = small_copy_lval(dst, dst_deref, p, ct);
     svalue_init(&tmp);
     tmp.type = ct;
@@ -414,4 +437,27 @@ void ir_emit_small_aggregate_copy(const SValue *src, int src_deref, const SValue
     tmp.vr = tmp_vr[p / w];
     tcc_ir_put(tcc_state->ir, TCCIR_OP_STORE, &tmp, NULL, &d);
   }
+}
+
+void ir_emit_small_aggregate_copy(const SValue *src, int src_deref, const SValue *dst, int dst_deref, int size,
+                                  int w, const unsigned char *covered)
+{
+  ir_emit_small_aggregate_chunks(src, src_deref, dst, dst_deref, size, w, covered, 0);
+}
+
+int ir_emit_small_padded_local_copy(const SValue *src, const SValue *dst, const CType *stype, int size, int align)
+{
+  if (size < 4 || size > SMALL_AGGREGATE_COPY_MAX || (size & 3) || (align & 3) ||
+      src->volatile_access || dst->volatile_access ||
+      (src->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL) ||
+      (dst->r & (VT_VALMASK | VT_LVAL)) != (VT_LOCAL | VT_LVAL))
+    return 0;
+  unsigned char covered[SMALL_AGGREGATE_COPY_MAX];
+  int w;
+  if (!small_aggregate_copy_plan(stype, size, align, (int)src->c.i, (int)dst->c.i, &w, covered) ||
+      w != 4 || covered[size - 2] || covered[size - 1])
+    return 0;
+  if (src->c.i != dst->c.i || src->vr != dst->vr)
+    ir_emit_small_aggregate_chunks(src, 0, dst, 0, size, w, covered, 1);
+  return 1;
 }

@@ -1,0 +1,2 @@
+error:
+a __rodata_relative pointer is NULL or the address of read-only data

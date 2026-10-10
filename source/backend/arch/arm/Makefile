@@ -11,6 +11,11 @@ TOP       ?= ../../..
 BUILD_DIR ?= .
 CC        ?= gcc
 AR        ?= ar
+# $(AR) may be the target compiler's built-in archiver (for example
+# `armv8m-tcc -ar`).  The combined architecture archive below uses GNU/LLVM
+# ar's MRI `addmod`/`addlib` commands, which tcc -ar deliberately does not
+# implement.  Keep this as a separate host-tool setting.
+MRI_AR    ?= ar
 CFLAGS    ?=
 DEFINES   ?=
 
@@ -64,7 +69,7 @@ $(LIB): $(OBJS) $(ISA_LIBS)
 	@for o in $(OBJS); do printf 'addmod %s\n' $$o >> $(BUILD_DIR)/_libarm.mri; done
 	@for l in $(ISA_LIBS); do printf 'addlib %s\n' $$l >> $(BUILD_DIR)/_libarm.mri; done
 	@printf 'save\nend\n' >> $(BUILD_DIR)/_libarm.mri
-	$(AR) -M < $(BUILD_DIR)/_libarm.mri
+	$(MRI_AR) -M < $(BUILD_DIR)/_libarm.mri
 	@rm -f $(BUILD_DIR)/_libarm.mri
 
 $(BUILD_DIR)/lib%.a: FORCE

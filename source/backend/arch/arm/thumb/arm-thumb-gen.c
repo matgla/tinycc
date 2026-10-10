@@ -129,6 +129,8 @@ ST_DATA const char *const target_machine_defs = "__arm__\0"
 #if defined TCC_ARM_EABI
                                                 "__ARM_EABI__\0"
 #endif
+                                                /* docs/rodata_relative.md */
+                                                "__TINYC_RODATA_RELATIVE__\0"
     ;
 
 /* Register class array - maps each register to its class flags */
@@ -221,9 +223,10 @@ uint32_t scratch_exclude_baseline(void)
  * We must POP in reverse order since ARM POP with register lists always pops
  * in register-number order, not stack order.
  * Size 128 since same register can be pushed multiple times for complex ops like
- * function calls with many arguments. */
-static int scratch_push_stack[128];
-int scratch_push_type[128]; /* 1 = PUSH, 2 = STR to scratch area */
+ * function calls with many arguments.  Core registers 0-15 and a 1/2 type
+ * fit a byte: these are .bss in every compiler process. */
+static signed char scratch_push_stack[128];
+signed char scratch_push_type[128]; /* 1 = PUSH, 2 = STR to scratch area */
 int scratch_push_count = 0;
 
 /* Flag: set to 1 when a real-run (non-dry-run) scratch PUSH is emitted.
@@ -335,7 +338,7 @@ int vfp_num(int r) { return LS_VFP_REG_NUM(r); }
 int mach_alloc_scratch(MachineCodegenContext *ctx, uint32_t excl)
 {
   if (ctx->n_scratch >= MACH_CTX_MAX_SCRATCH)
-    tcc_error("compiler_error: mach_alloc_scratch: per-instruction scratch limit exceeded");
+    tcc_ice("mach_alloc_scratch: per-instruction scratch limit exceeded");
   ScratchRegAlloc alloc = get_scratch_reg_with_save(excl);
   ctx->scratches[ctx->n_scratch++] = alloc;
   /* Phase-3 constraint recording: track count and save-mask per instruction.
@@ -355,7 +358,7 @@ int mach_alloc_scratch(MachineCodegenContext *ctx, uint32_t excl)
 int mach_alloc_scratch_for_sym(MachineCodegenContext *ctx, uint32_t excl, Sym *sym, int64_t imm)
 {
   if (ctx->n_scratch >= MACH_CTX_MAX_SCRATCH)
-    tcc_error("compiler_error: mach_alloc_scratch: per-instruction scratch limit exceeded");
+    tcc_ice("mach_alloc_scratch: per-instruction scratch limit exceeded");
   ScratchRegAlloc alloc = get_scratch_reg_for_sym_addr(sym, imm, excl);
   ctx->scratches[ctx->n_scratch++] = alloc;
   g_insn_scratch_allocs++;
@@ -371,7 +374,7 @@ int mach_alloc_scratch_for_sym(MachineCodegenContext *ctx, uint32_t excl, Sym *s
 static int mach_alloc_scratch_for_const(MachineCodegenContext *ctx, uint32_t excl, int64_t value)
 {
   if (ctx->n_scratch >= MACH_CTX_MAX_SCRATCH)
-    tcc_error("compiler_error: mach_alloc_scratch: per-instruction scratch limit exceeded");
+    tcc_ice("mach_alloc_scratch: per-instruction scratch limit exceeded");
   ScratchRegAlloc alloc = get_scratch_reg_for_const(value, excl);
   ctx->scratches[ctx->n_scratch++] = alloc;
   g_insn_scratch_allocs++;
@@ -617,7 +620,7 @@ int mach_ensure_in_reg(MachineCodegenContext *ctx, const MachineOperand *op, uin
   }
 
   default:
-    tcc_error("compiler_error: mach_ensure_in_reg: unhandled kind %d", (int)op->kind);
+    tcc_ice("mach_ensure_in_reg: unhandled kind %d", (int)op->kind);
     return PREG_REG_NONE;
   }
 }
@@ -689,7 +692,7 @@ int mach_get_dest_reg(MachineCodegenContext *ctx, const MachineOperand *op, uint
     return mach_alloc_scratch(ctx, excl);
 
   default:
-    tcc_error("compiler_error: mach_get_dest_reg: unexpected kind %d", (int)op->kind);
+    tcc_ice("mach_get_dest_reg: unexpected kind %d", (int)op->kind);
     return PREG_REG_NONE;
   }
 }
@@ -735,10 +738,20 @@ void mach_writeback_dest(const MachineOperand *op, int reg)
     break;
 
   case MACH_OP_FRAME_ADDR:
+  {
     /* Local stack slot address used as an lvalue destination.  Write the
-     * result back to the underlying frame slot. */
-    tcc_machine_store_spill_slot(reg, op->u.frame.offset);
+     * result back to the underlying frame slot -- at the slot's own width: a
+     * byte part of a frontend temporary (`_Complex char`) written as a word
+     * clobbered the three bytes after it, which frame relayout had given to
+     * another local. */
+    MachineOperand slot = *op;
+    slot.kind = MACH_OP_SPILL;
+    slot.u.spill.offset = op->u.frame.offset;
+    slot.needs_deref = 0;
+    slot.vreg = -1;
+    mach_store_slot(reg, &slot);
     break;
+  }
 
   case MACH_OP_PARAM_STACK:
     tcc_machine_store_param_slot(reg, op->u.param.offset);
@@ -787,7 +800,7 @@ void mach_writeback_dest(const MachineOperand *op, int reg)
   }
 
   default:
-    tcc_error("compiler_error: mach_writeback_dest: unexpected kind %d", (int)op->kind);
+    tcc_ice("mach_writeback_dest: unexpected kind %d", (int)op->kind);
   }
 }
 
@@ -831,6 +844,8 @@ void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op)
 
   case MACH_OP_IMM:
     tcc_machine_load_constant(dest_reg, PREG_REG_NONE, op->u.imm.val, 0, NULL);
+    if (op->needs_deref) /* `*(T *)0x40000000`: read through the address */
+      load_from_base(dest_reg, PREG_REG_NONE, op->btype, (int)op->is_unsigned, 0, 0, (uint32_t)dest_reg);
     return;
 
   case MACH_OP_FRAME_ADDR:
@@ -944,9 +959,14 @@ int helper_call_sp_bias;
  * frame-relative SP offset, like the pushes; NOT of an offset into the
  * argument area, which is relative to the moved SP. */
 int call_args_sp_bias;
+
+/* Bytes an inline asm statement's own register save (asm_gen_code's STMDB of
+ * the clobbered callee-saved registers) has moved SP while its operands are
+ * loaded, substituted and stored back.  Only nonzero inside one statement. */
+int asm_save_sp_bias;
 int scratch_push_sp_bias(void)
 {
-  int bias = helper_call_sp_bias + call_args_sp_bias;
+  int bias = helper_call_sp_bias + call_args_sp_bias + asm_save_sp_bias;
   if (dry_run_state.active)
     return bias;
   for (int i = 0; i < scratch_push_count; i++)
@@ -959,6 +979,19 @@ int scratch_push_sp_bias(void)
  * This allows accurate code size tracking without affecting the real pass. */
 ThumbLiteralPoolEntry *dry_run_literal_pool = NULL;
 int dry_run_literal_pool_count = 0;
+/* The dry-run pool is never trimmed at a flush (only at dry_run_start), so
+ * each dry flush re-"emits" every entry since the rehearsal began; in a dry
+ * run that emission only advances `ind`.  Keep the byte total of the entries
+ * already counted instead of re-walking them: same `ind`, linear instead of
+ * quadratic in the function's literal count. */
+static int dry_pool_counted;
+static int dry_pool_counted_bytes;
+
+static void th_literal_pool_dry_reset(void)
+{
+  dry_pool_counted = 0;
+  dry_pool_counted_bytes = 0;
+}
 
 /* Monotonic per-function totals (never reset by a pool flush) used by the
  * forward-branch narrowing safety check: the rehearsal records them per IR
@@ -1126,11 +1159,9 @@ static void branch_opt_init(void)
   branch_opt_state.optimization_enabled =
       0; /* Dry-run analysis disabled: use real-time backward branch narrowing instead */
   branch_opt_state.code_size_reduction = 0;
-  if (!branch_opt_state.branches)
-  {
-    branch_opt_state.branch_capacity = 64;
-    branch_opt_state.branches = tcc_malloc(branch_opt_state.branch_capacity * sizeof(BranchInfo));
-  }
+  /* No `branches` array: nothing records a branch while the analysis is
+   * disabled (branch_count stays 0), and its 64 preallocated entries were
+   * the one allocation the state made. */
 }
 
 /* Analyze branch offsets and select optimal encodings.
@@ -1298,10 +1329,11 @@ ST_FUNC void tcc_gen_machine_dry_run_start(void)
   /* Allocate dry-run literal pool if not already allocated */
   if (!dry_run_literal_pool)
   {
-    dry_run_literal_pool_size = 64;
+    dry_run_literal_pool_size = LITERAL_POOL_FIRST_SIZE;
     dry_run_literal_pool = tcc_malloc(dry_run_literal_pool_size * sizeof(ThumbLiteralPoolEntry));
   }
   dry_run_literal_pool_count = 0;
+  th_literal_pool_dry_reset();
   /* Clear the shared hash table for dry-run pass */
   literal_pool_hash_clear(&literal_pool_hash);
   literal_pool_lookup_cache_clear(&literal_pool_last_lookup);
@@ -1626,7 +1658,7 @@ no_free_reg:
 
   if (reg_to_save < 0)
   {
-    tcc_error("compiler_error: no register available for scratch (all 16 registers excluded)");
+    tcc_ice("no register available for scratch (all 16 registers excluded)");
   }
 
   /* No free register found - save one to the stack */
@@ -1659,7 +1691,7 @@ no_free_reg:
   {
     int sp_offset = save_sp_offset;
     if (!store_word_to_base(reg_to_save, R_SP, sp_offset, 0))
-      tcc_error("compiler_error: scratch save STR failed (offset %d)", sp_offset);
+      tcc_ice("scratch save STR failed (offset %d)", sp_offset);
     result.reg = reg_to_save;
     result.saved = 2; /* 2 = saved to scratch area (not PUSH) */
     result.would_save = 1;
@@ -1686,7 +1718,7 @@ no_free_reg:
   }
   else
   {
-    tcc_error("compiler_error: scratch register push stack overflow (>128 pushes without restore)");
+    tcc_ice("scratch register push stack overflow (>128 pushes without restore)");
   }
   /* Do NOT add to global_exclude! The register is now free to use (value saved on stack).
    * If we need another scratch later, we can push the same register again - each push/pop
@@ -1728,7 +1760,7 @@ void restore_scratch_reg(ScratchRegAlloc *alloc)
     int frame_offset = ir->scratch_save_base + (scratch_save_slot * 4);
     int sp_offset = allocated_stack_size + scratch_push_sp_bias() + frame_offset;
     if (!load_word_from_base(alloc->reg, R_SP, sp_offset, 0))
-      tcc_error("compiler_error: scratch restore LDR failed (offset %d)", sp_offset);
+      tcc_ice("scratch restore LDR failed (offset %d)", sp_offset);
     alloc->saved = 0;
     if (scratch_push_count > 0 && scratch_push_stack[scratch_push_count - 1] == alloc->reg)
       scratch_push_count--;
@@ -1804,7 +1836,7 @@ void restore_all_pushed_scratch_regs(void)
       int frame_offset = ir->scratch_save_base + (scratch_save_slot * 4);
       int sp_offset = allocated_stack_size + scratch_push_sp_bias() + frame_offset;
       if (!load_word_from_base(reg, R_SP, sp_offset, 0))
-        tcc_error("compiler_error: scratch auto-restore LDR failed (offset %d)", sp_offset);
+        tcc_ice("scratch auto-restore LDR failed (offset %d)", sp_offset);
     }
     else
     {
@@ -1843,7 +1875,7 @@ ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigne
 
   ScratchRegAlloc first = get_scratch_reg_with_save(exclude_regs);
   if (first.reg == PREG_NONE)
-    tcc_error("compiler_error: unable to allocate scratch register");
+    tcc_ice("unable to allocate scratch register");
 
   scratch->regs[0] = first.reg;
   scratch->reg_count = 1;
@@ -1859,7 +1891,7 @@ ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigne
   {
     ScratchRegAlloc second = get_scratch_reg_with_save(exclude_regs);
     if (second.reg == PREG_NONE)
-      tcc_error("compiler_error: unable to allocate scratch register pair");
+      tcc_ice("unable to allocate scratch register pair");
 
     scratch->regs[1] = second.reg;
     scratch->reg_count = 2;
@@ -1897,7 +1929,7 @@ int ot_check(thumb_opcode op)
   if (!is_valid_opcode(op))
   {
     LOG_SCRATCH("ot_check FAIL: opcode=0x%x ind=0x%x ir_op=%d", op.opcode, (unsigned)ind, g_debug_current_op);
-    tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
+    tcc_ice("received invalid opcode: 0x%x\n", op.opcode);
   }
   return ot(op);
 }
@@ -1979,7 +2011,7 @@ ST_FUNC void gen_fill_nops(int bytes)
 
   if (bytes & 1)
   {
-    tcc_error("compiler_error: 'gen_fill_nops' bytes are not aligned to: 2-bytes\n");
+    tcc_ice("'gen_fill_nops' bytes are not aligned to: 2-bytes\n");
     return;
   }
   while (bytes > 0)
@@ -2731,7 +2763,7 @@ static CType float_type, double_type, func_float_type, func_double_type;
 
 static void th_literal_pool_init()
 {
-  thumb_gen_state.literal_pool_size = 64;
+  thumb_gen_state.literal_pool_size = LITERAL_POOL_FIRST_SIZE;
   thumb_gen_state.literal_pool_count = 0;
   thumb_gen_state.pool_window_first = -1;
   thumb_gen_state.pool_bytes = 0;
@@ -3018,6 +3050,38 @@ void o(unsigned int i)
   cur_text_section->data[ind++] = i & 255;
   cur_text_section->data[ind++] = i >> 8;
 }
+/* Sanity-check a unique pool entry's symbol before it is emitted; a bad one
+ * is reported and dropped so no relocation is made against it. */
+static void th_literal_pool_check_sym(ThumbLiteralPoolEntry *entry)
+{
+  if (entry->relocation != -1 && entry->sym)
+  {
+    /* Extra validation - check that sym looks valid */
+    if (!entry->sym || (unsigned long)entry->sym < 0x1000)
+    {
+      tcc_warning("internal: literal pool entry has garbage sym pointer %p", entry->sym);
+      entry->sym = NULL;
+    }
+    else if (entry->sym->v == 0 || (entry->sym->v < TOK_IDENT && !(entry->sym->v & SYM_FIELD)))
+    {
+      tcc_warning("internal: literal pool entry has invalid sym->v (0x%x)", entry->sym->v);
+      entry->sym = NULL;
+    }
+  }
+}
+
+/* Empty the pending window after a flush. */
+static void th_literal_pool_flushed(void)
+{
+  thumb_gen_state.literal_pool_count = 0;
+  thumb_gen_state.pool_window_first = -1;
+  thumb_gen_state.pool_bytes = 0;
+  thumb_gen_state.code_size = 0;
+  /* Clear the hash table after flushing pool */
+  literal_pool_hash_clear(&literal_pool_hash);
+  literal_pool_lookup_cache_clear(&literal_pool_last_lookup);
+}
+
 void th_literal_pool_generate(void)
 {
   /* Not between the virtual instructions of an outlined window: the real pass
@@ -3047,17 +3111,6 @@ void th_literal_pool_generate(void)
   ThumbLiteralPoolEntry *pool = dry_run_state.active ? dry_run_literal_pool : thumb_gen_state.literal_pool;
   int pool_count = dry_run_state.active ? dry_run_literal_pool_count : thumb_gen_state.literal_pool_count;
 
-  /* Count unique literals to calculate pool size */
-  int pool_size = 0;
-  for (int i = 0; i < pool_count; i++)
-  {
-    if (pool[i].shared_index == -1)
-    {
-      int entry_size = (pool[i].data_size == 8) ? 8 : 4;
-      pool_size += entry_size;
-    }
-  }
-
   /* Emit a branch to skip over the literal pool.
    * We may need +2 for alignment NOP.
    * Branch offset is from PC+4 to after the pool.
@@ -3078,6 +3131,37 @@ void th_literal_pool_generate(void)
     ot_check(th_nop(ENFORCE_ENCODING_16BIT));
   }
 
+  if (dry_run_state.active)
+  {
+    if (dry_pool_counted > pool_count)
+      th_literal_pool_dry_reset();
+    for (int i = dry_pool_counted; i < pool_count; i++)
+    {
+      ThumbLiteralPoolEntry *entry = &pool[i];
+      if (entry->shared_index == -1)
+      {
+        th_literal_pool_check_sym(entry);
+        dry_pool_counted_bytes += (entry->data_size == 8) ? 8 : 4;
+      }
+    }
+    dry_pool_counted = pool_count;
+    ind += dry_pool_counted_bytes; /* what o() advances per literal in a dry run */
+    th_literal_pool_flushed();
+    generating_pool = 0;
+    return;
+  }
+
+  /* Count unique literals to calculate pool size (verbose report only) */
+  int pool_size = 0;
+  for (int i = 0; i < pool_count; i++)
+  {
+    if (pool[i].shared_index == -1)
+    {
+      int entry_size = (pool[i].data_size == 8) ? 8 : 4;
+      pool_size += entry_size;
+    }
+  }
+
   /* Array to store the output position of each unique literal */
   small_sequence(ThumbLitPosSeq) literal_positions_owner = {0};
   ThumbLitPosSeq_init(&literal_positions_owner, (size_t)pool_count);
@@ -3093,20 +3177,7 @@ void th_literal_pool_generate(void)
     {
       /* This is a unique entry - emit the literal value */
       literal_positions[i] = ind;
-      if (entry->relocation != -1 && entry->sym)
-      {
-        /* Extra validation - check that sym looks valid */
-        if (!entry->sym || (unsigned long)entry->sym < 0x1000)
-        {
-          tcc_warning("internal: literal pool entry has garbage sym pointer %p", entry->sym);
-          entry->sym = NULL;
-        }
-        else if (entry->sym->v == 0 || (entry->sym->v < TOK_IDENT && !(entry->sym->v & SYM_FIELD)))
-        {
-          tcc_warning("internal: literal pool entry has invalid sym->v (0x%x)", entry->sym->v);
-          entry->sym = NULL;
-        }
-      }
+      th_literal_pool_check_sym(entry);
       /* Skip relocation creation during dry-run - relocations should only be
        * created during the real code generation pass. */
       if (!dry_run_state.active && entry->relocation != -1 && entry->sym)
@@ -3212,7 +3283,7 @@ void th_literal_pool_generate(void)
     int field = aligned_position - 4;
     int limit = (entry->short_instruction || entry->data_size == 8) ? (0xff << 2) : 0xfff;
     if (field < 0 || field > limit)
-      tcc_error("compiler_error: literal pool out of range for %s at 0x%x: offset %d exceeds %d "
+      tcc_ice("literal pool out of range for %s at 0x%x: offset %d exceeds %d "
                 "(pool at 0x%x). The flush budget in ot() let the pool drift too far from the load.",
                 entry->short_instruction ? "LDR(T1)" : (entry->data_size == 8 ? "LDRD" : "LDR.W"),
                 entry->patch_position, field, limit, literal_pos);
@@ -3254,14 +3325,8 @@ void th_literal_pool_generate(void)
     }
   }
 
-  thumb_gen_state.literal_pool_count = 0;
-  thumb_gen_state.pool_window_first = -1;
-  thumb_gen_state.pool_bytes = 0;
-  thumb_gen_state.code_size = 0;
+  th_literal_pool_flushed();
   generating_pool = 0;
-  /* Clear the hash table after flushing pool */
-  literal_pool_hash_clear(&literal_pool_hash);
-  literal_pool_lookup_cache_clear(&literal_pool_last_lookup);
 }
 
 /* Exact span from the earliest pending literal load to the projected end of

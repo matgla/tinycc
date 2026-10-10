@@ -12,6 +12,7 @@
 #include "ir.h"
 #include "arm-thumb-callsite.h"
 #include "opt/flat/if_convert.h"
+#include "opt_utils.h"
 
 /* Debug tracking variable (defined in arm-thumb-gen.c) */
 extern int g_debug_current_op;
@@ -111,7 +112,11 @@ void tcc_ir_fill_registers(TCCIRState *ir, SValue *sv)
         need_lval = VT_LVAL;
       }
       int base_kind = VT_LOCAL;
-      if ((old_r & VT_LVAL) && old_v != VT_LOCAL && old_v != VT_LLOCAL)
+      /* A register-passed parameter's VT_LVAL means its own value, not a
+       * pointer in it (see is_register_param): spilled to its home, the slot
+       * IS the parameter -- an asm "=m"(param) wrote through whatever word
+       * sat next to it. */
+      if ((old_r & VT_LVAL) && old_v != VT_LOCAL && old_v != VT_LLOCAL && !is_register_param)
       {
         /* The original use wants to dereference the value in this vreg.
          * Since the value is spilled, we need double indirection:
@@ -211,11 +216,22 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
    */
   int argno = 0;             // current GPR argument register (r0-r3)
   unsigned vfp_used = 0;     // bitmap of allocated VFP arg registers s0-s15
+  int vfp_exhausted = 0;     // a VFP argument went to the stack: no later one back-fills (AAPCS C.2.vfp)
   const int hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && !ir->is_variadic);
   for (int vreg = 0; vreg < ir->next_parameter; ++vreg)
   {
     const int encoded_vreg = (TCCIR_VREG_TYPE_PARAM << 28) | vreg;
     IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, encoded_vreg);
+
+    /* A VFP register the ABI classifier already assigned: each word of an
+     * HFA or _Complex argument (tcc_ir_params_process_struct).  It uses no
+     * core register; record it so the scalars below never take it. */
+    if (interval && LS_IS_VFP_REG(interval->incoming_reg0))
+    {
+      const int s = LS_VFP_REG_NUM(interval->incoming_reg0);
+      vfp_used |= (interval->is_double ? 3u : 1u) << s;
+      continue;
+    }
 
     /* Hard-float: scalar float/double parameters arrive in VFP registers
      * (s0..s15, viewed as d0..d7), consuming an independent bank — not GPR
@@ -224,12 +240,12 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
      * even-aligned pair.  incoming_reg0 is marked with LS_VFP_REG_BASE so the
      * prolog homes it from the right register file. */
     if (hard_float && interval && interval->is_float && !interval->is_complex &&
-        interval->incoming_reg0 < 0)
+        interval->incoming_reg0 < 0 && !interval->incoming_stack)
     {
       const int slots = interval->is_double ? 2 : 1;
       const int step = slots;
       int base = -1;
-      for (int cand = 0; cand + slots <= 16; cand += step)
+      for (int cand = 0; !vfp_exhausted && cand + slots <= 16; cand += step)
       {
         const unsigned mask = (unsigned)((1u << slots) - 1u) << cand;
         if (!(vfp_used & mask))
@@ -245,6 +261,7 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
         interval->incoming_reg1 = -1;
         continue;
       }
+      vfp_exhausted = 1;
     }
     /* Placed on the caller's stack by the ABI (see params_mark_stack): every
      * core register is used or skipped by now. */
@@ -253,7 +270,12 @@ void tcc_ir_register_allocation_params(TCCIRState *ir)
       interval->incoming_reg0 = -1;
       interval->incoming_reg1 = -1;
       stack_param_home(interval);
-      argno = 4;
+      /* A VFP candidate there closed the VFP bank, not the core registers
+       * (params_mark_stack). */
+      if (hard_float && interval->use_vfp)
+        vfp_exhausted = 1;
+      else
+        argno = 4;
       continue;
     }
     /* is_double for soft-float (LS_REG_TYPE_DOUBLE_SOFT) or is_llong for 64-bit
@@ -380,7 +402,7 @@ void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir)
 
   /* Hint post-allocation swap pass: mark RETURNVALUE's source vreg with
    * incoming_reg0=0.  Only at -O1+ to avoid interfering with -O0 paths. */
-  if (tcc_state->optimize < 1)
+  if (TCC_OPT(tcc_state, optimize) < 1)
     return;
 
   for (int i = 0; i < ir->next_instruction_index; ++i)
@@ -389,11 +411,10 @@ void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir)
     if (q->op != TCCIR_OP_RETURNVALUE)
       continue;
 
-    const IROperand src = tcc_ir_op_get_src1(ir, q);
-    if (!irop_has_vreg(src) || irop_is_immediate(src))
+    if (!tcc_ir_op_src1_has_vreg(ir, q) || tcc_ir_op_src1_is_imm(ir, q))
       continue;
 
-    int32_t vr = irop_get_vreg(src);
+    int32_t vr = tcc_ir_op_src1_vreg(ir, q);
 
     for (int depth = 0; depth < 5; depth++)
     {
@@ -409,16 +430,14 @@ void tcc_ir_mark_return_value_incoming_regs(TCCIRState *ir)
           continue;
         if (!irop_config[dq->op].has_dest)
           continue;
-        IROperand dd = tcc_ir_op_get_dest(ir, dq);
-        if (irop_get_vreg(dd) != vr)
+        if (tcc_ir_op_dest_vreg(ir, dq) != vr)
           continue;
         if (dq->op == TCCIR_OP_LOAD || dq->op == TCCIR_OP_ASSIGN)
         {
-          IROperand ds = tcc_ir_op_get_src1(ir, dq);
-          if (irop_has_vreg(ds) &&
-              TCCIR_DECODE_VREG_TYPE(irop_get_vreg(ds)) != TCCIR_VREG_TYPE_PARAM)
+          if (tcc_ir_op_src1_has_vreg(ir, dq) &&
+              TCCIR_DECODE_VREG_TYPE(tcc_ir_op_src1_vreg(ir, dq)) != TCCIR_VREG_TYPE_PARAM)
           {
-            vr = irop_get_vreg(ds);
+            vr = tcc_ir_op_src1_vreg(ir, dq);
             found = 1;
           }
         }
@@ -511,7 +530,7 @@ int tcc_ir_param_is_captured_by_nested(int vreg)
     return 0;
   for (int i = 0; i < tcc_state->nb_nested_funcs; i++)
   {
-    const NestedFunc *nf = &tcc_state->nested_funcs[i];
+    const NestedFunc *nf = tcc_state->nested_funcs[i];
     if (nf->parent_nf != tcc_state->current_nested_func)
       continue;
     for (int j = 0; j < nf->nb_captured; j++)
@@ -557,6 +576,7 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
   uint8_t *is_stack_passed = tcc_mallocz((size_t)param_count);
   int argno = 0;
   unsigned vfp_used = 0;
+  int vfp_exhausted = 0;
   const int hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT && !ir->is_variadic);
   for (int vreg = 0; vreg < param_count; ++vreg)
   {
@@ -564,6 +584,24 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
     IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, encoded_vreg);
     if (!interval)
       continue;
+
+    /* A word of an HFA or _Complex argument in its VFP register, or a scalar
+     * a previous tcc_ir_register_allocation_params placed there. */
+    if (hard_float && LS_IS_VFP_REG(interval->incoming_reg0))
+    {
+      vfp_used |= (interval->is_double ? 3u : 1u) << LS_VFP_REG_NUM(interval->incoming_reg0);
+      continue;
+    }
+    if (interval->incoming_stack)
+    {
+      is_stack_passed[vreg] = 1;
+      /* A VFP candidate there closed the VFP bank, not the core registers. */
+      if (hard_float && interval->use_vfp)
+        vfp_exhausted = 1;
+      else
+        argno = 4;
+      continue;
+    }
 
     /* Hard-float: a scalar float/double param consumes VFP argument slots
      * (s0..s15), not GPR ones — it is only stack-passed once the VFP bank is
@@ -574,7 +612,7 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
     {
       const int slots = interval->is_double ? 2 : 1;
       int base = -1;
-      for (int cand = 0; cand + slots <= 16; cand += slots)
+      for (int cand = 0; !vfp_exhausted && cand + slots <= 16; cand += slots)
       {
         const unsigned mask = (unsigned)((1u << slots) - 1u) << cand;
         if (!(vfp_used & mask))
@@ -585,16 +623,13 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir)
         }
       }
       if (base < 0)
+      {
         is_stack_passed[vreg] = 1;
+        vfp_exhausted = 1;
+      }
       continue;
     }
 
-    if (interval->incoming_stack)
-    {
-      is_stack_passed[vreg] = 1;
-      argno = 4;
-      continue;
-    }
     const int is_64bit = interval->is_double || interval->is_llong;
     if (is_64bit && (argno & 1))
       argno++; /* align 64-bit to even reg pair */
@@ -1080,7 +1115,64 @@ void tcc_ir_codegen_drop_return(TCCIRState *ir)
 
 #ifdef CONFIG_TCC_ASM
 
-static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
+/* The operands the asm statement READS, as the optimizer left them.
+ *
+ * The front end saves each operand's SValue with the asm payload and emits an
+ * ASM_INPUT marker per read operand (each "+" output, then each input) just
+ * before INLINE_ASM.  Passes treat a marker as an ordinary use of a value, so
+ * they may rewrite it -- propagate the constant a local holds, or the vreg it
+ * was copied from -- and then delete the local's store and frame slot as dead.
+ * Lowering the saved SValue after that reads a slot that no longer exists:
+ * pico-sdk's `uint32_t zero = 0; asm("stlb %0, [%1]" :: "r"(zero), "r"(lock))`
+ * loaded both operands from below SP and the RP2350 kernel bus-faulted
+ * releasing a spinlock.  So a plain input whose marker now names an immediate
+ * or another vreg is rebuilt from the marker.  "+" operands keep the saved
+ * value (it is also where the result is written), as do memory constraints
+ * (the operand is an address), and nothing is touched unless the markers are
+ * all where the front end put them. */
+static void tcc_ir_asm_inputs_from_ir(TCCIRState *ir, const TCCIRInlineAsm *ia, SValue *vals)
+{
+  int reads[MAX_ASM_OPERANDS], nb_reads = 0;
+  for (int i = 0; i < ia->nb_outputs; ++i)
+    if (ia->operands[i].is_rw || ia->operands[i].addr_read)
+      reads[nb_reads++] = i;
+  for (int i = ia->nb_outputs; i < ia->nb_operands; ++i)
+    reads[nb_reads++] = i;
+  if (nb_reads == 0)
+    return;
+
+  int markers[MAX_ASM_OPERANDS], nb_markers = 0;
+  for (int k = ir->codegen_instruction_idx - 1; k >= 0 && nb_markers <= nb_reads; --k)
+  {
+    int op = ir->compact_instructions[k].op;
+    if (op == TCCIR_OP_NOP)
+      continue;
+    if (op != TCCIR_OP_ASM_INPUT)
+      break;
+    markers[nb_markers++] = k;
+  }
+  if (nb_markers != nb_reads)
+    return;
+
+  for (int j = 0; j < nb_reads; ++j)
+  {
+    const int i = reads[j];
+    if (i < ia->nb_outputs || strpbrk(ia->operands[i].constraint, "mQoV<>"))
+      continue;
+    IROperand cur = tcc_ir_op_get_src1(ir, &ir->compact_instructions[markers[nb_reads - 1 - j]]);
+    const int is_imm = irop_is_immediate(cur);
+    const int vr = irop_get_vreg(cur);
+    if (!is_imm && (vr < 0 || vr == vals[i].vr))
+      continue;
+    CType type = vals[i].type;
+    iroperand_to_svalue(ir, cur, &vals[i]);
+    vals[i].type = type;
+  }
+}
+
+/* noinline: inlined into tcc_ir_codegen_generate() its ops[]/vals[] arrays made
+ * a 6 KiB frame for every function, asm or not. */
+__attribute__((noinline)) static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
 {
   if (!ir)
     return;
@@ -1101,10 +1193,13 @@ static void tcc_ir_codegen_inline_asm_by_id(TCCIRState *ir, int id)
   memset(ops, 0, sizeof(ops));
   memset(vals, 0, sizeof(vals));
 
-  memcpy(ops, ia->operands, sizeof(ASMOperand) * (nb_operands + nb_labels));
+  if (nb_operands + nb_labels > 0) /* ia->operands is NULL for a bare asm */
+    memcpy(ops, ia->operands, sizeof(ASMOperand) * (nb_operands + nb_labels));
+  for (int i = 0; i < nb_operands; ++i)
+    vals[i] = ia->values[i];
+  tcc_ir_asm_inputs_from_ir(ir, ia, vals);
   for (int i = 0; i < nb_operands; ++i)
   {
-    vals[i] = ia->values[i];
     tcc_ir_fill_registers(ir, &vals[i]);
     ops[i].vt = &vals[i];
   }
@@ -1307,6 +1402,23 @@ static int try_reassign_scratch_conflict(TCCIRState *ir, int r, int insn_i)
    * resolution (no copy was emitted because src and dest share the same reg). */
   if (ir_iv->phi_pinned)
     return -1;
+  /* Graph-coalesced class members share the class register and the copies
+   * between them were erased; moving one member would split the class. */
+  if (ls_iv->co_member)
+    return -1;
+  /* The register must be held by this interval ALONE over its range: a second
+   * claimant means move coalescing put a copy's two ends on the same register
+   * and dropped the copy (same rule as try_demote_scratch_conflict). */
+  for (int k = 0; k < ls->next_interval_index; k++)
+  {
+    const LSLiveInterval *other = &ls->intervals[k];
+    if (other == ls_iv || other->stack_location != 0)
+      continue;
+    if (other->r0 != r && other->r1 != r)
+      continue;
+    if (other->start <= ls_iv->end && other->end >= ls_iv->start)
+      return -1;
+  }
 
   /* Compute the union of live register masks across [ls_iv->start .. ls_iv->end].
    * Any register set in this union is occupied by some other live vreg and
@@ -1430,11 +1542,11 @@ static int32_t *demote_ref_cache_build(TCCIRState *ir, int n_insns)
     if (q->op == TCCIR_OP_NOP)
       continue;
     if (irop_config[q->op].has_dest)
-      slot[0] = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+      slot[0] = tcc_ir_op_dest_vreg(ir, q);
     if (irop_config[q->op].has_src1)
-      slot[1] = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      slot[1] = tcc_ir_op_src1_vreg(ir, q);
     if (irop_config[q->op].has_src2)
-      slot[2] = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+      slot[2] = tcc_ir_op_src2_vreg(ir, q);
   }
   return cache;
 }
@@ -1467,7 +1579,7 @@ TCC_DBG_ENV_FLAG(cg_no_func_align, "TCC_NO_FUNC_ALIGN")
  * (function.c).  -O0 keeps its layout. */
 static void cg_word_align_start(void)
 {
-  if (!(ind & 2) || ind != func_ind || tcc_state->optimize == 0 || tcc_state->do_debug || cg_no_func_align())
+  if (!(ind & 2) || ind != func_ind || TCC_OPT(tcc_state, optimize) == 0 || tcc_state->do_debug || cg_no_func_align())
     return;
   gen_fill_nops(2);
   func_ind = ind;
@@ -1493,7 +1605,7 @@ static int cg_may_read_pool(TCCIRState *ir)
       if ((s == 0 && !irop_config[q->op].has_dest) || (s == 1 && !irop_config[q->op].has_src1) ||
           (s == 2 && !irop_config[q->op].has_src2) || (s == 1 && is_call))
         continue;
-      IROperand o = s == 0 ? tcc_ir_op_get_dest(ir, q) : s == 1 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand o = tcc_ir_op_get_slot(ir, q, s);
       const int tag = irop_get_tag(o);
       if (tag == IROP_TAG_SYMREF || tag == IROP_TAG_I64 || tag == IROP_TAG_F64 || tag == IROP_TAG_F32)
         return 1;
@@ -1726,7 +1838,12 @@ static bool ir_reg_conflict(const TCCIRState *ir, int reg, uint32_t start, uint3
     for (int k = 0; k < pools[p].count; k++)
     {
       const IRLiveInterval *other = &pools[p].arr[k];
-      if (other->allocation.r0 != (uint16_t)reg)
+      /* Either half: a 64-bit value in R0:R1 holds R1 too.  Missing that
+       * retargeted a spilled `T <- V` feeding PARAM1 into R1 while the u64
+       * stack argument of the same call sat in R0:R1 -- the reload into R1
+       * overwrote its high word (zig.c -Os, a split reload of a shared
+       * constant). */
+      if (other->allocation.r0 != (uint16_t)reg && other->allocation.r1 != (uint16_t)reg)
         continue;
       /* Skip the vreg we're about to reassign */
       if (p == 0 && k == TCCIR_DECODE_VREG_POSITION(skip_vreg) &&
@@ -1823,8 +1940,7 @@ static void ir_codegen_pre_patch_funcparam_allocations(TCCIRState *ir)
       continue;
 
     /* Decode parameter index */
-    IROperand nq_src2 = tcc_ir_op_get_src2(ir, &ir->compact_instructions[j]);
-    uint32_t encoded = (uint32_t)irop_get_imm64_ex(ir, nq_src2);
+    uint32_t encoded = (uint32_t)tcc_ir_op_src2_imm(ir, &ir->compact_instructions[j]);
     int param_idx = TCCIR_DECODE_PARAM_IDX(encoded);
     if (param_idx > 3)
       continue;
@@ -1877,7 +1993,7 @@ static void ir_codegen_recompute_dirty_from_allocations(TCCIRState *ir)
   uint64_t old_dirty = ir->ls.dirty_registers;
   uint64_t non_callee = old_dirty & ~callee_mask;
   uint64_t callee_dirty = old_dirty & callee_mask;
-  ir->ls.dirty_registers = non_callee | (callee_dirty & used);
+  ir->ls.dirty_registers = non_callee | (callee_dirty & used) | ir->ls.spare_scratch_regs;
 }
 
 /* ============================================================================
@@ -1925,8 +2041,7 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
 
   if (nq->op == TCCIR_OP_RETURNVALUE)
   {
-    IROperand nq_src1 = tcc_ir_op_get_src1(ir, nq);
-    int next_vr = irop_get_vreg(nq_src1);
+    int next_vr = tcc_ir_op_src1_vreg(ir, nq);
     if (next_vr != dest_vr)
       return false;
 
@@ -1957,8 +2072,7 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
    * other instruction reads the old allocation. */
   if (nq->op == TCCIR_OP_ASSIGN)
   {
-    IROperand nq_src1 = tcc_ir_op_get_src1(ir, nq);
-    int next_vr = irop_get_vreg(nq_src1);
+    int next_vr = tcc_ir_op_src1_vreg(ir, nq);
     if (next_vr != dest_vr)
       return false;
 
@@ -1971,13 +2085,12 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
       return false;
 
     /* Get the ASSIGN's destination vreg and its register allocation */
-    IROperand nq_dest = tcc_ir_op_get_dest(ir, nq);
-    int assign_dest_vr = irop_get_vreg(nq_dest);
+    int assign_dest_vr = tcc_ir_op_dest_vreg(ir, nq);
     if (assign_dest_vr < 0)
       return false;
 
     /* Both source and destination must have matching pair requirements */
-    int dest_needs_pair = irop_needs_pair(nq_dest);
+    int dest_needs_pair = tcc_ir_op_dest_needs_pair(ir, nq);
     if (dest_needs_pair != needs_pair)
       return false;
 
@@ -2065,8 +2178,7 @@ static bool ir_codegen_before_ret_peephole(TCCIRState *ir, int i, const IROperan
     }
 
     /* Decode parameter index from src2 (packed call_id | param_idx) */
-    IROperand nq_src2 = tcc_ir_op_get_src2(ir, nq);
-    uint32_t encoded = (uint32_t)irop_get_imm64_ex(ir, nq_src2);
+    uint32_t encoded = (uint32_t)tcc_ir_op_src2_imm(ir, nq);
     int param_idx = TCCIR_DECODE_PARAM_IDX(encoded);
 
     /* Only handle scalar register parameters (param 0..3 → R0..R3) */
@@ -2130,14 +2242,22 @@ static inline void ir_codegen_check_scratch(int i, TccIrOp op, const int *dry_in
 #endif
 }
 
-/* Unified scratch tracking: records during dry-run, checks during real-run. */
-static inline void ir_codegen_track_scratch(int is_dry_run, int i, TccIrOp op, int *dry_insn_scratch,
-                                            uint16_t *dry_insn_saves)
+/* What scratch tracking needs for one codegen pass; built once per pass so the
+ * ~50 tracking sites pass one pointer instead of three values. */
+typedef struct IrScratchTrack
 {
-  if (is_dry_run)
-    ir_codegen_record_scratch(i, dry_insn_scratch, dry_insn_saves);
+  int is_dry_run; /* a pass that records (dry run, not the rehearsal) */
+  int *dry_insn_scratch;
+  uint16_t *dry_insn_saves;
+} IrScratchTrack;
+
+/* Unified scratch tracking: records during dry-run, checks during real-run. */
+static inline void ir_codegen_track_scratch(const IrScratchTrack *t, int i, TccIrOp op)
+{
+  if (t->is_dry_run)
+    ir_codegen_record_scratch(i, t->dry_insn_scratch, t->dry_insn_saves);
   else
-    ir_codegen_check_scratch(i, op, dry_insn_scratch, dry_insn_saves);
+    ir_codegen_check_scratch(i, op, t->dry_insn_scratch, t->dry_insn_saves);
 }
 
 /* Find the next non-NOP instruction after `i`, for peepholes that fuse `i` with
@@ -2148,6 +2268,18 @@ static inline void ir_codegen_track_scratch(int is_dry_run, int i, TccIrOp op, i
  * NOP, because the partner would then be reachable without executing `i` (and
  * vice-versa).  branch_target_reset[] catches targets that is_jump_target
  * misses at -O0. */
+/* May the instruction at `i` and the one at `next_i` be fused into one wider
+ * access (LDRD/STRD, or byte stores into a word store)?  Not when either is a
+ * volatile access: each is exactly one bus access of its own width, and an
+ * LDRD/STRD that an exception abandons is restarted, repeating the first
+ * access -- gcc never pairs volatile scalars.  Spill slots are never volatile,
+ * so only the memory-operand peepholes ask. */
+static int ir_codegen_pair_ok(TCCIRState *ir, int i, int next_i)
+{
+  return next_i >= 0 && !tcc_ir_instr_access_is_volatile(ir, &ir->compact_instructions[i]) &&
+         !tcc_ir_instr_access_is_volatile(ir, &ir->compact_instructions[next_i]);
+}
+
 static int ir_codegen_next_nonnop_no_label(TCCIRState *ir, const uint8_t *branch_target_reset, int i)
 {
   for (int j = i + 1; j < ir->next_instruction_index; j++)
@@ -2201,9 +2333,9 @@ static int ir_codegen_count_vreg_uses(TCCIRState *ir, int32_t vreg)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg)
+    if (irop_config[q->op].has_src1 && tcc_ir_op_src1_vreg(ir, q) == vreg)
       uses++;
-    if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vreg)
+    if (irop_config[q->op].has_src2 && tcc_ir_op_src2_vreg(ir, q) == vreg)
       uses++;
     if (tcc_ir_op_is_mac(q->op) && q->operand_base + 3 < ir->iroperand_pool_count &&
         irop_get_vreg(ir->iroperand_pool[q->operand_base + 3]) == vreg)
@@ -2235,11 +2367,11 @@ static int ir_codegen_vreg_used_elsewhere(TCCIRState *ir, int32_t vreg, int def_
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    if (irop_config[q->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == vreg)
+    if (irop_config[q->op].has_dest && tcc_ir_op_dest_vreg(ir, q) == vreg)
       return 1;
-    if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg)
+    if (irop_config[q->op].has_src1 && tcc_ir_op_src1_vreg(ir, q) == vreg)
       return 1;
-    if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vreg)
+    if (irop_config[q->op].has_src2 && tcc_ir_op_src2_vreg(ir, q) == vreg)
       return 1;
     if (tcc_ir_op_is_mac(q->op) && q->operand_base + 3 < ir->iroperand_pool_count &&
         irop_get_vreg(ir->iroperand_pool[q->operand_base + 3]) == vreg)
@@ -2340,8 +2472,16 @@ static MopArgs decode_mop_args(TCCIRState *ir, IRQuadCompact *cq, const IROperan
  * A flat MopArgs per instruction was 80 bytes on the device and the largest
  * allocation of a big function's codegen.  at[i] = 1 + the record's offset
  * (chunk * MOP_CACHE_CHUNK + offset in chunk); 0 = never recorded.
+ *
+ * Chunks start at MOP_CACHE_FIRST bytes and double up to MOP_CACHE_CHUNK: a
+ * fixed 16 KiB first chunk was the largest single block of a small compile
+ * (hello world's peak) while its functions recorded a few hundred bytes.  The
+ * encoding above only needs every chunk to be <= MOP_CACHE_CHUNK, and the
+ * chunks are never moved, so the totals never exceed the fixed-size scheme's
+ * (1+2+4+8 KiB < one 16 KiB chunk).
  * ============================================================================ */
 #define MOP_CACHE_CHUNK 16384
+#define MOP_CACHE_FIRST 1024 /* >= the largest record: 8 + 5 MachineOperands */
 #define MOP_CACHE_HDR 8 /* slot mask byte, padded to MachineOperand's alignment */
 
 typedef struct MopCache
@@ -2350,7 +2490,10 @@ typedef struct MopCache
   unsigned char **chunks;
   int nchunks;
   uint32_t fill; /* bytes used in the last chunk */
+  uint32_t cap;  /* size of the last chunk */
 } MopCache;
+_Static_assert(MOP_CACHE_HDR + 5 * sizeof(MachineOperand) <= MOP_CACHE_FIRST,
+               "a fresh MopCache chunk must hold the largest record");
 
 static MopCache *mop_cache_new(int n)
 {
@@ -2392,10 +2535,14 @@ static void mop_cache_put(MopCache *mc, int i, const MopArgs *a, MopSpec spec)
   if (!rec || rec[0] != mask)
   {
     uint32_t need = MOP_CACHE_HDR + (uint32_t)__builtin_popcount(mask) * sizeof(MachineOperand);
-    if (mc->nchunks == 0 || mc->fill + need > MOP_CACHE_CHUNK)
+    if (mc->nchunks == 0 || mc->fill + need > mc->cap)
     {
+      uint32_t cap = mc->nchunks == 0 ? MOP_CACHE_FIRST : mc->cap * 2;
+      if (cap > MOP_CACHE_CHUNK)
+        cap = MOP_CACHE_CHUNK;
       mc->chunks = tcc_realloc(mc->chunks, sizeof(*mc->chunks) * (mc->nchunks + 1));
-      mc->chunks[mc->nchunks++] = tcc_malloc(MOP_CACHE_CHUNK);
+      mc->chunks[mc->nchunks++] = tcc_malloc(cap);
+      mc->cap = cap;
       mc->fill = 0;
     }
     rec = mc->chunks[mc->nchunks - 1] + mc->fill;
@@ -2471,6 +2618,23 @@ static inline MopArgs ir_decode_cached(int is_dry_run, int use_mop_cache, MopCac
   return a;
 }
 
+/* What the dispatch loop's DECODE sites pass unchanged: invariant for the pass
+ * (dry-run flag, MOP cache) or for the instruction (its operand copies). */
+typedef struct IrDecodeCtx
+{
+  int is_dry_run;
+  int use_mop_cache;
+  MopCache *mop_cache;
+  TCCIRState *ir;
+  const IROperand *src1_ir, *src2_ir, *dest_ir;
+} IrDecodeCtx;
+
+static MopArgs ir_decode_at(const IrDecodeCtx *c, int i, IRQuadCompact *cq, MopSpec spec)
+{
+  return ir_decode_cached(c->is_dry_run, c->use_mop_cache, c->mop_cache, i, c->ir, cq, c->src1_ir, c->src2_ir,
+                          c->dest_ir, spec);
+}
+
 /* TEMPORARY INSTRUMENT storage: see the use site in tcc_ir_codegen_generate.
  * Defined here rather than in libtcc.c because codegen is what writes it (8
  * sites below) and libtcc.c only prints it under -bench -- and because the
@@ -2499,6 +2663,22 @@ static int *ir_codegen_temp_uses(TCCIRState *ir, int *count)
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && TCCIR_DECODE_VREG_POSITION(vr) < n)
         uses[TCCIR_DECODE_VREG_POSITION(vr)]++;
     }
+  }
+  /* A phi-pinned TEMP's register is also read under a name that is not this
+   * vreg: ra:reload_elim dropped a later reload of the slot this temp was
+   * stored to (the dropped load's destination just reads the register), or an
+   * identity phi copy onto it was elided.  Neither reader is an operand here,
+   * so count it.  Without it a load+store run proved the register free once
+   * the store was done and made it the STM base -- `stmia r0!` left r0 an
+   * address, and the elided reload stored that as data. */
+  for (int p = 0; p < n; p++)
+  {
+    if (!uses[p])
+      continue;
+    const int32_t vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, p);
+    IRLiveInterval *li = tcc_ir_vreg_is_valid(ir, vr) ? tcc_ir_vreg_live_interval(ir, vr) : NULL;
+    if (li && li->phi_pinned)
+      uses[p]++;
   }
   *count = n;
   return uses;
@@ -2571,7 +2751,8 @@ static int ir_codegen_copy_word_access(TCCIRState *ir, const uint8_t *branch_tar
   /* The address: the load's source, the store's destination. */
   const MachineOperand *adr = is_load ? &a.src1 : &a.dest;
   const IROperand *adr_ir = is_load ? &src1_ir : &dest_ir;
-  if (tcc_ir_access_is_volatile(ir, *adr_ir) || adr->underalign_hint || val->underalign_hint)
+  if (tcc_ir_access_is_volatile(ir, *adr_ir) || adr->underalign_hint || val->underalign_hint ||
+      (adr->kind == MACH_OP_REG && !adr->align4))
     return 0;
   if (indexed)
   {
@@ -2661,6 +2842,49 @@ static int ir_codegen_scan_batched_word_copy(TCCIRState *ir, const uint8_t *bran
   return 1;
 }
 
+/* Caller-saved registers holding a caller_save interval (ra:caller_save) live
+ * across the call at `call_idx` -- strictly inside its range -- by their final
+ * allocation: a post-RA fixup may have moved it to a callee-saved register or
+ * demoted it to memory.  The call lowering adds them to its nested-call save
+ * mask.  The call's own result registers are never restored over. */
+uint32_t tcc_ir_caller_save_mask_at(TCCIRState *ir, int call_idx)
+{
+  uint32_t mask = 0;
+  if (!ir->ls.caller_save_count)
+    return 0;
+  for (int k = 0; k < ir->ls.next_interval_index; k++)
+  {
+    const LSLiveInterval *lsi = &ir->ls.intervals[k];
+    if (!lsi->caller_save || lsi->start >= (uint32_t)call_idx || lsi->end <= (uint32_t)call_idx)
+      continue;
+    IRLiveInterval *li = tcc_ir_get_live_interval(ir, (int32_t)lsi->vreg);
+    if (!li)
+      continue;
+    int r = li->allocation.r0;
+    if (r == PREG_NONE || (r & PREG_SPILLED) || li->allocation.offset != 0)
+      continue;
+    if ((r >= 0 && r <= 3) || r == 12)
+      mask |= 1u << r;
+  }
+  if (mask)
+  {
+    IROperand d = tcc_ir_op_get_dest(ir, &ir->compact_instructions[call_idx]);
+    int dv = irop_get_vreg(d);
+    if (dv >= 0)
+    {
+      IRLiveInterval *dl = tcc_ir_get_live_interval(ir, dv);
+      if (dl)
+      {
+        if (dl->allocation.r0 != PREG_NONE && !(dl->allocation.r0 & PREG_SPILLED) && dl->allocation.r0 < 16)
+          mask &= ~(1u << dl->allocation.r0);
+        if (dl->allocation.r1 != PREG_NONE && dl->allocation.r1 < 16)
+          mask &= ~(1u << dl->allocation.r1);
+      }
+    }
+  }
+  return mask;
+}
+
 void tcc_ir_codegen_generate(TCCIRState *ir)
 {
   IRQuadCompact *cq;
@@ -2723,6 +2947,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     int call_count = 0;
     int has_softfloat_ops = 0;
     int max_nested_save_regs = 0;
+    int has_caller_save = 0;
     /* Each call's stack-argument bytes by call id, for the window policy below. */
     int32_t *call_stack = NULL;
     int call_stack_size = 0;
@@ -2743,7 +2968,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         tcc_state->func_dynamic_sp = 1;
       }
 
-      if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
+      if ((q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID) || tcc_ir_call_clobbers_nothing(ir, q))
         continue;
 
       call_count++;
@@ -2760,6 +2985,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       TCCAbiArgLoc inline_locs[16];
       layout.locs = inline_locs;
       layout.capacity = 16;
+      {
+        const IROperand callee = tcc_ir_get_src1(ir, i);
+        thumb_call_layout_abi_flags(&layout,
+                                    irop_get_tag(callee) == IROP_TAG_SYMREF ? irop_get_sym_ex(ir, callee) : NULL);
+      }
 
       TCCAbiArgLoc *heap_locs = NULL;
       if (argc_hint > 16)
@@ -2873,6 +3103,14 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             need_save = 0;
           }
         }
+        {
+          uint32_t cs = tcc_ir_caller_save_mask_at(ir, i);
+          if (cs)
+          {
+            need_save |= cs;
+            has_caller_save = 1;
+          }
+        }
         const int save_count = __builtin_popcount(need_save);
         if (save_count > max_nested_save_regs)
           max_nested_save_regs = save_count;
@@ -2897,7 +3135,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
     /* Reserve nested-call register save area for functions with multiple calls.
      * Size based on actual max R0-R3 usage across calls (+ R9 if needed). */
-    if (call_count > 1 && max_nested_save_regs > 0)
+    if ((call_count > 1 || has_caller_save) && max_nested_save_regs > 0)
     {
       int save_regs = max_nested_save_regs;
       if (tcc_state->text_and_data_separation)
@@ -2998,6 +3236,24 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     ir->leaffunc = 0;
   }
 
+  /* The single call that made this a tail-call-only function can be gone by
+   * now: a pass after tcc_ir_backend_analyze_leaf_and_tail_calls dropped it
+   * (a call to a callee with no effect).  Nothing then branches out of the
+   * function, so it must return like a leaf -- without this the body was
+   * empty and its symbol ran into the next function (a pure-forward wrapper
+   * whose callee folded to nothing). */
+  if (ir->tail_call_only)
+  {
+    int has_call = 0;
+    for (int ci = 0; ci < ir->next_instruction_index && !has_call; ci++)
+    {
+      const int op = ir->compact_instructions[ci].op;
+      has_call = op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_BUILTIN_APPLY;
+    }
+    if (!has_call)
+      ir->tail_call_only = 0;
+  }
+
   /* ============================================================================
    * DRY RUN PASS: Analyze scratch register needs before emitting prologue
    * ============================================================================
@@ -3095,7 +3351,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
      the skip path relies on — no surprise LR push, an exactly-sized scratch
      area — are untouched.  When the term cannot matter, the scan that feeds it
      is dead work too: it decodes an operand per branch over the whole IR. */
-  const int fwd_branch_may_force_dry = (tcc_state->optimize != 0 || cg_keep_fwd_dry());
+  const int fwd_branch_may_force_dry = (TCC_OPT(tcc_state, optimize) != 0 || cg_keep_fwd_dry());
   int has_forward_branch = 0;
   for (int bi = 0; fwd_branch_may_force_dry && bi < ir->next_instruction_index && !has_forward_branch; bi++)
   {
@@ -3141,9 +3397,9 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
    * further fetch (matrix_mul +2.4%, dijkstra +1.3%). */
   /* -Os pads nothing: every pad is up to 2 bytes for a fetch cycle, the
    * trade that tier declines (zig.c: 72 KB of NOPs). */
-  const int align_level = tcc_state->optimize_size ? 0 : cg_align_loops();
+  const int align_level = TCC_OPT(tcc_state, optimize_size) ? 0 : cg_align_loops();
   const int align_bytes = (align_level == 2) ? 8 : 4;
-  if (tcc_state->optimize >= 1 && align_level >= 1)
+  if (TCC_OPT(tcc_state, optimize) >= 1 && align_level >= 1)
   {
     /* Loop extents, as [target, back-branch] spans.  A forward branch target
      * inside one is an `if` join reached once per ITERATION, which is what
@@ -3345,8 +3601,9 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * which vreg brings a value in through the same location
        * (cross_jump.c).  Before the rehearsal, so its address map is of the
        * merged code; the removed instructions' cached operands go too. */
-      if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("cross_jump_alloc"))
-        tcc_ir_cross_jump_alloc(ir); /* no operand cache built yet on this path */
+      if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("cross_jump_alloc") &&
+          tcc_ir_cross_jump_alloc(ir) && !tcc_ir_opt_pass_disabled("branch_tidy"))
+        tcc_ir_branch_tidy(ir); /* no operand cache built yet on this path */
       /* The real pass alone lays this body out: nothing measured its pool,
        * so ask its IR. */
       if (cg_may_read_pool(ir))
@@ -3460,10 +3717,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
      conservative encodings via their existing NULL guards.
      TCC_NO_REHEARSAL=1 forces the skip at any level (the measurement knob
      this decision was priced with). */
-  int cg_skip_rehearsal = tcc_state->optimize == 0 || cg_no_rehearsal();
+  int cg_skip_rehearsal = TCC_OPT(tcc_state, optimize) == 0 || cg_no_rehearsal();
   TCCPassTimer cg_pt = {0};
   int temp_uses_n = 0;
-  int *temp_uses = tcc_state->optimize > 0 ? ir_codegen_temp_uses(ir, &temp_uses_n) : NULL;
+  int *temp_uses = TCC_OPT(tcc_state, optimize) > 0 ? ir_codegen_temp_uses(ir, &temp_uses_n) : NULL;
   int p0_pool_entries = 0; /* literal-pool entries the discovery pass allocated */
   int outline_capturing = 0;
   int outline_planned = 0; /* windows the real pass calls instead */
@@ -3488,8 +3745,11 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
     tcc_pass_timing_begin(&cg_pt, pass == 0 ? "cg:dry" : pass == 1 ? "cg:rehearsal" : "cg:emit");
     const int is_dry_run = (pass < 2);
     const int is_rehearsal = (pass == 1);
+    const IrScratchTrack scratch_track = {is_dry_run && !is_rehearsal, dry_insn_scratch, dry_insn_saves};
     int codegen_skip_cmp = -1;
     int codegen_skip_select = -1; /* SUBS+IT peephole: skip this SELECT (CMP already emitted SUBS+IT+MOVNE in its slot). */
+    int codegen_subs_subsumes_cmp = -1; /* CMP+SUB-to-SUBS peephole: this SUB emits
+                                         * flag-setting and the CMP before it was skipped. */
     int codegen_cbz_reg = -1;    /* pending CBZ: physical register for compare */
     int codegen_cbz_nonzero = 0; /* pending CBZ: 0=CBZ (EQ), 1=CBNZ (NE) */
     /* CBZ/CBNZ peephole: fuse `CMP rN,#0; JUMPIF EQ/NE` into a single 16-bit
@@ -3577,7 +3837,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * the back-edge branch lands on a 4-aligned instruction (see
        * IRQuadCompact.align_target).  The pad sits BEFORE the target, so it is
        * executed only on fall-through entry, never on the back edge. */
-      if (cq->align_target && !tcc_state->optimize_size)
+      if (cq->align_target && !TCC_OPT(tcc_state, optimize_size))
         tcc_gen_machine_align_branch_target(align_bytes);
 
       /* -Os outliner: a window the real pass calls instead ends before this
@@ -3660,20 +3920,19 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       IROperand src1_ir = tcc_ir_op_get_src1(ir, cq);
       IROperand src2_ir = tcc_ir_op_get_src2(ir, cq);
       IROperand dest_ir = tcc_ir_op_get_dest(ir, cq);
+      const IrDecodeCtx decode_ctx = {is_dry_run, use_mop_cache, mop_cache, ir, &src1_ir, &src2_ir, &dest_ir};
 
       /* Operands are NOT filled here. machine_op_from_ir reads the interval
        * table directly from the raw operand.  All dispatch sites now use
        * MachineOperand-based (_mop) handlers unconditionally. */
 
-#define DECODE(...)                                                                                                    \
-  ir_decode_cached(is_dry_run, use_mop_cache, mop_cache, i, ir, cq, &src1_ir, &src2_ir, &dest_ir,                      \
-                   (MopSpec){__VA_ARGS__})
+#define DECODE(...) ir_decode_at(&decode_ctx, i, cq, (MopSpec){__VA_ARGS__})
 #define SCRATCH_WRAP(call)                                                                                             \
   do                                                                                                                   \
   {                                                                                                                    \
     tcc_gen_machine_insn_scratch_reset();                                                                              \
     call;                                                                                                              \
-    ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);                                 \
+    ir_codegen_track_scratch(&scratch_track, i, cq->op);                                                               \
   } while (0)
 
       switch (cq->op)
@@ -3758,7 +4017,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                                                                     b.dest);
                 if (fused)
                 {
-                  ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
+                  ir_codegen_track_scratch(&scratch_track, i, cq->op);
                   i = next_j;
                   break;
                 }
@@ -3786,8 +4045,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               next_j++;
             if (next_j < ir->next_instruction_index && ir->compact_instructions[next_j].op == TCCIR_OP_JUMPIF)
             {
-              IROperand jc = tcc_ir_op_get_src1(ir, &ir->compact_instructions[next_j]);
-              int ct = (int)irop_get_imm64_ex(ir, jc);
+              int ct = (int)tcc_ir_op_src1_imm(ir, &ir->compact_instructions[next_j]);
               if (ct == 0x94 || ct == 0x95)
               {
                 IROperand jdest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[next_j]);
@@ -3829,7 +4087,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           SCRATCH_WRAP({
             int fused = tcc_gen_machine_mlal_accum_mop(a.src1, a.src2, a.accum, a.dest, !a.dest.is_unsigned);
             if (!fused)
-              tcc_error("compiler_error: unable to lower 64-bit MLA");
+              tcc_ice("unable to lower 64-bit MLA");
           });
         }
         else
@@ -3851,11 +4109,13 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
         /* Peephole: (S/U)MULL feeding a single 64-bit ADD into the same
          * accumulator pair maps directly to (S/U)MLAL. */
-        if (a.dest.vreg >= 0 && ir_codegen_count_vreg_uses(ir, a.dest.vreg) == 1)
+        /* The use count scans the whole function: ask it last. */
+        int next_j = a.dest.vreg >= 0 ? ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i) : -1;
+        if (next_j >= 0)
         {
-          int next_j = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
-          if (next_j >= 0 && ir->compact_instructions[next_j].op == TCCIR_OP_ADD &&
-              !ir->compact_instructions[next_j].is_jump_target)
+          if (ir->compact_instructions[next_j].op == TCCIR_OP_ADD &&
+              !ir->compact_instructions[next_j].is_jump_target &&
+              ir_codegen_count_vreg_uses(ir, a.dest.vreg) == 1)
           {
             IRQuadCompact *nq = &ir->compact_instructions[next_j];
             IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
@@ -3876,7 +4136,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               int fused = tcc_gen_machine_mlal_accum_mop(a.src1, a.src2, *accum, b.dest, cq->op == TCCIR_OP_SMULL);
               if (fused)
               {
-                ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
+                ir_codegen_track_scratch(&scratch_track, i, cq->op);
                 i = next_j;
                 break;
               }
@@ -3889,10 +4149,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                   !ir->compact_instructions[store_j].is_jump_target)
               {
                 IRQuadCompact *sq = &ir->compact_instructions[store_j];
-                IROperand st_src_ir = tcc_ir_op_get_src1(ir, sq);
-                IROperand st_dest_ir = tcc_ir_op_get_dest(ir, sq);
-                if (irop_get_vreg(st_src_ir) == irop_get_vreg(n_dest_ir) &&
-                    irop_get_vreg(st_dest_ir) == accum->vreg &&
+                if (tcc_ir_op_src1_vreg(ir, sq) == irop_get_vreg(n_dest_ir) &&
+                    tcc_ir_op_dest_vreg(ir, sq) == accum->vreg &&
                     ir_codegen_count_vreg_uses(ir, irop_get_vreg(n_dest_ir)) == 1)
                 {
                   tcc_gen_machine_insn_scratch_reset();
@@ -3900,7 +4158,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                       tcc_gen_machine_mlal_accum_mop(a.src1, a.src2, *accum, *accum, cq->op == TCCIR_OP_SMULL);
                   if (fused)
                   {
-                    ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
+                    ir_codegen_track_scratch(&scratch_track, i, cq->op);
                     i = store_j;
                     break;
                   }
@@ -3920,6 +4178,18 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       case TCCIR_OP_SUB:
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
+        /* CMP+SUB-to-SUBS peephole consumer: the CMP above this SUB was
+         * skipped because the SUBS re-derives its flags (V-K); emit the
+         * flag-setting encoding and mark the flags live for the JUMPIF that
+         * follows.  Barrel shift and half-64 annotations are zero here — the
+         * CMP-side matcher refused anything else. */
+        if (i == codegen_subs_subsumes_cmp)
+        {
+          codegen_subs_subsumes_cmp = -1;
+          SCRATCH_WRAP(tcc_gen_machine_data_processing_mop_flags(a.src1, a.src2, a.dest, cq->op, 0));
+          ir->codegen_flags_live = 1;
+          break;
+        }
         /* Peephole: if next instruction is CMP #0 of the same dest vreg,
          * force flag-setting encoding for this ADD/SUB and skip the CMP.
          * ARM Thumb SUBS/ADDS sets Z flag which replaces CMP Rd, #0.
@@ -3944,10 +4214,31 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             if (next_jmpif_idx < ir->next_instruction_index &&
                 ir->compact_instructions[next_jmpif_idx].op == TCCIR_OP_JUMPIF)
             {
-              IROperand jc = tcc_ir_op_get_src1(ir, &ir->compact_instructions[next_jmpif_idx]);
-              int ct = (int)irop_get_imm64_ex(ir, jc);
+              int ct = (int)tcc_ir_op_src1_imm(ir, &ir->compact_instructions[next_jmpif_idx]);
               cond_safe = (ct == 0x94 || ct == 0x95); /* TOK_EQ or TOK_NE */
             }
+            /* The fused flag-setting op stands in for the CMP on *every* path
+             * that reaches the branch.  Refuse when any instruction the fusion
+             * skips (the CMP, or an identity move the scan steps over, up to
+             * the JUMPIF) is a branch target: another path reaches the test
+             * without running the ADD/SUB, so it reads stale flags.  Refuse
+             * when the CMP's operand is a volatile access: the fusion reuses
+             * the value just written, but each volatile read must reach memory.
+             * is_jump_target misses some -O0 back-edge targets; branch_target_reset[]
+             * completes the set (see the map built above). */
+            int fusion_ok = 1;
+            for (int tj = i + 1; tj <= next_jmpif_idx && tj < ir->next_instruction_index; tj++)
+            {
+              IRQuadCompact *tq = &ir->compact_instructions[tj];
+              if (tq->is_jump_target || (branch_target_reset && branch_target_reset[tj]))
+              {
+                fusion_ok = 0;
+                break;
+              }
+            }
+            if (fusion_ok &&
+                (ir_codegen_op_touches_volatile(ir, nq) || tcc_ir_access_is_volatile(ir, cmp_s1)))
+              fusion_ok = 0;
             /* Block when CMP src1 is a TEMP used as a pointer dereference
              * (is_lval + TEMP type = *ptr, tests memory not the pointer).
              * Allow VAR operands with is_lval (load from stack = same value). */
@@ -3960,7 +4251,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
              * (miscompile: 920501-6's `for(b=0,s=t; b++,(s>>=1)!=0;)` exited
              * after one iteration).  Keep the CMP, which the 64-bit EQ/NE
              * peephole below lowers correctly via cmp_eq64. */
-            if (cond_safe && !cmp_is_ptr_deref &&
+            if (cond_safe && fusion_ok && !cmp_is_ptr_deref &&
                 !a.src1.is_64bit && !a.dest.is_64bit &&
                 irop_is_immediate(cmp_s2) && irop_get_imm64_ex(ir, cmp_s2) == 0 &&
                 irop_has_vreg(cmp_s1) &&
@@ -4026,8 +4317,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
               next_j++;
             if (next_j < ir->next_instruction_index && ir->compact_instructions[next_j].op == TCCIR_OP_JUMPIF)
             {
-              IROperand jc = tcc_ir_op_get_src1(ir, &ir->compact_instructions[next_j]);
-              int ct = (int)irop_get_imm64_ex(ir, jc);
+              int ct = (int)tcc_ir_op_src1_imm(ir, &ir->compact_instructions[next_j]);
               if (ct == 0x94 || ct == 0x95) /* TOK_EQ or TOK_NE */
               {
                 IROperand jdest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[next_j]);
@@ -4041,6 +4331,73 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                     codegen_cbz_nonzero = (ct == 0x95); /* NE → CBNZ */
                     break;                               /* skip emitting CMP */
                   }
+                }
+              }
+            }
+          }
+        }
+        /* CMP+SUB-to-SUBS peephole: `CMP V,#K` immediately followed by the
+         * in-place `V <-- V SUB #K` whose next flag consumer is a JUMPIF.  The
+         * SUBS performs the identical subtraction V-K and leaves N/Z/C/V
+         * exactly as the CMP would, so the CMP is dead: skip it and force the
+         * flag-setting encoding on the SUB.  ssa:decrement_to_carry builds
+         * this shape for `for (; n >= K; n -= K)` loops (guard and latch),
+         * turning the latch into `subs r,#K; bcs` — one instruction per
+         * iteration less than `subs; cmp; bcs`.  The CMP must sit ABOVE the
+         * SUB (reading the pre-decrement value); a CMP of the SUB's result is
+         * a different comparison and must not match.  Refused when anything
+         * between the SUB and the JUMPIF is a branch target (a path arriving
+         * there missed the SUBS and reads stale flags) or touches volatile
+         * (the skipped CMP's read must still reach memory). */
+        if (!tcc_gen_machine_outline_suppressing())
+        {
+          MopArgs cs_a = DECODE(.dest = 1, .src1 = 1, .src2 = 1);
+          if (cs_a.src2.kind == MACH_OP_IMM && cs_a.src1.kind == MACH_OP_REG &&
+              !cs_a.src1.needs_deref && !cs_a.src1.is_64bit &&
+              !ir_codegen_op_touches_volatile(ir, cq) && !tcc_ir_access_is_volatile(ir, src1_ir))
+          {
+            int sub_j = i + 1;
+            while (sub_j < ir->next_instruction_index &&
+                   (ir->compact_instructions[sub_j].op == TCCIR_OP_NOP ||
+                    ir_codegen_is_identity_move(ir, sub_j)))
+              sub_j++;
+            if (sub_j < ir->next_instruction_index &&
+                ir->compact_instructions[sub_j].op == TCCIR_OP_SUB)
+            {
+              IRQuadCompact *cs_sq = &ir->compact_instructions[sub_j];
+              IROperand sub_s1 = tcc_ir_op_get_src1(ir, cs_sq);
+              IROperand sub_s2 = tcc_ir_op_get_src2(ir, cs_sq);
+              IROperand sub_d = tcc_ir_op_get_dest(ir, cs_sq);
+              int jmp_j = sub_j + 1;
+              while (jmp_j < ir->next_instruction_index &&
+                     (ir->compact_instructions[jmp_j].op == TCCIR_OP_NOP ||
+                      ir_codegen_is_identity_move(ir, jmp_j)))
+                jmp_j++;
+              if (jmp_j < ir->next_instruction_index &&
+                  ir->compact_instructions[jmp_j].op == TCCIR_OP_JUMPIF &&
+                  irop_has_vreg(src1_ir) && irop_has_vreg(sub_s1) &&
+                  irop_get_vreg(src1_ir) == irop_get_vreg(sub_s1) &&
+                  irop_get_vreg(src1_ir) == irop_get_vreg(sub_d) &&
+                  sub_s1.btype != IROP_BTYPE_INT64 && sub_d.btype != IROP_BTYPE_INT64 &&
+                  irop_is_immediate(sub_s2) &&
+                  irop_get_imm64_ex(ir, sub_s2) == irop_get_imm64_ex(ir, src2_ir) &&
+                  !tcc_ir_barrel_shift_at(ir, cs_sq) && !tcc_ir_zero_half64_at(ir, cs_sq) &&
+                  !ir_codegen_op_touches_volatile(ir, cs_sq))
+              {
+                int window_ok = 1;
+                for (int tj = sub_j + 1; tj <= jmp_j && tj < ir->next_instruction_index; tj++)
+                {
+                  IRQuadCompact *tq = &ir->compact_instructions[tj];
+                  if (tq->is_jump_target || (branch_target_reset && branch_target_reset[tj]))
+                  {
+                    window_ok = 0;
+                    break;
+                  }
+                }
+                if (window_ok)
+                {
+                  codegen_subs_subsumes_cmp = sub_j;
+                  break; /* skip emitting CMP; the SUBS re-derives its flags */
                 }
               }
             }
@@ -4064,11 +4421,33 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
              * iteration).  The relational path already relies on these ASSIGNs
              * preserving the CMP's flags up to the branch, so skipping them
              * here is consistent. */
-            int next_j = i + 1;
-            while (next_j < ir->next_instruction_index &&
-                   (ir->compact_instructions[next_j].op == TCCIR_OP_NOP ||
-                    ir->compact_instructions[next_j].op == TCCIR_OP_ASSIGN))
-              next_j++;
+            /* An unconditional JUMP preserves the flags too, and a tail merge
+             * (cross_jump, cross_jump_alloc) leaves exactly that between a CMP
+             * and the shared consumer: `CMP; JMP tail` with the SELECT in the
+             * tail.  Without following it the equality CMP took the SBCS form
+             * and the shared `ite ne` read a Z of the high word alone -- the
+             * native tcc built with the gen_opic compare fold answered `x == INT_MIN`
+             * as true for x = 0 (docs/bugs history: selfhost-const-compare-fold). */
+            int next_j = i + 1, hops = 0;
+            while (next_j < ir->next_instruction_index)
+            {
+              const TccIrOp nop = ir->compact_instructions[next_j].op;
+              if (nop == TCCIR_OP_NOP || nop == TCCIR_OP_ASSIGN)
+              {
+                next_j++;
+                continue;
+              }
+              if (nop == TCCIR_OP_JUMP && hops++ < 4)
+              {
+                const int t = (int)tcc_ir_op_dest_imm(ir, &ir->compact_instructions[next_j]);
+                if (t > 0 && t < ir->next_instruction_index && t != next_j)
+                {
+                  next_j = t;
+                  continue;
+                }
+              }
+              break;
+            }
             if (next_j < ir->next_instruction_index)
             {
               TccIrOp next_op = ir->compact_instructions[next_j].op;
@@ -4112,12 +4491,9 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             if (next_j < ir->next_instruction_index &&
                 ir->compact_instructions[next_j].op == TCCIR_OP_SELECT) {
               IRQuadCompact *sq = &ir->compact_instructions[next_j];
-              IROperand sel_s1 = tcc_ir_op_get_src1(ir, sq);
-              IROperand sel_s2 = tcc_ir_op_get_src2(ir, sq);
-              IROperand sel_cond = tcc_ir_op_get_cond(ir, sq);
-              int sel_cc = (int)irop_get_imm64_ex(ir, sel_cond);
-              int v1 = irop_is_immediate(sel_s1) ? (int)irop_get_imm64_ex(ir, sel_s1) : -1;
-              int v2 = irop_is_immediate(sel_s2) ? (int)irop_get_imm64_ex(ir, sel_s2) : -1;
+              int sel_cc = (int)tcc_ir_op_cond_imm(ir, sq);
+              int v1 = tcc_ir_op_src1_is_imm(ir, sq) ? (int)tcc_ir_op_src1_imm(ir, sq) : -1;
+              int v2 = tcc_ir_op_src2_is_imm(ir, sq) ? (int)tcc_ir_op_src2_imm(ir, sq) : -1;
               int matches = (v1 == 1 && v2 == 0 && sel_cc == TOK_NE) ||
                             (v1 == 0 && v2 == 1 && sel_cc == TOK_EQ);
               if (matches) {
@@ -4206,7 +4582,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       {
         MopArgs a = DECODE(.dest = 2, .src1 = 2);
         if (a.dest.kind == MACH_OP_NONE || a.src1.kind == MACH_OP_NONE)
-          tcc_error("compiler_error: LOAD operand produced MACH_OP_NONE (i=%d dest_kind=%d src_kind=%d)", i,
+          tcc_ice("LOAD operand produced MACH_OP_NONE (i=%d dest_kind=%d src_kind=%d)", i,
                     a.dest.kind, a.src1.kind);
 
         /* A small aggregate copied through a pointer arrives batched -- every
@@ -4375,7 +4751,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
       {
         MopArgs a = DECODE(.dest = 1, .src1 = 2);
         if (a.dest.kind == MACH_OP_NONE || a.src1.kind == MACH_OP_NONE)
-          tcc_error("compiler_error: STORE operand produced MACH_OP_NONE (i=%d dest_kind=%d src_kind=%d)", i,
+          tcc_ice("STORE operand produced MACH_OP_NONE (i=%d dest_kind=%d src_kind=%d)", i,
                     a.dest.kind, a.src1.kind);
 
         /* STRD peephole: if this is a 32-bit store to a spill slot and the
@@ -4399,7 +4775,10 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
            * point, so branches to it backpatch against code address 0. */
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE &&
               !ir->compact_instructions[next_i].is_jump_target &&
-              !(branch_target_reset && branch_target_reset[next_i]))
+              !(branch_target_reset && branch_target_reset[next_i]) &&
+              /* two volatile stores are two accesses, never one STRD */
+              !tcc_ir_instr_access_is_volatile(ir, cq) &&
+              !tcc_ir_instr_access_is_volatile(ir, &ir->compact_instructions[next_i]))
           {
             /* Decode the next store's operands */
             IRQuadCompact *nq = &ir->compact_instructions[next_i];
@@ -4451,7 +4830,9 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_STORE &&
-              !ir->compact_instructions[next_i].is_jump_target)
+              !ir->compact_instructions[next_i].is_jump_target &&
+              !tcc_ir_instr_access_is_volatile(ir, cq) &&
+              !tcc_ir_instr_access_is_volatile(ir, &ir->compact_instructions[next_i]))
           {
             IRQuadCompact *nq = &ir->compact_instructions[next_i];
             IROperand n_src1_ir = tcc_ir_op_get_src1(ir, nq);
@@ -4498,10 +4879,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
          * existing STORE_INDEXED-only peephole misses the pair. */
         if (a.dest.kind == MACH_OP_REG && a.dest.needs_deref &&
             a.src1.kind == MACH_OP_REG && !a.src1.is_64bit && !a.src1.needs_deref &&
-            !a.dest.underalign_hint && !a.src1.underalign_hint &&
+            a.dest.align4 && !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
+          if (!ir_codegen_pair_ok(ir, i, next_i))
+            next_i = -1;
           /* is_jump_target misses some branch targets (see branch_target_reset);
            * consuming a branch-target store removes the label's only emission
            * point, so branches to it backpatch against code address 0. */
@@ -4522,7 +4905,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
-                !b.dest.underalign_hint && !b.src1.underalign_hint &&
+                b.dest.align4 && !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -4551,10 +4934,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
          * before the paired store. */
         if (a.dest.kind == MACH_OP_REG && a.dest.needs_deref &&
             a.src1.kind == MACH_OP_IMM && !a.src1.is_64bit &&
-            !a.dest.underalign_hint && !a.src1.underalign_hint &&
+            a.dest.align4 && !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
+          if (!ir_codegen_pair_ok(ir, i, next_i))
+            next_i = -1;
           /* is_jump_target misses some branch targets (see branch_target_reset);
            * consuming a branch-target store removes the label's only emission
            * point, so branches to it backpatch against code address 0. */
@@ -4573,7 +4958,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
-                !b.dest.underalign_hint && !b.src1.underalign_hint &&
+                b.dest.align4 && !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -4593,13 +4978,20 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
 
         /* Store-load forwarding: STORE reg → spill followed immediately by
          * LOAD from the same spill → same reg.  The value is still in the
-         * register, so emit the store but skip the redundant load. */
+         * register, so emit the store but skip the redundant load.  Word
+         * slots only: a byte/halfword store keeps the low bits and the reload
+         * sign- or zero-extends them, so the register is NOT the slot's value
+         * (`signed char b[4]; b[0] = k; return b[0];` returned k). */
         if (a.dest.kind == MACH_OP_SPILL && !a.dest.needs_deref &&
             a.src1.kind == MACH_OP_REG && !a.src1.is_64bit &&
+            a.dest.btype != IROP_BTYPE_INT8 && a.dest.btype != IROP_BTYPE_INT16 &&
             (a.dest.u.spill.offset & 3) == 0)
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
-          if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_LOAD &&
+          /* Neither access may be volatile: `volatile int v[2]; v[1] = x;
+           * return v[1];` is exactly this STORE/LOAD pair, and the read is
+           * the access the source asked for. */
+          if (ir_codegen_pair_ok(ir, i, next_i) && ir->compact_instructions[next_i].op == TCCIR_OP_LOAD &&
               !ir->compact_instructions[next_i].is_jump_target)
           {
             IRQuadCompact *lq = &ir->compact_instructions[next_i];
@@ -4659,10 +5051,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
             a.src2.kind == MACH_OP_IMM &&
             a.src1.kind == MACH_OP_REG && !a.src1.needs_deref &&
-            !a.src1.underalign_hint && !a.dest.underalign_hint &&
+            a.src1.align4 && !a.src1.underalign_hint && !a.dest.underalign_hint &&
             (a.dest.btype == IROP_BTYPE_INT32 || a.dest.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
+          if (!ir_codegen_pair_ok(ir, i, next_i))
+            next_i = -1;
           if (next_i >= 0 && ir->compact_instructions[next_i].op == TCCIR_OP_LOAD_INDEXED &&
               !ir->compact_instructions[next_i].is_jump_target)
           {
@@ -4677,7 +5071,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.src1.kind == MACH_OP_REG && !b.src1.needs_deref &&
-                !b.src1.underalign_hint && !b.dest.underalign_hint &&
+                b.src1.align4 && !b.src1.underalign_hint && !b.dest.underalign_hint &&
                 (b.dest.btype == IROP_BTYPE_INT32 || b.dest.btype == IROP_BTYPE_FLOAT32) &&
                 a.src1.u.reg.r0 == b.src1.u.reg.r0)
             {
@@ -4728,7 +5122,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
             a.src2.kind == MACH_OP_IMM &&
             a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
-            !a.dest.underalign_hint && !a.src1.underalign_hint &&
+            a.dest.align4 && !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = -1;
@@ -4769,6 +5163,8 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             next_i = j;
             break;
           }
+          if (!ir_codegen_pair_ok(ir, i, next_i))
+            next_i = -1;
           /* is_jump_target misses some branch targets (see branch_target_reset);
            * consuming a branch-target store removes the label's only emission
            * point, so branches to it backpatch against code address 0. */
@@ -4787,7 +5183,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
-                !b.dest.underalign_hint && !b.src1.underalign_hint &&
+                b.dest.align4 && !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -4825,10 +5221,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
             a.scale.kind == MACH_OP_IMM && a.scale.u.imm.val == 0 &&
             a.src2.kind == MACH_OP_IMM &&
             a.dest.kind == MACH_OP_REG && !a.dest.needs_deref &&
-            !a.dest.underalign_hint && !a.src1.underalign_hint &&
+            a.dest.align4 && !a.dest.underalign_hint && !a.src1.underalign_hint &&
             (a.src1.btype == IROP_BTYPE_INT32 || a.src1.btype == IROP_BTYPE_FLOAT32))
         {
           int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, i);
+          if (!ir_codegen_pair_ok(ir, i, next_i))
+            next_i = -1;
           /* is_jump_target misses some branch targets (see branch_target_reset);
            * consuming a branch-target store removes the label's only emission
            * point, so branches to it backpatch against code address 0. */
@@ -4847,7 +5245,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
                 b.scale.kind == MACH_OP_IMM && b.scale.u.imm.val == 0 &&
                 b.src2.kind == MACH_OP_IMM &&
                 b.dest.kind == MACH_OP_REG && !b.dest.needs_deref &&
-                !b.dest.underalign_hint && !b.src1.underalign_hint &&
+                b.dest.align4 && !b.dest.underalign_hint && !b.src1.underalign_hint &&
                 (b.src1.btype == IROP_BTYPE_INT32 || b.src1.btype == IROP_BTYPE_FLOAT32) &&
                 a.dest.u.reg.r0 == b.dest.u.reg.r0)
             {
@@ -4895,7 +5293,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           for (int k = 1; k <= 3; k++)
           {
             int next_i = ir_codegen_next_nonnop_no_label(ir, branch_target_reset, last_i);
-            if (next_i < 0 ||
+            if (!ir_codegen_pair_ok(ir, i, next_i) ||
                 ir->compact_instructions[next_i].op != TCCIR_OP_STORE_INDEXED ||
                 ir->compact_instructions[next_i].is_jump_target)
               break;
@@ -5320,7 +5718,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         MopArgs a = DECODE(.dest = 2, .src1 = 1);
         tcc_gen_machine_insn_scratch_reset();
         tcc_gen_machine_func_call_mop(a.src1, src2_ir, a.dest, drop_return_value, ir, i);
-        ir_codegen_track_scratch(is_dry_run && !is_rehearsal, i, cq->op, dry_insn_scratch, dry_insn_saves);
+        ir_codegen_track_scratch(&scratch_track, i, cq->op);
         tcc_ir_spill_cache_clear(&ir->spill_cache);
         if (ir->has_static_chain)
           tcc_gen_machine_restore_chain();
@@ -5434,8 +5832,7 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
         /* Conditional select: dest = (cond) ? src1 : src2
          * Condition code stored in 4th pool entry as IMM32. */
         MopArgs a = DECODE(.dest = 2, .src1 = 1, .src2 = 1);
-        IROperand cond_op = tcc_ir_op_get_cond(ir, cq);
-        int cond_code = (int)irop_get_imm64_ex(ir, cond_op);
+        int cond_code = (int)tcc_ir_op_cond_imm(ir, cq);
         SCRATCH_WRAP(tcc_gen_machine_select_mop(a.src1, a.src2, a.dest, cond_code));
         break;
       }
@@ -5664,6 +6061,34 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
           if (all_fixed)
             dry_insn_scratch[i] = 0;
         }
+        /* Where nothing could be freed -- every low register an ABI-pinned
+         * parameter, say -- the instruction still saves and restores its
+         * scratch around itself, in a loop on every iteration.  Hand it a
+         * callee-saved register the function leaves unused instead: free
+         * everywhere, and in a prologue that already pushes registers no
+         * instruction at all, only a stack word. */
+        if (!tcc_ir_opt_pass_disabled("cg:spare_scratch"))
+        {
+          int spare_need = 0;
+          for (int i = 0; i < ir->next_instruction_index; i++)
+            if (dry_insn_saves[i] && dry_insn_scratch[i] && __builtin_popcount(dry_insn_saves[i]) > spare_need)
+              spare_need = __builtin_popcount(dry_insn_saves[i]);
+          uint32_t reserved = 1u << 7; /* the frame pointer */
+          if (tcc_state->text_and_data_separation)
+            reserved |= 1u << 9;
+          if (ir->has_static_chain || ir->emits_set_chain)
+            reserved |= 1u << (uint32_t)architecture_config.static_chain_reg;
+          if (tcc_gen_machine_rodata_anchor_get() >= 0)
+            reserved |= 1u << (uint32_t)tcc_gen_machine_rodata_anchor_get();
+          uint32_t avail = 0x0FF0u & ~reserved & ~(uint32_t)ir->ls.dirty_registers & ~extra_prologue_regs;
+          for (; spare_need > 0 && avail; spare_need--, avail &= avail - 1u)
+          {
+            const uint32_t bit = avail & -avail;
+            ir->ls.spare_scratch_regs |= bit;
+            ir->ls.dirty_registers |= bit;
+            any_fixup = 1;
+          }
+        }
         if (orig_live)
           tcc_free(orig_live);
         if (demote_ref_cache)
@@ -5811,9 +6236,12 @@ void tcc_ir_codegen_generate(TCCIRState *ir)
        * which vreg brings a value in through the same location
        * (cross_jump.c).  Before the rehearsal, so its address map is of the
        * merged code; the removed instructions' cached operands go too. */
-      if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("cross_jump_alloc") &&
+      if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("cross_jump_alloc") &&
           tcc_ir_cross_jump_alloc(ir) > 0)
       {
+        /* the merge leaves jumps to jumps and jumps nothing reaches */
+        if (!tcc_ir_opt_pass_disabled("branch_tidy"))
+          tcc_ir_branch_tidy(ir);
         tcc_ir_mop_cache_free(mop_cache);
         mop_cache = NULL;
         ir->codegen_mop_cache = NULL;

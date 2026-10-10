@@ -1,0 +1,10 @@
+open 3 170 39 0 42
+read_between 1003053 1003220
+write_between 42
+two_blocks 41 102
+from_call 49
+callee_sees_dest 119
+in_loop 36
+open_zig 5 170 15 170 0 6 120
+self_ref 8 107 6 170 z
+from_callee 0 5 10 m 1 40 1 a

@@ -22,26 +22,6 @@ test asserts the corrected behavior. Detailed reports live in
   test in the corpus dereferences a literal address, which is why it went
   unnoticed. Correctness/miscompile, pre-existing, unpinned.
 
-- `tcc_ir_gen_cvt_ftof`/`tcc_ir_gen_cvt_itof`/`tcc_ir_gen_cvt_ftoi` read the
-  conversion source from *below* the top of stack: `tcc_ir_gen_f()`
-  (ir/gen/float.c:200) calls `tcc_ir_put(ir, op, &vtop[-1], &vtop[0], &dest)`
-  for the unary CVT_* ops (whose irop_config has no src2), so the emitted
-  instruction's src1 is the stale slot `vtop[-1]`, the `&vtop[0]` argument is
-  silently ignored, and the result is written into `vtop[0]` with nothing
-  popped. Under the natural one-value cast convention (the value to convert
-  sits at `vtop`, exactly what `gen_cast()`'s inline expansion assumes when it
-  passes `vtop` as src1, tccgen.c:9945/9961) the instruction converts whatever
-  stale value lies beneath. Additionally the itof/ftof branches derive
-  `dest.type` from `vtop[0].type` (ir/gen/float.c:176,188), which under that
-  convention is the *source* type, so `tcc_ir_gen_cvt_itof` would mark an int
-  source's dest incorrectly. Latent — none of the three wrappers has any
-  caller in the product (the frontend reaches float.c only via
-  `tcc_ir_gen_f()`, and gen_cast inlines its own conversion `tcc_ir_put`).
-  Not yet fixed. Regression lock:
-  `tests/unit/arm/armv8m/test_gen_float.c`,
-  `test_cvt_itof_single_value_stack_reads_stale_slot_below` pins the current
-  buggy behavior — flip its assertions once float.c passes `&vtop[0]`.
-
 - [load_cse: pointer-deref store source tracked as the stored value](bugs/load-cse-lval-store-src-tracked-as-value.md)
   — `ssa_opt_load_cse`'s two `sstore_track_vr` call sites
   (`source/opt/ssa/memory/load_cse.c`:1031 and :1076) record a TEMP store

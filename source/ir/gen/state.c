@@ -113,10 +113,6 @@ TCCIRState *tcc_ir_alloc(void)
   block->static_chain_vreg = 0;
   block->parent_loc = 0;
 
-  /* Nested function tracking (for parent functions) */
-  block->nested_funcs = NULL;
-  block->nb_nested_funcs = 0;
-  block->nested_funcs_capacity = 0;
 
   tcc_ir_clear_live_intervals(block);
 
@@ -174,11 +170,16 @@ void tcc_ir_free(TCCIRState *ir)
   }
   tcc_free(ir->frame_pads);
   ir->frame_pads = NULL;
+  tcc_free(ir->label_pos);
+  ir->label_pos = NULL;
+  ir->label_count = ir->label_cap = 0;
   if (ir->sret_calls)
   {
     tcc_free(ir->sret_calls);
     ir->sret_calls = NULL;
   }
+  tcc_free(ir->sret_calls_empty);
+  ir->sret_calls_empty = NULL;
   if (ir->call_dyn_extra)
   {
     tcc_free(ir->call_dyn_extra);
@@ -294,6 +295,7 @@ void tcc_ir_free(TCCIRState *ir)
   ir->codegen_dry_pool_entries = NULL;
   tcc_free(ir->codegen_branch_target_reset);
   ir->codegen_branch_target_reset = NULL;
+  tcc_ir_vreg_index_close(ir, 1); /* a compile error can longjmp out of a pass */
 
   if (ir->stack_layout.slots != NULL)
   {
@@ -331,6 +333,10 @@ void tcc_ir_free(TCCIRState *ir)
     ir->switch_tables_capacity = 0;
   }
 
+  tcc_free(ir->switch_heads);
+  ir->switch_heads = NULL;
+  ir->switch_heads_n = ir->switch_heads_cap = 0;
+
   /* Free switch value tables (SWITCH_LOAD lookup data) */
   if (ir->switch_value_tables)
   {
@@ -340,15 +346,6 @@ void tcc_ir_free(TCCIRState *ir)
     ir->switch_value_tables = NULL;
     ir->num_switch_value_tables = 0;
     ir->switch_value_tables_capacity = 0;
-  }
-
-  /* Free nested_funcs array (note: NestedFunc structs themselves are owned by TCCState) */
-  if (ir->nested_funcs)
-  {
-    tcc_free(ir->nested_funcs);
-    ir->nested_funcs = NULL;
-    ir->nb_nested_funcs = 0;
-    ir->nested_funcs_capacity = 0;
   }
 
   tcc_free(ir);

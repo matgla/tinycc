@@ -39,23 +39,29 @@ typedef struct LDParser
   int fd;          /* file descriptor */
   const char *str; /* string input (if parsing from string) */
   int str_pos;     /* position in string */
-  int cc;          /* pushed back character */
+  int cc;          /* pushed back character (top of the push-back stack) */
+  int cc2;         /* second pushed back character, below cc */
+  int rpos, rlen;  /* file input buffered: one read() per byte cost a
+                      system call per character of the script */
+  unsigned char rbuf[512];
   char tok_buf[1024];
   int tok;
   addr_t tok_num;
   int expr_has_loadaddr;
   int expr_loadaddr_section_idx;
+  char expr_loadaddr_name[64];
+  int expr_uses_dot; /* the expression read the location counter */
 } LDParser;
 
 /* ================= Lexer ================= */
 
 static int ld_getc(LDParser *p)
 {
-  char b;
   if (p->cc != -1)
   {
     int c = p->cc;
-    p->cc = -1;
+    p->cc = p->cc2;
+    p->cc2 = -1;
     return c;
   }
   if (p->str)
@@ -64,13 +70,20 @@ static int ld_getc(LDParser *p)
       return EOF;
     return p->str[p->str_pos++];
   }
-  if (read(p->fd, &b, 1) == 1)
-    return (unsigned char)b;
-  return EOF;
+  if (p->rpos >= p->rlen)
+  {
+    ssize_t n = read(p->fd, p->rbuf, sizeof p->rbuf);
+    if (n <= 0)
+      return EOF;
+    p->rpos = 0;
+    p->rlen = (int)n;
+  }
+  return p->rbuf[p->rpos++];
 }
 
 static void ld_ungetc(LDParser *p, int c)
 {
+  p->cc2 = p->cc;
   p->cc = c;
 }
 
@@ -380,6 +393,7 @@ static addr_t ld_parse_primary(LDParser *p)
   {
     /* Location counter */
     val = p->ld->location_counter;
+    p->expr_uses_dot = 1;
     ld_next_token(p);
   }
   else if (p->tok == LDTOK_NAME)
@@ -443,12 +457,12 @@ static addr_t ld_parse_primary(LDParser *p)
       ld_expect(p, '(');
       if (p->tok == LDTOK_NAME)
       {
-        int os_idx = ld_script_find_output_section(p->ld, p->tok_buf);
-        if (os_idx >= 0)
-        {
-          p->expr_has_loadaddr = 1;
-          p->expr_loadaddr_section_idx = os_idx;
-        }
+        /* The section may be defined further down the script
+           (`__data_start_flash__ = LOADADDR(.data);` before `.data`):
+           keep the name and resolve it once the script is parsed. */
+        p->expr_has_loadaddr = 1;
+        p->expr_loadaddr_section_idx = ld_script_find_output_section(p->ld, p->tok_buf);
+        pstrcpy(p->expr_loadaddr_name, sizeof(p->expr_loadaddr_name), p->tok_buf);
         ld_next_token(p);
       }
       ld_expect(p, ')');
@@ -586,6 +600,8 @@ static addr_t ld_parse_expr(LDParser *p)
 {
   p->expr_has_loadaddr = 0;
   p->expr_loadaddr_section_idx = -1;
+  p->expr_loadaddr_name[0] = '\0';
+  p->expr_uses_dot = 0;
   return ld_parse_or(p);
 }
 
@@ -786,15 +802,46 @@ static int ld_parse_section_pattern(LDParser *p, LDOutputSection *os, int keep)
   if (p->tok == '(')
   {
     ld_next_token(p);
-    /* Parse section patterns inside parentheses */
-    while (p->tok != ')' && p->tok != LDTOK_EOF)
+    /* Parse section patterns inside parentheses.  SORT*(...) wraps patterns
+       whose matches are laid out by name (pico-sdk orders its init steps by
+       .preinit_array.<priority>); EXCLUDE_FILE(files) names input files, not
+       sections, and is skipped -- both used to become bogus patterns that
+       also shifted the index of every pattern after them. */
+    int sort_depth = 0;
+    while ((p->tok != ')' || sort_depth > 0) && p->tok != LDTOK_EOF)
     {
-      if (p->tok == LDTOK_NAME || p->tok == '.')
+      if (p->tok == LDTOK_NAME && !strncmp(p->tok_buf, "SORT", 4))
+      {
+        ld_next_token(p);
+        if (p->tok == '(')
+        {
+          sort_depth++;
+          ld_next_token(p);
+        }
+      }
+      else if (p->tok == LDTOK_NAME && !strcmp(p->tok_buf, "EXCLUDE_FILE"))
+      {
+        ld_next_token(p);
+        if (p->tok == '(')
+        {
+          while (p->tok != ')' && p->tok != LDTOK_EOF)
+            ld_next_token(p);
+          ld_next_token(p);
+        }
+      }
+      else if (p->tok == ')')
+      {
+        sort_depth--;
+        ld_next_token(p);
+      }
+      else if (p->tok == LDTOK_NAME || p->tok == '.')
       {
         pat = ld_add_pattern(os, keep);
         if (pat) {
           pstrcpy(pat->pattern, sizeof(pat->pattern), p->tok_buf);
           pat->type = (strchr(pat->pattern, '*') != NULL) ? LD_PAT_GLOB : LD_PAT_EXACT;
+          pat->sort = sort_depth > 0;
+          pat->prefix_len = (int)strcspn(pat->pattern, "*?");
         }
         ld_next_token(p);
       }
@@ -859,14 +906,20 @@ static int ld_parse_output_section_contents(LDParser *p, LDOutputSection *os)
               /* Compute offset from the evaluated value, not stale
                * current_offset */
               p->ld->symbols[idx].section_offset = val - os->start_lc;
+              p->ld->symbols[idx].patterns_before = os->nb_patterns;
               if (p->expr_has_loadaddr)
               {
                 p->ld->symbols[idx].has_loadaddr = 1;
                 p->ld->symbols[idx].loadaddr_section_idx = p->expr_loadaddr_section_idx;
+                pstrcpy(p->ld->symbols[idx].loadaddr_name, sizeof(p->ld->symbols[idx].loadaddr_name), p->expr_loadaddr_name);
                 p->ld->symbols[idx].section_offset = val;
               }
               p->ld->symbols[idx].defined = 1;
               p->ld->symbols[idx].section_idx = p->ld->current_section_idx;
+              /* `sym = ORIGIN(romfs)` inside a section reads no '.': an absolute
+                 value, as GNU ld and lld treat it, not an offset into the section */
+              if (!p->expr_uses_dot && !p->expr_has_loadaddr)
+                p->ld->symbols[idx].section_idx = -1;
             }
           }
         }
@@ -896,14 +949,20 @@ static int ld_parse_output_section_contents(LDParser *p, LDOutputSection *os)
             /* Compute offset from the evaluated value, not stale current_offset
              */
             p->ld->symbols[idx].section_offset = val - os->start_lc;
+            p->ld->symbols[idx].patterns_before = os->nb_patterns;
             if (p->expr_has_loadaddr)
             {
               p->ld->symbols[idx].has_loadaddr = 1;
               p->ld->symbols[idx].loadaddr_section_idx = p->expr_loadaddr_section_idx;
+              pstrcpy(p->ld->symbols[idx].loadaddr_name, sizeof(p->ld->symbols[idx].loadaddr_name), p->expr_loadaddr_name);
               p->ld->symbols[idx].section_offset = val;
             }
             p->ld->symbols[idx].defined = 1;
             p->ld->symbols[idx].section_idx = p->ld->current_section_idx;
+            /* `sym = ORIGIN(romfs)` inside a section reads no '.': an absolute
+               value, as GNU ld and lld treat it, not an offset into the section */
+            if (!p->expr_uses_dot && !p->expr_has_loadaddr)
+              p->ld->symbols[idx].section_idx = -1;
             if (p->tok == ';')
               ld_next_token(p);
           }
@@ -975,13 +1034,39 @@ static int ld_parse_sections(LDParser *p)
         ld_next_token(p);
       }
 
-      /* Skip section type flags like (NOLOAD), (COPY), etc. */
+      /* Section type flags: (NOLOAD) is kept -- its inputs get no file
+
+
+         contents -- (COPY), (INFO), ... are skipped. */
+
+
       if (p->tok == '(')
+
+
       {
+
+
+        ld_next_token(p);
+
+
+        if (p->tok == LDTOK_NAME && !strcmp(p->tok_buf, "NOLOAD"))
+
+
+          os->noload = 1;
+
+
         while (p->tok != ')' && p->tok != LDTOK_EOF)
+
+
           ld_next_token(p);
+
+
         if (p->tok == ')')
+
+
           ld_next_token(p);
+
+
       }
 
       /* Section content in braces */
@@ -1072,6 +1157,7 @@ static int ld_parse_sections(LDParser *p)
           {
             p->ld->symbols[idx].has_loadaddr = 1;
             p->ld->symbols[idx].loadaddr_section_idx = p->expr_loadaddr_section_idx;
+            pstrcpy(p->ld->symbols[idx].loadaddr_name, sizeof(p->ld->symbols[idx].loadaddr_name), p->expr_loadaddr_name);
             p->ld->symbols[idx].section_offset = val;
           }
           p->ld->symbols[idx].defined = 1;
@@ -1101,13 +1187,39 @@ static int ld_parse_sections(LDParser *p)
           ld_next_token(p);
         }
 
-        /* Skip section type flags like (NOLOAD), (COPY), etc. */
+        /* Section type flags: (NOLOAD) is kept -- its inputs get no file
+
+
+           contents -- (COPY), (INFO), ... are skipped. */
+
+
         if (p->tok == '(')
+
+
         {
+
+
+          ld_next_token(p);
+
+
+          if (p->tok == LDTOK_NAME && !strcmp(p->tok_buf, "NOLOAD"))
+
+
+            os->noload = 1;
+
+
           while (p->tok != ')' && p->tok != LDTOK_EOF)
+
+
             ld_next_token(p);
+
+
           if (p->tok == ')')
+
+
             ld_next_token(p);
+
+
         }
 
         if (p->tok == ':')
@@ -1230,6 +1342,7 @@ int ld_script_parse(TCCState *s1, LDScript *ld, int fd)
   parser.fd = fd;
   parser.str = NULL;
   parser.cc = -1;
+  parser.cc2 = -1;
 
   ld_next_token(&parser);
 
@@ -1292,6 +1405,7 @@ int ld_script_parse(TCCState *s1, LDScript *ld, int fd)
             {
               ld->symbols[idx].has_loadaddr = 1;
               ld->symbols[idx].loadaddr_section_idx = parser.expr_loadaddr_section_idx;
+              pstrcpy(ld->symbols[idx].loadaddr_name, sizeof(ld->symbols[idx].loadaddr_name), parser.expr_loadaddr_name);
               ld->symbols[idx].section_offset = val;
             }
             ld->symbols[idx].defined = 1;
@@ -1322,6 +1436,7 @@ int ld_script_parse_string(TCCState *s1, LDScript *ld, const char *script)
   parser.str = script;
   parser.str_pos = 0;
   parser.cc = -1;
+  parser.cc2 = -1;
 
   ld_next_token(&parser);
 
@@ -1402,6 +1517,49 @@ int ld_script_find_or_create_symbol(LDScript *ld, const char *name)
   return idx;
 }
 
+/* ld_section_matches_pattern for a parsed pattern: names not starting with
+ * the pattern's literal head are rejected without the glob walk (the linker
+ * asks for every input section against every pattern of the script). */
+static int ld_pattern_matches(const char *name, const LDSectionPattern *pat)
+{
+  int k;
+  for (k = 0; k < pat->prefix_len; k++)
+    if (name[k] != pat->pattern[k])
+      return 0;
+  return ld_section_matches_pattern(name, pat->pattern);
+}
+
+int ld_find_output_section(LDScript *ld, const char *name, int *pat_idx)
+{
+  int i, j;
+  if (pat_idx)
+    *pat_idx = -1;
+  if (!ld)
+    return -1;
+  for (i = 0; i < ld->nb_output_sections; i++)
+  {
+    LDOutputSection *os = &ld->output_sections[i];
+    /* Patterns first - they define the ordering within the output section */
+    for (j = 0; j < os->nb_patterns; j++)
+    {
+      if (ld_pattern_matches(name, &os->patterns[j]))
+      {
+        if (pat_idx)
+          *pat_idx = j;
+        return i;
+      }
+    }
+    /* Exact name match - comes after all patterns */
+    if (!strcmp(name, os->name))
+    {
+      if (pat_idx)
+        *pat_idx = os->nb_patterns; /* after all patterns */
+      return i;
+    }
+  }
+  return -1;
+}
+
 /* Check if a section should be kept (not garbage collected) based on linker
  * script KEEP directives */
 int ld_section_should_keep(LDScript *ld, const char *section_name)
@@ -1414,7 +1572,7 @@ int ld_section_should_keep(LDScript *ld, const char *section_name)
     for (int j = 0; j < os->nb_patterns; j++)
     {
       LDSectionPattern *pat = &os->patterns[j];
-      if (pat->keep && ld_section_matches_pattern(section_name, pat->pattern))
+      if (pat->keep && ld_pattern_matches(section_name, pat))
       {
         return 1;
       }

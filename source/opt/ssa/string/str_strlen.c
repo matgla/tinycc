@@ -53,7 +53,7 @@ static int strlen_fold(StrFoldCtx *c)
 
   ir_opt_nop_call_params(c->ir, c->call_idx);
   q->op = TCCIR_OP_ASSIGN;
-  tcc_ir_set_src1(c->ir, c->call_idx, irop_make_imm32(-1, len, VT_INT));
+  tcc_ir_set_src1_imm32(c->ir, c->call_idx, len, VT_INT);
   tcc_ir_set_src2(c->ir, c->call_idx, IROP_NONE);
   return 1;
 }

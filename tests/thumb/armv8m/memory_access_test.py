@@ -98,3 +98,5 @@ def test_ldrsht():
     
 def test_ldrt():
     utils.perform_test_for_file("test_ldrt.S")
+def test_ldm_stm_base_in_list():
+    utils.perform_test_for_file("test_ldm_stm_base_in_list.S")

@@ -65,11 +65,10 @@ int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir)
     for (int j = i + 1; j < n && !aborted; j++)
     {
       IRQuadCompact *jq = &ir->compact_instructions[j];
+      if (jq->is_jump_target) /* before the NOP skip: a NOP can be the join */
+        break;
       if (jq->op == TCCIR_OP_NOP)
         continue;
-
-      if (jq->is_jump_target)
-        break;
       if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF || jq->op == TCCIR_OP_IJUMP ||
           jq->op == TCCIR_OP_RETURNVALUE || jq->op == TCCIR_OP_RETURNVOID ||
           jq->op == TCCIR_OP_SWITCH_TABLE)
@@ -82,10 +81,9 @@ int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir)
       /* LEA T = &V_p creates the first alias. */
       if (jq->op == TCCIR_OP_LEA)
       {
-        IROperand ldest = tcc_ir_op_get_dest(ir, jq);
         IROperand lsrc = tcc_ir_op_get_src1(ir, jq);
         int32_t lsrc_vr = irop_get_vreg(lsrc);
-        int32_t ldest_vr = irop_get_vreg(ldest);
+        int32_t ldest_vr = tcc_ir_op_dest_vreg(ir, jq);
         if (lsrc_vr == v_dest_vr && !lsrc.is_lval &&
             TCCIR_DECODE_VREG_TYPE(ldest_vr) == TCCIR_VREG_TYPE_TEMP)
         {
@@ -102,9 +100,8 @@ int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir)
       /* STORE V_a <-- T_alias: src has is_lval=0, it stores a TEMP's pointer value. */
       if (!handled && jq->op == TCCIR_OP_STORE)
       {
-        IROperand sdest = tcc_ir_op_get_dest(ir, jq);
         IROperand ssrc = tcc_ir_op_get_src1(ir, jq);
-        int32_t sdest_vr = irop_get_vreg(sdest);
+        int32_t sdest_vr = tcc_ir_op_dest_vreg(ir, jq);
         int32_t ssrc_vr = irop_get_vreg(ssrc);
         if (!ssrc.is_lval && sdest_vr >= 0 && ssrc_vr >= 0 &&
             TCCIR_DECODE_VREG_TYPE(sdest_vr) == TCCIR_VREG_TYPE_VAR &&
@@ -132,9 +129,8 @@ int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir)
       /* ASSIGN T_b <-- V_alias is a slot load of the pointer, not a deref: propagate the alias. */
       if (!handled && jq->op == TCCIR_OP_ASSIGN)
       {
-        IROperand adest = tcc_ir_op_get_dest(ir, jq);
         IROperand asrc = tcc_ir_op_get_src1(ir, jq);
-        int32_t adest_vr = irop_get_vreg(adest);
+        int32_t adest_vr = tcc_ir_op_dest_vreg(ir, jq);
         int32_t asrc_vr = irop_get_vreg(asrc);
         if (adest_vr >= 0 && asrc_vr >= 0 &&
             TCCIR_DECODE_VREG_TYPE(adest_vr) == TCCIR_VREG_TYPE_TEMP &&
@@ -168,8 +164,7 @@ int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir)
       /* Redefinition of V_p or a tracked alias invalidates; VAR dest always has is_lval=1. */
       if (irop_config[jq->op].has_dest)
       {
-        IROperand d = tcc_ir_op_get_dest(ir, jq);
-        int32_t d_vr = irop_get_vreg(d);
+        int32_t d_vr = tcc_ir_op_dest_vreg(ir, jq);
         if (d_vr == v_dest_vr)
         {
           aborted = 1;
@@ -193,7 +188,7 @@ int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir)
           continue;
         if (s == 1 && !irop_config[jq->op].has_src2)
           continue;
-        IROperand u = (s == 0) ? tcc_ir_op_get_src1(ir, jq) : tcc_ir_op_get_src2(ir, jq);
+        IROperand u = tcc_ir_op_get_src1_or_2(ir, jq, s != 0);
         int32_t u_vr = irop_get_vreg(u);
         if (u_vr < 0)
           continue;
@@ -251,5 +246,3 @@ int tcc_ir_opt_addrof_var_fwd(TCCIRState *ir)
 
   return changes;
 }
-
-int tcc_ir_opt_addrof_var_fwd_ex(IROptCtx *ctx) { return tcc_ir_opt_addrof_var_fwd(ctx->ir); }

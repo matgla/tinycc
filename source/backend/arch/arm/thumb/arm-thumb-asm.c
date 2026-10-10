@@ -57,6 +57,17 @@
 #include "tcc.h"
 #include "tccir.h"
 
+/* Frame offsets as the IR backend computes them (arm-thumb-gen.c). */
+int fp_adjust_local_offset(int frame_offset, int is_param);
+int param_frame_offset(int param_off);
+
+/* Bytes asm_gen_code's prolog pushed (the clobbered callee-saved registers)
+ * below the frame, from that push to the matching pop.  A term of
+ * scratch_push_sp_bias(), so every SP-based frame offset taken meanwhile --
+ * the operand loads, an "m" operand substituted into the body, the output
+ * stores -- reaches over them (arm-thumb-gen.c). */
+extern int asm_save_sp_bias;
+
 /* Forward declarations for MOP-based load/store from arm-thumb-gen.c */
 void tcc_gen_mach_load_to_reg(int dest_reg, const MachineOperand *op);
 void tcc_gen_mach_store_from_reg(int src_reg, const MachineOperand *op);
@@ -182,14 +193,24 @@ ST_FUNC void gen_expr32(ExprValue *pe)
   }
 }
 
+/* ELF32 has no 64-bit relocation: a symbol cannot be emitted here. */
+ST_FUNC void gen_expr64(ExprValue *pe)
+{
+  if (pe->sym)
+    expect("constant");
+  gen_le32((int) pe->v);
+  gen_le32((int) (pe->v >> 32));
+}
+
 int is_valid_opcode(thumb_opcode op);
 
 static void thumb_emit_opcode(thumb_opcode op)
 {
+  /* Every encoder answers "no encoding" with an invalid opcode -- in the
+   * assembler that is the USER's instruction (`cmp r0, #12345`: the immediate
+   * is not a Thumb-2 modified constant), not an internal error. */
   if (!is_valid_opcode(op))
-  {
-    tcc_error("compiler_error: received invalid opcode: 0x%x\n", op.opcode);
-  }
+    tcc_error("instruction cannot be encoded: immediate out of range or invalid operand combination");
   if (op.size == 4)
   {
     gen_le16(op.opcode >> 16);
@@ -237,7 +258,19 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
   }
   else if ((r & VT_VALMASK) == VT_LOCAL)
   {
-    cstr_printf(add_str, "[fp,#%d]", (int)sv->c.i);
+    /* A frame slot (an "m" operand naming a local, or a stack parameter).
+     * Address it the way the IR backend does: off SP -- or the frame pointer,
+     * r7, when the function has one -- at its offset in the final frame.  It
+     * used to print the parser's offset off `fp`, i.e. r11, which IR functions
+     * never set up: the store landed wherever r11 pointed, and a slot more than
+     * 255 bytes down did not even encode.  Frame relayout pins a slot an asm
+     * operand names (tcc_ir_asm_frame_ref), so the offset is final here. */
+    const int base = tcc_state->need_frame_pointer ? R_FP : R_SP;
+    int off = (r & VT_PARAM) ? param_frame_offset((int)sv->c.i) : fp_adjust_local_offset((int)sv->c.i, 0);
+    if (off < 0 || off > 4095)
+      tcc_error("inline asm memory operand at frame offset %d is out of reach of [%s, #imm12]", off,
+                base == R_SP ? "sp" : "r7");
+    cstr_printf(add_str, "[%s,#%d]", base == R_SP ? "sp" : "r7", off);
   }
   else if (r & VT_LVAL)
   {
@@ -285,6 +318,32 @@ ST_FUNC void subst_asm_operand(CString *add_str, SValue *sv, int modifier)
 }
 
 /* generate prolog and epilog code for asm statement */
+/* The IR operand that loads or stores an asm operand's value.
+ *
+ * op->vt went through tcc_ir_fill_registers, so it is already resolved: a
+ * spilled variable's c.i is its final frame home.  But it keeps its vreg, and
+ * machine_op_from_ir, handed a STACKOFF with a vreg, resolves it again -- it
+ * reads the offset as the front end's (original_offset plus a sub-component
+ * delta) and adds `offset - original_offset` to the allocation.  Applied to an
+ * already-final offset that moves the access by the spill slot's distance
+ * from the variable's original one: Zig's HardFault handler stored
+ * `mrs %[out], psp` to [sp, #-488] and built the exit frame from a stale PSP.
+ * Restating the offset as the original one leaves the allocation exactly as
+ * fill_registers found it. */
+static IROperand asm_operand_irop(const SValue *sv)
+{
+  TCCIRState *ir = tcc_state->ir;
+  IROperand src = svalue_to_iroperand(ir, sv);
+  const int vr = irop_get_vreg(src);
+  if (irop_get_tag(src) == IROP_TAG_STACKOFF && src.btype != IROP_BTYPE_STRUCT && vr >= 0)
+  {
+    IRLiveInterval *interval = tcc_ir_try_get_live_interval(ir, vr);
+    if (interval)
+      src.u.imm32 = interval->original_offset;
+  }
+  return src;
+}
+
 ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs, int is_output, uint8_t *clobber_regs,
                           int out_reg)
 {
@@ -321,6 +380,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
       gen_le16(0xe92d);       /* STMDB SP!, first halfword */
       gen_le16(saved_regset); /* register list second halfword */
     }
+    asm_save_sp_bias = 4 * __builtin_popcount(saved_regset);
 
     /* Sequence the operand loads.  Emitting them in declaration order is wrong
      * as soon as one operand's destination register still holds another
@@ -359,14 +419,14 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
            output cases) */
         /* Convert LLOCAL stack slot to a pointer in a LOCAL stack slot.
           This matches the old SValue rewrite to VT_LOCAL|VT_LVAL with VT_PTR type. */
-        src = svalue_to_iroperand(tcc_state->ir, op->vt);
+        src = asm_operand_irop(op->vt);
         src.is_llocal = 0;
         src.is_lval = 1;
         src.btype = IROP_BTYPE_INT32; /* pointers are 32-bit on ARMv8-M */
       }
       else if (i >= nb_outputs || op->is_rw)
       { // not write-only
-        src = svalue_to_iroperand(tcc_state->ir, op->vt);
+        src = asm_operand_irop(op->vt);
         if (op->is_llong)
           tcc_error("long long not implemented");
       }
@@ -451,7 +511,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
         broke = 1;
       }
       if (!broke)
-        tcc_error("compiler_error: cannot sequence inline asm operand loads");
+        tcc_ice("cannot sequence inline asm operand loads");
     }
   }
   else
@@ -475,7 +535,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
         {
           if (!op->is_memory)
           {
-            IROperand ir_op = svalue_to_iroperand(tcc_state->ir, op->vt);
+            IROperand ir_op = asm_operand_irop(op->vt);
 
             /* Load pointer from LOCAL stack slot into out_reg.
                Change LLOCAL->LOCAL and set btype to PTR (INT32). */
@@ -499,7 +559,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
         }
         else
         {
-          IROperand ir_op = svalue_to_iroperand(tcc_state->ir, op->vt);
+          IROperand ir_op = asm_operand_irop(op->vt);
           MachineOperand mop = machine_op_from_ir(tcc_state->ir, &ir_op);
           tcc_gen_mach_store_from_reg(op->reg, &mop);
           if (op->is_llong)
@@ -514,6 +574,7 @@ ST_FUNC void asm_gen_code(ASMOperand *operands, int nb_operands, int nb_outputs,
       gen_le16(0xe8bd);       /* LDMIA SP!, first halfword */
       gen_le16(saved_regset); /* register list second halfword */
     }
+    asm_save_sp_bias = 0;
   }
 }
 
@@ -858,6 +919,118 @@ instruction
   if (*pout_reg >= 0)
     printf("out_reg=%d\n", *pout_reg);
 #endif
+}
+
+/* Case-insensitive string equality (YasOS's libc has no strcasecmp). */
+static int mc_ieq(const char *a, const char *b)
+{
+  for (; *a && tolower((unsigned char)*a) == tolower((unsigned char)*b); a++, b++)
+    ;
+  return !*a && !*b;
+}
+
+/* An inline asm statement that is nothing but system instructions -- the
+ * interrupt masking and event hints a kernel wraps in tiny accessors, Zig's
+ * `asm volatile ("mrs %[ret], PRIMASK\n cpsid i" : [ret] "=r" (-> u32) ::
+ * "memory")` (Zig has no intrinsics for them) -- as the name of a call,
+ * __tcc_mc_<insn>_<insn>..., that the backend emits as those instructions
+ * (thumb_machine_insn_call).  An INLINE_ASM statement keeps every helper
+ * holding one out of line, and inlined it turns whole passes off in the
+ * caller and reserves its frame pointer; a call is what every pass already
+ * understands -- one that may read and write any memory, as the asm may.
+ * At most one "=r" output, written by an mrs, comes back in R0; at most one
+ * "r" input, read by an msr, goes in R0; never both.  No register clobbers.
+ * Writes NAME (SIZE bytes) and returns 1, or returns 0 to keep the asm. */
+ST_FUNC int asm_machine_call_name(const char *str, ASMOperand *operands, int nb_operands, int nb_outputs,
+                                  const uint8_t *clobber_regs, char *name, int size)
+{
+  static const struct
+  {
+    const char *reg;
+    int sysm;
+  } sysregs[] = {{"primask", 0x10}, {"basepri", 0x11}, {"basepri_max", 0x12}, {"faultmask", 0x13}, {"control", 0x14}};
+  static const char *const plain[] = {"wfe", "wfi", "sev", "nop", "yield"};
+  static const char *const barriers[] = {"isb", "dsb", "dmb"};
+  const int nb_inputs = nb_operands - nb_outputs;
+  int reads = 0, writes = 0, insns = 0;
+
+  if (nb_outputs > 1 || nb_inputs > 1 || (nb_outputs && nb_inputs))
+    return 0;
+  for (int r = 0; r < NB_ASM_REGS; r++)
+    if (clobber_regs[r])
+      return 0;
+  for (int i = 0; i < nb_operands; i++)
+  {
+    /* No value yet when inline_body_asm_is_machine asks of a token stream. */
+    const int bt = operands[i].vt ? operands[i].vt->type.t & VT_BTYPE : VT_INT;
+    if (strcmp(operands[i].constraint, i < nb_outputs ? "=r" : "r") || operands[i].regvar ||
+        !(bt == VT_INT || bt == VT_PTR || bt == VT_SHORT || bt == VT_BYTE || bt == VT_BOOL))
+      return 0;
+  }
+  int len = snprintf(name, size, "__tcc_mc");
+  for (const char *p = str; *p;)
+  {
+    /* One instruction: up to a newline or ';', its words split at blanks and
+     * commas.  Operand names keep their case. */
+    char line[64], *word[4];
+    int n = 0, nw = 0;
+    for (; *p && *p != '\n' && *p != ';'; p++)
+      if (n < (int)sizeof(line) - 1)
+        line[n++] = *p;
+      else
+        return 0;
+    if (*p)
+      p++;
+    line[n] = 0;
+    for (char *s = line; *s;)
+    {
+      while (*s == ' ' || *s == '\t' || *s == ',')
+        *s++ = 0;
+      if (!*s)
+        break;
+      if (nw == 4)
+        return 0;
+      word[nw++] = s;
+      while (*s && *s != ' ' && *s != '\t' && *s != ',')
+        s++;
+    }
+    if (!nw)
+      continue;
+    char code[16] = "";
+    for (int i = 0; i < (int)(sizeof(plain) / sizeof(plain[0])); i++)
+      if (nw == 1 && mc_ieq(word[0], plain[i]))
+        snprintf(code, sizeof(code), "%s", plain[i]);
+    for (int i = 0; i < (int)(sizeof(barriers) / sizeof(barriers[0])); i++)
+      if (mc_ieq(word[0], barriers[i]) && (nw == 1 || (nw == 2 && mc_ieq(word[1], "sy"))))
+        snprintf(code, sizeof(code), "%s", barriers[i]);
+    if (nw == 2 && (mc_ieq(word[0], "cpsid") || mc_ieq(word[0], "cpsie")) &&
+        (mc_ieq(word[1], "i") || mc_ieq(word[1], "f") || mc_ieq(word[1], "if")))
+      snprintf(code, sizeof(code), "cpsi%c%s", tolower((unsigned char)word[0][4]), word[1][1] ? "if" : (tolower((unsigned char)word[1][0]) == 'i' ? "i" : "f"));
+    if (nw == 3 && (mc_ieq(word[0], "mrs") || mc_ieq(word[0], "msr")))
+    {
+      const int mrs = mc_ieq(word[0], "mrs");
+      const char *opnd = word[mrs ? 1 : 2], *reg = word[mrs ? 2 : 1], *end;
+      int sysm = -1;
+      for (int i = 0; i < (int)(sizeof(sysregs) / sizeof(sysregs[0])); i++)
+        if (mc_ieq(reg, sysregs[i].reg))
+          sysm = sysregs[i].sysm;
+      if (sysm < 0 || opnd[0] != '%' || find_constraint(operands, nb_operands, opnd + 1, &end) != (mrs ? 0 : nb_outputs) ||
+          *end || (mrs ? !nb_outputs : !nb_inputs))
+        return 0;
+      if (mrs)
+        writes++;
+      else
+        reads++;
+      snprintf(code, sizeof(code), "%s%02x", mrs ? "mrs" : "msr", sysm);
+    }
+    if (!code[0])
+      return 0;
+    len += snprintf(name + len, len < size ? size - len : 0, "_%s", code);
+    if (len >= size)
+      return 0;
+    insns++;
+  }
+  return insns && writes == nb_outputs && reads == nb_inputs;
 }
 
 ST_FUNC void asm_clobber(uint8_t *clobber_regs, const char *str)
@@ -1558,7 +1731,10 @@ thumb_opcode thumb_process_generic_data_op(th_generic_op_data data, int token, t
 
   if (thumb_operand_is_register(ops[2].type))
   {
-    if ((token == data.regular_variant_token && thumb_conditional_scope == 0) || THUMB_HAS_WIDE_QUALIFIER_FROM_STATE())
+    /* The 16-bit ALU register encodings only set flags outside an IT block, so an S-suffixed op inside one
+       must use the 32-bit encoding with S=1. */
+    if ((token == data.regular_variant_token && thumb_conditional_scope == 0) || THUMB_HAS_WIDE_QUALIFIER_FROM_STATE() ||
+        (setflags == FLAGS_BEHAVIOUR_SET && thumb_conditional_scope > 0))
     {
       encoding = ENFORCE_ENCODING_32BIT;
     }
@@ -1743,6 +1919,8 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift sh
 
     if (thumb_operand_is_register(ops[2].type))
     {
+      if (setflags == FLAGS_BEHAVIOUR_SET && thumb_conditional_scope > 0)
+        encoding = ENFORCE_ENCODING_32BIT;
       return th_add_reg(ops[0].reg, ops[1].reg, ops[2].reg, setflags, shift, encoding);
     }
   }
@@ -1832,14 +2010,24 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift sh
   case TOK_ASM_movw:
   case TOK_ASM_mov:
   {
-    thumb_flags_behaviour setflags = thumb_determine_flags_behaviour(token, TOK_ASM_movs, false);
+    thumb_flags_behaviour setflags = thumb_determine_flags_behaviour(token, TOK_ASM_movs, true);
     if (token == TOK_ASM_movw)
+      encoding = ENFORCE_ENCODING_32BIT;
+    /* MOVS T1 forms do not set flags inside an IT block: use MOVS.W. */
+    if (setflags == FLAGS_BEHAVIOUR_SET && thumb_conditional_scope > 0)
       encoding = ENFORCE_ENCODING_32BIT;
 
     if (thumb_operand_is_immediate(ops[2].type))
     {
       return th_mov_imm(ops[1].reg, ops[2].e.v, setflags, encoding);
     }
+    /* `mov pc, Rm` is a branch, and only the 16-bit high-register form may
+     * write PC: MOV.W with Rd = PC is UNPREDICTABLE and the Cortex-M33 takes
+     * UNDEFINSTR on it.  The register table's T1 refuses Rd = PC (codegen
+     * never means to branch through it), so emit it here, as GAS does --
+     * RP2350's external_memory.S returns from RAM code with `mov pc, lr`. */
+    if (ops[1].reg == 15 && token == TOK_ASM_mov && shift.type == THUMB_SHIFT_NONE && encoding != ENFORCE_ENCODING_32BIT)
+      return (thumb_opcode){.size = 2, .opcode = 0x4687 | (ops[2].reg << 3)};
     return th_mov_reg(ops[1].reg, ops[2].reg, setflags, shift, encoding, thumb_conditional_scope > 0);
   }
   case TOK_ASM_bfc:
@@ -1922,6 +2110,8 @@ thumb_opcode thumb_generate_opcode_for_data_processing(int token, thumb_shift sh
       {
         return th_sub_reg(ops[0].reg, R_SP, ops[2].reg, setflags, shift, encoding);
       }
+      if (setflags == FLAGS_BEHAVIOUR_SET && thumb_conditional_scope > 0)
+        encoding = ENFORCE_ENCODING_32BIT;
       return th_sub_reg(ops[0].reg, ops[1].reg, ops[2].reg, setflags, shift, encoding);
     }
   }
@@ -2508,11 +2698,23 @@ static thumb_opcode thumb_pushpop_opcode(TCCState *s1, int token)
   Operand op = {};
   parse_operand(s1, &op);
 
+  /* Explicit .w with exactly one register: the T2 register-list form is
+   * CONSTRAINED UNPREDICTABLE, gas emits the T3 STR/LDR writeback form. */
+  const uint32_t single = op.regset & (op.regset - 1) ? 0 : op.regset;
+  const int wide = THUMB_HAS_WIDE_QUALIFIER_FROM_STATE();
   switch (token)
   {
   case TOK_ASM_pop:
+    if (wide && single && !(single & (1u << R_PC)))
+      return th_ldr_imm((uint32_t)__builtin_ctz(single), R_SP, 4, 3, ENFORCE_ENCODING_32BIT);
+    if (wide)
+      return th_ldm(R_SP, op.regset, 1, ENFORCE_ENCODING_32BIT);
     return th_pop(op.regset);
   case TOK_ASM_push:
+    if (wide && single && !(single & (1u << R_PC)))
+      return th_str_imm((uint32_t)__builtin_ctz(single), R_SP, 4, 5, ENFORCE_ENCODING_32BIT);
+    if (wide)
+      return th_stmdb(R_SP, op.regset, 1, ENFORCE_ENCODING_32BIT);
     return th_push(op.regset);
   }
   return (thumb_opcode){0, 0};
@@ -2533,6 +2735,30 @@ static thumb_opcode thumb_vpushvpop_opcode(TCCState *s1, int token)
     return th_vpush(op.regset, is_doubleword);
   }
   return (thumb_opcode){0, 0};
+}
+
+/* vldm/vstm{ia,db} Rn{!}, {s../d..} -- context switches save s16-s31 this way. */
+static thumb_opcode thumb_vldmstm_opcode(TCCState *s1, int token)
+{
+  Operand ops[2] = {};
+  int writeback = 0;
+  parse_operand(s1, &ops[0]);
+  if (tok == '!')
+  {
+    writeback = 1;
+    next();
+  }
+  skip(',');
+  parse_operand(s1, &ops[1]);
+  if (!thumb_operand_is_register(ops[0].type))
+    expect("base register");
+  if (ops[1].type != OP_VREGSETS32 && ops[1].type != OP_VREGSETD32)
+    expect("floating-point register list");
+  int load = token == TOK_ASM_vldm || token == TOK_ASM_vldmia || token == TOK_ASM_vldmdb;
+  int db = token == TOK_ASM_vldmdb || token == TOK_ASM_vstmdb;
+  if (db && !writeback)
+    expect("'!' (decrement-before needs writeback)");
+  return th_vldmstm(load, db, ops[0].reg, writeback, ops[1].regset, ops[1].type == OP_VREGSETD32);
 }
 
 static uint32_t thumb_vfp_size_from_token_str(const char *token_str)
@@ -2857,6 +3083,36 @@ static thumb_opcode thumb_vcvt_opcode(TCCState *s1, int token, const char *orig_
   if (result.size == 0)
   {
     tcc_error("vcvt: unsupported conversion from %s to %s", src_type, dest_type);
+  }
+
+  /* Rounding-mode variants: vcvt{r,a,n,p,m}.{s32,u32}.{f32,f64}.  The mnemonic
+   * letter sits between "vcvt" and the first '.'. */
+  if (orig_token_str)
+  {
+    const char *dot = strchr(orig_token_str, '.');
+    const size_t mlen = dot ? (size_t)(dot - orig_token_str) : strlen(orig_token_str);
+    if (mlen != 4)
+    {
+      const char mode = (mlen == 5) ? orig_token_str[4] : 0;
+      const int to_int = (strcmp(dest_type, "s32") == 0 || strcmp(dest_type, "u32") == 0);
+      const int is_signed = (strcmp(dest_type, "s32") == 0);
+      if (!to_int || !strchr("ranpm", mode ? mode : 'x'))
+      {
+        tcc_error("unsupported VFP instruction '%s'", orig_token_str);
+      }
+      if (mode == 'r')
+      {
+        /* use FPSCR rounding mode: op bit (7) cleared */
+        result.opcode &= ~(1u << 7);
+      }
+      else
+      {
+        /* ARMv8 directed rounding: 1111 1110 1111 1 D 11 RM Vd 101 sz op 1 M 0 Vm; op = signed */
+        const uint32_t rm = (mode == 'a') ? 0 : (mode == 'n') ? 1 : (mode == 'p') ? 2 : 3;
+        result.opcode = (result.opcode & ~0xffff0000u & ~(1u << 7)) | 0xfebc0000u | (rm << 16) |
+                        (is_signed ? (1u << 7) : 0u);
+      }
+    }
   }
 
   return result;
@@ -3347,10 +3603,10 @@ static thumb_opcode thumb_data_shift_opcode(TCCState *s1, int token)
 
   if (token_svariant)
   {
+    /* The 16-bit shifts set flags only outside an IT block, so a
+     * flag-setting shift inside one needs the 32-bit S=1 encoding. */
     if (thumb_conditional_scope > 0)
-    {
-      tcc_error("cannot use '%s' in IT block", get_tok_str(token, NULL));
-    }
+      encoding = ENFORCE_ENCODING_32BIT;
     flags = FLAGS_BEHAVIOUR_SET;
   }
   else if (thumb_conditional_scope > 0)
@@ -3455,6 +3711,8 @@ static void thumb_branch(TCCState *s1, int token)
         /* Strip thumb bit from the fully computed target (GAS does this for B/BL).
            Otherwise we can end up with an odd offset and the short encoding rejects it. */
         int target = (e.v + esym->st_value) & ~1;
+        if (token == TOK_ASM_cbz || token == TOK_ASM_cbnz)
+          tcc_error("cbz/cbnz can only branch forward (0..126 bytes); backward target is out of range");
         jump_addr = th_encbranch(ind, target);
       }
       else
@@ -3818,6 +4076,13 @@ ST_FUNC void asm_opcode(TCCState *s1, int token)
   case TOK_ASM_vpush:
   case TOK_ASM_vpop:
     return thumb_emit_opcode(thumb_vpushvpop_opcode(s1, token));
+  case TOK_ASM_vldm:
+  case TOK_ASM_vldmia:
+  case TOK_ASM_vldmdb:
+  case TOK_ASM_vstm:
+  case TOK_ASM_vstmia:
+  case TOK_ASM_vstmdb:
+    return thumb_emit_opcode(thumb_vldmstm_opcode(s1, token));
   case TOK_ASM_cdp:
   case TOK_ASM_cdp2:
   case TOK_ASM_mcr:

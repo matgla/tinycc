@@ -61,6 +61,7 @@ tok_next:
      * Creates a _Complex int constant with real=0, imag=value.
      * Packed representation: real in low 32, imag in high 32 bits of CValue.i */
     CValue cv;
+    memset(&cv, 0, sizeof(cv));
     cv.i = (uint64_t)(uint32_t)tokc.i << 32;
     type.t = VT_INT | VT_COMPLEX;
     vsetc(&type, VT_CONST, &cv);
@@ -78,6 +79,7 @@ tok_next:
       float f;
       uint32_t u;
     } imag_bits;
+    memset(&cv, 0, sizeof(cv));
     imag_bits.f = tokc.f;
     cv.i = (uint64_t)imag_bits.u << 32;
     type.t = VT_FLOAT | VT_COMPLEX;
@@ -319,9 +321,15 @@ tok_next:
       }
       else
       {
-        /* __imag__ on non-complex returns 0 */
+        /* __imag__ on a real operand is a zero of the operand's own type;
+         * a volatile operand is still read once. */
+        CType zty = vtop->type;
+        zty.t &= ~(VT_CONSTANT | VT_VOLATILE | VT_BITFIELD);
+        if ((vtop->r & VT_LVAL) && (vtop->type.t & VT_VOLATILE))
+          gv(is_float(vtop->type.t) ? RC_FLOAT : RC_INT);
         vpop();
         vpushi(0);
+        gen_cast(&zty);
       }
     }
     else
@@ -377,12 +385,29 @@ tok_next:
       {
         /* L-value (global or indirect): adjust offset to access real or imag part.
          * Complex types are { real, imag } in memory. For imag, add elem_size
-         * to the address offset directly (not via gen_op which would do float math). */
-        if (!is_real)
-          vtop->c.i += elem_size;
+         * to the address offset directly (not via gen_op which would do float math).
+         * That offset only exists for a constant/symbol base: an indirect
+         * lvalue (address in a register/vreg, `__imag__ *p`) ignores c.i, so
+         * there step the address as a char pointer and dereference again. */
+        if (!is_real && (vtop->r & VT_VALMASK) != VT_CONST)
+        {
+          int keep = vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX;
+          gaddrof();
+          vtop->type = char_pointer_type;
+          vpushi(elem_size);
+          gen_op('+');
+          vtop->type.t = keep | result_type;
+          vtop->type.ref = NULL;
+          vtop->r |= VT_LVAL;
+        }
+        else
+        {
+          if (!is_real)
+            vtop->c.i += elem_size;
 
-        /* Change type to the base scalar type */
-        vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
+          /* Change type to the base scalar type */
+          vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
+        }
       }
       else
       {
@@ -392,15 +417,31 @@ tok_next:
          * returning ret_nregs=1 for sizes <= 4, the value is packed:
          *   real part in the low bits, imag part in the upper bits.
          * Extract __imag__ by shifting right by elem_size*8. */
-        if (is_real)
+        if (is_int_complex && elem_size * 2 <= 4)
         {
-          /* Real part is in the low bits — just change type to scalar */
+          /* Packed in one 32-bit register: real in the low bits, imag above.
+           * Bits above the packed size are not defined, so extract by an
+           * arithmetic shift and then *cast* to the component type, which
+           * truncates and sign/zero-extends correctly. */
+          CType int_t, el_t;
+          int_t.t = VT_INT;
+          int_t.ref = NULL;
+          el_t.t = (vtop->type.t & VT_UNSIGNED) | result_type;
+          el_t.ref = NULL;
+          vtop->type = int_t;
+          if (!is_real)
+          {
+            vpushi(elem_size * 8);
+            gen_op(TOK_SAR);
+          }
+          gen_cast(&el_t);
+        }
+        else if (is_real)
+        {
           vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | result_type;
         }
         else
         {
-          /* Imaginary part: shift right by elem_size*8 bits to
-           * bring imag to the low bits, then truncate to base type. */
           vtop->type.t = (vtop->type.t & ~VT_BTYPE & ~VT_COMPLEX) | VT_INT;
           vpushi(elem_size * 8);
           gen_op(TOK_SHR);
@@ -557,8 +598,25 @@ tok_next:
      * lets __builtin_constant_p see through simple cases like:
      *   int size = sizeof(int);  // single constant assignment
      *   __builtin_constant_p(size) -> 1
-     * Only valid when the variable's address is never taken (no aliasing). */
-    if (n == 0 && tcc_state->ir && tcc_state->optimize && vtop->vr >= 0 && (!vtop->sym || !vtop->sym->a.addrtaken))
+     * Only valid when the variable's address is never taken (no aliasing).
+     *
+     * Only for a value that lives in its vreg: a comparison result
+     * (VT_CMP/VT_JMP/VT_JMPI) is held in the flags or a jump chain.  Its vr
+     * is whatever the left operand had (`k < n` keeps k's vreg, so a
+     * single-constant-def k made the comparison "constant"), and its sym
+     * slot is the cmp_op/cmp_r union member, not a Sym pointer --
+     * dereferencing it read a wild heap address.
+     *
+     * And only where no later definition can reach this point: the scan below
+     * walks the instructions emitted so far, so a definition parsed after the
+     * call is invisible to it - yet it reaches here through a loop back edge
+     * (every loop form, and switch, sets bsym on the current scope) or
+     * through a backward goto to a label that is already in scope.  Answer 0
+     * there; saying 0 about a value that happens to be constant is always
+     * allowed, saying 1 about one that is not is not. */
+    if (n == 0 && tcc_state->ir && TCC_OPT(tcc_state, optimize) && vtop->vr >= 0 &&
+        (vtop->r & VT_VALMASK) != VT_CMP && (vtop->r & VT_VALMASK) != VT_JMP && (vtop->r & VT_VALMASK) != VT_JMPI &&
+        (!vtop->sym || !vtop->sym->a.addrtaken) && !cur_scope->bsym && !local_label_stack)
     {
       TCCIRState *ir = tcc_state->ir;
       int target_vr = vtop->vr;
@@ -1633,6 +1691,9 @@ tok_next:
   case TOK___atomic_xor_fetch:
   case TOK___atomic_and_fetch:
   case TOK___atomic_nand_fetch:
+  case TOK___atomic_store_n:
+  case TOK___atomic_exchange_n:
+  case TOK___atomic_compare_exchange_n:
     parse_atomic(tok);
     break;
 
@@ -1740,6 +1801,20 @@ tok_next:
         break;
     }
     s = sym_find(t);
+    /* A parent local that the nested function captures hides a same-named
+     * global; only a symbol declared in the nested function's own scopes
+     * (local_stack) takes precedence over the capture. */
+    if (s && !IS_ASM_SYM(s) && tcc_state->current_nested_func && tcc_state->current_nested_func->nb_captured > 0 &&
+        !sym_find2(local_stack, t))
+    {
+      NestedFunc *cnf = tcc_state->current_nested_func;
+      for (int ci = 0; ci < cnf->nb_captured; ci++)
+        if (cnf->captured_tokens[ci] == t)
+        {
+          s = NULL;
+          break;
+        }
+    }
     if (!s || IS_ASM_SYM(s))
     {
       /* Check if this identifier is a captured variable from an enclosing function */
@@ -1892,7 +1967,7 @@ tok_next:
     }
     else if (r == VT_CONST && IS_ENUM_VAL(s->type.t))
     {
-      vtop->c.i = s->enum_val;
+      vtop->c.i = sym_enum_val(s);
     }
 
     /* Implicit function-to-pointer: if a nested function name is used in

@@ -100,7 +100,7 @@ int tcc_opt_fp_mat_cache_lookup(TCCIRState *ir, int offset, int *phys_reg)
   if (!ir || !ir->opt_fp_mat_cache || !phys_reg)
     return 0;
 
-  if (!tcc_state->opt_fp_offset_cache)
+  if (!TCC_OPT(tcc_state, opt_fp_offset_cache))
     return 0;
 
   TCCFPMatCache *cache = (TCCFPMatCache *)ir->opt_fp_mat_cache;
@@ -126,7 +126,7 @@ void tcc_opt_fp_mat_cache_record(TCCIRState *ir, int offset, int phys_reg)
   if (!ir || !ir->opt_fp_mat_cache)
     return;
 
-  if (!tcc_state->opt_fp_offset_cache)
+  if (!TCC_OPT(tcc_state, opt_fp_offset_cache))
     return;
 
   TCCFPMatCache *cache = (TCCFPMatCache *)ir->opt_fp_mat_cache;

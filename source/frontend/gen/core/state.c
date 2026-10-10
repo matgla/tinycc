@@ -98,8 +98,12 @@ static void funcall_scratch_free_all(void)
 PendingAliasDef *pending_aliases;
 int nb_pending_aliases;
 
-/* Pending label-difference symbols for &&lab1 - &&lab0 in static initializers.
-   Set in gen_opic, consumed in init_putv. */
+/* Label-difference symbols for &&lab1 - &&lab0 in static initializers.
+   gen_opic folds the difference to `label_diff_marker + <addend diff>` (a
+   VT_CONST|VT_SYM value, so every operator but +/- const refuses it) and
+   parks the two labels here; init_putv consumes them when it stores a value
+   whose sym is the marker. */
+Sym label_diff_marker;
 Sym *pending_label_diff_plus;
 Sym *pending_label_diff_minus;
 
@@ -107,6 +111,7 @@ ST_DATA SValue *vtop;
 ST_DATA SValue _vstack[1 + VSTACK_SIZE];
 
 ST_DATA int nocode_wanted; /* no code generation wanted */
+ST_DATA int unevaluated_operand; /* inside an expr_type operand */
 ST_DATA SValue *discarded_call_vtop;
 
 ST_DATA int global_expr; /* true if compound literals must be allocated globally
@@ -141,6 +146,7 @@ ST_FUNC void tccgen_init(TCCState *s1)
 
   vtop = vstack - 1;
   memset(vtop, 0, sizeof *vtop);
+  tcc_ir_sym_canonicalizer = canonical_global_sym;
 
   str_lit_pool_reset();
 
@@ -201,6 +207,9 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   nb_pending_aliases = 0;
   nocode_wanted = DATA_ONLY_WANTED; /* no code outside of functions */
   discarded_call_vtop = NULL;
+  /* an error may have left them set mid-'&' */
+  unary_addr_operand = 0;
+  indir_keep_lvalue = 0;
   debug_modes = (s1->do_debug ? 1 : 0) | s1->test_coverage << 1;
 
   tcc_debug_start(s1);
@@ -211,7 +220,8 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   /* The `predef macros` stamp is taken when the <command line> buffer closes,
      which is well after this point -- so everything here used to be billed to
      it, and the label reads as if it were all macro parsing.  It is not: the
-     58 builtin prototypes are built here, and a ladder of extra -D flags
+     58 builtin prototypes were built here (now only armed, each is built when
+     its name is first interned -- see predef_protos.c), and a ladder of extra -D flags
      prices a warm macro definition at ~15 us, i.e. ~2.6 ms for the ~170
      predefines against a 17 ms window.  Split the window so the two are
      attributable separately. */
@@ -219,7 +229,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
   if (s1->predef_protos_pending)
   {
     s1->predef_protos_pending = 0;
-    tccgen_predef_protos(s1);
+    tccgen_predef_protos_arm();
   }
   tcc_init_stamp("predef protos");
 #ifdef INC_DEBUG
@@ -243,7 +253,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
    * static globals with no reachable readers.  Must run before
    * gen_late_reopt_functions so newly-flagged writer functions get picked
    * up by the existing late_reopt loop. */
-  if (s1->opt_dead_store)
+  if (TCC_OPT(s1, opt_dead_store))
     tcc_ir_tu_analyze_dead_statics();
   /* Propagate noreturn from callees to callers: for any function whose
    * tokens were preserved by the gen_function noreturn-trigger AND whose
@@ -253,7 +263,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
    * Static inline callees are emitted by gen_inline_functions(), after the
    * first end-of-TU propagation point.  Speculatively kept callers are
    * therefore cleaned up after a second propagation/reopt pass below. */
-  if (s1->opt_dce && s1->optimize >= 2)
+  if (TCC_OPT(s1, opt_dce) && TCC_OPT(s1, optimize) >= 2)
     tcc_ir_tu_propagate_noreturn_to_callers();
   gen_late_reopt_functions(s1);
   /* tu_static_writer functions were kept in inline_fns (gen_function's auto-
@@ -286,7 +296,7 @@ ST_FUNC int tccgen_compile(TCCState *s1)
     ifn->sym = NULL;
   }
   gen_inline_functions(s1);
-  if (s1->opt_dce && s1->optimize >= 2)
+  if (TCC_OPT(s1, opt_dce) && TCC_OPT(s1, optimize) >= 2)
   {
     tcc_ir_tu_propagate_noreturn_to_callers();
     gen_late_reopt_functions(s1);
@@ -350,12 +360,21 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   tcc_gen_machine_outline_reset();
 
   str_lit_pool_free();
+  gen_op_vector_reset(); /* frees the last function's vector recipes */
 
   /* Release per-TU function write summaries (Sym* keys are about to become
    * invalid as global_stack is popped). */
   tcc_ir_func_write_summary_clear_all();
   /* Same for the TU-wide read/call summary used by dead-static-store elim. */
   tcc_ir_tu_func_summary_clear_all();
+  /* The purity, constant-result and switch-snapshot caches are keyed by
+   * token number, and token numbers start over with the next file on the
+   * command line: left alone, a call in a later file to a function that got
+   * the same number found this file's function's facts (and was folded to
+   * its return value). */
+  tcc_ir_reset_func_purity_cache(s1);
+  s1->func_const_result_cache_count = 0;
+  tcc_ir_free_switch_func_cache(s1);
   funcall_scratch_free_all();
 
   tcc_free(pending_aliases);
@@ -405,17 +424,26 @@ ST_FUNC void tccgen_finish(TCCState *s1)
   }
 
   free_inline_functions(s1);
+  /* Before the pop: nothing may materialise a prototype onto a dying stack. */
+  tccgen_predef_protos_disarm();
   sym_pop(&global_stack, NULL, 0);
   sym_pop(&local_stack, NULL, 0);
+  sym_parked_free_all();
   /* free nested functions array */
+  for (int i = 0; i < s1->nested_funcs_capacity; i++)
+    tcc_free(s1->nested_funcs[i]);
   tcc_free(s1->nested_funcs);
   s1->nested_funcs = NULL;
   s1->nb_nested_funcs = 0;
   s1->nested_funcs_capacity = 0;
   /* free preprocessor macros */
   free_defines(NULL);
+  sym_pointer_nodes_free();
+  sym_short_pools_free();
   /* free sym_pools */
   dynarray_reset(&sym_pools, &nb_sym_pools);
+  sym_heads_free();
+  sym_facts_free_all();
   cstr_free(&initstr);
   dynarray_reset(&stk_data, &nb_stk_data);
   while (cur_switch)

@@ -7,7 +7,16 @@
 #include "../frontend/gen/op/float.c"
 #undef gen_negf
 #include "../frontend/gen/op/fold_math.c"
+#undef FM_SET
+#undef FM_SET_1D
+#undef FM_SET_1F
+#undef FM_SET_2D
+#undef FM_SET_2F
+#undef FM_TYPE_D
+#undef FM_TYPE_F
+#undef FOLD_MATH_FUNCS
 #undef NUM_FOLDABLE_MATH_FUNCS
+#undef X
 #include "../frontend/gen/op/int.c"
 #include "../frontend/gen/op/op.c"
 #include "../frontend/gen/op/vector.c"

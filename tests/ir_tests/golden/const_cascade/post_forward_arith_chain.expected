@@ -1,6 +1,6 @@
 0000: T0 <-- P1 AND #3
-0001: Addr[StackLoc[-20]] <-- #1 STORE_INDEXED T0
-0002: StackLoc[-20] <-- #5 [STORE]
+0001: Addr[StackLoc[-16]] <-- #1 STORE_INDEXED T0
+0002: StackLoc[-16] <-- #5 [STORE]
 0003: V0 <-- #5 [ASSIGN]
 0004: V1 <-- #8 [ASSIGN]
 0005: V2 <-- #16 [ASSIGN]

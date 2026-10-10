@@ -467,24 +467,11 @@ static int lac_fn_has_unenumerable_edges(const TCCIRState *ir)
  * caller-saved registers the short-lived temp wants to live in. */
 static int lac_breaks_region(TccIrOp op)
 {
-  switch (op) {
-  case TCCIR_OP_JUMP: case TCCIR_OP_JUMPIF: case TCCIR_OP_IJUMP:
-  case TCCIR_OP_SWITCH_TABLE: case TCCIR_OP_SWITCH_LOAD:
-  case TCCIR_OP_RETURNVOID: case TCCIR_OP_RETURNVALUE:
-  case TCCIR_OP_FUNCCALLVOID: case TCCIR_OP_FUNCCALLVAL:
-  case TCCIR_OP_TRAP:
-  case TCCIR_OP_INLINE_ASM: case TCCIR_OP_ASM_INPUT: case TCCIR_OP_ASM_OUTPUT:
-  case TCCIR_OP_SETJMP: case TCCIR_OP_LONGJMP:
-  case TCCIR_OP_NL_SETJMP: case TCCIR_OP_NL_LONGJMP:
-  case TCCIR_OP_BUILTIN_APPLY: case TCCIR_OP_BUILTIN_APPLY_ARGS:
-  case TCCIR_OP_BUILTIN_RETURN:
-  case TCCIR_OP_VLA_ALLOC: case TCCIR_OP_VLA_SP_SAVE: case TCCIR_OP_VLA_SP_RESTORE:
-  case TCCIR_OP_CALLSEQ_BEGIN: case TCCIR_OP_CALLSEQ_END:
-  case TCCIR_OP_SET_CHAIN:
+  if (op == TCCIR_OP_SWITCH_LOAD) /* its inline value table */
     return 1;
-  default:
-    return 0;
-  }
+  return ir_op_has(op, IR_HZ_FROM_OP & ~(IR_HZ_MEM_READ | IR_HZ_MEM_WRITE | IR_HZ_UPDATES_SRC | IR_HZ_FLAGS_SET |
+                                          IR_HZ_FLAGS_READ | IR_HZ_HINT | IR_HZ_CALL_PARAM)) &&
+         !ir_opset_has(IR_LEGACY_GAP_OPS(TCCIR_OP_CALLARG_REG, TCCIR_OP_CALLARG_STACK, TCCIR_OP_INIT_CHAIN_SLOT), op);
 }
 
 /* A dereference operand materializes sym+0 and folds its addend into the
@@ -565,9 +552,8 @@ static void lac_keep_label_ahead(TCCIRState *ir, int pos)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    IROperand jdest = tcc_ir_op_get_dest(ir, q);
-    if ((int)irop_get_imm64_ex(ir, jdest) == pos + 1)
-      tcc_ir_op_set_dest(ir, q, irop_make_imm32(-1, pos, IROP_BTYPE_INT32));
+    if ((int)tcc_ir_op_dest_imm(ir, q) == pos + 1)
+      tcc_ir_op_set_dest_imm32(ir, q, pos, IROP_BTYPE_INT32);
   }
   for (int ti = 0; ti < ir->num_switch_tables; ti++) {
     TCCIRSwitchTable *table = &ir->switch_tables[ti];
@@ -699,7 +685,8 @@ int tcc_ir_ssa_opt_local_addr_cse(TCCIRState *ir)
 
   /* Descending, so an earlier recorded position is still valid after each
    * insert shifts the tail. */
-  qsort(inserts, (size_t)ninserts, sizeof(LacInsert), lah_insert_cmp);
+  if (ninserts > 1)
+    tcc_qsort(inserts, (size_t)ninserts, sizeof(LacInsert), lah_insert_cmp);
   for (int k = 0; k < ninserts; k++) {
     IROperand src = gah_make_def_src(ir, inserts[k].sym, inserts[k].addend);
     IROperand dst = irop_make_vreg(inserts[k].tbase, IROP_BTYPE_INT32);
@@ -911,7 +898,7 @@ int tcc_ir_ssa_opt_loop_addr_hoist(TCCIRState *ir)
   }
   /* Outermost first: its preheader also covers the uses inside nested loops,
    * which then have no symref left to hoist. */
-  qsort(loops, (size_t)nloops, sizeof(LahLoop), lah_loop_cmp);
+  tcc_qsort(loops, (size_t)nloops, sizeof(LahLoop), lah_loop_cmp);
 
   in_loop = tcc_mallocz((size_t)cfg->num_blocks);
   worklist = tcc_malloc((size_t)cfg->num_blocks * sizeof(int));
@@ -1071,7 +1058,8 @@ int tcc_ir_ssa_opt_loop_addr_hoist(TCCIRState *ir)
   /* Loops are visited outermost-first, so the recorded positions are unsorted;
    * applying them in anything but descending order would shift the ones still
    * pending out from under their recorded index. */
-  qsort(inserts, (size_t)ninserts, sizeof(LacInsert), lah_insert_cmp);
+  if (ninserts > 1)
+    tcc_qsort(inserts, (size_t)ninserts, sizeof(LacInsert), lah_insert_cmp);
   for (int k = 0; k < ninserts; k++) {
     IROperand src = gah_make_def_src(ir, inserts[k].sym, inserts[k].addend);
     IROperand dst = irop_make_vreg(inserts[k].tbase, IROP_BTYPE_INT32);
@@ -1081,5 +1069,132 @@ int tcc_ir_ssa_opt_loop_addr_hoist(TCCIRState *ir)
     changes++;
   }
   tcc_free(inserts);
+  return changes;
+}
+
+/* ------------------------------------------------------------------ *
+ * -Os: build a wide constant once per function.
+ *
+ * A constant outside 0..255 costs a 4-byte MOV.W/MVN.W/MOVW at every site
+ * that needs it in a register, and imm_cache cannot carry it across the jump
+ * targets and calls between those sites.  The Zig C backend writes its
+ * `undefined` fill 0xaaaaaaaa into every error path's payload, call argument
+ * and phi copy: zig.c at -Os built it 18.6k times in 2,869 functions (74 KB).
+ * Materialised once at entry into a temp, a store of it reads the register
+ * (free) and a copy or argument becomes a 2-byte MOV; a function too tight to
+ * keep it in a register spills it once and reloads it with a 2-byte LDR
+ * [sp,#k], which is why the temp is never rematerialised (no_remat: remat
+ * would rebuild the 4-byte constant at every use and leave the entry def as
+ * pure cost).  A size-for-speed trade, so -Os only: the entry def (and its
+ * spill store) now runs on every call where the per-site builds ran only on
+ * the error paths.  zig.c -Os: -26.8 KB of .text, +2.8% guest instructions.
+ *
+ * Measured and rejected: placing the def at the uses' nearest common
+ * dominator instead of the entry (+4.4 KB vs entry), undoing a spilled share
+ * back to per-site immediates (+11 KB), gating on the peak-window register
+ * budget (budget >= 2: +11 KB -- the register-tight giants gain most),
+ * leaving uses inside loops alone (+15 KB, and no faster), and sharing 0..255
+ * for stores (2 bytes a site; +3..8 KB).
+ * ------------------------------------------------------------------ */
+
+/* Uses a constant needs before it gets a function-wide temp. */
+#define OSK_MIN_USES 3
+/* Distinct constants shared per function. */
+#define OSK_MAX_SHARED 4
+#define OSK_MAX_CLASSES 16
+
+/* Value operands the backend materialises into a scratch or the destination
+ * register: a stored value, a call argument, a copy (phi copies included). */
+static int osk_value_use(TCCIRState *ir, IRQuadCompact *q, int32_t *out_val)
+{
+  IROperand s;
+  int32_t v;
+  switch (q->op) {
+  case TCCIR_OP_STORE: case TCCIR_OP_STORE_INDEXED:
+  case TCCIR_OP_FUNCPARAMVAL: case TCCIR_OP_ASSIGN:
+    break;
+  default:
+    return 0;
+  }
+  s = tcc_ir_op_get_src1(ir, q);
+  if (s.is_sym || s.is_local || s.is_llocal || s.is_lval || s.is_complex)
+    return 0;
+  if (irop_get_tag(s) != IROP_TAG_IMM32 || s.btype != IROP_BTYPE_INT32)
+    return 0;
+  v = irop_get_imm32(s);
+  /* MOVS covers 0..255 in two bytes; pool constants are the job of the
+   * const classes above. */
+  if ((v >= 0 && v <= 255) || tcc_gen_machine_const_needs_pool(v))
+    return 0;
+  *out_val = v;
+  return 1;
+}
+
+int tcc_ir_ssa_opt_os_const_share(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  int32_t vals[OSK_MAX_CLASSES], tv[OSK_MAX_CLASSES];
+  int cnt[OSK_MAX_CLASSES];
+  int nc = 0, changes = 0;
+
+  for (int i = 0; i < n; i++) {
+    int32_t v;
+    int c;
+    if (!osk_value_use(ir, &ir->compact_instructions[i], &v))
+      continue;
+    for (c = 0; c < nc; c++)
+      if (vals[c] == v)
+        break;
+    if (c == nc) {
+      if (nc == OSK_MAX_CLASSES)
+        continue;
+      vals[nc] = v;
+      cnt[nc] = 0;
+      tv[nc] = -1;
+      nc++;
+    }
+    cnt[c]++;
+  }
+
+  for (int k = 0; k < OSK_MAX_SHARED; k++) {
+    int best = -1;
+    for (int c = 0; c < nc; c++)
+      if (tv[c] == -1 && cnt[c] >= OSK_MIN_USES && (best < 0 || cnt[c] > cnt[best]))
+        best = c;
+    if (best < 0)
+      break;
+    tv[best] = tcc_ir_vreg_alloc_temp(ir);
+    if (tv[best] < 0)
+      return 0; /* nothing rewritten yet */
+  }
+
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    int32_t v;
+    int c;
+    if (!osk_value_use(ir, q, &v))
+      continue;
+    for (c = 0; c < nc; c++)
+      if (vals[c] == v)
+        break;
+    if (c == nc || tv[c] < 0)
+      continue;
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    IROperand nw = irop_make_vreg(tv[c], s.btype);
+    nw.is_unsigned = s.is_unsigned;
+    tcc_ir_op_set_src1(ir, q, nw);
+  }
+
+  /* At entry, so each def dominates all its uses; after the rewrites, so the
+   * index shift is harmless. */
+  for (int c = 0; c < nc; c++) {
+    if (tv[c] < 0)
+      continue;
+    if (insert_instr_at(ir, 0, TCCIR_OP_ASSIGN, irop_make_vreg(tv[c], IROP_BTYPE_INT32),
+                        irop_make_imm32(-1, vals[c], IROP_BTYPE_INT32), irop_make_none()) < 0)
+      tcc_ice("os_const_share: cannot insert the shared constant");
+    tcc_ir_vreg_live_interval(ir, tv[c])->no_remat = 1;
+    changes++;
+  }
   return changes;
 }

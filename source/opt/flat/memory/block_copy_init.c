@@ -152,22 +152,23 @@ int tcc_ir_opt_block_copy_init(TCCIRState *ir)
     if (q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
 
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
     const char *name = get_tok_str(callee->v, NULL);
     if (!name)
       continue;
-    if (strcmp(name, "__aeabi_memset") != 0 && strcmp(name, "memset") != 0)
+    int size_idx, fill_idx;
+    if (!ir_opt_memset_params(name, &size_idx, &fill_idx))
       continue;
 
-    /* Param order is __aeabi_memset(dest, size, fill_value). */
+    /* memset(dest, fill, size) vs __aeabi_memset(dest, size, fill). */
     IROperand param_dest, param_size, param_fill;
     if (!ir_opt_get_call_param_operand(ir, i, 0, &param_dest))
       continue;
-    if (!ir_opt_get_call_param_operand(ir, i, 1, &param_size))
+    if (!ir_opt_get_call_param_operand(ir, i, size_idx, &param_size))
       continue;
-    if (!ir_opt_get_call_param_operand(ir, i, 2, &param_fill))
+    if (!ir_opt_get_call_param_operand(ir, i, fill_idx, &param_fill))
       continue;
 
     if (irop_get_tag(param_fill) != IROP_TAG_IMM32)

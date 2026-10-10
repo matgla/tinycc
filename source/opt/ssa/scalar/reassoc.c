@@ -38,22 +38,24 @@ static int reassoc_combine(int outer_op, int inner_op, int32_t c1, int32_t c2,
                            int *new_op, int32_t *combined)
 {
   *new_op = outer_op;
+  /* 32-bit wraparound is the intent: compute it unsigned (signed overflow is UB
+   * in the compiler), and negate through unsigned too (-INT32_MIN). */
   if (outer_op == TCCIR_OP_ADD && inner_op == TCCIR_OP_ADD) {
-    *combined = c1 + c2;
+    *combined = (int32_t)((uint32_t)c1 + (uint32_t)c2);
   } else if (outer_op == TCCIR_OP_ADD && inner_op == TCCIR_OP_SUB) {
-    int32_t v = c2 - c1;
+    int32_t v = (int32_t)((uint32_t)c2 - (uint32_t)c1);
     *new_op = v >= 0 ? TCCIR_OP_ADD : TCCIR_OP_SUB;
-    *combined = v >= 0 ? v : -v;
+    *combined = v >= 0 ? v : (int32_t)(0u - (uint32_t)v);
   } else if (outer_op == TCCIR_OP_SUB && inner_op == TCCIR_OP_ADD) {
-    int32_t v = c1 - c2;
+    int32_t v = (int32_t)((uint32_t)c1 - (uint32_t)c2);
     *new_op = v >= 0 ? TCCIR_OP_ADD : TCCIR_OP_SUB;
-    *combined = v >= 0 ? v : -v;
+    *combined = v >= 0 ? v : (int32_t)(0u - (uint32_t)v);
   } else if (outer_op == TCCIR_OP_SUB && inner_op == TCCIR_OP_SUB) {
     *new_op = TCCIR_OP_SUB;
-    *combined = c1 + c2;
+    *combined = (int32_t)((uint32_t)c1 + (uint32_t)c2);
   } else if (outer_op == inner_op) {
     switch (outer_op) {
-    case TCCIR_OP_MUL: *combined = c1 * c2; break;
+    case TCCIR_OP_MUL: *combined = (int32_t)((uint32_t)c1 * (uint32_t)c2); break;
     case TCCIR_OP_AND: *combined = c1 & c2; break;
     case TCCIR_OP_OR:  *combined = c1 | c2; break;
     case TCCIR_OP_XOR: *combined = c1 ^ c2; break;
@@ -91,13 +93,18 @@ static int reassoc_consts_cancel(int op1, int op2, IROperand imm1, IROperand imm
  * only synthetic-test wins) — the still-active flat add_reassoc reassociates
  * early where it is safe. */
 OPT_GEN_SSA(reassoc_bin, 0) {
-  int new_op = OPT_DSL_KEEP_OP;
+  int new_op = 0;
   int32_t combined = 0;
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(dest);
+  BIND(src2);
   GUARD(
     when(is_imm32(src2));
     and_not(tcc_ir_barrel_shift_at(ir, q)));
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = -1, .single_use = 1);
+  PBIND(dest);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(
     when(is_imm32(psrc2));
     and_not(psrc1.is_lval);
@@ -110,8 +117,7 @@ OPT_GEN_SSA(reassoc_bin, 0) {
     and(reassoc_combine(q->op, pop, (int32_t)psrc2.u.imm32,
                         (int32_t)src2.u.imm32, &new_op, &combined)));
   RETIRE_PAIR(psrc1, 0);
-  REWRITE(.new_op = new_op, .src1 = psrc1,
-          .src2 = mk_imm_bt(combined, dest.btype));
+  REWRITE(set_op(new_op), set_src1_ref(psrc1), set_src2_imm(combined, dest.btype));
 }
 
 /* `T = ASSIGN symref(S,+A); T2 = T ± imm` → `T2 = ASSIGN symref(S, A±imm)`.
@@ -125,12 +131,14 @@ OPT_GEN_SSA(reassoc_bin, 0) {
  * The direct `symref(S,+A) ± imm` operand form is ssa:fold's
  * fold_symref_addend. */
 OPT_GEN_SSA(reassoc_symref_def, 0) {
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(src2);
   GUARD(
     when(q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB);
     and(is_imm32(src2));
     and_not(tcc_ir_barrel_shift_at(ir, q)));
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = TCCIR_OP_ASSIGN, .single_use = 1);
+  PBIND(src1);
   GUARD(
     when(irop_get_tag(psrc1) == IROP_TAG_SYMREF && !psrc1.is_lval));
   IRPoolSymref *sr = irop_get_symref_ex(ir, psrc1);
@@ -146,13 +154,16 @@ OPT_GEN_SSA(reassoc_symref_def, 0) {
                                     irop_get_btype(psrc1));
   nsrc.is_unsigned = psrc1.is_unsigned;
   RETIRE_PAIR(nsrc, 1);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = nsrc);
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(nsrc));
 }
 
 /* (a + c) + (a - c) → a + a (and the symmetric orderings): both operands are
  * single-use TEMPs defined by ADD/SUB of the same base by canceling constants. */
 OPT_GEN_SSA(reassoc_add_cancel, TCCIR_OP_ADD) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(src1.tag == IROP_TAG_VREG);
     and(src2.tag == IROP_TAG_VREG);
@@ -163,6 +174,8 @@ OPT_GEN_SSA(reassoc_add_cancel, TCCIR_OP_ADD) {
     and_not(tcc_ir_barrel_shift_at(ir, q)));
 
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = -1, .single_use = 1);
+  PBIND(src1);
+  PBIND(src2);
 
   IRSSAVregInfo *vi2 = ssa_opt_vinfo(ctx, vreg(src2));
   GUARD(
@@ -192,9 +205,9 @@ OPT_GEN_SSA(reassoc_add_cancel, TCCIR_OP_ADD) {
 
   IROperand a_op = irop_make_vreg(vreg(psrc1), irop_get_btype(dest));
   RETIRE_PAIR(a_op, 0);
-  opt_dsl_drop_use(ctx, src2, i);
-  opt_dsl_add_use(ctx, a_op, i);
-  REWRITE(.src1 = a_op, .src2 = a_op);
+  opt_dsl_drop_use(ctx, &src2, i);
+  opt_dsl_add_use(ctx, &a_op, i);
+  REWRITE(set_src1_ref(a_op), set_src2_ref(a_op));
 }
 
 /* ADD/SUB try the symref-def collapse first (it consumes an ASSIGN producer,

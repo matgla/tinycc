@@ -84,7 +84,7 @@ def _parse_pass_to_knob() -> dict[str, str]:
     """
     src = (REPO_ROOT / "source" / "opt" / "engine" / "pipeline_table.c").read_text()
     out: dict[str, str] = {}
-    for m in re.finditer(r'PASS_GATED\(\s*"([^"]+)"[^)]*?FLAG\(opt_([a-z_]+)\)', src):
+    for m in re.finditer(r'PASS_GATED(?:_CTX)?\(\s*"([^"]+)"[^)]*?FLAG\(opt_([a-z_]+)\)', src):
         out.setdefault(m.group(1), m.group(2))
     return out
 

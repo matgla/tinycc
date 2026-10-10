@@ -210,9 +210,11 @@ UT_TEST(test_switch_to_data_symref_value_share_rodata_uses_data)
 
 /* ---------------------------------------------------------------- label sharing */
 
-/* Case 0's target IS the table's default_target: its ASSIGN+JUMP body must
+/* Case 1's target IS the table's default_target: its ASSIGN+JUMP body must
  * survive un-NOPed since the out-of-range dispatch edge still branches to
- * it. Case 1's non-shared body is NOPed as usual. */
+ * it.  Case 0's non-shared body is NOPed as usual -- and since the SWITCH_LOAD
+ * would otherwise fall through into the surviving body, case 0's ASSIGN slot,
+ * right behind the dispatch, becomes the jump to the merge. */
 UT_TEST(test_switch_to_data_default_shared_body_preserved)
 {
   elfsec_reset();
@@ -223,14 +225,14 @@ UT_TEST(test_switch_to_data_default_shared_body_preserved)
 
   int targets[2];
   int sw = emit_switch_table(ir, 0);                     /* 0 */
-  targets[0] = emit_case_body_imm(ir, 1, 100, 5);        /* 1,2: shared w/ default */
-  targets[1] = emit_case_body_imm(ir, 1, 200, 5);        /* 3,4 */
+  targets[0] = emit_case_body_imm(ir, 1, 100, 5);        /* 1,2 */
+  targets[1] = emit_case_body_imm(ir, 1, 200, 5);        /* 3,4: shared w/ default */
   emit_return_value(ir, 0);                               /* 5 */
 
   TCCIRSwitchTable tables[1];
   tables[0].min_val = 0;
   tables[0].max_val = 1;
-  tables[0].default_target = targets[0]; /* case 0 doubles as the default */
+  tables[0].default_target = targets[1]; /* case 1 doubles as the default */
   tables[0].targets = targets;
   tables[0].num_entries = 2;
   tables[0].table_code_addr = 0;
@@ -241,12 +243,13 @@ UT_TEST(test_switch_to_data_default_shared_body_preserved)
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, sw), TCCIR_OP_SWITCH_LOAD);
-  /* Case 0's body (the shared default) survives. */
-  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_JUMP);
-  /* Case 1's body is NOPed as usual. */
-  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_NOP);
-  UT_ASSERT_EQ(utb_op(ir, 4), TCCIR_OP_NOP);
+  /* Case 0's body goes; its first slot jumps past the survivor to the merge. */
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ(irop_get_imm32(tcc_ir_op_get_dest(ir, &ir->compact_instructions[1])), 5);
+  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_NOP);
+  /* Case 1's body (the shared default) survives. */
+  UT_ASSERT_EQ(utb_op(ir, 3), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, 4), TCCIR_OP_JUMP);
 
   utb_free(ir);
   return 0;

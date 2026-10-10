@@ -131,7 +131,7 @@ static void cpt_scan_max_positions(TCCIRState *ir, int n, int *max_tmp, int *max
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (!irop_config[q->op].has_dest)
       continue;
-    int32_t dest_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
     int pos = TCCIR_DECODE_VREG_POSITION(dest_vr);
     if (TCCIR_DECODE_VREG_TYPE(dest_vr) == TCCIR_VREG_TYPE_TEMP)
     {
@@ -155,7 +155,7 @@ static void cpt_mark_addrtaken(TCCIRState *ir, int n, int max_var, uint8_t *var_
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_LEA)
       continue;
-    int32_t sv = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+    int32_t sv = tcc_ir_op_src1_vreg(ir, q);
     if (sv >= 0 && TCCIR_DECODE_VREG_TYPE(sv) == TCCIR_VREG_TYPE_VAR)
     {
       int vp = TCCIR_DECODE_VREG_POSITION(sv);
@@ -172,22 +172,26 @@ static void cpt_mark_addrtaken(TCCIRState *ir, int n, int max_var, uint8_t *var_
 
 static int cpt_is_block_boundary(int op)
 {
-  return op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF || op == TCCIR_OP_FUNCCALLVOID ||
-         op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_RETURNVALUE || op == TCCIR_OP_RETURNVOID;
+  /* Every control transfer (IJUMP, SWITCH_TABLE, TRAP, an asm goto), every
+   * setjmp landing and every op that may change a tracked VAR behind the
+   * pass's back (asm, __builtin_apply, VLA, the static chain) ends a region. */
+  return ir_op_has(op, IR_HZ_FROM_OP & ~(IR_HZ_MEM_READ | IR_HZ_MEM_WRITE | IR_HZ_UPDATES_SRC | IR_HZ_FLAGS_SET |
+                                          IR_HZ_FLAGS_READ | IR_HZ_HINT | IR_HZ_CALL_PARAM)) ||
+         ir_op_has(op, IROP_ENDS_BLOCK);
 }
 
 static int cpt_try_switch_table_fold(CPTCtx *c, int i)
 {
   TCCIRState *ir = c->ir;
   IRQuadCompact *q = &ir->compact_instructions[i];
-  int32_t src1_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+  int32_t src1_vr = tcc_ir_op_src1_vreg(ir, q);
   if (TCCIR_DECODE_VREG_TYPE(src1_vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
   int pos = TCCIR_DECODE_VREG_POSITION(src1_vr);
   if (pos > c->max_tmp_pos || c->tmp_info[pos].gen != c->current_gen)
     return 0;
   int64_t index_val = c->tmp_info[pos].value;
-  int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+  int table_id = (int)tcc_ir_op_src2_imm(ir, q);
   if (table_id < 0 || table_id >= ir->num_switch_tables)
     return 0;
   TCCIRSwitchTable *table = &ir->switch_tables[table_id];
@@ -198,11 +202,24 @@ static int cpt_try_switch_table_fold(CPTCtx *c, int i)
     target = table->default_target;
   LOG_IR_GEN("OPTIMIZE: Constant SWITCH_TABLE index=%lld -> JUMP to %d", (long long)index_val, target);
   q->op = TCCIR_OP_JUMP;
-  tcc_ir_set_dest(ir, i, irop_make_imm32(-1, target, 0));
-  tcc_ir_set_src1(ir, i, IROP_NONE);
-  tcc_ir_set_src2(ir, i, IROP_NONE);
+  tcc_ir_set_dest_imm32(ir, i, target, 0);
+  tcc_ir_set_src1_none(ir, i);
+  tcc_ir_set_src2_none(ir, i);
   c->current_gen++;
   return 1;
+}
+
+/* An operand that reads THROUGH its vreg -- a TEMP lvalue (`T***DEREF***`), or
+ * a VAR's is_llocal (the pointer the variable holds) -- names the memory at
+ * that value.  Substituting the constant for it turns the load into the
+ * address: pico-sdk's `while (~resets_hw->reset_done & bits)` spun on
+ * ~0x40020008 once sccp had made the pointer temp a constant (the RP2350
+ * kernel hung in crt_init). */
+static int cpt_operand_reads_through(IROperand op)
+{
+  if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op)) == TCCIR_VREG_TYPE_VAR)
+    return op.is_llocal;
+  return op.is_lval;
 }
 
 static int cpt_propagate_src1(CPTCtx *c, int i)
@@ -213,6 +230,8 @@ static int cpt_propagate_src1(CPTCtx *c, int i)
     return 0;
   IROperand src1 = tcc_ir_op_get_src1(ir, q);
   if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(src1)) == TCCIR_VREG_TYPE_VAR && src1.is_local && !src1.is_lval)
+    return 0;
+  if (cpt_operand_reads_through(src1))
     return 0;
   int64_t prop_val;
   if (!cpt_operand_const(c, src1, &prop_val))
@@ -225,7 +244,7 @@ static int cpt_propagate_src1(CPTCtx *c, int i)
     if (!irop_is_immediate(cmp_s2))
     {
       int32_t s2_vr = irop_get_vreg(cmp_s2);
-      if (s2_vr < 0 || !cpt_operand_const(c, cmp_s2, &s2v))
+      if (s2_vr < 0 || cpt_operand_reads_through(cmp_s2) || !cpt_operand_const(c, cmp_s2, &s2v))
         return 0;
     }
   }
@@ -253,6 +272,8 @@ static int cpt_propagate_src2(CPTCtx *c, int i)
   if (tcc_ir_barrel_shift_at(ir, q))
     return 0;
   IROperand src2 = tcc_ir_op_get_src2(ir, q);
+  if (cpt_operand_reads_through(src2))
+    return 0;
   int64_t prop_val;
   if (!cpt_operand_const(c, src2, &prop_val))
     return 0;
@@ -262,7 +283,7 @@ static int cpt_propagate_src2(CPTCtx *c, int i)
     return 0;
   int64_t val = ir_opt_fit_const_to_operand(prop_val, src2);
   /* widen narrow const to zero-extended INT64 for INT64 bitwise ops so codegen doesn't sign-extend into the high reg */
-  if (irop_get_btype(tcc_ir_op_get_src1(ir, q)) == IROP_BTYPE_INT64 && btype != IROP_BTYPE_INT64 &&
+  if (tcc_ir_op_src1_btype(ir, q) == IROP_BTYPE_INT64 && btype != IROP_BTYPE_INT64 &&
       (q->op == TCCIR_OP_OR || q->op == TCCIR_OP_AND || q->op == TCCIR_OP_XOR))
   {
     val = (int64_t)(uint32_t)val;
@@ -311,16 +332,19 @@ static int cpt_try_fold_binop(CPTCtx *c, int i)
     res = v1 ^ v2;
     break;
   case TCCIR_OP_SHL:
-    res = (int64_t)((uint64_t)v1 << v2);
-    break;
   case TCCIR_OP_SHR:
-    if (btype == IROP_BTYPE_INT64)
-      res = (int64_t)((uint64_t)v1 >> v2);
-    else
-      res = (int64_t)((uint32_t)v1 >> v2);
-    break;
   case TCCIR_OP_SAR:
-    res = v1 >> v2;
+    /* A count outside [0, width) is the program's UB, and folding it is UB in
+     * the compiler too (x86 masks the count; the ARM shift it replaces does
+     * not): leave the shift to run as it does at -O0. */
+    if (v2 < 0 || v2 >= (btype == IROP_BTYPE_INT64 ? 64 : 32))
+      ok = 0;
+    else if (q->op == TCCIR_OP_SHL)
+      res = (int64_t)((uint64_t)v1 << v2);
+    else if (q->op == TCCIR_OP_SHR)
+      res = btype == IROP_BTYPE_INT64 ? (int64_t)((uint64_t)v1 >> v2) : (int64_t)((uint32_t)v1 >> v2);
+    else
+      res = v1 >> v2;
     break;
   case TCCIR_OP_ROR:
   {
@@ -398,7 +422,7 @@ static int cpt_try_fold_binop(CPTCtx *c, int i)
   {
     if (q->op == TCCIR_OP_SHL && v2 >= 32)
     {
-      if (irop_get_btype(tcc_ir_op_get_dest(ir, q)) == IROP_BTYPE_INT64)
+      if (tcc_ir_op_dest_btype(ir, q) == IROP_BTYPE_INT64)
         btype = IROP_BTYPE_INT64;
       else
         ok = 0;
@@ -410,7 +434,7 @@ static int cpt_try_fold_binop(CPTCtx *c, int i)
     return 0;
   q->op = TCCIR_OP_ASSIGN;
   tcc_ir_set_src1(ir, i, cpt_make_const(ir, res, btype));
-  tcc_ir_set_src2(ir, i, IROP_NONE);
+  tcc_ir_set_src2_none(ir, i);
   return 1;
 }
 
@@ -436,8 +460,8 @@ static int cpt_try_cmp_setif_fold(CPTCtx *c, int i)
     return 0;
   q->op = TCCIR_OP_NOP;
   next_q->op = TCCIR_OP_ASSIGN;
-  tcc_ir_set_src1(ir, i + 1, irop_make_imm32(-1, result, irop_get_btype(setif_src1)));
-  tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+  tcc_ir_set_src1_imm32(ir, i + 1, result, irop_get_btype(setif_src1));
+  tcc_ir_set_src2_none(ir, i + 1);
   return 1;
 }
 
@@ -452,12 +476,12 @@ static int cpt_try_softfp_cmp_fold(CPTCtx *c, int i, int *out_continue)
   IRQuadCompact *next_q = &ir->compact_instructions[i + 1];
   if (next_q->op != TCCIR_OP_JUMPIF && next_q->op != TCCIR_OP_SETIF)
     return 0;
-  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  Sym *callee = tcc_ir_op_src1_sym(ir, q);
   if (!callee)
     return 0;
   const char *fn = get_tok_str(callee->v, NULL);
-  int is_fcmp = fn && (strcmp(fn, "__aeabi_cfcmple") == 0 || strcmp(fn, "__aeabi_cfcmpeq") == 0);
-  int is_dcmp = fn && (strcmp(fn, "__aeabi_cdcmple") == 0 || strcmp(fn, "__aeabi_cdcmpeq") == 0);
+  int is_fcmp = fn && ir_opt_name_in(fn, "__aeabi_cfcmple\0__aeabi_cfcmpeq\0");
+  int is_dcmp = fn && ir_opt_name_in(fn, "__aeabi_cdcmple\0__aeabi_cdcmpeq\0");
   if (!is_fcmp && !is_dcmp)
     return 0;
   IROperand arg0, arg1;
@@ -491,11 +515,11 @@ static int cpt_try_softfp_cmp_fold(CPTCtx *c, int i, int *out_continue)
     return 1;
   }
   next_q->op = TCCIR_OP_ASSIGN;
-  tcc_ir_set_src1(ir, i + 1, irop_make_imm32(-1, result, irop_get_btype(cond)));
-  tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+  tcc_ir_set_src1_imm32(ir, i + 1, result, irop_get_btype(cond));
+  tcc_ir_set_src2_none(ir, i + 1);
   /* bump gen before recording so the new const survives this call's block boundary */
   c->current_gen++;
-  int32_t dv = irop_get_vreg(tcc_ir_op_get_dest(ir, next_q));
+  int32_t dv = tcc_ir_op_dest_vreg(ir, next_q);
   if (dv >= 0 && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP)
   {
     int dp = TCCIR_DECODE_VREG_POSITION(dv);

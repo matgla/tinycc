@@ -30,8 +30,8 @@ static NestedFunc *find_nested_func_by_sym(Sym *sym)
 {
   for (int i = 0; i < tcc_state->nb_nested_funcs; i++)
   {
-    if (tcc_state->nested_funcs[i].sym == sym)
-      return &tcc_state->nested_funcs[i];
+    if (tcc_state->nested_funcs[i]->sym == sym)
+      return tcc_state->nested_funcs[i];
   }
   return NULL;
 }
@@ -143,7 +143,7 @@ static void emit_all_trampolines(void)
 {
   for (int i = 0; i < tcc_state->nb_nested_funcs; i++)
   {
-    NestedFunc *nf = &tcc_state->nested_funcs[i];
+    NestedFunc *nf = tcc_state->nested_funcs[i];
     if (nf->trampoline_needed)
     {
       emit_trampoline_for_nested_func(nf);
@@ -217,6 +217,7 @@ void compile_nested_functions(Sym *parent_sym)
 
   /* Save ALL parent global state */
   saved.ir = tcc_state->ir;
+  NestedFunc *saved_current_nf = tcc_state->current_nested_func;
   saved.loc = loc;
   saved.ind = ind;
   saved.rsym = rsym;
@@ -246,7 +247,7 @@ void compile_nested_functions(Sym *parent_sym)
   int compile_idx = 0;
   while (compile_idx < tcc_state->nb_nested_funcs)
   {
-    NestedFunc *nf = &tcc_state->nested_funcs[compile_idx];
+    NestedFunc *nf = tcc_state->nested_funcs[compile_idx];
 
     /* Skip already-compiled functions (safety check) */
     if (nf->compiled)
@@ -265,7 +266,7 @@ void compile_nested_functions(Sym *parent_sym)
     tcc_state->current_nested_func = nf;
 
     /* Replay saved token stream (same as inline function expansion) */
-    tccpp_putfile(nf->filename);
+    tccpp_setfile(nf->filename);
     begin_macro(nf->func_str, 1);
     next(); /* prime the first token - should be '{' */
 
@@ -287,8 +288,8 @@ void compile_nested_functions(Sym *parent_sym)
     for (int j = 0; j < nf->nb_addr_labels; j++)
     {
       Sym *lbl = nf->addr_label_syms[j];
-      lbl->prev_tok = table_ident[lbl->v - TOK_IDENT]->sym_label;
-      table_ident[lbl->v - TOK_IDENT]->sym_label = lbl;
+      lbl->prev_tok = sym_label_head(lbl->v);
+      sym_set_label_head(lbl->v, lbl);
     }
 
     /* Temporarily push parent-scope typedefs into the symbol table so the
@@ -312,6 +313,8 @@ void compile_nested_functions(Sym *parent_sym)
       int ident_idx = tv - TOK_IDENT;
       if ((unsigned)ident_idx < (unsigned)(tok_ident - TOK_IDENT))
       {
+        if (SYM_IS_PARKED(table_ident[ident_idx]->sym_identifier))
+          sym_unpark(table_ident[ident_idx]);
         ts_sym->prev_tok = table_ident[ident_idx]->sym_identifier;
         table_ident[ident_idx]->sym_identifier = ts_sym;
       }
@@ -328,9 +331,9 @@ void compile_nested_functions(Sym *parent_sym)
       int ident_idx = (tag->v & ~SYM_STRUCT) - TOK_IDENT;
       if ((unsigned)ident_idx < (unsigned)(tok_ident - TOK_IDENT))
       {
-        saved_struct_prev[j] = table_ident[ident_idx]->sym_struct;
+        saved_struct_prev[j] = sym_tag_head(ident_idx + TOK_IDENT);
         tag->prev_tok = saved_struct_prev[j];
-        table_ident[ident_idx]->sym_struct = tag;
+        sym_set_tag_head(ident_idx + TOK_IDENT, tag);
       }
       else
       {
@@ -345,7 +348,7 @@ void compile_nested_functions(Sym *parent_sym)
     for (int j = 0; j < nf->nb_addr_labels; j++)
     {
       Sym *lbl = nf->addr_label_syms[j];
-      table_ident[lbl->v - TOK_IDENT]->sym_label = lbl->prev_tok;
+      sym_set_label_head(lbl->v, lbl->prev_tok);
     }
 
     /* Remove parent struct tags from hash table */
@@ -355,8 +358,8 @@ void compile_nested_functions(Sym *parent_sym)
       int ident_idx = (tag->v & ~SYM_STRUCT) - TOK_IDENT;
       if ((unsigned)ident_idx < (unsigned)(tok_ident - TOK_IDENT))
       {
-        if (table_ident[ident_idx]->sym_struct == tag)
-          table_ident[ident_idx]->sym_struct = saved_struct_prev[j];
+        if (sym_tag_head(ident_idx + TOK_IDENT) == tag)
+          sym_set_tag_head(ident_idx + TOK_IDENT, saved_struct_prev[j]);
       }
     }
 
@@ -402,6 +405,7 @@ void compile_nested_functions(Sym *parent_sym)
 
   /* Restore ALL parent state */
   tcc_state->ir = saved.ir;
+  tcc_state->current_nested_func = saved_current_nf;
   loc = saved.loc;
   /* NOTE: do NOT restore ind - nested func code is in .text and
      the parent's codegen will emit at the CURRENT ind (after nested funcs) */
@@ -476,10 +480,10 @@ void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, NestedFunc *
   if (!tok_str)
     return;
 
-  /* Build a set of tokens that are shadowed by the nested function's own
-   * parameters or by local declarations in the body (type_keyword identifier).
-   * These are NOT genuine captures — the nested function's parameter or local
-   * will shadow the parent's variable of the same name. */
+  /* Parameters shadow the parent's variables for the whole body.  Locals do
+   * not: they are scoped, so a token is captured whenever it resolves in the
+   * parent and the nested function's own scope rules pick its local where one
+   * is visible (unary() tries sym_find before captured_tokens). */
   int shadowed_toks[MAX_CAPTURED_VARS];
   int nb_shadowed = 0;
   /* Parameter names shadow parent variables of the same name */
@@ -495,55 +499,6 @@ void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, NestedFunc *
       }
     }
   }
-  /* Scan body for local declarations: type_keyword followed by identifier */
-  {
-    const int *tp = tok_str_buf(tok_str);
-    int prev = 0;
-    while (*tp != TOK_EOF && *tp != 0)
-    {
-      int tv = *tp++;
-      switch (tv)
-      {
-      case TOK_CINT: case TOK_CCHAR: case TOK_LCHAR: case TOK_LINENUM:
-      case TOK_PACK_REPLAY:
-      case TOK_CUINT: case TOK_CFLOAT: case TOK_CFLOAT_I: case TOK_CINT_I:
-#if LONG_SIZE == 4
-      case TOK_CLONG: case TOK_CULONG:
-#endif
-        tp++; break;
-      case TOK_CDOUBLE: case TOK_CDOUBLE_I: case TOK_CLLONG: case TOK_CULLONG:
-#if LONG_SIZE == 8
-      case TOK_CLONG: case TOK_CULONG:
-#endif
-        tp += 2; break;
-      case TOK_CLDOUBLE: case TOK_CLDOUBLE_I:
-#if LDOUBLE_SIZE == 8 || defined TCC_USING_DOUBLE_FOR_LDOUBLE
-        tp += 2;
-#elif LDOUBLE_SIZE == 12
-        tp += 3;
-#elif LDOUBLE_SIZE == 16
-        tp += 4;
-#endif
-        break;
-      case TOK_STR: case TOK_LSTR: case TOK_PPNUM: case TOK_PPSTR:
-      { int sz = *tp++; tp += (sz + sizeof(int) - 1) / sizeof(int); break; }
-      default: break;
-      }
-      if (tv >= TOK_IDENT && (prev == TOK_INT || prev == TOK_CHAR || prev == TOK_SHORT ||
-                               prev == TOK_LONG || prev == TOK_VOID || prev == TOK_FLOAT ||
-                               prev == TOK_DOUBLE || prev == TOK_UNSIGNED || prev == TOK_SIGNED1 ||
-                               prev == TOK_BOOL))
-      {
-        int already = 0;
-        for (int si = 0; si < nb_shadowed; si++)
-          if (shadowed_toks[si] == tv) { already = 1; break; }
-        if (!already && nb_shadowed < MAX_CAPTURED_VARS)
-          shadowed_toks[nb_shadowed++] = tv;
-      }
-      prev = tv;
-    }
-  }
-
   const int *p = tok_str_buf(tok_str);
   int prev_tok = 0; /* track previous token for goto detection */
 
@@ -558,6 +513,7 @@ void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, NestedFunc *
     case TOK_CCHAR:
     case TOK_LCHAR:
     case TOK_LINENUM:
+    case TOK_PACK_REPLAY:
     case TOK_CUINT:
     case TOK_CFLOAT:
     case TOK_CFLOAT_I:

@@ -54,8 +54,10 @@ int try_eliminate_loop_symbolic(TCCIRState *ir, IRLoop *loop)
     return 0;
   }
 
-  /* Condition must be one we know how to invert into a step direction. */
-  if (cond != TOK_GE && cond != TOK_LT && cond != TOK_GT && cond != TOK_LE)
+  /* The closed form below (limit*step gated by limit > 0) is the one for
+   * `for (i = 0; i < n; i++)`, i.e. exit on i >= n.  `i <= n` runs n+1 times
+   * and `i > n` / `i >= n` move away from the limit. */
+  if (cond != TOK_GE)
     return 0;
 
   /* Verify the loop body is ONLY IV updates / copy-throughs / NOP / JUMP / exit CMP+JUMPIF. */
@@ -80,8 +82,8 @@ int try_eliminate_loop_symbolic(TCCIRState *ir, IRLoop *loop)
       {
         if (i == ivs[k].def_idx - 1)
         {
-          IROperand src1 = tcc_ir_op_get_src1(ir, q);
-          if (irop_get_vreg(src1) == ivs[k].vreg) { is_iv_copy = 1; break; }
+          int32_t src1_vr = tcc_ir_op_src1_vreg(ir, q);
+          if (src1_vr == ivs[k].vreg) { is_iv_copy = 1; break; }
         }
       }
       if (is_iv_copy)
@@ -103,9 +105,9 @@ int try_eliminate_loop_symbolic(TCCIRState *ir, IRLoop *loop)
       IRQuadCompact *q = &ir->compact_instructions[j];
       if (q->op == TCCIR_OP_NOP)
         continue;
-      if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == ivs[k].vreg)
+      if (irop_config[q->op].has_src1 && tcc_ir_op_src1_vreg(ir, q) == ivs[k].vreg)
         used_after = 1;
-      if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == ivs[k].vreg)
+      if (irop_config[q->op].has_src2 && tcc_ir_op_src2_vreg(ir, q) == ivs[k].vreg)
         used_after = 1;
     }
     if (!used_after)
@@ -139,10 +141,14 @@ int try_eliminate_loop_symbolic(TCCIRState *ir, IRLoop *loop)
     if (gq->op == TCCIR_OP_CMP)
     {
       IROperand gsrc1 = tcc_ir_op_get_src1(ir, gq);
-      if (irop_get_vreg(gsrc1) == counter_iv->vreg && g + 1 < loop->start_idx)
+      IROperand gsrc2 = tcc_ir_op_get_src2(ir, gq);
+      if (irop_get_vreg(gsrc1) == counter_iv->vreg && g + 1 < loop->start_idx &&
+          !gsrc2.is_lval && !gsrc2.is_sym && !gsrc2.is_complex && irop_get_vreg(gsrc2) == irop_get_vreg(limit_op))
       {
         IRQuadCompact *gjq = &ir->compact_instructions[g + 1];
-        if (gjq->op == TCCIR_OP_JUMPIF)
+        /* Must be the zero-trip guard: skip the loop when i >= n. */
+        if (gjq->op == TCCIR_OP_JUMPIF && (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, gjq)) == TOK_GE &&
+            (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, gjq)) > loop->end_idx)
         {
           guard_cmp = g;
           guard_jmpif = g + 1;
@@ -317,8 +323,8 @@ int try_eliminate_loop(TCCIRState *ir, IRLoop *loop)
       {
         if (i == ivs[k].def_idx - 1)
         {
-          IROperand src1 = tcc_ir_op_get_src1(ir, q);
-          if (irop_get_vreg(src1) == ivs[k].vreg)
+          int32_t src1_vr = tcc_ir_op_src1_vreg(ir, q);
+          if (src1_vr == ivs[k].vreg)
           {
             is_iv_copy = 1;
             break;
@@ -340,8 +346,8 @@ int try_eliminate_loop(TCCIRState *ir, IRLoop *loop)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP)
     {
-      IROperand jd = tcc_ir_op_get_dest(ir, q);
-      int target = (int)irop_get_imm64_ex(ir, jd);
+      int64_t jd_imm = tcc_ir_op_dest_imm(ir, q);
+      int target = (int)jd_imm;
       if (target < loop->start_idx)
         return 0;
     }
@@ -364,12 +370,12 @@ int try_eliminate_loop(TCCIRState *ir, IRLoop *loop)
       IRQuadCompact *q = &ir->compact_instructions[j];
       if (q->op == TCCIR_OP_NOP)
         continue;
-      if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == ivs[k].vreg)
+      if (irop_config[q->op].has_src1 && tcc_ir_op_src1_vreg(ir, q) == ivs[k].vreg)
       {
         used_after = 1;
         break;
       }
-      if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == ivs[k].vreg)
+      if (irop_config[q->op].has_src2 && tcc_ir_op_src2_vreg(ir, q) == ivs[k].vreg)
       {
         used_after = 1;
         break;
@@ -394,8 +400,8 @@ int try_eliminate_loop(TCCIRState *ir, IRLoop *loop)
         IRQuadCompact *gq = &ir->compact_instructions[g];
         if (gq->op == TCCIR_OP_CMP)
         {
-          IROperand gsrc1 = tcc_ir_op_get_src1(ir, gq);
-          if (irop_get_vreg(gsrc1) == ivs[k].vreg && g + 1 < loop->start_idx)
+          int32_t gsrc1_vr = tcc_ir_op_src1_vreg(ir, gq);
+          if (gsrc1_vr == ivs[k].vreg && g + 1 < loop->start_idx)
           {
             IRQuadCompact *gjq = &ir->compact_instructions[g + 1];
             if (gjq->op == TCCIR_OP_JUMPIF)

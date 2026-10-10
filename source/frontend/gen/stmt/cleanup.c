@@ -68,7 +68,7 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
                                      clinl_name(fs), fs->type.ref->f.func_auto_inline, fs->type.ref->f.func_noinline));
     return 0;
   }
-  if (!tcc_state->opt_inline_functions && !tcc_state->opt_inline_small) {
+  if (!TCC_OPT(tcc_state, opt_inline_functions) && !TCC_OPT(tcc_state, opt_inline_small)) {
     TCC_DBG_TRACE(dbg_clinl, (stderr, "[CLINL] %s: inline opts off\n", clinl_name(fs)));
     return 0;
   }
@@ -177,6 +177,7 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   int saved_inline_return_loc = tcc_state->inline_return_loc;
   int saved_inline_return_vr = tcc_state->inline_return_vr;
   uint8_t saved_inline_return_redirected = tcc_state->inline_return_redirected;
+  uint8_t saved_inline_return_copied = tcc_state->inline_return_copied;
   /* Scope-exit cleanups are emitted even in CODE_OFF regions (see
    * try_call_scope_cleanup), and the replayed body's internal control flow
    * flips CODE_OFF back on when a forward branch inside it is resolved.  The
@@ -195,6 +196,7 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
    * should ever bind this one. */
   tcc_state->inline_return_vr = -1;
   tcc_state->inline_return_redirected = 0;
+  tcc_state->inline_return_copied = 0;
   tcc_state->inline_expansion_depth++;
   root_scope = cur_scope;
 
@@ -231,6 +233,7 @@ static int try_inline_cleanup_call(Sym *fs, Sym *vs)
   tcc_state->inline_return_loc = saved_inline_return_loc;
   tcc_state->inline_return_vr = saved_inline_return_vr;
   tcc_state->inline_return_redirected = saved_inline_return_redirected;
+  tcc_state->inline_return_copied = saved_inline_return_copied;
   tcc_state->inline_expansion_depth--;
   func_vt = saved_func_vt;
   func_var = saved_func_var;

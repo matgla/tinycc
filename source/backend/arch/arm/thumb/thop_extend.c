@@ -24,33 +24,8 @@
  *  Extend instructions — shared shapes
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* T1: <OP> <Rd>, <Rm>  —  16-bit, rd/rm low, no rotation */
-static const thop_variant_shape SHAPE_T16_EXTEND = {
-    .size = THOP_VARIANT_T16,
-    .rd_place = {0, 3},
-    .rm_place = {3, 3},
-    .rd_con = REG_LOW_ONLY,
-    .rm_con = REG_LOW_ONLY,
-    .imm = {.kind = IMM_RAW, .width = 0}, /* rotate must be 0 for T1 */
-    .shift_allowed = (1u << THUMB_SHIFT_ROR),
-    .feat = {.t16 = 1},
-};
-
-/* T2: <OP> <Rd>, <Rm>{, ROR #<rotate>}  —  32-bit, rotate in bits [5:4] */
-static const thop_variant_shape SHAPE_T32_EXTEND = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {8, 4},
-    .rm_place = {0, 4},
-    .ra_place = {16, 4}, /* rm duplicated at bits [19:16] */
-    .rd_con = REG_NOT_PC,
-    .imm = {.kind = IMM_RAW, .width = 2, .scale_log2 = 3},
-    .imm_place = {4, 2},
-    .shift_allowed = (1u << THUMB_SHIFT_ROR),
-    .feat = {.t32 = 1},
-};
-
-#define V_EXTEND_T16(b) {&SHAPE_T16_EXTEND, (b)}
-#define V_EXTEND_T32(b) {&SHAPE_T32_EXTEND, (b)}
+#define V_EXTEND_T16(b) {THOP_SHAPE_T16_EXTEND, (b)}
+#define V_EXTEND_T32(b) {THOP_SHAPE_T32_EXTEND, (b)}
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Generic wrapper
@@ -59,8 +34,7 @@ static const thop_variant_shape SHAPE_T32_EXTEND = {
 static thumb_opcode thop_extend(uint32_t rd, uint32_t rm, thumb_shift shift, thumb_enforce_encoding enc,
                                 const thop_table *table)
 {
-  return thop_emit(table->name, table->variants, table->variant_count,
-                   (thop_args){.rd = rd,
+  return thop_emit_table(table, (thop_args){.rd = rd,
                                .rm = rm,
                                .ra = rm,
                                .imm = shift.value,

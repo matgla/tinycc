@@ -18,26 +18,22 @@
 #include "opt_alias.h"
 #include "cfg.h"
 #include "mem_ssa.h"
+#include "opt_range.h"
 
 /* --- instruction classification ---------------------------------------- */
 
 /* A clobber creates a new memory version (a MemoryDef). */
-static int msa_is_clobber(int op)
+static int msa_is_clobber(TCCIRState *ir, const IRQuadCompact *q)
 {
-  switch (op) {
-  case TCCIR_OP_STORE:
-  case TCCIR_OP_STORE_INDEXED:
-  case TCCIR_OP_STORE_POSTINC:
-  case TCCIR_OP_BLOCK_COPY:
-  case TCCIR_OP_FUNCCALLVAL:
-  case TCCIR_OP_FUNCCALLVOID:
-  case TCCIR_OP_INLINE_ASM:
-  case TCCIR_OP_VLA_ALLOC:
-  case TCCIR_OP_LOAD_POSTINC: /* modifies the pointer; opaque, matches load_cse */
-    return 1;
-  default:
-    return 0;
-  }
+  /* Anything that may write memory: a memory-writing opcode, a call,
+   * setjmp/longjmp and __builtin_apply, asm (an ASM_OUTPUT stores an "=r"(*p)
+   * output), the static chain's slot, VLA SP changes -- and any op whose
+   * destination names memory.  LOAD_POSTINC (updates-src) modifies its
+   * pointer and is opaque, matching load_cse. */
+  return ir_q_hazards(ir, q,
+                      (IR_HZ_FROM_OP & ~(IR_HZ_MEM_READ | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ | IR_HZ_BRANCH |
+                                         IR_HZ_RETURN | IR_HZ_TRAP | IR_HZ_HINT | IR_HZ_CALL_PARAM)) |
+                          IR_HZ_DEST_LVAL | IR_HZ_DEST_STACKOFF) != 0;
 }
 
 /* A read observes the current memory version (a MemoryUse). */
@@ -46,9 +42,9 @@ static int msa_is_read(TCCIRState *ir, IRQuadCompact *q)
   if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_LOAD_INDEXED ||
       q->op == TCCIR_OP_LOAD_POSTINC)
     return 1;
-  if (irop_config[q->op].has_src1 && tcc_ir_op_get_src1(ir, q).is_lval)
+  if (irop_config[q->op].has_src1 && tcc_ir_op_src1_is_lval(ir, q))
     return 1;
-  if (irop_config[q->op].has_src2 && tcc_ir_op_get_src2(ir, q).is_lval)
+  if (irop_config[q->op].has_src2 && tcc_ir_op_src2_is_lval(ir, q))
     return 1;
   if (q->op == TCCIR_OP_MLA && tcc_ir_op_get_accum(ir, q).is_lval)
     return 1;
@@ -127,7 +123,7 @@ MemSSAState *tcc_ir_mem_ssa_build(TCCIRState *ir, IRCFG *cfg)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if (msa_is_clobber(q->op)) {
+    if (msa_is_clobber(ir, q)) {
       int b = cfg->instr_to_block[i];
       if (b >= 0 && b < nb)
         def_blocks[b / 8] |= (uint8_t)(1 << (b % 8));
@@ -200,7 +196,7 @@ MemSSAState *tcc_ir_mem_ssa_build(TCCIRState *ir, IRCFG *cfg)
           continue;
         if (msa_is_read(ir, q))
           m->use_reaching[i] = cur;
-        if (msa_is_clobber(q->op)) {
+        if (msa_is_clobber(ir, q)) {
           MemDefKind k = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
                           q->op == TCCIR_OP_STORE_POSTINC || q->op == TCCIR_OP_BLOCK_COPY)
                              ? MEM_DEF_STORE
@@ -373,9 +369,9 @@ int tcc_ir_mem_ssa_load_fwd(TCCIRState *ir, MemSSAState *m)
      * elided).  A truncating store (e.g. `short s = (long)t`) or widening load
      * would otherwise forward the wrong value. */
     int bt = irop_get_btype(addr);
-    if (irop_get_btype(tcc_ir_op_get_dest(ir, sq)) != bt ||
+    if (tcc_ir_op_dest_btype(ir, sq) != bt ||
         irop_get_btype(v) != bt ||
-        irop_get_btype(tcc_ir_op_get_dest(ir, q)) != bt)
+        tcc_ir_op_dest_btype(ir, q) != bt)
       continue;
     if (!msa_value_forwardable(v))
       continue;

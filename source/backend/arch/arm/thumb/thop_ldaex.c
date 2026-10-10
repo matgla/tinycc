@@ -27,30 +27,15 @@
 
 /* ───── LDAEX / LDAEXB / LDAEXH (T32, ARMv8-M) ───── */
 
-static const thop_variant_shape SHAPE_LDAEX = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {12, 4},
-    .rn_place = {16, 4},
-    .feat = {.t32 = 1, .ldaex = 1},
-};
-
-TH_TABLE(TH_LDAEX, "ldaex", {&SHAPE_LDAEX, 0xe8d00fef, NULL});
-TH_TABLE(TH_LDAEXB, "ldaexb", {&SHAPE_LDAEX, 0xe8d00fcf, NULL});
-TH_TABLE(TH_LDAEXH, "ldaexh", {&SHAPE_LDAEX, 0xe8d00fdf, NULL});
+TH_TABLE(TH_LDAEX, "ldaex", {THOP_SHAPE_LDAEX, 0xe8d00fef, 0});
+TH_TABLE(TH_LDAEXB, "ldaexb", {THOP_SHAPE_LDAEX, 0xe8d00fcf, 0});
+TH_TABLE(TH_LDAEXH, "ldaexh", {THOP_SHAPE_LDAEX, 0xe8d00fdf, 0});
 
 /* ───── STLEX / STLEXB / STLEXH (T32, ARMv8-M) ───── */
 
-static const thop_variant_shape SHAPE_STLEX = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {0, 4},
-    .rn_place = {16, 4},
-    .rm_place = {12, 4},
-    .feat = {.t32 = 1, .ldaex = 1},
-};
-
-TH_TABLE(TH_STLEX, "stlex", {&SHAPE_STLEX, 0xe8c00fe0, NULL});
-TH_TABLE(TH_STLEXB, "stlexb", {&SHAPE_STLEX, 0xe8c00fc0, NULL});
-TH_TABLE(TH_STLEXH, "stlexh", {&SHAPE_STLEX, 0xe8c00fd0, NULL});
+TH_TABLE(TH_STLEX, "stlex", {THOP_SHAPE_STLEX, 0xe8c00fe0, 0});
+TH_TABLE(TH_STLEXB, "stlexb", {THOP_SHAPE_STLEX, 0xe8c00fc0, 0});
+TH_TABLE(TH_STLEXH, "stlexh", {THOP_SHAPE_STLEX, 0xe8c00fd0, 0});
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Public wrappers
@@ -58,36 +43,30 @@ TH_TABLE(TH_STLEXH, "stlexh", {&SHAPE_STLEX, 0xe8c00fd0, NULL});
 
 thumb_opcode th_ldaex(uint32_t rt, uint32_t rn)
 {
-  return thop_emit(TH_LDAEX.name, TH_LDAEX.variants, TH_LDAEX.variant_count,
-                   (thop_args){.rd = rt, .rn = rn});
+  return thop_emit_table(&TH_LDAEX, (thop_args){.rd = rt, .rn = rn});
 }
 
 thumb_opcode th_stlex(uint32_t rd, uint32_t rt, uint32_t rn)
 {
-  return thop_emit(TH_STLEX.name, TH_STLEX.variants, TH_STLEX.variant_count,
-                   (thop_args){.rd = rd, .rn = rn, .rm = rt});
+  return thop_emit_table(&TH_STLEX, (thop_args){.rd = rd, .rn = rn, .rm = rt});
 }
 
 thumb_opcode th_ldaexb(uint32_t rt, uint32_t rn)
 {
-  return thop_emit(TH_LDAEXB.name, TH_LDAEXB.variants, TH_LDAEXB.variant_count,
-                   (thop_args){.rd = rt, .rn = rn});
+  return thop_emit_table(&TH_LDAEXB, (thop_args){.rd = rt, .rn = rn});
 }
 
 thumb_opcode th_ldaexh(uint32_t rt, uint32_t rn)
 {
-  return thop_emit(TH_LDAEXH.name, TH_LDAEXH.variants, TH_LDAEXH.variant_count,
-                   (thop_args){.rd = rt, .rn = rn});
+  return thop_emit_table(&TH_LDAEXH, (thop_args){.rd = rt, .rn = rn});
 }
 
 thumb_opcode th_stlexb(uint32_t rd, uint32_t rt, uint32_t rn)
 {
-  return thop_emit(TH_STLEXB.name, TH_STLEXB.variants, TH_STLEXB.variant_count,
-                   (thop_args){.rd = rd, .rn = rn, .rm = rt});
+  return thop_emit_table(&TH_STLEXB, (thop_args){.rd = rd, .rn = rn, .rm = rt});
 }
 
 thumb_opcode th_stlexh(uint32_t rd, uint32_t rt, uint32_t rn)
 {
-  return thop_emit(TH_STLEXH.name, TH_STLEXH.variants, TH_STLEXH.variant_count,
-                   (thop_args){.rd = rd, .rn = rn, .rm = rt});
+  return thop_emit_table(&TH_STLEXH, (thop_args){.rd = rd, .rn = rn, .rm = rt});
 }

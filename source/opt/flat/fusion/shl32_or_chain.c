@@ -42,15 +42,14 @@ int tcc_ir_opt_shl32_or_chain(TCCIRState *ir)
     int is_shl32 = 0, is_and_low = 0;
     if (q->op == TCCIR_OP_SHL || q->op == TCCIR_OP_AND)
     {
-      IROperand q_src2 = tcc_ir_op_get_src2(ir, q);
-      if (!irop_is_immediate(q_src2))
+      if (!tcc_ir_op_src2_is_imm(ir, q))
         continue;
-      int64_t imm = irop_get_imm64_ex(ir, q_src2);
+      int64_t imm = tcc_ir_op_src2_imm(ir, q);
       if (q->op == TCCIR_OP_SHL && imm == 32)
         is_shl32 = 1;
-      else if (q->op == TCCIR_OP_AND && (uint32_t)imm == 0xFFFFFFFFu)
-        /* Low 32 bits only: irop_get_imm64_ex sign-extends a 32-bit mask to
-           int64_t -1, so a 0x00000000FFFFFFFF test would never match. */
+      else if (q->op == TCCIR_OP_AND && (uint64_t)imm == 0xFFFFFFFFull)
+        /* Full 64-bit value: a 64-bit mask of #-1 is all-ones and keeps the
+           high half, only 0x00000000FFFFFFFF (i64 pool) drops it. */
         is_and_low = 1;
       else
         continue;
@@ -59,15 +58,13 @@ int tcc_ir_opt_shl32_or_chain(TCCIRState *ir)
     {
       continue;
     }
-    IROperand q_dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_btype(q_dest) != IROP_BTYPE_INT64)
+    if (tcc_ir_op_dest_btype(ir, q) != IROP_BTYPE_INT64)
       continue;
 
-    IROperand q_src1 = tcc_ir_op_get_src1(ir, q);
-    int32_t or_vr = irop_get_vreg(q_src1);
+    int32_t or_vr = tcc_ir_op_src1_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(or_vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
-    if (q_src1.is_lval || q_src1.is_sym)
+    if (tcc_ir_op_src1_is_lval(ir, q) || tcc_ir_op_src1_is_sym(ir, q))
       continue;
     if (ir_opt_du_uses(&du, or_vr) != 1 || !ir_opt_du_is_single_def(&du, or_vr))
       continue;
@@ -78,8 +75,7 @@ int tcc_ir_opt_shl32_or_chain(TCCIRState *ir)
     IRQuadCompact *or_q = &ir->compact_instructions[or_def];
     if (or_q->op != TCCIR_OP_OR)
       continue;
-    IROperand or_dest = tcc_ir_op_get_dest(ir, or_q);
-    if (irop_get_btype(or_dest) != IROP_BTYPE_INT64)
+    if (tcc_ir_op_dest_btype(ir, or_q) != IROP_BTYPE_INT64)
       continue;
 
     /* One of OR's operands must be `something SHL #32` (the dead-bits half). */
@@ -107,11 +103,9 @@ int tcc_ir_opt_shl32_or_chain(TCCIRState *ir)
       IRQuadCompact *shl_q = &ir->compact_instructions[def];
       if (shl_q->op != TCCIR_OP_SHL)
         continue;
-      IROperand shl_amt = tcc_ir_op_get_src2(ir, shl_q);
-      if (!irop_is_immediate(shl_amt) || irop_get_imm64_ex(ir, shl_amt) != 32)
+      if (!tcc_ir_op_src2_is_imm(ir, shl_q) || tcc_ir_op_src2_imm(ir, shl_q) != 32)
         continue;
-      IROperand shl_dest_chk = tcc_ir_op_get_dest(ir, shl_q);
-      if (irop_get_btype(shl_dest_chk) != IROP_BTYPE_INT64)
+      if (tcc_ir_op_dest_btype(ir, shl_q) != IROP_BTYPE_INT64)
         continue;
       chosen = s;
       shl1_def = def;
@@ -135,4 +129,3 @@ int tcc_ir_opt_shl32_or_chain(TCCIRState *ir)
   tcc_free(du.def);
   return changes;
 }
-int tcc_ir_opt_shl32_or_chain_ex(IROptCtx *ctx) { return tcc_ir_opt_shl32_or_chain(ctx->ir); }

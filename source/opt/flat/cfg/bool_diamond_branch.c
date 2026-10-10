@@ -71,10 +71,10 @@ int tcc_ir_opt_bool_diamond_branch(TCCIRState *ir)
     IRQuadCompact *qj = &ir->compact_instructions[j];
     if (qj->op != TCCIR_OP_JUMPIF)
       continue;
-    int cond = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, qj));
+    int cond = (int)tcc_ir_op_src1_imm(ir, qj);
     if (cond != TOK_EQ && cond != TOK_NE)
       continue;
-    int taken_target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, qj));
+    int taken_target = (int)tcc_ir_op_dest_imm(ir, qj);
     if (taken_target < 0 || taken_target > n)
       continue;
     int fall_target = ir_skip_nops_forward(ir, j + 1, n);
@@ -89,14 +89,12 @@ int tcc_ir_opt_bool_diamond_branch(TCCIRState *ir)
     IRQuadCompact *qk = &ir->compact_instructions[k];
     if (qk->op != TCCIR_OP_ASSIGN || !qk->is_jump_target)
       continue;
-    IROperand kd = tcc_ir_op_get_dest(ir, qk);
-    if (kd.is_lval || irop_get_vreg(kd) != tvr)
+    if (tcc_ir_op_dest_is_lval(ir, qk) || tcc_ir_op_dest_vreg(ir, qk) != tvr)
       continue;
-    IROperand ks = tcc_ir_op_get_src1(ir, qk);
-    if (ks.is_lval || !irop_is_immediate(ks))
+    if (tcc_ir_op_src1_is_lval(ir, qk) || !tcc_ir_op_src1_is_imm(ir, qk))
       continue;
 
-    int is_zero = ((int32_t)irop_get_imm64_ex(ir, ks) == 0);
+    int is_zero = ((int32_t)tcc_ir_op_src1_imm(ir, qk) == 0);
     int taken = (cond == TOK_EQ) ? is_zero : !is_zero;
     int new_target = taken ? taken_target : fall_target;
     if (new_target == k)
@@ -129,9 +127,9 @@ int tcc_ir_opt_bool_diamond_branch(TCCIRState *ir)
         }
         else
         {
-          if (qi->op != TCCIR_OP_MLA)
+          if (!ir_op_has(qi->op, IROP_A_SLOT3))
             continue;
-          o = tcc_ir_op_get_accum(ir, qi);
+          o = ir->iroperand_pool[qi->operand_base + 3];
         }
         if (irop_get_vreg(o) == tvr)
           other_read = 1;
@@ -139,8 +137,7 @@ int tcc_ir_opt_bool_diamond_branch(TCCIRState *ir)
       /* A write THROUGH the value (`Tv***DEREF*** <-- x`) reads it as well. */
       if (!other_read && irop_config[qi->op].has_dest)
       {
-        IROperand d = tcc_ir_op_get_dest(ir, qi);
-        if (d.is_lval && irop_get_vreg(d) == tvr)
+        if (tcc_ir_op_dest_is_lval(ir, qi) && tcc_ir_op_dest_vreg(ir, qi) == tvr)
           other_read = 1;
       }
     }

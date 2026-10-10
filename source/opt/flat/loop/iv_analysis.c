@@ -28,7 +28,7 @@ int find_induction_vars_ex(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int 
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
 
-    if (q->op != TCCIR_OP_ADD)
+    if (q->op != TCCIR_OP_ADD || tcc_ir_barrel_shift_at(ir, q))
       continue;
 
     IROperand dest = tcc_ir_op_get_dest(ir, q);
@@ -48,6 +48,14 @@ int find_induction_vars_ex(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int 
     if (irop_get_btype(dest) != IROP_BTYPE_INT32)
       continue;
 
+    /* A volatile VAR is never an induction variable: each read returns
+     * whatever the object holds, and each read and write must happen, so its
+     * trip count cannot be computed, nor the loop unrolled or eliminated --
+     * `for (volatile int i = 0; i < 1000; i++);` is a delay loop because of
+     * exactly that. */
+    if (tcc_ir_operand_names_volatile_var(ir, dest))
+      continue;
+
     /* Pattern: V = V + const  OR  V = T + const where T := V (copy-through) */
     int effective_src_vr = src1_vr;
     if (allow_copy_through && src1_vr != dest_vr && src1_vr >= 0 && irop_is_immediate(src2))
@@ -58,9 +66,9 @@ int find_induction_vars_ex(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int 
         IRQuadCompact *aq = &ir->compact_instructions[k];
         if (aq->op == TCCIR_OP_ASSIGN)
         {
-          IROperand adest = tcc_ir_op_get_dest(ir, aq);
-          IROperand asrc = tcc_ir_op_get_src1(ir, aq);
-          if (irop_get_vreg(adest) == src1_vr && irop_get_vreg(asrc) == dest_vr)
+          int32_t adest_vr = tcc_ir_op_dest_vreg(ir, aq);
+          int32_t asrc_vr = tcc_ir_op_src1_vreg(ir, aq);
+          if (adest_vr == src1_vr && asrc_vr == dest_vr)
           {
             effective_src_vr = dest_vr;
             break;
@@ -79,8 +87,8 @@ int find_induction_vars_ex(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int 
       for (int j = loop->start_idx; j <= loop->end_idx; j++)
       {
         IRQuadCompact *dq = &ir->compact_instructions[j];
-        IROperand ddest = tcc_ir_op_get_dest(ir, dq);
-        if (irop_get_vreg(ddest) == dest_vr && dq->op != TCCIR_OP_NOP)
+        int32_t ddest_vr = tcc_ir_op_dest_vreg(ir, dq);
+        if (ddest_vr == dest_vr && dq->op != TCCIR_OP_NOP)
           def_count++;
       }
 
@@ -90,24 +98,46 @@ int find_induction_vars_ex(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int 
       /* Look for initialization in preheader */
       int init_val = 0;
       int init_idx = -1;
+      /* The ASSIGN must reach the loop entry: stop at any other definition of
+       * the IV (a call result, a copy, an ADD) and at any jump target after
+       * it (another path enters the loop without running the ASSIGN). */
       for (int j = loop->preheader_idx; j >= 0 && j >= loop->preheader_idx - 5; j--)
       {
         IRQuadCompact *pq = &ir->compact_instructions[j];
-        if (pq->op == TCCIR_OP_ASSIGN)
+        if (pq->op != TCCIR_OP_NOP && irop_config[pq->op].has_dest &&
+            irop_get_vreg(tcc_ir_op_get_dest(ir, pq)) == dest_vr)
         {
-          IROperand pdest = tcc_ir_op_get_dest(ir, pq);
           IROperand psrc1 = tcc_ir_op_get_src1(ir, pq);
-          if (irop_get_vreg(pdest) == dest_vr && irop_is_immediate(psrc1))
+          if (pq->op == TCCIR_OP_ASSIGN && irop_is_immediate(psrc1))
           {
             init_val = (int)irop_get_imm64_ex(ir, psrc1);
             init_idx = j;
-            break;
           }
+          break;
         }
+        if (pq->is_jump_target)
+          break; /* joins here: an ASSIGN above is not on every path */
       }
 
       if (init_idx < 0)
         continue; /* No initialization found */
+
+      /* A branch from outside the loop into (init, loop] -- `if (c) i = 2;`
+       * jumping straight to the header -- enters without running the ASSIGN. */
+      int init_bypassed = 0;
+      for (int k = 0; k < ir->next_instruction_index && !init_bypassed; k++)
+      {
+        if (k >= loop->start_idx && k <= loop->end_idx)
+          continue;
+        IRQuadCompact *jq = &ir->compact_instructions[k];
+        if (jq->op != TCCIR_OP_JUMP && jq->op != TCCIR_OP_JUMPIF)
+          continue;
+        int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq));
+        if (target > init_idx && target <= loop->end_idx)
+          init_bypassed = 1;
+      }
+      if (init_bypassed)
+        continue;
 
       ivs[num_ivs].vreg = dest_vr;
       ivs[num_ivs].init_val = init_val;
@@ -218,7 +248,7 @@ int iv_read_reachable_outside(TCCIRState *ir, IRLoop *loop, int32_t iv_vr)
     }
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int t = (int)tcc_ir_op_dest_imm(ir, q);
       if (t < lo || t > hi)
         wl[nwl++] = t;
     }
@@ -249,9 +279,9 @@ int iv_read_reachable_outside(TCCIRState *ir, IRLoop *loop, int32_t iv_vr)
       break;
     }
     /* reads */
-    if ((irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == iv_vr) ||
-        (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == iv_vr) ||
-        (q->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, q)) == iv_vr))
+    if ((irop_config[q->op].has_src1 && tcc_ir_op_src1_vreg(ir, q) == iv_vr) ||
+        (irop_config[q->op].has_src2 && tcc_ir_op_src2_vreg(ir, q) == iv_vr) ||
+        (q->op == TCCIR_OP_MLA && tcc_ir_op_accum_vreg(ir, q) == iv_vr))
     {
       result = 1;
       break;
@@ -274,7 +304,7 @@ int iv_read_reachable_outside(TCCIRState *ir, IRLoop *loop, int32_t iv_vr)
       continue;
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      wl[nwl++] = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      wl[nwl++] = (int)tcc_ir_op_dest_imm(ir, q);
       if (q->op == TCCIR_OP_JUMPIF)
         wl[nwl++] = k + 1;
       continue;
@@ -325,30 +355,29 @@ static int iv_ctr_eliminable_list(TCCIRState *ir, IRLoop *loop, int32_t iv_vr, i
 
     if (uq->op == TCCIR_OP_LOAD_INDEXED || uq->op == TCCIR_OP_STORE_INDEXED)
     {
-      if (irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == iv_vr)
+      if (tcc_ir_op_src2_vreg(ir, uq) == iv_vr)
         continue;
     }
 
     if (uq->op == TCCIR_OP_ASSIGN && j >= iv_def_idx - 3 && j < iv_def_idx)
     {
-      if (irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == iv_vr)
+      if (tcc_ir_op_src1_vreg(ir, uq) == iv_vr)
         continue;
     }
 
     if (uq->op == TCCIR_OP_CMP)
     {
-      IROperand cs1 = tcc_ir_op_get_src1(ir, uq);
-      IROperand cs2 = tcc_ir_op_get_src2(ir, uq);
-      if (irop_get_vreg(cs1) == iv_vr && irop_is_immediate(cs2) && cmp_count < 2)
+      int32_t cs1_vr = tcc_ir_op_src1_vreg(ir, uq);
+      if (cs1_vr == iv_vr && tcc_ir_op_src2_is_imm(ir, uq) && cmp_count < 2)
       {
         cmp_count++;
         continue;
       }
     }
 
-    if (irop_config[uq->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == iv_vr)
+    if (irop_config[uq->op].has_src1 && tcc_ir_op_src1_vreg(ir, uq) == iv_vr)
       safe = 0;
-    if (safe && irop_config[uq->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == iv_vr)
+    if (safe && irop_config[uq->op].has_src2 && tcc_ir_op_src2_vreg(ir, uq) == iv_vr)
       safe = 0;
   }
   return safe && cmp_count > 0;
@@ -356,7 +385,7 @@ static int iv_ctr_eliminable_list(TCCIRState *ir, IRLoop *loop, int32_t iv_vr, i
 
 static int iv_ctr_eliminable(TCCIRState *ir, int32_t iv_vr, int iv_def_idx, int allow_a, int allow_b)
 {
-  int allow[2];
+  int allow[2] = {0, 0};
   int n = 0;
   if (allow_a >= 0)
     allow[n++] = allow_a;
@@ -365,29 +394,92 @@ static int iv_ctr_eliminable(TCCIRState *ir, int32_t iv_vr, int iv_def_idx, int 
   return iv_ctr_eliminable_list(ir, NULL, iv_vr, iv_def_idx, allow, n);
 }
 
+/* Lookups find_derived_ivs makes per candidate, each a scan of the loop or
+ * the function; built once per call, on first use.  find_derived_ivs only
+ * reads the IR, so they stay valid for the whole call. */
+typedef struct IVScan
+{
+  int built_deref;
+  int deref_all_canon;    /* every dereferenced vreg is canonically encoded */
+  int deref_max_pos;
+  uint8_t *deref;         /* [type * (deref_max_pos + 1) + position] */
+  int built_shl;
+  int shl_max_pos;
+  int *shl_pos;           /* per TEMP position: first body position of a SHL/MUL defining it */
+  int *body_max;          /* per body position: the largest instruction index up to it */
+} IVScan;
+
+static int iv_vreg_canon(int32_t vr)
+{
+  return vr >= 0 && vr == TCCIR_ENCODE_VREG(TCCIR_DECODE_VREG_TYPE(vr), TCCIR_DECODE_VREG_POSITION(vr));
+}
+
+static void iv_scan_free(IVScan *sc)
+{
+  tcc_free(sc->deref);
+  tcc_free(sc->shl_pos);
+  tcc_free(sc->body_max);
+}
+
+/* The vreg a LOAD reads through or a STORE writes through at instruction j,
+ * or -1. */
+static int32_t iv_deref_vreg_at(TCCIRState *ir, IRQuadCompact *uq)
+{
+  if (uq->op == TCCIR_OP_LOAD || uq->op == TCCIR_OP_LOAD_INDEXED)
+  {
+    if (tcc_ir_op_src1_is_lval(ir, uq))
+      return tcc_ir_op_src1_vreg(ir, uq);
+  }
+  else if (uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED)
+  {
+    if (tcc_ir_op_dest_is_lval(ir, uq))
+      return tcc_ir_op_dest_vreg(ir, uq);
+  }
+  return -1;
+}
+
 /* Does this derived address value reach a real memory access (rather than
  * being consumed by an indexed op's addressing mode)?  Those are the DIVs the
  * escape scan in transform_derived_iv used to refuse outright. */
-static int iv_div_addr_is_dereffed(TCCIRState *ir, int32_t dest_vr)
+static int iv_div_addr_is_dereffed(TCCIRState *ir, IVScan *sc, int32_t dest_vr)
 {
   if (dest_vr < 0)
     return 0;
-  for (int j = 0; j < ir->next_instruction_index; j++)
+  if (!sc->built_deref)
   {
-    IRQuadCompact *uq = &ir->compact_instructions[j];
-    if (uq->op == TCCIR_OP_LOAD || uq->op == TCCIR_OP_LOAD_INDEXED)
+    sc->built_deref = 1;
+    sc->deref_all_canon = 1;
+    sc->deref_max_pos = -1;
+    for (int j = 0; j < ir->next_instruction_index; j++)
     {
-      IROperand s1 = tcc_ir_op_get_src1(ir, uq);
-      if (s1.is_lval && irop_get_vreg(s1) == dest_vr)
-        return 1;
+      int32_t vr = iv_deref_vreg_at(ir, &ir->compact_instructions[j]);
+      if (vr < 0)
+        continue;
+      if (!iv_vreg_canon(vr))
+        sc->deref_all_canon = 0;
+      else if (TCCIR_DECODE_VREG_POSITION(vr) > sc->deref_max_pos)
+        sc->deref_max_pos = TCCIR_DECODE_VREG_POSITION(vr);
     }
-    if (uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED)
+    if (sc->deref_all_canon && sc->deref_max_pos >= 0)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, uq);
-      if (d.is_lval && irop_get_vreg(d) == dest_vr)
-        return 1;
+      int stride = sc->deref_max_pos + 1;
+      sc->deref = tcc_mallocz((size_t)8 * stride);
+      for (int j = 0; j < ir->next_instruction_index; j++)
+      {
+        int32_t vr = iv_deref_vreg_at(ir, &ir->compact_instructions[j]);
+        if (vr >= 0)
+          sc->deref[TCCIR_DECODE_VREG_TYPE(vr) * stride + TCCIR_DECODE_VREG_POSITION(vr)] = 1;
+      }
     }
   }
+  if (sc->deref_all_canon && iv_vreg_canon(dest_vr))
+  {
+    int p = TCCIR_DECODE_VREG_POSITION(dest_vr);
+    return p <= sc->deref_max_pos && sc->deref[TCCIR_DECODE_VREG_TYPE(dest_vr) * (sc->deref_max_pos + 1) + p];
+  }
+  for (int j = 0; j < ir->next_instruction_index; j++)
+    if (iv_deref_vreg_at(ir, &ir->compact_instructions[j]) == dest_vr)
+      return 1;
   return 0;
 }
 
@@ -431,8 +523,8 @@ static int iv_scaled_deref_postinc_viable(TCCIRState *ir, IRLoop *loop, int32_t 
     /* Address-slot use: src1 of a LOAD, dest of a STORE. */
     if (is_load || is_store)
     {
-      IROperand addr = is_load ? tcc_ir_op_get_src1(ir, uq) : tcc_ir_op_get_dest(ir, uq);
-      IROperand val = is_load ? tcc_ir_op_get_dest(ir, uq) : tcc_ir_op_get_src1(ir, uq);
+      IROperand addr = tcc_ir_op_get_dest_or_src1(ir, uq, is_load);
+      IROperand val = tcc_ir_op_get_dest_or_src1(ir, uq, !is_load);
       if (addr.is_lval && irop_get_vreg(addr) == dest_vr)
       {
         if (val.is_lval || irop_get_vreg(val) < 0)
@@ -453,19 +545,19 @@ static int iv_scaled_deref_postinc_viable(TCCIRState *ir, IRLoop *loop, int32_t 
 
     /* Any other read of the address value disqualifies: it escapes the
      * addressing role (stored, compared, passed, used to index...). */
-    if (irop_config[uq->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == dest_vr)
+    if (irop_config[uq->op].has_src1 && tcc_ir_op_src1_vreg(ir, uq) == dest_vr)
       return 0;
-    if (irop_config[uq->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == dest_vr)
+    if (irop_config[uq->op].has_src2 && tcc_ir_op_src2_vreg(ir, uq) == dest_vr)
       return 0;
     if ((uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED ||
          uq->op == TCCIR_OP_STORE_POSTINC || uq->op == TCCIR_OP_FUNCPARAMVAL) &&
         irop_config[uq->op].has_dest)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, uq);
-      if (irop_get_vreg(d) == dest_vr)
+      int32_t d_vr = tcc_ir_op_dest_vreg(ir, uq);
+      if (d_vr == dest_vr)
         return 0;
     }
-    if (uq->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, uq)) == dest_vr)
+    if (uq->op == TCCIR_OP_MLA && tcc_ir_op_accum_vreg(ir, uq) == dest_vr)
       return 0;
   }
   if (!in_loop_access)
@@ -482,9 +574,113 @@ static int iv_scaled_deref_postinc_viable(TCCIRState *ir, IRLoop *loop, int32_t 
   }
 }
 
+static int iv_find_by_vreg(const InductionVar *ivs, int num_ivs, int32_t vr)
+{
+  for (int k = 0; k < num_ivs; k++)
+    if (ivs[k].vreg == vr)
+      return k;
+  return -1;
+}
+
+/* Index of the IV named by iv_vr, or by the source of the ASSIGN/STORE defining it before idx. */
+static int iv_find_through_copy(TCCIRState *ir, const InductionVar *ivs, int num_ivs, int32_t iv_vr, int idx)
+{
+  int iv_idx = iv_find_by_vreg(ivs, num_ivs, iv_vr);
+  if (iv_idx >= 0 || iv_vr < 0)
+    return iv_idx;
+  int def = tcc_ir_find_defining_instruction(ir, iv_vr, idx);
+  if (def < 0)
+    return -1;
+  IRQuadCompact *dq = &ir->compact_instructions[def];
+  if (dq->op != TCCIR_OP_ASSIGN && dq->op != TCCIR_OP_STORE)
+    return -1;
+  return iv_find_by_vreg(ivs, num_ivs, tcc_ir_op_src1_vreg(ir, dq));
+}
+
+/* Source reads of vr outside instruction skip; with_store_dest also counts a store's dest. */
+static int iv_vreg_use_count(TCCIRState *ir, int32_t vr, int skip, int with_store_dest)
+{
+  int uses = 0;
+  for (int j = 0; j < ir->next_instruction_index; j++)
+  {
+    if (j == skip)
+      continue;
+    IRQuadCompact *uq = &ir->compact_instructions[j];
+    if (tcc_ir_op_src1_vreg(ir, uq) == vr)
+      uses++;
+    if (tcc_ir_op_src2_vreg(ir, uq) == vr)
+      uses++;
+    if (with_store_dest &&
+        (uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED || uq->op == TCCIR_OP_STORE_POSTINC) &&
+        tcc_ir_op_dest_vreg(ir, uq) == vr)
+      uses++;
+  }
+  return uses;
+}
+
+/* In-loop SHL/MUL before index i that defines TEMP operand t, else -1: the
+ * first such body instruction, provided no body instruction up to it is at or
+ * past i. */
+static int iv_find_shl_mul_def(TCCIRState *ir, IVScan *sc, IRLoop *loop, int i, IROperand t)
+{
+  int vr = irop_get_vreg(t);
+  if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+    return -1;
+  if (!sc->built_shl)
+  {
+    sc->built_shl = 1;
+    sc->shl_max_pos = -1;
+    sc->body_max = tcc_malloc(((size_t)loop->num_body_instrs + 1) * sizeof(int));
+    for (int j = 0, m = -1; j < loop->num_body_instrs; j++)
+    {
+      if (loop->body_instrs[j] > m)
+        m = loop->body_instrs[j];
+      sc->body_max[j] = m;
+      IRQuadCompact *sq = &ir->compact_instructions[loop->body_instrs[j]];
+      if (sq->op != TCCIR_OP_SHL && sq->op != TCCIR_OP_MUL)
+        continue;
+      int32_t dv = tcc_ir_op_dest_vreg(ir, sq);
+      if (iv_vreg_canon(dv) && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP &&
+          TCCIR_DECODE_VREG_POSITION(dv) > sc->shl_max_pos)
+        sc->shl_max_pos = TCCIR_DECODE_VREG_POSITION(dv);
+    }
+    sc->shl_pos = tcc_malloc(((size_t)sc->shl_max_pos + 2) * sizeof(int));
+    for (int p = 0; p <= sc->shl_max_pos; p++)
+      sc->shl_pos[p] = -1;
+    for (int j = 0; j < loop->num_body_instrs; j++)
+    {
+      IRQuadCompact *sq = &ir->compact_instructions[loop->body_instrs[j]];
+      if (sq->op != TCCIR_OP_SHL && sq->op != TCCIR_OP_MUL)
+        continue;
+      int32_t dv = tcc_ir_op_dest_vreg(ir, sq);
+      if (iv_vreg_canon(dv) && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP &&
+          sc->shl_pos[TCCIR_DECODE_VREG_POSITION(dv)] < 0)
+        sc->shl_pos[TCCIR_DECODE_VREG_POSITION(dv)] = j;
+    }
+  }
+  if (iv_vreg_canon(vr))
+  {
+    int p = TCCIR_DECODE_VREG_POSITION(vr);
+    int j = p <= sc->shl_max_pos ? sc->shl_pos[p] : -1;
+    return j >= 0 && sc->body_max[j] < i ? loop->body_instrs[j] : -1;
+  }
+  for (int j = 0; j < loop->num_body_instrs; j++)
+  {
+    int sj = loop->body_instrs[j];
+    if (sj >= i)
+      break;
+    IRQuadCompact *sq = &ir->compact_instructions[sj];
+    if ((sq->op == TCCIR_OP_SHL || sq->op == TCCIR_OP_MUL) &&
+        tcc_ir_op_dest_vreg(ir, sq) == vr)
+      return sj;
+  }
+  return -1;
+}
+
 int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_ivs, DerivedIV *divs, int max_divs)
 {
   int num_divs = 0;
+  IVScan sc = {0};
 
   /* MLA-only extended scan: include j>end_idx whose JMP/JUMPIF targets back into body (rotated loops); MLA-only avoids regressing the ADD-based scan */
   int mla_scan_start = loop->start_idx;
@@ -499,8 +695,8 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
         IRQuadCompact *jq = &ir->compact_instructions[j];
         if (jq->op != TCCIR_OP_JUMP && jq->op != TCCIR_OP_JUMPIF)
           continue;
-        IROperand jdest = tcc_ir_op_get_dest(ir, jq);
-        int jtarget = (int)irop_get_imm64_ex(ir, jdest);
+        int64_t jdest_imm = tcc_ir_op_dest_imm(ir, jq);
+        int jtarget = (int)jdest_imm;
         if (jtarget >= mla_scan_start && jtarget <= mla_scan_end)
         {
           mla_scan_end = j;
@@ -539,20 +735,15 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
   {
     int i = loop->body_instrs[bi];
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB)
+    if ((q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB) || tcc_ir_barrel_shift_at(ir, q))
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    int32_t dv = irop_get_vreg(d);
-    if (dv < 0 || d.is_lval || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
+    int32_t dv = tcc_ir_op_dest_vreg(ir, q);
+    if (dv < 0 || tcc_ir_op_dest_is_lval(ir, q) || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
       continue;
-    IROperand a = tcc_ir_op_get_src1(ir, q);
-    IROperand k = tcc_ir_op_get_src2(ir, q);
-    if (!irop_is_immediate(k) || irop_get_vreg(a) < 0)
+    int32_t a_vr = tcc_ir_op_src1_vreg(ir, q);
+    if (!tcc_ir_op_src2_is_imm(ir, q) || a_vr < 0)
       continue;
-    int iv_k = -1;
-    for (int v = 0; v < num_ivs && iv_k < 0; v++)
-      if (ivs[v].vreg == irop_get_vreg(a))
-        iv_k = v;
+    int iv_k = iv_find_by_vreg(ivs, num_ivs, a_vr);
     if (iv_k < 0)
       continue;
     if (!tcc_ir_vreg_has_single_use(ir, dv, -1))
@@ -562,7 +753,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     {
       IRQuadCompact *uq = &ir->compact_instructions[loop->body_instrs[bj]];
       if ((uq->op != TCCIR_OP_LOAD_INDEXED && uq->op != TCCIR_OP_STORE_INDEXED) ||
-          irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) != dv)
+          tcc_ir_op_src2_vreg(ir, uq) != dv)
         continue;
       IROperand sc = tcc_ir_op_get_scale(ir, uq);
       if (!irop_is_immediate(sc))
@@ -571,8 +762,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
       if (scale < 0 || scale > 3)
         break;
       affine_def[naffine] = i;
-      affine_base[naffine] = (uq->op == TCCIR_OP_LOAD_INDEXED) ? tcc_ir_op_get_src1(ir, uq)
-                                                                : tcc_ir_op_get_dest(ir, uq);
+      affine_base[naffine] = tcc_ir_op_get_dest_or_src1(ir, uq, uq->op == TCCIR_OP_LOAD_INDEXED);
       affine_stride[naffine] = ivs[iv_k].step * (1 << scale);
       naffine++;
       break;
@@ -591,7 +781,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     int i = loop->body_instrs[bi];
     IRQuadCompact *q = &ir->compact_instructions[i];
 
-    if (q->op != TCCIR_OP_ADD)
+    if (q->op != TCCIR_OP_ADD || tcc_ir_barrel_shift_at(ir, q))
       continue;
 
     IROperand dest = tcc_ir_op_get_dest(ir, q);
@@ -599,65 +789,20 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     IROperand src2 = tcc_ir_op_get_src2(ir, q);
 
     /* Pattern: T = base + T_mul_shl  OR  T = T_mul_shl + base */
-    int shl_vr = -1, base_vr = -1;
-    IROperand *base_op = NULL;
-    int shl_idx = -1;
-    int is_mul = 0;
-
-    /* Check src2 for SHL/MUL result */
-    int vr2 = irop_get_vreg(src2);
-    if (vr2 >= 0 && TCCIR_DECODE_VREG_TYPE(vr2) == TCCIR_VREG_TYPE_TEMP)
+    IROperand *base_op = &src1;
+    int shl_idx = iv_find_shl_mul_def(ir, &sc, loop, i, src2);
+    if (shl_idx < 0)
     {
-      /* Look for SHL/MUL defining this temp */
-      for (int j = 0; j < loop->num_body_instrs; j++)
-      {
-        int sj = loop->body_instrs[j];
-        if (sj >= i)
-          break; /* Must be before the ADD */
-        IRQuadCompact *sq = &ir->compact_instructions[sj];
-        if (sq->op == TCCIR_OP_SHL || sq->op == TCCIR_OP_MUL)
-        {
-          IROperand sdest = tcc_ir_op_get_dest(ir, sq);
-          if (irop_get_vreg(sdest) == vr2)
-          {
-            shl_vr = vr2;
-            shl_idx = sj;
-            base_op = &src1;
-            base_vr = irop_get_vreg(src1);
-            is_mul = (sq->op == TCCIR_OP_MUL);
-            break;
-          }
-        }
-      }
+      shl_idx = iv_find_shl_mul_def(ir, &sc, loop, i, src1);
+      base_op = &src2;
     }
-
-    /* Check src1 for SHL/MUL result if not found */
-    if (shl_vr < 0)
+    int shl_vr = -1, base_vr = -1, is_mul = 0;
+    if (shl_idx >= 0)
     {
-      int vr1 = irop_get_vreg(src1);
-      if (vr1 >= 0 && TCCIR_DECODE_VREG_TYPE(vr1) == TCCIR_VREG_TYPE_TEMP)
-      {
-        for (int j = 0; j < loop->num_body_instrs; j++)
-        {
-          int sj = loop->body_instrs[j];
-          if (sj >= i)
-            break;
-          IRQuadCompact *sq = &ir->compact_instructions[sj];
-          if (sq->op == TCCIR_OP_SHL || sq->op == TCCIR_OP_MUL)
-          {
-            IROperand sdest = tcc_ir_op_get_dest(ir, sq);
-            if (irop_get_vreg(sdest) == vr1)
-            {
-              shl_vr = vr1;
-              shl_idx = sj;
-              base_op = &src2;
-              base_vr = irop_get_vreg(src2);
-              is_mul = (sq->op == TCCIR_OP_MUL);
-              break;
-            }
-          }
-        }
-      }
+      IRQuadCompact *sq = &ir->compact_instructions[shl_idx];
+      shl_vr = tcc_ir_op_dest_vreg(ir, sq);
+      base_vr = irop_get_vreg(*base_op);
+      is_mul = (sq->op == TCCIR_OP_MUL);
     }
 
     if (shl_idx < 0)
@@ -692,38 +837,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
       }
     }
 
-    /* Find which IV this corresponds to */
-    int iv_idx = -1;
-    for (int k = 0; k < num_ivs; k++)
-    {
-      if (ivs[k].vreg == iv_vr)
-      {
-        iv_idx = k;
-        break;
-      }
-    }
-
-    /* Chase one level of copy: iv_vr defined by ASSIGN/STORE from a BIV */
-    if (iv_idx < 0 && iv_vr >= 0)
-    {
-      int def = tcc_ir_find_defining_instruction(ir, iv_vr, shl_idx);
-      if (def >= 0)
-      {
-        IRQuadCompact *dq = &ir->compact_instructions[def];
-        if (dq->op == TCCIR_OP_ASSIGN || dq->op == TCCIR_OP_STORE)
-        {
-          int copy_src = irop_get_vreg(tcc_ir_op_get_src1(ir, dq));
-          for (int k = 0; k < num_ivs; k++)
-          {
-            if (ivs[k].vreg == copy_src)
-            {
-              iv_idx = k;
-              break;
-            }
-          }
-        }
-      }
-    }
+    int iv_idx = iv_find_through_copy(ir, ivs, num_ivs, iv_vr, shl_idx);
 
     if (iv_idx < 0)
       continue; /* SHL/MUL operand is not an IV */
@@ -742,43 +856,13 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
 
     /* ADD result must be used (dead-code check); multiple uses are fine */
     int dest_vr = irop_get_vreg(dest);
-    int use_count = 0;
-    for (int j = 0; j < ir->next_instruction_index; j++)
-    {
-      if (j == i)
-        continue;
-      IRQuadCompact *uq = &ir->compact_instructions[j];
-      IROperand u1 = tcc_ir_op_get_src1(ir, uq);
-      IROperand u2 = tcc_ir_op_get_src2(ir, uq);
-      if (irop_get_vreg(u1) == dest_vr)
-        use_count++;
-      if (irop_get_vreg(u2) == dest_vr)
-        use_count++;
-      if (uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED || uq->op == TCCIR_OP_STORE_POSTINC)
-      {
-        IROperand ud = tcc_ir_op_get_dest(ir, uq);
-        if (irop_get_vreg(ud) == dest_vr)
-          use_count++;
-      }
-    }
+    int use_count = iv_vreg_use_count(ir, dest_vr, i, 1);
 
     if (use_count < 1)
       continue; /* Dead code — skip */
 
     /* SHL result must be used only by this ADD, else we can't NOP it */
-    int shl_vr_uses = 0;
-    for (int j = 0; j < ir->next_instruction_index; j++)
-    {
-      if (j == shl_idx)
-        continue;
-      IRQuadCompact *uq = &ir->compact_instructions[j];
-      IROperand u1 = tcc_ir_op_get_src1(ir, uq);
-      IROperand u2 = tcc_ir_op_get_src2(ir, uq);
-      if (irop_get_vreg(u1) == shl_vr)
-        shl_vr_uses++;
-      if (irop_get_vreg(u2) == shl_vr)
-        shl_vr_uses++;
-    }
+    int shl_vr_uses = iv_vreg_use_count(ir, shl_vr, shl_idx, 0);
 
     if (shl_vr_uses != 1)
     {
@@ -809,7 +893,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
      * there the address computation genuinely stays in the loop, because a
      * byte access off a stack base never gets folded. */
     int joins_group = 0;
-    if (iv_div_addr_is_dereffed(ir, dest_vr) &&
+    if (iv_div_addr_is_dereffed(ir, &sc, dest_vr) &&
         !iv_scaled_deref_postinc_viable(ir, loop, dest_vr, stride, &ivs[iv_idx], shl_idx, -1))
     {
       /* Not worth a walk on its own -- but as a member of an affine group on
@@ -832,7 +916,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
           group_allow[ngroup_allow++] = shl_idx;
       }
     }
-    if (iv_div_addr_is_dereffed(ir, dest_vr) && !joins_group &&
+    if (iv_div_addr_is_dereffed(ir, &sc, dest_vr) && !joins_group &&
         !iv_scaled_deref_postinc_viable(ir, loop, dest_vr, stride, &ivs[iv_idx], shl_idx, -1))
     {
       LOG_IV_SR("IV_SR: Skipping scaled deref DIV at idx=%d — address folds into the addressing mode anyway", i);
@@ -884,36 +968,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     if (iv_vr < 0)
       continue;
 
-    int iv_idx = -1;
-    for (int k = 0; k < num_ivs; k++)
-    {
-      if (ivs[k].vreg == iv_vr)
-      {
-        iv_idx = k;
-        break;
-      }
-    }
-    if (iv_idx < 0)
-    {
-      /* Chase one level of copy: T <-- VAR ASSIGN */
-      int def = tcc_ir_find_defining_instruction(ir, iv_vr, i);
-      if (def >= 0)
-      {
-        IRQuadCompact *dq = &ir->compact_instructions[def];
-        if (dq->op == TCCIR_OP_ASSIGN || dq->op == TCCIR_OP_STORE)
-        {
-          int copy_src = irop_get_vreg(tcc_ir_op_get_src1(ir, dq));
-          for (int k = 0; k < num_ivs; k++)
-          {
-            if (ivs[k].vreg == copy_src)
-            {
-              iv_idx = k;
-              break;
-            }
-          }
-        }
-      }
-    }
+    int iv_idx = iv_find_through_copy(ir, ivs, num_ivs, iv_vr, i);
     if (iv_idx < 0)
       continue;
 
@@ -929,8 +984,8 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
           continue;
         if (irop_config[lq->op].has_dest)
         {
-          IROperand ld = tcc_ir_op_get_dest(ir, lq);
-          if (irop_get_vreg(ld) == base_vr)
+          int32_t ld_vr = tcc_ir_op_dest_vreg(ir, lq);
+          if (ld_vr == base_vr)
           {
             redefined = 1;
             break;
@@ -946,25 +1001,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
 
     /* Dead-code check: must have at least one use of this MLA's dest. */
     int dest_vr = irop_get_vreg(dest);
-    int use_count = 0;
-    for (int j = 0; j < ir->next_instruction_index; j++)
-    {
-      if (j == i)
-        continue;
-      IRQuadCompact *uq = &ir->compact_instructions[j];
-      IROperand u1 = tcc_ir_op_get_src1(ir, uq);
-      IROperand u2 = tcc_ir_op_get_src2(ir, uq);
-      if (irop_get_vreg(u1) == dest_vr)
-        use_count++;
-      if (irop_get_vreg(u2) == dest_vr)
-        use_count++;
-      if (uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED || uq->op == TCCIR_OP_STORE_POSTINC)
-      {
-        IROperand ud = tcc_ir_op_get_dest(ir, uq);
-        if (irop_get_vreg(ud) == dest_vr)
-          use_count++;
-      }
-    }
+    int use_count = iv_vreg_use_count(ir, dest_vr, i, 1);
     if (use_count < 1)
       continue;
 
@@ -972,7 +1009,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
      * scaled by construction, so the deref would fold into the addressing
      * mode regardless — unless the walk ends post-indexed (the MLA itself is
      * the whitelisted IV use here; there is no separate SHL/MUL). */
-    if (iv_div_addr_is_dereffed(ir, dest_vr) &&
+    if (iv_div_addr_is_dereffed(ir, &sc, dest_vr) &&
         !iv_scaled_deref_postinc_viable(ir, loop, dest_vr, stride, &ivs[iv_idx], i, -1))
     {
       LOG_IV_SR("IV_SR: Skipping scaled deref MLA-DIV at idx=%d — folds into the addressing mode anyway", i);
@@ -1023,10 +1060,10 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     if (tcc_ir_barrel_shift_at(ir, q))
       continue;
 
-    IROperand base_op = is_load ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
-    IROperand index_op = tcc_ir_op_get_src2(ir, q);
+    IROperand base_op = tcc_ir_op_get_dest_or_src1(ir, q, is_load);
+    int32_t iv_vr = tcc_ir_op_src2_vreg(ir, q);
     IROperand scale_op = tcc_ir_op_get_scale(ir, q);
-    IROperand val_op = is_load ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+    IROperand val_op = tcc_ir_op_get_dest_or_src1(ir, q, !is_load);
 
     if (!irop_is_immediate(scale_op))
       continue;
@@ -1034,20 +1071,10 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
     /* Restrict to INT32: POSTINC fusion only handles INT32, else net regression */
     if (val_op.btype != IROP_BTYPE_INT32)
       continue;
-
-    int iv_vr = irop_get_vreg(index_op);
     if (iv_vr < 0)
       continue;
 
-    int iv_idx = -1;
-    for (int k = 0; k < num_ivs; k++)
-    {
-      if (ivs[k].vreg == iv_vr)
-      {
-        iv_idx = k;
-        break;
-      }
-    }
+    int iv_idx = iv_find_by_vreg(ivs, num_ivs, iv_vr);
 
     int aff_off_idx = -1;
     int aff_k = 0; /* index units; scaled into bytes once the scale is known */
@@ -1060,33 +1087,18 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
         IRQuadCompact *dq = &ir->compact_instructions[def];
         if (dq->op == TCCIR_OP_ASSIGN || dq->op == TCCIR_OP_STORE)
         {
-          int copy_src = irop_get_vreg(tcc_ir_op_get_src1(ir, dq));
-          for (int k = 0; k < num_ivs; k++)
-          {
-            if (ivs[k].vreg == copy_src)
-            {
-              iv_idx = k;
-              break;
-            }
-          }
+          iv_idx = iv_find_by_vreg(ivs, num_ivs, tcc_ir_op_src1_vreg(ir, dq));
         }
-        else if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB)
+        else if ((dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB) && !tcc_ir_barrel_shift_at(ir, dq))
         {
           int listed = 0;
           for (int a = 0; a < naffine && !listed; a++)
             listed = (affine_def[a] == def);
           if (listed)
           {
-            int32_t src = irop_get_vreg(tcc_ir_op_get_src1(ir, dq));
-            int64_t k = irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, dq));
-            for (int v = 0; v < num_ivs; v++)
-            {
-              if (ivs[v].vreg == src)
-              {
-                iv_idx = v;
-                break;
-              }
-            }
+            int32_t src = tcc_ir_op_src1_vreg(ir, dq);
+            int64_t k = tcc_ir_op_src2_imm(ir, dq);
+            iv_idx = iv_find_by_vreg(ivs, num_ivs, src);
             if (iv_idx >= 0 && k >= -1024 && k <= 1024)
             {
               aff_off_idx = def;
@@ -1116,8 +1128,8 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
           continue;
         if (irop_config[lq->op].has_dest)
         {
-          IROperand ld = tcc_ir_op_get_dest(ir, lq);
-          if (irop_get_vreg(ld) == base_vr)
+          int32_t ld_vr = tcc_ir_op_dest_vreg(ir, lq);
+          if (ld_vr == base_vr)
           {
             redefined = 1;
             break;
@@ -1188,14 +1200,13 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
   {
     int i = loop->body_instrs[bi];
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_ADD)
+    if (q->op != TCCIR_OP_ADD || tcc_ir_barrel_shift_at(ir, q))
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t dest_vr = irop_get_vreg(dest);
-    if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP || dest.is_lval)
+    int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
+    if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP || tcc_ir_op_dest_is_lval(ir, q))
       continue;
-    if (!iv_div_addr_is_dereffed(ir, dest_vr))
+    if (!iv_div_addr_is_dereffed(ir, &sc, dest_vr))
       continue;
 
     /* Skip an ADD an earlier pass already claimed. */
@@ -1255,7 +1266,7 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
         IRQuadCompact *lq = &ir->compact_instructions[j];
         if (lq->op == TCCIR_OP_NOP || j == i)
           continue;
-        if (irop_config[lq->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, lq)) == base_vr)
+        if (irop_config[lq->op].has_dest && tcc_ir_op_dest_vreg(ir, lq) == base_vr)
           redefined = 1;
       }
       if (redefined)
@@ -1285,5 +1296,6 @@ int find_derived_ivs(TCCIRState *ir, IRLoop *loop, InductionVar *ivs, int num_iv
               TCCIR_DECODE_VREG_POSITION(ivs[iv_idx].vreg), i);
   }
 
+  iv_scan_free(&sc);
   return num_divs;
 }

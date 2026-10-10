@@ -73,6 +73,212 @@ static const uint8_t *ir_opt_get_rodata_bytes(TCCIRState *ir, IROperand op, size
   return sec->data + offset;
 }
 
+
+/* ---- Address escape scan (Phase 1.5) ---------------------------------------
+ * Which vregs may hold the address of a frame object, and through which object.
+ * An address reaching a call, a store as the VALUE, a return, asm or any other
+ * use that is not a plain address derivation or a memory access through it
+ * escapes its whole object: the receiver can reach every byte of it. */
+enum { ESP_NONE = 0, ESP_ONE, ESP_MANY };
+typedef struct
+{
+  int64_t off; /* an offset inside the object (state ESP_ONE) */
+  uint8_t state;
+} EspAddr;
+
+typedef struct
+{
+  EspAddr *v[4]; /* indexed by TCCIR_VREG_TYPE */
+  int max[4];
+} EspAddrMap;
+
+static EspAddr *esp_slot(EspAddrMap *m, int32_t vr)
+{
+  if (vr < 0)
+    return NULL;
+  int t = TCCIR_DECODE_VREG_TYPE(vr), p = TCCIR_DECODE_VREG_POSITION(vr);
+  if (t < 1 || t > 3 || p > m->max[t])
+    return NULL;
+  return &m->v[t][p];
+}
+
+/* The vreg whose own value OP reads (not a dereference of it), or -1. */
+static int32_t esp_value_vreg(IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || op.is_sym)
+    return -1;
+  int tag = irop_get_tag(op);
+  if (tag == IROP_TAG_VREG)
+    return op.is_lval ? -1 : vr;
+  if (tag == IROP_TAG_STACKOFF) /* a VAR/PARAM named through its home; is_llocal derefs it */
+    return op.is_llocal ? -1 : vr;
+  return -1;
+}
+
+/* The address OP evaluates to, as far as frame objects go. */
+static EspAddr esp_operand_addr(EspAddrMap *m, IROperand op)
+{
+  EspAddr a = {0, ESP_NONE};
+  if (irop_get_tag(op) == IROP_TAG_STACKOFF && irop_get_vreg(op) < 0)
+  {
+    if (op.is_local && !op.is_lval && !op.is_llocal)
+    {
+      a.off = irop_get_stack_offset(op);
+      a.state = ESP_ONE;
+    }
+    return a;
+  }
+  EspAddr *s = esp_slot(m, esp_value_vreg(op));
+  if (s)
+    a = *s;
+  return a;
+}
+
+static int esp_merge(EspAddr *into, EspAddr a)
+{
+  if (a.state == ESP_NONE || into->state == ESP_MANY)
+    return 0;
+  if (into->state == ESP_NONE)
+  {
+    *into = a;
+    return 1;
+  }
+  if (a.state == ESP_MANY || a.off != into->off)
+  {
+    into->state = ESP_MANY;
+    return 1;
+  }
+  return 0;
+}
+
+/* An op whose vreg result is (an address derived from) its address operand. */
+static int esp_is_derivation(TccIrOp op)
+{
+  return op == TCCIR_OP_ASSIGN || op == TCCIR_OP_LEA || op == TCCIR_OP_ADD || op == TCCIR_OP_SUB ||
+         op == TCCIR_OP_SELECT || op == TCCIR_OP_LOAD || op == TCCIR_OP_STORE;
+}
+
+/* Calls fn(ctx, addr, i) for every escaping use of a frame address.  Returns 0
+ * when the vreg map could not be built (caller must assume everything escapes). */
+static int esp_for_each_escape(TCCIRState *ir, void (*fn)(void *, EspAddr, int), void *ctx)
+{
+  int n = ir->next_instruction_index;
+  EspAddrMap m;
+  memset(&m, 0, sizeof m);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    for (int k = 0; k < 3; k++)
+    {
+      int has = k == 0 ? irop_config[q->op].has_dest : k == 1 ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
+      if (!has)
+        continue;
+      IROperand o = tcc_ir_op_get_slot(ir, q, k);
+      int32_t vr = irop_get_vreg(o);
+      if (vr < 0)
+        continue;
+      int t = TCCIR_DECODE_VREG_TYPE(vr), p = TCCIR_DECODE_VREG_POSITION(vr);
+      if (t >= 1 && t <= 3 && p > m.max[t])
+        m.max[t] = p;
+    }
+  }
+  for (int t = 1; t <= 3; t++)
+    m.v[t] = tcc_mallocz(sizeof(EspAddr) * (m.max[t] + 1));
+
+  /* Propagate to a fixpoint: a VAR can be defined after a use (loops). The
+     lattice NONE < ONE < MANY bounds the rounds. */
+  int changed = 1, rounds = 0;
+  while (changed && rounds++ < 64)
+  {
+    changed = 0;
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (!esp_is_derivation(q->op) || !irop_config[q->op].has_dest)
+        continue;
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      if (!irop_dest_defines_vreg(d))
+        continue;
+      EspAddr *ds = esp_slot(&m, irop_get_vreg(d));
+      if (!ds)
+        continue;
+      if (irop_config[q->op].has_src1)
+        changed |= esp_merge(ds, esp_operand_addr(&m, tcc_ir_op_get_src1(ir, q)));
+      if (irop_config[q->op].has_src2)
+        changed |= esp_merge(ds, esp_operand_addr(&m, tcc_ir_op_get_src2(ir, q)));
+    }
+  }
+  int ok = !changed;
+
+  for (int i = 0; ok && i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    TccIrOp op = q->op;
+    if (op == TCCIR_OP_NOP)
+      continue;
+    int defines = irop_config[op].has_dest && irop_dest_defines_vreg(tcc_ir_op_get_dest(ir, q));
+    if (esp_is_derivation(op) && defines)
+      continue; /* the address moved into a tracked vreg; its uses are checked there */
+    /* Comparing an address leaks nothing. */
+    if (op == TCCIR_OP_CMP || op == TCCIR_OP_TEST_ZERO)
+      continue;
+    for (int k = 0; k < 3; k++)
+    {
+      int has = k == 0 ? irop_config[op].has_dest : k == 1 ? irop_config[op].has_src1 : irop_config[op].has_src2;
+      if (!has)
+        continue;
+      IROperand o = tcc_ir_op_get_slot(ir, q, k);
+      EspAddr a = esp_operand_addr(&m, o);
+      if (a.state == ESP_NONE)
+        continue;
+      /* The address used as the base of an access is not leaked by it. */
+      if ((k == 0 && (op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_STORE_POSTINC)) ||
+          (k == 1 && (op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_LOAD_POSTINC || op == TCCIR_OP_BLOCK_COPY ||
+                      op == TCCIR_OP_PREFETCH)))
+        continue;
+      /* A BLOCK_COPY destination is written whole: Phase 1.5 handles a direct
+         StackLoc one; one through a vreg falls through as an escape. */
+      if (k == 0 && op == TCCIR_OP_BLOCK_COPY && irop_get_vreg(o) < 0)
+        continue;
+      fn(ctx, a, i);
+    }
+  }
+
+  for (int t = 1; t <= 3; t++)
+    tcc_free(m.v[t]);
+  return ok;
+}
+
+typedef struct
+{
+  int64_t *off;
+  int count, cap;
+  int many; /* an address of an unknown object escaped */
+} EspEscapes;
+
+static void esp_collect(void *ctx, EspAddr a, int i)
+{
+  EspEscapes *e = ctx;
+  (void)i;
+  if (a.state == ESP_MANY)
+  {
+    e->many = 1;
+    return;
+  }
+  for (int k = 0; k < e->count; k++)
+    if (e->off[k] == a.off)
+      return;
+  if (e->count == e->cap)
+  {
+    e->cap = e->cap ? 2 * e->cap : 8;
+    e->off = tcc_realloc(e->off, sizeof(int64_t) * e->cap);
+  }
+  e->off[e->count++] = a.off;
+}
+
 /* Forward constant entry-block stores into deref/indexed loads; entry stores dominate all code. */
 int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
 {
@@ -135,15 +341,14 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     {
       IROperand bc_dest = tcc_ir_op_get_dest(ir, q);
       IROperand bc_src = tcc_ir_op_get_src1(ir, q);
-      IROperand bc_sz = tcc_ir_op_get_src2(ir, q);
 
       if (!bc_dest.is_local || irop_get_tag(bc_dest) != IROP_TAG_STACKOFF)
         continue;
-      if (!irop_is_immediate(bc_sz))
+      if (!tcc_ir_op_src2_is_imm(ir, q))
         continue;
 
       int64_t base_off = irop_get_stack_offset(bc_dest);
-      int total_size = (int)irop_get_imm64_ex(ir, bc_sz);
+      int total_size = (int)tcc_ir_op_src2_imm(ir, q);
       size_t avail = 0;
       const uint8_t *data = total_size > 0 ? ir_opt_get_rodata_bytes(ir, bc_src, &avail) : NULL;
 
@@ -289,17 +494,23 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       if (eq->op == TCCIR_OP_BLOCK_COPY)
       {
         IROperand bcd = tcc_ir_op_get_dest(ir, eq);
-        IROperand bcsz = tcc_ir_op_get_src2(ir, eq);
-        if (bcd.is_local && irop_get_tag(bcd) == IROP_TAG_STACKOFF && irop_is_immediate(bcsz))
+        if (bcd.is_local && irop_get_tag(bcd) == IROP_TAG_STACKOFF && tcc_ir_op_src2_is_imm(ir, eq))
         {
           int64_t bbase = irop_get_stack_offset(bcd);
-          int64_t bsz = irop_get_imm64_ex(ir, bcsz);
+          int64_t bsz = tcc_ir_op_src2_imm(ir, eq);
           for (int k = 0; k < estore_count; k++)
           {
             if (estores[k].offset >= bbase && estores[k].offset < bbase + bsz)
               estores[k].offset = 0x7FFFFFFFLL;
           }
         }
+        continue;
+      }
+      /* Inline asm ("=m" outputs, memory clobbers) and non-local control write unseen memory. */
+      if (ir_op_has(eq->op, IR_HZ_ASM | IR_HZ_NONLOCAL | IR_HZ_VLA))
+      {
+        for (int k = 0; k < estore_count; k++)
+          estores[k].offset = 0x7FFFFFFFLL;
         continue;
       }
       if (eq->op != TCCIR_OP_STORE && eq->op != TCCIR_OP_STORE_INDEXED && eq->op != TCCIR_OP_STORE_POSTINC)
@@ -320,11 +531,10 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         /* disp_fusion lowers `st.field = x` to a STORE_INDEXED over a non-lval stack base; still invalidates the slot. */
         if (sd.is_local && !sd.is_lval && !sd.is_llocal && irop_get_tag(sd) == IROP_TAG_STACKOFF)
         {
-          IROperand idx = tcc_ir_op_get_src2(ir, eq);
           IROperand scale_op = tcc_ir_op_get_scale(ir, eq);
-          if (irop_is_immediate(idx) && !idx.is_sym && irop_is_immediate(scale_op))
+          if (tcc_ir_op_src2_is_imm(ir, eq) && !tcc_ir_op_src2_is_sym(ir, eq) && irop_is_immediate(scale_op))
           {
-            soff = irop_get_stack_offset(sd) + (irop_get_imm64_ex(ir, idx) << irop_get_imm64_ex(ir, scale_op));
+            soff = irop_get_stack_offset(sd) + (tcc_ir_op_src2_imm(ir, eq) << irop_get_imm64_ex(ir, scale_op));
             have_soff = 1;
           }
         }
@@ -362,7 +572,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
           continue;
         if (si == 1 && !irop_config[eq->op].has_src2)
           continue;
-        IROperand op = (si == 0) ? tcc_ir_op_get_src1(ir, eq) : tcc_ir_op_get_src2(ir, eq);
+        IROperand op = tcc_ir_op_get_src1_or_2(ir, eq, si != 0);
         if (!op.is_local || op.is_lval || irop_get_tag(op) != IROP_TAG_STACKOFF)
           continue;
         int64_t aoff = irop_get_stack_offset(op);
@@ -376,85 +586,36 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         }
       }
     }
-    /* A stack addr passed to a call escapes the whole object; invalidate its entry stores within the object extent. */
-    for (int j = 0; j < n; j++)
+    /* A stack address that escapes (passed to a call, stored as a value, ...) --
+       directly or through any VAR/TEMP copy chain -- escapes its whole object:
+       invalidate every entry store inside it. */
     {
-      IRQuadCompact *eq = &ir->compact_instructions[j];
-      if (eq->op != TCCIR_OP_FUNCPARAMVAL && eq->op != TCCIR_OP_FUNCPARAMVOID)
-        continue;
-      IROperand arg = tcc_ir_op_get_src1(ir, eq);
-      int64_t esc_off;
-      int have = 0;
-      if (arg.is_local && !arg.is_lval && irop_get_tag(arg) == IROP_TAG_STACKOFF)
+      EspEscapes esc = {0};
+      int all = !esp_for_each_escape(ir, esp_collect, &esc) || esc.many;
+      for (int e = 0; !all && e < esc.count; e++)
       {
-        esc_off = irop_get_stack_offset(arg);
-        have = 1;
-      }
-      else if (irop_get_tag(arg) == IROP_TAG_VREG && irop_get_vreg(arg) >= 0)
-      {
-        int di = tcc_ir_find_defining_instruction(ir, irop_get_vreg(arg), j);
-        if (di >= 0)
+        int lo, hi;
+        if (!tcc_ir_frame_object_at(ir, (int)esc.off[e], &lo, &hi))
         {
-          IRQuadCompact *dq = &ir->compact_instructions[di];
-          if (dq->op == TCCIR_OP_ASSIGN || dq->op == TCCIR_OP_LEA)
+          all = 1; /* extent unknown */
+          break;
+        }
+        for (int k = 0; k < estore_count; k++)
+        {
+          if (estores[k].offset != 0x7FFFFFFFLL && estores[k].offset >= lo && estores[k].offset < hi)
           {
-            IROperand ds = tcc_ir_op_get_src1(ir, dq);
-            if (ds.is_local && !ds.is_lval && irop_get_tag(ds) == IROP_TAG_STACKOFF)
-            {
-              esc_off = irop_get_stack_offset(ds);
-              have = 1;
-            }
+            LOG_IR_GEN("ENTRY_STORE_PROP: invalidated off=%lld (object [%d,%d) escapes)",
+                       (long long)estores[k].offset, lo, hi);
+            estores[k].offset = 0x7FFFFFFFLL;
           }
         }
       }
-      if (!have)
-        continue;
-      /* Bound invalidation to the escaped object's extent [esc_off, obj_end): a BLOCK_COPY range, else the contiguous run of entry stores.
-         Do NOT consult ir->stack_layout here: it is built during register allocation,
-         long after this pass, so any slot it reports is stale/absent and shrinking
-         obj_end to it silently under-invalidates an escaped array (guard test 110). */
-      int64_t obj_end = esc_off;
-      for (int r = 0; r < bc_range_count; r++)
+      if (all && esc.count + esc.many > 0)
       {
-        if (esc_off >= bc_ranges[r].base && esc_off < bc_ranges[r].base + bc_ranges[r].size)
-        {
-          int64_t e = bc_ranges[r].base + bc_ranges[r].size;
-          if (e > obj_end)
-            obj_end = e;
-        }
-      }
-      if (obj_end == esc_off)
-      {
-        int grew = 1;
-        while (grew)
-        {
-          grew = 0;
-          for (int k = 0; k < estore_count; k++)
-          {
-            if (estores[k].offset == 0x7FFFFFFFLL)
-              continue;
-            if (estores[k].offset >= esc_off && estores[k].offset <= obj_end + 64)
-            {
-              int64_t e = estores[k].offset + 8;
-              if (e > obj_end)
-              {
-                obj_end = e;
-                grew = 1;
-              }
-            }
-          }
-        }
-      }
-      for (int k = 0; k < estore_count; k++)
-      {
-        if (estores[k].offset != 0x7FFFFFFFLL && estores[k].offset >= esc_off &&
-            estores[k].offset < obj_end)
-        {
-          LOG_IR_GEN("ENTRY_STORE_PROP: invalidated off=%lld (call-arg escape [%lld,%lld) at i=%d)",
-                     (long long)estores[k].offset, (long long)esc_off, (long long)obj_end, j);
+        for (int k = 0; k < estore_count; k++)
           estores[k].offset = 0x7FFFFFFFLL;
-        }
       }
+      tcc_free(esc.off);
     }
 
     ESTORE_COMPACT();
@@ -470,8 +631,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (irop_config[q->op].has_dest)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t vr = irop_get_vreg(d);
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
       if (vr >= 0)
       {
         int p = TCCIR_DECODE_VREG_POSITION(vr);
@@ -579,10 +739,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     /* STORE/ASSIGN: VAR <-- LEA_temp → propagate into var_lea_map */
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_ASSIGN)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      int32_t d_vr = irop_get_vreg(dest);
-      int32_t s1_vr = irop_get_vreg(s1);
+      int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
+      int32_t s1_vr = tcc_ir_op_src1_vreg(ir, q);
       if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR && s1_vr >= 0 &&
           TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_TEMP)
       {
@@ -604,9 +762,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
     /* ASSIGN: TEMP <-- VAR → propagate from var_lea_map */
     if (q->op == TCCIR_OP_ASSIGN)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      int32_t d_vr = irop_get_vreg(dest);
+      int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
       int32_t s1_vr = irop_get_vreg(s1);
       if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP && s1_vr >= 0 &&
           TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_VAR)
@@ -653,15 +810,14 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         if (dp <= max_tmp)
         {
           IROperand s1 = tcc_ir_op_get_src1(ir, q);
-          IROperand s2 = tcc_ir_op_get_src2(ir, q);
           int32_t s1_vr = irop_get_vreg(s1);
-          if (s1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_TEMP && irop_is_immediate(s2) &&
-              !s2.is_sym)
+          if (s1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_TEMP && tcc_ir_op_src2_is_imm(ir, q) &&
+              !tcc_ir_op_src2_is_sym(ir, q))
           {
             int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
             if (sp <= max_tmp && lea_map[sp].valid)
             {
-              LEA_SET(lea_map, tmp_defs, dp, lea_map[sp].offset + irop_get_imm64_ex(ir, s2), lea_map[sp].maybe);
+              LEA_SET(lea_map, tmp_defs, dp, lea_map[sp].offset + tcc_ir_op_src2_imm(ir, q), lea_map[sp].maybe);
             }
             else if (sp <= max_tmp && rt_valid[sp])
             {
@@ -671,13 +827,13 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
             }
           }
           else if (s1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_VAR &&
-                   irop_is_immediate(s2) && !s2.is_sym)
+                   tcc_ir_op_src2_is_imm(ir, q) && !tcc_ir_op_src2_is_sym(ir, q))
           {
             /* Same, one indirection out: the base pointer lives in a VAR alias. */
             int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
             if (sp <= max_var && var_lea_map[sp].valid)
             {
-              LEA_SET(lea_map, tmp_defs, dp, var_lea_map[sp].offset + irop_get_imm64_ex(ir, s2), var_lea_map[sp].maybe);
+              LEA_SET(lea_map, tmp_defs, dp, var_lea_map[sp].offset + tcc_ir_op_src2_imm(ir, q), var_lea_map[sp].maybe);
             }
             else if (sp <= max_var && var_rt_valid[sp])
             {
@@ -685,12 +841,12 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
               rt_valid[dp] = 1;
             }
           }
-          else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF && irop_is_immediate(s2) &&
-                   !s2.is_sym)
+          else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF && tcc_ir_op_src2_is_imm(ir, q) &&
+                   !tcc_ir_op_src2_is_sym(ir, q))
           {
-            LEA_SET(lea_map, tmp_defs, dp, irop_get_stack_offset(s1) + irop_get_imm64_ex(ir, s2), 0);
+            LEA_SET(lea_map, tmp_defs, dp, irop_get_stack_offset(s1) + tcc_ir_op_src2_imm(ir, q), 0);
           }
-          else if (!irop_is_immediate(s2))
+          else if (!tcc_ir_op_src2_is_imm(ir, q))
           {
             /* base + RUNTIME index → record the array base (separate map). */
             int64_t base;
@@ -723,15 +879,14 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         if (dp <= max_var)
         {
           IROperand s1 = tcc_ir_op_get_src1(ir, q);
-          IROperand s2 = tcc_ir_op_get_src2(ir, q);
           int32_t s1_vr = irop_get_vreg(s1);
           if (s1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1_vr) == TCCIR_VREG_TYPE_TEMP &&
-              irop_is_immediate(s2) && !s2.is_sym)
+              tcc_ir_op_src2_is_imm(ir, q) && !tcc_ir_op_src2_is_sym(ir, q))
           {
             int sp = TCCIR_DECODE_VREG_POSITION(s1_vr);
             if (sp <= max_tmp && lea_map[sp].valid)
             {
-              LEA_SET(var_lea_map, var_defs, dp, lea_map[sp].offset + irop_get_imm64_ex(ir, s2), lea_map[sp].maybe);
+              LEA_SET(var_lea_map, var_defs, dp, lea_map[sp].offset + tcc_ir_op_src2_imm(ir, q), lea_map[sp].maybe);
             }
             else if (sp <= max_tmp && rt_valid[sp])
             {
@@ -741,12 +896,12 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
             }
           }
           else if (s1.is_local && !s1.is_lval && irop_get_tag(s1) == IROP_TAG_STACKOFF &&
-                   irop_is_immediate(s2) && !s2.is_sym)
+                   tcc_ir_op_src2_is_imm(ir, q) && !tcc_ir_op_src2_is_sym(ir, q))
           {
-            LEA_SET(var_lea_map, var_defs, dp, irop_get_stack_offset(s1) + irop_get_imm64_ex(ir, s2), 0);
+            LEA_SET(var_lea_map, var_defs, dp, irop_get_stack_offset(s1) + tcc_ir_op_src2_imm(ir, q), 0);
           }
           /* `V = base + RUNTIME index` into a VAR: record the array base for runtime-store invalidation. */
-          else if (!irop_is_immediate(s2))
+          else if (!tcc_ir_op_src2_is_imm(ir, q))
           {
             int64_t base;
             int have = 0;
@@ -779,12 +934,11 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       if (eq->op == TCCIR_OP_STORE_INDEXED && sd.is_local && !sd.is_lval && !sd.is_llocal &&
           irop_get_tag(sd) == IROP_TAG_STACKOFF)
       {
-        IROperand s2 = tcc_ir_op_get_src2(ir, eq);
-        if (!irop_is_immediate(s2) || s2.is_sym)
+        if (!tcc_ir_op_src2_is_imm(ir, eq) || tcc_ir_op_src2_is_sym(ir, eq))
           continue;
         IROperand scale_op = ir->iroperand_pool[eq->operand_base + 3];
         int scale = (int)irop_get_imm64_ex(ir, scale_op);
-        int64_t soff = irop_get_stack_offset(sd) + (irop_get_imm64_ex(ir, s2) << scale);
+        int64_t soff = irop_get_stack_offset(sd) + (tcc_ir_op_src2_imm(ir, eq) << scale);
         for (int k = 0; k < estore_count; k++)
         {
           if (j > estores[k].idx && estores[k].offset == soff)
@@ -823,12 +977,11 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         continue;
       if (eq->op == TCCIR_OP_STORE_INDEXED)
       {
-        IROperand s2 = tcc_ir_op_get_src2(ir, eq);
-        if (!irop_is_immediate(s2))
+        if (!tcc_ir_op_src2_is_imm(ir, eq))
           continue;
         IROperand scale_op = ir->iroperand_pool[eq->operand_base + 3];
         int scale = (int)irop_get_imm64_ex(ir, scale_op);
-        soff += (irop_get_imm64_ex(ir, s2) << scale);
+        soff += (tcc_ir_op_src2_imm(ir, eq) << scale);
       }
       for (int k = 0; k < estore_count; k++)
       {
@@ -951,8 +1104,7 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       if (eq->op == TCCIR_OP_STORE_INDEXED)
       {
         /* Runtime address when the index is runtime OR the base is a runtime array pointer; skip only the fully-constant case (Phase 2.5 handles it). */
-        IROperand s2 = tcc_ir_op_get_src2(ir, eq);
-        int imm_index = irop_is_immediate(s2) && !s2.is_sym;
+        int imm_index = tcc_ir_op_src2_is_imm(ir, eq) && !tcc_ir_op_src2_is_sym(ir, eq);
         if (sd.is_local && irop_get_tag(sd) == IROP_TAG_STACKOFF)
         {
           if (imm_index)
@@ -1016,9 +1168,12 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       if (si == 1 && !irop_config[q->op].has_src2)
         continue;
 
-      IROperand src = (si == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand src = tcc_ir_op_get_src1_or_2(ir, q, si != 0);
 
       if (!src.is_lval)
+        continue;
+      /* A volatile read returns what the object holds, not what was stored. */
+      if (tcc_ir_access_is_volatile(ir, src))
         continue;
 
       /* Resolve the address through LEA map */
@@ -1076,6 +1231,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       continue;
     if (!irop_is_immediate(li_src2) || li_src2.is_sym)
       continue;
+    if (tcc_ir_access_is_volatile(ir, li_src1))
+      continue; /* a volatile read is never forwarded (the base carries the mark) */
 
     int bp = TCCIR_DECODE_VREG_POSITION(base_vr);
     if (bp > max_tmp || !lea_map[bp].valid)
@@ -1118,12 +1275,11 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
         int pool_off = q->operand_base + irop_config[TCCIR_OP_ASSIGN].has_dest;
         ir->iroperand_pool[pool_off] = estores[k].value;
       }
-      tcc_ir_set_src2(ir, i, IROP_NONE);
+      tcc_ir_set_src2_none(ir, i);
 
       if (estores[k].value.is_local && !estores[k].value.is_lval && irop_get_tag(estores[k].value) == IROP_TAG_STACKOFF)
       {
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        int32_t d_vr = irop_get_vreg(dest);
+        int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
         if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP)
         {
           int dp = TCCIR_DECODE_VREG_POSITION(d_vr);
@@ -1165,6 +1321,8 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
       continue;
     if (irop_get_vreg(src1) >= 0)
       continue; /* VAR/TEMP-backed: its stack offset does not identify the slot */
+    if (tcc_ir_access_is_volatile(ir, src1))
+      continue; /* `volatile char b[4]`: the slot's reads all stay */
 
     int read_btype = irop_get_btype(src1);
     if (read_btype == IROP_BTYPE_STRUCT || read_btype == IROP_BTYPE_FUNC)
@@ -1212,34 +1370,22 @@ int tcc_ir_opt_entry_store_prop(TCCIRState *ir)
 
   return changes;
 }
-int tcc_ir_opt_entry_store_prop_ex(IROptCtx *ctx) { return tcc_ir_opt_entry_store_prop(ctx->ir); }
 
-/* A by-value struct parameter lives in a frame home the entry block fills a
- * word at a time, `StackLoc[h] <-- Pn [STORE]`, and field reads load it.  SRA
- * splits the copies Zig makes of it (`t0 = a0; t1 = &t0`) but not the home,
- * which is no frame object, and the reads lea folding turned into direct slot
- * loads -- `a0.len` as `StackLoc[h+4] [LOAD]`, `a0.ptr[i]` as `StackLoc[h] ADD
- * i` -- reloaded it on every loop turn (Zig's StaticStringMap.defaultEql kept
- * both slices in memory with three free registers).  When nothing but the entry
- * store writes a home word and no address inside the homes is taken, every
- * word read of it is Pn.  The store stays; with no reads left DSE drops it. */
+// Immutable, unescaped parameter homes can use their incoming word values.
 #define PHF_MAX 32
 int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
 {
   const int n = ir->next_instruction_index;
   if (n == 0 || ir->inline_asm_count || ir->func_has_label_addr || tcc_ir_calls_returns_twice(ir))
     return 0;
-  /* Leaf functions only.  Across a call the parameter needs a callee-saved
-   * register or a slot of its own, and the home was that slot already:
-   * forwarded, Wyhash.hash spent a callee-saved register on its key slice
-   * through the u128 loop and ran 2% slower. */
+  int has_call = 0;
   for (int i = 0; i < n; i++)
     if (ir->compact_instructions[i].op == TCCIR_OP_FUNCCALLVOID || ir->compact_instructions[i].op == TCCIR_OP_FUNCCALLVAL)
-      return 0;
+      has_call = 1;
 
   struct PhfHome
   {
-    int off, idx, bad;
+    int off, idx, bad, keep;
     IROperand p;
   } h[PHF_MAX];
   int nh = 0;
@@ -1255,12 +1401,12 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
       continue;
     IROperand d = tcc_ir_op_get_dest(ir, q), s = tcc_ir_op_get_src1(ir, q);
     if (irop_get_tag(d) != IROP_TAG_STACKOFF || !d.is_local || !d.is_lval || d.is_llocal ||
-        irop_get_vreg(d) >= 0 || irop_get_btype(d) != IROP_BTYPE_INT32 || irop_is_64bit(d) ||
+        irop_get_vreg(d) >= 0 || irop_get_btype(d) != IROP_BTYPE_INT32 || irop_is_64bit(d) || d.is_complex ||
         tcc_ir_access_is_volatile(ir, d))
       continue;
     int32_t pv = irop_get_vreg(s);
     if (pv < 0 || TCCIR_DECODE_VREG_TYPE(pv) != TCCIR_VREG_TYPE_PARAM || s.is_lval || s.is_local || s.is_llocal ||
-        irop_get_btype(s) != IROP_BTYPE_INT32 || irop_is_64bit(s))
+        irop_get_btype(s) != IROP_BTYPE_INT32 || irop_is_64bit(s) || s.is_complex)
       continue;
     const int off = irop_get_stack_offset(d);
     if (off & 3)
@@ -1302,7 +1448,7 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
       if (s == 0) { if (!irop_config[q->op].has_dest) continue; op = tcc_ir_op_get_dest(ir, q); }
       else if (s == 1) { if (!irop_config[q->op].has_src1) continue; op = tcc_ir_op_get_src1(ir, q); }
       else if (s == 2) { if (!irop_config[q->op].has_src2) continue; op = tcc_ir_op_get_src2(ir, q); }
-      else { if (!tcc_ir_op_is_mac(q->op)) continue; op = tcc_ir_op_get_accum(ir, q); }
+      else { if (!ir_op_has(q->op, IROP_A_SLOT3)) continue; op = ir->iroperand_pool[q->operand_base + 3]; }
       /* A parameter vreg written anywhere is not the entry value. */
       int32_t vr = irop_get_vreg(op);
       if (s == 0 && vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM &&
@@ -1321,6 +1467,9 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
         continue;
       }
       int w = irop_is_64bit(op) ? 8 : ir_opt_store_btype_size_bytes(irop_get_btype(op));
+      /* A complex read observes both components, including the next home. */
+      if (op.is_complex)
+        w *= 2;
       if (w <= 0)
         w = irop_get_btype(op) == IROP_BTYPE_STRUCT ? hi - lo : 4;
       if (o + w <= lo || o >= hi)
@@ -1335,7 +1484,24 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
       }
       else if (s == 0)
         return 0; /* some other write of the slot */
+      else
+        for (int k = 0; k < nh; k++)
+          if (o < h[k].off + 4 && o + w > h[k].off &&
+              (o != h[k].off || w != 4 || irop_get_btype(op) != IROP_BTYPE_INT32 ||
+               op.is_complex || tcc_ir_access_is_volatile(ir, op)))
+            h[k].keep = 1;
     }
+  }
+
+  if (has_call) {
+    IRLoops *loops = tcc_ir_detect_loops(ir);
+    int candidates = 0;
+    for (int k = 0; k < nh; ++k)
+      candidates += !h[k].bad;
+    int budget = loops && loops->num_loops ? tcc_ir_loop_call_promotion_budget(ir, loops) : 0;
+    tcc_ir_free_loops(loops);
+    if (candidates > budget)
+      return 0;
   }
 
   int changes = 0;
@@ -1354,9 +1520,9 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
       IROperand op;
       if (s == 1) { if (!irop_config[q->op].has_src1) continue; op = tcc_ir_op_get_src1(ir, q); }
       else if (s == 2) { if (!irop_config[q->op].has_src2) continue; op = tcc_ir_op_get_src2(ir, q); }
-      else { if (!tcc_ir_op_is_mac(q->op)) continue; op = tcc_ir_op_get_accum(ir, q); }
+      else { if (!ir_op_has(q->op, IROP_A_SLOT3)) continue; op = ir->iroperand_pool[q->operand_base + 3]; }
       if (irop_get_tag(op) != IROP_TAG_STACKOFF || !op.is_local || !op.is_lval || op.is_llocal ||
-          irop_get_vreg(op) >= 0 || irop_get_btype(op) != IROP_BTYPE_INT32 || irop_is_64bit(op) ||
+          irop_get_vreg(op) >= 0 || irop_get_btype(op) != IROP_BTYPE_INT32 || irop_is_64bit(op) || op.is_complex ||
           tcc_ir_access_is_volatile(ir, op))
         continue;
       const int o = irop_get_stack_offset(op);
@@ -1370,11 +1536,17 @@ int tcc_ir_opt_param_home_fwd(TCCIRState *ir)
         else if (s == 2)
           tcc_ir_op_set_src2(ir, q, p);
         else
-          tcc_ir_op_set_accum(ir, q, p);
+          ir->iroperand_pool[q->operand_base + 3] = p;
         changes++;
         break;
       }
     }
   }
+  for (int k = 0; k < nh; k++)
+    if (!h[k].bad && !h[k].keep)
+    {
+      ir->compact_instructions[h[k].idx].op = TCCIR_OP_NOP;
+      changes++;
+    }
   return changes;
 }

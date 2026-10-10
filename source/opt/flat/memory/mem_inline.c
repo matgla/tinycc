@@ -49,6 +49,15 @@
  * store-load forwarding through the copied bytes (the float-bits memcpy(&u,
  * &f,4) reinterpret idiom), and never grow code. */
 #define MI_MEMCPY_MAX 4
+/* A copy whose destination (or source) is a local reached through its address
+ * is a different case: that local exists only to be read back, so the pieces
+ * win even when they are not a strict static win - store-load forwarding and
+ * dead-slot elimination then delete the slot and the runtime call.  This is
+ * how the Zig C backend spells an align(1) eight-byte load/store.  Gated on a
+ * single-def `T <- &slot` temp on one end, so a plain pointer-to-pointer copy
+ * keeps the call above. */
+#define MI_MEMCPY_LOCAL_MAX 8
+#define MI_MEMCPY_LOCAL_PIECES 2
 #define MI_MEMSET_MAX 8
 #define MI_MEMCPY_PIECES 1
 #define MI_MEMSET_PIECES 2
@@ -68,23 +77,23 @@ static int mi_classify(const char *nm, int *aligned4)
   if (!nm)
     return MI_NONE;
   *aligned4 = 0;
-  if (!strcmp(nm, "__aeabi_memcpy4") || !strcmp(nm, "__aeabi_memcpy8"))
+  if (ir_opt_name_in(nm, "__aeabi_memcpy4\0__aeabi_memcpy8\0"))
   {
     *aligned4 = 1;
     return MI_MEMCPY;
   }
-  if (!strcmp(nm, "memcpy") || !strcmp(nm, "__aeabi_memcpy"))
+  if (ir_opt_name_in(nm, "memcpy\0__aeabi_memcpy\0"))
     return MI_MEMCPY;
   if (!strcmp(nm, "memset"))
     return MI_MEMSET;
-  if (!strcmp(nm, "__aeabi_memset4") || !strcmp(nm, "__aeabi_memset8"))
+  if (ir_opt_name_in(nm, "__aeabi_memset4\0__aeabi_memset8\0"))
   {
     *aligned4 = 1;
     return MI_MEMSET_AEABI;
   }
   if (!strcmp(nm, "__aeabi_memset"))
     return MI_MEMSET_AEABI;
-  if (!strcmp(nm, "__aeabi_memclr4") || !strcmp(nm, "__aeabi_memclr8"))
+  if (ir_opt_name_in(nm, "__aeabi_memclr4\0__aeabi_memclr8\0"))
   {
     *aligned4 = 1;
     return MI_MEMCLR;
@@ -94,21 +103,19 @@ static int mi_classify(const char *nm, int *aligned4)
   return MI_NONE;
 }
 
-/* A usable INDEXED base: the pointer VALUE in a vreg, or a symbol address.
- * An is_lval operand is the pointee, not the pointer.  A STACKOFF address
- * (`Addr[StackLoc]`, the direct `memcpy(&u, &f, 4)` shape) does NOT work as
- * an INDEXED base -- the backend reads a STACKOFF operand as the slot's
- * VALUE, so the expansion dereferenced the copied bits as an address
- * (221_fuzz repro: BusFault with BFAR = the float pattern being copied).
- * Those accesses become direct StackLoc LOAD/STOREs instead (*is_stack) --
- * the canonical slot shape sl_forward and the promotion passes understand,
- * so the copy collapses and the &var address-take disappears (20141107-1:
- * LEA+INDEXED left a 17-instruction opaque stack dance per inlined site).
- * is_llocal slots hold a POINTER to the data (VLA), not the data: decline. */
-static int mi_base_ok(IROperand op, int *is_stack)
+/* STACKOFF with a vreg reads that value; real slot addresses need direct accesses. */
+static int mi_base_ok(IROperand *base, int *is_stack)
 {
+  IROperand op = *base;
   int tag = irop_get_tag(op);
   *is_stack = 0;
+  if (tag == IROP_TAG_STACKOFF && op.btype == IROP_BTYPE_INT32 && irop_is_vreg_value(op))
+  {
+    *base = irop_make_vreg(irop_get_vreg(op), op.btype);
+    base->is_unsigned = op.is_unsigned;
+    base->aux = op.aux;
+    return 1;
+  }
   if (op.is_lval)
     return 0;
   if (tag == IROP_TAG_VREG)
@@ -212,15 +219,27 @@ static int mi_pieces(int n, int offs[MI_MAX_PIECES], int ws[MI_MAX_PIECES])
  * INDEXED convention: [dest, src1, src2, scale].  Slots are recycled from the
  * call's own PARAM/CALL quads (never inserted): inserting quads grows the
  * NOP-inclusive slot count that the auto-inline gates read, flipping inline
- * decisions in callers (20141107-1 main 15->84). */
-static void mi_emit_at(TCCIRState *ir, int slot, int op, IROperand dest, IROperand src1, IROperand src2)
+ * decisions in callers (20141107-1 main 15->84).  A local-slot copy is the
+ * exception - see mi_try_expand - where foreign argument evaluation leaves no
+ * free quad and the pieces are inserted at the call position instead. */
+static void mi_emit_at(TCCIRState *ir, int slot, int insert, int op, IROperand dest, IROperand src1, IROperand src2)
 {
-  IRQuadCompact *q = &ir->compact_instructions[slot];
+  IRQuadCompact fresh, *q;
+  if (insert)
+  {
+    memset(&fresh, 0, sizeof(fresh));
+    fresh.orig_index = slot;
+    q = &fresh;
+  }
+  else
+    q = &ir->compact_instructions[slot];
   q->op = (TccIrOp)op;
   q->operand_base = (uint32_t)tcc_ir_iroperand_pool_add(ir, dest);
   tcc_ir_iroperand_pool_add(ir, src1);
   tcc_ir_iroperand_pool_add(ir, src2);
   tcc_ir_iroperand_pool_add(ir, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
+  if (insert)
+    tcc_ir_insert_instruction_before(ir, slot, q);
 }
 
 static int mi_result_used(TCCIRState *ir, int ci)
@@ -250,8 +269,7 @@ static int mi_result_used(TCCIRState *ir, int ci)
     /* an is_lval dest is an address USE (store through the pointer) */
     if (irop_config[q->op].has_dest)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (d.is_lval && irop_get_vreg(d) == cdv)
+      if (tcc_ir_op_dest_is_lval(ir, q) && tcc_ir_op_dest_vreg(ir, q) == cdv)
         return 1;
     }
   }
@@ -267,6 +285,7 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
   int np;
   int dst_stk = 0, src_stk = 0;
   int dst_var = 0, src_var = 0;
+  int local_copy = 0;
   IROperand dst_varop, src_varop;
 
   if (!ir_opt_get_call_param_operand(ir, ci, 0, &dst))
@@ -282,9 +301,23 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
       return 0;
     src = p1;
     nn = irop_get_imm64_ex(ir, p2);
-    if (nn < 0 || nn > MI_MEMCPY_MAX)
+    if (nn < 0 || nn > MI_MEMCPY_LOCAL_MAX)
       return 0;
-    if (nn > 0 && !mi_base_ok(src, &src_stk))
+    if (nn > MI_MEMCPY_MAX)
+    {
+      /* Beyond the strict ceiling, only accept a copy that ends in a local
+       * reached through its address: one of the two ends must resolve to a
+       * slot through a single-def `T <- &slot` temp (see mi_resolve_lea_base).
+       * Such a local exists only to be read back, so the pieces win even when
+       * they are not a strict static win - store-load forwarding and dead-slot
+       * elimination delete the slot and the runtime call.  This is how the
+       * Zig C backend spells an align(1) eight-byte load/store. */
+      IROperand slot;
+      if (mi_resolve_lea_base(ir, dst, &slot) != 2 && mi_resolve_lea_base(ir, p1, &slot) != 2)
+        return 0;
+      local_copy = 1;
+    }
+    if (nn > 0 && !mi_base_ok(&src, &src_stk))
       return 0;
     break;
   case MI_MEMSET:
@@ -314,7 +347,7 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
     return 0;
   }
 
-  if (nn > 0 && !mi_base_ok(dst, &dst_stk))
+  if (nn > 0 && !mi_base_ok(&dst, &dst_stk))
     return 0;
   if (mi_result_used(ir, ci))
     return 0;
@@ -325,8 +358,10 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
   /* Piece caps enforce the strict static-win policy (see header) and keep
    * the expansion within the call's own quad slots, so function IR size
    * stays stable and auto-inline decisions for callers don't flip (the
-   * slot-count trap: 20141107-1 main 15->84 with insertion-based emission). */
-  if (np > (kind == MI_MEMCPY ? MI_MEMCPY_PIECES : MI_MEMSET_PIECES))
+   * slot-count trap: 20141107-1 main 15->84 with insertion-based emission).
+   * A local-slot copy is the exception: it may insert, and its pieces are
+   * justified by the dead slot rather than by a static win. */
+  if (np > (kind == MI_MEMCPY ? (local_copy ? MI_MEMCPY_LOCAL_PIECES : MI_MEMCPY_PIECES) : MI_MEMSET_PIECES))
     return 0;
   /* STACKOFF offsets are abstract slot IDs remapped by frame allocation --
    * NEVER do arithmetic on them, and never rebuild them: reuse the original
@@ -405,7 +440,25 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
   }
   {
     int quads_needed = (kind == MI_MEMCPY) ? 2 * np : np;
-    if (quads_needed > n_slots)
+    int target[2 * MI_MAX_PIECES];
+    int insert = 0;
+    if (quads_needed <= n_slots)
+    {
+      for (int k = 0; k < quads_needed; k++)
+        target[k] = slots[n_slots - quads_needed + k];
+    }
+    else if (local_copy)
+    {
+      /* Foreign argument evaluation (the LEA of the local's address, the
+       * computed source pointer) sits between the params, so the call's own
+       * quads are not all free.  Such a copy ends in a slot that exists only
+       * to be read back, so the pieces are worth keeping: insert them at the
+       * call position instead of recycling.  Bounded by the piece cap. */
+      insert = 1;
+      for (int k = 0; k < quads_needed; k++)
+        target[k] = ci + k;
+    }
+    else
       return 0;
 
     /* mem* arguments carry no alignment guarantee (aeabi 4/8 variants
@@ -422,11 +475,12 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
       src.aux |= IROP_AUX_UNDERALIGN;
     }
 
-    /* NOP everything, then fill the LAST quads_needed slots so the accesses
-     * sit at the original call position. */
+    /* NOP everything, then emit at the target positions built above: the
+     * LAST quads_needed slots, or the call position for an inserted local-
+     * slot copy. */
     ir_opt_nop_call_params(ir, ci);
     ir->compact_instructions[ci].op = TCCIR_OP_NOP;
-    int si = n_slots - quads_needed;
+    int pi = 0;
 
     if (kind == MI_MEMCPY)
     {
@@ -446,14 +500,14 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
             IROperand slot = irop_retype_scalar(src_stk ? src : src_varop, mi_btype(ws[k]));
             slot.is_lval = 1;
             slot.is_unsigned = 1;
-            mi_emit_at(ir, slots[si++], TCCIR_OP_LOAD, d, slot,
+            mi_emit_at(ir, target[pi++], insert, TCCIR_OP_LOAD, d, slot,
                        irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
           }
           else
           {
             if (!aligned4)
               d.aux |= IROP_AUX_UNDERALIGN;
-            mi_emit_at(ir, slots[si++], TCCIR_OP_LOAD_INDEXED, d, src,
+            mi_emit_at(ir, target[pi++], insert, TCCIR_OP_LOAD_INDEXED, d, src,
                        irop_make_imm32(-1, offs[k], IROP_BTYPE_INT32));
           }
         }
@@ -466,14 +520,14 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
             IROperand slot = irop_retype_scalar(dst_stk ? dst : dst_varop, mi_btype(ws[k]));
             slot.is_lval = 1;
             slot.is_unsigned = 1;
-            mi_emit_at(ir, slots[si++], TCCIR_OP_STORE, slot, v,
+            mi_emit_at(ir, target[pi++], insert, TCCIR_OP_STORE, slot, v,
                        irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
           }
           else
           {
             if (!aligned4)
               v.aux |= IROP_AUX_UNDERALIGN;
-            mi_emit_at(ir, slots[si++], TCCIR_OP_STORE_INDEXED, dst, v,
+            mi_emit_at(ir, target[pi++], insert, TCCIR_OP_STORE_INDEXED, dst, v,
                        irop_make_imm32(-1, offs[k], IROP_BTYPE_INT32));
           }
         }
@@ -492,14 +546,14 @@ static int mi_try_expand(TCCIRState *ir, int ci, int kind, int aligned4)
           IROperand slot = irop_retype_scalar(dst_stk ? dst : dst_varop, mi_btype(ws[k]));
           slot.is_lval = 1;
           slot.is_unsigned = 1;
-          mi_emit_at(ir, slots[si++], TCCIR_OP_STORE, slot, v,
+          mi_emit_at(ir, target[pi++], insert, TCCIR_OP_STORE, slot, v,
                      irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
         }
         else
         {
           if (!aligned4)
             v.aux |= IROP_AUX_UNDERALIGN;
-          mi_emit_at(ir, slots[si++], TCCIR_OP_STORE_INDEXED, dst, v,
+          mi_emit_at(ir, target[pi++], insert, TCCIR_OP_STORE_INDEXED, dst, v,
                      irop_make_imm32(-1, offs[k], IROP_BTYPE_INT32));
         }
       }
@@ -526,7 +580,7 @@ int tcc_ir_opt_mem_inline(TCCIRState *ir)
     int kind;
     if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
-    callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
     int aligned4 = 0;
@@ -536,9 +590,4 @@ int tcc_ir_opt_mem_inline(TCCIRState *ir)
     changes += mi_try_expand(ir, i, kind, aligned4);
   }
   return changes;
-}
-
-int tcc_ir_opt_mem_inline_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_mem_inline(ctx->ir);
 }

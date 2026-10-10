@@ -77,11 +77,11 @@ static int lf_insn_temps(TCCIRState *ir, IRQuadCompact *q, int npos, int out[3])
   int32_t v[3] = {-1, -1, -1};
   int m = 0;
   if (cfg->has_src1)
-    v[0] = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+    v[0] = tcc_ir_op_src1_vreg(ir, q);
   if (cfg->has_src2)
-    v[1] = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+    v[1] = tcc_ir_op_src2_vreg(ir, q);
   if (cfg->has_dest)
-    v[2] = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    v[2] = tcc_ir_op_dest_vreg(ir, q);
   for (int k = 0; k < 3; k++)
   {
     int p = lf_temp_pos(v[k], npos);
@@ -105,9 +105,9 @@ static void lf_occ_build(TCCIRState *ir, int n, LfOcc *o)
     if (q->op == TCCIR_OP_NOP)
       continue;
     const IRRegistersConfig *cfg = &irop_config[q->op];
-    int32_t v[3] = {cfg->has_src1 ? irop_get_vreg(tcc_ir_op_get_src1(ir, q)) : -1,
-                    cfg->has_src2 ? irop_get_vreg(tcc_ir_op_get_src2(ir, q)) : -1,
-                    cfg->has_dest ? irop_get_vreg(tcc_ir_op_get_dest(ir, q)) : -1};
+    int32_t v[3] = {cfg->has_src1 ? tcc_ir_op_src1_vreg(ir, q) : -1,
+                    cfg->has_src2 ? tcc_ir_op_src2_vreg(ir, q) : -1,
+                    cfg->has_dest ? tcc_ir_op_dest_vreg(ir, q) : -1};
     for (int k = 0; k < 3; k++)
       if (v[k] >= 0 && TCCIR_DECODE_VREG_TYPE(v[k]) == TCCIR_VREG_TYPE_TEMP &&
           TCCIR_DECODE_VREG_POSITION(v[k]) >= npos)
@@ -226,8 +226,7 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
     else if (lea_q->op == TCCIR_OP_ASSIGN)
     {
       /* ASSIGN must have no src2 (or NONE) to be a pure copy of src1. */
-      IROperand s2 = tcc_ir_op_get_src2(ir, lea_q);
-      if (!irop_is_none(s2))
+      if (!tcc_ir_op_src2_is_none(ir, lea_q))
         continue;
     }
     else if (lea_q->op != TCCIR_OP_LEA)
@@ -249,8 +248,7 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
     if (irop_get_vreg(lea_src) != -1)
       continue;
 
-    IROperand lea_dest = tcc_ir_op_get_dest(ir, lea_q);
-    int32_t lea_vr = irop_get_vreg(lea_dest);
+    int32_t lea_vr = tcc_ir_op_dest_vreg(ir, lea_q);
     if (lea_vr < 0)
       continue;
     if (TCCIR_DECODE_VREG_TYPE(lea_vr) != TCCIR_VREG_TYPE_TEMP)
@@ -271,14 +269,12 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
         const IRRegistersConfig *cfg = &irop_config[uq->op];
         if (cfg->has_src1)
         {
-          IROperand s = tcc_ir_op_get_src1(ir, uq);
-          if (irop_has_vreg(s) && irop_get_vreg(s) == lea_vr)
+          if (tcc_ir_op_src1_has_vreg(ir, uq) && tcc_ir_op_src1_vreg(ir, uq) == lea_vr)
             total_uses++;
         }
         if (cfg->has_src2)
         {
-          IROperand s = tcc_ir_op_get_src2(ir, uq);
-          if (irop_has_vreg(s) && irop_get_vreg(s) == lea_vr)
+          if (tcc_ir_op_src2_has_vreg(ir, uq) && tcc_ir_op_src2_vreg(ir, uq) == lea_vr)
             total_uses++;
         }
         if (cfg->has_dest)
@@ -326,20 +322,17 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
       int uses_lea = 0;
       if (cfg->has_src1)
       {
-        IROperand s = tcc_ir_op_get_src1(ir, uq);
-        if (irop_has_vreg(s) && irop_get_vreg(s) == lea_vr)
+        if (tcc_ir_op_src1_has_vreg(ir, uq) && tcc_ir_op_src1_vreg(ir, uq) == lea_vr)
           uses_lea = 1;
       }
       if (!uses_lea && cfg->has_src2)
       {
-        IROperand s = tcc_ir_op_get_src2(ir, uq);
-        if (irop_has_vreg(s) && irop_get_vreg(s) == lea_vr)
+        if (tcc_ir_op_src2_has_vreg(ir, uq) && tcc_ir_op_src2_vreg(ir, uq) == lea_vr)
           uses_lea = 1;
       }
       if (!uses_lea && cfg->has_dest)
       {
-        IROperand d = tcc_ir_op_get_dest(ir, uq);
-        if (irop_has_vreg(d) && irop_get_vreg(d) == lea_vr)
+        if (tcc_ir_op_dest_has_vreg(ir, uq) && tcc_ir_op_dest_vreg(ir, uq) == lea_vr)
           uses_lea = 1;
       }
       if (uses_lea)
@@ -376,8 +369,7 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
       }
       if (ok)
       {
-        IROperand add_dest = tcc_ir_op_get_dest(ir, add_q);
-        int32_t add_vr = irop_get_vreg(add_dest);
+        int32_t add_vr = tcc_ir_op_dest_vreg(ir, add_q);
         /* Explicit-scan use count; ir_opt_du_uses undercounts STORE-dest uses. */
         int add_uses_real = 0;
         if (add_vr >= 0 && TCCIR_DECODE_VREG_TYPE(add_vr) == TCCIR_VREG_TYPE_TEMP)
@@ -392,22 +384,19 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
             const IRRegistersConfig *cfg2 = &irop_config[uq2->op];
             if (cfg2->has_src1)
             {
-              IROperand s = tcc_ir_op_get_src1(ir, uq2);
-              if (irop_has_vreg(s) && irop_get_vreg(s) == add_vr)
+              if (tcc_ir_op_src1_has_vreg(ir, uq2) && tcc_ir_op_src1_vreg(ir, uq2) == add_vr)
                 add_uses_real++;
             }
             if (cfg2->has_src2)
             {
-              IROperand s = tcc_ir_op_get_src2(ir, uq2);
-              if (irop_has_vreg(s) && irop_get_vreg(s) == add_vr)
+              if (tcc_ir_op_src2_has_vreg(ir, uq2) && tcc_ir_op_src2_vreg(ir, uq2) == add_vr)
                 add_uses_real++;
             }
             if (cfg2->has_dest)
             {
-              IROperand d = tcc_ir_op_get_dest(ir, uq2);
-              if (irop_has_vreg(d) && irop_get_vreg(d) == add_vr)
+              if (tcc_ir_op_dest_has_vreg(ir, uq2) && tcc_ir_op_dest_vreg(ir, uq2) == add_vr)
               {
-                if (d.is_lval)
+                if (tcc_ir_op_dest_is_lval(ir, uq2))
                   add_uses_real++;
                 else
                 {
@@ -439,20 +428,17 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
             int touches = 0;
             if (cfg->has_src1)
             {
-              IROperand s = tcc_ir_op_get_src1(ir, ck);
-              if (irop_has_vreg(s) && irop_get_vreg(s) == add_vr)
+              if (tcc_ir_op_src1_has_vreg(ir, ck) && tcc_ir_op_src1_vreg(ir, ck) == add_vr)
                 touches = 1;
             }
             if (!touches && cfg->has_src2)
             {
-              IROperand s = tcc_ir_op_get_src2(ir, ck);
-              if (irop_has_vreg(s) && irop_get_vreg(s) == add_vr)
+              if (tcc_ir_op_src2_has_vreg(ir, ck) && tcc_ir_op_src2_vreg(ir, ck) == add_vr)
                 touches = 1;
             }
             if (!touches && cfg->has_dest)
             {
-              IROperand d = tcc_ir_op_get_dest(ir, ck);
-              if (irop_has_vreg(d) && irop_get_vreg(d) == add_vr)
+              if (tcc_ir_op_dest_has_vreg(ir, ck) && tcc_ir_op_dest_vreg(ir, ck) == add_vr)
                 touches = 1;
             }
             if (touches)
@@ -471,7 +457,7 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
     /* The final consumer must deref the folded vreg (is_lval=1) exactly once;
      * a non-deref use (PARAM, another ADD) can't fold — the address escapes. */
     int32_t deref_vr =
-        (add_idx >= 0) ? irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[add_idx])) : lea_vr;
+        (add_idx >= 0) ? tcc_ir_op_dest_vreg(ir, &ir->compact_instructions[add_idx]) : lea_vr;
 
     /* LOAD_INDEXED special case: base in src1, constant offset in src2, scale
      * in slot 3. When base is the LEA vreg, scale==0, and src2 is IMM32, fold
@@ -506,7 +492,7 @@ int tcc_ir_opt_lea_fold(TCCIRState *ir)
               cq->op = TCCIR_OP_LOAD;
               tcc_ir_set_dest(ir, cur_idx, orig_dest);
               tcc_ir_set_src1(ir, cur_idx, stack_op);
-              tcc_ir_set_src2(ir, cur_idx, IROP_NONE);
+              tcc_ir_set_src2_none(ir, cur_idx);
 
               lea_q->op = TCCIR_OP_NOP;
               if (add_idx >= 0)

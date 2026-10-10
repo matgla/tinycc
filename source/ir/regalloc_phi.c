@@ -147,12 +147,10 @@ void ra_eliminate_dead_reg_copies(TCCIRState *ir)
       if (q->op == TCCIR_OP_NOP)
         continue;
       if (irop_config[q->op].has_src1) {
-        IROperand s = tcc_ir_op_get_src1(ir, q);
-        if (irop_has_vreg(s)) RA_DEADCOPY_MARK(irop_get_vreg(s));
+        if (tcc_ir_op_src1_has_vreg(ir, q)) RA_DEADCOPY_MARK(tcc_ir_op_src1_vreg(ir, q));
       }
       if (irop_config[q->op].has_src2) {
-        IROperand s = tcc_ir_op_get_src2(ir, q);
-        if (irop_has_vreg(s)) RA_DEADCOPY_MARK(irop_get_vreg(s));
+        if (tcc_ir_op_src2_has_vreg(ir, q)) RA_DEADCOPY_MARK(tcc_ir_op_src2_vreg(ir, q));
       }
       if (tcc_ir_op_is_mac(q->op)) {
         IROperand s = tcc_ir_op_get_accum(ir, q);
@@ -161,8 +159,7 @@ void ra_eliminate_dead_reg_copies(TCCIRState *ir)
       /* STORE-class ops read their "dest" operand (the memory address). */
       if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
           q->op == TCCIR_OP_STORE_POSTINC) {
-        IROperand d = tcc_ir_op_get_dest(ir, q);
-        if (irop_has_vreg(d)) RA_DEADCOPY_MARK(irop_get_vreg(d));
+        if (tcc_ir_op_dest_has_vreg(ir, q)) RA_DEADCOPY_MARK(tcc_ir_op_dest_vreg(ir, q));
       }
     }
 
@@ -171,10 +168,9 @@ void ra_eliminate_dead_reg_copies(TCCIRState *ir)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op != TCCIR_OP_ASSIGN)
         continue;
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!irop_has_vreg(d))
+      if (!tcc_ir_op_dest_has_vreg(ir, q))
         continue;
-      int32_t dv = irop_get_vreg(d);
+      int32_t dv = tcc_ir_op_dest_vreg(ir, q);
       if (TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
         continue;
       long idx = RA_DEADCOPY_IDX(dv);
@@ -283,6 +279,7 @@ static int ra_phi_copy_needed(TCCIRState *ir, IRPhiNode *phi, int operand_idx)
   if (ra_phi_copy_is_identity(dest_li, src_li)) {
     if (src_li)
       src_li->phi_pinned = 1;
+    dest_li->phi_pinned = 1;
     return 0;
   }
   return 1;
@@ -427,8 +424,51 @@ static int ra_collect_phi_copies_for_pred(TCCIRState *ir, IRCFG *cfg, IRSSAState
   return copy_count;
 }
 
-static void ra_emit_phi_copy(TCCIRState *ir, IRQuadCompact *new_instrs, int *wp,
-                             int *pool_wp, const RAPhiCopy *copy,
+/* Where ra_resolve_phis writes the rebuilt instruction stream and its new
+ * operands.  Both grow on demand instead of being sized for the worst case up
+ * front: the worst case reserves a cycle-breaking temp copy for EVERY phi copy
+ * (and 4 pool slots per copy where 2 are used), and the operand pool used to
+ * double whenever that over-estimate crossed its capacity -- regcomp.c's
+ * largest function doubled 4096 -> 8192 operands to write 1129, and the pool
+ * then stays that size until the function is done.  Every write below goes
+ * through an index (wp / pool_wp), never a pointer kept across a write, so
+ * moving either buffer is safe. */
+typedef struct RAPhiOut {
+  IRQuadCompact *instrs;
+  int cap;     /* entries allocated in instrs */
+  int grow;    /* entries added when instrs is full */
+  int wp;      /* next instruction slot */
+  int pool_wp; /* next operand pool slot */
+} RAPhiOut;
+
+static IRQuadCompact *ra_phi_out_instr(RAPhiOut *out)
+{
+  if (out->wp >= out->cap) {
+    /* Zero the new slots: the array starts zeroed and the writers below fill
+     * only the fields they mean to set. */
+    int old_cap = out->cap;
+    out->cap += out->grow;
+    out->instrs = tcc_realloc(out->instrs, out->cap * sizeof(IRQuadCompact));
+    memset(out->instrs + old_cap, 0, (out->cap - old_cap) * sizeof(IRQuadCompact));
+  }
+  return &out->instrs[out->wp++];
+}
+
+/* Reserve n operand pool slots at pool_wp, growing the pool the way every
+ * other pool writer does (doubling). */
+static int ra_phi_out_pool(TCCIRState *ir, RAPhiOut *out, int n)
+{
+  while (out->pool_wp + n > ir->iroperand_pool_capacity) {
+    int nc = ir->iroperand_pool_capacity ? ir->iroperand_pool_capacity * 2 : 256;
+    ir->iroperand_pool = tcc_realloc(ir->iroperand_pool, nc * sizeof(IROperand));
+    ir->iroperand_pool_capacity = nc;
+  }
+  int base = out->pool_wp;
+  out->pool_wp += n;
+  return base;
+}
+
+static void ra_emit_phi_copy(TCCIRState *ir, RAPhiOut *out, const RAPhiCopy *copy,
                              RAPhiCopyRecord *records, int *record_count)
 {
   IROperand dest_op;
@@ -443,21 +483,21 @@ static void ra_emit_phi_copy(TCCIRState *ir, IRQuadCompact *new_instrs, int *wp,
   src_op.tag = IROP_TAG_VREG;
   src_op.btype = copy->btype;
 
-  ir->iroperand_pool[*pool_wp] = dest_op;
-  ir->iroperand_pool[*pool_wp + 1] = src_op;
+  int pb = ra_phi_out_pool(ir, out, 2);
+  ir->iroperand_pool[pb] = dest_op;
+  ir->iroperand_pool[pb + 1] = src_op;
 
   if (records && record_count && *record_count < RA_MAX_PHI_COPY_RECORDS) {
     records[*record_count].src_vreg = copy->src_vreg;
-    records[*record_count].new_instr_idx = *wp;
+    records[*record_count].new_instr_idx = out->wp;
     (*record_count)++;
   }
 
-  new_instrs[*wp].op = TCCIR_OP_ASSIGN;
-  new_instrs[*wp].operand_base = *pool_wp;
-  new_instrs[*wp].line_num = 0;
-  new_instrs[*wp].is_jump_target = 0;
-  (*wp)++;
-  *pool_wp += 2;
+  IRQuadCompact *q = ra_phi_out_instr(out);
+  q->op = TCCIR_OP_ASSIGN;
+  q->operand_base = pb;
+  q->line_num = 0;
+  q->is_jump_target = 0;
 }
 
 static int ra_btype_stack_size(int btype)
@@ -542,13 +582,12 @@ static int32_t ra_create_phi_temp(TCCIRState *ir, int btype, int start, int end,
   return tmp_vreg;
 }
 
-static void ra_emit_scheduled_phi_copies(TCCIRState *ir, IRQuadCompact *new_instrs,
-                                         int *wp, int *pool_wp, RAPhiCopy *copies,
+static void ra_emit_scheduled_phi_copies(TCCIRState *ir, RAPhiOut *out, RAPhiCopy *copies,
                                          int copy_count, int block,
                                          RAPhiCopyRecord *records, int *record_count,
                                          int *phi_spill_cursor, RAPhiStats *stats)
 {
-  int start_wp = *wp;
+  int start_wp = out->wp;
   int emitted = 0;
   while (emitted < copy_count) {
     int progress = 0;
@@ -557,7 +596,7 @@ static void ra_emit_scheduled_phi_copies(TCCIRState *ir, IRQuadCompact *new_inst
         continue;
       if (ra_phi_copy_dest_clobbers_pending_source(ir, copies, copy_count, ci))
         continue;
-      ra_emit_phi_copy(ir, new_instrs, wp, pool_wp, &copies[ci], records, record_count);
+      ra_emit_phi_copy(ir, out, &copies[ci], records, record_count);
       copies[ci].emitted = 1;
       emitted++;
       progress = 1;
@@ -573,8 +612,8 @@ static void ra_emit_scheduled_phi_copies(TCCIRState *ir, IRQuadCompact *new_inst
         break;
 
       int32_t saved_src = copies[ci].src_vreg;
-      int32_t tmp_vreg = ra_create_phi_temp(ir, copies[ci].btype, *wp,
-                                            *wp + copy_count - emitted,
+      int32_t tmp_vreg = ra_create_phi_temp(ir, copies[ci].btype, out->wp,
+                                            out->wp + copy_count - emitted,
                                             phi_spill_cursor);
       if (tmp_vreg < 0) {
         RA_DBG("SSA phi resolver: failed to allocate cycle temp in block %d", block);
@@ -593,12 +632,12 @@ static void ra_emit_scheduled_phi_copies(TCCIRState *ir, IRQuadCompact *new_inst
         stats->cycle_temporaries++;
         ra_phi_stats_add_participant(stats, tmp_vreg);
       }
-      ra_emit_phi_copy(ir, new_instrs, wp, pool_wp, &save, records, record_count);
+      ra_emit_phi_copy(ir, out, &save, records, record_count);
       copies[ci].src_vreg = tmp_vreg;
     }
   }
   if (TCC_LOG_LS)
-    stats->parallel_emitted += *wp - start_wp;
+    stats->parallel_emitted += out->wp - start_wp;
 }
 void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
                             RAPhiStats *stats)
@@ -637,7 +676,6 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
    * and if pred's JUMPIF target == this phi's succ block, also note that
    * the JUMPIF edge carries a copy. */
   int extra_jumps = 0;
-  int modified_jumpifs = 0;
   uint8_t *jumpif_edge_has_copy = tcc_mallocz(nb);
   for (int sb = 0; sb < nb; sb++) {
     for (IRPhiNode *phi = ssa->block_phis[sb]; phi; phi = phi->next) {
@@ -663,7 +701,6 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   for (int b = 0; b < nb; b++) {
     if (jumpif_edge_has_copy[b]) {
       extra_jumps++;
-      modified_jumpifs++;
     }
   }
   tcc_free(copies_to_jumpif_succ);
@@ -703,31 +740,28 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     return;
   }
 
-  /* Track emitted phi copies so we can extend source vreg live intervals */
-  RAPhiCopyRecord *copy_records = tcc_mallocz(sizeof(RAPhiCopyRecord) * RA_MAX_PHI_COPY_RECORDS);
+  /* Track emitted phi copies so we can extend source vreg live intervals.
+   * Only the post-RA tail below reads them; pre-RA they are never used. */
+  RAPhiCopyRecord *copy_records = NULL;
+  if (!ra_phi_resolve_pre_ra_mode)
+    copy_records = tcc_mallocz(sizeof(RAPhiCopyRecord) * RA_MAX_PHI_COPY_RECORDS);
   int copy_record_count = 0;
 
-  /* Build new instruction array with phi copies inserted */
-  int new_n = old_n + total_copies + extra_jumps;
-  int new_cap = new_n + 16;
-  new_cap += total_copies;
-  IRQuadCompact *new_instrs = tcc_mallocz(new_cap * sizeof(IRQuadCompact));
+  /* Build new instruction array with phi copies inserted.  Sized for one
+   * copy per phi operand plus the JUMPIF back-edge jumps; cycle-breaking temp
+   * copies (rare) grow it by total_copies at a time -- the old up-front
+   * reserve -- see RAPhiOut. */
+  RAPhiOut out;
+  out.cap = old_n + total_copies + extra_jumps + 16;
+  out.grow = total_copies;
+  out.instrs = tcc_mallocz(out.cap * sizeof(IRQuadCompact));
+  out.wp = 0;
+  out.pool_wp = ir->iroperand_pool_count;
   int *old_to_new = tcc_malloc(old_n * sizeof(int));
-
-  /* Grow operand pool */
-  int pool_base = ir->iroperand_pool_count;
-  int needed_pool = total_copies * 4 + extra_jumps + modified_jumpifs * 2;
-  while (pool_base + needed_pool > ir->iroperand_pool_capacity) {
-    int nc = ir->iroperand_pool_capacity ? ir->iroperand_pool_capacity * 2 : 256;
-    ir->iroperand_pool = tcc_realloc(ir->iroperand_pool, nc * sizeof(IROperand));
-    ir->iroperand_pool_capacity = nc;
-  }
 
   RAPhiPredIndex phi_pred_idx;
   ra_phi_pred_index_build(cfg, ssa, &phi_pred_idx);
 
-  int wp = 0;
-  int pool_wp = pool_base;
   int phi_spill_cursor = ra_find_phi_spill_cursor(ir);
   int first_phi_temp_pos = ir->next_temporary_variable;
 
@@ -768,38 +802,37 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
                 b, old_target, target_block, fallthrough_block);
 
       for (int i = bb->start_idx; i < last_instr; i++) {
-        old_to_new[i] = wp;
-        new_instrs[wp++] = ir->compact_instructions[i];
+        old_to_new[i] = out.wp;
+        *ra_phi_out_instr(&out) = ir->compact_instructions[i];
       }
 
-      old_to_new[last_instr] = wp;
+      old_to_new[last_instr] = out.wp;
       if (target_count > 0) {
         IROperand cond = tcc_ir_op_get_src1(ir, term);
         cond.u.imm32 = ra_invert_cond((int)irop_get_imm64_ex(ir, cond));
 
         IROperand skip_dest = old_dest;
-        skip_dest.u.imm32 = -(wp + 1 + target_count + 1 + 1);
-        int skip_dest_pool_idx = pool_wp;
-        ir->iroperand_pool[pool_wp] = skip_dest;
-        ir->iroperand_pool[pool_wp + 1] = cond;
-        new_instrs[wp] = *term;
-        new_instrs[wp].operand_base = pool_wp;
-        wp++;
-        pool_wp += 2;
+        skip_dest.u.imm32 = -(out.wp + 1 + target_count + 1 + 1);
+        int skip_dest_pool_idx = ra_phi_out_pool(ir, &out, 2);
+        ir->iroperand_pool[skip_dest_pool_idx] = skip_dest;
+        ir->iroperand_pool[skip_dest_pool_idx + 1] = cond;
+        IRQuadCompact *skip = ra_phi_out_instr(&out);
+        *skip = *term;
+        skip->operand_base = skip_dest_pool_idx;
 
         RAPhiCopy *copies = tcc_malloc(sizeof(RAPhiCopy) * target_count);
         int copy_count = ra_collect_phi_copies_for_pred(ir, cfg, ssa, b, target_block, &phi_pred_idx, copies);
-        ra_emit_scheduled_phi_copies(ir, new_instrs, &wp, &pool_wp, copies, copy_count, b,
+        ra_emit_scheduled_phi_copies(ir, &out, copies, copy_count, b,
                                      copy_records, &copy_record_count, &phi_spill_cursor, stats);
         tcc_free(copies);
 
-        ir->iroperand_pool[pool_wp] = old_dest;
-        new_instrs[wp].op = TCCIR_OP_JUMP;
-        new_instrs[wp].operand_base = pool_wp;
-        new_instrs[wp].line_num = term->line_num;
-        new_instrs[wp].is_jump_target = 0;
-        wp++;
-        pool_wp++;
+        int jump_pool_idx = ra_phi_out_pool(ir, &out, 1);
+        ir->iroperand_pool[jump_pool_idx] = old_dest;
+        IRQuadCompact *jump = ra_phi_out_instr(&out);
+        jump->op = TCCIR_OP_JUMP;
+        jump->operand_base = jump_pool_idx;
+        jump->line_num = term->line_num;
+        jump->is_jump_target = 0;
 
         /* The inverted JUMPIF skips over the phi copies AND this back-edge JUMP,
          * landing on the instruction right after the JUMP we just wrote (== wp
@@ -807,20 +840,20 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
          * current wp — NOT before emitting the copies/JUMP.  Reading wp earlier
          * (the old `-(wp + 2)` before the copy emit) is fragile: the value used
          * must reflect the copies just emitted via ra_emit_scheduled_phi_copies
-         * (which advances wp through &wp).  Encode as the negative sentinel the
+         * (which advances out.wp).  Encode as the negative sentinel the
          * "Fix jump targets" pass below decodes with `-old_target - 1`, so a
          * target of `wp` is stored as `-(wp + 1)`. */
         skip_dest = ir->iroperand_pool[skip_dest_pool_idx];
-        skip_dest.u.imm32 = -(wp + 1);
+        skip_dest.u.imm32 = -(out.wp + 1);
         ir->iroperand_pool[skip_dest_pool_idx] = skip_dest;
       } else {
-        new_instrs[wp++] = *term;
+        *ra_phi_out_instr(&out) = *term;
       }
 
       if (fallthrough_count > 0) {
         RAPhiCopy *copies = tcc_malloc(sizeof(RAPhiCopy) * fallthrough_count);
         int copy_count = ra_collect_phi_copies_for_pred(ir, cfg, ssa, b, fallthrough_block, &phi_pred_idx, copies);
-        ra_emit_scheduled_phi_copies(ir, new_instrs, &wp, &pool_wp, copies, copy_count, b,
+        ra_emit_scheduled_phi_copies(ir, &out, copies, copy_count, b,
                                      copy_records, &copy_record_count, &phi_spill_cursor, stats);
         tcc_free(copies);
       }
@@ -830,17 +863,17 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     /* Keep conditional phi copies off the compare/test -> JUMPIF edge:
      * physical-register copies can otherwise clobber the condition flags. */
     for (int i = bb->start_idx; i < insert_before; i++) {
-      old_to_new[i] = wp;
-      new_instrs[wp++] = ir->compact_instructions[i];
+      old_to_new[i] = out.wp;
+      *ra_phi_out_instr(&out) = ir->compact_instructions[i];
     }
 
-    int pre_copy_wp = wp;
+    int pre_copy_wp = out.wp;
 
     /* Insert phi copies for this block's successors */
     if (copies_per_block[b] > 0) {
       RAPhiCopy *copies = tcc_malloc(sizeof(RAPhiCopy) * copies_per_block[b]);
       int copy_count = ra_collect_phi_copies_for_pred(ir, cfg, ssa, b, -1, &phi_pred_idx, copies);
-      ra_emit_scheduled_phi_copies(ir, new_instrs, &wp, &pool_wp, copies, copy_count, b,
+      ra_emit_scheduled_phi_copies(ir, &out, copies, copy_count, b,
                                    copy_records, &copy_record_count, &phi_spill_cursor, stats);
       tcc_free(copies);
     }
@@ -850,12 +883,14 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       if (i == bb->start_idx && copies_per_block[b] > 0)
         old_to_new[i] = pre_copy_wp;
       else
-        old_to_new[i] = wp;
-      new_instrs[wp++] = ir->compact_instructions[i];
+        old_to_new[i] = out.wp;
+      *ra_phi_out_instr(&out) = ir->compact_instructions[i];
     }
   }
 
-  ir->iroperand_pool_count = pool_wp;
+  ir->iroperand_pool_count = out.pool_wp;
+  IRQuadCompact *new_instrs = out.instrs;
+  int wp = out.wp;
 
   ra_phi_pred_index_free(&phi_pred_idx);
 
@@ -892,8 +927,9 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   /* Replace instruction array */
   tcc_free(ir->compact_instructions);
   ir->compact_instructions = new_instrs;
-  ir->compact_instructions_size = new_cap;
+  ir->compact_instructions_size = out.cap;
   ir->next_instruction_index = wp;
+  tcc_ir_frame_scope_remap(ir, old_to_new, old_n, wp);
 
   /* Rebuild is_jump_target flags */
   for (int i = 0; i < wp; i++)
@@ -901,8 +937,7 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   for (int i = 0; i < wp; i++) {
     IRQuadCompact *q = &new_instrs[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int tgt = (int)irop_get_imm64_ex(ir, dest);
+      int tgt = (int)tcc_ir_op_dest_imm(ir, q);
       if (tgt >= 0 && tgt < wp) new_instrs[tgt].is_jump_target = 1;
     }
   }
@@ -1002,7 +1037,7 @@ void ra_resolve_phis(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     for (int i = 0; i < new_n; i++) {
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
-        int target = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+        int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
         if (target >= 0 && target < new_n && target < i) {
           for (int j = 0; j < ir->ls.next_interval_index; j++) {
             LSLiveInterval *lsi = &ir->ls.intervals[j];
@@ -1116,12 +1151,10 @@ void ra_co_ops(TCCIRState *ir, IRQuadCompact *q,
   int store_class = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
                      q->op == TCCIR_OP_STORE_POSTINC);
   if (irop_config[q->op].has_src1) {
-    IROperand s = tcc_ir_op_get_src1(ir, q);
-    if (irop_has_vreg(s) && !irop_is_immediate(s)) uses[(*nuse)++] = irop_get_vreg(s);
+    if (tcc_ir_op_src1_has_vreg(ir, q) && !tcc_ir_op_src1_is_imm(ir, q)) uses[(*nuse)++] = tcc_ir_op_src1_vreg(ir, q);
   }
   if (irop_config[q->op].has_src2) {
-    IROperand s = tcc_ir_op_get_src2(ir, q);
-    if (irop_has_vreg(s) && !irop_is_immediate(s)) uses[(*nuse)++] = irop_get_vreg(s);
+    if (tcc_ir_op_src2_has_vreg(ir, q) && !tcc_ir_op_src2_is_imm(ir, q)) uses[(*nuse)++] = tcc_ir_op_src2_vreg(ir, q);
   }
   if (tcc_ir_op_is_mac(q->op)) {
     IROperand s = tcc_ir_op_get_accum(ir, q);
@@ -1148,7 +1181,7 @@ void ra_co_ops(TCCIRState *ir, IRQuadCompact *q,
 void ra_build_narrow_weights(TCCIRState *ir, const RegAllocTarget *target,
                                     SSAInterval *intervals, int count, int max_vreg_pos)
 {
-  if (!target->op_narrow_capable || tcc_state->optimize < 1 || count <= 0 || max_vreg_pos <= 0)
+  if (!target->op_narrow_capable || TCC_OPT(tcc_state, optimize) < 1 || count <= 0 || max_vreg_pos <= 0)
     return;
   if (tcc_ir_opt_pass_disabled("ra:narrow_pref"))
     return;
@@ -1165,7 +1198,7 @@ void ra_build_narrow_weights(TCCIRState *ir, const RegAllocTarget *target,
     if (q->op == TCCIR_OP_NOP) continue;
     int src2_imm = 0, scale = 0;
     if (irop_config[q->op].has_src2)
-      src2_imm = irop_is_immediate(tcc_ir_op_get_src2(ir, q));
+      src2_imm = tcc_ir_op_src2_is_imm(ir, q);
     if (q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED) {
       IROperand s = tcc_ir_op_get_scale(ir, q);
       if (irop_get_tag(s) == IROP_TAG_IMM32) scale = s.u.imm32;
@@ -1222,7 +1255,7 @@ void ra_refine_live_regs_accurate(TCCIRState *ir)
     if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD)
       return;
     if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF) {
-      int t = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      int t = (int)tcc_ir_op_dest_u_imm32(ir, q);
       if (t >= 0 && t < i)
         has_backedge = 1;
     }
@@ -1239,8 +1272,13 @@ void ra_refine_live_regs_accurate(TCCIRState *ir)
     int p = TCCIR_DECODE_VREG_POSITION(ir->ls.intervals[j].vreg);
     if (p + 1 > maxpos) maxpos = p + 1;
   }
-  int tbl = 4 * maxpos;
-  #define DVIDX(vr) ((TCCIR_DECODE_VREG_TYPE(vr) * maxpos) + TCCIR_DECODE_VREG_POSITION(vr))
+  /* Vreg types are VAR/TEMP/PARAM = 1..3: index from type 1, so the tables
+   * below (7 bytes a slot) carry no never-touched type-0 quarter.  Slots for
+   * types 1..3 map exactly as before, shifted down by maxpos; every use and
+   * def is tcc_ir_vreg_is_valid (type 1..3), and a type-0 interval slot was
+   * never upward-exposed, so never tracked. */
+  int tbl = 3 * maxpos;
+  #define DVIDX(vr) (((TCCIR_DECODE_VREG_TYPE(vr) - 1) * maxpos) + TCCIR_DECODE_VREG_POSITION(vr))
   /* vreg -> physical regs */
   int8_t *vr0 = tcc_malloc(tbl); int8_t *vr1 = tcc_malloc(tbl);
   for (int i = 0; i < tbl; i++) { vr0[i] = -1; vr1[i] = -1; }
@@ -1328,7 +1366,7 @@ void ra_refine_live_regs_accurate(TCCIRState *ir)
   for (int bi = 0; bi < n; bi++) {
     IRQuadCompact *q = &ir->compact_instructions[bi];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF) continue;
-    int t = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+    int t = (int)tcc_ir_op_dest_u_imm32(ir, q);
     if (t < 0 || t >= bi) continue; /* not a back-edge */
     /* live-in at the loop header t: find the block starting at t. */
     int hb = -1;
@@ -1394,7 +1432,7 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
                               int max_vreg_pos)
 {
   int level = ra_coalesce_level();
-  if (level <= 0 || tcc_state->optimize < 1 || count <= 1 || max_vreg_pos <= 0)
+  if (level <= 0 || TCC_OPT(tcc_state, optimize) < 1 || count <= 1 || max_vreg_pos <= 0)
     return;
   int n = ir->next_instruction_index;
   if (n <= 0) return;
@@ -1422,10 +1460,17 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
     }
   }
   int nb = cfg->num_blocks;
-  int tbl = 4 * max_vreg_pos;
+  /* VIDX space: vreg types VAR/TEMP/PARAM are 1..3, so it starts at type 1
+   * and the per-slot tables (iv_of, cand_id, glob_of, def_head, ...) carry no
+   * never-touched type-0 quarter.  Every vreg looked up is either
+   * tcc_ir_vreg_is_valid (type 1..3) or an interval's, and a type-0 interval
+   * slot was never read; types 1..3 map as before, shifted down by
+   * max_vreg_pos, so bit order and every decision are unchanged. */
+  int tbl = 3 * max_vreg_pos;
   int nw = (tbl + 63) / 64;
-  /* Guard pathologically large functions (compile-time / memory). */
-  if (nb <= 0 || (long)nb * nw > (4L << 20)) { tcc_ir_cfg_free(cfg); return; }
+  /* Guard pathologically large functions (compile-time / memory).  Measured
+   * on the historical 4 * max_vreg_pos space so the same functions bail. */
+  if (nb <= 0 || (long)nb * ((4 * max_vreg_pos + 63) / 64) > (4L << 20)) { tcc_ir_cfg_free(cfg); return; }
 
   /* Historical note: this used to bail on any function containing a 64-bit
    * (LLONG) interval, blaming the UMULL half-operand spill path for a
@@ -1439,7 +1484,7 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
     for (int i = 0; i < count; i++)
       if (intervals[i].reg_type == LS_REG_TYPE_LLONG) { tcc_ir_cfg_free(cfg); return; }
 
-  #define VIDX(vr) ((TCCIR_DECODE_VREG_TYPE(vr) * max_vreg_pos) + TCCIR_DECODE_VREG_POSITION(vr))
+  #define VIDX(vr) (((TCCIR_DECODE_VREG_TYPE(vr) - 1) * max_vreg_pos) + TCCIR_DECODE_VREG_POSITION(vr))
 
   int *iv_of = tcc_malloc(sizeof(int) * tbl);
   for (int i = 0; i < tbl; i++) iv_of[i] = -1;
@@ -1463,14 +1508,13 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_FUNCPARAMVAL) continue;
-    IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    if (!irop_has_vreg(s1) || irop_is_immediate(s1)) continue;
-    int cid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+    if (!tcc_ir_op_src1_has_vreg(ir, q) || tcc_ir_op_src1_is_imm(ir, q)) continue;
+    int cid = TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, q));
     if (cid < 0) continue;
     for (int j = i + 1; j < n; j++) {
       IRQuadCompact *qq = &ir->compact_instructions[j];
       if (qq->op != TCCIR_OP_FUNCCALLVOID && qq->op != TCCIR_OP_FUNCCALLVAL) continue;
-      int ccid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, qq)));
+      int ccid = TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, qq));
       if (ccid == cid) {
         param_sibling[i] = call_param_head[j];
         call_param_head[j] = i;
@@ -1779,6 +1823,12 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
       if (irop_has_vreg(d) && irop_has_vreg(s) && !irop_is_immediate(s) &&
           !d.is_lval && !s.is_lval) {
         dv = irop_get_vreg(d); sv = irop_get_vreg(s);
+        /* An ra:loop_split entry copy: its two sides exist precisely to have
+         * DIFFERENT live ranges (short in-loop temp vs the spilled carrier);
+         * coalescing them back would undo the split. */
+        IRLiveInterval *dli = tcc_ir_vreg_live_interval(ir, dv);
+        if (dli && dli->loop_split)
+          dv = -1;
       }
     } else if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && level >= 3) {
       IROperand d = tcc_ir_op_get_dest(ir, q), s1 = tcc_ir_op_get_src1(ir, q),
@@ -1914,21 +1964,54 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
   int *cand_vidx = tcc_malloc(sizeof(int) * ncand);
   for (int i = 0; i < tbl; i++) if (cand_id[i] >= 0) cand_vidx[cand_id[i]] = i;
 
-  /* ---- Stage 3: interference among candidates (per-def live-out). ---- */
-  /* Two passes to build CSR adjacency: count degrees, then fill. */
+  /* ---- Stage 3: interference among candidates (per-def live-out). ----
+   * Pass 0 counts degrees, pass 1 fills either a CSR adjacency or, when it is
+   * smaller, an ncand x ncand bit matrix.  The CSR records a pair once per def
+   * of either member it is live across, so its rows repeat neighbors (2-3x on
+   * libc's regexec.c / regcomp.c), and copy candidates are few but mutually
+   * live: there the matrix is ~10x smaller (regexec.c -O2: 42 KB of CSR, the
+   * compile's peak, vs 4 KB).  Stage 4 reads neighbors only as a set
+   * (interference = any neighbor in the other class; pressure = distinct
+   * neighbor classes), so either form gives the same unions. */
   int *deg = tcc_mallocz(sizeof(int) * ncand);
   uint64_t *live = tcc_malloc(sizeof(uint64_t) * nw);
+  int rw = (ncand + 63) / 64; /* bit-matrix words per row */
 
   for (int pass = 0; pass < 2; pass++) {
     int *adj_start = NULL, *adj = NULL, total = 0;
+    uint64_t *imat = NULL;
     if (pass == 1) {
-      adj_start = tcc_malloc(sizeof(int) * (ncand + 1));
-      adj_start[0] = 0;
-      for (int c = 0; c < ncand; c++) adj_start[c + 1] = adj_start[c] + deg[c];
-      total = adj_start[ncand];
-      adj = total ? tcc_malloc(sizeof(int) * total) : tcc_malloc(1);
-      for (int c = 0; c < ncand; c++) deg[c] = adj_start[c]; /* reuse as write cursor */
+      size_t csr_bytes = 0, mat_bytes = (size_t)ncand * rw * sizeof(uint64_t);
+      for (int c = 0; c < ncand; c++) csr_bytes += deg[c];
+      csr_bytes = (csr_bytes + ncand + 1) * sizeof(int);
+      if (mat_bytes <= csr_bytes) {
+        imat = tcc_mallocz(mat_bytes);
+      } else {
+        adj_start = tcc_malloc(sizeof(int) * (ncand + 1));
+        adj_start[0] = 0;
+        for (int c = 0; c < ncand; c++) adj_start[c + 1] = adj_start[c] + deg[c];
+        total = adj_start[ncand];
+        adj = total ? tcc_malloc(sizeof(int) * total) : tcc_malloc(1);
+        for (int c = 0; c < ncand; c++) deg[c] = adj_start[c]; /* reuse as write cursor */
+      }
     }
+    /* Visit candidate m_'s interference neighbors as x_, until stop_. */
+    #define RA_CO_FOR_NEIGHBOR(m_, x_, stop_, body)                               \
+      do {                                                                      \
+        if (imat) {                                                             \
+          const uint64_t *row_ = imat + (size_t)(m_) * rw;                      \
+          for (int w_ = 0; w_ < rw && !(stop_); w_++)                           \
+            for (uint64_t b_ = row_[w_]; b_ && !(stop_); b_ &= b_ - 1) {        \
+              int x_ = (w_ << 6) + __builtin_ctzll(b_);                         \
+              body                                                              \
+            }                                                                   \
+        } else {                                                                \
+          for (int a_ = adj_start[(m_)]; a_ < adj_start[(m_) + 1] && !(stop_); a_++) { \
+            int x_ = adj[a_];                                                   \
+            body                                                                \
+          }                                                                     \
+        }                                                                       \
+      } while (0)
     for (int b = 0; b < nb; b++) {
       RA_CO_LIVE_OUT(live, b);
       int s = cfg->blocks[b].start_idx, e = cfg->blocks[b].end_idx;
@@ -1942,12 +2025,11 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
          * it genuinely interferes with D — must NOT be excluded. */
         int32_t copy_src = -1;
         if (q->op == TCCIR_OP_ASSIGN) {
-          IROperand s1 = tcc_ir_op_get_src1(ir, q);
           IROperand dd = tcc_ir_op_get_dest(ir, q);
           /* Only a pure register copy `D <- S` (no deref) makes D and S equal;
            * a deref ASSIGN is a load/store, so its operands genuinely interfere. */
-          if (irop_has_vreg(s1) && !irop_is_immediate(s1) && !s1.is_lval && !dd.is_lval)
-            copy_src = irop_get_vreg(s1);
+          if (tcc_ir_op_src1_has_vreg(ir, q) && !tcc_ir_op_src1_is_imm(ir, q) && !tcc_ir_op_src1_is_lval(ir, q) && !dd.is_lval)
+            copy_src = tcc_ir_op_src1_vreg(ir, q);
         }
         if (hd && tcc_ir_vreg_is_valid(ir, def)) {
           int d = VIDX(def);
@@ -1960,6 +2042,10 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
               if (vi == d) continue;
               if (csrc >= 0 && vi == csrc) continue;
               if (pass == 0) { deg[cd]++; deg[c]++; }
+              else if (imat) {
+                imat[(size_t)cd * rw + (c >> 6)] |= 1ull << (c & 63);
+                imat[(size_t)c * rw + (cd >> 6)] |= 1ull << (cd & 63);
+              }
               else { adj[deg[cd]++] = c; adj[deg[c]++] = cd; }
             }
           }
@@ -1985,6 +2071,16 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
       int *seen = tcc_mallocz(sizeof(int) * ncand); /* generation-stamped neighbor set */
       int gen = 0;
       for (int c = 0; c < ncand; c++) { parent[c] = c; mnext[c] = -1; }
+      /* Degree of every class, for the Briggs test below: a member's own
+       * neighbor count to start, and on a merge the sum of both -- never less
+       * than the merged class really has, so it can only call a neighbor
+       * significant too often. */
+      const int briggs = !tcc_ir_opt_pass_disabled("ra:co_briggs");
+      int *cdeg = briggs ? tcc_mallocz(sizeof(int) * ncand) : NULL;
+      for (int c = 0; briggs && c < ncand; c++) {
+        int stop = 0;
+        RA_CO_FOR_NEIGHBOR(c, x, stop, { (void)x; cdeg[c]++; });
+      }
       #define UF_FIND(x) ({ int _r = (x); while (parent[_r] != _r) { parent[_r] = parent[parent[_r]]; _r = parent[_r]; } _r; })
 
       /* K for the Briggs degree test = number of allocatable int regs. */
@@ -2017,9 +2113,9 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
         /* non-interference: no member of class ra interferes with class rb */
         int interferes = 0;
         for (int m = ra; m >= 0 && !interferes; m = mnext[m]) {
-          for (int a = adj_start[m]; a < adj_start[m + 1]; a++) {
-            if (UF_FIND(adj[a]) == rb) { interferes = 1; break; }
-          }
+          RA_CO_FOR_NEIGHBOR(m, x, interferes, {
+            if (UF_FIND(x) == rb) interferes = 1;
+          });
         }
         if (interferes) continue;
         /* Conservative pressure test: reject if the merged class would have >= K
@@ -2042,16 +2138,21 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
           for (int side = 0; side < 2 && !over; side++) {
             int r = side ? rb : ra;
             for (int m = r; m >= 0 && !over; m = mnext[m]) {
-              for (int a = adj_start[m]; a < adj_start[m + 1]; a++) {
-                int nr = UF_FIND(adj[a]);
-                if (nr == ra || nr == rb) continue;
-                if (seen[nr] != gen) {
+              RA_CO_FOR_NEIGHBOR(m, x, over, {
+                int nr = UF_FIND(x);
+                /* Briggs: only a neighbor of significant degree (>= K) can be
+                 * left without a color by the merge; one with fewer neighbors
+                 * than registers always finds one.  The induction web of a
+                 * loop inlined into a large function has dozens of neighbors
+                 * -- every value live across it -- but few of them crowded,
+                 * and counting all of them kept its phi copy in the loop. */
+                if (nr != ra && nr != rb && seen[nr] != gen && (!briggs || cdeg[nr] >= K)) {
                   seen[nr] = gen;
                   SSAInterval *niv = &intervals[iv_of[cand_vidx[nr]]];
                   distinct += (niv->reg_type == LS_REG_TYPE_LLONG) ? 2 : 1;
-                  if (distinct >= limit) { over = 1; break; }
+                  if (distinct >= limit) over = 1;
                 }
-              }
+              });
             }
           }
           if (over) continue;
@@ -2059,6 +2160,8 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
         /* union (rank) + splice member lists */
         if (rank[ra] < rank[rb]) { int t = ra; ra = rb; rb = t; }
         parent[rb] = ra;
+        if (briggs)
+          cdeg[ra] += cdeg[rb];
         if (rank[ra] == rank[rb]) rank[ra]++;
         int tail = ra; while (mnext[tail] >= 0) tail = mnext[tail];
         mnext[tail] = rb;
@@ -2075,6 +2178,7 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
           /* gather members, pick rep */
           int rep_iv = -1; uint32_t lo_s = 0xffffffffu, hi_e = 0;
           int xcall = 0; uint32_t uc = 0, nuc = 0, sum_len = 0;
+          int cs_all = 1; uint32_t cs_sum = 0;
           int pref = -1; uint32_t pref_end = 0;
           for (int m = c; m >= 0; m = mnext[m]) {
             int ivi = iv_of[cand_vidx[m]];
@@ -2082,6 +2186,7 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
             if (iv->start < lo_s) lo_s = iv->start;
             if (iv->end > hi_e) hi_e = iv->end;
             xcall |= iv->crosses_call;
+            if (iv->crosses_call) { cs_all &= iv->cs_ok; cs_sum += iv->cs_cost; }
             uc += iv->use_count;
             nuc += iv->narrow_uses;
             sum_len += iv->end - iv->start + 1;
@@ -2111,6 +2216,8 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
           intervals[rep_iv].start = lo_s;
           intervals[rep_iv].end = hi_e;
           intervals[rep_iv].crosses_call = xcall ? 1 : 0;
+          intervals[rep_iv].cs_ok = (xcall && cs_all && cs_sum > 0) ? 1 : 0;
+          intervals[rep_iv].cs_cost = cs_sum > 65535 ? 65535 : (uint16_t)cs_sum;
           intervals[rep_iv].use_count = (uc > 65535) ? 65535 : (uint16_t)uc;
           intervals[rep_iv].narrow_uses = (nuc > 65535) ? 65535 : (uint16_t)nuc;
           if (pref >= 0 && intervals[rep_iv].pref_reg < 0)
@@ -2130,10 +2237,11 @@ void ra_coalesce_graph(TCCIRState *ir, SSAInterval *intervals, int count,
       }
       RA_DBG("coalesce: %d candidates, %d edges, %d unions (level=%d)", ncand, ne, merged, level);
 
-      tcc_free(parent); tcc_free(rank); tcc_free(mnext); tcc_free(seen);
+      tcc_free(parent); tcc_free(rank); tcc_free(mnext); tcc_free(seen); if (cdeg) tcc_free(cdeg);
       #undef UF_FIND
     }
-    if (pass == 1) { tcc_free(adj_start); tcc_free(adj); }
+    if (pass == 1) { tcc_free(adj_start); tcc_free(adj); tcc_free(imat); }
+    #undef RA_CO_FOR_NEIGHBOR
   }
 
   #undef ADD_CAND

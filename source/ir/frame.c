@@ -46,8 +46,9 @@
  * Functions whose frame is reachable other than through IR operands are left
  * alone: -g (debug info records the original offsets), bounds checking,
  * variadic functions (register save area), nested functions and captures
- * (the static chain reads the parent's frame by offset), VLAs, inline asm,
- * setjmp.
+ * (the static chain reads the parent's frame by offset), VLAs, setjmp.
+ * Inline asm reads its operands from the SValues the front end saved with it;
+ * the objects those name by offset are pinned, everything else moves.
  */
 
 #define USING_GLOBALS
@@ -64,7 +65,7 @@ static int frame_record(int loc, int size, int mask, int flags)
   /* When the layout may be recoloured, a guard byte above the object keeps its
    * one-past-end address inside its own record: otherwise it would equal the
    * start of the object allocated before it, and could not be told apart. */
-  int guard = ir && tcc_state->optimize > 0 && !tcc_state->do_debug && !tcc_bounds_checking(tcc_state);
+  int guard = ir && TCC_OPT(tcc_state, optimize) > 0 && !tcc_state->do_debug && !tcc_bounds_checking(tcc_state);
   /* The guard must not cost an object the word alignment it would otherwise
    * have had: inline copies into a char array use LDM/STM, which fault on an
    * unaligned address. */
@@ -78,13 +79,14 @@ static int frame_record(int loc, int size, int mask, int flags)
     if (ir->frame_obj_count == ir->frame_obj_cap)
     {
       ir->frame_obj_cap = ir->frame_obj_cap ? ir->frame_obj_cap * 2 : 32;
-      ir->frame_objs = tcc_realloc(ir->frame_objs, sizeof(int32_t) * 4 * ir->frame_obj_cap);
+      ir->frame_objs = tcc_realloc(ir->frame_objs, sizeof(int32_t) * FRAME_OBJ_WORDS * ir->frame_obj_cap);
     }
-    int32_t *o = &ir->frame_objs[4 * ir->frame_obj_count++];
+    int32_t *o = &ir->frame_objs[FRAME_OBJ_WORDS * ir->frame_obj_count++];
     o[0] = off;
     o[1] = loc - off;
     o[2] = size > 0 ? size : 1;
     o[3] = flags;
+    o[4] = 0;
   }
   return off;
 }
@@ -134,9 +136,9 @@ static void frame_cover(CType *t, int at, uint64_t *cov, int depth)
 void tcc_ir_frame_note_type(int off, CType *type)
 {
   TCCIRState *ir = tcc_state ? tcc_state->ir : NULL;
-  if (!ir || !type || !ir->frame_obj_count || ir->frame_objs[4 * (ir->frame_obj_count - 1)] != off)
+  if (!ir || !type || !ir->frame_obj_count || ir->frame_objs[FRAME_OBJ_WORDS * (ir->frame_obj_count - 1)] != off)
     return;
-  const int32_t *o = &ir->frame_objs[4 * (ir->frame_obj_count - 1)];
+  const int32_t *o = &ir->frame_objs[FRAME_OBJ_WORDS * (ir->frame_obj_count - 1)];
   uint64_t cov = 0;
   frame_cover(type, 0, &cov, 0);
   const int ext = o[1] < 64 ? o[1] : 64;
@@ -162,7 +164,7 @@ uint64_t tcc_ir_frame_padding(TCCIRState *ir, int lo, int hi)
   int objs = 0;
   for (int k = 0; k < ir->frame_obj_count; k++)
   {
-    const int32_t *o = &ir->frame_objs[4 * k];
+    const int32_t *o = &ir->frame_objs[FRAME_OBJ_WORDS * k];
     if (o[0] >= hi || o[0] + o[1] <= lo)
       continue;
     if (o[0] != lo)
@@ -209,9 +211,155 @@ void tcc_ir_frame_scope_end(TCCIRState *ir, int first_obj, int insn, int keep)
     return;
   for (int k = first_obj; k < ir->frame_obj_count; k++)
   {
-    int32_t *o = &ir->frame_objs[4 * k];
+    int32_t *o = &ir->frame_objs[FRAME_OBJ_WORDS * k];
     if (!(o[3] >> 4) && o[0] != keep)
       o[3] |= (insn + 1) << 4;
+  }
+}
+
+/* A C block's objects (new_scope .. prev_scope): their lifetime is the block,
+ * instructions [start, end) -- they die at its end whatever their address did,
+ * and are born again each time it is entered, so a loop whose back edge leaves
+ * and re-enters the block carries nothing in them (frame_live_extents only
+ * widens a block-scoped object over a loop that stays inside its block).
+ * Objects an inner block or an inlined body already ended keep their end. */
+void tcc_ir_frame_scope_block(TCCIRState *ir, int first_obj, int start, int end)
+{
+  if (!ir || start < 0 || end < start || end >= (1 << 26))
+    return;
+  for (int k = first_obj; k < ir->frame_obj_count; k++)
+  {
+    int32_t *o = &ir->frame_objs[FRAME_OBJ_WORDS * k];
+    if (!(o[3] >> 4))
+    {
+      o[3] |= (end + 1) << 4;
+      o[4] = start + 1;
+    }
+  }
+}
+
+/* A scope end is an instruction index, so every pass that moves instructions
+ * must move it like a jump target -- a stale one ends an escaped local while
+ * its pointer is still read, and relayout hands its bytes to another object
+ * (docs/bugs/frame-relayout-stale-inlined-scope-end.md).  These return the
+ * first instruction past the body, or -1 for an unscoped object. */
+static int frame_scope_get(const int32_t *o)
+{
+  int e = o[3] >> 4;
+  return e && e < (1 << 26) ? e - 1 : -1;
+}
+
+static void frame_scope_set(int32_t *o, int insn)
+{
+  if (insn >= 0 && insn < (1 << 26) - 1)
+    o[3] = (o[3] & 0xF) | ((insn + 1) << 4);
+}
+
+/* A label defined at instruction `jind` (gind() at its definition, which is
+ * also the orig_index of the instruction that follows it). */
+void tcc_ir_label_note(TCCIRState *ir, int jind)
+{
+  if (!ir || jind < 0)
+    return;
+  if (ir->label_count == ir->label_cap)
+  {
+    ir->label_cap = ir->label_cap ? 2 * ir->label_cap : 8;
+    ir->label_pos = tcc_realloc(ir->label_pos, sizeof(int32_t) * 2 * ir->label_cap);
+  }
+  ir->label_pos[2 * ir->label_count] = jind;
+  ir->label_pos[2 * ir->label_count + 1] = jind;
+  ir->label_count++;
+}
+
+/* Where the label defined at `jind` is now, or -1 if it was never noted. */
+int tcc_ir_label_insn(TCCIRState *ir, int jind)
+{
+  for (int k = 0; ir && k < ir->label_count; k++)
+    if (ir->label_pos[2 * k] == jind)
+      return ir->label_pos[2 * k + 1];
+  return -1;
+}
+
+/* One instruction was inserted before `before_idx`: an end at or after it
+ * moves up, so an insertion right before the end counts as inside the body.
+ * Label positions move the same way (as jump targets do). */
+void tcc_ir_frame_scope_insert(TCCIRState *ir, int before_idx)
+{
+  for (int k = 0; ir && k < ir->label_count; k++)
+    if (ir->label_pos[2 * k + 1] >= before_idx)
+      ir->label_pos[2 * k + 1]++;
+  for (int k = 0; ir && k < ir->frame_obj_count; k++)
+  {
+    int32_t *o = &ir->frame_objs[FRAME_OBJ_WORDS * k];
+    int e = frame_scope_get(o);
+    if (e >= before_idx)
+      frame_scope_set(o, e + 1);
+    /* A block's start moves only past an insertion strictly before it: one
+     * right at the start counts as inside, which can only widen the block. */
+    if (o[4] - 1 > before_idx)
+      o[4]++;
+  }
+}
+
+/* The instructions were renumbered: old index i is now map[i] (i < old_n),
+ * -1 when deleted -- the next surviving instruction then stands in for it,
+ * as it does for a branch -- and old_n became new_n. */
+void tcc_ir_frame_scope_remap(TCCIRState *ir, const int *map, int old_n, int new_n)
+{
+  for (int k = 0; ir && k < ir->label_count; k++)
+  {
+    int p = ir->label_pos[2 * k + 1], np = new_n;
+    for (int i = p; i >= 0 && i < old_n; i++)
+      if (map[i] >= 0)
+      {
+        np = map[i];
+        break;
+      }
+    ir->label_pos[2 * k + 1] = np;
+  }
+  for (int k = 0; ir && k < ir->frame_obj_count; k++)
+  {
+    int32_t *o = &ir->frame_objs[FRAME_OBJ_WORDS * k];
+    int e = frame_scope_get(o);
+    if (e < 0)
+      continue;
+    int ne = new_n;
+    for (int i = e; i < old_n; i++)
+      if (map[i] >= 0)
+      {
+        ne = map[i];
+        break;
+      }
+    frame_scope_set(o, ne);
+    if (o[4] > 0)
+    {
+      /* The first surviving instruction at or after the start begins it. */
+      int ns = new_n;
+      for (int i = o[4] - 1; i < old_n; i++)
+        if (map[i] >= 0)
+        {
+          ns = map[i];
+          break;
+        }
+      o[4] = (ns < ne ? ns : ne) + 1;
+    }
+  }
+}
+
+/* Instructions lo..hi were duplicated or reordered among themselves (loop
+ * unrolling, relayout): a body ending inside may now have code anywhere in
+ * that range, so it ends past hi. */
+void tcc_ir_frame_scope_widen(TCCIRState *ir, int lo, int hi)
+{
+  for (int k = 0; ir && k < ir->frame_obj_count; k++)
+  {
+    int32_t *o = &ir->frame_objs[FRAME_OBJ_WORDS * k];
+    int e = frame_scope_get(o);
+    if (e > lo && e <= hi)
+      frame_scope_set(o, hi + 1);
+    /* ... and a block starting inside may now have code from lo on. */
+    if (o[4] - 1 > lo && o[4] - 1 <= hi)
+      o[4] = lo + 1;
   }
 }
 
@@ -227,9 +375,12 @@ void tcc_ir_frame_note_sret_call(int call_id, int size)
       n *= 2;
     ir->sret_calls = tcc_realloc(ir->sret_calls, sizeof(int32_t) * n);
     memset(ir->sret_calls + ir->sret_calls_size, 0, sizeof(int32_t) * (n - ir->sret_calls_size));
+    ir->sret_calls_empty = tcc_realloc(ir->sret_calls_empty, n);
+    memset(ir->sret_calls_empty + ir->sret_calls_size, 0, n - ir->sret_calls_size);
     ir->sret_calls_size = n;
   }
   ir->sret_calls[call_id] = size > 0 ? size : 1;
+  ir->sret_calls_empty[call_id] = size <= 0;
 }
 
 static int frame_idx_cmp(const void *a, const void *b)
@@ -243,8 +394,8 @@ int tcc_ir_frame_object_size_at(TCCIRState *ir, int start)
   if (!ir || ir->frame_relaid)
     return -1;
   for (int k = 0; k < ir->frame_obj_count; k++)
-    if (ir->frame_objs[4 * k] == start)
-      return ir->frame_objs[4 * k + 2];
+    if (ir->frame_objs[FRAME_OBJ_WORDS * k] == start)
+      return ir->frame_objs[FRAME_OBJ_WORDS * k + 2];
   return -1;
 }
 
@@ -259,10 +410,10 @@ int tcc_ir_frame_object_at(TCCIRState *ir, int off, int *lo, int *hi)
     int32_t *e = tcc_malloc(sizeof(int32_t) * 2 * n);
     for (int k = 0; k < n; k++)
     {
-      e[2 * k] = ir->frame_objs[4 * k];
-      e[2 * k + 1] = ir->frame_objs[4 * k] + ir->frame_objs[4 * k + 1];
+      e[2 * k] = ir->frame_objs[FRAME_OBJ_WORDS * k];
+      e[2 * k + 1] = ir->frame_objs[FRAME_OBJ_WORDS * k] + ir->frame_objs[FRAME_OBJ_WORDS * k + 1];
     }
-    qsort(e, n, sizeof(int32_t) * 2, frame_idx_cmp);
+    tcc_qsort(e, n, sizeof(int32_t) * 2, frame_idx_cmp);
     for (int k = 0; k < n; k++)
     {
       if (m && e[2 * k] < e[2 * m - 1])
@@ -305,6 +456,9 @@ static int frame_name_returns_twice(const char *name)
                                       "qsetjmp",  "getcontext", "setjmp_syscall", "secure_setjmp"};
   while (*name == '_')
     name++;
+  /* Every name below starts with one of these: one compare rejects the rest. */
+  if (*name != 's' && *name != 'v' && *name != 'q' && *name != 'g')
+    return 0;
   for (unsigned k = 0; k < sizeof names / sizeof names[0]; k++)
     if (!strcmp(name, names[k]))
       return 1;
@@ -337,7 +491,8 @@ typedef struct
   uint8_t live;
   uint8_t pinned;  /* a gap: some untracked allocation, never dropped or moved */
   uint8_t kind;    /* FRAME_OBJ_* */
-  int scope_end;   /* first instruction past the inlined body that owns it, 0 = none */
+  int scope_end;   /* first instruction past the inlined body or block that owns it, + 1; 0 = none */
+  int scope_start; /* first instruction of the block that owns it, + 1; 0 = none (tcc_ir_frame_scope_block) */
   uint8_t escaped; /* its address may be used anywhere after it is taken */
   uint8_t precise; /* lifetime from liveness (frame_precise_lifetimes) */
   int first[2], last[2]; /* lifetime in source order and in RPO (frame_rpo);
@@ -397,12 +552,41 @@ static int frame_operand_offset(IROperand op, int bottom, int *off)
   return frame_operand_concrete(op, off) && *off >= bottom && *off < 0;
 }
 
+int tcc_ir_asm_frame_ref(TCCIRState *ir, int k, int *off)
+{
+#ifdef CONFIG_TCC_ASM
+  for (int a = 0; ir && a < ir->inline_asm_count; a++)
+  {
+    const TCCIRInlineAsm *ia = &ir->inline_asms[a];
+    for (int i = 0; ia->asm_str && ia->values && i < ia->nb_operands; i++)
+    {
+      const SValue *sv = &ia->values[i];
+      const int v = sv->r & VT_VALMASK;
+      /* tcc_ir_fill_registers leaves exactly these alone: a local without a
+       * vreg is its frame slot.  A parameter's slot is the caller's. */
+      if ((v != VT_LOCAL && v != VT_LLOCAL) || sv->vr != -1 || (sv->r & VT_PARAM))
+        continue;
+      if (k-- == 0)
+      {
+        *off = (int)sv->c.i;
+        return 1;
+      }
+    }
+  }
+#else
+  (void)ir, (void)k, (void)off;
+#endif
+  return 0;
+}
+
 static int frame_function_eligible(TCCIRState *ir)
 {
   if (tcc_state->do_debug || tcc_bounds_checking(tcc_state))
     return 0;
   if (ir->is_variadic || ir->has_static_chain || ir->captured_count > 0 || tcc_state->nb_nested_funcs > 0)
     return 0;
+  /* Inline asm is fine: what it names by frame offset outside the IR is
+   * pinned (tcc_ir_asm_frame_ref), and a pointer it is handed escapes. */
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
     switch (ir->compact_instructions[i].op)
@@ -410,9 +594,6 @@ static int frame_function_eligible(TCCIRState *ir)
     case TCCIR_OP_VLA_ALLOC:
     case TCCIR_OP_VLA_SP_SAVE:
     case TCCIR_OP_VLA_SP_RESTORE:
-    case TCCIR_OP_ASM_INPUT:
-    case TCCIR_OP_INLINE_ASM:
-    case TCCIR_OP_ASM_OUTPUT:
     case TCCIR_OP_SETJMP:
     case TCCIR_OP_NL_SETJMP:
       return 0;
@@ -510,6 +691,16 @@ typedef struct
    * and D's begins (frame_find_copies): the call instruction and the two
    * segments.  frame_colour gives them the same bytes, and the copy goes. */
   int *copy_at, *copy_pos, *copy_from, *copy_from_pos, *copy_dst, *copy_src, ncopy;
+  /* A copy made of word loads and stores rather than a call
+   * (frame_find_word_copies): its instructions are
+   * copy_insns[copy_first[c] .. copy_first[c] + copy_count[c]); a call's
+   * copy_count is 0. */
+  int *copy_first, *copy_count, *copy_insns, ncopy_insns;
+  /* And the other objects its run touches: copy_touch[copy_tfirst[c] ..
+   * + copy_tcount[c]), TAINT_MULTI for a pointer that may reach several. */
+  int *copy_tfirst, *copy_tcount, *copy_touch, ncopy_touch;
+  uint8_t *copy_precise; /* proved by liveness, not by the lifetimes' hulls */
+  struct FrameKept *kept; /* object liveness, kept for frame_colour's group checks */
 } FrameLive;
 
 static int frame_classify(FrameLive *fl, IROperand op, int *id)
@@ -682,7 +873,7 @@ static int frame_op_keeps_pointers(int op)
 /* The fourth operand slot some ops keep at operand_base + 3. */
 static int frame_op_has_slot3(int op)
 {
-  return tcc_ir_op_is_mac(op) || op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_SELECT;
+  return ir_op_has(op, IROP_A_SLOT3);
 }
 
 static int frame_call_id(TCCIRState *ir, IROperand enc)
@@ -794,13 +985,13 @@ static int frame_rpo(TCCIRState *ir, int n, int *pos, int **be_out, int *nbe_out
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
       /* A target past the last instruction is the epilogue: an exit. */
-      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int t = (int)tcc_ir_op_dest_imm(ir, q);
       if (t >= 0 && t < n)
         leader[t] = 1;
     }
     else if (q->op == TCCIR_OP_SWITCH_TABLE)
     {
-      int tid = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      int tid = (int)tcc_ir_op_src2_imm(ir, q);
       if (tid < 0 || tid >= ir->num_switch_tables)
         goto done;
       TCCIRSwitchTable *tab = &ir->switch_tables[tid];
@@ -837,7 +1028,7 @@ static int frame_rpo(TCCIRState *ir, int n, int *pos, int **be_out, int *nbe_out
     IRQuadCompact *q = &ir->compact_instructions[bstart[b + 1] - 1];
     int fall = q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_SWITCH_TABLE && q->op != TCCIR_OP_RETURNVALUE &&
                q->op != TCCIR_OP_RETURNVOID && q->op != TCCIR_OP_IJUMP;
-    int extra = q->op == TCCIR_OP_SWITCH_TABLE ? ir->switch_tables[irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q))].num_entries + 1 : 1;
+    int extra = q->op == TCCIR_OP_SWITCH_TABLE ? ir->switch_tables[tcc_ir_op_src2_imm(ir, q)].num_entries + 1 : 1;
     if (nsucc + extra + 1 > scap)
     {
       scap = (nsucc + extra + 1) * 2;
@@ -859,13 +1050,13 @@ static int frame_rpo(TCCIRState *ir, int n, int *pos, int **be_out, int *nbe_out
       int back = pass == 2;
       if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
       {
-        int ti = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+        int ti = (int)tcc_ir_op_dest_imm(ir, q);
         if (ti >= 0 && ti < n && (block_of[ti] <= b) == back)
           succ[nsucc++] = block_of[ti];
       }
       else if (q->op == TCCIR_OP_SWITCH_TABLE)
       {
-        TCCIRSwitchTable *tab = &ir->switch_tables[irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q))];
+        TCCIRSwitchTable *tab = &ir->switch_tables[tcc_ir_op_src2_imm(ir, q)];
         for (int k = -1; k < tab->num_entries; k++)
         {
           int t = k < 0 ? tab->default_target : tab->targets[k];
@@ -1166,7 +1357,7 @@ static void frame_precise_lifetimes(FrameLive *fl, FrameCFG *cfg, const int *pos
     return;
   }
 
-  qsort(ev->v, ev->n, sizeof(FrameEv), frame_ev_cmp);
+  tcc_qsort(ev->v, ev->n, sizeof(FrameEv), frame_ev_cmp);
   uint32_t *gen = tcc_mallocz(sizeof(uint32_t) * nb * W);
   uint32_t *kill = tcc_mallocz(sizeof(uint32_t) * nb * W);
   uint32_t *in = tcc_mallocz(sizeof(uint32_t) * nb * W);
@@ -1388,6 +1579,44 @@ static int frame_insn_touches(FrameLive *fl, int j, int d, int call, const int *
   return 0;
 }
 
+static void frame_add_copy(FrameLive *fl, int at, int at_pos, int from, int from_pos, int d, int s,
+                           const int *insns, int ninsns)
+{
+  if (fl->ncopy % 64 == 0)
+  {
+    int cap = fl->ncopy + 64;
+    fl->copy_at = tcc_realloc(fl->copy_at, sizeof(int) * cap);
+    fl->copy_pos = tcc_realloc(fl->copy_pos, sizeof(int) * cap);
+    fl->copy_from = tcc_realloc(fl->copy_from, sizeof(int) * cap);
+    fl->copy_from_pos = tcc_realloc(fl->copy_from_pos, sizeof(int) * cap);
+    fl->copy_dst = tcc_realloc(fl->copy_dst, sizeof(int) * cap);
+    fl->copy_src = tcc_realloc(fl->copy_src, sizeof(int) * cap);
+    fl->copy_first = tcc_realloc(fl->copy_first, sizeof(int) * cap);
+    fl->copy_count = tcc_realloc(fl->copy_count, sizeof(int) * cap);
+    fl->copy_tfirst = tcc_realloc(fl->copy_tfirst, sizeof(int) * cap);
+    fl->copy_tcount = tcc_realloc(fl->copy_tcount, sizeof(int) * cap);
+    fl->copy_precise = tcc_realloc(fl->copy_precise, cap);
+  }
+  fl->copy_precise[fl->ncopy] = 0;
+  fl->copy_tfirst[fl->ncopy] = fl->ncopy_touch;
+  fl->copy_tcount[fl->ncopy] = 0;
+  fl->copy_at[fl->ncopy] = at;
+  fl->copy_pos[fl->ncopy] = at_pos;
+  fl->copy_from[fl->ncopy] = from;
+  fl->copy_from_pos[fl->ncopy] = from_pos;
+  fl->copy_dst[fl->ncopy] = d;
+  fl->copy_src[fl->ncopy] = s;
+  fl->copy_first[fl->ncopy] = fl->ncopy_insns;
+  fl->copy_count[fl->ncopy] = ninsns;
+  if (ninsns > 0)
+  {
+    fl->copy_insns = tcc_realloc(fl->copy_insns, sizeof(int) * (fl->ncopy_insns + ninsns));
+    memcpy(fl->copy_insns + fl->ncopy_insns, insns, sizeof(int) * ninsns);
+    fl->ncopy_insns += ninsns;
+  }
+  fl->ncopy++;
+}
+
 static void frame_find_copies(FrameLive *fl, const int *call_params, const int *param_next, const int *param_call,
                               const int *pos, const FrameCFG *cfg)
 {
@@ -1397,14 +1626,18 @@ static void frame_find_copies(FrameLive *fl, const int *call_params, const int *
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_FUNCCALLVOID || call_params[i] < 0 || !frame_is_copy_helper(ir, q))
       continue;
-    int d = -1, s = -1, ddef = -1, sdef, id;
+    int d = -1, s = -1, ddef = -1, sdef, id, is_volatile = 0;
     int64_t len = -1;
     for (int p = call_params[i]; p >= 0; p = param_next[p])
     {
       IRQuadCompact *pq = &ir->compact_instructions[p];
       IROperand a = tcc_ir_op_get_src1(ir, pq);
-      int idx = TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, pq)));
+      int idx = TCCIR_DECODE_PARAM_IDX((uint32_t)tcc_ir_op_src2_imm(ir, pq));
       int kind = frame_classify(fl, a, &id);
+      /* A copy into or out of a volatile object must run: sharing the two
+       * objects' bytes would turn it into a self-copy and delete it. */
+      if (idx < 2 && tcc_ir_access_is_volatile(ir, a))
+        is_volatile = 1;
       if (idx == 0)
         d = frame_ptr_to_start(fl, a, kind, id, &ddef);
       else if (idx == 1)
@@ -1412,7 +1645,7 @@ static void frame_find_copies(FrameLive *fl, const int *call_params, const int *
       else if (idx == 2 && irop_is_immediate(a))
         len = irop_get_imm64_ex(ir, a);
     }
-    if (d < 0 || s < 0 || d == s)
+    if (d < 0 || s < 0 || d == s || is_volatile)
       continue;
     FrameSeg *gd = &fl->seg[d], *gs = &fl->seg[s];
     /* Only [0, len) is copied, and it becomes the same bytes of both: the
@@ -1437,24 +1670,562 @@ static void frame_find_copies(FrameLive *fl, const int *call_params, const int *
     }
     if (gd->first[0] != from || gd->first[1] != pos[from])
       continue;
-    if (fl->ncopy % 64 == 0)
-    {
-      int cap = fl->ncopy + 64;
-      fl->copy_at = tcc_realloc(fl->copy_at, sizeof(int) * cap);
-      fl->copy_pos = tcc_realloc(fl->copy_pos, sizeof(int) * cap);
-      fl->copy_from = tcc_realloc(fl->copy_from, sizeof(int) * cap);
-      fl->copy_from_pos = tcc_realloc(fl->copy_from_pos, sizeof(int) * cap);
-      fl->copy_dst = tcc_realloc(fl->copy_dst, sizeof(int) * cap);
-      fl->copy_src = tcc_realloc(fl->copy_src, sizeof(int) * cap);
-    }
-    fl->copy_at[fl->ncopy] = i;
-    fl->copy_pos[fl->ncopy] = pos[i];
-    fl->copy_from[fl->ncopy] = from;
-    fl->copy_from_pos[fl->ncopy] = pos[from];
-    fl->copy_dst[fl->ncopy] = d;
-    fl->copy_src[fl->ncopy] = s;
-    fl->ncopy++;
+    frame_add_copy(fl, i, pos[i], from, pos[from], d, s, NULL, 0);
   }
+}
+
+/* A copy between two frame objects made of word moves -- `T <-- S+k [LOAD]`
+ * then `D+k <-- T [STORE]` for a run of k, each T read only by its store --
+ * is what a small struct assignment, or an inlined by-value struct parameter,
+ * leaves behind: the Zig C backend copies structs from temporary to temporary.
+ * When S's lifetime ends in the run and D's begins there, the two objects can
+ * share their bytes exactly as a memmove's can (frame_find_copies): every
+ * store then writes back the word its load has just read, and the run goes. */
+typedef struct
+{
+  int s, d, blk, load, store, rel, width;
+} FrameWordMove;
+
+static int frame_word_move_cmp(const void *a, const void *b)
+{
+  const FrameWordMove *x = a, *y = b;
+  if (x->s != y->s)
+    return x->s < y->s ? -1 : 1;
+  if (x->d != y->d)
+    return x->d < y->d ? -1 : 1;
+  if (x->blk != y->blk)
+    return x->blk < y->blk ? -1 : 1;
+  return x->store < y->store ? -1 : x->store > y->store;
+}
+
+/* The one byte range of S or D that instruction x reads (LOAD) or writes
+ * (STORE) directly, or 0 when it touches them any other way. */
+static int frame_word_access(FrameLive *fl, int x, int s, int d, int *seg, int *rel, int *width, int *write)
+{
+  TCCIRState *ir = fl->ir;
+  IRQuadCompact *q = &ir->compact_instructions[x];
+  IROperand mem, other;
+  if (q->op == TCCIR_OP_LOAD)
+    mem = tcc_ir_op_get_src1(ir, q), other = tcc_ir_op_get_dest(ir, q), *write = 0;
+  else if (q->op == TCCIR_OP_STORE)
+    mem = tcc_ir_op_get_dest(ir, q), other = tcc_ir_op_get_src1(ir, q), *write = 1;
+  else
+    return 0;
+  int id, off, t = frame_op_taint(fl, other);
+  if (t == s || t == d || t == TAINT_MULTI || frame_classify(fl, other, &id) == FOP_MEM ||
+      frame_classify(fl, mem, &id) != FOP_MEM || (id != s && id != d) || !frame_operand_offset(mem, fl->bottom, &off))
+    return 0;
+  *seg = id;
+  *rel = off - fl->seg[id].start;
+  *width = frame_btype_width(mem);
+  return *width > 0 && *rel >= 0 && *rel + *width <= fl->seg[id].size;
+}
+
+/* Whether S and D may share their bytes with the moves mv[0..nmv) deleted:
+ * [lo, hi] is straight-line code (one block, no edge back to itself) where
+ * S's lifetime ends and D's begins.  Both are run symbolically, as two objects
+ * and as one: every other read of S or D in the run must see the same bytes
+ * either way, and D must hold the same bytes after it. */
+static int frame_word_copy_sound(FrameLive *fl, int s, int d, int lo, int hi, const FrameWordMove *mv, int nmv,
+                                 const uint8_t *member, const int *param_call)
+{
+  TCCIRState *ir = fl->ir;
+  const int ss = fl->seg[s].size, ds = fl->seg[d].size, ms = ss > ds ? ss : ds;
+  /* Byte values: 1 + b is S's byte b on entry, 0 D's unwritten garbage (or
+   * the merged object's beyond S), and every write makes fresh ones. */
+  int32_t *os = tcc_malloc(sizeof(int32_t) * (ss + ds + ms + 16 * nmv)), *od = os + ss, *m = od + ds, *tv = m + ms;
+  int32_t fresh = ms + 1;
+  int ok = 1;
+  for (int b = 0; b < ms; b++)
+  {
+    if (b < ss)
+      os[b] = m[b] = 1 + b;
+    else
+      m[b] = 0;
+    if (b < ds)
+      od[b] = 0;
+  }
+  for (int x = lo; x <= hi && ok; x++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[x];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (fl->seg[d].escaped && (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID))
+      ok = 0;
+    else if (member[x])
+    {
+      /* A move: the load takes S's bytes as they are now, its store puts
+       * them into D; in the merged object neither does anything. */
+      for (int k = 0; k < nmv; k++)
+      {
+        const FrameWordMove *w = &mv[k];
+        for (int b = 0; b < w->width; b++)
+        {
+          if (w->load == x)
+            tv[16 * k + b] = os[w->rel + b];
+          else if (w->store == x)
+            od[w->rel + b] = tv[16 * k + b];
+        }
+      }
+    }
+    else if (frame_insn_touches(fl, x, s, -1, param_call) || frame_insn_touches(fl, x, d, -1, param_call))
+    {
+      int seg, rel, width, write;
+      if (!frame_word_access(fl, x, s, d, &seg, &rel, &width, &write))
+      {
+        ok = 0;
+        break;
+      }
+      int32_t *o = seg == s ? os : od;
+      for (int b = 0; b < width; b++)
+      {
+        if (write)
+          o[rel + b] = m[rel + b] = fresh++;
+        else if (o[rel + b] != m[rel + b] && !(seg == d && o[rel + b] == 0))
+          ok = 0;
+      }
+    }
+  }
+  for (int b = 0; b < ds && ok; b++)
+    if (od[b] && od[b] != m[b])
+      ok = 0;
+  tcc_free(os);
+  return ok;
+}
+
+/* Liveness of single objects, for word copies whose hulls overlap although
+ * the objects never hold live values at once (an object written on two
+ * paths into a join, a source reused by another case of a switch).  Built
+ * per object on demand from the events frame_lifetimes recorded (sorted by
+ * instruction): the object's events, and whether it is live out of each
+ * block. */
+typedef struct FrameObjLive
+{
+  const FrameEvents *ev;
+  const FrameCFG *cfg;
+  int *first, *count, *idx; /* per segment: its events, ev->v[idx[first[s] ..]] */
+  uint8_t **out;            /* per segment, per block: live on exit; NULL until built */
+} FrameObjLive;
+
+static void frame_obj_live_init(FrameObjLive *L, FrameLive *fl, const FrameEvents *ev, const FrameCFG *cfg)
+{
+  L->ev = ev;
+  L->cfg = cfg;
+  L->first = tcc_mallocz(sizeof(int) * (fl->nseg + 1));
+  L->count = tcc_mallocz(sizeof(int) * (fl->nseg + 1));
+  L->idx = tcc_malloc(sizeof(int) * (ev->n > 0 ? ev->n : 1));
+  L->out = tcc_mallocz(sizeof(uint8_t *) * (fl->nseg + 1));
+  for (int x = 0; x < ev->n; x++)
+    L->count[ev->v[x].s]++;
+  for (int t = 1; t <= fl->nseg; t++)
+    L->first[t] = L->first[t - 1] + L->count[t - 1];
+  memset(L->count, 0, sizeof(int) * (fl->nseg + 1));
+  for (int x = 0; x < ev->n; x++)
+  {
+    int t = ev->v[x].s;
+    L->idx[L->first[t] + L->count[t]++] = x;
+  }
+}
+
+static void frame_obj_live_free(FrameObjLive *L, int nseg)
+{
+  for (int t = 0; t < nseg; t++)
+    tcc_free(L->out[t]);
+  tcc_free(L->out);
+  tcc_free(L->first);
+  tcc_free(L->count);
+  tcc_free(L->idx);
+}
+
+/* What the object liveness is built from, kept past frame_lifetimes. */
+typedef struct FrameKept
+{
+  FrameCFG cfg;
+  FrameEvents ev;
+  FrameObjLive L;
+} FrameKept;
+
+/* Object t along block b from just after instruction `after`: 1 if it is
+ * read before being wholly overwritten, 0 if overwritten first, -1 if
+ * neither happens before the block ends. */
+static int frame_obj_scan(FrameLive *fl, FrameObjLive *L, int t, int b, int after)
+{
+  const int size = fl->seg[t].size, lo = L->cfg->bstart[b], hi = L->cfg->bstart[b + 1];
+  const int *v = L->idx + L->first[t], nv = L->count[t];
+  int a = 0, z = nv;
+  while (a < z) /* the first event past `after` (and inside the block) */
+  {
+    int m = (a + z) / 2;
+    if (L->ev->v[v[m]].i <= after || L->ev->v[v[m]].i < lo)
+      a = m + 1;
+    else
+      z = m;
+  }
+  uint64_t cover = 0;
+  const uint64_t full = size >= 64 ? ~0ull : (1ull << size) - 1;
+  for (; a < nv && L->ev->v[v[a]].i < hi; a++)
+  {
+    const FrameEv *e = &L->ev->v[v[a]];
+    uint64_t m = 0;
+    if (e->width > 0 && e->off >= 0 && e->off + e->width <= size && size <= 64)
+      m = (e->width >= 64 ? ~0ull : (1ull << e->width) - 1) << e->off;
+    switch (e->kind)
+    {
+    case FEV_USE:
+      if (!m || (m & ~cover))
+        return 1;
+      break;
+    case FEV_WRITE:
+      if (e->off <= 0 && e->off + e->width >= size)
+        return 0;
+      cover |= m;
+      if (size <= 64 && (cover & full) == full)
+        return 0;
+      break;
+    case FEV_KILL:
+      return 0;
+    default:
+      break;
+    }
+  }
+  return -1;
+}
+
+static const uint8_t *frame_obj_out(FrameLive *fl, FrameObjLive *L, int t)
+{
+  if (L->out[t])
+    return L->out[t];
+  const FrameCFG *cfg = L->cfg;
+  const int nb = cfg->nb;
+  uint8_t *gk = tcc_malloc(nb), *in = tcc_mallocz(nb), *out = tcc_mallocz(nb);
+  for (int b = 0; b < nb; b++)
+    gk[b] = (uint8_t)(frame_obj_scan(fl, L, t, b, cfg->bstart[b] - 1) + 1); /* 0 through, 1 kill, 2 gen */
+  int changed;
+  do
+  {
+    changed = 0;
+    for (int x = 0; x < cfg->npost; x++)
+    {
+      int b = cfg->post[x], o = 0;
+      for (int j = cfg->succ_at[b]; j < cfg->succ_at[b + 1]; j++)
+        o |= in[cfg->succ[j]];
+      int i2 = gk[b] == 2 || (gk[b] == 0 && o);
+      if (o != out[b] || i2 != in[b])
+        out[b] = (uint8_t)o, in[b] = (uint8_t)i2, changed = 1;
+    }
+  } while (changed);
+  /* A block the walk from the entry never reached: nothing is known there. */
+  for (int b = 0; b < nb; b++)
+    if (!cfg->seen[b])
+      out[b] = 1;
+  tcc_free(gk);
+  tcc_free(in);
+  return L->out[t] = out;
+}
+
+/* Whether object t may be read after instruction x (before it, when
+ * `before`). */
+static int frame_obj_live_at(FrameLive *fl, FrameObjLive *L, int t, int x, int before)
+{
+  int b = L->cfg->block_of[x], r = frame_obj_scan(fl, L, t, b, before ? x - 1 : x);
+  return r >= 0 ? r : frame_obj_out(fl, L, t)[b];
+}
+
+/* Whether wherever A or B may be written outside [lo, hi] (none when lo >
+ * hi), the other is dead, and no instruction there touches both.  A
+ * reference that only reads is harmless: the bytes it reads were last
+ * written as that object (a write of the other would have been made while it
+ * was live). */
+static int frame_objs_apart(FrameLive *fl, FrameObjLive *L, int a, int b, int lo, int hi)
+{
+  TCCIRState *ir = fl->ir;
+  for (int k = 0; k < 2; k++)
+  {
+    const int t = k ? a : b, o = k ? b : a;
+    const int *v = L->idx + L->first[t];
+    for (int j = 0; j < L->count[t]; j++)
+    {
+      const FrameEv *e = &L->ev->v[v[j]];
+      if (e->i >= lo && e->i <= hi)
+        continue;
+      if (e->kind == FEV_REF || (e->kind == FEV_USE && ir->compact_instructions[e->i].op == TCCIR_OP_LOAD))
+        continue;
+      if (frame_obj_live_at(fl, L, o, e->i, 0))
+        return 0;
+      const int *w = L->idx + L->first[o];
+      for (int m = 0; m < L->count[o]; m++)
+        if (L->ev->v[w[m]].i == e->i)
+          return 0;
+    }
+  }
+  return 1;
+}
+
+/* Whether S and D never hold live values at once outside the run [lo, hi]:
+ * D is dead on entry to the run, S after it, and they are apart elsewhere. */
+static int frame_word_copy_disjoint(FrameLive *fl, FrameObjLive *L, int s, int d, int lo, int hi)
+{
+  return !frame_obj_live_at(fl, L, d, lo, 1) && !frame_obj_live_at(fl, L, s, hi, 0) &&
+         frame_objs_apart(fl, L, s, d, lo, hi);
+}
+
+/* Whether, in source order or in RPO, S's lifetime ends by the end of the
+ * run [lo, hi] and D's begins no earlier than its start.  One order is
+ * enough, as for colouring: in it, an execution that reached S after D
+ * would cross a backward edge both lifetimes are widened over (or live
+ * across), so the two overlap only inside the run. */
+static int frame_copy_bounds(const FrameSeg *gs, const FrameSeg *gd, int lo, int hi, int lo_pos, int hi_pos)
+{
+  return (gs->last[0] <= hi && gd->first[0] >= lo) || (gs->last[1] <= hi_pos && gd->first[1] >= lo_pos);
+}
+
+/* The same for a D whose address escapes: nothing says where it is read
+ * once a pointer to it exists, so no reference of S may follow any of D
+ * outside the run -- no path runs from a D event to an S event, nor from
+ * the run to an S event outside it.  Then, wherever D's bytes may still be
+ * reached, S is done with its own. */
+static int frame_word_copy_ordered(FrameLive *fl, FrameObjLive *L, int s, int d, int lo, int hi)
+{
+  const FrameCFG *cfg = L->cfg;
+  const FrameEv *v = L->ev->v;
+  const int nb = cfg->nb, blk = cfg->block_of[lo];
+  uint8_t *reach = tcc_mallocz(nb);
+  int *work = tcc_malloc(sizeof(int) * (nb > 0 ? nb : 1)), nw = 0, ok = 1;
+  /* Blocks entered after an event of D (outside the run) or after the run;
+   * S events later in the same block are checked directly. */
+  for (int k = 0; k <= L->count[d] && ok; k++)
+  {
+    int x, b;
+    if (k < L->count[d])
+    {
+      x = v[L->idx[L->first[d] + k]].i;
+      if (x >= lo && x <= hi)
+        continue;
+      b = cfg->block_of[x];
+      if (!cfg->seen[b])
+        ok = 0;
+      for (int m = 0; m < L->count[s] && ok; m++)
+      {
+        int y = v[L->idx[L->first[s] + m]].i;
+        if (cfg->block_of[y] == b && y > x)
+          ok = 0;
+      }
+    }
+    else
+    {
+      b = blk;
+      for (int m = 0; m < L->count[s] && ok; m++)
+      {
+        int y = v[L->idx[L->first[s] + m]].i;
+        if (cfg->block_of[y] == b && y > hi)
+          ok = 0;
+      }
+    }
+    for (int j = cfg->succ_at[b]; j < cfg->succ_at[b + 1]; j++)
+      if (!reach[cfg->succ[j]])
+        reach[cfg->succ[j]] = 1, work[nw++] = cfg->succ[j];
+  }
+  while (nw > 0 && ok)
+  {
+    int b = work[--nw];
+    for (int j = cfg->succ_at[b]; j < cfg->succ_at[b + 1]; j++)
+      if (!reach[cfg->succ[j]])
+        reach[cfg->succ[j]] = 1, work[nw++] = cfg->succ[j];
+  }
+  for (int m = 0; m < L->count[s] && ok; m++)
+  {
+    int y = v[L->idx[L->first[s] + m]].i, b = cfg->block_of[y];
+    if (reach[b] || !cfg->seen[b])
+      ok = 0;
+  }
+  tcc_free(reach);
+  tcc_free(work);
+  return ok;
+}
+
+/* Whether the moves mv[0..nmv) of block blk, within [lo, hi], may go with S
+ * and D sharing their bytes; *precise when liveness, not the lifetimes'
+ * hulls, keeps the two apart outside the run. */
+static int frame_word_copy_try(FrameLive *fl, FrameObjLive *L, const int *pos, int s, int d, int blk, int lo, int hi,
+                               const FrameWordMove *mv, int nmv, const uint8_t *member, const int *param_call,
+                               int *precise)
+{
+  const FrameCFG *cfg = L->cfg;
+  FrameSeg *gd = &fl->seg[d], *gs = &fl->seg[s];
+  *precise = 0;
+  for (int k = cfg->succ_at[blk]; k < cfg->succ_at[blk + 1]; k++)
+    if (cfg->succ[k] == blk)
+      return 0;
+  if (!frame_copy_bounds(gs, gd, lo, hi, pos[lo], pos[hi]))
+  {
+    if (!cfg->seen[blk] || (gd->escaped ? !frame_word_copy_ordered(fl, L, s, d, lo, hi)
+                                        : !frame_word_copy_disjoint(fl, L, s, d, lo, hi)))
+      return 0;
+    *precise = 1;
+  }
+  return frame_word_copy_sound(fl, s, d, lo, hi, mv, nmv, member, param_call);
+}
+
+static void frame_find_word_copies(FrameLive *fl, const int *param_call, const int *pos, const FrameCFG *cfg,
+                                   FrameObjLive *L)
+{
+  TCCIRState *ir = fl->ir;
+  const int n = fl->n;
+  const int nt = fl->taint_size[TCCIR_VREG_TYPE_TEMP] > 0 ? fl->taint_size[TCCIR_VREG_TYPE_TEMP] : 1;
+  if (n <= 0 || tcc_ir_opt_pass_disabled("frame_word_copy"))
+    return;
+  int *tdef = tcc_malloc(sizeof(int) * nt);
+  uint8_t *tdefs = tcc_mallocz(nt), *tuses = tcc_mallocz(nt);
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    const int has_dest = irop_config[q->op].has_dest;
+    const int nops = has_dest + irop_config[q->op].has_src1 + irop_config[q->op].has_src2 + frame_op_has_slot3(q->op);
+    for (int k = 0; k < nops; k++)
+    {
+      IROperand o = ir->iroperand_pool[q->operand_base + k];
+      int32_t vr = irop_get_vreg(o);
+      if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+        continue;
+      int ps = TCCIR_DECODE_VREG_POSITION(vr);
+      if (ps >= nt)
+        continue;
+      if (k == 0 && has_dest && irop_dest_defines_vreg(o))
+      {
+        tdefs[ps] += tdefs[ps] < 2;
+        tdef[ps] = i;
+      }
+      else
+        tuses[ps] += tuses[ps] < 2;
+    }
+  }
+
+  FrameWordMove *mv = NULL;
+  int nmv = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_STORE)
+      continue;
+    IROperand dst = tcc_ir_op_get_dest(ir, q), val = tcc_ir_op_get_src1(ir, q);
+    int32_t vr = irop_get_vreg(val);
+    int d, s, od, os;
+    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || irop_get_tag(val) != IROP_TAG_VREG ||
+        val.is_lval || frame_classify(fl, dst, &d) != FOP_MEM || !frame_operand_offset(dst, fl->bottom, &od))
+      continue;
+    int ps = TCCIR_DECODE_VREG_POSITION(vr);
+    if (ps >= nt || tdefs[ps] != 1 || tuses[ps] != 1)
+      continue;
+    int j = tdef[ps];
+    IRQuadCompact *lq = &ir->compact_instructions[j];
+    if (j >= i || lq->op != TCCIR_OP_LOAD || cfg->block_of[j] != cfg->block_of[i])
+      continue;
+    IROperand src = tcc_ir_op_get_src1(ir, lq);
+    if (frame_classify(fl, src, &s) != FOP_MEM || !frame_operand_offset(src, fl->bottom, &os) || s == d)
+      continue;
+    FrameSeg *gd = &fl->seg[d], *gs = &fl->seg[s];
+    const int rel = od - gd->start, width = frame_btype_width(dst);
+    if (gd->pinned || gs->pinned || gs->escaped || rel != os - gs->start || width <= 0 || width > 16 ||
+        rel + width > gd->size || rel + width > gs->size)
+      continue;
+    if (dst.btype != src.btype || tcc_ir_access_is_volatile(ir, dst) || tcc_ir_access_is_volatile(ir, src))
+      continue;
+    if (nmv % 64 == 0)
+      mv = tcc_realloc(mv, sizeof(FrameWordMove) * (nmv + 64));
+    mv[nmv++] = (FrameWordMove){s, d, cfg->block_of[i], j, i, rel, width};
+  }
+  tcc_free(tdef);
+  tcc_free(tdefs);
+  tcc_free(tuses);
+  if (nmv == 0)
+  {
+    tcc_free(mv);
+    return;
+  }
+  tcc_qsort(mv, nmv, sizeof(FrameWordMove), frame_word_move_cmp);
+  uint8_t *member = tcc_mallocz(n);
+  int *insns = tcc_malloc(sizeof(int) * 2 * nmv);
+  for (int a = 0, b; a < nmv; a = b)
+  {
+    int lo = n, hi = -1, s = mv[a].s, d = mv[a].d, blk = mv[a].blk;
+    for (b = a; b < nmv && mv[b].s == s && mv[b].d == d && mv[b].blk == blk; b++)
+    {
+      if (mv[b].load < lo)
+        lo = mv[b].load;
+      if (mv[b].store > hi)
+        hi = mv[b].store;
+      member[mv[b].load] = member[mv[b].store] = 1;
+    }
+    int precise = 0;
+    int ok = frame_word_copy_try(fl, L, pos, s, d, blk, lo, hi, mv + a, b - a, member, param_call, &precise);
+    if (!ok)
+    {
+      /* The run widened to the block's other references of D before it and
+       * of S after it (a field of D written just ahead of the copy). */
+      const FrameEv *v = L->ev->v;
+      int lo2 = lo, hi2 = hi;
+      for (int k = 0; k < L->count[d]; k++)
+      {
+        int x = v[L->idx[L->first[d] + k]].i;
+        if (x >= cfg->bstart[blk] && x < lo2)
+          lo2 = x;
+      }
+      for (int k = 0; k < L->count[s]; k++)
+      {
+        int x = v[L->idx[L->first[s] + k]].i;
+        if (x < cfg->bstart[blk + 1] && x > hi2)
+          hi2 = x;
+      }
+      if (lo2 != lo || hi2 != hi)
+      {
+        ok = frame_word_copy_try(fl, L, pos, s, d, blk, lo2, hi2, mv + a, b - a, member, param_call, &precise);
+        if (ok)
+          lo = lo2, hi = hi2;
+      }
+    }
+    int ni = 0;
+    for (int c = a; c < b; c++)
+    {
+      member[mv[c].load] = member[mv[c].store] = 0;
+      insns[ni++] = mv[c].load;
+      insns[ni++] = mv[c].store;
+    }
+    if (!ok)
+      continue;
+    frame_add_copy(fl, hi, pos[hi], lo, pos[lo], d, s, insns, ni);
+    fl->copy_precise[fl->ncopy - 1] = (uint8_t)precise;
+    /* Every other object the run touches, for frame_colour's group check. */
+    for (int x = lo; x <= hi; x++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[x];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      int nops = irop_config[q->op].has_dest + irop_config[q->op].has_src1 + irop_config[q->op].has_src2 +
+                 frame_op_has_slot3(q->op);
+      for (int k = 0; k < nops; k++)
+      {
+        int id, t = TAINT_NONE, kind = frame_classify(fl, ir->iroperand_pool[q->operand_base + k], &id);
+        if (kind == FOP_MEM || kind == FOP_ADDR)
+          t = id;
+        else if (kind == FOP_VAL || kind == FOP_DEREF)
+        {
+          int ty = TCCIR_DECODE_VREG_TYPE(id), ps = TCCIR_DECODE_VREG_POSITION(id);
+          t = fl->vseg[ty][ps] >= 0 ? fl->vseg[ty][ps] : fl->taint[ty][ps];
+        }
+        if (t == TAINT_NONE || t == s || t == d)
+          continue;
+        if (fl->ncopy_touch % 64 == 0)
+          fl->copy_touch = tcc_realloc(fl->copy_touch, sizeof(int) * (fl->ncopy_touch + 64));
+        fl->copy_touch[fl->ncopy_touch++] = t;
+        fl->copy_tcount[fl->ncopy - 1]++;
+      }
+    }
+  }
+  tcc_free(member);
+  tcc_free(insns);
+  tcc_free(mv);
 }
 
 static int frame_lifetimes(FrameLive *fl)
@@ -1556,7 +2327,7 @@ static int frame_lifetimes(FrameLive *fl)
         {
           IRQuadCompact *pq = &ir->compact_instructions[p];
           int t = frame_op_taint(fl, tcc_ir_op_get_src1(ir, pq));
-          int idx = TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, pq)));
+          int idx = TCCIR_DECODE_PARAM_IDX((uint32_t)tcc_ir_op_src2_imm(ir, pq));
           if (t >= 0 && (fl->seg[t].kind == FRAME_OBJ_RET_TEMP || (nocapture[i] == 2 && idx == 0)))
             frame_taint_join(fl, id, t);
         }
@@ -1640,13 +2411,12 @@ static int frame_lifetimes(FrameLive *fl)
         continue;
       if (op == TCCIR_OP_ADD || op == TCCIR_OP_SUB)
       {
-        IROperand b = tcc_ir_op_get_src2(ir, q);
-        if (!irop_is_immediate(b))
+        if (!tcc_ir_op_src2_is_imm(ir, q))
           continue;
-        int64_t c = irop_get_imm64_ex(ir, b);
+        int64_t c = tcc_ir_op_src2_imm(ir, q);
         rel += op == TCCIR_OP_SUB ? -(int)c : (int)c;
       }
-      else if (irop_config[op].has_src2 && !irop_is_none(tcc_ir_op_get_src2(ir, q)))
+      else if (irop_config[op].has_src2 && !tcc_ir_op_src2_is_none(ir, q))
         continue;
       fl->vseg[ty][ps] = seg;
       fl->vrel[ty][ps] = rel;
@@ -1768,6 +2538,10 @@ static int frame_lifetimes(FrameLive *fl)
       int end = fl->seg[s].scope_end && fl->seg[s].scope_end - 1 <= n - 1 ? fl->seg[s].scope_end - 1 : n - 1;
       if (end < fl->seg[s].first[0])
         end = n - 1;
+      /* A use past the end means code moved out of the body behind the
+       * scope's back: the object is live there whatever the end says. */
+      if (end < fl->seg[s].last[0])
+        end = fl->seg[s].last[0];
       fl->seg[s].last[0] = end;
       fl->seg[s].last[1] = n - 1;
     }
@@ -1789,7 +2563,12 @@ static int frame_lifetimes(FrameLive *fl)
       {
         grew = 0;
         for (int k = 0; k < ne; k++)
-          if (g->first[o] <= e[2 * k + 1] && g->last[o] >= e[2 * k])
+          if (g->first[o] <= e[2 * k + 1] && g->last[o] >= e[2 * k] &&
+              /* A block-scoped object carries a value around a loop only if
+               * the back edge stays inside its block: one that leaves or
+               * re-enters it ends the object's lifetime (source order, where
+               * the block's instructions are [start, end)). */
+              (o || !g->scope_start || (e[2 * k] >= g->scope_start - 1 && e[2 * k + 1] < g->scope_end - 1)))
           {
             if (e[2 * k] < g->first[o])
               g->first[o] = e[2 * k], grew = 1;
@@ -1799,7 +2578,19 @@ static int frame_lifetimes(FrameLive *fl)
       } while (grew);
     }
   }
-  frame_find_copies(fl, call_params, param_next, param_call, pos, &cfg);
+  {
+    FrameKept *k = tcc_mallocz(sizeof(FrameKept));
+    k->cfg = cfg;
+    k->ev = ev;
+    memset(&cfg, 0, sizeof cfg);
+    memset(&ev, 0, sizeof ev);
+    fl->kept = k;
+    if (k->ev.n > 1)
+      tcc_qsort(k->ev.v, k->ev.n, sizeof(FrameEv), frame_ev_cmp);
+    frame_obj_live_init(&k->L, fl, &k->ev, &k->cfg);
+    frame_find_copies(fl, call_params, param_next, param_call, pos, &k->cfg);
+    frame_find_word_copies(fl, param_call, pos, &k->cfg, &k->L);
+  }
   ok = 1;
 
 out:
@@ -1874,7 +2665,7 @@ static int frame_place(FrameUnit *u, int nu, const int *order, int nm, FrameSpan
         nsp++;
       }
     }
-    qsort(spans, nsp, sizeof *spans, frame_span_start_asc);
+    tcc_qsort(spans, nsp, sizeof *spans, frame_span_start_asc);
     int size = x->end - x->start, d = 0;
     /* The bottom is 8-aligned, so a distance keeps the object's alignment
      * when it is congruent with the object's original offset. */
@@ -1921,16 +2712,65 @@ static int frame_grp_find(int *grp, int s)
   return s;
 }
 
+/* Whether group root r has no member but itself. */
+static int frame_grp_single(int *grp, int nseg, int r)
+{
+  for (int s = 0; s < nseg; s++)
+    if (s != r && frame_grp_find(grp, s) == r)
+      return 0;
+  return 1;
+}
+
+/* For a copy proved by liveness between S and D alone: whether every other
+ * pair across the two groups (roots rs, rd) is kept apart the same way.
+ * An escaped member has no liveness to go by. */
+static int frame_groups_apart(FrameLive *fl, int *grp, int rs, int rd, int s, int d)
+{
+  FrameObjLive *L = &fl->kept->L;
+  int *m = tcc_malloc(sizeof(int) * (fl->nseg > 0 ? fl->nseg : 1)), ns = 0, nd = 0, ok = 1;
+  for (int x = 0; x < fl->nseg; x++)
+    if (frame_grp_find(grp, x) == rs)
+      m[ns++] = x;
+  for (int y = 0; y < fl->nseg; y++)
+    if (frame_grp_find(grp, y) == rd)
+      m[ns + nd++] = y;
+  for (int i = 0; i < ns && ok; i++)
+    for (int j = ns; j < ns + nd && ok; j++)
+      if (!(m[i] == s && m[j] == d))
+        ok = !fl->seg[m[i]].escaped && !fl->seg[m[j]].escaped && frame_objs_apart(fl, L, m[i], m[j], 1, 0);
+  tcc_free(m);
+  return ok;
+}
+
 static void frame_copies_free(FrameLive *fl)
 {
+  if (fl->kept)
+  {
+    frame_obj_live_free(&fl->kept->L, fl->nseg);
+    frame_cfg_free(&fl->kept->cfg);
+    tcc_free(fl->kept->ev.v);
+    tcc_free(fl->kept);
+    fl->kept = NULL;
+  }
   tcc_free(fl->copy_at);
   tcc_free(fl->copy_pos);
   tcc_free(fl->copy_from);
   tcc_free(fl->copy_from_pos);
   tcc_free(fl->copy_dst);
   tcc_free(fl->copy_src);
+  tcc_free(fl->copy_first);
+  tcc_free(fl->copy_count);
+  tcc_free(fl->copy_insns);
+  tcc_free(fl->copy_tfirst);
+  tcc_free(fl->copy_tcount);
+  tcc_free(fl->copy_touch);
+  tcc_free(fl->copy_precise);
+  fl->copy_precise = NULL;
+  fl->copy_tfirst = fl->copy_tcount = fl->copy_touch = NULL;
+  fl->ncopy_touch = 0;
   fl->copy_at = fl->copy_pos = fl->copy_from = fl->copy_from_pos = fl->copy_dst = fl->copy_src = NULL;
-  fl->ncopy = 0;
+  fl->copy_first = fl->copy_count = fl->copy_insns = NULL;
+  fl->ncopy = fl->ncopy_insns = 0;
 }
 
 /* Colour the live segments.  Returns the new bottom, or 1 when colouring does
@@ -1981,9 +2821,30 @@ static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom, int
       continue;
     /* The source group ends at the call, the destination group starts no
      * earlier than the copy (the call, or its destination pointer). */
-    if (seg[rs].last[0] > fl.copy_at[c] || seg[rs].last[1] > fl.copy_pos[c] || seg[rd].first[0] < fl.copy_from[c] ||
-        seg[rd].first[1] < fl.copy_from_pos[c])
+    if (!fl.copy_count[c] && (seg[rs].last[0] > fl.copy_at[c] || seg[rs].last[1] > fl.copy_pos[c] ||
+                              seg[rd].first[0] < fl.copy_from[c] || seg[rd].first[1] < fl.copy_from_pos[c]))
       continue;
+    if (fl.copy_count[c])
+    {
+      /* A word copy was proved for its two objects alone: the others
+       * already in either group must keep out of its run. */
+      if (fl.copy_precise[c] ? !frame_groups_apart(&fl, grp, rs, rd, fl.copy_src[c], fl.copy_dst[c])
+                             : !frame_copy_bounds(&seg[rs], &seg[rd], fl.copy_from[c], fl.copy_at[c],
+                                                  fl.copy_from_pos[c], fl.copy_pos[c]))
+        continue;
+      int clear = 1;
+      for (int k = 0; k < fl.copy_tcount[c] && clear; k++)
+      {
+        int t = fl.copy_touch[fl.copy_tfirst[c] + k];
+        if (t == TAINT_MULTI)
+          clear = rs == fl.copy_src[c] && rd == fl.copy_dst[c] && frame_grp_single(grp, nseg, rs) &&
+                  frame_grp_single(grp, nseg, rd);
+        else if (frame_grp_find(grp, t) == rs || frame_grp_find(grp, t) == rd)
+          clear = 0;
+      }
+      if (!clear)
+        continue;
+    }
     int keep = frame_offset_align(seg[rd].start) >= frame_offset_align(seg[rs].start) ? rd : rs;
     int other = keep == rd ? rs : rd, oa = frame_offset_align(seg[other].start);
     if (((seg[other].start - seg[keep].start) % oa + oa) % oa)
@@ -2035,13 +2896,13 @@ static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom, int
     if (!u[k].pinned)
       order[nm++] = k;
   frame_units_gl = u;
-  qsort(order, nm, sizeof(int), frame_unit_hot_first);
+  tcc_qsort(order, nm, sizeof(int), frame_unit_hot_first);
   frame_units_gl = NULL;
   int placed = frame_place(u, nu, order, nm, spans);
   if (frame_dbg())
     for (int s = 0; s < nseg; s++)
-      fprintf(stderr, "[FRAME] seg %d [%d,+%d) live=%d pin=%d kind=%d esc=%d prec=%d idx=[%d,%d] pos=[%d,%d] refs=%d unit=%d -> %d\n",
-              s, seg[s].start, seg[s].size, seg[s].live, seg[s].pinned, seg[s].kind, seg[s].escaped, seg[s].precise,
+      fprintf(stderr, "[FRAME] %s seg %d [%d,+%d) live=%d pin=%d kind=%d esc=%d prec=%d idx=[%d,%d] pos=[%d,%d] refs=%d unit=%d -> %d\n",
+              funcname ? funcname : "?", s, seg[s].start, seg[s].size, seg[s].live, seg[s].pinned, seg[s].kind, seg[s].escaped, seg[s].precise,
               seg[s].first[0], seg[s].last[0], seg[s].first[1], seg[s].last[1], seg[s].refs, seg[s].unit,
               seg[s].unit >= 0 ? u[seg[s].unit].new_start : 0);
 
@@ -2057,10 +2918,17 @@ static int frame_colour(TCCIRState *ir, FrameSeg *seg, int nseg, int bottom, int
       seg[s].delta = seg[s].unit >= 0 ? u[seg[s].unit].new_start - seg[s].start : 0;
     result = placed;
     /* The merged copies now copy an object onto itself. */
-    *merged_at = tcc_malloc(sizeof(int) * (fl.ncopy > 0 ? fl.ncopy : 1));
+    *merged_at = tcc_malloc(sizeof(int) * (fl.ncopy + fl.ncopy_insns > 0 ? fl.ncopy + fl.ncopy_insns : 1));
     for (int c = 0; c < fl.ncopy; c++)
-      if (merged[c])
+    {
+      if (!merged[c])
+        continue;
+      if (!fl.copy_count[c])
         (*merged_at)[(*nmerged)++] = fl.copy_at[c];
+      /* A word copy's loads and stores, as -1 - index: not a call. */
+      for (int k = 0; k < fl.copy_count[c]; k++)
+        (*merged_at)[(*nmerged)++] = -1 - fl.copy_insns[fl.copy_first[c] + k];
+    }
   }
   tcc_free(grp);
   tcc_free(merged);
@@ -2081,7 +2949,7 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
 
   /* Objects -> disjoint segments tiling [bottom, 0), gaps included. */
   int nobj = ir->frame_obj_count;
-  qsort(ir->frame_objs, nobj, sizeof(int32_t) * 4, frame_obj_cmp);
+  tcc_qsort(ir->frame_objs, nobj, sizeof(int32_t) * FRAME_OBJ_WORDS, frame_obj_cmp);
   /* `bottom` is the lowest offset an operand still names (compute_min_stack_ref),
    * so an object whose low words lost their last reference -- a dead store
    * removed -- starts below it.  Measure the frame from that object instead:
@@ -2094,7 +2962,7 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
   int nseg = 0, cur = bottom;
   for (int k = 0; k < nobj; k++)
   {
-    const int32_t *o = &ir->frame_objs[4 * k];
+    const int32_t *o = &ir->frame_objs[FRAME_OBJ_WORDS * k];
     int s = o[0], e = s + o[1];
     if (s < bottom || e > 0)
     {
@@ -2125,13 +2993,15 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
       g->kind &= o[3] & 0xF;
       /* Sharing bytes, the two live as long as the longer one. */
       g->scope_end = g->scope_end && (o[3] >> 4) ? (g->scope_end > (o[3] >> 4) ? g->scope_end : (o[3] >> 4)) : 0;
+      g->scope_start = g->scope_end && g->scope_start && o[4] ? (g->scope_start < o[4] ? g->scope_start : o[4]) : 0;
       cur = e;
       continue;
     }
     if (s > cur)
       seg[nseg++] = (FrameSeg){.start = cur, .end = s, .size = s - cur, .live = 1, .pinned = 1};
     seg[nseg++] = (FrameSeg){
-        .start = s, .end = e, .size = o[2] < e - s ? o[2] : e - s, .kind = (uint8_t)(o[3] & 0xF), .scope_end = o[3] >> 4};
+        .start = s, .end = e, .size = o[2] < e - s ? o[2] : e - s, .kind = (uint8_t)(o[3] & 0xF), .scope_end = o[3] >> 4,
+        .scope_start = o[3] >> 4 ? o[4] : 0};
     cur = e;
   }
   if (cur < 0)
@@ -2154,6 +3024,14 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
     int off, s;
     if (frame_operand_offset(pool[i], bottom, &off) && (s = frame_seg_find(seg, nseg, off)) >= 0)
       seg[s].live = 1;
+  }
+  /* Inline asm lowers its operands from the SValues saved with it, which the
+   * operand rewrite below never reaches: what they name stays, in place. */
+  {
+    int off, s;
+    for (int k = 0; tcc_ir_asm_frame_ref(ir, k, &off); k++)
+      if (off >= bottom && off < 0 && (s = frame_seg_find(seg, nseg, off)) >= 0)
+        seg[s].live = seg[s].pinned = 1;
   }
 
   /* Laid out once without regard to the 16-bit offsets, and again with every
@@ -2183,7 +3061,7 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
       }
     }
     new_top = 1;
-    if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("frame_colour") && !ir->func_has_label_addr &&
+    if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("frame_colour") && !ir->func_has_label_addr &&
         !tcc_ir_calls_returns_twice(ir))
     {
       int ijump = 0;
@@ -2223,6 +3101,11 @@ int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc)
   /* Only now, with the layout settled, do the kept attempt's merged copies go. */
   for (int k = 0; k < nmerged; k++)
   {
+    if (merged_at[k] < 0)
+    {
+      ir->compact_instructions[-1 - merged_at[k]].op = TCCIR_OP_NOP;
+      continue;
+    }
     ir_opt_nop_call_params(ir, merged_at[k]);
     ir->compact_instructions[merged_at[k]].op = TCCIR_OP_NOP;
   }

@@ -11,6 +11,9 @@
 #undef SR_TAINT_MAX
 #undef USING_GLOBALS
 #include "../opt/flat/loop/licm.c"
+#undef FPH_LOG
+#undef FPH_MAX_OCC
+#undef FPH_MAX_PER_LOOP
 #undef GLH_MAX_PER_LOOP
 #undef GLH_MAX_WRITTEN
 #undef LICM_MAX_ADDR_TEMPS

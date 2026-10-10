@@ -185,42 +185,40 @@ static int lcs_op_supported(TccIrOp op)
   }
 }
 
+typedef struct
+{
+  char suffix[8];
+  uint8_t kind;
+  uint8_t is_double;
+} LcsSoftcall;
+
+/* __aeabi_<suffix>; the 64-bit integer helpers are ordinary two-operand evaluations in the IR. */
+static const LcsSoftcall lcs_softcalls[] = {
+  {"dadd", 1, 1},    {"dsub", 2, 1},    {"dmul", 3, 1},    {"ddiv", 4, 1},    {"fadd", 1, 0},
+  {"fsub", 2, 0},    {"fmul", 3, 0},    {"fdiv", 4, 0},    {"f2iz", 5, 0},    {"f2uiz", 6, 0},
+  {"i2f", 7, 0},     {"ui2f", 8, 0},    {"f2d", 9, 1},     {"d2f", 10, 0},    {"d2iz", 11, 0},
+  {"d2uiz", 12, 0},  {"i2d", 13, 1},    {"ui2d", 14, 1},   {"cdcmpeq", 20, 1}, {"cdcmple", 21, 1},
+  {"cfcmpeq", 22, 0}, {"cfcmple", 23, 0}, {"llsl", 30, 0},  {"llsr", 31, 0},    {"lasr", 32, 0},
+  {"lmul", 33, 0},
+};
+
 /* Kind: 1-4 arith, 5-14 conversions, 20-23 VOID flag-setters, 0 = unknown helper. */
 static int lcs_classify_softcall(const char *name, int *out_is_double, int *out_nargs)
 {
-  if (!name) return 0;
   *out_is_double = 0;
   *out_nargs = 2;
-  if (!strcmp(name, "__aeabi_dadd")) { *out_is_double = 1; return 1; }
-  if (!strcmp(name, "__aeabi_dsub")) { *out_is_double = 1; return 2; }
-  if (!strcmp(name, "__aeabi_dmul")) { *out_is_double = 1; return 3; }
-  if (!strcmp(name, "__aeabi_ddiv")) { *out_is_double = 1; return 4; }
-  if (!strcmp(name, "__aeabi_fadd")) { return 1; }
-  if (!strcmp(name, "__aeabi_fsub")) { return 2; }
-  if (!strcmp(name, "__aeabi_fmul")) { return 3; }
-  if (!strcmp(name, "__aeabi_fdiv")) { return 4; }
-  *out_nargs = 1;
-  if (!strcmp(name, "__aeabi_f2iz"))  { return 5; }
-  if (!strcmp(name, "__aeabi_f2uiz")) { return 6; }
-  if (!strcmp(name, "__aeabi_i2f"))   { return 7; }
-  if (!strcmp(name, "__aeabi_ui2f"))  { return 8; }
-  if (!strcmp(name, "__aeabi_f2d"))   { *out_is_double = 1; return 9; }
-  if (!strcmp(name, "__aeabi_d2f"))   { return 10; }
-  if (!strcmp(name, "__aeabi_d2iz"))  { return 11; }
-  if (!strcmp(name, "__aeabi_d2uiz")) { return 12; }
-  if (!strcmp(name, "__aeabi_i2d"))   { *out_is_double = 1; return 13; }
-  if (!strcmp(name, "__aeabi_ui2d"))  { *out_is_double = 1; return 14; }
-  *out_nargs = 2;
-  if (!strcmp(name, "__aeabi_cdcmpeq")) { *out_is_double = 1; return 20; }
-  if (!strcmp(name, "__aeabi_cdcmple")) { *out_is_double = 1; return 21; }
-  if (!strcmp(name, "__aeabi_cfcmpeq")) { return 22; }
-  if (!strcmp(name, "__aeabi_cfcmple")) { return 23; }
-  /* 64-bit integer helpers: the IR passes the whole long long as one operand,
-   * so these are ordinary two-operand evaluations. */
-  if (!strcmp(name, "__aeabi_llsl")) { return 30; }
-  if (!strcmp(name, "__aeabi_llsr")) { return 31; }
-  if (!strcmp(name, "__aeabi_lasr")) { return 32; }
-  if (!strcmp(name, "__aeabi_lmul")) { return 33; }
+  if (!name || strncmp(name, "__aeabi_", 8))
+    return 0;
+  for (unsigned i = 0; i < sizeof(lcs_softcalls) / sizeof(lcs_softcalls[0]); i++)
+  {
+    if (strcmp(name + 8, lcs_softcalls[i].suffix))
+      continue;
+    int kind = lcs_softcalls[i].kind;
+    *out_is_double = lcs_softcalls[i].is_double;
+    if (kind >= 5 && kind <= 14)
+      *out_nargs = 1;
+    return kind;
+  }
   return 0;
 }
 
@@ -299,67 +297,46 @@ static int lcs_read_operand(const TCCIRState *ir, const LcsState *st,
   return 1;
 }
 
-static int lcs_write_operand(LcsState *st, IROperand op, int64_t value, int btype)
+static LcsSlot *lcs_dest_slot(LcsState *st, IROperand op)
 {
   if (op.is_sym || op.is_llocal)
-    return 0;
+    return NULL;
   if (op.is_local && !op.is_lval)
-    return 0;
+    return NULL;
   int32_t vr = irop_get_vreg(op);
   if (vr < 0)
-    return 0;
+    return NULL;
   int type = TCCIR_DECODE_VREG_TYPE(vr);
   int pos  = TCCIR_DECODE_VREG_POSITION(vr);
-  if (type == TCCIR_VREG_TYPE_VAR)
-  {
-    if (pos >= st->n_vars)
-      return 0;
-    st->vars[pos].known = 1;
-    st->vars[pos].value = value;
-    st->vars[pos].btype = btype;
-    st->vars[pos].is_unsigned = op.is_unsigned;
-    st->vars[pos].is_addr = 0;
-    return 1;
-  }
-  if (type == TCCIR_VREG_TYPE_TEMP)
-  {
-    if (pos >= st->n_tmps)
-      return 0;
-    st->tmps[pos].known = 1;
-    st->tmps[pos].value = value;
-    st->tmps[pos].btype = btype;
-    st->tmps[pos].is_unsigned = op.is_unsigned;
-    st->tmps[pos].is_addr = 0;
-    return 1;
-  }
-  return 0;
+  if (type == TCCIR_VREG_TYPE_VAR && pos < st->n_vars)
+    return &st->vars[pos];
+  if (type == TCCIR_VREG_TYPE_TEMP && pos < st->n_tmps)
+    return &st->tmps[pos];
+  return NULL;
+}
+
+static int lcs_set_slot(LcsState *st, IROperand op, int64_t value, int btype, int is_unsigned, int is_addr)
+{
+  LcsSlot *slot = lcs_dest_slot(st, op);
+  if (!slot)
+    return 0;
+  slot->known = 1;
+  slot->value = value;
+  slot->btype = btype;
+  slot->is_unsigned = is_unsigned;
+  slot->is_addr = is_addr;
+  return 1;
+}
+
+static int lcs_write_operand(LcsState *st, IROperand op, int64_t value, int btype)
+{
+  return lcs_set_slot(st, op, value, btype, op.is_unsigned, 0);
 }
 
 /* Tags the destination slot as an address so later loads/stores resolve through it. */
 static int lcs_write_addr_operand(LcsState *st, IROperand op, int32_t stack_offset)
 {
-  if (op.is_sym || op.is_llocal)
-    return 0;
-  if (op.is_local && !op.is_lval)
-    return 0;
-  int32_t vr = irop_get_vreg(op);
-  if (vr < 0)
-    return 0;
-  int type = TCCIR_DECODE_VREG_TYPE(vr);
-  int pos  = TCCIR_DECODE_VREG_POSITION(vr);
-  LcsSlot *slot = NULL;
-  if (type == TCCIR_VREG_TYPE_VAR && pos < st->n_vars)
-    slot = &st->vars[pos];
-  else if (type == TCCIR_VREG_TYPE_TEMP && pos < st->n_tmps)
-    slot = &st->tmps[pos];
-  if (!slot)
-    return 0;
-  slot->known = 1;
-  slot->value = stack_offset;
-  slot->btype = IROP_BTYPE_INT32;
-  slot->is_unsigned = 0;
-  slot->is_addr = 1;
-  return 1;
+  return lcs_set_slot(st, op, stack_offset, IROP_BTYPE_INT32, 0, 1);
 }
 
 /* Mask a result to its operand width so 32-bit overflow wraps. */
@@ -1076,7 +1053,7 @@ static int lcs_scan_body(TCCIRState *ir, int start_idx, int end_idx,
     {
       if (s == 0 && !irop_config[q->op].has_src1) continue;
       if (s == 1 && !irop_config[q->op].has_src2) continue;
-      IROperand op = (s == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand op = tcc_ir_op_get_src1_or_2(ir, q, s != 0);
       /* Skip sources that aren't value reads: cond tokens, callee syms, call-id encodings. */
       if (q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_JUMP)
         continue;
@@ -1135,23 +1112,23 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
 
   /* Back-edge targets don't affect first-iteration state; only pre-loop edges count. */
   int n_all = ir->next_instruction_index;
-  uint8_t *real_pre_target = tcc_mallocz((size_t)start_idx);
+  uint8_t *real_pre_target = tcc_mallocz((size_t)start_idx + 1);
   for (int j = 0; j < start_idx; j++)
   {
     IRQuadCompact *jq = &ir->compact_instructions[j];
     if (jq->op != TCCIR_OP_JUMP && jq->op != TCCIR_OP_JUMPIF) continue;
     IROperand jd = tcc_ir_op_get_dest(ir, jq);
     int target = (int)irop_get_imm64_ex(ir, jd);
-    if (target >= 0 && target < start_idx)
+    if (target >= 0 && target <= start_idx) /* start_idx itself: `if (c) i = 12;` jumping to the header */
       real_pre_target[target] = 1;
   }
   (void)n_all;
 
-  for (int i = 0; i < start_idx; i++)
+  for (int i = 0; i <= start_idx; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP) continue;
-    /* A real branch boundary: defs before it might be bypassed. */
+    /* A real branch boundary: defs before it might be bypassed.  Tested
+     * before the NOP skip: the boundary can be a NOP. */
     if (q->is_jump_target && real_pre_target[i])
     {
       for (int p = 0; p < st->n_vars; p++)
@@ -1161,6 +1138,9 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
       for (int m = 0; m < st->n_mem; m++)
         if (mem_has_def[m]) mem_flow_unsafe[m] = 1;
     }
+    if (i == start_idx)
+      break; /* the loop's first instruction only closes the pre-loop region */
+    if (q->op == TCCIR_OP_NOP) continue;
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF ||
         q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE ||
         q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
@@ -1270,10 +1250,9 @@ static void lcs_init_var_state(TCCIRState *ir, int start_idx, LcsState *st)
             }
             if (!mem_flow_unsafe[mem_idx])
             {
-              IROperand s1 = tcc_ir_op_get_src1(ir, q);
-              if (irop_is_immediate(s1))
+              if (tcc_ir_op_src1_is_imm(ir, q))
               {
-                ms->value = irop_get_imm64_ex(ir, s1);
+                ms->value = tcc_ir_op_src1_imm(ir, q);
                 ms->btype = irop_get_btype(d);
                 ms->known = 1;
                 ms->initial_value = ms->value;
@@ -1455,19 +1434,18 @@ static int lcs_var_used_after(TCCIRState *ir, int var_pos, int from_idx)
     if (q->op == TCCIR_OP_NOP) continue;
     if (irop_config[q->op].has_src1)
     {
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      if (irop_get_vreg(s) == target_vr) return 1;
+      int32_t s_vr = tcc_ir_op_src1_vreg(ir, q);
+      if (s_vr == target_vr) return 1;
     }
     if (irop_config[q->op].has_src2)
     {
-      IROperand s = tcc_ir_op_get_src2(ir, q);
-      if (irop_get_vreg(s) == target_vr) return 1;
+      int32_t s_vr = tcc_ir_op_src2_vreg(ir, q);
+      if (s_vr == target_vr) return 1;
     }
     /* A redefinition kills only when unconditionally reached from the exit. */
     if (!saw_branch && irop_config[q->op].has_dest)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!d.is_lval && irop_get_vreg(d) == target_vr) return 0;
+      if (!tcc_ir_op_dest_is_lval(ir, q) && tcc_ir_op_dest_vreg(ir, q) == target_vr) return 0;
     }
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_IJUMP ||
         q->op == TCCIR_OP_SWITCH_TABLE)
@@ -1494,7 +1472,7 @@ static int lcs_find_single_exit_target(TCCIRState *ir, int start_idx,
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
 
-    int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    int target = (int)tcc_ir_op_dest_imm(ir, q);
     int target_in_loop = (target >= start_idx && target <= end_idx);
     if (!target_in_loop)
       LCS_RECORD_EXIT(target);
@@ -1659,6 +1637,17 @@ static int lcs_generic_loop_is_stack_local(TCCIRState *ir, int start_idx,
 }
 
 /* allow_extension enables the rotated-range tail extension for callers that report tight ranges. */
+static IROperand lcs_residual_src(TCCIRState *ir, int btype, int64_t val)
+{
+  if (btype == IROP_BTYPE_FLOAT64)
+    return irop_make_f64(-1, tcc_ir_pool_add_f64(ir, (uint64_t)val));
+  if (btype == IROP_BTYPE_FLOAT32)
+    return irop_make_f32(-1, (uint32_t)val);
+  if (val == (int32_t)val)
+    return irop_make_imm32(-1, (int32_t)val, btype);
+  return irop_make_i64(-1, tcc_ir_pool_add_i64(ir, val), btype);
+}
+
 int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
                     int header_idx, int preheader_idx, int allow_extension)
 {
@@ -1708,7 +1697,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
       if (j >= eff_start && j <= eff_end) continue;
       IRQuadCompact *jq = &ir->compact_instructions[j];
       if (jq->op != TCCIR_OP_JUMP && jq->op != TCCIR_OP_JUMPIF) continue;
-      int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq));
+      int jt = (int)tcc_ir_op_dest_imm(ir, jq);
       if (jt > orig_end && jt <= eff_end)
         return 0;
     }
@@ -1733,7 +1722,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
   {
     IRQuadCompact *qx = &ir->compact_instructions[i];
     if (qx->op != TCCIR_OP_JUMP && qx->op != TCCIR_OP_JUMPIF) continue;
-    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, qx));
+    int t = (int)tcc_ir_op_dest_imm(ir, qx);
     if ((t < eff_start || t > eff_end) && lcs_skip_nops(ir, t) != exit_target)
       return 0;
   }
@@ -1774,6 +1763,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
   if (max_var > outer_max_var)
     outer_max_var = max_var;
 
+  int folded = 0;
   LcsState st = {0};
   st.n_vars = outer_max_var + 1;
   st.n_tmps = max_tmp + 1;
@@ -1853,23 +1843,13 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
 
   if (!sim_ok || st.mem_overflow)
   {
-    tcc_free(written_bitmap);
-    tcc_free(st.vars);
-    tcc_free(st.tmps);
-    tcc_free(st.calls);
-    tcc_free(st.mem);
-    return 0;
+    goto out;
   }
 
   /* Without a trip count the region may be a switch dispatch mis-detected as a loop. */
   if (!have_iv_trip && lcs_any_mem_used_after(ir, &st, exit_target))
   {
-    tcc_free(written_bitmap);
-    tcc_free(st.vars);
-    tcc_free(st.tmps);
-    tcc_free(st.calls);
-    tcc_free(st.mem);
-    return 0;
+    goto out;
   }
 
   /* NOPing the region makes it fall through to eff_end+1.  When that is not
@@ -1881,12 +1861,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
   if (need_exit_jump &&
       (exit_target < 0 || exit_target >= ir->next_instruction_index))
   {
-    tcc_free(written_bitmap);
-    tcc_free(st.vars);
-    tcc_free(st.tmps);
-    tcc_free(st.calls);
-    tcc_free(st.mem);
-    return 0;
+    goto out;
   }
 
   /* Residuals can only reuse NOP slots, so count them before NOPing the loop. */
@@ -1914,14 +1889,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
       needed++;
     }
     if (needed > avail)
-    {
-      tcc_free(written_bitmap);
-      tcc_free(st.vars);
-      tcc_free(st.tmps);
-      tcc_free(st.calls);
-      tcc_free(st.mem);
-      return 0;
-    }
+      goto out;
   }
 
   if (have_iv_trip)
@@ -1972,25 +1940,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
     /* Preserve narrow sign: dropping it sign-extends an unsigned char (254 -> -2). */
     d.is_unsigned = st.vars[p].is_unsigned;
     int64_t val = st.vars[p].value;
-    IROperand s;
-    if (btype == IROP_BTYPE_FLOAT64)
-    {
-      uint32_t pidx = tcc_ir_pool_add_f64(ir, (uint64_t)val);
-      s = irop_make_f64(-1, pidx);
-    }
-    else if (btype == IROP_BTYPE_FLOAT32)
-    {
-      s = irop_make_f32(-1, (uint32_t)val);
-    }
-    else if (val == (int32_t)val)
-    {
-      s = irop_make_imm32(-1, (int32_t)val, btype);
-    }
-    else
-    {
-      uint32_t pidx = tcc_ir_pool_add_i64(ir, val);
-      s = irop_make_i64(-1, pidx, btype);
-    }
+    IROperand s = lcs_residual_src(ir, btype, val);
     write_instr_at_nop(ir, slot_pos++, TCCIR_OP_ASSIGN, d, s, IROP_NONE);
   }
 
@@ -2007,25 +1957,7 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
                                      /*is_llocal*/ 0, /*is_param*/ 0, btype);
     d.is_unsigned = ms->is_unsigned;
     int64_t val = ms->value;
-    IROperand s;
-    if (btype == IROP_BTYPE_FLOAT64)
-    {
-      uint32_t pidx = tcc_ir_pool_add_f64(ir, (uint64_t)val);
-      s = irop_make_f64(-1, pidx);
-    }
-    else if (btype == IROP_BTYPE_FLOAT32)
-    {
-      s = irop_make_f32(-1, (uint32_t)val);
-    }
-    else if (val == (int32_t)val)
-    {
-      s = irop_make_imm32(-1, (int32_t)val, btype);
-    }
-    else
-    {
-      uint32_t pidx = tcc_ir_pool_add_i64(ir, val);
-      s = irop_make_i64(-1, pidx, btype);
-    }
+    IROperand s = lcs_residual_src(ir, btype, val);
     write_instr_at_nop(ir, slot_pos++, TCCIR_OP_STORE, d, s, IROP_NONE);
   }
 
@@ -2047,8 +1979,8 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
       IRQuadCompact *gq = &ir->compact_instructions[g];
       if (gq->op == TCCIR_OP_CMP)
       {
-        IROperand gsrc1 = tcc_ir_op_get_src1(ir, gq);
-        if (irop_get_vreg(gsrc1) == iv->vreg && g + 1 < loop->start_idx)
+        int32_t gsrc1_vr = tcc_ir_op_src1_vreg(ir, gq);
+        if (gsrc1_vr == iv->vreg && g + 1 < loop->start_idx)
         {
           IRQuadCompact *gjq = &ir->compact_instructions[g + 1];
           if (gjq->op == TCCIR_OP_JUMPIF)
@@ -2061,10 +1993,15 @@ int lcs_fold_region(TCCIRState *ir, int start_idx, int end_idx,
     }
   }
 
+  /* The loop's final stores now sit anywhere in its span: an inlined body ending in it spans the loop. */
+  tcc_ir_frame_scope_widen(ir, loop->start_idx, loop->end_idx);
+  folded = 1;
+
+out:
   tcc_free(written_bitmap);
   tcc_free(st.vars);
   tcc_free(st.tmps);
   tcc_free(st.calls);
   tcc_free(st.mem);
-  return 1;
+  return folded;
 }

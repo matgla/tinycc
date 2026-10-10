@@ -79,10 +79,16 @@ def _get_objdump():
     pytest.skip("arm-none-eabi-objdump not found")
 
 
-def _parse_frame_sizes(objdump_path, elf_path):
-    """Parse function stack frame sizes from disassembly.
+_FUNC_LABEL = re.compile(r'^[0-9a-f]+ <(\w+)>:')
+_ADDR = re.compile(r'^\s*([0-9a-f]+):')
 
-    Returns dict mapping function name -> total frame size (PUSH + SUB SP).
+
+def _parse_frame_sizes(objdump_path, elf_path, functions):
+    """Frame size (PUSH registers + SUB SP) of each named function.
+
+    Disassembles the ELF once and examines each function's prologue,
+    including an indirect sub sp whose amount comes from the literal pool.
+    Functions missing from the symbol table are left out of the result.
     """
     result = subprocess.run(
         [objdump_path, "-d", str(elf_path)],
@@ -91,162 +97,45 @@ def _parse_frame_sizes(objdump_path, elf_path):
         timeout=120,
     )
     assert result.returncode == 0, f"objdump failed: {result.stderr}"
+    lines = result.stdout.splitlines()
+
+    wanted = set(functions)
+    starts = {}
+    for i, line in enumerate(lines):
+        if line[:1] in "0123456789abcdef":
+            m = _FUNC_LABEL.match(line)
+            if m and m.group(1) in wanted and m.group(1) not in starts:
+                starts[m.group(1)] = i
+
+    addr_lines = None  # address -> first line at it, built on first use
+
+    def literal_word(addr):
+        nonlocal addr_lines
+        if addr_lines is None:
+            addr_lines = {}
+            for line in lines:
+                m = _ADDR.match(line)
+                if m:
+                    addr_lines.setdefault(int(m.group(1), 16), line)
+        m_word = re.search(r'\.word\s+0x([0-9a-f]+)', addr_lines.get(addr, ""))
+        return int(m_word.group(1), 16) if m_word else 0
 
     frames = {}
-    current_func = None
-    push_bytes = 0
-    sub_sp = 0
-    # Track whether we've seen the prologue (first few instructions)
-    insn_count = 0
-
-    for line in result.stdout.splitlines():
-        # New function label
-        m = re.match(r'^[0-9a-f]+ <(\w+)>:', line)
-        if m:
-            # Save previous function
-            if current_func is not None:
-                frames[current_func] = push_bytes + sub_sp
-            current_func = m.group(1)
-            push_bytes = 0
-            sub_sp = 0
-            insn_count = 0
-            continue
-
-        if current_func is None:
-            continue
-
-        insn_count += 1
-        # Only look at prologue (first ~10 instructions)
-        if insn_count > 15:
-            continue
-
-        # PUSH / STMDB SP! — count registers
-        # stmdb sp!, {r4, r5, r6, r7, r8, sl, ip, lr}
-        # push {r4, r5, r6, r7, lr}
-        m_push = re.search(r'(?:stmdb\s+sp!,|push)\s*\{([^}]+)\}', line)
-        if m_push:
-            regs = m_push.group(1).split(',')
-            push_bytes += len(regs) * 4
-            continue
-
-        # SUB SP, #imm  or  SUB SP, SP, #imm  (immediate in instruction)
-        # Also matches subw (Thumb encoding without dot)
-        m_sub = re.search(r'sub(?:\.w|w)?\s+sp,\s*(?:sp,\s*)?#(\d+)', line)
-        if m_sub:
-            sub_sp += int(m_sub.group(1))
-            continue
-
-        # SUB SP via register loaded from literal pool:
-        #   ldr.w ip, [pc, #N]  @  addr <func+off>
-        #   sub.w sp, sp, ip
-        # We detect the pattern: sub.w sp, sp, <reg> preceded by ldr.w <reg>, [pc, #N]
-        # and the literal value is in a .word at the referenced address.
-        # For simplicity, check if we see "sub.w sp, sp, ip" (or r12)
-        # and scan backwards for the corresponding ldr.w ip literal.
-        # This is handled by a second pass below if needed.
-
-    # Save last function
-    if current_func is not None:
-        frames[current_func] = push_bytes + sub_sp
-
-    # Second pass: find indirect SUB SP via literal pool for functions
-    # that have suspiciously small sub sp (like unary).
-    # Look for: ldr.w ip, [pc, #N] -> sub.w sp, sp, ip -> .word VALUE
-    current_func = None
-    insn_count = 0
-    ldr_target_addr = None
-    ldr_reg = None
-
-    for line in result.stdout.splitlines():
-        m = re.match(r'^[0-9a-f]+ <(\w+)>:', line)
-        if m:
-            current_func = m.group(1)
-            insn_count = 0
-            ldr_target_addr = None
-            ldr_reg = None
-            continue
-
-        if current_func is None:
-            continue
-
-        insn_count += 1
-        if insn_count > 15:
-            if ldr_target_addr is None:
-                current_func = None
-            continue
-
-        # ldr.w ip, [pc, #972]  @ 4bd20 <unary+0x3d8>
-        m_ldr = re.search(r'ldr(?:\.w)?\s+(ip|r12),\s*\[pc,\s*#\d+\]\s*@\s*([0-9a-f]+)', line)
-        if m_ldr:
-            ldr_reg = m_ldr.group(1)
-            ldr_target_addr = int(m_ldr.group(2), 16)
-            continue
-
-        # sub.w / subw sp, sp, ip
-        if ldr_target_addr and re.search(rf'sub(?:\.w|w)?\s+sp,\s*sp,\s*(?:{ldr_reg}|ip|r12)', line):
-            # Now find the .word at ldr_target_addr
-            break
-
-    # Third pass: if we found an indirect sub, read the literal value
-    if ldr_target_addr is not None:
-        target_hex = f"{ldr_target_addr:x}:"
-        for line in result.stdout.splitlines():
-            if target_hex in line:
-                m_word = re.search(r'\.word\s+0x([0-9a-f]+)', line)
-                if m_word:
-                    indirect_sub = int(m_word.group(1), 16)
-                    if current_func in frames:
-                        # Replace the sub_sp portion
-                        frames[current_func] = frames.get(current_func, 0) + indirect_sub
-                break
-
-    return frames
-
-
-def _parse_frame_sizes_simple(objdump_path, elf_path, functions):
-    """Targeted frame size extraction for specific functions.
-
-    More accurate than the generic parser: examines each function's
-    prologue individually and handles indirect sub sp via literal pool.
-    """
-    frames = {}
-
-    for func in functions:
-        result = subprocess.run(
-            [objdump_path, "-d", str(elf_path)],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        lines = result.stdout.splitlines()
-
-        # Find function start
-        func_start = None
-        for i, line in enumerate(lines):
-            if re.match(rf'^[0-9a-f]+ <{re.escape(func)}>:', line):
-                func_start = i
-                break
-
-        if func_start is None:
-            continue
-
+    for func, func_start in starts.items():
         push_bytes = 0
         sub_sp = 0
-        ldr_literals = {}  # reg -> (target_addr)
+        ldr_literals = {}  # reg -> literal pool address
 
-        # Scan prologue (first 15 instructions)
-        for j in range(func_start + 1, min(func_start + 20, len(lines))):
-            line = lines[j]
-
+        # Scan the prologue
+        for line in lines[func_start + 1:func_start + 20]:
             # Stop at next function
-            if re.match(r'^[0-9a-f]+ <\w+>:', line):
+            if _FUNC_LABEL.match(line):
                 break
 
             # PUSH / STMDB
             m_push = re.search(r'(?:stmdb\s+sp!,|push)\s*\{([^}]+)\}', line)
             if m_push:
-                regs = m_push.group(1).split(',')
-                push_bytes += len(regs) * 4
+                push_bytes += len(m_push.group(1).split(',')) * 4
                 continue
 
             # Direct sub sp, #imm  (matches sub, sub.w, and subw variants)
@@ -263,18 +152,8 @@ def _parse_frame_sizes_simple(objdump_path, elf_path, functions):
 
             # sub.w / subw sp, sp, reg  (indirect)
             m_sub_reg = re.search(r'sub(?:\.w|w)?\s+sp,\s*sp,\s*(\w+)', line)
-            if m_sub_reg:
-                reg = m_sub_reg.group(1)
-                if reg in ldr_literals:
-                    # Find the literal value
-                    target_addr = ldr_literals[reg]
-                    target_hex = f"{target_addr:x}:"
-                    for k in range(len(lines)):
-                        if target_hex in lines[k]:
-                            m_word = re.search(r'\.word\s+0x([0-9a-f]+)', lines[k])
-                            if m_word:
-                                sub_sp += int(m_word.group(1), 16)
-                            break
+            if m_sub_reg and m_sub_reg.group(1) in ldr_literals:
+                sub_sp += literal_word(ldr_literals[m_sub_reg.group(1)])
 
         frames[func] = push_bytes + sub_sp
 
@@ -288,8 +167,12 @@ def frame_sizes():
         pytest.skip(f"Native TCC binary not found: {TCC_ELF}")
 
     objdump = _get_objdump()
-    functions = list(FRAME_BUDGETS.keys())
-    return _parse_frame_sizes_simple(objdump, TCC_ELF, functions)
+    frames = _parse_frame_sizes(objdump, TCC_ELF, FRAME_BUDGETS)
+    if not frames:
+        # tcc only writes .symtab when linking with -g, so a release build
+        # has none of these functions (build_rootfs.sh --debug keeps them).
+        pytest.skip(f"{TCC_ELF.name} has no symbols for the budgeted functions")
+    return frames
 
 
 class TestStackFrameBudgets:

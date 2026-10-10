@@ -1,0 +1,2 @@
+error:
+cannot convert 'const char *__rodata_relative *' to 'const char **' (__rodata_relative differs)

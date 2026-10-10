@@ -113,7 +113,8 @@ uint8_t *ssa_opt_compute_reachable_blocks(IRSSAOptCtx *ctx)
   small_sequence(BranchIntSeq) worklist_owner = {0};
   BranchIntSeq_init(&worklist_owner, (size_t)nb);
   int *worklist = BranchIntSeq_data(&worklist_owner);
-  int wl_head = 0, wl_tail = 0;
+  int wl_head = 0;
+  IrReachList rl = {reachable, worklist, 0, nb};
 
   /* Entry = block containing instruction 0; an empty function or bad mapping
    * falls back to assuming everything reachable. */
@@ -124,18 +125,10 @@ uint8_t *ssa_opt_compute_reachable_blocks(IRSSAOptCtx *ctx)
   }
 
   reachable[entry] = 1;
-  worklist[wl_tail++] = entry;
+  worklist[rl.top++] = entry;
 
-#define MARK(blk_)                                                            \
-  do {                                                                        \
-    int _b = (blk_);                                                          \
-    if (_b >= 0 && _b < nb && !reachable[_b]) {                               \
-      reachable[_b] = 1;                                                      \
-      worklist[wl_tail++] = _b;                                               \
-    }                                                                         \
-  } while (0)
 
-  while (wl_head < wl_tail) {
+  while (wl_head < rl.top) {
     int b = worklist[wl_head++];
     IRBasicBlock *bb = &cfg->blocks[b];
 
@@ -153,35 +146,34 @@ uint8_t *ssa_opt_compute_reachable_blocks(IRSSAOptCtx *ctx)
       fall_block = cfg->instr_to_block[bb->end_idx];
 
     if (term < 0) {  /* all NOPs: fall through */
-      MARK(fall_block);
+      ir_opt_reach_push(&rl, fall_block);
       continue;
     }
 
     IRQuadCompact *q = &ir->compact_instructions[term];
     if (q->op == TCCIR_OP_JUMP) {
-      int target = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
       int tb = (target >= 0 && target < cfg->num_instrs) ?
                cfg->instr_to_block[target] : -1;
-      MARK(tb);
+      ir_opt_reach_push(&rl, tb);
     } else if (q->op == TCCIR_OP_JUMPIF) {
-      int target = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
       int tb = (target >= 0 && target < cfg->num_instrs) ?
                cfg->instr_to_block[target] : -1;
-      MARK(tb);
-      MARK(fall_block);
+      ir_opt_reach_push(&rl, tb);
+      ir_opt_reach_push(&rl, fall_block);
     } else if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
                q->op == TCCIR_OP_TRAP) {
       /* No successors. */
     } else if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE) {
       /* Conservative: keep all CFG successors reachable. */
       for (int si = 0; si < bb->num_succs; si++)
-        MARK(bb->succs[si]);
+        ir_opt_reach_push(&rl, bb->succs[si]);
     } else {
-      MARK(fall_block);
+      ir_opt_reach_push(&rl, fall_block);
     }
   }
 
-#undef MARK
 
   return reachable;
 }
@@ -248,7 +240,7 @@ static void ssa_rewrite_jumpif(IRSSAOptCtx *ctx, int j, int taken)
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *jump_q = &ir->compact_instructions[j];
   int jumpif_block = ssa_block_for_instr(ctx->cfg, j);
-  int target_idx = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jump_q));
+  int target_idx = (int)tcc_ir_op_dest_imm(ir, jump_q);
   int target_block = ssa_block_for_instr(ctx->cfg, target_idx);
   int fallthru_block = ssa_block_for_instr(ctx->cfg, j + 1);
 
@@ -275,7 +267,7 @@ static int ssa_flag_consumer_tok(IRSSAOptCtx *ctx, int j)
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *q = &ir->compact_instructions[j];
   if (q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_SETIF)
-    return (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, q));
+    return (int)tcc_ir_op_src1_imm(ir, q);
   if (q->op != TCCIR_OP_SELECT)
     return -1;
   if (tcc_ir_barrel_shift_at(ir, q) != 0)
@@ -288,7 +280,7 @@ static int ssa_flag_consumer_tok(IRSSAOptCtx *ctx, int j)
         kop == TCCIR_OP_JUMPIF)
       return -1;
   }
-  return (int)irop_get_imm64_ex(ir, tcc_ir_op_get_cond(ir, q));
+  return (int)tcc_ir_op_cond_imm(ir, q);
 }
 
 /* Rewrite the decided flag consumer at `j` for comparison outcome `result`:
@@ -304,12 +296,10 @@ static void ssa_rewrite_flag_consumer(IRSSAOptCtx *ctx, int j, int result)
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     q->op = TCCIR_OP_ASSIGN;
     tcc_ir_set_src1(ir, j, irop_make_imm32(0, result, dest.btype));
-    tcc_ir_set_src2(ir, j, IROP_NONE);
+    tcc_ir_set_src2_none(ir, j);
   } else {  /* SELECT: dest = cond ? src1 : src2 */
-    IROperand chosen = result ? tcc_ir_op_get_src1(ir, q)
-                              : tcc_ir_op_get_src2(ir, q);
-    IROperand dropped = result ? tcc_ir_op_get_src2(ir, q)
-                               : tcc_ir_op_get_src1(ir, q);
+    IROperand chosen = tcc_ir_op_get_src1_or_2(ir, q, !result);
+    IROperand dropped = tcc_ir_op_get_src1_or_2(ir, q, result);
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     q->op = TCCIR_OP_ASSIGN;
     tcc_ir_set_src1(ir, j, chosen);
@@ -340,13 +330,12 @@ static int ssa_vreg_is_bool01(IRSSAOptCtx *ctx, int32_t vr)
     return 1;
   case TCCIR_OP_UBFX:
   case TCCIR_OP_AND: {
-    if (irop_needs_pair(tcc_ir_op_get_dest(ir, dq)) ||
+    if (tcc_ir_op_dest_needs_pair(ir, dq) ||
         tcc_ir_barrel_shift_at(ir, dq) != 0)
       return 0;
-    IROperand d2 = tcc_ir_op_get_src2(ir, dq);
-    if (!irop_is_immediate(d2) || d2.is_lval)
+    if (!tcc_ir_op_src2_is_imm(ir, dq) || tcc_ir_op_src2_is_lval(ir, dq))
       return 0;
-    int64_t p = irop_get_imm64_ex(ir, d2);
+    int64_t p = tcc_ir_op_src2_imm(ir, dq);
     /* UBFX src2 packs lsb | width<<5; a 1-bit field is {0,1}. */
     return dq->op == TCCIR_OP_UBFX ? ((p >> 5) & 63) == 1 : p == 1;
   }
@@ -362,10 +351,9 @@ static int ssa_bool_norm(IRSSAOptCtx *ctx, int cmp_idx)
   int n = ir->next_instruction_index;
   IRQuadCompact *cmp_q = &ir->compact_instructions[cmp_idx];
 
-  IROperand cmp_s2 = tcc_ir_op_get_src2(ir, cmp_q);
-  if (!irop_is_immediate(cmp_s2) || cmp_s2.is_sym || cmp_s2.is_lval)
+  if (!tcc_ir_op_src2_is_imm(ir, cmp_q) || tcc_ir_op_src2_is_sym(ir, cmp_q) || tcc_ir_op_src2_is_lval(ir, cmp_q))
     return 0;
-  if (irop_get_imm64_ex(ir, cmp_s2) != 0)
+  if (tcc_ir_op_src2_imm(ir, cmp_q) != 0)
     return 0;
 
   IROperand cmp_s1 = tcc_ir_op_get_src1(ir, cmp_q);
@@ -381,13 +369,13 @@ static int ssa_bool_norm(IRSSAOptCtx *ctx, int cmp_idx)
   IRQuadCompact *setif_q = &ir->compact_instructions[j];
   if (setif_q->op != TCCIR_OP_SETIF)
     return 0;
-  if ((int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, setif_q)) != TOK_NE)
+  if ((int)tcc_ir_op_src1_imm(ir, setif_q) != TOK_NE)
     return 0;
 
   ssa_opt_nop_instr(ctx, cmp_idx);
   setif_q->op = TCCIR_OP_ASSIGN;
   tcc_ir_set_src1(ir, j, irop_make_vreg(vr, irop_get_btype(cmp_s1)));
-  tcc_ir_set_src2(ir, j, IROP_NONE);
+  tcc_ir_set_src2_none(ir, j);
   IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
   if (vi)
     ssa_opt_add_use_instr(vi, j);
@@ -407,6 +395,8 @@ static int ssa_var_block_def_src(IRSSAOptCtx *ctx, IRBasicBlock *bb,
   if (var_pos < ir->variables_live_intervals_size &&
       ir->variables_live_intervals[var_pos].is_volatile)
     return -1;
+  IRLiveInterval *vli = tcc_ir_vreg_live_interval(ir, vr);
+  int addrtaken = !vli || vli->addrtaken;
   for (int k = use_idx - 1; k >= bb->start_idx; k--) {
     IRQuadCompact *kq = &ir->compact_instructions[k];
     if (kq->op == TCCIR_OP_NOP)
@@ -415,6 +405,12 @@ static int ssa_var_block_def_src(IRSSAOptCtx *ctx, IRBasicBlock *bb,
       return -1;
     if (kq->op == TCCIR_OP_STORE_INDEXED || kq->op == TCCIR_OP_STORE_POSTINC)
       return -1;  /* may alias VAR through pointer arithmetic */
+    /* Inline asm ("memory" clobber, `&VAR` as an input) and the non-local ops
+     * write memory unseen here; so does a block copy once &VAR is taken. */
+    if (ir_op_has(kq->op, IR_HZ_ASM | IR_HZ_NONLOCAL | IR_HZ_VLA))
+      return -1;
+    if (kq->op == TCCIR_OP_BLOCK_COPY && addrtaken)
+      return -1;
     /* A slot write has kd.is_local=1; a pointer-deref through V inherited
      * is_local=0 from a TEMP and writes V's pointee, not V's slot. */
     if (irop_config[kq->op].has_dest) {
@@ -434,8 +430,11 @@ static int ssa_var_block_def_src(IRSSAOptCtx *ctx, IRBasicBlock *bb,
     }
     if (kq->op == TCCIR_OP_STORE) {
       IROperand kd = tcc_ir_op_get_dest(ir, kq);
-      if (kd.tag == IROP_TAG_STACKOFF && kd.is_local && kd.is_lval)
-        continue;  /* a known stack slot cannot alias this VAR */
+      /* An anonymous StackLoc store cannot alias a VAR that lives in a
+       * register, but its slot offset says nothing about where an
+       * address-taken VAR's slot ends up (see sccp_resolve_var). */
+      if (kd.tag == IROP_TAG_STACKOFF && kd.is_local && kd.is_lval && !addrtaken)
+        continue;
       return -1;   /* TEMP-DEREF or global STORE: may alias via escaped pointer */
     }
   }
@@ -461,9 +460,8 @@ static int ssa_operand_const(IRSSAOptCtx *ctx, IRBasicBlock *cmp_bb, int cmp_idx
     if (vi && vi->def_instr >= 0 && vi->def_count <= 1 && vi->def_phi_block < 0) {
       IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
       if (dq->op == TCCIR_OP_ASSIGN) {
-        IROperand ds = tcc_ir_op_get_src1(ir, dq);
-        if (irop_is_immediate(ds) && !ds.is_lval) {
-          *val = irop_get_imm64_ex(ir, ds);
+        if (tcc_ir_op_src1_is_imm(ir, dq) && !tcc_ir_op_src1_is_lval(ir, dq)) {
+          *val = tcc_ir_op_src1_imm(ir, dq);
           return 1;
         }
       }
@@ -576,8 +574,7 @@ static int ssa_cmp_extract_desc(IRSSAOptCtx *ctx, int cmp_idx, int slot,
 {
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *cmp_q = &ir->compact_instructions[cmp_idx];
-  IROperand s = (slot == 0) ? tcc_ir_op_get_src1(ir, cmp_q)
-                            : tcc_ir_op_get_src2(ir, cmp_q);
+  IROperand s = tcc_ir_op_get_src1_or_2(ir, cmp_q, slot != 0);
   if (s.is_lval || s.tag != IROP_TAG_VREG)
     return 0;
   int32_t vr = irop_get_vreg(s);
@@ -1149,7 +1146,7 @@ static int ssa_fold_test_zero(IRSSAOptCtx *ctx, int tz_idx)
     return 1;
   }
 
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, next_q));
+  int tok = (int)tcc_ir_op_src1_imm(ir, next_q);
   if (tok != TOK_EQ && tok != TOK_NE)
     return 0;
   int branch_taken = (tok == TOK_EQ) ? (val == 0) : (val != 0);
@@ -1169,13 +1166,13 @@ static int ssa_fold_test_zero(IRSSAOptCtx *ctx, int tz_idx)
   if (k < n) {
     IRQuadCompact *setif_q = &ir->compact_instructions[k];
     if (setif_q->op == TCCIR_OP_SETIF && !setif_q->is_jump_target) {
-      int stok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, setif_q));
+      int stok = (int)tcc_ir_op_src1_imm(ir, setif_q);
       if (stok == TOK_EQ || stok == TOK_NE) {
         int sres = (stok == TOK_EQ) ? (val == 0) : (val != 0);
         IROperand dest = tcc_ir_op_get_dest(ir, setif_q);
         setif_q->op = TCCIR_OP_ASSIGN;
-        tcc_ir_set_src1(ir, k, irop_make_imm32(-1, sres, irop_get_btype(dest)));
-        tcc_ir_set_src2(ir, k, IROP_NONE);
+        tcc_ir_set_src1_imm32(ir, k, sres, irop_get_btype(dest));
+        tcc_ir_set_src2_none(ir, k);
       }
     }
   }
@@ -1200,7 +1197,7 @@ static const char *ssa_flag_cmp_funcs[] = {
 
 static const char *ssa_call_callee_name(TCCIRState *ir, IRQuadCompact *q)
 {
-  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  Sym *callee = tcc_ir_op_src1_sym(ir, q);
   return callee ? get_tok_str(callee->v, NULL) : NULL;
 }
 
@@ -1218,14 +1215,14 @@ static int ssa_name_in(const char *name, const char **tbl, int cnt)
 static unsigned ssa_call_params(TCCIRState *ir, int call_idx, IROperand *p, int np)
 {
   IRQuadCompact *cq = &ir->compact_instructions[call_idx];
-  uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, cq));
+  uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, cq);
   int call_id = TCCIR_DECODE_CALL_ID(enc);
   unsigned found = 0;
   for (int k = call_idx - 1; k >= 0; k--) {
     IRQuadCompact *kq = &ir->compact_instructions[k];
     if (kq->op == TCCIR_OP_NOP || kq->op == TCCIR_OP_FUNCPARAMVOID) continue;
     if (kq->op != TCCIR_OP_FUNCPARAMVAL) break;
-    uint32_t penc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, kq));
+    uint32_t penc = (uint32_t)tcc_ir_op_src2_imm(ir, kq);
     if (TCCIR_DECODE_CALL_ID(penc) != call_id) break;
     int pidx = TCCIR_DECODE_PARAM_IDX(penc);
     if (pidx < np && !(found & (1u << pidx))) {
@@ -1504,7 +1501,7 @@ static int ssa_fold_return_const_reuse(IRSSAOptCtx *ctx, int ret_idx)
   IROperand rv = tcc_ir_op_get_src1(ir, R);
   if (rv.is_sym || rv.is_lval || !irop_is_immediate(rv))
     return 0;
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
   int64_t cval = irop_get_imm64_ex(ir, rv);
 
@@ -1533,13 +1530,12 @@ static int ssa_fold_return_const_reuse(IRSSAOptCtx *ctx, int ret_idx)
     int targets_r = 0;
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      if ((int)tcc_ir_op_get_dest(ir, q).u.imm32 == ret_idx)
+      if ((int)tcc_ir_op_dest_u_imm32(ir, q) == ret_idx)
         targets_r = 1;
     }
     else if (q->op == TCCIR_OP_SWITCH_TABLE)
     {
-      IROperand s2 = tcc_ir_op_get_src2(ir, q);
-      int tid = (int)irop_get_imm64_ex(ir, s2);
+      int tid = (int)tcc_ir_op_src2_imm(ir, q);
       if (tid >= 0 && tid < ir->num_switch_tables)
       {
         TCCIRSwitchTable *t = &ir->switch_tables[tid];
@@ -1696,8 +1692,8 @@ static int ssa_fold_redundant_flag_cmps(IRSSAOptCtx *ctx)
 
       IRQuadCompact *jump1 = &ir->compact_instructions[jump1_idx];
       IRQuadCompact *jump2 = &ir->compact_instructions[jump2_idx];
-      int tok1 = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jump1));
-      int tok2 = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jump2));
+      int tok1 = (int)tcc_ir_op_src1_imm(ir, jump1);
+      int tok2 = (int)tcc_ir_op_src1_imm(ir, jump2);
       int known_fact = vrp_negate_cmp_tok(tok1);
       if (known_fact < 0)
         continue;
@@ -1717,7 +1713,7 @@ static int ssa_fold_redundant_flag_cmps(IRSSAOptCtx *ctx)
       /* Swapped operands only order-compare soundly under UB (C11 6.5.8p5);
        * require matching targets or an ordering known_fact. */
       if (is_swapped &&
-          tcc_ir_op_get_dest(ir, jump1).u.imm32 != tcc_ir_op_get_dest(ir, jump2).u.imm32) {
+          tcc_ir_op_dest_u_imm32(ir, jump1) != tcc_ir_op_dest_u_imm32(ir, jump2)) {
         switch (known_fact) {
         case TOK_LT: case TOK_GT: case TOK_ULT: case TOK_UGT: break;
         default: continue;
@@ -1742,8 +1738,7 @@ static int ssa_fold_redundant_flag_cmps(IRSSAOptCtx *ctx)
       if (jump1_idx < 0 || ir->compact_instructions[jump1_idx].op != TCCIR_OP_JUMPIF)
         continue;
       int known_zero;
-      switch ((int)irop_get_imm64_ex(ir,
-                 tcc_ir_op_get_src1(ir, &ir->compact_instructions[jump1_idx]))) {
+      switch ((int)tcc_ir_op_src1_imm(ir, &ir->compact_instructions[jump1_idx])) {
       case TOK_NE: known_zero = 1; break;
       case TOK_EQ: known_zero = 0; break;
       default: continue;
@@ -1766,8 +1761,7 @@ static int ssa_fold_redundant_flag_cmps(IRSSAOptCtx *ctx)
           break;
         if (!ir_opt_pure_expr_equal(ir, expr1, i, expr2, t2, 0))
           continue;
-        int tok2 = (int)irop_get_imm64_ex(ir,
-                     tcc_ir_op_get_src1(ir, &ir->compact_instructions[jump2_idx]));
+        int tok2 = (int)tcc_ir_op_src1_imm(ir, &ir->compact_instructions[jump2_idx]);
         if ((known_zero && tok2 == TOK_EQ) || (!known_zero && tok2 == TOK_NE)) {
           ssa_opt_nop_instr(ctx, t2);
           ssa_rewrite_jumpif(ctx, jump2_idx, 1);

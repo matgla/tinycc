@@ -31,6 +31,23 @@
 
 static int k01_operand(IRSSAOptCtx *ctx, IROperand op, int depth, int vars_left);
 
+/* Side-table annotations keyed by orig_index change what an instruction reads:
+ * barrel-shift fusion folds a single-use shift into src2 (`orr.w r2, r1, r0,
+ * lsl #1`, `cmp.w r2, r1, asr #8`), and the 64-bit half / BFI tables narrow or
+ * reshape the operands.  None of them shows in the operands themselves, so an
+ * OR of two SETIFs may really be `SETIF | SETIF << 1` (0..3), and a CMP of two
+ * booleans may compare one of them shifted.  Such an instruction proves no
+ * {0,1} range and is not rewritten.
+ * TCC_DISABLE_PASS=ssa:bool_norm_annot_guard drops this check (A/B only:
+ * unsound). */
+static int bn_annotated(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (tcc_ir_opt_pass_disabled("ssa:bool_norm_annot_guard"))
+    return 0;
+  return tcc_ir_barrel_shift_at(ir, q) != 0 || tcc_ir_shift64_dead_half_at(ir, q) != 0 ||
+         tcc_ir_zero_half64_at(ir, q) != 0 || tcc_ir_bfi_params_at(ir, q) != 0;
+}
+
 /* Every write to this local puts a {0,1} value in it, and nothing outside the
  * function can reach it (address never taken, so no pointer, call or asm write
  * aliases it).  Volatile is irrelevant here: this is a range fact about the
@@ -65,6 +82,8 @@ static int k01_var(IRSSAOptCtx *ctx, int32_t vr, int read_bytes, int vars_left)
      * call's sret slot, a partial store) could leave a non-boolean behind. */
     if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_STORE)
       return 0;
+    if (bn_annotated(ir, q))
+      return 0;
     int wb = ir_opt_store_btype_size_bytes(irop_get_btype(d));
     if (wb <= 0 || wb > 4 || wb < read_bytes)
       return 0;
@@ -85,13 +104,15 @@ static int k01_temp(IRSSAOptCtx *ctx, int32_t vr, int depth, int vars_left)
   if (vi->def_instr >= ir->next_instruction_index)
     return 0;
   IRQuadCompact *q = &ir->compact_instructions[vi->def_instr];
+  if (q->op == TCCIR_OP_SETIF)
+    return 1;
+  if (bn_annotated(ir, q))
+    return 0;
   IROperand s1 = tcc_ir_op_get_src1(ir, q);
   IROperand s2 = tcc_ir_op_get_src2(ir, q);
 
   switch (q->op)
   {
-  case TCCIR_OP_SETIF:
-    return 1;
   case TCCIR_OP_ASSIGN:
   case TCCIR_OP_LOAD:
     return k01_operand(ctx, s1, depth + 1, vars_left);
@@ -208,10 +229,14 @@ static int bn_fold(IRSSAOptCtx *ctx, int i)
     return 0;
   IRQuadCompact *sq = &ir->compact_instructions[j];
 
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, sq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, sq);
   if (tok != TOK_EQ && tok != TOK_NE)
     return 0;
 
+  /* `CMP a, b lsl #k` compares a shifted b; XOR-ing the plain operands drops
+   * the shift. */
+  if (bn_annotated(ir, q) || bn_annotated(ir, sq))
+    return 0;
   IROperand a = tcc_ir_op_get_src1(ir, q);
   IROperand b = tcc_ir_op_get_src2(ir, q);
   /* Embedded derefs would move a memory read into the rewritten op; keep the

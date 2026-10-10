@@ -21,7 +21,7 @@ int ir_opt_vreg_address_taken_between(TCCIRState *ir, int32_t vreg, int start_id
   for (int i = start_idx + 1; i < end_idx; ++i)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_LEA && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg)
+    if (q->op == TCCIR_OP_LEA && tcc_ir_op_src1_vreg(ir, q) == vreg)
       return 1;
   }
 
@@ -30,6 +30,9 @@ int ir_opt_vreg_address_taken_between(TCCIRState *ir, int32_t vreg, int start_id
 
 int tcc_ir_vreg_has_single_def(TCCIRState *ir, int32_t vreg)
 {
+  int defs = tcc_ir_vreg_index_defs(ir, vreg);
+  if (defs >= 0)
+    return defs == 1;
   int def_count = 0;
   int n = ir->next_instruction_index;
 
@@ -40,8 +43,7 @@ int tcc_ir_vreg_has_single_def(TCCIRState *ir, int32_t vreg)
       continue;
     if (!irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(dest) == vreg)
+    if (tcc_ir_op_dest_vreg(ir, q) == vreg)
     {
       def_count++;
       if (def_count > 1)
@@ -54,6 +56,9 @@ int tcc_ir_vreg_has_single_def(TCCIRState *ir, int32_t vreg)
 /* A ZERO-def vreg (e.g. an untouched incoming parameter) is as safe as a single-def one: no def means no back-edge can change it. */
 int tcc_ir_vreg_has_multi_def(TCCIRState *ir, int32_t vreg)
 {
+  int defs = tcc_ir_vreg_index_defs(ir, vreg);
+  if (defs >= 0)
+    return defs >= 2;
   int def_count = 0;
   int n = ir->next_instruction_index;
 
@@ -64,8 +69,7 @@ int tcc_ir_vreg_has_multi_def(TCCIRState *ir, int32_t vreg)
       continue;
     if (!irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(dest) == vreg)
+    if (tcc_ir_op_dest_vreg(ir, q) == vreg)
     {
       def_count++;
       if (def_count > 1)
@@ -80,5 +84,5 @@ int32_t ir_opt_mla_accum_vreg(const TCCIRState *ir, const IRQuadCompact *q)
 {
   if (!tcc_ir_op_is_mac(q->op))
     return -1;
-  return irop_get_vreg(tcc_ir_op_get_accum(ir, q));
+  return tcc_ir_op_accum_vreg(ir, q);
 }

@@ -26,8 +26,7 @@ int dce_orphan_params(IRSSAOptCtx *ctx)
       continue;
     if (op == TCCIR_OP_FUNCPARAMVAL || op == TCCIR_OP_FUNCPARAMVOID)
       saw_param = 1;
-    int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(
-        ir, tcc_ir_op_get_src2(ir, &ir->compact_instructions[i])));
+    int cid = TCCIR_DECODE_CALL_ID((int32_t)tcc_ir_op_src2_imm(ir, &ir->compact_instructions[i]));
     if (cid > max_cid)
       max_cid = cid;
   }
@@ -40,8 +39,7 @@ int dce_orphan_params(IRSSAOptCtx *ctx)
     int op = ir->compact_instructions[i].op;
     if (op != TCCIR_OP_FUNCCALLVAL && op != TCCIR_OP_FUNCCALLVOID)
       continue;
-    int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(
-        ir, tcc_ir_op_get_src2(ir, &ir->compact_instructions[i])));
+    int cid = TCCIR_DECODE_CALL_ID((int32_t)tcc_ir_op_src2_imm(ir, &ir->compact_instructions[i]));
     if (cid >= 0 && cid <= max_cid)
       has_call[cid / 8] |= (uint8_t)(1 << (cid % 8));
   }
@@ -51,8 +49,7 @@ int dce_orphan_params(IRSSAOptCtx *ctx)
     int op = ir->compact_instructions[i].op;
     if (op != TCCIR_OP_FUNCPARAMVAL && op != TCCIR_OP_FUNCPARAMVOID)
       continue;
-    int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(
-        ir, tcc_ir_op_get_src2(ir, &ir->compact_instructions[i])));
+    int cid = TCCIR_DECODE_CALL_ID((int32_t)tcc_ir_op_src2_imm(ir, &ir->compact_instructions[i]));
     if (cid < 0 || cid > max_cid ||
         !(has_call[cid / 8] & (1 << (cid % 8)))) {
       ssa_opt_nop_instr(ctx, i);

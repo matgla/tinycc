@@ -190,6 +190,31 @@ UT_TEST(test_func_parameter_mop_grows_argument_list_and_backfills_gap)
   return 0;
 }
 
+/* Params arrive one index at a time; the list must grow geometrically, not by
+ * one int per param (limits-fnargs: 10000 args = 10000 whole-list reallocs). */
+UT_TEST(test_func_parameter_mop_grows_argument_list_geometrically)
+{
+  setup_gen();
+
+  MachineOperand src1 = mop_reg(R0, IROP_BTYPE_INT32);
+  for (int i = 0; i < 1000; i++)
+  {
+    MachineOperand src2 = mop_imm((int64_t)TCCIR_ENCODE_PARAM(110, i), IROP_BTYPE_INT32);
+    tcc_gen_machine_func_parameter_mop(src1, src2, TCCIR_OP_FUNCPARAMVAL);
+    ThumbGenCallSite *cs = thumb_get_call_site_for_id(110);
+    UT_ASSERT(cs->function_argument_capacity >= cs->function_argument_count);
+  }
+
+  /* 8, 16, ..., 1024: doubling, not 1000 single-int steps */
+  ThumbGenCallSite *cs = thumb_get_call_site_for_id(110);
+  UT_ASSERT_EQ(cs->function_argument_count, 1000);
+  UT_ASSERT_EQ(cs->function_argument_capacity, 1024);
+  for (int i = 0; i < 1000; i++)
+    UT_ASSERT_EQ(cs->function_argument_list[i], 1);
+
+  return 0;
+}
+
 /* FUNCPARAMVOID: creates the call site (0-argument call marker) but does not
  * touch function_argument_list at all -- (~13379-13382). */
 UT_TEST(test_func_parameter_mop_void_creates_site_without_argument_entry)

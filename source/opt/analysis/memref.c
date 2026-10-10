@@ -37,10 +37,9 @@ static int memref_resolve_ptr(TCCIRState *ir, int32_t vr, int at_idx, struct Sym
     IROperand s1 = tcc_ir_op_get_src1(ir, dq);
     if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB)
     {
-      IROperand s2 = tcc_ir_op_get_src2(ir, dq);
-      if (!irop_is_immediate(s2) || s2.is_sym)
+      if (!tcc_ir_op_src2_is_imm(ir, dq) || tcc_ir_op_src2_is_sym(ir, dq))
         return 0;
-      int64_t c = irop_get_imm64_ex(ir, s2);
+      int64_t c = tcc_ir_op_src2_imm(ir, dq);
       acc += (dq->op == TCCIR_OP_SUB) ? -c : c;
     }
     /* Terminal: a global &sym+addend. */

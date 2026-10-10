@@ -34,7 +34,9 @@ static int narrow_store_int_width(int bt)
 }
 
 OPT_GEN_FLAT(narrow_store_value_btype, TCCIR_OP_STORE) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
   int dbt = irop_get_btype(dest);
   int sw = narrow_store_int_width(irop_get_btype(src1));
   GUARD(
@@ -42,7 +44,7 @@ OPT_GEN_FLAT(narrow_store_value_btype, TCCIR_OP_STORE) {
     and(dbt == IROP_BTYPE_INT8 || dbt == IROP_BTYPE_INT16);
     and(sw > narrow_store_int_width(dbt)));
   src1.btype = (uint8_t)dbt;
-  REWRITE(.src1 = src1);
+  REWRITE(set_src1(src1));
 }
 
 const IROptGen narrow_store_gens[] = {

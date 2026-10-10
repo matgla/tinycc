@@ -96,6 +96,12 @@ int tcc_ir_ssa_opt_ptr_store_dse(IRSSAOptCtx *ctx)
   return 0;
 }
 
+int ssa_opt_copy_fwd(IRSSAOptCtx *ctx)
+{
+  (void)ctx;
+  return 0;
+}
+
 /* Target generator registration - no target generators for RA tests. */
 void tcc_ir_ssa_opt_register_target(const struct IRSSAOptGen *gens, int count)
 {
@@ -120,12 +126,15 @@ int ssa_opt_bool_norm(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_cmp_offset_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_sccp(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_load_cse(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
+int ssa_opt_expose_cmp_loads(TCCIRState *ir) { (void)ir; return 0; }
+int ssa_opt_load_combine(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int tcc_ir_ssa_opt_const_string_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int tcc_ir_ssa_opt_const_string_fold_flat(TCCIRState *ir) { (void)ir; return 0; }
 int tcc_ir_ssa_opt_bitop_const_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int tcc_ir_ssa_opt_global_addr_hoist(TCCIRState *ir) { (void)ir; return 0; }
 int tcc_ir_ssa_opt_local_addr_cse(TCCIRState *ir) { (void)ir; return 0; }
 int tcc_ir_ssa_opt_loop_addr_hoist(TCCIRState *ir) { (void)ir; return 0; }
+int tcc_ir_ssa_opt_os_const_share(TCCIRState *ir) { (void)ir; return 0; }
 int ssa_opt_var_forward(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_var_to_param_forward(IRSSAOptCtx *ctx) { (void)ctx; return 0; }
 int ssa_opt_var_const_fold(IRSSAOptCtx *ctx) { (void)ctx; return 0; }

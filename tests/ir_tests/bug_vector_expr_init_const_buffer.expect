@@ -1,0 +1,8 @@
+f=101 (101)
+g=22 (22)
+h=900 (900)
+call_init=6 (6)
+array_of_vectors=202 (202)
+string_init=66 (66)
+both_const=310 (310)
+const_copy=6012 (6012)

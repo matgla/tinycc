@@ -317,3 +317,11 @@ def test_uxtb():
 
 def test_uxth():
     utils.perform_test_for_file("test_uxth.S")
+def test_shift_imm_edges():
+    utils.perform_test_for_file("test_shift_imm_edges.S")
+
+def test_it_s_suffix_reg():
+    utils.perform_test_for_file("test_it_s_suffix_reg.S")
+
+def test_it_s_suffix_shift_mov():
+    utils.perform_test_for_file("test_it_s_suffix_shift_mov.S")

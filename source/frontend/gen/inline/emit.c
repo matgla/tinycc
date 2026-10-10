@@ -338,7 +338,7 @@ void gen_late_reopt_functions(TCCState *s)
 
     int saved_pack[PACK_STACK_SIZE + 1];
     int saved_budget = called_once_budget_begin(body_len);
-    tccpp_putfile(fn->filename);
+    tccpp_setfile(fn->filename);
     pp_pack_enter(s, fn->pack, saved_pack);
     begin_macro(compile_ts, 1);
     next();
@@ -385,7 +385,7 @@ void gen_late_reopt_functions(TCCState *s)
 /* Under -ffunction-sections, give each function its own .text.<name> input
  * section so the linker's gc_sections() can drop unreferenced bodies
  * individually.  Survivors are folded back into the single text_section
- * before GOT build and layout (coalesce_function_sections in tccelf.c), so
+ * before GOT build and layout (coalesce_split_sections in tccelf_output.c), so
  * sbrel classification, the export table and the YAFF writer all still see
  * one text section.  Without the flag this is exactly the old behaviour. */
 Section *function_text_section(TCCState *s1, Sym *sym)
@@ -464,7 +464,7 @@ static void emit_inline_functions(TCCState *s, int owed_only)
         fn->sym = NULL;
         int saved_pack[PACK_STACK_SIZE + 1];
         int saved_budget = called_once_budget_begin(fn->func_str->len);
-        tccpp_putfile(fn->filename);
+        tccpp_setfile(fn->filename);
         pp_pack_enter(s, fn->pack, saved_pack);
         begin_macro(fn->func_str, 1);
         next();
@@ -515,7 +515,26 @@ void free_inline_functions(TCCState *s)
   tcc_free(s->inline_fn_by_tok);
   s->inline_fn_by_tok = NULL;
   s->inline_fn_by_tok_size = 0;
+  s->inline_fn_by_tok_count = 0;
   s->inline_fn_indexed = 0;
+}
+
+/* A token-indexed array of InlineFunc pointers was as long as the highest
+ * token holding a body -- most of the TU's identifiers, 16 KiB on a 64-bit
+ * host for regcomp.c's 60-odd inline bodies.  A table keyed by token holds
+ * the same mapping in a few slots per body. */
+typedef struct InlineFnSlot
+{
+  int k;               /* symbol token - TOK_IDENT */
+  struct InlineFunc *fn; /* NULL = empty slot */
+} InlineFnSlot;
+
+static InlineFnSlot *inline_fn_slot(InlineFnSlot *slots, int size, int k)
+{
+  unsigned mask = (unsigned)size - 1, h = ((unsigned)k * 2654435761u) & mask;
+  while (slots[h].fn && slots[h].k != k)
+    h = (h + 1) & mask;
+  return &slots[h];
 }
 
 /* The inline_fns entry holding `sym`'s body, or NULL.  Entries are indexed by
@@ -532,25 +551,35 @@ InlineFunc *inline_fn_lookup(TCCState *s, Sym *sym)
     int k = (fn->sym->v & ~SYM_FIELD) - TOK_IDENT;
     if (k < 0)
       continue;
-    if (k >= s->inline_fn_by_tok_size)
+    if ((s->inline_fn_by_tok_count + 1) * 2 > s->inline_fn_by_tok_size)
     {
-      int n = s->inline_fn_by_tok_size ? s->inline_fn_by_tok_size : 256;
-      while (n <= k)
-        n *= 2;
-      s->inline_fn_by_tok = tcc_realloc(s->inline_fn_by_tok, sizeof(InlineFunc *) * n);
-      memset(s->inline_fn_by_tok + s->inline_fn_by_tok_size, 0,
-             sizeof(InlineFunc *) * (n - s->inline_fn_by_tok_size));
+      /* at most half full, so a probe ends quickly at an empty slot */
+      int n = s->inline_fn_by_tok_size ? s->inline_fn_by_tok_size * 2 : 64;
+      InlineFnSlot *grown = tcc_mallocz(sizeof(InlineFnSlot) * n);
+      for (int i = 0; i < s->inline_fn_by_tok_size; i++)
+        if (s->inline_fn_by_tok[i].fn)
+          *inline_fn_slot(grown, n, s->inline_fn_by_tok[i].k) = s->inline_fn_by_tok[i];
+      tcc_free(s->inline_fn_by_tok);
+      s->inline_fn_by_tok = grown;
       s->inline_fn_by_tok_size = n;
     }
     /* First entry for a symbol wins, as the linear scan it replaces did. */
-    InlineFunc *old = s->inline_fn_by_tok[k];
-    if (!old || old->sym != fn->sym)
-      s->inline_fn_by_tok[k] = fn;
+    InlineFnSlot *slot = inline_fn_slot(s->inline_fn_by_tok, s->inline_fn_by_tok_size, k);
+    if (!slot->fn)
+    {
+      slot->k = k;
+      slot->fn = fn;
+      s->inline_fn_by_tok_count++;
+    }
+    else if (slot->fn->sym != fn->sym)
+      slot->fn = fn;
   }
   int k = (sym->v & ~SYM_FIELD) - TOK_IDENT;
-  if (k < 0 || k >= s->inline_fn_by_tok_size || !s->inline_fn_by_tok[k])
+  if (k < 0 || !s->inline_fn_by_tok_size)
     return NULL;
-  InlineFunc *fn = s->inline_fn_by_tok[k];
+  InlineFunc *fn = inline_fn_slot(s->inline_fn_by_tok, s->inline_fn_by_tok_size, k)->fn;
+  if (!fn)
+    return NULL;
   if (fn->sym == sym)
     return fn;
   /* The indexed entry was consumed, or belongs to another symbol of the same
@@ -598,6 +627,10 @@ static int body_uses_frame_builtins(TokenString *body)
 /* Can the token-replay inliner express a called-once body?  (Constructs it
  * cannot reproduce, or whose meaning would change in the caller -- not a
  * size or benefit judgement.) */
+/* gcc's large-stack-frame default: a callee with a local array this big stays
+ * a call (inline_body_has_large_local_array). */
+#define CALLED_ONCE_LARGE_FRAME_ARRAY 256
+
 static int called_once_body_ok(Sym *sym, TokenString *body)
 {
   Sym *ref = sym->type.ref;
@@ -610,6 +643,9 @@ static int called_once_body_ok(Sym *sym, TokenString *body)
   int addr_of_label = 0, inline_asm = 0;
   inline_scan_body_features(body, &addr_of_label, &inline_asm);
   if (addr_of_label || inline_asm || inline_body_has_static_local(body) || inline_body_has_apply_args(body))
+    return 0;
+  /* A big local array would sit in the caller's frame on all its paths. */
+  if (inline_body_has_large_local_array(body, CALLED_ONCE_LARGE_FRAME_ARRAY))
     return 0;
   if ((ref->type.t & VT_BTYPE) != VT_VOID && !inline_body_has_return_stmt(body))
     return 0;
@@ -636,6 +672,8 @@ static int called_once_body_ok(Sym *sym, TokenString *body)
 int called_once_budget_begin(int own_len)
 {
   int saved = tcc_state->called_once_budget;
+  tcc_state->inline_caller_len = own_len;
+  tcc_state->inline_caller_gen++;
   /* TCC_CALLED_ONCE_LARGE / TCC_CALLED_ONCE_GROWTH: the two limits, for experiments. */
   static int large = -1, growth = -1;
   if (large < 0)
@@ -666,6 +704,20 @@ static void *deferred_alloc(size_t size)
   void *p = tcc_mallocz(size ? size : 1);
   dynarray_add(&deferred_scratch, &nb_deferred_scratch, p);
   return p;
+}
+
+/* Free a deferred_alloc block before the end: the analysis arrays die before
+ * the bodies are generated, and kept until then they sat under every
+ * function's IR at the peak of an -O2 compile. */
+static void deferred_release(void *p)
+{
+  for (int i = 0; i < nb_deferred_scratch; i++)
+    if (deferred_scratch[i] == p)
+    {
+      deferred_scratch[i] = deferred_scratch[--nb_deferred_scratch];
+      tcc_free(p);
+      return;
+    }
 }
 
 /* Release the deferred bodies and the scratch; tccgen_finish calls it on
@@ -739,7 +791,7 @@ TCC_DBG_ENV_FLAG(check_every_static, "TCC_CHECK_ALL_STATICS")
 void prune_unused_statics(TCCState *s)
 {
   const int nf = s->nb_deferred_fns, nd = s->nb_deferred_data;
-  if (!s->opt_drop_unused_statics || (!nf && !nd))
+  if (!TCC_OPT(s, opt_drop_unused_statics) || (!nf && !nd))
     goto define_all;
 
   /* Nodes: deferred functions, deferred objects, static inline bodies,
@@ -905,6 +957,16 @@ void prune_unused_statics(TCCState *s)
   for (int i = tent_base; i < n; i++)
     if (!live[i])
       tombstone_unused_static(node_sym[i]);
+  /* The graph is done with: free it now rather than under every body
+   * gen_deferred_function_bodies generates. */
+  deferred_release(node_sym);
+  deferred_release(node_toks);
+  deferred_release(root);
+  deferred_release(live);
+  deferred_release(head);
+  deferred_release(next_same);
+  deferred_release(by_elf);
+  deferred_release(work);
 
 define_all:
   if (s->nb_deferred_data)
@@ -981,7 +1043,7 @@ static int gc_node_at(const GcNode *nodes, const int *sec_first, const int *sec_
 
 void gc_unreferenced_statics(TCCState *s)
 {
-  if (!s->opt_drop_unused_statics || s->test_coverage || !symtab_section || !symtab_section->data)
+  if (!TCC_OPT(s, opt_drop_unused_statics) || s->test_coverage || !symtab_section || !symtab_section->data)
     return;
   const int nsyms = symtab_section->data_offset / sizeof(ElfW(Sym));
   const int nsec = s->nb_sections;
@@ -1011,7 +1073,7 @@ void gc_unreferenced_statics(TCCState *s)
     tcc_free(nodes);
     return;
   }
-  qsort(nodes, nn, sizeof *nodes, gc_node_cmp);
+  tcc_qsort(nodes, nn, sizeof *nodes, gc_node_cmp);
   /* Merge overlapping ranges (ICF aliases, a symbol inside another). */
   int m = 0;
   for (int i = 0; i < nn; i++)
@@ -1143,6 +1205,10 @@ void gc_unreferenced_statics(TCCState *s)
     if ((sec->sh_flags & SHF_EXECINSTR) && unit < 4)
       unit = 4;
     erase_section_range(s, sec, nodes[i].start, nodes[i].end - nodes[i].start, unit);
+    /* Under -g the erase adds a tombstone symbol (put_elf_sym), which can
+     * reallocate the table.  Symbols added after nsyms was taken are never
+     * candidates, so only the base pointer needs refreshing. */
+    syms = (ElfW(Sym) *)symtab_section->data;
   }
 
   /* Undefined globals nothing refers to any more. */
@@ -1277,6 +1343,8 @@ void gen_deferred_function_bodies(TCCState *s)
             int *grown = deferred_alloc(sizeof(int) * (edge_cap ? edge_cap * 2 : 1024));
             if (nedges)
               memcpy(grown, edges, sizeof(int) * nedges);
+            if (edges)
+              deferred_release(edges);
             edges = grown;
             edge_cap = edge_cap ? edge_cap * 2 : 1024;
           }
@@ -1295,20 +1363,22 @@ void gen_deferred_function_bodies(TCCState *s)
   {
     DeferredFunc *d = s->deferred_fns[j];
     Sym *sym = d->sym;
-    if (!s->opt_inline_called_once || !(sym->type.t & VT_STATIC) || calls[j] != 1 || mentions[j] ||
-        caller[j] == j || sym->c || sym->a.addrtaken || !d->body || !called_once_body_ok(sym, d->body))
+    if (!TCC_OPT(s, opt_inline_called_once) || !(sym->type.t & VT_STATIC) || calls[j] != 1 || mentions[j] ||
+        caller[j] == j || sym->c || sym->a.addrtaken || !d->body || is_pending_alias_target(sym) ||
+        !called_once_body_ok(sym, d->body))
     {
       /* TCC_CALLED_ONCE_DBG: why a function with one call stays a call. */
       static int dbg = -1;
       if (dbg < 0)
         dbg = getenv("TCC_CALLED_ONCE_DBG") != NULL;
-      if (dbg && calls[j] == 1 && s->opt_inline_called_once)
+      if (dbg && calls[j] == 1 && TCC_OPT(s, opt_inline_called_once))
         fprintf(stderr, "[ONCE] %s len=%d decline=%s caller=%s\n", get_tok_str(sym->v, NULL), d->body ? d->body->len : -1,
                 !(sym->type.t & VT_STATIC) ? "not-static"
                 : mentions[j]              ? "mentioned"
                 : caller[j] == j           ? "self"
                 : sym->c                   ? "emitted"
                 : sym->a.addrtaken         ? "addrtaken"
+                : is_pending_alias_target(sym) ? "alias-target"
                 : !d->body                 ? "no-body"
                                            : "body-rules",
                 caller[j] >= 0 && caller[j] < n ? get_tok_str(s->deferred_fns[caller[j]]->sym->v, NULL) : "?");
@@ -1330,6 +1400,11 @@ void gen_deferred_function_bodies(TCCState *s)
     sym->type.ref->f.func_called_once = 1;
     dynarray_add(&s->inline_fns, &s->nb_inline_fns, fn);
   }
+  /* Only the call graph and `once` are read from here on. */
+  deferred_release(by_tok);
+  deferred_release(calls);
+  deferred_release(mentions);
+  deferred_release(caller);
 
   /* Generate the others callees first (post-order over the call edges,
    * iteratively: call chains in generated C run deep). */

@@ -55,11 +55,13 @@ typedef struct RegAllocTarget {
 #define RA_RODATA_ANCHOR_MIN_SITES 2
 
 void tcc_ir_ssa_regalloc(struct TCCIRState *ir, const RegAllocTarget *target, int spill_base);
+int tcc_ir_callee_saved_capacity(const struct TCCIRState *ir, const RegAllocTarget *target);
 int tcc_ir_move_coalescing(struct TCCIRState *ir);
 
 /* Pre-RA cleanup passes (source/opt/ra/), run from tcc_ir_ssa_regalloc(). */
 int ra_repair_incomplete_calls(struct TCCIRState *ir);
 int ra_fold_const_branches(struct TCCIRState *ir);
+int ra_thread_known_branches(struct TCCIRState *ir);
 int ra_fold_phi_const_chain(struct TCCIRState *ir);
 int ra_fuse_umaal(struct TCCIRState *ir);
-
+int ra_exit_sink(struct TCCIRState *ir);

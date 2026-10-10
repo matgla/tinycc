@@ -63,6 +63,14 @@ static void asm_macros_free(void)
   asm_macros = NULL;
 }
 
+ST_FUNC void tcc_asm_cleanup(void)
+{
+  asm_macros_free();
+  /* .previous must not find a Section of the previous TCCState: tcc_delete
+     has freed its section table, so the static would be dangling. */
+  last_text_section = NULL;
+}
+
 static int asm_get_prefix_name(TCCState *s1, const char *prefix, unsigned int n)
 {
   char buf[64];
@@ -287,6 +295,19 @@ static void asm_expr_unary(TCCState *s1, ExprValue *pe)
   }
 }
 
+/* A label's place in its section, for label arithmetic.  On ARM a Thumb
+ * function symbol carries bit 0 in st_value (the interworking marker), but
+ * GAS measures `. - func` and `end - func` from the label itself: counting
+ * the bit made yasld's thunk template size 15 instead of 16. */
+static addr_t asm_sym_offset(const ElfSym *esym)
+{
+#if defined(TCC_TARGET_ARM)
+  if (ELFW(ST_TYPE)(esym->st_info) == STT_FUNC)
+    return esym->st_value & ~(addr_t)1;
+#endif
+  return esym->st_value;
+}
+
 static void asm_expr_prod(TCCState *s1, ExprValue *pe)
 {
   int op;
@@ -407,14 +428,14 @@ static inline void asm_expr_sum(TCCState *s1, ExprValue *pe)
         if (esym1 && esym1->st_shndx == esym2->st_shndx && esym1->st_shndx != SHN_UNDEF)
         {
           /* we also accept defined symbols in the same section */
-          pe->v += esym1->st_value - esym2->st_value;
+          pe->v += asm_sym_offset(esym1) - asm_sym_offset(esym2);
           pe->sym = NULL;
         }
         else if (esym2->st_shndx == cur_text_section->sh_num)
         {
           /* When subtracting a defined symbol in current section
              this actually makes the value PC-relative.  */
-          pe->v += 0 - esym2->st_value;
+          pe->v += 0 - asm_sym_offset(esym2);
           pe->pcrel = 1;
           e2.sym = NULL;
         }
@@ -594,6 +615,30 @@ static void pop_section(TCCState *s1)
   use_section1(s1, prev);
 }
 
+/* Skip a conditional-assembly branch not taken: to the matching .endif, or,
+ * when `to_else`, to a matching .else (whose branch is then assembled).
+ * Nested .if blocks inside the skipped text are skipped whole. */
+static void asm_skip_conditional(int to_else)
+{
+  int depth = 0;
+  for (;;)
+  {
+    next();
+    if (tok == CH_EOF)
+      tcc_error("end of file in a conditional block: missing .endif");
+    if (tok == TOK_ASMDIR_if || tok == TOK_ASMDIR_ifdef || tok == TOK_ASMDIR_ifndef)
+      depth++;
+    else if (tok == TOK_ASMDIR_endif)
+    {
+      if (depth-- == 0)
+        break;
+    }
+    else if (tok == TOK_ASMDIR_else && depth == 0 && to_else)
+      break;
+  }
+  next();
+}
+
 static void asm_parse_directive(TCCState *s1, int global)
 {
   int n, offset, v, size, tok1;
@@ -612,6 +657,12 @@ static void asm_parse_directive(TCCState *s1, int global)
     tok1 = tok;
     next();
     n = asm_int_expr(s1);
+#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM64)
+    /* GAS on ARM: `.align N` is 2^N bytes (`.align 2` is word alignment,
+       `.align 7` the 128 bytes a vector table needs); .balign stays bytes. */
+    if (tok1 == TOK_ASMDIR_align)
+      tok1 = TOK_ASMDIR_p2align;
+#endif
     if (tok1 == TOK_ASMDIR_p2align)
     {
       if (n < 0 || n > 30)
@@ -654,47 +705,19 @@ static void asm_parse_directive(TCCState *s1, int global)
     ind += size;
     break;
   case TOK_ASMDIR_quad:
-#ifdef TCC_TARGET_X86_64
     size = 8;
     goto asm_data;
-#else
-    next();
-    for (;;)
-    {
-      uint64_t vl;
-      const char *p;
-
-      p = tokc.str.data;
-      if (tok != TOK_PPNUM)
-      {
-      error_constant:
-        tcc_error("64 bit constant");
-      }
-      vl = strtoll(p, (char **)&p, 0);
-      if (*p != '\0')
-        goto error_constant;
-      next();
-      if (sec->sh_type != SHT_NOBITS)
-      {
-        /* XXX: endianness */
-        gen_le32(vl);
-        gen_le32(vl >> 32);
-      }
-      else
-      {
-        ind += 8;
-      }
-      if (tok != ',')
-        break;
-      next();
-    }
-    break;
-#endif
   case TOK_ASMDIR_byte:
     size = 1;
     goto asm_data;
   case TOK_ASMDIR_word:
+#if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM64)
+    /* GAS on ARM: .word is 32 bits (a vector table of .words of symbols). */
+    size = 4;
+    goto asm_data;
+#endif
   case TOK_ASMDIR_short:
+  case TOK_ASMDIR_hword:
     size = 2;
     goto asm_data;
   case TOK_ASMDIR_long:
@@ -711,12 +734,10 @@ static void asm_parse_directive(TCCState *s1, int global)
         if (size == 4)
         {
           gen_expr32(&e);
-#ifdef TCC_TARGET_X86_64
         }
         else if (size == 8)
         {
           gen_expr64(&e);
-#endif
         }
         else
         {
@@ -942,7 +963,7 @@ static void asm_parse_directive(TCCState *s1, int global)
       if (tok1 == TOK_ASMDIR_weak)
         sym->a.weak = 1;
       else if (tok1 == TOK_ASMDIR_hidden)
-        sym->a.visibility = STV_HIDDEN;
+        sym->a.visibility = STV_HIDDEN, sym->a.vis_explicit = 1;
       update_storage(sym);
       next();
     } while (tok == ',');
@@ -1243,6 +1264,130 @@ static void asm_parse_directive(TCCState *s1, int global)
   case TOK_ASMDIR_thumb:
     next();
     break;
+  case TOK_ASMDIR_if:
+  case TOK_ASMDIR_ifdef:
+  case TOK_ASMDIR_ifndef:
+  {
+    /* GAS conditional assembly: `.if expr`, `.ifdef sym`, `.ifndef sym`. */
+    int cond;
+    tok1 = tok;
+    next();
+    if (tok1 == TOK_ASMDIR_if)
+      cond = asm_int_expr(s1) != 0;
+    else
+    {
+      Sym *label = asm_label_find(tok);
+      ElfSym *esym = label ? elfsym(label) : NULL;
+      cond = esym && esym->st_shndx != SHN_UNDEF;
+      if (tok1 == TOK_ASMDIR_ifndef)
+        cond = !cond;
+      next();
+    }
+    if (!cond)
+      asm_skip_conditional(1);
+    break;
+  }
+  case TOK_ASMDIR_else:
+    /* reached at the end of the branch that was taken */
+    asm_skip_conditional(0);
+    break;
+  case TOK_ASMDIR_endif:
+    next();
+    break;
+  case TOK_ASMDIR_cpu:
+  case TOK_ASMDIR_arch:
+    /* `.cpu cortex-m33` / `.arch armv7-m`: the target is fixed by the
+       command line; the name lexes as several tokens because of the hyphen,
+       so skip the line. */
+    next();
+    while (tok != ';' && tok != TOK_LINEFEED && tok != CH_EOF)
+      next();
+    break;
+  case TOK_ASMDIR_incbin:
+  {
+    /* `.incbin "file"[, skip[, count]]` — the file's bytes, verbatim.  Found
+       like GAS does: as given, then beside the including file, then on the
+       -I path. */
+    char name[1024], path[1024];
+    long skip_bytes = 0, count = -1, got;
+    FILE *f = NULL;
+    int i;
+    next();
+    if (tok != TOK_STR)
+      expect("file name");
+    pstrcpy(name, sizeof(name), tokc.str.data);
+    next();
+    if (tok == ',')
+    {
+      next();
+      skip_bytes = asm_int_expr(s1);
+      if (tok == ',')
+      {
+        next();
+        count = asm_int_expr(s1);
+      }
+    }
+    pstrcpy(path, sizeof(path), name);
+    f = fopen(name, "rb");
+    if (!f && !IS_ABSPATH(name))
+    {
+      const char *slash = strrchr(file->filename, '/');
+      int dl = slash ? (int)(slash + 1 - file->filename) : 0;
+      if (dl >= (int)sizeof(path))
+        dl = sizeof(path) - 1;
+      memcpy(path, file->filename, dl);
+      path[dl] = '\0';
+      pstrcat(path, sizeof(path), name);
+      f = fopen(path, "rb");
+    }
+    for (i = 0; !f && !IS_ABSPATH(name) && i < s1->nb_include_paths; i++)
+    {
+      pstrcpy(path, sizeof(path), s1->include_paths[i]);
+      pstrcat(path, sizeof(path), "/");
+      pstrcat(path, sizeof(path), name);
+      f = fopen(path, "rb");
+    }
+    if (!f)
+      tcc_error("can't find .incbin file '%s'", name);
+    /* A dependency like an #include (-MD), so an edited blob rebuilds. */
+    if (s1->gen_deps)
+      dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(path));
+    if (skip_bytes > 0 && fseek(f, skip_bytes, SEEK_SET) != 0)
+      tcc_error(".incbin: can't skip %ld bytes in '%s'", skip_bytes, path);
+    {
+      /* Per chunk what g() does per byte: nothing under nocode_wanted, only
+         advance ind in a dry run, else write and advance. */
+      char *buf = tcc_malloc(65536);
+      for (;;)
+      {
+        long want = 65536;
+        if (count >= 0 && count < want)
+          want = count;
+        if (want == 0)
+          break;
+        got = (long)fread(buf, 1, want, f);
+        if (!nocode_wanted)
+        {
+          if (!tcc_gen_machine_dry_run_is_active())
+          {
+            if (ind + got > cur_text_section->data_allocated)
+              section_realloc(cur_text_section, ind + got);
+            memcpy(cur_text_section->data + ind, buf, got);
+          }
+          ind += got;
+        }
+        if (count >= 0)
+          count -= got;
+        if (got < want)
+          break;
+      }
+      tcc_free(buf);
+    }
+    fclose(f);
+    if (count > 0)
+      tcc_error(".incbin: '%s' is shorter than the requested count", path);
+    break;
+  }
 #ifdef TCC_TARGET_ARM
   case TOK_ASMDIR_fpu:
   {
@@ -1353,6 +1498,7 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global)
           const int *body_ptr;
           int arg_count = 0;
           int i, t;
+          CValue cv;
 
           /* initialize arg_strs */
           for (i = 0; i < ASM_MACRO_MAX_ARGS; i++)
@@ -1383,13 +1529,12 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global)
           body_ptr = tok_str_buf(m->body);
           for (;;)
           {
-            t = *body_ptr++;
+            tok_get(&t, &body_ptr, &cv);
             if (t == TOK_EOF)
               break;
             /* skip line number tokens */
             if (t == TOK_LINENUM)
             {
-              body_ptr++; /* skip line number value */
               continue;
             }
             /* check if this token is a macro argument */
@@ -1400,46 +1545,21 @@ static int tcc_assemble_internal(TCCState *s1, int do_preprocess, int global)
                 /* substitute with argument tokens */
                 const int *arg_ptr = tok_str_buf(arg_strs[i]);
                 int at;
-                while ((at = *arg_ptr++) != TOK_EOF)
+                CValue acv;
+                for (;;)
                 {
+                  tok_get(&at, &arg_ptr, &acv);
+                  if (at == TOK_EOF)
+                    break;
                   if (at == TOK_LINENUM)
-                  {
-                    arg_ptr++; /* skip line number */
                     continue;
-                  }
-                  tok_str_add(expanded, at);
-                  /* handle tokens with values */
-                  if (at >= TOK_CCHAR && at <= TOK_LINENUM)
-                  {
-                    tok_str_add(expanded, *arg_ptr++);
-                  }
-                  else if (at == TOK_STR || at == TOK_LSTR || at == TOK_PPNUM || at == TOK_PPSTR)
-                  {
-                    int size = *arg_ptr++;
-                    int nb_words = 1 + (size + sizeof(int) - 1) / sizeof(int);
-                    tok_str_add(expanded, size);
-                    for (int j = 1; j < nb_words; j++)
-                      tok_str_add(expanded, *arg_ptr++);
-                  }
+                  tok_str_add2(expanded, at, &acv);
                 }
                 goto next_body_tok;
               }
             }
             /* not an argument, copy token as-is */
-            tok_str_add(expanded, t);
-            /* handle tokens with values */
-            if (t >= TOK_CCHAR && t <= TOK_LINENUM)
-            {
-              tok_str_add(expanded, *body_ptr++);
-            }
-            else if (t == TOK_STR || t == TOK_LSTR || t == TOK_PPNUM || t == TOK_PPSTR)
-            {
-              int size = *body_ptr++;
-              int nb_words = 1 + (size + sizeof(int) - 1) / sizeof(int);
-              tok_str_add(expanded, size);
-              for (int j = 1; j < nb_words; j++)
-                tok_str_add(expanded, *body_ptr++);
-            }
+            tok_str_add2(expanded, t, &cv);
           next_body_tok:;
           }
           tok_str_add(expanded, TOK_EOF);
@@ -1488,7 +1608,6 @@ ST_FUNC int tcc_assemble(TCCState *s1, int do_preprocess)
   ret = tcc_assemble_internal(s1, do_preprocess, 1);
   cur_text_section->data_offset = ind;
   tcc_debug_end(s1);
-  asm_macros_free();
   return ret;
 }
 
@@ -1643,6 +1762,10 @@ ST_FUNC void tcc_asm_emit_inline(ASMOperand *operands, int nb_operands, int nb_o
   /* compute constraints */
   asm_compute_constraints(operands, nb_operands, nb_outputs, clobber_regs, reserved_regs, &out_reg);
 
+  /* generate loads -- before the substitution: the prolog's register saves
+   * move SP, and an SP-based memory operand has to account for them */
+  asm_gen_code(operands, nb_operands, nb_outputs, 0, clobber_regs, out_reg);
+
   cstr_new_s(&astr);
   cstr_cat(&astr, asm_str, asm_len + 1);
 
@@ -1655,9 +1778,6 @@ ST_FUNC void tcc_asm_emit_inline(ASMOperand *operands, int nb_operands, int nb_o
     subst_asm_operands(operands, nb_operands + nb_labels, &astr, astr1.data);
     cstr_free_s(&astr1);
   }
-
-  /* generate loads */
-  asm_gen_code(operands, nb_operands, nb_outputs, 0, clobber_regs, out_reg);
 
   /* We don't allow switching section within inline asm to bleed out. */
   sec = cur_text_section;
@@ -1720,7 +1840,13 @@ static void parse_asm_operands(ASMOperand *operands, int *nb_operands_ptr, int i
       pstrcpy(op->constraint, sizeof op->constraint, astr);
       skip('(');
       gexpr();
-      maybe_substitute_inline_const_arg(vtop);
+      /* Only input operands may take the inlined constant argument.  An output
+       * operand must stay an lvalue (test_lvalue() below), and the operand's
+       * current value is what the asm must see -- the call.c side already drops
+       * the map entry when the body writes the parameter, so a surviving entry
+       * means the value still equals the argument. */
+      if (!is_output)
+        maybe_substitute_inline_const_arg(vtop);
       /* Record a local register variable's register now, while its Sym is in
        * scope: by the time the IR lowers the asm the value may live in any
        * register (or be spilled) and the function's locals have been popped. */
@@ -1741,6 +1867,15 @@ static void parse_asm_operands(ASMOperand *operands, int *nb_operands_ptr, int i
            case */
         if ((vtop->r & VT_LVAL) && ((vtop->r & VT_VALMASK) == VT_LLOCAL || (vtop->r & VT_VALMASK) < VT_CONST) &&
             !strchr(op->constraint, 'm'))
+        {
+          gv(RC_INT);
+        }
+        /* A comparison or &&/|| result lives in the flags or a jump chain, not
+         * in a value: `"r"(a > b)` handed the asm the left operand's register
+         * (and the next operand's code could clobber the flags).  Make it the
+         * 0/1 value now. */
+        else if ((vtop->r & VT_VALMASK) == VT_CMP || (vtop->r & VT_VALMASK) == VT_JMP ||
+                 (vtop->r & VT_VALMASK) == VT_JMPI)
         {
           gv(RC_INT);
         }
@@ -1894,15 +2029,83 @@ ST_FUNC void asm_instr(void)
       for (; *cstr == '=' || *cstr == '&' || *cstr == '+' || *cstr == '%'; ++cstr)
         if (*cstr == '+')
           operands[i].is_rw = 1;
+      /* `"=m"(*p)` / `"=r"(*p)`: the asm (or the store after it) writes
+       * through p, so p is an INPUT of the asm, but the only IR mention of it
+       * was the ASM_OUTPUT marker's deref destination -- which dead-code
+       * passes do not count as a use of p.  `T0 <-- P0` was deleted and the
+       * store went through a register nobody set (or, at -O2, one an input
+       * had just been loaded into).  Such an output gets a read marker too,
+       * like a "+" one: a deref SOURCE is a use everywhere. */
+      SValue *ov = operands[i].vt;
+      operands[i].addr_read = !operands[i].is_rw && (ov->r & VT_LVAL) && (ov->r & VT_VALMASK) < VT_CONST;
     }
 
+#ifdef TCC_TARGET_ARM
+    /* System instructions only: a call the backend emits as them, which no
+     * pass has to treat as an asm statement (asm_machine_call_name). */
+    char mc_name[64];
+    if (!nb_labels && TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("asm:machine_call") &&
+        asm_machine_call_name(astr.data, operands, nb_operands, nb_outputs, clobber_regs, mc_name, sizeof(mc_name)))
+    {
+      CType ret = {.t = VT_VOID};
+      if (nb_outputs)
+      {
+        ret = operands[0].vt->type;
+        ret.t &= ~(VT_CONSTANT | VT_VOLATILE);
+      }
+      if (nb_operands > nb_outputs)
+      {
+        vpushv(operands[nb_outputs].vt);
+        gv(RC_INT);
+      }
+      gen_internal_call(mc_name, nb_operands - nb_outputs, &ret);
+      if (nb_outputs)
+      {
+        vpushv(operands[0].vt);
+        vswap();
+        vstore();
+      }
+      vpop();
+      cstr_free_s(&astr);
+      next();
+      for (i = 0; i < nb_operands; i++)
+        vpop();
+      return;
+    }
+#endif
     int inline_asm_id = tcc_ir_add_inline_asm(tcc_state->ir, astr.data, asm_len, must_subst, operands, nb_operands,
                                               nb_outputs, nb_labels, clobber_regs);
+
+    /* A memory operand ("m" and kin) hands the asm the OBJECT, not a value:
+     * its marker below must not be answered from a tracked store, nor the
+     * store before it deleted for want of a reader.  That is exactly a volatile
+     * access, which every forwarding and dead-store pass already respects --
+     * an "m" input on `buf[1] = x;` was forwarded x and the store dropped, so
+     * the asm read a slot nobody had written (and, at -O1, no slot at all).
+     * Only the marker operands are marked; the codegen reads ia->values. */
+    for (i = 0; i < nb_operands; ++i)
+    {
+      const char *cstr = operands[i].constraint;
+      while (*cstr == '=' || *cstr == '&' || *cstr == '+' || *cstr == '%')
+        ++cstr;
+      if (!strpbrk(cstr, "mQoV") || !(operands[i].vt->r & VT_LVAL))
+        continue;
+      operands[i].vt->volatile_access = 1;
+      /* ...and the object must HAVE an address: a scalar local or parameter
+       * would otherwise live in a register, and `ldr r0, %0` printed `ldr r0,
+       * r4`.  Exactly what `&v` does (unary.c). */
+      SValue *ov = operands[i].vt;
+      if (ov->sym && ((ov->r & VT_VALMASK) == VT_LOCAL || (ov->r & VT_PARAM)))
+      {
+        ov->sym->a.addrtaken = 1;
+        tcc_ir_set_addrtaken(tcc_state->ir, ov->sym->vreg);
+      }
+    }
 
     /* Read operands (inputs + read/write outputs) */
     for (i = 0; i < nb_outputs; ++i)
     {
-      if (operands[i].is_rw)
+      if (operands[i].is_rw || operands[i].addr_read)
         tcc_ir_put(tcc_state->ir, TCCIR_OP_ASM_INPUT, operands[i].vt, NULL, NULL);
     }
     for (i = nb_outputs; i < nb_operands; ++i)

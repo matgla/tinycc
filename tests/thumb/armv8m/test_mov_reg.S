@@ -40,3 +40,7 @@ test_mov_reg:
     mov r1, r3, asr #3
     movs r1, r3, asr #3 // optimized as asr
 
+
+    // a branch: only the 16-bit high-register form may write PC
+    mov pc, lr
+    mov pc, r3

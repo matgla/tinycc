@@ -506,9 +506,11 @@ UT_TEST(test_diamond_store_fwd_both_arms_same_const)
   return 0;
 }
 
-/* POSITIVE: different constants per arm fold via a fresh temp defined in both
- * arms (phi after SSA rebuild); the merge load becomes a register copy. */
-UT_TEST(test_diamond_store_fwd_different_const_phi)
+/* NEGATIVE (guard): different constants per arm would need a TEMP with two
+ * defs and no phi, which SSA consumers fold to one arm's value (docs/bugs
+ * ssa-diamond-store-fwd-two-def-temp-and-volatile): nothing is inserted and
+ * the merge load stays. */
+UT_TEST(test_diamond_store_fwd_different_const_keeps_load)
 {
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
@@ -540,24 +542,9 @@ UT_TEST(test_diamond_store_fwd_different_const_phi)
 
   int changes = ssa_opt_diamond_store_fwd_core(ir);
 
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(ir->next_instruction_index, 19);
-  /* then arm: STORE #42 @6, inserted ASSIGN tmp<-#42 @7, JUMP @8 -> merge @16 */
-  UT_ASSERT_EQ(utb_op(ir, 7), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 7)), 42);
-  UT_ASSERT_EQ(utb_op(ir, 8), TCCIR_OP_JUMP);
-  UT_ASSERT_EQ((int)utb_dest(ir, 8).u.imm32, 16);
-  /* else arm shifted to @10: STORE #43 @12, inserted ASSIGN tmp<-#43 @13 */
-  UT_ASSERT_EQ((int)utb_dest(ir, 4).u.imm32, 10);
-  UT_ASSERT_EQ(utb_op(ir, 13), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 13)), 43);
-  int32_t tmp_vr = irop_get_vreg(utb_dest(ir, 7));
-  UT_ASSERT(tmp_vr >= 0);
-  UT_ASSERT_EQ(irop_get_vreg(utb_dest(ir, 13)), tmp_vr);
-  /* merge load @17 is now a copy from the temp */
-  UT_ASSERT_EQ(utb_op(ir, 17), TCCIR_OP_ASSIGN);
-  UT_ASSERT(!irop_is_immediate(utb_src1(ir, 17)));
-  UT_ASSERT_EQ(irop_get_vreg(utb_src1(ir, 17)), tmp_vr);
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(ir->next_instruction_index, 17);
+  UT_ASSERT_EQ(utb_op(ir, 15), TCCIR_OP_LOAD_INDEXED);
 
   utb_free(ir);
   return 0;
@@ -826,9 +813,9 @@ UT_TEST(test_diamond_store_fwd_byte_sign_extend)
   return 0;
 }
 
-/* POSITIVE: fused arms with different constants and a fallthrough else arm;
- * the else def is inserted right before the merge label. */
-UT_TEST(test_diamond_store_fwd_diff_const_fused_fallthrough)
+/* NEGATIVE (guard): fused arms with different constants and a fallthrough else
+ * arm: no two-def TEMP is inserted, the merge load stays. */
+UT_TEST(test_diamond_store_fwd_diff_const_fused_fallthrough_keeps_load)
 {
   TCCIRState *ir = utb_new();
   utb_pools_init(ir);
@@ -856,20 +843,9 @@ UT_TEST(test_diamond_store_fwd_diff_const_fused_fallthrough)
 
   int changes = ssa_opt_diamond_store_fwd_core(ir);
 
-  UT_ASSERT_EQ(changes, 1);
-  UT_ASSERT_EQ(ir->next_instruction_index, 15);
-  UT_ASSERT_EQ(utb_op(ir, 5), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 5)), 7);
-  UT_ASSERT_EQ(utb_op(ir, 6), TCCIR_OP_JUMP);
-  UT_ASSERT_EQ((int)utb_dest(ir, 6).u.imm32, 12);
-  UT_ASSERT_EQ((int)utb_dest(ir, 3).u.imm32, 8);
-  UT_ASSERT_EQ(utb_op(ir, 11), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_src1(ir, 11)), 5);
-  int32_t tmp_vr = irop_get_vreg(utb_dest(ir, 5));
-  UT_ASSERT(tmp_vr >= 0);
-  UT_ASSERT_EQ(irop_get_vreg(utb_dest(ir, 11)), tmp_vr);
-  UT_ASSERT_EQ(utb_op(ir, 13), TCCIR_OP_ASSIGN);
-  UT_ASSERT_EQ(irop_get_vreg(utb_src1(ir, 13)), tmp_vr);
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(ir->next_instruction_index, 13);
+  UT_ASSERT_EQ(utb_op(ir, 11), TCCIR_OP_LOAD_INDEXED);
 
   utb_free(ir);
   return 0;

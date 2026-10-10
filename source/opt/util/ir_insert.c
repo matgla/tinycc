@@ -32,10 +32,9 @@ int gsym_cse_insert_before(TCCIRState *ir, int before_idx, IRQuadCompact *new_q)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)irop_get_imm64_ex(ir, dest);
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
       if (target >= before_idx)
-        tcc_ir_op_set_dest(ir, q, irop_make_imm32(-1, target + 1, IROP_BTYPE_INT32));
+        tcc_ir_op_set_dest_imm32(ir, q, target + 1, IROP_BTYPE_INT32);
     }
   }
   /* Patch switch-table targets (side table independent of the IR array). */
@@ -53,5 +52,6 @@ int gsym_cse_insert_before(TCCIRState *ir, int before_idx, IRQuadCompact *new_q)
       }
     }
   }
+  tcc_ir_frame_scope_insert(ir, before_idx);
   return before_idx;
 }

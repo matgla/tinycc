@@ -76,6 +76,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/ir/dump.c \
 	$(TOP)/source/ir/stack.c \
 	$(TOP)/source/ir/ssa.c \
+	$(TOP)/source/memory/sort.c \
 	$(TOP)/source/memory/unique_ptr.c \
 	$(TOP)/source/memory/vector.c \
 	$(TOP)/source/opt/ssa/scalar/gvn.c \
@@ -87,6 +88,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/ssa/loop/loop_unroll.c \
 	$(TOP)/source/opt/ssa/loop/iv_strength_reduction.c \
 	$(TOP)/source/opt/ssa/loop/decrement_to_zero.c \
+	$(TOP)/source/opt/ssa/loop/decrement_carry.c \
 	$(TOP)/source/opt/ssa/loop/loop_bottom_test.c \
 	$(TOP)/source/frontend/svalue.c \
 	$(TOP)/source/backend/arch/arm/arm.c \
@@ -121,6 +123,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/backend/arch/arm/thumb/thop_pld.c \
 	$(TOP)/source/backend/arch/arm/thumb/thop_rev.c \
 	$(TOP)/source/ir/tccir_operand.c \
+	$(TOP)/source/ir/op_props.c \
 	$(addprefix $(TOP)/,$(IR_GEN_FILES)) \
 	$(TOP)/source/opt/util/pass_disable.c \
 	$(TOP)/source/opt/util/volatile_access.c \
@@ -133,6 +136,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/util/call_params.c \
 	$(TOP)/source/opt/util/vreg_query.c \
 	$(TOP)/source/opt/util/xform.c \
+	$(TOP)/source/opt/util/range.c \
 	$(TOP)/source/opt/util/ir_insert.c \
 	$(TOP)/source/opt/flat/scalar/known_bits.c \
 	$(TOP)/source/opt/flat/scalar/const_prop_tmp.c \
@@ -167,6 +171,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/cfg/jump_thread.c \
 	$(TOP)/source/opt/flat/cfg/bool_diamond_branch.c \
 	$(TOP)/source/opt/flat/cfg/jumpif_invert.c \
+	$(TOP)/source/opt/flat/cfg/switch_head.c \
 	$(TOP)/source/opt/flat/memory/dead_lea_store.c \
 	$(TOP)/source/opt/flat/memory/store_inplace_arith.c \
 	$(TOP)/source/opt/flat/scalar/redundant_loop_check.c \
@@ -206,6 +211,7 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/loop/loop_relayout.c \
 	$(TOP)/source/opt/flat/loop/seq_guard_elim.c \
 	$(TOP)/source/opt/flat/loop/decrement_to_zero.c \
+	$(TOP)/source/opt/flat/loop/decrement_carry.c \
 	$(TOP)/source/opt/flat/loop/reroll.c \
 	$(TOP)/source/opt/flat/scalar/bitfield.c \
 	$(TOP)/source/opt/flat/scalar/cmp_expr_fold.c \
@@ -223,9 +229,11 @@ UT_MODULE_SRCS := \
 	$(TOP)/source/opt/flat/memory/small_global_memset_to_store.c \
 	$(TOP)/source/opt/flat/memory/mem_init.c \
 	$(TOP)/source/opt/flat/memory/memmove_to_indexed_stores.c \
+	$(TOP)/source/opt/flat/memory/escape_copy_call.c \
 	$(TOP)/source/opt/flat/memory/addrof_var_fwd.c \
 	$(TOP)/source/opt/flat/memory/ptr_local_fwd.c \
 	$(TOP)/source/opt/flat/memory/param_copy_alias.c \
+	$(TOP)/source/opt/flat/memory/struct_arg_split.c \
 	$(TOP)/source/opt/flat/memory/slot_const_store_fold.c \
 	$(TOP)/source/opt/flat/memory/sra.c \
 	$(TOP)/source/opt/flat/memory/invariant_global_load_hoist.c \
@@ -275,9 +283,13 @@ UT_MODULE_SRCS := \
 		$(TOP)/source/ir/regalloc_entry.c \
 		$(TOP)/source/ir/regalloc_post.c \
 		$(TOP)/source/ir/frame.c \
+		$(TOP)/source/ir/frame_dfe.c \
 		$(TOP)/source/ir/cross_jump.c \
 		$(TOP)/source/ir/self_store.c \
 		$(TOP)/source/ir/dead_def.c \
+		$(TOP)/source/opt/ra/branch_thread.c \
+		$(TOP)/source/opt/ra/exit_sink.c \
+		$(TOP)/source/ir/known_ext.c \
 		$(TOP)/source/opt/ra/const_branch_fold.c \
 		$(TOP)/source/opt/ra/incomplete_calls.c \
 		$(TOP)/source/opt/ra/phi_const_chain.c \
@@ -361,9 +373,11 @@ UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/source/opt/ssa/dce/dce.c \
 	$(TOP)/source/opt/ssa/loop/dead_loop.c \
 	$(TOP)/source/opt/ssa/scalar/fold.c \
+	$(TOP)/source/opt/ssa/memory/load_combine.c \
 	$(TOP)/source/opt/ssa/memory/load_cse.c \
 	$(TOP)/source/opt/ssa/memory/global_store_dse.c \
 	$(TOP)/source/opt/ssa/memory/ptr_store_dse.c \
+	$(TOP)/source/opt/ssa/memory/copy_fwd.c \
 	$(TOP)/source/opt/ssa/cfg/guard_collapse.c \
 	$(TOP)/source/opt/ssa/scalar/narrow.c \
 	$(TOP)/source/opt/ssa/cfg/phi.c \
@@ -420,12 +434,12 @@ UT_COVERAGE_ONLY_SRCS := \
 	$(TOP)/source/frontend/gen/type/size.c \
 	$(TOP)/source/frontend/gen/value/load.c \
 	$(TOP)/source/frontend/gen/value/longlong.c \
+	$(TOP)/source/frontend/gen/value/rodata_rel.c \
 	$(TOP)/source/frontend/gen/value/strlit_pool.c \
 	$(TOP)/source/frontend/gen/value/vstack.c \
 	$(TOP)/source/obj/tccdbg.c \
 	$(TOP)/source/frontend/tccasm.c \
 	$(TOP)/source/opt/engine/fp_mat_cache.c \
-	$(TOP)/source/opt/engine/pass_registry.c \
 	$(TOP)/source/driver/tcctools.c \
 	$(TOP)/source/driver/tcc.c \
 	$(TOP)/source/driver/libtcc.c \
@@ -443,6 +457,7 @@ UT_LOCAL_SRCS := \
 	test_ir_type.c \
 	test_ir_vreg.c \
 	test_ir_core.c \
+	test_ir_cfg.c \
 	test_ir_gen_control.c \
 	test_ir_gen_vla.c \
 	test_ir_dump.c \
@@ -504,6 +519,7 @@ UT_LOCAL_SRCS := \
 	test_opt_uninit.c \
 	test_opt_dead_vla.c \
 	test_opt_xform.c \
+	test_op_props.c \
 	test_opt_switch_collapse.c \
 	test_opt_switch_to_data.c \
 	test_opt_region_merge_case.c \
@@ -847,8 +863,14 @@ $(COV_STAMP3):
 # irop_get_vreg, tcc_ir_op_get_src1, ...) used to be static inline in
 # tccir_operand.h and now have out-of-line definitions there, so the suite has
 # to link the real module rather than get them for free from the header.
+#
+# vreg_query.c likewise: gen/value/longlong.c's detect_ll_ext_provenance rejects
+# multi-definition vregs through tcc_ir_vreg_has_single_def, an out-of-line IR
+# query that lives in the opt module (the cross build gets it from libopt.a).
 UT3_MODULE_SRCS := \
-	$(TOP)/source/ir/tccir_operand.c
+	$(TOP)/source/ir/tccir_operand.c \
+	$(TOP)/source/memory/sort.c \
+	$(TOP)/source/opt/util/vreg_query.c
 UT3_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR3)/%.o,$(UT3_MODULE_SRCS))
 
 UT3_LOCAL_SRCS := \
@@ -982,8 +1004,7 @@ $(COV_STAMP5):
 	@touch $@
 
 UT5_MODULE_SRCS := \
-	$(TOP)/source/opt/engine/fp_mat_cache.c \
-	$(TOP)/source/opt/engine/pass_registry.c
+	$(TOP)/source/opt/engine/fp_mat_cache.c
 UT5_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR5)/%.o,$(UT5_MODULE_SRCS))
 
 UT5_LOCAL_SRCS := \
@@ -1186,9 +1207,19 @@ $(BUILD_DIR7)/%.o: %.c $(UT_ROOT)/ut.h Makefile $(COV_STAMP7)
 $(TOP)/tccdefs_.h: $(TOP)/include/tccdefs.h
 	$(MAKE) -C $(TOP) tccdefs_.h
 
-$(BUILD_DIR7)/%.o: $(TOP)/%.c Makefile $(COV_STAMP7) $(TOP)/tccdefs_.h
+# tccpp.c also includes tcckw_index_.h, the keyword index gen_kw_index.c
+# builds for one set of target defines.  The top-level copy is for the cross
+# compiler's defines, not these (tccpp.c's _Static_assert rejects a mismatch),
+# so this suite generates its own and puts it first on the include path.
+UT7_GEN := $(BUILD_DIR7)/gen
+$(UT7_GEN)/tcckw_index_.h: $(TOP)/gen_kw_index.c Makefile
 	@mkdir -p $(dir $@)
-	$(HOSTCC) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
+	$(HOSTCC) $(filter-out $(UT_COV_CFLAGS),$(UT_CFLAGS)) -o $(UT7_GEN)/gen_kw_index $<
+	./$(UT7_GEN)/gen_kw_index $@
+
+$(BUILD_DIR7)/%.o: $(TOP)/%.c Makefile $(COV_STAMP7) $(TOP)/tccdefs_.h $(UT7_GEN)/tcckw_index_.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -I$(UT7_GEN) $(UT_CFLAGS) $(UT_DEPFLAGS) -c $< -o $@
 
 -include $(UT7_DEPS)
 
@@ -1445,9 +1476,11 @@ UT11_MODULE_SRCS := \
 	$(TOP)/source/opt/ssa/dce/dce.c \
 	$(TOP)/source/opt/ssa/scalar/fold.c \
 	$(TOP)/source/opt/ssa/scalar/sccp.c \
+	$(TOP)/source/opt/ssa/memory/load_combine.c \
 	$(TOP)/source/opt/ssa/memory/load_cse.c \
 	$(TOP)/source/opt/ssa/memory/global_store_dse.c \
 	$(TOP)/source/opt/ssa/memory/ptr_store_dse.c \
+	$(TOP)/source/opt/ssa/memory/copy_fwd.c \
 	$(TOP)/source/opt/ssa/cfg/guard_collapse.c \
 	$(TOP)/source/opt/ssa/cfg/branch.c \
 	$(TOP)/source/opt/ssa/cfg/cmp_eq.c \
@@ -1580,6 +1613,7 @@ $(COV_STAMP12):
 	@touch $@
 
 UT12_MODULE_SRCS := \
+	$(TOP)/source/memory/sort.c \
 	$(TOP)/source/memory/unique_ptr.c \
 	$(TOP)/source/memory/vector.c
 UT12_MODULE_OBJS := $(patsubst $(TOP)/%.c,$(BUILD_DIR12)/%.o,$(UT12_MODULE_SRCS))
@@ -1591,6 +1625,7 @@ UT12_LOCAL_SRCS := \
 	test_bitspan.c \
 	test_bit_matrix.c \
 	test_small_sequence.c \
+	test_sort.c \
 	test_unique_ptr.c \
 	test_vector.c \
 	stubs_unique_ptr.c

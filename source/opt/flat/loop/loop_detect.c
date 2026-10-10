@@ -105,16 +105,13 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
   if (!loops)
     return NULL;
 
-  loops->capacity = LICM_MAX_LOOPS;
-  loops->loops = tcc_mallocz(sizeof(IRLoop) * loops->capacity);
-  if (!loops->loops)
-  {
-    tcc_free(loops);
-    return NULL;
-  }
-  loops->ramp = tcc_malloc(sizeof(int) * ir->next_instruction_index);
-  for (int k = 0; k < ir->next_instruction_index; k++)
-    loops->ramp[k] = k;
+  /* Most functions have no back edge: grow the loop array and build the ramp
+   * only on the first one, instead of zeroing LICM_MAX_LOOPS entries (5 KB)
+   * and filling an int per instruction on every detection.  Every field of
+   * an entry is written before it counts in num_loops. */
+  loops->capacity = 0;
+  loops->loops = NULL;
+  loops->ramp = NULL;
 
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
@@ -128,10 +125,24 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
       /* target >= 0: an unresolved dest decodes negative and would index before compact_instructions. */
       if (target >= 0 && target < i)
       {
-        if (loops->num_loops >= loops->capacity)
+        if (loops->num_loops >= LICM_MAX_LOOPS)
         {
           LOG_LICM("Warning: too many loops, skipping rest");
           break;
+        }
+        if (loops->num_loops >= loops->capacity)
+        {
+          int cap = loops->capacity ? loops->capacity * 2 : 8;
+          if (cap > LICM_MAX_LOOPS)
+            cap = LICM_MAX_LOOPS;
+          loops->loops = tcc_realloc(loops->loops, sizeof(IRLoop) * cap);
+          loops->capacity = cap;
+        }
+        if (!loops->ramp)
+        {
+          loops->ramp = tcc_malloc(sizeof(int) * ir->next_instruction_index);
+          for (int k = 0; k < ir->next_instruction_index; k++)
+            loops->ramp[k] = k;
         }
 
         IRLoop *loop = &loops->loops[loops->num_loops];
@@ -167,8 +178,8 @@ IRLoops *tcc_ir_detect_loops(TCCIRState *ir)
             IRQuadCompact *jq = &ir->compact_instructions[j];
             if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF)
             {
-              IROperand jdest = tcc_ir_op_get_dest(ir, jq);
-              int jtarget = (int)irop_get_imm64_ex(ir, jdest);
+              int64_t jdest_imm = tcc_ir_op_dest_imm(ir, jq);
+              int jtarget = (int)jdest_imm;
               if (jtarget > max_idx && jtarget < ir->next_instruction_index)
               {
                 /* No reachability check; a distance cap stands in for a path back to the header. */
@@ -288,7 +299,7 @@ int tcc_ir_insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompa
     int new_size = ir->compact_instructions_size << 1;
     ir->compact_instructions = (IRQuadCompact *)tcc_realloc(ir->compact_instructions, sizeof(IRQuadCompact) * new_size);
     if (!ir->compact_instructions)
-      tcc_error("compiler_error: failed to resize compact_instructions");
+      tcc_ice("failed to resize compact_instructions");
     ir->compact_instructions_size = new_size;
   }
 
@@ -305,8 +316,8 @@ int tcc_ir_insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompa
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)irop_get_imm64_ex(ir, dest);
+      int64_t dest_imm = tcc_ir_op_dest_imm(ir, q);
+      int target = (int)dest_imm;
       if (target >= before_idx)
       {
         IROperand new_dest = irop_make_imm32(-1, target + 1, IROP_BTYPE_INT32);
@@ -330,6 +341,8 @@ int tcc_ir_insert_instruction_before(TCCIRState *ir, int before_idx, IRQuadCompa
       }
     }
   }
+
+  tcc_ir_frame_scope_insert(ir, before_idx);
 
   return before_idx;
 }

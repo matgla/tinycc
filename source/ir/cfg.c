@@ -11,28 +11,100 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "cfg.h"
+#include "memory/small_sequence.h"
+#include "memory/unique_ptr.h"
 
-static void cfg_add_edge(IRCFG *cfg, int from, int to)
+typedef struct IRCycleWork
+{
+  int indegree;
+  int queued_block;
+} IRCycleWork;
+
+TCC_SMALL_SEQUENCE_DEFINE(IRCycleSequence, IRCycleWork, 32)
+
+/* Edges are enumerated twice (cfg_build_edges): the counting pass bumps the
+ * counts only, sizing every block's slice of cfg->edge_store; the filling
+ * pass stores them.  A duplicate successor is counted but not stored (its
+ * slice keeps the unused slot); the pred is recorded either way, as before. */
+static void cfg_add_edge(IRCFG *cfg, int from, int to, int fill)
 {
   IRBasicBlock *fb = &cfg->blocks[from];
   IRBasicBlock *tb = &cfg->blocks[to];
+  if (!fill) {
+    fb->num_succs++;
+    tb->num_preds++;
+    return;
+  }
   /* Avoid duplicate successor edges */
   for (int i = 0; i < fb->num_succs; i++)
     if (fb->succs[i] == to)
       goto add_pred;
-  if (fb->num_succs >= fb->succs_cap) {
-    int nc = fb->succs_cap ? fb->succs_cap * 2 : 4;
-    fb->succs = tcc_realloc(fb->succs, nc * sizeof(int));
-    fb->succs_cap = nc;
-  }
   fb->succs[fb->num_succs++] = to;
 add_pred:
-  if (tb->num_preds >= tb->preds_cap) {
-    int nc = tb->preds_cap ? tb->preds_cap * 2 : 4;
-    tb->preds = tcc_realloc(tb->preds, nc * sizeof(int));
-    tb->preds_cap = nc;
-  }
   tb->preds[tb->num_preds++] = from;
+}
+
+static void cfg_build_edges(TCCIRState *ir, IRCFG *cfg, int fill)
+{
+  int n = cfg->num_instrs;
+  /* Filling a switch block's edges: seen[to] == b once `to` is a successor
+   * of b, which the scan in cfg_add_edge would find in O(cases). */
+  int *seen = NULL;
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    int last = cfg->blocks[b].end_idx - 1;
+    if (last < cfg->blocks[b].start_idx)
+      continue;
+    IRQuadCompact *q = &ir->compact_instructions[last];
+
+    if (q->op == TCCIR_OP_JUMP) {
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
+      if (target >= 0 && target < n)
+        cfg_add_edge(cfg, b, cfg->instr_to_block[target], fill);
+    }
+    else if (q->op == TCCIR_OP_JUMPIF) {
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
+      if (target >= 0 && target < n)
+        cfg_add_edge(cfg, b, cfg->instr_to_block[target], fill);
+      if (b + 1 < cfg->num_blocks)
+        cfg_add_edge(cfg, b, b + 1, fill);
+    }
+    else if (q->op == TCCIR_OP_SWITCH_TABLE) {
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
+      if (table_id >= 0 && table_id < ir->num_switch_tables) {
+        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
+        if (fill && !seen) {
+          seen = tcc_malloc(cfg->num_blocks * sizeof(int));
+          for (int i = 0; i < cfg->num_blocks; i++)
+            seen[i] = -1;
+        }
+        for (int ti = 0; ti < table->num_entries; ti++) {
+          int target = table->targets[ti];
+          if (target < 0 || target >= n)
+            continue;
+          int to = cfg->instr_to_block[target];
+          if (!fill) {
+            cfg_add_edge(cfg, b, to, 0);
+            continue;
+          }
+          IRBasicBlock *fb = &cfg->blocks[b];
+          if (seen[to] != b) {
+            seen[to] = b;
+            fb->succs[fb->num_succs++] = to;
+          }
+          cfg->blocks[to].preds[cfg->blocks[to].num_preds++] = b;
+        }
+      }
+    }
+    else if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
+             q->op == TCCIR_OP_IJUMP) {
+      /* no successors */
+    }
+    else {
+      if (b + 1 < cfg->num_blocks)
+        cfg_add_edge(cfg, b, b + 1, fill);
+    }
+  }
+  tcc_free(seen);
 }
 
 int tcc_ir_cfg_flat_has_backedge(TCCIRState *ir)
@@ -45,12 +117,52 @@ int tcc_ir_cfg_flat_has_backedge(TCCIRState *ir)
     if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_SWITCH_LOAD)
       return 1;
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
-      int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
       if (target >= 0 && target <= i)
         return 1;
     }
   }
   return 0;
+}
+
+int tcc_ir_cfg_has_cycle(TCCIRState *ir)
+{
+  if (!tcc_ir_cfg_flat_has_backedge(ir))
+    return 0;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD)
+      return 1;
+  }
+
+  unique_ptr(IRCFG) cfg = tcc_ir_cfg_build(ir);
+  if (!cfg)
+    return 0;
+  small_sequence(IRCycleSequence) work = {0};
+  int has_cycle = 1;
+  if (IRCycleSequence_init(&work, cfg->num_blocks) == 0) {
+    IRCycleWork *nodes = IRCycleSequence_data(&work);
+    for (int b = 0; b < cfg->num_blocks; b++) {
+      IRBasicBlock *block = &cfg->blocks[b];
+      for (int s = 0; s < block->num_succs; s++)
+        nodes[block->succs[s]].indegree++;
+    }
+    int head = 0, tail = 0;
+    for (int b = 0; b < cfg->num_blocks; b++)
+      if (nodes[b].indegree == 0)
+        nodes[tail++].queued_block = b;
+    while (head < tail) {
+      IRBasicBlock *block = &cfg->blocks[nodes[head++].queued_block];
+      for (int s = 0; s < block->num_succs; s++) {
+        int successor = block->succs[s];
+        if (--nodes[successor].indegree == 0)
+          nodes[tail++].queued_block = successor;
+      }
+    }
+    has_cycle = tail != cfg->num_blocks;
+  }
+  tcc_ir_cfg_free(unique_ptr_release(cfg));
+  return has_cycle;
 }
 
 IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
@@ -68,8 +180,7 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)irop_get_imm64_ex(ir, dest);
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
       if (target >= 0 && target < n) {
         is_leader[target] = 1;
       }
@@ -77,8 +188,7 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
     /* Switch case/default targets must be leaders; otherwise SCCP folds
      * values along the wrong chain via merged blocks. */
     if (q->op == TCCIR_OP_SWITCH_TABLE) {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id >= 0 && table_id < ir->num_switch_tables) {
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
         for (int ti = 0; ti < table->num_entries; ti++) {
@@ -105,9 +215,8 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
     if (is_leader[i])
       nb++;
 
-  cfg->capacity = nb;
   cfg->blocks = tcc_mallocz(nb * sizeof(IRBasicBlock));
-  cfg->instr_to_block = tcc_mallocz(n * sizeof(int));
+  cfg->instr_to_block = tcc_malloc(n * sizeof(int)); /* every entry written below */
 
   /* Create blocks */
   int bi = -1;
@@ -128,48 +237,26 @@ IRCFG *tcc_ir_cfg_build(TCCIRState *ir)
 
   tcc_free(is_leader);
 
-  /* Build edges */
+  /* Build edges: count, carve each block's slices out of one array, fill. */
+  cfg_build_edges(ir, cfg, 0);
+  int total_edges = 0;
+  for (int b = 0; b < cfg->num_blocks; b++)
+    total_edges += cfg->blocks[b].num_succs + cfg->blocks[b].num_preds;
+  cfg->edge_store = total_edges ? tcc_malloc(total_edges * sizeof(int)) : NULL;
+  int *slot = cfg->edge_store;
   for (int b = 0; b < cfg->num_blocks; b++) {
-    int last = cfg->blocks[b].end_idx - 1;
-    if (last < cfg->blocks[b].start_idx)
-      continue;
-    IRQuadCompact *q = &ir->compact_instructions[last];
-
-    if (q->op == TCCIR_OP_JUMP) {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)irop_get_imm64_ex(ir, dest);
-      if (target >= 0 && target < n)
-        cfg_add_edge(cfg, b, cfg->instr_to_block[target]);
-    }
-    else if (q->op == TCCIR_OP_JUMPIF) {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)irop_get_imm64_ex(ir, dest);
-      if (target >= 0 && target < n)
-        cfg_add_edge(cfg, b, cfg->instr_to_block[target]);
-      if (b + 1 < cfg->num_blocks)
-        cfg_add_edge(cfg, b, b + 1);
-    }
-    else if (q->op == TCCIR_OP_SWITCH_TABLE) {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int table_id = (int)irop_get_imm64_ex(ir, src2);
-      if (table_id >= 0 && table_id < ir->num_switch_tables) {
-        TCCIRSwitchTable *table = &ir->switch_tables[table_id];
-        for (int ti = 0; ti < table->num_entries; ti++) {
-          int target = table->targets[ti];
-          if (target >= 0 && target < n)
-            cfg_add_edge(cfg, b, cfg->instr_to_block[target]);
-        }
-      }
-    }
-    else if (q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID ||
-             q->op == TCCIR_OP_IJUMP) {
-      /* no successors */
-    }
-    else {
-      if (b + 1 < cfg->num_blocks)
-        cfg_add_edge(cfg, b, b + 1);
-    }
+    IRBasicBlock *bb = &cfg->blocks[b];
+    bb->succs = bb->num_succs ? slot : NULL;
+    slot += bb->num_succs;
+    bb->num_succs = 0;
   }
+  for (int b = 0; b < cfg->num_blocks; b++) {
+    IRBasicBlock *bb = &cfg->blocks[b];
+    bb->preds = bb->num_preds ? slot : NULL;
+    slot += bb->num_preds;
+    bb->num_preds = 0;
+  }
+  cfg_build_edges(ir, cfg, 1);
 
   return cfg;
 }
@@ -178,12 +265,9 @@ void tcc_ir_cfg_free(IRCFG *cfg)
 {
   if (!cfg)
     return;
-  for (int i = 0; i < cfg->num_blocks; i++) {
-    tcc_free(cfg->blocks[i].succs);
-    tcc_free(cfg->blocks[i].preds);
-    tcc_free(cfg->blocks[i].dom_frontier);
-    tcc_free(cfg->blocks[i].dom_children);
-  }
+  tcc_free(cfg->edge_store);
+  tcc_free(cfg->df_store);
+  tcc_free(cfg->dom_children_store);
   tcc_free(cfg->blocks);
   tcc_free(cfg->rpo_order);
   tcc_free(cfg->instr_to_block);
@@ -208,12 +292,12 @@ void tcc_ir_cfg_compute_rpo(IRCFG *cfg)
   cfg->rpo_count = 0;
 
   uint8_t *visited = tcc_mallocz(nb);
-  int *postorder = tcc_mallocz(nb * sizeof(int));
+  int *postorder = tcc_malloc(nb * sizeof(int)); /* written before read */
   int po_count = 0;
 
   /* Explicit-stack DFS */
   typedef struct { int block; int ci; } DFSFrame;
-  DFSFrame *stack = tcc_mallocz(nb * sizeof(DFSFrame));
+  DFSFrame *stack = tcc_malloc(nb * sizeof(DFSFrame));
   int sp = 0;
 
   visited[0] = 1;
@@ -237,7 +321,7 @@ void tcc_ir_cfg_compute_rpo(IRCFG *cfg)
   }
 
   /* Reverse postorder */
-  cfg->rpo_order = tcc_mallocz(po_count * sizeof(int));
+  cfg->rpo_order = tcc_malloc(po_count * sizeof(int));
   cfg->rpo_count = po_count;
   for (int i = 0; i < po_count; i++) {
     int b = postorder[po_count - 1 - i];
@@ -452,48 +536,18 @@ int tcc_ir_cfg_dominates(IRCFG *cfg, int a, int b)
   return 0;
 }
 
-static void cfg_add_df(IRBasicBlock *bb, int df_block)
+/* Dominance-frontier runner walk, memoized.  The outer loop visits join
+ * blocks `b` in ascending order and each runner receives a given `b` at most
+ * once, so a per-runner "last target recorded" int replaces the old
+ * nb×(nb/8) bitset matrix (which was 34 MB of zeroed PSRAM on a 16k-block
+ * function).  When the runner already carries `b`, the walk that recorded it
+ * also climbed on to idom(b), so the whole remaining suffix is done: break.
+ * That bound makes the total work O(Σ|DF|) instead of O(n²) on
+ * many-predecessor joins (8k-pred `goto` ladders were 38% of the compile).
+ * Run twice, like cfg_build_edges: counting (num_df only), then filling. */
+static void cfg_df_walk(IRCFG *cfg, int *last_df, int fill)
 {
-  if (bb->num_df >= bb->df_cap) {
-    int nc = bb->df_cap ? bb->df_cap * 2 : 4;
-    bb->dom_frontier = tcc_realloc(bb->dom_frontier, nc * sizeof(int));
-    bb->df_cap = nc;
-  }
-  bb->dom_frontier[bb->num_df++] = df_block;
-}
-
-static void cfg_add_dom_child(IRBasicBlock *bb, int child)
-{
-  if (bb->num_dom_children >= bb->dom_children_cap) {
-    int nc = bb->dom_children_cap ? bb->dom_children_cap * 2 : 4;
-    bb->dom_children = tcc_realloc(bb->dom_children, nc * sizeof(int));
-    bb->dom_children_cap = nc;
-  }
-  bb->dom_children[bb->num_dom_children++] = child;
-}
-
-void tcc_ir_cfg_compute_dom_frontiers(IRCFG *cfg)
-{
-  if (!cfg || cfg->num_blocks == 0)
-    return;
-
-  /* Build dominator tree children */
-  for (int b = 1; b < cfg->num_blocks; b++) {
-    int idom = cfg->blocks[b].idom;
-    if (idom >= 0 && idom != b)
-      cfg_add_dom_child(&cfg->blocks[idom], b);
-  }
-
-  /* Standard dominance-frontier runner walk, memoized.  The outer loop visits
-   * join blocks `b` in ascending order and each runner receives a given `b` at
-   * most once, so a per-runner "last target recorded" int replaces the old
-   * nb×(nb/8) bitset matrix (which was 34 MB of zeroed PSRAM on a 16k-block
-   * function).  When the runner already carries `b`, the walk that recorded it
-   * also climbed on to idom(b), so the whole remaining suffix is done: break.
-   * That bound makes the total work O(Σ|DF|) instead of O(n²) on
-   * many-predecessor joins (8k-pred `goto` ladders were 38% of the compile). */
   int nb = cfg->num_blocks;
-  int *last_df = tcc_malloc(nb * sizeof(int));
   for (int i = 0; i < nb; i++)
     last_df[i] = -1;
 
@@ -512,7 +566,10 @@ void tcc_ir_cfg_compute_dom_frontiers(IRCFG *cfg)
         if (last_df[runner] == b)
           break;
         last_df[runner] = b;
-        cfg_add_df(&cfg->blocks[runner], b);
+        IRBasicBlock *rb = &cfg->blocks[runner];
+        if (fill)
+          rb->dom_frontier[rb->num_df] = b;
+        rb->num_df++;
         if (runner == cfg->blocks[runner].idom)
           break;
         runner = cfg->blocks[runner].idom;
@@ -522,5 +579,59 @@ void tcc_ir_cfg_compute_dom_frontiers(IRCFG *cfg)
       }
     }
   }
+}
+
+void tcc_ir_cfg_compute_dom_frontiers(IRCFG *cfg)
+{
+  if (!cfg || cfg->num_blocks == 0)
+    return;
+  int nb = cfg->num_blocks;
+  tcc_free(cfg->dom_children_store);
+  tcc_free(cfg->df_store);
+  for (int b = 0; b < nb; b++) {
+    cfg->blocks[b].num_dom_children = 0;
+    cfg->blocks[b].num_df = 0;
+  }
+
+  /* Build dominator tree children: count, carve slices, fill in block order. */
+  int total = 0;
+  for (int b = 1; b < nb; b++) {
+    int idom = cfg->blocks[b].idom;
+    if (idom >= 0 && idom != b) {
+      cfg->blocks[idom].num_dom_children++;
+      total++;
+    }
+  }
+  cfg->dom_children_store = total ? tcc_malloc(total * sizeof(int)) : NULL;
+  int *slot = cfg->dom_children_store;
+  for (int b = 0; b < nb; b++) {
+    IRBasicBlock *bb = &cfg->blocks[b];
+    bb->dom_children = bb->num_dom_children ? slot : NULL;
+    slot += bb->num_dom_children;
+    bb->num_dom_children = 0;
+  }
+  for (int b = 1; b < nb; b++) {
+    int idom = cfg->blocks[b].idom;
+    if (idom >= 0 && idom != b) {
+      IRBasicBlock *ib = &cfg->blocks[idom];
+      ib->dom_children[ib->num_dom_children++] = b;
+    }
+  }
+
+  /* Dominance frontiers, the same way. */
+  int *last_df = tcc_malloc(nb * sizeof(int));
+  cfg_df_walk(cfg, last_df, 0);
+  total = 0;
+  for (int b = 0; b < nb; b++)
+    total += cfg->blocks[b].num_df;
+  cfg->df_store = total ? tcc_malloc(total * sizeof(int)) : NULL;
+  slot = cfg->df_store;
+  for (int b = 0; b < nb; b++) {
+    IRBasicBlock *bb = &cfg->blocks[b];
+    bb->dom_frontier = bb->num_df ? slot : NULL;
+    slot += bb->num_df;
+    bb->num_df = 0;
+  }
+  cfg_df_walk(cfg, last_df, 1);
   tcc_free(last_df);
 }

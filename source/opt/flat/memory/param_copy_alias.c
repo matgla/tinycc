@@ -13,6 +13,7 @@
 #include "ir.h"
 #include "opt.h"
 #include "opt_engine.h"
+#include "opt_utils.h"
 
 /* A by-value struct parameter belongs to the callee: its words sit in memory
  * the callee may read and write at will -- the caller's outgoing area for a
@@ -45,7 +46,7 @@ typedef struct PcaCopy
 static int pca_nops(int op)
 {
   int n = irop_config[op].has_dest + irop_config[op].has_src1 + irop_config[op].has_src2;
-  if (op == TCCIR_OP_MLA || op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_SELECT)
+  if (ir_op_has(op, IROP_A_SLOT3) && !ir_opset_has(IR_LEGACY_GAP_OPS(TCCIR_OP_UMAAL), op))
     n++;
   return n;
 }
@@ -171,6 +172,9 @@ static int pca_match_chain(TCCIRState *ir, PcaUses *u, int i, int limit, PcaCopy
       break;
     if (!pca_is_local_slot(d, &doff) || !d.is_lval || !pca_word_btype(d))
       break;
+    /* A volatile word is an access the copy must keep making. */
+    if (tcc_ir_access_is_volatile(ir, s) || tcc_ir_access_is_volatile(ir, d))
+      break;
     int32_t tv = irop_get_vreg(t);
     if (tv < 0 || TCCIR_DECODE_VREG_TYPE(tv) != TCCIR_VREG_TYPE_TEMP || irop_get_vreg(v) != tv || v.is_lval)
       break;
@@ -204,7 +208,7 @@ static int pca_match_chain(TCCIRState *ir, PcaUses *u, int i, int limit, PcaCopy
 static int pca_addr_temp(TCCIRState *ir, int k, int32_t tv, IROperand *slot)
 {
   IRQuadCompact *q = &ir->compact_instructions[k];
-  if ((q->op != TCCIR_OP_LEA && q->op != TCCIR_OP_ASSIGN) || irop_get_vreg(tcc_ir_op_get_dest(ir, q)) != tv)
+  if ((q->op != TCCIR_OP_LEA && q->op != TCCIR_OP_ASSIGN) || tcc_ir_op_dest_vreg(ir, q) != tv)
     return 0;
   IROperand a = tcc_ir_op_get_src1(ir, q);
   if (irop_get_tag(a) != IROP_TAG_STACKOFF || !a.is_local || a.is_lval || a.is_llocal)
@@ -215,13 +219,12 @@ static int pca_addr_temp(TCCIRState *ir, int k, int32_t tv, IROperand *slot)
 
 static int pca_is_copy_fn(TCCIRState *ir, IRQuadCompact *call)
 {
-  Sym *s = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, call));
+  Sym *s = tcc_ir_op_src1_sym(ir, call);
   if (!s)
     return 0;
   const char *nm = get_tok_str(s->v, NULL);
-  return !strcmp(nm, "memmove") || !strcmp(nm, "memcpy") || !strcmp(nm, "__aeabi_memmove") ||
-         !strcmp(nm, "__aeabi_memmove4") || !strcmp(nm, "__aeabi_memmove8") || !strcmp(nm, "__aeabi_memcpy") ||
-         !strcmp(nm, "__aeabi_memcpy4") || !strcmp(nm, "__aeabi_memcpy8");
+  return ir_opt_name_in(nm, "memmove\0memcpy\0__aeabi_memmove\0__aeabi_memmove4\0__aeabi_memmove8\0__aeabi_memcpy\0"
+                            "__aeabi_memcpy4\0__aeabi_memcpy8\0");
 }
 
 /* Ta <- &L ; Tb <- &S ; PARAM0 Ta ; PARAM1 Tb ; PARAM2 #size ; CALL memmove
@@ -241,11 +244,11 @@ static int pca_match_call(TCCIRState *ir, PcaUses *u, int i, int limit, PcaCopy 
   if (p0->op != TCCIR_OP_FUNCPARAMVAL || p1->op != TCCIR_OP_FUNCPARAMVAL || p2->op != TCCIR_OP_FUNCPARAMVAL ||
       call->op != TCCIR_OP_FUNCCALLVOID || !pca_is_copy_fn(ir, call))
     return 0;
-  int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, call)));
+  int call_id = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, call));
   IRQuadCompact *ps[3] = {p0, p1, p2};
   for (int k = 0; k < 3; k++)
   {
-    uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, ps[k]));
+    uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, ps[k]);
     if (TCCIR_DECODE_CALL_ID(enc) != call_id || TCCIR_DECODE_PARAM_IDX(enc) != k)
       return 0;
   }
@@ -320,7 +323,7 @@ static int pca_is_sret_buffer_arg(TCCIRState *ir, IRQuadCompact *q, int k, IROpe
     return 0;
   if (irop_get_stack_offset(op) != c->src)
     return 0;
-  const uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+  const uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, q);
   if (TCCIR_DECODE_PARAM_IDX(enc) != 0)
     return 0;
   const int call_id = TCCIR_DECODE_CALL_ID(enc);
@@ -339,7 +342,7 @@ static int pca_is_sret_buffer_arg(TCCIRState *ir, IRQuadCompact *q, int k, IROpe
  * has run reads an uninitialised object either way. */
 static int pca_sret_copy_follows_its_call(TCCIRState *ir, const PcaCopy *c, int arg_idx)
 {
-  const uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, &ir->compact_instructions[arg_idx]));
+  const uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, &ir->compact_instructions[arg_idx]);
   const int call_id = TCCIR_DECODE_CALL_ID(enc);
   int saw_call = 0;
   for (int i = arg_idx + 1; i < c->first; i++)
@@ -350,10 +353,7 @@ static int pca_sret_copy_follows_its_call(TCCIRState *ir, const PcaCopy *c, int 
     if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID || q->op == TCCIR_OP_FUNCCALLVAL ||
         q->op == TCCIR_OP_FUNCCALLVOID)
     {
-      IROperand enc_op = q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID
-                             ? tcc_ir_op_get_src2(ir, q)
-                             : tcc_ir_op_get_src2(ir, q);
-      if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, enc_op)) != call_id)
+      if (TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q)) != call_id)
         return 0;
       saw_call |= q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID;
       continue;
@@ -447,6 +447,10 @@ static int pca_try(TCCIRState *ir, PcaUses *u, PcaCopy *c)
          * whatever the control flow -- only after the copy. */
         if ((i < c->first && !sret_src) || !pca_is_local_slot(op, &off) || op.is_llocal)
           return 0;
+        /* A volatile destination (the memmove form carries no volatile
+         * operand of its own) keeps its own storage and its copy. */
+        if (op.is_lval && tcc_ir_access_is_volatile(ir, op))
+          return 0;
         if (q->op == TCCIR_OP_STORE && k == 0 && op.is_lval && sret_src)
           return 0; /* written by something other than the copy */
       }
@@ -454,6 +458,11 @@ static int pca_try(TCCIRState *ir, PcaUses *u, PcaCopy *c)
   }
 
   if (!c->entry_only && !sret_src)
+    return 0;
+  /* The source is a call's result buffer, which the call may assume it alone
+   * can reach (tcc_ir_sret_dealias): renamed onto it, an escaping address of
+   * the destination would be an address of that buffer. */
+  if (sret_src && tcc_ir_frame_range_escapes(ir, c->dst, c->dst + c->size))
     return 0;
 
   /* Rename every destination reference onto the source. */
@@ -561,9 +570,4 @@ int tcc_ir_opt_param_copy_alias(TCCIRState *ir)
   tcc_free(c);
   tcc_free(u.count);
   return changes;
-}
-
-int tcc_ir_opt_param_copy_alias_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_param_copy_alias(ctx->ir);
 }

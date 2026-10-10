@@ -12,8 +12,11 @@
 #undef GVN_HASH_SIZE
 #undef GVN_KILL_SRC
 #undef GVN_LOCAL_MAX
+#undef GVN_POOL_CHUNK
 #undef GVN_PURE_CALL_MAX_ARGS
 #undef GVN_SRC_OK
+#undef PCSE_MAX_ARGS
+#undef PCSE_MAX_SCAN
 #undef USING_GLOBALS
 #include "../opt/ssa/scalar/narrow.c"
 #undef NARROW_FLOAT_TABLE_COUNT

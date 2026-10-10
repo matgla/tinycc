@@ -19,9 +19,57 @@
 #include "opt_loop_utils.h"
 
 /* A VAR-vreg lval operand is a direct variable access (same convention as
- * ROT_LVAL_IS_INDIRECT below); every other lval dereferences the vreg. */
-#define ROT_VAR_DIRECT(op_)                                                                                       \
-  (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op_)) == TCCIR_VREG_TYPE_VAR && (op_).is_local)
+ * rot_lval_is_indirect below); every other lval dereferences the vreg. */
+static int rot_var_direct(IROperand op)
+{
+  return TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op)) == TCCIR_VREG_TYPE_VAR && op.is_local;
+}
+
+typedef struct
+{
+  int32_t iv_vr;
+  int32_t seen_reads[32];
+  int nseen_reads;
+  int32_t carried_defs[8];
+  int ncarried_defs;
+} RotCarry;
+
+static int rot_vr_listed(const int32_t *list, int n, int32_t vr)
+{
+  for (int k = 0; k < n; k++)
+    if (list[k] == vr)
+      return 1;
+  return 0;
+}
+
+static int32_t rot_carry_var(const RotCarry *c, IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  return (vr >= 0 && vr != c->iv_vr && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) ? vr : -1;
+}
+
+static void rot_note_read(RotCarry *c, IROperand op)
+{
+  int32_t vr = rot_carry_var(c, op);
+  if (vr >= 0 && !rot_vr_listed(c->seen_reads, c->nseen_reads, vr) &&
+      c->nseen_reads < (int)(sizeof(c->seen_reads) / sizeof(c->seen_reads[0])))
+    c->seen_reads[c->nseen_reads++] = vr;
+}
+
+static void rot_note_def(RotCarry *c, IROperand op)
+{
+  int32_t vr = rot_carry_var(c, op);
+  if (vr >= 0 && rot_vr_listed(c->seen_reads, c->nseen_reads, vr) &&
+      !rot_vr_listed(c->carried_defs, c->ncarried_defs, vr) &&
+      c->ncarried_defs < (int)(sizeof(c->carried_defs) / sizeof(c->carried_defs[0])))
+    c->carried_defs[c->ncarried_defs++] = vr;
+}
+
+static int rot_lval_is_indirect(IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  return op.is_lval && vr >= 0 && !(TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && op.is_local);
+}
 
 /* NOTE: the former rot_iv_dead_after_exit veto (reject a call-body rotation
  * whose IV is read after the loop) is gone.  Its cost model — a live-out IV
@@ -58,24 +106,27 @@ static int rot_guard_provably_folds(TCCIRState *ir, int hi, IRQuadCompact *cmp_q
     IRQuadCompact *q = &ir->compact_instructions[i];
     int op = q->op;
     if (op == TCCIR_OP_NOP)
+    {
+      if (q->is_jump_target)
+        break; /* a join, as below -- a NOP defines nothing */
       continue;
+    }
     if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF || op == TCCIR_OP_IJUMP)
       break; /* not the straight-line entry path — try the carried value */
     int is_def = 0;
     if (irop_config[op].has_dest)
     {
       IROperand d = tcc_ir_op_get_dest(ir, q);
-      is_def = irop_has_vreg(d) && irop_get_vreg(d) == iv && (!d.is_lval || ROT_VAR_DIRECT(d));
+      is_def = irop_has_vreg(d) && irop_get_vreg(d) == iv && (!d.is_lval || rot_var_direct(d));
     }
     /* a join between the def and the header can bring a different value */
     if (q->is_jump_target && !is_def)
       break;
     if (!is_def)
       continue;
-    IROperand v = tcc_ir_op_get_src1(ir, q);
-    if (op != TCCIR_OP_ASSIGN || !irop_is_immediate(v))
+    if (op != TCCIR_OP_ASSIGN || !tcc_ir_op_src1_is_imm(ir, q))
       return 0;
-    int64_t entry = irop_get_imm64_ex(ir, v);
+    int64_t entry = tcc_ir_op_src1_imm(ir, q);
     return evaluate_compare_condition_cmp_annotated(ir, cmp_q, entry, lim, cond, s1, s2) == 0;
   }
 
@@ -113,11 +164,11 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
 
   IROperand exit_dest = tcc_ir_op_get_dest(ir, jif_q);
   int exit_target = (int)irop_get_imm64_ex(ir, exit_dest);
-  IROperand cond_op = tcc_ir_op_get_src1(ir, jif_q);
-  int cond = (int)irop_get_imm64_ex(ir, cond_op);
+  int64_t cond_op_imm = tcc_ir_op_src1_imm(ir, jif_q);
+  int cond = (int)cond_op_imm;
 
-  IROperand body_entry_dest = tcc_ir_op_get_dest(ir, jmp_q);
-  int body_start = (int)irop_get_imm64_ex(ir, body_entry_dest);
+  int64_t body_entry_dest_imm = tcc_ir_op_dest_imm(ir, jmp_q);
+  int body_start = (int)body_entry_dest_imm;
 
   /* end_idx can cover the body too, so find the back-edge by scanning for the first JUMP to hi */
   int backedge_idx = -1;
@@ -126,8 +177,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP)
     {
-      IROperand jd = tcc_ir_op_get_dest(ir, q);
-      int jt = (int)irop_get_imm64_ex(ir, jd);
+      int64_t jd_imm = tcc_ir_op_dest_imm(ir, q);
+      int jt = (int)jd_imm;
       if (jt == hi)
       {
         backedge_idx = i;
@@ -162,8 +213,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMPIF)
       continue;
-    IROperand jd = tcc_ir_op_get_dest(ir, q);
-    int jt = (int)irop_get_imm64_ex(ir, jd);
+    int64_t jd_imm = tcc_ir_op_dest_imm(ir, q);
+    int jt = (int)jd_imm;
     if (jt >= 0 && jt < hi && i > backedge_idx)
     {
       LOG_LOOP_OPT("Rotation: reject — nested inside already-rotated loop [%d..%d]", jt, i);
@@ -201,8 +252,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP)
     {
-      IROperand jd = tcc_ir_op_get_dest(ir, q);
-      int jt = (int)irop_get_imm64_ex(ir, jd);
+      int64_t jd_imm = tcc_ir_op_dest_imm(ir, q);
+      int jt = (int)jd_imm;
       if (jt >= latch_start && jt <= backedge_idx)
       {
         body_end_jmp = i;
@@ -221,8 +272,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
       {
-        IROperand jd = tcc_ir_op_get_dest(ir, q);
-        int jt = (int)irop_get_imm64_ex(ir, jd);
+        int64_t jd_imm = tcc_ir_op_dest_imm(ir, q);
+        int jt = (int)jd_imm;
         if (jt < i && jt >= body_start)
         {
           has_inner_loop = 1;
@@ -237,8 +288,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
         IRQuadCompact *q = &ir->compact_instructions[i];
         if (q->op == TCCIR_OP_JUMPIF)
         {
-          IROperand jd = tcc_ir_op_get_dest(ir, q);
-          int jt = (int)irop_get_imm64_ex(ir, jd);
+          int64_t jd_imm = tcc_ir_op_dest_imm(ir, q);
+          int jt = (int)jd_imm;
           if (jt >= latch_start && jt <= backedge_idx)
           {
             body_latch_target = jt;
@@ -264,8 +315,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
       }
       if (q->op == TCCIR_OP_JUMPIF)
       {
-        IROperand jd = tcc_ir_op_get_dest(ir, q);
-        int jt = (int)irop_get_imm64_ex(ir, jd);
+        int64_t jd_imm = tcc_ir_op_dest_imm(ir, q);
+        int jt = (int)jd_imm;
         branches++;
         if (jt >= latch_start && jt <= backedge_idx && decide < 0)
         {
@@ -291,7 +342,7 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
         cold_terminates = 1;
       else if (lq->op == TCCIR_OP_FUNCCALLVOID || lq->op == TCCIR_OP_FUNCCALLVAL)
       {
-        Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, lq));
+        Sym *callee = tcc_ir_op_src1_sym(ir, lq);
         if (tcc_ir_callee_is_noreturn(callee))
           cold_terminates = 1;
       }
@@ -356,68 +407,24 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
      bodies are simply where the annotated ops live.  With orig_index fixed at
      the source, admitting them is worth -2.8% cycles on the QEMU corpus
      (dijkstra -1.33M, stringsearch -396k, memcpy-1 -338k, strcmp-1 -218k) for
-     zero test changes.  The macro stays: ROT_VAR_DIRECT shares its convention. */
-#define ROT_LVAL_IS_INDIRECT(op_)                                                                               \
-  ((op_).is_lval && irop_get_vreg(op_) >= 0 &&                                                                  \
-   !(TCCIR_DECODE_VREG_TYPE(irop_get_vreg(op_)) == TCCIR_VREG_TYPE_VAR && (op_).is_local))
+     zero test changes.  rot_var_direct shares its convention. */
 
   {
-    int32_t iv_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, cmp_q));
-    int32_t seen_reads[32];
-    int nseen_reads = 0;
-    int32_t carried_defs[8];
-    int ncarried_defs = 0;
-
-#define ROT_NOTE_READ(op_)                                                                                       \
-    do {                                                                                                         \
-      int32_t _vr = irop_get_vreg(op_);                                                                          \
-      if (_vr >= 0 && _vr != iv_vr && TCCIR_DECODE_VREG_TYPE(_vr) == TCCIR_VREG_TYPE_VAR) {                     \
-        int _seen = 0;                                                                                           \
-        for (int _k = 0; _k < nseen_reads; _k++)                                                                 \
-          if (seen_reads[_k] == _vr) {                                                                           \
-            _seen = 1;                                                                                           \
-            break;                                                                                               \
-          }                                                                                                      \
-        if (!_seen && nseen_reads < (int)(sizeof(seen_reads) / sizeof(seen_reads[0])))                           \
-          seen_reads[nseen_reads++] = _vr;                                                                       \
-      }                                                                                                          \
-    } while (0)
-
-#define ROT_NOTE_DEF(op_)                                                                                        \
-    do {                                                                                                         \
-      int32_t _vr = irop_get_vreg(op_);                                                                          \
-      if (_vr >= 0 && _vr != iv_vr && TCCIR_DECODE_VREG_TYPE(_vr) == TCCIR_VREG_TYPE_VAR) {                     \
-        int _read = 0;                                                                                           \
-        for (int _k = 0; _k < nseen_reads; _k++)                                                                 \
-          if (seen_reads[_k] == _vr) {                                                                           \
-            _read = 1;                                                                                           \
-            break;                                                                                               \
-          }                                                                                                      \
-        if (_read) {                                                                                             \
-          int _carried = 0;                                                                                      \
-          for (int _k = 0; _k < ncarried_defs; _k++)                                                             \
-            if (carried_defs[_k] == _vr) {                                                                       \
-              _carried = 1;                                                                                      \
-              break;                                                                                             \
-            }                                                                                                    \
-          if (!_carried && ncarried_defs < (int)(sizeof(carried_defs) / sizeof(carried_defs[0])))                \
-            carried_defs[ncarried_defs++] = _vr;                                                                 \
-        }                                                                                                        \
-      }                                                                                                          \
-    } while (0)
+    RotCarry carry = {0};
+    carry.iv_vr = tcc_ir_op_src1_vreg(ir, cmp_q);
 
     for (int i = body_start; i <= body_end; i++)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
       int op = q->op;
       if (irop_config[op].has_src1)
-        ROT_NOTE_READ(tcc_ir_op_get_src1(ir, q));
+        rot_note_read(&carry, tcc_ir_op_get_src1(ir, q));
       if (irop_config[op].has_src2)
-        ROT_NOTE_READ(tcc_ir_op_get_src2(ir, q));
+        rot_note_read(&carry, tcc_ir_op_get_src2(ir, q));
       if (op == TCCIR_OP_MLA)
-        ROT_NOTE_READ(tcc_ir_op_get_accum(ir, q));
+        rot_note_read(&carry, tcc_ir_op_get_accum(ir, q));
       if (irop_config[op].has_dest)
-        ROT_NOTE_DEF(tcc_ir_op_get_dest(ir, q));
+        rot_note_def(&carry, tcc_ir_op_get_dest(ir, q));
     }
     /* Exactly one loop-carried non-IV VAR.  This is a PERFORMANCE gate, not a
      * correctness one.
@@ -441,14 +448,12 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
      *
      * (`> 8` additionally still fails 296_fuzz_assign_strd_deref_src at -O2, so
      * there is at least one more latent bug further out.) */
-    if (ncarried_defs > 1)
+    if (carry.ncarried_defs > 1)
     {
-      LOG_LOOP_OPT("Rotation: reject — body carries %d non-IV VARs", ncarried_defs);
+      LOG_LOOP_OPT("Rotation: reject — body carries %d non-IV VARs", carry.ncarried_defs);
       return 0;
     }
 
-#undef ROT_NOTE_READ
-#undef ROT_NOTE_DEF
   }
 
   /* Indexed loads/stores in the body are NOT rejected: that guard was vestigial.
@@ -508,17 +513,16 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
        INSTRUCTIONS in the QEMU corpus.  Loops over named locals (bubble sort's
        inner loop) are admitted and are a clear win, so the gate is the operand
        form, not rotation itself. */
-    if ((irop_config[op].has_src1 && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_src1(ir, q))) ||
-        (irop_config[op].has_src2 && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_src2(ir, q))) ||
-        (op == TCCIR_OP_MLA && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_accum(ir, q))) ||
+    if ((irop_config[op].has_src1 && rot_lval_is_indirect(tcc_ir_op_get_src1(ir, q))) ||
+        (irop_config[op].has_src2 && rot_lval_is_indirect(tcc_ir_op_get_src2(ir, q))) ||
+        (op == TCCIR_OP_MLA && rot_lval_is_indirect(tcc_ir_op_get_accum(ir, q))) ||
         ((op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_POSTINC) &&
-         irop_config[op].has_dest && ROT_LVAL_IS_INDIRECT(tcc_ir_op_get_dest(ir, q))))
+         irop_config[op].has_dest && rot_lval_is_indirect(tcc_ir_op_get_dest(ir, q))))
     {
       LOG_LOOP_OPT("Rotation: reject — body has indirect lvalue operand at %d", i);
       return 0;
     }
   }
-#undef ROT_LVAL_IS_INDIRECT
 
   /* reject a trailing body JUMPIF whose fall-through reaches the exit: rotation would redirect it to the latch */
   if (body_end_is_implicit && !break_invert)
@@ -551,8 +555,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
       IRQuadCompact *jq = &ir->compact_instructions[j];
       if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF)
       {
-        IROperand jdest = tcc_ir_op_get_dest(ir, jq);
-        int jtarget = (int)irop_get_imm64_ex(ir, jdest);
+        int64_t jdest_imm = tcc_ir_op_dest_imm(ir, jq);
+        int jtarget = (int)jdest_imm;
         if (jtarget > loop->start_idx && jtarget <= loop->end_idx)
           ext_entry = 1;
         if (jtarget >= body_start && jtarget <= body_end_jmp)
@@ -574,8 +578,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
       {
-        IROperand jd = tcc_ir_op_get_dest(ir, q);
-        int jt = (int)irop_get_imm64_ex(ir, jd);
+        int64_t jd_imm = tcc_ir_op_dest_imm(ir, q);
+        int jt = (int)jd_imm;
         if (jt < i && jt >= body_start)
         {
           has_inner_loop = 1;
@@ -594,8 +598,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
         return 0;
       if (q->op == TCCIR_OP_JUMPIF || q->op == TCCIR_OP_JUMP)
       {
-        IROperand jd = tcc_ir_op_get_dest(ir, q);
-        int jt = (int)irop_get_imm64_ex(ir, jd);
+        int64_t jd_imm = tcc_ir_op_dest_imm(ir, q);
+        int jt = (int)jd_imm;
         /* internal body branches are safe: their targets get remapped into the relocated body */
         if (jt >= body_start && jt <= body_end_jmp)
         {
@@ -715,8 +719,8 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
     IRQuadCompact *dq = &ir->compact_instructions[break_decide_idx];
     if (dq->op != TCCIR_OP_JUMPIF)
       return 0;
-    IROperand dcond = tcc_ir_op_get_src1(ir, dq);
-    break_decide_inv_cond = invert_condition((int)irop_get_imm64_ex(ir, dcond));
+    int64_t dcond_imm = tcc_ir_op_src1_imm(ir, dq);
+    break_decide_inv_cond = invert_condition((int)dcond_imm);
     if (break_decide_inv_cond < 0)
     {
       LOG_LOOP_OPT("Rotation: reject — cannot invert break decide cond");
@@ -932,6 +936,9 @@ int try_rotate_loop(TCCIRState *ir, IRLoop *loop)
 
   LOG_IR_GEN("[LOOP-ROTATE] Rotated loop header=%d body=[%d..%d] latch=[%d..%d] → bottom-tested at %d", hi, body_start,
              body_end, latch_start, latch_end, body_target);
+
+  /* Body and latch moved within the loop: an inlined body ending in it may now run past that end. */
+  tcc_ir_frame_scope_widen(ir, loop->start_idx, loop->end_idx);
 
   tcc_free(_rbuf);
   return 1;

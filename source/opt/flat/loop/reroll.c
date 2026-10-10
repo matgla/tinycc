@@ -109,39 +109,11 @@ static void vrset_add(VregSet *s, int v)
 
 static int op_is_unsafe_for_reroll(TccIrOp op)
 {
-  switch (op) {
-    case TCCIR_OP_JUMP:
-    case TCCIR_OP_JUMPIF:
-    case TCCIR_OP_IJUMP:
-    case TCCIR_OP_RETURNVOID:
-    case TCCIR_OP_RETURNVALUE:
-    case TCCIR_OP_SWITCH_TABLE:
-    case TCCIR_OP_SETJMP:
-    case TCCIR_OP_LONGJMP:
-    case TCCIR_OP_NL_SETJMP:
-    case TCCIR_OP_NL_LONGJMP:
-    case TCCIR_OP_BUILTIN_APPLY_ARGS:
-    case TCCIR_OP_BUILTIN_APPLY:
-    case TCCIR_OP_BUILTIN_RETURN:
-    case TCCIR_OP_RETURN_ADDRESS:
-    case TCCIR_OP_ASM_INPUT:
-    case TCCIR_OP_INLINE_ASM:
-    case TCCIR_OP_ASM_OUTPUT:
-    case TCCIR_OP_VLA_ALLOC:
-    case TCCIR_OP_VLA_SP_SAVE:
-    case TCCIR_OP_VLA_SP_RESTORE:
-    case TCCIR_OP_CALLSEQ_BEGIN:
-    case TCCIR_OP_CALLSEQ_END:
-    case TCCIR_OP_CALLARG_REG:
-    case TCCIR_OP_CALLARG_STACK:
-    case TCCIR_OP_INIT_CHAIN_SLOT:
-    case TCCIR_OP_SET_CHAIN:
-    case TCCIR_OP_TRAP:
-    case TCCIR_OP_NOP:
-      return 1;
-    default:
-      return 0;
-  }
+  /* Calls, memory and flags are compared operand by operand by the caller. */
+  if (op == TCCIR_OP_NOP || op == TCCIR_OP_RETURN_ADDRESS)
+    return 1;
+  return ir_op_has(op, IR_HZ_FROM_OP & ~(IR_HZ_CALL | IR_HZ_CALL_PARAM | IR_HZ_MEM_READ | IR_HZ_MEM_WRITE |
+                                          IR_HZ_UPDATES_SRC | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ | IR_HZ_HINT));
 }
 
 /* src2 is (call_id << 16) | argc-or-param-idx; call_id is fresh per iteration, so only the low 16 bits may be compared. */
@@ -269,44 +241,48 @@ static void collect_body_defs(TCCIRState *ir, int base, int P, VregSet *defs)
   }
 }
 
-/* Every call group must stay whole in [base, base+P): a phase-shifted boundary would NOP a call's params while its CALL survives past the run, and the backend callsite scan then aborts. */
-static int body_calls_balanced(TCCIRState *ir, int base, int P)
+/* body_is_safe(base, P) for every P in [1, max_P] in one walk: safe[P] is set
+ * iff [base, base+P) holds no unsafe op, no branch target past its first
+ * instruction, and every call group in it stays whole.
+ *
+ * Every call group must stay whole in [base, base+P): a phase-shifted boundary
+ * would NOP a call's params while its CALL survives past the run, and the
+ * backend callsite scan then aborts.  An unsafe op, an inner branch target, an
+ * unverifiable param or a CALL whose params lie before `base` rejects every
+ * longer body as well, so the walk stops there; a group still open at the end
+ * of a prefix only rejects that one length. */
+static void body_safe_periods(TCCIRState *ir, int base, int max_P, uint8_t *safe)
 {
   /* Groups opened by params but not yet closed by their call; at most P fit in a P-length body. */
   int open_ids[REROLL_MAX_PERIOD];
   int n_open = 0;
-  for (int i = 0; i < P; i++) {
+  memset(safe, 0, (size_t)(max_P + 1));
+  for (int i = 0; i < max_P; i++) {
     IRQuadCompact *q = &ir->compact_instructions[base + i];
+    if (op_is_unsafe_for_reroll(q->op)) return;
+    if (i > 0 && q->is_jump_target) return;
     if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID) {
       IROperand s2 = tcc_ir_op_get_src2(ir, q);
-      if (irop_get_tag(s2) != IROP_TAG_IMM32) return 0; /* can't verify -> reject */
+      if (irop_get_tag(s2) != IROP_TAG_IMM32) return; /* can't verify -> reject */
       int cid = TCCIR_DECODE_CALL_ID((uint32_t)s2.u.imm32);
       int found = 0;
       for (int j = 0; j < n_open; j++) if (open_ids[j] == cid) { found = 1; break; }
       if (!found) open_ids[n_open++] = cid;
     } else if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID) {
       IROperand s2 = tcc_ir_op_get_src2(ir, q);
-      if (irop_is_none(s2)) continue; /* untracked call (no id) -- backend won't scan it */
-      if (irop_get_tag(s2) != IROP_TAG_IMM32) return 0;
-      if (TCCIR_DECODE_CALL_ARGC((uint32_t)s2.u.imm32) == 0) continue; /* zero-arg: self-contained */
-      int cid = TCCIR_DECODE_CALL_ID((uint32_t)s2.u.imm32);
-      int idx = -1;
-      for (int j = 0; j < n_open; j++) if (open_ids[j] == cid) { idx = j; break; }
-      if (idx < 0) return 0; /* CALL whose params are outside the body -> split */
-      open_ids[idx] = open_ids[--n_open];
+      if (!irop_is_none(s2)) { /* untracked call (no id) -- backend won't scan it */
+        if (irop_get_tag(s2) != IROP_TAG_IMM32) return;
+        if (TCCIR_DECODE_CALL_ARGC((uint32_t)s2.u.imm32) != 0) { /* zero-arg: self-contained */
+          int cid = TCCIR_DECODE_CALL_ID((uint32_t)s2.u.imm32);
+          int idx = -1;
+          for (int j = 0; j < n_open; j++) if (open_ids[j] == cid) { idx = j; break; }
+          if (idx < 0) return; /* CALL whose params are outside the body -> split */
+          open_ids[idx] = open_ids[--n_open];
+        }
+      }
     }
+    safe[i + 1] = n_open == 0; /* still-open group ends past the body boundary -> split */
   }
-  return n_open == 0; /* still-open group ends past the body boundary -> split */
-}
-
-static int body_is_safe(TCCIRState *ir, int base, int P)
-{
-  for (int i = 0; i < P; i++) {
-    IRQuadCompact *q = &ir->compact_instructions[base + i];
-    if (op_is_unsafe_for_reroll(q->op)) return 0;
-    if (i > 0 && q->is_jump_target) return 0;
-  }
-  return body_calls_balanced(ir, base, P);
 }
 
 static int count_repeats(TCCIRState *ir, int base, int P,
@@ -397,6 +373,50 @@ static int run_has_identity_rename(TCCIRState *ir, int base, int P,
   return 1;
 }
 
+/* Cost model: the rolled loop pays ADD+CMP+JUMPIF per element and gives up
+ * the post-indexed/folded addressing the straight-line body gets for free
+ * (its pointer-step ASSIGNs and increments fold into the memory operands at
+ * codegen), so re-rolling is a plain loss on a body that only moves data -
+ * at most a load/store pair per element plus address steps (2-3 machine
+ * ops). A body that computes, or moves more than two values per element,
+ * is long enough to pay for the counter. Memory accesses are counted as
+ * memory opcodes plus operands read through a pointer: the frontend folds
+ * some accesses into the consuming op (e.g. ADD with a DEREF operand). */
+static int reroll_deref_operand(IRQuadCompact *q, IROperand op)
+{
+  if (irop_is_none(op) || !irop_has_vreg(op))
+    return 0;
+  return !irop_is_vreg_value(op);
+}
+
+static int reroll_body_moves_only_data(TCCIRState *ir, int base, int P)
+{
+  int mem = 0;
+  for (int i = 0; i < P; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[base + i];
+    switch (q->op) {
+      case TCCIR_OP_LOAD:
+      case TCCIR_OP_LOAD_INDEXED:
+      case TCCIR_OP_LOAD_POSTINC:
+      case TCCIR_OP_STORE:
+      case TCCIR_OP_STORE_INDEXED:
+      case TCCIR_OP_STORE_POSTINC:
+        mem++;
+        continue;
+      case TCCIR_OP_ASSIGN:
+      case TCCIR_OP_ADD:
+      case TCCIR_OP_SUB:
+        break; /* step or folded access; counted via operands below */
+      default:
+        return 0; /* computes: the roll is priced in */
+    }
+    mem += reroll_deref_operand(q, tcc_ir_op_get_src1(ir, q))
+         + reroll_deref_operand(q, tcc_ir_op_get_src2(ir, q))
+         + reroll_deref_operand(q, tcc_ir_op_get_scale(ir, q));
+  }
+  return mem <= 2;
+}
+
 /* Safe iff the iteration rename is the identity, or no vreg defined in the run is referenced outside it. */
 static int reroll_is_safe(TCCIRState *ir, int base, int P, int N)
 {
@@ -425,11 +445,35 @@ static void reroll_rewrite(TCCIRState *ir, int base, int P, int N)
   IROperand one_imm    = irop_make_imm32(-1, 1, IROP_BTYPE_INT32);
   IROperand n_imm      = irop_make_imm32(-1, N, IROP_BTYPE_INT32);
 
-  /* insert_instr_at shifts existing jump targets >= base for us. */
+  int base_was_target = ir->compact_instructions[base].is_jump_target;
+  /* insert_instr_at shifts existing jump targets >= base, so a branch to the
+   * run's first instruction now lands one past the counter init. */
   int rc = insert_instr_at(ir, base, TCCIR_OP_ASSIGN, counter_op, zero_imm, irop_make_none());
   if (rc < 0) return; /* OOM; leave IR untouched */
 
   int body_start = base + 1;
+  /* A branch into the run must enter through the init: skipping it left the
+   * counter undefined (a run after an init loop's exit ran 3 times of 4). */
+  if (base_was_target)
+  {
+    for (int i = 0; i < ir->next_instruction_index; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if ((q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) &&
+          (int)tcc_ir_op_dest_imm(ir, q) == body_start)
+        tcc_ir_op_set_dest_imm32(ir, q, base, IROP_BTYPE_INT32);
+    }
+    for (int ti = 0; ti < ir->num_switch_tables; ti++)
+    {
+      TCCIRSwitchTable *table = &ir->switch_tables[ti];
+      if (table->default_target == body_start)
+        table->default_target = base;
+      for (int tj = 0; tj < table->num_entries; tj++)
+        if (table->targets[tj] == body_start)
+          table->targets[tj] = base;
+    }
+    ir->compact_instructions[base].is_jump_target = 1;
+  }
   int after_run  = base + 1 + P * N;  /* first index past NOPs */
 
   rc = insert_instr_at(ir, after_run, TCCIR_OP_ADD, counter_op, counter_op, one_imm);
@@ -452,6 +496,8 @@ static void reroll_rewrite(TCCIRState *ir, int base, int P, int N)
 
   /* Downstream passes (compact, jump-threading, SSA build) only preserve marked targets. */
   ir->compact_instructions[body_start].is_jump_target = 1;
+  /* The first iteration now runs for all N: an inlined body ending in the run spans the loop. */
+  tcc_ir_frame_scope_widen(ir, base, after_run + 2);
 
   LOG_REROLL("rerolled run @%d P=%d N=%d into counter=%d loop", base, P, N, counter_vreg);
 }
@@ -479,8 +525,10 @@ int tcc_ir_opt_reroll(TCCIRState *ir)
     if (i + REROLL_MIN_REPEATS * max_P > ir->next_instruction_index)
       max_P = (ir->next_instruction_index - i) / REROLL_MIN_REPEATS;
 
+    uint8_t safe[REROLL_MAX_PERIOD + 1];
+    body_safe_periods(ir, i, max_P, safe);
     for (int P = REROLL_MIN_PERIOD; P <= max_P; P++) {
-      if (!body_is_safe(ir, i, P)) continue;
+      if (!safe[P]) continue;
 
       /* Opcode-only prematch: skips collect_body_defs + full block_matches on the common no-match case; i+2P<=n holds since max_P caps i+REROLL_MIN_REPEATS*P<=n. */
       {
@@ -493,6 +541,8 @@ int tcc_ir_opt_reroll(TCCIRState *ir)
       collect_body_defs(ir, i, P, &defs);
       int reps = count_repeats(ir, i, P, &map, &defs);
       if (reps < REROLL_MIN_REPEATS) continue;
+      if (reroll_body_moves_only_data(ir, i, P))
+        continue; /* a copy/fill body: the counter traffic is a plain loss */
       int score = reps * P;
       if (score > best_score) {
         best_score = score;

@@ -99,8 +99,7 @@ int tcc_ir_opt_assign_fuse(TCCIRState *ir)
      * sub-word ASSIGN may truncate or widen, which the producer can't
      * faithfully reproduce by writing to a different dest. */
     IROperand asn_dest = tcc_ir_op_get_dest(ir, q_asn);
-    IROperand def_dest = tcc_ir_op_get_dest(ir, q_def);
-    if (irop_get_btype(asn_dest) != irop_get_btype(def_dest))
+    if (irop_get_btype(asn_dest) != tcc_ir_op_dest_btype(ir, q_def))
       continue;
     if (asn_dest.is_lval)
       continue;
@@ -115,5 +114,3 @@ int tcc_ir_opt_assign_fuse(TCCIRState *ir)
   tcc_free(du.def);
   return changes;
 }
-
-int tcc_ir_opt_assign_fuse_ex(IROptCtx *ctx) { return tcc_ir_opt_assign_fuse(ctx->ir); }

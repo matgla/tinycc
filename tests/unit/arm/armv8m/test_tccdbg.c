@@ -2272,7 +2272,7 @@ UT_TEST(test_tcc_get_dwarf_info_enum)
   enum_def.v = 400;
   member.type.t = VT_INT | VT_ENUM_VAL;
   member.v = 401;
-  member.enum_val = 1;
+  sym_set_enum_val(&member, 1);
   enum_def.next = &member;
 
   s.type.t = VT_ENUM;
@@ -2654,7 +2654,7 @@ UT_TEST(test_tcc_get_debug_info_enum_stabs)
   enum_def.v = 300;
   member.type.t = VT_INT | VT_ENUM_VAL;
   member.v = 301;
-  member.enum_val = 42;
+  sym_set_enum_val(&member, 42);
   enum_def.next = &member;
 
   s.type.t = VT_ENUM;

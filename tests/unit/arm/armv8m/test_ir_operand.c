@@ -10,6 +10,42 @@
 
 #include "ut.h"
 
+UT_TEST(test_access_alignment_proof_belongs_to_dereference)
+{
+  IROperand base = irop_make_vreg(1, IROP_BTYPE_INT32);
+  IROperand access = irop_make_vreg(2, IROP_BTYPE_INT64);
+  access.is_lval = 1;
+  base.aux = IROP_AUX_ALIGN4_OK;
+  irop_carry_access_marks(&base, access);
+  UT_ASSERT_EQ(base.aux & IROP_AUX_ALIGN4_OK, 0);
+  access.aux = IROP_AUX_ALIGN4_OK;
+  irop_carry_access_marks(&base, access);
+  UT_ASSERT_EQ(base.aux & IROP_AUX_ALIGN4_OK, IROP_AUX_ALIGN4_OK);
+  access.aux |= IROP_AUX_UNDERALIGN;
+  irop_carry_access_marks(&base, access);
+  UT_ASSERT_EQ(base.aux & IROP_AUX_ALIGN4_OK, 0);
+  UT_ASSERT_EQ(base.aux & IROP_AUX_UNDERALIGN, IROP_AUX_UNDERALIGN);
+  return 0;
+}
+
+UT_TEST(test_unproven_word_access_roundtrip_stays_unproven)
+{
+  TCCIRState *ir = tcc_ir_alloc();
+  const int btypes[] = {IROP_BTYPE_INT32, IROP_BTYPE_FLOAT32, IROP_BTYPE_INT64, IROP_BTYPE_FLOAT64};
+  for (int i = 0; i < 4; i++)
+  {
+    IROperand op = irop_make_vreg(TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 3), btypes[i]);
+    op.is_lval = 1;
+    SValue sv;
+    iroperand_to_svalue(ir, op, &sv);
+    IROperand back = svalue_to_iroperand(ir, &sv);
+    UT_ASSERT_EQ(back.aux & IROP_AUX_ALIGN4_OK, 0);
+    UT_ASSERT_EQ(back.aux & IROP_AUX_UNDERALIGN, IROP_AUX_UNDERALIGN);
+  }
+  tcc_ir_free(ir);
+  return 0;
+}
+
 static SValue sv_const_int(int v)
 {
   SValue sv;
@@ -1177,6 +1213,28 @@ UT_TEST(test_op_is_const_predicate)
 
   IROperand none = irop_make_none();
   UT_ASSERT(!irop_op_is_const(none));
+  return 0;
+}
+
+UT_TEST(test_vreg_value_distinguishes_home_from_dereference)
+{
+  int32_t vr = TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, 3);
+  IROperand value = irop_make_vreg(vr, IROP_BTYPE_INT32);
+  UT_ASSERT(irop_is_vreg_value(value));
+  value.is_lval = 1;
+  UT_ASSERT(!irop_is_vreg_value(value));
+
+  IROperand home = irop_make_stackoff(vr, -12, 1, 0, 0, IROP_BTYPE_INT32);
+  UT_ASSERT(irop_is_vreg_value(home));
+  home.is_llocal = 1;
+  UT_ASSERT(!irop_is_vreg_value(home));
+  home.is_llocal = home.is_lval = 0;
+  UT_ASSERT(!irop_is_vreg_value(home));
+
+  IROperand slot = irop_make_stackoff(0, -12, 1, 0, 0, IROP_BTYPE_INT32);
+  UT_ASSERT(!irop_is_vreg_value(slot));
+  UT_ASSERT(!irop_is_vreg_value(irop_make_none()));
+  UT_ASSERT(!irop_is_vreg_value(irop_make_imm32(0, 4, IROP_BTYPE_INT32)));
   return 0;
 }
 

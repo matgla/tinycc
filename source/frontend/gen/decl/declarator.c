@@ -403,13 +403,20 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
     case TOK_RESTRICT2:
     case TOK_RESTRICT3:
       goto redo;
+    case TOK_RODATA_REL:
+      qualifiers |= rodata_rel_qualifier();
+      goto redo;
     /* XXX: clarify attribute handling */
     case TOK_ATTRIBUTE1:
     case TOK_ATTRIBUTE2:
       parse_attribute(ad);
       break;
     }
-    mk_pointer(type);
+    if (ret == type && (td & TYPE_NESTDECL))
+      /* the caller applies its suffix to this pointer's target, in place */
+      mk_private_pointer(type);
+    else
+      mk_pointer(type);
     type->t |= qualifiers;
     if (ret == type)
       /* innermost pointed to type is the one for the first derivation */
@@ -420,14 +427,14 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
   {
     /* This is possibly a parameter type list for abstract declarators
        ('int ()'), use post_type for testing this.  */
-    if (!post_type(type, ad, 0, td))
+    if (!post_type(type, ad, 0, td & ~TYPE_NESTDECL))
     {
       /* It's not, so it's a nested declarator, and the post operations
          apply to the innermost pointed to type (if any).  */
       /* XXX: this is not correct to modify 'ad' at this point, but
          the syntax is not clear */
       parse_attribute(ad);
-      post = type_decl(type, ad, v, td);
+      post = type_decl(type, ad, v, td | TYPE_NESTDECL);
       skip(')');
     }
     else
@@ -446,7 +453,7 @@ CType *type_decl(CType *type, AttributeDef *ad, int *v, int td)
       expect("identifier");
     *v = 0;
   }
-  post_type(post, ad, post != ret ? 0 : storage, td & ~(TYPE_DIRECT | TYPE_ABSTRACT));
+  post_type(post, ad, post != ret ? 0 : storage, td & ~(TYPE_DIRECT | TYPE_ABSTRACT | TYPE_NESTDECL));
   parse_attribute(ad);
   type->t |= storage;
   return ret;

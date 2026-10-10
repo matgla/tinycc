@@ -11,6 +11,7 @@
 #include "licm.h"
 #include "opt.h"
 #include "opt_alias.h"
+#include "opt_range.h"
 #include "opt_utils.h"
 #include "cfg.h"
 #include "core.h"
@@ -69,6 +70,12 @@ static int loop_contains_vla(TCCIRState *ir, IRLoop *loop)
  * of a loop that mutated V7 through the pointers p14 and p15). */
 static int vreg_addr_taken_anywhere(TCCIRState *ir, int32_t vreg)
 {
+  /* A local captured by a nested function is written through the static
+   * chain, never through an `&x` the scan below could see: the front end
+   * flags it addrtaken (nested.c) -- honour that, or a loop calling the nested
+   * function treats the captured local as invariant and hoists its reads. */
+  if (tcc_ir_vreg_flag_addrtaken_get(ir, vreg))
+    return 1;
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -132,7 +139,7 @@ static int is_operand_loop_invariant_ex(TCCIRState *ir, IROperand op, IRLoop *lo
         IRQuadCompact *dq = &ir->compact_instructions[didx];
         if (dq->op == TCCIR_OP_NOP || !irop_config[dq->op].has_dest)
           continue;
-        if (irop_get_vreg(tcc_ir_op_get_dest(ir, dq)) == vreg)
+        if (tcc_ir_op_dest_vreg(ir, dq) == vreg)
           def_count++;
       }
       if (def_count <= 1)
@@ -150,15 +157,14 @@ static int is_operand_loop_invariant_ex(TCCIRState *ir, IROperand op, IRLoop *lo
     if (!irop_config[q->op].has_dest)
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(dest) == vreg)
+    int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
+    if (dest_vr == vreg)
     {
       /* This vreg is defined inside the loop.
        * Check if it's an ASSIGN from a hoisted vreg (transitively invariant) */
       if (q->op == TCCIR_OP_ASSIGN)
       {
-        IROperand src = tcc_ir_op_get_src1(ir, q);
-        int32_t src_vreg = irop_get_vreg(src);
+        int32_t src_vreg = tcc_ir_op_src1_vreg(ir, q);
         if (src_vreg >= 0)
         {
           for (int h = 0; h < num_hoisted_vregs; h++)
@@ -193,6 +199,30 @@ static int is_operand_loop_invariant_ex(TCCIRState *ir, IROperand op, IRLoop *lo
  * IMPURE/UNKNOWN callee — or an indirect call — may write memory), can change
  * what a PURE callee observes, so hoisting it would be a miscompile.  CONST
  * callees read no memory and are unaffected by this. */
+static int licm_q_may_clobber_memory(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (ir_op_has(q->op, IR_HZ_CALL))
+  {
+    /* An indirect / impure / merely-pure call may write memory.
+     * IR_LEGACY_GAP: a CONST call's lvalue destination is not looked at. */
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
+    return !callee || tcc_ir_get_func_purity(ir, callee) < TCC_FUNC_PURITY_CONST;
+  }
+  /* Inline asm may write arbitrary memory; a store through a non-STORE op
+   * shows up as an lvalue destination.  SET_CHAIN counts too: it precedes a
+   * call to a nested function, which writes the caller's captured locals
+   * through the chain whatever purity its body was given. */
+  return ir_q_hazards_except(ir, q,
+                             IR_HZ_ALL & ~(IR_HZ_MEM_READ | IR_HZ_SRC_LVAL | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ |
+                                           IR_HZ_CALL_PARAM | IR_HZ_CALL_SEQ | IR_HZ_UPDATES_SRC | IR_HZ_HINT |
+                                           IR_HZ_BRANCH | IR_HZ_RETURN | IR_HZ_TRAP | IR_HZ_JOIN |
+                                           IR_HZ_JOIN_END |
+                                           IR_LEGACY_GAP_HZ(IR_HZ_VLA | IR_HZ_NONLOCAL | IR_HZ_VOLATILE |
+                                                            IR_HZ_DEST_STACKOFF)),
+                             IR_LEGACY_GAP_OPS(TCCIR_OP_ASM_INPUT, TCCIR_OP_CALLARG_STACK,
+                                               TCCIR_OP_INIT_CHAIN_SLOT)) != 0;
+}
+
 /* CFG-block flavour of loop_body_may_clobber_memory, for the dominance-based
  * LICM below (which works on an `in_loop[]` block mask, not an IRLoop). */
 static int cfg_loop_may_clobber_memory(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_loop)
@@ -202,33 +232,8 @@ static int cfg_loop_may_clobber_memory(TCCIRState *ir, IRCFG *cfg, const uint8_t
     if (!in_loop[bi])
       continue;
     for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++)
-    {
-      IRQuadCompact *q = &ir->compact_instructions[ii];
-      switch (q->op)
-      {
-      case TCCIR_OP_NOP:
-        continue;
-      case TCCIR_OP_STORE:
-      case TCCIR_OP_STORE_INDEXED:
-      case TCCIR_OP_STORE_POSTINC:
-      case TCCIR_OP_BLOCK_COPY:
-      case TCCIR_OP_INLINE_ASM:
-      case TCCIR_OP_ASM_OUTPUT:
+      if (licm_q_may_clobber_memory(ir, &ir->compact_instructions[ii]))
         return 1;
-      case TCCIR_OP_FUNCCALLVAL:
-      case TCCIR_OP_FUNCCALLVOID:
-      {
-        Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
-        if (!callee || tcc_ir_get_func_purity(ir, callee) < TCC_FUNC_PURITY_CONST)
-          return 1;
-        continue;
-      }
-      default:
-        if (irop_config[q->op].has_dest && tcc_ir_op_get_dest(ir, q).is_lval)
-          return 1;
-        continue;
-      }
-    }
   }
   return 0;
 }
@@ -236,35 +241,8 @@ static int cfg_loop_may_clobber_memory(TCCIRState *ir, IRCFG *cfg, const uint8_t
 static int loop_body_may_clobber_memory(TCCIRState *ir, IRLoop *loop)
 {
   for (int i = 0; i < loop->num_body_instrs; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[loop->body_instrs[i]];
-    switch (q->op)
-    {
-    case TCCIR_OP_NOP:
-      continue;
-    case TCCIR_OP_STORE:
-    case TCCIR_OP_STORE_INDEXED:
-    case TCCIR_OP_STORE_POSTINC:
-    case TCCIR_OP_BLOCK_COPY:
+    if (licm_q_may_clobber_memory(ir, &ir->compact_instructions[loop->body_instrs[i]]))
       return 1;
-    case TCCIR_OP_INLINE_ASM:
-    case TCCIR_OP_ASM_OUTPUT:
-      return 1; /* inline asm may write arbitrary memory */
-    case TCCIR_OP_FUNCCALLVAL:
-    case TCCIR_OP_FUNCCALLVOID:
-    {
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
-      if (!callee || tcc_ir_get_func_purity(ir, callee) < TCC_FUNC_PURITY_CONST)
-        return 1; /* indirect / impure / merely-pure call may write memory */
-      continue;
-    }
-    default:
-      /* A memory store through a non-STORE op shows up as an lval destination. */
-      if (irop_config[q->op].has_dest && tcc_ir_op_get_dest(ir, q).is_lval)
-        return 1;
-      continue;
-    }
-  }
   return 0;
 }
 
@@ -310,8 +288,7 @@ static int tcc_ir_is_hoistable_call_ex(TCCIRState *ir, int instr_idx, IRLoop *lo
   }
 
   /* Get function symbol from src1 */
-  IROperand src1 = tcc_ir_op_get_src1(ir, q);
-  Sym *func_sym = irop_get_sym_ex(ir, src1);
+  Sym *func_sym = tcc_ir_op_src1_sym(ir, q);
 
   if (!func_sym)
   {
@@ -340,8 +317,8 @@ static int tcc_ir_is_hoistable_call_ex(TCCIRState *ir, int instr_idx, IRLoop *lo
   LOG_LICM("Call at %d: function is pure (purity=%d), checking args...", instr_idx, purity);
 
   /* Find all FUNCPARAMVAL instructions for this call */
-  IROperand call_src2 = tcc_ir_op_get_src2(ir, q);
-  int call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, call_src2));
+  int64_t call_src2_imm = tcc_ir_op_src2_imm(ir, q);
+  int call_id = TCCIR_DECODE_CALL_ID(call_src2_imm);
 
   for (int i = 0; i < loop->num_body_instrs; i++)
   {
@@ -351,8 +328,8 @@ static int tcc_ir_is_hoistable_call_ex(TCCIRState *ir, int instr_idx, IRLoop *lo
     if (param_q->op != TCCIR_OP_FUNCPARAMVAL)
       continue;
 
-    IROperand param_src2 = tcc_ir_op_get_src2(ir, param_q);
-    int param_call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, param_src2));
+    int64_t param_src2_imm = tcc_ir_op_src2_imm(ir, param_q);
+    int param_call_id = TCCIR_DECODE_CALL_ID(param_src2_imm);
     if (param_call_id != call_id)
       continue; /* Parameter for a different call */
 
@@ -387,8 +364,8 @@ typedef struct
 static int collect_call_params(TCCIRState *ir, int call_idx, int *param_indices, int max_params)
 {
   IRQuadCompact *call_q = &ir->compact_instructions[call_idx];
-  IROperand call_src2 = tcc_ir_op_get_src2(ir, call_q);
-  int call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, call_src2));
+  int64_t call_src2_imm = tcc_ir_op_src2_imm(ir, call_q);
+  int call_id = TCCIR_DECODE_CALL_ID(call_src2_imm);
   int num_params = 0;
 
   /* Scan all instructions for params/markers with matching call_id */
@@ -397,8 +374,8 @@ static int collect_call_params(TCCIRState *ir, int call_idx, int *param_indices,
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
     {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int param_call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, src2));
+      int64_t src2_imm = tcc_ir_op_src2_imm(ir, q);
+      int param_call_id = TCCIR_DECODE_CALL_ID(src2_imm);
       if (param_call_id == call_id)
       {
         param_indices[num_params++] = i;
@@ -514,7 +491,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
         IRQuadCompact *jq = &ir->compact_instructions[j];
         if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF)
         {
-          int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq));
+          int jt = (int)tcc_ir_op_dest_imm(ir, jq);
           if (jt >= loop->header_idx && jt <= loop->end_idx)
             external_entry = 1;
         }
@@ -522,7 +499,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
         {
           /* A switch outside the loop with a case/default target in the
            * range is an entry edge, same as a plain JUMP. */
-          int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, jq));
+          int table_id = (int)tcc_ir_op_src2_imm(ir, jq);
           if (table_id >= 0 && table_id < ir->num_switch_tables)
           {
             TCCIRSwitchTable *table = &ir->switch_tables[table_id];
@@ -605,8 +582,7 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
       if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
       {
         /* Check basic requirements (pure function, vreg dest) but NOT argument invariance yet */
-        IROperand src1 = tcc_ir_op_get_src1(ir, q);
-        Sym *func_sym = irop_get_sym_ex(ir, src1);
+        Sym *func_sym = tcc_ir_op_src1_sym(ir, q);
         if (func_sym && tcc_ir_get_func_purity(ir, func_sym) >= TCC_FUNC_PURITY_PURE)
         {
           if (q->op == TCCIR_OP_FUNCCALLVOID ||
@@ -701,8 +677,8 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
 
         /* Get old call_id and argc from the original call */
         IRQuadCompact *orig_call_q = &ir->compact_instructions[call_idx];
-        IROperand orig_call_src2 = tcc_ir_op_get_src2(ir, orig_call_q);
-        int64_t orig_encoded = irop_get_imm64_ex(ir, orig_call_src2);
+        int64_t orig_call_src2_imm = tcc_ir_op_src2_imm(ir, orig_call_q);
+        int64_t orig_encoded = orig_call_src2_imm;
         int argc = TCCIR_DECODE_CALL_ARGC(orig_encoded);
 
         /* Allocate a NEW call_id for the hoisted call */
@@ -771,8 +747,8 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
         for (int p = num_params - 1; p >= 0; p--)
         {
           /* Get param_idx from the original encoding */
-          IROperand orig_param_src2 = tcc_ir_op_get_src2(ir, &param_copies[p]);
-          int64_t orig_param_encoded = irop_get_imm64_ex(ir, orig_param_src2);
+          int64_t orig_param_src2_imm = tcc_ir_op_src2_imm(ir, &param_copies[p]);
+          int64_t orig_param_encoded = orig_param_src2_imm;
           int param_idx = TCCIR_DECODE_PARAM_IDX(orig_param_encoded);
 
           /* Create new encoding with new_call_id but same param_idx */
@@ -809,13 +785,12 @@ int tcc_ir_hoist_pure_calls(TCCIRState *ir, IRLoops *loops)
         if (hoistable[i].hoisted_vreg >= 0)
         {
           /* Get original destination from the adjusted position */
-          IROperand orig_dest = tcc_ir_op_get_dest(ir, call_q);
-          int32_t orig_vreg = irop_get_vreg(orig_dest);
+          int32_t orig_vreg = tcc_ir_op_dest_vreg(ir, call_q);
 
           call_q->op = TCCIR_OP_ASSIGN;
           IROperand hoisted_src = irop_make_vreg(hoistable[i].hoisted_vreg, IROP_BTYPE_INT32);
           tcc_ir_set_src1(ir, adjusted_call_idx, hoisted_src);
-          tcc_ir_set_src2(ir, adjusted_call_idx, IROP_NONE);
+          tcc_ir_set_src2_none(ir, adjusted_call_idx);
           /* Keep original destination */
           tcc_ir_op_set_dest(ir, call_q, irop_make_vreg(orig_vreg, IROP_BTYPE_INT32));
 
@@ -973,8 +948,7 @@ static int glh_single_def_of(TCCIRState *ir, int32_t vr)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (d.is_lval || irop_get_vreg(d) != vr)
+    if (tcc_ir_op_dest_is_lval(ir, q) || tcc_ir_op_dest_vreg(ir, q) != vr)
       continue;
     if (def >= 0)
       return -1;
@@ -1106,7 +1080,7 @@ static void glh_collect_global_writes(TCCIRState *ir, IRLoop *loop, GLHWrites *w
     }
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_FUNCCALLVOID: {
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      Sym *callee = tcc_ir_op_src1_sym(ir, q);
       if (!callee || tcc_ir_get_func_purity(ir, callee) < TCC_FUNC_PURITY_CONST)
         w->unknown = 1;
       continue;
@@ -1183,7 +1157,7 @@ static int tcc_ir_hoist_invariant_global_loads(TCCIRState *ir, IRLoops *loops)
         continue;
       IRQuadCompact *jq = &ir->compact_instructions[j];
       if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF) {
-        int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq));
+        int jt = (int)tcc_ir_op_dest_imm(ir, jq);
         if (jt >= loop->header_idx && jt <= loop->end_idx)
           bad = 1;
       } else if (jq->op == TCCIR_OP_SWITCH_TABLE || jq->op == TCCIR_OP_IJUMP) {
@@ -1213,7 +1187,7 @@ static int tcc_ir_hoist_invariant_global_loads(TCCIRState *ir, IRLoops *loops)
       for (int side = 0; side < 2; side++) {
         if (side == 0 && !irop_config[q->op].has_src1) continue;
         if (side == 1 && !irop_config[q->op].has_src2) continue;
-        IROperand op = side == 0 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        IROperand op = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
         if (!glh_operand_is_global_value(op))
           continue;
         IRPoolSymref *ref = irop_get_symref_ex(ir, op);
@@ -1255,7 +1229,7 @@ static int tcc_ir_hoist_invariant_global_loads(TCCIRState *ir, IRLoops *loops)
       for (int side = 0; side < 2; side++) {
         if (side == 0 && !irop_config[q->op].has_src1) continue;
         if (side == 1 && !irop_config[q->op].has_src2) continue;
-        IROperand op = side == 0 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        IROperand op = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
         if (!glh_operand_is_global_value(op))
           continue;
         IRPoolSymref *ref = irop_get_symref_ex(ir, op);
@@ -1358,9 +1332,9 @@ static void licm_move_jump_target_off_nop(TCCIRState *ir, int nop_pos)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    if ((int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q)) != nop_pos)
+    if ((int)tcc_ir_op_dest_imm(ir, q) != nop_pos)
       continue;
-    tcc_ir_op_set_dest(ir, q, irop_make_imm32(-1, t, IROP_BTYPE_INT32));
+    tcc_ir_op_set_dest_imm32(ir, q, t, IROP_BTYPE_INT32);
   }
   for (int k = 0; k < ir->num_switch_tables; k++)
   {
@@ -1402,24 +1376,31 @@ static int licm_vset_key(int32_t vr, int stride)
   return t * stride + p;
 }
 
+/* Every operand of a quad: dest, src1, src2 and MLA's accumulator. */
+static int licm_quad_operands(TCCIRState *ir, int idx, IROperand *out)
+{
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  int n = 0;
+  if (irop_config[q->op].has_dest)
+    out[n++] = tcc_ir_op_get_dest(ir, q);
+  if (irop_config[q->op].has_src1)
+    out[n++] = tcc_ir_op_get_src1(ir, q);
+  if (irop_config[q->op].has_src2)
+    out[n++] = tcc_ir_op_get_src2(ir, q);
+  if (q->op == TCCIR_OP_MLA)
+    out[n++] = tcc_ir_op_get_accum(ir, q);
+  return n;
+}
+
 static int licm_max_vreg_pos(TCCIRState *ir)
 {
   int max = -1;
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
     IROperand ops[4];
-    int m = 0;
-    if (irop_config[q->op].has_dest)
-      ops[m++] = tcc_ir_op_get_dest(ir, q);
-    if (irop_config[q->op].has_src1)
-      ops[m++] = tcc_ir_op_get_src1(ir, q);
-    if (irop_config[q->op].has_src2)
-      ops[m++] = tcc_ir_op_get_src2(ir, q);
-    if (q->op == TCCIR_OP_MLA)
-      ops[m++] = tcc_ir_op_get_accum(ir, q);
+    if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
+      continue;
+    int m = licm_quad_operands(ir, i, ops);
     for (int k = 0; k < m; k++)
     {
       int32_t vr = irop_get_vreg(ops[k]);
@@ -1440,19 +1421,13 @@ static void licm_addr_taken_set_build(TCCIRState *ir, LicmVregSet *set)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    IROperand srcs[3];
-    int nsrcs = 0;
-    if (irop_config[q->op].has_src1)
-      srcs[nsrcs++] = tcc_ir_op_get_src1(ir, q);
-    if (irop_config[q->op].has_src2)
-      srcs[nsrcs++] = tcc_ir_op_get_src2(ir, q);
-    if (q->op == TCCIR_OP_MLA)
-      srcs[nsrcs++] = tcc_ir_op_get_accum(ir, q);
-    for (int k = 0; k < nsrcs; k++)
+    IROperand ops[4];
+    int nops = licm_quad_operands(ir, i, ops);
+    for (int k = irop_config[q->op].has_dest ? 1 : 0; k < nops; k++)
     {
       int key;
-      if (irop_get_tag(srcs[k]) == IROP_TAG_STACKOFF && !srcs[k].is_lval &&
-          (key = licm_vset_key(irop_get_vreg(srcs[k]), set->stride)) >= 0)
+      if (irop_get_tag(ops[k]) == IROP_TAG_STACKOFF && !ops[k].is_lval &&
+          (key = licm_vset_key(irop_get_vreg(ops[k]), set->stride)) >= 0)
         set->bits[key] = 1;
     }
   }
@@ -1460,6 +1435,8 @@ static void licm_addr_taken_set_build(TCCIRState *ir, LicmVregSet *set)
 
 static int licm_addr_taken(TCCIRState *ir, LicmVregSet *set, int32_t vr)
 {
+  if (tcc_ir_vreg_flag_addrtaken_get(ir, vr))
+    return 1; /* `&x` elsewhere, or captured by a nested function */
   if (!set->bits)
     licm_addr_taken_set_build(ir, set);
   int key = licm_vset_key(vr, set->stride);
@@ -1494,7 +1471,7 @@ static void licm_outside_defs_build(TCCIRState *ir, IRCFG *cfg, const uint8_t *i
       IRQuadCompact *oq = &ir->compact_instructions[oi2];
       if (oq->op == TCCIR_OP_NOP || !irop_config[oq->op].has_dest)
         continue;
-      int key = licm_vset_key(irop_get_vreg(tcc_ir_op_get_dest(ir, oq)), set->stride);
+      int key = licm_vset_key(tcc_ir_op_dest_vreg(ir, oq), set->stride);
       if (key >= 0)
         set->bits[key] = 1;
     }
@@ -1521,10 +1498,15 @@ static int licm_name_is_noncapturing_mem(const char *nm)
     return 0;
   if (ir_opt_is_memcpy_or_memmove_name(nm))
     return 1;
-  return !strcmp(nm, "memset") || !strcmp(nm, "__aeabi_memset") ||
-         !strcmp(nm, "__aeabi_memset4") || !strcmp(nm, "__aeabi_memset8") ||
-         !strcmp(nm, "__aeabi_memclr") || !strcmp(nm, "__aeabi_memclr4") ||
-         !strcmp(nm, "__aeabi_memclr8");
+  if (!strcmp(nm, "memset"))
+    return 1;
+  if (strncmp(nm, "__aeabi_mem", 11))
+    return 0;
+  static const char kinds[] = "set\0set4\0set8\0clr\0clr4\0clr8";
+  for (const char *k = kinds; k < kinds + sizeof(kinds); k += strlen(k) + 1)
+    if (!strcmp(nm + 11, k))
+      return 1;
+  return 0;
 }
 
 static int licm_instr_in_loop(IRCFG *cfg, const uint8_t *in_loop, int idx)
@@ -1533,22 +1515,6 @@ static int licm_instr_in_loop(IRCFG *cfg, const uint8_t *in_loop, int idx)
     if (in_loop[bi] && idx >= cfg->blocks[bi].start_idx && idx < cfg->blocks[bi].end_idx)
       return 1;
   return 0;
-}
-
-/* Every operand of a quad: dest, src1, src2 and MLA's accumulator. */
-static int licm_quad_operands(TCCIRState *ir, int idx, IROperand *out)
-{
-  IRQuadCompact *q = &ir->compact_instructions[idx];
-  int n = 0;
-  if (irop_config[q->op].has_dest)
-    out[n++] = tcc_ir_op_get_dest(ir, q);
-  if (irop_config[q->op].has_src1)
-    out[n++] = tcc_ir_op_get_src1(ir, q);
-  if (irop_config[q->op].has_src2)
-    out[n++] = tcc_ir_op_get_src2(ir, q);
-  if (q->op == TCCIR_OP_MLA)
-    out[n++] = tcc_ir_op_get_accum(ir, q);
-  return n;
 }
 
 /* Is `vr` mentioned by any instruction other than `def_idx`?  Dest mentions
@@ -1640,13 +1606,13 @@ static int licm_slot_addr_escapes(TCCIRState *ir, IRCFG *cfg, const uint8_t *in_
     Sym *callee;
     if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
-    callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee || !licm_name_is_noncapturing_mem(get_tok_str(callee->v, NULL)))
       continue;
     if (licm_instr_in_loop(cfg, in_loop, i))
       continue;
     if (q->op == TCCIR_OP_FUNCCALLVAL &&
-        licm_vreg_touched_elsewhere(ir, irop_get_vreg(tcc_ir_op_get_dest(ir, q)), i))
+        licm_vreg_touched_elsewhere(ir, tcc_ir_op_dest_vreg(ir, q), i))
       continue; /* the returned dst pointer is kept — its args are not safe */
     for (int k = 0; k < 4; k++)
     {
@@ -1789,6 +1755,555 @@ int ssa_opt_licm_global_load(TCCIRState *ir)
   return changed;
 }
 
+/* ============================================================================
+ * Invariant field-pointer loads (the ProcessMemoryPool mark/mark-free family)
+ *
+ * A loop that walks a descriptor struct keeps re-reading the POINTER FIELDS:
+ *
+ *     for (i = start; i < end; i++)
+ *       if (!(p->marked[i >> 5] & (1u << (i & 31)))) {
+ *         p->used[i >> 5] |= 1u << (i & 31);
+ *         p->count += 1;
+ *       }
+ *
+ * reloads `p->marked` and `p->used` on every page (docs/bugs/
+ * pool-mark-per-page-invariant-reloads.md: 16,102 insns/launch for the
+ * kernel family).  The loaded values are loop-invariant whenever nothing in
+ * the loop can write those field bytes, and the writes split into:
+ *
+ *  - a direct store at a provably different constant offset of the same base
+ *    (`p->count += 1` — range-disjoint), and
+ *  - element stores THROUGH a loaded pointer (`p->used[i>>5] |= ...`).
+ *
+ * The second kind is settled by C11 6.5p7, the same rule GCC/Clang lean on:
+ * a store whose lvalue type is a non-pointer scalar (`uint32_t`) can never
+ * legally modify an object of pointer type (`uint32_t *used`).  tcc_ir_put
+ * records that fact on the operands as IROP_AUX_ALIAS_PTR (reads of pointer
+ * objects, writes of non-pointer objects; union-member accesses and bitfields
+ * never carry it — punning between union members is legal).  A pointer-writing
+ * or unclassifiable store conservatively kills every candidate, as does any
+ * non-CONST call, memcpy/BLOCK_COPY, inline asm, or a post-increment access.
+ *
+ * Candidates come in the two shapes the rotated loop holds:
+ *  A. a standalone `T <- B [LOAD_INDEXED #imm]` (the address fusions produce
+ *     this from `ADD #imm` + deref) — the instruction is MOVED to the
+ *     preheader; and
+ *  B. a deref source operand of arithmetic (`T <- B***DEREF*** ADD idx`) —
+ *     a plain `T' <- B [LOAD]` is inserted in the preheader and the operand
+ *     is rewritten to T', after which ordinary LICM handles what remains.
+ *
+ * The base B must resolve through single in-loop defs (ASSIGN / ADD const) to
+ * a PARAM, an address-never-taken VAR, or any vreg the loop never redefines:
+ * its value is then fixed for the whole loop, and every candidate and write
+ * address is compared as (root vreg, constant offset, width).
+ * ==========================================================================*/
+
+#define FPH_MAX_PER_LOOP 4
+#define FPH_MAX_OCC 12
+
+typedef struct
+{
+  int idx;  /* instruction carrying the deref source */
+  int side; /* 0 = src1, 1 = src2 */
+} FPHOcc;
+
+typedef struct
+{
+  int32_t root;   /* canonical base vreg */
+  int64_t off;    /* constant byte offset from the root */
+  int width;      /* access width in bytes */
+  int form_a_idx; /* standalone LOAD_INDEXED to move, -1 when absent */
+  int32_t value;  /* vreg the hoisted value lands in */
+  IROperand src_op; /* Form B: the deref operand to re-load in the preheader */
+  FPHOcc occ[FPH_MAX_OCC];
+  int n_occ;
+  int alive;
+} FPHLoc;
+
+static int fph_trace(void)
+{
+  static int v = -1;
+  if (v < 0)
+    v = getenv("TCC_LICM_FPH_TRACE") != NULL;
+  return v;
+}
+
+#define FPH_LOG(...)                                                                                                 \
+  do                                                                                                                 \
+  {                                                                                                                  \
+    if (fph_trace())                                                                                                 \
+      fprintf(stderr, "[licm:fph] " __VA_ARGS__);                                                                   \
+  } while (0)
+
+/* Defs of `vr` inside the loop's certain range [start,end].  A store THROUGH
+ * vr is not a def OF vr. */
+static int fph_loop_def(TCCIRState *ir, IRLoop *loop, int32_t vr, int *def_idx)
+{
+  int n = 0;
+  *def_idx = -1;
+  for (int i = 0; i < loop->num_body_instrs; i++)
+  {
+    int idx = loop->body_instrs[i];
+    if (idx < loop->start_idx || idx > loop->end_idx)
+      continue;
+    IRQuadCompact *q = &ir->compact_instructions[idx];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    if (tcc_ir_op_dest_is_lval(ir, q))
+      continue;
+    if (tcc_ir_op_dest_vreg(ir, q) == vr)
+    {
+      *def_idx = idx;
+      if (++n > 1)
+        break;
+    }
+  }
+  return n;
+}
+
+/* Resolve an address vreg to (root, constant offset).  Root: a PARAM, a VAR
+ * whose address is never taken, or any vreg with no defs in the loop (its
+ * entry value is fixed for the run).  Chains through single in-loop ASSIGN
+ * and ADD/SUB-constant defs, depth-capped. */
+static int fph_strip_ex(TCCIRState *ir, IRLoop *loop, int32_t vr, int depth, int64_t acc, int32_t *root,
+                        int64_t *off)
+{
+  if (vr < 0 || depth < 0)
+    return 0;
+  int def_idx;
+  int n = fph_loop_def(ir, loop, vr, &def_idx);
+  if (n == 0)
+  {
+    int t = TCCIR_DECODE_VREG_TYPE(vr);
+    if (t == TCCIR_VREG_TYPE_PARAM || t == TCCIR_VREG_TYPE_TEMP ||
+        (t == TCCIR_VREG_TYPE_VAR && !vreg_addr_taken_anywhere(ir, vr)))
+    {
+      *root = vr;
+      *off = acc;
+      return 1;
+    }
+    return 0;
+  }
+  if (n > 1)
+    return 0;
+  IRQuadCompact *q = &ir->compact_instructions[def_idx];
+  if (q->op == TCCIR_OP_ASSIGN)
+  {
+    IROperand s = tcc_ir_op_get_src1(ir, q);
+    if (s.is_lval || irop_get_tag(s) != IROP_TAG_VREG || irop_get_vreg(s) < 0)
+      return 0;
+    return fph_strip_ex(ir, loop, irop_get_vreg(s), depth - 1, acc, root, off);
+  }
+  if (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
+  {
+    IROperand s1 = tcc_ir_op_get_src1(ir, q), s2 = tcc_ir_op_get_src2(ir, q);
+    int64_t delta;
+    int32_t base_vr;
+    if (irop_get_tag(s2) == IROP_TAG_IMM32 && !s2.is_sym && !s2.is_lval && irop_get_tag(s1) == IROP_TAG_VREG &&
+        !s1.is_lval)
+    {
+      delta = tcc_ir_op_src2_imm(ir, q);
+      base_vr = irop_get_vreg(s1);
+    }
+    else if (q->op == TCCIR_OP_ADD && irop_get_tag(s1) == IROP_TAG_IMM32 && !s1.is_sym && !s1.is_lval &&
+             irop_get_tag(s2) == IROP_TAG_VREG && !s2.is_lval)
+    {
+      delta = tcc_ir_op_src1_imm(ir, q);
+      base_vr = irop_get_vreg(s2);
+    }
+    else
+      return 0;
+    return fph_strip_ex(ir, loop, base_vr, depth - 1, acc + (q->op == TCCIR_OP_ADD ? delta : -delta), root, off);
+  }
+  return 0;
+}
+
+static void fph_kill_all(FPHLoc *locs, int nlocs, const char *why, int qidx)
+{
+  for (int c = 0; c < nlocs; c++)
+    if (locs[c].alive)
+    {
+      FPH_LOG("loop write at %d (%s) kills root=%d off=%lld\n", qidx, why, locs[c].root,
+              (long long)locs[c].off);
+      locs[c].alive = 0;
+    }
+}
+
+/* Apply one loop instruction's memory write to the candidate set. */
+static void fph_note_write(TCCIRState *ir, IRLoop *loop, int qidx, FPHLoc *locs, int nlocs)
+{
+  IRQuadCompact *q = &ir->compact_instructions[qidx];
+  int kill_all = 0;
+  IROperand w = IROP_NONE;
+  int have_w = 0, variable_off = 0;
+  const char *why = "unclassifiable";
+
+  if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+  {
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
+    if (callee && tcc_ir_get_func_purity(ir, callee) >= TCC_FUNC_PURITY_CONST)
+      return; /* CONST: writes nothing */
+    kill_all = 1;
+    why = "call";
+  }
+  else if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED)
+  {
+    w = tcc_ir_op_get_dest(ir, q); /* the deref lvalue / the base operand */
+    have_w = 1;
+    variable_off = (q->op == TCCIR_OP_STORE_INDEXED);
+  }
+  else if (ir_op_has(q->op, IR_HZ_MEM_WRITE | IR_HZ_ASM | IR_HZ_CHAIN | IR_HZ_NONLOCAL))
+  {
+    if (ir_op_has(q->op, IR_HZ_MEM_WRITE) && irop_config[q->op].has_dest && tcc_ir_op_dest_is_lval(ir, q))
+    {
+      w = tcc_ir_op_get_dest(ir, q); /* generic lval-destination write (RMW forms) */
+      have_w = 1;
+    }
+    else
+    {
+      /* STORE_POSTINC, BLOCK_COPY, CALLARG_STACK, INIT_CHAIN_SLOT, asm,
+       * a nested-function chain setup, setjmp/longjmp: a write this pass
+       * cannot place. */
+      kill_all = 1;
+      why = "memory hazard";
+    }
+  }
+  else
+  {
+    return; /* no memory write */
+  }
+
+  if (kill_all)
+  {
+    fph_kill_all(locs, nlocs, why, qidx);
+    return;
+  }
+  if (!have_w)
+    return;
+
+  /* A store of a non-pointer scalar object cannot legally modify a
+   * pointer-typed object (C11 6.5p7): the mark tcc_ir_put sets only when the
+   * frontend knew the lvalue's type. */
+  if (irop_access_alias_ptr(w))
+    return;
+
+  int32_t wr;
+  int64_t woff;
+  if (q->op == TCCIR_OP_STORE_INDEXED)
+  {
+    if (irop_get_tag(w) != IROP_TAG_VREG || w.is_lval || irop_get_vreg(w) < 0)
+    {
+      fph_kill_all(locs, nlocs, "unplaceable indexed store", qidx);
+      return;
+    }
+    wr = irop_get_vreg(w);
+  }
+  else
+  {
+    if (!w.is_lval || irop_get_tag(w) != IROP_TAG_VREG || irop_get_vreg(w) < 0)
+    {
+      fph_kill_all(locs, nlocs, "unplaceable store", qidx);
+      return;
+    }
+    wr = irop_get_vreg(w);
+  }
+  if (!fph_strip_ex(ir, loop, wr, 4, 0, &wr, &woff))
+  {
+    fph_kill_all(locs, nlocs, "unstrippable store base", qidx);
+    return;
+  }
+  int wwidth = variable_off ? -1 : ir_opt_store_btype_size_bytes(irop_get_btype(w));
+  for (int c = 0; c < nlocs; c++)
+  {
+    if (!locs[c].alive)
+      continue;
+    if (locs[c].root != wr)
+    {
+      /* Different roots may alias at runtime (two params, a param and a
+       * temp): a pointer-typed or unknown write through one can reach the
+       * other's struct. */
+      FPH_LOG("loop write at %d kills root=%d off=%lld (different root %d)\n", qidx, locs[c].root,
+              (long long)locs[c].off, wr);
+      locs[c].alive = 0;
+      continue;
+    }
+    if (variable_off)
+    {
+      locs[c].alive = 0; /* same root, unknown index — may reach any offset */
+      FPH_LOG("loop write at %d kills root=%d off=%lld (variable index)\n", qidx, locs[c].root,
+              (long long)locs[c].off);
+      continue;
+    }
+    if (locs[c].off < woff + wwidth && woff < locs[c].off + locs[c].width)
+    {
+      locs[c].alive = 0;
+      FPH_LOG("loop write at %d kills root=%d off=%lld (range)\n", qidx, locs[c].root, (long long)locs[c].off);
+    }
+  }
+}
+
+static int tcc_ir_hoist_invariant_field_ptr_loads(TCCIRState *ir, IRLoops *loops)
+{
+  int total = 0;
+  for (int li = 0; li < loops->num_loops; li++)
+  {
+    IRLoop *loop = &loops->loops[li];
+
+    /* Preheader-insertion safety: identical requirements to the global-load
+     * hoist above (and pure-call hoisting, docs/bugs.md #7) — a real
+     * fall-through preheader that is the header's immediate predecessor,
+     * not nested in another loop, no entry edge from outside bypassing it,
+     * and no VLA. */
+    if (loop->preheader_idx < 0 || loop->preheader_idx != loop->header_idx - 1)
+      continue;
+    int bad = 0;
+    for (int oi = 0; oi < loops->num_loops && !bad; oi++)
+    {
+      if (oi == li)
+        continue;
+      IRLoop *o = &loops->loops[oi];
+      if (loop->preheader_idx >= o->start_idx && loop->preheader_idx <= o->end_idx)
+        bad = 1;
+    }
+    for (int j = 0; j < ir->next_instruction_index && !bad; j++)
+    {
+      if (j >= loop->start_idx && j <= loop->end_idx)
+        continue;
+      IRQuadCompact *jq = &ir->compact_instructions[j];
+      if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF)
+      {
+        int jt = (int)tcc_ir_op_dest_imm(ir, jq);
+        if (jt >= loop->header_idx && jt <= loop->end_idx)
+          bad = 1;
+      }
+      else if (jq->op == TCCIR_OP_SWITCH_TABLE || jq->op == TCCIR_OP_IJUMP)
+      {
+        bad = 1;
+      }
+    }
+    if (bad || loop_contains_vla(ir, loop))
+      continue;
+
+    FPHLoc locs[FPH_MAX_PER_LOOP];
+    int nlocs = 0;
+
+    for (int bi = 0; bi < loop->num_body_instrs; bi++)
+    {
+      int idx = loop->body_instrs[bi];
+      if (idx < loop->start_idx || idx > loop->end_idx)
+        continue;
+      IRQuadCompact *q = &ir->compact_instructions[idx];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+
+      if (q->op == TCCIR_OP_LOAD_INDEXED)
+      {
+        /* Form A: standalone `T <- B [LOAD_INDEXED #imm]`. */
+        IROperand base = tcc_ir_op_get_src1(ir, q);
+        IROperand s2 = tcc_ir_op_get_src2(ir, q);
+        IROperand dest = tcc_ir_op_get_dest(ir, q);
+        if (irop_get_tag(s2) != IROP_TAG_IMM32 || s2.is_sym || s2.is_lval)
+          continue;
+        if (irop_get_tag(base) != IROP_TAG_VREG || base.is_lval || irop_get_vreg(base) < 0)
+          continue;
+        if (dest.is_lval || irop_get_tag(dest) != IROP_TAG_VREG || irop_get_vreg(dest) < 0)
+          continue;
+        if (!irop_access_alias_ptr(base) || tcc_ir_access_is_volatile(ir, base))
+          continue;
+        int32_t root;
+        int64_t off;
+        if (!fph_strip_ex(ir, loop, irop_get_vreg(base), 4, 0, &root, &off))
+          continue;
+        /* Moving the def requires it to be the vreg's only one. */
+        if (glh_single_def_of(ir, irop_get_vreg(dest)) != idx)
+          continue;
+        int found = -1;
+        for (int c = 0; c < nlocs; c++)
+          if (locs[c].root == root && locs[c].off == off + tcc_ir_op_src2_imm(ir, q))
+            found = c;
+        if (found < 0 && nlocs < FPH_MAX_PER_LOOP)
+        {
+          found = nlocs++;
+          memset(&locs[found], 0, sizeof(locs[found]));
+          locs[found].root = root;
+          locs[found].off = off + tcc_ir_op_src2_imm(ir, q);
+          locs[found].width = ir_opt_store_btype_size_bytes(irop_get_btype(dest));
+          locs[found].alive = 1;
+          locs[found].form_a_idx = -1;
+          locs[found].src_op = base;
+        }
+        if (found >= 0 && locs[found].form_a_idx < 0)
+        {
+          locs[found].form_a_idx = idx;
+          locs[found].value = irop_get_vreg(dest);
+          locs[found].src_op = base;
+        }
+      }
+      else if (glh_is_value_consumer(q->op))
+      {
+        /* Form B: a deref source operand consumed as a value. */
+        for (int side = 0; side < 2; side++)
+        {
+          if (side == 0 && !irop_config[q->op].has_src1)
+            continue;
+          if (side == 1 && !irop_config[q->op].has_src2)
+            continue;
+          IROperand s = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
+          if (irop_get_tag(s) != IROP_TAG_VREG || !s.is_lval || s.is_local || s.is_llocal || s.is_sym)
+            continue;
+          if (!irop_access_alias_ptr(s) || tcc_ir_access_is_volatile(ir, s))
+            continue;
+          int32_t root;
+          int64_t off;
+          if (!fph_strip_ex(ir, loop, irop_get_vreg(s), 4, 0, &root, &off))
+            continue;
+          int found = -1;
+          for (int c = 0; c < nlocs; c++)
+            if (locs[c].root == root && locs[c].off == off)
+              found = c;
+          if (found < 0 && nlocs < FPH_MAX_PER_LOOP)
+          {
+            found = nlocs++;
+            memset(&locs[found], 0, sizeof(locs[found]));
+            locs[found].root = root;
+            locs[found].off = off;
+            locs[found].width = ir_opt_store_btype_size_bytes(irop_get_btype(s));
+            locs[found].alive = 1;
+            locs[found].form_a_idx = -1;
+            locs[found].src_op = s;
+          }
+          if (found >= 0 && locs[found].n_occ < FPH_MAX_OCC)
+          {
+            locs[found].occ[locs[found].n_occ].idx = idx;
+            locs[found].occ[locs[found].n_occ].side = side;
+            locs[found].n_occ++;
+          }
+        }
+      }
+    }
+
+    int alive = 0;
+    for (int c = 0; c < nlocs; c++)
+      if (locs[c].alive)
+        alive++;
+    if (alive == 0)
+      continue;
+
+    /* Writes. */
+    for (int bi = 0; bi < loop->num_body_instrs; bi++)
+    {
+      int idx = loop->body_instrs[bi];
+      if (idx < loop->start_idx || idx > loop->end_idx)
+        continue;
+      fph_note_write(ir, loop, idx, locs, nlocs);
+    }
+    alive = 0;
+    for (int c = 0; c < nlocs; c++)
+      if (locs[c].alive)
+        alive++;
+    if (alive == 0)
+      continue;
+
+    /* Rewrite Form B sources while indices are stable, and assign temps. */
+    int rewrote = 0;
+    for (int c = 0; c < nlocs; c++)
+    {
+      if (!locs[c].alive)
+        continue;
+      if (locs[c].form_a_idx < 0)
+        locs[c].value = tcc_ir_vreg_alloc_temp(ir);
+      for (int o = 0; o < locs[c].n_occ; o++)
+      {
+        IRQuadCompact *q = &ir->compact_instructions[locs[c].occ[o].idx];
+        IROperand s = locs[c].occ[o].side ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
+        IROperand nv = irop_make_vreg(locs[c].value, irop_get_btype(s));
+        nv.is_unsigned = s.is_unsigned;
+        if (locs[c].occ[o].side)
+          tcc_ir_set_src2(ir, locs[c].occ[o].idx, nv);
+        else
+          tcc_ir_set_src1(ir, locs[c].occ[o].idx, nv);
+        rewrote++;
+      }
+    }
+    if (rewrote == 0 && alive == 0)
+      continue;
+
+    /* Emit into the preheader (insertion renumbers the header past the new
+     * instructions, so back edges re-enter below them — the loads run exactly
+     * once, on the fall-through entry path).  The load is addressed off the
+     * stripped ROOT: the chain vregs the strip walked through (e.g.
+     * `T16 <-- P1` inside the body) are defined per-iteration and must not be
+     * named before their def. */
+    int insert_at = loop->preheader_idx + 1;
+    int k = 0;
+    for (int c = 0; c < nlocs; c++)
+    {
+      if (!locs[c].alive)
+        continue;
+      IRQuadCompact lq = {0};
+      IROperand ldest = irop_make_vreg(locs[c].value, irop_get_btype(locs[c].src_op));
+      ldest.is_unsigned = locs[c].src_op.is_unsigned;
+      IROperand lbase = irop_make_vreg(locs[c].root, irop_get_btype(locs[c].src_op));
+      lbase.is_unsigned = locs[c].src_op.is_unsigned;
+      /* Same access, same marks: volatility/alias-class/alignment facts of
+       * the occurrence carry to the preheader load's base operand. */
+      irop_carry_access_marks(&lbase, locs[c].src_op);
+      IROperand index_imm = irop_make_imm32(0, (int32_t)locs[c].off, IROP_BTYPE_INT32);
+      IROperand scale_imm = irop_make_imm32(0, 0, IROP_BTYPE_INT32);
+      lq.op = TCCIR_OP_LOAD_INDEXED;
+      lq.operand_base = tcc_ir_pool_add(ir, ldest);
+      tcc_ir_pool_add(ir, lbase);
+      tcc_ir_pool_add(ir, index_imm);
+      tcc_ir_pool_add(ir, scale_imm);
+      if (locs[c].form_a_idx >= 0)
+      {
+        /* Keep the moved instruction's identity for the backend side
+         * tables keyed by orig_index. */
+        IRQuadCompact *o = &ir->compact_instructions[locs[c].form_a_idx];
+        lq.orig_index = o->orig_index;
+        lq.line_num = o->line_num;
+      }
+      tcc_ir_insert_instruction_before(ir, insert_at + k, &lq);
+      FPH_LOG("loop %d: hoisted field load (root=%d off=%lld form_a=%d) to preheader\n", li, locs[c].root,
+              (long long)locs[c].off, locs[c].form_a_idx);
+      k++;
+      total++;
+    }
+
+    /* NOP the Form A originals (all insertions happened at or before the
+     * header, so body positions shift by exactly k). */
+    for (int c = 0; c < nlocs; c++)
+    {
+      if (!locs[c].alive || locs[c].form_a_idx < 0)
+        continue;
+      int nop_pos = locs[c].form_a_idx + (locs[c].form_a_idx >= insert_at ? k : 0);
+      ir->compact_instructions[nop_pos].op = TCCIR_OP_NOP;
+      licm_move_jump_target_off_nop(ir, nop_pos);
+    }
+
+    glh_shift_after(loops, li, insert_at, k);
+  }
+  return total;
+}
+
+/* Invariant field-pointer hoist, run after ssa:licm_global_load on the
+ * rotated loops (the shape provider).  Disableable via
+ * TCC_DISABLE_PASS=licm_field_ptr. */
+int ssa_opt_licm_field_ptr_load(TCCIRState *ir)
+{
+  if (!ir || tcc_ir_opt_pass_disabled("licm_field_ptr"))
+    return 0;
+  IRLoops *loops = tcc_ir_detect_loops(ir);
+  if (!loops)
+    return 0;
+  int changed = 0;
+  if (loops->num_loops > 0)
+    changed = tcc_ir_hoist_invariant_field_ptr_loads(ir, loops);
+  tcc_ir_free_loops(loops);
+  return changed;
+}
+
+
 /* ── Speculative-hoist profitability ──
  * A hoist that does not dominate the loop's exits trades ONE loop-long live
  * value for the ops it removes, so a single-use invariant is normally declined.
@@ -1842,7 +2357,7 @@ static int licm_feeds_from_invariant_chain(TCCIRState *ir, IRCFG *cfg, const uin
       continue;
     if (oi == 1 && !irop_config[q->op].has_src2)
       continue;
-    s = (oi == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+    s = tcc_ir_op_get_src1_or_2(ir, q, oi != 0);
     v = irop_get_vreg(s);
     if (v < 0)
       continue;
@@ -1861,7 +2376,7 @@ static int licm_feeds_from_invariant_chain(TCCIRState *ir, IRCFG *cfg, const uin
         IRQuadCompact *dq = &ir->compact_instructions[ii];
         if (dq->op == TCCIR_OP_NOP || !irop_config[dq->op].has_dest)
           continue;
-        if (irop_get_vreg(tcc_ir_op_get_dest(ir, dq)) != v)
+        if (tcc_ir_op_dest_vreg(ir, dq) != v)
           continue;
         if (is_invariant[ii])
           return 1;
@@ -1911,6 +2426,111 @@ static int licm_op_is_speculatable(int op)
   }
 }
 
+/* A plain register operand: a vreg's own value, not memory named through it. */
+static int licm_is_plain_reg(IROperand o)
+{
+  return irop_get_tag(o) == IROP_TAG_VREG && irop_get_vreg(o) >= 0 && !o.is_lval && !o.is_local &&
+         !o.is_llocal && !o.is_sym && !o.is_complex;
+}
+
+/* licm_op_is_speculatable for an instruction: also `T <- P [LOAD]` off a plain
+ * register, which is how a narrow parameter's value is read (`u8 b` is
+ * re-extended from its register at every use) -- an extension, not an access. */
+static int licm_q_is_speculatable(TCCIRState *ir, IRQuadCompact *q)
+{
+  if (licm_op_is_speculatable(q->op))
+    return 1;
+  return q->op == TCCIR_OP_LOAD && licm_is_plain_reg(tcc_ir_op_get_dest(ir, q)) &&
+         licm_is_plain_reg(tcc_ir_op_get_src1(ir, q));
+}
+
+/* Q is the only instruction anywhere that names each of its register sources:
+ * hoisting it ends those sources at the preheader, so the loop holds Q's
+ * result instead of them and no register is added across the loop. */
+static int licm_sole_reader_of_sources(TCCIRState *ir, int idx)
+{
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  int nsrc = 0;
+  for (int side = 0; side < 2; side++) {
+    if (side == 0 ? !irop_config[q->op].has_src1 : !irop_config[q->op].has_src2)
+      continue;
+    IROperand s = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
+    if (irop_is_immediate(s) || irop_get_tag(s) == IROP_TAG_SYMREF)
+      continue;
+    if (!licm_is_plain_reg(s))
+      return 0;
+    int32_t vr = irop_get_vreg(s);
+    nsrc++;
+    for (int i = 0; i < ir->next_instruction_index; i++) {
+      if (i == idx)
+        continue;
+      IRQuadCompact *o = &ir->compact_instructions[i];
+      if (o->op == TCCIR_OP_NOP)
+        continue;
+      IROperand ops[4];
+      int n = 0;
+      if (irop_config[o->op].has_dest)
+        ops[n++] = tcc_ir_op_get_dest(ir, o);
+      if (irop_config[o->op].has_src1)
+        ops[n++] = tcc_ir_op_get_src1(ir, o);
+      if (irop_config[o->op].has_src2)
+        ops[n++] = tcc_ir_op_get_src2(ir, o);
+      if (ir_op_has(o->op, IROP_A_SLOT3) || tcc_ir_op_is_mac(o->op))
+        ops[n++] = ir->iroperand_pool[o->operand_base + 3];
+      for (int k = 0; k < n; k++)
+        if (irop_has_vreg(ops[k]) && !irop_is_immediate(ops[k]) && irop_get_vreg(ops[k]) == vr)
+          return 0;
+    }
+  }
+  return nsrc > 0;
+}
+
+static int licm_late_register_cost(TCCIRState *ir, int idx, int *register_cost)
+{
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  int32_t credited = -1;
+  int cost = 1;
+  if (!licm_is_plain_reg(dest) || irop_is_64bit(dest))
+    return 0;
+  for (int side = 0; side < 2; side++) {
+    if (side == 0 ? !irop_config[q->op].has_src1 : !irop_config[q->op].has_src2)
+      continue;
+    IROperand src = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
+    if (irop_is_immediate(src))
+      continue;
+    if (!licm_is_plain_reg(src) || irop_is_64bit(src))
+      return 0;
+    int32_t vr = irop_get_vreg(src);
+    if (vr == credited)
+      continue;
+    int other_use = 0;
+    for (int i = 0; i < ir->next_instruction_index && !other_use; i++) {
+      IRQuadCompact *oq = &ir->compact_instructions[i];
+      if (i == idx || oq->op == TCCIR_OP_NOP)
+        continue;
+      IROperand ops[4];
+      int n = licm_quad_operands(ir, i, ops);
+      if (ir_op_has(oq->op, IROP_A_SLOT3) && n < 4)
+        ops[n++] = ir->iroperand_pool[oq->operand_base + 3];
+      for (int k = 0; k < n; k++) {
+        // A pure register definition does not keep its incoming value live.
+        if (k == 0 && irop_config[oq->op].has_dest &&
+            licm_q_is_speculatable(ir, oq) && licm_is_plain_reg(ops[k]))
+          continue;
+        if (irop_has_vreg(ops[k]) && !irop_is_immediate(ops[k]) && irop_get_vreg(ops[k]) == vr)
+          other_use = 1;
+      }
+    }
+    if (!other_use) {
+      cost--;
+      credited = vr;
+    }
+  }
+  *register_cost = cost;
+  return 1;
+}
+
 /* ============================================================================
  * Main Entry Point
  * ============================================================================ */
@@ -1933,8 +2553,7 @@ int ssa_opt_licm(TCCIRState *ir)
   return changed;
 }
 
-/* Timed at its production call site (ssa:licm in tcc_ir_ssa_regalloc). */
-IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
+static IRLoops *licm_run(TCCIRState *ir, int late)
 {
   if (!ir)
     return NULL;
@@ -1950,46 +2569,16 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
     return NULL;
   }
 
-  /* Step 2: Hoist pure function calls FIRST (FUNCTION_CALLS_OPTIMIZATION_PLAN Phase 1)
-   *
-   * Pure function hoisting is done before general LICM so that pure calls
-   * inside loops can be hoisted even if the loop contains other non-pure calls
-   * that would normally block LICM.
-   *
-   * Note: Loops containing VLA_ALLOC instructions are automatically skipped
-   * because VLAs have special stack semantics - the size computation must
-   * happen at the VLA allocation point, not in the preheader.
-   */
-  /* Pure/const call hoisting — RE-ENABLED (docs/bugs.md #7, fixed 2026-07-02).
-   * Four defects were fixed to make this safe:
-   *   1. Multi-loop index fix-up now shifts later loops by per-loop insertion
-   *      counts, not the cumulative total (which over-shifted a 3rd+ loop).
-   *   2. Transitive-invariance CHAINING (a call whose arg is another just-
-   *      hoisted call's result) is not attempted — a single non-chaining pass;
-   *      that path copied a FUNCPARAMVAL referencing a body-only vreg and
-   *      ordered the dependent call before its producer.
-   *   3. The copied CALL / param markers are laid out per each op's irop_config
-   *      (FUNCCALLVOID has no dest; FUNCPARAMVOID has no src1) — the old code
-   *      always emitted a dest+src1, misdecoding a void call's call_id.
-   *   4. collect_call_params gathers FUNCPARAMVOID markers too, so a call's
-   *      end-of-args marker travels with it.
-   *   5. A merely-PURE (memory-reading) call is hoisted only when the loop
-   *      cannot modify the memory it reads (PR20100); CONST calls always may.
-   * Change is signalled to the pipeline via num_loops > 0 (see tcc_ir_opt_licm),
-   * same as the dominance-based LICM below. */
-  int hoisted_calls = tcc_ir_hoist_pure_calls(ir, loops);
   int hoisted = 0;
-  (void)hoisted_calls;
-
-  /* Loop-invariant global-load hoisting runs on the fresh loop structure (same
-   * preheader shape the pure-call hoist relies on); re-detect if it changed the
-   * IR so the dom-LICM phase below sees valid indices. */
-  if (tcc_ir_hoist_invariant_global_loads(ir, loops) > 0) {
-    tcc_ir_free_loops(loops);
-    loops = tcc_ir_detect_loops(ir);
-    if (!loops || loops->num_loops == 0) {
+  if (!late) {
+    tcc_ir_hoist_pure_calls(ir, loops);
+    if (tcc_ir_hoist_invariant_global_loads(ir, loops) > 0) {
       tcc_ir_free_loops(loops);
-      return NULL;
+      loops = tcc_ir_detect_loops(ir);
+      if (!loops || loops->num_loops == 0) {
+        tcc_ir_free_loops(loops);
+        return NULL;
+      }
     }
   }
 
@@ -2059,7 +2648,20 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
            * value is undefined on the first iteration). */
           if (preheader >= 0 && !tcc_ir_cfg_dominates(cfg, preheader, h))
             preheader = -1;
-          if (preheader < 0) {
+          /* A loop whose header is the function's first block (`while (n--)`
+           * opening a body) has no predecessor outside the loop at all: the
+           * function entry is its preheader.  Code inserted at instruction 0
+           * runs once on entry, and the back edges -- the only other way in --
+           * are renumbered past it, as for any insertion at a header start. */
+          int entry_header = 0;
+          if (preheader < 0 && cfg->blocks[h].start_idx == 0) {
+            int outside_pred = 0;
+            for (int pi = 0; pi < cfg->blocks[h].num_preds; pi++)
+              if (cfg->blocks[h].preds[pi] >= 0 && !in_loop[cfg->blocks[h].preds[pi]])
+                outside_pred = 1;
+            entry_header = !outside_pred;
+          }
+          if (preheader < 0 && !entry_header) {
             tcc_free(in_loop);
             tcc_free(worklist);
             continue;
@@ -2076,7 +2678,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               IRQuadCompact *q = &ir->compact_instructions[ii];
               if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
                 continue;
-              int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+              int32_t vr = tcc_ir_op_dest_vreg(ir, q);
               if (vr >= 0) {
                 int pos = TCCIR_DECODE_VREG_POSITION(vr);
                 if (pos > max_vr)
@@ -2089,6 +2691,11 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
           /* Per-vreg use count within the loop body — a profitability signal for
            * hoists that don't dominate the loop's exits (see the safety check). */
           int *use_count = tcc_mallocz(4 * dc_stride * sizeof(int));
+          /* First def of each vreg in the loop, in block order: the invariance
+           * fixpoint below asks for it per operand per round. */
+          int *def_at = tcc_malloc(4 * dc_stride * sizeof(int));
+          for (int k = 0; k < 4 * dc_stride; k++)
+            def_at[k] = -1;
           for (int bi = 0; bi < cfg->num_blocks; bi++) {
             if (!in_loop[bi])
               continue;
@@ -2097,18 +2704,21 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               if (q->op == TCCIR_OP_NOP)
                 continue;
               if (irop_config[q->op].has_dest) {
-                int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+                int32_t vr = tcc_ir_op_dest_vreg(ir, q);
                 if (vr >= 0) {
                   int pos = TCCIR_DECODE_VREG_POSITION(vr);
                   int typ = TCCIR_DECODE_VREG_TYPE(vr);
-                  if (pos <= max_vr)
+                  if (pos <= max_vr) {
                     def_count[typ * dc_stride + pos]++;
+                    if (def_at[typ * dc_stride + pos] < 0)
+                      def_at[typ * dc_stride + pos] = ii;
+                  }
                 }
               }
               for (int side = 0; side < 2; side++) {
                 if (side == 0 && !irop_config[q->op].has_src1) continue;
                 if (side == 1 && !irop_config[q->op].has_src2) continue;
-                IROperand s = side == 0 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+                IROperand s = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
                 int32_t vr = irop_get_vreg(s);
                 if (vr >= 0) {
                   int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -2143,25 +2753,23 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                 IRQuadCompact *q = &ir->compact_instructions[ii];
                 if (q->op == TCCIR_OP_NOP)
                   continue;
-                /* Only hoist side-effect-free arithmetic/assign */
-                switch (q->op) {
-                case TCCIR_OP_ADD: case TCCIR_OP_SUB: case TCCIR_OP_MUL:
-                case TCCIR_OP_AND: case TCCIR_OP_OR: case TCCIR_OP_XOR:
-                case TCCIR_OP_SHL: case TCCIR_OP_SHR: case TCCIR_OP_SAR: case TCCIR_OP_ROR:
-                case TCCIR_OP_ASSIGN: case TCCIR_OP_LEA:
-                  break;
-                default:
+                /* Only hoist side-effect-free arithmetic/assign, and the
+                 * register-source LOAD that extends a narrow parameter */
+                if (!licm_q_is_speculatable(ir, q))
                   continue;
-                }
                 /* Dest must have single def in loop AND must not be
                  * defined outside the loop.  If the vreg carries a value
                  * INTO the loop (live at entry), hoisting clobbers it. */
                 if (irop_config[q->op].has_dest) {
-                  int32_t dvr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+                  int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
                   if (dvr >= 0) {
                     int dp = TCCIR_DECODE_VREG_POSITION(dvr);
                     int dt = TCCIR_DECODE_VREG_TYPE(dvr);
                     if (dp <= max_vr && def_count[dt * dc_stride + dp] > 1)
+                      continue;
+                    /* A PARAM has no defining instruction: its incoming argument
+                     * is live into the loop, and no outside def shows that. */
+                    if (dt == TCCIR_VREG_TYPE_PARAM)
                       continue;
                     /* Check if vreg is also defined outside the loop */
                     int outside_def = 0;
@@ -2177,7 +2785,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                         IRQuadCompact *oq = &ir->compact_instructions[oi2];
                         if (oq->op == TCCIR_OP_NOP || !irop_config[oq->op].has_dest)
                           continue;
-                        if (irop_get_vreg(tcc_ir_op_get_dest(ir, oq)) == dvr) {
+                        if (tcc_ir_op_dest_vreg(ir, oq) == dvr) {
                           outside_def = 1;
                           break;
                         }
@@ -2210,7 +2818,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                     IROperand s;
                     if (oi == 0 && !irop_config[q->op].has_src1) continue;
                     if (oi == 1 && !irop_config[q->op].has_src2) continue;
-                    s = (oi == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+                    s = tcc_ir_op_get_src1_or_2(ir, q, oi != 0);
                     if (!(s.is_lval || irop_op_is_lval(s))) continue;
                     if (licm_is_direct_slot_read(s) &&
                         licm_slot_read_is_invariant(ir, cfg, in_loop, s, &slot_ctx))
@@ -2228,7 +2836,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                     continue;
                   if (oi == 1 && !irop_config[q->op].has_src2)
                     continue;
-                  IROperand op = (oi == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+                  IROperand op = tcc_ir_op_get_src1_or_2(ir, q, oi != 0);
                   int tag = irop_get_tag(op);
                   if (tag == IROP_TAG_IMM32 || tag == IROP_TAG_I64 ||
                       tag == IROP_TAG_F32 || tag == IROP_TAG_F64 ||
@@ -2249,7 +2857,10 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                     /* Defined in loop — only invariant if single-def and that def is invariant */
                     if (def_count[vt * dc_stride + vp] == 1) {
                       /* Find the def instruction */
-                      int found_inv = 0;
+                      int found_inv = 0, da = def_at[vt * dc_stride + vp];
+                      if (da >= 0 && tcc_ir_op_dest_vreg(ir, &ir->compact_instructions[da]) == vr)
+                        found_inv = is_invariant[da];
+                      else
                       for (int bi2 = 0; bi2 < cfg->num_blocks && !found_inv; bi2++) {
                         if (!in_loop[bi2])
                           continue;
@@ -2257,7 +2868,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                           IRQuadCompact *dq = &ir->compact_instructions[jj];
                           if (!irop_config[dq->op].has_dest)
                             continue;
-                          if (irop_get_vreg(tcc_ir_op_get_dest(ir, dq)) == vr) {
+                          if (tcc_ir_op_dest_vreg(ir, dq) == vr) {
                             found_inv = is_invariant[jj];
                             break;
                           }
@@ -2270,7 +2881,15 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                       all_inv = 0;
                     }
                   }
-                  /* else: not defined in loop → invariant (defined outside) */
+                  /* Not defined in the loop: invariant -- unless the variable
+                   * can change without a def this scan sees.  A local captured
+                   * by a nested function called in the loop is written through
+                   * the static chain (`-u5 & u6` was hoisted while the loop's
+                   * call to the nested writer of u5 ran every iteration). */
+                  else if ((vt == TCCIR_VREG_TYPE_VAR || vt == TCCIR_VREG_TYPE_PARAM) &&
+                           licm_addr_taken(ir, &addr_taken, vr) && cfg_loop_may_clobber_memory(ir, cfg, in_loop)) {
+                    all_inv = 0;
+                  }
                 }
                 if (all_inv) {
                   is_invariant[ii] = 1;
@@ -2302,9 +2921,9 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
           LOG_LICM("dom-LICM: natural loop header=blk%d latch=blk%d preheader=blk%d", h, b, preheader);
 
           /* Hoist invariant instructions to preheader */
-          int insert_pos = cfg->blocks[preheader].end_idx;
+          int insert_pos = entry_header ? 0 : cfg->blocks[preheader].end_idx;
           /* If preheader ends with a jump, insert before it */
-          if (insert_pos > cfg->blocks[preheader].start_idx) {
+          if (!entry_header && insert_pos > cfg->blocks[preheader].start_idx) {
             int lop = ir->compact_instructions[insert_pos - 1].op;
             if (lop == TCCIR_OP_JUMP || lop == TCCIR_OP_JUMPIF)
               insert_pos--;
@@ -2327,6 +2946,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               tcc_free(is_exit);
               tcc_free(def_count);
               tcc_free(use_count);
+              tcc_free(def_at);
               tcc_free(in_loop);
               tcc_free(worklist);
               continue;
@@ -2351,7 +2971,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               IRQuadCompact *jq = &ir->compact_instructions[j];
               if (jq->op != TCCIR_OP_JUMP && jq->op != TCCIR_OP_JUMPIF)
                 continue;
-              if ((int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq)) == insert_pos)
+              if ((int)tcc_ir_op_dest_imm(ir, jq) == insert_pos)
                 insert_targeted = 1;
             }
             if (insert_targeted) {
@@ -2360,6 +2980,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               tcc_free(is_exit);
               tcc_free(def_count);
               tcc_free(use_count);
+              tcc_free(def_at);
               tcc_free(in_loop);
               tcc_free(worklist);
               continue;
@@ -2379,7 +3000,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               int32_t cdv;
               if (!is_invariant[ii] || cq->op == TCCIR_OP_NOP)
                 continue;
-              cdv = irop_config[cq->op].has_dest ? irop_get_vreg(tcc_ir_op_get_dest(ir, cq)) : -1;
+              cdv = irop_config[cq->op].has_dest ? tcc_ir_op_dest_vreg(ir, cq) : -1;
               if (licm_all_uses_invariant(ir, cfg, in_loop, is_invariant, ii, cdv) ||
                   licm_feeds_from_invariant_chain(ir, cfg, in_loop, is_invariant, def_count,
                                                   use_count, dc_stride, max_vr, ii))
@@ -2393,6 +3014,21 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
           int max_hoist = tcc_ir_estimate_hoist_budget(ir, loop_start_idx, loop_end_idx, ir->parameters_count);
 
           int total_hoisted_here = 0;
+          int register_cost = 0;
+          int has_call = 0;
+          if (late) {
+            for (int bi = 0; bi < cfg->num_blocks; bi++) {
+              if (!in_loop[bi])
+                continue;
+              for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
+                IRQuadCompact *q = &ir->compact_instructions[ii];
+                if (ir_op_has(q->op, IR_HZ_CALL | IR_HZ_ASM | IR_HZ_NONLOCAL | IROP_A_FP) ||
+                    (q->op == TCCIR_OP_BLOCK_COPY &&
+                     (int)tcc_ir_op_src2_imm(ir, q) >= TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES))
+                  has_call = 1;
+              }
+            }
+          }
           int body_shift = 0;
           /* Dests actually emitted to the preheader.  is_invariant marks a
            * whole chain, but the gates below (speculation profitability, the
@@ -2401,7 +3037,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
            * computes the use before its def ever ran (fuzz seed
            * struct_byval:76, test 388). */
           uint8_t *hoisted_dest = tcc_mallocz((size_t)4 * dc_stride);
-          for (int bi = 0; bi < cfg->num_blocks && total_hoisted_here < max_hoist; bi++) {
+          for (int bi = 0; bi < cfg->num_blocks && (late || total_hoisted_here < max_hoist); bi++) {
             if (!in_loop[bi])
               continue;
             for (int ii = cfg->blocks[bi].start_idx; ii < cfg->blocks[bi].end_idx; ii++) {
@@ -2414,8 +3050,12 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               if (q->op == TCCIR_OP_NOP)
                 continue;
 
-              if (total_hoisted_here >= max_hoist)
+              if (!late && total_hoisted_here >= max_hoist)
                 break;
+              int cost = 1;
+              if (late && (!licm_late_register_cost(ir, adj_ii, &cost) ||
+                           (cost > 0 && (has_call || register_cost + cost > max_hoist))))
+                continue;
 
               /* Safety: a trapping / side-effecting instruction may only be
                * hoisted if its block dominates all loop exits (so it certainly
@@ -2436,10 +3076,9 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                  * hoisted into a pressured loop just spills, costing more than
                  * the one op it saved — unless it is part of an invariant CHAIN
                  * that leaves as a unit for that same one register (chain_ok). */
-                if (!licm_op_is_speculatable(q->op))
+                if (!licm_q_is_speculatable(ir, q))
                   continue;
-                IROperand hd = tcc_ir_op_get_dest(ir, q);
-                int32_t hvr = irop_get_vreg(hd);
+                int32_t hvr = tcc_ir_op_dest_vreg(ir, q);
                 int hu = 0;
                 if (hvr >= 0) {
                   int hp = TCCIR_DECODE_VREG_POSITION(hvr);
@@ -2447,7 +3086,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                   if (hp <= max_vr)
                     hu = use_count[ht * dc_stride + hp];
                 }
-                if (hu < 2 && !chain_ok[ii])
+                if (!(late && cost <= 0) && hu < 2 && !chain_ok[ii] && !licm_sole_reader_of_sources(ir, adj_ii))
                   continue;
               }
 
@@ -2460,8 +3099,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
                     continue;
                   if (oi == 1 && !irop_config[q->op].has_src2)
                     continue;
-                  IROperand sop = (oi == 0) ? tcc_ir_op_get_src1(ir, q)
-                                            : tcc_ir_op_get_src2(ir, q);
+                  IROperand sop = tcc_ir_op_get_src1_or_2(ir, q, oi != 0);
                   int32_t svr = irop_get_vreg(sop);
                   if (svr < 0)
                     continue;
@@ -2497,6 +3135,9 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
               int adj_insert = insert_pos + total_hoisted_here;
               tcc_ir_insert_instruction_before(ir, adj_insert, &hoist_q);
               total_hoisted_here++;
+              register_cost += cost;
+              if (register_cost < 0)
+                register_cost = 0;
 
               /* NOP out the original.  tcc_ir_insert_instruction_before shifts
                * all instructions at indices >= adj_insert.  If adj_insert
@@ -2545,6 +3186,7 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
           tcc_free(is_exit);
           tcc_free(def_count);
           tcc_free(use_count);
+          tcc_free(def_at);
           tcc_free(in_loop);
           tcc_free(worklist);
         }
@@ -2561,4 +3203,19 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
   }
 
   return loops;
+}
+
+IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir)
+{
+  return licm_run(ir, 0);
+}
+
+int ssa_opt_licm_late(TCCIRState *ir)
+{
+  if (!ir)
+    return 0;
+  int before = ir->next_instruction_index;
+  IRLoops *loops = licm_run(ir, 1);
+  tcc_ir_free_loops(loops);
+  return ir->next_instruction_index - before;
 }

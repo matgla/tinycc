@@ -11,6 +11,7 @@
 
 #define USING_GLOBALS
 #include "ir.h"
+#include "opt_range.h"
 #include "regalloc.h"
 
 /* A 32x32->64 product plus one or two zero-extended words,
@@ -92,8 +93,7 @@ static int umaal_value_stable(TCCIRState *ir, IROperand v, int from, int to)
       continue;
     if (vr >= 0 && k < to && irop_config[q->op].has_dest)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!d.is_lval && irop_has_vreg(d) && irop_get_vreg(d) == vr)
+      if (!tcc_ir_op_dest_is_lval(ir, q) && tcc_ir_op_dest_has_vreg(ir, q) && tcc_ir_op_dest_vreg(ir, q) == vr)
         return 0;
     }
   }
@@ -103,29 +103,21 @@ static int umaal_value_stable(TCCIRState *ir, IROperand v, int from, int to)
 /* No control flow in [from, to): a jump ends the straight-line run. */
 static int umaal_straight(TCCIRState *ir, int from, int to)
 {
-  for (int k = from; k < to; k++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[k];
-    if (k > from && q->is_jump_target)
-      return 0;
-    switch (q->op)
-    {
-    case TCCIR_OP_JUMP:
-    case TCCIR_OP_JUMPIF:
-    case TCCIR_OP_IJUMP:
-    case TCCIR_OP_SWITCH_TABLE:
-    case TCCIR_OP_RETURNVALUE:
-    case TCCIR_OP_RETURNVOID:
-    case TCCIR_OP_SETJMP:
-    case TCCIR_OP_NL_SETJMP:
-    case TCCIR_OP_LONGJMP:
-    case TCCIR_OP_NL_LONGJMP:
-      return 0;
-    default:
-      break;
-    }
-  }
-  return !ir->compact_instructions[to].is_jump_target || to == from;
+  /* Control flow only, `from` itself included: a join after it, at `to` too. */
+  const uint32_t not_control = IR_HZ_CALL | IR_HZ_CALL_PARAM | IR_HZ_CALL_SEQ | IR_HZ_MEM_READ | IR_HZ_MEM_WRITE |
+                               IR_HZ_UPDATES_SRC | IR_HZ_VLA | IR_HZ_CHAIN | IR_HZ_HINT | IR_HZ_FLAGS_SET |
+                               IR_HZ_FLAGS_READ | IR_HZ_VOLATILE | IR_HZ_DEST_LVAL | IR_HZ_DEST_STACKOFF |
+                               IR_HZ_SRC_LVAL;
+  const uint32_t mask = IR_HZ_ALL & ~(not_control | IR_LEGACY_GAP_HZ(IR_HZ_TRAP | IR_HZ_ASM));
+  const IROpSet gaps =
+      IR_LEGACY_GAP_OPS(TCCIR_OP_BUILTIN_APPLY_ARGS, TCCIR_OP_BUILTIN_APPLY, TCCIR_OP_BUILTIN_RETURN);
+  if (to == from)
+    return 1;
+  if (to < from)
+    return !ir->compact_instructions[to].is_jump_target; /* IR_LEGACY_GAP: an inverted range */
+  if (ir_q_hazards_except(ir, &ir->compact_instructions[from], mask & IR_HZ_FROM_OP, gaps))
+    return 0;
+  return ir_range_safe_except(ir, from, to, mask, gaps);
 }
 
 static int umaal_is_add64(TCCIRState *ir, int i)
@@ -133,11 +125,8 @@ static int umaal_is_add64(TCCIRState *ir, int i)
   IRQuadCompact *q = &ir->compact_instructions[i];
   if (q->op != TCCIR_OP_ADD || tcc_ir_barrel_shift_at(ir, q))
     return 0;
-  IROperand d = tcc_ir_op_get_dest(ir, q);
-  IROperand s1 = tcc_ir_op_get_src1(ir, q);
-  IROperand s2 = tcc_ir_op_get_src2(ir, q);
-  return !d.is_lval && irop_get_btype(d) == IROP_BTYPE_INT64 && irop_get_btype(s1) == IROP_BTYPE_INT64 &&
-         irop_get_btype(s2) == IROP_BTYPE_INT64;
+  return !tcc_ir_op_dest_is_lval(ir, q) && tcc_ir_op_dest_btype(ir, q) == IROP_BTYPE_INT64 && tcc_ir_op_src1_btype(ir, q) == IROP_BTYPE_INT64 &&
+         tcc_ir_op_src2_btype(ir, q) == IROP_BTYPE_INT64;
 }
 
 /* `idx` is `ZEXT c` from a 32-bit c into a 64-bit TEMP. */
@@ -146,10 +135,9 @@ static int umaal_is_zext32(TCCIRState *ir, int idx)
   IRQuadCompact *q = &ir->compact_instructions[idx];
   if (q->op != TCCIR_OP_ZEXT)
     return 0;
-  IROperand d = tcc_ir_op_get_dest(ir, q);
   IROperand s = tcc_ir_op_get_src1(ir, q);
   /* Exactly a word: a narrower source's register is not known to be clean. */
-  return irop_get_btype(d) == IROP_BTYPE_INT64 && irop_get_btype(s) == IROP_BTYPE_INT32 && !s.is_lval;
+  return tcc_ir_op_dest_btype(ir, q) == IROP_BTYPE_INT64 && irop_get_btype(s) == IROP_BTYPE_INT32 && !s.is_lval;
 }
 
 static int umaal_is_umull(TCCIRState *ir, int idx)
@@ -157,9 +145,8 @@ static int umaal_is_umull(TCCIRState *ir, int idx)
   IRQuadCompact *q = &ir->compact_instructions[idx];
   if (q->op != TCCIR_OP_UMULL || tcc_ir_barrel_shift_at(ir, q))
     return 0;
-  IROperand s1 = tcc_ir_op_get_src1(ir, q);
   IROperand s2 = tcc_ir_op_get_src2(ir, q);
-  return !s1.is_lval && !s2.is_lval;
+  return !tcc_ir_op_src1_is_lval(ir, q) && !s2.is_lval;
 }
 
 /* Split ADD i into (umull, zext): the index of each, or -1. */
@@ -198,9 +185,8 @@ static IROperand umaal_through_trunc(UmaalCtx *c, IROperand op, int use, int rea
   IRQuadCompact *q = &ir->compact_instructions[d];
   if (q->op != TCCIR_OP_ASSIGN || tcc_ir_barrel_shift_at(ir, q))
     return op;
-  IROperand dst = tcc_ir_op_get_dest(ir, q);
   IROperand src = tcc_ir_op_get_src1(ir, q);
-  if (irop_get_btype(dst) != IROP_BTYPE_INT32 || irop_get_btype(src) != IROP_BTYPE_INT64 || src.is_lval ||
+  if (tcc_ir_op_dest_btype(ir, q) != IROP_BTYPE_INT32 || irop_get_btype(src) != IROP_BTYPE_INT64 || src.is_lval ||
       !irop_has_vreg(src) || irop_get_vreg(src) < 0 || src.is_complex)
     return op;
   if (!umaal_value_stable(ir, src, d, read_at))

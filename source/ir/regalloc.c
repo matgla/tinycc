@@ -80,13 +80,13 @@ int *ra_build_call_prefix(TCCIRState *ir)
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     TccIrOp op = q->op;
-    int is_call = (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL ||
-                   op == TCCIR_OP_BUILTIN_APPLY || ir_op_is_implicit_call_ra(op));
+    int is_call = ((op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL) && !tcc_ir_call_clobbers_nothing(ir, q)) ||
+                  op == TCCIR_OP_BUILTIN_APPLY || ir_op_is_implicit_call_ra(op);
     /* A large BLOCK_COPY lowers to a memcpy() call in the backend, clobbering
      * the caller-saved registers.  The (small) lowering saves/restores
      * everything it touches, so only the memcpy-sized copies count as calls. */
     if (!is_call && op == TCCIR_OP_BLOCK_COPY) {
-      int bc_size = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      int bc_size = (int)tcc_ir_op_src2_imm(ir, q);
       if (bc_size >= TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES)
         is_call = 1;
     }
@@ -110,9 +110,10 @@ static int *ra_build_real_call_prefix(TCCIRState *ir)
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     TccIrOp op = q->op;
-    int is_call = (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_BUILTIN_APPLY);
+    int is_call = ((op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL) && !tcc_ir_call_clobbers_nothing(ir, q)) ||
+                  op == TCCIR_OP_BUILTIN_APPLY;
     if (!is_call && op == TCCIR_OP_BLOCK_COPY) {
-      int bc_size = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      int bc_size = (int)tcc_ir_op_src2_imm(ir, q);
       if (bc_size >= TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES)
         is_call = 1;
     }
@@ -140,7 +141,13 @@ static int ra_has_call_in_range(const int *prefix, int start, int end, int n)
 static int *ra_build_switch_prefix(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
-  if (n <= 0)
+  /* No dispatch, no table: a NULL prefix answers "none in range" (see
+   * ra_has_switch_in_range), and saves n+1 ints in the common case. */
+  int any = 0;
+  for (int i = 0; i < n && !any; i++)
+    any = ir->compact_instructions[i].op == TCCIR_OP_SWITCH_TABLE ||
+          ir->compact_instructions[i].op == TCCIR_OP_SWITCH_LOAD;
+  if (!any)
     return NULL;
   int *prefix = tcc_malloc(sizeof(int) * (n + 1));
   prefix[0] = 0;
@@ -179,7 +186,11 @@ static int ra_has_switch_in_range(const int *prefix, int start, int end, int n)
 static int *ra_build_asm_prefix(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
-  if (n <= 0)
+  /* As ra_build_switch_prefix: NULL when the function has no asm. */
+  int any = 0;
+  for (int i = 0; i < n && !any; i++)
+    any = ir->compact_instructions[i].op == TCCIR_OP_INLINE_ASM;
+  if (!any)
     return NULL;
   int *prefix = tcc_malloc(sizeof(int) * (n + 1));
   prefix[0] = 0;
@@ -215,10 +226,11 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   int *asm_prefix = ra_build_asm_prefix(ir);
   int *real_call_prefix = ra_build_real_call_prefix(ir);
 
-  /* Allocate per-vreg start/end tracking indexed by encoded vreg.
-   * Use flat arrays indexed by (type * max_pos + position). */
-  int table_size = 4 * max_vreg_pos;
-  if (table_size <= 0) table_size = 1;
+  /* Allocate per-vreg start/end tracking indexed by encoded vreg, in the
+   * dense VAR/TEMP/PARAM layout of RaVregIdx. */
+  RaVregIdx vx;
+  ra_vidx_init(&vx, local_count, temp_count, param_count);
+  int table_size = vx.size;
   uint32_t *starts = tcc_malloc(sizeof(uint32_t) * table_size);
   uint32_t *ends = tcc_malloc(sizeof(uint32_t) * table_size);
   uint16_t *uses = tcc_mallocz(sizeof(uint16_t) * table_size);
@@ -227,23 +239,41 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     ends[i] = 0;
   }
 
-  #define VREG_IDX(vr) ((TCCIR_DECODE_VREG_TYPE(vr) * max_vreg_pos) + TCCIR_DECODE_VREG_POSITION(vr))
+  #define VREG_IDX(vr) ra_vidx(&vx, (vr))
 
-  /* Build per-instruction loop depth map for spill-cost weighting.
-   * Uses at deeper loop nesting get exponentially higher weight so the
-   * allocator prefers spilling values that live in shallow code. */
+  /* Conditional loop blocks get one quarter of the latch-path weight; see docs/ra_branch_cost.md. */
   uint8_t *instr_depth = tcc_mallocz(n);
-  if (tcc_state->optimize > 0) {
+  if (TCC_OPT(tcc_state, optimize) > 0) {
     IRLoops *loops = tcc_ir_detect_loops(ir);
     if (loops) {
+      IRCFG *rebuilt = NULL;
+      IRCFG *cost_cfg = cfg;
+      int branch_cost = !tcc_ir_opt_pass_disabled("ra:branch_cost");
+      if (loops->num_loops && branch_cost && cfg->num_instrs != n) {
+        rebuilt = tcc_ir_cfg_build(ir);
+        tcc_ir_cfg_compute_dominators(rebuilt);
+        cost_cfg = rebuilt;
+      }
       for (int li = 0; li < loops->num_loops; li++) {
         IRLoop *lp = &loops->loops[li];
+        int latch = -1, discount = 0;
+        if (branch_cost && cost_cfg->dom_tin) {
+          int header = cost_cfg->instr_to_block[lp->header_idx];
+          latch = cost_cfg->instr_to_block[lp->end_idx];
+          discount = tcc_ir_cfg_dominates(cost_cfg, header, latch);
+        }
         for (int bi = 0; bi < lp->num_body_instrs; bi++) {
           int idx = lp->body_instrs[bi];
-          if (idx >= 0 && idx < n && lp->depth > instr_depth[idx])
-            instr_depth[idx] = (uint8_t)lp->depth;
+          if (idx >= 0 && idx < n) {
+            int depth = lp->depth;
+            if (discount && !tcc_ir_cfg_dominates(cost_cfg, cost_cfg->instr_to_block[idx], latch))
+              depth--;
+            if (depth > instr_depth[idx])
+              instr_depth[idx] = (uint8_t)depth;
+          }
         }
       }
+      tcc_ir_cfg_free(rebuilt);
       tcc_ir_free_loops(loops);
     }
   }
@@ -277,7 +307,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP) continue;
 
-    /* Weight = 4^depth: depth 0 → 1, depth 1 → 4, depth 2 → 16, depth 3 → 64 */
+    /* Saturate the same branch-aware 4^depth weight for uses and call saves. */
     uint16_t w = 1;
     if (instr_depth[i] > 0) {
       w = 1 << (2 * (instr_depth[i] < 7 ? instr_depth[i] : 7));
@@ -285,8 +315,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
 
     /* Uses: src1, src2 */
     if (irop_config[q->op].has_src1) {
-      IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(s1);
+      int32_t vr = tcc_ir_op_src1_vreg(ir, q);
       if (vr >= 0 && tcc_ir_vreg_is_valid(ir, vr)) {
         int idx = VREG_IDX(vr);
         if (idx < table_size) {
@@ -297,8 +326,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       }
     }
     if (irop_config[q->op].has_src2) {
-      IROperand s2 = tcc_ir_op_get_src2(ir, q);
-      int32_t vr = irop_get_vreg(s2);
+      int32_t vr = tcc_ir_op_src2_vreg(ir, q);
       if (vr >= 0 && tcc_ir_vreg_is_valid(ir, vr)) {
         int idx = VREG_IDX(vr);
         if (idx < table_size) {
@@ -310,8 +338,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     }
     /* MLA accumulator (4th operand) */
     if (tcc_ir_op_is_mac(q->op)) {
-      IROperand acc = tcc_ir_op_get_accum(ir, q);
-      int32_t vr = irop_get_vreg(acc);
+      int32_t vr = tcc_ir_op_accum_vreg(ir, q);
       if (vr >= 0 && tcc_ir_vreg_is_valid(ir, vr)) {
         int idx = VREG_IDX(vr);
         if (idx < table_size) {
@@ -402,8 +429,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     int limit = (type == TCCIR_VREG_TYPE_VAR) ? local_count :
                 (type == TCCIR_VREG_TYPE_TEMP) ? temp_count : param_count;
     for (int pos = 0; pos < limit; pos++) {
-      int idx = type * max_vreg_pos + pos;
-      if (idx >= table_size) continue;
+      int idx = vx.base[type] + pos;
       if (starts[idx] != INTERVAL_NOT_STARTED) continue;
       int32_t vreg = TCCIR_ENCODE_VREG(type, pos);
       IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, vreg);
@@ -418,8 +444,8 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     RA_DBG("SSA ra_build_intervals: after def/use scan (%d instructions)", n);
     for (int idx = 0; idx < table_size; idx++) {
       if (starts[idx] == INTERVAL_NOT_STARTED) continue;
-      int type = idx / max_vreg_pos;
-      int pos = idx % max_vreg_pos;
+      int type = TCCIR_DECODE_VREG_TYPE(ra_vidx_vreg(&vx, idx));
+      int pos = TCCIR_DECODE_VREG_POSITION(ra_vidx_vreg(&vx, idx));
       RA_DBG("  %s%d range=[%u,%u] uses=%u", ra_vreg_type_char(type), pos,
              starts[idx], ends[idx], uses[idx]);
     }
@@ -450,7 +476,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
           if ((int)pred_end >= 0 && (int)pred_end < n) {
             IRQuadCompact *term = &ir->compact_instructions[pred_end];
             if (term->op == TCCIR_OP_JUMP || term->op == TCCIR_OP_JUMPIF) {
-              int target = (int)tcc_ir_op_get_dest(ir, term).u.imm32;
+              int target = (int)tcc_ir_op_dest_u_imm32(ir, term);
               if (target >= 0 && target < (int)pred_end &&
                   starts[idx] != INTERVAL_NOT_STARTED &&
                   starts[idx] > (uint32_t)target &&
@@ -500,8 +526,8 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     RA_DBG("SSA ra_build_intervals: after phi extension");
     for (int idx = 0; idx < table_size; idx++) {
       if (starts[idx] == INTERVAL_NOT_STARTED) continue;
-      int type = idx / max_vreg_pos;
-      int pos = idx % max_vreg_pos;
+      int type = TCCIR_DECODE_VREG_TYPE(ra_vidx_vreg(&vx, idx));
+      int pos = TCCIR_DECODE_VREG_POSITION(ra_vidx_vreg(&vx, idx));
       RA_DBG("  %s%d range=[%u,%u]", ra_vreg_type_char(type), pos,
              starts[idx], ends[idx]);
     }
@@ -545,7 +571,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     for (int i = 0; i < n; i++) {
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL) continue;
-      int ccid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      int ccid = TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, q));
       if (ccid > max_cid) max_cid = ccid;
     }
     int *next_call_by_cid = NULL;
@@ -557,10 +583,10 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       IRQuadCompact *q = &ir->compact_instructions[i];
       param_cidx[i] = -1;
       if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL) {
-        int ccid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+        int ccid = TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, q));
         if (ccid >= 0 && ccid <= max_cid) next_call_by_cid[ccid] = i;
       } else if (q->op == TCCIR_OP_FUNCPARAMVAL) {
-        int cid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+        int cid = TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, q));
         if (cid >= 0 && cid <= max_cid && next_call_by_cid)
           param_cidx[i] = next_call_by_cid[cid];
       }
@@ -738,6 +764,28 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
         ends[root] = (uint32_t)(n - 1);
     }
 
+    /* Pass 3: a local captured by a nested function of this one is read and
+     * written through the static chain by whatever call runs a child, from
+     * any point of the body, and no instruction here names that access.  Its
+     * slot is the whole function's: with only its own references, -O0 gave
+     * `int p = 4, q = 5, r = 6;` (never read by the parent) ONE slot. */
+    for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++) {
+      const NestedFunc *nf = tcc_state->nested_funcs[ni];
+      for (int j = 0; j < nf->nb_captured; j++) {
+        int32_t v_vr = nf->captured_vregs[j];
+        if (v_vr < 0 || TCCIR_DECODE_VREG_TYPE(v_vr) != TCCIR_VREG_TYPE_VAR ||
+            !tcc_ir_vreg_is_valid(ir, v_vr) ||
+            !nested_capture_owned_by(nf, j, tcc_state->current_nested_func))
+          continue;
+        int vidx = VREG_IDX(v_vr);
+        if (vidx >= table_size || starts[vidx] == INTERVAL_NOT_STARTED)
+          continue;
+        starts[vidx] = 0;
+        if (ends[vidx] < (uint32_t)(n - 1))
+          ends[vidx] = (uint32_t)(n - 1);
+      }
+    }
+
     tcc_free(taint_root);
   }
 
@@ -745,8 +793,8 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     RA_DBG("SSA ra_build_intervals: after addrtaken pointer-flow extension");
     for (int idx = 0; idx < table_size; idx++) {
       if (starts[idx] == INTERVAL_NOT_STARTED) continue;
-      int type = idx / max_vreg_pos;
-      int pos = idx % max_vreg_pos;
+      int type = TCCIR_DECODE_VREG_TYPE(ra_vidx_vreg(&vx, idx));
+      int pos = TCCIR_DECODE_VREG_POSITION(ra_vidx_vreg(&vx, idx));
       RA_DBG("  %s%d range=[%u,%u]", ra_vreg_type_char(type), pos,
              starts[idx], ends[idx]);
     }
@@ -780,7 +828,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
       for (int i = 0; i < n; i++) {
         IRQuadCompact *q = &ir->compact_instructions[i];
         if (q->op != TCCIR_OP_ASSIGN) continue;
-        int32_t dv = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+        int32_t dv = tcc_ir_op_dest_vreg(ir, q);
         if (dv < 0 || !tcc_ir_vreg_is_valid(ir, dv)) continue;
         int didx = VREG_IDX(dv);
         if (didx >= 0 && didx < table_size)
@@ -793,13 +841,11 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     ({                                                                          \
       int found_ = 0;                                                          \
       if (vreg_has_assign && ((vreg_has_assign[(vidx) >> 3] >> ((vidx) & 7)) & 1)) { \
-        int type__ = (vidx) / max_vreg_pos;                                    \
-        int pos__ = (vidx) % max_vreg_pos;                                     \
-        int32_t needle_ = TCCIR_ENCODE_VREG(type__, pos__);                    \
+        int32_t needle_ = ra_vidx_vreg(&vx, (vidx));                           \
         for (int s_ = (lo); s_ < (hi); s_++) {                                 \
           IRQuadCompact *qa_ = &ir->compact_instructions[s_];                  \
           if (qa_->op != TCCIR_OP_ASSIGN) continue;                            \
-          int32_t adv_ = irop_get_vreg(tcc_ir_op_get_dest(ir, qa_));           \
+          int32_t adv_ = tcc_ir_op_dest_vreg(ir, qa_);           \
           if (adv_ == needle_) { found_ = 1; break; }                          \
         }                                                                       \
       }                                                                         \
@@ -812,7 +858,8 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
              (broad) ? " (broad)" : "");                                        \
       for (int idx_ = 0; idx_ < table_size; idx_++) {                           \
         if (starts[idx_] == INTERVAL_NOT_STARTED) continue;                     \
-        int type_ = idx_ / max_vreg_pos;                                        \
+        int32_t vr_ = ra_vidx_vreg(&vx, idx_);                                  \
+        int type_ = TCCIR_DECODE_VREG_TYPE(vr_);                                \
         int live_at_target_;                                                     \
         int live_at_backedge_ = ((int)starts[idx_] <= (i) &&                    \
                                  (int)ends[idx_] >= (i));                        \
@@ -837,7 +884,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
             uint32_t old_s_ = starts[idx_];                                     \
             starts[idx_] = (target);                                            \
             RA_DBG("    %s%d [%u,%u] -> [%u,%u] (loop-carried)",               \
-                   ra_vreg_type_char(type_), idx_ % max_vreg_pos, old_s_,       \
+                   ra_vreg_type_char(type_), TCCIR_DECODE_VREG_POSITION(vr_), old_s_, \
                    ends[idx_], starts[idx_], ends[idx_]);                        \
           }                                                                    \
         }                                                                       \
@@ -856,7 +903,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
           int fresh_def_ = 0;                                                   \
           if (!(broad) && (int)starts[idx_] == (target) &&                      \
               type_ == TCCIR_VREG_TYPE_TEMP) {                                  \
-            int32_t nv_ = TCCIR_ENCODE_VREG(type_, idx_ % max_vreg_pos);        \
+            int32_t nv_ = vr_;                                                  \
             int32_t d_ = -1, u_[4]; int hd_ = 0, nu_ = 0;                       \
             ra_co_ops(ir, &ir->compact_instructions[(target)], &d_, &hd_,       \
                       u_, &nu_);                                                \
@@ -873,7 +920,7 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
             uint32_t old_e_ = ends[idx_];                                       \
             ends[idx_] = (i);                                                   \
             RA_DBG("    %s%d [%u,%u] -> [%u,%u]", ra_vreg_type_char(type_),    \
-                   idx_ % max_vreg_pos, starts[idx_], old_e_, starts[idx_],     \
+                   TCCIR_DECODE_VREG_POSITION(vr_), starts[idx_], old_e_, starts[idx_], \
                    ends[idx_]);                                                  \
           }                                                                     \
         }                                                                       \
@@ -883,15 +930,14 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
-      int target = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
       if (target >= 0 && target < n && target < i)
         RA_EXTEND_BACKEDGE(i, target, 0);
     } else if (q->op == TCCIR_OP_IJUMP) {
       if (i > 0)
         RA_EXTEND_BACKEDGE(i, 0, 1);
     } else if (q->op == TCCIR_OP_SWITCH_TABLE) {
-      IROperand s2 = tcc_ir_op_get_src2(ir, q);
-      int table_id = (int)irop_get_imm64_ex(ir, s2);
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id >= 0 && table_id < ir->num_switch_tables) {
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
         for (int j = 0; j < table->num_entries; j++) {
@@ -910,15 +956,54 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
   #undef RA_VREG_HAS_ASSIGN_IN_RANGE
   tcc_free(vreg_has_assign);
 
+  /* The linear rules above cannot see a value that leaves its range by a
+   * forward jump and returns by a backward one; real liveness can. */
+  uint8_t *live_in_at_start = tcc_mallocz(table_size > 0 ? table_size : 1);
+  ra_widen_intervals_by_liveness(ir, &vx, starts, ends, live_in_at_start);
+
   if (TCC_LOG_LS) {
     RA_DBG("SSA ra_build_intervals: after backward jump extension");
     for (int idx = 0; idx < table_size; idx++) {
       if (starts[idx] == INTERVAL_NOT_STARTED) continue;
-      int type = idx / max_vreg_pos;
-      int pos = idx % max_vreg_pos;
+      int type = TCCIR_DECODE_VREG_TYPE(ra_vidx_vreg(&vx, idx));
+      int pos = TCCIR_DECODE_VREG_POSITION(ra_vidx_vreg(&vx, idx));
       RA_DBG("  %s%d range=[%u,%u]", ra_vreg_type_char(type), pos,
              starts[idx], ends[idx]);
     }
+  }
+
+  /* Caller-save candidates: plain calls cost a loop-weighted store+reload each;
+   * anything else that clobbers caller-saved registers outside the call
+   * lowering's save/restore (switch dispatch, asm, native FP helpers, memcpy
+   * block copies, setjmp) rules the interval out. */
+  uint32_t *cs_cost_prefix = tcc_malloc(sizeof(uint32_t) * (n + 1));
+  int *cs_bad_prefix = tcc_malloc(sizeof(int) * (n + 1));
+  int cs_func_ok = TCC_OPT(tcc_state, optimize) >= 1 && !ir->has_static_chain &&
+                   !tcc_ir_opt_pass_disabled("ra:caller_save");
+  cs_cost_prefix[0] = 0;
+  cs_bad_prefix[0] = 0;
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    TccIrOp op = q->op;
+    uint32_t c = 0;
+    int bad = 0;
+    if ((op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID) && !tcc_ir_call_clobbers_nothing(ir, q)) {
+      /* Match the branch-aware use weight. */
+      int d = instr_depth[i] < 6 ? instr_depth[i] : 6;
+      c = 2u << (2 * d);
+    } else if (op == TCCIR_OP_BUILTIN_APPLY || ir_op_is_implicit_call_ra(op) ||
+               op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD ||
+               op == TCCIR_OP_INLINE_ASM || op == TCCIR_OP_ASM_INPUT || op == TCCIR_OP_ASM_OUTPUT ||
+               op == TCCIR_OP_VLA_ALLOC || op == TCCIR_OP_VLA_SP_SAVE || op == TCCIR_OP_VLA_SP_RESTORE) {
+      bad = 1;
+    } else if (op == TCCIR_OP_SETJMP || op == TCCIR_OP_NL_SETJMP || op == TCCIR_OP_LONGJMP ||
+               op == TCCIR_OP_NL_LONGJMP) {
+      cs_func_ok = 0;
+    } else if (op == TCCIR_OP_BLOCK_COPY && (int)tcc_ir_op_src2_imm(ir, q) >= TCCIR_BLOCK_COPY_MEMCPY_MIN_BYTES) {
+      bad = 1;
+    }
+    cs_cost_prefix[i + 1] = cs_cost_prefix[i] + c;
+    cs_bad_prefix[i + 1] = cs_bad_prefix[i] + bad;
   }
 
   /* Count active intervals */
@@ -934,8 +1019,8 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     int limit = (type == TCCIR_VREG_TYPE_VAR) ? local_count :
                 (type == TCCIR_VREG_TYPE_TEMP) ? temp_count : param_count;
     for (int pos = 0; pos < limit; pos++) {
-      int idx = type * max_vreg_pos + pos;
-      if (idx >= table_size || starts[idx] == INTERVAL_NOT_STARTED) continue;
+      int idx = vx.base[type] + pos;
+      if (starts[idx] == INTERVAL_NOT_STARTED) continue;
       if (ends[idx] < starts[idx]) continue;
       int32_t vreg = TCCIR_ENCODE_VREG(type, pos);
       if (tcc_ir_vreg_is_ignored(ir, vreg)) continue;
@@ -980,18 +1065,45 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
        * its range too: a leaf whose body opens with a memcpy-sized BLOCK_COPY
        * (a local's rodata initialiser) had its first parameter precolored in
        * r0 across the copy. */
-      const int xstart = type == TCCIR_VREG_TYPE_PARAM ? -1 : (int)iv->start;
+      const int xstart = type == TCCIR_VREG_TYPE_PARAM ? -1
+                         : (int)iv->start - (live_in_at_start[idx] ? 1 : 0);
       iv->crosses_real_call = ra_has_call_in_range(real_call_prefix, xstart, iv->end, n) ? 1 : 0;
       if (!iv->crosses_call) {
         iv->crosses_call = ra_has_call_in_range(call_prefix, xstart, iv->end, n);
         if (!iv->crosses_call && iv->end < (uint32_t)n) {
           TccIrOp eop = ir->compact_instructions[iv->end].op;
-          if (eop == TCCIR_OP_FUNCCALLVAL || eop == TCCIR_OP_FUNCCALLVOID) {
+          if ((eop == TCCIR_OP_FUNCCALLVAL || eop == TCCIR_OP_FUNCCALLVOID) &&
+              !tcc_ir_call_clobbers_nothing(ir, &ir->compact_instructions[iv->end])) {
             int idx = VREG_IDX(vreg);
             int is_param_use = (param_extended &&
                                 ((param_extended[idx >> 3] >> (idx & 7)) & 1));
             if (!is_param_use)
               iv->crosses_call = 1;
+          }
+        }
+      }
+
+      /* Caller-save eligibility over (xstart, end): see cs_cost_prefix. */
+      iv->cs_ok = 0;
+      iv->caller_save = 0;
+      iv->cs_cost = 0;
+      if (cs_func_ok && iv->crosses_call && iv->reg_type == LS_REG_TYPE_INT && !iv->addrtaken &&
+          !iv->is_volatile && iv->precolored < 0 && iv->end < (uint32_t)n) {
+        const int lo = xstart + 1 < 0 ? 0 : xstart + 1;
+        const int hi = (int)iv->end; /* inclusive for clobbers */
+        int ok = (cs_bad_prefix[hi + 1] - cs_bad_prefix[lo]) == 0;
+        TccIrOp eop = ir->compact_instructions[iv->end].op;
+        if (ok && (eop == TCCIR_OP_FUNCCALLVAL || eop == TCCIR_OP_FUNCCALLVOID)) {
+          /* The value dies at this call: fine as an argument, but not as an
+           * indirect target (argument setup may clobber it first). */
+          int idx2 = VREG_IDX(vreg);
+          ok = param_extended && ((param_extended[idx2 >> 3] >> (idx2 & 7)) & 1);
+        }
+        if (ok) {
+          uint32_t cost = cs_cost_prefix[iv->end] - cs_cost_prefix[lo];
+          if (cost > 0) {
+            iv->cs_ok = 1;
+            iv->cs_cost = cost > 65535 ? 65535 : (uint16_t)cost;
           }
         }
       }
@@ -1043,11 +1155,14 @@ void ra_build_intervals(TCCIRState *ir, IRCFG *cfg, IRSSAState *ssa,
     }
   }
 
+  tcc_free(live_in_at_start);
   tcc_free(starts);
   tcc_free(ends);
   tcc_free(uses);
   tcc_free(instr_depth);
   tcc_free(param_extended);
+  tcc_free(cs_cost_prefix);
+  tcc_free(cs_bad_prefix);
   tcc_free(vreg_read_as_src);
 
   if (TCC_LOG_LS) {
@@ -1235,10 +1350,9 @@ void ra_build_load_param_hints(SSAInterval *intervals, int count,
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_LOAD) continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
     IROperand s = tcc_ir_op_get_src1(ir, q);
     if (s.is_lval) continue;                /* real memory load, not a copy */
-    int32_t dest_vr = irop_get_vreg(d);
+    int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
     int32_t src_vr = irop_get_vreg(s);
     if (dest_vr < 0 || src_vr < 0) continue;
     /* Source must be a PARAM (the only LOAD-as-copy pattern we trust). */
@@ -1248,7 +1362,7 @@ void ra_build_load_param_hints(SSAInterval *intervals, int count,
      * INT64 needs a pair, FP types use a different reg class. */
     int sbtype = irop_get_btype(s);
     if (sbtype != IROP_BTYPE_INT32) continue;
-    int dbtype = irop_get_btype(d);
+    int dbtype = tcc_ir_op_dest_btype(ir, q);
     if (dbtype != IROP_BTYPE_INT32) continue;
     int dest_tbl = LOAD_VREG_IDX(dest_vr);
     int src_tbl = LOAD_VREG_IDX(src_vr);
@@ -1301,10 +1415,8 @@ void ra_build_bfi_hints(SSAInterval *intervals, int count,
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_BFI) continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    IROperand s = tcc_ir_op_get_src1(ir, q);
-    int32_t dest_vr = irop_get_vreg(d);
-    int32_t src_vr = irop_get_vreg(s);
+    int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
+    int32_t src_vr = tcc_ir_op_src1_vreg(ir, q);
     if (dest_vr < 0 || src_vr < 0) continue;
     int dest_tbl = BFI_VREG_IDX(dest_vr);
     int src_tbl = BFI_VREG_IDX(src_vr);

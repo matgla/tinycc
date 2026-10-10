@@ -38,33 +38,16 @@ void ir_opt_du_build(struct TCCIRState *ir, IROptDU *du);
 void ir_opt_du_build_mode(struct TCCIRState *ir, IROptDU *du, uint8_t mode);
 
 /* Def index strictly before before_idx; -1 when undefined or defined later. */
-static inline int ir_opt_du_def(const IROptDU *du, int32_t vreg, int before_idx)
-{
-  int idx = ir_opt_du_idx(du, vreg);
-  if (idx < 0)
-    return -1;
-  int d = du->def[idx];
-  return (d >= 0 && d < before_idx) ? d : -1;
-}
+/* (These four are out of line in analysis/du_chains.c.) */
+int ir_opt_du_def(const IROptDU *du, int32_t vreg, int before_idx);
 
 /* Saturating: 0, 1, or 2 meaning "2 or more". */
-static inline int ir_opt_du_uses(const IROptDU *du, int32_t vreg)
-{
-  int idx = ir_opt_du_idx(du, vreg);
-  return (idx >= 0) ? (int)du->use[idx] : 0;
-}
+int ir_opt_du_uses(const IROptDU *du, int32_t vreg);
 
 /* Saturating: 0, 1, or 2 meaning "2 or more". */
-static inline int ir_opt_du_def_count(const IROptDU *du, int32_t vreg)
-{
-  int idx = ir_opt_du_idx(du, vreg);
-  return (idx >= 0) ? (int)du->def_cnt[idx] : 0;
-}
+int ir_opt_du_def_count(const IROptDU *du, int32_t vreg);
 
-static inline int ir_opt_du_is_single_def(const IROptDU *du, int32_t vreg)
-{
-  return ir_opt_du_def_count(du, vreg) == 1;
-}
+int ir_opt_du_is_single_def(const IROptDU *du, int32_t vreg);
 
 /* Indexed [vreg_type * stride + vreg_position], stride via *out_stride; caller tcc_free()s. */
 uint8_t *ir_opt_build_def_count(struct TCCIRState *ir, int n, int *out_stride);

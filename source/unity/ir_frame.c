@@ -14,3 +14,8 @@
 #undef TAINT_MULTI
 #undef TAINT_NONE
 #undef USING_GLOBALS
+#include "../ir/frame_dfe.c"
+#undef DFE_LOWER_WORDS
+#undef DFE_MAX_SPAN
+#undef USING_GLOBALS
+#undef dfe_escape

@@ -71,6 +71,11 @@ static void new_scope(struct scope *o)
   /* record local declaration stack position */
   o->lstk = local_stack;
   o->llstk = local_label_stack;
+  {
+    TCCIRState *ir = tcc_state ? tcc_state->ir : NULL;
+    o->first_obj = ir ? ir->frame_obj_count : 0;
+    o->first_insn = ir ? ir->next_instruction_index : 0;
+  }
   ++local_scope;
 }
 
@@ -94,6 +99,16 @@ static void prev_scope(struct scope *o, int is_expr)
 
   /* pop locally defined symbols */
   pop_local_syms(o->lstk, is_expr);
+
+  /* The block's objects live only while it runs (C11 6.2.4p6), whatever their
+   * address did: frame colouring may then give another block's objects the
+   * same bytes, so the locals of a function's disjoint statements (the cases
+   * of a switch, an if and its else, inside a loop or not) do not all add up
+   * in its frame.  Not for a statement expression, whose value may live in
+   * one of them, nor inside an inlined body, whose objects the expansion ends
+   * itself -- the local its return is redirected into outlives the braces. */
+  if (tcc_state && tcc_state->ir && !is_expr && !tcc_state->in_inline_expansion)
+    tcc_ir_frame_scope_block(tcc_state->ir, o->first_obj, o->first_insn, tcc_state->ir->next_instruction_index);
   cur_scope = o->prev;
   --local_scope;
 }
@@ -214,6 +229,7 @@ again:
   {
     new_scope_s(&o);
     d = gind();
+    const_init_forget_all();
     skip('(');
     gexpr();
     check_nonvoid_value();
@@ -316,6 +332,30 @@ again:
       tcc_warning("'return' with no value");
       b = 0;
     }
+    /* The return operand may still be an lvalue (`return a[i];`).  If it lives
+     * in a VLA, leaving the scope restores SP (freeing the VLA) before the
+     * RETURNVALUE materialises the load, so the read would hit released stack.
+     * Load it into a temp first. */
+    if (b && tcc_state->ir && (func_vt.t & VT_BTYPE) != VT_STRUCT && (vtop->r & VT_LVAL))
+    {
+      struct scope *sc;
+      int has_vla = 0;
+      for (sc = cur_scope; sc && sc != root_scope; sc = sc->prev)
+        if (sc->vla.num)
+          has_vla = 1;
+      if (has_vla)
+      {
+        SValue load_dst;
+        svalue_init(&load_dst);
+        load_dst.type = vtop->type;
+        load_dst.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+        load_dst.r = 0;
+        load_dst.c.i = 0;
+        tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &load_dst);
+        vtop->vr = load_dst.vr;
+        vtop->r = 0;
+      }
+    }
     leave_scope(root_scope);
     if (b)
     {
@@ -329,7 +369,7 @@ again:
            * the caller's assignment will copy directly from the inlined
            * function's local variable. */
           if ((vtop->r & (VT_LOCAL | VT_LVAL)) == (VT_LOCAL | VT_LVAL) && vtop->vr == -1 &&
-              !tcc_state->inline_return_redirected)
+              !tcc_state->inline_return_redirected && !tcc_state->inline_return_copied)
           {
             /* Only the FIRST return may retarget the slot.  Retargeting again
              * would move the caller's read away from the slot the first
@@ -337,7 +377,8 @@ again:
              * so its path would read an uninitialized slot (a two-return
              * `return local;` / `return f();` body did exactly that).  Later
              * returns take the vstore() copy below, which writes into this
-             * same retargeted slot. */
+             * same retargeted slot.  Nor may a return retarget once an earlier
+             * one copied into the slot: that copy's path would read the local. */
             LOG_INLINE_STRUCT("[inline-struct] redirect return: loc %d -> %d", (int)tcc_state->inline_return_loc,
                               (int)vtop->c.i);
             tcc_state->inline_return_loc = vtop->c.i;
@@ -348,6 +389,7 @@ again:
           {
             /* Fallback: copy via vstore() when source is not a simple local */
             SValue src_save = *vtop;
+            tcc_state->inline_return_copied = 1;
             vtop--;
             CValue ret_cv;
             ret_cv.i = tcc_state->inline_return_loc;
@@ -488,6 +530,7 @@ again:
     skip(';');
     a = b = -1; /* Initialize break/continue chains with -1 sentinel */
     c = d = gind();
+    const_init_forget_all();
     if (tok != ';')
     {
       gexpr();
@@ -539,6 +582,7 @@ again:
     new_scope_s(&o);
     a = b = -1; /* Initialize break/continue chains with -1 sentinel */
     d = gind();
+    const_init_forget_all();
     lblock(&a, &b);
     /* continue jumps land at the condition check of the do/while */
     tcc_ir_backpatch_to_here(tcc_state->ir, b);
@@ -575,6 +619,10 @@ again:
     skip(')');
     if (!is_integer_btype(vtop->type.t & VT_BTYPE))
       tcc_error("switch value not an integer");
+    /* Materialise VT_CMP / VT_JMP* (comparison, !, &&, ||) into a 0/1 value
+     * before saving: the dispatch is emitted after the body, where the flags
+     * or jump chain are long gone and vr would be an operand's vreg. */
+    tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
     sw->sv = *vtop--; /* save switch value */
     print_vstack("block(2)");
     a = -1; /* Initialize break chain with -1 sentinel */
@@ -689,6 +737,19 @@ again:
         if (table->targets[k] < 0)
           table->targets[k] = def_target;
       }
+    }
+    /* The dispatch goes in front of the bodies once the function is done
+     * (switch_head.c). */
+    {
+      TCCIRState *ir = tcc_state->ir;
+      if (ir->switch_heads_n + 3 > ir->switch_heads_cap)
+      {
+        ir->switch_heads_cap = ir->switch_heads_cap * 2 + 24;
+        ir->switch_heads = tcc_realloc(ir->switch_heads, sizeof(int) * ir->switch_heads_cap);
+      }
+      ir->switch_heads[ir->switch_heads_n++] = b;
+      ir->switch_heads[ir->switch_heads_n++] = c;
+      ir->switch_heads[ir->switch_heads_n++] = ir->next_instruction_index;
     }
     // gsym(d);
   skip_switch:
@@ -858,6 +919,8 @@ again:
         s = label_push(&global_label_stack, t, LABEL_DEFINED);
       }
       s->jind = gind();
+      tcc_ir_label_note(tcc_state->ir, s->jind);
+      const_init_forget_all();
       s->cleanupstate = cur_scope->cl.s;
 
     block_after_label:

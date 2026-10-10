@@ -54,8 +54,7 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int target = (int)irop_get_imm64_ex(ir, dest);
+    int target = (int)tcc_ir_op_dest_imm(ir, q);
     if (target <= i)
       return 0;
   }
@@ -101,10 +100,8 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
 
     if (q->op == TCCIR_OP_LEA)
     {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t s_vr = irop_get_vreg(src1);
-      int32_t d_vr = irop_get_vreg(dest);
+      int32_t s_vr = tcc_ir_op_src1_vreg(ir, q);
+      int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
       if (s_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_VAR && d_vr >= 0)
       {
         int v = TCCIR_DECODE_VREG_POSITION(s_vr);
@@ -138,10 +135,8 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
     /* STORE V=T where T holds a LEA result -> propagate lea_map to var_lea. */
     if (q->op == TCCIR_OP_STORE)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      int32_t d_vr = irop_get_vreg(dest);
-      int32_t s_vr = irop_get_vreg(src1);
+      int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
+      int32_t s_vr = tcc_ir_op_src1_vreg(ir, q);
       if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR &&
           s_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_TEMP)
       {
@@ -159,10 +154,8 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
     /* ASSIGN/LOAD T=V where V holds a LEA result -> propagate var_lea to lea_map. */
     if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      int32_t d_vr = irop_get_vreg(dest);
-      int32_t s_vr = irop_get_vreg(src1);
+      int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
+      int32_t s_vr = tcc_ir_op_src1_vreg(ir, q);
       if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP &&
           s_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_VAR)
       {
@@ -189,10 +182,9 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
     if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
          q->op == TCCIR_OP_STORE_POSTINC) && irop_config[q->op].has_src1)
     {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      if (!src1.is_lval)
+      if (!tcc_ir_op_src1_is_lval(ir, q))
       {
-        int32_t vr = irop_get_vreg(src1);
+        int32_t vr = tcc_ir_op_src1_vreg(ir, q);
         if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
         {
           int t = TCCIR_DECODE_VREG_POSITION(vr);
@@ -204,8 +196,7 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
     /* RETURNVALUE of a LEA temp -> pointer to local escapes. */
     if (q->op == TCCIR_OP_RETURNVALUE)
     {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(src1);
+      int32_t vr = tcc_ir_op_src1_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
       {
         int t = TCCIR_DECODE_VREG_POSITION(vr);
@@ -227,7 +218,7 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
       int has = (k == 0) ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
       if (!has)
         continue;
-      IROperand s = (k == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand s = tcc_ir_op_get_src1_or_2(ir, q, k != 0);
       int32_t vr = irop_get_vreg(s);
       if (vr < 0)
         continue;
@@ -260,9 +251,8 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
     int written_var = -1;
     if (irop_config[q->op].has_dest)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t vr = irop_get_vreg(dest);
-      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && !dest.is_lval)
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
+      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && !tcc_ir_op_dest_is_lval(ir, q))
       {
         /* Direct write: conservative, only side-effect-free ASSIGN/STORE shapes. */
         if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_STORE ||
@@ -304,9 +294,4 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
   tcc_free(var_lea);
   tcc_free(lea_map);
   return changes;
-}
-
-int tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_dead_trailing_addrvar_store_elim(ctx->ir);
 }

@@ -11,65 +11,33 @@
 #define USING_GLOBALS
 
 #include "ir.h"
+#include "opt_range.h"
 #include "opt_utils.h"
 
 int ir_xform_same_block(TCCIRState *ir, int from_idx, int to_idx)
 {
-  for (int j = from_idx + 1; j < to_idx; j++)
-  {
-    TccIrOp bop = ir->compact_instructions[j].op;
-    if (bop == TCCIR_OP_JUMP || bop == TCCIR_OP_JUMPIF)
-      return 0;
-  }
-  return 1;
+  /* Control flow only: what the instructions do is the caller's business. */
+  const uint32_t not_control = IR_HZ_CALL | IR_HZ_CALL_PARAM | IR_HZ_CALL_SEQ | IR_HZ_MEM_READ | IR_HZ_MEM_WRITE |
+                               IR_HZ_UPDATES_SRC | IR_HZ_VLA | IR_HZ_CHAIN | IR_HZ_HINT | IR_HZ_FLAGS_SET |
+                               IR_HZ_FLAGS_READ | IR_HZ_VOLATILE | IR_HZ_DEST_LVAL | IR_HZ_DEST_STACKOFF |
+                               IR_HZ_SRC_LVAL;
+  if (to_idx < from_idx)
+    return 1; /* IR_LEGACY_GAP: an inverted range counts as one block */
+  return ir_range_safe_except(ir, from_idx, to_idx,
+                              IR_HZ_ALL & ~(not_control | IR_LEGACY_GAP_HZ(IR_HZ_JOIN | IR_HZ_JOIN_END | IR_HZ_RETURN |
+                                                                           IR_HZ_TRAP | IR_HZ_NONLOCAL | IR_HZ_ASM)),
+                              IR_LEGACY_GAP_OPS(TCCIR_OP_IJUMP, TCCIR_OP_SWITCH_TABLE));
 }
 
 int ir_xform_range_preserves_memory(TCCIRState *ir, int lo, int hi)
 {
-  if (hi < lo)
-    return 0;
-  for (int k = lo + 1; k < hi; k++) {
-    const IRQuadCompact *q = &ir->compact_instructions[k];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    /* A jump target lets another path's stores execute between the operand's old and new read points. */
-    if (q->is_jump_target)
-      return 0;
-    switch (q->op) {
-    /* control flow — the range is not straight-line */
-    case TCCIR_OP_JUMP:
-    case TCCIR_OP_JUMPIF:
-    case TCCIR_OP_IJUMP:
-    case TCCIR_OP_SWITCH_TABLE:
-    case TCCIR_OP_RETURNVOID:
-    case TCCIR_OP_RETURNVALUE:
-    /* memory writers / barriers */
-    case TCCIR_OP_STORE:
-    case TCCIR_OP_STORE_INDEXED:
-    case TCCIR_OP_STORE_POSTINC:
-    case TCCIR_OP_BLOCK_COPY:
-    case TCCIR_OP_FUNCCALLVAL:
-    case TCCIR_OP_FUNCCALLVOID:
-    case TCCIR_OP_CALLARG_STACK:
-    case TCCIR_OP_INLINE_ASM:
-    case TCCIR_OP_ASM_INPUT:
-    case TCCIR_OP_ASM_OUTPUT:
-    case TCCIR_OP_VLA_ALLOC:
-    case TCCIR_OP_VLA_SP_SAVE:
-    case TCCIR_OP_VLA_SP_RESTORE:
-    case TCCIR_OP_SETJMP:
-    case TCCIR_OP_LONGJMP:
-    case TCCIR_OP_NL_SETJMP:
-    case TCCIR_OP_NL_LONGJMP:
-    case TCCIR_OP_BUILTIN_APPLY_ARGS:
-    case TCCIR_OP_BUILTIN_APPLY:
-    case TCCIR_OP_BUILTIN_RETURN:
-    case TCCIR_OP_SET_CHAIN:
-    case TCCIR_OP_INIT_CHAIN_SLOT:
-      return 0;
-    default:
-      break;
-    }
-  }
-  return 1;
+  /* Reads, the flags and register-only call setup leave memory alone.  A jump
+   * target lets another path's stores execute between the operand's old and
+   * new read points (IR_HZ_JOIN, NOP ones included) -- `hi` itself too
+   * (IR_HZ_JOIN_END: a back edge entering there).  A store through a
+   * destination operand is a write, a volatile access in between would be
+   * reordered with the moved read, and a TRAP ends the path. */
+  return ir_range_safe(ir, lo, hi,
+                       IR_HZ_ALL & ~(IR_HZ_MEM_READ | IR_HZ_SRC_LVAL | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ |
+                                     IR_HZ_CALL_PARAM | IR_HZ_CALL_SEQ | IR_HZ_UPDATES_SRC | IR_HZ_HINT));
 }
