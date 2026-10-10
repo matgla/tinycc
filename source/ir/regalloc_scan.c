@@ -697,7 +697,7 @@ static void ra_widen_intervals_by_loops(TCCIRState *ir, const RaVregIdx *vx, uin
     for (int i = 0; i < n; i++)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
-      int lo = n, nt = 0, t[2];
+      int lo = n, nt = 0, t[2] = {0, 0};
       if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
         t[nt++] = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
       else if (q->op == TCCIR_OP_SWITCH_TABLE)
