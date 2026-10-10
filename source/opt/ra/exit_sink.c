@@ -270,11 +270,15 @@ int ra_exit_sink(TCCIRState *ir)
 
   int total = 0;
   for (int pass = 0; pass < RA_EXIT_SINK_MAX_PASSES; pass++) {
-    unique_ptr(IRCFG) cfg = tcc_ir_cfg_build(ir);
-    if (!cfg || cfg->num_blocks <= 1)
+    IRCFG *cfg = tcc_ir_cfg_build(ir);
+    if (!cfg || cfg->num_blocks <= 1) {
+      tcc_ir_cfg_free(cfg);
       break;
+    }
     tcc_ir_cfg_compute_dominators(cfg);
-    if (!ra_exit_sink_try(ir, cfg))
+    int changed = ra_exit_sink_try(ir, cfg);
+    tcc_ir_cfg_free(cfg);
+    if (!changed)
       break;
     total++;
   }
