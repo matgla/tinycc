@@ -23,6 +23,50 @@
 
 #include "gen_priv.h"
 
+/* A small_leaf body longer than this many token ints is not expanded into a
+ * caller longer than INLINE_GIANT_CALLER_TOKENS: zig.c's register-bound giants
+ * (Sema.analyzeBodyInner, 43k ints) fell off a frame cliff -- 26 KB to 70 KB --
+ * from ~80 extra tiny expansions.  A cost rule, gcc's large-function growth
+ * limit; the cliff itself is open (C_inlining.md F4).  zig.c -O2: -10M, -73 KB
+ * against the leaf rescue alone. */
+#define INLINE_GIANT_CALLER_TOKENS 32000
+#define INLINE_GIANT_CALLER_CALLEE_TOKENS 60
+/* A wrapper (gen_function: acyclic, one call) expands at most this many times
+ * into one function: uncapped, zig.c grew 505 KB and one Sema giant's frame
+ * passed 99 KB. */
+#define INLINE_WRAPPER_PER_CALLER 2
+
+static int inline_into_giant_caller(Sym *fs, InlineFunc *fn)
+{
+  return fs->type.ref->f.func_small_leaf && tcc_state->inline_caller_len > INLINE_GIANT_CALLER_TOKENS &&
+         fn->func_str->len > INLINE_GIANT_CALLER_CALLEE_TOKENS && !tcc_ir_opt_pass_disabled("inline:giant_caller");
+}
+
+static int inline_inside_wrapper(void)
+{
+  if (tcc_ir_opt_pass_disabled("inline:wrapper_dependencies"))
+    return 0;
+  for (int depth = 0; depth < tcc_state->inline_expansion_depth && depth < INLINE_NEST_MAX; depth++)
+  {
+    Sym *parent = tcc_state->inline_expansion_syms[depth];
+    if (parent && parent->type.ref && parent->type.ref->f.func_inl_wrapper)
+      return 1;
+  }
+  return 0;
+}
+
+static int inline_wrapper_cap_hit(Sym *fs, InlineFunc *fn)
+{
+  if (!fs->type.ref->f.func_inl_wrapper || inline_inside_wrapper())
+    return 0;
+  if (fn->caller_gen != tcc_state->inline_caller_gen)
+  {
+    fn->caller_gen = tcc_state->inline_caller_gen;
+    fn->caller_count = 0;
+  }
+  return fn->caller_count >= INLINE_WRAPPER_PER_CALLER;
+}
+
 /* Emit an IR void function call with arguments from an SValue array.
  * args[0..argc-1] are the arguments. Does not push a result. */
 void gen_ir_void_call_args(SValue *args, int argc, int func_tok)
@@ -44,6 +88,24 @@ void gen_ir_void_call_args(SValue *args, int argc, int func_tok)
   SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, argc);
   tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
   --vtop;
+}
+
+/* Move a VFP-returned value (gfunc_sret_vfp_words) between s0..s(words-1)
+ * and the buffer at *ptr: a call to __tcc_vfp_ret_ld (callee exit: buffer to
+ * registers) or __tcc_vfp_ret_st (caller, right after the call: registers to
+ * buffer), which the ARM backend emits as one VLDM/VSTM.  As calls, every
+ * pass sees them read or write the buffer.  Returns the call id. */
+ST_FUNC int gen_vfp_ret_transfer(const SValue *ptr, int words, int load)
+{
+  SValue args[2] = {*ptr};
+  svalue_init(&args[1]);
+  args[1].type.t = VT_INT;
+  args[1].r = VT_CONST;
+  args[1].vr = -1;
+  args[1].c.i = words;
+  const int call_id = tcc_state->ir->next_call_id;
+  gen_ir_void_call_args(args, 2, tok_alloc_const(load ? "__tcc_vfp_ret_ld" : "__tcc_vfp_ret_st"));
+  return call_id;
 }
 
 /* Extracted from unary_funcall() to reduce its stack frame size.
@@ -75,6 +137,222 @@ void nop_or_rollback_call_params(int call_id, int ir_idx_before_first_param, int
   {
     tcc_state->ir->next_instruction_index = ir_idx_before_args;
   }
+}
+
+/* ---- __multi3: the 128-bit multiply, expanded at the call -------------------
+ * zig.h without __int128 (tcc) multiplies zig_u128/zig_i128 -- two 64-bit
+ * halves, low first -- through compiler-rt's __multi3: 32 bytes of arguments,
+ * a 16-byte sret buffer and ~130 instructions a call, where Wyhash's mum needs
+ * a 64x64->128 product of two zero-extended words.  The kernel loader made 105
+ * such calls per launch (18% of its stack traffic).  The low 128 bits of the
+ * product do not depend on signedness, so the call becomes the schoolbook
+ * product of 32-bit words (UMULL after the backend's fusions); the zero high
+ * halves of a widened operand fold away.
+ *
+ * Intermediate values are anonymous locals reloaded at each use, which SSA
+ * promotes to registers: duplicating a lazily-extended 64-bit pair on the
+ * value stack can reference halves defined for one copy only (overflow.c),
+ * and value numbering runs before the UMULL fusion, so a recomputed product
+ * stays duplicated.  (The temp-local pool's slots are not promoted.) */
+static void m3_load(const SValue *agg, int ofs, int t)
+{
+  vpushv((SValue *)agg);
+  gaddrof();
+  vtop->type = char_pointer_type;
+  vpushi(ofs);
+  gen_op('+');
+  vtop->type.t = t;
+  vtop->type.ref = NULL;
+  vtop->r |= VT_LVAL;
+}
+
+/* (u64)a.word[i] * (u64)b.word[j] */
+static void m3_prod(const SValue *a, int i, const SValue *b, int j)
+{
+  m3_load(a, 4 * i, VT_INT | VT_UNSIGNED);
+  gen_cast_s(VT_LLONG | VT_UNSIGNED);
+  m3_load(b, 4 * j, VT_INT | VT_UNSIGNED);
+  gen_cast_s(VT_LLONG | VT_UNSIGNED);
+  gen_op('*');
+}
+
+static void m3_hi32(void)
+{
+  vpushi(32);
+  gen_op(TOK_SHR);
+}
+
+/* Pops the value on top of the stack into the temporary `t`. */
+static void m3_set(const SValue *t)
+{
+  vpushv((SValue *)t);
+  vswap();
+  vstore();
+  vpop();
+}
+
+/* The result lvalue of the call, as the post-call path pushes it. */
+static void m3_push_result(const SValue *ret, int nrvo_vreg, int nrvo_ptr_vreg)
+{
+  vsetc((CType *)&ret->type, ret->r, (CValue *)&ret->c);
+  if (nrvo_vreg != -1)
+    vtop->vr = nrvo_vreg;
+  else if (nrvo_ptr_vreg != -1)
+    vtop->vr = nrvo_ptr_vreg;
+}
+
+/* Turns the struct lvalue on top of the stack into its u64 half at `ofs`. */
+static void m3_half_of_top(int ofs)
+{
+  gaddrof();
+  vtop->type = char_pointer_type;
+  if (ofs)
+  {
+    vpushi(ofs);
+    gen_op('+');
+  }
+  vtop->type.t = VT_LLONG | VT_UNSIGNED;
+  vtop->type.ref = NULL;
+  vtop->r |= VT_LVAL;
+}
+
+static int m3_is_ti(const CType *t)
+{
+  int align;
+  return (t->t & VT_BTYPE) == VT_STRUCT && type_size((CType *)t, &align) == 16;
+}
+
+/* An anonymous local of type `t`, declared as a C local would be (SSA promotes it). */
+static int m3_local(SValue *sv, int t)
+{
+  const int size = (t & VT_BTYPE) == VT_LLONG ? 8 : 4;
+  int vr = tcc_ir_get_vreg_var(tcc_state->ir);
+  if (vr < 0)
+    return 0;
+  loc = tcc_ir_frame_alloc(loc, size, -size);
+  tcc_ir_assign_physical_register(tcc_state->ir, vr, loc, -1, -1);
+  tcc_ir_set_original_offset(tcc_state->ir, vr, loc);
+  if (size == 8)
+    tcc_ir_set_llong_type(tcc_state->ir, vr);
+  svalue_init(sv);
+  sv->type.t = t;
+  sv->type.ref = NULL;
+  sv->r = VT_LOCAL | VT_LVAL;
+  sv->vr = vr;
+  sv->c.i = loc;
+  return 1;
+}
+
+/* Pushes local `v` widened to u64. */
+static void m3_get64(const SValue *v)
+{
+  vpushv((SValue *)v);
+  gen_cast_s(VT_LLONG | VT_UNSIGNED);
+}
+
+/* Pops the u64 on top of the stack into u32 local `v`, keeping bits sh..sh+31. */
+static void m3_set32(const SValue *v, int sh)
+{
+  if (sh)
+  {
+    vpushi(sh);
+    gen_op(TOK_SHR);
+  }
+  gen_cast_s(VT_INT | VT_UNSIGNED);
+  m3_set(v);
+}
+
+int __attribute__((noinline)) try_inline_multi3(const char *func_name, Sym *call_func_sym, SValue *saved_args,
+                                                int nargs, const SValue *ret, int ret_nregs, int vfp_ret_words,
+                                                int nrvo_vreg, int nrvo_ptr_vreg, int call_id)
+{
+  const int u32 = VT_INT | VT_UNSIGNED, u64 = VT_LLONG | VT_UNSIGNED;
+  SValue T, L0, W1, W2, L1;
+
+  if (nargs != 2 || strcmp(func_name, "__multi3") || ret_nregs != 0 || vfp_ret_words || !call_func_sym ||
+      !call_func_sym->type.ref || TCC_OPT(tcc_state, optimize) < 1 || tcc_ir_opt_pass_disabled("inline:multi3"))
+    return 0;
+  if (!m3_is_ti(&call_func_sym->type.ref->type) || !m3_is_ti(&ret->type) || !m3_is_ti(&saved_args[0].type) ||
+      !m3_is_ti(&saved_args[1].type) || !(saved_args[0].r & VT_LVAL) || !(saved_args[1].r & VT_LVAL))
+    return 0;
+  if (!m3_local(&T, u64) || !m3_local(&L0, u32) || !m3_local(&W1, u32) || !m3_local(&W2, u32) ||
+      !m3_local(&L1, u32))
+    return 0;
+  const SValue *a = &saved_args[0], *b = &saved_args[1];
+
+  /* The call is gone: its parameters too, the sret pointer emitted before the
+   * argument span included. */
+  for (int i = 0; i < tcc_state->ir->next_instruction_index; i++)
+  {
+    if (tcc_state->ir->compact_instructions[i].op != TCCIR_OP_FUNCPARAMVAL)
+      continue;
+    IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+    if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2)) == call_id)
+      tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+  }
+
+  /* The schoolbook carry chain gcc emits, in shapes the UMULL/UMAAL fusions
+   * take (a word product plus a word):
+   *   T = a0*b0;              L0 = lo32(T)
+   *   T = a1*b0 + hi32(T);    W1 = lo32(T); W2 = hi32(T)
+   *   T = a0*b1 + W1;         L1 = lo32(T)
+   *   lo = L1:L0
+   *   hi = a1*b1 + W2 + hi32(T) + a.lo*b.hi + a.hi*b.lo */
+  m3_prod(a, 0, b, 0);
+  m3_set(&T);
+  vpushv(&T);
+  m3_set32(&L0, 0);
+  m3_prod(a, 1, b, 0);
+  vpushv(&T);
+  m3_hi32();
+  gen_op('+');
+  m3_set(&T);
+  vpushv(&T);
+  m3_set32(&W1, 0);
+  vpushv(&T);
+  m3_set32(&W2, 32);
+  m3_prod(a, 0, b, 1);
+  m3_get64(&W1);
+  gen_op('+');
+  m3_set(&T);
+  vpushv(&T);
+  m3_set32(&L1, 0);
+  /* lo */
+  m3_get64(&L1);
+  vpushi(32);
+  gen_op(TOK_SHL);
+  m3_get64(&L0);
+  gen_op('|');
+  /* hi */
+  m3_prod(a, 1, b, 1);
+  m3_get64(&W2);
+  gen_op('+');
+  vpushv(&T);
+  m3_hi32();
+  gen_op('+');
+  m3_load(a, 0, u64);
+  m3_load(b, 8, u64);
+  gen_op('*');
+  gen_op('+');
+  m3_load(a, 8, u64);
+  m3_load(b, 0, u64);
+  gen_op('*');
+  gen_op('+');
+  /* Both halves are computed before either store: the result buffer may be
+   * an operand's own storage (NRVO of `t8 = mulw(t7, t8)`). */
+  m3_push_result(ret, nrvo_vreg, nrvo_ptr_vreg);
+  m3_half_of_top(8);
+  vswap();
+  vstore();
+  vpop();
+  m3_push_result(ret, nrvo_vreg, nrvo_ptr_vreg);
+  m3_half_of_top(0);
+  vswap();
+  vstore();
+  vpop();
+  /* the call's value: the result buffer */
+  m3_push_result(ret, nrvo_vreg, nrvo_ptr_vreg);
+  return 1;
 }
 
 /* Redirect a call to a __tcc_* helper: NOP old params, emit new call via gen_ir_call_args. */
@@ -114,7 +392,7 @@ static int call_result_discarded(void)
   return tok == ';' && discarded_call_vtop != NULL && vtop - 1 == discarded_call_vtop;
 }
 
-void unary_funcall(void)
+static void unary_funcall_body(void)
 {
   int n, t, r, size, align;
   Sym *s;
@@ -130,6 +408,10 @@ void unary_funcall(void)
     /* pointer test (no array accepted) */
     if ((vtop->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR)
     {
+      /* a byte-reversed pointer member (big-endian scalar_storage_order) is
+         loaded and swapped while it is still typed as a pointer */
+      if ((vtop->r & VT_LVAL) && vtop->sso_reversed)
+        gv(RC_INT);
       vtop->type = *pointed_type(&vtop->type);
       if ((vtop->type.t & VT_BTYPE) != VT_FUNC)
         goto error_func;
@@ -169,9 +451,9 @@ void unary_funcall(void)
     int emit_set_chain = 1;
     for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
     {
-      if (tcc_state->nested_funcs[ni].sym == call_func_sym)
+      if (tcc_state->nested_funcs[ni]->sym == call_func_sym)
       {
-        call_nf = &tcc_state->nested_funcs[ni];
+        call_nf = tcc_state->nested_funcs[ni];
         break;
       }
     }
@@ -220,14 +502,27 @@ void unary_funcall(void)
   if (!NOEVAL_WANTED && tcc_state->ir)
     call_id = tcc_state->ir->next_call_id++;
 
+  /* An NRVO hint (expr_eq, a declaration's initializer) is for the first call
+   * of the right-hand side, the outermost one: taken now, so that no call
+   * among the arguments -- whose result is not the value assigned -- can
+   * claim the destination as its buffer. */
+  const int nrvo_hint = tcc_state->nrvo_target_active;
+  tcc_state->nrvo_target_active = 0;
+
   sa = s->next; /* first parameter */
   nb_args = regsize = 0;
   int nb_implicit_args = 0; /* sret pointer counted in nb_args but not saved_arg_count */
+  /* Hard-float result in s0..s(n-1) (gfunc_sret_vfp_words): the buffer gets
+   * no hidden argument; the registers are stored into it after the call. */
+  int vfp_ret_words = 0;
+  SValue vfp_ret_ptr;
   /* compute first implicit argument if a composite type is returned */
   if ((s->type.t & VT_BTYPE) == VT_STRUCT || (s->type.t & VT_COMPLEX))
   {
     variadic = (s->f.func_type == FUNC_ELLIPSIS);
     ret_nregs = gfunc_sret(&s->type, variadic, &ret.type, &ret_align, &regsize);
+    if (ret_nregs == 0)
+      vfp_ret_words = gfunc_sret_vfp_words(&s->type, variadic);
     if (ret_nregs <= 0)
     {
       /* get some space for the returned structure */
@@ -264,7 +559,7 @@ void unary_funcall(void)
       int nrvo_ptr_vreg = -1;
       int sret_loc = 0;
       int callee_is_nested = (call_func_sym && call_func_sym->a.nested_func);
-      if (ret_nregs == 0 && tcc_state->nrvo_target_active &&
+      if (ret_nregs == 0 && nrvo_hint &&
           tcc_state->nrvo_target_size == size &&
           tcc_state->nrvo_target_align == align &&
           !callee_is_nested)
@@ -282,13 +577,14 @@ void unary_funcall(void)
           nrvo_vreg = tcc_state->nrvo_target_vreg;
         }
         nrvo_claimed = 1;
-        /* Consume the hint: nested calls inside this expression must not
-         * try to claim the same slot. */
-        tcc_state->nrvo_target_active = 0;
       }
       else
       {
-        loc = tcc_ir_frame_alloc_ret_temp(loc, size, -align);
+        /* At least word-aligned: tcc_ir_sret_dealias keeps a buffer only at
+         * a word-aligned address (an optimized callee may LDM/LDRD through
+         * it), so a char-array struct's temporary would get a second one --
+         * 256 KB more frame for tests2/119's big_struct. */
+        loc = tcc_ir_frame_alloc_ret_temp(loc, size, -(align < 4 ? 4 : align));
         tcc_ir_frame_note_type(loc, &s->type);
         sret_loc = loc;
       }
@@ -331,6 +627,12 @@ void unary_funcall(void)
         vtop--;
         print_vstack("unary, function call");
       }
+      else if (vfp_ret_words)
+      {
+        vfp_ret_ptr = *vtop;
+        pin_call_arg_temp_slot(vtop);
+        vtop--;
+      }
       else
       {
         /* ret_nregs == 0: struct is returned via an implicit first argument
@@ -350,6 +652,7 @@ void unary_funcall(void)
           LOG_CODEGEN("FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
                       TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+          pin_call_arg_temp_slot(vtop);
           tcc_ir_frame_note_sret_call(call_id, size);
         }
         vtop--;
@@ -396,6 +699,10 @@ void unary_funcall(void)
   int can_inline_eval = 0;
   int can_optimize_string_builtin = 0;
   int can_optimize_fputs_family = 0;
+  /* Folding/rewriting a call by its NAME is only valid when the callee is the
+   * library function: not a static function of this TU that reuses the name,
+   * and not under plain -fno-builtin.  The __builtin_ spellings always fold. */
+  int libcall_by_name_ok = 1;
   const char *func_name = NULL;
   int inl_first_obj = 0; /* frame objects of an inline expansion start here (tcc_ir_frame_scope_end) */
 
@@ -403,6 +710,9 @@ void unary_funcall(void)
   if (call_func_sym && call_func_sym->v >= TOK_IDENT)
   {
     func_name = get_tok_str(call_func_sym->v, NULL);
+    if (func_name && strncmp(func_name, "__builtin_", 10) != 0 &&
+        ((call_func_sym->type.t & VT_STATIC) || (tcc_state->no_builtin_funcs & NO_BUILTIN_ALL)))
+      libcall_by_name_ok = 0;
 
     /* Calling alloca() (library version) modifies SP; the caller
      * needs a frame pointer so the epilogue can restore SP. */
@@ -420,7 +730,8 @@ void unary_funcall(void)
     {
       int is_unsigned;
       can_inline_builtin =
-          get_builtin_abs_info(func_name, &is_unsigned) && builtin_abs_decl_matches(call_func_sym, func_name);
+          (get_builtin_abs_info(func_name, &is_unsigned) && builtin_abs_decl_matches(call_func_sym, func_name)) ||
+          !strcmp(func_name, "__multi3"); /* try_inline_multi3 */
     }
 
     can_optimize_string_builtin = resolve_str_builtin_id(call_func_sym->v, func_name) != STRBI_UNKNOWN;
@@ -439,7 +750,7 @@ void unary_funcall(void)
    * Also enter this path for non-static auto-inline candidates: they don't
    * have VT_INLINE (needed for correct ELF linkage) but should still be
    * inlined at call sites within this translation unit. */
-  if (call_func_sym && tcc_state->optimize &&
+  if (call_func_sym && TCC_OPT(tcc_state, optimize) &&
       ((call_func_sym->type.t & VT_INLINE) ||
        (call_func_sym->type.ref &&
         (call_func_sym->type.ref->f.func_auto_inline || call_func_sym->type.ref->f.func_eval_only_inline))))
@@ -460,7 +771,7 @@ void unary_funcall(void)
    * leftover the old unconditional refusal was written against. */
   int self_inline_ok = 0;
   if (can_inline_eval && call_func_sym == tcc_state->cur_func_sym &&
-      !tcc_state->in_inline_expansion && tcc_state->opt_inline_functions &&
+      !tcc_state->in_inline_expansion && TCC_OPT(tcc_state, opt_inline_functions) &&
       call_func_sym->type.ref && call_func_sym->type.ref->f.func_auto_inline &&
       !call_func_sym->a.nested_func)
   {
@@ -484,7 +795,7 @@ void unary_funcall(void)
   int pf_file_idx = -1;   /* index of FILE* arg, or -1 for stdout */
   int pf_vararg_idx = -1; /* index of first vararg in saved_args[], or high value for va_list fns */
   int pf_min_args = 0;    /* minimum number of args for a valid call */
-  if (func_name && tcc_state->optimize > 0)
+  if (func_name && TCC_OPT(tcc_state, optimize) > 0)
   {
     /* --- printf family (stdout, variadic) --- */
     if (strcmp(func_name, "printf") == 0 || strcmp(func_name, "printf_unlocked") == 0 ||
@@ -976,6 +1287,7 @@ va_arg_pack_done:
                       "vtop_vr=%d",
                       call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), nb_args, vtop->r, vtop->vr);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+          pin_call_arg_temp_slot(vtop);
         }
         vtop--; /* consumed */
       }
@@ -1034,6 +1346,7 @@ va_arg_pack_done:
                     "vtop_vr=%d",
                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), n, nb_args, vtop->r, vtop->vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+          pin_call_arg_temp_slot(vtop);
       }
       vtop--; /* consumed */
       end_macro();
@@ -1046,7 +1359,7 @@ va_arg_pack_done:
   /* Try constant folding for math functions */
   int folded = 0;
   int nb_real_args = nb_args - nb_implicit_args;
-  if (can_try_fold && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
+  if (can_try_fold && libcall_by_name_ok && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
   {
     folded = try_fold_math_call(func_name, saved_args, saved_arg_count);
     if (!folded)
@@ -1091,6 +1404,16 @@ va_arg_pack_done:
       --vtop;
       inlined = 1;
     }
+  }
+
+  if (!folded && !inlined && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED &&
+      try_inline_multi3(func_name, call_func_sym, saved_args, saved_arg_count, &ret, ret_nregs, vfp_ret_words,
+                        nrvo_call_vreg, nrvo_call_ptr_vreg, call_id))
+  {
+    /* Move result over function pointer */
+    vtop[-1] = vtop[0];
+    --vtop;
+    inlined = 1;
   }
 
   /* Try compile-time evaluation of small inline functions called with
@@ -1534,7 +1857,7 @@ va_arg_pack_done:
 
   int string_builtin_optimized = 0;
   if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && !printf_family_optimized &&
-      !fputs_family_optimized && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
+      !fputs_family_optimized && libcall_by_name_ok && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
   {
     string_builtin_optimized =
         unary_funcall_opt_string_builtins(call_func_sym ? call_func_sym->v : 0, func_name, saved_args, nb_real_args,
@@ -1569,8 +1892,9 @@ va_arg_pack_done:
             * every depth but 0, so the nested attempt never starts. */
            (call_func_sym != tcc_state->cur_func_sym || self_inline_ok) &&
            /* Allow nested inlining under controlled conditions:
-            * - Void/struct/integer return, never a function already being
-            *   expanded (mutual recursion, pr22379), up to INLINE_NEST_MAX
+            * - Void/struct/integer return (bool too: zig.h's overflow
+            *   helpers), never a function already being expanded (mutual
+            *   recursion, pr22379), up to INLINE_NEST_MAX
             *   deep: zig.h's integer helpers nest five deep (saturating sub ->
             *   overflow sub -> truncate -> shift), under called-once bodies
             *   that nest as deep as zig's call chains, and a cap of 3 left the
@@ -1588,6 +1912,7 @@ va_arg_pack_done:
              ((call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID ||
               (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_STRUCT ||
               (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_PTR ||
+              (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_BOOL ||
               ((call_func_sym->type.ref->type.t & VT_BTYPE) <= VT_LLONG)))))
   {
     /* ---- Token-level inline expansion ----
@@ -1608,6 +1933,12 @@ va_arg_pack_done:
     if (call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl &&
         !(inline_fn && inline_fn->func_str && inline_body_has_loops(inline_fn->func_str)))
       force_always_inline = 1;
+    /* Token replay binds the body's names in the caller's scope and gives a
+     * `static` local per site, so such an always_inline body stays a call. */
+    if (force_always_inline && inline_fn && inline_fn->func_str &&
+        (inline_body_has_static_local(inline_fn->func_str) ||
+         inline_body_has_unsafe_shadowed_ident(inline_fn->func_str, call_func_sym)))
+      force_always_inline = 0;
     /* Note: has_inline_asm no longer blocks always_inline expansion.
      * tccasm.c's maybe_substitute_inline_const_arg() substitutes constant
      * arguments for 'n'/'i' asm constraints during inline replay, so
@@ -1705,7 +2036,7 @@ va_arg_pack_done:
      * that hurt value tracking in the caller.  Let IPC replace the call. */
     int skip_ipc_cached = 0;
     if (call_func_sym && call_func_sym->type.ref &&
-        call_func_sym->type.ref->f.func_eval_only_inline && tcc_state->opt_ipc)
+        call_func_sym->type.ref->f.func_eval_only_inline && TCC_OPT(tcc_state, opt_ipc))
     {
       int64_t _v; int _b;
       if (tcc_ir_lookup_const_result(tcc_state, call_func_sym->v, &_v, &_b))
@@ -1737,10 +2068,12 @@ va_arg_pack_done:
      * __tcc_* helpers (mempcpy, memcpy, strcpy, etc.) — inlining them
      * prevents the redirect and preserves test-harness abort checks that
      * should be bypassed. */
-    if (!force_always_inline && !has_addr_of_label && inline_fn && inline_fn->func_str && !has_inline_asm &&
+    if (!force_always_inline && !has_addr_of_label && inline_fn && inline_fn->func_str &&
+        (!has_inline_asm || (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("asm:machine_call") &&
+                             inline_body_asm_is_machine(inline_fn->func_str))) &&
         !func_has_label_addr && call_func_sym->type.ref && !skip_ipc_cached &&
         (call_func_sym->type.ref->f.func_auto_inline || eval_only_all_const) &&
-        !call_func_sym->type.ref->f.func_noinline && (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
+        !call_func_sym->type.ref->f.func_noinline && (TCC_OPT(tcc_state, opt_inline_functions) || TCC_OPT(tcc_state, opt_inline_small)) &&
         !strbi_is_redirect_target(resolve_str_builtin_id(0, func_name)) &&
         /* Don't inline a nested function with parent-scope captures unless
          * those captures are reachable from the current scope.  Reachable
@@ -1761,7 +2094,8 @@ va_arg_pack_done:
          * growth by the called_once_budget. */
         (call_func_sym->type.ref->f.func_called_once
              ? tcc_state->inline_expansion_depth < 32 && inline_fn->func_str->len <= tcc_state->called_once_budget
-             : auto_inline_sig_ok(call_func_sym) &&
+             : auto_inline_sig_ok(call_func_sym) && !inline_into_giant_caller(call_func_sym, inline_fn) &&
+                   !inline_wrapper_cap_hit(call_func_sym, inline_fn) &&
                    /* below the first level, within the caller's budget */
                    (!tcc_state->in_inline_expansion || inline_fn->func_str->len <= TINY_INLINE_TOKENS ||
                     inline_fn->func_str->len <= tcc_state->nested_inline_budget)) &&
@@ -1771,15 +2105,10 @@ va_arg_pack_done:
          * where bar takes void).  Use nb_real_args to exclude the implicit sret
          * pointer that struct-returning calls add to nb_args. */
         auto_inline_param_count(call_func_sym) == (nb_args - nb_implicit_args) &&
-        /* Budget: a "call-heavy" auto-inline body (one whose optimized IR
-         * still contains a non-foldable call, e.g. a printf wrapper) buys no
-         * savings when duplicated — it just multiplies the surviving call.
-         * Cap how many times such a callee is expanded; beyond the budget,
-         * fall back to a normal call.  Without this, a small helper invoked
-         * dozens of times by macro expansion (check() in 55_lshift_type at
-         * -O2) blows up compiler memory ("memory full"). */
+        /* Non-wrapper call-heavy bodies retain the translation-unit expansion cap. */
         !(call_func_sym->type.ref->f.func_inline_call_heavy &&
-          inline_fn->inline_count >= 8) &&
+          (!call_func_sym->type.ref->f.func_inl_wrapper ||
+           tcc_ir_opt_pass_disabled("inline:wrapper_local_budget")) && inline_fn->inline_count >= 8) &&
         ((call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID || inline_body_has_return_stmt(inline_fn->func_str)))
     {
       /* Safety: if the current outer macro stream is already reading from this
@@ -1813,6 +2142,8 @@ va_arg_pack_done:
                           call_func_sym->type.ref ? (call_func_sym->type.ref->type.t & VT_BTYPE) : -1, nb_args,
                           nb_implicit_args);
         force_always_inline = 1;
+        if (!call_func_sym->type.ref->f.func_inl_wrapper || !inline_inside_wrapper())
+          inline_fn->caller_count++;
         if (call_func_sym->type.ref->f.func_inline_call_heavy)
           inline_fn->inline_count++;
         if (call_func_sym->type.ref->f.func_called_once)
@@ -1840,15 +2171,15 @@ va_arg_pack_done:
                 "[auto-inline] callsite: NOT inlining %s: inline_fn=%p func_str=%p opt=%d/%d sig_ok=%d void=%d "
                 "has_ret=%d\n",
                 get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL), (void *)inline_fn,
-                inline_fn ? (void *)inline_fn->func_str : NULL, tcc_state->opt_inline_functions,
-                tcc_state->opt_inline_small, auto_inline_sig_ok(call_func_sym),
+                inline_fn ? (void *)inline_fn->func_str : NULL, TCC_OPT(tcc_state, opt_inline_functions),
+                TCC_OPT(tcc_state, opt_inline_small), auto_inline_sig_ok(call_func_sym),
                 (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID,
                 inline_fn && inline_fn->func_str ? inline_body_has_return_stmt(inline_fn->func_str) : -1);
       LOG_INLINE_STRUCT("[auto-inline] callsite: NOT inlining %s: inline_fn=%p func_str=%p opt=%d/%d sig_ok=%d "
                         "void=%d has_ret=%d auto_inline=%d",
                         get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL), (void *)inline_fn,
-                        inline_fn ? (void *)inline_fn->func_str : NULL, tcc_state->opt_inline_functions,
-                        tcc_state->opt_inline_small, auto_inline_sig_ok(call_func_sym),
+                        inline_fn ? (void *)inline_fn->func_str : NULL, TCC_OPT(tcc_state, opt_inline_functions),
+                        TCC_OPT(tcc_state, opt_inline_small), auto_inline_sig_ok(call_func_sym),
                         (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID,
                         inline_fn && inline_fn->func_str ? inline_body_has_return_stmt(inline_fn->func_str) : -1,
                         call_func_sym->type.ref->f.func_auto_inline);
@@ -1924,7 +2255,12 @@ va_arg_pack_done:
         SValue arg_val = saved_args[pi];
         inline_eval_cast_arg_to_param(&arg_val, &param_sym->type);
 
+        /* Only record the constant when the body never writes/addresses the
+         * parameter: tccasm.c's maybe_substitute_inline_const_arg() feeds it to
+         * inline-asm operands, and if the body assigns to the parameter first,
+         * the asm must see the new value, not the argument. */
         if (force_always_inline && inline_arg_is_constant_like(&saved_args[pi]) &&
+            !inline_body_writes_ident(inline_fn ? inline_fn->func_str : NULL, pv) &&
             tcc_state->inline_const_arg_count < countof(tcc_state->inline_const_args))
         {
           int map_idx = tcc_state->inline_const_arg_count++;
@@ -2007,6 +2343,7 @@ va_arg_pack_done:
       int saved_inline_return_loc = tcc_state->inline_return_loc;
       int saved_inline_return_vr = tcc_state->inline_return_vr;
       uint8_t saved_inline_return_redirected = tcc_state->inline_return_redirected;
+      uint8_t saved_inline_return_copied = tcc_state->inline_return_copied;
 
       /* Set up inline function context */
       func_vt = s->type; /* return type */
@@ -2089,6 +2426,7 @@ va_arg_pack_done:
       tcc_state->inline_return_loc = inline_ret_loc;
       tcc_state->inline_return_vr = inline_ret_vr;
       tcc_state->inline_return_redirected = 0;
+      tcc_state->inline_return_copied = 0;
       if (tcc_state->inline_expansion_depth < INLINE_NEST_MAX)
         tcc_state->inline_expansion_syms[tcc_state->inline_expansion_depth] = call_func_sym;
       tcc_state->inline_expansion_depth++;
@@ -2134,6 +2472,7 @@ va_arg_pack_done:
       tcc_state->inline_return_loc = saved_inline_return_loc;
       tcc_state->inline_return_vr = saved_inline_return_vr;
       tcc_state->inline_return_redirected = saved_inline_return_redirected;
+      tcc_state->inline_return_copied = saved_inline_return_copied;
       tcc_state->inline_expansion_depth--;
       func_vt = saved_func_vt;
       func_var = saved_func_var;
@@ -2193,7 +2532,7 @@ va_arg_pack_done:
       /* When in sizeof/typeof context, skip IR emission but still handle stack */
       --vtop;
     }
-    else if ((s->type.t & VT_BTYPE) == VT_VOID)
+    else if ((s->type.t & VT_BTYPE) == VT_VOID || vfp_ret_words)
     {
       /* In IR mode, make sure the call target is a VALUE (register/temp),
        * not an lvalue. Indirect calls like tabl1[i]() produce an lvalue
@@ -2266,6 +2605,13 @@ va_arg_pack_done:
     }
     else if (ret_nregs == 0)
     {
+      /* Returned in s0..s(n-1): store them into the buffer before anything
+       * else can run (the store must follow the call directly). */
+      if (vfp_ret_words && !NOEVAL_WANTED)
+      {
+        const int cid = gen_vfp_ret_transfer(&vfp_ret_ptr, vfp_ret_words, 0);
+        tcc_ir_frame_note_sret_call(cid, type_size(&s->type, &align));
+      }
       /* Struct returned via sret pointer: the callee already wrote to the
        * sret buffer. Just push the buffer location as an lvalue. */
       vsetc(&ret.type, ret.r, &ret.c);
@@ -2303,7 +2649,12 @@ va_arg_pack_done:
       vtop->vr = return_vreg;
 
       /* handle packed struct return */
-      if (((s->type.t & VT_BTYPE) == VT_STRUCT) && ret_nregs)
+      /* A _Complex float returned in a register (hard-float: d0) is wider than
+       * one core register, so like a small struct it is parked in a frame
+       * temporary and then used as an lvalue; complex arithmetic and
+       * __real__/__imag__ address the value in memory. */
+      if ((((s->type.t & VT_BTYPE) == VT_STRUCT) ||
+           ((s->type.t & VT_COMPLEX) && type_size(&s->type, &align) > 4)) && ret_nregs)
       {
         int addr, offset;
 
@@ -2367,4 +2718,12 @@ va_arg_pack_done:
       tcc_tcov_block_end(tcc_state, -1);
     CODE_OFF();
   }
+}
+
+/* Temp slots pinned by this call's arguments are free again once it is lowered. */
+void unary_funcall(void)
+{
+  unsigned saved_pending = pending_call_temp_slots;
+  unary_funcall_body();
+  pending_call_temp_slots = saved_pending;
 }

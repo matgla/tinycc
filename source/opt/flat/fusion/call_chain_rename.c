@@ -73,8 +73,7 @@ int tcc_ir_opt_call_chain_rename(TCCIRState *ir)
     /* PARAMVAL src may have is_lval=1 for a VAR (load V's storage into the
      * param reg).  After rename the value is already in the register, so the
      * new src is emitted is_lval=0; V's btype/is_unsigned are preserved. */
-    IROperand pv_src2 = tcc_ir_op_get_src2(ir, next_q);
-    int param_idx = TCCIR_DECODE_PARAM_IDX(irop_get_imm64_ex(ir, pv_src2));
+    int param_idx = TCCIR_DECODE_PARAM_IDX(tcc_ir_op_src2_imm(ir, next_q));
     if (param_idx != 0)
       continue;
 
@@ -86,32 +85,30 @@ int tcc_ir_opt_call_chain_rename(TCCIRState *ir)
     for (int k = j + 1; k < n; k++)
     {
       IRQuadCompact *kq = &ir->compact_instructions[k];
+      if (kq->is_jump_target) /* before the NOP skip: a NOP can be the join */
+        break;
       if (kq->op == TCCIR_OP_NOP)
         continue;
       if (kq->op == TCCIR_OP_JUMP || kq->op == TCCIR_OP_JUMPIF || kq->op == TCCIR_OP_IJUMP ||
-          kq->op == TCCIR_OP_RETURNVOID || kq->op == TCCIR_OP_RETURNVALUE || kq->op == TCCIR_OP_SWITCH_TABLE ||
-          kq->is_jump_target)
+          kq->op == TCCIR_OP_RETURNVOID || kq->op == TCCIR_OP_RETURNVALUE || kq->op == TCCIR_OP_SWITCH_TABLE)
         break;
 
       int reads_v = 0;
       if (irop_config[kq->op].has_src1)
       {
-        IROperand s = tcc_ir_op_get_src1(ir, kq);
-        if (irop_get_vreg(s) == v_vr)
+        if (tcc_ir_op_src1_vreg(ir, kq) == v_vr)
           reads_v = 1;
       }
       if (!reads_v && irop_config[kq->op].has_src2)
       {
-        IROperand s = tcc_ir_op_get_src2(ir, kq);
-        if (irop_get_vreg(s) == v_vr)
+        if (tcc_ir_op_src2_vreg(ir, kq) == v_vr)
           reads_v = 1;
       }
       /* STORE.dest is also a read of the address vreg, not a redef. */
       if (!reads_v && (kq->op == TCCIR_OP_STORE || kq->op == TCCIR_OP_STORE_INDEXED ||
                        kq->op == TCCIR_OP_STORE_POSTINC))
       {
-        IROperand d = tcc_ir_op_get_dest(ir, kq);
-        if (irop_get_vreg(d) == v_vr)
+        if (tcc_ir_op_dest_vreg(ir, kq) == v_vr)
           reads_v = 1;
       }
       if (reads_v)
@@ -119,8 +116,7 @@ int tcc_ir_opt_call_chain_rename(TCCIRState *ir)
 
       if (irop_config[kq->op].has_dest)
       {
-        IROperand d = tcc_ir_op_get_dest(ir, kq);
-        if (irop_get_vreg(d) == v_vr && !d.is_lval)
+        if (tcc_ir_op_dest_vreg(ir, kq) == v_vr && !tcc_ir_op_dest_is_lval(ir, kq))
         {
           /* Honest redefinition: V overwritten before any later read. */
           if (kq->op == TCCIR_OP_FUNCCALLVAL || kq->op == TCCIR_OP_ASSIGN || kq->op == TCCIR_OP_LOAD)

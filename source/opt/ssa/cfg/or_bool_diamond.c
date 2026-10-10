@@ -55,10 +55,9 @@ int ssa_opt_or_bool_diamond(TCCIRState *ir)
       continue;
     if (!stackoff_same_slot(tcc_ir_op_get_dest(ir, q_st_f), slot))
       continue;
-    IROperand st_f_src = tcc_ir_op_get_src1(ir, q_st_f);
-    if (!irop_is_immediate(st_f_src))
+    if (!tcc_ir_op_src1_is_imm(ir, q_st_f))
       continue;
-    int64_t val_f = irop_get_imm64_ex(ir, st_f_src);
+    int64_t val_f = tcc_ir_op_src1_imm(ir, q_st_f);
 
     /* Unique JUMP targeting i_or; the STORE just before it writes the true-arm value. */
     int i_jmp = -1;
@@ -68,7 +67,7 @@ int ssa_opt_or_bool_diamond(TCCIRState *ir)
       IRQuadCompact *qj = &ir->compact_instructions[j];
       if (qj->op != TCCIR_OP_JUMP && qj->op != TCCIR_OP_JUMPIF)
         continue;
-      int tgt = (int)tcc_ir_op_get_dest(ir, qj).u.imm32;
+      int tgt = (int)tcc_ir_op_dest_u_imm32(ir, qj);
       if (tgt != i_or)
         continue;
       if (qj->op != TCCIR_OP_JUMP)
@@ -92,10 +91,9 @@ int ssa_opt_or_bool_diamond(TCCIRState *ir)
       continue;
     if (!stackoff_same_slot(tcc_ir_op_get_dest(ir, q_st_t), slot))
       continue;
-    IROperand st_t_src = tcc_ir_op_get_src1(ir, q_st_t);
-    if (!irop_is_immediate(st_t_src))
+    if (!tcc_ir_op_src1_is_imm(ir, q_st_t))
       continue;
-    int64_t val_t = irop_get_imm64_ex(ir, st_t_src);
+    int64_t val_t = tcc_ir_op_src1_imm(ir, q_st_t);
 
     /* Only handle val_t=1, val_f=0 for now (the common `bool |= 1` shape). */
     if (val_t != 1 || val_f != 0)
@@ -108,7 +106,7 @@ int ssa_opt_or_bool_diamond(TCCIRState *ir)
       IRQuadCompact *qj = &ir->compact_instructions[j];
       if (qj->op != TCCIR_OP_JUMPIF)
         continue;
-      int tgt = (int)tcc_ir_op_get_dest(ir, qj).u.imm32;
+      int tgt = (int)tcc_ir_op_dest_u_imm32(ir, qj);
       if (tgt == i_st_f)
       {
         i_jmpif = j;
@@ -127,7 +125,7 @@ int ssa_opt_or_bool_diamond(TCCIRState *ir)
       IRQuadCompact *qj = &ir->compact_instructions[j];
       if (qj->op != TCCIR_OP_JUMP && qj->op != TCCIR_OP_JUMPIF)
         continue;
-      int tgt = (int)tcc_ir_op_get_dest(ir, qj).u.imm32;
+      int tgt = (int)tcc_ir_op_dest_u_imm32(ir, qj);
       if (tgt == i_st_f || tgt == i_or)
         extra_target = 1;
     }

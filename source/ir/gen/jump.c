@@ -85,7 +85,7 @@ void tcc_ir_backpatch_first(TCCIRState *ir, int t, int target_address)
   do
   {
     lp = t;
-    next = tcc_ir_op_get_dest(ir, &ir->compact_instructions[t]).u.imm32;
+    next = tcc_ir_op_dest_u_imm32(ir, &ir->compact_instructions[t]);
     /* Stop if we hit end of chain or go out of bounds */
     if (next < 0 || next >= ir->next_instruction_index)
       break;

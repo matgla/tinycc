@@ -161,36 +161,20 @@ UT_TEST(test_trip_count_gt_range_zero_and_negative)
   return 0;
 }
 
-UT_TEST(test_trip_count_ne_exact)
+UT_TEST(test_trip_count_equality_exit_not_computable)
 {
-  /* exit when i==limit: i=0,2,4,6,8 (exit at 10) -> 5 = 10/2 */
-  UT_ASSERT_EQ(compute_trip_count(0, 10, 2, UT_NE), 5);
-  return 0;
-}
-
-UT_TEST(test_trip_count_ne_zero_range_exits_immediately)
-{
-  UT_ASSERT_EQ(compute_trip_count(5, 5, 1, UT_NE), 0);
-  return 0;
-}
-
-UT_TEST(test_trip_count_ne_negative_range_infinite)
-{
-  /* step>0 but limit below init: never reaches limit -> -1 (infinite) */
-  UT_ASSERT_EQ(compute_trip_count(10, 5, 1, UT_NE), -1);
-  return 0;
-}
-
-UT_TEST(test_trip_count_ne_not_divisible_infinite)
-{
-  /* 10/3 has remainder -> would step over limit forever -> -1 */
-  UT_ASSERT_EQ(compute_trip_count(0, 10, 3, UT_NE), -1);
+  /* The trip count of an equality exit depends on whether the test sits before
+   * or after the increment, which this helper cannot see: -1 for both.  Exit
+   * when i != C in particular runs once or twice, never C - init trips. */
+  UT_ASSERT_EQ(compute_trip_count(0, 3, 1, UT_NE), -1);
+  UT_ASSERT_EQ(compute_trip_count(2, 3, 1, UT_NE), -1);
+  UT_ASSERT_EQ(compute_trip_count(0, 10, 2, UT_EQ), -1);
+  UT_ASSERT_EQ(compute_trip_count(5, 5, 1, UT_EQ), -1);
   return 0;
 }
 
 UT_TEST(test_trip_count_unsupported_cond)
 {
-  UT_ASSERT_EQ(compute_trip_count(0, 10, 1, UT_EQ), -1);
   UT_ASSERT_EQ(compute_trip_count(0, 10, 1, UT_LT), -1);
   UT_ASSERT_EQ(compute_trip_count(0, 10, 1, 0x00), -1);
   return 0;
@@ -709,12 +693,12 @@ UT_TEST(test_loop_size_cmp_orders_ascending_by_span)
   UT_ASSERT(loop_size_cmp(&big, &small) > 0);
   UT_ASSERT_EQ(loop_size_cmp(&equal_a, &equal_b), 0);
 
-  /* qsort() end-to-end: array sorts ascending by span. */
+  /* tcc_qsort() end-to-end: array sorts ascending by span. */
   IRLoop arr[3];
   arr[0] = big;
   arr[1] = small;
   arr[2] = equal_a;
-  qsort(arr, 3, sizeof(IRLoop), loop_size_cmp);
+  tcc_qsort(arr, 3, sizeof(IRLoop), loop_size_cmp);
   UT_ASSERT_EQ(arr[0].header_idx, small.header_idx);
   UT_ASSERT_EQ(arr[2].header_idx, big.header_idx);
   return 0;

@@ -72,20 +72,19 @@ static int cmpf_trace(TCCIRState *ir, IROperand op, int before_idx, IROperand *b
   if (d < 0)
     return 1;
   IRQuadCompact *dq = &ir->compact_instructions[d];
-  if (irop_get_btype(tcc_ir_op_get_dest(ir, dq)) != IROP_BTYPE_INT32)
+  if (tcc_ir_op_dest_btype(ir, dq) != IROP_BTYPE_INT32)
     return 1;
   IROperand s1 = tcc_ir_op_get_src1(ir, dq);
-  IROperand s2 = tcc_ir_op_get_src2(ir, dq);
 
-  if (dq->op == TCCIR_OP_AND && irop_is_immediate(s2) && !s2.is_sym)
+  if (dq->op == TCCIR_OP_AND && tcc_ir_op_src2_is_imm(ir, dq) && !tcc_ir_op_src2_is_sym(ir, dq))
   {
     *base = s1;
-    *mask = (uint32_t)irop_get_imm64_ex(ir, s2);
+    *mask = (uint32_t)tcc_ir_op_src2_imm(ir, dq);
     return 1;
   }
-  if (dq->op == TCCIR_OP_SHR && irop_is_immediate(s2) && !s2.is_sym)
+  if (dq->op == TCCIR_OP_SHR && tcc_ir_op_src2_is_imm(ir, dq) && !tcc_ir_op_src2_is_sym(ir, dq))
   {
-    int s = (int)irop_get_imm64_ex(ir, s2);
+    int s = (int)tcc_ir_op_src2_imm(ir, dq);
     if (s < 0 || s > 31)
       return 1;
     /* Look for a feeding SHL (mid/high field extract). */
@@ -100,7 +99,7 @@ static int cmpf_trace(TCCIRState *ir, IROperand op, int before_idx, IROperand *b
           IRQuadCompact *dq2 = &ir->compact_instructions[d2];
           IROperand s2b = tcc_ir_op_get_src2(ir, dq2);
           if (dq2->op == TCCIR_OP_SHL && irop_is_immediate(s2b) && !s2b.is_sym &&
-              irop_get_btype(tcc_ir_op_get_dest(ir, dq2)) == IROP_BTYPE_INT32)
+              tcc_ir_op_dest_btype(ir, dq2) == IROP_BTYPE_INT32)
           {
             int a = (int)irop_get_imm64_ex(ir, s2b);
             if (a >= 0 && a <= s)
@@ -143,10 +142,9 @@ int tcc_ir_opt_cmp_field_fuse(TCCIRState *ir)
     IRQuadCompact *jq = &ir->compact_instructions[i + 1];
     if (jq->op != TCCIR_OP_JUMPIF)
       continue;
-    IROperand jcond = tcc_ir_op_get_src1(ir, jq);
-    if (!irop_is_immediate(jcond) || (int)irop_get_imm64_ex(ir, jcond) != TOK_NE)
+    if (!tcc_ir_op_src1_is_imm(ir, jq) || (int)tcc_ir_op_src1_imm(ir, jq) != TOK_NE)
       continue;
-    int target = tcc_ir_op_get_dest(ir, jq).u.imm32;
+    int target = tcc_ir_op_dest_u_imm32(ir, jq);
 
     /* Trace the first unit's two sides to their base words + field masks. */
     IROperand baseA, baseB;
@@ -183,10 +181,9 @@ int tcc_ir_opt_cmp_field_fuse(TCCIRState *ir)
       IRQuadCompact *jk = &ir->compact_instructions[k + 1];
       if (jk->op != TCCIR_OP_JUMPIF || ck->is_jump_target || jk->is_jump_target)
         break;
-      IROperand jc = tcc_ir_op_get_src1(ir, jk);
-      if (!irop_is_immediate(jc) || (int)irop_get_imm64_ex(ir, jc) != TOK_NE)
+      if (!tcc_ir_op_src1_is_imm(ir, jk) || (int)tcc_ir_op_src1_imm(ir, jk) != TOK_NE)
         break;
-      if (tcc_ir_op_get_dest(ir, jk).u.imm32 != target)
+      if (tcc_ir_op_dest_u_imm32(ir, jk) != target)
         break;
       IROperand bA, bB;
       uint32_t kmA, kmB;
@@ -233,14 +230,14 @@ int tcc_ir_opt_cmp_field_fuse(TCCIRState *ir)
       ir->compact_instructions[xor_slot + 1].op = TCCIR_OP_AND;
       tcc_ir_op_set_dest(ir, &ir->compact_instructions[xor_slot + 1], tmv);
       tcc_ir_set_src1(ir, xor_slot + 1, txv);
-      tcc_ir_set_src2(ir, xor_slot + 1, irop_make_imm32(-1, (int32_t)union_mask, IROP_BTYPE_INT32));
+      tcc_ir_set_src2_imm32(ir, xor_slot + 1, (int32_t)union_mask, IROP_BTYPE_INT32);
       cmp_lhs = tmv;
     }
 
     /* last CMP -> CMP cmp_lhs, #0 ; keep the last JUMPIF (!= -> target). */
     ir->compact_instructions[last_cmp].op = TCCIR_OP_CMP;
     tcc_ir_set_src1(ir, last_cmp, cmp_lhs);
-    tcc_ir_set_src2(ir, last_cmp, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
+    tcc_ir_set_src2_imm32(ir, last_cmp, 0, IROP_BTYPE_INT32);
 
     LOG_CMPFUSE("fused %d field compares @%d..%d -> XOR&%#x at @%d (target %d)",
                 units, i, last_jmp, union_mask, xor_slot, target);
@@ -249,9 +246,4 @@ int tcc_ir_opt_cmp_field_fuse(TCCIRState *ir)
   }
 
   return changes;
-}
-
-int tcc_ir_opt_cmp_field_fuse_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_cmp_field_fuse(ctx->ir);
 }

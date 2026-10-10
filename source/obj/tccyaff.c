@@ -29,6 +29,7 @@
 #include "tccyaff.h"
 
 static const char *yaff_lib_read_exports(int fd, const YaffHeader *header, YaffLib *lib);
+static void yaff_lib_free(YaffLib *lib);
 
 #define TCC_YAFF_MAX_SYMBOL_ENTRY_SIZE 255
 
@@ -152,6 +153,7 @@ static void tcc_yaff_fill_arch_section(TCCState *s1, const YaffHeader *header, Y
   memset(out, 0, sizeof(*out));
   out->size = (uint16_t)sizeof(YaffArchSection);
   out->arch = (uint8_t)header->arch;
+  out->flags = YAFF_ARCH_FLAG_EXACT_THUMB;
 
 #if !defined(TCC_TARGET_ARM) && !defined(TCC_TARGET_ARM_THUMB)
   /* Only the ARM backends carry an FP configuration; elsewhere the section
@@ -253,14 +255,17 @@ ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename, int level)
 
   if (header.exported_symbols_amount > 0)
   {
-    YaffLib *lib;
-    const char *err;
-
-    s1->yaff_libs = tcc_realloc(s1->yaff_libs, (s1->nb_yaff_libs + 1) * sizeof(YaffLib));
-    lib = &s1->yaff_libs[s1->nb_yaff_libs++];
-    err = yaff_lib_read_exports(fd, &header, lib);
+    YaffLib lib;
+    const char *err = yaff_lib_read_exports(fd, &header, &lib);
     if (err)
+    {
+      yaff_lib_free(&lib);
       return tcc_error_noabort("%s", err);
+    }
+    /* Registered only once fully read: a half-filled entry would be walked by
+       tcc_yaff_resolve. */
+    s1->yaff_libs = tcc_realloc(s1->yaff_libs, (s1->nb_yaff_libs + 1) * sizeof(YaffLib));
+    s1->yaff_libs[s1->nb_yaff_libs++] = lib;
   }
 
   /* if the dll is already loaded, do not load it */
@@ -274,14 +279,25 @@ ST_FUNC int tcc_load_yaff(TCCState *s1, int fd, const char *filename, int level)
    left for yaff_lib_free. */
 static const char *yaff_lib_read_exports(int fd, const YaffHeader *header, YaffLib *lib)
 {
-  unsigned int region_size, hdr2[2], nbucket, nchain, lookup_size, chain_bytes;
+  unsigned int region_size, hdr2[2], nbucket, nchain, lookup_size, chain_bytes, i;
 
   memset(lib, 0, sizeof(*lib));
+  /* lookup entries are u16 offsets and the hash is walked by index: more
+     symbols than that cannot be a library this toolchain wrote. */
+  if (header->exported_symbols_amount > 0xFFFF)
+    return "corrupt YAFF export count";
   lib->nsyms = header->exported_symbols_amount;
 
   /* name/value region: [exported_symbols_offset, imported_symbols_lookup_offset) */
+  if (header->imported_symbols_lookup_offset < header->exported_symbols_offset)
+    return "corrupt YAFF export region bounds";
   region_size = header->imported_symbols_lookup_offset - header->exported_symbols_offset;
-  lib->region = tcc_malloc(region_size);
+  if (region_size > 0x100000)
+    return "corrupt YAFF export region size";
+  /* +1: a NUL after the region so strlen/strcmp on a name that lost its
+     terminator stay inside the buffer. */
+  lib->region = tcc_malloc(region_size + 1);
+  lib->region[region_size] = 0;
   lseek(fd, header->exported_symbols_offset, SEEK_SET);
   if ((unsigned)full_read(fd, lib->region, region_size) != region_size)
     return "short read of YAFF export region";
@@ -292,6 +308,9 @@ static const char *yaff_lib_read_exports(int fd, const YaffHeader *header, YaffL
   lseek(fd, header->exported_symbols_lookup_offset, SEEK_SET);
   if ((unsigned)full_read(fd, lib->lookup, lookup_size) != lookup_size)
     return "short read of YAFF export lookup";
+  for (i = 0; i < lib->nsyms; i++)
+    if ((unsigned)lib->lookup[i] + sizeof(YaffSymbolEntry) > region_size)
+      return "corrupt YAFF export lookup entry";
 
   /* name hash: [nbucket, nchain, bucket[nbucket], chain[nchain]] (self-sized) */
   lseek(fd, header->exported_symbols_hash_table_offset, SEEK_SET);
@@ -299,6 +318,9 @@ static const char *yaff_lib_read_exports(int fd, const YaffHeader *header, YaffL
     return "short read of YAFF hash header";
   nbucket = hdr2[0];
   nchain = hdr2[1];
+  /* chain[] is indexed by symbol index; nbucket == 0 divides in the lookup. */
+  if (nbucket == 0 || nbucket > 0x100000 || nchain < lib->nsyms || nchain > 0x100000)
+    return "corrupt YAFF hash table header";
   chain_bytes = (nbucket + nchain) * sizeof(unsigned int);
   lib->hash = tcc_malloc((2 + nbucket + nchain) * sizeof(unsigned int));
   lib->hash[0] = nbucket;
@@ -340,8 +362,11 @@ static YaffSymbolEntry *yaff_lib_find(const YaffLib *lib, unsigned int h, const 
    (>0) or 0 if no loaded library exports it. */
 ST_FUNC int tcc_yaff_resolve(TCCState *s1, const char *name)
 {
-  unsigned int h = tcc_yaff_hash(name);
+  unsigned int h;
   int li;
+  if (!s1->nb_yaff_libs)
+    return 0; /* nothing to hash the name for */
+  h = tcc_yaff_hash(name);
   for (li = 0; li < s1->nb_yaff_libs; li++)
   {
     YaffSymbolEntry *e = yaff_lib_find(&s1->yaff_libs[li], h, name);
@@ -365,6 +390,109 @@ ST_FUNC int tcc_yaff_resolve(TCCState *s1, const char *name)
    exports the name).  Classifying an in-module function as an import only
    keeps a reload the call did not need; the other direction is what
    R_ARM_YASOS_LOCAL_CALL catches at link time. */
+static unsigned int yaff_import_hash_at(const YaffImportLib *lib, unsigned int k)
+{
+  return lib->wide ? ((const unsigned int *)lib->hash)[k] : ((const unsigned short *)lib->hash)[k];
+}
+
+/* yaff_lib_find over the boiled-down tables: the same walk, the same guard. */
+static int yaff_import_lib_has(const YaffImportLib *lib, unsigned int h, const char *name)
+{
+  unsigned int i;
+  if (!lib->nbucket)
+    return 0;
+  for (i = yaff_import_hash_at(lib, h % lib->nbucket); i != 0; i = yaff_import_hash_at(lib, lib->nbucket + i))
+  {
+    if (i >= lib->nsyms)
+      break; /* corrupt chain guard */
+    if (strcmp(lib->names + lib->lookup[i] + lib->bias, name) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+static int yaff_import_lib_same(const YaffImportLib *a, const YaffImportLib *b)
+{
+  size_t hash_bytes = (size_t)(a->nbucket + a->nchain) * (a->wide ? 4 : 2);
+  return a->nsyms == b->nsyms && a->nbucket == b->nbucket && a->nchain == b->nchain &&
+         a->names_len == b->names_len && a->wide == b->wide && a->bias == b->bias &&
+         memcmp(a->lookup, b->lookup, a->nsyms * sizeof(*a->lookup)) == 0 &&
+         memcmp(a->hash, b->hash, hash_bytes) == 0 && memcmp(a->names, b->names, a->names_len) == 0;
+}
+
+/* Boil `lib`'s export tables down into `out`, taking over its buffers.  The
+   import set used to keep the three tables of every lib*.so whole for the
+   whole compile -- ~78 KB for the sysroot's, the largest allocation of a
+   small -O2 compile.  When the entries lie in index order without
+   overlapping (as tcc writes them), the names move down over the 4-byte
+   entry headers and the alignment padding in place -- a name only ever moves
+   down -- else the region stays as it is.  Lookups behave exactly as
+   yaff_lib_find's on the original tables. */
+static void yaff_import_lib_build(YaffLib *lib, YaffImportLib *out)
+{
+  const unsigned int hdr = sizeof(YaffSymbolEntry);
+  unsigned int i, n = lib->nsyms, nh = lib->hash[0] + lib->hash[1], w = 0, ordered = 1, narrow = 1;
+  for (i = 1; i < n && ordered; i++)
+    if (lib->lookup[i] < lib->lookup[i - 1] + hdr + strlen(lib->region + lib->lookup[i - 1] + hdr) + 1)
+      ordered = 0;
+  if (ordered)
+  {
+    for (i = 0; i < n; i++)
+    {
+      const char *name = lib->region + lib->lookup[i] + hdr;
+      size_t len = strlen(name) + 1;
+      memmove(lib->region + w, name, len);
+      lib->lookup[i] = (unsigned short)w;
+      w += len;
+    }
+    lib->region = tcc_realloc(lib->region, w ? w : 1);
+    out->bias = 0;
+  }
+  else
+  {
+    for (i = 0; i < n; i++)
+    {
+      unsigned int end = lib->lookup[i] + hdr + strlen(lib->region + lib->lookup[i] + hdr) + 1;
+      if (end > w)
+        w = end;
+    }
+    out->bias = hdr;
+  }
+  out->names = lib->region;
+  out->names_len = w;
+  out->lookup = lib->lookup;
+  out->nsyms = n;
+  out->nbucket = lib->hash[0];
+  out->nchain = lib->hash[1];
+  for (i = 0; i < nh; i++)
+    if (lib->hash[2 + i] > 0xFFFF)
+      narrow = 0;
+  out->wide = !narrow;
+  if (narrow)
+  {
+    unsigned short *h16 = tcc_malloc((nh ? nh : 1) * sizeof(*h16));
+    for (i = 0; i < nh; i++)
+      h16[i] = (unsigned short)lib->hash[2 + i];
+    out->hash = h16;
+    tcc_free(lib->hash);
+  }
+  else
+  {
+    memmove(lib->hash, lib->hash + 2, nh * sizeof(*lib->hash));
+    out->hash = lib->hash;
+  }
+  lib->region = NULL;
+  lib->lookup = NULL;
+  lib->hash = NULL;
+}
+
+static void yaff_import_lib_free(YaffImportLib *lib)
+{
+  tcc_free(lib->names);
+  tcc_free(lib->lookup);
+  tcc_free(lib->hash);
+}
+
 static void yaff_import_set_add(TCCState *s1, const char *path)
 {
   YaffHeader header;
@@ -377,11 +505,24 @@ static void yaff_import_set_add(TCCState *s1, const char *path)
   {
     if (yaff_lib_read_exports(fd, &header, &lib) == NULL)
     {
-      s1->import_libs = tcc_realloc(s1->import_libs, (s1->nb_import_libs + 1) * sizeof(YaffLib));
-      s1->import_libs[s1->nb_import_libs++] = lib;
+      YaffImportLib il;
+      int li;
+      yaff_import_lib_build(&lib, &il);
+      /* A library already in the set under another path (the sysroot lists
+         lib -> usr/lib twice) adds nothing to the union: keep one copy. */
+      for (li = 0; li < s1->nb_import_libs; li++)
+        if (yaff_import_lib_same(&s1->import_libs[li], &il))
+          break;
+      if (li < s1->nb_import_libs)
+        yaff_import_lib_free(&il);
+      else
+      {
+        s1->import_libs = tcc_realloc(s1->import_libs, (s1->nb_import_libs + 1) * sizeof(YaffImportLib));
+        s1->import_libs[s1->nb_import_libs++] = il;
+      }
+      s1->nb_import_libs_read++;
     }
-    else
-      yaff_lib_free(&lib);
+    yaff_lib_free(&lib);
   }
   close(fd);
 }
@@ -436,7 +577,7 @@ static void yaff_import_set_build(TCCState *s1)
 #endif
   /* No shared library anywhere: nothing is known about imports, and callers
      fall back to reloading R9 after every call out of the translation unit. */
-  if (s1->nb_import_libs > 0)
+  if (s1->nb_import_libs_read > 0)
     s1->import_set_state = 1;
 }
 
@@ -450,7 +591,7 @@ ST_FUNC int tcc_yaff_import_set_has(TCCState *s1, const char *name)
     return -1;
   h = tcc_yaff_hash(name);
   for (li = 0; li < s1->nb_import_libs; li++)
-    if (yaff_lib_find(&s1->import_libs[li], h, name))
+    if (yaff_import_lib_has(&s1->import_libs[li], h, name))
       break;
   if (li == s1->nb_import_libs)
     return 0;
@@ -478,10 +619,11 @@ ST_FUNC void tcc_yaff_import_set_free(TCCState *s1)
 {
   int li;
   for (li = 0; li < s1->nb_import_libs; li++)
-    yaff_lib_free(&s1->import_libs[li]);
+    yaff_import_lib_free(&s1->import_libs[li]);
   tcc_free(s1->import_libs);
   s1->import_libs = NULL;
   s1->nb_import_libs = 0;
+  s1->nb_import_libs_read = 0;
   tcc_free(s1->import_libtcc1);
   s1->import_libtcc1 = NULL;
   tcc_free(s1->import_fp_archive);
@@ -791,6 +933,19 @@ static int tcc_yaff_write_data_relocations(TCCState *s1, FILE *f)
             {
               original_offset = tcc_yaff_data_region_offset(s1, original_offset);
             }
+            else
+            {
+              /* YAFF_ARCH_FLAG_EXACT_THUMB: a pointer naming an STT_OBJECT
+               * keeps the bit its value has (a `&&label`, typed STT_OBJECT,
+               * is odd already; a data object in an executable section is
+               * even); anything else into code -- a function, an untyped
+               * symbol, a section-relative value -- is code, as the loader has
+               * always assumed. */
+              int ts = ELFW(R_SYM)(rel->r_info);
+              ElfW(Sym) *tsym = ts && s->link ? &((ElfW(Sym) *)s->link->data)[ts] : NULL;
+              if (!tsym || ELFW(ST_TYPE)(tsym->st_info) != STT_OBJECT)
+                original_offset |= 1;
+            }
 
             entry = (YaffDataRelocationEntry){
                 .to = from_address,
@@ -1090,6 +1245,15 @@ static int tcc_yaff_write_exported_symbols(TCCState *s1, FILE *f, YaffHeader *h)
     if (section_code == YAFF_SECTION_DATA)
     {
       offset = tcc_yaff_data_region_offset(s1, offset);
+    }
+    else
+    {
+      /* YAFF_ARCH_FLAG_EXACT_THUMB: a function (or an untyped asm symbol)
+       * is branched to; an STT_OBJECT keeps the bit its value has -- tcc
+       * types a `&&label` STT_OBJECT with the Thumb bit already set, while
+       * a data object that lives in an executable section is even. */
+      if (ELFW(ST_TYPE)(sym->st_info) != STT_OBJECT)
+        offset |= 1;
     }
     entry = (YaffSymbolEntry){
         .section = section_code,
@@ -1407,6 +1571,25 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
     return -1;
   }
 
+  /* (ELF dynamic metadata -- .dynsym/.hash/.dynamic -- is rebuilt as YAFF tables.)
+     Only five section images are written and the header is sized from them;
+     any other allocated section that layout placed in between would be lost
+     (initializers zeroed, later sections shifted off their link addresses). */
+  for (i = 1; i < s1->nb_sections; i++)
+  {
+    Section *sec = s1->sections[i];
+    if (!sec || !(sec->sh_flags & SHF_ALLOC) || !sec->sh_size ||
+        (sec->sh_type != SHT_PROGBITS && sec->sh_type != SHT_INIT_ARRAY && sec->sh_type != SHT_FINI_ARRAY) ||
+        sec == text_section || sec == rodata_section || sec == data_section || sec == s1->got ||
+        sec == s1->plt)
+      continue;
+    tcc_error_noabort("YAFF output cannot represent allocated section '%s' (%u bytes); "
+                      "put it in .text/.rodata/.data/.bss",
+                      sec->name, (unsigned)sec->sh_size);
+  }
+  if (s1->nb_errors)
+    return -1;
+
   header.yaff_version = YAFF_VERSION;
 #if defined(TCC_TARGET_ARM_ARCHV8M)
   header.arch = YAFF_ARCH_ARMV8_M;
@@ -1440,7 +1623,18 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
        * share when .rodata carries no relocations (and rd_padding == 0, since
        * the data cascade assumes it). Modules that fail the gate keep rodata
        * per-process (const_rodata_length stays 0 -> legacy behaviour). */
-      int rodata_has_relocs = (rodata_section->reloc != NULL && rodata_section->reloc->data_offset > 0);
+      /* An R_ARM_RODATA_OFF there (a __rodata_relative pointer) was resolved
+       * by the linker to an offset: nothing for the loader to patch. */
+      int rodata_has_relocs = 0;
+      if (rodata_section->reloc != NULL)
+      {
+        ElfW_Rel *rel;
+        for_each_elem(rodata_section->reloc, 0, rel, ElfW_Rel)
+        {
+          if (ELFW(R_TYPE)(rel->r_info) != R_ARM_RODATA_OFF)
+            rodata_has_relocs++;
+        }
+      }
       if (rd_padding != 0 || rodata_has_relocs)
       {
         LOG_YAFF("share-rodata: NOT sharing (.rodata has %u reloc bytes, rd_padding=%u)",
@@ -1631,5 +1825,7 @@ ST_FUNC int tcc_output_yaff(TCCState *s1, FILE *f, const char *filename)
   fwrite(&header, 1, sizeof(YaffHeader), f);
   fflush(f);
 
-  return 0;
+  /* The diagnostics above are tcc_error_noabort: the image is written anyway,
+     so report the failure here or the link exits 0 with a corrupt module. */
+  return s1->nb_errors ? -1 : 0;
 }

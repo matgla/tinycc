@@ -42,6 +42,7 @@ tcc-doc.info
 
 # gcov/lcov coverage artifacts (make coverage-tccgen)
 coverage-tccgen/
+coverage-opt/
 *.gcda
 *.gcno
 *.info
@@ -91,6 +92,7 @@ build_tccyaff/
 rootfs/
 __pycache__/
 tests/ir_tests/qemu/mps2-an505/newlib_build/
+tests/ir_tests/qemu/mps2-an505/libtcc1-bm/
 tests/ir_tests/profile_results
 tests/ir_tests/profile_baselines
 

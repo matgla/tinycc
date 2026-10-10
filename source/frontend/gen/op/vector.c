@@ -79,18 +79,9 @@ unsigned char *find_sv_const_init(const SValue *sv, int min_size)
 }
 
 /* Like find_sv_const_init, but only returns data backed by an ANONYMOUS sym
- * (a compound literal or a const-folded vector temp).  A *named* local can
- * carry a stale const_init buffer: when it is initialised from a non-constant
- * expression (e.g. `v4si t = ~a;`) the buffer stays zero-filled yet
- * const_init_valid is left set — init_putv (which clears validity when a
- * non-constant value is stored) only runs for brace-list initialisers, and
- * const_init_in_progress suppresses the store-based invalidation during the
- * initialiser.  Existing callers tolerate this because they only fold when
- * BOTH operands are constant (a named expression-init operand pairs with a
- * non-constant one, so no fold fires).  A single-operand substitution has no
- * such guard, so it must reject named locals.  Anonymous compound literals can
- * only ever be brace lists, so a valid buffer always reflects genuine
- * constants. */
+ * (a compound literal or a const-folded vector temp): a single-operand
+ * substitution only takes values that are constant by construction, never a
+ * named local's tracked contents. */
 unsigned char *find_sv_vec_literal_init(const SValue *sv, int min_size)
 {
   if ((sv->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != (VT_LOCAL | VT_LVAL))
@@ -206,6 +197,18 @@ void attach_const_init_to_temp(int frame_offset, int size, const unsigned char *
   f->const_init_valid = 1;
 }
 
+/* A loop head or a label can be re-entered by a backward jump from code that
+ * is parsed later, so const_init_data captured before it may not hold there. */
+void const_init_forget_all(void)
+{
+  for (Sym *s = local_stack; s; s = s->prev)
+  {
+    SymLocalFacts *f = sym_facts_peek(s);
+    if (f && f->const_init_valid)
+      f->const_init_valid = 0;
+  }
+}
+
 /* ---- element-major fusion of chained vector expressions ------------------
  *
  * gen_op_vector lowers one whole-vector op at a time: it evaluates all N
@@ -250,19 +253,36 @@ typedef struct VecRecipe
   int ir_start, ir_end;
 } VecRecipe;
 
-static VecRecipe vec_recipes[VEC_RECIPE_MAX];
-static int nb_vec_recipes;
-static struct
+/* Allocated by the first record of a function and released at the next
+ * function start (and by tccgen_finish): code without vector expressions
+ * never needs it, and as static tables they were ~4 KiB of .bss (6.5 KiB on
+ * a 64-bit host) on every compile. */
+typedef struct VecState
 {
-  int start, end;
-} vec_emit_ranges[VEC_EMIT_RANGE_MAX];
+  VecRecipe recipes[VEC_RECIPE_MAX];
+  struct
+  {
+    int start, end;
+  } emit_ranges[VEC_EMIT_RANGE_MAX];
+} VecState;
+static VecState *vec_state;
+static int nb_vec_recipes;
 static int nb_vec_emit_ranges;
+
+static VecState *vec_state_get(void)
+{
+  if (!vec_state)
+    vec_state = tcc_malloc(sizeof(*vec_state));
+  return vec_state;
+}
 
 /* Called at every function start: IR instruction indices are per function. */
 ST_FUNC void gen_op_vector_reset(void)
 {
   nb_vec_recipes = 0;
   nb_vec_emit_ranges = 0;
+  tcc_free(vec_state);
+  vec_state = NULL;
 }
 
 /* A recycled temp slot no longer holds the value its recipe describes. */
@@ -270,8 +290,8 @@ void vec_recipe_kill_slot(int vr)
 {
   int k;
   for (k = 0; k < nb_vec_recipes; k++)
-    if (vec_recipes[k].live && vec_recipes[k].res_vr == vr)
-      vec_recipes[k].live = 0;
+    if (vec_state->recipes[k].live && vec_state->recipes[k].res_vr == vr)
+      vec_state->recipes[k].live = 0;
 }
 
 void vec_emit_range_record(int start, int end)
@@ -280,8 +300,9 @@ void vec_emit_range_record(int start, int end)
     return;
   if (nb_vec_emit_ranges >= VEC_EMIT_RANGE_MAX)
     return;
-  vec_emit_ranges[nb_vec_emit_ranges].start = start;
-  vec_emit_ranges[nb_vec_emit_ranges].end = end;
+  vec_state_get();
+  vec_state->emit_ranges[nb_vec_emit_ranges].start = start;
+  vec_state->emit_ranges[nb_vec_emit_ranges].end = end;
   nb_vec_emit_ranges++;
 }
 
@@ -289,7 +310,7 @@ static int vec_ir_in_emit_range(int idx)
 {
   int k;
   for (k = 0; k < nb_vec_emit_ranges; k++)
-    if (idx >= vec_emit_ranges[k].start && idx < vec_emit_ranges[k].end)
+    if (idx >= vec_state->emit_ranges[k].start && idx < vec_state->emit_ranges[k].end)
       return 1;
   return 0;
 }
@@ -437,7 +458,7 @@ static int vec_recipe_lookup(const SValue *sv, int elem_count, int elem_size)
     return -1;
   for (k = 0; k < nb_vec_recipes; k++)
   {
-    VecRecipe *r = &vec_recipes[k];
+    VecRecipe *r = &vec_state->recipes[k];
     if (!r->live || r->consumed)
       continue;
     if (r->res_vr != sv->vr || r->res_loc != (int)sv->c.i)
@@ -481,7 +502,7 @@ static void vec_push_operand_elem(const SValue *sv, int scalar, int subst,
 /* Recompute element [i] of a recipe's result and leave it on the value stack. */
 static void vec_emit_node_elem(int node, int i)
 {
-  VecRecipe *r = &vec_recipes[node];
+  VecRecipe *r = &vec_state->recipes[node];
   CType res_elem_type = r->res_elem_type;
 
   if (r->left_node >= 0)
@@ -490,14 +511,14 @@ static void vec_emit_node_elem(int node, int i)
     vec_push_operand_elem(&r->left_sv, r->scalar_left, r->subst_left, r->imm_left_data,
                           &r->src_elem_type, r->elem_size, r->imm_is_unsigned, i);
 
-  r = &vec_recipes[node];
+  r = &vec_state->recipes[node];
   if (r->right_node >= 0)
     vec_emit_node_elem(r->right_node, i);
   else
     vec_push_operand_elem(&r->right_sv, r->scalar_right, r->subst_right, r->imm_right_data,
                           &r->src_elem_type, r->elem_size, r->imm_is_unsigned, i);
 
-  r = &vec_recipes[node];
+  r = &vec_state->recipes[node];
   gen_op(r->op);
   if (r->is_cmp)
   {
@@ -714,15 +735,15 @@ void gen_op_vector(int op)
 
   if (left_node >= 0)
   {
-    vec_range_nop(vec_recipes[left_node].ir_start, vec_recipes[left_node].ir_end);
-    vec_recipes[left_node].consumed = 1;
-    vec_recipes[left_node].live = 0;
+    vec_range_nop(vec_state->recipes[left_node].ir_start, vec_state->recipes[left_node].ir_end);
+    vec_state->recipes[left_node].consumed = 1;
+    vec_state->recipes[left_node].live = 0;
   }
   if (right_node >= 0)
   {
-    vec_range_nop(vec_recipes[right_node].ir_start, vec_recipes[right_node].ir_end);
-    vec_recipes[right_node].consumed = 1;
-    vec_recipes[right_node].live = 0;
+    vec_range_nop(vec_state->recipes[right_node].ir_start, vec_state->recipes[right_node].ir_end);
+    vec_state->recipes[right_node].consumed = 1;
+    vec_state->recipes[right_node].live = 0;
   }
 
   /* Constant-operand immediate substitution: for a commutative bitwise op
@@ -826,7 +847,7 @@ void gen_op_vector(int op)
       !(elem_type.t & VT_VOLATILE) && !(vec_type.t & VT_VOLATILE))
   {
     int elem_ir_end = tcc_state->ir->next_instruction_index;
-    VecRecipe *r = &vec_recipes[nb_vec_recipes];
+    VecRecipe *r = &vec_state_get()->recipes[nb_vec_recipes];
     /* An operand slot that is neither a recipe nor a stable location could be
      * recycled before the recomputation runs. */
     int left_ok = (left_node >= 0) || scalar_left || subst_left || !VR_IS_TEMP_LOCAL(left_sv.vr);

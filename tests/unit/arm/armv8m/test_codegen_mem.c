@@ -75,11 +75,17 @@ static int emit_byte_store_indexed(TCCIRState *ir, int base_vreg, int byte_val, 
 
 /* Word-sized (32-bit) STORE_INDEXED with a register-resident value and an
  * immediate (compile-time-constant) offset -- the shape the REG-source STRD
- * pairing peephole (ir/codegen.c ~3494-3582) looks for. */
+ * pairing peephole (ir/codegen.c ~3494-3582) looks for.  The base operand
+ * carries IROP_AUX_ALIGN4_OK because the pairing only attempts on a proven
+ * word-aligned address (machine_op align4 gate); production marks every
+ * lvalue with type alignment >= 4 (svalue_to_iroperand), so a hand-built
+ * base must claim the same proof or the gate rightly declines. */
 static int emit_reg_store_indexed(TCCIRState *ir, int base_vreg, int value_vreg, int32_t offset)
 {
   int pool_base = ir->iroperand_pool_count;
-  tcc_ir_pool_add(ir, irop_make_vreg(base_vreg, IROP_BTYPE_INT32));
+  IROperand base_op = irop_make_vreg(base_vreg, IROP_BTYPE_INT32);
+  base_op.aux |= IROP_AUX_ALIGN4_OK;
+  tcc_ir_pool_add(ir, base_op);
   tcc_ir_pool_add(ir, irop_make_vreg(value_vreg, IROP_BTYPE_INT32));
   tcc_ir_pool_add(ir, irop_make_imm32(-1, offset, IROP_BTYPE_INT32));
   tcc_ir_pool_add(ir, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
@@ -94,11 +100,15 @@ static int emit_reg_store_indexed(TCCIRState *ir, int base_vreg, int value_vreg,
 /* Word-sized (32-bit) STORE_INDEXED with an immediate value and an immediate
  * offset -- the shape the IMM-source STRD pairing peephole (ir/codegen.c
  * ~3584-3648) looks for; distinct from emit_byte_store_indexed's INT8 value
- * (which instead trips the byte-to-word coalescing peephole below it). */
+ * (which instead trips the byte-to-word coalescing peephole below it).
+ * Base carries IROP_AUX_ALIGN4_OK for the same align4 gate as
+ * emit_reg_store_indexed above. */
 static int emit_imm32_store_indexed(TCCIRState *ir, int base_vreg, int32_t value, int32_t offset)
 {
   int pool_base = ir->iroperand_pool_count;
-  tcc_ir_pool_add(ir, irop_make_vreg(base_vreg, IROP_BTYPE_INT32));
+  IROperand base_op = irop_make_vreg(base_vreg, IROP_BTYPE_INT32);
+  base_op.aux |= IROP_AUX_ALIGN4_OK;
+  tcc_ir_pool_add(ir, base_op);
   tcc_ir_pool_add(ir, irop_make_imm32(-1, value, IROP_BTYPE_INT32));
   tcc_ir_pool_add(ir, irop_make_imm32(-1, offset, IROP_BTYPE_INT32));
   tcc_ir_pool_add(ir, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
@@ -190,12 +200,15 @@ static int emit_spill_to_reg(TCCIRState *ir, int32_t spill_offset, int dest_vreg
 }
 
 /* dest, base, index(=offset immediate), scale=0 -- the LOAD_INDEXED
- * LDRD-pairing shape (ir/codegen.c ~3415-3486, try_ldrd_base). */
+ * LDRD-pairing shape (ir/codegen.c ~3415-3486, try_ldrd_base).  Base carries
+ * IROP_AUX_ALIGN4_OK for the same align4 gate as the STRD helpers above. */
 static int emit_reg_load_indexed(TCCIRState *ir, int dest_vreg, int base_vreg, int32_t offset)
 {
   int pool_base = ir->iroperand_pool_count;
   tcc_ir_pool_add(ir, irop_make_vreg(dest_vreg, IROP_BTYPE_INT32));
-  tcc_ir_pool_add(ir, irop_make_vreg(base_vreg, IROP_BTYPE_INT32));
+  IROperand base_op = irop_make_vreg(base_vreg, IROP_BTYPE_INT32);
+  base_op.aux |= IROP_AUX_ALIGN4_OK;
+  tcc_ir_pool_add(ir, base_op);
   tcc_ir_pool_add(ir, irop_make_imm32(-1, offset, IROP_BTYPE_INT32));
   tcc_ir_pool_add(ir, irop_make_imm32(-1, 0, IROP_BTYPE_INT32));
   int idx = ir->next_instruction_index;

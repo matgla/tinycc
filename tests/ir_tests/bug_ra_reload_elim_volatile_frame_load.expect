@@ -1,0 +1,7 @@
+vol_array_elem ok
+vol_struct_obj ok
+vol_struct_member ok
+vol_array_elem64 ok
+vol_double ok
+plain_store_volatile_load ok
+vol_read_twice ok

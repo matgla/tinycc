@@ -59,8 +59,7 @@ static void rse_build_def_map(TCCIRState *ir)
     IRQuadCompact *dq = &ir->compact_instructions[j];
     if (dq->op == TCCIR_OP_NOP || !irop_config[dq->op].has_dest)
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, dq);
-    int32_t dvr = irop_get_vreg(d);
+    int32_t dvr = tcc_ir_op_dest_vreg(ir, dq);
     if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
     {
       int p = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -86,10 +85,9 @@ static void rse_build_def_map(TCCIRState *ir)
       continue;
     if (!irop_config[dq->op].has_dest)
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, dq);
-    if (d.is_lval)
+    if (tcc_ir_op_dest_is_lval(ir, dq))
       continue;
-    int32_t dvr = irop_get_vreg(d);
+    int32_t dvr = tcc_ir_op_dest_vreg(ir, dq);
     if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP)
       continue;
     int p = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -165,10 +163,9 @@ static int rse_resolve_temp_addr_impl(TCCIRState *ir, int32_t vr,
 
   if (dq->op == TCCIR_OP_ADD)
   {
-    IROperand s2 = tcc_ir_op_get_src2(ir, dq);
-    if (!irop_is_immediate(s2))
+    if (!tcc_ir_op_src2_is_imm(ir, dq))
       return 0;
-    base_off += irop_get_imm64_ex(ir, s2);
+    base_off += tcc_ir_op_src2_imm(ir, dq);
   }
 
   *out_sym = base_sym;
@@ -220,7 +217,7 @@ static int rse_resolve_store_addr(TCCIRState *ir, IRQuadCompact *q,
     IROperand sc = tcc_ir_op_get_scale(ir, q);
     if (irop_is_immediate(sc))
       scale = irop_get_imm64_ex(ir, sc);
-    extra = irop_get_imm64_ex(ir, idx) << scale;
+    extra = (int64_t)((uint64_t)irop_get_imm64_ex(ir, idx) << scale); /* idx may be negative */
   }
 
   int store_width = (op == TCCIR_OP_STORE_INDEXED)
@@ -296,11 +293,11 @@ static int rse_is_merge_transparent(TCCIRState *ir, IRQuadCompact *q)
   }
   if (q->is_jump_target)
     return 0;
-  if (irop_config[q->op].has_src1 && tcc_ir_op_get_src1(ir, q).is_lval)
+  if (irop_config[q->op].has_src1 && tcc_ir_op_src1_is_lval(ir, q))
     return 0;
-  if (irop_config[q->op].has_src2 && tcc_ir_op_get_src2(ir, q).is_lval)
+  if (irop_config[q->op].has_src2 && tcc_ir_op_src2_is_lval(ir, q))
     return 0;
-  if (irop_config[q->op].has_dest && tcc_ir_op_get_dest(ir, q).is_lval)
+  if (irop_config[q->op].has_dest && tcc_ir_op_dest_is_lval(ir, q))
     return 0;
   return 1;
 }
@@ -405,8 +402,11 @@ int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
      only the direct-SYMREF form could ever merge. */
   rse_build_def_map(ir);
 
+  /* Collected on the first complete group: each lookup scans back for the
+     call's params, so collecting up front cost O(calls * insns) in every
+     function, merge candidate or not (101_cleanup's 65536-call main: 14 s). */
   RseRegion copy_srcs[RSE_MAX_COPY_SRC];
-  int copy_src_count = rse_collect_copy_sources(ir, copy_srcs, RSE_MAX_COPY_SRC);
+  int copy_src_count = -1;
 
   const Sym *grp_sym = NULL;
   int64_t grp_base = 0;
@@ -419,6 +419,7 @@ int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
   {
     int is_sub_word_store = 0;
     int cur_width = 0;
+    int cur_is_jump_target = 0;
     const Sym *cur_sym = NULL;
     int64_t cur_off = 0;
     uint32_t cur_val = 0;
@@ -426,10 +427,15 @@ int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
     if (i < n)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
+      cur_is_jump_target = q->is_jump_target;
 
       /* Lanes of an aggregate are built value-then-address, so the constituent
          stores are separated by the ADD/LEA that forms the next lane's address. */
-      if (q->op == TCCIR_OP_NOP || rse_is_merge_transparent(ir, q))
+      /* A jump target is a possible entry point into the instruction stream;
+         do not let the merged store move across it.  Transparent operations
+         already apply this rule, but NOPs take the fast path below. */
+      if ((q->op == TCCIR_OP_NOP && !q->is_jump_target) ||
+          rse_is_merge_transparent(ir, q))
         continue;
 
       if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED)
@@ -439,7 +445,7 @@ int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
         if (q->op == TCCIR_OP_STORE_INDEXED)
           store_btype = irop_get_btype(src1);
         else
-          store_btype = irop_get_btype(tcc_ir_op_get_dest(ir, q));
+          store_btype = tcc_ir_op_dest_btype(ir, q);
 
         if ((store_btype == IROP_BTYPE_INT8 || store_btype == IROP_BTYPE_INT16) && irop_is_immediate(src1) &&
             rse_resolve_store_addr(ir, q, &cur_sym, &cur_off))
@@ -461,7 +467,8 @@ int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
       int64_t aligned_base = cur_off & ~3LL;
       int byte_pos = (int)(cur_off & 3);
 
-      if (grp_count > 0 && cur_sym == grp_sym && aligned_base == grp_base && byte_pos == grp_filled)
+      if (grp_count > 0 && !cur_is_jump_target && cur_sym == grp_sym &&
+          aligned_base == grp_base && byte_pos == grp_filled)
       {
         grp_merged |= cur_val << (byte_pos * 8);
         grp_indices[grp_count++] = i;
@@ -485,6 +492,8 @@ int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
       if (grp_filled == 4)
       {
         int feeds_copy = 0;
+        if (copy_src_count < 0)
+          copy_src_count = rse_collect_copy_sources(ir, copy_srcs, RSE_MAX_COPY_SRC);
         for (int k = 0; k < copy_src_count; k++)
           if (copy_srcs[k].sym == grp_sym && grp_base < copy_srcs[k].end && copy_srcs[k].base < grp_base + 4)
           {
@@ -527,11 +536,6 @@ int tcc_ir_opt_byte_store_merge(TCCIRState *ir)
   return changes;
 }
 
-int tcc_ir_opt_byte_store_merge_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_byte_store_merge(ctx->ir);
-}
-
 /* Rewrite an aligned AEABI mem{cpy,move}{4,8} whose source is a non-escaping
    stack buffer filled only with compile-time constants into wide constant stores
    to the destination, dropping the buffer and the call. Safe because the source
@@ -540,6 +544,7 @@ int tcc_ir_opt_byte_store_merge_ex(IROptCtx *ctx)
    and a straight-line fill..call region. */
 
 #define CMD_MAX_BYTES 64 /* cap on copy size we expand inline */
+#define CMD_MAX_ADDR_HOLDERS 128 /* cap on buffer-address carriers we track */
 
 /* Resolve an address-holding operand to (sym, byte_off): direct
    `Addr[StackLoc[off]]` or a single-def TEMP (incl. +imm chains). */
@@ -596,17 +601,60 @@ static int cmd_store_addr(TCCIRState *ir, IRQuadCompact *q, const Sym **sym,
     IROperand base = tcc_ir_op_get_dest(ir, q);
     if (!cmd_op_addr(ir, base, sym, off))
       return 0;
-    IROperand idx = tcc_ir_op_get_src2(ir, q);
-    if (!irop_is_immediate(idx))
+    if (!tcc_ir_op_src2_is_imm(ir, q))
       return 0;
     IROperand sc = tcc_ir_op_get_scale(ir, q);
     int64_t scale = irop_is_immediate(sc) ? irop_get_imm64_ex(ir, sc) : 0;
-    *off += irop_get_imm64_ex(ir, idx) << scale;
-    int w = ir_opt_store_btype_size_bytes(irop_get_btype(tcc_ir_op_get_src1(ir, q)));
+    *off += tcc_ir_op_src2_imm(ir, q) << scale;
+    int w = ir_opt_store_btype_size_bytes(tcc_ir_op_src1_btype(ir, q));
     *width = w > 0 ? w : 4;
     return 1;
   }
   return 0;
+}
+
+/* Overlap of [off,off+w) with the buffer [off_b,off_b+S) at sym_b. */
+static int cmd_range_ovl(const Sym *sym, int64_t off, int w, const Sym *sym_b,
+                         int64_t off_b, int64_t S)
+{
+  return sym == sym_b && off < off_b + S && off_b < off + (w > 0 ? w : 1);
+}
+
+/* Linear membership over a small vreg-id set. */
+static int cmd_has_vreg(const int32_t *set, int n, int32_t vr)
+{
+  if (vr < 0)
+    return 0;
+  for (int i = 0; i < n; i++)
+    if (set[i] == vr)
+      return 1;
+  return 0;
+}
+
+/* Non-lval operand that holds an address overlapping the buffer: either it
+   resolves to one, or it is a vreg the escape scan flagged as a buffer-address
+   carrier (multi-def / non-resolving cases the resolver gives up on). */
+static int cmd_op_holds_buffer(TCCIRState *ir, IROperand op,
+                               const int32_t *holders, int n_holders,
+                               const Sym *sym_b, int64_t off_b, int64_t S)
+{
+  const Sym *s;
+  int64_t o;
+  if (cmd_op_addr(ir, op, &s, &o))
+    return cmd_range_ovl(s, o, 1, sym_b, off_b, S);
+  return cmd_has_vreg(holders, n_holders, irop_get_vreg(op));
+}
+
+/* lval operand that dereferences the buffer. */
+static int cmd_lval_reads_buffer(TCCIRState *ir, IROperand op,
+                                 const int32_t *holders, int n_holders,
+                                 const Sym *sym_b, int64_t off_b, int64_t S)
+{
+  const Sym *s;
+  int64_t o;
+  if (cmd_op_lval(ir, op, &s, &o))
+    return cmd_range_ovl(s, o, 1, sym_b, off_b, S);
+  return cmd_has_vreg(holders, n_holders, irop_get_vreg(op));
 }
 
 /* Constant value of a fill source: immediate, or single-def TEMP assigned #imm. */
@@ -631,23 +679,21 @@ static int cmd_const_value(TCCIRState *ir, IROperand val, int64_t *out)
   IRQuadCompact *dq = &ir->compact_instructions[d];
   if (dq->op != TCCIR_OP_ASSIGN)
     return 0;
-  IROperand s1 = tcc_ir_op_get_src1(ir, dq);
-  if (!irop_is_immediate(s1))
+  if (!tcc_ir_op_src1_is_imm(ir, dq))
     return 0;
-  *out = irop_get_imm64_ex(ir, s1);
+  *out = tcc_ir_op_src1_imm(ir, dq);
   return 1;
 }
 
 static int cmd_is_aligned_memcpy(TCCIRState *ir, IRQuadCompact *q)
 {
-  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  Sym *callee = tcc_ir_op_src1_sym(ir, q);
   if (!callee)
     return 0;
   const char *name = get_tok_str(callee->v, NULL);
   if (!name)
     return 0;
-  return strcmp(name, "__aeabi_memcpy4") == 0 || strcmp(name, "__aeabi_memcpy8") == 0 ||
-         strcmp(name, "__aeabi_memmove4") == 0 || strcmp(name, "__aeabi_memmove8") == 0;
+  return ir_opt_name_in(name, "__aeabi_memcpy4\0__aeabi_memcpy8\0__aeabi_memmove4\0__aeabi_memmove8\0");
 }
 
 /* Try to rewrite one memmove/memcpy call at index ci.  Returns 1 on success. */
@@ -659,13 +705,12 @@ static int cmd_try_one(TCCIRState *ir, int ci)
   if (!cmd_is_aligned_memcpy(ir, call))
     return 0;
 
-  int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, call)));
+  int call_id = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, call));
 
   /* The return value (memmove returns dest) must be dead. */
   if (call->op == TCCIR_OP_FUNCCALLVAL)
   {
-    IROperand cd = tcc_ir_op_get_dest(ir, call);
-    int32_t cdv = irop_get_vreg(cd);
+    int32_t cdv = tcc_ir_op_dest_vreg(ir, call);
     if (cdv >= 0)
     {
       for (int j = 0; j < n; j++)
@@ -694,7 +739,7 @@ static int cmd_try_one(TCCIRState *ir, int ci)
     IRQuadCompact *q = &ir->compact_instructions[j];
     if (q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID)
       continue;
-    uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+    uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, q);
     if (TCCIR_DECODE_CALL_ID(enc) != call_id)
       continue;
     int pidx = TCCIR_DECODE_PARAM_IDX(enc);
@@ -825,6 +870,60 @@ static int cmd_try_one(TCCIRState *ir, int ci)
     }
   }
 
+  /* Phase 3a: closed escape analysis.  Collect every vreg that may hold an
+     address overlapping the buffer, transitively through ASSIGN/LEA/ADD/SUB,
+     regardless of def count.  The scan below resolves addresses through
+     rse_resolve_temp_addr, which gives up on a multi-def TEMP, a non-TEMP vreg,
+     or a chain deeper than 4, and a failed resolution reads as "not the buffer"
+     - so a copy of the buffer address through such a vreg would be
+     dereferenced unseen.  Track the carriers ourselves and reject any use of
+     one that is not address propagation. */
+  int32_t holders[CMD_MAX_ADDR_HOLDERS];
+  int n_holders = 0;
+  int grew = 1;
+  while (grew)
+  {
+    grew = 0;
+    for (int i = 0; i < n; i++)
+    {
+      if (i == ci)
+        continue;
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int aop = q->op;
+      if (aop != TCCIR_OP_ASSIGN && aop != TCCIR_OP_LEA &&
+          aop != TCCIR_OP_ADD && aop != TCCIR_OP_SUB)
+        continue;
+      const Sym *s;
+      int64_t o;
+      int carries = 0;
+      IROperand s1 = tcc_ir_op_get_src1(ir, q);
+      if (cmd_op_addr(ir, s1, &s, &o))
+        carries = cmd_range_ovl(s, o, 1, sym_b, off_b, S);
+      if (!carries)
+        carries = cmd_has_vreg(holders, n_holders, irop_get_vreg(s1));
+      if (!carries && (aop == TCCIR_OP_ADD || aop == TCCIR_OP_SUB))
+      {
+        IROperand s2 = tcc_ir_op_get_src2(ir, q);
+        if (cmd_op_addr(ir, s2, &s, &o))
+          carries = cmd_range_ovl(s, o, 1, sym_b, off_b, S);
+        if (!carries)
+          carries = cmd_has_vreg(holders, n_holders, irop_get_vreg(s2));
+      }
+      if (!carries)
+        continue;
+      IROperand d = tcc_ir_op_get_dest(ir, q);
+      if (d.is_lval)
+        continue;
+      int32_t dv = irop_get_vreg(d);
+      if (dv < 0 || cmd_has_vreg(holders, n_holders, dv))
+        continue;
+      if (n_holders >= (int)(sizeof(holders) / sizeof(holders[0])))
+        return 0; /* too many address carriers: bail (safe) */
+      holders[n_holders++] = dv;
+      grew = 1;
+    }
+  }
+
   /* Phase 3: isolation scan over the whole function. */
   for (int i = 0; i < n; i++)
   {
@@ -837,7 +936,7 @@ static int cmd_try_one(TCCIRState *ir, int ci)
 
     if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
     {
-      uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, q);
       if (TCCIR_DECODE_CALL_ID(enc) != call_id)
         return 0; /* param of another (gone) call */
       /* our own params: buffer source (p1) + pointer/size (p0/p2), all fine */
@@ -858,25 +957,33 @@ static int cmd_try_one(TCCIRState *ir, int ci)
         /* collected fills were verified const above; nothing else to do */
         continue;
       }
-      /* variable-indexed store whose base is the buffer? */
-      if (q->op == TCCIR_OP_STORE_INDEXED &&
-          cmd_op_addr(ir, tcc_ir_op_get_dest(ir, q), &s, &o) && CMD_OVL(s, o, 1))
-        return 0;
+      /* variable-indexed store whose base is the buffer?  Also catch a base
+         that is a buffer-address carrier the resolver could not resolve. */
+      {
+        IROperand base = tcc_ir_op_get_dest(ir, q);
+        if (base.is_lval)
+        {
+          if (cmd_lval_reads_buffer(ir, base, holders, n_holders, sym_b, off_b, S))
+            return 0;
+        }
+        else if (cmd_op_holds_buffer(ir, base, holders, n_holders, sym_b, off_b, S))
+          return 0;
+      }
       /* the stored value must not be the buffer address (escape) */
-      if (cmd_op_addr(ir, tcc_ir_op_get_src1(ir, q), &s, &o) && CMD_OVL(s, o, 1))
+      if (cmd_op_holds_buffer(ir, tcc_ir_op_get_src1(ir, q), holders, n_holders, sym_b, off_b, S))
         return 0;
       continue;
     }
 
     if (q->op == TCCIR_OP_LOAD)
     {
-      if (cmd_op_lval(ir, tcc_ir_op_get_src1(ir, q), &s, &o) && CMD_OVL(s, o, 1))
+      if (cmd_lval_reads_buffer(ir, tcc_ir_op_get_src1(ir, q), holders, n_holders, sym_b, off_b, S))
         return 0; /* read of the buffer */
       continue;
     }
     if (q->op == TCCIR_OP_LOAD_INDEXED)
     {
-      if (cmd_op_addr(ir, tcc_ir_op_get_src1(ir, q), &s, &o) && CMD_OVL(s, o, 1))
+      if (cmd_op_holds_buffer(ir, tcc_ir_op_get_src1(ir, q), holders, n_holders, sym_b, off_b, S))
         return 0;
       continue;
     }
@@ -896,13 +1003,13 @@ static int cmd_try_one(TCCIRState *ir, int ci)
                                 : tcc_ir_op_get_accum(ir, q);
       if (op.is_lval)
       {
-        if (cmd_op_lval(ir, op, &s, &o) && CMD_OVL(s, o, 1))
+        if (cmd_lval_reads_buffer(ir, op, holders, n_holders, sym_b, off_b, S))
           return 0;
         continue;
       }
       if (k == 0)
         continue; /* a def is not a use */
-      if (cmd_op_addr(ir, op, &s, &o) && CMD_OVL(s, o, 1))
+      if (cmd_op_holds_buffer(ir, op, holders, n_holders, sym_b, off_b, S))
       {
         if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LEA &&
             q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB && q->op != TCCIR_OP_CMP)
@@ -983,10 +1090,9 @@ static int cmd_try_one(TCCIRState *ir, int ci)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LEA && q->op != TCCIR_OP_ADD)
         continue;
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (d.is_lval)
+      if (tcc_ir_op_dest_is_lval(ir, q))
         continue;
-      int32_t dv = irop_get_vreg(d);
+      int32_t dv = tcc_ir_op_dest_vreg(ir, q);
       if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
         continue;
       int used = 0;
@@ -1056,9 +1162,4 @@ int tcc_ir_opt_const_memcpy_to_dest(TCCIRState *ir)
   }
   rse_free_def_map();
   return changes;
-}
-
-int tcc_ir_opt_const_memcpy_to_dest_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_const_memcpy_to_dest(ctx->ir);
 }

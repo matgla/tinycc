@@ -2,6 +2,8 @@
 #include "../opt/ssa/loop/dead_loop.c"
 #undef DL_MAX_ESCAPE_CANDS
 #undef USING_GLOBALS
+#include "../opt/ssa/loop/decrement_carry.c"
+#undef SSA_DTC_MAX_PASSES
 #include "../opt/ssa/loop/decrement_to_zero.c"
 #undef SSA_DTZ_MAX_PASSES
 #include "../opt/ssa/loop/first_iter_exit.c"
@@ -14,6 +16,8 @@
 #include "../opt/ssa/loop/iv_strength_reduction.c"
 #undef SSA_IVSR_MAX_PASSES
 #include "../opt/ssa/loop/loop_bottom_test.c"
+#undef LHD_MAX_PREFIX
+#undef LHD_MAX_REWRITES
 #undef SSA_LBT_MAX_REWRITES
 #include "../opt/ssa/loop/loop_cand.c"
 #include "../opt/ssa/loop/loop_const_sim.c"
@@ -24,6 +28,13 @@
 #include "../opt/ssa/loop/loop_unroll.c"
 #undef CZ_MAX_CHAIN
 #undef CZ_MAX_SLOTS
+#undef MX_MAX_ESC
+#undef MX_MAX_FWD
+#undef MX_MAX_FWD_READS
+#undef MX_MAX_RENAME
+#undef MX_MAX_TOTAL
+#undef MX_MAX_TRIP
+#undef MX_MAX_VARS
 #undef SSA_LOOP_UNROLL_MAX_PASSES
 #undef SSA_UNROLL_MAX_SPAN
 #include "../opt/ssa/loop/ptr_iv_exit_subst.c"

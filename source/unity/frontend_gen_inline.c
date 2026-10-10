@@ -4,4 +4,5 @@
 #include "../frontend/gen/inline/const_eval.c"
 #include "../frontend/gen/inline/emit.c"
 #undef CALLED_ONCE_LARGE_BODY
+#undef CALLED_ONCE_LARGE_FRAME_ARRAY
 #undef GC_MARK

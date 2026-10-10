@@ -30,7 +30,10 @@ ST_FUNC ssize_t full_read(int fd, void *buf, size_t count)
 {
   char *cbuf = buf;
   size_t rnum = 0;
-  for (;;)
+  /* Stop once `count` bytes are in: a read() of the remaining 0 bytes would
+   * only report what we already know (about half of a link's read() calls
+   * were these empty tails). */
+  while (rnum < count)
   {
     ssize_t num = read(fd, cbuf, count - rnum);
     if (num < 0)
@@ -53,6 +56,47 @@ ST_FUNC void *load_data(int fd, unsigned long file_offset, unsigned long size)
   return data;
 }
 
+/* --gc-sections collects whole sections, so input sections stay apart until
+ * after GC.  A relocatable (-r) output writes sections out as they are and
+ * never runs the GC, so it keeps the classic merging. */
+static int gc_keeps_input_sections(TCCState *s1)
+{
+  return s1->gc_sections && s1->output_type != TCC_OUTPUT_OBJ;
+}
+
+/* An object's plain .text and its data sections (and their reloc sections)
+ * merged by name with every other object's would make one GC node of all of
+ * them: a single function-pointer table in any object's .data pinned every
+ * function any object's .data points at, and --gc-sections removed 7.5 KB
+ * of the 850 KB the O0-only tcc could lose.  Under GC each object gets its
+ * own section instead, named "<name>..<n>" so no lookup by name finds it;
+ * the survivors are folded back into the canonical section after GC
+ * (coalesce_split_sections, which folds data only from sections named so). */
+static int gc_private_input_section(TCCState *s1, const char *name)
+{
+  if (!gc_keeps_input_sections(s1) || name[0] != '.')
+    return 0;
+  if (name[1] == 'r' && name[2] == 'e')
+  {
+    if (!strncmp(name, ".rela.", 6))
+      name += 5;
+    else if (!strncmp(name, ".rel.", 5))
+      name += 4;
+  }
+  switch (name[1]) /* every input section of every object comes here */
+  {
+  case 't':
+    return !strcmp(name, ".text");
+  case 'd':
+    return !strcmp(name, ".data") || !strncmp(name, ".data.", 6);
+  case 'r':
+    return !strcmp(name, ".rodata") || !strncmp(name, ".rodata.", 8);
+  case 'b':
+    return !strcmp(name, ".bss") || !strncmp(name, ".bss.", 5);
+  }
+  return 0;
+}
+
 /* Return the canonical section name for function/data sections.
  * Merges .text.foo -> .text, .rodata.bar -> .rodata, .data.baz -> .data, .bss.qux -> .bss
  * Returns original name if no match.
@@ -64,10 +108,9 @@ static const char *get_merged_section_name(TCCState *s1, const char *name)
    * nothing left to collect (the .o path is exactly how the self-hosted tcc
    * links).  Same-named sections from different objects still merge, which
    * is conservative.  Survivors are folded back into one .text after GC by
-   * coalesce_function_sections().  Data/rodata folding stays unconditional
-   * -- their GC granularity is a separate project, and the YAFF writer
-   * reads those through fixed section globals. */
-  int keep_text_split = s1->gc_sections;
+   * coalesce_split_sections().  Data sections never get here under GC: see
+   * gc_private_input_section. */
+  int keep_text_split = gc_keeps_input_sections(s1);
   if (name[0] != '.')
     return name;
   switch (name[1])
@@ -263,6 +306,18 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
       sh->sh_addralign = 1;
     /* find corresponding section, if any */
     /* Use merged name for .text.*, .rodata.*, .data.*, .bss.* sections */
+    if (gc_private_input_section(s1, sh_name))
+    {
+      char private_name[256];
+      snprintf(private_name, sizeof private_name, "%s..%d", sh_name, s1->nb_sections);
+      s = new_section(s1, private_name, sh->sh_type, sh->sh_flags & ~SHF_GROUP);
+      s->sh_addralign = sh->sh_addralign;
+      s->sh_entsize = sh->sh_entsize;
+      sm_table[i].new_section = 1;
+      last_lookup_name = NULL;
+      last_lookup_section = NULL;
+    }
+    else
     {
       const char *lookup_name = get_merged_section_name(s1, sh_name);
       s = NULL;
@@ -340,10 +395,13 @@ ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset
       {
         /* Immediate loading */
         unsigned char *ptr;
-        lseek(fd, file_offset + sh->sh_offset, SEEK_SET);
         /* section_ptr_add will handle allocation as needed */
         ptr = section_ptr_add(s, size);
-        full_read(fd, ptr, size);
+        if (size)
+        {
+          lseek(fd, file_offset + sh->sh_offset, SEEK_SET);
+          full_read(fd, ptr, size);
+        }
       }
     }
     else
@@ -554,6 +612,39 @@ static Section *find_existing_section(TCCState *s1, const char *name)
   return section_ht_find(s1, name);
 }
 
+/* The hash of an archive index's symbol names.  Every name of every archive
+ * a link loads (libc.a alone has thousands) is hashed once per link, and
+ * elf_hash's per-character loop was most of that work; this reads the
+ * length -- which walking the name table needs anyway -- and a few
+ * characters, weighted to the end since the names share prefixes
+ * ("__aeabi_", "_"). Collisions only lengthen a chain: lookups compare
+ * names. */
+static unsigned int archive_name_hash(const char *name, size_t len)
+{
+  const unsigned char *u = (const unsigned char *)name;
+  unsigned int h = (unsigned int)len * 0x9E3779B1u;
+  if (len)
+    h ^= u[len - 1] | (unsigned int)u[len >> 1] << 8 | (unsigned int)u[0] << 16;
+  if (len >= 4)
+    h ^= (u[len - 2] | (unsigned int)u[len - 3] << 8 | (unsigned int)u[len - 4] << 16 |
+          (unsigned int)u[(len * 3) >> 2] << 24) * 0x85EBCA77u;
+  h ^= h >> 15;
+  h *= 0x2C1B3C6Du;
+  h ^= h >> 13;
+  return h;
+}
+
+/* Index of the archive symbol named `name` (the one a chain walk met first,
+ * as before), or -1. */
+static int archive_cache_lookup(const ArchiveSymbolCache *cache, const char *name, unsigned int h)
+{
+  int aidx;
+  for (aidx = cache->ar_ht_buckets[h & cache->ar_ht_mask]; aidx >= 0; aidx = cache->ar_ht_next[aidx])
+    if (cache->name_hashes[aidx] == h && !strcmp(cache->sym_names[aidx], name))
+      return aidx;
+  return -1;
+}
+
 /* Check whether any currently undefined symbol is satisfiable by cached
    archive symbol tables.  Returns 1 if at least one such undef exists,
    meaning a group rescan may still be productive. */
@@ -561,29 +652,20 @@ ST_FUNC int tcc_group_has_satisfiable_undefs(TCCState *s1)
 {
   Section *s = symtab_section;
   ElfW(Sym) *syms = (ElfW(Sym) *)s->data;
-  Section *hs = s->hash;
-  unsigned int *sym_hcache = hs ? hs->hash_val_cache : NULL;
   int ci, ui, si;
   if (s1->nb_archive_sym_caches == 0)
     return 0;
   for (ui = 0; ui < s1->nb_undef_syms; ui++)
   {
     unsigned int h;
-    int aidx;
     si = s1->undef_sym_list[ui];
     if (syms[si].st_shndx != SHN_UNDEF)
       continue;
     const char *name = (char *)s->link->data + syms[si].st_name;
-    h = (sym_hcache && si < hs->hash_val_alloc) ? sym_hcache[si] : elf_hash((const unsigned char *)name);
+    h = archive_name_hash(name, strlen(name));
     for (ci = 0; ci < s1->nb_archive_sym_caches; ci++)
-    {
-      ArchiveSymbolCache *cache = &s1->archive_sym_caches[ci];
-      for (aidx = cache->ar_ht_buckets[h & cache->ar_ht_mask]; aidx >= 0; aidx = cache->ar_ht_next[aidx])
-      {
-        if (cache->name_hashes[aidx] == h && !strcmp(cache->sym_names[aidx], name))
-          return 1;
-      }
-    }
+      if (archive_cache_lookup(&s1->archive_sym_caches[ci], name, h) >= 0)
+        return 1;
   }
   return 0;
 }
@@ -634,7 +716,7 @@ static ArchiveSymbolCache *create_archive_sym_cache(TCCState *s1, const char *fi
   /* Allocate symbol arrays */
   cache->sym_names = tcc_malloc(nsyms * sizeof(const char *));
   cache->name_hashes = tcc_malloc(nsyms * sizeof(unsigned int));
-  cache->member_offsets = tcc_malloc(nsyms * sizeof(unsigned long long));
+  cache->ar_index = ar_index;
 
   /* Build chained hash table */
   ar_ht_size = 1;
@@ -643,8 +725,7 @@ static ArchiveSymbolCache *create_archive_sym_cache(TCCState *s1, const char *fi
   cache->ar_ht_mask = ar_ht_size - 1;
   cache->ar_ht_buckets = tcc_malloc(ar_ht_size * sizeof(int));
   memset(cache->ar_ht_buckets, 0xff, ar_ht_size * sizeof(int));
-  cache->ar_ht_next = tcc_malloc(nsyms * sizeof(int));
-  memset(cache->ar_ht_next, 0xff, nsyms * sizeof(int));
+  cache->ar_ht_next = tcc_malloc(nsyms * sizeof(int)); /* every entry set below */
 
   /* Size loaded_members dedup set */
   loaded_member_size = 256;
@@ -664,13 +745,14 @@ static ArchiveSymbolCache *create_archive_sym_cache(TCCState *s1, const char *fi
   cache->loaded_members = tcc_mallocz(loaded_member_size * sizeof(unsigned long long));
 
   /* Populate symbol arrays and hash table */
-  for (p = ar_names, i = 0; i < nsyms; i++, p += strlen(p) + 1)
+  for (p = ar_names, i = 0; i < nsyms; i++)
   {
     unsigned int h;
     int bucket;
+    size_t len = strlen(p);
     cache->sym_names[i] = p;
-    cache->name_hashes[i] = h = elf_hash((const unsigned char *)p);
-    cache->member_offsets[i] = get_be(ar_index + i * entrysize, entrysize);
+    cache->name_hashes[i] = h = archive_name_hash(p, len);
+    p += len + 1;
     bucket = h & cache->ar_ht_mask;
     cache->ar_ht_next[i] = cache->ar_ht_buckets[bucket];
     cache->ar_ht_buckets[bucket] = i;
@@ -705,15 +787,9 @@ ST_FUNC int tcc_archive_index_load(TCCState *s1, const char *path)
 ST_FUNC int tcc_archive_index_has(TCCState *s1, const char *path, const char *name)
 {
   ArchiveSymbolCache *cache = find_archive_sym_cache(s1, path);
-  unsigned int h;
-  int aidx;
   if (!cache)
     return 0;
-  h = elf_hash((const unsigned char *)name);
-  for (aidx = cache->ar_ht_buckets[h & cache->ar_ht_mask]; aidx >= 0; aidx = cache->ar_ht_next[aidx])
-    if (cache->name_hashes[aidx] == h && strcmp(cache->sym_names[aidx], name) == 0)
-      return 1;
-  return 0;
+  return archive_cache_lookup(cache, name, archive_name_hash(name, strlen(name))) >= 0;
 }
 
 /* Free all cached archive symbol tables */
@@ -725,7 +801,6 @@ ST_FUNC void tcc_archive_cache_free(TCCState *s1)
     ArchiveSymbolCache *c = &s1->archive_sym_caches[i];
     tcc_free(c->filename);
     tcc_free(c->loaded_members);
-    tcc_free(c->member_offsets);
     tcc_free(c->name_hashes);
     tcc_free(c->sym_names);
     tcc_free(c->ar_ht_next);
@@ -772,39 +847,26 @@ static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
   do
   {
     Section *s = symtab_section;
-    Section *hs = s->hash;
-    unsigned int *sym_hcache = hs ? hs->hash_val_cache : NULL;
     int ui, si;
     bound = 0;
 
     for (ui = 0; ui < s1->nb_undef_syms; ui++)
     {
-      unsigned int h;
       int aidx;
+      const char *sym_name;
 
       si = s1->undef_sym_list[ui];
       sym = &((ElfW(Sym) *)s->data)[si];
       if (sym->st_shndx != SHN_UNDEF)
         continue;
 
-      /* Use cached hash from symtab hash table when available,
-         avoiding elf_hash recomputation across archive calls. */
-      h = (sym_hcache && si < hs->hash_val_alloc)
-              ? sym_hcache[si]
-              : elf_hash((const unsigned char *)((char *)s->link->data + sym->st_name));
-
-      for (aidx = cache->ar_ht_buckets[h & cache->ar_ht_mask]; aidx >= 0; aidx = cache->ar_ht_next[aidx])
+      sym_name = (char *)s->link->data + sym->st_name;
+      aidx = archive_cache_lookup(cache, sym_name, archive_name_hash(sym_name, strlen(sym_name)));
+      if (aidx >= 0)
       {
-        if (cache->name_hashes[aidx] != h)
-          continue;
-        {
-          const char *sym_name = (char *)s->link->data + sym->st_name;
-          if (strcmp(cache->sym_names[aidx], sym_name))
-            continue;
-        }
-        off = cache->member_offsets[aidx];
+        off = get_be(cache->ar_index + (size_t)aidx * cache->entrysize, cache->entrysize);
         if (alacarte_member_seen(cache->loaded_members, cache->loaded_member_mask, off))
-          break;
+          continue;
 
         len = read_ar_header(fd, off, &hdr);
         if (len <= 0 || memcmp(hdr.ar_fmag, ARFMAG, 2))
@@ -820,13 +882,10 @@ static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
         if (tcc_load_object_file(s1, fd, off) < 0)
           goto the_end;
         s1->current_archive_offset = saved_archive_offset;
-        alacarte_mark_member(cache->loaded_members, cache->loaded_member_mask, cache->member_offsets[aidx]);
+        alacarte_mark_member(cache->loaded_members, cache->loaded_member_mask,
+                             get_be(cache->ar_index + (size_t)aidx * cache->entrysize, cache->entrysize));
         ++bound;
         ++s1->group_rescan_loaded;
-        /* symtab/hash may have been reallocated by tcc_load_object_file */
-        hs = s->hash;
-        sym_hcache = hs ? hs->hash_val_cache : NULL;
-        break;
       }
     }
   } while (bound);

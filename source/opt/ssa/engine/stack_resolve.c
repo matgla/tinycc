@@ -61,8 +61,7 @@ int ssa_opt_resolve_lea_stackloc_ex(IRSSAOptCtx *ctx, int32_t vr, int32_t *out_b
 
     /* STORE with a non-lval dest materialises an address, same as LEA. */
     if (dq->op == TCCIR_OP_STORE) {
-      IROperand dest = tcc_ir_op_get_dest(ir, dq);
-      if (!dest.is_lval) {
+      if (!tcc_ir_op_dest_is_lval(ir, dq)) {
         IROperand src = tcc_ir_op_get_src1(ir, dq);
         if (src.tag == IROP_TAG_STACKOFF && !src.is_lval) {
           if (out_base_var)
@@ -80,12 +79,12 @@ int ssa_opt_resolve_lea_stackloc_ex(IRSSAOptCtx *ctx, int32_t vr, int32_t *out_b
 
     if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB) {
       IROperand src1 = tcc_ir_op_get_src1(ir, dq);
-      IROperand src2 = tcc_ir_op_get_src2(ir, dq);
-      if (!src1.is_lval && irop_is_immediate(src2)) {
+      if (!src1.is_lval && tcc_ir_op_src2_is_imm(ir, dq)) {
         int32_t s1vr = irop_get_vreg(src1);
         if (s1vr >= 0) {
-          int delta = irop_get_imm32(src2);
-          acc += (dq->op == TCCIR_OP_ADD) ? delta : -delta;
+          int delta = tcc_ir_op_src2_imm32(ir, dq);
+          /* wraparound add/subtract (delta may be INT_MIN): unsigned, no UB */
+          acc = (int)((unsigned)acc + ((dq->op == TCCIR_OP_ADD) ? (unsigned)delta : 0u - (unsigned)delta));
           vr = s1vr;
           continue;
         }
@@ -268,10 +267,9 @@ static int sdf_resolve(IRSSAOptCtx *ctx, int32_t vr, int *out_off, int32_t *out_
       return 0;
     }
     if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB) {
-      IROperand s2 = tcc_ir_op_get_src2(ir, dq);
-      if (irop_get_tag(s2) != IROP_TAG_IMM32 || s2.is_lval)
+      if (tcc_ir_op_src2_tag(ir, dq) != IROP_TAG_IMM32 || tcc_ir_op_src2_is_lval(ir, dq))
         return 0;
-      int d = irop_get_imm32(s2);
+      int d = tcc_ir_op_src2_imm32(ir, dq);
       acc += dq->op == TCCIR_OP_ADD ? d : -d;
       if (direct) {
         *out_off = irop_get_stack_offset(src) + acc;
@@ -300,7 +298,7 @@ int ssa_opt_stack_deref_fold(IRSSAOptCtx *ctx)
       continue;
     int is_store = op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED;
     int indexed = op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_LOAD_INDEXED;
-    IROperand base = is_store ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+    IROperand base = tcc_ir_op_get_dest_or_src1(ir, q, !is_store);
     if (irop_get_tag(base) != IROP_TAG_VREG || base.is_local || base.is_llocal || base.is_lval == indexed)
       continue;
     int32_t bvr = irop_get_vreg(base), slot_vr;
@@ -313,13 +311,12 @@ int ssa_opt_stack_deref_fold(IRSSAOptCtx *ctx)
      * moved onto the base when it was fused. */
     IROperand acc = base;
     if (indexed) {
-      IROperand idx = tcc_ir_op_get_src2(ir, q);
       IROperand scale = tcc_ir_op_get_scale(ir, q);
-      if (irop_get_tag(idx) != IROP_TAG_IMM32 || idx.is_lval ||
+      if (tcc_ir_op_src2_tag(ir, q) != IROP_TAG_IMM32 || tcc_ir_op_src2_is_lval(ir, q) ||
           (!irop_is_none(scale) && (irop_get_tag(scale) != IROP_TAG_IMM32 || irop_get_imm32(scale) != 0)))
         continue;
-      off += irop_get_imm32(idx);
-      acc = is_store ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
+      off += tcc_ir_op_src2_imm32(ir, q);
+      acc = tcc_ir_op_get_dest_or_src1(ir, q, is_store);
       acc.aux = base.aux;
       if (irop_is_64bit(acc))
         continue;
@@ -342,11 +339,11 @@ int ssa_opt_stack_deref_fold(IRSSAOptCtx *ctx)
     /* The pointer is no longer used here unless another operand names it. */
     int still = 0;
     if (irop_config[q->op].has_dest)
-      still |= irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == bvr;
+      still |= tcc_ir_op_dest_vreg(ir, q) == bvr;
     if (irop_config[q->op].has_src1)
-      still |= irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == bvr;
+      still |= tcc_ir_op_src1_vreg(ir, q) == bvr;
     if (irop_config[q->op].has_src2)
-      still |= irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == bvr;
+      still |= tcc_ir_op_src2_vreg(ir, q) == bvr;
     if (!still)
       ssa_opt_remove_use_instr(ssa_opt_vinfo(ctx, bvr), i);
     changes++;

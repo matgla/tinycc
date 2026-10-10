@@ -1,0 +1,25 @@
+0 alpha 1 -
+1 beta 2 b
+2 gamma 3 -
+3 delta 4 d
+words=3 last=three
+idx word=three len=5
+char=g
+char2=t
+find=4 d
+find missing=1
+copy=beta b
+memcpy=gamma d
+first=two
+inner=456789 9
+typedef=td0 td1
+mutable=m1 mm
+null=1 1
+eq=1
+arith=pha amma
+sorted alpha
+sorted beta
+sorted delta
+sorted gamma
+bsearch=gamma 3
+sizeof=4 60

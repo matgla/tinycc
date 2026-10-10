@@ -50,9 +50,9 @@ OPT_GEN_FLAT(pair_reorder, TCCIR_OP_LOAD_INDEXED)
   int blocked = 0;
   for (int k = i + 1; k < n && (k - i) <= window; k++) {
     IRQuadCompact *cq = &ir->compact_instructions[k];
+    if (cq->is_jump_target) { blocked = 1; break; } /* a NOP can be the join */
     if (cq->op == TCCIR_OP_NOP)
       continue;
-    if (cq->is_jump_target) { blocked = 1; break; }
     if (cq->op == q1->op) { q3_idx = k; break; }
     int safe = 0;
     if (cq->op == TCCIR_OP_FUNCPARAMVAL) {

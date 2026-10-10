@@ -27,7 +27,10 @@ int ir_opt_eval_const_string_operand(TCCIRState *ir, IROperand op, int use_idx, 
   if (!ir || !out || depth > 16)
     return 0;
 
-  if (op.is_lval && op.vreg_type == TCCIR_VREG_TYPE_TEMP)
+  /* An lval operand is the value loaded from the address, never the address of
+   * a string: `GlobalSym(tab)+4***DEREF***` is a pointer out of a rodata table,
+   * and the table slot's own bytes are not the string it points at. */
+  if (op.is_lval)
     return 0;
 
   if (ir_opt_get_constant_string_from_symref(ir, op))
@@ -51,10 +54,11 @@ int ir_opt_eval_const_string_operand(TCCIRState *ir, IROperand op, int use_idx, 
     return 0;
 
   q = &ir->compact_instructions[def_idx];
+  if (tcc_ir_barrel_shift_at(ir, q))
+    return 0;
   switch (q->op)
   {
   case TCCIR_OP_ASSIGN:
-  case TCCIR_OP_LOAD:
     return ir_opt_eval_const_string_operand(ir, tcc_ir_op_get_src1(ir, q), def_idx, out, depth + 1);
   case TCCIR_OP_ADD:
   {
@@ -180,16 +184,12 @@ static int ir_opt_stack_addr_offset(IROperand op, int *out_off)
 
 static int ir_opt_is_memcpy_like_name(const char *name)
 {
-  return name &&
-         (strcmp(name, "memcpy") == 0 || strcmp(name, "memmove") == 0 ||
-          strcmp(name, "__aeabi_memcpy") == 0 || strcmp(name, "__aeabi_memcpy4") == 0 ||
-          strcmp(name, "__aeabi_memcpy8") == 0);
+  return name && ir_opt_name_in(name, "memcpy\0memmove\0__aeabi_memcpy\0__aeabi_memcpy4\0__aeabi_memcpy8\0");
 }
 
 static int ir_opt_is_memset_like_name(const char *name)
 {
-  return name && (strcmp(name, "memset") == 0 || strcmp(name, "__aeabi_memset") == 0 ||
-                  strcmp(name, "__aeabi_memset4") == 0 || strcmp(name, "__aeabi_memset8") == 0);
+  return name && ir_opt_name_in(name, "memset\0__aeabi_memset\0__aeabi_memset4\0__aeabi_memset8\0");
 }
 
 /* What a library routine does through the pointer arguments it is given.  A name
@@ -199,7 +199,7 @@ static int ir_opt_is_memset_like_name(const char *name)
  * folding runs after both. */
 typedef struct StrArgModel
 {
-  const char *name;
+  const char *TCC_RODATA_REL name;
   unsigned read_only_args;  /* bit k: argument k is only read through */
   unsigned write_args;      /* bit k: argument k is written through */
   /* 1 when the routine's destination may not overlap the whole NUL-terminated
@@ -397,7 +397,7 @@ static int sb_apply(TCCIRState *ir, int idx, int base_off, uint8_t *bytes, uint8
 
   if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
   {
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     const char *name = callee ? get_tok_str(callee->v, NULL) : NULL;
     IROperand dst;
     IROperand src;
@@ -501,7 +501,7 @@ static int sb_scan_forward(TCCIRState *ir, int base_off, int call_idx, int *out_
 /* Which callee does this call name?  NULL for an indirect call. */
 static const char *sb_callee_name(TCCIRState *ir, int call_idx)
 {
-  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, &ir->compact_instructions[call_idx]));
+  Sym *callee = tcc_ir_op_src1_sym(ir, &ir->compact_instructions[call_idx]);
   return callee ? get_tok_str(callee->v, NULL) : NULL;
 }
 
@@ -763,4 +763,95 @@ int ir_opt_eval_stack_const_string(TCCIRState *ir, IROperand arg, int use_idx, I
   *out_sym = cand;
   *out_len = len;
   return 1;
+}
+
+int resolve_str_builtin_by_tok(int tok)
+{
+  switch (tok)
+  {
+  case TOK_builtin_strlen:
+    return STRBI_STRLEN;
+  case TOK_builtin_strnlen:
+    return STRBI_STRNLEN;
+  case TOK_builtin_strcmp:
+    return STRBI_STRCMP;
+  case TOK_builtin_strncmp:
+    return STRBI_STRNCMP;
+  case TOK_builtin_strcpy:
+    return STRBI_STRCPY;
+  case TOK_builtin_strncpy:
+    return STRBI_STRNCPY;
+  case TOK_builtin_stpcpy:
+    return STRBI_STPCPY;
+  case TOK_builtin_stpncpy:
+    return STRBI_STPNCPY;
+  case TOK_builtin_strcat:
+    return STRBI_STRCAT;
+  case TOK_builtin_strncat:
+    return STRBI_STRNCAT;
+  case TOK_builtin_strchr:
+    return STRBI_STRCHR;
+  case TOK_builtin_strrchr:
+    return STRBI_STRRCHR;
+  case TOK_builtin_strstr:
+    return STRBI_STRSTR;
+  case TOK_builtin_strpbrk:
+    return STRBI_STRPBRK;
+  case TOK_builtin_strcspn:
+    return STRBI_STRCSPN;
+  case TOK_builtin_memcmp:
+    return STRBI_MEMCMP;
+  case TOK_builtin_memcmp_eq:
+    return STRBI_MEMCMP_EQ;
+  case TOK_builtin_memchr:
+    return STRBI_MEMCHR;
+  case TOK_builtin_memmove:
+    return STRBI_MEMMOVE;
+  case TOK_builtin_mempcpy:
+    return STRBI_MEMPCPY;
+  default:
+    return STRBI_UNKNOWN;
+  }
+}
+
+int resolve_str_builtin_id(int tok, const char *name)
+{
+  static const struct
+  {
+    const char *TCC_RODATA_REL name;
+    int id;
+  } map[] = {{"strlen", STRBI_STRLEN},           {"__tcc_strlen", STRBI_STRLEN},
+             {"strnlen", STRBI_STRNLEN},         {"strcmp", STRBI_STRCMP},
+             {"__tcc_strcmp", STRBI_STRCMP},     {"strncmp", STRBI_STRNCMP},
+             {"__tcc_strncmp", STRBI_STRNCMP},   {"strcpy", STRBI_STRCPY},
+             {"__tcc_strcpy", STRBI_STRCPY},     {"strncpy", STRBI_STRNCPY},
+             {"__tcc_strncpy", STRBI_STRNCPY},   {"stpcpy", STRBI_STPCPY},
+             {"__tcc_stpcpy", STRBI_STPCPY},     {"stpncpy", STRBI_STPNCPY},
+             {"__tcc_stpncpy", STRBI_STPNCPY},   {"strcat", STRBI_STRCAT},
+             {"__tcc_strcat", STRBI_STRCAT},     {"strncat", STRBI_STRNCAT},
+             {"__tcc_strncat", STRBI_STRNCAT},   {"strchr", STRBI_STRCHR},
+             {"__tcc_strchr", STRBI_STRCHR},     {"strrchr", STRBI_STRRCHR},
+             {"__tcc_strrchr", STRBI_STRRCHR},   {"strstr", STRBI_STRSTR},
+             {"__tcc_strstr", STRBI_STRSTR},     {"strpbrk", STRBI_STRPBRK},
+             {"__tcc_strpbrk", STRBI_STRPBRK},   {"strcspn", STRBI_STRCSPN},
+             {"__tcc_strcspn", STRBI_STRCSPN},   {"strspn", STRBI_STRSPN},
+             {"memcmp", STRBI_MEMCMP},
+             {"__builtin_memcmp_eq", STRBI_MEMCMP_EQ},
+             {"memchr", STRBI_MEMCHR},           {"memmove", STRBI_MEMMOVE},
+             {"__tcc_memmove", STRBI_MEMMOVE},   {"bcopy", STRBI_BCOPY},
+             {"__tcc_bcopy", STRBI_BCOPY},       {"mempcpy", STRBI_MEMPCPY},
+             {"__tcc_mempcpy", STRBI_MEMPCPY},   {"index", STRBI_INDEX},
+             {"rindex", STRBI_RINDEX},           {"__builtin_index", STRBI_INDEX},
+             {"__builtin_rindex", STRBI_RINDEX}, {NULL, STRBI_UNKNOWN}};
+  int id = resolve_str_builtin_by_tok(tok);
+  if (id != STRBI_UNKNOWN)
+    return id;
+  if (!name)
+    return STRBI_UNKNOWN;
+  for (int i = 0; map[i].name; i++)
+  {
+    if (map[i].name[0] == name[0] && strcmp(name, map[i].name) == 0)
+      return map[i].id;
+  }
+  return STRBI_UNKNOWN;
 }

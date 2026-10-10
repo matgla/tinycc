@@ -81,11 +81,10 @@ int find_loop_exit_condition(TCCIRState *ir, IRLoop *loop, int iv_vreg, int *out
         continue;
       }
 
-      IROperand cmp_src1 = tcc_ir_op_get_src1(ir, cq);
+      int32_t vr1 = tcc_ir_op_src1_vreg(ir, cq);
       IROperand cmp_src2 = tcc_ir_op_get_src2(ir, cq);
 
       /* Check: CMP Viv, #limit */
-      int32_t vr1 = irop_get_vreg(cmp_src1);
       if (vr1 != iv_vreg || !irop_is_immediate(cmp_src2))
       {
         LOG_LOOP_OPT("[%d] CMP but vr1=%d (want %d) imm=%d, skipping", i,
@@ -104,11 +103,11 @@ int find_loop_exit_condition(TCCIRState *ir, IRLoop *loop, int iv_vreg, int *out
         continue;
       }
 
-      IROperand cond_op = tcc_ir_op_get_src1(ir, jq);
-      int cond = (int)irop_get_imm64_ex(ir, cond_op);
+      int64_t cond_op_imm = tcc_ir_op_src1_imm(ir, jq);
+      int cond = (int)cond_op_imm;
 
-      IROperand jmp_dest = tcc_ir_op_get_dest(ir, jq);
-      int jmp_target = (int)irop_get_imm64_ex(ir, jmp_dest);
+      int64_t jmp_dest_imm = tcc_ir_op_dest_imm(ir, jq);
+      int jmp_target = (int)jmp_dest_imm;
 
       /* Top-tested: exit target is outside the loop */
       if (jmp_target > loop->end_idx)
@@ -192,7 +191,12 @@ int compute_trip_count(int init_val, int limit, int step, int cond_token)
   if (step <= 0)
     return -1;
 
-  int64_t range = (int64_t)limit - (int64_t)init_val;
+  /* init_val/limit are the raw 32-bit immediates: widen by the compare's
+   * signedness (0xFFFFFFFE <u 3 is a zero-trip loop, not 5 trips). */
+  int is_uns = (cond_token == TOK_UGE || cond_token == TOK_UGT);
+  int64_t lo = is_uns ? (int64_t)(uint32_t)init_val : (int64_t)init_val;
+  int64_t hi = is_uns ? (int64_t)(uint32_t)limit : (int64_t)limit;
+  int64_t range = hi - lo;
 
   LOG_LOOP_OPT("compute_trip_count: init=%d limit=%d step=%d cond=%d range=%lld", init_val, limit, step, cond_token,
                (long long)range);
@@ -207,18 +211,17 @@ int compute_trip_count(int init_val, int limit, int step, int cond_token)
 
   case TOK_UGT:
   case TOK_GT: /* exit if iv > limit → loop while iv <= limit */
+    if (hi == (is_uns ? (int64_t)UINT32_MAX : (int64_t)INT32_MAX))
+      return -1; /* iv <= MAX never exits (wraps) */
     if (range < 0)
       return 0;
     return (int)(range / step + 1);
 
-  case TOK_NE: /* exit if iv != limit → loop until iv == limit */
-    if (range < 0)
-      return -1;
-    if (range == 0)
-      return 0;
-    if (range % step != 0)
-      return -1; /* would loop forever */
-    return (int)(range / step);
+  case TOK_NE: /* exit if iv != limit: runs once or twice, never (limit - init) trips;
+                * the count depends on whether the test follows the increment */
+  case TOK_EQ: /* exit if iv == limit: the count depends on whether the test sits before or
+                * after the increment (a mid-body `if (i == C) break;` runs one more trip) */
+    return -1;
 
   default:
     return -1;
@@ -356,9 +359,8 @@ int find_loop_exit_condition_op(TCCIRState *ir, IRLoop *loop, int iv_vreg, int *
       IRQuadCompact *cq = &ir->compact_instructions[i];
       if (cq->op != TCCIR_OP_CMP)
         continue;
-      IROperand cmp_src1 = tcc_ir_op_get_src1(ir, cq);
+      int32_t vr1 = tcc_ir_op_src1_vreg(ir, cq);
       IROperand cmp_src2 = tcc_ir_op_get_src2(ir, cq);
-      int32_t vr1 = irop_get_vreg(cmp_src1);
       if (vr1 != iv_vreg)
         continue;
       /* Accept either immediate OR a plain vreg (no DEREF/sym/complex). */
@@ -370,10 +372,10 @@ int find_loop_exit_condition_op(TCCIRState *ir, IRLoop *loop, int iv_vreg, int *
       IRQuadCompact *jq = &ir->compact_instructions[i + 1];
       if (jq->op != TCCIR_OP_JUMPIF)
         continue;
-      IROperand cond_op = tcc_ir_op_get_src1(ir, jq);
-      int cond = (int)irop_get_imm64_ex(ir, cond_op);
-      IROperand jmp_dest = tcc_ir_op_get_dest(ir, jq);
-      int jmp_target = (int)irop_get_imm64_ex(ir, jmp_dest);
+      int64_t cond_op_imm = tcc_ir_op_src1_imm(ir, jq);
+      int cond = (int)cond_op_imm;
+      int64_t jmp_dest_imm = tcc_ir_op_dest_imm(ir, jq);
+      int jmp_target = (int)jmp_dest_imm;
       if (jmp_target > loop->end_idx)
       {
         *out_cmp_idx = i;

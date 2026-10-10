@@ -44,3 +44,8 @@ def test_b():
 def test_cbz():
     branch_set = ["cbz", "cbnz"]
     perform_test_for_branches("test_cbz.S", branch_set)
+
+def test_far_backward_bl_b():
+    # Backward bl/b.w over more than 4 KB: imm10 must be offset bits 21:12.
+    branch_set = ["bl", "bl.w", "b.w"]
+    perform_test_for_branches("test_bl_far_back.S", branch_set)

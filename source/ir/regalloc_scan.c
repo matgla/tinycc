@@ -42,9 +42,7 @@ static int sort_by_start(const void *a, const void *b)
   /* Equal starts: precolored intervals first, so their fixed registers are
    * claimed before the scan hands the same register to a non-precolored
    * interval (the precolored assignment does not check int_free).  Then by
-   * vreg — qsort is not stable, and leaving ties unspecified makes the
-   * allocation depend on the libc's qsort (host glibc and the device libc
-   * order equal elements differently). */
+   * vreg. */
   if (ia->precolored >= 0 && ib->precolored < 0) return -1;
   if (ia->precolored < 0 && ib->precolored >= 0) return 1;
   if (ia->vreg < ib->vreg) return -1;
@@ -106,17 +104,14 @@ static int ra_safe_loop_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterv
     if (!irop_config[q->op].has_dest) continue;
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
         q->op == TCCIR_OP_STORE_POSTINC) continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (!irop_has_vreg(d) || irop_get_vreg(d) != cur_vreg) continue;
+    if (!tcc_ir_op_dest_has_vreg(ir, q) || tcc_ir_op_dest_vreg(ir, q) != cur_vreg) continue;
 
     int reads_partner = 0;
     if (irop_config[q->op].has_src1) {
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      if (irop_has_vreg(s) && irop_get_vreg(s) == partner_vreg) reads_partner = 1;
+      if (tcc_ir_op_src1_has_vreg(ir, q) && tcc_ir_op_src1_vreg(ir, q) == partner_vreg) reads_partner = 1;
     }
     if (!reads_partner && irop_config[q->op].has_src2) {
-      IROperand s = tcc_ir_op_get_src2(ir, q);
-      if (irop_has_vreg(s) && irop_get_vreg(s) == partner_vreg) reads_partner = 1;
+      if (tcc_ir_op_src2_has_vreg(ir, q) && tcc_ir_op_src2_vreg(ir, q) == partner_vreg) reads_partner = 1;
     }
     if (!reads_partner && tcc_ir_op_is_mac(q->op)) {
       IROperand s = tcc_ir_op_get_accum(ir, q);
@@ -144,20 +139,17 @@ static int ra_safe_loop_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterv
      * g12-carried hash T160<-T161, re-defined inside the rotated g16 loop). The
      * linear scan cannot model the inner back-edge, so reject conservatively. */
     if (irop_config[q->op].has_dest) {
-      IROperand cd = tcc_ir_op_get_dest(ir, q);
-      if (irop_has_vreg(cd) && irop_get_vreg(cd) == cur_vreg)
+      if (tcc_ir_op_dest_has_vreg(ir, q) && tcc_ir_op_dest_vreg(ir, q) == cur_vreg)
         return 0;
     }
 
     int uses_partner_as_src = 0;
     if (irop_config[q->op].has_src1) {
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      if (irop_has_vreg(s) && irop_get_vreg(s) == partner_vreg)
+      if (tcc_ir_op_src1_has_vreg(ir, q) && tcc_ir_op_src1_vreg(ir, q) == partner_vreg)
         uses_partner_as_src = 1;
     }
     if (!uses_partner_as_src && irop_config[q->op].has_src2) {
-      IROperand s = tcc_ir_op_get_src2(ir, q);
-      if (irop_has_vreg(s) && irop_get_vreg(s) == partner_vreg)
+      if (tcc_ir_op_src2_has_vreg(ir, q) && tcc_ir_op_src2_vreg(ir, q) == partner_vreg)
         uses_partner_as_src = 1;
     }
     if (!uses_partner_as_src && tcc_ir_op_is_mac(q->op)) {
@@ -167,10 +159,8 @@ static int ra_safe_loop_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterv
     }
     if (uses_partner_as_src) {
       if (q->op != TCCIR_OP_ASSIGN) return 0;
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!irop_has_vreg(d) || irop_get_vreg(d) != partner_vreg) return 0;
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      if (!irop_has_vreg(s) || irop_get_vreg(s) != cur_vreg) return 0;
+      if (!tcc_ir_op_dest_has_vreg(ir, q) || tcc_ir_op_dest_vreg(ir, q) != partner_vreg) return 0;
+      if (!tcc_ir_op_src1_has_vreg(ir, q) || tcc_ir_op_src1_vreg(ir, q) != cur_vreg) return 0;
       if (found_back_copy) return 0;
       found_back_copy = 1;
       continue;
@@ -180,15 +170,12 @@ static int ra_safe_loop_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterv
       int dest_is_use = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
                          q->op == TCCIR_OP_STORE_POSTINC);
       if (dest_is_use) {
-        IROperand d = tcc_ir_op_get_dest(ir, q);
-        if (irop_has_vreg(d) && irop_get_vreg(d) == partner_vreg)
+        if (tcc_ir_op_dest_has_vreg(ir, q) && tcc_ir_op_dest_vreg(ir, q) == partner_vreg)
           return 0;
       } else {
-        IROperand d = tcc_ir_op_get_dest(ir, q);
-        if (irop_has_vreg(d) && irop_get_vreg(d) == partner_vreg) {
+        if (tcc_ir_op_dest_has_vreg(ir, q) && tcc_ir_op_dest_vreg(ir, q) == partner_vreg) {
           if (q->op != TCCIR_OP_ASSIGN) return 0;
-          IROperand s = tcc_ir_op_get_src1(ir, q);
-          if (!irop_has_vreg(s) || irop_get_vreg(s) != cur_vreg) return 0;
+          if (!tcc_ir_op_src1_has_vreg(ir, q) || tcc_ir_op_src1_vreg(ir, q) != cur_vreg) return 0;
           if (found_back_copy) return 0;
           found_back_copy = 1;
         }
@@ -206,20 +193,17 @@ static int ra_instr_touches_vreg(TCCIRState *ir, IRQuadCompact *q, int32_t vreg)
   if (q->op == TCCIR_OP_NOP)
     return 0;
   if (irop_config[q->op].has_src1) {
-    IROperand s = tcc_ir_op_get_src1(ir, q);
-    if (irop_has_vreg(s) && irop_get_vreg(s) == vreg) return 1;
+    if (tcc_ir_op_src1_has_vreg(ir, q) && tcc_ir_op_src1_vreg(ir, q) == vreg) return 1;
   }
   if (irop_config[q->op].has_src2) {
-    IROperand s = tcc_ir_op_get_src2(ir, q);
-    if (irop_has_vreg(s) && irop_get_vreg(s) == vreg) return 1;
+    if (tcc_ir_op_src2_has_vreg(ir, q) && tcc_ir_op_src2_vreg(ir, q) == vreg) return 1;
   }
   if (tcc_ir_op_is_mac(q->op)) {
     IROperand s = tcc_ir_op_get_accum(ir, q);
     if (irop_has_vreg(s) && irop_get_vreg(s) == vreg) return 1;
   }
   if (irop_config[q->op].has_dest) {
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (irop_has_vreg(d) && irop_get_vreg(d) == vreg) return 1;
+    if (tcc_ir_op_dest_has_vreg(ir, q) && tcc_ir_op_dest_vreg(ir, q) == vreg) return 1;
   }
   return 0;
 }
@@ -271,11 +255,9 @@ static int ra_safe_exit_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterv
     IRQuadCompact *q = &ir->compact_instructions[j];
     if (q->op == TCCIR_OP_NOP) continue;
     if (!irop_config[q->op].has_dest) continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (!irop_has_vreg(d) || irop_get_vreg(d) != cur_vreg) continue;
+    if (!tcc_ir_op_dest_has_vreg(ir, q) || tcc_ir_op_dest_vreg(ir, q) != cur_vreg) continue;
     if (q->op != TCCIR_OP_ASSIGN) return 0;
-    IROperand s = tcc_ir_op_get_src1(ir, q);
-    if (!irop_has_vreg(s) || irop_get_vreg(s) != partner_vreg) return 0;
+    if (!tcc_ir_op_src1_has_vreg(ir, q) || tcc_ir_op_src1_vreg(ir, q) != partner_vreg) return 0;
     def_pos = j;
     break;
   }
@@ -308,11 +290,11 @@ static int ra_safe_exit_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterv
     if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE ||
         q->op == TCCIR_OP_SWITCH_LOAD) { dead = 0; break; } /* unknown targets */
     if (q->op == TCCIR_OP_JUMP) {
-      RA_EXITPHI_PUSH((int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q)));
+      RA_EXITPHI_PUSH((int)tcc_ir_op_dest_imm(ir, q));
       continue;
     }
     if (q->op == TCCIR_OP_JUMPIF) {
-      RA_EXITPHI_PUSH((int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q)));
+      RA_EXITPHI_PUSH((int)tcc_ir_op_dest_imm(ir, q));
       RA_EXITPHI_PUSH(i + 1);
       continue;
     }
@@ -342,14 +324,12 @@ static int ra_safe_exit_phi_coalesce(TCCIRState *ir, SSAInterval *cur, SSAInterv
       if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest) continue;
       if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
           q->op == TCCIR_OP_STORE_POSTINC) continue;
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!irop_has_vreg(d) || irop_get_vreg(d) != cur_vreg) continue;
+      if (!tcc_ir_op_dest_has_vreg(ir, q) || tcc_ir_op_dest_vreg(ir, q) != cur_vreg) continue;
       if (visited[j]) continue; /* (b) forward continuation */
       /* (c) a parallel `cur <- partner` copy is fine; anything else rejects. */
       int parallel_copy = 0;
       if (q->op == TCCIR_OP_ASSIGN) {
-        IROperand s = tcc_ir_op_get_src1(ir, q);
-        if (irop_has_vreg(s) && irop_get_vreg(s) == partner_vreg)
+        if (tcc_ir_op_src1_has_vreg(ir, q) && tcc_ir_op_src1_vreg(ir, q) == partner_vreg)
           parallel_copy = 1;
       }
       if (!parallel_copy) { dead = 0; break; }
@@ -422,7 +402,7 @@ void ra_alive_free(RaAliveInfo *info)
  * handled at the donor (`reg_shared`) plus an interlock in the scan. */
 int ra_alive_worth_building(TCCIRState *ir, const SSAInterval *intervals, int count)
 {
-  if (tcc_state->optimize < 1)
+  if (TCC_OPT(tcc_state, optimize) < 1)
     return 0;
   if (tcc_ir_opt_pass_disabled("ra:alive_share"))
     return 0;
@@ -440,19 +420,50 @@ int ra_alive_worth_building(TCCIRState *ir, const SSAInterval *intervals, int co
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    int t = (int)tcc_ir_op_dest_imm(ir, q);
     if (t >= 0 && t <= i)
       return 0;
   }
   return 1;
 }
+/* For every CALL, the chain of FUNCPARAMVAL quads (by instruction index) whose
+ * vreg source is read again AT that call: head[call] -> sibling[] -> ... -> -1.
+ * Both arrays are n entries, caller frees. */
+static void ra_param_use_lists(TCCIRState *ir, int n, int **out_head, int **out_sibling)
+{
+  int *call_param_head = tcc_malloc(sizeof(int) * n);
+  int *param_sibling = tcc_malloc(sizeof(int) * n);
+  for (int i = 0; i < n; i++) { call_param_head[i] = -1; param_sibling[i] = -1; }
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_FUNCPARAMVAL) continue;
+    if (!tcc_ir_op_src1_has_vreg(ir, q) || tcc_ir_op_src1_is_imm(ir, q)) continue;
+    int cid = TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, q));
+    if (cid < 0) continue;
+    for (int j = i + 1; j < n; j++)
+    {
+      IRQuadCompact *qq = &ir->compact_instructions[j];
+      if (qq->op != TCCIR_OP_FUNCCALLVOID && qq->op != TCCIR_OP_FUNCCALLVAL) continue;
+      if (TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, qq)) == cid)
+      {
+        param_sibling[i] = call_param_head[j];
+        call_param_head[j] = i;
+        break;
+      }
+    }
+  }
+  *out_head = call_param_head;
+  *out_sibling = param_sibling;
+}
+
 void ra_alive_build(TCCIRState *ir, RaAliveInfo *info, int max_vreg_pos)
 {
   memset(info, 0, sizeof *info);
   const int n = ir->next_instruction_index;
   if (n <= 0 || max_vreg_pos <= 0)
     return;
-  if (tcc_state->optimize < 1)
+  if (TCC_OPT(tcc_state, optimize) < 1)
     return;
   /* Un-enumerated edges make the dataflow unsound; same guard the coalescer
    * and the scratch-liveness refinement use. */
@@ -517,29 +528,8 @@ void ra_alive_build(TCCIRState *ir, RaAliveInfo *info, int max_vreg_pos)
    * between the PARAM quad and the call; ra_build_intervals extends ends for
    * exactly this, and the liveness has to model it or a share would clobber an
    * argument already marshalled. */
-  int *call_param_head = tcc_malloc(sizeof(int) * n);
-  int *param_sibling = tcc_malloc(sizeof(int) * n);
-  for (int i = 0; i < n; i++) { call_param_head[i] = -1; param_sibling[i] = -1; }
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_FUNCPARAMVAL) continue;
-    IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    if (!irop_has_vreg(s1) || irop_is_immediate(s1)) continue;
-    int cid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
-    if (cid < 0) continue;
-    for (int j = i + 1; j < n; j++)
-    {
-      IRQuadCompact *qq = &ir->compact_instructions[j];
-      if (qq->op != TCCIR_OP_FUNCCALLVOID && qq->op != TCCIR_OP_FUNCCALLVAL) continue;
-      if (TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, qq))) == cid)
-      {
-        param_sibling[i] = call_param_head[j];
-        call_param_head[j] = i;
-        break;
-      }
-    }
-  }
+  int *call_param_head = NULL, *param_sibling = NULL;
+  ra_param_use_lists(ir, n, &call_param_head, &param_sibling);
   #define AV_FOR_PARAM_USES(call_idx, vr_, body)                                    \
     do {                                                                            \
       for (int p_ = call_param_head[(call_idx)]; p_ >= 0; p_ = param_sibling[p_]) {  \
@@ -657,6 +647,367 @@ void ra_alive_build(TCCIRState *ir, RaAliveInfo *info, int max_vreg_pos)
   info->rows = rows;
 }
 
+/* Widen the linear [start,end] intervals to cover every point where the value
+ * is genuinely live.
+ *
+ * ra_build_intervals gives each vreg ONE contiguous range -- first to last
+ * reference in linear order -- and widens it only at backward jumps whose
+ * source or target the range already contains.  A value can leave that range
+ * by a FORWARD jump to a block laid out after its last use and come back by a
+ * BACKWARD jump to a block laid out before its def, falling or jumping into
+ * the use from there.  Neither end of the excursion is inside the range, so
+ * the blocks on it were treated as "value dead" and their temporaries got the
+ * value's register (hand-written goto state machines, generated scanners and
+ * the Zig C backend's label/goto output all have this layout).
+ *
+ * Real liveness (backward dataflow over the CFG, the model the coalescer and
+ * ra_alive_build trust) says where the value is live-in/live-out of a block;
+ * the range grows to the hull of those points.  Only "live AND possibly
+ * defined" counts: a path that reaches a use without passing a def reads an
+ * uninitialised value, and chasing it back to the function entry would only
+ * inflate the range.  Growth only ever adds, so this can cost registers but
+ * never remove a conflict the linear rules already saw.
+ *
+ * Only a function with a backward edge needs it: with forward edges alone
+ * every path from a def to a use is monotone in linear order and stays inside
+ * [first reference, last reference].
+ *
+ * `live_in_at_start[idx]` (zeroed by the caller) is set for a range that now
+ * begins at a block's first instruction with the value live-in there: the
+ * crossing tests in ra_build_intervals exclude the start, but a call, switch
+ * dispatch or asm statement AT that instruction clobbers the value too.
+ *
+ * An IJUMP's successors cannot be enumerated: it is treated as reaching every
+ * block (blocks entered only that way are not in the RPO, so such a function
+ * is iterated over all blocks).  A function whose bit sets would be too large
+ * to be worth their memory falls back to ra_widen_intervals_by_loops.  */
+#define RA_WIDEN_MAX_WORDS (1 << 19) /* uint64 words over all five per-block matrices: 4 MiB */
+
+/* Conservative stand-in for the liveness widening: a value can leave its linear
+ * range forward and re-enter it backward only through a backward edge whose
+ * loop encloses the range, so every enclosing loop is covered whole. */
+static void ra_widen_intervals_by_loops(TCCIRState *ir, const RaVregIdx *vx, uint32_t *starts, uint32_t *ends,
+                                        uint8_t *live_in_at_start)
+{
+  const int n = ir->next_instruction_index;
+  const int vsize = vx->size;
+  for (int changed = 1; changed;)
+  {
+    changed = 0;
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int lo = n, nt = 0, t[2];
+      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+        t[nt++] = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      else if (q->op == TCCIR_OP_SWITCH_TABLE)
+      {
+        int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+        if (table_id >= 0 && table_id < ir->num_switch_tables)
+        {
+          const TCCIRSwitchTable *tb = &ir->switch_tables[table_id];
+          for (int j = 0; j < tb->num_entries; j++)
+            if (tb->targets[j] >= 0 && tb->targets[j] <= i && tb->targets[j] < lo)
+              lo = tb->targets[j];
+          if (tb->default_target >= 0 && tb->default_target <= i && tb->default_target < lo)
+            lo = tb->default_target;
+        }
+      }
+      for (int k = 0; k < nt; k++)
+        if (t[k] >= 0 && t[k] <= i && t[k] < lo)
+          lo = t[k];
+      if (lo >= n)
+        continue;
+      for (int idx = 0; idx < vsize; idx++)
+      {
+        if (starts[idx] == INTERVAL_NOT_STARTED || ends[idx] <= starts[idx])
+          continue;
+        if ((int)starts[idx] > lo && (int)ends[idx] < i)
+        {
+          starts[idx] = (uint32_t)lo;
+          ends[idx] = (uint32_t)i;
+          live_in_at_start[idx] = 1;
+          changed = 1;
+        }
+      }
+    }
+  }
+}
+
+void ra_widen_intervals_by_liveness(TCCIRState *ir, const RaVregIdx *vx, uint32_t *starts, uint32_t *ends,
+                                    uint8_t *live_in_at_start)
+{
+  const int n = ir->next_instruction_index;
+  if (n <= 1)
+    return;
+
+  int has_back = 0, has_ijump = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_IJUMP)
+    {
+      has_ijump = 1;
+      has_back = 1;
+    }
+    else if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      if (t >= 0 && t <= i)
+        has_back = 1;
+    }
+    else if (q->op == TCCIR_OP_SWITCH_TABLE)
+    {
+      int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      if (table_id >= 0 && table_id < ir->num_switch_tables)
+      {
+        const TCCIRSwitchTable *tb = &ir->switch_tables[table_id];
+        for (int j = 0; j < tb->num_entries; j++)
+          if (tb->targets[j] >= 0 && tb->targets[j] <= i)
+            has_back = 1;
+        if (tb->default_target >= 0 && tb->default_target <= i)
+          has_back = 1;
+      }
+    }
+  }
+  if (!has_back)
+    return;
+
+  /* Dense row per vreg that has a range worth checking. */
+  const int vsize = vx->size;
+  int *dense = tcc_malloc(sizeof(int) * (vsize + 1));
+  int nd = 0;
+  for (int idx = 0; idx < vsize; idx++)
+  {
+    dense[idx] = -1;
+    if (starts[idx] != INTERVAL_NOT_STARTED && ends[idx] > starts[idx])
+      dense[idx] = nd++;
+  }
+  dense[vsize] = -1;
+  if (nd == 0)
+  {
+    tcc_free(dense);
+    return;
+  }
+
+  IRCFG *cfg = tcc_ir_cfg_build(ir);
+  if (!cfg)
+  {
+    tcc_free(dense);
+    return;
+  }
+  tcc_ir_cfg_compute_rpo(cfg);
+  const int nb = cfg->num_blocks;
+  const int bw = (nd + 63) / 64;
+  size_t max_words = RA_WIDEN_MAX_WORDS;
+#ifdef CONFIG_TCC_DEBUG
+  if (getenv("TCC_RA_WIDEN_MAX_WORDS"))
+    max_words = (size_t)strtoul(getenv("TCC_RA_WIDEN_MAX_WORDS"), NULL, 10);
+#endif
+  if (nb <= 0 || (size_t)5 * (size_t)nb * (size_t)bw > max_words)
+  {
+    tcc_ir_cfg_free(cfg);
+    tcc_free(dense);
+    ra_widen_intervals_by_loops(ir, vx, starts, ends, live_in_at_start);
+    return;
+  }
+
+  /* Visiting order: the RPO, or every block when an IJUMP can enter any of them. */
+  int *order = tcc_malloc(sizeof(int) * nb);
+  int norder = cfg->rpo_count;
+  if (has_ijump)
+  {
+    norder = nb;
+    for (int b = 0; b < nb; b++)
+      order[b] = b;
+  }
+  else
+    for (int b = 0; b < norder; b++)
+      order[b] = cfg->rpo_order[b];
+
+  /* A SWITCH_TABLE's default may be outside its table (the cfg only enumerates
+   * the entries): one extra successor per such block. */
+  int *xsucc = tcc_malloc(sizeof(int) * nb);
+  uint8_t *is_ijump = tcc_mallocz(nb);
+  for (int b = 0; b < nb; b++)
+  {
+    xsucc[b] = -1;
+    int last = cfg->blocks[b].end_idx - 1;
+    if (last < cfg->blocks[b].start_idx)
+      continue;
+    IRQuadCompact *q = &ir->compact_instructions[last];
+    if (q->op == TCCIR_OP_IJUMP)
+      is_ijump[b] = 1;
+    if (q->op != TCCIR_OP_SWITCH_TABLE)
+      continue;
+    int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+    if (table_id >= 0 && table_id < ir->num_switch_tables)
+    {
+      int dt = ir->switch_tables[table_id].default_target;
+      if (dt >= 0 && dt < n)
+        xsucc[b] = cfg->instr_to_block[dt];
+    }
+  }
+
+  int *call_param_head = NULL, *param_sibling = NULL;
+  ra_param_use_lists(ir, n, &call_param_head, &param_sibling);
+
+  const size_t mat = (size_t)nb * bw;
+  uint64_t *use_b = tcc_mallocz(sizeof(uint64_t) * mat);
+  uint64_t *def_b = tcc_mallocz(sizeof(uint64_t) * mat);
+  uint64_t *in_b = tcc_mallocz(sizeof(uint64_t) * mat);
+  uint64_t *out_b = tcc_mallocz(sizeof(uint64_t) * mat);
+  uint64_t *reach_b = tcc_mallocz(sizeof(uint64_t) * mat); /* possibly-defined at block exit */
+  uint64_t *row = tcc_malloc(sizeof(uint64_t) * bw);
+  uint64_t *seed = tcc_mallocz(sizeof(uint64_t) * bw);     /* defined on entry: the parameters */
+
+  #define W_ROW(vr) (tcc_ir_vreg_is_valid(ir, (vr)) ? dense[ra_vidx(vx, (vr))] : -1)
+
+  for (int idx = vx->base[TCCIR_VREG_TYPE_PARAM]; idx < vsize; idx++)
+    if (dense[idx] >= 0)
+      tcc_bitspan_set(seed, dense[idx]);
+
+  for (int b = 0; b < nb; b++)
+  {
+    uint64_t *ub = use_b + (size_t)b * bw, *db = def_b + (size_t)b * bw;
+    int s = cfg->blocks[b].start_idx, e = cfg->blocks[b].end_idx;
+    for (int i = s; i < e && i < n; i++)
+    {
+      int32_t def = -1, hd = 0, uses[4], nu = 0;
+      ra_co_ops(ir, &ir->compact_instructions[i], &def, &hd, uses, &nu);
+      for (int k = 0; k < nu; k++)
+      {
+        int r = W_ROW(uses[k]);
+        if (r >= 0 && !tcc_bitspan_test(db, r)) tcc_bitspan_set(ub, r);
+      }
+      for (int p = call_param_head[i]; p >= 0; p = param_sibling[p])
+      {
+        int r = W_ROW(irop_get_vreg(tcc_ir_op_get_src1(ir, &ir->compact_instructions[p])));
+        if (r >= 0 && !tcc_bitspan_test(db, r)) tcc_bitspan_set(ub, r);
+      }
+      if (hd)
+      {
+        int r = W_ROW(def);
+        if (r >= 0) tcc_bitspan_set(db, r);
+      }
+    }
+  }
+
+  /* Live-in / live-out, backward. */
+  for (int changed = 1, guard = 0; changed && (has_ijump || guard++ < nb + 4);)
+  {
+    changed = 0;
+    for (int ri = norder - 1; ri >= 0; ri--)
+    {
+      int b = order[ri];
+      uint64_t *lo = out_b + (size_t)b * bw, *li = in_b + (size_t)b * bw;
+      tcc_bitspan_zero(lo, bw);
+      if (is_ijump[b])
+        for (int sb = 0; sb < nb; sb++)
+          tcc_bitspan_or(lo, in_b + (size_t)sb * bw, bw);
+      for (int si = 0; si < cfg->blocks[b].num_succs; si++)
+      {
+        int sb = cfg->blocks[b].succs[si];
+        if (sb >= 0 && sb < nb) tcc_bitspan_or(lo, in_b + (size_t)sb * bw, bw);
+      }
+      if (xsucc[b] >= 0)
+        tcc_bitspan_or(lo, in_b + (size_t)xsucc[b] * bw, bw);
+      changed |= tcc_bitspan_or_andnot(li, use_b + (size_t)b * bw, lo, def_b + (size_t)b * bw, bw);
+    }
+  }
+
+  /* Possibly-defined, forward: reach_b[b] = (entry seed or any pred's reach) | defs(b). */
+  for (int changed = 1, guard = 0; changed && (has_ijump || guard++ < nb + 4);)
+  {
+    changed = 0;
+    for (int ri = 0; ri < norder; ri++)
+    {
+      int b = order[ri];
+      tcc_bitspan_zero(row, bw);
+      if (b == 0)
+        tcc_bitspan_or(row, seed, bw);
+      for (int ib = 0; has_ijump && ib < nb; ib++)
+        if (is_ijump[ib])
+          tcc_bitspan_or(row, reach_b + (size_t)ib * bw, bw);
+      for (int pi = 0; pi < cfg->blocks[b].num_preds; pi++)
+      {
+        int pb = cfg->blocks[b].preds[pi];
+        if (pb >= 0 && pb < nb) tcc_bitspan_or(row, reach_b + (size_t)pb * bw, bw);
+      }
+      uint64_t *rb = reach_b + (size_t)b * bw, *db = def_b + (size_t)b * bw;
+      for (int w = 0; w < bw; w++)
+      {
+        uint64_t v = row[w] | db[w];
+        if (v != rb[w]) { rb[w] = v; changed = 1; }
+      }
+    }
+  }
+
+  /* Widen: live-in (and possibly defined) at a block covers its first
+   * instruction, live-out covers its last.  Live-in without a use or live-out
+   * in the block is impossible, so the points between are covered by the
+   * range's own references. */
+  int *idx_of = tcc_malloc(sizeof(int) * nd);
+  for (int idx = 0; idx < vsize; idx++)
+    if (dense[idx] >= 0) idx_of[dense[idx]] = idx;
+  int widened = 0;
+  for (int ri = 0; ri < norder; ri++)
+  {
+    int b = order[ri];
+    const uint32_t first = (uint32_t)cfg->blocks[b].start_idx;
+    const uint32_t last = (uint32_t)(cfg->blocks[b].end_idx - 1);
+    if (cfg->blocks[b].end_idx <= cfg->blocks[b].start_idx || last >= (uint32_t)n)
+      continue;
+    tcc_bitspan_zero(row, bw);
+    if (b == 0)
+      tcc_bitspan_or(row, seed, bw);
+    for (int ib = 0; has_ijump && ib < nb; ib++)
+      if (is_ijump[ib])
+        tcc_bitspan_or(row, reach_b + (size_t)ib * bw, bw);
+    for (int pi = 0; pi < cfg->blocks[b].num_preds; pi++)
+    {
+      int pb = cfg->blocks[b].preds[pi];
+      if (pb >= 0 && pb < nb) tcc_bitspan_or(row, reach_b + (size_t)pb * bw, bw);
+    }
+    const uint64_t *li = in_b + (size_t)b * bw, *lo = out_b + (size_t)b * bw, *rb = reach_b + (size_t)b * bw;
+    for (int w = 0; w < bw; w++)
+    {
+      for (int pass = 0; pass < 2; pass++)
+      {
+        uint64_t bits = pass == 0 ? (li[w] & row[w]) : (lo[w] & rb[w]);
+        const uint32_t at = pass == 0 ? first : last;
+        for (; bits; bits &= bits - 1)
+        {
+          int k = w * 64 + __builtin_ctzll(bits);
+          if (k >= nd) break;
+          int idx = idx_of[k];
+          if (starts[idx] > at) { starts[idx] = at; widened++; }
+          if (ends[idx] < at) { ends[idx] = at; widened++; }
+          /* Live INTO the instruction at `at` (pass 0): the value is already
+           * in its register when that instruction runs, so a call / dispatch /
+           * asm sitting exactly at the range start still clobbers it.  The
+           * crossing tests are exclusive of the start; tell the caller. */
+          if (pass == 0 && starts[idx] == at) live_in_at_start[idx] = 1;
+        }
+      }
+    }
+  }
+  if (widened)
+    RA_DBG("ra_widen_intervals_by_liveness: %d range ends moved", widened);
+
+  #undef W_ROW
+  tcc_free(idx_of);
+  tcc_free(seed);
+  tcc_free(row);
+  tcc_free(use_b); tcc_free(def_b); tcc_free(in_b); tcc_free(out_b); tcc_free(reach_b);
+  tcc_free(call_param_head); tcc_free(param_sibling);
+  tcc_free(xsucc);
+  tcc_free(is_ijump);
+  tcc_free(order);
+  tcc_ir_cfg_free(cfg);
+  tcc_free(dense);
+}
+
 static int ra_may_need_frame_pointer(const TCCIRState *ir)
 {
   if (tcc_state->force_frame_pointer)
@@ -676,6 +1027,60 @@ static int ra_may_need_frame_pointer(const TCCIRState *ir)
       return 1;
   }
   return 0;
+}
+
+int tcc_ir_callee_saved_capacity(const TCCIRState *ir, const RegAllocTarget *target)
+{
+  uint64_t allowed = tcc_state->registers_map_for_allocator;
+  if (target->frame_pointer_reg >= 0 && !ra_may_need_frame_pointer(ir))
+    allowed |= 1ull << target->frame_pointer_reg;
+  if (target->static_chain_reg >= 0 && (ir->has_static_chain || tcc_state->nb_nested_funcs > 0))
+    allowed &= ~(1ull << target->static_chain_reg);
+  if (target->rodata_anchor_reg >= 0 && target->rodata_anchor_sites &&
+      target->rodata_anchor_sites(ir, RA_RODATA_ANCHOR_MIN_SITES) >= RA_RODATA_ANCHOR_MIN_SITES)
+    allowed &= ~(1ull << target->rodata_anchor_reg);
+  int count = 0;
+  for (int i = 0; i < target->int_class.num_callee_saved; ++i)
+    count += !!(allowed & (1ull << target->int_class.callee_saved[i]));
+  return count;
+}
+
+/* The return-block share (below, `reg_shared`) lets cur overwrite a register
+ * another live interval still owns, on the argument that control goes from
+ * cur's definition straight to the return at cur->end.  That holds only when
+ * no instruction in [start, end) can send control anywhere outside the range:
+ * a branch out of it reaches code that may still read the partner, after cur's
+ * definition already clobbered the partner's register.  The partner-touch scan
+ * only sees instructions INSIDE the range, so it cannot catch that.
+ *
+ * Zig's error-union shape `p = r.payload; if (r.error) return r.error;` built
+ * it: the error value's coalesced class starts at its load, before the test,
+ * so the branch to the code that stores through `p` lay inside cur's range, and
+ * the shared r0 replaced `p` by the error code (zig.c ast-check segfaults with
+ * ext_elim, which turned the error's re-extension into copies the coalescer
+ * merged).  Jumps within the range are fine: every path stays on the way to
+ * the return.  Anything that leaves it -- a jump out, an indirect or table
+ * jump, asm goto, setjmp/longjmp -- keeps the share off.  Returns and traps
+ * inside the range leave the function and are fine.
+ * TCC_DISABLE_PASS=ra:ret_share_exit drops this guard (A/B only: unsound). */
+static int ra_ret_tail_closed(TCCIRState *ir, int start, int end)
+{
+  if (tcc_ir_opt_pass_disabled("ra:ret_share_exit"))
+    return 1;
+  for (int p = start; p < end; p++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[p];
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      int t = (int)tcc_ir_op_dest_imm(ir, q);
+      if (t < start || t > end)
+        return 0;
+      continue;
+    }
+    if (ir_op_has(q->op, IR_HZ_BRANCH | IR_HZ_NONLOCAL | IROP_A_MAY_BRANCH | IROP_A_RETURNS_TWICE))
+      return 0;
+  }
+  return 1;
 }
 
 /* Can physical register `r` be handed to `cur` even though an active interval
@@ -712,7 +1117,7 @@ static int ra_alive_reg_shareable(const RaAliveInfo *alive, SSAInterval *cur,
     if (a->r0 != r && a->r1 != r)
       continue;
     holders++;
-    if (a->precolored >= 0 || a->co_member || a->loop_phi_locked || a->reg_shared || a->addrtaken)
+    if (a->precolored >= 0 || a->caller_save || a->co_member || a->loop_phi_locked || a->reg_shared || a->addrtaken)
       return 0;
     if (a->reg_type == LS_REG_TYPE_FLOAT || a->reg_type == LS_REG_TYPE_DOUBLE)
       return 0;
@@ -783,6 +1188,15 @@ static void ra_spill_pool_assign(RaSpillPool *p, SSAInterval *iv, int size, int 
     off = *spill_loc;
   }
   iv->stack_location = off;
+  /* Grown on demand rather than sized by the interval count: most intervals
+   * get a register.  Expiry only moves entries from active to free, so the
+   * sum of the two never passes the number of assignments. */
+  if (p->active_count + p->free_count >= p->cap)
+  {
+    p->cap = p->cap ? 2 * p->cap : 16;
+    p->free_slots = tcc_realloc(p->free_slots, sizeof(RaFreeSpillSlot) * p->cap);
+    p->active = tcc_realloc(p->active, sizeof(RaActiveSpill) * p->cap);
+  }
   p->active[p->active_count].iv = iv;
   p->active[p->active_count++].size = size;
   if (iv->end < p->active_min_end)
@@ -803,6 +1217,26 @@ static int ra_pressure_ev_cmp(const void *a, const void *b)
     return x->pos < y->pos ? -1 : 1;
   return y->delta - x->delta; /* starts before ends at one position: the upper bound */
 }
+/* ra:evict_pair: a 64-bit value in a register pair may be the victim a single
+ * INT interval evicts -- both registers come free, cur takes the low one.  A
+ * cold pair held across a whole function (the template-replay timestamp read
+ * once before and once after its loop) otherwise kept two callee-saved
+ * registers while the loop's hot values spilled. */
+static int ra_pair_victim_ok(const SSAInterval *a, const SSAInterval *cur, const RegAllocTarget *target)
+{
+  if (a->reg_type != LS_REG_TYPE_LLONG || a->r0 < 0 || a->r1 < 0 || a->stack_location != 0 ||
+      a->alive_shared || a->reg_shared)
+    return 0;
+  if (cur->crosses_call) {
+    /* cur takes the low register: it must survive cur's calls */
+    for (int ci = 0; ci < target->int_class.num_callee_saved; ci++)
+      if (target->int_class.callee_saved[ci] == a->r0)
+        return 1;
+    return 0;
+  }
+  return 1;
+}
+
 void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                            const RegAllocTarget *target, int spill_base,
                            uint64_t *out_dirty_int, uint64_t *out_dirty_fp,
@@ -810,7 +1244,10 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
 {
   if (count <= 0) return;
 
-  qsort(intervals, count, sizeof(SSAInterval), sort_by_start);
+  if (ra_trace_on())
+    RA_DBG("SSA ra_linear_scan: decision trace for %s (%d intervals)", ra_trace_func(), count);
+
+  tcc_qsort(intervals, count, sizeof(SSAInterval), sort_by_start);
 
   /* Accurate-liveness register sharing; ra_alive_worth_building did the
    * gating, and a failed build leaves `valid` clear.
@@ -823,14 +1260,21 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
   int share_ok = (alive && alive->valid);
   int alive_shared_used = 0;
   int reg_shared_used = 0;
-  const int evict_density = tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("ra:evict_density");
-  const int low_saved_pref = tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("ra:low_saved_pref");
+  const int evict_density = TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:evict_density");
+  const int evict_swap = TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:evict_swap");
+  /* ra:caller_save: call-crossing values in free caller-saved registers,
+   * saved around the calls they cross (see the eligibility in ra_build_intervals). */
+  const int caller_save_on = TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:caller_save");
+  const int evict_pair = TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:evict_pair");
+  const int low_saved_pref = TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:low_saved_pref");
 
-  /* Build vreg -> interval lookup for phi hint resolution */
-  int hint_tbl_size = (max_vreg_pos > 0) ? 4 * max_vreg_pos : 1;
+  /* Build vreg -> interval lookup for phi hint resolution (dense layout,
+   * see RaVregIdx: every interval's vreg is below these counts). */
+  RaVregIdx hx;
+  ra_vidx_init(&hx, ir->next_local_variable, ir->next_temporary_variable, ir->next_parameter);
+  int hint_tbl_size = hx.size;
   SSAInterval **vreg_to_iv = tcc_mallocz(sizeof(SSAInterval *) * hint_tbl_size);
-  #define HINT_IDX(vr) \
-    ((TCCIR_DECODE_VREG_TYPE(vr) * max_vreg_pos) + TCCIR_DECODE_VREG_POSITION(vr))
+  #define HINT_IDX(vr) ra_vidx(&hx, (vr))
   for (int i = 0; i < count; i++) {
     int idx = HINT_IDX(intervals[i].vreg);
     if (idx >= 0 && idx < hint_tbl_size)
@@ -907,7 +1351,12 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
    * set is for register-resident intervals; addrtaken intervals always spill
    * and were previously dropped on the floor.  We track them so their stack
    * slots can be returned to a free list once the interval ends. */
-  SSAInterval **active_addrtaken = tcc_malloc(sizeof(SSAInterval *) * count);
+  int n_mem = 0;
+  for (int i = 0; i < count; i++)
+    n_mem += intervals[i].addrtaken || intervals[i].is_volatile;
+  /* Only memory-forced intervals enter it (and free_slots_4 below): size both
+   * by their number, not by every interval. */
+  SSAInterval **active_addrtaken = tcc_malloc(sizeof(SSAInterval *) * (n_mem > 0 ? n_mem : 1));
   int active_addrtaken_count = 0;
   uint32_t active_addrtaken_min_end = UINT32_MAX;
 
@@ -915,7 +1364,7 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
    * by later addrtaken intervals.  Only 4-byte slots are tracked here; other
    * sizes fall through to fresh allocation, matching the legacy behavior of
    * always assigning `spill_loc -= 4` regardless of value width. */
-  int *free_slots_4 = tcc_malloc(sizeof(int) * count);
+  int *free_slots_4 = tcc_malloc(sizeof(int) * (n_mem > 0 ? n_mem : 1));
   int free_slots_4_count = 0;
 
   /* When more call-crossing INT values are live at once than there are free
@@ -930,7 +1379,7 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
    * on zig.c -Os: narrow_uses <= 1 -11.5 KB, == 0 -1.4, <= 2 -4.6; density
    * gates (as the non-crossing preference uses) all lost. */
   int hi_callee_pref = 0;
-  if (tcc_state->optimize >= 1 && !tcc_ir_opt_pass_disabled("ra:hi_callee_pref")) {
+  if (TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ra:hi_callee_pref")) {
     int low_cs = __builtin_popcountll(int_free & 0xf0ull);
     int nev = 0;
     RaPressureEv *ev = tcc_malloc(sizeof(RaPressureEv) * 2 * (count > 0 ? count : 1));
@@ -944,7 +1393,7 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
       ev[nev].pos = iv->start, ev[nev].delta = w, nev++;
       ev[nev].pos = iv->end + 1, ev[nev].delta = -w, nev++;
     }
-    qsort(ev, nev, sizeof(RaPressureEv), ra_pressure_ev_cmp);
+    tcc_qsort(ev, nev, sizeof(RaPressureEv), ra_pressure_ev_cmp);
     int live = 0, peak = 0;
     for (int k = 0; k < nev; k++) {
       live += ev[k].delta;
@@ -957,8 +1406,6 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
 
   int spill_loc = spill_base;
   RaSpillPool spool = {0};
-  spool.free_slots = tcc_malloc(sizeof(RaFreeSpillSlot) * count);
-  spool.active = tcc_malloc(sizeof(RaActiveSpill) * count);
   spool.active_min_end = UINT32_MAX;
   spool.no_reuse = ra_no_spill_reuse() || tcc_ir_calls_returns_twice(ir);
 
@@ -1160,7 +1607,7 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
         } else if ((int)cur->end < ir->next_instruction_index) {
           IRQuadCompact *eq = &ir->compact_instructions[cur->end];
           if (eq->op == TCCIR_OP_RETURNVALUE &&
-              irop_get_vreg(tcc_ir_op_get_src1(ir, eq)) == cur->vreg)
+              tcc_ir_op_src1_vreg(ir, eq) == cur->vreg)
             wants_return_pair = 1; /* outgoing: this pair is what we return */
         }
       }
@@ -1203,19 +1650,19 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
        * only when this instruction is its last use (end == cur->start), and
        * only on the terms the pair boundary reuse below sets for donors. */
       if (r0 < 0 && cur->reg_type == LS_REG_TYPE_LLONG && !cur->co_member &&
-          tcc_state->optimize >= 1 && max_vreg_pos > 0 &&
+          TCC_OPT(tcc_state, optimize) >= 1 && max_vreg_pos > 0 &&
           (int)cur->start < ir->next_instruction_index) {
         IRQuadCompact *dq = &ir->compact_instructions[cur->start];
         SSAInterval *don[2] = {NULL, NULL};
         if (dq->op == TCCIR_OP_UMAAL) {
-          int32_t av = irop_get_vreg(tcc_ir_op_get_accum(ir, dq));
+          int32_t av = tcc_ir_op_accum_vreg(ir, dq);
           int ai = av >= 0 ? HINT_IDX(av) : -1;
           SSAInterval *p = (ai >= 0 && ai < hint_tbl_size) ? vreg_to_iv[ai] : NULL;
           if (p && p->r1 >= 0)
             don[0] = don[1] = p;
         } else if (dq->op == TCCIR_OP_ZEXT || dq->op == TCCIR_OP_PACK64) {
           for (int w = 0; w < (dq->op == TCCIR_OP_PACK64 ? 2 : 1); w++) {
-            IROperand so = w ? tcc_ir_op_get_src2(ir, dq) : tcc_ir_op_get_src1(ir, dq);
+            IROperand so = tcc_ir_op_get_src1_or_2(ir, dq, w);
             int32_t sv = (!so.is_lval && irop_has_vreg(so)) ? irop_get_vreg(so) : -1;
             int si = sv >= 0 ? HINT_IDX(sv) : -1;
             SSAInterval *p = (si >= 0 && si < hint_tbl_size) ? vreg_to_iv[si] : NULL;
@@ -1376,7 +1823,7 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
           uint16_t victim_uses = UINT16_MAX;
           for (int j = 0; j < active_count; j++) {
             SSAInterval *a = active[j];
-            if (a->precolored >= 0) continue;
+            if (a->precolored >= 0 || a->caller_save) continue;
             if (a->reg_type != LS_REG_TYPE_INT) continue;
             if (a->end <= cur->end) continue;
             if (a->r0 < 0 || a->stack_location != 0) continue;
@@ -1389,6 +1836,15 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
              * (combo_num seed 84127: the g16 loop counter lost to a 64-bit OR's
              * high half). */
             if (a->loop_phi_locked) continue;
+            /* Its register has to be ITS ALONE.  alive_share leaves a second
+             * live holder (a borrower, or the owner a borrower sits on) on a
+             * register the allocator still shows as taken by one of them, so
+             * spilling this victim does not free the register -- and putting it
+             * in int_free hands it to the pair (or, when the pair cannot be
+             * completed, to the next call-crossing value), overwriting the
+             * holder that is still living there.  Same rule as the single-INT
+             * victim scan below and the expire path. */
+            if (ra_reg_has_other_holder(active, active_count, a, a->r0)) continue;
             int is_callee = 0;
             for (int ci = 0; ci < target->int_class.num_callee_saved; ci++) {
               if (target->int_class.callee_saved[ci] == a->r0) { is_callee = 1; break; }
@@ -1531,9 +1987,11 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
 
     /* Integer: single register */
     int reg = -1;
-    RA_DBG("  alloc T%d [%u,%u] xcall=%d narrow=%u int_free=0x%llx active=%d",
+    RA_DBG("  alloc T%d [%u,%u] uses=%u xcall=%d co=%d co_to=%d lp=%d hint=%d narrow=%u int_free=0x%llx active=%d",
            TCCIR_DECODE_VREG_POSITION(cur->vreg), cur->start, cur->end,
-           cur->crosses_call, cur->narrow_uses, (unsigned long long)int_free, active_count);
+           cur->use_count, cur->crosses_call, cur->co_member, ra_coalesce_pos(cur),
+           cur->loop_phi_locked, cur->hint_vreg, cur->narrow_uses,
+           (unsigned long long)int_free, active_count);
 
     /* Phi-coalescing: try the hinted partner's register first.
      * ra_build_phi_hints set hint_vreg to a vreg this interval used to
@@ -1617,7 +2075,7 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
      * alive in R. */
     int coalesced_loop_phi = 0;
     if (reg < 0 && cur->hint_vreg >= 0 && max_vreg_pos > 0 && !cur->co_member &&
-        cur->reg_type == LS_REG_TYPE_INT && tcc_state->optimize >= 1) {
+        cur->reg_type == LS_REG_TYPE_INT && TCC_OPT(tcc_state, optimize) >= 1) {
       int hint_idx = HINT_IDX(cur->hint_vreg);
       if (hint_idx >= 0 && hint_idx < hint_tbl_size) {
         SSAInterval *partner = vreg_to_iv[hint_idx];
@@ -1711,13 +2169,14 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
            * those paths never execute cur's def, so partner's value
            * remains intact in hr along them. */
           if (reg < 0 && !alive_shared_used && cur->end > cur->start &&
-              (int)cur->end < ir->next_instruction_index) {
+              (int)cur->end < ir->next_instruction_index &&
+              ra_ret_tail_closed(ir, (int)cur->start, (int)cur->end)) {
             IRQuadCompact *eq = &ir->compact_instructions[cur->end];
             if (eq->op == TCCIR_OP_RETURNVALUE || eq->op == TCCIR_OP_RETURNVOID) {
               for (int k = 0; k < active_count; k++) {
                 SSAInterval *a = active[k];
                 if (a->r0 != hr || a->r1 >= 0 || a->stack_location != 0 ||
-                    a->reg_type != LS_REG_TYPE_INT)
+                    a->reg_type != LS_REG_TYPE_INT || a->caller_save)
                   continue;
                 int conflict = 0;
                 for (int p = (int)cur->start; p <= (int)cur->end && !conflict; p++) {
@@ -1760,11 +2219,60 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
         if (int_free & (1ull << r)) { reg = r; break; }
       }
     }
+    /* No callee-saved register left: a value whose crossed calls are cheaper
+     * to save around than its uses are to reload lives in a free caller-saved
+     * register, which the call lowering stores before and reloads after each
+     * call it crosses (the nested-call save area). */
+    int cs_take = 0;
+    if (reg < 0 && cur->crosses_call && cur->cs_ok && cur->precolored < 0 && caller_save_on &&
+        2u * (uint32_t)cur->cs_cost <= ra_spill_cost(cur)) {
+      /* ...and cheaper than the eviction the spill path would make: a cold
+       * victim's reloads can cost less than these saves. */
+      uint32_t best_victim = UINT32_MAX;
+      for (int j = 0; j < active_count; j++) {
+        SSAInterval *a = active[j];
+        if (a->precolored >= 0 || a->caller_save || a->end <= cur->end || a->loop_phi_locked)
+          continue;
+        if (a->reg_type != LS_REG_TYPE_INT && !(evict_pair && ra_pair_victim_ok(a, cur, target)))
+          continue;
+        if (ra_spill_cost(a) < best_victim)
+          best_victim = ra_spill_cost(a);
+      }
+      cs_take = (uint32_t)cur->cs_cost < best_victim;
+    }
+    if (cs_take) {
+      /* Leave caller-saved registers for the short temporaries in its range:
+       * taking the last ones moves the spills onto them.  Kernel warm launch
+       * (instructions): keep 2 -> 264.5k, 3 -> 263.9k, 4 -> 264.6k. */
+      const int cs_keep = 3;
+      int free_cs = 0;
+      static const int cs_regs[] = {0, 1, 2, 3, 12};
+      for (int oi = 0; oi < 5; oi++)
+        if (cs_regs[oi] < tcc_state->registers_for_allocator && (int_free & (1ull << cs_regs[oi])))
+          free_cs++;
+      if (free_cs - 1 < cs_keep)
+        cs_take = 0;
+    }
+    if (cs_take) {
+      static const int cs_order[] = {3, 2, 1, 12, 0};
+      for (int oi = 0; oi < 5; oi++) {
+        int r = cs_order[oi];
+        if (r < tcc_state->registers_for_allocator && (int_free & (1ull << r))) {
+          reg = r;
+          cur->caller_save = 1;
+          if (ra_trace_on())
+            RA_DBG("  caller_save T%d [%u,%u] uses=%u cs_cost=%u -> R%d (saved around its calls)",
+                   TCCIR_DECODE_VREG_POSITION(cur->vreg), cur->start, cur->end, cur->use_count,
+                   cur->cs_cost, r);
+          break;
+        }
+      }
+    }
     if (reg < 0 && !cur->crosses_call &&
         (int)cur->start < ir->next_instruction_index) {
       IRQuadCompact *dq = &ir->compact_instructions[cur->start];
       if (tcc_ir_op_is_mac(dq->op) &&
-          irop_get_vreg(tcc_ir_op_get_dest(ir, dq)) == cur->vreg) {
+          tcc_ir_op_dest_vreg(ir, dq) == cur->vreg) {
         IROperand accum = tcc_ir_op_get_accum(ir, dq);
         if (accum.is_sym) {
           static const int sym_mla_order[] = {10, 11, 8, 9};
@@ -1852,49 +2360,43 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
           continue;
         }
       }
-      /* Spill: among intervals that extend past cur, evict the one
-       * with the lowest spill cost (fewest loop-weighted uses).
-       * use_count is already weighted by loop depth (4^depth per use),
-       * so this prefers evicting intervals with few loop-hot uses.
-       *
-       * ra:evict_density weighs that cost by the range the eviction frees:
-       * cost per remaining instruction.  Without splitting a victim is gone
-       * for the rest of its range, so a long, sparsely used one frees its
-       * register for every later interval, where a short hot one frees it
-       * for a few.  zig.c -O2: -21 KB.  Refusing the eviction when cur is
-       * the colder one (spill cur instead) was measured +47 KB: the freed
-       * register is what keeps the next intervals out of memory. */
+      /* Outliving victims retain priority; see docs/bugs/ra-spill-self-despite-cheaper-short-actives.md. */
       SSAInterval *victim = NULL;
       int victim_idx = -1;
       uint16_t victim_uses = UINT16_MAX;
+      SSAInterval *swap_victim = NULL;
+      int swap_idx = -1;
+      uint32_t swap_cost = ra_spill_cost(cur);
       for (int j = 0; j < active_count; j++) {
         SSAInterval *a = active[j];
-        if (a->precolored >= 0) continue;
-        if (a->reg_type != LS_REG_TYPE_INT) continue;
-        if (a->end <= cur->end) continue;
-        /* Never evict a loop-phi-locked interval: it holds a loop-carried value
-         * (its absorbed partner's uses still read this register across the loop
-         * body) and spilling it here would not reload those uses. */
+        if (a->precolored >= 0 || a->caller_save) continue;
+        if (a->reg_type != LS_REG_TYPE_INT && !(evict_pair && ra_pair_victim_ok(a, cur, target))) continue;
+        int short_active = a->end <= cur->end;
+        if (short_active && (!evict_swap || ra_spill_cost(a) >= swap_cost)) continue;
+        if (short_active && cur->crosses_call) {
+          int callee_saved = 0;
+          for (int ci = 0; ci < target->int_class.num_callee_saved; ci++)
+            callee_saved |= target->int_class.callee_saved[ci] == a->r0;
+          if (!callee_saved) continue;
+        }
+        /* Absorbed loop-phi partners still depend on this register. */
         if (a->loop_phi_locked) continue;
-        /* Its register has to be ITS ALONE.  alive_share puts a second live
-         * holder on a register the allocator still shows as taken by the first,
-         * so spilling the one we picked does NOT free it -- the other is still
-         * living there, and handing the register to cur destroys its value.
-         * The expire path states the same invariant ("only free a register when
-         * no surviving interval still holds it"); eviction had no equivalent.
-         *
-         * Measured: alive_share lends R12 to T509 over [105,122] while T411 owns
-         * it across [102,126]; eviction then spills T411 and gives R12 to T510
-         * over [115,119], overwriting T509 between its def and its use.  fuzz
-         * longlong 197 and 1449 at -O2, combo_num 1103 at -O1. */
+        /* Evicting one co-holder does not free the register. */
         {
           int co_held = 0;
           for (int k = 0; k < active_count; k++) {
             SSAInterval *b = active[k];
             if (b != a && b != cur && b->stack_location == 0 &&
-                (b->r0 == a->r0 || b->r1 == a->r0)) { co_held = 1; break; }
+                (b->r0 == a->r0 || b->r1 == a->r0 ||
+                 (a->r1 >= 0 && (b->r0 == a->r1 || b->r1 == a->r1)))) { co_held = 1; break; }
           }
           if (co_held) continue;
+        }
+        if (short_active) {
+          swap_victim = a;
+          swap_idx = j;
+          swap_cost = ra_spill_cost(a);
+          continue;
         }
         if (evict_density) {
           if (!victim ||
@@ -1911,17 +2413,38 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
           victim_idx = j;
         }
       }
+      if (!victim && swap_victim) {
+        victim = swap_victim;
+        victim_idx = swap_idx;
+      }
       if (victim) {
+        if (ra_trace_on())
+          RA_DBG("  %s T%d evicts T%d [%u,%u] uses=%u from R%d; cur takes that R%d",
+                 victim->end <= cur->end ? "spill_swap" : "spill_evict",
+                 TCCIR_DECODE_VREG_POSITION(cur->vreg),
+                 TCCIR_DECODE_VREG_POSITION(victim->vreg), victim->start, victim->end,
+                 victim->use_count, victim->r0, victim->r0);
         /* Evict victim, give its register to cur */
         reg = victim->r0;
         victim->r0 = -1;
-        ra_spill_pool_assign(&spool, victim, 4, &spill_loc);
+        if (victim->r1 >= 0) {
+          /* a pair (ra:evict_pair): its high register is free from here on */
+          int_free |= (1ull << victim->r1);
+          victim->r1 = -1;
+          ra_spill_pool_assign(&spool, victim, 8, &spill_loc);
+        } else {
+          ra_spill_pool_assign(&spool, victim, 4, &spill_loc);
+        }
         /* Remove victim from active */
         active[victim_idx] = active[--active_count];
         cur->r0 = reg;
         active[active_count++] = cur;
       } else {
         ra_spill_pool_assign(&spool, cur, 4, &spill_loc);
+        if (ra_trace_on())
+          RA_DBG("  spill_self T%d [%u,%u] uses=%u: no eligible outliving or cheaper short active -> spill(%d)",
+                 TCCIR_DECODE_VREG_POSITION(cur->vreg), cur->start, cur->end,
+                 cur->use_count, spill_loc);
       }
     }
   }
@@ -1941,8 +2464,8 @@ void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
       int type = TCCIR_DECODE_VREG_TYPE(iv->vreg);
       int pos = TCCIR_DECODE_VREG_POSITION(iv->vreg);
       if (iv->stack_location != 0) {
-        RA_DBG("  %s%d [%u,%u] -> spill(%d)", ra_vreg_type_char(type), pos,
-               iv->start, iv->end, iv->stack_location);
+        RA_DBG("  %s%d [%u,%u] uses=%u -> spill(%d)", ra_vreg_type_char(type), pos,
+               iv->start, iv->end, iv->use_count, iv->stack_location);
       } else if (iv->r1 >= 0) {
         RA_DBG("  %s%d [%u,%u] -> R%d:R%d", ra_vreg_type_char(type), pos,
                iv->start, iv->end, iv->r0, iv->r1);
@@ -1966,6 +2489,7 @@ void ra_write_results(TCCIRState *ir, SSAInterval *intervals, int count)
 {
   /* Clear LS intervals and repopulate from SSA results */
   tcc_ls_clear_live_intervals(&ir->ls);
+  tcc_ls_reserve(&ir->ls, count);
 
   for (int i = 0; i < count; i++) {
     SSAInterval *iv = &intervals[i];
@@ -1973,6 +2497,8 @@ void ra_write_results(TCCIRState *ir, SSAInterval *intervals, int count)
                              iv->crosses_call, iv->addrtaken, iv->reg_type,
                              0, iv->precolored);
     LSLiveInterval *lsi = &ir->ls.intervals[ir->ls.next_interval_index - 1];
+    lsi->caller_save = iv->caller_save && iv->stack_location == 0;
+    ir->ls.caller_save_count += lsi->caller_save;
     lsi->r0 = iv->r0;
     lsi->r1 = iv->r1;
     lsi->stack_location = iv->stack_location;

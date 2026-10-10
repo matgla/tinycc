@@ -255,6 +255,9 @@ typedef enum TccIrOp
    * the allocator, the post-RA passes and codegen see it; everything that
    * reads MLA's fourth operand reads this one via tcc_ir_op_is_mac(). */
   TCCIR_OP_UMAAL,
+  /* Number of opcodes -- not an op.  Sizes ir_op_props[] (op_props.h), whose
+   * selftest fails for any op below it that the table does not classify. */
+  TCCIR_OP_COUNT
 } TccIrOp;
 
 /* Ops with a fourth (accumulator) operand at pool[operand_base+3] that is a
@@ -355,14 +358,21 @@ typedef struct IRLiveInterval
   uint8_t incoming_stack : 1; // param the ABI placed wholly on the caller's stack (incoming_reg0 < 0 is also "unset")
   uint8_t is_struct : 1;      // param of struct type: its vreg names memory, never a value
   uint8_t nested_home : 1;    // param captured by a nested function: it keeps a parent-frame home
+  uint8_t no_remat : 1;       // reload when spilled, never rematerialise (-Os shared constant)
+  /* remat_kind and the two incoming regs share the flags' word: as separate
+   * bytes behind the 32-bit fields they padded the struct to 40 bytes; packed
+   * here it is 32, and the per-function interval arrays (one entry per
+   * temp/var/param, alive through register allocation) shrink by a fifth.
+   * Sixteen flag bits fill those two bytes: remat_kind has one kind. */
+  uint8_t remat_kind : 1;  // 0=none, 1=imm32: recompute value instead of reloading when spilled
+  uint8_t loop_split : 1;  // ra:loop_split entry-copy temp: the split is the point, never coalesce it back with its source
+  int8_t incoming_reg0;    // for params: which register arg arrives in (-1 if stack)
+  int8_t incoming_reg1;    // for doubles: second register (-1 if not double or stack)
   uint32_t start;           // start instruction index
   uint32_t end;             // end instruction index
   IRVregReplacement allocation;
-  int8_t incoming_reg0;    // for params: which register arg arrives in (-1 if stack)
-  int8_t incoming_reg1;    // for doubles: second register (-1 if not double or stack)
   int32_t original_offset; // for params: original offset from function entry point
   int stack_slot_index;    // index into stack layout (-1 if not stack-backed)
-  uint8_t remat_kind;      // 0=none, 1=imm32: recompute value instead of reloading when spilled
   int32_t remat_imm;       // the constant when remat_kind==1
 } IRLiveInterval;
 
@@ -530,6 +540,11 @@ typedef struct IRParamForm
 #define IR_PF_MEM 2  /* memory at a parameter offset (stack scalar, in-place struct) */
 #define IR_PF_HOME 3 /* a register-passed struct the prologue stores into a home slot */
 
+/* Words per ir->frame_objs record: [0] frame offset, [1] size incl. padding,
+ * [2] size, [3] FRAME_OBJ_* flags | (scope end + 1) << 4, [4] scope start + 1
+ * (0 = none; tcc_ir_frame_scope_block). */
+#define FRAME_OBJ_WORDS 5
+
 typedef struct TCCIRState
 {
   // number of function parameters
@@ -566,16 +581,27 @@ typedef struct TCCIRState
                                         nested function; R10 is callee-saved, so it must be in
                                         the prologue save mask and excluded from reassignment */
   int32_t static_chain_vreg;         /* vreg holding static chain pointer (parent FP) */
+  /* Hard-float, a result returned in s0..s(vfp_ret_words-1)
+   * (gfunc_sret_vfp_words): the frame buffer the body's returns write and the
+   * exit loads the registers from.  func_vc's slot holds its address, not a
+   * hidden parameter. */
+  int32_t vfp_ret_buf;
+  uint8_t vfp_ret_words;
   int32_t captured_offsets_list[32]; /* offsets of captured vars (for chain-relative access) */
   int32_t captured_chain_depths[32]; /* 1 = direct R10, 2+ = multi-hop */
   int32_t captured_count;            /* number of captured variables */
   int32_t loc;
   int32_t parent_loc; /* parent's loc value (for nested function offset validation) */
-  /* Frontend stack objects as (frame offset, size incl. alignment padding,
-   * FRAME_OBJ_* flags) triples, for frame relayout (frame.c).  Filled while
-   * the body is parsed. */
+  /* Frontend stack objects as FRAME_OBJ_WORDS-word records (frame offset,
+   * size incl. alignment padding, size, FRAME_OBJ_* flags | scope end, scope
+   * start), for frame relayout (frame.c).  Filled while the body is parsed. */
   int32_t *frame_objs;
   int frame_obj_count, frame_obj_cap;
+  /* Labels as (Sym::jind, current instruction index) pairs.  The index moves
+   * with every renumbering like a frame scope end (frame.c), so `&&label` still
+   * finds its place once the labelled instruction itself is gone. */
+  int32_t *label_pos;
+  int label_count, label_cap;
   /* Padding of the frame objects whose type the frontend knew, as (start,
    * low word, high word) triples of a byte mask: bit b = byte b of the object
    * is no member's (tcc_ir_frame_note_type). */
@@ -584,6 +610,8 @@ typedef struct TCCIRState
   /* By call id: the size of the struct written through parameter 0, the
    * struct-return buffer, or 0 (frame.c). */
   int32_t *sret_calls;
+  /* By call id: the struct returned is empty (sret_calls says 1 for it). */
+  uint8_t *sret_calls_empty;
   int sret_calls_size;
   /* Sorted, merged [start, end) extents of frame_objs for lookups, built for
    * frame_obj_count objects; frame_relaid once relayout moved them. */
@@ -593,11 +621,6 @@ typedef struct TCCIRState
   /* ssa:loop_unroll copied loads from a const table with the IV as index:
    * the constant-index loads it left fold (ssa:unroll_cascade). */
   uint8_t unrolled_table_loads;
-
-  /* Nested function tracking (for parent functions that contain nested functions) */
-  NestedFunc **nested_funcs;     /* array of pointers to nested function descriptors */
-  int32_t nb_nested_funcs;       /* count of nested functions */
-  int32_t nested_funcs_capacity; /* allocated capacity of nested_funcs array */
 
   /* Optimization module data - opaque pointer to keep IR arch-independent */
   TCCFPMatCache *opt_fp_mat_cache;
@@ -717,6 +740,13 @@ typedef struct TCCIRState
    * state so the IR layer (regalloc) can consult it without referencing a tccgen
    * global (which the standalone unit-test link does not provide). */
   int func_has_label_addr;
+  /* The body has an `asm goto`: control can leave an INLINE_ASM for a label the
+   * IR records no edge to, so a block entered only through such a label looks
+   * unreachable.  Reachability sweeps (dce, SSA) skip the function, as for IJUMP. */
+  int func_has_asm_goto;
+  /* The return class ra:known_ext proved for this body (FuncAttr.func_ret_zext),
+   * published by gen_function once the body is final. */
+  int ret_zext_class;
 
   /* Set the first time IR generation builds a VOLATILE lvalue operand for this
    * function.  Clear means the body performs no volatile access at all, which
@@ -738,6 +768,12 @@ typedef struct TCCIRState
   TCCIRSwitchTable *switch_tables;
   int num_switch_tables;
   int switch_tables_capacity;
+
+  /* The switches the frontend laid out as `JMP dispatch; bodies; dispatch`,
+   * as (jump, dispatch, end) index triples in the order they closed
+   * (opt/flat/cfg/switch_head.c). */
+  int *switch_heads;
+  int switch_heads_n, switch_heads_cap;
 
   /* Switch value tables for SWITCH_LOAD (constant-table dispatch). */
   TCCIRSwitchValueTable *switch_value_tables;
@@ -792,6 +828,12 @@ typedef struct TCCIRState
    * can_narrow_forward_branch can prove no flush lands inside it. */
   uint16_t *codegen_dry_pool_entries;
   uint8_t *codegen_branch_target_reset;
+
+  /* Per-vreg def and use counts, open only while a pass that queries them per
+   * candidate runs (tcc_ir_vreg_index_open, opt/util/vreg_def_use.c); NULL
+   * otherwise.  Answers tcc_ir_vreg_has_single_use/_single_def/_multi_def and
+   * tcc_ir_find_defining_instruction without a whole-function scan. */
+  struct IRVregIndex *vreg_index;
 } TCCIRState;
 
 /* Volatility queries for the optimizer, in the two shapes memory ops come in:
@@ -865,6 +907,15 @@ void tcc_ir_set_original_offset(TCCIRState *ir, int vreg, int offset);
  * for tcc_ir_frame_relayout. */
 int tcc_ir_frame_alloc(int loc, int size, int mask);
 void tcc_ir_frame_scope_end(struct TCCIRState *ir, int first_obj, int insn, int keep);
+void tcc_ir_frame_scope_block(struct TCCIRState *ir, int first_obj, int start, int end);
+/* Keep those scope ends (instruction indices) in step with passes that move
+ * instructions: an insert before `before_idx`, a renumbering (map[old] = new
+ * or -1), or code duplicated/reordered within lo..hi. */
+void tcc_ir_frame_scope_insert(struct TCCIRState *ir, int before_idx);
+void tcc_ir_frame_scope_remap(struct TCCIRState *ir, const int *map, int old_n, int new_n);
+void tcc_ir_frame_scope_widen(struct TCCIRState *ir, int lo, int hi);
+void tcc_ir_label_note(struct TCCIRState *ir, int jind);
+int tcc_ir_label_insn(struct TCCIRState *ir, int jind);
 /* The same for the temporaries that carry a struct into or out of a call: its
  * address reaching the call does not let the callee keep it.  An argument's
  * copy is never visible to the program; a call's struct result is, through
@@ -887,14 +938,28 @@ void tcc_ir_frame_note_type(int off, CType *type);
  * elsewhere (before frame relayout only). */
 uint64_t tcc_ir_frame_padding(TCCIRState *ir, int lo, int hi);
 int tcc_ir_frame_relayout(TCCIRState *ir, int *ploc);
+/* The k-th concrete frame offset an inline asm operand names outside the IR
+ * (the SValues the front end saved with the statement): 1 and *off, or 0 when
+ * there are no more. */
+int tcc_ir_asm_frame_ref(TCCIRState *ir, int k, int *off);
 /* The function calls setjmp, vfork or another function that returns twice, so
  * a frame slot live only on one return may still be read on the other. */
 int tcc_ir_calls_returns_twice(TCCIRState *ir);
 int tcc_ir_cross_jump(TCCIRState *ir);
 int tcc_ir_cross_jump_alloc(TCCIRState *ir);
 int tcc_ir_region_merge(TCCIRState *ir);
+int tcc_ir_branch_tidy(TCCIRState *ir);
+int tcc_ir_drop_jumpif_to_next(TCCIRState *ir);
+int tcc_ir_setif_test_chain_fold(TCCIRState *ir);
 int tcc_ir_self_store(TCCIRState *ir);
 int tcc_ir_dead_def(TCCIRState *ir);
+struct IRSSAState;
+int tcc_ir_known_ext(TCCIRState *ir, struct IRSSAState *ssa);
+uint32_t tcc_ir_ret_zext_mask(int ret_class);
+/* Writes into frame bytes nothing reads go, frame objects split into the
+ * pieces still referenced (frame_dfe.c).  *inserted: instructions it added
+ * (the CFG must be rebuilt). */
+int tcc_ir_frame_dead_bytes(TCCIRState *ir, int *inserted);
 int tcc_ir_get_reg_type(TCCIRState *ir, int vreg);
 
 void tcc_ir_register_allocation_params(TCCIRState *ir);
@@ -906,6 +971,8 @@ void tcc_ir_avoid_spilling_stack_passed_params(TCCIRState *ir);
 int tcc_ir_param_is_captured_by_nested(int vreg);
 void tcc_ir_mark_nested_captured_params(TCCIRState *ir);
 void tcc_ir_build_stack_layout(TCCIRState *ir);
+/* Caller-saved registers to save around the call at call_idx (ra:caller_save) */
+uint32_t tcc_ir_caller_save_mask_at(TCCIRState *ir, int call_idx);
 const TCCStackSlot *tcc_ir_stack_slot_by_vreg(const TCCIRState *ir, int vreg);
 const TCCStackSlot *tcc_ir_stack_slot_by_offset(const TCCIRState *ir, int frame_offset);
 void tcc_ir_assign_physical_register(TCCIRState *ir, int vreg, int offset, int r0, int r1);
@@ -1031,6 +1098,196 @@ IROperand tcc_ir_op_get_src2(const TCCIRState *ir, const IRQuadCompact *q);
 
 IROperand tcc_ir_get_src2(const TCCIRState *ir, int index);
 
+/* irop_get_vreg of an operand slot, without the by-value IROperand round trip at the call site. */
+#ifdef TCC_IROP_INLINE_ACCESSORS
+static inline int32_t tcc_ir_op_dest_vreg(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+}
+
+static inline int32_t tcc_ir_op_src1_vreg(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+}
+
+static inline int32_t tcc_ir_op_src2_vreg(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+}
+
+/* `pick_src2 ? src2 : src1` and `pick_src1 ? src1 : dest` of an instruction: one call
+ * that returns the chosen operand instead of a ternary over two by-value calls (which
+ * costs both calls plus a 9-byte copy at every site). */
+static inline IROperand tcc_ir_op_get_src1_or_2(const TCCIRState *ir, const IRQuadCompact *q, int pick_src2)
+{
+  return pick_src2 ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
+}
+
+static inline IROperand tcc_ir_op_get_dest_or_src1(const TCCIRState *ir, const IRQuadCompact *q, int pick_src1)
+{
+  return pick_src1 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
+}
+
+/* Operand slot by number: 0 dest, 1 src1, anything else src2. */
+static inline IROperand tcc_ir_op_get_slot(const TCCIRState *ir, const IRQuadCompact *q, int slot)
+{
+  return slot == 0 ? tcc_ir_op_get_dest(ir, q) : slot == 1 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+}
+
+/* irop_has_vreg / irop_get_btype / irop_is_immediate of an operand slot, for the
+ * same reason: a temporary that only feeds these never has to exist. */
+static inline int tcc_ir_op_dest_has_vreg(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_has_vreg(tcc_ir_op_get_dest(ir, q));
+}
+
+static inline int tcc_ir_op_src1_has_vreg(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_has_vreg(tcc_ir_op_get_src1(ir, q));
+}
+
+static inline int tcc_ir_op_src2_has_vreg(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_has_vreg(tcc_ir_op_get_src2(ir, q));
+}
+
+static inline int tcc_ir_op_dest_btype(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_get_btype(tcc_ir_op_get_dest(ir, q));
+}
+
+static inline int tcc_ir_op_src1_btype(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_get_btype(tcc_ir_op_get_src1(ir, q));
+}
+
+static inline int tcc_ir_op_src2_btype(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_get_btype(tcc_ir_op_get_src2(ir, q));
+}
+
+static inline int32_t tcc_ir_op_dest_imm32(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_get_imm32(tcc_ir_op_get_dest(ir, q));
+}
+
+static inline int32_t tcc_ir_op_src2_imm32(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_get_imm32(tcc_ir_op_get_src2(ir, q));
+}
+
+static inline int tcc_ir_op_src2_is_none(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_is_none(tcc_ir_op_get_src2(ir, q));
+}
+
+static inline int tcc_ir_op_dest_needs_pair(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_needs_pair(tcc_ir_op_get_dest(ir, q));
+}
+
+static inline int tcc_ir_op_src2_tag(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_get_tag(tcc_ir_op_get_src2(ir, q));
+}
+
+static inline int tcc_ir_op_dest_is_lval(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return tcc_ir_op_get_dest(ir, q).is_lval;
+}
+
+static inline int tcc_ir_op_src1_is_lval(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return tcc_ir_op_get_src1(ir, q).is_lval;
+}
+
+static inline int tcc_ir_op_src2_is_lval(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return tcc_ir_op_get_src2(ir, q).is_lval;
+}
+
+static inline int tcc_ir_op_src1_is_sym(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return tcc_ir_op_get_src1(ir, q).is_sym;
+}
+
+static inline int tcc_ir_op_src2_is_sym(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return tcc_ir_op_get_src2(ir, q).is_sym;
+}
+
+static inline int tcc_ir_op_dest_is_local(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return tcc_ir_op_get_dest(ir, q).is_local;
+}
+
+static inline int tcc_ir_op_src1_is_local(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return tcc_ir_op_get_src1(ir, q).is_local;
+}
+
+/* The raw u.imm32 word of the dest slot (a jump target index). */
+static inline int32_t tcc_ir_op_dest_u_imm32(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return tcc_ir_op_get_dest(ir, q).u.imm32;
+}
+
+static inline int tcc_ir_op_src1_is_imm(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_is_immediate(tcc_ir_op_get_src1(ir, q));
+}
+
+static inline int tcc_ir_op_src2_is_imm(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  return irop_is_immediate(tcc_ir_op_get_src2(ir, q));
+}
+#else
+int32_t tcc_ir_op_dest_vreg(const TCCIRState *ir, const IRQuadCompact *q);
+int32_t tcc_ir_op_src1_vreg(const TCCIRState *ir, const IRQuadCompact *q);
+int32_t tcc_ir_op_src2_vreg(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_dest_has_vreg(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src1_has_vreg(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src2_has_vreg(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_dest_btype(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src1_btype(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src2_btype(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src1_is_imm(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src2_is_imm(const TCCIRState *ir, const IRQuadCompact *q);
+int32_t tcc_ir_op_dest_u_imm32(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_dest_is_lval(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src1_is_lval(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src2_is_lval(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src1_is_sym(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src2_is_sym(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_dest_is_local(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src1_is_local(const TCCIRState *ir, const IRQuadCompact *q);
+int32_t tcc_ir_op_dest_imm32(const TCCIRState *ir, const IRQuadCompact *q);
+int32_t tcc_ir_op_src2_imm32(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src2_is_none(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_dest_needs_pair(const TCCIRState *ir, const IRQuadCompact *q);
+int tcc_ir_op_src2_tag(const TCCIRState *ir, const IRQuadCompact *q);
+IROperand tcc_ir_op_get_src1_or_2(const TCCIRState *ir, const IRQuadCompact *q, int pick_src2);
+IROperand tcc_ir_op_get_dest_or_src1(const TCCIRState *ir, const IRQuadCompact *q, int pick_src1);
+IROperand tcc_ir_op_get_slot(const TCCIRState *ir, const IRQuadCompact *q, int slot);
+#endif
+
+/* irop_get_imm64_ex of an operand slot (jump targets, condition tokens). */
+int64_t tcc_ir_op_dest_imm(const TCCIRState *ir, const IRQuadCompact *q);
+int64_t tcc_ir_op_src1_imm(const TCCIRState *ir, const IRQuadCompact *q);
+int64_t tcc_ir_op_src2_imm(const TCCIRState *ir, const IRQuadCompact *q);
+
+/* irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q)): a call's callee symbol. */
+struct Sym *tcc_ir_op_src1_sym(const TCCIRState *ir, const IRQuadCompact *q);
+
+/* A call the backend emits as instructions that write no register but its
+ * result: the DMB of an atomic (__tcc_dmb), an inline read-modify-write
+ * (__tcc_ax_*, its loop on scratch registers) and the system instructions of
+ * an asm statement (__tcc_mc_*, an mrs into the result's register, an msr from
+ * the operand's).  Every pass still treats it as a call that reads and writes
+ * memory; the register allocator and the frame do not treat it as one: no
+ * value has to leave R0-R3 for it, and it makes no function a non-leaf. */
+int tcc_ir_call_clobbers_nothing(const TCCIRState *ir, const IRQuadCompact *q);
+
 /* Get the 4th operand (scale) for indexed memory operations.
  * This is stored at operand_base + 3 for LOAD_INDEXED/STORE_INDEXED.
  */
@@ -1042,6 +1299,9 @@ IROperand tcc_ir_op_get_scale(const TCCIRState *ir, const IRQuadCompact *q);
  */
 IROperand tcc_ir_op_get_accum(const TCCIRState *ir, const IRQuadCompact *q);
 
+/* irop_get_vreg(tcc_ir_op_get_accum(ir, q)) */
+int32_t tcc_ir_op_accum_vreg(const TCCIRState *ir, const IRQuadCompact *q);
+
 void tcc_ir_op_set_accum(TCCIRState *ir, IRQuadCompact *q, IROperand op);
 
 /* Get the 4th operand (condition code) for SELECT operations.
@@ -1049,6 +1309,9 @@ void tcc_ir_op_set_accum(TCCIRState *ir, IRQuadCompact *q, IROperand op);
  * Condition is stored at operand_base + 3 as IMM32 (ARM cond nibble).
  */
 IROperand tcc_ir_op_get_cond(const TCCIRState *ir, const IRQuadCompact *q);
+
+/* irop_get_imm64_ex(ir, tcc_ir_op_get_cond(ir, q)) */
+int64_t tcc_ir_op_cond_imm(const TCCIRState *ir, const IRQuadCompact *q);
 
 /* ============================================================================
  * IROperand pool setter functions
@@ -1067,6 +1330,20 @@ void tcc_ir_set_src1(TCCIRState *ir, int index, IROperand irop);
 void tcc_ir_op_set_src2(TCCIRState *ir, const IRQuadCompact *q, IROperand irop);
 
 void tcc_ir_set_src2(TCCIRState *ir, int index, IROperand irop);
+
+/* tcc_ir_set_X(ir, index, IROP_NONE) / tcc_ir_op_set_X(ir, q, IROP_NONE): an
+ * operand slot cleared without building IROP_NONE at the call site. */
+void tcc_ir_set_dest_none(TCCIRState *ir, int index);
+void tcc_ir_set_src1_none(TCCIRState *ir, int index);
+void tcc_ir_set_src2_none(TCCIRState *ir, int index);
+void tcc_ir_op_set_src1_none(TCCIRState *ir, const IRQuadCompact *q);
+void tcc_ir_op_set_src2_none(TCCIRState *ir, const IRQuadCompact *q);
+
+/* tcc_ir_[op_]set_X(..., irop_make_imm32(-1, val, btype)). */
+void tcc_ir_set_dest_imm32(TCCIRState *ir, int index, int32_t val, int btype);
+void tcc_ir_set_src1_imm32(TCCIRState *ir, int index, int32_t val, int btype);
+void tcc_ir_set_src2_imm32(TCCIRState *ir, int index, int32_t val, int btype);
+void tcc_ir_op_set_dest_imm32(TCCIRState *ir, const IRQuadCompact *q, int32_t val, int btype);
 
 /* Pool management functions */
 int tcc_ir_iroperand_pool_add(TCCIRState *ir, IROperand irop);

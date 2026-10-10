@@ -26,6 +26,60 @@
    Addr[StackLoc] use outside memset PARAM0 (offset liveness needs object
    boundaries the IR pipeline lacks). */
 
+/* A mem* call has no lvalue operand, so its volatility rides on the address
+ * PARAMs (vstore leaves them unmarked NONVOLATILE when either side of the copy
+ * is volatile).  Such a call writes (or reads) volatile memory: never delete it. */
+static int dls_writecall_is_volatile(TCCIRState *ir, int call_idx, IROperand p0)
+{
+  IROperand p1;
+  Sym *callee;
+
+  if (tcc_ir_access_is_volatile(ir, p0))
+    return 1;
+  /* PARAM1 is an address only for memcpy/memmove (memset's is the fill value). */
+  callee = tcc_ir_op_src1_sym(ir, &ir->compact_instructions[call_idx]);
+  return callee && ir_opt_is_memcpy_or_memmove_name(get_tok_str(callee->v, NULL)) &&
+         ir_opt_get_call_param_operand(ir, call_idx, 1, &p1) && tcc_ir_access_is_volatile(ir, p1);
+}
+
+/* memset/memcpy/memmove return their destination: a FUNCCALLVAL whose result
+ * is read anywhere hands out PARAM0's address where no PARAM shows it, so the
+ * call is no plain write (its PARAMs then count as escapes). */
+static int dls_call_result_used(TCCIRState *ir, int n, int ci)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[ci];
+  if (cq->op != TCCIR_OP_FUNCCALLVAL)
+    return 0;
+  IROperand r = tcc_ir_op_get_dest(ir, cq);
+  if (irop_is_none(r))
+    return 0;
+  if (!irop_has_vreg(r) || r.is_lval || irop_get_vreg(r) < 0)
+    return 1;
+  const int32_t vr = irop_get_vreg(r);
+  for (int j = 0; j < n; j++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    const IRRegistersConfig *cfg = &irop_config[q->op];
+    IROperand ops[4];
+    int np = 0;
+    if (cfg->has_dest && j != ci)
+      ops[np++] = tcc_ir_op_get_dest(ir, q); /* a deref through it, or a redefinition: either way */
+    if (cfg->has_src1)
+      ops[np++] = tcc_ir_op_get_src1(ir, q);
+    if (cfg->has_src2)
+      ops[np++] = tcc_ir_op_get_src2(ir, q);
+    if (tcc_ir_op_is_mac(q->op) || q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_STORE_INDEXED ||
+        q->op == TCCIR_OP_SELECT)
+      ops[np++] = ir->iroperand_pool[q->operand_base + 3];
+    for (int k = 0; k < np; k++)
+      if (irop_has_vreg(ops[k]) && irop_get_vreg(ops[k]) == vr)
+        return 1;
+  }
+  return 0;
+}
+
 /* Resolve a TEMP vreg to its exact frame offset via Addr[StackLoc](+/-#const)*(ASSIGN/LEA)* chains; returns 1 iff every def-chain step is constant. */
 static int dls_vreg_frame_off(TCCIRState *ir, int32_t vr, int before_idx, int *out_off)
 {
@@ -44,10 +98,9 @@ static int dls_vreg_frame_off(TCCIRState *ir, int32_t vr, int before_idx, int *o
     IROperand s1 = tcc_ir_op_get_src1(ir, dq);
     if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB)
     {
-      IROperand s2 = tcc_ir_op_get_src2(ir, dq);
-      if (!irop_is_immediate(s2) || s2.is_sym)
+      if (!tcc_ir_op_src2_is_imm(ir, dq) || tcc_ir_op_src2_is_sym(ir, dq))
         return 0;
-      long c = (long)irop_get_imm64_ex(ir, s2);
+      long c = (long)tcc_ir_op_src2_imm(ir, dq);
       acc += (dq->op == TCCIR_OP_SUB) ? -c : c;
     }
     /* s1 is the base: a direct Addr[StackLoc] terminates the walk, else recurse. */
@@ -68,6 +121,106 @@ static int dls_vreg_frame_off(TCCIRState *ir, int32_t vr, int before_idx, int *o
   return 0;
 }
 
+/* Parallel per-slot tame state; end[] bounds a slot's extent so a non-tame
+ * deref through one slot can't poison eliminations on non-overlapping slots. */
+typedef struct DlsTameSlots
+{
+  int *off;
+  uint8_t *ok;
+  int *end;
+  int n, cap;
+} DlsTameSlots;
+
+/* Index of the tame slot at offset `off`, or -1. */
+static int dls_tame_find(const DlsTameSlots *ts, int off)
+{
+  for (int i = 0; i < ts->n; i++)
+    if (ts->off[i] == off)
+      return i;
+  return -1;
+}
+
+/* 1 iff [off, off + width) intersects any non-tame slot's bounded extent (its
+ * deref might observe the write); has_unknown_deref is a hard bail. */
+static int dls_nontame_overlaps(const DlsTameSlots *ts, int has_unknown_deref, int off, int width)
+{
+  int hit = has_unknown_deref;
+  for (int t = 0; !hit && t < ts->n; t++)
+  {
+    if (ts->ok[t])
+      continue;
+    int ns = ts->off[t];
+    int ne = ts->end[t];
+    if (off < ne && ns < off + width)
+      hit = 1;
+  }
+  return hit;
+}
+
+/* Index of the tame slot at offset `off`, adding it (tame, end 0) if new. */
+static int dls_tame_find_or_add(DlsTameSlots *ts, int off)
+{
+  int x = dls_tame_find(ts, off);
+  if (x < 0)
+  {
+    if (ts->n >= ts->cap)
+    {
+      ts->cap *= 2;
+      ts->off = tcc_realloc(ts->off, (size_t)ts->cap * sizeof(int));
+      ts->ok = tcc_realloc(ts->ok, (size_t)ts->cap * sizeof(uint8_t));
+      ts->end = tcc_realloc(ts->end, (size_t)ts->cap * sizeof(int));
+    }
+    x = ts->n++;
+    ts->off[x] = off;
+    ts->ok[x] = 1;
+    ts->end[x] = 0;
+  }
+  return x;
+}
+
+/* Flat index of vreg vr into the per-vreg tables (TEMPs, then VARs, then
+ * PARAMs), or -1 when it is none of those or out of range. */
+static int dls_vr_flat(const TCCIRState *ir, int max_vreg, int32_t vr)
+{
+  int t = TCCIR_DECODE_VREG_TYPE(vr);
+  int p = TCCIR_DECODE_VREG_POSITION(vr);
+  int b = -1;
+  if (t == TCCIR_VREG_TYPE_TEMP)
+    b = p;
+  else if (t == TCCIR_VREG_TYPE_VAR)
+    b = ir->next_temporary_variable + p;
+  else if (t == TCCIR_VREG_TYPE_PARAM)
+    b = ir->next_temporary_variable + ir->next_local_variable + p;
+  return (b >= 0 && b < max_vreg) ? b : -1;
+}
+
+/* (offset, width, position) read/escape ranges for position-aware liveness. */
+typedef struct DlsLiveRange
+{
+  int off;
+  int width;
+  int pos;
+} DlsLiveRange;
+
+typedef struct DlsLive
+{
+  DlsLiveRange *r;
+  int n, cap;
+} DlsLive;
+
+static void dls_live_add(DlsLive *l, int off, int width, int pos)
+{
+  if (l->n >= l->cap)
+  {
+    l->cap *= 2;
+    l->r = tcc_realloc(l->r, sizeof(DlsLiveRange) * l->cap);
+  }
+  l->r[l->n].off = off;
+  l->r[l->n].width = width;
+  l->r[l->n].pos = pos;
+  l->n++;
+}
+
 int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -78,7 +231,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
   if (ir->captured_count > 0 || ir->has_static_chain)
     return 0;
 
-  /* Precise vreg-deref relaxation is only sound when all slot reads are in live[]; indexed/postinc loads aren't recorded, so they disable it. */
+  /* Precise vreg-deref relaxation is only sound when all slot reads are in lv.r[]; indexed/postinc loads aren't recorded, so they disable it. */
   int dls_has_indexed = 0;
   /* Position-based liveness (read.pos > store.pos) is only sound in forward-only CFG; a back-edge makes a loop-carried store look dead, so it disables the relaxation. */
   int dls_has_backedge = 0;
@@ -93,7 +246,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       dls_has_indexed = 1;
     if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
     {
-      int tg = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      int tg = (int)tcc_ir_op_dest_u_imm32(ir, q);
       if (tg >= 0 && tg <= i)
         dls_has_backedge = 1;
     }
@@ -120,7 +273,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
       continue;
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
     const char *name = get_tok_str(callee->v, NULL);
@@ -128,16 +281,17 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       continue;
     int sz_at_2 = -1;
     int memcpy_like = 0;
-    if (strcmp(name, "__aeabi_memset") == 0 || strcmp(name, "memset") == 0)
-      sz_at_2 = 0;
+    int ms_size_idx, ms_fill_idx;
+    if (ir_opt_memset_params(name, &ms_size_idx, &ms_fill_idx))
+      sz_at_2 = ms_size_idx == 2;
     else if (ir_opt_is_memcpy_or_memmove_name(name))
     {
       sz_at_2 = 1;
       memcpy_like = 1;
     }
-    if (sz_at_2 < 0)
+    if (sz_at_2 < 0 || dls_call_result_used(ir, n, i))
       continue;
-    int cid = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+    int cid = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
     if (cid < 0 || cid >= max_call_id || !is_writecall)
       continue;
     is_writecall[cid / 8] |= (1 << (cid % 8));
@@ -157,65 +311,16 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
   /* vreg_external[V]=1: V provably came from external memory (param or ptr-arith on one), so can't alias the local frame. */
   unsigned char *vreg_external = tcc_mallocz((size_t)max_vreg);
 #define VR_SLOT_AMBIG INT_MIN
-#define VR_FLAT(_vr)                                                                                                   \
-  ({                                                                                                                   \
-    int _t = TCCIR_DECODE_VREG_TYPE(_vr);                                                                              \
-    int _p = TCCIR_DECODE_VREG_POSITION(_vr);                                                                          \
-    int _b = -1;                                                                                                       \
-    if (_t == TCCIR_VREG_TYPE_TEMP)                                                                                    \
-      _b = _p;                                                                                                         \
-    else if (_t == TCCIR_VREG_TYPE_VAR)                                                                                \
-      _b = ir->next_temporary_variable + _p;                                                                           \
-    else if (_t == TCCIR_VREG_TYPE_PARAM)                                                                              \
-      _b = ir->next_temporary_variable + ir->next_local_variable + _p;                                                 \
-    (_b >= 0 && _b < max_vreg) ? _b : -1;                                                                              \
-  })
 
-  /* Parallel per-slot tame state; tame_slot_end[] bounds a slot's extent so a non-tame deref through one slot can't poison eliminations on non-overlapping slots. */
-  int slot_cap = 32;
-  int *tame_slot_off = tcc_malloc((size_t)slot_cap * sizeof(int));
-  uint8_t *tame_slot_ok = tcc_malloc((size_t)slot_cap * sizeof(uint8_t));
-  int *tame_slot_end = tcc_malloc((size_t)slot_cap * sizeof(int));
-  int tame_slot_n = 0;
+  /* Parallel per-slot tame state; ts.end[] bounds a slot's extent so a non-tame deref through one slot can't poison eliminations on non-overlapping slots. */
+  DlsTameSlots ts;
+  ts.cap = 32;
+  ts.off = tcc_malloc((size_t)ts.cap * sizeof(int));
+  ts.ok = tcc_malloc((size_t)ts.cap * sizeof(uint8_t));
+  ts.end = tcc_malloc((size_t)ts.cap * sizeof(int));
+  ts.n = 0;
   /* An unknown-slot TMP deref could touch any frame byte; disables the "off not in tame_slot → eligible" shortcut. */
   int has_unknown_deref = 0;
-
-#define TAME_FIND_OR_ADD(_off)                                                                                         \
-  ({                                                                                                                   \
-    int _x = -1;                                                                                                       \
-    for (int _i = 0; _i < tame_slot_n; _i++)                                                                           \
-      if (tame_slot_off[_i] == (_off))                                                                                 \
-      {                                                                                                                \
-        _x = _i;                                                                                                       \
-        break;                                                                                                         \
-      }                                                                                                                \
-    if (_x < 0)                                                                                                        \
-    {                                                                                                                  \
-      if (tame_slot_n >= slot_cap)                                                                                     \
-      {                                                                                                                \
-        slot_cap *= 2;                                                                                                 \
-        tame_slot_off = tcc_realloc(tame_slot_off, (size_t)slot_cap * sizeof(int));                                    \
-        tame_slot_ok = tcc_realloc(tame_slot_ok, (size_t)slot_cap * sizeof(uint8_t));                                  \
-        tame_slot_end = tcc_realloc(tame_slot_end, (size_t)slot_cap * sizeof(int));                                    \
-      }                                                                                                                \
-      _x = tame_slot_n++;                                                                                              \
-      tame_slot_off[_x] = (_off);                                                                                      \
-      tame_slot_ok[_x] = 1;                                                                                            \
-      tame_slot_end[_x] = 0;                                                                                           \
-    }                                                                                                                  \
-    _x;                                                                                                                \
-  })
-#define TAME_FIND(_off)                                                                                                \
-  ({                                                                                                                   \
-    int _x = -1;                                                                                                       \
-    for (int _i = 0; _i < tame_slot_n; _i++)                                                                           \
-      if (tame_slot_off[_i] == (_off))                                                                                 \
-      {                                                                                                                \
-        _x = _i;                                                                                                       \
-        break;                                                                                                         \
-      }                                                                                                                \
-    _x;                                                                                                                \
-  })
 
   /* Step 1: seed vreg_slot[] from direct addr-of-local sources. */
   for (int i = 0; i < n; i++)
@@ -226,15 +331,14 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       continue;
     if (!irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int dv = VR_FLAT(irop_get_vreg(dest));
+    int dv = dls_vr_flat(ir, max_vreg, tcc_ir_op_dest_vreg(ir, q));
     if (dv < 0)
       continue;
     IROperand s1 = tcc_ir_op_get_src1(ir, q);
     if (irop_get_tag(s1) != IROP_TAG_STACKOFF || !s1.is_local || s1.is_lval || irop_get_vreg(s1) != -1)
       continue;
     int slot = irop_get_stack_offset(s1);
-    TAME_FIND_OR_ADD(slot);
+    dls_tame_find_or_add(&ts, slot);
     if (vreg_slot[dv] == -1)
       vreg_slot[dv] = slot;
     else if (vreg_slot[dv] != slot)
@@ -254,18 +358,15 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         continue;
       if (!irop_config[q->op].has_dest)
         continue;
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int dv = VR_FLAT(irop_get_vreg(dest));
+      int dv = dls_vr_flat(ir, max_vreg, tcc_ir_op_dest_vreg(ir, q));
       if (dv < 0)
         continue;
-      IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      int sv1 = VR_FLAT(irop_get_vreg(s1));
+      int sv1 = dls_vr_flat(ir, max_vreg, tcc_ir_op_src1_vreg(ir, q));
       int s1_slot = (sv1 >= 0) ? vreg_slot[sv1] : -1;
       int next = s1_slot;
       if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LEA)
       {
-        IROperand s2 = tcc_ir_op_get_src2(ir, q);
-        int sv2 = VR_FLAT(irop_get_vreg(s2));
+        int sv2 = dls_vr_flat(ir, max_vreg, tcc_ir_op_src2_vreg(ir, q));
         int s2_slot = (sv2 >= 0) ? vreg_slot[sv2] : -1;
         /* &slot + ptr-to-slot' is ambiguous. */
         if (s2_slot != -1)
@@ -309,16 +410,15 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
           continue;
         if (!irop_config[q->op].has_dest)
           continue;
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        int dv = VR_FLAT(irop_get_vreg(dest));
+        int dv = dls_vr_flat(ir, max_vreg, tcc_ir_op_dest_vreg(ir, q));
         if (dv < 0 || vreg_external[dv])
           continue;
         if (vreg_slot[dv] != -1)
           continue; /* known to carry a stack slot — not "external" */
         IROperand s1 = tcc_ir_op_get_src1(ir, q);
         IROperand s2 = irop_config[q->op].has_src2 ? tcc_ir_op_get_src2(ir, q) : s1;
-        int sv1 = VR_FLAT(irop_get_vreg(s1));
-        int sv2 = irop_config[q->op].has_src2 ? VR_FLAT(irop_get_vreg(s2)) : -1;
+        int sv1 = dls_vr_flat(ir, max_vreg, irop_get_vreg(s1));
+        int sv2 = irop_config[q->op].has_src2 ? dls_vr_flat(ir, max_vreg, irop_get_vreg(s2)) : -1;
         int s1_param = (irop_get_vreg(s1) != -1 && TCCIR_DECODE_VREG_TYPE(irop_get_vreg(s1)) == TCCIR_VREG_TYPE_PARAM &&
                         !s1.is_lval);
         int s1_ext = s1_param || (sv1 >= 0 && vreg_external[sv1]);
@@ -412,11 +512,11 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
 
     /* Check if this is a write-call PARAM0 (which is harmless). */
     int is_write_p0 = 0;
-    /* PARAM1 of memcpy/memmove is a bounded read (modelled as a live[] range later), so tag it tame here. */
+    /* PARAM1 of memcpy/memmove is a bounded read (modelled as a lv.r[] range later), so tag it tame here. */
     int is_memcpy_src_bounded = 0;
     if ((q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID) && is_writecall)
     {
-      uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, q);
       int cid = TCCIR_DECODE_CALL_ID(enc);
       int pidx = TCCIR_DECODE_PARAM_IDX(enc);
       if (cid >= 0 && cid < max_call_id && (is_writecall[cid / 8] & (1 << (cid % 8))) && pidx == 0)
@@ -435,7 +535,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
             continue;
           if (qj->op == TCCIR_OP_FUNCPARAMVAL || qj->op == TCCIR_OP_FUNCPARAMVOID)
           {
-            uint32_t encj = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, qj));
+            uint32_t encj = (uint32_t)tcc_ir_op_src2_imm(ir, qj);
             if (TCCIR_DECODE_CALL_ID(encj) == cid && TCCIR_DECODE_PARAM_IDX(encj) == 2)
             {
               sz_op = tcc_ir_op_get_src1(ir, qj);
@@ -444,7 +544,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
               break;
             }
           }
-          else if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, qj))) == cid)
+          else if (TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, qj)) == cid)
             break;
         }
       }
@@ -490,7 +590,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       int v_slot = VR_SLOT_AMBIG + 1; /* "unknown" sentinel < AMBIG */
       if (vr != -1)
       {
-        int vf = VR_FLAT(vr);
+        int vf = dls_vr_flat(ir, max_vreg, vr);
         if (vf >= 0)
           v_slot = vreg_slot[vf];
       }
@@ -499,23 +599,23 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       int vr_type = (vr != -1) ? TCCIR_DECODE_VREG_TYPE(vr) : 0;
       if (op.is_lval && vr != -1 && k != 0 && vr_type == TCCIR_VREG_TYPE_TEMP)
       {
-        int vf2 = VR_FLAT(vr);
+        int vf2 = dls_vr_flat(ir, max_vreg, vr);
         int is_external = (vf2 >= 0 && vreg_external && vreg_external[vf2]);
         if ((v_slot == -1 || v_slot == VR_SLOT_AMBIG) && !is_external)
         {
           has_unknown_deref = 1;
-          for (int t = 0; t < tame_slot_n; t++)
-            tame_slot_ok[t] = 0;
+          for (int t = 0; t < ts.n; t++)
+            ts.ok[t] = 0;
         }
         else if (v_slot != -1 && v_slot != VR_SLOT_AMBIG && v_slot != VR_SLOT_AMBIG + 1)
         {
           int foff;
-          /* A deref via a resolvable exact offset is recorded precisely in live[] below, so no poison (gated on dls_precise_ok). */
+          /* A deref via a resolvable exact offset is recorded precisely in lv.r[] below, so no poison (gated on dls_precise_ok). */
           if (!dls_precise_ok || !dls_vreg_frame_off(ir, vr, i, &foff))
           {
-            int idx = TAME_FIND_OR_ADD(v_slot);
+            int idx = dls_tame_find_or_add(&ts, v_slot);
             if (idx >= 0)
-              tame_slot_ok[idx] = 0;
+              ts.ok[idx] = 0;
           }
         }
       }
@@ -523,7 +623,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       /* Direct addr-of-local: classify in-place. */
       if (slot != INT_MIN)
       {
-        int idx = TAME_FIND_OR_ADD(slot);
+        int idx = dls_tame_find_or_add(&ts, slot);
         int tame_here = 0;
         switch (q->op)
         {
@@ -535,13 +635,11 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         case TCCIR_OP_ADD:
         case TCCIR_OP_SUB:
         {
-          IROperand s2 = tcc_ir_op_get_src2(ir, q);
-          if (k == 1 && (irop_get_tag(s2) == IROP_TAG_IMM32 || irop_get_tag(s2) == IROP_TAG_I64))
+          if (k == 1 && (tcc_ir_op_src2_tag(ir, q) == IROP_TAG_IMM32 || tcc_ir_op_src2_tag(ir, q) == IROP_TAG_I64))
             tame_here = 1;
           else if (k == 1)
           {
-            IROperand adest = tcc_ir_op_get_dest(ir, q);
-            int adv = VR_FLAT(irop_get_vreg(adest));
+            int adv = dls_vr_flat(ir, max_vreg, tcc_ir_op_dest_vreg(ir, q));
             if (adv >= 0 && vreg_slot[adv] == slot)
               tame_here = 1;
           }
@@ -559,7 +657,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
           break;
         }
         if (!tame_here)
-          tame_slot_ok[idx] = 0;
+          ts.ok[idx] = 0;
       }
 
       /* Vreg use of a derived-address vreg: plain value (is_lval=0) IS the address; a VAR/PARAM lval load yields the stored address too (so calls like strlen(local_ptr) get classified).  TMP lval is a deref, handled above.  Skip the dest role for ADD/SUB/ASSIGN (propagation target, not a use). */
@@ -571,7 +669,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       }
       if (classify_use)
       {
-        int idx = (v_slot == VR_SLOT_AMBIG) ? -1 : TAME_FIND_OR_ADD(v_slot);
+        int idx = (v_slot == VR_SLOT_AMBIG) ? -1 : dls_tame_find_or_add(&ts, v_slot);
         int tame_here = 0;
         switch (q->op)
         {
@@ -583,15 +681,13 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         case TCCIR_OP_ADD:
         case TCCIR_OP_SUB:
         {
-          IROperand s2 = tcc_ir_op_get_src2(ir, q);
           if (k == 0)
             tame_here = 1; /* dest: propagation target, not a use */
-          else if (k == 1 && (irop_get_tag(s2) == IROP_TAG_IMM32 || irop_get_tag(s2) == IROP_TAG_I64))
+          else if (k == 1 && (tcc_ir_op_src2_tag(ir, q) == IROP_TAG_IMM32 || tcc_ir_op_src2_tag(ir, q) == IROP_TAG_I64))
             tame_here = 1;
           else if (k == 1)
           {
-            IROperand adest = tcc_ir_op_get_dest(ir, q);
-            int adv = VR_FLAT(irop_get_vreg(adest));
+            int adv = dls_vr_flat(ir, max_vreg, tcc_ir_op_dest_vreg(ir, q));
             if (adv >= 0 && vreg_slot[adv] == v_slot)
               tame_here = 1;
           }
@@ -626,7 +722,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
                   target_read = 1;
                   break;
                 }
-              if (!target_read && TAME_FIND(sdoff) < 0)
+              if (!target_read && dls_tame_find(&ts, sdoff) < 0)
                 tame_here = 1;
             }
           }
@@ -645,43 +741,21 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         {
           if (v_slot == VR_SLOT_AMBIG)
           {
-            for (int t = 0; t < tame_slot_n; t++)
-              tame_slot_ok[t] = 0;
+            for (int t = 0; t < ts.n; t++)
+              ts.ok[t] = 0;
           }
           else if (idx >= 0)
-            tame_slot_ok[idx] = 0;
+            ts.ok[idx] = 0;
         }
       }
     }
   }
 
   /* Collect (offset,width,position) read/escape ranges for position-aware liveness: a STORE at i is dead if no read after i touches the same bytes. */
-  typedef struct
-  {
-    int off;
-    int width;
-    int pos;
-  } LiveRange;
-  int cap = 64;
-  LiveRange *live = tcc_malloc(sizeof(LiveRange) * cap);
-  int live_count = 0;
-
-#define DLS_LIVE_ADD(off_, width_, pos_)                                                                               \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    int _o = (off_);                                                                                                   \
-    int _w = (width_);                                                                                                 \
-    int _p = (pos_);                                                                                                   \
-    if (live_count >= cap)                                                                                             \
-    {                                                                                                                  \
-      cap *= 2;                                                                                                        \
-      live = tcc_realloc(live, sizeof(LiveRange) * cap);                                                               \
-    }                                                                                                                  \
-    live[live_count].off = _o;                                                                                         \
-    live[live_count].width = _w;                                                                                       \
-    live[live_count].pos = _p;                                                                                         \
-    live_count++;                                                                                                      \
-  } while (0)
+  DlsLive lv;
+  lv.cap = 64;
+  lv.r = tcc_malloc(sizeof(DlsLiveRange) * lv.cap);
+  lv.n = 0;
 
   for (int i = 0; i < n; i++)
   {
@@ -724,7 +798,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         op = tcc_ir_op_get_accum(ir, q);
       }
 
-      /* A TEMP lval src resolving to an exact frame offset is an explicit read; record it (mirrors the no-poison decision above, keeping live[] complete). */
+      /* A TEMP lval src resolving to an exact frame offset is an explicit read; record it (mirrors the no-poison decision above, keeping lv.r[] complete). */
       if (dls_precise_ok && k != 0 && op.is_lval)
       {
         int rvr = irop_get_vreg(op);
@@ -738,7 +812,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
               w = irop_is_64bit(op) ? 8 : 4;
             if (op.is_complex)
               w *= 2;
-            DLS_LIVE_ADD(foff, w, i);
+            dls_live_add(&lv, foff, w, i);
           }
         }
       }
@@ -756,8 +830,8 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         if (q->op == TCCIR_OP_BLOCK_COPY && k == 0)
           continue;
         int off = irop_get_stack_offset(op);
-        int tidx = TAME_FIND_OR_ADD(off);
-        tame_slot_ok[tidx] = 0;
+        int tidx = dls_tame_find_or_add(&ts, off);
+        ts.ok[tidx] = 0;
         continue;
       }
       int off = irop_get_stack_offset(op);
@@ -770,12 +844,12 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         /* _Complex T touches 2 * sizeof(T) consecutive bytes (both halves). */
         if (op.is_complex)
           w *= 2;
-        DLS_LIVE_ADD(off, w, i);
+        dls_live_add(&lv, off, w, i);
       }
     }
   }
 
-  /* Bounded-read live[] for memcpy/memmove sources: emit the read range the callee will actually read. */
+  /* Bounded-read lv.r[] for memcpy/memmove sources: emit the read range the callee will actually read. */
   if (is_memcpy_like)
   {
     for (int i = 0; i < n; i++)
@@ -783,7 +857,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
         continue;
-      int cid = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      int cid = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
       if (cid < 0 || cid >= max_call_id)
         continue;
       if (!(is_memcpy_like[cid / 8] & (1 << (cid % 8))))
@@ -803,20 +877,32 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
           irop_get_vreg(src_p) == -1)
       {
         int off = irop_get_stack_offset(src_p);
-        DLS_LIVE_ADD(off, sz, i);
+        dls_live_add(&lv, off, sz, i);
       }
       else
       {
         int vr = irop_get_vreg(src_p);
         if (vr == -1)
           continue;
-        int vf = VR_FLAT(vr);
+        int vf = dls_vr_flat(ir, max_vreg, vr);
         if (vf < 0)
           continue;
         int slot = vreg_slot[vf];
-        if (slot == -1 || slot == VR_SLOT_AMBIG)
+        if (slot == -1)
           continue;
-        DLS_LIVE_ADD(slot, sz, i);
+        /* The source was tagged tame above on the promise that its read is
+         * recorded here, so every case must record one: the exact bytes when
+         * the pointer resolves to an offset; else everything from its slot up
+         * (it may point anywhere inside, `&x + 16`); else -- a pointer into
+         * one of several slots, `p = c ? &a : &b.f` -- the whole frame.  The
+         * SD driver's get_config lost its config copy to the last case. */
+        int foff;
+        if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && dls_vreg_frame_off(ir, vr, i, &foff))
+          dls_live_add(&lv, foff, sz, i);
+        else if (slot != VR_SLOT_AMBIG)
+          dls_live_add(&lv, slot, 1 << 28, i);
+        else
+          dls_live_add(&lv, -(1 << 28), 1 << 29, i);
       }
     }
   }
@@ -824,45 +910,27 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
   int changes = 0;
 
   /* Bound each tame slot's extent by the nearest higher tame-slot offset (a confirmed allocation start); a safe over-approximation, 0 = frame top. */
-  for (int t = 0; t < tame_slot_n; t++)
+  for (int t = 0; t < ts.n; t++)
   {
-    int s = tame_slot_off[t];
+    int s = ts.off[t];
     int end = 0;
     int best_set = 0;
-    for (int u = 0; u < tame_slot_n; u++)
+    for (int u = 0; u < ts.n; u++)
     {
-      int o = tame_slot_off[u];
+      int o = ts.off[u];
       if (o > s && (!best_set || o < end))
       {
         end = o;
         best_set = 1;
       }
     }
-    tame_slot_end[t] = end;
+    ts.end[t] = end;
   }
-
-  /* 1 iff [_off,_off+_width) intersects any non-tame slot's bounded extent (its deref might observe the write); has_unknown_deref is a hard bail. */
-#define DLS_NONTAME_RANGE_OVERLAPS(_off, _width)                                                                       \
-  ({                                                                                                                   \
-    int _o = (_off);                                                                                                   \
-    int _w = (_width);                                                                                                 \
-    int _hit = has_unknown_deref;                                                                                      \
-    for (int _t = 0; !_hit && _t < tame_slot_n; _t++)                                                                  \
-    {                                                                                                                  \
-      if (tame_slot_ok[_t])                                                                                            \
-        continue;                                                                                                      \
-      int _ns = tame_slot_off[_t];                                                                                     \
-      int _ne = tame_slot_end[_t];                                                                                     \
-      if (_o < _ne && _ns < _o + _w)                                                                                   \
-        _hit = 1;                                                                                                      \
-    }                                                                                                                  \
-    _hit;                                                                                                              \
-  })
 
   /* STORE and direct-PARAM0 elimination skip entirely if any slot escaped non-tamely (its deref could read anywhere in the slot, bounds unknown). */
   int any_nontame = has_unknown_deref;
-  for (int t = 0; !any_nontame && t < tame_slot_n; t++)
-    if (!tame_slot_ok[t])
+  for (int t = 0; !any_nontame && t < ts.n; t++)
+    if (!ts.ok[t])
       any_nontame = 1;
 
   if (!any_nontame)
@@ -870,6 +938,9 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_STORE)
+      continue;
+    /* A volatile access is observable even when nothing reads the slot back. */
+    if (tcc_ir_instr_access_is_volatile(ir, q))
       continue;
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     if (irop_get_tag(dest) != IROP_TAG_STACKOFF)
@@ -893,9 +964,9 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       width *= 2;
     /* Position-aware liveness: only reads after this STORE make it live; with a back-edge any overlapping read keeps it (a read may execute after the store). */
     int alive = 0;
-    for (int k = 0; k < live_count; k++)
-      if ((dls_has_backedge || live[k].pos > i) &&
-          off < live[k].off + live[k].width && off + width > live[k].off)
+    for (int k = 0; k < lv.n; k++)
+      if ((dls_has_backedge || lv.r[k].pos > i) &&
+          off < lv.r[k].off + lv.r[k].width && off + width > lv.r[k].off)
       {
         alive = 1;
         break;
@@ -914,6 +985,9 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_STORE)
       continue;
+    /* A volatile access is observable even when nothing reads the slot back. */
+    if (tcc_ir_instr_access_is_volatile(ir, q))
+      continue;
     IROperand dest = tcc_ir_op_get_dest(ir, q);
     if (!dest.is_lval)
       continue;
@@ -930,11 +1004,11 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       continue;
     if (dest.is_complex)
       width *= 2;
-    if (DLS_NONTAME_RANGE_OVERLAPS(foff, width))
+    if (dls_nontame_overlaps(&ts, has_unknown_deref, foff, width))
       continue;
     int alive = 0;
-    for (int kk = 0; kk < live_count; kk++)
-      if (live[kk].pos > i && foff < live[kk].off + live[kk].width && foff + width > live[kk].off)
+    for (int kk = 0; kk < lv.n; kk++)
+      if (lv.r[kk].pos > i && foff < lv.r[kk].off + lv.r[kk].width && foff + width > lv.r[kk].off)
       {
         alive = 1;
         break;
@@ -946,35 +1020,37 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     changes++;
   }
 
-  /* STORE_INDEXED/STORE_POSTINC via a vreg V → tame slot S: eliminate when S is tame, no non-tame deref reaches it, and no later read intersects [S, tame_slot_end).  Whole-slot liveness (exact offset unknown).  Skip entirely if any indexed/postinc load exists (not recorded in live[]). */
+  /* STORE_INDEXED/STORE_POSTINC via a vreg V → tame slot S: eliminate when S is tame, no non-tame deref reaches it, and no later read intersects [S, ts.end).  Whole-slot liveness (exact offset unknown).  Skip entirely if any indexed/postinc load exists (not recorded in lv.r[]). */
   if (!has_unknown_deref && !dls_has_indexed)
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_STORE_INDEXED && q->op != TCCIR_OP_STORE_POSTINC)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int vr = irop_get_vreg(dest);
+    /* A volatile access is observable even when nothing reads the slot back. */
+    if (tcc_ir_instr_access_is_volatile(ir, q))
+      continue;
+    int vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr == -1)
       continue;
-    int vf = VR_FLAT(vr);
+    int vf = dls_vr_flat(ir, max_vreg, vr);
     if (vf < 0)
       continue;
     int slot = vreg_slot[vf];
     if (slot == -1 || slot == VR_SLOT_AMBIG)
       continue;
-    int tidx = TAME_FIND(slot);
-    if (tidx < 0 || !tame_slot_ok[tidx])
+    int tidx = dls_tame_find(&ts, slot);
+    if (tidx < 0 || !ts.ok[tidx])
       continue;
-    int slot_end = tame_slot_end[tidx];
+    int slot_end = ts.end[tidx];
     /* No non-tame deref through a different slot may reach into S's bytes. */
-    if (DLS_NONTAME_RANGE_OVERLAPS(slot, slot_end - slot))
+    if (dls_nontame_overlaps(&ts, has_unknown_deref, slot, slot_end - slot))
       continue;
     /* Whole-slot liveness: any later read in [slot, slot_end)? */
     int alive = 0;
-    for (int k = 0; k < live_count; k++)
-      if ((dls_has_backedge || live[k].pos > i) &&
-          live[k].off < slot_end && live[k].off + live[k].width > slot)
+    for (int k = 0; k < lv.n; k++)
+      if ((dls_has_backedge || lv.r[k].pos > i) &&
+          lv.r[k].off < slot_end && lv.r[k].off + lv.r[k].width > slot)
       {
         alive = 1;
         break;
@@ -993,22 +1069,24 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_BLOCK_COPY)
       continue;
+    /* A volatile access is observable even when nothing reads the slot back. */
+    if (tcc_ir_instr_access_is_volatile(ir, q))
+      continue;
     IROperand dest = tcc_ir_op_get_dest(ir, q);
-    IROperand sz = tcc_ir_op_get_src2(ir, q);
     if (irop_get_tag(dest) != IROP_TAG_STACKOFF || !dest.is_local || irop_get_vreg(dest) != -1)
       continue;
-    if (irop_get_tag(sz) != IROP_TAG_IMM32)
+    if (tcc_ir_op_src2_tag(ir, q) != IROP_TAG_IMM32)
       continue;
     int base = irop_get_stack_offset(dest);
-    int width = (int)irop_get_imm64_ex(ir, sz);
+    int width = (int)tcc_ir_op_src2_imm(ir, q);
     if (width <= 0)
       continue;
-    if (DLS_NONTAME_RANGE_OVERLAPS(base, width))
+    if (dls_nontame_overlaps(&ts, has_unknown_deref, base, width))
       continue;
     int alive = 0;
-    for (int k = 0; k < live_count; k++)
-      if ((dls_has_backedge || live[k].pos > i) &&
-          base < live[k].off + live[k].width && base + width > live[k].off)
+    for (int k = 0; k < lv.n; k++)
+      if ((dls_has_backedge || lv.r[k].pos > i) &&
+          base < lv.r[k].off + lv.r[k].width && base + width > lv.r[k].off)
       {
         alive = 1;
         break;
@@ -1027,7 +1105,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
         continue;
-      int cid = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      int cid = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
       if (cid < 0 || cid >= max_call_id)
         continue;
       if (!(is_writecall[cid / 8] & (1 << (cid % 8))))
@@ -1037,6 +1115,8 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       if (!ir_opt_get_call_param_operand(ir, i, 0, &p0))
         continue;
       if (!ir_opt_get_call_param_operand(ir, i, sz_pidx, &p_sz))
+        continue;
+      if (dls_writecall_is_volatile(ir, i, p0))
         continue;
       if (irop_get_tag(p0) != IROP_TAG_STACKOFF || !p0.is_local || p0.is_lval)
         continue;
@@ -1050,9 +1130,9 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
         continue;
       /* Position-aware: only reads after this call keep it alive. */
       int alive = 0;
-      for (int k = 0; k < live_count; k++)
-        if ((dls_has_backedge || live[k].pos > i) &&
-            base < live[k].off + live[k].width && base + sz > live[k].off)
+      for (int k = 0; k < lv.n; k++)
+        if ((dls_has_backedge || lv.r[k].pos > i) &&
+            base < lv.r[k].off + lv.r[k].width && base + sz > lv.r[k].off)
         {
           alive = 1;
           break;
@@ -1066,7 +1146,7 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     }
   }
 
-  /* vreg-PARAM0 write-call elim: a memset/memcpy/memmove writing through a vreg → tame slot S is dead iff S is tame and no live[] entry reaches offset >= S.  Gated on any_nontame==0: StackLoc offsets aren't allocation boundaries, so a non-tame escape of an overlapping slot must block it. */
+  /* vreg-PARAM0 write-call elim: a memset/memcpy/memmove writing through a vreg → tame slot S is dead iff S is tame and no lv.r[] entry reaches offset >= S.  Gated on any_nontame==0: StackLoc offsets aren't allocation boundaries, so a non-tame escape of an overlapping slot must block it. */
   if (!any_nontame && writecall_count > 0)
   {
     for (int i = 0; i < n; i++)
@@ -1074,13 +1154,15 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
         continue;
-      int cid = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      int cid = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
       if (cid < 0 || cid >= max_call_id)
         continue;
       if (!(is_writecall[cid / 8] & (1 << (cid % 8))))
         continue;
       IROperand p0;
       if (!ir_opt_get_call_param_operand(ir, i, 0, &p0))
+        continue;
+      if (dls_writecall_is_volatile(ir, i, p0))
         continue;
       /* Skip the direct Addr[StackLoc[X]] case — handled above. */
       if (irop_get_tag(p0) == IROP_TAG_STACKOFF && !p0.is_lval && irop_get_vreg(p0) == -1)
@@ -1089,19 +1171,19 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
       int vr = irop_get_vreg(p0);
       if (vr == -1)
         continue;
-      int vf = VR_FLAT(vr);
+      int vf = dls_vr_flat(ir, max_vreg, vr);
       if (vf < 0)
         continue;
       int slot = vreg_slot[vf];
       if (slot == -1 || slot == VR_SLOT_AMBIG)
         continue;
-      int tidx = TAME_FIND(slot);
-      if (tidx < 0 || !tame_slot_ok[tidx])
+      int tidx = dls_tame_find(&ts, slot);
+      if (tidx < 0 || !ts.ok[tidx])
         continue;
       /* Whole-slot check: any live range whose end exceeds slot, read after this call?  (Wide reads may start below slot and extend across it.) */
       int alive = 0;
-      for (int k = 0; k < live_count; k++)
-        if ((dls_has_backedge || live[k].pos > i) && live[k].off + live[k].width > slot)
+      for (int k = 0; k < lv.n; k++)
+        if ((dls_has_backedge || lv.r[k].pos > i) && lv.r[k].off + lv.r[k].width > slot)
         {
           alive = 1;
           break;
@@ -1115,22 +1197,16 @@ int tcc_ir_opt_dead_local_slot_elim(TCCIRState *ir)
     }
   }
 
-  tcc_free(live);
+  tcc_free(lv.r);
   tcc_free(slr);
   tcc_free(is_writecall);
   tcc_free(writecall_size_at_2);
   tcc_free(is_memcpy_like);
   tcc_free(vreg_slot);
   tcc_free(vreg_external);
-  tcc_free(tame_slot_off);
-  tcc_free(tame_slot_ok);
-  tcc_free(tame_slot_end);
+  tcc_free(ts.off);
+  tcc_free(ts.ok);
+  tcc_free(ts.end);
   return changes;
-#undef DLS_LIVE_ADD
 #undef VR_SLOT_AMBIG
-#undef VR_FLAT
-#undef TAME_FIND_OR_ADD
-#undef TAME_FIND
-#undef DLS_NONTAME_RANGE_OVERLAPS
 }
-int tcc_ir_opt_dead_local_slot_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_local_slot_elim(ctx->ir); }

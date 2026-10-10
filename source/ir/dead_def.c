@@ -38,7 +38,7 @@
 
 static int dd_has_slot3(int op)
 {
-  return tcc_ir_op_is_mac(op) || op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_SELECT;
+  return ir_op_has(op, IROP_A_SLOT3);
 }
 
 static IROperand dd_slot(TCCIRState *ir, IRQuadCompact *q, int s)
@@ -122,26 +122,7 @@ static int dd_annotated(TCCIRState *ir, IRQuadCompact *q)
  * the array is not the only continuation. */
 static int dd_ends_run(int op)
 {
-  switch (op)
-  {
-  case TCCIR_OP_JUMP:
-  case TCCIR_OP_JUMPIF:
-  case TCCIR_OP_IJUMP:
-  case TCCIR_OP_SWITCH_TABLE:
-  case TCCIR_OP_SWITCH_LOAD:
-  case TCCIR_OP_RETURNVALUE:
-  case TCCIR_OP_RETURNVOID:
-  case TCCIR_OP_SETJMP:
-  case TCCIR_OP_NL_SETJMP:
-  case TCCIR_OP_LONGJMP:
-  case TCCIR_OP_NL_LONGJMP:
-  case TCCIR_OP_BUILTIN_RETURN:
-  case TCCIR_OP_INLINE_ASM:
-  case TCCIR_OP_TRAP:
-    return 1;
-  default:
-    return 0;
-  }
+  return ir_op_has(op, IROP_ENDS_BLOCK) || op == TCCIR_OP_SWITCH_LOAD;
 }
 
 static void dd_count(TCCIRState *ir, IRQuadCompact *q, int *occ, int nt, int delta)
@@ -176,7 +157,7 @@ static int dd_overwritten(TCCIRState *ir, int i, int32_t vr, int width)
       named = irop_get_vreg(dd_slot(ir, q, s)) == vr;
     if (named)
       return 0;
-    if (irop_config[q->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == vr)
+    if (irop_config[q->op].has_dest && tcc_ir_op_dest_vreg(ir, q) == vr)
       return dd_plain_temp_dest(ir, q) == vr && dd_full_def_op(q->op) && !dd_annotated(ir, q) &&
              dd_width(tcc_ir_op_get_dest(ir, q)) >= width;
     if (dd_ends_run(q->op))

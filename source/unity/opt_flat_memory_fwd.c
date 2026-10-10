@@ -25,8 +25,6 @@
 #undef PLF_UNKNOWN
 #undef USING_GLOBALS
 #include "../opt/flat/memory/sl_forward.c"
-#undef CHECK_ADDR_ALIAS
-#undef CHECK_WIDTH_OVERLAP
 #undef GSLFWD_MAX_ENTRIES
 #undef SL_FWD_MAX_DEAD_STORES
 #undef USING_GLOBALS

@@ -104,7 +104,7 @@ ST_FUNC int tcc_gen_machine_outline_enabled(void)
   if (off < 0)
     off = getenv("TCC_NO_OUTLINE") != NULL;
   const TCCState *s1 = tcc_state;
-  return s1->optimize_size && s1->optimize > 0 && !off && !s1->check_only && !s1->do_debug && !s1->test_coverage &&
+  return TCC_OPT(s1, optimize_size) && TCC_OPT(s1, optimize) > 0 && !off && !s1->check_only && !s1->do_debug && !s1->test_coverage &&
          !s1->do_backtrace;
 }
 

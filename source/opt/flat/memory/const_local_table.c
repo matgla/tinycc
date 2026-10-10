@@ -197,8 +197,12 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
   if (n == 0 || ir->frame_relaid || !ir->frame_obj_count || ir->inline_asm_count || tcc_ir_calls_returns_twice(ir))
     return 0;
 
-  /* Candidate objects: those whose address goes into a TEMP. */
-  CltObj *objs = tcc_malloc(sizeof(CltObj) * CLT_MAX_OBJ);
+  /* Candidate objects: those whose address goes into a TEMP.  The array grows
+   * on demand up to CLT_MAX_OBJ (nothing holds an element pointer while it is
+   * filled): a fixed CLT_MAX_OBJ array was 16 KiB per -O2 function, nearly
+   * always for a handful of objects. */
+  int objs_cap = 16;
+  CltObj *objs = tcc_malloc(sizeof(CltObj) * objs_cap);
   int nobj = 0;
   for (int i = 0; i < n && nobj < CLT_MAX_OBJ; i++)
   {
@@ -214,11 +218,16 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
      * scope's object reuse it. */
     int size = -1;
     for (int k = 0; k < ir->frame_obj_count; k++)
-      if (ir->frame_objs[4 * k] == lo && ir->frame_objs[4 * k + 2] > size)
-        size = ir->frame_objs[4 * k + 2];
+      if (ir->frame_objs[FRAME_OBJ_WORDS * k] == lo && ir->frame_objs[FRAME_OBJ_WORDS * k + 2] > size)
+        size = ir->frame_objs[FRAME_OBJ_WORDS * k + 2];
     hi = lo + size;
     if (size <= 0 || size > CLT_MAX_SIZE || (lo & 3) || off >= hi)
       continue;
+    if (nobj == objs_cap)
+    {
+      objs_cap *= 2;
+      objs = tcc_realloc(objs, sizeof(CltObj) * objs_cap);
+    }
     objs[nobj++] = (CltObj){.lo = lo, .hi = hi, .first = -1, .last = -1, .zcall = -1, .zfirst = -1};
   }
   if (!nobj)
@@ -261,13 +270,14 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     const char *name = callee ? get_tok_str(callee->v, NULL) : NULL;
-    if (!name || (strcmp(name, "__aeabi_memset") && strcmp(name, "memset")))
+    int size_idx, fill_idx;
+    if (!ir_opt_memset_params(name, &size_idx, &fill_idx))
       continue;
     IROperand pd, ps, pf;
-    if (!ir_opt_get_call_param_operand(ir, i, 0, &pd) || !ir_opt_get_call_param_operand(ir, i, 1, &ps) ||
-        !ir_opt_get_call_param_operand(ir, i, 2, &pf))
+    if (!ir_opt_get_call_param_operand(ir, i, 0, &pd) || !ir_opt_get_call_param_operand(ir, i, size_idx, &ps) ||
+        !ir_opt_get_call_param_operand(ir, i, fill_idx, &pf))
       continue;
     if (!clt_direct_frame(pd) || pd.is_lval || irop_get_tag(ps) != IROP_TAG_IMM32 ||
         irop_get_tag(pf) != IROP_TAG_IMM32 || irop_get_imm64_ex(ir, pf) != 0)
@@ -312,9 +322,8 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (!irop_config[q->op].has_dest || !irop_config[q->op].has_src1)
         continue;
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t dv = irop_get_vreg(d);
-      if (d.is_lval || !clt_is_temp(dv))
+      int32_t dv = tcc_ir_op_dest_vreg(ir, q);
+      if (tcc_ir_op_dest_is_lval(ir, q) || !clt_is_temp(dv))
         continue;
       IROperand s1 = tcc_ir_op_get_src1(ir, q), a;
       int k = -1;
@@ -410,15 +419,22 @@ int tcc_ir_opt_const_local_table(TCCIRState *ir)
       if (q->op == TCCIR_OP_LOAD_INDEXED && k == 1)
         continue;
       if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) &&
-          clt_temp_obj(&temps, irop_get_vreg(tcc_ir_op_get_dest(ir, q))) == ob &&
-          !tcc_ir_op_get_dest(ir, q).is_lval && !(q->op == TCCIR_OP_SUB && k == 2))
+          clt_temp_obj(&temps, tcc_ir_op_dest_vreg(ir, q)) == ob &&
+          !tcc_ir_op_dest_is_lval(ir, q) && !(q->op == TCCIR_OP_SUB && k == 2))
         continue;
       objs[ob].bad = 1; /* the address escapes, or is compared or stored */
     }
   }
 
   int changes = 0;
-  uint8_t *image = tcc_malloc(CLT_MAX_SIZE), *written = tcc_malloc(CLT_MAX_SIZE);
+  /* Sized for the largest object that can still become a table rather than
+   * CLT_MAX_SIZE: two fixed 64 KiB buffers were the largest allocation of a
+   * typical -O2 compile, for objects of a few dozen bytes. */
+  int max_size = 1;
+  for (int ob = 0; ob < nobj; ob++)
+    if (!objs[ob].bad && objs[ob].first >= 0 && objs[ob].hi - objs[ob].lo > max_size)
+      max_size = objs[ob].hi - objs[ob].lo;
+  uint8_t *image = tcc_malloc(max_size), *written = tcc_malloc(max_size);
   for (int ob = 0; ob < nobj; ob++)
   {
     CltObj *o = &objs[ob];

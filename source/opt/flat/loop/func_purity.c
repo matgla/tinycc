@@ -9,6 +9,7 @@
  */
 
 #include "licm.h"
+#include "opt_range.h"
 #include "opt.h"
 #include "opt_utils.h"
 #include "cfg.h"
@@ -17,107 +18,153 @@
 #include "vreg.h"
 #include <string.h>
 
-/* purity: 2 = PURE (reads memory), 3 = CONST (depends only on arguments) */
-static struct
+/* purity: 2 = PURE (reads memory: string/memory functions),
+ *         3 = CONST (depends only on arguments: math, ctype).
+ * Sorted in strcmp order: pure_table_lookup binary-searches it (a linear
+ * strcmp scan here was ~1% of all compile work: every call site of every
+ * function in every opt pass queries it). */
+static const struct
 {
-  const char *name;
+  const char *TCC_RODATA_REL name;
   int purity;
 } pure_func_table[] = {
-    /* String functions - PURE (read memory) */
-    {"strlen", 2},
-    {"strcmp", 2},
-    {"strncmp", 2},
-    {"strchr", 2},
-    {"strrchr", 2},
-    {"strstr", 2},
-    {"strpbrk", 2},
-    {"strcspn", 2},
-    {"strspn", 2},
-    /* TCC-internal renamed variants (read-only string functions) */
-    {"__tcc_strlen", 2},
+    {"__tcc_memcmp1", 2},
     {"__tcc_strcmp", 2},
+    {"__tcc_strcspn", 2},
+    {"__tcc_strlen", 2},
     {"__tcc_strnlen", 2},
     {"__tcc_strpbrk", 2},
     {"__tcc_strrchr", 2},
     {"__tcc_strstr", 2},
-    {"__tcc_strcspn", 2},
-    {"__tcc_memcmp1", 2},
-
-    /* Memory functions - PURE */
-    {"memcmp", 2},
-    {"memchr", 2},
-
-    /* Math functions - CONST (no memory reads, pure computation) */
     {"abs", 3},
-    {"labs", 3},
-    {"llabs", 3},
-    {"fabs", 3},
-    {"fabsf", 3},
-    {"sqrt", 3},
-    {"sqrtf", 3},
-    {"sin", 3},
-    {"sinf", 3},
-    {"cos", 3},
-    {"cosf", 3},
-    {"tan", 3},
-    {"tanf", 3},
     {"atan", 3},
-    {"atanf", 3},
     {"atan2", 3},
     {"atan2f", 3},
-    {"exp", 3},
-    {"expf", 3},
-    {"log", 3},
-    {"logf", 3},
-    {"log10", 3},
-    {"log10f", 3},
-    {"pow", 3},
-    {"powf", 3},
+    {"atanf", 3},
     {"ceil", 3},
     {"ceilf", 3},
+    {"cos", 3},
+    {"cosf", 3},
+    {"exp", 3},
+    {"expf", 3},
+    {"fabs", 3},
+    {"fabsf", 3},
     {"floor", 3},
     {"floorf", 3},
-    {"round", 3},
-    {"roundf", 3},
     {"fmod", 3},
     {"fmodf", 3},
-    {"modf", 3},
-    {"modff", 3},
-
-    /* Character classification - CONST */
-    {"isalpha", 3},
-    {"isdigit", 3},
     {"isalnum", 3},
-    {"isspace", 3},
-    {"isupper", 3},
+    {"isalpha", 3},
+    {"iscntrl", 3},
+    {"isdigit", 3},
+    {"isgraph", 3},
     {"islower", 3},
     {"isprint", 3},
-    {"isgraph", 3},
     {"ispunct", 3},
-    {"iscntrl", 3},
+    {"isspace", 3},
+    {"isupper", 3},
     {"isxdigit", 3},
+    {"labs", 3},
+    {"llabs", 3},
+    {"log", 3},
+    {"log10", 3},
+    {"log10f", 3},
+    {"logf", 3},
+    {"memchr", 2},
+    {"memcmp", 2},
+    {"modf", 3},
+    {"modff", 3},
+    {"pow", 3},
+    {"powf", 3},
+    {"round", 3},
+    {"roundf", 3},
+    {"sin", 3},
+    {"sinf", 3},
+    {"sqrt", 3},
+    {"sqrtf", 3},
+    {"strchr", 2},
+    {"strcmp", 2},
+    {"strcspn", 2},
+    {"strlen", 2},
+    {"strncmp", 2},
+    {"strpbrk", 2},
+    {"strrchr", 2},
+    {"strspn", 2},
+    {"strstr", 2},
+    {"tan", 3},
+    {"tanf", 3},
     {"tolower", 3},
     {"toupper", 3},
 };
 
 #define NUM_PURE_FUNCS (sizeof(pure_func_table) / sizeof(pure_func_table[0]))
 
+/* Table purity of `name`, or TCC_FUNC_PURITY_UNKNOWN. */
+static int pure_table_lookup(const char *name)
+{
+  int lo = 0, hi = (int)NUM_PURE_FUNCS - 1;
+#ifdef CONFIG_TCC_DEBUG
+  static int checked;
+  if (!checked)
+  {
+    for (size_t k = 1; k < NUM_PURE_FUNCS; k++)
+      if (strcmp(pure_func_table[k - 1].name, pure_func_table[k].name) >= 0)
+        tcc_ice("pure_func_table is not sorted at '%s'", pure_func_table[k].name);
+    checked = 1;
+  }
+#endif
+  while (lo <= hi)
+  {
+    int mid = (lo + hi) / 2;
+    int c = strcmp(name, pure_func_table[mid].name);
+    if (c == 0)
+      return pure_func_table[mid].purity;
+    if (c < 0)
+      hi = mid - 1;
+    else
+      lo = mid + 1;
+  }
+  return TCC_FUNC_PURITY_UNKNOWN;
+}
+
+/* The cache is an open-addressed table keyed by token (0 = empty slot), at
+ * most half full.  It was a list of 256 entries scanned linearly: in a TU with
+ * more functions -- a Zig kernel has ~1900 -- everything compiled after the
+ * 256th was never cached, so neither LICM nor a caller's own inference ever
+ * learned that it was pure. */
+static int purity_slot(const TCCState *s, int func_token)
+{
+  unsigned mask = (unsigned)s->func_purity_cache_cap - 1;
+  unsigned h = ((unsigned)func_token * 2654435761u) & mask;
+  while (s->func_purity_cache[h].token && s->func_purity_cache[h].token != func_token)
+    h = (h + 1) & mask;
+  return (int)h;
+}
+
 void tcc_ir_cache_func_purity(TCCState *s, int func_token, TCCFuncPurity purity)
 {
   if (!s || func_token < TOK_IDENT)
     return;
-
-  for (int i = 0; i < s->func_purity_cache_count; i++)
-  {
-    if (s->func_purity_cache[i].token == func_token)
-      return;
-  }
-
+  if (s->func_purity_cache_cap && s->func_purity_cache[purity_slot(s, func_token)].token)
+    return; /* first verdict wins */
   if (s->func_purity_cache_count >= FUNC_PURITY_CACHE_SIZE)
     return;
 
-  s->func_purity_cache[s->func_purity_cache_count].token = func_token;
-  s->func_purity_cache[s->func_purity_cache_count].purity = purity;
+  if ((s->func_purity_cache_count + 1) * 2 > s->func_purity_cache_cap)
+  {
+    int old_cap = s->func_purity_cache_cap;
+    __typeof__(s->func_purity_cache) old = s->func_purity_cache;
+    s->func_purity_cache_cap = old_cap ? old_cap * 2 : 64;
+    s->func_purity_cache = tcc_mallocz(s->func_purity_cache_cap * sizeof(*s->func_purity_cache));
+    for (int i = 0; i < old_cap; i++)
+      if (old[i].token)
+        s->func_purity_cache[purity_slot(s, old[i].token)] = old[i];
+    tcc_free(old);
+  }
+
+  int h = purity_slot(s, func_token);
+  s->func_purity_cache[h].token = func_token;
+  s->func_purity_cache[h].purity = purity;
   s->func_purity_cache_count++;
 
   LOG_LICM("PURITY: Cached '%s' as %s", get_tok_str(func_token, NULL),
@@ -126,17 +173,20 @@ void tcc_ir_cache_func_purity(TCCState *s, int func_token, TCCFuncPurity purity)
                                           : "IMPURE");
 }
 
+void tcc_ir_reset_func_purity_cache(TCCState *s)
+{
+  tcc_free(s->func_purity_cache);
+  s->func_purity_cache = NULL;
+  s->func_purity_cache_cap = 0;
+  s->func_purity_cache_count = 0;
+}
+
 int tcc_ir_lookup_func_purity(TCCState *s, int func_token)
 {
-  if (!s || func_token < TOK_IDENT)
+  if (!s || func_token < TOK_IDENT || !s->func_purity_cache_cap)
     return -1;
-
-  for (int i = 0; i < s->func_purity_cache_count; i++)
-  {
-    if (s->func_purity_cache[i].token == func_token)
-      return s->func_purity_cache[i].purity;
-  }
-  return -1;
+  int h = purity_slot(s, func_token);
+  return s->func_purity_cache[h].token ? s->func_purity_cache[h].purity : -1;
 }
 
 /* Conservative: 0 for any address we cannot prove is stack/param */
@@ -159,9 +209,18 @@ static int is_stack_or_param_addr(TCCIRState *ir, IROperand op)
   return 0;
 }
 
+/* A source operand that reads memory other than the function's own frame. */
+static int reads_outside_frame(IROperand op)
+{
+  return op.is_lval && !op.is_llocal && irop_get_tag(op) != IROP_TAG_STACKOFF;
+}
+
 TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
 {
   if (!ir || !func_sym)
+    return TCC_FUNC_PURITY_IMPURE;
+  /* A weak body may be replaced by one with other effects. */
+  if (func_sym->a.weak)
     return TCC_FUNC_PURITY_IMPURE;
 
   const char *func_name = get_tok_str(func_sym->v, NULL);
@@ -171,6 +230,16 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
+
+    if (ir_q_hazards(ir, q, IR_HZ_VOLATILE))
+    {
+      LOG_LICM("PURITY: Function '%s' is IMPURE: volatile access", func_name);
+      return TCC_FUNC_PURITY_IMPURE;
+    }
+    /* A read folded into a non-LOAD operand (CMP/ADD ... DEREF) still depends on memory. */
+    if ((irop_config[q->op].has_src1 && reads_outside_frame(tcc_ir_op_get_src1(ir, q))) ||
+        (irop_config[q->op].has_src2 && reads_outside_frame(tcc_ir_op_get_src2(ir, q))))
+      is_const = 0;
 
     switch (q->op)
     {
@@ -203,22 +272,15 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_FUNCCALLVOID:
       {
-        IROperand src1 = tcc_ir_op_get_src1(ir, q);
-        Sym *callee = irop_get_sym_ex(ir, src1);
+        Sym *callee = tcc_ir_op_src1_sym(ir, q);
         if (callee)
         {
-          /* table/attributes only, never the cache: avoids infinite recursion */
+          /* table and attributes, then the cache of compiled bodies (a lookup,
+           * never a recursive inference) */
           int callee_purity = TCC_FUNC_PURITY_UNKNOWN;
 
           const char *callee_name = get_tok_str(callee->v, NULL);
-          for (size_t j = 0; j < sizeof(pure_func_table) / sizeof(pure_func_table[0]); j++)
-          {
-            if (strcmp(callee_name, pure_func_table[j].name) == 0)
-            {
-              callee_purity = pure_func_table[j].purity;
-              break;
-            }
-          }
+          callee_purity = pure_table_lookup(callee_name);
 
           /* soft-float / 64-bit AEABI helpers compute from their arguments
            * alone, so a function is not made impure by calling one */
@@ -238,6 +300,19 @@ TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState *ir, Sym *func_sym)
               callee_purity = TCC_FUNC_PURITY_CONST;
             else if (func_pure)
               callee_purity = TCC_FUNC_PURITY_PURE;
+          }
+
+          /* A same-TU callee already compiled has its own verdict cached.
+           * Statics are generated callees first, so `size()` calling a
+           * sentinel scan is PURE like the scan.  A callee still being
+           * compiled (recursion) or not yet compiled has no entry and keeps
+           * this function IMPURE. */
+          if (callee_purity == TCC_FUNC_PURITY_UNKNOWN && !callee->a.weak &&
+              !tcc_ir_opt_pass_disabled("purity:transitive"))
+          {
+            int cached = tcc_ir_lookup_func_purity(tcc_state, callee->v);
+            if (cached >= TCC_FUNC_PURITY_PURE)
+              callee_purity = cached;
           }
 
           if (callee_purity == TCC_FUNC_PURITY_IMPURE || callee_purity == TCC_FUNC_PURITY_UNKNOWN)
@@ -321,12 +396,12 @@ int tcc_ir_get_func_purity(TCCIRState *ir, Sym *sym)
 
   LOG_LICM("Checking purity for function '%s': func_pure=%d, func_const=%d", func_name, func_pure, func_const);
 
-  for (size_t i = 0; i < NUM_PURE_FUNCS; i++)
   {
-    if (strcmp(func_name, pure_func_table[i].name) == 0)
+    int table_purity = pure_table_lookup(func_name);
+    if (table_purity != TCC_FUNC_PURITY_UNKNOWN)
     {
-      LOG_LICM("Found '%s' in pure function table with purity=%d", func_name, pure_func_table[i].purity);
-      return pure_func_table[i].purity;
+      LOG_LICM("Found '%s' in pure function table with purity=%d", func_name, table_purity);
+      return table_purity;
     }
   }
 

@@ -36,9 +36,8 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP) continue;
     if (!irop_config[q->op].has_dest) continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (d.is_lval) continue;
-    int32_t v = irop_get_vreg(d);
+    if (tcc_ir_op_dest_is_lval(ir, q)) continue;
+    int32_t v = tcc_ir_op_dest_vreg(ir, q);
     if (v < 0 || TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_TEMP) continue;
     int pos = TCCIR_DECODE_VREG_POSITION(v);
     if (pos > max_tmp) max_tmp = pos;
@@ -58,9 +57,8 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
     int op = q->op;
 
     if (irop_config[op].has_dest) {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!d.is_lval) {
-        int32_t v = irop_get_vreg(d);
+      if (!tcc_ir_op_dest_is_lval(ir, q)) {
+        int32_t v = tcc_ir_op_dest_vreg(ir, q);
         if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
           int pos = TCCIR_DECODE_VREG_POSITION(v);
           if (pos <= max_tmp) {
@@ -71,7 +69,7 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
         }
       } else if (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED ||
                  op == TCCIR_OP_STORE_POSTINC) {
-        int32_t v = irop_get_vreg(d);
+        int32_t v = tcc_ir_op_dest_vreg(ir, q);
         if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
           int pos = TCCIR_DECODE_VREG_POSITION(v);
           if (pos <= max_tmp) use_count[pos]++;
@@ -79,16 +77,14 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
       }
     }
     if (irop_config[op].has_src1) {
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      int32_t v = irop_get_vreg(s);
+      int32_t v = tcc_ir_op_src1_vreg(ir, q);
       if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
         int pos = TCCIR_DECODE_VREG_POSITION(v);
         if (pos <= max_tmp) use_count[pos]++;
       }
     }
     if (irop_config[op].has_src2) {
-      IROperand s = tcc_ir_op_get_src2(ir, q);
-      int32_t v = irop_get_vreg(s);
+      int32_t v = tcc_ir_op_src2_vreg(ir, q);
       if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
         int pos = TCCIR_DECODE_VREG_POSITION(v);
         if (pos <= max_tmp) use_count[pos]++;
@@ -147,7 +143,7 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
 
     /* btype must match across the whole chain: a width difference changes ASSIGN's implicit widen/narrow (e.g. ZEXT of a 32-bit const into a 64-bit register pair). */
     int u_dest_bt = irop_get_btype(u_dest);
-    int def_dest_bt = irop_get_btype(tcc_ir_op_get_dest(ir, def_q));
+    int def_dest_bt = tcc_ir_op_dest_btype(ir, def_q);
     int def_src_bt = irop_get_btype(def_src);
     if (u_dest_bt != def_dest_bt || u_dest_bt != def_src_bt)
       continue;
@@ -168,16 +164,13 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
       IRQuadCompact *kq = &ir->compact_instructions[k];
       if (kq->op == TCCIR_OP_NOP) continue;
       if (irop_config[kq->op].has_dest) {
-        IROperand kd = tcc_ir_op_get_dest(ir, kq);
-        if (!kd.is_lval && irop_get_vreg(kd) == u_dest_vr) { conflict = 1; break; }
+        if (!tcc_ir_op_dest_is_lval(ir, kq) && tcc_ir_op_dest_vreg(ir, kq) == u_dest_vr) { conflict = 1; break; }
       }
       if (irop_config[kq->op].has_src1) {
-        IROperand ks = tcc_ir_op_get_src1(ir, kq);
-        if (irop_get_vreg(ks) == u_dest_vr) { conflict = 1; break; }
+        if (tcc_ir_op_src1_vreg(ir, kq) == u_dest_vr) { conflict = 1; break; }
       }
       if (irop_config[kq->op].has_src2) {
-        IROperand ks = tcc_ir_op_get_src2(ir, kq);
-        if (irop_get_vreg(ks) == u_dest_vr) { conflict = 1; break; }
+        if (tcc_ir_op_src2_vreg(ir, kq) == u_dest_vr) { conflict = 1; break; }
       }
     }
     if (conflict) continue;

@@ -219,7 +219,7 @@ static int gdcse_apply(TCCIRState *ir, GDCseEntry *e)
     return 0;
 
   IRQuadCompact *fq = &ir->compact_instructions[first];
-  IROperand read = e->use_src2[0] ? tcc_ir_op_get_src2(ir, fq) : tcc_ir_op_get_src1(ir, fq);
+  IROperand read = tcc_ir_op_get_src1_or_2(ir, fq, e->use_src2[0]);
 
   int32_t vreg = tcc_ir_vreg_alloc_temp(ir);
   if (vreg < 0)

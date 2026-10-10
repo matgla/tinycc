@@ -16,9 +16,8 @@ struct IRLoops;
 struct IROptCtx;
 struct Sym;
 
-/* Each pass has a plain (TCCIRState *) form wrapping the pipeline _ex (IROptCtx *) form. */
+/* Pipeline tables dispatch these TCCIRState* passes directly (IROptPass.takes_ir). */
 int tcc_ir_opt_dce(struct TCCIRState *ir);
-int tcc_ir_opt_dce_ex(struct IROptCtx *ctx);
 
 /* 1 if the callee never returns (noreturn attr or abort/exit/_Exit/quick_exit). */
 int tcc_ir_callee_is_noreturn(struct Sym *callee);
@@ -29,39 +28,30 @@ int tcc_ir_opt_compact_nops_ex(struct IROptCtx *ctx);
 
 /* NOPs the whole body when nothing is observable (no STORE/CALL/RETURNVALUE/volatile read). */
 int tcc_ir_opt_useless_function_body(struct TCCIRState *ir);
-int tcc_ir_opt_useless_function_body_ex(struct IROptCtx *ctx);
 
 /* No RETURN anywhere and no calls/asm/volatile/setjmp/trap -> collapse body to `b .`. */
 int tcc_ir_opt_noreturn_collapse(struct TCCIRState *ir);
-int tcc_ir_opt_noreturn_collapse_ex(struct IROptCtx *ctx);
 
 /* Collapses infinite loops with no externally-observable side effects to self-jumps. */
 int tcc_ir_opt_infinite_loop_simplify(struct TCCIRState *ir);
-int tcc_ir_opt_infinite_loop_simplify_ex(struct IROptCtx *ctx);
 
 /* Stores preceding a side-effect-free infinite loop are unobservable: reroute entry edges to the loop sink. */
 int tcc_ir_opt_dead_before_infinite_loop(struct TCCIRState *ir);
-int tcc_ir_opt_dead_before_infinite_loop_ex(struct IROptCtx *ctx);
 
 /* Lone-TRAP body: resets dirty_registers/leaffunc/noreturn/need_frame_pointer; caller must reset `loc`. */
 int tcc_ir_opt_trap_only_body_suppress(struct TCCIRState *ir);
-int tcc_ir_opt_trap_only_body_suppress_ex(struct IROptCtx *ctx);
 
 /* NOPs VLA_ALLOCs with compile-time 0 size plus their VLA_SP_SAVE/RESTORE pair when SP is untouched between. */
 int tcc_ir_opt_zero_vla_elim(struct TCCIRState *ir);
-int tcc_ir_opt_zero_vla_elim_ex(struct IROptCtx *ctx);
 
 /* NOPs a VLA whose base pointer only feeds STORE destinations (never loaded, never escaping). */
 int tcc_ir_opt_dead_vla_struct_elim(struct TCCIRState *ir);
-int tcc_ir_opt_dead_vla_struct_elim_ex(struct IROptCtx *ctx);
 
 /* Retargets VLA_SP_SAVE from a slot to the immediately reloading LOAD's vreg (one `mov vreg, sp`). */
 int tcc_ir_opt_alloca_load_fwd(struct TCCIRState *ir);
-int tcc_ir_opt_alloca_load_fwd_ex(struct IROptCtx *ctx);
 
 /* Companion to dead_vla_struct_elim for the VREG-target VLA_SP_SAVE shape alloca_load_fwd produces. */
 int tcc_ir_opt_dead_alloca_vreg_elim(struct TCCIRState *ir);
-int tcc_ir_opt_dead_alloca_vreg_elim_ex(struct IROptCtx *ctx);
 
 /* Unconditional self-call before any return path never returns: collapse body to `b .`. */
 int tcc_ir_opt_infinite_self_recursion(struct TCCIRState *ir, struct Sym *func_sym);
@@ -70,7 +60,6 @@ int tcc_ir_opt_infinite_self_recursion(struct TCCIRState *ir, struct Sym *func_s
 int tcc_ir_opt_noreturn_call_epilogue_suppress(struct TCCIRState *ir);
 
 int tcc_ir_opt_dse(struct TCCIRState *ir);
-int tcc_ir_opt_dse_ex(struct IROptCtx *ctx);
 
 int tcc_ir_opt_dead_addrvar_elim(struct TCCIRState *ir);
 int tcc_ir_opt_dead_var_store_elim(struct TCCIRState *ir);
@@ -114,7 +103,6 @@ int tcc_ir_opt_var_to_tmp(struct TCCIRState *ir);
 
 /* Drops the redundant per-parameter local an inline expansion creates (Vpar = Vsrc copy). */
 int tcc_ir_opt_inline_param_copy_elim(struct TCCIRState *ir);
-int tcc_ir_opt_inline_param_copy_elim_ex(struct IROptCtx *ctx);
 
 int tcc_ir_opt_add_reassoc(struct TCCIRState *ir);
 
@@ -183,14 +171,12 @@ int tcc_ir_opt_reroll(struct TCCIRState *ir);
 
 /* `((V<<n) | low) >> n` -> V when low < 2^n and V < 2^(32-n). */
 int tcc_ir_opt_bitfield_insert_extract(struct TCCIRState *ir);
-int tcc_ir_opt_bitfield_insert_extract_ex(struct IROptCtx *ctx);
 
 /* (W & ~field) | (V << lsb) -> BFI; must run before barrel_shift_fusion; records lsb/width in ir->bfi_params[orig_index]. */
 int tcc_ir_opt_bitfield_insert_to_bfi(struct TCCIRState *ir);
 
 /* Run of `a.fi != b.fi` bitfield compares to one label -> one masked word XOR compare; must precede shift-into-CMP fusion. */
 int tcc_ir_opt_cmp_field_fuse(struct TCCIRState *ir);
-int tcc_ir_opt_cmp_field_fuse_ex(struct IROptCtx *ctx);
 
 int tcc_ir_opt_sl_forward(struct TCCIRState *ir);
 
@@ -200,15 +186,21 @@ int tcc_ir_opt_addrof_var_fwd(struct TCCIRState *ir);
 /* Rewrites derefs through single-def entry-block `P = &V` pointer VARs (and their TEMP copies) to direct V accesses. */
 int tcc_ir_opt_ptr_local_fwd(struct TCCIRState *ir);
 int tcc_ir_opt_param_copy_alias(struct TCCIRState *ir);
-int tcc_ir_opt_param_copy_alias_ex(struct IROptCtx *ctx);
+/* Small by-value struct args built from word stores in a slot become one scalar PARAM per word (ra:struct_arg_split). */
+int tcc_ir_opt_struct_arg_split(struct TCCIRState *ir);
 int tcc_ir_opt_slot_const_store_fold(struct TCCIRState *ir);
-int tcc_ir_opt_slot_const_store_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_sra(struct TCCIRState *ir);
 /* Word reads of a by-value struct parameter's frame home become the parameter's vreg. */
 int tcc_ir_opt_param_home_fwd(struct TCCIRState *ir);
 /* Build a struct returned through the hidden sret pointer in the caller's buffer. */
 int tcc_ir_opt_sret_nrvo(struct TCCIRState *ir);
-int tcc_ir_opt_ptr_local_fwd_ex(struct IROptCtx *ctx);
+void tcc_ir_analyze_param_nocapture(struct TCCIRState *ir, struct Sym *sym);
+/* The caller side of that: a struct-return buffer the callee could reach any
+ * other way (a destination whose address escapes, or only a pointer) becomes
+ * a fresh temporary copied out after the call.  Every optimization level. */
+int tcc_ir_sret_dealias(struct TCCIRState *ir);
+/* Does an address into frame bytes [lo, hi) escape (sret_nrvo.c)? */
+int tcc_ir_frame_range_escapes(struct TCCIRState *ir, int lo, int hi);
 
 /* Forwards a load of a copied local field (`x=G; ... x.field`) to the source global `G.field`. */
 int tcc_ir_opt_copy_source_load_fwd(struct TCCIRState *ir);
@@ -218,7 +210,6 @@ int tcc_ir_opt_global_sl_fwd(struct TCCIRState *ir);
 
 /* Cross-BB CSE of global ASSIGN/LOAD; requires forward-only control flow and no aliasing stores. */
 int tcc_ir_opt_invariant_global_load_hoist(struct TCCIRState *ir);
-int tcc_ir_opt_invariant_global_load_hoist_ex(struct IROptCtx *ctx);
 
 /* CSEs a global lvalue operand read >1 time in one straight-line clobber-free region into a single ASSIGN. */
 int tcc_ir_opt_global_deref_cse(struct TCCIRState *ir);
@@ -266,18 +257,14 @@ void tcc_ir_tu_propagate_noreturn_to_callers(void);
 
 /* NOPs stores to statics the end-of-TU analysis confirmed have no reachable readers. */
 int tcc_ir_opt_dead_static_store_elim(struct TCCIRState *ir);
-int tcc_ir_opt_dead_static_store_elim_ex(struct IROptCtx *ctx);
 
 /* Merges STORE clusters to same-section globals into one LEA + STORE_INDEXED, dropping per-store literal loads. */
 int tcc_ir_opt_global_base_share(struct TCCIRState *ir);
-int tcc_ir_opt_global_base_share_ex(struct IROptCtx *ctx);
 
 /* Kills stack-slot stores whose bytes a later CALL's callee write summary fully overwrites. */
 int tcc_ir_opt_dead_init_via_call(struct TCCIRState *ir);
 int tcc_ir_opt_dead_local_slot_elim(struct TCCIRState *ir);
-int tcc_ir_opt_dead_local_slot_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_dead_temp_local_elim(struct TCCIRState *ir);
-int tcc_ir_opt_dead_temp_local_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_call_chain_rename(struct TCCIRState *ir);
 int tcc_ir_opt_stackoff_addr_cse(struct TCCIRState *ir);
 /* Late variant (run from regalloc, after alias-sensitive passes): park the
@@ -293,11 +280,15 @@ int tcc_ir_opt_stack_addr_cse(struct TCCIRState *ir);
 int tcc_ir_opt_entry_store_prop(struct TCCIRState *ir);
 int tcc_ir_opt_redundant_loop_check(struct TCCIRState *ir);
 int tcc_ir_opt_jump_threading(struct TCCIRState *ir);
+/* Post-regalloc form: may also retarget a JUMPIF backward (see jump_thread.c). */
+int tcc_ir_opt_jump_threading_post_ra(struct TCCIRState *ir);
 int tcc_ir_opt_bool_diamond_branch(struct TCCIRState *ir);
 int tcc_ir_opt_orphan_cmp_elim(struct TCCIRState *ir);
+int tcc_ir_opt_orphan_cmp_elim_ex(struct TCCIRState *ir, void (*nop)(void *, int), void *opaque);
 
 /* `JUMPIF C -> A; JUMP -> B` -> `JUMPIF !C -> B`; allow_backward=0 pre-RA keeps rotation's body->latch JUMP intact. */
 int tcc_ir_opt_jumpif_invert(struct TCCIRState *ir, int allow_backward);
+int tcc_ir_opt_switch_head(struct TCCIRState *ir);
 
 /* Replaces the memset(0)+stores pattern with a BLOCK_COPY from rodata. */
 int tcc_ir_opt_block_copy_init(struct TCCIRState *ir);
@@ -336,71 +327,26 @@ int tcc_ir_opt_backedge_phi_hoist(struct TCCIRState *ir);
 /* Post-RA: per noreturn callee keep the first guarded call as a shared sink and retarget later guards to it; TCC_NO_ABORT_MERGE disables. */
 int tcc_ir_opt_abort_tail_merge(struct TCCIRState *ir);
 
-int tcc_ir_opt_const_prop_tmp_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_known_bits_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_dead_lea_store_elim_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_const_aggregate_fold_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_const_var_prop_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_global_init_prop_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_symref_const_prop_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_value_tracking_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_add_reassoc_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_cmp_stack_addr_fold_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_cmp_expr_fold_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_cmp_xor_cancel_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_const_string_calls_ex(struct IROptCtx *ctx);
-int ssa_const_string_fold_flat_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_mem_inline(struct TCCIRState *ir);
-int tcc_ir_opt_mem_inline_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_setif_branch_fuse_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_stack_bool_diamond_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_pack64_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_pack64_tautology_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_pack64_from_stack_stores_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_cmp_narrow_64_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_cmp_hi_only_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_cmp_imm_swap_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_and64_narrow_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_sl_forward_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_entry_store_prop_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_assign_fuse_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_var_to_tmp_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_switch_to_data_ex(struct IROptCtx *ctx);
+int tcc_ir_opt_escape_copy_call(struct TCCIRState *ir);
 int tcc_ir_opt_switch_to_data(struct TCCIRState *ir);
-int tcc_ir_opt_switch_collapse_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_switch_collapse(struct TCCIRState *ir);
-int tcc_ir_opt_redundant_loop_check_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_eliminate_fallthrough_ex(struct IROptCtx *ctx);
 /* Branches whose one side can only run into __builtin_unreachable fold to the other side. */
 int tcc_ir_opt_unreachable_fold(struct TCCIRState *ir);
-int tcc_ir_opt_unreachable_fold_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_uninit_local_ub(struct TCCIRState *ir);
-int tcc_ir_opt_uninit_local_ub_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_uninit_dominates_return(struct TCCIRState *ir);
-int tcc_ir_opt_uninit_dominates_return_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_ub_only_body_elide(struct TCCIRState *ir);
-int tcc_ir_opt_ub_only_body_elide_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_local_only_body_elide(struct TCCIRState *ir);
-int tcc_ir_opt_local_only_body_elide_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_return_uninit_elide(struct TCCIRState *ir);
-int tcc_ir_opt_const_return_uninit_elide_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_null_store_dom_return(struct TCCIRState *ir);
-int tcc_ir_opt_null_store_dom_return_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_redundant_var_assign_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_dead_var_store_elim_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_dead_addrvar_elim_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_rmw_byte_clear(struct TCCIRState *ir);
 int tcc_ir_opt_byte_store_merge(struct TCCIRState *ir);
-int tcc_ir_opt_byte_store_merge_ex(struct IROptCtx *ctx);
 int tcc_ir_opt_const_memcpy_to_dest(struct TCCIRState *ir);
-int tcc_ir_opt_const_memcpy_to_dest_ex(struct IROptCtx *ctx);
 /* Drops a `memmove(B,A,N); memmove(A,B,N)` pair where B is a dead round-trip temp and A is unmodified between. */
 int tcc_ir_opt_struct_copy_roundtrip_elim(struct TCCIRState *ir);
 /* `memmove(local, &global, N)` into a private read-only slot: reads the global directly and drops the copy. */
 int tcc_ir_opt_memmove_global_load_fwd(struct TCCIRState *ir);
-int tcc_ir_opt_addrof_var_fwd_ex(struct IROptCtx *ctx);
-int tcc_ir_opt_global_sl_fwd_ex(struct IROptCtx *ctx);
 
 void tcc_ir_opt_fp_cache_init(struct TCCIRState *ir);
 
@@ -418,6 +364,25 @@ void tcc_ir_opt_fp_cache_invalidate_reg(struct TCCIRState *ir, int phys_reg);
 int tcc_ir_find_defining_instruction(struct TCCIRState *ir, int32_t vreg, int before_idx);
 
 int tcc_ir_vreg_has_single_use(struct TCCIRState *ir, int32_t vreg, int exclude_idx);
+
+/* The vreg index: while open, the def/use queries above (and
+ * tcc_ir_vreg_has_single_def/_multi_def) read per-vreg counts built in one
+ * walk instead of scanning the function per query.  The counts describe the
+ * IR as it was when built, so the opener MUST keep them in step with every
+ * change to the IR: an instruction changed in place (op or operands) is
+ * bracketed by tcc_ir_vreg_index_unnote(i) before and _note(i) after; any
+ * other change (inserted or removed instructions, changes made by helpers)
+ * calls tcc_ir_vreg_index_dirty, and the next queries rebuild.  open returns
+ * 1 when this call opened it (pass that to close); a nested open shares the
+ * outer one. */
+int tcc_ir_vreg_index_open(struct TCCIRState *ir);
+void tcc_ir_vreg_index_dirty(struct TCCIRState *ir);
+void tcc_ir_vreg_index_unnote(struct TCCIRState *ir, int idx);
+void tcc_ir_vreg_index_note(struct TCCIRState *ir, int idx);
+void tcc_ir_vreg_index_close(struct TCCIRState *ir, int opened);
+/* Defs of vreg (non-NOP instructions naming it as dest); -1 when no index is
+ * open or it cannot answer for vreg. */
+int tcc_ir_vreg_index_defs(struct TCCIRState *ir, int32_t vreg);
 
 /* Post-RA: 1 when graph coalescing merged `vreg` into a class.  The copies
  * between the members were erased, so the members' register is also read

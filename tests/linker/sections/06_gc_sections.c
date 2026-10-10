@@ -14,9 +14,12 @@ static int gc_addr_taken(int x) { return x * 3 + 1; }
 
 static int (*gc_table[1])(int) = {gc_addr_taken};
 
-/* Unreferenced but default-visibility global: a runtime root (other yasld
- * modules may resolve it), must survive without any witnessing reloc. */
-int gc_exported_unused(int x) { return x + 100; }
+/* Unreferenced but default-visibility global: exported by a shared library
+ * (other yasld modules may resolve it with no witnessing reloc), so a -shared
+ * link keeps it; an executable exports only what a loaded library names, so
+ * there it is collected.  Explicit, because the suite builds with
+ * -fvisibility=hidden. */
+__attribute__((visibility("default"))) int gc_exported_unused(int x) { return x + 100; }
 
 /* Hidden global, unreferenced: invisible outside the image, collectable. */
 __attribute__((visibility("hidden"))) int gc_hidden_unused(int x) { return x - 7; }

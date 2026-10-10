@@ -26,7 +26,7 @@ int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir)
   int n = ir->next_instruction_index;
   if (n < 3)
     return 0;
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
 
   IRLoops *loops = tcc_ir_detect_loops(ir);
@@ -98,8 +98,7 @@ int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir)
 
       if (q->op == TCCIR_OP_JUMPIF)
       {
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        int target = (int)dest.u.imm32;
+        int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
         if (target < loop->start_idx || target > loop->end_idx)
         {
           is_infinite = 0;
@@ -108,8 +107,7 @@ int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir)
       }
       if (q->op == TCCIR_OP_JUMP)
       {
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        int target = (int)dest.u.imm32;
+        int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
         if (target == loop->header_idx)
           back_edge_idx = idx;
         else if (target < loop->start_idx || target > loop->end_idx)
@@ -158,8 +156,7 @@ int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir)
               {
                 if (irop_config[lq->op].has_src1)
                 {
-                  IROperand s1 = tcc_ir_op_get_src1(ir, lq);
-                  if (!s1.is_lval && irop_get_vreg(s1) == dest_vr)
+                  if (!tcc_ir_op_src1_is_lval(ir, lq) && tcc_ir_op_src1_vreg(ir, lq) == dest_vr)
                   {
                     for (int bk = 0; bk < loop->num_body_instrs; bk++)
                     {
@@ -227,12 +224,10 @@ int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir)
               continue;
             if (!irop_config[dq->op].has_dest)
               continue;
-            IROperand dd = tcc_ir_op_get_dest(ir, dq);
-            if (irop_get_vreg(dd) != val_vr)
+            if (tcc_ir_op_dest_vreg(ir, dq) != val_vr)
               continue;
             IROperand ds1 = tcc_ir_op_get_src1(ir, dq);
-            IROperand ds2 = tcc_ir_op_get_src2(ir, dq);
-            if (ds1.is_sym && ds1.is_lval && irop_is_immediate(ds2) && !ds2.is_sym)
+            if (ds1.is_sym && ds1.is_lval && tcc_ir_op_src2_is_imm(ir, dq) && !tcc_ir_op_src2_is_sym(ir, dq))
             {
               IRPoolSymref *dsr = irop_get_symref_ex(ir, ds1);
               if (dsr && dsr->sym == sr->sym && dsr->addend == sr->addend)
@@ -310,8 +305,8 @@ int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir)
     ir->compact_instructions[loop->header_idx].is_jump_target = 1;
     IROperand self = irop_make_imm32(-1, loop->header_idx, IROP_BTYPE_INT32);
     tcc_ir_set_dest(ir, loop->header_idx, self);
-    tcc_ir_set_src1(ir, loop->header_idx, IROP_NONE);
-    tcc_ir_set_src2(ir, loop->header_idx, IROP_NONE);
+    tcc_ir_set_src1_none(ir, loop->header_idx);
+    tcc_ir_set_src2_none(ir, loop->header_idx);
 
     /* NOP the old back-edge if it's not the header */
     if (back_edge_idx != loop->header_idx)
@@ -323,9 +318,4 @@ int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir)
 
   tcc_ir_free_loops(loops);
   return changes;
-}
-
-int tcc_ir_opt_infinite_loop_simplify_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_infinite_loop_simplify(ctx->ir);
 }

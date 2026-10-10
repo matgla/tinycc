@@ -26,6 +26,8 @@ make cross fp-libs       # everything including floating point libraries
 
 # Run tests
 make test -j16               # IR tests (primary test suite)
+make full-test               # test + golden IR + FP hard/softfp + pass coverage + QEMU self-host fixpoint
+make test-selfhost-qemu      # just the self-host fixpoint (private an524 build, needs the YasOS checkout)
 make test-asm -j16           # Assembly instruction tests
 make test-all                # IR + GCC torture tests
 make test-gcc-torture-compile  # GCC compile-only tests
@@ -137,11 +139,20 @@ Public IR interface is `source/ir/tccir.h`.
 | `source/ir/vreg.c` | Virtual register management |
 | `source/ir/stack.c` | Stack frame layout |
 
+Backward jumps from shared return tails are not proof of a loop. Inline
+classification uses `tcc_ir_cfg_has_cycle`; `tcc_ir_cfg_flat_has_backedge` is
+only a conservative pre-scan. See [`docs/inline_control_flow.md`](docs/inline_control_flow.md).
+
 IR naming conventions:
 - Internal functions: `ir_<module>_<action>()` (static)
 - Public API (in `source/ir/tccir.h`): `tcc_ir_<action>()`
 
 ### IR Opcodes
+
+Operand meaning depends on its tag and indirection flags: `is_lval` alone
+does not distinguish a value read from its spill/home encoding and a pointer
+dereference. Use `irop_is_vreg_value` for that distinction; see
+[`docs/ir_operand_values.md`](docs/ir_operand_values.md).
 
 Defined in `tccir.h` as `TccIrOp` enum. Key opcode groups:
 - Arithmetic: `TCCIR_OP_ADD`, `SUB`, `MUL`, `DIV`

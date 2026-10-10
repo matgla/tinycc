@@ -812,7 +812,7 @@ UT_TEST(test_backedge_phi_hoist_inverts_and_hoists)
   int jif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(5), utb_imm(TOK_GE, I32), UTB_NONE); /* 1: exit=5 */
   int asg = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_temp(2, I32), UTB_NONE);  /* 2: phi copy */
   int jmp = utb_emit(ir, TCCIR_OP_JUMP, utb_jtarget(0), UTB_NONE, UTB_NONE);              /* 3: body_target=0 < i=1 */
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(3, I32), utb_temp(3, I32), utb_imm(1, I32));        /* 4: filler */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                                /* 4: exit stays the fall-through */
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32), UTB_NONE);               /* 5: exit; reads T3, not T1 */
 
   int changes = tcc_ir_opt_backedge_phi_hoist(ir);
@@ -836,6 +836,41 @@ UT_TEST(test_backedge_phi_hoist_inverts_and_hoists)
   UT_ASSERT_EQ((int)new_cond.u.imm32, TOK_LT); /* invert_condition(GE) == LT */
   IROperand new_dest = utb_dest(ir, asg);
   UT_ASSERT_EQ((int)new_dest.u.imm32, 0); /* retargeted to body_target (the old JUMP's target) */
+
+  utb_free(ir);
+  utb_ls_free(ir);
+  return 0;
+}
+
+/* NEGATIVE (guard): the exit target is NOT the fall-through after the latch
+ * JUMP -- live code sits between them (a switch's `case 2: JUMPIF ==2 -> X`
+ * jumping over the case-1 store while the default arm loops back through phi
+ * copies).  The rewritten `copies; JUMPIF != -> back` would fall through into
+ * that store on the case-2 path and lose X.  The transform must not fire. */
+UT_TEST(test_backedge_phi_hoist_exit_not_fallthrough_kept)
+{
+  TCCIRState *ir = utb_new();
+  utb_ls_new(ir);
+  utb_ls_reg(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 1), 4);
+  utb_ls_reg(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 2), 4);
+
+  int cmp = utb_emit(ir, TCCIR_OP_CMP, UTB_NONE, utb_temp(0, I32), utb_imm(2, I32));       /* 0 */
+  int jif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(6), utb_imm(TOK_EQ, I32), UTB_NONE); /* 1: case 2 -> 6 */
+  int asg = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_temp(2, I32), UTB_NONE);   /* 2: phi copy */
+  int jmp = utb_emit(ir, TCCIR_OP_JUMP, utb_jtarget(0), UTB_NONE, UTB_NONE);               /* 3: default: back edge */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                                /* 4 */
+  int st = utb_emit(ir, TCCIR_OP_ADD, utb_temp(3, I32), utb_temp(3, I32), utb_imm(1, I32)); /* 5: case 1 only */
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I32), UTB_NONE);                /* 6: X */
+
+  int changes = tcc_ir_opt_backedge_phi_hoist(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, cmp), TCCIR_OP_CMP);
+  UT_ASSERT_EQ(utb_op(ir, jif), TCCIR_OP_JUMPIF);
+  UT_ASSERT_EQ((int)utb_dest(ir, jif).u.imm32, 6);
+  UT_ASSERT_EQ(utb_op(ir, asg), TCCIR_OP_ASSIGN);
+  UT_ASSERT_EQ(utb_op(ir, jmp), TCCIR_OP_JUMP);
+  UT_ASSERT_EQ(utb_op(ir, st), TCCIR_OP_ADD);
 
   utb_free(ir);
   utb_ls_free(ir);
@@ -927,7 +962,7 @@ UT_TEST(test_backedge_phi_hoist_dead_reg_alias_still_hoists)
   int jif = utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(5), utb_imm(TOK_GE, I32), UTB_NONE); /* 1: exit=5 */
   int asg = utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_temp(2, I32), UTB_NONE);   /* 2 */
   int jmp = utb_emit(ir, TCCIR_OP_JUMP, utb_jtarget(0), UTB_NONE, UTB_NONE);               /* 3 */
-  utb_emit(ir, TCCIR_OP_ADD, utb_temp(4, I32), utb_temp(4, I32), utb_imm(1, I32));         /* 4 */
+  utb_emit(ir, TCCIR_OP_NOP, UTB_NONE, UTB_NONE, UTB_NONE);                                /* 4 */
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(4, I32), UTB_NONE);                /* 5 */
 
   int changes = tcc_ir_opt_backedge_phi_hoist(ir);

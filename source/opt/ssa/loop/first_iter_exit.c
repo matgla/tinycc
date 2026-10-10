@@ -282,8 +282,8 @@ static int ld_eval_branch(TCCIRState *ir, LdState *st, int test_idx,
 {
   IRQuadCompact *test_q = &ir->compact_instructions[test_idx];
   IRQuadCompact *jump_q = &ir->compact_instructions[jumpif_idx];
-  IROperand jcond = tcc_ir_op_get_src1(ir, jump_q);
-  int tok = (int)irop_get_imm64_ex(ir, jcond);
+  int64_t jcond_imm = tcc_ir_op_src1_imm(ir, jump_q);
+  int tok = (int)jcond_imm;
 
   if (test_q->op == TCCIR_OP_TEST_ZERO) {
     IROperand src1 = tcc_ir_op_get_src1(ir, test_q);
@@ -355,8 +355,8 @@ static void ld_nop_fallthrough_jumps(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int target = (int)irop_get_imm64_ex(ir, dest);
+    int64_t dest_imm = tcc_ir_op_dest_imm(ir, q);
+    int target = (int)dest_imm;
     int next_live = i + 1;
     while (next_live < n && ir->compact_instructions[next_live].op == TCCIR_OP_NOP)
       next_live++;
@@ -381,17 +381,8 @@ static int fie_try_candidate(TCCIRState *ir, IRCFG *cfg, int header_b,
 
   /* Header preds must be {function-entry, latch}: no jump target may sit
    * between the walked entry code and the header. */
-  if (hb->num_preds != 2)
-    return 0;
-  int latch_seen = 0, entry_pred = -1;
-  for (int i = 0; i < hb->num_preds; i++) {
-    int p = hb->preds[i];
-    if (p == latch_b && !latch_seen)
-      latch_seen = 1;
-    else
-      entry_pred = p;
-  }
-  if (!latch_seen || entry_pred < 0 || member[entry_pred])
+  int entry_pred = fie_entry_pred(hb, latch_b, member);
+  if (entry_pred < 0)
     return 0;
   if (cfg->blocks[entry_pred].start_idx != 0)
     return 0;
@@ -420,8 +411,8 @@ static int fie_try_candidate(TCCIRState *ir, IRCFG *cfg, int header_b,
     if (q->op == TCCIR_OP_JUMPIF) {
       if (test_idx < 0)
         return 0;
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)irop_get_imm64_ex(ir, dest);
+      int64_t dest_imm = tcc_ir_op_dest_imm(ir, q);
+      int target = (int)dest_imm;
       if (target < 0 || target >= cfg->num_instrs)
         return 0;
       if (member[cfg->instr_to_block[target]])
@@ -442,11 +433,15 @@ static int fie_try_candidate(TCCIRState *ir, IRCFG *cfg, int header_b,
   jump_q->op = TCCIR_OP_JUMP;
   tcc_ir_set_dest(ir, jumpif_idx, exit_dest);
 
+  /* The header code ahead of the exit test runs exactly once before the
+   * exit is taken: keep it, drop the compare and the rest of the loop. */
   for (int b = 0; b < cfg->num_blocks; b++) {
     if (!member[b])
       continue;
     for (int i = cfg->blocks[b].start_idx; i < cfg->blocks[b].end_idx; i++) {
       if (i == jumpif_idx)
+        continue;
+      if (b == header_b && i < jumpif_idx && i != test_idx)
         continue;
       ir->compact_instructions[i].op = TCCIR_OP_NOP;
     }
@@ -471,28 +466,12 @@ int ssa_opt_first_iter_exit(TCCIRState *ir)
     tcc_ir_cfg_compute_dominators(cfg);
 
     /* Dominance-verified back-edges latch->header, tried smallest-first. */
-    int cap = cfg->num_blocks;
-    FieCand *cands = tcc_mallocz(sizeof(FieCand) * (size_t)cap);
-    int nc = 0;
-    for (int b = 0; b < cfg->num_blocks && nc < cap; b++) {
-      IRBasicBlock *bb = &cfg->blocks[b];
-      for (int si = 0; si < bb->num_succs && nc < cap; si++) {
-        int h = bb->succs[si];
-        if (h < 0 || h >= cfg->num_blocks)
-          continue;
-        if (!tcc_ir_cfg_dominates(cfg, h, b))
-          continue;
-        cands[nc].header_b = h;
-        cands[nc].latch_b = b;
-        cands[nc].size = cfg->blocks[b].end_idx - cfg->blocks[h].start_idx;
-        nc++;
-      }
-    }
+    int nc;
+    FieCand *cands = fie_collect_cands(cfg, &nc);
 
     /* Stop at the first elimination: the rewrite invalidates this CFG. */
     int fired = 0;
     if (nc > 0) {
-      qsort(cands, nc, sizeof(FieCand), fie_cand_cmp);
       uint8_t *member = tcc_malloc((size_t)cfg->num_blocks);
       for (int i = 0; i < nc && !fired; i++)
         fired = fie_try_candidate(ir, cfg, cands[i].header_b,

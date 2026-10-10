@@ -195,7 +195,7 @@ static int tcc_output_binary(TCCState *s1, FILE *f)
 /* Write an elf, coff or "binary" file */
 static int tcc_write_elf_file(TCCState *s1, const char *filename, int phnum, ElfW(Phdr) * phdr)
 {
-  int fd, mode, file_type, ret;
+  int fd, mode, file_type, ret = 0;
   FILE *f;
 
   file_type = s1->output_type;
@@ -224,6 +224,10 @@ static int tcc_write_elf_file(TCCState *s1, const char *filename, int phnum, Elf
   else
     ret = tcc_output_binary(s1, f);
   fclose(f);
+  /* A writer that reported errors left a half-valid image; never leave it
+     where a build would install it. */
+  if (ret < 0 || (ret && s1->nb_errors))
+    unlink(filename);
 
   return ret;
 }
@@ -375,10 +379,34 @@ static Section *create_bsd_note_section(TCCState *s1, const char *name, const ch
 
 static void alloc_sec_names(TCCState *s1, int is_obj);
 
+/* Sections --gc-sections always keeps by name: init/fini arrays and the
+ * linker's own special sections.  Dispatches on the second character so the
+ * hundreds of .text../.data../.rel... inputs of a link are rejected at once. */
+static int gc_root_section_name(const char *name)
+{
+  static const char *const roots[] = {".init", ".fini", ".init_array", ".fini_array", ".preinit_array", ".ctors",
+                                      ".dtors", ".got", ".got.plt", ".plt", ".interp", ".eh_frame",
+                                      ".eh_frame_hdr", ".ARM.attributes", ".ARM.exidx"};
+  size_t k;
+  if (name[0] != '.')
+    return 0;
+  switch (name[1])
+  {
+  case 'i': case 'f': case 'p': case 'c': case 'd': case 'g': case 'e': case 'A':
+    break;
+  default:
+    return 0;
+  }
+  for (k = 0; k < sizeof roots / sizeof roots[0]; k++)
+    if (roots[k][1] == name[1] && !strcmp(name, roots[k]))
+      return 1;
+  return 0;
+}
+
 /* --gc-sections implementation: remove unused sections */
 void gc_sections(TCCState *s1)
 {
-  int i, sym_index, changed;
+  int i, sym_index;
   Section *s, *sr;
   ElfW(Sym) * sym, *symtab;
   ElfW_Rel *rel;
@@ -404,20 +432,30 @@ void gc_sections(TCCState *s1)
       continue;
     }
     /* Keep init/fini arrays and special sections */
-    if (!strcmp(s->name, ".init") || !strcmp(s->name, ".fini") || !strcmp(s->name, ".init_array") ||
-        !strcmp(s->name, ".fini_array") || !strcmp(s->name, ".preinit_array") || !strcmp(s->name, ".ctors") ||
-        !strcmp(s->name, ".dtors") || !strcmp(s->name, ".got") || !strcmp(s->name, ".got.plt") ||
-        !strcmp(s->name, ".plt") || !strcmp(s->name, ".interp") || !strcmp(s->name, ".eh_frame") ||
-        !strcmp(s->name, ".eh_frame_hdr") || !strcmp(s->name, ".ARM.attributes") || !strcmp(s->name, ".ARM.exidx"))
+    if (gc_root_section_name(s->name))
     {
       sec_used[i] = 1;
       continue;
     }
     /* Keep sections marked with KEEP() in linker script */
-    if (s1->ld_script && ld_section_should_keep(s1->ld_script, s->name))
+    if (s1->ld_script)
     {
-      sec_used[i] = 1;
-      continue;
+      /* A per-object section the loader renamed "<name>..<n>" is matched
+       * by the name the object gave it. */
+      const char *cut = strstr(s->name, "..");
+      const char *match = s->name;
+      char orig[256];
+      if (cut && (size_t)(cut - s->name) < sizeof orig)
+      {
+        memcpy(orig, s->name, cut - s->name);
+        orig[cut - s->name] = 0;
+        match = orig;
+      }
+      if (ld_section_should_keep(s1->ld_script, match))
+      {
+        sec_used[i] = 1;
+        continue;
+      }
     }
     /* Keep debug sections if debugging enabled */
     if (s1->do_debug && !strncmp(s->name, ".debug", 6))
@@ -461,66 +499,91 @@ void gc_sections(TCCState *s1)
       continue;
     }
     /* Mark global/weak symbols that are exported */
-    if (s1->rdynamic && ELFW(ST_BIND)(sym->st_info) != STB_LOCAL)
+    if (s1->rdynamic && ELFW(ST_BIND)(sym->st_info) != STB_LOCAL && !elf_sym_is_module_local(sym))
     {
       sec_used[sym->st_shndx] = 1;
       continue;
     }
-    /* Exported symbols are runtime roots regardless of -rdynamic: under
-     * -fvisibility=hidden the dynamic-symbol set is exactly the defined
-     * GLOBAL/WEAK symbols with default visibility, and other yasld modules
-     * resolve against them at runtime with no relocation in this image to
-     * witness the use.  Collecting one would leave a .dynsym entry pointing
-     * at reclaimed bytes -- a silent wrong-address at runtime, not a link
-     * error.  Hidden globals and statics stay collectable. */
-    if (ELFW(ST_BIND)(sym->st_info) != STB_LOCAL && ELFW(ST_VISIBILITY)(sym->st_other) == STV_DEFAULT)
+    /* Exported symbols are runtime roots: other yasld modules resolve
+     * against them with no relocation in this image to witness the use.
+     * Collecting one would leave a .dynsym entry pointing at reclaimed
+     * bytes -- a silent wrong-address at runtime, not a link error.  The
+     * root set is exactly what gets exported: a shared library exports
+     * every global that is not hidden or internal (export_global_syms), an
+     * executable only the globals a loaded library names
+     * (bind_libs_dynsyms; all of them under -rdynamic, rooted above).
+     * Rooting every global of an executable too pinned all of tcc, whose
+     * globals were all STV_DEFAULT before -fvisibility=hidden worked, and
+     * --gc-sections dropped 7.5 KB of the 850 KB that is unreachable from
+     * main.  Hidden globals and statics stay collectable.  A -static link
+     * has no .dynsym and nothing resolving against it later (the kernel),
+     * so there every unreferenced function is collectable. */
+    if (!s1->static_link && ELFW(ST_BIND)(sym->st_info) != STB_LOCAL && !elf_sym_is_module_local(sym) &&
+        (!(s1->output_type & TCC_OUTPUT_EXE) || tcc_dynsym_find(s1, name)))
     {
       sec_used[sym->st_shndx] = 1;
       continue;
     }
   }
 
-  /* Iteratively mark sections referenced by relocations from used sections */
-  do
+  /* Mark everything reachable through relocations from used sections: a
+   * worklist of newly used sections, each scanning only the relocation
+   * sections that apply to it (one pass over every relocation in total;
+   * repeated full passes until nothing changed reach the same set). */
   {
-    changed = 0;
-    for (i = 1; i < s1->nb_sections; i++)
+    int nb = s1->nb_sections, top = 0;
+    int *rel_head = tcc_malloc(nb * sizeof(int)); /* section -> first RELX section applying to it */
+    int *rel_next = tcc_malloc(nb * sizeof(int));
+    int *work = tcc_malloc(nb * sizeof(int));
+    for (i = 0; i < nb; i++)
+      rel_head[i] = -1;
+    for (i = nb - 1; i >= 1; i--)
     {
       sr = s1->sections[i];
-      if (!sr || sr->sh_type != SHT_RELX)
+      if (!sr || sr->sh_type != SHT_RELX || sr->sh_info >= (unsigned)nb)
         continue;
-      /* Get the section this relocation applies to */
-      s = s1->sections[sr->sh_info];
-      if (!s || !sec_used[sr->sh_info])
-        continue;
+      rel_next[i] = rel_head[sr->sh_info];
+      rel_head[sr->sh_info] = i;
+    }
+    for (i = 1; i < nb; i++)
+      if (sec_used[i])
+        work[top++] = i;
+    while (top > 0)
+    {
+      int t = work[--top], r;
+      s = s1->sections[t];
       /* References from non-allocated sections must not confer liveness:
        * DWARF describes every function (each .text.<name> is referenced by
        * .rel.debug_info via its section symbol), so following these would
        * pin the whole program and -g would silently disable GC.  Dropped
        * targets get the SHN_ABS tombstone in the sweep instead, which is
        * how debug info for collected code is conventionally marked. */
-      if (!(s->sh_flags & SHF_ALLOC))
+      if (!s || !(s->sh_flags & SHF_ALLOC))
         continue;
-
-      /* Iterate through relocations */
-      for_each_elem(sr, 0, rel, ElfW_Rel)
+      for (r = rel_head[t]; r >= 0; r = rel_next[r])
       {
-        sym_index = ELFW(R_SYM)(rel->r_info);
-        if (sym_index == 0 || sym_index >= nb_syms)
-          continue;
-        sym = &symtab[sym_index];
-        if (sym->st_shndx == SHN_UNDEF || sym->st_shndx >= SHN_LORESERVE)
-          continue;
-        if (sym->st_shndx >= s1->nb_sections)
-          continue;
-        if (!sec_used[sym->st_shndx])
+        sr = s1->sections[r];
+        for_each_elem(sr, 0, rel, ElfW_Rel)
         {
-          sec_used[sym->st_shndx] = 1;
-          changed = 1;
+          int shndx;
+          sym_index = ELFW(R_SYM)(rel->r_info);
+          if (sym_index == 0 || sym_index >= nb_syms)
+            continue;
+          shndx = symtab[sym_index].st_shndx;
+          if (shndx == SHN_UNDEF || shndx >= SHN_LORESERVE || shndx >= nb)
+            continue;
+          if (!sec_used[shndx])
+          {
+            sec_used[shndx] = 1;
+            work[top++] = shndx;
+          }
         }
       }
     }
-  } while (changed);
+    tcc_free(rel_head);
+    tcc_free(rel_next);
+    tcc_free(work);
+  }
 
   /* Also mark relocation sections for used sections */
   for (i = 1; i < s1->nb_sections; i++)
@@ -549,9 +612,18 @@ void gc_sections(TCCState *s1)
         s->data_offset = 0;
         s->sh_size = 0;
         /* Clearing SHF_ALLOC keeps the shell out of layout AND out of
-         * coalesce_function_sections, which must not fold a collected
-         * .text.<name> back into .text. */
-        s->sh_flags &= ~SHF_ALLOC;
+         * coalesce_split_sections, which must not fold a collected
+         * .text.<name> back into .text.
+         *
+         * The linker's own output sections are the exception: they are only
+         * emptied.  coalesce_split_sections appends every surviving
+         * .text.<name> to text_section, and layout, the veneers and the YAFF
+         * writer address all four through these globals.  A collected .text
+         * (e.g. archive members pulled in only by dead code, all in plain
+         * .text) that lost SHF_ALLOC took the live, coalesced code with it:
+         * an image with no code at all, or a layout with no PT_LOAD. */
+        if (s != text_section && s != data_section && s != rodata_section && s != bss_section)
+          s->sh_flags &= ~SHF_ALLOC;
         collected[i] = 1;
         any_collected = 1;
         if (s->reloc)
@@ -587,21 +659,102 @@ void gc_sections(TCCState *s1)
       }
     }
     tcc_free(collected);
+
+    /* An undefined symbol that only collected sections referred to is no
+     * longer needed: GNU ld and lld report undefined symbols reached from
+     * kept sections only.  The kernel's libc stdio.o calls fcntl() from a
+     * function the kernel never uses, and the link failed on it.  Demote such
+     * symbols to weak so the undefined-symbol checks let them through; no
+     * relocation is left to read their value. */
+    if (any_collected)
+    {
+      unsigned char *referenced = tcc_mallocz(nb_syms);
+      for (i = 1; i < s1->nb_sections; i++)
+      {
+        sr = s1->sections[i];
+        if (!sr || sr->sh_type != SHT_RELX || !sr->data_offset)
+          continue;
+        for_each_elem(sr, 0, rel, ElfW_Rel)
+        {
+          sym_index = ELFW(R_SYM)(rel->r_info);
+          if (sym_index > 0 && sym_index < nb_syms)
+            referenced[sym_index] = 1;
+        }
+      }
+      for (sym_index = 1; sym_index < nb_syms; sym_index++)
+      {
+        sym = &symtab[sym_index];
+        if (sym->st_shndx == SHN_UNDEF && !referenced[sym_index] &&
+            ELFW(ST_BIND)(sym->st_info) == STB_GLOBAL)
+          sym->st_info = ELFW(ST_INFO)(STB_WEAK, ELFW(ST_TYPE)(sym->st_info));
+      }
+      tcc_free(referenced);
+    }
   }
 
   tcc_free(sec_used);
 }
 
-/* Fold every per-function .text.* input section (created under
- * -ffunction-sections; unreferenced ones already emptied by gc_sections)
- * back into the single text_section before GOT build and layout.
+/* The canonical section a split input section folds back into, or NULL.
+ * Split inputs are the per-function ".text.<fn>" sections and, under
+ * --gc-sections, each object's own .text and data sections (".data..<n>",
+ * ".rodata.str..<n>", see gc_private_input_section in tccelf_load.c). */
+static Section *split_section_target(TCCState *s1, Section *s, Section **rodata)
+{
+  static const char *const base[] = {".text", ".data", ".rodata", ".bss"};
+  int k;
+  if (!(s->sh_flags & SHF_ALLOC) || s == text_section || s == data_section || s == rodata_section ||
+      s == bss_section)
+    return NULL;
+  for (k = 0; k < 4; k++)
+  {
+    size_t n = strlen(base[k]);
+    Section *t;
+    if (strncmp(s->name, base[k], n) || s->name[n] != '.')
+      continue;
+    /* A data section the compiler made (section attribute) keeps its own
+     * output section, as before; only the loader's per-object ones fold. */
+    if (k != 0 && !strstr(s->name, ".."))
+      return NULL;
+    if (k == 0)
+      t = text_section;
+    else if (k == 1)
+      t = data_section;
+    else if (k == 3)
+      t = bss_section;
+    else
+    {
+      /* rodata_section is ".data.ro" on some targets; objects' .rodata
+       * merged into a section of its own name there. */
+      if (!*rodata)
+      {
+        if (!strcmp(rodata_section->name, ".rodata"))
+          *rodata = rodata_section;
+        else if (!(*rodata = section_ht_find(s1, ".rodata")))
+          *rodata = new_section(s1, ".rodata", s->sh_type, s->sh_flags);
+      }
+      t = *rodata;
+    }
+    if (s == t || s->sh_type != t->sh_type)
+      return NULL;
+    if (k == 0 && !(s->sh_flags & SHF_EXECINSTR))
+      return NULL;
+    return t;
+  }
+  return NULL;
+}
+
+/* Fold every split input section (per-function .text.* under
+ * -ffunction-sections, per-object .data/.rodata/.bss under --gc-sections;
+ * unreferenced ones already emptied by gc_sections) back into its single
+ * canonical section before GOT build and layout.
  *
  * Everything downstream of this point -- sbrel classification, layout, the
- * export table and the YAFF writer -- addresses code through the
- * text_section global (tccyaff.c writes text_section->data as the entire
- * code payload), so coalescing here lets all of it stay ignorant of split
- * text.  Sections merge in creation order, which is emission order, so the
- * resulting layout matches what a non-split build produces.
+ * export table and the YAFF writer -- addresses code and data through the
+ * section globals (tccyaff.c writes text_section->data as the entire code
+ * payload), so coalescing here lets all of it stay ignorant of split
+ * sections.  Sections merge in creation order, which is load and emission
+ * order, so the resulting layout matches what a non-split build produces.
  *
  * Symbol fixup relies on two properties verified in this tree:
  *  - relocate_syms() adds a section base only for sh_num < SHN_LORESERVE,
@@ -610,58 +763,65 @@ void gc_sections(TCCState *s1)
  *    (tcc_debug_funcstart records dwarf_register_text_section(cur_text_section)),
  *    so bumping the section symbol's st_value by the merge base keeps every
  *    debug address correct without touching the DWARF bytes. */
-static void coalesce_function_sections(TCCState *s1)
+static void coalesce_split_sections(TCCState *s1)
 {
   int i, have_split = 0;
   addr_t *base_of;
-  unsigned char *merged;
+  Section **target_of;
+  Section *rodata = NULL;
   ElfW(Sym) * sym;
   /* Snapshot the section count: put_elf_reloc below can create .rel.text
    * mid-loop, growing s1->nb_sections past the size of the arrays.  New
-   * sections are reloc sections, never merge candidates, so the snapshot
-   * loses nothing. */
+   * sections are reloc sections (or the canonical .rodata), never merge
+   * candidates, so the snapshot loses nothing. */
   int nb_sections = s1->nb_sections;
 
-  for (i = 1; i < nb_sections; i++)
+  for (i = 1; i < nb_sections && !have_split; i++)
   {
     Section *s = s1->sections[i];
-    if (s && s != text_section && s->sh_type == SHT_PROGBITS && (s->sh_flags & SHF_EXECINSTR) &&
-        (s->sh_flags & SHF_ALLOC) && !strncmp(s->name, ".text.", 6))
-    {
+    if (s && (s->sh_flags & SHF_ALLOC) && s->name[0] == '.' && strchr(s->name + 1, '.') &&
+        split_section_target(s1, s, &rodata))
       have_split = 1;
-      break;
-    }
   }
   if (!have_split)
     return;
 
   base_of = tcc_mallocz(sizeof(addr_t) * nb_sections);
-  merged = tcc_mallocz(nb_sections);
+  target_of = tcc_mallocz(sizeof(Section *) * nb_sections);
 
   for (i = 1; i < nb_sections; i++)
   {
     Section *s = s1->sections[i];
-    if (!s || s == text_section || s->sh_type != SHT_PROGBITS)
-      continue;
-    if ((s->sh_flags & (SHF_EXECINSTR | SHF_ALLOC)) != (SHF_EXECINSTR | SHF_ALLOC))
-      continue;
-    if (strncmp(s->name, ".text.", 6))
+    Section *t;
+    addr_t align;
+    if (!s || !(t = split_section_target(s1, s, &rodata)))
       continue;
 
     /* Thumb literal pools are PC-relative loads with PC aligned down to 4;
      * every function must therefore start 4-aligned, exactly as it would
-     * have in a monolithic .text. */
-    text_section->data_offset += -text_section->data_offset & (addr_t)3;
-    base_of[i] = text_section->data_offset;
-    merged[i] = 1;
+     * have in a monolithic .text.  A whole object's .text keeps the
+     * alignment it asked for, as the loader's concatenation gave it. */
+    align = s->sh_addralign ? s->sh_addralign : 1;
+    if (t == text_section)
+      align = strncmp(s->name, ".text..", 7) ? 4 : (align > 4 ? align : 4);
+    t->data_offset += -t->data_offset & (align - 1);
+    if (align > t->sh_addralign)
+      t->sh_addralign = align;
+    base_of[i] = t->data_offset;
+    target_of[i] = t;
     if (s->data_offset)
     {
-      void *p = section_ptr_add(text_section, s->data_offset);
-      memcpy(p, s->data, s->data_offset);
+      if (t->sh_type == SHT_NOBITS)
+        t->data_offset += s->data_offset;
+      else
+      {
+        void *p = section_ptr_add(t, s->data_offset);
+        memcpy(p, s->data, s->data_offset);
+      }
     }
 
-    /* Move the section's relocations into .rel.text, rebased.  Addends live
-     * in the copied code bytes (REL format), so only r_offset changes;
+    /* Move the section's relocations into the target's, rebased.  Addends
+     * live in the copied bytes (REL format), so only r_offset changes;
      * symbol indices are global to symtab and stay valid. */
     if (s->reloc && s->reloc->data_offset)
     {
@@ -670,7 +830,7 @@ static void coalesce_function_sections(TCCState *s1)
       ElfW_Rel *rel = (ElfW_Rel *)sr->data;
       int r;
       for (r = 0; r < nb; r++)
-        put_elf_reloc(symtab_section, text_section, rel[r].r_offset + base_of[i], ELFW(R_TYPE)(rel[r].r_info),
+        put_elf_reloc(symtab_section, t, rel[r].r_offset + base_of[i], ELFW(R_TYPE)(rel[r].r_info),
                       ELFW(R_SYM)(rel[r].r_info));
       sr->data_offset = 0;
     }
@@ -681,10 +841,10 @@ static void coalesce_function_sections(TCCState *s1)
    * the STT_SECTION symbols DWARF relocates against (st_value 0 -> base). */
   for_each_elem(symtab_section, 1, sym, ElfW(Sym))
   {
-    if (sym->st_shndx < nb_sections && merged[sym->st_shndx])
+    if (sym->st_shndx < nb_sections && target_of[sym->st_shndx])
     {
       sym->st_value += base_of[sym->st_shndx];
-      sym->st_shndx = text_section->sh_num;
+      sym->st_shndx = target_of[sym->st_shndx]->sh_num;
     }
   }
 
@@ -692,7 +852,7 @@ static void coalesce_function_sections(TCCState *s1)
    * alloc_sec_names() skips them and they never reach the output. */
   for (i = 1; i < nb_sections; i++)
   {
-    if (merged[i])
+    if (target_of[i])
     {
       Section *s = s1->sections[i];
       s->sh_flags &= ~SHF_ALLOC;
@@ -702,7 +862,7 @@ static void coalesce_function_sections(TCCState *s1)
   }
 
   tcc_free(base_of);
-  tcc_free(merged);
+  tcc_free(target_of);
 }
 
 /* Output an elf, coff or binary file */
@@ -720,6 +880,18 @@ static int elf_output_file(TCCState *s1, const char *filename)
   interp = dynstr = dynamic = NULL;
   sec_order = NULL;
   dyninf.roinf = &dyninf._roinf;
+
+#ifdef TCC_TARGET_YAFF
+  /* A YAFF module is relocated by yasld through its GOT and the relocations
+   * recorded against it.  A -static link builds no GOT unless code needs one
+   * and fills the entries with final link-time addresses and no relocations,
+   * so the writer either dereferenced the missing GOT (SIGSEGV on any
+   * GOT-free -static link, the default output of a YasOS-configured tcc) or
+   * produced a module the loader cannot relocate. */
+  if (s1->output_format == TCC_OUTPUT_FORMAT_YAFF && s1->static_link)
+    return tcc_error_noabort("-static cannot produce a YAFF module; "
+                             "use -Wl,-oformat=elf32-littlearm for a static image");
+#endif
 
   /* Load linker script if specified */
   if (s1->linker_script)
@@ -778,11 +950,37 @@ static int elf_output_file(TCCState *s1, const char *filename)
     gc_sections(s1);
   }
 
-  /* Per-function .text.* sections (from -ffunction-sections objects) must be
-   * folded back into text_section before build_got/layout -- see the comment
-   * on coalesce_function_sections.  Runs unconditionally: it is a no-op when
-   * no split-text input exists. */
-  coalesce_function_sections(s1);
+  /* Split input sections (.text.<fn>, and each object's own data under
+   * --gc-sections) must be folded back into their canonical sections before
+   * build_got/layout -- see the comment on coalesce_split_sections.  Runs
+   * unconditionally: it is a no-op when no split input exists. */
+  coalesce_split_sections(s1);
+
+#ifdef TCC_TARGET_ARM
+  /* Thumb branches between memory regions the script puts far apart (RAM
+   * code calling flash on the RP2350) go through veneers: sized now, before
+   * layout fixes the addresses. */
+  if (s1->ld_script)
+    arm_add_range_veneers(s1);
+#endif
+
+  /* Inputs of a (NOLOAD) output section occupy memory but have no file
+   * contents: the RP2350 .ram_vector_table became a PT_LOAD at 0x20000000
+   * with bytes in it, which a flasher would try to write. */
+  if (s1->ld_script)
+  {
+    int i;
+    for (i = 1; i < s1->nb_sections; i++)
+    {
+      Section *sec = s1->sections[i];
+      int pat = -1, os;
+      if (!sec || !(sec->sh_flags & SHF_ALLOC) || sec->sh_type != SHT_PROGBITS)
+        continue;
+      os = ld_find_output_section_idx(s1, sec->name, &pat);
+      if (os >= 0 && os < s1->ld_script->nb_output_sections && s1->ld_script->output_sections[os].noload)
+        sec->sh_type = SHT_NOBITS;
+    }
+  }
 
   if (!s1->static_link)
   {
@@ -928,28 +1126,17 @@ static int elf_output_file(TCCState *s1, const char *filename)
             ld->output_sections[j].load_memory_region_idx != ld->output_sections[j].memory_region_idx)
         {
           /* This output section has AT > (LMA in different region than VMA).
-             Find the LOAD segment whose p_vaddr matches and fix p_paddr. */
-          addr_t vma = 0;
-          /* Find the VMA of this output section from its first ELF section */
-          for (k = 1; k < s1->nb_sections; k++)
-          {
-            Section *sec = s1->sections[k];
-            if (sec->sh_addr && ld_section_matches_output(s1, sec->name, j))
-            {
-              vma = sec->sh_addr;
-              break;
-            }
-          }
+             Its inputs may sit in several LOAD segments (code, read-only
+             and data get their own); each keeps its offset from the
+             section's start in the load image. */
+          addr_t vma = ld->output_section_vmas[j], vma_end = ld->output_section_vma_ends[j];
           if (vma)
           {
             for (k = 0; k < dyninf.phnum; k++)
             {
               ElfW(Phdr) *ph = &dyninf.phdr[k];
-              if (ph->p_type == PT_LOAD && ph->p_vaddr <= vma && vma < ph->p_vaddr + ph->p_memsz)
-              {
-                ph->p_paddr = ld->output_section_loadaddrs[j];
-                break;
-              }
+              if (ph->p_type == PT_LOAD && ph->p_vaddr >= vma && ph->p_vaddr < vma_end)
+                ph->p_paddr = ld->output_section_loadaddrs[j] + (ph->p_vaddr - vma);
             }
           }
         }
@@ -1041,6 +1228,13 @@ static int elf_output_obj(TCCState *s1, const char *filename)
   Section *s;
   int i, ret, file_offset;
   s1->nb_errors = 0;
+#ifdef TCC_TARGET_ARM
+  /* Objects carry the EABI attributes the linked image does: other linkers
+   * read Tag_CPU_arch from every input, and lld took an untagged object for
+   * ARMv4T and rejected the Thumb-2 branch relocations the assembler left. */
+  if (!have_section(s1, ".ARM.attributes"))
+    create_arm_attribute_section(s1);
+#endif
   /* Allocate strings for section names */
   alloc_sec_names(s1, 1);
   file_offset = (sizeof(ElfW(Ehdr)) + 3) & -4;

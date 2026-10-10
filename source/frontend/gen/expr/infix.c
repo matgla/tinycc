@@ -225,6 +225,66 @@ void expr_cond(void)
   }
 }
 
+/* A destination claimed as a call's struct-return buffer (NRVO) is written
+ * by the call: sound only when that call's result IS the value assigned,
+ * `x = f(...)` and nothing more.  With anything around the call --
+ * `x = (f(), x)`, `x = *g(f(), &x)`, `x = ({ f(); x; })`, `S x = { f().b }`,
+ * and after it `x = f().fp(x)`, `x = f().arr[x.i]`, `z = cf() + z`,
+ * `x = f().k ? y : x` -- the call would overwrite x while x's old value is
+ * still to be read.  So the hint is only given when the right-hand side is
+ * the name of a function (or a function pointer), its parenthesized
+ * arguments, and then a token that ends the assignment.  The tokens are read
+ * ahead and replayed (tokens replayed from a string are not macro-expanded
+ * again).  The first call parsed is then the outermost one, and every call
+ * drops the hint before it parses its arguments (gfunc_call).  Whether the
+ * callee can reach the destination some other way is decided on the IR
+ * (tcc_ir_sret_dealias). */
+int nrvo_rhs_is_direct_call(void)
+{
+  if (tok < TOK_UIDENT)
+    return 0;
+  Sym *s = sym_find(tok);
+  if (!s || (s->type.t & VT_TYPEDEF))
+    return 0;
+  const int bt = s->type.t & VT_BTYPE;
+  if (bt != VT_FUNC && !(bt == VT_PTR && !(s->type.t & VT_ARRAY) && s->type.ref &&
+                         (s->type.ref->type.t & VT_BTYPE) == VT_FUNC))
+    return 0;
+  const int ident = tok;
+  /* #pragma pack met while reading ahead is replayed in place, as for a
+   * saved function body (skip_or_save_block) */
+  TokenString *saved_capture = pp_pragma_capture;
+  TokenString *str = tok_str_alloc();
+  pp_pragma_capture = str;
+  next();
+  int call = 0;
+  if (tok == '(')
+  {
+    int level = 0;
+    for (;;)
+    {
+      const int t = tok;
+      if (t == TOK_EOF)
+        break;
+      tok_str_add_tok(str);
+      next();
+      if (t == '(' || t == '[' || t == '{')
+        level++;
+      else if ((t == ')' || t == ']' || t == '}') && --level == 0)
+        break;
+    }
+    /* tok: what follows the call's ')' */
+    call = level == 0 && (tok == ';' || tok == ',' || tok == ')' || tok == ']' || tok == '}' || tok == ':');
+  }
+  if (tok != TOK_EOF) /* (a string's TOK_EOF stays where it is) */
+    tok_str_add_tok(str);
+  pp_pragma_capture = saved_capture;
+  tok_str_add(str, 0);
+  begin_macro(str, 1);
+  tok = ident;
+  return call;
+}
+
 void expr_eq(void)
 {
   int t;
@@ -265,7 +325,7 @@ void expr_eq(void)
           (lhs_bt == VT_STRUCT || (vtop->type.t & VT_COMPLEX)) &&
           !(vtop->type.t & VT_VECTOR) &&
           (lhs_is_local || lhs_is_reg_deref) &&
-          !(vtop->type.t & VT_VOLATILE))
+          !(vtop->type.t & VT_VOLATILE) && nrvo_rhs_is_direct_call())
       {
         int nrvo_align;
         int nrvo_size = type_size(&vtop->type, &nrvo_align);

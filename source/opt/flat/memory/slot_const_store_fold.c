@@ -68,7 +68,7 @@ static int scsf_slot(IROperand op, int32_t *off)
 static int scsf_nops(int op)
 {
   int n = irop_config[op].has_dest + irop_config[op].has_src1 + irop_config[op].has_src2;
-  if (op == TCCIR_OP_MLA || op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_SELECT)
+  if (ir_op_has(op, IROP_A_SLOT3) && !ir_opset_has(IR_LEGACY_GAP_OPS(TCCIR_OP_UMAAL), op))
     n++;
   return n;
 }
@@ -201,9 +201,4 @@ int tcc_ir_opt_slot_const_store_fold(TCCIRState *ir)
     }
   }
   return changes;
-}
-
-int tcc_ir_opt_slot_const_store_fold_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_slot_const_store_fold(ctx->ir);
 }

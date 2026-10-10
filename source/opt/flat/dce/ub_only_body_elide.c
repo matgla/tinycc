@@ -49,7 +49,13 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
   int n = ir->next_instruction_index;
   if (n == 0)
     return 0;
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
+    return 0;
+  /* A nested function's StackLoc reads are the PARENT's slots, reached through
+   * the static chain -- initialised by the parent, not uninitialised locals of
+   * this frame.  `void set(void) { *p = v; }` read p and v that way, was taken
+   * for a body whose only effect is UB, and was emptied. */
+  if (ir->has_static_chain)
     return 0;
 
   /* First pass: inventory STOREs and bail on ops that block whole-function elision. */
@@ -188,8 +194,7 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
     }
     if (q->op == TCCIR_OP_LEA && irop_config[q->op].has_src1)
     {
-      IROperand op = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(op);
+      int32_t vr = tcc_ir_op_src1_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -200,8 +205,7 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
     /* Any VAR appearing as dest is "written" at some point. */
     if (irop_config[q->op].has_dest)
     {
-      IROperand dop = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(dop);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -266,14 +270,13 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
         continue;
       if (!irop_config[q->op].has_dest)
         continue;
-      IROperand dop = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(dop);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       if (dvr < 0)
         continue;
       if (TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP)
         continue;
       /* dest with is_lval is an address, not a new TEMP value — skip. */
-      if (dop.is_lval)
+      if (tcc_ir_op_dest_is_lval(ir, q))
         continue;
       int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
       if (dpos < 0 || dpos >= UB_ELIDE_MAX_TEMPS)
@@ -346,20 +349,9 @@ int tcc_ir_opt_ub_only_body_elide(TCCIRState *ir)
              "(every STORE goes through uninit-pointer address — whole-function UB)");
 
   /* NOP everything — codegen emits a bare prologue + bx lr. */
-  for (int i = 0; i < n; i++)
-  {
-    ir->compact_instructions[i].op = TCCIR_OP_NOP;
-    ir->compact_instructions[i].is_jump_target = 0;
-  }
+  ir_opt_nop_body(ir, n);
 
-  ir->ls.dirty_registers = 0;
-  ir->ls.dirty_float_registers = 0;
-  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
-    memset(ir->ls.live_regs_by_instruction, 0,
-           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
-  ir->leaffunc = 1;
+  ir_opt_reset_body_regs(ir);
 
   return 1;
 }
-
-int tcc_ir_opt_ub_only_body_elide_ex(IROptCtx *ctx) { return tcc_ir_opt_ub_only_body_elide(ctx->ir); }

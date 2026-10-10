@@ -7,9 +7,9 @@
  *      FMUL/FDIV with a fresh TEMP dest, float/double vreg marking, and the
  *      "result into vtop[-1], pop one" value-stack contract.
  *    - tcc_ir_gen_f(): the generic dispatcher -- arithmetic tokens
- *      ('+','-','*','/'), 'n' (negate), 'c' (compare), 't'/'i'/'f'
- *      (conversions), and the TOK_ULT..TOK_GT comparison range with the
- *      GT/GE operand-swap NaN fix.
+ *      ('+','-','*','/'), 'n' (negate), 'c' (compare), and the
+ *      TOK_ULT..TOK_GT comparison range with the GT/GE operand-swap NaN fix
+ *      (conversion tokens are not dispatched -- see the CVT note below).
  *    - tcc_ir_gen_fneg(): unary TCCIR_OP_FNEG (src1 = vtop[0], no pop).
  *    - tcc_ir_gen_fcmp(): TCCIR_OP_FCMP with the TOK_LT default cmp_op.
  *    - tcc_ir_gen_cvt_ftof/itof/ftoi(): conversion wrappers.
@@ -57,9 +57,15 @@
  *      callers in the product: the frontend reaches float.c only through
  *      tcc_ir_gen_f() (tccgen.c:4897 'n', tccgen.c:5240 gen_opif general
  *      case), and gen_cast() inlines its own conversion tcc_ir_put with
- *      vtop as src1. The wrappers are tested here as exported API. The
- *      CVT wrappers' &vtop[-1]-as-source behavior is a suspected bug pinned
- *      by characterization tests (see docs/bugs.md).
+ *      vtop as src1. The wrappers are tested here as exported API; they use
+ *      the one-value cast convention (value at vtop[0] with its SOURCE type,
+ *      destination type passed as the dst_type_t argument, result written in
+ *      place) -- the docs/bugs.md below-top-of-stack bug is fixed, and
+ *      test_cvt_itof_reads_top_not_stale_slot_below locks that in.
+ *    - tcc_ir_gen_f() no longer dispatches 't'/'i'/'f' conversion tokens:
+ *      a conversion's destination type cannot be derived from the operand
+ *      stack, so the CVT wrappers take it as a parameter and erroring out of
+ *      the dispatcher is the honest fallback for those tokens.
  */
 
 #define USING_GLOBALS
@@ -77,9 +83,9 @@ extern void tcc_ir_gen_fmul(TCCIRState *ir);
 extern void tcc_ir_gen_fdiv(TCCIRState *ir);
 extern void tcc_ir_gen_fneg(TCCIRState *ir);
 extern void tcc_ir_gen_fcmp(TCCIRState *ir);
-extern void tcc_ir_gen_cvt_ftof(TCCIRState *ir);
-extern void tcc_ir_gen_cvt_itof(TCCIRState *ir);
-extern void tcc_ir_gen_cvt_ftoi(TCCIRState *ir);
+extern void tcc_ir_gen_cvt_ftof(TCCIRState *ir, int dst_type_t);
+extern void tcc_ir_gen_cvt_itof(TCCIRState *ir, int dst_type_t);
+extern void tcc_ir_gen_cvt_ftoi(TCCIRState *ir, int dst_type_t);
 
 /* ---------------------------------------------------------------------------
  * Minimal frontend value stack (see HARNESS NOTES).
@@ -544,105 +550,114 @@ UT_TEST(test_gen_f_cmp_gt_ge_swap_operands_for_nan)
 }
 
 /* -------------------------------------------------------------------------- */
-/* Conversions (dead wrappers -- pinned characterization, see HARNESS NOTES)  */
+/* Conversions (dead wrappers -- one-value cast convention)                   */
 /* -------------------------------------------------------------------------- */
 
-/* float.c's conversion path calls tcc_ir_put(ir, op, &vtop[-1], &vtop[0],
- * &dest) -- the binary-op call shape -- but irop_config for CVT_* is
- * {dest, src1} with NO src2. So the emitted instruction's source operand is
- * vtop[-1] (the entry BELOW the top), the &vtop[0] argument is silently
- * ignored, the result is written into vtop[0], and nothing is popped. The
- * fixtures below push the source at vtop[-1] and a "destination type"
- * marker at vtop[0] (float.c derives dest.type from vtop[0].type for
- * itof/ftof) -- the only stack layout under which these wrappers produce a
- * sensible instruction. */
+/* The CVT wrappers take the value to convert from vtop[0] with its SOURCE
+ * type intact (the convention gen_cast's inline expansion uses when it
+ * passes `vtop` as src1, and the one the backend's CVT lowering relies on:
+ * src1.is_64bit/is_unsigned pick the __aeabi helper) and the DESTINATION
+ * type as the dst_type_t argument -- it cannot be derived from the stack.
+ * The result replaces the value in place (unary contract, like FNEG) and
+ * the caller owns the vtop->type update, exactly as gen_cast does after its
+ * own conversion puts. */
 
-UT_TEST(test_cvt_itof_source_taken_from_below_top)
+/* Shared oracle for the native conversion path: exactly one CVT instruction;
+ * src1 is the pushed vreg with the source btype; dest is a fresh TEMP with
+ * the destination btype, float-marked iff want_is_float; the result lands
+ * in vtop[0] IN PLACE (stack depth unchanged) and vtop->type is left for
+ * the caller to update. Returns 0 on success, -1 on the first failure. */
+static int check_native_cvt(TCCIRState *ir, int src_vr, TccIrOp want_op, int src_btype,
+                            int want_dst_btype, int want_is_float, int want_is_double)
+{
+  UT_ASSERT_EQ(tcc_ir_count(ir), 1);
+  IRQuadCompact *q = &ir->compact_instructions[0];
+  UT_ASSERT_EQ(q->op, want_op);
+
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  IROperand s1 = tcc_ir_op_get_src1(ir, q);
+  UT_ASSERT_EQ(irop_get_vreg(s1), src_vr);
+  UT_ASSERT_EQ(irop_get_btype(s1), src_btype);
+
+  int dvr = irop_get_vreg(d);
+  UT_ASSERT_EQ(TCCIR_DECODE_VREG_TYPE(dvr), TCCIR_VREG_TYPE_TEMP);
+  UT_ASSERT(dvr != src_vr);
+  UT_ASSERT_EQ(irop_get_btype(d), want_dst_btype);
+  IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, dvr);
+  UT_ASSERT_EQ(iv->is_float, want_is_float);
+  UT_ASSERT_EQ(iv->is_double, want_is_double);
+
+  /* unary contract: stack depth unchanged, top rewritten to the result,
+   * vtop->type untouched (caller owns the type update) */
+  UT_ASSERT_EQ(vtop, _vstack + 1);
+  UT_ASSERT_EQ(vtop->vr, dvr);
+  UT_ASSERT_EQ(vtop->r, 0);
+  return 0;
+}
+
+UT_TEST(test_cvt_itof_converts_top_in_place)
 {
   ut_setup(&ut_fpu_all);
   TCCIRState *ir = tcc_ir_alloc();
-  int src = ut_push_var(ir, VT_INT);      /* vtop[-1]: value to convert */
-  int marker = ut_push_var(ir, VT_FLOAT); /* vtop[0]: destination type holder */
+  int src = ut_push_var(ir, VT_INT); /* vtop[0]: the value to convert */
 
-  tcc_ir_gen_cvt_itof(ir);
+  tcc_ir_gen_cvt_itof(ir, VT_FLOAT);
 
-  UT_ASSERT_EQ(tcc_ir_count(ir), 1);
-  IRQuadCompact *q = &ir->compact_instructions[0];
-  UT_ASSERT_EQ(q->op, TCCIR_OP_CVT_ITOF);
-  UT_ASSERT(!irop_config[TCCIR_OP_CVT_ITOF].has_src2);
-
-  IROperand s1 = tcc_ir_op_get_src1(ir, q);
-  UT_ASSERT_EQ(irop_get_vreg(s1), src);
-  UT_ASSERT_EQ(irop_get_btype(s1), IROP_BTYPE_INT32);
-
-  IROperand d = tcc_ir_op_get_dest(ir, q);
-  int dvr = irop_get_vreg(d);
-  UT_ASSERT_EQ(TCCIR_DECODE_VREG_TYPE(dvr), TCCIR_VREG_TYPE_TEMP);
-  UT_ASSERT(dvr != src && dvr != marker);
-  UT_ASSERT_EQ(irop_get_btype(d), IROP_BTYPE_FLOAT32);
-  IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, dvr);
-  UT_ASSERT_EQ(iv->is_float, 1);
-  UT_ASSERT_EQ(iv->is_double, 0);
-
-  /* result lands in vtop[0]; vtop[-1] is left untouched (no pop, no rewrite) */
-  UT_ASSERT_EQ(vtop, _vstack + 2);
-  UT_ASSERT_EQ(vtop[-1].vr, src);
-  UT_ASSERT_EQ(vtop[0].vr, dvr);
-  UT_ASSERT_EQ(vtop[0].r, 0);
-  UT_ASSERT_EQ(vtop[0].type.t, VT_FLOAT);
-
+  if (check_native_cvt(ir, src, TCCIR_OP_CVT_ITOF, IROP_BTYPE_INT32, IROP_BTYPE_FLOAT32, 1, 0))
+    return -1;
+  UT_ASSERT_EQ(vtop->type.t, VT_INT); /* caller owns the type update */
   ut_teardown(ir);
   return 0;
 }
 
-UT_TEST(test_cvt_itof_double_marker_marks_double_dest)
+UT_TEST(test_cvt_itof_to_double_marks_double_dest)
 {
   ut_setup(&ut_fpu_all);
   TCCIRState *ir = tcc_ir_alloc();
   int src = ut_push_var(ir, VT_INT);
-  ut_push_var(ir, VT_DOUBLE); /* destination type holder */
 
-  tcc_ir_gen_cvt_itof(ir);
+  tcc_ir_gen_cvt_itof(ir, VT_DOUBLE);
 
-  IRQuadCompact *q = &ir->compact_instructions[0];
-  UT_ASSERT_EQ(irop_get_vreg(tcc_ir_op_get_src1(ir, q)), src);
-  IROperand d = tcc_ir_op_get_dest(ir, q);
-  UT_ASSERT_EQ(irop_get_btype(d), IROP_BTYPE_FLOAT64);
-  IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, irop_get_vreg(d));
-  UT_ASSERT_EQ(iv->is_float, 1);
-  UT_ASSERT_EQ(iv->is_double, 1);
-  UT_ASSERT_EQ(vtop[0].type.t, VT_DOUBLE);
-
+  if (check_native_cvt(ir, src, TCCIR_OP_CVT_ITOF, IROP_BTYPE_INT32, IROP_BTYPE_FLOAT64, 1, 1))
+    return -1;
   ut_teardown(ir);
   return 0;
 }
 
 UT_TEST(test_cvt_ftoi_dest_is_plain_int)
 {
-  /* ftoi hardcodes dest.type.t = VT_INT (float.c:183) and never marks the
-   * dest vreg as float. */
+  /* ftoi's dest is an int vreg: IROP_BTYPE_INT32 and NO float marking on the
+   * interval, whatever the source float width is. */
   ut_setup(&ut_fpu_all);
   TCCIRState *ir = tcc_ir_alloc();
-  int src = ut_push_var(ir, VT_FLOAT); /* vtop[-1]: value to convert */
-  ut_push_var(ir, VT_FLOAT);           /* vtop[0]: ignored by the ftoi branch */
+  int src = ut_push_var(ir, VT_FLOAT); /* vtop[0]: the value to convert */
 
-  tcc_ir_gen_cvt_ftoi(ir);
+  tcc_ir_gen_cvt_ftoi(ir, VT_INT);
+
+  if (check_native_cvt(ir, src, TCCIR_OP_CVT_FTOI, IROP_BTYPE_FLOAT32, IROP_BTYPE_INT32, 0, 0))
+    return -1;
+  UT_ASSERT_EQ(vtop->type.t, VT_FLOAT);
+  ut_teardown(ir);
+  return 0;
+}
+
+UT_TEST(test_cvt_ftoi_unsigned_dest_keeps_flag)
+{
+  /* dst_type_t carries VT_UNSIGNED, and it flows into the dest operand's
+   * is_unsigned -- the backend picks __aeabi_f2uiz over __aeabi_f2iz from
+   * it (arm-thumb-fp.c CVT_FTOI). */
+  ut_setup(&ut_fpu_all);
+  TCCIRState *ir = tcc_ir_alloc();
+  ut_push_var(ir, VT_FLOAT); /* vtop[0]: the value to convert */
+
+  tcc_ir_gen_cvt_ftoi(ir, VT_INT | VT_UNSIGNED);
 
   UT_ASSERT_EQ(tcc_ir_count(ir), 1);
   IRQuadCompact *q = &ir->compact_instructions[0];
   UT_ASSERT_EQ(q->op, TCCIR_OP_CVT_FTOI);
-  UT_ASSERT_EQ(irop_get_vreg(tcc_ir_op_get_src1(ir, q)), src);
-  UT_ASSERT_EQ(irop_get_btype(tcc_ir_op_get_src1(ir, q)), IROP_BTYPE_FLOAT32);
-
   IROperand d = tcc_ir_op_get_dest(ir, q);
   UT_ASSERT_EQ(irop_get_btype(d), IROP_BTYPE_INT32);
-  IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, irop_get_vreg(d));
-  UT_ASSERT_EQ(iv->is_float, 0);
-  UT_ASSERT_EQ(iv->is_double, 0);
-
-  UT_ASSERT_EQ(vtop, _vstack + 2);
-  UT_ASSERT_EQ(vtop[0].vr, irop_get_vreg(d));
-  UT_ASSERT_EQ(vtop[0].type.t, VT_INT);
+  UT_ASSERT_EQ(d.is_unsigned, 1);
 
   ut_teardown(ir);
   return 0;
@@ -652,35 +667,37 @@ UT_TEST(test_cvt_ftof_float_to_double)
 {
   ut_setup(&ut_fpu_all);
   TCCIRState *ir = tcc_ir_alloc();
-  int src = ut_push_var(ir, VT_FLOAT); /* vtop[-1]: value to convert */
-  ut_push_var(ir, VT_DOUBLE);          /* vtop[0]: destination type holder */
+  int src = ut_push_var(ir, VT_FLOAT); /* vtop[0]: the value to convert */
 
-  tcc_ir_gen_cvt_ftof(ir);
+  tcc_ir_gen_cvt_ftof(ir, VT_DOUBLE);
 
-  UT_ASSERT_EQ(tcc_ir_count(ir), 1);
-  IRQuadCompact *q = &ir->compact_instructions[0];
-  UT_ASSERT_EQ(q->op, TCCIR_OP_CVT_FTOF);
-  UT_ASSERT_EQ(irop_get_vreg(tcc_ir_op_get_src1(ir, q)), src);
-  UT_ASSERT_EQ(irop_get_btype(tcc_ir_op_get_src1(ir, q)), IROP_BTYPE_FLOAT32);
+  /* src keeps FLOAT32 (is_64bit = 0 -> __aeabi_f2d), dest is FLOAT64 */
+  if (check_native_cvt(ir, src, TCCIR_OP_CVT_FTOF, IROP_BTYPE_FLOAT32, IROP_BTYPE_FLOAT64, 1, 1))
+    return -1;
+  ut_teardown(ir);
+  return 0;
+}
 
-  IROperand d = tcc_ir_op_get_dest(ir, q);
-  UT_ASSERT_EQ(irop_get_btype(d), IROP_BTYPE_FLOAT64);
-  IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, irop_get_vreg(d));
-  UT_ASSERT_EQ(iv->is_float, 1);
-  UT_ASSERT_EQ(iv->is_double, 1);
-  UT_ASSERT_EQ(vtop[0].type.t, VT_DOUBLE);
+UT_TEST(test_cvt_ftof_double_to_float)
+{
+  ut_setup(&ut_fpu_all);
+  TCCIRState *ir = tcc_ir_alloc();
+  int src = ut_push_var(ir, VT_DOUBLE);
 
+  tcc_ir_gen_cvt_ftof(ir, VT_FLOAT);
+
+  /* src keeps FLOAT64 (is_64bit = 1 -> __aeabi_d2f), dest is FLOAT32 */
+  if (check_native_cvt(ir, src, TCCIR_OP_CVT_FTOF, IROP_BTYPE_FLOAT64, IROP_BTYPE_FLOAT32, 1, 0))
+    return -1;
   ut_teardown(ir);
   return 0;
 }
 
 /* Regression lock for docs/bugs.md "tcc_ir_gen_cvt_* read the conversion
- * source from below the top of stack": under the natural one-value cast
- * convention (the value to convert sits at vtop, exactly what gen_cast's
- * inline expansion assumes when it passes `vtop` as src1), the wrapper
- * reads the STALE slot below the top instead. This pins the CURRENT
- * (buggy) behavior -- flip the assertion when float.c passes &vtop[0]. */
-UT_TEST(test_cvt_itof_single_value_stack_reads_stale_slot_below)
+ * source from below the top of stack": the wrapper must convert the value
+ * AT vtop (what gen_cast's inline expansion assumes when it passes `vtop`
+ * as src1), not the stale slot beneath it. */
+UT_TEST(test_cvt_itof_reads_top_not_stale_slot_below)
 {
   ut_setup(&ut_fpu_all);
   TCCIRState *ir = tcc_ir_alloc();
@@ -692,20 +709,18 @@ UT_TEST(test_cvt_itof_single_value_stack_reads_stale_slot_below)
   _vstack[0].type.t = VT_INT;
 
   int real = ut_push_var(ir, VT_INT); /* vtop[0]: the value to convert */
-  vtop->type.t = VT_FLOAT;            /* cast target type, per wrapper convention */
 
-  tcc_ir_gen_cvt_itof(ir);
+  tcc_ir_gen_cvt_itof(ir, VT_FLOAT);
 
   UT_ASSERT_EQ(tcc_ir_count(ir), 1);
   IRQuadCompact *q = &ir->compact_instructions[0];
   UT_ASSERT_EQ(q->op, TCCIR_OP_CVT_ITOF);
 
-  /* BUG: src1 is the stale slot below the top, NOT the value at vtop. */
-  UT_ASSERT_EQ(irop_get_vreg(tcc_ir_op_get_src1(ir, q)), stale);
-  UT_ASSERT_NE(irop_get_vreg(tcc_ir_op_get_src1(ir, q)), real);
+  /* src1 is the value at vtop, NOT the stale slot below the top. */
+  UT_ASSERT_EQ(irop_get_vreg(tcc_ir_op_get_src1(ir, q)), real);
+  UT_ASSERT_NE(irop_get_vreg(tcc_ir_op_get_src1(ir, q)), stale);
 
-  /* ...while the result is written into the top entry as if it had been
-   * the source. */
+  /* ...and the result replaces the top value in place. */
   UT_ASSERT_EQ(vtop, _vstack + 1);
   UT_ASSERT_EQ(vtop[0].vr, irop_get_vreg(tcc_ir_op_get_dest(ir, q)));
 
@@ -904,10 +919,9 @@ UT_TEST(test_soft_cvt_itof_emits_param_call)
 {
   ut_setup(&ut_fpu_soft);
   TCCIRState *ir = tcc_ir_alloc();
-  int src = ut_push_var(ir, VT_INT); /* vtop[-1]: value to convert */
-  ut_push_var(ir, VT_FLOAT);         /* vtop[0]: destination type holder */
+  int src = ut_push_var(ir, VT_INT); /* vtop[0]: value to convert */
 
-  tcc_ir_gen_cvt_itof(ir);
+  tcc_ir_gen_cvt_itof(ir, VT_FLOAT);
 
   UT_ASSERT_EQ(tcc_ir_count(ir), 2);
   IRQuadCompact *p0 = &ir->compact_instructions[0];
@@ -919,8 +933,9 @@ UT_TEST(test_soft_cvt_itof_emits_param_call)
 
   IROperand d = tcc_ir_op_get_dest(ir, call);
   UT_ASSERT_EQ(irop_get_btype(d), IROP_BTYPE_FLOAT32);
+  /* unary contract: result replaces the top value in place */
+  UT_ASSERT_EQ(vtop, _vstack + 1);
   UT_ASSERT_EQ(vtop[0].vr, irop_get_vreg(d));
-  UT_ASSERT_EQ(vtop[0].type.t, VT_FLOAT);
 
   ut_teardown(ir);
   return 0;
@@ -937,9 +952,8 @@ UT_TEST(test_soft_cvt_ftof_stays_native_via_type_size_stub)
   ut_setup(&ut_fpu_soft);
   TCCIRState *ir = tcc_ir_alloc();
   int src = ut_push_var(ir, VT_FLOAT);
-  ut_push_var(ir, VT_DOUBLE);
 
-  tcc_ir_gen_cvt_ftof(ir);
+  tcc_ir_gen_cvt_ftof(ir, VT_DOUBLE);
 
   UT_ASSERT_EQ(tcc_ir_count(ir), 1);
   IRQuadCompact *q = &ir->compact_instructions[0];

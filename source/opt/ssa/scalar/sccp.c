@@ -54,6 +54,9 @@ typedef struct {
   int esc_cap;
   int esc_done;
   int esc_all;
+  /* Some volatile access touches the frame (volatile_frame_access). */
+  int vol_done;
+  int vol_frame;
 } SCCPState;
 
 static SCCPCell *sccp_cell(SCCPState *s, int32_t vreg)
@@ -142,7 +145,7 @@ static int sccp_get_operand_value(SCCPState *s, IROperand op, int64_t *out)
   return c->state;
 }
 
-static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
+static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype, int load_unsigned,
                                    int instr_idx, int64_t *out, int *dep_pos);
 
 /* The frame slot a TEMP address names, or INT_MIN.  `&VAR` resolves to the
@@ -210,7 +213,7 @@ static int sccp_get_store_src_value_ex(SCCPState *s, IROperand src,
 
   if (load_off != INT_MIN) {
     int dep_pos = -1;
-    int st2 = sccp_resolve_stack_load(s, load_off, irop_get_btype(src),
+    int st2 = sccp_resolve_stack_load(s, load_off, irop_get_btype(src), src.is_unsigned,
                                        instr_idx, out, &dep_pos);
     if (st2 == SCCP_CONST) {
       if (src_pos_out && dep_pos >= 0)
@@ -400,10 +403,69 @@ static void sccp_esc_flood(SCCPState *s, int32_t vr, int lo, int hi,
   }
 }
 
-/* SCCP_OBJ_BOUND caps how far the containing object extends past the base. */
+/* Inline asm and the non-local control ops (setjmp, VLA stack games) write
+ * memory the walkers below cannot see: a "memory" clobber, an address handed
+ * in as an input, an "=m" output.  Deny by default -- every walker stops here
+ * and treats any slot as written. */
+static int sccp_op_writes_opaque_memory(TccIrOp op)
+{
+  return ir_op_has(op, IR_HZ_ASM | IR_HZ_NONLOCAL | IR_HZ_VLA);
+}
+
+/* The bytes [*lo, *hi) that memory reached through an address into the frame
+ * at `off` may span: the frontend object holding it.  A pointer one past an
+ * object's end can be indexed back into it, so the object ending at `off`
+ * counts too.  When the layout cannot say (frame already relaid out, an
+ * object the frontend did not record) the answer is the whole frame. */
+static void sccp_frame_extent(SCCPState *s, int off, int *lo, int *hi)
+{
+  int l1 = 0, h1 = 0, l2 = 0, h2 = 0;
+  int a = tcc_ir_frame_object_at(s->ctx->ir, off, &l1, &h1);
+  int b = off > INT_MIN && tcc_ir_frame_object_at(s->ctx->ir, off - 1, &l2, &h2);
+  if (!a && !b) {
+    *lo = INT_MIN;
+    *hi = INT_MAX;
+    return;
+  }
+  if (a && b) {
+    *lo = l1 < l2 ? l1 : l2;
+    *hi = h1 > h2 ? h1 : h2;
+  } else if (a) {
+    *lo = l1;
+    *hi = h1;
+  } else {
+    *lo = l2;
+    *hi = h2;
+  }
+}
+
+/* May memory reached through an address into the frame at `off` overlap [lo, hi)? */
+static int sccp_extent_overlaps(SCCPState *s, int off, int lo, int hi)
+{
+  int elo, ehi;
+  sccp_frame_extent(s, off, &elo, &ehi);
+  return ehi > lo && hi > elo;
+}
+
+/* A BLOCK_COPY writes a destination the walkers can only prove disjoint when
+ * it is a frame slot of a known size. */
+static int sccp_block_copy_may_hit(SCCPState *s, IRQuadCompact *q, int lo, int hi)
+{
+  TCCIRState *ir = s->ctx->ir;
+  IROperand bcd = tcc_ir_op_get_dest(ir, q);
+  IROperand bcsz = tcc_ir_op_get_src2(ir, q);
+  if (irop_get_tag(bcd) != IROP_TAG_STACKOFF || irop_get_vreg(bcd) != -1 ||
+      !irop_is_immediate(bcsz))
+    return 1;
+  int bc_lo = (int)irop_get_stack_offset(bcd);
+  int bc_hi = bc_lo + (int)irop_get_imm64_ex(ir, bcsz);
+  return bc_hi > lo && hi > bc_lo;
+}
+
+/* An escaped frame address reaches the whole frontend object it points into
+ * (the call may index it either way), not a guessed number of bytes. */
 static int sccp_slot_addr_escapes(SCCPState *s, int load_lo, int load_hi)
 {
-  enum { SCCP_OBJ_BOUND = 4096 };
   TCCIRState *ir = s->ctx->ir;
   if (!s->esc_done) {
     s->esc_done = 1;
@@ -446,8 +508,8 @@ static int sccp_slot_addr_escapes(SCCPState *s, int load_lo, int load_hi)
           s->esc_all = 1;
           break;
         }
-        int lo = irop_get_stack_offset(o);
-        int hi = lo + SCCP_OBJ_BOUND;
+        int lo, hi;
+        sccp_frame_extent(s, irop_get_stack_offset(o), &lo, &hi);
         int act = sccp_esc_classify(op, roles[k], dest.is_lval);
         if (act == ESC_ESCAPE) {
           sccp_esc_add(s, lo, hi);
@@ -492,8 +554,7 @@ static int sccp_var_def_clobbers_slot(SCCPState *s, IRQuadCompact *q,
   if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
       q->op == TCCIR_OP_STORE_POSTINC)
     return 0; /* STORE-family dests are handled by the store target checks */
-  IROperand d = tcc_ir_op_get_dest(ir, q);
-  int32_t dv = irop_get_vreg(d);
+  int32_t dv = tcc_ir_op_dest_vreg(ir, q);
   if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_VAR)
     return 0;
   IRLiveInterval *vi = tcc_ir_vreg_live_interval(ir, dv);
@@ -530,17 +591,12 @@ static int sccp_scan_block_for_stack_store(SCCPState *s, IRBasicBlock *bb,
     }
     if (sq->op == TCCIR_OP_STORE_POSTINC)
       return SCCP_BOTTOM;  /* writes to memory + updates pointer */
+    if (sccp_op_writes_opaque_memory(sq->op))
+      return SCCP_BOTTOM;
     /* A BLOCK_COPY between the store and the load overwrites its whole range;
      * without this the stale store is forwarded across a folded strcpy. */
     if (sq->op == TCCIR_OP_BLOCK_COPY) {
-      IROperand bcd = tcc_ir_op_get_dest(ir, sq);
-      IROperand bcsz = tcc_ir_op_get_src2(ir, sq);
-      if (irop_get_tag(bcd) != IROP_TAG_STACKOFF || irop_get_vreg(bcd) != -1 ||
-          !irop_is_immediate(bcsz))
-        return SCCP_BOTTOM;
-      int bc_lo = (int)irop_get_stack_offset(bcd);
-      int bc_hi = bc_lo + (int)irop_get_imm64_ex(ir, bcsz);
-      if (bc_hi > load_lo && load_hi > bc_lo)
+      if (sccp_block_copy_may_hit(s, sq, load_lo, load_hi))
         return SCCP_BOTTOM;
       continue;
     }
@@ -595,8 +651,6 @@ static int sccp_no_aliasing_between(SCCPState *s, int store_idx, int load_idx,
   int load_size = sccp_btype_bytes(load_btype);
   int load_lo = soff;
   int load_hi = soff + load_size;
-  /* Assumed extent of a stack array when an indexed write has an unresolved index. */
-  const int LCS_INDEXED_MAX_ARRAY = 64;
   for (int i = store_idx + 1; i < load_idx; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     TccIrOp op = q->op;
@@ -610,7 +664,7 @@ static int sccp_no_aliasing_between(SCCPState *s, int store_idx, int load_idx,
         return 0;
       continue;
     }
-    if (op == TCCIR_OP_BLOCK_COPY)
+    if (op == TCCIR_OP_BLOCK_COPY || sccp_op_writes_opaque_memory(op))
       return 0;
     if (op != TCCIR_OP_STORE && op != TCCIR_OP_STORE_INDEXED &&
         op != TCCIR_OP_STORE_POSTINC)
@@ -627,9 +681,8 @@ static int sccp_no_aliasing_between(SCCPState *s, int store_idx, int load_idx,
     }
     int base_off = sccp_store_indexed_base_off(s->ctx, q);
     if (base_off != INT_MIN) {
-      int extent_lo = base_off;
-      int extent_hi = base_off + LCS_INDEXED_MAX_ARRAY;
-      if (extent_hi <= load_lo || extent_lo >= load_hi)
+      /* A variable index reaches anywhere in the array's object. */
+      if (!sccp_extent_overlaps(s, base_off, load_lo, load_hi))
         continue;
       return 0;
     }
@@ -674,21 +727,25 @@ static int sccp_resolved_stack_write_between(SCCPState *s, int store_idx, int lo
     if ((q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL) &&
         sccp_slot_addr_escapes(s, load_lo, load_hi))
       return 1;
+    if (sccp_op_writes_opaque_memory(q->op))
+      return 1;
+    if (q->op == TCCIR_OP_BLOCK_COPY) {
+      if (sccp_block_copy_may_hit(s, q, load_lo, load_hi))
+        return 1;
+      continue;
+    }
     if (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_STORE_INDEXED &&
         q->op != TCCIR_OP_STORE_POSTINC)
       continue;
     int store_btype = 0;
     int target = sccp_store_target_off(s->ctx, q, &store_btype);
     if (target == INT_MIN) {
-      /* A non-constant index still clobbers when the array's extent covers the slot. */
+      /* A non-constant index still clobbers when the array's object covers the slot. */
       if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC) {
-        const int LCS_INDEXED_MAX_ARRAY = 64;
         int base_off = sccp_indexed_store_base_off(s->ctx, q);
         if (base_off == INT_MIN)
           return 1;
-        int extent_lo = base_off;
-        int extent_hi = base_off + LCS_INDEXED_MAX_ARRAY;
-        if (extent_hi > load_lo && load_hi > extent_lo)
+        if (sccp_extent_overlaps(s, base_off, load_lo, load_hi))
           return 1;
       }
       /* A pointer STORE with no concrete stack slot can write any address-taken slot. */
@@ -753,7 +810,8 @@ static int sccp_loop_clobbers_slot(SCCPState *s, int load_idx, int soff, int loa
         continue;
       if (sccp_var_def_clobbers_slot(s, q, load_lo, load_hi))
         return 1;
-      if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_BLOCK_COPY)
+      if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_BLOCK_COPY ||
+          sccp_op_writes_opaque_memory(op))
         return 1;
       if (op != TCCIR_OP_STORE && op != TCCIR_OP_STORE_INDEXED && op != TCCIR_OP_STORE_POSTINC)
         continue;
@@ -805,14 +863,20 @@ static int sccp_loop_writes_slot_between(SCCPState *s, int from_idx, int to_idx,
             if (pvr >= 0)
               aoff = sccp_lea_slot(s->ctx, pvr);
           }
-          const int SCCP_OBJ_BOUND = 4096;
-          if (aoff != INT_MIN && aoff <= load_lo && load_lo - aoff < SCCP_OBJ_BOUND)
+          if (aoff != INT_MIN && sccp_extent_overlaps(s, aoff, load_lo, load_hi))
             return 1;
         }
         continue;
       }
+      if (sccp_op_writes_opaque_memory(op))
+        return 1;
+      if (op == TCCIR_OP_BLOCK_COPY) {
+        if (sccp_block_copy_may_hit(s, q, load_lo, load_hi))
+          return 1;
+        continue;
+      }
       /* Calls with no by-ref slot arg are left to the resolved-store check below. */
-      if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_BLOCK_COPY)
+      if (op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_FUNCCALLVAL)
         continue;
       if (sccp_var_def_clobbers_slot(s, q, load_lo, load_hi))
         return 1;
@@ -826,7 +890,9 @@ static int sccp_loop_writes_slot_between(SCCPState *s, int from_idx, int to_idx,
           return 1;
         continue;
       }
-      /* Unresolved indexed writes keep forwarding; opaque pointer derefs may alias. */
+      /* An unresolved indexed write is judged against its array's extent by
+       * sccp_resolved_stack_write_between / sccp_no_aliasing_between, which
+       * scan this range too; opaque pointer derefs may alias. */
       if (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_POSTINC)
         return 1;
       continue;
@@ -835,10 +901,54 @@ static int sccp_loop_writes_slot_between(SCCPState *s, int from_idx, int to_idx,
   return 0;
 }
 
-static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
-                                   int instr_idx, int64_t *out, int *dep_pos)
+/* Does a volatile access read or write a frame object -- `volatile char b[4]`,
+ * a volatile local struct?  Such an object holds whatever its next read
+ * returns, so a load of it is never resolved to a stored value.  Answered once
+ * per function and for the whole frame: the access may reach the object through
+ * a slot address or an indexed base whose extent is not known here, and
+ * functions with volatile locals are rare enough not to need finer ranges. */
+static int sccp_operand_is_volatile_frame(IRSSAOptCtx *ctx, IROperand o, int is_base)
+{
+  if (!(o.is_lval || is_base) || !irop_access_is_volatile(o))
+    return 0;
+  if (o.tag == IROP_TAG_STACKOFF && o.is_local && irop_get_vreg(o) == -1)
+    return 1;
+  int32_t vr = irop_get_vreg(o);
+  return o.tag == IROP_TAG_VREG && !o.is_local && vr >= 0 &&
+         TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP && sccp_lea_slot(ctx, vr) != INT_MIN;
+}
+
+static int sccp_volatile_frame_access(SCCPState *s)
+{
+  if (s->vol_done)
+    return s->vol_frame;
+  s->vol_done = 1;
+  TCCIRState *ir = s->ctx->ir;
+  if (!ir->func_has_volatile_access)
+    return 0;
+  for (int i = 0; i < ir->next_instruction_index && !s->vol_frame; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    const int load_base = q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_LOAD_POSTINC;
+    const int store_base = q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC;
+    if ((irop_config[q->op].has_dest &&
+         sccp_operand_is_volatile_frame(s->ctx, tcc_ir_op_get_dest(ir, q), store_base)) ||
+        (irop_config[q->op].has_src1 &&
+         sccp_operand_is_volatile_frame(s->ctx, tcc_ir_op_get_src1(ir, q), load_base)) ||
+        (irop_config[q->op].has_src2 && sccp_operand_is_volatile_frame(s->ctx, tcc_ir_op_get_src2(ir, q), 0)))
+      s->vol_frame = 1;
+  }
+  return s->vol_frame;
+}
+
+static int sccp_resolve_stack_load_raw(SCCPState *s, int soff, int load_btype,
+                                       int instr_idx, int64_t *out, int *dep_pos)
 {
   IRCFG *cfg = s->ctx->cfg;
+  if (sccp_volatile_frame_access(s))
+    return SCCP_BOTTOM;
   int block = cfg->instr_to_block[instr_idx];
   IRBasicBlock *bb = &cfg->blocks[block];
 
@@ -904,6 +1014,23 @@ static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype,
   return SCCP_BOTTOM;
 }
 
+/* The lattice holds a 32-bit value sign-extended, but an 8/16-bit slot keeps
+ * only the low bits of what was stored and the load extends them by ITS
+ * signedness, whatever the store's.  Forwarding the store's source as is
+ * folded `(signed char)200` to 200 and `(short)70000` to 70000. */
+static int sccp_resolve_stack_load(SCCPState *s, int soff, int load_btype, int load_unsigned,
+                                   int instr_idx, int64_t *out, int *dep_pos)
+{
+  int st = sccp_resolve_stack_load_raw(s, soff, load_btype, instr_idx, out, dep_pos);
+  if (st != SCCP_CONST)
+    return st;
+  if (load_btype == IROP_BTYPE_INT8)
+    *out = load_unsigned ? (int64_t)(uint8_t)*out : (int64_t)(int8_t)*out;
+  else if (load_btype == IROP_BTYPE_INT16)
+    *out = load_unsigned ? (int64_t)(uint16_t)*out : (int64_t)(int16_t)*out;
+  return st;
+}
+
 /* *dep_src_pos reports the TEMP a STORE-based resolution depends on, or -1. */
 static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
                             int64_t *out, int *dep_src_pos)
@@ -925,19 +1052,18 @@ static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL)
+    if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL ||
+        sccp_op_writes_opaque_memory(q->op))
       return SCCP_BOTTOM;
 
     if (irop_config[q->op].has_dest && q->op != TCCIR_OP_STORE &&
         q->op != TCCIR_OP_STORE_INDEXED && q->op != TCCIR_OP_STORE_POSTINC) {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t dv = irop_get_vreg(dest);
+      int32_t dv = tcc_ir_op_dest_vreg(ir, q);
       if (dv >= 0 && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_VAR &&
           TCCIR_DECODE_VREG_POSITION(dv) == var_pos) {
         if (q->op == TCCIR_OP_ASSIGN) {
-          IROperand src = tcc_ir_op_get_src1(ir, q);
-          if (irop_is_immediate(src)) {
-            *out = irop_get_imm64_ex(ir, src);
+          if (tcc_ir_op_src1_is_imm(ir, q)) {
+            *out = tcc_ir_op_src1_imm(ir, q);
             return SCCP_CONST;
           }
         }
@@ -989,14 +1115,12 @@ static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
               continue;
             int is_def = 0;
             if (lq->op == TCCIR_OP_ASSIGN || lq->op == TCCIR_OP_LEA) {
-              IROperand ld = tcc_ir_op_get_dest(ir, lq);
-              if (irop_get_vreg(ld) == cur_vr)
+              if (tcc_ir_op_dest_vreg(ir, lq) == cur_vr)
                 is_def = 1;
             }
             if (!is_def && lq->op == TCCIR_OP_STORE) {
-              IROperand ld = tcc_ir_op_get_dest(ir, lq);
-              int32_t sd = irop_get_vreg(ld);
-              if (sd == cur_vr && !ld.is_lval)
+              int32_t sd = tcc_ir_op_dest_vreg(ir, lq);
+              if (sd == cur_vr && !tcc_ir_op_dest_is_lval(ir, lq))
                 is_def = 1;
             }
             if (is_def) {
@@ -1013,8 +1137,7 @@ static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
               break;
             }
             if (irop_config[lq->op].has_dest) {
-              IROperand ld = tcc_ir_op_get_dest(ir, lq);
-              if (irop_get_vreg(ld) == cur_vr)
+              if (tcc_ir_op_dest_vreg(ir, lq) == cur_vr)
                 break;
             }
           }
@@ -1029,6 +1152,18 @@ static int sccp_resolve_var(SCCPState *s, int32_t var_vreg, int instr_idx,
         /* Never walk past an unknown pointer store: it may alias this VAR. */
         return SCCP_BOTTOM;
       }
+    }
+
+    /* Nor past an indexed or post-increment store, or a block copy, when V's
+     * address is taken: mem_inline lowers `memcpy(asBytes(&v), src, 4)` to
+     * `T <-- x STORE_INDEXED #0` with T = &v, and walking past it folded v to
+     * its zero initializer (yasld's find_thunk never matched in the tcc-built
+     * kernel, gcc-torture 930608-1). */
+    if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC ||
+        q->op == TCCIR_OP_BLOCK_COPY) {
+      IRLiveInterval *vi = tcc_ir_vreg_live_interval(ir, var_vreg);
+      if (!vi || vi->addrtaken)
+        return SCCP_BOTTOM;
     }
   }
 
@@ -1051,7 +1186,7 @@ static int sccp_get_operand_value_ex(SCCPState *s, IROperand op,
       int load_off = sccp_lea_slot(s->ctx, tvr);
       if (load_off != INT_MIN) {
         int dep_pos = -1;
-        int st = sccp_resolve_stack_load(s, load_off, irop_get_btype(op),
+        int st = sccp_resolve_stack_load(s, load_off, irop_get_btype(op), op.is_unsigned,
                                           instr_idx, out, &dep_pos);
         if (st == SCCP_CONST)
           return SCCP_CONST;
@@ -1067,7 +1202,7 @@ static int sccp_get_operand_value_ex(SCCPState *s, IROperand op,
     if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR) {
       int dep_pos = -1;
       int st = sccp_resolve_stack_load(s, irop_get_stack_offset(op),
-                                        irop_get_btype(op), instr_idx, out,
+                                        irop_get_btype(op), op.is_unsigned, instr_idx, out,
                                         &dep_pos);
       if (st == SCCP_CONST)
         return SCCP_CONST;
@@ -1303,9 +1438,8 @@ static void sccp_visit_instr(SCCPState *s, int idx)
    * (304_fuzz).  Lval dests (through-pointer stores) stay excluded. */
   int store_def_of_temp = 0;
   if (q->op == TCCIR_OP_STORE) {
-    IROperand sd = tcc_ir_op_get_dest(ir, q);
-    int32_t sdv = irop_get_vreg(sd);
-    store_def_of_temp = (!sd.is_lval && sdv >= 0 &&
+    int32_t sdv = tcc_ir_op_dest_vreg(ir, q);
+    store_def_of_temp = (!tcc_ir_op_dest_is_lval(ir, q) && sdv >= 0 &&
                          TCCIR_DECODE_VREG_TYPE(sdv) == TCCIR_VREG_TYPE_TEMP);
   }
   if (irop_config[q->op].has_dest &&
@@ -1417,7 +1551,7 @@ static void sccp_visit_instr(SCCPState *s, int idx)
         int64_t sval = 0;
         int dep_pos = -1;
         int rst = sccp_resolve_stack_load(s, irop_get_stack_offset(src),
-                                           irop_get_btype(src), idx, &sval,
+                                           irop_get_btype(src), src.is_unsigned, idx, &sval,
                                            &dep_pos);
         if (rst == SCCP_CONST) {
           int changed = sccp_meet(dest_cell, sval);
@@ -1434,7 +1568,7 @@ static void sccp_visit_instr(SCCPState *s, int idx)
         if (eff_off != INT_MIN) {
           int64_t sval = 0;
           int dep_pos = -1;
-          int rst = sccp_resolve_stack_load(s, eff_off, irop_get_btype(src),
+          int rst = sccp_resolve_stack_load(s, eff_off, irop_get_btype(src), src.is_unsigned,
                                              idx, &sval, &dep_pos);
           if (rst == SCCP_CONST) {
             int changed = sccp_meet(dest_cell, sval);
@@ -1464,8 +1598,7 @@ handle_control_flow:
       sccp_visit_instr(s, ni);
   }
   if (q->op == TCCIR_OP_JUMP) {
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int target = dest.u.imm32;
+    int target = tcc_ir_op_dest_u_imm32(ir, q);
     int target_block = (target >= 0 && target < cfg->num_instrs) ?
                         cfg->instr_to_block[target] : -1;
     sccp_add_cfg_edge(s, block, target_block);
@@ -1475,8 +1608,7 @@ handle_control_flow:
     while (ci >= 0 && ir->compact_instructions[ci].op == TCCIR_OP_NOP)
       ci--;
 
-    IROperand jmp_dest = tcc_ir_op_get_dest(ir, q);
-    int target = jmp_dest.u.imm32;
+    int target = tcc_ir_op_dest_u_imm32(ir, q);
     int target_block = (target >= 0 && target < cfg->num_instrs) ?
                         cfg->instr_to_block[target] : -1;
     IRBasicBlock *bb = &cfg->blocks[block];
@@ -1531,8 +1663,7 @@ handle_control_flow:
               v2 = (int64_t)(int32_t)m;
             }
           }
-          IROperand cond = tcc_ir_op_get_src1(ir, q);
-          int tok = (int)irop_get_imm64_ex(ir, cond);
+          int tok = (int)tcc_ir_op_src1_imm(ir, q);
           int result = bs_ok ? sccp_eval_cond(v1, v2, tok) : -1;
           if (result >= 0) {
             if (result)
@@ -1548,8 +1679,7 @@ handle_control_flow:
         int64_t v1;
         int st1 = sccp_get_operand_value_ex(s, s1, ci, &v1);
         if (st1 == SCCP_CONST) {
-          IROperand cond = tcc_ir_op_get_src1(ir, q);
-          int tok = (int)irop_get_imm64_ex(ir, cond);
+          int tok = (int)tcc_ir_op_src1_imm(ir, q);
           int branch = (tok == 0x94) ? (v1 == 0) : (tok == 0x95) ? (v1 != 0) : -1;
           if (branch >= 0) {
             if (branch)
@@ -1702,13 +1832,13 @@ static int sccp_materialize_const_phis(SCCPState *s)
          * materializing register at codegen, and skipping these costs 0 bytes
          * across the ir_tests corpus. */
         if (uq->op == TCCIR_OP_MLA &&
-            irop_get_vreg(tcc_ir_op_get_accum(ir, uq)) == dvr) { ok = 0; break; }
+            tcc_ir_op_accum_vreg(ir, uq) == dvr) { ok = 0; break; }
         int in_src = 0;
         if (irop_config[uq->op].has_src1 &&
-            irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == dvr)
+            tcc_ir_op_src1_vreg(ir, uq) == dvr)
           in_src = 1;
         if (irop_config[uq->op].has_src2 &&
-            irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == dvr)
+            tcc_ir_op_src2_vreg(ir, uq) == dvr)
           in_src = 1;
         if (!in_src) { ok = 0; break; }   /* dest/accum/other position */
       }
@@ -1778,8 +1908,7 @@ static int sccp_apply(SCCPState *s)
     if (ssa_opt_has_side_effects(q->op))
       continue;
     if (q->op == TCCIR_OP_ASSIGN) {
-      IROperand src = tcc_ir_op_get_src1(ir, q);
-      if (irop_is_immediate(src))
+      if (tcc_ir_op_src1_is_imm(ir, q))
         continue;
     }
 
@@ -1798,17 +1927,17 @@ static int sccp_apply(SCCPState *s)
     }
 
     if (irop_config[q->op].has_src1) {
-      IRSSAVregInfo *svi = ssa_opt_vinfo(s->ctx, irop_get_vreg(tcc_ir_op_get_src1(ir, q)));
+      IRSSAVregInfo *svi = ssa_opt_vinfo(s->ctx, tcc_ir_op_src1_vreg(ir, q));
       if (svi) ssa_opt_remove_use_instr(svi, vi->def_instr);
     }
     if (irop_config[q->op].has_src2) {
-      IRSSAVregInfo *svi = ssa_opt_vinfo(s->ctx, irop_get_vreg(tcc_ir_op_get_src2(ir, q)));
+      IRSSAVregInfo *svi = ssa_opt_vinfo(s->ctx, tcc_ir_op_src2_vreg(ir, q));
       if (svi) ssa_opt_remove_use_instr(svi, vi->def_instr);
     }
 
     q->op = TCCIR_OP_ASSIGN;
     tcc_ir_set_src1(ir, vi->def_instr, imm);
-    tcc_ir_set_src2(ir, vi->def_instr, IROP_NONE);
+    tcc_ir_set_src2_none(ir, vi->def_instr);
     changes++;
     TCC_DBG_BLOCK(scan_imm_dest) {
       for (int j = 0; j < ir->next_instruction_index; j++) {
@@ -1836,7 +1965,7 @@ static int sccp_apply(SCCPState *s)
     int block = cfg->instr_to_block[i];
     IRBasicBlock *bb = &cfg->blocks[block];
     for (int oi = 0; oi < n_srcs; oi++) {
-      IROperand src = oi == 0 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand src = tcc_ir_op_get_src1_or_2(ir, q, oi != 0);
       if (irop_is_immediate(src))
         continue;
 
@@ -1850,7 +1979,7 @@ static int sccp_apply(SCCPState *s)
           int load_off = sccp_lea_slot(s->ctx, tvr);
           if (load_off != INT_MIN) {
             int dep_pos = -1;
-            int st = sccp_resolve_stack_load(s, load_off, irop_get_btype(src),
+            int st = sccp_resolve_stack_load(s, load_off, irop_get_btype(src), src.is_unsigned,
                                               i, &val, &dep_pos);
             if (st == SCCP_CONST)
               got = 1;
@@ -1870,7 +1999,7 @@ static int sccp_apply(SCCPState *s)
         if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR) {
           int dep_pos = -1;
           int st = sccp_resolve_stack_load(s, irop_get_stack_offset(src),
-                                            irop_get_btype(src), i, &val,
+                                            irop_get_btype(src), src.is_unsigned, i, &val,
                                             &dep_pos);
           if (st == SCCP_CONST)
             got = 1;
@@ -1895,7 +2024,8 @@ static int sccp_apply(SCCPState *s)
             if (kq->op == TCCIR_OP_NOP) continue;
             if (kq->op == TCCIR_OP_FUNCCALLVOID || kq->op == TCCIR_OP_FUNCCALLVAL)
               break;
-            if (kq->op == TCCIR_OP_STORE_INDEXED || kq->op == TCCIR_OP_STORE_POSTINC)
+            if (kq->op == TCCIR_OP_STORE_INDEXED || kq->op == TCCIR_OP_STORE_POSTINC ||
+                kq->op == TCCIR_OP_BLOCK_COPY || sccp_op_writes_opaque_memory(kq->op))
               break;
             if (irop_config[kq->op].has_dest) {
               IROperand kd = tcc_ir_op_get_dest(ir, kq);
@@ -1934,8 +2064,7 @@ static int sccp_apply(SCCPState *s)
                 for (int oi = 0; oi < 2; oi++) {
                   if (oi == 0 && !irop_config[uq->op].has_src1) continue;
                   if (oi == 1 && !irop_config[uq->op].has_src2) continue;
-                  IROperand op = oi == 0 ? tcc_ir_op_get_src1(ir, uq)
-                                         : tcc_ir_op_get_src2(ir, uq);
+                  IROperand op = tcc_ir_op_get_src1_or_2(ir, uq, oi != 0);
                   if (irop_get_vreg(op) == svr &&
                       !(op.is_local && !op.is_lval)) {
                     other_uses++;
@@ -1999,11 +2128,14 @@ int ssa_opt_sccp(IRSSAOptCtx *ctx)
   s.cells = tcc_mallocz(ntmp * sizeof(SCCPCell));
   s.block_reachable = tcc_mallocz(nb);
   s.edge_exec = tcc_mallocz((size_t)nb * nb);
-  int max_edges = nb * nb < 4096 ? nb * nb : 4096;
-  s.cfg_wl_cap = max_edges;
-  s.cfg_wl = tcc_mallocz(max_edges * sizeof(int));
-  s.ssa_wl_cap = ntmp;
-  s.ssa_wl = tcc_mallocz(ntmp * sizeof(int));
+  /* Both worklists grow on push (sccp_add_cfg_edge, sccp_add_ssa): start
+   * them small.  Sized for the worst case (up to 4096 edges, every TEMP) they
+   * were among the largest blocks of an -O2 compile, while a worklist holds a
+   * few entries at once. */
+  s.cfg_wl_cap = 64;
+  s.cfg_wl = tcc_mallocz(s.cfg_wl_cap * sizeof(int));
+  s.ssa_wl_cap = 64;
+  s.ssa_wl = tcc_mallocz(s.ssa_wl_cap * sizeof(int));
 
   /* Entry definitions have no def site; they must start BOTTOM, not TOP. */
   for (int pos = 0; pos < ntmp; pos++) {

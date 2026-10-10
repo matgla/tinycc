@@ -569,6 +569,124 @@ UT_TEST(test_shl_store_indexed_fuse_swapped_add_operands)
   return 0;
 }
 
+/* POSITIVE: the `[addr, #0]` STORE_INDEXED that mem_inline emits for an
+ * align(1) word store through a pointer (the Zig backend's memcpy of a word)
+ * fuses like the plain STORE does -- the zero offset is the fused form's
+ * [Rn, Rm, LSL #scale] with no displacement. */
+UT_TEST(test_shl_store_indexed_fuse_zero_offset_indexed)
+{
+  TCCIRState *ir = utb_ssa_new(6);
+  int shl = utb_emit(ir, TCCIR_OP_SHL, utb_temp(2, I32), utb_temp(0, I32), utb_imm(2, I32));
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(3, I32), utb_temp(1, I32), utb_temp(2, I32));
+  int st = utb_emit(ir, TCCIR_OP_STORE_INDEXED, utb_temp(3, I32), utb_temp(4, I32), utb_imm(0, I32));
+
+  IRSSAOptCtx ctx;
+  utb_ssa_ctx_init(&ctx, ir);
+  utb_def(&ctx, utb_vreg(utb_temp(2, I32)), shl);
+  utb_def(&ctx, utb_vreg(utb_temp(3, I32)), add);
+  utb_use(&ctx, utb_vreg(utb_temp(2, I32)), add);
+  utb_use(&ctx, utb_vreg(utb_temp(3, I32)), st);
+
+  int r = ssa_gen_arm_fuse_shl_add_to_store_indexed(&ctx, shl);
+
+  UT_ASSERT_EQ(r, 1);
+  UT_ASSERT_EQ(utb_op(ir, shl), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, st), TCCIR_OP_STORE_INDEXED);
+  UT_ASSERT_EQ(utb_vreg(utb_dest(ir, st)), utb_vreg(utb_temp(1, I32))); /* base */
+  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, st)), utb_vreg(utb_temp(4, I32))); /* value */
+  UT_ASSERT_EQ(utb_vreg(utb_src2(ir, st)), utb_vreg(utb_temp(0, I32))); /* idx */
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_op4(ir, st)), 2);         /* scale */
+
+  utb_ssa_ctx_free(&ctx);
+  utb_free(ir);
+  return 0;
+}
+
+/* Negative: the STORE_INDEXED's immediate offset is not #0 -- the fused
+ * [Rn, Rm, LSL #scale] cannot express it, must not fuse. */
+UT_TEST(test_shl_store_indexed_no_fuse_indexed_nonzero_offset)
+{
+  TCCIRState *ir = utb_ssa_new(6);
+  int shl = utb_emit(ir, TCCIR_OP_SHL, utb_temp(2, I32), utb_temp(0, I32), utb_imm(2, I32));
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(3, I32), utb_temp(1, I32), utb_temp(2, I32));
+  int st = utb_emit(ir, TCCIR_OP_STORE_INDEXED, utb_temp(3, I32), utb_temp(4, I32), utb_imm(4, I32));
+
+  IRSSAOptCtx ctx;
+  utb_ssa_ctx_init(&ctx, ir);
+  utb_def(&ctx, utb_vreg(utb_temp(2, I32)), shl);
+  utb_def(&ctx, utb_vreg(utb_temp(3, I32)), add);
+  utb_use(&ctx, utb_vreg(utb_temp(2, I32)), add);
+  utb_use(&ctx, utb_vreg(utb_temp(3, I32)), st);
+
+  int r = ssa_gen_arm_fuse_shl_add_to_store_indexed(&ctx, shl);
+
+  UT_ASSERT_EQ(r, 0);
+  UT_ASSERT_EQ(utb_op(ir, shl), TCCIR_OP_SHL);
+
+  utb_ssa_ctx_free(&ctx);
+  utb_free(ir);
+  return 0;
+}
+
+/* POSITIVE: the LOAD-side twin -- the `[addr, #0]` LOAD_INDEXED mem_inline
+ * emits for an align(1) word load through a pointer fuses like a plain LOAD.
+ * The dest already carries the access width, so no width transfer happens. */
+UT_TEST(test_shl_load_indexed_fuse_indexed_zero_offset)
+{
+  TCCIRState *ir = utb_ssa_new(6);
+  int shl = utb_emit(ir, TCCIR_OP_SHL, utb_temp(2, I32), utb_temp(0, I32), utb_imm(2, I32));
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(3, I32), utb_temp(1, I32), utb_temp(2, I32));
+  int ld = utb_emit(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(4, I32), utb_temp(3, I32), utb_imm(0, I32));
+
+  IRSSAOptCtx ctx;
+  utb_ssa_ctx_init(&ctx, ir);
+  utb_def(&ctx, utb_vreg(utb_temp(2, I32)), shl);
+  utb_def(&ctx, utb_vreg(utb_temp(3, I32)), add);
+  utb_use(&ctx, utb_vreg(utb_temp(2, I32)), add);
+  utb_use(&ctx, utb_vreg(utb_temp(3, I32)), ld);
+
+  int r = ssa_gen_arm_fuse_shl_add_to_load_indexed(&ctx, shl);
+
+  UT_ASSERT_EQ(r, 1);
+  UT_ASSERT_EQ(utb_op(ir, shl), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, add), TCCIR_OP_NOP);
+  UT_ASSERT_EQ(utb_op(ir, ld), TCCIR_OP_LOAD_INDEXED);
+  UT_ASSERT_EQ(utb_vreg(utb_dest(ir, ld)), utb_vreg(utb_temp(4, I32))); /* result */
+  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, ld)), utb_vreg(utb_temp(1, I32))); /* base */
+  UT_ASSERT_EQ(utb_vreg(utb_src2(ir, ld)), utb_vreg(utb_temp(0, I32))); /* idx */
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, utb_op4(ir, ld)), 2);         /* scale */
+
+  utb_ssa_ctx_free(&ctx);
+  utb_free(ir);
+  return 0;
+}
+
+/* Negative: LOAD_INDEXED's immediate offset is not #0 -- must not fuse. */
+UT_TEST(test_shl_load_indexed_no_fuse_indexed_nonzero_offset)
+{
+  TCCIRState *ir = utb_ssa_new(6);
+  int shl = utb_emit(ir, TCCIR_OP_SHL, utb_temp(2, I32), utb_temp(0, I32), utb_imm(2, I32));
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(3, I32), utb_temp(1, I32), utb_temp(2, I32));
+  int ld = utb_emit(ir, TCCIR_OP_LOAD_INDEXED, utb_temp(4, I32), utb_temp(3, I32), utb_imm(4, I32));
+
+  IRSSAOptCtx ctx;
+  utb_ssa_ctx_init(&ctx, ir);
+  utb_def(&ctx, utb_vreg(utb_temp(2, I32)), shl);
+  utb_def(&ctx, utb_vreg(utb_temp(3, I32)), add);
+  utb_use(&ctx, utb_vreg(utb_temp(2, I32)), add);
+  utb_use(&ctx, utb_vreg(utb_temp(3, I32)), ld);
+
+  int r = ssa_gen_arm_fuse_shl_add_to_load_indexed(&ctx, shl);
+
+  UT_ASSERT_EQ(r, 0);
+  UT_ASSERT_EQ(utb_op(ir, shl), TCCIR_OP_SHL);
+
+  utb_ssa_ctx_free(&ctx);
+  utb_free(ir);
+  return 0;
+}
+
 /* ========================================================================
  * ssa_gen_arm_reduce_mul_to_shift
  * dest = MUL(src, #pow2) -> dest = SHL(src, #log2(pow2))
@@ -1035,6 +1153,36 @@ UT_TEST(test_mla_accum_add_imm_fuse_basic)
   IROperand accum = utb_op4(ir, mla);
   UT_ASSERT_EQ(utb_vreg(accum), utb_vreg(utb_temp(3, I32)));
   UT_ASSERT_EQ(accum.is_lval, 0);
+
+  utb_ssa_ctx_free(&ctx);
+  utb_free(ir);
+  return 0;
+}
+
+/* Regression: the address-computing ADD sits BEFORE an intervening STORE that
+ * may alias the accumulator's memory (LICM/GVN hoisting an invariant LEA above
+ * an aliasing store).  Relocating the load up to the ADD would read the pre-
+ * store value, so the fusion must bail.  Locks the clobber/control-flow window
+ * guard in ssa_gen_arm_fuse_mla_accum_through_add_imm. */
+UT_TEST(test_mla_accum_add_imm_no_fuse_intervening_store)
+{
+  TCCIRState *ir = utb_ssa_new(12);
+  int lea = utb_emit(ir, TCCIR_OP_ADD, utb_temp(3, I32), utb_temp(0, I32), utb_imm(16, I32));
+  int st  = utb_emit(ir, TCCIR_OP_STORE, utb_lval(utb_temp(7, I32)), utb_temp(8, I32), UTB_NONE);
+  int mla = utb_emit4(ir, TCCIR_OP_MLA, utb_temp(4, I32), utb_temp(1, I32), utb_temp(2, I32),
+                      utb_lval(utb_temp(3, I32)));
+
+  IRSSAOptCtx ctx;
+  utb_ssa_ctx_init(&ctx, ir);
+  utb_def(&ctx, utb_vreg(utb_temp(3, I32)), lea);
+  utb_use(&ctx, utb_vreg(utb_temp(3, I32)), mla);
+
+  int r = ssa_gen_arm_fuse_mla_accum_through_add_imm(&ctx, mla);
+
+  UT_ASSERT_EQ(r, 0);
+  UT_ASSERT_EQ(utb_op(ir, lea), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_op(ir, st), TCCIR_OP_STORE);
+  UT_ASSERT_EQ(utb_op(ir, mla), TCCIR_OP_MLA);
 
   utb_ssa_ctx_free(&ctx);
   utb_free(ir);

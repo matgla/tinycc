@@ -251,6 +251,45 @@ void tok_str_add_tok(TokenString *s)
   }
 }
 
+/* Stand-ins for tccpp.c's token-string codec (asm macro expansion uses them).
+ * Only the token shapes the asm tests produce are handled: no value, one word
+ * (TOK_CCHAR..TOK_LINENUM) and length-prefixed strings. */
+void tok_str_add2(TokenString *s, int t, CValue *cv)
+{
+  tok_str_add(s, t);
+  if (t >= TOK_CCHAR && t <= TOK_LINENUM)
+  {
+    tok_str_add(s, cv->i);
+  }
+  else if (t == TOK_STR || t == TOK_LSTR || t == TOK_PPNUM || t == TOK_PPSTR)
+  {
+    int size = cv->str.size;
+    int nb = (size + (int)sizeof(int) - 1) / (int)sizeof(int);
+    tok_str_add(s, size);
+    ut_tok_str_grow(s, nb);
+    memcpy(&tok_str_buf(s)[s->len], cv->str.data, (size_t)size);
+    s->len += nb;
+  }
+}
+
+void tok_get(int *t, const int **pp, CValue *cv)
+{
+  const int *p = *pp;
+
+  *t = *p++;
+  if (*t >= TOK_CCHAR && *t <= TOK_LINENUM)
+  {
+    cv->i = *p++;
+  }
+  else if (*t == TOK_STR || *t == TOK_LSTR || *t == TOK_PPNUM || *t == TOK_PPSTR)
+  {
+    cv->str.size = *p++;
+    cv->str.data = (char *)p;
+    p += (cv->str.size + (int)sizeof(int) - 1) / (int)sizeof(int);
+  }
+  *pp = p;
+}
+
 void begin_macro(TokenString *str, int alloc) { (void)str; (void)alloc; }
 void end_macro(void) {}
 
@@ -1051,9 +1090,10 @@ UT_TEST(test_asm_parse_directive_align_and_fill_value)
   cur_text_section = &sec;
   ind = 1;
 
+  /* GAS on ARM: `.align 2` is 2^2 = 4-byte alignment. */
   tok = TOK_ASMDIR_align;
   utb_clear_token_q();
-  utb_queue_ppnum("4");
+  utb_queue_ppnum("2");
   utb_queue_token(',');
   utb_queue_ppnum("0xAB");
   asm_parse_directive(tcc_state, 1);
@@ -1110,23 +1150,34 @@ UT_TEST(test_asm_parse_directive_byte_word_long)
   UT_ASSERT_EQ(buf[1], 2);
   UT_ASSERT_EQ(ind, 2);
 
+  /* GAS on ARM: .word is 32 bits (.short / .hword is the 16-bit one). */
   tok = TOK_ASMDIR_word;
   utb_clear_token_q();
   utb_queue_ppnum("0x1234");
   asm_parse_directive(tcc_state, 1);
   UT_ASSERT_EQ(buf[2], 0x34);
   UT_ASSERT_EQ(buf[3], 0x12);
-  UT_ASSERT_EQ(ind, 4);
+  UT_ASSERT_EQ(buf[4], 0x00);
+  UT_ASSERT_EQ(buf[5], 0x00);
+  UT_ASSERT_EQ(ind, 6);
+
+  tok = TOK_ASMDIR_short;
+  utb_clear_token_q();
+  utb_queue_ppnum("0x5678");
+  asm_parse_directive(tcc_state, 1);
+  UT_ASSERT_EQ(buf[6], 0x78);
+  UT_ASSERT_EQ(buf[7], 0x56);
+  UT_ASSERT_EQ(ind, 8);
 
   tok = TOK_ASMDIR_long;
   utb_clear_token_q();
   utb_queue_ppnum("0xdeadbeef");
   asm_parse_directive(tcc_state, 1);
-  UT_ASSERT_EQ(buf[4], 0xef);
-  UT_ASSERT_EQ(buf[5], 0xbe);
-  UT_ASSERT_EQ(buf[6], 0xad);
-  UT_ASSERT_EQ(buf[7], 0xde);
-  UT_ASSERT_EQ(ind, 8);
+  UT_ASSERT_EQ(buf[8], 0xef);
+  UT_ASSERT_EQ(buf[9], 0xbe);
+  UT_ASSERT_EQ(buf[10], 0xad);
+  UT_ASSERT_EQ(buf[11], 0xde);
+  UT_ASSERT_EQ(ind, 12);
   return 0;
 }
 

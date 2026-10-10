@@ -117,6 +117,29 @@ char *tcc_strdup(const char *str)
   return p;
 }
 
+/* arm-thumb-gen.c's frame offsets, for arm-thumb-asm.c's memory operands. */
+int ut_stub_frame_size; /* allocated_stack_size, as a test sets it */
+__attribute__((weak)) int fp_adjust_local_offset(int frame_offset, int is_param)
+{
+  return (is_param || frame_offset > 0) ? frame_offset : ut_stub_frame_size + frame_offset;
+}
+__attribute__((weak)) int param_frame_offset(int param_off) { return param_off; }
+__attribute__((weak)) int asm_save_sp_bias;
+
+/* libtcc.c's, for tccasm.c's .incbin dependency (-MD). */
+void dynarray_add(void *ptab, int *nb_ptr, void *data)
+{
+  int nb = *nb_ptr;
+  void **pp = *(void ***)ptab;
+  if ((nb & (nb - 1)) == 0)
+  {
+    pp = tcc_realloc(pp, (nb ? nb * 2 : 1) * sizeof(void *));
+    *(void ***)ptab = pp;
+  }
+  pp[nb++] = data;
+  *nb_ptr = nb;
+}
+
 /* ───── Minimal stubs for thumb code paths ───── */
 
 #include <stdio.h>
@@ -127,6 +150,16 @@ void _tcc_error(const char *fmt, ...)
   va_list ap;
   va_start(ap, fmt);
   fprintf(stderr, "[test stub] _tcc_error: ");
+  vfprintf(stderr, fmt, ap);
+  va_end(ap);
+  abort();
+}
+
+void _tcc_ice(const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  fprintf(stderr, "[test stub] _tcc_ice: ");
   vfprintf(stderr, fmt, ap);
   va_end(ap);
   abort();
@@ -486,12 +519,11 @@ int tok_alloc_const(const char *str)
   return utb_next_tok++;
 }
 
+/* Mirrors TokenSym (tcc.h): tags and labels are not in it any more. */
 typedef struct UtbTokenSym
 {
   struct UtbTokenSym *hash_next;
   void *sym_define;
-  void *sym_label;
-  void *sym_struct;
   void *sym_identifier;
   int tok;
   int len;
@@ -549,6 +581,17 @@ int gv(int rc)
   (void)rc;
   fprintf(stderr, "[test stub] gv: unexpectedly called (VT_BITFIELD test-gen "
                    "path is not supported by this harness)\n");
+  abort();
+}
+
+/* ir/gen/put.c's tcc_ir_put() loads a byte-reversed (big-endian
+ * scalar_storage_order) lvalue operand through the frontend.  No test here
+ * builds one (svalue_init() clears sso_reversed), so trap like gv() above. */
+void sso_load_operand(const struct SValue *sv, struct SValue *out)
+{
+  (void)sv;
+  (void)out;
+  fprintf(stderr, "[test stub] sso_load_operand: unexpectedly called\n");
   abort();
 }
 

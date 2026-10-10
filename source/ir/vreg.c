@@ -77,6 +77,40 @@ int tcc_ir_vreg_is_ignored(TCCIRState *ir, int vreg)
 /* Forward declaration for interval initialization */
 static void ir_vreg_intervals_init(IRLiveInterval *intervals, int count);
 
+/* Resize one interval array to exactly `cap` entries; a new tail is zeroed and
+ * initialised.  The array moves: no caller may keep an IRLiveInterval pointer
+ * across an allocation. */
+static void ir_vreg_intervals_resize(IRLiveInterval **intervals, int *size, int cap)
+{
+  const int used = *size;
+  *intervals = (IRLiveInterval *)tcc_realloc(*intervals, sizeof(IRLiveInterval) * cap);
+  if (cap > used)
+  {
+    memset(&(*intervals)[used], 0, sizeof(IRLiveInterval) * (cap - used));
+    ir_vreg_intervals_init(&(*intervals)[used], cap - used);
+  }
+  *size = cap;
+}
+
+/* Grow one interval array to hold at least `need` entries.  The arrays are
+ * freed after every function, so the slack left in the largest one is what
+ * reaches the peak.  CONFIG_TCC_LOW_MEM grows by 1.5x instead of doubling: a
+ * few more reallocs on a large function for about a third less slack.  (The
+ * instruction array and operand pool keep doubling: ra_resolve_phis replaces
+ * the one and doubles the other itself, so a 1.5x step there only moved which
+ * files got lucky -- measured worse over the corpus.) */
+static void ir_vreg_intervals_grow(IRLiveInterval **intervals, int *size, int need)
+{
+  int cap = *size > 0 ? *size : 1;
+  while (cap < need)
+#ifdef CONFIG_TCC_LOW_MEM
+    cap += cap > 1 ? cap >> 1 : 1;
+#else
+    cap <<= 1;
+#endif
+  ir_vreg_intervals_resize(intervals, size, cap);
+}
+
 /* Allocate a temporary virtual register */
 int tcc_ir_vreg_alloc_temp(TCCIRState *ir)
 {
@@ -84,16 +118,8 @@ int tcc_ir_vreg_alloc_temp(TCCIRState *ir)
     return -1;
 
   if (ir->next_temporary_variable >= ir->temporary_variables_live_intervals_size)
-  {
-    const int used = ir->temporary_variables_live_intervals_size;
-    ir->temporary_variables_live_intervals_size <<= 1;
-    ir->temporary_variables_live_intervals = (IRLiveInterval *)tcc_realloc(
-        ir->temporary_variables_live_intervals, sizeof(IRLiveInterval) * ir->temporary_variables_live_intervals_size);
-    memset(&ir->temporary_variables_live_intervals[used], 0,
-           sizeof(IRLiveInterval) * (ir->temporary_variables_live_intervals_size - used));
-    ir_vreg_intervals_init(&ir->temporary_variables_live_intervals[used],
-                           ir->temporary_variables_live_intervals_size - used);
-  }
+    ir_vreg_intervals_grow(&ir->temporary_variables_live_intervals, &ir->temporary_variables_live_intervals_size,
+                           ir->next_temporary_variable + 1);
 
   const int next_temp_vr = ir->next_temporary_variable;
   ++ir->next_temporary_variable;
@@ -107,14 +133,8 @@ int tcc_ir_vreg_alloc_var(TCCIRState *ir)
     return -1;
 
   if (ir->next_local_variable >= ir->variables_live_intervals_size)
-  {
-    const int used = ir->variables_live_intervals_size;
-    ir->variables_live_intervals_size <<= 1;
-    ir->variables_live_intervals = (IRLiveInterval *)tcc_realloc(
-        ir->variables_live_intervals, sizeof(IRLiveInterval) * ir->variables_live_intervals_size);
-    memset(&ir->variables_live_intervals[used], 0, sizeof(IRLiveInterval) * (ir->variables_live_intervals_size - used));
-    ir_vreg_intervals_init(&ir->variables_live_intervals[used], ir->variables_live_intervals_size - used);
-  }
+    ir_vreg_intervals_grow(&ir->variables_live_intervals, &ir->variables_live_intervals_size,
+                           ir->next_local_variable + 1);
 
   const int next_var_vr = ir->next_local_variable;
   ++ir->next_local_variable;
@@ -125,15 +145,8 @@ int tcc_ir_vreg_alloc_var(TCCIRState *ir)
 int tcc_ir_vreg_alloc_param(TCCIRState *ir)
 {
   if (ir->next_parameter >= ir->parameters_live_intervals_size)
-  {
-    const int used = ir->parameters_live_intervals_size;
-    ir->parameters_live_intervals_size <<= 1;
-    ir->parameters_live_intervals = (IRLiveInterval *)tcc_realloc(
-        ir->parameters_live_intervals, sizeof(IRLiveInterval) * ir->parameters_live_intervals_size);
-    memset(&ir->parameters_live_intervals[used], 0,
-           sizeof(IRLiveInterval) * (ir->parameters_live_intervals_size - used));
-    ir_vreg_intervals_init(&ir->parameters_live_intervals[used], ir->parameters_live_intervals_size - used);
-  }
+    ir_vreg_intervals_grow(&ir->parameters_live_intervals, &ir->parameters_live_intervals_size,
+                           ir->next_parameter + 1);
 
   const int next_param_vr = ir->next_parameter;
   ++ir->next_parameter;
@@ -184,20 +197,43 @@ static void ir_vreg_intervals_init(IRLiveInterval *intervals, int count)
   }
 }
 
-/* Ensure temporary live interval array can hold at least `count` entries */
-void tcc_ir_vreg_ensure_temp_capacity(TCCIRState *ir, int count)
+/* Resize an interval array holding `count` vregs when it is short of them or
+ * carries more slack than `headroom`. */
+static void ir_vreg_intervals_fit(IRLiveInterval **intervals, int *size, int count, int headroom)
 {
-  while (count > ir->temporary_variables_live_intervals_size) {
-    int used = ir->temporary_variables_live_intervals_size;
-    ir->temporary_variables_live_intervals_size <<= 1;
-    ir->temporary_variables_live_intervals = (IRLiveInterval *)tcc_realloc(
-        ir->temporary_variables_live_intervals,
-        sizeof(IRLiveInterval) * ir->temporary_variables_live_intervals_size);
-    memset(&ir->temporary_variables_live_intervals[used], 0,
-           sizeof(IRLiveInterval) * (ir->temporary_variables_live_intervals_size - used));
-    ir_vreg_intervals_init(&ir->temporary_variables_live_intervals[used],
-                           ir->temporary_variables_live_intervals_size - used);
-  }
+  if (*size < count || *size > count + headroom)
+    ir_vreg_intervals_resize(intervals, size, count + headroom > 0 ? count + headroom : 1);
+}
+
+/* Size the temp and var interval arrays once SSA renaming has numbered every
+ * temp of the function (`temp_count`).  Besides growing the temp array, this
+ * trims the slack that doubling during IR generation left in both (the
+ * 262k-instruction function of 101_cleanup.c kept room for 131072 vars and
+ * used 65543; 95_bitfields.c room for 4096 temps): they stay alive through
+ * register allocation and code generation, where a function's memory peaks.  No var is allocated
+ * after this point, and temps only by the phi resolver's cycle breakers and a
+ * few post-RA rewrites (at most 32 in a function of the test corpus, none at
+ * -O0), so the arrays keep that much headroom; CONFIG_TCC_LOW_MEM keeps just
+ * enough for a few cycle breakers.
+ * Trimming moves an array like growing does: this runs at the end of
+ * tcc_ir_ssa_rename, where no IRLiveInterval pointer is held. */
+void tcc_ir_vreg_fit_intervals(TCCIRState *ir, int temp_count)
+{
+#ifdef CONFIG_TCC_LOW_MEM
+  /* A few temps for the phi resolver's cycle breakers, so one swap does not
+   * cost a 1.5x step of the whole array.  No var slack: a var allocated later
+   * grows the array, and the only lookups past next_local_variable were the
+   * nested-function passes resolving a PARENT's captured vregs in this IR,
+   * which use the bounds-safe tcc_ir_try_get_live_interval. */
+  const int temp_headroom = 8, var_headroom = 0;
+#else
+  const int temp_headroom = (temp_count >> 3) + 32;
+  const int var_headroom = (ir->next_local_variable >> 3) + 16;
+#endif
+  ir_vreg_intervals_fit(&ir->temporary_variables_live_intervals, &ir->temporary_variables_live_intervals_size,
+                        temp_count, temp_headroom);
+  ir_vreg_intervals_fit(&ir->variables_live_intervals, &ir->variables_live_intervals_size, ir->next_local_variable,
+                        var_headroom);
 }
 
 /* ============================================================================
@@ -274,6 +310,16 @@ void tcc_ir_vreg_flag_addrtaken_set(TCCIRState *ir, int vreg)
   IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
   if (interval)
     interval->addrtaken = 1;
+}
+
+/* 1 when vreg is flagged address-taken (by `&x`, or by a nested function
+ * capturing it); 0 for no interval or a non-vreg. */
+int tcc_ir_vreg_flag_addrtaken_get(TCCIRState *ir, int vreg)
+{
+  if (vreg < 0 || TCCIR_DECODE_VREG_TYPE(vreg) == 0)
+    return 0;
+  IRLiveInterval *interval = tcc_ir_vreg_live_interval(ir, vreg);
+  return interval && interval->addrtaken;
 }
 
 /* Mark vreg as float/double type */

@@ -59,8 +59,8 @@ UT_TEST(test_memset_local_size4_single_int32_store)
 
   int icall = emit_memset_call(ir, callee, 1,
                                utb_stackoff(16, 0, 0, 0, I32), /* dst */
-                               utb_imm(4, I32),                /* size */
-                               utb_imm(0, I32));               /* fill */
+                               utb_imm(0, I32),                /* fill (libc order) */
+                               utb_imm(4, I32));               /* size */
 
   int changes = tcc_ir_opt_small_memset_to_store(ir);
 
@@ -105,9 +105,9 @@ UT_TEST(test_memset_local_size2_and_size1)
   utb_set_tok_str(TOK_MEMSET, "memset");
   IROperand callee = utb_callee(ir, &ms, TOK_MEMSET);
   int c2 = emit_memset_call(ir, callee, 1, utb_stackoff(0, 0, 0, 0, I32),
-                            utb_imm(2, I32), utb_imm(0, I32));
+                            utb_imm(0, I32), utb_imm(2, I32));
   int c1 = emit_memset_call(ir, callee, 2, utb_stackoff(8, 0, 0, 0, I32),
-                            utb_imm(1, I32), utb_imm(0, I32));
+                            utb_imm(0, I32), utb_imm(1, I32));
 
   UT_ASSERT_EQ(tcc_ir_opt_small_memset_to_store(ir), 2);
   UT_ASSERT_EQ(irop_get_btype(utb_dest(ir, c2)), IROP_BTYPE_INT16);
@@ -126,7 +126,7 @@ UT_TEST(test_memset_local_size3_two_stores_repurposes_param_slot)
   utb_set_tok_str(TOK_MEMSET, "memset");
   IROperand callee = utb_callee(ir, &ms, TOK_MEMSET);
   int icall = emit_memset_call(ir, callee, 1, utb_stackoff(16, 0, 0, 0, I32),
-                               utb_imm(3, I32), utb_imm(0, I32));
+                               utb_imm(0, I32), utb_imm(3, I32));
 
   UT_ASSERT_EQ(tcc_ir_opt_small_memset_to_store(ir), 1);
   /* First STORE at the call slot: INT16 at offset 16. */
@@ -150,7 +150,7 @@ UT_TEST(test_memset_local_size7_bails_needs_three_stores)
   utb_set_tok_str(TOK_MEMSET, "memset");
   IROperand callee = utb_callee(ir, &ms, TOK_MEMSET);
   int icall = emit_memset_call(ir, callee, 1, utb_stackoff(0, 0, 0, 0, I32),
-                               utb_imm(7, I32), utb_imm(0, I32));
+                               utb_imm(0, I32), utb_imm(7, I32));
 
   UT_ASSERT_EQ(tcc_ir_opt_small_memset_to_store(ir), 0);
   UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_FUNCCALLVOID);
@@ -167,7 +167,7 @@ UT_TEST(test_memset_local_size_over_cap_bails)
   utb_set_tok_str(TOK_MEMSET, "memset");
   IROperand callee = utb_callee(ir, &ms, TOK_MEMSET);
   int icall = emit_memset_call(ir, callee, 1, utb_stackoff(0, 0, 0, 0, I32),
-                               utb_imm(9, I32), utb_imm(0, I32));
+                               utb_imm(0, I32), utb_imm(9, I32));
 
   UT_ASSERT_EQ(tcc_ir_opt_small_memset_to_store(ir), 0);
   UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_FUNCCALLVOID);
@@ -183,7 +183,7 @@ UT_TEST(test_memset_local_nonzero_fill_kept)
   utb_set_tok_str(TOK_MEMSET, "memset");
   IROperand callee = utb_callee(ir, &ms, TOK_MEMSET);
   int icall = emit_memset_call(ir, callee, 1, utb_stackoff(0, 0, 0, 0, I32),
-                               utb_imm(4, I32), utb_imm(7, I32)); /* fill != 0 */
+                               utb_imm(7, I32), utb_imm(4, I32)); /* fill != 0 */
 
   UT_ASSERT_EQ(tcc_ir_opt_small_memset_to_store(ir), 0);
   UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_FUNCCALLVOID);
@@ -200,7 +200,7 @@ UT_TEST(test_memset_local_non_stack_dest_kept)
   utb_set_tok_str(TOK_MEMSET, "memset");
   IROperand callee = utb_callee(ir, &ms, TOK_MEMSET);
   int icall = emit_memset_call(ir, callee, 1, utb_temp(0, I32) /* not stackoff */,
-                               utb_imm(4, I32), utb_imm(0, I32));
+                               utb_imm(0, I32), utb_imm(4, I32));
 
   UT_ASSERT_EQ(tcc_ir_opt_small_memset_to_store(ir), 0);
   UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_FUNCCALLVOID);
@@ -233,7 +233,7 @@ UT_TEST(test_memset_local_lval_dest_kept)
   utb_set_tok_str(TOK_MEMSET, "memset");
   IROperand callee = utb_callee(ir, &ms, TOK_MEMSET);
   int icall = emit_memset_call(ir, callee, 1, utb_lval(utb_stackoff(0, 0, 0, 0, I32)),
-                               utb_imm(4, I32), utb_imm(0, I32));
+                               utb_imm(0, I32), utb_imm(4, I32));
 
   UT_ASSERT_EQ(tcc_ir_opt_small_memset_to_store(ir), 0);
   UT_ASSERT_EQ(utb_op(ir, icall), TCCIR_OP_FUNCCALLVOID);

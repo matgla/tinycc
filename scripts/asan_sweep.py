@@ -1,246 +1,213 @@
 #!/usr/bin/env python3
 """
-asan_sweep.py — Phase BH / Track 1 ASAN+UBSan corpus sweep for tinycc.
+asan_sweep.py -- sweep the corpus with an instrumented armv8m-tcc and report
+the COMPILER's own memory-safety / undefined-behaviour bugs, deduplicated.
 
-The cross compiler armv8m-tcc is built with AddressSanitizer ON by default
-(config.mak: -fsanitize=address), so compiling any corpus file *with* it makes
-tcc report ASAN/LeakSanitizer errors on its OWN heap bugs.  The ORACLE is the
-sanitizer output printed by tcc, not the compile exit code: a plain
-"unsupported feature" compile error is NOT a hit.
+The oracle is the sanitizer (or valgrind) report printed by tcc itself, never
+the compile exit code: a plain "unsupported feature" error is not a hit.  Each
+compile can yield several findings (one ASan error, any number of UBSan
+runtime errors, LSan leak blocks, valgrind error blocks); a finding's dedup key
+is its kind plus its top meaningful frames (UBSan: its source location), so one
+bug seen across a thousand files is one entry.
 
-This sweeps the corpus (gcc-torture compile+execute, tests2, ir_tests) across
--O0/-O1/-O2, greps stderr for sanitizer signatures, and dedups hits by the top
-meaningful backtrace frames so one bug across many files collapses to one entry.
+Compilers.  The tree's armv8m-tcc is NOT instrumented (config.mak has no
+-fsanitize by default).  Build an instrumented one out of tree:
 
-Test/tooling only.  Does NOT modify production code.  --with-ubsan builds a
-SEPARATE compiler out-of-band (config.mak is saved+restored) so the shared
-armv8m-tcc other agents depend on is never mutated.
+    scripts/build_sanitized_cross.sh DIR [asan|lowmem|o0only|valgrind]
+
+or let this script do it (--variant, built under --build-root), so the tree's
+armv8m-tcc never changes under anyone running tests against it.  Variants:
+  asan      ASan+UBSan (clang when available: gcc's libubsan is often absent)
+  lowmem    asan + -DCONFIG_TCC_LOW_MEM   (device-sized tables and arenas)
+  o0only    asan + -DCONFIG_TCC_O0_ONLY   (the Pico 2 compiler; -O flags inert)
+  valgrind  plain -O2 -g build, every compile run under valgrind memcheck
+            (--track-origins=yes): uninitialised reads ASan cannot see
+
+Shapes (--shape, comma-separated):
+  single    one file per compile                              (-c f.c)
+  multi-c   two files on one command line, -c                 (-c a.c b.c)
+            tcc compiles them one after another in fresh TCCStates -- any
+            static state that survives tcc_delete leaks into the second file
+  multi-r   two files into one relocatable object, -r         (-r a.c b.c -o x.o)
+            both files share ONE TCCState: per-file tables, token-keyed caches
+
+Corpora: gcc-torture (execute + compile), tests2, ir_tests, all.  Multi-file
+shapes pair files of the chosen corpus deterministically (i with i+1, and i
+with i+N/2), so every file appears first and second.
 
 Examples:
-  # full sweep, all corpora, all O-levels:
-  scripts/asan_sweep.py --corpus all
-  # one shard of gcc-torture for a parallel fleet:
-  scripts/asan_sweep.py --corpus gcc-torture --shard 3/40
-  # quick smoke:
-  scripts/asan_sweep.py --corpus tests2 --limit 30
+  make asan-sweep                              # default matrix, see Makefile
+  scripts/asan_sweep.py --variant asan --corpus tests2 -j 8
+  scripts/asan_sweep.py --variant asan --corpus all --olevels -O0,-O1,-O2,-Os \\
+        --debug-info both --shape single,multi-c,multi-r -j 8 --report r.txt
+  scripts/asan_sweep.py --variant valgrind --corpus ir_tests --sample 200 -j 8
+  scripts/asan_sweep.py --compiler /path/to/armv8m-tcc --corpus tests2
+
+Leaks are off by default (tcc keeps per-TU arenas until exit on purpose);
+--leaks turns LeakSanitizer on.  Exit status is 1 when any finding is
+reported, so the sweep can gate a CI job.
 """
 
 import argparse
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Sanitizer signatures that mark a genuine hit.  We deliberately key on the
-# sanitizer's own markers, NOT on the compiler exit code (a plain "unsupported
-# feature" error also exits nonzero but prints none of these).
-SANITIZER_RE = re.compile(
-    r"(ERROR: AddressSanitizer"
-    r"|ERROR: LeakSanitizer"
-    r"|LeakSanitizer: detected memory leaks"
-    r"|runtime error:"          # UBSan
-    r"|SUMMARY: .*Sanitizer)"
-)
+# --------------------------------------------------------------------------
+# Report parsing
+# --------------------------------------------------------------------------
 
-# A SUMMARY line is the most human-readable one-liner for the report.
-SUMMARY_RE = re.compile(r"SUMMARY: .*?Sanitizer:.*")
-# UBSan runtime errors do not always emit a SUMMARY; capture the first one.
-UBSAN_RE = re.compile(r".*runtime error:.*")
-
-# Backtrace frame:  "    #3 0x... in <symbol> (...)"
+ASAN_ERR_RE = re.compile(r"ERROR: AddressSanitizer: (\S+)")
+ASAN_SEGV_RE = re.compile(r"AddressSanitizer: (SEGV|stack-overflow|ABRT|BUS|FPE)")
+LSAN_BLOCK_RE = re.compile(r"^(Direct|Indirect) leak of \d+ byte\(s\) in \d+ object\(s\) allocated from:",
+                           re.M)
+UBSAN_RE = re.compile(r"^(?P<loc>\S+:\d+:\d+): runtime error: (?P<msg>.*)$", re.M)
 FRAME_RE = re.compile(r"#\d+\s+0x[0-9a-f]+\s+in\s+(\S+)")
+VG_ERR_HEAD_RE = re.compile(r"^==\d+== (?P<kind>(Invalid (read|write|free)[^\n]*"
+                            r"|Conditional jump or move depends on uninitialised value\(s\)"
+                            r"|Use of uninitialised value[^\n]*"
+                            r"|Syscall param[^\n]*uninitialised[^\n]*"
+                            r"|Source and destination overlap[^\n]*"
+                            r"|Mismatched free[^\n]*"
+                            r"|Argument '[^']*' of function \S+ has a fishy[^\n]*"
+                            r"|Process terminating with default action[^\n]*))$", re.M)
+VG_FRAME_RE = re.compile(r"^==\d+==\s+(?:at|by) 0x[0-9A-F]+: (\S+)", re.M)
 
-# Generic allocator / wrapper / runtime frames that are NOT the root cause and
-# must be skipped when building a dedup key (otherwise every leak collapses into
-# one bucket regardless of where it was actually allocated).
 NOISE_FRAMES = {
-    "malloc", "calloc", "realloc", "free", "reallocarray",
+    "malloc", "calloc", "realloc", "free", "reallocarray", "memcpy", "memmove",
+    "memset", "strlen", "strcmp", "memcmp", "strcpy", "strncmp",
     "realloc.part.0", "malloc.part.0",
-    "operator new", "operator new[]",
     "default_reallocator", "default_realloc",
     "tcc_malloc", "tcc_mallocz", "tcc_realloc", "tcc_realloc_debug",
     "tcc_malloc_debug", "tcc_mallocz_debug", "tcc_free", "tcc_strdup",
-    "__interceptor_malloc", "__interceptor_calloc", "__interceptor_realloc",
     "__libc_start_main", "__libc_start_call_main", "_start", "main",
-    "__asan_memcpy", "__asan_memset", "__asan_memmove",
-    "__sanitizer_print_stack_trace",
 }
 
 
 def _is_noise(sym):
     if sym in NOISE_FRAMES:
         return True
-    # libasan internal frames have no real symbol of interest.
-    if sym.startswith("__asan_") or sym.startswith("__ubsan_") or sym.startswith("__lsan_"):
-        return True
-    if sym.startswith("__interceptor_"):
-        return True
+    for p in ("__asan", "__ubsan", "__lsan", "__interceptor_", "__sanitizer",
+              "___interceptor_", "_vgr", "__GI_", "__memcpy", "__memmove",
+              "__memset", "__strlen", "__libc_", "operator"):
+        if sym.startswith(p):
+            return True
     return False
 
 
-def meaningful_frames(stderr_text, k=3):
-    """Return the first k meaningful (non-noise) backtrace symbols across the
-    whole report, in order.  This is the dedup key — the same bug across many
-    files collapses to a single entry."""
-    frames = []
-    for m in FRAME_RE.finditer(stderr_text):
+def _top_frames(text, regex, k=3):
+    out = []
+    for m in regex.finditer(text):
         sym = m.group(1)
         if _is_noise(sym):
             continue
-        frames.append(sym)
-        if len(frames) >= k:
+        out.append(sym)
+        if len(out) >= k:
             break
-    return frames
+    return out
 
 
-def summary_line(stderr_text):
-    m = SUMMARY_RE.search(stderr_text)
+def parse_findings(stderr, leaks):
+    """Return [(key, summary)] for every distinct finding in one compile."""
+    found = []
+    # UBSan: one per runtime error line, keyed by location + message shape.
+    for m in UBSAN_RE.finditer(stderr):
+        loc = re.sub(r"^.*?/(source/)", r"\1", m.group("loc"))
+        msg = re.sub(r"-?\b\d+\b|0x[0-9a-f]+", "N", m.group("msg"))
+        found.append((f"ubsan {loc}: {msg}", f"{loc}: runtime error: {m.group('msg')}"[:240]))
+    # ASan: one error per process (it aborts).
+    m = ASAN_ERR_RE.search(stderr) or ASAN_SEGV_RE.search(stderr)
     if m:
-        return m.group(0).strip()
-    m = UBSAN_RE.search(stderr_text)
-    if m:
-        return m.group(0).strip()[:200]
-    # Fall back to the ERROR line.
-    for line in stderr_text.splitlines():
-        if "Sanitizer" in line and ("ERROR" in line or "WARNING" in line):
-            return line.strip()
-    return "Sanitizer report (no SUMMARY line)"
+        tail = stderr[m.start():]
+        frames = _top_frames(tail.split("allocated by thread")[0].split("freed by thread")[0],
+                             FRAME_RE)
+        key = f"asan {m.group(1)}: " + " <- ".join(frames)
+        line = stderr[m.start():].splitlines()[0]
+        found.append((key, line.strip()[:240]))
+    # LSan: one per leak block.
+    if leaks:
+        for mm in LSAN_BLOCK_RE.finditer(stderr):
+            body = stderr[mm.end():mm.end() + 4000].split("\n\n")[0]
+            frames = _top_frames(body, FRAME_RE)
+            found.append((f"lsan {mm.group(1).lower()}: " + " <- ".join(frames),
+                          mm.group(0)))
+    # valgrind memcheck: one per error block.
+    for mm in VG_ERR_HEAD_RE.finditer(stderr):
+        body = stderr[mm.end():mm.end() + 6000]
+        nxt = re.search(r"^==\d+== \S", body, re.M)
+        # stop at the next error head (a line with text right after "== ")
+        body = body[:nxt.start()] if nxt else body
+        frames = _top_frames(body.split("Address 0x")[0].split("Uninitialised value was")[0],
+                             VG_FRAME_RE)
+        kind = re.sub(r"\d+", "N", mm.group("kind"))
+        found.append((f"valgrind {kind}: " + " <- ".join(frames), mm.group("kind")))
+    # dedup within the compile
+    seen, out = set(), []
+    for k, s in found:
+        if k not in seen:
+            seen.add(k)
+            out.append((k, s))
+    return out
 
 
 # --------------------------------------------------------------------------
-# Corpus enumeration
+# Corpus
 # --------------------------------------------------------------------------
 
 def _gcc_torture_root():
     return REPO / "tests/gcctestsuite/gcc-testsuite/gcc/testsuite/gcc.c-torture"
 
 
-def expand_gcc_builtin_sources(source):
-    """Mirror tests/ir_tests/run.py:expand_gcc_builtin_sources — a builtins/
-    execute test needs its <name>-lib.c companion plus lib/main.c so the
-    compile actually exercises the same multi-TU shape the real harness uses."""
-    extra = []
-    if source.name.endswith("-lib.c"):
-        return extra
-    parent = source.parent
-    if parent.name != "builtins":
-        return extra
-    if parent.parent.name != "execute":
-        return extra
-    if parent.parent.parent.name != "gcc.c-torture":
-        return extra
-    lib_file = source.with_name(f"{source.stem}-lib.c")
-    builtins_main = parent / "lib" / "main.c"
-    for f in (lib_file, builtins_main):
-        if f.exists():
-            extra.append(f)
-    return extra
-
-
 def enumerate_corpus(corpus):
-    """Return a list of (primary_source: Path, extra_sources: [Path]) work items."""
-    items = []
-
-    def add_gcc_torture():
+    files = []
+    if corpus in ("gcc-torture", "all"):
         root = _gcc_torture_root()
         if not root.exists():
             print(f"warning: gcc-torture not found at {root} "
                   f"(run 'make download-gcc-tests')", file=sys.stderr)
-            return
-        execute = root / "execute"
-        # Top-level + ieee + builtins, recursively; skip -lib.c companions and
-        # files inside lib/ (they are pulled in as extra sources, not compiled
-        # standalone).
-        for c in sorted(execute.rglob("*.c")):
-            if c.name.endswith("-lib.c"):
-                continue
-            if c.parent.name == "lib":
-                continue
-            items.append((c, expand_gcc_builtin_sources(c)))
-        compile_dir = root / "compile"
-        if compile_dir.exists():
-            for c in sorted(compile_dir.glob("*.c")):
-                items.append((c, []))
-
-    if corpus in ("gcc-torture", "all"):
-        add_gcc_torture()
+        else:
+            files += sorted((root / "execute").rglob("*.c"))
+            files += sorted((root / "compile").glob("*.c"))
     if corpus in ("tests2", "all"):
-        for c in sorted((REPO / "tests/tests2").glob("*.c")):
-            items.append((c, []))
+        files += sorted((REPO / "tests/tests2").glob("*.c"))
     if corpus in ("ir_tests", "all"):
-        for c in sorted((REPO / "tests/ir_tests").glob("*.c")):
-            items.append((c, []))
-
-    return items
+        files += sorted((REPO / "tests/ir_tests").glob("*.c"))
+    return files
 
 
-def apply_shard_limit(items, shard, limit):
-    if shard:
-        i, n = shard
-        items = [it for idx, it in enumerate(items) if idx % n == (i - 1)]
-    if limit:
-        items = items[:limit]
-    return items
-
-
-# --------------------------------------------------------------------------
-# Compile
-# --------------------------------------------------------------------------
-
-def build_compile_cmd(compiler, include_flags, abi_flags, opt, sources):
-    cmd = [str(compiler), f"-B{REPO}"]
-    cmd += abi_flags
-    cmd += include_flags
-    cmd += [opt, "-c"]
-    cmd += [str(s) for s in sources]
-    cmd += ["-o", "/dev/null"]
-    return cmd
-
-
-def run_one(compiler, include_flags, abi_flags, opt, primary, extras, timeout):
-    sources = [primary] + list(extras)
-    cmd = build_compile_cmd(compiler, include_flags, abi_flags, opt, sources)
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-        )
-        stderr = proc.stderr.decode("utf-8", errors="replace")
-        rc = proc.returncode
-    except subprocess.TimeoutExpired as e:
-        stderr = (e.stderr or b"").decode("utf-8", errors="replace")
-        rc = -1
-    return rc, stderr
+def make_pairs(files):
+    n = len(files)
+    pairs = []
+    for i in range(0, n - 1, 2):
+        pairs.append((files[i], files[i + 1]))
+    h = n // 2
+    for i in range(h):
+        if i + h < n:
+            pairs.append((files[i + h], files[i]))
+    return pairs
 
 
 # --------------------------------------------------------------------------
-# Harness flags
+# Flags (mirror tests/ir_tests/qemu/mps2-an505/Makefile for armv8m-tcc)
 # --------------------------------------------------------------------------
-# Reconstruct the EXACT include/ABI flags the real torture harness passes when
-# CC is armv8m-tcc.  Mirrors tests/ir_tests/qemu/mps2-an505/Makefile:
-#   GCC_ABI_FLAGS = -mcpu=cortex-m33 -mthumb -mfloat-abi=soft
-#   CFLAGS += -nostdlib -fvisibility=hidden $(GCC_ABI_FLAGS) -ffunction-sections
-#   (armv8m-tcc branch) -I libc_includes -I libc_imports -I newlib
-#                       -I $(ARM_SYSROOT)/include -I $(TCC_PATH)/include
 
 GCC_ABI_FLAGS = ["-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=soft"]
-DEFAULT_ABI_FLAGS = ["-nostdlib", "-fvisibility=hidden",
-                     *GCC_ABI_FLAGS, "-ffunction-sections"]
+DEFAULT_ABI_FLAGS = ["-nostdlib", "-fvisibility=hidden", *GCC_ABI_FLAGS, "-ffunction-sections"]
 
 
-def arm_sysroot() -> str:
+def arm_sysroot():
     try:
-        proc = subprocess.run(
-            ["arm-none-eabi-gcc", *GCC_ABI_FLAGS, "--print-sysroot"],
-            capture_output=True, text=True,
-        )
+        proc = subprocess.run(["arm-none-eabi-gcc", *GCC_ABI_FLAGS, "--print-sysroot"],
+                              capture_output=True, text=True)
         if proc.returncode == 0 and proc.stdout.strip():
             return proc.stdout.strip()
     except (OSError, subprocess.SubprocessError):
@@ -248,214 +215,198 @@ def arm_sysroot() -> str:
     return "/usr/arm-none-eabi"
 
 
-def default_include_flags() -> list:
+def default_include_flags():
     libc = (REPO / "tests" / "ir_tests" / "libc_includes").resolve()
     imports = (REPO / "tests" / "ir_tests" / "libc_imports").resolve()
-    return [
-        f"-I{libc}",
-        f"-I{imports}",
-        f"-I{libc / 'newlib'}",
-        f"-I{arm_sysroot()}/include",
-        f"-I{REPO / 'include'}",
-    ]
+    return [f"-I{libc}", f"-I{imports}", f"-I{libc / 'newlib'}",
+            f"-I{arm_sysroot()}/include", f"-I{REPO / 'include'}"]
 
 
-def build_ubsan_compiler(dest_dir: Path) -> Path:
-    """Build a SEPARATE UBSan compiler out-of-band.
+# --------------------------------------------------------------------------
+# Running
+# --------------------------------------------------------------------------
 
-    ./configure rewrites config.mak, so it is saved and restored around the
-    build and the shared ASAN armv8m-tcc is rebuilt afterwards -- concurrent
-    users of the tree must never see it mutated.
-    """
-    config = REPO / "config.mak"
-    backup = Path(tempfile.mkstemp(prefix="config.mak.bak.")[1])
-    shutil.copy(config, backup)
-    ubsan_tcc = dest_dir / "armv8m-tcc"
-    try:
-        subprocess.run(["./configure", "--enable-ubsan"], cwd=REPO,
-                       check=True, stdout=subprocess.DEVNULL)
-        subprocess.run(["make", "cross"], cwd=REPO, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        shutil.copy(REPO / "armv8m-tcc", ubsan_tcc)
-    finally:
-        shutil.copy(backup, config)
-        backup.unlink(missing_ok=True)
-        print("restored config.mak")
-        # Rebuild the shared ASAN compiler so concurrent agents see it unchanged.
-        if subprocess.run(["make", "cross"], cwd=REPO,
-                          stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL).returncode != 0:
-            print("warning: could not rebuild shared ASAN armv8m-tcc; run 'make cross'",
-                  file=sys.stderr)
-    return ubsan_tcc
+VALGRIND_CMD = ["valgrind", "--tool=memcheck", "--track-origins=yes",
+                "--error-limit=no", "--num-callers=16", "-q"]
+
+
+def san_env(leaks):
+    env = dict(os.environ)
+    env["ASAN_OPTIONS"] = (f"detect_leaks={1 if leaks else 0}:abort_on_error=0:"
+                           "allocator_may_return_null=0:detect_stack_use_after_return=0")
+    env["LSAN_OPTIONS"] = f"detect_leaks={1 if leaks else 0}"
+    env["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=0"
+    return env
+
+
+def build_cmd(compiler, base_flags, opt, dbg, shape, sources, valgrind):
+    cmd = [str(compiler), f"-B{REPO}", *base_flags, opt]
+    if dbg:
+        cmd.append("-g")
+    if shape == "multi-r":
+        cmd += ["-r", *[str(s) for s in sources], "-o", "out.o"]
+    elif shape == "multi-c":
+        cmd += ["-c", *[str(s) for s in sources]]
+    else:
+        cmd += ["-c", *[str(s) for s in sources], "-o", "out.o"]
+    if valgrind:
+        cmd = VALGRIND_CMD + cmd
+    return cmd
+
+
+def run_job(cmd, env, timeout):
+    with tempfile.TemporaryDirectory(prefix="sweep.") as d:
+        try:
+            p = subprocess.run(cmd, cwd=d, env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, timeout=timeout)
+            return p.returncode, p.stderr.decode("utf-8", "replace")
+        except subprocess.TimeoutExpired as e:
+            return -1, (e.stderr or b"").decode("utf-8", "replace") + "\n[timeout]"
+
+
+def build_variant(variant, build_root):
+    dest = Path(build_root) / variant
+    script = REPO / "scripts" / "build_sanitized_cross.sh"
+    print(f"building {variant} compiler in {dest} ...", file=sys.stderr)
+    subprocess.run([str(script), str(dest), variant], check=True)
+    return dest / "armv8m-tcc"
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--compiler", default=str(REPO / "armv8m-tcc"),
-                    help="path to the cross compiler (ASAN-built armv8m-tcc)")
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--compiler", default=None,
+                    help="instrumented armv8m-tcc to use (default: build --variant)")
+    ap.add_argument("--variant", default="asan",
+                    choices=["asan", "lowmem", "o0only", "valgrind"],
+                    help="compiler build variant (built out of tree unless --compiler)")
+    ap.add_argument("--valgrind", action="store_true",
+                    help="run every compile under valgrind (implied by --variant valgrind)")
+    ap.add_argument("--build-root", default=str(REPO / ".sanitize"),
+                    help="where --variant compilers are built (default: .sanitize/)")
     ap.add_argument("--corpus", default="all",
                     choices=["gcc-torture", "tests2", "ir_tests", "all"])
-    ap.add_argument("--olevels", default="-O0,-O1,-O2",
-                    help="comma-separated optimization levels")
-    ap.add_argument("--shard", default=None,
-                    help="i/N — sweep only shard i of N (1-based)")
-    ap.add_argument("--limit", type=int, default=0,
-                    help="cap number of files swept (after sharding)")
-    ap.add_argument("--timeout", type=int, default=60,
-                    help="per-compile timeout in seconds")
-    ap.add_argument("--include-flags", default="",
-                    help="space-separated -I flags from the harness Makefile")
-    ap.add_argument("--abi-flags", default="",
-                    help="space-separated ABI/codegen flags from the Makefile")
-    ap.add_argument("--report", default=None,
-                    help="write the deduped report here (also printed to stdout)")
+    ap.add_argument("--olevels", default="-O0,-O1,-O2,-Os")
+    ap.add_argument("--debug-info", default="no", choices=["no", "yes", "both"],
+                    help="compile without -g, with -g, or both")
+    ap.add_argument("--shape", default="single",
+                    help="comma list of single,multi-c,multi-r")
+    ap.add_argument("-j", "--jobs", type=int, default=8)
+    ap.add_argument("--shard", default=None, help="i/N -- only shard i of N (1-based)")
+    ap.add_argument("--limit", type=int, default=0, help="cap work items (after sharding)")
+    ap.add_argument("--sample", type=int, default=0,
+                    help="random (seeded) sample of this many files per corpus pass")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--timeout", type=int, default=120)
+    ap.add_argument("--leaks", action="store_true", help="enable LeakSanitizer findings")
+    ap.add_argument("--include-flags", default="")
+    ap.add_argument("--abi-flags", default="")
+    ap.add_argument("--extra-flags", default="", help="appended to every compile")
+    ap.add_argument("--report", default=None)
     ap.add_argument("--list-hits-raw", default=None,
-                    help="append every raw hit line (file|olevel|key) here")
-    ap.add_argument("--with-ubsan", action="store_true",
-                    help="ALSO build an out-of-band UBSan compiler and sweep with it "
-                         "(rebuilds into a temp dir, restoring config.mak; SLOW)")
-    ap.add_argument("--progress-every", type=int, default=100)
+                    help="append every hit as file|flags|key here")
+    ap.add_argument("--keep-logs", default=None,
+                    help="directory: save the full stderr of the first hit of each key")
     args = ap.parse_args()
 
-    shard = None
-    if args.shard:
-        i, n = args.shard.split("/")
-        shard = (int(i), int(n))
-        if not (1 <= shard[0] <= shard[1]):
-            print(f"error: bad shard {args.shard}", file=sys.stderr)
-            return 2
-
-    olevels = [o.strip() for o in args.olevels.split(",") if o.strip()]
-    # Values not supplied fall back to the flags the real harness Makefile uses.
-    include_flags = args.include_flags.split() or default_include_flags()
-    abi_flags = args.abi_flags.split() or DEFAULT_ABI_FLAGS
-
-    compiler = Path(args.compiler)
+    valgrind = args.valgrind or args.variant == "valgrind"
+    if valgrind and not shutil.which("valgrind"):
+        print("error: valgrind not found", file=sys.stderr)
+        return 2
+    compiler = Path(args.compiler) if args.compiler else build_variant(args.variant, args.build_root)
     if not (compiler.is_file() and os.access(compiler, os.X_OK)):
         print(f"error: compiler not found or not executable: {compiler}", file=sys.stderr)
-        print("       build it with 'make cross' first.", file=sys.stderr)
         return 2
 
-    rc = run_sweep(compiler, "asan", args, shard, olevels, include_flags, abi_flags)
-    if rc != 0 or not args.with_ubsan:
-        return rc
+    include_flags = args.include_flags.split() or default_include_flags()
+    abi_flags = args.abi_flags.split() or DEFAULT_ABI_FLAGS
+    base_flags = abi_flags + include_flags + args.extra_flags.split()
+    olevels = [o.strip() for o in args.olevels.split(",") if o.strip()]
+    dbgs = {"no": [False], "yes": [True], "both": [False, True]}[args.debug_info]
+    shapes = [s.strip() for s in args.shape.split(",") if s.strip()]
 
-    print()
-    print("################################################################")
-    print("# --with-ubsan: building a SEPARATE UBSan compiler out-of-band")
-    print("# (config.mak is saved + restored; shared armv8m-tcc untouched)")
-    print("################################################################")
-    ubsan_dir = Path(tempfile.mkdtemp(prefix="asan_sweep_ubsan."))
-    try:
-        ubsan_tcc = build_ubsan_compiler(ubsan_dir)
-        rc = run_sweep(ubsan_tcc, "ubsan", args, shard, olevels, include_flags, abi_flags)
-    except subprocess.CalledProcessError:
-        print("UBSan build failed", file=sys.stderr)
-        rc = 1
-    finally:
-        shutil.rmtree(ubsan_dir, ignore_errors=True)
-    return rc
+    files = enumerate_corpus(args.corpus)
+    if args.sample and args.sample < len(files):
+        files = sorted(random.Random(args.seed).sample(files, args.sample))
 
-
-def run_sweep(compiler, tag, args, shard, olevels, include_flags, abi_flags):
-    """Sweep one compiler over the corpus and print (optionally write) a report."""
-    print("=" * 64)
-    print(f" Sweep ({tag}): {compiler}")
-    print("=" * 64)
-
-    items = enumerate_corpus(args.corpus)
-    total_files = len(items)
-    items = apply_shard_limit(items, shard, args.limit)
-
-    # bug_key -> dict(summary, key_frames, count, repros=[(file, olevel)])
-    bugs = {}
-    swept = 0
-    hit_compiles = 0
-    raw_hits = []
-
-    for idx, (primary, extras) in enumerate(items):
-        for opt in olevels:
-            swept += 1
-            rc, stderr = run_one(compiler, include_flags, abi_flags,
-                                 opt, primary, extras, args.timeout)
-            if not SANITIZER_RE.search(stderr):
-                continue
-            hit_compiles += 1
-            frames = meaningful_frames(stderr, k=3)
-            key = " <- ".join(frames) if frames else "(no meaningful frames)"
-            summ = summary_line(stderr)
-            rel = os.path.relpath(primary, REPO)
-            raw_hits.append(f"{rel}|{opt}|{key}")
-            b = bugs.setdefault(key, {
-                "summary": summ,
-                "frames": frames,
-                "count": 0,
-                "repro": None,
-                "files": set(),
-            })
-            b["count"] += 1
-            b["files"].add(rel)
-            if b["repro"] is None:
-                b["repro"] = (rel, opt)
-            # Prefer the most informative summary if a later one is richer.
-            if summ and len(summ) > len(b["summary"]):
-                b["summary"] = summ
-        if args.progress_every and (idx + 1) % args.progress_every == 0:
-            print(f"  ... {idx + 1}/{len(items)} files, "
-                  f"{len(bugs)} unique bug(s)", file=sys.stderr)
-
-    # ---- report ----
-    lines = []
-    lines.append("=" * 78)
-    lines.append("ASAN/UBSan sweep report")
-    lines.append("=" * 78)
-    lines.append(f"corpus            : {args.corpus}")
-    lines.append(f"olevels           : {','.join(olevels)}")
-    if shard:
-        lines.append(f"shard             : {shard[0]}/{shard[1]}")
+    jobs = []
+    for shape in shapes:
+        units = [(f,) for f in files] if shape == "single" else make_pairs(files)
+        for u in units:
+            for opt in olevels:
+                for dbg in dbgs:
+                    jobs.append((shape, u, opt, dbg))
+    if args.shard:
+        i, n = (int(x) for x in args.shard.split("/"))
+        jobs = [j for idx, j in enumerate(jobs) if idx % n == i - 1]
     if args.limit:
-        lines.append(f"limit             : {args.limit}")
-    lines.append(f"files in corpus   : {total_files}")
-    lines.append(f"files this run    : {len(items)}")
-    lines.append(f"compiles run      : {swept}")
-    lines.append(f"sanitizer hits    : {hit_compiles} compile(s)")
-    lines.append(f"unique bugs       : {len(bugs)}")
-    lines.append("")
+        jobs = jobs[:args.limit]
 
-    if bugs:
-        # Sort by count descending so the most-frequent bug is first.
-        for n, (key, b) in enumerate(
-                sorted(bugs.items(), key=lambda kv: -kv[1]["count"]), 1):
-            repro_file, repro_opt = b["repro"]
-            lines.append(f"[BUG {n}] {key}")
-            lines.append(f"    summary : {b['summary']}")
-            lines.append(f"    seen in : {b['count']} compile(s) "
-                         f"across {len(b['files'])} file(s)")
-            lines.append(f"    repro   : {repro_file} {repro_opt}")
-            lines.append("")
-    else:
-        lines.append("No sanitizer hits in this slice.")
+    env = san_env(args.leaks)
+    bugs = {}
+    lock = threading.Lock()
+    counters = {"done": 0, "hits": 0, "timeouts": 0}
+    raw = []
+    if args.keep_logs:
+        Path(args.keep_logs).mkdir(parents=True, exist_ok=True)
+
+    def work(job):
+        shape, units, opt, dbg = job
+        cmd = build_cmd(compiler, base_flags, opt, dbg, shape, units, valgrind)
+        rc, err = run_job(cmd, env, args.timeout * (6 if valgrind else 1))
+        findings = parse_findings(err, args.leaks)
+        rel = " ".join(os.path.relpath(u, REPO) for u in units)
+        flags = f"{shape} {opt}{' -g' if dbg else ''}"
+        with lock:
+            counters["done"] += 1
+            if rc == -1:
+                counters["timeouts"] += 1
+            if findings:
+                counters["hits"] += 1
+            for key, summ in findings:
+                b = bugs.setdefault(key, {"summary": summ, "count": 0, "files": set(),
+                                          "repro": (rel, flags), "cmd": cmd})
+                if b["count"] == 0 and args.keep_logs:
+                    idx = len(bugs)
+                    Path(args.keep_logs, f"hit{idx:03d}.log").write_text(
+                        " ".join(cmd) + "\n\n" + err)
+                b["count"] += 1
+                b["files"].add(rel)
+                raw.append(f"{rel}|{flags}|{key}")
+            if counters["done"] % 500 == 0:
+                print(f"  ... {counters['done']}/{len(jobs)} compiles, "
+                      f"{len(bugs)} distinct finding(s)", file=sys.stderr, flush=True)
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        list(ex.map(work, jobs))
+
+    lines = ["=" * 78, "sanitizer sweep report", "=" * 78,
+             f"compiler          : {compiler}",
+             f"variant           : {'valgrind' if valgrind else args.variant}",
+             f"corpus            : {args.corpus} ({len(files)} files)",
+             f"olevels           : {','.join(olevels)}",
+             f"debug info        : {args.debug_info}",
+             f"shapes            : {','.join(shapes)}",
+             f"compiles run      : {counters['done']}",
+             f"timeouts          : {counters['timeouts']}",
+             f"compiles with hit : {counters['hits']}",
+             f"distinct findings : {len(bugs)}", ""]
+    for n, (key, b) in enumerate(sorted(bugs.items(), key=lambda kv: -kv[1]["count"]), 1):
+        lines.append(f"[{n}] {key}")
+        lines.append(f"    summary : {b['summary']}")
+        lines.append(f"    seen in : {b['count']} compile(s) across {len(b['files'])} unit(s)")
+        lines.append(f"    repro   : {b['repro'][1]} {b['repro'][0]}")
         lines.append("")
-
+    if not bugs:
+        lines.append("No findings.")
     report = "\n".join(lines)
     print(report)
-
     if args.report:
-        report_path = Path(args.report)
-        if tag == "ubsan":
-            # Keep the ASAN report intact when both sweeps run in one invocation.
-            report_path = report_path.with_name(
-                report_path.stem + ".ubsan" + (report_path.suffix or ".txt"))
-        report_path.write_text(report)
-    if args.list_hits_raw and raw_hits:
+        Path(args.report).write_text(report + "\n")
+    if args.list_hits_raw and raw:
         with open(args.list_hits_raw, "a") as f:
-            for h in raw_hits:
-                f.write(h + "\n")
-
-    return 0
+            f.write("\n".join(raw) + "\n")
+    return 1 if bugs else 0
 
 
 if __name__ == "__main__":

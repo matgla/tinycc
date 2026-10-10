@@ -23,6 +23,32 @@
 
 #include "gen_priv.h"
 
+/* Whether an object of type T holds a pointer at byte offset OFF. */
+static int objsize_ptr_slot_at(CType *t, int off)
+{
+  if (t->t & VT_ARRAY)
+  {
+    int align, esz = type_size(&t->ref->type, &align);
+    return esz > 0 && objsize_ptr_slot_at(&t->ref->type, off % esz);
+  }
+  if ((t->t & VT_BTYPE) == VT_PTR)
+    return off == 0;
+  if ((t->t & VT_BTYPE) == VT_STRUCT)
+  {
+    Sym *f;
+    for (f = t->ref->next; f; f = f->next)
+    {
+      int align, fsz;
+      if (f->type.t & VT_BITFIELD)
+        continue;
+      fsz = type_size(&f->type, &align);
+      if (off >= (int)f->c && off < (int)f->c + fsz && objsize_ptr_slot_at(&f->type, off - (int)f->c))
+        return 1;
+    }
+  }
+  return 0;
+}
+
 /* Extracted from unary() to reduce stack frame size. */
 void __attribute__((noinline)) unary_builtin_chk(void)
 {
@@ -64,9 +90,10 @@ void __attribute__((noinline)) unary_builtin_chk(void)
     skip(')');
 
     /* --- Compute object size --- */
-    /* Only mode 0 (max remaining in outermost object) is implemented;
-     * modes 1-3 fall back to -1 (unknown). */
-    if (obj_type_val == 0 || obj_type_val == 1)
+    /* Modes 2/3 are the lower-bound twins of 0/1: same size when the object
+     * is known, but "unknown" is 0 there instead of (size_t)-1. */
+    int lower_bound = obj_type_val & 2;
+    obj_type_val &= 1;
     {
 /* Helper: search local_stack for the outermost variable that
  * contains a given frame-pointer offset.  Returns remaining
@@ -102,10 +129,13 @@ void __attribute__((noinline)) unary_builtin_chk(void)
       if (_tgt >= _base && _tgt < _end)                                                                                \
       {                                                                                                                \
         (out_size) = (addr_t)(_end - _tgt);                                                                            \
+        os_sym = _s;                                                                                                   \
         break;                                                                                                         \
       }                                                                                                                \
     }                                                                                                                  \
   } while (0)
+
+      Sym *os_sym = NULL;
 
       /* All VT_LOCAL cases (both lval and non-lval, with or without
        * array type) use the same local variable search for mode 0. */
@@ -140,6 +170,12 @@ void __attribute__((noinline)) unary_builtin_chk(void)
           /* Pointer, pointer-to-struct, or address-of result.
            * Search for enclosing variable. */
           FIND_LOCAL_OBJSIZE(target_offset, result);
+          /* A pointer value loaded from a pointer slot of the container
+           * (ptrs[1], s.p): the container is the pointer's storage, not the
+           * object it points to. */
+          if (result != (addr_t)-1 && os_sym && (ptr_r & VT_LVAL) && (ptr_type.t & VT_BTYPE) == VT_PTR &&
+              !(ptr_type.t & VT_ARRAY) && objsize_ptr_slot_at(&os_sym->type, target_offset - (int)os_sym->c))
+            result = (addr_t)-1;
           if (result != (addr_t)-1 && obj_type_val == 1)
           {
             /* Mode 1: remaining in the innermost subobject.
@@ -172,6 +208,8 @@ void __attribute__((noinline)) unary_builtin_chk(void)
 #undef FIND_LOCAL_OBJSIZE
     }
 
+    if (lower_bound && result == (addr_t)-1)
+      result = 0;
     vpushs(result);
     break;
   }
@@ -283,6 +321,23 @@ void __attribute__((noinline)) unary_builtin_chk(void)
       func_name = NULL;
       break;
     }
+    if (func_name && tcc_state->ir)
+    {
+      /* Convert the argument to the helper's parameter type ourselves: the
+       * helpers are pushed unprototyped, so an int reaching a 64-bit helper
+       * would leave r1 stale and a long would not be widened. */
+      int wide = (tok == TOK_builtin_clzll || tok == TOK_builtin_ctzll || tok == TOK_builtin_popcountll ||
+                  tok == TOK_builtin_parityll || tok == TOK_builtin_ffsll);
+      int is_ffs = (tok == TOK_builtin_ffs || tok == TOK_builtin_ffsl || tok == TOK_builtin_ffsll);
+      int func_tok = tok_alloc_const(func_name);
+      CType arg_type;
+      parse_builtin_params(0, "e");
+      arg_type.ref = NULL;
+      arg_type.t = (wide ? VT_LLONG : VT_INT) | (is_ffs ? 0 : VT_UNSIGNED);
+      gen_cast(&arg_type);
+      gen_builtin_libcall(func_tok, 1, VT_INT);
+      break;
+    }
     if (func_name)
     {
       int func_tok = tok_alloc_const(func_name);
@@ -334,8 +389,8 @@ void __attribute__((noinline)) unary_builtin_chk(void)
     struct chk_desc
     {
       int tok;
-      const char *base_func;
-      const char *chk_func;
+      const char *TCC_RODATA_REL base_func;
+      const char *TCC_RODATA_REL chk_func;
       int n_prefix;
       int n_drop;
       int has_varargs;
@@ -575,9 +630,17 @@ void __attribute__((noinline)) unary_builtin_chk(void)
     }
     else
     {
-      /* objsize not constant — would need runtime check, but since we don't
-       * know objsize we can't even do that. Just call base function. */
-      use_chk = 0;
+      /* objsize is not a compile-time constant, but its run-time value is
+       * still the destination size: pass it to the __*_chk function so the
+       * check happens at run time, as gcc does.  Appending an empty string
+       * writes nothing, so it needs no check. */
+      unsigned long long src_bytes;
+
+      use_chk = 1;
+      if ((desc->tok == TOK_builtin___strcat_chk || desc->tok == TOK_builtin___strncat_chk) &&
+          !desc->has_varargs && desc->n_prefix >= 2 &&
+          svalue_get_conservative_string_bytes_u64(&all_args[1], &src_bytes) && src_bytes == 1)
+        use_chk = 0;
     }
 
     /* --- Emit IR call --- */

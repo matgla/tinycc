@@ -111,7 +111,7 @@ int ssa_opt_loop_rotate(TCCIRState *ir)
             IRQuadCompact *q = &ir->compact_instructions[ii];
             if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
               continue;
-            int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+            int t = (int)tcc_ir_op_dest_imm(ir, q);
             if (t > hi_idx && t < ir->next_instruction_index)
               hi_idx = t;
           }
@@ -140,7 +140,7 @@ int ssa_opt_loop_rotate(TCCIRState *ir)
 
     /* Rotate inner (smallest) loops before outer ones. */
     if (ncands > 1)
-      qsort(cands, ncands, sizeof(IRLoop), loop_nest_cmp);
+      tcc_qsort(cands, ncands, sizeof(IRLoop), loop_nest_cmp);
 
     int pass_rotated = 0;
     for (int i = 0; i < ncands; i++) {

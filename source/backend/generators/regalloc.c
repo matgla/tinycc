@@ -64,6 +64,18 @@ static int ir_call_is_tail_positioned(TCCIRState *ir, int call_idx)
   const IRQuadCompact *cq = &ir->compact_instructions[call_idx];
   int is_tail = 0;
 
+  /* A VFP result transfer (gen_vfp_ret_transfer) or an inline machine call
+   * (tcc_is_inline_machine_call) is no call at all: there is no function to
+   * branch to, so a function ending in one must still return through its
+   * epilogue. */
+  {
+    const IROperand fn = tcc_ir_op_get_src1(ir, cq);
+    Sym *fs = irop_get_tag(fn) == IROP_TAG_SYMREF ? irop_get_sym_ex(ir, fn) : NULL;
+    if (fs && (!strncmp(get_tok_str(fs->v, NULL), "__tcc_vfp_ret_", 14) ||
+               tcc_is_inline_machine_call(get_tok_str(fs->v, NULL))))
+      return 0;
+  }
+
   int j = call_idx + 1;
   while (j < ir->next_instruction_index && ir->compact_instructions[j].op == TCCIR_OP_NOP)
     j++;
@@ -158,7 +170,7 @@ static int pf_arg_is_param(IROperand op, const IRParamForm *f)
  * slot, from the very registers the callee expects it in. */
 void tcc_ir_backend_fold_pure_forward(TCCIRState *ir, Sym *sym)
 {
-  if (!ir || !sym || !sym->type.ref || tcc_state->optimize <= 0 || tcc_ir_opt_pass_disabled("pure_forward"))
+  if (!ir || !sym || !sym->type.ref || TCC_OPT(tcc_state, optimize) <= 0 || tcc_ir_opt_pass_disabled("pure_forward"))
     return;
   Sym *fref = sym->type.ref;
   if (fref->f.func_type != FUNC_NEW || ir->has_static_chain || ir->captured_count > 0 || ir->naked ||
@@ -337,7 +349,7 @@ void tcc_ir_backend_analyze_leaf_and_tail_calls(TCCIRState *ir, int func_var)
   for (int i = 0; i < ir->next_instruction_index; ++i)
   {
     const IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+    if ((q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID) && !tcc_ir_call_clobbers_nothing(ir, q))
     {
       ir->leaffunc = 0;
       call_count++;
@@ -407,6 +419,11 @@ static void compute_min_stack_ref(TCCIRState *ir, int func_var)
       }
     }
   }
+  /* Inline asm names some slots only in the SValues saved with it. */
+  int asm_off;
+  for (int k = 0; tcc_ir_asm_frame_ref(ir, k, &asm_off); k++)
+    if (asm_off < min_stack_ref)
+      min_stack_ref = asm_off;
   if (min_stack_ref > loc)
   {
     loc = min_stack_ref;
@@ -435,7 +452,7 @@ static void setup_register_allocation(TCCIRState *ir, int func_var)
     if (has_ijmp && tcc_state->registers_for_allocator > 12)
       tcc_state->registers_for_allocator = 12;
   }
-  if (tcc_state->optimize < 1 && tcc_state->registers_for_allocator > 12)
+  if (TCC_OPT(tcc_state, optimize) < 1 && tcc_state->registers_for_allocator > 12)
     tcc_state->registers_for_allocator = 12;
 
   {
@@ -475,16 +492,16 @@ static void setup_register_allocation(TCCIRState *ir, int func_var)
 /* ================================================================== */
 static void run_post_ra_optimizations(TCCIRState *ir)
 {
-  if (tcc_state->optimize > 0)
+  if (TCC_OPT(tcc_state, optimize) > 0)
     tcc_ir_opt_bitfield_insert_to_bfi(ir);
 
-  if (tcc_state->optimize > 0)
+  if (TCC_OPT(tcc_state, optimize) > 0)
     tcc_ir_barrel_shift_fusion(ir);
 
-  if (tcc_state->optimize > 0)
+  if (TCC_OPT(tcc_state, optimize) > 0)
     tcc_ir_opt_shift_pair_to_ubfx(ir);
 
-  if (tcc_state->optimize > 0)
+  if (TCC_OPT(tcc_state, optimize) > 0)
     tcc_ir_opt_narrow_store_value_btype(ir);
 }
 
@@ -496,7 +513,7 @@ static void run_ssa_and_post_ra_passes(TCCIRState *ir)
 {
   {
     const RegAllocTarget *ra_target = arm_get_regalloc_target();
-    if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("ra:stack_param_promote"))
+    if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("ra:stack_param_promote"))
       tcc_ir_promote_loop_stack_params(ir);
     dbg_scan_imm_dest(ir, "before-ssa-regalloc");
     dbg_scan_overlap(ir, "before-ssa-regalloc");
@@ -510,20 +527,20 @@ static void run_ssa_and_post_ra_passes(TCCIRState *ir)
    * it.  The operand stays an immediate in the IR past allocation -- codegen
    * materializes it into a scratch register at emit time -- so swapping here
    * still deletes the `mov`. */
-  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("ra:cmp_imm_swap"))
+  if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("ra:cmp_imm_swap"))
     tcc_ir_opt_cmp_imm_swap(ir);
   tcc_ir_dump_after_pass(ir, "ra:cmp_imm_swap");
 
-  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("ra:backedge_phi_hoist"))
+  if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("ra:backedge_phi_hoist"))
     tcc_ir_opt_backedge_phi_hoist(ir);
   tcc_ir_dump_after_pass(ir, "ra:backedge_phi_hoist");
   dbg_scan_imm_dest(ir, "after-backedge-phi-hoist");
 
-  if (tcc_state->optimize > 0)
+  if (TCC_OPT(tcc_state, optimize) > 0)
     tcc_ir_opt_post_ra_forward_diamond(ir);
   dbg_scan_imm_dest(ir, "after-post-ra-fwd-diamond");
 
-  if (tcc_state->optimize > 0)
+  if (TCC_OPT(tcc_state, optimize) > 0)
     tcc_ir_opt_abort_tail_merge(ir);
 }
 
@@ -532,16 +549,18 @@ static void run_ssa_and_post_ra_passes(TCCIRState *ir)
 /* ================================================================== */
 static void run_jump_threading_loop(TCCIRState *ir)
 {
-  if (tcc_state->opt_jump_threading) {
+  if (TCC_OPT(tcc_state, opt_jump_threading)) {
     for (int outer = 0; outer < 3; outer++) {
       int jt_changes;
       do {
-        jt_changes = tcc_ir_opt_jump_threading(ir);
-        jt_changes += tcc_ir_opt_eliminate_fallthrough(ir);
-        jt_changes += tcc_ir_opt_jumpif_invert(ir, 1);
-        jt_changes += tcc_ir_opt_orphan_cmp_elim(ir);
+        jt_changes = tcc_ir_opt_pass_disabled("jt:thread") ? 0 : tcc_ir_opt_jump_threading_post_ra(ir);
+        jt_changes += tcc_ir_opt_pass_disabled("jt:fallthru") ? 0 : tcc_ir_opt_eliminate_fallthrough(ir);
+        jt_changes += tcc_ir_opt_pass_disabled("jt:invert") ? 0 : tcc_ir_opt_jumpif_invert(ir, 1);
+        jt_changes += tcc_ir_opt_pass_disabled("jt:orphan") ? 0 : tcc_ir_opt_orphan_cmp_elim(ir);
       } while (jt_changes > 0);
-      if (!tcc_state->opt_dce || tcc_ir_opt_dce(ir) == 0)
+      if (!TCC_OPT(tcc_state, opt_dce) || tcc_ir_opt_dce(ir) == 0)
+         break;
+      if (tcc_ir_opt_pass_disabled("jt:dce"))
          break;
     }
   }
@@ -550,6 +569,14 @@ static void run_jump_threading_loop(TCCIRState *ir)
 /* ================================================================== */
 /*  Register coalescing: live-range swap optimization                 */
 /* ================================================================== */
+/* Whether interval `c` occupies core register `reg`: its only or its low
+ * register, or the high register of a 64-bit pair (r2:r3 holds r3 as well as
+ * r2).  Testing r0 alone let a pair's high half go unseen. */
+static inline int interval_holds_reg(const LSLiveInterval *c, int reg)
+{
+  return c->r0 == reg || c->r1 == reg;
+}
+
 static void run_register_coalescing(TCCIRState *ir)
 {
   for (int hi = 0; hi < ir->ls.next_interval_index; hi++)
@@ -581,10 +608,19 @@ static void run_register_coalescing(TCCIRState *ir)
     for (int bi = 0; bi < ir->ls.next_interval_index; bi++)
     {
       LSLiveInterval *b = &ir->ls.intervals[bi];
-      if (b->r0 != wanted_reg || b->r1 >= 0 || b->crosses_call)
+      if (!interval_holds_reg(b, wanted_reg) || b->crosses_call)
         continue;
       if (b->start > hint_li->end || b->end < hint_li->start)
         continue;
+      /* A 64-bit pair on wanted_reg (either half) cannot be swapped with a
+       * single register, and the VAR cannot take wanted_reg while it is
+       * there: no swap at all, rather than skipping it and picking another
+       * blocker. */
+      if (b->r1 >= 0)
+      {
+        blocker = NULL;
+        break;
+      }
       if (TCCIR_DECODE_VREG_TYPE(b->vreg) == TCCIR_VREG_TYPE_PARAM)
       {
         blocker = NULL;
@@ -610,13 +646,13 @@ static void run_register_coalescing(TCCIRState *ir)
       LSLiveInterval *c = &ir->ls.intervals[ci];
       if (c == hint_li || c == blocker)
         continue;
-      if (c->r0 == have_reg &&
+      if (interval_holds_reg(c, have_reg) &&
           c->start < blocker->end && c->end > blocker->start)
       {
         safe = 0;
         break;
       }
-      if (c->r0 == wanted_reg &&
+      if (interval_holds_reg(c, wanted_reg) &&
           c->start < hint_li->end && c->end > hint_li->start)
       {
         safe = 0;
@@ -628,6 +664,7 @@ static void run_register_coalescing(TCCIRState *ir)
 
     hint_li->r0 = wanted_reg;
     blocker->r0 = have_reg;
+    ir->ls.live_sweep_valid = 0;
     /* The post-RA passes still to run before compute_stack_layout copies every
      * interval into its IRLiveInterval read the registers from there, not from
      * ls.intervals.  Left stale, ra:reload_elim saw `StackLoc <- R0(P0)` then
@@ -906,6 +943,8 @@ static void compute_stack_layout(TCCIRState *ir, int func_var)
   }
 
   tcc_ir_move_coalescing(ir);
+  if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("ra:jumpif_to_next"))
+    tcc_ir_drop_jumpif_to_next(ir);
 
   /* Post-move-coalescing min offset scan */
   {
@@ -997,13 +1036,20 @@ static void finalize_nested_functions(TCCIRState *ir, Sym *sym)
   {
     for (int i = 0; i < tcc_state->nb_nested_funcs; i++)
     {
-      NestedFunc *nf = &tcc_state->nested_funcs[i];
+      NestedFunc *nf = tcc_state->nested_funcs[i];
       for (int j = 0; j < nf->nb_captured; j++)
       {
         int vreg = nf->captured_vregs[j];
-        if (vreg >= 0)
+        /* A sibling's or a child's child's vregs name another IR. */
+        if (vreg >= 0 && nested_capture_owned_by(nf, j, tcc_state->current_nested_func))
         {
-          IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+          /* nested_funcs holds every nested function of the outermost parent,
+           * so inside a nested function's pipeline this also visits itself and
+           * its siblings, whose captured_vregs name the PARENT's IR: such a
+           * vreg can lie past this IR's interval arrays (try_get: NULL, as a
+           * never-allocated slot's offset 0 was) -- a fatal lookup here broke
+           * any capture of a parent var/param beyond this function's own. */
+          IRLiveInterval *interval = tcc_ir_try_get_live_interval(ir, vreg);
           if (interval && interval->allocation.offset != 0)
             nf->captured_offsets[j] = interval->allocation.offset;
         }
@@ -1014,7 +1060,7 @@ static void finalize_nested_functions(TCCIRState *ir, Sym *sym)
     uint8_t saved_force_lr = tcc_state->force_lr_save;
     int can_omit_fp = (tcc_state->nb_nested_funcs > 0);
     for (int i = 0; i < tcc_state->nb_nested_funcs && can_omit_fp; i++) {
-      NestedFunc *nf = &tcc_state->nested_funcs[i];
+      NestedFunc *nf = tcc_state->nested_funcs[i];
       if (nf->trampoline_needed ||
           !nf->sym || !nf->sym->type.ref ||
           !nf->sym->type.ref->f.func_auto_inline)
@@ -1037,13 +1083,13 @@ static void finalize_nested_functions(TCCIRState *ir, Sym *sym)
 static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
                                    Sym *global_label_stack_start)
 {
-  if (tcc_state->opt_dead_store)
+  if (TCC_OPT(tcc_state, opt_dead_store))
     tcc_ir_analyze_pure_via_sret(ir, sym);
 
-  if (tcc_state->opt_dead_store)
+  if (TCC_OPT(tcc_state, opt_dead_store))
     tcc_ir_compute_func_write_summary(ir, sym);
 
-  if (tcc_state->opt_dead_store && !tcc_state->ir_late_reopt_phase)
+  if (TCC_OPT(tcc_state, opt_dead_store) && !tcc_state->ir_late_reopt_phase)
     tcc_ir_collect_tu_func_summary(ir, sym);
 
   /* Reset label markers */
@@ -1060,7 +1106,7 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
   }
 
   /* Dead-code elimination passes */
-  if (tcc_state->opt_dce)
+  if (TCC_OPT(tcc_state, opt_dce))
   {
     if (tcc_ir_opt_noreturn_collapse(ir))
       loc = 0;
@@ -1070,32 +1116,32 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
       tcc_ir_opt_noreturn_call_epilogue_suppress(ir);
   }
 
-  if (tcc_state->opt_dce) {
+  if (TCC_OPT(tcc_state, opt_dce)) {
     if (tcc_ir_opt_ub_only_body_elide(ir))
       loc = 0;
   }
 
-  if (tcc_state->opt_dce) {
+  if (TCC_OPT(tcc_state, opt_dce)) {
     if (tcc_ir_opt_null_store_dom_return(ir))
       loc = 0;
   }
 
-  if (tcc_state->opt_dce) {
+  if (TCC_OPT(tcc_state, opt_dce)) {
     if (tcc_ir_opt_trap_only_body_suppress(ir))
       loc = 0;
   }
 
-  if (tcc_state->opt_dce) {
+  if (TCC_OPT(tcc_state, opt_dce)) {
     if (tcc_ir_opt_local_only_body_elide(ir))
       loc = 0;
   }
 
-  if (tcc_state->opt_dce) {
+  if (TCC_OPT(tcc_state, opt_dce)) {
     if (tcc_ir_opt_const_return_uninit_elide(ir))
       loc = 0;
   }
 
-  if (tcc_state->opt_dce) {
+  if (TCC_OPT(tcc_state, opt_dce)) {
     if (tcc_ir_opt_useless_function_body(ir))
       loc = 0;
   }
@@ -1104,9 +1150,10 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
   tcc_ir_opt_returnvalue_merge(ir);
   dbg_scan_imm_dest(ir, "after-returnvalue-merge");
 
-  if (tcc_state->opt_dce && tcc_state->optimize >= 2 && !tcc_state->ir_late_reopt_phase &&
+  if (TCC_OPT(tcc_state, opt_dce) && TCC_OPT(tcc_state, optimize) >= 2 && !tcc_state->ir_late_reopt_phase &&
       sym && sym->type.ref && !sym->type.ref->f.func_keep_tokens_for_noreturn)
   {
+    int keep = 0;
     for (int i = 0; i < ir->next_instruction_index; i++)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
@@ -1115,11 +1162,21 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
       Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
       if (!callee || !callee->type.ref || callee == sym)
         continue;
+      /* Replayed at the end of the TU, a call to a function with no
+       * prototype here is checked against one declared further down:
+       * pr47428's `fn (0)` became "too few arguments" (see
+       * body_calls_unprototyped in decl.c).  No replay for such a body. */
+      if (callee->type.ref->f.func_type == FUNC_OLD)
+      {
+        keep = 0;
+        break;
+      }
       if (callee->type.ref->f.func_compiled && !(callee->type.t & VT_INLINE))
         continue;
-      sym->type.ref->f.func_keep_tokens_for_noreturn = 1;
-      break;
+      keep = 1;
     }
+    if (keep)
+      sym->type.ref->f.func_keep_tokens_for_noreturn = 1;
   }
 
   /* Re-check leaf status after all optimizations */
@@ -1129,18 +1186,49 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
     for (int i = 0; i < ir->next_instruction_index; ++i)
     {
       int op = ir->compact_instructions[i].op;
-      if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_BUILTIN_APPLY)
+      if (((op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID) &&
+           !tcc_ir_call_clobbers_nothing(ir, &ir->compact_instructions[i])) ||
+          op == TCCIR_OP_BUILTIN_APPLY)
       {
         still_has_call = 1;
         break;
+      }
+      /* Complex FP arithmetic lowers to __aeabi_* / __divsc3 calls in the
+       * backend even when the FPU has the scalar op inline, so it keeps the
+       * function non-leaf (LR must be saved). */
+      if (op == TCCIR_OP_FADD || op == TCCIR_OP_FSUB || op == TCCIR_OP_FMUL || op == TCCIR_OP_FDIV)
+      {
+        IROperand cdest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[i]);
+        if (cdest.is_complex)
+        {
+          still_has_call = 1;
+          break;
+        }
       }
     }
     if (!still_has_call)
       ir->leaffunc = 1;
   }
 
-  /* Re-check tail-call status after all optimizations (one-directional:
-   * upgrade only, never clear).  Passes running after the pre-SSA analysis
+  /* The call that made the function tail-call-only can be gone: the body
+   * elision passes above drop a call to a callee with no effect (a
+   * pure-forward wrapper whose callee folded empty).  Codegen emits no
+   * epilogue for a tail-call-only function, so the body came out 0 bytes and
+   * its symbol ran into the next function. */
+  if (ir->tail_call_only)
+  {
+    int still_has_call = 0;
+    for (int i = 0; i < ir->next_instruction_index && !still_has_call; ++i)
+    {
+      int op = ir->compact_instructions[i].op;
+      still_has_call = op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID || op == TCCIR_OP_BUILTIN_APPLY;
+    }
+    if (!still_has_call)
+      ir->tail_call_only = 0;
+  }
+
+  /* Re-check tail-call status after all optimizations (upgrade only; the
+   * clear above is for a call that no longer exists).  Passes running after the pre-SSA analysis
    * in tcc_ir_backend_analyze_leaf_and_tail_calls can leave a lone call in
    * tail position — e.g. the ssa:narrow soft-FP demotion fold NOPs the
    * f2d/d2f conversion calls around a math libcall — which the early
@@ -1154,7 +1242,7 @@ static void run_post_alloc_passes(TCCIRState *ir, Sym *sym,
     for (int i = 0; i < ir->next_instruction_index; ++i)
     {
       const IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+      if ((q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID) && !tcc_ir_call_clobbers_nothing(ir, q))
       {
         call_count++;
         call_idx = i;
@@ -1210,7 +1298,7 @@ void tcc_ir_backend_regalloc_pipeline(TCCIRState *ir, Sym *sym, int func_var,
    * redirected into the block whose compare this deletes would arrive carrying
    * somebody else's flags.  After ra:cmp_imm_swap for the reason given there. */
   tcc_pass_timing_begin(&ra_pt, "ra:redundant_cmp");
-  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("ra:redundant_cmp"))
+  if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("ra:redundant_cmp"))
     tcc_ir_opt_redundant_cmp(ir);
   tcc_pass_timing_end(&ra_pt, -1);
   tcc_ir_dump_after_pass(ir, "ra:redundant_cmp");
@@ -1230,20 +1318,20 @@ void tcc_ir_backend_regalloc_pipeline(TCCIRState *ir, Sym *sym, int func_var,
    * register happened to hold -- silently wrong values, no crash.  Nothing
    * below this point rewrites operands. */
   tcc_pass_timing_begin(&ra_pt, "ra:shift64_dead_half");
-  if (tcc_state->optimize > 0)
+  if (TCC_OPT(tcc_state, optimize) > 0)
     tcc_ir_opt_shift64_dead_half(ir);
   tcc_pass_timing_end(&ra_pt, -1);
 
   /* Same "nothing below rewrites operands" requirement, for the same reason. */
   tcc_pass_timing_begin(&ra_pt, "ra:zero_half64");
-  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("zero_half64"))
+  if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("zero_half64"))
     tcc_ir_opt_zero_half64(ir);
   tcc_pass_timing_end(&ra_pt, -1);
 
   /* After zero_half64, which clears the side table both passes write to, and
    * under the same "nothing below rewrites operands" requirement. */
   tcc_pass_timing_begin(&ra_pt, "ra:cmp_hi_only");
-  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("cmp_hi_only"))
+  if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("cmp_hi_only"))
     tcc_ir_opt_cmp_hi_only(ir);
   tcc_pass_timing_end(&ra_pt, -1);
 

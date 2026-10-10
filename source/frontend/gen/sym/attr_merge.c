@@ -38,6 +38,7 @@ void merge_symattr(struct SymAttr *sa, struct SymAttr *sa1)
       vis = sa1->visibility;
     sa->visibility = vis;
   }
+  sa->vis_explicit |= sa1->vis_explicit;
   sa->dllexport |= sa1->dllexport;
   sa->nodecorate |= sa1->nodecorate;
   sa->dllimport |= sa1->dllimport;
@@ -177,8 +178,11 @@ static void patch_type(Sym *sym, CType *type)
   {
     if ((sym->type.t & VT_ARRAY) && type->ref->c >= 0)
     {
-      /* set array size if it was omitted in extern declaration */
-      sym->type.ref->c = type->ref->c;
+      /* Set the size omitted in the extern declaration on a ref of its own:
+       * the old one may be a typedef's.  Global stack, as sym outlives any scope. */
+      Sym *own = sym_push2(&global_stack, SYM_FIELD, sym->type.ref->type.t, type->ref->c);
+      own->type.ref = sym->type.ref->type.ref;
+      sym->type.ref = own;
     }
     if ((type->t ^ sym->type.t) & VT_STATIC)
       tcc_warning("storage mismatch for redefinition of '%s'", get_tok_str(sym->v, NULL));
@@ -209,11 +213,12 @@ void patch_storage(Sym *sym, AttributeDef *ad, CType *type)
 static Sym *sym_copy(Sym *s0, Sym **ps)
 {
   Sym *s;
-  s = sym_malloc(), *s = *s0;
-  s->facts = NULL; /* s0 keeps them: a copy on another stack must not share them */
+  s = sym_malloc(), *s = *s0; /* facts are keyed by Sym: s0 keeps them */
   s->prev = *ps, *ps = s;
   if (s->v < SYM_FIRST_ANOM)
   {
+    if (SYM_IS_PARKED(table_ident[s->v - TOK_IDENT]->sym_identifier))
+      sym_unpark(table_ident[s->v - TOK_IDENT]);
     ps = &table_ident[s->v - TOK_IDENT]->sym_identifier;
     s->prev_tok = *ps, *ps = s;
   }
@@ -316,6 +321,26 @@ static Sym *find_global_alias_target_sym(int target_tok)
   return NULL;
 }
 
+/* A block-scope `extern int g;` is a Sym of its own (external_sym copies the
+ * file-scope one onto local_stack) that is freed at the end of the block, yet
+ * names the same object.  The optimizers decide "same global" by comparing Sym
+ * pointers, so an IR symref always carries the outermost Sym of the ELF
+ * symbol: the one the file-scope declaration made, which lives for the whole
+ * TU.  Installed as tcc_ir_sym_canonicalizer by tccgen_init. */
+Sym *canonical_global_sym(Sym *sym)
+{
+  if (!sym || sym->c <= 0 || sym->v < TOK_IDENT || sym->v >= SYM_FIRST_ANOM)
+    return sym;
+  TokenSym *ts = table_ident[sym->v - TOK_IDENT];
+  if (!ts || SYM_IS_PARKED(ts->sym_identifier))
+    return sym;
+  Sym *best = sym;
+  for (Sym *p = ts->sym_identifier; p; p = p->prev_tok)
+    if (p->c == sym->c && p->sym_scope == 0 && p->type.t == sym->type.t)
+      best = p;
+  return best;
+}
+
 static int resolve_alias_symbol(Sym *alias_sym, int target_tok, int report_error)
 {
   Sym *target_sym;
@@ -366,6 +391,16 @@ void mark_pending_alias_targets_used(void)
     if (target)
       target->a.used = 1;
   }
+}
+
+/* Whether a not yet resolved alias names SYM.  Such a symbol must get a body
+ * of its own: nothing but the alias will ever refer to it. */
+int is_pending_alias_target(Sym *sym)
+{
+  for (int i = 0; i < nb_pending_aliases; i++)
+    if (find_global_alias_target_sym(pending_aliases[i].target_tok) == sym)
+      return 1;
+  return 0;
 }
 
 void resolve_pending_aliases(void)

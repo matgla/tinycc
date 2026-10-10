@@ -36,12 +36,28 @@ static HOT void gen_op_impl(int op);
  * operands. */
 ST_FUNC HOT void gen_op(int op)
 {
-  int under = 0;
+  int under = 0, sso = 0;
+  /* A byte-reversed member operand (big-endian scalar_storage_order) is
+   * loaded and swapped first, never handed to the IR as a memory operand.
+   * What still carries the mark afterwards is an array member's address:
+   * keep it on the pointer arithmetic so `s.arr[i]` is reversed too. */
+  if ((vtop->r & VT_LVAL) && vtop->sso_reversed)
+    gv(RC_TYPE(vtop->type.t));
+  if ((vtop[-1].r & VT_LVAL) && vtop[-1].sso_reversed)
+  {
+    vswap();
+    gv(RC_TYPE(vtop->type.t));
+    vswap();
+  }
   if (op == '+' || op == '-')
+  {
     under = vtop[0].underaligned | vtop[-1].underaligned;
+    sso = vtop[0].sso_reversed | vtop[-1].sso_reversed;
+  }
   gen_op_impl(op);
   if (under)
     vtop->underaligned = 1;
+  vtop->sso_reversed = sso && (vtop->type.t & VT_BTYPE) == VT_PTR;
 }
 
 static HOT void gen_op_impl(int op)
@@ -116,13 +132,8 @@ redo:
    * imaginary part (`x + 1.0i` lost the `i`). */
   if ((op == '+' || op == '-') && ((t1 | t2) & VT_COMPLEX) && (is_float(bt1) || is_float(bt2)))
   {
-    int l_c = (vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
-    int r_c = (vtop[0].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
-    if (!(l_c && r_c))
-    {
-      gen_complex_float_arith(op);
-      return;
-    }
+    gen_complex_float_arith(op); /* folds a const+const pair itself */
+    return;
   }
 
   /* Complex float/double * : decompose at the frontend.  Handles mixed
@@ -188,21 +199,46 @@ redo:
   }
 
   /* C11 6.7.2.1p10: a bit-field has an integer type of the specified width.
-     For unsigned long long bit-fields narrower than 64 bits but wider than
-     32, arithmetic must wrap at the bit-field width, not at 64 bits.
-     Track the effective width here so we can truncate after the operation. */
+     For unsigned long long bit-fields wider than int but narrower than 64 bits,
+     arithmetic must wrap at the bit-field width, not at 64 bits.  But the result
+     type is the *usual arithmetic conversion* of the operands, so the bit-field
+     width only governs when it is the widest type involved:
+       - a plain long long / unsigned long long operand (or a bit-field declared
+         64 bits wide) widens the result to 64 bits and disables truncation;
+       - a shift's type is that of its left operand only, so a bit-field used
+         as the shift count never truncates;
+       - two bit-fields of different widths take the larger width.
+     Narrow (<= int) and signed bit-fields never truncate here.  Track the
+     effective width so we can truncate after the operation. */
   bf_trunc_size = 0;
-  if ((t1 & VT_BITFIELD) && (t1 & VT_UNSIGNED) && bt1 == VT_LLONG)
   {
-    int bs = BIT_SIZE(t1);
-    if (bs > 32 && bs < 64)
-      bf_trunc_size = bs;
-  }
-  if ((t2 & VT_BITFIELD) && (t2 & VT_UNSIGNED) && bt2 == VT_LLONG)
-  {
-    int bs = BIT_SIZE(t2);
-    if (bs > 32 && bs < 64 && bs > bf_trunc_size)
-      bf_trunc_size = bs;
+    /* Does an operand that contributes to the result type have effective width
+       64?  For a shift only the left operand (vtop[-1]) does. */
+    int wide64 = 0;
+    if (bt1 == VT_LLONG && (!(t1 & VT_BITFIELD) || BIT_SIZE(t1) >= 64))
+      wide64 = 1;
+    if (op_class != SHIFT_OP && bt2 == VT_LLONG &&
+        (!(t2 & VT_BITFIELD) || BIT_SIZE(t2) >= 64))
+      wide64 = 1;
+
+    if (!wide64)
+    {
+      if ((t1 & VT_BITFIELD) && (t1 & VT_UNSIGNED) && bt1 == VT_LLONG)
+      {
+        int bs = BIT_SIZE(t1);
+        if (bs > 32 && bs < 64)
+          bf_trunc_size = bs;
+      }
+      /* A shift's right operand is only a shift count: it never governs the
+         result type, so it is not considered here. */
+      if (op_class != SHIFT_OP && (t2 & VT_BITFIELD) && (t2 & VT_UNSIGNED) &&
+          bt2 == VT_LLONG)
+      {
+        int bs = BIT_SIZE(t2);
+        if (bs > 32 && bs < 64 && bs > bf_trunc_size)
+          bf_trunc_size = bs;
+      }
+    }
   }
 
   /* GCC vector extension: dispatch to element-wise scalar lowering */

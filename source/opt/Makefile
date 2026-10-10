@@ -37,6 +37,7 @@ CORE_OPT_SRC = \
 	source/opt/util/vreg_query.c \
 	source/opt/util/vreg_def_use.c \
 	source/opt/util/xform.c \
+	source/opt/util/range.c \
 	source/opt/util/ir_insert.c \
 	source/opt/analysis/du_chains.c \
 	source/opt/analysis/alias.c \
@@ -49,8 +50,7 @@ CORE_OPT_SRC = \
 	source/opt/engine/gen_adapters.c \
 	source/opt/engine/pass_timing.c \
 	source/opt/engine/fp_cache_shim.c \
-	source/opt/engine/fp_mat_cache.c \
-	source/opt/engine/pass_registry.c
+	source/opt/engine/fp_mat_cache.c
 
 # Interface headers these units depend on.  $(TCC_CORE_DEPS) is not optional:
 # these TUs include source/include/tcc.h, so configure's defines decide struct TCCState's
@@ -60,7 +60,9 @@ CORE_OPT_HDRS = \
 
 # Pre-RA cleanup passes, relocated out of ir/regalloc.c.
 RA_OPT_SRC = \
+	source/opt/ra/branch_thread.c \
 	source/opt/ra/const_branch_fold.c \
+	source/opt/ra/exit_sink.c \
 	source/opt/ra/incomplete_calls.c \
 	source/opt/ra/phi_const_chain.c \
 	source/opt/ra/umaal_fusion.c

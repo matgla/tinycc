@@ -1,0 +1,31 @@
+chain(0) error=0 lo=0 hi=7
+chain(1) error=111 lo=aaaaaaaaaaaaaaaa hi=2aaaaaaaaaa
+chain(2) error=112 lo=aaaaaaaaaaaaaaaa hi=2aaaaaaaaaa
+chain(3) error=112 lo=aaaaaaaaaaaaaaaa hi=2aaaaaaaaaa
+chain(4) error=113 lo=aaaaaaaaaaaaaaaa hi=2aaaaaaaaaa
+chain(5) error=114 lo=aaaaaaaaaaaaaaaa hi=2aaaaaaaaaa
+chain(6) error=0 lo=6 hi=7
+wide_live(0)=0 p=0 9 9 9 9
+wide_live(1)=1 p=1 a 14 1e 11
+wide_live(2)=2 p=2 a 14 1e 22
+wide_live(3)=3 p=3 a 14 1e 33
+wide_live(4)=0 p=0 9 9 9 9
+mixed_live(0)=0 p=9 9 9 9
+mixed_live(1)=49 p=15 d f 101
+mixed_live(2)=49 p=15 d f 202
+mixed_live(3)=49 p=15 d f 303
+mixed_live(4)=0 p=9 9 9 9
+say(0)=0 none 0 0
+say(1)=1 one 5 6
+say(2)=1 two 5 6
+say(3)=1 three 5 6
+say(4)=0 none 0 0
+narrow(0)=0 0 0 0
+narrow(1)=10 1234 1 2
+narrow(2)=10 4321 1 2
+narrow(3)=10 5555 1 2
+narrow(4)=0 0 0 0
+loop_exit(0)=10 out=1 1 1 0
+loop_exit(1)=-1 out=3 2 dead 70
+loop_exit(2)=-1 out=5 1 dead 71
+loop_exit(3)=-1 out=1 1 dead 72

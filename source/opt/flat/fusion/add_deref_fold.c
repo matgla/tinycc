@@ -77,8 +77,7 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
           break;
         if (irop_config[cq->op].has_dest)
         {
-          IROperand cd = tcc_ir_op_get_dest(ir, cq);
-          if (irop_get_vreg(cd) == base_vr && !cd.is_lval)
+          if (tcc_ir_op_dest_vreg(ir, cq) == base_vr && !tcc_ir_op_dest_is_lval(ir, cq))
           {
             copy_idx = j;
             break;
@@ -91,8 +90,7 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
       if (cq->op != TCCIR_OP_ASSIGN)
         continue;
       IROperand cs1 = tcc_ir_op_get_src1(ir, cq);
-      IROperand cd = tcc_ir_op_get_dest(ir, cq);
-      if (cs1.is_lval || cd.is_lval)
+      if (cs1.is_lval || tcc_ir_op_dest_is_lval(ir, cq))
         continue;
       int32_t cs1_vr = irop_get_vreg(cs1);
       if (cs1_vr < 0 || TCCIR_DECODE_VREG_TYPE(cs1_vr) != TCCIR_VREG_TYPE_PARAM)
@@ -131,18 +129,16 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
         continue;
       if (irop_config[uq->op].has_src1)
       {
-        IROperand s = tcc_ir_op_get_src1(ir, uq);
-        if (irop_get_vreg(s) == dest_vr)
-        { use_idx = j; use_is_deref = s.is_lval; use_in_src2 = 0; break; }
+        if (tcc_ir_op_src1_vreg(ir, uq) == dest_vr)
+        { use_idx = j; use_is_deref = tcc_ir_op_src1_is_lval(ir, uq); use_in_src2 = 0; break; }
       }
       if (irop_config[uq->op].has_src2)
       {
-        IROperand s = tcc_ir_op_get_src2(ir, uq);
-        if (irop_get_vreg(s) == dest_vr)
-        { use_idx = j; use_is_deref = s.is_lval; use_in_src2 = 1; break; }
+        if (tcc_ir_op_src2_vreg(ir, uq) == dest_vr)
+        { use_idx = j; use_is_deref = tcc_ir_op_src2_is_lval(ir, uq); use_in_src2 = 1; break; }
       }
       if ((uq->op == TCCIR_OP_STORE || uq->op == TCCIR_OP_STORE_INDEXED) &&
-          irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == dest_vr)
+          tcc_ir_op_dest_vreg(ir, uq) == dest_vr)
       { use_idx = j; break; }
     }
 
@@ -187,7 +183,7 @@ int tcc_ir_opt_add_deref_fold(TCCIRState *ir)
     /* The DEREF use's btype sets the load width; the ADD dest's pointer
      * btype may differ from the loaded value type. */
     IRQuadCompact *uq_pre = &ir->compact_instructions[use_idx];
-    IROperand use_op = use_in_src2 ? tcc_ir_op_get_src2(ir, uq_pre) : tcc_ir_op_get_src1(ir, uq_pre);
+    IROperand use_op = tcc_ir_op_get_src1_or_2(ir, uq_pre, use_in_src2);
     int load_btype = irop_get_btype(use_op);
 
     /* Skip 64-bit and struct loads: LOAD_INDEXED uses LDRD which requires

@@ -1,0 +1,14 @@
+eq_local=0
+ne_local=1
+gt_local=1
+branch=22
+sub_eq=0
+sub_ne=1
+eq_param=0
+ne_param=1
+indirect=0
+same_base=1
+same_ne=0
+reass_same=1
+diff_imm=0
+[returns 0]

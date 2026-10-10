@@ -20,10 +20,13 @@
 
 /* Both operands must be same is_sym+is_lval global read (same sym+addend),
  * non-volatile and non-FP. fold_val is the identity result (div->1, mod->0).
- * REWRITE cannot clear src2 to NONE, so clear it manually. */
+ * src2 is cleared to NONE before the opcode changes. */
 static int self_arith(IROptCtx *ctx, int i, int fold_val)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
 
   /* Same register on both sides: x/x==1, x%x==0 for x!=0 (div-by-zero UB).
    * Both read at this quad, so equal vregs = identical value. Registers only
@@ -32,8 +35,7 @@ static int self_arith(IROptCtx *ctx, int i, int fold_val)
       !src1.is_lval && !src2.is_lval && !src1.is_sym && !src2.is_sym &&
       !irop_is_immediate(src1) && !irop_is_immediate(src2)) {
     tcc_ir_set_src2(ir, i, IROP_NONE);
-    REWRITE(.new_op = TCCIR_OP_ASSIGN,
-            .src1 = irop_make_imm32(-1, fold_val, irop_get_btype(dest)));
+    REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(irop_make_imm32(-1, fold_val, irop_get_btype(dest))));
   }
 
   GUARD(when(src1.is_sym && src1.is_lval && src2.is_sym && src2.is_lval));
@@ -50,8 +52,7 @@ static int self_arith(IROptCtx *ctx, int i, int fold_val)
     return 0;
 
   tcc_ir_set_src2(ir, i, IROP_NONE);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN,
-          .src1 = irop_make_imm32(-1, fold_val, irop_get_btype(dest)));
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(irop_make_imm32(-1, fold_val, irop_get_btype(dest))));
 }
 
 OPT_GEN_FLAT(self_arith_div, TCCIR_OP_DIV) {

@@ -29,6 +29,7 @@
 #include "core.h"
 #include "dump.h"
 #include "machine_op.h"
+#include "op_props.h"
 #include "opt.h"
 #include "pool.h"
 #include "regalloc.h"

@@ -51,6 +51,9 @@ typedef struct DerivedIV
    * is aimed at (the group's smallest `offset`), so every member's access is
    * a non-negative immediate off one pointer.  0 when nothing is shared. */
   int origin;
+  /* The access follows the IV's in-loop update, so it reads the already
+   * stepped value: the walking pointer starts one stride ahead. */
+  int use_after_def;
 } DerivedIV;
 
 /* IV analysis */
@@ -139,6 +142,13 @@ int tcc_ir_loop_seq_entry_const(struct TCCIRState *ir, int at_idx, int32_t vreg,
 /* Rewrites a count-up pure-counter loop in [start,end] to count-down-to-zero; 1 if rewritten. */
 int dtz_try_region(struct TCCIRState *ir, int start, int end, int header_idx,
                    int preheader_idx);
+
+/* Rewrites a guard-protected `for (; n >= K; n -= K)` loop in [start,end] to
+ * the guard-predecremented form whose latch CMP reads the body's counter value
+ * (dtc = decrement-to-carry); 1 if rewritten.  Needs the CFG for the
+ * single-entry check and the loop membership map. */
+int dtc_try_region(struct TCCIRState *ir, struct IRCFG *cfg, const uint8_t *member,
+                   int start, int end, int header_idx);
 
 /* Misc helpers */
 int signed_to_unsigned_cond(int cond_token);

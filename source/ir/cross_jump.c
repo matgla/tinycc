@@ -30,6 +30,7 @@
  */
 
 #include "ir.h"
+#include "opt_utils.h"
 
 #define CJ_MAX_TAIL 64
 
@@ -65,17 +66,21 @@ static int cj_mergeable_op(int op)
 
 static int cj_reads_flags(int op)
 {
-  return op == TCCIR_OP_SETIF || op == TCCIR_OP_SELECT || op == TCCIR_OP_JUMPIF;
+  /* ADC_USE / SUBC_USE included: a merged tail must not consume the carry the
+   * other predecessor's low-half add produced. */
+  return ir_op_has(op, IR_HZ_FLAGS_READ);
 }
 
 static int cj_sets_flags(int op)
 {
-  return op == TCCIR_OP_CMP || op == TCCIR_OP_TEST_ZERO || op == TCCIR_OP_FCMP;
+  /* The carry producers do not count: a tail they start keeps its consumer
+   * out, which is only conservative. */
+  return ir_op_has(op, IR_HZ_FLAGS_SET) && !ir_opset_has(IROPSET(TCCIR_OP_ADC_GEN, TCCIR_OP_SUBC_GEN), op);
 }
 
 static int cj_has_slot3(int op)
 {
-  return tcc_ir_op_is_mac(op) || op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_SELECT;
+  return ir_op_has(op, IROP_A_SLOT3);
 }
 
 /* Struct operands name their type by an index into a per-operand pool, so the
@@ -140,6 +145,72 @@ static int cj_insn_same(TCCIRState *ir, IRQuadCompact *a, IRQuadCompact *b)
          tcc_ir_shift64_dead_half_at(ir, a) == tcc_ir_shift64_dead_half_at(ir, b) &&
          tcc_ir_zero_half64_at(ir, a) == tcc_ir_zero_half64_at(ir, b) &&
          tcc_ir_bfi_params_at(ir, a) == tcc_ir_bfi_params_at(ir, b);
+}
+
+static IROperand cj_slot(TCCIRState *ir, IRQuadCompact *q, int s);
+static int cj_prev(TCCIRState *ir, int i);
+static int cjl_is_call(int op);
+
+static uint32_t cj_mix(uint32_t h, uint32_t v)
+{
+  return (h ^ v) * 0x01000193u;
+}
+
+/* A fingerprint of what cj_insn_same and cjl_insn_same compare: instructions
+ * they find equal have equal keys.  Slot 2 of a call is only its tag (the call
+ * ids are paired later). */
+static uint32_t cj_insn_key(TCCIRState *ir, IRQuadCompact *q)
+{
+  uint32_t h = cj_mix(0x811C9DC5u, q->op);
+  for (int s = 0; s < 4; s++)
+  {
+    IROperand o = cj_slot(ir, q, s);
+    if (irop_is_none(o))
+    {
+      h = cj_mix(h, 0xFFu);
+      continue;
+    }
+    h = cj_mix(h, o.tag);
+    if (s == 2 && cjl_is_call(q->op))
+      continue;
+    int32_t vr = irop_get_vreg(o);
+    h = cj_mix(h, o.btype | (vr >= 0 ? (TCCIR_DECODE_VREG_TYPE(vr) + 1) << 8 : 0));
+    switch (o.tag)
+    {
+    case IROP_TAG_IMM32:
+    case IROP_TAG_STACKOFF:
+    case IROP_TAG_F32:
+      if (o.btype != IROP_BTYPE_STRUCT)
+        h = cj_mix(h, (uint32_t)o.u.imm32);
+      break;
+    case IROP_TAG_SYMREF:
+    {
+      IRPoolSymref *sr = irop_get_symref_ex(ir, o);
+      if (sr)
+        h = cj_mix(cj_mix(h, (uint32_t)(uintptr_t)sr->sym), (uint32_t)sr->addend);
+      break;
+    }
+    default:
+      break;
+    }
+  }
+  return h;
+}
+
+/* The exit at j and the instruction before it.  Two exits whose keys differ
+ * leave to different places (JUMP targets are in the key) or end in different
+ * instructions, so the tail walk would stop before taking one: the pair loops
+ * skip them uncompared.  Without this a switch of a thousand
+ * `case n: p = &xn; break;` compares half a million pairs, each operand by
+ * operand. */
+static uint32_t cj_exit_key(TCCIRState *ir, int j)
+{
+  IRQuadCompact *q = &ir->compact_instructions[j];
+  uint32_t h = cj_mix(0x811C9DC5u, q->op);
+  if (q->op == TCCIR_OP_JUMP)
+    h = cj_mix(h, (uint32_t)tcc_ir_op_dest_imm32(ir, q));
+  int p = cj_prev(ir, j);
+  return p < 0 ? h : cj_mix(h, cj_insn_key(ir, &ir->compact_instructions[p]));
 }
 
 /* A dense index for a vreg (TEMP, VAR, PARAM), or -1. */
@@ -258,6 +329,9 @@ int tcc_ir_cross_jump(TCCIRState *ir)
   for (int i = 0; i < n; i++)
     if (ir->compact_instructions[i].op == TCCIR_OP_JUMP)
       jumps[nj++] = i;
+  uint32_t *keys = tcc_malloc(sizeof(uint32_t) * (nj + 1));
+  for (int x = 0; x < nj; x++)
+    keys[x] = cj_exit_key(ir, jumps[x]);
 
   int *tail_a = tcc_malloc(sizeof(int) * n), *tail_b = tcc_malloc(sizeof(int) * n);
   /* Every vreg's operand occurrences, to tell a tail-local value. */
@@ -285,12 +359,14 @@ int tcc_ir_cross_jump(TCCIRState *ir)
     IRQuadCompact *qa = &ir->compact_instructions[ja];
     if (qa->op != TCCIR_OP_JUMP)
       continue;
-    int target = irop_get_imm32(tcc_ir_op_get_dest(ir, qa));
+    int target = tcc_ir_op_dest_imm32(ir, qa);
     for (int y = x + 1; y < nj; y++)
     {
+      if (keys[y] != keys[x])
+        continue;
       int jb = jumps[y];
       IRQuadCompact *qb = &ir->compact_instructions[jb];
-      if (qb->op != TCCIR_OP_JUMP || qb->is_jump_target || irop_get_imm32(tcc_ir_op_get_dest(ir, qb)) != target)
+      if (qb->op != TCCIR_OP_JUMP || qb->is_jump_target || tcc_ir_op_dest_imm32(ir, qb) != target)
         continue;
       /* The longest common tail, walked backwards in step.  A path entering
        * the removed copy anywhere but at its first instruction -- a jump target
@@ -355,9 +431,10 @@ int tcc_ir_cross_jump(TCCIRState *ir)
       int start_a = tail_a[k - 1], start_b = tail_b[k - 1];
       for (int m = 0; m < k; m++)
         ir->compact_instructions[tail_b[m]].op = TCCIR_OP_NOP;
-      tcc_ir_set_dest(ir, jb, irop_make_imm32(-1, start_a, IROP_BTYPE_INT32));
+      tcc_ir_set_dest_imm32(ir, jb, start_a, IROP_BTYPE_INT32);
       ir->compact_instructions[start_a].is_jump_target = 1;
       (void)start_b;
+      keys[y] = cj_exit_key(ir, jb); /* new target, new last instruction */
       merged++;
     }
   }
@@ -368,6 +445,7 @@ int tcc_ir_cross_jump(TCCIRState *ir)
   tcc_free(occ);
   tcc_free(tail_b);
   tcc_free(tail_a);
+  tcc_free(keys);
   tcc_free(jumps);
   return merged;
 }
@@ -444,13 +522,12 @@ static int cjl_defined_in(TCCIRState *ir, const int *tail, int k, int32_t key)
 
 static int cjl_is_call(int op)
 {
-  return op == TCCIR_OP_FUNCPARAMVAL || op == TCCIR_OP_FUNCPARAMVOID || op == TCCIR_OP_FUNCCALLVAL ||
-         op == TCCIR_OP_FUNCCALLVOID;
+  return ir_op_has(op, IR_HZ_CALL | IR_HZ_CALL_PARAM);
 }
 
 static int cjl_call_id(TCCIRState *ir, IRQuadCompact *q)
 {
-  return TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+  return TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, q));
 }
 
 /* cj_insn_same, and calls: a call's parameters and the call carry the call id
@@ -642,7 +719,7 @@ static int cjl_same_exit(TCCIRState *ir, IRQuadCompact *a, IRQuadCompact *b)
   if (a->op != b->op)
     return 0;
   if (a->op == TCCIR_OP_JUMP)
-    return irop_get_imm32(tcc_ir_op_get_dest(ir, a)) == irop_get_imm32(tcc_ir_op_get_dest(ir, b));
+    return tcc_ir_op_dest_imm32(ir, a) == tcc_ir_op_dest_imm32(ir, b);
   if (a->op == TCCIR_OP_RETURNVALUE)
   {
     IROperand oa = tcc_ir_op_get_src1(ir, a), ob = tcc_ir_op_get_src1(ir, b);
@@ -661,6 +738,9 @@ int tcc_ir_cross_jump_alloc(TCCIRState *ir)
   for (int i = 0; i < n; i++)
     if (cjl_is_exit(ir->compact_instructions[i].op))
       exits[ne++] = i;
+  uint32_t *keys = tcc_malloc(sizeof(uint32_t) * (ne + 1));
+  for (int x = 0; x < ne; x++)
+    keys[x] = cj_exit_key(ir, exits[x]);
 
   int *tail_a = tcc_malloc(sizeof(int) * (CJ_MAX_TAIL + 1)), *tail_b = tcc_malloc(sizeof(int) * (CJ_MAX_TAIL + 1));
   const int nkeys = ir->next_temporary_variable + ir->next_local_variable + ir->next_parameter + 1;
@@ -702,6 +782,8 @@ int tcc_ir_cross_jump_alloc(TCCIRState *ir)
       continue;
     for (int y = x + 1; y < ne; y++)
     {
+      if (keys[y] != keys[x])
+        continue;
       int jb = exits[y];
       IRQuadCompact *qb = &ir->compact_instructions[jb];
       if (!cjl_is_exit(qb->op) || qb->is_jump_target || !cjl_same_exit(ir, qa, qb))
@@ -789,6 +871,11 @@ int tcc_ir_cross_jump_alloc(TCCIRState *ir)
       ir->iroperand_pool[jq->operand_base] = irop_make_imm32(-1, start_a, IROP_BTYPE_INT32);
       jq->op = TCCIR_OP_JUMP;
       ir->compact_instructions[start_a].is_jump_target = 1;
+      /* jb is gone or a jump elsewhere, and the next exit may now follow a
+       * different instruction. */
+      keys[y] = cj_exit_key(ir, jb);
+      if (y + 1 < ne)
+        keys[y + 1] = cj_exit_key(ir, exits[y + 1]);
       merged++;
     }
   }
@@ -801,6 +888,7 @@ int tcc_ir_cross_jump_alloc(TCCIRState *ir)
   tcc_free(occ);
   tcc_free(tail_b);
   tcc_free(tail_a);
+  tcc_free(keys);
   tcc_free(exits);
   return merged;
 }
@@ -851,8 +939,7 @@ static int rm_op_ok(int op)
 
 static int rm_is_call_op(int op)
 {
-  return op == TCCIR_OP_FUNCPARAMVAL || op == TCCIR_OP_FUNCPARAMVOID || op == TCCIR_OP_FUNCCALLVAL ||
-         op == TCCIR_OP_FUNCCALLVOID;
+  return ir_op_has(op, IR_HZ_CALL | IR_HZ_CALL_PARAM);
 }
 
 static int rm_is_jump(int op)
@@ -899,7 +986,7 @@ static int rm_next(TCCIRState *ir, int i, int n)
 
 static int rm_call_id(TCCIRState *ir, IRQuadCompact *q)
 {
-  return TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+  return TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, q));
 }
 
 #define RM_NOCASE INT64_MIN
@@ -1174,7 +1261,7 @@ static int rm_case_accept(RMState *st, int a, int k)
     for (int m = 0; m < k; m++)
     {
       IRQuadCompact *q = &ir->compact_instructions[st->ia[m]];
-      if (rm_is_jump(q->op) && irop_get_imm32(tcc_ir_op_get_dest(ir, q)) == t)
+      if (rm_is_jump(q->op) && tcc_ir_op_dest_imm32(ir, q) == t)
         inside++;
     }
     if (inside != st->jrefs[t])
@@ -1249,7 +1336,7 @@ static int rm_match(RMState *st, int a, int b)
       seen_producer = 1;
     if (rm_is_jump(qa->op))
     {
-      int ta = irop_get_imm32(tcc_ir_op_get_dest(ir, qa)), tb = irop_get_imm32(tcc_ir_op_get_dest(ir, qb));
+      int ta = tcc_ir_op_dest_imm32(ir, qa), tb = tcc_ir_op_dest_imm32(ir, qb);
       if (ta != tb)
       {
         /* Both inside their own copy, at the same position. */
@@ -1286,7 +1373,7 @@ static int rm_match(RMState *st, int a, int b)
     for (int m = 0; m < k; m++)
     {
       IRQuadCompact *q = &ir->compact_instructions[st->ib[m]];
-      if (rm_is_jump(q->op) && irop_get_imm32(tcc_ir_op_get_dest(ir, q)) == t)
+      if (rm_is_jump(q->op) && tcc_ir_op_dest_imm32(ir, q) == t)
         inside++;
     }
     if (inside != st->jrefs[t])
@@ -1432,13 +1519,13 @@ int tcc_ir_region_merge(TCCIRState *ir)
     }
     if (rm_is_jump(q->op))
     {
-      int t = irop_get_imm32(tcc_ir_op_get_dest(ir, q));
+      int t = tcc_ir_op_dest_imm32(ir, q);
       if (t >= 0 && t < n)
         st.jrefs[t]++;
     }
     if (q->op == TCCIR_OP_SWITCH_TABLE)
     {
-      int id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      int id = (int)tcc_ir_op_src2_imm(ir, q);
       if (id >= 0 && id < ir->num_switch_tables)
       {
         TCCIRSwitchTable *tab = &ir->switch_tables[id];
@@ -1471,7 +1558,7 @@ int tcc_ir_region_merge(TCCIRState *ir)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op == TCCIR_OP_SWITCH_TABLE)
       {
-        TCCIRSwitchTable *tab = &ir->switch_tables[irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q))];
+        TCCIRSwitchTable *tab = &ir->switch_tables[tcc_ir_op_src2_imm(ir, q)];
         if (tab->num_entries > 0)
           st.swsel[i] = rm_case_selector(&st, i, tab->min_val);
       }
@@ -1519,7 +1606,7 @@ int tcc_ir_region_merge(TCCIRState *ir)
       for (int t = b + 1; t <= st.ib[k - 1]; t++)
         st.dead[t] = 1;
       qf->op = TCCIR_OP_JUMP;
-      tcc_ir_op_set_dest(ir, qf, irop_make_imm32(-1, a, IROP_BTYPE_INT32));
+      tcc_ir_op_set_dest_imm32(ir, qf, a, IROP_BTYPE_INT32);
       st.dead[fb] = 1;
       ir->compact_instructions[a].is_jump_target = 1;
       merged++;
@@ -1568,4 +1655,439 @@ out:
   tcc_free(st.occ);
   tcc_free(st.ord);
   return merged;
+}
+
+/* Whether the flags set at instruction i are read before the next
+ * instruction that sets them: straight on from i, a read keeps them, a set
+ * kills them, and anything that leaves the straight line (a branch, a call, a
+ * return) keeps them -- conservatively. */
+static int flags_read_after(TCCIRState *ir, int i)
+{
+  const int n = ir->next_instruction_index;
+  for (int j = i + 1; j < n; j++)
+  {
+    const int op = ir->compact_instructions[j].op;
+    if (op == TCCIR_OP_NOP)
+      continue;
+    if (ir_op_has(op, IR_HZ_FLAGS_READ))
+      return 1;
+    if (ir_op_has(op, IR_HZ_BRANCH | IR_HZ_CALL | IR_HZ_RETURN | IR_HZ_NONLOCAL | IR_HZ_ASM | IR_HZ_TRAP) ||
+        ir_op_has(op, IROP_ENDS_BLOCK))
+      return 1;
+    if (ir_op_has(op, IR_HZ_FLAGS_SET))
+      return 0;
+  }
+  return 1;
+}
+
+/* A conditional branch to where control goes anyway goes, and with it the
+ * compare that fed only it.  Dead-store elimination can empty what such a
+ * branch skipped after the branch passes ran -- an inline compare-exchange's
+ * write-back of the old value to an `expected` nobody reads again -- in SSA
+ * (ssa:dce, once SRA scalarized a Zig optional) or after allocation
+ * (ra_dead_frame_store_elim).  Returns the number of instructions removed. */
+int tcc_ir_drop_jumpif_to_next(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  int removed = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int j = i + 1;
+    while (j < n && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+      j++;
+    int t = tcc_ir_op_dest_imm32(ir, q);
+    while (t >= 0 && t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+      t++;
+    if (t != j)
+      continue;
+    q->op = TCCIR_OP_NOP;
+    removed++;
+    int p = i - 1;
+    while (p >= 0 && ir->compact_instructions[p].op == TCCIR_OP_NOP)
+      p--;
+    if (p < 0)
+      continue;
+    IRQuadCompact *c = &ir->compact_instructions[p];
+    if ((c->op != TCCIR_OP_CMP && c->op != TCCIR_OP_TEST_ZERO) || flags_read_after(ir, p))
+      continue;
+    IROperand a = tcc_ir_op_get_src1(ir, c);
+    IROperand b = c->op == TCCIR_OP_CMP ? tcc_ir_op_get_src2(ir, c) : IROP_NONE;
+    if (a.is_lval || a.is_llocal || (!irop_is_none(b) && (b.is_lval || b.is_llocal)))
+      continue;
+    c->op = TCCIR_OP_NOP;
+    removed++;
+  }
+  return removed;
+}
+
+/* `t0 <- SETIF c; t1 <- t0; t2 <- t1 AND #1; CMP t2,#0; JUMPIF` -> `t0 <-
+ * SETIF c; CMP t0,#0; JUMPIF`, for setif_fuse to finish: a 0/1 value tests
+ * the same through copies and odd masks.  The Zig C backend tests its
+ * optionals' bools that way once SRA scalarizes them -- a struct copy, a u8
+ * field load -- and the inline compare-exchange of every kernel spin lock
+ * reached codegen as ITE/MOV/MOV/CMP/branch.  Only a chain the SETIF heads
+ * with nothing else between, each link defined once and used once, and no
+ * jump into it.  Returns the number of tests rewritten. */
+int tcc_ir_setif_test_chain_fold(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  int changes = 0;
+  /* Where the jumps that are left land: a dropped branch leaves its
+   * target's is_jump_target set.  With a table or indirect jump, trust the
+   * flags. */
+  uint8_t *landed = tcc_mallocz(n + 1);
+  for (int k = 0; k < n; k++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[k];
+    if (q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_IJUMP || ir_op_has(q->op, IROP_A_MAY_BRANCH))
+    {
+      for (int t = 0; t < n; t++)
+        landed[t] = ir->compact_instructions[t].is_jump_target;
+      break;
+    }
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int t = tcc_ir_op_dest_imm32(ir, q);
+    while (t >= 0 && t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+      t++;
+    if (t >= 0 && t <= n)
+      landed[t] = 1;
+  }
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *test = &ir->compact_instructions[i];
+    if (test->op != TCCIR_OP_CMP || landed[i])
+      continue;
+    IROperand ts = tcc_ir_op_get_src1(ir, test), tz = tcc_ir_op_get_src2(ir, test);
+    if (!irop_is_immediate(tz) || irop_get_imm64_ex(ir, tz) != 0 || ts.is_lval || ts.is_llocal)
+      continue;
+    int32_t vr = irop_get_vreg(ts);
+    if (vr < 0 || irop_get_btype(ts) == IROP_BTYPE_INT64 || irop_get_btype(ts) == IROP_BTYPE_FLOAT32 ||
+        irop_get_btype(ts) == IROP_BTYPE_FLOAT64)
+      continue;
+    /* Walk the chain back: every non-NOP instruction before the test must be
+     * its next link, up to the SETIF. */
+    int chain[8], len = 0, setif = -1;
+    for (int k = i - 1; k >= 0 && len < 8; k--)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[k];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (!irop_config[q->op].has_dest || irop_get_vreg(tcc_ir_op_get_dest(ir, q)) != vr ||
+          !irop_dest_defines_vreg(tcc_ir_op_get_dest(ir, q)))
+        break;
+      if (q->op == TCCIR_OP_SETIF)
+      {
+        setif = k;
+        break;
+      }
+      IROperand s1 = tcc_ir_op_get_src1(ir, q);
+      const int bt = irop_get_btype(s1);
+      if (s1.is_lval || s1.is_llocal || irop_get_vreg(s1) < 0 || bt == IROP_BTYPE_INT64 ||
+          bt == IROP_BTYPE_FLOAT32 || bt == IROP_BTYPE_FLOAT64)
+        break;
+      if (q->op == TCCIR_OP_AND)
+      {
+        IROperand m = tcc_ir_op_get_src2(ir, q);
+        if (!irop_is_immediate(m) || !(irop_get_imm64_ex(ir, m) & 1))
+          break;
+      }
+      else if (q->op != TCCIR_OP_ASSIGN)
+        break;
+      chain[len++] = k;
+      vr = irop_get_vreg(s1);
+    }
+    if (setif < 0 || !len)
+      continue;
+    /* Each link (and the SETIF's value) defined once and read once -- by the
+     * next link or the test -- and no jump lands between SETIF and test. */
+    int ok = 1;
+    for (int k = setif + 1; k <= i && ok; k++)
+      ok = !landed[k];
+    int32_t vregs[9];
+    int nv = 0;
+    vregs[nv++] = irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[setif]));
+    for (int c = len - 1; c >= 0; c--)
+      vregs[nv++] = irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[chain[c]]));
+    for (int k = 0; k < n && ok; k++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[k];
+      if (q->op == TCCIR_OP_NOP)
+        continue;
+      if (irop_config[q->op].has_dest && k != setif)
+      {
+        int32_t d = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+        int is_link = 0;
+        for (int c = 0; c < len; c++)
+          is_link |= chain[c] == k;
+        for (int v = 0; v < nv && !is_link; v++)
+          ok &= d != vregs[v];
+      }
+      for (int s = 1; s <= 2 && ok; s++)
+      {
+        if ((s == 1 && !irop_config[q->op].has_src1) || (s == 2 && !irop_config[q->op].has_src2))
+          continue;
+        int32_t r = irop_get_vreg(s == 1 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q));
+        if (r < 0)
+          continue;
+        /* the reader allowed for vregs[v]: the next link, or the test */
+        for (int v = 0; v < nv; v++)
+          if (r == vregs[v])
+          {
+            int reader = v + 1 < nv ? chain[len - 1 - v] : i;
+            ok &= k == reader && s == 1;
+          }
+      }
+      if (ir_op_has(q->op, IROP_A_SLOT3) && ok && q->operand_base + 3 < (uint32_t)ir->iroperand_pool_count)
+      {
+        int32_t r = irop_get_vreg(ir->iroperand_pool[q->operand_base + 3]);
+        for (int v = 0; v < nv; v++)
+          ok &= r < 0 || r != vregs[v];
+      }
+    }
+    if (!ok)
+      continue;
+    IROperand src = tcc_ir_op_get_dest(ir, &ir->compact_instructions[setif]);
+    src.is_lval = 0;
+    tcc_ir_set_src1(ir, i, src);
+    for (int c = 0; c < len; c++)
+      ir->compact_instructions[chain[c]].op = TCCIR_OP_NOP;
+    changes++;
+  }
+  tcc_free(landed);
+  return changes;
+}
+
+/*
+ * Branch tidy after the merges.
+ *
+ * The merges above replace a repeated tail or region by a jump to the kept
+ * copy, after the branch cleanups have run: a branch that reached the
+ * removed copy through a lone jump now reaches a jump to the kept one, a
+ * conditional branch skips over a jump it could take inverted, and a jump
+ * whose only way in went through the removed copy is left behind unreached.
+ * Branches are threaded through jumps (both ways: no loop pass runs after
+ * this), a JUMPIF over a JUMP is inverted, a jump to the next instruction
+ * goes, and what the entry no longer reaches goes too.
+ */
+
+static int bt_target(TCCIRState *ir, int i)
+{
+  return tcc_ir_op_dest_imm32(ir, &ir->compact_instructions[i]);
+}
+
+static int bt_uncond(int op)
+{
+  switch (op)
+  {
+  case TCCIR_OP_JUMP:
+  case TCCIR_OP_IJUMP:
+  case TCCIR_OP_SWITCH_TABLE:
+  case TCCIR_OP_RETURNVALUE:
+  case TCCIR_OP_RETURNVOID:
+  case TCCIR_OP_TRAP:
+  case TCCIR_OP_LONGJMP:
+  case TCCIR_OP_NL_LONGJMP:
+  case TCCIR_OP_BUILTIN_RETURN:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* Would the JUMPIF at i become a CBZ/CBNZ?  Its compare is against zero. */
+static int bt_cbz_candidate(TCCIRState *ir, int i)
+{
+  int j = i - 1;
+  while (j >= 0 && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+    j--;
+  if (j < 0)
+    return 0;
+  IRQuadCompact *q = &ir->compact_instructions[j];
+  if (q->op == TCCIR_OP_TEST_ZERO)
+    return 1;
+  if (q->op != TCCIR_OP_CMP)
+    return 0;
+  return tcc_ir_op_src2_tag(ir, q) == IROP_TAG_IMM32 && !tcc_ir_op_src2_is_lval(ir, q) && !tcc_ir_op_src2_is_sym(ir, q) && tcc_ir_op_src2_imm32(ir, q) == 0;
+}
+
+/* Branch encodings decide what pays here.  A B reaches +-2 KB, so a jump
+ * threaded past another jump keeps its size, and the other one goes when
+ * nothing else enters it.  A conditional branch to a jump gives up its 16-bit
+ * form when the far target is out of reach: it is threaded only when the jump
+ * it bypasses goes with it.  Inverting `B<c> L; B X; L:` into `B<!c> X` never
+ * costs (B<c>.W is the size of B<c>.N + B.N).  A compare against zero is left
+ * alone: its branch becomes a CBZ, forward-only within 126 bytes, which the
+ * far target would lose. */
+int tcc_ir_branch_tidy(TCCIRState *ir)
+{
+  const int n = ir->next_instruction_index;
+  if (n < 2 || ir->func_has_label_addr || tcc_ir_calls_returns_twice(ir))
+    return 0;
+  for (int i = 0; i < n; i++)
+  {
+    int op = ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_NL_SETJMP || op == TCCIR_OP_SETJMP || op == TCCIR_OP_INLINE_ASM)
+      return 0;
+  }
+  int changes = 0;
+  int *refs = tcc_malloc(sizeof(int) * (n + 1));
+  uint8_t *reach = tcc_malloc(n + 1);
+  int *stack = tcc_malloc(sizeof(int) * (n + 1));
+  for (int round = 0; round < 4; round++)
+  {
+    int ch = 0;
+    /* Branch targets, NOP runs resolved to what they land on. */
+    memset(refs, 0, sizeof(int) * (n + 1));
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+      {
+        int t = bt_target(ir, i);
+        while (t >= 0 && t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+          t++;
+        if (t >= 0 && t <= n)
+          refs[t]++;
+      }
+    }
+    for (int t = 0; t < ir->num_switch_tables; t++)
+    {
+      TCCIRSwitchTable *tbl = &ir->switch_tables[t];
+      for (int j = -1; j < tbl->num_entries; j++)
+      {
+        int x = j < 0 ? tbl->default_target : tbl->targets[j];
+        while (x >= 0 && x < n && ir->compact_instructions[x].op == TCCIR_OP_NOP)
+          x++;
+        if (x >= 0 && x <= n)
+          refs[x]++;
+      }
+    }
+    /* Thread through jumps. */
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+        continue;
+      int t = bt_target(ir, i);
+      while (t >= 0 && t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+        t++;
+      if (t < 0 || t >= n || t == i || ir->compact_instructions[t].op != TCCIR_OP_JUMP)
+        continue;
+      int f = bt_target(ir, t);
+      if (f < 0 || f > n || f == t)
+        continue;
+      if (q->op == TCCIR_OP_JUMPIF)
+      {
+        int p = t - 1;
+        while (p >= 0 && ir->compact_instructions[p].op == TCCIR_OP_NOP)
+          p--;
+        if (bt_cbz_candidate(ir, i) || refs[t] != 1 || p < 0 || !bt_uncond(ir->compact_instructions[p].op))
+          continue;
+      }
+      tcc_ir_set_dest_imm32(ir, i, f, IROP_BTYPE_INT32);
+      if (f < n)
+        ir->compact_instructions[f].is_jump_target = 1;
+      refs[t]--;
+      ch++;
+    }
+    /* JUMPIF c -> L; JUMP X; L:  ==>  JUMPIF !c -> X, when nothing else
+     * enters the JUMP. */
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_JUMPIF || bt_cbz_candidate(ir, i))
+        continue;
+      int j = i + 1;
+      while (j < n && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+        j++;
+      if (j >= n || ir->compact_instructions[j].op != TCCIR_OP_JUMP || refs[j])
+        continue;
+      int after = j + 1;
+      while (after < n && ir->compact_instructions[after].op == TCCIR_OP_NOP)
+        after++;
+      int t = bt_target(ir, i);
+      while (t >= 0 && t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+        t++;
+      if (t != after)
+        continue;
+      int inv = invert_condition(irop_get_imm32(tcc_ir_op_get_src1(ir, q)));
+      if (inv < 0)
+        continue;
+      int x = bt_target(ir, j);
+      tcc_ir_set_dest_imm32(ir, i, x, IROP_BTYPE_INT32);
+      tcc_ir_set_src1_imm32(ir, i, inv, IROP_BTYPE_INT32);
+      ir->compact_instructions[j].op = TCCIR_OP_NOP;
+      ch++;
+    }
+    /* A JUMP to where control goes anyway. */
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      if (q->op != TCCIR_OP_JUMP)
+        continue;
+      int j = i + 1;
+      while (j < n && ir->compact_instructions[j].op == TCCIR_OP_NOP)
+        j++;
+      int t = bt_target(ir, i);
+      while (t >= 0 && t < n && ir->compact_instructions[t].op == TCCIR_OP_NOP)
+        t++;
+      if (t == j)
+      {
+        q->op = TCCIR_OP_NOP;
+        ch++;
+      }
+    }
+    /* What the entry no longer reaches. */
+    memset(reach, 0, n + 1);
+    int sp = 0;
+    reach[0] = 1;
+    stack[sp++] = 0;
+    while (sp)
+    {
+      int i = stack[--sp];
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int succ[2], ns = 0;
+      if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+        succ[ns++] = bt_target(ir, i);
+      if (q->op == TCCIR_OP_NOP || !bt_uncond(q->op))
+        succ[ns++] = i + 1;
+      if (q->op == TCCIR_OP_SWITCH_TABLE)
+      {
+        int id = tcc_ir_op_src2_imm32(ir, q);
+        TCCIRSwitchTable *tbl = id >= 0 && id < ir->num_switch_tables ? &ir->switch_tables[id] : NULL;
+        for (int j = -1; tbl && j < tbl->num_entries; j++)
+        {
+          int x = j < 0 ? tbl->default_target : tbl->targets[j];
+          if (x >= 0 && x < n && !reach[x])
+          {
+            reach[x] = 1;
+            stack[sp++] = x;
+          }
+        }
+      }
+      for (int k = 0; k < ns; k++)
+        if (succ[k] >= 0 && succ[k] < n && !reach[succ[k]])
+        {
+          reach[succ[k]] = 1;
+          stack[sp++] = succ[k];
+        }
+    }
+    for (int i = 0; i < n; i++)
+      if (!reach[i] && ir->compact_instructions[i].op != TCCIR_OP_NOP)
+      {
+        ir->compact_instructions[i].op = TCCIR_OP_NOP;
+        ch++;
+      }
+    changes += ch;
+    if (!ch)
+      break;
+  }
+  tcc_free(stack);
+  tcc_free(reach);
+  tcc_free(refs);
+  return changes;
 }

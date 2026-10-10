@@ -37,6 +37,17 @@
 /* define_stack is defined in tccgen.c, which we do not link. */
 Sym *define_stack;
 
+/* The lazy __builtin_* prototypes (gen/decl/predef_protos.c) are not linked
+   either: never armed, so tccpp's intern hook never calls in. */
+unsigned char tcc_predef_protos_armed;
+unsigned char tcc_predef_protos_queued;
+void tccgen_predef_proto_interned(TokenSym *ts) { (void)ts; }
+
+/* The isolated preprocessor binary does not link tccasm.c.  Production
+ * preprocess_end() calls this hook to release inline-asm macros, so provide
+ * the corresponding no-op for this frontend-only harness. */
+void tcc_asm_cleanup(void) {}
+
 /* tccpp.c's preprocess_start() references the target machine predefs blob that
  * normally lives in the backend (arm-thumb-gen.c).  Supply a minimal ARMv8-M
  * string so the lifecycle tests can call preprocess_start() without pulling in
@@ -137,6 +148,17 @@ void sym_free(Sym *sym)
   tcc_free(sym);
 }
 
+/* Macro Syms are short ones (symtab.c pools them); a whole Sym will do here. */
+Sym *sym_push2_short(Sym **ps, int v, int t, int c)
+{
+  return sym_push2(ps, v, t, c);
+}
+
+void sym_free_short(Sym *sym)
+{
+  tcc_free(sym);
+}
+
 int _tcc_error_noabort(const char *fmt, ...)
 {
   va_list ap;
@@ -148,6 +170,21 @@ int _tcc_error_noabort(const char *fmt, ...)
 }
 
 void _tcc_error(const char *fmt, ...)
+{
+  if (tcc_state && tcc_state->error_set_jmp_enabled)
+    longjmp(tcc_state->error_jmp_buf, 1);
+
+  {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+  }
+  fputc('\n', stderr);
+  exit(1);
+}
+
+void _tcc_ice(const char *fmt, ...)
 {
   if (tcc_state && tcc_state->error_set_jmp_enabled)
     longjmp(tcc_state->error_jmp_buf, 1);

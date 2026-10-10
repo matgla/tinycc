@@ -241,5 +241,3 @@ int tcc_ir_opt_cmp_imm_swap(TCCIRState *ir)
   tcc_free(entry);
   return changes;
 }
-
-int tcc_ir_opt_cmp_imm_swap_ex(IROptCtx *ctx) { return tcc_ir_opt_cmp_imm_swap(ctx->ir); }

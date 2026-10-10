@@ -1,0 +1,8 @@
+0000: V0 <-- P0 ADD P1
+0001: T1 <-- &V1
+0002: PARAM0[call_0] T1
+0003: PARAM1[call_0] V0
+0004: PARAM2[call_0] #4
+0005: CALL GlobalSym(#0) --> VReg?
+0006: T3 <-- V1 [LOAD]
+0007: RETURNVALUE T3

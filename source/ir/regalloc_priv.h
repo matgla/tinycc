@@ -65,17 +65,88 @@
 
 #define RA_DBG(fmt, ...) LOG_LS(fmt, ##__VA_ARGS__)
 
+/* Extra per-decision lines for ONE function's linear scan: TCC_RA_TRACE_FUNC=<name>
+ * matches the function being compiled (tcc_state->cur_func_sym, set by gen_function
+ * before its body is generated), so a whole-TU compile stays readable.  The lines
+ * it gates name each spill decision (evict-whom / spill-self) and print the
+ * coalescing and loop-lock state at each allocation; without the filter they stay
+ * off.  Needs the usual -DTCC_LOG_LS=1 build to print at all. */
+TCC_DBG_ENV_STR(ra_trace_func, "TCC_RA_TRACE_FUNC")
+
+static inline int ra_trace_on(void)
+{
+  const char *want = ra_trace_func();
+  if (!want)
+    return 0;
+  const Sym *fs = tcc_state ? tcc_state->cur_func_sym : NULL;
+  if (!fs)
+    return 0;
+  const char *name = get_tok_str(fs->v, NULL);
+  return name && !strcmp(want, name);
+}
+
+/* Dense index for per-vreg tables: the VARs, then the TEMPs, then the PARAMs,
+ * each [0, count).  The type * max_pos + pos layout left the type-0 quarter
+ * unused and sized every type by the largest count -- 4x the entries of a
+ * temp-heavy function (1457-instruction regcomp: 2908 slots for 778 vregs).
+ * A vreg outside every range maps to `size`, which every table user already
+ * rejects with its `idx < size` bound. */
+typedef struct RaVregIdx {
+  int base[4];
+  int cnt[4];
+  int size;
+} RaVregIdx;
+
+static inline void ra_vidx_init(RaVregIdx *x, int nvar, int ntemp, int nparam)
+{
+  x->base[0] = 0, x->cnt[0] = 0;
+  x->base[TCCIR_VREG_TYPE_VAR] = 0, x->cnt[TCCIR_VREG_TYPE_VAR] = nvar;
+  x->base[TCCIR_VREG_TYPE_TEMP] = nvar, x->cnt[TCCIR_VREG_TYPE_TEMP] = ntemp;
+  x->base[TCCIR_VREG_TYPE_PARAM] = nvar + ntemp, x->cnt[TCCIR_VREG_TYPE_PARAM] = nparam;
+  x->size = nvar + ntemp + nparam;
+  if (x->size <= 0)
+    x->size = 1; /* one never-addressed slot keeps the tables non-empty */
+}
+
+static inline int ra_vidx(const RaVregIdx *x, int32_t vr)
+{
+  if (vr < 0)
+    return x->size;
+  const unsigned t = (unsigned)TCCIR_DECODE_VREG_TYPE(vr);
+  const int p = TCCIR_DECODE_VREG_POSITION(vr);
+  if (t > TCCIR_VREG_TYPE_PARAM || p >= x->cnt[t])
+    return x->size;
+  return x->base[t] + p;
+}
+
+/* The vreg at dense index idx (0 <= idx < size, and not the empty filler). */
+static inline int32_t ra_vidx_vreg(const RaVregIdx *x, int idx)
+{
+  const int t = idx >= x->base[TCCIR_VREG_TYPE_PARAM] ? TCCIR_VREG_TYPE_PARAM
+                : idx >= x->base[TCCIR_VREG_TYPE_TEMP] ? TCCIR_VREG_TYPE_TEMP
+                                                       : TCCIR_VREG_TYPE_VAR;
+  return TCCIR_ENCODE_VREG(t, idx - x->base[t]);
+}
+
 /* ============================================================================
  * SSA Live Interval
  * ============================================================================ */
 
 typedef struct SSAInterval {
+  /* Widest fields first: interleaving int8 and int32 fields padded the
+   * struct to 40 bytes; grouped by size it is 36, on the device as well. */
   int32_t vreg;
   uint32_t start;
   uint32_t end;
+  int32_t stack_location;
+  int32_t hint_vreg;
+  int32_t coalesce_to; /* graph coalescing: vreg of the representative this one merged into (-1 = rep / not merged) */
+  uint16_t use_count;
+  uint16_t narrow_uses; /* static count of references from ops with 16-bit encodings (want r0-r7) */
   int8_t r0;
   int8_t r1;
-  int32_t stack_location;
+  int8_t precolored;
+  int8_t pref_reg; /* soft hint: prefer this physical reg if available (e.g. r0 for RETURNVALUE feeders) */
   uint8_t crosses_call : 1;
   uint8_t crosses_real_call : 1; /* crosses a real FUNCCALL (VFP caller-saved clobber) — excludes native FP-op implicit calls */
   uint8_t addrtaken : 1;
@@ -85,14 +156,18 @@ typedef struct SSAInterval {
   uint8_t alive_shared : 1; /* holds a pair BORROWED from a still-live owner (ra_alive_reg_shareable proved the owner dead only across THIS interval's range) — must not be passed on */
   uint8_t loop_phi_locked : 1; /* absorbed a loop-phi partner (carries a loop-carried value across the whole loop body); must not be evicted — spilling it mid-loop would not reload the partner's uses and corrupts the IV */
   uint8_t reg_type;
-  uint16_t use_count;
-  uint16_t narrow_uses; /* static count of references from ops with 16-bit encodings (want r0-r7) */
-  int8_t precolored;
-  int8_t pref_reg; /* soft hint: prefer this physical reg if available (e.g. r0 for RETURNVALUE feeders) */
-  int32_t hint_vreg;
-  int32_t coalesce_to; /* graph coalescing: vreg of the representative this one merged into (-1 = rep / not merged) */
   uint8_t co_member;   /* 1 if part of a graph-coalesced class (rep or member) — the in-scan transfer must leave it alone */
+  uint8_t cs_ok;       /* crosses only plain calls: may live in a caller-saved register saved around them */
+  uint8_t caller_save; /* got one: the call lowering saves/reloads it around every call strictly inside [start,end] */
+  uint16_t cs_cost;    /* loop-weighted saves + reloads that costs (2 * 4^depth per crossed call) */
 } SSAInterval;
+
+/* Decoded coalesce-class partner (graph coalescing), or -1 when the interval
+ * is not part of a class.  For the trace lines only. */
+static inline int ra_coalesce_pos(const SSAInterval *iv)
+{
+  return iv->coalesce_to >= 0 ? TCCIR_DECODE_VREG_POSITION(iv->coalesce_to) : -1;
+}
 
 /* Pre-allocation frame-pointer prediction.  The real decision is made after
  * allocation — tcc_ir_codegen_generate forces FP for VLA, soft-float ops and
@@ -163,6 +238,7 @@ typedef struct
   int free_count;
   RaActiveSpill *active; /* spilled intervals still live */
   int active_count;
+  int cap; /* entries in each array; free_count + active_count <= cap */
   uint32_t active_min_end;
   /* No reuse when the function calls setjmp, vfork, ...: a slot whose interval
    * ended on one return may still be read on the other. */
@@ -280,6 +356,7 @@ typedef struct
   int land;       /* 1: branches to `before` now land on the copy; 0: they skip it */
   int32_t dest, src;
   uint8_t btype, is_unsigned; /* the def's width for a def-group store copy */
+  uint8_t entry;              /* 1: a loop group's entry copy; sorts last at a shared point */
 } RaSplitCopy;
 
 typedef struct
@@ -330,6 +407,8 @@ void ra_build_outgoing_param_hints(SSAInterval *intervals, int count,
 void ra_alive_free(RaAliveInfo *info);
 int ra_alive_worth_building(TCCIRState *ir, const SSAInterval *intervals, int count);
 void ra_alive_build(TCCIRState *ir, RaAliveInfo *info, int max_vreg_pos);
+void ra_widen_intervals_by_liveness(TCCIRState *ir, const RaVregIdx *vx, uint32_t *starts, uint32_t *ends,
+                                    uint8_t *live_in_at_start);
 void ra_linear_scan(TCCIRState *ir, SSAInterval *intervals, int count,
                            const RegAllocTarget *target, int spill_base,
                            uint64_t *out_dirty_int, uint64_t *out_dirty_fp,

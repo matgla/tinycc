@@ -102,7 +102,7 @@ static int gs_resolve_global_base(IRSSAOptCtx *ctx, int32_t vr,
       return 0;
     IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
     if (dq->op == TCCIR_OP_LEA || dq->op == TCCIR_OP_ASSIGN ||
-        (dq->op == TCCIR_OP_STORE && !tcc_ir_op_get_dest(ir, dq).is_lval)) {
+        (dq->op == TCCIR_OP_STORE && !tcc_ir_op_dest_is_lval(ir, dq))) {
       IROperand src = tcc_ir_op_get_src1(ir, dq);
       if (src.is_sym && !src.is_lval) {
         IRPoolSymref *sr = irop_get_symref_ex(ir, src);
@@ -121,11 +121,10 @@ static int gs_resolve_global_base(IRSSAOptCtx *ctx, int32_t vr,
     }
     if (dq->op == TCCIR_OP_ADD || dq->op == TCCIR_OP_SUB) {
       IROperand s1 = tcc_ir_op_get_src1(ir, dq);
-      IROperand s2 = tcc_ir_op_get_src2(ir, dq);
-      if (!s1.is_lval && irop_is_immediate(s2)) {
+      if (!s1.is_lval && tcc_ir_op_src2_is_imm(ir, dq)) {
         int32_t s1vr = irop_get_vreg(s1);
         if (s1vr >= 0) {
-          int d = irop_get_imm32(s2);
+          int d = tcc_ir_op_src2_imm32(ir, dq);
           acc += (dq->op == TCCIR_OP_ADD) ? d : -d;
           vr = s1vr;
           continue;
@@ -189,8 +188,7 @@ static int gs_classify_indexed(IRSSAOptCtx *ctx, const IRQuadCompact *q,
   TCCIRState *ir = ctx->ir;
   if (ssa_opt_indirect_stack_offset(ctx, q, side) != INT_MIN)
     return 0;
-  IROperand base = (side == SSA_OPT_INDIRECT_DEST) ? tcc_ir_op_get_dest(ir, q)
-                                                   : tcc_ir_op_get_src1(ir, q);
+  IROperand base = tcc_ir_op_get_dest_or_src1(ir, q, side != SSA_OPT_INDIRECT_DEST);
   int32_t bvr = irop_get_vreg(base);
   if (bvr < 0)
     return -1;
@@ -215,7 +213,8 @@ static int gs_classify_indexed(IRSSAOptCtx *ctx, const IRQuadCompact *q,
   if (irop_is_immediate(scop))
     sc = irop_get_imm64_ex(ir, scop);
   r->sym = gs;
-  r->off = go + (irop_get_imm64_ex(ir, idx) << sc);
+  /* a negative index shifted left is UB in signed arithmetic */
+  r->off = go + (int64_t)((uint64_t)irop_get_imm64_ex(ir, idx) << sc);
   r->width = width;
   gs_ref_locate(r);
   return 2;
@@ -229,7 +228,7 @@ static int gs_classify_store(IRSSAOptCtx *ctx, const IRQuadCompact *q, GsRef *r)
      * it as an unmodelled store so it is neither killed nor kills. */
     if (tcc_ir_access_is_volatile(ir, tcc_ir_op_get_dest(ir, q)))
       return -1;
-    int w = sl_store_byte_width(irop_get_btype(tcc_ir_op_get_src1(ir, q)));
+    int w = sl_store_byte_width(tcc_ir_op_src1_btype(ir, q));
     return gs_classify_indexed(ctx, q, SSA_OPT_INDIRECT_DEST, w, r);
   }
   IROperand dest = tcc_ir_op_get_dest(ir, q);
@@ -332,7 +331,7 @@ int dce_dead_global_stores(IRSSAOptCtx *ctx)
         }
         if (!flush &&
             (q->op == TCCIR_OP_LOAD_INDEXED || q->op == TCCIR_OP_LOAD_POSTINC)) {
-          int w = sl_store_byte_width(irop_get_btype(tcc_ir_op_get_dest(ir, q)));
+          int w = sl_store_byte_width(tcc_ir_op_dest_btype(ir, q));
           GsRef r;
           int k = gs_classify_indexed(ctx, q, SSA_OPT_INDIRECT_SRC1, w, &r);
           if (k == -1)

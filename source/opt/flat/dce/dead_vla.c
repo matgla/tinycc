@@ -172,6 +172,21 @@ static int analyze_dead_vla(TCCIRState *ir, int vla_idx, int max_tmp,
         reads_tainted = 1;
     }
 
+    /* Any read through a tainted deref observes bytes we'd be eliminating --
+     * whatever the op, a STORE included: `V <-- T***DEREF*** [STORE]` copies
+     * a VLA element into a variable (the STORE branch below only looks for
+     * the pointer itself escaping). */
+    int deref_pos;
+    if (has_s1 && operand_is_temp_lval(s1, &deref_pos) &&
+        deref_pos <= max_tmp && tainted[deref_pos])
+      return 0;
+    if (has_s2 && operand_is_temp_lval(s2, &deref_pos) &&
+        deref_pos <= max_tmp && tainted[deref_pos])
+      return 0;
+    if (has_accum && operand_is_temp_lval(accum, &deref_pos) &&
+        deref_pos <= max_tmp && tainted[deref_pos])
+      return 0;
+
     /* Tainted deref-dest = kill candidate; tainted src1 = the pointer escapes.
      * The indexed/postinc forms address through a plain (non-lval) dest, so
      * they need the same treatment -- see the dest-is-a-use comment in
@@ -198,15 +213,6 @@ static int analyze_dead_vla(TCCIRState *ir, int vla_idx, int max_tmp,
       }
       continue;
     }
-
-    /* Any read through a tainted deref observes bytes we'd be eliminating. */
-    int deref_pos;
-    if (has_s1 && operand_is_temp_lval(s1, &deref_pos) &&
-        deref_pos <= max_tmp && tainted[deref_pos])
-      return 0;
-    if (has_s2 && operand_is_temp_lval(s2, &deref_pos) &&
-        deref_pos <= max_tmp && tainted[deref_pos])
-      return 0;
 
     if (!reads_slot && !reads_tainted)
       continue;
@@ -274,8 +280,7 @@ static int sweep_orphan_tmp_defs(TCCIRState *ir, int max_tmp)
         continue;
       if (irop_config[q->op].has_src1)
       {
-        IROperand s = tcc_ir_op_get_src1(ir, q);
-        int32_t vr = irop_get_vreg(s);
+        int32_t vr = tcc_ir_op_src1_vreg(ir, q);
         if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
         {
           int p = TCCIR_DECODE_VREG_POSITION(vr);
@@ -285,8 +290,7 @@ static int sweep_orphan_tmp_defs(TCCIRState *ir, int max_tmp)
       }
       if (irop_config[q->op].has_src2)
       {
-        IROperand s = tcc_ir_op_get_src2(ir, q);
-        int32_t vr = irop_get_vreg(s);
+        int32_t vr = tcc_ir_op_src2_vreg(ir, q);
         if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
         {
           int p = TCCIR_DECODE_VREG_POSITION(vr);
@@ -322,10 +326,9 @@ static int sweep_orphan_tmp_defs(TCCIRState *ir, int max_tmp)
            q->op == TCCIR_OP_STORE_POSTINC) &&
           irop_config[q->op].has_dest)
       {
-        IROperand d = tcc_ir_op_get_dest(ir, q);
-        if (d.is_lval || q->op != TCCIR_OP_STORE)
+        if (tcc_ir_op_dest_is_lval(ir, q) || q->op != TCCIR_OP_STORE)
         {
-          int32_t vr = irop_get_vreg(d);
+          int32_t vr = tcc_ir_op_dest_vreg(ir, q);
           if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
           {
             int p = TCCIR_DECODE_VREG_POSITION(vr);
@@ -345,10 +348,9 @@ static int sweep_orphan_tmp_defs(TCCIRState *ir, int max_tmp)
         continue;
       if (!irop_config[q->op].has_dest)
         continue;
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (d.is_lval)
+      if (tcc_ir_op_dest_is_lval(ir, q))
         continue;
-      int32_t vr = irop_get_vreg(d);
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
       if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
         continue;
       int p = TCCIR_DECODE_VREG_POSITION(vr);
@@ -372,9 +374,10 @@ int tcc_ir_opt_dead_vla_struct_elim(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-  /* Static chains and nested funcs leak a VLA address with no visible FUNCCALL. */
-  if (ir->captured_count > 0 || ir->has_static_chain ||
-      ir->nb_nested_funcs > 0)
+  /* Static chains and nested funcs leak a VLA address with no visible FUNCCALL.
+   * A parent's children are in tcc_state's table (an IR-side count of them
+   * was never filled in, so a VLA only a child read was deleted). */
+  if (ir->captured_count > 0 || ir->has_static_chain || tcc_state->nb_nested_funcs > 0)
     return 0;
 
   /* Bail on opcodes whose memory effects we don't model. */
@@ -393,8 +396,7 @@ int tcc_ir_opt_dead_vla_struct_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t vr = irop_get_vreg(dest);
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -459,11 +461,6 @@ int tcc_ir_opt_dead_vla_struct_elim(TCCIRState *ir)
   }
 
   return total_changes;
-}
-
-int tcc_ir_opt_dead_vla_struct_elim_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_dead_vla_struct_elim(ctx->ir);
 }
 
 /* SP_SAVE-to-slot + LOAD-back becomes a REG-dest SP_SAVE, i.e. `mov dest, sp`. */
@@ -574,11 +571,6 @@ int tcc_ir_opt_alloca_load_fwd(TCCIRState *ir)
   return changes;
 }
 
-int tcc_ir_opt_alloca_load_fwd_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_alloca_load_fwd(ctx->ir);
-}
-
 /* VREG-dest counterpart of dead_vla_struct_elim, whose slot analysis misses the
  * SP_SAVE once alloca_load_fwd has retargeted it to a vreg. */
 int tcc_ir_opt_dead_alloca_vreg_elim(TCCIRState *ir)
@@ -587,7 +579,7 @@ int tcc_ir_opt_dead_alloca_vreg_elim(TCCIRState *ir)
   if (n == 0)
     return 0;
 
-  if (ir->captured_count > 0 || ir->has_static_chain || ir->nb_nested_funcs > 0)
+  if (ir->captured_count > 0 || ir->has_static_chain || tcc_state->nb_nested_funcs > 0)
     return 0;
 
   for (int i = 0; i < n; i++)
@@ -647,8 +639,7 @@ int tcc_ir_opt_dead_alloca_vreg_elim(TCCIRState *ir)
     if (save_idx < 0)
       continue;
 
-    IROperand save_dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[save_idx]);
-    int32_t seed_vr = irop_get_vreg(save_dest);
+    int32_t seed_vr = tcc_ir_op_dest_vreg(ir, &ir->compact_instructions[save_idx]);
     if (seed_vr < 0)
       continue; /* slot-dest case → handled by dead_vla_struct_elim */
     int seed_type = TCCIR_DECODE_VREG_TYPE(seed_vr);
@@ -852,9 +843,4 @@ int tcc_ir_opt_dead_alloca_vreg_elim(TCCIRState *ir)
   }
 
   return total_changes;
-}
-
-int tcc_ir_opt_dead_alloca_vreg_elim_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_dead_alloca_vreg_elim(ctx->ir);
 }

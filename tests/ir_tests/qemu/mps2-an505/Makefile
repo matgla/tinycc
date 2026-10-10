@@ -106,15 +106,54 @@ LIBGLOSS_PATH = $(shell dirname $(RDIMON_CRT0_PATH))
 endif
 
 CRT_LIBS =
+LIBTCC1_BM_A :=
+LDFLAGS_TAIL :=
+
+# The libtcc1-bm rule below sits before `all`, so pin the default goal.
+.DEFAULT_GOAL := all
 
 ifneq (,$(findstring armv8m-tcc,$(CC)))
 CFLAGS += -I$(LIBC_INCLUDES) -I$(LIBC_IMPORTS) -I$(NEWLIB_INCLUDES) -I$(ARM_SYSROOT)/include -I$(TCC_PATH)/include
 TCC_FLAGS += -B$(TCC_PATH)
 # These images are bare metal: nothing sets up a GOT base in R9, so the
 # SB-relative addressing a YASOS build defaults to has no runtime to back it.
-# Coverage for it lives in the yasos.zig QEMU smoke, which has the loader.
-TCC_FLAGS += -mno-sb-relative-got
+# -mno-sb-relative-got alone is not enough since text_and_data_separation
+# (on by default for the YASOS target) also addresses globals R9-relative;
+# -fno-pic turns the whole mode off, which is the codegen an "ARM Linux"
+# cross produces anyway -- i.e. what these tests always exercised.  R9-
+# relative coverage lives in the yasos.zig QEMU smoke, which has the loader.
+TCC_FLAGS += -fno-pic -mno-sb-relative-got
+
+# The tree's armv8m-libtcc1.a has the same problem INSIDE it: it is built
+# YasOS-flavoured, so builtin.o reads its global through the R9 GOT base and
+# any helper use faults on bare metal no matter what flags this side passes
+# (358_ssa_clrsb_fold: HardFault at the helper's `ldr Rt,[r9,#imm]`).  Build
+# the same members bare-metal-flavoured, once per compiler binary, and shadow
+# the shared archive: -L first so the explicit -larmv8m-libtcc1.a resolves
+# here, and -B LAST so the linker runtime's unconditional libtcc1 pull
+# (tcc_add_support; the last -B owns the {B} library paths) also lands here.
+LIBTCC1_BM_MEMBERS = libtcc1 alloca armeabi armeabi_divmod va_list builtin arm_string arm_mem arm_copystub armv8m_atomic
+LIBTCC1_BM_CC_SUM := $(shell sha256sum "$(CC)" 2>/dev/null | cut -c1-12)
+ifeq ($(strip $(LIBTCC1_BM_CC_SUM)),)
+LIBTCC1_BM_CC_SUM := unknowncc
+endif
+LIBTCC1_BM_DIR := $(MAKEFILE_DIR)libtcc1-bm/$(LIBTCC1_BM_CC_SUM)/
+LIBTCC1_BM_A := $(LIBTCC1_BM_DIR)armv8m-libtcc1.a
+$(LIBTCC1_BM_A): $(wildcard $(TCC_PATH)/lib/*.c) $(wildcard $(TCC_PATH)/lib/*.S) $(wildcard $(TCC_PATH)/lib/*.h)
+	@mkdir -p $(LIBTCC1_BM_DIR)obj
+	@for f in $(LIBTCC1_BM_MEMBERS); do \
+	  src=$(TCC_PATH)/lib/$$f.c; \
+	  [ -f "$$src" ] || src=$(TCC_PATH)/lib/$$f.S; \
+	  $(CC_WRAPPER) $(CC) -fno-pic -mno-sb-relative-got -I$(TCC_PATH)/include -I$(TCC_PATH)/lib \
+	    -c $$src -o $(LIBTCC1_BM_DIR)obj/$$f.o || exit 1; \
+	done
+	ar rcs $@ $(addprefix $(LIBTCC1_BM_DIR)obj/,$(addsuffix .o,$(LIBTCC1_BM_MEMBERS)))
+LDFLAGS := -L$(LIBTCC1_BM_DIR) $(LDFLAGS)
 LDFLAGS += -B$(TCC_PATH)
+# The shadowing -B: appended at the link command's very end so it is the
+# LAST -B (the one that owns the {B} library paths) -- the branch lines
+# below append more LDFLAGS after this.
+LDFLAGS_TAIL := -B$(LIBTCC1_BM_DIR)
 
 # `-lsoftfp` resolves to lib/fp/libsoftfp.so (the yaff shared object) before
 # libsoftfp.a, which left every __aeabi_* symbol to be supplied by libgcc --
@@ -167,8 +206,8 @@ $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.c | $(OUTPUT)
 $(OUTPUT)/%.o: $(MAKEFILE_DIR)%.S | $(OUTPUT)
 	$(CC_WRAPPER) $(CC) $(CFLAGS) -c $< -o $@
 
-$(TARGET): $(OBJS) $(if $(filter 1,$(USE_NEWLIB_BUILD)),$(NEWLIB_DIR)/libc.a)
-	$(CC_WRAPPER) $(CC) $(CFLAGS) $(OBJS) $(EXTRA_OBJS) $(CRT_LIBS) -o $@ $(LDFLAGS)
+$(TARGET): $(OBJS) $(LIBTCC1_BM_A) $(if $(filter 1,$(USE_NEWLIB_BUILD)),$(NEWLIB_DIR)/libc.a)
+	$(CC_WRAPPER) $(CC) $(CFLAGS) $(TCC_FLAGS) $(OBJS) $(EXTRA_OBJS) $(CRT_LIBS) -o $@ $(LDFLAGS) $(LDFLAGS_TAIL)
 
 # Build newlib from source if not already built (soft ABI by default; other
 # ABIs normally use the toolchain multilib instead — see USE_NEWLIB_BUILD).

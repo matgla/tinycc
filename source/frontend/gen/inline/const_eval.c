@@ -92,7 +92,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
   void *saved_error_opaque;
   int saved_overlay_n;
 
-  if (!tcc_state->optimize || !func_sym)
+  if (!TCC_OPT(tcc_state, optimize) || !func_sym)
     return 0;
   /* Accept either an explicit `inline` function, a static auto-inline
    * candidate (selected by the body-size heuristic), or an eval-only
@@ -124,7 +124,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
      * are typically zero with a pending relocation (e.g. static T *p = &x),
      * so reading raw bytes would yield a bogus null value. */
     if ((args[i].r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM | VT_LVAL) && args[i].sym &&
-        !args[i].sym->a.possibly_written && !args[i].sym->a.tentative && !(args[i].type.t & (VT_ARRAY | VT_VLA)))
+        sym_is_const_object(args[i].sym) && !args[i].sym->a.possibly_written && !args[i].sym->a.tentative && !(args[i].type.t & (VT_ARRAY | VT_VLA)))
     {
       int btype = args[i].type.t & VT_BTYPE;
       if (btype == VT_BYTE || btype == VT_SHORT || btype == VT_INT || btype == VT_LLONG || btype == VT_BOOL)
@@ -149,7 +149,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
               if (!(args[i].type.t & VT_UNSIGNED) && sz < 8)
               {
                 int shift = (8 - sz) * 8;
-                val = (int64_t)(val << shift) >> shift;
+                val = (int64_t)((uint64_t)val << shift) >> shift;
               }
             }
             args[i].c.i = val;
@@ -196,6 +196,14 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
   {
     if (TCC_LOG_INLINE_STRUCT)
       fprintf(stderr, "[inline-eval] FAIL %s: body has side effects\n", get_tok_str(func_sym->v & ~SYM_FIELD, NULL));
+    tcc_free(local_args);
+    return 0;
+  }
+
+  /* The body is replayed in the caller's scope: a caller-local enum
+   * constant, object or tag with a callee-used name would be folded in. */
+  if (inline_body_has_unsafe_shadowed_ident(fn->func_str, func_sym))
+  {
     tcc_free(local_args);
     return 0;
   }
@@ -332,7 +340,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
   /* Push parameter symbols as compile-time constants. For 64-bit args we
    * cannot fit the value in Sym::c (int). Piggy-back on the enum-constant
    * mechanism: VT_ENUM_VAL on the param type makes identifier lookup pull
-   * the full 64-bit value from Sym::enum_val (see tccgen.c identifier
+   * the full 64-bit value from sym_enum_val() (see tccgen.c identifier
    * resolution path for IS_ENUM_VAL). */
   param = func_type_ref->next;
   for (i = 0; i < nb_args; i++, param = param->next)
@@ -346,7 +354,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
       CType et = param->type;
       et.t |= VT_ENUM_VAL;
       s = sym_push(param->v & ~SYM_FIELD, &et, VT_CONST, 0);
-      s->enum_val = param_arg.c.i;
+      sym_set_enum_val(s, param_arg.c.i);
     }
     else if (param_arg.r & VT_SYM)
     {
@@ -531,7 +539,7 @@ int try_inline_const_eval(Sym *func_sym, SValue *args, int nb_args)
             CType et = type;
             et.t |= VT_ENUM_VAL;
             s = sym_push(name_tok & ~SYM_FIELD, &et, VT_CONST, 0);
-            s->enum_val = vtop->c.i;
+            sym_set_enum_val(s, vtop->c.i);
           }
           else
           {

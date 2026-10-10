@@ -203,6 +203,22 @@ UT_TEST(test_eval_const_u64_add_chain_folds)
   return 0;
 }
 
+UT_TEST(test_eval_const_u64_barrel_shift_rejected)
+{
+  TCCIRState *ir = utb_new();
+  int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(7, I32), utb_imm(3, I32));
+  uint64_t out = 0;
+  UT_ASSERT_EQ(ir_opt_eval_const_u64(ir, utb_temp(0, I32), add + 1, &out, 0), 1);
+  UT_ASSERT_EQ(out, 10);
+  ir->barrel_shifts_len = add + 1;
+  ir->barrel_shifts = tcc_mallocz(ir->barrel_shifts_len);
+  ir->barrel_shifts[add] = (1 << 5) | 3;
+  UT_ASSERT_EQ(ir_opt_eval_const_u64(ir, utb_temp(0, I32), add + 1, &out, 0), 0);
+  tcc_free(ir->barrel_shifts);
+  utb_free(ir);
+  return 0;
+}
+
 /* POSITIVE: a 32-bit SHR of a value whose top bits look like a sign-extended
  * negative (0xFFFFFFFF80000000 stored as a 64-bit constant, but the source
  * operand is declared INT32) is masked to 32 bits before shifting, per the

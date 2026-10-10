@@ -14,9 +14,11 @@ IR_SRC = \
 	source/ir/vreg.c \
 	source/ir/stack.c \
 	source/ir/frame.c \
+	source/ir/frame_dfe.c \
 	source/ir/cross_jump.c \
 	source/ir/self_store.c \
 	source/ir/dead_def.c \
+	source/ir/known_ext.c \
 	source/ir/dump.c \
 	source/ir/codegen.c \
 	source/ir/cfg.c \
@@ -27,6 +29,7 @@ IR_SRC = \
 	source/ir/regalloc_entry.c \
 	source/ir/regalloc_post.c \
 	source/ir/machine_op.c \
+	source/ir/op_props.c \
 	source/ir/tccir_operand.c
 
 IR_HDRS = $(wildcard source/ir/*.h)

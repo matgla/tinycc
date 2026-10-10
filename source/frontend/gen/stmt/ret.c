@@ -23,6 +23,20 @@
 
 #include "gen_priv.h"
 
+/* A function whose return class was published (FuncAttr.func_ret_zext, see
+ * source/ir/known_ext.c) is being compiled again: direct calls compiled since
+ * rely on r0's upper bits being clear, so the new body must clear them too.
+ * The mask is an identity on every value the first body returned, and
+ * ra:known_ext removes it again wherever the new body provably agrees. */
+static void gfunc_return_keep_zext_promise(void)
+{
+  Sym *fs = tcc_state->cur_func_sym;
+  if (!fs || !fs->type.ref || !fs->type.ref->f.func_ret_zext)
+    return;
+  vpushi((int)tcc_ir_ret_zext_mask(fs->type.ref->f.func_ret_zext));
+  gen_op('&');
+}
+
 /* ------------------------------------------------------------------------- */
 /* return from function */
 #ifndef TCC_TARGET_ARM64
@@ -64,6 +78,48 @@ void gfunc_return(CType *func_type)
          * memmove. */
         int complex_size, complex_align;
         complex_size = type_size(func_type, &complex_align);
+
+        /* A constant _Complex double (`return 3.5 + 4.5i;`) packs both
+         * components in its CValue and has no memory image: write the two
+         * halves into a temp local and return that. */
+        if (((vtop->type.t & VT_BTYPE) == VT_DOUBLE || (vtop->type.t & VT_BTYPE) == VT_LDOUBLE) &&
+            (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
+        {
+          CType elem_type, orig_type = vtop->type;
+          double parts[2];
+          int mat_vr, mat_loc;
+          memcpy(&parts[0], &vtop->c, 8);
+          memcpy(&parts[1], (char *)&vtop->c + 8, 8);
+          vpop();
+          elem_type.t = VT_DOUBLE;
+          elem_type.ref = NULL;
+          mat_loc = get_temp_local_var(16, 8, &mat_vr);
+          for (int k = 0; k < 2; k++)
+          {
+            SValue dst;
+            CValue cv;
+            memset(&dst, 0, sizeof(dst));
+            dst.type = elem_type;
+            dst.r = VT_LOCAL | VT_LVAL;
+            dst.vr = mat_vr;
+            dst.c.i = mat_loc + 8 * k;
+            vpushv(&dst);
+            memset(&cv, 0, sizeof(cv));
+            cv.d = parts[k];
+            vsetc(&elem_type, VT_CONST, &cv);
+            vstore();
+            vpop();
+          }
+          {
+            SValue mat_sv;
+            memset(&mat_sv, 0, sizeof(mat_sv));
+            mat_sv.type = orig_type;
+            mat_sv.r = VT_LOCAL | VT_LVAL;
+            mat_sv.vr = mat_vr;
+            mat_sv.c.i = mat_loc;
+            vpushv(&mat_sv);
+          }
+        }
 
         /* src_mem describes WHERE the source bytes live, as an lvalue
          * (VT_LVAL set).  Either points at vtop directly (in-memory
@@ -297,7 +353,7 @@ void gfunc_return(CType *func_type)
          * at 16 now, as vstore's same cap does -- and like it, only when
          * optimizing, where the word copies fold. */
         if (tcc_state->ir && !has_struct_vla && (vtop->r & VT_LVAL) && s_size > 0 &&
-            s_size <= (tcc_state->optimize > 0 ? 16 : 8) && !(s_size & 3) && !(s_align & 3) && !NOEVAL_WANTED)
+            s_size <= (TCC_OPT(tcc_state, optimize) > 0 ? 16 : 8) && !(s_size & 3) && !(s_align & 3) && !NOEVAL_WANTED)
         {
           SValue src_mem = *vtop;
 
@@ -482,6 +538,19 @@ void gfunc_return(CType *func_type)
       }
       gv(rc);
       vtop -= ret_nregs - 1;
+      if (ret_nregs == 1)
+        gfunc_return_keep_zext_promise();
+      /* A one- or two-byte composite leaves r0's upper bits unspecified, but
+       * clear ones let a direct caller skip its UXTB/UXTH (known_ext.c).  The
+       * mask is dropped again wherever the value is already zero-extended. */
+      if (ret_nregs == 1 && (size == 1 || size == 2) && (ret_type.t & VT_BTYPE) != VT_FLOAT &&
+          TCC_OPT(tcc_state, optimize) >= 1 && !tcc_ir_opt_pass_disabled("ret_small_struct_mask") &&
+          !(tcc_state->cur_func_sym && tcc_state->cur_func_sym->type.ref &&
+            tcc_state->cur_func_sym->type.ref->f.func_ret_zext))
+      {
+        vpushi(size == 1 ? 0xFF : 0xFFFF);
+        gen_op('&');
+      }
       /* Emit RETURNVALUE so the IR codegen knows to place the loaded
          value into the return register (r0).  Without this the vreg
          produced by gv() is never connected to the physical return
@@ -505,6 +574,11 @@ void gfunc_return(CType *func_type)
       tcc_ir_put(tcc_state->ir, TCCIR_OP_LOAD, vtop, NULL, &dest);
       vtop->vr = dest.vr;
       vtop->r = 0; /* no longer an lvalue */
+    }
+    {
+      int bt = func_type->t & VT_BTYPE;
+      if (bt == VT_BYTE || bt == VT_SHORT || bt == VT_INT || bt == VT_BOOL)
+        gfunc_return_keep_zext_promise();
     }
     tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
     tcc_ir_gen_return_value(tcc_state->ir, vtop);

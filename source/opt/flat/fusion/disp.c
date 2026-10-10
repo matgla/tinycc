@@ -28,7 +28,7 @@ OPT_GEN_FLAT(disp, TCCIR_OP_LOAD)
   TCCIRState *ir = ctx->ir;
   const IROptDU *du = &ctx->du;
 
-  if (!tcc_state->opt_disp_fusion)
+  if (!TCC_OPT(tcc_state, opt_disp_fusion))
     return 0;
 
   IRQuadCompact *q = &ir->compact_instructions[i];
@@ -112,6 +112,9 @@ OPT_GEN_FLAT(disp, TCCIR_OP_LOAD)
 
   IROperand orig_dest = tcc_ir_op_get_dest(ir, q);
   IROperand orig_src1 = tcc_ir_op_get_src1(ir, q);
+  /* LOAD_INDEXED takes its width from the dest; a LOAD's is its deref's. */
+  if (q->op == TCCIR_OP_LOAD && !irop_indexed_load_dest(&orig_dest, orig_src1))
+    return 0;
 
   {
     int32_t base_vr = irop_get_vreg(base_op);

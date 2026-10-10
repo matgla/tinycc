@@ -34,3 +34,15 @@ int tcc_gen_machine_frame_top_offset(void)
 {
   return 0;
 }
+
+/* From arm-thumb-emit.c — AAPCS-VFP HFA classification; the optimizer asks it
+ * before turning a by-value struct argument into words (struct_arg_split.c).
+ * The unit tests build no hard-float call, so nothing is an HFA. */
+struct CType;
+
+int gfunc_hfa(struct CType *type, int *base_size)
+{
+  (void)type;
+  *base_size = 4;
+  return 0;
+}

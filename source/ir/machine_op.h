@@ -78,13 +78,8 @@ typedef struct MachineOperand
   uint8_t is_64bit : 1;        /* Two-register value (INT64 or FLOAT64) */
   uint8_t is_unsigned : 1;     /* Unsigned type (VT_UNSIGNED) */
   uint8_t is_complex : 1;      /* Complex type (VT_COMPLEX) */
-  uint8_t align4 : 1;          /* 64-bit deref only: the accessed address is proven
-                                * >= 4-byte aligned, so LDRD/STRD may be used through
-                                * a general base register (IROperand.align4_ok). */
-  uint8_t underalign_hint : 1; /* Base of an indexed access whose chain crossed a
-                                * packed member: address may be < 4-byte aligned, so
-                                * the 64-bit indexed lowering must avoid LDRD/STRD
-                                * (IROperand.underalign_hint). */
+  uint8_t align4 : 1;          /* Access address is proven >= 4-byte aligned. */
+  uint8_t underalign_hint : 1; /* Access may be less than 4-byte aligned. */
   int vreg;                    /* Original vreg (for debug / liveness queries) */
   union
   {

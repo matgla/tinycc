@@ -32,16 +32,40 @@ typedef struct
   int def_count;     /* counts ALL defs (cap 2 — single-def required) */
 } TmpAddr;
 
+/* Resolve a deref (lval) operand to the StackLoc offset it reads or writes:
+ * directly, or through a single-def LEA temp; *slot_off is set only on success. */
+static int dlea_resolve_lval_slot(const TmpAddr *tmp_addr, int max_tmp, const IROperand *op, int *slot_off)
+{
+  if (!op->is_lval)
+    return 0;
+  if (irop_get_tag(*op) == IROP_TAG_STACKOFF && op->is_local && irop_get_vreg(*op) == -1)
+  {
+    *slot_off = irop_get_stack_offset(*op);
+    return 1;
+  }
+  int32_t vr = irop_get_vreg(*op);
+  if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+  {
+    int p = TCCIR_DECODE_VREG_POSITION(vr);
+    if (p <= max_tmp && tmp_addr[p].has_off)
+    {
+      *slot_off = tmp_addr[p].off;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int is_recognized_mem_call(TCCIRState *ir, IRQuadCompact *q,
                                   int *out_size_at_idx)
 {
-  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  Sym *callee = tcc_ir_op_src1_sym(ir, q);
   if (!callee)
     return 0;
   const char *name = get_tok_str(callee->v, NULL);
   if (!name)
     return 0;
-  if (strcmp(name, "memset") == 0 || strcmp(name, "__aeabi_memset") == 0)
+  if (ir_opt_name_in(name, "memset\0__aeabi_memset\0"))
   {
     *out_size_at_idx = 2;
     return 1;
@@ -96,8 +120,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t vr = irop_get_vreg(dest);
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -122,7 +145,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    int tg = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+    int tg = (int)tcc_ir_op_dest_u_imm32(ir, q);
     if (tg >= 0 && tg <= i)
     {
       if (be_n >= be_cap)
@@ -144,10 +167,9 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (dest.is_lval)
+    if (tcc_ir_op_dest_is_lval(ir, q))
       continue; /* address-of use, not a temp def */
-    int32_t vr = irop_get_vreg(dest);
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -172,34 +194,6 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
   /* Helper closure: resolve an lval operand to a stack-slot offset, either
    * direct StackLoc[X] or via a TEMP that holds Addr[StackLoc[X]]. */
   int slot_off = 0;
-#define RESOLVE_LVAL_SLOT(_op)                                              \
-  ({                                                                       \
-    int _ok = 0;                                                           \
-    if ((_op).is_lval)                                                     \
-    {                                                                      \
-      if (irop_get_tag(_op) == IROP_TAG_STACKOFF && (_op).is_local &&      \
-          irop_get_vreg(_op) == -1)                                        \
-      {                                                                    \
-        slot_off = irop_get_stack_offset(_op);                             \
-        _ok = 1;                                                           \
-      }                                                                    \
-      else                                                                 \
-      {                                                                    \
-        int32_t _vr = irop_get_vreg(_op);                                  \
-        if (_vr >= 0 &&                                                    \
-            TCCIR_DECODE_VREG_TYPE(_vr) == TCCIR_VREG_TYPE_TEMP)           \
-        {                                                                  \
-          int _p = TCCIR_DECODE_VREG_POSITION(_vr);                        \
-          if (_p <= max_tmp && tmp_addr[_p].has_off)                       \
-          {                                                                \
-            slot_off = tmp_addr[_p].off;                                   \
-            _ok = 1;                                                       \
-          }                                                                \
-        }                                                                  \
-      }                                                                    \
-    }                                                                      \
-    _ok;                                                                   \
-  })
 
   /* Pass 2: collect read events per slot. A memset/memcpy PARAM0 write is not
    * a read; a memcpy PARAM1 with bounded size is a read AT the call position.
@@ -239,7 +233,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
      * a source (a read); we bailed on any non-mem* call already. */
     if (q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID)
     {
-      uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, q);
       int cid = TCCIR_DECODE_CALL_ID(enc);
       int pidx = TCCIR_DECODE_PARAM_IDX(enc);
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
@@ -262,7 +256,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
           continue;
         if (qj->op == TCCIR_OP_FUNCPARAMVAL || qj->op == TCCIR_OP_FUNCPARAMVOID)
         {
-          uint32_t encj = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, qj));
+          uint32_t encj = (uint32_t)tcc_ir_op_src2_imm(ir, qj);
           if (TCCIR_DECODE_CALL_ID(encj) != cid)
             continue;
           if (TCCIR_DECODE_PARAM_IDX(encj) == 2)
@@ -282,7 +276,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
         }
         if (qj->op != TCCIR_OP_FUNCCALLVOID && qj->op != TCCIR_OP_FUNCCALLVAL)
           continue;
-        uint32_t cenc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, qj));
+        uint32_t cenc = (uint32_t)tcc_ir_op_src2_imm(ir, qj);
         if (TCCIR_DECODE_CALL_ID(cenc) == cid)
         {
           call_pos = j;
@@ -379,7 +373,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
         continue;
       /* Any lval-src use is a read of the slot (STORE writes were handled
        * above; counting a rare non-STORE dest-lval as a read stays safe). */
-      if (op.is_lval && RESOLVE_LVAL_SLOT(op))
+      if (op.is_lval && dlea_resolve_lval_slot(tmp_addr, max_tmp, &op, &slot_off))
       {
         if (k != 0)
         {
@@ -398,10 +392,9 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
       int dest_temp_pos = -1;
       if (irop_config[q->op].has_dest)
       {
-        IROperand qd = tcc_ir_op_get_dest(ir, q);
-        if (!qd.is_lval)
+        if (!tcc_ir_op_dest_is_lval(ir, q))
         {
-          int32_t dvr = irop_get_vreg(qd);
+          int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
           if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
           {
             dest_temp_pos = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -480,7 +473,10 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
     if (q->op != TCCIR_OP_STORE)
       continue;
     IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (!RESOLVE_LVAL_SLOT(dest))
+    if (!dlea_resolve_lval_slot(tmp_addr, max_tmp, &dest, &slot_off))
+      continue;
+    /* A volatile store is an access whether or not anything reads it back. */
+    if (tcc_ir_access_is_volatile(ir, dest))
       continue;
     int dest_w = ir_opt_store_btype_size_bytes(irop_get_btype(dest));
     if (dest_w <= 0)
@@ -500,10 +496,10 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
     for (int j = i + 1; j < n; j++)
     {
       IRQuadCompact *qj = &ir->compact_instructions[j];
+      if (qj->is_jump_target)
+        break; /* control-flow merge — straight-line run ends (a NOP one too) */
       if (qj->op == TCCIR_OP_NOP)
         continue;
-      if (qj->is_jump_target)
-        break; /* control-flow merge — straight-line run ends */
       if (qj->op == TCCIR_OP_JUMP || qj->op == TCCIR_OP_JUMPIF ||
           qj->op == TCCIR_OP_IJUMP || qj->op == TCCIR_OP_SWITCH_TABLE ||
           qj->op == TCCIR_OP_RETURNVALUE || qj->op == TCCIR_OP_RETURNVOID ||
@@ -512,7 +508,7 @@ int tcc_ir_opt_dead_lea_store_elim(TCCIRState *ir)
       if (qj->op != TCCIR_OP_STORE)
         continue;
       IROperand d2 = tcc_ir_op_get_dest(ir, qj);
-      if (!RESOLVE_LVAL_SLOT(d2))
+      if (!dlea_resolve_lval_slot(tmp_addr, max_tmp, &d2, &slot_off))
         continue; /* writes a non-tracked location (no escapes survived Pass 2) */
       int off2 = slot_off;
       int w2 = ir_opt_store_btype_size_bytes(irop_get_btype(d2));
@@ -587,11 +583,5 @@ done:
   tcc_free(reads);
   tcc_free(tmp_addr);
   return changes;
-#undef RESOLVE_LVAL_SLOT
 #undef ADD_READ
-}
-
-int tcc_ir_opt_dead_lea_store_elim_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_dead_lea_store_elim(ctx->ir);
 }

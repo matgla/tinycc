@@ -10,6 +10,7 @@ in the new layout.
 import functools
 import re
 import subprocess
+from struct import pack_into, unpack_from
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ BUILD_DIR = LINKER_DIR / "build"
 
 READELF = "arm-none-eabi-readelf"
 OBJDUMP = "arm-none-eabi-objdump"
+OBJCOPY = "arm-none-eabi-objcopy"
 
 
 def _base_cflags():
@@ -82,6 +84,63 @@ def _compile_to_object(name, subdir, extra_cflags=(), obj_name=None):
             f"Compile failed for {subdir}/{name}: {cmd}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
     return obj
+
+
+def _compile_and_link_asm(name, subdir):
+    """Assemble and link a bare-metal Thumb fixture as an ELF executable."""
+    src = LINKER_DIR / subdir / f"{name}.s"
+    obj = BUILD_DIR / subdir / f"{name}.o"
+    out = BUILD_DIR / subdir / f"{name}.elf"
+    obj.parent.mkdir(parents=True, exist_ok=True)
+
+    compile_cmd = [str(TCC)] + _base_cflags() + ["-c", str(src), "-o", str(obj)]
+    result = subprocess.run(
+        compile_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    assert result.returncode == 0, f"Assembly failed: {compile_cmd}\n{result.stderr}"
+
+    # Give the linker its ARM runtime search paths even though -nostdlib means
+    # no runtime object is needed.  This keeps the invocation valid for both
+    # plain and YasOS-configured cross compilers.
+    link_cmd = [
+        str(TCC),
+        f"-B{ROOT / 'lib'}",
+        f"-L{ROOT}",
+        f"-L{ROOT / 'lib' / 'tcc'}",
+        "-nostdlib",
+        "-static",
+        "-Wl,-oformat=elf32-littlearm",
+        str(obj),
+        "-o",
+        str(out),
+    ]
+    result = subprocess.run(
+        link_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    assert result.returncode == 0, f"Link failed: {link_cmd}\n{result.stderr}"
+    return obj, out
+
+
+def _read_text_bytes(exe, name):
+    """Extract the linked .text section as raw bytes."""
+    raw = BUILD_DIR / "relocations" / f"{name}.text.bin"
+    result = subprocess.run(
+        [OBJCOPY, "-O", "binary", "-j", ".text", str(exe), str(raw)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+    )
+    assert result.returncode == 0, f"objcopy failed for {exe}: {result.stderr}"
+    return raw.read_bytes()
 
 
 def _compile_to_yaff(name, tinycc_root):
@@ -408,6 +467,57 @@ def test_relocation_multiple_refs_same_symbol():
     assert len({r["info"] for r in shared}) == 1, f"expected one symbol index for all refs, got {shared}"
 
 
+@pytest.mark.linker
+@pytest.mark.linker_reloc
+def test_thumb_pc_relative_relocations_preserve_addends_and_imm3():
+    """Linked ADR/LDR literals must resolve S + A relative to the Thumb PC.
+
+    The source deliberately leaves all targets forward/undefined while the
+    assembler emits the relocations.  The target distances exercise ADR's
+    imm3 and i fields, and the nonzero addends exercise both REL addend
+    decoding and clearing the old immediate before writing the new one.
+    """
+    obj, exe = _compile_and_link_asm("07_thumb_pc_relative_addends", "relocations")
+    symbols = {s["name"]: int(s["value"], 16) for s in _readelf_syms(obj)}
+    text_section = next(s for s in _readelf_sections(exe) if s["name"] == ".text")
+    text_base = int(text_section["addr"], 16)
+    text = _read_text_bytes(exe, "07_thumb_pc_relative_addends")
+
+    # (instruction offset, relocation kind, symbol, addend)
+    expected = [
+        (0x00, "adr", "adr_target_100", 0),
+        (0x04, "adr", "adr_target_300", 8),
+        (0x08, "adr", "adr_target_900", -4),
+        (0x0C, "pc12", "ldr_target_100", 0),
+        (0x10, "pc12", "ldr_target_300", 0xF0),
+        (0x14, "pc8", "adr_target_100", 12),
+    ]
+
+    for offset, kind, symbol, addend in expected:
+        hi = int.from_bytes(text[offset : offset + 2], "little")
+        lo = int.from_bytes(text[offset + 2 : offset + 4], "little")
+
+        if kind == "adr":
+            immediate = ((hi >> 10) & 1) << 11
+            immediate |= ((lo >> 12) & 7) << 8
+            immediate |= lo & 0xFF
+            signed_immediate = -immediate if hi & 0x80 else immediate
+        elif kind == "pc12":
+            immediate = lo & 0xFFF
+            signed_immediate = -immediate if not hi & 0x80 else immediate
+        else:
+            immediate = (lo & 0xFF) << 2
+            signed_immediate = -immediate if not hi & 0x80 else immediate
+
+        pc = text_base + offset
+        actual = (pc & ~3) + 4 + signed_immediate
+        target = text_base + symbols[symbol] + addend
+        assert actual == target, (
+            f"{kind} at +0x{offset:x} resolved to 0x{actual:x}, "
+            f"expected 0x{target:x} (encoded immediate {signed_immediate})"
+        )
+
+
 # -----------------------------------------------------------------------------
 # sections/
 # -----------------------------------------------------------------------------
@@ -554,15 +664,77 @@ def test_symbol_visibility_hidden_attribute():
     assert by_name["hidden_var"]["bind"] == "GLOBAL"
     assert by_name["hidden_func"]["bind"] == "GLOBAL"
 
-    # -fvisibility=hidden is part of _base_cflags() for the whole suite, but
-    # this fork's option parser does not recognize it (no "visibility" entry
-    # in libtcc.c's options_f table), so it silently falls through to
-    # "unsupported option" and has no effect. A plain global therefore stays
-    # STV_DEFAULT even under that flag; only the explicit
-    # __attribute__((visibility("hidden"))) above is honored. This is a
-    # front-end option-parsing gap, not a tccelf.c defect, so it is only
-    # characterized here.
-    assert by_name["plain_global"]["vis"] == "DEFAULT"
+    # -fvisibility=hidden is part of _base_cflags() for the whole suite.
+    assert by_name["plain_global"]["vis"] == "HIDDEN"
+    assert by_name["default_global"]["vis"] == "DEFAULT"
+
+
+@pytest.mark.linker
+@pytest.mark.linker_symbol
+@pytest.mark.parametrize(
+    "flag, plain",
+    [(None, "DEFAULT"), ("-fvisibility=hidden", "HIDDEN"), ("-fvisibility=protected", "PROTECTED"),
+     ("-fvisibility=default", "DEFAULT")],
+    ids=["no_flag", "hidden", "protected", "default"],
+)
+def test_symbol_fvisibility_flag_and_pragma(flag, plain):
+    """-fvisibility= covers definitions that name no visibility; attributes,
+    #pragma GCC visibility and asm-defined symbols keep their own, and an
+    extern reference stays STV_DEFAULT unless a pragma encloses it (gcc's
+    rules, checked against arm-none-eabi-gcc)."""
+    cflags = [f for f in _base_cflags() if not f.startswith("-fvisibility=")]
+    if flag:
+        cflags.append(flag)
+    src = LINKER_DIR / "symbols" / "08_fvisibility.c"
+    obj = BUILD_DIR / "symbols" / f"08_fvisibility_{plain.lower()}_{bool(flag)}.o"
+    obj.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [str(TCC), *cflags, "-c", str(src), "-o", str(obj)]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
+    assert result.returncode == 0, f"{cmd}\n{result.stderr}"
+    vis = {s["name"]: s["vis"] for s in _readelf_syms(obj) if s["bind"] != "LOCAL"}
+
+    for name in ("plain_var", "plain_func", "tentative_var", "later_def", "aliased_func", "use_undef", "after_pop"):
+        assert vis[name] == plain, f"{name}: {vis[name]} under {flag}"
+    expected = {
+        "attr_default": "DEFAULT",
+        "attr_protected": "PROTECTED",
+        "undef_ref": "DEFAULT",
+        "pragma_default": "DEFAULT",
+        "attr_beats_pragma": "HIDDEN",
+        "nested_hidden": "HIDDEN",
+        "pragma_hidden_ref": "HIDDEN",
+        "back_to_default": "DEFAULT",
+        "asm_func": "DEFAULT",
+    }
+    for name, want in expected.items():
+        assert vis[name] == want, f"{name}: {vis[name]} under {flag}, want {want}"
+
+
+@pytest.mark.linker
+@pytest.mark.linker_symbol
+@pytest.mark.parametrize("bad", ["-fvisibility=bogus", "-fvisibility="])
+def test_symbol_fvisibility_rejects_unknown(bad):
+    src = LINKER_DIR / "symbols" / "08_fvisibility.c"
+    result = subprocess.run(
+        [str(TCC), "-c", bad, str(src), "-o", str(BUILD_DIR / "symbols" / "bad.o")],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
+    )
+    assert result.returncode != 0
+    assert "visibility" in result.stderr
+
+
+@pytest.mark.linker
+@pytest.mark.linker_symbol
+def test_symbol_pragma_visibility_pop_without_push():
+    src = BUILD_DIR / "symbols" / "pop_without_push.c"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("#pragma GCC visibility pop\nint x;\n")
+    result = subprocess.run(
+        [str(TCC), "-c", str(src), "-o", str(src.with_suffix(".o"))],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace",
+    )
+    assert result.returncode != 0
+    assert "without a push" in result.stderr
 
 
 @pytest.mark.linker
@@ -702,7 +874,9 @@ def test_yaff_output_structure(tinycc_root):
 @pytest.mark.linker_section
 def test_gc_sections_collects_dead_static_bodies(tinycc_root):
     """--gc-sections over .o inputs: unreferenced static bodies vanish;
-    address-taken statics and default-visibility globals survive.
+    address-taken statics survive.  An executable exports only what a
+    loaded library names (none here), so an unreferenced default-visibility
+    global is collected too -- see test_gc_sections_shared_keeps_exports.
 
     Links from a relocatable object on purpose -- that is the path the
     self-hosted device tcc takes, and it only works because the loader keeps
@@ -720,6 +894,7 @@ def test_gc_sections_collects_dead_static_bodies(tinycc_root):
         f"-L{tinycc_root}",
         "-Wl,--gc-sections",
         "-Wl,-e,entry",
+        "-Wl,-oformat=elf32-littlearm",  # the YasOS cross defaults to YAFF; force ELF
         "-g",  # plain EXE output strips .symtab; -g keeps it for the asserts
         str(obj),
         "-o",
@@ -732,24 +907,159 @@ def test_gc_sections_collects_dead_static_bodies(tinycc_root):
 
     syms = {s["name"]: s for s in _readelf_syms(out)}
 
-    # Kept: the entry point, the dispatch-table target, and the export.
-    assert "entry" in syms
-    assert "gc_addr_taken" in syms, "address-taken static was collected"
-    assert "gc_exported_unused" in syms, (
-        "default-visibility global was collected -- yasld modules resolve "
-        "exports at runtime with no witnessing relocation, so exports must "
-        "be GC roots"
-    )
+    # Kept: the entry point and the dispatch-table target.
+    assert not _gc_collected(syms, "entry")
+    assert not _gc_collected(syms, "gc_addr_taken"), "address-taken static was collected"
 
-    def collected(name):
-        """Collected symbols either disappear or carry the ABS tombstone."""
-        s = syms.get(name)
-        return s is None or s.get("ndx") == "ABS" or s["value"].lower().startswith("ffffffff")
-
-    assert collected("gc_dead_static"), f"dead static survived GC: {syms.get('gc_dead_static')}"
-    assert collected("gc_hidden_unused"), (
+    assert _gc_collected(syms, "gc_dead_static"), f"dead static survived GC: {syms.get('gc_dead_static')}"
+    assert _gc_collected(syms, "gc_hidden_unused"), (
         f"hidden unreferenced global survived GC: {syms.get('gc_hidden_unused')}"
     )
+    assert _gc_collected(syms, "gc_exported_unused"), (
+        "unreferenced global survived an executable link: an executable exports "
+        "only the globals a loaded library names, so the rest are not GC roots "
+        "(tcc ignores -fvisibility=hidden, so rooting every default-visibility "
+        f"global pinned all of tcc): {syms.get('gc_exported_unused')}"
+    )
+
+
+def _gc_collected(syms, name):
+    """Collected symbols either disappear or carry the ABS 0xFFFFFFFF tombstone."""
+    s = syms.get(name)
+    return s is None or s.get("ndx") == "ABS" or s["value"].lower().startswith("ffffffff")
+
+
+def _gc_link(tinycc_root, objs, out, extra):
+    """Link objs into out with the cross; return (CompletedProcess, cmd)."""
+    cmd = [
+        str(TCC),
+        "-nostdlib",
+        f"-B{tinycc_root}/lib",
+        f"-L{tinycc_root}/lib/fp",
+        f"-L{tinycc_root}",
+        *extra,
+        *[str(o) for o in objs],
+        "-o",
+        str(out),
+    ]
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
+    return result, cmd
+
+
+@pytest.mark.linker
+@pytest.mark.linker_section
+def test_gc_sections_shared_keeps_exports(tinycc_root):
+    """A shared library exports every default-visibility global, and other
+    yasld modules resolve them at runtime with no relocation in this image to
+    witness the use, so -shared --gc-sections must keep them."""
+    obj = _compile_to_object("06_gc_sections", "sections")
+    out = BUILD_DIR / "sections" / "06_gc_sections.so"
+    result, cmd = _gc_link(tinycc_root, [obj], out, ["-shared", "-Wl,--gc-sections", "-g"])
+    assert result.returncode == 0, f"link failed: {cmd}\n{result.stdout}\n{result.stderr}"
+    if out.read_bytes().startswith(b"YAFF"):
+        pytest.skip("cross compiler produced YAFF, not ELF (a YasOS build)")
+
+    syms = {s["name"]: s for s in _readelf_syms(out)}
+    assert not _gc_collected(syms, "gc_exported_unused"), (
+        f"exported global collected from a shared library: {syms.get('gc_exported_unused')}"
+    )
+    assert _gc_collected(syms, "gc_dead_static"), f"dead static survived GC: {syms.get('gc_dead_static')}"
+    assert _gc_collected(syms, "gc_hidden_unused"), (
+        f"hidden unreferenced global survived GC: {syms.get('gc_hidden_unused')}"
+    )
+
+
+def _readelf_dynsyms(elf):
+    result = subprocess.run(
+        [READELF, "--dyn-syms", "-W", str(elf)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        errors="replace",
+    )
+    assert result.returncode == 0, f"readelf --dyn-syms failed for {elf}: {result.stderr}"
+    return {line.split()[-1] for line in result.stdout.splitlines() if re.match(r"\s*\d+:", line)}
+
+
+@pytest.mark.linker
+@pytest.mark.linker_section
+def test_shared_library_exports_only_default_visibility(tinycc_root):
+    """-shared -fvisibility=hidden: hidden globals stay out of the exported
+    symbols, and the references to them resolve locally.  The linker used to
+    copy every non-local symbol into .dynsym with its visibility dropped, and
+    gave each global reached through the GOT a dynamic symbol of its own, so
+    a library exported everything whatever it was compiled with -- its own
+    section bounds (_etext, __start_*, __init_array_*, ...) included."""
+    obj = _compile_to_object("10_visibility_shared", "sections", extra_cflags=["-fPIC"])
+    out = BUILD_DIR / "sections" / "10_visibility_shared.so"
+    result, cmd = _gc_link(tinycc_root, [obj], out, ["-shared"])
+    assert result.returncode == 0, f"link failed: {cmd}\n{result.stdout}\n{result.stderr}"
+
+    data = out.read_bytes()
+    # The linker's own boundary symbols are each module's private bounds.
+    hidden = ("lib_counter", "lib_hook", "lib_helper", "__start_text", "__stop_bss", "_etext", "_edata", "_end",
+              "__init_array_start", "__fini_array_end", "_GLOBAL_OFFSET_TABLE_")
+    if data.startswith(b"YAFF"):
+        # Names live only in the YAFF symbol tables (no -g, no .symtab).
+        assert b"lib_api\0" in data, "default-visibility lib_api is not exported"
+        for name in hidden:
+            assert name.encode() + b"\0" not in data, f"hidden {name} is in the YAFF symbol tables"
+        return
+
+    dynsyms = _readelf_dynsyms(out)
+    assert "lib_api" in dynsyms
+    for name in hidden:
+        assert name not in dynsyms, f"hidden {name} exported: {sorted(dynsyms)}"
+    for rel in _readelf_reloc(out):
+        assert rel["sym_name"] not in hidden, f"dynamic relocation against hidden symbol: {rel}"
+
+
+@pytest.mark.linker
+@pytest.mark.linker_section
+def test_shared_library_input_definition_of_linker_symbol_stays_exported(tinycc_root):
+    obj = _compile_to_object(
+        "11_user_defines_end", "sections", extra_cflags=["-fPIC", "-fvisibility=default"]
+    )
+    out = BUILD_DIR / "sections" / "11_user_defines_end.so"
+    result, cmd = _gc_link(tinycc_root, [obj], out, ["-shared"])
+    assert result.returncode == 0, f"link failed: {cmd}\n{result.stdout}\n{result.stderr}"
+    data = out.read_bytes()
+    if data.startswith(b"YAFF"):
+        assert b"_end\0" in data, "the library's own _end is not exported"
+        return
+    assert "_end" in _readelf_dynsyms(out)
+    by_name = {s["name"]: s for s in _readelf_syms(out)}
+    assert by_name["_end"]["vis"] == "DEFAULT"
+
+
+@pytest.mark.linker
+@pytest.mark.linker_section
+def test_gc_sections_per_object_data(tinycc_root):
+    """Each object's .data/.rodata/.bss is its own GC node.
+
+    The loader merged every object's data into one section, so a single live
+    function-pointer table anywhere kept every table -- and every function
+    those point at -- alive; --gc-sections removed 7.5 KB of the 850 KB the
+    O0-only tcc had unreachable.  The dead object's tables and their targets
+    must go, the live object's must stay, and the surviving data must still
+    be one .data in the image.
+    """
+    live = _compile_to_object("09_gc_data_live", "sections")
+    dead = _compile_to_object("09_gc_data_dead", "sections")
+    out = BUILD_DIR / "sections" / "09_gc_data.elf"
+    result, cmd = _gc_link(
+        tinycc_root, [live, dead], out, ["-Wl,--gc-sections", "-Wl,-e,entry", "-g", "-Wl,-oformat=elf32-littlearm"]
+    )
+    assert result.returncode == 0, f"link failed: {cmd}\n{result.stdout}\n{result.stderr}"
+
+    syms = {s["name"]: s for s in _readelf_syms(out)}
+    for name in ("entry", "live_target", "live_table"):
+        assert not _gc_collected(syms, name), f"{name} was collected: {syms.get(name)}"
+    for name in ("dead_via_data", "dead_via_rodata", "dead_table", "dead_rotable", "dead_counter"):
+        assert _gc_collected(syms, name), f"{name} survived GC: {syms.get(name)}"
+
+    names = _readelf_section_names(out)
+    assert not [n for n in names if ".." in n], f"per-object input sections leaked into the image: {names}"
+    assert names.count(".data") == 1, names
 
 
 @pytest.mark.linker
@@ -820,3 +1130,309 @@ def test_yaff_gc_sections_got_in_range(tinycc_root):
         f"yasld will refuse to load this module: "
         + ", ".join(f"GOT[{i}]={so:#x}" for i, so, _ in bad[:8])
     )
+
+
+def _link(tinycc_root, objs, out, extra):
+    """Link objs into out with the cross; return the CompletedProcess."""
+    cmd = [
+        str(TCC),
+        "-nostdlib",
+        f"-B{tinycc_root}/lib",
+        f"-L{tinycc_root}/lib/fp",
+        f"-L{tinycc_root}",
+        *extra,
+        *[str(o) for o in objs],
+        "-o",
+        str(out),
+    ]
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
+    result.cmd = cmd
+    return result
+
+
+def _elf_entry(elf):
+    result = subprocess.run(
+        [READELF, "-h", str(elf)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
+    assert result.returncode == 0, f"readelf -h failed for {elf}: {result.stderr}"
+    m = re.search(r"Entry point address:\s+0x([0-9a-f]+)", result.stdout)
+    assert m, result.stdout
+    return int(m.group(1), 16)
+
+
+@pytest.mark.linker
+@pytest.mark.linker_section
+@pytest.mark.parametrize("script", [False, True], ids=["no_script", "ld_script"])
+def test_gc_sections_collected_plain_text_keeps_coalesced_code(tinycc_root, script):
+    """--gc-sections -static where plain .text holds only dead code.
+
+    GC collects .text itself; the live .text.<name> sections are then
+    coalesced into that same text_section.  Collecting it used to clear its
+    SHF_ALLOC, so the live code vanished from layout: with a linker script
+    an ELF with no code at all (the yasboot -O0 image), without one a
+    segfault in layout_sections.
+    """
+    obj = _compile_to_object("07_gc_collected_text", "sections")
+    out = BUILD_DIR / "sections" / f"07_gc_collected_text_{'ld' if script else 'plain'}.elf"
+    extra = ["-static", "-Wl,--gc-sections", "-Wl,-oformat=elf32-littlearm"]
+    if script:
+        extra += ["-T", str(LINKER_DIR / "sections" / "07_gc_collected_text.ld")]
+    result = _link(tinycc_root, [obj], out, extra)
+    assert result.returncode == 0, f"link failed: {result.cmd}\n{result.stdout}\n{result.stderr}"
+
+    entry = _elf_entry(out) & ~1
+    code = [
+        s
+        for s in _readelf_sections(out)
+        if "A" in s["flags"] and "X" in s["flags"] and int(s["size"], 16) > 0
+    ]
+    assert any(s["name"] == ".text" for s in code), (
+        f"no allocated, non-empty .text in the image: {[s['name'] for s in _readelf_sections(out)]}"
+    )
+    assert any(int(s["addr"], 16) <= entry < int(s["addr"], 16) + int(s["size"], 16) for s in code), (
+        f"entry {entry:#x} is not inside any code section: {code}"
+    )
+    if script:
+        text = next(s for s in code if s["name"] == ".text")
+        assert int(text["addr"], 16) >= 0x10000000, f".text not placed in flash: {text}"
+
+
+@pytest.mark.linker
+@pytest.mark.linker_section
+def test_static_link_without_allocated_contents(tinycc_root):
+    """A -static image with no PT_LOAD must still lay out (no segfault)."""
+    obj = _compile_to_object("08_static_no_code", "sections")
+    out = BUILD_DIR / "sections" / "08_static_no_code.elf"
+    result = _link(
+        tinycc_root, [obj], out, ["-nodefaultlibs", "-static", "-Wl,-oformat=elf32-littlearm"]
+    )
+    assert result.returncode == 0, f"link failed: {result.cmd}\n{result.stdout}\n{result.stderr}"
+    assert _elf_entry(out) == 0x1001
+
+
+@pytest.mark.linker
+@pytest.mark.linker_section
+def test_static_yaff_is_a_diagnostic_not_a_crash(tinycc_root):
+    """-static with YAFF output (the default of a YasOS-configured tcc) is
+    refused with a message.  The writer used to dereference the GOT a static
+    link never built and segfault."""
+    obj = _compile_to_object("07_gc_collected_text", "sections")
+    out = BUILD_DIR / "sections" / "07_static.yaff"
+    result = _link(tinycc_root, [obj], out, ["-static", "-Wl,-oformat=yaff"])
+    assert result.returncode == 1, (
+        f"expected a link error, got rc={result.returncode}: {result.cmd}\n{result.stdout}\n{result.stderr}"
+    )
+    assert "-static cannot produce a YAFF module" in result.stderr
+
+
+def _section_addr(elf, name):
+    result = subprocess.run(
+        [READELF, "-SW", str(elf)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
+    assert result.returncode == 0, result.stderr
+    for line in result.stdout.splitlines():
+        m = re.match(r"\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+([0-9a-f]+)", line)
+        if m and m.group(1) == name:
+            return int(m.group(2), 16)
+    raise AssertionError(f"no {name} in {elf}")
+
+
+def _section_word(elf, addr):
+    """The little-endian word at address `addr` of an ELF image."""
+    result = subprocess.run(
+        [READELF, "-SW", str(elf)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
+    assert result.returncode == 0, result.stderr
+    for line in result.stdout.splitlines():
+        m = re.match(r"\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)", line)
+        if not m:
+            continue
+        sec_addr, sec_off, sec_size = (int(m.group(i), 16) for i in (2, 3, 4))
+        if sec_addr and sec_addr <= addr < sec_addr + sec_size:
+            with open(elf, "rb") as f:
+                f.seek(sec_off + addr - sec_addr)
+                return int.from_bytes(f.read(4), "little")
+    raise AssertionError(f"no section holds 0x{addr:x}")
+
+
+@pytest.mark.linker
+@pytest.mark.linker_reloc
+def test_rodata_relative_resolves_across_objects(tinycc_root):
+    """A __rodata_relative word holds (target - __tcc_rodata_base) + 1, NULL
+    stays 0, and the table itself stays in .rodata with no relocation left
+    for the loader (docs/rodata_relative.md)."""
+    table = _compile_to_object("07_rodata_rel_table", "relocations")
+    target = _compile_to_object("07_rodata_rel_target_const", "relocations")
+    out = BUILD_DIR / "relocations" / "07_rodata_rel.elf"
+    result, cmd = _gc_link(tinycc_root, [table, target], out, ["-Wl,-e,entry", "-g", "-Wl,-oformat=elf32-littlearm"])
+    assert result.returncode == 0, f"link failed: {cmd}\n{result.stdout}\n{result.stderr}"
+
+    syms = {s["name"]: s for s in _readelf_syms(out)}
+    # Nothing here reads the table, so __tcc_rodata_base is not defined; it
+    # would be the start of .rodata.
+    base = _section_addr(out, ".rodata")
+    tbl = int(syms["rel_table"]["value"], 16)
+    tgt = int(syms["rel_target"]["value"], 16)
+    words = [_section_word(out, tbl + 4 * i) for i in range(3)]
+    assert words[1] == tgt + 2 - base + 1, [hex(w) for w in words]
+    assert words[2] == 0, [hex(w) for w in words]
+    # The first entry points at a string of this object, also in .rodata.
+    assert 0 < words[0] <= words[1] + 0x1000, [hex(w) for w in words]
+
+
+@pytest.mark.linker
+@pytest.mark.linker_reloc
+def test_rodata_relative_rejects_writable_target(tinycc_root):
+    """The target is declared const where the table names it but defined
+    writable elsewhere: it is in .data, which has no offset from .rodata."""
+    table = _compile_to_object("07_rodata_rel_table", "relocations")
+    target = _compile_to_object("07_rodata_rel_target_writable", "relocations")
+    out = BUILD_DIR / "relocations" / "07_rodata_rel_bad.elf"
+    result, cmd = _gc_link(tinycc_root, [table, target], out, ["-Wl,-e,entry"])
+    assert result.returncode != 0, f"link should fail: {cmd}\n{result.stdout}"
+    assert "'rel_target' is not in .rodata" in result.stderr + result.stdout
+
+
+@pytest.mark.linker
+@pytest.mark.linker_yaff
+def test_yaff_rejects_unwritable_alloc_section(tinycc_root):
+    """A named allocated section is not one of the five images the writer
+    emits; the link must fail with no module left behind (it used to exit 0
+    with the initializer zero-filled)."""
+    out = BUILD_DIR / "yaff" / "02_named_alloc_section.yaff"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.unlink(missing_ok=True)
+    cmd = [
+        str(TCC), "-O2", "-nostdlib", "-nodefaultlibs",
+        "-Wl,-oformat=yaff",
+        str(LINKER_DIR / "yaff" / "02_named_alloc_section.c"), "-o", str(out),
+    ]
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
+    assert result.returncode == 1, f"link should fail: {cmd}\n{result.stdout}{result.stderr}"
+    assert "cannot represent allocated section '.mydata'" in result.stderr + result.stdout
+    assert not out.exists(), "a failed YAFF link left its output behind"
+
+
+def _corrupt_yaff_lib(tinycc_root, tag, patch):
+    """Copy lib/libsoftfp.so with `patch(bytearray)` applied, into its own dir."""
+    src = tinycc_root / "lib" / "libsoftfp.so"
+    if not src.exists():
+        pytest.skip("lib/libsoftfp.so not built")
+    d = BUILD_DIR / "yaff" / f"badlib_{tag}"
+    d.mkdir(parents=True, exist_ok=True)
+    data = bytearray(src.read_bytes())
+    patch(data)
+    (d / "libsoftfp.so").write_bytes(data)
+    return d
+
+
+# YaffHeader offsets (packed): exported_symbols_offset, imported_symbols_lookup_offset,
+# exported_symbols_hash_table_offset.
+_EXPORT_OFF, _IMPORT_LOOKUP_OFF, _HASH_OFF = 88, 96, 108
+
+
+def _corrupt_nbucket_zero(b):
+    pack_into("<I", b, unpack_from("<I", b, _HASH_OFF)[0], 0)
+
+
+def _corrupt_reversed_region(b):
+    lookup = unpack_from("<I", b, _IMPORT_LOOKUP_OFF)[0]
+    pack_into("<II", b, _EXPORT_OFF, lookup + 8, lookup)
+
+
+def _corrupt_huge_hash_counts(b):
+    pack_into("<II", b, unpack_from("<I", b, _HASH_OFF)[0], 0x3FFFFFFF, 0)
+
+
+@pytest.mark.linker
+@pytest.mark.linker_yaff
+@pytest.mark.parametrize(
+    "tag,patch",
+    [
+        ("nbucket0", _corrupt_nbucket_zero),
+        ("reversed", _corrupt_reversed_region),
+        ("hugehash", _corrupt_huge_hash_counts),
+    ],
+)
+def test_yaff_corrupt_library_is_rejected(tinycc_root, tag, patch):
+    """A corrupt lib*.so is a diagnostic, not a crash, division by zero or
+    multi-GB allocation (the reader used to trust every header offset/count)."""
+    libdir = _corrupt_yaff_lib(tinycc_root, tag, patch)
+    obj = _compile_to_object("02_named_alloc_section", "yaff", obj_name=f"badlib_{tag}")
+    out = libdir / "out.yaff"
+    cmd = [
+        str(TCC), "-nostdlib", "-nodefaultlibs", "-shared", f"-L{libdir}", "-lsoftfp",
+        "-Wl,-oformat=yaff", str(obj), "-o", str(out),
+    ]
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
+    assert result.returncode == 1, f"expected a clean error, got {result.returncode}: {cmd}\n{result.stderr}"
+    assert "corrupt YAFF" in result.stderr + result.stdout
+
+
+@pytest.mark.linker
+@pytest.mark.linker_yaff
+def test_yaff_writer_error_fails_link_and_removes_output():
+    """Bare-metal (non-PIC) builds emit absolute relocations the YAFF writer
+    reports with tcc_error_noabort; the link used to exit 0 with the corrupt
+    module left at the output path.  A PIC (YasOS) build has no such
+    relocation, so this only applies to the plain cross compiler."""
+    if _compiler_targets_yasos():
+        pytest.skip("YasOS build is PIC: no absolute relocation to reject")
+    out = BUILD_DIR / "yaff" / "03_abs32_in_text.yaff"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.unlink(missing_ok=True)
+    cmd = [
+        str(TCC), "-O2", "-nostdlib", "-nodefaultlibs", "-Wl,-oformat=yaff",
+        str(LINKER_DIR / "yaff" / "03_abs32_in_text.c"), "-o", str(out),
+    ]
+    result = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    )
+    assert result.returncode == 1, f"link should fail: {cmd}\n{result.stdout}{result.stderr}"
+    assert "R_ARM_ABS32 relocation" in result.stderr + result.stdout
+    assert not out.exists(), "a failed YAFF link left its output behind"
+
+
+@pytest.mark.linker
+def test_object_after_end_group_is_linked(tinycc_root):
+    """The input right after -Wl,--end-group was skipped (the group branch
+    of the driver loop stepped past it)."""
+    objs = [_compile_to_object(f"01_end_group_next_input_{x}", "driver") for x in "abc"]
+    out = BUILD_DIR / "driver" / "01_end_group.elf"
+    result = _link(
+        tinycc_root,
+        [],
+        out,
+        ["-Wl,-oformat=elf32-littlearm", str(objs[0]), "-Wl,--start-group", str(objs[1]),
+         "-Wl,--end-group", str(objs[2])],
+    )
+    assert result.returncode == 0, f"link failed: {result.cmd}\n{result.stdout}\n{result.stderr}"
+
+
+@pytest.mark.linker
+@pytest.mark.linker_section
+def test_gc_sections_aggressive_is_plain_gc_sections(tinycc_root):
+    """--gc-sections-aggressive used to link every symbol against its input
+    object's own section number: variables of different objects aliased each
+    other and the image got several .data sections.  It is now a spelling of
+    --gc-sections, so it must yield the very same image."""
+    a = _compile_to_object("12_gc_aggressive_a", "sections")
+    b = _compile_to_object("12_gc_aggressive_b", "sections")
+    images = {}
+    for flag in ("--gc-sections", "--gc-sections-aggressive"):
+        out = BUILD_DIR / "sections" / f"12_gc{flag[4:]}.elf"
+        result = _link(tinycc_root, [a, b], out, ["-static", "-Wl,-oformat=elf32-littlearm", f"-Wl,{flag}"])
+        assert result.returncode == 0, f"link failed: {result.cmd}\n{result.stdout}\n{result.stderr}"
+        images[flag] = out.read_bytes()
+    assert images["--gc-sections"] == images["--gc-sections-aggressive"]
+    sections = subprocess.run(
+        [READELF, "-SW", str(out)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace"
+    ).stdout
+    assert len(re.findall(r"\s\.data\s", sections)) == 1, sections
+    assert len(re.findall(r"\s\.text\s", sections)) == 1, sections

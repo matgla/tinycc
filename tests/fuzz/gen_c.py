@@ -53,6 +53,7 @@ CLI
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import sys
 from pathlib import Path
@@ -113,6 +114,12 @@ PROFILES = {
     "fp_round": frozenset({"float", "fp_round"}),
     "volatile": frozenset({"volatile"}),  # adds volatile accesses (DSE/load-CSE over-elimination probe)
     "agg_deep": frozenset({"agg_deep"}),  # adds nested structs, 2-D arrays, 2-level pointers
+    # "hazard": the constructs optimizer passes most often forget to stop at
+    # (docs/bugs gap audit 2026-10-06): __builtin_apply, __builtin_setjmp /
+    # longjmp, asm "=m" / "+r" outputs and memory clobbers, VLAs and alloca,
+    # GNU nested functions writing captured locals, computed goto.
+    "hazard":   frozenset({"hazard"}),
+    "hazard_mem": frozenset({"hazard", "ptr", "volatile", "agg_deep"}),
 }
 DEFAULT_PROFILE = "int"
 
@@ -182,6 +189,15 @@ FP_DEEP_STEP_MAX = 50      # trip * step << 2**24 -> always exact
 
 # --- "volatile" profile tunables -------------------------------------------
 MAX_VOLATILE_VARS = 3
+
+# --- "hazard" profile tunables ----------------------------------------------
+HZ_VLA_MAX = 8             # VLA / alloca element count is (x & 7) + 1 -> 1..8
+HZ_KINDS = ["hz_apply", "hz_apply_local", "hz_sj", "hz_asm_m", "hz_asm_r",
+            "hz_barrier", "hz_vla", "hz_alloca", "hz_nested", "hz_cgoto"]
+# Triage aid: FUZZ_HZ_KINDS=hz_vla,hz_sj restricts the hazard statements to those
+# kinds (changes the stream; leave unset for the canonical one).
+if os.environ.get("FUZZ_HZ_KINDS"):
+    HZ_KINDS = [k for k in os.environ["FUZZ_HZ_KINDS"].split(",") if k in HZ_KINDS]
 
 # --- "agg_deep" profile tunables --------------------------------------------
 # Nested struct (struct N2 { struct N n; unsigned t; }), a 2-D array (both dims
@@ -684,6 +700,11 @@ class Gen:
             opts += ["arr2dstore", "arr2dstore"]
         if self.has("agg_deep") and self.pp2:
             opts.append("pp2store")
+        # "hazard" profile: each construct sits between a value computed before
+        # it and a use after it, so a pass that moves/forwards/deletes across it
+        # changes the checksum.
+        if self.has("hazard") and self.uvars:
+            opts += HZ_KINDS
         kind = self.rng.choice(opts)
 
         if kind == "assign":
@@ -1035,6 +1056,95 @@ class Gen:
                 rhs = f"({a}) {op} ({b})"
             return [f"{pad}{name} = {rhs};", self._fclamp(pad, name, ctype)]
 
+        if kind == "hz_apply":
+            # Load hz_cell, let __builtin_apply rewrite it, reload it.
+            v = self.rng.choice(self.uvars)
+            return [f"{pad}{v} = hz_cell;",
+                    f"{pad}cs = csmix(cs, hz_apply(&hz_cell, (unsigned)({self.expr(MAX_EXPR_DEPTH)})));",
+                    f"{pad}cs = csmix(cs, hz_cell ^ {v});"]
+
+        if kind == "hz_apply_local":
+            # The same through a main() local whose address escapes into the apply.
+            v = self.rng.choice(self.uvars)
+            return [f"{pad}cs = csmix(cs, hz_apply(&{v}, (unsigned)({self.expr(MAX_EXPR_DEPTH)})));",
+                    f"{pad}cs = csmix(cs, {v});"]
+
+        if kind == "hz_sj":
+            return [f"{pad}cs = csmix(cs, hz_sj((unsigned)({self.expr(MAX_EXPR_DEPTH)})));"]
+
+        if kind == "hz_asm_m":
+            # An asm "=m" output: the store happens inside the asm.
+            t = self.fresh("hzm")
+            return [f"{pad}{{",
+                    f"{pad}  unsigned {t} = 0u;",
+                    f'{pad}  __asm__ volatile("str %1, %0" : "=m"({t}) : "r"((unsigned)({self.expr(MAX_EXPR_DEPTH)})));',
+                    f"{pad}  cs = csmix(cs, {t});",
+                    f"{pad}}}"]
+
+        if kind == "hz_asm_r":
+            # A "+r" in/out operand changed by the asm.
+            v = self.rng.choice(self.uvars)
+            imm = self.rng.randint(1, 255)
+            return [f'{pad}__asm__("add %0, %0, #{imm}" : "+r"({v}));',
+                    f"{pad}cs = csmix(cs, {v});"]
+
+        if kind == "hz_barrier":
+            # Store, compiler barrier, reload: the reload must stay correct.
+            v = self.rng.choice(self.uvars)
+            return [f"{pad}hz_cell = (unsigned)({self.expr(MAX_EXPR_DEPTH)});",
+                    f'{pad}__asm__ volatile("" ::: "memory");',
+                    f"{pad}{v} = hz_cell + {v};"]
+
+        if kind == "hz_vla":
+            n = self.fresh("hzn")
+            a = self.fresh("hzv")
+            k = self.fresh("hzk")
+            src = self.rng.choice(self.uvars)
+            sel = self.expr(MAX_EXPR_DEPTH)
+            return [f"{pad}{{",
+                    f"{pad}  unsigned {n} = ((unsigned)({self.expr(MAX_EXPR_DEPTH)}) & {HZ_VLA_MAX - 1}u) + 1u;",
+                    f"{pad}  unsigned {a}[{n}];",
+                    f"{pad}  for (unsigned {k} = 0u; {k} < {n}; {k}++) {a}[{k}] = {src} * ({k} + 3u);",
+                    f"{pad}  cs = csmix(cs, {a}[(unsigned)({sel}) % {n}]);",
+                    f"{pad}}}"]
+
+        if kind == "hz_alloca":
+            n = self.fresh("hzn")
+            a = self.fresh("hza")
+            k = self.fresh("hzk")
+            src = self.rng.choice(self.uvars)
+            return [f"{pad}{{",
+                    f"{pad}  unsigned {n} = ((unsigned)({self.expr(MAX_EXPR_DEPTH)}) & {HZ_VLA_MAX - 1}u) + 1u;",
+                    f"{pad}  unsigned *{a} = __builtin_alloca({n} * sizeof(unsigned));",
+                    f"{pad}  for (unsigned {k} = 0u; {k} < {n}; {k}++) {a}[{k}] = {src} ^ {k};",
+                    f"{pad}  cs = csmix(cs, {a}[{n} - 1u]);",
+                    f"{pad}}}"]
+
+        if kind == "hz_nested":
+            # A GNU nested function that writes one captured local and reads
+            # another; both are read back after the call.
+            fn = self.fresh("hznf")
+            w = self.rng.choice(self.uvars)
+            r = self.rng.choice(self.uvars)
+            return [f"{pad}{{",
+                    f"{pad}  unsigned {fn}(unsigned x) {{ {w} = {w} * 3u + x; return {w} ^ {r}; }}",
+                    f"{pad}  cs = csmix(cs, {fn}((unsigned)({self.expr(MAX_EXPR_DEPTH)})));",
+                    f"{pad}  cs = csmix(cs, {w});",
+                    f"{pad}}}"]
+
+        if kind == "hz_cgoto":
+            t = self.fresh("hzt")
+            la, lb, lc = self.fresh("hzLa"), self.fresh("hzLb"), self.fresh("hzLc")
+            v = self.rng.choice(self.uvars)
+            c1, c2 = self.rconst(), self.rconst()
+            return [f"{pad}{{",
+                    f"{pad}  static void *const {t}[2] = {{ &&{la}, &&{lb} }};",
+                    f"{pad}  goto *{t}[(unsigned)({self.expr(MAX_EXPR_DEPTH)}) & 1u];",
+                    f"{pad}{la}: {v} ^= {c1}; goto {lc};",
+                    f"{pad}{lb}: {v} += {c2};",
+                    f"{pad}{lc}: cs = csmix(cs, {v});",
+                    f"{pad}}}"]
+
         if kind == "vstore":
             name = self.rng.choice(self.vvars)
             return [f"{pad}{name} = (unsigned)({self.expr(MAX_EXPR_DEPTH)});"]
@@ -1102,6 +1212,39 @@ def _prologue(seed: int, features=frozenset()) -> str:
             "memcpy(u, &d, sizeof u); return csmix(u[0], u[1]); }\n"
             "static unsigned fbits_f(float f){ unsigned u; "
             "memcpy(&u, &f, sizeof u); return u; }\n"
+        )
+    if "hazard" in features:
+        # __builtin_apply re-calls hz_set with hz_apply's own arguments, so *p
+        # changes behind the two plain loads around it; hz_sj's setjmp returns
+        # twice, counted by a volatile static (a non-volatile local changed
+        # between setjmp and longjmp would be indeterminate).  noipa: gcc's IPA
+        # mod/ref does not see __builtin_apply write through p, so gcc -O2 kept
+        # a caller's local in a register across hz_apply(&local, ...) -- a wrong
+        # REFERENCE (gcc -O0 and every tcc level agree), not a tcc bug.
+        base += (
+            "\n"
+            "/* hazard profile: memory the hazards below change behind the optimizer. */\n"
+            "static unsigned hz_cell = 0x2468ace1u;\n"
+            "static void hz_set(unsigned *q, unsigned v) { *q = v ^ 0x5a5a5a5au; }\n"
+            "__attribute__((noinline, noipa)) static unsigned hz_apply(unsigned *p, unsigned v)\n"
+            "{\n"
+            "  void *args = __builtin_apply_args();\n"
+            "  unsigned a = *p;\n"
+            "  __builtin_apply((void (*)())hz_set, args, 16);\n"
+            "  unsigned b = *p;\n"
+            "  return a * 31u + b;\n"
+            "}\n"
+            "static void *hz_jb[5];\n"
+            "__attribute__((noinline, noipa)) static void hz_jump(void) { __builtin_longjmp(hz_jb, 1); }\n"
+            "__attribute__((noinline, noipa)) static unsigned hz_sj(unsigned x)\n"
+            "{\n"
+            "  static volatile unsigned n;\n"
+            "  n = 0u;\n"
+            "  __builtin_setjmp(hz_jb);\n"
+            "  if (++n < (x & 3u) + 1u)\n"
+            "    hz_jump();\n"
+            "  return n * 7u + x;\n"
+            "}\n"
         )
     if "varargs" in features:
         # Sum n int args; read each with va_arg(ap,int) — int is its own default
@@ -1460,6 +1603,11 @@ def generate_program(seed: int, profile: str = DEFAULT_PROFILE) -> str:
     # output-sensitive to variadic codegen even if no vcall was sampled.
     if g.has("varargs"):
         main.append("  cs = csmix(cs, vsum(2u, 1, (int)cs));")
+    # Reference every hazard helper and fold the memory they change.
+    if g.has("hazard"):
+        main.append("  cs = csmix(cs, hz_apply(&hz_cell, cs));")
+        main.append("  cs = csmix(cs, hz_sj(cs));")
+        main.append("  cs = csmix(cs, hz_cell);")
     for name, _ in g.svars:
         main.append(f"  cs = csmix(cs, (unsigned){name});")
     for name in g.arrays:

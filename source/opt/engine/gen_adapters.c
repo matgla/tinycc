@@ -16,7 +16,6 @@
 #include "opt/flat/bool.h"
 #include "opt/flat/call_result.h"
 #include "opt/flat/branch.h"
-#include "const_string_fold.h"
 
 int tcc_ir_opt_gens_fusion_ex(IROptCtx *ctx)
 {
@@ -42,13 +41,3 @@ int tcc_ir_opt_gens_branch_ex(IROptCtx *ctx)
 {
   return tcc_ir_opt_run_gens(ctx, branch_gens, branch_gens_count);
 }
-
-int tcc_ir_opt_cmp_stack_addr_fold_ex(IROptCtx *ctx) { return tcc_ir_opt_cmp_stack_addr_fold(ctx->ir); }
-
-int tcc_ir_opt_const_prop_tmp_ex(IROptCtx *ctx) { return tcc_ir_opt_const_prop_tmp(ctx->ir); }
-int tcc_ir_opt_const_var_prop_ex(IROptCtx *ctx) { return tcc_ir_opt_const_var_prop(ctx->ir); }
-int tcc_ir_opt_global_init_prop_ex(IROptCtx *ctx) { return tcc_ir_opt_global_init_prop(ctx->ir); }
-int tcc_ir_opt_symref_const_prop_ex(IROptCtx *ctx) { return tcc_ir_opt_symref_const_prop(ctx->ir); }
-int tcc_ir_opt_value_tracking_ex(IROptCtx *ctx) { return tcc_ir_opt_value_tracking(ctx->ir); }
-int tcc_ir_opt_const_string_calls_ex(IROptCtx *ctx) { return tcc_ir_opt_const_string_calls(ctx->ir); }
-int ssa_const_string_fold_flat_ex(IROptCtx *ctx) { return tcc_ir_ssa_opt_const_string_fold_flat(ctx->ir); }

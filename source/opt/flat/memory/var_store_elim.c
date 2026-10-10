@@ -23,11 +23,10 @@ static int ir_dce_addrof_var_pos(TCCIRState *ir, IRQuadCompact *q)
   if (!irop_config[q->op].has_src1)
     return -1;
 
-  IROperand s = tcc_ir_op_get_src1(ir, q);
-  int32_t vr = irop_get_vreg(s);
+  int32_t vr = tcc_ir_op_src1_vreg(ir, q);
   if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
     return -1;
-  if (q->op == TCCIR_OP_ASSIGN && !(s.is_local && !s.is_lval))
+  if (q->op == TCCIR_OP_ASSIGN && !(tcc_ir_op_src1_is_local(ir, q) && !tcc_ir_op_src1_is_lval(ir, q)))
     return -1;
   return TCCIR_DECODE_VREG_POSITION(vr);
 }
@@ -93,12 +92,11 @@ static int ir_op_pure_for_dead_var_dest(TCCIRState *ir, IRQuadCompact *q)
   }
   case TCCIR_OP_STORE: {
     /* only local stores are safe; pointer stores are observable */
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    return d.is_local;
+    return tcc_ir_op_dest_is_local(ir, q);
   }
   case TCCIR_OP_FUNCCALLVAL:
   case TCCIR_OP_FUNCCALLVOID: {
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee) return 0;
     const char *name = get_tok_str(callee->v, NULL);
     return name && tcc_ir_is_pure_aeabi(name);
@@ -198,8 +196,7 @@ int tcc_ir_opt_dead_var_store_elim(TCCIRState *ir)
       continue;
     if (!irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t vr = irop_get_vreg(dest);
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -271,8 +268,7 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)dest.u.imm32;
+      int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
       if (target >= 0 && target < n)
         is_target[target / 8] |= (1 << (target % 8));
     }
@@ -344,8 +340,7 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
 
     if (irop_config[q->op].has_dest)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t vr = irop_get_vreg(dest);
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -376,5 +371,3 @@ static int tcc_ir_opt_redundant_var_assign__timed(TCCIRState *ir)
   tcc_free(is_target);
   return changes;
 }
-int tcc_ir_opt_redundant_var_assign_ex(IROptCtx *ctx) { return tcc_ir_opt_redundant_var_assign(ctx->ir); }
-int tcc_ir_opt_dead_var_store_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_var_store_elim(ctx->ir); }

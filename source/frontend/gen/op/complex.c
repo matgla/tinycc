@@ -315,8 +315,12 @@ void gen_complex_float_cmp(int op)
  * Complex int:   real at offset +0, imag at offset +elem_size.
  * Constant complex ints are packed into 64 bits: real in low, imag in high.
  *
- * Before decomposition, both operands must be promoted to the same base type
- * via the usual arithmetic conversions so that elem_size is consistent.
+ * Each operand keeps its own base type: a narrow complex operand (_Complex
+ * char/short) packs its halves at *its* element width, so a component is read
+ * with that width and widened afterwards.  Casting the whole packed pair
+ * first would read one wide word and take the imaginary half from past the
+ * end of the object.  gen_op() applies the usual arithmetic conversions to
+ * the scalar components, which is what `bt` computes up front as well.
  */
 void gen_complex_int_arith(int op)
 {
@@ -344,17 +348,10 @@ void gen_complex_int_arith(int op)
   elem_type.t = bt | (is_unsigned ? VT_UNSIGNED : 0);
   elem_type.ref = NULL;
 
-  /* Cast both operands to the promoted type (strip VT_COMPLEX for cast,
-   * but retain the complex flag on the SValue for component extraction). */
-  vswap();
-  if ((vtop->type.t & VT_BTYPE) != bt)
-    gen_cast_s(elem_type.t);
-  vtop->type.t |= VT_COMPLEX;
-  vswap();
-  if ((vtop->type.t & VT_BTYPE) != bt)
-    gen_cast_s(elem_type.t);
-  vtop->type.t |= VT_COMPLEX;
-
+  /* Do not cast the operands here: gen_cast() on a complex value converts it
+   * as one object, which is exactly what a narrow complex operand must not be
+   * treated as.  Keep the operands as they are and widen each component once
+   * it has been read (PUSH_COMP below). */
   int l_const = (vtop[-1].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
   int r_const = (vtop[0].r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
 
@@ -386,19 +383,28 @@ void gen_complex_int_arith(int op)
     }                                                                                                                  \
     else if (is_const)                                                                                                 \
     {                                                                                                                  \
-      int shift_ = elem_size * 8;                                                                                      \
-      uint64_t mask_ = (elem_size == 8) ? ~0ULL : ((1ULL << shift_) - 1);                                              \
-      uint64_t val_ = (sv).c.i;                                                                                        \
-      vpushi(0);                                                                                                       \
-      vtop->c.i = (int64_t)(((comp) == 0) ? (val_ & mask_) : ((val_ >> shift_) & mask_));                              \
-      vtop->type = elem_type;                                                                                          \
+      /* A packed complex constant is shifted by the operand's own element \
+       * width; the half is then widened to the promoted type. */         \
+      int own_ = btype_size((sv).type.t & VT_BTYPE);                                                   \
+      int shift_ = own_ * 8;                                                                           \
+      uint64_t mask_ = (own_ == 8) ? ~0ULL : ((1ULL << shift_) - 1);                                   \
+      uint64_t val_ = (sv).c.i;                                                                        \
+      int64_t part_ = (int64_t)(((comp) == 0) ? (val_ & mask_) : ((val_ >> shift_) & mask_));         \
+      if (!((sv).type.t & VT_UNSIGNED) && own_ < 8)                                                    \
+        part_ = (int64_t)(((uint64_t)part_ << (64 - shift_)) >> (64 - shift_));                        \
+      vpushi(0);                                                                                       \
+      vtop->c.i = part_;                                                                               \
+      vtop->type = elem_type;                                                                          \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
-      vpushv(&(sv));                                                                                                   \
-      vtop->type.t &= ~VT_COMPLEX;                                                                                     \
-      if ((comp) == 1)                                                                                                 \
-        incr_offset(elem_size);                                                                                        \
+      /* Load the half at the operand's own stride and width: gen_op() \
+       * promotes the scalar component. */                             \
+      int own_ = btype_size((sv).type.t & VT_BTYPE);                                                   \
+      vpushv(&(sv));                                                                                   \
+      vtop->type.t &= ~VT_COMPLEX;                                                                     \
+      if ((comp) == 1)                                                                                 \
+        incr_offset(own_);                                                                             \
     }                                                                                                                  \
   } while (0)
 
@@ -514,6 +520,82 @@ void gen_complex_int_arith(int op)
     result.vr = res_vr;
     result.c.i = res_loc;
     vpushv(&result);
+  }
+}
+
+/* Split a constant operand of complex float arithmetic into its real/imag
+ * components of the element type `bt`.  A plain scalar constant (not
+ * VT_COMPLEX) has no imaginary half -- its bytes past the value are not a
+ * second component (`3.5 + 4.5i` used to read 3.5 as the imaginary part too). */
+static void complex_const_components(const SValue *sv, int is_complex, int bt, CValue *re, CValue *im)
+{
+  int sbt = sv->type.t & VT_BTYPE;
+
+  if (!is_complex)
+  {
+    double v;
+    if (!is_float(sbt))
+      v = (sv->type.t & VT_UNSIGNED) ? (double)(uint64_t)sv->c.i : (double)(int64_t)sv->c.i;
+    else if (sbt == VT_FLOAT)
+      v = (double)sv->c.f;
+    else
+      v = sv->c.d;
+    if (bt == VT_FLOAT)
+      re->f = (float)v;
+    else
+      re->d = v;
+  }
+  else if (!is_float(sbt))
+  {
+    /* Complex int constant: (imag << shift | real) in c.i */
+    int shift = btype_size(sbt) * 8;
+    uint64_t mask = (shift >= 64) ? ~0ULL : ((1ULL << shift) - 1);
+    uint64_t re_u = sv->c.i & mask;
+    uint64_t im_u = (shift >= 64) ? 0 : ((sv->c.i >> shift) & mask);
+    double rv, iv;
+    if (sv->type.t & VT_UNSIGNED)
+    {
+      rv = (double)re_u;
+      iv = (double)im_u;
+    }
+    else
+    {
+      if (shift < 64)
+      {
+        uint64_t sign = 1ULL << (shift - 1);
+        re_u = (re_u ^ sign) - sign;
+        im_u = (im_u ^ sign) - sign;
+      }
+      rv = (double)(int64_t)re_u;
+      iv = (double)(int64_t)im_u;
+    }
+    if (bt == VT_FLOAT)
+    {
+      re->f = (float)rv;
+      im->f = (float)iv;
+    }
+    else
+    {
+      re->d = rv;
+      im->d = iv;
+    }
+  }
+  else if (bt == VT_FLOAT)
+  {
+    union
+    {
+      float f;
+      uint32_t u;
+    } a, b;
+    a.u = (uint32_t)(sv->c.i & 0xFFFFFFFF);
+    b.u = (uint32_t)(sv->c.i >> 32);
+    re->f = a.f;
+    im->f = b.f;
+  }
+  else
+  {
+    memcpy(&re->d, &sv->c, 8);
+    memcpy(&im->d, (const char *)&sv->c + 8, 8);
   }
 }
 
@@ -822,6 +904,14 @@ void gen_complex_float_arith(int op)
   int l_complex = (vtop[-1].type.t & VT_COMPLEX) != 0;
   int r_complex = (vtop[0].type.t & VT_COMPLEX) != 0;
   int bt = (l_complex ? vtop[-1].type.t : vtop[0].type.t) & VT_BTYPE;
+  /* A complex-int operand (`7i`) mixed with a float scalar takes the float
+   * operand's base type; the int parts are converted per component. */
+  if (!is_float(bt))
+  {
+    int other = (l_complex ? vtop[0].type.t : vtop[-1].type.t) & VT_BTYPE;
+    if (is_float(other))
+      bt = other;
+  }
   int elem_size = (bt == VT_DOUBLE || bt == VT_LDOUBLE) ? 8 : 4;
   int complex_size = elem_size * 2;
 
@@ -836,60 +926,39 @@ void gen_complex_float_arith(int op)
   memset(&r_imag_cv, 0, sizeof(CValue));
 
   if (r_const)
-  {
-    int r_bt = vtop[0].type.t & VT_BTYPE;
-    if (!is_float(r_bt))
-    {
-      if (bt == VT_FLOAT)
-        r_real_cv.f = (float)vtop[0].c.i;
-      else
-        r_real_cv.d = (double)vtop[0].c.i;
-    }
-    else if (bt == VT_FLOAT)
-    {
-      union
-      {
-        float f;
-        uint32_t u;
-      } a, b;
-      a.u = (uint32_t)(vtop[0].c.i & 0xFFFFFFFF);
-      b.u = (uint32_t)(vtop[0].c.i >> 32);
-      r_real_cv.f = a.f;
-      r_imag_cv.f = b.f;
-    }
-    else
-    {
-      memcpy(&r_real_cv.d, &vtop[0].c, 8);
-      memcpy(&r_imag_cv.d, (char *)&vtop[0].c + 8, 8);
-    }
-  }
+    complex_const_components(&vtop[0], r_complex, bt, &r_real_cv, &r_imag_cv);
   if (l_const)
+    complex_const_components(&vtop[-1], l_complex, bt, &l_real_cv, &l_imag_cv);
+  if (l_const && r_const && (op == '+' || op == '-'))
   {
-    int l_bt = vtop[-1].type.t & VT_BTYPE;
-    if (!is_float(l_bt))
-    {
-      if (bt == VT_FLOAT)
-        l_real_cv.f = (float)vtop[-1].c.i;
-      else
-        l_real_cv.d = (double)vtop[-1].c.i;
-    }
-    else if (bt == VT_FLOAT)
+    /* Both constant: fold component-wise into a packed complex constant
+     * (same packing as the imaginary literals / complex initializers). */
+    CType rt = vtop[-1].type.t & VT_COMPLEX ? vtop[-1].type : vtop[0].type;
+    CValue res;
+    memset(&res, 0, sizeof(res));
+    if (bt == VT_FLOAT)
     {
       union
       {
         float f;
         uint32_t u;
       } a, b;
-      a.u = (uint32_t)(vtop[-1].c.i & 0xFFFFFFFF);
-      b.u = (uint32_t)(vtop[-1].c.i >> 32);
-      l_real_cv.f = a.f;
-      l_imag_cv.f = b.f;
+      a.f = (op == '+') ? l_real_cv.f + r_real_cv.f : l_real_cv.f - r_real_cv.f;
+      b.f = (op == '+') ? l_imag_cv.f + r_imag_cv.f : l_imag_cv.f - r_imag_cv.f;
+      res.i = (uint64_t)a.u | ((uint64_t)b.u << 32);
     }
     else
     {
-      memcpy(&l_real_cv.d, &vtop[-1].c, 8);
-      memcpy(&l_imag_cv.d, (char *)&vtop[-1].c + 8, 8);
+      double a = (op == '+') ? l_real_cv.d + r_real_cv.d : l_real_cv.d - r_real_cv.d;
+      double b = (op == '+') ? l_imag_cv.d + r_imag_cv.d : l_imag_cv.d - r_imag_cv.d;
+      memcpy(&res, &a, 8);
+      memcpy((char *)&res + 8, &b, 8);
     }
+    rt.t = (rt.t & ~VT_BTYPE & ~VT_UNSIGNED & ~VT_CONSTANT & ~VT_VOLATILE) | bt | VT_COMPLEX;
+    vpop();
+    vpop();
+    vsetc(&rt, VT_CONST, &res);
+    return;
   }
   SValue saved_lhs = vtop[-1];
   SValue saved_rhs = vtop[0];

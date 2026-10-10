@@ -22,9 +22,13 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
     return;
   if (func_sym->f.func_pure_via_sret)
     return;
+  /* A weak body may be replaced by one with side effects. */
+  if (func_sym->a.weak)
+    return;
 
-  /* Non-zero func_vc is the local slot holding the spilled sret pointer. */
-  if (func_vc == 0)
+  /* Non-zero func_vc is the local slot holding the spilled sret pointer --
+   * not a parameter when the result is returned in s0-s7. */
+  if (func_vc == 0 || ir->vfp_ret_words)
     return;
 
   /* P0 is seeded unconditionally: the prolog store to the slot may already be forwarded away. */
@@ -79,8 +83,7 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
       if (!irop_config[q->op].has_dest)
         continue;
 
-      IROperand dst = tcc_ir_op_get_dest(ir, q);
-      int32_t dest_vr = irop_get_vreg(dst);
+      int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
       if (dest_vr < 0)
         continue;
       if (SRET_TEST(dest_vr))
@@ -105,9 +108,8 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
       }
       else if (q->op == TCCIR_OP_ADD)
       {
-        IROperand src1 = tcc_ir_op_get_src1(ir, q);
         IROperand src2 = tcc_ir_op_get_src2(ir, q);
-        int32_t src1_vr = irop_get_vreg(src1);
+        int32_t src1_vr = tcc_ir_op_src1_vreg(ir, q);
         if (src1_vr >= 0 && SRET_TEST(src1_vr) && irop_is_immediate(src2) && !src2.is_sym)
         {
           SRET_MARK(dest_vr);
@@ -121,6 +123,11 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
   for (int i = 0; i < n && pure; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
+    if (tcc_ir_instr_access_is_volatile(ir, q))
+    {
+      pure = 0;
+      break;
+    }
     switch (q->op)
     {
     case TCCIR_OP_NOP:
@@ -171,7 +178,7 @@ void tcc_ir_analyze_pure_via_sret(TCCIRState *ir, Sym *func_sym)
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_FUNCCALLVOID:
     {
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      Sym *callee = tcc_ir_op_src1_sym(ir, q);
       if (!callee)
       {
         pure = 0;

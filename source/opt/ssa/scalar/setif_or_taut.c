@@ -143,6 +143,19 @@ static int so_compatible(const SoBool *a, const SoBool *b)
   return so_operand_same(a->s1_op, b->s1_op) && so_operand_same(a->s2_op, b->s2_op);
 }
 
+/* Side-table annotations keyed by a CMP's orig_index change what it compares:
+ * a barrel shift folded into src2 (`cmp.w r2, r1, asr #8`) or a 64-bit
+ * zero-half / high-word-only verdict.  None of them travels with the operands,
+ * so a CMP carrying one is neither a source of operands to re-emit elsewhere
+ * nor a compare whose operands can be swapped out underneath it.
+ * TCC_DISABLE_PASS=ssa:setif_annot_guard drops this check (A/B only: unsound). */
+static int so_cmp_annotated(const TCCIRState *ir, const IRQuadCompact *cq)
+{
+  if (tcc_ir_opt_pass_disabled("ssa:setif_annot_guard"))
+    return 0;
+  return tcc_ir_barrel_shift_at(ir, cq) != 0 || tcc_ir_zero_half64_at(ir, cq) != 0;
+}
+
 /* Bool-info of a SETIF: its state mask over the CMP immediately preceding it. */
 static SoBool so_from_setif(IRSSAOptCtx *ctx, int setif_idx, IRQuadCompact *sq)
 {
@@ -153,6 +166,8 @@ static SoBool so_from_setif(IRSSAOptCtx *ctx, int setif_idx, IRQuadCompact *sq)
   if (ci < 0 || ir->compact_instructions[ci].op != TCCIR_OP_CMP)
     return so_fail();
   IRQuadCompact *cq = &ir->compact_instructions[ci];
+  if (so_cmp_annotated(ir, cq))
+    return so_fail();
   IROperand cs1 = tcc_ir_op_get_src1(ir, cq);
   IROperand cs2 = tcc_ir_op_get_src2(ir, cq);
   int bt1 = irop_get_btype(cs1), bt2 = irop_get_btype(cs2);
@@ -160,7 +175,7 @@ static SoBool so_from_setif(IRSSAOptCtx *ctx, int setif_idx, IRQuadCompact *sq)
       bt2 == IROP_BTYPE_FLOAT32 || bt2 == IROP_BTYPE_FLOAT64)
     return so_fail();
 
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, sq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, sq);
   uint8_t mask = so_cond_to_mask(tok);
   if (mask == 0)
     return so_fail();
@@ -276,11 +291,10 @@ static int so_or_is_taut(IRSSAOptCtx *ctx, int i)
 {
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *q = &ir->compact_instructions[i];
-  IROperand dest = tcc_ir_op_get_dest(ir, q);
   IROperand s1 = tcc_ir_op_get_src1(ir, q);
   IROperand s2 = tcc_ir_op_get_src2(ir, q);
-  int32_t dvr = irop_get_vreg(dest);
-  if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP || dest.is_lval)
+  int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
+  if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP || tcc_ir_op_dest_is_lval(ir, q))
     return 0;
   if (s1.is_lval || s2.is_lval)
     return 0;
@@ -393,6 +407,10 @@ static int so_fold_cmp(IRSSAOptCtx *ctx, int i)
   int is_select = (use->op == TCCIR_OP_SELECT);
   int is_setif = (use->op == TCCIR_OP_SETIF);
 
+  /* An annotated src2 is not the plain boolean the chain resolves to, and the
+   * annotation would stay on whatever operand the rewrite puts there. */
+  if (so_cmp_annotated(ir, q))
+    return 0;
   IROperand cs1 = tcc_ir_op_get_src1(ir, q);
   IROperand cs2 = tcc_ir_op_get_src2(ir, q);
   if (cs1.is_lval || cs2.is_lval)
@@ -431,19 +449,19 @@ static int so_fold_cmp(IRSSAOptCtx *ctx, int i)
       IROperand dest = tcc_ir_op_get_dest(ir, use);
       q->op = TCCIR_OP_NOP;
       use->op = TCCIR_OP_ASSIGN;
-      tcc_ir_set_src1(ir, j, irop_make_imm32(-1, result, irop_get_btype(dest)));
-      tcc_ir_set_src2(ir, j, IROP_NONE);
+      tcc_ir_set_src1_imm32(ir, j, result, irop_get_btype(dest));
+      tcc_ir_set_src2_none(ir, j);
       tcc_ir_op_set_dest(ir, use, dest);
     }
     else if (is_select)
     {
-      IROperand keep = result ? tcc_ir_op_get_src1(ir, use) : tcc_ir_op_get_src2(ir, use);
-      IROperand drop = result ? tcc_ir_op_get_src2(ir, use) : tcc_ir_op_get_src1(ir, use);
+      IROperand keep = tcc_ir_op_get_src1_or_2(ir, use, !result);
+      IROperand drop = tcc_ir_op_get_src1_or_2(ir, use, result);
       so_drop_use(ctx, drop, j);
       q->op = TCCIR_OP_NOP;
       use->op = TCCIR_OP_ASSIGN;
       tcc_ir_set_src1(ir, j, keep);
-      tcc_ir_set_src2(ir, j, IROP_NONE);
+      tcc_ir_set_src2_none(ir, j);
     }
     else
     {
@@ -522,7 +540,7 @@ int ssa_opt_setif_or_taut(IRSSAOptCtx *ctx)
     imm.is_unsigned = dest.is_unsigned;
     q->op = TCCIR_OP_ASSIGN;
     tcc_ir_set_src1(ir, i, imm);
-    tcc_ir_set_src2(ir, i, IROP_NONE);
+    tcc_ir_set_src2_none(ir, i);
 
     IRSSAVregInfo *v1 = ssa_opt_vinfo(ctx, irop_get_vreg(s1));
     if (v1)

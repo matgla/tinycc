@@ -1627,7 +1627,7 @@ static void data_processing_mop_impl(MachineOperand src1, MachineOperand src2, M
     carry_handler = handler;
     break;
   default:
-    tcc_error("compiler_error: tcc_gen_machine_data_processing_mop: unhandled op %d", (int)op);
+    tcc_ice("tcc_gen_machine_data_processing_mop: unhandled op %d", (int)op);
     return;
   }
 
@@ -1726,7 +1726,7 @@ ST_FUNC void tcc_gen_machine_bitop1_mop(MachineOperand src1, MachineOperand dest
     ot_check(th_rev16((uint32_t)rd, (uint32_t)rm, ENFORCE_ENCODING_NONE));
     break;
   default:
-    tcc_error("compiler_error: tcc_gen_machine_bitop1_mop: unhandled op %d", (int)op);
+    tcc_ice("tcc_gen_machine_bitop1_mop: unhandled op %d", (int)op);
     break;
   }
   mach_writeback_dest(&dest, rd);
@@ -2441,7 +2441,7 @@ ST_FUNC void tcc_gen_machine_muldiv_mop(MachineOperand src1, MachineOperand src2
     break;
   }
   default:
-    tcc_error("compiler_error: tcc_gen_machine_muldiv_mop: unhandled op %d", (int)op);
+    tcc_ice("tcc_gen_machine_muldiv_mop: unhandled op %d", (int)op);
     break;
   }
   mach_release_all(&ctx);
@@ -2937,7 +2937,7 @@ ST_FUNC void tcc_gen_machine_pack64_mop(MachineOperand src_lo, MachineOperand sr
 {
   if (!dest.is_64bit)
   {
-    tcc_error("compiler_error: tcc_gen_machine_pack64_mop: dest not 64-bit");
+    tcc_ice("tcc_gen_machine_pack64_mop: dest not 64-bit");
     return;
   }
   MachineOperand dst_lo = mach_make_lo_half(&dest);
@@ -3191,6 +3191,10 @@ ST_FUNC void tcc_gen_machine_assign_mop_ex(MachineOperand src, MachineOperand de
 
   case MACH_OP_IMM:
     tcc_machine_load_constant(dest_reg, PREG_REG_NONE, src.u.imm.val, 0, NULL);
+    /* `T <-- #0x40000000***DEREF***`: `switch (REG)` assigns the register's
+     * value to the controlling temp, not its address. */
+    if (src.needs_deref)
+      load_from_base(dest_reg, PREG_REG_NONE, src.btype, (int)src.is_unsigned, 0, 0, (uint32_t)dest_reg);
     break;
 
   case MACH_OP_SPILL:

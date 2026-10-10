@@ -625,6 +625,13 @@ void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op)
   cgstub_record("return_value_mop", op, CGSTUB_NO_OP, src, CGSTUB_NO_OP);
 }
 
+void thumb_call_layout_abi_flags(TCCAbiCallLayout *layout, Sym *sym)
+{
+  (void)sym;
+  layout->hard_float = 0;
+  layout->is_variadic = 0;
+}
+
 /* AAPCS-shaped but minimal: first 4 words in R0-R3, the rest on the outgoing
  * stack area. Good enough for the pre-scan's stack-size estimate and for
  * Phase 4's call-family dispatch tests; not a full ABI classifier. */

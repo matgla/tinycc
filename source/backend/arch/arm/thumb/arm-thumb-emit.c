@@ -412,7 +412,8 @@ thumb_opcode th_generic_mov_imm(uint32_t r, int imm)
 {
   if (imm < 0)
   {
-    return th_mvn_imm(r, 0, -imm - 1, flags_safe(), ENFORCE_ENCODING_NONE);
+    /* ~imm == -imm - 1 without overflowing for INT_MIN */
+    return th_mvn_imm(r, 0, ~imm, flags_safe(), ENFORCE_ENCODING_NONE);
   }
   return th_mov_imm(r, imm, flags_safe(), ENFORCE_ENCODING_NONE);
 }
@@ -494,7 +495,7 @@ int th_patch_call(int t, int a)
      * where offset = (i:imm5) * 2 */
     int offset = a - (lt + 4); /* PC-relative, Thumb PC = insn + 4 */
     if (offset < 0 || offset > 126 || (offset & 1))
-      tcc_error("compiler_error: CBZ/CBNZ target out of range: offset=%d in %s", offset, funcname ? funcname : "?");
+      tcc_ice("CBZ/CBNZ target out of range: offset=%d in %s", offset, funcname ? funcname : "?");
     uint32_t imm6 = (uint32_t)offset >> 1;
     uint32_t i_bit = (imm6 >> 5) & 1;
     uint32_t imm5 = imm6 & 0x1f;
@@ -502,7 +503,7 @@ int th_patch_call(int t, int a)
     *x |= (uint16_t)((i_bit << 9) | (imm5 << 3));
   }
   else
-    tcc_error("compiler_error: unhandled branch type in th_patch_call for: t: "
+    tcc_ice("unhandled branch type in th_patch_call for: t: "
               "0x%x, a: 0x%x, x: 0x%x 0x%x\n",
               t, a, x[0], x[1]);
 
@@ -569,9 +570,19 @@ ST_FUNC void tcc_gen_machine_indirect_jump_mop(MachineOperand src, TccIrOp op)
 {
   (void)op;
   MachineCodegenContext ctx = {0};
-  int target = mach_ensure_in_reg(&ctx, &src, 0);
+  int target = mach_ensure_in_reg(&ctx, &src, 1u << R_IP);
+  if (ctx.n_scratch > 0)
+  {
+    /* Loading the target took scratch registers, possibly pushed to free them:
+     * their restore must come BEFORE the branch (after it, it never runs and
+     * the stack stays unbalanced -- -O0 computed goto returned through a
+     * stray word).  Branch through IP, which no scratch restore touches. */
+    if (target != R_IP)
+      ot_check_mov_reg(R_IP, (uint32_t)target, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    mach_release_all(&ctx);
+    target = R_IP;
+  }
   ot_check(th_bx_reg((uint16_t)target));
-  mach_release_all(&ctx);
 }
 
 /* Returns the number of bytes emitted by tcc_gen_machine_switch_table_mop for
@@ -1189,7 +1200,7 @@ ST_FUNC int tcc_machine_can_encode_stack_offset_with_param_adj(int frame_offset,
 ST_FUNC void tcc_machine_load_spill_slot(int dest_reg, int frame_offset)
 {
   if (dest_reg == PREG_REG_NONE)
-    tcc_error("compiler_error: load_spill_slot requires a destination register");
+    tcc_ice("load_spill_slot requires a destination register");
 
   /* Adjust for callee-saved gap below FP (spill slots are always locals) */
   frame_offset = fp_adjust_local_offset(frame_offset, 0);
@@ -1229,7 +1240,7 @@ ST_FUNC void tcc_machine_load_spill_slot(int dest_reg, int frame_offset)
 ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset)
 {
   if (src_reg == PREG_REG_NONE)
-    tcc_error("compiler_error: store_spill_slot requires a source register");
+    tcc_ice("store_spill_slot requires a source register");
 
   /* Adjust for callee-saved gap below FP (spill slots are always locals) */
   frame_offset = fp_adjust_local_offset(frame_offset, 0);
@@ -1285,31 +1296,91 @@ static int unalias_ldbl(int btype)
   return btype;
 }
 
-/* Return whether a structure is an homogeneous float aggregate or not.
-   The answer is true if all the elements of the structure are of the same
-   primitive float type and there is less than 4 elements.
-
-   type: the type corresponding to the structure to be tested */
-static int is_hgen_float_aggr(CType *type)
+/* AAPCS-VFP homogeneous floating-point aggregate (HFA) classification.
+ *
+ * Flatten `type` (arrays and nested structs included) and count its base
+ * elements: every one must be a float, or every one a double, and there must
+ * be 1-4 of them.  Returns the element count (0 when not an HFA); *base is
+ * set to VT_FLOAT/VT_DOUBLE.  Bit-fields, unions, complex members and
+ * unsized/flexible arrays disqualify the aggregate. */
+static int hfa_scan(const CType *type, int *base)
 {
-  if ((type->t & VT_BTYPE) == VT_STRUCT)
+  const int t = type->t;
+  if (t & VT_ARRAY)
   {
-    struct Sym *ref;
-    int btype, nb_fields = 0;
-
-    ref = type->ref->next;
-    if (ref)
+    if (!type->ref || type->ref->c <= 0)
+      return 0;
+    const int n = hfa_scan(&type->ref->type, base);
+    if (!n || n * type->ref->c > 4)
+      return 0;
+    return n * type->ref->c;
+  }
+  if (t & VT_COMPLEX)
+    return 0;
+  const int btype = unalias_ldbl(t & VT_BTYPE);
+  if (btype == VT_FLOAT || btype == VT_DOUBLE)
+  {
+    if (*base && *base != btype)
+      return 0;
+    *base = btype;
+    return 1;
+  }
+  if (btype == VT_STRUCT && type->ref && !IS_UNION(t))
+  {
+    int count = 0;
+    for (const Sym *f = type->ref->next; f; f = f->next)
     {
-      btype = unalias_ldbl(ref->type.t & VT_BTYPE);
-      if (btype == VT_FLOAT || btype == VT_DOUBLE)
-      {
-        for (; ref && btype == unalias_ldbl(ref->type.t & VT_BTYPE); ref = ref->next, nb_fields++)
-          ;
-        return !ref && nb_fields <= 4;
-      }
+      if (f->type.t & VT_BITFIELD)
+        return 0;
+      const int n = hfa_scan(&f->type, base);
+      if (!n)
+        return 0;
+      count += n;
+      if (count > 4)
+        return 0;
     }
+    return count;
   }
   return 0;
+}
+
+static int is_hgen_float_aggr(CType *type)
+{
+  int base = 0;
+  return (type->t & VT_BTYPE) == VT_STRUCT && hfa_scan(type, &base) > 0;
+}
+
+/* AAPCS-VFP co-processor register candidate shape of an aggregate: a struct
+ * HFA, or a _Complex float/double (two elements).  Returns the element count
+ * (0 when it is neither) and sets *base_size to the element size, 4 or 8. */
+ST_FUNC int gfunc_hfa(CType *type, int *base_size)
+{
+  int base = 0, n = 0;
+  if (type->t & VT_COMPLEX)
+  {
+    base = unalias_ldbl(type->t & VT_BTYPE);
+    n = (base == VT_FLOAT || base == VT_DOUBLE) ? 2 : 0;
+  }
+  else if ((type->t & VT_BTYPE) == VT_STRUCT)
+    n = hfa_scan(type, &base);
+  *base_size = base == VT_DOUBLE ? 8 : 4;
+  return n;
+}
+
+/* Hard-float (AAPCS-VFP) return of an HFA or _Complex float/double wider
+ * than 8 bytes: in s0..s(n-1), n = the result's size in words (2-8).
+ * Returns n, or 0 when the value is not returned that way.  The front end
+ * still gives such a value a result buffer (gfunc_sret says 0), but no
+ * hidden pointer reaches the callee: the caller stores s0..s(n-1) into the
+ * buffer after the call and the callee loads them from its own buffer at
+ * its exit (gen_vfp_ret_transfer). */
+ST_FUNC int gfunc_sret_vfp_words(CType *vt, int variadic)
+{
+  int base;
+  if (float_abi != ARM_HARD_FLOAT || variadic)
+    return 0;
+  const int n = gfunc_hfa(vt, &base);
+  return n * base > 8 ? n * base / 4 : 0;
 }
 
 // How many registers are necessary to return struct via registers
@@ -1320,7 +1391,10 @@ ST_FUNC int gfunc_sret(CType *vt, int variadic, CType *ret, int *ret_align, int 
   const int size = type_size(vt, &align);
 
   TRACE("'gfunc_sret'");
-  if (float_abi == ARM_HARD_FLOAT && !variadic && (is_float(vt->t) || is_hgen_float_aggr(vt)))
+  /* RETURNVALUE carries at most d0, so a VFP value wider than 8 bytes keeps
+   * the result-buffer shape here; gfunc_sret_vfp_words says it is passed in
+   * s0-s7 rather than through a hidden pointer. */
+  if (float_abi == ARM_HARD_FLOAT && !variadic && size <= 8 && (is_float(vt->t) || is_hgen_float_aggr(vt)))
   {
     *ret_align = 8;
     *regsize = 8;
@@ -1483,6 +1557,10 @@ static int th_pic_reloc_for_sym(Sym *sym, int sym_off)
       sym_in_rodata = 1;
   }
   if (tcc_state->share_rodata && (sym->type.t & VT_STATIC) && sym_off != SHN_UNDEF && sym_in_rodata)
+    return R_ARM_RODATA_OFF;
+  /* The start of .rodata (rodata_rel.c), which is what the anchor holds:
+   * the linker resolves the literal to 0 (+ the addend). */
+  if (tcc_state->share_rodata && sym->v == TOK___tcc_rodata_base)
     return R_ARM_RODATA_OFF;
   /* sym_off == SHN_UNDEF: forward-declared, section unknown — GOT32 is safe.
    * So is a constant still waiting in COMMON (a tentative `static const T x;`
@@ -1775,7 +1853,7 @@ void load_full_const(int r, int r1, uint32_t imm_lo, uint32_t imm_hi)
             /* The prologue parked the base in a register reserved for the
              * whole body (tcc_gen_machine_rodata_anchor_claim). */
             if (r == rodata_anchor_reg)
-              tcc_error("compiler_error: rodata anchor r%d handed out as a value register",
+              tcc_ice("rodata anchor r%d handed out as a value register",
                         rodata_anchor_reg);
             ot_check(th_add_reg(r, r, rodata_anchor_reg, flags_safe(), THUMB_SHIFT_DEFAULT,
                                 ENFORCE_ENCODING_NONE));
@@ -1870,7 +1948,7 @@ int load_short_from_base(int ir, int base, int fc, int sign)
 ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int is_param)
 {
   if (dest_reg == PREG_REG_NONE)
-    tcc_error("compiler_error: addr_of_stack_slot requires a destination register");
+    tcc_ice("addr_of_stack_slot requires a destination register");
 
   /* Stack parameters live above the saved-register area.
    * When computing their address, fold in offset_to_args (prologue push size).
@@ -1936,7 +2014,7 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
   {
     offset_alloc = get_scratch_reg_with_save(1u << base_reg);
     if (offset_alloc.reg == PREG_NONE)
-      tcc_error("compiler_error: unable to allocate scratch register for stack address");
+      tcc_ice("unable to allocate scratch register for stack address");
     offset_reg = offset_alloc.reg;
   }
 
@@ -1954,6 +2032,36 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
     tcc_ir_opt_fp_cache_record(ir, frame_offset, dest_reg);
 }
 
+/* A constant with no 2-byte encoding here -- MOV.W/MVN.W/MOVW, a literal-pool
+ * load, or a MOVS the live flags forbid -- that another register is known to
+ * hold is a 2-byte `mov rd, rs` instead.  The Zig C backend passes its
+ * `undefined` 0xaaaaaaaa in two argument registers of one call, and a high
+ * register receiving 0 takes `mov.w rH, #0`.  imm_cache says who holds what
+ * (maintained identically in the dry and real passes).  Not inside an IT
+ * block, where the copy would be conditional.
+ * TCC_DISABLE_PASS=codegen:const_reg_copy turns it off. */
+static int const_reg_copy_off = -1;
+
+int load_constant_from_holding_reg(int reg, int64_t key)
+{
+  if (const_reg_copy_off < 0)
+    const_reg_copy_off = tcc_ir_opt_pass_disabled("codegen:const_reg_copy");
+  if (const_reg_copy_off || !thumb_gen_state.generating_function || mov_equiv_it_pending > 0 || reg < 0 ||
+      reg >= R_SP)
+    return 0;
+  if (th_generic_mov_imm((uint32_t)reg, (int)(uint32_t)key).size == 2)
+    return 0;
+  for (int rr = 0; rr < R_SP; rr++)
+  {
+    if (rr == reg || !imm_cache[rr].valid || imm_cache[rr].sym != NULL ||
+        (uint32_t)imm_cache[rr].value != (uint32_t)key)
+      continue;
+    ot_check_mov_reg((uint32_t)reg, (uint32_t)rr, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+    return 1;
+  }
+  return 0;
+}
+
 /* Load a constant value into a register (or register pair for 64-bit).
  * This is a simplified wrapper around load_full_const/th_generic_mov_imm
  * that doesn't require an SValue. Used by IR-level materialization.
@@ -1961,7 +2069,7 @@ ST_FUNC void tcc_machine_addr_of_stack_slot(int dest_reg, int frame_offset, int 
 ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t value, int is_64bit, Sym *sym)
 {
   if (dest_reg == PREG_REG_NONE)
-    tcc_error("compiler_error: load_constant requires a destination register");
+    tcc_ice("load_constant requires a destination register");
 
   /* Symbol-relative constants always need the literal pool for relocations */
   if (sym)
@@ -2004,7 +2112,9 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
   }
 
   /* 32-bit constant */
-  if (!ot(th_generic_mov_imm(dest_reg, (uint32_t)value)))
+  if (load_constant_from_holding_reg(dest_reg, value))
+    ;
+  else if (!ot(th_generic_mov_imm(dest_reg, (uint32_t)value)))
     load_full_const(dest_reg, PREG_NONE, LFC_SPLIT(value));
 
   if (!sym && !is_64bit && dest_reg >= 0 && dest_reg < 16)
@@ -2020,9 +2130,9 @@ ST_FUNC void tcc_machine_load_constant(int dest_reg, int dest_reg_high, int64_t 
 ST_FUNC void tcc_machine_load_cmp_result(int dest_reg, int condition_code)
 {
   if (dest_reg == PREG_REG_NONE)
-    tcc_error("compiler_error: load_cmp_result requires a destination register");
+    tcc_ice("load_cmp_result requires a destination register");
   if (dest_reg == R_SP || dest_reg == R_PC)
-    tcc_error("compiler_error: load_cmp_result cannot use SP or PC");
+    tcc_ice("load_cmp_result cannot use SP or PC");
 
   const uint32_t firstcond = mapcc(condition_code);
   /* IT block: if cond then mov 1, else mov 0 */
@@ -2036,11 +2146,11 @@ ST_FUNC void tcc_machine_load_cmp_result(int dest_reg, int condition_code)
 ST_FUNC void tcc_machine_load_jmp_result(int dest_reg, int jmp_addr, int invert)
 {
   if (dest_reg == PREG_REG_NONE)
-    tcc_error("compiler_error: load_jmp_result requires a destination register");
+    tcc_ice("load_jmp_result requires a destination register");
 
 #ifdef TCC_TARGET_ARM_ARCHV6M
   if (dest_reg > 7)
-    tcc_error("compiler_error: implement load_jmp_result for armv6m with high register");
+    tcc_ice("implement load_jmp_result for armv6m with high register");
 #endif
 
   /* Load the "true" branch value, then unconditionally branch over the "false" value,
@@ -2098,7 +2208,7 @@ void load_from_base(int r, int r1, int irop_btype, int is_unsigned, int fc, int 
      * UNALIGN_TRP).  Restrict to SP/FP-relative bases where TCC's stack
      * allocator guarantees 4-byte alignment of 64-bit slots; arbitrary
      * pointers (e.g. into a packed struct) may be unaligned. */
-    const int base_is_stack = (base_reg == (uint32_t)R_SP || base_reg == (uint32_t)R_FP);
+    const int base_is_stack = frame_word_base((int)base_reg);
     if (base_is_stack && (fc & 3) == 0 && fc <= 1020 && r >= 0 && r <= R_LR && r != R_SP && ir_high >= 0 &&
         ir_high <= R_LR && ir_high != R_SP && r != ir_high)
     {
@@ -2231,7 +2341,7 @@ void thumb_require_materialized_reg(const char *ctx, const char *operand, int re
   const bool reg_is_hw = (reg >= 0) && (reg <= 15);
   if (reg == PREG_REG_NONE || !reg_is_hw)
   {
-    tcc_error("compiler_error: %s expects %s in a physical register (pr=%d)", ctx, operand, reg);
+    tcc_ice("%s expects %s in a physical register (pr=%d)", ctx, operand, reg);
   }
 }
 uint32_t thumb_exclude_mask_for_regs(int count, const int *regs)

@@ -96,11 +96,11 @@ static void fold_materialize_consts(IRSSAOptCtx *ctx, int idx)
   int32_t v;
   if (!fold_read_imm32(ir, src1, &v) && try_resolve_const_vreg(ctx, src1, idx, &v)) {
     tcc_ir_op_set_src1(ir, q, mk_imm_bt(v, irop_get_btype(src1)));
-    opt_dsl_drop_use(ctx, src1, idx);
+    opt_dsl_drop_use(ctx, &src1, idx);
   }
   if (!fold_read_imm32(ir, src2, &v) && try_resolve_const_vreg(ctx, src2, idx, &v)) {
     tcc_ir_op_set_src2(ir, q, mk_imm_bt(v, irop_get_btype(src2)));
-    opt_dsl_drop_use(ctx, src2, idx);
+    opt_dsl_drop_use(ctx, &src2, idx);
   }
 }
 
@@ -226,7 +226,10 @@ static int fold_mask_is_copy(IRSSAOptCtx *ctx, IROperand dest, IROperand src, in
  * var_to_param_forward LSL-drop bug class). */
 OPT_GEN_SSA(fold_barrel, -1) {
   int32_t v1 = 0, v2 = 0;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(!irop_is_64bit(dest) && !irop_is_64bit(src1) && !irop_is_64bit(src2));
     and(fold_read_imm32(ir, src1, &v1) || try_resolve_const_vreg(ctx, src1, i, &v1));
@@ -259,19 +262,20 @@ OPT_GEN_SSA(fold_barrel, -1) {
     return 0;
   }
   if (src1.tag == IROP_TAG_VREG)
-    opt_dsl_drop_use(ctx, src1, i);
+    opt_dsl_drop_use(ctx, &src1, i);
   if (src2.tag == IROP_TAG_VREG)
-    opt_dsl_drop_use(ctx, src2, i);
+    opt_dsl_drop_use(ctx, &src2, i);
   fold_clear_barrel(ir, q);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN,
-          .src1 = mk_imm_bt((int32_t)bres, irop_get_btype(dest)));
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm((int32_t)bres, irop_get_btype(dest)));
 }
 
 /* symref+addend ± #imm -> ASSIGN symref+(addend±imm), so address consumers
  * (ssa:const_string_fold in particular) see a constant symbol address. */
 OPT_GEN_SSA(fold_symref_addend, -1) {
   int32_t off = 0;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB);
     and(irop_get_tag(src1) == IROP_TAG_SYMREF && !src1.is_lval);
@@ -281,27 +285,27 @@ OPT_GEN_SSA(fold_symref_addend, -1) {
     return 0;
   int32_t na = (q->op == TCCIR_OP_ADD) ? sr->addend + off : sr->addend - off;
   uint32_t nidx = tcc_ir_pool_add_symref(ir, sr->sym, na, sr->flags);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN,
-          .src1 = irop_make_symref(0, nidx, 0, src1.is_local, src1.is_const,
-                                   irop_get_btype(src1)));
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(irop_make_symref(0, nidx, 0, src1.is_local, src1.is_const, irop_get_btype(src1))));
 }
 
 /* Division/modulo by constant 0 is UB (C11 6.5.5p5): rewrite to TRAP and NOP
  * the block tail so TRAP becomes the terminator (mirrors div_by_zero_trap). */
 OPT_GEN_SSA(fold_div_zero_trap, -1) {
   int32_t v2 = 0;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(q->op == TCCIR_OP_DIV || q->op == TCCIR_OP_UDIV ||
          q->op == TCCIR_OP_IMOD || q->op == TCCIR_OP_UMOD);
     and(fold_read_imm32(ir, src2, &v2) && v2 == 0);
     and(ctx->cfg && i >= 0 && i < ctx->cfg->num_instrs));
-  opt_dsl_drop_use(ctx, src1, i);
-  opt_dsl_drop_use(ctx, src2, i);
+  opt_dsl_drop_use(ctx, &src1, i);
+  opt_dsl_drop_use(ctx, &src2, i);
   int end = ctx->cfg->blocks[ctx->cfg->instr_to_block[i]].end_idx;
   for (int j = i + 1; j < end && j < ir->next_instruction_index; j++)
     ssa_opt_nop_instr(ctx, j);
-  REWRITE(.new_op = TCCIR_OP_TRAP);
+  REWRITE(set_op(TCCIR_OP_TRAP));
 }
 
 /* dest = A SELECT A [cond]  ->  dest = A.  Identical immediate arms make the
@@ -309,15 +313,18 @@ OPT_GEN_SSA(fold_div_zero_trap, -1) {
  * Cleans up const diamonds that vrp / if-conversion leave as `#k SELECT #k`
  * (sccp propagates through instruction defs, not phi/select-fed merges). */
 OPT_GEN_SSA(fold_select_equal, TCCIR_OP_SELECT) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(irop_get_vreg(src1) < 0 && irop_get_vreg(src2) < 0);
     and(irop_is_immediate(src1) && irop_is_immediate(src2) &&
         !src1.is_sym && !src2.is_sym &&
         irop_get_btype(src1) == irop_get_btype(src2) &&
         irop_get_imm64_ex(ir, src1) == irop_get_imm64_ex(ir, src2)));
-  opt_dsl_drop_use(ctx, tcc_ir_op_get_cond(ir, q), i);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = src1);
+  IROperand cond = tcc_ir_op_get_cond(ir, q);
+  opt_dsl_drop_use(ctx, &cond, i);
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(src1));
 }
 
 /* Same, for identical register arms: `dest = X SELECT X [cond]` -> `dest = X`.
@@ -327,15 +334,18 @@ OPT_GEN_SSA(fold_select_equal, TCCIR_OP_SELECT) {
  * Bare vregs only — an lval operand is a memory read whose two occurrences the
  * SELECT does not necessarily perform at the same program point. */
 OPT_GEN_SSA(fold_select_equal_vreg, TCCIR_OP_SELECT) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(src1.tag == IROP_TAG_VREG && src2.tag == IROP_TAG_VREG);
     and(!src1.is_lval && !src2.is_lval);
     and(irop_get_vreg(src1) >= 0 && irop_get_vreg(src1) == irop_get_vreg(src2));
     and(irop_get_btype(src1) == irop_get_btype(src2)));
-  opt_dsl_drop_use(ctx, src2, i);
-  opt_dsl_drop_use(ctx, tcc_ir_op_get_cond(ir, q), i);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = src1);
+  opt_dsl_drop_use(ctx, &src2, i);
+  IROperand cond = tcc_ir_op_get_cond(ir, q);
+  opt_dsl_drop_use(ctx, &cond, i);
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(src1));
 }
 
 /* Both operands immediate: full constant fold.  An IMM32 operand of a 64-bit
@@ -343,7 +353,10 @@ OPT_GEN_SSA(fold_select_equal_vreg, TCCIR_OP_SELECT) {
  * word (fuzz longlong seed 3161: `#imm SHR #32`). */
 OPT_GEN_SSA(fold_const_eval, -1) {
   int32_t val1 = 0, val2 = 0;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(fold_read_imm32(ir, src1, &val1));
     and(fold_read_imm32(ir, src2, &val2)));
@@ -451,16 +464,19 @@ OPT_GEN_SSA(fold_const_eval, -1) {
   IROperand imm = (is_64 && result != (int64_t)(int32_t)result)
                       ? irop_make_i64(0, tcc_ir_pool_add_i64(ir, result), dest.btype)
                       : mk_imm_bt((int32_t)result, dest.btype);
-  opt_dsl_drop_use(ctx, src1, i);
-  opt_dsl_drop_use(ctx, src2, i);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = imm);
+  opt_dsl_drop_use(ctx, &src1, i);
+  opt_dsl_drop_use(ctx, &src2, i);
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(imm));
 }
 
 /* x - x, x ^ x, x % x -> 0;  x / x -> 1;  x & x, x | x -> x.  x/x and x%x
  * assume x != 0 (division by zero is UB, so the zero case never reaches here);
  * src1 == src2 rules out the INT_MIN/-1 overflow trap. */
 OPT_GEN_SSA(fold_x_op_x, -1) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(src1.tag == IROP_TAG_VREG && src2.tag == IROP_TAG_VREG);
     and(!src1.is_lval && !src2.is_lval);
@@ -470,20 +486,18 @@ OPT_GEN_SSA(fold_x_op_x, -1) {
   case TCCIR_OP_XOR:
   case TCCIR_OP_IMOD:
   case TCCIR_OP_UMOD:
-    opt_dsl_drop_use(ctx, src1, i);
-    opt_dsl_drop_use(ctx, src1, i);
-    REWRITE(.new_op = TCCIR_OP_ASSIGN,
-            .src1 = mk_imm_bt(0, dest.btype));
+    opt_dsl_drop_use(ctx, &src1, i);
+    opt_dsl_drop_use(ctx, &src1, i);
+    REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(0, dest.btype));
   case TCCIR_OP_DIV:
   case TCCIR_OP_UDIV:
-    opt_dsl_drop_use(ctx, src1, i);
-    opt_dsl_drop_use(ctx, src1, i);
-    REWRITE(.new_op = TCCIR_OP_ASSIGN,
-            .src1 = mk_imm_bt(1, dest.btype));
+    opt_dsl_drop_use(ctx, &src1, i);
+    opt_dsl_drop_use(ctx, &src1, i);
+    REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(1, dest.btype));
   case TCCIR_OP_AND:
   case TCCIR_OP_OR:
-    opt_dsl_drop_use(ctx, src1, i);
-    REWRITE(.new_op = TCCIR_OP_ASSIGN);
+    opt_dsl_drop_use(ctx, &src1, i);
+    REWRITE(set_op(TCCIR_OP_ASSIGN));
   default:
     return 0;
   }
@@ -495,7 +509,10 @@ OPT_GEN_SSA(fold_x_op_x, -1) {
  * The register form is handled by fold_x_op_x; this covers the direct symref-lval
  * operands (`a / a` on a global) that never get a vreg. */
 OPT_GEN_SSA(fold_divmod_self_symref, -1) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(q->op == TCCIR_OP_DIV || q->op == TCCIR_OP_UDIV ||
          q->op == TCCIR_OP_IMOD || q->op == TCCIR_OP_UMOD);
@@ -512,8 +529,7 @@ OPT_GEN_SSA(fold_divmod_self_symref, -1) {
     return 0;
   int fold_val = (q->op == TCCIR_OP_IMOD || q->op == TCCIR_OP_UMOD) ? 0 : 1;
   tcc_ir_set_src2(ir, i, IROP_NONE);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN,
-          .src1 = mk_imm_bt(fold_val, dest.btype));
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(fold_val, dest.btype));
 }
 
 /* One XOR arm is #-1, the other is `a` itself (common after LOAD-CSE folds
@@ -534,8 +550,13 @@ static int fold_bitcomp_inner_matches(IROperand xs1, IROperand xs2, IROperand a)
  * A fused barrel shift on either instruction breaks the identity — the real
  * operand is `(src2 SHIFT #n)`, so `a | ((a ^ -1) LSL #n)` is not -1. */
 OPT_GEN_SSA(fold_bitcomp_src2, -1) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC2, .op = TCCIR_OP_XOR);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(
     when(q->op == TCCIR_OP_OR || q->op == TCCIR_OP_AND);
     and(src1.tag == IROP_TAG_VREG && !src1.is_lval && irop_get_vreg(src1) >= 0);
@@ -544,15 +565,20 @@ OPT_GEN_SSA(fold_bitcomp_src2, -1) {
     and_not(tcc_ir_barrel_shift_at(ir, &ir->compact_instructions[pidx]));
     and(ctx->cfg && ctx->cfg->instr_to_block[pidx] == ctx->cfg->instr_to_block[i]);
     and(fold_bitcomp_inner_matches(psrc1, psrc2, src1)));
-  opt_dsl_drop_use(ctx, src1, i);
-  opt_dsl_drop_use(ctx, src2, i);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN,
-          .src1 = mk_imm_bt((q->op == TCCIR_OP_OR) ? -1 : 0, dest.btype));
+  opt_dsl_drop_use(ctx, &src1, i);
+  opt_dsl_drop_use(ctx, &src2, i);
+  int32_t v = (q->op == TCCIR_OP_OR) ? -1 : 0;
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(v, dest.btype));
 }
 
 OPT_GEN_SSA(fold_bitcomp_src1, -1) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = TCCIR_OP_XOR);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(
     when(q->op == TCCIR_OP_OR || q->op == TCCIR_OP_AND);
     and(src2.tag == IROP_TAG_VREG && !src2.is_lval && irop_get_vreg(src2) >= 0);
@@ -561,10 +587,10 @@ OPT_GEN_SSA(fold_bitcomp_src1, -1) {
     and_not(tcc_ir_barrel_shift_at(ir, &ir->compact_instructions[pidx]));
     and(ctx->cfg && ctx->cfg->instr_to_block[pidx] == ctx->cfg->instr_to_block[i]);
     and(fold_bitcomp_inner_matches(psrc1, psrc2, src2)));
-  opt_dsl_drop_use(ctx, src2, i);
-  opt_dsl_drop_use(ctx, src1, i);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN,
-          .src1 = mk_imm_bt((q->op == TCCIR_OP_OR) ? -1 : 0, dest.btype));
+  opt_dsl_drop_use(ctx, &src2, i);
+  opt_dsl_drop_use(ctx, &src1, i);
+  int32_t v = (q->op == TCCIR_OP_OR) ? -1 : 0;
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(v, dest.btype));
 }
 
 /* Non-lval single-def TEMP vreg — value-stable at any dominated use site.
@@ -594,8 +620,13 @@ static int fold_same_value(IRSSAOptCtx *ctx, IROperand a, IROperand b)
  * covers double complement).  The kept operand must be value-stable at this
  * site (imm or TEMP) and widths must match end-to-end. */
 OPT_GEN_SSA(fold_xor_cancel_src1, TCCIR_OP_XOR) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = TCCIR_OP_XOR);
+  PBIND(dest);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(
     when(q->op == TCCIR_OP_XOR);
     and(pvi->def_count == 1);
@@ -611,14 +642,19 @@ OPT_GEN_SSA(fold_xor_cancel_src1, TCCIR_OP_XOR) {
   GUARD(
     when(is_imm32(kept) || fold_single_def_temp(ctx, kept));
     and(irop_get_btype(dest) == irop_get_btype(kept)));
-  opt_dsl_drop_use(ctx, src2, i);
+  opt_dsl_drop_use(ctx, &src2, i);
   RETIRE_PAIR(kept, 0);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = kept);
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(kept));
 }
 
 OPT_GEN_SSA(fold_xor_cancel_src2, TCCIR_OP_XOR) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
   PAIR(.link = IR_PAIR_DEF_OF_SRC2, .op = TCCIR_OP_XOR);
+  PBIND(dest);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(
     when(q->op == TCCIR_OP_XOR);
     and(pvi->def_count == 1);
@@ -634,16 +670,22 @@ OPT_GEN_SSA(fold_xor_cancel_src2, TCCIR_OP_XOR) {
   GUARD(
     when(is_imm32(kept) || fold_single_def_temp(ctx, kept));
     and(irop_get_btype(dest) == irop_get_btype(kept)));
-  opt_dsl_drop_use(ctx, src1, i);
+  opt_dsl_drop_use(ctx, &src1, i);
   RETIRE_PAIR(kept, 0);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = kept);
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(kept));
 }
 
 /* Absorption: x & (x | y) -> x;  x | (x & y) -> x (either arm order).
  * The shared x must be value-stable across both sites (fold_same_value). */
 OPT_GEN_SSA(fold_absorb_src2, -1) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC2, .op = -1);
+  PBIND(dest);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(
     when((q->op == TCCIR_OP_AND && pop == TCCIR_OP_OR) ||
          (q->op == TCCIR_OP_OR && pop == TCCIR_OP_AND));
@@ -651,13 +693,19 @@ OPT_GEN_SSA(fold_absorb_src2, -1) {
     and_not(tcc_ir_barrel_shift_at(ir, &ir->compact_instructions[pidx]));
     and(irop_get_btype(pdest) == irop_get_btype(dest));
     and(fold_same_value(ctx, psrc1, src1) || fold_same_value(ctx, psrc2, src1)));
-  opt_dsl_drop_use(ctx, src2, i);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN);
+  opt_dsl_drop_use(ctx, &src2, i);
+  REWRITE(set_op(TCCIR_OP_ASSIGN));
 }
 
 OPT_GEN_SSA(fold_absorb_src1, -1) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = -1);
+  PBIND(dest);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(
     when((q->op == TCCIR_OP_AND && pop == TCCIR_OP_OR) ||
          (q->op == TCCIR_OP_OR && pop == TCCIR_OP_AND));
@@ -665,15 +713,21 @@ OPT_GEN_SSA(fold_absorb_src1, -1) {
     and_not(tcc_ir_barrel_shift_at(ir, &ir->compact_instructions[pidx]));
     and(irop_get_btype(pdest) == irop_get_btype(dest));
     and(fold_same_value(ctx, psrc1, src2) || fold_same_value(ctx, psrc2, src2)));
-  opt_dsl_drop_use(ctx, src1, i);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = src2);
+  opt_dsl_drop_use(ctx, &src1, i);
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(src2));
 }
 
 /* Same-direction shift chains: (x shl a) shl b -> x shl (a+b) or 0 when
  * a+b >= 32; shr likewise; (x sar a) sar b -> x sar min(a+b, 31). */
 OPT_GEN_SSA(fold_shift_chain, -1) {
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = -1);
+  PBIND(dest);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(
     when(q->op == TCCIR_OP_SHL || q->op == TCCIR_OP_SHR || q->op == TCCIR_OP_SAR);
     and(pop == q->op);
@@ -688,11 +742,11 @@ OPT_GEN_SSA(fold_shift_chain, -1) {
   if (q->op == TCCIR_OP_SAR && total > 31)
     total = 31;
   if (total >= 32) {
-    opt_dsl_drop_use(ctx, src1, i);
-    REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = mk_imm_bt(0, dest.btype));
+    opt_dsl_drop_use(ctx, &src1, i);
+    REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(0, dest.btype));
   }
   RETIRE_PAIR(psrc1, 0);
-  REWRITE(.src1 = psrc1, .src2 = mk_imm(total));
+  REWRITE(set_src1_ref(psrc1), set_src2_imm(total, IROP_BTYPE_INT32));
 }
 
 /* Only NOPs between instructions a and b (a < b): a rewrite that moves a
@@ -713,8 +767,13 @@ static int fold_gap_is_nops(TCCIRState *ir, int a, int b)
  * that read from the SHL down to the SHR: the single-use + NOP-only-gap gates
  * keep exactly one read in unchanged memory order. */
 OPT_GEN_SSA(fold_shl_shr_mask64, -1) {
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(dest);
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = TCCIR_OP_SHL, .single_use = 1);
+  PBIND(dest);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(
     when(q->op == TCCIR_OP_SHR);
     and(irop_get_btype(dest) == IROP_BTYPE_INT64);
@@ -730,7 +789,7 @@ OPT_GEN_SSA(fold_shl_shr_mask64, -1) {
                     ? irop_make_i64(0, tcc_ir_pool_add_i64(ir, (int64_t)mask), dest.btype)
                     : mk_imm_bt((int32_t)mask, dest.btype);
   RETIRE_PAIR(psrc1, 1);
-  REWRITE(.new_op = TCCIR_OP_AND, .src1 = psrc1, .src2 = m);
+  REWRITE(set_op(TCCIR_OP_AND), set_src1_ref(psrc1), set_src2_ref(m));
 }
 
 /* x+0, x-0, x|0, x^0, x<<0, x>>0, x*1, x&~0, x/1 -> x;
@@ -739,7 +798,10 @@ OPT_GEN_SSA(fold_shl_shr_mask64, -1) {
  * 64-bit width) must not fall into the identity folds. */
 OPT_GEN_SSA(fold_identity_src2, -1) {
   int32_t v1 = 0, v2 = 0;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(fold_read_imm32(ir, src2, &v2));
     and(!src1.is_lval);
@@ -769,18 +831,15 @@ OPT_GEN_SSA(fold_identity_src2, -1) {
   default: break;
   }
   if (is_identity)
-    REWRITE(.new_op = TCCIR_OP_ASSIGN);
+    REWRITE(set_op(TCCIR_OP_ASSIGN));
   if (is_absorb) {
-    opt_dsl_drop_use(ctx, src1, i);
-    REWRITE(.new_op = TCCIR_OP_ASSIGN,
-            .src1 = mk_imm_bt(absorb_val, dest.btype));
+    opt_dsl_drop_use(ctx, &src1, i);
+    REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(absorb_val, dest.btype));
   }
   /* x/-1: RSB #0 beats MVN+SDIV; on ARM both wrap INT_MIN/-1 to INT_MIN. */
   if (q->op == TCCIR_OP_DIV && v2 == -1 &&
       !irop_is_64bit(dest) && !irop_is_64bit(src1))
-    REWRITE(.new_op = TCCIR_OP_SUB,
-            .src1 = mk_imm_bt(0, irop_get_btype(src1)),
-            .src2 = src1);
+    REWRITE(set_op(TCCIR_OP_SUB), set_src1_imm(0, irop_get_btype(src1)), set_src2_ref(src1));
   return 0;
 }
 
@@ -793,8 +852,12 @@ OPT_GEN_SSA(fold_identity_src2, -1) {
  * test 396; the same trap the neighbouring folds already guard against). */
 OPT_GEN_SSA(fold_double_neg, TCCIR_OP_SUB) {
   int32_t v1 = 0;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
   PAIR(.link = IR_PAIR_DEF_OF_SRC2, .op = TCCIR_OP_SUB);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(
     when(q->op == TCCIR_OP_SUB);
     and(fold_read_imm32(ir, src1, &v1) && v1 == 0);
@@ -807,14 +870,17 @@ OPT_GEN_SSA(fold_double_neg, TCCIR_OP_SUB) {
   IROperand new_src = psrc2;
   new_src.is_lval = 0;
   RETIRE_PAIR(new_src, 0);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = new_src);
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(new_src));
 }
 
 /* 0+x, 0|x, 0^x, 1*x, ~0&x -> x;  0*x, 0&x, 0<<x, 0>>x, 0 ror x -> 0;
  * -1|x -> -1 */
 OPT_GEN_SSA(fold_identity_src1, -1) {
   int32_t v1 = 0;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(fold_read_imm32(ir, src1, &v1));
     and(!src2.is_lval && src2.tag == IROP_TAG_VREG));
@@ -836,11 +902,10 @@ OPT_GEN_SSA(fold_identity_src1, -1) {
   default: break;
   }
   if (is_identity)
-    REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = src2);
+    REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(src2));
   if (is_absorb) {
-    opt_dsl_drop_use(ctx, src2, i);
-    REWRITE(.new_op = TCCIR_OP_ASSIGN,
-            .src1 = mk_imm_bt(absorb_val, dest.btype));
+    opt_dsl_drop_use(ctx, &src2, i);
+    REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(absorb_val, dest.btype));
   }
   return 0;
 }
@@ -850,7 +915,10 @@ OPT_GEN_SSA(fold_identity_src1, -1) {
  * Kills the bitfield insert+re-extract left by the retme round-trip (20040709-2). */
 OPT_GEN_SSA(fold_and_masked, TCCIR_OP_AND) {
   int32_t M = 0;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(is_value_dest(dest));
     and_not(irop_is_64bit(dest) || irop_is_64bit(src1) || irop_is_64bit(src2));
@@ -860,9 +928,8 @@ OPT_GEN_SSA(fold_and_masked, TCCIR_OP_AND) {
     int budget = 4096;
     uint32_t maybe = fold_maybe_set_bits(ctx, src1, i, 24, &budget);
     if ((maybe & (uint32_t)M) == 0) {
-      opt_dsl_drop_use(ctx, src1, i);
-      REWRITE(.new_op = TCCIR_OP_ASSIGN,
-              .src1 = mk_imm_bt(0, irop_get_btype(dest)));
+      opt_dsl_drop_use(ctx, &src1, i);
+      REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(0, irop_get_btype(dest)));
     }
     /* Mirror image: the mask covers every bit X can have set, so `X & M` is a
      * copy.  Stripping it is what lets setif_branch_fuse see through the `& 1u`
@@ -870,10 +937,10 @@ OPT_GEN_SSA(fold_and_masked, TCCIR_OP_AND) {
      * SSA const-prop forms this shape after the flat known_bits pass is done. */
     if ((maybe & ~(uint32_t)M) == 0 &&
         irop_get_btype(src1) == irop_get_btype(dest))
-      REWRITE(.new_op = TCCIR_OP_ASSIGN);
+      REWRITE(set_op(TCCIR_OP_ASSIGN));
     IROperand w;
     if (fold_mask_is_copy(ctx, dest, src1, i, (uint32_t)M, &w))
-      REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = w);
+      REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(w));
   }
   IRQuadCompact *dq = fold_single_dom_def(ctx, src1, i);
   if (!dq || tcc_ir_barrel_shift_at(ir, dq))
@@ -884,7 +951,7 @@ OPT_GEN_SSA(fold_and_masked, TCCIR_OP_AND) {
         !fold_read_imm32(ir, tcc_ir_op_get_src2(ir, dq), &K))
       return 0;
     if ((K & ~M) == 0)
-      REWRITE(.new_op = TCCIR_OP_ASSIGN);
+      REWRITE(set_op(TCCIR_OP_ASSIGN));
     /* X moves from dq's site here: imm / dominating single-def TEMP is stable,
      * an lval read only when no store/call/control transfer lies between. */
     IROperand X = tcc_ir_op_get_src1(ir, dq);
@@ -896,10 +963,9 @@ OPT_GEN_SSA(fold_and_masked, TCCIR_OP_AND) {
     } else if (!fold_read_imm32(ir, X, &xtmp) && !fold_single_dom_def(ctx, X, i)) {
       return 0;
     }
-    opt_dsl_drop_use(ctx, src1, i);
-    opt_dsl_add_use(ctx, X, i);
-    REWRITE(.src1 = X,
-            .src2 = mk_imm_bt(K & M, irop_get_btype(src2)));
+    opt_dsl_drop_use(ctx, &src1, i);
+    opt_dsl_add_use(ctx, &X, i);
+    REWRITE(set_src1(X), set_src2_imm(K & M, irop_get_btype(src2)));
   }
   if (dq->op != TCCIR_OP_OR)
     return 0;
@@ -928,9 +994,9 @@ OPT_GEN_SSA(fold_and_masked, TCCIR_OP_AND) {
     int32_t ov;
     if (!fold_read_imm32(ir, other, &ov) && !fold_single_dom_def(ctx, other, i))
       continue;
-    opt_dsl_drop_use(ctx, src1, i);
-    opt_dsl_add_use(ctx, other, i);
-    REWRITE(.src1 = other);
+    opt_dsl_drop_use(ctx, &src1, i);
+    opt_dsl_add_use(ctx, &other, i);
+    REWRITE(set_src1_ref(other));
   }
   return 0;
 }
@@ -938,7 +1004,10 @@ OPT_GEN_SSA(fold_and_masked, TCCIR_OP_AND) {
 /* `d = s1 OR s2` with one arm provably all-zero (barrel-shift-aware) collapses
  * to a copy — kills the bitfield-insert OR whose inserted field folded to #0. */
 OPT_GEN_SSA(fold_or_zero_arm, TCCIR_OP_OR) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(is_value_dest(dest) && !irop_is_64bit(dest));
     and_not(irop_is_64bit(src1) || irop_is_64bit(src2)));
@@ -960,13 +1029,16 @@ OPT_GEN_SSA(fold_or_zero_arm, TCCIR_OP_OR) {
   IROperand drop = keep_src1 ? src2 : src1;
   if (keep.is_lval)
     return 0;
-  opt_dsl_drop_use(ctx, drop, i);
+  opt_dsl_drop_use(ctx, &drop, i);
   fold_clear_barrel(ir, q);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = keep);
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(keep));
 }
 
 OPT_GEN_SSA(fold_bfi, TCCIR_OP_BFI) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(is_temp_vreg(dest));
     and_not(irop_is_64bit(dest) || irop_is_64bit(src1) || irop_is_64bit(src2)));
@@ -982,8 +1054,7 @@ OPT_GEN_SSA(fold_bfi, TCCIR_OP_BFI) {
     return 0;
   uint32_t mask = (width == 32) ? 0xFFFFFFFFu : ((1u << width) - 1u);
   uint32_t result = ((uint32_t)val1 & ~(mask << lsb)) | (((uint32_t)val2 & mask) << lsb);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN,
-          .src1 = mk_imm_bt((int32_t)result, irop_get_btype(dest)));
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm((int32_t)result, irop_get_btype(dest)));
 }
 
 /* Constant U/SBFX extract: src2 encodes lsb (bits 0-4) | width<<5 (0 means 8),
@@ -1004,7 +1075,7 @@ static int fold_bfx_value(IRSSAOptCtx *ctx, int i, int is_signed, int32_t *out)
   if (!fold_read_imm32(ir, src1, &val1)) {
     if (!try_resolve_const_vreg(ctx, src1, i, &val1))
       return 0;
-    opt_dsl_drop_use(ctx, src1, i);
+    opt_dsl_drop_use(ctx, &src1, i);
   }
   int lsb = src2.u.imm32 & 0x1F;
   int width = (src2.u.imm32 >> 5) & 0x1F;
@@ -1020,7 +1091,10 @@ static int fold_bfx_value(IRSSAOptCtx *ctx, int i, int is_signed, int32_t *out)
 
 OPT_GEN_SSA(fold_ubfx, TCCIR_OP_UBFX) {
   int32_t result = 0;
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND_IMM(src2);
   /* fold_bfx_value extracts from the source's LOW word; UBFX_HI_HALF does not
    * name that word.  See source/opt/flat/fusion/shift64_extract_ubfx.c. */
   GUARD(when(!(is_imm32(src2) && ((int32_t)imm(src2) & UBFX_HI_HALF))));
@@ -1031,19 +1105,18 @@ OPT_GEN_SSA(fold_ubfx, TCCIR_OP_UBFX) {
     IROperand w;
     if ((f & 0x1F) == 0 && width > 0 && width < 32 && !tcc_ir_barrel_shift_at(ir, q) &&
         fold_mask_is_copy(ctx, dest, src1, i, (1u << width) - 1u, &w))
-      REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = w);
+      REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_ref(w));
   }
   GUARD(when(fold_bfx_value(ctx, i, 0, &result)));
-  REWRITE(.new_op = TCCIR_OP_ASSIGN,
-          .src1 = mk_imm_bt(result, irop_get_btype(dest)));
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(result, irop_get_btype(dest)));
 }
 
 OPT_GEN_SSA(fold_sbfx, TCCIR_OP_SBFX) {
   int32_t result = 0;
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(dest);
   GUARD(when(fold_bfx_value(ctx, i, 1, &result)));
-  REWRITE(.new_op = TCCIR_OP_ASSIGN,
-          .src1 = mk_imm_bt(result, irop_get_btype(dest)));
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(result, irop_get_btype(dest)));
 }
 
 /* clz/rbit/rev/rev16 of a compile-time constant.  tccgen lowers the matching
@@ -1052,7 +1125,9 @@ OPT_GEN_SSA(fold_sbfx, TCCIR_OP_SBFX) {
  * here too or a constant argument stays a runtime instruction. */
 OPT_GEN_SSA(fold_bitop1, -1) {
   int32_t v = 0;
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
   GUARD(when(fold_read_imm32(ir, src1, &v)));
   uint32_t x = (uint32_t)v;
   int32_t result;
@@ -1077,8 +1152,7 @@ OPT_GEN_SSA(fold_bitop1, -1) {
   default:
     return 0;
   }
-  REWRITE(.new_op = TCCIR_OP_ASSIGN,
-          .src1 = mk_imm_bt(result, irop_get_btype(dest)));
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1_imm(result, irop_get_btype(dest)));
 }
 
 /* ---- A 64-bit value taken apart and put back together ----------------------
@@ -1126,9 +1200,9 @@ static int fold_is_hi_shift(TCCIRState *ir, IRQuadCompact *q)
 /* Replace src1 of instruction i by `w`, keeping the use lists right. */
 static void fold_retarget_src1(IRSSAOptCtx *ctx, int i, IROperand old, IROperand w)
 {
-  opt_dsl_drop_use(ctx, old, i);
+  opt_dsl_drop_use(ctx, &old, i);
   tcc_ir_set_src1(ctx->ir, i, w);
-  opt_dsl_add_use(ctx, w, i);
+  opt_dsl_add_use(ctx, &w, i);
 }
 
 /* `d <- (PACK64 a b) [ASSIGN]` into a word is `d <- a`. */
@@ -1210,7 +1284,7 @@ static int fold_pack64_of_halves(IRSSAOptCtx *ctx, int i)
   IROperand sx = tcc_ir_op_get_src1(ir, sq);
   if (sx.is_lval || irop_get_vreg(sx) != irop_get_vreg(x))
     return 0;
-  opt_dsl_drop_use(ctx, b, i);
+  opt_dsl_drop_use(ctx, &b, i);
   q->op = TCCIR_OP_ASSIGN;
   fold_retarget_src1(ctx, i, a, x);
   return 1;

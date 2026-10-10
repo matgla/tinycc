@@ -136,10 +136,13 @@ static const char help2[] = "Tiny C Compiler " TCC_VERSION " - More Options\n"
                             "  gnu89-inline                  'extern inline' is like 'static inline'\n"
                             "  asynchronous-unwind-tables    create eh_frame section [on]\n"
                             "  test-coverage                 create code coverage code\n"
+                            "  visibility=default|hidden|internal|protected\n"
+                            "                                visibility of definitions without one\n"
                             "-m... target specific options:\n"
                             "  ms-bitfields                  use MSVC bitfield layout\n"
 #ifdef TCC_TARGET_ARM
                             "  float-abi                     hard/softfp on arm\n"
+                            "  inline-atomics                read-modify-write atomics as LDREX/STREX loops\n"
 #endif
 #ifdef TCC_TARGET_X86_64
                             "  no-sse                        disable floats on x86_64\n"
@@ -179,6 +182,9 @@ static const char help2[] = "Tiny C Compiler " TCC_VERSION " - More Options\n"
 static const char version[] = "tcc version " TCC_VERSION
 #ifdef TCC_GITHASH
                               " " TCC_GITHASH
+#endif
+#ifdef CONFIG_TCC_O0_ONLY
+                              " O0-only"
 #endif
                               " ("
 #ifdef TCC_TARGET_I386
@@ -261,7 +267,9 @@ static void set_environment(TCCState *s)
   }
 }
 
-static char *default_outputfile(TCCState *s, const char *first_file)
+/* noinline: inlined into main(), its 1 KiB buffer stays allocated for the whole
+ * compile, under every parser/optimizer frame. */
+__attribute__((noinline)) static char *default_outputfile(TCCState *s, const char *first_file)
 {
   char buf[1024];
   char *ext;
@@ -500,7 +508,8 @@ redo:
           break;
       }
 
-      n = group_end + 1;
+      /* the loop condition's ++n steps past the end marker */
+      n = group_end;
       continue;
     }
     else if (f->type & AFF_GROUP_END)

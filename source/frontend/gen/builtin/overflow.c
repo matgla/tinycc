@@ -23,6 +23,341 @@
 
 #include "gen_priv.h"
 
+/* Exact overflow check for operands whose own type is not the result type.
+ *
+ * Both operands become 64-bit patterns (sign- or zero-extended by their own
+ * type) and the infinite-precision value is kept as a (high, low) pair for
+ * add/sub, or as a magnitude and a sign for mul.  The result type is applied
+ * only to that exact value, so a negative operand into an unsigned result or
+ * a 64-bit unsigned operand into a signed one is not wrapped before the test.
+ *
+ * Stack on entry: res  a  b  (res is the result pointer, or a dummy for the
+ * _p predicates); on exit: the flag.  The result is stored through res when
+ * `store` is set. */
+static void ovf_dup(int d)
+{
+  vpushv(&vtop[-d]);
+}
+
+static void ovf_cast(int t)
+{
+  CType c;
+  c.t = t;
+  c.ref = NULL;
+  gen_cast(&c);
+}
+
+/* Compare, and force the flag into a register: a VT_CMP left below other
+ * stack entries would be clobbered by the next flag-setting instruction. */
+static void ovf_cmp(int op)
+{
+  gen_op(op);
+  gv(RC_INT);
+}
+
+/* x -> (x < 0) for a 64-bit pattern x. */
+static void ovf_is_neg(void)
+{
+  ovf_cast(VT_LLONG);
+  vpushi(0);
+  ovf_cmp(TOK_LT);
+}
+
+/* A 64-bit pattern parked in a stack temporary.  Operands are reloaded from
+ * it at every use: duplicating a lazily extended register pair references
+ * halves that were defined for only one of the copies. */
+typedef struct
+{
+  int loc, vr;
+} OvfSlot;
+
+static void ovf_ld(const OvfSlot *sl)
+{
+  SValue v;
+  svalue_init(&v);
+  v.type.t = VT_LLONG | VT_UNSIGNED;
+  v.type.ref = NULL;
+  v.r = VT_LOCAL | VT_LVAL;
+  v.vr = sl->vr;
+  v.c.i = sl->loc;
+  vpushv(&v);
+}
+
+/* Pops the 64-bit pattern on top of the stack into a fresh slot. */
+static void ovf_spill(OvfSlot *sl)
+{
+  sl->loc = get_temp_local_var(8, 8, &sl->vr);
+  if (sl->vr == -1)
+    tcc_error("overflow builtin: out of temporary slots");
+  ovf_ld(sl);
+  vswap();
+  vstore();
+  vpop();
+}
+
+/* -> neg  |x|  for the signed 64-bit pattern in `x`. */
+static void ovf_mag_neg(const OvfSlot *x)
+{
+  ovf_ld(x);
+  ovf_cast(VT_LLONG);
+  vpushi(63);
+  gen_op(TOK_SAR);
+  ovf_cast(VT_LLONG | VT_UNSIGNED); /* s: all ones if x < 0 */
+  ovf_ld(x);
+  ovf_dup(1);
+  gen_op('^'); /* s  x^s */
+  ovf_dup(1);
+  gen_op('-'); /* s  |x| */
+  vswap();
+  vpushi(1);
+  gen_op('&');
+  ovf_cast(VT_INT); /* |x|  neg */
+  vswap();          /* neg  |x| */
+}
+
+static void ovf_exact(int arith_tok, int sa, int sb, const CType *res_type, int res_unsigned, int w, int store)
+{
+  const int ull = VT_LLONG | VT_UNSIGNED;
+  OvfSlot A, B;
+  ovf_cast(ull); /* b */
+  ovf_spill(&B);
+  ovf_ld(&B); /* keeps B's slot out of reach of A's allocation */
+  vswap();
+  ovf_cast(ull); /* a */
+  ovf_spill(&A);
+  vpop();
+  /* res */
+
+  if (arith_tok != '*')
+  {
+    int add = arith_tok == '+';
+    ovf_ld(&A);
+    ovf_ld(&B);
+    gen_op(arith_tok); /* L */
+    if (add)
+    {
+      ovf_dup(0);
+      ovf_ld(&A);
+      ovf_cmp(TOK_LT); /* carry: L < a */
+    }
+    else
+    {
+      ovf_ld(&A);
+      ovf_ld(&B);
+      ovf_cmp(TOK_LT); /* borrow: a < b */
+    }
+    /* L  c.  The high part H of the infinite result is c - na - nb for add
+     * and nb - c - na for sub (n* = operand < 0). */
+    if (sb)
+    {
+      ovf_ld(&B);
+      ovf_is_neg(); /* c  nb */
+      if (add)
+        gen_op('-');
+      else
+      {
+        vswap();
+        gen_op('-');
+      }
+    }
+    else if (!add)
+    {
+      vpushi(0);
+      vswap();
+      gen_op('-');
+    }
+    if (sa)
+    {
+      ovf_ld(&A);
+      ovf_is_neg();
+      gen_op('-');
+    }
+    gv(RC_INT);
+    /* res  L  H */
+    if (!res_unsigned)
+    {
+      /* A signed result takes the sign of the low part's bit w-1 as high bits. */
+      ovf_dup(1);
+      vpushi(w - 1);
+      gen_op(TOK_SHR);
+      vpushi(1);
+      gen_op('&');
+      ovf_cast(VT_INT);
+      gen_op('+');
+    }
+    vpushi(0);
+    ovf_cmp(TOK_NE); /* L  hi_bad */
+    vswap();         /* hi_bad  L */
+    ovf_dup(0);
+    gen_cast((CType *)res_type); /* hi_bad  L  T */
+    if (w < 64)
+    {
+      ovf_dup(0);
+      ovf_cast(ull);
+      ovf_dup(2);
+      ovf_cmp(TOK_NE); /* hi_bad  L  T  lo_bad */
+      vrott(3);
+      vswap();
+      vpop(); /* hi_bad  lo_bad  T */
+      vrott(3);
+      gen_op('|'); /* T  flag */
+    }
+    else
+    {
+      vswap();
+      vpop();
+      vswap(); /* T  flag */
+    }
+  }
+  else
+  {
+    /* T = low product, stored; the flag comes from |a| * |b| and the sign. */
+    int n = (sa || sb) ? 1 : 0;
+    ovf_ld(&A);
+    ovf_ld(&B);
+    gen_op('*');
+    gen_cast((CType *)res_type); /* res  T */
+    if (sa)
+    {
+      ovf_mag_neg(&A); /* na  |a| */
+      vswap();         /* |a|  na */
+      if (sb)
+      {
+        ovf_mag_neg(&B); /* |a|  na  nb  |b| */
+        vrott(3);        /* |a|  |b|  na  nb */
+        gen_op('^');
+        gv(RC_INT);
+      }
+      else
+      {
+        ovf_ld(&B);
+        vswap(); /* |a|  b  na */
+      }
+    }
+    else
+    {
+      ovf_ld(&A);
+      if (sb)
+      {
+        ovf_mag_neg(&B);
+        vswap(); /* a  |b|  nb */
+      }
+      else
+        ovf_ld(&B);
+    }
+    /* res  T  ma  mb  [neg] */
+    ovf_dup(1 + n);
+    ovf_dup(1 + n);
+    gen_op('*'); /* ... P */
+    ovf_dup(2 + n);
+    vpush64(ull, 0);
+    ovf_cmp(TOK_EQ);
+    ovf_dup(3 + n);
+    gen_op('|'); /* ma | (ma == 0) */
+    vpush64(ull, ~0ULL);
+    vswap();
+    gen_op('/'); /* UINT64_MAX / ma */
+    ovf_dup(2 + n);
+    ovf_cmp(TOK_LT); /* ovfP: the magnitude product wraps */
+    vrotb(4 + n);
+    vpop();
+    vrotb(3 + n);
+    vpop(); /* T  [neg]  P  ovf */
+    if (res_unsigned)
+    {
+      if (n)
+      {
+        ovf_dup(1);
+        vpush64(ull, 0);
+        ovf_cmp(TOK_NE);
+        ovf_dup(3);
+        gen_op('&');
+        gen_op('|'); /* a negative non-zero product */
+      }
+      if (w < 64)
+      {
+        ovf_dup(1);
+        vpush64(ull, (1ULL << w) - 1);
+        ovf_cmp(TOK_GT);
+        gen_op('|');
+      }
+    }
+    else
+    {
+      unsigned long long lim = (1ULL << (w - 1)) - 1;
+      if (n)
+      {
+        ovf_dup(2);
+        ovf_cast(ull);
+        vpush64(ull, lim);
+        gen_op('+'); /* lim + neg */
+        ovf_dup(2);
+        vswap();
+      }
+      else
+      {
+        vpush64(ull, lim);
+        ovf_dup(2);
+        vswap();
+      }
+      ovf_cmp(TOK_GT); /* |product| > lim + neg */
+      gen_op('|');
+    }
+    gv(RC_INT);
+    vrott(2 + n);
+    vpop();
+    if (n)
+      vpop(); /* T  flag */
+  }
+
+  /* res  T  flag */
+  if (store)
+  {
+    vrott(3);
+    vswap();
+    indir();
+    vswap();
+    vstore();
+    vpop();
+  }
+  else
+  {
+    vrott(3);
+    vpop();
+    vpop();
+  }
+}
+
+/* True when an operand's own type is not what the result-typed checks assume:
+ * a 64-bit operand into a <= 32-bit result, or a 64-bit result whose operand
+ * has another signedness (an unsigned operand narrower than 64 bits into a
+ * signed result is exact in long long and keeps the cheap path). */
+static int ovf_needs_exact(int res_bt, int res_unsigned, int arith_tok, int typed_mul_ok)
+{
+  int any64 = 0, mism = 0;
+  for (int k = -1; k <= 0; k++)
+  {
+    int obt = vtop[k].type.t & VT_BTYPE, ouns = (vtop[k].type.t & VT_UNSIGNED) != 0;
+    if (obt == VT_LLONG)
+      any64 = 1;
+    if (ouns != res_unsigned && !(ouns && obt != VT_LLONG))
+      mism = 1;
+  }
+  if (res_bt != VT_LLONG)
+    return any64;
+  if (mism && typed_mul_ok && arith_tok == '*')
+  {
+    /* signed <= 32-bit operands into an unsigned 64-bit product: the signed
+     * long long product is exact (signed_to_unsigned_mul). */
+    int small = 1;
+    for (int k = -1; k <= 0; k++)
+      small &= (vtop[k].type.t & VT_BTYPE) != VT_LLONG;
+    if (small)
+      return 0;
+  }
+  return mism;
+}
+
 /* Extracted from unary() to reduce stack frame size. */
 void __attribute__((noinline)) unary_builtin_overflow(void)
 {
@@ -100,6 +435,21 @@ void __attribute__((noinline)) unary_builtin_overflow(void)
     default:
       arith_tok = '*';
       break;
+    }
+
+    {
+      /* Stack: a  b  res_ptr -- the operands are vtop[-2], vtop[-1]. */
+      vtop--;
+      int exact = ovf_needs_exact(res_bt, is_unsigned, arith_tok, res_bt == VT_LLONG && is_unsigned && op_tok == TOK_builtin_mul_overflow);
+      vtop++;
+      if (exact)
+      {
+        int sa = !(vtop[-2].type.t & VT_UNSIGNED), sb = !(vtop[-1].type.t & VT_UNSIGNED);
+        int w = res_bt == VT_LLONG ? 64 : res_bt == VT_INT ? 32 : res_bt == VT_SHORT ? 16 : res_bt == VT_BYTE ? 8 : 1;
+        vrott(3); /* res_ptr  a  b */
+        ovf_exact(arith_tok, sa, sb, &res_type, is_unsigned, w, 1);
+        break;
+      }
     }
 
     /* A 32-bit add or subtract whose operands both convert to the result type
@@ -604,214 +954,13 @@ void __attribute__((noinline)) unary_builtin_overflow(void)
       break;
     }
 
-    if (res_bt == VT_LLONG)
+    if (res_bt == VT_LLONG || ovf_needs_exact(res_bt, is_unsigned, arith_tok, 0))
     {
-      /* 64-bit result: can't widen further on 32-bit target.
-       * Use arithmetic overflow checks. */
-
-      /* Stack: a  b */
-      CType ll_type;
-      ll_type.ref = NULL;
-      ll_type.t = is_unsigned ? (VT_LLONG | VT_UNSIGNED) : VT_LLONG;
-      gen_cast(&ll_type); /* cast b */
-      vswap();
-      gen_cast(&ll_type); /* cast a */
-      vswap();
-      /* Stack: a  b (both widened) */
-
-      /* Save copies of a and b for the overflow check. */
-      vpushv(vtop);     /* Stack: a  b  b2 */
-      vrott(3);         /* Stack: b2  a  b */
-      vpushv(vtop - 1); /* Stack: b2  a  b  a2 */
-      vrott(4);         /* Stack: a2  b2  a  b */
-
-      gen_op(arith_tok); /* Stack: a2  b2  result */
-
-      /* For all cases except pure-unsigned mul, save a result copy. */
-      int need_result = !(is_unsigned && arith_tok == '*');
-      if (need_result)
-      {
-        vpushv(vtop); /* Stack: a2  b2  result  r2 */
-        vrott(3);     /* Stack: a2  b2  r2  result */
-      }
-
-      /* Discard the result (we don't store it for _overflow_p) */
-      vpop();
-      /* After pop:
-       *   need_result true:  a2  b2  r2
-       *   need_result false: a2  b2
-       */
-
-      if (is_unsigned && arith_tok == '+')
-      {
-        /* unsigned add overflow: result < a */
-        vswap();        /* a2  r2  b2 */
-        vpop();         /* a2  r2 */
-        vswap();        /* r2  a2 */
-        gen_op(TOK_LT); /* r2 < a2 */
-      }
-      else if (is_unsigned && arith_tok == '-')
-      {
-        /* unsigned sub overflow: a < result */
-        vswap();        /* a2  r2  b2 */
-        vpop();         /* a2  r2 */
-        gen_op(TOK_LT); /* a2 < r2 */
-      }
-      else if (!is_unsigned && arith_tok == '+')
-      {
-        /* signed add overflow: ((a ^ result) & (b ^ result)) < 0
-         *
-         * Note: after vrott(3)+vpop above, the actual stack layout is
-         *   a2  r2  b2  (vrott moves top to deepest in the 3-group).
-         * Indices below account for that layout. */
-        vpushv(vtop - 1); /* a2  r2  b2  r2copy */
-        vpushv(vtop - 1); /* a2  r2  b2  r2copy  b2copy */
-        gen_op('^');      /* a2  r2  b2  (r ^ b)  [== (b ^ r)] */
-        vpushv(vtop - 3); /* ...  (b^r)  a2 */
-        vpushv(vtop - 3); /* ...  (b^r)  a2  r2 */
-        gen_op('^');      /* a2  r2  b2  (b^r)  (a^r) */
-        gen_op('&');      /* a2  r2  b2  ((b^r) & (a^r)) */
-        vpushi(0);
-        gen_op(TOK_LT); /* a2  r2  b2  overflow_flag */
-        /* Discard unused copies */
-        vrott(4);
-        vpop();
-        vpop();
-        vpop();
-      }
-      else if (!is_unsigned && arith_tok == '-')
-      {
-        /* signed sub overflow: ((a ^ b) & (a ^ result)) < 0 */
-        vpushv(vtop - 2); /* a2  b2  r2  a3 */
-        vpushv(vtop - 2); /* a2  b2  r2  a3  b3 */
-        gen_op('^');      /* a2  b2  r2  xor_ab */
-        vpushv(vtop - 3); /* ...  xor_ab  a4 */
-        vpushv(vtop - 2); /* ...  xor_ab  a4  r3 */
-        gen_op('^');      /* a2  b2  r2  xor_ab  xor_ar */
-        gen_op('&');      /* a2  b2  r2  (xor_ab & xor_ar) */
-        vpushi(0);
-        gen_op(TOK_LT); /* overflow_flag  a2  b2  r2 */
-        /* Discard unused copies */
-        vrott(4);
-        vpop();
-        vpop();
-        vpop();
-      }
-      else if (is_unsigned && arith_tok == '*')
-      {
-        /* unsigned mul overflow: UINT64_MAX / (a | (a==0)) < b */
-        /* Stack: a2  b2 */
-        /* Compute a == 0 */
-        vpushv(vtop - 1); /* a2  b2  a3 */
-        vpushi(0);
-        gen_cast(&ll_type);
-        gen_op(TOK_EQ); /* a2  b2  (a3==0) */
-        /* Compute a3 | (a3==0) = safe_a */
-        vpushv(vtop - 2); /* a2  b2  (a==0)  a4 */
-        gen_op('|');      /* a2  b2  safe_a */
-        /* Push UINT64_MAX */
-        {
-          CType ull_type;
-          ull_type.t = VT_LLONG | VT_UNSIGNED;
-          ull_type.ref = NULL;
-          vpush(&ull_type);
-          vtop->r = VT_CONST;
-          vtop->c.i = -1;
-        }
-        /* Stack: a2  b2  safe_a  UINT64_MAX */
-        vswap();     /* a2  b2  UINT64_MAX  safe_a */
-        gen_op('/'); /* a2  b2  limit */
-        /* Check limit < b */
-        vswap();        /* a2  limit  b2 */
-        gen_op(TOK_LT); /* a2  (limit < b2) */
-        /* Discard a2 */
-        vswap();
-        vpop();
-      }
-      else
-      {
-        /* signed mul overflow: branchless division round-trip. */
-        CType sll;
-        sll.t = VT_LLONG;
-        sll.ref = NULL;
-
-        /* --- Compute safe_a = a + (a==0) + 2*(a==-1) --- */
-        /* Note: actual stack is a2  r2  b2 (vrott moves top to deepest) */
-        vpushv(vtop - 2); /* ...  a3 */
-        vpushi(0);
-        gen_cast(&sll);
-        gen_op(TOK_EQ);   /* ...  (a==0) */
-        vpushv(vtop - 3); /* ...  (a==0)  a4 */
-        vpush(&sll);
-        vtop->r = VT_CONST;
-        vtop->c.i = -1;
-        gen_op(TOK_EQ); /* ...  (a==0)  (a4==-1) */
-        vpushi(2);
-        gen_op('*');      /* ...  (a==0)  2*(a==-1) */
-        gen_op('+');      /* ...  adjustment */
-        vpushv(vtop - 3); /* ...  adj  a5 */
-        gen_op('+');      /* ...  safe_a */
-        /* Stack: a2  b2  r2  safe_a */
-
-        /* --- Compute div_check = (r2 / safe_a != b2) --- */
-        vpushv(vtop - 2); /* ...  safe_a  r3 */
-        vswap();          /* ...  r3  safe_a */
-        gen_op('/');      /* ...  quot */
-        vpushv(vtop - 1); /* ...  quot  b3 */
-        gen_op(TOK_NE);   /* ...  div_check */
-        /* Stack: a2  b2  r2  div_check */
-
-        /* --- Compute a_normal = (a != 0) & (a != -1) --- */
-        vpushv(vtop - 3); /* ...  div_check  a6 */
-        vpushi(0);
-        gen_cast(&sll);
-        gen_op(TOK_NE);   /* (a6 != 0) */
-        vpushv(vtop - 4); /* ...  (a!=0)  a7 */
-        vpush(&sll);
-        vtop->r = VT_CONST;
-        vtop->c.i = -1;
-        gen_op(TOK_NE); /* (a7 != -1) */
-        gen_op('&');    /* a_normal */
-        /* Stack: a2  b2  r2  div_check  a_normal */
-        gen_op('&'); /* base_ovf */
-        /* Stack: a2  b2  r2  base_ovf */
-
-        /* --- edge1 = (a == -1) & (b == LLONG_MIN) --- */
-        vpushv(vtop - 3); /* ...  base_ovf  a8 */
-        vpush(&sll);
-        vtop->r = VT_CONST;
-        vtop->c.i = -1;
-        gen_op(TOK_EQ);   /* (a8 == -1) */
-        vpushv(vtop - 2); /* ...  (a==-1)  b4 */
-        vpush(&sll);
-        vtop->r = VT_CONST;
-        vtop->c.i = (int64_t)((uint64_t)1 << 63); /* LLONG_MIN */
-        gen_op(TOK_EQ);                           /* (b4 == LLONG_MIN) */
-        gen_op('&');                              /* edge1 */
-        /* Stack: a2  r2  b2  base_ovf  edge1 */
-        gen_op('|');
-
-        /* --- edge2 = (b == -1) & (a == LLONG_MIN) --- */
-        vpushv(vtop - 1); /* ...  (base|e1)  b5 */
-        vpush(&sll);
-        vtop->r = VT_CONST;
-        vtop->c.i = -1;
-        gen_op(TOK_EQ);   /* (b5 == -1) */
-        vpushv(vtop - 4); /* ...  (b==-1)  a9 */
-        vpush(&sll);
-        vtop->r = VT_CONST;
-        vtop->c.i = (int64_t)((uint64_t)1 << 63);
-        gen_op(TOK_EQ); /* (a9 == LLONG_MIN) */
-        gen_op('&');    /* edge2 */
-        /* Stack: a2  b2  r2  (base|e1)  edge2 */
-        gen_op('|'); /* overflow */
-        /* Discard unused copies */
-        vrott(4);
-        vpop();
-        vpop();
-        vpop();
-      }
-
+      int sa = !(vtop[-1].type.t & VT_UNSIGNED), sb = !(vtop[0].type.t & VT_UNSIGNED);
+      int w = res_bt == VT_LLONG ? 64 : res_bt == VT_INT ? 32 : res_bt == VT_SHORT ? 16 : res_bt == VT_BYTE ? 8 : 1;
+      vpushi(0);
+      vrott(3); /* dummy  a  b */
+      ovf_exact(arith_tok, sa, sb, &dummy_type, is_unsigned, w, 0);
       break;
     }
 

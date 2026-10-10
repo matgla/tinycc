@@ -35,7 +35,7 @@ static int ir_has_backward_control_flow(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
       if (target >= 0 && target <= i)
         return 1;
     }
@@ -82,7 +82,7 @@ static void sav_build_def_map(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[j];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest || !sav_is_def_op(q->op))
       continue;
-    int32_t dvr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
     if (dvr < 0)
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -223,8 +223,7 @@ static int ir_resolve_stack_addr_value_ex(TCCIRState *ir, IROperand op, int at_i
     int is_def_of_vr = 0;
     if (q->op != TCCIR_OP_NOP && irop_config[q->op].has_dest && sav_is_def_op(q->op))
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      if (irop_get_vreg(dest) == vr)
+      if (tcc_ir_op_dest_vreg(ir, q) == vr)
         is_def_of_vr = 1;
     }
 
@@ -342,8 +341,8 @@ int tcc_ir_opt_stack_addr_simplify(TCCIRState *ir)
       {
         IROperand dest = tcc_ir_op_get_dest(ir, q);
         q->op = TCCIR_OP_ASSIGN;
-        tcc_ir_set_src1(ir, i, irop_make_imm32(-1, (int32_t)result, irop_get_btype(dest)));
-        tcc_ir_set_src2(ir, i, IROP_NONE);
+        tcc_ir_set_src1_imm32(ir, i, (int32_t)result, irop_get_btype(dest));
+        tcc_ir_set_src2_none(ir, i);
         changes++;
       }
     }
@@ -390,8 +389,7 @@ int tcc_ir_opt_cmp_stack_addr_fold(TCCIRState *ir)
     IRQuadCompact *next = &ir->compact_instructions[i + 1];
     if (next->op == TCCIR_OP_JUMPIF)
     {
-      IROperand cond = tcc_ir_op_get_src1(ir, next);
-      int tok = (int)irop_get_imm64_ex(ir, cond);
+      int tok = (int)tcc_ir_op_src1_imm(ir, next);
       int result = evaluate_compare_condition(0, 0, tok); /* equal-equal */
       if (result < 0)
         continue;
@@ -424,7 +422,7 @@ int tcc_ir_opt_cmp_stack_addr_fold(TCCIRState *ir)
       q->op = TCCIR_OP_NOP;
       next->op = TCCIR_OP_ASSIGN;
       tcc_ir_set_src1(ir, i + 1, chosen);
-      tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+      tcc_ir_set_src2_none(ir, i + 1);
       changes++;
     }
   }

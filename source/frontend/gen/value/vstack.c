@@ -75,6 +75,7 @@ void vsetc(CType *type, int r, CValue *vc)
   vtop->volatile_access = 0; /* likewise: volatility derives from the fresh type */
   vtop->pr1_reg = PREG_REG_NONE;
   vtop->pr1_spilled = 0;
+  vtop->sso_reversed = 0;
   vtop->sym = NULL;
   /* Note: jtrue/jfalse are in a union with c, so we DON'T initialize them here.
      They should only be used when r == VT_CMP, and c is used otherwise. */

@@ -168,6 +168,14 @@ static int kb_lval_stack_off(const TCCIRState *ir, IROperand op,
     *out_off = (int32_t)irop_get_imm64_ex(ir, op);
     return 1;
   }
+  /* A vreg named through its STACKOFF home with is_lval set is the variable
+   * reading its OWN value, not a dereference of it: `T48 <-- V7 [LOAD]` copies
+   * the pointer V7 holds.  Resolving it through var_addr answered with the
+   * slot V7 points at, so the copy became that slot's contents (the vfmt
+   * argument slice got the value 2048 where its element address belonged).
+   * A real dereference is a VREG-tagged lval, or is_llocal. */
+  if (op.tag == IROP_TAG_STACKOFF && irop_get_vreg(op) >= 0 && op.is_lval && !op.is_llocal)
+    return 0;
   if (op.is_lval)
   {
     int32_t vr = irop_get_vreg(op);
@@ -175,6 +183,22 @@ static int kb_lval_stack_off(const TCCIRState *ir, IROperand op,
                             current_gen, out_off);
   }
   return 0;
+}
+
+/* The vreg whose own value OP reads, or -1 when OP dereferences it.  A VAR
+ * named through its STACKOFF home with is_lval reads its own value (see
+ * kb_lval_stack_off); any other lval vreg is `*vreg`. */
+static int32_t kb_vreg_value_of(IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0 || op.is_sym)
+    return -1;
+  if (!op.is_lval)
+    return vr;
+  if (op.tag == IROP_TAG_STACKOFF && !op.is_llocal &&
+      TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
+    return vr;
+  return -1;
 }
 
 /* Resolve a base pointer operand (e.g. STORE_INDEXED base) to a concrete
@@ -190,7 +214,7 @@ static int kb_base_stack_off(const TCCIRState *ir, IROperand base,
     *out_off = (int32_t)irop_get_imm64_ex(ir, base);
     return 1;
   }
-  return vreg_addr_lookup(irop_get_vreg(base), tmp_kb, max_tmp_pos, var_addr,
+  return vreg_addr_lookup(kb_vreg_value_of(base), tmp_kb, max_tmp_pos, var_addr,
                           max_var_pos, current_gen, out_off);
 }
 
@@ -213,8 +237,7 @@ static int kb_call_exposes_stack_addr(TCCIRState *ir, int call_i,
                                       const VregAddrKB *var_addr,
                                       int max_var_pos, int current_gen)
 {
-  IROperand call_meta = tcc_ir_op_get_src2(ir, &ir->compact_instructions[call_i]);
-  int argc = TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, call_meta));
+  int argc = TCCIR_DECODE_CALL_ARGC((uint32_t)tcc_ir_op_src2_imm(ir, &ir->compact_instructions[call_i]));
 
   for (int p = 0; p < argc; p++)
   {
@@ -242,8 +265,7 @@ static int kb_operand_depends_on_tmp(const TCCIRState *ir, int start, int end,
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(dest) != vr || dest.is_lval)
+    if (tcc_ir_op_dest_vreg(ir, q) != vr || tcc_ir_op_dest_is_lval(ir, q))
       continue;
 
     if (irop_config[q->op].has_src1 &&
@@ -398,6 +420,11 @@ static int kb_operand_const_u64(const TCCIRState *ir, const IROperand *op,
   if (op->is_lval)
   {
     int32_t stack_off;
+    /* a volatile object holds whatever the next read returns, not what was
+     * last stored to it -- `volatile char b[4]` lives in the frame like any
+     * other slot, but its reads must stay */
+    if (tcc_ir_access_is_volatile(ir, *op))
+      return 0;
     if (!kb_lval_stack_off(ir, *op, tmp_kb, max_tmp_pos, var_addr, max_var_pos,
                            current_gen, &stack_off))
       return 0;
@@ -578,6 +605,10 @@ static int kb_operand(const TCCIRState *ir, IROperand op,
 {
   *out_kz = 0;
   *out_ko = 0;
+
+  /* A volatile read knows nothing about its value (see the constant lookup). */
+  if (op.is_lval && tcc_ir_access_is_volatile(ir, op))
+    return 0;
 
   /* Direct StackLoc[X] lval — reading the slot's current value.
    * Must have no real vreg: a VAR/TEMP/PARAM with STACKOFF tag
@@ -815,8 +846,7 @@ static void *kb_begin(IROptCtx *ctx)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t vr = irop_get_vreg(dest);
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     int type = TCCIR_DECODE_VREG_TYPE(vr);
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
     if (type == TCCIR_VREG_TYPE_TEMP && pos > max_tmp_pos)
@@ -841,7 +871,7 @@ static void *kb_begin(IROptCtx *ctx)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
       if (target >= 0 && target <= i && target < n)
         st->backedge_target[target] = 1;
     }
@@ -910,7 +940,8 @@ static void kb_dest_track_var_addr(KBState *st, TCCIRState *ir, int op,
 
 /* TMP dest holding Addr[StackLoc]: direct LEA/ASSIGN, an ASSIGN copy of another
  * address temp, or an ADD/SUB of a constant onto such a temp.  Returns 1 when a
- * stack-offset fact was recorded (dest fully consumed). */
+ * stack-offset fact was recorded (dest fully consumed).  `T <-- Taddr***DEREF***`
+ * holds what is stored AT the address, not the address. */
 static int kb_dest_track_tmp_addr(KBState *st, TCCIRState *ir, int op, int dpos,
                                   IROperand s1_raw, IROperand s2_raw)
 {
@@ -929,7 +960,7 @@ static int kb_dest_track_tmp_addr(KBState *st, TCCIRState *ir, int op, int dpos,
   if (op == TCCIR_OP_ASSIGN)
   {
     int32_t off;
-    if (vreg_addr_lookup(irop_get_vreg(s1_raw), st->tmp_kb, st->max_tmp_pos,
+    if (vreg_addr_lookup(kb_vreg_value_of(s1_raw), st->tmp_kb, st->max_tmp_pos,
                          st->var_addr, st->max_var_pos, st->current_gen, &off))
     {
       st->tmp_kb[dpos].gen = st->current_gen;
@@ -945,7 +976,7 @@ static int kb_dest_track_tmp_addr(KBState *st, TCCIRState *ir, int op, int dpos,
       irop_is_immediate(s2_raw) && !s2_raw.is_sym && !s2_raw.is_lval)
   {
     int32_t off;
-    if (vreg_addr_lookup(irop_get_vreg(s1_raw), st->tmp_kb, st->max_tmp_pos,
+    if (vreg_addr_lookup(kb_vreg_value_of(s1_raw), st->tmp_kb, st->max_tmp_pos,
                          st->var_addr, st->max_var_pos, st->current_gen, &off))
     {
       int64_t delta = irop_get_imm64_ex(ir, s2_raw);
@@ -1013,7 +1044,7 @@ static int kb_dest_try_const_fold(KBState *st, TCCIRState *ir, int i, int op,
   {
     q->op = TCCIR_OP_ASSIGN;
     tcc_ir_set_src1(ir, i, imm);
-    tcc_ir_set_src2(ir, i, IROP_NONE);
+    tcc_ir_set_src2_none(ir, i);
     (*changes)++;
   }
   st->tmp_kb[dpos].gen = st->current_gen;
@@ -1281,7 +1312,7 @@ static int kb_dest_scalar_compute(KBState *st, TCCIRState *ir, int i, int op,
         {
           q->op = TCCIR_OP_ASSIGN;
           tcc_ir_set_src1(ir, i, keep);
-          tcc_ir_set_src2(ir, i, IROP_NONE);
+          tcc_ir_set_src2_none(ir, i);
           LOG_IR_GEN("OPTIMIZE: knownbits AND #%x identity -> copy at i=%d (kz=%08x)",
                      mask, i, kz);
           changes++;
@@ -1320,7 +1351,7 @@ static int kb_dest_scalar_compute(KBState *st, TCCIRState *ir, int i, int op,
         imm.is_unsigned = dest.is_unsigned;
         q->op = TCCIR_OP_ASSIGN;
         tcc_ir_set_src1(ir, i, imm);
-        tcc_ir_set_src2(ir, i, IROP_NONE);
+        tcc_ir_set_src2_none(ir, i);
         st->tmp_kb[dpos].gen = st->current_gen;
         st->tmp_kb[dpos].kz = 0xFFFFFFFFu;
         st->tmp_kb[dpos].ko = 0;
@@ -1363,7 +1394,7 @@ static int kb_dest_scalar_compute(KBState *st, TCCIRState *ir, int i, int op,
         imm.is_unsigned = dest.is_unsigned;
         q->op = TCCIR_OP_ASSIGN;
         tcc_ir_set_src1(ir, i, imm);
-        tcc_ir_set_src2(ir, i, IROP_NONE);
+        tcc_ir_set_src2_none(ir, i);
         LOG_IR_GEN(
             "OPTIMIZE: knownbits fold TMP:%d = #%d at i=%d (kz=%08x ko=%08x)",
             dpos, val, i, dkz, dko);
@@ -1483,7 +1514,7 @@ static void kb_fold_fallthrough_setif(TCCIRState *ir, int k, int n)
   IRQuadCompact *setif_q = &ir->compact_instructions[k];
   if (setif_q->op != TCCIR_OP_SETIF || setif_q->is_jump_target)
     return;
-  int setif_tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, setif_q));
+  int setif_tok = (int)tcc_ir_op_src1_imm(ir, setif_q);
   int setif_result = (setif_tok == 0x95) ? 1 : (setif_tok == 0x94) ? 0 : -1;
   if (setif_result < 0)
     return;
@@ -1491,7 +1522,7 @@ static void kb_fold_fallthrough_setif(TCCIRState *ir, int k, int n)
   IROperand imm = irop_make_imm32(-1, setif_result, irop_get_btype(dest));
   setif_q->op = TCCIR_OP_ASSIGN;
   tcc_ir_set_src1(ir, k, imm);
-  tcc_ir_set_src2(ir, k, IROP_NONE);
+  tcc_ir_set_src2_none(ir, k);
 }
 
 OPT_GEN_FLAT(kb_store, TCCIR_OP_STORE)
@@ -1653,7 +1684,7 @@ OPT_GEN_FLAT(kb_test_zero, TCCIR_OP_TEST_ZERO)
     return 0;
 
   IRQuadCompact *jq = &ir->compact_instructions[j];
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, jq);
   int branch_taken;
   if (tok == 0x94)
     branch_taken = 0;
@@ -1693,8 +1724,7 @@ static int kb_cmp_fold_lval_operands(KBState *st, TCCIRState *ir, int i,
       continue;
     if (si == 1 && !irop_config[TCCIR_OP_CMP].has_src2)
       continue;
-    IROperand sop = (si == 0) ? tcc_ir_op_get_src1(ir, q)
-                              : tcc_ir_op_get_src2(ir, q);
+    IROperand sop = tcc_ir_op_get_src1_or_2(ir, q, si != 0);
     if (!sop.is_lval)
       continue;
     int sop_btype = irop_get_btype(sop);
@@ -1751,12 +1781,11 @@ static int kb_cmp_fold_sign_branch(KBState *st, TCCIRState *ir, int i,
 {
   int n = st->n;
   IROperand cmp_src1 = tcc_ir_op_get_src1(ir, q);
-  IROperand cmp_src2 = tcc_ir_op_get_src2(ir, q);
   uint32_t kz, ko;
   if (!(irop_get_btype(cmp_src1) == IROP_BTYPE_INT32 &&
-        irop_get_btype(cmp_src2) == IROP_BTYPE_INT32 &&
-        irop_is_immediate(cmp_src2) && !cmp_src2.is_sym &&
-        irop_get_imm64_ex(ir, cmp_src2) == 0 &&
+        tcc_ir_op_src2_btype(ir, q) == IROP_BTYPE_INT32 &&
+        tcc_ir_op_src2_is_imm(ir, q) && !tcc_ir_op_src2_is_sym(ir, q) &&
+        tcc_ir_op_src2_imm(ir, q) == 0 &&
         kb_operand(ir, cmp_src1, st->tmp_kb, st->max_tmp_pos, st->current_gen,
                    st->var_addr, st->max_var_pos,
                    st->stack_slots, st->n_stack_slots, &kz, &ko)))
@@ -1768,7 +1797,7 @@ static int kb_cmp_fold_sign_branch(KBState *st, TCCIRState *ir, int i,
     return 0;
 
   IRQuadCompact *jq = &ir->compact_instructions[j];
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, jq);
   int branch_taken = kb_cmp_sign_branch_taken((ko >> 31) & 1u, (kz >> 31) & 1u,
                                               ko != 0, tok);
   if (branch_taken < 0)
@@ -1820,7 +1849,7 @@ static int kb_cmp_fold_const_eq_neq(KBState *st, TCCIRState *ir, int i,
         !ir->compact_instructions[j].is_jump_target))
     return 0;
   IRQuadCompact *jq = &ir->compact_instructions[j];
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, jq);
   int branch_taken;
   if (tok == 0x94)       /* EQ: x == C is impossible -> never taken */
     branch_taken = 0;

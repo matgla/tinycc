@@ -23,6 +23,132 @@
 
 #include "gen_priv.h"
 
+/* Byte-swap vtop, converted to the unsigned integer of `size` bytes (2, 4 or
+   8): the __builtin_bswap16/32/64 lowering, also used for the members of a
+   scalar_storage_order("big-endian") aggregate. */
+void gen_bswap(int size)
+{
+  CType result_type;
+  result_type.t = (size == 2)   ? (VT_SHORT | VT_UNSIGNED)
+                  : (size == 4) ? (VT_INT | VT_UNSIGNED)
+                                : (VT_LLONG | VT_UNSIGNED);
+  result_type.ref = NULL;
+
+  /* Check if argument is a compile-time constant */
+  if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop->r & VT_SYM))
+  {
+    /* Apply the builtin's unsigned parameter conversion before folding.
+     * In particular, a negative signed int/short must be sign-extended to
+     * the parameter width before it is reinterpreted as unsigned. */
+    gen_cast(&result_type);
+    uint64_t val = vtop->c.i;
+
+    /* Perform byte swap */
+    uint64_t result = 0;
+    if (size == 2)
+    {
+      result = ((val & 0x00FF) << 8) | ((val & 0xFF00) >> 8);
+      result = (uint16_t)result;
+    }
+    else if (size == 4)
+    {
+      result = ((val & 0x000000FF) << 24) | ((val & 0x0000FF00) << 8) | ((val & 0x00FF0000) >> 8) |
+               ((val & 0xFF000000) >> 24);
+      result = (uint32_t)result;
+    }
+    else
+    {
+      result = ((val & 0x00000000000000FFULL) << 56) | ((val & 0x000000000000FF00ULL) << 40) |
+               ((val & 0x0000000000FF0000ULL) << 24) | ((val & 0x00000000FF000000ULL) << 8) |
+               ((val & 0x000000FF00000000ULL) >> 8) | ((val & 0x0000FF0000000000ULL) >> 24) |
+               ((val & 0x00FF000000000000ULL) >> 40) | ((val & 0xFF00000000000000ULL) >> 56);
+    }
+
+    vtop--;
+
+    /* Push result with appropriate type */
+    vpush(&result_type);
+    vtop->r = VT_CONST;
+    vtop->c.i = result;
+  }
+  else
+  {
+    /* For runtime values, generate inline byte swap using shifts and ORs */
+    /* For bswap64 on 32-bit target with unsigned ≤32-bit argument:
+     * bswap64(zext(x32)) = bswap32(x32) << 32.
+     * Decompose to avoid __bswapdi3 call and expose the zero low-word
+     * to the optimizer. */
+    int bswap64_from_small = 0;
+#if PTR_SIZE == 4
+    if (size == 8 && (vtop->type.t & VT_BTYPE) != VT_LLONG && (vtop->type.t & VT_UNSIGNED))
+      bswap64_from_small = 1;
+#endif
+
+    if (bswap64_from_small)
+    {
+      CType uint32_type;
+      uint32_type.t = VT_INT | VT_UNSIGNED;
+      uint32_type.ref = NULL;
+      gen_cast(&uint32_type);
+      if (tcc_machine_has_bit_ops())
+        gen_bitop1(TCCIR_OP_REV);
+      else
+        gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
+      vpushi(0);
+      vswap();
+      lbuild(VT_LLONG | VT_UNSIGNED);
+    }
+    else
+    {
+      /* Cast to appropriate unsigned type */
+      gen_cast(&result_type);
+
+      if (size == 2)
+      {
+        /* bswap16: widen to 32 bits first, then swap. */
+        CType uint32_type;
+        uint32_type.t = VT_INT | VT_UNSIGNED;
+        uint32_type.ref = NULL;
+        gen_cast(&uint32_type);
+
+        if (tcc_machine_has_bit_ops())
+        {
+          /* REV16 swaps the bytes inside each halfword, so the swapped value
+             of the zero-extended input already sits in the low halfword. */
+          gen_bitop1(TCCIR_OP_REV16);
+        }
+        else
+        {
+          /* Call __bswapsi2 library function using IR */
+          gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
+
+          /* Shift right by 16 to get the swapped 16-bit value in the low bits */
+          /* Actually, for a 16-bit value 0xABCD, bswap32 gives 0xCDAB0000,
+             so we need to shift right by 16 to get 0x0000CDAB */
+          vpushi(16);
+          gen_op(TOK_SHR);
+        }
+
+        /* Cast back to uint16 */
+        gen_cast(&result_type);
+      }
+      else if (size == 4)
+      {
+        if (tcc_machine_has_bit_ops())
+          gen_bitop1(TCCIR_OP_REV);
+        else /* bswap32: call __bswapsi2 library function */
+          gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
+      }
+      else
+      {
+        /* bswap64: emit as library call (complex on 32-bit ARM) */
+        /* Call __bswapdi3 library function using IR */
+        gen_builtin_libcall(TOK___bswapdi3, 1, VT_LLONG | VT_UNSIGNED);
+      }
+    }
+  }
+}
+
 /* Extracted from unary_builtin_fp() to reduce stack frame size. */
 void __attribute__((noinline)) unary_builtin_fp2(void)
 {
@@ -38,6 +164,22 @@ void __attribute__((noinline)) unary_builtin_fp2(void)
 
     /* See an inlined parameter that was bound to a constant arg through. */
     inline_subst_const_arg(vtop);
+
+    /* The parameter type of the builtin decides the conversion: fabs/fabsl
+     * take a double, fabsf a float.  Converting before anything else means an
+     * integer argument reaches the libm helper as a real double (r0:r1)
+     * instead of an integer in r0 with a leftover high word, and a constant
+     * integer is folded by the branch below. */
+    {
+      int arg_bt0 = vtop->type.t & VT_BTYPE;
+      if (arg_bt0 != VT_FLOAT && arg_bt0 != VT_DOUBLE && arg_bt0 != VT_LDOUBLE)
+      {
+        CType pt;
+        pt.t = (tok1 == TOK_builtin_fabsf) ? VT_FLOAT : VT_DOUBLE;
+        pt.ref = NULL;
+        gen_cast(&pt);
+      }
+    }
 
     /* Check if argument is a compile-time constant */
     int bt = vtop->type.t & VT_BTYPE;
@@ -285,6 +427,27 @@ void __attribute__((noinline)) unary_builtin_fp2(void)
 
     int is_float = (tok1 == TOK_builtin_fmaxf || tok1 == TOK_builtin_fminf);
     int is_max = (tok1 == TOK_builtin_fmax || tok1 == TOK_builtin_fmaxf || tok1 == TOK_builtin_fmaxl);
+
+    /* Both parameters are floating: convert an operand that is not (an int, a
+     * long long) to the builtin's parameter type before folding or calling the
+     * helper, otherwise its value reaches r0 with a leftover high word and the
+     * helper compares garbage. */
+    {
+      CType pt;
+      pt.t = is_float ? VT_FLOAT : VT_DOUBLE;
+      pt.ref = NULL;
+      int bt_x0 = vtop[-1].type.t & VT_BTYPE, bt_y0 = vtop[0].type.t & VT_BTYPE;
+      if (bt_x0 != VT_FLOAT && bt_x0 != VT_DOUBLE && bt_x0 != VT_LDOUBLE)
+      {
+        SValue tmp = vtop[0];
+        vtop[0] = vtop[-1];
+        gen_cast(&pt);
+        vtop[-1] = vtop[0];
+        vtop[0] = tmp;
+      }
+      if (bt_y0 != VT_FLOAT && bt_y0 != VT_DOUBLE && bt_y0 != VT_LDOUBLE)
+        gen_cast(&pt);
+    }
 
     /* Check if both arguments are constants */
     int bt_x = vtop[-1].type.t & VT_BTYPE;
@@ -602,154 +765,7 @@ void __attribute__((noinline)) unary_builtin_fp2(void)
     else if (tok1 == TOK_builtin_bswap32)
       size = 4;
 
-    /* Check if argument is a compile-time constant */
-    if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST && !(vtop->r & VT_SYM))
-    {
-      uint64_t val;
-      int bt = vtop->type.t & VT_BTYPE;
-
-      /* Extract the constant value based on type */
-      if (bt == VT_LLONG)
-      {
-        val = vtop->c.i;
-      }
-      else if (bt == VT_INT)
-      {
-        val = (uint32_t)vtop->c.i;
-      }
-      else if (bt == VT_SHORT)
-      {
-        val = (uint16_t)vtop->c.i;
-      }
-      else
-      {
-        val = (uint64_t)vtop->c.i;
-      }
-
-      /* Perform byte swap */
-      uint64_t result = 0;
-      if (size == 2)
-      {
-        result = ((val & 0x00FF) << 8) | ((val & 0xFF00) >> 8);
-        result = (uint16_t)result;
-      }
-      else if (size == 4)
-      {
-        result = ((val & 0x000000FF) << 24) | ((val & 0x0000FF00) << 8) | ((val & 0x00FF0000) >> 8) |
-                 ((val & 0xFF000000) >> 24);
-        result = (uint32_t)result;
-      }
-      else
-      {
-        result = ((val & 0x00000000000000FFULL) << 56) | ((val & 0x000000000000FF00ULL) << 40) |
-                 ((val & 0x0000000000FF0000ULL) << 24) | ((val & 0x00000000FF000000ULL) << 8) |
-                 ((val & 0x000000FF00000000ULL) >> 8) | ((val & 0x0000FF0000000000ULL) >> 24) |
-                 ((val & 0x00FF000000000000ULL) >> 40) | ((val & 0xFF00000000000000ULL) >> 56);
-      }
-
-      vtop--;
-
-      /* Push result with appropriate type */
-      CType result_type;
-      result_type.t = (size == 2)   ? (VT_SHORT | VT_UNSIGNED)
-                      : (size == 4) ? (VT_INT | VT_UNSIGNED)
-                                    : (VT_LLONG | VT_UNSIGNED);
-      result_type.ref = NULL;
-      vpush(&result_type);
-      vtop->r = VT_CONST;
-      vtop->c.i = result;
-    }
-    else
-    {
-      /* For runtime values, generate inline byte swap using shifts and ORs */
-      CType result_type;
-      if (size == 2)
-      {
-        result_type.t = VT_SHORT | VT_UNSIGNED;
-      }
-      else if (size == 4)
-      {
-        result_type.t = VT_INT | VT_UNSIGNED;
-      }
-      else
-      {
-        result_type.t = VT_LLONG | VT_UNSIGNED;
-      }
-      result_type.ref = NULL;
-
-      /* For bswap64 on 32-bit target with unsigned ≤32-bit argument:
-       * bswap64(zext(x32)) = bswap32(x32) << 32.
-       * Decompose to avoid __bswapdi3 call and expose the zero low-word
-       * to the optimizer. */
-      int bswap64_from_small = 0;
-#if PTR_SIZE == 4
-      if (size == 8 && (vtop->type.t & VT_BTYPE) != VT_LLONG && (vtop->type.t & VT_UNSIGNED))
-        bswap64_from_small = 1;
-#endif
-
-      if (bswap64_from_small)
-      {
-        CType uint32_type;
-        uint32_type.t = VT_INT | VT_UNSIGNED;
-        uint32_type.ref = NULL;
-        gen_cast(&uint32_type);
-        if (tcc_machine_has_bit_ops())
-          gen_bitop1(TCCIR_OP_REV);
-        else
-          gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
-        vpushi(0);
-        vswap();
-        lbuild(VT_LLONG | VT_UNSIGNED);
-      }
-      else
-      {
-        /* Cast to appropriate unsigned type */
-        gen_cast(&result_type);
-
-        if (size == 2)
-        {
-          /* bswap16: widen to 32 bits first, then swap. */
-          CType uint32_type;
-          uint32_type.t = VT_INT | VT_UNSIGNED;
-          uint32_type.ref = NULL;
-          gen_cast(&uint32_type);
-
-          if (tcc_machine_has_bit_ops())
-          {
-            /* REV16 swaps the bytes inside each halfword, so the swapped value
-               of the zero-extended input already sits in the low halfword. */
-            gen_bitop1(TCCIR_OP_REV16);
-          }
-          else
-          {
-            /* Call __bswapsi2 library function using IR */
-            gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
-
-            /* Shift right by 16 to get the swapped 16-bit value in the low bits */
-            /* Actually, for a 16-bit value 0xABCD, bswap32 gives 0xCDAB0000,
-               so we need to shift right by 16 to get 0x0000CDAB */
-            vpushi(16);
-            gen_op(TOK_SHR);
-          }
-
-          /* Cast back to uint16 */
-          gen_cast(&result_type);
-        }
-        else if (size == 4)
-        {
-          if (tcc_machine_has_bit_ops())
-            gen_bitop1(TCCIR_OP_REV);
-          else /* bswap32: call __bswapsi2 library function */
-            gen_builtin_libcall(TOK___bswapsi2, 1, VT_INT | VT_UNSIGNED);
-        }
-        else
-        {
-          /* bswap64: emit as library call (complex on 32-bit ARM) */
-          /* Call __bswapdi3 library function using IR */
-          gen_builtin_libcall(TOK___bswapdi3, 1, VT_LLONG | VT_UNSIGNED);
-        }
-      }
-    }
+    gen_bswap(size);
     break;
   }
   }

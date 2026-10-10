@@ -31,21 +31,22 @@ int tcc_ir_opt_small_memset_to_store(TCCIRState *ir)
     if (q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
 
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
     const char *name = get_tok_str(callee->v, NULL);
     if (!name)
       continue;
-    if (strcmp(name, "__aeabi_memset") != 0 && strcmp(name, "memset") != 0)
+    int size_idx, fill_idx;
+    if (!ir_opt_memset_params(name, &size_idx, &fill_idx))
       continue;
 
     IROperand p_dst, p_size, p_fill;
     if (!ir_opt_get_call_param_operand(ir, i, 0, &p_dst))
       continue;
-    if (!ir_opt_get_call_param_operand(ir, i, 1, &p_size))
+    if (!ir_opt_get_call_param_operand(ir, i, size_idx, &p_size))
       continue;
-    if (!ir_opt_get_call_param_operand(ir, i, 2, &p_fill))
+    if (!ir_opt_get_call_param_operand(ir, i, fill_idx, &p_fill))
       continue;
 
     /* Fill must be 0 */
@@ -109,14 +110,13 @@ int tcc_ir_opt_small_memset_to_store(TCCIRState *ir)
     int extra_store_idx = -1;
     if (nchunks == 2)
     {
-      int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      int call_id = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
       for (int j = i - 1; j >= 0; j--)
       {
         IRQuadCompact *pq = &ir->compact_instructions[j];
         if (pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID)
           continue;
-        IROperand enc = tcc_ir_op_get_src2(ir, pq);
-        if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, enc)) != call_id)
+        if (TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, pq)) != call_id)
           continue;
         extra_store_idx = j;
         break;

@@ -9,12 +9,12 @@
 ┌─────────────────────────────────────────────────────────┐
 │  User code: OPT_GEN_SSA(my_pass, OP) { ... }            │
 ├─────────────────────────────────────────────────────────┤
-│  L1 — Pattern grammar (PATTERN / GUARD / REWRITE)       │
+│  L1 — Rule grammar (MATCH / BIND / GUARD / REWRITE)     │
 │  L2 — Generator table entry (OPT_GEN_ENTRY)             │
 │  L3 — Pass descriptor (existing pipeline, no change)    │
 ├─────────────────────────────────────────────────────────┤
-│  Helpers: constraint checks, guard DSL, rewrite API     │
-│  Types: constraint enums, spec structs                  │
+│  Helpers: guard DSL, operand builders, setters          │
+│  Types: PAIR spec                                       │
 └─────────────────────────────────────────────────────────┘
          │
          ▼
@@ -25,9 +25,9 @@
 
 | File | Purpose |
 |------|---------|
-| `opt_dsl.h` | Main header — `OPT_GEN_SSA` / `OPT_GEN_FLAT` / `PATTERN` / `GUARD` / `REWRITE` |
-| `opt_dsl_types.h` | Type definitions: `IROptConstraint`, `IROptPatternSpec`, `IROptRewriteSpec` |
-| `opt_dsl_helpers.h` | Helper macros: binding accessors, constraint checks, guard DSL, rewrite API |
+| `opt_dsl.h` | Main header — `OPT_GEN_SSA` / `OPT_GEN_FLAT` / `MATCH` / `BIND*` / `GUARD` / `REWRITE` + setters |
+| `opt_dsl_types.h` | Type definitions: `IRPairLink`, `IROptPairSpec` |
+| `opt_dsl_helpers.h` | Helper macros: read accessors, `mk_imm`, guard DSL, `OPT_DSL_OUTLINE` |
 | `opt_dsl_entry.h` | Table entry macros: `OPT_GEN_ENTRY`, `OPT_GEN_ENTRY_FLAT`, `OPT_DSL_TABLE_COUNT` |
 | `opt_dsl_ssa.h` | SSA-only cross-instruction (def-use) support: `PAIR` / `RETIRE_PAIR` |
 | `opt_dsl_phi.h` | SSA phi rules and fixed-point CFG traversal |
@@ -45,28 +45,48 @@
 
 ```c
 #include "ir.h"
-#include "opt/optimization_dsl.h"
+#include "opt_dsl.h"
 
-OPT_GEN_SSA(my_pass, TCCIR_OP_MUL) {
-  PATTERN(
-    .constraints = { .src1 = IR_CONSTRAINT_VREG,
-                     .src2 = IR_CONSTRAINT_IMM });
+OPT_GEN_SSA(sr_udiv, TCCIR_OP_UDIV) {
+  int shift = 0;
+  MATCH();
+  BIND(src2);
   GUARD(
-    when(ir_op_any(q->op, IROP_P_ALU))
-    and(is_power_of_two(imm(src2))));
-  REWRITE(
-    .new_op = TCCIR_OP_SHL,
-    .src2   = imm(ctz64(imm(src2))));
+    when(is_imm32(src2));
+    and(is_power_of_2_shift((uint32_t)src2.u.imm32, &shift)));
+  REWRITE(set_op(TCCIR_OP_SHR), set_src2_imm(shift, IROP_BTYPE_INT32));
 }
 
 const IRSSAOptGen my_pass_gens[] = {
-  OPT_GEN_ENTRY(my_pass, TCCIR_OP_MUL),
+  OPT_GEN_ENTRY(sr_udiv, TCCIR_OP_UDIV),
 };
 ```
 
+- **`MATCH()`** opens the body: binds `ir`, `q` and the guard flag, nothing else.
+- **`BIND(slot)`** binds `dest` / `src1` / `src2` (by value) where the rule
+  reads it; `BIND_IMM` / `BIND_VREG` / `BIND_STACKOFF` also bail unless the
+  operand is an immediate / a vreg / a STACKOFF.  Bind at the top of the rule,
+  before anything mutates instruction `i`.  A check a later guard already
+  implies (e.g. `is_imm32` after `BIND_IMM`) is dropped: plain `BIND`.
+- **`GUARD(when(..); and(..); and_not(..))`** returns 0 at the first failing
+  clause.
+- **`REWRITE(...)`** applies its setters in argument order, then returns 1:
+  `set_op(op)`, `set_dest(v)`, `set_src1(v)`, `set_src2(v)`;
+  `set_srcN_imm(v, bt)` is `set_srcN(mk_imm_bt(v, bt))` and `set_srcN_ref(x)`
+  passes an lvalue operand by address — both are one small call per site.
+  Order matters: `tcc_ir_set_srcN` look up the slot layout of the *current*
+  opcode, and an argument expression that reads `q->op` sees the new opcode
+  once `set_op` ran — compute such values before `REWRITE`.  A setter is
+  unconditional: never pass an operand that may be `IROP_NONE`.
+
+The generated code is plain calls — no spec structs and no run-time tag tests.
+Small shared helpers carry `OPT_DSL_OUTLINE` (`noinline` under tcc, which would
+otherwise inline them at every call; one out-of-line copy per TU is smaller on
+the device).
+
 ## SSA cross-instruction peepholes (`PAIR` / `RETIRE_PAIR`)
 
-`PATTERN`/`GUARD`/`REWRITE` are single-instruction: they cannot look at the SSA
+`MATCH`/`GUARD`/`REWRITE` are single-instruction: they cannot look at the SSA
 def of a source operand or maintain use lists. Def-use peepholes — "the producer
 of my src1 is a SHL, fold the pair" — used to stay hand-written. `opt_dsl_ssa.h`
 (SSA engine only; include after `ir.h` + `ssa_opt.h`) closes that gap with two
@@ -74,28 +94,33 @@ macros that bracket the rewrite:
 
 ```c
 OPT_GEN_SSA(narrow_ubfx, TCCIR_OP_UBFX) {
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = TCCIR_OP_SHR, .single_use = 1);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(when(is_imm32(src2) && is_imm32(psrc2)));
   /* ... read psrc1/psrc2, compute the merged field ... */
   RETIRE_PAIR(psrc1, /*delete_second=*/1);   /* SHR is now dead */
-  REWRITE(.new_op = TCCIR_OP_UBFX, .src1 = psrc1, .src2 = mk_imm(...));
+  REWRITE(set_op(TCCIR_OP_UBFX), set_src1_ref(psrc1), set_src2(mk_imm(...)));
 }
 ```
 
-- **`PAIR(.link, .op, .single_use)`** — placed right after `PATTERN`. Resolves
+- **`PAIR(.link, .op, .single_use)`** — placed after `MATCH`/`BIND`. Resolves
   the linked source (`IR_PAIR_DEF_OF_SRC1` / `_SRC2`) to its single-def TEMP-vreg
   producer, checks the producer opcode (`.op = -1` for any) and, if `.single_use`,
   that its result has exactly one use. Bails the dispatch on any miss, else binds
-  `pidx` / `pop` / `pvi` / `pdest` / `psrc1` / `psrc2`.
+  `pidx` / `pop` / `pvi`.
+- **`PBIND(slot)`** — directly after `PAIR`, binds the producer's
+  `dest`/`src1`/`src2` as `pdest`/`psrc1`/`psrc2` (only the ones the rule reads).
 - **`RETIRE_PAIR(new_linked, delete_second)`** — called once guards pass, just
   before `REWRITE`, when the rewrite forwards instruction `i` past the producer
   (its linked source becomes `new_linked`). `delete_second = 1` when the producer
   was used only here (it dies: use count zeroed + NOP'd); `= 0` to just drop the
   single use edge (the producer may survive, or is left for DCE).
 
-The single-instruction macros are unchanged, so this is opt-in — passes that
-don't call `PAIR` are unaffected. Reference: `source/opt/ssa/narrow.c`.
+Passes that don't call `PAIR` are unaffected. Reference:
+`source/opt/ssa/scalar/narrow.c`.
 
 ## Multi-rule generators (`opt_dsl_chain`) and use-edge helpers
 
@@ -115,19 +140,19 @@ Steps that must *stop* the chain regardless of success (e.g. a barrel-annotated
 op that may only const-fold) stay as explicit `return dispatch(...)` lines in
 the chain function. Rules whose reachability depended on an earlier terminal
 must encode it locally in their GUARD (see `fold_identity_src2`'s
-both-imm exclusion in `source/opt/ssa/fold.c`).
+both-imm exclusion in `source/opt/ssa/scalar/fold.c`).
 
 For rewrites the `RETIRE_PAIR` machinery doesn't cover, `opt_dsl_ssa.h` also
 provides operand-level use-edge maintenance:
 
-- `opt_dsl_drop_use(ctx, op, i)` — drop instruction `i`'s use edge for `op`'s
+- `opt_dsl_drop_use(ctx, &op, i)` — drop instruction `i`'s use edge for `op`'s
   vreg (no-op unless a tracked TEMP).
-- `opt_dsl_add_use(ctx, op, i)` — add a use edge for a plain (non-sym) vreg
+- `opt_dsl_add_use(ctx, &op, i)` — add a use edge for a plain (non-sym) vreg
   operand newly consumed by `i`.
 
 `opt_dsl_helpers.h` additionally has `mk_imm_bt(v, bt)` — `mk_imm` with an
 explicit btype (e.g. the folded dest's width). Reference:
-`source/opt/ssa/fold.c`.
+`source/opt/ssa/scalar/fold.c`.
 
 ## Phi rules
 

@@ -1,0 +1,10 @@
+fetch_op: 10 15 12 268 13 12 -> ffffffff
+op_fetch: 107 105 1069 68 68 fffffff7 -> fffffff7
+cas ok: 1 e=7 w=9
+cas fail: 0 e=9 w=9
+cas s16: 1 0 e=-32768 s=-32768
+s8: 1 f=-1 g=-3 s=-3 h16=-1
+u8: r=250 w=2 u=2
+calls: a=40 c1=1 c2=0 ex=50 x1=50 w=70
+locked: 5
+relocked: 6

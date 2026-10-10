@@ -1964,12 +1964,31 @@ UT_TEST(test_subst_const_sym_leading_underscore)
   return 0;
 }
 
+/* A frame slot ("m" on a local) is addressed off SP at its offset in the final
+ * frame -- never `fp` (r11), which IR functions do not set up. */
+extern int ut_stub_frame_size;
 UT_TEST(test_subst_local)
 {
   seed_subst_reg_names();
   SValue sv;
   make_sv_local(&sv, -16);
-  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "[fp,#-16]");
+  ut_stub_frame_size = 32;
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "[sp,#16]");
+  ut_stub_frame_size = 0;
+  return 0;
+}
+
+/* With a frame pointer the base is r7, the bottom of the frame. */
+UT_TEST(test_subst_local_frame_pointer)
+{
+  seed_subst_reg_names();
+  SValue sv;
+  make_sv_local(&sv, -4);
+  ut_stub_frame_size = 24;
+  tcc_state->need_frame_pointer = 1;
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "[r7,#20]");
+  tcc_state->need_frame_pointer = 0;
+  ut_stub_frame_size = 0;
   return 0;
 }
 
@@ -2050,7 +2069,7 @@ UT_TEST(test_subst_local_positive_offset)
   seed_subst_reg_names();
   SValue sv;
   make_sv_local(&sv, 24);
-  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "[fp,#24]");
+  UT_ASSERT_STREQ(subst_operand_to_string(&sv, 0), "[sp,#24]");
   return 0;
 }
 

@@ -83,7 +83,7 @@ ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
   }
 
   if (reg_to_save < 0)
-    tcc_error("compiler_error: no register available for scratch (all 16 registers excluded)");
+    tcc_ice("no register available for scratch (all 16 registers excluded)");
 
 #ifdef ARM_THUMB_DEBUG_SCRATCH
   fprintf(stderr, "[SCRATCH] WARNING: no free scratch register! Saving r%d to stack\n", reg_to_save);
@@ -95,7 +95,7 @@ ScratchRegAlloc get_scratch_reg_with_save(uint32_t exclude_regs)
   if (scratch_push_count < 128)
     scratch_push_stack[scratch_push_count++] = reg_to_save;
   else
-    tcc_error("compiler_error: scratch register push stack overflow (>128 pushes without restore)");
+    tcc_ice("scratch register push stack overflow (>128 pushes without restore)");
 
   return result;
 }
@@ -172,7 +172,7 @@ ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigne
 
   ScratchRegAlloc first = get_scratch_reg_with_save(exclude_regs);
   if (first.reg == PREG_NONE)
-    tcc_error("compiler_error: unable to allocate scratch register");
+    tcc_ice("unable to allocate scratch register");
 
   scratch->regs[0] = first.reg;
   scratch->reg_count = 1;
@@ -186,7 +186,7 @@ ST_FUNC void tcc_machine_acquire_scratch(TCCMachineScratchRegs *scratch, unsigne
   {
     ScratchRegAlloc second = get_scratch_reg_with_save(exclude_regs);
     if (second.reg == PREG_NONE)
-      tcc_error("compiler_error: unable to allocate scratch register pair");
+      tcc_ice("unable to allocate scratch register pair");
 
     scratch->regs[1] = second.reg;
     scratch->reg_count = 2;

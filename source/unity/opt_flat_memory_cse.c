@@ -6,6 +6,7 @@
 #include "../opt/flat/memory/global_base_share.c"
 #undef GBS_DELTA_MAX
 #undef GBS_DELTA_MIN
+#undef GBS_IS_TARGET
 #undef GBS_MAX_CLUSTER
 #undef USING_GLOBALS
 #include "../opt/flat/memory/global_deref_cse.c"

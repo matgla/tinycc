@@ -135,7 +135,7 @@ static int lbt_defines_vreg(const TCCIRState *ir, const IRQuadCompact *q, int32_
     return 0;
   if (op == TCCIR_OP_LOAD_POSTINC || op == TCCIR_OP_STORE_POSTINC)
   {
-    IROperand b = (op == TCCIR_OP_LOAD_POSTINC) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
+    IROperand b = tcc_ir_op_get_dest_or_src1(ir, q, op == TCCIR_OP_LOAD_POSTINC);
     if (irop_get_vreg(b) == v)
       return 1;
   }
@@ -200,10 +200,9 @@ static int lbt_body_profitable(const TCCIRState *ir, int from, int to, int32_t v
       continue;
     IROperand d = tcc_ir_op_get_dest(ir, q);
     IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    IROperand s2 = tcc_ir_op_get_src2(ir, q);
     if (d.is_lval || s1.is_lval || !irop_has_vreg(d) || !irop_has_vreg(s1))
       continue;
-    if (!irop_is_immediate(s2))
+    if (!tcc_ir_op_src2_is_imm(ir, q))
       continue;
     int32_t dv = irop_get_vreg(d);
     if (dv != irop_get_vreg(s1))
@@ -241,7 +240,7 @@ static int lbt_body_has_scaled_index(const TCCIRState *ir, int from, int to)
     int op = q->op;
     if (op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED)
     {
-      if (!irop_is_immediate(tcc_ir_op_get_src2(ir, q)))
+      if (!tcc_ir_op_src2_is_imm(ir, q))
         return 1;
       continue;
     }
@@ -267,16 +266,15 @@ static int lbt_walk_is_postinc_shaped(const TCCIRState *ir, int from, int bump_i
     int op = q->op;
     if (op == TCCIR_OP_ASSIGN)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      if (!d.is_lval && !s1.is_lval && irop_has_vreg(d) && irop_get_vreg(s1) == walk_vreg &&
+      if (!tcc_ir_op_dest_is_lval(ir, q) && !s1.is_lval && tcc_ir_op_dest_has_vreg(ir, q) && irop_get_vreg(s1) == walk_vreg &&
           nalias < (int)(sizeof(alias) / sizeof(alias[0])))
-        alias[nalias++] = irop_get_vreg(d);
+        alias[nalias++] = tcc_ir_op_dest_vreg(ir, q);
       continue;
     }
     if (op != TCCIR_OP_LOAD && op != TCCIR_OP_STORE)
       continue;
-    IROperand ptr = (op == TCCIR_OP_LOAD) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
+    IROperand ptr = tcc_ir_op_get_dest_or_src1(ir, q, op == TCCIR_OP_LOAD);
     if (!ptr.is_lval || ptr.is_local || ptr.is_llocal || ptr.is_sym || !irop_has_vreg(ptr))
       continue;
     int32_t pv = irop_get_vreg(ptr);
@@ -436,7 +434,7 @@ static int lbt_try_backedge(TCCIRState *ir, int be, int level)
   if (jmp_q->is_jump_target)
     return 0;
 
-  int hi = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jmp_q));
+  int hi = (int)tcc_ir_op_dest_imm(ir, jmp_q);
   if (hi < 0 || hi >= be)
     return 0;
 
@@ -453,11 +451,11 @@ static int lbt_try_backedge(TCCIRState *ir, int be, int level)
   if (jif_q->is_jump_target)
     return 0;
 
-  int cond = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jif_q));
+  int cond = (int)tcc_ir_op_src1_imm(ir, jif_q);
   int inv_cond = invert_condition(cond);
   if (inv_cond < 0)
     return 0;
-  int exit_target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jif_q));
+  int exit_target = (int)tcc_ir_op_dest_imm(ir, jif_q);
   /* The guard's target must leave the loop forwards; a target inside would make
    * the fall-through after the tail test wrong. */
   if (exit_target <= be || exit_target > n)
@@ -566,6 +564,414 @@ int ssa_opt_loop_bottom_test(TCCIRState *ir)
         total++;
         /* the rewritten back-edge is now a JUMPIF; resume past it */
         scan = i + 2;
+        hit = 1;
+        break;
+      }
+    }
+    if (!hit)
+      break;
+  }
+  return total;
+}
+
+/* ssa:loop_header_dup -- the general form of the rewrite above.
+ *
+ * ssa:loop_rotate wants the frontend's `CMP; JUMPIF; JUMP` header and
+ * lbt_try_backedge wants the CMP to be the header's FIRST instruction and the
+ * body to be a profitable pointer walk.  Most hot loops are neither: `while
+ * (n-- != 0)`, `while (i++ < n)`, `for (...) if (f(x)) return ...` (a call in
+ * the body) and every Zig-CBE loop (`v = i; t = v & -1; if (!(t < n)) break;`,
+ * the bound read from a slice in memory) put a handful of copies, loads and
+ * arithmetic in front of the CMP, so they kept the exit-test branch at the top
+ * AND an unconditional `b` back to it on every iteration.
+ *
+ * The rewrite is the same one: the back-edge `JUMP hi` is replaced by a copy of
+ * the header up to and including the exit test, with the exit test inverted and
+ * aimed at the first body instruction:
+ *
+ *   before: hi: P1..Pk; CMP a,b; JUMPIF cond -> exit;  body...;  JUMP hi
+ *   after:  hi: P1..Pk; CMP a,b; JUMPIF cond -> exit;  body...;
+ *               P1'..Pk'; CMP a',b'; JUMPIF !cond -> body; [JUMP exit]
+ *
+ * Why it is sound: at the back-edge, control would go to `hi` and run
+ * P1..Pk, CMP, JUMPIF in that order with nothing in between, then continue at
+ * `body` or `exit`.  The copy runs exactly that sequence in place and branches
+ * to the same two places, so every executed path is the same sequence of
+ * operations as before -- including every memory read, which the copy performs
+ * INSTEAD of the header's next execution, not in addition to it.  The header
+ * at `hi` stays as the entry guard.  What has to hold for the COPY to be a
+ * faithful IR instruction sequence, and is checked here:
+ *
+ *   - every Pi is a value computation: copy / ALU / load (plain or indexed),
+ *     or a store to a direct local VAR -- no call, no store through a pointer,
+ *     no volatile access anywhere in the header;
+ *   - nothing but the fall-through from `hi` reaches the middle of the header
+ *     (no jump target inside it), so the copy is not entered half-way, and
+ *     nothing branches to the back-edge JUMP itself (insert_instr_at moves such
+ *     a branch along with the JUMP, past the copy);
+ *   - TEMPs stay single-definition: every TEMP the header defines is private to
+ *     it (read by nothing outside [hi, JUMPIF]) and gets a fresh TEMP in the
+ *     copy.  A header TEMP read by the body or past the exit is refused, as is
+ *     a header that reads one of its own TEMPs before defining it.  VAR/PARAM
+ *     destinations are shared with the header (the copy IS the header's next
+ *     execution) and SSA renames them;
+ *   - the header is at most LHD_MAX_PREFIX real instructions (code growth);
+ *   - the function takes no label address and has no IJUMP: computed-goto
+ *     targets are not renumbered by insert_instr_at.
+ *
+ * Inner loops in the body are fine: they are rewritten first (their back-edges
+ * come first in instruction order) and the outer back-edge is an ordinary JUMP.
+ * Only the LAST back-edge to a header is rewritten; earlier `continue` jumps
+ * keep going to `hi`.
+ *
+ * In instruction count the rewrite saves the `b` only when the tail test needs
+ * no extra work: a zero test that was a forward `cbz` becomes `cmp; bne` (cbz
+ * cannot branch backwards), and phi copies on the new back-edge need an edge
+ * split -- either way the iteration costs what it did before, just with the
+ * taken branch moved.  Disableable via TCC_DISABLE_PASS=ssa:loop_header_dup. */
+#define LHD_MAX_PREFIX 8
+#define LHD_MAX_REWRITES 64
+
+static int lhd_op_allowed(int op)
+{
+  switch (op)
+  {
+  case TCCIR_OP_ASSIGN:
+  case TCCIR_OP_LOAD:
+  case TCCIR_OP_LOAD_INDEXED:
+  case TCCIR_OP_STORE:
+  case TCCIR_OP_ADD:
+  case TCCIR_OP_SUB:
+  case TCCIR_OP_AND:
+  case TCCIR_OP_OR:
+  case TCCIR_OP_XOR:
+  case TCCIR_OP_SHL:
+  case TCCIR_OP_SHR:
+  case TCCIR_OP_SAR:
+  case TCCIR_OP_MUL:
+  case TCCIR_OP_UBFX:
+  case TCCIR_OP_SBFX:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* A source the copy may read again: re-reading is exactly what the header
+ * would have done at that point.  Volatile operands are refused all the same. */
+static int lhd_src_ok(const TCCIRState *ir, IROperand op)
+{
+  if (irop_is_immediate(op) || !op.is_lval)
+    return 1;
+  return !tcc_ir_access_is_volatile(ir, op) && !tcc_ir_operand_names_volatile_var(ir, op);
+}
+
+/* A destination: a register value, or a direct non-volatile local VAR.  A
+ * store through a pointer is refused. */
+static int lhd_dest_ok(const TCCIRState *ir, IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0)
+    return 0;
+  if (!op.is_lval)
+    return 1;
+  if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR || !op.is_local)
+    return 0;
+  return !tcc_ir_access_is_volatile(ir, op) && !tcc_ir_operand_names_volatile_var(ir, op);
+}
+
+static int lhd_is_temp(int32_t vr)
+{
+  return vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP;
+}
+
+static int lhd_vreg_listed(const int32_t *list, int n, int32_t vr)
+{
+  for (int k = 0; k < n; k++)
+    if (list[k] == vr)
+      return 1;
+  return 0;
+}
+
+typedef struct
+{
+  int32_t from[LHD_MAX_PREFIX];
+  int32_t to[LHD_MAX_PREFIX];
+  int n;
+} LhdRename;
+
+static void lhd_rename_src(const LhdRename *r, IROperand *op)
+{
+  int32_t vr = irop_get_vreg(*op);
+  if (!lhd_is_temp(vr))
+    return;
+  for (int k = r->n - 1; k >= 0; k--)
+    if (r->from[k] == vr)
+    {
+      irop_set_vreg(op, r->to[k]);
+      return;
+    }
+}
+
+static int lhd_try_backedge(TCCIRState *ir, int be)
+{
+  int n = ir->next_instruction_index;
+  IRQuadCompact *jmp_q = &ir->compact_instructions[be];
+  if (jmp_q->op != TCCIR_OP_JUMP || jmp_q->is_jump_target)
+    return 0;
+  int hi = (int)tcc_ir_op_dest_imm(ir, jmp_q);
+  if (hi < 0 || hi >= be)
+    return 0;
+
+  /* only the last back-edge to this header */
+  for (int j = be + 1; j < n; j++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[j];
+    if ((q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) && (int)tcc_ir_op_dest_imm(ir, q) == hi)
+      return 0;
+  }
+
+  /* header = prefix instructions, then CMP, then JUMPIF */
+  int prefix[LHD_MAX_PREFIX];
+  int nprefix = 0;
+  int cmp = -1;
+  for (int i = hi; i < be; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->is_jump_target && i != hi)
+      return 0;
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (q->op == TCCIR_OP_CMP)
+    {
+      cmp = i;
+      break;
+    }
+    if (nprefix >= LHD_MAX_PREFIX || !lhd_op_allowed(q->op))
+      return 0;
+    prefix[nprefix++] = i;
+  }
+  if (cmp < 0)
+    return 0;
+  int jif = lbt_skip_nops(ir, cmp + 1);
+  if (jif >= be)
+    return 0;
+  for (int i = cmp + 1; i <= jif; i++)
+    if (ir->compact_instructions[i].is_jump_target)
+      return 0;
+  IRQuadCompact *jif_q = &ir->compact_instructions[jif];
+  if (jif_q->op != TCCIR_OP_JUMPIF)
+    return 0;
+  int cond = (int)tcc_ir_op_src1_imm(ir, jif_q);
+  int inv_cond = invert_condition(cond);
+  if (inv_cond < 0)
+    return 0;
+  int exit_target = (int)tcc_ir_op_dest_imm(ir, jif_q);
+  if (exit_target <= be || exit_target > n)
+    return 0;
+  int body_start = lbt_skip_nops(ir, jif + 1);
+  if (body_start >= be)
+    return 0;
+
+  IRQuadCompact *cmp_q = &ir->compact_instructions[cmp];
+  IROperand cmp_src1 = tcc_ir_op_get_src1(ir, cmp_q);
+  IROperand cmp_src2 = tcc_ir_op_get_src2(ir, cmp_q);
+  if (!lhd_src_ok(ir, cmp_src1) || !lhd_src_ok(ir, cmp_src2))
+    return 0;
+  if (tcc_ir_barrel_shift_at(ir, cmp_q) || tcc_ir_instr_access_is_volatile(ir, cmp_q))
+    return 0;
+
+  /* prefix operands, and the TEMPs the header defines */
+  int32_t tdefs[LHD_MAX_PREFIX];
+  int ntdefs = 0;
+  for (int k = 0; k < nprefix; k++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[prefix[k]];
+    int op = q->op;
+    if (!irop_config[op].has_dest || !irop_config[op].has_src1)
+      return 0;
+    IROperand d = tcc_ir_op_get_dest(ir, q);
+    if (!lhd_dest_ok(ir, d))
+      return 0;
+    if (!lhd_src_ok(ir, tcc_ir_op_get_src1(ir, q)))
+      return 0;
+    if (irop_config[op].has_src2 && !lhd_src_ok(ir, tcc_ir_op_get_src2(ir, q)))
+      return 0;
+    if (tcc_ir_barrel_shift_at(ir, q) || tcc_ir_instr_access_is_volatile(ir, q))
+      return 0;
+    int32_t dv = irop_get_vreg(d);
+    if (lhd_is_temp(dv) && !d.is_lval && !lhd_vreg_listed(tdefs, ntdefs, dv))
+      tdefs[ntdefs++] = dv;
+  }
+  /* A TEMP read before the header defines it carries a value round the loop. */
+  {
+    int32_t seen[LHD_MAX_PREFIX];
+    int nseen = 0;
+    for (int k = 0; k <= nprefix; k++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[k < nprefix ? prefix[k] : cmp];
+      for (int w = 1; w <= 3; w++)
+      {
+        IROperand *o = lbt_operand_slot(ir, q, w);
+        if (!o && w == 3 && ir_op_has(q->op, IROP_A_SLOT3))
+          o = &ir->iroperand_pool[q->operand_base + 3];
+        if (!o)
+          continue;
+        int32_t vr = irop_get_vreg(*o);
+        if (lhd_vreg_listed(tdefs, ntdefs, vr) && !lhd_vreg_listed(seen, nseen, vr))
+          return 0;
+      }
+      if (k < nprefix)
+      {
+        int32_t dv = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+        if (lhd_vreg_listed(tdefs, ntdefs, dv) && !lhd_vreg_listed(seen, nseen, dv))
+          seen[nseen++] = dv;
+      }
+    }
+  }
+  /* Every header TEMP must be private to the header: one read anywhere else
+   * (the body, past the exit) would need the copy to give it a second
+   * definition, and TEMPs are single-definition values to everything
+   * downstream.  Turning such a TEMP into a VAR instead measured -0.08M
+   * instructions on the Zig compiler benchmark and can ADD a back-edge copy
+   * (the old and the new value both stay live), so those loops are left. */
+  for (int i = 0; ntdefs && i < n; i++)
+  {
+    if (i >= hi && i <= jif)
+      continue;
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    for (int w = 0; w < 4; w++)
+    {
+      IROperand *o = lbt_operand_slot(ir, q, w);
+      if (!o && w == 3 && ir_op_has(q->op, IROP_A_SLOT3))
+        o = &ir->iroperand_pool[q->operand_base + 3];
+      if (o && lhd_vreg_listed(tdefs, ntdefs, irop_get_vreg(*o)))
+        return 0;
+    }
+  }
+
+  int need_exit_jump = lbt_skip_nops(ir, be + 1) != exit_target;
+  int ncopy = nprefix + 1; /* prefix + CMP; the JUMPIF takes over the old JUMP */
+
+  /* Collect what to copy BEFORE the first insertion moves anything. */
+  struct
+  {
+    int op;
+    int orig;
+    int line;
+    IROperand d, s1, s2, s3;
+  } cp[LHD_MAX_PREFIX + 1];
+  for (int k = 0; k < ncopy; k++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[k < nprefix ? prefix[k] : cmp];
+    cp[k].op = q->op;
+    cp[k].orig = q->orig_index;
+    cp[k].line = (int)q->line_num;
+    cp[k].d = irop_make_none();
+    cp[k].s1 = irop_make_none();
+    cp[k].s2 = irop_make_none();
+    cp[k].s3 = irop_make_none();
+    if (irop_config[q->op].has_dest)
+      cp[k].d = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_src1)
+      cp[k].s1 = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2)
+      cp[k].s2 = tcc_ir_op_get_src2(ir, q);
+    if (ir_op_has(q->op, IROP_A_SLOT3)) /* LOAD_INDEXED's scale */
+      cp[k].s3 = ir->iroperand_pool[q->operand_base + 3];
+  }
+  int test_line = (int)ir->compact_instructions[cmp].line_num;
+
+  /* Claim the slots first, so a failed allocation leaves bare NOPs in front of
+   * a still-intact back-edge.  insert_instr_at renumbers every jump target and
+   * switch arm at or past the insertion point; exit_target is past `be`. */
+  IROperand none_op = irop_make_none();
+  for (int k = 0; k < ncopy; k++)
+  {
+    if (insert_instr_at(ir, be + k, TCCIR_OP_NOP, none_op, none_op, none_op) < 0)
+      return 0;
+    exit_target++;
+  }
+  int jmp_pos = be + ncopy; /* the old back-edge JUMP */
+  if (need_exit_jump)
+  {
+    if (insert_instr_at(ir, jmp_pos + 1, TCCIR_OP_NOP, none_op, none_op, none_op) < 0)
+      return 0;
+    exit_target++;
+  }
+
+  LhdRename rn = {{0}, {0}, 0};
+  for (int k = 0; k < ncopy; k++)
+  {
+    IROperand d = cp[k].d, s1 = cp[k].s1, s2 = cp[k].s2, s3 = cp[k].s3;
+    lhd_rename_src(&rn, &s1);
+    lhd_rename_src(&rn, &s2);
+    lhd_rename_src(&rn, &s3);
+    if (irop_config[cp[k].op].has_dest)
+    {
+      int32_t dv = irop_get_vreg(d);
+      if (lhd_is_temp(dv) && !d.is_lval)
+      {
+        int32_t nv = tcc_ir_vreg_alloc_temp(ir);
+        irop_set_vreg(&d, nv);
+        rn.from[rn.n] = dv;
+        rn.to[rn.n] = nv;
+        rn.n++;
+      }
+    }
+    int pos = be + k;
+    write_instr_at_nop(ir, pos, cp[k].op, d, s1, s2);
+    if (ir_op_has(cp[k].op, IROP_A_SLOT3))
+      tcc_ir_pool_add(ir, s3); /* lands at operand_base + 3 */
+    tcc_ir_copy_orig_annotations(ir, cp[k].orig, ir->compact_instructions[pos].orig_index);
+    ir->compact_instructions[pos].line_num = cp[k].line;
+  }
+
+  ir->compact_instructions[jmp_pos].op = TCCIR_OP_NOP;
+  write_instr_at_nop(ir, jmp_pos, TCCIR_OP_JUMPIF, irop_make_imm32(-1, body_start, IROP_BTYPE_INT32),
+                     irop_make_imm32(-1, inv_cond, IROP_BTYPE_INT32), none_op);
+  ir->compact_instructions[jmp_pos].line_num = test_line;
+  ir->compact_instructions[body_start].is_jump_target = 1;
+  if (need_exit_jump)
+  {
+    write_instr_at_nop(ir, jmp_pos + 1, TCCIR_OP_JUMP, irop_make_imm32(-1, exit_target, IROP_BTYPE_INT32), none_op,
+                       none_op);
+    ir->compact_instructions[jmp_pos + 1].line_num = test_line;
+    if (exit_target < ir->next_instruction_index)
+      ir->compact_instructions[exit_target].is_jump_target = 1;
+  }
+  /* Same branch-target alignment request as the pointer-walk case above. */
+  ir->compact_instructions[lbt_skip_nops(ir, body_start)].align_target = 1;
+
+  LOG_IR_GEN("[LOOP-HEADER-DUP] header=%d prefix=%d body_start=%d -> tail copy@%d JUMPIF@%d exit=%d", hi, nprefix,
+             body_start, be, jmp_pos, exit_target);
+  return 1;
+}
+
+int ssa_opt_loop_header_dup(TCCIRState *ir)
+{
+  if (!ir || ir->next_instruction_index == 0)
+    return 0;
+  if (ir->func_has_label_addr)
+    return 0;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+    if (ir->compact_instructions[i].op == TCCIR_OP_IJUMP)
+      return 0;
+  if (!tcc_ir_cfg_flat_has_backedge(ir))
+    return 0;
+  int total = 0;
+  int scan = 0;
+  while (total < LHD_MAX_REWRITES)
+  {
+    int hit = 0;
+    for (int i = scan; i < ir->next_instruction_index; i++)
+    {
+      if (lhd_try_backedge(ir, i))
+      {
+        total++;
+        scan = i + 1;
         hit = 1;
         break;
       }

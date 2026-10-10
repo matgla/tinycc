@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 
 #include "ir.h"
+#include "opt_range.h"
 #include "opt_utils.h"
 
 static int ir_opt_pure_expr_equal_impl(TCCIRState *ir, IROperand a, int a_use_idx,
@@ -119,31 +120,32 @@ static int ir_opt_pure_def_memory_stable(TCCIRState *ir, int a_def_idx, int b_de
   int nids = 0;
   nids = ir_opt_collect_var_read_ids(ir, &ir->compact_instructions[a_def_idx], read_ids, nids);
   nids = ir_opt_collect_var_read_ids(ir, &ir->compact_instructions[b_def_idx], read_ids, nids);
+  /* A destination that itself names memory (lvalue or STACKOFF) mutates it
+   * like a STORE.  Calls are judged by name below. */
+  const uint32_t mask = IR_HZ_ALL & ~(IR_HZ_CALL | IR_HZ_MEM_READ | IR_HZ_SRC_LVAL | IR_HZ_FLAGS_SET |
+                                      IR_HZ_FLAGS_READ | IR_HZ_CALL_PARAM | IR_HZ_CALL_SEQ | IR_HZ_UPDATES_SRC |
+                                      IR_HZ_HINT |
+                                      IR_LEGACY_GAP_HZ(IR_HZ_BRANCH | IR_HZ_RETURN | IR_HZ_NONLOCAL | IR_HZ_CHAIN |
+                                                       IR_HZ_TRAP | IR_HZ_VOLATILE | IR_HZ_JOIN_END));
+  const IROpSet gaps = IR_LEGACY_GAP_OPS(TCCIR_OP_ASM_INPUT, TCCIR_OP_ASM_OUTPUT, TCCIR_OP_VLA_SP_SAVE,
+                                         TCCIR_OP_VLA_SP_RESTORE, TCCIR_OP_CALLARG_STACK, TCCIR_OP_INIT_CHAIN_SLOT);
   for (int k = lo + 1; k < hi; k++)
   {
     IRQuadCompact *kq = &ir->compact_instructions[k];
     int kop = kq->op;
-    if (kop == TCCIR_OP_FUNCCALLVOID || kop == TCCIR_OP_FUNCCALLVAL)
+    if (ir_q_hazards_except(ir, kq, mask, gaps))
+      return 0;
+    if (ir_op_has(kop, IR_HZ_CALL))
     {
       /* Pure helpers (isnan, __aeabi_f2d, ...) touch no memory; compare-fp-3's isunordered fold depends on skipping them. */
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, kq));
+      Sym *callee = tcc_ir_op_src1_sym(ir, kq);
       const char *name = callee ? get_tok_str(callee->v, NULL) : NULL;
       if (!ir_opt_is_pure_helper_name(name))
         return 0;
     }
-    else if (kop == TCCIR_OP_STORE || kop == TCCIR_OP_STORE_INDEXED ||
-             kop == TCCIR_OP_STORE_POSTINC || kop == TCCIR_OP_BLOCK_COPY ||
-             kop == TCCIR_OP_INLINE_ASM || kop == TCCIR_OP_VLA_ALLOC)
-      return 0;
-    if (kq->is_jump_target)
-      return 0;
     if (irop_config[kop].has_dest)
     {
-      IROperand kd = tcc_ir_op_get_dest(ir, kq);
-      int32_t kd_vr = irop_get_vreg(kd);
-      /* A destination that itself names memory mutates it like a STORE. */
-      if (kd.is_lval || irop_get_tag(kd) == IROP_TAG_STACKOFF)
-        return 0;
+      int32_t kd_vr = tcc_ir_op_dest_vreg(ir, kq);
       for (int s = 0; s < nids; s++)
         if (kd_vr == read_ids[s])
           return 0;
@@ -154,9 +156,9 @@ static int ir_opt_pure_def_memory_stable(TCCIRState *ir, int a_def_idx, int b_de
 
 static int ir_opt_pure_def_has_memory_read(TCCIRState *ir, IRQuadCompact *q)
 {
-  if (irop_config[q->op].has_src1 && tcc_ir_op_get_src1(ir, q).is_lval)
+  if (irop_config[q->op].has_src1 && tcc_ir_op_src1_is_lval(ir, q))
     return 1;
-  if (irop_config[q->op].has_src2 && tcc_ir_op_get_src2(ir, q).is_lval)
+  if (irop_config[q->op].has_src2 && tcc_ir_op_src2_is_lval(ir, q))
     return 1;
   if (q->op == TCCIR_OP_MLA && tcc_ir_op_get_accum(ir, q).is_lval)
     return 1;
@@ -252,14 +254,11 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
   }
   case TCCIR_OP_FUNCCALLVAL:
   {
-    IROperand a_callee_op = tcc_ir_op_get_src1(ir, qa);
     IROperand b_callee_op = tcc_ir_op_get_src1(ir, qb);
-    Sym *a_callee = irop_get_sym_ex(ir, a_callee_op);
+    Sym *a_callee = tcc_ir_op_src1_sym(ir, qa);
     Sym *b_callee = irop_get_sym_ex(ir, b_callee_op);
     const char *a_name;
     const char *b_name;
-    IROperand a_call_meta = tcc_ir_op_get_src2(ir, qa);
-    IROperand b_call_meta = tcc_ir_op_get_src2(ir, qb);
     int argc;
 
     if (!a_callee || !b_callee)
@@ -270,8 +269,8 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
     if (!ir_opt_is_pure_helper_name(a_name) || !b_name || strcmp(a_name, b_name) != 0)
       return 0;
 
-    argc = TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, a_call_meta));
-    if (argc != TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, b_call_meta)))
+    argc = TCCIR_DECODE_CALL_ARGC((uint32_t)tcc_ir_op_src2_imm(ir, qa));
+    if (argc != TCCIR_DECODE_CALL_ARGC((uint32_t)tcc_ir_op_src2_imm(ir, qb)))
       return 0;
 
     for (int param_idx = 0; param_idx < argc; ++param_idx)
@@ -292,11 +291,9 @@ int ir_opt_pure_def_equal(TCCIRState *ir, int a_def_idx, int b_def_idx, int dept
   case TCCIR_OP_SETIF:
   {
     /* The flag-producing CMP must sit at def_idx - 1 modulo NOPs. */
-    IROperand cond_a = tcc_ir_op_get_src1(ir, qa);
-    IROperand cond_b = tcc_ir_op_get_src1(ir, qb);
-    if (!irop_is_immediate(cond_a) || !irop_is_immediate(cond_b))
+    if (!tcc_ir_op_src1_is_imm(ir, qa) || !tcc_ir_op_src1_is_imm(ir, qb))
       return 0;
-    if (irop_get_imm64_ex(ir, cond_a) != irop_get_imm64_ex(ir, cond_b))
+    if (tcc_ir_op_src1_imm(ir, qa) != tcc_ir_op_src1_imm(ir, qb))
       return 0;
 
     int cmp_a_idx = a_def_idx - 1;

@@ -195,6 +195,10 @@ typedef struct
   Section *sec;
   int local_offset;
   Sym *flex_array_ref;
+  /* flex_array_ref is a struct member's flexible array inside a union:
+   * at most flex_array_max elements fit in the union's storage. */
+  int flex_array_bounded;
+  int flex_array_max;
   /* When non-NULL, init_putv captures pure-constant scalar values into
    * const_init_sym->const_init_data so the values can later be read at
    * compile time (e.g. for __builtin_shuffle masks). Any non-constant
@@ -215,6 +219,11 @@ typedef struct
   unsigned char *const_probe_data;
   int const_probe_base;
   int const_probe_size;
+  /* The element being initialized is a member of a big-endian
+   * scalar_storage_order aggregate (or an element of such an array member):
+   * init_putv writes its scalars byte-reversed.  Set per member by
+   * decl_designator from the field's own mark. */
+  int sso_be;
 } init_params;
 
 /* Stack of saved by-value call arguments for a funcall in progress
@@ -296,6 +305,7 @@ extern int nb_pending_aliases;
 /* Pending label-difference symbols for &&lab1 - &&lab0 in static
  * initializers.  Producer: op/int.c's gen_opic(); consumer:
  * init/initializer.c's init_putv(). */
+extern Sym label_diff_marker;
 extern Sym *pending_label_diff_plus;
 extern Sym *pending_label_diff_minus;
 
@@ -362,6 +372,7 @@ void unary_builtin_modf(void);
 
 /* --- builtin/fp2.c --- */
 void unary_builtin_fp2(void);
+void gen_bswap(int size);
 
 /* --- builtin/misc.c --- */
 int gcc_classify_type(CType *type);
@@ -405,10 +416,12 @@ void parse_decl_attributes(AttributeDef *ad);
 
 /* --- decl/btype.c --- */
 int parse_btype(CType *type, AttributeDef *ad, int ignore_label);
+void parse_btype_qualify(CType *type, int qualifiers);
 
 /* --- decl/decl.c --- */
 int decl(int l);
 void do_Static_assert(void);
+int tok_is_static_assert(void);
 
 /* --- decl/declarator.c --- */
 int asm_label_instr(void);
@@ -439,12 +452,15 @@ void parse_type(CType *type);
 void expr_cond(void);
 void expr_const1(void);
 void expr_eq(void);
+int nrvo_rhs_is_direct_call(void);
 void init_prec(void);
 
 /* --- expr/primary.c --- */
 int unary_primary(void);
 
 /* --- expr/unary.c --- */
+extern int unary_addr_operand;
+extern int indir_keep_lvalue;
 void unary_generic(void);
 int unary_paren(void);
 
@@ -462,7 +478,6 @@ void init_putv(init_params *p, CType *type, unsigned long c, int vreg);
 void init_putz(init_params *p, unsigned long c, int size);
 void parse_init_elem(int expr_type);
 void skip_or_save_block(TokenString **str);
-void sso_swap_struct_init(init_params *p, CType *type, unsigned long c);
 
 /* --- inline/analysis.c --- */
 int auto_inline_nonstatic_struct_body_ok(Sym *func_sym, TokenString *func_str);
@@ -474,12 +489,15 @@ int inline_body_has_return_stmt(TokenString *func_str);
 int inline_body_has_shadowed_ident(TokenString *func_str);
 int inline_body_has_side_effects(TokenString *func_str);
 int inline_body_has_static_local(TokenString *func_str);
+int inline_body_has_large_local_array(TokenString *func_str, int limit);
 int inline_body_has_unsafe_loops(TokenString *func_str);
 int inline_body_has_unsafe_shadowed_ident(TokenString *func_str, Sym *call_func_sym);
 Sym **inline_hide_label_bindings(TokenString *func_str, int **tokens_out, int *count_out);
 void inline_restore_label_bindings(int *tokens, Sym **saved_labels, int count);
 void inline_release_hidden_label_bindings(void);
 void inline_scan_body_features(TokenString *func_str, int *has_addr_of_label, int *has_inline_asm);
+int inline_body_asm_is_machine(TokenString *func_str);
+int inline_body_writes_ident(TokenString *func_str, int ident_tok);
 int nested_callee_captures_reachable(TCCState *s, Sym *call_func_sym, NestedFunc *current_nf);
 int nested_callee_has_genuine_capture(TCCState *s, Sym *call_func_sym);
 int nested_capture_is_read_only(NestedFunc *nf);
@@ -511,6 +529,7 @@ void prune_unused_statics(TCCState *s);
 int called_once_budget_begin(int own_len);
 void called_once_budget_end(int saved);
 void gen_late_reopt_functions(TCCState *s);
+int sym_is_const_object(Sym *sym);
 
 /* --- nested/nested.c --- */
 void prescan_captured_vars(NestedFunc *nf, Sym *parent_local_stack, NestedFunc *explicit_parent_nf);
@@ -547,6 +566,7 @@ uint64_t value64(uint64_t l1, int t);
 
 /* --- op/vector.c --- */
 void attach_const_init_to_temp(int frame_offset, int size, const unsigned char *data);
+void const_init_forget_all(void);
 unsigned char *find_sv_const_init(const SValue *sv, int min_size);
 unsigned char *find_sv_vec_literal_init(const SValue *sv, int min_size);
 void gen_op_vector(int op);
@@ -588,6 +608,7 @@ int small_aggregate_copy_plan(const CType *stype, int size, int align, int src_o
                               unsigned char *covered);
 void ir_emit_small_aggregate_copy(const SValue *src, int src_deref, const SValue *dst, int dst_deref, int size,
                                   int w, const unsigned char *covered);
+int ir_emit_small_padded_local_copy(const SValue *src, const SValue *dst, const CType *stype, int size, int align);
 
 /* --- sym/attr_merge.c --- */
 void apply_alias_attribute(Sym *alias_sym, int target_tok);
@@ -598,6 +619,8 @@ void merge_symattr(struct SymAttr *sa, struct SymAttr *sa1);
 void patch_storage(Sym *sym, AttributeDef *ad, CType *type);
 void resolve_pending_aliases(void);
 void mark_pending_alias_targets_used(void);
+int is_pending_alias_target(Sym *sym);
+Sym *canonical_global_sym(Sym *sym);
 void sym_copy_ref(Sym *s, Sym **ps);
 
 /* --- sym/symtab.c --- */
@@ -638,15 +661,26 @@ int adjust_bf(SValue *sv, int bit_pos, int bit_size);
 void gbound(void);
 void gen_bounded_ptr_add(void);
 int get_temp_local_var(int size, int align, int *vr_out);
+extern unsigned pending_call_temp_slots;
+void pin_call_arg_temp_slot(const SValue *sv);
 void gv_dup(void);
 void incr_bf_adr(int o);
 void incr_offset(int offset);
 void move_reg(int r, int s, int t);
+int sso_scalar_size(CType *type);
+void sso_store_reversed(void);
 void store_packed_bf(int bit_pos, int bit_size);
 
 /* --- value/longlong.c --- */
 void gen_opl(int op);
 void lbuild(int t);
+
+/* --- value/rodata_rel.c --- */
+int rodata_rel_qualifier(void);
+void rodata_rel_store_error(void);
+void rodata_rel_check_targets(CType *dt, CType *st, CType *src, CType *dst);
+void rodata_rel_rvalue(void);
+void rodata_rel_init(Section *sec, unsigned long c);
 
 /* --- value/strlit_pool.c --- */
 void str_lit_pool_free(void);

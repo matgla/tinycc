@@ -103,33 +103,88 @@ static int ir_body_is_register_only(TCCIRState *ir)
   return 1;
 }
 
-/* A static function whose optimized body is at most this many real ops of
- * straight-line code (see ir_body_is_straight_leaf) is inlined at every call
- * site, whatever its token length.  The token gate at registration counts
- * source, and Zig's C backend spells one rotate as ten zig.h helper calls:
- * math.rotr is 122 tokens, compiles to 20 ops standalone and to two shifts
- * and an OR once its constant shift amount arrives, and the Zig compiler
- * called it 10.6M times from BLAKE3.  Swept on that compiler: 16 ops -3.1%
- * instructions, 24 -9.2%, 32 -9.4%. */
+/* Count live operations; see docs/inline_control_flow.md for the cycle check. */
 #define SMALL_LEAF_INLINE_OPS 24
 
-/* Straight-line leaf: no call, no inline asm, no backward jump. */
-static int ir_body_is_straight_leaf(TCCIRState *ir)
+/* Static acyclic wrappers use a local caller budget; see docs/inline_readonly_wrappers.md. */
+#define WRAPPER_INLINE_OPS 12
+
+/* The inline-atomic barrier is a FUNCCALLVOID to __tcc_dmb that the backend
+ * emits as one DMB (tcc_gen_machine_func_call_mop): not a call for inlining.
+ * Counting it made every acquire load a non-leaf (zig.c Entry.acquire, 1.7M
+ * calls, kept its itemPtr/getItem callers out of line too).  The same holds
+ * for an -minline-atomics read-modify-write, a call to __tcc_ax_* the backend
+ * emits as an LDREX/STREX loop (thumb_inline_atomic_call): the kernel's
+ * SpinLock.lock is that loop and nothing else; and for an asm statement of
+ * system instructions, __tcc_mc_* (asm_machine_call_name): its interrupt
+ * masking and event hints. */
+static int ir_call_is_barrier(TCCIRState *ir, IRQuadCompact *q)
+{
+  if ((q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL) ||
+      tcc_ir_opt_pass_disabled("inline:barrier_leaf"))
+    return 0;
+  Sym *cs = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  if (!cs)
+    return 0;
+  const char *nm = get_tok_str(cs->v, NULL);
+  return (q->op == TCCIR_OP_FUNCCALLVOID && !strcmp(nm, "__tcc_dmb")) || tcc_is_inline_machine_call(nm);
+}
+
+/* A wrapper has one to maxcalls real calls, with no cycle, asm, indirect jump, or VLA. */
+static int ir_body_is_acyclic_wrapper(TCCIRState *ir, int maxcalls)
+{
+  int calls = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_INLINE_ASM || q->op == TCCIR_OP_BUILTIN_APPLY || q->op == TCCIR_OP_IJUMP ||
+        q->op == TCCIR_OP_VLA_ALLOC)
+      return 0;
+    if ((q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID) && !ir_call_is_barrier(ir, q) &&
+        ++calls > maxcalls)
+      return 0;
+  }
+  return calls > 0 && !tcc_ir_cfg_has_cycle(ir);
+}
+
+static int ir_body_is_leaf(TCCIRState *ir)
 {
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
+    if (ir_call_is_barrier(ir, q))
+      continue;
     if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_INLINE_ASM ||
         q->op == TCCIR_OP_BUILTIN_APPLY || q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_VLA_ALLOC)
       return 0;
-    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
-    {
-      IROperand jd = tcc_ir_op_get_dest(ir, q);
-      if ((int)irop_get_imm64_ex(ir, jd) <= i)
-        return 0;
-    }
   }
   return 1;
+}
+
+static int ir_body_is_acyclic_leaf(TCCIRState *ir)
+{
+  return ir_body_is_leaf(ir) && !tcc_ir_cfg_has_cycle(ir);
+}
+
+int inline_body_has_unsafe_loops(TokenString *func_str); /* inline/analysis.c */
+
+/* Small loop class (inline:small_loop): a static leaf of at most
+ * SMALL_LEAF_INLINE_OPS live ops, loop included -- the kernel's
+ * SpinLock.lock is an LDREX/STREX attempt and a WFE in a loop, called on
+ * every lock_irqsave, which LLVM inlines into each of them.  Its body is
+ * replayed from tokens, so a loop the token replay could misbind (one in
+ * expression context, a `for`: inline_body_has_unsafe_loops) keeps it out
+ * of line.  Not at -Os. */
+static int ir_body_is_small_loop_leaf(TCCIRState *ir, Sym *sym, int real_ops)
+{
+  if (TCC_OPT(tcc_state, optimize_size) || tcc_ir_opt_pass_disabled("inline:small_loop") ||
+      !(sym->type.t & VT_STATIC) || real_ops > SMALL_LEAF_INLINE_OPS || !ir_body_is_leaf(ir) ||
+      !tcc_ir_cfg_has_cycle(ir))
+    return 0;
+  for (int fi = 0; fi < tcc_state->nb_inline_fns; fi++)
+    if (tcc_state->inline_fns[fi]->sym == sym)
+      return tcc_state->inline_fns[fi]->func_str && !inline_body_has_unsafe_loops(tcc_state->inline_fns[fi]->func_str);
+  return 0;
 }
 
 TCC_DBG_ENV_STR(dbg_dump_func, "TCC_DUMP_FUNC")
@@ -219,7 +274,7 @@ void gen_function(Sym *sym)
     ir->needs_chain_save = nf->needs_chain_save;
   }
 
-  if (tcc_state->opt_fp_offset_cache)
+  if (TCC_OPT(tcc_state, opt_fp_offset_cache))
     tcc_ir_opt_fp_cache_init(ir);
 
   local_scope = 1;
@@ -253,16 +308,18 @@ void gen_function(Sym *sym)
         func_has_chain_op = 1;
     }
     for (int ni = 0; ni < tcc_state->nb_nested_funcs && !any_trampoline_needed; ni++) {
-      if (tcc_state->nested_funcs[ni].trampoline_needed)
+      if (tcc_state->nested_funcs[ni]->trampoline_needed)
         any_trampoline_needed = 1;
     }
     if (!func_has_chain_op && !any_trampoline_needed) {
       for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++) {
-        NestedFunc *nf = &tcc_state->nested_funcs[ni];
+        NestedFunc *nf = tcc_state->nested_funcs[ni];
         for (int ci = 0; ci < nf->nb_captured; ci++) {
           int vreg = nf->captured_vregs[ci];
-          if (vreg >= 0) {
-            IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+          if (vreg >= 0 && nested_capture_owned_by(nf, ci, tcc_state->current_nested_func)) {
+            /* Owned entries only: an ancestor's vreg names its IR, and may
+             * lie past this one's interval arrays as well. */
+            IRLiveInterval *interval = tcc_ir_try_get_live_interval(ir, vreg);
             if (interval)
               interval->addrtaken = 0;
           }
@@ -272,7 +329,7 @@ void gen_function(Sym *sym)
   }
   if (ir && tcc_state->nb_nested_funcs > 0) {
     for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++) {
-      NestedFunc *nf = &tcc_state->nested_funcs[ni];
+      NestedFunc *nf = tcc_state->nested_funcs[ni];
       if (!nf->sym || !nf->sym->type.ref || !nf->sym->type.ref->f.func_auto_inline)
         continue;
       if (nf->trampoline_needed || nf->nb_captured == 0)
@@ -285,7 +342,7 @@ void gen_function(Sym *sym)
       int called_by_sibling = 0;
       int func_tok = nf->sym->v & ~SYM_FIELD;
       for (int si = 0; si < tcc_state->nb_nested_funcs && !called_by_sibling; si++) {
-        NestedFunc *sib = &tcc_state->nested_funcs[si];
+        NestedFunc *sib = tcc_state->nested_funcs[si];
         if (sib == nf || !sib->func_str)
           continue;
         const int *tp = tok_str_buf(sib->func_str);
@@ -300,16 +357,17 @@ void gen_function(Sym *sym)
       if (!called_by_sibling) {
         for (int ci = 0; ci < nf->nb_captured; ci++) {
           int vreg = nf->captured_vregs[ci];
-          if (vreg >= 0) {
+          if (vreg >= 0 && nested_capture_owned_by(nf, ci, tcc_state->current_nested_func)) {
             int keep_addrtaken = 0;
             for (int oi = 0; oi < tcc_state->nb_nested_funcs && !keep_addrtaken; oi++) {
-              NestedFunc *other = &tcc_state->nested_funcs[oi];
+              NestedFunc *other = tcc_state->nested_funcs[oi];
               if (other == nf || other->nb_captured == 0)
                 continue;
 
               int captures_vreg = 0;
               for (int oc = 0; oc < other->nb_captured; oc++) {
-                if (other->captured_vregs[oc] == vreg) {
+                if (other->captured_vregs[oc] == vreg &&
+                    nested_capture_owned_by(other, oc, tcc_state->current_nested_func)) {
                   captures_vreg = 1;
                   break;
                 }
@@ -327,7 +385,7 @@ void gen_function(Sym *sym)
                 int other_called_by_sibling = 0;
                 int other_func_tok = other->sym->v & ~SYM_FIELD;
                 for (int si = 0; si < tcc_state->nb_nested_funcs && !other_called_by_sibling; si++) {
-                  NestedFunc *sib = &tcc_state->nested_funcs[si];
+                  NestedFunc *sib = tcc_state->nested_funcs[si];
                   if (sib == other || !sib->func_str)
                     continue;
                   const int *tp = tok_str_buf(sib->func_str);
@@ -349,7 +407,7 @@ void gen_function(Sym *sym)
             }
 
             if (!keep_addrtaken) {
-              IRLiveInterval *interval = tcc_ir_get_live_interval(ir, vreg);
+              IRLiveInterval *interval = tcc_ir_try_get_live_interval(ir, vreg); /* may be the parent's */
               if (interval)
                 interval->addrtaken = 0;
             }
@@ -365,6 +423,20 @@ void gen_function(Sym *sym)
     gen_instrument_call(sym, "__cyg_profile_func_exit");
   }
 
+  /* A result returned in s0-s7 is loaded from the buffer the returns wrote,
+   * at the common exit after every cleanup: the last thing before the
+   * epilogue, and never a tail call. */
+  if (ir->vfp_ret_words && !ir->naked)
+  {
+    SValue buf;
+    svalue_init(&buf);
+    buf.type.t = VT_PTR;
+    buf.r = VT_LOCAL;
+    buf.vr = -1;
+    buf.c.i = ir->vfp_ret_buf;
+    gen_vfp_ret_transfer(&buf, ir->vfp_ret_words, 1);
+  }
+
   if (tcc_state->do_bench)
   {
     unsigned now = tcc_getclock_us();
@@ -378,6 +450,10 @@ void gen_function(Sym *sym)
    * two phases are synchronized here so the opt unit stays free of any
    * codegen/backend logic. */
   int nonstatic_global_copier = 0;
+  /* Before anything else reads the IR: struct-return buffers a callee could
+   * reach some other way become fresh temporaries (sret_nrvo.c). */
+  if (tcc_ir_sret_dealias(ir))
+    tcc_ir_dump_after_pass(ir, "sret_dealias");
   tcc_ir_opt_run_function_pipeline(ir, sym, func_var, &nonstatic_global_copier);
 
   tcc_ir_backend_fold_pure_forward(ir, sym);
@@ -396,16 +472,20 @@ void gen_function(Sym *sym)
 
   /* Stores writing back what was just loaded from the same frame bytes:
    * copies between objects frame relayout placed on the same slot. */
-  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("self_store") && tcc_ir_self_store(ir))
+  if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("self_store") && tcc_ir_self_store(ir))
     tcc_ir_dump_after_pass(ir, "self_store");
 
   /* Repeated single-entry regions (switch case bodies) share one copy. */
-  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("region_merge") && tcc_ir_region_merge(ir))
+  if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("region_merge") && tcc_ir_region_merge(ir))
     tcc_ir_dump_after_pass(ir, "region_merge");
 
   /* Identical block tails jumping to the same place share one copy. */
-  if (tcc_state->optimize > 0 && !tcc_ir_opt_pass_disabled("cross_jump") && tcc_ir_cross_jump(ir))
+  if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("cross_jump") && tcc_ir_cross_jump(ir))
     tcc_ir_dump_after_pass(ir, "cross_jump");
+
+  /* The merges leave branches to jumps, and jumps nothing reaches. */
+  if (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("branch_tidy") && tcc_ir_branch_tidy(ir))
+    tcc_ir_dump_after_pass(ir, "branch_tidy");
 
   tcc_ir_codegen_generate(ir);
 
@@ -455,7 +535,14 @@ void gen_function(Sym *sym)
 
   /* Infer and cache function purity for LICM optimization
    * This allows LICM to hoist calls to pure functions defined in the same TU */
-  if (tcc_state->opt_licm && ir && sym)
+  /* Nothing learned from a weak definition's body may leave this function:
+   * the link can replace it (a kernel's strong _sbrk over libc's ENOSYS
+   * default), so callers must call through the symbol and assume nothing --
+   * not its purity, not a constant result, not a trivial body to inline. */
+  const int body_is_final = sym && !sym->a.weak;
+  const int wrappers_on = !TCC_OPT(tcc_state, optimize_size) && !tcc_ir_opt_pass_disabled("inline:wrappers");
+
+  if (TCC_OPT(tcc_state, opt_licm) && ir && body_is_final)
   {
     /* Forward declare the inference function */
     extern TCCFuncPurity tcc_ir_infer_func_purity(TCCIRState * ir, Sym * func_sym);
@@ -465,7 +552,7 @@ void gen_function(Sym *sym)
     tcc_ir_cache_func_purity(tcc_state, sym->v, purity);
   }
 
-  if (tcc_state->opt_ipc && ir && sym)
+  if (TCC_OPT(tcc_state, opt_ipc) && ir && body_is_final)
   {
     int64_t const_val;
     int const_btype;
@@ -486,12 +573,56 @@ void gen_function(Sym *sym)
     }
   }
 
+  /* Read-only wrappers share the small-leaf limit; caller caps still apply. */
+  const int wrapper_inline_ops =
+      wrappers_on && !tcc_ir_opt_pass_disabled("inline:readonly_wrappers") &&
+              tcc_ir_lookup_func_purity(tcc_state, sym->v) >= TCC_FUNC_PURITY_PURE
+          ? SMALL_LEAF_INLINE_OPS
+          : WRAPPER_INLINE_OPS;
+
+  if (ir && body_is_final && sym->type.ref->f.func_auto_inline &&
+      !sym->type.ref->f.func_inl_wrapper && wrappers_on &&
+      (sym->type.t & VT_STATIC) && !sym->a.nested_func && !nonstatic_global_copier)
+  {
+    int real_ops = 0, calls = 0;
+    for (int ii = 0; ii < ir->next_instruction_index; ii++)
+    {
+      int op = ir->compact_instructions[ii].op;
+      real_ops += op != TCCIR_OP_NOP;
+      calls += (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID) &&
+               !ir_call_is_barrier(ir, &ir->compact_instructions[ii]);
+    }
+    if (calls == 1 && real_ops <= wrapper_inline_ops && ir_body_is_acyclic_wrapper(ir, 1))
+    {
+      sym->type.ref->f.func_small_leaf = 1;
+      sym->type.ref->f.func_inl_wrapper = 1;
+    }
+  }
+
   /* Post-optimization re-inlining: if the optimized IR is trivial,
    * retroactively mark the function for auto-inlining so future callers
    * inline it via the existing token-replay mechanism.
    * Skip nested functions: marking them auto_inline causes the parent
    * to omit the frame pointer, breaking static chain access. */
-  if (ir && sym && !sym->type.ref->f.func_auto_inline &&
+  /* A body registration already made auto_inline (by token length) is
+   * classified as well: as a small_leaf, the IR-size revoke below no longer
+   * demotes it, while a body over the token limit gets the same class from
+   * the block after this one.  Without it, raising -finline-limit UN-inlined
+   * straight leaves such as math.rotr (+165M instructions on zig.c at 200),
+   * and every registered leaf over 12 IR slots was judged as call-heavy. */
+  if (ir && body_is_final && sym->type.ref->f.func_auto_inline && !sym->type.ref->f.func_small_leaf &&
+      !sym->a.nested_func && !nonstatic_global_copier && (sym->type.t & VT_STATIC) &&
+      !tcc_ir_opt_pass_disabled("inline:leaf_rescue"))
+  {
+    int real_ops = 0;
+    for (int ii = 0; ii < ir->next_instruction_index; ii++)
+      if (ir->compact_instructions[ii].op != TCCIR_OP_NOP)
+        real_ops++;
+    if ((real_ops <= SMALL_LEAF_INLINE_OPS && ir_body_is_acyclic_leaf(ir)) ||
+        ir_body_is_small_loop_leaf(ir, sym, real_ops))
+      sym->type.ref->f.func_small_leaf = 1;
+  }
+  if (ir && body_is_final && !sym->type.ref->f.func_auto_inline &&
       !sym->a.nested_func &&
       !nonstatic_global_copier)
   {
@@ -504,8 +635,28 @@ void gen_function(Sym *sym)
       if (ir->compact_instructions[ii].op != TCCIR_OP_NOP)
         real_ops++;
     if (ir->next_instruction_index <= 8 || real_ops == 0)
+    {
       sym->type.ref->f.func_auto_inline = 1;
-    else if ((sym->type.t & VT_STATIC) && real_ops <= SMALL_LEAF_INLINE_OPS && ir_body_is_straight_leaf(ir))
+      /* A trivial static leaf is a small_leaf too: inlined at every site
+       * whatever its token length, where decl.c's registration would have
+       * left it eval-only (constant arguments). */
+      if ((sym->type.t & VT_STATIC) && ir_body_is_acyclic_leaf(ir) &&
+          !tcc_ir_opt_pass_disabled("inline:trivial_leaf"))
+        sym->type.ref->f.func_small_leaf = 1;
+    }
+    else if ((sym->type.t & VT_STATIC) && real_ops <= SMALL_LEAF_INLINE_OPS && ir_body_is_acyclic_leaf(ir))
+    {
+      sym->type.ref->f.func_auto_inline = 1;
+      sym->type.ref->f.func_small_leaf = 1;
+    }
+    else if (wrappers_on && (sym->type.t & VT_STATIC) && real_ops <= wrapper_inline_ops &&
+             ir_body_is_acyclic_wrapper(ir, 1))
+    {
+      sym->type.ref->f.func_auto_inline = 1;
+      sym->type.ref->f.func_small_leaf = 1;
+      sym->type.ref->f.func_inl_wrapper = 1;
+    }
+    else if (ir_body_is_small_loop_leaf(ir, sym, real_ops))
     {
       sym->type.ref->f.func_auto_inline = 1;
       sym->type.ref->f.func_small_leaf = 1;
@@ -537,7 +688,6 @@ void gen_function(Sym *sym)
   {
     int call_ops = 0;
     int has_aggr_copy = 0;
-    int has_loop = 0;
     int real_ops = 0;
     for (int ii = 0; ii < ir->next_instruction_index; ii++)
     {
@@ -551,12 +701,6 @@ void gen_function(Sym *sym)
         const char *cn = cs ? get_tok_str(cs->v, NULL) : NULL;
         if (cn && (strstr(cn, "memmove") || strstr(cn, "memcpy")))
           has_aggr_copy = 1;
-      }
-      if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
-      {
-        IROperand jd = tcc_ir_op_get_dest(ir, &ir->compact_instructions[ii]);
-        if ((int)irop_get_imm64_ex(ir, jd) <= ii)
-          has_loop = 1;
       }
     }
     /* Naturally-small functions (short token body) whose post-opt IR grew
@@ -587,22 +731,20 @@ void gen_function(Sym *sym)
      * inlined and have their standalone copy dropped by --gc-sections.) */
     int nonstatic_bloat =
         !(sym->type.t & VT_STATIC) && has_aggr_copy && ir->next_instruction_index > 8;
-    /* A body that keeps a loop after optimization is dominated by its loop at
-     * runtime, so inlining buys only the call overhead while duplicating the
-     * loop at every site — GCC keeps such helpers out of line.  The slot-count
-     * gate below used to catch these by accident (unfused 64-bit and indexed
-     * code was fat); ldrd/strd pairing shrank pr38048-2's foo from 27 slots to
-     * 24 with identical real ops and flipped it straight through the `> 24`
-     * boundary, inlining loop bodies into main in pr38048-2 (+23), pr53163
-     * (+47), 258_derived_iv_strength_reduction (+32) and builtin-bitops-1
-     * (+183).  Count real ops, not slots, so residual NOPs cannot decide.
-     * The ≤12 floor keeps tiny loop helpers inlinable for the constant-arg
-     * path, where loop_const_sim can still fold the whole thing. */
-    int loop_body = has_loop && real_ops > 12;
+    /* Tail sharing can introduce backward jumps without introducing a loop. */
+    int loop_body = !sym->type.ref->f.func_small_leaf && real_ops > 12 && tcc_ir_cfg_has_cycle(ir);
     if (!sym->type.ref->f.func_small_leaf &&
         (call_ops >= 3 || (!naturally_small && ir->next_instruction_index > 24) || nonstatic_bloat || loop_body))
     {
-      sym->type.ref->f.func_auto_inline = 0;
+      /* Wrappers keep expansion with the per-caller budget. */
+      if (wrappers_on && (sym->type.t & VT_STATIC) && !nonstatic_global_copier && real_ops <= wrapper_inline_ops &&
+          ir_body_is_acyclic_wrapper(ir, 1))
+      {
+        sym->type.ref->f.func_small_leaf = 1;
+        sym->type.ref->f.func_inl_wrapper = 1;
+      }
+      else
+        sym->type.ref->f.func_auto_inline = 0;
     }
     /* A loop the body keeps is only worth duplicating at an all-constant call
      * site if ssa:loop_const_sim can then collapse it, which it only does for
@@ -610,6 +752,21 @@ void gen_function(Sym *sym)
      * hand, so tccgen keeps the token stream for exactly those helpers. */
     if (loop_body && ir_body_is_register_only(ir))
       sym->type.ref->f.func_const_arg_loop = 1;
+  }
+
+  /* Keep read-only loops visible to call-result reuse; see docs/inline_readonly_wrappers.md. */
+  if (ir && body_is_final && sym->type.ref->f.func_auto_inline &&
+      !sym->type.ref->f.func_alwinl && !tcc_ir_opt_pass_disabled("inline:readonly_loops"))
+  {
+    TCCFuncPurity purity = tcc_ir_lookup_func_purity(tcc_state, sym->v);
+    if (purity == TCC_FUNC_PURITY_UNKNOWN)
+      purity = tcc_ir_infer_func_purity(ir, sym);
+    if (purity >= TCC_FUNC_PURITY_PURE && !ir_body_is_register_only(ir) && tcc_ir_cfg_has_cycle(ir))
+    {
+      sym->type.ref->f.func_auto_inline = 0;
+      sym->type.ref->f.func_small_leaf = 0;
+      sym->type.ref->f.func_inl_wrapper = 0;
+    }
   }
 
   /* Mark surviving auto-inline candidates whose body keeps a non-trivial,
@@ -625,7 +782,8 @@ void gen_function(Sym *sym)
     for (int ii = 0; ii < ir->next_instruction_index; ii++)
     {
       int op = ir->compact_instructions[ii].op;
-      if (op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID)
+      if ((op == TCCIR_OP_FUNCCALLVAL || op == TCCIR_OP_FUNCCALLVOID) &&
+          !ir_call_is_barrier(ir, &ir->compact_instructions[ii]))
       {
         sym->type.ref->f.func_inline_call_heavy = 1;
         break;
@@ -667,6 +825,14 @@ void gen_function(Sym *sym)
     ind = func_ind - func_align_pad;
     cur_text_section->data_offset = ind;
   }
+  /* Publish what ra:known_ext proved r0 holds at every return, for the direct
+   * calls compiled after this.  A folded body is another function's, which
+   * may yet be recompiled under its own promise: publish nothing for it.  A
+   * recompile only ever narrows the class -- gfunc_return masked every return
+   * value to the one callers were already given. */
+  else if (ir && sym->type.ref && ir->ret_zext_class &&
+           (!sym->type.ref->f.func_ret_zext || ir->ret_zext_class < sym->type.ref->f.func_ret_zext))
+    sym->type.ref->f.func_ret_zext = ir->ret_zext_class;
   local_scope = 0;
   label_pop(&global_label_stack, global_label_stack_start, 0);
 
@@ -680,7 +846,13 @@ void gen_function(Sym *sym)
       if (esym_plus && esym_minus)
       {
         int32_t diff = (int32_t)esym_plus->st_value - (int32_t)esym_minus->st_value;
-        add32le(f->sec->data + f->offset, diff);
+        unsigned char *where = f->sec->data + f->offset;
+        if (f->size == 1)
+          where[0] = (unsigned char)(where[0] + diff);
+        else if (f->size == 2)
+          write16le(where, (uint16_t)(read16le(where) + diff));
+        else
+          add32le(where, diff);
       }
       tcc_free(f);
       f = next;
@@ -774,10 +946,10 @@ void gen_function_check_only(Sym *sym)
     tcc_state->label_diff_fixups = next;
   }
   for (int i = nested_start; i < tcc_state->nb_nested_funcs; i++)
-    if (tcc_state->nested_funcs[i].func_str)
+    if (tcc_state->nested_funcs[i]->func_str)
     {
-      tok_str_free(tcc_state->nested_funcs[i].func_str);
-      tcc_state->nested_funcs[i].func_str = NULL;
+      tok_str_free(tcc_state->nested_funcs[i]->func_str);
+      tcc_state->nested_funcs[i]->func_str = NULL;
     }
   tcc_state->nb_nested_funcs = nested_start;
 

@@ -134,11 +134,9 @@ static int ssa_mark_addrtaken(TCCIRState *ir, IRQuadCompact *q, SSABitset *addrt
 {
   int32_t vr = -1;
   if (q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_ASM_INPUT) {
-    IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    vr = irop_get_vreg(src1);
+    vr = tcc_ir_op_src1_vreg(ir, q);
   } else if (q->op == TCCIR_OP_ASM_OUTPUT) {
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    vr = irop_get_vreg(dest);
+    vr = tcc_ir_op_dest_vreg(ir, q);
   } else {
     return 0;
   }
@@ -155,6 +153,9 @@ static int ssa_mark_addrtaken(TCCIRState *ir, IRQuadCompact *q, SSABitset *addrt
  * modifications made between setjmp and longjmp if locals are in regs. */
 static int ssa_has_unsupported_ops(TCCIRState *ir)
 {
+  /* asm goto: the labels' edges are not in the CFG (see func_has_asm_goto) */
+  if (ir->func_has_asm_goto)
+    return 1;
   for (int i = 0; i < ir->next_instruction_index; i++) {
     TccIrOp op = ir->compact_instructions[i].op;
     if (op == TCCIR_OP_IJUMP || op == TCCIR_OP_SETJMP || op == TCCIR_OP_NL_SETJMP)
@@ -507,8 +508,7 @@ static void ssa_scan_var_global(TCCIRState *ir, IRCFG *cfg, SSAVarInfo *info,
         q->op == TCCIR_OP_FUNCPARAMVOID)
       continue;
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int pos = ssa_global_var_pos(irop_get_vreg(d), num_vars);
+      int pos = ssa_global_var_pos(tcc_ir_op_dest_vreg(ir, q), num_vars);
       if (pos >= 0 && blk >= 0)
         gs.killed[pos] = blk + 1; /* fresh full definition */
     }
@@ -1194,7 +1194,7 @@ void tcc_ir_ssa_rename(TCCIRState *ir, IRSSAState *ssa)
     }
   }
 
-  tcc_ir_vreg_ensure_temp_capacity(ir, next_temp_pos);
+  tcc_ir_vreg_fit_intervals(ir, next_temp_pos);
   ir->next_temporary_variable = next_temp_pos;
 
   for (int v = 0; v < num_vars; v++)

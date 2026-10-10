@@ -36,3 +36,8 @@ int tcc_ir_ssa_opt_local_addr_cse(struct TCCIRState *ir);
  * Returns the number of materializations inserted. */
 int tcc_ir_ssa_opt_loop_addr_hoist(struct TCCIRState *ir);
 
+
+/* -Os: a constant outside MOVS range that a function stores, passes or copies
+ * at several sites is materialised once at entry into a temp the sites read.
+ * Returns the number of materializations inserted. */
+int tcc_ir_ssa_opt_os_const_share(struct TCCIRState *ir);

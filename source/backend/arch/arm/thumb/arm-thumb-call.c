@@ -38,6 +38,10 @@
  * and __builtin_apply. */
 
 #include "arm-thumb-gen.h"
+#include "source/backend/arch/arm/thumb/thop_ldaex.h"
+#include "source/backend/arch/arm/thumb/thop_ldrex.h"
+#include "source/backend/arch/arm/thumb/thop_mrs.h"
+#include "source/backend/arch/arm/thumb/thop_mem_exclusive.h"
 
 static int get_struct_base_addr_mop(const MachineOperand *mop, int default_reg);
 static int find_call_scratch(uint32_t extra_exclude, uint32_t arg_move_dst_mask);
@@ -200,11 +204,9 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
      * from three words up: at two, the LDRD in the loop below is already one
      * 4-byte instruction.
      *
-     * th_ldm() silently strips the base register from the list when there is no
-     * writeback, so a base sitting inside the destination range would quietly
-     * load one register too few — reject that here instead of relying on the
-     * helper.  PC and SP must stay out of the list too: PC would turn the load
-     * into a branch. */
+     * A base inside the destination range would be clobbered mid-transfer by
+     * the loaded word, so keep it out.  PC and SP must stay out of the list
+     * too: PC would turn the load into a branch. */
     int last_dst = base_dst + word_count - 1;
     if (word_count >= 3 && src_aligned && base_addr_reg != R_SP && base_dst >= 0 && last_dst <= R_IP &&
         !(base_addr_reg >= base_dst && base_addr_reg <= last_dst))
@@ -294,7 +296,7 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
          * Otherwise the 64-bit load_from_base path, which preserves the base
          * when base == dst_reg (the lo-load would clobber it before the
          * hi-load can use it) and stays unaligned-safe. */
-        if (!(m->mop.align4 && try_ldrd_pair(m->dst_reg, m->dst_reg_hi, base, 0, 0)))
+        if (!(m->mop.align4 && !m->mop.underalign_hint && try_ldrd_pair(m->dst_reg, m->dst_reg_hi, base, 0, 0)))
           load_from_base(m->dst_reg, m->dst_reg_hi, IROP_BTYPE_INT64, 0, 0, 0, (uint32_t)base);
       }
       else
@@ -405,6 +407,9 @@ static void thumb_emit_arg_move(const ThumbArgMove *m)
 
       case MACH_OP_IMM:
         tcc_machine_load_constant(dst, PREG_REG_NONE, mop->u.imm.val, 0, NULL);
+        /* `*(volatile T *)0x40000000`: the register's value, not its address. */
+        if (mop->needs_deref)
+          load_from_base(dst, PREG_REG_NONE, mop->btype, (int)mop->is_unsigned, 0, 0, (uint32_t)dst);
         handled = 1;
         break;
 
@@ -557,7 +562,7 @@ static void thumb_emit_parallel_arg_moves(ThumbArgMove *moves, int move_count)
         }
       }
       if (cyc < 0)
-        tcc_error("compiler_error: arg move cycle without reg sources");
+        tcc_ice("arg move cycle without reg sources");
 
       if (!have_tmp)
       {
@@ -713,7 +718,7 @@ static int build_reg_move_64bit(ThumbArgMove *moves, int move_count, const Machi
       moves[move_count++] =
           (ThumbArgMove){.kind = THUMB_ARG_MOVE_REG, .dst_reg = base_reg + 1, .src_reg = mop->u.reg.r1};
   }
-  else if (mop->kind == MACH_OP_IMM)
+  else if (mop->kind == MACH_OP_IMM && !mop->needs_deref)
   {
     const uint64_t imm64 = (uint64_t)mop->u.imm.val;
     moves[move_count++] =
@@ -752,8 +757,14 @@ static int build_reg_move_32bit(ThumbArgMove *moves, int move_count, const Machi
     break;
 
   case MACH_OP_IMM:
-    moves[move_count++] =
-        (ThumbArgMove){.kind = THUMB_ARG_MOVE_IMM, .dst_reg = base_reg, .imm = (uint32_t)mop->u.imm.val, .sym = NULL};
+    /* An absolute-address lvalue -- an MMIO register passed straight to a call,
+     * pico-sdk's SDIO_ERRMSG(..., SDIO_PIO->sm[0].addr, SDIO_PIO->ctrl) -- is a
+     * load through the address at emit time, not the address itself. */
+    if (mop->needs_deref)
+      moves[move_count++] = (ThumbArgMove){.kind = THUMB_ARG_MOVE_MOP, .dst_reg = base_reg, .mop = *mop};
+    else
+      moves[move_count++] =
+          (ThumbArgMove){.kind = THUMB_ARG_MOVE_IMM, .dst_reg = base_reg, .imm = (uint32_t)mop->u.imm.val, .sym = NULL};
     break;
 
   case MACH_OP_SYMBOL:
@@ -879,7 +890,7 @@ static void thumb_emit_word_copy_r0_r1(int size)
     ot_check(th_sub_imm(ARM_LR, ARM_LR, 1, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
     const int off = top - (ind + 4);
     if (off < -256)
-      tcc_error("compiler_error: word copy loop out of branch range");
+      tcc_ice("word copy loop out of branch range");
     ot_check(th_b_t1(1 /* NE */, (uint32_t)(off >> 1)));
     left %= 3;
   }
@@ -906,7 +917,7 @@ static void thumb_emit_word_copy_r0_r1(int size)
 }
 
 static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc *loc, int stack_offset,
-                                   int src_align, uint32_t arg_move_dst_mask)
+                                   int src_align, uint32_t arg_move_dst_mask, uint32_t live_mask)
 {
   int words_in_regs = (loc->kind == TCC_ABI_LOC_REG_STACK) ? loc->reg_count : 0;
   int struct_src_offset = words_in_regs * 4;
@@ -920,24 +931,51 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
    * computed meanwhile. */
   if (words >= STACK_ARG_MEMCPY_MIN_WORDS)
   {
-    const uint16_t saved = (uint16_t)((1u << R0) | (1u << R1) | (1u << R2) | (1u << R3) | (1u << R12) | (1u << ARM_LR));
-    ot_check(th_push(saved));
-    helper_call_sp_bias += 24;
+    /* Only the registers that hold something the rest of the call setup still
+     * reads are saved (live_mask, call_live_regs); the others -- the common
+     * case, the argument registers are loaded after the stack arguments -- are
+     * free, and the push/pop pair around the copy (6 registers, 24 bytes of
+     * SP bias) vanishes.  The memcpy call clobbers all six, so it keeps them. */
+    const uint16_t all6 = (uint16_t)((1u << R0) | (1u << R1) | (1u << R2) | (1u << R3) | (1u << R12) | (1u << ARM_LR));
+    const uint16_t saved = (src_align >= 4) ? (uint16_t)(all6 & live_mask) : all6;
+    const int nsaved = __builtin_popcount(saved);
+    if (saved)
+      ot_check(th_push(saved));
+    helper_call_sp_bias += nsaved * 4;
     int src = get_struct_base_addr_mop(mop, R1);
-    if (src != R1)
-      ot_check_mov_reg(R1, (uint32_t)src, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
-    if (struct_src_offset)
-      ot_check(th_add_imm(R1, R1, (uint32_t)struct_src_offset, flags_safe(), ENFORCE_ENCODING_NONE));
-    load_immediate(R0, stack_offset + scratch_push_sp_bias() - call_args_sp_bias, NULL, false);
-    ot_check(th_add_reg(R0, R0, ARM_SP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    /* `add r1, src, #off` and `add r0, sp, #off` in one instruction each, where
+     * the offset encodes (TCC_DISABLE_PASS=codegen:copy_addr_fuse: the old
+     * mov + adds / movs + add pairs). */
+    const int fuse = !tcc_ir_opt_pass_disabled("codegen:copy_addr_fuse");
+    thumb_opcode fused;
+    if (fuse && src != R1 && struct_src_offset &&
+        (fused = th_add_imm(R1, (uint32_t)src, (uint32_t)struct_src_offset, flags_safe(), ENFORCE_ENCODING_NONE)).size)
+      ot_check(fused);
+    else
+    {
+      if (src != R1)
+        ot_check_mov_reg(R1, (uint32_t)src, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
+      if (struct_src_offset)
+        ot_check(th_add_imm(R1, R1, (uint32_t)struct_src_offset, flags_safe(), ENFORCE_ENCODING_NONE));
+    }
+    const int dst_off = stack_offset + scratch_push_sp_bias() - call_args_sp_bias;
+    if (fuse && dst_off >= 0 &&
+        (fused = th_add_imm(R0, ARM_SP, (uint32_t)dst_off, flags_safe(), ENFORCE_ENCODING_NONE)).size)
+      ot_check(fused);
+    else
+    {
+      load_immediate(R0, dst_off, NULL, false);
+      ot_check(th_add_reg(R0, R0, ARM_SP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
+    }
     if (src_align >= 4)
     {
       /* A word-aligned source copies inline: the saved registers are all free
        * now.  A memcpy call cost ~75 instructions for the 48-256 byte structs
        * the Zig C backend passes by value. */
       thumb_emit_word_copy_r0_r1(words * 4);
-      ot_check(th_pop(saved));
-      helper_call_sp_bias -= 24;
+      if (saved)
+        ot_check(th_pop(saved));
+      helper_call_sp_bias -= nsaved * 4;
       return;
     }
     load_immediate(R2, words * 4, NULL, false);
@@ -951,7 +989,7 @@ static void place_stack_arg_struct(const MachineOperand *mop, const TCCAbiArgLoc
     if (text_and_data_separation)
       ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));
     ot_check(th_pop(saved));
-    helper_call_sp_bias -= 24;
+    helper_call_sp_bias -= nsaved * 4;
     return;
   }
 
@@ -1265,7 +1303,7 @@ static void place_stack_arg_64bit(const MachineOperand *mop, int stack_offset, T
       store_word_to_stack(mop->u.reg.r1, hi_offset);
     }
   }
-  else if (mop->kind == MACH_OP_IMM)
+  else if (mop->kind == MACH_OP_IMM && !mop->needs_deref)
   {
     uint64_t imm64 = (uint64_t)mop->u.imm.val;
     uint32_t lo_val = (uint32_t)imm64;
@@ -1388,6 +1426,8 @@ static void place_stack_arg_32bit(const MachineOperand *mop, int stack_offset, C
   {
     int scr = find_call_scratch(0, ctx->arg_move_dst_mask);
     load_immediate(scr, (uint32_t)mop->u.imm.val, NULL, false);
+    if (mop->needs_deref) /* an absolute-address lvalue: its value */
+      load_from_base(scr, PREG_REG_NONE, mop->btype, mop->is_unsigned, 0, 0, scr);
     store_word_to_stack(scr, stack_offset);
     break;
   }
@@ -1485,7 +1525,7 @@ static int build_register_arg_moves(CallGenContext *ctx, ThumbArgMove *reg_moves
     else if (is_64bit)
     {
       if (loc->reg_count < 2)
-        tcc_error("compiler_error: 64-bit register argument has insufficient registers");
+        tcc_ice("64-bit register argument has insufficient registers");
       move_count = build_reg_move_64bit(reg_moves, move_count, mop, arg, base_reg, ctx->call_site, tcc_state->ir);
     }
     else
@@ -1497,33 +1537,111 @@ static int build_register_arg_moves(CallGenContext *ctx, ThumbArgMove *reg_moves
   return move_count;
 }
 
-/* Place hard-float single-precision arguments into their VFP argument registers
- * (s0..s15).  Emitted AFTER the GPR argument moves so r0-r3 already hold their
- * final values.  VFP-resident sources form a permutation among the s-registers,
- * resolved as a parallel move with VFP_SCRATCH0 (s14) breaking any cycle; other
- * sources (imm/memory) are materialized through a GPR scratch that excludes the
- * GPR argument registers. */
-static void emit_vfp_arg_moves(CallGenContext *ctx)
+/* An HFA struct or _Complex float/double argument: its words are loaded into
+ * s<reg_base>.. (see emit_vfp_composite_arg) rather than moved as a scalar. */
+static int vfp_arg_is_composite(const CallGenContext *ctx, int i)
 {
-  int dst[16], src[16];
-  const MachineOperand *mop[16];
-  int n = 0;
-  const uint32_t gpr_excl_all = (uint32_t)(ctx->call_site->registers_map & 0xffffu);
+  return ctx->layout->locs[i].kind == TCC_ABI_LOC_VFP_REG &&
+         (ctx->mops[i].btype == IROP_BTYPE_STRUCT || ctx->mops[i].is_complex);
+}
 
-  for (int i = 0; i < ctx->argc && n < 16; ++i)
+/* Core registers the composite VFP arguments still read: an aggregate's
+ * address, or a _Complex float's value pair.  Their loads run after the stack
+ * arguments are placed, so stack placement must not take them as scratch. */
+static uint32_t vfp_composite_src_regs(const CallGenContext *ctx)
+{
+  uint32_t regs = 0;
+  for (int i = 0; i < ctx->argc; ++i)
   {
-    const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
-    if (loc->kind != TCC_ABI_LOC_VFP_REG)
+    const MachineOperand *m = &ctx->mops[i];
+    if (!vfp_arg_is_composite(ctx, i) || m->kind != MACH_OP_REG)
       continue;
+    if (m->u.reg.r0 >= 0 && m->u.reg.r0 < 16)
+      regs |= 1u << m->u.reg.r0;
+    if (m->is_complex && !m->needs_deref && m->is_64bit && m->u.reg.r1 >= 0 && m->u.reg.r1 < 16)
+      regs |= 1u << m->u.reg.r1;
+  }
+  return regs;
+}
 
-    /* Double: the value lives in a GPR pair (doubles are not VFP-resident —
-     * there is no double-precision arithmetic on this FPU), so pack the two
-     * halves straight into the d-register.  Emitted immediately: d-registers
-     * are not sources for any other argument move. */
-    if (loc->reg_count == 2)
+/* Load composite VFP argument `i` into s<reg_base>..s<reg_base+reg_count-1>:
+ * word w of its memory image goes to s<reg_base+w>, which puts each double in
+ * its d-register low word first. */
+static void emit_vfp_composite_arg(CallGenContext *ctx, int i)
+{
+  const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
+  const MachineOperand *m = &ctx->mops[i];
+  const int sbase = loc->reg_base, words = loc->reg_count;
+
+  /* A _Complex float held as a value: in a core register pair, or packed in
+   * a 64-bit immediate (real low, imaginary high). */
+  if (m->is_complex && !m->needs_deref && words == 2 && (m->kind == MACH_OP_REG && m->is_64bit))
+  {
+    ot_check(th_vmov_gp_sp((uint16_t)m->u.reg.r0, (uint16_t)sbase, 0));
+    ot_check(th_vmov_gp_sp((uint16_t)m->u.reg.r1, (uint16_t)(sbase + 1), 0));
+    return;
+  }
+  if (m->is_complex && words == 2 && m->kind == MACH_OP_IMM)
+  {
+    const uint64_t imm64 = (uint64_t)m->u.imm.val;
+    const int r = find_call_scratch(0, ctx->arg_move_dst_mask);
+    for (int w = 0; w < 2; ++w)
     {
-      MachineCodegenContext mctx = {0};
-      MachineOperand m = ctx->mops[i];
+      load_immediate(r, (uint32_t)(imm64 >> (32 * w)), NULL, false);
+      ot_check(th_vmov_gp_sp((uint16_t)r, (uint16_t)(sbase + w), 0));
+    }
+    return;
+  }
+
+  /* In the frame: VLDR straight off sp/fp at the offsets get_struct_base_addr_mop
+   * would address (as the core-register struct path does), when every word is
+   * aligned and in VLDR's +-1020 range. */
+  if ((m->kind == MACH_OP_SPILL && !m->needs_deref) || m->kind == MACH_OP_PARAM_STACK ||
+      m->kind == MACH_OP_FRAME_ADDR)
+  {
+    const int off = m->kind == MACH_OP_PARAM_STACK
+                        ? param_frame_offset(m->u.param.offset)
+                        : fp_adjust_local_offset(m->kind == MACH_OP_SPILL ? m->u.spill.offset : m->u.frame.offset, 0);
+    const int fbase = tcc_state->need_frame_pointer ? R_FP : R_SP;
+    if (!(off & 3) && off >= -1020 && off + 4 * (words - 1) <= 1020)
+    {
+      for (int w = 0; w < words; ++w)
+        ot_check(th_vldr((uint32_t)(sbase + w), (uint32_t)fbase, off + 4 * w, 0));
+      return;
+    }
+  }
+
+  /* In memory: VLDR straight from its address, which must be word aligned
+   * (VLDR faults on any other); a packed one goes word by word through a core
+   * register. */
+  int align = 0;
+  irop_type_size_align(ctx->args[i], &align);
+  const int scratch = find_call_scratch(0, ctx->arg_move_dst_mask);
+  const int base = get_struct_base_addr_mop(m, scratch);
+  if (align >= 4)
+  {
+    for (int w = 0; w < words; ++w)
+      ot_check(th_vldr((uint32_t)(sbase + w), (uint32_t)base, 4 * w, 0));
+    return;
+  }
+  const int r = find_call_scratch(1u << base, ctx->arg_move_dst_mask);
+  for (int w = 0; w < words; ++w)
+  {
+    load_struct_word_into(r, base, 4 * w);
+    ot_check(th_vmov_gp_sp((uint16_t)r, (uint16_t)(sbase + w), 0));
+  }
+}
+
+/* Pack one double argument (GPR pair / memory) into its d-register. */
+static void emit_vfp_double_arg(CallGenContext *ctx, int i, uint32_t gpr_excl_all)
+{
+  const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
+  MachineCodegenContext mctx = {0};
+      /* A double read through a pointer (`f(va_arg(ap, double))` passes
+       * T***DEREF***) holds an address, not a pair: load both words first,
+       * as the soft-float path does, keeping clear of the GPR arguments. */
+      uint32_t excl = gpr_excl_all;
+      MachineOperand m = mach_resolve_deref_64(&mctx, &ctx->mops[i], &excl);
       MachineOperand lo = mach_make_lo_half(&m);
       MachineOperand hi = mach_make_hi_half(&m);
       lo.btype = IROP_BTYPE_INT32;
@@ -1532,18 +1650,56 @@ static void emit_vfp_arg_moves(CallGenContext *ctx)
       int rhi = mach_ensure_in_reg(&mctx, &hi, gpr_excl_all | (1u << (uint32_t)rlo));
       ot_check(th_vmov_2gp_dp((uint16_t)rlo, (uint16_t)rhi, (uint16_t)(loc->reg_base / 2), 0));
       mach_release_all(&mctx);
+}
+
+/* Place hard-float arguments into their VFP argument registers (s0..s15), in
+ * two phases around the GPR argument moves.
+ *
+ * Phase 0 runs before them, while every source register is still intact: the
+ * single-precision arguments that are VFP-resident form a permutation among
+ * the s-registers, resolved as a parallel move with VFP_SCRATCH0 (s14)
+ * breaking any cycle; then the composite arguments (HFA, _Complex) are loaded
+ * -- after the permutation, which may still read the s-registers they fill,
+ * and before the GPR moves, which may overwrite the address they load from.
+ *
+ * Phase 1 runs after them, so r0-r3 already hold their final values: the
+ * single-precision arguments materialized through a GPR scratch (imm/memory)
+ * that excludes the GPR argument registers, then the doubles, packed from GPR
+ * pairs. */
+static void emit_vfp_arg_moves(CallGenContext *ctx, int phase)
+{
+  int dst[16], src[16];
+  int dbl_arg[16];
+  int ndbl = 0;
+  const MachineOperand *mop[16];
+  int n = 0;
+  const uint32_t gpr_excl_all = (uint32_t)(ctx->call_site->registers_map & 0xffffu);
+
+  for (int i = 0; i < ctx->argc && n < 16; ++i)
+  {
+    const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
+    if (loc->kind != TCC_ABI_LOC_VFP_REG || vfp_arg_is_composite(ctx, i))
+      continue;
+
+    /* Double: the value lives in a GPR pair (doubles are not VFP-resident —
+     * there is no double-precision arithmetic on this FPU), so pack the two
+     * halves straight into the d-register, last: the pack sources are
+     * GPRs/memory, and float destinations never overlap a double's pair. */
+    if (loc->reg_count == 2)
+    {
+      if (phase == 1 && ndbl < 16)
+        dbl_arg[ndbl++] = i;
       continue;
     }
-
-    dst[n] = loc->reg_base;
     const MachineOperand *m = &ctx->mops[i];
-    src[n] = (m->kind == MACH_OP_VFP_REG) ? m->u.reg.r0 : -1; /* -1 = materialize */
+    const int vfp_src = (m->kind == MACH_OP_VFP_REG) ? m->u.reg.r0 : -1; /* -1 = materialize */
+    if ((vfp_src >= 0) != (phase == 0))
+      continue;
+    dst[n] = loc->reg_base;
+    src[n] = vfp_src;
     mop[n] = m;
     n++;
   }
-  if (n == 0)
-    return;
-
   const uint32_t gpr_excl = gpr_excl_all;
   int remaining = n;
   while (remaining > 0)
@@ -1591,6 +1747,40 @@ static void emit_vfp_arg_moves(CallGenContext *ctx)
         }
     }
   }
+  if (phase == 0)
+  {
+    for (int i = 0; i < ctx->argc; ++i)
+      if (vfp_arg_is_composite(ctx, i))
+        emit_vfp_composite_arg(ctx, i);
+    return;
+  }
+  for (int k = 0; k < ndbl; ++k)
+    emit_vfp_double_arg(ctx, dbl_arg[k], gpr_excl_all);
+}
+
+/* The argument register that receives the indirect call target held in REG
+ * when the target is also passed as a 32-bit register argument (`v(n, v)`),
+ * or -1.  Once the argument moves are done that register holds the target, so
+ * the call branches through it and needs no holding register.  REG itself is
+ * preferred: an identity argument is never written. */
+static int call_target_arg_reg(const CallGenContext *ctx, int reg)
+{
+  int found = -1;
+  for (int i = 0; i < ctx->argc; ++i)
+  {
+    const TCCAbiArgLoc *loc = &ctx->layout->locs[i];
+    const MachineOperand *mop = &ctx->mops[i];
+    if (loc->kind != TCC_ABI_LOC_REG || loc->reg_count != 1)
+      continue;
+    if (mop->kind != MACH_OP_REG || mop->needs_deref || mop->is_64bit || mop->is_complex ||
+        mop->btype == IROP_BTYPE_STRUCT || mop->u.reg.r0 != reg)
+      continue;
+    if (ARM_R0 + loc->reg_base == reg)
+      return reg;
+    if (found < 0)
+      found = ARM_R0 + loc->reg_base;
+  }
+  return found;
 }
 
 /* Pre-save stack arguments that source from R0-R3 before register shuffle */
@@ -1640,7 +1830,7 @@ static void presave_stack_args_from_arg_regs(CallGenContext *ctx)
 static int is_simple_imm_stack_arg(const TCCAbiArgLoc *loc, const MachineOperand *mop)
 {
   return loc->kind != TCC_ABI_LOC_REG && loc->kind != TCC_ABI_LOC_VFP_REG && mop->kind == MACH_OP_IMM &&
-         !mop->is_64bit && mop->btype != IROP_BTYPE_STRUCT && !mop->is_complex;
+         !mop->needs_deref && !mop->is_64bit && mop->btype != IROP_BTYPE_STRUCT && !mop->is_complex;
 }
 
 /* Order by 4 KB window, then value, then offset.  Grouping equal values within a
@@ -1658,6 +1848,44 @@ static int stack_imm_arg_cmp(const void *a, const void *b)
   if (x->off != y->off)
     return x->off < y->off ? -1 : 1;
   return 0;
+}
+
+/* The core registers in R0-R3, IP, LR that still hold a value the call setup
+ * reads after stack argument ARG_INDEX is placed: every register a pending
+ * register move, a later stack argument or the call target names, and every
+ * register already protected (identity arguments, move sources, the pre-saved
+ * target).  Everything else is dead at the call -- the call clobbers it, so
+ * nothing lives in it across the call -- and a block copy may use it freely.
+ * TCC_DISABLE_PASS=codegen:struct_arg_live_save restores the full save. */
+static uint32_t call_live_regs(const CallGenContext *ctx, int arg_index, const TCCAbiArgLoc *loc)
+{
+  const uint32_t all6 = (1u << R0) | (1u << R1) | (1u << R2) | (1u << R3) | (1u << R12) | (1u << ARM_LR);
+  if (tcc_ir_opt_pass_disabled("codegen:struct_arg_live_save"))
+    return all6;
+  uint32_t live = scratch_global_exclude | ctx->call_target_regs;
+  for (int i = 0; i < ctx->argc; ++i)
+  {
+    const MachineOperand *m = &ctx->mops[i];
+    const TCCAbiArgLoc *li = &ctx->layout->locs[i];
+    /* A stack-only argument placed before this one (or this one) is read. */
+    if (li->kind != TCC_ABI_LOC_REG && li->kind != TCC_ABI_LOC_REG_STACK && li->kind != TCC_ABI_LOC_VFP_REG &&
+        i <= arg_index)
+      continue;
+    if (m->kind != MACH_OP_REG)
+      continue;
+    /* A scalar stack argument held in R0-R3 was stored by
+     * presave_stack_args_from_arg_regs before any placement: dead by now. */
+    if (li->kind != TCC_ABI_LOC_REG && li->kind != TCC_ABI_LOC_REG_STACK && li->kind != TCC_ABI_LOC_VFP_REG &&
+        !m->needs_deref && m->btype != IROP_BTYPE_STRUCT && !m->is_complex &&
+        ((m->u.reg.r0 >= 0 && m->u.reg.r0 <= ARM_R3) ||
+         (m->is_64bit && m->u.reg.r1 >= 0 && m->u.reg.r1 <= ARM_R3)))
+      continue;
+    if (m->u.reg.r0 >= 0 && m->u.reg.r0 < 16)
+      live |= 1u << m->u.reg.r0;
+    if (m->u.reg.r1 >= 0 && m->u.reg.r1 < 16)
+      live |= 1u << m->u.reg.r1;
+  }
+  return live & all6;
 }
 
 /* Emit a single non-simple-immediate stack argument (struct/complex/64-bit, or a
@@ -1712,7 +1940,8 @@ static void place_one_stack_arg(CallGenContext *ctx, const TCCAbiArgLoc *loc, co
         if (a > 0)
           src_align = a;
       }
-      place_stack_arg_struct(mop, loc, stack_offset, src_align, ctx->arg_move_dst_mask);
+      place_stack_arg_struct(mop, loc, stack_offset, src_align, ctx->arg_move_dst_mask,
+                             call_live_regs(ctx, arg_index, loc));
     }
   }
   else if (mop->is_64bit)
@@ -1861,7 +2090,7 @@ static void place_stack_arguments(CallGenContext *ctx)
     items[n].val = (uint32_t)mop->u.imm.val;
     n++;
   }
-  qsort(items, n, sizeof(StackImmArg), stack_imm_arg_cmp);
+  tcc_qsort(items, n, sizeof(StackImmArg), stack_imm_arg_cmp);
 
   uint32_t saved_excl = scratch_global_exclude;
   scratch_global_exclude |= (1u << rv) | (1u << rb);
@@ -1928,28 +2157,11 @@ static void place_stack_arguments(CallGenContext *ctx)
  *   MACH_OP_NONE  — no-op (void return or drop_value)
  * 64-bit pairs (int64, double, complex float) are split into lo/hi halves
  * via mach_make_lo_half / mach_make_hi_half (R0 → lo, R1 → hi). */
-/* True when a call targets a soft-float __aeabi_* runtime helper, which returns
- * a float in R0 (soft ABI) even under hard-float — as opposed to a user
- * function, which returns it in s0.  The __aeabi_ namespace is reserved, so the
- * name is an unambiguous signal. */
+/* True when a call targets a soft-float __aeabi_* runtime helper (see
+ * thumb_callee_sym_is_aeabi). */
 static int mach_callee_is_aeabi(const MachineOperand *func_mop)
 {
-  if (func_mop->kind != MACH_OP_SYMBOL || !func_mop->u.sym.sym)
-    return 0;
-  const char *name = get_tok_str(func_mop->u.sym.sym->v, NULL);
-  return name && strncmp(name, "__aeabi_", 8) == 0;
-}
-
-/* True when the callee is a variadic (FUNC_ELLIPSIS) function.  Such a callee
- * receives every argument by the base (GPR) standard, so FP arguments are not
- * placed in VFP registers.  Indirect calls (no symbol) are assumed non-variadic
- * — function pointers to variadic functions are rare. */
-static int mach_callee_is_variadic(const MachineOperand *func_mop)
-{
-  if (func_mop->kind != MACH_OP_SYMBOL || !func_mop->u.sym.sym)
-    return 0;
-  Sym *s = func_mop->u.sym.sym;
-  return s->type.ref && s->type.ref->f.func_type == FUNC_ELLIPSIS;
+  return func_mop->kind == MACH_OP_SYMBOL && thumb_callee_sym_is_aeabi(func_mop->u.sym.sym);
 }
 
 /* True when the callee is a function this translation unit has already
@@ -2220,20 +2432,30 @@ static int thumb_inline_copy_mode(TCCIRState *ir, MachineOperand func_mop, const
   int n = irop_get_imm32(n_op);
   /* -Os: a copy longer than the largest copy stub stays the call (a MOVS and
    * a BL) -- inline it is a 14-byte LDM/STM loop plus its count and tail. */
-  if (tcc_state->optimize_size && n > COPY_STUB_MAX_WORDS * 4)
+  if (TCC_OPT(tcc_state, optimize_size) && n > COPY_STUB_MAX_WORDS * 4)
     return 0;
+  /* A volatile side keeps its accesses visible in THIS function -- the
+   * volatile_trace contract: exact widths, counts and order.  The __tcc_wcopy_N
+   * stubs and thumb_emit_word_copy_r0_r1's own loop hide the accesses inside
+   * libtcc1 / one shared routine, so a volatile copy expands unrolled here
+   * instead (mode 3; vstore leaves the copy's argument operands unmarked for
+   * exactly this query).  The unrolled body moves whole words only, so a
+   * plain-variant copy with a byte tail keeps its call. */
+  const int copy_volatile = tcc_ir_access_is_volatile(ir, args[0]) || tcc_ir_access_is_volatile(ir, args[1]);
   /* An unaligned-contract copy whose pointers are word aligned after all: a
    * string literal copied into a char array field of a word-aligned local
    * (Zig's `undefined` fill, 48 bytes in every Wyhash.init). */
   if ((!strcmp(nm, "__aeabi_memcpy") || !strcmp(nm, "__aeabi_memmove")) && n >= 8 && inline_copy_max() &&
       thumb_copy_arg_word_aligned(ir, args[0]) && thumb_copy_arg_word_aligned(ir, args[1]) &&
       !thumb_copy_args_overlap(args, n))
-    return 1;
+    return (copy_volatile && !(n & 3)) ? 3 : 1;
   if (strcmp(nm, "__aeabi_memmove4") && strcmp(nm, "__aeabi_memmove8") && strcmp(nm, "__aeabi_memcpy4") &&
       strcmp(nm, "__aeabi_memcpy8"))
     return 0;
   if (n <= 0 || (n & 3) || !inline_copy_max())
     return 0;
+  if (copy_volatile)
+    return 3;
   return n > inline_copy_max() ? 1 : 2;
 }
 
@@ -2260,7 +2482,19 @@ static int thumb_inline_aligned_copy_call(TCCIRState *ir, MachineOperand func_mo
     thumb_emit_word_copy_r0_r1(n);
     return 1;
   }
-  if (thumb_copy_stub_call(n))
+  if (mode == 3)
+  {
+    /* Volatile side: every access stays visible in this function.  Outside
+     * the copy-stub window thumb_emit_word_copy_r0_r1 already is the
+     * unrolled pairs or its own visible 12-bytes-per-turn loop; inside the
+     * window (where it would call __tcc_wcopy_N) expand unrolled here. */
+    if (n < 3 * 4 || n > COPY_STUB_MAX_WORDS * 4)
+    {
+      thumb_emit_word_copy_r0_r1(n);
+      return 1;
+    }
+  }
+  else if (thumb_copy_stub_call(n))
     return 1;
   const uint32_t quad = (1u << R2) | (1u << R3) | (1u << R_IP) | (1u << R_LR);
   for (; n >= 16; n -= 16)
@@ -2282,12 +2516,387 @@ static int thumb_inline_aligned_copy_call(TCCIRState *ir, MachineOperand func_mo
   return 1;
 }
 
+/* An -minline-atomics read-modify-write (inline_atomic_rmw): a call to
+ * __tcc_ax_<op><size>_<flags> emitted as the LDREX/STREX loop itself, on the
+ * registers its operands already occupy -- pointer, then the operand (for
+ * "cas" the expected value, then the desired one) -- with the old value,
+ * zero-extended like the runtime helpers', in the result's register.  The loop
+ * takes its other registers from the scratch allocator, so the register
+ * allocator treats the call as writing nothing but its result
+ * (tcc_ir_call_clobbers_nothing).  Flags: 1 acquire, 2 release, 4 a DMB after
+ * (seq_cst, for the plain `ldr; dmb` of a seq_cst load to come).  A core with
+ * LDAEX/STLEX orders through them, as LLVM does; one without (ARMv7-M) puts
+ * DMBs around the loop instead. */
+static int thumb_is_machine_call(MachineOperand func_mop, const char *prefix)
+{
+  return func_mop.kind == MACH_OP_SYMBOL && func_mop.u.sym.sym && !func_mop.u.sym.addend &&
+         !strncmp(get_tok_str(func_mop.u.sym.sym->v, NULL), prefix, 9);
+}
+
+static void thumb_atomic_load_ex(int size, int acq, uint32_t rt, uint32_t rn)
+{
+  if (size == 1)
+    ot_check(acq ? th_ldaexb(rt, rn) : th_ldrexb(rt, rn));
+  else if (size == 2)
+    ot_check(acq ? th_ldaexh(rt, rn) : th_ldrexh(rt, rn));
+  else
+    ot_check(acq ? th_ldaex(rt, rn) : th_ldrex(rt, rn, 0));
+}
+
+static void thumb_atomic_store_ex(int size, int rel, uint32_t rd, uint32_t rt, uint32_t rn)
+{
+  if (size == 1)
+    ot_check(rel ? th_stlexb(rd, rt, rn) : th_strexb(rd, rt, rn));
+  else if (size == 2)
+    ot_check(rel ? th_stlexh(rd, rt, rn) : th_strexh(rd, rt, rn));
+  else
+    ot_check(rel ? th_stlex(rd, rt, rn) : th_strex(rd, rt, rn, 0));
+}
+
+static void thumb_inline_atomic_call(TCCIRState *ir, int call_idx, int call_id, int argc, MachineOperand func_mop,
+                                     MachineOperand dest_mop, int drop_value)
+{
+  enum
+  {
+    AX_CAS,
+    AX_XCHG,
+    AX_ADD,
+    AX_SUB,
+    AX_AND,
+    AX_OR,
+    AX_XOR,
+    AX_NAND,
+    AX_LDA,
+    AX_STL
+  };
+  static const char *const ops[] = {"cas", "xchg", "add", "sub", "and", "or", "xor", "nand", "lda", "stl"};
+  const char *const name = get_tok_str(func_mop.u.sym.sym->v, NULL);
+  const char *p = name + 9;
+  int op = -1;
+  for (int i = 0; i < (int)(sizeof(ops) / sizeof(ops[0])); i++)
+  {
+    const size_t len = strlen(ops[i]);
+    if (!strncmp(p, ops[i], len) && p[len] >= '1' && p[len] <= '4')
+    {
+      op = i;
+      p += len;
+      break;
+    }
+  }
+  const int size = op >= 0 ? *p - '0' : 0;
+  const int flags = op >= 0 && p[1] == '_' ? atoi(p + 2) : -1;
+  if ((size != 1 && size != 2 && size != 4) || flags < 0 || flags > 7 ||
+      argc != (op == AX_CAS ? 3 : op == AX_LDA ? 1 : 2))
+    tcc_ice("unknown inline atomic '%s'", name);
+
+  /* The operands, where they are. */
+  TCCAbiCallLayout layout;
+  memset(&layout, 0, sizeof(layout));
+  small_sequence(ThumbIROperandSequence) args_owner = {0};
+  small_sequence(ThumbMachineOperandSequence) mops_owner = {0};
+  if (thumb_build_call_layout_from_ir(ir, call_idx, call_id, argc, &layout, &args_owner, &mops_owner) != argc)
+    tcc_ice("inline atomic '%s': bad operands", name);
+  const MachineOperand *mops = ThumbMachineOperandSequence_data(&mops_owner);
+  MachineCodegenContext mctx = {0};
+  uint32_t used = 0;
+  const int ptr = mach_ensure_in_reg(&mctx, &mops[0], used);
+  used |= 1u << ptr;
+  const int v8 = arm_target_dependent.feat.ldaex;
+  if (op == AX_LDA)
+  {
+    /* An acquire load (inline_atomic_access): LDA, or LDR; DMB. */
+    if (layout.locs)
+      tcc_free(layout.locs);
+    int rt = !drop_value && dest_mop.kind != MACH_OP_NONE ? mach_get_dest_reg(&mctx, &dest_mop, used)
+                                                          : mach_alloc_scratch(&mctx, used);
+    if (v8)
+      ot_check(size == 1 ? th_ldab(rt, ptr) : size == 2 ? th_ldah(rt, ptr) : th_lda(rt, ptr));
+    else
+    {
+      if (size == 1)
+        ot_check(th_ldrb_imm(rt, ptr, 0, 6, ENFORCE_ENCODING_NONE));
+      else if (size == 2)
+        ot_check(th_ldrh_imm(rt, ptr, 0, 6, ENFORCE_ENCODING_NONE));
+      else
+        ot_check_ldr_imm(rt, ptr, 0, 6, ENFORCE_ENCODING_NONE);
+      ot_check(th_dmb(0xf));
+    }
+    if (!drop_value && dest_mop.kind != MACH_OP_NONE)
+      mach_writeback_dest(&dest_mop, rt);
+    mach_release_all(&mctx);
+    return;
+  }
+  /* A compare-exchange against a constant that CMP's immediate holds (the
+   * spin lock's free == 0): no register for it. */
+  int cas_imm = -1;
+  if (op == AX_CAS && mops[1].kind == MACH_OP_IMM)
+  {
+    const uint32_t v = (uint32_t)mops[1].u.imm.val & (size == 1 ? 0xffu : size == 2 ? 0xffffu : 0xffffffffu);
+    if (v <= 255)
+      cas_imm = (int)v;
+  }
+  int val = cas_imm >= 0 ? -1 : mach_ensure_in_reg(&mctx, &mops[1], used);
+  if (val >= 0)
+    used |= 1u << val;
+  if (op == AX_STL)
+  {
+    /* A release store (inline_atomic_access): STL, or DMB; STR. */
+    if (layout.locs)
+      tcc_free(layout.locs);
+    if (v8)
+      ot_check(size == 1 ? th_stlb(val, ptr) : size == 2 ? th_stlh(val, ptr) : th_stl(val, ptr));
+    else
+    {
+      ot_check(th_dmb(0xf));
+      if (size == 1)
+        ot_check(th_strb_imm(val, ptr, 0, 6, ENFORCE_ENCODING_NONE));
+      else if (size == 2)
+        ot_check(th_strh_imm(val, ptr, 0, 6, ENFORCE_ENCODING_NONE));
+      else
+        ot_check_str_imm(val, ptr, 0, 6, ENFORCE_ENCODING_NONE);
+    }
+    mach_release_all(&mctx);
+    return;
+  }
+  int desired = -1;
+  if (op == AX_CAS)
+  {
+    desired = mach_ensure_in_reg(&mctx, &mops[2], used);
+    used |= 1u << desired;
+  }
+  if (layout.locs)
+    tcc_free(layout.locs);
+
+  /* The old value: the result's own register when no operand is in it. */
+  int rout = -1, old;
+  if (!drop_value && dest_mop.kind != MACH_OP_NONE)
+    rout = mach_get_dest_reg(&mctx, &dest_mop, used);
+  if (rout >= 0 && !(used >> rout & 1))
+    old = rout;
+  else
+    old = mach_alloc_scratch(&mctx, used);
+  used |= 1u << old;
+  const int status = mach_alloc_scratch(&mctx, used);
+  used |= 1u << status;
+  int value = val;
+  const thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
+  if (op == AX_CAS && size < 4 && cas_imm < 0)
+  {
+    /* The expected value compares with what LDREXB/H zero-extends. */
+    value = mach_alloc_scratch(&mctx, used);
+    used |= 1u << value;
+    if (size == 1)
+      ot_check(th_uxtb(value, val, no_shift, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_uxth(value, val, no_shift, ENFORCE_ENCODING_NONE));
+  }
+  else if (op != AX_CAS && op != AX_XCHG)
+  {
+    value = mach_alloc_scratch(&mctx, used); /* the new value */
+    used |= 1u << value;
+  }
+
+  const int acq = v8 && (flags & 1), rel = v8 && (flags & 2);
+  if (!v8 && (flags & 2))
+    ot_check(th_dmb(0xf));
+  /* The loop in one piece: no literal pool inside, and no IT block split. */
+  th_literal_pool_reserve_upcoming_bytes(32);
+  const int top = ind;
+  thumb_atomic_load_ex(size, acq, old, ptr);
+  if (op == AX_CAS)
+  {
+    /*  top:  ldrex   old, [ptr]
+     *        cmp     old, expected
+     *        itt     eq
+     *        strexeq status, desired, [ptr]
+     *        cmpeq   status, #1           (the store failed: try again)
+     *        beq     top
+     *        clrex
+     * Strong, so also a valid weak compare-exchange; success is old ==
+     * expected, which the frontend tests. */
+    if (cas_imm >= 0)
+      ot_check(th_cmp_imm(old, (uint32_t)cas_imm, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+    else
+      ot_check(th_cmp_reg(0, old, value, FLAGS_BEHAVIOUR_SET, no_shift, ENFORCE_ENCODING_NONE));
+    ot_check(th_it(0 /* EQ */, 0x4 /* TT */));
+    thumb_atomic_store_ex(size, rel, status, desired, ptr);
+    ot_check(th_cmp_imm(status, 1, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+    const int off = top - (ind + 4);
+    if (off < -256)
+      tcc_ice("inline atomic loop out of branch range");
+    ot_check(th_b_t1(0 /* EQ */, (uint32_t)(off >> 1)));
+    /* A mismatch leaves the reservation open.  Close it, as the runtime and
+     * LLVM do: a spin lock waits next with WFE, and an open reservation keeps
+     * the WFE from sleeping -- on QEMU each contended kernel lock_irqsave
+     * spun at full speed instead (+4.5% instructions per launch).  After a
+     * successful store it is already closed. */
+    ot_check(th_clrex());
+  }
+  else
+  {
+    /*  top:  ldrex   old, [ptr]
+     *        <op>    new, old, val        (xchg: stores val itself)
+     *        strex   status, new, [ptr]
+     *        cmp     status, #0
+     *        bne     top */
+    switch (op)
+    {
+    case AX_ADD:
+      ot_check(th_add_reg(value, old, val, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift, ENFORCE_ENCODING_NONE));
+      break;
+    case AX_SUB:
+      ot_check(th_sub_reg(value, old, val, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift, ENFORCE_ENCODING_NONE));
+      break;
+    case AX_AND:
+    case AX_NAND:
+      ot_check(th_and_reg(value, old, val, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift, ENFORCE_ENCODING_NONE));
+      if (op == AX_NAND)
+        ot_check(th_mvn_reg(value, value, value, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift, ENFORCE_ENCODING_NONE));
+      break;
+    case AX_OR:
+      ot_check(th_orr_reg(value, old, val, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift, ENFORCE_ENCODING_NONE));
+      break;
+    case AX_XOR:
+      ot_check(th_eor_reg(value, old, val, FLAGS_BEHAVIOUR_NOT_IMPORTANT, no_shift, ENFORCE_ENCODING_NONE));
+      break;
+    }
+    thumb_atomic_store_ex(size, rel, status, value, ptr);
+    ot_check(th_cmp_imm(status, 0, FLAGS_BEHAVIOUR_SET, ENFORCE_ENCODING_NONE));
+    const int off = top - (ind + 4);
+    if (off < -256)
+      tcc_ice("inline atomic loop out of branch range");
+    ot_check(th_b_t1(1 /* NE */, (uint32_t)(off >> 1)));
+  }
+  if (flags & 4 || (!v8 && (flags & 1)))
+    ot_check(th_dmb(0xf));
+  if (rout >= 0)
+  {
+    if (old != rout)
+      ot_check_mov_reg(rout, old, flags_safe(), no_shift, ENFORCE_ENCODING_NONE, false);
+    mach_writeback_dest(&dest_mop, rout);
+  }
+  mach_release_all(&mctx);
+}
+
+/* An asm statement of system instructions (asm_machine_call_name): a call to
+ * __tcc_mc_<insn>_<insn>... emitted as those instructions where the operands
+ * already are -- an msr reads its operand's register, an mrs writes the
+ * result's -- with no call around them: the register allocator treats the
+ * call as writing nothing but its result (tcc_ir_call_clobbers_nothing). */
+static void thumb_machine_insn_call(TCCIRState *ir, int call_idx, int call_id, int argc, MachineOperand func_mop,
+                                    MachineOperand dest_mop, int drop_value)
+{
+  const char *const name = get_tok_str(func_mop.u.sym.sym->v, NULL);
+  MachineCodegenContext mctx = {0};
+  int rin = -1, rout = -1;
+  if (argc > 0)
+  {
+    TCCAbiCallLayout layout;
+    memset(&layout, 0, sizeof(layout));
+    small_sequence(ThumbIROperandSequence) args_owner = {0};
+    small_sequence(ThumbMachineOperandSequence) mops_owner = {0};
+    if (argc != 1 || thumb_build_call_layout_from_ir(ir, call_idx, call_id, argc, &layout, &args_owner, &mops_owner) != 1)
+      tcc_ice("machine call '%s': bad operand", name);
+    rin = mach_ensure_in_reg(&mctx, &ThumbMachineOperandSequence_data(&mops_owner)[0], 0);
+    if (layout.locs)
+      tcc_free(layout.locs);
+  }
+  if (!drop_value && dest_mop.kind != MACH_OP_NONE)
+    rout = mach_get_dest_reg(&mctx, &dest_mop, rin >= 0 ? 1u << rin : 0);
+  const char *p = name + 8;
+  while (*p == '_')
+  {
+    char code[16];
+    int n = 0;
+    for (p++; *p && *p != '_'; p++)
+      if (n < (int)sizeof(code) - 1)
+        code[n++] = *p;
+    code[n] = 0;
+    if (!strcmp(code, "wfe"))
+      ot_check(th_wfe(ENFORCE_ENCODING_NONE));
+    else if (!strcmp(code, "wfi"))
+      ot_check(th_wfi(ENFORCE_ENCODING_NONE));
+    else if (!strcmp(code, "sev"))
+      ot_check(th_sev(ENFORCE_ENCODING_NONE));
+    else if (!strcmp(code, "nop"))
+      ot_check(th_nop(ENFORCE_ENCODING_NONE));
+    else if (!strcmp(code, "yield"))
+      ot_check(th_yield(ENFORCE_ENCODING_NONE));
+    else if (!strcmp(code, "isb"))
+      ot_check(th_isb(0xf));
+    else if (!strcmp(code, "dsb"))
+      ot_check(th_dsb(0xf));
+    else if (!strcmp(code, "dmb"))
+      ot_check(th_dmb(0xf));
+    else if (!strncmp(code, "cpsi", 4) && (code[4] == 'd' || code[4] == 'e') && code[5])
+      ot_check(th_cps(code[4] == 'd', strchr(code + 5, 'i') != NULL, strchr(code + 5, 'f') != NULL));
+    else if (!strncmp(code, "mrs", 3) && n == 5)
+    {
+      /* Reading a special register has no effect of its own. */
+      if (rout >= 0)
+        ot_check(th_mrs((uint32_t)rout, (uint32_t)strtoul(code + 3, NULL, 16)));
+    }
+    else if (!strncmp(code, "msr", 3) && n == 5 && rin >= 0)
+      ot_check(th_msr((uint32_t)strtoul(code + 3, NULL, 16), (uint32_t)rin, 2));
+    else
+      tcc_ice("unknown machine instruction '%s' in '%s'", code, name);
+  }
+  if (*p)
+    tcc_ice("malformed machine call '%s'", name);
+  if (rout >= 0)
+    mach_writeback_dest(&dest_mop, rout);
+  mach_release_all(&mctx);
+}
+
+/* A call to __tcc_vfp_ret_ld / __tcc_vfp_ret_st (gen_vfp_ret_transfer): a
+ * result returned in s0..s(n-1) moved from or to the buffer whose address is
+ * argument 0.  Returns n (argument 1), or 0 for any other call; *load says
+ * which direction. */
+static int thumb_vfp_ret_transfer(MachineOperand func_mop, const IROperand *args, int argc, int *load)
+{
+  if (func_mop.kind != MACH_OP_SYMBOL || !func_mop.u.sym.sym || argc != 2)
+    return 0;
+  const char *nm = get_tok_str(func_mop.u.sym.sym->v, NULL);
+  if (strcmp(nm, "__tcc_vfp_ret_ld") && strcmp(nm, "__tcc_vfp_ret_st"))
+    return 0;
+  const int n = irop_is_immediate(args[1]) ? (int)irop_get_imm32(args[1]) : 0;
+  if (n < 1 || n > 8)
+    tcc_ice("%s: bad register count", nm);
+  *load = nm[14] == 'l';
+  return n;
+}
+
+/* The registers a store reads were left by the call before it: no
+ * floating-point instruction may sit between the two. */
+static void thumb_vfp_ret_store_check(TCCIRState *ir, int call_idx)
+{
+  for (int j = call_idx - 1; j >= 0; j--)
+  {
+    const IRQuadCompact *q = &ir->compact_instructions[j];
+    if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
+      return;
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    IROperand ops[3] = {IROP_NONE, IROP_NONE, IROP_NONE};
+    if (irop_config[q->op].has_dest)
+      ops[0] = tcc_ir_op_get_dest(ir, q);
+    if (irop_config[q->op].has_src1)
+      ops[1] = tcc_ir_op_get_src1(ir, q);
+    if (irop_config[q->op].has_src2)
+      ops[2] = tcc_ir_op_get_src2(ir, q);
+    for (int k = 0; k < 3; k++)
+      if (!irop_is_none(ops[k]) && !ops[k].is_lval &&
+          (ops[k].btype == IROP_BTYPE_FLOAT32 || ops[k].btype == IROP_BTYPE_FLOAT64))
+        tcc_ice("VFP result store separated from its call by instruction %d", j);
+  }
+}
+
 ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand call_id_op, MachineOperand dest_mop,
                                            int drop_value, TCCIRState *ir, int call_idx)
 {
   /* === Validation === */
   if (irop_is_none(call_id_op) || !ir)
-    tcc_error("compiler_error: func_call_op requires call_id+ir");
+    tcc_ice("func_call_op requires call_id+ir");
 
   const int call_id = TCCIR_DECODE_CALL_ID(call_id_op.u.imm32);
   const int argc_hint = TCCIR_DECODE_CALL_ARGC(call_id_op.u.imm32);
@@ -2302,26 +2911,32 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     return;
   }
 
+  if (thumb_is_machine_call(func_mop, "__tcc_mc_"))
+  {
+    thumb_machine_insn_call(ir, call_idx, call_id, argc_hint, func_mop, dest_mop, drop_value);
+    return;
+  }
+  if (thumb_is_machine_call(func_mop, "__tcc_ax_"))
+  {
+    thumb_inline_atomic_call(ir, call_idx, call_id, argc_hint, func_mop, dest_mop, drop_value);
+    return;
+  }
+
   ThumbGenCallSite *call_site = thumb_get_call_site_for_id(call_id);
   if (!call_site)
-    tcc_error("compiler_error: no call site found for call_id=%d", call_id);
+    tcc_ice("no call site found for call_id=%d", call_id);
 
   /* === Build ABI layout === */
   TCCAbiCallLayout layout;
   memset(&layout, 0, sizeof(layout));
 
-  /* Hard-float VFP argument passing applies to non-variadic user functions.
-   * Soft __aeabi_* helpers take their float arguments in GPRs regardless, and a
-   * variadic callee passes every argument by the base (GPR) standard. */
-  layout.hard_float =
-      (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT) && !mach_callee_is_aeabi(&func_mop);
-  layout.is_variadic = mach_callee_is_variadic(&func_mop);
+  thumb_call_layout_abi_flags(&layout, func_mop.kind == MACH_OP_SYMBOL ? func_mop.u.sym.sym : NULL);
 
   small_sequence(ThumbIROperandSequence) args_owner = {0};
   small_sequence(ThumbMachineOperandSequence) mops_owner = {0};
   const int argc = thumb_build_call_layout_from_ir(ir, call_idx, call_id, argc_hint, &layout, &args_owner, &mops_owner);
   if (argc < 0)
-    tcc_error("compiler_error: failed to build call layout for call_id=%d", call_id);
+    tcc_ice("failed to build call layout for call_id=%d", call_id);
 
   int stack_size = (argc > 0) ? (int)layout.stack_size : 0;
 
@@ -2335,15 +2950,23 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
       .stack_size = stack_size,
   };
 
+  int vfp_load = 0;
+  const int vfp_xfer = thumb_vfp_ret_transfer(func_mop, ctx.args, ctx.argc, &vfp_load);
+  if (vfp_xfer && !vfp_load)
+    thumb_vfp_ret_store_check(ir, call_idx);
+
   /* Set tail_call_pending if this is a tail-call-only function. */
-  if (ir->tail_call_only)
+  if (ir->tail_call_only && !vfp_xfer)
     tail_call_pending = 1;
 
   /* === Preserve nested call registers (R0-R3, R9) via STR to frame ===
    * Instead of PUSH/POP (which moves SP), store to the pre-reserved
    * nested-call save area in the frame.  SP stays fixed. */
   int arg_regs_in_use = call_site->registers_map & 0x0F;
-  int arg_regs_save_mask = tail_call_pending ? 0 : (arg_regs_in_use);
+  /* ...plus the values ra:caller_save keeps in caller-saved registers across
+   * this call: stored here, before argument setup, and reloaded below after
+   * the return value has been moved out. */
+  int arg_regs_save_mask = tail_call_pending ? 0 : (arg_regs_in_use | (int)tcc_ir_caller_save_mask_at(ir, call_idx));
 
   /* On yasos with no-pic-data-is-text-relative, R9 holds the GOT base and is
    * caller-saved.  Save it alongside the nested-call argument registers so it
@@ -2431,6 +3054,18 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   /* === Save scratch exclusion state === */
   uint32_t saved_scratch_exclude = scratch_global_exclude;
 
+  /* === Indirect call target that is also a register argument ===
+   *
+   * `v(n, v)`: once the argument moves are done, the target's argument
+   * register holds it, so the call branches through that register and the
+   * target needs no holding register while the arguments are placed.  The
+   * register allocator steers such a target into its argument register; when
+   * that hint misses, the move scheduler reads it before overwriting it. */
+  int target_arg_reg = -1;
+  if (func_mop.kind == MACH_OP_REG && !func_mop.needs_deref && func_mop.u.reg.r0 >= 0 &&
+      (func_mop.u.reg.r0 <= 3 || tail_call_pending))
+    target_arg_reg = call_target_arg_reg(&ctx, func_mop.u.reg.r0);
+
   /* === Pre-save indirect call target if it resides in an argument register ===
    *
    * When a function pointer is allocated to R0-R3 by the register allocator,
@@ -2442,7 +3077,7 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   {
     const int is_direct = (func_mop.kind == MACH_OP_SYMBOL || func_mop.kind == MACH_OP_IMM);
     if (!is_direct && func_mop.kind == MACH_OP_REG && !func_mop.needs_deref && func_mop.u.reg.r0 >= 0 &&
-        func_mop.u.reg.r0 <= 3)
+        func_mop.u.reg.r0 <= 3 && target_arg_reg < 0)
     {
       /* Find a free register outside R0-R3, R12 (stack-arg scratch), SP, PC. */
       uint32_t exclude = scratch_global_exclude | 0x0Fu | (1u << R_IP) | (1u << R_SP) | (1u << R_PC);
@@ -2451,9 +3086,9 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
         safe_reg = tcc_ls_find_free_scratch_reg(&ir->ls, ir->codegen_instruction_idx, exclude, ir->leaffunc);
 
       if (safe_reg == PREG_NONE || safe_reg < 0 || safe_reg >= 16 || safe_reg == R_SP || safe_reg == R_PC)
-        tcc_error("compiler_error: func_call_mop: cannot find safe register "
-                  "to pre-save indirect call target (R%d)",
-                  func_mop.u.reg.r0);
+        tcc_ice("func_call_mop: cannot find safe register "
+                "to pre-save indirect call target (R%d)",
+                func_mop.u.reg.r0);
 
       /* Move function pointer from arg reg to safe reg. */
       thumb_shift no_shift = {THUMB_SHIFT_NONE, 0, THUMB_SHIFT_IMMEDIATE};
@@ -2471,6 +3106,14 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     }
   }
 
+  if (func_mop.kind == MACH_OP_REG)
+  {
+    if (func_mop.u.reg.r0 >= 0 && func_mop.u.reg.r0 < 16)
+      ctx.call_target_regs |= 1u << func_mop.u.reg.r0;
+    if (func_mop.u.reg.r1 >= 0 && func_mop.u.reg.r1 < 16)
+      ctx.call_target_regs |= 1u << func_mop.u.reg.r1;
+  }
+
   /* === Build register argument moves === */
   ThumbArgMove reg_moves[8];
   int reg_move_count = build_register_arg_moves(&ctx, reg_moves);
@@ -2480,6 +3123,16 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
     int w = 0;
     for (int i = 0; i < reg_move_count; i++)
       if (!(reg_moves[i].dst_reg == R2 && reg_moves[i].kind != THUMB_ARG_MOVE_IMM64 &&
+            reg_moves[i].kind != THUMB_ARG_MOVE_STRUCT))
+        reg_moves[w++] = reg_moves[i];
+    reg_move_count = w;
+  }
+  /* A register transfer reads only its buffer address: no move into R1. */
+  if (vfp_xfer)
+  {
+    int w = 0;
+    for (int i = 0; i < reg_move_count; i++)
+      if (!(reg_moves[i].dst_reg == R1 && reg_moves[i].kind != THUMB_ARG_MOVE_IMM64 &&
             reg_moves[i].kind != THUMB_ARG_MOVE_STRUCT))
         reg_moves[w++] = reg_moves[i];
     reg_move_count = w;
@@ -2534,7 +3187,11 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
      * interval for the liveness query to find. */
     scratch_global_exclude |= arg_move_src_mask;
 
-    ctx.arg_move_dst_mask = arg_move_dst_mask & ~arg_move_src_mask;
+    /* The composite VFP arguments load after the stack ones are placed. */
+    const uint32_t vfp_src_mask = vfp_composite_src_regs(&ctx);
+    scratch_global_exclude |= vfp_src_mask;
+
+    ctx.arg_move_dst_mask = arg_move_dst_mask & ~arg_move_src_mask & ~vfp_src_mask;
   }
 
   /* Pre-save stack args sourcing from R0-R3 before register shuffle */
@@ -2545,11 +3202,14 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
    * via arg_move_dst_mask in find_call_scratch, yielding 16-bit STR
    * encodings instead of 32-bit STR.W with R12. */
   place_stack_arguments(&ctx);
+  emit_vfp_arg_moves(&ctx, 0);
 
   /* === Now block all R0-R3 and emit register argument moves === */
   scratch_global_exclude |= 0x0F;
   thumb_emit_parallel_arg_moves(reg_moves, reg_move_count);
-  emit_vfp_arg_moves(&ctx);
+  emit_vfp_arg_moves(&ctx, 1);
+  if (target_arg_reg >= 0)
+    func_mop.u.reg.r0 = target_arg_reg;
 
   /* === Tail call: tear down frame before branching === */
   if (tail_call_pending)
@@ -2583,7 +3243,9 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
   }
 
   /* === Emit call === */
-  if (tail_call_pending || !thumb_inline_aligned_copy_call(ir, func_mop, ctx.args, ctx.argc))
+  if (vfp_xfer)
+    ot_check(th_vldmstm(vfp_load, 0, R0, 0, (1u << vfp_xfer) - 1u, 0));
+  else if (tail_call_pending || !thumb_inline_aligned_copy_call(ir, func_mop, ctx.args, ctx.argc))
     gcall_or_jump_mop(0, func_mop);
   if (dyn_extra)
   {
@@ -2593,7 +3255,7 @@ ST_FUNC void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand ca
      * compiler bug, not a limit. */
     for (int k = dyn_push_mark; k < scratch_push_count; k++)
       if (scratch_push_type[k] == 1 && !dry_run_state.active)
-        tcc_error("compiler_error: scratch PUSH inside a call's argument window");
+        tcc_ice("scratch PUSH inside a call's argument window");
     call_args_sp_bias -= dyn_extra;
     gadd_sp_ex(dyn_extra, -1);
   }
@@ -3181,11 +3843,11 @@ ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, M
     {
       r = mach_alloc_scratch(&ctx, 1u << (uint32_t)size_reg);
       if (ctx.scratches[ctx.n_scratch - 1].would_save && !dry_run_state.active)
-        tcc_error("compiler_error: alloca/VLA size stays live and no register is free "
+        tcc_ice("alloca/VLA size stays live and no register is free "
                   "to compute the new stack top");
     }
     if (r == R_SP)
-      tcc_error("compiler_error: VLA alloc picked SP as temp");
+      tcc_ice("VLA alloc picked SP as temp");
 
     const int vla_reserve = vla_outgoing_reserve();
 
@@ -3268,7 +3930,7 @@ ST_FUNC void tcc_gen_machine_vla_mop(MachineOperand dest, MachineOperand src1, M
     break;
   }
   default:
-    tcc_error("compiler_error: tcc_gen_machine_vla_mop unsupported op %d", op);
+    tcc_ice("tcc_gen_machine_vla_mop unsupported op %d", op);
   }
   mach_release_all(&ctx);
 }
@@ -3300,7 +3962,7 @@ static int select_can_inline(const MachineOperand *op)
   switch (op->kind)
   {
   case MACH_OP_IMM:
-    return 1; /* MOV/MOVW/MVN or literal pool LDR — always 1 instruction */
+    return !op->needs_deref; /* MOV/MOVW/MVN or literal pool LDR; a deref loads too */
   case MACH_OP_REG:
     return !op->needs_deref; /* MOV reg is 1 instr; deref needs LDR too */
   case MACH_OP_SYMBOL:
@@ -3363,7 +4025,7 @@ static void select_emit_inline(MachineCodegenContext *ctx, const MachineOperand 
     tcc_machine_addr_of_stack_slot(reg, op->u.frame.offset, 0);
     break;
   default:
-    tcc_error("compiler_error: select_emit_inline: unhandled kind %d", (int)op->kind);
+    tcc_ice("select_emit_inline: unhandled kind %d", (int)op->kind);
     break;
   }
 }
@@ -3526,12 +4188,12 @@ ST_FUNC void tcc_gen_machine_predicated_alu_mop(MachineOperand src1, MachineOper
 ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROperand src, int size)
 {
   if (size <= 0)
-    tcc_error("compiler_error: block_copy size must be positive, got %d", size);
+    tcc_ice("block_copy size must be positive, got %d", size);
 
   /* Get the source symbol from the SYMREF operand */
   IRPoolSymref *symref = irop_get_symref_ex(ir, src);
   if (!symref || !symref->sym)
-    tcc_error("compiler_error: block_copy source is not a valid symbol reference");
+    tcc_ice("block_copy source is not a valid symbol reference");
   Sym *sym = validate_sym_for_reloc(symref->sym);
 
   /* Get the destination stack offset */
@@ -3629,9 +4291,9 @@ ST_FUNC void tcc_gen_machine_block_copy_mop(TCCIRState *ir, IROperand dest, IROp
     if (remaining_words > 1)
     {
       if (!ot(th_add_imm(r_src, r_src, 4, flags_safe(), ENFORCE_ENCODING_NONE)))
-        tcc_error("compiler_error: block_copy cannot advance source pointer");
+        tcc_ice("block_copy cannot advance source pointer");
       if (!ot(th_add_imm(r_dst, r_dst, 4, flags_safe(), ENFORCE_ENCODING_NONE)))
-        tcc_error("compiler_error: block_copy cannot advance dest pointer");
+        tcc_ice("block_copy cannot advance dest pointer");
     }
     remaining_words--;
   }
@@ -3960,9 +4622,9 @@ ST_FUNC void tcc_gen_machine_spill_block_copy(int32_t src_spill_off, int32_t dst
     if (remaining > 1)
     {
       if (!ot(th_add_imm(r_src, r_src, 4, flags_safe(), ENFORCE_ENCODING_NONE)))
-        tcc_error("compiler_error: spill_block_copy cannot advance source pointer");
+        tcc_ice("spill_block_copy cannot advance source pointer");
       if (!ot(th_add_imm(r_dst, r_dst, 4, flags_safe(), ENFORCE_ENCODING_NONE)))
-        tcc_error("compiler_error: spill_block_copy cannot advance dest pointer");
+        tcc_ice("spill_block_copy cannot advance dest pointer");
     }
     remaining--;
   }
@@ -4114,7 +4776,7 @@ ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand area,
   }
   else
   {
-    tcc_error("compiler_error: setjmp save area must be a frame slot (kind %d)", (int)area.kind);
+    tcc_ice("setjmp save area must be a frame slot (kind %d)", (int)area.kind);
   }
   ot_check_str_imm(4, R_IP, 0, 6, ENFORCE_ENCODING_NONE);     /* r4  -> area[0] */
   ot_check_str_imm(5, R_IP, 4, 6, ENFORCE_ENCODING_NONE);     /* r5  -> area[1] */
@@ -4133,7 +4795,13 @@ ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand area,
   ot_check_mov_reg(R_IP, R_SP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
   ot_check_str_imm(R_IP, buf_reg, 8, 6, ENFORCE_ENCODING_NONE); /* SP -> buf[2] */
 
-  /* ---- save resume address (ADR IP, resume_label) ---- */
+  /* ---- save resume address (ADR IP, resume_label) ----
+   * The ADR immediate is the fixed distance to the resume label, so nothing
+   * may be emitted between ADR and label except the five instructions below:
+   * pick the destination register first (it can emit a scratch save) and
+   * flush the literal pool up front if it would otherwise fall in the window. */
+  int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
+  th_literal_pool_reserve_upcoming_bytes(24);
   int adr_addr = ind;
   int adr_pc = adr_addr + 4;
   int adr_base = adr_pc & ~3;
@@ -4145,12 +4813,13 @@ ST_FUNC void tcc_gen_machine_setjmp_mop(MachineOperand buf, MachineOperand area,
   ot_check_str_imm(R_IP, buf_reg, 4, 6, ENFORCE_ENCODING_NONE);                              /* -> buf[1] */
 
   /* ---- normal path: return 0 ---- */
-  int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
   ot_check(th_mov_imm(dest_reg, 0, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 0 */
   ot_check(th_b_t4(4));                                                                     /* B.W +4 (skip resume) */
   codegen_internal_merge_point(); /* longjmp lands below */
 
   /* ---- resume_label: longjmp lands here ---- */
+  if (ind != resume_label_addr)
+    tcc_ice("__builtin_setjmp resume label moved (pool flush inside ADR window)");
   ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 1 */
   /* ---- end_label ---- */
 
@@ -4196,7 +4865,13 @@ ST_FUNC void tcc_gen_machine_nl_setjmp_mop(MachineOperand buf, MachineOperand de
   ot_check_mov_reg(R_IP, R_SP, flags_safe(), THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE, false);
   ot_check_str_imm(R_IP, buf_reg, 32, 6, ENFORCE_ENCODING_NONE); /* SP -> buf[8] */
 
-  /* ---- save resume address (ADR IP, resume_label) ---- */
+  /* ---- save resume address (ADR IP, resume_label) ----
+   * The ADR immediate is the fixed distance to the resume label, so nothing
+   * may be emitted between ADR and label except the five instructions below:
+   * pick the destination register first (it can emit a scratch save) and
+   * flush the literal pool up front if it would otherwise fall in the window. */
+  int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
+  th_literal_pool_reserve_upcoming_bytes(24);
   int adr_addr = ind;
   int adr_pc = adr_addr + 4;
   int adr_base = adr_pc & ~3;
@@ -4208,12 +4883,13 @@ ST_FUNC void tcc_gen_machine_nl_setjmp_mop(MachineOperand buf, MachineOperand de
   ot_check_str_imm(R_IP, buf_reg, 36, 6, ENFORCE_ENCODING_NONE);                             /* -> buf[9] */
 
   /* ---- normal path: return 0 ---- */
-  int dest_reg = mach_get_dest_reg(&ctx, &dest, 0);
   ot_check(th_mov_imm(dest_reg, 0, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 0 */
   ot_check(th_b_t4(4));                                                                     /* B.W +4 (skip resume) */
   codegen_internal_merge_point(); /* longjmp lands below */
 
   /* ---- resume_label: longjmp lands here ---- */
+  if (ind != resume_label_addr)
+    tcc_ice("__builtin_setjmp resume label moved (pool flush inside ADR window)");
   ot_check(th_mov_imm(dest_reg, 1, flags_safe(), ENFORCE_ENCODING_32BIT)); /* dest = 1 */
   /* ---- end_label ---- */
 
@@ -4662,7 +5338,7 @@ ST_FUNC void tcc_gen_machine_func_parameter_mop(MachineOperand src1, MachineOper
   ThumbGenCallSite *call_site = thumb_get_or_create_call_site(call_id);
   if (call_site == NULL)
   {
-    tcc_error("compiler_error: failed to allocate call site for call_id=%d", call_id);
+    tcc_ice("failed to allocate call site for call_id=%d", call_id);
     return;
   }
 
@@ -4677,11 +5353,21 @@ ST_FUNC void tcc_gen_machine_func_parameter_mop(MachineOperand src1, MachineOper
   if (dry_run_state.active)
     return;
 
-  /* Expand argument list if needed */
+  /* Expand argument list if needed.  Grow the allocation geometrically: params
+   * arrive one index at a time, and growing by one int per param made a
+   * 10000-argument call (limits-fnargs) do 10000 reallocs that each copy the
+   * whole list -- ~200 MB of copying on a device without in-place realloc. */
   if (param_index >= call_site->function_argument_count)
   {
     int new_count = param_index + 1;
-    call_site->function_argument_list = (int *)tcc_realloc(call_site->function_argument_list, new_count * sizeof(int));
+    if (new_count > call_site->function_argument_capacity)
+    {
+      int new_cap = call_site->function_argument_capacity ? call_site->function_argument_capacity * 2 : 8;
+      if (new_cap < new_count)
+        new_cap = new_count;
+      call_site->function_argument_list = (int *)tcc_realloc(call_site->function_argument_list, new_cap * sizeof(int));
+      call_site->function_argument_capacity = new_cap;
+    }
     /* Initialize new slots */
     for (int i = call_site->function_argument_count; i < new_count; i++)
     {

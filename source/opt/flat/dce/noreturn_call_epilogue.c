@@ -23,7 +23,7 @@
 
 static int call_is_noreturn(TCCIRState *ir, IRQuadCompact *q)
 {
-  return tcc_ir_callee_is_noreturn(irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q)));
+  return tcc_ir_callee_is_noreturn(tcc_ir_op_src1_sym(ir, q));
 }
 
 int tcc_ir_opt_noreturn_call_epilogue_suppress(TCCIRState *ir)
@@ -31,7 +31,7 @@ int tcc_ir_opt_noreturn_call_epilogue_suppress(TCCIRState *ir)
   int n = ir->next_instruction_index;
   if (n == 0)
     return 0;
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
   if (ir->noreturn)
     return 0; /* already set by a stronger pass */
@@ -82,8 +82,7 @@ int tcc_ir_opt_noreturn_call_epilogue_suppress(TCCIRState *ir)
     int target = -1;
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      target = (int)irop_get_imm64_ex(ir, dest);
+      target = (int)tcc_ir_op_dest_imm(ir, q);
     }
     else
       continue;

@@ -35,6 +35,7 @@
 #include "source/frontend/gen/sym/attr_merge.c"
 #include "source/frontend/gen/value/load.c"
 #include "source/frontend/gen/value/longlong.c"
+#include "source/frontend/gen/value/rodata_rel.c"
 #include "source/frontend/gen/op/int.c"
 #include "source/frontend/gen/op/float.c"
 #include "source/frontend/gen/type/compare.c"
@@ -98,6 +99,12 @@ NORETURN void expect(const char *msg)
 #endif
 
 NORETURN void _tcc_error(const char *fmt, ...)
+{
+  (void)fmt;
+  abort();
+}
+
+NORETURN void _tcc_ice(const char *fmt, ...)
 {
   (void)fmt;
   abort();
@@ -177,6 +184,19 @@ void tcc_ir_frame_note_sret_call(int call_id, int size)
 {
   (void)call_id;
   (void)size;
+}
+
+void tcc_ir_label_note(TCCIRState *ir, int jind)
+{
+  (void)ir;
+  (void)jind;
+}
+
+int tcc_ir_label_insn(TCCIRState *ir, int jind)
+{
+  (void)ir;
+  (void)jind;
+  return -1;
 }
 
 void tcc_ir_set_float_type(TCCIRState *ir, int vreg, int is_float, int is_double)
@@ -355,6 +375,14 @@ int tcc_ir_find_defining_instruction(struct TCCIRState *ir, int32_t vreg, int be
   (void)before_idx;
   return -1;
 }
+/* vreg_query.c's def counts consult the vreg index (vreg_def_use.c) first;
+ * no pass opens one here, so it never answers. */
+int tcc_ir_vreg_index_defs(struct TCCIRState *ir, int32_t vreg)
+{
+  (void)ir;
+  (void)vreg;
+  return -1;
+}
 SValue svalue_call_id_argc(int call_id, int argc)
 {
   SValue sv;
@@ -475,6 +503,15 @@ TokenSym *tok_ensure(int v)
   if (v >= TOK_IDENT && (v - TOK_IDENT) < UT_TABLE_SIZE)
     return ut_table[v - TOK_IDENT];
   return NULL;
+}
+
+/* Only the lazy __builtin_* prototype builder (predef_protos.c) interns a
+   name here, and the tests never arm it. */
+TokenSym *tok_alloc(const char *str, int len)
+{
+  (void)str;
+  (void)len;
+  abort();
 }
 
 static void reset_symbol_state(void)
@@ -1359,7 +1396,7 @@ UT_TEST(test_sym_free)
   sym_facts(s)->const_init_data = dummy_data;
   sym_free(s);
   global_stack = NULL;
-  UT_ASSERT(s->facts == NULL);
+  UT_ASSERT(sym_facts_peek(s) == NULL);
   UT_ASSERT_EQ((unsigned int)s->v, 0xDEADBEEFU);
   return 0;
 }
@@ -2430,10 +2467,10 @@ UT_TEST(test_find_sv_const_init)
   memset(&sf, 0, sizeof(sf));
   s.v = TOK_IDENT + 1; /* a named local */
   s.c = 0x20;          /* stack offset */
-  s.facts = &sf;
   sf.const_init_data = data;
   sf.const_init_valid = 1;
   sf.const_init_size = 8;
+  *sym_facts(&s) = sf; /* facts live in a side map keyed by the Sym */
   s.prev = NULL;
   local_stack = &s;
 
@@ -2454,6 +2491,8 @@ UT_TEST(test_find_sv_const_init)
   s.v = SYM_FIRST_ANOM;
   UT_ASSERT_EQ(find_sv_vec_literal_init(&sv, 4), data);
 
+  sym_facts(&s)->const_init_data = NULL; /* static: not the map's to free */
+  sym_free_facts(&s);
   local_stack = NULL;
   return 0;
 }
@@ -2484,6 +2523,7 @@ UT_TEST(test_funcall_scratch)
 UT_TEST(test_find_nested_func_by_sym)
 {
   static NestedFunc nfs[3];
+  static NestedFunc *nfp[3] = {&nfs[0], &nfs[1], &nfs[2]};
   Sym s0, s1, s2, other;
 
   memset(nfs, 0, sizeof(nfs));
@@ -2492,7 +2532,7 @@ UT_TEST(test_find_nested_func_by_sym)
   nfs[2].sym = &s2;
 
   tcc_state = &ut_dummy_state;
-  ut_dummy_state.nested_funcs = nfs;
+  ut_dummy_state.nested_funcs = nfp;
   ut_dummy_state.nb_nested_funcs = 3;
 
   UT_ASSERT_EQ(find_nested_func_by_sym(&s1), &nfs[1]);
@@ -2576,6 +2616,14 @@ int tcc_ir_codegen_test_gen(struct TCCIRState *ir, int invert, int test)
 void tcc_tcov_block_begin(struct TCCState *s1)
 {
   (void)s1;
+}
+
+/* gen_bswap (builtin/fp2.c), reached from gv() for big-endian
+ * scalar_storage_order members, asks whether REV/REV16 exist: ARMv8-M
+ * Mainline has them. */
+int tcc_machine_has_bit_ops(void)
+{
+  return 1;
 }
 
 UT_TEST(test_gind)
@@ -3593,9 +3641,9 @@ UT_TEST(test_svalue_get_conservative_max_u64)
   local.type.t = VT_INT;
   local.v = TOK_IDENT + 1;
   local.c = 0x30;
-  local.facts = &lf;
   lf.objsize_max_valid = 1;
   lf.objsize_max_value = 500;
+  *sym_facts(&local) = lf; /* facts live in a side map keyed by the Sym */
   local.prev = NULL;
   local_stack = &local;
 
@@ -3607,9 +3655,10 @@ UT_TEST(test_svalue_get_conservative_max_u64)
   UT_ASSERT_EQ((int)m, 500);
 
   /* an unbounded local yields nothing */
-  lf.objsize_max_valid = 0;
+  sym_facts(&local)->objsize_max_valid = 0;
   UT_ASSERT(!svalue_get_conservative_max_u64(&sv, &m));
 
+  sym_free_facts(&local);
   local_stack = NULL;
   return 0;
 }
@@ -3630,9 +3679,9 @@ UT_TEST(test_svalue_get_conservative_string_bytes_u64)
   local.type.t = VT_INT;
   local.v = TOK_IDENT + 1;
   local.c = 0x40;
-  local.facts = &lf;
   lf.objsize_strlen_valid = 1;
   lf.objsize_strlen_value = 9;
+  *sym_facts(&local) = lf; /* facts live in a side map keyed by the Sym */
   local.prev = NULL;
   local_stack = &local;
 
@@ -3644,7 +3693,7 @@ UT_TEST(test_svalue_get_conservative_string_bytes_u64)
   UT_ASSERT_EQ((int)m, 9);
 
   /* without a strlen fact there is no bound */
-  lf.objsize_strlen_valid = 0;
+  sym_facts(&local)->objsize_strlen_valid = 0;
   UT_ASSERT(!svalue_get_conservative_string_bytes_u64(&sv, &m));
 
   /* a bare (non-local, non-string) constant has no string bound */
@@ -3655,6 +3704,7 @@ UT_TEST(test_svalue_get_conservative_string_bytes_u64)
   sv.c.i = 5;
   UT_ASSERT(!svalue_get_conservative_string_bytes_u64(&sv, &m));
 
+  sym_free_facts(&local);
   local_stack = NULL;
   return 0;
 }
@@ -4326,7 +4376,8 @@ UT_TEST(test_nested_callee_has_genuine_capture)
   nf.captured_tokens[0] = TOK_IDENT + 5;
   nf.func_str = NULL;
 
-  ut_dummy_state.nested_funcs = &nf;
+  NestedFunc *nfp = &nf;
+  ut_dummy_state.nested_funcs = &nfp;
   ut_dummy_state.nb_nested_funcs = 1;
 
   /* an unshadowed captured variable is a genuine capture */
@@ -4339,10 +4390,11 @@ UT_TEST(test_nested_callee_has_genuine_capture)
   UT_ASSERT_EQ(nested_callee_has_genuine_capture(&ut_dummy_state, &fsym), 0);
   fref.next = NULL;
 
-  /* shadowed by a body-local declaration ("int x;") -> not genuine */
+  /* a body-local declaration ("int x;") does not hide the capture: only
+   * parameters do (the prescan runs over the whole body) -> still genuine */
   ts = make_tokstr(body);
   nf.func_str = &ts;
-  UT_ASSERT_EQ(nested_callee_has_genuine_capture(&ut_dummy_state, &fsym), 0);
+  UT_ASSERT_EQ(nested_callee_has_genuine_capture(&ut_dummy_state, &fsym), 1);
   nf.func_str = NULL;
 
   /* a callee absent from the nested table -> 0 */
@@ -4362,6 +4414,7 @@ UT_TEST(test_nested_callee_has_genuine_capture)
 UT_TEST(test_nested_callee_captures_reachable)
 {
   static NestedFunc nfs[3];
+  static NestedFunc *nfp[3] = {&nfs[0], &nfs[1], &nfs[2]};
   Sym symA, symB, symC, sym_unrel;
 
   tcc_state = &ut_dummy_state;
@@ -4375,7 +4428,7 @@ UT_TEST(test_nested_callee_captures_reachable)
   nfs[1].parent_nf = &nfs[0];
   nfs[2].parent_nf = &nfs[1];
 
-  ut_dummy_state.nested_funcs = nfs;
+  ut_dummy_state.nested_funcs = nfp;
   ut_dummy_state.nb_nested_funcs = 3;
 
   /* callee not in the table -> unreachable */

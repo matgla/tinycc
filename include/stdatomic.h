@@ -94,44 +94,31 @@ typedef struct {
 #define atomic_init(object, desired)                                      \
     atomic_store_explicit(object, desired, __ATOMIC_RELAXED)
 
+/* The value forms throughout: a `__typeof__ (*ptr) tmp` would be an _Atomic,
+ * which tcc treats as volatile, and the builtin would take its address --
+ * either keeps it in memory for good. */
 #define atomic_store_explicit(object, desired, order)                     \
-    ({ __typeof__ (object) ptr = (object);                                \
-       __typeof__ (*ptr) tmp = (desired);                                 \
-       __atomic_store (ptr, &tmp, (order));                               \
-    })
+    __atomic_store_n ((object), (desired), (order))
 #define atomic_store(object, desired)                                     \
      atomic_store_explicit (object, desired, __ATOMIC_SEQ_CST)
 
-/* The value-returning builtin: `__atomic_load (ptr, &tmp, order)` would take
- * the address of a local, which keeps it in memory for good. */
 #define atomic_load_explicit(object, order)                               \
     __atomic_load_n ((object), (order))
 #define atomic_load(object) atomic_load_explicit (object, __ATOMIC_SEQ_CST)
 
 #define atomic_exchange_explicit(object, desired, order)                  \
-    ({ __typeof__ (object) ptr = (object);                                \
-       __typeof__ (*ptr) val = (desired);                                 \
-       __typeof__ (*ptr) tmp;                                             \
-       __atomic_exchange (ptr, &val, &tmp, (order));                      \
-       tmp;                                                               \
-    })
+    __atomic_exchange_n ((object), (desired), (order))
 #define atomic_exchange(object, desired)                                  \
   atomic_exchange_explicit (object, desired, __ATOMIC_SEQ_CST)
 
 #define atomic_compare_exchange_strong_explicit(object, expected, desired, success, failure) \
-    ({ __typeof__ (object) ptr = (object);                                \
-       __typeof__ (*ptr) tmp = desired;                                   \
-       __atomic_compare_exchange(ptr, expected, &tmp, 0, success, failure); \
-    })
+    __atomic_compare_exchange_n ((object), (expected), (desired), 0, (success), (failure))
 #define atomic_compare_exchange_strong(object, expected, desired)         \
     atomic_compare_exchange_strong_explicit (object, expected, desired,   \
                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
 
 #define atomic_compare_exchange_weak_explicit(object, expected, desired, success, failure) \
-    ({ __typeof__ (object) ptr = (object);                                \
-       __typeof__ (*ptr) tmp = desired;                                   \
-       __atomic_compare_exchange(ptr, expected, &tmp, 1, success, failure); \
-    })
+    __atomic_compare_exchange_n ((object), (expected), (desired), 1, (success), (failure))
 #define atomic_compare_exchange_weak(object, expected, desired)           \
     atomic_compare_exchange_weak_explicit (object, expected, desired,     \
                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)

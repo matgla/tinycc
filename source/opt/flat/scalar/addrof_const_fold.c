@@ -16,6 +16,92 @@
 #include "opt_utils.h"
 #include "opt_du.h"
 
+/* The constant a store of src1 (*val on entry) writes: src1 itself, or what a
+ * single-def TEMP src1 was assigned from -- an IMM/SYMREF, or a single-def VAR
+ * holding one stored before it.  The result keeps src1's btype; returns its tag. */
+static int acf_look_through(TCCIRState *ir, int i, int max_var, const uint8_t *var_def_count, IROperand *val)
+{
+  const IROperand src1 = *val;
+  IROperand effective_val = src1;
+  int sv_tag = irop_get_tag(src1);
+
+  /* If src1 is a TEMP, look back through one TEMP->VAR->IMM indirection. */
+  if (sv_tag == IROP_TAG_VREG)
+  {
+    int32_t s1vr = irop_get_vreg(src1);
+    if (s1vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1vr) == TCCIR_VREG_TYPE_TEMP)
+    {
+      int t1 = TCCIR_DECODE_VREG_POSITION(s1vr);
+      int def_idx = -1;
+      int def_count = 0;
+      for (int j = 0; j < i && def_count <= 1; j++)
+      {
+        IRQuadCompact *r = &ir->compact_instructions[j];
+        if (r->op == TCCIR_OP_NOP || !irop_config[r->op].has_dest)
+          continue;
+        int32_t rdvr = tcc_ir_op_dest_vreg(ir, r);
+        if (rdvr >= 0 && TCCIR_DECODE_VREG_TYPE(rdvr) == TCCIR_VREG_TYPE_TEMP &&
+            TCCIR_DECODE_VREG_POSITION(rdvr) == t1)
+        {
+          def_idx = j;
+          def_count++;
+        }
+      }
+      if (def_count == 1)
+      {
+        IRQuadCompact *def_q = &ir->compact_instructions[def_idx];
+        if (def_q->op == TCCIR_OP_ASSIGN || def_q->op == TCCIR_OP_LOAD)
+        {
+          IROperand def_src = tcc_ir_op_get_src1(ir, def_q);
+          int def_tag = irop_get_tag(def_src);
+          if ((def_tag == IROP_TAG_IMM32 || def_tag == IROP_TAG_SYMREF) &&
+              !irop_is_64bit(def_src))
+          {
+            effective_val = def_src;
+            effective_val.btype = src1.btype;
+            sv_tag = def_tag;
+          }
+          /* Second hop: TEMP loaded from a single-def VAR holding an IMM/SYMREF. */
+          else
+          {
+            int32_t def_svr = irop_get_vreg(def_src);
+            if (def_svr >= 0 && TCCIR_DECODE_VREG_TYPE(def_svr) == TCCIR_VREG_TYPE_VAR)
+            {
+              int v1 = TCCIR_DECODE_VREG_POSITION(def_svr);
+              if (v1 <= max_var && var_def_count[v1] == 1)
+              {
+                for (int j = 0; j < def_idx; j++)
+                {
+                  IRQuadCompact *r = &ir->compact_instructions[j];
+                  if (r->op != TCCIR_OP_STORE && r->op != TCCIR_OP_ASSIGN)
+                    continue;
+                  int32_t rdvr = tcc_ir_op_dest_vreg(ir, r);
+                  if (rdvr < 0 || TCCIR_DECODE_VREG_TYPE(rdvr) != TCCIR_VREG_TYPE_VAR ||
+                      TCCIR_DECODE_VREG_POSITION(rdvr) != v1)
+                    continue;
+                  IROperand rsrc = tcc_ir_op_get_src1(ir, r);
+                  int rtag = irop_get_tag(rsrc);
+                  if ((rtag == IROP_TAG_IMM32 || rtag == IROP_TAG_SYMREF) &&
+                      !irop_is_64bit(rsrc))
+                  {
+                    effective_val = rsrc;
+                    effective_val.btype = src1.btype;
+                    sv_tag = rtag;
+                  }
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  *val = effective_val;
+  return sv_tag;
+}
+
 int tcc_ir_opt_param_addrof_const_fold(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -71,8 +157,7 @@ int tcc_ir_opt_param_addrof_const_fold(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t dvr = irop_get_vreg(dest);
+    int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
     if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_VAR)
       continue;
     int vp = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -87,9 +172,8 @@ int tcc_ir_opt_param_addrof_const_fold(TCCIRState *ir)
     if (q->op != TCCIR_OP_LEA)
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    int32_t dvr = irop_get_vreg(dest);
+    int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
     int32_t svr = irop_get_vreg(src1);
 
     if (!src1.is_local || src1.is_lval)
@@ -194,82 +278,7 @@ int tcc_ir_opt_param_addrof_const_fold(TCCIRState *ir)
           {
             /* Accept IMM32/SYMREF const addresses; reject 64-bit values. */
             IROperand effective_val = src1;
-            int sv_tag = irop_get_tag(src1);
-
-            /* If src1 is a TEMP, look back through one TEMP->VAR->IMM indirection. */
-            if (sv_tag == IROP_TAG_VREG)
-            {
-              int32_t s1vr = irop_get_vreg(src1);
-              if (s1vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1vr) == TCCIR_VREG_TYPE_TEMP)
-              {
-                int t1 = TCCIR_DECODE_VREG_POSITION(s1vr);
-                int def_idx = -1;
-                int def_count = 0;
-                for (int j = 0; j < i && def_count <= 1; j++)
-                {
-                  IRQuadCompact *r = &ir->compact_instructions[j];
-                  if (r->op == TCCIR_OP_NOP || !irop_config[r->op].has_dest)
-                    continue;
-                  IROperand rdest = tcc_ir_op_get_dest(ir, r);
-                  int32_t rdvr = irop_get_vreg(rdest);
-                  if (rdvr >= 0 && TCCIR_DECODE_VREG_TYPE(rdvr) == TCCIR_VREG_TYPE_TEMP &&
-                      TCCIR_DECODE_VREG_POSITION(rdvr) == t1)
-                  {
-                    def_idx = j;
-                    def_count++;
-                  }
-                }
-                if (def_count == 1)
-                {
-                  IRQuadCompact *def_q = &ir->compact_instructions[def_idx];
-                  if (def_q->op == TCCIR_OP_ASSIGN || def_q->op == TCCIR_OP_LOAD)
-                  {
-                    IROperand def_src = tcc_ir_op_get_src1(ir, def_q);
-                    int def_tag = irop_get_tag(def_src);
-                    if ((def_tag == IROP_TAG_IMM32 || def_tag == IROP_TAG_SYMREF) &&
-                        !irop_is_64bit(def_src))
-                    {
-                      effective_val = def_src;
-                      effective_val.btype = src1.btype;
-                      sv_tag = def_tag;
-                    }
-                    /* Second hop: TEMP loaded from a single-def VAR holding an IMM/SYMREF. */
-                    else
-                    {
-                      int32_t def_svr = irop_get_vreg(def_src);
-                      if (def_svr >= 0 && TCCIR_DECODE_VREG_TYPE(def_svr) == TCCIR_VREG_TYPE_VAR)
-                      {
-                        int v1 = TCCIR_DECODE_VREG_POSITION(def_svr);
-                        if (v1 <= max_var && var_def_count[v1] == 1)
-                        {
-                          for (int j = 0; j < def_idx; j++)
-                          {
-                            IRQuadCompact *r = &ir->compact_instructions[j];
-                            if (r->op != TCCIR_OP_STORE && r->op != TCCIR_OP_ASSIGN)
-                              continue;
-                            IROperand rdest = tcc_ir_op_get_dest(ir, r);
-                            int32_t rdvr = irop_get_vreg(rdest);
-                            if (rdvr < 0 || TCCIR_DECODE_VREG_TYPE(rdvr) != TCCIR_VREG_TYPE_VAR ||
-                                TCCIR_DECODE_VREG_POSITION(rdvr) != v1)
-                              continue;
-                            IROperand rsrc = tcc_ir_op_get_src1(ir, r);
-                            int rtag = irop_get_tag(rsrc);
-                            if ((rtag == IROP_TAG_IMM32 || rtag == IROP_TAG_SYMREF) &&
-                                !irop_is_64bit(rsrc))
-                            {
-                              effective_val = rsrc;
-                              effective_val.btype = src1.btype;
-                              sv_tag = rtag;
-                            }
-                            break;
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
+            int sv_tag = acf_look_through(ir, i, max_var, var_def_count, &effective_val);
 
             int sv_ok = (sv_tag == IROP_TAG_IMM32 || sv_tag == IROP_TAG_SYMREF) && !irop_is_64bit(effective_val);
             if (pi[p].store_idx == -1 && sv_ok)
@@ -377,10 +386,8 @@ int tcc_ir_opt_param_addrof_const_fold(TCCIRState *ir)
           continue;
         IRQuadCompact *q = &ir->compact_instructions[i];
         /* Verify this chain instruction belongs to this P. */
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        IROperand src1 = tcc_ir_op_get_src1(ir, q);
-        int32_t dvr = irop_get_vreg(dest);
-        int32_t svr = irop_get_vreg(src1);
+        int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
+        int32_t svr = tcc_ir_op_src1_vreg(ir, q);
         int belongs = 0;
         if (q->op == TCCIR_OP_STORE && dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR)
         {
@@ -474,8 +481,7 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t dvr = irop_get_vreg(dest);
+    int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
     if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_VAR)
       continue;
     int vp = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -490,9 +496,8 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir)
     if (q->op != TCCIR_OP_LEA)
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
     IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    int32_t dvr = irop_get_vreg(dest);
+    int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
     int32_t svr = irop_get_vreg(src1);
 
     if (!src1.is_local || src1.is_lval)
@@ -533,9 +538,8 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir)
       if (q->op == TCCIR_OP_NOP)
         continue;
 
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
       IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      int32_t dvr = irop_get_vreg(dest);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       int32_t svr = irop_get_vreg(src1);
 
       if (q->op == TCCIR_OP_STORE && dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR &&
@@ -551,7 +555,7 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir)
           chain_changed = 1;
         }
       }
-      else if (q->op == TCCIR_OP_ASSIGN && !dest.is_lval && dvr >= 0 &&
+      else if (q->op == TCCIR_OP_ASSIGN && !tcc_ir_op_dest_is_lval(ir, q) && dvr >= 0 &&
                TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && svr >= 0 &&
                TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR)
       {
@@ -595,81 +599,7 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir)
           if (!vi[v].disqualified)
           {
             IROperand effective_val = src1;
-            int sv_tag = irop_get_tag(src1);
-
-            /* Same TEMP->VAR->IMM look-through as the PARAM pass. */
-            if (sv_tag == IROP_TAG_VREG)
-            {
-              int32_t s1vr = irop_get_vreg(src1);
-              if (s1vr >= 0 && TCCIR_DECODE_VREG_TYPE(s1vr) == TCCIR_VREG_TYPE_TEMP)
-              {
-                int t1 = TCCIR_DECODE_VREG_POSITION(s1vr);
-                int def_idx = -1;
-                int def_count = 0;
-                for (int j = 0; j < i && def_count <= 1; j++)
-                {
-                  IRQuadCompact *r = &ir->compact_instructions[j];
-                  if (r->op == TCCIR_OP_NOP || !irop_config[r->op].has_dest)
-                    continue;
-                  IROperand rdest = tcc_ir_op_get_dest(ir, r);
-                  int32_t rdvr = irop_get_vreg(rdest);
-                  if (rdvr >= 0 && TCCIR_DECODE_VREG_TYPE(rdvr) == TCCIR_VREG_TYPE_TEMP &&
-                      TCCIR_DECODE_VREG_POSITION(rdvr) == t1)
-                  {
-                    def_idx = j;
-                    def_count++;
-                  }
-                }
-                if (def_count == 1)
-                {
-                  IRQuadCompact *def_q = &ir->compact_instructions[def_idx];
-                  if (def_q->op == TCCIR_OP_ASSIGN || def_q->op == TCCIR_OP_LOAD)
-                  {
-                    IROperand def_src = tcc_ir_op_get_src1(ir, def_q);
-                    int def_tag = irop_get_tag(def_src);
-                    if ((def_tag == IROP_TAG_IMM32 || def_tag == IROP_TAG_SYMREF) &&
-                        !irop_is_64bit(def_src))
-                    {
-                      effective_val = def_src;
-                      effective_val.btype = src1.btype;
-                      sv_tag = def_tag;
-                    }
-                    else
-                    {
-                      int32_t def_svr = irop_get_vreg(def_src);
-                      if (def_svr >= 0 && TCCIR_DECODE_VREG_TYPE(def_svr) == TCCIR_VREG_TYPE_VAR)
-                      {
-                        int va = TCCIR_DECODE_VREG_POSITION(def_svr);
-                        if (va <= max_var && var_def_count[va] == 1)
-                        {
-                          for (int j = 0; j < def_idx; j++)
-                          {
-                            IRQuadCompact *r = &ir->compact_instructions[j];
-                            if (r->op != TCCIR_OP_STORE && r->op != TCCIR_OP_ASSIGN)
-                              continue;
-                            IROperand rdest = tcc_ir_op_get_dest(ir, r);
-                            int32_t rdvr = irop_get_vreg(rdest);
-                            if (rdvr < 0 || TCCIR_DECODE_VREG_TYPE(rdvr) != TCCIR_VREG_TYPE_VAR ||
-                                TCCIR_DECODE_VREG_POSITION(rdvr) != va)
-                              continue;
-                            IROperand rsrc = tcc_ir_op_get_src1(ir, r);
-                            int rtag = irop_get_tag(rsrc);
-                            if ((rtag == IROP_TAG_IMM32 || rtag == IROP_TAG_SYMREF) &&
-                                !irop_is_64bit(rsrc))
-                            {
-                              effective_val = rsrc;
-                              effective_val.btype = src1.btype;
-                              sv_tag = rtag;
-                            }
-                            break;
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
+            int sv_tag = acf_look_through(ir, i, max_var, var_def_count, &effective_val);
 
             int sv_ok = (sv_tag == IROP_TAG_IMM32 || sv_tag == IROP_TAG_SYMREF) && !irop_is_64bit(effective_val);
             if (vi[v].store_idx == -1 && sv_ok)
@@ -826,10 +756,8 @@ int tcc_ir_opt_local_addrof_const_fold(TCCIRState *ir)
         if (!(chain_instr[i / 8] & (1 << (i % 8))))
           continue;
         IRQuadCompact *q = &ir->compact_instructions[i];
-        IROperand dest = tcc_ir_op_get_dest(ir, q);
-        IROperand src1 = tcc_ir_op_get_src1(ir, q);
-        int32_t dvr = irop_get_vreg(dest);
-        int32_t svr = irop_get_vreg(src1);
+        int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
+        int32_t svr = tcc_ir_op_src1_vreg(ir, q);
         int belongs = 0;
         if (q->op == TCCIR_OP_STORE && dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR)
         {

@@ -130,21 +130,7 @@ int tcc_ir_is_64bit(int t)
 /* Returns true if operation requires FPU */
 int tcc_ir_type_op_needs_fpu(TccIrOp op)
 {
-  switch (op)
-  {
-    case TCCIR_OP_FADD:
-    case TCCIR_OP_FSUB:
-    case TCCIR_OP_FMUL:
-    case TCCIR_OP_FDIV:
-    case TCCIR_OP_FNEG:
-    case TCCIR_OP_FCMP:
-    case TCCIR_OP_CVT_FTOF:
-    case TCCIR_OP_CVT_ITOF:
-    case TCCIR_OP_CVT_FTOI:
-      return 1;
-    default:
-      return 0;
-  }
+  return ir_op_has(op, IROP_A_FP);
 }
 
 /* ============================================================================

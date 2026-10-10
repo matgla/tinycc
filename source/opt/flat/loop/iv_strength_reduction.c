@@ -119,10 +119,9 @@ static int sr_div_value_stays_in_regs(TCCIRState *ir, int lo, int hi, int32_t se
 
       if (irop_config[q->op].has_dest)
       {
-        IROperand d = tcc_ir_op_get_dest(ir, q);
-        if (d.is_lval)
+        if (tcc_ir_op_dest_is_lval(ir, q))
           return 0; /* store through an lval dest — memory write */
-        int32_t dv = irop_get_vreg(d);
+        int32_t dv = tcc_ir_op_dest_vreg(ir, q);
         if (dv >= 0)
         {
           int already = 0;
@@ -156,8 +155,8 @@ static int sr_div_value_stays_in_regs(TCCIRState *ir, int lo, int hi, int32_t se
 static void sr_rewrite_indexed_through(TCCIRState *ir, IRQuadCompact *q, IROperand ptr_op, int rel)
 {
   int is_load = (q->op == TCCIR_OP_LOAD_INDEXED);
-  IROperand old_base = is_load ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
-  IROperand value = is_load ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+  IROperand old_base = tcc_ir_op_get_dest_or_src1(ir, q, is_load);
+  IROperand value = tcc_ir_op_get_dest_or_src1(ir, q, !is_load);
   IROperand new_base = ptr_op;
   new_base.is_lval = old_base.is_lval;
   irop_carry_access_marks(&new_base, old_base);
@@ -179,9 +178,38 @@ static void sr_rewrite_indexed_through(TCCIRState *ir, IRQuadCompact *q, IROpera
   q->operand_base = operand_base;
 }
 
+/* Does the derived address use at use_idx read the IV after its in-loop update
+ * at def_idx, in the same iteration -- the update and then a straight run of
+ * code reaching the use?  That is the one shape whose `ptr += stride`
+ * transform_derived_iv pushes past the use, so the use reads the pointer before
+ * its step while the IV has already stepped, and the pointer starts one stride
+ * ahead.  Linear order alone is not execution order: a `continue` latch laid
+ * out ahead of the body has def_idx < use_idx and still runs after the use
+ * (the register-order loop of ra_linear_scan -- the device tcc skipped
+ * order[0] and read one past the table).  A jump, a call or a jump target in
+ * between ends the run: the stride then follows the update directly, the
+ * pointer tracks the IV, and it starts at the IV's first element. */
+static int sr_use_follows_iv_update(TCCIRState *ir, int def_idx, int use_idx)
+{
+  if (def_idx < 0 || use_idx <= def_idx || use_idx >= ir->next_instruction_index)
+    return 0;
+  for (int si = def_idx + 1; si <= use_idx; si++)
+  {
+    const IRQuadCompact *sq = &ir->compact_instructions[si];
+    if (sq->op == TCCIR_OP_JUMP || sq->op == TCCIR_OP_JUMPIF || sq->op == TCCIR_OP_FUNCCALLVAL ||
+        sq->op == TCCIR_OP_FUNCCALLVOID || sq->is_jump_target)
+      return 0;
+  }
+  return 1;
+}
+
 int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, DerivedIV *div, int *out_ptr_vreg,
                                 int *out_idx_shift, int *out_postnop_origpos, int *out_stride_pos, int shared_ptr_vreg)
 {
+  /* Decided once, before anything is inserted: the start offset below and
+   * the stride placement in step 4 must agree. */
+  div->use_after_def = sr_use_follows_iv_update(ir, iv->def_idx, div->use_idx);
+
   if (out_ptr_vreg)
     *out_ptr_vreg = -1;
   if (out_idx_shift)
@@ -226,8 +254,7 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
     int feeds_mem = 0;
     if (uop != TCCIR_OP_STORE_INDEXED && uop != TCCIR_OP_LOAD_INDEXED)
     {
-      IROperand ud = tcc_ir_op_get_dest(ir, &ir->compact_instructions[div->use_idx]);
-      int32_t ud_vr = irop_get_vreg(ud);
+      int32_t ud_vr = tcc_ir_op_dest_vreg(ir, &ir->compact_instructions[div->use_idx]);
       if (ud_vr >= 0)
       {
         int lo = loop->start_idx >= 0 ? loop->start_idx : 0;
@@ -266,7 +293,7 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
   /* Don't split a CMP→JUMPIF pair: an inserted ADD (init_offset != 0) would clobber the flags. */
   {
     int element_size_check = div->stride / iv->step;
-    int init_offset_check = iv->init_val * element_size_check + div->origin;
+    int init_offset_check = iv->init_val * element_size_check + div->origin + (div->use_after_def ? div->stride : 0);
     if (init_offset_check != 0 && insert_pos > 0 && ir->compact_instructions[insert_pos - 1].op == TCCIR_OP_CMP &&
         insert_pos < ir->next_instruction_index && ir->compact_instructions[insert_pos].op == TCCIR_OP_JUMPIF)
     {
@@ -294,8 +321,8 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
         IRQuadCompact *q = &ir->compact_instructions[i];
         if (irop_config[q->op].has_dest)
         {
-          IROperand qd = tcc_ir_op_get_dest(ir, q);
-          if (irop_get_vreg(qd) == base_vr)
+          int32_t qd_vr = tcc_ir_op_dest_vreg(ir, q);
+          if (qd_vr == base_vr)
           {
             def_found_before = 1;
             break;
@@ -316,8 +343,8 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
           continue;
         if (irop_config[lq->op].has_dest)
         {
-          IROperand ld = tcc_ir_op_get_dest(ir, lq);
-          if (irop_get_vreg(ld) == base_vr)
+          int32_t ld_vr = tcc_ir_op_dest_vreg(ir, lq);
+          if (ld_vr == base_vr)
           {
             LOG_IV_SR("IV_SR: Skipping DIV transform — base vreg redefined inside loop at idx %d", i);
             return 0;
@@ -336,7 +363,7 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
    * A group primary aims the pointer at the group's smallest offset (origin)
    * so every member reads at a non-negative immediate off it. */
   int element_size = div->stride / iv->step;
-  int init_offset = iv->init_val * element_size + div->origin;
+  int init_offset = iv->init_val * element_size + div->origin + (div->use_after_def ? div->stride : 0);
 
   if (init_offset == 0)
   {
@@ -456,82 +483,67 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
 
   /* Step 4: insert ptr += stride after the IV increment, pushed past all uses of the derived address (copy-prop/coalescing can merge ptr with the address temp). */
   int stride_insert_pos = new_iv_def_idx + 1;
-  if (new_use_idx > new_iv_def_idx)
+  if (div->use_after_def)
   {
-    int safe_to_push = 1;
-    for (int si = new_iv_def_idx + 1; si <= new_use_idx; si++)
+    /* Stride must land after the last deref through this pointer. */
+    int32_t use_dest_vr = tcc_ir_op_dest_vreg(ir, &ir->compact_instructions[new_use_idx]);
+    int last_use = new_use_idx;
+    if (use_dest_vr >= 0)
     {
-      IRQuadCompact *sq = &ir->compact_instructions[si];
-      if (sq->op == TCCIR_OP_JUMP || sq->op == TCCIR_OP_JUMPIF || sq->op == TCCIR_OP_FUNCCALLVAL ||
-          sq->op == TCCIR_OP_FUNCCALLVOID)
+      /* Extend the scan window by idx_shift + postnop so it doesn't stop short of a trailing FUNCCALL. */
+      int loop_end = loop->end_idx + idx_shift + (postnop_inserted ? 1 : 0);
+      int saw_param_use = 0;
+      for (int si = new_use_idx + 1; si <= loop_end; si++)
       {
-        safe_to_push = 0;
-        break;
-      }
-    }
-    if (safe_to_push)
-    {
-      /* Stride must land after the last deref through this pointer. */
-      IROperand use_dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[new_use_idx]);
-      int32_t use_dest_vr = irop_get_vreg(use_dest);
-      int last_use = new_use_idx;
-      if (use_dest_vr >= 0)
-      {
-        /* Extend the scan window by idx_shift + postnop so it doesn't stop short of a trailing FUNCCALL. */
-        int loop_end = loop->end_idx + idx_shift + (postnop_inserted ? 1 : 0);
-        int saw_param_use = 0;
-        for (int si = new_use_idx + 1; si <= loop_end; si++)
+        IRQuadCompact *sq = &ir->compact_instructions[si];
+        if (sq->op == TCCIR_OP_NOP)
+          continue;
+        if (sq->op == TCCIR_OP_JUMP || sq->op == TCCIR_OP_JUMPIF)
+          break;
+        if (sq->op == TCCIR_OP_FUNCCALLVAL || sq->op == TCCIR_OP_FUNCCALLVOID)
         {
-          IRQuadCompact *sq = &ir->compact_instructions[si];
-          if (sq->op == TCCIR_OP_NOP)
-            continue;
-          if (sq->op == TCCIR_OP_JUMP || sq->op == TCCIR_OP_JUMPIF)
-            break;
-          if (sq->op == TCCIR_OP_FUNCCALLVAL || sq->op == TCCIR_OP_FUNCCALLVOID)
-          {
-            /* Params materialize at the call: if one passed our address, push the stride past the CALL. */
-            if (saw_param_use)
-              last_use = si;
-            break;
-          }
-          int uses_it = 0;
-          int defines_it = 0;
-          if (irop_config[sq->op].has_dest)
-          {
-            IROperand d = tcc_ir_op_get_dest(ir, sq);
-            if (irop_get_vreg(d) == use_dest_vr)
-            {
-              if (sq->op == TCCIR_OP_STORE || sq->op == TCCIR_OP_STORE_INDEXED ||
-                  sq->op == TCCIR_OP_STORE_POSTINC)
-                uses_it = 1;
-              else
-                defines_it = 1;
-            }
-          }
-          if (irop_config[sq->op].has_src1)
-          {
-            IROperand s1 = tcc_ir_op_get_src1(ir, sq);
-            if (irop_get_vreg(s1) == use_dest_vr)
-              uses_it = 1;
-          }
-          if (irop_config[sq->op].has_src2)
-          {
-            IROperand s2 = tcc_ir_op_get_src2(ir, sq);
-            if (irop_get_vreg(s2) == use_dest_vr)
-              uses_it = 1;
-          }
-          if (defines_it && !uses_it)
-            break;
-          if (uses_it)
-          {
+          /* Params materialize at the call: if one passed our address, push the stride past the CALL. */
+          if (saw_param_use)
             last_use = si;
-            if (sq->op == TCCIR_OP_FUNCPARAMVAL)
-              saw_param_use = 1;
+          break;
+        }
+        int uses_it = 0;
+        int defines_it = 0;
+        if (irop_config[sq->op].has_dest)
+        {
+          int32_t d_vr = tcc_ir_op_dest_vreg(ir, sq);
+          if (d_vr == use_dest_vr)
+          {
+            if (sq->op == TCCIR_OP_STORE || sq->op == TCCIR_OP_STORE_INDEXED ||
+                sq->op == TCCIR_OP_STORE_POSTINC)
+              uses_it = 1;
+            else
+              defines_it = 1;
           }
         }
+        if (irop_config[sq->op].has_src1)
+        {
+          int32_t s1_vr = tcc_ir_op_src1_vreg(ir, sq);
+          if (s1_vr == use_dest_vr)
+            uses_it = 1;
+        }
+        if (irop_config[sq->op].has_src2)
+        {
+          int32_t s2_vr = tcc_ir_op_src2_vreg(ir, sq);
+          if (s2_vr == use_dest_vr)
+            uses_it = 1;
+        }
+        if (defines_it && !uses_it)
+          break;
+        if (uses_it)
+        {
+          last_use = si;
+          if (sq->op == TCCIR_OP_FUNCPARAMVAL)
+            saw_param_use = 1;
+        }
       }
-      stride_insert_pos = last_use + 1;
     }
+    stride_insert_pos = last_use + 1;
   }
   IROperand stride_op = irop_make_imm32(-1, div->stride, IROP_BTYPE_INT32);
 
@@ -557,6 +569,24 @@ int transform_derived_iv(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Derived
     *out_idx_shift = idx_shift;
 
   return 3; /* Full success: init + replace + stride */
+}
+
+/* CMP iv, #imm at i, followed past NOPs/ASSIGNs (which keep the flags) by a JUMPIF; its index in *jq_idx. */
+static int sr_iv_cmp_jumpif(TCCIRState *ir, int i, int32_t iv_vr, int *jq_idx)
+{
+  IRQuadCompact *cq = &ir->compact_instructions[i];
+  if (cq->op != TCCIR_OP_CMP)
+    return 0;
+  if (tcc_ir_op_src1_vreg(ir, cq) != iv_vr || !tcc_ir_op_src2_is_imm(ir, cq))
+    return 0;
+  int n = ir->next_instruction_index;
+  int j = i + 1;
+  while (j < n && (ir->compact_instructions[j].op == TCCIR_OP_NOP || ir->compact_instructions[j].op == TCCIR_OP_ASSIGN))
+    j++;
+  if (j >= n || ir->compact_instructions[j].op != TCCIR_OP_JUMPIF)
+    return 0;
+  *jq_idx = j;
+  return 1;
 }
 
 /* Try to eliminate the original IV counter after strength reduction has created
@@ -612,38 +642,22 @@ int try_eliminate_iv_counter(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Der
 
     for (int i = scan_start; i <= scan_end; i++)
     {
-      IRQuadCompact *cq = &ir->compact_instructions[i];
-      if (cq->op != TCCIR_OP_CMP)
+      int jq_idx;
+      if (!sr_iv_cmp_jumpif(ir, i, iv_vr, &jq_idx))
         continue;
-
-      IROperand cmp_src1 = tcc_ir_op_get_src1(ir, cq);
-      IROperand cmp_src2 = tcc_ir_op_get_src2(ir, cq);
-
-      if (irop_get_vreg(cmp_src1) != iv_vr || !irop_is_immediate(cmp_src2))
-        continue;
-
-      /* Look forward for the JUMPIF, skipping NOPs and ASSIGNs (which don't clobber flags) */
-      int jq_idx = i + 1;
-      while (jq_idx < n && (ir->compact_instructions[jq_idx].op == TCCIR_OP_NOP ||
-                            ir->compact_instructions[jq_idx].op == TCCIR_OP_ASSIGN))
-        jq_idx++;
-
-      if (jq_idx >= n)
-        continue;
+      int64_t cmp_src2_imm = tcc_ir_op_src2_imm(ir, &ir->compact_instructions[i]);
       IRQuadCompact *jq = &ir->compact_instructions[jq_idx];
-      if (jq->op != TCCIR_OP_JUMPIF)
-        continue;
 
-      IROperand cond_op = tcc_ir_op_get_src1(ir, jq);
-      hdr_cond_token = (int)irop_get_imm64_ex(ir, cond_op);
+      int64_t cond_op_imm = tcc_ir_op_src1_imm(ir, jq);
+      hdr_cond_token = (int)cond_op_imm;
 
       /* Exit target must be outside the loop */
-      IROperand jmp_dest = tcc_ir_op_get_dest(ir, jq);
-      int exit_target = (int)irop_get_imm64_ex(ir, jmp_dest);
+      int64_t jmp_dest_imm = tcc_ir_op_dest_imm(ir, jq);
+      int exit_target = (int)jmp_dest_imm;
       if (exit_target <= adj_end + 1) /* +1 for the stride ADD we inserted */
         continue;
 
-      limit_val = (int)irop_get_imm64_ex(ir, cmp_src2);
+      limit_val = (int)cmp_src2_imm;
       hdr_cmp_idx = i;
       hdr_jmpif_idx = jq_idx;
       break;
@@ -658,38 +672,22 @@ int try_eliminate_iv_counter(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Der
 
   for (int i = adj_end; i >= adj_end - 5 && i >= 0; i--)
   {
-    IRQuadCompact *cq = &ir->compact_instructions[i];
-    if (cq->op != TCCIR_OP_CMP)
+    int jq_idx;
+    if (!sr_iv_cmp_jumpif(ir, i, iv_vr, &jq_idx))
       continue;
-
-    IROperand cmp_src1 = tcc_ir_op_get_src1(ir, cq);
-    IROperand cmp_src2 = tcc_ir_op_get_src2(ir, cq);
-
-    if (irop_get_vreg(cmp_src1) != iv_vr || !irop_is_immediate(cmp_src2))
-      continue;
-
-    /* Look forward for the JUMPIF */
-    int jq_idx = i + 1;
-    while (jq_idx < n && (ir->compact_instructions[jq_idx].op == TCCIR_OP_NOP ||
-                          ir->compact_instructions[jq_idx].op == TCCIR_OP_ASSIGN))
-      jq_idx++;
-
-    if (jq_idx >= n)
-      continue;
+    int64_t cmp_src2_imm = tcc_ir_op_src2_imm(ir, &ir->compact_instructions[i]);
     IRQuadCompact *jq = &ir->compact_instructions[jq_idx];
-    if (jq->op != TCCIR_OP_JUMPIF)
-      continue;
 
-    IROperand cond_op = tcc_ir_op_get_src1(ir, jq);
-    be_cond_token = (int)irop_get_imm64_ex(ir, cond_op);
+    int64_t cond_op_imm = tcc_ir_op_src1_imm(ir, jq);
+    be_cond_token = (int)cond_op_imm;
 
     /* Back-edge target must be inside the loop (jumps back) */
-    IROperand jmp_dest = tcc_ir_op_get_dest(ir, jq);
-    int back_target = (int)irop_get_imm64_ex(ir, jmp_dest);
+    int64_t jmp_dest_imm = tcc_ir_op_dest_imm(ir, jq);
+    int back_target = (int)jmp_dest_imm;
     if (back_target > adj_end)
       continue; /* Not a back-edge */
 
-    int be_limit = (int)irop_get_imm64_ex(ir, cmp_src2);
+    int be_limit = (int)cmp_src2_imm;
 
     /* Use limit_val from header if found, otherwise from back-edge */
     if (hdr_cmp_idx < 0)
@@ -732,16 +730,16 @@ int try_eliminate_iv_counter(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Der
     /* Allow the copy-through pattern: T = V just before V = T + 1 */
     if (q->op == TCCIR_OP_ASSIGN && i >= adj_iv_def - 2 && i < adj_iv_def)
     {
-      IROperand asrc = tcc_ir_op_get_src1(ir, q);
-      if (irop_get_vreg(asrc) == iv_vr)
+      int32_t asrc_vr = tcc_ir_op_src1_vreg(ir, q);
+      if (asrc_vr == iv_vr)
         continue; /* This is the copy-through temp */
     }
 
     /* Check src1 and src2 for uses of the IV */
     if (irop_config[q->op].has_src1)
     {
-      IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      if (irop_get_vreg(s1) == iv_vr)
+      int32_t s1_vr = tcc_ir_op_src1_vreg(ir, q);
+      if (s1_vr == iv_vr)
       {
         other_uses++;
         if (TCC_LOG_IV_SR)
@@ -750,8 +748,8 @@ int try_eliminate_iv_counter(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Der
     }
     if (irop_config[q->op].has_src2)
     {
-      IROperand s2 = tcc_ir_op_get_src2(ir, q);
-      if (irop_get_vreg(s2) == iv_vr)
+      int32_t s2_vr = tcc_ir_op_src2_vreg(ir, q);
+      if (s2_vr == iv_vr)
       {
         other_uses++;
         if (TCC_LOG_IV_SR)
@@ -775,7 +773,23 @@ int try_eliminate_iv_counter(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Der
   /* end is built from ptr when ptr still equals base + origin (init 0), and
    * from base otherwise -- only the latter still owes the origin. */
   if (iv->init_val != 0)
-    end_offset += div->origin;
+    end_offset += div->origin + (div->use_after_def ? div->stride : 0);
+
+  /* The ptr/end compares below are unsigned, which is right for an address.
+   * A constant base makes the walked value a plain integer offset: if it
+   * crosses the sign boundary (-2 .. 10) the unsigned test exits at once. */
+  if (irop_is_none(div->base_op) || irop_is_immediate(div->base_op))
+  {
+    int64_t base = irop_is_none(div->base_op) ? 0 : (int64_t)irop_get_imm32(div->base_op);
+    int64_t first = base + (int64_t)iv->init_val * element_size + div->origin;
+    int64_t last = base + (int64_t)limit_val * element_size + div->origin;
+    if (((int32_t)first < 0) != ((int32_t)last < 0))
+    {
+      LOG_IV_SR("IV_SR_ELIM: constant-base walk %lld..%lld crosses zero, keep the counter", (long long)first,
+                (long long)last);
+      return 0;
+    }
+  }
 
   /* Allocate a vreg for end_ptr */
   int end_vreg = tcc_ir_vreg_alloc_temp(ir);
@@ -923,8 +937,8 @@ int try_eliminate_iv_counter(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Der
     if (adj_iv_init >= 0 && adj_iv_init < ir->next_instruction_index)
     {
       IRQuadCompact *init_q = &ir->compact_instructions[adj_iv_init];
-      IROperand init_dest = tcc_ir_op_get_dest(ir, init_q);
-      if (irop_get_vreg(init_dest) == iv_vr)
+      int32_t init_dest_vr = tcc_ir_op_dest_vreg(ir, init_q);
+      if (init_dest_vr == iv_vr)
         init_q->op = TCCIR_OP_NOP;
     }
 
@@ -933,8 +947,8 @@ int try_eliminate_iv_counter(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Der
     if (adj_iv_inc >= 0 && adj_iv_inc < ir->next_instruction_index)
     {
       IRQuadCompact *inc_q = &ir->compact_instructions[adj_iv_inc];
-      IROperand inc_dest = tcc_ir_op_get_dest(ir, inc_q);
-      if (irop_get_vreg(inc_dest) == iv_vr)
+      int32_t inc_dest_vr = tcc_ir_op_dest_vreg(ir, inc_q);
+      if (inc_dest_vr == iv_vr)
         inc_q->op = TCCIR_OP_NOP;
 
       /* Also NOP the copy-through temp (T1 = V1) that precedes V1 = T1 + 1 */
@@ -945,8 +959,8 @@ int try_eliminate_iv_counter(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Der
           continue;
         if (cq->op == TCCIR_OP_ASSIGN)
         {
-          IROperand csrc = tcc_ir_op_get_src1(ir, cq);
-          if (irop_get_vreg(csrc) == iv_vr)
+          int32_t csrc_vr = tcc_ir_op_src1_vreg(ir, cq);
+          if (csrc_vr == iv_vr)
           {
             cq->op = TCCIR_OP_NOP;
             break;
@@ -969,6 +983,29 @@ int try_eliminate_iv_counter(TCCIRState *ir, IRLoop *loop, InductionVar *iv, Der
  * Returns number of transformations applied
  */
 /* Core IV strength reduction using pre-detected loops */
+
+typedef struct
+{
+  int init_pos;
+  int shift;
+  int has_postnop;
+  int use_for_nop;
+  int has_stride;
+  int stride_pos;
+} IvsrShift;
+
+static void ivsr_apply_shift(const IvsrShift *c, int *idx)
+{
+  int orig = *idx;
+  if (orig >= c->init_pos)
+  {
+    *idx = orig + c->shift;
+    if (c->has_postnop && orig > c->use_for_nop)
+      (*idx)++;
+    if (c->has_stride && c->stride_pos >= 0 && *idx >= c->stride_pos)
+      (*idx)++;
+  }
+}
 
 int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
 {
@@ -1020,6 +1057,9 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
 
     LOG_IV_SR("IV_SR: Found %d DIV(s) in loop %d", num_divs, li);
 
+    for (int dj = 0; dj < num_divs; dj++)
+      divs[dj].use_after_def = sr_use_follows_iv_update(ir, ivs[divs[dj].iv_idx].def_idx, divs[dj].use_idx);
+
     /* Deduplicate DIVs that compute identical (iv, stride, base) recurrences.
      * A duplicate (share_with >= 0) is only attempted when its primary FAILED
      * to transform, and transform_derived_iv refuses shared rewrites outright
@@ -1034,6 +1074,8 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
           continue; /* only chain to primaries */
         if (divs[dj].iv_idx != divs[dk].iv_idx || divs[dj].stride != divs[dk].stride)
           continue;
+        if (divs[dj].use_after_def != divs[dk].use_after_def)
+          continue; /* the one pointer would be a stride off for one of them */
         /* Compare base operands: same vreg, or same immediate value, or same
          * stack offset -- looking through a single-def copy of an address, so
          * loads off `Addr[StackLoc[k]]` and a store through `T <- Addr[...]`
@@ -1147,20 +1189,9 @@ int iv_strength_reduction_core(TCCIRState *ir, IRLoops *loops)
          * init/postnop-shifted index below — NOT against iv->def_idx, which is
          * wrong whenever the stride was pushed past a FUNCCALL. */
         int stride_pos = sr_stride_pos;
+        IvsrShift shift_ctx = {init_pos, sr_idx_shift, has_postnop, orig_use_for_nop, has_stride, stride_pos};
 
-#define APPLY_SHIFT(idx)                                                                                               \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    int _orig = (idx);                                                                                                 \
-    if (_orig >= init_pos)                                                                                             \
-    {                                                                                                                  \
-      (idx) = _orig + sr_idx_shift;                                                                                    \
-      if (has_postnop && _orig > orig_use_for_nop)                                                                     \
-        (idx)++;                                                                                                       \
-      if (has_stride && stride_pos >= 0 && (idx) >= stride_pos)                                                        \
-        (idx)++;                                                                                                       \
-    }                                                                                                                  \
-  } while (0)
+#define APPLY_SHIFT(idx) ivsr_apply_shift(&shift_ctx, &(idx))
 
         /* Shift indices of remaining DIVs and all IVs so we can
          * continue processing more DIVs in this loop. */

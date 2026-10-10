@@ -25,14 +25,6 @@ int tcc_ir_opt_zero_vla_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir);
 int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir);
 
-/* IROptCtx wrapper entry points. */
-int tcc_ir_opt_dead_var_store_elim_ex(IROptCtx *ctx);
-int tcc_ir_opt_dead_addrvar_elim_ex(IROptCtx *ctx);
-int tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(IROptCtx *ctx);
-int tcc_ir_opt_zero_vla_elim_ex(IROptCtx *ctx);
-int tcc_ir_opt_dead_before_infinite_loop_ex(IROptCtx *ctx);
-int tcc_ir_opt_infinite_loop_simplify_ex(IROptCtx *ctx);
-
 #define I32 IROP_BTYPE_INT32
 
 /* ------------------------------------------------------------------ helpers */
@@ -403,17 +395,9 @@ UT_TEST(test_infinite_loop_simplify_indexed_store_blocks_collapse)
  * docs/plan_legacy_loop_dead_loop_elim_ssa.md), so its two unit tests
  * (const-VAR hoist positive, _ex-empty) were removed with the symbol. */
 
-/* ================================================================== IROptCtx wrappers */
+/* ================================================================== direct entry points */
 
-/* Helper: zero an IROptCtx and point it at `ir`. */
-static IROptCtx utb_ctx(TCCIRState *ir)
-{
-  IROptCtx ctx = {0};
-  ctx.ir = ir;
-  return ctx;
-}
-
-UT_TEST(test_dead_var_store_elim_ex_forwards)
+UT_TEST(test_dead_var_store_elim_direct_call)
 {
   TCCIRState *ir = utb_new();
   utb_alloc_var_intervals(ir, 2);
@@ -421,8 +405,7 @@ UT_TEST(test_dead_var_store_elim_ex_forwards)
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(9, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_var(1, I32), UTB_NONE);
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_dead_var_store_elim_ex(&ctx);
+  int changes = tcc_ir_opt_dead_var_store_elim(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
@@ -431,7 +414,7 @@ UT_TEST(test_dead_var_store_elim_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_dead_addrvar_elim_ex_forwards)
+UT_TEST(test_dead_addrvar_elim_direct_call)
 {
   TCCIRState *ir = utb_new();
   int lea = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
@@ -439,8 +422,7 @@ UT_TEST(test_dead_addrvar_elim_ex_forwards)
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(1, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_var(1, I32), UTB_NONE);
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_dead_addrvar_elim_ex(&ctx);
+  int changes = tcc_ir_opt_dead_addrvar_elim(ir);
 
   UT_ASSERT_EQ(changes, 2);
   UT_ASSERT_EQ(utb_op(ir, lea), TCCIR_OP_NOP);
@@ -450,7 +432,7 @@ UT_TEST(test_dead_addrvar_elim_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_dead_trailing_addrvar_store_elim_ex_forwards)
+UT_TEST(test_dead_trailing_addrvar_store_elim_direct_call)
 {
   TCCIRState *ir = utb_new();
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);
@@ -460,8 +442,7 @@ UT_TEST(test_dead_trailing_addrvar_store_elim_ex_forwards)
   int dead = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(2, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(&ctx);
+  int changes = tcc_ir_opt_dead_trailing_addrvar_store_elim(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, kept), TCCIR_OP_STORE);
@@ -471,13 +452,12 @@ UT_TEST(test_dead_trailing_addrvar_store_elim_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_zero_vla_elim_ex_forwards)
+UT_TEST(test_zero_vla_elim_direct_call)
 {
   TCCIRState *ir = utb_new();
   int alloc = utb_emit(ir, TCCIR_OP_VLA_ALLOC, UTB_NONE, utb_imm(0, I32), utb_imm(8, I32));
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_zero_vla_elim_ex(&ctx);
+  int changes = tcc_ir_opt_zero_vla_elim(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, alloc), TCCIR_OP_NOP);
@@ -486,7 +466,7 @@ UT_TEST(test_zero_vla_elim_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_dead_before_infinite_loop_ex_forwards)
+UT_TEST(test_dead_before_infinite_loop_direct_call)
 {
   TCCIRState *ir = utb_new();
   tcc_state->optimize = 2;
@@ -494,8 +474,7 @@ UT_TEST(test_dead_before_infinite_loop_ex_forwards)
   int dead = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
   emit_jump(ir, 1);
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_dead_before_infinite_loop_ex(&ctx);
+  int changes = tcc_ir_opt_dead_before_infinite_loop(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
@@ -505,7 +484,7 @@ UT_TEST(test_dead_before_infinite_loop_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_infinite_loop_simplify_ex_forwards)
+UT_TEST(test_infinite_loop_simplify_direct_call)
 {
   TCCIRState *ir = utb_loop_new();
   tcc_state->optimize = 2;
@@ -519,8 +498,7 @@ UT_TEST(test_infinite_loop_simplify_ex_forwards)
   int back_edge = emit_jump(ir, 0);
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_infinite_loop_simplify_ex(&ctx);
+  int changes = tcc_ir_opt_infinite_loop_simplify(ir);
 
   UT_ASSERT(changes > 0);
   UT_ASSERT_EQ(utb_op(ir, header), TCCIR_OP_JUMP);

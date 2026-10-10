@@ -89,6 +89,11 @@ static int ra_rl_operand_regs(TCCIRState *ir, IROperand op, int *r0, int *r1)
   IRLiveInterval *li = tcc_ir_vreg_live_interval(ir, vr);
   if (!li || li->allocation.offset != 0)
     return 0;
+  /* An s-register (hard-float) is no core register: masked to five bits, s0
+   * would pass for r0 and a word copy of a float parameter's home would read
+   * whatever r0 holds. */
+  if (LS_IS_VFP_REG(li->allocation.r0) || LS_IS_VFP_REG(li->allocation.r1))
+    return 0;
   if (ra_alloc_half_spilled(li->allocation.r0) || ra_alloc_half_spilled(li->allocation.r1))
     return 0;
   int a0 = li->allocation.r0 & PREG_REG_NONE;
@@ -155,13 +160,52 @@ static void ra_rl_reserve_regs(LSLiveIntervalState *ls, int r0, int r1, int lo, 
   }
 }
 
+/* Does `q` leave every register and every frame slot alone except the ones its
+ * IR destination names?  Only then may a slot->register fact outlive it.
+ *
+ * This is deny-by-default on purpose.  The pass used to list the ops that can
+ * disturb a slot or a register and treat everything else as harmless, so each
+ * op nobody thought of kept its facts: a BLOCK_COPY (its lowering runs on
+ * r0-r3/r12/lr as cursors and data registers, and it writes the frame without
+ * being a STORE), a __builtin_apply, a longjmp, a switch dispatch (r12), a
+ * soft-float operation that still ends in an __aeabi_* helper (the helper
+ * clobbers r0-r3 whatever register the result is moved to).  What is allowed
+ * through is named instead: an op whose only hazards are reading memory,
+ * touching the flags, or transferring control (the join that follows resets
+ * the table), and whose destination is a register.  Anything else -- calls and
+ * their setup, memory writes, asm, VLAs, non-local control, the static chain,
+ * and any hazard class added to op_props.h later -- starts from nothing. */
+static int ra_rl_op_keeps_facts(TCCIRState *ir, const IRQuadCompact *q)
+{
+  const TccIrOp op = (TccIrOp)q->op;
+
+  if (ir_op_has(op, IR_HZ_FROM_OP & ~(IR_HZ_MEM_READ | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ | IR_HZ_BRANCH |
+                                      IR_HZ_RETURN | IR_HZ_TRAP | IR_HZ_HINT)))
+    return 0;
+
+  /* The dispatch and its value-table read use r12 as a scratch; the table
+   * says "branch" and "memory read", which are otherwise harmless. */
+  if (op == TCCIR_OP_SWITCH_TABLE || op == TCCIR_OP_SWITCH_LOAD)
+    return 0;
+
+  /* An FP op that is lowered to an __aeabi_* helper by the backend. */
+  if (ir_op_is_implicit_call_ra(op))
+    return 0;
+
+  /* A store through the destination of an op that is not a STORE. */
+  if (irop_config[op].has_dest && tcc_ir_op_get_dest(ir, (IRQuadCompact *)q).is_lval)
+    return 0;
+
+  return 1;
+}
+
 static int ra_redundant_reload_elim(TCCIRState *ir)
 {
   LSLiveIntervalState *ls = &ir->ls;
   const int n = ir->next_instruction_index;
   int removed = 0;
 
-  if (tcc_state->optimize < 1)
+  if (TCC_OPT(tcc_state, optimize) < 1)
     return 0;
   if (tcc_ir_opt_pass_disabled("ra:reload_elim"))
     return 0;
@@ -207,36 +251,24 @@ static int ra_redundant_reload_elim(TCCIRState *ir)
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    switch (q->op)
+    /* STORE and LOAD are the two ops this table is about and are handled
+     * below.  Every other op must prove it leaves the facts alone. */
+    if (q->op != TCCIR_OP_STORE && q->op != TCCIR_OP_LOAD && !ra_rl_op_keeps_facts(ir, q))
     {
-    /* A call, a write through a pointer or an indexed write can land on any
-     * slot, and inline asm can do anything at all. */
-    case TCCIR_OP_FUNCCALLVAL:
-    case TCCIR_OP_FUNCCALLVOID:
-    case TCCIR_OP_STORE_INDEXED:
-    case TCCIR_OP_STORE_POSTINC:
-    case TCCIR_OP_INLINE_ASM:
-    case TCCIR_OP_ASM_INPUT:
-    case TCCIR_OP_ASM_OUTPUT:
-    case TCCIR_OP_SETJMP:
-    case TCCIR_OP_NL_SETJMP:
-    case TCCIR_OP_VLA_ALLOC:
-    case TCCIR_OP_VLA_SP_RESTORE:
       ntracked = 0;
       continue;
-    default:
-      break;
     }
 
     int slot_off = 0;
 
     /* Drop a load that rewrites the very registers already holding the slot. */
     if (q->op == TCCIR_OP_LOAD && ntracked &&
-        ra_rl_slot_offset(tcc_ir_op_get_src1(ir, q), &slot_off))
+        ra_rl_slot_offset(tcc_ir_op_get_src1(ir, q), &slot_off) &&
+        !tcc_ir_access_is_volatile(ir, tcc_ir_op_get_src1(ir, q)))
     {
       int d0 = 0, d1 = 0;
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int width = ra_rl_exact_width(irop_get_btype(tcc_ir_op_get_src1(ir, q)));
+      int width = ra_rl_exact_width(tcc_ir_op_src1_btype(ir, q));
       if (width && !dest.is_lval && ra_rl_operand_regs(ir, dest, &d0, &d1) &&
           ((d1 >= 0) == (width == 8)))
       {
@@ -272,7 +304,7 @@ static int ra_redundant_reload_elim(TCCIRState *ir)
     {
       IROperand val = tcc_ir_op_get_src1(ir, q);
       int s0 = 0, s1 = 0;
-      int dst_bt = irop_get_btype(tcc_ir_op_get_dest(ir, q));
+      int dst_bt = tcc_ir_op_dest_btype(ir, q);
       int size = ra_rl_exact_width(dst_bt);
       int inval_size = size;
       if (!size)
@@ -299,7 +331,9 @@ static int ra_redundant_reload_elim(TCCIRState *ir)
         if (escaped[e] == slot_off)
           is_escaped = 1;
 
-      if (size && !is_escaped && !val.is_lval && ra_rl_operand_regs(ir, val, &s0, &s1) &&
+      /* A volatile store is an access of its own, not a value to forward from. */
+      if (size && !is_escaped && !tcc_ir_access_is_volatile(ir, tcc_ir_op_get_dest(ir, q)) && !val.is_lval &&
+          ra_rl_operand_regs(ir, val, &s0, &s1) &&
           ((s1 >= 0) == (size == 8)) && ra_rl_exact_width(irop_get_btype(val)) == size &&
           ntracked < RA_REL_MAX_TRACKED)
       {
@@ -447,16 +481,18 @@ static int ra_dfs_dead_to_return(TCCIRState *ir, int at, int off, int w)
     case TCCIR_OP_ASSIGN:
       break;
     default:
-      if (irop_config[q->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, q)) >= 0)
+      if (irop_config[q->op].has_dest && tcc_ir_op_dest_vreg(ir, q) >= 0)
         break; /* a plain computation into a register */
       return 0;
     }
 
-    for (int k = 0; k < 3; ++k)
+    /* slot 3 too: an MLA/MLS accumulator reads its slot like any source */
+    for (int k = 0; k < 4; ++k)
     {
       IROperand op = (k == 0)   ? (irop_config[q->op].has_dest ? tcc_ir_op_get_dest(ir, q) : IROP_NONE)
                      : (k == 1) ? (irop_config[q->op].has_src1 ? tcc_ir_op_get_src1(ir, q) : IROP_NONE)
-                                : (irop_config[q->op].has_src2 ? tcc_ir_op_get_src2(ir, q) : IROP_NONE);
+                     : (k == 2) ? (irop_config[q->op].has_src2 ? tcc_ir_op_get_src2(ir, q) : IROP_NONE)
+                                : (tcc_ir_op_is_mac(q->op) ? tcc_ir_op_get_accum(ir, q) : IROP_NONE);
       if (!ra_dfs_is_slot(op))
         continue;
       /* A plain STORE's destination overwrites the slot, it does not read it;
@@ -479,7 +515,7 @@ static int ra_dead_frame_store_elim(TCCIRState *ir)
   const int n = ir->next_instruction_index;
   int removed = 0;
 
-  if (tcc_state->optimize < 1)
+  if (TCC_OPT(tcc_state, optimize) < 1)
     return 0;
   if (tcc_ir_opt_pass_disabled("ra:dead_frame_store"))
     return 0;
@@ -676,7 +712,7 @@ static int ra_copy_propagate(TCCIRState *ir)
   const int n = ir->next_instruction_index;
   int removed = 0;
 
-  if (tcc_state->optimize < 1)
+  if (TCC_OPT(tcc_state, optimize) < 1)
     return 0;
   if (!ls->live_regs_by_instruction || ls->live_regs_by_instruction_size <= 0)
     return 0;
@@ -850,18 +886,18 @@ static int ra_copy_propagate(TCCIRState *ir)
       if (k == i || qk->op == TCCIR_OP_NOP)
         continue;
       if (irop_config[qk->op].has_dest &&
-          irop_get_vreg(tcc_ir_op_get_dest(ir, qk)) == dv)
+          tcc_ir_op_dest_vreg(ir, qk) == dv)
       { ok = 0; break; } /* redefined, or written through as an address */
 
       int reads = 0;
       if (irop_config[qk->op].has_src1 &&
-          irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == dv)
+          tcc_ir_op_src1_vreg(ir, qk) == dv)
         reads = 1;
       if (!reads && irop_config[qk->op].has_src2 &&
-          irop_get_vreg(tcc_ir_op_get_src2(ir, qk)) == dv)
+          tcc_ir_op_src2_vreg(ir, qk) == dv)
         reads = 1;
       if (!reads && tcc_ir_op_is_mac(qk->op) &&
-          irop_get_vreg(tcc_ir_op_get_accum(ir, qk)) == dv)
+          tcc_ir_op_accum_vreg(ir, qk) == dv)
         reads = 1;
       if (!reads)
         continue;
@@ -948,13 +984,12 @@ static int ra_count_copies_reaching_codegen(TCCIRState *ir)
     if (q->op != TCCIR_OP_ASSIGN)
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
     IROperand src = tcc_ir_op_get_src1(ir, q);
-    int32_t dest_vreg = irop_get_vreg(dest);
+    int32_t dest_vreg = tcc_ir_op_dest_vreg(ir, q);
     int32_t src_vreg = irop_get_vreg(src);
-    if (dest.is_lval || src.is_lval || dest_vreg < 0 || src_vreg < 0)
+    if (tcc_ir_op_dest_is_lval(ir, q) || src.is_lval || dest_vreg < 0 || src_vreg < 0)
       continue;
-    if (irop_get_btype(dest) != irop_get_btype(src)) {
+    if (tcc_ir_op_dest_btype(ir, q) != irop_get_btype(src)) {
       copies++;
       continue;
     }
@@ -978,16 +1013,16 @@ static int ra_rp_vreg_mentioned(TCCIRState *ir, uint32_t vr)
     if (qk->op == TCCIR_OP_NOP)
       continue;
     if (irop_config[qk->op].has_dest &&
-        (uint32_t)irop_get_vreg(tcc_ir_op_get_dest(ir, qk)) == vr)
+        (uint32_t)tcc_ir_op_dest_vreg(ir, qk) == vr)
       return 1;
     if (irop_config[qk->op].has_src1 &&
-        (uint32_t)irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == vr)
+        (uint32_t)tcc_ir_op_src1_vreg(ir, qk) == vr)
       return 1;
     if (irop_config[qk->op].has_src2 &&
-        (uint32_t)irop_get_vreg(tcc_ir_op_get_src2(ir, qk)) == vr)
+        (uint32_t)tcc_ir_op_src2_vreg(ir, qk) == vr)
       return 1;
     if (tcc_ir_op_is_mac(qk->op) &&
-        (uint32_t)irop_get_vreg(tcc_ir_op_get_accum(ir, qk)) == vr)
+        (uint32_t)tcc_ir_op_accum_vreg(ir, qk) == vr)
       return 1;
   }
   return 0;
@@ -1099,7 +1134,7 @@ static int ra_retarget_producer(TCCIRState *ir)
   const int n = ir->next_instruction_index;
   int retargeted = 0;
 
-  if (tcc_state->optimize < 1)
+  if (TCC_OPT(tcc_state, optimize) < 1)
     return 0;
   if (!ls->live_regs_by_instruction || ls->live_regs_by_instruction_size <= 0)
     return 0;
@@ -1229,8 +1264,24 @@ static int ra_retarget_producer(TCCIRState *ir)
      * only up to where the allocator said it ends. */
     if (src_iv->start != (uint32_t)d)
       continue;
+    /* ...or, extended back over a loop it is read after, it already starts
+     * at or before the producer: its register is its own there too, any read
+     * of an older value at or above the producer happens before the write,
+     * and the destination is still written only at the copy (checked below).
+     * A rotated loop's induction step `t2 = t1 + 1; t3 = t2` is that shape
+     * whenever t3 is also read after the loop. */
     if (dst_iv->start != (uint32_t)i)
-      continue;
+    {
+      if (dst_iv->start > (uint32_t)d)
+        continue;
+      int other_def = 0;
+      for (int k = 0; k < n && !other_def; ++k)
+        other_def = k != i && ir->compact_instructions[k].op != TCCIR_OP_NOP &&
+                    irop_config[ir->compact_instructions[k].op].has_dest &&
+                    tcc_ir_op_dest_vreg(ir, &ir->compact_instructions[k]) == dv;
+      if (other_def)
+        continue;
+    }
     if (src_iv->end > dst_iv->end)
       continue;
 
@@ -1275,20 +1326,20 @@ static int ra_retarget_producer(TCCIRState *ir)
           qk->op == TCCIR_OP_NL_SETJMP)
       { ok = 0; break; }
       if ((qk->op == TCCIR_OP_JUMP || qk->op == TCCIR_OP_JUMPIF) &&
-          (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, qk)) == i)
+          (int)tcc_ir_op_dest_imm(ir, qk) == i)
       { ok = 0; break; }
       if (irop_config[qk->op].has_dest &&
-          irop_get_vreg(tcc_ir_op_get_dest(ir, qk)) == sv)
+          tcc_ir_op_dest_vreg(ir, qk) == sv)
       { ok = 0; break; }
       int reads = 0;
       if (irop_config[qk->op].has_src1 &&
-          irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == sv)
+          tcc_ir_op_src1_vreg(ir, qk) == sv)
         reads = 1;
       if (!reads && irop_config[qk->op].has_src2 &&
-          irop_get_vreg(tcc_ir_op_get_src2(ir, qk)) == sv)
+          tcc_ir_op_src2_vreg(ir, qk) == sv)
         reads = 1;
       if (!reads && tcc_ir_op_is_mac(qk->op) &&
-          irop_get_vreg(tcc_ir_op_get_accum(ir, qk)) == sv)
+          tcc_ir_op_accum_vreg(ir, qk) == sv)
         reads = 1;
       if (!reads)
         continue;
@@ -1309,7 +1360,7 @@ static int ra_retarget_producer(TCCIRState *ir)
       if (qk->op == TCCIR_OP_NOP)
         continue;
       if (irop_config[qk->op].has_dest &&
-          irop_get_vreg(tcc_ir_op_get_dest(ir, qk)) == dv)
+          tcc_ir_op_dest_vreg(ir, qk) == dv)
       { ok = 0; break; }
     }
     if (!ok)
@@ -1341,7 +1392,8 @@ static int ra_retarget_producer(TCCIRState *ir)
      * left claiming its own registers over [d,i]; nothing writes them any
      * more, but pretending they are still busy only costs later passes an
      * opportunity, where clearing them wrongly would cost correctness. */
-    dst_iv->start = (uint32_t)d;
+    if (dst_iv->start > (uint32_t)d)
+      dst_iv->start = (uint32_t)d;
     {
       IRLiveInterval *dst_li = tcc_ir_vreg_live_interval(ir, dv);
       if (dst_li && dst_li->start > (uint32_t)d)
@@ -1374,11 +1426,12 @@ static int ra_retarget_producer(TCCIRState *ir)
  * M33 the post-increment is also a cycle cheaper than the separate add (docs,
  * and tcc-m33-addressing-mode-cycle-costs).
  *
- * The store arm only sees IV-strength-reduced walks (`a[i] = v` loops turned
- * into a pointer walk).  A source-level `*p++ = v` does NOT lower to this
- * shape but to a copy of the pointer followed by the increment
- * (`T <- P; P <- T + k; T***DEREF*** <- V`); that needs its own matcher plus
- * a liveness proof that T is dead, and is still absent.
+ * A source-level `*p++ = v` lowers the increment BEFORE the access
+ * (`T <- P + k; P***DEREF*** <- V; P <- T`, or with a copy of P first);
+ * ra:bump_sink (regalloc_entry.c) moves the increment below the access before
+ * allocation, so it reaches here in one of the forms matched below.  The
+ * third form is an increment into a different vreg that the allocator gave
+ * P's register.
  *
  * This runs POST-allocation deliberately.  Pre-RA the fused op writes P without
  * the allocator being told (irop_config says the POSTINC ops read P as a USE
@@ -1396,7 +1449,7 @@ static int ra_load_postinc_fuse(TCCIRState *ir)
   const int n = ir->next_instruction_index;
   int fused = 0;
 
-  if (tcc_state->optimize < 1)
+  if (TCC_OPT(tcc_state, optimize) < 1)
     return 0;
   int load_disabled = tcc_ir_opt_pass_disabled("ra:load_postinc");
   int store_disabled = tcc_ir_opt_pass_disabled("ra:store_postinc");
@@ -1415,8 +1468,8 @@ static int ra_load_postinc_fuse(TCCIRState *ir)
 
     /* LOAD: `value <- ptr***DEREF***` — ptr is src1, an lvalue.
      * STORE: `ptr***DEREF*** <- value` — ptr is the dest, an lvalue. */
-    IROperand ptr = is_load ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
-    IROperand value = is_load ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+    IROperand ptr = tcc_ir_op_get_dest_or_src1(ir, q, is_load);
+    IROperand value = tcc_ir_op_get_dest_or_src1(ir, q, !is_load);
 
     /* A dereference THROUGH a register: `R4 <- R3***DEREF***`.  is_local /
      * is_llocal / is_sym are the frame-slot and global forms, which name memory
@@ -1487,11 +1540,9 @@ static int ra_load_postinc_fuse(TCCIRState *ir)
       if (jq->op == TCCIR_OP_ADD)
       {
         IROperand ad = tcc_ir_op_get_dest(ir, jq);
-        IROperand a1 = tcc_ir_op_get_src1(ir, jq);
-        IROperand a2 = tcc_ir_op_get_src2(ir, jq);
-        if (!ad.is_lval && irop_get_vreg(a1) == pv && irop_is_immediate(a2))
+        if (!ad.is_lval && tcc_ir_op_src1_vreg(ir, jq) == pv && tcc_ir_op_src2_is_imm(ir, jq))
         {
-          int64_t k = irop_get_imm64_ex(ir, a2);
+          int64_t k = tcc_ir_op_src2_imm(ir, jq);
           int32_t av = irop_get_vreg(ad);
           if (k >= 1 && k <= 255 && av == pv)
           {
@@ -1513,9 +1564,8 @@ static int ra_load_postinc_fuse(TCCIRState *ir)
                 continue;
               if (mq->op == TCCIR_OP_ASSIGN)
               {
-                IROperand cd = tcc_ir_op_get_dest(ir, mq);
                 IROperand cs = tcc_ir_op_get_src1(ir, mq);
-                if (!cd.is_lval && !cs.is_lval && irop_get_vreg(cd) == pv &&
+                if (!tcc_ir_op_dest_is_lval(ir, mq) && !cs.is_lval && tcc_ir_op_dest_vreg(ir, mq) == pv &&
                     irop_get_vreg(cs) == av)
                 {
                   IRLiveInterval *tli = tcc_ir_vreg_live_interval(ir, av);
@@ -1527,6 +1577,20 @@ static int ra_load_postinc_fuse(TCCIRState *ir)
                 }
               }
               break; /* first non-NOP decides either way */
+            }
+            /* The allocator already gave T P's register (the copy back, if
+             * any, sits beyond a loop's exit test): T <- P + #k then
+             * overwrites P in place, which is the in-place bump.  Two values
+             * that differ by k share a register only when P is dead from the
+             * ADD on, so nothing later reads the un-incremented P. */
+            if (add_idx < 0)
+            {
+              IRLiveInterval *tli = tcc_ir_vreg_live_interval(ir, av);
+              IRLiveInterval *pli = tcc_ir_vreg_live_interval(ir, pv);
+              if (tli && pli && tli->allocation.offset == 0 && !ra_alloc_half_unset(tli->allocation.r0) &&
+                  !ra_alloc_half_spilled(tli->allocation.r0) && tli->allocation.r0 == pli->allocation.r0 &&
+                  irop_get_btype(ad) == IROP_BTYPE_INT32)
+                add_idx = j;
             }
           }
         }
@@ -1562,7 +1626,7 @@ static int ra_load_postinc_fuse(TCCIRState *ir)
           if (irop_get_vreg(o) == pv)
             touches = 1;
         }
-        if (tcc_ir_op_is_mac(jq->op) && irop_get_vreg(tcc_ir_op_get_accum(ir, jq)) == pv)
+        if (tcc_ir_op_is_mac(jq->op) && tcc_ir_op_accum_vreg(ir, jq) == pv)
           touches = 1;
         /* A call reads its arguments where it is made, not where their
          * FUNCPARAMVALs sit, and those can lie ABOVE the access: in
@@ -1572,20 +1636,20 @@ static int ra_load_postinc_fuse(TCCIRState *ir)
          * earlier call with the same id ends them). */
         if (!touches && (jq->op == TCCIR_OP_FUNCCALLVOID || jq->op == TCCIR_OP_FUNCCALLVAL))
         {
-          int cid = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, jq)));
+          int cid = TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, jq));
           for (int m = j - 1; m >= 0 && !touches; --m)
           {
             IRQuadCompact *mq = &ir->compact_instructions[m];
             if (mq->op == TCCIR_OP_FUNCCALLVOID || mq->op == TCCIR_OP_FUNCCALLVAL)
             {
-              if (TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, mq))) == cid)
+              if (TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, mq)) == cid)
                 break;
               continue;
             }
             if (mq->op != TCCIR_OP_FUNCPARAMVAL ||
-                TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, mq))) != cid)
+                TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, mq)) != cid)
               continue;
-            if (irop_get_vreg(tcc_ir_op_get_src1(ir, mq)) == pv)
+            if (tcc_ir_op_src1_vreg(ir, mq) == pv)
               touches = 1;
           }
         }
@@ -1615,7 +1679,6 @@ static int ra_load_postinc_fuse(TCCIRState *ir)
      * the memory it names, and the writeback then lands in a scratch. */
     IROperand base = ptr;
     base.is_lval = 0;
-    base.aux = 0;
     /* LOAD_POSTINC decodes {dest=value, src1=base}; STORE_POSTINC decodes
      * {dest=base, src1=value} — the same slots as the plain ops they replace. */
     ir->iroperand_pool[nb + 0] = is_load ? value : base;
@@ -1687,7 +1750,7 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
       IROperand ts = tcc_ir_op_get_src1(ir, q);
       int valid_tag = (ts.tag == IROP_TAG_VREG ||
                        (ts.tag == IROP_TAG_STACKOFF && ts.is_local));
-      int dest_bt = irop_get_btype(tcc_ir_op_get_dest(ir, q));
+      int dest_bt = tcc_ir_op_dest_btype(ir, q);
       int src_bt = irop_get_btype(ts);
       int width_safe = (dest_bt == src_bt) &&
                        (dest_bt == IROP_BTYPE_INT32 ||
@@ -1787,10 +1850,10 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
             IRQuadCompact *kq = &ir->compact_instructions[k];
             int reads_dst = 0;
             if (irop_config[kq->op].has_src1 &&
-                irop_get_vreg(tcc_ir_op_get_src1(ir, kq)) == dv)
+                tcc_ir_op_src1_vreg(ir, kq) == dv)
               reads_dst = 1;
             if (!reads_dst && irop_config[kq->op].has_src2 &&
-                irop_get_vreg(tcc_ir_op_get_src2(ir, kq)) == dv)
+                tcc_ir_op_src2_vreg(ir, kq) == dv)
               reads_dst = 1;
             if (reads_dst) {
               for (int j2 = 0; j2 < ls->next_interval_index; j2++) {
@@ -1816,15 +1879,19 @@ int tcc_ir_move_coalescing(TCCIRState *ir)
       if (!conflict) {
         int old_reg = dst_iv->r0;
         dst_iv->r0 = src_reg;
+        ls->live_sweep_valid = 0;
+        uint8_t *held = tcc_ls_reg_held_by_other_range(ls, old_reg, (int)dst_iv->start,
+                                                    (int)dst_iv->end < tbl_size ? (int)dst_iv->end : tbl_size - 1, dst_iv);
         for (int k = (int)dst_iv->start; k <= (int)dst_iv->end && k < tbl_size; ++k)
         {
           /* old_reg's bit may be shared with another interval that coalesced
            * onto it earlier (in-place two-address ops overlap on purpose) —
            * only clear positions where no other claimant is still live. */
-          if (!tcc_ls_reg_held_by_other(ls, old_reg, k, dst_iv))
+          if (!held[k - (int)dst_iv->start])
             ls->live_regs_by_instruction[k] &= ~(1u << old_reg);
           ls->live_regs_by_instruction[k] |= (1u << src_reg);
         }
+        tcc_free(held);
         RA_DBG("move_coalesce fwd @%d: T%d R%d->R%d [%u,%u]", i,
                (int)(dv & 0xffffff), old_reg, src_reg, dst_iv->start, dst_iv->end);
         coalesced++;
@@ -1861,8 +1928,7 @@ try_reverse:;
       if (def_idx < 0 || def_idx >= n) { conflict = 1; goto rev_check_done; }
       IRQuadCompact *qdef = &ir->compact_instructions[def_idx];
       if (!irop_config[qdef->op].has_src1) { conflict = 1; goto rev_check_done; }
-      IROperand s1 = tcc_ir_op_get_src1(ir, qdef);
-      if (irop_get_vreg(s1) != dv) { conflict = 1; goto rev_check_done; }
+      if (tcc_ir_op_src1_vreg(ir, qdef) != dv) { conflict = 1; goto rev_check_done; }
     }
 
     /* Check src is not redefined while dest is still live */
@@ -1906,11 +1972,11 @@ try_reverse:;
       if (k == (int)src_iv->end) {
         int reads_src = 0;
         if (irop_config[qk->op].has_src1 &&
-            irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == sv) reads_src = 1;
+            tcc_ir_op_src1_vreg(ir, qk) == sv) reads_src = 1;
         if (!reads_src && irop_config[qk->op].has_src2 &&
-            irop_get_vreg(tcc_ir_op_get_src2(ir, qk)) == sv) reads_src = 1;
+            tcc_ir_op_src2_vreg(ir, qk) == sv) reads_src = 1;
         if (!reads_src && tcc_ir_op_is_mac(qk->op) &&
-            irop_get_vreg(tcc_ir_op_get_accum(ir, qk)) == sv) reads_src = 1;
+            tcc_ir_op_accum_vreg(ir, qk) == sv) reads_src = 1;
         if (reads_src) continue;
       }
       conflict = 1;
@@ -1926,17 +1992,16 @@ try_reverse:;
       IRQuadCompact *qk = &ir->compact_instructions[k];
       if (qk->op == TCCIR_OP_NOP) continue;
       if (irop_config[qk->op].has_src1) {
-        if (irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == dv) { conflict = 1; break; }
+        if (tcc_ir_op_src1_vreg(ir, qk) == dv) { conflict = 1; break; }
       }
       if (!conflict && irop_config[qk->op].has_src2) {
-        if (irop_get_vreg(tcc_ir_op_get_src2(ir, qk)) == dv) { conflict = 1; break; }
+        if (tcc_ir_op_src2_vreg(ir, qk) == dv) { conflict = 1; break; }
       }
       if (!conflict && irop_config[qk->op].has_dest) {
-        IROperand dk = tcc_ir_op_get_dest(ir, qk);
-        if (dk.is_lval && irop_get_vreg(dk) == dv) { conflict = 1; break; }
+        if (tcc_ir_op_dest_is_lval(ir, qk) && tcc_ir_op_dest_vreg(ir, qk) == dv) { conflict = 1; break; }
       }
       if (!conflict && tcc_ir_op_is_mac(qk->op)) {
-        if (irop_get_vreg(tcc_ir_op_get_accum(ir, qk)) == dv) { conflict = 1; break; }
+        if (tcc_ir_op_accum_vreg(ir, qk) == dv) { conflict = 1; break; }
       }
     }
     if (conflict) goto rev_check_done;
@@ -1955,7 +2020,7 @@ try_reverse:;
       if (qk->op == TCCIR_OP_IJUMP || qk->op == TCCIR_OP_SWITCH_TABLE ||
           qk->op == TCCIR_OP_SWITCH_LOAD) { conflict = 1; break; }
       if (qk->op == TCCIR_OP_JUMP || qk->op == TCCIR_OP_JUMPIF) {
-        int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, qk));
+        int jt = (int)tcc_ir_op_dest_imm(ir, qk);
         if (jt < (int)src_iv->start || jt > i) { conflict = 1; break; }
       }
     }
@@ -1981,16 +2046,20 @@ rev_check_done:
 
     int old_reg = src_iv->r0;
     src_iv->r0 = dest_reg;
+    ls->live_sweep_valid = 0;
+    uint8_t *held = tcc_ls_reg_held_by_other_range(ls, old_reg, (int)src_iv->start,
+                                                    (int)src_iv->end < tbl_size ? (int)src_iv->end : tbl_size - 1, src_iv);
     for (int k = (int)src_iv->start; k <= (int)src_iv->end && k < tbl_size; ++k)
     {
       /* old_reg's bit may be shared with another interval that coalesced
        * onto it earlier — only clear positions with no other live claimant
        * (volatile 36818: T175 leaving R5 wiped T212's in-place-XOR claim,
        * and the phase-3 scratch fixup then put the outer loop counter there). */
-      if (!tcc_ls_reg_held_by_other(ls, old_reg, k, src_iv))
+      if (!held[k - (int)src_iv->start])
         ls->live_regs_by_instruction[k] &= ~(1u << old_reg);
       ls->live_regs_by_instruction[k] |= (1u << dest_reg);
     }
+    tcc_free(held);
     RA_DBG("move_coalesce rev @%d: T%d R%d->R%d [%u,%u]", i,
            (int)(sv & 0xffffff), old_reg, dest_reg, src_iv->start, src_iv->end);
     /* Record this src vreg as reverse-coalesced */

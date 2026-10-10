@@ -484,11 +484,14 @@ UT_TEST(test_dispatch_add_cmp_zero_jumpif_eq_fuses_into_flags_mop)
 
   /* JUMPIF condition operand is the TOK_EQ token itself (an immediate),
    * mirroring tcc_ir_codegen_test_gen()'s real emission shape. Target is the
-   * RETURNVALUE right after -- only routing is under test here, not the
+   * second RETURNVALUE after it -- only routing is under test here, not the
    * branch's actual semantics. */
   SValue s_cond = sv_const(TOK_EQ);
-  SValue s_target = sv_const(ir->next_instruction_index + 1);
+  /* Over one RETURNVALUE: a jump to the very next instruction would be
+   * dropped with its compare (tcc_ir_drop_jumpif_to_next). */
+  SValue s_target = sv_const(ir->next_instruction_index + 2);
   tcc_ir_put(ir, TCCIR_OP_JUMPIF, &s_cond, NULL, &s_target);
+  tcc_ir_put(ir, TCCIR_OP_RETURNVALUE, &s_a, NULL, NULL);
   tcc_ir_put(ir, TCCIR_OP_RETURNVALUE, &s_c, NULL, NULL);
 
   tcc_ir_ssa_regalloc(ir, arm_get_regalloc_target(), 0);
@@ -532,8 +535,11 @@ UT_TEST(test_dispatch_sub_cmp_zero_jumpif_ne_fuses_into_flags_mop)
   tcc_ir_put(ir, TCCIR_OP_CMP, &s_c, &s_zero, NULL);
 
   SValue s_cond = sv_const(TOK_NE);
-  SValue s_target = sv_const(ir->next_instruction_index + 1);
+  /* Over one RETURNVALUE: a jump to the very next instruction would be
+   * dropped with its compare (tcc_ir_drop_jumpif_to_next). */
+  SValue s_target = sv_const(ir->next_instruction_index + 2);
   tcc_ir_put(ir, TCCIR_OP_JUMPIF, &s_cond, NULL, &s_target);
+  tcc_ir_put(ir, TCCIR_OP_RETURNVALUE, &s_a, NULL, NULL);
   tcc_ir_put(ir, TCCIR_OP_RETURNVALUE, &s_c, NULL, NULL);
 
   tcc_ir_ssa_regalloc(ir, arm_get_regalloc_target(), 0);

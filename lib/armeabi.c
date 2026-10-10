@@ -251,140 +251,206 @@ int __aeabi_idiv(int numerator, int denominator)
 
 /* 64-bit unsigned division/modulus.
  * AAPCS returns small structs in r0-r3; TCC also consumes quotient in r0:r1.
- */
-typedef struct
-{
-  u32 quotient_low;
-  u32 quotient_high;
-  u32 remainder_low;
-  u32 remainder_high;
-} uint64_div_result;
-
-static int armeabi_clz32(u32 x);
-
-/* 32 x 32 -> 64 multiply from 16-bit halves (32-bit operations only). */
-static void umul32(u32 a, u32 b, u32 *lo, u32 *hi)
-{
-  u32 al = a & 0xFFFFu, ah = a >> 16, bl = b & 0xFFFFu, bh = b >> 16;
-  u32 ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
-  u32 mid = (ll >> 16) + (lh & 0xFFFFu) + (hl & 0xFFFFu);
-  *lo = (ll & 0xFFFFu) | (mid << 16);
-  *hi = hh + (lh >> 16) + (hl >> 16) + (mid >> 16);
-}
-
-/* (u1:u0) / v for u1 < v: a 32-bit quotient, the remainder in *r.
- * Hacker's Delight divlu: normalise v, then two 16-bit quotient digits, each
- * estimated by dividing by v's top 16 bits (UDIV on ARMv8-M) and corrected
- * at most twice. */
-static u32 divlu(u32 u1, u32 u0, u32 v, u32 *r)
-{
-  int s = armeabi_clz32(v);
-  u32 vn1, vn0, un32, un21, un10, un1, un0, q1, q0, rhat;
-
-  v <<= s;
-  vn1 = v >> 16;
-  vn0 = v & 0xFFFFu;
-  un32 = s ? (u1 << s) | (u0 >> (32 - s)) : u1;
-  un10 = u0 << s;
-  un1 = un10 >> 16;
-  un0 = un10 & 0xFFFFu;
-
-  q1 = un32 / vn1;
-  rhat = un32 - q1 * vn1;
-  while (q1 > 0xFFFFu || q1 * vn0 > ((rhat << 16) | un1))
-  {
-    q1--;
-    rhat += vn1;
-    if (rhat > 0xFFFFu)
-      break;
-  }
-  un21 = (un32 << 16) + un1 - q1 * v;
-
-  q0 = un21 / vn1;
-  rhat = un21 - q0 * vn1;
-  while (q0 > 0xFFFFu || q0 * vn0 > ((rhat << 16) | un0))
-  {
-    q0--;
-    rhat += vn1;
-    if (rhat > 0xFFFFu)
-      break;
-  }
-  *r = ((un21 << 16) + un0 - q0 * v) >> s;
-  return (q1 << 16) | q0;
-}
-
-/* 64 / 64 division (Hacker's Delight divdu), dividing by zero gives 0 rem 0.
- * The bit-at-a-time loop this replaces took ~2,600 instructions a call. */
-static void udivmod_u64(uint64_div_result *out, u32 n_lo, u32 n_hi, u32 d_lo, u32 d_hi)
-{
-  u32 s, v1, q0, junk, p_lo, p_hi, r_lo, r_hi;
-
-  out->quotient_low = 0;
-  out->quotient_high = 0;
-  out->remainder_low = 0;
-  out->remainder_high = 0;
-
-  if ((d_lo | d_hi) == 0)
-    return;
-
-  if (d_hi == 0)
-  {
-    u32 k = n_hi;
-    if (n_hi >= d_lo)
-    {
-      out->quotient_high = n_hi / d_lo;
-      k = n_hi - out->quotient_high * d_lo;
-    }
-    out->quotient_low = divlu(k, n_lo, d_lo, &out->remainder_low);
-    return;
-  }
-
-  if (n_hi < d_hi || (n_hi == d_hi && n_lo < d_lo))
-  {
-    out->remainder_low = n_lo;
-    out->remainder_high = n_hi;
-    return;
-  }
-
-  /* d >= 2^32: the quotient fits 32 bits.  Estimate it from n / 2 over the
-   * top 32 bits of d normalised; the estimate is exact or one too big. */
-  s = armeabi_clz32(d_hi);
-  v1 = s ? (d_hi << s) | (d_lo >> (32 - s)) : d_hi;
-  q0 = divlu(n_hi >> 1, (n_lo >> 1) | (n_hi << 31), v1, &junk) >> (31 - s);
-  if (q0 != 0)
-    q0--;
-  umul32(q0, d_lo, &p_lo, &p_hi);
-  p_hi += q0 * d_hi;
-  r_lo = n_lo - p_lo;
-  r_hi = n_hi - p_hi - (n_lo < p_lo);
-  if (r_hi > d_hi || (r_hi == d_hi && r_lo >= d_lo))
-  {
-    q0++;
-    r_hi = r_hi - d_hi - (r_lo < d_lo);
-    r_lo -= d_lo;
-  }
-  out->quotient_low = q0;
-  out->remainder_low = r_lo;
-  out->remainder_high = r_hi;
-}
-
-/* Helpers for __aeabi_{u,}ldivmod wrappers.
  *
  * TinyCC (ARM/Thumb) currently miscompiles functions that *return* a 16-byte
  * struct, using an implicit sret pointer, which does not match the EABI for
  * __aeabi_{u,}ldivmod (which returns quotient in r0:r1 and remainder in r2:r3).
+ * We therefore implement the EABI entry points in assembly (armeabi_divmod.S)
+ * and call these C helpers to compute the results into memory.
  *
- * We therefore implement the EABI entry points in assembly and call these C
- * helpers to compute the results into memory.
+ * The whole divide — the clz normalization, the two-digit (Hacker's Delight
+ * divlu) step and the 64/64 estimate — is inline in the unsigned helper, so
+ * a 64-bit divide pays one stack frame and no out-of-line helper calls.
+ * The chain this replaces (helper -> udivmod_u64 -> divlu -> armeabi_clz32)
+ * cost core-sort's 4,560 timestamp divides 569k instructions in the tcc
+ * kernel against the llvm kernel's 260k through compiler_rt's single
+ * __udivmoddi4.  Divide by zero gives 0 remainder 0; the bit-at-a-time loop
+ * this family replaces took ~2,600 instructions a call.
  */
 void __tcc_aeabi_uldivmod_helper(u32 n_lo, u32 n_hi, u32 d_lo, u32 d_hi, u32 *q_lo, u32 *q_hi, u32 *r_lo, u32 *r_hi)
 {
-  uint64_div_result r;
-  udivmod_u64(&r, n_lo, n_hi, d_lo, d_hi);
-  *q_lo = r.quotient_low;
-  *q_hi = r.quotient_high;
-  *r_lo = r.remainder_low;
-  *r_hi = r.remainder_high;
+  u32 ql = 0, qh = 0, rl = 0, rh = 0;
+  u32 v, vn1, vn0, un32, un21, un10, un1, un0, q1, q0, rhat, k, u1, u0, p_lo, p_hi, rem_lo, rem_hi;
+  int s;
+
+  if ((d_lo | d_hi) != 0)
+  {
+    if (d_hi == 0)
+    {
+      /* d fits 32 bits: peel the high part, then the two-digit step on
+       * (k:n_lo): normalise v, estimate each 16-bit quotient digit by
+       * dividing by v's top 16 bits (UDIV on ARMv8-M), correct at most
+       * twice. */
+      k = n_hi;
+      if (n_hi >= d_lo)
+      {
+        qh = n_hi / d_lo;
+        k = n_hi - qh * d_lo;
+      }
+
+      v = d_lo;
+      s = 0;
+      if ((v & 0xFFFF0000u) == 0)
+      {
+        s += 16;
+        v <<= 16;
+      }
+      if ((v & 0xFF000000u) == 0)
+      {
+        s += 8;
+        v <<= 8;
+      }
+      if ((v & 0xF0000000u) == 0)
+      {
+        s += 4;
+        v <<= 4;
+      }
+      if ((v & 0xC0000000u) == 0)
+      {
+        s += 2;
+        v <<= 2;
+      }
+      if ((v & 0x80000000u) == 0)
+      {
+        s += 1;
+        v <<= 1;
+      }
+
+      vn1 = v >> 16;
+      vn0 = v & 0xFFFFu;
+      un32 = s ? (k << s) | (n_lo >> (32 - s)) : k;
+      un10 = n_lo << s;
+      un1 = un10 >> 16;
+      un0 = un10 & 0xFFFFu;
+
+      q1 = un32 / vn1;
+      rhat = un32 - q1 * vn1;
+      while (q1 > 0xFFFFu || q1 * vn0 > ((rhat << 16) | un1))
+      {
+        q1--;
+        rhat += vn1;
+        if (rhat > 0xFFFFu)
+          break;
+      }
+      un21 = (un32 << 16) + un1 - q1 * v;
+
+      q0 = un21 / vn1;
+      rhat = un21 - q0 * vn1;
+      while (q0 > 0xFFFFu || q0 * vn0 > ((rhat << 16) | un0))
+      {
+        q0--;
+        rhat += vn1;
+        if (rhat > 0xFFFFu)
+          break;
+      }
+
+      rl = ((un21 << 16) + un0 - q0 * v) >> s;
+      ql = (q1 << 16) | q0;
+    }
+    else if (n_hi < d_hi || (n_hi == d_hi && n_lo < d_lo))
+    {
+      rl = n_lo;
+      rh = n_hi;
+    }
+    else
+    {
+      /* d >= 2^32: the quotient fits 32 bits.  Estimate it from n / 2 over
+       * the top 32 bits of d normalised; the estimate is exact or one too
+       * big. */
+      v = d_hi;
+      s = 0;
+      if ((v & 0xFFFF0000u) == 0)
+      {
+        s += 16;
+        v <<= 16;
+      }
+      if ((v & 0xFF000000u) == 0)
+      {
+        s += 8;
+        v <<= 8;
+      }
+      if ((v & 0xF0000000u) == 0)
+      {
+        s += 4;
+        v <<= 4;
+      }
+      if ((v & 0xC0000000u) == 0)
+      {
+        s += 2;
+        v <<= 2;
+      }
+      if ((v & 0x80000000u) == 0)
+      {
+        s += 1;
+        v <<= 1;
+      }
+      if (s)
+        v |= d_lo >> (32 - s);
+
+      /* v's top bit is set, so the two-digit step needs no normalisation
+       * of its own. */
+      u1 = n_hi >> 1;
+      u0 = (n_lo >> 1) | (n_hi << 31);
+      vn1 = v >> 16;
+      vn0 = v & 0xFFFFu;
+      un32 = u1;
+      un10 = u0;
+      un1 = un10 >> 16;
+      un0 = un10 & 0xFFFFu;
+
+      q1 = un32 / vn1;
+      rhat = un32 - q1 * vn1;
+      while (q1 > 0xFFFFu || q1 * vn0 > ((rhat << 16) | un1))
+      {
+        q1--;
+        rhat += vn1;
+        if (rhat > 0xFFFFu)
+          break;
+      }
+      un21 = (un32 << 16) + un1 - q1 * v;
+
+      q0 = un21 / vn1;
+      rhat = un21 - q0 * vn1;
+      while (q0 > 0xFFFFu || q0 * vn0 > ((rhat << 16) | un0))
+      {
+        q0--;
+        rhat += vn1;
+        if (rhat > 0xFFFFu)
+          break;
+      }
+
+      q0 = ((q1 << 16) | q0) >> (31 - s);
+      if (q0 != 0)
+        q0--;
+
+      /* 32 x 32 -> 64 multiply from 16-bit halves (32-bit operations only). */
+      {
+        u32 al = q0 & 0xFFFFu, ah = q0 >> 16, bl = d_lo & 0xFFFFu, bh = d_lo >> 16;
+        u32 ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
+        u32 mid = (ll >> 16) + (lh & 0xFFFFu) + (hl & 0xFFFFu);
+        p_lo = (ll & 0xFFFFu) | (mid << 16);
+        p_hi = hh + (lh >> 16) + (hl >> 16) + (mid >> 16);
+      }
+      p_hi += q0 * d_hi;
+      rem_lo = n_lo - p_lo;
+      rem_hi = n_hi - p_hi - (n_lo < p_lo);
+      if (rem_hi > d_hi || (rem_hi == d_hi && rem_lo >= d_lo))
+      {
+        q0++;
+        rem_hi = rem_hi - d_hi - (rem_lo < d_lo);
+        rem_lo -= d_lo;
+      }
+
+      ql = q0;
+      rl = rem_lo;
+      rh = rem_hi;
+    }
+  }
+
+  *q_lo = ql;
+  *q_hi = qh;
+  *r_lo = rl;
+  *r_hi = rh;
 }
 
 /* Type definitions for 64-bit operations */
@@ -431,18 +497,12 @@ void __tcc_aeabi_ldivmod_helper(u32 n_lo, s32 n_hi, u32 d_lo, s32 d_hi, u32 *q_l
     u64_neg(&ud_lo, &ud_hi);
   }
 
-  uint64_div_result ur;
-  udivmod_u64(&ur, un_lo, un_hi, ud_lo, ud_hi);
+  __tcc_aeabi_uldivmod_helper(un_lo, un_hi, ud_lo, ud_hi, q_lo, q_hi, r_lo, r_hi);
 
   if (q_neg)
-    u64_neg(&ur.quotient_low, &ur.quotient_high);
+    u64_neg(q_lo, q_hi);
   if (r_neg)
-    u64_neg(&ur.remainder_low, &ur.remainder_high);
-
-  *q_lo = ur.quotient_low;
-  *q_hi = ur.quotient_high;
-  *r_lo = ur.remainder_low;
-  *r_hi = ur.remainder_high;
+    u64_neg(r_lo, r_hi);
 }
 
 /* 64-bit comparison functions */

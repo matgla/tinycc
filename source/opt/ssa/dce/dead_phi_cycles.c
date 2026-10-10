@@ -51,16 +51,16 @@ static int ssa_dce_vreg_unread(IRSSAOptCtx *ctx, const IRPhiNode *self,
     if (q->op == TCCIR_OP_NOP)
       continue;
     if (irop_config[q->op].has_src1 &&
-        irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == v)
+        tcc_ir_op_src1_vreg(ir, q) == v)
       return 0;
     if (irop_config[q->op].has_src2 &&
-        irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == v)
+        tcc_ir_op_src2_vreg(ir, q) == v)
       return 0;
     if (q->op == TCCIR_OP_MLA &&
-        irop_get_vreg(tcc_ir_op_get_accum(ir, q)) == v)
+        tcc_ir_op_accum_vreg(ir, q) == v)
       return 0;
     if (irop_config[q->op].has_dest &&
-        irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == v) {
+        tcc_ir_op_dest_vreg(ir, q) == v) {
       if (reject_redef || q->op == TCCIR_OP_STORE ||
           q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC)
         return 0;
@@ -139,23 +139,21 @@ int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
     if (q->op == TCCIR_OP_NOP)
       continue;
     if (q->op == TCCIR_OP_ASSIGN) {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t dv = irop_get_vreg(d);
+      int32_t dv = tcc_ir_op_dest_vreg(ir, q);
       if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP) {
-        IROperand s = tcc_ir_op_get_src1(ir, q);
-        MARK_TEMP_LIVE(irop_get_vreg(s));
+        MARK_TEMP_LIVE(tcc_ir_op_src1_vreg(ir, q));
       }
       continue;
     }
     if (irop_config[q->op].has_src1)
-      MARK_TEMP_LIVE(irop_get_vreg(tcc_ir_op_get_src1(ir, q)));
+      MARK_TEMP_LIVE(tcc_ir_op_src1_vreg(ir, q));
     if (irop_config[q->op].has_src2)
-      MARK_TEMP_LIVE(irop_get_vreg(tcc_ir_op_get_src2(ir, q)));
+      MARK_TEMP_LIVE(tcc_ir_op_src2_vreg(ir, q));
     if (q->op == TCCIR_OP_MLA)
-      MARK_TEMP_LIVE(irop_get_vreg(tcc_ir_op_get_accum(ir, q)));
+      MARK_TEMP_LIVE(tcc_ir_op_accum_vreg(ir, q));
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
         q->op == TCCIR_OP_STORE_POSTINC)
-      MARK_TEMP_LIVE(irop_get_vreg(tcc_ir_op_get_dest(ir, q)));
+      MARK_TEMP_LIVE(tcc_ir_op_dest_vreg(ir, q));
   }
 
   int changed = 1;
@@ -165,13 +163,13 @@ int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op != TCCIR_OP_ASSIGN)
         continue;
-      int32_t dv = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+      int32_t dv = tcc_ir_op_dest_vreg(ir, q);
       if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP)
         continue;
       int dp = TCCIR_DECODE_VREG_POSITION(dv);
       if (dp >= cap || !BM_TEST(dp))
         continue;
-      int32_t sv = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      int32_t sv = tcc_ir_op_src1_vreg(ir, q);
       if (sv < 0 || TCCIR_DECODE_VREG_TYPE(sv) != TCCIR_VREG_TYPE_TEMP)
         continue;
       int sp = TCCIR_DECODE_VREG_POSITION(sv);
@@ -207,7 +205,8 @@ int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
   do {
     round_removed = 0;
     for (int b = 0; b < cfg->num_blocks; b++) {
-      int in_backedge_region = ssa_dce_block_in_backedge_region(cfg, b);
+      /* Asked only of a dead phi: the scan walks every edge of the CFG. */
+      int in_backedge_region = -1;
       IRPhiNode **pp = &ssa->block_phis[b];
       while (*pp) {
         IRPhiNode *phi = *pp;
@@ -216,6 +215,8 @@ int dce_dead_phi_cycles(IRSSAOptCtx *ctx)
           int dp = TCCIR_DECODE_VREG_POSITION(dv);
           if (dp < cap && !BM_TEST(dp)) {
             /* Graph liveness can call a back-edge phi dead while a use remains, so demand direct-scan proof (seed 18960, pr49049). */
+            if (in_backedge_region < 0)
+              in_backedge_region = ssa_dce_block_in_backedge_region(cfg, b);
             if (in_backedge_region && (!ssa_dce_phi_dest_unread(ctx, phi) ||
                                        !ssa_dce_phi_operands_unread(ctx, phi))) {
               pp = &phi->next;

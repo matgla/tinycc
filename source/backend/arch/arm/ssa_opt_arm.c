@@ -147,6 +147,61 @@ int ssa_gen_arm_fuse_mul_add_to_mla(IRSSAOptCtx *ctx, int instr_idx)
 }
 
 /* ============================================================================
+ * Operand stability for the SHL+ADD -> LOAD/STORE_INDEXED fusions
+ *
+ * The fused access reads idx and base at the memory op instead of at the SHL /
+ * ADD.  That is only the same value when neither was redefined in between.  The
+ * SSA builder does not rename everything: a reassigned PARAM (`P1 <-- P2
+ * [STORE]`, the entry value being its first def) or a register-promoted local's
+ * in-place `T <-- x [STORE]` is a second def under the same name.
+ * ============================================================================ */
+
+/* Is `op` read-stable anywhere: no vreg, or exactly one definition in total. */
+static int arm_operand_single_def(IRSSAOptCtx *ctx, IROperand op)
+{
+  int32_t vr = irop_get_vreg(op);
+  if (vr < 0)
+    return 1;
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
+  if (!vi)
+    return 0;
+  int total = ssa_opt_def_total(vi);
+  if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_PARAM)
+    total++;                 /* the value it enters the function with */
+  return total <= 1;
+}
+
+/* Does the instruction at idx write the vreg `vr` (a deref dest writes through it, not to it)? */
+static int arm_instr_defines_vreg(TCCIRState *ir, int idx, int32_t vr)
+{
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  if (!irop_config[q->op].has_dest)
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  return !d.is_lval && irop_get_vreg(d) == vr;
+}
+
+/* May the memory op at mem_idx read `idx` and `base` instead of the SHL at shl_idx / the ADD
+ * (which read them there)?  Single-def operands always can.  A redefinable one needs the three
+ * instructions in one block and no def of it in between. */
+static int arm_indexed_operands_hold(IRSSAOptCtx *ctx, int shl_idx, int mem_idx, IROperand idx,
+                                     IROperand base)
+{
+  if (arm_operand_single_def(ctx, idx) && arm_operand_single_def(ctx, base))
+    return 1;
+  TCCIRState *ir = ctx->ir;
+  if (!ctx->cfg || shl_idx >= mem_idx || ctx->cfg->instr_to_block[shl_idx] != ctx->cfg->instr_to_block[mem_idx])
+    return 0;
+  int32_t ivr = irop_get_vreg(idx), bvr = irop_get_vreg(base);
+  for (int i = shl_idx + 1; i < mem_idx; i++)
+  {
+    if ((ivr >= 0 && arm_instr_defines_vreg(ir, i, ivr)) || (bvr >= 0 && arm_instr_defines_vreg(ir, i, bvr)))
+      return 0;
+  }
+  return 1;
+}
+
+/* ============================================================================
  * ssa_gen_arm_fuse_shl_add_to_load_indexed
  *
  * Pattern: t1 = SHL(idx, #scale); t2 = ADD(base, t1); t3 = LOAD(t2)
@@ -214,21 +269,37 @@ int ssa_gen_arm_fuse_shl_add_to_load_indexed(IRSSAOptCtx *ctx, int instr_idx)
   if (add_vi->uses[0].kind != SSA_USE_INSTR)
     return 0;
 
-  /* Find the LOAD that uses the ADD result */
+  /* Find the LOAD that uses the ADD result.  A LOAD_INDEXED whose offset is
+   * #0 (mem_inline's [addr, #0] piece of an align(1) memcpy) is the fused
+   * form with a zero displacement, so it fuses like a plain LOAD does; its
+   * src1 is already a plain address operand, not an lvalue. */
   int load_idx = add_vi->uses[0].idx;
   IRQuadCompact *load_q = &ir->compact_instructions[load_idx];
-  if (load_q->op != TCCIR_OP_LOAD)
+  const TccIrOp load_op = load_q->op;
+  if (load_op == TCCIR_OP_LOAD_INDEXED) {
+    IROperand load_off = tcc_ir_op_get_src2(ir, load_q);
+    if (load_off.tag != IROP_TAG_IMM32 || irop_get_imm64_ex(ir, load_off) != 0)
+      return 0;
+  } else if (load_op != TCCIR_OP_LOAD) {
     return 0;
+  }
 
   IROperand load_src = tcc_ir_op_get_src1(ir, load_q);
   if (irop_get_vreg(load_src) != add_vr)
     return 0;
-  if (!load_src.is_lval)
+  if (load_op == TCCIR_OP_LOAD && !load_src.is_lval)
     return 0;
 
-  /* Rewrite LOAD → LOAD_INDEXED(base, index, scale) */
   IROperand shl_src1 = tcc_ir_op_get_src1(ir, shl_q);
+  if (!arm_indexed_operands_hold(ctx, instr_idx, load_idx, shl_src1, base))
+    return 0;
+
+  /* Rewrite LOAD → LOAD_INDEXED(base, index, scale); the width moves from
+   * the deref onto the dest.  A LOAD_INDEXED #0 input already carries the
+   * access width on its dest and a plain address in src1, so nothing moves. */
   IROperand load_dest = tcc_ir_op_get_dest(ir, load_q);
+  if (load_op == TCCIR_OP_LOAD && !irop_indexed_load_dest(&load_dest, load_src))
+    return 0;
 
   load_q->op = TCCIR_OP_LOAD_INDEXED;
 
@@ -241,15 +312,16 @@ int ssa_gen_arm_fuse_shl_add_to_load_indexed(IRSSAOptCtx *ctx, int instr_idx)
   tcc_ir_pool_add(ir, IROP_NONE);
   tcc_ir_pool_add(ir, IROP_NONE);
   if (lb + 3 >= ir->iroperand_pool_capacity) {
-    load_q->op = TCCIR_OP_LOAD;
+    load_q->op = load_op;
     return 0;
   }
   load_q->operand_base = lb;
 
   /* base: clear lval since LOAD_INDEXED handles the deref, but carry the
-   * replaced deref's access marks (alignment, volatility) onto it. */
+   * replaced access's access marks (alignment, volatility) onto it: the plain
+   * LOAD carries them on its deref src, the LOAD_INDEXED #0 on its dest. */
   base.is_lval = 0;
-  irop_carry_access_marks(&base, load_src);
+  irop_carry_access_marks(&base, load_op == TCCIR_OP_LOAD ? load_src : load_dest);
 
   ir->iroperand_pool[lb + 0] = load_dest;
   ir->iroperand_pool[lb + 1] = base;
@@ -346,17 +418,29 @@ int ssa_gen_arm_fuse_shl_add_to_store_indexed(IRSSAOptCtx *ctx, int instr_idx)
   if (add_vi->uses[0].kind != SSA_USE_INSTR)
     return 0;
 
+  /* A STORE_INDEXED whose offset is #0 (mem_inline's [addr, #0] piece of an
+   * align(1) memcpy) is the fused form with a zero displacement, so it fuses
+   * like a plain STORE does; its dest already holds a plain address operand. */
   int store_idx = add_vi->uses[0].idx;
   IRQuadCompact *store_q = &ir->compact_instructions[store_idx];
-  if (store_q->op != TCCIR_OP_STORE)
+  const TccIrOp store_op = store_q->op;
+  if (store_op == TCCIR_OP_STORE_INDEXED) {
+    IROperand store_off = tcc_ir_op_get_src2(ir, store_q);
+    if (store_off.tag != IROP_TAG_IMM32 || irop_get_imm64_ex(ir, store_off) != 0)
+      return 0;
+  } else if (store_op != TCCIR_OP_STORE) {
     return 0;
+  }
 
   IROperand store_dest = tcc_ir_op_get_dest(ir, store_q);
   if (irop_get_vreg(store_dest) != add_vr)
     return 0;
 
-  /* Rewrite STORE → STORE_INDEXED(base, src, index, scale) */
   IROperand shl_src1 = tcc_ir_op_get_src1(ir, shl_q);
+  if (!arm_indexed_operands_hold(ctx, instr_idx, store_idx, shl_src1, base))
+    return 0;
+
+  /* Rewrite STORE → STORE_INDEXED(base, src, index, scale) */
   IROperand store_src = tcc_ir_op_get_src1(ir, store_q);
 
   store_q->op = TCCIR_OP_STORE_INDEXED;
@@ -370,7 +454,7 @@ int ssa_gen_arm_fuse_shl_add_to_store_indexed(IRSSAOptCtx *ctx, int instr_idx)
   tcc_ir_pool_add(ir, IROP_NONE);
   tcc_ir_pool_add(ir, IROP_NONE);
   if (sb + 3 >= ir->iroperand_pool_capacity) {
-    store_q->op = TCCIR_OP_STORE;
+    store_q->op = store_op;
     return 0;
   }
   store_q->operand_base = sb;
@@ -582,7 +666,10 @@ int ssa_gen_arm_fuse_load_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
   if (!arm_extract_add_imm_base(ir, ctx, lea_vr, &base, &imm, &lea_idx))
     return 0;
 
+  /* LOAD_INDEXED takes its width from the dest; a LOAD's is its deref's. */
   IROperand load_dest = tcc_ir_op_get_dest(ir, load_q);
+  if (!irop_indexed_load_dest(&load_dest, load_src))
+    return 0;
 
   /* Build the new operand pool entry for LOAD_INDEXED(base, imm, scale=0). */
   int lb = ir->iroperand_pool_count;
@@ -621,6 +708,171 @@ int ssa_gen_arm_fuse_load_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
     ssa_opt_add_use_instr(base_vi, instr_idx);
 
   return 1;
+}
+
+/* ============================================================================
+ * arm_addreg_indexed: t = ADD(a, b) feeding only memory accesses
+ *
+ * Pattern: t = ADD(a, b); x = LOAD(*t) / STORE(*t) <- v   (a, b registers)
+ * Result:  x = LOAD_INDEXED(a, b, #0) / STORE_INDEXED(a, v, b, #0)
+ *
+ * LDR/STR (and the byte/halfword forms) take `[Rn, Rm]`; the flat indexed
+ * fusion runs before param_home_fwd / SRA turn by-value slice params and
+ * Zig's `&slice.ptr[i]` into register bases, so the address stayed an ADD
+ * and a plain access: `adds r2, r0, r1; ldrb r3, [r2]` per byte of a
+ * string scan (mem.findSentinel), of Tokenizer.next, of eqlBytes.  Every use
+ * of t must be such an access (then the ADD dies); 64-bit and floating
+ * values are left alone -- LDRD/STRD/VLDR/VSTR have no register offset.
+ * zig.c -O2: -12.6M instructions, -1.7 KB (10-08 plan, W4).
+ * ============================================================================ */
+
+static int arm_addreg_value_ok(IROperand v)
+{
+  const int bt = irop_get_btype(v);
+  return bt != IROP_BTYPE_INT64 && bt != IROP_BTYPE_FLOAT32 && bt != IROP_BTYPE_FLOAT64;
+}
+
+/* t (lea_vr) = ADD(a, b) of two registers, single-def, every use an address
+ * of a LOAD / STORE, and a, b still hold their values at mem_idx. */
+static int arm_addreg_base(IRSSAOptCtx *ctx, int32_t lea_vr, int mem_idx, IROperand *out_a, IROperand *out_b)
+{
+  TCCIRState *ir = ctx->ir;
+  if (tcc_ir_opt_pass_disabled("arm_addreg_indexed"))
+    return 0;
+  if (lea_vr < 0 || TCCIR_DECODE_VREG_TYPE(lea_vr) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, lea_vr);
+  if (!vi || vi->def_count != 1 || vi->def_instr < 0)
+    return 0;
+  for (int u = 0; u < vi->use_count; u++)
+  {
+    IRSSAUse use = vi->uses[u];
+    if (use.kind != SSA_USE_INSTR)
+      return 0;
+    IRQuadCompact *uq = &ir->compact_instructions[use.idx];
+    if (uq->op == TCCIR_OP_LOAD)
+    {
+      IROperand s1 = tcc_ir_op_get_src1(ir, uq);
+      if (!s1.is_lval || irop_get_vreg(s1) != lea_vr)
+        return 0;
+    }
+    else if (uq->op == TCCIR_OP_STORE)
+    {
+      IROperand d = tcc_ir_op_get_dest(ir, uq);
+      if (irop_get_vreg(d) != lea_vr || irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == lea_vr)
+        return 0;
+    }
+    else
+      return 0;
+  }
+  IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
+  if (dq->op != TCCIR_OP_ADD)
+    return 0;
+  if (ir->barrel_shifts && dq->orig_index >= 0 && dq->orig_index < ir->barrel_shifts_len &&
+      ir->barrel_shifts[dq->orig_index] != 0)
+    return 0;
+  IROperand a = tcc_ir_op_get_src1(ir, dq);
+  IROperand b = tcc_ir_op_get_src2(ir, dq);
+  if (a.tag != IROP_TAG_VREG || b.tag != IROP_TAG_VREG || a.is_lval || b.is_lval || a.is_local || b.is_local ||
+      a.is_llocal || b.is_llocal || a.is_sym || b.is_sym)
+    return 0;
+  if (irop_is_64bit(a) || irop_is_64bit(b) || irop_is_64bit(tcc_ir_op_get_dest(ir, dq)))
+    return 0;
+  if (!arm_indexed_operands_hold(ctx, vi->def_instr, mem_idx, b, a))
+    return 0;
+  *out_a = a;
+  *out_b = b;
+  return 1;
+}
+
+/* Swap t's use at mem_idx for uses of a and b. */
+static void arm_addreg_retarget_uses(IRSSAOptCtx *ctx, int32_t lea_vr, int mem_idx, IROperand a, IROperand b)
+{
+  IRSSAVregInfo *lvi = ssa_opt_vinfo(ctx, lea_vr);
+  if (lvi)
+    ssa_opt_remove_use_instr(lvi, mem_idx);
+  IRSSAVregInfo *avi = ssa_opt_vinfo(ctx, irop_get_vreg(a));
+  if (avi)
+    ssa_opt_add_use_instr(avi, mem_idx);
+  IRSSAVregInfo *bvi = ssa_opt_vinfo(ctx, irop_get_vreg(b));
+  if (bvi)
+    ssa_opt_add_use_instr(bvi, mem_idx);
+}
+
+static int ssa_gen_arm_fuse_load_through_add_reg(IRSSAOptCtx *ctx, int instr_idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
+  if (q->op != TCCIR_OP_LOAD)
+    return 0;
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  IROperand src = tcc_ir_op_get_src1(ir, q);
+  if (!arm_addreg_value_ok(dest) || !src.is_lval || src.is_local || src.is_llocal || src.tag != IROP_TAG_VREG ||
+      tcc_ir_access_is_volatile(ir, src))
+    return 0;
+  int32_t lea_vr = irop_get_vreg(src);
+  IROperand a, b;
+  if (!arm_addreg_base(ctx, lea_vr, instr_idx, &a, &b))
+    return 0;
+  int nb = ir->iroperand_pool_count;
+  tcc_ir_pool_add(ir, IROP_NONE);
+  tcc_ir_pool_add(ir, IROP_NONE);
+  tcc_ir_pool_add(ir, IROP_NONE);
+  tcc_ir_pool_add(ir, IROP_NONE);
+  if (nb + 3 >= ir->iroperand_pool_capacity)
+    return 0;
+  a.is_lval = 0;
+  irop_carry_access_marks(&a, src);
+  q->op = TCCIR_OP_LOAD_INDEXED;
+  q->operand_base = nb;
+  ir->iroperand_pool[nb + 0] = dest;
+  ir->iroperand_pool[nb + 1] = a;
+  ir->iroperand_pool[nb + 2] = b;
+  ir->iroperand_pool[nb + 3] = irop_make_imm32(0, 0, IROP_BTYPE_INT32);
+  arm_addreg_retarget_uses(ctx, lea_vr, instr_idx, a, b);
+  return 1;
+}
+
+static int ssa_gen_arm_fuse_store_through_add_reg(IRSSAOptCtx *ctx, int instr_idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
+  if (q->op != TCCIR_OP_STORE)
+    return 0;
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  IROperand val = tcc_ir_op_get_src1(ir, q);
+  if (!arm_addreg_value_ok(dest) || !arm_addreg_value_ok(val) || dest.is_local || dest.is_llocal ||
+      dest.tag != IROP_TAG_VREG || tcc_ir_access_is_volatile(ir, dest))
+    return 0;
+  int32_t lea_vr = irop_get_vreg(dest);
+  IROperand a, b;
+  if (!arm_addreg_base(ctx, lea_vr, instr_idx, &a, &b))
+    return 0;
+  int nb = ir->iroperand_pool_count;
+  tcc_ir_pool_add(ir, IROP_NONE);
+  tcc_ir_pool_add(ir, IROP_NONE);
+  tcc_ir_pool_add(ir, IROP_NONE);
+  tcc_ir_pool_add(ir, IROP_NONE);
+  if (nb + 3 >= ir->iroperand_pool_capacity)
+    return 0;
+  a.is_lval = 0;
+  irop_carry_access_marks(&a, dest);
+  q->op = TCCIR_OP_STORE_INDEXED;
+  q->operand_base = nb;
+  ir->iroperand_pool[nb + 0] = a;
+  ir->iroperand_pool[nb + 1] = val;
+  ir->iroperand_pool[nb + 2] = b;
+  ir->iroperand_pool[nb + 3] = irop_make_imm32(0, 0, IROP_BTYPE_INT32);
+  arm_addreg_retarget_uses(ctx, lea_vr, instr_idx, a, b);
+  return 1;
+}
+
+static int ssa_gen_arm_fuse_load_combined(IRSSAOptCtx *ctx, int instr_idx)
+{
+  int r = ssa_gen_arm_fuse_load_through_add_imm(ctx, instr_idx);
+  if (r > 0)
+    return r;
+  return ssa_gen_arm_fuse_load_through_add_reg(ctx, instr_idx);
 }
 
 /* ============================================================================
@@ -767,6 +1019,50 @@ int ssa_gen_arm_fuse_mla_accum_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
   if (abs_imm > 4095)
     return 0;
 
+  /* Same hoist hazard as the STORE-source sibling: this fuses the MLA's
+   * accumulator deref by turning the address-computing ADD itself into a
+   * LOAD_INDEXED, i.e. the load is RELOCATED upward from this MLA to the
+   * ADD's definition site.  That hoist is only sound when nothing between the
+   * two positions can write the loaded memory or divert control flow.  LICM /
+   * GVN can place the defining ADD before an intervening aliasing store, call,
+   * or branch (e.g. an invariant `t = base + #imm` hoisted above a store that
+   * may alias `*t`); hoisting the load to the ADD would then read the pre-store
+   * value.  Bail on any intervening memory clobber or control-flow op; a join
+   * target between the two (a loop back-edge landing on a fallthrough block
+   * boundary emits no JUMP of its own) also means a path from the ADD to the
+   * use wraps around later stores, so it bails too — the hoist stays inside
+   * one straight-line basic block for real. */
+  {
+    int didx = vi->def_instr;
+    if (didx >= instr_idx)
+      return 0;
+    for (int j = didx + 1; j < instr_idx; j++) {
+      if (ir->compact_instructions[j].is_jump_target)
+        return 0;
+      switch (ir->compact_instructions[j].op) {
+      case TCCIR_OP_STORE:
+      case TCCIR_OP_STORE_INDEXED:
+      case TCCIR_OP_STORE_POSTINC:
+      case TCCIR_OP_FUNCCALLVAL:
+      case TCCIR_OP_FUNCCALLVOID:
+      case TCCIR_OP_BLOCK_COPY:
+      case TCCIR_OP_INLINE_ASM:
+      case TCCIR_OP_VLA_ALLOC:
+      case TCCIR_OP_SETJMP:
+      case TCCIR_OP_LONGJMP:
+      case TCCIR_OP_NL_SETJMP:
+      case TCCIR_OP_NL_LONGJMP:
+      case TCCIR_OP_JUMP:
+      case TCCIR_OP_JUMPIF:
+      case TCCIR_OP_IJUMP:
+      case TCCIR_OP_SWITCH_TABLE:
+        return 0;
+      default:
+        break;
+      }
+    }
+  }
+
   IROperand lea_dest = tcc_ir_op_get_dest(ir, dq);
   IROperand base_clean = base_op;
   base_clean.is_lval = 0;
@@ -888,6 +1184,15 @@ int ssa_gen_arm_fuse_store_src_through_add_imm(IRSSAOptCtx *ctx, int instr_idx)
     if (didx >= instr_idx)
       return 0;
     for (int j = didx + 1; j < instr_idx; j++) {
+      /* A join target inside the range is an edge entering between the ADD
+       * and the use — most importantly a loop back-edge landing on a
+       * fallthrough block boundary, which emits no JUMP of its own.  A path
+       * from the ADD to the use then wraps around stores executed after the
+       * ADD (LICM hoists the invariant `t = base + #imm` above a store to
+       * `*t` inside the loop; fuzz seed 2395), and the linear scan below
+       * cannot see them. */
+      if (ir->compact_instructions[j].is_jump_target)
+        return 0;
       switch (ir->compact_instructions[j].op) {
       case TCCIR_OP_STORE:
       case TCCIR_OP_STORE_INDEXED:
@@ -973,15 +1278,74 @@ static int ssa_gen_arm_fuse_store_add_imm_combined(IRSSAOptCtx *ctx, int instr_i
   int r = ssa_gen_arm_fuse_store_through_add_imm(ctx, instr_idx);
   if (r > 0)
     return r;
-  return ssa_gen_arm_fuse_store_src_through_add_imm(ctx, instr_idx);
+  r = ssa_gen_arm_fuse_store_src_through_add_imm(ctx, instr_idx);
+  if (r > 0)
+    return r;
+  return ssa_gen_arm_fuse_store_through_add_reg(ctx, instr_idx);
+}
+
+/* ============================================================================
+ * ssa_gen_arm_mla_zero_product
+ *
+ * Pattern: t = MLA(a, #0, c) or MLA(#0, b, c)  ->  t = ASSIGN c
+ *
+ * The fusion above runs while a multiplicand is still a register holding 0;
+ * var_imm_prop turns it into #0 afterwards, and nothing folded the product.
+ * zig.h's 128-bit multiply leaves exactly these: the cross terms of a u64
+ * widened to u128, whose high half is constant 0 (Wyhash's mum).
+ * ============================================================================ */
+
+static int ssa_gen_arm_mla_zero_product(IRSSAOptCtx *ctx, int instr_idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[instr_idx];
+  if (q->op != TCCIR_OP_MLA)
+    return 0;
+  const int base = q->operand_base;
+  IROperand dest = ir->iroperand_pool[base + 0];
+  IROperand m1 = ir->iroperand_pool[base + 1];
+  IROperand m2 = ir->iroperand_pool[base + 2];
+  IROperand accum = ir->iroperand_pool[base + 3];
+  if (irop_get_btype(dest) == IROP_BTYPE_INT64 || irop_get_btype(accum) == IROP_BTYPE_INT64 ||
+      irop_get_btype(accum) == IROP_BTYPE_FLOAT64)
+    return 0;
+  if (!((irop_is_immediate(m1) && !m1.is_lval && irop_get_imm64_ex(ir, m1) == 0) ||
+        (irop_is_immediate(m2) && !m2.is_lval && irop_get_imm64_ex(ir, m2) == 0)))
+    return 0;
+  /* An operand that reads memory must still be read (volatile): leave it. */
+  if (m1.is_lval || m2.is_lval)
+    return 0;
+  if (ir->barrel_shifts && q->orig_index >= 0 && q->orig_index < ir->barrel_shifts_len &&
+      ir->barrel_shifts[q->orig_index] != 0)
+    return 0;
+  for (int k = 1; k <= 2; k++) {
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(k == 1 ? m1 : m2));
+    if (vi)
+      ssa_opt_remove_use_instr(vi, instr_idx);
+  }
+  /* ASSIGN dest <- accum: the 3-operand layout ([dest, src1, src2]) at a
+   * fresh pool slot, as the fusion allocates one for its 4. */
+  int nb = ir->iroperand_pool_count;
+  tcc_ir_pool_add(ir, IROP_NONE);
+  tcc_ir_pool_add(ir, IROP_NONE);
+  tcc_ir_pool_add(ir, IROP_NONE);
+  if (nb + 2 >= ir->iroperand_pool_capacity)
+    return 0;
+  ir->iroperand_pool[nb + 0] = dest;
+  ir->iroperand_pool[nb + 1] = accum;
+  ir->iroperand_pool[nb + 2] = IROP_NONE;
+  q->op = TCCIR_OP_ASSIGN;
+  q->operand_base = nb;
+  return 1;
 }
 
 static const IRSSAOptGen ssa_gen_arm[] = {
   { TCCIR_OP_MUL,   ssa_gen_arm_fuse_mul_add_to_mla,             "arm_mla_fusion" },
   { TCCIR_OP_MUL,   ssa_gen_arm_reduce_mul_to_shift,             "arm_mul_to_shl" },
   { TCCIR_OP_SHL,   ssa_gen_arm_fuse_shl_indexed,                "arm_shl_indexed" },
-  { TCCIR_OP_LOAD,  ssa_gen_arm_fuse_load_through_add_imm,       "arm_load_add_imm" },
+  { TCCIR_OP_LOAD,  ssa_gen_arm_fuse_load_combined,              "arm_load_add_imm" },
   { TCCIR_OP_STORE, ssa_gen_arm_fuse_store_add_imm_combined,     "arm_store_add_imm" },
+  { TCCIR_OP_MLA,   ssa_gen_arm_mla_zero_product,                "arm_mla_zero_product" },
   { TCCIR_OP_MLA,   ssa_gen_arm_fuse_mla_accum_through_add_imm,  "arm_mla_accum_add_imm" },
 };
 

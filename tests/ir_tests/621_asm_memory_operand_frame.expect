@@ -1,0 +1,3 @@
+store=42 load=15 rw=15
+clobbers=99 vla=37 far=103 param=60
+wparam=5 rwparam=42

@@ -33,36 +33,33 @@ static int mul_pick_imm(IROperand src1, IROperand src2,
 OPT_GEN_SSA(sr_mul, TCCIR_OP_MUL) {
   int shift = 0;
   IROperand val_op = IROP_NONE, imm_op = IROP_NONE;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
+  BIND(src2);
   GUARD(
     when(mul_pick_imm(src1, src2, &val_op, &imm_op));
     and(is_power_of_2_shift((uint32_t)imm_op.u.imm32, &shift)));
-  REWRITE(
-    .new_op = TCCIR_OP_SHL,
-    .src1   = val_op,
-    .src2   = mk_imm(shift));
+  REWRITE(set_op(TCCIR_OP_SHL), set_src1_ref(val_op), set_src2_imm(shift, IROP_BTYPE_INT32));
 }
 
 OPT_GEN_SSA(sr_udiv, TCCIR_OP_UDIV) {
   int shift = 0;
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(src2);
   GUARD(
     when(is_imm32(src2));
     and(is_power_of_2_shift((uint32_t)src2.u.imm32, &shift)));
-  REWRITE(
-    .new_op = TCCIR_OP_SHR,
-    .src2   = mk_imm(shift));
+  REWRITE(set_op(TCCIR_OP_SHR), set_src2_imm(shift, IROP_BTYPE_INT32));
 }
 
 OPT_GEN_SSA(sr_umod, TCCIR_OP_UMOD) {
   int shift = 0;
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(src2);
   GUARD(
     when(is_imm32(src2));
     and(is_power_of_2_shift((uint32_t)src2.u.imm32, &shift)));
-  REWRITE(
-    .new_op = TCCIR_OP_AND,
-    .src2   = mk_imm((uint32_t)src2.u.imm32 - 1u));
+  REWRITE(set_op(TCCIR_OP_AND), set_src2_imm((uint32_t)src2.u.imm32 - 1u, IROP_BTYPE_INT32));
 }
 
 static const IRSSAOptGen strength_gens[] = {

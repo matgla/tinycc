@@ -19,10 +19,13 @@
 #undef USING_GLOBALS
 #include "../opt/util/purity.c"
 #undef USING_GLOBALS
+#include "../opt/util/range.c"
+#undef USING_GLOBALS
 #include "../opt/util/volatile_access.c"
 #undef USING_GLOBALS
 #include "../opt/util/vreg_def_use.c"
 #undef USING_GLOBALS
+#undef VIDX_MANY
 #include "../opt/util/vreg_query.c"
 #undef USING_GLOBALS
 #include "../opt/util/xform.c"

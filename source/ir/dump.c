@@ -658,7 +658,7 @@ void tcc_ir_dump_compact(TCCIRState *ir, IRQuadCompact *q, int pc, FILE *out)
     fprintf(out, " [BLOCK_COPY]");
   else if (op == TCCIR_OP_SELECT)
     fprintf(out, " [SELECT cond=0x%lx]",
-            (unsigned long)irop_get_imm64_ex(ir, tcc_ir_op_get_cond(ir, q)));
+            (unsigned long)tcc_ir_op_cond_imm(ir, q));
   else if (op == TCCIR_OP_STORE)
     fprintf(out, " [STORE]");
   else if (op == TCCIR_OP_LOAD)

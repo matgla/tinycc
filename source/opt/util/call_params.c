@@ -37,8 +37,7 @@ int ir_opt_get_call_param_operand(TCCIRState *ir, int call_idx, int param_idx, I
     if (q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID)
       continue;
 
-    IROperand enc = tcc_ir_op_get_src2(ir, q);
-    uint32_t encoded = (uint32_t)irop_get_imm64_ex(ir, enc);
+    uint32_t encoded = (uint32_t)tcc_ir_op_src2_imm(ir, q);
     if (TCCIR_DECODE_CALL_ID(encoded) != call_id)
       continue;
     if (TCCIR_DECODE_PARAM_IDX(encoded) != param_idx)
@@ -75,8 +74,7 @@ int ir_opt_get_call_param_index(TCCIRState *ir, int call_idx, int param_idx)
     if (q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID)
       continue;
 
-    IROperand enc = tcc_ir_op_get_src2(ir, q);
-    uint32_t encoded = (uint32_t)irop_get_imm64_ex(ir, enc);
+    uint32_t encoded = (uint32_t)tcc_ir_op_src2_imm(ir, q);
     if (TCCIR_DECODE_CALL_ID(encoded) != call_id)
       continue;
     if (TCCIR_DECODE_PARAM_IDX(encoded) != param_idx)
@@ -100,7 +98,7 @@ void ir_opt_nop_call_params(TCCIRState *ir, int call_idx)
   if (call_q->op != TCCIR_OP_FUNCCALLVAL && call_q->op != TCCIR_OP_FUNCCALLVOID)
     return;
 
-  call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, call_q)));
+  call_id = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, call_q));
   for (int i = call_idx - 1; i >= 0; --i)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -131,7 +129,7 @@ void ir_opt_nop_call_param(TCCIRState *ir, int call_idx, int param_idx)
   if (call_q->op != TCCIR_OP_FUNCCALLVAL && call_q->op != TCCIR_OP_FUNCCALLVOID)
     return;
 
-  call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, call_q)));
+  call_id = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, call_q));
   for (int i = call_idx - 1; i >= 0; --i)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -163,9 +161,9 @@ void ir_opt_change_call_argc(TCCIRState *ir, int call_idx, int argc)
   if (call_q->op != TCCIR_OP_FUNCCALLVAL && call_q->op != TCCIR_OP_FUNCCALLVOID)
     return;
 
-  encoded = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, call_q));
+  encoded = (uint32_t)tcc_ir_op_src2_imm(ir, call_q);
   call_id = TCCIR_DECODE_CALL_ID(encoded);
-  tcc_ir_set_src2(ir, call_idx, irop_make_imm32(-1, (int32_t)TCCIR_ENCODE_CALL(call_id, argc), IROP_BTYPE_INT32));
+  tcc_ir_set_src2_imm32(ir, call_idx, (int32_t)TCCIR_ENCODE_CALL(call_id, argc), IROP_BTYPE_INT32);
 }
 
 int change_callee_sym(TCCIRState *ir, int instr_idx, const char *new_name, int ret_btype)

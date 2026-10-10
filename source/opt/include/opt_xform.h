@@ -22,8 +22,6 @@ int ir_xform_same_block(TCCIRState *ir, int from_idx, int to_idx);
 
 /* Folds `T = V OP src; V = T` into `V = V OP src; NOP`; returns number of folds. */
 int tcc_ir_opt_store_inplace_arith(TCCIRState *ir);
-struct IROptCtx;
-int tcc_ir_opt_store_inplace_arith_ex(struct IROptCtx *ctx);
 
 /* is_lval/is_llocal operands are fused memory reads, evaluated when the instruction runs. */
 static inline int ir_xform_operand_reads_memory(IROperand op)

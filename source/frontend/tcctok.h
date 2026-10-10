@@ -37,6 +37,7 @@ DEF(TOK_INLINE3, "__inline__") /* gcc keyword */
 DEF(TOK_RESTRICT1, "restrict")
 DEF(TOK_RESTRICT2, "__restrict")
 DEF(TOK_RESTRICT3, "__restrict__")
+DEF(TOK_RODATA_REL, "__rodata_relative") /* pointer qualifier, rodata_rel.c */
 DEF(TOK_EXTENSION, "__extension__")    /* gcc keyword */
 DEF(TOK_THREAD_LOCAL, "_Thread_local") /* C11 thread-local storage */
 
@@ -92,6 +93,8 @@ DEF(TOK_IFNDEF, "ifndef")
 DEF(TOK_ELIF, "elif")
 DEF(TOK_ENDIF, "endif")
 DEF(TOK_DEFINED, "defined")
+/* C23 spells _Static_assert as static_assert; an identifier before C23 */
+DEF(TOK_static_assert, "static_assert")
 DEF(TOK_UNDEF, "undef")
 DEF(TOK_ERROR, "error")
 DEF(TOK_WARNING, "warning")
@@ -415,6 +418,11 @@ DEF_ATOMIC(atomic_or_fetch)
 DEF_ATOMIC(atomic_xor_fetch)
 DEF_ATOMIC(atomic_and_fetch)
 DEF_ATOMIC(atomic_nand_fetch)
+/* The value forms: the operand by value, not through a pointer.  Same
+ * operation and runtime helper as the generic form above (parse_atomic). */
+DEF_ATOMIC(atomic_store_n)
+DEF_ATOMIC(atomic_exchange_n)
+DEF_ATOMIC(atomic_compare_exchange_n)
 
 /* pragma */
 DEF(TOK_pack, "pack")
@@ -452,6 +460,9 @@ DEF(TOK___fixunsxfdi, "__fixunsxfdi")
 DEF(TOK___fixunssfdi, "__fixunssfdi")
 DEF(TOK___fixunsdfdi, "__fixunsdfdi")
 #endif
+/* the linker-defined start of .rodata a __rodata_relative pointer is an
+   offset from (rodata_rel.c) */
+DEF(TOK___tcc_rodata_base, "__tcc_rodata_base")
 DEF(TOK___bswapdi3, "__bswapdi3")
 DEF(TOK___bswapsi2, "__bswapsi2")
 
@@ -635,6 +646,14 @@ DEF_ASMDIR(symver)
 DEF_ASMDIR(syntax)
 DEF_ASMDIR(arch)
 DEF_ASMDIR(fpu)
+DEF_ASMDIR(cpu)
+DEF_ASMDIR(incbin)
+DEF_ASMDIR(hword)
+DEF_ASMDIR(if)
+DEF_ASMDIR(ifdef)
+DEF_ASMDIR(ifndef)
+DEF_ASMDIR(else)
+DEF_ASMDIR(endif)
 DEF_ASMDIR(thumb)
 DEF_ASMDIR(thumb_func)
 DEF_ASMDIR(section) /* must be last directive */

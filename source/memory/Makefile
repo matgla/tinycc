@@ -4,6 +4,7 @@
 MEMORY_INC = -I$(TOP)/source/memory/include
 
 MEMORY_SRC = \
+	source/memory/sort.c \
 	source/memory/unique_ptr.c \
 	source/memory/vector.c
 

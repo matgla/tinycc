@@ -209,15 +209,16 @@ static int symaddr_entry_end(TCCIRState *ir, int num_hoist)
 
 OPT_GEN_FLAT(symaddr_add, TCCIR_OP_ADD)
 {
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY,
-                           .src2 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
+  BIND(src2);
   SymaddrState *st = ctx->pass_state;
   SymaddrEntry *entry = symaddr_find_exact(st, ir, src1);
   if (entry)
-    REWRITE(.src1 = irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32));
+    REWRITE(set_src1(irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32)));
   entry = symaddr_find_exact(st, ir, src2);
   GUARD(when(entry != NULL));
-  REWRITE(.src2 = irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32));
+  REWRITE(set_src2(irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32)));
 }
 
 /* Common: find a selected base entry for `sr` with an encodable delta. */
@@ -239,8 +240,9 @@ static SymaddrEntry *symaddr_find_base(SymaddrState *st, IRPoolSymref *sr, int64
 
 OPT_GEN_FLAT(symaddr_store, TCCIR_OP_STORE)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY,
-                           .src1 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
   SymaddrState *st = ctx->pass_state;
   if (i < st->num_hoist ||
       (!st->late && i >= st->entry_end) ||
@@ -269,14 +271,15 @@ OPT_GEN_FLAT(symaddr_store, TCCIR_OP_STORE)
     tcc_ir_pool_add(ir, mk_imm(0));
     q->operand_base = operand_base;
   }
-  REWRITE(.new_op = TCCIR_OP_STORE_INDEXED);
+  REWRITE(set_op(TCCIR_OP_STORE_INDEXED));
 }
 
 /* Direct global load: `V <- Sym*** [LOAD]` -> LOAD_INDEXED [T, #delta]. */
 OPT_GEN_FLAT(symaddr_load, TCCIR_OP_LOAD)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY,
-                           .src1 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
   SymaddrState *st = ctx->pass_state;
   if (!st->late)
     return 0;
@@ -306,7 +309,7 @@ OPT_GEN_FLAT(symaddr_load, TCCIR_OP_LOAD)
     tcc_ir_pool_add(ir, mk_imm(delta));
     tcc_ir_pool_add(ir, mk_imm(0));
     q->operand_base = operand_base;
-    REWRITE(.new_op = TCCIR_OP_LOAD_INDEXED);
+    REWRITE(set_op(TCCIR_OP_LOAD_INDEXED));
   }
 }
 
@@ -316,8 +319,10 @@ OPT_GEN_FLAT(symaddr_load, TCCIR_OP_LOAD)
  * expansions) ride along on the new base operand. */
 OPT_GEN_FLAT(symaddr_ldx_base, TCCIR_OP_LOAD_INDEXED)
 {
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY,
-                           .src2 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   SymaddrState *st = ctx->pass_state;
   if (!st->late)
     return 0;
@@ -350,7 +355,7 @@ OPT_GEN_FLAT(symaddr_ldx_base, TCCIR_OP_LOAD_INDEXED)
       tcc_ir_pool_add(ir, mk_imm(idx));
       tcc_ir_pool_add(ir, mk_imm(0));
       q->operand_base = operand_base;
-      REWRITE(.new_op = TCCIR_OP_LOAD_INDEXED);
+      REWRITE(set_op(TCCIR_OP_LOAD_INDEXED));
     }
   }
   else
@@ -359,16 +364,17 @@ OPT_GEN_FLAT(symaddr_ldx_base, TCCIR_OP_LOAD_INDEXED)
     {
       IROperand new_base = irop_make_vreg(base->hoist_vreg, IROP_BTYPE_INT32);
       new_base.aux |= src1.aux;
-      REWRITE(.src1 = new_base);
+      REWRITE(set_src1(new_base));
     }
   }
 }
 
 OPT_GEN_FLAT(symaddr_stx_base, TCCIR_OP_STORE_INDEXED)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY,
-                           .src1 = IR_CONSTRAINT_ANY,
-                           .src2 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   SymaddrState *st = ctx->pass_state;
   if (!st->late)
     return 0;
@@ -401,7 +407,7 @@ OPT_GEN_FLAT(symaddr_stx_base, TCCIR_OP_STORE_INDEXED)
       tcc_ir_pool_add(ir, mk_imm(idx));
       tcc_ir_pool_add(ir, mk_imm(0));
       q->operand_base = operand_base;
-      REWRITE(.new_op = TCCIR_OP_STORE_INDEXED);
+      REWRITE(set_op(TCCIR_OP_STORE_INDEXED));
     }
   }
   else
@@ -410,7 +416,7 @@ OPT_GEN_FLAT(symaddr_stx_base, TCCIR_OP_STORE_INDEXED)
     {
       IROperand new_base = irop_make_vreg(base->hoist_vreg, IROP_BTYPE_INT32);
       new_base.aux |= dest.aux;
-      REWRITE(.dest = new_base);
+      REWRITE(set_dest(new_base));
     }
   }
 }
@@ -418,36 +424,39 @@ OPT_GEN_FLAT(symaddr_stx_base, TCCIR_OP_STORE_INDEXED)
 /* Address-value uses beyond ADD: plain copies, compares, call arguments. */
 OPT_GEN_FLAT(symaddr_assign_src, TCCIR_OP_ASSIGN)
 {
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
   SymaddrState *st = ctx->pass_state;
   SymaddrEntry *entry = st->late ? symaddr_find_exact(st, ir, src1) : NULL;
   GUARD(when(i >= st->num_hoist && entry != NULL));
-  REWRITE(.src1 = irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32));
+  REWRITE(set_src1(irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32)));
 }
 
 OPT_GEN_FLAT(symaddr_param_src, TCCIR_OP_FUNCPARAMVAL)
 {
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
   SymaddrState *st = ctx->pass_state;
   SymaddrEntry *entry = st->late ? symaddr_find_exact(st, ir, src1) : NULL;
   GUARD(when(entry != NULL));
-  REWRITE(.src1 = irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32));
+  REWRITE(set_src1(irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32)));
 }
 
 OPT_GEN_FLAT(symaddr_cmp_src, TCCIR_OP_CMP)
 {
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY,
-                           .src2 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
+  BIND(src2);
   SymaddrState *st = ctx->pass_state;
   SymaddrEntry *entry;
   if (!st->late)
     return 0;
   entry = symaddr_find_exact(st, ir, src1);
   if (entry)
-    REWRITE(.src1 = irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32));
+    REWRITE(set_src1(irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32)));
   entry = symaddr_find_exact(st, ir, src2);
   GUARD(when(entry != NULL));
-  REWRITE(.src2 = irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32));
+  REWRITE(set_src2(irop_make_vreg(entry->hoist_vreg, IROP_BTYPE_INT32)));
 }
 
 const IROptGen symaddr_cse_gens[] = {

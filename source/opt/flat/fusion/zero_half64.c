@@ -76,16 +76,23 @@ typedef struct
  * handed out, or a store through a pointer changes it behind this scan's back.
  * (The single-definition requirement is common to both and is settled by the
  * def census in tcc_ir_opt_zero_half64.)  Same rule tcc_ir_opt_cmp_narrow_64
- * applies to a local. */
-static int zh_var_addr_taken(TCCIRState *ir, int32_t vr)
+ * applies to a local.  Clears ok_v for every VAR position that is LEA'd, in one
+ * walk: asking per local walked the body once per def (101_cleanup's 65536
+ * address-taken locals: 7.5 s). */
+static void zh_drop_addr_taken_vars(TCCIRState *ir, ZHState *st)
 {
   for (int k = 0; k < ir->next_instruction_index; k++)
   {
     IRQuadCompact *qk = &ir->compact_instructions[k];
-    if (qk->op == TCCIR_OP_LEA && irop_get_vreg(tcc_ir_op_get_src1(ir, qk)) == vr)
-      return 1;
+    if (qk->op != TCCIR_OP_LEA)
+      continue;
+    int32_t vr = tcc_ir_op_src1_vreg(ir, qk);
+    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
+      continue;
+    int p = TCCIR_DECODE_VREG_POSITION(vr);
+    if (p >= 0 && p <= st->max_v)
+      st->ok_v[p] = 0;
   }
-  return 0;
 }
 
 /* The known-zero halves recorded for `vr`, or 0 when it has no entry. */
@@ -217,7 +224,7 @@ static int zh_use_ignores_half(TCCIRState *ir, IRQuadCompact *u, int32_t vreg, i
    * destination sends the same opcode to thumb_emit_data_processing_mop32,
    * which reads the low words outright, so the width that decides is the
    * DEST's -- not the operand's. */
-  if (!irop_needs_pair(tcc_ir_op_get_dest(ir, u)))
+  if (!tcc_ir_op_dest_needs_pair(ir, u))
     return 0;
 
   switch (u->op)
@@ -242,7 +249,7 @@ static int zh_use_ignores_half(TCCIRState *ir, IRQuadCompact *u, int32_t vreg, i
      * value named on BOTH sides is still read through src1. */
     if (half != ZK_HI || m1)
       return 0;
-    return !irop_is_immediate(s2) && irop_needs_pair(tcc_ir_op_get_dest(ir, u));
+    return !irop_is_immediate(s2) && tcc_ir_op_dest_needs_pair(ir, u);
 
   case TCCIR_OP_SHL:
     /* A left shift by >= 32 builds its high word out of the source's LOW word
@@ -266,6 +273,62 @@ static int zh_use_ignores_half(TCCIRState *ir, IRQuadCompact *u, int32_t vreg, i
   }
 }
 
+/* Key of a TEMP or VAR in zh_build_uses' lists, or -1. */
+static int zh_use_key(const ZHState *st, int32_t vr)
+{
+  if (vr < 0)
+    return -1;
+  int t = TCCIR_DECODE_VREG_TYPE(vr), p = TCCIR_DECODE_VREG_POSITION(vr);
+  if (t == TCCIR_VREG_TYPE_TEMP && p >= 0 && p <= st->max_t)
+    return p;
+  if (t == TCCIR_VREG_TYPE_VAR && p >= 0 && p <= st->max_v)
+    return st->max_t + 1 + p;
+  return -1;
+}
+
+/* For each TEMP and VAR, the non-NOP instructions naming it in src1, src2 or
+ * a multiply-accumulate's accumulator, in program order: uses[start[k] ..
+ * start[k + 1]).  Pass 3 asks this of every candidate def; scanning the whole
+ * function each time was quadratic in a long 64-bit basic block. */
+static void zh_build_uses(TCCIRState *ir, const ZHState *st, int **start_out, int **uses_out)
+{
+  int n = ir->next_instruction_index, nk = st->max_t + 1 + st->max_v + 1;
+  int *start = tcc_mallocz(((size_t)nk + 1) * sizeof(int));
+  for (int pass = 0; pass < 2; pass++)
+  {
+    int *uses = pass ? tcc_malloc(((size_t)start[nk] + 1) * sizeof(int)) : NULL;
+    int *fill = pass ? tcc_malloc(((size_t)nk + 1) * sizeof(int)) : NULL;
+    if (pass)
+      memcpy(fill, start, ((size_t)nk + 1) * sizeof(int));
+    for (int j = 0; j < n; j++)
+    {
+      IRQuadCompact *u = &ir->compact_instructions[j];
+      if (u->op == TCCIR_OP_NOP)
+        continue;
+      int k[3] = {zh_use_key(st, tcc_ir_op_src1_vreg(ir, u)), zh_use_key(st, tcc_ir_op_src2_vreg(ir, u)),
+                  tcc_ir_op_is_mac(u->op) ? zh_use_key(st, tcc_ir_op_accum_vreg(ir, u)) : -1};
+      for (int a = 0; a < 3; a++)
+      {
+        if (k[a] < 0 || (a >= 1 && k[a] == k[0]) || (a == 2 && k[2] == k[1]))
+          continue;
+        if (pass)
+          uses[fill[k[a]]++] = j;
+        else
+          start[k[a] + 1]++;
+      }
+    }
+    if (!pass)
+      for (int x = 0; x < nk; x++)
+        start[x + 1] += start[x];
+    else
+    {
+      tcc_free(fill);
+      *uses_out = uses;
+    }
+  }
+  *start_out = start;
+}
+
 int tcc_ir_opt_zero_half64(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -280,8 +343,7 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    int32_t vr = irop_get_vreg(d);
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr < 0)
       continue;
     int t = TCCIR_DECODE_VREG_TYPE(vr), p = TCCIR_DECODE_VREG_POSITION(vr);
@@ -329,7 +391,7 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op == TCCIR_OP_NOP)
         continue;
-      int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
       if (vr < 0)
         continue;
       int t = TCCIR_DECODE_VREG_TYPE(vr), p = TCCIR_DECODE_VREG_POSITION(vr);
@@ -361,21 +423,8 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
       else if (t == TCCIR_VREG_TYPE_VAR && p >= 0 && p <= max_v)
         st.ok_v[p] = 0;
     }
-    /* zh_var_addr_taken walks the whole body, so ask it once per local. */
-    for (int i = 0; i < n && max_v >= 0; i++)
-    {
-      IRQuadCompact *q = &ir->compact_instructions[i];
-      if (q->op == TCCIR_OP_NOP)
-        continue;
-      int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
-      if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
-        continue;
-      int p = TCCIR_DECODE_VREG_POSITION(vr);
-      if (p < 0 || p > max_v || !st.ok_v[p])
-        continue;
-      if (zh_var_addr_taken(ir, vr))
-        st.ok_v[p] = 0;
-    }
+    if (max_v >= 0)
+      zh_drop_addr_taken_vars(ir, &st);
     tcc_free(cnt_t);
     tcc_free(cnt_v);
   }
@@ -388,8 +437,7 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    int32_t dv = irop_get_vreg(d);
+    int32_t dv = tcc_ir_op_dest_vreg(ir, q);
     if (dv < 0)
       continue;
     int dt = TCCIR_DECODE_VREG_TYPE(dv);
@@ -409,7 +457,7 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
     else
       continue;
     def[p] = i;
-    if (!irop_needs_pair(d) || d.is_lval)
+    if (!tcc_ir_op_dest_needs_pair(ir, q) || tcc_ir_op_dest_is_lval(ir, q))
       continue;
     zk[p] = (uint8_t)zh_result(ir, &st, q);
   }
@@ -423,6 +471,7 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
     memset(ir->zero_half64, 0, (size_t)ir->zero_half64_len);
 
   int changes = 0;
+  int *use_start = NULL, *uses = NULL; /* zh_build_uses, when pass 3 first asks */
 
   /* Pass 2: per-instruction operand bits. */
   for (int i = 0; i < n; i++)
@@ -483,27 +532,29 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
     if (!zk)
       continue;
 
+    if (!use_start)
+      zh_build_uses(ir, &st, &use_start, &uses);
+    int key = zh_use_key(&st, dv);
     int dead = 0;
     for (int half = ZK_LO; half <= ZK_HI; half <<= 1)
     {
       if (!(zk & half))
         continue;
       int all_ignore = 1;
-      for (int j = 0; j < n && all_ignore; j++)
+      for (int x = use_start[key]; x < use_start[key + 1] && all_ignore; x++)
       {
+        int j = uses[x];
         if (j == i)
           continue;
         IRQuadCompact *u = &ir->compact_instructions[j];
-        if (u->op == TCCIR_OP_NOP)
-          continue;
         /* An accumulator (MLA's UMLAL form, UMAAL) is read whole: both words. */
-        if (tcc_ir_op_is_mac(u->op) && irop_get_vreg(tcc_ir_op_get_accum(ir, u)) == dv)
+        if (tcc_ir_op_is_mac(u->op) && tcc_ir_op_accum_vreg(ir, u) == dv)
         {
           all_ignore = 0;
           break;
         }
-        if (irop_get_vreg(tcc_ir_op_get_src1(ir, u)) != dv &&
-            irop_get_vreg(tcc_ir_op_get_src2(ir, u)) != dv)
+        if (tcc_ir_op_src1_vreg(ir, u) != dv &&
+            tcc_ir_op_src2_vreg(ir, u) != dv)
           continue;
         all_ignore = zh_use_ignores_half(ir, u, dv, half);
       }
@@ -519,6 +570,8 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
     }
   }
 
+  tcc_free(use_start);
+  tcc_free(uses);
   tcc_free(st.zk_t);
   tcc_free(st.def_t);
   tcc_free(st.zk_v);
@@ -527,5 +580,3 @@ int tcc_ir_opt_zero_half64(TCCIRState *ir)
   tcc_free(st.ok_v);
   return changes;
 }
-
-int tcc_ir_opt_zero_half64_ex(IROptCtx *ctx) { return tcc_ir_opt_zero_half64(ctx->ir); }

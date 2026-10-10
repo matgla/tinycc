@@ -280,15 +280,13 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     /* Get initial offset */
     orig = (*(uint16_t *)ptr);
     x = (val - addr - 4);
-    if (x < 0)
+    /* CBZ/CBNZ only reach 0..126 bytes forward; never turn it into a NOP. */
+    if (x < 0 || x > 126 || (x & 1))
     {
-      (*(uint16_t *)ptr) = 0xbf00;
+      tcc_error_noabort("R_ARM_THM_JUMP6 (cbz/cbnz) target out of range or misaligned: offset %d (0..126, even)", x);
       return;
     }
-    else
-    {
-      x = (x >> 1);
-    }
+    x = (x >> 1);
     /* Compute and store final offset */
     i = (x >> 5) & 1;
     imm5 = x & 0x1f;
@@ -297,7 +295,7 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   }
   case R_ARM_THM_ALU_PREL_11_0:
   {
-    int x, hi, lo, s, i, imm3, imm8;
+    int x, addend, hi, lo, s, i, imm3, imm8;
     /* weak reference */
     if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
       return;
@@ -308,33 +306,32 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     i = (hi >> 10) & 1;
     imm3 = (lo >> 12) & 0x7;
     imm8 = lo & 0xff;
-    x = i << 11 | imm3 << 8 | imm8;
+    addend = i << 11 | imm3 << 8 | imm8;
+    if (hi & 0x0080)
+      addend = -addend;
 
-    if (hi & 0x00a0)
-    {
-      x = -x;
-    }
-
+    /* R_ARM_THM_ALU_PREL_11_0 is a REL relocation.  The immediate in the
+       instruction is therefore S + A - (Align(P, 4) + 4), with A already
+       encoded by the assembler. */
     addr &= -4;
-    if (val < addr)
-    {
-      x = val - addr - 4;
-    }
-    else
-    {
-      s = 0;
-      x = val - (addr + 4);
-    }
+    x = (int)val + addend - (int)addr - 4;
 
+    s = 0;
     if (x < 0)
     {
       s = 0xa;
       x = -x;
     }
 
+    if (x > 0xfff)
+    {
+      tcc_error_noabort("ADR relocation out of range: %x,%d", addr, type);
+      return;
+    }
+
     /* Compute and store final offset */
     i = (x >> 11) & 1;
-    imm3 = (x >> 12) & 0x3;
+    imm3 = (x >> 8) & 0x7;
     imm8 = x & 0xff;
     (*(uint16_t *)ptr) = (uint16_t)((hi & 0xfb0f) | (i << 10)) | (s << 4);
     (*(uint16_t *)(ptr + 2)) = (uint16_t)((lo & 0x8f00) | (imm3 << 12) | imm8);
@@ -342,51 +339,74 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     return;
   case R_ARM_THM_PC12:
   {
-    int x, orig;
+    int x, addend, hi, orig;
     /* weak reference */
     if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
       return;
 
     /* Get initial offset */
+    hi = (*(uint16_t *)ptr);
     orig = (*(uint16_t *)(ptr + 2));
+    addend = orig & 0xfff;
+    if (!(hi & 0x0080))
+      addend = -addend;
+
     addr &= -4;
-    if (val > addr)
+    x = (int)val + addend - (int)addr - 4;
+    if (x < -0xfff || x > 0xfff)
     {
-      x = val - addr - 4;
+      tcc_error_noabort("literal relocation out of range: %x,%d", addr, type);
+      return;
+    }
+
+    /* Compute and store final offset */
+    if (x < 0)
+    {
+      hi &= 0xff7f;
+      x = -x;
     }
     else
     {
-      uint32_t original_instruction = (*(uint16_t *)ptr);
-      (*(uint16_t *)ptr) = original_instruction & 0xff7f;
-      x = addr + 4 - val;
+      hi |= 0x0080;
     }
-    /* Compute and store final offset */
-    (*(uint16_t *)(ptr + 2)) = orig | (x & 0xfff);
+    (*(uint16_t *)ptr) = hi;
+    (*(uint16_t *)(ptr + 2)) = (uint16_t)((orig & 0xf000) | x);
   }
     return;
   case R_ARM_THM_PC8:
   {
-    int x, orig;
+    int x, addend, hi, orig;
     /* weak reference */
     if (sym->st_shndx == SHN_UNDEF && ELFW(ST_BIND)(sym->st_info) == STB_WEAK)
       return;
 
     /* Get initial offset */
+    hi = (*(uint16_t *)ptr);
     orig = (*(uint16_t *)(ptr + 2));
+    addend = (orig & 0xff) << 2;
+    if (!(hi & 0x0080))
+      addend = -addend;
+
     addr &= -4;
-    if (val > addr)
+    x = (int)val + addend - (int)addr - 4;
+    if (x < -0x3fc || x > 0x3fc || (x & 3))
     {
-      x = val - addr - 4;
+      tcc_error_noabort("literal pair relocation out of range: %x,%d", addr, type);
+      return;
+    }
+
+    /* Compute and store final offset */
+    if (x < 0)
+    {
+      hi &= 0xff7f;
+      x = -x;
     }
     else
     {
-      uint32_t original_instruction = (*(uint16_t *)ptr);
-      (*(uint16_t *)ptr) = original_instruction & 0xff7f;
-      x = addr + 4 - val;
+      hi |= 0x0080;
     }
-    x >>= 2;
-    /* Compute and store final offset */
-    (*(uint16_t *)(ptr + 2)) = orig | (x & 0xff);
+    (*(uint16_t *)ptr) = hi;
+    (*(uint16_t *)(ptr + 2)) = (uint16_t)((orig & 0xff00) | (x >> 2));
   }
     return;
 
@@ -476,9 +496,12 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
        * if target is to be entered in arm mode:
          - bit 1 must not set
          - instruction must be a call (bl) or a jump to PLT */
+    /* Out of BL/B.W range (+-16 MB) is an error for a call too: encoding it
+       anyway wrapped the offset and branched somewhere else entirely.  Far
+       targets the linker script separates get veneers before layout. */
     if (x >= 0x1000000 || x < -0x1000000)
-      if ((val & 2) || (!is_call && !to_plt))
-        tcc_error_noabort("can't relocate value at %x,%d", addr, type);
+      if ((val & 2) || !to_plt)
+        tcc_error_noabort("can't relocate value at %x,%d (branch out of range)", addr, type);
     /* Compute and store final offset */
     s = (x >> 24) & 1;
     i1 = (x >> 23) & 1;
@@ -511,19 +534,18 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   case R_ARM_MOVT_ABS:
   case R_ARM_MOVW_ABS_NC:
   {
-    int x, imm4, imm12;
+    /* REL relocations keep the addend in the instruction's immediate fields.
+       Decode it, add it to the symbol value, and rewrite only those fields.
+       The Thumb variants are handled by the separate R_ARM_THM_MOVT_ABS /
+       R_ARM_THM_MOVW_ABS_NC case below. */
+    uint32_t insn = read32le(ptr);
+    uint32_t addend = (((insn >> 4) & 0xf000u) | (insn & 0xfffu));
+    if (addend & 0x8000u)
+      addend -= 0x10000u;
+    val += addend;
     if (type == R_ARM_MOVT_ABS)
       val >>= 16;
-    imm12 = val & 0xfff;
-    imm4 = (val >> 12) & 0xf;
-    x = (imm4 << 16) | imm12;
-    /* The Thumb variants are handled by the separate R_ARM_THM_MOVT_ABS /
-       R_ARM_THM_MOVW_ABS_NC case below, so `type` here is always one of the
-       two ARM (A32) relocations -- never R_ARM_THM_MOVT_ABS.  A stray
-       `if (type == R_ARM_THM_MOVT_ABS)` check used to guard this add and was
-       therefore dead code (see docs/bugs.md #10).  add32le matches upstream
-       tinycc's handling of these relocations. */
-    add32le(ptr, x);
+    write32le(ptr, (insn & 0xfff0f000u) | ((val & 0xf000u) << 4) | (val & 0xfffu));
   }
     return;
   case R_ARM_MOVT_PREL:
@@ -542,18 +564,19 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   case R_ARM_THM_MOVT_ABS:
   case R_ARM_THM_MOVW_ABS_NC:
   {
-    int x, i, imm4, imm3, imm8;
+    /* REL relocations keep the addend in the instruction's immediate fields.
+       Decode it, add it to the symbol value, and rewrite only those fields. */
+    uint32_t insn = read32le(ptr);
+    uint32_t addend = ((insn & 0xfu) << 12) | (((insn >> 10) & 1u) << 11) |
+                      (((insn >> 28) & 7u) << 8) | ((insn >> 16) & 0xffu);
+    if (addend & 0x8000u)
+      addend -= 0x10000u;
+    val += addend;
     if (type == R_ARM_THM_MOVT_ABS)
       val >>= 16;
-    imm8 = val & 0xff;
-    imm3 = (val >> 8) & 0x7;
-    i = (val >> 11) & 1;
-    imm4 = (val >> 12) & 0xf;
-    x = (imm3 << 28) | (imm8 << 16) | (i << 10) | imm4;
-    if (type == R_ARM_THM_MOVT_ABS)
-      write32le(ptr, read32le(ptr) | x);
-    else
-      add32le(ptr, x);
+    uint32_t x = (((val >> 12) & 0xfu)) | (((val >> 11) & 1u) << 10) |
+                 (((val >> 8) & 7u) << 28) | ((val & 0xffu) << 16);
+    write32le(ptr, (insn & ~0x70ff040fu) | x);
   }
     return;
   case R_ARM_PREL31:
@@ -604,7 +627,21 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     return;
   case R_ARM_RODATA_OFF:
     /* Offset of the symbol within .rodata: anchor (rodata runtime base, from
-     * the reserved GOT slot) + this value = the symbol's address. */
+     * the reserved GOT slot) + this value = the symbol's address.  Also a
+     * __rodata_relative pointer's word, whose target the compiler could not
+     * see (rodata_rel.c): anything outside .rodata has no such offset.  The
+     * addend is in the word, so `val` is where the symbol starts: at the end
+     * of .rodata is the next section (only __tcc_rodata_base of an empty
+     * .rodata starts there). */
+    if (val != rodata_section->sh_addr &&
+        (val < rodata_section->sh_addr || val >= rodata_section->sh_addr + rodata_section->sh_size))
+    {
+      const char *name = (const char *)symtab_section->link->data + sym->st_name;
+      tcc_error_noabort("'%s' is not in .rodata: a __rodata_relative pointer (or a "
+                        "share-rodata reference) cannot reach it",
+                        name);
+      return;
+    }
     add32le(ptr, val - rodata_section->sh_addr);
     return;
   case R_ARM_GOT32:
@@ -657,5 +694,80 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
   default:
     LOG_RELOC("FIXME: handle reloc type %d at %x [%p] to %x", type, (unsigned)addr, ptr, (unsigned)val);
     return;
+  }
+}
+
+/* Range-extension veneers for Thumb BL / B.W (R_ARM_THM_PC22 / JUMP24).
+ *
+ * A branch reaches +-16 MB.  When the linker script puts the caller's section
+ * and the callee's in memory regions further apart than that (the RP2350's
+ * .time_critical code runs from SRAM at 0x2000_0000 and calls into flash at
+ * 0x1000_0000), the branch is pointed at a veneer appended to the caller's
+ * section instead -- `ldr.w pc, [pc, #0]` and the callee's address -- which
+ * sits within reach and loads the full 32-bit target.  One veneer per
+ * (section, callee).  Runs before layout so the veneers are sized in. */
+ST_FUNC void arm_add_range_veneers(TCCState *s1)
+{
+  ElfW(Sym) *symtab;
+  int i, nb_syms, n_veneers = 0;
+  for (i = 1; i < s1->nb_sections; i++)
+  {
+    Section *sr = s1->sections[i], *s;
+    ElfW_Rel *rel;
+    addr_t src_origin, dst_origin;
+    int src_mr;
+    int *veneer_of; /* symbol index -> veneer symbol, for this section */
+    if (!sr || sr->sh_type != SHT_RELX || !sr->data_offset)
+      continue;
+    s = s1->sections[sr->sh_info];
+    if (!s || !(s->sh_flags & SHF_EXECINSTR) || !(s->sh_flags & SHF_ALLOC))
+      continue;
+    src_mr = ld_section_memory_region(s1, s->name, &src_origin);
+    if (src_mr < 0)
+      continue;
+    nb_syms = symtab_section->data_offset / sizeof(ElfW(Sym));
+    veneer_of = tcc_mallocz(nb_syms * sizeof(int));
+    /* By index: adding a veneer's literal relocation appends to this very
+     * section and may move its data. */
+    int k, nb_rels = sr->data_offset / sizeof(ElfW_Rel);
+    for (k = 0; k < nb_rels; k++)
+    {
+      rel = (ElfW_Rel *)sr->data + k;
+      int type = ELFW(R_TYPE)(rel->r_info), sym_index = ELFW(R_SYM)(rel->r_info), dst_mr;
+      ElfW(Sym) *sym;
+      long diff;
+      if (type != R_ARM_THM_PC22 && type != R_ARM_THM_JUMP24)
+        continue;
+      symtab = (ElfW(Sym) *)symtab_section->data;
+      if (sym_index <= 0 || sym_index >= nb_syms)
+        continue;
+      sym = &symtab[sym_index];
+      if (sym->st_shndx == SHN_UNDEF || sym->st_shndx >= SHN_LORESERVE || sym->st_shndx >= s1->nb_sections)
+        continue;
+      dst_mr = ld_section_memory_region(s1, s1->sections[sym->st_shndx]->name, &dst_origin);
+      if (dst_mr < 0 || dst_mr == src_mr)
+        continue;
+      diff = (long)dst_origin - (long)src_origin;
+      if (diff < 0x800000 && diff > -0x800000) /* regions close enough for a direct branch */
+        continue;
+      if (!veneer_of[sym_index])
+      {
+        char name[48];
+        unsigned char *p;
+        addr_t off;
+        section_ptr_add(s, (-s->data_offset) & 3); /* the literal load needs a word-aligned PC */
+        off = s->data_offset;
+        p = section_ptr_add(s, 8);
+        p[0] = 0xdf; p[1] = 0xf8; p[2] = 0x00; p[3] = 0xf0; /* ldr.w pc, [pc, #0] */
+        p[4] = p[5] = p[6] = p[7] = 0;
+        put_elf_reloc(symtab_section, s, off + 4, R_ARM_ABS32, sym_index);
+        snprintf(name, sizeof(name), "__tcc_veneer_%d", n_veneers++);
+        veneer_of[sym_index] = set_elf_sym(symtab_section, off | 1, 8, ELFW(ST_INFO)(STB_GLOBAL, STT_FUNC),
+                                           STV_HIDDEN, s->sh_num, name);
+        rel = (ElfW_Rel *)sr->data + k;
+      }
+      rel->r_info = ELFW(R_INFO)(veneer_of[sym_index], type);
+    }
+    tcc_free(veneer_of);
   }
 }

@@ -98,6 +98,7 @@ FLAT_OPT_SRC = \
 	source/opt/flat/loop/loop_relayout.c \
 	source/opt/flat/loop/seq_guard_elim.c \
 	source/opt/flat/loop/decrement_to_zero.c \
+	source/opt/flat/loop/decrement_carry.c \
 	source/opt/flat/loop/const_sim.c \
 	source/opt/flat/loop/reroll.c \
 	source/opt/flat/cfg/switch_to_data.c \
@@ -105,6 +106,7 @@ FLAT_OPT_SRC = \
 	source/opt/flat/cfg/jump_thread.c \
 	source/opt/flat/cfg/bool_diamond_branch.c \
 	source/opt/flat/cfg/jumpif_invert.c \
+	source/opt/flat/cfg/switch_head.c \
 	source/opt/flat/scalar/var_to_tmp.c \
 	source/opt/flat/cfg/returnvalue_merge.c \
 	source/opt/flat/loop/backedge_phi_hoist.c \
@@ -139,9 +141,11 @@ FLAT_OPT_SRC = \
 	source/opt/flat/memory/addrof_var_fwd.c \
 	source/opt/flat/memory/ptr_local_fwd.c \
 	source/opt/flat/memory/param_copy_alias.c \
+	source/opt/flat/memory/struct_arg_split.c \
 	source/opt/flat/memory/slot_const_store_fold.c \
 	source/opt/flat/memory/sra.c \
-	source/opt/flat/memory/memmove_to_indexed_stores.c
+	source/opt/flat/memory/memmove_to_indexed_stores.c \
+	source/opt/flat/memory/escape_copy_call.c
 
 # Header set the units depend on (force a rebuild on interface edits).
 FLAT_OPT_HDRS = \
