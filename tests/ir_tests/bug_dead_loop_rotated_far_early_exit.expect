@@ -1,0 +1,4 @@
+count_runs t: 2 [2 3]
+count_runs u: 3 [1 2 3]
+first_bad: -1 1 -1 1
+pure_tail: 3 5

@@ -1131,6 +1131,27 @@ static int dl_any_cand_read_outside(IRSSAOptCtx *ctx, IRLoop *loop,
   return 0;
 }
 
+/* The latch's fall-through is the loop's only way out.  An early exit (a
+ * `return 0` of an inlined search loop) depends on the trip, so killing the
+ * back-edge would run one iteration and fall out where the exit was due;
+ * detect_loops only pads the range with exit targets within 50 instructions,
+ * so a far one passes the loop_max_idx check. */
+static int dl_only_exit_is_latch(TCCIRState *ir, IRLoop *loop, int jpf_idx)
+{
+  for (int i = loop->start_idx; i < jpf_idx; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_SWITCH_LOAD ||
+        q->op == TCCIR_OP_RETURNVALUE || q->op == TCCIR_OP_RETURNVOID)
+      return 0;
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int t = (int)tcc_ir_op_dest_imm(ir, q);
+    if (!dl_instr_in_loop(loop, t))
+      return 0;
+  }
+  return 1;
+}
+
 static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
 {
   TCCIRState *ir = ctx->ir;
@@ -1171,6 +1192,8 @@ static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
   if (header_block < 0 || latch_block < 0 || fallthru_block < 0)
     return 0;
   if (fallthru_block == header_block || dl_block_in_loop(cfg, loop, fallthru_block))
+    return 0;
+  if (!dl_only_exit_is_latch(ir, loop, jpf_idx))
     return 0;
 
   /* --- the compare drives a monotone induction variable ------------------ */

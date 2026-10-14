@@ -793,6 +793,7 @@ TEST_FILES = [
     # each trip one of its conditions (trip-count-dependent exit value, an
     # escaping counter, a store, a second back-edge, a volatile read).
     ("450_dead_loop_rotated.c", 0),
+    ("bug_dead_loop_rotated_far_early_exit.c", 0),  # an early exit past detect_loops' reach keeps the back-edge
 
     # ssa:switch_fold picks the arm of a constant-selector SWITCH_TABLE at
     # compile time.  What it has to get right is every way a selector can miss
