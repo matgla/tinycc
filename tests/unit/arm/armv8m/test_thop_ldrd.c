@@ -303,3 +303,22 @@ UT_TEST(test_ldrd_vs_strd_base)
 
   return 0;
 }
+
+/* ------------------------------------------------------------------ invalid operands rejected */
+
+UT_TEST(test_ldrd_strd_invalid_operands_rejected)
+{
+  setup_armv7m();
+
+  /* offset not a multiple of 4 must not be silently rounded */
+  UT_ASSERT_EQ(th_ldrd_imm(0, 1, 2, 6, 0x6).size, 0);
+  UT_ASSERT_EQ(th_strd_imm(0, 1, 2, 6, 0x6).size, 0);
+  /* Rt == Rt2 for LDRD is UNPREDICTABLE */
+  UT_ASSERT_EQ(th_ldrd_imm(0, 0, 2, 4, 0x6).size, 0);
+  /* P=0, W=0 selects a different encoding space */
+  UT_ASSERT_EQ(th_ldrd_imm(0, 1, 2, 4, 0x2).size, 0);
+  /* valid still works */
+  UT_ASSERT_EQ(th_ldrd_imm(0, 1, 2, 4, 0x6).opcode, 0xE9D20101);
+
+  return 0;
+}

@@ -3,4 +3,7 @@
 #include "../frontend/gen/decl/btype.c"
 #include "../frontend/gen/decl/declarator.c"
 #include "../frontend/gen/decl/predef_protos.c"
+#undef NB_PREDEF_PROTOS
+#undef PP_PREFIX
+#undef PP_PREFIX_LEN
 #include "../frontend/gen/decl/struct.c"

@@ -36,7 +36,7 @@ int tcc_ir_opt_const_string_calls(TCCIRState *ir)
     if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
 
-    callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
 
@@ -54,7 +54,7 @@ int tcc_ir_opt_const_string_calls(TCCIRState *ir)
 
     /* Simple redirects to __tcc_* helpers via a static id->name table */
     {
-      static const char *const strbi_helper[] = {
+      static const char *TCC_RODATA_REL const strbi_helper[] = {
           [STRBI_MEMMOVE] = "__tcc_memmove", [STRBI_BCOPY] = "__tcc_bcopy",
           [STRBI_MEMPCPY] = "__tcc_mempcpy", [STRBI_STRCAT] = "__tcc_strcat",
           [STRBI_STRCHR] = "__tcc_strchr",   [STRBI_INDEX] = "__tcc_strchr",

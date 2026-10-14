@@ -1,0 +1,2 @@
+error:
+a __rodata_relative pointer cannot point to a function ('g')

@@ -24,32 +24,7 @@
  *  Shift register — shared shapes
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* T1: <OP> <Rdn>, <Rm>  —  16-bit, all low, rd==rn, no shift field */
-static const thop_variant_shape SHAPE_T16_SHIFT_REG = {
-    .size = THOP_VARIANT_T16,
-    .rd_place = {0, 3},
-    .rm_place = {3, 3},
-    .rd_con = REG_LOW_ONLY | REG_EQ_RN,
-    .rn_con = REG_LOW_ONLY,
-    .rm_con = REG_LOW_ONLY,
-    .implicit_s = true,
-    .feat = {.t16 = 1},
-};
-
-/* T2/T3 (32-bit): <OP>{S}.W <Rd>, <Rn>, <Rm>  —  no shift field, rd/rn/rm any (not PC/SP) */
-static const thop_variant_shape SHAPE_T32_SHIFT_REG = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {8, 4},
-    .rn_place = {16, 4},
-    .rm_place = {0, 4},
-    .rd_con = REG_NOT_PC,
-    .rn_con = REG_NOT_PC,
-    .rm_con = REG_NOT_SP | REG_NOT_PC,
-    .has_s_bit = 1,
-    .feat = {.t32 = 1},
-};
-
-static thumb_opcode shift_reg_t1_emit(uint32_t base, const thop_args *a)
+thumb_opcode shift_reg_t1_emit(uint32_t base, const thop_args *a)
 {
     return (thumb_opcode){
         .size = 2,
@@ -57,10 +32,10 @@ static thumb_opcode shift_reg_t1_emit(uint32_t base, const thop_args *a)
     };
 }
 
-#define V_LSL_REG_T1(b) {&SHAPE_T16_SHIFT_REG, (b), shift_reg_t1_emit}
-#define V_LSR_REG_T1(b) {&SHAPE_T16_SHIFT_REG, (b), shift_reg_t1_emit}
-#define V_ASR_REG_T1(b) {&SHAPE_T16_SHIFT_REG, (b), shift_reg_t1_emit}
-#define V_SHIFT_REG32(b) {&SHAPE_T32_SHIFT_REG, (b)}
+#define V_LSL_REG_T1(b) {THOP_SHAPE_T16_SHIFT_REG, (b), THOP_CUSTOM_shift_reg_t1_emit}
+#define V_LSR_REG_T1(b) {THOP_SHAPE_T16_SHIFT_REG, (b), THOP_CUSTOM_shift_reg_t1_emit}
+#define V_ASR_REG_T1(b) {THOP_SHAPE_T16_SHIFT_REG, (b), THOP_CUSTOM_shift_reg_t1_emit}
+#define V_SHIFT_REG32(b) {THOP_SHAPE_T32_SHIFT_REG, (b)}
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Generic wrapper
@@ -69,8 +44,7 @@ static thumb_opcode shift_reg_t1_emit(uint32_t base, const thop_args *a)
 static thumb_opcode thop_shift_reg(uint32_t rd, uint32_t rn, uint32_t rm, thumb_flags_behaviour flags,
                                    thumb_enforce_encoding enc, const thop_table *table)
 {
-    return thop_emit(table->name, table->variants, table->variant_count,
-                     (thop_args){.rd = rd, .rn = rn, .rm = rm, .flags = flags, .enc = enc});
+    return thop_emit_table(table, (thop_args){.rd = rd, .rn = rn, .rm = rm, .flags = flags, .enc = enc});
 }
 
 #define THOP_SHIFT_REG_FN(fn_name, table_id)                                                                           \

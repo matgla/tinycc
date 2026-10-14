@@ -71,8 +71,7 @@ int tcc_ir_opt_setif_neg_to_select(TCCIRState *ir)
     if (sif->op != TCCIR_OP_SETIF)
       continue;
 
-    IROperand sif_dest = tcc_ir_op_get_dest(ir, sif);
-    int32_t t = irop_get_vreg(sif_dest);
+    int32_t t = tcc_ir_op_dest_vreg(ir, sif);
     if (t < 0)
       continue;
 
@@ -84,11 +83,9 @@ int tcc_ir_opt_setif_neg_to_select(TCCIRState *ir)
     if (sub->op != TCCIR_OP_SUB)
       continue;
 
-    IROperand sub_s1 = tcc_ir_op_get_src1(ir, sub);
-    IROperand sub_s2 = tcc_ir_op_get_src2(ir, sub);
-    if (!irop_is_immediate(sub_s1) || sub_s1.is_sym || irop_get_imm64_ex(ir, sub_s1) != 0)
+    if (!tcc_ir_op_src1_is_imm(ir, sub) || tcc_ir_op_src1_is_sym(ir, sub) || tcc_ir_op_src1_imm(ir, sub) != 0)
       continue;
-    if (irop_get_vreg(sub_s2) != t)
+    if (tcc_ir_op_src2_vreg(ir, sub) != t)
       continue;
 
     /* The SETIF result must feed only the negate, so NOPing it is safe. */
@@ -106,10 +103,9 @@ int tcc_ir_opt_setif_neg_to_select(TCCIRState *ir)
     if (prev_op != TCCIR_OP_CMP && prev_op != TCCIR_OP_TEST_ZERO)
       continue;
 
-    IROperand sif_cond = tcc_ir_op_get_src1(ir, sif);
-    if (!irop_is_immediate(sif_cond) || sif_cond.is_sym)
+    if (!tcc_ir_op_src1_is_imm(ir, sif) || tcc_ir_op_src1_is_sym(ir, sif))
       continue;
-    int cond = (int)irop_get_imm64_ex(ir, sif_cond);
+    int cond = (int)tcc_ir_op_src1_imm(ir, sif);
 
     /* Rewrite the negate in place as SELECT(#-1, #0, cond), reusing its dest. */
     IROperand sub_dest = tcc_ir_op_get_dest(ir, sub);
@@ -188,13 +184,11 @@ int tcc_ir_ifconv_match_predicated_select(TCCIRState *ir, int i, int *sel_index_
    * a 32-bit reverse-subtract negate `dest = 0 - src2`. */
   if (cq->op != TCCIR_OP_SUB)
     return 0;
-  IROperand csrc1 = tcc_ir_op_get_src1(ir, cq);
-  IROperand cdest = tcc_ir_op_get_dest(ir, cq);
-  if (!(irop_is_immediate(csrc1) && irop_get_imm64_ex(ir, csrc1) == 0))
+  if (!(tcc_ir_op_src1_is_imm(ir, cq) && tcc_ir_op_src1_imm(ir, cq) == 0))
     return 0;
-  if (irop_get_btype(cdest) == IROP_BTYPE_INT64)
+  if (tcc_ir_op_dest_btype(ir, cq) == IROP_BTYPE_INT64)
     return 0;
-  int32_t d_vr = irop_get_vreg(cdest);
+  int32_t d_vr = tcc_ir_op_dest_vreg(ir, cq);
   if (d_vr < 0)
     return 0;
 
@@ -204,7 +198,7 @@ int tcc_ir_ifconv_match_predicated_select(TCCIRState *ir, int i, int *sel_index_
   IRQuadCompact *sq = &ir->compact_instructions[sj];
 
   /* SELECT then-arm is this compute's (single-use) result. */
-  if (irop_get_vreg(tcc_ir_op_get_src1(ir, sq)) != d_vr ||
+  if (tcc_ir_op_src1_vreg(ir, sq) != d_vr ||
       !tcc_ir_vreg_has_single_use(ir, d_vr, -1))
     return 0;
 
@@ -220,7 +214,7 @@ int tcc_ir_ifconv_match_predicated_select(TCCIRState *ir, int i, int *sel_index_
     return 0;
 
   *sel_index_out = sj;
-  *cond_out = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_cond(ir, sq));
+  *cond_out = (int)tcc_ir_op_cond_imm(ir, sq);
   return 1;
 }
 
@@ -248,10 +242,30 @@ int tcc_ir_opt_select(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[j];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    int t = (int)irop_get_imm64_ex(ir, d);
+    int t = (int)tcc_ir_op_dest_imm(ir, q);
     if (t >= 0 && t < n)
       jt_cnt[t]++;
+  }
+  /* Switch cases and the default of a live SWITCH_TABLE are predecessors too (a
+   * table left behind by a lowered switch is not); a NOP target counts at the
+   * instruction it falls to as well. */
+  for (int j = 0; j < n; j++) {
+    IRQuadCompact *sq = &ir->compact_instructions[j];
+    if (sq->op != TCCIR_OP_SWITCH_TABLE)
+      continue;
+    int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, sq));
+    if (table_id < 0 || table_id >= ir->num_switch_tables)
+      continue;
+    TCCIRSwitchTable *tbl = &ir->switch_tables[table_id];
+    for (int e = -1; e < tbl->num_entries; e++) {
+      int tt = e < 0 ? tbl->default_target : tbl->targets[e];
+      if (tt < 0 || tt >= n)
+        continue;
+      jt_cnt[tt]++;
+      int sk = ir_skip_nops_forward(ir, tt, n);
+      if (sk != tt && sk < n)
+        jt_cnt[sk]++;
+    }
   }
   #define JT_HAS_OTHER(target, exclude_idx) \
     ir_has_other_jump_to_fast(ir, jt_cnt, (target), (exclude_idx))
@@ -272,10 +286,8 @@ int tcc_ir_opt_select(TCCIRState *ir)
       continue;
 
     /* Get JUMPIF operands: dest=else_target, src1=condition */
-    IROperand jumpif_dest = tcc_ir_op_get_dest(ir, jumpif_q);
-    IROperand jumpif_cond = tcc_ir_op_get_src1(ir, jumpif_q);
-    int branch_cond = (int)irop_get_imm64_ex(ir, jumpif_cond);
-    int else_target = (int)irop_get_imm64_ex(ir, jumpif_dest);
+    int branch_cond = (int)tcc_ir_op_src1_imm(ir, jumpif_q);
+    int else_target = (int)tcc_ir_op_dest_imm(ir, jumpif_q);
 
     /* Normalize `JUMPIF C → A; JUMP → B` into `JUMPIF !C → B` when A is the
      * instruction immediately following the JUMP.  Without this, a ternary
@@ -326,6 +338,18 @@ int tcc_ir_opt_select(TCCIRState *ir)
       continue;
     if (JT_HAS_OTHER(else_target, i))
       continue;
+    /* A diamond is then-arm; else-arm, entered only at its top: a label or case
+     * between the JUMPIF and the else block means other code lies in between.
+     * Arms are a handful of instructions, so a far else target is no diamond. */
+    if (else_target <= i || else_target > n || else_target - i > 64)
+      continue;
+    {
+      int inner = 0;
+      for (int k = i + 1; k < else_target && !inner; k++)
+        inner = jt_cnt[k] > 0;
+      if (inner)
+        continue;
+    }
 
     /* ----------------------------------------------------------------
      * Pattern: Call diamond (PARAM+CALL in both branches)
@@ -353,7 +377,7 @@ int tcc_ir_opt_select(TCCIRState *ir)
       IRQuadCompact *jump_q = &ir->compact_instructions[jump_idx];
       if (jump_q->op != TCCIR_OP_JUMP)
         continue;
-      int merge_target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jump_q));
+      int merge_target = (int)tcc_ir_op_dest_imm(ir, jump_q);
 
       /* else_target should point to the else block */
       if (else_target < 0 || else_target >= n)
@@ -377,24 +401,20 @@ int tcc_ir_opt_select(TCCIRState *ir)
         continue;
 
       /* Verify both calls target the same function */
-      Sym *then_callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, then_call_q));
-      Sym *else_callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, else_call_q));
+      Sym *then_callee = tcc_ir_op_src1_sym(ir, then_call_q);
+      Sym *else_callee = tcc_ir_op_src1_sym(ir, else_call_q);
       if (!then_callee || !else_callee || then_callee != else_callee)
         continue;
 
       /* Verify both params are param index 0 for their respective calls */
-      IROperand then_param_enc = tcc_ir_op_get_src2(ir, then_q1);
-      IROperand else_param_enc = tcc_ir_op_get_src2(ir, else_q1);
-      int then_param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, then_param_enc));
-      int else_param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, else_param_enc));
+      int then_param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)tcc_ir_op_src2_imm(ir, then_q1));
+      int else_param_idx = TCCIR_DECODE_PARAM_IDX((uint32_t)tcc_ir_op_src2_imm(ir, else_q1));
       if (then_param_idx != 0 || else_param_idx != 0)
         continue;
 
       /* Both calls have 1 argument (CALL #N where argc from encoded src2) */
-      IROperand then_call_meta = tcc_ir_op_get_src2(ir, then_call_q);
-      IROperand else_call_meta = tcc_ir_op_get_src2(ir, else_call_q);
-      int then_argc = TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, then_call_meta));
-      int else_argc = TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, else_call_meta));
+      int then_argc = TCCIR_DECODE_CALL_ARGC((uint32_t)tcc_ir_op_src2_imm(ir, then_call_q));
+      int else_argc = TCCIR_DECODE_CALL_ARGC((uint32_t)tcc_ir_op_src2_imm(ir, else_call_q));
       if (then_argc != 1 || else_argc != 1)
         continue;
 
@@ -511,16 +531,15 @@ int tcc_ir_opt_select(TCCIRState *ir)
         continue;
 
       /* Same destination vreg */
-      IROperand else_dest = tcc_ir_op_get_dest(ir, else_q);
       IROperand else_val = tcc_ir_op_get_src1(ir, else_q);
-      if (irop_get_vreg(else_dest) != dest_vreg)
+      if (tcc_ir_op_dest_vreg(ir, else_q) != dest_vreg)
         continue;
 
       /* The else block must be exactly one ASSIGN.  After it, the next
        * instruction must be the merge point (the JMP target from then).
        * Otherwise the else block has more instructions and it's not a
        * simple diamond — NOP'ing the else ASSIGN would break the rest. */
-      int merge_target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jump_q));
+      int merge_target = (int)tcc_ir_op_dest_imm(ir, jump_q);
       int after_else = ir_skip_nops_forward(ir, else_start + 1, n);
       if (after_else != merge_target)
         continue;
@@ -587,7 +606,7 @@ int tcc_ir_opt_select(TCCIRState *ir)
       if (tc_vr >= 0 && tc_is_i32 &&
           then_jmp < n && ir->compact_instructions[then_jmp].op == TCCIR_OP_JUMP)
       {
-        int mvia = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, &ir->compact_instructions[then_jmp]));
+        int mvia = (int)tcc_ir_op_dest_imm(ir, &ir->compact_instructions[then_jmp]);
         int mvia_i = (mvia >= 0 && mvia < n) ? ir_skip_nops_forward(ir, mvia, n) : n;
         if (mvia_i < n && ir->compact_instructions[mvia_i].op == TCCIR_OP_ASSIGN &&
             !JT_HAS_OTHER(mvia_i, then_jmp))
@@ -605,11 +624,11 @@ int tcc_ir_opt_select(TCCIRState *ir)
             IRQuadCompact *elq = &ir->compact_instructions[else_start2];
             int else_jmp = ir_skip_nops_forward(ir, else_start2 + 1, n);
             if ((elq->op == TCCIR_OP_LOAD || elq->op == TCCIR_OP_ASSIGN) &&
-                irop_get_vreg(tcc_ir_op_get_dest(ir, elq)) == tm_vr &&
+                tcc_ir_op_dest_vreg(ir, elq) == tm_vr &&
                 ir_ifconv_arm_value_safe(ir, elq) &&
-                irop_btype_select_lowerable(irop_get_btype(tcc_ir_op_get_src1(ir, elq))) &&
+                irop_btype_select_lowerable(tcc_ir_op_src1_btype(ir, elq)) &&
                 else_jmp < n && ir->compact_instructions[else_jmp].op == TCCIR_OP_JUMP &&
-                (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, &ir->compact_instructions[else_jmp])) == merge)
+                (int)tcc_ir_op_dest_imm(ir, &ir->compact_instructions[else_jmp]) == merge)
             {
               IROperand vel = tcc_ir_op_get_src1(ir, elq);
               IROperand sel_cond = irop_make_imm32(-1, then_cond, VT_INT);
@@ -659,9 +678,8 @@ int tcc_ir_opt_select(TCCIRState *ir)
      * SETIF's flag-source intact. */
     if (then_q1->op == TCCIR_OP_SETIF)
     {
-      IROperand then_dest = tcc_ir_op_get_dest(ir, then_q1);
       IROperand setif_cond = tcc_ir_op_get_src1(ir, then_q1);
-      int32_t dest_vreg = irop_get_vreg(then_dest);
+      int32_t dest_vreg = tcc_ir_op_dest_vreg(ir, then_q1);
 
       /* SETIF's condition must equal `then_cond` (the negation of the
        * JUMPIF's branch condition) so SETIF returns 1 precisely along the
@@ -679,7 +697,7 @@ int tcc_ir_opt_select(TCCIRState *ir)
       IRQuadCompact *jump_q = &ir->compact_instructions[jump_idx];
       if (jump_q->op != TCCIR_OP_JUMP)
         goto setif_diamond_done;
-      int merge_target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jump_q));
+      int merge_target = (int)tcc_ir_op_dest_imm(ir, jump_q);
 
       /* Find else block (same vreg, ASSIGN of constant 0) */
       int else_start = ir_skip_nops_forward(ir, else_target, n);
@@ -688,9 +706,8 @@ int tcc_ir_opt_select(TCCIRState *ir)
       IRQuadCompact *else_q = &ir->compact_instructions[else_start];
       if (else_q->op != TCCIR_OP_ASSIGN)
         goto setif_diamond_done;
-      IROperand else_dest = tcc_ir_op_get_dest(ir, else_q);
       IROperand else_val = tcc_ir_op_get_src1(ir, else_q);
-      if (irop_get_vreg(else_dest) != dest_vreg)
+      if (tcc_ir_op_dest_vreg(ir, else_q) != dest_vreg)
         goto setif_diamond_done;
       if (!irop_is_immediate(else_val) || else_val.is_sym ||
           irop_get_imm64_ex(ir, else_val) != 0)
@@ -824,7 +841,7 @@ int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir)
     if (jif->op != TCCIR_OP_JUMPIF)
       continue;
 
-    int exit_target = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, jif));
+    int exit_target = (int)tcc_ir_op_dest_imm32(ir, jif);
     int cond = (int)tcc_ir_op_get_src1(ir, jif).u.imm32;
 
     if (exit_target <= i || exit_target >= n)
@@ -849,7 +866,7 @@ int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir)
     if (jmp->op != TCCIR_OP_JUMP)
       continue;
 
-    int merge_target = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, jmp));
+    int merge_target = (int)tcc_ir_op_dest_imm32(ir, jmp);
     if (merge_target <= jump_idx || merge_target >= n)
       continue;
 
@@ -866,10 +883,8 @@ int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir)
     int safe = 1;
     for (int j = 0; j < num_assigns && safe; j++) {
       IRQuadCompact *aq = &ir->compact_instructions[i + 1 + j];
-      IROperand adst = tcc_ir_op_get_dest(ir, aq);
-      IROperand asrc = tcc_ir_op_get_src1(ir, aq);
-      int32_t adst_vr = irop_get_vreg(adst);
-      int32_t asrc_vr = irop_get_vreg(asrc);
+      int32_t adst_vr = tcc_ir_op_dest_vreg(ir, aq);
+      int32_t asrc_vr = tcc_ir_op_src1_vreg(ir, aq);
       if (adst_vr < 0 || asrc_vr < 0) { safe = 0; break; }
 
       int dst_reg = -2, dst_reg1 = -2, src_reg = -2, src_reg1 = -2;
@@ -911,8 +926,8 @@ int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir)
      * ra_phi_copy_needed() sets for the identical post-RA-identity case. */
     for (int j = 0; j < num_assigns; j++) {
       IRQuadCompact *aq = &ir->compact_instructions[i + 1 + j];
-      int32_t adst_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, aq));
-      int32_t asrc_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, aq));
+      int32_t adst_vr = tcc_ir_op_dest_vreg(ir, aq);
+      int32_t asrc_vr = tcc_ir_op_src1_vreg(ir, aq);
       IRLiveInterval *dli = tcc_ir_vreg_live_interval(ir, adst_vr);
       IRLiveInterval *sli = tcc_ir_vreg_live_interval(ir, asrc_vr);
       if (dli) dli->phi_pinned = 1;
@@ -951,13 +966,22 @@ int tcc_ir_opt_post_ra_forward_diamond(TCCIRState *ir)
       IRQuadCompact *kq = &ir->compact_instructions[k];
       if (kq->op != TCCIR_OP_JUMP && kq->op != TCCIR_OP_JUMPIF)
         continue;
-      int kt = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, kq));
+      int kt = (int)tcc_ir_op_dest_imm32(ir, kq);
       if (kt < i + 1 || kt > jump_idx)
         continue;
       IROperand kd = {0};
       kd.tag = IROP_TAG_IMM32;
       kd.u.imm32 = merge_target;
       tcc_ir_op_set_dest(ir, kq, kd);
+    }
+    /* Switch-table entries into the region (`case N: break;`) go to merge_target too. */
+    for (int t = 0; t < ir->num_switch_tables; t++) {
+      TCCIRSwitchTable *tbl = &ir->switch_tables[t];
+      if (tbl->default_target >= i + 1 && tbl->default_target <= jump_idx)
+        tbl->default_target = merge_target;
+      for (int e = 0; e < tbl->num_entries; e++)
+        if (tbl->targets[e] >= i + 1 && tbl->targets[e] <= jump_idx)
+          tbl->targets[e] = merge_target;
     }
 
     /* NOP the no-op ASSIGNs and the bridging JUMP */

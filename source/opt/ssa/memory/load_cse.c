@@ -12,7 +12,97 @@
 #include "ir.h"
 #include "ssa_opt.h"
 #include "load_cse.h"
+#include "opt_du.h"
+#include "opt_loop_utils.h"
+#include "memory/unique_ptr.h"
 #include <limits.h>
+
+/* This is a profitability key only; SSA load CSE still proves availability and alias safety. */
+static int lcse_cmp_read_root(TCCIRState *ir, const IROptDU *du, IROperand op, int before)
+{
+  if (op.tag != IROP_TAG_VREG || !op.is_lval || op.is_local || op.is_llocal || op.is_sym ||
+      irop_get_btype(op) != IROP_BTYPE_INT32 || tcc_ir_access_is_volatile(ir, op))
+    return -1;
+  int32_t vr = irop_get_vreg(op);
+  for (int hop = 0; hop < 8; hop++) {
+    int def = ir_opt_du_def(du, vr, before);
+    if (def < 0 || !ir_opt_du_is_single_def(du, vr))
+      break;
+    IRQuadCompact *q = &ir->compact_instructions[def];
+    if (q->op != TCCIR_OP_ASSIGN)
+      break;
+    IROperand src = tcc_ir_op_get_src1(ir, q);
+    if (!irop_is_vreg_value(src))
+      break;
+    vr = irop_get_vreg(src);
+    before = def;
+  }
+  return ir_opt_du_idx(du, vr);
+}
+
+int ssa_opt_expose_cmp_loads(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index, candidate = 0;
+  for (int i = 0; i < n && !candidate; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_CMP)
+      for (int side = 0; side < 2; side++) {
+        IROperand op = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
+        if (op.tag == IROP_TAG_VREG && op.is_lval && !op.is_local && !op.is_llocal)
+          candidate = 1;
+      }
+  }
+  if (!candidate)
+    return 0;
+
+  IROptDU du;
+  ir_opt_du_build(ir, &du);
+  unique_ptr(uint8_t) reads = tcc_mallocz(du.total > 0 ? du.total : 1);
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    for (int side = 0; side < 2; side++) {
+      if (side ? !irop_config[q->op].has_src2 : !irop_config[q->op].has_src1)
+        continue;
+      int key = lcse_cmp_read_root(ir, &du, tcc_ir_op_get_src1_or_2(ir, q, side != 0), i);
+      if (key >= 0 && reads[key] < 2)
+        reads[key]++;
+    }
+  }
+
+  int changes = 0;
+  /* Reverse insertion preserves the DU definition indices used by the profitability scan. */
+  for (int i = n - 1; i >= 0; i--) {
+    if (ir->compact_instructions[i].op != TCCIR_OP_CMP)
+      continue;
+    int inserted = 0;
+    for (int side = 1; side >= 0; side--) {
+      IRQuadCompact *q = &ir->compact_instructions[i + inserted];
+      IROperand src = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
+      int key = lcse_cmp_read_root(ir, &du, src, i);
+      if (key < 0 || reads[key] < 2)
+        continue;
+      int line = q->line_num;
+      IROperand value = irop_make_vreg(tcc_ir_vreg_alloc_temp(ir), IROP_BTYPE_INT32);
+      value.is_unsigned = src.is_unsigned;
+      if (insert_instr_at(ir, i, TCCIR_OP_LOAD, value, src, irop_make_none()) < 0)
+        continue;
+      /* Edges entering the CMP must execute its new load, including switch and loop edges. */
+      tcc_ir_keep_label_ahead(ir, i);
+      ir->compact_instructions[i].line_num = line;
+      inserted++;
+      q = &ir->compact_instructions[i + inserted];
+      if (side)
+        tcc_ir_op_set_src2(ir, q, value);
+      else
+        tcc_ir_op_set_src1(ir, q, value);
+      changes++;
+    }
+  }
+  tcc_free(du.def);
+  return changes;
+}
 
 
 #define GLOAD_MAX 16
@@ -26,19 +116,21 @@
 typedef struct {
   Sym *sym;
   int64_t addend;
-  int btype;
+  int btype;          /* ACCESS width (see lcse_sx) */
   int32_t result_vr;
+  uint8_t sx;         /* sign-extending narrow read */
 } GLoadEntry;
 
 typedef struct {
   int32_t base_vr;
   int32_t result_vr;
-  int btype;
+  int btype;         /* ACCESS width: a plain LOAD's source, a LOAD_INDEXED's dest */
   int32_t idx_imm;   /* valid when idx_vr < 0 */
   int32_t idx_vr;    /* TEMP holding a runtime index, or -1 for the constant form */
   int32_t base_off;  /* frame offset when base_is_stack; base_vr is -1 then */
   uint8_t base_is_stack;
   uint8_t scale;
+  uint8_t sx;        /* sign-extending narrow read */
 } ILoadEntry;
 
 typedef struct {
@@ -87,17 +179,34 @@ typedef struct {
   int vscount;
 } GLoadState;
 
-static int gload_find(const GLoadState *st, Sym *sym, int64_t addend, int btype)
+/* Two loads of one address yield the same register value only when they read
+ * the same width with the same extension.  The width is the ACCESS width: a
+ * plain LOAD (and a deref operand) reads at its source operand's btype, which
+ * need not equal the dest's -- an LDRB into a 32-bit TEMP, or the LDR/LDRH
+ * ssa:load_combine leaves next to a surviving p[0] byte load.  Keying on the
+ * dest btype let a byte load and a word load of p CSE into each other. */
+static inline int lcse_sx(IROperand op)
+{
+  int bt = irop_get_btype(op);
+  return (bt == IROP_BTYPE_INT8 || bt == IROP_BTYPE_INT16) && !op.is_unsigned;
+}
+
+static inline int lcse_btype_wide(int bt)
+{
+  return bt == IROP_BTYPE_INT64 || bt == IROP_BTYPE_FLOAT64 || bt == IROP_BTYPE_STRUCT;
+}
+
+static int gload_find(const GLoadState *st, Sym *sym, int64_t addend, int btype, int sx)
 {
   for (int k = 0; k < st->count; k++) {
     if (st->entries[k].sym == sym && st->entries[k].addend == addend &&
-        st->entries[k].btype == btype)
+        st->entries[k].btype == btype && st->entries[k].sx == (uint8_t)sx)
       return k;
   }
   return -1;
 }
 
-static void gload_track(GLoadState *st, Sym *sym, int64_t addend, int btype,
+static void gload_track(GLoadState *st, Sym *sym, int64_t addend, int btype, int sx,
                          int32_t result_vr)
 {
   if (st->count >= GLOAD_MAX)
@@ -106,6 +215,7 @@ static void gload_track(GLoadState *st, Sym *sym, int64_t addend, int btype,
   e->sym = sym;
   e->addend = addend;
   e->btype = btype;
+  e->sx = (uint8_t)sx;
   e->result_vr = result_vr;
 }
 
@@ -147,6 +257,35 @@ static int slot_btype_bytes(int btype)
   case IROP_BTYPE_FLOAT64: return 8;
   default: return 8;
   }
+}
+
+/* A store narrower than a word keeps only the low 8/16 bits and the reload
+ * extends them (sign or zero, by the load's type).  Forwarding the stored TEMP
+ * -- or an immediate the narrow slot cannot hold -- as a plain ASSIGN hands the
+ * reload the full 32-bit value, with no truncation and no extension.  A narrow
+ * TEMP store is tracked, but only the direct reload forwards it, as the UBFX /
+ * SBFX of the TEMP the reload would have done (sstore_narrow_reload); an
+ * immediate that is the same under both extensions (0..0x7f / 0..0x7fff) still
+ * forwards as it stands. */
+static int narrow_store_vr_forwardable(int btype)
+{
+  return btype != IROP_BTYPE_INT8 && btype != IROP_BTYPE_INT16;
+}
+
+/* Whether an entry's value may replace a read of its slot as it stands. */
+static int sstore_value_forwardable(const SStoreEntry *se)
+{
+  return se->stored_vr < 0 || narrow_store_vr_forwardable(se->btype);
+}
+
+static int narrow_store_imm_forwardable(int btype, IROperand imm)
+{
+  if (btype != IROP_BTYPE_INT8 && btype != IROP_BTYPE_INT16)
+    return 1;
+  if (!irop_is_immediate(imm))
+    return 0;
+  int64_t v = irop_get_imm32(imm);
+  return v >= 0 && v <= (btype == IROP_BTYPE_INT8 ? 0x7f : 0x7fff);
 }
 
 static void sstore_invalidate_overlap(GLoadState *st, int offset, int btype)
@@ -193,6 +332,10 @@ static void sstore_track_imm(GLoadState *st, int offset, int btype, IROperand im
                              int32_t base_var)
 {
   sstore_invalidate_overlap(st, offset, btype);
+  if (!narrow_store_imm_forwardable(btype, imm)) {
+    sstore_remove_offset(st, offset);
+    return;
+  }
   int k = sstore_find(st, offset);
   if (k >= 0) {
     st->sstores[k].btype = btype;
@@ -328,7 +471,10 @@ static int gstore_find(const GLoadState *st, Sym *sym, int64_t addend, int btype
   return -1;
 }
 
-/* exact (sym,addend,btype) match preserved; the calling tracker overwrites it */
+/* exact (sym,addend,btype) match preserved; the calling tracker overwrites it.
+ * A same-size entry of ANOTHER btype (union float/int pun) is not that match:
+ * gstore_find keys on btype, so the tracker would append beside it and a later
+ * load of the old type would forward the stale value.  Drop it. */
 static void gstore_invalidate_overlap(GLoadState *st, Sym *sym, int64_t addend, int btype)
 {
   int size = slot_btype_bytes(btype);
@@ -341,7 +487,7 @@ static void gstore_invalidate_overlap(GLoadState *st, Sym *sym, int64_t addend, 
     int esize = slot_btype_bytes(e->btype);
     int64_t elo = e->addend;
     int64_t ehi = elo + esize;
-    if (e->addend == addend && esize == size)
+    if (e->addend == addend && esize == size && e->btype == btype)
       continue;
     if (elo < hi && ehi > lo) {
       st->gstores[k] = st->gstores[--st->gscount];
@@ -354,6 +500,11 @@ static void gstore_track_vr(GLoadState *st, Sym *sym, int64_t addend, int btype,
 {
   gstore_invalidate_overlap(st, sym, addend, btype);
   int k = gstore_find(st, sym, addend, btype);
+  if (!narrow_store_vr_forwardable(btype)) {
+    if (k >= 0)
+      st->gstores[k] = st->gstores[--st->gscount];
+    return;
+  }
   if (k >= 0) {
     st->gstores[k].stored_vr = stored_vr;
     return;
@@ -371,6 +522,11 @@ static void gstore_track_imm(GLoadState *st, Sym *sym, int64_t addend, int btype
 {
   gstore_invalidate_overlap(st, sym, addend, btype);
   int k = gstore_find(st, sym, addend, btype);
+  if (!narrow_store_imm_forwardable(btype, imm)) {
+    if (k >= 0)
+      st->gstores[k] = st->gstores[--st->gscount];
+    return;
+  }
   if (k >= 0) {
     st->gstores[k].stored_vr = -1;
     st->gstores[k].stored_imm = imm;
@@ -418,6 +574,11 @@ static int tvstore_find(const GLoadState *st, int32_t ptr_vr, int btype)
 static void tvstore_track_imm(GLoadState *st, int32_t ptr_vr, int btype, IROperand imm)
 {
   int k = tvstore_find(st, ptr_vr, btype);
+  if (!narrow_store_imm_forwardable(btype, imm)) {
+    if (k >= 0)
+      st->tvstores[k] = st->tvstores[--st->tvcount];
+    return;
+  }
   if (k >= 0) {
     st->tvstores[k].stored_vr = -1;
     st->tvstores[k].stored_imm = imm;
@@ -435,6 +596,11 @@ static void tvstore_track_imm(GLoadState *st, int32_t ptr_vr, int btype, IROpera
 static void tvstore_track_vr(GLoadState *st, int32_t ptr_vr, int btype, int32_t stored_vr)
 {
   int k = tvstore_find(st, ptr_vr, btype);
+  if (!narrow_store_vr_forwardable(btype)) {
+    if (k >= 0)
+      st->tvstores[k] = st->tvstores[--st->tvcount];
+    return;
+  }
   if (k >= 0) {
     st->tvstores[k].stored_vr = stored_vr;
     return;
@@ -467,11 +633,11 @@ static inline int iload_idx_is_reg(const ILoadEntry *e) { return e->idx_vr >= 0;
  * base" for such an entry -- the conservative answer everywhere it matters. */
 static int iload_find_ex(const GLoadState *st, int32_t base_vr, int base_is_stack,
                          int32_t base_off, int32_t idx_imm, int32_t idx_vr,
-                         int scale, int btype)
+                         int scale, int btype, int sx)
 {
   for (int k = 0; k < st->ilcount; k++) {
     const ILoadEntry *e = &st->iloads[k];
-    if (e->scale != scale || e->btype != btype || e->idx_vr != idx_vr)
+    if (e->scale != scale || e->btype != btype || e->sx != (uint8_t)sx || e->idx_vr != idx_vr)
       continue;
     if (e->base_is_stack != (uint8_t)base_is_stack)
       continue;
@@ -485,14 +651,14 @@ static int iload_find_ex(const GLoadState *st, int32_t base_vr, int base_is_stac
 }
 
 static int iload_find(const GLoadState *st, int32_t base_vr, int32_t idx_imm,
-                      int32_t idx_vr, int scale, int btype)
+                      int32_t idx_vr, int scale, int btype, int sx)
 {
-  return iload_find_ex(st, base_vr, 0, 0, idx_imm, idx_vr, scale, btype);
+  return iload_find_ex(st, base_vr, 0, 0, idx_imm, idx_vr, scale, btype, sx);
 }
 
 static void iload_track_ex(GLoadState *st, int32_t base_vr, int base_is_stack,
                            int32_t base_off, int32_t idx_imm, int32_t idx_vr,
-                           int scale, int btype, int32_t result_vr)
+                           int scale, int btype, int sx, int32_t result_vr)
 {
   if (st->ilcount >= ILOAD_MAX)
     return;
@@ -500,6 +666,7 @@ static void iload_track_ex(GLoadState *st, int32_t base_vr, int base_is_stack,
   e->base_vr = base_vr;
   e->result_vr = result_vr;
   e->btype = btype;
+  e->sx = (uint8_t)sx;
   e->idx_imm = idx_imm;
   e->idx_vr = idx_vr;
   e->base_off = base_off;
@@ -508,9 +675,9 @@ static void iload_track_ex(GLoadState *st, int32_t base_vr, int base_is_stack,
 }
 
 static void iload_track(GLoadState *st, int32_t base_vr, int32_t idx_imm, int32_t idx_vr,
-                        int scale, int btype, int32_t result_vr)
+                        int scale, int btype, int sx, int32_t result_vr)
 {
-  iload_track_ex(st, base_vr, 0, 0, idx_imm, idx_vr, scale, btype, result_vr);
+  iload_track_ex(st, base_vr, 0, 0, idx_imm, idx_vr, scale, btype, sx, result_vr);
 }
 
 static void iload_remove_vr(GLoadState *st, int32_t vr)
@@ -552,8 +719,8 @@ static void lcse_count_defs(TCCIRState *ir, const LcseDefCounts *dc)
       continue;
     /* POSTINC advances its pointer operand without encoding a def */
     if (q->op == TCCIR_OP_LOAD_POSTINC || q->op == TCCIR_OP_STORE_POSTINC) {
-      lcse_count_def(dc, irop_get_vreg(tcc_ir_op_get_src1(ir, q)));
-      lcse_count_def(dc, irop_get_vreg(tcc_ir_op_get_dest(ir, q)));
+      lcse_count_def(dc, tcc_ir_op_src1_vreg(ir, q));
+      lcse_count_def(dc, tcc_ir_op_dest_vreg(ir, q));
       continue;
     }
     if (!irop_config[q->op].has_dest)
@@ -660,7 +827,7 @@ static int iload_base_may_be_frame(IRSSAOptCtx *ctx, int32_t vr, int depth)
   for (int s = 0; s < 2; s++) {
     if (s == 0 ? !irop_config[dq->op].has_src1 : !irop_config[dq->op].has_src2)
       continue;
-    IROperand op = s == 0 ? tcc_ir_op_get_src1(ir, dq) : tcc_ir_op_get_src2(ir, dq);
+    IROperand op = tcc_ir_op_get_src1_or_2(ir, dq, s != 0);
     if (op.tag == IROP_TAG_STACKOFF || op.is_local || op.is_llocal)
       return 1;                   /* a frame address feeds the computation */
     if (op.is_lval)
@@ -791,7 +958,7 @@ static int vslot_forward_reads(IRSSAOptCtx *ctx, GLoadState *st, int i, IRQuadCo
     if (side == 1 && (!can_src2 || !irop_config[op].has_src2))
       continue;
 
-    IROperand s = side == 0 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+    IROperand s = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
     if (s.tag != IROP_TAG_VREG || s.is_lval || s.is_llocal || s.is_local)
       continue;
     int32_t vr = irop_get_vreg(s);
@@ -825,6 +992,141 @@ static int vslot_forward_reads(IRSSAOptCtx *ctx, GLoadState *st, int i, IRQuadCo
 
 #define resolve_lea_stackloc ssa_opt_resolve_lea_stackloc
 
+/* Copy only the live prefix of each table (entries past a count are never
+ * read): a whole-struct copy moved ~2.6 KB per snapshot. */
+static void gload_state_copy(GLoadState *dst, const GLoadState *src)
+{
+  dst->count = src->count;
+  memcpy(dst->entries, src->entries, sizeof src->entries[0] * src->count);
+  dst->scount = src->scount;
+  memcpy(dst->sstores, src->sstores, sizeof src->sstores[0] * src->scount);
+  dst->gscount = src->gscount;
+  memcpy(dst->gstores, src->gstores, sizeof src->gstores[0] * src->gscount);
+  dst->tvcount = src->tvcount;
+  memcpy(dst->tvstores, src->tvstores, sizeof src->tvstores[0] * src->tvcount);
+  dst->ilcount = src->ilcount;
+  memcpy(dst->iloads, src->iloads, sizeof src->iloads[0] * src->ilcount);
+  dst->vscount = src->vscount;
+  memcpy(dst->vslots, src->vslots, sizeof src->vslots[0] * src->vscount);
+}
+
+/* `T <- slot [LOAD]` (8 or 16 bits) after `slot <- X [STORE]`: the reload is
+ * X's low bits extended by the load's signedness, `T <- X UBFX|SBFX #0,#w`. */
+static int sstore_narrow_reload(IRSSAOptCtx *ctx, int i, IRQuadCompact *q, int32_t stored_vr, IROperand src1)
+{
+  TCCIRState *ir = ctx->ir;
+  int bt = irop_get_btype(src1);
+  if ((bt != IROP_BTYPE_INT8 && bt != IROP_BTYPE_INT16) || src1.is_complex || tcc_ir_barrel_shift_at(ir, q))
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  if (d.is_lval || irop_is_64bit(d))
+    return 0;
+  IROperand x = irop_make_vreg(stored_vr, IROP_BTYPE_INT32);
+  IROperand bits = irop_make_imm32(-1, (bt == IROP_BTYPE_INT8 ? 8 : 16) << 5, IROP_BTYPE_INT32);
+  int base = tcc_ir_iroperand_pool_add(ir, d);
+  tcc_ir_iroperand_pool_add(ir, x);
+  tcc_ir_iroperand_pool_add(ir, bits);
+  q->operand_base = base;
+  q->op = src1.is_unsigned ? TCCIR_OP_UBFX : TCCIR_OP_SBFX;
+  IRSSAVregInfo *rvi = ssa_opt_vinfo(ctx, stored_vr);
+  if (rvi)
+    ssa_opt_add_use_instr(rvi, i);
+  IRSSAVregInfo *pvi = ssa_opt_vinfo(ctx, irop_get_vreg(src1));
+  if (pvi)
+    ssa_opt_remove_use_instr(pvi, i);
+  return 1;
+}
+
+/* `V <- X [STORE]; ...; T <- V [LOAD]`, the load 8 or 16 bits of a local
+ * whose address is never taken, reached only from the store: straight-line
+ * code, no live jump target after the store.  The SSA CFG is not rebuilt when
+ * a branch folds, so the store's block need not dominate the load's there --
+ * zig.h's two-return ctz once its zero arm folds under a `bits != 0` test.
+ * The targets are recomputed from the live jumps. */
+static int lcse_linear_narrow_reloads(IRSSAOptCtx *ctx)
+{
+  TCCIRState *ir = ctx->ir;
+  const int n = ir->next_instruction_index;
+  if (ctx->no_stack_fwd || n < 2 || tcc_ir_opt_pass_disabled("ssa:load_cse:linear_reload"))
+    return 0;
+  unique_ptr(uint8_t) tgt = tcc_mallocz((size_t)(n + 7) / 8);
+  for (int i = 0; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    /* a computed goto or asm goto enters at labels no jump names */
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_INLINE_ASM)
+      return 0;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
+      int t = (int)tcc_ir_op_dest_u_imm32(ir, q);
+      if (t >= 0 && t < n)
+        tgt[t >> 3] |= (uint8_t)(1u << (t & 7));
+    }
+  }
+  for (int k = 0; k < ir->num_switch_tables; k++) {
+    TCCIRSwitchTable *swt = &ir->switch_tables[k];
+    for (int e = 0; e < swt->num_entries; e++)
+      if (swt->targets[e] >= 0 && swt->targets[e] < n)
+        tgt[swt->targets[e] >> 3] |= (uint8_t)(1u << (swt->targets[e] & 7));
+    if (swt->default_target >= 0 && swt->default_target < n)
+      tgt[swt->default_target >> 3] |= (uint8_t)(1u << (swt->default_target & 7));
+  }
+
+  const uint32_t stop = IROP_ENDS_BLOCK | IR_HZ_RETURN | IR_HZ_CALL | IR_HZ_ASM | IR_HZ_NONLOCAL | IR_HZ_CHAIN |
+                        IR_HZ_TRAP | IR_HZ_VLA | IR_HZ_UPDATES_SRC;
+  int changes = 0;
+  for (int i = 1; i < n; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op != TCCIR_OP_LOAD || tcc_ir_barrel_shift_at(ir, q))
+      continue;
+    IROperand src1 = tcc_ir_op_get_src1(ir, q);
+    int bt = irop_get_btype(src1);
+    int32_t v = irop_get_vreg(src1);
+    if (src1.tag != IROP_TAG_STACKOFF || !src1.is_lval || !src1.is_local || src1.is_llocal || src1.is_complex ||
+        (bt != IROP_BTYPE_INT8 && bt != IROP_BTYPE_INT16) || v < 0 ||
+        TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_VAR || !vslot_var_forwardable(ir, v) ||
+        tcc_ir_access_is_volatile(ir, src1))
+      continue;
+    int store = -1;
+    for (int j = i - 1, steps = 0; j >= 0 && steps < 64; j--) {
+      if (tgt[(j + 1) >> 3] & (1u << ((j + 1) & 7)))
+        break;
+      IRQuadCompact *p = &ir->compact_instructions[j];
+      if (p->op == TCCIR_OP_NOP)
+        continue;
+      steps++;
+      if (ir_op_has(p->op, stop))
+        break;
+      if (!irop_config[p->op].has_dest)
+        continue;
+      IROperand d = tcc_ir_op_get_dest(ir, p);
+      if (irop_get_vreg(d) != v)
+        continue;
+      /* the last write to V: a whole store at least as wide as the read */
+      int dbt = irop_get_btype(d);
+      if (p->op == TCCIR_OP_STORE && d.tag == IROP_TAG_STACKOFF && d.is_lval && d.is_local && !d.is_llocal &&
+          !d.is_complex && irop_get_stack_offset(d) == irop_get_stack_offset(src1) &&
+          (dbt == bt || dbt == IROP_BTYPE_INT32 || (dbt == IROP_BTYPE_INT16 && bt == IROP_BTYPE_INT8)))
+        store = j;
+      break;
+    }
+    if (store < 0)
+      continue;
+    IROperand x = tcc_ir_op_get_src1(ir, &ir->compact_instructions[store]);
+    int32_t xv = irop_get_vreg(x);
+    if (x.tag != IROP_TAG_VREG || x.is_lval || x.is_llocal || x.is_local || irop_is_64bit(x) || xv < 0 ||
+        TCCIR_DECODE_VREG_TYPE(xv) != TCCIR_VREG_TYPE_TEMP)
+      continue;
+    /* X still holds the stored value at the load */
+    int redef = 0;
+    for (int k = store + 1; k < i && !redef; k++) {
+      IRQuadCompact *p = &ir->compact_instructions[k];
+      redef = p->op != TCCIR_OP_NOP && irop_config[p->op].has_dest && tcc_ir_op_dest_vreg(ir, p) == xv;
+    }
+    if (!redef && sstore_narrow_reload(ctx, i, q, xv, src1))
+      changes++;
+  }
+  return changes;
+}
+
 typedef struct GLoadWork {
   int block;
   GLoadState *state;
@@ -843,7 +1145,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
   int sp = 0, cap = 8;
   {
     GLoadState *seed = tcc_malloc(sizeof *seed);
-    *seed = *st_init;
+    gload_state_copy(seed, st_init);
     work[sp].block = b_init;
     work[sp].state = seed;
     sp++;
@@ -877,10 +1179,10 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
     if (q->op == TCCIR_OP_NOP)
       continue;
 
-    /* calls/BLOCK_COPY/INLINE_ASM/POSTINC touch unmodelled memory: kill all state */
-    if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL ||
-        q->op == TCCIR_OP_BLOCK_COPY || q->op == TCCIR_OP_INLINE_ASM ||
-        q->op == TCCIR_OP_STORE_POSTINC || q->op == TCCIR_OP_LOAD_POSTINC) {
+    /* calls (__builtin_apply too), setjmp/longjmp, BLOCK_COPY, INLINE_ASM and
+     * POSTINC touch unmodelled memory: kill all state */
+    if (ir_op_has(q->op, IR_HZ_CALL | IR_HZ_NONLOCAL | IR_HZ_UPDATES_SRC) ||
+        q->op == TCCIR_OP_BLOCK_COPY || q->op == TCCIR_OP_INLINE_ASM) {
       st->count = 0;
       st->scount = 0;
       st->gscount = 0;
@@ -903,7 +1205,11 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         q->op != TCCIR_OP_VLA_ALLOC) {
       int rewrites = 0;
       for (int side = 0; side < 2; side++) {
-        IROperand op = side == 0 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        IROperand op = tcc_ir_op_get_src1_or_2(ir, q, side != 0);
+        /* a volatile operand is a read that must happen: never forwarded into,
+         * whichever of the three kinds below it is */
+        if (op.is_lval && tcc_ir_access_is_volatile(ir, op))
+          continue;
         /* global-deref ALU operand (bitfield RMW fused form): forward a tracked store/load */
         if (op.is_lval && op.is_sym && !op.is_llocal && !op.is_local) {
           IRPoolSymref *ref = irop_get_symref_ex(ir, op);
@@ -925,7 +1231,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
               }
               have_new = 1;
             } else {
-              int fk = gload_find(st, ref->sym, ref->addend, op_btype);
+              int fk = gload_find(st, ref->sym, ref->addend, op_btype, lcse_sx(op));
               if (fk >= 0) {
                 new_op = irop_make_vreg(st->entries[fk].result_vr, op_btype);
                 IRSSAVregInfo *rvi = ssa_opt_vinfo(ctx, st->entries[fk].result_vr);
@@ -954,7 +1260,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
             int op_btype = irop_get_btype(op);
             int sk = sstore_find(st, irop_get_stack_offset(op));
             if (sk >= 0 && st->sstores[sk].btype == op_btype &&
-                st->sstores[sk].base_var == -1) {
+                st->sstores[sk].base_var == -1 && sstore_value_forwardable(&st->sstores[sk])) {
               SStoreEntry *se = &st->sstores[sk];
               IROperand new_op;
               if (se->stored_vr >= 0) {
@@ -1027,7 +1333,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
             co = 0;
           }
           if (cb == pvr || lcse_base_stable(dc, cb)) {
-            int fk = iload_find(st, cb, co, -1, 0, op_btype);
+            int fk = iload_find(st, cb, co, -1, 0, op_btype, lcse_sx(op));
             if (fk >= 0) {
               new_op = irop_make_vreg(st->iloads[fk].result_vr, op_btype);
               IRSSAVregInfo *rvi = ssa_opt_vinfo(ctx, st->iloads[fk].result_vr);
@@ -1086,10 +1392,9 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
             if (q->op == TCCIR_OP_STORE && dest.is_lval) {
               can_check = 1;
             } else if (q->op == TCCIR_OP_STORE_INDEXED) {
-              IROperand idx = tcc_ir_op_get_src2(ir, q);
               IROperand sc = tcc_ir_op_get_scale(ir, q);
-              if (irop_is_immediate(idx) && irop_is_immediate(sc)) {
-                int io = (int)irop_get_imm32(idx) * (1 << irop_get_imm32(sc));
+              if (tcc_ir_op_src2_is_imm(ir, q) && irop_is_immediate(sc)) {
+                int io = (int)tcc_ir_op_src2_imm32(ir, q) * (1 << irop_get_imm32(sc));
                 store_lo = io;
                 store_hi = io + size;
                 can_check = 1;
@@ -1180,11 +1485,10 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
           }
         } else if (q->op == TCCIR_OP_STORE_INDEXED) {
           /* indexed stack write: const index invalidates the exact slot, runtime index drops all stack/iload forwarding (fuzz seed 2657) */
-          IROperand idx = tcc_ir_op_get_src2(ir, q);
           IROperand sc = tcc_ir_op_get_scale(ir, q);
-          if (irop_is_immediate(idx) && irop_is_immediate(sc)) {
+          if (tcc_ir_op_src2_is_imm(ir, q) && irop_is_immediate(sc)) {
             int off = irop_get_stack_offset(dest) +
-                      (int)irop_get_imm32(idx) * (1 << irop_get_imm32(sc));
+                      (int)tcc_ir_op_src2_imm32(ir, q) * (1 << irop_get_imm32(sc));
             sstore_invalidate_overlap(st, off, irop_get_btype(dest));
             sstore_remove_offset(st, off);
             st->ilcount = 0;
@@ -1481,6 +1785,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
       int32_t il_idx = (il_idx_vr < 0) ? irop_get_imm32(idx_idx) : 0;
       int il_scale = irop_get_imm32(idx_sc);
       int il_btype = irop_get_btype(idx_dest);
+      int il_sx = lcse_sx(idx_dest);
 
       /* forward a tracked stack store into a LOAD_INDEXED whose base resolves to LEA(StackLoc[N]) (scale-0 byte-offset form; helper enforces scale==0, const idx) */
       if (!ctx->no_stack_fwd) {
@@ -1489,7 +1794,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         if (eff_off != INT_MIN) {
           int sk = sstore_find(st, eff_off);
           if (sk >= 0 && st->sstores[sk].btype == il_btype &&
-              st->sstores[sk].base_var == load_base) {
+              st->sstores[sk].base_var == load_base && sstore_value_forwardable(&st->sstores[sk])) {
             SStoreEntry *se = &st->sstores[sk];
             IROperand new_src;
             if (se->stored_vr >= 0) {
@@ -1505,7 +1810,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
               ssa_opt_remove_use_instr(bvi, i);
             q->op = TCCIR_OP_ASSIGN;
             tcc_ir_set_src1(ir, i, new_src);
-            tcc_ir_set_src2(ir, i, IROP_NONE);
+            tcc_ir_set_src2_none(ir, i);
             changes++;
             continue;
           }
@@ -1513,7 +1818,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
       }
 
       int found = iload_find_ex(st, il_base_vr, il_base_is_stack, il_base_off,
-                                il_idx, il_idx_vr, il_scale, il_btype);
+                                il_idx, il_idx_vr, il_scale, il_btype, il_sx);
       if (found >= 0) {
         int32_t earlier_vr = st->iloads[found].result_vr;
         IROperand new_src = irop_make_vreg(earlier_vr, il_btype);
@@ -1535,14 +1840,14 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         }
         q->op = TCCIR_OP_ASSIGN;
         tcc_ir_set_src1(ir, i, new_src);
-        tcc_ir_set_src2(ir, i, IROP_NONE);
+        tcc_ir_set_src2_none(ir, i);
         iload_track_ex(st, il_base_vr, il_base_is_stack, il_base_off, il_idx,
-                       il_idx_vr, il_scale, il_btype, il_dest_vr);
+                       il_idx_vr, il_scale, il_btype, il_sx, il_dest_vr);
         changes++;
         continue;
       }
       iload_track_ex(st, il_base_vr, il_base_is_stack, il_base_off, il_idx,
-                     il_idx_vr, il_scale, il_btype, il_dest_vr);
+                     il_idx_vr, il_scale, il_btype, il_sx, il_dest_vr);
       continue;
     }
 
@@ -1555,14 +1860,18 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         !(src1.is_lval && !src1.is_sym && !src1.is_local && !src1.is_llocal &&
           src1.tag == IROP_TAG_VREG))
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t dest_vr = irop_get_vreg(dest);
+    int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
     if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
-    if (dest.is_lval)
+    if (tcc_ir_op_dest_is_lval(ir, q))
       continue;
-    int dest_btype = irop_get_btype(dest);
+    int dest_btype = tcc_ir_op_dest_btype(ir, q);
     if (q->op == TCCIR_OP_ASSIGN && irop_get_btype(src1) != dest_btype)
+      continue;
+    /* Key every lookup below on what is READ (lcse_sx), not on the dest. */
+    int acc_btype = irop_get_btype(src1);
+    int acc_sx = lcse_sx(src1);
+    if (acc_btype != dest_btype && (lcse_btype_wide(acc_btype) || lcse_btype_wide(dest_btype)))
       continue;
 
     /* A volatile read has to happen every time: no store-forwarding into it,
@@ -1575,7 +1884,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         src1.tag == IROP_TAG_VREG) {
       int32_t ptr_vr_l = irop_get_vreg(src1);
       if (ptr_vr_l >= 0 && TCCIR_DECODE_VREG_TYPE(ptr_vr_l) == TCCIR_VREG_TYPE_TEMP) {
-        int tk = tvstore_find(st, ptr_vr_l, dest_btype);
+        int tk = tvstore_find(st, ptr_vr_l, acc_btype);
         if (tk >= 0) {
           TVStoreEntry *te = &st->tvstores[tk];
           IROperand new_src;
@@ -1589,7 +1898,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
           }
           q->op = TCCIR_OP_ASSIGN;
           tcc_ir_set_src1(ir, i, new_src);
-          tcc_ir_set_src2(ir, i, IROP_NONE);
+          tcc_ir_set_src2_none(ir, i);
           IRSSAVregInfo *pvi = ssa_opt_vinfo(ctx, ptr_vr_l);
           if (pvi)
             ssa_opt_remove_use_instr(pvi, i);
@@ -1613,7 +1922,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         }
         /* base stability: TEMP single-def; VAR/PARAM need <=1 textual def; zero-hop form reads the current value */
         if (canon_base == ptr_vr || lcse_base_stable(dc, canon_base)) {
-          int found = iload_find(st, canon_base, canon_off, -1, 0, dest_btype);
+          int found = iload_find(st, canon_base, canon_off, -1, 0, acc_btype, acc_sx);
           if (found >= 0) {
             int32_t earlier_vr = st->iloads[found].result_vr;
             IROperand new_src = irop_make_vreg(earlier_vr, dest_btype);
@@ -1625,12 +1934,12 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
               ssa_opt_remove_use_instr(pvi, i);
             q->op = TCCIR_OP_ASSIGN;
             tcc_ir_set_src1(ir, i, new_src);
-            tcc_ir_set_src2(ir, i, IROP_NONE);
-            iload_track(st, canon_base, canon_off, -1, 0, dest_btype, dest_vr);
+            tcc_ir_set_src2_none(ir, i);
+            iload_track(st, canon_base, canon_off, -1, 0, acc_btype, acc_sx, dest_vr);
             changes++;
             continue;
           }
-          iload_track(st, canon_base, canon_off, -1, 0, dest_btype, dest_vr);
+          iload_track(st, canon_base, canon_off, -1, 0, acc_btype, acc_sx, dest_vr);
         }
       }
     }
@@ -1640,11 +1949,16 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
       int stack_off = INT_MIN;
       int32_t load_base = -1;
 
-      /* direct StackLoc load; skip a VAR-vreg operand whose offset may alias an unrelated StackLoc */
+      /* direct StackLoc load.  A VAR-vreg operand names a local by its VAR
+       * and a placeholder offset, keyed as its stores are (base_var). */
       if (src1.tag == IROP_TAG_STACKOFF) {
         int32_t svr = irop_get_vreg(src1);
         if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
           stack_off = irop_get_stack_offset(src1);
+        else if (src1.is_local && !src1.is_llocal && q->op == TCCIR_OP_LOAD && vslot_var_forwardable(ir, svr)) {
+          stack_off = irop_get_stack_offset(src1);
+          load_base = svr;
+        }
       }
 
 
@@ -1657,11 +1971,21 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
         int sk = sstore_find(st, stack_off);
         if (sk >= 0) {
           SStoreEntry *se = &st->sstores[sk];
-          if (se->btype != dest_btype)
-            continue;
           /* `&VAR` offset is a shared placeholder: the canonical base must match (ptr fuzz seed 67) */
           if (se->base_var != load_base)
             continue;
+          if (se->btype != acc_btype) {
+            /* a word store read back as its low byte or halfword */
+            if (q->op == TCCIR_OP_LOAD && se->btype == IROP_BTYPE_INT32 && se->stored_vr >= 0 &&
+                sstore_narrow_reload(ctx, i, q, se->stored_vr, src1))
+              changes++;
+            continue;
+          }
+          if (!sstore_value_forwardable(se)) {
+            if (q->op == TCCIR_OP_LOAD && sstore_narrow_reload(ctx, i, q, se->stored_vr, src1))
+              changes++;
+            continue;
+          }
           IROperand new_src;
           if (se->stored_vr >= 0) {
             new_src = irop_make_vreg(se->stored_vr, dest_btype);
@@ -1677,7 +2001,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
             ssa_opt_remove_use_instr(pvi, i);
           q->op = TCCIR_OP_ASSIGN;
           tcc_ir_set_src1(ir, i, new_src);
-          tcc_ir_set_src2(ir, i, IROP_NONE);
+          tcc_ir_set_src2_none(ir, i);
           changes++;
           continue;
         }
@@ -1697,7 +2021,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
       continue;
 
     /* prefer a tracked store over an earlier load: eliminates the LOAD and an immediate folds further */
-    int gstore_k = gstore_find(st, ref->sym, ref->addend, dest_btype);
+    int gstore_k = gstore_find(st, ref->sym, ref->addend, acc_btype);
     if (gstore_k >= 0) {
       GStoreEntry *ge = &st->gstores[gstore_k];
       IROperand new_src;
@@ -1711,13 +2035,13 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
       }
       q->op = TCCIR_OP_ASSIGN;
       tcc_ir_set_src1(ir, i, new_src);
-      tcc_ir_set_src2(ir, i, IROP_NONE);
-      gload_track(st, ref->sym, ref->addend, dest_btype, dest_vr);
+      tcc_ir_set_src2_none(ir, i);
+      gload_track(st, ref->sym, ref->addend, acc_btype, acc_sx, dest_vr);
       changes++;
       continue;
     }
 
-    int found = gload_find(st, ref->sym, ref->addend, dest_btype);
+    int found = gload_find(st, ref->sym, ref->addend, acc_btype, acc_sx);
 
     if (found >= 0) {
       int32_t earlier_vr = st->entries[found].result_vr;
@@ -1729,10 +2053,10 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
 
       q->op = TCCIR_OP_ASSIGN;
       tcc_ir_set_src1(ir, i, new_src);
-      tcc_ir_set_src2(ir, i, IROP_NONE);
+      tcc_ir_set_src2_none(ir, i);
       changes++;
     } else {
-      gload_track(st, ref->sym, ref->addend, dest_btype, dest_vr);
+      gload_track(st, ref->sym, ref->addend, acc_btype, acc_sx, dest_vr);
     }
   }
 
@@ -1750,7 +2074,7 @@ static int gload_process_block(IRSSAOptCtx *ctx, const LcseDefCounts *dc,
       work = tcc_realloc(work, sizeof *work * cap);
     }
     GLoadState *snap = tcc_malloc(sizeof *snap);
-    *snap = *st;
+    gload_state_copy(snap, st);
     work[sp].block = bb->dom_children[ci];
     work[sp].state = snap;
     sp++;
@@ -1789,6 +2113,7 @@ int ssa_opt_load_cse(IRSSAOptCtx *ctx)
   uint8_t *reachable = ssa_opt_compute_reachable_blocks(ctx);
   int var_fwd = !tcc_ir_opt_pass_disabled("ssa:load_cse:var_fwd");
   int changes = gload_process_block(ctx, &dc, reachable, &initial, 0, var_fwd);
+  changes += lcse_linear_narrow_reloads(ctx);
   tcc_free(reachable);
   tcc_free(dc.var_defs);
   tcc_free(dc.param_defs);

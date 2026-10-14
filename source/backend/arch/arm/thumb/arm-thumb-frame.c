@@ -192,7 +192,7 @@ static void prologue_load_stack_param(int lo, int hi, int off)
   ot_check(th_ldr_imm(lo, lo, 0, 6, ENFORCE_ENCODING_NONE));
 }
 
-/* Whether the last prologue saved LR: the body may then BL. */
+/* Whether the last prologue saved LR and left it free: the body may then BL. */
 static int prolog_saved_lr;
 ST_FUNC int tcc_gen_machine_prolog_saved_lr(void)
 {
@@ -207,12 +207,14 @@ ST_FUNC void tcc_gen_machine_outline_window_open(void)
   frame_word_last.kind = 0;
 }
 
-/* The window's ops are done, and `bytes` of them were recorded, not emitted:
- * the BL to the shared body replaces them. */
+/* The recorded window is replaced by a BL to its shared body. */
 ST_FUNC void tcc_gen_machine_outline_window_closed(int bytes)
 {
   thumb_gen_state.code_size -= bytes;
   frame_word_last.kind = 0;
+  /* Rewinding ind can alias a spill reload's virtual position inside the window. */
+  if (tcc_state->ir)
+    tcc_state->ir->spill_cache.last_emit_kind = 0;
 }
 
 /* The BL to a shared body.  Not through ot(): the caches saw the window's own
@@ -246,6 +248,9 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
 
   thumb_gen_state.generating_function = 1;
   thumb_gen_state.code_size = 0;
+  th_last_insn.end = -1; /* no instruction of this function to widen yet */
+  th_widened_reset();
+  th_func_code_start = ind;
   /* Clear global symbol cache at function start */
   thumb_gen_state.cached_global_sym = NULL;
   thumb_gen_state.cached_global_reg = PREG_NONE;
@@ -259,7 +264,9 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
   int save_lr = !leaffunc || tcc_state->force_lr_save;
   if (extra_prologue_regs & (1u << R_LR))
     save_lr = 1;
-  prolog_saved_lr = save_lr;
+  /* The body may BL only while LR is free: a function whose allocator handed
+   * LR out as a register has live values in it across every outlined window. */
+  prolog_saved_lr = save_lr && !(((extra_prologue_regs | used_registers) >> R_LR) & 1u);
 
   /* Variadic functions need a stable FP for va_list setup. */
   if (func_var)
@@ -273,7 +280,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    * allocated means the prediction missed a forcing condition, and silently
    * continuing would use one register as frame base and value at once. */
   if (need_fp && (used_registers & (1ULL << R_FP)))
-    tcc_error("compiler_error: R7 allocated in a frame-pointer function "
+    tcc_ice("R7 allocated in a frame-pointer function "
               "(ra_may_need_frame_pointer out of sync with a forcing site)");
 
   /* Collect callee-saved registers */
@@ -469,13 +476,15 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
    */
   if (func_var)
   {
-    /* Store r0-r3 at frame offsets -16..-4 for named parameter access.
-     * (The contiguous PUSH'd copy is at FP+offset_to_args-16..FP+offset_to_args-4
-     * and is used by va_arg for anonymous argument traversal.) */
-    tcc_gen_machine_store_to_stack_ex(R0, fp_adjust_local_offset(-16, 0), prologue_incoming_mask);
-    tcc_gen_machine_store_to_stack_ex(R1, fp_adjust_local_offset(-12, 0), prologue_incoming_mask);
-    tcc_gen_machine_store_to_stack_ex(R2, fp_adjust_local_offset(-8, 0), prologue_incoming_mask);
-    tcc_gen_machine_store_to_stack_ex(R3, fp_adjust_local_offset(-4, 0), prologue_incoming_mask);
+    /* Store r0-r3 at frame offsets -16..-4 (-20..-8 beside a static chain)
+     * for named parameter access.  (The contiguous PUSH'd copy is at
+     * FP+offset_to_args-16..FP+offset_to_args-4 and is used by va_arg for
+     * anonymous argument traversal.) */
+    const int save = tcc_ir_variadic_reg_save_base(ir);
+    tcc_gen_machine_store_to_stack_ex(R0, fp_adjust_local_offset(save, 0), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R1, fp_adjust_local_offset(save + 4, 0), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R2, fp_adjust_local_offset(save + 8, 0), prologue_incoming_mask);
+    tcc_gen_machine_store_to_stack_ex(R3, fp_adjust_local_offset(save + 12, 0), prologue_incoming_mask);
 
     /* The frame-metadata triple that used to live at FP-20/-24/-28 (__gr_top,
      * named_arg_reg_bytes, named_arg_stack_bytes) is gone: it existed purely so
@@ -682,8 +691,12 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
        * VFP-resident — there is no double-precision arithmetic here — so unpack
        * d<n> into the GPR pair the allocator gave it.  Emitted before the GPR
        * parallel move, whose sources are all still live. */
-      if (is_64bit && is_vfp_reg(incoming_r0) && alloc_r0 != PREG_NONE && alloc_r0 >= 0 && alloc_r1 >= 0)
+      if (is_64bit && is_vfp_reg(incoming_r0))
       {
+        /* IRVregReplacement.r0/r1 are uint16_t: "no register" (dead parameter)
+         * is 0xFFFF, not a negative int.  Nothing to unpack into then. */
+        if (alloc_r0 > R12 || alloc_r1 > R12)
+          continue;
         /* Deferred: the unpack writes GPRs that may still hold incoming GPR
          * arguments (a leading int parameter sits in r0, and d0 commonly unpacks
          * into r0:r1), so it must run only after the GPR parallel move below has
@@ -802,7 +815,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
       }
       if (dst_mask & (1u << temp))
       {
-        tcc_error("compiler_error: prolog param shuffle has no temp register");
+        tcc_ice("prolog param shuffle has no temp register");
       }
 
       /* Pick any destination in the remaining cycle, save its original value,
@@ -825,7 +838,7 @@ ST_FUNC void tcc_gen_machine_prolog(int leaffunc, uint64_t used_registers, int s
         }
         if (idx < 0)
         {
-          tcc_error("compiler_error: broken prolog param shuffle cycle");
+          tcc_ice("broken prolog param shuffle cycle");
         }
 
         const int src = moves[idx].src;
@@ -1266,7 +1279,9 @@ void load_immediate(int reg, uint32_t imm, Sym *sym, int update_flags)
     return;
 
   /* Try to encode as ARM immediate (supports various rotated 8-bit patterns) */
-  if (!ot(th_generic_mov_imm(reg, imm)))
+  if (cacheable && load_constant_from_holding_reg(reg, key))
+    ;
+  else if (!ot(th_generic_mov_imm(reg, imm)))
   {
     /* Value doesn't fit in immediate encoding, use literal pool */
     load_full_const(reg, PREG_NONE, imm, 0);

@@ -18,6 +18,7 @@
 #include "opt_utils.h"
 #include "opt_du.h"
 #include "opt_loop_utils.h"
+#include "opt_range.h"
 #include "cfg.h"
 #include "licm.h"
 
@@ -29,6 +30,143 @@ static void mark_var_escaped(uint8_t *m, int v)
 static int var_is_escaped(const uint8_t *m, int v)
 {
   return m[v / 8] & (1 << (v % 8));
+}
+
+/* Which local's address a TEMP or VAR vreg may hold (pt, -1 = none), and
+ * whether every def of it gives exactly that address (inexact = 0). */
+typedef struct DtaPtrs
+{
+  int *tmp_pt, *var_pt;
+  uint8_t *tmp_inexact, *var_inexact;
+  int max_tmp, max_var;
+} DtaPtrs;
+
+/* Slot index for vreg vr, or NULL when it is not a TEMP/VAR in range. */
+static int *dta_pt(DtaPtrs *P, int32_t vr, uint8_t **inexact)
+{
+  if (vr < 0)
+    return NULL;
+  int t = TCCIR_DECODE_VREG_TYPE(vr);
+  int p = TCCIR_DECODE_VREG_POSITION(vr);
+  if (t == TCCIR_VREG_TYPE_TEMP && p <= P->max_tmp)
+  {
+    *inexact = &P->tmp_inexact[p];
+    return &P->tmp_pt[p];
+  }
+  if (t == TCCIR_VREG_TYPE_VAR && p <= P->max_var)
+  {
+    *inexact = &P->var_inexact[p];
+    return &P->var_pt[p];
+  }
+  return NULL;
+}
+
+static int dta_target(DtaPtrs *P, int32_t vr)
+{
+  uint8_t *ix;
+  int *pt = dta_pt(P, vr, &ix);
+  return pt ? *pt : -1;
+}
+
+static int dta_exact(DtaPtrs *P, int32_t vr)
+{
+  uint8_t *ix;
+  int *pt = dta_pt(P, vr, &ix);
+  return pt && *pt >= 0 && !*ix;
+}
+
+/* A STORE-family DEST names memory (a TEMP base, or any lval); a VAR DEST
+ * of a plain STORE without lval is that VAR's own def. */
+static int dta_dest_is_mem(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  if (d.is_lval)
+    return 1;
+  if (q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_STORE_POSTINC)
+    return 1;
+  int32_t vr = irop_get_vreg(d);
+  return q->op == TCCIR_OP_STORE && vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP;
+}
+
+/* `D <- S` that copies a pointer value from vreg S into vreg D. */
+static int dta_is_copy(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_LOAD && q->op != TCCIR_OP_STORE)
+    return 0;
+  if (dta_dest_is_mem(ir, q) || tcc_ir_op_src1_is_lval(ir, q))
+    return 0;
+  int32_t d = tcc_ir_op_dest_vreg(ir, q);
+  if (d < 0)
+    return 0;
+  int t = TCCIR_DECODE_VREG_TYPE(d);
+  return t == TCCIR_VREG_TYPE_TEMP || t == TCCIR_VREG_TYPE_VAR;
+}
+
+/* One sweep of the points-to facts; returns whether anything changed. */
+static int dta_propagate(TCCIRState *ir, int n, DtaPtrs *P, uint8_t *var_escaped)
+{
+  int changed = 0;
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP)
+      continue;
+    if (ir_op_has(q->op, IR_HZ_UPDATES_SRC))
+    {
+      /* POSTINC advances its pointer operand: one more def of it. */
+      IROperand ops[3] = {tcc_ir_op_get_dest(ir, q), tcc_ir_op_get_src1(ir, q), tcc_ir_op_get_src2(ir, q)};
+      for (int k = 0; k < 3; k++)
+      {
+        uint8_t *ix;
+        if (dta_pt(P, irop_get_vreg(ops[k]), &ix) && !*ix)
+          changed = *ix = 1;
+      }
+    }
+    if (!irop_config[q->op].has_dest || dta_dest_is_mem(ir, q))
+      continue;
+    uint8_t *d_ix;
+    int *d_pt = dta_pt(P, tcc_ir_op_dest_vreg(ir, q), &d_ix);
+    if (!d_pt)
+      continue;
+    int target = -1, exact = 0;
+    if (q->op == TCCIR_OP_LEA)
+    {
+      IROperand s = tcc_ir_op_get_src1(ir, q);
+      int32_t s_vr = irop_get_vreg(s);
+      if (!s.is_lval && s_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_VAR &&
+          TCCIR_DECODE_VREG_POSITION(s_vr) <= P->max_var)
+      {
+        target = TCCIR_DECODE_VREG_POSITION(s_vr);
+        exact = 1;
+      }
+    }
+    else if (dta_is_copy(ir, q))
+    {
+      int32_t s_vr = tcc_ir_op_src1_vreg(ir, q);
+      target = dta_target(P, s_vr);
+      exact = dta_exact(P, s_vr);
+    }
+    if (target < 0)
+    {
+      /* Some other def: whatever address it may also hold, it is not only that. */
+      if (!*d_ix)
+        changed = *d_ix = 1;
+      continue;
+    }
+    if (*d_pt < 0)
+    {
+      *d_pt = target;
+      changed = 1;
+    }
+    else if (*d_pt != target)
+    {
+      mark_var_escaped(var_escaped, *d_pt);
+      mark_var_escaped(var_escaped, target);
+    }
+    if (!exact && !*d_ix)
+      changed = *d_ix = 1;
+  }
+  return changed;
 }
 
 int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
@@ -54,8 +192,7 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int target = (int)irop_get_imm64_ex(ir, dest);
+    int target = (int)tcc_ir_op_dest_imm(ir, q);
     if (target <= i)
       return 0;
   }
@@ -84,202 +221,129 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
   if (max_var == 0)
     return 0;
 
-  int *lea_map = tcc_malloc(sizeof(int) * (max_tmp + 1));
-  for (int i = 0; i <= max_tmp; i++) lea_map[i] = -1;
-  int *var_lea = tcc_malloc(sizeof(int) * (max_var + 1));
-  for (int i = 0; i <= max_var; i++) var_lea[i] = -1;
+  DtaPtrs P;
+  P.max_tmp = max_tmp;
+  P.max_var = max_var;
+  P.tmp_pt = tcc_malloc(sizeof(int) * (max_tmp + 1));
+  for (int i = 0; i <= max_tmp; i++) P.tmp_pt[i] = -1;
+  P.var_pt = tcc_malloc(sizeof(int) * (max_var + 1));
+  for (int i = 0; i <= max_var; i++) P.var_pt[i] = -1;
+  P.tmp_inexact = tcc_mallocz(max_tmp + 1);
+  P.var_inexact = tcc_mallocz(max_var + 1);
   uint8_t *var_escaped = tcc_mallocz((max_var + 8) / 8);
   int *var_last_read = tcc_malloc(sizeof(int) * (max_var + 1));
   for (int i = 0; i <= max_var; i++) var_last_read[i] = -1;
 
-  /* Pass 1: build lea_map (T=&V) and var_lea (V'=&V), propagate through TEMP<->VAR copies. */
+  /* Pass 1: which vregs may hold &V -- from a LEA, through any chain of
+   * register copies -- and which hold nothing else.  Facts only grow. */
+  while (dta_propagate(ir, n, &P, var_escaped))
+    ;
+
+  /* Pass 2: deny by default.  A vreg that may hold &V is used only as a
+   * deref base (a read or a write of V) or as the source of a pass-1 copy;
+   * any other use (arithmetic, select, an indexed/postinc base, a stored or
+   * returned value) lets &V go where this pass cannot follow, so V escapes,
+   * and so does a volatile V: every write to it is an access that stays.
+   * Pass 3: var_last_read[V] from direct reads of V and derefs of &V. */
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
+    int plain_mem = q->op != TCCIR_OP_LOAD_INDEXED && q->op != TCCIR_OP_STORE_INDEXED &&
+                    !ir_op_has(q->op, IR_HZ_UPDATES_SRC);
+    int copy = dta_is_copy(ir, q);
 
-    if (q->op == TCCIR_OP_LEA)
+    for (int k = 0; k < 4; k++)
     {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t s_vr = irop_get_vreg(src1);
-      int32_t d_vr = irop_get_vreg(dest);
-      if (s_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_VAR && d_vr >= 0)
+      IROperand s;
+      if (k == 0)
       {
-        int v = TCCIR_DECODE_VREG_POSITION(s_vr);
-        if (v <= max_var)
-        {
-          if (TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP)
-          {
-            int t = TCCIR_DECODE_VREG_POSITION(d_vr);
-            if (t <= max_tmp)
-            {
-              if (lea_map[t] >= 0 && lea_map[t] != v)
-                mark_var_escaped(var_escaped, v);
-              lea_map[t] = v;
-            }
-          }
-          else if (TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR)
-          {
-            int d_pos = TCCIR_DECODE_VREG_POSITION(d_vr);
-            if (d_pos <= max_var)
-            {
-              if (var_lea[d_pos] >= 0 && var_lea[d_pos] != v)
-                mark_var_escaped(var_escaped, v);
-              var_lea[d_pos] = v;
-            }
-          }
-        }
+        if (!irop_config[q->op].has_dest)
+          continue;
+        s = tcc_ir_op_get_dest(ir, q);
       }
-      continue;
-    }
-
-    /* STORE V=T where T holds a LEA result -> propagate lea_map to var_lea. */
-    if (q->op == TCCIR_OP_STORE)
-    {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      int32_t d_vr = irop_get_vreg(dest);
-      int32_t s_vr = irop_get_vreg(src1);
-      if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR &&
-          s_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_TEMP)
+      else if (k == 1 || k == 2)
       {
-        int d_pos = TCCIR_DECODE_VREG_POSITION(d_vr);
-        int s_tmp = TCCIR_DECODE_VREG_POSITION(s_vr);
-        if (d_pos <= max_var && s_tmp <= max_tmp && lea_map[s_tmp] >= 0)
-        {
-          if (var_lea[d_pos] >= 0 && var_lea[d_pos] != lea_map[s_tmp])
-            mark_var_escaped(var_escaped, lea_map[s_tmp]);
-          var_lea[d_pos] = lea_map[s_tmp];
-        }
+        if (!(k == 1 ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2))
+          continue;
+        s = tcc_ir_op_get_src1_or_2(ir, q, k == 2);
       }
-    }
-
-    /* ASSIGN/LOAD T=V where V holds a LEA result -> propagate var_lea to lea_map. */
-    if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD)
-    {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      int32_t d_vr = irop_get_vreg(dest);
-      int32_t s_vr = irop_get_vreg(src1);
-      if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP &&
-          s_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_VAR)
+      else
       {
-        int d_tmp = TCCIR_DECODE_VREG_POSITION(d_vr);
-        int s_pos = TCCIR_DECODE_VREG_POSITION(s_vr);
-        if (d_tmp <= max_tmp && s_pos <= max_var && var_lea[s_pos] >= 0)
-        {
-          if (lea_map[d_tmp] >= 0 && lea_map[d_tmp] != var_lea[s_pos])
-            mark_var_escaped(var_escaped, var_lea[s_pos]);
-          lea_map[d_tmp] = var_lea[s_pos];
-        }
+        if (!ir_op_has(q->op, IROP_A_SLOT3))
+          continue;
+        s = ir->iroperand_pool[q->operand_base + 3];
       }
-    }
-  }
-
-  /* Pass 2: scan LEA-TEMP uses for untracked escapes. */
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-
-    /* STORE src1=T (value, non-lval) where T is a LEA temp -> pointer escapes. */
-    if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
-         q->op == TCCIR_OP_STORE_POSTINC) && irop_config[q->op].has_src1)
-    {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      if (!src1.is_lval)
-      {
-        int32_t vr = irop_get_vreg(src1);
-        if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
-        {
-          int t = TCCIR_DECODE_VREG_POSITION(vr);
-          if (t <= max_tmp && lea_map[t] >= 0)
-            mark_var_escaped(var_escaped, lea_map[t]);
-        }
-      }
-    }
-    /* RETURNVALUE of a LEA temp -> pointer to local escapes. */
-    if (q->op == TCCIR_OP_RETURNVALUE)
-    {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(src1);
-      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
-      {
-        int t = TCCIR_DECODE_VREG_POSITION(vr);
-        if (t <= max_tmp && lea_map[t] >= 0)
-          mark_var_escaped(var_escaped, lea_map[t]);
-      }
-    }
-  }
-
-  /* Pass 3: record var_last_read[V] from direct VAR reads and LEA-TEMP derefs. */
-  for (int i = 0; i < n; i++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-
-    for (int k = 0; k < 2; k++)
-    {
-      int has = (k == 0) ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
-      if (!has)
-        continue;
-      IROperand s = (k == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
       int32_t vr = irop_get_vreg(s);
       if (vr < 0)
         continue;
       int vt = TCCIR_DECODE_VREG_TYPE(vr);
       int vp = TCCIR_DECODE_VREG_POSITION(vr);
-      if (vt == TCCIR_VREG_TYPE_VAR && vp <= max_var)
+
+      if (vt == TCCIR_VREG_TYPE_VAR && vp <= max_var && tcc_ir_operand_names_volatile_var(ir, s))
+        mark_var_escaped(var_escaped, vp);
+
+      /* Direct VAR read: even STORE src1 of `STORE dest <- V` reads V, and
+       * a VAR the DEST stores through is read for its address. */
+      if (vt == TCCIR_VREG_TYPE_VAR && vp <= max_var && (k != 0 || dta_dest_is_mem(ir, q)) &&
+          i > var_last_read[vp])
+        var_last_read[vp] = i;
+
+      int v = dta_target(&P, vr);
+      if (v < 0)
+        continue;
+      if (k == 0)
       {
-        /* Direct VAR read: even STORE src1 of `STORE dest <- V` reads V. */
-        if (i > var_last_read[vp])
-          var_last_read[vp] = i;
+        if (!dta_dest_is_mem(ir, q))
+          continue; /* a def of the pointer vreg itself */
+        if (!plain_mem)
+          mark_var_escaped(var_escaped, v);
+        continue; /* a write through it: pass 4 decides */
       }
-      else if (vt == TCCIR_VREG_TYPE_TEMP && vp <= max_tmp && lea_map[vp] >= 0 && s.is_lval)
+      if (s.is_lval && plain_mem)
       {
-        /* lval deref of LEA TEMP -> read of V's memory. */
-        int v = lea_map[vp];
-        if (v <= max_var && i > var_last_read[v])
+        if (i > var_last_read[v])
           var_last_read[v] = i;
+        continue;
       }
+      if (k == 1 && copy)
+        continue;
+      mark_var_escaped(var_escaped, v);
     }
   }
 
-  /* Pass 4: NOP writes to V after last_read[V] (direct, or via a LEA TEMP). */
+  /* Pass 4: NOP writes to V after last_read[V] (direct, or via exactly &V). */
   int changes = 0;
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
+    /* The write is dead, not what it reads or writes: `x = *r` with r
+     * volatile keeps its load, `*(volatile int *)&x = v` its store. */
+    if (ir_q_hazards(ir, q, IR_HZ_VOLATILE))
+      continue;
 
     int written_var = -1;
     if (irop_config[q->op].has_dest)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t vr = irop_get_vreg(dest);
-      if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR && !dest.is_lval)
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
+      if (!dta_dest_is_mem(ir, q))
       {
         /* Direct write: conservative, only side-effect-free ASSIGN/STORE shapes. */
-        if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_STORE ||
-            q->op == TCCIR_OP_STORE_INDEXED || q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ADD ||
-            q->op == TCCIR_OP_SUB || q->op == TCCIR_OP_AND || q->op == TCCIR_OP_OR ||
-            q->op == TCCIR_OP_XOR || q->op == TCCIR_OP_MUL || q->op == TCCIR_OP_SHL ||
-            q->op == TCCIR_OP_SHR || q->op == TCCIR_OP_SAR || q->op == TCCIR_OP_ZEXT)
+        if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR &&
+            (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_STORE ||
+             q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ADD ||
+             q->op == TCCIR_OP_SUB || q->op == TCCIR_OP_AND || q->op == TCCIR_OP_OR ||
+             q->op == TCCIR_OP_XOR || q->op == TCCIR_OP_MUL || q->op == TCCIR_OP_SHL ||
+             q->op == TCCIR_OP_SHR || q->op == TCCIR_OP_SAR || q->op == TCCIR_OP_ZEXT))
           written_var = TCCIR_DECODE_VREG_POSITION(vr);
       }
-      else if ((q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
-                q->op == TCCIR_OP_STORE_POSTINC) &&
-               vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+      else if (q->op == TCCIR_OP_STORE && dta_exact(&P, vr))
       {
-        /* STORE/INDEXED/POSTINC imply a memory write regardless of is_lval. */
-        int t = TCCIR_DECODE_VREG_POSITION(vr);
-        if (t <= max_tmp && lea_map[t] >= 0)
-          written_var = lea_map[t];
+        /* A plain store through a vreg that holds exactly &V. */
+        written_var = dta_target(&P, vr);
       }
     }
 
@@ -301,12 +365,9 @@ int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir)
 
   tcc_free(var_last_read);
   tcc_free(var_escaped);
-  tcc_free(var_lea);
-  tcc_free(lea_map);
+  tcc_free(P.var_inexact);
+  tcc_free(P.tmp_inexact);
+  tcc_free(P.var_pt);
+  tcc_free(P.tmp_pt);
   return changes;
-}
-
-int tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_dead_trailing_addrvar_store_elim(ctx->ir);
 }

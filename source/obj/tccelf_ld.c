@@ -637,7 +637,7 @@ ST_FUNC int tcc_load_linker_script(TCCState *s1, const char *filename)
   /* Allocate linker script structure if not already done */
   if (!s1->ld_script)
   {
-    s1->ld_script = tcc_mallocz(sizeof(LDScript));
+    s1->ld_script = tcc_malloc(sizeof(LDScript)); /* ld_script_init clears it */
     ld_script_init(s1->ld_script);
   }
 
@@ -677,16 +677,20 @@ void ld_apply_symbols(TCCState *s1, LDScript *ld)
       /* Look up once, reuse for both PROVIDE check and update */
       sym_idx = find_elf_sym(s1->symtab, sym->name);
 
-      /* For PROVIDE symbols, only define if not already defined */
+      /* For PROVIDE symbols, only define if no input defines it.  A
+       * definition this function made on the early pass (before layout) is
+       * the script's own and must take the final address on the late pass;
+       * skipping it left every PROVIDEd symbol at its placeholder value. */
       if (sym->visibility == LD_SYM_PROVIDE || sym->visibility == LD_SYM_PROVIDE_HIDDEN)
       {
-        if (sym_idx)
+        if (sym_idx && !sym->applied)
         {
           ElfW(Sym) *esym = &((ElfW(Sym) *)s1->symtab->data)[sym_idx];
           if (esym->st_shndx != SHN_UNDEF)
             continue; /* Already defined, skip */
         }
       }
+      sym->applied = 1;
 
       /* Update existing symbol, or create new */
       if (sym_idx)
@@ -717,6 +721,37 @@ void ld_apply_symbols(TCCState *s1, LDScript *ld)
       }
     }
   }
+}
+
+/* The memory region (VMA) the linker script places input section `name` in,
+ * or -1; *origin gets the region's start. */
+int ld_section_memory_region(TCCState *s1, const char *name, addr_t *origin)
+{
+  LDScript *ld = s1->ld_script;
+  int pat = -1, os, mr;
+  if (!ld)
+    return -1;
+  os = ld_find_output_section_idx(s1, name, &pat);
+  if (os < 0 || os >= ld->nb_output_sections)
+    return -1;
+  mr = ld->output_sections[os].memory_region_idx;
+  if (mr < 0 || mr >= ld->nb_memory_regions)
+    return -1;
+  *origin = ld->memory_regions[mr].origin;
+  return mr;
+}
+
+/* Whether the linker script assigns `name` (plainly or through PROVIDE). */
+int ld_script_defines_symbol(TCCState *s1, const char *name)
+{
+  LDScript *ld = s1->ld_script;
+  int i;
+  if (!ld)
+    return 0;
+  for (i = 0; i < ld->nb_symbols; i++)
+    if (ld->symbols[i].defined && !strcmp(ld->symbols[i].name, name))
+      return 1;
+  return 0;
 }
 
 /* Update linker script symbol values based on actual section layout */
@@ -781,14 +816,18 @@ void ld_update_symbol_values(TCCState *s1, LDScript *ld)
         rodata_end = sec_end;
     }
 
-    /* Map output section names to addresses */
-    for (j = 0; j < ld->nb_output_sections; j++)
+    /* An output section starts at the lowest input section placed in it,
+     * not at the input section sharing its name: `.text` also holds .vectors
+     * and .bootmeta, which come first. */
+    if (s->sh_flags & SHF_ALLOC)
     {
-      if (!strcmp(s->name, ld->output_sections[j].name))
+      int pat_idx = -1;
+      int out = ld_find_output_section_idx(s1, s->name, &pat_idx);
+      if (out >= 0 && out < ld->nb_output_sections &&
+          (!output_section_has_addr[out] || s->sh_addr < output_section_addrs[out]))
       {
-        output_section_addrs[j] = s->sh_addr;
-        output_section_has_addr[j] = 1;
-        break;
+        output_section_addrs[out] = s->sh_addr;
+        output_section_has_addr[out] = 1;
       }
     }
 
@@ -837,6 +876,10 @@ void ld_update_symbol_values(TCCState *s1, LDScript *ld)
              between input sections. Otherwise use the raw content size. */
           if (load_mr < 0 && output_section_vma_end[j] > lma_start)
             lma_cur[mr] = output_section_vma_end[j];
+          else if (load_mr >= 0 && output_section_has_addr[j] && output_section_vma_end[j] > output_section_addrs[j])
+            /* AT>: the image keeps the VMA layout, gaps between input
+               sections included, so it needs the whole span */
+            lma_cur[mr] = lma_start + (output_section_vma_end[j] - output_section_addrs[j]);
           else
             lma_cur[mr] = lma_start + output_section_sizes[j];
         }
@@ -850,7 +893,11 @@ void ld_update_symbol_values(TCCState *s1, LDScript *ld)
 
     /* Save computed LMA values in LDScript for p_paddr fixup */
     for (j = 0; j < ld->nb_output_sections; j++)
+    {
       ld->output_section_loadaddrs[j] = output_section_loadaddrs[j];
+      ld->output_section_vmas[j] = output_section_has_addr[j] ? output_section_addrs[j] : 0;
+      ld->output_section_vma_ends[j] = output_section_vma_end[j];
+    }
     ld->has_loadaddrs = 1;
   }
 
@@ -859,19 +906,24 @@ void ld_update_symbol_values(TCCState *s1, LDScript *ld)
    * assigned to in the linker script. Track per-region end addresses. */
   addr_t mr_end[LD_MAX_MEMORY_REGIONS] = {0};
 
-  /* Initialize memory region end addresses from laid-out sections */
-  for (j = 0; j < ld->nb_output_sections; j++)
+  /* Initialize memory region end addresses from the laid-out sections: the
+   * real end of every allocated section inside the region, including ones
+   * the script does not name (.got lands after .bss).  The script's own
+   * current_offset is a parse-time position that knows nothing of input
+   * sizes, and placed .heap -- and __heap_start__ -- on top of .bss. */
+  for (i = 1; i < s1->nb_sections; i++)
   {
-    if (output_section_has_addr[j])
+    s = s1->sections[i];
+    if (!s->sh_addr || !(s->sh_flags & SHF_ALLOC))
+      continue;
+    for (j = 0; j < ld->nb_memory_regions; j++)
     {
-      int mr = ld->output_sections[j].memory_region_idx;
-      if (mr < 0)
-        mr = 0;
-      if (mr >= 0 && mr < ld->nb_memory_regions)
+      LDMemoryRegion *r = &ld->memory_regions[j];
+      if (s->sh_addr >= r->origin && s->sh_addr < r->origin + r->length)
       {
-        addr_t sec_end_addr = output_section_addrs[j] + ld->output_sections[j].current_offset;
-        if (sec_end_addr > mr_end[mr])
-          mr_end[mr] = sec_end_addr;
+        if (s->sh_addr + s->sh_size > mr_end[j])
+          mr_end[j] = s->sh_addr + s->sh_size;
+        break;
       }
     }
   }
@@ -911,8 +963,30 @@ void ld_update_symbol_values(TCCState *s1, LDScript *ld)
       addr_t section_addr = output_section_addrs[sym->section_idx];
       if (output_section_has_addr[sym->section_idx])
       {
-        /* Symbol value = section base address + offset within section */
-        sym->value = section_addr + sym->section_offset;
+        /* Symbol value = section base address + offset within section.  The
+         * offset was taken at parse time, when input sections had no size:
+         * a symbol after input statements (`KEEP(*(.romfs)) __romfs_end__ =
+         * .;`) is at least past the inputs those statements placed --
+         * otherwise __romfs_end__ equalled __romfs_start__. */
+        addr_t v = section_addr + sym->section_offset;
+        if (sym->patterns_before > 0)
+        {
+          int k;
+          for (k = 1; k < s1->nb_sections; k++)
+          {
+            Section *in = s1->sections[k];
+            int pat = -1;
+            if (!in->sh_addr || !(in->sh_flags & SHF_ALLOC))
+              continue;
+            /* data_offset, not sh_size: layout pads sh_size to the
+             * section alignment, and an end symbol counting the pad made
+             * __init_array_end one (null) entry long. */
+            if (ld_find_output_section_idx(s1, in->name, &pat) == sym->section_idx && pat >= 0 &&
+                pat < sym->patterns_before && in->sh_addr + in->data_offset > v)
+              v = in->sh_addr + in->data_offset;
+          }
+        }
+        sym->value = v;
       }
     }
   }
@@ -921,6 +995,8 @@ void ld_update_symbol_values(TCCState *s1, LDScript *ld)
   for (j = 0; j < ld->nb_symbols; j++)
   {
     LDSymbol *sym = &ld->symbols[j];
+    if (sym->has_loadaddr && sym->loadaddr_section_idx < 0 && sym->loadaddr_name[0])
+      sym->loadaddr_section_idx = ld_script_find_output_section(ld, sym->loadaddr_name);
     if (sym->has_loadaddr && sym->loadaddr_section_idx >= 0 && sym->loadaddr_section_idx < ld->nb_output_sections)
     {
       addr_t lma = output_section_loadaddrs[sym->loadaddr_section_idx];
@@ -937,6 +1013,12 @@ void ld_update_symbol_values(TCCState *s1, LDScript *ld)
   for (j = 0; j < ld->nb_symbols; j++)
   {
     LDSymbol *sym = &ld->symbols[j];
+
+    /* Assigned inside an output section, the first pass placed it from the
+     * real layout; these name-based guesses would undo that (__data_start__
+     * at the first .data input left .time_critical out of the RAM copy). */
+    if (sym->section_idx >= 0)
+      continue;
 
     /* Update standard section symbols - these ALWAYS use computed values */
     if (!strcmp(sym->name, "__bss_start__") || !strcmp(sym->name, "__bss_start"))
@@ -1003,7 +1085,8 @@ static void set_or_update_global_sym(TCCState *s1, const char *name, addr_t valu
       return;
     }
   }
-  set_global_sym(s1, name, NULL, value);
+  /* not set_global_sym: it makes a section-less value 0 an undefined symbol */
+  set_elf_sym(symtab_section, value, 0, ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), 0, SHN_ABS, name);
 }
 
 /* Export standard end/heap symbols based on section layout */
@@ -1015,77 +1098,83 @@ ST_FUNC void ld_export_standard_symbols(TCCState *s1)
   addr_t text_start = 0, text_end = 0;
   addr_t end_addr = 0;
   addr_t sec_end;
+  int have_bss = 0, have_data = 0, have_text = 0, have_end = 0;
   int i;
 
   /* Find section addresses */
   for (i = 1; i < s1->nb_sections; i++)
   {
     s = s1->sections[i];
-    if (!s->sh_addr)
+    /* address 0 is a valid placement (YAFF modules, -Ttext=0) */
+    if (!(s->sh_flags & SHF_ALLOC) || !s->sh_size)
       continue;
 
     sec_end = s->sh_addr + s->sh_size;
-    if (sec_end > end_addr)
+    if (!have_end || sec_end > end_addr)
       end_addr = sec_end;
+    have_end = 1;
 
     /* Match .bss and .bss.* sections */
     if (!strcmp(s->name, ".bss") || !strncmp(s->name, ".bss.", 5))
     {
-      if (bss_start == 0 || s->sh_addr < bss_start)
+      if (!have_bss || s->sh_addr < bss_start)
         bss_start = s->sh_addr;
-      if (sec_end > bss_end)
+      if (!have_bss || sec_end > bss_end)
         bss_end = sec_end;
+      have_bss = 1;
     }
     /* Match .data and .data.* sections */
     else if (!strcmp(s->name, ".data") || !strncmp(s->name, ".data.", 6))
     {
-      if (data_start == 0 || s->sh_addr < data_start)
+      if (!have_data || s->sh_addr < data_start)
         data_start = s->sh_addr;
-      if (sec_end > data_end)
+      if (!have_data || sec_end > data_end)
         data_end = sec_end;
+      have_data = 1;
     }
     /* Match .text and .text.* sections */
     else if (!strcmp(s->name, ".text") || !strncmp(s->name, ".text.", 6))
     {
-      if (text_start == 0 || s->sh_addr < text_start)
+      if (!have_text || s->sh_addr < text_start)
         text_start = s->sh_addr;
-      if (sec_end > text_end)
+      if (!have_text || sec_end > text_end)
         text_end = sec_end;
+      have_text = 1;
     }
   }
 
   /* Set standard symbols, updating existing ones if already defined
      (e.g. by tcc_add_linker_symbols) */
-  if (bss_start)
+  if (have_bss)
   {
     set_or_update_global_sym(s1, "__bss_start__", bss_start);
     set_or_update_global_sym(s1, "__bss_start", bss_start);
   }
-  if (bss_end)
+  if (have_bss)
   {
     set_or_update_global_sym(s1, "__bss_end__", bss_end);
     set_or_update_global_sym(s1, "_bss_end__", bss_end);
   }
-  if (data_start)
+  if (have_data)
   {
     set_or_update_global_sym(s1, "__data_start__", data_start);
   }
-  if (data_end)
+  if (have_data)
   {
     set_or_update_global_sym(s1, "_edata", data_end);
     set_or_update_global_sym(s1, "__data_end__", data_end);
   }
-  if (text_start)
+  if (have_text)
   {
     set_or_update_global_sym(s1, "__text_start__", text_start);
     set_or_update_global_sym(s1, "_stext", text_start);
   }
-  if (text_end)
+  if (have_text)
   {
     set_or_update_global_sym(s1, "_etext", text_end);
     set_or_update_global_sym(s1, "__text_end__", text_end);
   }
-  if (end_addr)
+  if (have_end)
   {
     set_or_update_global_sym(s1, "__end__", end_addr);
     set_or_update_global_sym(s1, "_end", end_addr);

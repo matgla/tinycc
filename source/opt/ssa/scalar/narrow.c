@@ -33,8 +33,14 @@ static IROperand narrow_copy_src(IROperand dest, int32_t vr)
 /* (x SHL #n) SHR #n  ->  x AND #((1 << (32-n)) - 1)   [SHL #24/SHR #24 -> AND #0xFF].
  * The mask is 32-bit-only: at INT64 (x << 24) >> 24 masks 40 bits, not 8. */
 OPT_GEN_SSA(narrow_shr, TCCIR_OP_SHR) {
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = TCCIR_OP_SHL);
+  PBIND(dest);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(
     when(is_imm32(src2) && is_imm32(psrc2));
     and(imm(src2) > 0 && imm(src2) < 32);
@@ -44,17 +50,20 @@ OPT_GEN_SSA(narrow_shr, TCCIR_OP_SHR) {
 
   uint32_t mask = (1u << (32 - imm(src2))) - 1;
   RETIRE_PAIR(psrc1, 0);
-  REWRITE(
-    .new_op = TCCIR_OP_AND,
-    .src1   = psrc1,
-    .src2   = irop_make_imm32(0, (int32_t)mask, dest.btype));
+  REWRITE(set_op(TCCIR_OP_AND), set_src1_ref(psrc1), set_src2(irop_make_imm32(0, (int32_t)mask, dest.btype)));
 }
 
 /* (x AND #a) AND #b -> x  when b keeps every a-bit;  (x SHR #n) AND #m -> x when
  * m covers all live bits, else (x SHR #n) AND #((1<<w)-1) -> UBFX(x,#n,#w). */
 OPT_GEN_SSA(narrow_and, TCCIR_OP_AND) {
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = -1);
+  PBIND(dest);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(when(is_imm32(src2)));
 
   uint32_t outer = (uint32_t)imm(src2);
@@ -89,7 +98,7 @@ OPT_GEN_SSA(narrow_and, TCCIR_OP_AND) {
     }
     /* outer covers inner: the outer AND changes nothing */
     if ((inner & outer) == inner)
-      REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = narrow_copy_src(dest, src1_vr));
+      REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(narrow_copy_src(dest, src1_vr)));
     /* inner dies: compose the two masks and read v directly.  A contiguous
      * low-bits result becomes a UBFX (the canonical form this pass emits for
      * the SHR case, and the shape the bitfield store→load forward matches);
@@ -99,14 +108,8 @@ OPT_GEN_SSA(narrow_and, TCCIR_OP_AND) {
       int w = (m != 0 && (m & (m + 1)) == 0) ? __builtin_popcount(m) : 0;
       RETIRE_PAIR(psrc1, 1);
       if (w >= 1 && w < 32)
-        REWRITE(
-          .new_op = TCCIR_OP_UBFX,
-          .src1   = psrc1,
-          .src2   = irop_make_imm32(-1, 0 | (w << 5), IROP_BTYPE_INT32));
-      REWRITE(
-        .new_op = TCCIR_OP_AND,
-        .src1   = psrc1,
-        .src2   = irop_make_imm32(-1, (int32_t)m, dest.btype));
+        REWRITE(set_op(TCCIR_OP_UBFX), set_src1_ref(psrc1), set_src2(irop_make_imm32(-1, 0 | (w << 5), IROP_BTYPE_INT32)));
+      REWRITE(set_op(TCCIR_OP_AND), set_src1_ref(psrc1), set_src2(irop_make_imm32(-1, (int32_t)m, dest.btype)));
     }
     return 0;
   }
@@ -128,17 +131,14 @@ OPT_GEN_SSA(narrow_and, TCCIR_OP_AND) {
 
     uint32_t max_bits = (1u << (32 - shift)) - 1;
     if ((outer & max_bits) == max_bits)
-      REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = narrow_copy_src(dest, src1_vr));
+      REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(narrow_copy_src(dest, src1_vr)));
 
     int width = (outer != 0 && (outer & (outer + 1)) == 0)
                     ? __builtin_popcount(outer)
                     : 0;
     if (width >= 1 && width < 32 && shift + width <= 32 && pvi->use_count == 1) {
       RETIRE_PAIR(psrc1, 1);
-      REWRITE(
-        .new_op = TCCIR_OP_UBFX,
-        .src1   = psrc1,
-        .src2   = irop_make_imm32(-1, shift | (width << 5), IROP_BTYPE_INT32));
+      REWRITE(set_op(TCCIR_OP_UBFX), set_src1_ref(psrc1), set_src2(irop_make_imm32(-1, shift | (width << 5), IROP_BTYPE_INT32)));
     }
   }
 
@@ -151,8 +151,14 @@ OPT_GEN_SSA(narrow_and, TCCIR_OP_AND) {
  * narrow type.  The C backend's casts extend what a load or a previous cast
  * just extended (`ldrh; ubfx #0,#16; ubfx #0,#16`). */
 OPT_GEN_SSA(narrow_ubfx_noop, TCCIR_OP_UBFX) {
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = -1);
+  PBIND(dest);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(when(is_imm32(src2)));
 
   int32_t param = (int32_t)imm(src2);
@@ -185,18 +191,24 @@ OPT_GEN_SSA(narrow_ubfx_noop, TCCIR_OP_UBFX) {
     if (fs && (fs->type.t & VT_BTYPE) == VT_FUNC && fs->type.ref) {
       int rt = fs->type.ref->type.t, rbt = rt & VT_BTYPE;
       int rw = rbt == VT_BOOL ? 1 : rbt == VT_BYTE ? 8 : rbt == VT_SHORT ? 16 : 0;
+      /* a _Complex/vector of narrow elements is packed, not one narrow value */
+      if (rt & (VT_COMPLEX | VT_VECTOR))
+        rw = 0;
       fits = rw && (rbt == VT_BOOL || (rt & VT_UNSIGNED)) && rw <= width;
     }
   }
   GUARD(when(fits));
 
-  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = narrow_copy_src(dest, vreg(src1)));
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(narrow_copy_src(dest, vreg(src1))));
 }
 
 /* (x SHR #n) fed into UBFX(#lsb,#w) -> UBFX(x, #(lsb+n), #w) when the SHR dies. */
 OPT_GEN_SSA(narrow_ubfx, TCCIR_OP_UBFX) {
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND(src2);
   PAIR(.link = IR_PAIR_DEF_OF_SRC1, .op = TCCIR_OP_SHR, .single_use = 1);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(when(is_imm32(src2) && is_imm32(psrc2)));
 
   int32_t param = (int32_t)imm(src2);
@@ -211,10 +223,7 @@ OPT_GEN_SSA(narrow_ubfx, TCCIR_OP_UBFX) {
     and(lsb + n + width <= 32));
 
   RETIRE_PAIR(psrc1, 1);
-  REWRITE(
-    .new_op = TCCIR_OP_UBFX,
-    .src1   = psrc1,
-    .src2   = irop_make_imm32(-1, (lsb + n) | (width << 5), IROP_BTYPE_INT32));
+  REWRITE(set_op(TCCIR_OP_UBFX), set_src1_ref(psrc1), set_src2(irop_make_imm32(-1, (lsb + n) | (width << 5), IROP_BTYPE_INT32)));
 }
 
 static const IRSSAOptGen narrow_gens[] = {
@@ -231,8 +240,8 @@ static const IRSSAOptGen narrow_gens[] = {
 
 typedef struct
 {
-  const char *double_name;
-  const char *float_name;
+  const char *TCC_RODATA_REL double_name;
+  const char *TCC_RODATA_REL float_name;
 } NarrowFloatEntry;
 
 static const NarrowFloatEntry narrow_float_table[] = {

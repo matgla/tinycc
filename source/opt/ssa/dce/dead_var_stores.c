@@ -29,8 +29,7 @@ static int var_addr_is_write_only(IRSSAOptCtx *ctx, int32_t vreg)
     if (q->op == TCCIR_OP_NOP)
       continue;
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (irop_get_vreg(d) == vreg)
+      if (tcc_ir_op_dest_vreg(ir, q) == vreg)
         continue;
     }
     return 0;
@@ -85,8 +84,7 @@ int dce_dead_var_stores(IRSSAOptCtx *ctx)
       if (s.is_local && !s.is_lval) {
         int safe = 0;
         if (irop_config[q->op].has_dest) {
-          IROperand d = tcc_ir_op_get_dest(ir, q);
-          int32_t dvr = irop_get_vreg(d);
+          int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
           if (dvr >= 0 &&
               TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP &&
               (!sl_temp_has_live_uses(ctx, dvr) ||
@@ -113,10 +111,9 @@ int dce_dead_var_stores(IRSSAOptCtx *ctx)
 
     /* is_lval && !is_local means the dest VAR's value is read as a pointer, not written. */
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(d);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR &&
-          (q->op == TCCIR_OP_STORE_INDEXED || (d.is_lval && !d.is_local))) {
+          (q->op == TCCIR_OP_STORE_INDEXED || (tcc_ir_op_dest_is_lval(ir, q) && !tcc_ir_op_dest_is_local(ir, q)))) {
         int pos = TCCIR_DECODE_VREG_POSITION(dvr);
         if (pos < num_vars)
           var_used[pos / 8] |= (1 << (pos % 8));
@@ -124,13 +121,11 @@ int dce_dead_var_stores(IRSSAOptCtx *ctx)
     }
 
     if (q->op == TCCIR_OP_LEA) {
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(s);
+      int32_t vr = tcc_ir_op_src1_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos < num_vars) {
-          IROperand d = tcc_ir_op_get_dest(ir, q);
-          int32_t dvr = irop_get_vreg(d);
+          int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
           if (dvr < 0 ||
               TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP ||
               (sl_temp_has_live_uses(ctx, dvr) &&
@@ -141,8 +136,7 @@ int dce_dead_var_stores(IRSSAOptCtx *ctx)
     }
 
     if (q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ASSIGN) {
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(s);
+      int32_t vr = tcc_ir_op_src1_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos < num_vars)
@@ -151,8 +145,7 @@ int dce_dead_var_stores(IRSSAOptCtx *ctx)
     }
 
     if (q->op == TCCIR_OP_FUNCPARAMVAL) {
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(s);
+      int32_t vr = tcc_ir_op_src1_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR) {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
         if (pos < num_vars)
@@ -167,8 +160,7 @@ int dce_dead_var_stores(IRSSAOptCtx *ctx)
       continue;
     if (!irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t dvr = irop_get_vreg(dest);
+    int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
     if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_VAR)
       continue;
     /* STORE to a dead VAR is safe to eliminate; other side-effect ops are not */
@@ -196,11 +188,10 @@ int dce_dead_var_stores(IRSSAOptCtx *ctx)
       continue;
     if (!irop_config[q->op].has_src1)
       continue;
-    IROperand s = tcc_ir_op_get_src1(ir, q);
-    int32_t svr = irop_get_vreg(s);
+    int32_t svr = tcc_ir_op_src1_vreg(ir, q);
     if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
       continue;
-    if (!(s.is_local && !s.is_lval))
+    if (!(tcc_ir_op_src1_is_local(ir, q) && !tcc_ir_op_src1_is_lval(ir, q)))
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(svr);
     if (pos >= num_vars)
@@ -209,8 +200,7 @@ int dce_dead_var_stores(IRSSAOptCtx *ctx)
       continue;
     if (var_used[pos / 8] & (1 << (pos % 8)))
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    int32_t dvr = irop_get_vreg(d);
+    int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
     if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP)
       continue;
     if (!var_addr_is_write_only(ctx, dvr))

@@ -82,21 +82,19 @@ static int ra_try_resolve_const_local(TCCIRState *ir, const uint8_t *is_target,
       if (is_target && is_target[k]) return 0;
       continue;
     }
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (d.is_lval) {
+    if (tcc_ir_op_dest_is_lval(ir, q)) {
       if (is_target && is_target[k]) return 0;
       continue;
     }
-    int32_t dv = irop_get_vreg(d);
+    int32_t dv = tcc_ir_op_dest_vreg(ir, q);
     if (dv != vr) {
       if (is_target && is_target[k]) return 0;
       continue;
     }
 
     if (opc != TCCIR_OP_ASSIGN) return 0;
-    IROperand s = tcc_ir_op_get_src1(ir, q);
-    if (!irop_is_immediate(s) || s.is_lval) return 0;
-    *out = irop_get_imm64_ex(ir, s);
+    if (!tcc_ir_op_src1_is_imm(ir, q) || tcc_ir_op_src1_is_lval(ir, q)) return 0;
+    *out = tcc_ir_op_src1_imm(ir, q);
     return 1;
   }
   return 0;
@@ -125,11 +123,10 @@ static uint8_t *ra_build_jump_target_map(TCCIRState *ir)
   for (int i = 0; i < n; i++) {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
-      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int t = (int)tcc_ir_op_dest_imm(ir, q);
       if (t >= 0 && t < n) map[t] = 1;
     } else if (q->op == TCCIR_OP_SWITCH_TABLE) {
-      IROperand s2 = tcc_ir_op_get_src2(ir, q);
-      int table_id = (int)irop_get_imm64_ex(ir, s2);
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id >= 0 && table_id < ir->num_switch_tables) {
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
         for (int j = 0; j < table->num_entries; j++) {
@@ -193,8 +190,7 @@ int ra_fold_const_branches(TCCIRState *ir)
       v2 = (int64_t)(int32_t)(uint32_t)v2;
     }
 
-    IROperand cond = tcc_ir_op_get_src1(ir, q);
-    int tok = (int)irop_get_imm64_ex(ir, cond);
+    int tok = (int)tcc_ir_op_src1_imm(ir, q);
     int result = ra_eval_cmp_cond(v1, v2, tok);
     if (result < 0) continue;
 
@@ -204,7 +200,7 @@ int ra_fold_const_branches(TCCIRState *ir)
       cmp_q->op = TCCIR_OP_NOP;
       q->op = TCCIR_OP_JUMP;
       tcc_ir_set_dest(ir, i, target);
-      tcc_ir_set_src1(ir, i, IROP_NONE);
+      tcc_ir_set_src1_none(ir, i);
       ra_nop_dead_block(ir, is_target, i + 1);
     } else {
       /* Never taken. */

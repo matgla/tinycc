@@ -50,6 +50,71 @@
  * struct-by-value through retme).
  */
 
+/* How many instructions define each vreg, for scre_resolve_slot_addr: one
+ * whole-function scan per pass (and after each rewrite) instead of one per
+ * copy parameter resolved.  Open addressing on the vreg, keys -1 = empty. */
+static struct
+{
+  int32_t *key;
+  int *cnt;
+  int mask; /* table size - 1; -1: not built */
+} scre_defs = {NULL, NULL, -1};
+
+/* A def for the "only def" check: a store through a pointer is an address
+ * use, not a def (STORE_INDEXED's destination is the base address); a VAR or
+ * PARAM stored as itself (a STACKOFF lvalue) is redefined. */
+static int scre_counts_as_def(TCCIRState *ir, IRQuadCompact *q, int32_t *vr)
+{
+  if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest || q->op == TCCIR_OP_STORE_INDEXED)
+    return 0;
+  IROperand od = tcc_ir_op_get_dest(ir, q);
+  *vr = irop_get_vreg(od);
+  return *vr >= 0 && irop_dest_defines_vreg(od);
+}
+
+static int scre_def_slot(int32_t vr)
+{
+  unsigned h = ((uint32_t)vr * 2654435761u) & scre_defs.mask;
+  while (scre_defs.key[h] != vr && scre_defs.key[h] >= 0)
+    h = (h + 1) & scre_defs.mask;
+  return h;
+}
+
+static void scre_defs_invalidate(void)
+{
+  tcc_free(scre_defs.key);
+  tcc_free(scre_defs.cnt);
+  scre_defs.key = NULL;
+  scre_defs.cnt = NULL;
+  scre_defs.mask = -1;
+}
+
+static int scre_def_count(TCCIRState *ir, int32_t vr)
+{
+  if (scre_defs.mask < 0)
+  {
+    const int n = ir->next_instruction_index;
+    int size = 16;
+    while (size < 2 * n)
+      size <<= 1;
+    scre_defs.mask = size - 1;
+    scre_defs.key = tcc_malloc(sizeof(int32_t) * size);
+    scre_defs.cnt = tcc_mallocz(sizeof(int) * size);
+    memset(scre_defs.key, -1, sizeof(int32_t) * size);
+    for (int o = 0; o < n; o++)
+    {
+      int32_t dv;
+      if (scre_counts_as_def(ir, &ir->compact_instructions[o], &dv))
+      {
+        const int h = scre_def_slot(dv);
+        scre_defs.key[h] = dv;
+        scre_defs.cnt[h]++;
+      }
+    }
+  }
+  return scre_defs.cnt[scre_def_slot(vr)];
+}
+
 /* Resolve a call-param operand to a stack-slot address.  The operand is either
  * a direct `Addr[StackLoc[off]]` (is_lval=0) or a TEMP whose single prior def
  * is `T <- Addr[StackLoc[off]]` (LEA / ASSIGN-with-no-src2).  Returns 1 and
@@ -74,8 +139,7 @@ static int scre_resolve_slot_addr(TCCIRState *ir, IROperand op, int before_idx, 
       continue;
     if (!irop_config[dq->op].has_dest)
       continue;
-    IROperand dd = tcc_ir_op_get_dest(ir, dq);
-    if (!irop_has_vreg(dd) || irop_get_vreg(dd) != vr)
+    if (!tcc_ir_op_dest_has_vreg(ir, dq) || tcc_ir_op_dest_vreg(ir, dq) != vr)
       continue;
     /* Found the textually latest def of the param vreg BEFORE the use.  That
      * is only THE reaching def if the vreg has no other def anywhere: for a
@@ -84,25 +148,13 @@ static int scre_resolve_slot_addr(TCCIRState *ir, IROperand op, int before_idx, 
      * fall-through arm's def eliminated a real cross-slot transfer as a
      * "roundtrip" (the on-device tcc corrupted SELECT folds in its own
      * ssa_rewrite_flag_consumer this way). */
-    for (int o = 0; o < ir->next_instruction_index; o++)
-    {
-      if (o == d)
-        continue;
-      IRQuadCompact *oq = &ir->compact_instructions[o];
-      if (oq->op == TCCIR_OP_NOP || !irop_config[oq->op].has_dest)
-        continue;
-      if (oq->op == TCCIR_OP_STORE_INDEXED)
-        continue; /* its destination is the base address */
-      /* A store through a pointer is an address use, not a def; a VAR or
-       * PARAM stored as itself (a STACKOFF lvalue) is redefined. */
-      IROperand od = tcc_ir_op_get_dest(ir, oq);
-      if (irop_get_vreg(od) == vr && irop_dest_defines_vreg(od))
-        return 0;
-    }
+    int32_t dv;
+    if (scre_def_count(ir, vr) > scre_counts_as_def(ir, dq, &dv))
+      return 0;
     if (dq->op != TCCIR_OP_LEA && dq->op != TCCIR_OP_ASSIGN)
       return 0;
     IROperand ds1 = tcc_ir_op_get_src1(ir, dq);
-    if (dq->op == TCCIR_OP_ASSIGN && !irop_is_none(tcc_ir_op_get_src2(ir, dq)))
+    if (dq->op == TCCIR_OP_ASSIGN && !tcc_ir_op_src2_is_none(ir, dq))
       return 0;
     if (irop_get_tag(ds1) != IROP_TAG_STACKOFF || ds1.is_lval)
       return 0;
@@ -117,7 +169,7 @@ static int scre_is_memcpy_like(TCCIRState *ir, IRQuadCompact *q)
 {
   if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
     return 0;
-  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  Sym *callee = tcc_ir_op_src1_sym(ir, q);
   if (!callee)
     return 0;
   const char *name = get_tok_str(callee->v, NULL);
@@ -178,7 +230,7 @@ static int scre_touches_region(TCCIRState *ir, IRQuadCompact *q, int32_t lo, int
 
 static int scre_call_id(TCCIRState *ir, IRQuadCompact *q)
 {
-  return TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+  return TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
 }
 
 /* Instruction `k` touches region B: is it only plumbing for the two copies?
@@ -199,11 +251,10 @@ static int scre_is_copy_plumbing(TCCIRState *ir, int k, int cid1, int cid2)
   IROperand s1 = tcc_ir_op_get_src1(ir, q);
   if (irop_get_tag(s1) != IROP_TAG_STACKOFF || s1.is_lval)
     return 0;
-  if (q->op == TCCIR_OP_ASSIGN && !irop_is_none(tcc_ir_op_get_src2(ir, q)))
+  if (q->op == TCCIR_OP_ASSIGN && !tcc_ir_op_src2_is_none(ir, q))
     return 0;
-  IROperand d = tcc_ir_op_get_dest(ir, q);
-  int32_t dv = irop_get_vreg(d);
-  if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP || d.is_lval)
+  int32_t dv = tcc_ir_op_dest_vreg(ir, q);
+  if (dv < 0 || TCCIR_DECODE_VREG_TYPE(dv) != TCCIR_VREG_TYPE_TEMP || tcc_ir_op_dest_is_lval(ir, q))
     return 0;
   for (int u = 0; u < ir->next_instruction_index; u++)
   {
@@ -211,11 +262,11 @@ static int scre_is_copy_plumbing(TCCIRState *ir, int k, int cid1, int cid2)
     if (u == k || uq->op == TCCIR_OP_NOP)
       continue;
     const IRRegistersConfig *cfg = &irop_config[uq->op];
-    int reads = (cfg->has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == dv) ||
-                (cfg->has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == dv) ||
-                (uq->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, uq)) == dv);
+    int reads = (cfg->has_src1 && tcc_ir_op_src1_vreg(ir, uq) == dv) ||
+                (cfg->has_src2 && tcc_ir_op_src2_vreg(ir, uq) == dv) ||
+                (uq->op == TCCIR_OP_MLA && tcc_ir_op_accum_vreg(ir, uq) == dv);
     /* A store through it, or a write-back of it, is a use as well. */
-    if (!reads && cfg->has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == dv)
+    if (!reads && cfg->has_dest && tcc_ir_op_dest_vreg(ir, uq) == dv)
       reads = 1;
     if (!reads)
       continue;
@@ -234,6 +285,7 @@ int tcc_ir_opt_struct_copy_roundtrip_elim(TCCIRState *ir)
   int changes = 0;
   if (n < 4)
     return 0;
+  scre_defs_invalidate();
 
   for (int i1 = 0; i1 < n; i1++)
   {
@@ -305,26 +357,25 @@ int tcc_ir_opt_struct_copy_roundtrip_elim(TCCIRState *ir)
       IRQuadCompact *cq = &ir->compact_instructions[calls[ci]];
       if (cq->op != TCCIR_OP_FUNCCALLVAL)
         continue;
-      IROperand res = tcc_ir_op_get_dest(ir, cq);
-      if (!irop_has_vreg(res))
+      if (!tcc_ir_op_dest_has_vreg(ir, cq))
         continue;
-      int32_t rv = irop_get_vreg(res);
+      int32_t rv = tcc_ir_op_dest_vreg(ir, cq);
       for (int u = calls[ci] + 1; u < n; u++)
       {
         IRQuadCompact *uq = &ir->compact_instructions[u];
         if (uq->op == TCCIR_OP_NOP)
           continue;
         const IRRegistersConfig *cfg = &irop_config[uq->op];
-        if ((cfg->has_src1 && irop_has_vreg(tcc_ir_op_get_src1(ir, uq)) &&
-             irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == rv) ||
-            (cfg->has_src2 && irop_has_vreg(tcc_ir_op_get_src2(ir, uq)) &&
-             irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == rv))
+        if ((cfg->has_src1 && tcc_ir_op_src1_has_vreg(ir, uq) &&
+             tcc_ir_op_src1_vreg(ir, uq) == rv) ||
+            (cfg->has_src2 && tcc_ir_op_src2_has_vreg(ir, uq) &&
+             tcc_ir_op_src2_vreg(ir, uq) == rv))
         {
           dead_result = 0;
           break;
         }
-        if (cfg->has_dest && irop_has_vreg(tcc_ir_op_get_dest(ir, uq)) &&
-            irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == rv)
+        if (cfg->has_dest && tcc_ir_op_dest_has_vreg(ir, uq) &&
+            tcc_ir_op_dest_vreg(ir, uq) == rv)
           break; /* redefined */
       }
     }
@@ -366,9 +417,11 @@ int tcc_ir_opt_struct_copy_roundtrip_elim(TCCIRState *ir)
     ir_opt_nop_call_params(ir, i2);
     c2->op = TCCIR_OP_NOP;
     changes++;
+    scre_defs_invalidate(); /* the calls' result vregs lost a def */
     LOG_IR_GEN("STRUCT COPY ROUNDTRIP ELIM: calls @%d,%d  A=%d B=%d size=%d", i1, i2, a_off, b_off, sz1);
   }
 
+  scre_defs_invalidate();
   return changes;
 }
 
@@ -437,13 +490,12 @@ static int mglf_resolve_global_src(TCCIRState *ir, IROperand op, int before_idx,
       continue;
     if (!irop_config[dq->op].has_dest)
       continue;
-    IROperand dd = tcc_ir_op_get_dest(ir, dq);
-    if (!irop_has_vreg(dd) || irop_get_vreg(dd) != vr)
+    if (!tcc_ir_op_dest_has_vreg(ir, dq) || tcc_ir_op_dest_vreg(ir, dq) != vr)
       continue;
     if (dq->op != TCCIR_OP_LEA && dq->op != TCCIR_OP_ASSIGN)
       return 0;
     IROperand ds1 = tcc_ir_op_get_src1(ir, dq);
-    if (dq->op == TCCIR_OP_ASSIGN && !irop_is_none(tcc_ir_op_get_src2(ir, dq)))
+    if (dq->op == TCCIR_OP_ASSIGN && !tcc_ir_op_src2_is_none(ir, dq))
       return 0;
     if (irop_get_tag(ds1) != IROP_TAG_SYMREF || ds1.is_lval || ds1.is_local)
       return 0;
@@ -478,10 +530,52 @@ static int mglf_is_value_read_op(int op)
 
 #define MGLF_MAX 32
 
+/* Does any control-flow edge enter (lo, hi]?  A computed goto may enter
+ * anywhere. */
+static int mglf_edge_into(TCCIRState *ir, int lo, int hi)
+{
+  const int n = ir->next_instruction_index;
+  for (int k = 0; k < n; k++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[k];
+    if (q->op == TCCIR_OP_IJUMP)
+      return 1;
+    if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
+    {
+      const int t = (int)tcc_ir_op_dest_imm(ir, q);
+      if (t > lo && t <= hi)
+        return 1;
+    }
+  }
+  for (int t = 0; t < ir->num_switch_tables; t++)
+  {
+    TCCIRSwitchTable *st = &ir->switch_tables[t];
+    if (st->default_target > lo && st->default_target <= hi)
+      return 1;
+    for (int j = 0; st->targets && j < st->num_entries; j++)
+      if (st->targets[j] > lo && st->targets[j] <= hi)
+        return 1;
+  }
+  return 0;
+}
+
+/* The operand past dest/src1/src2 some ops carry (a MAC's accumulator, an
+ * indexed access's scale, a SELECT's condition): 1 with *out if q has one.
+ * Neither scan below rewrites it, so naming D there disqualifies. */
+static int mglf_extra_operand(TCCIRState *ir, IRQuadCompact *q, IROperand *out)
+{
+  const int op = q->op;
+  if (!tcc_ir_op_is_mac(op) && op != TCCIR_OP_LOAD_INDEXED && op != TCCIR_OP_STORE_INDEXED && op != TCCIR_OP_SELECT)
+    return 0;
+  *out = ir->iroperand_pool[q->operand_base + 3];
+  return 1;
+}
+
 int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   int changes = 0;
+  scre_defs_invalidate();
 
   for (int ci = 0; ci < n; ci++)
   {
@@ -525,7 +619,7 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
       if (q->op != TCCIR_OP_LEA && q->op != TCCIR_OP_ASSIGN)
         continue;
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      if (q->op == TCCIR_OP_ASSIGN && !irop_is_none(tcc_ir_op_get_src2(ir, q)))
+      if (q->op == TCCIR_OP_ASSIGN && !tcc_ir_op_src2_is_none(ir, q))
         continue;
       if (irop_get_tag(s1) != IROP_TAG_STACKOFF || s1.is_lval || !s1.is_local)
         continue;
@@ -587,6 +681,12 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
         int in_s1 = cfg->has_src1 && irop_has_vreg(s1) && irop_get_vreg(s1) == av;
         int in_s2 = cfg->has_src2 && irop_has_vreg(s2) && irop_get_vreg(s2) == av;
         int in_d = cfg->has_dest && irop_has_vreg(d) && irop_get_vreg(d) == av;
+        IROperand x;
+        if (mglf_extra_operand(ir, q, &x) && irop_has_vreg(x) && irop_get_vreg(x) == av)
+        {
+          ok = 0;
+          break;
+        }
         if (!in_s1 && !in_s2 && !in_d)
           continue;
         /* (The copy's own params reference D's dest address but always precede
@@ -678,11 +778,14 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
       if (q->op == TCCIR_OP_NOP)
         continue;
       const IRRegistersConfig *cfg = &irop_config[q->op];
-      IROperand ops3[3];
-      int np = 0, posn[3];
+      IROperand ops3[4];
+      int np = 0, posn[4];
       if (cfg->has_dest) { ops3[np] = tcc_ir_op_get_dest(ir, q); posn[np] = 0; np++; }
       if (cfg->has_src1) { ops3[np] = tcc_ir_op_get_src1(ir, q); posn[np] = 1; np++; }
       if (cfg->has_src2) { ops3[np] = tcc_ir_op_get_src2(ir, q); posn[np] = 2; np++; }
+      /* The extra operand: never a forwardable read (posn 3 matches no
+       * rewrite below), so a reference to the slot there disqualifies. */
+      if (mglf_extra_operand(ir, q, &ops3[np])) { posn[np] = 3; np++; }
       for (int p = 0; p < np && ok; p++)
       {
         IROperand o = ops3[p];
@@ -694,7 +797,7 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
         /* Address-of in the seeding LEA/ASSIGN (already tracked by Pass 1). */
         if (!o.is_lval && posn[p] == 1 &&
             (q->op == TCCIR_OP_LEA ||
-             (q->op == TCCIR_OP_ASSIGN && irop_is_none(tcc_ir_op_get_src2(ir, q)))))
+             (q->op == TCCIR_OP_ASSIGN && tcc_ir_op_src2_is_none(ir, q))))
           continue;
         /* Direct lval LOAD of the slot, or a value-read op (ADD/SHR/...) whose
          * is_lval StackLoc operand reads the slot — both forwardable.  A store
@@ -726,10 +829,20 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
       continue;
 
     /* The window [ci+1, last_load] must be straight-line with no call, no
-     * store and no control-flow edge, so the global is provably unmodified. */
+     * store and no control-flow edge, so the global is provably unmodified.
+     * No edge may come IN either: a jump whose target lies in the window
+     * (a NOP there carries no is_jump_target worth trusting) merges a path
+     * on which the copy never ran. */
+    if (ok && mglf_edge_into(ir, ci, last_load))
+      ok = 0;
     for (int k = ci + 1; k <= last_load && ok; k++)
     {
       IRQuadCompact *q = &ir->compact_instructions[k];
+      if (q->is_jump_target)
+      {
+        ok = 0;
+        break;
+      }
       if (q->op == TCCIR_OP_NOP)
         continue;
       switch (q->op)
@@ -787,9 +900,11 @@ int tcc_ir_opt_memmove_global_load_fwd(TCCIRState *ir)
     ir_opt_nop_call_params(ir, ci);
     c->op = TCCIR_OP_NOP;
     changes++;
+    scre_defs_invalidate();
     LOG_IR_GEN("MEMMOVE GLOBAL LOAD FWD: copy@%d D=%d N=%d -> %d loads forwarded to global", ci, dbase, N, ld_n);
   next_call:;
   }
 
+  scre_defs_invalidate();
   return changes;
 }

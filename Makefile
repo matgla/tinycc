@@ -478,7 +478,18 @@ endif
 
 TCC_LIBS = $(MODULE_LIBS) $(ARCH_LIB)
 TCC_FILES = $(DRIVER_MAIN_OBJ) $(TCC_LIBS)
-$(X)source/frontend/tccpp.o : $(TCCDEFS_H) tccdefs_table_.h
+$(X)source/frontend/tccpp.o : $(TCCDEFS_H) tccdefs_table_.h tcckw_index_.h
+
+# The keyword index of the lazy builtin-token interner (gen_kw_index.c): host
+# tool with the TARGET's -D flags, for the same reasons as gen_predef_table
+# below.  The cross and native stages share this directory but not their -D
+# flags, so it is regenerated on every build and replaced only when it changed
+# (tccpp.c's _Static_assert catches a stale table, it cannot repair one).
+tcckw_index_.h : gen_kw_index.c FORCE
+	$Sgcc -o gen_kw_index-$T$(EXESUF) gen_kw_index.c \
+	  $(DEFINES) $(filter -D%,$(CFLAGS)) \
+	  && ./gen_kw_index-$T$(EXESUF) $@.tmp && rm -f gen_kw_index-$T$(EXESUF) \
+	  && if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
 # Stage B of the predefine pipeline: tccdefs_.h -> tccdefs_table_.h.
 #
@@ -504,10 +515,18 @@ $(X)source/frontend/tccpp.o : $(TCCDEFS_H) tccdefs_table_.h
 # gcc, not $(CC), for the same reason the c2str rule hardcodes it: this is a
 # HOST tool, and in the native/self-host stage $(CC) is armv8m-tcc, which would
 # build it for the target (and fail on the yasos libc's missing strtok_r).
-tccdefs_table_.h : tccdefs_.h gen_predef_table.c
+#
+# Regenerated on every build and replaced only when it changed, like
+# tcckw_index_.h: which predefines exist depends on the -D flags, and a table
+# left behind by another configure in this directory (`make test`'s has no
+# -DTARGETOS_YasOS) silently drops target predefines such as YasOS's
+# __GNUC__ 4 (pico-sdk: "Unsupported toolchain") -- a timestamp rule, even
+# one on config.mak, cannot see every flags change.
+tccdefs_table_.h : tccdefs_.h gen_predef_table.c FORCE
 	$Sgcc -o gen_predef_table-$T$(EXESUF) gen_predef_table.c \
 	  $(addsuffix ,$(DEFINES) $(filter -D%,$(CFLAGS))) \
-	  && ./gen_predef_table-$T$(EXESUF) $@ && rm -f gen_predef_table-$T$(EXESUF)
+	  && ./gen_predef_table-$T$(EXESUF) $@.tmp && rm -f gen_predef_table-$T$(EXESUF) \
+	  && if cmp -s $@.tmp $@; then rm -f $@.tmp; else mv -f $@.tmp $@; fi
 
 # Feature-test macros for every TU, not just those that include tcc.h before
 # their first system header (tcc.h defines them too, for other builds).
@@ -569,7 +588,7 @@ unity:
 # It preprocesses every source, so the generated headers they #include must
 # exist first -- on a fresh checkout (CI runs it straight after configure)
 # nothing has built them yet.
-unity-info: $(TCCDEFS_H) tccdefs_table_.h
+unity-info: $(TCCDEFS_H) tccdefs_table_.h tcckw_index_.h
 	@echo 'CC $(CC) $(DEFINES) $(CFLAGS) $(OPT_PIPELINE_INC) $(BACKEND_GENERATORS_INC)'
 	@$(foreach l,$(UNITY_LIB_NAMES),echo 'LIB $l $(UNITY_SRC_$l)';)
 .PHONY: unity-info
@@ -1031,9 +1050,37 @@ test-ir: cross test-venv test-prepare download-gcc-tests
 	fi
 
 # container target: runs the full test suite (all test-* targets below)
-.NOTPARALLEL: test test-full test-all
+.NOTPARALLEL: test test-full test-all full-test
 test: cross test-aeabi-host test-asm warn-check optflag-check opt-dsl-check test-venv test-prepare download-gcc-tests ut test-frontend test-linker test-debug test-runtime test-selfhost test-ir
 	@echo "------------ test suite complete ------------"
+
+# QEMU self-host fixpoint: the device's tcc builds tinycc, then that tcc rebuilds
+# itself byte-identically.  Needs the YasOS checkout around this one; builds a
+# private mps3-an524 kernel + rootfs (see scripts/tcc_selfhost_an524.sh) so the
+# shared tree's board build is left alone.  SELFHOST_ARGS goes to
+# tcc_selfhost.py (e.g. SELFHOST_ARGS="--stages 2").
+YASOS_ROOT ?= $(abspath $(TOP)/../..)
+SELFHOST_ARGS ?=
+.PHONY: test-selfhost-qemu
+test-selfhost-qemu: test-venv
+	@echo "------------ self-host fixpoint on QEMU (an524) ------------"
+	@if [ ! -x "$(YASOS_ROOT)/scripts/tcc_selfhost_an524.sh" ]; then \
+		echo "test-selfhost-qemu: no YasOS checkout at $(YASOS_ROOT) (set YASOS_ROOT)"; exit 1; \
+	fi
+	@py=python3; if [ "$(USE_VENV)" = "1" ]; then py="$(abspath $(VENV_PY))"; fi; \
+	PYTHON="$$py" "$(YASOS_ROOT)/scripts/tcc_selfhost_an524.sh" $(SELFHOST_ARGS)
+
+# Everything: the regular suite plus the variants it leaves out -- golden IR
+# snapshots, the FP suite under the hard and softfp ABIs, the pass-coverage
+# ledger and the QEMU self-host fixpoint.  `make test` stays the everyday run.
+.PHONY: full-test
+full-test: test
+	@+$(MAKE) --no-print-directory test-golden-ir
+	@+$(MAKE) --no-print-directory test-fp FLOAT_ABI=hard
+	@+$(MAKE) --no-print-directory test-fp FLOAT_ABI=softfp
+	@+$(MAKE) --no-print-directory check-pass-coverage
+	@+$(MAKE) --no-print-directory test-selfhost-qemu
+	@echo "------------ full test suite complete ------------"
 
 # Fully sequential test run: disables pytest-xdist too, for the cleanest logs.
 .PHONY: test-sequential
@@ -1087,6 +1134,18 @@ tcc_c$(EXESUF): $($T_FILES)
 .PHONY: coverage-tccgen
 coverage-tccgen:
 	@$(TOPSRC)/scripts/coverage_tccgen.py
+
+# Line/branch coverage map of the optimizer and back end (source/opt, ir,
+# backend, machine): an out-of-tree instrumented cross (coverage-opt/build, so
+# this tree's armv8m-tcc is untouched) compiles ir_tests, tests2 and gcc torture
+# at -O0/-O1/-O2/-Os.  Output: coverage-opt/index.html, coverage-opt/opt.info and
+# coverage-opt/ranking.txt (per-directory totals, functions by uncovered lines,
+# never-taken bail-out guards vs never-run transform paths).  Requires lcov,
+# rsync.  Tunables: COV_JOBS, COV_OLEVELS, COV_OUT, COV_NO_TORTURE=1, COV_EXTRA.
+# See docs/opt_coverage_map.md.
+.PHONY: coverage-opt
+coverage-opt:
+	@$(TOPSRC)/scripts/coverage_opt.py
 # test the installed tcc instead
 test-install: $(TCCDEFS_H)
 	@$(MAKE) -C tests TESTINSTALL=yes #_all

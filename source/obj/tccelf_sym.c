@@ -137,7 +137,8 @@ ST_FUNC Section *new_section(TCCState *s1, const char *name, int sh_type, int sh
 
 ST_FUNC void init_symtab(Section *s)
 {
-  int *ptr, nb_buckets = SYMTAB_INITIAL_HASH_BUCKETS;
+  int *ptr, nb_buckets = (s->hash->sh_flags & SHF_PRIVATE) ? SYMTAB_PRIVATE_INITIAL_HASH_BUCKETS
+                                                             : SYMTAB_INITIAL_HASH_BUCKETS;
   put_elf_str(s->link, "");
   section_ptr_add(s, sizeof(ElfW(Sym)));
   ptr = section_ptr_add(s->hash, (2 + nb_buckets + 1) * sizeof(int));
@@ -231,17 +232,25 @@ void section_reserve(Section *sec, unsigned long size)
     sec->data_offset = size;
 }
 #endif
+/* The lowest-numbered section named `name`, or NULL.  Looked up in the
+ * section name hash rather than by scanning every section: the hash keeps
+ * sections reorder_sections() dropped, and it may hold several of one name,
+ * so only entries still at their own index count and the lowest one wins. */
 Section *have_section(TCCState *s1, const char *name)
 {
-  Section *sec;
-  int i;
-  for (i = 1; i < s1->nb_sections; i++)
+  Section *s, *best = NULL;
+  unsigned int idx;
+  if (!s1->section_ht)
+    return NULL;
+  idx = section_name_hash(name) & s1->section_ht_mask;
+  while ((s = s1->section_ht[idx]) != NULL)
   {
-    sec = s1->sections[i];
-    if (!strcmp(name, sec->name))
-      return sec;
+    if (s->sh_num > 0 && s->sh_num < s1->nb_sections && s1->sections[s->sh_num] == s &&
+        (!best || s->sh_num < best->sh_num) && !strcmp(s->name, name))
+      best = s;
+    idx = (idx + 1) & s1->section_ht_mask;
   }
-  return NULL;
+  return best;
 }
 
 /* return a reference to a section, and create it if it does not
@@ -251,8 +260,13 @@ ST_FUNC Section *find_section(TCCState *s1, const char *name)
   Section *sec = have_section(s1, name);
   if (sec)
     return sec;
-  /* sections are created as PROGBITS */
-  return new_section(s1, name, SHT_PROGBITS, SHF_ALLOC);
+  /* sections are created as PROGBITS.  Their alignment starts at a pointer
+   * and grows with what is placed in them (section_add): the 8-byte default
+   * spread pico-sdk's one-pointer .preinit_array.<prio> sections apart, and
+   * the init loop called the padding between them. */
+  sec = new_section(s1, name, SHT_PROGBITS, SHF_ALLOC);
+  sec->sh_addralign = PTR_SIZE;
+  return sec;
 }
 
 ST_FUNC int put_elf_str(Section *s, const char *sym)
@@ -463,6 +477,11 @@ static int find_elf_sym_with_hash(Section *s, const char *name, unsigned int ful
 
 ST_FUNC int find_elf_sym(Section *s, const char *name)
 {
+  /* A table holding only the null symbol has nothing to find: skip hashing
+   * the name (bind_libs_dynsyms asks an empty dynsymtab for every symbol of
+   * a link that loads no shared library). */
+  if (s->data_offset <= sizeof(ElfW(Sym)))
+    return 0;
   return find_elf_sym_with_hash(s, name, elf_hash((unsigned char *)name));
 }
 

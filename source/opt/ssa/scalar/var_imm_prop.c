@@ -43,7 +43,7 @@ static int var_imm_prop_slot(IRSSAOptCtx *ctx, const OptDslVarImmState *st,
     tcc_ir_op_set_accum(ir, q, imm);
   if (q->op == TCCIR_OP_LOAD) {
     q->op = TCCIR_OP_ASSIGN;
-    tcc_ir_op_set_src2(ir, q, IROP_NONE);
+    tcc_ir_op_set_src2_none(ir, q);
   }
   return 1;
 }

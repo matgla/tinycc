@@ -11,6 +11,8 @@
 #undef LCS_MAX_VAR_POS
 #undef LCS_RECORD_EXIT
 #undef USING_GLOBALS
+#include "../opt/flat/loop/decrement_carry.c"
+#undef USING_GLOBALS
 #include "../opt/flat/loop/func_purity.c"
 #undef NUM_PURE_FUNCS
 #include "../opt/flat/loop/loop_detect.c"
@@ -26,10 +28,6 @@
 #undef RJ
 #undef USING_GLOBALS
 #include "../opt/flat/loop/loop_rotate.c"
-#undef ROT_LVAL_IS_INDIRECT
-#undef ROT_NOTE_DEF
-#undef ROT_NOTE_READ
-#undef ROT_VAR_DIRECT
 #undef USING_GLOBALS
 #undef _ROFF
 #include "../opt/flat/loop/loop_unroll.c"

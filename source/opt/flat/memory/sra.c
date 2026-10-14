@@ -43,14 +43,17 @@
 #include "opt.h"
 #include "opt_utils.h"
 
-#define SRA_MAX_BYTES 36 /* 32 bytes, plus the guard word frame_record adds */
+#define SRA_MAX_BYTES 64 /* Includes frame-record guards; padding is a 64-bit mask. */
 
 /* TCC_SRA_PTRVAR=0 keeps objects reached through pointer VARs in memory. */
 TCC_DBG_ENV_INT(sra_ptrvar, "TCC_SRA_PTRVAR", 1)
 /* TCC_SRA_PTRVAR_DF=0 follows pointer VARs within a block only. */
 TCC_DBG_ENV_INT(sra_ptrvar_df, "TCC_SRA_PTRVAR_DF", 1)
+/* TCC_SRA_ADDR_ALU=0 keeps objects a field of which is read inside address
+ * arithmetic (`&obj.field + index`) in memory. */
+TCC_DBG_ENV_INT(sra_addr_alu, "TCC_SRA_ADDR_ALU", 1)
 /* TCC_SRA_PARAM_MAX: the largest struct argument split into words, in bytes. */
-TCC_DBG_ENV_INT(sra_param_max, "TCC_SRA_PARAM_MAX", SRA_MAX_BYTES - 4)
+TCC_DBG_ENV_INT(sra_param_max, "TCC_SRA_PARAM_MAX", 32)
 /* TCC_SRA_NARROW_IDX_OFF=1 keeps objects with a narrow indexed store in memory. */
 TCC_DBG_ENV_FLAG(sra_narrow_idx_off, "TCC_SRA_NARROW_IDX_OFF")
 /* TCC_SRA_MIXED_OFF=1 keeps objects whose narrow fields are also read wider in memory. */
@@ -120,6 +123,7 @@ typedef struct
   int nloads;                    /* field loads */
   int npart;                     /* partial stores of a non-constant (each a read-modify-write) */
   uint8_t fstart[SRA_MAX_BYTES]; /* per byte: the start of the field holding it, 0xFF none (sra_index_fields) */
+  uint64_t word_cmp;             /* Word comparisons require an exact, unmasked field. */
   uint64_t pad;                  /* bytes no member of its type covers (tcc_ir_frame_padding) */
 } SraUnit;
 
@@ -196,13 +200,19 @@ static int sra_struct_is_word(IROperand op)
 /* A struct passed BY VALUE whose words can come from field VARs: whole words,
  * 8 bytes up to TCC_SRA_PARAM_MAX, float-free, AAPCS alignment <= 4.  Its
  * words then occupy exactly the registers / stack words N consecutive word
- * arguments would (arm_aapcs.c: a composite starts at the NCRN and straddles
- * r3 onto the stack contiguously, like scalars; only an 8-aligned one skips to
- * an even register).  The number of words, or 0. */
+ * arguments would for the base (soft/softfp) ABI.  Hard-float is deliberately
+ * excluded: after a VFP argument spills, AAPCS C.6 keeps the next composite
+ * whole on the stack, while replacing it with scalar words would make the
+ * call-site ABI classifier lose that aggregate boundary.  The number of
+ * words, or 0. */
 static int sra_struct_param_words(IROperand op)
 {
   if (irop_get_btype(op) != IROP_BTYPE_STRUCT || !op.is_lval || op.is_llocal || op.is_complex)
     return 0;
+#if defined(TCC_TARGET_ARM_THUMB)
+  if (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT)
+    return 0;
+#endif
   CType *ct = irop_get_ctype(op);
   if (!ct)
     return 0;
@@ -507,7 +517,14 @@ static int32_t sra_field_mask(int bytes)
  * (ssa_store_slot_def_pos).  Only the forms the frontend puts ahead of a
  * narrow store are recognised -- a constant, a mask by a subset of it, and a
  * value that is itself a narrow unsigned one.  `def` maps a TEMP to its only
- * defining instruction, or -1 when it has none or several. */
+ * defining instruction, or -1 when it has none or several.
+ *
+ * NOT decided from the stored operand's own btype: the frontend gives a
+ * narrow STORE's value the STORE's width and leaves the truncation to the
+ * store (vstore's delayed char/short cast), so `q.s = word` stores a word
+ * operand typed u16.  It is the definition that has to say so, as in
+ * sl_forward's sl_fwd_value_within_bits.  A store whose value only looks
+ * narrow by its type (sra_narrow_store_typed) still promotes, through a mask. */
 static int sra_narrow_store_fits(TCCIRState *ir, IRQuadCompact *q, int bytes,
                                  const int32_t *def, int ntemp)
 {
@@ -517,9 +534,6 @@ static int sra_narrow_store_fits(TCCIRState *ir, IRQuadCompact *q, int bytes,
     return (irop_get_imm32(op) & ~mask) == 0;
   if (irop_get_tag(op) != IROP_TAG_VREG || op.is_lval || op.is_llocal)
     return 0;
-  int ob = sra_btype_bytes(irop_get_btype(op));
-  if (ob && ob <= bytes && op.is_unsigned)
-    return 1;
   int t = sra_temp_pos(op, ntemp);
   if (t < 0 || !def || def[t] < 0)
     return 0;
@@ -539,12 +553,38 @@ static int sra_narrow_store_fits(TCCIRState *ir, IRQuadCompact *q, int bytes,
   return 0;
 }
 
+/* Is a narrow store's value a narrow unsigned register value by its type
+ * alone?  Such a type does not say the value fits (sra_narrow_store_fits):
+ * the frontend left the truncation to the store.  The field then takes the
+ * value masked to its width (sra_store_as_def), as the store would have cut
+ * it -- most such values do fit, and known_ext drops the mask again. */
+static int sra_narrow_store_typed(TCCIRState *ir, IRQuadCompact *q, int bytes)
+{
+  IROperand op = tcc_ir_op_get_src1(ir, q);
+  if (irop_get_tag(op) != IROP_TAG_VREG || op.is_lval || op.is_llocal)
+    return 0;
+  int ob = sra_btype_bytes(irop_get_btype(op));
+  return ob && ob <= bytes && op.is_unsigned;
+}
+
+static void sra_relay(TCCIRState *ir, IRQuadCompact *q, TccIrOp op, IROperand dest, IROperand src1,
+                      IROperand src2);
+
 /* A narrow field's STORE becomes an ASSIGN -- a definition of the VAR -- with
- * the same two operands and the VAR widened to 32 bits. */
-static void sra_store_as_def(TCCIRState *ir, int i, IROperand rep)
+ * the same two operands and the VAR widened to 32 bits; with MASK_BYTES, an
+ * AND that first cuts the value to that width (sra_narrow_store_typed). */
+static void sra_store_as_def(TCCIRState *ir, int i, IROperand rep, int mask_bytes)
 {
   rep.is_lval = 0; /* a value definition of the VAR, not a write through it */
-  ir->compact_instructions[i].op = TCCIR_OP_ASSIGN;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  if (mask_bytes)
+  {
+    IROperand x = irop_retype_scalar(tcc_ir_op_get_src1(ir, q), IROP_BTYPE_INT32);
+    x.is_unsigned = 1;
+    sra_relay(ir, q, TCCIR_OP_AND, rep, x, irop_make_imm32(-1, sra_field_mask(mask_bytes), IROP_BTYPE_INT32));
+    return;
+  }
+  q->op = TCCIR_OP_ASSIGN;
   tcc_ir_set_dest(ir, i, rep);
 }
 
@@ -587,6 +627,9 @@ static int sra_slot_bytes(TCCIRState *ir, TccIrOp op, int s, IROperand o)
   if (!o.is_lval || o.is_llocal || o.is_complex || tcc_ir_access_is_volatile(ir, o))
     return 0;
   int bt = irop_get_btype(o);
+  if ((s == 1 || s == 2) && op == TCCIR_OP_CMP && bt == IROP_BTYPE_INT32 &&
+      !o.is_complex && !tcc_ir_access_is_volatile(ir, o))
+    return 4;
   if (sra_btype_bytes(bt) &&
       ((s == 1 && (op == TCCIR_OP_LOAD || op == TCCIR_OP_ASSIGN)) || (s == 0 && op == TCCIR_OP_STORE)))
     return sra_btype_bytes(bt);
@@ -649,7 +692,7 @@ static int sra_wide_access(TCCIRState *ir, IRQuadCompact *q, int s, IROperand o)
 /* The ops that keep a fourth operand at operand_base + 3 (frame.c's list). */
 static int sra_op_has_slot3(int op)
 {
-  return op == TCCIR_OP_MLA || op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_SELECT;
+  return ir_op_has(op, IROP_A_SLOT3) && !ir_opset_has(IR_LEGACY_GAP_OPS(TCCIR_OP_UMAAL), op);
 }
 
 /* Operand slot s (0-3) of q, or IROP_NONE. */
@@ -936,7 +979,8 @@ static void sra_ins_apply(TCCIRState *ir, SraInsList *l)
 {
   if (l->n == 0)
     return;
-  qsort(l->v, l->n, sizeof(SraIns), sra_ins_cmp);
+  tcc_ir_label_sync(ir);
+  tcc_qsort(l->v, l->n, sizeof(SraIns), sra_ins_cmp);
   const int n = ir->next_instruction_index, nn = n + l->n;
   IRQuadCompact *out = tcc_malloc(sizeof(IRQuadCompact) * (nn + 1));
   int32_t *lead = tcc_malloc(sizeof(int32_t) * (n + 1));
@@ -964,9 +1008,9 @@ static void sra_ins_apply(TCCIRState *ir, SraInsList *l)
     IRQuadCompact *q = &out[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
       if (target >= 0 && target <= n)
-        tcc_ir_op_set_dest(ir, q, irop_make_imm32(-1, lead[target], IROP_BTYPE_INT32));
+        tcc_ir_op_set_dest_imm32(ir, q, lead[target], IROP_BTYPE_INT32);
     }
   }
   for (int t = 0; t < ir->num_switch_tables; t++)
@@ -985,6 +1029,7 @@ static void sra_ins_apply(TCCIRState *ir, SraInsList *l)
   }
   memcpy(ir->compact_instructions, out, sizeof(IRQuadCompact) * nn);
   ir->next_instruction_index = nn;
+  tcc_ir_frame_scope_remap(ir, (const int *)lead, n, nn);
   tcc_free(lead);
   tcc_free(out);
 }
@@ -1021,7 +1066,7 @@ static void sra_rewrite_wide(TCCIRState *ir, SraInsList *ins, int i, int s, IROp
   {
     IROperand rep = sra_field_op(ir, u, at, IROP_BTYPE_INT64, o.is_unsigned);
     if (s == 0)
-      sra_store_as_def(ir, i, rep);
+      sra_store_as_def(ir, i, rep, 0);
     else if (s == 1)
       tcc_ir_set_src1(ir, i, rep);
     else
@@ -1038,7 +1083,7 @@ static void sra_rewrite_wide(TCCIRState *ir, SraInsList *ins, int i, int s, IROp
     {
       int64_t c = irop_get_imm64_ex(ir, v);
       tcc_ir_set_dest(ir, i, lo);
-      tcc_ir_set_src1(ir, i, irop_make_imm32(-1, (int32_t)(uint32_t)c, IROP_BTYPE_INT32));
+      tcc_ir_set_src1_imm32(ir, i, (int32_t)(uint32_t)c, IROP_BTYPE_INT32);
       sra_ins_add(ir, ins, i, 1, TCCIR_OP_STORE, hi, irop_make_imm32(-1, (int32_t)(uint32_t)((uint64_t)c >> 32), IROP_BTYPE_INT32),
                   IROP_NONE);
       return;
@@ -1086,7 +1131,7 @@ static int sra_access_through(TCCIRState *ir, IRQuadCompact *q, int ntemp, int *
     return -1;
   int is_store = op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED;
   int indexed = op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_LOAD_INDEXED;
-  IROperand base = is_store ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+  IROperand base = tcc_ir_op_get_dest_or_src1(ir, q, !is_store);
   int t = sra_temp_pos(base, ntemp);
   if (t < 0 || irop_get_tag(base) != IROP_TAG_VREG || base.is_local || base.is_llocal || base.is_lval == indexed)
     return -1;
@@ -1094,19 +1139,123 @@ static int sra_access_through(TCCIRState *ir, IRQuadCompact *q, int ntemp, int *
   *acc = base;
   if (indexed)
   {
-    IROperand idx = tcc_ir_op_get_src2(ir, q);
     IROperand scale = tcc_ir_op_get_scale(ir, q);
-    if (irop_get_tag(idx) != IROP_TAG_IMM32 || idx.is_lval ||
+    if (tcc_ir_op_src2_tag(ir, q) != IROP_TAG_IMM32 || tcc_ir_op_src2_is_lval(ir, q) ||
         (!irop_is_none(scale) && (irop_get_tag(scale) != IROP_TAG_IMM32 || irop_get_imm32(scale) != 0)))
       return -1;
-    *disp = irop_get_imm32(idx);
-    *acc = is_store ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_dest(ir, q);
+    *disp = tcc_ir_op_src2_imm32(ir, q);
+    *acc = tcc_ir_op_get_dest_or_src1(ir, q, is_store);
     acc->aux = base.aux;
   }
   if (irop_is_64bit(*acc) || acc->is_complex || !sra_btype_bytes(irop_get_btype(*acc)) ||
       tcc_ir_access_is_volatile(ir, *acc))
     return -1;
   return t;
+}
+
+/* sra_access_through for a 64-bit integer access instead: the Zig C backend
+ * writes a u64 member through a pointer temporary (`t2 = &t0._offset;
+ * (*t2) = a1;`).  A store's value must be a plain TEMP or constant, as for a
+ * direct 64-bit slot store (sra_wide_access); the doubleword is then a field
+ * like that one, and sra_rewrite_wide rewrites the access. */
+static int sra_wide_through(TCCIRState *ir, IRQuadCompact *q, int ntemp, int *disp, IROperand *acc)
+{
+  int op = q->op;
+  if (op != TCCIR_OP_STORE && op != TCCIR_OP_LOAD && op != TCCIR_OP_STORE_INDEXED && op != TCCIR_OP_LOAD_INDEXED)
+    return -1;
+  int is_store = op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED;
+  int indexed = op == TCCIR_OP_STORE_INDEXED || op == TCCIR_OP_LOAD_INDEXED;
+  IROperand base = tcc_ir_op_get_dest_or_src1(ir, q, !is_store);
+  int t = sra_temp_pos(base, ntemp);
+  if (t < 0 || irop_get_tag(base) != IROP_TAG_VREG || base.is_local || base.is_llocal || base.is_lval == indexed)
+    return -1;
+  *disp = 0;
+  *acc = base;
+  if (indexed)
+  {
+    IROperand scale = tcc_ir_op_get_scale(ir, q);
+    if (tcc_ir_op_src2_tag(ir, q) != IROP_TAG_IMM32 || tcc_ir_op_src2_is_lval(ir, q) ||
+        (!irop_is_none(scale) && (irop_get_tag(scale) != IROP_TAG_IMM32 || irop_get_imm32(scale) != 0)))
+      return -1;
+    *disp = tcc_ir_op_src2_imm32(ir, q);
+    *acc = tcc_ir_op_get_dest_or_src1(ir, q, is_store);
+    acc->aux = base.aux;
+  }
+  if (irop_get_btype(*acc) != IROP_BTYPE_INT64 || acc->is_complex || tcc_ir_access_is_volatile(ir, *acc))
+    return -1;
+  if (is_store)
+  {
+    IROperand v = tcc_ir_op_get_src1(ir, q);
+    int tag = irop_get_tag(v);
+    if (v.is_lval || v.is_complex || v.is_local || v.is_llocal ||
+        !((tag == IROP_TAG_VREG && irop_get_vreg(v) >= 0) || tag == IROP_TAG_IMM32 || tag == IROP_TAG_I64))
+      return -1;
+  }
+  return t;
+}
+
+/* Is q address arithmetic whose result feeds nothing but memory accesses:
+ * an ADD / SUB into an address-only TEMP (sra_addr_only_temps). */
+static int sra_addr_arith(TCCIRState *ir, IRQuadCompact *q, int ntemp, const uint8_t *aok)
+{
+  if ((q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB) || !irop_config[q->op].has_dest)
+    return 0;
+  IROperand d = tcc_ir_op_get_dest(ir, q);
+  int t = sra_temp_pos(d, ntemp);
+  return !d.is_lval && t >= 0 && aok && aok[t];
+}
+
+/* aok[t]: every use of TEMP t is the base of a load or a store, or a source
+ * of address arithmetic whose own result is address-only -- so a field read
+ * that lands in such a chain is a base pointer a loop would otherwise reload
+ * from the frame each iteration.  Accepting a field in ANY operand was tried
+ * before and made the Zig compiler larger (the header's note); this stays
+ * narrow to uses that only ever address memory. */
+static uint8_t *sra_addr_only_temps(TCCIRState *ir, int ntemp)
+{
+  const int n = ir->next_instruction_index;
+  uint8_t *aok = ntemp > 0 ? tcc_malloc(ntemp) : NULL;
+  if (!aok)
+    return NULL;
+  memset(aok, 1, ntemp);
+  for (int round = 0, changed = 1; changed && round < 8; round++)
+  {
+    changed = 0;
+    for (int i = 0; i < n; i++)
+    {
+      IRQuadCompact *q = &ir->compact_instructions[i];
+      int op = q->op;
+      if (op == TCCIR_OP_NOP)
+        continue;
+      int is_access = op == TCCIR_OP_LOAD || op == TCCIR_OP_STORE ||
+                      op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED;
+      int indexed = op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED;
+      int base_slot = op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED ? 0 : 1;
+      int is_addsub = op == TCCIR_OP_ADD || op == TCCIR_OP_SUB;
+      for (int s = 0; s < 3; s++)
+      {
+        IROperand o = sra_operand(ir, q, s);
+        int t = sra_temp_pos(o, ntemp);
+        if (t < 0 || !aok[t])
+          continue;
+        if (s == 0 && !o.is_lval)
+          continue; /* a definition, not a use */
+        int ok_use = 0;
+        if (is_access && s == base_slot && o.is_lval != indexed && !o.is_local && !o.is_llocal)
+          ok_use = 1; /* the base of a memory access */
+        else if (s >= 1 && o.is_lval)
+          ok_use = 1; /* *T fused into an operand: a load or store through T */
+        else if (is_addsub && (s == 1 || s == 2) && !o.is_lval)
+          ok_use = sra_addr_arith(ir, q, ntemp, aok);
+        if (!ok_use)
+        {
+          aok[t] = 0;
+          changed = 1;
+        }
+      }
+    }
+  }
+  return aok;
 }
 
 /* A call that reads or writes a range of an object whole.
@@ -1153,10 +1302,9 @@ static int sra_call_kind(TCCIRState *ir, IRQuadCompact *q)
 {
   if (q->op != TCCIR_OP_FUNCCALLVOID)
     return SRA_CALL_OTHER;
-  Sym *cs = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  Sym *cs = tcc_ir_op_src1_sym(ir, q);
   const char *nm = cs ? get_tok_str(cs->v, NULL) : NULL;
-  if (nm && (!strcmp(nm, "__aeabi_memmove4") || !strcmp(nm, "__aeabi_memmove8") ||
-             !strcmp(nm, "__aeabi_memcpy4") || !strcmp(nm, "__aeabi_memcpy8")))
+  if (nm && ir_opt_name_in(nm, "__aeabi_memmove4\0__aeabi_memmove8\0__aeabi_memcpy4\0__aeabi_memcpy8\0"))
     return SRA_CALL_COPY;
   return SRA_CALL_OTHER;
 }
@@ -1169,7 +1317,7 @@ static int sra_whole_use(TCCIRState *ir, int i, const int32_t *call_at, const in
                          const uint8_t *ckind, int ncall, SraWhole *w)
 {
   IRQuadCompact *q = &ir->compact_instructions[i];
-  uint32_t e = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+  uint32_t e = (uint32_t)tcc_ir_op_src2_imm(ir, q);
   int c = TCCIR_DECODE_CALL_ID(e), p = TCCIR_DECODE_PARAM_IDX(e);
   if (c < 0 || c >= ncall || call_at[c] <= i)
     return 0;
@@ -1192,6 +1340,13 @@ static int sra_whole_use(TCCIRState *ir, int i, const int32_t *call_at, const in
      * nothing but the call's own arguments may sit between them. */
     IROperand o = tcc_ir_op_get_src1(ir, &ir->compact_instructions[cparam[c][1 - p]]);
     if (irop_get_tag(o) != IROP_TAG_VREG || irop_get_vreg(o) < 0 || o.is_lval || o.is_llocal || o.is_local)
+      return 0;
+    /* Replacing the object turns the copy into one access per FIELD it needs,
+     * so the other side is read or written only where a field is: wrong when
+     * that side is volatile -- copying `*(volatile struct S *)p` reads all of
+     * it.  The frontend proves the copy's source non-volatile (vstore); an
+     * unproven side declines, as everywhere else. */
+    if (tcc_ir_access_is_volatile(ir, o))
       return 0;
     int first = cparam[c][0];
     for (int k = 1; k < 3; k++)
@@ -1375,6 +1530,12 @@ static void sra_expand_whole(TCCIRState *ir, SraInsList *ins, SraUnit *u, const 
     if (!w)
       continue;
     const int d = at - a0;
+    /* The copy helper (__aeabi_memmove4/8) promises a word-aligned pointer,
+     * so a field a whole number of words into it is a word-aligned access:
+     * one LDRD/STRD or LDM/STM may carry it. */
+    IROperand abase = base;
+    if (!(d & 3))
+      abase.aux = (abase.aux | IROP_AUX_ALIGN4_OK) & ~IROP_AUX_UNDERALIGN;
     IROperand imm = irop_make_imm32(-1, d, IROP_BTYPE_INT32);
     IROperand imm4 = irop_make_imm32(-1, d + 4, IROP_BTYPE_INT32);
     if (e->dir == 0 && w == 8)
@@ -1386,8 +1547,8 @@ static void sra_expand_whole(TCCIRState *ir, SraInsList *ins, SraUnit *u, const 
       else
       {
         IROperand lo = sra_new_temp(ir, IROP_BTYPE_INT32), hi = sra_new_temp(ir, IROP_BTYPE_INT32);
-        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, lo, base, imm);
-        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, hi, base, imm4);
+        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, lo, abase, imm);
+        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, hi, abase, imm4);
         sra_ins_add(ir, ins, anchor, after, TCCIR_OP_PACK64, x, lo, hi);
       }
       IROperand rep = sra_field_op(ir, u, at, IROP_BTYPE_INT64, 1);
@@ -1401,7 +1562,7 @@ static void sra_expand_whole(TCCIRState *ir, SraInsList *ins, SraUnit *u, const 
         sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD, x, sra_slot_op(e->slot, u->lo + at, sra_width_btype(w)),
                     IROP_NONE);
       else
-        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, x, base, imm);
+        sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD_INDEXED, x, abase, imm);
       /* A narrow field's definition is an ASSIGN (sra_store_as_def). */
       IROperand rep = sra_field_op(ir, u, at, IROP_BTYPE_INT32, 1);
       if (w < 4)
@@ -1416,8 +1577,8 @@ static void sra_expand_whole(TCCIRState *ir, SraInsList *ins, SraUnit *u, const 
       sra_ins_add(ir, ins, anchor, after, TCCIR_OP_ASSIGN, lo, x, IROP_NONE);
       sra_ins_add(ir, ins, anchor, after, TCCIR_OP_SHR, th, x, irop_make_imm32(-1, 32, IROP_BTYPE_INT32));
       sra_ins_add(ir, ins, anchor, after, TCCIR_OP_ASSIGN, hi, th, IROP_NONE);
-      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, base, lo, imm);
-      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, base, hi, imm4);
+      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, abase, lo, imm);
+      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, abase, hi, imm4);
     }
     else
     {
@@ -1425,7 +1586,7 @@ static void sra_expand_whole(TCCIRState *ir, SraInsList *ins, SraUnit *u, const 
       sra_ins_add(ir, ins, anchor, after, TCCIR_OP_LOAD, x, sra_field_op(ir, u, at, IROP_BTYPE_INT32, 1), IROP_NONE);
       IROperand v = irop_make_vreg(irop_get_vreg(x), sra_width_btype(w));
       v.is_unsigned = 1;
-      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, base, v, imm);
+      sra_ins_add(ir, ins, anchor, after, TCCIR_OP_STORE_INDEXED, abase, v, imm);
     }
     at += w - 1;
   }
@@ -1473,10 +1634,9 @@ static int sra_is_copy_op(TCCIRState *ir, IRQuadCompact *q, int nvar)
 /* base +/- q's constant second operand, or SRA_VMIX when it is not one. */
 static int32_t sra_offset_by(TCCIRState *ir, IRQuadCompact *q, int32_t base)
 {
-  IROperand c = tcc_ir_op_get_src2(ir, q);
-  if (irop_get_tag(c) != IROP_TAG_IMM32 || c.is_lval)
+  if (tcc_ir_op_src2_tag(ir, q) != IROP_TAG_IMM32 || tcc_ir_op_src2_is_lval(ir, q))
     return SRA_VMIX;
-  int64_t x = (int64_t)base + (q->op == TCCIR_OP_ADD ? 1 : -1) * (int64_t)irop_get_imm32(c);
+  int64_t x = (int64_t)base + (q->op == TCCIR_OP_ADD ? 1 : -1) * (int64_t)tcc_ir_op_src2_imm32(ir, q);
   return x > -(1 << 24) && x < (1 << 24) ? (int32_t)x : SRA_VMIX;
 }
 
@@ -1540,7 +1700,7 @@ static int sra_forward_const_vars(TCCIRState *ir, int first_sra_var)
      * seen here. */
     if (q->op == TCCIR_OP_LEA || q->op == TCCIR_OP_ASM_INPUT || q->op == TCCIR_OP_ASM_OUTPUT)
     {
-      IROperand a = q->op == TCCIR_OP_ASM_OUTPUT ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+      IROperand a = tcc_ir_op_get_dest_or_src1(ir, q, q->op != TCCIR_OP_ASM_OUTPUT);
       int32_t avr = irop_get_vreg(a);
       if (avr >= 0 && TCCIR_DECODE_VREG_TYPE(avr) == TCCIR_VREG_TYPE_VAR && TCCIR_DECODE_VREG_POSITION(avr) < nv)
         st[TCCIR_DECODE_VREG_POSITION(avr)] = 2;
@@ -1621,7 +1781,7 @@ static int sra_forward_const_vars(TCCIRState *ir, int first_sra_var)
     {
       if (!(s == 1 ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2))
         continue;
-      IROperand o = s == 1 ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand o = tcc_ir_op_get_src1_or_2(ir, q, s != 1);
       int32_t vr = irop_get_vreg(o);
       if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
         continue;
@@ -1688,6 +1848,9 @@ static int sra_objects(TCCIRState *ir)
   /* Each TEMP's only defining instruction, or -1: what a narrow store's value
    * has to be looked up through (sra_narrow_store_fits). */
   int32_t *def_idx = ntemp > 0 ? tcc_malloc(sizeof(int32_t) * ntemp) : NULL;
+  /* Per instruction: a narrow store whose value fits only by its type, so
+   * the field takes it masked to this many bytes (sra_narrow_store_typed). */
+  uint8_t *smask = tcc_mallocz(n + 1);
   for (int t = 0; t < ntemp; t++)
     def_idx[t] = -1;
   int32_t *toff = ntemp > 0 ? tcc_malloc(sizeof(int32_t) * ntemp) : NULL;
@@ -2095,14 +2258,14 @@ static int sra_objects(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_FUNCPARAMVAL)
     {
-      uint32_t e = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      uint32_t e = (uint32_t)tcc_ir_op_src2_imm(ir, q);
       int c = TCCIR_DECODE_CALL_ID(e), p = TCCIR_DECODE_PARAM_IDX(e);
       if (c >= 0 && c < nwcall && p >= 0 && p < 3)
         cparam[c][p] = cparam[c][p] == -1 ? i : -2;
     }
     else if (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID)
     {
-      int c = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      int c = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
       if (c >= 0 && c < nwcall)
       {
         call_at[c] = call_at[c] == -1 ? i : INT32_MAX; /* twice: never matches */
@@ -2115,6 +2278,7 @@ static int sra_objects(TCCIRState *ir)
 
   /* A use other than as an access base or the source of a derived address
    * lets the address escape. */
+  uint8_t *aok = sra_addr_alu() ? sra_addr_only_temps(ir, ntemp) : NULL;
   for (int i = 0; i < n && ntemp > 0; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
@@ -2123,10 +2287,13 @@ static int sra_objects(TCCIRState *ir)
     int disp, dt = sra_addr_def(ir, q, ntemp);
     IROperand acc;
     int bt = sra_access_through(ir, q, ntemp, &disp, &acc);
+    if (bt < 0 && !no_wide)
+      bt = sra_wide_through(ir, q, ntemp, &disp, &acc);
     int base_slot = q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ? 0 : 1;
     for (int s = 0; s < 4; s++)
     {
-      int t = sra_temp_pos(sra_operand(ir, q, s), ntemp);
+      IROperand po = sra_operand(ir, q, s);
+      int t = sra_temp_pos(po, ntemp);
       if (t < 0 || toff[t] == SRA_NO_ADDR)
         continue;
       if (s == 0 && dt == t)
@@ -2137,8 +2304,18 @@ static int sra_objects(TCCIRState *ir)
         continue;
       if (s == 1 && vdef && vdef[i] != SRA_NO_ADDR)
         continue; /* derives a pointer VAR's address */
+      /* `(*T) + x` reading the field at T's address, when the sum feeds
+       * nothing but memory accesses: the offset-0 load of such a chain. */
+      if (s == 1 && (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && po.is_lval && !po.is_llocal &&
+          !po.is_complex && sra_btype_bytes(irop_get_btype(po)) == 4 &&
+          !tcc_ir_access_is_volatile(ir, po) && sra_addr_arith(ir, q, ntemp, aok))
+      {
+        sra_note_field(&u[troot[t]], toff[t], 4, po.is_unsigned, 0);
+        u[troot[t]].refs++;
+        u[troot[t]].ok_refs++;
+        continue;
+      }
       int pw;
-      IROperand po = sra_operand(ir, q, s);
       if (s == 1 && q->op == TCCIR_OP_FUNCPARAMVAL && struct_param && troot[t] >= 0 &&
           toff[t] == u[troot[t]].lo && po.is_lval && (pw = sra_struct_param_words(po)) > 0 &&
           !tcc_ir_access_is_volatile(ir, po))
@@ -2287,11 +2464,25 @@ static int sra_objects(TCCIRState *ir)
         }
       }
       int bytes = s < 3 ? sra_slot_bytes(ir, q->op, s, o) : 0;
+      /* A field read inside address arithmetic (`T <-- slot ADD index`),
+       * when the sum feeds nothing but memory accesses: the base pointer
+       * the field holds, which the loop below would reload each pass. */
+      if (!bytes && s >= 1 && s <= 2 && o.is_lval && !o.is_llocal && !o.is_complex &&
+          !tcc_ir_access_is_volatile(ir, o) && sra_addr_arith(ir, q, ntemp, aok))
+      {
+        int fb = sra_btype_bytes(irop_get_btype(o));
+        if (fb && fb <= 4)
+          bytes = fb;
+      }
       if (bytes && (irop_get_btype(o) != IROP_BTYPE_STRUCT || off == u[k].lo))
       {
         if (bytes < 4 && s == 0 && q->op == TCCIR_OP_STORE && off - u[k].lo >= 0 && off - u[k].lo < SRA_MAX_BYTES)
         {
-          if (!sra_narrow_store_fits(ir, q, bytes, def_idx, ntemp))
+          if (sra_narrow_store_fits(ir, q, bytes, def_idx, ntemp))
+            ;
+          else if (sra_narrow_store_typed(ir, q, bytes))
+            smask[i] = (uint8_t)bytes;
+          else
             u[k].nofit[off - u[k].lo] |= (uint8_t)bytes;
           if (!irop_is_plain_imm(tcc_ir_op_get_src1(ir, q)))
           {
@@ -2300,6 +2491,8 @@ static int sra_objects(TCCIRState *ir)
           }
         }
         sra_note_field(&u[k], off, bytes, o.is_unsigned, s == 0);
+        if (q->op == TCCIR_OP_CMP && !u[k].bad)
+          u[k].word_cmp |= (uint64_t)1 << (off - u[k].lo);
         u[k].ok_refs++;
       }
       else
@@ -2312,6 +2505,22 @@ static int sra_objects(TCCIRState *ir)
     int disp;
     IROperand acc;
     int t = ntemp > 0 ? sra_access_through(ir, q, ntemp, &disp, &acc) : -1;
+    int wt = t < 0 && ntemp > 0 && !no_wide ? sra_wide_through(ir, q, ntemp, &disp, &acc) : -1;
+    if (wt >= 0 && toff[wt] != SRA_NO_ADDR && !tbad[wt] && troot[wt] >= 0)
+    {
+      int off = toff[wt] + disp, k = sra_find_unit(u, nu, off);
+      if (k != troot[wt])
+      {
+        u[troot[wt]].bad = 1; /* strays outside the object */
+        sra_why(&u[troot[wt]], "stray", q->op);
+      }
+      else
+      {
+        u[k].refs++;
+        u[k].ok_refs++;
+        sra_note_wide(&u[k], off);
+      }
+    }
     if (t >= 0 && toff[t] != SRA_NO_ADDR && !tbad[t] && troot[t] >= 0)
     {
       int off = toff[t] + disp, k = sra_find_unit(u, nu, off);
@@ -2337,7 +2546,11 @@ static int sra_objects(TCCIRState *ir)
         else if (abytes < 4 && (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED) && off - u[k].lo >= 0 &&
                  off - u[k].lo < SRA_MAX_BYTES)
         {
-          if (!sra_narrow_store_fits(ir, q, abytes, def_idx, ntemp))
+          if (sra_narrow_store_fits(ir, q, abytes, def_idx, ntemp))
+            ;
+          else if (sra_narrow_store_typed(ir, q, abytes))
+            smask[i] = (uint8_t)abytes;
+          else
             u[k].nofit[off - u[k].lo] |= (uint8_t)abytes;
           if (!irop_is_plain_imm(tcc_ir_op_get_src1(ir, q)))
           {
@@ -2365,6 +2578,13 @@ static int sra_objects(TCCIRState *ir)
   for (int k = 0; k < nu; k++)
     if (!u[k].bad)
       sra_resolve_wide(&u[k]);
+  for (int k = 0; k < nu; k++)
+    for (int at = 0; !u[k].bad && at < SRA_MAX_BYTES; at++)
+      if (((u[k].word_cmp >> at) & 1) && (u[k].width[at] != 4 || u[k].pmask[at]))
+      {
+        u[k].bad = 1;
+        sra_why(&u[k], "cmp-field", TCCIR_OP_CMP);
+      }
   /* Ranges accessed whole: inside the object, with a field for each byte a
    * call writes and a later whole read passes on, and no field across an
    * end. */
@@ -2506,16 +2726,16 @@ static int sra_objects(TCCIRState *ir)
       int at = u[k].bad && u[k].why ? u[k].why_at : -1;
       if (at >= 0 && at < n && ir->compact_instructions[at].op == TCCIR_OP_FUNCPARAMVAL)
       {
-        uint32_t e = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, &ir->compact_instructions[at]));
+        uint32_t e = (uint32_t)tcc_ir_op_src2_imm(ir, &ir->compact_instructions[at]);
         int c = TCCIR_DECODE_CALL_ID(e);
         pidx = TCCIR_DECODE_PARAM_IDX(e);
         for (int j = at + 1; j < n; j++)
         {
           IRQuadCompact *cq = &ir->compact_instructions[j];
           if ((cq->op == TCCIR_OP_FUNCCALLVAL || cq->op == TCCIR_OP_FUNCCALLVOID) &&
-              TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, cq))) == c)
+              TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, cq)) == c)
           {
-            Sym *cs = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, cq));
+            Sym *cs = tcc_ir_op_src1_sym(ir, cq);
             callee = cs ? get_tok_str(cs->v, NULL) : "(indirect)";
             break;
           }
@@ -2556,7 +2776,7 @@ static int sra_objects(TCCIRState *ir)
       if (q->op != TCCIR_OP_FUNCPARAMVAL || !sra_param_at(o = tcc_ir_op_get_src1(ir, q), ntemp, toff, &off) ||
           (k = sra_find_unit(u, nu, off)) < 0 || u[k].bad || off != u[k].lo || !(pw = sra_struct_param_words(o)))
         continue;
-      int c = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      int c = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
       if (c < 0 || c >= ncall)
         continue;
       if (!call_extra)
@@ -2568,7 +2788,7 @@ static int sra_objects(TCCIRState *ir)
       }
       call_extra[c] += pw - 1;
       splits = tcc_realloc(splits, sizeof(*splits) * (nsplit + 1));
-      splits[nsplit][0] = TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+      splits[nsplit][0] = TCCIR_DECODE_PARAM_IDX((uint32_t)tcc_ir_op_src2_imm(ir, q));
       splits[nsplit][1] = pw - 1;
       splits[nsplit][2] = split_first[c];
       split_first[c] = nsplit++;
@@ -2633,6 +2853,18 @@ static int sra_objects(TCCIRState *ir)
     int disp;
     IROperand acc;
     int t = ntemp > 0 ? sra_access_through(ir, q, ntemp, &disp, &acc) : -1;
+    int wt = t < 0 && ntemp > 0 && !no_wide ? sra_wide_through(ir, q, ntemp, &disp, &acc) : -1;
+    if (wt >= 0 && toff[wt] != SRA_NO_ADDR && !tbad[wt] && troot[wt] >= 0 && !u[troot[wt]].bad)
+    {
+      /* A doubleword through an address TEMP: the access as a plain slot
+       * LOAD / STORE first, the value or dest kept, then the wide rewrite. */
+      int k = troot[wt], at = toff[wt] + disp - u[k].lo;
+      int is_store = q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED;
+      q->op = is_store ? TCCIR_OP_STORE : TCCIR_OP_LOAD;
+      sra_rewrite_wide(ir, &ins, i, is_store ? 0 : 1, acc, &u[k], at);
+      changes++;
+      continue;
+    }
     if (t >= 0 && toff[t] != SRA_NO_ADDR && !tbad[t] && troot[t] >= 0 && !u[troot[t]].bad)
     {
       int k = troot[t], at = toff[t] + disp - u[k].lo;
@@ -2649,7 +2881,7 @@ static int sra_objects(TCCIRState *ir)
           sra_partial_store_bfi(ir, i, &u[k], fs, at - fs, abytes, tcc_ir_op_get_src1(ir, q));
         else if (is_store)
           sra_partial_store(ir, &ins, i, &u[k], fs, at - fs, abytes, tcc_ir_op_get_src1(ir, q),
-                            !(u[k].nofit[at] & abytes));
+                            !(u[k].nofit[at] & abytes) && !smask[i]);
         else
           sra_partial_load(ir, &ins, i, &u[k], fs, at - fs, abytes, acc.is_unsigned, tcc_ir_op_get_dest(ir, q));
         changes++;
@@ -2680,7 +2912,7 @@ static int sra_objects(TCCIRState *ir)
       }
       if (is_store && narrow)
       {
-        sra_store_as_def(ir, i, rep);
+        sra_store_as_def(ir, i, rep, smask[i]);
         changes++;
         continue;
       }
@@ -2691,6 +2923,31 @@ static int sra_objects(TCCIRState *ir)
         tcc_ir_set_src1(ir, i, rep);
       changes++;
       continue;
+    }
+    /* Address arithmetic reading a field through an address TEMP:
+     * `T9 <-- (*T8) ADD x` becomes `T9 <-- V_field ADD x`. */
+    if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) && sra_addr_arith(ir, q, ntemp, aok))
+    {
+      for (int s2 = 1; s2 <= 2; s2++)
+      {
+        IROperand o2 = sra_operand(ir, q, s2);
+        int t2 = sra_temp_pos(o2, ntemp);
+        if (t2 < 0 || !o2.is_lval || o2.is_llocal || o2.is_complex || sra_btype_bytes(irop_get_btype(o2)) != 4 ||
+            toff[t2] == SRA_NO_ADDR || troot[t2] < 0 || tbad[t2] || u[troot[t2]].bad ||
+            (tkeep && tkeep[t2]))
+          continue;
+        int k2 = troot[t2], at2 = toff[t2] - u[k2].lo;
+        if (at2 < 0 || at2 >= SRA_MAX_BYTES || !u[k2].width[at2])
+          continue;
+        IROperand rep = sra_field_op(ir, &u[k2], at2, IROP_BTYPE_INT32, 1);
+        if (s2 == 1)
+          tcc_ir_set_src1(ir, i, rep);
+        else
+          tcc_ir_set_src2(ir, i, rep);
+        changes++;
+      }
+      /* fall through: a raw-slot operand of the same ADD is swapped by the
+       * slot loop below. */
     }
     /* A call with split arguments takes the extra words in its argc. */
     if (call_extra && (q->op == TCCIR_OP_FUNCCALLVAL || q->op == TCCIR_OP_FUNCCALLVOID))
@@ -2790,7 +3047,7 @@ static int sra_objects(TCCIRState *ir)
           sra_partial_store_bfi(ir, i, &u[k], fs, at - fs, obytes, tcc_ir_op_get_src1(ir, q));
         else if (s == 0)
           sra_partial_store(ir, &ins, i, &u[k], fs, at - fs, obytes, tcc_ir_op_get_src1(ir, q),
-                            !(u[k].nofit[at] & obytes));
+                            !(u[k].nofit[at] & obytes) && !smask[i]);
         else
           sra_partial_load(ir, &ins, i, &u[k], fs, at - fs, obytes ? obytes : 4, obytes ? o.is_unsigned : 1,
                            tcc_ir_op_get_dest(ir, q));
@@ -2826,7 +3083,7 @@ static int sra_objects(TCCIRState *ir)
       }
       if (s == 0 && narrow && q->op == TCCIR_OP_STORE)
       {
-        sra_store_as_def(ir, i, rep);
+        sra_store_as_def(ir, i, rep, smask[i]);
         changes++;
         continue;
       }
@@ -2862,12 +3119,14 @@ static int sra_objects(TCCIRState *ir)
   tcc_free(vdef);
   tcc_free(vdefroot);
   tcc_free(def_idx);
+  tcc_free(smask);
   tcc_free(tbad);
   tcc_free(tbad_op);
   tcc_free(tbad_at);
   tcc_free(troot);
   tcc_free(tfrom);
   tcc_free(toff);
+  tcc_free(aok);
   tcc_free(defs);
   tcc_free(u);
   return changes;
@@ -2875,7 +3134,7 @@ static int sra_objects(TCCIRState *ir)
 
 int tcc_ir_opt_sra(TCCIRState *ir)
 {
-  if (!ir || !tcc_state || tcc_state->optimize <= 0 || !sra_function_eligible(ir))
+  if (!ir || !tcc_state || TCC_OPT(tcc_state, optimize) <= 0 || !sra_function_eligible(ir))
     return 0;
   const int first_var = ir->next_local_variable;
   int changes = sra_objects(ir);

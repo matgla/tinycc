@@ -23,8 +23,7 @@ uint8_t *ir_opt_build_merge_bitmap(TCCIRState *ir, int n)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)dest.u.imm32;
+      int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
       if (target >= 0 && target < n)
       {
         pred_count[target]++;
@@ -34,8 +33,7 @@ uint8_t *ir_opt_build_merge_bitmap(TCCIRState *ir, int n)
     }
     else if (q->op == TCCIR_OP_SWITCH_TABLE)
     {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id >= 0 && table_id < ir->num_switch_tables)
       {
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
@@ -48,6 +46,17 @@ uint8_t *ir_opt_build_merge_bitmap(TCCIRState *ir, int n)
         if (table->default_target >= 0 && table->default_target < n)
           pred_count[table->default_target]++;
       }
+    }
+    else if (q->op == TCCIR_OP_INLINE_ASM)
+    {
+      /* An asm goto's labels are edges out of the asm, which also falls through. */
+      for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (target < n)
+        {
+          pred_count[target]++;
+          if (i >= target)
+            is_merge[target / 8] |= (1 << (target % 8));
+        }
     }
     /* NOP falls through: count that edge or a merge behind DCE-left NOP padding is missed */
     if (i + 1 < n && q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_RETURNVALUE &&
@@ -75,15 +84,13 @@ void ir_opt_mark_block_starts(TCCIRState *ir, int *block_start_seen, int gen, in
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      const int tgt = (int)irop_get_imm64_ex(ir, dest);
+      const int tgt = (int)tcc_ir_op_dest_imm(ir, q);
       if (tgt >= 0 && tgt < n)
         block_start_seen[tgt] = gen;
     }
     else if (q->op == TCCIR_OP_SWITCH_TABLE)
     {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id >= 0 && table_id < ir->num_switch_tables)
       {
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
@@ -97,6 +104,12 @@ void ir_opt_mark_block_starts(TCCIRState *ir, int *block_start_seen, int gen, in
           block_start_seen[table->default_target] = gen;
       }
     }
+    else if (q->op == TCCIR_OP_INLINE_ASM)
+    {
+      for (int k = 0, tgt; (tgt = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (tgt < n)
+          block_start_seen[tgt] = gen;
+    }
   }
 }
 
@@ -109,8 +122,7 @@ uint8_t *ir_opt_build_block_starts_bitmap(TCCIRState *ir, int n)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      const int tgt = (int)irop_get_imm64_ex(ir, dest);
+      const int tgt = (int)tcc_ir_op_dest_imm(ir, q);
       if (tgt >= 0 && tgt < n)
         bs[tgt / 8] |= (1 << (tgt % 8));
       if (i + 1 < n)
@@ -118,8 +130,7 @@ uint8_t *ir_opt_build_block_starts_bitmap(TCCIRState *ir, int n)
     }
     else if (q->op == TCCIR_OP_SWITCH_TABLE)
     {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id >= 0 && table_id < ir->num_switch_tables)
       {
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
@@ -132,6 +143,14 @@ uint8_t *ir_opt_build_block_starts_bitmap(TCCIRState *ir, int n)
         if (table->default_target >= 0 && table->default_target < n)
           bs[table->default_target / 8] |= (1 << (table->default_target % 8));
       }
+    }
+    else if (q->op == TCCIR_OP_INLINE_ASM && tcc_ir_asm_goto_target(ir, q, 0) >= 0)
+    {
+      for (int k = 0, tgt; (tgt = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+        if (tgt < n)
+          bs[tgt / 8] |= (1 << (tgt % 8));
+      if (i + 1 < n)
+        bs[(i + 1) / 8] |= (1 << ((i + 1) % 8));
     }
   }
   return bs;
@@ -167,9 +186,55 @@ int ir_has_other_jump_to_fast(TCCIRState *ir, const int *jt_cnt,
   if (exclude_idx >= 0 && exclude_idx < n) {
     IRQuadCompact *q = &ir->compact_instructions[exclude_idx];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if ((int)irop_get_imm64_ex(ir, d) == target) total--;
+      if ((int)tcc_ir_op_dest_imm(ir, q) == target) total--;
     }
   }
   return total > 0;
+}
+
+void ir_opt_reach_mark(IrReachWorklist *w, int idx)
+{
+  if (idx >= 0 && idx < w->n && !(w->bits[idx / 8] & (1 << (idx % 8))))
+  {
+    w->bits[idx / 8] |= (1 << (idx % 8));
+    w->wl[w->tail++] = idx;
+  }
+}
+
+void ir_opt_reach_push(IrReachList *w, int idx)
+{
+  if (idx >= 0 && idx < w->n && !w->seen[idx])
+  {
+    w->seen[idx] = 1;
+    w->list[w->top++] = idx;
+  }
+}
+
+void ir_opt_nop_body(TCCIRState *ir, int n)
+{
+  for (int i = 0; i < n; i++)
+  {
+    ir->compact_instructions[i].op = TCCIR_OP_NOP;
+    ir->compact_instructions[i].is_jump_target = 0;
+  }
+}
+
+void ir_opt_set_self_jump0(TCCIRState *ir)
+{
+  ir->compact_instructions[0].op = TCCIR_OP_JUMP;
+  ir->compact_instructions[0].is_jump_target = 1;
+  IROperand self = irop_make_imm32(-1, 0, IROP_BTYPE_INT32);
+  tcc_ir_set_dest(ir, 0, self);
+  tcc_ir_set_src1_none(ir, 0);
+  tcc_ir_set_src2_none(ir, 0);
+}
+
+void ir_opt_reset_body_regs(TCCIRState *ir)
+{
+  ir->ls.dirty_registers = 0;
+  ir->ls.dirty_float_registers = 0;
+  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
+    memset(ir->ls.live_regs_by_instruction, 0,
+           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
+  ir->leaffunc = 1;
 }

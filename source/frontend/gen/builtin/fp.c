@@ -181,7 +181,11 @@ void __attribute__((noinline)) unary_builtin_fp(void)
   case TOK_builtin_signbitf:
   {
     int tok1 = tok;
-    parse_builtin_params(1, "e");
+    /* Unlike constant_p/classify_type, signbit evaluates its operand: the
+     * runtime path below stores the value and tests bit 31, so the argument
+     * must be parsed in code-emitting mode or a non-trivial one (`a * b`,
+     * `x - 10.0f`, a call) leaves no value behind for that path to test. */
+    parse_builtin_params(0, "e");
 
     /* See an inlined parameter that was bound to a constant arg through. */
     inline_subst_const_arg(vtop);

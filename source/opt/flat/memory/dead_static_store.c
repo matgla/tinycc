@@ -90,12 +90,12 @@ static void dss_build_vreg_map(TCCIRState *ir, DssVregEntry *map, int *count)
       continue;
     /* A post-increment moves its base pointer: a definition deriving nothing. */
     if (q->op == TCCIR_OP_LOAD_POSTINC)
-      dss_vreg_map_def(map, count, irop_get_vreg(tcc_ir_op_get_src1(ir, q)), NULL);
+      dss_vreg_map_def(map, count, tcc_ir_op_src1_vreg(ir, q), NULL);
     if (!irop_config[q->op].has_dest || q->op == TCCIR_OP_STORE_INDEXED)
       continue;
     if (q->op == TCCIR_OP_STORE_POSTINC)
     {
-      dss_vreg_map_def(map, count, irop_get_vreg(tcc_ir_op_get_dest(ir, q)), NULL);
+      dss_vreg_map_def(map, count, tcc_ir_op_dest_vreg(ir, q), NULL);
       continue;
     }
 
@@ -125,9 +125,8 @@ static void dss_build_vreg_map(TCCIRState *ir, DssVregEntry *map, int *count)
     {
       if (irop_config[q->op].has_src1)
       {
-        IROperand s1 = tcc_ir_op_get_src1(ir, q);
-        int32_t svr = irop_get_vreg(s1);
-        if (svr >= 0 && !s1.is_sym)
+        int32_t svr = tcc_ir_op_src1_vreg(ir, q);
+        if (svr >= 0 && !tcc_ir_op_src1_is_sym(ir, q))
           derived_sym = dss_vreg_map_lookup(map, *count, svr);
       }
     }
@@ -175,11 +174,10 @@ static Sym *dss_resolve_store_dest_sym(TCCIRState *ir, IRQuadCompact *q,
         continue;
       if (!irop_config[dq->op].has_dest)
         continue;
-      IROperand d = tcc_ir_op_get_dest(ir, dq);
-      if (d.is_lval)
+      if (tcc_ir_op_dest_is_lval(ir, dq))
         continue;
-      if (irop_get_vreg(d) == vr &&
-          TCCIR_DECODE_VREG_TYPE(irop_get_vreg(d)) == TCCIR_VREG_TYPE_TEMP)
+      if (tcc_ir_op_dest_vreg(ir, dq) == vr &&
+          TCCIR_DECODE_VREG_TYPE(tcc_ir_op_dest_vreg(ir, dq)) == TCCIR_VREG_TYPE_TEMP)
       {
         def_idx = j;
         def_count++;
@@ -233,7 +231,7 @@ int tcc_ir_opt_dead_static_store_elim(TCCIRState *ir)
      * writes only through its destination argument. */
     if (q->op == TCCIR_OP_FUNCCALLVOID)
     {
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      Sym *callee = tcc_ir_op_src1_sym(ir, q);
       IROperand dst;
       if (!callee || !tu_is_block_copy_helper(get_tok_str(callee->v, NULL)) ||
           !ir_opt_get_call_param_operand(ir, i, 0, &dst))
@@ -270,9 +268,4 @@ int tcc_ir_opt_dead_static_store_elim(TCCIRState *ir)
   }
 
   return changes;
-}
-
-int tcc_ir_opt_dead_static_store_elim_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_dead_static_store_elim(ctx->ir);
 }

@@ -43,6 +43,10 @@ const CgStubCall *cgstub_nth_call_any(int n);
  * when enabled, else 4 bytes (32-bit). Default: disabled (0), i.e. 4 bytes. */
 void cgstub_set_branch_size_16(int enable);
 
+/* return_value_mop advances `ind` by this many bytes, as the value move it
+ * stands for would.  Default: 0 (the return value op lays out as nothing). */
+void cgstub_set_return_value_bytes(int bytes);
+
 /* switch_table_dry_run_size / switch_load_dry_run_size return num_entries *
  * this many bytes. Defaults: 4 / 4. */
 void cgstub_set_switch_entry_sizes(int table_entry_size, int load_entry_size);

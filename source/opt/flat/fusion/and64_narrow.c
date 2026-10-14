@@ -52,7 +52,7 @@ static int a64_use_reads_low_only(TCCIRState *ir, IRQuadCompact *u, int32_t vreg
   if (!m1 && !m2)
     return 0;
 
-  if (u->op == TCCIR_OP_ASSIGN && m1 && !m2 && !irop_needs_pair(tcc_ir_op_get_dest(ir, u)))
+  if (u->op == TCCIR_OP_ASSIGN && m1 && !m2 && !tcc_ir_op_dest_needs_pair(ir, u))
     return 1;
 
   if (m1 && irop_needs_pair(s1))
@@ -111,7 +111,7 @@ int tcc_ir_opt_and64_narrow(TCCIRState *ir)
       IRQuadCompact *u = &ir->compact_instructions[j];
       if (u->op == TCCIR_OP_NOP)
         continue;
-      if (irop_get_vreg(tcc_ir_op_get_src1(ir, u)) != dv && irop_get_vreg(tcc_ir_op_get_src2(ir, u)) != dv)
+      if (tcc_ir_op_src1_vreg(ir, u) != dv && tcc_ir_op_src2_vreg(ir, u) != dv)
         continue;
       low_only = a64_use_reads_low_only(ir, u, dv);
       break;
@@ -138,5 +138,3 @@ int tcc_ir_opt_and64_narrow(TCCIRState *ir)
 
   return changes;
 }
-
-int tcc_ir_opt_and64_narrow_ex(IROptCtx *ctx) { return tcc_ir_opt_and64_narrow(ctx->ir); }

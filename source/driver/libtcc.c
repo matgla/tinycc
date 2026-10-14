@@ -186,8 +186,13 @@ static unsigned long tcc_big_alloc_bytes;
    line the macros in tcc.h capture; the table is fixed and small because the
    distinct sites that allocate >= 2 KiB number in the tens, and a site that
    does not fit is folded into the totals above (so the bytes still add up)
-   rather than growing the table on the allocation path. */
+   rather than growing the table on the allocation path.  LOW_MEM keeps the
+   dozen biggest: the table is .bss in every compiler process. */
+#ifdef CONFIG_TCC_LOW_MEM
+#define TCC_ALLOC_SITES 12
+#else
 #define TCC_ALLOC_SITES 48
+#endif
 typedef struct TCCAllocSite
 {
   const char *file;
@@ -574,7 +579,9 @@ enum
   ERROR_ERROR
 };
 
-static void error1(int mode, const char *fmt, va_list ap)
+/* tag: printed after "error: " -- keeps the internal-compiler-error prefix
+ * in one place instead of in every message literal */
+static void error1(int mode, const char *tag, const char *fmt, va_list ap)
 {
   BufferedFile **pf, *f;
   TCCState *s1 = tcc_state;
@@ -630,6 +637,8 @@ static void error1(int mode, const char *fmt, va_list ap)
     cstr_printf(&cs, "tcc: ");
   }
   cstr_printf(&cs, mode == ERROR_WARN ? "warning: " : "error: ");
+  if (tag)
+    cstr_printf(&cs, "%s", tag);
   if (pp_expr > 1)
     pp_error(&cs); /* special handler for preprocessor expression errors */
   else
@@ -669,7 +678,7 @@ PUB_FUNC int _tcc_error_noabort(const char *fmt, ...)
 {
   va_list ap;
   va_start(ap, fmt);
-  error1(ERROR_NOABORT, fmt, ap);
+  error1(ERROR_NOABORT, NULL, fmt, ap);
   va_end(ap);
   return -1;
 }
@@ -679,16 +688,26 @@ PUB_FUNC void _tcc_error(const char *fmt, ...)
 {
   va_list ap;
   va_start(ap, fmt);
-  error1(ERROR_ERROR, fmt, ap);
+  error1(ERROR_ERROR, NULL, fmt, ap);
   exit(1);
 }
 #define _tcc_error use_tcc_error_noabort
+
+/* internal compiler error: a compiler invariant broke (not a user mistake).
+ * Same level as tcc_error (aborts the compile), tagged "compiler_error: ". */
+PUB_FUNC void _tcc_ice(const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  error1(ERROR_ERROR, "compiler_error: ", fmt, ap);
+  exit(1);
+}
 
 PUB_FUNC void _tcc_warning(const char *fmt, ...)
 {
   va_list ap;
   va_start(ap, fmt);
-  error1(ERROR_WARN, fmt, ap);
+  error1(ERROR_WARN, NULL, fmt, ap);
   va_end(ap);
 }
 
@@ -964,7 +983,15 @@ LIBTCCAPI TCCState *tcc_new(void)
   /* Calls to undefined functions that no library in the library paths exports
    * keep R9 (no reload after the call); -fno-module-local-calls restores the
    * reload after every call out of the translation unit. */
+#ifdef CONFIG_TCC_O0_ONLY
+  /* The r9-reload elision reads every library's export table into the heap
+   * (tens of KB for libc.so) to decide which callees bind locally; an
+   * O0-only compiler reloads r9 after every external call instead.
+   * -fmodule-local-calls still turns it on. */
+  s->module_local_calls = 0;
+#else
   s->module_local_calls = 1;
+#endif
 #else
   s->text_and_data_separation = 0;
 #endif
@@ -989,6 +1016,8 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
 
   /* free IR-level interprocedural caches */
   tcc_ir_free_switch_func_cache(s1);
+  tcc_free(s1->func_purity_cache);
+  tcc_free(s1->func_const_result_cache);
 
   /* free lazy object files (Phase 2 GC) */
   tcc_free_lazy_objfiles(s1);
@@ -1599,8 +1628,10 @@ static int tcc_set_linker(TCCState *s, const char *option)
     }
     else if (link_option(option, "gc-sections-aggressive", &p))
     {
+      /* The lazy per-object loader this used to enable linked symbols
+         against object-local section numbers (and collected nothing the
+         plain pass does not).  Kept as a spelling of --gc-sections. */
       s->gc_sections = 1;
-      s->gc_sections_aggressive = 1;
     }
     else if (link_option(option, "no-gc-sections", &p))
     {
@@ -1655,7 +1686,7 @@ static int tcc_set_linker(TCCState *s, const char *option)
 
 typedef struct TCCOption
 {
-  const char *name;
+  const char *TCC_RODATA_REL name;
   uint16_t index;
   uint16_t flags;
 } TCCOption;
@@ -1845,7 +1876,7 @@ typedef struct FlagDef
 {
   uint16_t offset;
   uint16_t flags;
-  const char *name;
+  const char *TCC_RODATA_REL name;
 } FlagDef;
 
 #define WD_ALL 0x0001    /* warning is activated when using -Wall */
@@ -1904,7 +1935,9 @@ static const FlagDef options_f[] = {{offsetof(TCCState, char_is_unsigned), 0, "u
                                     {offsetof(TCCState, module_local_calls), 0, "module-local-calls"},
                                     {0, 0, NULL}};
 
-static const FlagDef options_m[] = {{offsetof(TCCState, ms_bitfields), 0, "ms-bitfields"}, {0, 0, NULL}};
+static const FlagDef options_m[] = {{offsetof(TCCState, ms_bitfields), 0, "ms-bitfields"},
+                                    {offsetof(TCCState, inline_atomics), 0, "inline-atomics"},
+                                    {0, 0, NULL}};
 
 static int set_flag(TCCState *s, const FlagDef *flags, const char *name)
 {
@@ -2227,10 +2260,25 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         }
         break;
       }
+      /* -fvisibility=: the visibility of definitions that name none */
+      if (strstart("visibility=", &optarg))
+      {
+        if (!strcmp(optarg, "default"))
+          s->default_visibility = STV_DEFAULT;
+        else if (!strcmp(optarg, "hidden"))
+          s->default_visibility = STV_HIDDEN;
+        else if (!strcmp(optarg, "internal"))
+          s->default_visibility = STV_INTERNAL;
+        else if (!strcmp(optarg, "protected"))
+          s->default_visibility = STV_PROTECTED;
+        else
+          return tcc_error_noabort("unknown visibility '%s' in -fvisibility=", optarg);
+        break;
+      }
       /* Plain -fno-builtin: disable all builtin call inlining (mem* expansion). */
       if (!strcmp(optarg, "no-builtin"))
       {
-        s->no_builtin_funcs |= NO_BUILTIN_MEMFUNCS;
+        s->no_builtin_funcs |= NO_BUILTIN_MEMFUNCS | NO_BUILTIN_ALL;
         break;
       }
       /* Handle -fno-builtin-<name> flags */
@@ -2501,7 +2549,7 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
        * (loop unrolling / IV strength reduction / LICM, MUL+ADD→MLA fusion,
        * interprocedural const-prop, re-rolling, and full small-function
        * inlining) is gated to -O2. */
-      if (s->optimize >= 1)
+      if (TCC_OPT(s, optimize) >= 1)
       {
         s->opt_dce = 1;
         s->opt_const_prop = 1;
@@ -2523,14 +2571,14 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
         s->opt_inline_small = 1;    /* Inline tiny static/inline functions (≤30 words) */
         s->opt_inline_called_once = 1; /* Inline static functions called from one place, bodies deferred to TU end */
         s->opt_drop_unused_statics = 1; /* Emit only the statics something live refers to */
-        if (!s->opt_inline_limit_user)
+        if (!TCC_OPT(s, opt_inline_limit_user))
           s->opt_inline_limit = 30;
       }
       /* -O2: everything in -O1 plus the heavy tier — loop unrolling / IV
        * strength reduction / LICM / re-rolling, MUL+ADD→MLA fusion,
        * interprocedural constant propagation, and full small-function
        * inlining. */
-      if (s->optimize >= 2)
+      if (TCC_OPT(s, optimize) >= 2)
       {
         s->opt_mla_fusion = 1;      /* Fuse MUL+ADD into MLA */
         /* fp-offset-cache disabled: miscompiles loops when combined with
@@ -2546,7 +2594,7 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv, int optind)
          * The old `if (limit < 100) limit = 100` force-raised, so
          * `-finline-limit=20 -O2` was silently ignored while
          * `-O2 -finline-limit=20` worked — the meaning depended on argv order. */
-        if (!s->opt_inline_limit_user)
+        if (!TCC_OPT(s, opt_inline_limit_user))
           s->opt_inline_limit = 100;
       }
       break;
@@ -2620,8 +2668,12 @@ LIBTCCAPI int tcc_set_options(TCCState *s, const char *r)
    ~41 ms of tcc-side init that neither -bench's ms buckets nor PASS_TIME can
    attribute (it is before the passes). Recording is unconditional because the
    first stamps land before -bench has been parsed; the cost is one gettimeofday
-   per stamp. */
+   per stamp.  A compile records ~13; LOW_MEM keeps room for 16 (.bss). */
+#ifdef CONFIG_TCC_LOW_MEM
+#define TCC_INIT_STAMP_MAX 16
+#else
 #define TCC_INIT_STAMP_MAX 48
+#endif
 static struct
 {
   const char *label;

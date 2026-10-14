@@ -250,7 +250,6 @@ static inline void ssa_ctx_init_manual(ssa_ctx *c)
 
   c->cfg = tcc_mallocz(sizeof(*c->cfg));
   c->cfg->num_blocks = blocks;
-  c->cfg->capacity = blocks;
   c->cfg->blocks = tcc_mallocz(sizeof(IRBasicBlock) * blocks);
   c->cfg->num_instrs = UTB_MAX_INSTR;
   c->cfg->instr_to_block = tcc_mallocz(sizeof(int) * UTB_MAX_INSTR);

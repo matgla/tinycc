@@ -185,6 +185,8 @@ typedef struct CodeGenDryRunState
   int instruction_count;        /* IR instructions processed */
   int max_nested_saves;         /* Max nested-call save slots used at any call site */
   int rodata_anchor_sites;      /* Shared-.rodata addresses materialised in the body */
+  uint32_t prolog_pushes;       /* Callee-saved regs the prologue is expected to push */
+  uint32_t prolog_pushes_used;  /* ...of which the run took one as a dead scratch */
 } CodeGenDryRunState;
 /* True only for the discovery dry run: "model what would happen" rather than
  * "emit what the real pass emits". */
@@ -194,6 +196,13 @@ typedef struct CodeGenDryRunState
  * We only hash entries created through th_literal_pool_find_or_allocate(), so
  * plain th_literal_pool_allocate() users stay distinct. */
 #define LITERAL_POOL_HASH_BUCKET_COUNT 512
+/* First size of the real and dry-run literal pool arrays; both grow by
+ * doubling in th_literal_pool_allocate and live for the whole TU. */
+#ifdef CONFIG_TCC_LOW_MEM
+#define LITERAL_POOL_FIRST_SIZE 16
+#else
+#define LITERAL_POOL_FIRST_SIZE 64
+#endif
 #define LITERAL_POOL_LOOKUP_CACHE_SIZE 16
 
 typedef struct LiteralPoolLookupCacheEntry
@@ -422,6 +431,7 @@ typedef struct CallGenContext
   uint32_t arg_move_dst_mask; /* Registers that will be explicitly written by register arg moves.
                                * These are safe to clobber as scratch during stack arg placement
                                * because the subsequent register moves will overwrite them. */
+  uint32_t call_target_regs;  /* Registers naming the indirect call target (read at the call). */
 } CallGenContext;
 
 /* Copy a (possibly split) struct argument's stack portion into the outgoing
@@ -464,7 +474,7 @@ extern int epilogue_stack_dealloc;
 extern int vararg_push_size;
 extern uint32_t scratch_global_exclude;
 extern int rodata_anchor_reg;
-extern int scratch_push_type[128];
+extern signed char scratch_push_type[128];
 extern int scratch_push_count;
 extern int tail_call_pending;
 extern int g_debug_current_op;
@@ -472,10 +482,26 @@ extern CodeGenDryRunState dry_run_state;
 extern int dry_run_rehearsal;
 extern int helper_call_sp_bias;
 extern int call_args_sp_bias;
+extern int asm_save_sp_bias;
 extern ThumbLiteralPoolEntry *dry_run_literal_pool;
 extern int dry_run_literal_pool_count;
 extern int pool_entries_total;
 extern int align_pad_max;
+/* The last instruction ot() wrote (real pass): where it ends, its encoding,
+ * and whether it is conditional (an IT or inside an IT block). */
+typedef struct ThumbLastInsn
+{
+  int pos, end;
+  uint32_t opcode;
+  int size;
+  int conditional;
+} ThumbLastInsn;
+extern ThumbLastInsn th_last_insn;
+extern int th_func_code_start;
+/* Instructions widened in place of an alignment pad this function: reset at
+ * the prolog; th_patch_call ICEs on a branch into the middle of one. */
+void th_widened_reset(void);
+int th_widened_contains_mid(int addr);
 extern int dry_run_literal_pool_size;
 extern TCCChainedHash literal_pool_hash;
 extern LiteralPoolLookupCache literal_pool_last_lookup;
@@ -611,6 +637,7 @@ MachineOperand mach_make_complex_imag(const MachineOperand *op);
 ST_FUNC void tcc_gen_machine_store_to_stack_ex(int reg, int offset, uint32_t extra_exclude);
 void gcall_or_jump_mop(int is_jmp, MachineOperand target);
 void load_immediate(int reg, uint32_t imm, Sym *sym, int update_flags);
+int load_constant_from_holding_reg(int reg, int64_t key);
 
 /* Defined in arm-thumb-call.c. */
 int thumb_callee_needs_local_call_marker(Sym *sym);

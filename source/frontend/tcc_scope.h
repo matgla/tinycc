@@ -23,6 +23,7 @@ struct scope
   } cl;
   int *bsym, *csym;
   Sym *lstk, *llstk;
+  int first_obj, first_insn; /* ir frame_obj_count, next_instruction_index at entry (tcc_ir_frame_scope_block) */
 };
 
 extern struct scope *cur_scope, *loop_scope, *root_scope;

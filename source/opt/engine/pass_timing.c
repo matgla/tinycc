@@ -37,14 +37,19 @@ unsigned long tcc_pass_clk_us(void)
 }
 
 #define TCC_PASS_TIMING_MAX 256
-static struct {
+/* Allocated on the first record, i.e. only when timing is on: as a static
+ * table it was 6 KiB of .bss (12 KiB on a 64-bit host) that every compile
+ * paid for, timed or not.  Kept for the life of the process, as the static
+ * table was: with several files on one -c command line each dump reports the
+ * running totals of every file so far. */
+static struct TCCPassTime {
   const char *name;
   unsigned long self_us;      /* exclusive: minus time attributed to nested timed passes */
   unsigned long incl_us;      /* inclusive */
   unsigned long calls;
   unsigned long productive;   /* calls that reported changes > 0 */
   unsigned long unknown;      /* calls whose change count was not reported */
-} tcc_pt_tab[TCC_PASS_TIMING_MAX];
+} *tcc_pt_tab;
 static int tcc_pt_count;
 static int tcc_pt_overflow;
 
@@ -70,6 +75,8 @@ static void tcc_pass_timing_record(const char *name, unsigned long self_us,
       tcc_pt_overflow++;
       return;
     }
+    if (!tcc_pt_tab)
+      tcc_pt_tab = tcc_mallocz(sizeof(*tcc_pt_tab) * TCC_PASS_TIMING_MAX);
     tcc_pt_count++;
     tcc_pt_tab[i].name = name;
   }

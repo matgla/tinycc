@@ -73,7 +73,7 @@ static int bf_possible_bits(TCCIRState *ir, IROperand op, int before_idx, uint32
   if (dq->op == TCCIR_OP_ASSIGN)
     return bf_possible_bits(ir, a1, d, out);
 
-  if (irop_get_btype(tcc_ir_op_get_dest(ir, dq)) != IROP_BTYPE_INT32)
+  if (tcc_ir_op_dest_btype(ir, dq) != IROP_BTYPE_INT32)
     return 0;
 
   switch (dq->op)
@@ -159,10 +159,9 @@ static int bf_real_def(TCCIRState *ir, int32_t vr, int before_idx)
     IRQuadCompact *dq = &ir->compact_instructions[d];
     if (dq->op != TCCIR_OP_ASSIGN)
       return d;
-    IROperand a1 = tcc_ir_op_get_src1(ir, dq);
-    if (a1.is_lval)
+    if (tcc_ir_op_src1_is_lval(ir, dq))
       return -1;
-    vr = irop_get_vreg(a1);
+    vr = tcc_ir_op_src1_vreg(ir, dq);
     before_idx = d;
   }
   return -1;
@@ -182,10 +181,9 @@ int tcc_ir_opt_bitfield_insert_extract(TCCIRState *ir)
     if (q->op != TCCIR_OP_SHR && q->op != TCCIR_OP_AND)
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (dest.is_lval || irop_get_btype(dest) != IROP_BTYPE_INT32)
+    if (tcc_ir_op_dest_is_lval(ir, q) || tcc_ir_op_dest_btype(ir, q) != IROP_BTYPE_INT32)
       continue;
-    int32_t dest_vr = irop_get_vreg(dest);
+    int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
     if (dest_vr < 0 || TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
 
@@ -206,8 +204,7 @@ int tcc_ir_opt_bitfield_insert_extract(TCCIRState *ir)
       if (bf_const_u32(ir, sa, &sav))
       {
         int av = (int)sav;
-        IROperand inner = tcc_ir_op_get_src1(ir, orq);
-        int32_t iv = inner.is_lval ? -1 : irop_get_vreg(inner);
+        int32_t iv = tcc_ir_op_src1_is_lval(ir, orq) ? -1 : tcc_ir_op_src1_vreg(ir, orq);
         if (av >= 1 && av <= 31 && iv >= 0 && TCCIR_DECODE_VREG_TYPE(iv) == TCCIR_VREG_TYPE_TEMP)
         {
           int di = bf_real_def(ir, iv, def_or);
@@ -286,7 +283,7 @@ int tcc_ir_opt_bitfield_insert_extract(TCCIRState *ir)
 
         q->op = TCCIR_OP_ASSIGN;
         tcc_ir_set_src1(ir, i, new_src);
-        tcc_ir_set_src2(ir, i, IROP_NONE);
+        tcc_ir_set_src2_none(ir, i);
         LOG_BITFIELD("@%d: ((V SHL %d) | low) extract folded to field value (a=%d b=%d w=%d)", i, s_eff, outer_shl,
                      b, w);
         changes++;
@@ -323,7 +320,7 @@ int tcc_ir_opt_bitfield_insert_extract(TCCIRState *ir)
 
         q->op = TCCIR_OP_ASSIGN;
         tcc_ir_set_src1(ir, i, new_src);
-        tcc_ir_set_src2(ir, i, IROP_NONE);
+        tcc_ir_set_src2_none(ir, i);
         LOG_BITFIELD("@%d: (OR@%d) & %#x folded to low field value", i, def_or, m);
         changes++;
         break;
@@ -332,11 +329,6 @@ int tcc_ir_opt_bitfield_insert_extract(TCCIRState *ir)
   }
 
   return changes;
-}
-
-int tcc_ir_opt_bitfield_insert_extract_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_bitfield_insert_extract(ctx->ir);
 }
 
 /* Must run before tcc_ir_barrel_shift_fusion (which would fold the SHL into the OR). */
@@ -364,14 +356,15 @@ int tcc_ir_opt_bitfield_insert_to_bfi(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   int changes = 0;
+  /* def/use queries per candidate OR: counts built once, kept in step with the folds */
+  int vidx = tcc_ir_vreg_index_open(ir);
 
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *orq = &ir->compact_instructions[i];
     if (orq->op != TCCIR_OP_OR || orq->is_jump_target)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, orq);
-    if (dest.is_lval || irop_get_btype(dest) != IROP_BTYPE_INT32)
+    if (tcc_ir_op_dest_is_lval(ir, orq) || tcc_ir_op_dest_btype(ir, orq) != IROP_BTYPE_INT32)
       continue;
 
     IROperand o1 = tcc_ir_op_get_src1(ir, orq);
@@ -475,7 +468,7 @@ int tcc_ir_opt_bitfield_insert_to_bfi(TCCIRState *ir)
       for (int j = lo + 1; j < i && safe; j++)
       {
         IRQuadCompact *jq = &ir->compact_instructions[j];
-        if (jq->op == TCCIR_OP_NOP)
+        if (jq->op == TCCIR_OP_NOP && !jq->is_jump_target) /* a NOP can be the join */
           continue;
         if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF || jq->op == TCCIR_OP_IJUMP ||
             jq->op == TCCIR_OP_SWITCH_TABLE || jq->is_jump_target)
@@ -485,10 +478,9 @@ int tcc_ir_opt_bitfield_insert_to_bfi(TCCIRState *ir)
         }
         if (irop_config[jq->op].has_dest)
         {
-          IROperand jd = tcc_ir_op_get_dest(ir, jq);
-          if (irop_has_vreg(jd))
+          if (tcc_ir_op_dest_has_vreg(ir, jq))
           {
-            int32_t jdv = irop_get_vreg(jd);
+            int32_t jdv = tcc_ir_op_dest_vreg(ir, jq);
             if ((j > and_idx && jdv == word_vr) || (shl_idx >= 0 && j > shl_idx && jdv == value_vr))
             {
               safe = 0;
@@ -505,6 +497,9 @@ int tcc_ir_opt_bitfield_insert_to_bfi(TCCIRState *ir)
         ir->bfi_params_len = ir->max_orig_index + 1;
       }
 
+      tcc_ir_vreg_index_unnote(ir, i);
+      tcc_ir_vreg_index_unnote(ir, and_idx);
+      tcc_ir_vreg_index_unnote(ir, shl_idx);
       orq->op = TCCIR_OP_BFI;
       tcc_ir_set_src1(ir, i, word_op);
       tcc_ir_set_src2(ir, i, value_op);
@@ -512,10 +507,12 @@ int tcc_ir_opt_bitfield_insert_to_bfi(TCCIRState *ir)
       andq->op = TCCIR_OP_NOP;
       if (shl_idx >= 0)
         ir->compact_instructions[shl_idx].op = TCCIR_OP_NOP;
+      tcc_ir_vreg_index_note(ir, i);
       changes++;
       LOG_BITFIELD("INSERT->BFI @%d: lsb=%d width=%d (AND@%d SHL@%d)", i, lsb, width, and_idx, shl_idx);
     }
   }
 
+  tcc_ir_vreg_index_close(ir, vidx);
   return changes;
 }

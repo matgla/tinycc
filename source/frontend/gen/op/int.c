@@ -52,6 +52,25 @@ static int gen_opic_lt(uint64_t a, uint64_t b)
 
 /* handle integer constant optimizations and various machine
    independent opt */
+/* Both operands are `&&label` (or string literal) values and no other label difference is live on
+ * the value stack (only one pair is parked at a time).  Data-symbol
+ * differences are not load-time constants for the front end to fold. */
+static int label_diff_operands_ok(SValue *v1, SValue *v2)
+{
+  SValue *sv;
+  if (!v1->sym || !v2->sym)
+    return 0;
+  /* string literals (anonymous symbols) are accepted too: gcc folds
+     &"abc"[1] - &"abc"[0] */
+  if ((v1->sym->v < SYM_FIRST_ANOM && label_find(v1->sym->v) != v1->sym) ||
+      (v2->sym->v < SYM_FIRST_ANOM && label_find(v2->sym->v) != v2->sym))
+    return 0;
+  for (sv = _vstack + 1; sv <= vtop; sv++)
+    if ((sv->r & VT_SYM) && sv->sym == &label_diff_marker)
+      return 0;
+  return 1;
+}
+
 void gen_opic(int op)
 {
   SValue *v1 = vtop - 1;
@@ -262,7 +281,9 @@ void gen_opic(int op)
     }
     if (c1 && ((l1 == 0 && (op == TOK_SHL || op == TOK_SHR || op == TOK_SAR)) || (l1 == -1 && op == TOK_SAR)))
     {
-      /* treat (0 << x), (0 >> x) and (-1 >> x) as constant */
+      /* treat (0 << x), (0 >> x) and (-1 >> x) as constant -- but x is
+       * still a pending lvalue, and a volatile one must be read first */
+      gv_discarded_volatile();
       vpop();
       vtop->r |= VT_NONCONST;
     }
@@ -270,7 +291,12 @@ void gen_opic(int op)
                     (op == '|' && (l2 == -1 || (l2 == 0xFFFFFFFF && t2 != VT_LLONG))) ||
                     (l2 == 1 && (op == '%' || op == TOK_UMOD))))
     {
-      /* treat (x & 0), (x * 0), (x | -1) and (x % 1) as constant */
+      /* treat (x & 0), (x * 0), (x | -1) and (x % 1) as constant -- after
+       * reading x if it is a volatile lvalue: the value is known, but the
+       * access is still mandated (`REG & 0` reads REG) */
+      vswap();
+      gv_discarded_volatile();
+      vswap();
       if (l2 == 1)
         vtop->c.i = 0;
       vswap();
@@ -332,16 +358,25 @@ void gen_opic(int op)
       vtop->c.i = l2;
     }
     else if (op == '-' && CONST_WANTED && (v1->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) &&
-             (v2->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM))
+             (v2->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) &&
+             (v1->sym == v2->sym || label_diff_operands_ok(v1, v2)))
     {
-      /* Label difference in constant context: &&lab1 - &&lab0.
-         Record the two symbols for deferred resolution after codegen,
-         produce a pure VT_CONST result with the addend difference. */
-      pending_label_diff_plus = v1->sym;
-      pending_label_diff_minus = v2->sym;
+      /* A symbol minus itself is the plain addend difference.  Otherwise it
+         is a label difference &&lab1 - &&lab0: record the two symbols for
+         deferred resolution after codegen and leave
+         `label_diff_marker + addend difference` as the value. */
       v1->c.i = v1->c.i - v2->c.i;
-      v1->r = VT_CONST;
-      v1->sym = NULL;
+      if (v1->sym == v2->sym)
+      {
+        v1->r = VT_CONST;
+        v1->sym = NULL;
+      }
+      else
+      {
+        pending_label_diff_plus = v1->sym;
+        pending_label_diff_minus = v2->sym;
+        v1->sym = &label_diff_marker;
+      }
       vtop--;
     }
     else

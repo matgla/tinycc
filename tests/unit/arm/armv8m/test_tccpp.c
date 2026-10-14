@@ -1194,6 +1194,45 @@ UT_TEST(test_next_lexes_string_with_tok_str)
   return 0;
 }
 
+UT_TEST(test_next_character_constant_uses_target_char_signedness)
+{
+  /* Use an octal escape so the source byte is 0xff.  A hex escape is first
+     encoded as UTF-8 by parse_escape_string for ordinary string tokens. */
+  tcc_state->char_is_unsigned = 1;
+  UT_ASSERT(ut_open_input("'\\377'") == 0);
+  ut_reset_pp_state();
+  parse_flags = PARSE_FLAG_TOK_NUM | PARSE_FLAG_TOK_STR;
+  next();
+  UT_ASSERT_EQ(tok, TOK_CCHAR);
+  UT_ASSERT_EQ(tokc.i, 255);
+  file = NULL;
+
+  UT_ASSERT(ut_open_input("'ab\\377'") == 0);
+  ut_reset_pp_state();
+  next();
+  UT_ASSERT_EQ(tok, TOK_CCHAR);
+  UT_ASSERT_EQ(tokc.i, 0x6162ff);
+  file = NULL;
+
+  tcc_state->char_is_unsigned = 0;
+  UT_ASSERT(ut_open_input("'\\377'") == 0);
+  ut_reset_pp_state();
+  next();
+  UT_ASSERT_EQ(tok, TOK_CCHAR);
+  UT_ASSERT_EQ(tokc.i, -1);
+  file = NULL;
+
+  UT_ASSERT(ut_open_input("'ab\\377'") == 0);
+  ut_reset_pp_state();
+  next();
+  UT_ASSERT_EQ(tok, TOK_CCHAR);
+  UT_ASSERT_EQ(tokc.i, 0x6162ff);
+  tcc_state->char_is_unsigned = 1;
+  parse_flags = 0;
+  file = NULL;
+  return 0;
+}
+
 UT_TEST(test_next_lexes_increment_operator)
 {
   UT_ASSERT(ut_open_input("++") == 0);

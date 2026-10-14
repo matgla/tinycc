@@ -1,0 +1,6 @@
+/usr/lib/libc.so: [usr|/usr 1-4] [lib|/usr/lib 5-8] [libc.so|/usr/lib/libc.so 9-16] sum=13 last=16
+//a///bb//: [a|//a 2-3] [bb|//a///bb 6-8] sum=3 last=8
+rel/x: [rel|rel 0-3] [x|rel/x 4-5] sum=4 last=5
+/: sum=0 last=0
+: sum=0 last=0
+single: [single|single 0-6] sum=6 last=6

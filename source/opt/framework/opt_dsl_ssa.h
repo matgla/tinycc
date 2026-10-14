@@ -18,6 +18,7 @@
 
 #include "ssa_opt.h"
 #include "opt_dsl_types.h"
+#include "opt_dsl_helpers.h"
 
 typedef struct {
   int             idx;    /* index of the defining instruction */
@@ -28,11 +29,8 @@ typedef struct {
   IROperand       src2;
 } OptDslPair;
 
-/* Resolve spec.link's operand to its single-def TEMP-vreg producer; fills *out
- * and returns 1, or returns 0 when the operand is not a single-def TEMP vreg,
- * its opcode does not match spec.op (>= 0), or single_use is asked and unmet. */
-static inline int opt_dsl_pair_match(IRSSAOptCtx *ctx, int i,
-                                     IROptPairSpec spec, OptDslPair *out)
+/* vreg info of spec.link's single-def TEMP producer, or NULL on any spec mismatch. */
+static inline IRSSAVregInfo *opt_dsl_pair_find(IRSSAOptCtx *ctx, int i, IROptPairSpec spec)
 {
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *q = &ir->compact_instructions[i];
@@ -41,17 +39,28 @@ static inline int opt_dsl_pair_match(IRSSAOptCtx *ctx, int i,
                        : tcc_ir_op_get_src1(ir, q);
   int32_t vr = irop_get_vreg(linked);
   if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
-    return 0;
+    return NULL;
   if (linked.is_lval || linked.tag != IROP_TAG_VREG)
-    return 0;
+    return NULL;
   IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, vr);
   if (!vi || vi->def_instr < 0 || vi->def_count > 1)
-    return 0;
+    return NULL;
   if (spec.single_use && vi->use_count != 1)
+    return NULL;
+  if (spec.op >= 0 && ir->compact_instructions[vi->def_instr].op != spec.op)
+    return NULL;
+  return vi;
+}
+
+/* opt_dsl_pair_find, with the producer's index, opcode and operands in *out. */
+static inline int opt_dsl_pair_match(IRSSAOptCtx *ctx, int i,
+                                     IROptPairSpec spec, OptDslPair *out)
+{
+  IRSSAVregInfo *vi = opt_dsl_pair_find(ctx, i, spec);
+  if (!vi)
     return 0;
+  TCCIRState *ir = ctx->ir;
   IRQuadCompact *def = &ir->compact_instructions[vi->def_instr];
-  if (spec.op >= 0 && def->op != spec.op)
-    return 0;
   out->idx  = vi->def_instr;
   out->op   = def->op;
   out->vi   = vi;
@@ -61,39 +70,42 @@ static inline int opt_dsl_pair_match(IRSSAOptCtx *ctx, int i,
   return 1;
 }
 
-/* Instruction i has stopped using the paired producer's result and now uses
- * new_linked instead.  delete_second: the producer was used only here, so it is
- * dead — zero its use count and NOP it.  Otherwise just drop the one use edge
- * (the producer may survive, or is left for DCE). */
-static inline void opt_dsl_pair_retire(IRSSAOptCtx *ctx, int i,
-                                       const OptDslPair *p,
-                                       IROperand new_linked, int delete_second)
+/* i now reads new_linked instead of producer pidx; delete_second NOPs the producer, else drops one use edge. */
+OPT_DSL_OUTLINE static inline void opt_dsl_pair_release(IRSSAOptCtx *ctx, int i, IRSSAVregInfo *pvi, int pidx,
+                                        IROperand new_linked, int delete_second)
 {
   IRSSAVregInfo *nvi = ssa_opt_vinfo(ctx, irop_get_vreg(new_linked));
   if (delete_second) {
-    p->vi->use_count = 0;
-    ssa_opt_nop_instr(ctx, p->idx);
+    pvi->use_count = 0;
+    ssa_opt_nop_instr(ctx, pidx);
   } else {
-    ssa_opt_remove_use_instr(p->vi, i);
+    ssa_opt_remove_use_instr(pvi, i);
   }
   if (nvi)
     ssa_opt_add_use_instr(nvi, i);
 }
 
-/* Drop instruction i's use edge for op's vreg (no-op unless a tracked TEMP). */
-static inline void opt_dsl_drop_use(IRSSAOptCtx *ctx, IROperand op, int i)
+static inline void opt_dsl_pair_retire(IRSSAOptCtx *ctx, int i,
+                                       const OptDslPair *p,
+                                       IROperand new_linked, int delete_second)
 {
-  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(op));
+  opt_dsl_pair_release(ctx, i, p->vi, p->idx, new_linked, delete_second);
+}
+
+/* Drop instruction i's use edge for *op's vreg (no-op unless a tracked TEMP). */
+OPT_DSL_OUTLINE static inline void opt_dsl_drop_use(IRSSAOptCtx *ctx, const IROperand *op, int i)
+{
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(*op));
   if (vi)
     ssa_opt_remove_use_instr(vi, i);
 }
 
-/* Add a use edge for a plain (non-sym) vreg operand consumed by instruction i. */
-static inline void opt_dsl_add_use(IRSSAOptCtx *ctx, IROperand op, int i)
+/* Add a use edge for a plain (non-sym) vreg operand *op consumed by instruction i. */
+OPT_DSL_OUTLINE static inline void opt_dsl_add_use(IRSSAOptCtx *ctx, const IROperand *op, int i)
 {
-  if (op.tag != IROP_TAG_VREG || op.is_sym)
+  if (op->tag != IROP_TAG_VREG || op->is_sym)
     return;
-  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(op));
+  IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(*op));
   if (vi)
     ssa_opt_add_use_instr(vi, i);
 }
@@ -113,24 +125,23 @@ static inline int opt_dsl_chain(IRSSAOptCtx *ctx, int i,
   return 0;
 }
 
-/* PAIR(...) — after PATTERN, bind the SSA def of a source operand and bail the
- * dispatch on mismatch.  Binds pidx/pop/pvi/pdest/psrc1/psrc2. */
+/* PAIR(...) — after MATCH, bind the SSA def of a source operand (pidx/pop/pvi) or bail the dispatch. */
 #define PAIR(...) \
-  OptDslPair _opt_dsl_pair; \
+  IRSSAVregInfo *pvi; \
   do { \
     const IROptPairSpec _opt_dsl_ps = { __VA_ARGS__ }; \
-    if (!opt_dsl_pair_match(ctx, i, _opt_dsl_ps, &_opt_dsl_pair)) \
-      return 0; \
+    pvi = opt_dsl_pair_find(ctx, i, _opt_dsl_ps); \
   } while (0); \
-  int pidx = _opt_dsl_pair.idx; (void)pidx; \
-  int pop = _opt_dsl_pair.op; (void)pop; \
-  IRSSAVregInfo *pvi = _opt_dsl_pair.vi; (void)pvi; \
-  IROperand pdest = _opt_dsl_pair.dest; (void)pdest; \
-  IROperand psrc1 = _opt_dsl_pair.src1; (void)psrc1; \
-  IROperand psrc2 = _opt_dsl_pair.src2; (void)psrc2
+  if (!pvi) \
+    return 0; \
+  int pidx = pvi->def_instr; \
+  IRQuadCompact *_opt_dsl_pq = &ir->compact_instructions[pidx]; \
+  int pop = _opt_dsl_pq->op; \
+  (void)pidx; (void)pop
 
-/* RETIRE_PAIR(new_linked, delete_second) — once all guards pass and just before
- * REWRITE, move the use lists off the paired producer (see opt_dsl_pair_retire). */
+/* PBIND(slot) binds the producer's dest/src1/src2 as pdest/psrc1/psrc2; use it directly after PAIR. */
+#define PBIND(name) IROperand p##name = tcc_ir_op_get_##name(ir, _opt_dsl_pq)
+
+/* RETIRE_PAIR(new_linked, delete_second) — after the guards, before REWRITE: move use lists off the producer. */
 #define RETIRE_PAIR(new_linked, delete_second) \
-  opt_dsl_pair_retire(ctx, i, &_opt_dsl_pair, (new_linked), (delete_second))
-
+  opt_dsl_pair_release(ctx, i, pvi, pidx, (new_linked), (delete_second))

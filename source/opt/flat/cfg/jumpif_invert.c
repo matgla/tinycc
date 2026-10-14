@@ -26,8 +26,7 @@ int tcc_ir_opt_jumpif_invert(TCCIRState *ir, int allow_backward)
     if (q->op != TCCIR_OP_JUMPIF)
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int a = (int)irop_get_imm64_ex(ir, dest);
+    int a = (int)tcc_ir_op_dest_imm(ir, q);
     if (a < 0 || a > n)
       continue;
 
@@ -47,10 +46,10 @@ int tcc_ir_opt_jumpif_invert(TCCIRState *ir, int allow_backward)
       continue;
 
     if (!allow_backward &&
-        (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq)) < i)
+        (int)tcc_ir_op_dest_imm(ir, jq) < i)
       continue;
 
-    int inv = invert_condition((int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, q)));
+    int inv = invert_condition((int)tcc_ir_op_src1_imm(ir, q));
     if (inv < 0)
       continue;
 
@@ -61,7 +60,7 @@ int tcc_ir_opt_jumpif_invert(TCCIRState *ir, int allow_backward)
       IRQuadCompact *tq = &ir->compact_instructions[j];
       if (j != i && (tq->op == TCCIR_OP_JUMP || tq->op == TCCIR_OP_JUMPIF))
       {
-        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, tq));
+        int t = (int)tcc_ir_op_dest_imm(ir, tq);
         if (t > i && t <= jmp_idx)
           targeted = 1;
       }

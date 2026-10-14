@@ -57,9 +57,10 @@ rewrites (more than one producer, inserting instructions) stays hand-written.
 
 OPT_GEN_SSA(rule_name, TCCIR_OP_MUL) {
   int k = 0;
-  PATTERN(.constraints = { .src2 = IR_CONSTRAINT_IMM });   /* first stmt; keep non-empty */
+  MATCH();                                                  /* binds ir, q */
+  BIND(src2);                                               /* only what the rule reads */
   GUARD(when(is_imm32(src2)); and(is_power_of_2((uint32_t)src2.u.imm32, &k)));
-  REWRITE(.new_op = TCCIR_OP_SHL, .src2 = mk_imm(k));       /* .new_op defaults to keep */
+  REWRITE(set_op(TCCIR_OP_SHL), set_src2(mk_imm(k)));      /* setters run in order */
 }
 
 static const IRSSAOptGen <pass>_gens[] = { OPT_GEN_ENTRY(rule_name, TCCIR_OP_MUL) };
@@ -68,7 +69,8 @@ int ssa_opt_<pass>(IRSSAOptCtx *ctx)
 { return ssa_opt_run_gens(ctx, <pass>_gens, OPT_DSL_TABLE_COUNT(<pass>_gens)); }
 ```
 
-- `PATTERN` binds `ir,q,dest,src1,src2`; read operands in GUARD with
+- `MATCH` binds `ir,q`; `BIND(slot)` binds `dest`/`src1`/`src2` (`BIND_IMM`/
+  `BIND_VREG`/`BIND_STACKOFF` also filter); read operands in GUARD with
   `imm()/vreg()/stackoff()/lval()`, build in REWRITE with `mk_imm()`.
 - `GUARD` clauses: `when(e)` sets, `and(e)`/`and_not(e)` accumulate. `&&`
   short-circuits, so a later `and()` that reads an operand is safe when an
@@ -76,24 +78,23 @@ int ssa_opt_<pass>(IRSSAOptCtx *ctx)
 
 ## DSL fidelity gotchas (the ones that bite)
 
-1. **`IR_CONSTRAINT_IMM` is broader than you think.** It is
-   `irop_is_immediate` = tag ∈ {IMM32,F32,I64,F64}, and it ignores `is_lval`.
-   If your rewrite reads the raw `.u.imm32` field, that is only valid for
-   `tag==IROP_TAG_IMM32 && !is_lval` — keep that exact check in the GUARD via
-   `is_imm32()` (in `ssa_opt_helpers.h`). Use the PATTERN constraint only as a
-   cheap pre-filter, never as the semantic gate.
+1. **`BIND_IMM` is broader than you think.** It is `irop_is_immediate` =
+   tag ∈ {IMM32,F32,I64,F64}, non-lval. If your rewrite reads the raw
+   `.u.imm32` field, that is only valid for `tag==IROP_TAG_IMM32 && !is_lval`
+   — keep that exact check in the GUARD via `is_imm32()` (in
+   `ssa_opt_helpers.h`), and then a plain `BIND` is enough.
 2. **`ssa_opt_run_gens` matches the FIRST gen for an op, then `break`s.** Two
    table entries for the same opcode → only the first runs. Commutative "immediate
    in either source" must live in **one** dispatch: pick with a helper, then
-   `REWRITE(.src1 = val_op, ...)`. REWRITE applies any operand field whose tag
-   != NONE, so you pass the existing `IROperand` straight through — there is no
-   `mk_vreg`, and you don't need one.
-3. **REWRITE sets `q->op` before the operands.** The new opcode's operand
+   `REWRITE(set_src1(val_op), ...)`: you pass the existing `IROperand` straight
+   through. Setters are unconditional — never pass one that may be `IROP_NONE`.
+3. **Put `set_op` first in REWRITE**, then the operands: the setters look up
+   the operand layout of the *current* opcode, so the new opcode's operand
    config (`has_dest/has_src1/has_src2`) must match the old one, or the operand
-   offsets shift under you. All binary-ALU→binary-ALU rewrites are safe.
-4. **`PATTERN` must be the first statement** after any locals it references,
-   and empty `{}` is a GNU extension — give it a non-empty initializer
-   (`.constraints = { .dest = IR_CONSTRAINT_ANY }` is a harmless no-op).
+   offsets shift under you. All binary-ALU→binary-ALU rewrites are safe. A
+   setter argument that reads `q->op` sees the new opcode — compute it first.
+4. **`MATCH` and the `BIND`s come first**, before anything mutates instruction
+   `i`; a `BIND` after a mutation reads the mutated operand.
 5. `static inline` helpers in a shared header avoid `-Wunused-function` in TUs
    that don't use them all; plain `static` in a header does not.
 

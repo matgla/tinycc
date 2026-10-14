@@ -28,6 +28,7 @@ void svalue_init(SValue *sv)
   sv->volatile_access = 0;
   sv->pr1_reg = PREG_REG_NONE;
   sv->pr1_spilled = 0;
+  sv->sso_reversed = 0;
   sv->r = 0;
   sv->vr = -1;
   sv->type.t = 0;

@@ -102,7 +102,7 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
        * packed-access tracking): use LDRD directly.  LDRD Rt==Rn is fine
        * without writeback, so no base-preservation dance is needed.  Without
        * the proof, load_from_base emits the unaligned-safe LDR pair. */
-      if (dest.is_64bit && !dest.is_complex && src.align4 && dest_r1 != (int)PREG_REG_NONE &&
+      if (dest.is_64bit && !dest.is_complex && src.align4 && !src.underalign_hint && dest_r1 != (int)PREG_REG_NONE &&
           try_ldrd_pair(dest_reg, dest_r1, src.u.reg.r0, 0, 0))
         break;
       load_from_base(dest_reg, dest_r1, btype, is_unsigned, 0, 0, (uint32_t)src.u.reg.r0);
@@ -159,7 +159,7 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
         restore_scratch_reg(&rr);
       }
       /* 64-bit + proven alignment: LDRD through the loaded pointer. */
-      if (dest.is_64bit && !dest.is_complex && src.align4 && dest_r1 != (int)PREG_REG_NONE &&
+      if (dest.is_64bit && !dest.is_complex && src.align4 && !src.underalign_hint && dest_r1 != (int)PREG_REG_NONE &&
           try_ldrd_pair(dest_reg, dest_r1, ptr_r, 0, 0))
         break;
       load_from_base(dest_reg, dest_r1, btype, is_unsigned, 0, 0, (uint32_t)ptr_r);
@@ -253,7 +253,7 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
   }
 
   default:
-    tcc_error("compiler_error: load_mop: unhandled src kind %d", (int)src.kind);
+    tcc_ice("load_mop: unhandled src kind %d", (int)src.kind);
   }
 
   /* Write back result to spill/param slot if dest was not a plain register. */
@@ -354,7 +354,7 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
     }
     else
     {
-      tcc_error("compiler_error: store_mop: unhandled dest kind %d for complex double store", (int)dest.kind);
+      tcc_ice("store_mop: unhandled dest kind %d for complex double store", (int)dest.kind);
     }
     mach_release_all(&ctx);
     return;
@@ -403,7 +403,7 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
          * Otherwise the pointer may target packed-struct memory that is only
          * 1- or 2-byte aligned, so two plain STRs stay the safe fallback. */
         const uint32_t base = (uint32_t)dest.u.reg.r0;
-        if (dest.align4 && try_strd_pair(lo_reg, hi_reg, (int)base, 0, 0))
+        if (dest.align4 && !dest.underalign_hint && try_strd_pair(lo_reg, hi_reg, (int)base, 0, 0))
           break;
         th_store32_imm_or_reg_ex(lo_reg, base, 0, 0, excl | (1u << base));
         th_store32_imm_or_reg_ex(hi_reg, base, 4, 0, excl | (1u << base));
@@ -452,7 +452,7 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
         /* Pointer-through store from an LLOCAL spill slot: STRD only when
          * the frontend proved >= 4-byte alignment of the target (dest.align4);
          * an arbitrary pointer may reference unaligned packed-struct memory. */
-        if (dest.align4 && try_strd_pair(lo_reg, hi_reg, ptr_r, 0, 0))
+        if (dest.align4 && !dest.underalign_hint && try_strd_pair(lo_reg, hi_reg, ptr_r, 0, 0))
           break;
         th_store32_imm_or_reg_ex(lo_reg, (uint32_t)ptr_r, 0, 0, excl | (1u << (uint32_t)ptr_r));
         th_store32_imm_or_reg_ex(hi_reg, (uint32_t)ptr_r, 4, 0, excl | (1u << (uint32_t)ptr_r));
@@ -550,7 +550,7 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
     }
 
     default:
-      tcc_error("compiler_error: store_mop: unhandled dest kind %d for 64-bit src", (int)dest.kind);
+      tcc_ice("store_mop: unhandled dest kind %d for 64-bit src", (int)dest.kind);
     }
     mach_release_all(&ctx);
     return;
@@ -743,7 +743,7 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
   }
 
   default:
-    tcc_error("compiler_error: store_mop: unhandled dest kind %d", (int)dest.kind);
+    tcc_ice("store_mop: unhandled dest kind %d", (int)dest.kind);
   }
 
   mach_release_all(&ctx);
@@ -812,7 +812,7 @@ ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperan
    * LDRD supports word-aligned offsets in range [-1020, 1020].
    * base.underalign_hint (packed-derived address): skip — LDRD faults on
    * unaligned addresses; the generic path below emits an LDR pair instead. */
-  if (dest.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM && !base.underalign_hint)
+  if (dest.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM && base.align4 && !base.underalign_hint)
   {
     int imm = (int)index.u.imm.val;
     int sign = (imm < 0);
@@ -893,7 +893,7 @@ ST_FUNC void tcc_gen_machine_load_indexed_mop(MachineOperand dest, MachineOperan
     int ea_r = mach_alloc_scratch(&ctx, excl);
     ot_check(th_add_reg((uint32_t)ea_r, (uint32_t)base_reg, (uint32_t)index_reg, flags_safe(), shift,
                         ENFORCE_ENCODING_NONE));
-    if (base.underalign_hint)
+    if (!base.align4 || base.underalign_hint)
     {
       /* Packed-derived address: LDRD faults on unaligned addresses, plain LDR
        * tolerates them (UNALIGN_TRP=0).  load_from_base with a general base
@@ -1022,7 +1022,7 @@ ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOpera
   /* Fast path: 64-bit constant-displacement store using STRD [base, #imm].
    * base.underalign_hint (packed-derived address): skip — STRD faults on
    * unaligned addresses; the generic path below emits an STR pair instead. */
-  if (value.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM && !base.underalign_hint)
+  if (value.is_64bit && shift_amount == 0 && index.kind == MACH_OP_IMM && base.align4 && !base.underalign_hint)
   {
     int imm = (int)index.u.imm.val;
     int sign = (imm < 0);
@@ -1069,7 +1069,7 @@ ST_FUNC void tcc_gen_machine_store_indexed_mop(MachineOperand base, MachineOpera
     int ea_r = mach_alloc_scratch(&ctx, excl);
     ot_check(th_add_reg((uint32_t)ea_r, (uint32_t)base_reg, (uint32_t)index_reg, flags_safe(), shift,
                         ENFORCE_ENCODING_NONE));
-    if (base.underalign_hint)
+    if (!base.align4 || base.underalign_hint)
     {
       /* Packed-derived address: STRD faults on unaligned addresses, plain STR
        * tolerates them (UNALIGN_TRP=0).  Store the halves separately. */
@@ -1119,7 +1119,7 @@ ST_FUNC void tcc_gen_machine_load_postinc_mop(MachineOperand dest, MachineOperan
   if (offset_imm < 0 || offset_imm > 255)
   {
     mach_release_all(&ctx);
-    tcc_error("compiler_error: post-increment offset %d out of range (0-255)", offset_imm);
+    tcc_ice("post-increment offset %d out of range (0-255)", offset_imm);
     return;
   }
   const uint32_t puw = 3; /* post-index (p=0), add (u=1), writeback (w=1) */
@@ -1132,8 +1132,13 @@ ST_FUNC void tcc_gen_machine_load_postinc_mop(MachineOperand dest, MachineOperan
     const int dest_hi = mach_get_dest_reg(&ctx, &dest_hi_mop, (1u << (uint32_t)dest_lo));
     uint32_t excl = (1u << (uint32_t)dest_lo) | (1u << (uint32_t)dest_hi);
     int ptr_reg = mach_ensure_in_reg(&ctx, &ptr, excl);
-    ot_check(
-        th_ldrd_imm((uint32_t)dest_lo, (uint32_t)dest_hi, (uint32_t)ptr_reg, offset_imm, puw));
+    if (ptr.align4 && !ptr.underalign_hint && !(offset_imm & 3))
+      ot_check(th_ldrd_imm((uint32_t)dest_lo, (uint32_t)dest_hi, (uint32_t)ptr_reg, offset_imm, puw));
+    else
+    {
+      load_from_base(dest_lo, dest_hi, IROP_BTYPE_INT64, 0, 0, 0, (uint32_t)ptr_reg);
+      ot_check(th_add_imm(ptr_reg, ptr_reg, offset_imm, flags_safe(), ENFORCE_ENCODING_NONE));
+    }
     mach_writeback_dest(&dest_hi_mop, dest_hi);
     mach_writeback_dest(&dest, dest_lo);
     mach_release_all(&ctx);
@@ -1182,7 +1187,7 @@ ST_FUNC void tcc_gen_machine_store_postinc_mop(MachineOperand ptr, MachineOperan
   if (offset_imm < 0 || offset_imm > 255)
   {
     mach_release_all(&ctx);
-    tcc_error("compiler_error: post-increment offset %d out of range (0-255)", offset_imm);
+    tcc_ice("post-increment offset %d out of range (0-255)", offset_imm);
     return;
   }
   const uint32_t puw = 3; /* post-index (p=0), add (u=1), writeback (w=1) */
@@ -1200,8 +1205,15 @@ ST_FUNC void tcc_gen_machine_store_postinc_mop(MachineOperand ptr, MachineOperan
     const int hi_reg = mach_ensure_in_reg(&ctx, &val_hi, excl | ptr_excl);
     excl |= (1u << (uint32_t)hi_reg);
     int ptr_reg = mach_ensure_in_reg(&ctx, &ptr, excl);
-    ot_check(
-        th_strd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)ptr_reg, offset_imm, puw));
+    if (ptr.align4 && !ptr.underalign_hint && !(offset_imm & 3))
+      ot_check(th_strd_imm((uint32_t)lo_reg, (uint32_t)hi_reg, (uint32_t)ptr_reg, offset_imm, puw));
+    else
+    {
+      excl |= (1u << (uint32_t)ptr_reg);
+      th_store32_imm_or_reg_ex(lo_reg, (uint32_t)ptr_reg, 0, 0, excl);
+      th_store32_imm_or_reg_ex(hi_reg, (uint32_t)ptr_reg, 4, 0, excl);
+      ot_check(th_add_imm(ptr_reg, ptr_reg, offset_imm, flags_safe(), ENFORCE_ENCODING_NONE));
+    }
     mach_release_all(&ctx);
     return;
   }

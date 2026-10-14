@@ -18,3 +18,8 @@ struct IRSSAOptCtx;
  * instructions rewritten. */
 int ssa_opt_gvn(struct IRSSAOptCtx *ctx);
 
+/* A call to a PURE or CONST callee repeating an earlier call in its block --
+ * same arguments, no memory write in between -- reuses that call's result.
+ * Returns the number of calls removed. */
+int ssa_opt_pure_call_cse(struct IRSSAOptCtx *ctx);
+

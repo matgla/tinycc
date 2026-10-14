@@ -78,6 +78,97 @@ static void check_fields(CType *type, int check)
   }
 }
 
+/* scalar_storage_order("big-endian"): convert the bitfields [g0, stop) of one
+   storage-unit group from LE to BE bit positions.  PCC layout can place a
+   field across its declared type's unit (a `long long :4` demoted to int that
+   starts at bit 29), so the unit is widened to cover every field's extent;
+   otherwise unit_bits - abs_bp - bs goes negative and corrupts type.t. */
+static void sso_flush_group(Sym *g0, Sym *stop, int start_off, int unit_bits, int base_type, int content_end)
+{
+  Sym *g;
+  int need = 0;
+  for (g = g0; g != stop; g = g->next)
+  {
+    if (!(g->type.t & VT_BITFIELD) || BIT_SIZE(g->type.t) == 0)
+      continue;
+    int end = (g->c - start_off) * 8 + BIT_POS(g->type.t) + BIT_SIZE(g->type.t);
+    if (end > need)
+      need = end;
+  }
+  if (need > unit_bits)
+  {
+    while (unit_bits < need && unit_bits < 64)
+      unit_bits *= 2;
+    base_type = unit_bits == 64 ? VT_LLONG : unit_bits == 32 ? VT_INT : VT_SHORT;
+  }
+  const int ubytes = unit_bits / 8;
+  /* The unit must not run past the end of the struct (packed: no tail padding):
+     anchor it earlier, so the group sits in its low-order bytes. */
+  if (start_off + ubytes > content_end)
+  {
+    if (content_end - ubytes >= 0)
+    {
+      int anchor = content_end - ubytes;
+      for (g = g0; g != stop; g = g->next)
+        if ((g->type.t & VT_BITFIELD) && BIT_SIZE(g->type.t) != 0)
+        {
+          int bp = (g->c - anchor) * 8 + BIT_POS(g->type.t);
+          g->c = anchor;
+          g->type.t = (g->type.t & ~(0x3f << VT_STRUCT_SHIFT)) | ((unsigned)bp << VT_STRUCT_SHIFT);
+        }
+      start_off = anchor;
+    }
+    else
+    {
+      /* The struct is smaller than any unit covering the group (a packed 3-byte
+         group): give each field the smallest unit covering its own bytes. */
+      for (g = g0; g != stop; g = g->next)
+      {
+        if (!(g->type.t & VT_BITFIELD) || BIT_SIZE(g->type.t) == 0)
+          continue;
+        int bs = BIT_SIZE(g->type.t);
+        int abs_bp = (g->c - start_off) * 8 + BIT_POS(g->type.t);
+        int first = start_off + abs_bp / 8;
+        int span = (abs_bp + bs - 1) / 8 - abs_bp / 8 + 1;
+        int fb = span <= 1 ? 1 : span <= 2 ? 2 : span <= 4 ? 4 : 8;
+        int anchor = first + fb > content_end ? content_end - fb : first;
+        if (anchor < 0)
+          anchor = first; /* no room: leave the overflow to be diagnosed */
+        int be_bp = fb * 8 - ((first - anchor) * 8 + abs_bp % 8) - bs;
+        int fbase = fb == 8 ? VT_LLONG : fb == 4 ? VT_INT : fb == 2 ? VT_SHORT : VT_BYTE;
+        if (be_bp < 0)
+          be_bp = 0;
+        g->c = anchor;
+        g->type.t = (g->type.t & ~(0x3f << VT_STRUCT_SHIFT)) | ((unsigned)be_bp << VT_STRUCT_SHIFT);
+        g->type.ref = g;
+        g->a.sso_be = 1;
+        g->r = fb;
+        g->auxtype = (g->type.t & VT_BTYPE) != fbase ? fbase : -1;
+      }
+      return;
+    }
+  }
+  for (g = g0; g != stop; g = g->next)
+  {
+    if (!(g->type.t & VT_BITFIELD) || BIT_SIZE(g->type.t) == 0)
+      continue;
+    int abs_bp = (g->c - start_off) * 8 + BIT_POS(g->type.t);
+    int bs = BIT_SIZE(g->type.t);
+    int be_bp = unit_bits - abs_bp - bs;
+    if (be_bp < 0)
+      be_bp = 0;
+    g->c = start_off;
+    g->type.t = (g->type.t & ~(0x3f << VT_STRUCT_SHIFT)) | ((unsigned)be_bp << VT_STRUCT_SHIFT);
+    g->type.ref = g;
+    g->a.sso_be = 1;
+    g->r = ubytes;
+    if ((g->type.t & VT_BTYPE) != base_type)
+      g->auxtype = base_type;
+    else
+      g->auxtype = -1;
+  }
+}
+
 void struct_layout(CType *type, AttributeDef *ad)
 {
   int size, align, maxalign, offset, c, bit_pos, bit_size;
@@ -199,7 +290,7 @@ void struct_layout(CType *type, AttributeDef *ad)
         else if (!packed)
         {
           int a8 = align * 8;
-          int ofs = ((c * 8 + bit_pos) % a8 + bit_size + a8 - 1) / a8;
+          int ofs = (int)(((int64_t)c * 8 + bit_pos) % a8 + bit_size + a8 - 1) / a8;
           if (ofs > size / align)
             goto new_field;
         }
@@ -297,6 +388,25 @@ void struct_layout(CType *type, AttributeDef *ad)
   if (ad->a.sso_be)
   {
     type->ref->a.sso_be = 1;
+    /* every member is marked: member access swaps the scalar ones (and
+       arrays of them), sso_flush_group below lays out the bitfields */
+    for (f = type->ref->next; f; f = f->next)
+      f->a.sso_be = 1;
+    /* end of the member data: a packed struct has no padding beyond it */
+    int content_end = 0;
+    for (f = type->ref->next; f; f = f->next)
+    {
+      int fend;
+      if (f->type.t & VT_BITFIELD)
+        fend = f->c + (BIT_POS(f->type.t) + BIT_SIZE(f->type.t) + 7) / 8;
+      else
+      {
+        int fa;
+        fend = f->c + type_size(&f->type, &fa);
+      }
+      if (fend > content_end)
+        content_end = fend;
+    }
     Sym *group_start = NULL;
     int group_start_off = 0;
     int group_end_off = 0; /* exclusive: first byte outside the group */
@@ -322,25 +432,7 @@ void struct_layout(CType *type, AttributeDef *ad)
         sso_flush:;
           /* Flush current group: convert each field's LE position to BE.
              Compute absolute bit offset from the group's start, then flip. */
-          Sym *g;
-          int ubytes = group_unit_bits / 8;
-          for (g = group_start; g != f; g = g->next)
-          {
-            if (!(g->type.t & VT_BITFIELD) || BIT_SIZE(g->type.t) == 0)
-              continue;
-            int abs_bp = (g->c - group_start_off) * 8 + BIT_POS(g->type.t);
-            int bs = BIT_SIZE(g->type.t);
-            int be_bp = group_unit_bits - abs_bp - bs;
-            g->c = group_start_off;
-            g->type.t = (g->type.t & ~(0x3f << VT_STRUCT_SHIFT)) | (be_bp << VT_STRUCT_SHIFT);
-            g->type.ref = g;
-            g->a.sso_be = 1;
-            g->r = ubytes;
-            if ((g->type.t & VT_BTYPE) != group_base_type)
-              g->auxtype = group_base_type;
-            else
-              g->auxtype = -1;
-          }
+          sso_flush_group(group_start, f, group_start_off, group_unit_bits, group_base_type, content_end);
           group_start = NULL;
           if (!(f->type.t & VT_BITFIELD) || BIT_SIZE(f->type.t) == 0)
             continue;
@@ -367,32 +459,15 @@ void struct_layout(CType *type, AttributeDef *ad)
     /* Flush last group */
     if (group_start)
     {
-      Sym *g;
-      int ubytes = group_unit_bits / 8;
-      for (g = group_start; g; g = g->next)
-      {
-        if (!(g->type.t & VT_BITFIELD) || BIT_SIZE(g->type.t) == 0)
-          continue;
-        int abs_bp = (g->c - group_start_off) * 8 + BIT_POS(g->type.t);
-        int bs = BIT_SIZE(g->type.t);
-        int be_bp = group_unit_bits - abs_bp - bs;
-        g->c = group_start_off;
-        g->type.t = (g->type.t & ~(0x3f << VT_STRUCT_SHIFT)) | (be_bp << VT_STRUCT_SHIFT);
-        g->type.ref = g;
-        g->a.sso_be = 1;
-        g->r = ubytes;
-        if ((g->type.t & VT_BTYPE) != group_base_type)
-          g->auxtype = group_base_type;
-        else
-          g->auxtype = -1;
-      }
+      sso_flush_group(group_start, NULL, group_start_off, group_unit_bits, group_base_type, content_end);
     }
   }
 
   /* check whether we can access bitfields by their type */
   for (f = type->ref->next; f; f = f->next)
   {
-    int s, px, cx, c0;
+    int s, cx, c0;
+    int64_t px; /* bit position: c * 8 overflows int past 256 MB */
     CType t;
 
     if (0 == (f->type.t & VT_BITFIELD))
@@ -426,9 +501,9 @@ void struct_layout(CType *type, AttributeDef *ad)
     t.t = VT_BYTE;
     for (;;)
     {
-      px = f->c * 8 + bit_pos;
-      cx = (px >> 3) & -align;
-      px = px - (cx << 3);
+      px = (int64_t)f->c * 8 + bit_pos;
+      cx = (int)((px >> 3) & -align);
+      px = px - ((int64_t)cx << 3);
       if (c0 == cx)
         break;
       s = (px + bit_size + 7) >> 3;
@@ -460,7 +535,7 @@ void struct_layout(CType *type, AttributeDef *ad)
     {
       /* update offset and bit position */
       f->c = cx;
-      bit_pos = px;
+      bit_pos = (int)px;
       f->type.t = (f->type.t & ~(0x3f << VT_STRUCT_SHIFT)) | (bit_pos << VT_STRUCT_SHIFT);
       if (s != size)
         f->auxtype = t.t;
@@ -574,7 +649,7 @@ do_decl:
           ll = expr_const64();
         }
         ss = sym_push(v, &t, VT_CONST, 0);
-        ss->enum_val = ll;
+        sym_set_enum_val(ss, ll);
         *ps = ss, ps = &ss->next;
         if (ll < nl)
           nl = ll;
@@ -611,7 +686,7 @@ do_decl:
       /* set type for enum members */
       for (ss = s->next; ss; ss = ss->next)
       {
-        ll = ss->enum_val;
+        ll = sym_enum_val(ss);
         if (ll == (int)ll) /* default is int if it fits */
           continue;
         if (t.t & VT_UNSIGNED)
@@ -634,7 +709,7 @@ do_decl:
       {
         if (!parse_btype(&btype, &ad1, 0))
         {
-          if (tok == TOK_STATIC_ASSERT)
+          if (tok_is_static_assert())
           {
             do_Static_assert();
             continue;

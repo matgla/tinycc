@@ -1,0 +1,16 @@
+kp -56 4469
+kp 56 -4469
+ku 255 65535
+kb 1 0 1
+kf 1 1
+ke 258
+kmix 5 7 44 10 9 11
+kstk 13
+kaddr -127 kwr -32768 kfaddr 1
+kll 1099511627779 kint 70
+krec 45
+proto 1 1 44 1
+ks -56 4469
+ks 56 -4469
+sf 1 ki 1 0
+kib 1 0 kic 255

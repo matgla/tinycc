@@ -43,9 +43,7 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
       continue;
     for (int k = 0; k < 3; k++)
     {
-      IROperand op = (k == 0)   ? tcc_ir_op_get_dest(ir, q)
-                     : (k == 1) ? tcc_ir_op_get_src1(ir, q)
-                                : tcc_ir_op_get_src2(ir, q);
+      IROperand op = tcc_ir_op_get_slot(ir, q, k);
       int32_t vr = irop_get_vreg(op);
       if (vr < 0) continue;
       int t = TCCIR_DECODE_VREG_TYPE(vr);
@@ -83,8 +81,7 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
     if (lea)
     {
       /* `int *p = &a; foo(&p);` — &a escapes through p even if p is never read as a value. */
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      int32_t svr = irop_get_vreg(s);
+      int32_t svr = tcc_ir_op_src1_vreg(ir, q);
       if (svr >= 0 && TCCIR_DECODE_VREG_TYPE(svr) == TCCIR_VREG_TYPE_VAR)
       {
         int sp = TCCIR_DECODE_VREG_POSITION(svr);
@@ -118,7 +115,7 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
         int has = (slot == 1) ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
         if (!has)
           continue;
-        op = (slot == 1) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        op = tcc_ir_op_get_src1_or_2(ir, q, slot != 1);
       }
       int32_t vr = irop_get_vreg(op);
       if (vr < 0) continue;
@@ -139,10 +136,37 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op != TCCIR_OP_LEA)
+    /* An inline asm memory operand ("m") on the VAR hands the asm its address,
+     * as a LEA would: the frontend marks those marker operands as volatile
+     * accesses (tccasm.c), which an "r" operand never is. */
+    if (q->op == TCCIR_OP_ASM_INPUT || q->op == TCCIR_OP_ASM_OUTPUT)
+    {
+      IROperand a = tcc_ir_op_get_dest_or_src1(ir, q, q->op == TCCIR_OP_ASM_INPUT);
+      int32_t avr = irop_get_vreg(a);
+      if (avr >= 0 && TCCIR_DECODE_VREG_TYPE(avr) == TCCIR_VREG_TYPE_VAR && a.is_lval &&
+          tcc_ir_access_is_volatile(ir, a) && TCCIR_DECODE_VREG_POSITION(avr) <= max_var)
+        has_live_lea[TCCIR_DECODE_VREG_POSITION(avr) / 8] |= (1 << (TCCIR_DECODE_VREG_POSITION(avr) % 8));
       continue;
-    IROperand s = tcc_ir_op_get_src1(ir, q);
-    int32_t svr = irop_get_vreg(s);
+    }
+    if (q->op != TCCIR_OP_LEA) {
+      /* Address values can be embedded in a STORE/ASSIGN or call operand,
+       * including an inlined cleanup's &local. They keep the home live just
+       * as a LEA does, even after all explicit LEAs have been forwarded. */
+      for (int k = 0; k < 4; k++) {
+        if (k == 3 && !ir_op_has(q->op, IROP_A_SLOT3))
+          continue;
+        IROperand o = k == 3 ? ir->iroperand_pool[q->operand_base + 3] : tcc_ir_op_get_slot(ir, q, k);
+        int32_t v = irop_get_vreg(o);
+        if (irop_get_tag(o) != IROP_TAG_STACKOFF || !o.is_local || o.is_lval || o.is_llocal ||
+            v < 0 || TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_VAR)
+          continue;
+        int p = TCCIR_DECODE_VREG_POSITION(v);
+        if (p <= max_var)
+          has_live_lea[p / 8] |= 1 << (p % 8);
+      }
+      continue;
+    }
+    int32_t svr = tcc_ir_op_src1_vreg(ir, q);
     if (svr < 0 || TCCIR_DECODE_VREG_TYPE(svr) != TCCIR_VREG_TYPE_VAR)
       continue;
     int sp = TCCIR_DECODE_VREG_POSITION(svr);
@@ -150,8 +174,7 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
       continue;
 
     int dest_read = 1;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    int32_t dvr = irop_get_vreg(d);
+    int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
     if (dvr >= 0)
     {
       int dt = TCCIR_DECODE_VREG_TYPE(dvr);
@@ -179,9 +202,7 @@ static int refresh_stale_var_addrtaken(TCCIRState *ir)
       continue;
     for (int k = 0; k < 3; k++)
     {
-      IROperand op = (k == 0)   ? tcc_ir_op_get_dest(ir, q)
-                     : (k == 1) ? tcc_ir_op_get_src1(ir, q)
-                                : tcc_ir_op_get_src2(ir, q);
+      IROperand op = tcc_ir_op_get_slot(ir, q, k);
       int32_t vr = irop_get_vreg(op);
       if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
         continue;
@@ -213,12 +234,11 @@ static int ir_has_variadic_stack_arg_call(TCCIRState *ir)
     if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
 
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee || !callee->type.ref || callee->type.ref->f.func_type != FUNC_ELLIPSIS)
       continue;
 
-    IROperand meta = tcc_ir_op_get_src2(ir, q);
-    int argc = TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, meta));
+    int argc = TCCIR_DECODE_CALL_ARGC((uint32_t)tcc_ir_op_src2_imm(ir, q));
     if (argc > 4)
       return 1;
   }
@@ -278,8 +298,7 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
       continue;
     if (!irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t dest_vr = irop_get_vreg(dest);
+    int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(dest_vr) != TCCIR_VREG_TYPE_VAR)
       continue;
 
@@ -363,7 +382,7 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
       int has = (slot == 0) ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
       if (!has)
         continue;
-      IROperand op = (slot == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand op = tcc_ir_op_get_src1_or_2(ir, q, slot != 0);
       int32_t vr = irop_get_vreg(op);
       if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
         continue;
@@ -426,13 +445,13 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
     for (i = 0; i < n; i++)
     {
       IRQuadCompact *q = &ir->compact_instructions[i];
+      if (ir->compact_instructions[i].is_jump_target) /* a NOP one too */
+        branched_into[i / 8] |= (1 << (i % 8));
       if (q->op == TCCIR_OP_NOP)
         continue;
-      if (ir->compact_instructions[i].is_jump_target)
-        branched_into[i / 8] |= (1 << (i % 8));
       if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
         continue;
-      int target = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
       if (target >= 0 && target < n)
         branched_into[target / 8] |= (1 << (target % 8));
     }
@@ -447,7 +466,7 @@ static int tcc_ir_opt_const_var_prop__timed(TCCIRState *ir)
         int has = (slot == 0) ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
         if (!has)
           continue;
-        IROperand op = (slot == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        IROperand op = tcc_ir_op_get_src1_or_2(ir, q, slot != 0);
         int32_t vr = irop_get_vreg(op);
         if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
           continue;
@@ -483,9 +502,8 @@ skip_dominance_guard:;
 
     if (irop_config[q->op].has_src1)
     {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      int32_t src1_vr = irop_get_vreg(src1);
-      if (src1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_VAR && !(src1.is_local && !src1.is_lval))
+      int32_t src1_vr = tcc_ir_op_src1_vreg(ir, q);
+      if (src1_vr >= 0 && TCCIR_DECODE_VREG_TYPE(src1_vr) == TCCIR_VREG_TYPE_VAR && !(tcc_ir_op_src1_is_local(ir, q) && !tcc_ir_op_src1_is_lval(ir, q)))
       {
         int pos = TCCIR_DECODE_VREG_POSITION(src1_vr);
         /* Symrefs fold only at a single use so the pool address isn't materialized at every
@@ -574,8 +592,7 @@ skip_dominance_guard:;
         continue;
       if (irop_config[q->op].has_src1)
       {
-        IROperand src1 = tcc_ir_op_get_src1(ir, q);
-        int32_t vr = irop_get_vreg(src1);
+        int32_t vr = tcc_ir_op_src1_vreg(ir, q);
         if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
         {
           int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -585,8 +602,7 @@ skip_dominance_guard:;
       }
       if (irop_config[q->op].has_src2)
       {
-        IROperand src2 = tcc_ir_op_get_src2(ir, q);
-        int32_t vr = irop_get_vreg(src2);
+        int32_t vr = tcc_ir_op_src2_vreg(ir, q);
         if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
         {
           int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -608,8 +624,7 @@ skip_dominance_guard:;
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op != TCCIR_OP_ASSIGN)
         continue;
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t vr = irop_get_vreg(dest);
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
       if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
         continue;
       int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -647,8 +662,7 @@ neg_vreg_phase:
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
         continue;
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t dest_vr = irop_get_vreg(dest);
+      int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
       if (dest_vr >= -1 || dest_vr < -(int)NEG_VREG_MAX)
         continue;
       int idx = (int)(-dest_vr - 1);
@@ -689,8 +703,7 @@ neg_vreg_phase:
           continue;
         if (irop_config[q->op].has_src1)
         {
-          IROperand src1 = tcc_ir_op_get_src1(ir, q);
-          int32_t vr = irop_get_vreg(src1);
+          int32_t vr = tcc_ir_op_src1_vreg(ir, q);
           if (vr < -1 && vr >= -(int)NEG_VREG_MAX)
           {
             int idx = (int)(-vr - 1);
@@ -716,8 +729,7 @@ neg_vreg_phase:
         }
         if (irop_config[q->op].has_src2)
         {
-          IROperand src2 = tcc_ir_op_get_src2(ir, q);
-          int32_t vr = irop_get_vreg(src2);
+          int32_t vr = tcc_ir_op_src2_vreg(ir, q);
           if (vr < -1 && vr >= -(int)NEG_VREG_MAX)
           {
             int idx = (int)(-vr - 1);

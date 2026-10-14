@@ -1,0 +1,11 @@
+ne hit: r=7 out=1 w=8 sink=0
+ne miss: r=8 out=0 w=8 sink=3
+keep free: r=0 out=1 w=5 sink=4
+keep busy: r=5 out=0 w=5 sink=6
+spin free: waits=0 w=11
+spin taken: waits=3 w=12
+twin: 12 20 20 sink=105
+twin tmp: 10 20 10 sink=2307
+changed: 30 40 40 sink=302
+other: 50 50 60 sink=2
+unsigned: 80 70 70 sink=4

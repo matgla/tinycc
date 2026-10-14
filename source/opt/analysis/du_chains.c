@@ -79,12 +79,17 @@ void ir_opt_du_build_mode(TCCIRState *ir, IROptDU *du, uint8_t mode)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP)
       continue;
-    /* STORE-family ops keep the address pointer in `dest`: that is a use, not a def. */
+    /* STORE-family ops keep the address pointer in `dest`: that is a use, not a
+     * def.  So does any op whose dest is an lvalue -- it writes THROUGH the
+     * vreg: an asm output `"=m"(s->b)` is `ASM_OUTPUT T1***DEREF***`, and
+     * counting it as a def of T1 let a fold turn `T1 <- T0 ADD #4` into a
+     * load of the field, leaving the asm to store through the loaded value. */
     int dest_is_addr_use = (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
-                            q->op == TCCIR_OP_STORE_POSTINC);
+                            q->op == TCCIR_OP_STORE_POSTINC) ||
+                           (irop_config[q->op].has_dest && tcc_ir_op_dest_is_lval(ir, q));
     if (irop_config[q->op].has_dest)
     {
-      int idx = ir_opt_du_idx(du, irop_get_vreg(tcc_ir_op_get_dest(ir, q)));
+      int idx = ir_opt_du_idx(du, tcc_ir_op_dest_vreg(ir, q));
       if (idx >= 0)
       {
         if (dest_is_addr_use)
@@ -102,20 +107,20 @@ void ir_opt_du_build_mode(TCCIRState *ir, IROptDU *du, uint8_t mode)
     }
     if (irop_config[q->op].has_src1)
     {
-      int idx = ir_opt_du_idx(du, irop_get_vreg(tcc_ir_op_get_src1(ir, q)));
+      int idx = ir_opt_du_idx(du, tcc_ir_op_src1_vreg(ir, q));
       if (idx >= 0 && du->use[idx] < 2)
         du->use[idx]++;
     }
     if (irop_config[q->op].has_src2)
     {
-      int idx = ir_opt_du_idx(du, irop_get_vreg(tcc_ir_op_get_src2(ir, q)));
+      int idx = ir_opt_du_idx(du, tcc_ir_op_src2_vreg(ir, q));
       if (idx >= 0 && du->use[idx] < 2)
         du->use[idx]++;
     }
     /* MLA's 4th accumulator operand is a use; missing it makes its result look dead (seed 4274). */
     if (tcc_ir_op_is_mac(q->op))
     {
-      int idx = ir_opt_du_idx(du, irop_get_vreg(tcc_ir_op_get_accum(ir, q)));
+      int idx = ir_opt_du_idx(du, tcc_ir_op_accum_vreg(ir, q));
       if (idx >= 0 && du->use[idx] < 2)
         du->use[idx]++;
     }
@@ -139,7 +144,7 @@ uint8_t *ir_opt_build_def_count(TCCIRState *ir, int n, int *out_stride)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr < 0)
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -153,7 +158,7 @@ uint8_t *ir_opt_build_def_count(TCCIRState *ir, int n, int *out_stride)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr < 0)
       continue;
     int typ = TCCIR_DECODE_VREG_TYPE(vr);
@@ -176,4 +181,31 @@ uint8_t *ir_opt_build_def_count(TCCIRState *ir, int n, int *out_stride)
   }
   *out_stride = stride;
   return dc;
+}
+
+/* The opt_du.h queries (out of line: tcc inlined them at every caller). */
+int ir_opt_du_def(const IROptDU *du, int32_t vreg, int before_idx)
+{
+  int idx = ir_opt_du_idx(du, vreg);
+  if (idx < 0)
+    return -1;
+  int d = du->def[idx];
+  return (d >= 0 && d < before_idx) ? d : -1;
+}
+
+int ir_opt_du_uses(const IROptDU *du, int32_t vreg)
+{
+  int idx = ir_opt_du_idx(du, vreg);
+  return (idx >= 0) ? (int)du->use[idx] : 0;
+}
+
+int ir_opt_du_def_count(const IROptDU *du, int32_t vreg)
+{
+  int idx = ir_opt_du_idx(du, vreg);
+  return (idx >= 0) ? (int)du->def_cnt[idx] : 0;
+}
+
+int ir_opt_du_is_single_def(const IROptDU *du, int32_t vreg)
+{
+  return ir_opt_du_def_count(du, vreg) == 1;
 }

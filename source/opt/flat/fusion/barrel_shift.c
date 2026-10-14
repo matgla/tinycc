@@ -18,46 +18,7 @@
 #include "opt_utils.h"
 
 
-/*
- * Folds a single-use shift/rotate into the consuming ALU instruction's src2
- * using the ARM barrel shifter.  Results are written to ir->barrel_shifts[]
- * (a side-table), not into IRQuadCompact, so no intermediate pass can corrupt them.
- *
- * Pattern:
- *   t = SHL/SHR/SAR/ROR(x, #n)     -- single use, 32-bit
- *   result = ADD/SUB/AND/OR/XOR/CMP(y, t)
- *
- * Encoding: barrel_shifts[i] = (type<<5)|amount
- *   type: 1=SHL, 2=SHR, 3=SAR, 4=ROR.  amount: 0-31.
- *
- * SHL into ADD is the one combination that can LOSE instructions, because
- * `t = x SHL #n; a = base ADD t; *a` is exactly `base[x]` -- the shape the
- * addressing-mode selector collapses into a single `ldr rd,[base,x,lsl #n]`.
- * Eating the shift here leaves a standalone address-forming ADD behind and
- * costs one instruction per access (pr46883's loop body grew 25->32, pr53645
- * 762->852).  Two gates keep only the profitable half: skip when the ADD's
- * result reaches an address, and skip scales 1..3 outright (the only ones a
- * scaled addressing mode can encode, so a consumer this pass does not model --
- * PREFETCH, a later-formed indexed access -- can still claim them).  Every
- * other consumer keeps the fusion, which is a strict win: the shift vanishes.
- *
- * The ALU operand and the shift may name the SAME register.  `x + (x >>u 31)`
- * -- the bias step of a signed divide by two, and the shape of every
- * `a OP (a SHIFT k)` idiom -- encodes as one `add.w rd, rn, rn, lsr #31`,
- * because Rn and Rm are independent fields that may hold the same number.
- * This pass used to refuse that case; the refusal cost an instruction every
- * time and protected nothing (87 such fusions appear across an exhaustive
- * op x shift-kind x amount matrix, all matching gcc's answers).
- *
- * Despite running from run_post_ra_optimizations, this sees the flat IR
- * BEFORE tcc_ir_ssa_regalloc: a VAR may still have a def per branch, and
- * du.def names only the last one.  So the shift must be its result's only
- * def, and no path may enter between the shift and the consumer: a join there
- * reaches the consumer without the shift (ctags' isTagExtraBitMarked computed
- * `index` in both arms of an if, and the join read the else arm's value on
- * the then path), and a back edge there re-reads a shift source the shift
- * read once.
- */
+/* See docs/bugs/indexed-address-shapes-not-fused.md for fusion and safety constraints. */
 
 /* Every JUMP/JUMPIF/switch target, plus anything already flagged. */
 static uint8_t *barrel_build_target_map(TCCIRState *ir, int n)
@@ -70,13 +31,13 @@ static uint8_t *barrel_build_target_map(TCCIRState *ir, int n)
       map[i] = 1;
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int t = (int)tcc_ir_op_dest_imm(ir, q);
       if (t >= 0 && t < n)
         map[t] = 1;
     }
     else if (q->op == TCCIR_OP_SWITCH_TABLE)
     {
-      int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id >= 0 && table_id < ir->num_switch_tables)
       {
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
@@ -133,9 +94,7 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
                    : k == 1 ? !irop_config[q->op].has_src1
                             : !irop_config[q->op].has_src2)
           continue;
-        IROperand s = k == 0 ? tcc_ir_op_get_dest(ir, q)
-                    : k == 1 ? tcc_ir_op_get_src1(ir, q)
-                             : tcc_ir_op_get_src2(ir, q);
+        IROperand s = tcc_ir_op_get_slot(ir, q, k);
         if (!irop_has_vreg(s))
           continue;
         if (!addressing && (!s.is_lval || s.is_local || s.is_llocal))
@@ -166,9 +125,15 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
     /* Try fusing on src2 first; for commutative ops, also try src1 (swapping
      * operands so the shift lands on src2 where the backend expects it). */
     for (int attempt = 0; attempt < (commutative ? 2 : 1); attempt++) {
-      IROperand src2 = (attempt == 0) ? tcc_ir_op_get_src2(ir, q)
-                                      : tcc_ir_op_get_src1(ir, q);
+      IROperand src2 = tcc_ir_op_get_src1_or_2(ir, q, attempt == 0);
       if (!irop_has_vreg(src2))
+        continue;
+
+      /* The shifted value must be consumed as a value.  A dereferenced
+       * operand is a memory read at the shift result's address; replacing it
+       * with the shift source would silently delete that load.  The local
+       * forms likewise carry an implicit memory access. */
+      if (src2.is_lval || src2.is_local || src2.is_llocal)
         continue;
 
       int32_t vr2 = irop_get_vreg(src2);
@@ -200,11 +165,10 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
       if (src2.btype == IROP_BTYPE_INT64)
         continue;
 
-      IROperand shift_src2 = tcc_ir_op_get_src2(ir, sq);
-      if (!irop_is_immediate(shift_src2))
+      if (!tcc_ir_op_src2_is_imm(ir, sq))
         continue;
 
-      int64_t amount = irop_get_imm64_ex(ir, shift_src2);
+      int64_t amount = tcc_ir_op_src2_imm(ir, sq);
       if (amount < 0 || amount > 31)
         continue;
 
@@ -217,25 +181,30 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
       if (amount == 0 && stype != 1)
         continue;
 
-      /* `base + (idx << 1..3)` is a scaled addressing mode; so is any ADD whose
-       * result reaches a dereference.  Leave both for the addressing selector. */
+      /* Single-use addresses belong to the addressing selector; shared ones need an ADD. */
       if (stype == 1 && q->op == TCCIR_OP_ADD) {
-        if (amount >= 1 && amount <= 3)
-          continue;
         IROperand ad = tcc_ir_op_get_dest(ir, q);
         int aidx = irop_has_vreg(ad) ? ir_opt_du_idx(&du, irop_get_vreg(ad)) : -1;
-        if (!deref_base || aidx < 0 || deref_base[aidx])
+        int shared_result = irop_is_vreg_value(ad) && ir_opt_du_is_single_def(&du, irop_get_vreg(ad)) &&
+                            ir_opt_du_uses(&du, irop_get_vreg(ad)) > 1;
+        if (!shared_result && ((amount >= 1 && amount <= 3) || !deref_base || aidx < 0 || deref_base[aidx]))
           continue;
       }
 
       IROperand shift_src1 = tcc_ir_op_get_src1(ir, sq);
-      if (!irop_has_vreg(shift_src1))
+      if (!irop_is_vreg_value(shift_src1))
+        continue;
+
+      /* A local's home reads its value only when aliases and volatile accesses cannot change it. */
+      IRLiveInterval *shift_live = tcc_ir_try_get_live_interval(ir, irop_get_vreg(shift_src1));
+      if ((shift_src1.is_local && !shift_live) ||
+          (shift_live && (shift_live->addrtaken || shift_live->is_volatile)) ||
+          tcc_ir_access_is_volatile(ir, shift_src1))
         continue;
 
       int32_t shift_src_vr = irop_get_vreg(shift_src1);
 
-      IROperand other = (attempt == 0) ? tcc_ir_op_get_src1(ir, q)
-                                        : tcc_ir_op_get_src2(ir, q);
+      IROperand other = tcc_ir_op_get_src1_or_2(ir, q, attempt != 0);
       if (!irop_has_vreg(other))
         continue;
 
@@ -252,8 +221,7 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
           continue;
         if (irop_config[bop].has_dest)
         {
-          IROperand jdest = tcc_ir_op_get_dest(ir, jq);
-          if (irop_has_vreg(jdest) && irop_get_vreg(jdest) == shift_src_vr)
+          if (tcc_ir_op_dest_has_vreg(ir, jq) && tcc_ir_op_dest_vreg(ir, jq) == shift_src_vr)
             safe = 0;
         }
       }
@@ -276,4 +244,3 @@ void tcc_ir_barrel_shift_fusion(TCCIRState *ir)
   tcc_free(deref_base);
   tcc_free(du.def);
 }
-

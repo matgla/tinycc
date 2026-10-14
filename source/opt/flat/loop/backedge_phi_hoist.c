@@ -28,7 +28,7 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
     if (jif->op != TCCIR_OP_JUMPIF)
       continue;
 
-    int exit_target = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, jif));
+    int exit_target = (int)tcc_ir_op_dest_imm32(ir, jif);
     int cond = (int)tcc_ir_op_get_src1(ir, jif).u.imm32;
 
     if (exit_target <= i)
@@ -52,28 +52,59 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
     if (jmp->op != TCCIR_OP_JUMP)
       continue;
 
-    int body_target = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, jmp));
+    int body_target = (int)tcc_ir_op_dest_imm32(ir, jmp);
     if (body_target >= i)
       continue;
 
-    /* exit target must stay fall-through reachable past the JUMP */
-    if (exit_target < jump_idx)
+    /* The rewritten JUMPIF falls through to whatever follows the (NOPed)
+     * JUMP, so exit_target must BE that fall-through: only NOPs may sit
+     * between them.  Live code there (a switch's `case 2: JUMPIF -> X` over
+     * the case-1 body, with the default arm looping back through these
+     * copies) would run on the exit path and X's own path would be lost. */
+    if (exit_target <= jump_idx)
       continue;
+    {
+      int fallthrough = 1;
+      for (int k = jump_idx + 1; k < exit_target; k++) {
+        if (ir->compact_instructions[k].op != TCCIR_OP_NOP) {
+          fallthrough = 0;
+          break;
+        }
+      }
+      if (!fallthrough)
+        continue;
+    }
 
     if (i == 0)
       continue;
     IRQuadCompact *cmp_q = &ir->compact_instructions[i - 1];
-    if (cmp_q->op != TCCIR_OP_CMP)
+    int32_t latch_v = -1; /* decrement_to_carry latch: CMP V,#K; SUB V,#K; JUMPIF */
+    if (cmp_q->op == TCCIR_OP_SUB)
+    {
+      /* The fused latch's flag producer is the SUBS, with its CMP one op
+       * further up; the hoisted copies land between the SUB and the JUMPIF,
+       * where an ASSIGN's mov/ldr/str lowering preserves the SUBS' flags. */
+      if (i < 2)
+        continue;
+      IRQuadCompact *sub_q = cmp_q;
+      cmp_q = &ir->compact_instructions[i - 2];
+      latch_v = tcc_ir_op_dest_vreg(ir, sub_q);
+      if (cmp_q->op != TCCIR_OP_CMP || latch_v < 0 ||
+          tcc_ir_op_src1_vreg(ir, cmp_q) != latch_v ||
+          tcc_ir_op_src1_vreg(ir, sub_q) != latch_v ||
+          !tcc_ir_op_src2_is_imm(ir, cmp_q) || !tcc_ir_op_src2_is_imm(ir, sub_q) ||
+          tcc_ir_op_src2_imm(ir, cmp_q) != tcc_ir_op_src2_imm(ir, sub_q))
+        continue;
+    }
+    else if (cmp_q->op != TCCIR_OP_CMP)
       continue;
 
     /* spilled operands lower to load/store sequences that disturb pending flags */
     int safe = 1;
     for (int j = 0; j < num_assigns && safe; j++) {
       IRQuadCompact *aq = &ir->compact_instructions[i + 1 + j];
-      IROperand adst = tcc_ir_op_get_dest(ir, aq);
-      IROperand asrc = tcc_ir_op_get_src1(ir, aq);
-      int32_t adst_vr = irop_get_vreg(adst);
-      int32_t asrc_vr = irop_get_vreg(asrc);
+      int32_t adst_vr = tcc_ir_op_dest_vreg(ir, aq);
+      int32_t asrc_vr = tcc_ir_op_src1_vreg(ir, aq);
 
       if (adst_vr >= 0) {
         int spilled = 0;
@@ -100,44 +131,40 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
     }
 
     /* an ASSIGN dest feeding the CMP would change the flags it already set */
-    IROperand cmp_src1 = tcc_ir_op_get_src1(ir, cmp_q);
-    IROperand cmp_src2 = tcc_ir_op_get_src2(ir, cmp_q);
-    int32_t cmp_vr1 = irop_get_vreg(cmp_src1);
-    int32_t cmp_vr2 = irop_get_vreg(cmp_src2);
+    int32_t cmp_vr1 = tcc_ir_op_src1_vreg(ir, cmp_q);
+    int32_t cmp_vr2 = tcc_ir_op_src2_vreg(ir, cmp_q);
     for (int j = 0; j < num_assigns && safe; j++) {
       IRQuadCompact *aq = &ir->compact_instructions[i + 1 + j];
-      IROperand adst = tcc_ir_op_get_dest(ir, aq);
-      int32_t adst_vr = irop_get_vreg(adst);
+      int32_t adst_vr = tcc_ir_op_dest_vreg(ir, aq);
       if (adst_vr >= 0 && (adst_vr == cmp_vr1 || adst_vr == cmp_vr2))
         safe = 0;
     }
 
     /* a dest used after exit_target before redefinition still needs its pre-ASSIGN value */
     for (int j = 0; j < num_assigns && safe; j++) {
-      IROperand adst = tcc_ir_op_get_dest(ir, &ir->compact_instructions[i + 1 + j]);
-      int32_t adst_vr = irop_get_vreg(adst);
+      int32_t adst_vr = tcc_ir_op_dest_vreg(ir, &ir->compact_instructions[i + 1 + j]);
       if (adst_vr < 0) continue;
       for (int k = exit_target; k < n && safe; k++) {
         IRQuadCompact *eq = &ir->compact_instructions[k];
         if (eq->op == TCCIR_OP_NOP) continue;
         if (irop_config[eq->op].has_src1) {
-          if (irop_get_vreg(tcc_ir_op_get_src1(ir, eq)) == adst_vr)
+          if (tcc_ir_op_src1_vreg(ir, eq) == adst_vr)
             safe = 0;
         }
         if (safe && irop_config[eq->op].has_src2) {
-          if (irop_get_vreg(tcc_ir_op_get_src2(ir, eq)) == adst_vr)
+          if (tcc_ir_op_src2_vreg(ir, eq) == adst_vr)
             safe = 0;
         }
         if (safe && tcc_ir_op_is_mac(eq->op)) {
-          if (irop_get_vreg(tcc_ir_op_get_accum(ir, eq)) == adst_vr)
+          if (tcc_ir_op_accum_vreg(ir, eq) == adst_vr)
             safe = 0;
         }
         if (safe && irop_config[eq->op].has_dest &&
-            irop_get_vreg(tcc_ir_op_get_dest(ir, eq)) == adst_vr) {
+            tcc_ir_op_dest_vreg(ir, eq) == adst_vr) {
           /* STORE-family and is_lval dests hold the address: a use, not a def */
           if (eq->op == TCCIR_OP_STORE || eq->op == TCCIR_OP_STORE_INDEXED ||
               eq->op == TCCIR_OP_STORE_POSTINC ||
-              tcc_ir_op_get_dest(ir, eq).is_lval)
+              tcc_ir_op_dest_is_lval(ir, eq))
             safe = 0;
           else
             break; /* genuine redefinition kills the prior value */
@@ -158,8 +185,8 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
      * by another interval still live at the branch is unsafe. */
     for (int j = 0; j < num_assigns && safe; j++) {
       IRQuadCompact *aq = &ir->compact_instructions[i + 1 + j];
-      int32_t adst_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, aq));
-      int32_t asrc_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, aq));
+      int32_t adst_vr = tcc_ir_op_dest_vreg(ir, aq);
+      int32_t asrc_vr = tcc_ir_op_src1_vreg(ir, aq);
       LSLiveInterval *di = NULL, *si = NULL;
       if (adst_vr < 0)
         continue;
@@ -202,7 +229,7 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
         IRQuadCompact *kq = &ir->compact_instructions[k];
         if (kq->op != TCCIR_OP_JUMP && kq->op != TCCIR_OP_JUMPIF)
           continue;
-        int kt = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, kq));
+        int kt = (int)tcc_ir_op_dest_imm32(ir, kq);
         if (kt >= i + 1 && kt < jump_idx)
           side_entry = 1;
       }
@@ -221,8 +248,8 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
         int all_noop = 1;
         for (int j = 0; j < num_assigns && all_noop; j++) {
           IRQuadCompact *aq = &ir->compact_instructions[i + 1 + j];
-          int32_t adst_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, aq));
-          int32_t asrc_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, aq));
+          int32_t adst_vr = tcc_ir_op_dest_vreg(ir, aq);
+          int32_t asrc_vr = tcc_ir_op_src1_vreg(ir, aq);
           if (adst_vr < 0 || asrc_vr < 0) { all_noop = 0; break; }
           int dst_reg = -2, dst_reg1 = -2, src_reg = -3, src_reg1 = -3;
           for (int k = 0; k < ir->ls.next_interval_index; k++) {
@@ -285,7 +312,7 @@ int tcc_ir_opt_backedge_phi_hoist(TCCIRState *ir)
       IRQuadCompact *kq = &ir->compact_instructions[k];
       if (kq->op != TCCIR_OP_JUMP && kq->op != TCCIR_OP_JUMPIF)
         continue;
-      int kt = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, kq));
+      int kt = (int)tcc_ir_op_dest_imm32(ir, kq);
       if (kt < i + 1 || kt > jump_idx)
         continue;
       IROperand kd = {0};

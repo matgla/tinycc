@@ -87,7 +87,17 @@ Sym *bci_image_sym(Section *sec, const uint8_t *bytes, int size, const BciReloc 
   addr_t off = section_add(sec, size, 4);
   memcpy(sec->data + off, bytes, size);
   for (int i = 0; i < nrel; i++)
+  {
+    /* A table image can be emitted while nocode_wanted still holds
+     * CODE_OFF_BIT (dead code after the function's last return), where
+     * put_extern_sym silently skips and the reloc sym stays unbound (c=0)
+     * for greloca to reject.  get_sym_ref has the same problem and bypasses
+     * the guard with put_extern_sym2; bind here the same way.  check_only
+     * (a dropped static's diagnostics parse) still emits nothing. */
+    if (rel[i].sym->c <= 0 && !tcc_state->check_only)
+      put_extern_sym2(rel[i].sym, SHN_UNDEF, 0, 0, 1);
     greloc(sec, rel[i].sym, off + rel[i].off, R_DATA_PTR);
+  }
   CType ctype;
   /* const-qualified: nothing ever writes an image, so loads from it fold
    * (global_init_prop). */
@@ -152,22 +162,23 @@ int tcc_ir_opt_block_copy_init(TCCIRState *ir)
     if (q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
 
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
     const char *name = get_tok_str(callee->v, NULL);
     if (!name)
       continue;
-    if (strcmp(name, "__aeabi_memset") != 0 && strcmp(name, "memset") != 0)
+    int size_idx, fill_idx;
+    if (!ir_opt_memset_params(name, &size_idx, &fill_idx))
       continue;
 
-    /* Param order is __aeabi_memset(dest, size, fill_value). */
+    /* memset(dest, fill, size) vs __aeabi_memset(dest, size, fill). */
     IROperand param_dest, param_size, param_fill;
     if (!ir_opt_get_call_param_operand(ir, i, 0, &param_dest))
       continue;
-    if (!ir_opt_get_call_param_operand(ir, i, 1, &param_size))
+    if (!ir_opt_get_call_param_operand(ir, i, size_idx, &param_size))
       continue;
-    if (!ir_opt_get_call_param_operand(ir, i, 2, &param_fill))
+    if (!ir_opt_get_call_param_operand(ir, i, fill_idx, &param_fill))
       continue;
 
     if (irop_get_tag(param_fill) != IROP_TAG_IMM32)

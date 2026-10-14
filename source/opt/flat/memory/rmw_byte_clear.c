@@ -171,14 +171,12 @@ static int rmw_byte_clear_vreg_used_elsewhere(TCCIRState *ir, int32_t vr, int sk
     }
     if (irop_config[q->op].has_src1)
     {
-      IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      if (irop_has_vreg(s1) && irop_get_vreg(s1) == vr)
+      if (tcc_ir_op_src1_has_vreg(ir, q) && tcc_ir_op_src1_vreg(ir, q) == vr)
         return 1;
     }
     if (irop_config[q->op].has_src2)
     {
-      IROperand s2 = tcc_ir_op_get_src2(ir, q);
-      if (irop_has_vreg(s2) && irop_get_vreg(s2) == vr)
+      if (tcc_ir_op_src2_has_vreg(ir, q) && tcc_ir_op_src2_vreg(ir, q) == vr)
         return 1;
     }
     if (q->op == TCCIR_OP_MLA)
@@ -219,6 +217,9 @@ static int rmw_byte_clear_match_pair(TCCIRState *ir, int and_idx, RMWByteClearPa
 
   if (!irop_op_is_lval(and_src1) || !irop_is_immediate(and_src2))
     return 0;
+  /* a volatile word access must stay a word read + word write */
+  if (tcc_ir_instr_access_is_volatile(ir, q))
+    return 0;
 
   mask = (uint32_t)irop_get_imm32(and_src2);
   cleared = ~mask;
@@ -239,6 +240,8 @@ static int rmw_byte_clear_match_pair(TCCIRState *ir, int and_idx, RMWByteClearPa
 
   sq = &ir->compact_instructions[j];
   if (sq->op != TCCIR_OP_STORE)
+    return 0;
+  if (tcc_ir_instr_access_is_volatile(ir, sq))
     return 0;
 
   store_dest = tcc_ir_op_get_dest(ir, sq);
@@ -372,20 +375,20 @@ int tcc_ir_opt_rmw_byte_clear(TCCIRState *ir)
     if (q->op != TCCIR_OP_AND)
       continue;
 
-    IROperand and_dest = tcc_ir_op_get_dest(ir, q);
     IROperand and_src1 = tcc_ir_op_get_src1(ir, q);
-    IROperand and_src2 = tcc_ir_op_get_src2(ir, q);
 
     if (!irop_op_is_lval(and_src1))
       continue;
-    if (!irop_is_immediate(and_src2))
+    if (!tcc_ir_op_src2_is_imm(ir, q))
       continue;
 
-    uint32_t mask = (uint32_t)irop_get_imm32(and_src2);
+    uint32_t mask = (uint32_t)tcc_ir_op_src2_imm32(ir, q);
     if (mask != 0xFFFFFF00u)
       continue;
+    if (tcc_ir_instr_access_is_volatile(ir, q))
+      continue;
 
-    int32_t and_dest_vr = irop_get_vreg(and_dest);
+    int32_t and_dest_vr = tcc_ir_op_dest_vreg(ir, q);
     int32_t addr_vr = irop_get_vreg(and_src1);
     if (and_dest_vr < 0 || addr_vr < 0)
       continue;
@@ -403,11 +406,12 @@ int tcc_ir_opt_rmw_byte_clear(TCCIRState *ir)
       continue;
 
     IROperand store_dest = tcc_ir_op_get_dest(ir, sq);
-    IROperand store_src = tcc_ir_op_get_src1(ir, sq);
 
-    if (irop_get_vreg(store_src) != and_dest_vr)
+    if (tcc_ir_op_src1_vreg(ir, sq) != and_dest_vr)
       continue;
     if (!irop_op_is_lval(store_dest))
+      continue;
+    if (tcc_ir_instr_access_is_volatile(ir, sq))
       continue;
     if (irop_get_vreg(store_dest) != addr_vr)
       continue;
@@ -426,14 +430,12 @@ int tcc_ir_opt_rmw_byte_clear(TCCIRState *ir)
         continue;
       if (!irop_config[kq->op].has_dest)
         continue;
-      IROperand d = tcc_ir_op_get_dest(ir, kq);
-      if (!irop_has_vreg(d) || irop_get_vreg(d) != addr_vr)
+      if (!tcc_ir_op_dest_has_vreg(ir, kq) || tcc_ir_op_dest_vreg(ir, kq) != addr_vr)
         continue;
       if (kq->op == TCCIR_OP_ADD) {
         IROperand s1 = tcc_ir_op_get_src1(ir, kq);
-        IROperand s2 = tcc_ir_op_get_src2(ir, kq);
-        if (irop_is_immediate(s2) && irop_has_vreg(s1)) {
-          int32_t imm = irop_get_imm32(s2);
+        if (tcc_ir_op_src2_is_imm(ir, kq) && irop_has_vreg(s1)) {
+          int32_t imm = tcc_ir_op_src2_imm32(ir, kq);
           if (imm >= -255 && imm <= 4095) {
             add_idx = k;
             add_base_op = s1;
@@ -455,22 +457,19 @@ int tcc_ir_opt_rmw_byte_clear(TCCIRState *ir)
         int is_store_op = (kq->op == TCCIR_OP_STORE || kq->op == TCCIR_OP_STORE_INDEXED ||
                            kq->op == TCCIR_OP_STORE_POSTINC);
         if (irop_config[kq->op].has_dest) {
-          IROperand d = tcc_ir_op_get_dest(ir, kq);
-          if (irop_has_vreg(d) && irop_get_vreg(d) == addr_vr && is_store_op) {
+          if (tcc_ir_op_dest_has_vreg(ir, kq) && tcc_ir_op_dest_vreg(ir, kq) == addr_vr && is_store_op) {
             extra = 1;
             break;
           }
         }
         if (irop_config[kq->op].has_src1) {
-          IROperand s1 = tcc_ir_op_get_src1(ir, kq);
-          if (irop_has_vreg(s1) && irop_get_vreg(s1) == addr_vr) {
+          if (tcc_ir_op_src1_has_vreg(ir, kq) && tcc_ir_op_src1_vreg(ir, kq) == addr_vr) {
             extra = 1;
             break;
           }
         }
         if (irop_config[kq->op].has_src2) {
-          IROperand s2 = tcc_ir_op_get_src2(ir, kq);
-          if (irop_has_vreg(s2) && irop_get_vreg(s2) == addr_vr) {
+          if (tcc_ir_op_src2_has_vreg(ir, kq) && tcc_ir_op_src2_vreg(ir, kq) == addr_vr) {
             extra = 1;
             break;
           }

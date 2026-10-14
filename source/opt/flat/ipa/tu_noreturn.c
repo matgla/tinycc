@@ -34,7 +34,7 @@ void tcc_ir_tu_propagate_noreturn_to_callers(void)
       Sym *callee = e->calls.items[i];
       if (!callee || !callee->type.ref)
         continue;
-      int inferred_purity = tcc_ir_lookup_func_purity(tcc_state, callee->v);
+      int inferred_purity = tcc_ir_lookup_func_purity(tcc_state, func_cache_token(callee));
       if (callee->type.ref->f.func_noreturn)
       {
         fs->type.ref->f.func_late_reopt = 1;
@@ -47,7 +47,7 @@ void tcc_ir_tu_propagate_noreturn_to_callers(void)
         for (int j = 0; j < e->calls.count; j++)
         {
           Sym *other = e->calls.items[j];
-          if (!other || tcc_ir_lookup_func_purity(tcc_state, other->v) < TCC_FUNC_PURITY_PURE)
+          if (!other || tcc_ir_lookup_func_purity(tcc_state, func_cache_token(other)) < TCC_FUNC_PURITY_PURE)
           {
             all_calls_elidable = 0;
             break;

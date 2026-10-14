@@ -34,6 +34,7 @@ static void *vtf_begin(IROptCtx *ctx)
   int n = ir->next_instruction_index;
   VtfState *st = tcc_mallocz(sizeof(VtfState));
   st->n = n;
+  st->max_var_for_lea = -1;
   if (n < 2)
     return st;
 
@@ -45,8 +46,7 @@ static void *vtf_begin(IROptCtx *ctx)
     IRQuadCompact *jq = &ir->compact_instructions[i];
     if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, jq);
-      int t = (int)d.u.imm32;
+      int t = (int)tcc_ir_op_dest_u_imm32(ir, jq);
       if (t >= 0 && t < n)
         st->is_target[t >> 3] |= (uint8_t)(1u << (t & 7));
     }
@@ -76,8 +76,7 @@ static void *vtf_begin(IROptCtx *ctx)
     }
     if (sq->op == TCCIR_OP_LEA)
     {
-      IROperand ls = tcc_ir_op_get_src1(ir, sq);
-      int32_t vr = irop_get_vreg(ls);
+      int32_t vr = tcc_ir_op_src1_vreg(ir, sq);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -86,7 +85,7 @@ static void *vtf_begin(IROptCtx *ctx)
       }
     }
   }
-  if (st->max_var_for_lea > 0 && !st->has_nested_or_chain)
+  if (st->max_var_for_lea >= 0 && !st->has_nested_or_chain)
   {
     st->var_has_lea = tcc_mallocz((st->max_var_for_lea + 8) / 8);
     for (int i = 0; i < n; i++)
@@ -94,8 +93,7 @@ static void *vtf_begin(IROptCtx *ctx)
       IRQuadCompact *sq = &ir->compact_instructions[i];
       if (sq->op == TCCIR_OP_LEA)
       {
-        IROperand ls = tcc_ir_op_get_src1(ir, sq);
-        int32_t vr = irop_get_vreg(ls);
+        int32_t vr = tcc_ir_op_src1_vreg(ir, sq);
         if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
         {
           int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -198,8 +196,7 @@ OPT_GEN_FLAT(var_tmp_fwd, -1)
     /* A JMP to the next real instruction is a fallthrough — keep scanning. */
     if (q->op == TCCIR_OP_JUMP)
     {
-      IROperand jd = tcc_ir_op_get_dest(ir, q);
-      int jt = (int)jd.u.imm32;
+      int jt = (int)tcc_ir_op_dest_u_imm32(ir, q);
       while (jt < n && ir->compact_instructions[jt].op == TCCIR_OP_NOP)
         jt++;
       int next_real = j + 1;
@@ -217,8 +214,7 @@ OPT_GEN_FLAT(var_tmp_fwd, -1)
 
     if (irop_config[q->op].has_dest)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t d_vr = irop_get_vreg(d);
+      int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
       if (d_vr == src_vr)
         break;
     }
@@ -256,8 +252,7 @@ OPT_GEN_FLAT(var_tmp_fwd, -1)
     /* A redef of V ends the forwarding — later reads see the new value. */
     if (irop_config[q->op].has_dest)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t d_vr = irop_get_vreg(d);
+      int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
       if (d_vr == dest_vr)
         break;
     }

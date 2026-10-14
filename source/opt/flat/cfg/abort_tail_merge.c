@@ -26,7 +26,7 @@ static int ir_abort_guard_site(TCCIRState *ir, int i, int n, int *call_idx, int 
   if (jif->op != TCCIR_OP_JUMPIF)
     return -1;
 
-  int cont = (int)irop_get_imm32(tcc_ir_op_get_dest(ir, jif));
+  int cont = (int)tcc_ir_op_dest_imm32(ir, jif);
   int cond = (int)tcc_ir_op_get_src1(ir, jif).u.imm32;
 
   int j = i + 1;
@@ -41,10 +41,10 @@ static int ir_abort_guard_site(TCCIRState *ir, int i, int n, int *call_idx, int 
     return -1;
 
   IRQuadCompact *call = &ir->compact_instructions[j];
-  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, call));
+  Sym *callee = tcc_ir_op_src1_sym(ir, call);
   if (!tcc_ir_callee_is_noreturn(callee))
     return -1;
-  if (TCCIR_DECODE_CALL_ARGC((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, call))) != 0)
+  if (TCCIR_DECODE_CALL_ARGC((uint32_t)tcc_ir_op_src2_imm(ir, call)) != 0)
     return -1;
   if (cont != j + 1)
     return -1;

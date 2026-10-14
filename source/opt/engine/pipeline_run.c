@@ -61,17 +61,19 @@ static void pipeline_time_requirements(IROptCtx *ctx, uint32_t requires)
 }
 
 /* Called only after a pass reported changes > 0, which means the IR was
- * mutated -- so the cached analyses are dropped unconditionally, whatever the
- * table entry declared.  Honouring `invalidates` here instead would make the
- * per-pass dirty tracking below depend on every table entry having an accurate
- * mask: an entry that reports changes while declaring 0 would leave
- * ctx->generation stale and let the driver skip passes with real work.  The
- * four INVALIDATES_* bits are runtime-identical today in any case
- * (docs/plans/opt_pass_dedup_and_perf.md, RC2). */
-static void pipeline_apply_invalidations(IROptCtx *ctx, uint32_t invalidates)
+ * mutated -- so the cached analyses are dropped unconditionally.  A per-pass
+ * invalidation mask would make the per-pass dirty tracking below depend on
+ * every table entry having an accurate mask: an entry that reports changes
+ * while declaring none would leave ctx->generation stale and let the driver
+ * skip passes with real work (docs/plans/opt_pass_dedup_and_perf.md, RC2). */
+static void pipeline_apply_invalidations(IROptCtx *ctx)
 {
-  (void)invalidates;
   tcc_ir_opt_ctx_invalidate(ctx);
+}
+
+static int pipeline_call(IROptCtx *ctx, const IROptPass *pass)
+{
+  return pass->takes_ir ? pass->fn.run_ir(ctx->ir) : pass->fn.run(ctx);
 }
 
 #if CONFIG_TCC_DEBUG_ENV
@@ -147,6 +149,15 @@ void dbg_scan_imm_dest(TCCIRState *ir, const char *pass)
  * `make test-golden-ir` gates. */
 #define PIPELINE_MAX_TRACKED 64
 
+/* Whether the TCCState flag at `offset` is on.  Never in an O0-only compiler,
+ * whose tables carry no gated pass to run (pipeline_table.c): -O and -f<opt>
+ * still set the fields there, and nothing may read them. */
+#ifdef CONFIG_TCC_O0_ONLY
+#define PIPELINE_FLAG_ON(offset) 0
+#else
+#define PIPELINE_FLAG_ON(offset) (*((unsigned char *)tcc_state + (offset)))
+#endif
+
 /* Dumping every pass here is what keeps group-only passes visible to the golden-IR harness. */
 int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
 {
@@ -168,14 +179,14 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
 
     if (group->trigger_idx >= 0) {
       const IROptPass *trigger = &group->passes[group->trigger_idx];
-      if (trigger->flag_offset && !*((unsigned char *)tcc_state + trigger->flag_offset))
+      if (trigger->flag_offset && !PIPELINE_FLAG_ON(trigger->flag_offset))
         break;
       if (tcc_ir_opt_pass_disabled(trigger->name))
         break;
       pipeline_time_requirements(ctx, trigger->requires);
       int tch;
       TCC_PASS_TIMED(tch, trigger->name ? trigger->name : "P:trigger",
-                     trigger->run(ctx));
+                     pipeline_call(ctx, trigger));
       dbg_scan_imm_dest(ctx->ir, trigger->name);
       dbg_scan_overlap(ctx->ir, trigger->name);
       tcc_ir_dump_after_pass(ctx->ir, trigger->name);
@@ -184,16 +195,16 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
       if (tch <= 0)
         break;
       round_changes += tch;
-      pipeline_apply_invalidations(ctx, trigger->invalidates);
+      pipeline_apply_invalidations(ctx);
     }
 
     for (int p = 0; p < group->count; p++) {
       if (p == group->trigger_idx)
         continue;
       const IROptPass *pass = &group->passes[p];
-      if (!pass->run)
+      if (!pass->fn.run)
         continue;
-      if (pass->flag_offset && !*((unsigned char *)tcc_state + pass->flag_offset))
+      if (pass->flag_offset && !PIPELINE_FLAG_ON(pass->flag_offset))
         continue;
       if (tcc_ir_opt_pass_disabled(pass->name))
         continue;
@@ -209,13 +220,13 @@ int tcc_ir_opt_run_group(IROptCtx *ctx, const IRPassGroup *group)
       pipeline_time_requirements(ctx, pass->requires);
 
       int changes;
-      TCC_PASS_TIMED(changes, pass->name ? pass->name : "P:pass", pass->run(ctx));
+      TCC_PASS_TIMED(changes, pass->name ? pass->name : "P:pass", pipeline_call(ctx, pass));
       dbg_scan_imm_dest(ctx->ir, pass->name);
       dbg_scan_overlap(ctx->ir, pass->name);
       tcc_ir_dump_after_pass(ctx->ir, pass->name);
       if (changes > 0) {
         round_changes += changes;
-        pipeline_apply_invalidations(ctx, pass->invalidates);
+        pipeline_apply_invalidations(ctx);
       } else if (track) {
         /* No change reported and no invalidation ran, so ctx->generation is
          * still the value this pass just proved clean. */
@@ -256,9 +267,4 @@ int tcc_ir_opt_run_pipeline(TCCIRState *ir, const IRPassGroup *groups,
 
   tcc_ir_opt_ctx_free(&ctx);
   return total_changes;
-}
-
-int tcc_ir_opt_gen_pass_adapter(IROptCtx *ctx, const IROptGenPassData *data)
-{
-  return tcc_ir_opt_run_gens(ctx, data->gens, data->count);
 }

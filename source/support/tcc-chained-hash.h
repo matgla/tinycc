@@ -12,6 +12,11 @@ typedef struct TCCChainedHash
   uint32_t bucket_mask;
   uint32_t entry_capacity;
   uint32_t hashed_count;
+  /* Range of entry indices inserted since the last clear (dirty_lo > dirty_hi
+   * when none): a clear zeroes just their buckets instead of the whole
+   * bucket array, which only ever grows. */
+  uint32_t dirty_lo;
+  uint32_t dirty_hi;
   uint32_t *buckets;
   uint32_t *next;
   uint32_t *hashes;
@@ -23,6 +28,8 @@ static inline void tcc_chained_hash_init(TCCChainedHash *hash, uint32_t bucket_c
   hash->bucket_mask = bucket_count - 1;
   hash->entry_capacity = entry_capacity;
   hash->hashed_count = 0;
+  hash->dirty_lo = UINT32_MAX;
+  hash->dirty_hi = 0;
   hash->buckets = tcc_mallocz(bucket_count * sizeof(*hash->buckets));
   hash->next = tcc_mallocz(entry_capacity * sizeof(*hash->next));
   hash->hashes = tcc_mallocz(entry_capacity * sizeof(*hash->hashes));
@@ -37,16 +44,34 @@ static inline void tcc_chained_hash_destroy(TCCChainedHash *hash)
   hash->bucket_mask = 0;
   hash->entry_capacity = 0;
   hash->hashed_count = 0;
+  hash->dirty_lo = UINT32_MAX;
+  hash->dirty_hi = 0;
   hash->buckets = NULL;
   hash->next = NULL;
   hash->hashes = NULL;
 }
 
+/* Every non-empty bucket heads a chain of entries inserted since the last
+ * clear, each stored under hashes[e] & bucket_mask, so zeroing the bucket of
+ * every index in the dirty range empties the table (a stale index in the range
+ * only re-zeroes some bucket).  Falls back to the full memset when the range
+ * is not smaller than the bucket array. */
 static inline void tcc_chained_hash_clear(TCCChainedHash *hash)
 {
   if (!hash->buckets)
     return;
-  memset(hash->buckets, 0, hash->bucket_count * sizeof(*hash->buckets));
+  if (hash->dirty_lo <= hash->dirty_hi)
+  {
+    if (hash->dirty_hi - hash->dirty_lo < hash->bucket_count / 2)
+    {
+      for (uint32_t e = hash->dirty_lo; e <= hash->dirty_hi; e++)
+        hash->buckets[hash->hashes[e] & hash->bucket_mask] = 0;
+    }
+    else
+      memset(hash->buckets, 0, hash->bucket_count * sizeof(*hash->buckets));
+  }
+  hash->dirty_lo = UINT32_MAX;
+  hash->dirty_hi = 0;
   hash->hashed_count = 0;
 }
 
@@ -113,6 +138,10 @@ static inline void tcc_chained_hash_insert_head(TCCChainedHash *hash, uint32_t f
   hash->hashes[entry_index] = full_hash;
   hash->next[entry_index] = hash->buckets[bucket];
   hash->buckets[bucket] = entry_index + 1;
+  if (entry_index < hash->dirty_lo)
+    hash->dirty_lo = entry_index;
+  if (entry_index > hash->dirty_hi)
+    hash->dirty_hi = entry_index;
   hash->hashed_count++;
   if (hash->hashed_count > 2 * hash->bucket_count)
     tcc_chained_hash_rebuild(hash, hash->bucket_count << 1);

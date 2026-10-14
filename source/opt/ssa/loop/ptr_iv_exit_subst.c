@@ -34,16 +34,13 @@ static int ptr_iv_find_loop_step(TCCIRState *ir, IRLoop *loop, int instr_idx,
   IRQuadCompact *q = &ir->compact_instructions[instr_idx];
   if (q->op != TCCIR_OP_ADD)
     return 0;
-  IROperand dest = tcc_ir_op_get_dest(ir, q);
-  IROperand src1 = tcc_ir_op_get_src1(ir, q);
-  IROperand src2 = tcc_ir_op_get_src2(ir, q);
-  int32_t d_vr = irop_get_vreg(dest);
-  int32_t s1_vr = irop_get_vreg(src1);
+  int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
+  int32_t s1_vr = tcc_ir_op_src1_vreg(ir, q);
   if (d_vr < 0 || TCCIR_DECODE_VREG_TYPE(d_vr) != TCCIR_VREG_TYPE_VAR)
     return 0;
-  if (!irop_is_immediate(src2))
+  if (!tcc_ir_op_src2_is_imm(ir, q))
     return 0;
-  int step = (int)irop_get_imm64_ex(ir, src2);
+  int step = (int)tcc_ir_op_src2_imm(ir, q);
   if (step == 0)
     return 0;
 
@@ -60,9 +57,9 @@ static int ptr_iv_find_loop_step(TCCIRState *ir, IRLoop *loop, int instr_idx,
       continue;
     if (aq->op != TCCIR_OP_ASSIGN)
       return 0;
-    IROperand adest = tcc_ir_op_get_dest(ir, aq);
-    IROperand asrc = tcc_ir_op_get_src1(ir, aq);
-    if (irop_get_vreg(adest) == s1_vr && irop_get_vreg(asrc) == d_vr) {
+    int32_t adest_vr = tcc_ir_op_dest_vreg(ir, aq);
+    int32_t asrc_vr = tcc_ir_op_src1_vreg(ir, aq);
+    if (adest_vr == s1_vr && asrc_vr == d_vr) {
       *out_vreg = d_vr;
       *out_step = step;
       return 1;
@@ -72,23 +69,30 @@ static int ptr_iv_find_loop_step(TCCIRState *ir, IRLoop *loop, int instr_idx,
   return 0;
 }
 
+/* q defines vreg vr (a STORE through vr's deref does not); *out_lval receives the dest's lval flag. */
+static int piv_is_def_of(TCCIRState *ir, IRQuadCompact *q, int32_t vr, int *out_lval)
+{
+  if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+    return 0;
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  if (irop_get_vreg(dest) != vr)
+    return 0;
+  if (q->op == TCCIR_OP_STORE && dest.is_lval && !dest.is_local)
+    return 0;
+  *out_lval = dest.is_lval;
+  return 1;
+}
+
 static int ptr_iv_find_init(TCCIRState *ir, int vreg, int preheader_idx,
                             int *out_off, int *out_is_llocal, int *out_is_param,
                             int *out_init_idx, int *out_btype)
 {
   for (int j = preheader_idx; j >= 0; j--) {
     IRQuadCompact *q = &ir->compact_instructions[j];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    if (j < preheader_idx && q->is_jump_target)
+    if (j < preheader_idx && q->is_jump_target) /* a NOP can be the join */
       return 0;
-    if (!irop_config[q->op].has_dest)
-      continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(dest) != vreg)
-      continue;
-    /* STOREs through a vreg-deref do not redefine vreg itself. */
-    if (q->op == TCCIR_OP_STORE && dest.is_lval && !dest.is_local)
+    int lval;
+    if (!piv_is_def_of(ir, q, vreg, &lval))
       continue;
     if (q->op != TCCIR_OP_ASSIGN)
       return 0;
@@ -109,17 +113,8 @@ static int ptr_iv_unique_loop_def(TCCIRState *ir, IRLoop *loop, int vreg, int de
 {
   for (int j = loop->start_idx; j <= loop->end_idx; j++) {
     IRQuadCompact *q = &ir->compact_instructions[j];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    if (!irop_config[q->op].has_dest)
-      continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(dest) != vreg)
-      continue;
-    /* A STORE through vreg's deref does not redefine vreg. */
-    if (q->op == TCCIR_OP_STORE && dest.is_lval && !dest.is_local)
-      continue;
-    if (j != def_idx)
+    int lval;
+    if (piv_is_def_of(ir, q, vreg, &lval) && j != def_idx)
       return 0;
   }
   return 1;
@@ -138,8 +133,7 @@ static int ptr_iv_subst_uses_in_instr(TCCIRState *ir, int idx, int vreg, IROpera
     }
   }
   if (irop_config[q->op].has_src2) {
-    IROperand s = tcc_ir_op_get_src2(ir, q);
-    if (irop_get_vreg(s) == vreg && irop_get_tag(s) == IROP_TAG_STACKOFF) {
+    if (tcc_ir_op_src2_vreg(ir, q) == vreg && tcc_ir_op_src2_tag(ir, q) == IROP_TAG_STACKOFF) {
       tcc_ir_op_set_src2(ir, q, repl);
       subs++;
     }
@@ -168,15 +162,10 @@ static int piv_resolve_frame_addr(TCCIRState *ir, IROperand op, int exit_target,
 
   for (int j = at - 1; j >= exit_target; j--) {
     IRQuadCompact *q = &ir->compact_instructions[j];
-    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+    int lval;
+    if (!piv_is_def_of(ir, q, vr, &lval))
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_get_vreg(dest) != vr)
-      continue;
-    /* A STORE through vr's deref is a use of vr, not a def. */
-    if (q->op == TCCIR_OP_STORE && dest.is_lval && !dest.is_local)
-      continue;
-    if (dest.is_lval)
+    if (lval)
       return 0; /* memory-form write — not a modeled vreg def */
     if (q->op == TCCIR_OP_LEA) {
       IROperand src = tcc_ir_op_get_src1(ir, q);
@@ -235,8 +224,8 @@ static int piv_fold_substituted_cmp(TCCIRState *ir, int cmp_idx, int exit_target
   if (off1 != off2 || p1 != p2)
     return 0; /* proven-unequal is foldable too, but left alone */
 
-  IROperand cond = tcc_ir_op_get_src1(ir, next);
-  int tok = (int)irop_get_imm64_ex(ir, cond);
+  int64_t cond_imm = tcc_ir_op_src1_imm(ir, next);
+  int tok = (int)cond_imm;
   int result = evaluate_compare_condition(0, 0, tok); /* equal-equal */
   if (result < 0)
     return 0;
@@ -283,6 +272,21 @@ static int ptr_iv_exit_subst_loop(TCCIRState *ir, IRLoop *loop,
   int trip_count = compute_trip_count(primary->init_val, limit, primary->step, cond);
   if (trip_count <= 0)
     return 0;
+
+  /* init + step * trip_count is the pointer's value on the counted exit only.
+   * A break/goto (any other branch leaving the loop) can land
+   * on the same exit_target, or in the range walked below, with a smaller
+   * pointer, so the counted exit must be the loop's only way out. */
+  for (int j = loop->start_idx; j <= loop->end_idx; j++) {
+    IRQuadCompact *lq = &ir->compact_instructions[j];
+    if (lq->op == TCCIR_OP_IJUMP || lq->op == TCCIR_OP_SWITCH_TABLE)
+      return 0;
+    if ((lq->op != TCCIR_OP_JUMP && lq->op != TCCIR_OP_JUMPIF) || j == jmpif_idx)
+      continue;
+    int lt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, lq));
+    if (lt < loop->start_idx || lt > loop->end_idx)
+      return 0;
+  }
 
   PtrIV pivs[PTRIV_MAX];
   int n_pivs = 0;
@@ -332,16 +336,16 @@ static int ptr_iv_exit_subst_loop(TCCIRState *ir, IRLoop *loop,
     IRQuadCompact *gq = &ir->compact_instructions[g];
     if (gq->op != TCCIR_OP_CMP)
       continue;
-    IROperand gs1 = tcc_ir_op_get_src1(ir, gq);
-    if (irop_get_vreg(gs1) != primary->vreg)
+    int32_t gs1_vr = tcc_ir_op_src1_vreg(ir, gq);
+    if (gs1_vr != primary->vreg)
       continue;
     if (g + 1 >= loop->start_idx)
       break;
     IRQuadCompact *gjq = &ir->compact_instructions[g + 1];
     if (gjq->op != TCCIR_OP_JUMPIF)
       continue;
-    IROperand gjd = tcc_ir_op_get_dest(ir, gjq);
-    int gjt = (int)irop_get_imm64_ex(ir, gjd);
+    int64_t gjd_imm = tcc_ir_op_dest_imm(ir, gjq);
+    int gjt = (int)gjd_imm;
     if (gjt < loop->end_idx)
       continue; /* entry guard must target past the loop */
     gq->op = TCCIR_OP_NOP;
@@ -355,8 +359,8 @@ static int ptr_iv_exit_subst_loop(TCCIRState *ir, IRLoop *loop,
         IRQuadCompact *sq = &ir->compact_instructions[s];
         if (sq->op != TCCIR_OP_JUMP && sq->op != TCCIR_OP_JUMPIF)
           continue;
-        IROperand sd = tcc_ir_op_get_dest(ir, sq);
-        int st = (int)irop_get_imm64_ex(ir, sd);
+        int64_t sd_imm = tcc_ir_op_dest_imm(ir, sq);
+        int st = (int)sd_imm;
         if (st == gjt)
           has_other_in_edge = 1;
       }
@@ -373,12 +377,12 @@ static int ptr_iv_exit_subst_loop(TCCIRState *ir, IRLoop *loop,
   int n = ir->next_instruction_index;
   for (int j = exit_target; j < n; j++) {
     IRQuadCompact *q = &ir->compact_instructions[j];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-
+    /* Before the NOP skip: a NOP can be the merge. */
     if (j > exit_target && q->is_jump_target) {
       for (int p = 0; p < n_pivs; p++) live[p] = 0;
     }
+    if (q->op == TCCIR_OP_NOP)
+      continue;
 
     int any_live = 0;
     for (int p = 0; p < n_pivs; p++) if (live[p]) { any_live = 1; break; }
@@ -420,8 +424,8 @@ static int ptr_iv_exit_subst_loop(TCCIRState *ir, IRLoop *loop,
     }
 
     if (q->op == TCCIR_OP_JUMP) {
-      IROperand jd = tcc_ir_op_get_dest(ir, q);
-      int t = (int)irop_get_imm64_ex(ir, jd);
+      int64_t jd_imm = tcc_ir_op_dest_imm(ir, q);
+      int t = (int)jd_imm;
       if (t <= j) {
         for (int p = 0; p < n_pivs; p++) live[p] = 0;
       }
@@ -461,17 +465,8 @@ static int piv_try_candidate(TCCIRState *ir, IRCFG *cfg, int header_b,
   fie_collect_members(cfg, header_b, latch_b, member);
 
   /* Single-entry: header preds must be exactly {out-of-loop pred, latch}. */
-  if (hb->num_preds != 2)
-    return 0;
-  int latch_seen = 0, entry_pred = -1;
-  for (int i = 0; i < hb->num_preds; i++) {
-    int p = hb->preds[i];
-    if (p == latch_b && !latch_seen)
-      latch_seen = 1;
-    else
-      entry_pred = p;
-  }
-  if (!latch_seen || entry_pred < 0 || member[entry_pred])
+  int entry_pred = fie_entry_pred(hb, latch_b, member);
+  if (entry_pred < 0)
     return 0;
 
   for (int b = 0; b < cfg->num_blocks; b++) {
@@ -529,27 +524,11 @@ int ssa_opt_ptr_iv_exit_subst(TCCIRState *ir)
     }
     tcc_ir_cfg_compute_dominators(cfg);
 
-    int cap = cfg->num_blocks;
-    FieCand *cands = tcc_mallocz(sizeof(FieCand) * (size_t)cap);
-    int nc = 0;
-    for (int b = 0; b < cfg->num_blocks && nc < cap; b++) {
-      IRBasicBlock *bb = &cfg->blocks[b];
-      for (int si = 0; si < bb->num_succs && nc < cap; si++) {
-        int h = bb->succs[si];
-        if (h < 0 || h >= cfg->num_blocks)
-          continue;
-        if (!tcc_ir_cfg_dominates(cfg, h, b))
-          continue;
-        cands[nc].header_b = h;
-        cands[nc].latch_b = b;
-        cands[nc].size = cfg->blocks[b].end_idx - cfg->blocks[h].start_idx;
-        nc++;
-      }
-    }
+    int nc;
+    FieCand *cands = fie_collect_cands(cfg, &nc);
 
     int cfg_changed = 0;
     if (nc > 0) {
-      qsort(cands, nc, sizeof(FieCand), fie_cand_cmp);
       uint8_t *member = tcc_malloc((size_t)cfg->num_blocks);
       for (int i = 0; i < nc && !cfg_changed; i++) {
         int cfg_changes = 0;

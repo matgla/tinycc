@@ -992,7 +992,33 @@ UT_TEST(test_branch_return_reuse_decline_ne_edge)
 UT_TEST(test_branch_return_reuse_decline_two_preds)
 {
   ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
-  /* A second (unconditional) predecessor reaches the return: no proof. */
+  /* A second (unconditional) predecessor reaches the return: no proof.  Its
+   * block does work, or the two edges would converge on an empty path and
+   * branch_converge would drop the JUMPIF (test_branch_converging_jumpif). */
+  ssa_add_instr(&c, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_param(0, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMPIF, utb_imm(4, I32), utb_imm(0x94, I32));
+  ssa_add_instr(&c, TCCIR_OP_ASSIGN, utb_temp(1, I32), utb_imm(7, I32));
+  ssa_add_instr(&c, TCCIR_OP_JUMP, utb_imm(4, I32), UTB_NONE);
+  ssa_add_instr(&c, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32));
+
+  ssa_ctx_build_cfg(&c);
+  ssa_ctx_build_ssa_plain(&c);
+  ssa_ctx_rebuild(&c);
+
+  int changed = run_branch_with_opt_level(c.ctx, 2);
+  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 4)), IROP_VR(utb_imm(0, I32)));
+
+  ssa_ctx_free(&c);
+  return 0;
+}
+
+UT_TEST(test_branch_converging_jumpif)
+{
+  ssa_ctx c = ssa_ctx_new(/*blocks=*/2, /*temps=*/4);
+  /* Both edges reach the return, the fall-through through an empty JUMP
+   * block: the JUMPIF decides nothing and is dropped (the test stays for
+   * orphan_cmp).  The return itself is left alone. */
   ssa_add_instr(&c, TCCIR_OP_TEST_ZERO, UTB_NONE, utb_param(0, I32));
   ssa_add_instr(&c, TCCIR_OP_JUMPIF, utb_imm(3, I32), utb_imm(0x94, I32));
   ssa_add_instr(&c, TCCIR_OP_JUMP, utb_imm(3, I32), UTB_NONE);
@@ -1003,7 +1029,9 @@ UT_TEST(test_branch_return_reuse_decline_two_preds)
   ssa_ctx_rebuild(&c);
 
   int changed = run_branch_with_opt_level(c.ctx, 2);
-  UT_ASSERT_EQ(changed, 0);
+  UT_ASSERT(changed >= 1);
+  UT_ASSERT_EQ(utb_op(c.ir, 0), TCCIR_OP_TEST_ZERO);
+  UT_ASSERT_EQ(utb_op(c.ir, 1), TCCIR_OP_NOP);
   UT_ASSERT_EQ(IROP_VR(utb_src1(c.ir, 3)), IROP_VR(utb_imm(0, I32)));
 
   ssa_ctx_free(&c);

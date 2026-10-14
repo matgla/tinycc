@@ -1,0 +1,27 @@
+pick(0) = 0
+pick(1) = 7
+pick(2) = 65535
+pick(3) = 32769
+pick(4) = 0
+pick(5) = 300
+join 0: 0 0  add 0 65520
+join 1: 21 600  add 7 65527
+join 2: 196606 765  add 65535 65519
+join 3: 98308 3  add 32769 32753
+join 4: 0 384  add 0 65520
+join 5: 901 0  add 300 284
+loop_u16 1 364 56369
+loop_u8 414 6586
+signed_later(0) = 0 0
+signed_later(1) = -1056 -1056
+signed_later(2) = -1001 -1001
+signed_later(3) = 1 1
+signed_later(4) = -1128 -1128
+signed_later(5) = 0 0
+word 0: cut 4660 twice 0 rebuild 00000000
+word 1: cut 43981 twice 43981 rebuild 1234abcd
+word 2: cut 1 twice 1 rebuild ffff0001
+word 3: cut 65535 twice 65535 rebuild 0000ffff
+hdr 32 2147483648 low 65536 65535 vol 195
+sx 65480 127 65535
+shapes 5 636 342

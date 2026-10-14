@@ -23,15 +23,13 @@ static int is_power_of_2(uint32_t v, int *shift)
 /* MUL(x, 2^n) -> SHL(x, n) */
 OPT_GEN_SSA(dsl_strength_mul_power2, TCCIR_OP_MUL) {
   int shift = 0;
-  PATTERN(
-    .constraints = { .dest = IR_CONSTRAINT_VREG,
-                     .src1 = IR_CONSTRAINT_VREG,
-                     .src2 = IR_CONSTRAINT_IMM });
+  MATCH();
+  BIND_VREG(dest);
+  BIND_VREG(src1);
+  BIND_IMM(src2);
   GUARD(
     when(is_power_of_2((uint32_t)imm(src2), &shift)));
-  REWRITE(
-    .new_op = TCCIR_OP_SHL,
-    .src2   = mk_imm(shift));
+  REWRITE(set_op(TCCIR_OP_SHL), set_src2(mk_imm(shift)));
 }
 
 static const IRSSAOptGen dsl_strength_gens[] = {

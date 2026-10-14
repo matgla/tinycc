@@ -38,6 +38,7 @@ ssa:reassoc
 ssa:strength
 ssa:narrow
 ssa:gvn
+ssa:dup_diamond
 ssa:phi_simplify
 ssa:dead_loop          (O2 only)
 ssa:dce
@@ -117,6 +118,27 @@ result fits in a smaller type (e.g. 64-bit → 32-bit when value fits).
 ### ssa:gvn
 Global Value Numbering. Identifies and eliminates global common
 subexpressions across basic blocks.
+
+### ssa:dup_diamond
+Duplicate diamond reuse. A diamond whose head is the join of the diamond just
+before it, tests the same value (same compare operands, same or inverted
+condition token) and holds the same instructions arm for arm, takes the first
+diamond's results: its join phis are replaced by the first join's matching
+phis, VARs its arms store are renamed to the first diamond's VARs, and its test,
+branch and arm bodies become NOPs. Inlined Zig `capacity()` accessors produce
+this shape (`m ? hdr(m)->capacity : 0` twice in `HashMap.getIndex`).
+
+Proof obligations:
+
+- operands match through mapped arm TEMPs or through a common stable root
+  (a single-def TEMP or an unmutated PARAM, reached by same-width copies);
+- arms hold only pure ops, plain loads and whole stores to non-address-taken,
+  non-volatile VAR slots, with no barrel-shift or other side-table annotation;
+- between the two tests nothing writes memory, calls, branches, or touches
+  volatile memory (a VAR slot store or a register-only TEMP def is allowed);
+- the second diamond's arm TEMPs are read only inside its arms or by its join
+  phis, every read of a renamed VAR is dominated by its join, and each VAR is
+  written only by its own diamond's arms.
 
 ### ssa:phi_simplify
 Phi node simplification. The local rule eliminates phis whose defined,

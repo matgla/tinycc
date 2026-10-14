@@ -121,8 +121,7 @@ int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir)
         if ((p->op == TCCIR_OP_FUNCPARAMVAL || p->op == TCCIR_OP_FUNCPARAMVOID) && k == 1) {
           param_idx = j;
         } else if ((p->op == TCCIR_OP_ASSIGN || p->op == TCCIR_OP_LEA) && k == 1) {
-          IROperand pd = tcc_ir_op_get_dest(ir, p);
-          int32_t pd_vr = irop_get_vreg(pd);
+          int32_t pd_vr = tcc_ir_op_dest_vreg(ir, p);
           if (pd_vr >= 0 && TCCIR_DECODE_VREG_TYPE(pd_vr) == TCCIR_VREG_TYPE_TEMP) {
             int hit = -1;
             int multi = 0;
@@ -159,8 +158,11 @@ int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir)
             const char *nm = get_tok_str(callee->v, NULL);
             if (!nm) break;
             int sz_pidx = -1;
-            if (!strcmp(nm, "__aeabi_memset") || !strcmp(nm, "memset"))
-              sz_pidx = 2;
+            int ms_fill_idx;
+            if (ir_opt_memset_params(nm, &sz_pidx, &ms_fill_idx))
+            {
+              /* sz_pidx set */
+            }
             else if (!strcmp(nm, "__aeabi_memmove") || !strcmp(nm, "__aeabi_memcpy") ||
                      !strcmp(nm, "memmove") || !strcmp(nm, "memcpy"))
               sz_pidx = 2;
@@ -205,4 +207,3 @@ int tcc_ir_opt_dead_temp_local_elim(TCCIRState *ir)
   }
   return changes;
 }
-int tcc_ir_opt_dead_temp_local_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_temp_local_elim(ctx->ir); }

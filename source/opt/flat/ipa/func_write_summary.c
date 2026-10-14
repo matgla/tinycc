@@ -102,6 +102,9 @@ void tcc_ir_compute_func_write_summary(TCCIRState *ir, Sym *func_sym)
 {
   if (!ir || !func_sym)
     return;
+  /* A weak body may be replaced by one that writes differently. */
+  if (func_sym->a.weak)
+    return;
   if (fws_lookup(func_sym))
     return; /* Already computed (e.g. function compiled twice). */
 
@@ -201,6 +204,9 @@ void tcc_ir_compute_func_write_summary(TCCIRState *ir, Sym *func_sym)
       if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD)
       {
         IROperand src = tcc_ir_op_get_src1(ir, q);
+        /* An lval source is the pointed-to value (*pp), not the address pp. */
+        if (src.is_lval)
+          continue;
         int32_t src_vr = irop_get_vreg(src);
         if (src_vr < 0)
           continue;
@@ -215,6 +221,8 @@ void tcc_ir_compute_func_write_summary(TCCIRState *ir, Sym *func_sym)
       {
         IROperand src1 = tcc_ir_op_get_src1(ir, q);
         IROperand src2 = tcc_ir_op_get_src2(ir, q);
+        if (src1.is_lval)
+          continue;
         int32_t s1_vr = irop_get_vreg(src1);
         if (s1_vr < 0)
           continue;
@@ -241,10 +249,13 @@ void tcc_ir_compute_func_write_summary(TCCIRState *ir, Sym *func_sym)
   uint8_t must_write[FWS_MAX_PARAMS][FWS_MAX_BYTES / 8];
   memset(read_first, 0, sizeof(read_first));
   memset(must_write, 0, sizeof(must_write));
+  unsigned read_params = 0;
 
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->is_jump_target) /* before the NOP skip: a NOP can be the join */
+      break;
     if (q->op == TCCIR_OP_NOP)
       continue;
 
@@ -263,21 +274,17 @@ void tcc_ir_compute_func_write_summary(TCCIRState *ir, Sym *func_sym)
         continue;
       if (k == 2 && !irop_config[q->op].has_src2)
         continue;
-      IROperand sop = (k == 1) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand sop = tcc_ir_op_get_src1_or_2(ir, q, k != 1);
       if (!sop.is_lval)
         continue;
       int32_t svr = irop_get_vreg(sop);
       if (svr < 0)
         continue;
-      int svr_type = TCCIR_DECODE_VREG_TYPE(svr);
-      /* PARAM/VAR lval source in ASSIGN/LOAD is a stack-home load, not a pointer deref. */
-      if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD) &&
-          (svr_type == TCCIR_VREG_TYPE_PARAM || svr_type == TCCIR_VREG_TYPE_VAR))
-        continue;
       int sbit = VR_BIT(svr);
       if (sbit < 0 || sbit >= total || vp[sbit] < 0)
         continue;
       int pidx = vp[sbit];
+      read_params |= 1u << pidx;
       int off = vo[sbit];
       int size = fws_btype_bytes(sop.btype);
       if (size <= 0)
@@ -313,6 +320,9 @@ void tcc_ir_compute_func_write_summary(TCCIRState *ir, Sym *func_sym)
     if (off < 0 || off + size > FWS_MAX_BYTES)
       continue;
     if (pidx < 0 || pidx >= FWS_MAX_PARAMS)
+      continue;
+    /* Different pointer parameters can alias at any offset; only earlier writes remain proven. */
+    if (read_params & ~(1u << pidx))
       continue;
 
     for (int b = off; b < off + size; b++)

@@ -244,6 +244,17 @@ or sofile.tcov file is generated with code coverage.
 
 @end table
 
+@table @option
+@item -fvisibility=@var{default|hidden|internal|protected}
+Set the ELF visibility of every definition that does not name one with
+@code{__attribute__((visibility(...)))} or an enclosing
+@code{#pragma GCC visibility push(...)} (popped with
+@code{#pragma GCC visibility pop}). Symbols defined in assembly keep their
+own. With @option{-fvisibility=hidden}, a shared library exports only what it
+marks @code{visibility("default")}.
+
+@end table
+
 Warning options:
 
 @table @option
@@ -406,6 +417,14 @@ Target specific options:
 @item -mms-bitfields
 Use an algorithm for bitfield alignment consistent with MSVC. Default is
 gcc's algorithm.
+
+@item -minline-atomics (ARM only)
+Expand @code{__atomic_compare_exchange}, @code{__atomic_exchange} and the
+@code{__atomic_fetch_@var{op}} / @code{__atomic_@var{op}_fetch} family on 1-, 2-
+and 4-byte integers and pointers inline, as LDREX/STREX (LDAEX/STLEX) loops,
+instead of calling the runtime's @code{__atomic_*} helpers.  Off by default:
+an exclusive store to memory the global monitor does not cover (the RP2350's
+PSRAM) never succeeds, so only code whose atomics live in SRAM may use it.
 
 @item -mfloat-abi (ARM only)
 Select the float ABI. Possible values: @code{softfp} and @code{hard}

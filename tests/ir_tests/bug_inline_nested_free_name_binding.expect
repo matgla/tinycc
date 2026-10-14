@@ -1,0 +1,15 @@
+typedef 901 901
+variable 1012
+enum 78 708
+const 23 108
+param 500
+depth2 353
+extern 4041
+always_inline 26
+cleanup 600 7
+cleanup tag 1 87
+functions 17 1010 1005
+scopes 1532
+own 133
+direct 221018
+chain 3325

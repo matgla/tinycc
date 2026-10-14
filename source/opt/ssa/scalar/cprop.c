@@ -21,7 +21,9 @@
  * width-converting ASSIGNs (differing btype) and non-TEMP srcs — PARAM/VAR are
  * multi-def, not SSA-renamed. */
 OPT_GEN_SSA(cprop_assign, TCCIR_OP_ASSIGN) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
   GUARD(
     when(src1.tag == IROP_TAG_VREG);
     and_not(src1.is_lval || src1.is_llocal || src1.is_local);
@@ -199,12 +201,27 @@ static int ssa_gen_cprop_imm(IRSSAOptCtx *ctx, int idx)
   return count > 0 ? 1 : 0;
 }
 
+/* Two LOAD sources of one location read the same value only at the same width,
+ * extension and type class (an int load is not a float load of the same bits). */
+static int ssa_cprop_load_same_access(IROperand a, IROperand b)
+{
+  if (a.btype != b.btype || a.is_complex != b.is_complex)
+    return 0;
+  if ((a.btype == IROP_BTYPE_INT8 || a.btype == IROP_BTYPE_INT16) && a.is_unsigned != b.is_unsigned)
+    return 0;
+  if (a.btype == IROP_BTYPE_STRUCT && a.u.s.ctype_idx != b.u.s.ctype_idx)
+    return 0;
+  return 1;
+}
+
 /* Redundant LOAD: T2 <- V where a prior same-block LOAD of the same source V
  * (no intervening write) produced T1 -> rewrite to T2 <- T1 [ASSIGN].  Source V
  * is a plain VREG or a STACKOFF (spilled VAR); skip llocal / tag mismatches. */
 OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
   IRCFG *cfg = ctx->cfg;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
   GUARD(
     when(cfg != NULL);
     and_not(src1.is_llocal);
@@ -283,8 +300,13 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
       continue;
     /* A vreg-backed slot names memory by vreg AND offset: two fields of one
      * stack-resident struct parameter share the vreg. */
-    if (ps.tag == IROP_TAG_STACKOFF &&
-        (irop_get_stack_offset(ps) != irop_get_stack_offset(src) || ps.btype != src.btype))
+    if (ps.tag == IROP_TAG_STACKOFF && irop_get_stack_offset(ps) != irop_get_stack_offset(src))
+      continue;
+    /* A plain LOAD takes its width and extension from the source operand, so
+     * a deref through one pointer vreg names a different VALUE per width: an
+     * LDRB and an LDR of p are not interchangeable (load_combine leaves a
+     * wide LOAD of p next to a surviving p[0] byte load). */
+    if (!ssa_cprop_load_same_access(ps, src))
       continue;
     IROperand pd = tcc_ir_op_get_dest(ir, pq);
     int32_t pd_vr = irop_get_vreg(pd);
@@ -319,7 +341,7 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
   if (pvi)
     ssa_opt_add_use_instr(pvi, i);
 
-  REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = new_src);
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(new_src));
 }
 
 /* Symref CSE: T2 <- &sym where a prior same-block ASSIGN of the same symref
@@ -327,7 +349,9 @@ OPT_GEN_SSA(cprop_load_redundant, TCCIR_OP_LOAD) {
  * Only plain address materializations (not lval/local/llocal symrefs). */
 OPT_GEN_SSA(cprop_symref_cse, TCCIR_OP_ASSIGN) {
   IRCFG *cfg = ctx->cfg;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
   GUARD(
     when(cfg != NULL);
     and(src1.tag == IROP_TAG_SYMREF);
@@ -383,7 +407,7 @@ OPT_GEN_SSA(cprop_symref_cse, TCCIR_OP_ASSIGN) {
   if (pvi)
     ssa_opt_add_use_instr(pvi, i);
 
-  REWRITE(.src1 = new_src);
+  REWRITE(set_src1(new_src));
 }
 
 /* Verify every use of the single-def TEMP `dvi` is an instruction in copy_blk

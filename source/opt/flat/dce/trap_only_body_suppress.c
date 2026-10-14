@@ -26,7 +26,7 @@ int tcc_ir_opt_trap_only_body_suppress(TCCIRState *ir)
   int n = ir->next_instruction_index;
   if (n == 0)
     return 0;
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
   if (ir->naked)
     return 0;
@@ -50,19 +50,9 @@ int tcc_ir_opt_trap_only_body_suppress(TCCIRState *ir)
 
   LOG_IR_GEN("TRAP-ONLY-BODY: body collapsed to a single TRAP at i=%d — "
              "suppressing prologue/epilogue", trap_idx);
-  ir->ls.dirty_registers = 0;
-  ir->ls.dirty_float_registers = 0;
-  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
-    memset(ir->ls.live_regs_by_instruction, 0,
-           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
-  ir->leaffunc = 1;
+  ir_opt_reset_body_regs(ir);
   ir->noreturn = 1;
   tcc_state->need_frame_pointer = 0;
   tcc_state->force_frame_pointer = 0;
   return 1;
-}
-
-int tcc_ir_opt_trap_only_body_suppress_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_trap_only_body_suppress(ctx->ir);
 }

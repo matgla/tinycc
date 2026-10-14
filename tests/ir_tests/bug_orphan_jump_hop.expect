@@ -1,0 +1,12 @@
+four 4 [64 0] [4 4] [0 0] rec 1
+eight 16 [64 0] [4 8] [0 0] rec 2
+sixty 16 [64 0] [4 60] [0 0] rec 3
+big -1 [64 0] [4 0] [31 0] rec 3
+comb7 1 [1 7] rec 4
+comb8 -1 [1 0] rec 4
+comb7h 41 [41 7] rec 5
+last 31 [31 1] rec 6
+hint 31 [31 1] rec 7
+end -1 [32 0] rec 7
+zero -1 [41 7] [4 0] [32 0] rec 7
+none -1 rec 7

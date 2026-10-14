@@ -1,0 +1,6 @@
+constant=7 0
+real=7 0
+int=5 6
+narrow=8 9
+local=7 0
+[returns 0]

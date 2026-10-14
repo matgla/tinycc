@@ -62,23 +62,29 @@ static int vl_def_pos(TCCIRState *ir, IRQuadCompact *q, int num_vars)
   return p;
 }
 
+/* Set the bit of every VAR `q` reads in `live`, except those already set in
+ * `kill` (NULL: none).  With kill = the block's defs-so-far this adds the
+ * instruction's upward-exposed uses straight into the block's USE set. */
 static void vl_mark_uses(TCCIRState *ir, IRQuadCompact *q, int num_vars,
-                         uint32_t *live)
+                         uint32_t *live, const uint32_t *kill)
 {
-  int p;
+  int p[4], k = 0;
   if (irop_config[q->op].has_src1 &&
-      (p = vl_var_pos(tcc_ir_op_get_src1(ir, q), num_vars)) >= 0)
-    VL_SET(live, p);
+      (p[k] = vl_var_pos(tcc_ir_op_get_src1(ir, q), num_vars)) >= 0)
+    k++;
   if (irop_config[q->op].has_src2 &&
-      (p = vl_var_pos(tcc_ir_op_get_src2(ir, q), num_vars)) >= 0)
-    VL_SET(live, p);
+      (p[k] = vl_var_pos(tcc_ir_op_get_src2(ir, q), num_vars)) >= 0)
+    k++;
   if (q->op == TCCIR_OP_MLA &&
-      (p = vl_var_pos(tcc_ir_op_get_accum(ir, q), num_vars)) >= 0)
-    VL_SET(live, p);
+      (p[k] = vl_var_pos(tcc_ir_op_get_accum(ir, q), num_vars)) >= 0)
+    k++;
   if (irop_config[q->op].has_dest &&
       vl_def_pos(ir, q, num_vars) < 0 &&
-      (p = vl_var_pos(tcc_ir_op_get_dest(ir, q), num_vars)) >= 0)
-    VL_SET(live, p);
+      (p[k] = vl_var_pos(tcc_ir_op_get_dest(ir, q), num_vars)) >= 0)
+    k++;
+  while (k-- > 0)
+    if (!kill || !VL_BIT(kill, p[k]))
+      VL_SET(live, p[k]);
 }
 
 static int vl_removable(TCCIRState *ir, IRQuadCompact *q)
@@ -185,10 +191,9 @@ int dce_var_liveness(IRSSAOptCtx *ctx)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op == TCCIR_OP_NOP)
         continue;
-      memset(live, 0, bmsz);
-      vl_mark_uses(ir, q, num_vars, live);
-      for (int w = 0; w < nw; w++)
-        ub[w] |= live[w] & ~db[w];
+      /* Uses go straight into USE: clearing and OR-ing a whole bitset per
+       * instruction made this O(instructions x VARs). */
+      vl_mark_uses(ir, q, num_vars, ub, db);
       int dp = vl_def_pos(ir, q, num_vars);
       if (dp >= 0 && !VL_BIT(excl, dp))
         VL_SET(db, dp);
@@ -239,7 +244,7 @@ int dce_var_liveness(IRSSAOptCtx *ctx)
           }
           VL_CLR(live, dp);
         }
-        vl_mark_uses(ir, q, num_vars, live);
+        vl_mark_uses(ir, q, num_vars, live, NULL);
       }
     }
   }

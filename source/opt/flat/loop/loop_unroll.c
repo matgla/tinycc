@@ -20,10 +20,10 @@
 
 
 /* Ops with a 4th pool slot at operand_base+3: a multiply-accumulate's
- * accumulator, an indexed access's scale. */
+ * accumulator, an indexed access's scale, SELECT's condition code. */
 static int unroll_has_op4(int op)
 {
-  return tcc_ir_op_is_mac(op) || op == TCCIR_OP_LOAD_INDEXED || op == TCCIR_OP_STORE_INDEXED;
+  return ir_op_has(op, IROP_A_SLOT3);
 }
 
 /* How many of a body's instructions survive once the IV is a constant: an
@@ -179,6 +179,13 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
     return 0;
   }
 
+  return try_unroll_loop_ivs(ir, loop, loops, loop_idx, ivs, num_ivs);
+}
+
+/* The late pass supplies counters represented by resolved phi copies. */
+int try_unroll_loop_ivs(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_idx,
+                        InductionVar *ivs, int num_ivs)
+{
   /* Primary IV = the one in the exit condition; accumulators match the pattern but are body instrs. */
   int cmp_idx, jmpif_idx, limit, cond, exit_target;
   InductionVar *iv = NULL;
@@ -364,12 +371,8 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
           other->header_idx += extra;
         if (other->preheader_idx > orig_end)
           other->preheader_idx += extra;
-        for (int b = 0; b < other->num_body_instrs; b++)
-        {
-          if (other->body_instrs[b] > orig_end)
-            other->body_instrs[b] += extra;
-        }
       }
+      tcc_ir_loops_shift_bodies(loops, 0, loop_idx, orig_end + 1, extra);
     }
   }
 
@@ -378,8 +381,8 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP && i != loop->end_idx)
     {
-      IROperand jd = tcc_ir_op_get_dest(ir, q);
-      int target = (int)irop_get_imm64_ex(ir, jd);
+      int64_t jd_imm = tcc_ir_op_dest_imm(ir, q);
+      int target = (int)jd_imm;
       if (target < i && target < loop->start_idx)
         goto unroll_cleanup; /* backward jump escaping the loop: nested or malformed */
     }
@@ -401,8 +404,8 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
       IRQuadCompact *gq = &ir->compact_instructions[g];
       if (gq->op == TCCIR_OP_CMP)
       {
-        IROperand gsrc1 = tcc_ir_op_get_src1(ir, gq);
-        if (irop_get_vreg(gsrc1) == iv->vreg && g + 1 < loop->start_idx)
+        int32_t gsrc1_vr = tcc_ir_op_src1_vreg(ir, gq);
+        if (gsrc1_vr == iv->vreg && g + 1 < loop->start_idx)
         {
           IRQuadCompact *gjq = &ir->compact_instructions[g + 1];
           if (gjq->op == TCCIR_OP_JUMPIF)
@@ -500,7 +503,11 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
       IROperand src2 = body_src2s[b];
       IROperand op4 = body_op4s[b];
 
-      int iv_val = iv->init_val + k * iv->step;
+      /* A read that follows the increment in iteration order (from the header,
+       * wrapping at the loop end) sees the already-stepped value. */
+      int span = loop_end - loop->start_idx + 1;
+      int after_inc = ((body_indices[b] - loop->header_idx + span) % span) > ((iv->def_idx - loop->header_idx + span) % span);
+      int iv_val = iv->init_val + (k + after_inc) * iv->step;
       IROperand iv_const = irop_make_imm32(-1, iv_val, IROP_BTYPE_INT32);
 
       if (irop_get_vreg(src1) == iv->vreg)
@@ -591,8 +598,8 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
         continue;
       if (irop_config[q->op].has_src1)
       {
-        IROperand s1 = tcc_ir_op_get_src1(ir, q);
-        if (irop_get_vreg(s1) == iv->vreg)
+        int32_t s1_vr = tcc_ir_op_src1_vreg(ir, q);
+        if (s1_vr == iv->vreg)
         {
           iv_used_after = 1;
           break;
@@ -600,8 +607,8 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
       }
       if (irop_config[q->op].has_src2)
       {
-        IROperand s2 = tcc_ir_op_get_src2(ir, q);
-        if (irop_get_vreg(s2) == iv->vreg)
+        int32_t s2_vr = tcc_ir_op_src2_vreg(ir, q);
+        if (s2_vr == iv->vreg)
         {
           iv_used_after = 1;
           break;
@@ -646,6 +653,8 @@ int try_unroll_loop_ex(TCCIRState *ir, IRLoop *loop, IRLoops *loops, int loop_id
   ret = 1;
   if (table_loads)
     ir->unrolled_table_loads = 1;
+  /* The copies fill the whole region: an inlined body ending in it is in every one. */
+  tcc_ir_frame_scope_widen(ir, loop->start_idx, loop_end);
 
 unroll_cleanup:
   tcc_free(_ubuf);

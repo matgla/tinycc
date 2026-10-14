@@ -50,7 +50,7 @@ int tcc_ir_opt_null_store_dom_return(TCCIRState *ir)
   if (n == 0)
     return 0;
   /* O2-only UB-exploit pass. */
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
 
   /* Bail on unanalyzable ops that can hide pointer writes, and on non-void returns. */
@@ -127,8 +127,7 @@ int tcc_ir_opt_null_store_dom_return(TCCIRState *ir)
     }
     if (q->op == TCCIR_OP_LEA && irop_config[q->op].has_src1)
     {
-      IROperand op = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(op);
+      int32_t vr = tcc_ir_op_src1_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int p = TCCIR_DECODE_VREG_POSITION(vr);
@@ -211,11 +210,10 @@ int tcc_ir_opt_null_store_dom_return(TCCIRState *ir)
     /* Apply the write effect of this instruction to known-zero tracking. */
     if (irop_config[q->op].has_dest)
     {
-      IROperand dst = tcc_ir_op_get_dest(ir, q);
       /* Deref/stack-address destinations don't define a value vreg. */
-      if (!dst.is_lval && !dst.is_local)
+      if (!tcc_ir_op_dest_is_lval(ir, q) && !tcc_ir_op_dest_is_local(ir, q))
       {
-        int32_t dvr = irop_get_vreg(dst);
+        int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
         if (dvr >= 0)
         {
           int dtype = TCCIR_DECODE_VREG_TYPE(dvr);
@@ -315,20 +313,9 @@ int tcc_ir_opt_null_store_dom_return(TCCIRState *ir)
              "(STORE at i=%d through compile-time NULL dominates all RETURNVOIDs)", ub_store_idx);
 
   /* NOP everything — codegen emits bare prologue + bx lr. */
-  for (int i = 0; i < n; i++)
-  {
-    ir->compact_instructions[i].op = TCCIR_OP_NOP;
-    ir->compact_instructions[i].is_jump_target = 0;
-  }
+  ir_opt_nop_body(ir, n);
 
-  ir->ls.dirty_registers = 0;
-  ir->ls.dirty_float_registers = 0;
-  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
-    memset(ir->ls.live_regs_by_instruction, 0,
-           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
-  ir->leaffunc = 1;
+  ir_opt_reset_body_regs(ir);
 
   return 1;
 }
-
-int tcc_ir_opt_null_store_dom_return_ex(IROptCtx *ctx) { return tcc_ir_opt_null_store_dom_return(ctx->ir); }

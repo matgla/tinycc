@@ -28,6 +28,11 @@ typedef struct TCCAbiArgDesc
   uint32_t size;     /* bytes (struct actual size; scalars: 4/8) */
   uint8_t alignment; /* bytes (power of two); use at least 4 */
   uint8_t is_float;  /* scalar floating-point (float/double) — VFP-eligible */
+  /* Homogeneous FP aggregate (struct or _Complex of 1-4 floats or doubles):
+   * the number of base elements and the base element size (4 or 8), 0 when
+   * the argument is not one.  Hard-float passes these in VFP registers. */
+  uint8_t hfa_count;
+  uint8_t hfa_base;
 } TCCAbiArgDesc;
 
 typedef enum TCCAbiLocKind

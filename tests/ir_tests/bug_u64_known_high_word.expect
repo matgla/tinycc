@@ -1,0 +1,140 @@
+-- 00000000
+hi_of_xor(x) 00000000e7037ed1
+hi32_of_or((uint16_t)x) 0000000012345678
+hi_of_and(x) e703000000000000
+shr40_of_xor(x) 0000000000e7037e
+sar40_of_xor(x) ffffffffffe7037e
+shl_keeps_low(x) 000000007037ed1a
+expand((uint16_t)x) 0000000000000000
+hi_of_expand((uint16_t)x) 00000000e7037ed1
+mum_const_hi(x) 42bc986dc5eec4d3
+u16_key_hash((uint16_t)x) 42bc986dc5eec4d3
+hi_of_signed((int32_t)x) 0000000000000000
+hi_of_phi(x, ((uint64_t)x << 32) | 0x55u, (int)(i & 1)) 00000000e7037ed1
+mum_live_hi(((uint64_t)x << 32) | (x ^ 0x5a5a5a5au)) b5241add3bb1b692
+-- 00000001
+hi_of_xor(x) 00000000e7037ed1
+hi32_of_or((uint16_t)x) 0000000012345678
+hi_of_and(x) e703000000000000
+shr40_of_xor(x) 0000000000e7037e
+sar40_of_xor(x) ffffffffffe7037e
+shl_keeps_low(x) 000000007037ed1a
+expand((uint16_t)x) 0000000000010000
+hi_of_expand((uint16_t)x) 00000000e7037ed1
+mum_const_hi(x) 22a2d5db3856770f
+u16_key_hash((uint16_t)x) 3c2ad6d670ba24c9
+hi_of_signed((int32_t)x) 0000000000000000
+hi_of_phi(x, ((uint64_t)x << 32) | 0x55u, (int)(i & 1)) 00000000e7037ed0
+mum_live_hi(((uint64_t)x << 32) | (x ^ 0x5a5a5a5au)) 5353ea9f6533652c
+-- 00000080
+hi_of_xor(x) 00000000e7037ed1
+hi32_of_or((uint16_t)x) 0000000012345678
+hi_of_and(x) e703000000000000
+shr40_of_xor(x) 0000000000e7037e
+sar40_of_xor(x) ffffffffffe7037e
+shl_keeps_low(x) 000000007037ed1a
+expand((uint16_t)x) 0000000000800000
+hi_of_expand((uint16_t)x) 00000000e7037ed1
+mum_const_hi(x) 7f5d53403a286ec3
+u16_key_hash((uint16_t)x) 09995f9753fec132
+hi_of_signed((int32_t)x) 0000000000000000
+hi_of_phi(x, ((uint64_t)x << 32) | 0x55u, (int)(i & 1)) 00000000e7037ed1
+mum_live_hi(((uint64_t)x << 32) | (x ^ 0x5a5a5a5au)) 6e1c7b404c6de1bd
+-- 000000ff
+hi_of_xor(x) 00000000e7037ed1
+hi32_of_or((uint16_t)x) 0000000012345678
+hi_of_and(x) e703000000000000
+shr40_of_xor(x) 0000000000e7037e
+sar40_of_xor(x) ffffffffffe7037e
+shl_keeps_low(x) 000000007037ed1a
+expand((uint16_t)x) 0000000000ff0000
+hi_of_expand((uint16_t)x) 00000000e7037ed1
+mum_const_hi(x) 996aa1d58a03da50
+u16_key_hash((uint16_t)x) 8ca69cfbecf7e00e
+hi_of_signed((int32_t)x) 0000000000000000
+hi_of_phi(x, ((uint64_t)x << 32) | 0x55u, (int)(i & 1)) 00000000e7037e2e
+mum_live_hi(((uint64_t)x << 32) | (x ^ 0x5a5a5a5au)) 1398cfeea0a1390b
+-- 00001234
+hi_of_xor(x) 00000000e7037ed1
+hi32_of_or((uint16_t)x) 0000000012345678
+hi_of_and(x) e703000000000000
+shr40_of_xor(x) 0000000000e7037e
+sar40_of_xor(x) ffffffffffe7037e
+shl_keeps_low(x) 000000007037ed1a
+expand((uint16_t)x) 0000000000341212
+hi_of_expand((uint16_t)x) 00000000e7037ed1
+mum_const_hi(x) 399a17e6f286a6ad
+u16_key_hash((uint16_t)x) fdc9513515482b44
+hi_of_signed((int32_t)x) 0000000000000000
+hi_of_phi(x, ((uint64_t)x << 32) | 0x55u, (int)(i & 1)) 00000000e7037ed1
+mum_live_hi(((uint64_t)x << 32) | (x ^ 0x5a5a5a5au)) eb7965975dada6c9
+-- 00008001
+hi_of_xor(x) 00000000e7037ed1
+hi32_of_or((uint16_t)x) 0000000012345678
+hi_of_and(x) e703000000000000
+shr40_of_xor(x) 0000000000e7037e
+sar40_of_xor(x) ffffffffffe7037e
+shl_keeps_low(x) 000000007037ed1a
+expand((uint16_t)x) 0000000000018080
+hi_of_expand((uint16_t)x) 00000000e7037ed1
+mum_const_hi(x) 03683687f1cc670a
+u16_key_hash((uint16_t)x) 1bb28af56e6a9efc
+hi_of_signed((int32_t)x) 0000000000000000
+hi_of_phi(x, ((uint64_t)x << 32) | 0x55u, (int)(i & 1)) 00000000e703fed0
+mum_live_hi(((uint64_t)x << 32) | (x ^ 0x5a5a5a5au)) 6bb4b450402a5663
+-- 0000ffff
+hi_of_xor(x) 00000000e7037ed1
+hi32_of_or((uint16_t)x) 0000000012345678
+hi_of_and(x) e703000000000000
+shr40_of_xor(x) 0000000000e7037e
+sar40_of_xor(x) ffffffffffe7037e
+shl_keeps_low(x) 000000007037ed1a
+expand((uint16_t)x) 0000000000ffffff
+hi_of_expand((uint16_t)x) 00000000e7037ed1
+mum_const_hi(x) 9968bbde6182b809
+u16_key_hash((uint16_t)x) ab12bc6c0883945c
+hi_of_signed((int32_t)x) 0000000000000000
+hi_of_phi(x, ((uint64_t)x << 32) | 0x55u, (int)(i & 1)) 00000000e7037ed1
+mum_live_hi(((uint64_t)x << 32) | (x ^ 0x5a5a5a5au)) 78abdc968cff5319
+-- 80000001
+hi_of_xor(x) 00000000e7037ed1
+hi32_of_or((uint16_t)x) 0000000012345678
+hi_of_and(x) e703000000000000
+shr40_of_xor(x) 0000000000e7037e
+sar40_of_xor(x) ffffffffffe7037e
+shl_keeps_low(x) 000000007037ed12
+expand((uint16_t)x) 0000000000010000
+hi_of_expand((uint16_t)x) 00000000e7037ed1
+mum_const_hi(x) 3dee92b528516856
+u16_key_hash((uint16_t)x) 3c2ad6d670ba24c9
+hi_of_signed((int32_t)x) ffffffffffffffff
+hi_of_phi(x, ((uint64_t)x << 32) | 0x55u, (int)(i & 1)) 0000000067037ed0
+mum_live_hi(((uint64_t)x << 32) | (x ^ 0x5a5a5a5au)) 3e94c2be38040d4d
+-- deadbeef
+hi_of_xor(x) 00000000e7037ed1
+hi32_of_or((uint16_t)x) 0000000012345678
+hi_of_and(x) e703000000000000
+shr40_of_xor(x) 0000000000e7037e
+sar40_of_xor(x) ffffffffffe7037e
+shl_keeps_low(x) 000000007037ed17
+expand((uint16_t)x) 0000000000efbebe
+hi_of_expand((uint16_t)x) 00000000e7037ed1
+mum_const_hi(x) f8b01a6ba31f0489
+u16_key_hash((uint16_t)x) 8b3f49bd390d2bef
+hi_of_signed((int32_t)x) ffffffffffffffff
+hi_of_phi(x, ((uint64_t)x << 32) | 0x55u, (int)(i & 1)) 00000000e7037ed1
+mum_live_hi(((uint64_t)x << 32) | (x ^ 0x5a5a5a5au)) 652c1a20b0adde3f
+-- ffffffff
+hi_of_xor(x) 00000000e7037ed1
+hi32_of_or((uint16_t)x) 0000000012345678
+hi_of_and(x) e703000000000000
+shr40_of_xor(x) 0000000000e7037e
+sar40_of_xor(x) ffffffffffe7037e
+shl_keeps_low(x) 000000007037ed15
+expand((uint16_t)x) 0000000000ffffff
+hi_of_expand((uint16_t)x) 00000000e7037ed1
+mum_const_hi(x) 8a3bc00474a13a35
+u16_key_hash((uint16_t)x) ab12bc6c0883945c
+hi_of_signed((int32_t)x) ffffffffffffffff
+hi_of_phi(x, ((uint64_t)x << 32) | 0x55u, (int)(i & 1)) 0000000018fc812e
+mum_live_hi(((uint64_t)x << 32) | (x ^ 0x5a5a5a5au)) 35098491ba41c8c5

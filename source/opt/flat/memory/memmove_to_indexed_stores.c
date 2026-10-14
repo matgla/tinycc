@@ -18,6 +18,176 @@
 
 
 
+
+/* Trace the address held in trace_vr back from instruction j -- at most 8
+ * defining instructions, never across a join or a jump -- through ADDs of an
+ * immediate (accumulated onto trace_add) to a LEA/ASSIGN of a local StackLoc.  On
+ * success *off is that slot's offset plus the adds and the LEA's index is
+ * returned; otherwise -1. */
+static int mtis_trace_stack_addr(TCCIRState *ir, int j, int32_t trace_vr, int trace_add, int *off)
+{
+  int trace_depth = 0;
+  for (int k = j - 1; k >= 0 && trace_depth < 8; k--)
+  {
+    IRQuadCompact *kq = &ir->compact_instructions[k];
+    if (kq->is_jump_target) break; /* a NOP can be the join */
+    if (kq->op == TCCIR_OP_NOP) continue;
+    if (kq->op == TCCIR_OP_JUMP || kq->op == TCCIR_OP_JUMPIF || kq->op == TCCIR_OP_IJUMP) break;
+    if (!irop_config[kq->op].has_dest) continue;
+    IROperand kd = tcc_ir_op_get_dest(ir, kq);
+    if (irop_get_vreg(kd) != trace_vr || !irop_dest_defines_vreg(kd)) continue;
+    trace_depth++;
+    if (kq->op == TCCIR_OP_ADD)
+    {
+      IROperand as1 = tcc_ir_op_get_src1(ir, kq);
+      if (tcc_ir_op_src2_is_imm(ir, kq) && irop_has_vreg(as1) && !as1.is_lval)
+      {
+        trace_add += (int)tcc_ir_op_src2_imm(ir, kq);
+        trace_vr = irop_get_vreg(as1);
+        continue;
+      }
+      break;
+    }
+    if (kq->op != TCCIR_OP_LEA && kq->op != TCCIR_OP_ASSIGN) break;
+    IROperand ks = tcc_ir_op_get_src1(ir, kq);
+    if (irop_get_tag(ks) != IROP_TAG_STACKOFF || !ks.is_local || ks.is_lval) break;
+    *off = (int)irop_get_imm64_ex(ir, ks) + trace_add;
+    return k;
+  }
+  return -1;
+}
+
+/* Whether an op touches memory only through its operands (no hidden reads or
+ * writes: calls, asm, setjmp, ... are barriers). */
+static int mtis_plain_op(TccIrOp op)
+{
+  switch (op)
+  {
+  case TCCIR_OP_ASSIGN: case TCCIR_OP_LEA: case TCCIR_OP_LOAD: case TCCIR_OP_STORE:
+  case TCCIR_OP_LOAD_INDEXED: case TCCIR_OP_STORE_INDEXED: case TCCIR_OP_LOAD_POSTINC:
+  case TCCIR_OP_STORE_POSTINC: case TCCIR_OP_ADD: case TCCIR_OP_SUB: case TCCIR_OP_MUL:
+  case TCCIR_OP_AND: case TCCIR_OP_OR: case TCCIR_OP_XOR: case TCCIR_OP_SHL: case TCCIR_OP_SHR:
+  case TCCIR_OP_SAR: case TCCIR_OP_ROR: case TCCIR_OP_CMP: case TCCIR_OP_TEST_ZERO:
+  case TCCIR_OP_SETIF: case TCCIR_OP_SELECT: case TCCIR_OP_ZEXT: case TCCIR_OP_UBFX:
+  case TCCIR_OP_SBFX: case TCCIR_OP_BFI: case TCCIR_OP_CLZ: case TCCIR_OP_RBIT: case TCCIR_OP_REV:
+  case TCCIR_OP_REV16: case TCCIR_OP_MLA: case TCCIR_OP_UMULL: case TCCIR_OP_SMULL:
+  case TCCIR_OP_UMAAL: case TCCIR_OP_PACK64: case TCCIR_OP_FUNCPARAMVAL:
+  case TCCIR_OP_FUNCPARAMVOID: case TCCIR_OP_NOP:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+/* Is the address of any byte of frame object [lo, hi) computed anywhere,
+ * other than as the memcpy's own PARAM0 (call id CALL_ID)? */
+static int mtis_object_addr_taken(TCCIRState *ir, int lo, int hi, int call_id)
+{
+  int n = ir->next_instruction_index;
+  for (int j = 0; j < n; j++)
+  {
+    IRQuadCompact *sq = &ir->compact_instructions[j];
+    if (sq->op == TCCIR_OP_NOP)
+      continue;
+    if ((sq->op == TCCIR_OP_FUNCPARAMVAL || sq->op == TCCIR_OP_FUNCPARAMVOID))
+    {
+      uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, sq);
+      if (TCCIR_DECODE_CALL_ID(enc) == call_id && TCCIR_DECODE_PARAM_IDX(enc) == 0)
+        continue;
+    }
+    for (int si = 0; si < 3; si++)
+    {
+      int has = si == 0 ? irop_config[sq->op].has_dest : si == 1 ? irop_config[sq->op].has_src1
+                                                                  : irop_config[sq->op].has_src2;
+      if (!has)
+        continue;
+      IROperand o = tcc_ir_op_get_slot(ir, sq, si);
+      if (irop_get_tag(o) != IROP_TAG_STACKOFF || !o.is_local || o.is_lval)
+        continue;
+      int off = (int)irop_get_imm64_ex(ir, o);
+      if (off >= lo && off < hi)
+        return 1;
+    }
+  }
+  return 0;
+}
+
+/* Could instruction SQ read or write the memcpy destination?  For a stack
+ * destination, [obj_lo, obj_hi) is its frame object and ADDR_TAKEN says
+ * whether a pointer may reach it; for a pointer destination (dst_is_stackoff
+ * 0) any memory access not provably elsewhere counts. */
+static int mtis_may_touch_dst(TCCIRState *ir, IRQuadCompact *sq, int dst_is_stackoff, int obj_lo, int obj_hi,
+                              int addr_taken, int call_id)
+{
+  /* An indirect access reaches a stack destination only if its address is taken. */
+  int indirect_hits = dst_is_stackoff ? addr_taken : 1;
+  if (!mtis_plain_op(sq->op))
+    return indirect_hits;
+  int base_slot = -1; /* operand slot used as an address base by an indexed/postinc access */
+  if (sq->op == TCCIR_OP_STORE_INDEXED || sq->op == TCCIR_OP_STORE_POSTINC)
+    base_slot = 0;
+  else if (sq->op == TCCIR_OP_LOAD_INDEXED || sq->op == TCCIR_OP_LOAD_POSTINC)
+    base_slot = 1;
+  for (int si = 0; si < 3; si++)
+  {
+    int has = si == 0 ? irop_config[sq->op].has_dest : si == 1 ? irop_config[sq->op].has_src1
+                                                                : irop_config[sq->op].has_src2;
+    if (!has)
+      continue;
+    IROperand o = tcc_ir_op_get_slot(ir, sq, si);
+    int tag = irop_get_tag(o);
+    int32_t vr = irop_get_vreg(o);
+    if (tag == IROP_TAG_STACKOFF && o.is_local)
+    {
+      if (o.is_llocal)
+      {
+        if (indirect_hits)
+          return 1; /* through the pointer held in the slot */
+        continue;
+      }
+      /* A VAR/PARAM read through its home is a register value unless its
+         address is taken, in which case it lives in the frame. */
+      if (vr >= 0)
+      {
+        IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, vr);
+        if (iv && !iv->addrtaken)
+          continue;
+      }
+      if (!o.is_lval && si != base_slot)
+        continue; /* only computes an address */
+      int off = (int)irop_get_imm64_ex(ir, o);
+      if (dst_is_stackoff)
+      {
+        if (off >= obj_lo && off < obj_hi)
+          return 1;
+      }
+      else
+      {
+        /* A pointer destination can only be in a frame object whose address is taken. */
+        int lo, hi;
+        if (!tcc_ir_frame_object_at(ir, off, &lo, &hi) || mtis_object_addr_taken(ir, lo, hi, call_id))
+          return 1;
+      }
+      continue;
+    }
+    if (si == base_slot && vr >= 0)
+    {
+      if (indirect_hits)
+        return 1;
+      continue;
+    }
+    if (tag == IROP_TAG_VREG && o.is_lval)
+    {
+      if (indirect_hits)
+        return 1;
+      continue;
+    }
+    if (o.is_sym && o.is_lval && !dst_is_stackoff)
+      return 1; /* a global the pointer may point to */
+  }
+  return 0;
+}
+
 /* Fold memmove/memcpy from a stack temp fully covered by preceding local STOREs. */
 int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
 {
@@ -34,7 +204,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       continue;
 
     /* Callee must be memmove/memcpy family (returns first arg). */
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
     const char *name = get_tok_str(callee->v, NULL);
@@ -47,8 +217,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
     /* FUNCCALLVAL returns the dst pointer: foldable only if nothing reads it. */
     if (q->op == TCCIR_OP_FUNCCALLVAL)
     {
-      IROperand call_dest = tcc_ir_op_get_dest(ir, q);
-      int32_t ret_vr = irop_get_vreg(call_dest);
+      int32_t ret_vr = tcc_ir_op_dest_vreg(ir, q);
       int has_reader = 0;
       if (ret_vr >= 0)
       {
@@ -61,8 +230,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
             continue;
           if (irop_config[sq->op].has_src1)
           {
-            IROperand s = tcc_ir_op_get_src1(ir, sq);
-            if (irop_has_vreg(s) && irop_get_vreg(s) == ret_vr)
+            if (tcc_ir_op_src1_has_vreg(ir, sq) && tcc_ir_op_src1_vreg(ir, sq) == ret_vr)
             {
               has_reader = 1;
               break;
@@ -70,8 +238,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
           }
           if (irop_config[sq->op].has_src2)
           {
-            IROperand s = tcc_ir_op_get_src2(ir, sq);
-            if (irop_has_vreg(s) && irop_get_vreg(s) == ret_vr)
+            if (tcc_ir_op_src2_has_vreg(ir, sq) && tcc_ir_op_src2_vreg(ir, sq) == ret_vr)
             {
               has_reader = 1;
               break;
@@ -116,10 +283,10 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       for (int j = i - 1; j >= 0; j--)
       {
         IRQuadCompact *lq = &ir->compact_instructions[j];
+        if (lq->is_jump_target) /* a NOP can be the join */
+          break;
         if (lq->op == TCCIR_OP_NOP)
           continue;
-        if (lq->is_jump_target)
-          break;
         if (lq->op == TCCIR_OP_JUMP || lq->op == TCCIR_OP_JUMPIF || lq->op == TCCIR_OP_IJUMP)
           break;
         if (!irop_config[lq->op].has_dest)
@@ -189,10 +356,10 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         for (int j = i - 1; j >= 0 && trace_depth < 8; j--)
         {
           IRQuadCompact *lq = &ir->compact_instructions[j];
+          if (lq->is_jump_target) /* a NOP can be the join */
+            break;
           if (lq->op == TCCIR_OP_NOP)
             continue;
-          if (lq->is_jump_target)
-            break;
           if (lq->op == TCCIR_OP_JUMP || lq->op == TCCIR_OP_JUMPIF || lq->op == TCCIR_OP_IJUMP)
             break;
           if (!irop_config[lq->op].has_dest)
@@ -231,10 +398,9 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
           if (lq->op == TCCIR_OP_ADD)
           {
             IROperand as1 = tcc_ir_op_get_src1(ir, lq);
-            IROperand as2 = tcc_ir_op_get_src2(ir, lq);
-            if (irop_is_immediate(as2) && irop_has_vreg(as1) && !as1.is_lval)
+            if (tcc_ir_op_src2_is_imm(ir, lq) && irop_has_vreg(as1) && !as1.is_lval)
             {
-              trace_add += (int)irop_get_imm64_ex(ir, as2);
+              trace_add += (int)tcc_ir_op_src2_imm(ir, lq);
               trace_vr = irop_get_vreg(as1);
               continue;
             }
@@ -242,10 +408,9 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
           }
           if (lq->op == TCCIR_OP_STORE && !ld.is_lval)
           {
-            IROperand ls = tcc_ir_op_get_src1(ir, lq);
-            if (irop_has_vreg(ls) && !ls.is_lval)
+            if (tcc_ir_op_src1_has_vreg(ir, lq) && !tcc_ir_op_src1_is_lval(ir, lq))
             {
-              trace_vr = irop_get_vreg(ls);
+              trace_vr = tcc_ir_op_src1_vreg(ir, lq);
               continue;
             }
             break;
@@ -284,12 +449,12 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
     for (int j = i - 1; j >= 0 && nstores < 16; j--)
     {
       IRQuadCompact *sq = &ir->compact_instructions[j];
+      if (sq->is_jump_target) /* before the skips: a NOP can be the join */
+        break;
       if (sq->op == TCCIR_OP_NOP)
         continue;
       if (sq->op == TCCIR_OP_FUNCPARAMVAL || sq->op == TCCIR_OP_FUNCPARAMVOID)
         continue; /* memmove's own params */
-      if (sq->is_jump_target)
-        break;
       if (sq->op == TCCIR_OP_JUMP || sq->op == TCCIR_OP_JUMPIF || sq->op == TCCIR_OP_IJUMP)
         break;
 
@@ -299,11 +464,9 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         if (memset_idx < 0 &&
             (sq->op == TCCIR_OP_FUNCCALLVOID || sq->op == TCCIR_OP_FUNCCALLVAL))
         {
-          Sym *ms_callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, sq));
+          Sym *ms_callee = tcc_ir_op_src1_sym(ir, sq);
           const char *ms_name = ms_callee ? get_tok_str(ms_callee->v, NULL) : NULL;
-          int is_memset_like = ms_name &&
-                               (strcmp(ms_name, "memset") == 0 ||
-                                strcmp(ms_name, "__aeabi_memset") == 0);
+          int is_memset_like = ms_name && ir_opt_name_in(ms_name, "memset\0__aeabi_memset\0");
           if (is_memset_like)
           {
             IROperand ms_p0, ms_p1, ms_p2;
@@ -326,8 +489,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
                   ms_off + ms_n <= tmp_base + total_size)
               {
                 /* Find the PARAM0 instruction index for later rewrite. */
-                int ms_call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(
-                    ir, tcc_ir_op_get_src2(ir, sq)));
+                int ms_call_id = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, sq));
                 int p0_idx = -1;
                 for (int k = j - 1; k >= 0; --k)
                 {
@@ -336,8 +498,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
                     continue;
                   if (pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID)
                     continue;
-                  IROperand penc = tcc_ir_op_get_src2(ir, pq);
-                  uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, penc);
+                  uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, pq);
                   if (TCCIR_DECODE_CALL_ID(enc) != ms_call_id)
                     continue;
                   if (TCCIR_DECODE_PARAM_IDX(enc) == 0)
@@ -412,38 +573,13 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         {
           int32_t trace_vr = irop_get_vreg(st_dest);
           int trace_add = 0;
-          int trace_depth = 0;
           if (trace_vr >= 0)
           {
-            for (int k = j - 1; k >= 0 && trace_depth < 8; k--)
+            int lea_k = mtis_trace_stack_addr(ir, j, trace_vr, trace_add, &st_off);
+            if (lea_k >= 0)
             {
-              IRQuadCompact *kq = &ir->compact_instructions[k];
-              if (kq->op == TCCIR_OP_NOP) continue;
-              if (kq->is_jump_target) break;
-              if (kq->op == TCCIR_OP_JUMP || kq->op == TCCIR_OP_JUMPIF || kq->op == TCCIR_OP_IJUMP) break;
-              if (!irop_config[kq->op].has_dest) continue;
-              IROperand kd = tcc_ir_op_get_dest(ir, kq);
-              if (irop_get_vreg(kd) != trace_vr || !irop_dest_defines_vreg(kd)) continue;
-              trace_depth++;
-              if (kq->op == TCCIR_OP_ADD)
-              {
-                IROperand as1 = tcc_ir_op_get_src1(ir, kq);
-                IROperand as2 = tcc_ir_op_get_src2(ir, kq);
-                if (irop_is_immediate(as2) && irop_has_vreg(as1) && !as1.is_lval)
-                {
-                  trace_add += (int)irop_get_imm64_ex(ir, as2);
-                  trace_vr = irop_get_vreg(as1);
-                  continue;
-                }
-                break;
-              }
-              if (kq->op != TCCIR_OP_LEA && kq->op != TCCIR_OP_ASSIGN) break;
-              IROperand ks = tcc_ir_op_get_src1(ir, kq);
-              if (irop_get_tag(ks) != IROP_TAG_STACKOFF || !ks.is_local || ks.is_lval) break;
-              st_off = (int)irop_get_imm64_ex(ir, ks) + trace_add;
               st_off_found = 1;
-              st_store_lea = k;
-              break;
+              st_store_lea = lea_k;
             }
             if (st_off_found)
               st_size = ir_opt_store_btype_size_bytes(irop_get_btype(st_dest));
@@ -453,49 +589,23 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       else /* TCCIR_OP_STORE_INDEXED */
       {
         st_src = tcc_ir_op_get_src1(ir, sq);
-        IROperand st_idx = tcc_ir_op_get_src2(ir, sq);
         if (irop_get_tag(st_dest) == IROP_TAG_VREG && irop_has_vreg(st_dest) &&
-            irop_get_tag(st_idx) == IROP_TAG_IMM32)
+            tcc_ir_op_src2_tag(ir, sq) == IROP_TAG_IMM32)
         {
           IROperand scale_op = ir->iroperand_pool[sq->operand_base + 3];
           int scale_val = (int)irop_get_imm64_ex(ir, scale_op);
           if (scale_val == 0)
           {
             int32_t trace_vr = irop_get_vreg(st_dest);
-            int idx_val = (int)irop_get_imm64_ex(ir, st_idx);
+            int idx_val = (int)tcc_ir_op_src2_imm(ir, sq);
             int trace_add = idx_val;
-            int trace_depth = 0;
             if (trace_vr >= 0)
             {
-              for (int k = j - 1; k >= 0 && trace_depth < 8; k--)
+              int lea_k = mtis_trace_stack_addr(ir, j, trace_vr, trace_add, &st_off);
+              if (lea_k >= 0)
               {
-                IRQuadCompact *kq = &ir->compact_instructions[k];
-                if (kq->op == TCCIR_OP_NOP) continue;
-                if (kq->is_jump_target) break;
-                if (kq->op == TCCIR_OP_JUMP || kq->op == TCCIR_OP_JUMPIF || kq->op == TCCIR_OP_IJUMP) break;
-                if (!irop_config[kq->op].has_dest) continue;
-                IROperand kd = tcc_ir_op_get_dest(ir, kq);
-                if (irop_get_vreg(kd) != trace_vr || !irop_dest_defines_vreg(kd)) continue;
-                trace_depth++;
-                if (kq->op == TCCIR_OP_ADD)
-                {
-                  IROperand as1 = tcc_ir_op_get_src1(ir, kq);
-                  IROperand as2 = tcc_ir_op_get_src2(ir, kq);
-                  if (irop_is_immediate(as2) && irop_has_vreg(as1) && !as1.is_lval)
-                  {
-                    trace_add += (int)irop_get_imm64_ex(ir, as2);
-                    trace_vr = irop_get_vreg(as1);
-                    continue;
-                  }
-                  break;
-                }
-                if (kq->op != TCCIR_OP_LEA && kq->op != TCCIR_OP_ASSIGN) break;
-                IROperand ks = tcc_ir_op_get_src1(ir, kq);
-                if (irop_get_tag(ks) != IROP_TAG_STACKOFF || !ks.is_local || ks.is_lval) break;
-                st_off = (int)irop_get_imm64_ex(ir, ks) + trace_add;
                 st_off_found = 1;
-                st_store_lea = k;
-                break;
+                st_store_lea = lea_k;
               }
             }
           }
@@ -557,6 +667,13 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
      * pass must avoid.  Rare combination; just refuse it. */
     if (dst_named && memset_idx >= 0)
       continue;
+    /* The memset is only moved onto a stack destination (below); through a
+     * pointer it would stay on the dead temporary, and the bytes only it
+     * zeroes -- a trailing `0` member of a compound literal, the padding --
+     * would never reach dst.  frame_dfe.c's `d->acc[n] = (DfeAcc){..., 0}`
+     * left `dead` as heap garbage, and the device tcc dropped copies. */
+    if (!dst_is_stackoff && memset_idx >= 0)
+      continue;
 
     /* Stores into the src range before this index are dead: the contributing stores fully cover it. */
     int earliest_contrib_idx = i;
@@ -595,10 +712,8 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
       /* Skip params of the memmove call. */
       if (sq->op == TCCIR_OP_FUNCPARAMVAL || sq->op == TCCIR_OP_FUNCPARAMVOID)
       {
-        IROperand pop_enc = tcc_ir_op_get_src2(ir, sq);
-        IROperand call_src2 = tcc_ir_op_get_src2(ir, q);
-        if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, pop_enc)) ==
-            TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, call_src2)))
+        if (TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, sq)) ==
+            TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q)))
           continue;
       }
 
@@ -609,10 +724,8 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
           continue;
         if (sq->op == TCCIR_OP_FUNCPARAMVAL || sq->op == TCCIR_OP_FUNCPARAMVOID)
         {
-          IROperand pop_enc = tcc_ir_op_get_src2(ir, sq);
-          IROperand ms_src2 = tcc_ir_op_get_src2(ir, &ir->compact_instructions[memset_idx]);
-          if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, pop_enc)) ==
-              TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, ms_src2)))
+          if (TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, sq)) ==
+              TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, &ir->compact_instructions[memset_idx])))
             continue;
         }
       }
@@ -691,16 +804,40 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         continue;
     }
 
-    /* Relocated stores write dst earlier than the memcpy did, so nothing may access dst's range before the call. */
-    if (dst_is_stackoff)
+    /* Relocated stores write dst EARLIER than the memcpy did: nothing between
+       the first of them and the call may read or write dst -- not a direct
+       access to its frame object, not a load or store through a pointer that
+       may reach it, not a call. */
     {
-      int dst_safe = 1;
-      for (int j = 0; j < i && dst_safe; j++)
+      int win_lo = i;
+      for (int s = 0; s < nstores; s++)
+        if (store_indices[s] < win_lo)
+          win_lo = store_indices[s];
+      if (memset_idx >= 0 && memset_idx < win_lo)
+        win_lo = memset_idx;
+      int call_id = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
+      int ms_call_id = memset_idx >= 0 ? TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, &ir->compact_instructions[memset_idx]))
+                                       : -1;
+      int obj_lo = 0, obj_hi = 0, addr_taken = 1;
+      if (dst_is_stackoff)
       {
-        if (j == i)
-          continue;
+        if (tcc_ir_frame_object_at(ir, dst_base, &obj_lo, &obj_hi))
+          addr_taken = mtis_object_addr_taken(ir, obj_lo, obj_hi, call_id);
+        else
+        {
+          obj_lo = dst_base;
+          obj_hi = dst_base + total_size;
+        }
+        if (obj_lo > dst_base)
+          obj_lo = dst_base;
+        if (obj_hi < dst_base + total_size)
+          obj_hi = dst_base + total_size;
+      }
+      int dst_safe = 1;
+      for (int j = win_lo + 1; j < i && dst_safe; j++)
+      {
         IRQuadCompact *sq = &ir->compact_instructions[j];
-        if (sq->op == TCCIR_OP_NOP)
+        if (sq->op == TCCIR_OP_NOP || j == lea_idx || j == memset_idx)
           continue;
         /* Contributing stores and their LEAs are about to be relocated to dst. */
         int is_store_of_ours = 0;
@@ -714,40 +851,15 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         }
         if (is_store_of_ours)
           continue;
-        /* Skip params of the memcpy call. */
+        /* Params of the memcpy and of the memset that moves with it. */
         if (sq->op == TCCIR_OP_FUNCPARAMVAL || sq->op == TCCIR_OP_FUNCPARAMVOID)
         {
-          IROperand pop_enc = tcc_ir_op_get_src2(ir, sq);
-          IROperand call_src2 = tcc_ir_op_get_src2(ir, q);
-          if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, pop_enc)) ==
-              TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, call_src2)))
+          int pid = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, sq));
+          if (pid == call_id || pid == ms_call_id)
             continue;
         }
-        /* A LEA only computes an address, so it neither reads nor writes dst's range. */
-        if (sq->op == TCCIR_OP_LEA)
-          continue;
-        for (int si = 0; si < 3; si++)
-        {
-          IROperand op;
-          if (si == 0 && irop_config[sq->op].has_dest)
-            op = tcc_ir_op_get_dest(ir, sq);
-          else if (si == 1 && irop_config[sq->op].has_src1)
-            op = tcc_ir_op_get_src1(ir, sq);
-          else if (si == 2 && irop_config[sq->op].has_src2)
-            op = tcc_ir_op_get_src2(ir, sq);
-          else
-            continue;
-          if (irop_get_tag(op) != IROP_TAG_STACKOFF)
-            continue;
-          if (!op.is_local)
-            continue;
-          int off = (int)irop_get_imm64_ex(ir, op);
-          if (off < dst_base || off >= dst_base + total_size)
-            continue;
-          /* dst range referenced elsewhere — bail. */
+        if (mtis_may_touch_dst(ir, sq, dst_is_stackoff, obj_lo, obj_hi, addr_taken, call_id))
           dst_safe = 0;
-          break;
-        }
       }
       if (!dst_safe)
         continue;
@@ -756,7 +868,7 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
     /* The LEA producing p_src must have no user other than the memmove's PARAM1. */
     if (lea_idx >= 0)
     {
-      int32_t lea_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, &ir->compact_instructions[lea_idx]));
+      int32_t lea_vr = tcc_ir_op_dest_vreg(ir, &ir->compact_instructions[lea_idx]);
       int lea_other_uses = 0;
       for (int j = 0; j < n && !lea_other_uses; j++)
       {
@@ -768,11 +880,9 @@ int tcc_ir_opt_memmove_to_indexed_stores(TCCIRState *ir)
         /* The memmove PARAM1 is the expected use. */
         if (sq->op == TCCIR_OP_FUNCPARAMVAL || sq->op == TCCIR_OP_FUNCPARAMVOID)
         {
-          IROperand pop_enc = tcc_ir_op_get_src2(ir, sq);
-          IROperand call_src2 = tcc_ir_op_get_src2(ir, q);
-          if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, pop_enc)) ==
-                  TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, call_src2)) &&
-              TCCIR_DECODE_PARAM_IDX((uint32_t)irop_get_imm64_ex(ir, pop_enc)) == 1)
+          if (TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, sq)) ==
+                  TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q)) &&
+              TCCIR_DECODE_PARAM_IDX((uint32_t)tcc_ir_op_src2_imm(ir, sq)) == 1)
             continue;
         }
         for (int si = 0; si < 3; si++)

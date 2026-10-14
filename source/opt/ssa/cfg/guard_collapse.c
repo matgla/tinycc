@@ -80,7 +80,7 @@ int tcc_ir_ssa_opt_guard_collapse_ex(IRSSAOptCtx *ctx, int idle_cleanup)
         }
         if (q->op != TCCIR_OP_JUMP)
           continue;
-        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+        int t = (int)tcc_ir_op_dest_imm(ir, q);
         if (t <= i) {
           fallthrough_jmp = 0;
           break;

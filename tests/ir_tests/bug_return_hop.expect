@@ -1,0 +1,11 @@
+first_hit 12 6 12
+keep_a 9 25 move_b 4 19
+keep64 4886718345 12884901889
+scan 9 77 0
+tail 40 25
+far 21 25890275
+find_neg 12 24 -8
+mask_first 1 0 1 0
+mask_first_if 3 5
+mask_store 0 1 0
+mask_volatile 1 0

@@ -57,6 +57,16 @@ struct sym_version
 #define SHF_DYNSYM 0x40000000
 /* Larger initial ELF hash tables reduce rebuild churn without changing lookup semantics. */
 #define SYMTAB_INITIAL_HASH_BUCKETS 512
+#ifdef CONFIG_TCC_LOW_MEM
+/* The compiler's own (SHF_PRIVATE, never written out) tables start small:
+ * at 512 buckets .hashtab and .dynhashtab took a 4 KiB block each, while a
+ * small compile hashes a few dozen globals.  put_elf_sym doubles the table
+ * past 2 symbols per bucket; chains stay newest-first, so lookups find the
+ * same symbol at any bucket count. An output .hash keeps the 512. */
+#define SYMTAB_PRIVATE_INITIAL_HASH_BUCKETS 64
+#else
+#define SYMTAB_PRIVATE_INITIAL_HASH_BUCKETS SYMTAB_INITIAL_HASH_BUCKETS
+#endif
 
 #if defined(TCC_TARGET_PE) || defined(TCC_TARGET_ARM_THUMB)
 #define shf_RELRO SHF_ALLOC
@@ -173,6 +183,14 @@ ST_FUNC void tcc_add_runtime(TCCState *s1);
 #endif
 ST_FUNC void resolve_common_syms(TCCState *s1);
 
+/* A hidden or internal definition belongs to the module being linked: it
+   resolves locally and is never exported, whatever its binding. */
+static inline int elf_sym_is_module_local(ElfW(Sym) * sym)
+{
+  unsigned vis = ELFW(ST_VISIBILITY)(sym->st_other);
+  return sym->st_shndx != SHN_UNDEF && (vis == STV_HIDDEN || vis == STV_INTERNAL);
+}
+
 /* Defined in tccelf_layout.c. */
 #ifndef ELF_OBJ_ONLY
 ST_FUNC void fill_got(TCCState *s1);
@@ -204,6 +222,7 @@ ST_FUNC int tcc_group_has_satisfiable_undefs(TCCState *s1);
 #ifndef ELF_OBJ_ONLY
 ST_FUNC int tcc_load_linker_script(TCCState *s1, const char *filename);
 void ld_apply_symbols(TCCState *s1, LDScript *ld);
+int ld_script_defines_symbol(TCCState *s1, const char *name);
 void ld_update_symbol_values(TCCState *s1, LDScript *ld);
 ST_FUNC void ld_export_standard_symbols(TCCState *s1);
 #endif

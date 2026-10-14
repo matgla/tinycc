@@ -117,6 +117,8 @@ static void relayout_retarget(TCCIRState *ir, const RelayoutMap *m)
       table->targets[j] = relayout_map(m, table->targets[j]);
   }
 
+  tcc_ir_frame_scope_widen(ir, m->region_start, m->region_end);
+
   /* Recompute is_jump_target over the permuted region: the two elided jumps
    * may have carried the flag, and the body's first instruction no longer
    * needs it unless a surviving branch still targets it. */
@@ -188,14 +190,14 @@ int try_relayout_loop(TCCIRState *ir, IRLoop *loop)
     RJ("header-shape");
 
   IRQuadCompact *jmp_q = &ir->compact_instructions[tramp_idx];
-  int body_start = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jmp_q));
+  int body_start = (int)tcc_ir_op_dest_imm(ir, jmp_q);
 
   /* back edge: first JUMP to the header below the trampoline */
   int backedge_idx = -1;
   for (int i = tramp_idx + 1; i <= loop->end_idx; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_JUMP && (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q)) == hi)
+    if (q->op == TCCIR_OP_JUMP && (int)tcc_ir_op_dest_imm(ir, q) == hi)
     {
       backedge_idx = i;
       break;
@@ -225,7 +227,7 @@ int try_relayout_loop(TCCIRState *ir, IRLoop *loop)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP)
       continue;
-    int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    int jt = (int)tcc_ir_op_dest_imm(ir, q);
     if (jt >= latch_start && jt <= latch_end)
     {
       body_end_jmp = i;
@@ -269,7 +271,7 @@ int try_relayout_loop(TCCIRState *ir, IRLoop *loop)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMPIF)
       continue;
-    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    int t = (int)tcc_ir_op_dest_imm(ir, q);
     if (t >= region_start && t <= region_end && t != body_start)
       RJ("exit-inside-region");
   }

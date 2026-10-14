@@ -15,6 +15,10 @@
  * described (see IRParamForm); NULL when not recording. */
 static IRParamForm *pf_cur;
 
+/* A struct split between r0-r3 and at most this many stack words is copied
+ * into a home with per-word PARAM vregs; a longer one is used in place. */
+#define PARAM_SPLIT_HOME_MAX_STACK_WORDS 4
+
 /* Forward declarations for internal helpers */
 static void tcc_ir_params_add_hidden_sret(TCCIRState *ir, CType *func_type);
 static void tcc_ir_params_process_arguments(TCCIRState *ir, Sym *param_list, TCCAbiCallLayout *call_layout);
@@ -37,9 +41,17 @@ void tcc_ir_params_add(TCCIRState *ir, CType *func_type)
   /* Set up local variable area - variadic functions need extra space */
   loc = variadic ? -28 : 0;
   func_vc = 0;
+  /* The incoming static chain is saved at frame top - 4 (the prologue, and
+   * every chain reload after a call, use that fixed slot): reserve it before
+   * any parameter home, the sret pointer's included, takes it. */
+  if (ir->has_static_chain && loc > -4)
+    loc = -4;
 
-  /* Handle hidden sret pointer for struct/complex returns */
-  if ((sym->type.t & VT_BTYPE) == VT_STRUCT || (sym->type.t & VT_COMPLEX))
+  /* Handle hidden sret pointer for struct/complex returns (none for one
+   * returned in r0/r1, gfunc_regpair_ret) */
+  Sym *fsym = tcc_state->cur_func_sym;
+  if (((sym->type.t & VT_BTYPE) == VT_STRUCT || (sym->type.t & VT_COMPLEX)) &&
+      !(fsym && fsym->type.ref == sym && gfunc_regpair_ret(fsym)))
   {
     tcc_ir_params_add_hidden_sret(ir, func_type);
     /* If sret was used (func_vc != 0), the hidden pointer consumed r0
@@ -48,7 +60,7 @@ void tcc_ir_params_add(TCCIRState *ir, CType *func_type)
      * parameters are off-by-one: the last register param is
      * misclassified as in-register when it is actually on the stack,
      * and the backend generates ADD (address) instead of LDR (value). */
-    if (func_vc != 0)
+    if (func_vc != 0 && !ir->vfp_ret_words)
       call_layout.next_reg = 1;
   }
 
@@ -66,7 +78,42 @@ static void tcc_ir_params_add_hidden_sret(TCCIRState *ir, CType *func_type)
 
   int ret_nregs = gfunc_sret(&sym->type, (sym->f.func_type == FUNC_ELLIPSIS), &ret_type, &ret_align, &regsize);
 
-  if (ret_nregs == 0)
+  const int vfp_words = ret_nregs == 0 ? gfunc_sret_vfp_words(&sym->type, sym->f.func_type == FUNC_ELLIPSIS) : 0;
+  if (vfp_words)
+  {
+    /* Returned in s0..s(n-1): no hidden pointer arrives.  The returns write
+     * a frame buffer, whose address func_vc's slot holds as it would hold
+     * the caller's, and the exit loads the registers from it. */
+    int size, align;
+    size = type_size(&sym->type, &align);
+    loc = tcc_ir_frame_alloc(loc, size, -8);
+    tcc_ir_frame_note_type(loc, &sym->type);
+    ir->vfp_ret_buf = loc;
+    ir->vfp_ret_words = (uint8_t)vfp_words;
+    loc = tcc_ir_frame_alloc(loc, PTR_SIZE, -PTR_SIZE);
+    func_vc = loc;
+    if (ir->naked) /* no frame: the asm body leaves the result in s0-s7 */
+      return;
+
+    SValue buf, addr, slot;
+    svalue_init(&buf);
+    buf.type.t = VT_PTR;
+    buf.r = VT_LOCAL;
+    buf.vr = -1;
+    buf.c.i = ir->vfp_ret_buf;
+    svalue_init(&addr);
+    addr.type.t = VT_PTR;
+    addr.r = 0;
+    addr.vr = tcc_ir_get_vreg_temp(ir);
+    tcc_ir_put(ir, TCCIR_OP_LEA, &buf, NULL, &addr);
+    svalue_init(&slot);
+    slot.type.t = VT_PTR;
+    slot.r = VT_LOCAL | VT_LVAL;
+    slot.vr = -1;
+    slot.c.i = func_vc;
+    tcc_ir_put(ir, TCCIR_OP_STORE, &addr, NULL, &slot);
+  }
+  else if (ret_nregs == 0)
   {
     /* Struct returned via hidden pointer in first parameter (r0) */
     SValue src, dst;
@@ -129,6 +176,103 @@ static void tcc_ir_params_process_arguments(TCCIRState *ir, Sym *param_list, TCC
   }
 }
 
+/* How the ABI sees a parameter of TYPE: kind, size, alignment, VFP class. */
+void tcc_ir_param_abi_desc(CType *type, TCCAbiArgDesc *desc)
+{
+  int align = 0;
+  const int size = type_size(type, &align);
+  if (align < 1)
+    align = 1;
+
+  memset(desc, 0, sizeof(*desc));
+  if ((type->t & VT_BTYPE) == VT_STRUCT)
+  {
+    desc->kind = TCC_ABI_ARG_STRUCT_BYVAL;
+    desc->size = (uint32_t)size;
+    /* Use AAPCS natural alignment (based on member types) for register
+     * double-word alignment rule (even-register requirement). */
+    int aapcs_align = ctype_aapcs_alignment(type);
+    desc->alignment = (uint8_t)(aapcs_align < align ? aapcs_align : align);
+  }
+  else if (type->t & VT_COMPLEX)
+  {
+    /* Complex types are passed like composites (AAPCS treats them as
+     * arrays of two elements): complex float = 8 bytes, complex double = 16 bytes. */
+    desc->kind = TCC_ABI_ARG_STRUCT_BYVAL;
+    desc->size = (uint32_t)size;
+    desc->alignment = (uint8_t)align;
+  }
+  else if (tcc_ir_type_is_64bit(type->t))
+  {
+    desc->kind = TCC_ABI_ARG_SCALAR64;
+    desc->size = 8;
+    desc->alignment = (uint8_t)align;
+  }
+  else
+  {
+    desc->kind = TCC_ABI_ARG_SCALAR32;
+    desc->size = 4;
+    desc->alignment = (uint8_t)align;
+  }
+
+  /* Scalar float/double only: complex is passed as a composite (see above), so
+   * it must not be diverted into the VFP argument bank. */
+  desc->is_float = (is_float(type->t) && !(type->t & VT_COMPLEX) && (type->t & VT_BTYPE) != VT_STRUCT) ? 1 : 0;
+  if (!desc->is_float)
+  {
+    int hfa_base;
+    desc->hfa_count = (uint8_t)gfunc_hfa(type, &hfa_base);
+    desc->hfa_base = (uint8_t)hfa_base;
+  }
+}
+
+/* The core-register moves that turn the arguments of a call with a hidden
+ * sret pointer in r0 into those of the same call without it: every argument
+ * word in r(SRC[i]) goes to r(DST[i]), DST[i] <= SRC[i], ascending.  Returns
+ * the number of moves, or -1 when an argument is not wholly in registers
+ * under both layouts (a stack argument would need its slot moved too). */
+int tcc_ir_params_sret_shift_moves(Sym *func_ref, uint8_t *src, uint8_t *dst, int max)
+{
+  TCCAbiCallLayout with_sret, without;
+  int n = 0, arg_index = 0;
+  memset(&with_sret, 0, sizeof(with_sret));
+  memset(&without, 0, sizeof(without));
+  with_sret.hard_float = without.hard_float = (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT);
+  with_sret.is_variadic = without.is_variadic = func_ref->f.func_type == FUNC_ELLIPSIS;
+  with_sret.next_reg = 1;
+  for (Sym *p = func_ref->next; p && n >= 0; p = p->next, arg_index++)
+  {
+    TCCAbiArgDesc desc;
+    tcc_ir_param_abi_desc(&p->type, &desc);
+    TCCAbiArgLoc a = tcc_abi_classify_argument(&with_sret, arg_index, &desc);
+    TCCAbiArgLoc b = tcc_abi_classify_argument(&without, arg_index, &desc);
+    if (a.kind != b.kind || (a.kind != TCC_ABI_LOC_REG && a.kind != TCC_ABI_LOC_VFP_REG))
+      n = -1;
+    else if (a.kind == TCC_ABI_LOC_VFP_REG)
+    {
+      if (a.reg_base != b.reg_base)
+        n = -1;
+    }
+    else if (a.reg_count != b.reg_count || b.reg_base > a.reg_base)
+      n = -1;
+    else
+      for (int k = 0; k < a.reg_count && n >= 0; k++)
+      {
+        if (n >= max)
+          n = -1;
+        else
+        {
+          src[n] = (uint8_t)(a.reg_base + k);
+          dst[n] = (uint8_t)(b.reg_base + k);
+          n++;
+        }
+      }
+  }
+  tcc_abi_call_layout_deinit(&with_sret);
+  tcc_abi_call_layout_deinit(&without);
+  return n;
+}
+
 void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAbiCallLayout *call_layout)
 {
   CType *type = &sym->type;
@@ -139,41 +283,7 @@ void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAb
     align = 1;
 
   TCCAbiArgDesc desc;
-  memset(&desc, 0, sizeof(desc));
-
-  if ((type->t & VT_BTYPE) == VT_STRUCT)
-  {
-    desc.kind = TCC_ABI_ARG_STRUCT_BYVAL;
-    desc.size = (uint32_t)size;
-    /* Use AAPCS natural alignment (based on member types) for register
-     * double-word alignment rule (even-register requirement). */
-    int aapcs_align = ctype_aapcs_alignment(type);
-    desc.alignment = (uint8_t)(aapcs_align < align ? aapcs_align : align);
-  }
-  else if (type->t & VT_COMPLEX)
-  {
-    /* Complex types are passed like composites (AAPCS treats them as
-     * arrays of two elements): complex float = 8 bytes, complex double = 16 bytes. */
-    desc.kind = TCC_ABI_ARG_STRUCT_BYVAL;
-    desc.size = (uint32_t)size;
-    desc.alignment = (uint8_t)align;
-  }
-  else if (tcc_ir_type_is_64bit(type->t))
-  {
-    desc.kind = TCC_ABI_ARG_SCALAR64;
-    desc.size = 8;
-    desc.alignment = (uint8_t)align;
-  }
-  else
-  {
-    desc.kind = TCC_ABI_ARG_SCALAR32;
-    desc.size = 4;
-    desc.alignment = (uint8_t)align;
-  }
-
-  /* Scalar float/double only: complex is passed as a composite (see above), so
-   * it must not be diverted into the VFP argument bank. */
-  desc.is_float = (is_float(type->t) && !(type->t & VT_COMPLEX) && (type->t & VT_BTYPE) != VT_STRUCT) ? 1 : 0;
+  tcc_ir_param_abi_desc(type, &desc);
 
   TCCAbiArgLoc loc_info = tcc_abi_classify_argument(call_layout, arg_index, &desc);
   tcc_ir_params_update_tracking(ir, loc_info, call_layout);
@@ -194,7 +304,10 @@ void tcc_ir_params_process_single(TCCIRState *ir, Sym *sym, int arg_index, TCCAb
 /* A parameter the ABI placed wholly on the caller's stack.  Recorded on its
  * PARAM vreg because tcc_ir_register_allocation_params re-derives register
  * placement by counting, and cannot tell a register an 8-aligned struct
- * skipped (r3 before a stack-passed S24L) from one still free. */
+ * skipped (r3 before a stack-passed S24L) from one still free.  Under
+ * hard-float, use_vfp on such a vreg marks a VFP candidate (a float, double,
+ * _Complex float/double or HFA): it is on the stack because the VFP bank was
+ * full, and later core-register arguments still take r0-r3. */
 static void params_mark_stack(TCCIRState *ir, Sym *ps)
 {
   if (!ir || !ps || ps->vreg < 0 || TCCIR_DECODE_VREG_TYPE(ps->vreg) != TCCIR_VREG_TYPE_PARAM)
@@ -259,6 +372,18 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
   int slot_align = align < 4 ? 4 : align;
   int flags = 0, addr = 0;
 
+  /* convert_parameter_type dropped the qualifier from the function type; put
+   * it back on the parameter's symbol (as tcc_ir_params_process_scalar does),
+   * or field reads of a `volatile struct` parameter are plain reads that
+   * param_home_fwd / SRA forward from the entry stores and LICM hoists. */
+  CType qual_type;
+  if (sym->a.param_volatile)
+  {
+    qual_type = *type;
+    qual_type.t |= VT_VOLATILE;
+    type = &qual_type;
+  }
+
   if (loc_info->kind == TCC_ABI_LOC_REG)
   {
     /* Struct passed in registers - spill to local home */
@@ -308,9 +433,49 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
     return;
   }
 
-  if (loc_info->kind == TCC_ABI_LOC_REG_STACK && loc_info->stack_off == 0 && !call_layout->is_variadic)
+  if (loc_info->kind == TCC_ABI_LOC_VFP_REG)
   {
-    /* Struct straddles r3 and the stack.  The prologue pushes r0-r3 right
+    /* Hard-float HFA or _Complex float/double in s<reg_base>.. (a double is
+     * the s-register pair of its d-register, low word first): one float PARAM
+     * vreg per word, stored into a local home like a core-register struct.
+     * Moving the raw words keeps a double's bits intact. */
+    int slot_size = tcc_abi_align_up_int(size, 4);
+    loc = (loc - slot_size) & -slot_align;
+    const int struct_slot = loc;
+    for (int w = 0; w < loc_info->reg_count; ++w)
+    {
+      const int word_param_vr = tcc_ir_get_vreg_param(ir);
+      tcc_ir_set_float_type(ir, word_param_vr, 1, 0);
+      IRLiveInterval *word_iv = tcc_ir_vreg_live_interval(ir, word_param_vr);
+      if (word_iv)
+      {
+        word_iv->incoming_reg0 = LS_VFP_REG_BASE + loc_info->reg_base + w;
+        word_iv->incoming_reg1 = -1;
+      }
+
+      SValue src, dst;
+      memset(&src, 0, sizeof(src));
+      memset(&dst, 0, sizeof(dst));
+      src.type.t = VT_FLOAT;
+      src.r = 0;
+      src.vr = word_param_vr;
+      dst.type.t = VT_FLOAT;
+      dst.r = VT_LOCAL | VT_LVAL;
+      dst.vr = -1;
+      dst.c.i = struct_slot + w * 4;
+      tcc_ir_put(ir, TCCIR_OP_STORE, &src, NULL, &dst);
+    }
+    int v = sym->v & ~SYM_FIELD;
+    if (!v)
+      v = anon_sym++;
+    sym_push(v, type, VT_LVAL | VT_LOCAL, struct_slot);
+    return;
+  }
+
+  if (loc_info->kind == TCC_ABI_LOC_REG_STACK && loc_info->stack_off == 0 && !call_layout->is_variadic &&
+      tcc_abi_align_up_int(size, 4) / 4 - loc_info->reg_count > PARAM_SPLIT_HOME_MAX_STACK_WORDS)
+  {
+    /* Long struct straddling r3 and the stack.  The prologue pushes r0-r3 right
      * below the stack arguments (push_arg_regs), which makes it contiguous in
      * memory: use it in place from its first register's slot instead of
      * copying it word by word into the frame.  Parameter offsets are then
@@ -331,8 +496,12 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
 
   if (loc_info->kind == TCC_ABI_LOC_REG_STACK)
   {
-    /* Struct straddles registers and stack, the stack part not first on the
-     * stack (only under hard-float, after VFP arguments spilled): copy it. */
+    /* Struct straddles registers and stack with a short stack part (or one
+     * not first on the stack: only under hard-float, after VFP arguments
+     * spilled): copy it into a home like a register struct.  Its register
+     * words are PARAM vregs and its stack words one load each, so field reads
+     * forward from the entry stores (param_home_fwd, SRA) instead of staying
+     * memory reads of an in-place copy, reloaded in every loop iteration. */
     int slot_size = tcc_abi_align_up_int(size, 4);
     loc = (loc - slot_size) & -slot_align;
     const int struct_slot = loc;
@@ -404,6 +573,13 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
         v = anon_sym++;
       sym_push(v, type, flags, addr);
     }
+    if (pf_cur)
+      *pf_cur = (IRParamForm){.kind = IR_PF_HOME,
+                              .reg_base = (int8_t)loc_info->reg_base,
+                              .off = struct_slot,
+                              .words = reg_words,
+                              .stack_off = loc_info->stack_off,
+                              .stack_words = stack_words};
     return;
   }
 
@@ -416,6 +592,15 @@ void tcc_ir_params_process_struct(TCCIRState *ir, Sym *sym, CType *type, int siz
       v = anon_sym++;
     Sym *ps = sym_push(v, type, flags, addr);
     params_mark_stack(ir, ps);
+    /* A hard-float HFA here went to the stack because the VFP bank was full,
+     * which leaves the core registers alone (see params_mark_stack). */
+    int hfa_base;
+    if (call_layout->hard_float && !call_layout->is_variadic && gfunc_hfa(type, &hfa_base) > 0 && ps->vreg >= 0)
+    {
+      IRLiveInterval *iv = tcc_ir_vreg_live_interval(ir, ps->vreg);
+      if (iv)
+        iv->use_vfp = 1;
+    }
     if (pf_cur && ps->vreg >= 0)
       *pf_cur = (IRParamForm){.kind = IR_PF_MEM, .vreg = ps->vreg, .off = addr};
   }
@@ -438,7 +623,7 @@ void tcc_ir_params_process_scalar(TCCIRState *ir, Sym *sym, CType *type, TCCAbiA
     flags = VT_PARAM | VT_LVAL;
     if (variadic && loc_info->kind == TCC_ABI_LOC_REG)
     {
-      addr = -16 + (loc_info->reg_base * 4);
+      addr = tcc_ir_variadic_reg_save_base(ir) + (loc_info->reg_base * 4);
       flags |= VT_LOCAL;
     }
     else

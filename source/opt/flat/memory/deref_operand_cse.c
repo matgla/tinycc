@@ -168,8 +168,7 @@ static int docse_clobbers(TCCIRState *ir, IRQuadCompact *q)
   /* Catch-all for any op not named above that writes through an lvalue dest. */
   if (irop_config[q->op].has_dest)
   {
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (dest.is_lval)
+    if (tcc_ir_op_dest_is_lval(ir, q))
       return 1;
   }
   return 0;
@@ -203,7 +202,7 @@ static uint8_t *docse_entry_map(TCCIRState *ir, int n)
       entry[i] = 1;
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    int t = (int)tcc_ir_op_dest_imm(ir, q);
     if (t >= 0 && t < n)
       entry[t] = 1;
   }
@@ -259,10 +258,9 @@ static int docse_defs_tracked_base(TCCIRState *ir, IRQuadCompact *q, const DOCse
 {
   if (!num_entries || !irop_config[q->op].has_dest)
     return 0;
-  IROperand dest = tcc_ir_op_get_dest(ir, q);
-  if (dest.is_lval)
+  if (tcc_ir_op_dest_is_lval(ir, q))
     return 0; /* a memory write, not a vreg def — handled as a clobber */
-  int32_t dvr = irop_get_vreg(dest);
+  int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
   if (dvr < 0)
     return 0;
   for (int k = 0; k < num_entries; k++)
@@ -285,7 +283,7 @@ static int docse_apply(TCCIRState *ir, DOCseEntry *e, const uint8_t *entry_map)
     return 0;
 
   IRQuadCompact *fq = &ir->compact_instructions[first];
-  IROperand read = e->use_src2[0] ? tcc_ir_op_get_src2(ir, fq) : tcc_ir_op_get_src1(ir, fq);
+  IROperand read = tcc_ir_op_get_src1_or_2(ir, fq, e->use_src2[0]);
 
   int32_t vreg = tcc_ir_vreg_alloc_temp(ir);
   if (vreg < 0)

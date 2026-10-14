@@ -18,50 +18,18 @@
 static int ivsr_try_candidate(TCCIRState *ir, IRCFG *cfg, int header_b,
                               uint8_t *member, uint8_t *scratch)
 {
-  IRBasicBlock *hb = &cfg->blocks[header_b];
-  lcs_collect_header_members(cfg, header_b, member, scratch);
-
-  int eff_start = ir->next_instruction_index;
-  int eff_end = -1;
-  for (int b = 0; b < cfg->num_blocks; b++) {
-    if (!member[b])
-      continue;
-    if (cfg->blocks[b].start_idx < eff_start)
-      eff_start = cfg->blocks[b].start_idx;
-    if (cfg->blocks[b].end_idx - 1 > eff_end)
-      eff_end = cfg->blocks[b].end_idx - 1;
-  }
-  if (eff_end < eff_start)
+  LcsSpan sp;
+  if (!lcs_cand_span(ir, cfg, header_b, member, scratch, 0, &sp))
     return 0;
-
-  /* Contiguity: every non-NOP in the span belongs to a member. */
-  for (int i = eff_start; i <= eff_end; i++) {
-    if (ir->compact_instructions[i].op == TCCIR_OP_NOP)
-      continue;
-    int b = cfg->instr_to_block[i];
-    if (b < 0 || b >= cfg->num_blocks || !member[b])
-      return 0;
-  }
-  /* Single-entry: header dominates every member (a proper natural loop). */
-  for (int b = 0; b < cfg->num_blocks; b++) {
-    if (member[b] && !tcc_ir_cfg_dominates(cfg, header_b, b))
-      return 0;
-  }
-
-  int preheader = eff_start - 1;
-  while (preheader >= 0) {
-    int pop = ir->compact_instructions[preheader].op;
-    if (pop != TCCIR_OP_JUMP && pop != TCCIR_OP_JUMPIF)
-      break;
-    preheader--;
-  }
+  int eff_start = sp.start;
+  int eff_end = sp.end;
 
   int nbody = eff_end - eff_start + 1;
   IRLoop loop = {0};
-  loop.header_idx = hb->start_idx;
+  loop.header_idx = sp.header;
   loop.start_idx = eff_start;
   loop.end_idx = eff_end;
-  loop.preheader_idx = preheader;
+  loop.preheader_idx = sp.preheader;
   loop.depth = 1;
   loop.body_instrs = tcc_malloc(sizeof(int) * (size_t)nbody);
   loop.body_instrs_capacity = nbody;
@@ -97,14 +65,7 @@ int ssa_opt_iv_strength_reduction(TCCIRState *ir)
 
     int nb = cfg->num_blocks;
     uint8_t *is_header = tcc_mallocz((size_t)nb);
-    for (int b = 0; b < nb; b++) {
-      IRBasicBlock *bb = &cfg->blocks[b];
-      for (int si = 0; si < bb->num_succs; si++) {
-        int h = bb->succs[si];
-        if (h >= 0 && h < nb && tcc_ir_cfg_dominates(cfg, h, b))
-          is_header[h] = 1;
-      }
-    }
+    lcs_mark_headers(cfg, is_header);
 
     uint8_t *member = tcc_malloc((size_t)nb);
     uint8_t *scratch = tcc_malloc((size_t)nb);

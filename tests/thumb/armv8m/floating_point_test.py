@@ -8,3 +8,6 @@ def test_vpush():
 
 def test_vfp():
     utils.perform_test_for_file("test_vfp.S")
+
+def test_vcvt_rounding():
+    utils.perform_test_for_file("test_vcvt_rounding.S")

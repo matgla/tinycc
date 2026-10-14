@@ -8,10 +8,14 @@
 #undef JT_NOP_JUMP
 #undef USING_GLOBALS
 #include "../opt/flat/cfg/jump_thread.c"
+#undef JT_MAX_ITERATIONS
+#undef JT_MAX_MARKS
 #undef USING_GLOBALS
 #include "../opt/flat/cfg/jumpif_invert.c"
 #undef USING_GLOBALS
 #include "../opt/flat/cfg/returnvalue_merge.c"
+#undef USING_GLOBALS
+#include "../opt/flat/cfg/switch_head.c"
 #undef USING_GLOBALS
 #include "../opt/flat/cfg/switch_to_data.c"
 #undef SWITCHDATA_MAX_BODY_OPS

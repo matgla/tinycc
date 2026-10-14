@@ -1,0 +1,18 @@
+probe 47 95 4294967295 4294967295
+bt_ne 1 0 1 0
+bt_eq 0 1 0 1
+bt_if 7 9
+bt_sel 11 22
+bt_value 2147483648 8 0
+bt_signed 0 1 0
+bt_mask_kept 1 256
+bt_mask_first 1 0
+scheduled_here 1 0 1 1
+ugt0 3 18 ule0 18 3
+count_down 0 5050
+find 4/0 16/0 2863311530/1 2863311530/1
+regions 4 64 4
+regions 4294967295
+regions 4294967295
+valid_stack_ptr 1 0 0 0
+reserve 4 9 16 57 4294967295 4294967295

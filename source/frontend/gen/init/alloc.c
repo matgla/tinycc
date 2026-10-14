@@ -32,7 +32,6 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
 {
   int len, n, no_oblock, i;
   int size1, align1;
-  int need_sso_swap = 0;
   Sym *s, *f;
   Sym indexsym;
   CType *t1;
@@ -191,6 +190,9 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
           args[2].vr = -1;
 
           gen_ir_void_call_args(args, 3, TOK_memcpy);
+          /* The bulk copy bypasses init_putv's constant capture. */
+          if (p->const_init_sym)
+            sym_facts_peek(p->const_init_sym)->const_init_valid = 0;
 
           int remaining = n - copy_len;
           if (remaining > 0 && !(flags & DIF_CLEAR))
@@ -273,12 +275,6 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
     }
     if (!no_oblock)
       skip('}');
-    /* Byte-swap storage units for big-endian scalar_storage_order structs.
-       After all bitfield values have been stored with LE byte order (using
-       BE bit positions), swap bytes of each storage unit to produce the
-       correct big-endian memory layout. */
-    if (need_sso_swap && !(flags & DIF_SIZE_ONLY) && !NODATA_WANTED)
-      sso_swap_struct_init(p, type, c);
   }
   else if ((flags & DIF_HAVE_ELEM)
            /* Use i_c_parameter_t, to strip toplevel qualifiers.
@@ -323,8 +319,6 @@ void decl_initializer(init_params *p, CType *type, unsigned long c, int flags, i
     f = s->next;
     n = s->c;
     size1 = 1;
-    if (s->a.sso_be)
-      need_sso_swap = 1;
     goto do_init_list;
   }
   else if (tok == '{')
@@ -402,7 +396,12 @@ static int type_contains_pointer(CType *type)
   bt = tp->t & VT_BTYPE;
   if (bt == VT_PTR)
   {
-    /* A real pointer (arrays were stripped above). */
+    /* A real pointer (arrays were stripped above).  A __rodata_relative one
+       is an offset the linker fills in: nothing to relocate at load time. */
+    if (tp->t & VT_RODATA_REL)
+    {
+      return 0;
+    }
     return 1;
   }
   if (bt == VT_STRUCT)
@@ -484,6 +483,7 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
   int vreg = -1;
   Section *sec;
   Sym *flexible_array;
+  Sym *union_flex = NULL;
   Sym *sym;
   int saved_nocode_wanted = nocode_wanted;
 #ifdef CONFIG_TCC_BCHECK
@@ -532,7 +532,9 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
     /* For unions: if any member is a struct with a flexible array
        member, set flex_array_ref so the FAM can be initialized.
        The union already provides backing storage, so no dry-run
-       size computation is needed. */
+       size computation is needed, but the elements must fit in it.
+       The array Sym is the struct definition's own: its size is
+       put back after the initializer (union_flex). */
     if (!flexible_array && IS_UNION(type->ref->type.t))
     {
       Sym *member;
@@ -547,7 +549,11 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
               mf = mf->next;
             if (mf->type.t & VT_ARRAY && mf->type.ref->c < 0)
             {
-              p.flex_array_ref = mf->type.ref;
+              int esize = pointed_size(&mf->type);
+              union_flex = mf->type.ref;
+              p.flex_array_ref = union_flex;
+              p.flex_array_bounded = 1;
+              p.flex_array_max = esize > 0 ? (size - member->c - mf->c) / esize : 0;
               break;
             }
           }
@@ -771,6 +777,14 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
 
     /* allocate symbol in corresponding section */
     sec = ad->section;
+    /* a variable the program writes makes its __attribute__((section))
+     * section writable, as gcc marks it (find_section creates every named
+     * section read-only).  Not tcc's own sections: string literals are
+     * char[] placed in .rodata this way, and a writable .rodata stops the
+     * string builtins folding over them. */
+    if (sec && !(type->t & VT_CONSTANT) && sec != rodata_section && sec != data_section &&
+        sec != bss_section && !(sec->sh_flags & SHF_EXECINSTR))
+      sec->sh_flags |= SHF_WRITE;
     if (!sec)
     {
       CType *tp = type;
@@ -1010,7 +1024,7 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
     int saved_nrvo_align = tcc_state->nrvo_target_align;
     int saved_nrvo_ptr_vreg = tcc_state->nrvo_target_ptr_vreg;
     if (!sec && tcc_state->ir &&
-        ((type->t & VT_BTYPE) == VT_STRUCT || (type->t & VT_COMPLEX)))
+        ((type->t & VT_BTYPE) == VT_STRUCT || (type->t & VT_COMPLEX)) && nrvo_rhs_is_direct_call())
     {
       int nrvo_size, nrvo_align;
       nrvo_size = type_size(type, &nrvo_align);
@@ -1057,6 +1071,8 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
         pp.const_probe_base = addr;
         pp.const_probe_size = size;
         pp.flex_array_ref = p.flex_array_ref;
+        pp.flex_array_bounded = p.flex_array_bounded;
+        pp.flex_array_max = p.flex_array_max;
         nocode_wanted++;
         decl_initializer(&pp, type, addr, DIF_FIRST, -1);
         nocode_wanted--;
@@ -1121,11 +1137,17 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
       }
     }
 
+    /* The const_init buffer only records a brace list (or string literal)
+     * element by element; an expression initializer (`v4 t = a;`) leaves its
+     * bytes unknown. */
+    if (p.const_init_sym && tok != '{' && tok != TOK_STR && tok != TOK_LSTR)
+      sym_facts_peek(p.const_init_sym)->const_init_valid = 0;
+
     if (!templated)
       decl_initializer(&p, type, addr, DIF_FIRST, vreg);
 
     if (p.const_init_sym)
-      p.const_init_sym->facts->const_init_in_progress = 0;
+      sym_facts_peek(p.const_init_sym)->const_init_in_progress = 0;
 
     tcc_state->nrvo_target_ptr_vreg = saved_nrvo_ptr_vreg;
     tcc_state->nrvo_target_active = saved_nrvo_active;
@@ -1141,6 +1163,8 @@ void decl_initializer_alloc(CType *type, AttributeDef *ad, int r, int has_init, 
   }
 
 no_alloc:
+  if (union_flex)
+    union_flex->c = -1;
   /* restore parse state if needed */
   if (init_str)
   {

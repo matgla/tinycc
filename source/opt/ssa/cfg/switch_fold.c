@@ -67,7 +67,7 @@ int ssa_opt_switch_fold(IRSSAOptCtx *ctx)
     if (sel.is_lval || !irop_is_immediate(sel))
       continue;
 
-    int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+    int table_id = (int)tcc_ir_op_src2_imm(ir, q);
     if (table_id < 0 || table_id >= ir->num_switch_tables)
       continue;
     TCCIRSwitchTable *table = &ir->switch_tables[table_id];

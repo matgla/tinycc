@@ -1,0 +1,10 @@
+probe 63 -1 -1
+probe_byval 63 -1 -1
+count_set 3 0 0
+count_until 2 1 0
+find_free_run 1 9 -1 -1
+bad probe -1
+bad probe_byval -1
+bad count_set 0
+bad count_until 0
+bad find_free_run -1 -1

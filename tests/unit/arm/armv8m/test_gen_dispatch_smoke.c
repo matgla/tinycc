@@ -851,12 +851,31 @@ UT_TEST(test_set_chain_emits_mov_r10_fp)
   setup_gen();
   allocated_stack_size = 0;
 
-  /* An empty frame's top is the frame pointer itself. */
-  tcc_gen_machine_set_chain();
+  /* SET_CHAIN only records the chain; the call writes it at its branch.
+   * An empty frame's top is the frame pointer itself. */
+  tcc_gen_machine_set_chain(0);
+  UT_ASSERT_EQ(ind, 0);
+  tcc_gen_machine_flush_chain();
   UT_ASSERT_EQ(ind, 2);
   UT_ASSERT(bytes_match_opcode(ind, th_mov_reg(R10, R_FP, FLAGS_BEHAVIOUR_NOT_IMPORTANT, THUMB_SHIFT_DEFAULT,
                                                ENFORCE_ENCODING_NONE, false)));
 
+  return 0;
+}
+
+UT_TEST(test_set_chain_walks_up_incoming_chain)
+{
+  setup_gen();
+  allocated_stack_size = 24;
+
+  /* Level 2: our incoming chain (R10) walked up one frame, through that
+   * frame's saved chain at its top - 4.  Level 1 is R10 itself. */
+  tcc_gen_machine_set_chain(2);
+  tcc_gen_machine_flush_chain();
+  UT_ASSERT_EQ(ind, 4);
+  UT_ASSERT(bytes_match_opcode(ind, th_ldr_imm(R10, R10, 4, 4 /* sub */, ENFORCE_ENCODING_NONE)));
+
+  allocated_stack_size = 0;
   return 0;
 }
 
@@ -867,9 +886,14 @@ UT_TEST(test_set_chain_passes_frame_top)
 
   /* The chain is the frame's top, FP + frame size: nested functions address
    * captured variables at their (negative) frame offsets from it. */
-  tcc_gen_machine_set_chain();
+  tcc_gen_machine_set_chain(0);
+  tcc_gen_machine_flush_chain();
   UT_ASSERT_EQ(ind, 4);
   UT_ASSERT(bytes_match_opcode(ind, th_add_imm(R10, R_FP, 24, FLAGS_BEHAVIOUR_NOT_IMPORTANT, ENFORCE_ENCODING_NONE)));
+
+  /* Flushed once: a second call passes no chain of its own. */
+  tcc_gen_machine_flush_chain();
+  UT_ASSERT_EQ(ind, 4);
 
   allocated_stack_size = 0;
   return 0;
@@ -1001,7 +1025,7 @@ UT_TEST(test_init_chain_slot_emits_store_to_chain)
   UT_ASSERT(chain_sym != NULL);
 
   IROperand src = utb_symref(ir, chain_sym, 0, 0, 0, IROP_BTYPE_INT32);
-  tcc_gen_machine_init_chain_slot(src);
+  tcc_gen_machine_init_chain_slot(src, 0);
 
   UT_ASSERT(ind > 0);
 

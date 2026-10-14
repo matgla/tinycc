@@ -6,7 +6,7 @@
  *    - opt_dsl_pair_match(): SRC1/SRC2 link selection, specific vs any (.op=-1)
  *      opcode, single_use gating, multi-def and non-vreg rejection.
  *    - opt_dsl_pair_retire(): use-list fixup with delete_second 0 vs 1.
- *    - PATTERN + PAIR(DEF_OF_SRC2) + GUARD + RETIRE_PAIR + REWRITE end-to-end
+ *    - MATCH + PAIR(DEF_OF_SRC2) + PBIND + GUARD + RETIRE_PAIR + REWRITE end-to-end
  *      through ssa_opt_run_gens.
  *
  *  Copyright (c) 2026 Mateusz Stadnik
@@ -286,15 +286,17 @@ UT_TEST(test_pair_retire_delete)
 /* ========================================================================
  * End-to-end DSL gen: ADD whose src2 is defined by a single-use SHL #k, folded
  * to SUB with src2 forwarded to the SHL's input and the SHL retired.  Exercises
- * PATTERN + PAIR(DEF_OF_SRC2) + GUARD + RETIRE_PAIR + REWRITE.
+ * MATCH + PAIR(DEF_OF_SRC2) + PBIND + GUARD + RETIRE_PAIR + REWRITE.
  * ======================================================================== */
 
 OPT_GEN_SSA(t_pair_src2, TCCIR_OP_ADD) {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
   PAIR(.link = IR_PAIR_DEF_OF_SRC2, .op = TCCIR_OP_SHL, .single_use = 1);
+  PBIND(src1);
+  PBIND(src2);
   GUARD(when(is_imm32(psrc2)));
   RETIRE_PAIR(psrc1, 1);
-  REWRITE(.new_op = TCCIR_OP_SUB, .src2 = psrc1);
+  REWRITE(set_op(TCCIR_OP_SUB), set_src2(psrc1));
 }
 
 static const IRSSAOptGen t_pair_gens[] = {

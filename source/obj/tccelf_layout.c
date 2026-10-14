@@ -213,7 +213,8 @@ void bind_libs_dynsyms(TCCState *s1)
     dynsym_index = tcc_dynsym_find(s1, name);
     if (sym->st_shndx != SHN_UNDEF)
     {
-      if (ELFW(ST_BIND)(sym->st_info) != STB_LOCAL && (dynsym_index || s1->rdynamic))
+      if (ELFW(ST_BIND)(sym->st_info) != STB_LOCAL && !elf_sym_is_module_local(sym) &&
+          (dynsym_index || s1->rdynamic))
         set_elf_sym(s1->dynsym, sym->st_value, sym->st_size, sym->st_info, 0, sym->st_shndx, name);
     }
     else if (dynsym_index)
@@ -232,7 +233,8 @@ void bind_libs_dynsyms(TCCState *s1)
 /* Export all non local symbols. This is used by shared libraries so that the
    non local symbols they define can resolve a reference in another shared
    library or in the executable. Correspondingly, it allows undefined local
-   symbols to be resolved by other shared libraries or by the executable. */
+   symbols to be resolved by other shared libraries or by the executable.
+   Hidden and internal definitions stay inside the library. */
 void export_global_syms(TCCState *s1)
 {
   int dynindex, index;
@@ -240,7 +242,7 @@ void export_global_syms(TCCState *s1)
   ElfW(Sym) * sym;
   for_each_elem(symtab_section, 1, sym, ElfW(Sym))
   {
-    if (ELFW(ST_BIND)(sym->st_info) != STB_LOCAL)
+    if (ELFW(ST_BIND)(sym->st_info) != STB_LOCAL && !elf_sym_is_module_local(sym))
     {
       name = (char *)symtab_section->link->data + sym->st_name;
       dynindex = set_elf_sym(s1->dynsym, sym->st_value, sym->st_size, sym->st_info, 0, sym->st_shndx, name);
@@ -309,8 +311,9 @@ int set_sec_sizes(TCCState *s1)
 #endif
 
     /* Suppress legacy stabs sections. */
-    if (!strcmp(s->name, ".stab") || !strcmp(s->name, ".stabstr") || !strncmp(s->name, ".rel.stab", 9) ||
-        !strncmp(s->name, ".rela.stab", 10))
+    if (s->name[0] == '.' && (s->name[1] == 's' || s->name[1] == 'r') &&
+        (!strcmp(s->name, ".stab") || !strcmp(s->name, ".stabstr") || !strncmp(s->name, ".rel.stab", 9) ||
+         !strncmp(s->name, ".rela.stab", 10)))
     {
       s->sh_flags = 0;
       s->sh_size = 0;
@@ -328,38 +331,7 @@ int set_sec_sizes(TCCState *s1)
    to indicate it should come last within that output section. */
 int ld_find_output_section_idx(TCCState *s1, const char *name, int *pat_idx)
 {
-  LDScript *ld = s1->ld_script;
-  int i, j;
-
-  if (pat_idx)
-    *pat_idx = -1;
-
-  if (!ld || ld->nb_output_sections == 0)
-    return -1;
-
-  for (i = 0; i < ld->nb_output_sections; i++)
-  {
-    LDOutputSection *os = &ld->output_sections[i];
-    /* Check patterns first - they define the ordering within the output section
-     */
-    for (j = 0; j < os->nb_patterns; j++)
-    {
-      if (ld_section_matches_pattern(name, os->patterns[j].pattern))
-      {
-        if (pat_idx)
-          *pat_idx = j;
-        return i;
-      }
-    }
-    /* Check exact name match - comes after all patterns */
-    if (!strcmp(name, os->name))
-    {
-      if (pat_idx)
-        *pat_idx = os->nb_patterns; /* after all patterns */
-      return i;
-    }
-  }
-  return -1;
+  return ld_find_output_section(s1->ld_script, name, pat_idx);
 }
 
 /* Check if a section name matches a specific output section index */
@@ -374,12 +346,63 @@ int ld_section_matches_output(TCCState *s1, const char *name, int os_idx)
    program headers are filled since they contain info about the layout.
    We do the following ordering: interp, symbol tables, relocations, progbits,
    nobits */
+/* sort_sections groups linker-script sections by output section (class
+ * 0x100 + index); order each group by the pattern that placed a section,
+ * then -- for SORT() patterns -- by name, then by input order.  Pattern
+ * indices are looked up once per section (a group can hold thousands of
+ * -fdata-sections inputs). */
+static void ld_order_within_output_sections(TCCState *s1, int *sec_order, int *sec_cls, int nb_sections)
+{
+  int *pat = tcc_malloc(nb_sections * sizeof(int));
+  unsigned char *by_name = tcc_mallocz(nb_sections);
+  int i = 1;
+  while (i < nb_sections)
+  {
+    int k = sec_cls[i], j = i, a, b;
+    while (j < nb_sections && sec_cls[j] == k)
+      j++;
+    if (k >= 0x100 && k < 0x120 && j - i > 1)
+    {
+      for (a = i; a < j; a++)
+      {
+        int sec = sec_order[a], p = -1;
+        int os = ld_find_output_section_idx(s1, s1->sections[sec]->name, &p);
+        pat[sec] = p;
+        by_name[sec] = os >= 0 && p >= 0 && p < s1->ld_script->output_sections[os].nb_patterns &&
+                       s1->ld_script->output_sections[os].patterns[p].sort;
+      }
+      for (a = i + 1; a < j; a++) /* stable insertion sort */
+      {
+        int v = sec_order[a];
+        for (b = a; b > i; b--)
+        {
+          int u = sec_order[b - 1], before;
+          if (pat[v] != pat[u])
+            before = pat[v] < pat[u];
+          else if (by_name[v] && strcmp(s1->sections[v]->name, s1->sections[u]->name) != 0)
+            before = strcmp(s1->sections[v]->name, s1->sections[u]->name) < 0;
+          else
+            before = v < u;
+          if (!before)
+            break;
+          sec_order[b] = u;
+        }
+        sec_order[b] = v;
+      }
+    }
+    i = j;
+  }
+  tcc_free(pat);
+  tcc_free(by_name);
+}
+
 static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
 {
   Section *s;
   int i, j, k, f, f0, n, ld_idx;
   int nb_sections = s1->nb_sections;
   int *sec_cls = sec_order + nb_sections;
+  int *cls = tcc_malloc(nb_sections * sizeof *cls), *count, max_k = 0;
 
   for (i = 1; i < nb_sections; i++)
   {
@@ -527,12 +550,14 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
            pat_idx is the index of the matching pattern (0+), or nb_patterns
            for exact name match (comes after all patterns).
            Keep values in 0x100-0x5ff range to ensure proper handling. */
-        /* Limit ld_idx to fit in 5 bits (0-31 output sections) */
+        /* Limit ld_idx to fit in 5 bits (0-31 output sections).  The
+         * pattern order inside an output section is applied after this
+         * pass (ld_order_within_output_sections): folding it into k took
+         * only 4 bits, so the 16th pattern of .text wrapped round to the
+         * front, and k could land on 0x240, the RELRO class. */
         if (ld_idx > 31)
           ld_idx = 31;
-        /* pat_idx in lower bits, ld_idx in upper bits, all within 0x100-0x6ff
-         */
-        k = 0x100 + (ld_idx << 4) + (pat_idx & 0x0f);
+        k = 0x100 + ld_idx;
       }
       else
       {
@@ -542,11 +567,34 @@ static int sort_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
       }
     }
 
-    for (n = i; n > 1 && k < (f = sec_cls[n - 1]); --n)
-      sec_cls[n] = f, sec_order[n] = sec_order[n - 1];
-    sec_cls[n] = k, sec_order[n] = i;
+    cls[i] = k;
+    if (k > max_k)
+      max_k = k;
   }
+  /* Counting sort by class, sections of one class in index order: what
+   * inserting each section after every earlier one of a class <= its own
+   * gave, in quadratic time over the hundreds of sections of a
+   * --gc-sections link.  Classes are small (< 0xa00). */
+  count = tcc_mallocz((max_k + 2) * sizeof *count);
+  for (i = 1; i < nb_sections; i++)
+    count[cls[i] + 1]++;
+  for (k = 0, n = 1; k <= max_k; k++)
+  {
+    f = count[k + 1];
+    count[k + 1] = n; /* first slot of class k */
+    n += f;
+  }
+  for (i = 1; i < nb_sections; i++)
+  {
+    n = count[cls[i] + 1]++;
+    sec_cls[n] = cls[i];
+    sec_order[n] = i;
+  }
+  tcc_free(count);
+  tcc_free(cls);
   sec_order[0] = 0;
+  if (s1->ld_script && s1->ld_script->nb_output_sections > 0)
+    ld_order_within_output_sections(s1, sec_order, sec_cls, nb_sections);
   d->shnum = 1;
 
   /* count PT_LOAD headers needed */
@@ -830,19 +878,22 @@ int layout_sections(TCCState *s1, int *sec_order, struct dyn_inf *d)
     }
   }
 
-  /* Fill other headers */
+  /* Fill other headers.  They take the slots after the PT_LOADs -- counted
+   * by n, not found through `ph`, which is still NULL when nothing
+   * allocatable has any size (a -static link of an object without code). */
+  ph = d->phdr + phfill + n;
   if (d->note)
-    fill_phdr(++ph, PT_NOTE, d->note);
+    fill_phdr(ph++, PT_NOTE, d->note);
   if (d->dynamic)
   {
-    ElfW(Phdr) *dph = fill_phdr(++ph, PT_DYNAMIC, d->dynamic);
+    ElfW(Phdr) *dph = fill_phdr(ph++, PT_DYNAMIC, d->dynamic);
     dph->p_flags |= PF_W;
   }
   if (eh_frame_hdr_section)
-    fill_phdr(++ph, PT_GNU_EH_FRAME, eh_frame_hdr_section);
+    fill_phdr(ph++, PT_GNU_EH_FRAME, eh_frame_hdr_section);
   if (d->roinf)
   {
-    ElfW(Phdr) *rph = fill_phdr(++ph, PT_GNU_RELRO, d->roinf);
+    ElfW(Phdr) *rph = fill_phdr(ph++, PT_GNU_RELRO, d->roinf);
     rph->p_flags |= PF_W;
   }
   if (d->interp)

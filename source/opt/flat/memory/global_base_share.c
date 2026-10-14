@@ -39,9 +39,8 @@ static IRPoolSymref *gbs_get_store_symref(TCCIRState *ir, IRQuadCompact *q, ElfS
   if (irop_get_tag(dest) != IROP_TAG_SYMREF || !dest.is_lval)
     return NULL;
   /* Only INT32/INT64/float; dest and src btype must match to avoid narrowing within the STORE. */
-  IROperand src = tcc_ir_op_get_src1(ir, q);
   int dest_bt = irop_get_btype(dest);
-  int src_bt = irop_get_btype(src);
+  int src_bt = tcc_ir_op_src1_btype(ir, q);
   if (dest_bt != src_bt)
     return NULL;
   if (dest_bt != IROP_BTYPE_INT32 && dest_bt != IROP_BTYPE_INT64 &&
@@ -76,11 +75,29 @@ static IRPoolSymref *gbs_get_store_symref(TCCIRState *ir, IRQuadCompact *q, ElfS
   return sr;
 }
 
+/* Actual JUMP/JUMPIF targets as a bitmap: is_jump_target can be stale. */
+static uint8_t *gbs_jump_targets(TCCIRState *ir)
+{
+  int n = ir->next_instruction_index;
+  uint8_t *targets = tcc_mallocz((n + 7) / 8 + 1);
+  for (int t = 0; t < n; t++)
+  {
+    IRQuadCompact *jq = &ir->compact_instructions[t];
+    if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF)
+    {
+      int tg = (int)tcc_ir_op_dest_u_imm32(ir, jq);
+      if (tg >= 0 && tg < n)
+        targets[tg / 8] |= (1 << (tg % 8));
+    }
+  }
+  return targets;
+}
+
 int tcc_ir_opt_global_base_share(TCCIRState *ir)
 {
   if (!ir || !tcc_state)
     return 0;
-  if (!tcc_state->opt_indexed_memory)
+  if (!TCC_OPT(tcc_state, opt_indexed_memory))
     return 0;
 
   int n = ir->next_instruction_index;
@@ -95,13 +112,16 @@ int tcc_ir_opt_global_base_share(TCCIRState *ir)
       return 0;
   }
 
+  uint8_t *targets = gbs_jump_targets(ir);
+#define GBS_IS_TARGET(idx) (ir->compact_instructions[idx].is_jump_target || (targets[(idx) / 8] & (1 << ((idx) % 8))))
+
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_STORE)
       continue;
     /* Skip jump-target STOREs — base wouldn't be live across the merge. */
-    if (q->is_jump_target)
+    if (GBS_IS_TARGET(i))
       continue;
 
     ElfSym *anchor_esym = NULL;
@@ -122,6 +142,9 @@ int tcc_ir_opt_global_base_share(TCCIRState *ir)
     for (int j = i + 1; j < n && cluster_size < GBS_MAX_CLUSTER; j++)
     {
       IRQuadCompact *qj = &ir->compact_instructions[j];
+      /* A join point ends the cluster even when it is a NOP: the base is not defined on the other path. */
+      if (GBS_IS_TARGET(j))
+        break;
       if (qj->op == TCCIR_OP_NOP)
         continue;
 
@@ -133,8 +156,6 @@ int tcc_ir_opt_global_base_share(TCCIRState *ir)
           qj->op == TCCIR_OP_FUNCPARAMVAL || qj->op == TCCIR_OP_FUNCPARAMVOID ||
           qj->op == TCCIR_OP_RETURNVALUE || qj->op == TCCIR_OP_RETURNVOID ||
           qj->op == TCCIR_OP_INLINE_ASM)
-        break;
-      if (qj->is_jump_target)
         break;
 
       /* Non-STORE ops between are fine; RA manages base-reg liveness. */
@@ -182,6 +203,8 @@ int tcc_ir_opt_global_base_share(TCCIRState *ir)
       cluster_stores[k] += 1;
     n = ir->next_instruction_index;
     last_in_cluster += 1;
+    tcc_free(targets);
+    targets = gbs_jump_targets(ir);
 
     for (int k = 0; k < cluster_size; k++)
     {
@@ -211,11 +234,8 @@ int tcc_ir_opt_global_base_share(TCCIRState *ir)
     /* Skip past the cluster. */
     i = last_in_cluster;
   }
+#undef GBS_IS_TARGET
 
+  tcc_free(targets);
   return changes;
-}
-
-int tcc_ir_opt_global_base_share_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_global_base_share(ctx->ir);
 }

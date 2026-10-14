@@ -36,7 +36,7 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
   if (n == 0)
     return 0;
   /* O2-only: elide observable-but-unreachable side effects (function never returns). */
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
 
   int has_jump = 0;
@@ -152,8 +152,7 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
 
   /* Only collapse when the final JUMP demonstrably loops back to a live earlier op. */
   {
-    IROperand jdest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[last_idx]);
-    int jt = (int)irop_get_imm64_ex(ir, jdest);
+    int jt = (int)tcc_ir_op_dest_imm(ir, &ir->compact_instructions[last_idx]);
     if (jt < 0 || jt >= n || jt > last_idx)
       return 0;
     if (nc_jump_exits(ir, n, last_idx, jt))
@@ -166,7 +165,7 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    int jt = (int)tcc_ir_op_dest_imm(ir, q);
     if (jt < 0)
       continue;
     if (nc_jump_exits(ir, n, last_idx, jt))
@@ -176,36 +175,17 @@ int tcc_ir_opt_noreturn_collapse(TCCIRState *ir)
   LOG_IR_GEN("NORETURN-COLLAPSE: collapsing function body to infinite loop "
              "(no RETURN, no calls/asm/volatile — side effects unobservable)");
 
-  for (int i = 0; i < n; i++)
-  {
-    ir->compact_instructions[i].op = TCCIR_OP_NOP;
-    ir->compact_instructions[i].is_jump_target = 0;
-  }
+  ir_opt_nop_body(ir, n);
 
-  ir->compact_instructions[0].op = TCCIR_OP_JUMP;
-  ir->compact_instructions[0].is_jump_target = 1;
-  IROperand self = irop_make_imm32(-1, 0, IROP_BTYPE_INT32);
-  tcc_ir_set_dest(ir, 0, self);
-  tcc_ir_set_src1(ir, 0, IROP_NONE);
-  tcc_ir_set_src2(ir, 0, IROP_NONE);
+  ir_opt_set_self_jump0(ir);
 
-  ir->ls.dirty_registers = 0;
-  ir->ls.dirty_float_registers = 0;
-  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
-    memset(ir->ls.live_regs_by_instruction, 0,
-           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
-  ir->leaffunc = 1;
+  ir_opt_reset_body_regs(ir);
   /* Suppress the unreachable `bx lr`: control never reaches the epilogue. */
   ir->noreturn = 1;
   /* Publish func_noreturn to callers only when the body had a real STORE (genuine work in an infinite loop). */
   if (has_store && tcc_state && tcc_state->cur_func_sym &&
-      tcc_state->cur_func_sym->type.ref)
+      tcc_state->cur_func_sym->type.ref && !tcc_state->cur_func_sym->a.weak)
     tcc_state->cur_func_sym->type.ref->f.func_noreturn = 1;
 
   return 1;
-}
-
-int tcc_ir_opt_noreturn_collapse_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_noreturn_collapse(ctx->ir);
 }

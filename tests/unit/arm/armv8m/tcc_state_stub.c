@@ -30,6 +30,27 @@
 #define USING_GLOBALS
 #include "tcc.h"
 
+/* Optimizer-only binaries do not link the frontend facts map. Weak defaults
+ * leave summaries unknown; suites linking symtab.c use the real map. */
+__attribute__((weak)) const SymLocalFacts *sym_facts_get(const Sym *s)
+{
+  static const SymLocalFacts empty;
+  (void)s;
+  return &empty;
+}
+__attribute__((weak)) SymLocalFacts *sym_facts_peek(const Sym *s)
+{
+  (void)s;
+  return NULL;
+}
+__attribute__((weak)) SymLocalFacts *sym_facts(Sym *s)
+{
+  static SymLocalFacts scratch;
+  (void)s;
+  memset(&scratch, 0, sizeof scratch);
+  return &scratch;
+}
+
 static TCCState ut_tcc_state_storage;
 TCCState *tcc_state = &ut_tcc_state_storage;
 
@@ -100,3 +121,23 @@ void tcc_state_free(TCCState *s)
   /* Do nothing. */
 }
 #endif /* UT_SSA_OPT_REAL */
+
+/* r0/r1 aggregate returns (arm-thumb-emit.c gfunc_regpair_ret, elfsym.c
+ * gfunc_regpair_address_sym and gfunc_regpair_asm_sym): weak, for the binaries that link either half
+ * without the other.  No function returns in r0/r1 in them. */
+__attribute__((weak)) int gfunc_regpair_ret(Sym *fsym)
+{
+  (void)fsym;
+  return 0;
+}
+
+__attribute__((weak)) Sym *gfunc_regpair_address_sym(Sym *sym)
+{
+  return sym;
+}
+
+__attribute__((weak)) Sym *gfunc_regpair_asm_sym(Sym *sym, int how)
+{
+  (void)how;
+  return sym;
+}

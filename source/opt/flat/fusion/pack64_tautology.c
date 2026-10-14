@@ -92,7 +92,7 @@ int tcc_ir_opt_pack64_tautology(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     int t = TCCIR_DECODE_VREG_TYPE(vr);
     int p = TCCIR_DECODE_VREG_POSITION(vr);
     if (t == TCCIR_VREG_TYPE_TEMP && p > max_temp_pos)
@@ -118,7 +118,7 @@ int tcc_ir_opt_pack64_tautology(TCCIRState *ir)
       continue;
     if (irop_config[q->op].has_src1)
     {
-      int32_t vr = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      int32_t vr = tcc_ir_op_src1_vreg(ir, q);
       if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -128,7 +128,7 @@ int tcc_ir_opt_pack64_tautology(TCCIRState *ir)
     }
     if (irop_config[q->op].has_src2)
     {
-      int32_t vr = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+      int32_t vr = tcc_ir_op_src2_vreg(ir, q);
       if (TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -138,7 +138,7 @@ int tcc_ir_opt_pack64_tautology(TCCIRState *ir)
     }
     if (irop_config[q->op].has_dest)
     {
-      int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
       int t = TCCIR_DECODE_VREG_TYPE(vr);
       int pos = TCCIR_DECODE_VREG_POSITION(vr);
       /* STORE-like ops use dest as an address sink, not a vreg def. */
@@ -170,10 +170,8 @@ int tcc_ir_opt_pack64_tautology(TCCIRState *ir)
     if (pk_dest.is_lval)
       continue;
 
-    IROperand lo_op = tcc_ir_op_get_src1(ir, q);
-    IROperand hi_op = tcc_ir_op_get_src2(ir, q);
-    int32_t lo_vr = irop_get_vreg(lo_op);
-    int32_t hi_vr = irop_get_vreg(hi_op);
+    int32_t lo_vr = tcc_ir_op_src1_vreg(ir, q);
+    int32_t hi_vr = tcc_ir_op_src2_vreg(ir, q);
     if (lo_vr < 0 || hi_vr < 0)
       continue;
 
@@ -190,8 +188,7 @@ int tcc_ir_opt_pack64_tautology(TCCIRState *ir)
     if (hi_def->op != TCCIR_OP_SHR)
       continue;
     IROperand hi_src = tcc_ir_op_get_src1(ir, hi_def);
-    IROperand hi_amt = tcc_ir_op_get_src2(ir, hi_def);
-    if (!irop_is_immediate(hi_amt) || irop_get_imm64_ex(ir, hi_amt) != 32)
+    if (!tcc_ir_op_src2_is_imm(ir, hi_def) || tcc_ir_op_src2_imm(ir, hi_def) != 32)
       continue;
     int32_t x_hi_vr = irop_get_vreg(hi_src);
     if (x_hi_vr < 0)
@@ -219,6 +216,22 @@ int tcc_ir_opt_pack64_tautology(TCCIRState *ir)
     if (!x_interval || !(x_interval->is_llong || x_interval->is_double))
       continue;
 
+    /* X must keep the value the halves were taken from: no redefinition of X
+     * and no join between the first read of X and the PACK64. */
+    int first_read = lo_def_i < hi_def_i ? lo_def_i : hi_def_i;
+    int x_redefined = first_read >= i;
+    for (int k = first_read + 1; k < i && !x_redefined; k++)
+    {
+      IRQuadCompact *kq = &ir->compact_instructions[k];
+      if (kq->is_jump_target)
+        x_redefined = 1;
+      else if (kq->op != TCCIR_OP_NOP && irop_config[kq->op].has_dest &&
+               irop_get_vreg(tcc_ir_op_get_dest(ir, kq)) == x_lo_vr)
+        x_redefined = 1;
+    }
+    if (x_redefined)
+      continue;
+
     LOG_IR_GEN("OPTIMIZE: PACK64 tautology at i=%d (X vr=%d)", i, x_lo_vr);
 
     /* Rewrite to ASSIGN dest = lo_src (the u64 lvalue reference to X). */
@@ -235,10 +248,10 @@ int tcc_ir_opt_pack64_tautology(TCCIRState *ir)
       for (int j = i + 1; j < n; j++)
       {
         IRQuadCompact *jq = &ir->compact_instructions[j];
+        if (jq->is_jump_target) /* before the NOP skip: a NOP can be the join */
+          break;
         if (jq->op == TCCIR_OP_NOP)
           continue;
-        if (jq->is_jump_target)
-          break;
         /* Stop on control-flow ops (preserve correctness across BBs). */
         if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF || jq->op == TCCIR_OP_IJUMP ||
             jq->op == TCCIR_OP_RETURNVOID || jq->op == TCCIR_OP_RETURNVALUE)
@@ -258,7 +271,7 @@ int tcc_ir_opt_pack64_tautology(TCCIRState *ir)
         if (irop_config[jq->op].has_dest)
         {
           IROperand d = tcc_ir_op_get_dest(ir, jq);
-          if (irop_get_vreg(d) == dest_vr)
+          if (irop_get_vreg(d) == dest_vr || irop_get_vreg(d) == x_lo_vr)
             break;
         }
       }
@@ -270,4 +283,3 @@ int tcc_ir_opt_pack64_tautology(TCCIRState *ir)
   tcc_free(temp_use_count);
   return changes;
 }
-int tcc_ir_opt_pack64_tautology_ex(IROptCtx *ctx) { return tcc_ir_opt_pack64_tautology(ctx->ir); }

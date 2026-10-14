@@ -1,0 +1,2 @@
+error:
+a __rodata_relative pointer is set only by the initializer of a static object

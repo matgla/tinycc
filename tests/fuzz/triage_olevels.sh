@@ -13,6 +13,11 @@
 #
 # Reproducers are saved to fuzz_triage_repros/.  tcc -O0 is normally CORRECT, so
 # an O0-WRONG row points at the front end / libc / O0 codegen, not an optimizer.
+#
+# Every triaged seed is also auto-filed as a docs/bugs/fuzz_<profile>_seed<N>.md
+# report (from the standard template, with the repro frozen into docs/bugs/repro/)
+# — skipped when a report with that filename already exists (see
+# tests/fuzz/bug_report.py).
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -45,6 +50,7 @@ KNOBS=(
   "-fno-dead-store-elim" "-fno-mla-fusion" "-fno-disp-fusion" "-fno-lea-fold"
   "-fno-jump-threading" "-fno-loop-unroll" "ENV:TCC_DISABLE_PASS=ssa:loop_rotate"
   "-fno-inline-functions|-fno-inline-small-functions"   # both: csmix inlining
+  "ENV:TCC_DISABLE_PASS=ra:licm"
   "ENV:TCC_NO_COALESCE=1"                                # graph coalescing
 )
 
@@ -132,9 +138,25 @@ triage_one() {
 
   printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' \
     "$s" "$cls" "${ref:-?}" "${o0:-?}" "${o1:-?}" "${o2:-?}" "${os:-?}" "$culprit"
+
+  # Auto-file a docs/bugs report for the finding from the standard template
+  # (docs/bugs/fuzz_<PROFILE>_seed<N>.md + a frozen repro copy).  Filename-
+  # based dedup: a no-op when the report already exists.  A "?" class means
+  # the divergence did not reproduce in this standalone re-run (all levels
+  # agree, ref unknown or matching) — the table row records it, but there is
+  # nothing confirmed enough to file.  Best-effort — a filing failure must
+  # never kill the triage row — and quiet: stdout carries only the table row,
+  # so the helper's one status line goes to stderr.
+  if [ "$cls" != "?" ]; then
+    python3 "$ROOT/tests/fuzz/bug_report.py" \
+        --profile "$PROFILE" --seed "$s" --class "$cls" \
+        --ref "${ref:-?}" --o0 "${o0:-?}" --o1 "${o1:-?}" \
+        --o2 "${o2:-?}" --os "${os:-?}" --culprit="$culprit" \
+        --src "$src" --via "triage_olevels.sh ${LO}-${HI}" >&2 || :
+  fi
 }
 export -f sweep_one triage_one val
-export REPRO PROFILE SEEDPFX
+export REPRO PROFILE SEEDPFX LO HI
 export KNOBS_STR="${KNOBS[*]}"   # arrays don't survive `export -f`; pass as a string
 
 # 1) enumerate failing seeds (unless an explicit SEEDS list was given)
@@ -193,4 +215,7 @@ echo "$FAILS" | xargs -P "$JOBS" -I{} bash -c 'triage_one "$1"' _ {} \
 echo >> "$OUT"
 echo "Repros in tests/fuzz/fuzz_triage_repros/.  Per-seed serial repro:" >> "$OUT"
 echo '`python3 scripts/diff_olevels.py --seed N --require-qemu`' >> "$OUT"
+echo "Each triaged seed is also auto-filed as a bug report in docs/bugs/" >> "$OUT"
+echo '(fuzz_<profile>_seed<N>.md, skipped when one already exists); fixing' >> "$OUT"
+echo 'sessions delete them per the usual docs/bugs/README.md workflow.' >> "$OUT"
 echo "Report written to $OUT" >&2

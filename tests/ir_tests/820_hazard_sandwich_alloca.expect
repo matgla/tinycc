@@ -1,0 +1,10 @@
+load 1005
+expr 12024
+cmp 0
+cmp2 9
+glob 5010
+pure 5002
+loop 633
+loopld 744
+local 1006
+xor 8000

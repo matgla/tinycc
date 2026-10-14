@@ -1,0 +1,5 @@
+primask before=0 inside=1 after=0 counter=5
+nested inside=1 still=1 restored=0 counter=7
+basepri=0x40 then 0
+twice=42 sum=42
+hits=38 spin=5 v=7

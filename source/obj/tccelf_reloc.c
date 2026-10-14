@@ -338,7 +338,7 @@ int build_got(TCCState *s1)
 #else
   section_ptr_add(s1->got, 3 * PTR_SIZE * 2);
 #endif
-  return set_elf_sym(symtab_section, 0, 0, ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), 0, s1->got->sh_num,
+  return set_elf_sym(symtab_section, 0, 0, ELFW(ST_INFO)(STB_GLOBAL, STT_OBJECT), STV_HIDDEN, s1->got->sh_num,
                      "_GLOBAL_OFFSET_TABLE_");
 }
 
@@ -395,7 +395,10 @@ static struct sym_attr *put_got_entry(TCCState *s1, int dyn_reloc_type, int sym_
 
   if (s1->dynsym)
   {
-    if (ELFW(ST_BIND)(sym->st_info) == STB_LOCAL)
+    /* A hidden definition takes the STB_LOCAL path too: through a dynamic
+       symbol it would be exported (and preemptible). */
+    if (ELFW(ST_BIND)(sym->st_info) == STB_LOCAL ||
+        (elf_sym_is_module_local(sym) && sym->st_shndx < SHN_LORESERVE))
     {
       /* Hack alarm.  We don't want to emit dynamic symbols
          and symbol based relocs for STB_LOCAL symbols, but rather
@@ -601,6 +604,30 @@ ST_FUNC int set_global_sym(TCCState *s1, const char *name, Section *sec, addr_t 
   return set_elf_sym(symtab_section, offs, 0, ELFW(ST_INFO)(name ? STB_GLOBAL : STB_LOCAL, STT_NOTYPE), 0, shn, name);
 }
 
+/* tcc's own boundary symbols are defaults: a linker script that assigns the
+ * same name owns it (GNU ld lets script assignments win).  Defining both was
+ * "'__fini_array_start' defined twice" against PROVIDE_HIDDEN(... = .).
+ * They are hidden: each module's bounds are its own, so a shared library must
+ * neither export them nor bind its references to another module's (GNU ld's
+ * scripts PROVIDE_HIDDEN them).  A definition from an input keeps its own
+ * visibility -- the merge in set_elf_sym would otherwise hide it. */
+static void set_default_linker_sym(TCCState *s1, const char *name, Section *sec, addr_t offs)
+{
+  int shn, sym_index;
+  if (ld_script_defines_symbol(s1, name))
+    return;
+  sym_index = find_elf_sym(symtab_section, name);
+  if (sym_index && ((ElfW(Sym) *)symtab_section->data)[sym_index].st_shndx != SHN_UNDEF)
+  {
+    set_global_sym(s1, name, sec, offs);
+    return;
+  }
+  shn = sec ? sec->sh_num : offs ? SHN_ABS : SHN_UNDEF;
+  if (sec && offs == -1)
+    offs = sec->data_offset;
+  set_elf_sym(symtab_section, offs, 0, ELFW(ST_INFO)(STB_GLOBAL, STT_NOTYPE), STV_HIDDEN, shn, name);
+}
+
 static void add_init_array_defines(TCCState *s1, const char *section_name)
 {
   Section *s;
@@ -617,9 +644,9 @@ static void add_init_array_defines(TCCState *s1, const char *section_name)
     end_offset = s->data_offset;
   }
   snprintf(buf, sizeof(buf), "__%s_start", section_name + 1);
-  set_global_sym(s1, buf, s, 0);
+  set_default_linker_sym(s1, buf, s, 0);
   snprintf(buf, sizeof(buf), "__%s_end", section_name + 1);
-  set_global_sym(s1, buf, s, end_offset);
+  set_default_linker_sym(s1, buf, s, end_offset);
 }
 
 ST_FUNC void add_array(TCCState *s1, const char *sec, int c)
@@ -1090,9 +1117,16 @@ static void tcc_add_linker_symbols(TCCState *s1)
   int i;
   Section *s;
 
-  set_global_sym(s1, "_etext", text_section, -1);
-  set_global_sym(s1, "_edata", data_section, -1);
-  set_global_sym(s1, "_end", bss_section, -1);
+  /* What a __rodata_relative pointer is an offset from (rodata_rel.c);
+   * defined only for a module that names it. */
+  {
+    int i_base = find_elf_sym(symtab_section, "__tcc_rodata_base");
+    if (i_base && ((ElfW(Sym) *)symtab_section->data)[i_base].st_shndx == SHN_UNDEF)
+      set_default_linker_sym(s1, "__tcc_rodata_base", rodata_section, 0);
+  }
+  set_default_linker_sym(s1, "_etext", text_section, -1);
+  set_default_linker_sym(s1, "_edata", data_section, -1);
+  set_default_linker_sym(s1, "_end", bss_section, -1);
 #if TARGETOS_OpenBSD
   set_global_sym(s1, "__executable_start", NULL, ELF_START_ADDR);
 #endif
@@ -1128,9 +1162,9 @@ static void tcc_add_linker_symbols(TCCState *s1)
         p++;
       }
       snprintf(buf, sizeof(buf), "__start_%s", p0);
-      set_global_sym(s1, buf, s, 0);
+      set_default_linker_sym(s1, buf, s, 0);
       snprintf(buf, sizeof(buf), "__stop_%s", p0);
-      set_global_sym(s1, buf, s, -1);
+      set_default_linker_sym(s1, buf, s, -1);
     }
   next_sec:;
   }

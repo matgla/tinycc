@@ -1,0 +1,12 @@
+ok-ok err=0
+  node0 name=10 inst=20 tok=30 used=ffffffff
+  node1 name=95 inst=0 tok=180 used=00000000
+err-first err=7
+  node0 name=10 inst=20 tok=30 used=ffffffff
+  node1 name=95 inst=0 tok=180 used=00000000
+err-second err=4665
+  node0 name=12 inst=22 tok=32 used=ffffffff
+  node1 name=95 inst=0 tok=180 used=00000000
+no-second err=0
+  node0 name=13 inst=23 tok=33 used=ffffffff
+  node1 name=95 inst=0 tok=180 used=00000000

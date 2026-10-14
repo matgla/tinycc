@@ -35,7 +35,7 @@ int tcc_ir_opt_global_init_prop(TCCIRState *ir)
     /* LOAD src1 deref becomes ASSIGN; other ops fold an is_sym&&is_lval deref in place. */
     for (int slot = 0; slot < 2; slot++)
     {
-      IROperand opnd = (slot == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand opnd = tcc_ir_op_get_src1_or_2(ir, q, slot != 0);
       if (!opnd.is_sym || !opnd.is_lval)
         continue;
 
@@ -211,7 +211,7 @@ int tcc_ir_opt_global_init_prop(TCCIRState *ir)
           if (!result_is_unsigned && read_size < 8)
           {
             int shift = (8 - read_size) * 8;
-            val = (int64_t)(val << shift) >> shift;
+            val = (int64_t)((uint64_t)val << shift) >> shift;
           }
         }
 

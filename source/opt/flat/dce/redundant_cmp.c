@@ -126,11 +126,18 @@ static int rcmp_is_terminator(TccIrOp op)
 /* Branch targets, recomputed from the branches actually present.  The
  * IRQuadCompact is_jump_target bit outlives the branch that set it, so it is a
  * superset -- fine as the fallback for a computed jump, whose target list
- * cannot be enumerated, but too coarse to gate on by itself. */
-static uint8_t *rcmp_build_entry_map(TCCIRState *ir, int *out_indirect)
+ * cannot be enumerated, but too coarse to gate on by itself.
+ *
+ * `*out_multi` marks the indices targeted by two or more JUMP/JUMPIFs, so
+ * "reached only by our JUMPIF" can be told from "reached by several branches"
+ * without rescanning the function per compare.  The pass only ever turns
+ * CMPs into NOPs, so neither map goes stale while it runs. */
+static uint8_t *rcmp_build_entry_map(TCCIRState *ir, int *out_indirect, uint8_t **out_multi)
 {
   int n = ir->next_instruction_index;
-  uint8_t *entry = tcc_mallocz((size_t)(n + 7) / 8);
+  size_t bytes = (size_t)(n + 7) / 8;
+  uint8_t *entry = tcc_mallocz(bytes * 2);
+  uint8_t *multi = entry + bytes;
   int indirect = 0;
 
   for (int j = 0; j < n; j++)
@@ -148,39 +155,29 @@ static uint8_t *rcmp_build_entry_map(TCCIRState *ir, int *out_indirect)
       continue;
     int t = (int)d.u.imm32;
     if (t >= 0 && t < n)
-      entry[t / 8] |= (uint8_t)(1 << (t % 8));
+    {
+      uint8_t bit = (uint8_t)(1 << (t % 8));
+      if (entry[t / 8] & bit)
+        multi[t / 8] |= bit;
+      entry[t / 8] |= bit;
+    }
   }
 
+  /* The exact target sets are only consulted when there is no computed jump
+   * (the taken edge is refused otherwise), so widening `entry` here is safe. */
   if (indirect)
     for (int j = 0; j < n; j++)
       if (ir->compact_instructions[j].is_jump_target)
         entry[j / 8] |= (uint8_t)(1 << (j % 8));
 
   *out_indirect = indirect;
+  *out_multi = multi;
   return entry;
 }
 
 static inline int rcmp_is_entry(const uint8_t *entry, int idx)
 {
   return (entry[idx / 8] >> (idx % 8)) & 1;
-}
-
-/* Count the branches that target `idx`, so "reached only by our JUMPIF" can be
- * distinguished from "reached by several branches". */
-static int rcmp_target_count(TCCIRState *ir, int idx)
-{
-  int n = ir->next_instruction_index;
-  int count = 0;
-  for (int j = 0; j < n; j++)
-  {
-    IRQuadCompact *q = &ir->compact_instructions[j];
-    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
-      continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (!irop_is_none(d) && (int)d.u.imm32 == idx)
-      count++;
-  }
-  return count;
 }
 
 int tcc_ir_opt_redundant_cmp(TCCIRState *ir)
@@ -190,7 +187,8 @@ int tcc_ir_opt_redundant_cmp(TCCIRState *ir)
     return 0;
 
   int indirect = 0;
-  uint8_t *entry = rcmp_build_entry_map(ir, &indirect);
+  uint8_t *multi;
+  uint8_t *entry = rcmp_build_entry_map(ir, &indirect, &multi);
   int changes = 0;
 
   for (int i = 0; i < n; i++)
@@ -222,7 +220,9 @@ int tcc_ir_opt_redundant_cmp(TCCIRState *ir)
     if (!indirect && L > j && L < n)
     {
       int m = rcmp_next_real(ir, L);
-      int ok = (m >= 0 && rcmp_target_count(ir, L) == 1);
+      /* Exactly one branch targets L: without a computed jump `entry` holds
+       * the direct targets only, so this is "targeted, and not twice". */
+      int ok = (m >= 0 && rcmp_is_entry(entry, L) && !rcmp_is_entry(multi, L));
       /* No other branch may land inside the NOP run we walk over. */
       for (int k = L + 1; ok && k <= m; k++)
         if (rcmp_is_entry(entry, k))

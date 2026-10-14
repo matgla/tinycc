@@ -14,31 +14,20 @@
 
 /* Requires ir.h (IROperand, IROP_TAG_IMM32) to be included first. */
 
-/* Non-lval inline 32-bit immediate: tag is IMM32 specifically (not I64/F32/F64)
- * and not an lval.  Narrower than the DSL IR_CONSTRAINT_IMM, which also matches
- * those wider tags — use this when a rewrite reads the raw .u.imm32 field. */
+/* Non-lval IMM32 (not I64/F32/F64, unlike the DSL's BIND_IMM): safe to read .u.imm32. */
 static inline int is_imm32(IROperand op)
 {
   return op.tag == IROP_TAG_IMM32 && !op.is_lval;
 }
 
 /* Ops that may clobber arbitrary memory / re-enter control flow, invalidating a
- * backward value-forwarding scan: calls, inline asm, VLA growth, setjmp family. */
+ * backward value-forwarding scan: calls (__builtin_apply included), inline asm
+ * and its operand markers, VLA growth and SP save/restore, the setjmp family. */
 static inline int ssa_op_is_call_barrier(int op)
 {
-  switch (op) {
-  case TCCIR_OP_FUNCCALLVAL:
-  case TCCIR_OP_FUNCCALLVOID:
-  case TCCIR_OP_INLINE_ASM:
-  case TCCIR_OP_VLA_ALLOC:
-  case TCCIR_OP_SETJMP:
-  case TCCIR_OP_LONGJMP:
-  case TCCIR_OP_NL_SETJMP:
-  case TCCIR_OP_NL_LONGJMP:
-    return 1;
-  default:
-    return 0;
-  }
+  return ir_op_has(op, IR_HZ_FROM_OP & ~(IR_HZ_MEM_READ | IR_HZ_MEM_WRITE | IR_HZ_UPDATES_SRC | IR_HZ_FLAGS_SET |
+                                          IR_HZ_FLAGS_READ | IR_HZ_BRANCH | IR_HZ_RETURN | IR_HZ_TRAP | IR_HZ_HINT |
+                                          IR_HZ_CALL_PARAM | IR_HZ_CALL_SEQ | IR_HZ_CHAIN));
 }
 
 /* The operand-carrier ops of an inline-asm block; some scans treat them as
@@ -59,13 +48,13 @@ static inline int is_i64f64(IROperand op)
 static inline int ssa_op_reads_vreg(TCCIRState *ir, IRQuadCompact *q, int32_t vr)
 {
   if (irop_config[q->op].has_src1 &&
-      irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vr)
+      tcc_ir_op_src1_vreg(ir, q) == vr)
     return 1;
   if (irop_config[q->op].has_src2 &&
-      irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vr)
+      tcc_ir_op_src2_vreg(ir, q) == vr)
     return 1;
   if (q->op == TCCIR_OP_MLA &&
-      irop_get_vreg(tcc_ir_op_get_accum(ir, q)) == vr)
+      tcc_ir_op_accum_vreg(ir, q) == vr)
     return 1;
   return 0;
 }
@@ -116,8 +105,7 @@ static inline IROperand ssa_cprop_imm_for_use(IROperand imm, IROperand use)
 static inline int ssa_cprop_imm_other_operand_const(TCCIRState *ir, IRQuadCompact *q,
                                                      int32_t old_vr, int src_slot)
 {
-  IROperand other = src_slot == 1 ? tcc_ir_op_get_src2(ir, q)
-                                  : tcc_ir_op_get_src1(ir, q);
+  IROperand other = tcc_ir_op_get_src1_or_2(ir, q, src_slot == 1);
   if (irop_get_vreg(other) == old_vr)
     return 1;
   return irop_is_immediate(other) && !other.is_lval;

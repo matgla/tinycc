@@ -306,6 +306,25 @@ static int apply_patches_to_buffer(Section *sec, int *patch_idx, uint32_t buf_st
   return applied;
 }
 
+/* Largest prefix of the n-byte buffer starting at section offset buf_start that
+ * does not cut a pending 4-byte patch in half.  Patches are sorted; the first
+ * one starting inside the buffer and ending past it limits the prefix. */
+static size_t patch_safe_prefix(Section *sec, int patch_idx, uint32_t buf_start, size_t n)
+{
+  uint32_t buf_end = buf_start + n;
+  int i;
+  for (i = patch_idx; i < sec->nb_reloc_patches && sec->reloc_patch_offsets[i] < buf_end; i++)
+  {
+    uint32_t offset = sec->reloc_patch_offsets[i];
+    if (offset >= buf_start && offset + 4 > buf_end)
+    {
+      size_t cut = offset - buf_start;
+      return cut ? cut : n; /* cut == 0: patch wider than what is left, give up */
+    }
+  }
+  return n;
+}
+
 /* Write a lazy section directly to output file without materializing to memory.
  * This avoids the memory allocation for sections that are only written to output.
  * Applies relocation patches inline during streaming if present.
@@ -351,9 +370,19 @@ int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
         size_t from_data = sec->data_allocated - output_pos;
         if (from_data > gap)
           from_data = gap;
-        fwrite(sec->data + output_pos, 1, from_data, f);
-        output_pos += from_data;
         gap -= from_data;
+        while (from_data > 0)
+        {
+          n = from_data < sizeof(buffer) ? from_data : sizeof(buffer);
+          if (patch_idx < sec->nb_reloc_patches)
+            n = patch_safe_prefix(sec, patch_idx, output_pos, n);
+          memcpy(buffer, sec->data + output_pos, n);
+          if (patch_idx < sec->nb_reloc_patches)
+            apply_patches_to_buffer(sec, &patch_idx, output_pos, output_pos + n, buffer, n);
+          fwrite(buffer, 1, n, f);
+          output_pos += n;
+          from_data -= n;
+        }
       }
 
       /* Fill remaining gap with zeros */
@@ -386,6 +415,18 @@ int section_write_streaming(TCCState *s1, Section *sec, FILE *f)
       {
         fprintf(stderr, "tcc: short read from '%s'\n", c->source_path);
         break;
+      }
+
+      /* Do not let the buffer end inside a patch: give the tail back to the
+         next read so all four bytes are in memory when it is applied */
+      if (patch_idx < sec->nb_reloc_patches)
+      {
+        size_t keep = patch_safe_prefix(sec, patch_idx, c->dest_offset + chunk_written, n);
+        if (keep < n)
+        {
+          lseek(fd, -(off_t)(n - keep), SEEK_CUR);
+          n = keep;
+        }
       }
 
       /* Apply any patches that fall within this buffer */

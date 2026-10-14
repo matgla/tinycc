@@ -23,7 +23,8 @@
 
 OPT_GEN_FLAT(self_copy_elim, TCCIR_OP_FUNCCALLVAL)
 {
-  PATTERN(.constraints = { .src1 = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
 
   Sym *callee = irop_get_sym_ex(ir, src1);
   if (!callee)
@@ -61,6 +62,7 @@ OPT_GEN_FLAT(self_copy_elim, TCCIR_OP_FUNCCALLVAL)
   {
     q->op = TCCIR_OP_NOP;
   }
+  tcc_ir_vreg_index_dirty(ir);
   return 1;
 }
 
@@ -71,9 +73,15 @@ const IROptGen self_copy_gens[] = {
 
 const int self_copy_gens_count = sizeof(self_copy_gens) / sizeof(self_copy_gens[0]);
 
+/* Every memcpy/memmove call compares its two pointers as expressions, and
+ * each comparison asks for single defs and reaching defs: counts built once
+ * per pass, rebuilt after a call is dropped. */
 int tcc_ir_opt_self_copy_elim_ex(IROptCtx *ctx)
 {
-  return tcc_ir_opt_run_gens(ctx, self_copy_gens, self_copy_gens_count);
+  int vidx = tcc_ir_vreg_index_open(ctx->ir);
+  int changes = tcc_ir_opt_run_gens(ctx, self_copy_gens, self_copy_gens_count);
+  tcc_ir_vreg_index_close(ctx->ir, vidx);
+  return changes;
 }
 
 int tcc_ir_opt_self_copy_elim(TCCIRState *ir)
@@ -82,7 +90,7 @@ int tcc_ir_opt_self_copy_elim(TCCIRState *ir)
     return 0;
   IROptCtx ctx;
   tcc_ir_opt_ctx_init(&ctx, ir);
-  int changes = tcc_ir_opt_run_gens(&ctx, self_copy_gens, self_copy_gens_count);
+  int changes = tcc_ir_opt_self_copy_elim_ex(&ctx);
   tcc_ir_opt_ctx_free(&ctx);
   return changes;
 }

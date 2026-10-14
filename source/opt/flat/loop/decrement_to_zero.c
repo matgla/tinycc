@@ -37,13 +37,9 @@ int dtz_try_region(TCCIRState *ir, int start, int end, int header_idx,
     if (q->op != TCCIR_OP_ADD)
       break;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    IROperand src2 = tcc_ir_op_get_src2(ir, q);
-
-    int d_vr = irop_get_vreg(dest);
-    int s1_vr = irop_get_vreg(src1);
-    if (d_vr >= 0 && d_vr == s1_vr && irop_is_immediate(src2) && irop_get_imm64_ex(ir, src2) == 1 &&
+    int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
+    int32_t s1_vr = tcc_ir_op_src1_vreg(ir, q);
+    if (d_vr >= 0 && d_vr == s1_vr && tcc_ir_op_src2_is_imm(ir, q) && tcc_ir_op_src2_imm(ir, q) == 1 &&
         TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR)
     {
       iv_def_idx = i;
@@ -67,9 +63,8 @@ int dtz_try_region(TCCIRState *ir, int start, int end, int header_idx,
     if (q->op != TCCIR_OP_CMP)
       continue;
 
-    IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    IROperand s2 = tcc_ir_op_get_src2(ir, q);
-    if (irop_get_vreg(s1) != iv_vr || !irop_is_immediate(s2))
+    int32_t s1_vr = tcc_ir_op_src1_vreg(ir, q);
+    if (s1_vr != iv_vr || !tcc_ir_op_src2_is_imm(ir, q))
       continue;
 
     int jq_idx = i + 1;
@@ -78,12 +73,12 @@ int dtz_try_region(TCCIRState *ir, int start, int end, int header_idx,
     if (jq_idx >= n || ir->compact_instructions[jq_idx].op != TCCIR_OP_JUMPIF)
       continue;
 
-    IROperand cond = tcc_ir_op_get_src1(ir, &ir->compact_instructions[jq_idx]);
-    int cond_tok = (int)irop_get_imm64_ex(ir, cond);
+    int64_t cond_imm = tcc_ir_op_src1_imm(ir, &ir->compact_instructions[jq_idx]);
+    int cond_tok = (int)cond_imm;
     if (cond_tok != 0x9c) /* TOK_LT (<S) */
       continue;
 
-    limit_val = (int)irop_get_imm64_ex(ir, s2);
+    limit_val = (int)tcc_ir_op_src2_imm(ir, q);
     if (limit_val <= 0)
       continue;
 
@@ -105,9 +100,8 @@ int dtz_try_region(TCCIRState *ir, int start, int end, int header_idx,
     if (q->op != TCCIR_OP_ASSIGN)
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    IROperand src1 = tcc_ir_op_get_src1(ir, q);
-    if (irop_get_vreg(dest) == iv_vr && irop_is_immediate(src1) && irop_get_imm64_ex(ir, src1) == 0)
+    int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
+    if (dest_vr == iv_vr && tcc_ir_op_src1_is_imm(ir, q) && tcc_ir_op_src1_imm(ir, q) == 0)
     {
       init_idx = i;
       break;
@@ -130,8 +124,8 @@ int dtz_try_region(TCCIRState *ir, int start, int end, int header_idx,
         continue;
       if (i == be_cmp_idx)
         continue;
-      IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      if (irop_get_vreg(s1) != iv_vr)
+      int32_t s1_vr = tcc_ir_op_src1_vreg(ir, q);
+      if (s1_vr != iv_vr)
         continue;
 
       int jq_idx = i + 1;
@@ -161,11 +155,11 @@ int dtz_try_region(TCCIRState *ir, int start, int end, int header_idx,
         continue;
       if (q->op == TCCIR_OP_ASSIGN)
       {
-        IROperand s = tcc_ir_op_get_src1(ir, q);
-        if (irop_get_vreg(s) == iv_vr)
+        int32_t s_vr = tcc_ir_op_src1_vreg(ir, q);
+        if (s_vr == iv_vr)
         {
-          IROperand d = tcc_ir_op_get_dest(ir, q);
-          copy_through_vr = irop_get_vreg(d);
+          int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
+          copy_through_vr = d_vr;
         }
       }
       break;
@@ -178,12 +172,12 @@ int dtz_try_region(TCCIRState *ir, int start, int end, int header_idx,
         IRQuadCompact *q = &ir->compact_instructions[i];
         if (q->op == TCCIR_OP_NOP || i == iv_def_idx)
           continue;
-        if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == copy_through_vr)
+        if (irop_config[q->op].has_src1 && tcc_ir_op_src1_vreg(ir, q) == copy_through_vr)
         {
           other_uses++;
           break;
         }
-        if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == copy_through_vr)
+        if (irop_config[q->op].has_src2 && tcc_ir_op_src2_vreg(ir, q) == copy_through_vr)
         {
           other_uses++;
           break;
@@ -219,14 +213,14 @@ int dtz_try_region(TCCIRState *ir, int start, int end, int header_idx,
 
       if (copy_through_vr >= 0 && q->op == TCCIR_OP_ASSIGN && i >= iv_def_idx - 3 && i < iv_def_idx)
       {
-        IROperand s = tcc_ir_op_get_src1(ir, q);
-        if (irop_get_vreg(s) == iv_vr)
+        int32_t s_vr = tcc_ir_op_src1_vreg(ir, q);
+        if (s_vr == iv_vr)
           continue;
       }
 
-      if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == iv_vr)
+      if (irop_config[q->op].has_src1 && tcc_ir_op_src1_vreg(ir, q) == iv_vr)
         other_uses++;
-      if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == iv_vr)
+      if (irop_config[q->op].has_src2 && tcc_ir_op_src2_vreg(ir, q) == iv_vr)
         other_uses++;
     }
 

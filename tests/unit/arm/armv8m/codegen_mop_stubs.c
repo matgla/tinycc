@@ -42,6 +42,7 @@ typedef struct CgStubKnobs
   unsigned int scratch_regs_pushed;
   int insn_scratch_count;
   unsigned short insn_scratch_saves_mask;
+  int return_value_bytes;
 } CgStubKnobs;
 
 static CgStubKnobs cgstub_knobs;
@@ -118,6 +119,11 @@ const CgStubCall *cgstub_nth_call_any(int n)
   if (n < 0 || n >= cgstub_log_count)
     return NULL;
   return &cgstub_log[n];
+}
+
+void cgstub_set_return_value_bytes(int bytes)
+{
+  cgstub_knobs.return_value_bytes = bytes;
 }
 
 void cgstub_set_branch_size_16(int enable)
@@ -206,6 +212,11 @@ void tcc_gen_machine_data_processing_mop_flags(MachineOperand src1, MachineOpera
 {
   (void)barrel_shift;
   cgstub_record("data_processing_mop_flags", op, dest, src1, src2);
+}
+
+int tcc_gen_machine_ands_is_direct(MachineOperand src2)
+{
+  return !src2.is_64bit && (src2.kind != MACH_OP_IMM || (!src2.needs_deref && src2.u.imm.val <= 0xff));
 }
 
 void tcc_gen_machine_cmp_eq64_mop(MachineOperand src1, MachineOperand src2)
@@ -520,9 +531,10 @@ int tcc_gen_machine_pool_entries_total(void)
   return 0;
 }
 
-void tcc_gen_machine_align_branch_target(int align)
+void tcc_gen_machine_align_branch_target(int align, int widen_from)
 {
   (void)align;
+  (void)widen_from;
   /* No instruction stream here, so nothing to pad. */
 }
 
@@ -531,6 +543,21 @@ int tcc_gen_machine_cbz_forward_ok(int32_t target_ir, int current_ir_idx)
   (void)target_ir;
   (void)current_ir_idx;
   return 0; /* dispatch tests exercise the non-fused path */
+}
+
+void tcc_gen_machine_cas_branch_offer(MachineOperand lhs, MachineOperand rhs, int cond, int target_ir, int cmp_ir)
+{
+  (void)lhs;
+  (void)rhs;
+  (void)cond;
+  (void)target_ir;
+  (void)cmp_ir;
+}
+
+int tcc_gen_machine_cas_branch_taken(int *branch_addr)
+{
+  (void)branch_addr;
+  return 0; /* no inline atomics here: the CMP and JUMPIF emit as usual */
 }
 
 void tcc_gen_machine_dry_run_set_rehearsal(int on)
@@ -623,6 +650,14 @@ void tcc_gen_machine_func_call_mop(MachineOperand func_mop, IROperand call_id, M
 void tcc_gen_machine_return_value_mop(MachineOperand src, TccIrOp op)
 {
   cgstub_record("return_value_mop", op, CGSTUB_NO_OP, src, CGSTUB_NO_OP);
+  ind += cgstub_knobs.return_value_bytes;
+}
+
+void thumb_call_layout_abi_flags(TCCAbiCallLayout *layout, Sym *sym)
+{
+  (void)sym;
+  layout->hard_float = 0;
+  layout->is_variadic = 0;
 }
 
 /* AAPCS-shaped but minimal: first 4 words in R0-R3, the rest on the outgoing
@@ -788,6 +823,23 @@ uint32_t tcc_gen_machine_dry_run_get_scratch_regs_pushed(void)
   return cgstub_knobs.scratch_regs_pushed;
 }
 
+/* Each pushed register counts as one save (the knob is a mask). */
+int tcc_gen_machine_dry_run_get_scratch_push_count(void)
+{
+  return __builtin_popcount(cgstub_knobs.scratch_regs_pushed);
+}
+
+/* The discovery run's prologue-push model: nothing to model without a backend. */
+void tcc_gen_machine_dry_run_set_prolog_pushes(uint32_t regs)
+{
+  (void)regs;
+}
+
+uint32_t tcc_gen_machine_dry_run_get_prolog_pushes_used(void)
+{
+  return 0;
+}
+
 int tcc_gen_machine_dry_run_get_max_nested_saves(void)
 {
   cgstub_record("dry_run_get_max_nested_saves", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
@@ -810,6 +862,17 @@ int tcc_gen_machine_insn_scratch_count(void)
   cgstub_record("insn_scratch_count", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
   cgstub_knobs.insn_scratch_count = 0; /* one-shot */
   return v;
+}
+
+/* Read before the one-shot saves mask: one save per register in it. */
+int tcc_gen_machine_insn_scratch_save_count(void)
+{
+  return __builtin_popcount(cgstub_knobs.insn_scratch_saves_mask);
+}
+
+uint32_t tcc_gen_machine_insn_scratch_exclude(void)
+{
+  return 0;
 }
 
 uint16_t tcc_gen_machine_insn_scratch_saves_mask(void)
@@ -889,9 +952,18 @@ void tcc_gen_machine_imm_cache_invalidate_live(uint32_t live_mask)
  * Static chain (nested functions)
  * ============================================================================ */
 
-void tcc_gen_machine_set_chain(void)
+void tcc_gen_machine_set_chain(int level)
 {
+  (void)level;
   cgstub_record("set_chain", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
+}
+
+void tcc_gen_machine_chain_reset(void)
+{
+}
+
+void tcc_gen_machine_flush_chain(void)
+{
 }
 
 void tcc_gen_machine_restore_chain(void)
@@ -899,8 +971,9 @@ void tcc_gen_machine_restore_chain(void)
   cgstub_record("restore_chain", (TccIrOp)-1, CGSTUB_NO_OP, CGSTUB_NO_OP, CGSTUB_NO_OP);
 }
 
-void tcc_gen_machine_init_chain_slot(IROperand src1)
+void tcc_gen_machine_init_chain_slot(IROperand src1, int level)
 {
+  (void)level;
   cgstub_push("init_chain_slot", (TccIrOp)-1, MACH_OP_NONE, -1, MACH_OP_NONE, irop_get_vreg(src1), MACH_OP_NONE, -1,
              0, 0);
 }

@@ -23,6 +23,44 @@
 
 #include "gen_priv.h"
 
+/* GNU cast to union: the type of the member whose unqualified type is
+   compatible with the lvalue-converted type of vtop (arrays and functions
+   decay to pointers), unqualified.  As in gcc, no such member is an error. */
+static CType union_cast_member_type(CType *union_type)
+{
+  CType op = vtop->type;
+  Sym *f;
+
+  if (op.t & (VT_ARRAY | VT_VLA))
+  {
+    op = *pointed_type(&vtop->type);
+    mk_pointer(&op);
+  }
+  else if ((op.t & VT_BTYPE) == VT_FUNC)
+    mk_pointer(&op);
+
+  for (f = union_type->ref->next; f; f = f->next)
+  {
+    if (!(f->type.t & VT_BITFIELD) && compare_types(&f->type, &op, 1))
+    {
+      CType mtype = f->type;
+      mtype.t &= ~(VT_CONSTANT | VT_VOLATILE);
+      return mtype;
+    }
+  }
+  tcc_error("cast to union type from type not present in union");
+}
+
+/* vtop is a load-time constant a static initializer accepts: a constant or
+   symbol address, or an anonymous object (compound literal). */
+static int is_init_constant(SValue *sv)
+{
+  if ((sv->r & (VT_VALMASK | VT_LVAL)) == VT_CONST)
+    return 1;
+  return (sv->r & VT_VALMASK) == VT_CONST && (sv->r & (VT_SYM | VT_LVAL)) == (VT_SYM | VT_LVAL) &&
+         sv->sym->v >= SYM_FIRST_ANOM;
+}
+
 /* Parenthesized expression, cast, compound literal, or statement expression.
    Extracted from unary_primary() to keep its locals out of the main frame.
    Returns 1 for sizeof/alignof type-only operand (early return), 0 otherwise. */
@@ -53,7 +91,14 @@ __attribute__((noinline)) int unary_paren(void)
         r |= VT_LVAL;
       memset(&ad, 0, sizeof(AttributeDef));
       int lit_ir_start = tcc_state->ir ? tcc_state->ir->next_instruction_index : 0;
+      /* sizeof/typeof operand at file scope: DATA_ONLY_WANTED makes the sign
+       * bit win over the no-eval count, so the literal would still be laid
+       * out in .data.  Drop it so only the type is completed. */
+      int saved_nocode = nocode_wanted;
+      if (global_expr && unevaluated_operand)
+        nocode_wanted &= ~DATA_ONLY_WANTED;
       decl_initializer_alloc(&type, &ad, r, 1, 0, 0);
+      nocode_wanted = saved_nocode;
       /* A fully-constant vector compound literal only ever writes its own
        * brand-new stack object, whose address nothing else can hold yet.  Mark
        * the materialising stores/copy so an in-flight vector recipe is not
@@ -68,42 +113,62 @@ __attribute__((noinline)) int unary_paren(void)
     }
     else if (IS_UNION(type.t))
     {
-      /* GCC extension: (union_type) scalar_expr */
+      /* GCC extension: (union_type) expr */
       unary();
 
-      if ((vtop->type.t & VT_BTYPE) == VT_STRUCT || (vtop->type.t & (VT_ARRAY | VT_VLA)))
+      if ((vtop->type.t & VT_BTYPE) == VT_STRUCT && compare_types(&type, &vtop->type, 1))
       {
+        /* the operand already has the union type */
         gen_cast(&type);
-      }
-      else if (nocode_wanted)
-      {
-        vtop->type = type;
       }
       else
       {
-        int u_align;
-        int u_size = type_size(&type, &u_align);
-        int vr_tmp;
-        int tmp_loc = get_temp_local_var(u_size, u_align, &vr_tmp);
+        CType mtype = union_cast_member_type(&type);
 
-        Sym *field = type.ref->next;
-        if (field)
-          gen_cast(&field->type);
+        if (global_expr && is_init_constant(vtop))
+        {
+          /* static initializer: build the union in an anonymous object that
+             init_putv copies, as for a compound literal */
+          init_params ip = {data_section};
+          int u_align;
+          int u_size = type_size(&type, &u_align);
+          unsigned long offset;
+          if (NOSTATIC_WANTED)
+            u_size = 0, u_align = 1;
+          offset = section_add(ip.sec, u_size, u_align);
+          vpush_ref(&type, ip.sec, offset, u_size);
+          vswap();
+          init_putv(&ip, &mtype, offset, -1);
+          vtop->r |= VT_LVAL;
+        }
+        else if (nocode_wanted)
+        {
+          vtop->type = type;
+        }
+        else
+        {
+          int u_align;
+          int u_size = type_size(&type, &u_align);
+          int vr_tmp;
+          int tmp_loc = get_temp_local_var(u_size, u_align, &vr_tmp);
 
-        SValue dst_sv;
-        memset(&dst_sv, 0, sizeof(dst_sv));
-        dst_sv.type = vtop->type;
-        dst_sv.r = VT_LOCAL | VT_LVAL;
-        dst_sv.vr = vr_tmp;
-        dst_sv.c.i = tmp_loc;
+          gen_cast(&mtype);
 
-        vpushv(&dst_sv);
-        vswap();
-        vstore();
-        vtop--;
+          SValue dst_sv;
+          memset(&dst_sv, 0, sizeof(dst_sv));
+          dst_sv.type = mtype;
+          dst_sv.r = VT_LOCAL | VT_LVAL;
+          dst_sv.vr = vr_tmp;
+          dst_sv.c.i = tmp_loc;
 
-        dst_sv.type = type;
-        vpushv(&dst_sv);
+          vpushv(&dst_sv);
+          vswap();
+          vstore();
+          vtop--;
+
+          dst_sv.type = type;
+          vpushv(&dst_sv);
+        }
       }
     }
     else
@@ -210,9 +275,21 @@ __attribute__((noinline)) void unary_generic(void)
   next();
 }
 
+/* Set by '&' for the unary() that parses its operand (see unary()). */
+int unary_addr_operand;
+/* indir() must leave its result an lvalue: the operand of '&' is built. */
+int indir_keep_lvalue;
+
 ST_FUNC HOT void unary(void)
 {
   Sym *s;
+  /* This is the operand of '&': it stays the lvalue it names -- indir()
+     folds no load into a constant, a __rodata_relative pointer stays a word.
+     The flag is the caller's: the expressions nested in this one get 0. */
+  const int addr_operand = unary_addr_operand;
+  const int saved_keep_lvalue = indir_keep_lvalue;
+  unary_addr_operand = 0;
+  indir_keep_lvalue = addr_operand;
 
   /* generate line number info */
   if (debug_modes)
@@ -281,6 +358,7 @@ ST_FUNC HOT void unary(void)
     goto postfix;
   case '&':
     next();
+    unary_addr_operand = 1;
     unary();
     if ((vtop->type.t & VT_BTYPE) != VT_FUNC && !(vtop->type.t & (VT_ARRAY | VT_VLA)))
     {
@@ -292,11 +370,24 @@ ST_FUNC HOT void unary(void)
         vtop->vr = -1;
       }
       test_lvalue();
+      /* (as gcc) -- except a constant address: offsetof's `&((T *)0)->m` */
+      if (vtop->sso_reversed && (vtop->r & (VT_VALMASK | VT_SYM)) != VT_CONST)
+        tcc_error("cannot take address of scalar with reverse storage order");
     }
     if (vtop->sym && ((vtop->r & VT_SYM) || (vtop->r & VT_LOCAL) || (vtop->r & VT_PARAM)))
     {
-      vtop->sym->a.addrtaken = 1;
-      tcc_ir_set_addrtaken(tcc_state->ir, vtop->sym->vreg);
+      if (tcc_state->defer_addrtaken && (vtop->r & (VT_VALMASK | VT_SYM | VT_PARAM)) == VT_LOCAL &&
+          !vtop->sym->a.nested_func && tcc_state->nb_deferred_addrtaken < 4)
+      {
+        if (!tcc_state->nb_deferred_addrtaken)
+          tcc_state->deferred_addr_lval = *vtop;
+        tcc_state->deferred_addrtaken[tcc_state->nb_deferred_addrtaken++] = vtop->sym;
+      }
+      else
+      {
+        vtop->sym->a.addrtaken = 1;
+        tcc_ir_set_addrtaken(tcc_state->ir, vtop->sym->vreg);
+      }
       if (vtop->sym->a.nested_func)
         setup_nested_func_trampoline(vtop->sym);
     }
@@ -312,19 +403,27 @@ ST_FUNC HOT void unary(void)
   case TOK_SOTYPE:
   case '(':
     if (unary_paren())
-      return;
+      goto done;
     goto postfix;
   default:
     break;
   }
 
   if (unary_primary())
-    return;
+    goto done;
 
 postfix:
   /* post operations */
   while (1)
   {
+    /* Every postfix operator reads the pointer, but ++/-- would write it. */
+    if ((vtop->type.t & VT_RODATA_REL) && (vtop->r & VT_LVAL))
+    {
+      if (tok == TOK_INC || tok == TOK_DEC)
+        rodata_rel_store_error();
+      if (tok == TOK_ARROW || tok == '[' || tok == '(')
+        rodata_rel_rvalue();
+    }
     if (tok == TOK_INC || tok == TOK_DEC)
     {
       inc(1, tok);
@@ -354,6 +453,14 @@ postfix:
         type_size(&struct_type, &salign);
         member_underaligned = vtop->underaligned || salign < 4 || (cumofs & 3) != 0;
       }
+      /* Union-member accesses keep the alias-class marks off their IR loads
+       * and stores: C permits reading a union member other than the one last
+       * written, so pointer/non-pointer type-based disambiguation (C11 6.5p7)
+       * must not apply across them.  Sticky in the lvalue like `underaligned`
+       * above — the array-member offset arithmetic below mutates this SValue
+         in place but never rebuilds it. */
+      if (IS_UNION(struct_type.t))
+        vtop->union_member = 1;
       /* add field offset to pointer */
       if (struct_has_vla_member(&vtop->type) && (vtop->r & VT_VALMASK) == VT_LOCAL)
       {
@@ -448,10 +555,20 @@ postfix:
       /* change type to field type, and set to lvalue */
       vtop->type = s->type;
       vtop->type.t |= qualifiers;
+      /* An array member of a qualified struct has qualified ELEMENTS: once
+       * `r->ch` decays, `r->ch[1]` takes its type from the element, so a
+       * qualifier left on the array type alone is lost there and two volatile
+       * accesses to `r->ch[1]` fold into one. */
+      if ((vtop->type.t & VT_ARRAY) && qualifiers)
+        parse_btype_qualify(&vtop->type, qualifiers);
       /* Set even for array-typed members (no VT_LVAL): the mark rides the
        * SValue into pointer decay and gen_op('+') propagates it, so
        * packed->arr[i] still reaches the deref marked. */
       vtop->underaligned = member_underaligned;
+      /* A scalar member of a big-endian scalar_storage_order aggregate, or an
+       * array of them, is stored byte-reversed.  Set (or cleared) on every
+       * access, like the alignment mark: the base may itself have been one. */
+      vtop->sso_reversed = s->a.sso_be && sso_scalar_size(&vtop->type) != 0;
       /* an array (or VLA) is never an lvalue */
       if (!(vtop->type.t & (VT_ARRAY | VT_VLA)))
       {
@@ -505,5 +622,14 @@ postfix:
     {
       break;
     }
+  }
+done:
+  indir_keep_lvalue = saved_keep_lvalue;
+  if (!addr_operand && (vtop->type.t & VT_RODATA_REL) && (vtop->r & VT_LVAL))
+  {
+    /* The left side of an assignment: say why it cannot be one. */
+    if (tok == '=' || TOK_ASSIGN(tok))
+      rodata_rel_store_error();
+    rodata_rel_rvalue();
   }
 }

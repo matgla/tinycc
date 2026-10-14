@@ -7,7 +7,13 @@
 #undef SPILL_MARK_BEGIN
 #undef SPILL_MARK_END
 #undef USING_GLOBALS
+#include "../ir/known_ext.c"
+#undef KE_ALL
+#undef KE_MAX_SWEEPS
 #include "../ir/machine_op.c"
+#undef USING_GLOBALS
+#include "../ir/op_props.c"
+#undef K
 #undef USING_GLOBALS
 #include "../ir/pool.c"
 #undef USING_GLOBALS

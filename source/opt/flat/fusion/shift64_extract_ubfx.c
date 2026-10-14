@@ -75,10 +75,9 @@ int tcc_ir_opt_shift64_extract_ubfx(TCCIRState *ir)
      * mask passes have already made of one. */
     if (q->op == TCCIR_OP_AND)
     {
-      IROperand m = tcc_ir_op_get_src2(ir, q);
-      if (!irop_is_immediate(m) || m.is_sym)
+      if (!tcc_ir_op_src2_is_imm(ir, q) || tcc_ir_op_src2_is_sym(ir, q))
         continue;
-      uint64_t mv = (uint64_t)irop_get_imm64_ex(ir, m);
+      uint64_t mv = (uint64_t)tcc_ir_op_src2_imm(ir, q);
       if ((mv >> 32) != 0)
         continue;
       width = u64x_mask_width((uint32_t)mv);
@@ -99,18 +98,16 @@ int tcc_ir_opt_shift64_extract_ubfx(TCCIRState *ir)
 
     /* The result is the 32-bit field, so a pair destination would still owe a
      * high word this rewrite does not produce. */
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (irop_needs_pair(dest) || dest.is_lval)
+    if (tcc_ir_op_dest_needs_pair(ir, q) || tcc_ir_op_dest_is_lval(ir, q))
       continue;
 
     /* The shift's result reaches the mask as a 32-bit operand as often as a
      * 64-bit one -- and64_narrow and narrow.c both retype it in place once
      * they have proved only its low word is read -- so the width that matters
      * is the SHIFT's, checked below, not this operand's. */
-    IROperand s1 = tcc_ir_op_get_src1(ir, q);
-    if (s1.is_lval || !irop_has_vreg(s1))
+    if (tcc_ir_op_src1_is_lval(ir, q) || !tcc_ir_op_src1_has_vreg(ir, q))
       continue;
-    int32_t t1 = irop_get_vreg(s1);
+    int32_t t1 = tcc_ir_op_src1_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(t1) != TCCIR_VREG_TYPE_TEMP)
       continue;
 
@@ -125,12 +122,11 @@ int tcc_ir_opt_shift64_extract_ubfx(TCCIRState *ir)
       continue;
     /* It is the shift that has to be the 64-bit one: only then does a count of
      * 32 or more mean "the high word", which is the whole argument here. */
-    if (!irop_needs_pair(tcc_ir_op_get_dest(ir, shr_q)))
+    if (!tcc_ir_op_dest_needs_pair(ir, shr_q))
       continue;
-    IROperand cnt = tcc_ir_op_get_src2(ir, shr_q);
-    if (!irop_is_immediate(cnt) || cnt.is_sym)
+    if (!tcc_ir_op_src2_is_imm(ir, shr_q) || tcc_ir_op_src2_is_sym(ir, shr_q))
       continue;
-    int64_t k = irop_get_imm64_ex(ir, cnt);
+    int64_t k = tcc_ir_op_src2_imm(ir, shr_q);
     if (k < 32 || k > 63)
       continue;
 
@@ -154,15 +150,16 @@ int tcc_ir_opt_shift64_extract_ubfx(TCCIRState *ir)
     for (int j = shr_idx + 1; j < i && safe; j++)
     {
       IRQuadCompact *jq = &ir->compact_instructions[j];
-      if (jq->op == TCCIR_OP_NOP)
+      if (jq->is_jump_target) /* before the NOP skip: a NOP can be the join */
+        safe = 0;
+      else if (jq->op == TCCIR_OP_NOP)
         continue;
-      if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF || jq->op == TCCIR_OP_IJUMP ||
-          jq->op == TCCIR_OP_SWITCH_TABLE || jq->is_jump_target)
+      else if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF || jq->op == TCCIR_OP_IJUMP ||
+               jq->op == TCCIR_OP_SWITCH_TABLE)
         safe = 0;
       else if (irop_config[jq->op].has_dest)
       {
-        IROperand jd = tcc_ir_op_get_dest(ir, jq);
-        if (irop_has_vreg(jd) && irop_get_vreg(jd) == v_vr)
+        if (tcc_ir_op_dest_has_vreg(ir, jq) && tcc_ir_op_dest_vreg(ir, jq) == v_vr)
           safe = 0;
       }
     }
@@ -173,13 +170,10 @@ int tcc_ir_opt_shift64_extract_ubfx(TCCIRState *ir)
                (int)k, lsb, width, shr_idx);
     q->op = TCCIR_OP_UBFX;
     tcc_ir_set_src1(ir, i, v);
-    tcc_ir_set_src2(ir, i,
-                    irop_make_imm32(-1, lsb | (width << 5) | UBFX_HI_HALF, IROP_BTYPE_INT32));
+    tcc_ir_set_src2_imm32(ir, i, lsb | (width << 5) | UBFX_HI_HALF, IROP_BTYPE_INT32);
     shr_q->op = TCCIR_OP_NOP;
     changes++;
   }
 
   return changes;
 }
-
-int tcc_ir_opt_shift64_extract_ubfx_ex(IROptCtx *ctx) { return tcc_ir_opt_shift64_extract_ubfx(ctx->ir); }

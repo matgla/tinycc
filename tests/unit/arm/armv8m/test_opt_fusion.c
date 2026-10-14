@@ -1164,6 +1164,102 @@ UT_TEST(test_barrel_shift_fusion_multi_use_shift_kept)
   return 0;
 }
 
+UT_TEST(test_barrel_shift_fusion_shared_address_local_value)
+{
+  for (int amount = 1; amount <= 3; amount++) {
+    for (int swap = 0; swap <= 1; swap++) {
+      TCCIRState *ir = utb_fusion_new(6);
+      ir->variables_live_intervals_size = 1;
+      ir->variables_live_intervals = tcc_mallocz(sizeof(IRLiveInterval));
+      IROperand index = irop_make_stackoff(irop_get_vreg(utb_var(0, I32)), -4, 1, 0, 0, I32);
+      int shl = utb_emit(ir, TCCIR_OP_SHL, utb_temp(1, I32), index, utb_imm(amount, I32));
+      int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32),
+                         utb_temp(swap ? 1 : 0, I32), utb_temp(swap ? 0 : 1, I32));
+      utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(3, I32), utb_temp(2, I32), UTB_NONE);
+      utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(4, I32), utb_temp(2, I32), UTB_NONE);
+      utb_emit(ir, TCCIR_OP_LOAD, utb_temp(5, I32), utb_deref_temp(3, I32), UTB_NONE);
+
+      tcc_ir_barrel_shift_fusion(ir);
+
+      UT_ASSERT_EQ(utb_op(ir, shl), TCCIR_OP_NOP);
+      UT_ASSERT_EQ(utb_src1(ir, add).vr, utb_temp(0, I32).vr);
+      UT_ASSERT_EQ(utb_src2(ir, add).vr, index.vr);
+      UT_ASSERT_EQ(ir->barrel_shifts[add], (1 << 5) | amount);
+      tcc_free(ir->barrel_shifts);
+      utb_free(ir);
+    }
+  }
+  return 0;
+}
+
+UT_TEST(test_barrel_shift_fusion_single_use_address_kept)
+{
+  for (int amount = 1; amount <= 3; amount++) {
+    TCCIRState *ir = utb_fusion_new(4);
+    int shl = utb_emit(ir, TCCIR_OP_SHL, utb_temp(1, I32), utb_temp(0, I32), utb_imm(amount, I32));
+    int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_param(0, I32), utb_temp(1, I32));
+    utb_emit(ir, TCCIR_OP_LOAD, utb_temp(3, I32), utb_deref_temp(2, I32), UTB_NONE);
+
+    tcc_ir_barrel_shift_fusion(ir);
+
+    UT_ASSERT_EQ(utb_op(ir, shl), TCCIR_OP_SHL);
+    UT_ASSERT_EQ(ir->barrel_shifts[add], 0);
+    tcc_free(ir->barrel_shifts);
+    utb_free(ir);
+  }
+  return 0;
+}
+
+UT_TEST(test_barrel_shift_fusion_adjacent_memory_source_kept)
+{
+  for (int kind = 0; kind < 5; kind++) {
+    TCCIRState *ir = utb_fusion_new(4);
+    ir->variables_live_intervals_size = 1;
+    ir->variables_live_intervals = tcc_mallocz(sizeof(IRLiveInterval));
+    IROperand source = utb_deref_temp(0, I32);
+    if (kind > 0) {
+      source = irop_make_stackoff(irop_get_vreg(utb_var(0, I32)), -4, kind != 1, kind == 2, 0, I32);
+      ir->variables_live_intervals[0].addrtaken = kind == 3;
+      ir->variables_live_intervals[0].is_volatile = kind == 4;
+    }
+    int shr = utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I32), source, utb_imm(5, I32));
+    int sub = utb_emit(ir, TCCIR_OP_SUB, utb_temp(2, I32), utb_temp(3, I32), utb_temp(1, I32));
+
+    tcc_ir_barrel_shift_fusion(ir);
+
+    UT_ASSERT_EQ(utb_op(ir, shr), TCCIR_OP_SHR);
+    UT_ASSERT_EQ(ir->barrel_shifts[sub], 0);
+    tcc_free(ir->barrel_shifts);
+    utb_free(ir);
+  }
+  return 0;
+}
+
+UT_TEST(test_barrel_shift_fusion_shared_address_control_flow_kept)
+{
+  for (int kind = 0; kind < 3; kind++) {
+    TCCIRState *ir = utb_fusion_new(5);
+    int shl = utb_emit(ir, TCCIR_OP_SHL, utb_temp(1, I32), utb_temp(0, I32), utb_imm(3, I32));
+    if (kind == 0)
+      utb_emit(ir, TCCIR_OP_JUMP, utb_jtarget_fusion(2), UTB_NONE, UTB_NONE);
+    else if (kind == 1)
+      utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(5, I32), UTB_NONE);
+    else
+      utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(2, I32), utb_imm(5, I32), UTB_NONE);
+    int add = utb_emit(ir, TCCIR_OP_ADD, utb_temp(2, I32), utb_param(0, I32), utb_temp(1, I32));
+    utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(3, I32), utb_temp(2, I32), UTB_NONE);
+    utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(4, I32), utb_temp(2, I32), UTB_NONE);
+
+    tcc_ir_barrel_shift_fusion(ir);
+
+    UT_ASSERT_EQ(utb_op(ir, shl), TCCIR_OP_SHL);
+    UT_ASSERT_EQ(ir->barrel_shifts[add], 0);
+    tcc_free(ir->barrel_shifts);
+    utb_free(ir);
+  }
+  return 0;
+}
+
 /* ================================================================== shift_pair_to_ubfx */
 
 /* POSITIVE: `(x << 4) >> 10` (a=4 <= b=10, both in [1,31], SHL single-use,

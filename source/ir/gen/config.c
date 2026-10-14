@@ -92,7 +92,8 @@ const IRRegistersConfig irop_config[] = {
     [TCCIR_OP_CALLSEQ_END] = {0, 1, 1},
 
     /* Init chain slot: src1 carries the chain slot symbol (SYMREF), no vreg */
-    [TCCIR_OP_INIT_CHAIN_SLOT] = {0, 1, 0},
+    [TCCIR_OP_INIT_CHAIN_SLOT] = {0, 1, 1}, /* src2: IMM chain level (nested_chain_level) */
+    [TCCIR_OP_SET_CHAIN] = {0, 1, 0},       /* src1: IMM chain level (nested_chain_level) */
     /* No-operation */
     [TCCIR_OP_NOP] = {0, 0, 0},
     /* Prefetch: src1=address vreg, src2=rw hint (in c.i), no dest */

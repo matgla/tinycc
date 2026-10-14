@@ -20,6 +20,7 @@ import sys
 import time
 from pathlib import Path
 
+from cross_includes import INCLUDE_FLAGS
 from qemu_run import run_test, compile_testcase, CompileConfig, ASAN_ENABLED, VALGRIND_ENABLED
 
 # Import gcctestsuite conftest explicitly (avoid shadowing by local conftest.py)
@@ -266,18 +267,12 @@ def test_gcc_compile_ir(test_case, opt_level, tmp_path):
 
     compiler = CURRENT_DIR / "../../armv8m-tcc"
     project_root = (CURRENT_DIR / "../..").resolve()
-    libc_includes = CURRENT_DIR / "libc_includes"
-    libc_imports = CURRENT_DIR / "libc_imports"
-    newlib_includes = libc_includes / "newlib"
     output_obj = tmp_path / f"{test_case.source.stem}.o"
 
     cmd = [
         str(compiler),
         f"-B{project_root}",
-        f"-I{libc_includes}",
-        f"-I{libc_imports}",
-        f"-I{newlib_includes}",
-        f"-I{project_root / 'include'}",
+        *INCLUDE_FLAGS,
         opt_level,
     ]
     if test_case.dg_options:

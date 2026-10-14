@@ -27,7 +27,7 @@ int ssa_opt_dce(IRSSAOptCtx *ctx)
 
   changes += dce_temp_worklist(ctx);
   changes += dce_unreachable(ctx);
-  if (tcc_state->optimize >= 1) {
+  if (TCC_OPT(tcc_state, optimize) >= 1) {
     int inner;
     do {
       inner = 0;

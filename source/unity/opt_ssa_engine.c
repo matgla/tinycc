@@ -7,4 +7,5 @@
 #include "../opt/ssa/engine/stack_resolve.c"
 #undef USING_GLOBALS
 #include "../opt/ssa/engine/use_def.c"
+#undef SSA_USE_FIRST_CAP
 #undef USING_GLOBALS

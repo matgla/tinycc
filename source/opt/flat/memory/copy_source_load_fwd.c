@@ -253,7 +253,7 @@ static uint64_t csf_demanded_of_result(TCCIRState *ir, int idx, int depth, int *
 static uint64_t csf_demanded_of_input(TCCIRState *ir, int idx, int slot, int depth, int *budget)
 {
   IRQuadCompact *q = &ir->compact_instructions[idx];
-  IROperand in = slot ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
+  IROperand in = tcc_ir_op_get_src1_or_2(ir, q, slot);
   uint64_t in_mask = csf_op_width_mask(in);
   if (depth <= 0 || --*budget < 0)
     return in_mask;
@@ -267,7 +267,7 @@ static uint64_t csf_demanded_of_input(TCCIRState *ir, int idx, int slot, int dep
 
   IROperand dest = tcc_ir_op_get_dest(ir, q);
   uint64_t d = csf_demanded_of_result(ir, idx, depth, budget) & csf_op_width_mask(dest);
-  IROperand other = slot ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+  IROperand other = tcc_ir_op_get_src1_or_2(ir, q, !slot);
   int64_t k;
   switch (q->op)
   {
@@ -323,7 +323,7 @@ static uint64_t csf_demanded_of_result(TCCIRState *ir, int idx, int depth, int *
         continue;
       if (s == 1 && !irop_config[uq->op].has_src2)
         continue;
-      if (irop_get_vreg(s ? tcc_ir_op_get_src2(ir, uq) : tcc_ir_op_get_src1(ir, uq)) == vr)
+      if (irop_get_vreg(tcc_ir_op_get_src1_or_2(ir, uq, s)) == vr)
         return CSF_ALL64;
     }
   }
@@ -333,15 +333,15 @@ static uint64_t csf_demanded_of_result(TCCIRState *ir, int idx, int depth, int *
     IRQuadCompact *uq = &ir->compact_instructions[j];
     if (uq->op == TCCIR_OP_NOP)
       continue;
-    if (irop_config[uq->op].has_dest && irop_get_vreg(tcc_ir_op_get_dest(ir, uq)) == vr)
+    if (irop_config[uq->op].has_dest && tcc_ir_op_dest_vreg(ir, uq) == vr)
     {
       /* An lval dest is a store THROUGH the temp — a use of every bit. */
-      if (tcc_ir_op_get_dest(ir, uq).is_lval)
+      if (tcc_ir_op_dest_is_lval(ir, uq))
         return CSF_ALL64;
       break; /* redefined: later uses read a different value */
     }
     /* MLA's accumulator and SELECT's condition live outside src1/src2. */
-    if ((uq->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, uq)) == vr) ||
+    if ((uq->op == TCCIR_OP_MLA && tcc_ir_op_accum_vreg(ir, uq) == vr) ||
         (uq->op == TCCIR_OP_SELECT && irop_get_vreg(tcc_ir_op_get_cond(ir, uq)) == vr))
       return CSF_ALL64;
     for (int s = 0; s < 2; s++)
@@ -350,7 +350,7 @@ static uint64_t csf_demanded_of_result(TCCIRState *ir, int idx, int depth, int *
         continue;
       if (s == 1 && !irop_config[uq->op].has_src2)
         continue;
-      IROperand u = s ? tcc_ir_op_get_src2(ir, uq) : tcc_ir_op_get_src1(ir, uq);
+      IROperand u = tcc_ir_op_get_src1_or_2(ir, uq, s);
       if (irop_get_vreg(u) != vr)
         continue;
       /* An MLA/SELECT-style extra operand or a barrel-shifted use is not
@@ -517,10 +517,8 @@ static int csf_is_block_copy_helper(const char *nm)
 {
   if (!nm)
     return 0;
-  return !strcmp(nm, "memcpy") || !strcmp(nm, "memmove") ||
-         !strcmp(nm, "__aeabi_memcpy") || !strcmp(nm, "__aeabi_memmove") ||
-         !strcmp(nm, "__aeabi_memcpy4") || !strcmp(nm, "__aeabi_memmove4") ||
-         !strcmp(nm, "__aeabi_memcpy8") || !strcmp(nm, "__aeabi_memmove8");
+  return ir_opt_name_in(nm, "memcpy\0memmove\0__aeabi_memcpy\0__aeabi_memmove\0__aeabi_memcpy4\0__aeabi_memmove4\0"
+                            "__aeabi_memcpy8\0__aeabi_memmove8\0");
 }
 
 /* Largest whole-aggregate copy admitted into the map, in bytes. */
@@ -550,7 +548,7 @@ static int csf_global_field_read_exists(TCCIRState *ir, Sym *sym, int32_t addend
         continue;
       if (slot == 1 && !irop_config[q->op].has_src2)
         continue;
-      IROperand op = slot ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
+      IROperand op = tcc_ir_op_get_src1_or_2(ir, q, slot);
       if (!op.is_sym || !op.is_lval || irop_get_btype(op) != btype)
         continue;
       IRPoolSymref *r = irop_get_symref_ex(ir, op);
@@ -578,9 +576,8 @@ static int csf_reaches_compare(TCCIRState *ir, int idx, int depth, int *budget)
     return 1;
   if (!irop_config[q->op].has_dest)
     return 0;
-  IROperand d = tcc_ir_op_get_dest(ir, q);
-  int32_t vr = irop_get_vreg(d);
-  if (vr < 0 || d.is_lval || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
+  int32_t vr = tcc_ir_op_dest_vreg(ir, q);
+  if (vr < 0 || tcc_ir_op_dest_is_lval(ir, q) || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
     return 0;
   int n = ir->next_instruction_index;
   for (int j = idx + 1; j < n; j++)
@@ -588,8 +585,8 @@ static int csf_reaches_compare(TCCIRState *ir, int idx, int depth, int *budget)
     IRQuadCompact *uq = &ir->compact_instructions[j];
     if (uq->op == TCCIR_OP_NOP)
       continue;
-    int uses = (irop_config[uq->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, uq)) == vr) ||
-               (irop_config[uq->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, uq)) == vr);
+    int uses = (irop_config[uq->op].has_src1 && tcc_ir_op_src1_vreg(ir, uq) == vr) ||
+               (irop_config[uq->op].has_src2 && tcc_ir_op_src2_vreg(ir, uq) == vr);
     if (uses && csf_reaches_compare(ir, j, depth - 1, budget))
       return 1;
   }
@@ -623,10 +620,9 @@ static int csf_store_forwarded_source(TCCIRState *ir, int copy_idx, int32_t vvr,
     IRQuadCompact *cq = &ir->compact_instructions[cd];
     if (cq->op != TCCIR_OP_ASSIGN)
       break;
-    IROperand cs = tcc_ir_op_get_src1(ir, cq);
-    if (cs.is_lval || cs.is_sym)
+    if (tcc_ir_op_src1_is_lval(ir, cq) || tcc_ir_op_src1_is_sym(ir, cq))
       break;
-    cv = irop_get_vreg(cs);
+    cv = tcc_ir_op_src1_vreg(ir, cq);
     cat = cd;
   }
 
@@ -641,7 +637,7 @@ static int csf_store_forwarded_source(TCCIRState *ir, int copy_idx, int32_t vvr,
     IRPoolSymref *r = irop_get_symref_ex(ir, d);
     if (!r || !r->sym || (r->sym->type.t & VT_VOLATILE))
       return 0;
-    int32_t sv = irop_get_vreg(tcc_ir_op_get_src1(ir, jq));
+    int32_t sv = tcc_ir_op_src1_vreg(ir, jq);
     int match = 0;
     for (int c = 0; c < nchain; c++)
       if (chain[c] == sv)
@@ -699,7 +695,7 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
       has_ijump = 1;
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      int t = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      int t = (int)tcc_ir_op_dest_u_imm32(ir, q);
       if (t >= 0 && t < n)
       {
         if (i < tgt_min[t])
@@ -719,6 +715,9 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
     tcc_free(tgt_max);
     return 0;
   }
+  /* Reaching-def queries per candidate copy and use: counts built once, kept
+   * in step with each operand rewrite. */
+  int vidx = tcc_ir_vreg_index_open(ir);
 
   /* Copy map: StackLoc[off] holds a copy of global (sym, addend), `width` bytes,
    * established by the store at `store_idx`. */
@@ -754,7 +753,7 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
      * inside it forward to the matching offset of the source global. */
     if (q->op == TCCIR_OP_FUNCCALLVOID || q->op == TCCIR_OP_FUNCCALLVAL)
     {
-      Sym *cs = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      Sym *cs = tcc_ir_op_src1_sym(ir, q);
       IROperand p0, p1, p2;
       if (cs && csf_is_block_copy_helper(get_tok_str(cs->v, NULL)) &&
           ir_opt_get_call_param_operand(ir, i, 0, &p0) &&
@@ -786,10 +785,9 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
     if (q->op != TCCIR_OP_STORE)
       continue;
     IROperand dest = tcc_ir_op_get_dest(ir, q);
-    IROperand val = tcc_ir_op_get_src1(ir, q);
     /* value must be a plain single-def TEMP loaded from a global. */
-    int32_t vvr = irop_get_vreg(val);
-    if (vvr < 0 || val.is_lval || val.is_sym || TCCIR_DECODE_VREG_TYPE(vvr) != TCCIR_VREG_TYPE_TEMP)
+    int32_t vvr = tcc_ir_op_src1_vreg(ir, q);
+    if (vvr < 0 || tcc_ir_op_src1_is_lval(ir, q) || tcc_ir_op_src1_is_sym(ir, q) || TCCIR_DECODE_VREG_TYPE(vvr) != TCCIR_VREG_TYPE_TEMP)
       continue;
     int vdef = tcc_ir_find_defining_instruction(ir, vvr, i);
     if (vdef < 0)
@@ -836,6 +834,7 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
 
   if (nfields == 0)
   {
+    tcc_ir_vreg_index_close(ir, vidx);
     tcc_free(tgt_min);
     tcc_free(tgt_max);
     return 0;
@@ -866,7 +865,7 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
       if (slot == 1 && tcc_ir_barrel_shift_at(ir, q))
         continue;
 
-      IROperand addr = slot ? tcc_ir_op_get_src2(ir, q) : tcc_ir_op_get_src1(ir, q);
+      IROperand addr = tcc_ir_op_get_src1_or_2(ir, q, slot);
       /* Only forward a local memory read; skip reads already from a global and
        * anything that is not an lvalue (an immediate, an address, a register).
        * LOAD keeps its historical shape: src1 IS the place it reads. */
@@ -879,7 +878,7 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
         continue;
       int lw = ir_opt_store_btype_size_bytes(irop_get_btype(addr));
       if (lw <= 0 && q->op == TCCIR_OP_LOAD)
-        lw = ir_opt_store_btype_size_bytes(irop_get_btype(tcc_ir_op_get_dest(ir, q)));
+        lw = ir_opt_store_btype_size_bytes(tcc_ir_op_dest_btype(ir, q));
       if (lw <= 0)
         continue;
 
@@ -953,7 +952,7 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
         case TCCIR_OP_FUNCCALLVOID:
         case TCCIR_OP_FUNCCALLVAL:
         {
-          Sym *cs = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, jq));
+          Sym *cs = tcc_ir_op_src1_sym(ir, jq);
           int p = cs ? tcc_ir_get_func_purity(ir, cs) : TCC_FUNC_PURITY_IMPURE;
           if (p == TCC_FUNC_PURITY_PURE || p == TCC_FUNC_PURITY_CONST)
             break;
@@ -980,8 +979,7 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
           /* any op that could write memory or is opaque: be safe. */
           if (irop_config[jq->op].has_dest)
           {
-            IROperand d = tcc_ir_op_get_dest(ir, jq);
-            if (d.is_lval)
+            if (tcc_ir_op_dest_is_lval(ir, jq))
             {
               clean = 0;
             }
@@ -1039,14 +1037,17 @@ int tcc_ir_opt_copy_source_load_fwd(TCCIRState *ir)
       newop.u.pool_idx = pool_idx;
       newop.btype = irop_get_btype(addr);
       newop.is_unsigned = addr.is_unsigned;
+      tcc_ir_vreg_index_unnote(ir, i);
       if (slot)
         tcc_ir_set_src2(ir, i, newop);
       else
         tcc_ir_set_src1(ir, i, newop);
+      tcc_ir_vreg_index_note(ir, i);
       changes++;
     }
   }
 
+  tcc_ir_vreg_index_close(ir, vidx);
   tcc_free(tgt_min);
   tcc_free(tgt_max);
   return changes;

@@ -274,4 +274,31 @@ UT_TEST(test_dead_init_empty_ir_no_crash)
 }
 
 UT_COVERS("compute_func_write_summary");
+UT_TEST(test_dead_init_aliased_input_kept)
+{
+  tcc_ir_func_write_summary_clear_all();
+  static Sym callee;
+  TCCIRState *cir = utb_new();
+  utb_emit(cir, TCCIR_OP_LOAD, utb_temp(0, I64), utb_lval(utb_param(0, I64)), UTB_NONE);
+  utb_emit(cir, TCCIR_OP_STORE, utb_lval(utb_param(1, I64)), utb_temp(0, I64), UTB_NONE);
+  tcc_ir_compute_func_write_summary(cir, &callee);
+  utb_free(cir);
+
+  TCCIRState *ir = utb_new();
+  utb_pools_init(ir);
+  int store = utb_emit(ir, TCCIR_OP_STORE, utb_stackoff(16, 1, 0, 0, I64), utb_imm(99, I64), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_stackoff(16, 0, 0, 0, I32),
+           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 0), I32));
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_stackoff(16, 0, 0, 0, I32),
+           utb_imm((int32_t)TCCIR_ENCODE_PARAM(1, 1), I32));
+  utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, utb_callee_ref(ir, &callee),
+           utb_imm((int32_t)TCCIR_ENCODE_CALL(1, 2), I32));
+
+  UT_ASSERT_EQ(tcc_ir_opt_dead_init_via_call(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, store), TCCIR_OP_STORE);
+  utb_free(ir);
+  tcc_ir_func_write_summary_clear_all();
+  return 0;
+}
+
 UT_COVERS("dead_init_via_call");

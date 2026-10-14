@@ -55,8 +55,8 @@ int insert_instr_at(TCCIRState *ir, int pos, TccIrOp op, IROperand dest, IROpera
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      IROperand jdest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)irop_get_imm64_ex(ir, jdest);
+      int64_t jdest_imm = tcc_ir_op_dest_imm(ir, q);
+      int target = (int)jdest_imm;
       if (target >= pos)
       {
         IROperand new_dest = irop_make_imm32(-1, target + 1, IROP_BTYPE_INT32);
@@ -75,6 +75,7 @@ int insert_instr_at(TCCIRState *ir, int pos, TccIrOp op, IROperand dest, IROpera
         table->targets[tj]++;
     }
   }
+  tcc_ir_frame_scope_insert(ir, pos);
 
   IRQuadCompact *new_q = &ir->compact_instructions[pos];
   new_q->op = op;

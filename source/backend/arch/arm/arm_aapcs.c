@@ -64,19 +64,29 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
   loc.reg_count = 0;
   loc.stack_off = 0;
 
-  /* Hard-float scalar float/double: pass in VFP argument registers (s0..s15,
-   * viewed as d0..d7 for doubles), else on the stack.  Variadic callees use the
-   * base standard (GPRs), so this only applies to non-variadic calls.
+  /* Hard-float co-processor register candidates (AAPCS-VFP C.1-C.5): a
+   * scalar float/double, or a homogeneous aggregate of 1-4 of them (a struct
+   * HFA, a _Complex float/double), takes the lowest run of consecutive free
+   * s-registers in s0..s15 -- even-aligned d-registers for doubles.  Variadic
+   * callees use the base standard (GPRs), so this only applies to
+   * non-variadic calls.
+   *
+   * Allocation back-fills: a float can take a gap a double left below it, so
+   * the bank is a per-register bitmap.  A candidate that finds no run closes
+   * the bank for every later argument (C.3) and goes on the stack at its
+   * natural alignment (C.5) -- never into core registers.
    *
    * Doubles ride the VFP bank even on a single-precision-only FPU: the ABI is
    * about where arguments live, not about which arithmetic exists, so the
    * callee unpacks d0 into a GPR pair to call __aeabi_dadd.  That is what
    * arm-none-eabi-gcc does for -mfpu=fpv5-sp-d16, and matching it is what makes
    * our objects interoperate with its libm. */
-  if (layout->hard_float && !layout->is_variadic && arg_desc->is_float && (size == 4 || size == 8))
+  const int cprc_count = arg_desc->is_float ? 1 : arg_desc->hfa_count;
+  const int cprc_base = arg_desc->is_float ? size : arg_desc->hfa_base;
+  if (layout->hard_float && !layout->is_variadic && cprc_count > 0 && (cprc_base == 4 || cprc_base == 8))
   {
-    const int slots = size / 4;             /* s-registers consumed */
-    const int step = (slots == 2) ? 2 : 1;  /* doubles must be even-aligned */
+    const int step = cprc_base / 4;        /* doubles must be even-aligned */
+    const int slots = cprc_count * step;   /* s-registers consumed */
     int base = -1;
 
     if (!layout->vfp_exhausted)
@@ -103,10 +113,10 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
     }
     else
     {
-      layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, size);
+      layout->next_stack_off = tcc_abi_align_up_int(layout->next_stack_off, align > 8 ? 8 : align);
       loc.kind = TCC_ABI_LOC_STACK;
       loc.stack_off = layout->next_stack_off;
-      layout->next_stack_off += size;
+      layout->next_stack_off += tcc_abi_align_up_int(size, 4);
     }
     layout->stack_size = tcc_abi_align_up_int(layout->next_stack_off, layout->stack_align ? layout->stack_align : 8);
     return loc;
@@ -159,10 +169,11 @@ TCCAbiArgLoc tcc_abi_classify_argument(TCCAbiCallLayout *layout, int arg_index, 
         loc.reg_count = (uint8_t)regs_needed;
         layout->next_reg = (uint8_t)(layout->next_reg + regs_needed);
       }
-      else if (layout->next_reg <= 3)
+      else if (layout->next_reg <= 3 && layout->next_stack_off == 0)
       {
-        /* AAPCS: Struct straddles registers and stack.
-         * Put first word(s) in remaining registers, rest on stack. */
+        /* AAPCS C.5: split only while no earlier argument has reached the
+         * stack (NSAA is still SP).  Once a VFP argument has spilled, C.6
+         * moves the whole composite to the stack instead. */
         int regs_avail = 4 - layout->next_reg;
         int words_on_stack = regs_needed - regs_avail;
         loc.kind = TCC_ABI_LOC_REG_STACK;

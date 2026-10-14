@@ -251,7 +251,7 @@ static const thop_variant_shape SHAPE_ERR_LOW_ONLY = {
     .rd_con = REG_LOW_ONLY,
     .feat = {.t16 = 1},
 };
-static const thop_variant VARIANT_ERR_LOW_ONLY[] = {{&SHAPE_ERR_LOW_ONLY, 0x0000, NULL}};
+static const thop_variant VARIANT_ERR_LOW_ONLY[] = {{0, 0x0000, 0}}; /* shape id 0 of &SHAPE_ERR_LOW_ONLY */
 
 static const thop_variant_shape SHAPE_ERR_FEAT_DSP = {
     .size = THOP_VARIANT_T32,
@@ -259,7 +259,7 @@ static const thop_variant_shape SHAPE_ERR_FEAT_DSP = {
     .rd_con = REG_ANY,
     .feat = {.t32 = 1, .dsp = 1},
 };
-static const thop_variant VARIANT_ERR_FEAT_DSP[] = {{&SHAPE_ERR_FEAT_DSP, 0xFA000000, NULL}};
+static const thop_variant VARIANT_ERR_FEAT_DSP[] = {{0, 0xFA000000, 0}}; /* shape id 0 of &SHAPE_ERR_FEAT_DSP */
 
 UT_TEST(test_emit_error_returns_zero_opcode_reg_constraint_fail)
 {
@@ -268,7 +268,7 @@ UT_TEST(test_emit_error_returns_zero_opcode_reg_constraint_fail)
                 .shift = THUMB_SHIFT_DEFAULT,
                 .enc = ENFORCE_ENCODING_NONE,
                 .flags = FLAGS_BEHAVIOUR_NOT_IMPORTANT};
-  thumb_opcode op = thop_emit_error("test_low_only", VARIANT_ERR_LOW_ONLY, 1, a);
+  thumb_opcode op = thop_emit_error_in(&SHAPE_ERR_LOW_ONLY, "test_low_only", VARIANT_ERR_LOW_ONLY, 1, a);
   UT_ASSERT_EQ(op.size, 0);
   UT_ASSERT_EQ(op.opcode, 0);
   return 0;
@@ -287,7 +287,7 @@ UT_TEST(test_emit_error_returns_zero_opcode_feature_mismatch)
                 .shift = THUMB_SHIFT_DEFAULT,
                 .enc = ENFORCE_ENCODING_NONE,
                 .flags = FLAGS_BEHAVIOUR_NOT_IMPORTANT};
-  thumb_opcode op = thop_emit_error("test_feat_dsp", VARIANT_ERR_FEAT_DSP, 1, a);
+  thumb_opcode op = thop_emit_error_in(&SHAPE_ERR_FEAT_DSP, "test_feat_dsp", VARIANT_ERR_FEAT_DSP, 1, a);
   UT_ASSERT_EQ(op.size, 0);
   UT_ASSERT_EQ(op.opcode, 0);
   return 0;
@@ -299,7 +299,7 @@ UT_TEST(test_emit_error_empty_table)
   thop_args a = {.shift = THUMB_SHIFT_DEFAULT,
                 .enc = ENFORCE_ENCODING_NONE,
                 .flags = FLAGS_BEHAVIOUR_NOT_IMPORTANT};
-  thumb_opcode op = thop_emit_error("test_empty", VARIANT_ERR_LOW_ONLY, 0, a);
+  thumb_opcode op = thop_emit_error_in(&SHAPE_ERR_LOW_ONLY, "test_empty", VARIANT_ERR_LOW_ONLY, 0, a);
   UT_ASSERT_EQ(op.size, 0);
   UT_ASSERT_EQ(op.opcode, 0);
   return 0;
@@ -512,6 +512,22 @@ UT_TEST(test_encbranch_8_negative_wraps_into_byte)
 UT_TEST(test_encbranch_11_halfword_scaled)
 {
   UT_ASSERT_EQ(th_encbranch_11(0, 20), 8); /* (20-0-4)>>1 = 8 */
+  return 0;
+}
+
+UT_TEST(test_encbranch_11_max_forward_offset_2046)
+{
+  /* B T2 reaches imm11*2 with imm11 in [-1024,1023]: PC (= pos+4) + 2046 is
+   * the farthest forward target (imm11 = 0x3ff). branch_fits_t2 narrows to
+   * it, so the back-patcher must accept it. Oracle: arm-none-eabi-as. */
+  UT_ASSERT_EQ(th_encbranch_11(0, 2050), 0x3ff);
+  return 0;
+}
+
+UT_TEST(test_encbranch_11_max_backward_offset_2048)
+{
+  /* PC - 2048 -> imm11 = -1024 = 0x400 */
+  UT_ASSERT_EQ(th_encbranch_11(2044, 0), 0x400);
   return 0;
 }
 

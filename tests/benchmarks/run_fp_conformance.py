@@ -167,6 +167,41 @@ def report(output: str, allow_ftz: bool = False) -> int:
     return n
 
 
+# (fp_lib, -mfpu, allow_ftz) per FP mode.  The DCP column is the only one that
+# QEMU cannot run, so it lives here.  The bare-metal image is built softfp-ABI
+# in every column: hardfp+softdouble differs from softfp only in its ABI, which
+# this image has no call boundary to exercise (tests/ir_tests/test_qemu.py
+# test_fp_matrix covers that under QEMU).
+MATRIX_MODES = {
+    "softfp": ("softfp", "", False),
+    "hardfp_softdouble": ("vfpv4sp", "fpv5-sp-d16", False),
+    "hardfp_dcp": ("rp2350fp", "rp2350", True),
+}
+MATRIX_OPT_LEVELS = ["0", "1", "2"]
+
+
+def run_matrix(args) -> int:
+    """Build, flash and run every mode x opt level; print a table, return fails."""
+    results = {}
+    for mode, (fp_lib, mfpu, ftz) in MATRIX_MODES.items():
+        for opt in MATRIX_OPT_LEVELS:
+            print(f"\n=== {mode} -O{opt} ===")
+            elf = build_image(args.compiler, opt, fp_lib, mfpu, args.clean)
+            ok, output, errors = upload_and_run(elf, args.host, args.port,
+                                                identity=args.identity, password=args.password)
+            if not ok:
+                print(errors or "flash/run failed")
+                results[(mode, opt)] = "ERROR"
+                continue
+            failures = report(output, allow_ftz=ftz)
+            results[(mode, opt)] = "PASS" if failures == 0 else ("NOVERDICT" if failures < 0 else f"FAIL({failures})")
+    print("\nFP conformance matrix:")
+    print(f"  {'mode':<20}" + "".join(f"-O{o:<10}" for o in MATRIX_OPT_LEVELS))
+    for mode in MATRIX_MODES:
+        print(f"  {mode:<20}" + "".join(f"{results[(mode, o)]:<12}" for o in MATRIX_OPT_LEVELS))
+    return sum(1 for v in results.values() if v != "PASS")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -185,10 +220,16 @@ def main() -> int:
                         "has no subnormal support); still fails on anything else")
     p.add_argument("--mfpu", default="",
                    help="value for TCC's -mfpu= (e.g. rp2350 for inline DCP/VFP)")
+    p.add_argument("--matrix", action="store_true",
+                   help="run softfp / hardfp+softdouble / hardfp+dcp at -O0/-O1/-O2 "
+                        "(ignores --opt-level, --fp-lib, --mfpu, --allow-ftz)")
     p.add_argument("--clean", action="store_true", help="wipe the build dir first")
     p.add_argument("--skip-build", action="store_true", help="reuse the existing image")
     p.add_argument("--serial-log", help="write the raw serial capture here")
     args = p.parse_args()
+
+    if args.matrix:
+        return 0 if run_matrix(args) == 0 else 1
 
     elf = build_image(args.compiler, args.opt_level, args.fp_lib, args.mfpu,
                       args.clean and not args.skip_build)

@@ -23,19 +23,21 @@
  *   neutral element     (AND:1, OR:0): `a OP n → a`     → ASSIGN src1
  *   annihilator element (AND:0, OR:1): `a OP z → z`     → ASSIGN #z
  * Idempotent `a OP a → a` also collapses to ASSIGN src1.
- * REWRITE cannot clear src2 to NONE, so clear it manually. */
+ * src2 is cleared to NONE before the opcode changes. */
 static int bool_idempotent(IROptCtx *ctx, int i, int neutral)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
+  BIND(src2);
   if (irop_is_immediate(src2) && imm(src2) == !neutral) {
     tcc_ir_set_src2(ir, i, IROP_NONE);
-    REWRITE(.new_op = TCCIR_OP_ASSIGN, .src1 = mk_imm(!neutral));
+    REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(mk_imm(!neutral)));
   }
   GUARD(
     when((vreg(src1) >= 0 && vreg(src1) == vreg(src2)) ||
          (irop_is_immediate(src2) && imm(src2) == neutral)));
   tcc_ir_set_src2(ir, i, IROP_NONE);
-  REWRITE(.new_op = TCCIR_OP_ASSIGN);
+  REWRITE(set_op(TCCIR_OP_ASSIGN));
 }
 
 OPT_GEN_FLAT(bool_idempotent_and, TCCIR_OP_BOOL_AND) {

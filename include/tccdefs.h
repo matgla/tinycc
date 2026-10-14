@@ -82,6 +82,13 @@
 #define __ORDER_LITTLE_ENDIAN__ 1234
 #define __ORDER_BIG_ENDIAN__ 4321
 #define __BYTE_ORDER__ __ORDER_LITTLE_ENDIAN__
+/* The __atomic_* builtins' memory orders, predefined as gcc and clang do. */
+#define __ATOMIC_RELAXED 0
+#define __ATOMIC_CONSUME 1
+#define __ATOMIC_ACQUIRE 2
+#define __ATOMIC_RELEASE 3
+#define __ATOMIC_ACQ_REL 4
+#define __ATOMIC_SEQ_CST 5
 #if defined _WIN32
 #define __WCHAR_TYPE__ unsigned short
 #define __WINT_TYPE__ unsigned short

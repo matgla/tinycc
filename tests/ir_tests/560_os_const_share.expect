@@ -1,0 +1,14 @@
+fallible(0): err=1 aaaaaaaa aaaaaaaa ffffffff
+merge(0)=55555555
+fallible(1): err=0 00000001 fffeffef 00002002
+merge(1)=aaaaaaad
+fallible(2): err=5 aaaaaaaa aaaaaaaa 00002002
+merge(2)=00000000
+fallible(3): err=5 aaaaaaaa fffeffef 00002002
+merge(3)=55555555
+fallible(4): err=5 aaaaaaaa aaaaaaaa ffffffff
+merge(4)=55555555
+fallible(5): err=0 00000005 fffeffef 00002002
+merge(5)=aaaaaa89
+pressure=772d9bdc out=aaaaaaaa 00000012 aaaaaaaa 84404a34 aaaaaaaa
+again=55555546 aaaaaaaa aaaaaaaa aaaaaaaa aaaaaaaa calls=32

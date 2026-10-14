@@ -426,8 +426,8 @@ UT_TEST(test_relocate_thm_movw_abs_nc_or_merges_into_existing_bits)
   Elf32_Sym syms[2];
   ut_arm_link_reset(s1, &symtab_sec, syms, 2);
 
-  /* THM_MOVW_ABS_NC takes the `else` (add32le) branch: type is
-   * R_ARM_THM_MOVW_ABS_NC, not R_ARM_THM_MOVT_ABS. */
+  /* Zero implicit addend: the patcher must preserve the non-immediate bits
+   * (none here) and encode only the low half of the symbol value. */
   uint8_t buf[4];
   write32le(buf, 0);
 
@@ -452,9 +452,11 @@ UT_TEST(test_relocate_thm_movt_abs_or_merges_into_existing_bits)
   Elf32_Sym syms[2];
   ut_arm_link_reset(s1, &symtab_sec, syms, 2);
 
-  /* Pre-existing opcode bits that must be preserved by the OR-merge. */
+  /* Pre-existing non-immediate bits that must be preserved.  Keep them clear
+     of the MOVW/MOVT immediate fields (mask 0x70ff040f), so the zero implicit
+     addend remains zero. */
   uint8_t buf[4];
-  write32le(buf, 0x00010001u);
+  write32le(buf, 0x0f00f000u);
 
   addr_t val = 0xABCD1234u;
   ElfW_Rel rel = rel_for_sym(1, R_ARM_THM_MOVT_ABS);
@@ -466,7 +468,132 @@ UT_TEST(test_relocate_thm_movt_abs_or_merges_into_existing_bits)
   uint32_t i = (hi >> 11) & 1u;
   uint32_t imm4 = (hi >> 12) & 0xfu;
   uint32_t expect_x = (imm3 << 28) | (imm8 << 16) | (i << 10) | imm4;
-  UT_ASSERT_EQ(read32le(buf), (0x00010001u | expect_x));
+  UT_ASSERT_EQ(read32le(buf), (0x0f00f000u | expect_x));
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* relocate(): R_ARM_THM_MOVW_ABS_NC / R_ARM_THM_MOVT_ABS with addends  */
+/* ------------------------------------------------------------------ */
+
+/* docs/bugs/arm-link-thm-movw-movt-abs-addend-corrupts-insn.md:
+ * ARM ELF REL relocations keep the addend inside the MOVW/MOVT immediate
+ * fields.  The correct patcher must decode that addend, add it to the
+ * symbol value, and rewrite only the immediate fields.  These tests use a
+ * synthetic instruction whose non-immediate bits (opcode/Rd-shaped bits)
+ * are set, so a field-wise add or OR is visible as corruption.
+ */
+static uint32_t ut_pack_thm_imm16(uint32_t v)
+{
+  v &= 0xffffu;
+  uint32_t imm8 = v & 0xffu;
+  uint32_t imm3 = (v >> 8) & 7u;
+  uint32_t i = (v >> 11) & 1u;
+  uint32_t imm4 = (v >> 12) & 0xfu;
+  return (imm3 << 28) | (imm8 << 16) | (i << 10) | imm4;
+}
+
+static int32_t ut_sign_extend16(uint32_t v)
+{
+  v &= 0xffffu;
+  if (v & 0x8000u)
+    return (int32_t)v - 0x10000;
+  return (int32_t)v;
+}
+
+UT_TEST(test_relocate_thm_movw_abs_nc_positive_addend)
+{
+  TCCState s1_storage;
+  TCCState *s1 = &s1_storage;
+  Section symtab_sec;
+  Elf32_Sym syms[2];
+  ut_arm_link_reset(s1, &symtab_sec, syms, 2);
+
+  const uint32_t base = 0x0f00f000u; /* non-immediate bits only */
+  const uint32_t addend = 0x00ffu;
+  const uint32_t sym = 0x0001u;
+
+  uint8_t buf[4];
+  write32le(buf, base | ut_pack_thm_imm16(addend));
+
+  ElfW_Rel rel = rel_for_sym(1, R_ARM_THM_MOVW_ABS_NC);
+  relocate(s1, &rel, R_ARM_THM_MOVW_ABS_NC, buf, 0, sym);
+
+  uint32_t sum = sym + (uint32_t)ut_sign_extend16(addend);
+  uint32_t final = sum & 0xffffu;
+  UT_ASSERT_EQ(read32le(buf), base | ut_pack_thm_imm16(final));
+  return 0;
+}
+
+UT_TEST(test_relocate_thm_movw_abs_nc_negative_addend)
+{
+  TCCState s1_storage;
+  TCCState *s1 = &s1_storage;
+  Section symtab_sec;
+  Elf32_Sym syms[2];
+  ut_arm_link_reset(s1, &symtab_sec, syms, 2);
+
+  const uint32_t base = 0x0f00f000u;
+  const uint32_t addend = 0xfffcu; /* -4 */
+  const uint32_t sym = 0x0088u;
+
+  uint8_t buf[4];
+  write32le(buf, base | ut_pack_thm_imm16(addend));
+
+  ElfW_Rel rel = rel_for_sym(1, R_ARM_THM_MOVW_ABS_NC);
+  relocate(s1, &rel, R_ARM_THM_MOVW_ABS_NC, buf, 0, sym);
+
+  uint32_t sum = sym + (uint32_t)ut_sign_extend16(addend);
+  uint32_t final = sum & 0xffffu;
+  UT_ASSERT_EQ(read32le(buf), base | ut_pack_thm_imm16(final));
+  return 0;
+}
+
+UT_TEST(test_relocate_thm_movt_abs_positive_addend)
+{
+  TCCState s1_storage;
+  TCCState *s1 = &s1_storage;
+  Section symtab_sec;
+  Elf32_Sym syms[2];
+  ut_arm_link_reset(s1, &symtab_sec, syms, 2);
+
+  const uint32_t base = 0x0f00f000u;
+  const uint32_t addend = 0x0002u;
+  const uint32_t sym = 0x0000ffffu;
+
+  uint8_t buf[4];
+  write32le(buf, base | ut_pack_thm_imm16(addend));
+
+  ElfW_Rel rel = rel_for_sym(1, R_ARM_THM_MOVT_ABS);
+  relocate(s1, &rel, R_ARM_THM_MOVT_ABS, buf, 0, sym);
+
+  uint32_t sum = sym + (uint32_t)ut_sign_extend16(addend);
+  uint32_t final = (sum >> 16) & 0xffffu;
+  UT_ASSERT_EQ(read32le(buf), base | ut_pack_thm_imm16(final));
+  return 0;
+}
+
+UT_TEST(test_relocate_thm_movt_abs_negative_addend)
+{
+  TCCState s1_storage;
+  TCCState *s1 = &s1_storage;
+  Section symtab_sec;
+  Elf32_Sym syms[2];
+  ut_arm_link_reset(s1, &symtab_sec, syms, 2);
+
+  const uint32_t base = 0x0f00f000u;
+  const uint32_t addend = 0xffffu; /* -1 */
+  const uint32_t sym = 0x00010000u;
+
+  uint8_t buf[4];
+  write32le(buf, base | ut_pack_thm_imm16(addend));
+
+  ElfW_Rel rel = rel_for_sym(1, R_ARM_THM_MOVT_ABS);
+  relocate(s1, &rel, R_ARM_THM_MOVT_ABS, buf, 0, sym);
+
+  uint32_t sum = sym + (uint32_t)ut_sign_extend16(addend);
+  uint32_t final = (sum >> 16) & 0xffffu;
+  UT_ASSERT_EQ(read32le(buf), base | ut_pack_thm_imm16(final));
   return 0;
 }
 
@@ -591,6 +718,7 @@ UT_TEST(test_relocate_rodata_off)
   ut_arm_link_reset(s1, &symtab_sec, syms, 2);
   memset(&rodata_sec, 0, sizeof(rodata_sec));
   rodata_sec.sh_addr = 0x5000;
+  rodata_sec.sh_size = 0x100;
   /* Assign via the bare macro name -- see ut_arm_link_reset() comment on
    * `symtab_section` for why `s1->rodata_section` would double-expand. */
   rodata_section = &rodata_sec;
@@ -602,6 +730,39 @@ UT_TEST(test_relocate_rodata_off)
   relocate(s1, &rel, R_ARM_RODATA_OFF, buf, 0, 0x5010);
 
   UT_ASSERT_EQ(read32le(buf), 0x10u);
+  UT_ASSERT_EQ(ut_arm_link_error_calls, 0);
+  return 0;
+}
+
+/* A __rodata_relative word's target outside .rodata -- including at its end,
+ * where the next section starts -- has no offset from it (rodata_rel.c). */
+UT_TEST(test_relocate_rodata_off_outside_rodata_reports_error)
+{
+  static const addr_t vals[] = {0x4ffc, 0x5100, 0x6000};
+  for (int i = 0; i < 3; i++)
+  {
+    TCCState s1_storage;
+    TCCState *s1 = &s1_storage;
+    Section symtab_sec, strtab_sec, rodata_sec;
+    Elf32_Sym syms[2];
+    ut_arm_link_reset(s1, &symtab_sec, syms, 2);
+    memset(&strtab_sec, 0, sizeof(strtab_sec));
+    strtab_sec.data = (unsigned char *)"\0target";
+    syms[1].st_name = 1;
+    symtab_sec.link = &strtab_sec;
+    memset(&rodata_sec, 0, sizeof(rodata_sec));
+    rodata_sec.sh_addr = 0x5000;
+    rodata_sec.sh_size = 0x100;
+    rodata_section = &rodata_sec;
+
+    uint8_t buf[4];
+    write32le(buf, 1);
+    ElfW_Rel rel = rel_for_sym(1, R_ARM_RODATA_OFF);
+    relocate(s1, &rel, R_ARM_RODATA_OFF, buf, 0, vals[i]);
+
+    UT_ASSERT_EQ(ut_arm_link_error_calls, 1);
+    UT_ASSERT_EQ(read32le(buf), 1u);
+  }
   return 0;
 }
 
@@ -841,7 +1002,10 @@ UT_TEST(test_relocate_thm_jump6_forward_branch)
   return 0;
 }
 
-UT_TEST(test_relocate_thm_jump6_negative_offset_forces_nop)
+/* CBZ/CBNZ reach 0..126 bytes forward only: anything else is an error and the
+ * instruction word is left alone (it used to be silently turned into a NOP, or
+ * wrapped modulo 128).  (fixed thumb-cbz bug report, see git history) */
+static int ut_jump6_rejects(addr_t addr, addr_t val)
 {
   TCCState s1_storage;
   TCCState *s1 = &s1_storage;
@@ -851,15 +1015,42 @@ UT_TEST(test_relocate_thm_jump6_negative_offset_forces_nop)
   ut_set_nonweak_sym(syms, 1);
 
   uint8_t buf[2];
-  write16le(buf, 0x1234);
-
-  addr_t addr = 0x2000;
-  addr_t val = 0x1000; /* val - addr - 4 < 0 */
+  write16le(buf, 0xb100);
+  ut_arm_link_error_calls = 0;
   ElfW_Rel rel = rel_for_sym(1, R_ARM_THM_JUMP6);
   relocate(s1, &rel, R_ARM_THM_JUMP6, buf, addr, val);
-
   uint16_t result = (uint16_t)(buf[0] | (buf[1] << 8));
-  UT_ASSERT_EQ(result, 0xbf00); /* documented NOP fallback */
+  return ut_arm_link_error_calls == 1 && result == 0xb100;
+}
+
+UT_TEST(test_relocate_thm_jump6_negative_offset_is_error)
+{
+  UT_ASSERT(ut_jump6_rejects(0x2000, 0x1000));
+  return 0;
+}
+
+UT_TEST(test_relocate_thm_jump6_too_far_is_error)
+{
+  UT_ASSERT(ut_jump6_rejects(0x1000, 0x1000 + 4 + 128));
+  UT_ASSERT(ut_jump6_rejects(0x1000, 0x1000 + 4 + 200));
+  return 0;
+}
+
+UT_TEST(test_relocate_thm_jump6_max_offset_ok)
+{
+  TCCState s1_storage;
+  TCCState *s1 = &s1_storage;
+  Section symtab_sec;
+  Elf32_Sym syms[2];
+  ut_arm_link_reset(s1, &symtab_sec, syms, 2);
+  ut_set_nonweak_sym(syms, 1);
+  uint8_t buf[2];
+  write16le(buf, 0xb100);
+  ut_arm_link_error_calls = 0;
+  ElfW_Rel rel = rel_for_sym(1, R_ARM_THM_JUMP6);
+  relocate(s1, &rel, R_ARM_THM_JUMP6, buf, 0x1000, 0x1000 + 4 + 126);
+  UT_ASSERT_EQ(ut_arm_link_error_calls, 0);
+  UT_ASSERT_EQ((uint16_t)(buf[0] | (buf[1] << 8)), (uint16_t)(0xb100 | (1 << 9) | (31 << 3)));
   return 0;
 }
 

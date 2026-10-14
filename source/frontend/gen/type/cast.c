@@ -144,11 +144,158 @@ static void gen_cast_vector(CType *dst_type)
   vpushv(&dst_sv);
 }
 
+static int complex_element_size(int bt)
+{
+  if (is_float(bt))
+    return (bt == VT_FLOAT) ? 4 : 8;
+  return btype_size(bt);
+}
+
+/* Lower a runtime conversion involving a complex value one element at a time.
+ * The scalar cast machinery cannot represent a complex integer as one value on
+ * ARMv8-M: _Complex long long is a 16-byte pair, while the IR scalar path only
+ * knows about one 64-bit value.  Going through a temporary also gives rvalues
+ * (including call results) an address before their two elements are read. */
+static void gen_cast_complex_runtime(CType *dst_type, int sbt, int dbt)
+{
+  int src_complex = (vtop->type.t & VT_COMPLEX) != 0;
+  int dst_complex = (dst_type->t & VT_COMPLEX) != 0;
+  int src_bt = sbt & VT_BTYPE;
+  int dst_bt = dbt & VT_BTYPE;
+  int src_elem_size = complex_element_size(src_bt);
+  int dst_elem_size = complex_element_size(dst_bt);
+
+  if (!src_complex && dst_complex)
+  {
+    int result_vr;
+    int result_loc = get_temp_local_var(2 * dst_elem_size, dst_elem_size, &result_vr);
+    CType dst_elem_type = *dst_type;
+    dst_elem_type.t &= ~VT_COMPLEX;
+
+    SValue source = *vtop;
+    vpop();
+
+    /* real = converted source */
+    vpushv(&source);
+    gen_cast(&dst_elem_type);
+    {
+      SValue dst;
+      memset(&dst, 0, sizeof(dst));
+      dst.type = dst_elem_type;
+      dst.r = VT_LOCAL | VT_LVAL;
+      /* A component store must carry its byte offset; ASSIGN treats one
+       * temp-local vreg as a single value and would collapse both halves. */
+      dst.vr = -1;
+      dst.c.i = result_loc;
+      vpushv(&dst);
+      vswap();
+      vstore();
+      vpop();
+    }
+
+    /* imag = 0 */
+    {
+      SValue dst;
+      memset(&dst, 0, sizeof(dst));
+      dst.type = dst_elem_type;
+      dst.r = VT_LOCAL | VT_LVAL;
+      dst.vr = -1;
+      dst.c.i = result_loc + dst_elem_size;
+      vpushv(&dst);
+      CValue zero;
+      memset(&zero, 0, sizeof(zero));
+      vsetc(&dst_elem_type, VT_CONST, &zero);
+      vstore();
+      vpop();
+    }
+
+    SValue result;
+    memset(&result, 0, sizeof(result));
+    result.type = *dst_type;
+    result.r = VT_LOCAL | VT_LVAL;
+    result.vr = -1;
+    result.c.i = result_loc;
+    vpushv(&result);
+    return;
+  }
+
+  /* A complex rvalue has no address from which to select its real element. */
+  if (!(vtop->r & VT_LVAL))
+  {
+    int source_vr;
+    int source_loc = get_temp_local_var(2 * src_elem_size, src_elem_size, &source_vr);
+    SValue source_slot;
+    memset(&source_slot, 0, sizeof(source_slot));
+    source_slot.type = vtop->type;
+    source_slot.r = VT_LOCAL | VT_LVAL;
+    source_slot.vr = source_vr;
+    source_slot.c.i = source_loc;
+    vpushv(&source_slot);
+    vswap();
+    vstore();
+    vpop();
+    vpushv(&source_slot);
+  }
+
+  if (src_complex && !dst_complex)
+  {
+    /* The real element is at offset zero; strip VT_COMPLEX before casting. */
+    vtop->type.t &= ~VT_COMPLEX;
+    gen_cast(dst_type);
+    return;
+  }
+
+  /* complex -> complex, with different element widths */
+  {
+    int result_vr;
+    int result_loc = get_temp_local_var(2 * dst_elem_size, dst_elem_size, &result_vr);
+    SValue source = *vtop;
+    vpop();
+
+    CType source_elem_type = source.type;
+    source_elem_type.t &= ~VT_COMPLEX;
+    CType dst_elem_type = *dst_type;
+    dst_elem_type.t &= ~VT_COMPLEX;
+
+    for (int part = 0; part < 2; part++)
+    {
+      SValue component = source;
+      component.type = source_elem_type;
+      vpushv(&component);
+      if (part)
+        incr_offset(src_elem_size);
+      gen_cast(&dst_elem_type);
+
+      SValue dst;
+      memset(&dst, 0, sizeof(dst));
+      dst.type = dst_elem_type;
+      dst.r = VT_LOCAL | VT_LVAL;
+      dst.vr = -1;
+      dst.c.i = result_loc + part * dst_elem_size;
+      vpushv(&dst);
+      vswap();
+      vstore();
+      vpop();
+    }
+
+    SValue result;
+    memset(&result, 0, sizeof(result));
+    result.type = *dst_type;
+    result.r = VT_LOCAL | VT_LVAL;
+    result.vr = -1;
+    result.c.i = result_loc;
+    vpushv(&result);
+  }
+}
+
 /* cast 'vtop' to 'type'. Casting to bitfields is forbidden. */
 void gen_cast(CType *type)
 {
   int sbt, dbt, sf, df, c;
   int dbt_bt, sbt_bt, ds, ss, bits, trunc;
+
+  if (type->t & VT_RODATA_REL)
+    rodata_rel_store_error();
 
   if (is_transparent_union_type(type))
   {
@@ -172,6 +319,10 @@ void gen_cast(CType *type)
   /* bitfields first get cast to ints */
   if (vtop->type.t & VT_BITFIELD)
     gv(RC_INT);
+  /* a byte-reversed member is converted from its loaded value, never by
+     relabelling the lvalue */
+  if ((vtop->r & VT_LVAL) && vtop->sso_reversed && (type->t & VT_BTYPE) != VT_VOID)
+    gv(RC_TYPE(vtop->type.t));
 
   if (IS_ENUM(type->t) && type->ref->c < 0)
     tcc_error("cast to incomplete type");
@@ -193,118 +344,23 @@ void gen_cast(CType *type)
    * When VT_COMPLEX flag changes but base type is the same (e.g. double → _Complex double),
    * we still need to repack the CValue. Force entry into the main cast body. */
   if (sbt == dbt && ((vtop->type.t ^ type->t) & VT_COMPLEX) &&
-      (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST && is_float(sbt))
+      (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST)
   {
     /* Force sbt != dbt so we enter the main cast body below,
      * where the complex constant cast handler will pick this up. */
     goto process_cast;
   }
 
-  /* Non-constant scalar↔complex cast with matching base type
-   * (e.g. int → _Complex int, double → _Complex double).
-   * The sbt==dbt shortcut below would just update the type flag without
-   * generating any code, leaving the imaginary part uninitialized — so the
-   * subsequent complex op would read garbage from memory beyond the scalar. */
-  if (sbt == dbt && ((vtop->type.t ^ type->t) & VT_COMPLEX))
+  /* Non-constant casts involving a complex value must be component-wise.
+   * This includes different integer widths: the generic scalar machinery
+   * would otherwise treat a complex pair as one scalar or pass the source
+   * data as a pointer. */
+  if (((vtop->type.t | type->t) & VT_COMPLEX) &&
+      (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST &&
+      (!((vtop->type.t & VT_COMPLEX) && (type->t & VT_COMPLEX)) || sbt != dbt))
   {
-    int is_const = (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST;
-    if (is_const)
-      goto process_cast; /* constant case handled in the main cast body */
-
-    int src_complex = (vtop->type.t & VT_COMPLEX) != 0;
-    int dst_complex = (type->t & VT_COMPLEX) != 0;
-    int sbt_bt2 = sbt & VT_BTYPE;
-    int is_fp = is_float(sbt_bt2);
-    /* btype_size handles only integer types; compute float widths here. */
-    int elem_sz;
-    if (is_fp)
-      elem_sz = (sbt_bt2 == VT_FLOAT) ? 4 : 8; /* VT_DOUBLE / VT_LDOUBLE → 8 on ARM */
-    else
-      elem_sz = btype_size(sbt_bt2);
-
-    if (!src_complex && dst_complex)
-    {
-      /* scalar → _Complex: allocate temp, store scalar as real, store 0 as imag.
-       * vstore() consumes both its dst and value entries from the vstack, so
-       * we save the source SValue and pop it first — then push a fresh entry
-       * for the new complex temp at the end. This keeps the vstack balanced
-       * and avoids overwriting whatever was below the source.
-       *
-       * We use vr=-1 on the component dsts so vstore() emits STORE (which
-       * honors the c.i stack offset) rather than ASSIGN (which treats the
-       * entire vreg as one slot and would collapse the real/imag stores). */
-      int complex_sz = elem_sz * 2;
-      CType scalar_type;
-      scalar_type.t = sbt;
-      scalar_type.ref = NULL;
-
-      int tmp_vr;
-      int tmp_loc = get_temp_local_var(complex_sz, elem_sz, &tmp_vr);
-      (void)tmp_vr; /* tmp_vr only used to keep the temp slot reserved */
-
-      SValue saved_src = *vtop;
-      vpop();
-
-      /* Store real part = saved source value */
-      {
-        SValue dst;
-        memset(&dst, 0, sizeof(dst));
-        dst.type = scalar_type;
-        dst.r = VT_LOCAL | VT_LVAL;
-        dst.vr = -1;
-        dst.c.i = tmp_loc;
-        vpushv(&dst);
-        vpushv(&saved_src);
-        vstore();
-        vpop();
-      }
-
-      /* Store imaginary part = 0 (float 0.0 or int 0 per base type) */
-      {
-        SValue dst;
-        memset(&dst, 0, sizeof(dst));
-        dst.type = scalar_type;
-        dst.r = VT_LOCAL | VT_LVAL;
-        dst.vr = -1;
-        dst.c.i = tmp_loc + elem_sz;
-        vpushv(&dst);
-        if (is_fp)
-        {
-          CValue zero_cv;
-          memset(&zero_cv, 0, sizeof(zero_cv));
-          if (sbt_bt2 == VT_FLOAT)
-            zero_cv.f = 0.0f;
-          else if (sbt_bt2 == VT_DOUBLE)
-            zero_cv.d = 0.0;
-          else /* VT_LDOUBLE */
-            zero_cv.ld = 0.0;
-          vsetc(&scalar_type, VT_CONST, &zero_cv);
-        }
-        else
-        {
-          vpushi(0);
-          vtop->type = scalar_type;
-        }
-        vstore();
-        vpop();
-      }
-
-      /* Push the new complex temp lvalue as vtop */
-      SValue complex_sv;
-      memset(&complex_sv, 0, sizeof(complex_sv));
-      complex_sv.type = *type;
-      complex_sv.r = VT_LOCAL | VT_LVAL;
-      complex_sv.vr = -1;
-      complex_sv.c.i = tmp_loc;
-      vpushv(&complex_sv);
-      return;
-    }
-    else if (src_complex && !dst_complex)
-    {
-      /* _Complex → scalar: extract real part (at offset 0), discard imaginary */
-      vtop->type = *type;
-      return;
-    }
+    gen_cast_complex_runtime(type, sbt, dbt);
+    return;
   }
 
   /* Complex → complex with a different float base (_Complex float ↔
@@ -393,7 +449,9 @@ void gen_cast(CType *type)
       memset(&dst, 0, sizeof(dst));
       dst.type.t = dst_bt2;
       dst.r = VT_LOCAL | VT_LVAL;
-      dst.vr = res_vr;
+      /* Component stores use the explicit stack offset, not ASSIGN to the
+       * whole complex temp vreg. */
+      dst.vr = -1;
       dst.c.i = res_loc + comp * dst_sz;
       vpushv(&dst);
       vswap();
@@ -405,7 +463,7 @@ void gen_cast(CType *type)
     memset(&result, 0, sizeof(result));
     result.type = *type;
     result.r = VT_LOCAL | VT_LVAL;
-    result.vr = res_vr;
+    result.vr = -1;
     result.c.i = res_loc;
     vpushv(&result);
     return;
@@ -462,7 +520,89 @@ again:
         /* int → _Complex int: real = value, imag = 0 */
         uint64_t mask = (dst_bt == VT_LLONG) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << (btype_size(dst_bt) * 8)) - 1);
         uint64_t real_val = vtop->c.i & mask;
+
+        /* A _Complex long long is 16 bytes, so its zero imaginary half cannot
+         * remain in the single 64-bit CValue used for scalar constants.  If
+         * it did, call lowering would read the real half twice. */
+        if (dst_bt == VT_LLONG)
+        {
+          int src_shift = btype_size(src_bt) * 8;
+          uint64_t src_mask = (src_bt == VT_LLONG) ? ~0ULL : ((1ULL << src_shift) - 1);
+          real_val = vtop->c.i & src_mask;
+          if (!(vtop->type.t & VT_UNSIGNED) && src_shift < 64 && (real_val & (1ULL << (src_shift - 1))))
+            real_val |= ~src_mask;
+
+          int mat_vr;
+          int mat_loc = get_temp_local_var(16, 8, &mat_vr);
+          CType elem_type = *type;
+          elem_type.t &= ~VT_COMPLEX;
+          vpop();
+          for (int part = 0; part < 2; part++)
+          {
+            SValue dst;
+            memset(&dst, 0, sizeof(dst));
+            dst.type = elem_type;
+            dst.r = VT_LOCAL | VT_LVAL;
+            dst.vr = -1;
+            dst.c.i = mat_loc + part * 8;
+            vpushv(&dst);
+            CValue cv;
+            memset(&cv, 0, sizeof(cv));
+            cv.i = part ? 0 : real_val;
+            vsetc(&elem_type, VT_CONST, &cv);
+            vstore();
+            vpop();
+          }
+          SValue result;
+          memset(&result, 0, sizeof(result));
+          result.type = *type;
+          result.r = VT_LOCAL | VT_LVAL;
+          result.vr = -1;
+          result.c.i = mat_loc;
+          vpushv(&result);
+          goto done;
+        }
         vtop->c.i = real_val; /* imag = 0, real = truncated value */
+      }
+      else if (src_complex && dst_complex && dst_bt == VT_LLONG && src_bt != VT_LLONG)
+      {
+        /* Two 64-bit elements do not fit the packed 64-bit constant: widen
+           into a temp local (sign/zero extension per the source type). */
+        int src_shift = btype_size(src_bt) * 8;
+        uint64_t src_mask = (1ULL << src_shift) - 1;
+        uint64_t real_val = vtop->c.i & src_mask;
+        uint64_t imag_val = (vtop->c.i >> src_shift) & src_mask;
+        int is_unsigned = (vtop->type.t & VT_UNSIGNED) != 0;
+        int mat_vr;
+        int mat_loc = get_temp_local_var(16, 8, &mat_vr);
+        CType elem_type = *type;
+        elem_type.t &= ~VT_COMPLEX;
+        vpop();
+        for (int part = 0; part < 2; part++)
+        {
+          uint64_t v = part ? imag_val : real_val;
+          if (!is_unsigned && (v >> (src_shift - 1)) & 1)
+            v |= ~src_mask;
+          SValue dst;
+          memset(&dst, 0, sizeof(dst));
+          dst.type = elem_type;
+          dst.r = VT_LOCAL | VT_LVAL;
+          dst.vr = -1;
+          dst.c.i = mat_loc + part * 8;
+          vpushv(&dst);
+          vpush64(dst_bt, v);
+          vstore();
+          vpop();
+        }
+        {
+          SValue res;
+          memset(&res, 0, sizeof(res));
+          res.type = *type;
+          res.r = VT_LOCAL | VT_LVAL;
+          res.vr = -1;
+          res.c.i = mat_loc;
+          vpushv(&res);
+        }
       }
       else if (src_complex && dst_complex)
       {
@@ -472,7 +612,8 @@ again:
         uint64_t src_mask = (src_bt == VT_LLONG) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << src_shift) - 1);
         uint64_t dst_mask = (dst_bt == VT_LLONG) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << dst_shift) - 1);
         uint64_t real_val = vtop->c.i & src_mask;
-        uint64_t imag_val = (vtop->c.i >> src_shift) & src_mask;
+        /* a 64-bit constant carries no imaginary half (see complex.c) */
+        uint64_t imag_val = (src_shift >= 64) ? 0 : (vtop->c.i >> src_shift) & src_mask;
         real_val &= dst_mask;
         imag_val &= dst_mask;
         vtop->c.i = (imag_val << dst_shift) | real_val;
@@ -505,7 +646,31 @@ again:
       double src_real = 0.0, src_imag = 0.0;
       if (src_complex)
       {
-        if (src_bt == VT_FLOAT)
+        if (!is_float(src_bt))
+        {
+          /* Complex int: parts packed as (imag << shift | real) in CValue.i */
+          int shift = btype_size(src_bt) * 8;
+          uint64_t mask = (shift >= 64) ? ~0ULL : ((1ULL << shift) - 1);
+          uint64_t re_u = vtop->c.i & mask;
+          uint64_t im_u = (shift >= 64) ? 0 : ((vtop->c.i >> shift) & mask);
+          if (vtop->type.t & VT_UNSIGNED)
+          {
+            src_real = (double)re_u;
+            src_imag = (double)im_u;
+          }
+          else
+          {
+            if (shift < 64)
+            {
+              uint64_t sign = 1ULL << (shift - 1);
+              re_u = (re_u ^ sign) - sign;
+              im_u = (im_u ^ sign) - sign;
+            }
+            src_real = (double)(int64_t)re_u;
+            src_imag = (double)(int64_t)im_u;
+          }
+        }
+        else if (src_bt == VT_FLOAT)
         {
           /* Complex float: packed as {float_real, float_imag} in CValue.i */
           union

@@ -14,46 +14,9 @@
 
 int ssa_opt_has_side_effects(int op)
 {
-  switch (op) {
-  case TCCIR_OP_STORE:
-  case TCCIR_OP_STORE_INDEXED:
-  case TCCIR_OP_STORE_POSTINC:
-  case TCCIR_OP_FUNCCALLVAL:
-  case TCCIR_OP_FUNCCALLVOID:
-  case TCCIR_OP_FUNCPARAMVAL:
-  case TCCIR_OP_FUNCPARAMVOID:
-  case TCCIR_OP_CALLSEQ_BEGIN:
-  case TCCIR_OP_CALLSEQ_END:
-  case TCCIR_OP_CALLARG_REG:
-  case TCCIR_OP_CALLARG_STACK:
-  case TCCIR_OP_RETURNVALUE:
-  case TCCIR_OP_RETURNVOID:
-  case TCCIR_OP_JUMP:
-  case TCCIR_OP_JUMPIF:
-  case TCCIR_OP_IJUMP:
-  case TCCIR_OP_SWITCH_TABLE:
-  case TCCIR_OP_INLINE_ASM:
-  case TCCIR_OP_ASM_INPUT:
-  case TCCIR_OP_ASM_OUTPUT:
-  case TCCIR_OP_SETJMP:
-  case TCCIR_OP_LONGJMP:
-  case TCCIR_OP_NL_SETJMP:
-  case TCCIR_OP_NL_LONGJMP:
-  case TCCIR_OP_VLA_ALLOC:
-  case TCCIR_OP_VLA_SP_SAVE:
-  case TCCIR_OP_VLA_SP_RESTORE:
-  case TCCIR_OP_BLOCK_COPY:
-  case TCCIR_OP_SET_CHAIN:
-  case TCCIR_OP_INIT_CHAIN_SLOT:
-  case TCCIR_OP_BUILTIN_APPLY_ARGS:
-  case TCCIR_OP_BUILTIN_APPLY:
-  case TCCIR_OP_BUILTIN_RETURN:
-  case TCCIR_OP_TRAP:
-  case TCCIR_OP_PREFETCH:
-    return 1;
-  default:
-    return 0;
-  }
+  /* Everything but reading memory and the flags. */
+  return ir_op_has(op, IR_HZ_FROM_OP & ~(IR_HZ_MEM_READ | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ)) &&
+         !ir_opset_has(IR_LEGACY_GAP_OPS(TCCIR_OP_LOAD_POSTINC), op);
 }
 
 void ssa_opt_nop_instr(IRSSAOptCtx *ctx, int idx)
@@ -64,27 +27,23 @@ void ssa_opt_nop_instr(IRSSAOptCtx *ctx, int idx)
     return;
 
   if (irop_config[q->op].has_src1) {
-    IROperand s = tcc_ir_op_get_src1(ir, q);
-    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(s));
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, tcc_ir_op_src1_vreg(ir, q));
     if (vi)
       ssa_opt_remove_use_instr(vi, idx);
   }
   if (irop_config[q->op].has_src2) {
-    IROperand s = tcc_ir_op_get_src2(ir, q);
-    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(s));
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, tcc_ir_op_src2_vreg(ir, q));
     if (vi)
       ssa_opt_remove_use_instr(vi, idx);
   }
   if (q->op == TCCIR_OP_MLA) {
-    IROperand a = tcc_ir_op_get_accum(ir, q);
-    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(a));
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, tcc_ir_op_accum_vreg(ir, q));
     if (vi)
       ssa_opt_remove_use_instr(vi, idx);
   }
   if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED ||
       q->op == TCCIR_OP_STORE_POSTINC) {
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(d));
+    IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, tcc_ir_op_dest_vreg(ir, q));
     if (vi)
       ssa_opt_remove_use_instr(vi, idx);
   }
@@ -140,8 +99,7 @@ static int ssa_opt_use_is_barrel_shift_src2(IRSSAOptCtx *ctx, IRSSAUse use,
   if (tcc_ir_barrel_shift_at(ir, q) == 0 || !irop_config[q->op].has_src2)
     return 0;
 
-  IROperand src2 = tcc_ir_op_get_src2(ir, q);
-  return irop_get_vreg(src2) == old_vr;
+  return tcc_ir_op_src2_vreg(ir, q) == old_vr;
 }
 
 static void ssa_opt_rewrite_phi_operand(IRSSAOptCtx *ctx, int block,

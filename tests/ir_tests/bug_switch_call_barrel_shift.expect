@@ -1,0 +1,17 @@
+sum16(15)=0
+sum16(16)=0
+sum16(64)=6
+sum16(100)=15
+count_dbl(0)=0
+count_dbl(7)=4
+count_dbl(10)=5
+count_asr(3)=0
+count_asr(17)=4
+count_asr(-8)=0
+add_scaled(4)=48
+sub_scaled(5)=960
+wrap_add(3)=8
+cnt3=0 3 18 6
+cnt_shl=24 0
+sum16(vn)=1
+dispatch=10 20 70 -1

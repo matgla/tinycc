@@ -78,9 +78,8 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
     if (q->op == TCCIR_OP_LEA)
     {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
       int32_t d_vr = irop_get_vreg(dest);
-      int32_t s_vr = irop_get_vreg(src1);
+      int32_t s_vr = tcc_ir_op_src1_vreg(ir, q);
       if (s_vr >= 0 && TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_VAR)
       {
         int var_pos = TCCIR_DECODE_VREG_POSITION(s_vr);
@@ -106,10 +105,8 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
     /* LEA propagation: STORE V = T where T is a LEA result */
     if (q->op == TCCIR_OP_STORE)
     {
-      IROperand dest_op = tcc_ir_op_get_dest(ir, q);
-      IROperand src1_op = tcc_ir_op_get_src1(ir, q);
-      int32_t d_vr = irop_get_vreg(dest_op);
-      int32_t s_vr = irop_get_vreg(src1_op);
+      int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
+      int32_t s_vr = tcc_ir_op_src1_vreg(ir, q);
       if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR && s_vr >= 0 &&
           TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_TEMP)
       {
@@ -123,10 +120,8 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
     /* LEA propagation: ASSIGN T = V where V holds a LEA result */
     if (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LOAD)
     {
-      IROperand dest_op = tcc_ir_op_get_dest(ir, q);
-      IROperand src1_op = tcc_ir_op_get_src1(ir, q);
-      int32_t d_vr = irop_get_vreg(dest_op);
-      int32_t s_vr = irop_get_vreg(src1_op);
+      int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
+      int32_t s_vr = tcc_ir_op_src1_vreg(ir, q);
       if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP && s_vr >= 0 &&
           TCCIR_DECODE_VREG_TYPE(s_vr) == TCCIR_VREG_TYPE_VAR)
       {
@@ -140,8 +135,7 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
     /* Mark VARs read as src1 (all instructions including STORE) */
     if (irop_config[q->op].has_src1)
     {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(src1);
+      int32_t vr = tcc_ir_op_src1_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -153,8 +147,7 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
     /* Mark VARs read as src2 */
     if (irop_config[q->op].has_src2)
     {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int32_t vr = irop_get_vreg(src2);
+      int32_t vr = tcc_ir_op_src2_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -166,7 +159,7 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
     /* MLA accumulator is a read the src1/src2 helpers above don't cover. */
     if (q->op == TCCIR_OP_MLA)
     {
-      int32_t vr = irop_get_vreg(tcc_ir_op_get_accum(ir, q));
+      int32_t vr = tcc_ir_op_accum_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -185,8 +178,7 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
 
     if (irop_config[q->op].has_src1)
     {
-      IROperand src1 = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(src1);
+      int32_t vr = tcc_ir_op_src1_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
       {
         int tmp_pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -195,8 +187,7 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
           int is_ptr_copy = 0;
           if (q->op == TCCIR_OP_STORE)
           {
-            IROperand d = tcc_ir_op_get_dest(ir, q);
-            int32_t d_vr = irop_get_vreg(d);
+            int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
             if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_VAR)
               is_ptr_copy = 1;
           }
@@ -212,8 +203,7 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
 
     if (irop_config[q->op].has_src2)
     {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int32_t vr = irop_get_vreg(src2);
+      int32_t vr = tcc_ir_op_src2_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
       {
         int tmp_pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -232,9 +222,9 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
      * the LEA like STORE's and dies with it in Pass 3. */
     int32_t use_vr = -1;
     if (q->op == TCCIR_OP_MLA)
-      use_vr = irop_get_vreg(tcc_ir_op_get_accum(ir, q));
+      use_vr = tcc_ir_op_accum_vreg(ir, q);
     else if (q->op == TCCIR_OP_STORE_POSTINC)
-      use_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+      use_vr = tcc_ir_op_dest_vreg(ir, q);
     if (use_vr >= 0 && TCCIR_DECODE_VREG_TYPE(use_vr) == TCCIR_VREG_TYPE_TEMP)
     {
       int tmp_pos = TCCIR_DECODE_VREG_POSITION(use_vr);
@@ -249,8 +239,7 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_FUNCPARAMVAL)
       continue;
-    IROperand param_val = tcc_ir_op_get_src1(ir, q);
-    int32_t vr = irop_get_vreg(param_val);
+    int32_t vr = tcc_ir_op_src1_vreg(ir, q);
     if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
     {
       int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -284,8 +273,7 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
     /* ASSIGN to dead VAR -> NOP (only if VAR has LEA, proving all accesses are tracked) */
     if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_dest)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t vr = irop_get_vreg(dest);
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -300,12 +288,10 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
     /* LEA from dead VAR -> NOP (TMP dests only; VAR dests handled by regular DSE) */
     if (q->op == TCCIR_OP_LEA)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t d_vr = irop_get_vreg(dest);
+      int32_t d_vr = tcc_ir_op_dest_vreg(ir, q);
       if (d_vr >= 0 && TCCIR_DECODE_VREG_TYPE(d_vr) == TCCIR_VREG_TYPE_TEMP)
       {
-        IROperand src1 = tcc_ir_op_get_src1(ir, q);
-        int32_t vr = irop_get_vreg(src1);
+        int32_t vr = tcc_ir_op_src1_vreg(ir, q);
         if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
         {
           int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -325,8 +311,7 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
      * STORE_INDEXEDs, and wrote the zeros through its caller's r4 and r5). */
     if (q->op == TCCIR_OP_STORE || q->op == TCCIR_OP_STORE_INDEXED)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t vr = irop_get_vreg(dest);
+      int32_t vr = tcc_ir_op_dest_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
       {
         int tmp_pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -349,8 +334,7 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_STORE)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t vr = irop_get_vreg(dest);
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
     {
       int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -370,5 +354,3 @@ int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir)
   tcc_free(var_read);
   return changes;
 }
-
-int tcc_ir_opt_dead_addrvar_elim_ex(IROptCtx *ctx) { return tcc_ir_opt_dead_addrvar_elim(ctx->ir); }

@@ -24,21 +24,12 @@
  *  Unprivileged load/store — shared shape (T32 only)
  * ═══════════════════════════════════════════════════════════════════ */
 
-static const thop_variant_shape SHAPE_T32_MEM_UNPRIV = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {12, 4},
-    .rn_place = {16, 4},
-    .imm = {.kind = IMM_RAW, .width = 8},
-    .imm_place = {0, 8},
-    .feat = {.t32 = 1},
-};
-
-#define V_MEM_UNPRIV(b) {&SHAPE_T32_MEM_UNPRIV, (b)}
+#define V_MEM_UNPRIV(b) {THOP_SHAPE_T32_MEM_UNPRIV, (b)}
 
 #define THOP_MEM_UNPRIV_FN(fn_name, table_id)                                                                          \
     thumb_opcode fn_name(uint32_t rt, uint32_t rn, int imm)                                                              \
     {                                                                                                                    \
-        return thop_emit((table_id).name, (table_id).variants, (table_id).variant_count,                                 \
+        return thop_emit_table(&(table_id), \
                          (thop_args){.rd = rt, .rn = rn, .imm = (uint32_t)imm});                                         \
     }
 

@@ -19,19 +19,12 @@
 /* Pass entry points (defined in ir/opt_dce.c; forward-declared here to avoid
  * pulling in the optimizer engine headers). */
 int tcc_ir_opt_dead_var_store_elim(TCCIRState *ir);
+int tcc_ir_opt_dse(TCCIRState *ir);
 int tcc_ir_opt_dead_addrvar_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_trailing_addrvar_store_elim(TCCIRState *ir);
 int tcc_ir_opt_zero_vla_elim(TCCIRState *ir);
 int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir);
 int tcc_ir_opt_infinite_loop_simplify(TCCIRState *ir);
-
-/* IROptCtx wrapper entry points. */
-int tcc_ir_opt_dead_var_store_elim_ex(IROptCtx *ctx);
-int tcc_ir_opt_dead_addrvar_elim_ex(IROptCtx *ctx);
-int tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(IROptCtx *ctx);
-int tcc_ir_opt_zero_vla_elim_ex(IROptCtx *ctx);
-int tcc_ir_opt_dead_before_infinite_loop_ex(IROptCtx *ctx);
-int tcc_ir_opt_infinite_loop_simplify_ex(IROptCtx *ctx);
 
 #define I32 IROP_BTYPE_INT32
 
@@ -245,6 +238,84 @@ UT_TEST(test_dead_trailing_addrvar_write_before_read_kept)
   return 0;
 }
 
+/* A write to V0 after its last read, in a function that touches volatile
+ * memory.  The write is dead; a volatile access it performs is not. */
+enum DtaVolatile
+{
+  DTA_VOL_NONE,       /* V0 <- *P0 (proven non-volatile): NOPed */
+  DTA_VOL_LOAD_SRC,   /* V0 <- *P0 (volatile) */
+  DTA_VOL_ALU_SRC,    /* V0 <- *P0 ADD #1 (volatile) */
+  DTA_VOL_VAR,        /* V0 <- #2, V0 a volatile local */
+  DTA_VOL_VAR_VIA_PTR, /* *&V0 <- #2, V0 a volatile local */
+  DTA_VOL_STORE_DEST  /* *(volatile int *)&V0 <- #2 */
+};
+
+static TCCIRState *dta_vol_fixture(enum DtaVolatile kind, int *write)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 2);
+  ir->func_has_volatile_access = 1;
+  if (kind == DTA_VOL_VAR || kind == DTA_VOL_VAR_VIA_PTR)
+    ir->variables_live_intervals[0].is_volatile = 1;
+  IROperand r = utb_lval(utb_param(0, I32)); /* no mark: may be volatile */
+  IROperand nv_r = r;
+  nv_r.aux |= IROP_AUX_NONVOLATILE;
+  IROperand slot = utb_deref_temp(0, I32);
+  slot.aux |= IROP_AUX_NONVOLATILE;
+
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE); /* dummy 2nd VAR */
+  utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, slot, utb_imm(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(1, I32), slot, UTB_NONE); /* last read of V0 */
+  switch (kind)
+  {
+  case DTA_VOL_NONE:
+    *write = utb_emit(ir, TCCIR_OP_LOAD, utb_var(0, I32), nv_r, UTB_NONE);
+    break;
+  case DTA_VOL_LOAD_SRC:
+    *write = utb_emit(ir, TCCIR_OP_LOAD, utb_var(0, I32), r, UTB_NONE);
+    break;
+  case DTA_VOL_ALU_SRC:
+    *write = utb_emit(ir, TCCIR_OP_ADD, utb_var(0, I32), r, utb_imm(1, I32));
+    break;
+  case DTA_VOL_VAR:
+    *write = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(0, I32), utb_imm(2, I32), UTB_NONE);
+    break;
+  case DTA_VOL_VAR_VIA_PTR:
+    *write = utb_emit(ir, TCCIR_OP_STORE, slot, utb_imm(2, I32), UTB_NONE);
+    break;
+  case DTA_VOL_STORE_DEST:
+    *write = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(2, I32), UTB_NONE);
+    break;
+  }
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
+  return ir;
+}
+
+UT_TEST(test_dead_trailing_addrvar_nonvolatile_write_in_volatile_fn_removed)
+{
+  int write;
+  TCCIRState *ir = dta_vol_fixture(DTA_VOL_NONE, &write);
+  UT_ASSERT_EQ(tcc_ir_opt_dead_trailing_addrvar_store_elim(ir), 1);
+  UT_ASSERT_EQ(utb_op(ir, write), TCCIR_OP_NOP);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_dead_trailing_addrvar_volatile_access_kept)
+{
+  static const int ops[] = {0, TCCIR_OP_LOAD, TCCIR_OP_ADD, TCCIR_OP_ASSIGN, TCCIR_OP_STORE, TCCIR_OP_STORE};
+  for (int kind = DTA_VOL_LOAD_SRC; kind <= DTA_VOL_STORE_DEST; kind++)
+  {
+    int write;
+    TCCIRState *ir = dta_vol_fixture(kind, &write);
+    UT_ASSERT_EQ(tcc_ir_opt_dead_trailing_addrvar_store_elim(ir), 0);
+    UT_ASSERT_EQ(utb_op(ir, write), ops[kind]);
+    utb_free(ir);
+  }
+  return 0;
+}
+
 /* ================================================================== zero_vla_elim */
 
 /* POSITIVE: a VLA_ALLOC whose size resolves to the compile-time constant 0
@@ -403,17 +474,9 @@ UT_TEST(test_infinite_loop_simplify_indexed_store_blocks_collapse)
  * docs/plan_legacy_loop_dead_loop_elim_ssa.md), so its two unit tests
  * (const-VAR hoist positive, _ex-empty) were removed with the symbol. */
 
-/* ================================================================== IROptCtx wrappers */
+/* ================================================================== direct entry points */
 
-/* Helper: zero an IROptCtx and point it at `ir`. */
-static IROptCtx utb_ctx(TCCIRState *ir)
-{
-  IROptCtx ctx = {0};
-  ctx.ir = ir;
-  return ctx;
-}
-
-UT_TEST(test_dead_var_store_elim_ex_forwards)
+UT_TEST(test_dead_var_store_elim_direct_call)
 {
   TCCIRState *ir = utb_new();
   utb_alloc_var_intervals(ir, 2);
@@ -421,8 +484,7 @@ UT_TEST(test_dead_var_store_elim_ex_forwards)
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(9, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_var(1, I32), UTB_NONE);
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_dead_var_store_elim_ex(&ctx);
+  int changes = tcc_ir_opt_dead_var_store_elim(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
@@ -431,7 +493,7 @@ UT_TEST(test_dead_var_store_elim_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_dead_addrvar_elim_ex_forwards)
+UT_TEST(test_dead_addrvar_elim_direct_call)
 {
   TCCIRState *ir = utb_new();
   int lea = utb_emit(ir, TCCIR_OP_LEA, utb_temp(0, I32), utb_var(0, I32), UTB_NONE);
@@ -439,8 +501,7 @@ UT_TEST(test_dead_addrvar_elim_ex_forwards)
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(1, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_var(1, I32), UTB_NONE);
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_dead_addrvar_elim_ex(&ctx);
+  int changes = tcc_ir_opt_dead_addrvar_elim(ir);
 
   UT_ASSERT_EQ(changes, 2);
   UT_ASSERT_EQ(utb_op(ir, lea), TCCIR_OP_NOP);
@@ -450,7 +511,7 @@ UT_TEST(test_dead_addrvar_elim_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_dead_trailing_addrvar_store_elim_ex_forwards)
+UT_TEST(test_dead_trailing_addrvar_store_elim_direct_call)
 {
   TCCIRState *ir = utb_new();
   utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(0, I32), UTB_NONE);
@@ -460,8 +521,7 @@ UT_TEST(test_dead_trailing_addrvar_store_elim_ex_forwards)
   int dead = utb_emit(ir, TCCIR_OP_STORE, utb_deref_temp(0, I32), utb_imm(2, I32), UTB_NONE);
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(1, I32), UTB_NONE);
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_dead_trailing_addrvar_store_elim_ex(&ctx);
+  int changes = tcc_ir_opt_dead_trailing_addrvar_store_elim(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, kept), TCCIR_OP_STORE);
@@ -471,13 +531,12 @@ UT_TEST(test_dead_trailing_addrvar_store_elim_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_zero_vla_elim_ex_forwards)
+UT_TEST(test_zero_vla_elim_direct_call)
 {
   TCCIRState *ir = utb_new();
   int alloc = utb_emit(ir, TCCIR_OP_VLA_ALLOC, UTB_NONE, utb_imm(0, I32), utb_imm(8, I32));
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_zero_vla_elim_ex(&ctx);
+  int changes = tcc_ir_opt_zero_vla_elim(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, alloc), TCCIR_OP_NOP);
@@ -486,7 +545,7 @@ UT_TEST(test_zero_vla_elim_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_dead_before_infinite_loop_ex_forwards)
+UT_TEST(test_dead_before_infinite_loop_direct_call)
 {
   TCCIRState *ir = utb_new();
   tcc_state->optimize = 2;
@@ -494,8 +553,7 @@ UT_TEST(test_dead_before_infinite_loop_ex_forwards)
   int dead = utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
   emit_jump(ir, 1);
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_dead_before_infinite_loop_ex(&ctx);
+  int changes = tcc_ir_opt_dead_before_infinite_loop(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);
@@ -505,7 +563,7 @@ UT_TEST(test_dead_before_infinite_loop_ex_forwards)
   return 0;
 }
 
-UT_TEST(test_infinite_loop_simplify_ex_forwards)
+UT_TEST(test_infinite_loop_simplify_direct_call)
 {
   TCCIRState *ir = utb_loop_new();
   tcc_state->optimize = 2;
@@ -519,8 +577,7 @@ UT_TEST(test_infinite_loop_simplify_ex_forwards)
   int back_edge = emit_jump(ir, 0);
   utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_infinite_loop_simplify_ex(&ctx);
+  int changes = tcc_ir_opt_infinite_loop_simplify(ir);
 
   UT_ASSERT(changes > 0);
   UT_ASSERT_EQ(utb_op(ir, header), TCCIR_OP_JUMP);
@@ -529,6 +586,90 @@ UT_TEST(test_infinite_loop_simplify_ex_forwards)
 
   tcc_state->optimize = 0;
   utb_free(ir);
+  return 0;
+}
+
+enum DseWawGuard
+{
+  DSE_WAW_NONE,
+  DSE_WAW_READ,
+  DSE_WAW_ALIAS_READ,
+  DSE_WAW_CALL,
+  DSE_WAW_TARGET,
+  DSE_WAW_PARTIAL,
+  DSE_WAW_SELF_READ,
+  DSE_WAW_VOLATILE,
+  DSE_WAW_SCALED,
+  DSE_WAW_REDEFINE
+};
+
+static TCCIRState *dse_waw_fixture(enum DseWawGuard guard, int *lo, int *hi)
+{
+  TCCIRState *ir = utb_new();
+  utb_alloc_var_intervals(ir, 2);
+  ir->variables_live_intervals[1].addrtaken = 1;
+  IROperand var = utb_var(1, IROP_BTYPE_INT64);
+  IROperand ptr = utb_temp(1, I32);
+  utb_emit(ir, TCCIR_OP_LEA, ptr, var, UTB_NONE);
+  *lo = utb_emit4(ir, TCCIR_OP_STORE_INDEXED, ptr, utb_imm(0, I32), utb_imm(0, I32),
+                  utb_imm(guard == DSE_WAW_SCALED ? 1 : 0, I32));
+  *hi = utb_emit4(ir, TCCIR_OP_STORE_INDEXED, ptr, utb_imm(0, I32), utb_imm(4, I32), utb_imm(0, I32));
+  if (guard == DSE_WAW_READ)
+    utb_emit(ir, TCCIR_OP_LOAD, utb_temp(4, I32), utb_lval(ptr), UTB_NONE);
+  if (guard == DSE_WAW_ALIAS_READ)
+    utb_emit(ir, TCCIR_OP_LOAD, utb_temp(4, I32), utb_lval(utb_param(0, I32)), UTB_NONE);
+  if (guard == DSE_WAW_CALL)
+    utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, utb_param(0, I32), utb_imm(0, I32));
+  if (guard == DSE_WAW_REDEFINE)
+    utb_emit(ir, TCCIR_OP_ASSIGN, ptr, utb_param(0, I32), UTB_NONE);
+  IROperand dest = guard == DSE_WAW_PARTIAL ? utb_var(1, I32) : var;
+  IROperand value = guard == DSE_WAW_SELF_READ ? var : utb_param(1, IROP_BTYPE_INT64);
+  int overwrite = utb_emit(ir, TCCIR_OP_ASSIGN, dest, value, UTB_NONE);
+  if (guard == DSE_WAW_TARGET)
+    ir->compact_instructions[overwrite].is_jump_target = 1;
+  if (guard == DSE_WAW_VOLATILE)
+  {
+    ir->func_has_volatile_access = 1;
+    ir->variables_live_intervals[1].is_volatile = 1;
+  }
+  utb_emit(ir, TCCIR_OP_LOAD, utb_temp(3, IROP_BTYPE_INT64), utb_lval(ptr), UTB_NONE);
+  if (guard == DSE_WAW_READ || guard == DSE_WAW_ALIAS_READ)
+  {
+    utb_emit(ir, TCCIR_OP_ADD, utb_temp(5, IROP_BTYPE_INT64), utb_temp(3, IROP_BTYPE_INT64), utb_temp(4, I32));
+    utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(5, IROP_BTYPE_INT64), UTB_NONE);
+  }
+  else
+    utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, IROP_BTYPE_INT64), UTB_NONE);
+  return ir;
+}
+
+UT_TEST(test_dse_addrvar_indexed_zeroing_fully_overwritten)
+{
+  int ops[] = {TCCIR_OP_ASSIGN, TCCIR_OP_LOAD, TCCIR_OP_STORE};
+  for (unsigned k = 0; k < sizeof(ops) / sizeof(ops[0]); k++)
+  {
+    int lo, hi;
+    TCCIRState *ir = dse_waw_fixture(DSE_WAW_NONE, &lo, &hi);
+    ir->compact_instructions[hi + 1].op = ops[k];
+    UT_ASSERT(tcc_ir_opt_dse(ir) >= 2);
+    UT_ASSERT_EQ(utb_op(ir, lo), TCCIR_OP_NOP);
+    UT_ASSERT_EQ(utb_op(ir, hi), TCCIR_OP_NOP);
+    utb_free(ir);
+  }
+  return 0;
+}
+
+UT_TEST(test_dse_addrvar_indexed_zeroing_guards)
+{
+  for (int guard = DSE_WAW_READ; guard <= DSE_WAW_REDEFINE; guard++)
+  {
+    int lo, hi;
+    TCCIRState *ir = dse_waw_fixture(guard, &lo, &hi);
+    tcc_ir_opt_dse(ir);
+    UT_ASSERT_EQ(utb_op(ir, lo), TCCIR_OP_STORE_INDEXED);
+    UT_ASSERT_EQ(utb_op(ir, hi), TCCIR_OP_STORE_INDEXED);
+    utb_free(ir);
+  }
   return 0;
 }
 

@@ -110,14 +110,13 @@ static int bitop_call_fold(TCCIRState *ir, int i, IROperand callee_op, int *out)
 
 OPT_GEN_SSA(bitop_fold, TCCIR_OP_FUNCCALLVAL) {
   int result = 0;
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(src1);
   GUARD(when(bitop_call_fold(ir, i, src1, &result)));
 
   ir_opt_nop_call_params(ir, i);
   tcc_ir_set_src2(ir, i, IROP_NONE);
-  REWRITE(
-    .new_op = TCCIR_OP_ASSIGN,
-    .src1   = irop_make_imm32(-1, result, VT_INT));
+  REWRITE(set_op(TCCIR_OP_ASSIGN), set_src1(irop_make_imm32(-1, result, VT_INT)));
 }
 
 static const IRSSAOptGen bitop_gens[] = {

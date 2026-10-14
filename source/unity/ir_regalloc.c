@@ -14,3 +14,5 @@
 #undef AV_FOR_PARAM_USES
 #undef HINT_IDX
 #undef RA_EXITPHI_PUSH
+#undef RA_WIDEN_MAX_WORDS
+#undef W_ROW

@@ -210,21 +210,30 @@ UT_TEST(test_stmdb_no_writeback)
 UT_TEST(test_ldm_exclude_bit)
 {
   setup_armv7m();
-  /* When rn is in regset, exclude_bit clears it from raw placement */
+  /* Write-back with the base in the list is UNPREDICTABLE: rejected, the
+   * base is never silently dropped from the list. */
   thumb_opcode op = th_ldm(0, 0x05, 1, ENFORCE_ENCODING_NONE); /* ldm r0!, {r0, r2} */
+  UT_ASSERT_EQ(op.size, 0);
+  /* Without write-back the base stays in the list (16-bit LDM T1 form) */
+  op = th_ldm(0, 0x05, 0, ENFORCE_ENCODING_NONE);
   UT_ASSERT_EQ(op.size, 2);
-  /* r0 bit cleared from raw placement -> only r2 remains -> 0xC804 */
-  UT_ASSERT_EQ(op.opcode, 0xC804);
+  UT_ASSERT_EQ(op.opcode, 0xC805);
+  /* 16-bit LDM, base not in list, implicit write-back */
+  op = th_ldm(0, 0x06, 1, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 2);
+  UT_ASSERT_EQ(op.opcode, 0xC806);
   return 0;
 }
 
 UT_TEST(test_stm_exclude_bit)
 {
   setup_armv7m();
-  /* When rn is in regset, exclude_bit clears it from raw placement */
+  /* Base is the lowest register in the list: 16-bit form stores both r0, r2 */
   thumb_opcode op = th_stm(0, 0x05, 1, ENFORCE_ENCODING_NONE); /* stm r0!, {r0, r2} */
   UT_ASSERT_EQ(op.size, 2);
-  /* r0 bit cleared from raw placement -> only r2 remains -> 0xC004 */
-  UT_ASSERT_EQ(op.opcode, 0xC004);
+  UT_ASSERT_EQ(op.opcode, 0xC005);
+  /* Base not the lowest register in the list: UNPREDICTABLE, rejected */
+  op = th_stm(2, 0x05, 1, ENFORCE_ENCODING_NONE);
+  UT_ASSERT_EQ(op.size, 0);
   return 0;
 }

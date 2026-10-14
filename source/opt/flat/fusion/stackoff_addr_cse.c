@@ -186,14 +186,13 @@ static int32_t sib_find_prologue_addr_temp(TCCIRState *ir, int prologue_end, int
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_ASSIGN)
       continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
     IROperand s1 = tcc_ir_op_get_src1(ir, q);
     if (irop_get_tag(s1) != IROP_TAG_STACKOFF || s1.is_lval || s1.is_llocal)
       continue;
     if (s1.u.imm32 != off)
       continue;
-    int32_t vr = irop_get_vreg(d);
-    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || d.is_lval)
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
+    if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP || tcc_ir_op_dest_is_lval(ir, q))
       continue;
     int defs = 0;
     for (int j = 0; j < n; j++)
@@ -208,10 +207,9 @@ static int32_t sib_find_prologue_addr_temp(TCCIRState *ir, int prologue_end, int
       if (dq->op == TCCIR_OP_STORE || dq->op == TCCIR_OP_STORE_INDEXED ||
           dq->op == TCCIR_OP_STORE_POSTINC)
         continue;
-      IROperand dd = tcc_ir_op_get_dest(ir, dq);
-      if (dd.is_lval)
+      if (tcc_ir_op_dest_is_lval(ir, dq))
         continue;
-      if (irop_get_vreg(dd) == vr)
+      if (tcc_ir_op_dest_vreg(ir, dq) == vr)
         defs++;
     }
     if (defs == 1)
@@ -271,8 +269,7 @@ int tcc_ir_opt_stackoff_indexed_base_cse(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_LOAD_INDEXED && q->op != TCCIR_OP_STORE_INDEXED)
       continue;
-    IROperand base = (q->op == TCCIR_OP_STORE_INDEXED) ? tcc_ir_op_get_dest(ir, q)
-                                                       : tcc_ir_op_get_src1(ir, q);
+    IROperand base = tcc_ir_op_get_dest_or_src1(ir, q, q->op != TCCIR_OP_STORE_INDEXED);
     if (irop_get_tag(base) != IROP_TAG_STACKOFF || base.is_lval)
       continue;
     int32_t off = base.u.imm32;
@@ -325,7 +322,7 @@ int tcc_ir_opt_stackoff_indexed_base_cse(TCCIRState *ir)
     int is_store = (q->op == TCCIR_OP_STORE_INDEXED);
     if (q->op != TCCIR_OP_LOAD_INDEXED && !is_store)
       continue;
-    IROperand base = is_store ? tcc_ir_op_get_dest(ir, q) : tcc_ir_op_get_src1(ir, q);
+    IROperand base = tcc_ir_op_get_dest_or_src1(ir, q, !is_store);
     if (irop_get_tag(base) != IROP_TAG_STACKOFF || base.is_lval)
       continue;
     int slot = -1;

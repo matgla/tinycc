@@ -68,8 +68,7 @@ int tcc_ir_opt_zero_vla_elim(TCCIRState *ir)
           if (irop_get_tag(dest) == IROP_TAG_STACKOFF &&
               irop_get_stack_offset(dest) == slot)
           {
-            IROperand src = tcc_ir_op_get_src1(ir, qj);
-            if (irop_is_immediate(src) && irop_get_imm64_ex(ir, src) == 0)
+            if (tcc_ir_op_src1_is_imm(ir, qj) && tcc_ir_op_src1_imm(ir, qj) == 0)
               size_is_zero = 1;
             break;
           }
@@ -232,9 +231,4 @@ int tcc_ir_opt_zero_vla_elim(TCCIRState *ir)
 #undef SLOT_USED_BY
 
   return changed;
-}
-
-int tcc_ir_opt_zero_vla_elim_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_zero_vla_elim(ctx->ir);
 }

@@ -121,7 +121,13 @@ int tcc_ir_vreg_has_single_def(struct TCCIRState *ir, int32_t vreg);
 int tcc_ir_vreg_has_multi_def(struct TCCIRState *ir, int32_t vreg);
 
 /* memcpy/memmove + __aeabi_mem{cpy,move}{,4,8}; the __tcc_memmove alias is NOT included. */
+/* Whether name is one of the NUL-separated names in list ("a\0b\0"; the
+ * literal's own terminator ends the list). */
+int ir_opt_name_in(const char *name, const char *list);
 int ir_opt_is_memcpy_or_memmove_name(const char *name);
+/* memset(dst, c, n) vs __aeabi_memset(dst, n, c): for either name, returns 1 and the
+ * PARAM indices of the size and fill value; 0 for any other callee. */
+int ir_opt_memset_params(const char *name, int *size_idx, int *fill_idx);
 
 int change_callee_sym(struct TCCIRState *ir, int instr_idx, const char *new_name, int ret_btype);
 int change_callee_sym_keep_type(struct TCCIRState *ir, int instr_idx, const char *new_name);
@@ -155,17 +161,36 @@ static inline int64_t ir_d_to_bits(double d)
   return (int64_t)c.u;
 }
 
-/* 3-way compare (-1/0/+1) of soft-float bit patterns; *is_nan flags IEEE-unordered. */
-static inline int ir_softfp_cmp3(int is_double, int64_t a0, int64_t a1, int *is_nan)
+/* A forward-reachability worklist over instruction indices: `bits` marks the
+ * reached ones, wl[head..tail) holds those still to visit; both sized n. */
+typedef struct IrReachWorklist
 {
-  if (is_double)
-  {
-    double a = ir_bits_to_d(a0), b = ir_bits_to_d(a1);
-    *is_nan = (a != a) || (b != b);
-    return (a > b) - (a < b);
-  }
-  float a = ir_bits_to_f(a0), b = ir_bits_to_f(a1);
-  *is_nan = (a != a) || (b != b);
-  return (a > b) - (a < b);
-}
+  uint8_t *bits;
+  int *wl;
+  int head, tail, n;
+} IrReachWorklist;
+
+/* Reach instruction idx (ignored outside [0, n) or when already reached). */
+void ir_opt_reach_mark(IrReachWorklist *w, int idx);
+
+/* The same with one byte per element: seen[idx] set, idx pushed on list[top++]. */
+typedef struct IrReachList
+{
+  uint8_t *seen;
+  int *list;
+  int top, n;
+} IrReachList;
+
+void ir_opt_reach_push(IrReachList *w, int idx);
+
+/* Whole-body rewrites of the collapse passes: NOP instructions [0, n) and clear
+ * their jump-target marks; make instruction 0 a `JUMP 0` self-loop (`b .`);
+ * clear the post-RA dirty-register masks and live-register map and mark the
+ * function a leaf, for a body that no longer touches registers. */
+void ir_opt_nop_body(struct TCCIRState *ir, int n);
+void ir_opt_set_self_jump0(struct TCCIRState *ir);
+void ir_opt_reset_body_regs(struct TCCIRState *ir);
+
+/* 3-way compare (-1/0/+1) of soft-float bit patterns; *is_nan flags IEEE-unordered. */
+int ir_softfp_cmp3(int is_double, int64_t a0, int64_t a1, int *is_nan);
 

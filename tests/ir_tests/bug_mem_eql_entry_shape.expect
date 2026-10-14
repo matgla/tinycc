@@ -1,0 +1,14 @@
+eql: 1312 equal, 14432 differ
+find_child: usr/lib
+find_child none: 1
+find_entry: libc.so lib 1
+xor_fold4: 00000100 00000000
+sum64_4: 00060f1f201a1101
+identities: 000048d0 8000a869
+trim: [usr/lib] 3 [/ /usr/lib/ /] 0 0
+ret_goto: -22 -14 7
+ret_uchar: 200 46 253 1 0
+ret_schar: -100 -56 -7 44
+ret_short: -30000 0 -29536
+ret_reread: 1 9 5 12 18
+ret_volatile: 1 5 ret_addr: 1 42

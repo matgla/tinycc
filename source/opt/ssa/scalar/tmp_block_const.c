@@ -121,7 +121,7 @@ int ssa_opt_tmp_block_const(IRSSAOptCtx *ctx)
     }
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      int t = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      int t = (int)tcc_ir_op_dest_u_imm32(ir, q);
       if (t >= 0 && t < n)
         leader[t] = 1;
     }
@@ -179,10 +179,9 @@ int ssa_opt_tmp_block_const(IRSSAOptCtx *ctx)
     if (tbc_foldable_binop(q->op) && irop_config[q->op].has_dest &&
         irop_config[q->op].has_src1 && irop_config[q->op].has_src2)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(d);
-      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && !d.is_lval &&
-          irop_get_btype(d) == IROP_BTYPE_INT32)
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
+      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && !tcc_ir_op_dest_is_lval(ir, q) &&
+          tcc_ir_op_dest_btype(ir, q) == IROP_BTYPE_INT32)
       {
         IROperand s1 = tcc_ir_op_get_src1(ir, q);
         IROperand s2 = tcc_ir_op_get_src2(ir, q);
@@ -211,7 +210,7 @@ int ssa_opt_tmp_block_const(IRSSAOptCtx *ctx)
             }
             q->op = TCCIR_OP_ASSIGN;
             tcc_ir_set_src1(ir, i, irop_make_imm32(0, (int32_t)res, IROP_BTYPE_INT32));
-            tcc_ir_set_src2(ir, i, IROP_NONE);
+            tcc_ir_set_src2_none(ir, i);
             changes++;
             /* falls through: the def-update below records the new fact */
           }
@@ -233,7 +232,7 @@ int ssa_opt_tmp_block_const(IRSSAOptCtx *ctx)
          * immediate would bypass the shift. */
         if (s == 1 && tcc_ir_barrel_shift_at(ir, q))
           continue;
-        IROperand o = (s == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+        IROperand o = tcc_ir_op_get_src1_or_2(ir, q, s != 0);
         int32_t vr = irop_get_vreg(o);
         if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
           continue;
@@ -261,16 +260,15 @@ int ssa_opt_tmp_block_const(IRSSAOptCtx *ctx)
     /* Update facts from defs: only a non-lval TEMP dest changes the value. */
     if (irop_config[q->op].has_dest)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(d);
-      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && !d.is_lval)
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
+      if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP && !tcc_ir_op_dest_is_lval(ir, q))
       {
         int pos = TCCIR_DECODE_VREG_POSITION(dvr);
         if (pos < ntemp)
         {
           f.gen[pos] = 0;
           if ((q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_STORE) &&
-              irop_get_btype(d) == IROP_BTYPE_INT32)
+              tcc_ir_op_dest_btype(ir, q) == IROP_BTYPE_INT32)
           {
             int32_t cv;
             if (tbc_imm32_of(ir, tcc_ir_op_get_src1(ir, q), &cv))

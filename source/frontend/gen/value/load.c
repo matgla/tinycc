@@ -30,13 +30,26 @@
 /* find a free temporary local variable (return the offset on stack) match
    size and align. If none, add new temporary stack variable.
    The temp local index is encoded in vr_out using VR_TEMP_LOCAL(). */
+/* Temp slots named by FUNCPARAMVALs of calls still being built.  An argument
+ * leaves the vstack once its FUNCPARAMVAL is emitted, but the slot is only read
+ * when the call is lowered, so it must stay out of get_temp_local_var()'s reach
+ * until then.  unary_funcall saves/restores this around each call. */
+unsigned pending_call_temp_slots;
+
+void pin_call_arg_temp_slot(const SValue *sv)
+{
+  int r = sv->r & VT_VALMASK;
+  if ((r == VT_LOCAL || r == VT_LLOCAL) && VR_IS_TEMP_LOCAL(sv->vr))
+    pending_call_temp_slots |= 1u << VR_TEMP_LOCAL_IDX(sv->vr);
+}
+
 int get_temp_local_var(int size, int align, int *vr_out)
 {
   int i;
   struct temp_local_variable *temp_var;
   SValue *p;
   int r;
-  unsigned used = 0;
+  unsigned used = pending_call_temp_slots;
 
   /* mark locations that are still in use */
   for (p = vstack; p <= vtop; p++)
@@ -98,13 +111,14 @@ ST_FUNC void gaddrof(void)
     Sym *s;
     for (s = local_stack; s; s = s->prev)
     {
-      if (!s->facts || !s->facts->const_init_data || !s->facts->const_init_valid)
+      SymLocalFacts *f = sym_facts_peek(s);
+      if (!f || !f->const_init_data || !f->const_init_valid)
         continue;
-      if (s->facts->const_init_in_progress)
+      if (f->const_init_in_progress)
         continue;
       if ((int)s->c == off)
       {
-        s->facts->const_init_valid = 0;
+        f->const_init_valid = 0;
         break;
       }
     }
@@ -439,6 +453,116 @@ int adjust_bf(SValue *sv, int bit_pos, int bit_size)
   return t;
 }
 
+/* scalar_storage_order("big-endian"): the byte size of a value of `type`
+   stored byte-reversed in such an aggregate -- a scalar wider than a byte, or
+   for an array the scalar element.  0 for what is never swapped: bytes,
+   aggregates, bitfields (their storage unit is swapped instead), complex and
+   vector values. */
+int sso_scalar_size(CType *type)
+{
+  int align;
+  while (type->t & VT_ARRAY)
+    type = &type->ref->type;
+  if (type->t & (VT_BITFIELD | VT_COMPLEX | VT_VECTOR | VT_VLA))
+    return 0;
+  switch (type->t & VT_BTYPE)
+  {
+  case VT_SHORT:
+  case VT_INT:
+  case VT_LLONG:
+  case VT_PTR:
+  case VT_FLOAT:
+  case VT_DOUBLE:
+  case VT_LDOUBLE:
+    return type_size(type, &align);
+  default:
+    return 0;
+  }
+}
+
+/* The unsigned integer type of a byte-reversed scalar of `size` bytes. */
+static CType sso_uint_type(int size)
+{
+  CType t;
+  t.t = (size == 2 ? VT_SHORT : size == 4 ? VT_INT : VT_LLONG) | VT_UNSIGNED;
+  t.ref = NULL;
+  return t;
+}
+
+/* Reinterpret the bits of rvalue vtop as `to` (same size) through a temp
+   slot: the float <-> integer step of a byte-reversed float. */
+static void sso_reinterpret(CType *to)
+{
+  int align, vr;
+  const int size = type_size(to, &align);
+  const int tmp = get_temp_local_var(size, align, &vr);
+  CType from = vtop->type;
+  vset(&from, VT_LOCAL | VT_LVAL, tmp);
+  vtop->vr = vr;
+  vswap();
+  vstore();
+  vtop--;
+  vset(to, VT_LOCAL | VT_LVAL, tmp);
+  vtop->vr = vr;
+}
+
+/* vtop is a byte-reversed lvalue: load it as the unsigned integer of its size,
+   swap the bytes, and convert the result back to the lvalue's own type. */
+static void sso_load_reversed(void)
+{
+  CType type = vtop->type;
+  const int size = sso_scalar_size(&type);
+  vtop->sso_reversed = 0;
+  if (!size) /* relabelled after the member access: a path missing its swap */
+    tcc_error("internal: byte-reversed lvalue of a non-scalar type");
+  CType utype = sso_uint_type(size);
+  vtop->type.t = utype.t | (type.t & VT_VOLATILE);
+  vtop->type.ref = NULL;
+  gv(RC_TYPE(utype.t));
+  gen_bswap(size);
+  type.t &= ~(VT_CONSTANT | VT_VOLATILE);
+  if (is_float(type.t))
+    sso_reinterpret(&type);
+  else
+    gen_cast(&type);
+}
+
+/* tcc_ir_put()'s fallback for a byte-reversed lvalue handed to the IR as a
+   plain source operand (a variadic argument, a returned value, a condition):
+   `out` is its loaded, swapped value.  The caller's SValue is left alone. */
+void sso_load_operand(const SValue *sv, SValue *out)
+{
+  vpushv((SValue *)sv);
+  gv(RC_TYPE(vtop->type.t));
+  *out = *vtop;
+  vtop--;
+}
+
+/* vstore() into a byte-reversed lvalue: convert the source to the
+   destination's type, swap its bytes and store them as the unsigned integer
+   of that size.  The value of the assignment is the converted source. */
+void sso_store_reversed(void)
+{
+  CType type = vtop[-1].type;
+  const int size = sso_scalar_size(&type);
+  vtop[-1].sso_reversed = 0;
+  if (!size)
+    tcc_error("internal: byte-reversed lvalue of a non-scalar type");
+  CType utype = sso_uint_type(size);
+  type.t &= ~(VT_CONSTANT | VT_VOLATILE);
+  gen_cast(&type);
+  gv(RC_TYPE(type.t)); /* evaluated once: both stored and the result */
+  vdup();
+  vrott(3); /* value dst value */
+  if (is_float(type.t))
+    sso_reinterpret(&utype);
+  gen_bswap(size);
+  vtop[-1].type.t = utype.t | (vtop[-1].type.t & VT_VOLATILE);
+  vtop[-1].type.ref = NULL;
+  vstore();
+  vtop--;
+}
+
 /* store vtop a register belonging to class 'rc'. lvalues are
    converted to values. Cannot be used if cannot be converted to
    register value (such as structures). */
@@ -463,10 +587,20 @@ ST_FUNC int gv(int rc)
     }
   }
 
+  if ((vtop->r & VT_LVAL) && vtop->sso_reversed)
+  {
+    sso_load_reversed();
+    return gv(rc);
+  }
+
   /* NOTE: get_reg can modify vstack[] */
   if (vtop->type.t & VT_BITFIELD)
   {
     CType type;
+    /* the storage unit of a big-endian scalar_storage_order bitfield is
+       byte-reversed; its bit position counts from the swapped value's LSB */
+    const Sym *bf = vtop->type.ref;
+    const int bf_sso = bf && bf->a.sso_be;
 
     bit_pos = BIT_POS(vtop->type.t);
     bit_size = BIT_SIZE(vtop->type.t);
@@ -479,6 +613,11 @@ ST_FUNC int gv(int rc)
       type.t |= VT_UNSIGNED;
 
     r = adjust_bf(vtop, bit_pos, bit_size);
+    if (bf_sso && (vtop->r & VT_LVAL) && sso_scalar_size(&vtop->type))
+    {
+      vtop->sso_reversed = 1;
+      sso_load_reversed();
+    }
 
     if ((vtop->type.t & VT_BTYPE) == VT_LLONG)
       type.t |= VT_LLONG;

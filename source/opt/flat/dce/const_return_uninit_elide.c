@@ -41,7 +41,7 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
   int n = ir->next_instruction_index;
   if (n == 0)
     return 0;
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
   if (ir->has_static_chain)
     return 0;
@@ -217,7 +217,7 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
         continue;
       if (k == 2 && !irop_config[q->op].has_src2)
         continue;
-      IROperand sop = (k == 1) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand sop = tcc_ir_op_get_src1_or_2(ir, q, k != 1);
       if (irop_get_tag(sop) != IROP_TAG_STACKOFF)
         continue;
       if (!sop.is_lval)
@@ -244,7 +244,7 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
         continue;
       if (k == 2 && !irop_config[q->op].has_src2)
         continue;
-      IROperand sop = (k == 1) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand sop = tcc_ir_op_get_src1_or_2(ir, q, k != 1);
       int32_t svr = irop_get_vreg(sop);
       if (svr < 0)
         continue;
@@ -292,8 +292,7 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
     /* Record this instruction's VAR-vreg write (after the read check, program order). */
     if (!found_uninit && irop_config[q->op].has_dest)
     {
-      IROperand dop = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(dop);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR)
         crue_mark_var(var_written, dvr, CRUE_MAX_VAR_POS);
     }
@@ -315,23 +314,14 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
              "every RETURNVALUE returns the same constant)");
 
   /* NOP everything, then place a single RETURNVALUE-const at index 0. */
-  for (int i = 0; i < n; i++)
-  {
-    ir->compact_instructions[i].op = TCCIR_OP_NOP;
-    ir->compact_instructions[i].is_jump_target = 0;
-  }
+  ir_opt_nop_body(ir, n);
 
   ir->compact_instructions[0].op = TCCIR_OP_RETURNVALUE;
-  tcc_ir_set_dest(ir, 0, IROP_NONE);
+  tcc_ir_set_dest_none(ir, 0);
   tcc_ir_set_src1(ir, 0, rv_src);
-  tcc_ir_set_src2(ir, 0, IROP_NONE);
+  tcc_ir_set_src2_none(ir, 0);
 
-  ir->ls.dirty_registers = 0;
-  ir->ls.dirty_float_registers = 0;
-  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
-    memset(ir->ls.live_regs_by_instruction, 0,
-           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
-  ir->leaffunc = 1;
+  ir_opt_reset_body_regs(ir);
 
   /* Clear param allocations: the body no longer references any param. */
   for (int p = 0; p < ir->next_parameter; p++)
@@ -344,5 +334,3 @@ int tcc_ir_opt_const_return_uninit_elide(TCCIRState *ir)
 
   return 1;
 }
-
-int tcc_ir_opt_const_return_uninit_elide_ex(IROptCtx *ctx) { return tcc_ir_opt_const_return_uninit_elide(ctx->ir); }

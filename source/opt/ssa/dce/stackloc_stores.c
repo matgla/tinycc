@@ -142,8 +142,7 @@ int dce_dead_stackloc_stores(IRSSAOptCtx *ctx)
     if (q->op == TCCIR_OP_NOP)
       continue;
     if (!ssa_opt_has_side_effects(q->op) && irop_config[q->op].has_dest) {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(d);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       if (dvr >= 0 &&
           TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP &&
           !sl_temp_has_live_uses(ctx, dvr))
@@ -155,8 +154,7 @@ int dce_dead_stackloc_stores(IRSSAOptCtx *ctx)
       if (sl_is_anon_stackloc(s) && !s.is_lval) {
         /* Addr[StackLoc] into a dead TEMP never escapes, so it marks nothing. */
         if (irop_config[q->op].has_dest) {
-          IROperand d = tcc_ir_op_get_dest(ir, q);
-          int32_t dvr = irop_get_vreg(d);
+          int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
           if (dvr >= 0 &&
               TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP &&
               !sl_temp_has_live_uses(ctx, dvr))

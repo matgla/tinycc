@@ -26,18 +26,27 @@ static int find_first_non_nop(TCCIRState *ir, int start_idx)
   return (idx < n) ? idx : start_idx;
 }
 
-static int follow_jump_chain(TCCIRState *ir, int target_idx, uint8_t *visited)
+/* Upper bound on the entries one follow_jump_chain() marks: every JUMP step
+ * counts against MAX_ITERATIONS and at most one NOP skip follows each step
+ * (find_first_non_nop lands on a non-NOP, or on an already-visited index). */
+#define JT_MAX_ITERATIONS 100
+#define JT_MAX_MARKS (2 * (JT_MAX_ITERATIONS + 1) + 2)
+
+/* Marks the indices it visits in `visited` and records them in `marks` so the
+ * caller can clear exactly those afterwards instead of the whole array. */
+static int follow_jump_chain(TCCIRState *ir, int target_idx, uint8_t *visited, int *marks, int *nmarks)
 {
   int n = ir->next_instruction_index;
   int current = target_idx;
   int iterations = 0;
-  const int MAX_ITERATIONS = 100;
+  const int MAX_ITERATIONS = JT_MAX_ITERATIONS;
 
-  while (current < n && iterations < MAX_ITERATIONS)
+  while (current < n && iterations < MAX_ITERATIONS && *nmarks < JT_MAX_MARKS)
   {
     if (visited[current])
       break;
     visited[current] = 1;
+    marks[(*nmarks)++] = current;
 
     IRQuadCompact *q = &ir->compact_instructions[current];
 
@@ -49,8 +58,7 @@ static int follow_jump_chain(TCCIRState *ir, int target_idx, uint8_t *visited)
 
     if (q->op == TCCIR_OP_JUMP)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int next_target = (int)irop_get_imm64_ex(ir, dest);
+      int next_target = (int)tcc_ir_op_dest_imm(ir, q);
       /* target == n is the epilogue, a valid terminal: hence > n, not >= n. */
       if (next_target < 0 || next_target > n)
         break;
@@ -63,8 +71,29 @@ static int follow_jump_chain(TCCIRState *ir, int target_idx, uint8_t *visited)
   return current;
 }
 
-/* Post-RA pass: no phi nodes exist, so jump targets can be forwarded freely. */
-int tcc_ir_opt_jump_threading(TCCIRState *ir)
+/* Forward every JUMP/JUMPIF across a chain of unconditional JUMPs.
+ *
+ * allow_backward_jumpif=0 keeps a conditional branch from being retargeted
+ * BACKWARD (the guard dates from the legacy pipeline; its recorded reason is
+ * that the JUMPIF then lands inside an enclosing loop body and a downstream
+ * cleanup collapsed a live loop-exit test).  The pre-regalloc cfg_cleanup run
+ * keeps it: the flat loop passes after it match loops on their trampoline
+ * layout.
+ *
+ * allow_backward_jumpif=1 is for the post-regalloc run only.  There no pass
+ * reads loop shape any more, register assignment is final, and a trampoline
+ * `L: JUMP H` emits nothing but the branch, so the register and flag state on
+ * arrival at H is the state the JUMPIF had, whichever way it gets there.  The
+ * scratch-register bookkeeping still holds: a value live into H is live at L
+ * (L reaches H) and live at H, and its interval -- contiguous in instruction
+ * order, extended over the back-edge at L -- spans H..L, which contains the
+ * JUMPIF.  What this buys is the hot `continue`/state-machine
+ * shape `bcc L ... L: b H` -- one taken `b` per iteration on each threaded
+ * path (Zig CBE's Tokenizer.next, getKeyword) -- and, when nothing else
+ * reaches L, jumpif_invert(allow_backward=1) then turns the fall-through
+ * `bcc exit; b H` pair into one `b!cc H`.  TCC_DISABLE_PASS=ra:jt_backward
+ * turns it off. */
+static int jump_threading_impl(TCCIRState *ir, int allow_backward_jumpif)
 {
   int n = ir->next_instruction_index;
   int changes = 0;
@@ -86,12 +115,16 @@ int tcc_ir_opt_jump_threading(TCCIRState *ir)
     if (target < 0 || target >= n)
       continue;
 
-    memset(visited, 0, n);
-    int new_target = follow_jump_chain(ir, target, visited);
+    int marks[JT_MAX_MARKS];
+    int nmarks = 0;
+    int new_target = follow_jump_chain(ir, target, visited, marks, &nmarks);
+    for (int k = 0; k < nmarks; k++)
+      visited[marks[k]] = 0;
     new_target = find_first_non_nop(ir, new_target);
 
-    /* Retargeting a JUMPIF backward would land it inside an enclosing loop body and let downstream cleanup collapse a live loop-exit test. */
-    if (q->op == TCCIR_OP_JUMPIF && new_target < target)
+    /* Retargeting a JUMPIF backward would land it inside an enclosing loop body and let downstream cleanup collapse a live loop-exit test
+     * (pre-regalloc only, see above). */
+    if (q->op == TCCIR_OP_JUMPIF && new_target < target && !allow_backward_jumpif)
       new_target = target;
 
     if (new_target != target)
@@ -105,6 +138,16 @@ int tcc_ir_opt_jump_threading(TCCIRState *ir)
 
   tcc_free(visited);
   return changes;
+}
+
+int tcc_ir_opt_jump_threading(TCCIRState *ir)
+{
+  return jump_threading_impl(ir, 0);
+}
+
+int tcc_ir_opt_jump_threading_post_ra(TCCIRState *ir)
+{
+  return jump_threading_impl(ir, !tcc_ir_opt_pass_disabled("ra:jt_backward"));
 }
 
 /* Removing a JUMPIF leaves its flag-setter orphaned; orphan_cmp_elim clears it in the next cascade iteration. */
@@ -126,8 +169,7 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int target = (int)irop_get_imm64_ex(ir, dest);
+    int target = (int)tcc_ir_op_dest_imm(ir, q);
 
     int next_real = find_first_non_nop(ir, i + 1);
 
@@ -139,8 +181,7 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
       IRQuadCompact *nq = &ir->compact_instructions[next_real];
       if (nq->op != TCCIR_OP_JUMP)
         continue;
-      IROperand nd = tcc_ir_op_get_dest(ir, nq);
-      int next_target = (int)irop_get_imm64_ex(ir, nd);
+      int next_target = (int)tcc_ir_op_dest_imm(ir, nq);
       if (next_target != target)
         continue;
     }
@@ -167,14 +208,15 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
         for (int j = i - 1; j >= 0; j--)
         {
           IRQuadCompact *pq = &ir->compact_instructions[j];
-          if (pq->op == TCCIR_OP_NOP)
-            continue;
-          /* A jump_target heads the basic block; don't reason across it. */
+          /* A jump_target heads the basic block; don't reason across it --
+           * a NOP one included (tested before the NOP skip). */
           if (pq->is_jump_target)
             break;
+          if (pq->op == TCCIR_OP_NOP)
+            continue;
           if (pq->op == TCCIR_OP_FUNCCALLVAL || pq->op == TCCIR_OP_FUNCCALLVOID)
           {
-            Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, pq));
+            Sym *callee = tcc_ir_op_src1_sym(ir, pq);
             const char *name = callee ? get_tok_str(callee->v, NULL) : NULL;
             if (!name || (!tcc_ir_is_pure_aeabi(name) &&
                           !ir_opt_is_pure_helper_name(name) &&
@@ -200,8 +242,6 @@ int tcc_ir_opt_eliminate_fallthrough(TCCIRState *ir)
 
   return changes;
 }
-
-int tcc_ir_opt_eliminate_fallthrough_ex(IROptCtx *ctx) { return tcc_ir_opt_eliminate_fallthrough(ctx->ir); }
 
 /* ---- Branches into __builtin_unreachable ----
  *
@@ -260,8 +300,7 @@ static int unreach_passes_over(TCCIRState *ir, IRQuadCompact *q)
    * value instruction. */
   if (irop_config[q->op].has_dest)
   {
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (d.is_lval && !d.is_local)
+    if (tcc_ir_op_dest_is_lval(ir, q) && !tcc_ir_op_dest_is_local(ir, q))
       return 0;
   }
   return 1;
@@ -292,7 +331,7 @@ int tcc_ir_opt_unreachable_fold(TCCIRState *ir)
         d = q->unreachable;
       else if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
       {
-        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+        int t = (int)tcc_ir_op_dest_imm(ir, q);
         d = t >= 0 && t < n && doomed[t] && (q->op == TCCIR_OP_JUMP || doomed[p + 1]);
       }
       else if (unreach_passes_over(ir, q))
@@ -308,7 +347,7 @@ int tcc_ir_opt_unreachable_fold(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[p];
     if (q->op != TCCIR_OP_JUMPIF || doomed[p])
       continue;
-    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    int t = (int)tcc_ir_op_dest_imm(ir, q);
     if (t < 0 || t > n)
       continue;
     if (doomed[t])
@@ -326,9 +365,4 @@ int tcc_ir_opt_unreachable_fold(TCCIRState *ir)
   }
   tcc_free(doomed);
   return changes;
-}
-
-int tcc_ir_opt_unreachable_fold_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_unreachable_fold(ctx->ir);
 }

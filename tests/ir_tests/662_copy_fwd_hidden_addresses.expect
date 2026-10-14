@@ -1,0 +1,18 @@
+src_via_memcpy_ret 135
+dst_via_memcpy_ret 1198
+dead_copy_read_via_memcpy_ret 15070
+memcpy_ret_into_member 1211234
+ret_then_overwrite 1013012
+ret_then_overwrite_frame 107045
+ret_only_reader 1001
+ret_as_argument 841320
+memset_ret 916
+one_past_end 9907
+other_escaped_write 13106
+from_mixed_section 2102 2
+mla_accumulator 210741
+mla_accumulator 1983243103
+copy_on_one_arm 0 4085640534
+copy_on_one_arm 1 2292927765
+copy_on_one_arm 2 2208467306
+copy_on_one_arm 3 1329858023

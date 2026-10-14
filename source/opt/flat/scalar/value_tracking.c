@@ -143,7 +143,7 @@ static void vt_analyze(TCCIRState *ir, int n, ValueTrackingAnalysis *a)
 
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      int target = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
       a->has_control_flow = 1;
       if (target >= 0 && target < n)
       {
@@ -152,9 +152,22 @@ static void vt_analyze(TCCIRState *ir, int n, ValueTrackingAnalysis *a)
           a->is_merge[target / 8] |= (1 << (target % 8));
       }
     }
+    if (q->op == TCCIR_OP_INLINE_ASM)
+    {
+      for (int k = 0, target; (target = tcc_ir_asm_goto_target(ir, q, k)) >= 0; k++)
+      {
+        a->has_control_flow = 1;
+        if (target < n)
+        {
+          pred_count[target]++;
+          if (target <= i)
+            a->is_merge[target / 8] |= (1 << (target % 8));
+        }
+      }
+    }
     if (q->op == TCCIR_OP_SWITCH_TABLE)
     {
-      int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       a->has_control_flow = 1;
       if (table_id >= 0 && table_id < ir->num_switch_tables)
       {
@@ -192,7 +205,7 @@ static void vt_analyze(TCCIRState *ir, int n, ValueTrackingAnalysis *a)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    int32_t vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_VAR)
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -237,7 +250,7 @@ static IROperand vt_rewrite_call_as_assign(TCCIRState *ir, IRQuadCompact *q, int
   q->op = TCCIR_OP_ASSIGN;
   tcc_ir_set_dest(ir, i, call_dest);
   tcc_ir_set_src1(ir, i, src);
-  tcc_ir_set_src2(ir, i, IROP_NONE);
+  tcc_ir_set_src2_none(ir, i);
   return call_dest;
 }
 
@@ -288,9 +301,8 @@ static int32_t vt_resolve_copy_root(TCCIRState *ir, int32_t vr, int i)
     IRQuadCompact *dq = &ir->compact_instructions[def];
     if (dq->op != TCCIR_OP_ASSIGN && dq->op != TCCIR_OP_STORE)
       break;
-    IROperand dsrc = tcc_ir_op_get_src1(ir, dq);
-    int32_t svr = irop_get_vreg(dsrc);
-    if (svr < 0 || dsrc.is_lval)
+    int32_t svr = tcc_ir_op_src1_vreg(ir, dq);
+    if (svr < 0 || tcc_ir_op_src1_is_lval(ir, dq))
       break;
     vr = svr;
   }
@@ -556,7 +568,7 @@ static int vt_try_fold_long_arithmetic(TCCIRState *ir, IRQuadCompact *q, int i, 
           tcc_ir_set_dest(ir, i, call_dest);
           arg0.btype = IROP_BTYPE_INT64;
           tcc_ir_set_src1(ir, i, arg0);
-          tcc_ir_set_src2(ir, i, irop_make_imm32(-1, (int32_t)(val1 & 63), IROP_BTYPE_INT32));
+          tcc_ir_set_src2_imm32(ir, i, (int32_t)(val1 & 63), IROP_BTYPE_INT32);
           LOG_IR_GEN("VALUE_TRACK: %s(vreg, %lld) at i=%d -> lowered to IR shift", fname, (long long)val1, i);
           /* CALL redefines dest VAR with a runtime shift; invalidate or the stale pre-call constant forwards to a later
            * read (longlong seed) */
@@ -673,7 +685,7 @@ static int vt_try_fold_soft_float(TCCIRState *ir, IRQuadCompact *q, int i, VRegC
 {
   if (q->op != TCCIR_OP_FUNCCALLVAL)
     return 0;
-  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  Sym *callee = tcc_ir_op_src1_sym(ir, q);
   const char *name = callee ? get_tok_str(callee->v, NULL) : NULL;
   if (!name)
     return 0;
@@ -721,7 +733,7 @@ static int vt_try_fold_void_float_compare(TCCIRState *ir, IRQuadCompact *q, int 
     IRQuadCompact *next_q = &ir->compact_instructions[i + 1];
     if (next_q->op == TCCIR_OP_JUMPIF || next_q->op == TCCIR_OP_SETIF)
     {
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      Sym *callee = tcc_ir_op_src1_sym(ir, q);
       if (callee)
       {
         const char *fname = get_tok_str(callee->v, NULL);
@@ -798,8 +810,8 @@ static int vt_try_fold_void_float_compare(TCCIRState *ir, IRQuadCompact *q, int 
               {
                 int btype = irop_get_btype(cond);
                 next_q->op = TCCIR_OP_ASSIGN;
-                tcc_ir_set_src1(ir, i + 1, irop_make_imm32(-1, result, btype));
-                tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+                tcc_ir_set_src1_imm32(ir, i + 1, result, btype);
+                tcc_ir_set_src2_none(ir, i + 1);
                 IROperand setif_dest = tcc_ir_op_get_dest(ir, next_q);
                 vt_mark_dest_const(state, max_vreg, vt_gen, vt_def_gen, setif_dest, result);
                 LOG_IR_GEN("VALUE_TRACK: %s+SETIF fold -> cmp=%d result=%d at i=%d", fname, cmp_result, result, i);
@@ -821,11 +833,11 @@ static void vt_eval_int_binop(TccIrOp op, int64_t val1, int64_t val2, int is_64,
   int shift_mask = is_64 ? 63 : 31;
   switch (op)
   {
-  case TCCIR_OP_ADD:
-    result = val1 + val2;
+  case TCCIR_OP_ADD: /* wraparound, computed unsigned: signed overflow is UB */
+    result = (int64_t)((uint64_t)val1 + (uint64_t)val2);
     break;
   case TCCIR_OP_SUB:
-    result = val1 - val2;
+    result = (int64_t)((uint64_t)val1 - (uint64_t)val2);
     break;
   case TCCIR_OP_XOR:
     result = val1 ^ val2;
@@ -874,13 +886,13 @@ static void vt_commit_binop_fold(TCCIRState *ir, IRQuadCompact *q, int i, VRegCo
 {
   q->op = TCCIR_OP_ASSIGN;
   if (result == (int32_t)result)
-    tcc_ir_set_src1(ir, i, irop_make_imm32(-1, (int32_t)result, btype));
+    tcc_ir_set_src1_imm32(ir, i, (int32_t)result, btype);
   else
   {
     uint32_t pool_idx = tcc_ir_pool_add_i64(ir, result);
     tcc_ir_set_src1(ir, i, irop_make_i64(-1, pool_idx, btype));
   }
-  tcc_ir_set_src2(ir, i, IROP_NONE);
+  tcc_ir_set_src2_none(ir, i);
   (*changes)++;
 
   if (dest_pos >= 0 && dest_pos <= max_vreg)
@@ -1030,7 +1042,7 @@ static int vt_handle_arithmetic(TCCIRState *ir, IRQuadCompact *q, int i, VRegCon
       {
         LOG_IR_GEN("VALUE_TRACK 2a SUBST: i=%d src2 V%d -> #%lld", i, src2_pos, (long long)val2);
         if (val2 == (int32_t)val2)
-          tcc_ir_set_src2(ir, i, irop_make_imm32(-1, (int32_t)val2, btype));
+          tcc_ir_set_src2_imm32(ir, i, (int32_t)val2, btype);
         else
         {
           uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val2);
@@ -1068,8 +1080,7 @@ static int vt_handle_compare(TCCIRState *ir, IRQuadCompact *q, int i, int n, VRe
         int64_t val1 = state[src1_pos].value;
         int64_t val2 = irop_get_imm64_ex(ir, src2);
 
-        IROperand cond = tcc_ir_op_get_src1(ir, jump_q);
-        int tok = (int)irop_get_imm64_ex(ir, cond);
+        int tok = (int)tcc_ir_op_src1_imm(ir, jump_q);
 
         int result = evaluate_compare_condition_cmp_annotated(ir, q, val1, val2, tok, src1, src2);
 
@@ -1116,8 +1127,8 @@ static int vt_handle_compare(TCCIRState *ir, IRQuadCompact *q, int i, int n, VRe
           int btype = irop_get_btype(setif_src1);
           q->op = TCCIR_OP_NOP;
           jump_q->op = TCCIR_OP_ASSIGN;
-          tcc_ir_set_src1(ir, i + 1, irop_make_imm32(-1, result, btype));
-          tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+          tcc_ir_set_src1_imm32(ir, i + 1, result, btype);
+          tcc_ir_set_src2_none(ir, i + 1);
           LOG_IR_GEN("VALUE_TRACK: CMP+SETIF vreg=%lld,#%lld cond=0x%x -> %d at i=%d", (long long)val1, (long long)val2,
                      cond, result, i);
           (*changes)++;
@@ -1137,7 +1148,7 @@ static int vt_handle_compare(TCCIRState *ir, IRQuadCompact *q, int i, int n, VRe
 static void vt_set_src1_const(TCCIRState *ir, int i, int64_t val, int btype)
 {
   if (val == (int32_t)val)
-    tcc_ir_set_src1(ir, i, irop_make_imm32(-1, (int32_t)val, btype));
+    tcc_ir_set_src1_imm32(ir, i, (int32_t)val, btype);
   else
   {
     uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
@@ -1227,8 +1238,7 @@ static void vt_step_gen_boundary(VTCtx *c, int i)
       /* preserve const-state across a JMP skipping only DCE NOPs to the next real instr; safe only when i is not merge */
       if (prev->op == TCCIR_OP_JUMP && !skip_clear && !(c->is_merge[i / 8] & (1 << (i % 8))))
       {
-        IROperand jdest = tcc_ir_op_get_dest(ir, prev);
-        int jtarget = (int)irop_get_imm64_ex(ir, jdest);
+        int jtarget = (int)tcc_ir_op_dest_imm(ir, prev);
         if (jtarget >= i && jtarget < c->n)
         {
           int all_nops = 1;
@@ -1278,6 +1288,19 @@ static void vt_step_lea(VTCtx *c, int i, IROperand src1, int32_t dest_vr)
              irop_get_vreg(src1) >= 0 ? TCCIR_DECODE_VREG_TYPE(irop_get_vreg(src1)) : -1);
 }
 
+/* A store through &V is V's whole value only when it writes all of V: a
+ * 32-bit store into a 32-bit scalar, a 64-bit one into a long long.  A
+ * narrower store replaces some of V's bytes, and an 8/16-bit V would also
+ * need the reader's signedness, so those only invalidate V. */
+static int vt_store_covers_var(TCCIRState *ir, IROperand dest, int var_pos)
+{
+  IRLiveInterval *vi = tcc_ir_get_live_interval(ir, TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_VAR, var_pos));
+  if (!vi || vi->is_float || vi->is_complex || vi->is_struct)
+    return 0;
+  int bt = irop_get_btype(dest);
+  return vi->is_llong ? bt == IROP_BTYPE_INT64 : bt == IROP_BTYPE_INT32;
+}
+
 static void vt_step_store(VTCtx *c, int i, IROperand dest, IROperand src1, int dest_pos)
 {
   TCCIRState *ir = c->ir;
@@ -1291,7 +1314,7 @@ static void vt_step_store(VTCtx *c, int i, IROperand dest, IROperand src1, int d
       int var_pos = c->lea_map[tmp_pos].var_pos;
       if (var_pos <= c->max_vreg)
       {
-        if (irop_is_immediate(src1))
+        if (irop_is_immediate(src1) && vt_store_covers_var(ir, dest, var_pos))
         {
           VT_SET_CONST(c->state, var_pos, irop_get_imm64_ex(ir, src1));
           if (c->is_addrtaken[var_pos / 8] & (1 << (var_pos % 8)))
@@ -1503,7 +1526,7 @@ static int tcc_ir_opt_value_tracking__timed(TCCIRState *ir)
 
     if (q->op == TCCIR_OP_FUNCCALLVAL)
     {
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      Sym *callee = tcc_ir_op_src1_sym(ir, q);
       if (callee)
       {
         const char *fname = get_tok_str(callee->v, NULL);

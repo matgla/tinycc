@@ -36,8 +36,7 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
       continue;
     if (!irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t dvr = irop_get_vreg(dest);
+    int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
     if (TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP)
       continue;
     const int pos = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -93,7 +92,7 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
       int has = (slot == 0) ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
       if (!has)
         continue;
-      IROperand opnd = (slot == 0) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand opnd = tcc_ir_op_get_src1_or_2(ir, q, slot != 0);
       /* Operand must be a plain vreg (not already a sym/imm operand). */
       if (opnd.is_sym)
         continue;
@@ -137,8 +136,7 @@ int tcc_ir_opt_symref_const_prop(TCCIRState *ir)
     /* Record fresh ASSIGN(symref) defs; any other write to the tmp kills it. */
     if (irop_config[q->op].has_dest)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(dest);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       if (TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(dvr);

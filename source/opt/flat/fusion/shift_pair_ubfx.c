@@ -52,6 +52,8 @@ int tcc_ir_opt_shift_pair_to_ubfx(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
   int changes = 0;
+  /* def/use queries per candidate SHR: counts built once, kept in step with the folds */
+  int vidx = tcc_ir_vreg_index_open(ir);
 
   for (int i = 0; i < n; i++)
   {
@@ -61,17 +63,15 @@ int tcc_ir_opt_shift_pair_to_ubfx(TCCIRState *ir)
     int is_signed = (shr_q->op == TCCIR_OP_SAR);
     if (tcc_ir_op_get_dest(ir, shr_q).btype == IROP_BTYPE_INT64)
       continue;
-    IROperand shr_n = tcc_ir_op_get_src2(ir, shr_q);
-    if (!irop_is_immediate(shr_n) || shr_n.is_sym)
+    if (!tcc_ir_op_src2_is_imm(ir, shr_q) || tcc_ir_op_src2_is_sym(ir, shr_q))
       continue;
-    int b = (int)irop_get_imm64_ex(ir, shr_n);
+    int b = (int)tcc_ir_op_src2_imm(ir, shr_q);
     if (b < 1 || b > 31)
       continue;
 
-    IROperand shr_src1 = tcc_ir_op_get_src1(ir, shr_q);
-    if (shr_src1.is_lval || !irop_has_vreg(shr_src1))
+    if (tcc_ir_op_src1_is_lval(ir, shr_q) || !tcc_ir_op_src1_has_vreg(ir, shr_q))
       continue;
-    int32_t t1 = irop_get_vreg(shr_src1);
+    int32_t t1 = tcc_ir_op_src1_vreg(ir, shr_q);
     if (t1 < 0 || TCCIR_DECODE_VREG_TYPE(t1) != TCCIR_VREG_TYPE_TEMP)
       continue;
 
@@ -83,10 +83,9 @@ int tcc_ir_opt_shift_pair_to_ubfx(TCCIRState *ir)
       continue;
     if (tcc_ir_op_get_dest(ir, shl_q).btype == IROP_BTYPE_INT64)
       continue;
-    IROperand shl_n = tcc_ir_op_get_src2(ir, shl_q);
-    if (!irop_is_immediate(shl_n) || shl_n.is_sym)
+    if (!tcc_ir_op_src2_is_imm(ir, shl_q) || tcc_ir_op_src2_is_sym(ir, shl_q))
       continue;
-    int a = (int)irop_get_imm64_ex(ir, shl_n);
+    int a = (int)tcc_ir_op_src2_imm(ir, shl_q);
     if (a < 1 || a > b)
       continue;
 
@@ -105,7 +104,7 @@ int tcc_ir_opt_shift_pair_to_ubfx(TCCIRState *ir)
     for (int j = shl_idx + 1; j < i && safe; j++)
     {
       IRQuadCompact *jq = &ir->compact_instructions[j];
-      if (jq->op == TCCIR_OP_NOP)
+      if (jq->op == TCCIR_OP_NOP && !jq->is_jump_target) /* a NOP can be the join */
         continue;
       if (jq->op == TCCIR_OP_JUMP || jq->op == TCCIR_OP_JUMPIF ||
           jq->op == TCCIR_OP_IJUMP || jq->op == TCCIR_OP_SWITCH_TABLE || jq->is_jump_target)
@@ -115,8 +114,7 @@ int tcc_ir_opt_shift_pair_to_ubfx(TCCIRState *ir)
       }
       if (irop_config[jq->op].has_dest)
       {
-        IROperand jd = tcc_ir_op_get_dest(ir, jq);
-        if (irop_has_vreg(jd) && irop_get_vreg(jd) == t0_vr)
+        if (tcc_ir_op_dest_has_vreg(ir, jq) && tcc_ir_op_dest_vreg(ir, jq) == t0_vr)
         {
           safe = 0;
           break;
@@ -129,14 +127,18 @@ int tcc_ir_opt_shift_pair_to_ubfx(TCCIRState *ir)
     int lsb = b - a;
     int width = 32 - b;
     int32_t param = lsb | (width << 5);
+    tcc_ir_vreg_index_unnote(ir, i);
+    tcc_ir_vreg_index_unnote(ir, shl_idx);
     shr_q->op = is_signed ? TCCIR_OP_SBFX : TCCIR_OP_UBFX;
     tcc_ir_set_src1(ir, i, t0);
-    tcc_ir_set_src2(ir, i, irop_make_imm32(-1, param, IROP_BTYPE_INT32));
+    tcc_ir_set_src2_imm32(ir, i, param, IROP_BTYPE_INT32);
     shl_q->op = TCCIR_OP_NOP;
+    tcc_ir_vreg_index_note(ir, i);
     changes++;
     LOG_IR_GEN("SHIFT-PAIR->%s @%d: (x<<%d)>>%d -> lsb=%d width=%d (SHL@%d NOP)", is_signed ? "SBFX" : "UBFX", i, a, b,
                lsb, width, shl_idx);
   }
 
+  tcc_ir_vreg_index_close(ir, vidx);
   return changes;
 }

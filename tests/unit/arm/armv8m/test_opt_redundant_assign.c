@@ -16,7 +16,6 @@
 
 /* Pass entry point (declared in ir/opt.h). */
 int tcc_ir_opt_redundant_var_assign(TCCIRState *ir);
-int tcc_ir_opt_redundant_var_assign_ex(IROptCtx *ctx);
 
 #define I32 IROP_BTYPE_INT32
 
@@ -173,17 +172,14 @@ UT_TEST(test_redundant_var_assign_empty)
   return 0;
 }
 
-/* WRAPPER: the IROptCtx entry point forwards to the bare TCCIRState* pass. */
-UT_TEST(test_redundant_var_assign_ex_forwards)
+UT_TEST(test_redundant_var_assign_direct_call)
 {
   TCCIRState *ir = utb_new();
 
   int i0 = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(1, I32), UTB_NONE);
   int i1 = utb_emit(ir, TCCIR_OP_ASSIGN, utb_var(1, I32), utb_imm(2, I32), UTB_NONE);
 
-  IROptCtx ctx = {0};
-  ctx.ir = ir;
-  int changes = tcc_ir_opt_redundant_var_assign_ex(&ctx);
+  int changes = tcc_ir_opt_redundant_var_assign(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, i0), TCCIR_OP_NOP);

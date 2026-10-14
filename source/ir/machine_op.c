@@ -47,6 +47,25 @@ static IRLiveInterval *machine_op_interval_for_vreg(TCCIRState *ir, int vreg)
   return NULL;
 }
 
+/* The capture whose offset range (gen_function: [vbase, vbase + size], one
+ * past the end included) holds frame offset `off`, with the parent-frame
+ * offset it stands for in *chain_off; -1 when `off` is no capture's. */
+int tcc_ir_capture_lookup(const TCCIRState *ir, int32_t off, int32_t *chain_off)
+{
+  if (!ir->has_static_chain)
+    return -1;
+  for (int ci = 0; ci < ir->captured_count && ci < 32; ci++)
+  {
+    const int32_t rel = off - ir->captured_vbase[ci];
+    if (rel >= 0 && rel <= ir->captured_size[ci])
+    {
+      *chain_off = ir->captured_offsets_list[ci] + rel;
+      return ci;
+    }
+  }
+  return -1;
+}
+
 /* ============================================================================
  * machine_op_from_ir: Convert an IROperand to a MachineOperand
  * ============================================================================
@@ -88,7 +107,7 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
   m.is_unsigned = (bool)op->is_unsigned;
   m.is_64bit = (bool)irop_needs_pair(*op);
   m.is_complex = (bool)op->is_complex;
-  m.align4 = (op->aux & IROP_AUX_ALIGN4_OK) != 0;
+  m.align4 = (op->aux & (IROP_AUX_ALIGN4_OK | IROP_AUX_UNDERALIGN)) == IROP_AUX_ALIGN4_OK;
   m.underalign_hint = (op->aux & IROP_AUX_UNDERALIGN) != 0;
   const int tag = irop_get_tag(*op);
   const int vreg = irop_get_vreg(*op);
@@ -146,21 +165,17 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
   {
     const int32_t stack_off = irop_get_stack_offset(*op);
 
-    /* Captured variable: vreg < 0 means the variable belongs to a parent
+    /* Captured variable: an offset in a capture's range belongs to a parent
      * frame and must be reached via the static chain (R10). */
-    if (ir->has_static_chain && ir->captured_count > 0)
+    int32_t chain_off;
+    const int ci = tcc_ir_capture_lookup(ir, stack_off, &chain_off);
+    if (ci >= 0)
     {
-      for (int ci = 0; ci < ir->captured_count; ci++)
-      {
-        if (ir->captured_offsets_list[ci] == stack_off)
-        {
-          m.kind = MACH_OP_CHAIN_REL;
-          m.u.chain.offset = stack_off;
-          m.u.chain.chain_index = ci;
-          m.needs_deref = (bool)op->is_lval;
-          return m;
-        }
-      }
+      m.kind = MACH_OP_CHAIN_REL;
+      m.u.chain.offset = chain_off;
+      m.u.chain.chain_index = ci;
+      m.needs_deref = (bool)op->is_lval;
+      return m;
     }
 
     if (op->is_param && op->is_local)
@@ -302,21 +317,6 @@ MachineOperand machine_op_from_ir(TCCIRState *ir, const IROperand *op)
       spilled_param = 1;
     }
 
-    /* Captured variable check for spilled vreg < 0 case. */
-    if (ir->has_static_chain && ir->captured_count > 0 && vreg < 0)
-    {
-      for (int ci = 0; ci < ir->captured_count; ci++)
-      {
-        if (ir->captured_offsets_list[ci] == alloc_offset)
-        {
-          m.kind = MACH_OP_CHAIN_REL;
-          m.u.chain.offset = alloc_offset;
-          m.u.chain.chain_index = ci;
-          m.needs_deref = (bool)need_lval;
-          return m;
-        }
-      }
-    }
 
     if (spilled_param && op->is_local)
     {

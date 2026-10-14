@@ -30,6 +30,7 @@
  * call.  Only after the whole TU is parsed, where those answers are complete.
  */
 
+#ifndef CONFIG_TCC_O0_ONLY
 #include "tcc.h"
 
 /* A body generated in this TU, by fingerprint. */
@@ -57,8 +58,14 @@ static uint8_t *icf_value_tok;
 static int icf_value_tok_size;
 static int icf_value_tok_done;
 
+/* The bucket array grows with the entries (2 buckets per entry slot, at most
+ * ICF_BUCKETS): a static 4096-bucket table was 16 KiB of .bss (32 KiB on a
+ * 64-bit host) on every compile.  icf_record rehashes on growth in index
+ * order, so a chain lists its entries newest-first at any bucket count and a
+ * lookup meets same-hash entries in the same order. */
 #define ICF_BUCKETS 4096
-static IcfEntry *icf_table[ICF_BUCKETS];
+static IcfEntry **icf_table;
+static unsigned icf_nbuckets;
 static IcfEntry *icf_entries;
 static int icf_nb_entries, icf_entries_size;
 
@@ -75,7 +82,9 @@ void tcc_icf_section_changed(Section *sec)
 
 void tcc_icf_reset(void)
 {
-  memset(icf_table, 0, sizeof(icf_table));
+  tcc_free(icf_table);
+  icf_table = NULL;
+  icf_nbuckets = 0;
   tcc_free(icf_entries);
   icf_entries = NULL;
   icf_nb_entries = icf_entries_size = 0;
@@ -311,15 +320,23 @@ static void icf_record(uint64_t hash, Section *sec, addr_t start, addr_t size, s
 {
   if (icf_nb_entries >= icf_entries_size)
   {
-    icf_entries_size = icf_entries_size ? icf_entries_size * 2 : 256;
+    /* One entry per function: start small (a TU has tens), the rehash below
+     * keeps every chain in the same order at any size. */
+    icf_entries_size = icf_entries_size ? icf_entries_size * 2 : 32;
     IcfEntry *grown = tcc_realloc(icf_entries, sizeof(*grown) * icf_entries_size);
     /* The table holds indices, not pointers, so a move is free. */
     icf_entries = grown;
-    memset(icf_table, 0, sizeof(icf_table));
+    if (icf_nbuckets < ICF_BUCKETS)
+    {
+      icf_nbuckets = icf_entries_size * 2 < ICF_BUCKETS ? icf_entries_size * 2 : ICF_BUCKETS;
+      tcc_free(icf_table);
+      icf_table = tcc_malloc(sizeof(*icf_table) * icf_nbuckets);
+    }
+    memset(icf_table, 0, sizeof(*icf_table) * icf_nbuckets);
     for (int i = 0; i < icf_nb_entries; i++)
     {
       IcfEntry *e = &icf_entries[i];
-      unsigned b = (unsigned)(e->hash % ICF_BUCKETS);
+      unsigned b = (unsigned)(e->hash % icf_nbuckets);
       e->next = icf_table[b];
       icf_table[b] = e;
     }
@@ -333,7 +350,7 @@ static void icf_record(uint64_t hash, Section *sec, addr_t start, addr_t size, s
   e->nrel = nrel;
   e->value = value;
   e->self_sym = self_sym;
-  unsigned b = (unsigned)(hash % ICF_BUCKETS);
+  unsigned b = (unsigned)(hash % icf_nbuckets);
   e->next = icf_table[b];
   icf_table[b] = e;
 }
@@ -363,7 +380,7 @@ static void icf_drop_range_symbols(TCCState *s1, Section *sec, addr_t start, int
  * the symbol at it; the caller then rewinds `ind`. */
 int tcc_icf_try_fold(TCCState *s1, Sym *sym, Section *sec, addr_t start, addr_t size, size_t reloc_mark)
 {
-  if (!s1->tu_parsed || s1->optimize == 0 || s1->do_debug || s1->test_coverage || s1->do_backtrace)
+  if (!s1->tu_parsed || TCC_OPT(s1, optimize) == 0 || s1->do_debug || s1->test_coverage || s1->do_backtrace)
     return 0;
   if (tcc_ir_opt_pass_disabled("icf"))
     return 0;
@@ -375,6 +392,10 @@ int tcc_icf_try_fold(TCCState *s1, Sym *sym, Section *sec, addr_t start, addr_t 
   if (icf_address_may_be_taken(s1, sym))
     return 0;
   if (sym->asm_label || !sym->c)
+    return 0;
+  /* Callers were promised this body's return class (FuncAttr.func_ret_zext);
+   * the identical body may be recompiled later without that promise. */
+  if (sym->type.ref && sym->type.ref->f.func_ret_zext)
     return 0;
   ElfSym *esym = elfsym(sym);
   if (!esym || esym->st_shndx != sec->sh_num)
@@ -398,7 +419,7 @@ int tcc_icf_try_fold(TCCState *s1, Sym *sym, Section *sec, addr_t start, addr_t 
 
   const int self_sym = sym->c;
   const uint64_t hash = icf_hash_body(sec, start, size, rel, nrel, self_sym);
-  for (IcfEntry *e = icf_table[hash % ICF_BUCKETS]; e; e = e->next)
+  for (IcfEntry *e = icf_nbuckets ? icf_table[hash % icf_nbuckets] : NULL; e; e = e->next)
   {
     if (e->hash != hash || !e->sec)
       continue;
@@ -424,3 +445,4 @@ int tcc_icf_try_fold(TCCState *s1, Sym *sym, Section *sec, addr_t start, addr_t 
   icf_record(hash, sec, start, size, reloc_mark, nrel, esym->st_value, self_sym);
   return 0;
 }
+#endif /* CONFIG_TCC_O0_ONLY */

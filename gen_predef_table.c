@@ -23,7 +23,9 @@
  *
  *  Output is tccdefs_table_.h: entries in source order (definition order is
  *  preserved so a body that names another predefine still resolves the same
- *  way), plus a name-sorted index for the O(log n) lookup the lazy path uses.
+ *  way), plus the name hash index the lazy path looks identifiers up in.
+ *  All of it is pointer-free (strings are offsets into one blob), so on
+ *  YasOS the tables stay in flash instead of being relocated into RAM.
  *
  *  The text remains authoritative: TCC_NO_PREDEF_TABLE=1 selects it and is
  *  the byte-identity A/B seam, exactly as TCC_NO_PROGRAMMATIC_DECLS is for
@@ -45,6 +47,7 @@
 #undef free
 #undef realloc
 #undef strdup
+#undef qsort
 
 static const char predef_text[] =
 #include "tccdefs_.h"
@@ -60,6 +63,7 @@ typedef struct
   const char *flag; /* C expression for the flags field */
   int tok_off;      /* index into tcc_predef_toks[] */
   int tok_count;
+  int name_off;     /* offset of name in tcc_predef_strs[] */
 } Entry;
 
 static Entry entries[MAX_ENTRIES];
@@ -93,10 +97,32 @@ typedef struct
   int tok;
   const char *tokname; /* symbolic TOK_* spelling, for readable output */
   char text[64];
+  int text_off; /* offset of text in tcc_predef_strs[] */
 } TokItem;
 
 static TokItem toks[MAX_TOKS];
 static int nb_toks;
+
+/* tcc_predef_strs[]: NUL-separated, each distinct string once. */
+static char blob[16384];
+static int blob_len;
+
+static int blob_add(const char *str)
+{
+  int i, n = (int)strlen(str) + 1;
+  for (i = 0; i < blob_len; i += (int)strlen(blob + i) + 1)
+    if (!strcmp(blob + i, str))
+      return i;
+  if (blob_len + n > (int)sizeof(blob) || blob_len + n > 65535)
+  {
+    fprintf(stderr, "gen_predef_table: string blob full\n");
+    exit(1);
+  }
+  memcpy(blob + blob_len, str, n);
+  i = blob_len;
+  blob_len += n;
+  return i;
+}
 
 /* Mirrors tccpp.c's tok_two_chars[]. Kept as a table rather than special-casing
  * "->" (the only two-char operator the current predefines use) so a future
@@ -294,11 +320,6 @@ static void put_cstr(FILE *f, const char *s)
   fputc('"', f);
 }
 
-static int cmp_entry(const void *a, const void *b)
-{
-  return strcmp(((const Entry *)a)->name, ((const Entry *)b)->name);
-}
-
 int main(int argc, char **argv)
 {
   const char *out = argc > 1 ? argv[1] : "tccdefs_table_.h";
@@ -313,8 +334,7 @@ int main(int argc, char **argv)
   /* Guard state. Only the three shapes documented above occur; anything else
      is a hard error rather than a silent mis-generation. */
   int skipping = 0, depth = 0;
-  int i, sorted_n;
-  static Entry sorted[MAX_ENTRIES];
+  int i;
   FILE *f;
 
   memcpy(text, predef_text, sizeof(predef_text));
@@ -470,9 +490,6 @@ int main(int argc, char **argv)
       return 1;
     }
 
-  memcpy(sorted, entries, sizeof(Entry) * nb_entries);
-  qsort(sorted, nb_entries, sizeof(Entry), cmp_entry);
-  sorted_n = nb_entries;
 
   f = fopen(out, "w");
   if (!f)
@@ -484,6 +501,24 @@ int main(int argc, char **argv)
              "   Source of truth: include/tccdefs.h (via tccdefs_.h).\n"
              "   %d predefined macros for this target. */\n\n",
           nb_entries);
+  /* Every string the consumer reads (macro names incl. parameter lists, token
+     spellings) goes into one blob and the tables hold 16-bit offsets into it:
+     pointer-free, so they need no load-time relocation and stay in flash on
+     YasOS instead of costing every compiler process ~3 KB of .data. */
+  for (i = 0; i < nb_entries; i++)
+    entries[i].name_off = blob_add(entries[i].name);
+  for (i = 0; i < nb_toks; i++)
+    if (toks[i].kind != PDT_FIXED)
+      toks[i].text_off = blob_add(toks[i].text);
+  fprintf(f, "static const char tcc_predef_strs[] =");
+  for (i = 0; i < blob_len;)
+  {
+    fprintf(f, "\n    ");
+    put_cstr(f, blob + i);
+    fprintf(f, " \"\\0\"");
+    i += (int)strlen(blob + i) + 1;
+  }
+  fprintf(f, ";\n\n");
   fprintf(f, "/* Pre-tokenised macro bodies: the consumer replays these with\n"
              "   tok_alloc/parse_number/tok_str_add, so materialising a predefine\n"
              "   never re-enters the lexer. */\n");
@@ -495,52 +530,71 @@ int main(int argc, char **argv)
     {
       if (it->tokname)
         fprintf(f, "    { PDT_FIXED, %s, 0 },\n", it->tokname);
-      else if (it->tok >= 32 && it->tok < 127)
+      else if (it->tok >= 32 && it->tok < 127 && it->tok != '\'' && it->tok != '\\')
         fprintf(f, "    { PDT_FIXED, '%c', 0 },\n", it->tok);
       else
         fprintf(f, "    { PDT_FIXED, %d, 0 },\n", it->tok);
     }
     else
-    {
-      fprintf(f, "    { %s, 0, ", it->kind == PDT_IDENT ? "PDT_IDENT" : "PDT_NUM");
-      put_cstr(f, it->text);
-      fprintf(f, " },\n");
-    }
+      fprintf(f, "    { %s, 0, %d }, /* %s */\n", it->kind == PDT_IDENT ? "PDT_IDENT" : "PDT_NUM", it->text_off,
+              it->text);
   }
   fprintf(f, "};\n\n");
   fprintf(f, "static const TCCPredefMacro tcc_predef_macros[] = {\n");
   for (i = 0; i < nb_entries; i++)
   {
-    fprintf(f, "    { ");
-    put_cstr(f, entries[i].name);
-    fprintf(f, ", ");
-    put_cstr(f, entries[i].body);
-    fprintf(f, ", %s, %d, %d },\n", entries[i].flag, entries[i].tok_off, entries[i].tok_count);
+    int len = 0;
+    while (entries[i].name[len] && entries[i].name[len] != '(')
+      len++;
+    if (len > 255)
+    {
+      fprintf(stderr, "gen_predef_table: macro name too long: %s\n", entries[i].name);
+      return 1;
+    }
+    fprintf(f, "    { %d, %d, %s, %d, %d }, /* %s */\n", entries[i].name_off, len, entries[i].flag,
+            entries[i].tok_off, entries[i].tok_count, entries[i].name);
   }
   fprintf(f, "};\n\n");
+  /* Name index for the lazy path (an identifier interned for the first time
+     looks itself up here): bare-name hash, chains newest first, index+1 with
+     0 = end.  Built here instead of into .bss at startup. */
+  {
+    static unsigned short head[PREDEF_HASH_SIZE], next[MAX_ENTRIES];
+    if (nb_entries >= PREDEF_HASH_SIZE)
+    {
+      fprintf(stderr, "gen_predef_table: %d entries, PREDEF_HASH_SIZE is %d\n", nb_entries, PREDEF_HASH_SIZE);
+      return 1;
+    }
+    for (i = 0; i < nb_entries; i++)
+    {
+      unsigned h = TOK_HASH_INIT;
+      int k;
+      for (k = 0; entries[i].name[k] && entries[i].name[k] != '('; k++)
+        h = TOK_HASH_FUNC(h, ((const unsigned char *)entries[i].name)[k]);
+      h &= PREDEF_HASH_SIZE - 1;
+      next[i] = head[h];
+      head[h] = (unsigned short)(i + 1);
+    }
+    fprintf(f, "static const unsigned short predef_hash_head[PREDEF_HASH_SIZE] = {");
+    for (i = 0; i < PREDEF_HASH_SIZE; i++)
+      fprintf(f, "%s%d,", i % 16 ? "" : "\n   ", head[i]);
+    fprintf(f, "\n};\n");
+    fprintf(f, "static const unsigned short predef_hash_next[] = {");
+    for (i = 0; i < nb_entries; i++)
+      fprintf(f, "%s%d,", i % 16 ? "" : "\n   ", next[i]);
+    fprintf(f, "\n};\n\n");
+  }
   fprintf(f, "/* Raw declarations that are not #defines and still need the\n"
-             "   parser -- one typedef on this target. */\n");
-  fprintf(f, "static const char *const tcc_predef_raw[] = {\n");
+             "   parser -- one typedef on this target.  NUL-separated, an empty\n"
+             "   string ends the list (no pointer table to relocate). */\n");
+  fprintf(f, "static const char tcc_predef_raw[] =");
   for (i = 0; i < nb_raw; i++)
   {
-    fprintf(f, "    ");
+    fprintf(f, "\n    ");
     put_cstr(f, raw[i]);
-    fprintf(f, ",\n");
+    fprintf(f, " \"\\0\"");
   }
-  fprintf(f, "    0\n};\n\n");
-  fprintf(f, "/* name-sorted indices into the table above, for bsearch on the lazy path */\n");
-  fprintf(f, "static const unsigned short tcc_predef_macro_sorted[] = {\n   ");
-  for (i = 0; i < sorted_n; i++)
-  {
-    int j;
-    for (j = 0; j < nb_entries; j++)
-      if (!strcmp(entries[j].name, sorted[i].name))
-        break;
-    fprintf(f, " %d,", j);
-    if ((i % 12) == 11)
-      fprintf(f, "\n   ");
-  }
-  fprintf(f, "\n};\n");
+  fprintf(f, " \"\";\n");
   fclose(f);
   fprintf(stderr, "gen_predef_table: wrote %d entries (%d body tokens) + %d raw lines to %s (target text %zu B)\n",
           nb_entries, nb_toks, nb_raw, out, sizeof(predef_text) - 1);

@@ -25,10 +25,8 @@ UT_TEST(test_initialize_add_and_clear_intervals)
   ls_init(&ls);
 
   UT_ASSERT(ls.intervals != NULL);
-  UT_ASSERT(ls.active_set != NULL);
   UT_ASSERT_EQ(ls.intervals_size, 64);
   UT_ASSERT_EQ(ls.next_interval_index, 0);
-  UT_ASSERT_EQ(ls.next_active_index, 0);
   UT_ASSERT_EQ(ls.dirty_registers, 0);
   UT_ASSERT_EQ(ls.dirty_float_registers, 0);
   UT_ASSERT_EQ(ls.live_regs_by_instruction_size, 0);
@@ -52,19 +50,25 @@ UT_TEST(test_initialize_add_and_clear_intervals)
   UT_ASSERT_EQ(ls.intervals[69].stack_location, 0);
 
   tcc_ls_add_live_interval(&ls, VR_PARAM(0), 10, 10, 0, 0, LS_REG_TYPE_INT, 0, -1);
-  UT_ASSERT(ls.intervals[70].sort_key < ls.intervals[69].sort_key);
+  UT_ASSERT_EQ(ls.next_interval_index, 71);
+  UT_ASSERT_EQ(ls.intervals[70].vreg, VR_PARAM(0));
+
+  /* reserve grows to exactly the count asked for, never shrinks */
+  tcc_ls_reserve(&ls, 300);
+  UT_ASSERT_EQ(ls.intervals_size, 300);
+  UT_ASSERT_EQ(ls.intervals[70].vreg, VR_PARAM(0));
+  tcc_ls_reserve(&ls, 10);
+  UT_ASSERT_EQ(ls.intervals_size, 300);
 
   ls.live_regs_by_instruction = tcc_malloc(sizeof(uint32_t) * 2);
   ls.live_regs_by_instruction[0] = 1u;
   ls.live_regs_by_instruction[1] = 2u;
   ls.live_regs_by_instruction_size = 2;
-  ls.next_active_index = 5;
   ls.cached_instruction_idx = 7;
   ls.cached_live_regs = 0x55;
 
   tcc_ls_clear_live_intervals(&ls);
   UT_ASSERT_EQ(ls.next_interval_index, 0);
-  UT_ASSERT_EQ(ls.next_active_index, 0);
   UT_ASSERT_EQ(ls.live_regs_by_instruction_size, 0);
   UT_ASSERT_EQ(ls.cached_instruction_idx, -1);
   UT_ASSERT_EQ(ls.cached_live_regs, 0);

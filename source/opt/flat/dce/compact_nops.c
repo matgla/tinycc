@@ -42,6 +42,7 @@ int tcc_ir_opt_compact_nops(TCCIRState *ir)
   }
   if (!has_nops)
     return 0;
+  tcc_ir_label_sync(ir);
 
   /* Build old_to_new mapping and compact in one forward pass */
   int *old_to_new = tcc_malloc(n * sizeof(int));
@@ -77,8 +78,7 @@ int tcc_ir_opt_compact_nops(TCCIRState *ir)
     IRQuadCompact *q = &instr[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int old_target = (int)irop_get_imm64_ex(ir, dest);
+      int old_target = (int)tcc_ir_op_dest_imm(ir, q);
       if (old_target < 0)
         continue;
 
@@ -187,8 +187,7 @@ int tcc_ir_opt_compact_nops(TCCIRState *ir)
     IRQuadCompact *q = &instr[i];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)irop_get_imm64_ex(ir, dest);
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
       if (target >= 0 && target < write_pos)
         instr[target].is_jump_target = 1;
     }
@@ -206,6 +205,8 @@ int tcc_ir_opt_compact_nops(TCCIRState *ir)
   }
 
   ir->next_instruction_index = write_pos;
+  tcc_ir_frame_scope_remap(ir, old_to_new, n, write_pos);
+  tcc_ir_asm_mark_targets(ir);
 
   tcc_free(old_to_new);
 

@@ -18,6 +18,7 @@ typedef struct { int32_t a[8]; } S32;
 typedef struct { int32_t a[9]; } S36;
 typedef struct { int16_t s; unsigned char c[15]; int8_t t[3]; } S20H; /* 2-aligned */
 typedef struct { int32_t a[40]; } S160; /* copied by memcpy on the tcc side */
+typedef struct { int32_t a, b; } P2;
 /* 8-aligned only through a member's own alignment: gcc's doubleword test
  * reads each field's DECL_ALIGN, which counts _Alignas on the member -- also on
  * a packed member, whose type alone has alignment 1 (Zig's C backend emits
@@ -55,6 +56,9 @@ static void mix_fill(void *p, unsigned n, unsigned seed)
   uint32_t P##_f10(int x, S160 s, int y);                                                                               \
   uint32_t P##_f11(int x, SA8 s, int y);                                                                                \
   uint32_t P##_f12(int x, SP8 s, int y);                                                                                \
+  uint32_t P##_f13(float f0, float f1, float f2, float f3, float f4, float f5, float f6, float f7,                     \
+                   float f8, float f9, float f10, float f11, float f12, float f13, float f14, float f15,              \
+                   float f16, int x, int y, int z, P2 s);                                                              \
   S24 P##_r1(int k, S20 s);                                                                                             \
   uint32_t P##_v1(int n, ...);                                                                                          \
   uint32_t P##_m1(S32 s);
@@ -72,6 +76,9 @@ static void mix_fill(void *p, unsigned n, unsigned seed)
   uint32_t P##_f10(int x, S160 s, int y) { return (uint32_t)(x * 11 + y * 13) + CK(s); }                               \
   uint32_t P##_f11(int x, SA8 s, int y) { return (uint32_t)(x * 17 + y * 19) + CK(s); }                                 \
   uint32_t P##_f12(int x, SP8 s, int y) { return (uint32_t)(x * 23 + y * 29) + CK(s); }                                 \
+  uint32_t P##_f13(float f0, float f1, float f2, float f3, float f4, float f5, float f6, float f7,                    \
+                   float f8, float f9, float f10, float f11, float f12, float f13, float f14, float f15,             \
+                   float f16, int x, int y, int z, P2 s) { return (uint32_t)(s.a * 10 + s.b); }                     \
   S24 P##_r1(int k, S20 s)                                                                                              \
   {                                                                                                                     \
     S24 r;                                                                                                              \
@@ -102,7 +109,7 @@ static void mix_fill(void *p, unsigned n, unsigned seed)
   }
 
 #define DEFINE_DRIVER(P, O)                                                                                             \
-  void run_##P(void)                                                                                                    \
+  int run_##P(void)                                                                                                     \
   {                                                                                                                     \
     S17 s17;                                                                                                            \
     S20 s20;                                                                                                            \
@@ -114,6 +121,8 @@ static void mix_fill(void *p, unsigned n, unsigned seed)
     S160 s160;                                                                                                          \
     SA8 sa8;                                                                                                            \
     SP8 sp8;                                                                                                            \
+    P2 p2 = { 11, 22 };                                                                                                  \
+    int bad = 0;                                                                                                        \
     mix_fill(&s160, sizeof s160, 9);                                                                                    \
     mix_fill(&sa8, sizeof sa8, 10);                                                                                     \
     mix_fill(&sp8, sizeof sp8, 11);                                                                                     \
@@ -133,8 +142,17 @@ static void mix_fill(void *p, unsigned n, unsigned seed)
     printf(#P " r1: %u\n", (unsigned)CK(r));                                                                           \
     printf(#P " f10: %u\n", (unsigned)O##_f10(3, s160, 4));                                                                           \
     printf(#P " a8: %u %u\n", (unsigned)O##_f11(3, sa8, 4), (unsigned)O##_f12(5, sp8, 6));                              \
+    {                                                                                                                   \
+      uint32_t f13 = O##_f13(0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f,                                        \
+                             8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f,                                 \
+                             16.0f, 7, 8, 9, p2);                                                                      \
+      if (f13 != 132)                                                                                                  \
+        printf(#P " f13: %u\n", (unsigned)f13);                                                                        \
+      bad |= f13 != 132;                                                                                                \
+    }                                                                                                                   \
     printf(#P " v1: %u\n", (unsigned)O##_v1(2, s24, 7, s24, 8));                                                       \
     uint32_t before = CK(s32);                                                                                          \
     uint32_t m = O##_m1(s32);                                                                                           \
     printf(#P " m1: %u %d\n", (unsigned)m, CK(s32) == before);                                                          \
+    return bad;                                                                                                         \
   }

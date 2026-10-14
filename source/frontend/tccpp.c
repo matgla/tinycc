@@ -80,7 +80,6 @@ static void parse_number(const char *p);
 static void tcc_predef_try_materialize(TokenSym *ts, const char *str, int len);
 static void parse_string(const char *p, int len);
 
-static struct TinyAlloc *toksym_alloc;
 static struct TinyAlloc *tokstr_alloc;
 
 static TokenString *macro_stack;
@@ -169,9 +168,20 @@ ST_FUNC void expect(const char *msg)
 #define TAL_DEBUG_FILE_LEN 40
 #endif
 
-#define TOKSYM_TAL_SIZE (48 * 1024) /* allocator for tiny TokenSym in table_ident */
+#ifdef CONFIG_TCC_LOW_MEM
+/* Small first arenas, and every further one the same size (TAL_NEXT_SIZE):
+ * doubling would overshoot by up to half of what is in use. */
+#define TOKSTR_TAL_SIZE (2 * 1024)
+#define TAL_NEXT_SIZE(size) (size)
+#define TOKSYM_CHUNK_SIZE (4 * 1024)
+#else
 #define TOKSTR_TAL_SIZE (8 * 1024)  /* allocator for TokenString structs only (not buffers) */
-#define TOKSYM_TAL_LIMIT 256        /* prefer unique limits to distinguish allocators debug msgs */
+#define TAL_NEXT_SIZE(size) ((size) * 2)
+/* Equal steps here too: one malloc per 8 KB costs nothing measurable, and the
+ * old 48 KB first arena was a third empty after a hello world. */
+#define TOKSYM_CHUNK_SIZE (8 * 1024)
+#endif
+#define TOKSYM_BIG 256              /* a longer TokenSym gets a block of its own */
 #define TOKSTR_TAL_LIMIT 128        /* structs are ~48-64 bytes */
 
 typedef struct TinyAlloc
@@ -354,7 +364,7 @@ tail_call:
     {
       TinyAlloc *bottom = al, *next = al->top ? al->top : al;
 
-      al = tal_new(pal, next->limit, next->size * 2);
+      al = tal_new(pal, next->limit, TAL_NEXT_SIZE(next->size));
       al->next = next;
       bottom->top = al;
     }
@@ -385,6 +395,67 @@ tail_call:
 }
 
 #endif /* USE_TAL */
+
+/* ------------------------------------------------------------------------- */
+/* TokenSym storage.  A TokenSym lives until tccpp_delete and is never freed or
+ * resized on its own, so a bump arena does: no per-entry allocator header (TAL
+ * kept one, 4 bytes on ARM), and an entry takes offsetof(str) + len + 1 rather
+ * than sizeof(TokenSym) + len, which counted str[1] and its padding again.
+ * Chunks are chained through their first word and freed together. */
+typedef struct TokSymChunk
+{
+  struct TokSymChunk *prev;
+} TokSymChunk;
+
+static TokSymChunk *toksym_chunks;
+static uint8_t *toksym_p, *toksym_end;
+
+static TokenSym *toksym_new(int len)
+{
+  unsigned size = (offsetof(TokenSym, str) + len + 1 + sizeof(void *) - 1) & ~(sizeof(void *) - 1);
+  TokSymChunk *c;
+  uint8_t *ret;
+
+  if (size > (unsigned)(toksym_end - toksym_p))
+  {
+    if (size > TOKSYM_BIG)
+    {
+      /* Link it behind the current chunk, which keeps its free tail. */
+      c = tcc_malloc(sizeof *c + size);
+      if (toksym_chunks)
+      {
+        c->prev = toksym_chunks->prev;
+        toksym_chunks->prev = c;
+      }
+      else
+      {
+        c->prev = NULL;
+        toksym_chunks = c;
+      }
+      return (TokenSym *)(c + 1);
+    }
+    c = tcc_malloc(sizeof *c + TOKSYM_CHUNK_SIZE);
+    c->prev = toksym_chunks;
+    toksym_chunks = c;
+    toksym_p = (uint8_t *)(c + 1);
+    toksym_end = toksym_p + TOKSYM_CHUNK_SIZE;
+  }
+  ret = toksym_p;
+  toksym_p += size;
+  return (TokenSym *)ret;
+}
+
+static void toksym_free_all(void)
+{
+  TokSymChunk *c, *prev;
+  for (c = toksym_chunks; c; c = prev)
+  {
+    prev = c->prev;
+    tcc_free(c);
+  }
+  toksym_chunks = NULL;
+  toksym_p = toksym_end = NULL;
+}
 /* String token statistics - enable for analysis
 static unsigned long str_total_added = 0;
 static unsigned long str_bytes_copied = 0;
@@ -451,7 +522,8 @@ ST_FUNC void cstr_cat(CString *cstr, const char *str, int len)
   size = cstr->size + len;
   if (size > cstr->size_allocated)
     cstr_realloc(cstr, size);
-  memmove(cstr->data + cstr->size, str, len);
+  if (len > 0) /* str may be NULL for an empty append: memmove(.., NULL, 0) is UB */
+    memmove(cstr->data + cstr->size, str, len);
   cstr->size = size;
 }
 
@@ -558,19 +630,24 @@ static TokenSym *tok_alloc_new(TokenSym **pts, const char *str, int len)
   {
     int new_alloc = table_ident_alloc ? table_ident_alloc : TOK_IDENT_PREALLOC;
     while (new_alloc <= i)
+#ifdef CONFIG_TCC_LOW_MEM
+      /* Equal steps: doubling 1024 -> 2048 for a hello world's ~1200 ids
+         left 3 KB of the device table unused.  Every user re-reads
+         table_ident, so moving it is safe. */
+      new_alloc += 256;
+#else
       new_alloc <<= 1;
+#endif
     ptable = tcc_realloc(table_ident, new_alloc * sizeof(TokenSym *));
     table_ident = ptable;
     table_ident_alloc = new_alloc;
   }
 
-  ts = tal_realloc(toksym_alloc, 0, sizeof(TokenSym) + len);
+  ts = toksym_new(len);
 
   table_ident[i] = ts;
   ts->tok = tok_ident++;
   ts->sym_define = NULL;
-  ts->sym_label = NULL;
-  ts->sym_struct = NULL;
   ts->sym_identifier = NULL;
   ts->len = len;
   ts->hash_next = NULL;
@@ -581,11 +658,10 @@ static TokenSym *tok_alloc_new(TokenSym **pts, const char *str, int len)
      predefine re-enters tok_alloc for the identifiers in its own body, and a
      half-built entry would be found by that recursion. */
   tcc_predef_try_materialize(ts, str, len);
+  TCC_PREDEF_PROTO_INTERNED(ts);
   return ts;
 }
 
-#define TOK_HASH_INIT 1
-#define TOK_HASH_FUNC(h, c) ((h) + ((h) << 5) + ((h) >> 27) + (c))
 
 /* ------------------------------------------------------------------------- */
 /* Lazy builtin-token (keyword) interning.
@@ -597,44 +673,12 @@ static TokenSym *tok_alloc_new(TokenSym **pts, const char *str, int len)
  * whole builtin id range up-front (ids are fixed by enum order == blob order)
  * but only allocate a TokenSym for a builtin the first time it is actually
  * seen (lexed) or define_push'd.  Recognition uses a small static index over
- * the tcc_keywords blob (no heap), so unreferenced builtins cost nothing but
- * their reserved (NULL) table_ident slot. */
-#define KW_HASH_SIZE 1024 /* power of two, > NB_BUILTIN_TOKS */
-static const char *kw_str[NB_BUILTIN_TOKS];        /* ptr into tcc_keywords blob */
-static unsigned short kw_len[NB_BUILTIN_TOKS];      /* its length */
-static unsigned short kw_hash_head[KW_HASH_SIZE];   /* head index+1 (0 = empty) */
-static unsigned short kw_hash_next[NB_BUILTIN_TOKS];/* chain link, index+1 (0 = end) */
-static int kw_index_built;
-
-/* Build the static keyword index from the tcc_keywords blob (one pass, no
- * heap).  Called once from tccpp_new. */
-static void kw_index_build(void)
-{
-  const char *p = tcc_keywords;
-  int idx = 0;
-  unsigned int h;
-  int i;
-  memset(kw_hash_head, 0, sizeof kw_hash_head);
-  while (*p)
-  {
-    const char *r = p;
-    int len;
-    while (*r)
-      r++;
-    len = (int)(r - p);
-    kw_str[idx] = p;
-    kw_len[idx] = (unsigned short)len;
-    h = TOK_HASH_INIT;
-    for (i = 0; i < len; i++)
-      h = TOK_HASH_FUNC(h, ((unsigned char *)p)[i]);
-    h &= (KW_HASH_SIZE - 1);
-    kw_hash_next[idx] = kw_hash_head[h];
-    kw_hash_head[h] = (unsigned short)(idx + 1);
-    idx++;
-    p = r + 1;
-  }
-  kw_index_built = 1;
-}
+ * the tcc_keywords blob, so unreferenced builtins cost nothing but their
+ * reserved (NULL) table_ident slot.  The index is generated at build time
+ * (gen_kw_index.c -> tcckw_index_.h): const and pointer-free, so it sits in
+ * flash instead of costing every compiler process 8 KB of .bss. */
+#include "tcckw_index_.h"
+_Static_assert(KW_GEN_COUNT == NB_BUILTIN_TOKS, "tcckw_index_.h is stale");
 
 /* Allocate (or return the existing) TokenSym for builtin token id `tok` in
  * [TOK_IDENT, TOK_IDENT+NB_BUILTIN_TOKS).  Idempotent; inserts into hash_ident
@@ -648,13 +692,11 @@ static TokenSym *tok_materialize_builtin(int tok)
   unsigned int h;
   if (ts)
     return ts;
-  str = kw_str[i];
+  str = tcc_keywords + kw_off[i];
   len = kw_len[i];
-  ts = tal_realloc(toksym_alloc, 0, sizeof(TokenSym) + len);
+  ts = toksym_new(len);
   ts->tok = tok;
   ts->sym_define = NULL;
-  ts->sym_label = NULL;
-  ts->sym_struct = NULL;
   ts->sym_identifier = NULL;
   ts->len = len;
   memcpy(ts->str, str, len);
@@ -666,6 +708,7 @@ static TokenSym *tok_materialize_builtin(int tok)
   ts->hash_next = hash_ident[h];
   hash_ident[h] = ts;
   table_ident[i] = ts;
+  TCC_PREDEF_PROTO_INTERNED(ts);
   return ts;
 }
 
@@ -680,7 +723,7 @@ static TokenSym *kw_lookup_materialize(unsigned int full_hash, const char *str, 
   for (e = kw_hash_head[kh]; e; e = kw_hash_next[e - 1])
   {
     int ki = e - 1;
-    if (kw_len[ki] == len && !memcmp(kw_str[ki], str, len))
+    if (kw_len[ki] == len && !memcmp(tcc_keywords + kw_off[ki], str, len))
       return tok_materialize_builtin(TOK_IDENT + ki);
   }
   return NULL;
@@ -689,7 +732,7 @@ static TokenSym *kw_lookup_materialize(unsigned int full_hash, const char *str, 
 /* Return table_ident[v - TOK_IDENT], materializing a lazy builtin slot first
  * if needed.  For user ids the slot is always present (interned when the name
  * was first lexed), so this is just a deref; the range guard avoids touching
- * kw_str[] for non-builtin ids.  Used by writers that may target an as-yet-
+ * kw_off[] for non-builtin ids.  Used by writers that may target an as-yet-
  * unseen builtin: the startup define_push of __LINE__ etc., and codegen that
  * references runtime-helper / builtin names by fixed token id (e.g. the
  * __aeabi_* helpers via external_global_sym). */
@@ -699,6 +742,22 @@ ST_FUNC TokenSym *tok_ensure(int v)
   if (!ts && (unsigned)(v - TOK_IDENT) < (unsigned)NB_BUILTIN_TOKS)
     ts = tok_materialize_builtin(v);
   return ts;
+}
+
+/* Find an already-interned token; NULL if `str` was never interned (a lazy
+ * builtin slot that has not been materialized counts as not interned).
+ * Interns nothing, so it leaves token ids and the lazy slots alone. */
+ST_FUNC TokenSym *tok_find(const char *str, int len)
+{
+  TokenSym *ts;
+  unsigned int h = TOK_HASH_INIT;
+  int i;
+  for (i = 0; i < len; i++)
+    h = TOK_HASH_FUNC(h, ((unsigned char *)str)[i]);
+  for (ts = hash_ident[h & (TOK_HASH_SIZE - 1)]; ts; ts = ts->hash_next)
+    if (ts->len == len && !memcmp(ts->str, str, len))
+      return ts;
+  return NULL;
 }
 
 /* find a token and add it if not found */
@@ -915,14 +974,14 @@ ST_FUNC const char *get_tok_str(int v, CValue *cv)
         return ts->str;
       /* Lazy builtin not materialized: its string lives in the blob -- but
          ONLY for the reserved builtin range.  A NULL slot outside it means a
-         bogus token id, and indexing kw_str[] with it reads past the array
+         bogus token id, and indexing kw_off[] with it reads past the array
          and hands back whatever follows: on the RP2350 that surfaced as a
          HardFault inside tcc_ir_opt_const_aggregate_fold, whose callee-name
          strcmp walked the garbage pointer (device -O1; benign on the host,
-         where the bytes after kw_str[] happen to be readable).  tok_ensure()
+         where the bytes after kw_off[] happen to be readable).  tok_ensure()
          guards the same array for the same reason. */
       if ((unsigned)(v - TOK_IDENT) < (unsigned)NB_BUILTIN_TOKS)
-        return (char *)kw_str[v - TOK_IDENT];
+        return (char *)tcc_keywords + kw_off[v - TOK_IDENT];
       return NULL;
     }
     else if (v >= SYM_FIRST_ANOM)
@@ -1480,6 +1539,31 @@ static void tok_str_shrink(TokenString *s)
   }
 }
 
+/* For a token string kept as long as a macro or a saved function body,
+   usually the whole TU: give back all of the doubling slack, not only when
+   it is over half the buffer (a 40-token body kept 64 slots). */
+ST_FUNC void tok_str_fit(TokenString *s)
+{
+  if (s->allocated_len > s->len)
+  {
+    s->data.str = tcc_realloc(s->data.str, s->len * sizeof(int));
+    s->allocated_len = s->len;
+  }
+}
+
+/* A TokenString kept past the statement that made it (a saved function body)
+   moves out of the TokenString arena: an arena only rewinds once every struct
+   in it is freed, so one long-lived struct pins it, and the short-lived ones
+   allocated after it keep adding arenas (48 KB of them at -O2 on regcomp.c).
+   tok_str_free still takes it: tal_free hands foreign pointers to tcc_free. */
+ST_FUNC TokenString *tok_str_keep(TokenString *s)
+{
+  TokenString *k = tcc_malloc(sizeof *k);
+  *k = *s;
+  tal_free(tokstr_alloc, s);
+  return k;
+}
+
 static int tok_str_word_count(const int *p)
 {
   int t = *p;
@@ -1905,6 +1989,12 @@ ST_FUNC void pp_apply_pack_replay(TCCState *s1, int code)
       tcc_error("out of pack stack");
     *++s1->pack_stack_ptr = value;
     break;
+  case TCC_PCH_REPLAY_PACK_PUSH_DUP:
+    if (s1->pack_stack_ptr >= s1->pack_stack + PACK_STACK_SIZE - 1)
+      tcc_error("out of pack stack");
+    s1->pack_stack_ptr[1] = *s1->pack_stack_ptr;
+    s1->pack_stack_ptr++;
+    break;
   case TCC_PCH_REPLAY_PACK_POP:
     if (s1->pack_stack_ptr <= s1->pack_stack)
       tcc_error("out of pack stack");
@@ -2011,7 +2101,7 @@ ST_INLN void define_push(int v, int macro_type, int *str, Sym *first_arg)
   Sym *s, *o;
 
   o = define_find(v);
-  s = sym_push2(&define_stack, v, macro_type, 0);
+  s = sym_push2_short(&define_stack, v, macro_type, 0);
   s->d = str;
   s->next = first_arg;
   /* v may be an as-yet-unmaterialized builtin (e.g. the startup defines for
@@ -2057,9 +2147,15 @@ static uint8_t *skip_logical_line(uint8_t *p)
     nl = memchr(q, '\n', len);
     bs = memchr(q, '\\', len);
     if (!bs || (nl && nl < bs))
-      return nl ? nl : file->buf_end;
-
-    p = bs;
+    {
+      if (nl)
+        return nl;
+      /* Neither found: the line continues past the I/O buffer.  Refill via
+         the CH_EOB sentinel and keep scanning. */
+      p = file->buf_end;
+    }
+    else
+      p = bs;
     c = handle_bs(&p);
     if (c == CH_EOF || c == '\n')
       return p;
@@ -2075,7 +2171,7 @@ ST_FUNC void free_defines(Sym *b)
     define_stack = top->prev;
     tok_str_free_str(top->d);
     define_undef(top);
-    sym_free(top);
+    sym_free_short(top);
   }
 }
 
@@ -2416,7 +2512,7 @@ static int expr_preprocess(TCCState *s1)
  * in memory) and ORs the flag with range checks, and that costs more than its
  * fallback's `*res < lhs` -- zig.c -Os +7 KB.  Answer "yes" once both of
  * those compile as well as the fallback does. */
-static const char *const tcc_builtins_supported[] = {
+static const char *TCC_RODATA_REL const tcc_builtins_supported[] = {
     "__builtin_bswap16", "__builtin_bswap32", "__builtin_bswap64",
     "__builtin_clz", "__builtin_clzl", "__builtin_clzll", "__builtin_ctz", "__builtin_ctzl", "__builtin_ctzll",
     "__builtin_popcount", "__builtin_popcountl", "__builtin_popcountll",
@@ -2491,7 +2587,7 @@ ST_FUNC void parse_define(void)
         if (varg < TOK_IDENT)
         bad_list:
           tcc_error("bad macro parameter list");
-        s = sym_push2(&define_stack, varg | SYM_FIELD, is_vaargs, 0);
+        s = sym_push2_short(&define_stack, varg | SYM_FIELD, is_vaargs, 0);
         *ps = s;
         ps = &s->next;
         if (tok == ')')
@@ -2536,7 +2632,7 @@ ST_FUNC void parse_define(void)
   }
   parse_flags = saved_parse_flags;
   tok_str_add(&str, 0);
-  tok_str_shrink(&str);
+  tok_str_fit(&str);
   if (t0 == TOK_PPJOIN)
   bad_twosharp:
     tcc_error("'##' cannot appear at either end of macro");
@@ -2692,9 +2788,10 @@ static int pragma_parse(TCCState *s1)
           val = *s1->pack_stack_ptr;
           if (!capturing)
             s1->pack_stack_ptr++;
-          rec_kind = TCC_PCH_REPLAY_PACK_PUSH;
+          rec_kind = TCC_PCH_REPLAY_PACK_PUSH_DUP;
           if (tok != ',')
             goto pack_set;
+          rec_kind = TCC_PCH_REPLAY_PACK_PUSH;
           next();
         }
         if (tok != TOK_CINT)
@@ -2749,6 +2846,51 @@ static int pragma_parse(TCCState *s1)
       tcc_free(p);
     }
   }
+  else if (tok >= TOK_IDENT && !strcmp(get_tok_str(tok, NULL), "GCC"))
+  {
+    /* #pragma GCC visibility push(default|hidden|internal|protected) / pop:
+       the visibility of the declarations in between (see decl()).  The
+       other GCC pragmas stay ignored. */
+    next();
+    if (tok != TOK_VISIBILITY1)
+    {
+      tcc_warning_c(warn_all)("#pragma GCC %s ignored", get_tok_str(tok, &tokc));
+      return 0;
+    }
+    next();
+    if (tok == TOK_ASM_pop)
+    {
+      if (s1->visibility_stack_depth == 0)
+        tcc_error("#pragma GCC visibility pop without a push");
+      s1->visibility_stack_depth--;
+    }
+    else if (tok == TOK_ASM_push)
+    {
+      const char *name;
+      int vis;
+      next();
+      skip('(');
+      name = get_tok_str(tok, &tokc);
+      if (!strcmp(name, "default"))
+        vis = STV_DEFAULT;
+      else if (!strcmp(name, "hidden"))
+        vis = STV_HIDDEN;
+      else if (!strcmp(name, "internal"))
+        vis = STV_INTERNAL;
+      else if (!strcmp(name, "protected"))
+        vis = STV_PROTECTED;
+      else
+        goto pragma_err;
+      next();
+      if (tok != ')')
+        goto pragma_err;
+      if (s1->visibility_stack_depth >= VISIBILITY_STACK_SIZE)
+        tcc_error("#pragma GCC visibility push nested too deeply");
+      s1->visibility_stack[s1->visibility_stack_depth++] = vis;
+    }
+    else
+      goto pragma_err;
+  }
   else
   {
     tcc_warning_c(warn_all)("#pragma %s ignored", get_tok_str(tok, &tokc));
@@ -2760,7 +2902,20 @@ pragma_err:
   tcc_error("malformed #pragma directive");
 }
 
-/* put alternative filename */
+/* Set the reported filename to one already resolved -- a name saved from
+ * file->filename, as the deferred/inline body replays do.  Going through
+ * tccpp_putfile would prepend the directory again on every replay. */
+ST_FUNC void tccpp_setfile(const char *filename)
+{
+  if (0 == strcmp(file->filename, filename))
+    return;
+  if (file->true_filename == file->filename)
+    file->true_filename = tcc_strdup(file->filename);
+  pstrcpy(file->filename, sizeof file->filename, filename);
+  tcc_debug_newfile(tcc_state);
+}
+
+/* put alternative filename (#line, .file): relative to the real file */
 ST_FUNC void tccpp_putfile(const char *filename)
 {
   char buf[1024];
@@ -2775,13 +2930,7 @@ ST_FUNC void tccpp_putfile(const char *filename)
 #ifdef _WIN32
   normalize_slashes(buf);
 #endif
-  if (0 == strcmp(file->filename, buf))
-    return;
-  // printf("new file '%s'\n", buf);
-  if (file->true_filename == file->filename)
-    file->true_filename = tcc_strdup(file->filename);
-  pstrcpy(file->filename, sizeof file->filename, buf);
-  tcc_debug_newfile(tcc_state);
+  tccpp_setfile(buf);
 }
 
 /* is_bof is true if first non space token at beginning of file */
@@ -3218,9 +3367,12 @@ static void parse_escape_string(CString *outstr, const uint8_t *buf, int is_long
     cstr_wccat(outstr, '\0');
 }
 
-static void parse_string(const char *s, int len)
+/* noinline + small buf: the compiler inlines this into next(), which sits at the
+ * bottom of every recursive-descent chain, so a 1000-byte buffer here became a
+ * 1 KiB hole in every parser stack on the 32 KiB target. */
+__attribute__((noinline)) static void parse_string(const char *s, int len)
 {
-  uint8_t buf[1000], *p = buf;
+  uint8_t buf[128], *p = buf;
   int is_long, sep;
 
   if ((is_long = *s == 'L'))
@@ -3240,7 +3392,6 @@ static void parse_string(const char *s, int len)
   if (sep == '\'')
   {
     int char_size, i, n, c;
-    /* XXX: make it portable */
     if (!is_long)
       tok = TOK_CCHAR, char_size = 1;
     else
@@ -3255,8 +3406,13 @@ static void parse_string(const char *s, int len)
       if (is_long)
         c = ((nwchar_t *)tokcstr.data)[i];
       else
-        c = (c << 8) | ((char *)tokcstr.data)[i];
+        c = (c << 8) | ((unsigned char *)tokcstr.data)[i];
     }
+    /* A single narrow character constant has the value of the target char
+       converted to int.  Multi-character constants concatenate bytes, so
+       their component bytes must remain unsigned. */
+    if (!is_long && n == 1 && !tcc_state->char_is_unsigned)
+      c = (signed char)c;
     tokc.i = c;
   }
   else
@@ -3293,6 +3449,37 @@ static void bn_zero(unsigned int *bn)
   {
     bn[i] = 0;
   }
+}
+
+/* Accumulate one hex/binary float digit into the 64-bit mantissa.  Leading
+   zeros carry no significance and use no room; a digit that no longer fits
+   is dropped but still scales the value (integer part: `*exp_extra`) and
+   feeds `*sticky` so the final rounding sees it. */
+static void hexfloat_digit(unsigned int *bn, int shift, int t, int is_frac, int *frac_bits, int *exp_extra,
+                           int *sticky)
+{
+  int used = 0;
+  if (bn[1])
+    used = 64 - __builtin_clz(bn[1]);
+  else if (bn[0])
+    used = 32 - __builtin_clz(bn[0]);
+  if (used == 0 && t == 0)
+  {
+    if (is_frac)
+      *frac_bits += shift;
+    return;
+  }
+  if (used + shift <= BN_SIZE * 32)
+  {
+    bn_lshift(bn, shift, t);
+    if (is_frac)
+      *frac_bits += shift;
+    return;
+  }
+  if (!is_frac)
+    *exp_extra += shift;
+  if (t)
+    *sticky = 1;
 }
 
 /* parse number in null terminated string 'p' and return it in the
@@ -3367,7 +3554,8 @@ static void parse_number(const char *p)
       else
         shift = 1;
       bn_zero(bn);
-      int bn_used_bits = 0;
+      int exp_extra = 0, sticky = 0;
+      frac_bits = 0;
       q = token_buf;
       while (1)
       {
@@ -3388,10 +3576,8 @@ static void parse_number(const char *p)
         {
           t = t - '0';
         }
-        bn_lshift(bn, shift, t);
-        bn_used_bits += shift;
+        hexfloat_digit(bn, shift, t, 0, &frac_bits, &exp_extra, &sticky);
       }
-      frac_bits = 0;
       if (ch == '.')
       {
         ch = *p++;
@@ -3416,16 +3602,7 @@ static void parse_number(const char *p)
           }
           if (t >= b)
             tcc_error("invalid digit");
-          /* Only accumulate digits that fit in the bignum.  Excess
-             fractional digits beyond BN_SIZE*32 bits would overflow
-             the fixed-width bignum and corrupt the result.  Silently
-             ignore them (they are beyond double precision anyway). */
-          if (bn_used_bits + shift <= BN_SIZE * 32)
-          {
-            bn_lshift(bn, shift, t);
-            frac_bits += shift;
-            bn_used_bits += shift;
-          }
+          hexfloat_digit(bn, shift, t, 1, &frac_bits, &exp_extra, &sticky);
           ch = *p++;
         }
       }
@@ -3454,8 +3631,12 @@ static void parse_number(const char *p)
 
       /* now we can generate the number */
       /* XXX: should patch directly float number */
+      /* dropped digits sit far below the double's last bit (the mantissa
+         is full), so a sticky low bit is enough to round them correctly */
+      if (sticky)
+        bn[0] |= 1;
       d = (double)bn[1] * 4294967296.0 + (double)bn[0];
-      d = ldexp(d, exp_val - frac_bits);
+      d = ldexp(d, exp_val + exp_extra - frac_bits);
       t = toup(ch);
       if (t == 'F')
       {
@@ -4312,11 +4493,21 @@ redo_no_start:
   case ':':
   case '?':
   case '~':
-  case '@': /* only used in assembler */
   parse_simple:
     tok = c;
     p++;
     break;
+  case '@': /* only used in assembler */
+#if defined(TCC_TARGET_ARM)
+    /* GAS for ARM reads '@' as a line comment ('#' is the immediate prefix
+       there, and types are spelled %function). */
+    if (parse_flags & PARSE_FLAG_ASM_FILE)
+    {
+      p = parse_line_comment(p);
+      goto redo_no_start;
+    }
+#endif
+    goto parse_simple;
   default:
     if (c >= 0x80 && c <= 0xFF) /* utf8 identifiers */
       goto parse_ident_fast;
@@ -4661,7 +4852,7 @@ static int next_argstream(Sym **nested_list, TokenString *ws_str)
     /* also, end of scope for nested defined symbol */
     sa = *nested_list;
     if (sa)
-      *nested_list = sa->prev, sym_free(sa);
+      *nested_list = sa->prev, sym_free_short(sa);
   }
   if (ws_str)
   {
@@ -4805,11 +4996,11 @@ static int macro_subst_tok(TokenString *tok_str, Sym **nested_list, Sym *s)
     if (s->type.t & MACRO_JOIN)
       jstr = macro_twosharps(mstr);
 
-    sa = sym_push2(nested_list, v, 0, 0);
+    sa = sym_push2_short(nested_list, v, 0, 0);
     ret = macro_subst(tok_str, nested_list, jstr);
     /* pop nested defined symbol */
     if (sa == *nested_list)
-      *nested_list = sa->prev, sym_free(sa);
+      *nested_list = sa->prev, sym_free_short(sa);
     if (jstr != mstr)
       tok_str_free_str(jstr);
     if (mstr != s->d)
@@ -5244,7 +5435,8 @@ static void putdefs(CString *cs, const char *p)
 }
 
 /* TCC_NO_PROGRAMMATIC_DECLS forces the text path for the predefined
- * prototypes, for A/B validation against tccgen_predef_protos. */
+ * prototypes, for A/B validation against the programmatic (lazy) ones in
+ * gen/decl/predef_protos.c. */
 TCC_DBG_ENV_FLAG(pp_no_programmatic_decls, "TCC_NO_PROGRAMMATIC_DECLS")
 
 #if !CONFIG_TCC_PREDEF_TABLE
@@ -5321,23 +5513,15 @@ typedef struct TCCPredefTok
 {
   unsigned char kind;
   int tok;
-  const char *text;
+  unsigned short text; /* PDT_IDENT/PDT_NUM: offset into tcc_predef_strs[] */
 } TCCPredefTok;
 
 #include "tccdefs_table_.h"
 
-#define NB_PREDEF ((int)(sizeof(tcc_predef_macros) / sizeof(tcc_predef_macros[0])))
-
-/* Name index: a small open hash over the table, built once per process. The
- * shape mirrors the lazy builtin-keyword index above -- static storage, no
- * heap -- because this runs for every newly interned identifier. */
-#define PREDEF_HASH_SIZE 256 /* power of two, > NB_PREDEF */
-static unsigned short predef_hash_head[PREDEF_HASH_SIZE];
-static unsigned short predef_hash_next[NB_PREDEF];
-static unsigned char predef_index_built;
-/* Bare macro name length (the table's name field carries the parameter list
- * for function-like macros, e.g. "__builtin_offsetof(type,field)"). */
-static unsigned char predef_name_len[NB_PREDEF];
+/* The name index (predef_hash_head/next, by bare-name hash with TOK_HASH_FUNC,
+ * index+1 chains) is generated with the tables: static, no heap, no .bss --
+ * it runs for every newly interned identifier. */
+#define PREDEF_STR(off) (tcc_predef_strs + (off))
 
 static unsigned predef_hash(const char *s, int len)
 {
@@ -5346,25 +5530,6 @@ static unsigned predef_hash(const char *s, int len)
   for (i = 0; i < len; i++)
     h = TOK_HASH_FUNC(h, ((const unsigned char *)s)[i]);
   return h & (PREDEF_HASH_SIZE - 1);
-}
-
-static void predef_build_index(void)
-{
-  int i;
-  for (i = 0; i < NB_PREDEF; i++)
-  {
-    const char *n = tcc_predef_macros[i].name;
-    int len = 0;
-    while (n[len] && n[len] != '(')
-      len++;
-    predef_name_len[i] = (unsigned char)len;
-    {
-      unsigned h = predef_hash(n, len);
-      predef_hash_next[i] = predef_hash_head[h];
-      predef_hash_head[h] = (unsigned short)(i + 1); /* index+1; 0 = empty */
-    }
-  }
-  predef_index_built = 1;
 }
 
 /* Is this entry active for the current TCCState? The two conditions that could
@@ -5407,9 +5572,7 @@ static void predef_materialize(TokenSym *ts, int idx)
   /* Parameters, for function-like macros: the table spells them inside the
      name field exactly as the text form did. */
   {
-    const char *p = e->name;
-    while (*p && *p != '(')
-      p++;
+    const char *p = PREDEF_STR(e->name) + e->name_len;
     if (*p == '(')
     {
       macro_type = MACRO_FUNC;
@@ -5420,7 +5583,7 @@ static void predef_materialize(TokenSym *ts, int idx)
         Sym *s;
         while (*p && *p != ',' && *p != ')')
           p++;
-        s = sym_push2(&define_stack, tok_alloc(b, (int)(p - b))->tok | SYM_FIELD, 0, 0);
+        s = sym_push2_short(&define_stack, tok_alloc(b, (int)(p - b))->tok | SYM_FIELD, 0, 0);
         *ps = s;
         ps = &s->next;
         if (*p == ',')
@@ -5436,10 +5599,10 @@ static void predef_materialize(TokenSym *ts, int idx)
     switch (t->kind)
     {
     case PDT_IDENT:
-      tok_str_add(&str, tok_alloc(t->text, (int)strlen(t->text))->tok);
+      tok_str_add(&str, tok_alloc(PREDEF_STR(t->text), (int)strlen(PREDEF_STR(t->text)))->tok);
       break;
     case PDT_NUM:
-      parse_number(t->text);
+      parse_number(PREDEF_STR(t->text));
       tok_str_add2(&str, tok, &tokc);
       break;
     default:
@@ -5451,7 +5614,7 @@ static void predef_materialize(TokenSym *ts, int idx)
      walks past the end when a source #define redefines a predefined name --
      which is a heap read overflow ASAN catches on the first such redefinition. */
   tok_str_add(&str, 0);
-  tok_str_shrink(&str);
+  tok_str_fit(&str);
 
   define_push(ts->tok, macro_type, tok_str_ensure_heap(&str), first);
 
@@ -5470,14 +5633,12 @@ static void tcc_predef_try_materialize(TokenSym *ts, const char *str, int len)
 
   if (!tcc_state)
     return;
-  if (!predef_index_built)
-    predef_build_index();
 
   h = predef_hash(str, len);
   for (i = predef_hash_head[h]; i; i = predef_hash_next[i - 1])
   {
     int idx = i - 1;
-    if (predef_name_len[idx] == len && !memcmp(tcc_predef_macros[idx].name, str, len))
+    if (tcc_predef_macros[idx].name_len == len && !memcmp(PREDEF_STR(tcc_predef_macros[idx].name), str, len))
     {
       if (predef_entry_active(tcc_state, &tcc_predef_macros[idx]))
         predef_materialize(ts, idx);
@@ -5492,6 +5653,22 @@ static void tcc_predefs_base(TCCState *s1, CString *cs, int is_asm, int include_
   cstr_printf(cs, "#define __TINYC__ 9%.2s\n", *&TCC_VERSION + 4);
   putdefs(cs, target_machine_defs);
   putdefs(cs, target_os_defs);
+#if defined TCC_TARGET_ARM_ARCHV8M
+  /* The ACLE description of ARMv8-M Mainline gcc and clang give a Cortex-M33
+   * (pico-sdk's spin locks pick their LDREX path on __ARM_ARCH_8M_MAIN__).
+   * DSP and CMSE are left out: code reaching for their intrinsics is not
+   * code tcc has been taught to emit. */
+  cstr_printf(cs, "#define __ARM_ARCH 8\n"
+                  "#define __ARM_ARCH_8M_MAIN__ 1\n"
+                  "#define __ARM_ARCH_ISA_THUMB 2\n"
+                  "#define __ARM_ARCH_PROFILE 77\n"
+                  "#define __ARM_FEATURE_CLZ 1\n"
+                  "#define __ARM_FEATURE_IDIV 1\n"
+                  "#define __ARM_FEATURE_LDREX 7\n"
+                  "#define __ARM_FEATURE_QBIT 1\n"
+                  "#define __ARM_FEATURE_SAT 1\n"
+                  "#define __ARM_FEATURE_UNALIGNED 1\n");
+#endif
 
 #if defined(TCC_TARGET_ARM) || defined(TCC_TARGET_ARM_THUMB)
   if (s1->float_abi == ARM_HARD_FLOAT)
@@ -5558,9 +5735,9 @@ static void tcc_predefs_base(TCCState *s1, CString *cs, int is_asm, int include_
 #endif
   if (s1->char_is_unsigned)
     putdef(cs, "__CHAR_UNSIGNED__");
-  if (s1->optimize > 0)
+  if (TCC_OPT(s1, optimize) > 0)
     putdef(cs, "__OPTIMIZE__");
-  if (s1->optimize_size)
+  if (TCC_OPT(s1, optimize_size))
     putdef(cs, "__OPTIMIZE_SIZE__");
   if (s1->option_pthread)
     putdef(cs, "_REENTRANT");
@@ -5568,9 +5745,6 @@ static void tcc_predefs_base(TCCState *s1, CString *cs, int is_asm, int include_
     putdef(cs, "__leading_underscore");
   cstr_printf(cs, "#define __SIZEOF_POINTER__ %d\n", PTR_SIZE);
   cstr_printf(cs, "#define __SIZEOF_LONG__ %d\n", LONG_SIZE);
-  cstr_printf(cs, "#define __SIZEOF_INT__ 4\n");
-  cstr_printf(cs, "#define __SIZEOF_SHORT__ 2\n");
-  cstr_printf(cs, "#define __SIZEOF_LONG_LONG__ 8\n");
   cstr_printf(cs, "#define __SIZEOF_FLOAT__ 4\n");
   cstr_printf(cs, "#define __SIZEOF_DOUBLE__ 8\n");
   cstr_printf(cs, "#define __SIZEOF_LONG_DOUBLE__ %d\n", LDOUBLE_SIZE);
@@ -5613,10 +5787,10 @@ static void tcc_predefs_base(TCCState *s1, CString *cs, int is_asm, int include_
        TCC_OUTPUT_PREPROCESS arm below. */
     if (s1->output_type != TCC_OUTPUT_PREPROCESS)
     {
-      int ri;
-      for (ri = 0; tcc_predef_raw[ri]; ri++)
+      const char *r;
+      for (r = tcc_predef_raw; *r; r += strlen(r) + 1)
       {
-        cstr_cat(cs, tcc_predef_raw[ri], -1);
+        cstr_cat(cs, r, -1);
         cstr_ccat(cs, '\n');
       }
     }
@@ -5679,6 +5853,7 @@ ST_FUNC void preprocess_start(TCCState *s1, int filetype)
   pp_debug_tok = pp_debug_symv = 0;
   s1->pack_stack[0] = 0;
   s1->pack_stack_ptr = s1->pack_stack;
+  s1->visibility_stack_depth = 0;
 
   set_idnum('$', !is_asm && s1->dollars_in_identifiers ? IS_ID : 0);
   set_idnum('.', is_asm ? IS_ID : 0);
@@ -5710,6 +5885,9 @@ ST_FUNC void preprocess_end(TCCState *s1)
   macro_ptr = NULL;
   while (file)
     tcc_close();
+#ifdef CONFIG_TCC_ASM
+  tcc_asm_cleanup();
+#endif
   tccpp_delete(s1);
 }
 
@@ -5746,7 +5924,6 @@ ST_FUNC void tccpp_new(TCCState *s)
     set_idnum(i, IS_ID);
 
   /* init allocators */
-  tal_new(&toksym_alloc, TOKSYM_TAL_LIMIT, TOKSYM_TAL_SIZE);
   tal_new(&tokstr_alloc, TOKSTR_TAL_LIMIT, TOKSTR_TAL_SIZE);
 
   table_ident_alloc = TOK_IDENT_PREALLOC;
@@ -5766,11 +5943,8 @@ ST_FUNC void tccpp_new(TCCState *s)
   tok_str_realloc(&tokstr_buf, TOKSTR_MAX_SIZE);
   tok_str_new(&unget_buf);
 
-  /* Reserve the whole builtin token id range; build the static keyword index
-     (no heap).  Builtin TokenSyms are materialized lazily on first use rather
-     than interned eagerly here. */
-  if (!kw_index_built)
-    kw_index_build();
+  /* Reserve the whole builtin token id range.  Builtin TokenSyms are
+     materialized lazily on first use rather than interned eagerly here. */
   tok_ident = TOK_IDENT + NB_BUILTIN_TOKS;
 
   /* we add dummy defines for some special macros to speed up tests
@@ -5785,7 +5959,7 @@ ST_FUNC void tccpp_new(TCCState *s)
 
 ST_FUNC void tccpp_delete(TCCState *s)
 {
-  int i, n;
+  int n;
 
   dynarray_reset(&s->cached_includes, &s->nb_cached_includes);
 
@@ -5793,8 +5967,7 @@ ST_FUNC void tccpp_delete(TCCState *s)
   n = tok_ident - TOK_IDENT;
   if (n > total_idents)
     total_idents = n;
-  for (i = 0; i < n; i++)
-    tal_free(toksym_alloc, table_ident[i]);
+  toksym_free_all();
   tcc_free(table_ident);
   table_ident = NULL;
   table_ident_alloc = 0;
@@ -5822,8 +5995,6 @@ ST_FUNC void tccpp_delete(TCCState *s)
   */
 
   /* free allocators */
-  tal_delete(toksym_alloc);
-  toksym_alloc = NULL;
   tal_delete(tokstr_alloc);
   tokstr_alloc = NULL;
 }
@@ -5968,6 +6139,21 @@ static int pp_check_he0xE(int t, const char *p)
   return t;
 }
 
+/* -dM / -dD list the predefines too, as gcc does.  The table ones are defined
+ * lazily, when their name is first interned, which never goes through the
+ * #define path the dump hooks: intern each active entry and print it. */
+static void pp_dump_table_predefs(TCCState *s1)
+{
+  int i;
+  for (i = 0; i < (int)(sizeof(tcc_predef_macros) / sizeof(tcc_predef_macros[0])); i++)
+  {
+    const TCCPredefMacro *e = &tcc_predef_macros[i];
+    if (!predef_entry_active(s1, e))
+      continue;
+    define_print(s1, tok_alloc(PREDEF_STR(e->name), e->name_len)->tok);
+  }
+}
+
 /* Preprocess the current file */
 ST_FUNC int tcc_preprocess(TCCState *s1)
 {
@@ -5992,6 +6178,9 @@ ST_FUNC int tcc_preprocess(TCCState *s1)
     while (tok != TOK_EOF);
     return 0;
   }
+
+  if (s1->dflag & 3)
+    pp_dump_table_predefs(s1);
 
   token_seen = TOK_LINEFEED, spcs = 0, level = 0;
   if (file->prev)

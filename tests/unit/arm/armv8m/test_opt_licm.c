@@ -549,16 +549,16 @@ UT_TEST(test_licm_lea_stack_addr_hoisted)
   return 0;
 }
 
-/* NEGATIVE (no preheader): when the loop header is at function entry there is
- * no out-of-loop predecessor to hoist into.  A loop is detected but no
- * instruction may be inserted.
+/* POSITIVE (entry preheader): when the loop header is at function entry it has
+ * no out-of-loop predecessor, and the function entry itself is the preheader:
+ * the invariant goes to instruction 0 and the back edge is renumbered past it.
  *
- *   idx 0: T1 = T0 + #5     ; would be invariant, but header is the entry
+ *   idx 0: T1 = T0 + #5     ; invariant, header is the entry
  *   idx 1: T2 = T2 + #1
  *   idx 2: JUMPIF ->0
  *   idx 3: RETURNVOID
  */
-UT_TEST(test_licm_header_at_entry_no_hoist)
+UT_TEST(test_licm_header_at_entry_hoists_to_entry)
 {
   TCCIRState *ir = utb_loop_new();
 
@@ -573,9 +573,23 @@ UT_TEST(test_licm_header_at_entry_no_hoist)
   int loops = tcc_ir_opt_licm(ir);
 
   UT_ASSERT(loops >= 1);
-  UT_ASSERT_EQ(ir->next_instruction_index, n_before);
-  UT_ASSERT_EQ(count_nops(ir), nops_before);
+  UT_ASSERT_EQ(ir->next_instruction_index, n_before + 1);
+  UT_ASSERT_EQ(count_nops(ir), nops_before + 1);
+  /* The hoisted add opens the function; its in-loop original is a NOP. */
   UT_ASSERT_EQ(utb_op(ir, 0), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_vreg(utb_dest(ir, 0)), TCCIR_ENCODE_VREG(TCCIR_VREG_TYPE_TEMP, 1));
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_NOP);
+
+  /* The back edge enters at the old header, past the hoisted instruction. */
+  int jmp_idx = -1;
+  for (int i = 0; i < ir->next_instruction_index; i++)
+    if (ir->compact_instructions[i].op == TCCIR_OP_JUMPIF)
+    {
+      jmp_idx = i;
+      break;
+    }
+  UT_ASSERT(jmp_idx >= 0);
+  UT_ASSERT_EQ((int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, &ir->compact_instructions[jmp_idx])), 1);
 
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
 
@@ -1073,11 +1087,11 @@ UT_TEST(test_hoist_budget_defaults_total_regs_when_unset)
 /* ==================================================================
  * tcc_ir_cache_func_purity / tcc_ir_lookup_func_purity
  *
- * A small linear cache on TCCState keyed by function token, consulted by
+ * A hash table on TCCState keyed by function token, consulted by
  * tcc_ir_get_func_purity() before falling back to the conservative IMPURE
  * default.  Uses the shared tcc_state global (tcc_state_stub.c); tests reset
- * func_purity_cache_count first since the storage persists across the whole
- * UT binary run.
+ * it first (tcc_ir_reset_func_purity_cache) since the storage persists across
+ * the whole UT binary run.
  * ================================================================== */
 
 #define UT_TOK_A (TOK_IDENT + 100)
@@ -1086,20 +1100,20 @@ UT_TEST(test_hoist_budget_defaults_total_regs_when_unset)
 /* POSITIVE: a cached token round-trips through lookup. */
 UT_TEST(test_purity_cache_add_then_lookup_roundtrips)
 {
-  tcc_state->func_purity_cache_count = 0;
+  tcc_ir_reset_func_purity_cache(tcc_state);
 
   tcc_ir_cache_func_purity(tcc_state, UT_TOK_A, TCC_FUNC_PURITY_CONST);
   int got = tcc_ir_lookup_func_purity(tcc_state, UT_TOK_A);
   UT_ASSERT_EQ(got, (int)TCC_FUNC_PURITY_CONST);
 
-  tcc_state->func_purity_cache_count = 0;
+  tcc_ir_reset_func_purity_cache(tcc_state);
   return 0;
 }
 
 /* NEGATIVE: a token that was never cached returns -1 (not found sentinel). */
 UT_TEST(test_purity_cache_lookup_miss_returns_minus_one)
 {
-  tcc_state->func_purity_cache_count = 0;
+  tcc_ir_reset_func_purity_cache(tcc_state);
 
   int got = tcc_ir_lookup_func_purity(tcc_state, UT_TOK_B);
   UT_ASSERT_EQ(got, -1);
@@ -1112,7 +1126,7 @@ UT_TEST(test_purity_cache_lookup_miss_returns_minus_one)
  * overwriting. */
 UT_TEST(test_purity_cache_duplicate_token_keeps_first_value)
 {
-  tcc_state->func_purity_cache_count = 0;
+  tcc_ir_reset_func_purity_cache(tcc_state);
 
   tcc_ir_cache_func_purity(tcc_state, UT_TOK_A, TCC_FUNC_PURITY_CONST);
   tcc_ir_cache_func_purity(tcc_state, UT_TOK_A, TCC_FUNC_PURITY_IMPURE);
@@ -1120,7 +1134,7 @@ UT_TEST(test_purity_cache_duplicate_token_keeps_first_value)
   UT_ASSERT_EQ(tcc_state->func_purity_cache_count, 1);
   UT_ASSERT_EQ(tcc_ir_lookup_func_purity(tcc_state, UT_TOK_A), (int)TCC_FUNC_PURITY_CONST);
 
-  tcc_state->func_purity_cache_count = 0;
+  tcc_ir_reset_func_purity_cache(tcc_state);
   return 0;
 }
 
@@ -1129,7 +1143,7 @@ UT_TEST(test_purity_cache_duplicate_token_keeps_first_value)
  * garbage. */
 UT_TEST(test_purity_cache_rejects_token_below_tok_ident)
 {
-  tcc_state->func_purity_cache_count = 0;
+  tcc_ir_reset_func_purity_cache(tcc_state);
 
   tcc_ir_cache_func_purity(tcc_state, 5 /* < TOK_IDENT */, TCC_FUNC_PURITY_CONST);
   UT_ASSERT_EQ(tcc_state->func_purity_cache_count, 0);
@@ -1278,12 +1292,12 @@ UT_TEST(test_get_func_purity_cache_hit)
   ut_init_func_sym(&s, TOK_IDENT + 8);
   utb_set_tok_str(s.v, "some_cached_fn");
 
-  tcc_state->func_purity_cache_count = 0;
+  tcc_ir_reset_func_purity_cache(tcc_state);
   tcc_ir_cache_func_purity(tcc_state, s.v, TCC_FUNC_PURITY_PURE);
 
   UT_ASSERT_EQ(tcc_ir_get_func_purity(NULL, &s), (int)TCC_FUNC_PURITY_PURE);
 
-  tcc_state->func_purity_cache_count = 0;
+  tcc_ir_reset_func_purity_cache(tcc_state);
   return 0;
 }
 
@@ -1295,7 +1309,7 @@ UT_TEST(test_get_func_purity_unknown_defaults_impure)
   ut_init_func_sym(&s, TOK_IDENT + 9);
   utb_set_tok_str(s.v, "totally_unknown_fn");
 
-  tcc_state->func_purity_cache_count = 0;
+  tcc_ir_reset_func_purity_cache(tcc_state);
   UT_ASSERT_EQ(tcc_ir_get_func_purity(NULL, &s), (int)TCC_FUNC_PURITY_IMPURE);
   return 0;
 }
@@ -1532,3 +1546,91 @@ UT_TEST(test_infer_purity_null_args_are_impure)
 }
 
 UT_COVERS("licm");
+
+UT_TEST(test_licm_late_replaces_sources_across_call)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(10, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_temp(0, I32), utb_imm(17, I32));
+  utb_emit(ir, TCCIR_OP_SHR, utb_temp(2, I32), utb_temp(1, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(2, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, utb_imm(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(1), utb_param(0, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+  ir->compact_instructions[1].orig_index = 71;
+  ir->compact_instructions[2].orig_index = 72;
+
+  UT_ASSERT_EQ(ssa_opt_licm_late(ir), 2);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_ADD);
+  UT_ASSERT_EQ(utb_op(ir, 2), TCCIR_OP_SHR);
+  UT_ASSERT_EQ(ir->compact_instructions[1].orig_index, 71);
+  UT_ASSERT_EQ(ir->compact_instructions[2].orig_index, 72);
+  UT_ASSERT_EQ(ssa_opt_licm_late(ir), 0);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_licm_late_shared_source_across_call_not_hoisted)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(10, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I32), utb_param(0, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, utb_imm(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(1), utb_temp(2, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_param(0, I32), UTB_NONE);
+
+  UT_ASSERT_EQ(ssa_opt_licm_late(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_SHR);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_licm_late_counts_repeated_source_once)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(10, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_param(0, I32), utb_param(0, I32));
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, utb_imm(0, I32), utb_imm(1, I32));
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(1), utb_param(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  UT_ASSERT_EQ(ssa_opt_licm_late(ir), 1);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_ADD);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_licm_late_wide_result_not_hoisted)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(10, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, IROP_BTYPE_INT64),
+           utb_param(0, IROP_BTYPE_INT64), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(1), utb_param(1, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  UT_ASSERT_EQ(ssa_opt_licm_late(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_SHR);
+  utb_free(ir);
+  return 0;
+}
+
+UT_TEST(test_licm_late_fourth_operand_keeps_source_live)
+{
+  TCCIRState *ir = utb_loop_new();
+  utb_emit(ir, TCCIR_OP_ASSIGN, utb_temp(0, I32), utb_imm(10, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_SHR, utb_temp(1, I32), utb_param(0, I32), utb_imm(2, I32));
+  utb_emit(ir, TCCIR_OP_FUNCPARAMVAL, UTB_NONE, utb_temp(1, I32), utb_imm(0, I32));
+  utb_emit(ir, TCCIR_OP_FUNCCALLVOID, UTB_NONE, utb_imm(0, I32), utb_imm(1, I32));
+  utb_emit4(ir, TCCIR_OP_SELECT, utb_temp(2, I32), utb_param(1, I32),
+            utb_imm(0, I32), utb_param(0, I32));
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_jtarget(1), utb_temp(2, I32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVOID, UTB_NONE, UTB_NONE, UTB_NONE);
+
+  UT_ASSERT_EQ(ssa_opt_licm_late(ir), 0);
+  UT_ASSERT_EQ(utb_op(ir, 1), TCCIR_OP_SHR);
+  utb_free(ir);
+  return 0;
+}

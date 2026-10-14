@@ -1,0 +1,2 @@
+error:
+'__rodata_relative' qualifies a pointer: write it after the '*'

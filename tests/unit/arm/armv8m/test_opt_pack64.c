@@ -774,24 +774,25 @@ UT_TEST(test_shl32_or_chain_shl32_consumer_fires)
 }
 
 /* Pattern B (AND-low consumer): same chain, but the final consumer is
- * `AND #0xFFFFFFFF` instead of `SHL #32`. Regression lock for bugs.md #9
- * (fixed): irop_make_imm32 stores the mask as a sign-extending 32-bit
- * immediate, so irop_get_imm64_ex() sign-extends 0xFFFFFFFFu (int32_t -1) to
- * int64_t -1. The old check `(uint64_t)imm == 0xFFFFFFFFULL`
- * (ir/opt_pack64.c:1033) compared against 0x00000000FFFFFFFF and could never
- * match the sign-extended -1, so the AND-consumer half of this fusion was dead
- * code. The fix compares the low 32 bits `(uint32_t)imm == 0xFFFFFFFFu`, so the
- * fold now fires -- mirroring test_shl32_or_chain_shl32_consumer_fires. */
+ * `AND 0x00000000FFFFFFFF` instead of `SHL #32`. The mask has to be the full
+ * 64-bit value, which the frontend keeps in the i64 pool (an IMM32 0xFFFFFFFF
+ * sign-extends to #-1 = all-ones and keeps the high half -- see
+ * test_shl32_or_chain_and_all_ones_no_fire).
+ *   0: T_sar(i64) = X SAR #31
+ *   1: T_shl1(i64) = T_sar SHL #32
+ *   2: T_or(i64) = X2 OR T_shl1         ; keep first
+ *   3: T_use(i64) = T_or AND 0xFFFFFFFF ; consumer -> rewritten to X2 AND ... */
 UT_TEST(test_shl32_or_chain_and_low_consumer_fires)
 {
   TCCIRState *ir = utb_new();
+  utb_pools_init(ir); /* the low-32 mask is an i64-pool immediate */
   ir->next_temporary_variable = 5;
 
   utb_emit(ir, TCCIR_OP_SAR, utb_temp(0, I64), utb_temp(4, I64), utb_imm(31, I32));      /* 0 */
   int i_shl1 = utb_emit(ir, TCCIR_OP_SHL, utb_temp(1, I64), utb_temp(0, I64), utb_imm(32, I32)); /* 1 */
   int i_or = utb_emit(ir, TCCIR_OP_OR, utb_temp(2, I64), utb_temp(5, I64), utb_temp(1, I64));    /* 2: keep first */
-  int i_use = utb_emit(ir, TCCIR_OP_AND, utb_temp(3, I64), utb_temp(2, I64),
-                       irop_make_imm32(0, (int32_t)0xFFFFFFFFu, I64)); /* 3 */
+  IROperand low_mask = irop_make_i64(0, tcc_ir_pool_add_i64(ir, 0xFFFFFFFFull), I64);
+  int i_use = utb_emit(ir, TCCIR_OP_AND, utb_temp(3, I64), utb_temp(2, I64), low_mask); /* 3 */
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I64), UTB_NONE);
 
   int changes = tcc_ir_opt_shl32_or_chain(ir);
@@ -805,6 +806,33 @@ UT_TEST(test_shl32_or_chain_and_low_consumer_fires)
   UT_ASSERT_EQ(utb_op(ir, i_or), TCCIR_OP_NOP);
   UT_ASSERT_EQ(utb_op(ir, i_shl1), TCCIR_OP_NOP);
   UT_ASSERT_EQ(utb_assert_wellformed(ir, 16), 0);
+
+  utb_free(ir);
+  return 0;
+}
+
+/* NEGATIVE: the AND's mask is the sign-extended IMM32 0xFFFFFFFF, i.e. the
+ * 64-bit value #-1 = all-ones. That keeps the high half the chain contributes,
+ * so the fold must not drop it (docs/bugs/shl32-or-chain-matches-and-minus-one-as-low-mask). */
+UT_TEST(test_shl32_or_chain_and_all_ones_no_fire)
+{
+  TCCIRState *ir = utb_new();
+  ir->next_temporary_variable = 5;
+
+  utb_emit(ir, TCCIR_OP_SAR, utb_temp(0, I64), utb_temp(4, I64), utb_imm(31, I32));
+  int i_shl1 = utb_emit(ir, TCCIR_OP_SHL, utb_temp(1, I64), utb_temp(0, I64), utb_imm(32, I32));
+  int i_or = utb_emit(ir, TCCIR_OP_OR, utb_temp(2, I64), utb_temp(5, I64), utb_temp(1, I64));
+  int i_use = utb_emit(ir, TCCIR_OP_AND, utb_temp(3, I64), utb_temp(2, I64),
+                       irop_make_imm32(0, (int32_t)0xFFFFFFFFu, I64));
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_temp(3, I64), UTB_NONE);
+
+  int changes = tcc_ir_opt_shl32_or_chain(ir);
+
+  UT_ASSERT_EQ(changes, 0);
+  UT_ASSERT_EQ(utb_op(ir, i_use), TCCIR_OP_AND);
+  UT_ASSERT_EQ(utb_vreg(utb_src1(ir, i_use)), utb_vreg(utb_temp(2, I64))); /* still reads the OR */
+  UT_ASSERT_EQ(utb_op(ir, i_or), TCCIR_OP_OR);
+  UT_ASSERT_EQ(utb_op(ir, i_shl1), TCCIR_OP_SHL);
 
   utb_free(ir);
   return 0;

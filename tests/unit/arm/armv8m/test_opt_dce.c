@@ -12,7 +12,6 @@
 
 /* Pass entry points defined in ir/opt_dce.c. */
 int tcc_ir_opt_dce(TCCIRState *ir);
-int tcc_ir_opt_dce_ex(IROptCtx *ctx);
 int tcc_ir_opt_useless_function_body(TCCIRState *ir);
 int tcc_ir_opt_noreturn_collapse(TCCIRState *ir);
 int tcc_ir_opt_trap_only_body_suppress(TCCIRState *ir);
@@ -813,16 +812,7 @@ UT_TEST(test_noreturn_collapse_conditional_exit_returns_zero)
   return 0;
 }
 
-/* WRAPPER: IROptCtx entry points forward to the bare TCCIRState* passes. */
-
-static IROptCtx utb_ctx(TCCIRState *ir)
-{
-  IROptCtx ctx = {0};
-  ctx.ir = ir;
-  return ctx;
-}
-
-UT_TEST(test_dce_ex_forwards)
+UT_TEST(test_dce_direct_call)
 {
   TCCIRState *ir = utb_new();
   utb_emit(ir, TCCIR_OP_ADD, utb_temp(0, I32), utb_imm(1, I32), utb_imm(2, I32));
@@ -830,8 +820,7 @@ UT_TEST(test_dce_ex_forwards)
   int dead = utb_emit(ir, TCCIR_OP_ADD, utb_temp(1, I32), utb_imm(4, I32), utb_imm(5, I32));
   utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, utb_imm(0, I32), UTB_NONE);
 
-  IROptCtx ctx = utb_ctx(ir);
-  int changes = tcc_ir_opt_dce_ex(&ctx);
+  int changes = tcc_ir_opt_dce(ir);
 
   UT_ASSERT_EQ(changes, 1);
   UT_ASSERT_EQ(utb_op(ir, dead), TCCIR_OP_NOP);

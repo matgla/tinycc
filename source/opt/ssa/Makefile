@@ -24,6 +24,7 @@ SSA_OPT_SRC = \
 	source/opt/ssa/string/str_strstr.c \
 	source/opt/ssa/string/str_memchr.c \
 	source/opt/ssa/memory/global_addr_hoist.c \
+	source/opt/ssa/memory/load_combine.c \
 	source/opt/ssa/memory/load_cse.c \
 	source/opt/ssa/memory/diamond_store_fwd.c \
 	source/opt/ssa/scalar/bitop_const_fold.c \
@@ -43,6 +44,7 @@ SSA_OPT_SRC = \
 	source/opt/ssa/cfg/switch_fold.c \
 	source/opt/ssa/cfg/or_bool_diamond.c \
 	source/opt/ssa/cfg/cmp_eq.c \
+	source/opt/ssa/cfg/dup_diamond.c \
 	source/opt/ssa/cfg/vrp.c \
 	source/opt/ssa/dce/temp_worklist.c \
 	source/opt/ssa/dce/unreachable.c \
@@ -64,11 +66,13 @@ SSA_OPT_SRC = \
 	source/opt/ssa/loop/loop_unroll.c \
 	source/opt/ssa/loop/iv_strength_reduction.c \
 	source/opt/ssa/loop/decrement_to_zero.c \
+	source/opt/ssa/loop/decrement_carry.c \
 	source/opt/ssa/loop/loop_bottom_test.c \
 	source/opt/ssa/loop/dead_loop.c \
 	source/opt/ssa/scalar/sccp.c \
 	source/opt/ssa/memory/global_store_dse.c \
 	source/opt/ssa/memory/ptr_store_dse.c \
+	source/opt/ssa/memory/copy_fwd.c \
 	source/opt/ssa/cfg/guard_collapse.c \
 	source/opt/ssa/engine/use_def.c \
 	source/opt/ssa/engine/rewrite.c \
@@ -92,6 +96,7 @@ SSA_OPT_HDRS = \
 	source/opt/ssa/include/opt/ssa/phi.h \
 	source/opt/ssa/include/opt/ssa/branch.h \
 	source/opt/ssa/include/opt/ssa/cmp_eq.h \
+	source/opt/ssa/include/opt/ssa/dup_diamond.h \
 	source/opt/ssa/include/opt/ssa/vrp.h \
 	source/opt/ssa/include/opt/ssa/setif_or_taut.h \
 	source/opt/ssa/include/opt/ssa/bool_norm.h \

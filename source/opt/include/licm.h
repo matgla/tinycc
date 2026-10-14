@@ -39,7 +39,10 @@ typedef struct IRLoops
   int capacity;  /* Capacity of loops array */
   int *ramp;     /* ramp[k] == k for every instruction; each loop's body_instrs is a
                     window of it.  One array per detection instead of one copy of every
-                    body -- nested loops in a big function summed to megabytes. */
+                    body -- nested loops in a big function summed to megabytes.  Windows
+                    of nested loops overlap, so a shift goes through
+                    tcc_ir_loops_shift_bodies (each shared entry once). */
+  int ramp_len;  /* entries in ramp */
 } IRLoops;
 
 typedef enum TCCFuncPurity
@@ -57,6 +60,9 @@ void tcc_ir_cache_func_purity(TCCState *s, int func_token, TCCFuncPurity purity)
 
 int tcc_ir_lookup_func_purity(TCCState *s, int func_token);
 
+/* Forget every cached verdict (token numbers start over with the next file). */
+void tcc_ir_reset_func_purity_cache(TCCState *s);
+
 /* Checks cache, then attributes, then the well-known-function table. */
 int tcc_ir_get_func_purity(TCCIRState *ir, Sym *sym);
 
@@ -68,15 +74,28 @@ IRLoops *tcc_ir_opt_licm_ex(TCCIRState *ir);
 
 /* ssa:licm — runs on flat IR before ssa:iv_strength_reduction. */
 int ssa_opt_licm(TCCIRState *ir);
+int ssa_opt_licm_late(TCCIRState *ir);
 int ssa_opt_licm_global_load(TCCIRState *ir);
+
+/* ssa:licm_field_ptr — hoists loop-invariant loads of pointer-typed struct
+ * fields (post rotation, right after ssa:licm_global_load). */
+int ssa_opt_licm_field_ptr_load(TCCIRState *ir);
 
 /* Must run immediately before register allocation; returns params promoted. */
 int tcc_ir_promote_loop_stack_params(TCCIRState *ir);
+
+int tcc_ir_loop_call_promotion_budget(TCCIRState *ir, IRLoops *loops);
 
 /* Natural loops only. */
 IRLoops *tcc_ir_detect_loops(TCCIRState *ir);
 
 void tcc_ir_free_loops(IRLoops *loops);
+
+/* After `delta` instructions were inserted at `pos`: add delta to every body
+ * entry >= pos of the loops first..num_loops-1 other than `skip` (-1: none).
+ * Nested loops share ramp entries; each entry moves once, not once per loop
+ * that contains it. */
+void tcc_ir_loops_shift_bodies(IRLoops *loops, int first, int skip, int pos, int delta);
 
 int tcc_ir_is_in_loop(IRLoop *loop, int instr_idx);
 

@@ -81,14 +81,12 @@ int tcc_ir_detect_const_result(TCCIRState *ir, int64_t *value, int *btype)
       continue;
     if (q->op == TCCIR_OP_ASSIGN)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      if (irop_get_vreg(dest) == ret_vr)
+      if (tcc_ir_op_dest_vreg(ir, q) == ret_vr)
       {
-        IROperand as1 = tcc_ir_op_get_src1(ir, q);
-        if (irop_is_immediate(as1))
+        if (tcc_ir_op_src1_is_imm(ir, q))
         {
-          *value = irop_get_imm64_ex(ir, as1);
-          *btype = irop_get_btype(as1);
+          *value = tcc_ir_op_src1_imm(ir, q);
+          *btype = tcc_ir_op_src1_btype(ir, q);
           return 1;
         }
         return 0;
@@ -102,12 +100,23 @@ int tcc_ir_detect_const_result(TCCIRState *ir, int64_t *value, int *btype)
 
 void tcc_ir_cache_const_result(TCCState *s, int func_token, int64_t value, int btype)
 {
+  if (!func_token)
+    return; /* func_cache_token: never cached */
   if (s->func_const_result_cache_count >= FUNC_CONST_RESULT_CACHE_SIZE)
     return;
   for (int i = 0; i < s->func_const_result_cache_count; i++)
   {
     if (s->func_const_result_cache[i].token == func_token)
       return;
+  }
+  if (s->func_const_result_cache_count == s->func_const_result_cache_cap)
+  {
+    int cap = s->func_const_result_cache_cap ? s->func_const_result_cache_cap * 2 : 16;
+    if (cap > FUNC_CONST_RESULT_CACHE_SIZE)
+      cap = FUNC_CONST_RESULT_CACHE_SIZE;
+    s->func_const_result_cache =
+        tcc_realloc(s->func_const_result_cache, cap * sizeof(*s->func_const_result_cache));
+    s->func_const_result_cache_cap = cap;
   }
   int idx = s->func_const_result_cache_count++;
   s->func_const_result_cache[idx].token = func_token;
@@ -117,6 +126,8 @@ void tcc_ir_cache_const_result(TCCState *s, int func_token, int64_t value, int b
 
 int tcc_ir_lookup_const_result(TCCState *s, int func_token, int64_t *value, int *btype)
 {
+  if (!func_token)
+    return 0;
   for (int i = 0; i < s->func_const_result_cache_count; i++)
   {
     if (s->func_const_result_cache[i].token == func_token)
@@ -143,19 +154,17 @@ int tcc_ir_opt_const_call_replace(TCCIRState *ir)
     if (q->op != TCCIR_OP_FUNCCALLVAL)
       continue;
 
-    IROperand callee_op = tcc_ir_op_get_src1(ir, q);
-    Sym *callee = irop_get_sym_ex(ir, callee_op);
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
 
     int64_t val;
     int btype;
-    if (!tcc_ir_lookup_const_result(tcc_state, callee->v, &val, &btype))
+    if (!tcc_ir_lookup_const_result(tcc_state, func_cache_token(callee), &val, &btype))
       continue;
 
     IROperand dest = tcc_ir_op_get_dest(ir, q);
-    IROperand call_info = tcc_ir_op_get_src2(ir, q);
-    int call_id = TCCIR_DECODE_CALL_ID((int)irop_get_imm64_ex(ir, call_info));
+    int call_id = TCCIR_DECODE_CALL_ID((int)tcc_ir_op_src2_imm(ir, q));
     int32_t dest_vr = irop_get_vreg(dest);
 
     LOG_IR_GEN("OPTIMIZE: IPC replace call to %s with #%lld at i=%d", get_tok_str(callee->v, NULL), (long long)val, i);
@@ -169,13 +178,13 @@ int tcc_ir_opt_const_call_replace(TCCIRState *ir)
     {
       q->op = TCCIR_OP_ASSIGN;
       if (val == (int32_t)val)
-        tcc_ir_set_src1(ir, i, irop_make_imm32(-1, (int32_t)val, btype));
+        tcc_ir_set_src1_imm32(ir, i, (int32_t)val, btype);
       else
       {
         uint32_t pool_idx = tcc_ir_pool_add_i64(ir, val);
         tcc_ir_set_src1(ir, i, irop_make_i64(-1, pool_idx, btype));
       }
-      tcc_ir_set_src2(ir, i, IROP_NONE);
+      tcc_ir_set_src2_none(ir, i);
       tcc_ir_set_dest(ir, i, dest);
     }
 
@@ -188,8 +197,7 @@ int tcc_ir_opt_const_call_replace(TCCIRState *ir)
       IRQuadCompact *pq = &ir->compact_instructions[j];
       if (pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID)
         continue;
-      IROperand ps2 = tcc_ir_op_get_src2(ir, pq);
-      int p_call_id = TCCIR_DECODE_CALL_ID((int)irop_get_imm64_ex(ir, ps2));
+      int p_call_id = TCCIR_DECODE_CALL_ID((int)tcc_ir_op_src2_imm(ir, pq));
       if (p_call_id == call_id)
         pq->op = TCCIR_OP_NOP;
     }
@@ -211,6 +219,8 @@ typedef struct SwitchSimOp
 {
   uint8_t op;
   uint8_t flags;
+  /* barrel_shifts[] annotation on src2 ((type << 5) | amount), or 0. */
+  uint8_t bshift;
   int32_t dest_vreg;
   int32_t src1_vreg;
   int64_t src1_imm;
@@ -291,6 +301,35 @@ static int switch_func_decode_lval_sym(TCCIRState *ir, IROperand op, SwitchSimOp
   snap_op->sym_flags = (uint16_t)sr->flags;
   snap_op->sym_btype = (int8_t)btype;
   return 1;
+}
+
+/* The snapshot is taken from the final IR, after tcc_ir_barrel_shift_fusion
+ * folded single-use shifts into src2 of ADD/SUB/CMP as side-table annotations:
+ * the real RHS is `src2 SHIFT #n`.  Record it; 0 for an unmodelled encoding. */
+static int switch_func_decode_barrel(TCCIRState *ir, IRQuadCompact *q, SwitchSimOp *o)
+{
+  uint8_t bs = tcc_ir_barrel_shift_at(ir, q);
+  int type = bs >> 5;
+  if (bs && (type < 1 || type > 4))
+    return 0;
+  o->bshift = bs;
+  return 1;
+}
+
+/* Apply a recorded barrel shift to a 32-bit value (result sign-extended). */
+static int64_t switch_sim_barrel(int64_t v, uint8_t bs)
+{
+  uint32_t x = (uint32_t)v;
+  unsigned amount = bs & 31u;
+  switch (bs >> 5)
+  {
+  case 1: x = x << amount; break;
+  case 2: x = x >> amount; break;
+  case 3: x = (uint32_t)((int32_t)x >> amount); break;
+  case 4: x = amount ? ((x >> amount) | (x << (32 - amount))) : x; break;
+  default: break;
+  }
+  return (int64_t)(int32_t)x;
 }
 
 int tcc_ir_detect_switch_func(TCCIRState *ir, TCCFuncSwitchSnapshot **out)
@@ -408,6 +447,8 @@ int tcc_ir_detect_switch_func(TCCIRState *ir, TCCFuncSwitchSnapshot **out)
       if (!switch_func_decode_operand(ir, s2, &vr, &imm))
         goto fail;
       if (vr < 0) { o->flags |= 2; o->src2_imm = imm; } else o->src2_vreg = vr;
+      if (!switch_func_decode_barrel(ir, q, o))
+        goto fail;
       break;
     }
     case TCCIR_OP_CMP:
@@ -422,12 +463,13 @@ int tcc_ir_detect_switch_func(TCCIRState *ir, TCCFuncSwitchSnapshot **out)
       if (!switch_func_decode_operand(ir, s2, &vr, &imm))
         goto fail;
       if (vr < 0) { o->flags |= 2; o->src2_imm = imm; } else o->src2_vreg = vr;
+      if (!switch_func_decode_barrel(ir, q, o))
+        goto fail;
       break;
     }
     case TCCIR_OP_JUMP:
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int64_t t = irop_get_imm64_ex(ir, d);
+      int64_t t = tcc_ir_op_dest_imm(ir, q);
       if (t < 0 || t >= n)
         goto fail;
       o->target = (int32_t)t;
@@ -435,10 +477,8 @@ int tcc_ir_detect_switch_func(TCCIRState *ir, TCCFuncSwitchSnapshot **out)
     }
     case TCCIR_OP_JUMPIF:
     {
-      IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      o->src1_imm = irop_get_imm64_ex(ir, s1); /* condition code (TOK_*) */
-      int64_t t = irop_get_imm64_ex(ir, d);
+      o->src1_imm = tcc_ir_op_src1_imm(ir, q); /* condition code (TOK_*) */
+      int64_t t = tcc_ir_op_dest_imm(ir, q);
       if (t < 0 || t >= n)
         goto fail;
       o->target = (int32_t)t;
@@ -486,7 +526,7 @@ fail:
 
 void tcc_ir_cache_switch_func(TCCState *s, int func_token, TCCFuncSwitchSnapshot *snap)
 {
-  if (!s || !snap)
+  if (!s || !snap || !func_token)
   {
     tcc_ir_switch_func_snapshot_free(snap);
     return;
@@ -510,7 +550,7 @@ void tcc_ir_cache_switch_func(TCCState *s, int func_token, TCCFuncSwitchSnapshot
 
 const TCCFuncSwitchSnapshot *tcc_ir_lookup_switch_func(TCCState *s, int func_token)
 {
-  if (!s)
+  if (!s || !func_token)
     return NULL;
   for (int i = 0; i < s->func_switch_cache_count; i++)
   {
@@ -586,8 +626,24 @@ static int switch_sim_read_src(const SwitchSimEnv *env, const SwitchSimOp *o,
     if (o->flags & 1) { *out = o->src1_imm; return 1; }
     return switch_sim_get(env, o->src1_vreg, out);
   }
-  if (o->flags & 2) { *out = o->src2_imm; return 1; }
-  return switch_sim_get(env, o->src2_vreg, out);
+  int r = 1;
+  if (o->flags & 2)
+    *out = o->src2_imm;
+  else
+    r = switch_sim_get(env, o->src2_vreg, out);
+  if (o->bshift && r == 1)
+    *out = switch_sim_barrel(*out, o->bshift);
+  /* A replayed op carries no annotation: an unknown shifted src2 is a bail. */
+  if (o->bshift && r == 2)
+    return 0;
+  return r;
+}
+
+/* 32-bit ADD/SUB as the machine does it: wrapped, held sign-extended. */
+static int64_t switch_sim_addsub(int op, int64_t l, int64_t r)
+{
+  uint32_t v = (op == TCCIR_OP_ADD) ? (uint32_t)l + (uint32_t)r : (uint32_t)l - (uint32_t)r;
+  return (int64_t)(int32_t)v;
 }
 
 /* Record an op index for replay at the caller; cap protects unbounded growth. */
@@ -691,7 +747,7 @@ int tcc_ir_simulate_switch_func_ex(const TCCFuncSwitchSnapshot *snap, int64_t ar
         return 0;
       if (rl == 1 && rr == 1)
       {
-        int64_t v = (o->op == TCCIR_OP_ADD) ? (l + r1) : (l - r1);
+        int64_t v = switch_sim_addsub(o->op, l, r1);
         if (!switch_sim_set(&env, o->dest_vreg, v, 1))
           return 0;
       }
@@ -821,8 +877,7 @@ static int switch_insert_before(TCCIRState *ir, int before_idx, const IRQuadComp
     IRQuadCompact *q = &ir->compact_instructions[k];
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF)
     {
-      IROperand dest = tcc_ir_op_get_dest(ir, q);
-      int target = (int)irop_get_imm64_ex(ir, dest);
+      int target = (int)tcc_ir_op_dest_imm(ir, q);
       if (target >= before_idx && k != before_idx)
       {
         IROperand new_dest = irop_make_imm32(-1, target + 1, IROP_BTYPE_INT32);
@@ -830,6 +885,7 @@ static int switch_insert_before(TCCIRState *ir, int before_idx, const IRQuadComp
       }
     }
   }
+  tcc_ir_frame_scope_insert(ir, before_idx);
   return 1;
 }
 
@@ -859,17 +915,15 @@ static int build_caller_src1(TCCIRState *caller_ir, VregMap *m, const SwitchSimO
 static int build_caller_src2(TCCIRState *caller_ir, VregMap *m, const SwitchSimOp *o,
                              const SwitchSimEnv *sim_env, int btype, IROperand *out)
 {
-  if (o->flags & 2)
-  {
-    *out = irop_make_imm32(-1, (int32_t)o->src2_imm, btype);
-    return 1;
-  }
   int64_t v;
-  if (switch_sim_get(sim_env, o->src2_vreg, &v) == 1)
+  int r = switch_sim_read_src(sim_env, o, 2, &v);
+  if (r == 1)
   {
     *out = irop_make_imm32(-1, (int32_t)v, btype);
     return 1;
   }
+  if (r != 2)
+    return 0;
   int32_t cvr = map_callee_vreg(m, caller_ir, o->src2_vreg);
   if (cvr < 0)
     return 0;
@@ -985,7 +1039,7 @@ static int rebuild_sim_env(const TCCFuncSwitchSnapshot *snap, int64_t arg_value,
       if (rl == 0 || rr == 0) return 0;
       if (rl == 1 && rr == 1)
       {
-        int64_t v = (o->op == TCCIR_OP_ADD) ? (l + r1) : (l - r1);
+        int64_t v = switch_sim_addsub(o->op, l, r1);
         switch_sim_set(env, o->dest_vreg, v, 1);
       }
       else switch_sim_set(env, o->dest_vreg, 0, 0);
@@ -1046,17 +1100,15 @@ int tcc_ir_opt_switch_call_replace(TCCIRState *ir)
     if (q->op != TCCIR_OP_FUNCCALLVAL)
       continue;
 
-    IROperand callee_op = tcc_ir_op_get_src1(ir, q);
-    Sym *callee = irop_get_sym_ex(ir, callee_op);
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
 
-    const TCCFuncSwitchSnapshot *snap = tcc_ir_lookup_switch_func(tcc_state, callee->v);
+    const TCCFuncSwitchSnapshot *snap = tcc_ir_lookup_switch_func(tcc_state, func_cache_token(callee));
     if (!snap)
       continue;
 
-    IROperand call_info = tcc_ir_op_get_src2(ir, q);
-    int encoded = (int)irop_get_imm64_ex(ir, call_info);
+    int encoded = (int)tcc_ir_op_src2_imm(ir, q);
     int call_id = TCCIR_DECODE_CALL_ID(encoded);
     int argc = TCCIR_DECODE_CALL_ARGC(encoded);
     if (argc != 1)
@@ -1072,8 +1124,7 @@ int tcc_ir_opt_switch_call_replace(TCCIRState *ir)
         continue;
       if (pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID)
         break;
-      IROperand ps2 = tcc_ir_op_get_src2(ir, pq);
-      int enc = (int)irop_get_imm64_ex(ir, ps2);
+      int enc = (int)tcc_ir_op_src2_imm(ir, pq);
       if (TCCIR_DECODE_CALL_ID(enc) != call_id)
         break;
       if (TCCIR_DECODE_PARAM_IDX(enc) == 0 && pq->op == TCCIR_OP_FUNCPARAMVAL)
@@ -1128,29 +1179,36 @@ int tcc_ir_opt_switch_call_replace(TCCIRState *ir)
       }
     }
 
-    /* Rewrite the (now-shifted) FUNCCALLVAL into the result ASSIGN. */
+    /* Rewrite the (now-shifted) FUNCCALLVAL into the result ASSIGN; a
+     * discarded result (no dest) leaves only the replayed stores -- an
+     * ASSIGN without a destination would be emitted into r0. */
     q = &ir->compact_instructions[call_idx];
-    q->op = TCCIR_OP_ASSIGN;
-    if (ret_val == (int32_t)ret_val)
-      tcc_ir_set_src1(ir, call_idx, irop_make_imm32(-1, (int32_t)ret_val, ret_btype));
+    if (irop_get_vreg(dest) < 0)
+      q->op = TCCIR_OP_NOP;
     else
     {
-      uint32_t pool_idx = tcc_ir_pool_add_i64(ir, ret_val);
-      tcc_ir_set_src1(ir, call_idx, irop_make_i64(-1, pool_idx, ret_btype));
+      q->op = TCCIR_OP_ASSIGN;
+      if (ret_val == (int32_t)ret_val)
+        tcc_ir_set_src1_imm32(ir, call_idx, (int32_t)ret_val, ret_btype);
+      else
+      {
+        uint32_t pool_idx = tcc_ir_pool_add_i64(ir, ret_val);
+        tcc_ir_set_src1(ir, call_idx, irop_make_i64(-1, pool_idx, ret_btype));
+      }
+      tcc_ir_set_src2_none(ir, call_idx);
+      tcc_ir_set_dest(ir, call_idx, dest);
     }
-    tcc_ir_set_src2(ir, call_idx, IROP_NONE);
-    tcc_ir_set_dest(ir, call_idx, dest);
 
-    /* NOP the matching FUNCPARAMVAL(s).  Scan backward from the call. */
-    for (int j = call_idx - 1; j >= 0; j--)
+    /* NOP the matching FUNCPARAMVAL(s).  Scan backward from the call's
+     * original position: the replay ops sit between it and the params. */
+    for (int j = i - 1; j >= 0; j--)
     {
       IRQuadCompact *pq = &ir->compact_instructions[j];
       if (pq->op == TCCIR_OP_NOP)
         continue;
       if (pq->op == TCCIR_OP_FUNCPARAMVAL || pq->op == TCCIR_OP_FUNCPARAMVOID)
       {
-        IROperand ps2 = tcc_ir_op_get_src2(ir, pq);
-        int enc = (int)irop_get_imm64_ex(ir, ps2);
+        int enc = (int)tcc_ir_op_src2_imm(ir, pq);
         if (TCCIR_DECODE_CALL_ID(enc) == call_id)
           pq->op = TCCIR_OP_NOP;
         continue;

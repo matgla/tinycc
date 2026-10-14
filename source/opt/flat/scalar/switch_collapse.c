@@ -30,8 +30,7 @@ static int sc_resolve_chain(TCCIRState *ir, int start, uint8_t *visited)
       continue;
     }
     if (q->op == TCCIR_OP_JUMP) {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      cur = (int)irop_get_imm64_ex(ir, d);
+      cur = (int)tcc_ir_op_dest_imm(ir, q);
       continue;
     }
     return cur;
@@ -79,8 +78,7 @@ int tcc_ir_opt_switch_collapse(TCCIRState *ir)
     if (q->op != TCCIR_OP_SWITCH_TABLE)
       continue;
 
-    IROperand tid_op = tcc_ir_op_get_src2(ir, q);
-    int table_id = (int)irop_get_imm64_ex(ir, tid_op);
+    int table_id = (int)tcc_ir_op_src2_imm(ir, q);
     if (table_id < 0 || table_id >= ir->num_switch_tables)
       continue;
     TCCIRSwitchTable *table = &ir->switch_tables[table_id];
@@ -104,13 +102,23 @@ int tcc_ir_opt_switch_collapse(TCCIRState *ir)
     if (!uniform)
       continue;
 
-    q->op = TCCIR_OP_NOP;
-    LOG_IR_GEN("switch_collapse: SWITCH_TABLE at %d -> NOP (all targets resolve to %d)", i, common);
+    /* The dispatch is a terminator: dropping it makes control fall through to i + 1.  NOP it only when
+     * that resolves to the common endpoint, otherwise branch there explicitly. */
+    memset(visited, 0, n);
+    int fall = sc_resolve_chain(ir, i + 1, visited);
+    if (fall >= 0 && sc_endpoints_equiv(ir, fall, common)) {
+      q->op = TCCIR_OP_NOP;
+    } else {
+      q->op = TCCIR_OP_JUMP;
+      tcc_ir_op_set_dest_imm32(ir, q, table->default_target, IROP_BTYPE_INT32);
+      tcc_ir_op_set_src1_none(ir, q);
+      tcc_ir_op_set_src2_none(ir, q);
+    }
+    LOG_IR_GEN("switch_collapse: SWITCH_TABLE at %d -> %s (all targets resolve to %d)", i,
+               q->op == TCCIR_OP_NOP ? "NOP" : "JUMP", common);
     changes++;
   }
 
   tcc_free(visited);
   return changes;
 }
-
-int tcc_ir_opt_switch_collapse_ex(IROptCtx *ctx) { return tcc_ir_opt_switch_collapse(ctx->ir); }

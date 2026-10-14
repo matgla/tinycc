@@ -142,22 +142,8 @@ typedef struct __attribute__((packed)) IROperand
 _Static_assert(sizeof(IROperand) == 9, "IROperand must be 9 bytes");
 
 /* IROperand.aux flag bits. */
-#define IROP_AUX_ALIGN4_OK 0x1u   /* 64-bit lvalue only: the accessed address is
-                                   * proven >= 4-byte aligned (static type rules,
-                                   * no packed member in the access chain), so the
-                                   * backend may use LDRD/STRD through a general
-                                   * base register.  Default clear = not proven;
-                                   * operands built by IR passes stay clear and
-                                   * fall back to the unaligned-safe LDR/STR pair. */
-#define IROP_AUX_UNDERALIGN 0x2u  /* The access chain crossed a packed member, so
-                                   * the address may be < 4-byte aligned.
-                                   * Inverse-polarity sibling of ALIGN4_OK for the
-                                   * LOAD_INDEXED / STORE_INDEXED path, whose
-                                   * 64-bit lowering has historically assumed
-                                   * alignment: fusion passes copy this from the
-                                   * original deref operand onto the base operand,
-                                   * and the backend then avoids LDRD/STRD.
-                                   * Default clear keeps legacy indexed behavior. */
+#define IROP_AUX_ALIGN4_OK 0x1u   /* Access address is proven >= 4-byte aligned. */
+#define IROP_AUX_UNDERALIGN 0x2u  /* Access may be less than 4-byte aligned. */
 #define IROP_AUX_NONVOLATILE 0x4u /* lvalue operands only: the access is proven
                                    * NOT volatile, because the SValue it was
                                    * built from carried no VT_VOLATILE.  Same
@@ -171,6 +157,22 @@ _Static_assert(sizeof(IROperand) == 9, "IROperand must be 9 bytes");
                                    * is simply treated as possibly volatile — the
                                    * omission costs an optimization, never
                                    * correctness. */
+#define IROP_AUX_ALIAS_PTR 0x8u  /* lvalue operands only: a C11 6.5p7 alias-class
+                                   * mark set by tcc_ir_put (never by IR passes;
+                                   * union-member accesses and bitfields never
+                                   * carry it).  Its meaning is role-dependent:
+                                   * on a SOURCE operand of an op that consumes
+                                   * the value (a plain LOAD's deref, a deref
+                                   * source of arithmetic) it says the object
+                                   * READ has pointer type; on a memory-write
+                                   * DEST operand it says the object WRITTEN has
+                                   * a non-pointer scalar type (anything but
+                                   * char, which may alias anything).  Together
+                                   * the two let LICM's invariant field-pointer
+                                   * hoist (licm.c) treat such a write as unable
+                                   * to modify such a read.  Default clear = the
+                                   * class is unknown, which only declines the
+                                   * hoist. */
 
 /* Is this operand's memory access possibly volatile?  Takes the deref (lvalue)
  * operand of a LOAD/STORE, or the BASE operand of a LOAD/STORE_INDEXED, onto
@@ -186,18 +188,45 @@ static inline int irop_access_is_volatile(IROperand op)
   return !(op.aux & IROP_AUX_NONVOLATILE);
 }
 
-/* Move the marks that describe the ACCESS (not the address) from the deref
- * operand a fusion replaces onto the base operand of the LOAD/STORE_INDEXED
- * that replaces it.  UNDERALIGN keeps the backend's 64-bit lowering off
- * LDRD/STRD; NONVOLATILE lets the load/store CSE and DSE passes see that the
- * access may be collapsed.  UNDERALIGN is OR'd (either operand may carry it),
- * NONVOLATILE is copied: it is a "proven" bit, and inheriting a stale one from
- * the address operand would license CSE of a volatile access. */
+/* The 6.5p7 alias-class mark from tcc_ir_put's role-dependent tagging. */
+static inline int irop_access_alias_ptr(IROperand op)
+{
+  return (op.aux & IROP_AUX_ALIAS_PTR) != 0;
+}
+
+/* Access proofs belong to the dereference, never to the pointer's storage. */
 static inline void irop_carry_access_marks(IROperand *base, IROperand deref)
 {
   unsigned a = (unsigned)base->aux | ((unsigned)deref.aux & IROP_AUX_UNDERALIGN);
+  a = (a & ~(unsigned)IROP_AUX_ALIGN4_OK) | ((unsigned)deref.aux & IROP_AUX_ALIGN4_OK);
+  if (a & IROP_AUX_UNDERALIGN)
+    a &= ~(unsigned)IROP_AUX_ALIGN4_OK;
   a = (a & ~(unsigned)IROP_AUX_NONVOLATILE) | ((unsigned)deref.aux & IROP_AUX_NONVOLATILE);
+  /* The 6.5p7 alias-class mark rides the same transfer with copy semantics:
+   * it describes the deref's access, and a stale one inherited from the base
+   * would license the LICM field-pointer hoist on an access whose class was
+   * never established. */
+  a = (a & ~(unsigned)IROP_AUX_ALIAS_PTR) | ((unsigned)deref.aux & IROP_AUX_ALIAS_PTR);
   base->aux = a & 0xfu;
+}
+
+/* A plain LOAD reads at its SOURCE (deref) operand's width and extension; a
+ * LOAD_INDEXED reads at its DEST's.  A fold rewriting LOAD -> LOAD_INDEXED
+ * writes the LOAD's dest narrowed to the deref's 8/16-bit width and
+ * signedness (the register value is the same: LDRB/LDRH/LDRSB/LDRSH extend to
+ * the word).  Keeping a u32 dest over a 16-bit deref turned an LDRH into an
+ * LDR.  Returns 0 when the indexed form cannot express the load -- a narrow
+ * dest over a wider read -- and the fold must decline. */
+static inline int irop_indexed_load_dest(IROperand *dest, IROperand deref)
+{
+  int sb = deref.btype, db = dest->btype;
+  int s_narrow = sb == IROP_BTYPE_INT8 || sb == IROP_BTYPE_INT16;
+  int d_narrow = db == IROP_BTYPE_INT8 || db == IROP_BTYPE_INT16;
+  if (!s_narrow)
+    return !d_narrow;
+  dest->btype = sb;
+  dest->is_unsigned = deref.is_unsigned;
+  return 1;
 }
 
 /* ============================================================================
@@ -222,6 +251,7 @@ void tcc_ir_pools_free(struct TCCIRState *ir);
 uint32_t tcc_ir_pool_add_i64(struct TCCIRState *ir, int64_t val);
 uint32_t tcc_ir_pool_add_f64(struct TCCIRState *ir, uint64_t bits);
 uint32_t tcc_ir_pool_add_symref(struct TCCIRState *ir, struct Sym *sym, int32_t addend, uint32_t flags);
+extern struct Sym *(*tcc_ir_sym_canonicalizer)(struct Sym *sym);
 uint32_t tcc_ir_pool_add_ctype(struct TCCIRState *ir, const struct CType *ctype);
 
 /* Pool read accessors (for inline helpers) */
@@ -337,8 +367,9 @@ IRPoolSymref *irop_get_symref_ex(const struct TCCIRState *ir, IROperand op);
 /* Extract clean vreg value (type + position, for IR passes).
  * Body must stay identical to the out-of-line copy in tccir_operand.c. */
 #ifdef TCC_IROP_INLINE_ACCESSORS
-static inline int32_t irop_get_vreg(const IROperand op)
+static inline int32_t irop_get_vreg_w(int32_t w)
 {
+  IROperand op = {.vr = w};
   /* IROP_NONE (vr == -1, all bits set) must return -1 before the negative vreg
    * sentinel check, because its bit pattern also matches the sentinel. */
   if (op.vr == -1)
@@ -351,6 +382,11 @@ static inline int32_t irop_get_vreg(const IROperand op)
   if (op.vreg_type == 0)
     return -1;
   return (op.vreg_type << 28) | op.position;
+}
+
+static inline int32_t(irop_get_vreg)(const IROperand op)
+{
+  return irop_get_vreg_w(op.vr);
 }
 #else
 int32_t irop_get_vreg(const IROperand op);
@@ -426,17 +462,7 @@ int irop_op_is_lval(const IROperand op);
  * and appears as a STACKOFF lvalue naming the variable itself -- a definition,
  * whatever the op (an inlined pointer parameter lands as `V <-- x [STORE]`) --
  * or, is_llocal, as a write through the pointer it holds. */
-static inline int irop_dest_defines_vreg(IROperand d)
-{
-  if (irop_get_vreg(d) < 0)
-    return 0;
-  int tag = irop_get_tag(d);
-  if (tag == IROP_TAG_VREG)
-    return !d.is_lval;
-  if (tag == IROP_TAG_STACKOFF)
-    return d.is_lval && !d.is_llocal;
-  return 0;
-}
+/* (irop_dest_defines_vreg is defined with the first-word readers below.) */
 
 /* Check if operand has VT_LOCAL semantics - uses bitfield */
 int irop_op_is_local(const IROperand op);
@@ -446,3 +472,66 @@ int irop_op_is_llocal(const IROperand op);
 
 /* Check if operand is constant - uses bitfield */
 int irop_op_is_const(const IROperand op);
+
+/* The readers below look only at the operand's first word (vr and the bitfields
+ * packed into it), so each has a twin taking just that word, and calls go
+ * through it: passing the packed 9-byte IROperand by value costs three
+ * registers loaded from the caller's copy at every call site, the word one
+ * load.  The by-value functions remain (defined as `(name)(...)`) and answer
+ * the same. */
+#ifndef TCC_IROP_INLINE_ACCESSORS
+int32_t irop_get_vreg_w(int32_t w);
+#endif
+int irop_get_tag_w(int32_t w);
+int irop_get_btype_w(int32_t w);
+int irop_is_64bit_w(int32_t w);
+int irop_needs_pair_w(int32_t w);
+int irop_is_immediate_w(int32_t w);
+int irop_is_none_w(int32_t w);
+int irop_has_vreg_w(int32_t w);
+int irop_op_is_lval_w(int32_t w);
+#define irop_get_vreg(op) irop_get_vreg_w((op).vr)
+#define irop_get_tag(op) irop_get_tag_w((op).vr)
+#define irop_get_btype(op) irop_get_btype_w((op).vr)
+#define irop_is_64bit(op) irop_is_64bit_w((op).vr)
+#define irop_needs_pair(op) irop_needs_pair_w((op).vr)
+#define irop_is_immediate(op) irop_is_immediate_w((op).vr)
+#define irop_is_none(op) irop_is_none_w((op).vr)
+#define irop_has_vreg(op) irop_has_vreg_w((op).vr)
+#define irop_op_is_lval(op) irop_op_is_lval_w((op).vr)
+
+/* Reads the vreg's value (possibly from its home), not memory through that value. */
+#ifdef TCC_IROP_INLINE_ACCESSORS
+static inline int irop_is_vreg_value_w(int32_t w)
+{
+  IROperand op = {.vr = w};
+  if (irop_get_vreg(op) < 0 || op.is_llocal)
+    return 0;
+  int tag = irop_get_tag(op);
+  if (tag == IROP_TAG_VREG)
+    return !op.is_lval;
+  return tag == IROP_TAG_STACKOFF && op.is_local && op.is_lval;
+}
+#else
+int irop_is_vreg_value_w(int32_t w);
+#endif
+#define irop_is_vreg_value(op) irop_is_vreg_value_w((op).vr)
+
+/* irop_dest_defines_vreg (documented above) reads only the first word too. */
+#ifdef TCC_IROP_INLINE_ACCESSORS
+static inline int irop_dest_defines_vreg_w(int32_t w)
+{
+  IROperand d = {.vr = w};
+  if (irop_get_vreg(d) < 0)
+    return 0;
+  int tag = irop_get_tag(d);
+  if (tag == IROP_TAG_VREG)
+    return !d.is_lval;
+  if (tag == IROP_TAG_STACKOFF)
+    return d.is_lval && !d.is_llocal;
+  return 0;
+}
+#else
+int irop_dest_defines_vreg_w(int32_t w);
+#endif
+#define irop_dest_defines_vreg(op) irop_dest_defines_vreg_w((op).vr)

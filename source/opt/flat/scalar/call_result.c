@@ -2,7 +2,7 @@
  *  TCC IR - Call-result dead elimination generator table (pre-SSA engine)
  *
  *  Generators:
- *    dead_sret_call    — eliminate calls to func_pure_via_sret with dead sret target
+ *    dead_sret_call    — eliminate calls to pure_via_sret functions with dead sret target
  *    dead_call_result  — convert FUNCCALLVAL→FUNCCALLVOID when result unused
  *    fold_call_result_store — fold CALL→TEMP_LOCAL+LOAD+STORE into direct CALL→*V
  *
@@ -38,9 +38,49 @@ static int call_result_stackoff_in_range(IROperand op, int32_t base, int32_t siz
   return off >= base && off < base + size;
 }
 
+/* The first instruction that can run again after instruction i: i itself, or
+ * the head of the outermost loop around it (a backward jump at or after the
+ * region's start into it, to a fixpoint).  A computed goto, a switch table or
+ * an asm goto may lead anywhere: 0. */
+static int call_result_region_start(TCCIRState *ir, int i)
+{
+  const int n = ir->next_instruction_index;
+  int lo = i;
+  for (int changed = 1; changed;)
+  {
+    changed = 0;
+    for (int j = lo; j < n; j++)
+    {
+      const IRQuadCompact *p = &ir->compact_instructions[j];
+      if (p->op == TCCIR_OP_IJUMP || p->op == TCCIR_OP_SWITCH_TABLE || ir_op_has(p->op, IROP_A_MAY_BRANCH))
+        return 0;
+      if (p->op != TCCIR_OP_JUMP && p->op != TCCIR_OP_JUMPIF)
+        continue;
+      int t = (int)tcc_ir_op_dest_imm32(ir, p);
+      if (t >= 0 && t < lo)
+      {
+        lo = t;
+        changed = 1;
+      }
+    }
+  }
+  return lo;
+}
+
+/* A FUNCPARAMVAL/VOID of call `call_id`. */
+static int call_result_is_own_param(TCCIRState *ir, const IRQuadCompact *p, int call_id)
+{
+  if (p->op != TCCIR_OP_FUNCPARAMVAL && p->op != TCCIR_OP_FUNCPARAMVOID)
+    return 0;
+  return TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, p))) == call_id;
+}
+
 OPT_GEN_FLAT(dead_call_result, TCCIR_OP_FUNCCALLVAL)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   const IROptDU *du = &ctx->du;
 
   int32_t dest_vr = irop_get_vreg(dest);
@@ -73,12 +113,15 @@ OPT_GEN_FLAT(dead_call_result, TCCIR_OP_FUNCCALLVAL)
 
   ir->iroperand_pool[q->operand_base + 0] = src1;
   ir->iroperand_pool[q->operand_base + 1] = src2;
-  REWRITE(.new_op = TCCIR_OP_FUNCCALLVOID);
+  REWRITE(set_op(TCCIR_OP_FUNCCALLVOID));
 }
 
 OPT_GEN_FLAT(dead_sret_call, TCCIR_OP_FUNCCALLVAL)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
+  BIND(src1);
+  BIND(src2);
   const IROptDU *du = &ctx->du;
   int n = ir->next_instruction_index;
 
@@ -93,10 +136,7 @@ OPT_GEN_FLAT(dead_sret_call, TCCIR_OP_FUNCCALLVAL)
   Sym *callee = irop_get_sym_ex(ir, src1);
   if (!callee)
     return 0;
-  int callee_pure = callee->f.func_pure_via_sret;
-  if (callee->type.ref)
-    callee_pure |= callee->type.ref->f.func_pure_via_sret;
-  if (!callee_pure)
+  if (!callee->a.pure_via_sret)
     return 0;
 
   int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, src2));
@@ -119,10 +159,13 @@ OPT_GEN_FLAT(dead_sret_call, TCCIR_OP_FUNCCALLVAL)
     sret_size = (sret_size + 3) & ~3;
   }
 
+  /* Whatever can run after the call: in a loop, the code before it too (the
+   * buffer a loop's condition reads is written by a call at its bottom). */
+  const int lo = call_result_region_start(ir, i);
   int range_used_later = 0;
-  for (int j = i + 1; j < n && !range_used_later; j++) {
+  for (int j = lo; j < n && !range_used_later; j++) {
     IRQuadCompact *p = &ir->compact_instructions[j];
-    if (p->op == TCCIR_OP_NOP)
+    if (p->op == TCCIR_OP_NOP || j == i || call_result_is_own_param(ir, p, call_id))
       continue;
     IROperand ops[3];
     call_result_ops3(ir, p, ops);
@@ -134,7 +177,7 @@ OPT_GEN_FLAT(dead_sret_call, TCCIR_OP_FUNCCALLVAL)
     return 0;
 
   int address_escaped = 0;
-  for (int j = 0; j < i && !address_escaped; j++) {
+  for (int j = 0; j < lo && !address_escaped; j++) {
     IRQuadCompact *p = &ir->compact_instructions[j];
     if (p->op == TCCIR_OP_NOP)
       continue;
@@ -148,15 +191,10 @@ OPT_GEN_FLAT(dead_sret_call, TCCIR_OP_FUNCCALLVAL)
     int32_t dest_vr = irop_get_vreg(pdest);
     if (dest_vr < 0)
       continue;
-    for (int k = i + 1; k < n && !address_escaped; k++) {
+    for (int k = lo; k < n && !address_escaped; k++) {
       IRQuadCompact *pk = &ir->compact_instructions[k];
-      if (pk->op == TCCIR_OP_NOP)
+      if (pk->op == TCCIR_OP_NOP || k == i || call_result_is_own_param(ir, pk, call_id))
         continue;
-      if ((pk->op == TCCIR_OP_FUNCPARAMVAL || pk->op == TCCIR_OP_FUNCPARAMVOID)) {
-        uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, pk));
-        if (TCCIR_DECODE_CALL_ID(enc) == call_id)
-          continue;
-      }
       if (irop_config[pk->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, pk)) == dest_vr)
         address_escaped = 1;
       if (!address_escaped && irop_config[pk->op].has_src2 &&
@@ -168,12 +206,13 @@ OPT_GEN_FLAT(dead_sret_call, TCCIR_OP_FUNCCALLVAL)
     return 0;
 
   ir_opt_nop_call_params(ir, i);
-  REWRITE(.new_op = TCCIR_OP_NOP);
+  REWRITE(set_op(TCCIR_OP_NOP));
 }
 
 OPT_GEN_FLAT(fold_call_result_store, TCCIR_OP_FUNCCALLVAL)
 {
-  PATTERN(.constraints = { .dest = IR_CONSTRAINT_ANY });
+  MATCH();
+  BIND(dest);
   int n = ir->next_instruction_index;
 
   IROperand call_dest = dest;

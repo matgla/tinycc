@@ -24,7 +24,17 @@
 #include "gen_priv.h"
 
 /* indirection with full error checking and bound check */
-ST_FUNC void indir(void)
+ST_FUNC /* The inline-eval folds are sound only for objects that can never change:
+ * possibly_written is parse-order and misses later writers and escaped
+ * pointers.  Non-const statics are folded by global_init_prop at end of TU. */
+int sym_is_const_object(Sym *sym)
+{
+  if (sym->type.t & VT_CONSTANT)
+    return 1;
+  return (sym->type.t & VT_ARRAY) && sym->type.ref && (sym->type.ref->type.t & VT_CONSTANT);
+}
+
+void indir(void)
 {
   if ((vtop->type.t & VT_BTYPE) != VT_PTR)
   {
@@ -32,6 +42,12 @@ ST_FUNC void indir(void)
       return;
     expect("pointer");
   }
+  /* A byte-reversed pointer member (big-endian scalar_storage_order) is
+   * loaded and swapped; what it points to is in native order.  (A pointer
+   * still marked after this is an array member's address: its elements are
+   * reversed too.) */
+  if ((vtop->r & VT_LVAL) && vtop->sso_reversed)
+    gv(RC_INT);
   if (vtop->r & VT_LVAL)
   {
     SValue dest;
@@ -71,8 +87,13 @@ ST_FUNC void indir(void)
    * no observed writes becomes a VT_CONST of the initializer value. Applies
    * only under nocode_wanted (speculative try_inline_const_eval) so regular
    * code generation is unaffected. */
-  if (nocode_wanted && (vtop->r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM | VT_LVAL) && vtop->sym &&
-      !vtop->sym->a.possibly_written && !vtop->sym->a.tentative && !(vtop->type.t & (VT_ARRAY | VT_VLA)))
+  /* Not for the operand of '&', which needs the address this lvalue names:
+   * a folded `&arr[2]` in a static initializer became `&arr` (the restore in
+   * unary() knows only the symbol).  Not for a word a relocation fills in
+   * (a pointer, a __rodata_relative offset): its bytes are only the addend. */
+  if (nocode_wanted && !indir_keep_lvalue && (vtop->r & (VT_VALMASK | VT_SYM | VT_LVAL)) == (VT_CONST | VT_SYM | VT_LVAL) && vtop->sym &&
+      sym_is_const_object(vtop->sym) && !(vtop->type.t & VT_VOLATILE) &&
+      !vtop->sym->a.possibly_written && !vtop->sym->a.tentative && !(vtop->type.t & (VT_ARRAY | VT_VLA | VT_RODATA_REL)))
   {
     int btype = vtop->type.t & VT_BTYPE;
     if (btype == VT_BYTE || btype == VT_SHORT || btype == VT_INT || btype == VT_LLONG || btype == VT_BOOL ||
@@ -86,7 +107,20 @@ ST_FUNC void indir(void)
         int align;
         int sz = type_size(&vtop->type, &align);
         unsigned long off = (unsigned long)(esym->st_value + (unsigned long long)vtop->c.i);
-        if (sec && sec->data && sz > 0 && off + (unsigned long)sz <= sec->data_offset)
+        int relocated = 0;
+        if (sec && sec->reloc)
+        {
+          ElfW_Rel *rel;
+          for_each_elem(sec->reloc, 0, rel, ElfW_Rel)
+          {
+            if (rel->r_offset + 4 > off && rel->r_offset < off + (unsigned long)sz)
+            {
+              relocated = 1;
+              break;
+            }
+          }
+        }
+        if (sec && sec->data && sz > 0 && !relocated && off + (unsigned long)sz <= sec->data_offset)
         {
           const unsigned char *ptr = sec->data + off;
           int64_t val = 0;
@@ -98,7 +132,7 @@ ST_FUNC void indir(void)
             if (!(vtop->type.t & VT_UNSIGNED) && sz < 8)
             {
               int shift = (8 - sz) * 8;
-              val = (int64_t)(val << shift) >> shift;
+              val = (int64_t)((uint64_t)val << shift) >> shift;
             }
           }
           vtop->c.i = val;
@@ -203,9 +237,11 @@ void gfunc_param_typed(Sym *func, Sym *arg)
 void expr_type(CType *type, void (*expr_fn)(void))
 {
   nocode_wanted++;
+  unevaluated_operand++;
   expr_fn();
   *type = vtop->type;
   vpop();
+  unevaluated_operand--;
   nocode_wanted--;
 }
 

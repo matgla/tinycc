@@ -32,8 +32,7 @@ int tcc_ir_opt_var_to_tmp(TCCIRState *ir)
       continue;
     if (irop_config[q->op].has_dest)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t v = irop_get_vreg(d);
+      int32_t v = tcc_ir_op_dest_vreg(ir, q);
       if (TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR)
       {
         int p = TCCIR_DECODE_VREG_POSITION(v);
@@ -43,8 +42,7 @@ int tcc_ir_opt_var_to_tmp(TCCIRState *ir)
     }
     if (irop_config[q->op].has_src1)
     {
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      int32_t v = irop_get_vreg(s);
+      int32_t v = tcc_ir_op_src1_vreg(ir, q);
       if (TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR)
       {
         int p = TCCIR_DECODE_VREG_POSITION(v);
@@ -54,8 +52,7 @@ int tcc_ir_opt_var_to_tmp(TCCIRState *ir)
     }
     if (irop_config[q->op].has_src2)
     {
-      IROperand s = tcc_ir_op_get_src2(ir, q);
-      int32_t v = irop_get_vreg(s);
+      int32_t v = tcc_ir_op_src2_vreg(ir, q);
       if (TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR)
       {
         int p = TCCIR_DECODE_VREG_POSITION(v);
@@ -88,8 +85,7 @@ int tcc_ir_opt_var_to_tmp(TCCIRState *ir)
     /* A VAR dest carries is_lval=1 because a VAR is memory, not because its address was taken: count it regardless. */
     if (irop_config[q->op].has_dest)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t v = irop_get_vreg(d);
+      int32_t v = tcc_ir_op_dest_vreg(ir, q);
       if (TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR)
       {
         int p = TCCIR_DECODE_VREG_POSITION(v);
@@ -110,7 +106,7 @@ int tcc_ir_opt_var_to_tmp(TCCIRState *ir)
         int p = TCCIR_DECODE_VREG_POSITION(v);
         int ok = 0;
         if (q->op == TCCIR_OP_ASSIGN && s.is_lval &&
-            TCCIR_DECODE_VREG_TYPE(irop_get_vreg(tcc_ir_op_get_dest(ir, q))) == TCCIR_VREG_TYPE_TEMP)
+            TCCIR_DECODE_VREG_TYPE(tcc_ir_op_dest_vreg(ir, q)) == TCCIR_VREG_TYPE_TEMP)
           ok = 1;
         else if ((q->op == TCCIR_OP_FUNCPARAMVAL || q->op == TCCIR_OP_FUNCPARAMVOID) && s.is_lval)
           ok = 1;
@@ -122,8 +118,7 @@ int tcc_ir_opt_var_to_tmp(TCCIRState *ir)
     }
     if (irop_config[q->op].has_src2)
     {
-      IROperand s = tcc_ir_op_get_src2(ir, q);
-      int32_t v = irop_get_vreg(s);
+      int32_t v = tcc_ir_op_src2_vreg(ir, q);
       if (TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_VAR)
       {
         /* VAR in src2 is never the "T <-- V [ASSIGN lval]" pattern */
@@ -216,8 +211,7 @@ int tcc_ir_opt_var_to_tmp(TCCIRState *ir)
       /* Defensive: single-def was already established, so a redef here shouldn't occur */
       if (irop_config[q->op].has_dest)
       {
-        IROperand d = tcc_ir_op_get_dest(ir, q);
-        if (irop_get_vreg(d) == dest_vr)
+        if (tcc_ir_op_dest_vreg(ir, q) == dest_vr)
         {
           aborted = 1;
           break;
@@ -230,8 +224,7 @@ int tcc_ir_opt_var_to_tmp(TCCIRState *ir)
         IROperand s = tcc_ir_op_get_src1(ir, q);
         if (irop_get_vreg(s) == dest_vr && s.is_lval)
         {
-          IROperand ud = tcc_ir_op_get_dest(ir, q);
-          if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(ud)) != TCCIR_VREG_TYPE_TEMP)
+          if (TCCIR_DECODE_VREG_TYPE(tcc_ir_op_dest_vreg(ir, q)) != TCCIR_VREG_TYPE_TEMP)
           {
             aborted = 1;
             break;
@@ -300,5 +293,3 @@ int tcc_ir_opt_var_to_tmp(TCCIRState *ir)
   tcc_free(info);
   return changes;
 }
-
-int tcc_ir_opt_var_to_tmp_ex(IROptCtx *ctx) { return tcc_ir_opt_var_to_tmp(ctx->ir); }

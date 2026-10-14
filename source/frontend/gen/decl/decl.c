@@ -23,6 +23,13 @@
 
 #include "gen_priv.h"
 
+/* `_Static_assert`, or C23's `static_assert` keyword.  Before C23 the latter
+ * is an ordinary identifier (<assert.h> defines it as a macro). */
+int tok_is_static_assert(void)
+{
+  return tok == TOK_STATIC_ASSERT || (tok == TOK_static_assert && tcc_state->cversion >= 202311);
+}
+
 void do_Static_assert(void)
 {
   int c;
@@ -53,11 +60,15 @@ static void save_function_body(TokenString **str, int **pack, int compiled_now)
   int captures = pp_pack_captures;
   *pack = pp_pack_snapshot(tcc_state);
   skip_or_save_block(str);
+  /* Replayed after the TU is parsed, its asm must not name an r0/r1 function. */
+  gfunc_regpair_note_asm_names(*str);
   if (!compiled_now && pp_pack_captures != captures)
   {
     const int *buf = tok_str_buf(*str);
     pp_apply_pack_replays(tcc_state, buf, buf + (*str)->len);
   }
+  tok_str_fit(*str);
+  *str = tok_str_keep(*str);
 }
 
 /* A file-scope function definition's body, from its opening '{' in the
@@ -111,12 +122,12 @@ static void define_global_function(Sym *sym, Section *ad_section)
     if (sym->type.ref && (sym->type.t & VT_STATIC) &&
         sym->type.ref->f.func_type != FUNC_ELLIPSIS &&
         !sym->type.ref->f.func_alwinl && !sym->type.ref->f.func_noinline &&
-        (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
+        (TCC_OPT(tcc_state, opt_inline_functions) || TCC_OPT(tcc_state, opt_inline_small)) &&
         tcc_state->nb_vla_param_exprs == 0 && fn->func_str)
     {
       int sig = auto_inline_sig_ok(sym);
-      int thr = tcc_state->opt_inline_limit > 0 ? tcc_state->opt_inline_limit
-                                                : (tcc_state->opt_inline_functions ? 60 : 30);
+      int thr = TCC_OPT(tcc_state, opt_inline_limit) > 0 ? TCC_OPT(tcc_state, opt_inline_limit)
+                                                : (TCC_OPT(tcc_state, opt_inline_functions) ? 60 : 30);
       /* Void-returning with 64-bit params: same narrow cap as the auto
        * path (longer bodies trip an IR coalescing bug on narrowed locals). */
       if (sig == 2)
@@ -203,7 +214,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
             * params that fit in 32-bit registers, and scalar or struct return
             * types.  64-bit types and struct *parameters* are not handled.
             * Returns 2 for void+llong signatures (body-length gated below). */
-           auto_inline_sig_ok(sym) && (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
+           auto_inline_sig_ok(sym) && (TCC_OPT(tcc_state, opt_inline_functions) || TCC_OPT(tcc_state, opt_inline_small)) &&
            /* Don't auto-inline functions with VLA parameters: the VLA size
             * expressions (which may have side effects like i++) are evaluated
             * during function prolog, outside the saved body token stream.
@@ -229,8 +240,8 @@ static void define_global_function(Sym *sym, Section *ad_section)
     fn->func_str = NULL;
     save_function_body(&fn->func_str, &fn->pack, 1);
 
-    int threshold = tcc_state->opt_inline_limit > 0 ? tcc_state->opt_inline_limit
-                                                    : (tcc_state->opt_inline_functions ? 60 : 30);
+    int threshold = TCC_OPT(tcc_state, opt_inline_limit) > 0 ? TCC_OPT(tcc_state, opt_inline_limit)
+                                                    : (TCC_OPT(tcc_state, opt_inline_functions) ? 60 : 30);
     int is_static = !!(sym->type.t & VT_STATIC);
     int body_len = fn->func_str ? fn->func_str->len : 0;
 
@@ -444,10 +455,11 @@ static void define_global_function(Sym *sym, Section *ad_section)
           next();
           gen_function(sym);
           end_macro();
-          if (sym->type.ref->f.func_small_leaf) {
+          if (sym->type.ref->f.func_small_leaf || sym->type.ref->f.func_inl_few_callers) {
             /* Promoted as a small straight-line leaf (see gen_function):
              * its optimized body is what gets duplicated, not its tokens,
-             * so it inlines at every call site. */
+             * so it inlines at every call site.  A few-callers leaf inlines
+             * at each of its few sites. */
           } else if (sym->type.ref->f.func_auto_inline) {
             /* Retroactively promoted: convert to eval-only so callsite
              * inlining only fires when ALL args are compile-time constants.
@@ -472,7 +484,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
            * non-const static, we still need its tokens for end-of-TU
            * re-compilation; preserve them by going through the same
            * inline_fns path used for the smaller-body case. */
-          if (tcc_state->opt_dead_store) {
+          if (TCC_OPT(tcc_state, opt_dead_store)) {
             TokenString *compile_ts = tok_str_alloc();
             int *buf = tcc_malloc(body_len * sizeof(int));
             memcpy(buf, tok_str_buf(fn->func_str), body_len * sizeof(int));
@@ -537,7 +549,7 @@ static void define_global_function(Sym *sym, Section *ad_section)
      * because they are not in inline_fns.  Bound the saved body
      * length so very large functions don't pin extra memory. */
     const int late_reopt_cap = 512;
-    if (tcc_state->opt_dead_store)
+    if (TCC_OPT(tcc_state, opt_dead_store))
     {
       struct InlineFunc *fn = tcc_mallocz(sizeof *fn + strlen(file->filename));
       strcpy(fn->filename, file->filename);
@@ -647,7 +659,8 @@ static int tok_ends_decl_specifiers(int t)
  * as of the definition, so such a body is generated here instead.  An
  * identifier that is a parameter, or that the body mentioned before (a local
  * function pointer), is not a file-scope reference; nor is a predefined token
- * (a builtin unary() expands itself, or a library name like memcpy). */
+ * (a builtin unary() expands itself, or a library name like memcpy), nor a
+ * struct/union/enum tag. */
 static int body_calls_unprototyped(Sym *sym, TokenString *body)
 {
   const int *start = tok_str_buf(body), *p = start, *end = start + body->len;
@@ -660,7 +673,9 @@ static int body_calls_unprototyped(Sym *sym, TokenString *body)
     tok_get(&t, &p, &cv);
     for (next_tok = p; next_tok < end && *next_tok == TOK_LINENUM;)
       next_tok += 2;
-    if (t >= TOK_UIDENT && prev != '.' && prev != TOK_ARROW && next_tok < end && *next_tok == '(')
+    /* A tag after struct/union/enum names a type: `struct T (*fp)(void)`. */
+    if (t >= TOK_UIDENT && prev != '.' && prev != TOK_ARROW && prev != TOK_STRUCT && prev != TOK_UNION &&
+        prev != TOK_ENUM && next_tok < end && *next_tok == '(')
     {
       Sym *s = sym_find(t);
       if (s && !IS_ASM_SYM(s))
@@ -692,7 +707,7 @@ static int body_calls_unprototyped(Sym *sym, TokenString *body)
 
 static int defer_function_body(Sym *sym, Section *section)
 {
-  if (!(tcc_state->opt_inline_called_once || tcc_state->opt_drop_unused_statics) || tcc_state->nb_vla_param_exprs ||
+  if (!(TCC_OPT(tcc_state, opt_inline_called_once) || TCC_OPT(tcc_state, opt_drop_unused_statics)) || tcc_state->nb_vla_param_exprs ||
       (sym->type.t & VT_INLINE) || !sym->type.ref || sym->type.ref->f.func_type != FUNC_NEW || sym->a.nested_func)
     return 0;
   DeferredFunc *d = tcc_mallocz(sizeof *d + strlen(file->filename));
@@ -724,14 +739,20 @@ void define_deferred_function(DeferredFunc *d)
   TokenString *body = d->body;
   int saved_pack[PACK_STACK_SIZE + 1];
   int saved_budget = called_once_budget_begin(body->len);
+  Sym *saved_sym = tcc_state->deferred_sym;
+  int saved_sites = tcc_state->deferred_call_sites;
+  tcc_state->deferred_sym = d->sym;
+  tcc_state->deferred_call_sites = d->call_sites;
   d->body = NULL;
-  tccpp_putfile(d->filename);
+  tccpp_setfile(d->filename);
   pp_pack_enter(tcc_state, d->pack, saved_pack);
   begin_macro(body, 1);
   next();
   define_global_function(d->sym, d->section);
   end_macro();
   pp_pack_leave(tcc_state, saved_pack);
+  tcc_state->deferred_sym = saved_sym;
+  tcc_state->deferred_call_sites = saved_sites;
   called_once_budget_end(saved_budget);
 }
 
@@ -778,7 +799,7 @@ static void size_array_from_saved_init(CType *type, TokenString *init)
 static int defer_static_data(CType *type, AttributeDef *ad, int r, int v)
 {
   int align;
-  if (!tcc_state->opt_drop_unused_statics || !(type->t & VT_STATIC) || (type->t & VT_EXTERN) || ad->section ||
+  if (!TCC_OPT(tcc_state, opt_drop_unused_statics) || !(type->t & VT_STATIC) || (type->t & VT_EXTERN) || ad->section ||
       ad->a.used || ad->alias_target || ad->asm_label || ad->cleanup_func)
     return 0;
   const int unsized = type_size(type, &align) < 0;
@@ -839,7 +860,7 @@ void define_deferred_data(DeferredData *d)
 {
   TokenString *init = d->init;
   d->init = NULL;
-  tccpp_putfile(d->filename);
+  tccpp_setfile(d->filename);
   begin_macro(init, 1);
   next();
   decl_initializer_alloc(&d->type, &d->ad, d->r, 1, d->sym->v, 1);
@@ -861,7 +882,7 @@ void check_dropped_deferred_data(DeferredData *d, TokenString *init)
   const int saved_nocode_wanted = nocode_wanted;
   nocode_wanted = DATA_ONLY_WANTED;
   tcc_state->check_only++;
-  tccpp_putfile(d->filename);
+  tccpp_setfile(d->filename);
   begin_macro(init, 1);
   next();
   decl_initializer(&p, &d->type, addr, DIF_FIRST, -1);
@@ -876,7 +897,7 @@ void check_dropped_deferred_data(DeferredData *d, TokenString *init)
 void check_dropped_function(DeferredFunc *d, TokenString *body)
 {
   int saved_pack[PACK_STACK_SIZE + 1];
-  tccpp_putfile(d->filename);
+  tccpp_setfile(d->filename);
   pp_pack_enter(tcc_state, d->pack, saved_pack);
   begin_macro(body, 1);
   next();
@@ -909,7 +930,7 @@ int decl(int l)
         next();
         continue;
       }
-      if (tok == TOK_STATIC_ASSERT)
+      if (tok_is_static_assert())
       {
         do_Static_assert();
         continue;
@@ -958,9 +979,18 @@ int decl(int l)
 
     while (1)
     { /* iterate thru each declaration */
+      Sym *stack_before = global_stack;
       type = btype;
       ad = adbase;
       type_decl(&type, &ad, &v, TYPE_DIRECT);
+      /* #pragma GCC visibility covers every declaration it encloses, extern
+       * ones too; an attribute on the declaration wins.  Not typedefs: their
+       * attributes merge into every later declaration that uses them. */
+      if (tcc_state->visibility_stack_depth && !ad.a.vis_explicit && !(type.t & VT_TYPEDEF))
+      {
+        ad.a.visibility = tcc_state->visibility_stack[tcc_state->visibility_stack_depth - 1];
+        ad.a.vis_explicit = 1;
+      }
       if (ad.attr_mode && !(type.t & VT_VECTOR) && (btype.t & (VT_BTYPE | VT_LONG)) != (ad.attr_mode - 1))
       {
         int u = ad.attr_mode - 1;
@@ -1086,25 +1116,31 @@ int decl(int l)
           /* Grow nested funcs array if needed */
           if (tcc_state->nb_nested_funcs >= tcc_state->nested_funcs_capacity)
           {
-            tcc_state->nested_funcs_capacity =
-                tcc_state->nested_funcs_capacity ? tcc_state->nested_funcs_capacity * 2 : 4;
+            int old_capacity = tcc_state->nested_funcs_capacity;
+            tcc_state->nested_funcs_capacity = old_capacity ? old_capacity * 2 : 4;
             tcc_state->nested_funcs =
-                tcc_realloc(tcc_state->nested_funcs, tcc_state->nested_funcs_capacity * sizeof(NestedFunc));
+                tcc_realloc(tcc_state->nested_funcs, tcc_state->nested_funcs_capacity * sizeof(NestedFunc *));
+            memset(tcc_state->nested_funcs + old_capacity, 0,
+                   (tcc_state->nested_funcs_capacity - old_capacity) * sizeof(NestedFunc *));
           }
 
-          /* Get pointer to new nested func slot */
-          NestedFunc *nf = &tcc_state->nested_funcs[tcc_state->nb_nested_funcs];
+          /* Get pointer to new nested func slot (allocated once, reused by
+           * later parents; the pointer never moves) */
+          if (!tcc_state->nested_funcs[tcc_state->nb_nested_funcs])
+            tcc_state->nested_funcs[tcc_state->nb_nested_funcs] = tcc_mallocz(sizeof(NestedFunc));
+          NestedFunc *nf = tcc_state->nested_funcs[tcc_state->nb_nested_funcs];
+          nested_func_release(nf);
           memset(nf, 0, sizeof(*nf));
 
           /* Store filename for later */
           pstrncpy(nf->filename, file->filename, sizeof(nf->filename));
 
-          /* Push symbol into global scope, bypassing external_sym to avoid
-           * redefinition errors when multiple parent functions each define
-           * a nested function with the same name (e.g. "nested" in foo and bar). */
+          /* The function's Sym lives on global_stack, bypassing external_sym
+           * (each parent may define a nested function of the same name); its
+           * name binds in the defining block (nested_define, below). */
           type.t &= ~VT_EXTERN;
           type.t |= VT_STATIC; /* nested functions are always local */
-          nf->sym = global_identifier_push(v, type.t, 0);
+          nf->sym = sym_push2(&global_stack, v, type.t, 0);
           nf->sym->r = VT_CONST | VT_SYM;
           nf->sym->a = ad.a;
           nf->sym->type.ref = type.ref;
@@ -1130,6 +1166,7 @@ int decl(int l)
 
           /* Save the token stream (function body only, not parameters) */
           skip_or_save_block(&nf->func_str);
+          nested_define(nf);
 
           /* Pre-scan to identify captured parent variables.
            * If we're inside a nested function's gen_function, current_nested_func
@@ -1149,14 +1186,14 @@ int decl(int l)
            * the optimizer can mishandle after inlining. */
           if (tcc_state->ir && nf->func_str &&
               !nf->sym->type.ref->f.func_noinline &&
-              (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
+              (TCC_OPT(tcc_state, opt_inline_functions) || TCC_OPT(tcc_state, opt_inline_small)) &&
               auto_inline_sig_ok(nf->sym) && nf->nb_nlgotos == 0 &&
               nf->nb_addr_labels == 0 &&
               (!nested_has_genuine_capture(nf) || nested_capture_is_read_only(nf)))
           {
             int body_len = nf->func_str->len;
-            int threshold = tcc_state->opt_inline_limit > 0 ? tcc_state->opt_inline_limit
-                                                            : (tcc_state->opt_inline_functions ? 60 : 30);
+            int threshold = TCC_OPT(tcc_state, opt_inline_limit) > 0 ? TCC_OPT(tcc_state, opt_inline_limit)
+                                                            : (TCC_OPT(tcc_state, opt_inline_functions) ? 60 : 30);
             if (body_len <= threshold && !inline_body_has_apply_args(nf->func_str) &&
                 !inline_body_has_static_local(nf->func_str) && !inline_body_has_unsafe_loops(nf->func_str))
             {
@@ -1176,18 +1213,44 @@ int decl(int l)
                 fn->func_str->len = body_len;
               }
               dynarray_add(&tcc_state->inline_fns, &tcc_state->nb_inline_fns, fn);
+              inline_record_def_bindings(fn, nf);
 
             }
           }
 
-          /* Capture parent-scope typedefs and struct/union/enum tags so the
-           * nested function body can reference them.  Walk the local_stack
-           * which is still live at this point (before pop_local_syms). */
+          /* Capture parent-scope typedefs, enumeration constants and
+           * struct/union/enum tags so the nested function body can reference
+           * them.  Walk the local_stack which is still live at this point
+           * (before pop_local_syms); only a name's innermost binding is
+           * visible here, so a shadowed one is not recorded. */
           nf->nb_parent_typedefs = 0;
+          nf->nb_parent_enums = 0;
+          nf->nb_parent_statics = 0;
           nf->nb_parent_struct_tags = 0;
           for (Sym *ts = local_stack; ts; ts = ts->prev)
           {
-            if (ts->type.t & VT_TYPEDEF)
+            int named = !(ts->v & SYM_FIELD) && (ts->v & ~SYM_STRUCT) < SYM_FIRST_ANOM;
+            if (named && !(ts->v & SYM_STRUCT) && sym_find(ts->v) != ts)
+              continue; /* hidden by an inner binding of the name */
+            if (named && (ts->v & SYM_STRUCT) && sym_tag_head(ts->v & ~SYM_STRUCT) != ts)
+              continue;
+            if (IS_ENUM_VAL(ts->type.t) && !(ts->v & SYM_STRUCT) && (ts->r & VT_VALMASK) == VT_CONST)
+            {
+              if (nf->nb_parent_enums >= MAX_CAPTURED_VARS)
+                continue;
+              nf->parent_enum_tokens[nf->nb_parent_enums] = ts->v;
+              nf->parent_enum_types[nf->nb_parent_enums] = ts->type;
+              nf->parent_enum_vals[nf->nb_parent_enums] = sym_enum_val(ts);
+              nf->nb_parent_enums++;
+            }
+            else if (named && !(ts->v & SYM_STRUCT) && (ts->r & (VT_VALMASK | VT_SYM)) == (VT_CONST | VT_SYM) &&
+                     !(ts->type.t & VT_TYPEDEF) && ts->c > 0)
+            {
+              /* a static local or block-scope extern variable */
+              if (nf->nb_parent_statics < MAX_CAPTURED_VARS)
+                nf->parent_static_syms[nf->nb_parent_statics++] = ts;
+            }
+            else if (ts->type.t & VT_TYPEDEF)
             {
               if (nf->nb_parent_typedefs >= MAX_CAPTURED_VARS)
                 continue;
@@ -1206,6 +1269,9 @@ int decl(int l)
               nf->nb_parent_struct_tags++;
             }
           }
+          /* ...and those an enclosing nested function's body sees from its
+           * own parent (not on local_stack). */
+          nested_record_inherited(nf);
 
           /* Pin struct field Syms reachable from captured typedefs/struct tags.
            * pop_local_syms frees Syms with c==0 (which includes struct fields
@@ -1362,14 +1428,10 @@ int decl(int l)
             tcc_error("storage class specified for '%s'", get_tok_str(v, NULL));
           if (sym->type.t != VT_VOID)
             tcc_error("redefinition of parameter '%s'", get_tok_str(v, NULL));
+          /* A float keeps its type: the double its caller passes is
+             converted on entry (knr_params_receive). */
+          sym->a.param_volatile = (type.t & VT_VOLATILE) != 0;
           convert_parameter_type(&type);
-          /* K&R default argument promotion: float parameters are received
-             as double because callers apply default argument promotions
-             (C89 6.5.4.2).  Without a prototype, float is promoted to
-             double at the call site, so the function must receive the
-             parameter as double. */
-          if ((type.t & VT_BTYPE) == VT_FLOAT)
-            type.t = (type.t & ~VT_BTYPE) | VT_DOUBLE;
           sym->type = type;
         }
         else if (type.t & VT_TYPEDEF)
@@ -1438,8 +1500,15 @@ int decl(int l)
                   type_size(&type, &align) < 0))
           {
             /* external variable or function */
+            int fresh = l == VT_CONST && (type.t & VT_BTYPE) == VT_FUNC && !ad.asm_label && !ad.alias_target &&
+                        !sym_find(v);
             type.t |= VT_EXTERN;
-            external_sym(v, &type, r, &ad);
+            sym = external_sym(v, &type, r, &ad);
+            if (l == VT_LOCAL && (type.t & VT_BTYPE) == VT_FUNC)
+              nested_note_block_proto(v); /* `auto`: a nested function defined later */
+            /* a first prototype: kept compactly until something names it */
+            if (fresh)
+              sym_park_proto(sym, stack_before);
           }
           else
           {

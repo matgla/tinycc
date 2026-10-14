@@ -22,10 +22,15 @@ IRSSAVregInfo *ssa_opt_vinfo(IRSSAOptCtx *ctx, int32_t vreg)
   return &ctx->vinfo[pos];
 }
 
+/* Use lists start at 2: most TEMPs have one or two uses, and with a list per
+ * vreg a first block of 4 left half of the use storage of an -O2 function
+ * empty. */
+#define SSA_USE_FIRST_CAP 2
+
 void ssa_opt_add_use_instr(IRSSAVregInfo *vi, int instr_idx)
 {
   if (vi->use_count >= vi->use_cap) {
-    int nc = vi->use_cap ? vi->use_cap * 2 : 4;
+    int nc = vi->use_cap ? vi->use_cap * 2 : SSA_USE_FIRST_CAP;
     vi->uses = tcc_realloc(vi->uses, nc * sizeof(IRSSAUse));
     vi->use_cap = nc;
   }
@@ -35,7 +40,7 @@ void ssa_opt_add_use_instr(IRSSAVregInfo *vi, int instr_idx)
 void ssa_opt_add_use_phi(IRSSAVregInfo *vi, int block, int slot)
 {
   if (vi->use_count >= vi->use_cap) {
-    int nc = vi->use_cap ? vi->use_cap * 2 : 4;
+    int nc = vi->use_cap ? vi->use_cap * 2 : SSA_USE_FIRST_CAP;
     vi->uses = tcc_realloc(vi->uses, nc * sizeof(IRSSAUse));
     vi->use_cap = nc;
   }
@@ -64,12 +69,10 @@ void ssa_opt_scan_instr_uses(IRSSAOptCtx *ctx, int i, IRQuadCompact *q)
   TCCIRState *ir = ctx->ir;
 
   if (irop_config[q->op].has_src1) {
-    IROperand s = tcc_ir_op_get_src1(ir, q);
-    ssa_opt_record_use(ctx, irop_get_vreg(s), i);
+    ssa_opt_record_use(ctx, tcc_ir_op_src1_vreg(ir, q), i);
   }
   if (irop_config[q->op].has_src2) {
-    IROperand s = tcc_ir_op_get_src2(ir, q);
-    ssa_opt_record_use(ctx, irop_get_vreg(s), i);
+    ssa_opt_record_use(ctx, tcc_ir_op_src2_vreg(ir, q), i);
   }
   if (q->op == TCCIR_OP_MLA) {
     IROperand a = tcc_ir_op_get_accum(ir, q);
@@ -137,8 +140,7 @@ static void ssa_opt_build_chains(IRSSAOptCtx *ctx)
       continue;
 
     if (ssa_opt_quad_defines_value(ir, q)) {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, irop_get_vreg(d));
+      IRSSAVregInfo *vi = ssa_opt_vinfo(ctx, tcc_ir_op_dest_vreg(ir, q));
       if (vi) {
         vi->def_instr = i;
         vi->def_count++;

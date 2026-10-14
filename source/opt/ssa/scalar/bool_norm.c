@@ -25,11 +25,29 @@
 #include "opt_utils.h"
 #include "opt_alias.h"
 #include "opt/ssa/bool_norm.h"
+#include "opt/ssa/fold.h"
 
 #define K01_MAX_DEPTH 8
 #define K01_MAX_INSTRS 8000
 
 static int k01_operand(IRSSAOptCtx *ctx, IROperand op, int depth, int vars_left);
+
+/* Side-table annotations keyed by orig_index change what an instruction reads:
+ * barrel-shift fusion folds a single-use shift into src2 (`orr.w r2, r1, r0,
+ * lsl #1`, `cmp.w r2, r1, asr #8`), and the 64-bit half / BFI tables narrow or
+ * reshape the operands.  None of them shows in the operands themselves, so an
+ * OR of two SETIFs may really be `SETIF | SETIF << 1` (0..3), and a CMP of two
+ * booleans may compare one of them shifted.  Such an instruction proves no
+ * {0,1} range and is not rewritten.
+ * TCC_DISABLE_PASS=ssa:bool_norm_annot_guard drops this check (A/B only:
+ * unsound). */
+static int bn_annotated(const TCCIRState *ir, const IRQuadCompact *q)
+{
+  if (tcc_ir_opt_pass_disabled("ssa:bool_norm_annot_guard"))
+    return 0;
+  return tcc_ir_barrel_shift_at(ir, q) != 0 || tcc_ir_shift64_dead_half_at(ir, q) != 0 ||
+         tcc_ir_zero_half64_at(ir, q) != 0 || tcc_ir_bfi_params_at(ir, q) != 0;
+}
 
 /* Every write to this local puts a {0,1} value in it, and nothing outside the
  * function can reach it (address never taken, so no pointer, call or asm write
@@ -65,6 +83,8 @@ static int k01_var(IRSSAOptCtx *ctx, int32_t vr, int read_bytes, int vars_left)
      * call's sret slot, a partial store) could leave a non-boolean behind. */
     if (q->op != TCCIR_OP_ASSIGN && q->op != TCCIR_OP_STORE)
       return 0;
+    if (bn_annotated(ir, q))
+      return 0;
     int wb = ir_opt_store_btype_size_bytes(irop_get_btype(d));
     if (wb <= 0 || wb > 4 || wb < read_bytes)
       return 0;
@@ -85,13 +105,15 @@ static int k01_temp(IRSSAOptCtx *ctx, int32_t vr, int depth, int vars_left)
   if (vi->def_instr >= ir->next_instruction_index)
     return 0;
   IRQuadCompact *q = &ir->compact_instructions[vi->def_instr];
+  if (q->op == TCCIR_OP_SETIF)
+    return 1;
+  if (bn_annotated(ir, q))
+    return 0;
   IROperand s1 = tcc_ir_op_get_src1(ir, q);
   IROperand s2 = tcc_ir_op_get_src2(ir, q);
 
   switch (q->op)
   {
-  case TCCIR_OP_SETIF:
-    return 1;
   case TCCIR_OP_ASSIGN:
   case TCCIR_OP_LOAD:
     return k01_operand(ctx, s1, depth + 1, vars_left);
@@ -208,10 +230,14 @@ static int bn_fold(IRSSAOptCtx *ctx, int i)
     return 0;
   IRQuadCompact *sq = &ir->compact_instructions[j];
 
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, sq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, sq);
   if (tok != TOK_EQ && tok != TOK_NE)
     return 0;
 
+  /* `CMP a, b lsl #k` compares a shifted b; XOR-ing the plain operands drops
+   * the shift. */
+  if (bn_annotated(ir, q) || bn_annotated(ir, sq))
+    return 0;
   IROperand a = tcc_ir_op_get_src1(ir, q);
   IROperand b = tcc_ir_op_get_src2(ir, q);
   /* Embedded derefs would move a memory read into the rewritten op; keep the
@@ -286,6 +312,50 @@ static int bn_fold(IRSSAOptCtx *ctx, int i)
   return 1;
 }
 
+static int bn_not_int(IROperand op)
+{
+  int bt = irop_get_btype(op);
+  return !(bt == IROP_BTYPE_INT32 || bt == IROP_BTYPE_INT8 || bt == IROP_BTYPE_INT16) || irop_is_64bit(op);
+}
+
+/* `TEST_ZERO (v ^ 1)` or `CMP (v ^ 1), #0` with v in {0,1} tests v with EQ
+ * and NE swapped.  bn_fold leaves that XOR when `v == 0` feeds a branch, where
+ * the SETIF it replaced would have fused into the branch. */
+static int bn_not_test(IRSSAOptCtx *ctx, int i)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[i];
+  if (bn_annotated(ir, q))
+    return 0;
+  if (q->op == TCCIR_OP_CMP && !bn_is_imm(ir, tcc_ir_op_get_src2(ir, q), 0))
+    return 0;
+  IROperand t = tcc_ir_op_get_src1(ir, q);
+  int32_t tvr = irop_get_vreg(t);
+  /* Both are 0 or 1, so the width either is tested at does not matter. */
+  if (t.is_lval || t.is_sym || tvr < 0 || TCCIR_DECODE_VREG_TYPE(tvr) != TCCIR_VREG_TYPE_TEMP || bn_not_int(t))
+    return 0;
+  IRSSAVregInfo *tvi = ssa_opt_vinfo(ctx, tvr);
+  if (!tvi || tvi->def_count != 1 || tvi->def_phi_block >= 0 || tvi->def_instr < 0 || tvi->use_count != 1)
+    return 0;
+  IRQuadCompact *xq = &ir->compact_instructions[tvi->def_instr];
+  if (xq->op != TCCIR_OP_XOR || bn_annotated(ir, xq))
+    return 0;
+  IROperand xs1 = tcc_ir_op_get_src1(ir, xq), xs2 = tcc_ir_op_get_src2(ir, xq);
+  IROperand v = bn_is_imm(ir, xs2, 1) ? xs1 : bn_is_imm(ir, xs1, 1) ? xs2 : IROP_NONE;
+  if (irop_get_vreg(v) < 0 || v.is_lval || bn_not_int(v) || !k01_operand(ctx, v, 0, 1))
+    return 0;
+  /* v must still hold its value here: an SSA TEMP does. */
+  if (TCCIR_DECODE_VREG_TYPE(irop_get_vreg(v)) != TCCIR_VREG_TYPE_TEMP)
+    return 0;
+  if (!ssa_opt_flags_test_zero_only(ir, i, 0))
+    return 0;
+  bn_drop_use(ctx, t, i);
+  tcc_ir_set_src1(ir, i, v);
+  bn_add_use(ctx, v, i);
+  ssa_opt_flags_invert_zero_test(ir, i);
+  return 1;
+}
+
 int ssa_opt_bool_norm(IRSSAOptCtx *ctx)
 {
   TCCIRState *ir = ctx->ir;
@@ -299,6 +369,12 @@ int ssa_opt_bool_norm(IRSSAOptCtx *ctx)
     if (ir->compact_instructions[i].op != TCCIR_OP_CMP)
       continue;
     changes += bn_fold(ctx, i);
+  }
+  for (int i = 0; i < n - 1; i++)
+  {
+    TccIrOp op = (TccIrOp)ir->compact_instructions[i].op;
+    if (op == TCCIR_OP_CMP || op == TCCIR_OP_TEST_ZERO)
+      changes += bn_not_test(ctx, i);
   }
   return changes;
 }

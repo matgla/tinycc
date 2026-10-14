@@ -24,18 +24,11 @@
  *  Exclusive/acquire-release — shared shape (T32 only)
  * ═══════════════════════════════════════════════════════════════════ */
 
-static const thop_variant_shape SHAPE_T32_EXCLUSIVE = {
-    .size = THOP_VARIANT_T32,
-    .rd_place = {12, 4},
-    .rn_place = {16, 4},
-    .feat = {.t32 = 1},
-};
-
-#define V_EXCLUSIVE(b) {&SHAPE_T32_EXCLUSIVE, (b)}
+#define V_EXCLUSIVE(b) {THOP_SHAPE_T32_EXCLUSIVE, (b)}
 
 static thumb_opcode thop_exclusive(uint32_t rt, uint32_t rn, const thop_table *table)
 {
-    return thop_emit(table->name, table->variants, table->variant_count, (thop_args){.rd = rt, .rn = rn});
+    return thop_emit_table(table, (thop_args){.rd = rt, .rn = rn});
 }
 
 #define THOP_EXCLUSIVE_FN(fn_name, table_id)                                                                           \

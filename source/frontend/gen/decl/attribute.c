@@ -324,6 +324,7 @@ redo:
         ad->a.visibility = STV_PROTECTED;
       else
         expect("visibility(\"default|hidden|internal|protected\")");
+      ad->a.vis_explicit = 1;
       skip(')');
       break;
     case TOK_ALIGNED1:

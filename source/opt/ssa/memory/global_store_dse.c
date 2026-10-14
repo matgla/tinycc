@@ -11,6 +11,7 @@
 #define USING_GLOBALS
 #include "ir.h"
 #include "ssa_opt.h"
+#include "opt_utils.h"
 #include "global_store_dse.h"
 
 
@@ -62,7 +63,7 @@ int ssa_opt_global_store_dse(IRSSAOptCtx *ctx)
       return 0;
     }
     if (q->op == TCCIR_OP_JUMP || q->op == TCCIR_OP_JUMPIF) {
-      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int t = (int)tcc_ir_op_dest_imm(ir, q);
       if (t >= 0 && t < n)
         is_target[t / 8] |= (uint8_t)(1 << (t % 8));
     }
@@ -77,11 +78,10 @@ int ssa_opt_global_store_dse(IRSSAOptCtx *ctx)
 
     if (q->op == TCCIR_OP_STORE) {
       IROperand dest = tcc_ir_op_get_dest(ir, q);
-      IROperand src = tcc_ir_op_get_src1(ir, q);
-      if (dest.is_sym && dest.is_lval && !src.is_lval &&
+      if (dest.is_sym && dest.is_lval && !tcc_ir_op_src1_is_lval(ir, q) &&
           irop_get_btype(dest) == IROP_BTYPE_INT32) {
         IRPoolSymref *ref = irop_get_symref_ex(ir, dest);
-        if (ref && ref->sym && !(ref->sym->type.t & VT_VOLATILE)) {
+        if (ref && ref->sym && !(ref->sym->type.t & VT_VOLATILE) && !tcc_ir_instr_access_is_volatile(ir, q)) {
           for (int k = 0; k < np; k++) {
             if (pend[k].sym == ref->sym && pend[k].addend == ref->addend) {
               ssa_opt_nop_instr(ctx, pend[k].idx);
@@ -103,19 +103,15 @@ int ssa_opt_global_store_dse(IRSSAOptCtx *ctx)
       continue;
     }
 
-    switch (q->op) {
-    case TCCIR_OP_FUNCCALLVAL: case TCCIR_OP_FUNCCALLVOID:
-    case TCCIR_OP_IJUMP: case TCCIR_OP_SWITCH_TABLE:
-    case TCCIR_OP_BLOCK_COPY: case TCCIR_OP_INLINE_ASM:
-    case TCCIR_OP_STORE_INDEXED: case TCCIR_OP_STORE_POSTINC:
-    case TCCIR_OP_LOAD_POSTINC:
-    case TCCIR_OP_JUMP: case TCCIR_OP_JUMPIF:
-    case TCCIR_OP_RETURNVALUE: case TCCIR_OP_RETURNVOID:
-    case TCCIR_OP_TRAP:
+    /* Deny by default: every op with a hazard of its own (calls, branches, asm,
+     * __builtin_apply, setjmp/longjmp, pointer-based loads and stores, VLA, chain and
+     * call-sequence ops) may read the global.  A plain LOAD is resolved below against
+     * the symbol it names; flag traffic and prefetch hints are harmless. */
+    if ((q->op != TCCIR_OP_LOAD &&
+         ir_op_has(q->op, IR_HZ_FROM_OP & ~(IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ | IR_HZ_HINT))) ||
+        tcc_ir_instr_access_is_volatile(ir, q)) {
       np = 0;
       continue;
-    default:
-      break;
     }
     if (irop_config[q->op].has_src1)
       gsd_read_reset(ir, tcc_ir_op_get_src1(ir, q), pend, &np);

@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "log.h"
+#include "thop_shapes.h"
 
 static inline const char *th_reg_name(uint32_t r)
 {
@@ -344,29 +345,30 @@ typedef struct
 _Static_assert(sizeof(thop_variant_shape) == 44, "thop_variant_shape");
 
 typedef struct thop_args thop_args;
-typedef thumb_opcode (*thop_custom_emit)(uint32_t base, const thop_args *a);
 
+/* One encoding of an instruction.  Shape and custom emitter are ids, not
+ * pointers (thop_shapes.h): a pointer table needs load-time relocation, so on
+ * YasOS every thop table used to be copied into each compiler process's RAM
+ * (~6 KB); as plain data they stay in flash.  Initialisers keep the order
+ * {shape, base, custom}. */
 typedef struct
 {
-  const thop_variant_shape *shape;
+  uint16_t shape; /* enum thop_shape_id; THOP_SHAPE_END terminates a table */
   uint32_t base;
-  thop_custom_emit custom;
+  uint8_t custom; /* enum thop_custom_id; THOP_CUSTOM_NONE = encode by shape */
 } thop_variant;
+
+#define THOP_NAME_MAX 16
 
 typedef struct thop_table
 {
-  const char *name;
-  const thop_variant *variants;
-  size_t variant_count;
+  char name[THOP_NAME_MAX];
+  thop_variant variants[]; /* ends with {THOP_SHAPE_END} */
 } thop_table;
 
-#define TH_TABLE(id, mnemonic, ...)                                                                                    \
-  static const thop_variant id##_VARIANTS[] = {__VA_ARGS__};                                                           \
-  static const thop_table id = {                                                                                       \
-      .name = mnemonic,                                                                                                \
-      .variants = id##_VARIANTS,                                                                                       \
-      .variant_count = sizeof(id##_VARIANTS) / sizeof(id##_VARIANTS[0]),                                               \
-  }
+#define TH_TABLE(id, mnemonic, ...) static const thop_table id = {mnemonic, {__VA_ARGS__, {THOP_SHAPE_END}}}
+
+extern const thop_variant_shape thop_shapes[THOP_SHAPE_COUNT];
 
 /* ───── Emit engine ───── */
 
@@ -401,11 +403,14 @@ void th_sym_d();
 
 uint32_t th_shift_type_to_op(thumb_shift shift);
 uint32_t th_shift_value_to_sr_type(thumb_shift shift);
+bool th_shift_imm_normalize(thumb_shift *shift);
 
 thumb_opcode th_generic_op_reg_shift_with_status(uint32_t op, uint32_t rd, uint32_t rn, uint32_t rm,
                                                  thumb_flags_behaviour setflags, thumb_shift shift);
 
 thumb_opcode thop_emit_error(const char *name, const thop_variant *table, size_t n, thop_args a);
+thumb_opcode thop_emit_error_in(const thop_variant_shape *shapes, const char *name, const thop_variant *table,
+                                size_t n, thop_args a);
 
 /* Bulk helpers — type-pun through memcpy (defined behaviour, the
    compiler folds it away). Used for profile composition and the
@@ -576,3 +581,9 @@ static inline __attribute__((always_inline)) bool thop_try_imm(const thop_varian
 }
 
 thumb_opcode thop_emit(const char *name, const thop_variant *table, size_t n, thop_args a);
+/* The engine over variants whose shape ids index `shapes` (thop_emit: thop_shapes;
+   unit tests bring their own). */
+thumb_opcode thop_emit_in(const thop_variant_shape *shapes, const char *name, const thop_variant *table, size_t n,
+                          thop_args a);
+/* thop_emit over a whole TH_TABLE. */
+thumb_opcode thop_emit_table(const thop_table *t, thop_args a);

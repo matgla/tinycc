@@ -54,6 +54,7 @@ typedef struct
 TCC_SMALL_SEQUENCE_DEFINE(CAggTmpArr, CAggTmpAddr, 32)
 TCC_SMALL_SEQUENCE_DEFINE(CAggSlotArr, CAggSlot, 32)
 TCC_SMALL_SEQUENCE_DEFINE(CAggI64Arr, int64_t, 32)
+TCC_SMALL_SEQUENCE_DEFINE(CAggIntArr, int, 32)
 TCC_SMALL_SEQUENCE_DEFINE(CAggByteArr, uint8_t, 256)
 
 /* A FUNCCALL to a noreturn callee (abort/exit/...) does not fall through. */
@@ -62,7 +63,7 @@ static int caf_is_noreturn_call(TCCIRState *ir, int i)
   IRQuadCompact *q = &ir->compact_instructions[i];
   if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
     return 0;
-  return tcc_ir_callee_is_noreturn(irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q)));
+  return tcc_ir_callee_is_noreturn(tcc_ir_op_src1_sym(ir, q));
 }
 
 static int caf_is_terminator(TCCIRState *ir, int i)
@@ -80,7 +81,7 @@ static int caf_is_mem_call(TCCIRState *ir, int call_idx)
   IRQuadCompact *q = &ir->compact_instructions[call_idx];
   if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
     return 0;
-  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  Sym *callee = tcc_ir_op_src1_sym(ir, q);
   if (!callee)
     return 0;
   const char *name = get_tok_str(callee->v, NULL);
@@ -94,7 +95,7 @@ static int caf_dop(TCCIRState *ir, IRQuadCompact *q)
 {
   if (q->op != TCCIR_OP_FUNCCALLVAL)
     return 0;
-  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  Sym *callee = tcc_ir_op_src1_sym(ir, q);
   if (!callee)
     return 0;
   const char *name = get_tok_str(callee->v, NULL);
@@ -108,6 +109,33 @@ static int caf_dop(TCCIRState *ir, IRQuadCompact *q)
 }
 
 TCC_DBG_ENV_FLAG(cagg_disabled, "TCC_NO_CONST_AGG")
+
+/* Resolve a deref (lval) operand to (offset, root).  root == CAF_ROOT_NONE for
+ * a direct StackLoc operand (no LEA chain observed for this access). */
+static int caf_resolve_lval(const CAggTmpAddr *ta, int max_tmp, const IROperand *op, int32_t *outoff,
+                            int32_t *outroot)
+{
+  *outroot = CAF_ROOT_NONE;
+  if (!op->is_lval)
+    return 0;
+  if (irop_get_tag(*op) == IROP_TAG_STACKOFF && op->is_local && irop_get_vreg(*op) == -1)
+  {
+    *outoff = irop_get_stack_offset(*op);
+    return 1;
+  }
+  int32_t vr = irop_get_vreg(*op);
+  if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+  {
+    int p = TCCIR_DECODE_VREG_POSITION(vr);
+    if (p <= max_tmp && ta[p].has_off)
+    {
+      *outoff = ta[p].off;
+      *outroot = ta[p].root;
+      return 1;
+    }
+  }
+  return 0;
+}
 
 int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
 {
@@ -131,7 +159,7 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
       return 0;
     if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
     {
-      int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int t = (int)tcc_ir_op_dest_imm(ir, q);
       if (t < 0 || t >= n)
         return 0;
     }
@@ -144,8 +172,7 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int32_t vr = irop_get_vreg(dest);
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -165,10 +192,9 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (dest.is_lval)
+    if (tcc_ir_op_dest_is_lval(ir, q))
       continue;
-    int32_t vr = irop_get_vreg(dest);
+    int32_t vr = tcc_ir_op_dest_vreg(ir, q);
     if (vr < 0 || TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP)
       continue;
     int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -202,10 +228,9 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
         }
         if (q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB)
         {
-          IROperand s2 = tcc_ir_op_get_src2(ir, q);
-          if (irop_get_tag(s2) == IROP_TAG_IMM32 && !s2.is_lval)
+          if (tcc_ir_op_src2_tag(ir, q) == IROP_TAG_IMM32 && !tcc_ir_op_src2_is_lval(ir, q))
           {
-            int32_t k = (int32_t)irop_get_imm64_ex(ir, s2);
+            int32_t k = (int32_t)tcc_ir_op_src2_imm(ir, q);
             ta[pos].has_off = 1;
             ta[pos].off = (q->op == TCCIR_OP_ADD) ? ta[sp].off + k : ta[sp].off - k;
             ta[pos].root = ta[sp].root;
@@ -215,38 +240,6 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
       }
     }
   }
-
-/* Resolve a deref (lval) operand to (offset, root).  root == CAF_ROOT_NONE for
- * a direct StackLoc operand (no LEA chain observed for this access). */
-#define CAF_RESOLVE_LVAL(_op, _outoff, _outroot)                             \
-  ({                                                                         \
-    int _ok = 0;                                                             \
-    (_outroot) = CAF_ROOT_NONE;                                              \
-    if ((_op).is_lval)                                                       \
-    {                                                                        \
-      if (irop_get_tag(_op) == IROP_TAG_STACKOFF && (_op).is_local &&        \
-          irop_get_vreg(_op) == -1)                                          \
-      {                                                                      \
-        (_outoff) = irop_get_stack_offset(_op);                             \
-        _ok = 1;                                                             \
-      }                                                                      \
-      else                                                                   \
-      {                                                                      \
-        int32_t _vr = irop_get_vreg(_op);                                    \
-        if (_vr >= 0 && TCCIR_DECODE_VREG_TYPE(_vr) == TCCIR_VREG_TYPE_TEMP) \
-        {                                                                    \
-          int _p = TCCIR_DECODE_VREG_POSITION(_vr);                          \
-          if (_p <= max_tmp && ta[_p].has_off)                               \
-          {                                                                  \
-            (_outoff) = ta[_p].off;                                          \
-            (_outroot) = ta[_p].root;                                        \
-            _ok = 1;                                                         \
-          }                                                                  \
-        }                                                                    \
-      }                                                                      \
-    }                                                                        \
-    _ok;                                                                     \
-  })
 
 /* Resolve an address VALUE operand (is_lval==0) to its root base. */
 #define CAF_RESOLVE_ADDR_ROOT(_op, _outroot)                                 \
@@ -300,7 +293,7 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
     int param_is_memsrc = 0;
     if (is_param)
     {
-      uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, q);
       if (TCCIR_DECODE_PARAM_IDX(enc) == 1)
       {
         int cid = TCCIR_DECODE_CALL_ID(enc);
@@ -309,7 +302,7 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
           IRQuadCompact *cj = &ir->compact_instructions[j];
           if (cj->op != TCCIR_OP_FUNCCALLVOID && cj->op != TCCIR_OP_FUNCCALLVAL)
             continue;
-          uint32_t cenc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, cj));
+          uint32_t cenc = (uint32_t)tcc_ir_op_src2_imm(ir, cj);
           if (TCCIR_DECODE_CALL_ID(cenc) == cid)
           {
             param_is_memsrc = caf_is_mem_call(ir, j);
@@ -326,10 +319,9 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
         (q->op == TCCIR_OP_ASSIGN || q->op == TCCIR_OP_LEA ||
          q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB))
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!d.is_lval)
+      if (!tcc_ir_op_dest_is_lval(ir, q))
       {
-        int32_t dvr = irop_get_vreg(d);
+        int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
         if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_TEMP)
         {
           int dp = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -344,7 +336,7 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
       int has = (k == 1) ? irop_config[q->op].has_src1 : irop_config[q->op].has_src2;
       if (!has)
         continue;
-      IROperand op = (k == 1) ? tcc_ir_op_get_src1(ir, q) : tcc_ir_op_get_src2(ir, q);
+      IROperand op = tcc_ir_op_get_src1_or_2(ir, q, k != 1);
       int32_t aroot;
       if (!CAF_RESOLVE_ADDR_ROOT(op, aroot))
         continue;
@@ -381,14 +373,14 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
     if (q->op == TCCIR_OP_STORE)
     {
       IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!CAF_RESOLVE_LVAL(d, off, root))
+      if (!caf_resolve_lval(ta, max_tmp, &d, &off, &root))
         continue;
       sz8 = irop_is_64bit(d);
     }
     else
     {
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      if (!s1.is_lval || !CAF_RESOLVE_LVAL(s1, off, root))
+      if (!s1.is_lval || !caf_resolve_lval(ta, max_tmp, &s1, &off, &root))
         continue;
       sz8 = irop_is_64bit(s1);
     }
@@ -440,22 +432,34 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
 
   /* ---- Pass D: forward dataflow + dadd/dsub fold ------------------------- */
   small_sequence(CAggByteArr) is_jt_owner = {0}, has_back_pred_owner = {0}, need_save_owner = {0};
+  small_sequence(CAggIntArr) predecessors_owner = {0};
   if (CAggByteArr_init(&is_jt_owner, (size_t)n) != 0 ||
       CAggByteArr_init(&has_back_pred_owner, (size_t)n) != 0 ||
-      CAggByteArr_init(&need_save_owner, (size_t)n) != 0)
+      CAggByteArr_init(&need_save_owner, (size_t)n) != 0 ||
+      CAggIntArr_init(&predecessors_owner, (size_t)n * 2) != 0)
     return 0;
   uint8_t *is_jt = CAggByteArr_data(&is_jt_owner);
   uint8_t *has_back_pred = CAggByteArr_data(&has_back_pred_owner);
   uint8_t *need_save = CAggByteArr_data(&need_save_owner);
+  int *pred_head = CAggIntArr_data(&predecessors_owner);
+  int *pred_next = pred_head + n;
   for (int i = 0; i < n; i++)
+    pred_head[i] = -1;
+  // Reverse insertion preserves the original ascending predecessor order.
+  for (int i = n - 1; i >= 0; i--)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    int t = (int)tcc_ir_op_dest_imm(ir, q);
     is_jt[t] = 1;
     if (t <= i)
       has_back_pred[t] = 1;
+    else
+    {
+      pred_next[i] = pred_head[t];
+      pred_head[t] = i;
+    }
     need_save[i] = 1;
     if (t - 1 >= 0 && !caf_is_terminator(ir, t - 1))
       need_save[t - 1] = 1;
@@ -494,13 +498,8 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
             memcpy(acc, saved[i - 1], sizeof(CAggSlot) * ncand);
           first = 0;
         }
-        for (int j = 0; j < i; j++)
+        for (int j = pred_head[i]; j >= 0; j = pred_next[j])
         {
-          IRQuadCompact *jq = &ir->compact_instructions[j];
-          if (jq->op != TCCIR_OP_JUMP && jq->op != TCCIR_OP_JUMPIF)
-            continue;
-          if ((int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, jq)) != i)
-            continue;
           CAggSlot *ps = saved[j];
           if (!ps)
           {
@@ -573,7 +572,7 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
           q->op = TCCIR_OP_ASSIGN;
           tcc_ir_set_dest(ir, i, call_dest);
           tcc_ir_set_src1(ir, i, imm_src);
-          tcc_ir_set_src2(ir, i, IROP_NONE);
+          tcc_ir_set_src2_none(ir, i);
           int32_t dv = irop_get_vreg(call_dest);
           if (dv >= 0 && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP)
           {
@@ -590,13 +589,13 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
     if ((q->op == TCCIR_OP_LOAD || q->op == TCCIR_OP_ASSIGN) && irop_config[q->op].has_src1)
     {
       IROperand s1 = tcc_ir_op_get_src1(ir, q);
-      IROperand d = tcc_ir_op_get_dest(ir, q);
       int32_t off, root;
-      if (s1.is_lval && !d.is_lval && irop_is_64bit(s1) && CAF_RESOLVE_LVAL(s1, off, root))
+      if (s1.is_lval && !tcc_ir_op_dest_is_lval(ir, q) && irop_is_64bit(s1) &&
+          caf_resolve_lval(ta, max_tmp, &s1, &off, &root))
       {
         (void)root;
         int idx = CAF_SLOT_IDX(off);
-        int32_t dv = irop_get_vreg(d);
+        int32_t dv = tcc_ir_op_dest_vreg(ir, q);
         if (idx >= 0 && cur[idx].known && dv >= 0 &&
             TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP)
         {
@@ -612,19 +611,18 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
     {
       IROperand d = tcc_ir_op_get_dest(ir, q);
       int32_t off, root;
-      if (CAF_RESOLVE_LVAL(d, off, root))
+      if (caf_resolve_lval(ta, max_tmp, &d, &off, &root))
       {
         (void)root;
         int ssize = irop_is_64bit(d) ? 8 : 4;
-        IROperand v = tcc_ir_op_get_src1(ir, q);
         int64_t cval = 0;
         int cval_ok = 0;
         if (ssize == 8)
         {
-          if (irop_is_immediate(v)) { cval = irop_get_imm64_ex(ir, v); cval_ok = 1; }
+          if (tcc_ir_op_src1_is_imm(ir, q)) { cval = tcc_ir_op_src1_imm(ir, q); cval_ok = 1; }
           else
           {
-            int32_t vv = irop_get_vreg(v);
+            int32_t vv = tcc_ir_op_src1_vreg(ir, q);
             if (vv >= 0 && TCCIR_DECODE_VREG_TYPE(vv) == TCCIR_VREG_TYPE_TEMP)
             {
               int vp = TCCIR_DECODE_VREG_POSITION(vv);
@@ -653,10 +651,9 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
     /* Any other def of a TEMP invalidates its recorded constant. */
     if (irop_config[q->op].has_dest)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!d.is_lval)
+      if (!tcc_ir_op_dest_is_lval(ir, q))
       {
-        int32_t dv = irop_get_vreg(d);
+        int32_t dv = tcc_ir_op_dest_vreg(ir, q);
         if (dv >= 0 && TCCIR_DECODE_VREG_TYPE(dv) == TCCIR_VREG_TYPE_TEMP)
         {
           int dp = TCCIR_DECODE_VREG_POSITION(dv);
@@ -680,9 +677,4 @@ int tcc_ir_opt_const_aggregate_fold(TCCIRState *ir)
       tcc_free(saved[i]);
   tcc_free(saved);
   return changes;
-}
-
-int tcc_ir_opt_const_aggregate_fold_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_const_aggregate_fold(ctx->ir);
 }

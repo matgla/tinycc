@@ -330,21 +330,27 @@ void lbuild(int t)
 #endif
 
 #if PTR_SIZE == 4
-/* Inspect the direct IR producer of a 64-bit vreg to see if it is a 32->64
- * extension emitted by gen_cast.  Returns:
+/* Inspect the direct IR producer of a 64-bit, single-definition TEMP to see if
+ * it is a 32->64 extension emitted by gen_cast.  Returns:
  *   1 for zero-extension via TCCIR_OP_ZEXT (out *out_low_vr is the 32-bit src)
  *   2 for sign-extension via the canonical SHL #32 + OR low pattern
  *   0 otherwise.
  *
  * Intentionally strict: only looks at the direct producer of `vr`, no
- * ASSIGN-chain walking.  gen_cast for 32->64 unsigned emits ZEXT directly into
- * the destination vreg, and the signed path emits OR(SHL(SAR(low,31),32),low)
- * directly.  Anything in between (extra ASSIGNs from gv_dup, etc.) is opaque
- * and we conservatively bail. */
+ * ASSIGN-chain walking, and rejects vregs with more than one definition.
+ * gen_cast for 32->64 unsigned emits ZEXT directly into the destination vreg,
+ * and the signed path emits OR(SHL(SAR(low,31),32),low) directly.  Anything in
+ * between (extra ASSIGNs from gv_dup, etc.) is opaque and we conservatively
+ * bail.  A single-definition TEMP is required because a textual last
+ * definition of a VAR (or a multi-def TEMP) need not be the definition reaching
+ * this use across a branch. */
 static int detect_ll_ext_provenance(int vr, int *out_low_vr)
 {
   TCCIRState *ir = tcc_state->ir;
   if (!ir || vr < 0)
+    return 0;
+  if (TCCIR_DECODE_VREG_TYPE(vr) != TCCIR_VREG_TYPE_TEMP ||
+      !tcc_ir_vreg_has_single_def(ir, vr))
     return 0;
   int n = ir->next_instruction_index;
   if (n <= 0)
@@ -487,6 +493,130 @@ static int try_emit_widening_mul64(int t)
   return 1;
 }
 
+/* Reciprocal construction and limb arithmetic: docs/bugs/kernel-u64-divmod-constant-divisor-gap.md. */
+static SValue ll_div_const(uint64_t value, int type)
+{
+  SValue sv;
+  svalue_init(&sv);
+  sv.type.t = type;
+  sv.r = VT_CONST;
+  sv.vr = -1;
+  sv.c.i = value;
+  return sv;
+}
+
+static SValue ll_div_emit(TccIrOp op, SValue a, SValue b, int type)
+{
+  SValue dest;
+  svalue_init(&dest);
+  dest.type.t = type;
+  dest.r = 0;
+  dest.vr = tcc_ir_get_vreg_temp(tcc_state->ir);
+  if ((type & VT_BTYPE) == VT_LLONG)
+    tcc_ir_set_llong_type(tcc_state->ir, dest.vr);
+  tcc_ir_put(tcc_state->ir, op, &a, &b, &dest);
+  return dest;
+}
+
+static SValue ll_div_high(SValue value)
+{
+  return ll_div_emit(TCCIR_OP_SHR, value, ll_div_const(32, VT_INT), VT_LLONG | VT_UNSIGNED);
+}
+
+static SValue ll_div_low(SValue value)
+{
+  return ll_div_emit(TCCIR_OP_ASSIGN, value, value, VT_INT | VT_UNSIGNED);
+}
+
+static SValue ll_div_mulhi(SValue n, uint64_t magic)
+{
+  int wide = VT_LLONG | VT_UNSIGNED;
+  SValue nl = ll_div_low(n), nh = ll_div_low(ll_div_high(n));
+  SValue ml = ll_div_const((uint32_t)magic, VT_INT | VT_UNSIGNED);
+  SValue mh = ll_div_const(magic >> 32, VT_INT | VT_UNSIGNED);
+  SValue p00 = ll_div_emit(TCCIR_OP_UMULL, nl, ml, wide);
+  SValue p01 = ll_div_emit(TCCIR_OP_UMULL, nl, mh, wide);
+  SValue p10 = ll_div_emit(TCCIR_OP_UMULL, nh, ml, wide);
+  SValue p11 = ll_div_emit(TCCIR_OP_UMULL, nh, mh, wide);
+  SValue lo01 = ll_div_low(p01), lo10 = ll_div_low(p10);
+  lo01 = ll_div_emit(TCCIR_OP_ZEXT, lo01, lo01, wide);
+  lo10 = ll_div_emit(TCCIR_OP_ZEXT, lo10, lo10, wide);
+  SValue carry = ll_div_emit(TCCIR_OP_ADD, ll_div_high(p00), lo01, wide);
+  carry = ll_div_emit(TCCIR_OP_ADD, carry, lo10, wide);
+  SValue high = ll_div_emit(TCCIR_OP_ADD, p11, ll_div_high(p01), wide);
+  high = ll_div_emit(TCCIR_OP_ADD, high, ll_div_high(p10), wide);
+  return ll_div_emit(TCCIR_OP_ADD, high, ll_div_high(carry), wide);
+}
+
+static int try_emit_const_udiv64(int op)
+{
+  if (!tcc_state->ir || !TCC_OPT(tcc_state, optimize) || TCC_OPT(tcc_state, optimize_size) ||
+      (nocode_wanted & ~CODE_OFF_BIT) ||
+      (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) != VT_CONST || vtop->vr >= 0)
+    return 0;
+  uint64_t d = vtop->c.i;
+  if (!d)
+    return 0;
+  int wide = VT_LLONG | VT_UNSIGNED;
+  int shift = 0, add = 0;
+  uint64_t magic = 0;
+  for (uint64_t bits = d; bits > 1; bits >>= 1)
+    ++shift;
+  if (d & (d - 1)) {
+    uint64_t rem = (uint64_t)1 << shift;
+    for (int i = 0; i < 64; ++i) {
+      int overflow = (rem >> 63) != 0;
+      rem <<= 1;
+      magic <<= 1;
+      if (overflow || rem >= d) {
+        rem -= d;
+        magic |= 1;
+      }
+    }
+    if (d - rem >= ((uint64_t)1 << shift)) {
+      uint64_t twice = rem + rem;
+      magic = magic + magic + (twice < rem || twice >= d);
+      add = 1;
+    }
+    ++magic;
+  }
+  /* Keep 32-bit extraction destinations from narrowing their 64-bit producers. */
+  int saved_coalescing = tcc_state->ir->prevent_coalescing;
+  tcc_state->ir->prevent_coalescing = 1;
+  SValue n = ll_div_emit(TCCIR_OP_ASSIGN, vtop[-1], vtop[-1], wide);
+  SValue q = n;
+  if (d & (d - 1)) {
+    q = ll_div_mulhi(n, magic);
+    if (add) {
+      SValue delta = ll_div_emit(TCCIR_OP_SUB, n, q, wide);
+      delta = ll_div_emit(TCCIR_OP_SHR, delta, ll_div_const(1, VT_INT), wide);
+      q = ll_div_emit(TCCIR_OP_ADD, delta, q, wide);
+    }
+  }
+  if (shift)
+    q = ll_div_emit(TCCIR_OP_SHR, q, ll_div_const(shift, VT_INT), wide);
+  if (op == TOK_UMOD) {
+    if (!(d & (d - 1)))
+      q = ll_div_emit(TCCIR_OP_AND, n, ll_div_const(d - 1, wide), wide);
+    else {
+      SValue ql = ll_div_low(q), qh = ll_div_low(ll_div_high(q));
+      SValue dl = ll_div_const((uint32_t)d, VT_INT | VT_UNSIGNED);
+      SValue dh = ll_div_const(d >> 32, VT_INT | VT_UNSIGNED);
+      SValue low = ll_div_emit(TCCIR_OP_UMULL, ql, dl, wide);
+      SValue cross1 = ll_div_emit(TCCIR_OP_UMULL, ql, dh, wide);
+      SValue cross2 = ll_div_emit(TCCIR_OP_UMULL, qh, dl, wide);
+      SValue cross = ll_div_emit(TCCIR_OP_ADD, cross1, cross2, wide);
+      cross = ll_div_emit(TCCIR_OP_SHL, cross, ll_div_const(32, VT_INT), wide);
+      SValue product = ll_div_emit(TCCIR_OP_ADD, low, cross, wide);
+      q = ll_div_emit(TCCIR_OP_SUB, n, product, wide);
+    }
+  }
+  tcc_state->ir->prevent_coalescing = saved_coalescing;
+  --vtop;
+  *vtop = q;
+  return 1;
+}
+
 /* generate CPU independent (unsigned) long long operations */
 void gen_opl(int op)
 {
@@ -502,12 +632,16 @@ void gen_opl(int op)
     func = TOK___divdi3;
     goto gen_func;
   case TOK_UDIV:
+    if (try_emit_const_udiv64(op))
+      break;
     func = TOK___udivdi3;
     goto gen_func;
   case '%':
     func = TOK___moddi3;
     goto gen_mod_func;
   case TOK_UMOD:
+    if (try_emit_const_udiv64(op))
+      break;
     func = TOK___umoddi3;
   gen_mod_func:
 #ifdef TCC_ARM_EABI
@@ -709,7 +843,7 @@ void gen_opl(int op)
      * the argument moves, the inline sequence eight instructions (~22 bytes)
      * at every site -- 440 of them in zig.c. */
     if (tcc_state->ir &&
-        ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST || !tcc_state->optimize_size))
+        ((vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == VT_CONST || !TCC_OPT(tcc_state, optimize_size)))
     {
       /* IR mode: generate a single 64-bit shift instruction directly.
        * The lexpand/lbuild decomposition produces intermediate 32-bit values

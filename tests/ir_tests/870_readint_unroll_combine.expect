@@ -1,0 +1,37 @@
+cmp_shift lsl=0000587a lsl_t=7f00fe85 asr=000027e5 lsr=00004295
+off0 rd4=7fff8001 rd2=8001 rd8=5581fe007fff8001
+off0 le32=7fff8001 be32=0180ff7f le16=8001 be16=0180 le24=ff8001
+off0 signed=-32767 shuf=7f8001ff two=7f7a7a01
+off0 w=7fff8001 b2=ff
+off1 rd4=007fff80 rd2=ff80 rd8=aa5581fe007fff80
+off1 le32=007fff80 be32=80ff7f00 le16=ff80 be16=80ff le24=7fff80
+off1 signed=-128 shuf=00ff807f two=ff7f7a7a
+off1 w=007fff80 b2=7f
+off2 rd4=fe007fff rd2=7fff rd8=12aa5581fe007fff
+off2 le32=fe007fff be32=ff7f00fe le16=7fff be16=ff7f le24=007fff
+off2 signed=-1 shuf=fe7fff00 two=c9ff7f7c
+off2 w=fe007fff b2=00
+off3 rd4=81fe007f rd2=007f rd8=3412aa5581fe007f
+off3 le32=81fe007f be32=7f00fe81 le16=007f be16=7f00 le24=fe007f
+off3 signed=127 shuf=81007ffe two=1dc9fe80
+off3 w=81fe007f b2=fe
+off0 cast4=7fff8001 cast8=5581fe007fff8001 x2=7fff800181fe007f
+off0 scast=-1984756359 carry=0038e98a esc=000007f0 adj=7f7a7a01
+off1 cast4=007fff80 cast8=aa5581fe007fff80 x2=007fff8078563412
+off1 scast=8784072 carry=00371c49 esc=00007ff0 adj=ff7f7a7a
+off2 cast4=fe007fff cast8=12aa5581fe007fff x2=fe007fffff0ff0de
+off2 scast=-36349494 carry=00370665 esc=00000fff adj=c9ff7f7c
+off3 cast4=81fe007f cast8=3412aa5581fe007f x2=81fe007f000080ff
+off3 scast=1984515316 carry=0038f0eb esc=00000810 adj=1dc9fe80
+words w0=81fe007f w9=08f19904 w15=a001fe80 h=75d97c69
+store_between=50405c20
+mid_count=0f8d843f i=2
+mid_up=62965f2c mid_long=4ab51280
+rt0=00000007 rt3=00000dcf rt9=299fd8d4
+cse0 h_pre=0008ff80 w_pre=00800000 w_after=00800000 w_two=007fff80/0000ff80 f29=007ffe80
+cse0 ix_pre=00800000 ix_h=000002fa parse=81fe007f
+cse1 h_pre=00084581 w_pre=12aa5602 w_after=12aa5602 w_two=12aa5581/00005581 f29=00aa5483
+cse1 ix_pre=fe0080fe ix_h=0004f600 parse=ffffffff
+cse2 h_pre=00051856 w_pre=bc9a78ac w_after=bc9a78ac w_two=bc9a7856/00007856 f29=009a78fa
+cse2 ix_pre=81fe00fe ix_h=00028af4 parse=aa5581fe
+cse parse0=ffffffff mix=aa5582fc mix2=78563400 mix3=00005e9e

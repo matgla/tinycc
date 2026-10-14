@@ -27,7 +27,7 @@ static int ir_reassoc_var_addr_taken(TCCIRState *ir, int32_t vreg)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_LEA)
       continue;
-    if (irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vreg)
+    if (tcc_ir_op_src1_vreg(ir, q) == vreg)
       return 1;
   }
   return 0;
@@ -169,8 +169,7 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
         IRQuadCompact *jq = &ir->compact_instructions[j];
         if (jq->op == TCCIR_OP_NOP)
           continue;
-        IROperand jdst = tcc_ir_op_get_dest(ir, jq);
-        if (irop_get_vreg(jdst) == inner_vr)
+        if (tcc_ir_op_dest_vreg(ir, jq) == inner_vr)
         {
           redefined = 1;
           break;
@@ -233,19 +232,19 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
       new_src.is_unsigned = def_src1.is_unsigned;
       q->op = TCCIR_OP_ASSIGN;
       tcc_ir_set_src1(ir, i, new_src);
-      tcc_ir_set_src2(ir, i, IROP_NONE);
+      tcc_ir_set_src2_none(ir, i);
     }
     else if (combined == 0)
     {
       q->op = TCCIR_OP_ASSIGN;
       tcc_ir_set_src1(ir, i, def_src1);
-      tcc_ir_set_src2(ir, i, IROP_NONE);
+      tcc_ir_set_src2_none(ir, i);
     }
     else
     {
       q->op = TCCIR_OP_ADD;
       tcc_ir_set_src1(ir, i, def_src1);
-      tcc_ir_set_src2(ir, i, irop_make_imm32(-1, (int32_t)combined, btype));
+      tcc_ir_set_src2_imm32(ir, i, (int32_t)combined, btype);
     }
     changes++;
   }
@@ -254,5 +253,3 @@ int tcc_ir_opt_add_reassoc(TCCIRState *ir)
   tcc_free(is_merge);
   return changes;
 }
-
-int tcc_ir_opt_add_reassoc_ex(IROptCtx *ctx) { return tcc_ir_opt_add_reassoc(ctx->ir); }

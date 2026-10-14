@@ -22,6 +22,19 @@
 #include "ir.h"
 #include "regalloc.h"
 
+/* Does the immediate's value fit an integer of btype bt as it is? */
+static int pcc_imm_fits(TCCIRState *ir, IROperand imm, int bt, int is_unsigned)
+{
+  int64_t k = (int32_t)irop_get_imm64_ex(ir, imm);
+  int bits = bt == IROP_BTYPE_INT8 ? 8 : bt == IROP_BTYPE_INT16 ? 16 : bt == IROP_BTYPE_INT32 ? 32 : 0;
+  if (!bits)
+    return 0;
+  if (bits == 32)
+    return 1;
+  return is_unsigned ? k >= 0 && k < ((int64_t)1 << bits)
+                     : k >= -((int64_t)1 << (bits - 1)) && k < ((int64_t)1 << (bits - 1));
+}
+
 /* Folds the post-ra_resolve_phis chain `T_case <- const_N` + `T_phi <- T_case` (switch-case body plus its phi copy) into a single `T_phi <- const_N`. */
 /* Precondition: T_case has exactly one use and the source is freely duplicable (IMM/SYMREF/STACKOFF/F32 inline payload, F64/I64/SYMREF via pool_idx). */
 /* Rewrites the original def's dest rather than the copy: that keeps the slot carrying the basic-block label and leaves the source operand's in-pool payload intact. */
@@ -36,9 +49,8 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP) continue;
     if (!irop_config[q->op].has_dest) continue;
-    IROperand d = tcc_ir_op_get_dest(ir, q);
-    if (d.is_lval) continue;
-    int32_t v = irop_get_vreg(d);
+    if (tcc_ir_op_dest_is_lval(ir, q)) continue;
+    int32_t v = tcc_ir_op_dest_vreg(ir, q);
     if (v < 0 || TCCIR_DECODE_VREG_TYPE(v) != TCCIR_VREG_TYPE_TEMP) continue;
     int pos = TCCIR_DECODE_VREG_POSITION(v);
     if (pos > max_tmp) max_tmp = pos;
@@ -58,9 +70,8 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
     int op = q->op;
 
     if (irop_config[op].has_dest) {
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      if (!d.is_lval) {
-        int32_t v = irop_get_vreg(d);
+      if (!tcc_ir_op_dest_is_lval(ir, q)) {
+        int32_t v = tcc_ir_op_dest_vreg(ir, q);
         if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
           int pos = TCCIR_DECODE_VREG_POSITION(v);
           if (pos <= max_tmp) {
@@ -71,7 +82,7 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
         }
       } else if (op == TCCIR_OP_STORE || op == TCCIR_OP_STORE_INDEXED ||
                  op == TCCIR_OP_STORE_POSTINC) {
-        int32_t v = irop_get_vreg(d);
+        int32_t v = tcc_ir_op_dest_vreg(ir, q);
         if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
           int pos = TCCIR_DECODE_VREG_POSITION(v);
           if (pos <= max_tmp) use_count[pos]++;
@@ -79,16 +90,14 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
       }
     }
     if (irop_config[op].has_src1) {
-      IROperand s = tcc_ir_op_get_src1(ir, q);
-      int32_t v = irop_get_vreg(s);
+      int32_t v = tcc_ir_op_src1_vreg(ir, q);
       if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
         int pos = TCCIR_DECODE_VREG_POSITION(v);
         if (pos <= max_tmp) use_count[pos]++;
       }
     }
     if (irop_config[op].has_src2) {
-      IROperand s = tcc_ir_op_get_src2(ir, q);
-      int32_t v = irop_get_vreg(s);
+      int32_t v = tcc_ir_op_src2_vreg(ir, q);
       if (v >= 0 && TCCIR_DECODE_VREG_TYPE(v) == TCCIR_VREG_TYPE_TEMP) {
         int pos = TCCIR_DECODE_VREG_POSITION(v);
         if (pos <= max_tmp) use_count[pos]++;
@@ -147,9 +156,15 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
 
     /* btype must match across the whole chain: a width difference changes ASSIGN's implicit widen/narrow (e.g. ZEXT of a 32-bit const into a 64-bit register pair). */
     int u_dest_bt = irop_get_btype(u_dest);
-    int def_dest_bt = irop_get_btype(tcc_ir_op_get_dest(ir, def_q));
+    int def_dest_bt = tcc_ir_op_dest_btype(ir, def_q);
     int def_src_bt = irop_get_btype(def_src);
-    if (u_dest_bt != def_dest_bt || u_dest_bt != def_src_bt)
+    /* An integer immediate whose value every type on the chain holds as is
+     * moves the same register image whichever of them it is typed as (a
+     * promoted `uint8_t r = k;` arm: a byte-typed constant, a word phi). */
+    int narrow_imm = dtag == IROP_TAG_IMM32 && pcc_imm_fits(ir, def_src, def_src_bt, def_src.is_unsigned) &&
+                     pcc_imm_fits(ir, def_src, u_dest_bt, u_dest.is_unsigned) &&
+                     pcc_imm_fits(ir, def_src, def_dest_bt, tcc_ir_op_get_dest(ir, def_q).is_unsigned);
+    if (u_dest_bt != def_dest_bt || (u_dest_bt != def_src_bt && !narrow_imm))
       continue;
     /* Guards collapsing a narrowing read of a wider T_src. */
     if (irop_get_btype(u_src) != u_dest_bt)
@@ -168,16 +183,13 @@ int ra_fold_phi_const_chain(TCCIRState *ir)
       IRQuadCompact *kq = &ir->compact_instructions[k];
       if (kq->op == TCCIR_OP_NOP) continue;
       if (irop_config[kq->op].has_dest) {
-        IROperand kd = tcc_ir_op_get_dest(ir, kq);
-        if (!kd.is_lval && irop_get_vreg(kd) == u_dest_vr) { conflict = 1; break; }
+        if (!tcc_ir_op_dest_is_lval(ir, kq) && tcc_ir_op_dest_vreg(ir, kq) == u_dest_vr) { conflict = 1; break; }
       }
       if (irop_config[kq->op].has_src1) {
-        IROperand ks = tcc_ir_op_get_src1(ir, kq);
-        if (irop_get_vreg(ks) == u_dest_vr) { conflict = 1; break; }
+        if (tcc_ir_op_src1_vreg(ir, kq) == u_dest_vr) { conflict = 1; break; }
       }
       if (irop_config[kq->op].has_src2) {
-        IROperand ks = tcc_ir_op_get_src2(ir, kq);
-        if (irop_get_vreg(ks) == u_dest_vr) { conflict = 1; break; }
+        if (tcc_ir_op_src2_vreg(ir, kq) == u_dest_vr) { conflict = 1; break; }
       }
     }
     if (conflict) continue;

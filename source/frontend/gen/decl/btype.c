@@ -31,7 +31,10 @@ static void sym_to_attr(AttributeDef *ad, Sym *s)
 
 /* Add type qualifiers to a type. If the type is an array then the qualifiers
    are added to the element type, copied because it could be a typedef. */
-static void parse_btype_qualify(CType *type, int qualifiers)
+/* Qualify `type`; for an array type that means its (innermost) element type,
+ * as C 6.7.3p9 says, on fresh copies of the array type syms so the shared
+ * typedef or struct-member type is left alone. */
+void parse_btype_qualify(CType *type, int qualifiers)
 {
   while (type->t & VT_ARRAY)
   {
@@ -239,6 +242,9 @@ int parse_btype(CType *type, AttributeDef *ad, int ignore_label)
       t |= VT_DEFSIGN;
       next();
       typespec_found = 1;
+      break;
+    case TOK_RODATA_REL:
+      tcc_error("'__rodata_relative' qualifies a pointer: write it after the '*'");
       break;
     case TOK_REGISTER:
     case TOK_AUTO:

@@ -54,6 +54,14 @@ typedef struct SValue
                                 * one, so setters err towards 1. */
   uint8_t pr1_reg : 5;     /* Physical register number (0-15 for ARM, 31=PREG_REG_NONE) */
   uint8_t pr1_spilled : 1; /* Spilled to stack flag */
+  uint8_t sso_reversed : 1; /* Memory reached through this value is stored in
+                             * reverse byte order: a member of a
+                             * scalar_storage_order("big-endian") aggregate.
+                             * Set at member access (and kept through an array
+                             * member's pointer arithmetic); an lvalue carrying
+                             * it is loaded by gv() and stored by vstore() with
+                             * the bytes swapped, and must never reach the IR
+                             * as a plain memory operand. */
 
   /* Value location and flags - union for bitfield or legacy access */
   union
@@ -66,7 +74,17 @@ typedef struct SValue
       unsigned short has_sym : 1;     /* VT_SYM: symbol value is added (bit 9) */
       unsigned short mustcast : 2;    /* VT_MUSTCAST: value must be casted (bits 10-11) */
       unsigned short nonconst : 1;    /* VT_NONCONST: not a C standard integer constant (bit 12) */
-      unsigned short reserved_13 : 1; /* unused (bit 13) */
+      unsigned short union_member : 1; /* the lvalue's access chain crossed a union member
+                                        * (set at '.'/'->' when the aggregate is a union, kept
+                                        * through the in-place offset arithmetic of an array
+                                        * member).  Read by tcc_ir_put to suppress the
+                                        * C11 6.5p7 alias-class marks: punning between union
+                                        * members is legal, so a union-member access must not
+                                        * be classified as "pointer object" / "non-pointer
+                                        * object" for the LICM field-load hoist.  A stale 1
+                                        * only costs the optimization; a lost 1 could hoist a
+                                        * load a union store legally changes, so the setter at
+                                        * member access must never be skipped. */
       unsigned short mustbound : 1;   /* VT_MUSTBOUND: bound checking required (bit 14) */
       unsigned short bounded : 1;     /* VT_BOUNDED: value is bounded (bit 15) */
     };

@@ -22,6 +22,85 @@
  * Split out of tccgen.c; see docs/plan_tccgen_split.md. */
 
 #include "gen_priv.h"
+#include "memory/vector.h"
+
+/* A small_leaf body longer than this many token ints is not expanded into a
+ * caller longer than INLINE_GIANT_CALLER_TOKENS: zig.c's register-bound giants
+ * (Sema.analyzeBodyInner, 43k ints) fell off a frame cliff -- 26 KB to 70 KB --
+ * from ~80 extra tiny expansions.  A cost rule, gcc's large-function growth
+ * limit; the cliff itself is open (C_inlining.md F4).  zig.c -O2: -10M, -73 KB
+ * against the leaf rescue alone. */
+#define INLINE_GIANT_CALLER_TOKENS 32000
+#define INLINE_GIANT_CALLER_CALLEE_TOKENS 60
+/* A wrapper (gen_function: acyclic, one call) expands at most this many times
+ * into one function: uncapped, zig.c grew 505 KB and one Sema giant's frame
+ * passed 99 KB. */
+#define INLINE_WRAPPER_PER_CALLER 2
+/* Aggregate-return loops share this bound, including expansions inside wrappers. */
+
+static int inline_into_giant_caller(Sym *fs, InlineFunc *fn)
+{
+  return fs->type.ref->f.func_small_leaf && tcc_state->inline_caller_len > INLINE_GIANT_CALLER_TOKENS &&
+         fn->func_str->len > INLINE_GIANT_CALLER_CALLEE_TOKENS && !tcc_ir_opt_pass_disabled("inline:giant_caller");
+}
+
+static int inline_inside_wrapper(void)
+{
+  if (tcc_ir_opt_pass_disabled("inline:wrapper_dependencies"))
+    return 0;
+  for (int depth = 0; depth < tcc_state->inline_expansion_depth && depth < INLINE_NEST_MAX; depth++)
+  {
+    Sym *parent = tcc_state->inline_expansion_syms[depth];
+    if (parent && parent->type.ref && parent->type.ref->f.func_inl_wrapper)
+      return 1;
+  }
+  return 0;
+}
+
+/* A body the nested-inline budget does not count: one of at most
+ * TINY_INLINE_TOKENS, or a small straight-line or small-loop leaf, whose
+ * optimized body of a few ops -- not its tokens -- is what an expansion
+ * duplicates; it inlines at every first-level site already.  Counted by
+ * tokens, a 99-token bit_set.isSet stayed a call in the kernel's mremap page
+ * scan once the scan's other expansions had spent the budget.  A wrapper
+ * brings its callee along and still counts.  An aggregate-return loop
+ * (inline:sret_loop) is bounded per caller instead: charged by its tokens as
+ * well, ComponentIterator.init spent the budget peekNext needed inside the
+ * kernel's get_file_header. */
+static int inline_body_budget_free(Sym *fs, InlineFunc *fn)
+{
+  if (fn->func_str->len <= TINY_INLINE_TOKENS)
+    return 1;
+  return fs->type.ref->f.func_small_leaf && !fs->type.ref->f.func_inl_wrapper &&
+         !tcc_ir_opt_pass_disabled("inline:small_leaf_budget");
+}
+
+/* Inside the expansion of a called-once or few-callers body: what it expands
+ * again was counted where that body was first generated, and moves with it. */
+static int inline_inside_moved_body(void)
+{
+  for (int depth = 0; depth < tcc_state->inline_expansion_depth && depth < INLINE_NEST_MAX; depth++)
+  {
+    Sym *parent = tcc_state->inline_expansion_syms[depth];
+    if (parent && parent->type.ref &&
+        (parent->type.ref->f.func_inl_few_callers || parent->type.ref->f.func_called_once))
+      return 1;
+  }
+  return 0;
+}
+
+static int inline_wrapper_cap_hit(Sym *fs, InlineFunc *fn)
+{
+  if (!fs->type.ref->f.func_inl_sret_loop &&
+      (!fs->type.ref->f.func_inl_wrapper || inline_inside_wrapper()))
+    return 0;
+  if (fn->caller_gen != tcc_state->inline_caller_gen)
+  {
+    fn->caller_gen = tcc_state->inline_caller_gen;
+    fn->caller_count = 0;
+  }
+  return fn->caller_count >= INLINE_WRAPPER_PER_CALLER;
+}
 
 /* Emit an IR void function call with arguments from an SValue array.
  * args[0..argc-1] are the arguments. Does not push a result. */
@@ -44,6 +123,24 @@ void gen_ir_void_call_args(SValue *args, int argc, int func_tok)
   SValue call_id_sv = tcc_ir_svalue_call_id_argc(new_call_id, argc);
   tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &vtop[0], &call_id_sv, NULL);
   --vtop;
+}
+
+/* Move a VFP-returned value (gfunc_sret_vfp_words) between s0..s(words-1)
+ * and the buffer at *ptr: a call to __tcc_vfp_ret_ld (callee exit: buffer to
+ * registers) or __tcc_vfp_ret_st (caller, right after the call: registers to
+ * buffer), which the ARM backend emits as one VLDM/VSTM.  As calls, every
+ * pass sees them read or write the buffer.  Returns the call id. */
+ST_FUNC int gen_vfp_ret_transfer(const SValue *ptr, int words, int load)
+{
+  SValue args[2] = {*ptr};
+  svalue_init(&args[1]);
+  args[1].type.t = VT_INT;
+  args[1].r = VT_CONST;
+  args[1].vr = -1;
+  args[1].c.i = words;
+  const int call_id = tcc_state->ir->next_call_id;
+  gen_ir_void_call_args(args, 2, tok_alloc_const(load ? "__tcc_vfp_ret_ld" : "__tcc_vfp_ret_st"));
+  return call_id;
 }
 
 /* Extracted from unary_funcall() to reduce its stack frame size.
@@ -77,6 +174,222 @@ void nop_or_rollback_call_params(int call_id, int ir_idx_before_first_param, int
   }
 }
 
+/* ---- __multi3: the 128-bit multiply, expanded at the call -------------------
+ * zig.h without __int128 (tcc) multiplies zig_u128/zig_i128 -- two 64-bit
+ * halves, low first -- through compiler-rt's __multi3: 32 bytes of arguments,
+ * a 16-byte sret buffer and ~130 instructions a call, where Wyhash's mum needs
+ * a 64x64->128 product of two zero-extended words.  The kernel loader made 105
+ * such calls per launch (18% of its stack traffic).  The low 128 bits of the
+ * product do not depend on signedness, so the call becomes the schoolbook
+ * product of 32-bit words (UMULL after the backend's fusions); the zero high
+ * halves of a widened operand fold away.
+ *
+ * Intermediate values are anonymous locals reloaded at each use, which SSA
+ * promotes to registers: duplicating a lazily-extended 64-bit pair on the
+ * value stack can reference halves defined for one copy only (overflow.c),
+ * and value numbering runs before the UMULL fusion, so a recomputed product
+ * stays duplicated.  (The temp-local pool's slots are not promoted.) */
+static void m3_load(const SValue *agg, int ofs, int t)
+{
+  vpushv((SValue *)agg);
+  gaddrof();
+  vtop->type = char_pointer_type;
+  vpushi(ofs);
+  gen_op('+');
+  vtop->type.t = t;
+  vtop->type.ref = NULL;
+  vtop->r |= VT_LVAL;
+}
+
+/* (u64)a.word[i] * (u64)b.word[j] */
+static void m3_prod(const SValue *a, int i, const SValue *b, int j)
+{
+  m3_load(a, 4 * i, VT_INT | VT_UNSIGNED);
+  gen_cast_s(VT_LLONG | VT_UNSIGNED);
+  m3_load(b, 4 * j, VT_INT | VT_UNSIGNED);
+  gen_cast_s(VT_LLONG | VT_UNSIGNED);
+  gen_op('*');
+}
+
+static void m3_hi32(void)
+{
+  vpushi(32);
+  gen_op(TOK_SHR);
+}
+
+/* Pops the value on top of the stack into the temporary `t`. */
+static void m3_set(const SValue *t)
+{
+  vpushv((SValue *)t);
+  vswap();
+  vstore();
+  vpop();
+}
+
+/* The result lvalue of the call, as the post-call path pushes it. */
+static void m3_push_result(const SValue *ret, int nrvo_vreg, int nrvo_ptr_vreg)
+{
+  vsetc((CType *)&ret->type, ret->r, (CValue *)&ret->c);
+  if (nrvo_vreg != -1)
+    vtop->vr = nrvo_vreg;
+  else if (nrvo_ptr_vreg != -1)
+    vtop->vr = nrvo_ptr_vreg;
+}
+
+/* Turns the struct lvalue on top of the stack into its u64 half at `ofs`. */
+static void m3_half_of_top(int ofs)
+{
+  gaddrof();
+  vtop->type = char_pointer_type;
+  if (ofs)
+  {
+    vpushi(ofs);
+    gen_op('+');
+  }
+  vtop->type.t = VT_LLONG | VT_UNSIGNED;
+  vtop->type.ref = NULL;
+  vtop->r |= VT_LVAL;
+}
+
+static int m3_is_ti(const CType *t)
+{
+  int align;
+  return (t->t & VT_BTYPE) == VT_STRUCT && type_size((CType *)t, &align) == 16;
+}
+
+/* An anonymous local of type `t`, declared as a C local would be (SSA promotes it). */
+static int m3_local(SValue *sv, int t)
+{
+  const int size = (t & VT_BTYPE) == VT_LLONG ? 8 : 4;
+  int vr = tcc_ir_get_vreg_var(tcc_state->ir);
+  if (vr < 0)
+    return 0;
+  loc = tcc_ir_frame_alloc(loc, size, -size);
+  tcc_ir_assign_physical_register(tcc_state->ir, vr, loc, -1, -1);
+  tcc_ir_set_original_offset(tcc_state->ir, vr, loc);
+  if (size == 8)
+    tcc_ir_set_llong_type(tcc_state->ir, vr);
+  svalue_init(sv);
+  sv->type.t = t;
+  sv->type.ref = NULL;
+  sv->r = VT_LOCAL | VT_LVAL;
+  sv->vr = vr;
+  sv->c.i = loc;
+  return 1;
+}
+
+/* Pushes local `v` widened to u64. */
+static void m3_get64(const SValue *v)
+{
+  vpushv((SValue *)v);
+  gen_cast_s(VT_LLONG | VT_UNSIGNED);
+}
+
+/* Pops the u64 on top of the stack into u32 local `v`, keeping bits sh..sh+31. */
+static void m3_set32(const SValue *v, int sh)
+{
+  if (sh)
+  {
+    vpushi(sh);
+    gen_op(TOK_SHR);
+  }
+  gen_cast_s(VT_INT | VT_UNSIGNED);
+  m3_set(v);
+}
+
+int __attribute__((noinline)) try_inline_multi3(const char *func_name, Sym *call_func_sym, SValue *saved_args,
+                                                int nargs, const SValue *ret, int ret_nregs, int vfp_ret_words,
+                                                int nrvo_vreg, int nrvo_ptr_vreg, int call_id)
+{
+  const int u32 = VT_INT | VT_UNSIGNED, u64 = VT_LLONG | VT_UNSIGNED;
+  SValue T, L0, W1, W2, L1;
+
+  if (nargs != 2 || strcmp(func_name, "__multi3") || ret_nregs != 0 || vfp_ret_words || !call_func_sym ||
+      !call_func_sym->type.ref || TCC_OPT(tcc_state, optimize) < 1 || tcc_ir_opt_pass_disabled("inline:multi3"))
+    return 0;
+  if (!m3_is_ti(&call_func_sym->type.ref->type) || !m3_is_ti(&ret->type) || !m3_is_ti(&saved_args[0].type) ||
+      !m3_is_ti(&saved_args[1].type) || !(saved_args[0].r & VT_LVAL) || !(saved_args[1].r & VT_LVAL))
+    return 0;
+  if (!m3_local(&T, u64) || !m3_local(&L0, u32) || !m3_local(&W1, u32) || !m3_local(&W2, u32) ||
+      !m3_local(&L1, u32))
+    return 0;
+  const SValue *a = &saved_args[0], *b = &saved_args[1];
+
+  /* The call is gone: its parameters too, the sret pointer emitted before the
+   * argument span included. */
+  for (int i = 0; i < tcc_state->ir->next_instruction_index; i++)
+  {
+    if (tcc_state->ir->compact_instructions[i].op != TCCIR_OP_FUNCPARAMVAL)
+      continue;
+    IROperand src2 = tcc_ir_get_src2(tcc_state->ir, i);
+    if (TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(tcc_state->ir, src2)) == call_id)
+      tcc_state->ir->compact_instructions[i].op = TCCIR_OP_NOP;
+  }
+
+  /* The schoolbook carry chain gcc emits, in shapes the UMULL/UMAAL fusions
+   * take (a word product plus a word):
+   *   T = a0*b0;              L0 = lo32(T)
+   *   T = a1*b0 + hi32(T);    W1 = lo32(T); W2 = hi32(T)
+   *   T = a0*b1 + W1;         L1 = lo32(T)
+   *   lo = L1:L0
+   *   hi = a1*b1 + W2 + hi32(T) + a.lo*b.hi + a.hi*b.lo */
+  m3_prod(a, 0, b, 0);
+  m3_set(&T);
+  vpushv(&T);
+  m3_set32(&L0, 0);
+  m3_prod(a, 1, b, 0);
+  vpushv(&T);
+  m3_hi32();
+  gen_op('+');
+  m3_set(&T);
+  vpushv(&T);
+  m3_set32(&W1, 0);
+  vpushv(&T);
+  m3_set32(&W2, 32);
+  m3_prod(a, 0, b, 1);
+  m3_get64(&W1);
+  gen_op('+');
+  m3_set(&T);
+  vpushv(&T);
+  m3_set32(&L1, 0);
+  /* lo */
+  m3_get64(&L1);
+  vpushi(32);
+  gen_op(TOK_SHL);
+  m3_get64(&L0);
+  gen_op('|');
+  /* hi */
+  m3_prod(a, 1, b, 1);
+  m3_get64(&W2);
+  gen_op('+');
+  vpushv(&T);
+  m3_hi32();
+  gen_op('+');
+  m3_load(a, 0, u64);
+  m3_load(b, 8, u64);
+  gen_op('*');
+  gen_op('+');
+  m3_load(a, 8, u64);
+  m3_load(b, 0, u64);
+  gen_op('*');
+  gen_op('+');
+  /* Both halves are computed before either store: the result buffer may be
+   * an operand's own storage (NRVO of `t8 = mulw(t7, t8)`). */
+  m3_push_result(ret, nrvo_vreg, nrvo_ptr_vreg);
+  m3_half_of_top(8);
+  vswap();
+  vstore();
+  vpop();
+  m3_push_result(ret, nrvo_vreg, nrvo_ptr_vreg);
+  m3_half_of_top(0);
+  vswap();
+  vstore();
+  vpop();
+  /* the call's value: the result buffer */
+  m3_push_result(ret, nrvo_vreg, nrvo_ptr_vreg);
+  return 1;
+}
+
 /* Redirect a call to a __tcc_* helper: NOP old params, emit new call via gen_ir_call_args. */
 int redirect_call_to_tcc_helper(SValue *saved_args, int nargs, const char *helper_name, CType *result_type,
                                        int call_id, int ir_idx_before_first_param, int ir_idx_before_args)
@@ -96,6 +409,21 @@ int redirect_call_to_tcc_helper(SValue *saved_args, int nargs, const char *helpe
  * This saves ~3000+ bytes per unary() stack frame. */
 /* Whether SYM's body is already being expanded further out: expanding it
  * again is recursion, which token replay would unroll without end. */
+/* SET_CHAIN for the call being emitted: R10 = the chain at `level`
+ * (nested_chain_level); level < 0: no chain to set. */
+static void emit_set_chain(int level)
+{
+  if (level < 0 || !tcc_state->ir)
+    return;
+  SValue src;
+  svalue_init(&src);
+  src.type.t = VT_INT;
+  src.r = VT_CONST;
+  src.c.i = level;
+  src.vr = -1;
+  tcc_ir_put(tcc_state->ir, TCCIR_OP_SET_CHAIN, &src, NULL, NULL);
+}
+
 static int inline_expansion_in_progress(Sym *sym)
 {
   int depth = tcc_state->inline_expansion_depth < INLINE_NEST_MAX ? tcc_state->inline_expansion_depth : INLINE_NEST_MAX;
@@ -103,6 +431,18 @@ static int inline_expansion_in_progress(Sym *sym)
     if (tcc_state->inline_expansion_syms[i] == sym)
       return 1;
   return 0;
+}
+
+/* Whether a promoted argument (K&R call) differs from the arithmetic
+ * parameter it binds to, so binding it needs a conversion. */
+static int inline_knr_arg_needs_conversion(const CType *arg, const CType *param)
+{
+  int pbt = param->t & VT_BTYPE;
+  if ((param->t & (VT_ARRAY | VT_VLA | VT_VECTOR | VT_COMPLEX)) ||
+      !(pbt == VT_BOOL || pbt == VT_BYTE || pbt == VT_SHORT || pbt == VT_INT || pbt == VT_LLONG || pbt == VT_FLOAT ||
+        pbt == VT_DOUBLE || pbt == VT_LDOUBLE))
+    return 0;
+  return (arg->t & (VT_BTYPE | VT_UNSIGNED | VT_COMPLEX | VT_VECTOR)) != (param->t & (VT_BTYPE | VT_UNSIGNED));
 }
 
 /* Whether the call whose callee sits at vtop is a whole expression statement,
@@ -114,7 +454,7 @@ static int call_result_discarded(void)
   return tok == ';' && discarded_call_vtop != NULL && vtop - 1 == discarded_call_vtop;
 }
 
-void unary_funcall(void)
+static void unary_funcall_body(void)
 {
   int n, t, r, size, align;
   Sym *s;
@@ -130,6 +470,10 @@ void unary_funcall(void)
     /* pointer test (no array accepted) */
     if ((vtop->type.t & (VT_BTYPE | VT_ARRAY)) == VT_PTR)
     {
+      /* a byte-reversed pointer member (big-endian scalar_storage_order) is
+         loaded and swapped while it is still typed as a pointer */
+      if ((vtop->r & VT_LVAL) && vtop->sso_reversed)
+        gv(RC_INT);
       vtop->type = *pointed_type(&vtop->type);
       if ((vtop->type.t & VT_BTYPE) != VT_FUNC)
         goto error_func;
@@ -148,15 +492,22 @@ void unary_funcall(void)
   /* Save function symbol before switching to type ref - needed for nested_func check */
   Sym *call_func_sym = vtop->sym;
   s = vtop->type.ref;
+  /* A direct call (BL to the function itself) of an internal function takes
+   * its 8-byte aggregate in r0/r1 (gfunc_regpair_ret); through a pointer, the
+   * address is the AAPCS adapter's. */
+  Sym *regpair_callee =
+      (vtop->r & (VT_VALMASK | VT_LVAL | VT_SYM)) == (VT_CONST | VT_SYM) && vtop->c.i == 0 && call_func_sym &&
+              (call_func_sym->type.t & VT_BTYPE) == VT_FUNC && call_func_sym->type.ref == s
+          ? call_func_sym
+          : NULL;
   next();
 
-  /* If calling a nested function, emit SET_CHAIN to pass static chain (parent FP).
-   * Only emit when the caller is the callee's PARENT.  When the caller is
-   * itself a nested function (current_nested_func != NULL) and the callee is
-   * a sibling (defined in the same enclosing scope), R10 already holds the
-   * correct chain pointer from our own incoming chain — emitting SET_CHAIN
-   * would clobber it with R7 which may be an unrelated frame pointer. */
-  int set_chain_ir_idx = -1;
+  /* A call of a nested function passes its static chain, the frame of the
+   * function that defines the callee (nested_chain_level).  SET_CHAIN is
+   * emitted right before the FUNCCALL and takes effect at the branch, so the
+   * argument code still sees our own chain.  Level 1 (a sibling, our own
+   * incoming chain) is already in R10. */
+  int set_chain_level = -1;
   /* The nested function this call targets, if any.  Its nb_real_calls counts
    * the call sites that actually emitted a call: incremented here, decremented
    * again below wherever the body is inlined instead.  gen_function needs the
@@ -166,43 +517,19 @@ void unary_funcall(void)
   NestedFunc *call_nf = NULL;
   if (tcc_state->ir && call_func_sym && call_func_sym->a.nested_func)
   {
-    int emit_set_chain = 1;
     for (int ni = 0; ni < tcc_state->nb_nested_funcs; ni++)
     {
-      if (tcc_state->nested_funcs[ni].sym == call_func_sym)
+      if (tcc_state->nested_funcs[ni]->sym == call_func_sym)
       {
-        call_nf = &tcc_state->nested_funcs[ni];
+        call_nf = tcc_state->nested_funcs[ni];
         break;
       }
     }
     if (call_nf)
       call_nf->nb_real_calls++;
-    if (tcc_state->current_nested_func)
-    {
-      /* Caller is a nested function.  Determine if callee is our child
-       * (defined inside our body) or a sibling (defined in the same parent
-       * scope).  Only emit SET_CHAIN for child calls. */
-      if (call_nf && call_nf->parent_nf != tcc_state->current_nested_func)
-      {
-        /* Sibling call: R10 already has the correct parent FP */
-        emit_set_chain = 0;
-      }
-    }
-    if (emit_set_chain)
-    {
-      /* Emit SET_CHAIN: R10 = FP (current frame pointer) */
-      SValue src, dest;
-      svalue_init(&src);
-      svalue_init(&dest);
-      src.type.t = VT_PTR;
-      src.r = 0;
-      src.vr = -1;
-      dest.type.t = VT_PTR;
-      dest.r = 0;
-      dest.vr = -1;
-      set_chain_ir_idx = tcc_ir_count(tcc_state->ir);
-      tcc_ir_put(tcc_state->ir, TCCIR_OP_SET_CHAIN, &src, NULL, &dest);
-    }
+    set_chain_level = nested_chain_level(call_nf);
+    if (set_chain_level == 1)
+      set_chain_level = -1;
   }
 
   /* Each IR-level call gets a unique call_id so FUNCPARAM* can be bound
@@ -220,14 +547,30 @@ void unary_funcall(void)
   if (!NOEVAL_WANTED && tcc_state->ir)
     call_id = tcc_state->ir->next_call_id++;
 
+  /* An NRVO hint (expr_eq, a declaration's initializer) is for the first call
+   * of the right-hand side, the outermost one: taken now, so that no call
+   * among the arguments -- whose result is not the value assigned -- can
+   * claim the destination as its buffer. */
+  const int nrvo_hint = tcc_state->nrvo_target_active;
+  tcc_state->nrvo_target_active = 0;
+
   sa = s->next; /* first parameter */
   nb_args = regsize = 0;
   int nb_implicit_args = 0; /* sret pointer counted in nb_args but not saved_arg_count */
+  int sret_param_idx = -1;  /* IR index of the sret pointer's FUNCPARAMVAL */
+  /* Hard-float result in s0..s(n-1) (gfunc_sret_vfp_words): the buffer gets
+   * no hidden argument; the registers are stored into it after the call. */
+  int vfp_ret_words = 0;
+  SValue vfp_ret_ptr;
   /* compute first implicit argument if a composite type is returned */
   if ((s->type.t & VT_BTYPE) == VT_STRUCT || (s->type.t & VT_COMPLEX))
   {
     variadic = (s->f.func_type == FUNC_ELLIPSIS);
-    ret_nregs = gfunc_sret(&s->type, variadic, &ret.type, &ret_align, &regsize);
+    ret_nregs = gfunc_sret_fn(regpair_callee, &s->type, variadic, &ret.type, &ret_align, &regsize);
+    if (!gfunc_regpair_ret(regpair_callee))
+      regpair_callee = NULL;
+    if (ret_nregs == 0)
+      vfp_ret_words = gfunc_sret_vfp_words(&s->type, variadic);
     if (ret_nregs <= 0)
     {
       /* get some space for the returned structure */
@@ -264,7 +607,7 @@ void unary_funcall(void)
       int nrvo_ptr_vreg = -1;
       int sret_loc = 0;
       int callee_is_nested = (call_func_sym && call_func_sym->a.nested_func);
-      if (ret_nregs == 0 && tcc_state->nrvo_target_active &&
+      if (ret_nregs == 0 && nrvo_hint &&
           tcc_state->nrvo_target_size == size &&
           tcc_state->nrvo_target_align == align &&
           !callee_is_nested)
@@ -282,13 +625,14 @@ void unary_funcall(void)
           nrvo_vreg = tcc_state->nrvo_target_vreg;
         }
         nrvo_claimed = 1;
-        /* Consume the hint: nested calls inside this expression must not
-         * try to claim the same slot. */
-        tcc_state->nrvo_target_active = 0;
       }
       else
       {
-        loc = tcc_ir_frame_alloc_ret_temp(loc, size, -align);
+        /* At least word-aligned: tcc_ir_sret_dealias keeps a buffer only at
+         * a word-aligned address (an optimized callee may LDM/LDRD through
+         * it), so a char-array struct's temporary would get a second one --
+         * 256 KB more frame for tests2/119's big_struct. */
+        loc = tcc_ir_frame_alloc_ret_temp(loc, size, -(align < 4 ? 4 : align));
         tcc_ir_frame_note_type(loc, &s->type);
         sret_loc = loc;
       }
@@ -331,6 +675,12 @@ void unary_funcall(void)
         vtop--;
         print_vstack("unary, function call");
       }
+      else if (vfp_ret_words)
+      {
+        vfp_ret_ptr = *vtop;
+        pin_call_arg_temp_slot(vtop);
+        vtop--;
+      }
       else
       {
         /* ret_nregs == 0: struct is returned via an implicit first argument
@@ -349,7 +699,9 @@ void unary_funcall(void)
           num.c.i = TCCIR_ENCODE_PARAM(call_id, 0);
           LOG_CODEGEN("FUNCPARAMVAL push: site=sret_param0 call_id=%d param_idx=%d vtop_r=0x%x vtop_vr=%d", call_id,
                       TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), vtop->r, vtop->vr);
+          sret_param_idx = tcc_ir_count(tcc_state->ir);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+          pin_call_arg_temp_slot(vtop);
           tcc_ir_frame_note_sret_call(call_id, size);
         }
         vtop--;
@@ -396,6 +748,10 @@ void unary_funcall(void)
   int can_inline_eval = 0;
   int can_optimize_string_builtin = 0;
   int can_optimize_fputs_family = 0;
+  /* Folding/rewriting a call by its NAME is only valid when the callee is the
+   * library function: not a static function of this TU that reuses the name,
+   * and not under plain -fno-builtin.  The __builtin_ spellings always fold. */
+  int libcall_by_name_ok = 1;
   const char *func_name = NULL;
   int inl_first_obj = 0; /* frame objects of an inline expansion start here (tcc_ir_frame_scope_end) */
 
@@ -403,6 +759,9 @@ void unary_funcall(void)
   if (call_func_sym && call_func_sym->v >= TOK_IDENT)
   {
     func_name = get_tok_str(call_func_sym->v, NULL);
+    if (func_name && strncmp(func_name, "__builtin_", 10) != 0 &&
+        ((call_func_sym->type.t & VT_STATIC) || (tcc_state->no_builtin_funcs & NO_BUILTIN_ALL)))
+      libcall_by_name_ok = 0;
 
     /* Calling alloca() (library version) modifies SP; the caller
      * needs a frame pointer so the epilogue can restore SP. */
@@ -420,7 +779,8 @@ void unary_funcall(void)
     {
       int is_unsigned;
       can_inline_builtin =
-          get_builtin_abs_info(func_name, &is_unsigned) && builtin_abs_decl_matches(call_func_sym, func_name);
+          (get_builtin_abs_info(func_name, &is_unsigned) && builtin_abs_decl_matches(call_func_sym, func_name)) ||
+          !strcmp(func_name, "__multi3"); /* try_inline_multi3 */
     }
 
     can_optimize_string_builtin = resolve_str_builtin_id(call_func_sym->v, func_name) != STRBI_UNKNOWN;
@@ -439,8 +799,8 @@ void unary_funcall(void)
    * Also enter this path for non-static auto-inline candidates: they don't
    * have VT_INLINE (needed for correct ELF linkage) but should still be
    * inlined at call sites within this translation unit. */
-  if (call_func_sym && tcc_state->optimize &&
-      ((call_func_sym->type.t & VT_INLINE) ||
+  if (call_func_sym && TCC_OPT(tcc_state, optimize) &&
+      ((call_func_sym->type.t & VT_INLINE) || call_func_sym->a.guard_head ||
        (call_func_sym->type.ref &&
         (call_func_sym->type.ref->f.func_auto_inline || call_func_sym->type.ref->f.func_eval_only_inline))))
     can_inline_eval = 1;
@@ -460,7 +820,7 @@ void unary_funcall(void)
    * leftover the old unconditional refusal was written against. */
   int self_inline_ok = 0;
   if (can_inline_eval && call_func_sym == tcc_state->cur_func_sym &&
-      !tcc_state->in_inline_expansion && tcc_state->opt_inline_functions &&
+      !tcc_state->in_inline_expansion && TCC_OPT(tcc_state, opt_inline_functions) &&
       call_func_sym->type.ref && call_func_sym->type.ref->f.func_auto_inline &&
       !call_func_sym->a.nested_func)
   {
@@ -484,7 +844,7 @@ void unary_funcall(void)
   int pf_file_idx = -1;   /* index of FILE* arg, or -1 for stdout */
   int pf_vararg_idx = -1; /* index of first vararg in saved_args[], or high value for va_list fns */
   int pf_min_args = 0;    /* minimum number of args for a valid call */
-  if (func_name && tcc_state->optimize > 0)
+  if (func_name && TCC_OPT(tcc_state, optimize) > 0)
   {
     /* --- printf family (stdout, variadic) --- */
     if (strcmp(func_name, "printf") == 0 || strcmp(func_name, "printf_unlocked") == 0 ||
@@ -571,14 +931,18 @@ void unary_funcall(void)
    * 1. Save all argument tokens from the call site
    * 2. Count named (fixed) parameters of the callee
    * 3. Split into fixed arg tokens and variadic arg tokens
-   * 4. Create a clone of the inline function's token stream with
-   *    __builtin_va_arg_pack() replaced by the variadic arg tokens
-   * 5. Register the clone as a new inline function
-   * 6. Change the call target to the clone
-   * 7. Replay only the fixed arg tokens for normal call parsing
+   * 4. Parse the variadic args once for their types only
+   * 5. Create a clone of the inline function's token stream with
+   *    __builtin_va_arg_pack() replaced by extra parameters, one per
+   *    variadic arg, so the args are evaluated at the call in the caller's
+   *    scope (pasting their tokens re-resolved names in the callee's)
+   * 6. Register the clone as a new inline function
+   * 7. Change the call target to the clone
+   * 8. Replay all the arg tokens for normal call parsing
+   * Without code (sizeof, dead code) nothing is emitted: no clone needed.
    */
   if (call_func_sym && call_func_sym->type.ref && call_func_sym->type.ref->f.func_va_arg_pack &&
-      (call_func_sym->type.t & VT_INLINE) && !tcc_state->check_only)
+      (call_func_sym->type.t & VT_INLINE) && !tcc_state->check_only && !nocode_wanted)
   {
     /* Find the InlineFunc for this symbol */
     struct InlineFunc *orig_fn = NULL;
@@ -616,10 +980,9 @@ void unary_funcall(void)
       tok_str_add(all_args, TOK_EOF);
       /* tok is now ')' - don't consume it; file position is past ')' */
 
-      /* Split into fixed args and variadic args.
-       * Fixed args are separated by commas at depth 0. */
+      /* Find the variadic args: they follow the n_named-th comma at
+       * depth 0 (a compound literal's braces nest too). */
       const int *ap = tok_str_buf(all_args);
-      TokenString *fixed_args = tok_str_alloc();
       TokenString *va_args = tok_str_alloc();
 
       int arg_idx = 0;
@@ -650,9 +1013,9 @@ void unary_funcall(void)
           if (t == TOK_EOF || t == 0)
             break;
 
-          if (t == '(' || t == '[')
+          if (t == '(' || t == '[' || t == '{')
             depth++;
-          else if (t == ')' || t == ']')
+          else if (t == ')' || t == ']' || t == '}')
             depth--;
 
           if (t == ',' && depth == 0)
@@ -670,61 +1033,64 @@ void unary_funcall(void)
               }
               break;
             }
-            /* Copy the comma to fixed_args */
-            tok_str_add2(fixed_args, t, &cv);
-            continue;
           }
-
-          if (arg_idx < n_named)
-            tok_str_add2(fixed_args, t, &cv);
         }
       }
 
-      /* Terminate fixed_args with ')' and 0 (macro end marker).
-       * The arg parsing loop will see ')' and break.
-       * Then next() will read 0, triggering end_macro() which
-       * restores reading from the source file (positioned after ')'). */
-      tok_str_add(fixed_args, ')');
-      tok_str_add(fixed_args, 0);
       tok_str_add(va_args, TOK_EOF);
 
-      if (token_stream_references_local_object(tok_str_buf(va_args)))
-      {
-        TokenString *replay_args = tok_str_alloc();
-        const int *rp = tok_str_buf(all_args);
-
-        while (1)
-        {
-          int t;
-          CValue cv;
-
-          tok_get(&t, &rp, &cv);
-          if (t == TOK_EOF || t == 0)
-            break;
-          tok_str_add2(replay_args, t, &cv);
-        }
-        tok_str_add(replay_args, ')');
-        tok_str_add(replay_args, 0);
-
-        tok_str_free(all_args);
-        tok_str_free(fixed_args);
-        tok_str_free(va_args);
-
-        begin_macro(replay_args, 1);
-        next();
-        goto va_arg_pack_done;
-      }
-
-      /* Check if variadic args are empty */
-      int va_args_empty = 1;
+      /* The variadic args' types, parsed without code in the caller's scope:
+       * each becomes a parameter of the clone. */
+      static int va_pack_clone_id = 0;
+      int clone_id = va_pack_clone_id++;
+      int nb_va = 0;
+      CType *va_types = NULL;
+      int *va_toks = NULL;
       {
         const int *vcheck = tok_str_buf(va_args);
         int vt;
         CValue vcv;
         tok_get(&vt, &vcheck, &vcv);
         if (vt != TOK_EOF && vt != 0)
-          va_args_empty = 0;
+        {
+          TokenString *scan = tok_str_alloc();
+          const int *vp = tok_str_buf(va_args);
+          while (1)
+          {
+            tok_get(&vt, &vp, &vcv);
+            if (vt == TOK_EOF || vt == 0)
+              break;
+            tok_str_add2(scan, vt, &vcv);
+          }
+          tok_str_add(scan, TOK_EOF);
+          tok_str_add(scan, 0);
+          begin_macro(scan, 1);
+          next();
+          while (1)
+          {
+            CType ty;
+            char pname[64];
+            expr_type(&ty, expr_eq);
+            if (ty.t & VT_BITFIELD)
+              ty.t &= VT_BTYPE | VT_UNSIGNED;
+            ty.t &= ~(VT_STORAGE | VT_INLINE);
+            convert_parameter_type(&ty);
+            va_types = tcc_realloc(va_types, sizeof *va_types * (nb_va + 1));
+            va_toks = tcc_realloc(va_toks, sizeof *va_toks * (nb_va + 1));
+            va_types[nb_va] = ty;
+            snprintf(pname, sizeof pname, "__va_pack_%d_arg%d", clone_id, nb_va);
+            va_toks[nb_va] = tok_alloc(pname, strlen(pname))->tok;
+            nb_va++;
+            if (tok != ',')
+              break;
+            next();
+          }
+          if (tok != TOK_EOF)
+            expect(",");
+          end_macro();
+        }
       }
+      int va_args_empty = nb_va == 0;
 
       /* Create clone body: copy orig_fn->func_str, replacing
        * __builtin_va_arg_pack ( ) with variadic arg tokens.
@@ -732,6 +1098,8 @@ void unary_funcall(void)
       TokenString *clone_body = tok_str_alloc();
       const int *bp = tok_str_buf(orig_fn->func_str);
       int last_comma_len = -1; /* clone_body->len before last ',' was added */
+      int ident_ord = 0;       /* names so far, numbered as inline_body_free_names_unsafe walks them */
+      scoped_vector(int) spliced = {0};
       while (1)
       {
         int t;
@@ -756,17 +1124,17 @@ void unary_funcall(void)
           }
           else
           {
-            /* Insert variadic arg tokens */
-            const int *vp = tok_str_buf(va_args);
-            while (1)
+            /* Insert the clone's variadic parameters (its own names: the
+             * free-name walk skips them as spliced). */
+            vector_push_back(&spliced, ident_ord);
+            for (int vi = 0; vi < nb_va; vi++)
             {
-              int vt;
-              CValue vcv;
-              tok_get(&vt, &vp, &vcv);
-              if (vt == TOK_EOF || vt == 0)
-                break;
-              tok_str_add2(clone_body, vt, &vcv);
+              if (vi)
+                tok_str_add(clone_body, ',');
+              tok_str_add(clone_body, va_toks[vi]);
+              ident_ord++;
             }
+            vector_push_back(&spliced, ident_ord);
           }
           last_comma_len = -1;
           continue;
@@ -777,14 +1145,14 @@ void unary_funcall(void)
         else
           last_comma_len = -1;
 
+        ident_ord += t >= TOK_UIDENT;
         tok_str_add2(clone_body, t, &cv);
       }
       tok_str_add(clone_body, TOK_EOF);
 
       /* Create a unique symbol for the clone */
-      static int va_pack_clone_id = 0;
       char *clone_name = tcc_malloc(256);
-      snprintf(clone_name, 256, "__va_pack_%s_%d", get_tok_str(call_func_sym->v, NULL), va_pack_clone_id++);
+      snprintf(clone_name, 256, "__va_pack_%s_%d", get_tok_str(call_func_sym->v, NULL), clone_id);
       int clone_tok_id = tok_alloc(clone_name, strlen(clone_name))->tok;
       tcc_free(clone_name);
 
@@ -809,7 +1177,18 @@ void unary_funcall(void)
         *pparam = new_param;
         pparam = &new_param->next;
       }
+      for (int vi = 0; vi < nb_va; vi++)
+      {
+        int align;
+        Sym *new_param = sym_push2(&global_stack, va_toks[vi] | SYM_FIELD, va_types[vi].t, 0);
+        new_param->type = va_types[vi];
+        *pparam = new_param;
+        pparam = &new_param->next;
+        clone_ref->f.func_args += (type_size(&va_types[vi], &align) + PTR_SIZE - 1) / PTR_SIZE;
+      }
       *pparam = NULL;
+      tcc_free(va_types);
+      tcc_free(va_toks);
 
       clone_type.ref = clone_ref;
       clone_type.t &= ~VT_EXTERN;
@@ -827,6 +1206,11 @@ void unary_funcall(void)
       strcpy(clone_fn->filename, orig_fn->filename);
       clone_fn->sym = clone_sym;
       clone_fn->func_str = clone_body;
+      /* the caller's arguments bind at the call site: [count, start, end, ...] */
+      clone_fn->spliced = tcc_malloc(sizeof(int) * (spliced.size + 1));
+      clone_fn->spliced[0] = (int)spliced.size / 2;
+      if (spliced.size)
+        memcpy(clone_fn->spliced + 1, spliced.data, sizeof(int) * spliced.size);
       /* the clone replays the original's body: same #pragma pack state */
       if (orig_fn->pack)
       {
@@ -851,17 +1235,30 @@ void unary_funcall(void)
       sa = s->next;
       call_func_sym = clone_sym;
 
-      /* Replay fixed args + ')' via macro so normal call parsing handles them.
-       * When the macro ends (0 marker), next() restores file-level reading
-       * at the position just past the original ')'. */
-      begin_macro(fixed_args, 1);
-      next(); /* prime first token from fixed_args */
+      /* Replay all the args + ')' via macro so normal call parsing handles
+       * them, the variadic ones as the clone's extra parameters.  When the
+       * macro ends (0 marker), next() restores file-level reading at the
+       * position just past the original ')'. */
+      TokenString *replay_args = tok_str_alloc();
+      const int *rp = tok_str_buf(all_args);
+      while (1)
+      {
+        int t;
+        CValue cv;
+        tok_get(&t, &rp, &cv);
+        if (t == TOK_EOF || t == 0)
+          break;
+        tok_str_add2(replay_args, t, &cv);
+      }
+      tok_str_add(replay_args, ')');
+      tok_str_add(replay_args, 0);
+      begin_macro(replay_args, 1);
+      next(); /* prime first token from replay_args */
 
       tok_str_free(all_args);
       tok_str_free(va_args);
     }
   }
-va_arg_pack_done:
 
   p = NULL;
   if (tok != ')')
@@ -882,11 +1279,13 @@ va_arg_pack_done:
         /* IR expects 0-based parameter indices.
          * Keep FUNCPARAMVAL numbering consistent across all call sites. */
         expr_eq();
-        /* Convert VT_CMP/VT_JMP to actual 0/1 value before passing as
-         * parameter */
+        /* Materialize comparisons before applying the parameter conversion. */
         if (!NOEVAL_WANTED)
           tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
         gfunc_param_typed(s, sa);
+        /* Conversion to _Bool can leave a new VT_CMP on the value stack. */
+        if (!NOEVAL_WANTED)
+          tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
 
         /* Save argument for potential constant folding or inline evaluation.
          * This must happen BEFORE the double-complex materialization below,
@@ -976,6 +1375,7 @@ va_arg_pack_done:
                       "vtop_vr=%d",
                       call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), nb_args, vtop->r, vtop->vr);
           tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+          pin_call_arg_temp_slot(vtop);
         }
         vtop--; /* consumed */
       }
@@ -1003,6 +1403,8 @@ va_arg_pack_done:
       begin_macro(p, 1), next();
       expr_eq();
       gfunc_param_typed(s, sa);
+      if (!NOEVAL_WANTED)
+        tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
 
       /* Save argument for potential constant folding or inline evaluation (in reverse order for reverse_funcargs)
        */
@@ -1034,6 +1436,7 @@ va_arg_pack_done:
                     "vtop_vr=%d",
                     call_id, TCCIR_DECODE_PARAM_IDX((uint32_t)num.c.i), n, nb_args, vtop->r, vtop->vr);
         tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCPARAMVAL, vtop, &num, NULL);
+          pin_call_arg_temp_slot(vtop);
       }
       vtop--; /* consumed */
       end_macro();
@@ -1046,7 +1449,7 @@ va_arg_pack_done:
   /* Try constant folding for math functions */
   int folded = 0;
   int nb_real_args = nb_args - nb_implicit_args;
-  if (can_try_fold && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
+  if (can_try_fold && libcall_by_name_ok && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
   {
     folded = try_fold_math_call(func_name, saved_args, saved_arg_count);
     if (!folded)
@@ -1093,6 +1496,16 @@ va_arg_pack_done:
     }
   }
 
+  if (!folded && !inlined && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED &&
+      try_inline_multi3(func_name, call_func_sym, saved_args, saved_arg_count, &ret, ret_nregs, vfp_ret_words,
+                        nrvo_call_vreg, nrvo_call_ptr_vreg, call_id))
+  {
+    /* Move result over function pointer */
+    vtop[-1] = vtop[0];
+    --vtop;
+    inlined = 1;
+  }
+
   /* Try compile-time evaluation of small inline functions called with
    * constant arguments.  This enables patterns like:
    *   inline int f(int x) { return __builtin_constant_p(x); }
@@ -1108,8 +1521,6 @@ va_arg_pack_done:
       vtop[-1] = vtop[0];
       --vtop;
       tcc_state->ir->next_instruction_index = ir_idx_before_args;
-      if (set_chain_ir_idx >= 0 && tcc_state->ir)
-        tcc_state->ir->compact_instructions[set_chain_ir_idx].op = TCCIR_OP_NOP;
       if (call_nf && call_nf->nb_real_calls > 0)
         call_nf->nb_real_calls--;
       inline_evaled = 1;
@@ -1534,7 +1945,7 @@ va_arg_pack_done:
 
   int string_builtin_optimized = 0;
   if (!folded && !inlined && !inline_evaled && !sprintf_family_optimized && !printf_family_optimized &&
-      !fputs_family_optimized && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
+      !fputs_family_optimized && libcall_by_name_ok && func_name && saved_arg_count == nb_real_args && !NOEVAL_WANTED)
   {
     string_builtin_optimized =
         unary_funcall_opt_string_builtins(call_func_sym ? call_func_sym->v : 0, func_name, saved_args, nb_real_args,
@@ -1569,8 +1980,9 @@ va_arg_pack_done:
             * every depth but 0, so the nested attempt never starts. */
            (call_func_sym != tcc_state->cur_func_sym || self_inline_ok) &&
            /* Allow nested inlining under controlled conditions:
-            * - Void/struct/integer return, never a function already being
-            *   expanded (mutual recursion, pr22379), up to INLINE_NEST_MAX
+            * - Void/struct/integer return (bool too: zig.h's overflow
+            *   helpers), never a function already being expanded (mutual
+            *   recursion, pr22379), up to INLINE_NEST_MAX
             *   deep: zig.h's integer helpers nest five deep (saturating sub ->
             *   overflow sub -> truncate -> shift), under called-once bodies
             *   that nest as deep as zig's call chains, and a cap of 3 left the
@@ -1588,6 +2000,7 @@ va_arg_pack_done:
              ((call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID ||
               (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_STRUCT ||
               (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_PTR ||
+              (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_BOOL ||
               ((call_func_sym->type.ref->type.t & VT_BTYPE) <= VT_LLONG)))))
   {
     /* ---- Token-level inline expansion ----
@@ -1608,6 +2021,12 @@ va_arg_pack_done:
     if (call_func_sym->type.ref && call_func_sym->type.ref->f.func_alwinl &&
         !(inline_fn && inline_fn->func_str && inline_body_has_loops(inline_fn->func_str)))
       force_always_inline = 1;
+    /* Token replay binds the body's names in the caller's scope and gives a
+     * `static` local per site, so such an always_inline body stays a call. */
+    if (force_always_inline && inline_fn && inline_fn->func_str &&
+        (inline_body_has_static_local(inline_fn->func_str) ||
+         inline_body_has_unsafe_shadowed_ident(inline_fn->func_str, call_func_sym)))
+      force_always_inline = 0;
     /* Note: has_inline_asm no longer blocks always_inline expansion.
      * tccasm.c's maybe_substitute_inline_const_arg() substitutes constant
      * arguments for 'n'/'i' asm constraints during inline replay, so
@@ -1656,7 +2075,7 @@ va_arg_pack_done:
         saved_arg_count == nb_real_args &&
         inline_fn && inline_fn->func_str &&
         (saved_arg_count > 0 ||
-         (tcc_ir_lookup_func_purity(tcc_state, call_func_sym->v) == TCC_FUNC_PURITY_CONST &&
+         (tcc_ir_lookup_func_purity(tcc_state, func_cache_token(call_func_sym)) == TCC_FUNC_PURITY_CONST &&
           !inline_body_has_loops(inline_fn->func_str))))
     {
       int all_const = 1;
@@ -1705,10 +2124,10 @@ va_arg_pack_done:
      * that hurt value tracking in the caller.  Let IPC replace the call. */
     int skip_ipc_cached = 0;
     if (call_func_sym && call_func_sym->type.ref &&
-        call_func_sym->type.ref->f.func_eval_only_inline && tcc_state->opt_ipc)
+        call_func_sym->type.ref->f.func_eval_only_inline && TCC_OPT(tcc_state, opt_ipc))
     {
       int64_t _v; int _b;
-      if (tcc_ir_lookup_const_result(tcc_state, call_func_sym->v, &_v, &_b))
+      if (tcc_ir_lookup_const_result(tcc_state, func_cache_token(call_func_sym), &_v, &_b))
         skip_ipc_cached = 1;
     }
 
@@ -1737,10 +2156,12 @@ va_arg_pack_done:
      * __tcc_* helpers (mempcpy, memcpy, strcpy, etc.) — inlining them
      * prevents the redirect and preserves test-harness abort checks that
      * should be bypassed. */
-    if (!force_always_inline && !has_addr_of_label && inline_fn && inline_fn->func_str && !has_inline_asm &&
+    if (!force_always_inline && !has_addr_of_label && inline_fn && inline_fn->func_str &&
+        (!has_inline_asm || (TCC_OPT(tcc_state, optimize) > 0 && !tcc_ir_opt_pass_disabled("asm:machine_call") &&
+                             inline_body_asm_is_machine(inline_fn->func_str))) &&
         !func_has_label_addr && call_func_sym->type.ref && !skip_ipc_cached &&
         (call_func_sym->type.ref->f.func_auto_inline || eval_only_all_const) &&
-        !call_func_sym->type.ref->f.func_noinline && (tcc_state->opt_inline_functions || tcc_state->opt_inline_small) &&
+        !call_func_sym->type.ref->f.func_noinline && (TCC_OPT(tcc_state, opt_inline_functions) || TCC_OPT(tcc_state, opt_inline_small)) &&
         !strbi_is_redirect_target(resolve_str_builtin_id(0, func_name)) &&
         /* Don't inline a nested function with parent-scope captures unless
          * those captures are reachable from the current scope.  Reachable
@@ -1761,9 +2182,13 @@ va_arg_pack_done:
          * growth by the called_once_budget. */
         (call_func_sym->type.ref->f.func_called_once
              ? tcc_state->inline_expansion_depth < 32 && inline_fn->func_str->len <= tcc_state->called_once_budget
-             : auto_inline_sig_ok(call_func_sym) &&
+             : auto_inline_sig_ok(call_func_sym) && !inline_into_giant_caller(call_func_sym, inline_fn) &&
+                   !inline_wrapper_cap_hit(call_func_sym, inline_fn) &&
+                   /* a few-callers leaf: within its TU expansion count */
+                   (!call_func_sym->type.ref->f.func_inl_few_callers || inline_fn->few_callers_left > 0 ||
+                    inline_inside_moved_body()) &&
                    /* below the first level, within the caller's budget */
-                   (!tcc_state->in_inline_expansion || inline_fn->func_str->len <= TINY_INLINE_TOKENS ||
+                   (!tcc_state->in_inline_expansion || inline_body_budget_free(call_func_sym, inline_fn) ||
                     inline_fn->func_str->len <= tcc_state->nested_inline_budget)) &&
         /* Don't inline if call-site argument count doesn't match the function's
          * actual parameter count.  This can happen when calling through a cast
@@ -1771,15 +2196,10 @@ va_arg_pack_done:
          * where bar takes void).  Use nb_real_args to exclude the implicit sret
          * pointer that struct-returning calls add to nb_args. */
         auto_inline_param_count(call_func_sym) == (nb_args - nb_implicit_args) &&
-        /* Budget: a "call-heavy" auto-inline body (one whose optimized IR
-         * still contains a non-foldable call, e.g. a printf wrapper) buys no
-         * savings when duplicated — it just multiplies the surviving call.
-         * Cap how many times such a callee is expanded; beyond the budget,
-         * fall back to a normal call.  Without this, a small helper invoked
-         * dozens of times by macro expansion (check() in 55_lshift_type at
-         * -O2) blows up compiler memory ("memory full"). */
+        /* Non-wrapper call-heavy bodies retain the translation-unit expansion cap. */
         !(call_func_sym->type.ref->f.func_inline_call_heavy &&
-          inline_fn->inline_count >= 8) &&
+          (!call_func_sym->type.ref->f.func_inl_wrapper ||
+           tcc_ir_opt_pass_disabled("inline:wrapper_local_budget")) && inline_fn->inline_count >= 8) &&
         ((call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID || inline_body_has_return_stmt(inline_fn->func_str)))
     {
       /* Safety: if the current outer macro stream is already reading from this
@@ -1813,11 +2233,23 @@ va_arg_pack_done:
                           call_func_sym->type.ref ? (call_func_sym->type.ref->type.t & VT_BTYPE) : -1, nb_args,
                           nb_implicit_args);
         force_always_inline = 1;
+        if (!tcc_state->in_inline_expansion && !nocode_wanted && inline_fn->leaf_ops > 0)
+        {
+          tcc_state->inline_leaf_sites++;
+          tcc_state->inline_leaf_ops += inline_fn->leaf_ops;
+          tcc_state->inline_leaf_backedges += inline_fn->leaf_backedges;
+          tcc_state->inline_leaf_bounded += inline_fn->leaf_bounded;
+        }
+        if (call_func_sym->type.ref->f.func_inl_sret_loop ||
+            !call_func_sym->type.ref->f.func_inl_wrapper || !inline_inside_wrapper())
+          inline_fn->caller_count++;
         if (call_func_sym->type.ref->f.func_inline_call_heavy)
           inline_fn->inline_count++;
+        if (call_func_sym->type.ref->f.func_inl_few_callers && !inline_inside_moved_body())
+          inline_fn->few_callers_left--;
         if (call_func_sym->type.ref->f.func_called_once)
           tcc_state->called_once_budget -= inline_fn->func_str->len;
-        else if (tcc_state->in_inline_expansion && inline_fn->func_str->len > TINY_INLINE_TOKENS)
+        else if (tcc_state->in_inline_expansion && !inline_body_budget_free(call_func_sym, inline_fn))
           tcc_state->nested_inline_budget -= inline_fn->func_str->len;
       }
       else if (TCC_LOG_INLINE_STRUCT)
@@ -1840,15 +2272,15 @@ va_arg_pack_done:
                 "[auto-inline] callsite: NOT inlining %s: inline_fn=%p func_str=%p opt=%d/%d sig_ok=%d void=%d "
                 "has_ret=%d\n",
                 get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL), (void *)inline_fn,
-                inline_fn ? (void *)inline_fn->func_str : NULL, tcc_state->opt_inline_functions,
-                tcc_state->opt_inline_small, auto_inline_sig_ok(call_func_sym),
+                inline_fn ? (void *)inline_fn->func_str : NULL, TCC_OPT(tcc_state, opt_inline_functions),
+                TCC_OPT(tcc_state, opt_inline_small), auto_inline_sig_ok(call_func_sym),
                 (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID,
                 inline_fn && inline_fn->func_str ? inline_body_has_return_stmt(inline_fn->func_str) : -1);
       LOG_INLINE_STRUCT("[auto-inline] callsite: NOT inlining %s: inline_fn=%p func_str=%p opt=%d/%d sig_ok=%d "
                         "void=%d has_ret=%d auto_inline=%d",
                         get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL), (void *)inline_fn,
-                        inline_fn ? (void *)inline_fn->func_str : NULL, tcc_state->opt_inline_functions,
-                        tcc_state->opt_inline_small, auto_inline_sig_ok(call_func_sym),
+                        inline_fn ? (void *)inline_fn->func_str : NULL, TCC_OPT(tcc_state, opt_inline_functions),
+                        TCC_OPT(tcc_state, opt_inline_small), auto_inline_sig_ok(call_func_sym),
                         (call_func_sym->type.ref->type.t & VT_BTYPE) == VT_VOID,
                         inline_fn && inline_fn->func_str ? inline_body_has_return_stmt(inline_fn->func_str) : -1,
                         call_func_sym->type.ref->f.func_auto_inline);
@@ -1858,6 +2290,22 @@ va_arg_pack_done:
       LOG_INLINE_STRUCT("[auto-inline] callsite: SKIP %s: has_addr_of_label=%d func_auto_inline=%d",
                         get_tok_str(call_func_sym->v & ~SYM_FIELD, NULL), has_addr_of_label,
                         call_func_sym->type.ref->f.func_auto_inline);
+    }
+    /* Guard head (docs/inline_guard_heads.md): its own call stays a call, being in progress. */
+    if (!force_always_inline && !has_addr_of_label && !func_has_label_addr && call_func_sym->a.guard_head &&
+        !tcc_state->check_only && !nocode_wanted && TCC_OPT(tcc_state, optimize) >= 2 &&
+        !TCC_OPT(tcc_state, optimize_size) && !tcc_ir_opt_pass_disabled("inline:guard_head") &&
+        call_func_sym->type.ref && !call_func_sym->type.ref->f.func_noinline &&
+        tcc_state->inline_expansion_depth < INLINE_NEST_MAX && !inline_expansion_in_progress(call_func_sym) &&
+        auto_inline_param_count(call_func_sym) == (nb_args - nb_implicit_args))
+    {
+      InlineFunc *guard = guard_head_lookup(tcc_state, call_func_sym);
+      if (guard && !inline_body_has_unsafe_shadowed_ident(guard->func_str, call_func_sym) &&
+          !guard_head_captures_local(guard->guard_free))
+      {
+        inline_fn = guard;
+        force_always_inline = 1;
+      }
     }
     if (inline_fn && inline_fn->func_str && (has_addr_of_label || force_always_inline))
     {
@@ -1888,11 +2336,15 @@ va_arg_pack_done:
         /* No args — just roll back any FUNCPARAMVOID */
         tcc_state->ir->next_instruction_index = ir_idx_before_args;
       }
+      /* The sret pointer went out ahead of the argument span: with no call
+       * left to take it, it kept the return buffer's address escaping and
+       * its frame slot reserved. */
+      if (sret_param_idx >= 0 && sret_param_idx < tcc_state->ir->next_instruction_index &&
+          tcc_state->ir->compact_instructions[sret_param_idx].op == TCCIR_OP_FUNCPARAMVAL)
+        tcc_state->ir->compact_instructions[sret_param_idx].op = TCCIR_OP_NOP;
 
-      /* NOP out SET_CHAIN when inlining a nested function call —
-       * the inlined body accesses parent variables directly. */
-      if (set_chain_ir_idx >= 0 && tcc_state->ir)
-        tcc_state->ir->compact_instructions[set_chain_ir_idx].op = TCCIR_OP_NOP;
+      /* An inlined nested function call is not a real call (and emits no
+       * SET_CHAIN): the inlined body accesses parent variables directly. */
       if (call_nf && call_nf->nb_real_calls > 0)
         call_nf->nb_real_calls--;
 
@@ -1902,7 +2354,13 @@ va_arg_pack_done:
       int saved_inline_const_arg_count = tcc_state->inline_const_arg_count;
       tcc_state->inline_const_arg_count = 0;
       ++local_scope;            /* shadow caller's same-named variables */
-      Sym *param_sym = s->next; /* first parameter from function type */
+      /* The body binds its definition's parameters: an old-style one keeps
+       * them when a prototype (the call's type, s) is in scope. */
+      Sym *def_ref = call_func_sym && (call_func_sym->type.t & VT_BTYPE) == VT_FUNC && call_func_sym->type.ref &&
+                             call_func_sym->type.ref->f.func_type == FUNC_OLD
+                         ? call_func_sym->type.ref
+                         : s;
+      Sym *param_sym = def_ref->next; /* first parameter from function type */
       for (int pi = 0; pi < nb_args && param_sym; pi++, param_sym = param_sym->next)
       {
         int psize, palign;
@@ -1923,8 +2381,25 @@ va_arg_pack_done:
         Sym *psym = sym_push(pv, &param_sym->type, VT_LOCAL | VT_LVAL, loc);
         SValue arg_val = saved_args[pi];
         inline_eval_cast_arg_to_param(&arg_val, &param_sym->type);
+        /* A K&R definition's caller passes the promoted argument and the
+         * callee converts it to the parameter's type on entry (C11 6.9.1p10):
+         * so must the expansion.  Bound unconverted, `if (c < 0)` with a
+         * `signed char c` tested the int 200 and skipped the work. */
+        if (def_ref->f.func_type == FUNC_OLD && inline_knr_arg_needs_conversion(&arg_val.type, &param_sym->type))
+        {
+          vpushv(&arg_val);
+          gen_cast(&param_sym->type);
+          tcc_ir_codegen_cmp_jmp_set(tcc_state->ir);
+          arg_val = *vtop;
+          vtop--;
+        }
 
+        /* Only record the constant when the body never writes/addresses the
+         * parameter: tccasm.c's maybe_substitute_inline_const_arg() feeds it to
+         * inline-asm operands, and if the body assigns to the parameter first,
+         * the asm must see the new value, not the argument. */
         if (force_always_inline && inline_arg_is_constant_like(&saved_args[pi]) &&
+            !inline_body_writes_ident(inline_fn ? inline_fn->func_str : NULL, pv) &&
             tcc_state->inline_const_arg_count < countof(tcc_state->inline_const_args))
         {
           int map_idx = tcc_state->inline_const_arg_count++;
@@ -2007,6 +2482,7 @@ va_arg_pack_done:
       int saved_inline_return_loc = tcc_state->inline_return_loc;
       int saved_inline_return_vr = tcc_state->inline_return_vr;
       uint8_t saved_inline_return_redirected = tcc_state->inline_return_redirected;
+      uint8_t saved_inline_return_copied = tcc_state->inline_return_copied;
 
       /* Set up inline function context */
       func_vt = s->type; /* return type */
@@ -2089,6 +2565,7 @@ va_arg_pack_done:
       tcc_state->inline_return_loc = inline_ret_loc;
       tcc_state->inline_return_vr = inline_ret_vr;
       tcc_state->inline_return_redirected = 0;
+      tcc_state->inline_return_copied = 0;
       if (tcc_state->inline_expansion_depth < INLINE_NEST_MAX)
         tcc_state->inline_expansion_syms[tcc_state->inline_expansion_depth] = call_func_sym;
       tcc_state->inline_expansion_depth++;
@@ -2134,6 +2611,7 @@ va_arg_pack_done:
       tcc_state->inline_return_loc = saved_inline_return_loc;
       tcc_state->inline_return_vr = saved_inline_return_vr;
       tcc_state->inline_return_redirected = saved_inline_return_redirected;
+      tcc_state->inline_return_copied = saved_inline_return_copied;
       tcc_state->inline_expansion_depth--;
       func_vt = saved_func_vt;
       func_var = saved_func_var;
@@ -2193,7 +2671,7 @@ va_arg_pack_done:
       /* When in sizeof/typeof context, skip IR emission but still handle stack */
       --vtop;
     }
-    else if ((s->type.t & VT_BTYPE) == VT_VOID)
+    else if ((s->type.t & VT_BTYPE) == VT_VOID || vfp_ret_words)
     {
       /* In IR mode, make sure the call target is a VALUE (register/temp),
        * not an lvalue. Indirect calls like tabl1[i]() produce an lvalue
@@ -2220,7 +2698,10 @@ va_arg_pack_done:
         call_target = load_dest;
         call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
       }
+      emit_set_chain(set_chain_level);
+      tcc_state->regpair_direct_call = regpair_callee;
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVOID, &call_target, &call_id_sv, NULL);
+      tcc_state->regpair_direct_call = NULL;
       --vtop;
     }
     else
@@ -2253,7 +2734,10 @@ va_arg_pack_done:
         call_target = load_dest;
         call_target.r &= ~VT_LVAL; /* Clear VT_LVAL since we now have the value */
       }
+      emit_set_chain(set_chain_level);
+      tcc_state->regpair_direct_call = regpair_callee;
       tcc_ir_put(tcc_state->ir, TCCIR_OP_FUNCCALLVAL, &call_target, &call_id_sv, &dest);
+      tcc_state->regpair_direct_call = NULL;
       --vtop;
     }
 
@@ -2266,6 +2750,13 @@ va_arg_pack_done:
     }
     else if (ret_nregs == 0)
     {
+      /* Returned in s0..s(n-1): store them into the buffer before anything
+       * else can run (the store must follow the call directly). */
+      if (vfp_ret_words && !NOEVAL_WANTED)
+      {
+        const int cid = gen_vfp_ret_transfer(&vfp_ret_ptr, vfp_ret_words, 0);
+        tcc_ir_frame_note_sret_call(cid, type_size(&s->type, &align));
+      }
       /* Struct returned via sret pointer: the callee already wrote to the
        * sret buffer. Just push the buffer location as an lvalue. */
       vsetc(&ret.type, ret.r, &ret.c);
@@ -2288,7 +2779,7 @@ va_arg_pack_done:
       n = ret_nregs;
       while (n > 1)
       {
-        int rc = reg_classes[ret.r] & ~(RC_INT | RC_FLOAT);
+        int rc = RC_RET(ret.type.t);
         /* We assume that when a structure is returned in multiple
            registers, their classes are consecutive values of the
            suite s(n) = 2^n */
@@ -2303,7 +2794,12 @@ va_arg_pack_done:
       vtop->vr = return_vreg;
 
       /* handle packed struct return */
-      if (((s->type.t & VT_BTYPE) == VT_STRUCT) && ret_nregs)
+      /* A _Complex float returned in a register (hard-float: d0) is wider than
+       * one core register, so like a small struct it is parked in a frame
+       * temporary and then used as an lvalue; complex arithmetic and
+       * __real__/__imag__ address the value in memory. */
+      if ((((s->type.t & VT_BTYPE) == VT_STRUCT) ||
+           ((s->type.t & VT_COMPLEX) && type_size(&s->type, &align) > 4)) && ret_nregs)
       {
         int addr, offset;
 
@@ -2317,7 +2813,12 @@ va_arg_pack_done:
         tcc_ir_frame_note_type(loc, &s->type);
         addr = loc;
         offset = 0;
-        for (;;)
+        if (regpair_callee)
+        {
+          regpair_store_call_result(&s->type, addr);
+          ret_nregs = 0;
+        }
+        while (ret_nregs)
         {
           vset(&ret.type, VT_LOCAL | VT_LVAL, addr + offset);
           vswap();
@@ -2367,4 +2868,12 @@ va_arg_pack_done:
       tcc_tcov_block_end(tcc_state, -1);
     CODE_OFF();
   }
+}
+
+/* Temp slots pinned by this call's arguments are free again once it is lowered. */
+void unary_funcall(void)
+{
+  unsigned saved_pending = pending_call_temp_slots;
+  unary_funcall_body();
+  pending_call_temp_slots = saved_pending;
 }

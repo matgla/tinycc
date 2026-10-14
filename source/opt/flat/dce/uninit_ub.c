@@ -193,13 +193,13 @@ static int udr_function_provably_noreturn(TCCIRState *ir)
     /* A noreturn callee (exit/abort/...) would make `b .` hang instead of exit. */
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_FUNCCALLVOID:
-      if (tcc_ir_callee_is_noreturn(irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q))))
+      if (tcc_ir_callee_is_noreturn(tcc_ir_op_src1_sym(ir, q)))
         return 0;
       break;
     case TCCIR_OP_JUMP:
     case TCCIR_OP_JUMPIF:
     {
-      int jt = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+      int jt = (int)tcc_ir_op_dest_imm(ir, q);
       if (jt < 0)
         return 0;
       jt = udr_nopskip_target(ir, jt, n);
@@ -209,7 +209,7 @@ static int udr_function_provably_noreturn(TCCIRState *ir)
     }
     case TCCIR_OP_SWITCH_TABLE:
     {
-      int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id < 0 || table_id >= ir->num_switch_tables)
         return 0;
       TCCIRSwitchTable *t = &ir->switch_tables[table_id];
@@ -300,7 +300,7 @@ static int udr_observable_effect_reaches_return(TCCIRState *ir)
         break;
       case TCCIR_OP_JUMP:
       {
-        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+        int t = (int)tcc_ir_op_dest_imm(ir, q);
         if (t < 0)
         {
           r = 1; /* malformed target -> conservative */
@@ -315,7 +315,7 @@ static int udr_observable_effect_reaches_return(TCCIRState *ir)
       }
       case TCCIR_OP_JUMPIF:
       {
-        int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+        int t = (int)tcc_ir_op_dest_imm(ir, q);
         if (t < 0)
         {
           r = 1;
@@ -335,7 +335,7 @@ static int udr_observable_effect_reaches_return(TCCIRState *ir)
       }
       case TCCIR_OP_SWITCH_TABLE:
       {
-        int table_id = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+        int table_id = (int)tcc_ir_op_src2_imm(ir, q);
         if (table_id < 0 || table_id >= ir->num_switch_tables)
         {
           r = 1;
@@ -439,8 +439,7 @@ static void udr_prescan_addr_taken(TCCIRState *ir, uint8_t *addr_taken, int max_
     }
     if (q->op == TCCIR_OP_LEA && irop_config[q->op].has_src1)
     {
-      IROperand op = tcc_ir_op_get_src1(ir, q);
-      int32_t vr = irop_get_vreg(op);
+      int32_t vr = tcc_ir_op_src1_vreg(ir, q);
       if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(vr);
@@ -470,11 +469,11 @@ static int udr_entry_block_reads_uninit(TCCIRState *ir, const uint8_t *addr_take
   for (int i = 0; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_NOP)
-      continue;
-    /* Subsequent jump targets end the entry block. */
+    /* Subsequent jump targets end the entry block -- a NOP one too. */
     if (i > 0 && q->is_jump_target)
       break;
+    if (q->op == TCCIR_OP_NOP)
+      continue;
 
     /* Check src1 / src2 for read of an unwritten VAR. */
     for (int k = 1; k <= 2; k++)
@@ -503,8 +502,7 @@ static int udr_entry_block_reads_uninit(TCCIRState *ir, const uint8_t *addr_take
     /* Apply this op's WRITE after the read check (program order). */
     if (irop_config[q->op].has_dest)
     {
-      IROperand dop = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(dop);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -528,7 +526,7 @@ int tcc_ir_opt_uninit_local_ub(TCCIRState *ir)
   if (n == 0)
     return 0;
   /* O2-only: UB exploitation is too aggressive for lower levels. */
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
 
   /* The decisive scan only ever looks at the entry block, but the two guards it
@@ -558,25 +556,14 @@ int tcc_ir_opt_uninit_local_ub(TCCIRState *ir)
   LOG_IR_GEN("UNINIT-UB: collapsing function body to infinite loop (read of uninit local in entry block)");
 
   /* Replace the whole IR with a single self-jump; codegen emits `b .`. */
-  for (int i = 0; i < n; i++)
-  {
-    ir->compact_instructions[i].op = TCCIR_OP_NOP;
-    ir->compact_instructions[i].is_jump_target = 0;
-  }
+  ir_opt_nop_body(ir, n);
 
-  ir->compact_instructions[0].op = TCCIR_OP_JUMP;
-  ir->compact_instructions[0].is_jump_target = 1;
-  IROperand self = irop_make_imm32(-1, 0, IROP_BTYPE_INT32);
-  tcc_ir_set_dest(ir, 0, self);
-  tcc_ir_set_src1(ir, 0, IROP_NONE);
-  tcc_ir_set_src2(ir, 0, IROP_NONE);
+  ir_opt_set_self_jump0(ir);
 
   ir->leaffunc = 1;
 
   return 1;
 }
-
-int tcc_ir_opt_uninit_local_ub_ex(IROptCtx *ctx) { return tcc_ir_opt_uninit_local_ub(ctx->ir); }
 
 /* Uninit-read-dominates-return — extends uninit_local_ub from "entry block" to
  * any read of an uninit local that dominates every RETURN. Such a read makes
@@ -588,7 +575,7 @@ int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir)
   int n = ir->next_instruction_index;
   if (n == 0)
     return 0;
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
 
   /* Guard order below is by cost, not by logic: every one of these is a pure
@@ -639,8 +626,7 @@ int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir)
 
     if (irop_config[q->op].has_dest)
     {
-      IROperand dop = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(dop);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       if (dvr >= 0 && TCCIR_DECODE_VREG_TYPE(dvr) == TCCIR_VREG_TYPE_VAR)
       {
         int pos = TCCIR_DECODE_VREG_POSITION(dvr);
@@ -704,8 +690,7 @@ int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir)
     int is_implicit_ret = 0;
     if (op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
     {
-      IROperand d = tcc_ir_op_get_dest(ir, rq);
-      int t = (int)irop_get_imm64_ex(ir, d);
+      int t = (int)tcc_ir_op_dest_imm(ir, rq);
       if (t >= n)
         is_implicit_ret = 1;
     }
@@ -731,30 +716,15 @@ int tcc_ir_opt_uninit_dominates_return(TCCIRState *ir)
   LOG_IR_GEN("UNINIT-DOM-RETURN: collapsing function body to infinite loop "
              "(uninit VAR read at i=%d dominates all RETURNs)", uninit_read_idx);
 
-  for (int i = 0; i < n; i++)
-  {
-    ir->compact_instructions[i].op = TCCIR_OP_NOP;
-    ir->compact_instructions[i].is_jump_target = 0;
-  }
+  ir_opt_nop_body(ir, n);
 
-  ir->compact_instructions[0].op = TCCIR_OP_JUMP;
-  ir->compact_instructions[0].is_jump_target = 1;
-  IROperand self = irop_make_imm32(-1, 0, IROP_BTYPE_INT32);
-  tcc_ir_set_dest(ir, 0, self);
-  tcc_ir_set_src1(ir, 0, IROP_NONE);
-  tcc_ir_set_src2(ir, 0, IROP_NONE);
+  ir_opt_set_self_jump0(ir);
 
-  ir->ls.dirty_registers = 0;
-  ir->ls.dirty_float_registers = 0;
-  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
-    memset(ir->ls.live_regs_by_instruction, 0,
-           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
-  ir->leaffunc = 1;
+  ir_opt_reset_body_regs(ir);
   ir->noreturn = 1;
-  if (tcc_state && tcc_state->cur_func_sym && tcc_state->cur_func_sym->type.ref)
+  /* A weak body may be replaced by a strong one that returns. */
+  if (tcc_state && tcc_state->cur_func_sym && tcc_state->cur_func_sym->type.ref && !tcc_state->cur_func_sym->a.weak)
     tcc_state->cur_func_sym->type.ref->f.func_noreturn = 1;
 
   return 1;
 }
-
-int tcc_ir_opt_uninit_dominates_return_ex(IROptCtx *ctx) { return tcc_ir_opt_uninit_dominates_return(ctx->ir); }

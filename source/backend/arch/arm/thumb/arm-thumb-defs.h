@@ -218,6 +218,7 @@ struct ThumbGenCallSite
   int registers_map;
   int *function_argument_list;
   int function_argument_count;
+  int function_argument_capacity;
   int used_stack_size;
 };
 
@@ -309,9 +310,17 @@ typedef struct thumb_asm_suffix {
     uint8_t has_suffix; /* 1 if any suffix was present */
 } thumb_asm_suffix;
 
-/* Condition code name to value mapping structure */
+/* Condition code name to value mapping structure.  This header can come
+ * before tcc.h, which defines TCC_RODATA_REL the same way. */
+#ifndef TCC_RODATA_REL
+#ifdef __TINYC_RODATA_RELATIVE__
+#define TCC_RODATA_REL __rodata_relative
+#else
+#define TCC_RODATA_REL
+#endif
+#endif
 typedef struct cond_name_entry {
-    const char *name;
+    const char *TCC_RODATA_REL name;
     int code;
 } cond_name_entry_t;
 

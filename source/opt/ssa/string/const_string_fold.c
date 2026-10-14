@@ -55,6 +55,11 @@ static int const_string_fold_core(TCCIRState *ir, IRSSAOptCtx *ctx)
   int changes = 0;
 
   ensure_index_built();
+  /* The handlers' evaluators ask single-def and defining-instruction
+   * questions per call argument, each a function scan without the vreg
+   * index.  can_fold only reads; a fold edits the IR its own way, so the
+   * index is marked stale after each one. */
+  int vidx = tcc_ir_vreg_index_open(ir);
 
   for (int i = 0; i < ir->next_instruction_index; i++)
   {
@@ -67,7 +72,7 @@ static int const_string_fold_core(TCCIRState *ir, IRSSAOptCtx *ctx)
     if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
 
-    callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
 
@@ -86,9 +91,13 @@ static int const_string_fold_core(TCCIRState *ir, IRSSAOptCtx *ctx)
     c.is_valued = (q->op == TCCIR_OP_FUNCCALLVAL);
 
     if (h->can_fold(&c))
+    {
       changes += h->fold(&c);
+      tcc_ir_vreg_index_dirty(ir);
+    }
   }
 
+  tcc_ir_vreg_index_close(ir, vidx);
   return changes;
 }
 

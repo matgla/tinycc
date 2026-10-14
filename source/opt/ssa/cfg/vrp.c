@@ -35,7 +35,9 @@
 
 /* Endpoints are int32: every seeding path clamps to the int32 domain before storing, and sv_set
  * drops anything that would not fit.  Only the intermediate math below runs in int64. */
-typedef struct { int32_t lo, hi; uint8_t valid; } SVRange;
+/* nz: the value is known non-zero where no single signed interval says so (`x >u 0`).
+ * sign64: a 64-bit value has no range here, only a known sign (1 >= 0, -1 < 0, 0 unknown). */
+typedef struct { int32_t lo, hi; uint8_t valid, nz; int8_t sign64; } SVRange;
 typedef struct { int slot; SVRange prev; } SVUndo;
 
 /* Inline-first per-function scratch (heap only past the inline cap).  Caps measured over
@@ -218,6 +220,7 @@ typedef struct
   int slot;         /* x's tracking slot, or -1 */
   int64_t c;
   int c_ok;
+  int swapped;      /* `CMP #c,x`: the reader's condition token applies to (c, x) */
 } SVCmp;
 
 /* Decode `CMP x,#c`, or `TEST_ZERO x` as x vs 0; 0 unless the rhs is an immediate. */
@@ -230,6 +233,7 @@ static int sv_read_cmp(SVState *s, int cmp_idx, SVCmp *out)
    * test 393). */
   if (tcc_ir_barrel_shift_at(ir, cq))
     return 0;
+  out->swapped = 0;
   if (cq->op == TCCIR_OP_TEST_ZERO)
   {
     out->x = tcc_ir_op_get_src1(ir, cq);
@@ -244,10 +248,20 @@ static int sv_read_cmp(SVState *s, int cmp_idx, SVCmp *out)
     out->c_ok = 1;
     return 1;
   }
+  IROperand cs1 = tcc_ir_op_get_src1(ir, cq);
   IROperand cs2 = tcc_ir_op_get_src2(ir, cq);
+  /* `CMP #c,x` (a rotated loop's `0 < n` guard): read as x against c; the
+   * callers swap the condition token. */
+  if (!irop_is_immediate(cs2) && irop_is_immediate(cs1) && !cs1.is_sym)
+  {
+    IROperand t = cs1;
+    cs1 = cs2;
+    cs2 = t;
+    out->swapped = 1;
+  }
   if (!irop_is_immediate(cs2))
     return 0;
-  out->x = tcc_ir_op_get_src1(ir, cq);
+  out->x = cs1;
   out->c_op = cs2;
   out->xvr = irop_get_vreg(out->x);
   out->slot = sv_operand_slot(s, out->x);
@@ -424,6 +438,22 @@ static void sv_set(SVState *s, int slot, int64_t lo, int64_t hi)
   s->ranges[slot].hi = (int32_t)hi;
 }
 
+static void sv_set_sign64(SVState *s, int slot, int sign)
+{
+  SVUndo entry = { slot, s->ranges[slot] };
+  SVUndoVec_push_back(s->log, entry);
+  s->ranges[slot].sign64 = (int8_t)sign;
+}
+
+static void sv_set_nonzero(SVState *s, int slot)
+{
+  if (s->ranges[slot].nz)
+    return;
+  SVUndo entry = { slot, s->ranges[slot] };
+  SVUndoVec_push_back(s->log, entry);
+  s->ranges[slot].nz = 1;
+}
+
 /* Meet a new fact with any range already in scope; an empty meet marks a dead path — skip. */
 static void sv_set_intersect(SVState *s, int slot, int64_t lo, int64_t hi)
 {
@@ -473,7 +503,7 @@ static void sv_jumpif_edges(IRSSAOptCtx *ctx, int jmp_idx, int *target_block, in
   TCCIRState *ir = ctx->ir;
   IRCFG *cfg = ctx->cfg;
   int n = cfg->num_instrs;
-  int target = (int)tcc_ir_op_get_dest(ir, &ir->compact_instructions[jmp_idx]).u.imm32;
+  int target = (int)tcc_ir_op_dest_u_imm32(ir, &ir->compact_instructions[jmp_idx]);
   int ft = ir_skip_nops_forward(ir, jmp_idx + 1, n);
   *target_block = (target >= 0 && target < n) ? cfg->instr_to_block[target] : -1;
   *ft_block = (ft < n) ? cfg->instr_to_block[ft] : -1;
@@ -662,6 +692,98 @@ static void sv_seed_bitop(SVState *s, IRQuadCompact *q, int dslot, int op,
     sv_set(s, dslot, xlo >> k, xhi >> k);
 }
 
+/* SAR #k bounds any 32-bit value to [INT32_MIN>>k, INT32_MAX>>k] — the shape `(intN_t)x`
+ * lowers to (SHL #k; SAR #k) before it becomes an SBFX. */
+static void sv_seed_sar_width(SVState *s, IRQuadCompact *q, int dslot, IROperand src1, IROperand src2)
+{
+  int64_t k;
+  if (!irop_is_plain_imm(src2) || !sv_read_const32(s->ctx->ir, src2, &k) || k < 1 || k > 31)
+    return;
+  if (src1.btype != IROP_BTYPE_INT32 || tcc_ir_op_get_dest(s->ctx->ir, q).btype != IROP_BTYPE_INT32)
+    return;
+  sv_set_intersect(s, dslot, (int64_t)INT32_MIN >> k, (int64_t)INT32_MAX >> k);
+}
+
+/* Bits common to every value of [lo,hi]: the shared leading prefix of the two endpoints.
+ * Only for a range that does not straddle zero, where unsigned order matches signed order. */
+static int sv_range_known_bits(int64_t lo, int64_t hi, uint32_t *ones, uint32_t *zeros)
+{
+  if ((lo < 0) != (hi < 0))
+    return 0;
+  uint32_t ulo = (uint32_t)lo, diff = ulo ^ (uint32_t)hi;
+  uint32_t prefix = 0xFFFFFFFFu;
+  while (diff)
+  {
+    prefix <<= 1;
+    diff >>= 1;
+  }
+  *ones = ulo & prefix;
+  *zeros = ~ulo & prefix;
+  return 1;
+}
+
+/* `d <- x AND #k` / `d <- x OR #k` whose mask cannot change any value of x's range is
+ * `d <- x`.  zig.h's full-width signed truncate (x & SIGN) ? x | MIN : x & MAX is exactly
+ * this once the branch edge bounds x to one sign (sv_enter_and_test). */
+static int sv_try_fold_mask_identity(IRSSAOptCtx *ctx, SVState *s, int idx)
+{
+  TCCIRState *ir = ctx->ir;
+  IRQuadCompact *q = &ir->compact_instructions[idx];
+  int op = q->op;
+  if (op != TCCIR_OP_AND && op != TCCIR_OP_OR && op != TCCIR_OP_SBFX && op != TCCIR_OP_UBFX)
+    return 0;
+  if (tcc_ir_barrel_shift_at(ir, q))
+    return 0;
+  IROperand dest = tcc_ir_op_get_dest(ir, q);
+  IROperand src1 = tcc_ir_op_get_src1(ir, q);
+  IROperand src2 = tcc_ir_op_get_src2(ir, q);
+  if (dest.is_lval || dest.is_sym || irop_is_immediate(src1) || !irop_is_plain_imm(src2))
+    return 0;
+  if (dest.btype == IROP_BTYPE_INT64 && src1.btype == IROP_BTYPE_INT64 && op != TCCIR_OP_SBFX &&
+      op != TCCIR_OP_UBFX)
+  {
+    /* A known sign decides only the sign-bit masks: x >= 0 keeps x & (INT64_MAX | anything),
+     * x < 0 keeps x | INT64_MIN. */
+    int sl = sv_operand_slot(s, src1);
+    uint64_t uk = (uint64_t)irop_get_imm64_ex(ir, src2), sign = (uint64_t)1 << 63;
+    int known = sl >= 0 ? s->ranges[sl].sign64 : 0;
+    if (op == TCCIR_OP_AND ? !(known > 0 && (uk | sign) == ~(uint64_t)0)
+                           : !(known < 0 && uk == sign))
+      return 0;
+    q->op = TCCIR_OP_ASSIGN;
+    tcc_ir_set_src2_none(ir, idx);
+    return 1;
+  }
+  int64_t k, lo, hi;
+  if (!sv_read_const32(ir, src2, &k) || !sv_operand_range(s, src1, &lo, &hi))
+    return 0;
+  if (op == TCCIR_OP_SBFX || op == TCCIR_OP_UBFX)
+  {
+    /* A bit-0 field as wide as every value of x: (intN_t)x of an x that already fits.
+     * The copy keeps the bits, so dest must read them the same way: same btype. */
+    int width = (int)((k >> 5) & 0x1F);
+    if ((k & 0x1F) != 0 || (k & UBFX_HI_HALF) || width == 0 || dest.btype != src1.btype ||
+        dest.is_unsigned != src1.is_unsigned)
+      return 0;
+    int64_t flo = op == TCCIR_OP_SBFX ? -((int64_t)1 << (width - 1)) : 0;
+    int64_t fhi = op == TCCIR_OP_SBFX ? ((int64_t)1 << (width - 1)) - 1 : ((int64_t)1 << width) - 1;
+    if (lo < flo || hi > fhi)
+      return 0;
+  }
+  else
+  {
+    uint32_t ones, zeros, uk = (uint32_t)k;
+    if (dest.btype != IROP_BTYPE_INT32 || src1.btype != IROP_BTYPE_INT32 ||
+        !sv_range_known_bits(lo, hi, &ones, &zeros))
+      return 0;
+    if (op == TCCIR_OP_AND ? (~uk & ~zeros) != 0 : (uk & ~ones) != 0)
+      return 0;
+  }
+  q->op = TCCIR_OP_ASSIGN;
+  tcc_ir_set_src2_none(ir, idx);
+  return 1;
+}
+
 /* Seed dest's range from a value-producing def; SSA is single-def so no kill is needed. */
 static void sv_seed_def(SVState *s, IRQuadCompact *q)
 {
@@ -694,7 +816,11 @@ static void sv_seed_def(SVState *s, IRQuadCompact *q)
   else if (op == TCCIR_OP_ADD || op == TCCIR_OP_SUB)
     sv_seed_addsub(s, dslot, op, src1, src2);
   else if (op == TCCIR_OP_AND || op == TCCIR_OP_SHL || op == TCCIR_OP_SAR || op == TCCIR_OP_SHR)
+  {
     sv_seed_bitop(s, q, dslot, op, src1, src2);
+    if (op == TCCIR_OP_SAR)
+      sv_seed_sar_width(s, q, dslot, src1, src2);
+  }
   else if (op == TCCIR_OP_MUL || op == TCCIR_OP_DIV || op == TCCIR_OP_UDIV ||
            op == TCCIR_OP_UMOD || op == TCCIR_OP_IMOD)
     sv_seed_muldiv(s, dslot, op, src1, src2);
@@ -765,10 +891,16 @@ static int sv_cmp_verdict(SVState *s, int cmp_idx, int tok, SVCmp *cmp, int32_t 
   cmp->xvr = -1;
   if (tok < 0)
     return -1;
+  /* Deciding the compare must not delete the reads it is made of: a volatile access is
+   * mandated however decidable the comparison is (`x >=u 0` still reads x). */
+  if (tcc_ir_instr_access_is_volatile(ir, &ir->compact_instructions[cmp_idx]))
+    return -1;
   /* A deref/sym x yields slot = -1 (the base vreg's range describes the wrong value), which
    * disables only the range fold; the tautology-vs-0 path below holds for any value. */
   if (sv_read_cmp(s, cmp_idx, cmp))
   {
+    if (cmp->swapped && (tok = vrp_swap_cmp_tok(tok)) < 0)
+      return -1;
     int verdict = -1;
     if (irop_get_imm64_ex(ir, cmp->c_op) == 0)   /* tautology vs 0, no range needed */
     {
@@ -787,6 +919,14 @@ static int sv_cmp_verdict(SVState *s, int cmp_idx, int tok, SVCmp *cmp, int32_t 
         verdict = tok == VRP_TOK_GE;
       else if (cmp->c == INT32_MAX && (tok == VRP_TOK_GT || tok == VRP_TOK_LE))
         verdict = tok == VRP_TOK_LE;
+    }
+    if (verdict < 0 && cmp->slot >= 0 && s->ranges[cmp->slot].nz && cmp->c_ok && cmp->c == 0 &&
+        cmp->x.btype == IROP_BTYPE_INT32)
+    {
+      if (tok == VRP_TOK_EQ || tok == VRP_TOK_ULE)
+        verdict = 0;
+      else if (tok == VRP_TOK_NE || tok == VRP_TOK_UGT)
+        verdict = 1;
     }
     if (verdict < 0 && cmp->slot >= 0 && s->ranges[cmp->slot].valid && cmp->c_ok)
       verdict = sv_range_verdict(s->ranges[cmp->slot].lo, s->ranges[cmp->slot].hi, cmp->c, tok);
@@ -826,7 +966,7 @@ static int sv_try_fold_jumpif(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int jmp
 {
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *jq = &ir->compact_instructions[jmp_idx];
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, jq);
 
   SVCmp cmp;
   int32_t b_vr;
@@ -860,8 +1000,9 @@ static int sv_try_fold_regreg(IRSSAOptCtx *ctx, int block, int cmp_idx, int jmp_
   if (sv_first_real(ir, bb->start_idx, bb->end_idx) != cmp_idx)
     return 0;
 
-  /* Only the pred's JUMPIF runs between the two CMPs — no store — so even lval operands hold
-   * identical values at both, provided the full operand identity (vreg + flags) matches. */
+  /* Only the pred's JUMPIF runs between the two CMPs — no store — so even non-volatile lval
+   * operands hold identical values at both, provided the full operand identity (vreg + flags)
+   * matches. */
   IRQuadCompact *cq = &ir->compact_instructions[cmp_idx];
   IROperand a_op = tcc_ir_op_get_src1(ir, cq), b_op = tcc_ir_op_get_src2(ir, cq);
   int32_t a = irop_get_vreg(a_op);
@@ -878,6 +1019,11 @@ static int sv_try_fold_regreg(IRSSAOptCtx *ctx, int block, int cmp_idx, int jmp_
     return 0;
   IRQuadCompact *pcq = &ir->compact_instructions[pcmp];
   IROperand pa_op = tcc_ir_op_get_src1(ir, pcq), pb_op = tcc_ir_op_get_src2(ir, pcq);
+
+  /* Each volatile read is a separate mandated access, so the second CMP does not repeat the
+   * first one's value, and folding it would delete the second read. */
+  if (tcc_ir_instr_access_is_volatile(ir, cq) || tcc_ir_instr_access_is_volatile(ir, pcq))
+    return 0;
 
   int eff = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, &ir->compact_instructions[jmp_idx]));
   if (sv_same_operand(a_op, pa_op) && sv_same_operand(b_op, pb_op))
@@ -896,7 +1042,7 @@ static int sv_try_fold_regreg(IRSSAOptCtx *ctx, int block, int cmp_idx, int jmp_
   if (block != ft_block || block == target_block)
     return 0;
 
-  int known = vrp_negate_cmp_tok((int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, pjq)));
+  int known = vrp_negate_cmp_tok((int)tcc_ir_op_src1_imm(ir, pjq));
   if (known < 0)
     return 0;
 
@@ -920,7 +1066,7 @@ static int sv_try_fold_setif(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int set_
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *cq = &ir->compact_instructions[cmp_idx];
   IRQuadCompact *sq = &ir->compact_instructions[set_idx];
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, sq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, sq);
 
   SVCmp cmp;
   int32_t b_vr;
@@ -931,7 +1077,7 @@ static int sv_try_fold_setif(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int set_
   IROperand set_dest = tcc_ir_op_get_dest(ir, sq);
   cq->op = TCCIR_OP_NOP;
   sq->op = TCCIR_OP_ASSIGN;
-  tcc_ir_set_src1(ir, set_idx, irop_make_imm32(-1, v, IROP_BTYPE_INT32));
+  tcc_ir_set_src1_imm32(ir, set_idx, v, IROP_BTYPE_INT32);
   tcc_ir_op_set_dest(ir, sq, set_dest);
 
   sv_drop_cmp_use(ctx, cmp.xvr, cmp_idx);
@@ -945,7 +1091,7 @@ static int sv_try_fold_select(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int sel
   TCCIRState *ir = ctx->ir;
   IRQuadCompact *cq = &ir->compact_instructions[cmp_idx];
   IRQuadCompact *sq = &ir->compact_instructions[sel_idx];
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_cond(ir, sq));
+  int tok = (int)tcc_ir_op_cond_imm(ir, sq);
 
   SVCmp cmp;
   int32_t b_vr;
@@ -953,8 +1099,8 @@ static int sv_try_fold_select(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int sel
   if (v < 0 || sv_next_reads_flags(ir, sel_idx))
     return 0;
 
-  IROperand chosen = v ? tcc_ir_op_get_src1(ir, sq) : tcc_ir_op_get_src2(ir, sq);
-  IROperand dropped = v ? tcc_ir_op_get_src2(ir, sq) : tcc_ir_op_get_src1(ir, sq);
+  IROperand chosen = tcc_ir_op_get_src1_or_2(ir, sq, !v);
+  IROperand dropped = tcc_ir_op_get_src1_or_2(ir, sq, v);
   IROperand sel_dest = tcc_ir_op_get_dest(ir, sq);
   cq->op = TCCIR_OP_NOP;
   sq->op = TCCIR_OP_ASSIGN;
@@ -968,6 +1114,75 @@ static int sv_try_fold_select(IRSSAOptCtx *ctx, SVState *s, int cmp_idx, int sel
 }
 
 /* --------------------------------------------------------------- domwalk hooks */
+
+/* An edge of `T <- x AND #k ; T ==/!= 0` (CMP T,#0 or TEST_ZERO T) bounds x.
+ * 32-bit x: when k reaches x's sign bit m (the top bit of k, with x in [-2^m, 2^m-1];
+ * m = 31 always qualifies), `== 0` clears the sign and every bit of k, so x is in
+ * [0, ~k & (2^m-1)]; `!= 0` with k == 2^m sets it, x in [-2^m,-1].
+ * 64-bit x has no range, only a sign: `== 0` with bit 63 in k is x >= 0, `!= 0` with
+ * k == bit 63 alone is x < 0. */
+static void sv_enter_and_test(SVState *s, int cmp_idx, int eff_tok)
+{
+  if (eff_tok != VRP_TOK_EQ && eff_tok != VRP_TOK_NE)
+    return;
+  TCCIRState *ir = s->ctx->ir;
+  IRQuadCompact *cq = &ir->compact_instructions[cmp_idx];
+  if (tcc_ir_barrel_shift_at(ir, cq))
+    return;
+  IROperand t = tcc_ir_op_get_src1(ir, cq);
+  if (cq->op == TCCIR_OP_CMP)
+  {
+    IROperand c = tcc_ir_op_get_src2(ir, cq);
+    if (!irop_is_plain_imm(c) || irop_get_imm64_ex(ir, c) != 0)
+      return;
+  }
+  int32_t tvr = irop_get_vreg(t);
+  int is64 = t.btype == IROP_BTYPE_INT64;
+  if (t.is_lval || t.is_sym || (t.btype != IROP_BTYPE_INT32 && !is64) ||
+      tvr < 0 || TCCIR_DECODE_VREG_TYPE(tvr) != TCCIR_VREG_TYPE_TEMP)
+    return;
+  IRSSAVregInfo *vi = ssa_opt_vinfo(s->ctx, tvr);
+  if (!vi || vi->def_instr < 0 || ssa_opt_def_total(vi) != 1)
+    return;
+  IRQuadCompact *dq = &ir->compact_instructions[vi->def_instr];
+  if (dq->op != TCCIR_OP_AND || tcc_ir_barrel_shift_at(ir, dq))
+    return;
+  IROperand x = tcc_ir_op_get_src1(ir, dq), kop = tcc_ir_op_get_src2(ir, dq);
+  if (x.btype != t.btype || tcc_ir_op_get_dest(ir, dq).btype != t.btype || !irop_is_plain_imm(kop))
+    return;
+  int xslot = sv_operand_slot(s, x);
+  if (xslot < 0)
+    return;
+  if (is64)
+  {
+    uint64_t uk = (uint64_t)irop_get_imm64_ex(ir, kop), sign = (uint64_t)1 << 63;
+    if (eff_tok == VRP_TOK_EQ && (uk & sign))
+      sv_set_sign64(s, xslot, 1);
+    else if (eff_tok == VRP_TOK_NE && uk == sign)
+      sv_set_sign64(s, xslot, -1);
+    return;
+  }
+  int64_t k;
+  if (!sv_read_const32(ir, kop, &k) || k == 0)
+    return;
+  int64_t xlo = INT32_MIN, xhi = INT32_MAX;
+  if (s->ranges[xslot].valid)
+  {
+    xlo = s->ranges[xslot].lo;
+    xhi = s->ranges[xslot].hi;
+  }
+  uint32_t uk = (uint32_t)k;
+  int m = 31;
+  while (!(uk >> m))
+    m--;
+  int64_t sign = (int64_t)1 << m;
+  if (xlo < -sign || xhi > sign - 1)
+    return;   /* bit m is not x's sign: x & k says nothing interval-shaped */
+  if (eff_tok == VRP_TOK_EQ)
+    sv_set_intersect(s, xslot, 0, (int64_t)(~uk & (uint32_t)(sign - 1)));
+  else if (uk == (uint32_t)sign)
+    sv_set_intersect(s, xslot, -sign, -1);
+}
 
 /* On entering a block whose sole predecessor is its immediate dominator, refine the
  * compared value's range by the edge condition (taken edge if this is the jump target). */
@@ -996,10 +1211,7 @@ static int sv_enter(IRSSAOptCtx *ctx, int block, void *state)
   if (cq->op != TCCIR_OP_CMP && cq->op != TCCIR_OP_TEST_ZERO)
     return 0;
 
-  SVCmp cmp;
-  if (!sv_read_cmp(s, cmp_idx, &cmp) || !cmp.c_ok)
-    return 0;
-  int tok = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_src1(ir, jq));
+  int tok = (int)tcc_ir_op_src1_imm(ir, jq);
 
   /* A target past the last instruction is the function exit: this block is then unambiguously
    * the fall-through, which is what we refine on. */
@@ -1014,9 +1226,23 @@ static int sv_enter(IRSSAOptCtx *ctx, int block, void *state)
   int eff_tok = is_target ? tok : vrp_negate_cmp_tok(tok);
   if (eff_tok < 0)
     return 0;
+  sv_enter_and_test(s, cmp_idx, eff_tok);
+
+  SVCmp cmp;
+  if (!sv_read_cmp(s, cmp_idx, &cmp) || !cmp.c_ok)
+    return 0;
+  /* `CMP #c,x`: the token reads (c, x); swapping commutes with the edge negation above. */
+  if (cmp.swapped && (eff_tok = vrp_swap_cmp_tok(eff_tok)) < 0)
+    return 0;
   int64_t lo, hi;
   if (!sv_interval_for(eff_tok, cmp.c, &lo, &hi))
   {
+    /* `x != 0`, `x >u c`, `x >=u c` (c != 0): x is non-zero.  Word compares
+     * only: a narrow read of the same value could still be zero. */
+    if (cmp.slot >= 0 && cmp.x.btype == IROP_BTYPE_INT32 &&
+        ((eff_tok == VRP_TOK_NE && cmp.c == 0) || eff_tok == VRP_TOK_UGT ||
+         (eff_tok == VRP_TOK_UGE && cmp.c != 0)))
+      sv_set_nonzero(s, cmp.slot);
     /* No representable interval: still trim an in-scope range at its boundary. */
     if (cmp.slot < 0 || !s->ranges[cmp.slot].valid)
       return 0;
@@ -1111,7 +1337,7 @@ static int sv_visit(IRSSAOptCtx *ctx, int block, void *state)
         if (op2 == TCCIR_OP_JUMPIF)
         {
           int fired = sv_try_fold_jumpif(ctx, s, i, j);
-          if (!fired && q->op == TCCIR_OP_CMP && !irop_is_immediate(tcc_ir_op_get_src2(ir, q)))
+          if (!fired && q->op == TCCIR_OP_CMP && !tcc_ir_op_src2_is_imm(ir, q))
             fired = sv_try_fold_regreg(ctx, block, i, j);
           changes += fired;
         }
@@ -1122,6 +1348,7 @@ static int sv_visit(IRSSAOptCtx *ctx, int block, void *state)
       }
       continue;
     }
+    changes += sv_try_fold_mask_identity(ctx, s, i);
     sv_seed_def(s, q);
   }
   return changes;
@@ -1175,7 +1402,7 @@ int ssa_opt_vrp(IRSSAOptCtx *ctx)
         continue;
       if (q->op == TCCIR_OP_LEA)
       {
-        int32_t avr = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+        int32_t avr = tcc_ir_op_src1_vreg(ir, q);
         if (avr >= 0)
         {
           int at = TCCIR_DECODE_VREG_TYPE(avr), ap = TCCIR_DECODE_VREG_POSITION(avr);
@@ -1187,13 +1414,12 @@ int ssa_opt_vrp(IRSSAOptCtx *ctx)
       }
       if (!irop_config[q->op].has_dest)
         continue;
-      IROperand d = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(d);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       if (dvr < 0)
         continue;
       {
         int dt = TCCIR_DECODE_VREG_TYPE(dvr), dp = TCCIR_DECODE_VREG_POSITION(dvr);
-        if (pw && dt == TCCIR_VREG_TYPE_PARAM && dp >= 0 && dp < s.param_cap && !d.is_lval)
+        if (pw && dt == TCCIR_VREG_TYPE_PARAM && dp >= 0 && dp < s.param_cap && !tcc_ir_op_dest_is_lval(ir, q))
           pw[dp] = 1;
         if (vw && dt == TCCIR_VREG_TYPE_VAR && dp >= 0 && dp < s.var_cap && vw[dp] < 2)
           vw[dp]++;

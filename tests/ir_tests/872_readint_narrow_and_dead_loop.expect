@@ -1,0 +1,15 @@
+rd0 le16=0000f6d1 le6=0000845f be16=0000d1f6 be6=00005f84 twice=5f3af6be q1=0000cba6 loop=0018e32f
+rd1 le16=0000f9d4 le6=00008762 be16=0000d4f9 be6=00006287 twice=623dceba q1=0000cea9 loop=030fdad8
+rd2 le16=0000fcd7 le6=00008a65 be16=0000d7fc be6=0000658a twice=6540caca q1=0000d1ac loop=6055c4de
+dl x=00000000 outer=00000000 manual=00000000 first=c121b299
+dl x=00000001 outer=ef0b73a9 manual=00ba4934 first=3fd09be4
+dl x=00000002 outer=fd4f41e9 manual=2bc1dadc first=02b2eed4
+dl x=00000003 outer=309a7f59 manual=442b7da4 first=3e353414
+dl x=deadbeef outer=da48bab9 manual=d04b9d94 first=b30ef874
+dl x=80000001 outer=ef0b73a9 manual=00ba4934 first=3fd09be4
+nested n=0 00000005
+nested n=1 00013bfc
+nested n=2 0d6668f6
+nested n=3 aa2f85bf
+nested n=4 e9a88df9
+nested n=5 3cd1a008

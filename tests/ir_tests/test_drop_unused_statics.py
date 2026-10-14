@@ -196,3 +196,27 @@ int main(void)
                if len(cols) == 8 and cols[0][:-1].isdigit() and cols[6].isdigit()]
     assert "write_only" not in defined and "only_in_initializer" not in defined, defined
     assert "main" in defined
+
+
+# Replaying a deferred body restores the file name it was saved with.  That
+# name is already resolved (directory included), so it must not be resolved
+# again like a #line name: each replay prepended the directory once more, and
+# the kernel's CBE file reported ./.zig-cache/o/H/./.zig-cache/o/H/.../kernel.c
+# (and wrote it into the debug info) until the name overflowed its buffer.
+
+@pytest.mark.parametrize("opt", ["-O1", "-O2"])
+def test_replayed_body_keeps_a_relative_file_name(tmp_path, opt):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    # A body calling an unprototyped function is replayed on the spot.
+    (sub / "a.c").write_text(
+        "int old();\n"
+        "static int s(int x) { return old(x); }\n"
+        "int f(int x) { return s(x); }\n"
+        "static int t(int x) { return old(x) + 1; }\n"
+        "int g(int x) { return t(x); }\n"
+        "int h(int x) { if (x) return 1; }\n"
+    )
+    proc = subprocess.run([str(TCC), "-c", opt, "-o", "a.o", "./sub/a.c"], capture_output=True, text=True, cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "./sub/a.c:6: warning: function might return no value: 'h'" in proc.stderr.splitlines(), proc.stderr

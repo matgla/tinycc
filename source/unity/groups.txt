@@ -55,7 +55,7 @@ opt_flat_loop_iv: opt/flat/loop/iv_*.c opt/flat/loop/licm.c
 opt_ssa_cfg_or_bool: opt/ssa/cfg/or_bool_diamond.c
 
 # source/ir: frame layout and cross-jumping apart from the IR core.
-ir_frame: ir/frame.c ir/cross_jump.c
+ir_frame: ir/frame.c ir/frame_dfe.c ir/cross_jump.c
 
 # source/opt/ssa/scalar: the propagation engines apart from the folds.
 opt_ssa_scalar_prop: opt/ssa/scalar/sccp.c opt/ssa/scalar/cprop.c

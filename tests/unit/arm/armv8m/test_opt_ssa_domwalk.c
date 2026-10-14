@@ -32,7 +32,6 @@ static IRCFG *dw_cfg_new(int nblocks)
 {
   IRCFG *cfg = tcc_mallocz(sizeof *cfg);
   cfg->num_blocks = nblocks;
-  cfg->capacity = nblocks;
   cfg->blocks = tcc_mallocz(sizeof(IRBasicBlock) * nblocks);
   return cfg;
 }

@@ -96,6 +96,9 @@ static int tu_is_static_global_candidate(const Sym *sym)
     return 0;
   if (sym->a.weak || sym->a.dllimport)
     return 0;
+  /* __attribute__((used)): inline asm or unseen code may read it. */
+  if (sym->a.used)
+    return 0;
   /* VT_STATIC implies storage in this TU even when VT_EXTERN is also set. */
   if (!(sym->type.t & VT_STATIC))
     return 0;
@@ -171,9 +174,9 @@ static int32_t tu_dest_def(TCCIRState *ir, IRQuadCompact *q)
 static void tu_note_postinc_def(TCCIRState *ir, IRQuadCompact *q, TuVregSymEntry *map, int *count)
 {
   if (q->op == TCCIR_OP_LOAD_POSTINC)
-    tu_vreg_map_def(map, count, irop_get_vreg(tcc_ir_op_get_src1(ir, q)), NULL);
+    tu_vreg_map_def(map, count, tcc_ir_op_src1_vreg(ir, q), NULL);
   else if (q->op == TCCIR_OP_STORE_POSTINC)
-    tu_vreg_map_def(map, count, irop_get_vreg(tcc_ir_op_get_dest(ir, q)), NULL);
+    tu_vreg_map_def(map, count, tcc_ir_op_dest_vreg(ir, q), NULL);
 }
 
 /* Any pre-opt value read or unrecognized address use of a static blocks tu_no_readers; store-address plumbing `T=&g+i; *T=v` does not. */
@@ -190,7 +193,7 @@ static uint8_t *tu_block_copy_call_ids(TCCIRState *ir, int *count)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
-    int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+    int cid = TCCIR_DECODE_CALL_ID((int32_t)tcc_ir_op_src2_imm(ir, q));
     if (cid > max_id)
       max_id = cid;
   }
@@ -203,7 +206,10 @@ static uint8_t *tu_block_copy_call_ids(TCCIRState *ir, int *count)
       continue;
     Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
     int cid = TCCIR_DECODE_CALL_ID((int32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
-    if (callee && cid >= 0 && tu_is_block_copy_helper(get_tok_str(callee->v, NULL)))
+    /* A helper whose result is used returns its destination pointer, so reads
+     * through that result are reads of the static: not a pure write. */
+    if (callee && cid >= 0 && q->op == TCCIR_OP_FUNCCALLVOID &&
+        tu_is_block_copy_helper(get_tok_str(callee->v, NULL)))
       ids[cid] = 1;
   }
   return ids;
@@ -213,7 +219,7 @@ static int tu_is_block_copy_dest_param(TCCIRState *ir, IRQuadCompact *q, const u
 {
   if (q->op != TCCIR_OP_FUNCPARAMVAL)
     return 0;
-  int32_t enc = (int32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q));
+  int32_t enc = (int32_t)tcc_ir_op_src2_imm(ir, q);
   int cid = TCCIR_DECODE_CALL_ID(enc);
   return TCCIR_DECODE_PARAM_IDX(enc) == 0 && cid >= 0 && cid < count && ids[cid];
 }
@@ -302,13 +308,9 @@ int tu_is_block_copy_helper(const char *nm)
 {
   if (!nm)
     return 0;
-  return !strcmp(nm, "memcpy") || !strcmp(nm, "memmove") || !strcmp(nm, "memset") ||
-         !strcmp(nm, "__aeabi_memcpy") || !strcmp(nm, "__aeabi_memmove") ||
-         !strcmp(nm, "__aeabi_memset") || !strcmp(nm, "__aeabi_memclr") ||
-         !strcmp(nm, "__aeabi_memcpy4") || !strcmp(nm, "__aeabi_memmove4") ||
-         !strcmp(nm, "__aeabi_memcpy8") || !strcmp(nm, "__aeabi_memmove8") ||
-         !strcmp(nm, "__aeabi_memset4") || !strcmp(nm, "__aeabi_memset8") ||
-         !strcmp(nm, "__aeabi_memclr4") || !strcmp(nm, "__aeabi_memclr8");
+  return ir_opt_name_in(nm, "memcpy\0memmove\0memset\0__aeabi_memcpy\0__aeabi_memmove\0__aeabi_memset\0"
+                            "__aeabi_memclr\0__aeabi_memcpy4\0__aeabi_memmove4\0__aeabi_memcpy8\0__aeabi_memmove8\0"
+                            "__aeabi_memset4\0__aeabi_memset8\0__aeabi_memclr4\0__aeabi_memclr8\0");
 }
 
 /* --- mod-ref query -------------------------------------------------------- */
@@ -346,6 +348,10 @@ static int tu_modref_walk(Sym *callee, MemLoc L)
     if (nvisited >= TU_MODREF_MAX_VISIT)
       return 1;
     visited[nvisited++] = f;
+
+    /* A weak definition may be replaced by a strong one at link time. */
+    if (f->a.weak)
+      return 1;
 
     TuFuncSummary *s = tu_summary_lookup(f);
     if (!s)
@@ -385,7 +391,7 @@ int tcc_ir_call_may_write(TCCIRState *ir, int call_idx, MemLoc L)
   /* An UNKNOWN location aliases everything, so no summary can rule it out. */
   if (L.kind != MEMLOC_GLOBAL && L.kind != MEMLOC_FRAME)
     return 1;
-  Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+  Sym *callee = tcc_ir_op_src1_sym(ir, q);
   if (!callee)
     return 1; /* indirect call */
   /* A DIRECT block-copy/fill call writes its destination range, and that has to
@@ -486,9 +492,8 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
         {
           if (irop_config[q->op].has_src1)
           {
-            IROperand s1 = tcc_ir_op_get_src1(ir, q);
-            int32_t svr = irop_get_vreg(s1);
-            if (svr >= 0 && !s1.is_sym)
+            int32_t svr = tcc_ir_op_src1_vreg(ir, q);
+            if (svr >= 0 && !tcc_ir_op_src1_is_sym(ir, q))
               derived_sym = tu_vreg_map_lookup(vreg_map, vreg_map_count, svr);
           }
         }
@@ -510,8 +515,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
     {
       if (irop_config[q->op].has_src1)
       {
-        IROperand s1 = tcc_ir_op_get_src1(ir, q);
-        int32_t svr = irop_get_vreg(s1);
+        int32_t svr = tcc_ir_op_src1_vreg(ir, q);
         if (svr >= 0)
         {
           Sym *esc = tu_vreg_map_lookup(vreg_map, vreg_map_count, svr);
@@ -527,8 +531,7 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
     {
       if (irop_config[q->op].has_src1)
       {
-        IROperand s1 = tcc_ir_op_get_src1(ir, q);
-        int32_t svr = irop_get_vreg(s1);
+        int32_t svr = tcc_ir_op_src1_vreg(ir, q);
         if (svr >= 0)
         {
           Sym *esc = tu_vreg_map_lookup(vreg_map, vreg_map_count, svr);
@@ -628,6 +631,8 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
       Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
       if (callee)
         tu_symset_add(&s->calls, callee);
+      else
+        s->writes_unknown = 1; /* indirect call */
 
       /* Mod-ref: a block-copy/fill helper writes ONLY through its destination
        * pointer, so resolve that here rather than letting the (summary-less,
@@ -645,6 +650,8 @@ void tcc_ir_collect_tu_func_summary(TCCIRState *ir, Sym *func_sym)
           if (dl.kind == MEMLOC_GLOBAL && dl.sym)
           {
             tu_symset_add(&s->global_writes, dl.sym);
+            if (q->op == TCCIR_OP_FUNCCALLVAL)
+              tu_symset_add(&s->static_reads, dl.sym); /* result aliases dest */
             if (tu_is_static_global_candidate(dl.sym))
             {
               tu_symset_add(&s->static_writes, dl.sym);

@@ -65,6 +65,21 @@ static const char *get_softfp_func_name(TccIrOp op, int is_double)
  * Used by tcc_gen_machine_fp_mop to set up R0/R1 before BL __aeabi_f*. */
 static void fp_mop_load_arg(int target_reg, const MachineOperand *op)
 {
+  /* One register, so one word: a 64-bit operand reaching here is one half of a
+   * double that fp_mop_load_double_arg split (the halves keep the double
+   * btype).  Loading it with that btype made load_from_base fetch a register
+   * pair into target_reg and a scratch it believed free -- which can be the
+   * register the other half was just loaded into:
+   *   ldrd r0, r1, [r7, #96]   @ b_im low word
+   *   ldrd r1, r0, [r7, #100]  @ b_im high word, r0 = the word after b_im */
+  MachineOperand word_op;
+  if (op->btype == IROP_BTYPE_INT64 || op->btype == IROP_BTYPE_FLOAT64)
+  {
+    word_op = *op;
+    word_op.btype = IROP_BTYPE_INT32;
+    word_op.is_64bit = false;
+    op = &word_op;
+  }
   switch (op->kind)
   {
   case MACH_OP_NONE:
@@ -100,6 +115,8 @@ static void fp_mop_load_arg(int target_reg, const MachineOperand *op)
   }
   case MACH_OP_IMM:
     tcc_machine_load_constant(target_reg, PREG_REG_NONE, op->u.imm.val, 0, NULL);
+    if (op->needs_deref) /* `*(T *)0x40000000`: read through the address */
+      load_from_base(target_reg, PREG_REG_NONE, op->btype, (int)op->is_unsigned, 0, 0, (uint32_t)target_reg);
     return;
   case MACH_OP_SYMBOL:
   {
@@ -139,7 +156,7 @@ static void fp_mop_load_arg(int target_reg, const MachineOperand *op)
     return;
   }
   default:
-    tcc_error("compiler_error: fp_mop_load_arg: unhandled kind %d", (int)op->kind);
+    tcc_ice("fp_mop_load_arg: unhandled kind %d", (int)op->kind);
   }
 }
 
@@ -626,7 +643,7 @@ static void thumb_emit_vfp_arith_mop(MachineOperand src1, MachineOperand src2, M
     case TCCIR_OP_FSUB: ot_check(th_vsub_f((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 0)); break;
     case TCCIR_OP_FMUL: ot_check(th_vmul_f((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 0)); break;
     case TCCIR_OP_FDIV: ot_check(th_vdiv_f((uint16_t)sd, (uint16_t)sn, (uint16_t)sm, 0)); break;
-    default: tcc_error("compiler_error: thumb_emit_vfp_arith_mop: unhandled op %d", (int)op); break;
+    default: tcc_ice("thumb_emit_vfp_arith_mop: unhandled op %d", (int)op); break;
     }
     if (dest.kind != MACH_OP_VFP_REG)
     {
@@ -664,7 +681,7 @@ static void thumb_emit_vfp_arith_mop(MachineOperand src1, MachineOperand src2, M
     ot_check(th_vdiv_f(0, 0, 1, 0));
     break;
   default:
-    tcc_error("compiler_error: thumb_emit_vfp_arith_mop: unhandled op %d", (int)op);
+    tcc_ice("thumb_emit_vfp_arith_mop: unhandled op %d", (int)op);
     break;
   }
   ot_check(th_vmov_gp_sp((uint16_t)rd, 0, 1)); /* rd = s0 */
@@ -1091,6 +1108,101 @@ static void thumb_process_complex_div_double_mop(MachineOperand src1, MachineOpe
     ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));
 }
 
+/* Complex division under -mfloat-abi=hard.  libgcc's __divsc3/__divdc3 follow
+ * the VFP variant of the AAPCS there: the four components arrive in s0-s3 /
+ * d0-d3 and the _Complex result (an HFA) comes back in s0,s1 / d0,d1 -- no
+ * hidden return pointer.  The call is not an IR call, so the allocator does
+ * not know it clobbers the caller-saved VFP bank; save s0-s15 around it.
+ *
+ * Frame (below the optional {r9,r12} save): 16/32-byte result area, then the
+ * 64-byte VFP save area on top. */
+static void thumb_process_complex_div_hard_mop(MachineOperand src1, MachineOperand src2, MachineOperand dest,
+                                               int is_double)
+{
+  MachineOperand parts[4];
+  MachineOperand d_real, d_imag;
+  if (is_double)
+  {
+    parts[0] = mach_make_complex_real(&src1);
+    parts[1] = mach_make_complex_imag(&src1);
+    parts[2] = mach_make_complex_real(&src2);
+    parts[3] = mach_make_complex_imag(&src2);
+    d_real = mach_make_complex_real(&dest);
+    d_imag = mach_make_complex_imag(&dest);
+  }
+  else
+  {
+    parts[0] = mach_make_lo_half(&src1);
+    parts[1] = mach_make_hi_half(&src1);
+    parts[2] = mach_make_lo_half(&src2);
+    parts[3] = mach_make_hi_half(&src2);
+    d_real = mach_make_lo_half(&dest);
+    d_imag = mach_make_hi_half(&dest);
+  }
+  const int res_sz = is_double ? 16 : 8;
+
+  if (text_and_data_separation)
+    ot_check(th_push((uint16_t)((1 << R9) | (1 << R12))));
+  ot_check(th_sub_imm(R_SP, R_SP, res_sz, flags_safe(), ENFORCE_ENCODING_NONE));
+  ot_check(th_vpush(0xFFFFu, 0)); /* s0-s15 */
+
+  for (int i = 0; i < 4; i++)
+  {
+    if (is_double)
+    {
+      fp_mop_load_double_arg(R0, R1, &parts[i]);
+      ot_check(th_vmov_2gp_dp(R0, R1, (uint16_t)i, 0)); /* d<i> = r0:r1 */
+    }
+    else
+    {
+      fp_mop_load_arg(R0, &parts[i]);
+      ot_check(th_vmov_gp_sp(R0, (uint16_t)i, 0)); /* s<i> = r0 */
+    }
+  }
+
+  {
+    Sym *sym = external_global_sym(tok_alloc_const(is_double ? "__divdc3" : "__divsc3"), &func_old_type);
+    MachineOperand func_mop = {0};
+    func_mop.kind = MACH_OP_SYMBOL;
+    func_mop.u.sym.sym = sym;
+    func_mop.u.sym.addend = 0;
+    gcall_or_jump_mop(0, func_mop);
+  }
+
+  /* Result: s0,s1 (float) or d0,d1 (double) -> result area above the save. */
+  if (is_double)
+  {
+    ot_check(th_vstr(0, R_SP, 64, 1));
+    ot_check(th_vstr(1, R_SP, 72, 1));
+  }
+  else
+  {
+    ot_check(th_vstr(0, R_SP, 64, 0));
+    ot_check(th_vstr(1, R_SP, 68, 0));
+  }
+  ot_check(th_vpop(0xFFFFu, 0));
+
+  if (is_double)
+  {
+    fp_mop_load_double_from_sp(R0, R1, 0);
+    fp_mop_writeback_result(&d_real, 1);
+    fp_mop_load_double_from_sp(R0, R1, 8);
+    fp_mop_writeback_result(&d_imag, 1);
+    ot_check(th_add_imm(R_SP, R_SP, res_sz, flags_safe(), ENFORCE_ENCODING_NONE));
+    if (text_and_data_separation)
+      ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));
+  }
+  else
+  {
+    ot_check_ldr_imm(R0, R_SP, 0, 6, ENFORCE_ENCODING_NONE);
+    ot_check_ldr_imm(R1, R_SP, 4, 6, ENFORCE_ENCODING_NONE);
+    ot_check(th_add_imm(R_SP, R_SP, res_sz, flags_safe(), ENFORCE_ENCODING_NONE));
+    if (text_and_data_separation)
+      ot_check(th_pop((uint16_t)((1 << R9) | (1 << R12))));
+    complex_pair_writeback(&d_real, R0, &d_imag, R1);
+  }
+}
+
 /* tcc_gen_machine_fp_mop: MachineOperand-based entry point for floating-point
  * operations via soft-float EABI library calls.
  * Handles single-precision, double-precision, and complex float operations.
@@ -1125,6 +1237,8 @@ ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, Ma
     }
     else if (op == TCCIR_OP_FDIV)
     {
+      if (tcc_state && tcc_state->float_abi == ARM_HARD_FLOAT)
+        return thumb_process_complex_div_hard_mop(src1, src2, dest, complex_is_double);
       if (complex_is_double)
         return thumb_process_complex_div_double_mop(src1, src2, dest);
       return thumb_process_complex_div_mop(src1, src2, dest);
@@ -1300,7 +1414,7 @@ ST_FUNC void tcc_gen_machine_fp_mop(MachineOperand src1, MachineOperand src2, Ma
   }
 
   if (!func_name)
-    tcc_error("compiler_error: tcc_gen_machine_fp_mop: no func_name for op %d", (int)op);
+    tcc_ice("tcc_gen_machine_fp_mop: no func_name for op %d", (int)op);
 
   fp_mop_do_bl(func_name);
 

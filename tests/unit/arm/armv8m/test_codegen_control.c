@@ -16,6 +16,7 @@
 #include "source/backend/arch/arm/arm_regalloc.h"
 #include "codegen_mop_stubs.h"
 #include "ut.h"
+#include "ir_build.h"
 
 static SValue sv_var(int vreg)
 {
@@ -781,6 +782,9 @@ UT_TEST(test_test_gen_constant_condition_not_taken_is_noop)
 UT_TEST(test_dispatch_jump_routes_to_jump_mop)
 {
   cgstub_reset();
+  /* The jumped-over return must emit something, or the real pass drops the
+   * jump (test_dispatch_jump_over_code_free_ops_dropped). */
+  cgstub_set_return_value_bytes(2);
   TCCIRState *ir = tcc_ir_alloc();
   setup_tcc_state_two_pass();
 
@@ -802,6 +806,40 @@ UT_TEST(test_dispatch_jump_routes_to_jump_mop)
   UT_ASSERT(c != NULL);
   UT_ASSERT_EQ(c->ir_op, TCCIR_OP_JUMP);
   UT_ASSERT_EQ(c->aux0, 3); /* target_ir */
+
+  tcc_ir_free(ir);
+  return 0;
+}
+
+/* A JUMP whose span the rehearsal laid out as zero bytes only reaches the next
+ * instruction: the discovery and rehearsal passes size it, the real pass emits
+ * nothing for it (no 16-bit branch left to be patched into a NOP). */
+UT_TEST(test_dispatch_jump_over_code_free_ops_dropped)
+{
+  cgstub_reset();
+  TCCIRState *ir = tcc_ir_alloc();
+  setup_tcc_state_two_pass();
+
+  int v = tcc_ir_vreg_alloc_temp(ir);
+  SValue s_v = sv_var(v);
+  SValue s_one = sv_const(1);
+  tcc_ir_put(ir, TCCIR_OP_ASSIGN, &s_one, NULL, &s_v);
+
+  SValue jend = sv_jump_target(3);
+  tcc_ir_put(ir, TCCIR_OP_JUMP, NULL, NULL, &jend);
+  tcc_ir_put(ir, TCCIR_OP_RETURNVALUE, &s_v, NULL, NULL);
+
+  tcc_ir_ssa_regalloc(ir, arm_get_regalloc_target(), 0);
+  ir->leaffunc = 1;
+  tcc_ir_codegen_generate(ir);
+
+  UT_ASSERT_EQ(cgstub_call_count("jump_mop"), 2);
+  for (int k = 0; k < 2; k++)
+  {
+    const CgStubCall *c = cgstub_nth_call("jump_mop", k);
+    UT_ASSERT(c != NULL);
+    UT_ASSERT_EQ(c->ir_op, TCCIR_OP_JUMP);
+  }
 
   tcc_ir_free(ir);
   return 0;
@@ -1023,5 +1061,49 @@ UT_TEST(test_dispatch_switch_load_routes_to_switch_load_mop)
   ir->switch_value_tables = NULL;
   ir->num_switch_value_tables = 0;
   tcc_ir_free(ir);
+  return 0;
+}
+
+UT_TEST(test_regalloc_threads_error_tag_after_dead_frame_stores)
+{
+  setup_tcc_state_two_pass();
+  int old_threading = tcc_state->opt_jump_threading;
+  tcc_state->opt_jump_threading = 1;
+  TCCIRState *ir = tcc_ir_alloc();
+  int input = tcc_ir_vreg_alloc_param(ir);
+  int error = tcc_ir_vreg_alloc_temp(ir);
+  int copied = tcc_ir_vreg_alloc_temp(ir);
+  IROperand p = irop_make_vreg(input, IROP_BTYPE_INT32);
+  IROperand e = irop_make_vreg(error, IROP_BTYPE_INT32);
+  IROperand c = irop_make_vreg(copied, IROP_BTYPE_INT32);
+  IROperand zero = utb_imm(0, IROP_BTYPE_INT32);
+  /* Promotion leaves an unused copy here; dead_def must expose the error-tag join before threading. */
+  ir->loc = -8;
+  ir->frame_obj_count = ir->frame_obj_cap = 1;
+  ir->frame_objs = tcc_mallocz(FRAME_OBJ_WORDS * sizeof(int32_t));
+  ir->frame_objs[0] = -8;
+  ir->frame_objs[1] = ir->frame_objs[2] = 8;
+  utb_emit(ir, TCCIR_OP_TEST_ZERO, UTB_NONE, p, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(4, IROP_BTYPE_INT32), utb_imm(TOK_EQ, IROP_BTYPE_INT32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, e, utb_imm(37, IROP_BTYPE_INT32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMP, utb_imm(5, IROP_BTYPE_INT32), UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, e, zero, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_ASSIGN, c, e, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_STORE, irop_make_stackoff(-1, -8, 1, 0, 0, IROP_BTYPE_INT32), c, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_TEST_ZERO, UTB_NONE, c, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_JUMPIF, utb_imm(10, IROP_BTYPE_INT32), utb_imm(TOK_EQ, IROP_BTYPE_INT32), UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, c, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_RETURNVALUE, UTB_NONE, zero, UTB_NONE);
+  tcc_ir_ssa_regalloc(ir, arm_get_regalloc_target(), 0);
+  int tests = 0, stores = 0;
+  for (int i = 0; i < ir->next_instruction_index; i++) {
+    int op = ir->compact_instructions[i].op;
+    tests += op == TCCIR_OP_TEST_ZERO || op == TCCIR_OP_CMP;
+    stores += op == TCCIR_OP_STORE;
+  }
+  tcc_ir_free(ir);
+  tcc_state->opt_jump_threading = old_threading;
+  UT_ASSERT_EQ(stores, 0);
+  UT_ASSERT_EQ(tests, 1);
   return 0;
 }

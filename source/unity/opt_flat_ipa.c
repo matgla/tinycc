@@ -3,6 +3,7 @@
 #undef USING_GLOBALS
 #undef VR_BIT
 #include "../opt/flat/ipa/pure_via_sret.c"
+#undef PURE_VIA_SRET_OP_HZ
 #undef SRET_MARK
 #undef SRET_TEST
 #undef SRET_VR_TO_BIT

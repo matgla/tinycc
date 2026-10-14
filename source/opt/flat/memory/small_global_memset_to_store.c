@@ -32,7 +32,7 @@ int tcc_ir_opt_small_global_memset_to_store(TCCIRState *ir)
     if (q->op != TCCIR_OP_FUNCCALLVOID && q->op != TCCIR_OP_FUNCCALLVAL)
       continue;
 
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!callee)
       continue;
     const char *name = get_tok_str(callee->v, NULL);
@@ -45,7 +45,7 @@ int tcc_ir_opt_small_global_memset_to_store(TCCIRState *ir)
     /* memset returns dst: the FUNCCALLVAL form is droppable only if nothing reads that vreg. */
     if (q->op == TCCIR_OP_FUNCCALLVAL)
     {
-      int32_t ret_vr = irop_get_vreg(tcc_ir_op_get_dest(ir, q));
+      int32_t ret_vr = tcc_ir_op_dest_vreg(ir, q);
       int has_reader = 0;
       if (ret_vr >= 0)
       {
@@ -58,14 +58,12 @@ int tcc_ir_opt_small_global_memset_to_store(TCCIRState *ir)
             continue;
           if (irop_config[sq->op].has_src1)
           {
-            IROperand s = tcc_ir_op_get_src1(ir, sq);
-            if (irop_has_vreg(s) && irop_get_vreg(s) == ret_vr)
+            if (tcc_ir_op_src1_has_vreg(ir, sq) && tcc_ir_op_src1_vreg(ir, sq) == ret_vr)
               has_reader = 1;
           }
           if (!has_reader && irop_config[sq->op].has_src2)
           {
-            IROperand s = tcc_ir_op_get_src2(ir, sq);
-            if (irop_has_vreg(s) && irop_get_vreg(s) == ret_vr)
+            if (tcc_ir_op_src2_has_vreg(ir, sq) && tcc_ir_op_src2_vreg(ir, sq) == ret_vr)
               has_reader = 1;
           }
         }
@@ -137,7 +135,7 @@ int tcc_ir_opt_small_global_memset_to_store(TCCIRState *ir)
       continue; /* would need >1 store — leave as a call */
 
     /* Repurpose the CALL slot itself as the STORE; NOP the call's PARAMs. */
-    int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, q)));
+    int call_id = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
     uint32_t sidx = tcc_ir_pool_add_symref(ir, sr->sym, base_addend, sr->flags);
     IROperand st_dest = irop_make_symref(-1, sidx, /*is_lval*/ 1, /*is_local*/ 0, /*is_const*/ 0, btype);
     IROperand st_src = irop_make_imm32(-1, 0, btype);
@@ -149,7 +147,7 @@ int tcc_ir_opt_small_global_memset_to_store(TCCIRState *ir)
       IRQuadCompact *pq = &ir->compact_instructions[j];
       if (pq->op != TCCIR_OP_FUNCPARAMVAL && pq->op != TCCIR_OP_FUNCPARAMVOID)
         continue;
-      uint32_t enc = (uint32_t)irop_get_imm64_ex(ir, tcc_ir_op_get_src2(ir, pq));
+      uint32_t enc = (uint32_t)tcc_ir_op_src2_imm(ir, pq);
       if (TCCIR_DECODE_CALL_ID(enc) == call_id)
         pq->op = TCCIR_OP_NOP;
     }

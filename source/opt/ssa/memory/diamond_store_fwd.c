@@ -32,32 +32,14 @@ static int dsf_is_candidate_store(int op)
 
 static int dsf_effect_barrier(int op)
 {
-  switch (op) {
-  case TCCIR_OP_FUNCCALLVOID:
-  case TCCIR_OP_FUNCCALLVAL:
-  case TCCIR_OP_RETURNVALUE:
-  case TCCIR_OP_RETURNVOID:
-  case TCCIR_OP_INLINE_ASM:
-  case TCCIR_OP_ASM_OUTPUT:
-  case TCCIR_OP_STORE_POSTINC:
-  case TCCIR_OP_BLOCK_COPY:
-  case TCCIR_OP_IJUMP:
-  case TCCIR_OP_SWITCH_TABLE:
-  case TCCIR_OP_SETJMP:
-  case TCCIR_OP_NL_SETJMP:
-  case TCCIR_OP_LONGJMP:
-  case TCCIR_OP_NL_LONGJMP:
-  case TCCIR_OP_BUILTIN_APPLY:
-  case TCCIR_OP_BUILTIN_APPLY_ARGS:
-  case TCCIR_OP_BUILTIN_RETURN:
-  case TCCIR_OP_VLA_ALLOC:
-  case TCCIR_OP_TRAP:
-  case TCCIR_OP_INIT_CHAIN_SLOT:
-  case TCCIR_OP_SET_CHAIN:
-    return 1;
-  default:
+  /* The diamond's own stores and branches are matched by the callers. */
+  if (dsf_is_candidate_store(op) || op == TCCIR_OP_JUMP || op == TCCIR_OP_JUMPIF)
     return 0;
-  }
+  return ir_op_has(op, IR_HZ_FROM_OP & ~(IR_HZ_MEM_READ | IR_HZ_FLAGS_SET | IR_HZ_FLAGS_READ | IR_HZ_HINT |
+                                          IR_HZ_CALL_PARAM | IR_LEGACY_GAP_HZ(IR_HZ_CALL_SEQ))) &&
+         !ir_opset_has(IR_LEGACY_GAP_OPS(TCCIR_OP_ASM_INPUT, TCCIR_OP_CALLARG_STACK, TCCIR_OP_LOAD_POSTINC,
+                                         TCCIR_OP_VLA_SP_SAVE, TCCIR_OP_VLA_SP_RESTORE),
+                       op);
 }
 
 /* store dest slots hold the base pointer (a use), not a definition */
@@ -78,7 +60,7 @@ static int dsf_vreg_single_real_def(TCCIRState *ir, int32_t vr)
       continue;
     if (dsf_is_candidate_store(q->op))
       continue;
-    if (irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == vr && ++count > 1)
+    if (tcc_ir_op_dest_vreg(ir, q) == vr && ++count > 1)
       return 0;
   }
   return count == 1;
@@ -180,15 +162,13 @@ static int dsf_match_scaled_index(TCCIRState *ir, IROperand side, int addr_def,
   IRQuadCompact *q = &ir->compact_instructions[def];
   if (q->op != TCCIR_OP_SHL)
     return 0;
-  IROperand amount = tcc_ir_op_get_src2(ir, q);
-  if (!irop_is_immediate(amount))
+  if (!tcc_ir_op_src2_is_imm(ir, q))
     return 0;
-  int shift = (int)irop_get_imm64_ex(ir, amount);
+  int shift = (int)tcc_ir_op_src2_imm(ir, q);
   if (shift < 1 || shift > 3)
     return 0;
-  IROperand idx_op = tcc_ir_op_get_src1(ir, q);
-  int32_t index_vr = irop_get_vreg(idx_op);
-  if (index_vr < 0 || idx_op.is_lval)
+  int32_t index_vr = tcc_ir_op_src1_vreg(ir, q);
+  if (index_vr < 0 || tcc_ir_op_src1_is_lval(ir, q))
     return 0;
   *out_index_vr = index_vr;
   *out_shift = shift;
@@ -209,20 +189,19 @@ static int dsf_decompose_store_addr(TCCIRState *ir, int store_idx, DsfAddr *out)
   if (sq->op == TCCIR_OP_STORE_INDEXED) {
     if (dest.is_lval || irop_get_vreg(dest) < 0)
       return 0;
-    IROperand idx = tcc_ir_op_get_src2(ir, sq);
     IROperand sc = tcc_ir_op_get_scale(ir, sq);
     if (!irop_is_immediate(sc))
       return 0;
     int shift = (int)irop_get_imm64_ex(ir, sc);
     if (shift < 0 || shift > 3)
       return 0;
-    if (irop_is_immediate(idx)) {
+    if (tcc_ir_op_src2_is_imm(ir, sq)) {
       out->has_imm_index = 1;
-      out->index_imm = irop_get_imm64_ex(ir, idx);
+      out->index_imm = tcc_ir_op_src2_imm(ir, sq);
     } else {
-      if (idx.is_lval)
+      if (tcc_ir_op_src2_is_lval(ir, sq))
         return 0;
-      out->index_vr = irop_get_vreg(idx);
+      out->index_vr = tcc_ir_op_src2_vreg(ir, sq);
       if (out->index_vr < 0)
         return 0;
     }
@@ -278,15 +257,14 @@ static int dsf_find_branch_store(TCCIRState *ir, int from, int limit,
     if (q->op == TCCIR_OP_NOP)
       continue;
     if (dsf_is_candidate_store(q->op)) {
-      IROperand val = tcc_ir_op_get_src1(ir, q);
-      if (!irop_is_immediate(val))
+      if (!tcc_ir_op_src1_is_imm(ir, q))
         return -1;
-      *out_const = irop_get_imm64_ex(ir, val);
+      *out_const = tcc_ir_op_src1_imm(ir, q);
       store_idx = j;
       continue;
     }
     if (q->op == TCCIR_OP_JUMP) {
-      *out_merge_target = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      *out_merge_target = (int)tcc_ir_op_dest_u_imm32(ir, q);
       *out_jump_idx = j;
       break;
     }
@@ -306,7 +284,7 @@ static int dsf_cond_chain_end(TCCIRState *ir, int jumpif_idx, int else_target)
       continue;
     if (q->op != TCCIR_OP_JUMPIF)
       break;
-    if ((int)tcc_ir_op_get_dest(ir, q).u.imm32 != else_target)
+    if ((int)tcc_ir_op_dest_u_imm32(ir, q) != else_target)
       break;
     last = j;
   }
@@ -316,13 +294,12 @@ static int dsf_cond_chain_end(TCCIRState *ir, int jumpif_idx, int else_target)
 static int dsf_load_matches_addr(TCCIRState *ir, IRQuadCompact *q, int use_idx,
                                  const DsfAddr *addr)
 {
-  IROperand load_index = tcc_ir_op_get_src2(ir, q);
   if (addr->has_imm_index) {
-    if (!irop_is_immediate(load_index) ||
-        irop_get_imm64_ex(ir, load_index) != addr->index_imm)
+    if (!tcc_ir_op_src2_is_imm(ir, q) ||
+        tcc_ir_op_src2_imm(ir, q) != addr->index_imm)
       return 0;
   } else {
-    if (load_index.is_lval || irop_get_vreg(load_index) != addr->index_vr)
+    if (tcc_ir_op_src2_is_lval(ir, q) || tcc_ir_op_src2_vreg(ir, q) != addr->index_vr)
       return 0;
   }
   IROperand scale = tcc_ir_op_get_scale(ir, q);
@@ -331,7 +308,7 @@ static int dsf_load_matches_addr(TCCIRState *ir, IRQuadCompact *q, int use_idx,
     return 0;
   int store_size = dsf_btype_size(addr->btype);
   if (store_size == 0 ||
-      store_size != dsf_btype_size(irop_get_btype(tcc_ir_op_get_dest(ir, q))))
+      store_size != dsf_btype_size(tcc_ir_op_dest_btype(ir, q)))
     return 0;
   IROperand load_base = tcc_ir_op_get_src1(ir, q);
   if (load_base.is_lval)
@@ -364,8 +341,7 @@ static int dsf_foreign_edge_into(TCCIRState *ir, int then_start, int else_target
     if (q->op == TCCIR_OP_IJUMP)
       return 1;
     if (q->op == TCCIR_OP_SWITCH_TABLE) {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id < 0 || table_id >= ir->num_switch_tables)
         return 1;
       TCCIRSwitchTable *table = &ir->switch_tables[table_id];
@@ -381,7 +357,7 @@ static int dsf_foreign_edge_into(TCCIRState *ir, int then_start, int else_target
       continue;
     if (j == then_jump || j == else_jump)
       continue;
-    int t = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+    int t = (int)tcc_ir_op_dest_u_imm32(ir, q);
     if (t > then_start && t <= load_idx && t != else_target)
       return 1;
   }
@@ -422,16 +398,6 @@ static void dsf_rewrite_load_to_assign(TCCIRState *ir, int load_idx, IROperand s
   ir->iroperand_pool[q->operand_base + 3] = IROP_NONE;
 }
 
-static void dsf_insert_assign_before(TCCIRState *ir, int idx, IROperand dest,
-                                     IROperand src)
-{
-  IRQuadCompact q = {0};
-  q.op = TCCIR_OP_ASSIGN;
-  q.operand_base = tcc_ir_pool_add(ir, dest);
-  tcc_ir_pool_add(ir, src);
-  tcc_ir_insert_instruction_before(ir, idx, &q);
-}
-
 int ssa_opt_diamond_store_fwd_core(TCCIRState *ir)
 {
   int n = ir->next_instruction_index;
@@ -445,7 +411,7 @@ int ssa_opt_diamond_store_fwd_core(TCCIRState *ir)
     if (q->op != TCCIR_OP_JUMPIF)
       continue;
 
-    int else_target = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+    int else_target = (int)tcc_ir_op_dest_u_imm32(ir, q);
     if (else_target <= i || else_target >= n)
       continue;
 
@@ -470,6 +436,12 @@ int ssa_opt_diamond_store_fwd_core(TCCIRState *ir)
     if (else_merge >= 0 && else_merge != then_merge)
       continue;
 
+    /* Every volatile access happens, and a volatile read need not return what the
+     * last store wrote (MMIO). */
+    if (tcc_ir_instr_access_is_volatile(ir, &ir->compact_instructions[then_store]) ||
+        tcc_ir_instr_access_is_volatile(ir, &ir->compact_instructions[else_store]))
+      continue;
+
     DsfAddr then_addr, else_addr;
     if (!dsf_decompose_store_addr(ir, then_store, &then_addr) ||
         !dsf_decompose_store_addr(ir, else_store, &else_addr))
@@ -483,6 +455,9 @@ int ssa_opt_diamond_store_fwd_core(TCCIRState *ir)
 
     int load_idx = dsf_find_merge_load(ir, then_merge, &then_addr);
     if (load_idx < 0)
+      continue;
+
+    if (tcc_ir_instr_access_is_volatile(ir, &ir->compact_instructions[load_idx]))
       continue;
 
     if (dsf_foreign_edge_into(ir, then_start, else_target, load_idx,
@@ -501,20 +476,10 @@ int ssa_opt_diamond_store_fwd_core(TCCIRState *ir)
       continue;
     }
 
-    int32_t tmp_vr = tcc_ir_vreg_alloc_temp(ir);
-    if (tmp_vr < 0)
-      continue;
-    IROperand tmp_op = irop_make_vreg(tmp_vr, lbtype);
-    tmp_op.is_unsigned = ldest.is_unsigned;
-
-    /* insert the higher-index (else) def first so then-side indices stay valid */
-    int else_ins = else_jump >= 0 ? else_jump : then_merge;
-    dsf_insert_assign_before(ir, else_ins, tmp_op,
-                             dsf_make_const(ir, lbtype, velse));
-    dsf_insert_assign_before(ir, then_jump, tmp_op,
-                             dsf_make_const(ir, lbtype, vthen));
-    dsf_rewrite_load_to_assign(ir, load_idx + 2, tmp_op);
-    return changes + 1;
+    /* Different constants per arm would need a value defined on both paths.  A
+     * fresh TEMP assigned in each arm has two definitions and no phi (the CFG the
+     * phis were built against is stale once instructions are inserted), and SSA
+     * consumers fold such a TEMP to one of its defs -- so the load stays. */
   }
 
   return changes;

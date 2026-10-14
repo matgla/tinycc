@@ -1,0 +1,14 @@
+[FAM_UNION_OVERFLOW]
+bug_union_fam_init_shared_struct_type_errors.c:18: error: initializer of flexible array member does not fit in the union
+
+[FAM_UNION_DESIGNATED_OVERFLOW]
+bug_union_fam_init_shared_struct_type_errors.c:20: error: initializer of flexible array member does not fit in the union
+
+[FAM_UNION_STRING_OVERFLOW]
+bug_union_fam_init_shared_struct_type_errors.c:22: error: initializer of flexible array member does not fit in the union
+
+[FAM_UNION_LOCAL_OVERFLOW]
+bug_union_fam_init_shared_struct_type_errors.c:24: error: initializer of flexible array member does not fit in the union
+
+[FAM_UNION_FITS]
+[returns 0]

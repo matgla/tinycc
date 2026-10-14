@@ -34,3 +34,25 @@ int tcc_gen_machine_frame_top_offset(void)
 {
   return 0;
 }
+
+/* From arm-thumb-emit.c — AAPCS-VFP HFA classification; the optimizer asks it
+ * before turning a by-value struct argument into words (struct_arg_split.c).
+ * The unit tests build no hard-float call, so nothing is an HFA. */
+struct CType;
+
+int gfunc_hfa(struct CType *type, int *base_size)
+{
+  (void)type;
+  *base_size = 4;
+  return 0;
+}
+
+/* From arm-thumb-call.c — paired/chunked copy of an interleaved one-base word
+ * run.  0 = no plan, so codegen keeps its word-at-a-time copy. */
+int tcc_gen_machine_interleaved_word_copy(int base, int src_off, int dst_off, int nwords,
+                                          unsigned word_regs, int start_idx, int end_idx)
+{
+  (void)base; (void)src_off; (void)dst_off; (void)nwords;
+  (void)word_regs; (void)start_idx; (void)end_idx;
+  return 0;
+}

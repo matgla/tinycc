@@ -1,0 +1,3 @@
+out 111 222 333 444 sum=2808
+in acc=124 sum=311
+clob out=115 sum=305

@@ -7,8 +7,8 @@
 0005: T1 <-- StackLoc[-8] [ASSIGN]
 0006: T1***DEREF*** <-- #1 [STORE]
 0007: T2 <-- StackLoc[-8] [ASSIGN]
-0008: VReg? <-- StackLoc[-12]
-0009: T3 <-- T2***DEREF*** [LOAD]
+0008: T3 <-- T2***DEREF*** [LOAD]
+0009: VReg? <-- StackLoc[-12]
 0010: RETURNVALUE T3
 0011: VReg? <-- StackLoc[-12]
 === END IR BEFORE OPTIMIZATIONS ===
@@ -21,8 +21,8 @@
 0005: T1 <-- StackLoc[-8] [ASSIGN]
 0006: T1***DEREF*** <-- #1 [STORE]
 0007: T2 <-- StackLoc[-8] [ASSIGN]
-0008: VReg? <-- StackLoc[-12]
-0009: T3 <-- T2***DEREF*** [LOAD]
+0008: T3 <-- T2***DEREF*** [LOAD]
+0009: VReg? <-- StackLoc[-12]
 0010: RETURNVALUE T3
 0011: VReg? <-- StackLoc[-12]
 === END IR AFTER LOOP ROTATION ===
@@ -35,8 +35,8 @@
 0005: R0(T1) <-- StackLoc[-8] [ASSIGN]
 0006: R0(T1)***DEREF*** <-- #1 [STORE]
 0007: R0(T2) <-- StackLoc[-8] [ASSIGN]
-0008: VReg? <-- StackLoc[-12]
-0009: R0(T3) <-- R0(T2)***DEREF*** [LOAD]
+0008: R0(T3) <-- R0(T2)***DEREF*** [LOAD]
+0009: VReg? <-- StackLoc[-12]
 0010: RETURNVALUE R0(T3)
 0011: NOP 
 === END IR AFTER OPTIMIZATIONS ===

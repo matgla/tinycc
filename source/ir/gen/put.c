@@ -74,8 +74,70 @@ static SValue *ir_put_far_struct(TCCIRState *ir, SValue *sv, SValue *tmp)
   return tmp;
 }
 
+/* A byte-reversed (big-endian scalar_storage_order) lvalue is loaded and
+ * swapped by gv(); one that reaches the IR directly as a source operand is
+ * loaded here first, or it would be read in native byte order. */
+static SValue *ir_put_sso_load(SValue *sv, SValue *tmp)
+{
+  if (!sv || !(sv->r & VT_LVAL) || !sv->sso_reversed)
+    return sv;
+  sso_load_operand(sv, tmp);
+  return tmp;
+}
+
 /* Defined in ir/gen/softfloat.c */
 int ir_put_soft_call_fpu_if_needed(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest);
+
+/* C11 6.5p7 alias-class marking, consumed by LICM's invariant field-pointer
+ * hoist (licm.c).  An lvalue operand whose access provably reads a POINTER
+ * object, or writes a NON-pointer scalar object, carries IROP_AUX_ALIAS_PTR so
+ * the hoist can reason that such a write can never legally modify such a read
+ * (an int store over a pointer-typed member is a strict-aliasing violation).
+ * The marks are set only here, where the frontend's C type is still in hand:
+ *
+ *  - reads:  a deref SOURCE consumed as a value (plain loads and the deref
+ *    sources of arithmetic) is marked when the object's type is exactly a
+ *    pointer.  LEA is excluded — its source names an address, no access
+ *    happens.
+ *  - writes: a memory-write DEST lvalue is marked when the stored object's
+ *    type is a scalar that is neither a pointer nor char (char may alias
+ *    anything), and not a bitfield (its storage unit is shared).
+ *
+ * Union-member accesses are never marked — reading a union member other than
+ * the one last written is legal, so type-based disambiguation must not cross
+ * them.  Every refusal or missed site merely leaves the bit clear, which only
+ * declines the hoist. */
+static int ir_put_lvalue_reads_pointer(const SValue *sv)
+{
+  return (sv->r & VT_LVAL) && !sv->union_member && (sv->type.t & VT_BTYPE) == VT_PTR &&
+         !(sv->type.t & (VT_BITFIELD | VT_ARRAY));
+}
+
+static int ir_put_lvalue_writes_nonpointer(const SValue *sv)
+{
+  if (!(sv->r & VT_LVAL) || sv->union_member)
+    return 0;
+  int bt = sv->type.t & VT_BTYPE;
+  return (sv->type.t & VT_BITFIELD) == 0 &&
+         (bt == VT_INT || bt == VT_SHORT || bt == VT_LLONG || bt == VT_FLOAT || bt == VT_DOUBLE ||
+          bt == VT_LDOUBLE || bt == VT_BOOL || bt == VT_QLONG);
+}
+
+static IROperand ir_put_alias_mark_src(TCCIRState *ir, TccIrOp op, IROperand opnd, const SValue *sv)
+{
+  (void)ir;
+  if (op != TCCIR_OP_LEA && ir_put_lvalue_reads_pointer(sv))
+    opnd.aux |= IROP_AUX_ALIAS_PTR;
+  return opnd;
+}
+
+static IROperand ir_put_alias_mark_dest(TCCIRState *ir, TccIrOp op, IROperand opnd, const SValue *sv)
+{
+  (void)ir;
+  if (irop_config[op].has_dest && opnd.is_lval && ir_put_lvalue_writes_nonpointer(sv))
+    opnd.aux |= IROP_AUX_ALIAS_PTR;
+  return opnd;
+}
 
 int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *dest)
 {
@@ -99,11 +161,11 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
   ir_ensure_sym_registered(src2);
   ir_ensure_sym_registered(dest);
 
-  SValue far_src1, far_src2;
+  SValue far_src1, far_src2, sso_src1, sso_src2;
   if (irop_config[op].has_src1 == 1)
-    src1 = ir_put_far_struct(ir, src1, &far_src1);
+    src1 = ir_put_far_struct(ir, ir_put_sso_load(src1, &sso_src1), &far_src1);
   if (irop_config[op].has_src2 == 1)
-    src2 = ir_put_far_struct(ir, src2, &far_src2);
+    src2 = ir_put_far_struct(ir, ir_put_sso_load(src2, &sso_src2), &far_src2);
 
   /* Check if we need to use soft-float call instead of native FPU instruction.
    * Skip this for complex operations - they need special handling in the code generator. */
@@ -227,33 +289,33 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
       dest_interval->is_lvalue = new_is_lvalue;
     }
 
-    IROperand dest_irop = svalue_to_iroperand(ir, dest);
-    tcc_ir_pool_add(ir, dest_irop);
-  }
-
-  /* Handle source 1 operand */
-  if (irop_config[op].has_src1 == 1)
-  {
-    if (src1 == NULL)
-    {
-      fprintf(stderr, "tcc_ir_put: src1 is NULL for op %s\n", tcc_ir_dump_op_name(op));
-      exit(1);
+      IROperand dest_irop = ir_put_alias_mark_dest(ir, op, svalue_to_iroperand(ir, dest), dest);
+      tcc_ir_pool_add(ir, dest_irop);
     }
-    IROperand src1_irop = svalue_to_iroperand(ir, src1);
-    tcc_ir_pool_add(ir, src1_irop);
-  }
 
-  /* Handle source 2 operand */
-  if (irop_config[op].has_src2 == 1)
-  {
-    if (src2 == NULL)
+    /* Handle source 1 operand */
+    if (irop_config[op].has_src1 == 1)
     {
-      fprintf(stderr, "tcc_ir_put: src2 is NULL for op %s\n", tcc_ir_dump_op_name(op));
-      exit(1);
+      if (src1 == NULL)
+      {
+        fprintf(stderr, "tcc_ir_put: src1 is NULL for op %s\n", tcc_ir_dump_op_name(op));
+        exit(1);
+      }
+      IROperand src1_irop = ir_put_alias_mark_src(ir, op, svalue_to_iroperand(ir, src1), src1);
+      tcc_ir_pool_add(ir, src1_irop);
     }
-    IROperand src2_irop = svalue_to_iroperand(ir, src2);
-    tcc_ir_pool_add(ir, src2_irop);
-  }
+
+    /* Handle source 2 operand */
+    if (irop_config[op].has_src2 == 1)
+    {
+      if (src2 == NULL)
+      {
+        fprintf(stderr, "tcc_ir_put: src2 is NULL for op %s\n", tcc_ir_dump_op_name(op));
+        exit(1);
+      }
+      IROperand src2_irop = ir_put_alias_mark_src(ir, op, svalue_to_iroperand(ir, src2), src2);
+      tcc_ir_pool_add(ir, src2_irop);
+    }
 
   /* Mark function as non-leaf if it makes a call */
   if ((op == TCCIR_OP_FUNCCALLVOID) || (op == TCCIR_OP_FUNCCALLVAL))
@@ -333,6 +395,9 @@ int tcc_ir_put(TCCIRState *ir, TccIrOp op, SValue *src1, SValue *src2, SValue *d
           new_prev_dest.is_llocal = dest_irop.is_llocal;
           new_prev_dest.is_lval = dest_irop.is_lval;
           new_prev_dest.u = dest_irop.u;
+          /* ... and the slot's width: the instruction now stores into it,
+           * and a byte slot written as a word clobbers its neighbours. */
+          new_prev_dest.btype = dest_irop.btype;
         }
       }
       else

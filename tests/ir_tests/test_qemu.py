@@ -57,6 +57,72 @@ CURRENT_DIR = Path(__file__).parent
 
 # Add test files here - each must have a corresponding .expect file
 TEST_FILES = [
+    ("bug_asm_goto_edges.c", 0),
+    ("bug_asm_goto_branch_thread.c", 0),
+    ("bug_asm_goto_slot_back_edge.c", 0),
+    ("bug_asm_goto_select_join.c", 0),
+    ("bug_asm_goto_vrp_join.c", 0),
+    ("bug_asm_goto_label_hoisted_def.c", 0),
+    ("bug_asm_goto_postinc_fuse.c", 0),
+    ("bug_bool_param_normalized.c", 0),
+    ("bug_u64_quotient_remainder_reuse.c", 0),
+    ("bug_uaccess_setcc_latch.c", 0),
+    ("bug_access_ok_bool_tail.c", 0),
+    ("bug_struct_tag_paren_defers_body.c", 0),
+    ("bug_u64_constant_divmod.c", 0),
+    ("bug_romfs_reader_temporaries.c", 0),
+    ("bug_romfs_load_u64_tail.c", 0),
+    ("bug_interleaved_word_copy_ldm.c", 0),
+    ("bug_memset_small_clear.c", 0),
+    ("bug_kernel_validator_overwritten_zeroing.c", 0),
+    ("bug_addrof_local_copy_reload.c", 0),
+    ("bug_narrow_store_addr_wide_read.c", 0),
+    ("bug_clt_one_past_end_escape.c", 0),
+    ("bug_derived_iv_memory_base.c", 0),
+    ("bug_ptr_local_fwd_multidef_copy.c", 0),
+    ("bug_aggregate_copy_alignment.c", 0),
+    ("bug_readint64_combine.c", 0),
+    ("bug_wyhash_readint_copy8.c", 0),
+    ("bug_licm_field_ptr_hoist.c", 0),
+    ("bug_licm_field_ptr_zero_trip.c", 0),
+    ("bug_licm_stale_loop_body.c", 0),
+    ("bug_frame_word_pair_it_block.c", 0),
+    ("bug_licm_field_ptr_narrow_load.c", 0),
+    ("bug_bit_test_probe.c", 0),
+    ("bug_return_hop.c", 0),
+    ("bug_orphan_jump_hop.c", 0),
+    ("bug_orphan_jump_spans_empty.c", 0),
+    ("bug_struct_arg_split_join_param.c", 0),
+    ("bug_signed_truncate_identity.c", 0),
+    ("901_ra_spill_swap.c", 0),
+    ("900_loop_param_homes.c", 0),
+    ("902_escape_copy_call.c", 0),
+    ("903_switch_store_to_data.c", 0),
+    # ssa:decrement_to_carry — counted-down `for (; n >= K; n -= K)` loops:
+    # guard pre-decrement + latch CMP reading the body's counter, so the
+    # codegen CMP skip leaves `subs; bcs` latches (memset/memcpy word loops).
+    # Pins iteration counts for signed/unsigned/> shapes, empty bodies, the
+    # counter-exit-value +K fixup, chained loops on one counter, and the two
+    # declination shapes (counter read in body / after loop without fixup).
+    ("904_decrement_to_carry.c", 0),
+    # flag-neutral windows between a compare and its branch (setif window
+    # fuse, two-register remat) and the u8 stack-passed needle param
+    # (ra:stack_param_promote narrow widths).
+    ("905_setif_window_fuse.c", 0),
+    ("906_narrow_local_probe.c", 0),
+    ("907_borrowed_header_nrvo.c", 0),
+    # constant-arm edges jumping into a merged bool test (bool_diamond_branch
+    # mirrored orientation): the `c1 || c2` diamonds of the Zig C backend.
+    ("908_bool_diamond_or_merge.c", 0),
+    # function addresses as table values (clt_const_store IROP_TAG_SYMREF): the
+    # CBE's syscall dispatcher indexes a relocated image instead of copying the
+    # table per call; the escape/rewrite shapes must keep the stack copy.
+    ("909_const_local_table_symref_indexed.c", 0),
+    ("bug_const_local_table_direct_frame_reads.c", 0),
+    ("bug_const_local_table_var_dest.c", 0),
+    ("bug_guarded_field_reuse.c", 0),
+    ("897_shifted_address_shared_use.c", 0),
+    ("896_licm_promoted.c", 0),
     ("01_hello_world.c", 34),
     ("20_op_add.c", 0),
     ("30_function_call.c", 30),
@@ -67,17 +133,62 @@ TEST_FILES = [
     ("62_or_continue_shortcircuit.c", 0),
     ("90_global_array_assignment.c", 0),
     ("bug_swap.c", 0),
+    ("bug_dead_loop_exit_phi_mid_body_break.c", 0),
+    ("bug_dead_trail_addrvar_ptr_copy.c", 0),
+    ("bug_dead_trail_volatile_access.c", 0),  # dead_trail_addrvar keeps writes that access volatile memory
+    ("bug_narrow_volatile_load_dead_local.c", 0),  # a volatile load into a dead char/short local stays
+    ("bug_volatile_64bit_store_kept.c", 0),  # an overwritten 64-bit volatile store stays
+    ("bug_redundant_assign_volatile_local.c", 0),  # an overwritten store to a volatile local stays
+    ("bug_first_iter_exit_keeps_pre_exit_body.c", 0),
+    ("bug_ivsr_counter_elim_negative_offset.c", 0),
+    ("bug_ivsr_use_after_iv_update.c", 0),
+    ("bug_ivsr_continue_latch_before_body.c", 0),
+    ("bug_loop_unroll_do_while_eq_continue.c", 0),
+    ("bug_sizeof_compound_literal_file_scope.c", 0),
+    ("bug_init_compound_literal_member_relocs.c", 0),  # init_putv: member relocs use the member offset
+    ("bug_inline_replay_scope_binding.c", 0),  # inlined callee names bind at definition, not in the caller scope
+    ("bug_inline_nested_free_name_binding.c", 0),  # below depth 0, a callee's free name bound to an outer local keeps the call
+    ("bug_inline_nested_free_array_shadow.c", 0),  # ... a local W must not replace the callee's array W
+    ("bug_inline_into_outofline_nested_capture.c", 0),  # a callee inlined into an out-of-line nested fn sees no captures
+    ("bug_inline_replay_nested_def_scope.c", 0),  # a callee defining a nested function is not replayed
+    ("bug_inline_nested_fn_call_site_scope.c", 0),  # an inlined nested function's names bind as at its definition
+    ("bug_inline_replay_nested_callee_child_scope.c", 0),  # a replayed nested callee's own nested fn is unbound after the replay
+    ("bug_r5_nested_inline_combined.c", 0),  # nested frames + block scope + inline replay together
+    ("bug_r5_nested_inline_combined2.c", 0),  # nested fns + free names + K&R + volatile + comma + parent enums
+    ("bug_nested_loop_body_not_reemitted.c", 0),  # a nested fn whose auto-inline was revoked is not emitted again at TU end
+    ("bug_dce_overwrite_mac_accum_read.c", 0),  # ssa:dce overwrite-store scan sees an MLA accumulator read
+    ("bug_patch_type_shared_typedef_array.c", 0),  # patch_type must not complete the shared typedef array Sym
     ("bug_partition.c", 0),
     ("bug_llong_const.c", 0),
+    ("bug_init_putv_const_init_capture.c", 0),
+    ("bug_vector_expr_init_const_buffer.c", 0),  # const_init buffer valid only for a captured brace list / string
+    ("bug_vstore_const_init_control_flow.c", 0),  # a store never re-validates const_init; loop heads and labels forget it
+    ("bug_shl32_or_and_all_ones.c", 0),  # shl32_or_chain must not treat 64-bit AND #-1 as low-32 mask
+    ("bug_sso_be_bitfield_cross_unit.c", 0),  # big-endian bitfield crossing its demoted unit: be_bp must not go negative
+    ("bug_va_arg_pack_caller_scope_args.c", 0),  # __builtin_va_arg_pack() arguments are parsed and evaluated in the caller
+    ("bug_va_arg_pack_forwarding_shapes.c", 0),  # va_arg_pack: aggregate/array/function args, forwarding, nested fn, sizeof
+    ("bug_inline_const_arg_param_write_builtin.c", 0),  # always_inline const-arg subst must not fold builtins on a written parameter
+    ("bug_sso_be_runtime_byte_order.c", 0),  # big-endian scalar_storage_order members: every runtime load/store is byte-swapped
+    ("bug_skip_to_eol_io_buffer.c", 0),  # directive tail straddling the I/O buffer end must be skipped
     ("bug_mul_by_const.c", 0),
     ("bug_mul_compound.c", 0),
     ("bug_ull_mul10_loop.c", 0),
     ("bug_ull_mul10_once.c", 0),
     ("bug_ll_mul10_switch_min.c", 0),
+    ("bug_widening_mul64_control_flow.c", 0),
     ("bug_parse_number_64bit.c", 0),
     ("bug_llong_min_const_cmp.c", 0),
+    # cmp_narrow_64 proved a loaded operand's high word zero from the definition
+    # of the pointer it is loaded through, and compared only the low words.
+    ("bug_cmp_narrow_64_deref_pointer_def.c", 0),
+    # Inline const-eval folded non-const static elements to their initializers.
+    ("bug_inline_eval_static_array_fold.c", 0),
     ("bug_ull_mul_int_accum.c", 0),
+    ("bug_bit_builtins_ll_arg_conversion.c", 0),
     ("bug_struct_slot_reuse.c", 0),
+    # run_register_coalescing's swap handed the blocker the high half of a live
+    # 64-bit pair (r2:r3); the safety scan looked at low registers only.
+    ("bug_ra_register_swap_pair_high_half.c", 0),
     # ("bug_ternary_string.c", 0),  # Nested ternary with string literals
     # ("bug_return_else_string.c", 0),  # Return string from else block
     ("test_cleanup_double.c", 0),
@@ -155,6 +266,19 @@ TEST_FILES = [
     ("bug_addrof_reg_param.c", 0),
     ("bug_addrof_param_modify.c", 0),
 
+    # 64-bit (x << 8) | (x >> 24) must not fuse into a 32-bit ROR
+    ("bug_rotate_fusion_64bit.c", 0),
+
+    # __real__/__imag__ of call results and of non-complex operands
+    ("bug_real_imag_rvalue.c", 0),
+
+    # complex int + - * / on _Complex char/short read the imaginary half past
+    # the end of the narrow operand (the whole packed pair was cast at once)
+    ("bug_complex_narrow_int_arith_operand_parts.c", 0),
+    # a folded stack address keeps a _Complex operand's two halves (lea_fold,
+    # stack_addr_fold, the indexed-load fusions)
+    ("bug_lea_fold_complex_operand.c", 0),
+
     # struct field post-increment in for-loop (spilled lvalue address fix)
     ("bug_struct_field_postinc.c", 0),
 
@@ -163,9 +287,25 @@ TEST_FILES = [
 
     # union self-cast through typedef should not take the scalar-to-union extension path
     ("bug_union_self_cast_typedef.c", 0),
+    # (union U)x must initialise the member of x's type, not the first member
+    ("bug_union_cast_member_type.c", 0),
+    # a union initializer must not resize a struct member's flexible array type
+    ("bug_union_fam_init_shared_struct_type.c", 0),
 
     # inline asm operands may reuse their own live registers in IR mode
     ("bug_inline_asm_reserved_regs.c", 0),
+
+    # indirect call whose target is also one of its own arguments
+    # (`return v(n, v);`): ICE "cannot find safe register to pre-save indirect
+    # call target" at -O1/-O2/-Os when the call is a tail call
+    ("bug_ra_tail_call_callee_also_argument.c", 0),
+    ("bug_ra_tail_call_target_in_arg_reg.c", 0),
+    # a call argument loaded through a register (`f(x, *p)`) is read before
+    # another argument move overwrites that register
+    ("bug_call_arg_deref_base_clobbered.c", 0),
+    # the same in a noreturn leaf: the pointer parameters still sit in r0-r3,
+    # the argument registers, and the loads through them form cycles
+    ("bug_noreturn_leaf_deref_cycle_args.c", 0),
 
     # `register T x __asm("rN")` locals get a vreg (they aliased the previous
     # local's stack slot) -- the shape of Zig's C-backend syscall wrappers
@@ -177,6 +317,12 @@ TEST_FILES = [
     # branch narrowing / CBZ fusion: the rehearsal models mid-function returns
     # and refuses ranges holding inline asm
     ("bug_branch_narrow_rehearsal.c", 0),
+    # a jump over code-free phi copies is dropped, and a fall-through
+    # alignment pad widens the instruction before it (no executed NOPs)
+    ("bug_executed_nops.c", 0),
+    # ...but never when a branch targets the pad's address (an `if` join
+    # before the loop head): the widened instruction would be entered mid-way
+    ("bug_executed_nops_pad_target.c", 0),
 
     # a byte/halfword local read through its own stack slot (after lea_fold)
     # keeps its width -- Zig's 2-byte `!void` error union test
@@ -203,8 +349,31 @@ TEST_FILES = [
     # a constant initializer copied from .rodata keeps its narrow fields narrow
     ("bug_block_copy_init_narrow.c", 0),
 
+    # ra:reload_elim keeps its slot->register facts only across ops that touch
+    # neither the register nor the slot (BLOCK_COPY, helper calls, ...), and
+    # never deletes a volatile load (test_codegen_asm.py counts the loads)
+    ("bug_ra_reload_elim_block_copy_implicit_calls.c", 0),
+    ("bug_ra_reload_elim_volatile_frame_load.c", 0),
+    ("bug_ra_reload_elim_switch_apply_longjmp.c", 0),
+    ("bug_entry_store_asm_mem_output.c", 0),
+    ("bug_entry_store_retargeted_ptr_store.c", 0),
+    ("bug_strlen_fold_const_pointer_var.c", 0),
+    ("bug_var_tmp_fwd_lea_var0.c", 0),
+    ("bug_object_size_loaded_pointer.c", 0),
+    ("bug_ra_widen_ijump_forward_exit_backward_reentry.c", 0),
+
     # an array's address stored into memory keeps the array's initializer
     ("bug_dse_indexed_store_escape.c", 0),
+
+    # a pointer array read through a LOAD_INDEXED (its result used only as a
+    # store base) keeps the stores that fill it: dse's write-only addr-TMP scan
+    # must not treat a memory read's dest as that address
+    ("bug_dse_indexed_load_base_read.c", 0),
+
+    # const_memcpy_to_dest must not drop a local buffer's const fill when a
+    # read reaches it through a pointer the isolation scan cannot resolve
+    # (a multi-def TEMP from a ternary).
+    ("bug_const_memcpy_dest_multidef_ptr_read.c", 0),
 
     # dead-store elimination bounds reads through an address by its object
     ("test_dse_object_ranges.c", 0),
@@ -213,6 +382,8 @@ TEST_FILES = [
     # loads/stores through a pointer to a frame object become direct slots
     ("test_stack_deref_fold.c", 0),
     ("test_ptr_local_fwd.c", 0),
+    ("bug_ptr_local_fwd_asm_goto.c", 0),
+    ("bug_redundant_assign_volatile_read.c", 0),
     ("test_struct_arg_stack.c", 0),
     # struct values more than 32 KiB from the frame base (16-bit operand offset)
     ("test_struct_far_frame.c", 0),
@@ -222,6 +393,8 @@ TEST_FILES = [
     ("test_struct_param_pass_on.c", 0),
     # a local filled by a whole copy of a by-value struct parameter aliases it
     ("test_param_copy_alias.c", 0),
+    # a struct parameter split between r3 and the stack gets per-word PARAM vregs
+    ("bug_split_byval_param_word_vregs.c", 0),
     # byte/halfword field stores over a zero-filled local word fold into it
     ("test_slot_const_store_fold.c", 0),
     # a function only forwarding its parameters becomes a branch to the callee
@@ -246,6 +419,7 @@ TEST_FILES = [
     ("test_errunion_bool_checks.c", 0),
     # a static function identical to one already generated is dropped for it, unless its address is taken
     ("test_icf_folding.c", 0),
+    ("bug_icf_emitted_inline_body.c", 0),
     # a local copied from a call's own struct buffer is that buffer, anywhere in the function
     ("test_call_buffer_copy_alias.c", 0),
     ("test_ldm_block_copy.c", 0),
@@ -253,6 +427,27 @@ TEST_FILES = [
     ("bug_sra_narrow_field_undefined.c", 0),
     ("bug_narrow_field_store_forward.c", 0),
     ("bug_alive_share_evicted_owner.c", 0),
+    # ra:branch_thread trusted a `vr <- x` copy made above a loop header that is
+    # itself the flag setter; the back edge skips the copy, so every iteration
+    # was threaded as if vr == x and the test of vr was dropped (-O1/-O2/-Os)
+    ("bug_ra_branch_thread_copy_at_join_setter.c", 0),
+    # ra:branch_thread's unreachable sweep NOPed a block only an asm goto
+    # enters (the IR has no edge for it); the CAS cases need -minline-atomics
+    ("bug_ra_branch_thread_asm_goto_label.c", 0),
+    # ra:branch_thread's twin-compare decisions and SELECT splits in functions
+    # with asm goto (a label on the join, or on a block only it enters)
+    ("bug_bt_asm_goto_twin_select.c", 0),
+    # ra:loop_split placed a loop entry copy `T <- V` before the def group's
+    # loop-forced write-back `V <- T2` at their shared insertion point, so T
+    # read V with no reaching def (-O2)
+    ("bug_ra_loop_split_entry_copy_order.c", 0),
+    # ra:loop_split skipped graph-coalesced carriers and ran only before the
+    # rescan, so the yasld replay loops' carriers reloaded every iteration
+    ("bug_ra_loop_split_rescan_carriers.c", 0),
+    ("bug_ra_coalesce_contained_iv_copy.c", 0),
+    # a value live through a loop but unused in it kept its register for the
+    # whole loop while the loop's own values reloaded every iteration
+    ("bug_ra_live_through_loop_split.c", 0),
     # word copies between frame slots fused into LDM/STM chunks
     ("test_frame_block_copy.c", 0),
     ("test_sra.c", 0),
@@ -263,6 +458,7 @@ TEST_FILES = [
 
     # mul clobbers base register during struct array indexing (non-power-of-2 element size)
     ("bug_struct_array_index_mul_clobber.c", 0),
+    ("bug_deref_indexed_struct_arg.c", 0),
 
     # GNU attributes may prefix a declarator after a comma in a declaration list
     ("bug_decl_attr_after_comma.c", 0),
@@ -272,6 +468,8 @@ TEST_FILES = [
 
     # comma expressions in sizeof must safely drop unused results without IR
     ("bug_sizeof_comma_func_decay.c", 0),
+    # the value of `(a, f())` is the call's result, not a dropped return
+    ("bug_comma_rhs_call_result.c", 0),
 
     # 64-bit left-shift in a loop clobbers adjacent pointer register/spill slot
     ("bug_ll_shift_ptr_clobber.c", 0),
@@ -281,6 +479,10 @@ TEST_FILES = [
 
     # identity comparison fold eliminates struct member comparisons with different addends
     ("bug_struct_member_cmp_fold.c", 0),
+
+    # cmp_expr_fold folds (x + K) == (x + K) to true when x was reassigned
+    # between the two adds: the fallback only compared base vregs, pre-SSA.
+    ("bug_cmp_expr_fold_base_redef.c", 0),
 
     # SL-FWD multi-pred merge alias bug: inlined callee conditionally writes
     # through caller's stack ptr; caller post-call read must NOT forward the
@@ -373,6 +575,9 @@ TEST_FILES = [
     ("../tests2/102_alignas.c", 0),
     ("../tests2/103_implicit_memmove.c", 0),
     (["../tests2/104_inline.c", "../tests2/104+_inline.c"], 0),
+    # token-keyed -O2 function caches must not outlive their file: a later
+    # file's calls folded to an earlier file's constants
+    (["721_tu_function_caches.c", "721+_tu_function_caches.c"], 0),
     ("../tests2/105_local_extern.c", 0),
 
     # __builtin_classify_type tests
@@ -380,6 +585,10 @@ TEST_FILES = [
 
     # __builtin_bswap16, __builtin_bswap32, __builtin_bswap64 tests
     ("145_builtin_bswap.c", 0),
+
+    # Signed constant arguments must be converted to the builtin's unsigned
+    # parameter width before constant folding, just like runtime arguments.
+    ("bug_bswap_signed_const.c", 0),
 
     # __builtin_add_overflow, __builtin_sub_overflow, __builtin_mul_overflow tests
     ("165_builtin_add_overflow.c", 0),
@@ -409,6 +618,44 @@ TEST_FILES = [
     # mem_inline must move a STRUCT slot's offset out of the split u.s encoding
     # when it narrows the slot's btype (offset was becoming offset << 16)
     ("427_mem_inline_struct_slot.c", 0),
+    ("bug_mem_inline_named_pointer.c", 0),
+    # an 8-byte memcpy through a local's address (the Zig backend's align(1)
+    # load/store) must expand to plain accesses, not stay a call
+    ("bug_memcpy_local_copy8.c", 0),
+    # a by-value align(1) 4-byte struct copy read back byte-wise must keep the
+    # bytes in registers, not round-trip each group through stack slots
+    ("bug_eqlbytes_stack_roundtrip.c", 0),
+    ("bug_eqlbytes_kernel_roundtrip.c", 0),
+    ("bug_kernel_eql_slice.c", 0),
+    ("bug_mem_eql_entry_shape.c", 0),
+    ("bug_kernel_slice_scan.c", 0),
+    # a second inlined `m ? hdr(m)->capacity : 0` on the same m reuses the
+    # first diamond's result; `(hdr *)(m - 12)->f` loads [m, #-4]
+    ("bug_hash_map_capacity_guard.c", 0),
+    ("bug_componentiterator_inline.c", 0),
+    ("bug_inline_sret_loop_nested_budget.c", 0),
+    ("bug_alwinl_function_decay.c", 0),  # always_inline designator decayed without & emits the body
+    ("bug_pure_via_sret_scope_slot.c", 0),  # pure_via_sret flag kept off a global Sym's sym_scope word
+    ("bug_asm_label_static_toplevel_asm.c", 0),  # asm names a static symbol by its asm label
+    ("bug_regpair_static_aggregate_return.c", 0),
+    ("bug_regpair_static_by_name.c", 0),
+    ("bug_regpair_narrow_member_const.c", 0),
+    ("bug_sra_narrow_store_wide_value.c", 0),
+    ("bug_ptr_silent_store.c", 0),
+    ("bug_loop_leaf_wrapper_inline.c", 0),
+    ("bug_guard_head_partial_inline.c", 0),
+    # a guard head's free names keep their file-scope meaning under an outer expansion's locals
+    ("bug_guard_head_caller_bindings.c", 0),
+    # a head local or parameter named like a file-scope typedef: `T * x;` is no declaration
+    ("bug_guard_head_typedef_shadow.c", 0),
+    # an inlined K&R body converts each promoted argument to its parameter's type
+    ("bug_inline_knr_narrow_param.c", 0),
+    ("bug_knr_param_entry_conversion.c", 0),
+    ("bug_knr_definition_redeclared_by_prototype.c", 0),
+    # r0/r1 aggregate returns and their adapters around guard-head call sites
+    ("bug_regpair_guard_head_combo.c", 0),
+    ("bug_regpair_guard_head_cycle.c", 0),
+    ("bug_inline_shared_return.c", 0),
 
     # find_call_scratch must not hand out r7 (frame base, never a liveness
     # interval) as a data scratch while marshaling stack-passed struct args
@@ -423,6 +670,10 @@ TEST_FILES = [
     # a fallthrough-only loop condition lost its TEST_ZERO to setif_fuse and
     # the continue path spun forever on the same bitmask bit
     ("430_backedge_jump_target_fuse.c", 0),
+
+    # Barrel-shift fusion must preserve dereferenced consumer operands and
+    # must not move a dereferenced shift source across an intervening store.
+    ("431_barrel_shift_lval_operands.c", 0),
 
     # A param's implicit entry def means a conditional overwrite is never its
     # single def; cmp_expr_fold folded post-assign compares of a stack param
@@ -442,6 +693,15 @@ TEST_FILES = [
     # second `return <local>;` moved the caller's read off the first return's
     # slot, whose value was never copied (uninitialized read)
     ("434_inline_two_returns_struct_slot.c", 0),
+    ("bug_inline_struct_return_fallback_then_local.c", 0),
+    # inlining a struct-returning call must drop its sret parameter too
+    ("bug_inline_sret_orphan_param.c", 0),
+    # a small leaf costs nothing from the nested-inline budget
+    ("bug_inline_small_leaf_nested_budget.c", 0),
+    # static leaves with a few call sites inline (setRangeValue, next_bit)
+    ("bug_inline_few_callers_static.c", 0),
+    # a pure sret call at a loop's bottom feeds the loop's test: not dead
+    ("bug_dead_sret_call_loop_carried.c", 0),
 
     # 64-bit/FP values must not be if-converted to SELECT: the single-register
     # ITE lowering keeps garbage in the high word (self-host: known_bits'
@@ -563,6 +823,12 @@ TEST_FILES = [
     # much as the rewrites: an immediate second operand, a narrow destination,
     # and a value assigned twice.
     ("455_zero_half64.c", 0),
+    # A 64-bit shift by a literal, or OR/XOR/AND with one, of a value whose high
+    # word zero_half64 proved zero reads only the low word, so the widening's
+    # `mov hi, #0` dies (per-word may-be-set masks); refusals: two defs, a high
+    # word also stored, SAR of a maybe-negative value, loop-carried values.
+    ("bug_u64_zero_high_shift.c", 0),
+    ("bug_u64_known_high_word.c", 0),
 
     # `(v64 >> k) & mask` with k >= 32 as one UBFX on the high word -- every
     # accessor in lib/fp/soft/soft_common.h.  Sweeps every count and width, and
@@ -611,6 +877,12 @@ TEST_FILES = [
     # Loop rotation relocates the body; a SWITCH_TABLE's arm indices live
     # outside the instruction stream and were left pointing at the old slots.
     ("463_rotate_switch_in_body.c", 0),
+
+    # Barrel-shift annotations (orig_index side table) must survive loop
+    # rotation's cloned latch CMP and reach the switch-call IPC simulator.
+    ("bug_switch_call_barrel_shift.c", 0),
+    # a folded switch-dispatcher call with a discarded result leaves no dest-less ASSIGN
+    ("bug_switch_call_discarded_result.c", 0),
 
     # loop_relayout matched only a single-test `CMP; JUMPIF; JUMP` header, so
     # any short-circuit loop condition kept both trampoline jumps.  Covers the
@@ -682,6 +954,8 @@ TEST_FILES = [
     ("526_bottom_test_ptr_walk.c", 0),
     # &&/|| whose last operand is a constant: the chain decides, no stale flags
     ("527_landor_const_last_operand.c", 0),
+    # a discarded `c && (x, 1)` chain is backpatched when popped
+    ("bug_landor_const_tail_discarded.c", 0),
 
     # Compile-time strlen constant folding
     ("171_strlen_constfold.c", 0),
@@ -707,6 +981,7 @@ TEST_FILES = [
     ("../tests2/130_large_argument.c", 0),
     ("../tests2/133_string_concat.c", 0),
     ("../tests2/135_func_arg_struct_compare.c", 0),
+    ("../tests2/136_character_constant_values.c", 0),
 
     # Switch statement tests (jump table optimization)
     ("test_switch.c", 0),
@@ -729,6 +1004,21 @@ TEST_FILES = [
     ("nested_capture_param_mixed.c", 0),
     ("nested_capture_64bit.c", 0),
     ("nested_capture_two_level.c", 0),
+    ("bug_nested_capture_prescan_shadow_scope.c", 0),
+    # a nested function keeps sl (the static chain) out of RA and scratch use
+    ("bug_nested_static_chain_scratch_reg.c", 0),
+    # a static chain comes from a real frame, at the branch, for the callee's level
+    ("bug_nested_set_chain_frame.c", 0),
+    # captures and calls of an outer level use that level's frame
+    ("bug_nested_ancestor_chain.c", 0),
+    # a parent's captured aggregates are shared with its nested functions
+    ("bug_nested_parent_aggregate_capture.c", 0),
+    # a struct-returning nested function keeps its own locals at home
+    ("bug_nested_sret_own_frame.c", 0),
+    # a parent's frame layout keeps what its nested functions reach
+    ("bug_nested_parent_frame_captured_slots.c", 0),
+    # a variadic nested function keeps its chain slot
+    ("bug_nested_variadic_chain_slot.c", 0),
     ("sl_forward_load_redefines_var.c", 0),
     ("466_alive_share_boundary_coholder.c", 0),
     ("nested_direct_call_args.c", 0),
@@ -739,6 +1029,14 @@ TEST_FILES = [
     ("nested_funcptr_call_twice.c", 0),
     ("nested_recursive_parent.c", 0),
     ("nested_multi_level.c", 0),
+    # the by-token IPA caches never key a nested function (func_cache_token)
+    ("bug_nested_fn_ipa_cache_token.c", 0),
+    # ipa:pure_via_sret flags a function in SymAttr, not its sym_scope word
+    ("bug_pure_via_sret_flag_nested_fn.c", 0),
+    # nested bodies see the parent's visible enum constants, typedefs and tags
+    ("bug_nested_fn_parent_enum_constant.c", 0),
+    # a nested function's name binds in its block; bodies see their definition's names
+    ("bug_nested_fn_name_block_scope.c", 0),
 
     # Complex number tests
     ("test_complex_fold.c", 0),
@@ -851,6 +1149,12 @@ TEST_FILES = [
     # NOT a tcc bug: pins tcc's CORRECT output for a program the gcc oracle
     # miscompiles at -O2 (bitfield seed 1486); guards against a future regression.
     ("237_fuzz_bitfield_gcc_o2_miscompile.c", 0),
+    # Bug: a wide unsigned long long bit-field wrongly truncated the result of
+    # ops with a plain 64-bit operand (Y + s.x, Y << s.x, Y += s.x) and of
+    # shifts where the bit-field was only the shift count.  gen_op_impl masked
+    # whenever *either* operand was a wide unsigned bit-field, ignoring the
+    # other operand's width and the shift's left-only typing.  Wrong at all -O.
+    ("bug_wide_ull_bitfield_trunc.c", 0),
     ("238_fuzz_loop_const_sim_unsigned_char_residual.c", 0),
     ("239_fuzz_pack64_stack_slot_alias.c", 0),
     ("240_fuzz_block_copy_call_clobber.c", 0),
@@ -891,6 +1195,11 @@ TEST_FILES = [
     # struct_byval seed 6105: real-run scratch PUSH in an FP-omitted frame
     # skewed SP-relative loads inside the push window by 4 bytes.
     ("263_fuzz_scratch_push_sp_offset.c", 0),
+    # the discovery run models the real pass's dead pushed-register scratch
+    ("bug_dry_scratch_pushed_dead_reg.c", 0),
+    # no scratch save slot for an instruction phase 3 vacated registers at
+    ("bug_scratch_area_fixed_insns.c", 0),
+    ("bug_scratch_area_no_real_push.c", 0),
     # ptr seed 8507: ssa:load_cse's TVStore (store through an unresolved
     # TEMP pointer) survived a direct StackLoc store to the same address,
     # forwarding a stale constant into a later deref of that pointer.
@@ -1165,6 +1474,12 @@ TEST_FILES = [
     ("319_ssa_branch_unsigned_cmp.c", 0),
     ("320_ssa_branch_reflexive.c", 0),
     ("321_ssa_cmp_eq_dom_facts.c", 0),
+    # cmp_eq_prop also records compare-with-constant facts (ctz zero guard)
+    ("bug_cmp_eq_prop_const_fact.c", 0),
+    ("bug_narrow_ret_slot_load_fwd.c", 0),
+    ("bug_known_ext_sext_copy.c", 0),
+    ("bug_known_ext_bool_select.c", 0),
+    ("bug_sl_forward_signed_field_reload.c", 0),
     ("322_ssa_cprop_copy_chain.c", 0),
     ("323_ssa_cprop_var_forward.c", 0),
     ("324_ssa_cprop_var_const_fold_intervening.c", 0),
@@ -1217,6 +1532,13 @@ TEST_FILES = [
     # never freeing a register a surviving active interval still occupies.
     ("342_fuzz_ra_expire_coalesced_reg_share.c", 0),
 
+    # The call-crossing 64-bit pair fallback in ra_linear_scan evicted a
+    # callee-saved victim without asking whether an alive_share co-holder still
+    # lives in its register (x owns r11 across a branch arm where it is dead, `b`
+    # borrows it); the freed register went to the pair / the next call-crossing
+    # value and overwrote `b`.  Wrong at -O1/-O2/-Os, correct at -O0.
+    ("bug_ra_pair_eviction_shared_holder.c", 0),
+
     # Promoted from orphan triage: builtins, _Complex, aggregate init,
     # 64-bit ops, cast/bitfield, and previously-fixed bug regressions.
     # Verified against the gcc -m32 -funsigned-char oracle.
@@ -1224,6 +1546,13 @@ TEST_FILES = [
     ("142_builtin_copysign.c", 0),
     ("150_builtin_setjmp.c", 0),
     ("160_builtin_prefetch.c", 0),
+    # __builtin_signbit parsed its argument in "no code" mode, so the runtime
+    # path tested a stale value, dropped the argument's side effects, and died
+    # on an argument with no value at all (a call).
+    ("bug_builtin_signbit_nocode_arg.c", 0),
+    # __builtin_fabs / __builtin_fmax take a double parameter: an int / long
+    # long argument reached the libm helper unconverted (garbage high word).
+    ("bug_builtin_fabs_int_arg.c", 0),
     ("95_ternary_array.c", 0),
     ("96_compound_array_init.c", 0),
     ("99_struct_init_inline.c", 0),
@@ -1284,9 +1613,33 @@ TEST_FILES = [
     # source read later or a destination live before must keep theirs.
     ("477_frame_copy_coalescing.c", 0),
 
-    # __atomic_load/__atomic_store of 1/2/4 bytes are inline LDR/STR with a
-    # DMB per the memory order -- no runtime helper (libtcc1 has none).
+    # __atomic_load/__atomic_store of 1/2/4 bytes are inline -- no runtime
+    # helper (libtcc1 has none): on ARMv8-M LDA/STL for acquire/release/
+    # seq_cst, plain LDR/STR for relaxed; ARMv7-M uses LDR/STR plus DMBs.
     ("478_inline_atomic_load_store.c", 0),
+    # __ATOMIC_RELAXED..__ATOMIC_SEQ_CST are predefined, as in gcc and clang
+    ("bug_atomic_memory_order_predefined.c", 0),
+    # Seq_cst loads/stores as LDA/STL, RMW by order, and the inline CAS's
+    # failure-path CLREX: every order and width still moves the same values
+    # (test_atomic_cas_seqcst_codegen.py checks the shapes).
+    ("bug_atomic_cas_seqcst_orders.c", 0),
+    # `if (cas(...))`: the inline CAS loop branches to the if's targets (both
+    # outcomes, the write-back, a CAS-retry loop, out-of-range targets).
+    ("bug_atomic_cas_result_branch.c", 0),
+    # `ok = a == b; if (a != b) ...; if (ok)`: the second test threaded on the
+    # first branch's edges (a CAS's flag, plain compares, a changed operand).
+    ("bug_cas_flag_join_thread.c", 0),
+    # A join repeating its branches' compare: decided per edge, a SELECT there
+    # split into moves (a CAS kept as a value, operands changed, weaker or
+    # other-signedness conditions, three edges).
+    ("bug_bt_twin_compare_select.c", 0),
+    # A SELECT join split into side blocks while another join threads its
+    # edge to the same place with pad copies: the padded edge must not fall
+    # into a side block (both processing orders).
+    ("bug_bt_select_shared_pad.c", 0),
+    # The CAS loop's branch lands on a jump block every other branch threads
+    # past: that jump is still emitted.
+    ("bug_cas_branch_orphan_jump.c", 0),
 
     # DSE: a copy of a temp holding one of two stack addresses is still an
     # address; loads through it keep the stores that filled both objects
@@ -1379,6 +1732,7 @@ TEST_FILES = [
     # UMULL + zero-extended words -> UMAAL before RA (opt/ra/umaal_fusion.c):
     # one/two addends, word views of pairs, loads, bignum row, pair pressure.
     ("508_umaal_fusion.c", 0),
+    ("bug_wyhash_pair_spills.c", 0),
     # A byte/halfword STORE into a register temp is a whole def (MOV, or a
     # word store of the extended value when spilled): not live from entry.
     ("509_narrow_temp_store_def.c", 0),
@@ -1428,16 +1782,24 @@ TEST_FILES = [
     # assignment, aligned memcpy, by-value stack arguments (tail call too) and
     # initialiser images in a leaf; every chain entry, guards around the copy.
     ("549_copy_stub_calls.c", 0),
+    # byte_store_merge must stop before a sub-word store that is a jump target;
+    # otherwise entering at the label skips the merged word store entirely.
+    ("550_byte_store_merge_jump_target.c", 0),
     # SRA: a u16 stored into a word field whose other half is struct padding is
     # a plain move (Zig error unions), not a read of the old word and a BFI.
     ("600_sra_padded_partial_store.c", 0),
     # __builtin_{add,sub,mul}_overflow on 8/16/32-bit results: the 32-bit
     # add/sub checks and the int-width narrow path, against 64-bit reference.
     ("601_overflow_builtins_narrow.c", 0),
+    # overflow builtins with operands whose sign/width differs from the result:
+    # the check uses the operands' own infinite-precision value.
+    ("bug_overflow_builtins_mixed_operand_types.c", 0),
     # -Os machine outliner: one template instantiated eight times; its windows
     # (a jump target at the start, a compare feeding the branch after it, an
     # IT block inside) become shared bodies called with BL.
     ("602_outline_shared_windows.c", 0),
+    # Rewinding an outlined window to BL must invalidate position-keyed spill reloads.
+    ("bug_os_outliner_spill_reload.c", 0),
     # awk's record reader: a static helper's out-parameter writes to the
     # caller's locals were lost at -O1+, so the whole input was one record
     ("603_inline_outparam_record_split.c", 0),
@@ -1449,10 +1811,374 @@ TEST_FILES = [
     ("607_assign_not_of_call_writing_lhs.c", 0),
     # barrel-shift fusion across a join: a VAR with a def per arm
     ("608_barrel_shift_join_multidef.c", 0),
+    # Zig kernel's VFS mount at -O2: `&local + 28` into an inlined interface
+    # call; dse dropped the copy into the local
+    ("609_dse_inlined_param_var_store_copy.c", 0),
+    # Zig kernel's MaxProcFile at -O2: known_bits read `T <-- V [LOAD]` as a
+    # load through V, and the vfmt args slice pointer became 2048
+    ("610_kb_var_load_is_own_value.c", 0),
+    # a weak default is replaceable: never inlined or folded (yaslibc sbrk)
+    (["612_weak_default_not_inlined.c", "612+_weak_default_not_inlined.c"], 0),
+    # yasld find_thunk at -O2: memcpy into asBytes(&local) then compare
+    ("611_find_thunk_memcpy_locals.c", 0),
+    # pico-sdk's spinlock release: an asm input whose local the optimizer
+    # const-propagated and deleted was still loaded from the dead slot
+    ("613_asm_input_const_local.c", 0),
+    # frame relayout runs on functions with inline asm: the slot an "=m"
+    # operand names stays put while dead and disjoint objects around it go
+    ("614_frame_relayout_asm.c", 0),
+    # Zig's `self: Self` by value: struct copies whose reads ssa:copy_fwd
+    # takes from the source, and the shapes it must leave alone
+    ("615_struct_copy_forward.c", 0),
+    # ssa:copy_fwd with escapes as events: a copy whose address goes out
+    # only later (or in another live range of a reused local) is forwarded;
+    # a stashed pointer, a later call or the next iteration still see it
+    ("660_copy_fwd_flow_escape.c", 0),
+    # ... and with a global as the source: read-only data takes every read,
+    # a writable global none after a call or store that may change it
+    ("661_copy_fwd_global_source.c", 0),
+    # ... and with addresses no operand shows: memcpy/memset's result, a
+    # pointer one past the object; a writable variable in a code section;
+    # memmove_global_fwd's MLA accumulator and jumps into its window
+    ("662_copy_fwd_hidden_addresses.c", 0),
+    # frame dead bytes (ir/frame_dfe.c): writes nothing reads dropped, copies
+    # shrunk or turned into word moves, objects cut into the pieces still
+    # named -- and the escapes, copies out, by-value args it must leave alone
+    ("680_frame_dead_bytes.c", 0),
+    # a temporary built right before a copy (a 0xaa image, a callee's
+    # result) built in the copy's destination instead, and the refusals
+    ("681_frame_image_forward.c", 0),
+    # ... and against setjmp called by name, computed goto, an asm "m"
+    # operand, an overlapping memmove; then the post-RA frame passes it
+    # newly reaches: an MLA accumulator read, a reload elimination's
+    # register reused by self_store
+    ("682_frame_dfe_control.c", 0),
+    ("683_post_ra_frame_reads.c", 0),
+    # an inlined body's escaped local ends where the body ends -- an index
+    # that has to move with the code (unrolled in front of it, copied by an
+    # unrolled loop around it), or relayout overlaps it with a live object
+    ("684_frame_scope_end_moved.c", 0),
+    ("685_frame_scope_end_copies.c", 0),
+    # dead_local_slot: a memcpy source through a pointer to one of several
+    # locals (a tagged union copied out by value: yasos' SD config) still
+    # reads them -- the stores filling them were deleted as dead
+    ("686_dead_local_slot_memcpy_src.c", 0),
+    ("bug_dead_local_slot_multidef_memcpy_src.c", 0),
+    # dead_loop: a loop emptied by copy_fwd is deleted up to its exit, and
+    # the switch dispatch laid out between its back-edge and that exit went
+    # with it -- the body is the natural loop, not the instruction range
+    ("687_dead_loop_switch_dispatch.c", 0),
+    # an LDM/STM-fused frame word copy used its last word's register as the
+    # STM base while ra:reload_elim still read that word from it
+    ("688_ldm_stm_fusion_reload_elim.c", 0),
+    # memmove_to_indexed_stores: a temporary zeroed by memset then filled,
+    # copied through a pointer -- the bytes only the memset wrote (a trailing
+    # `0` member) were never stored to the destination (the device tcc's own
+    # frame_dfe.c: `d->acc[n] = (DfeAcc){..., 0}`)
+    ("689_memmove_indexed_memset_tail.c", 0),
+    # docs/bugs round 2026-10-06: a join on a NOP in global_sl_fwd and
+    # global_base_share; known_bits taking a loaded pointer for its slot's
+    # address; `__imag__ *p`; entry_store, memmove_to_indexed_stores and
+    # sl_forward escape/alias holes; reroll's counter init skipped by a branch
+    # into the run; computed-goto labels after unrolling and at -O0; narrow
+    # integer complex parts (found on the way)
+    ("700_global_sl_fwd_nop_join.c", 0),
+    ("701_global_base_share_nop_join.c", 0),
+    ("702_known_bits_loaded_pointer.c", 0),
+    ("703_imag_through_pointer.c", 0),
+    ("704_entry_store_escape_chains.c", 0),
+    ("705_memmove_stores_before_reads.c", 0),
+    ("706_sl_forward_whole_object_escape.c", 0),
+    ("707_reroll_entry_through_init.c", 0),
+    ("708_computed_goto_labels.c", 0),
+    ("709_complex_int_narrow_parts.c", 0),
+    # -Os os_const_share: a wide constant (Zig's 0xaaaaaaaa undefined fill, -1,
+    # 0x2002) stored, passed and phi-copied at several sites is built once at
+    # entry; a spilled share is reloaded, never rematerialised; an entry def
+    # in front of a backward-goto target.
+    ("560_os_const_share.c", 0),
+    # ra:known_ext: extensions of values already extended (loads, masks,
+    # phis), duplicate extensions, a BFI that reinserts its own field; and the
+    # return classes a direct call to a static function relies on.
+    ("580_known_ext_joins.c", 0),
+    ("581_known_ext_call_return.c", 0),
+    # A widening store into a char/short object (u8 -> u16) casts at once
+    # instead of taking vstore's delayed int -> char/short cast.
+    ("582_widening_charshort_store.c", 0),
+    # Word-by-word copies between frame objects share the two objects' bytes
+    # (frame.c frame_find_word_copies): inlined by-value parameters, chains,
+    # join objects proved apart by liveness, and the near misses.
+    ("590_frame_word_copy_merge.c", 0),
+    ("710_memmove_stack_dst_derived_read.c", 0),
+    # ssa_string_fold: a pointer loaded from a rodata table is not a string, and
+    # strcpy to an odd frame offset must not become a word STM
+    ("715_ssa_string_fold_ptr_table.c", 0),
+    ("716_strcpy_stack_unaligned_dst.c", 0),
     # toysh's wildcard_matchlen against literal case patterns, and strchr
     # finding the NUL terminator: device-only shapes, pinned
     ("604_toysh_wildcard_literal.c", 0),
     ("605_strchr_nul_terminator.c", 0),
+    # a volatile bitfield assignment's value is the value stored, not a
+    # re-read of the field (it used to read the register again at -O0)
+    ("620_volatile_bitfield_assign_value.c", 0),
+    # inline asm "m" operands on locals and stack parameters: addressed off
+    # SP/r7 at the final frame offset, and an "m" input's store kept
+    ("621_asm_memory_operand_frame.c", 0),
+    # an asm operand whose variable was spilled: the lowering resolved its
+    # frame home twice and wrote/read below SP (yasos kernel mrs psp), and
+    # missed the asm's own register save when addressing off SP
+    ("623_asm_spilled_operand.c", 0),
+    # a 64-bit equality CMP whose SELECT a tail merge moved behind a JMP took
+    # the relational SBCS lowering (gen_opic's compare fold, as the native tcc)
+    ("622_cmp64_eq_consumer_behind_jump.c", 0),
+    # struct returns built in the caller's buffer across calls (sret_nrvo):
+    # the caller never hands a callee a buffer it can reach another way --
+    # the destination passed in the same call, stashed, taken in a loop, a
+    # pointer (tcc_ir_sret_dealias); locals merged into the buffer only where
+    # their lifetimes never meet (gotos, loops, copies both ways); and the
+    # front end's claim of a destination only for `x = f(...)` itself, never
+    # behind a comma, an argument call, a statement expression, a brace
+    # initializer, nor at a packed member's unaligned address
+    ("640_sret_noalias.c", 0),
+    ("641_sret_nrvo_merge.c", 0),
+    # ... and a local whose payload alone is copied into the result
+    # (`return try f()`), merged word by word where the two never meet
+    ("bug_sret_nrvo_partial_forward.c", 0),
+    # ... and an optional copied between locals: a test of the copy's
+    # is_null, a relay built by member stores (copy_fwd)
+    ("bug_copy_fwd_relay_padding.c", 0),
+    ("bug_copy_fwd_relay_window_ops.c", 0),
+    ("bug_copy_fwd_relay_asm_escape.c", 0),
+    ("642_sret_claim_shapes.c", 0),
+    ("643_sret_claim_postfix.c", 0),
+    ("644_sret_memop_result.c", 0),
+    # ... and the copy it adds after a call gets its own orig_index, or a
+    # label address on instruction 0 lands on it
+    ("645_sret_label_addr_orig_index.c", 0),
+    # a pure-forward wrapper whose only call was dropped (the callee folded
+    # empty) came out 0 bytes at -O2/-Os and ran into the next function
+    ("720_pure_forward_wrapper_dropped_call.c", 0),
+
+    # docs/bugs round 2026-10-06 (2): the nested-function table reallocated
+    # under compile_nested_functions; a nested function resolving its
+    # siblings' captured offsets against its own IR; captured locals sharing
+    # one -O0 slot; dead_vla_struct's nested-function guard reading a field
+    # nothing set; a pure-forward wrapper left 0 bytes once its call was dropped
+    ("711_nested_funcs_grow_while_compiling.c", 0),
+    ("712_nested_sibling_captured_offsets.c", 0),
+    ("713_pure_forward_dropped_call.c", 0),
+    ("714_nested_captured_slots_whole_function.c", 0),
+
+    # Block-scoped frame objects share bytes across disjoint blocks (frame
+    # colouring with block scope ends); a value carried around a loop through
+    # a pointer, and a backward goto inside one block, must keep them apart.
+    ("740_block_scope_frame_sharing.c", 0),
+
+    # UBSan sweep finds (2026-10-06): a real constant converted to complex long
+    # long copied its real part into the imaginary one; out-of-range constant
+    # shift counts were folded with the host's UB shift
+    ("790_complex_llong_from_real_const.c", 0),
+    ("791_shift_count_out_of_range_not_folded.c", 0),
+
+    # ssa:sccp regressions (docs/bugs ssa-sccp-*): escaped frame address and
+    # indexed store extents were guessed (4096 / 64 bytes), a narrow store was
+    # forwarded without truncation, inline asm and BLOCK_COPY were not writers.
+    ("792_sccp_escaped_large_frame_object.c", 0),
+    ("793_sccp_indexed_store_large_array.c", 0),
+    ("794_sccp_narrow_store_forward_truncates.c", 0),
+    ("795_sccp_asm_and_block_copy_writes.c", 0),
+    # docs/bugs ssa family: zig counter init moved over an intervening def of
+    # the counter; ptr IV exit value substituted past an early break
+    ("796_zig_counter_init_clobbered_by_def.c", 0),
+    ("797_ptr_iv_exit_subst_early_break.c", 0),
+
+    # docs/bugs round 2026-10-06 (3): dse treated every op off its short
+    # blacklist as pure and deleted __builtin_apply / __builtin_setjmp whose
+    # result was unused
+    ("730_dse_keeps_builtin_apply.c", 0),
+    ("731_dse_keeps_builtin_setjmp.c", 0),
+
+    # docs/bugs ssa-store family (2026-10-07): dead_overwrite_stores ignored
+    # asm readers, ptr_store_dse ignored __builtin_apply, diamond_store_fwd
+    # built a phi-less two-def TEMP (sccp folded it; -O2 crashed)
+    ("750_ssa_dos_keeps_store_read_by_asm.c", 0),
+    ("751_ptr_store_dse_keeps_store_read_by_apply.c", 0),
+    ("752_diamond_store_fwd_two_def_temp.c", 0),
+
+    # gen_c.py "hazard" profile finds (2026-10-06): dead_vla_struct deleted a
+    # VLA read only through an inlined call's argument copy
+    ("810_dead_vla_read_by_inlined_arg.c", 0),
+    # ... and an asm input that is a comparison result was never materialised
+    ("811_asm_input_comparison_value.c", 0),
+    # ... and an asm output through a pointer lost the pointer
+    ("813_asm_output_through_pointer.c", 0),
+    # ... ssa:licm hoisted a nested-function-captured local out of a loop
+    # calling the writer, and ub_only_body_elide emptied a nested function
+    # whose StackLoc (static chain) reads it took for uninitialised locals
+    ("814_licm_nested_captured_local.c", 0),
+    ("815_nested_store_through_captured_ptr.c", 0),
+    # Hazard "sandwich" programs: for each construct, ten shapes of a value
+    # read before it, memory changed by it, the value read after (load, expr,
+    # compare, global, pure call, loop, local, xor); expected output from
+    # arm-none-eabi-gcc -O2.
+    ("820_hazard_sandwich_alloca.c", 0),
+    ("821_hazard_sandwich_apply.c", 0),
+    ("822_hazard_sandwich_asm_clob.c", 0),
+    ("823_hazard_sandwich_asm_goto.c", 0),
+    ("824_hazard_sandwich_asm_m.c", 0),
+    ("825_hazard_sandwich_asm_m_nv.c", 0),
+    ("826_hazard_sandwich_asm_pr.c", 0),
+    ("827_hazard_sandwich_asm_r.c", 0),
+    ("828_hazard_sandwich_call.c", 0),
+    ("829_hazard_sandwich_cgoto.c", 0),
+    ("830_hazard_sandwich_nested.c", 0),
+    ("831_hazard_sandwich_switch.c", 0),
+    ("832_hazard_sandwich_vla.c", 0),
+    ("833_hazard_sandwich_vstore.c", 0),
+    ("834_rodata_relative.c", 0),
+    ("835_static_init_element_address.c", 0),
+    # __builtin_setjmp resume ADR distance broken by a literal-pool flush
+    ("836_builtin_setjmp_after_literal_pool_flush.c", 0),
+    ("837_nl_setjmp_after_literal_pool_flush.c", 0),
+    # redundant_loop_check folded an in-body test of the guard variable after the body redefined it
+    ("838_redundant_loop_check_guard_redef.c", 0),
+    # switch_collapse NOPed the dispatch; control fell through to the epilogue
+    ("839_switch_collapse_dispatch_fallthrough.c", 0),
+    # always_inline + const arg: inline_const_args substituted the param's slot
+    # into asm operands regardless of role/def -> wrong value + spurious lvalue error
+    ("840_inline_const_arg_asm_param_write.c", 0),
+    ("841_gvn_addrtaken_param.c", 0),
+    ("843_load_cse_global_pun_store.c", 0),
+    ("844_load_cse_narrow_frame_forward.c", 0),
+    # ssa:arm_fuse_shl_add_to_{load,store}_indexed read a redefined param at the memory op
+    ("842_ssa_shl_add_indexed_param_redef.c", 0),
+    # loop passes (source/opt/flat/loop): exit condition, IV init reaching def, unsigned trip count, post-increment IV reads
+    ("845_loop_eliminate_symbolic_exit_cond.c", 0),
+    ("846_loop_iv_init_reaching_def.c", 0),
+    ("847_loop_trip_count_unsigned_cond.c", 0),
+    ("848_loop_unroll_iv_read_after_increment.c", 0),
+    ("849_tu_modref_memcpy_result_indirect_call.c", 0),
+    ("850_temp_slot_call_args.c", 0),
+    (["851_weak_callee_modref.c", "851+_weak_callee_modref.c"], 0),
+    (["bug_weak_inferred_noreturn.c", "bug_weak_inferred_noreturn+.c"], 0),
+    ("bug_noreturn_call_cfg_edge.c", 0),
+    ("bug_noreturn_leaf_lr_push.c", 0),
+    ("bug_subs_window_aliased_store.c", 0),
+    (["bug_weak_pure_via_sret.c", "bug_weak_pure_via_sret+.c"], 0),
+    (["bug_func_write_summary_deref_param.c", "bug_func_write_summary_deref_param+.c"], 0),
+    ("bug_func_purity_folded_read.c", 0),
+    ("bug_pack64_tautology_redef.c", 0),
+    ("bug_pragma_pack_push_in_body.c", 0),
+    ("bug_post_ra_diamond_switch_target.c", 0),
+    ("bug_if_convert_select_goto_switch.c", 0),
+    ("bug_sso_be_packed_bitfield_unit_in_struct.c", 0),
+    ("852_memset_libc_param_order.c", 0),
+    ("853_licm_param_redef.c", 0),
+    ("854_local_only_body_phi_pointer.c", 0),
+    ("855_local_array_template_conversion.c", 0),
+    ("856_libcall_name_static_user_fn.c", 0),
+    ("857_label_diff_table.c", 0),
+    ("858_hex_float_leading_zeros.c", 0),
+    ("859_complex_llong_const_cast.c", 0),
+    ("bug_complex_imaginary_literal_uninit_stack.c", 0),
+    ("bug_complex_double_div_param_stack.c", 0),
+    ("860_alias_to_inlined_static.c", 0),
+    ("861_global_block_extern_alias.c", 0),
+    ("862_global_sl_fwd_overlap_and_asm.c", 0),
+    ("863_dse_pointer_chain_multidef.c", 0),
+    ("864_asm_goto_label_only_block.c", 0),
+    ("865_complex_llong_runtime_conversions.c", 0),
+    # Zig mem.readInt: constant-trip mid-exit byte loop (ssa:loop_unroll_midexit)
+    # + byte-chain -> ldr/ldrh (ssa:load_combine), with the shapes both must
+    # decline (store between loads, signed bytes, BE, 3 bytes, trip 17, runtime trip).
+    ("870_readint_unroll_combine.c", 0),
+    # Load CSE keyed on the dest btype instead of the access width/extension:
+    # LDRB/LDRSB/LDRH/LDR of one address merged (ssa:cprop, ssa:load_cse,
+    # invariant_global_load_hoist); load_combine exposed it on readInt code.
+    ("871_load_cse_access_width.c", 0),
+    # 2-byte load_combine at base+#k widened to LDR by the LOAD -> LOAD_INDEXED
+    # displacement folds; ssa:dead_loop's guarded rewrite dropping exit-live
+    # header phis of a loop whose inner constant-trip loop was unrolled.
+    ("872_readint_narrow_and_dead_loop.c", 0),
+    # return-block register sharing across a branch that leaves the return tail
+    ("873_ret_share_branch_exit.c", 0),
+    # setif_mask_fold re-emitting / rewriting a barrel-shift-annotated CMP
+    ("874_setif_mask_fold_barrel_shift.c", 0),
+    ("875_setif_mask_fold_annotated_outer_cmp.c", 0),
+    # dead_loop guarded rewrite: a non-candidate header phi read after the loop
+    ("876_dead_loop_guarded_phi_escape.c", 0),
+    # bool_norm proving {0,1} through an OR whose src2 carries a barrel shift
+    ("877_bool_norm_barrel_shift.c", 0),
+    # setif_branch_remat re-emitting a barrel-shift-annotated CMP at a branch
+    ("878_setif_remat_barrel_shift.c", 0),
+    # ssa:loop_rotate copying a barrel-shift-fused header CMP to the latch
+    ("bug_loop_rotate_latch_cmp_barrel_shift.c", 0),
+    # frame_dfe: copies of never-written bytes and of vregs nothing defines
+    # (zig tagged-value temporaries) are dropped; every byte written on some
+    # path, through a pointer, by a callee, or volatile still arrives
+    ("883_frame_undef_copy.c", 0),
+    ("884_errtail_overwritten_ptr_stores.c", 0),
+    ("885_errtail_imm_tail_merge.c", 0),
+    # ssa:loop_header_dup: while loops with header prefix instructions bottom-tested
+    ("880_loop_header_dup.c", 0),
+    # ra:jt_backward: conditional branches threaded backwards onto a loop head post-RA
+    ("879_loop_backedge_thread.c", 0),
+    # ra:backedge_phi_hoist: the exit target must be the fall-through after the latch JUMP
+    ("881_backedge_phi_hoist_fallthrough.c", 0),
+    # One gen_c.py "hazard" program pinned (seed 233 uses all ten constructs:
+    # __builtin_apply on a global and a local, __builtin_setjmp, asm "=m" /
+    # "+r" / memory clobber, VLA, alloca, nested function, computed goto);
+    # expected checksum from arm-none-eabi-gcc -O0 and -O2.
+    ("812_fuzz_hazard_profile_seed233.c", 0),
+
+    # __builtin_constant_p of a comparison (gcc.c-torture/compile/20110902.c):
+    # the single-constant-def vreg shortcut read a VT_CMP/VT_JMP value's stale
+    # vr (`k < n` -> 1) and its cmp_op/cmp_r union as a Sym pointer (wild heap
+    # read, intermittent compiler segfault)
+    ("745_builtin_constant_p_comparison.c", 0),
+    # __builtin_constant_p of a local reassigned later in a loop body: only the
+    # definitions parsed so far were counted, so the wrong 1 was baked into
+    # every trip of the loop.
+    ("bug_builtin_constant_p_loop_redef.c", 0),
+    # __*_chk elision trusted the same flow-insensitive per-Sym max fact: a
+    # loop back edge, an escaped address, a pointer write and a run-time
+    # objsize each dropped a check the runtime function would have caught.
+    ("bug_fortify_objsize_max_fact_flow_insensitive.c", 0),
+    # Phase-3 scratch fixup must not split coalesced classes / elided phi ends.
+    ("792_scratch_reassign_coalesced_class.c", 0),
+    # Stack-passed struct copies save only the registers the call setup still reads.
+    ("886_struct_arg_copy_live_regs.c", 0),
+    # inline:wrappers / barrier_leaf / trivial_leaf / leaf_rescue: Zig-style accessor chains, capped wrappers.
+    ("889_inline_accessor_classes.c", 0),
+    # inline:multi3 + arm_mla_zero_product: zig.h's 128-bit multiply without the __multi3 call.
+    ("890_inline_multi3.c", 0),
+    # arm_addreg_indexed: [Rn, Rm] loads/stores from `base + index` (W4).
+    ("891_addreg_indexed.c", 0),
+    # ssa:pure_call_cse + purity:transitive: a repeated call to a callee that writes no memory reuses the result.
+    ("892_pure_call_cse.c", 0),
+    # Read-modify-write atomics through the runtime helpers; the same file runs
+    # inline under -minline-atomics below.
+    ("893_inline_atomic_rmw.c", 0),
+    # System-instruction asm lowered to machine calls, and small loop leaves
+    # inlined in expression context.
+    ("894_asm_machine_call.c", 0),
+    # ra:bump_sink: pointer bumps sunk below the base's last read (post-indexed walks).
+    ("895_bump_sink.c", 0),
+    # ra:exit_sink: values computed each iteration but read only in a loop-exit
+    # block sink into that block (docs/bugs/loop-exit-value-computed-every-iteration.md).
+    ("898_loop_exit_sink.c", 0),
+    # fuzz seed 2395: the store-source LEA fusion (arm_store_add_imm) hoisted a
+    # load to the LICM'd address ADD across a loop back-edge that re-enters
+    # after an aliasing store in the same loop (fallthrough join invisible to
+    # its linear clobber scan). Wrong only at -O2.
+    ("899_fuzz_lea_store_src_loop_hoist.c", 0),
+    # ra:caller_save: call-crossing values in caller-saved registers, saved around cold calls.
+    ("887_ra_caller_save_cold_calls.c", 0),
+    # ra:evict_pair: a cold 64-bit pair held across a hot loop is the victim a single value evicts.
+    ("888_ra_evict_cold_pair.c", 0),
+    ("891_ra_branch_cost.c", 0),
+    ("893_inline_readonly_wrapper.c", 0),
+    ("894_pure_call_forward.c", 0),
 
     # First-iteration-exit loop elimination (20070824-1.c pointer-chase shape
     # + runtime control loops); pins behavior across the legacy ->
@@ -1602,6 +2328,14 @@ TEST_FILES = [
     ("418_fuzz_slfwd_call_dest_var.c", 0),
     ("419_loop_const_sim_wide_trip.c", 0),
     ("420_bitfield_unit_narrow.c", 0),
+    # RA interval missed a value live over a forward exit + backward re-entry: wrong at all -O.
+    ("bug_ra_interval_forward_exit_backward_reentry.c", 0),
+    ("bug_ra_interval_live_in_at_asm_block_start.c", 0),
+    # codegen ADD/SUB+CMP#0 fusion skipped a CMP that is a loop back-edge target (and a volatile read).
+    ("bug_sub_cmp0_fusion_jump_target.c", 0),
+    ("bug_cmp0_fusion_deref_operand.c", 0),
+    # ra:struct_arg_split: small by-value struct args built in a slot become scalar word PARAMs.
+    ("882_struct_arg_word_split.c", 0),
 ]
 
 # Per-test compiler defines (e.g. for missing platform macros)
@@ -1770,6 +2504,13 @@ TCC_BUG_TEST_FILES = [
     # the value is read at the CALL, below it.  printf got p+1 (FatFs
     # f_setlabel -> FR_INVALID_NAME in sdformat).
     ("bug_postinc_call_arg_deref.c", 0),
+    # Bug: sl_forward forwarded a frame store across a call although the slot's
+    # address escapes later in the same loop body (back edge).
+    ("bug_sl_forward_escape_in_loop.c", 0),
+    # Bug: switch (a < b) / (!a) / (a && b) dispatched on an operand, not the 0/1 result.
+    ("bug_switch_on_comparison.c", 0),
+    # Bug: switch_to_data NOPed a case body that a goto still jumps to.
+    ("bug_switch_to_data_goto_case.c", 0),
 
 
 ]
@@ -1785,6 +2526,10 @@ TAGGED_TEST_FILES = [
     "../tests2/60_errors_and_warnings.c",
     "../tests2/95_bitfields.c",
     "../tests2/96_nodata_wanted.c",
+    # cast to union from a type no member has is an error, as in gcc
+    "bug_union_cast_member_type_errors.c",
+    # initializing a struct member's flexible array through a union is rejected
+    "bug_union_fam_init_shared_struct_type_errors.c",
 ]
 
 
@@ -2054,6 +2799,21 @@ def test_qemu_execution(test_file, expected_exit_code, timeout, opt_level, tmp_p
     _run_qemu_test(test_file, expected_exit_code, defines=defines, opt_level=opt_level, output_dir=tmp_path, timeout=timeout)
 
 
+@pytest.mark.parametrize("opt_level", OPT_LEVELS)
+def test_bool_param_normalized_reverse(opt_level, tmp_path):
+    _run_qemu_test("bug_bool_param_normalized.c", 0,
+                   opt_level=f"{opt_level} -freverse-funcargs", output_dir=tmp_path)
+
+
+# ra_widen_intervals_by_liveness falls back to loop-wide widening when its
+# per-block bit sets exceed the size cap; lower the cap (debug cross knob) so the
+# small reproducer takes that path.
+@pytest.mark.parametrize("opt_level", ["-O1", "-O2", "-Os"])
+def test_ra_widen_size_cap_fallback(opt_level, tmp_path, monkeypatch):
+    monkeypatch.setenv("TCC_RA_WIDEN_MAX_WORDS", "1")
+    _run_qemu_test("bug_ra_interval_forward_exit_backward_reentry.c", 0, opt_level=opt_level, output_dir=tmp_path)
+
+
 # Hard-float (-mfloat-abi=hard) execution gate.  Compiles with the VFP
 # single-precision register class (MACH_OP_VFP_REG) across all opt levels and
 # checks the numeric result via exit code.  fp_hard_mixed_exec.c covers mixed
@@ -2067,6 +2827,14 @@ HARD_FLOAT_TEST_FILES = [
     ("fp_hard_loop_exec.c", 1),
     ("fp_hard_absplit_exec.c", 1),
     ("fp_hard_double_exec.c", 1),
+    ("fp_hard_va_double_arg_exec.c", 1),
+    ("fp_hard_forward_float_with_double_exec.c", 1),
+    ("fp_hard_unused_double_param_exec.c", 1),
+    ("fp_hard_hfa_ret_exec.c", 1),
+    ("fp_hard_hfa_args_exec.c", 1),
+    ("fp_hard_hfa_ret_regs_exec.c", 1),
+    ("fp_hard_complex_exec.c", 1),
+    ("fp_hard_vfp_no_backfill_exec.c", 1),
 ]
 HARD_FLOAT_CFLAGS = "-mfloat-abi=hard -mfpu=fpv5-sp-d16"
 
@@ -2087,7 +2855,61 @@ _HARD_FLOAT_PARAMS, _HARD_FLOAT_IDS = _generate_hard_float_params()
 @pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _HARD_FLOAT_PARAMS, ids=_HARD_FLOAT_IDS)
 def test_hard_float_execution(test_file, expected_exit_code, opt_level, tmp_path):
     cflags = f"{opt_level} {HARD_FLOAT_CFLAGS}"
-    _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
+    # float_abi="hard" links the hard-float libgcc/libc too: tests that reach a
+    # libgcc routine (complex division) need the VFP-convention variant.
+    _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path, float_abi="hard")
+
+
+# ra:struct_arg_split under the hard-float ABI: the pass changes how by-value
+# struct arguments reach the call, and the shapes it rewrites (tuple round trips
+# through frame slots) only appear with hard float -- soft float already passes
+# them as words.  Same program and expected output as the default run.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"struct_arg_split_hard{o}" for o in OPT_LEVELS])
+def test_struct_arg_split_hard_float(opt_level, tmp_path):
+    cflags = f"{opt_level} {HARD_FLOAT_CFLAGS}"
+    _run_qemu_test("882_struct_arg_word_split.c", 0, opt_level=cflags, output_dir=tmp_path, float_abi="hard")
+
+
+# r0/r1 aggregate returns of static functions under the hard-float ABI: an HFA
+# keeps s0-s1, a float argument stays in s0 while an adapter moves the core
+# argument registers.  Same program and expected output as the default run.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"regpair_static_return_hard{o}" for o in OPT_LEVELS])
+def test_regpair_static_return_hard_float(opt_level, tmp_path):
+    cflags = f"{opt_level} {HARD_FLOAT_CFLAGS}"
+    _run_qemu_test("bug_regpair_static_aggregate_return.c", 0, opt_level=cflags, output_dir=tmp_path,
+                   float_abi="hard")
+
+
+# r0/r1 aggregate returns: a call compiled before the declaration that makes
+# the function an alias.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"regpair_static_return_late_alias{o}" for o in OPT_LEVELS])
+def test_regpair_static_return_late_alias(opt_level, tmp_path):
+    _run_qemu_test("bug_regpair_static_late_alias.c", 0, opt_level=opt_level, output_dir=tmp_path)
+
+
+# r0/r1 aggregate returns: a GNU extern inline body (static until the real
+# definition replaces it) must not make f r0/r1 for the other TU's callers.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"regpair_extern_inline{o}" for o in OPT_LEVELS])
+def test_regpair_extern_inline_gnu89(opt_level, tmp_path):
+    _run_qemu_test(["bug_regpair_extern_inline.c", "bug_regpair_extern_inline+.c"], 0,
+                   opt_level=f"{opt_level} -fgnu89-inline", output_dir=tmp_path)
+
+
+# r0/r1 aggregate returns: asm in a body generated after the TU is parsed
+# makes a static function global or weak after a direct call of it; the other
+# TU calls it by name with the AAPCS convention.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"regpair_asm_global_in_body{o}" for o in OPT_LEVELS])
+def test_regpair_asm_global_in_body(opt_level, tmp_path):
+    _run_qemu_test(["bug_regpair_asm_global_in_body.c", "bug_regpair_asm_global_in_body+.c"], 0,
+                   opt_level=opt_level, output_dir=tmp_path)
+
+
+# The PARAM reading the argument slot is the join of two arms that both write
+# it: the words must come from both, not from the arm laid out just above.
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"struct_arg_split_join_hard{o}" for o in OPT_LEVELS])
+def test_struct_arg_split_join_param_hard_float(opt_level, tmp_path):
+    cflags = f"{opt_level} {HARD_FLOAT_CFLAGS}"
+    _run_qemu_test("bug_struct_arg_split_join_param.c", 0, opt_level=cflags, output_dir=tmp_path, float_abi="hard")
 
 
 # Float ABI x libm interop.  These call real libc/libm functions, which follow
@@ -2107,23 +2929,135 @@ def test_libm_float_abi(float_abi, opt_level, tmp_path):
                    float_abi=float_abi)
 
 
+# fp_hard_complex_exec.c under the base-PCS ABIs too: YasOS userspace is softfp,
+# where __divdc3 takes a hidden result pointer and the operands in r2:r3 plus
+# the stack (a different backend path from the hard-float one above).
+_COMPLEX_ABI_PARAMS = [
+    (abi, opt) for abi in ("soft", "softfp") for opt in OPT_LEVELS
+]
+
+
+@pytest.mark.parametrize("float_abi,opt_level", _COMPLEX_ABI_PARAMS,
+                         ids=[f"fp_complex_{a}{o}" for a, o in _COMPLEX_ABI_PARAMS])
+def test_complex_float_abi(float_abi, opt_level, tmp_path):
+    _run_qemu_test("fp_hard_complex_exec.c", 1, opt_level=opt_level, output_dir=tmp_path,
+                   float_abi=float_abi)
+
+
 # AAPCS32 interop with gcc-built code: abi_mix_b.c is compiled by
 # arm-none-eabi-gcc, main and abi_mix_a.c by tcc, and each side calls the
 # other with structs of 17-36 bytes in registers, split and on the stack
-# (see abi_mix.h).  Built for the suite's float ABI so the objects link.
-@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"abi_gcc_interop{o}" for o in OPT_LEVELS])
-def test_abi_gcc_interop(opt_level, tmp_path):
+# (see abi_mix.h).  The f13 case also puts a struct after 17 VFP arguments;
+# under hard-float, f16 has already gone to the stack, so the struct must not
+# be split across r3 and the stack (AAPCS32 C.5/C.6).  Build both float ABIs
+# explicitly so the hard-float GCC interop path is covered independently of
+# the suite default.
+_ABI_GCC_INTEROP_PARAMS = [
+    (float_abi, opt) for float_abi in ("soft", "hard") for opt in OPT_LEVELS
+]
+
+
+@pytest.mark.parametrize("float_abi,opt_level", _ABI_GCC_INTEROP_PARAMS,
+                         ids=[f"abi_gcc_interop_{a}{o}" for a, o in _ABI_GCC_INTEROP_PARAMS])
+def test_abi_gcc_interop(float_abi, opt_level, tmp_path):
     import subprocess
-    from qemu_run import DEFAULT_FLOAT_ABI, DEFAULT_FPU
     (tmp_path / "gcc").mkdir()
     gcc_obj = tmp_path / "gcc" / "abi_mix_b_gcc.o"  # outside the build dir `make clean` removes
-    fp = [f"-mfloat-abi={DEFAULT_FLOAT_ABI}"] + ([] if DEFAULT_FLOAT_ABI == "soft" else [f"-mfpu={DEFAULT_FPU}"])
+    fp = [f"-mfloat-abi={float_abi}"] + ([] if float_abi == "soft" else ["-mfpu=fpv5-sp-d16"])
     r = subprocess.run(["arm-none-eabi-gcc", "-mcpu=cortex-m33", "-mthumb", *fp, "-O2", "-ffunction-sections",
                         "-c", str(CURRENT_DIR / "abi_mix_b.c"), "-o", str(gcc_obj)],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     _run_qemu_test(["abi_mix_main.c", "abi_mix_a.c"], 0, opt_level=opt_level, output_dir=tmp_path / "build",
-                   extra_objs=[gcc_obj])
+                   float_abi=float_abi, extra_objs=[gcc_obj])
+
+
+# Hard-float HFAs against gcc: abi_hfa_b.c is built by arm-none-eabi-gcc
+# (-mfloat-abi=hard), main and abi_hfa_a.c by tcc.  HFAs that are not flat
+# structs of scalars (arrays, nested structs) must come back in s0/s1/d0 like
+# gcc's, larger HFAs and _Complex double in s0-s7 without a hidden result
+# pointer, and HFA / _Complex arguments go in s0-s15 (back-filled; on the
+# stack once the bank is full, leaving r0-r3 to later core arguments).
+@pytest.mark.parametrize("opt_level", OPT_LEVELS, ids=[f"abi_hfa_gcc_interop{o}" for o in OPT_LEVELS])
+def test_abi_hfa_gcc_interop(opt_level, tmp_path):
+    import subprocess
+    (tmp_path / "gcc").mkdir()
+    gcc_obj = tmp_path / "gcc" / "abi_hfa_b_gcc.o"
+    r = subprocess.run(["arm-none-eabi-gcc", "-mcpu=cortex-m33", "-mthumb", "-mfloat-abi=hard", "-mfpu=fpv5-sp-d16",
+                        "-O2", "-ffunction-sections", "-c", str(CURRENT_DIR / "abi_hfa_b.c"), "-o", str(gcc_obj)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    _run_qemu_test(["abi_hfa_main.c", "abi_hfa_a.c"], 0, opt_level=opt_level, output_dir=tmp_path / "build",
+                   float_abi="hard", extra_objs=[gcc_obj])
+
+
+# Floating point matrix: every mode-agnostic FP test x FP mode x opt level.
+#
+# The three modes are the ones userspace ships (docs/userspace_floating_point.md):
+#   softfp            FPv5-SP inline for float, double in software, args in GPRs
+#   hardfp+softdouble same instructions, AAPCS-VFP (args/results in s0-s15)
+#   hardfp+dcp        -mfpu=rp2350: double on the DCP coprocessor
+# QEMU's Cortex-M33 has no CP4, so the dcp column cannot execute here; it runs
+# on the board through benchmarks/run_fp_conformance.py --matrix.  The fp_hard_*
+# tests stay in test_hard_float_execution (they pin the hard ABI itself).
+FP_MATRIX_MODES = {
+    "softfp": "softfp",
+    "hardfp_softdouble": "hard",
+}
+FP_MATRIX_OPT_LEVELS = ["-O0", "-O1", "-O2"]
+FP_MATRIX_TESTS = [
+    "test_cleanup_double.c",
+    "test_fp_offset_cache.c",
+    "test_fp_cache_callee_saved.c",
+    "test_double_printf_ops.c",
+    "test_double_printf_literals.c",
+    "test_double_printf_mixed.c",
+    "test_float_math_loop.c",
+    "test_float_simple_calc.c",
+    "72_float_result.c",
+    "73_float_ops.c",
+    "test_aeabi_dmul_bits.c",
+    "test_aeabi_double_all.c",
+    "170_nan_comparison.c",
+    "421_fp_conformance.c",
+    "428_callsite_struct_fp_clobber.c",
+    "223_fuzz_loop_const_sim_fp_compare.c",
+    "337_fuzz_genopif_double_round.c",
+    "338_fuzz_genopif_double_round2.c",
+    "383_fuzz_softfp_cmp_fold_phi_prune.c",
+    "390_fuzz_dead_loop_double_phi_imm.c",
+    "396_fuzz_fold_double_neg_barrel_shift.c",
+    "504_sra_wide_doubleword_fields.c",
+    "858_hex_float_leading_zeros.c",
+    "fp_libm_exec.c",
+]
+
+
+def _generate_fp_matrix_params():
+    expected = {}
+    for test_file, exp in TEST_FILES:
+        if isinstance(test_file, str):
+            expected[test_file] = exp
+    expected["fp_libm_exec.c"] = 1
+    params, ids = [], []
+    for test_file in FP_MATRIX_TESTS:
+        exp = expected.get(test_file, 0)
+        exit_code, timeout = (exp[0], exp[1] if len(exp) > 1 else 10) if isinstance(exp, tuple) else (exp, 10)
+        for mode in FP_MATRIX_MODES:
+            for opt in FP_MATRIX_OPT_LEVELS:
+                params.append((test_file, exit_code, timeout, mode, opt))
+                ids.append(f"{_test_id(test_file)}_{mode}{opt}")
+    return params, ids
+
+
+_FP_MATRIX_PARAMS, _FP_MATRIX_IDS = _generate_fp_matrix_params()
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,timeout,mode,opt_level", _FP_MATRIX_PARAMS, ids=_FP_MATRIX_IDS)
+def test_fp_matrix(test_file, expected_exit_code, timeout, mode, opt_level, tmp_path):
+    float_abi = FP_MATRIX_MODES[mode]
+    _run_qemu_test(test_file, expected_exit_code, defines=TEST_FILE_DEFINES.get(test_file), timeout=timeout,
+                   opt_level=opt_level, output_dir=tmp_path, float_abi=float_abi)
 
 
 # Nested function xfail tests (not yet implemented)
@@ -2360,6 +3294,62 @@ def test_gnu89_inline_bugs(test_file, expected_exit_code, opt_level, tmp_path):
         pytest.fail("test_file is None")
 
     cflags = f"{opt_level} -fgnu89-inline"
+    _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Tests compiled with -minline-atomics (read-modify-write as LDREX/STREX loops)
+# ---------------------------------------------------------------------------
+
+INLINE_ATOMICS_TEST_FILES = [
+    ("bug_asm_goto_select_join.c", 0),
+    ("bug_asm_goto_branch_thread.c", 0),
+    ("bug_small_struct_copy_padding.c", 0),
+    # Every op, size and order inline; narrow signed values, the failure
+    # write-back, a body that is only the atomic (no tail call to a helper that
+    # does not exist), and a weak compare-exchange spin loop.
+    ("893_inline_atomic_rmw.c", 0),
+    # The CAS loop with no IT block and its CLREX on the failure path only;
+    # seq_cst as LDA/STL/LDAEX/STLEX with no DMB.
+    ("bug_atomic_cas_seqcst_orders.c", 0),
+    # The loop's exits are the `if (cas(...))` branch: no re-test of old.
+    ("bug_atomic_cas_result_branch.c", 0),
+    # The CAS's flag tested after the failure path joins: threaded away.
+    ("bug_cas_flag_join_thread.c", 0),
+    # The CAS's result selected after the join: a move on each edge.
+    ("bug_bt_twin_compare_select.c", 0),
+    # The loop's unthreaded branch keeps the jump block it lands on.
+    ("bug_cas_branch_orphan_jump.c", 0),
+    # The CAS's re-test threaded in a function with asm goto: the block only
+    # the asm goto enters stays.
+    ("bug_ra_branch_thread_asm_goto_label.c", 0),
+    # A CAS's result selected after a join an asm goto also enters.
+    ("bug_bt_asm_goto_twin_select.c", 0),
+]
+
+
+def _generate_inline_atomics_params():
+    params = []
+    ids = []
+    for test_file, expected in INLINE_ATOMICS_TEST_FILES:
+        for opt in OPT_LEVELS:
+            params.append((test_file, expected, opt))
+            ids.append(f"{_test_id(test_file)}{opt}")
+    return params, ids
+
+
+_INLINE_ATOMICS_PARAMS, _INLINE_ATOMICS_IDS = (
+    _generate_inline_atomics_params() if INLINE_ATOMICS_TEST_FILES else ([], [])
+)
+
+
+@pytest.mark.parametrize("test_file,expected_exit_code,opt_level", _INLINE_ATOMICS_PARAMS, ids=_INLINE_ATOMICS_IDS)
+def test_inline_atomics(test_file, expected_exit_code, opt_level, tmp_path):
+    """Tests compiled with -minline-atomics."""
+    if test_file is None:
+        pytest.fail("test_file is None")
+
+    cflags = f"{opt_level} -minline-atomics"
     _run_qemu_test(test_file, expected_exit_code, opt_level=cflags, output_dir=tmp_path)
 
 

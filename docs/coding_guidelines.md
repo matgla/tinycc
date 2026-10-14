@@ -60,6 +60,8 @@ New code must use the ownership utilities under `source/memory/include/memory/` 
 - `dynamic_bitset` — owned bitsets with inline word storage and heap fallback.
 - `unique_ptr` — scope-owned single allocations; its deleter is `tcc_free`, so it owns `tcc_malloc*`/`tcc_realloc` memory and **never** plain `malloc` memory.
 
+Sort with `tcc_qsort` (`source/memory/sort.c`, stable), never libc `qsort` (`tcc.h` poisons it): libc implementations order equal elements differently, so the host cross and the device tcc would emit different code.
+
 Raw pointers are acceptable only at existing shared ABI/layout boundaries that cannot yet be represented by these utilities. Keep the framework owner inside the implementation wherever possible, and extend `source/memory` for recurring ownership patterns rather than adding new manual allocation/free pairs.
 
 ## IR Naming Conventions

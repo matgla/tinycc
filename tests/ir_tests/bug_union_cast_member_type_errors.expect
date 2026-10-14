@@ -1,0 +1,20 @@
+[CAST_SHORT]
+bug_union_cast_member_type_errors.c:19: error: cast to union type from type not present in union
+
+[CAST_LONG]
+bug_union_cast_member_type_errors.c:21: error: cast to union type from type not present in union
+
+[CAST_UNSIGNED]
+bug_union_cast_member_type_errors.c:23: error: cast to union type from type not present in union
+
+[CAST_OTHER_STRUCT]
+bug_union_cast_member_type_errors.c:25: error: cast to union type from type not present in union
+
+[CAST_FUNC]
+bug_union_cast_member_type_errors.c:28: error: cast to union type from type not present in union
+
+[CAST_STATIC]
+bug_union_cast_member_type_errors.c:30: error: cast to union type from type not present in union
+
+[CAST_OK]
+ok 5

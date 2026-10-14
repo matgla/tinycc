@@ -26,7 +26,7 @@ int tcc_ir_opt_infinite_self_recursion(TCCIRState *ir, Sym *func_sym)
   int n = ir->next_instruction_index;
   if (n == 0 || !func_sym)
     return 0;
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
 
   int self_call_idx = -1;
@@ -41,7 +41,7 @@ int tcc_ir_opt_infinite_self_recursion(TCCIRState *ir, Sym *func_sym)
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_FUNCCALLVOID:
     {
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      Sym *callee = tcc_ir_op_src1_sym(ir, q);
       if (callee == func_sym)
       {
         self_call_idx = i;
@@ -119,27 +119,14 @@ int tcc_ir_opt_infinite_self_recursion(TCCIRState *ir, Sym *func_sym)
   LOG_IR_GEN("INFINITE-RECURSION-COLLAPSE: function unconditionally self-calls "
              "at i=%d; collapsing body to `b .`", self_call_idx);
 
-  for (int i = 0; i < n; i++)
-  {
-    ir->compact_instructions[i].op = TCCIR_OP_NOP;
-    ir->compact_instructions[i].is_jump_target = 0;
-  }
+  ir_opt_nop_body(ir, n);
 
-  ir->compact_instructions[0].op = TCCIR_OP_JUMP;
-  ir->compact_instructions[0].is_jump_target = 1;
-  IROperand self = irop_make_imm32(-1, 0, IROP_BTYPE_INT32);
-  tcc_ir_set_dest(ir, 0, self);
-  tcc_ir_set_src1(ir, 0, IROP_NONE);
-  tcc_ir_set_src2(ir, 0, IROP_NONE);
+  ir_opt_set_self_jump0(ir);
 
-  ir->ls.dirty_registers = 0;
-  ir->ls.dirty_float_registers = 0;
-  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
-    memset(ir->ls.live_regs_by_instruction, 0,
-           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
-  ir->leaffunc = 1;
+  ir_opt_reset_body_regs(ir);
   ir->noreturn = 1;
-  if (func_sym && func_sym->type.ref)
+  /* A weak body may be replaced by a strong one that returns. */
+  if (func_sym && func_sym->type.ref && !func_sym->a.weak)
     func_sym->type.ref->f.func_noreturn = 1;
 
   return 1;

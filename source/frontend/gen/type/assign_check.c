@@ -102,8 +102,18 @@ int mark_value_bytes(CType *type, int base, unsigned char *map, int map_size)
   return 0;
 }
 
-/* modify type so that its it is a pointer to type. */
+/* modify type so that its it is a pointer to type.  The pointer's Sym is
+   shared by every pointer to the same type (sym_pointer_node): it must not
+   be written. */
 ST_FUNC void mk_pointer(CType *type)
+{
+  type->ref = sym_pointer_node(type);
+  type->t = VT_PTR | (type->t & VT_STORAGE);
+}
+
+/* mk_pointer with a Sym of its own, for a pointer whose target is still to
+   be rewritten in place (type_decl). */
+ST_FUNC void mk_private_pointer(CType *type)
 {
   Sym *s;
   s = sym_push(SYM_FIELD, type, 0, -1);
@@ -138,6 +148,8 @@ void verify_assign_cast(CType *dt)
   int dbt, sbt, qualwarn, lvl;
 
   st = &vtop->type; /* source type */
+  if (dt->t & VT_RODATA_REL)
+    rodata_rel_store_error();
   dbt = dt->t & VT_BTYPE;
   sbt = st->t & VT_BTYPE;
   if (dt->t & VT_CONSTANT)
@@ -166,6 +178,7 @@ void verify_assign_cast(CType *dt)
       type2 = st; /* a function is implicitly a function pointer */
     else
       goto error;
+    rodata_rel_check_targets(type1, type2, st, dt);
     if (is_compatible_types(type1, type2))
       break;
     for (qualwarn = lvl = 0;; ++lvl)

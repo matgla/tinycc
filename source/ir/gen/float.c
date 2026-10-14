@@ -59,16 +59,10 @@ void tcc_ir_gen_f(TCCIRState *ir, int op)
     vtop->jtrue = -1;      /* -1 = no chain */
     vtop->vr = -1;         /* clear stale vreg so gv() materializes the CMP result */
     return;
-  case 't': /* float-to-float conversion */
-    ir_op = TCCIR_OP_CVT_FTOF;
-    break;
-  case 'i': /* int-to-float conversion */
-    ir_op = TCCIR_OP_CVT_ITOF;
-    break;
-  case 'f': /* float-to-int conversion */
-    ir_op = TCCIR_OP_CVT_FTOI;
-    break;
   default:
+    /* Conversions ('t'/'i'/'f') are NOT dispatched here: they are unary ops
+     * whose destination type cannot be derived from the operand stack, so
+     * tcc_ir_gen_cvt_ftof/itof/ftoi take it as an argument instead. */
     /* Comparison operations */
     if (op >= TOK_ULT && op <= TOK_GT)
     {
@@ -218,53 +212,18 @@ void tcc_ir_gen_f(TCCIRState *ir, int op)
     return;
   }
 
-  /* Binary FP operations and conversions */
+  /* Binary FP operations */
   svalue_init(&dest);
   dest.vr = tcc_ir_get_vreg_temp(ir);
   dest.r = 0;
-  if (ir_op == TCCIR_OP_CVT_ITOF || ir_op == TCCIR_OP_CVT_FTOI || ir_op == TCCIR_OP_CVT_FTOF)
-  {
-    /* For conversions, dest type depends on the operation */
-    if (ir_op == TCCIR_OP_CVT_ITOF)
-    {
-      /* int to float: result is float type of destination */
-      dest.type = vtop->type;
-      is_double = (vtop->type.t & VT_BTYPE) == VT_DOUBLE || (vtop->type.t & VT_BTYPE) == VT_LDOUBLE;
-      tcc_ir_set_float_type(ir, dest.vr, 1, is_double);
-    }
-    else if (ir_op == TCCIR_OP_CVT_FTOI)
-    {
-      /* float to int: result is int type */
-      dest.type.t = VT_INT;
-    }
-    else /* TCCIR_OP_CVT_FTOF */
-    {
-      /* float-to-float: result is destination type */
-      dest.type = vtop->type;
-      is_double = (vtop->type.t & VT_BTYPE) == VT_DOUBLE || (vtop->type.t & VT_BTYPE) == VT_LDOUBLE;
-      tcc_ir_set_float_type(ir, dest.vr, 1, is_double);
-    }
-  }
-  else
-  {
-    dest.type = vtop[-1].type;
-    /* Mark temp as float/double */
-    is_double = (vtop[-1].type.t & VT_BTYPE) == VT_DOUBLE || (vtop[-1].type.t & VT_BTYPE) == VT_LDOUBLE;
-    tcc_ir_set_float_type(ir, dest.vr, 1, is_double);
-  }
+  dest.type = vtop[-1].type;
+  /* Mark temp as float/double */
+  is_double = (vtop[-1].type.t & VT_BTYPE) == VT_DOUBLE || (vtop[-1].type.t & VT_BTYPE) == VT_LDOUBLE;
+  tcc_ir_set_float_type(ir, dest.vr, 1, is_double);
   tcc_ir_put(ir, ir_op, &vtop[-1], &vtop[0], &dest);
-  if (ir_op == TCCIR_OP_CVT_ITOF || ir_op == TCCIR_OP_CVT_FTOI || ir_op == TCCIR_OP_CVT_FTOF)
-  {
-    vtop->vr = dest.vr;
-    vtop->r = 0;
-    vtop->type = dest.type;
-  }
-  else
-  {
-    vtop[-1].vr = dest.vr;
-    vtop[-1].r = 0;
-    --vtop;
-  }
+  vtop[-1].vr = dest.vr;
+  vtop[-1].r = 0;
+  --vtop;
 }
 
 void tcc_ir_gen_fdiv(TCCIRState *ir)
@@ -280,16 +239,44 @@ void tcc_ir_gen_fcmp(TCCIRState *ir)
   tcc_ir_gen_f(ir, 'c');
 }
 
-/* Conversions */
-void tcc_ir_gen_cvt_ftof(TCCIRState *ir)
+/* Conversions. The value to convert sits at vtop[0] with its SOURCE type
+ * intact -- the one-value cast convention gen_cast()'s inline expansion uses
+ * when it passes `vtop` as src1, and the one the backend's CVT lowering
+ * relies on (src1.is_64bit/is_unsigned pick the helper, e.g. __aeabi_l2f vs
+ * __aeabi_i2f). The destination type is the dst_type_t argument (VT_BTYPE
+ * bits, plus VT_UNSIGNED for an unsigned ftoi dest), mirroring the non-IR
+ * gen_cvt_itof(int t) & co signatures in tcc.h -- it cannot be derived from
+ * the operand stack. The result replaces the value in place (unary contract,
+ * like FNEG); the caller owns the vtop->type update, exactly as gen_cast
+ * does after its own conversion puts. */
+static void tcc_ir_gen_cvt(TCCIRState *ir, TccIrOp ir_op, int dst_type_t)
 {
-  tcc_ir_gen_f(ir, 't');
+  SValue dest;
+
+  svalue_init(&dest);
+  dest.type.t = dst_type_t;
+  dest.vr = tcc_ir_get_vreg_temp(ir);
+  dest.r = 0;
+  if (ir_op != TCCIR_OP_CVT_FTOI)
+  {
+    /* itof/ftof produce an FP dest; ftoi's int dest stays unmarked */
+    int is_double = (dst_type_t & VT_BTYPE) == VT_DOUBLE || (dst_type_t & VT_BTYPE) == VT_LDOUBLE;
+    tcc_ir_set_float_type(ir, dest.vr, 1, is_double);
+  }
+  tcc_ir_put(ir, ir_op, &vtop[0], NULL, &dest);
+  vtop->vr = dest.vr;
+  vtop->r = 0;
 }
-void tcc_ir_gen_cvt_itof(TCCIRState *ir)
+
+void tcc_ir_gen_cvt_ftof(TCCIRState *ir, int dst_type_t)
 {
-  tcc_ir_gen_f(ir, 'i');
+  tcc_ir_gen_cvt(ir, TCCIR_OP_CVT_FTOF, dst_type_t);
 }
-void tcc_ir_gen_cvt_ftoi(TCCIRState *ir)
+void tcc_ir_gen_cvt_itof(TCCIRState *ir, int dst_type_t)
 {
-  tcc_ir_gen_f(ir, 'f');
+  tcc_ir_gen_cvt(ir, TCCIR_OP_CVT_ITOF, dst_type_t);
+}
+void tcc_ir_gen_cvt_ftoi(TCCIRState *ir, int dst_type_t)
+{
+  tcc_ir_gen_cvt(ir, TCCIR_OP_CVT_FTOI, dst_type_t);
 }

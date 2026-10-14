@@ -38,6 +38,11 @@ static int strcpy_prepare(const StrFoldCtx *c, IROperand *out_dst, IROperand *ou
   if (irop_get_tag(dst) != IROP_TAG_STACKOFF || dst.is_lval)
     return 0;
 
+  /* ...and the lowering stores the body with STM, which faults on a non-word
+   * destination (UsageFault regardless of UNALIGN_TRP): `buf + 1` stays a call. */
+  if ((irop_get_stack_offset(dst) & 3) != 0)
+    return 0;
+
   if (ir_opt_eval_const_string(c->ir, src, c->call_idx, &s, 0) &&
       ir_opt_eval_const_string_operand(c->ir, src, c->call_idx, &src_sym, 0))
   {
@@ -65,8 +70,7 @@ static int strcpy_prepare(const StrFoldCtx *c, IROperand *out_dst, IROperand *ou
    * A -1 result vreg means the call produces no value (discarded) -> safe. */
   if (c->is_valued)
   {
-    IROperand res = tcc_ir_op_get_dest(c->ir, &c->ir->compact_instructions[c->call_idx]);
-    int32_t rv = irop_get_vreg(res);
+    int32_t rv = tcc_ir_op_dest_vreg(c->ir, &c->ir->compact_instructions[c->call_idx]);
     if (rv != -1)
     {
       IRSSAVregInfo *vi;

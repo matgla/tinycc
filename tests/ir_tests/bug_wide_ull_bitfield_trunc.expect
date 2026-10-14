@@ -1,0 +1,10 @@
+OK a = 4000000000001
+OK b = 8000000000000
+OK c = 4000000000001
+OK xx = fffffffffe
+OK xmul = 1
+OK xshl = fffffffffe
+OK xone = 0
+OK xy = fffffffffe
+OK nn = 7fe
+ALL PASSED

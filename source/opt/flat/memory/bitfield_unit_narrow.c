@@ -162,11 +162,11 @@ static int bfun_reads(TCCIRState *ir, int i, int32_t vr)
 {
   IRQuadCompact *q = &ir->compact_instructions[i];
   int n = 0;
-  if (irop_config[q->op].has_src1 && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vr)
+  if (irop_config[q->op].has_src1 && tcc_ir_op_src1_vreg(ir, q) == vr)
     n++;
-  if (irop_config[q->op].has_src2 && irop_get_vreg(tcc_ir_op_get_src2(ir, q)) == vr)
+  if (irop_config[q->op].has_src2 && tcc_ir_op_src2_vreg(ir, q) == vr)
     n++;
-  if (q->op == TCCIR_OP_MLA && irop_get_vreg(tcc_ir_op_get_accum(ir, q)) == vr)
+  if (q->op == TCCIR_OP_MLA && tcc_ir_op_accum_vreg(ir, q) == vr)
     n++;
   if (irop_config[q->op].has_dest)
   {
@@ -223,17 +223,16 @@ static int32_t bfun_match_op_imm(TCCIRState *ir, int idx, TccIrOp op, int32_t sr
   IRQuadCompact *q = &ir->compact_instructions[idx];
   if (q->op != op)
     return -1;
-  if (irop_get_vreg(tcc_ir_op_get_src1(ir, q)) != src_vr)
+  if (tcc_ir_op_src1_vreg(ir, q) != src_vr)
     return -1;
   int ok = 1;
   if (bfun_imm(ir, tcc_ir_op_get_src2(ir, q), &ok) != imm || !ok)
     return -1;
   if (tcc_ir_barrel_shift_at(ir, q))
     return -1;
-  IROperand d = tcc_ir_op_get_dest(ir, q);
-  if (d.is_lval)
+  if (tcc_ir_op_dest_is_lval(ir, q))
     return -1;
-  int32_t dv = irop_get_vreg(d);
+  int32_t dv = tcc_ir_op_dest_vreg(ir, q);
   return bfun_is_temp(dv) ? dv : -1;
 }
 
@@ -349,10 +348,10 @@ static int bfun_try_one(TCCIRState *ir, int li)
   for (int i = li + 1; i < n; i++)
   {
     IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->is_jump_target) /* before the NOP skip: a NOP can be the join */
+      return 0;
     if (q->op == TCCIR_OP_NOP)
       continue;
-    if (q->is_jump_target)
-      return 0;
     if (q->op == TCCIR_OP_STORE && bfun_same_word(ir, tcc_ir_op_get_dest(ir, q), word))
     {
       si = i;
@@ -378,7 +377,7 @@ static int bfun_try_one(TCCIRState *ir, int li)
     if (c > 1 || i > si || i < li)
       return 0;
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (q->op == TCCIR_OP_AND && irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == tv)
+    if (q->op == TCCIR_OP_AND && tcc_ir_op_src1_vreg(ir, q) == tv)
     {
       if (clear_idx >= 0)
         return 0;
@@ -406,7 +405,7 @@ static int bfun_try_one(TCCIRState *ir, int li)
   const uint32_t fmask = (width == 8) ? 0xFFu : 0xFFFFu;
 
   /* clear -> merge */
-  int32_t tm = irop_get_vreg(tcc_ir_op_get_dest(ir, cq));
+  int32_t tm = tcc_ir_op_dest_vreg(ir, cq);
   if (!bfun_is_temp(tm) || bfun_sole_def(ir, tm) != clear_idx)
     return 0;
   int or_idx = bfun_sole_use(ir, tm);
@@ -415,18 +414,18 @@ static int bfun_try_one(TCCIRState *ir, int li)
   IRQuadCompact *oq = &ir->compact_instructions[or_idx];
   if (oq->op != TCCIR_OP_OR || tcc_ir_barrel_shift_at(ir, oq))
     return 0;
-  int32_t or_s1 = irop_get_vreg(tcc_ir_op_get_src1(ir, oq));
-  int32_t or_s2 = irop_get_vreg(tcc_ir_op_get_src2(ir, oq));
+  int32_t or_s1 = tcc_ir_op_src1_vreg(ir, oq);
+  int32_t or_s2 = tcc_ir_op_src2_vreg(ir, oq);
   int32_t positioned = (or_s1 == tm) ? or_s2 : or_s1;
   if (!bfun_is_temp(positioned))
     return 0;
 
   /* merge -> store, and nothing else. */
-  int32_t tr = irop_get_vreg(tcc_ir_op_get_dest(ir, oq));
+  int32_t tr = tcc_ir_op_dest_vreg(ir, oq);
   if (!bfun_is_temp(tr) || bfun_sole_def(ir, tr) != or_idx || bfun_sole_use(ir, tr) != si)
     return 0;
   IRQuadCompact *sq = &ir->compact_instructions[si];
-  if (irop_get_vreg(tcc_ir_op_get_src1(ir, sq)) != tr)
+  if (tcc_ir_op_src1_vreg(ir, sq) != tr)
     return 0;
 
   /* Undo the positioning shift, then require the explicit field mask: the
@@ -439,7 +438,7 @@ static int bfun_try_one(TCCIRState *ir, int li)
     shl_idx = bfun_sole_def(ir, positioned);
     if (shl_idx < 0 || shl_idx <= li || shl_idx >= or_idx)
       return 0;
-    int32_t src = irop_get_vreg(tcc_ir_op_get_src1(ir, &ir->compact_instructions[shl_idx]));
+    int32_t src = tcc_ir_op_src1_vreg(ir, &ir->compact_instructions[shl_idx]);
     if (bfun_match_op_imm(ir, shl_idx, TCCIR_OP_SHL, src, lsb) != positioned)
       return 0;
     if (bfun_sole_use(ir, positioned) != or_idx)
@@ -459,7 +458,7 @@ static int bfun_try_one(TCCIRState *ir, int li)
   if (mask_idx >= 0 && mask_idx < or_idx &&
       bfun_sole_use(ir, masked) == (lsb > 0 ? shl_idx : or_idx) &&
       bfun_match_op_imm(ir, mask_idx, TCCIR_OP_AND,
-                        irop_get_vreg(tcc_ir_op_get_src1(ir, &ir->compact_instructions[mask_idx])),
+                        tcc_ir_op_src1_vreg(ir, &ir->compact_instructions[mask_idx]),
                         (int64_t)fmask) == masked)
   {
     stored_op = tcc_ir_op_get_src1(ir, &ir->compact_instructions[mask_idx]);
@@ -486,7 +485,7 @@ static int bfun_try_one(TCCIRState *ir, int li)
         IRQuadCompact *q = &ir->compact_instructions[i];
         if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
           continue;
-        if (irop_get_vreg(tcc_ir_op_get_dest(ir, q)) == sv)
+        if (tcc_ir_op_dest_vreg(ir, q) == sv)
           return 0;
       }
   }
@@ -497,7 +496,7 @@ static int bfun_try_one(TCCIRState *ir, int li)
   {
     int i = ext[e].shr_idx;
     IRQuadCompact *q = &ir->compact_instructions[i];
-    if (irop_get_vreg(tcc_ir_op_get_src1(ir, q)) != tv)
+    if (tcc_ir_op_src1_vreg(ir, q) != tv)
       return 0;
     if (lsb + width == 32 && bfun_match_op_imm(ir, i, TCCIR_OP_SHR, tv, lsb) >= 0)
       continue; /* top field: a single SHR is the whole extraction */

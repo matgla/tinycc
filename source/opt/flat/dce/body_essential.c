@@ -21,6 +21,34 @@
 #include "cfg.h"
 #include "licm.h"
 
+#define LOCAL_ONLY_MAX_TEMPS 8192
+
+/* A dead instruction s reached from a kept one: mark it an entry. */
+static void be_mark_entry(uint8_t *entry, const uint8_t *dead, int n, int s)
+{
+  if (s >= 0 && s < n && (dead[s / 8] & (1 << (s % 8))))
+    entry[s / 8] |= (1 << (s % 8));
+}
+
+/* Whether operand sop is a local's address: a direct non-param StackLoc
+ * address, or a TEMP that local_ptr (one bit per TEMP position, the first
+ * LOCAL_ONLY_MAX_TEMPS of them) marks as holding one. */
+static int lob_is_local_ptr_op(const uint8_t *local_ptr, IROperand sop)
+{
+  int r = 0;
+  int32_t vr = irop_get_vreg(sop);
+  int tag = irop_get_tag(sop);
+  if (tag == IROP_TAG_STACKOFF && sop.is_local && !sop.is_lval && !sop.is_llocal && !sop.is_param)
+    r = 1;
+  if (vr >= 0 && TCCIR_DECODE_VREG_TYPE(vr) == TCCIR_VREG_TYPE_TEMP)
+  {
+    int p = TCCIR_DECODE_VREG_POSITION(vr);
+    if (p >= 0 && p < LOCAL_ONLY_MAX_TEMPS && (local_ptr[p >> 3] & (uint8_t)(1u << (p & 7))) != 0)
+      r = 1;
+  }
+  return r;
+}
+
 static int ir_opt_pure_call_id_test(const uint8_t *pure_call_ids, int pure_call_id_bytes, int call_id)
 {
   return call_id >= 0 && call_id / 8 < pure_call_id_bytes &&
@@ -59,7 +87,7 @@ static int ir_opt_callee_is_body_elidable(TCCIRState *ir, Sym *callee)
   /* Flag-cmp / fneg / dneg helpers have no side effects beyond their result — elidable. */
   if (name && ir_opt_is_flag_cmp_helper_name(name))
     return 1;
-  if (name && (strcmp(name, "__aeabi_fneg") == 0 || strcmp(name, "__aeabi_dneg") == 0))
+  if (name && ir_opt_name_in(name, "__aeabi_fneg\0__aeabi_dneg\0"))
     return 1;
 
   return tcc_ir_get_func_purity(ir, callee) >= TCC_FUNC_PURITY_PURE;
@@ -172,8 +200,7 @@ static int ir_opt_op_is_essential(TCCIRState *ir, IRQuadCompact *q, int idx,
   case TCCIR_OP_JUMPIF:
   {
     /* Backward/self jumps form observable loops; forward jumps route over NOPs and drop. */
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    int target = (int)dest.u.imm32;
+    int target = (int)tcc_ir_op_dest_u_imm32(ir, q);
     if (target >= 0 && target <= idx)
       return 1;
     return 0;
@@ -223,14 +250,13 @@ static int ir_opt_op_is_essential(TCCIRState *ir, IRQuadCompact *q, int idx,
   case TCCIR_OP_FUNCCALLVAL:
   case TCCIR_OP_FUNCCALLVOID:
   {
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     return !ir_opt_callee_is_body_elidable(ir, callee);
   }
   case TCCIR_OP_FUNCPARAMVAL:
   case TCCIR_OP_FUNCPARAMVOID:
   {
-    IROperand src2 = tcc_ir_op_get_src2(ir, q);
-    int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, src2));
+    int call_id = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
     return !ir_opt_pure_call_id_test(pure_call_ids, pure_call_id_bytes, call_id);
   }
   default:
@@ -256,8 +282,7 @@ static int ir_opt_vreg_has_def_in_range(TCCIRState *ir, int32_t vreg, int start,
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (!dest.is_lval && irop_get_vreg(dest) == vreg)
+    if (!tcc_ir_op_dest_is_lval(ir, q) && tcc_ir_op_dest_vreg(ir, q) == vreg)
       return 1;
   }
   return 0;
@@ -274,22 +299,21 @@ static int ir_opt_vreg_has_iv_update_in_range(TCCIRState *ir, int32_t vreg, int 
     if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (dest.is_lval || irop_get_vreg(dest) != vreg)
+    if (tcc_ir_op_dest_is_lval(ir, q) || tcc_ir_op_dest_vreg(ir, q) != vreg)
       continue;
 
     if ((q->op == TCCIR_OP_ADD || q->op == TCCIR_OP_SUB) &&
         irop_config[q->op].has_src1 && irop_config[q->op].has_src2 &&
-        irop_is_immediate(tcc_ir_op_get_src2(ir, q)))
+        tcc_ir_op_src2_is_imm(ir, q))
     {
-      int32_t s1 = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      int32_t s1 = tcc_ir_op_src1_vreg(ir, q);
       if (ir_opt_vreg_has_def_in_range(ir, s1, start, end))
         return 1;
     }
 
     if (q->op == TCCIR_OP_ASSIGN && irop_config[q->op].has_src1)
     {
-      int32_t src = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      int32_t src = tcc_ir_op_src1_vreg(ir, q);
       if (ir_opt_vreg_has_iv_update_in_range(ir, src, start, end, depth + 1))
         return 1;
     }
@@ -313,13 +337,13 @@ static int ir_opt_jumpif_uses_iv_update(TCCIRState *ir, int jif_idx, int start, 
 
     if (irop_config[q->op].has_src1)
     {
-      int32_t s1 = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      int32_t s1 = tcc_ir_op_src1_vreg(ir, q);
       if (ir_opt_vreg_has_iv_update_in_range(ir, s1, start, end, 0))
         return 1;
     }
     if (irop_config[q->op].has_src2)
     {
-      int32_t s2 = irop_get_vreg(tcc_ir_op_get_src2(ir, q));
+      int32_t s2 = tcc_ir_op_src2_vreg(ir, q);
       if (ir_opt_vreg_has_iv_update_in_range(ir, s2, start, end, 0))
         return 1;
     }
@@ -338,19 +362,18 @@ static int ir_opt_range_has_iv_update(TCCIRState *ir, int start, int end)
       continue;
     if (q->op != TCCIR_OP_ADD && q->op != TCCIR_OP_SUB)
       continue;
-    if (!irop_config[q->op].has_src2 || !irop_is_immediate(tcc_ir_op_get_src2(ir, q)))
+    if (!irop_config[q->op].has_src2 || !tcc_ir_op_src2_is_imm(ir, q))
       continue;
 
-    IROperand dest = tcc_ir_op_get_dest(ir, q);
-    if (dest.is_lval)
+    if (tcc_ir_op_dest_is_lval(ir, q))
       continue;
 
-    int32_t dest_vr = irop_get_vreg(dest);
+    int32_t dest_vr = tcc_ir_op_dest_vreg(ir, q);
     int dest_vt = TCCIR_DECODE_VREG_TYPE(dest_vr);
     if (dest_vt != TCCIR_VREG_TYPE_TEMP && dest_vt != TCCIR_VREG_TYPE_VAR)
       continue;
 
-    int32_t src_vr = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+    int32_t src_vr = tcc_ir_op_src1_vreg(ir, q);
     if (ir_opt_vreg_has_def_in_range(ir, src_vr, start, end))
       return 1;
   }
@@ -368,7 +391,7 @@ static int ir_opt_region_has_conditional_exit(TCCIRState *ir, int start, int end
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
       continue;
-    int t = (int)irop_get_imm64_ex(ir, tcc_ir_op_get_dest(ir, q));
+    int t = (int)tcc_ir_op_dest_imm(ir, q);
     if (q->op == TCCIR_OP_JUMPIF)
       has_cond = 1;
     if (t < start || t > end)
@@ -390,8 +413,7 @@ static int ir_opt_successor_enters_range(TCCIRState *ir, int succ, int start, in
     return 1;
   if (succ >= 0 && succ < n && ir->compact_instructions[succ].op == TCCIR_OP_JUMP)
   {
-    IROperand dest = tcc_ir_op_get_dest(ir, &ir->compact_instructions[succ]);
-    int target = (int)irop_get_imm64_ex(ir, dest);
+    int target = (int)tcc_ir_op_dest_imm(ir, &ir->compact_instructions[succ]);
     return target >= start && target <= end;
   }
   return 0;
@@ -400,8 +422,7 @@ static int ir_opt_successor_enters_range(TCCIRState *ir, int succ, int start, in
 static int ir_opt_backward_jump_has_cond_exit(TCCIRState *ir, int idx)
 {
   IRQuadCompact *q = &ir->compact_instructions[idx];
-  IROperand dest = tcc_ir_op_get_dest(ir, q);
-  int target = (int)irop_get_imm64_ex(ir, dest);
+  int target = (int)tcc_ir_op_dest_imm(ir, q);
 
   if (target < 0 || target > idx)
     return 0;
@@ -431,8 +452,7 @@ static int ir_opt_backward_jump_has_cond_exit(TCCIRState *ir, int idx)
     if (iq->op != TCCIR_OP_JUMPIF)
       continue;
 
-    IROperand idest = tcc_ir_op_get_dest(ir, iq);
-    int itarget = (int)irop_get_imm64_ex(ir, idest);
+    int itarget = (int)tcc_ir_op_dest_imm(ir, iq);
     int target_enters = ir_opt_successor_enters_range(ir, itarget, target, idx);
     int fallthrough_enters = ir_opt_successor_enters_range(ir, i + 1, target, idx);
     if (!target_enters && fallthrough_enters &&
@@ -451,12 +471,7 @@ static int ir_opt_backward_jump_has_cond_exit(TCCIRState *ir, int idx)
  * no spurious push/pop or mov-param setup. */
 static void ir_opt_reset_elided_body_codegen_state(TCCIRState *ir)
 {
-  ir->ls.dirty_registers = 0;
-  ir->ls.dirty_float_registers = 0;
-  if (ir->ls.live_regs_by_instruction && ir->ls.live_regs_by_instruction_size > 0)
-    memset(ir->ls.live_regs_by_instruction, 0,
-           ir->ls.live_regs_by_instruction_size * sizeof(ir->ls.live_regs_by_instruction[0]));
-  ir->leaffunc = 1;
+  ir_opt_reset_body_regs(ir);
   for (int p = 0; p < ir->next_parameter; p++)
   {
     IRLiveInterval *iv = &ir->parameters_live_intervals[p];
@@ -519,12 +534,11 @@ int tcc_ir_opt_useless_function_body(TCCIRState *ir)
     if (q->op != TCCIR_OP_FUNCCALLVAL && q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
 
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, q);
     if (!ir_opt_callee_is_body_elidable(ir, callee))
       continue;
 
-    IROperand src2 = tcc_ir_op_get_src2(ir, q);
-    int call_id = TCCIR_DECODE_CALL_ID((uint32_t)irop_get_imm64_ex(ir, src2));
+    int call_id = TCCIR_DECODE_CALL_ID((uint32_t)tcc_ir_op_src2_imm(ir, q));
     ir_opt_pure_call_id_mark(&pure_call_ids, &pure_call_id_bytes, call_id);
   }
 
@@ -564,9 +578,9 @@ int tcc_ir_opt_useless_function_body(TCCIRState *ir)
     for (int i = 0; i < n; i++)
       ir->compact_instructions[i].is_jump_target = 0;
     ir->compact_instructions[0].op = TCCIR_OP_RETURNVALUE;
-    tcc_ir_set_dest(ir, 0, IROP_NONE);
+    tcc_ir_set_dest_none(ir, 0);
     tcc_ir_set_src1(ir, 0, rv_src);
-    tcc_ir_set_src2(ir, 0, IROP_NONE);
+    tcc_ir_set_src2_none(ir, 0);
   }
 
   ir_opt_reset_elided_body_codegen_state(ir);
@@ -577,11 +591,6 @@ int tcc_ir_opt_useless_function_body(TCCIRState *ir)
   LOG_IR_GEN("USELESS-BODY: NOPed %d instructions (no observable side effects)", changes);
   /* Return 1 even when changes==0 so the caller still resets loc for now-dead locals. */
   return changes > 0 ? changes : 1;
-}
-
-int tcc_ir_opt_useless_function_body_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_useless_function_body(ctx->ir);
 }
 
 /* Anchor test for dead_before_infinite_loop: a function that never returns and has
@@ -650,10 +659,10 @@ static int ir_inf_dead_find_sink(TCCIRState *ir, int start, const uint8_t *dead,
     case TCCIR_OP_TRAP:
       break;
     case TCCIR_OP_JUMP:
-      succ[ns++] = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      succ[ns++] = (int)tcc_ir_op_dest_u_imm32(ir, q);
       break;
     case TCCIR_OP_JUMPIF:
-      succ[ns++] = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+      succ[ns++] = (int)tcc_ir_op_dest_u_imm32(ir, q);
       succ[ns++] = i + 1;
       break;
     default:
@@ -686,7 +695,7 @@ int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir)
   int n = ir->next_instruction_index;
   if (n < 2)
     return 0;
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
 
   /* Indirect jumps have statically-unknown successors — bail. */
@@ -705,7 +714,7 @@ int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[i];
     if (q->op != TCCIR_OP_JUMP)
       continue;
-    if ((int)tcc_ir_op_get_dest(ir, q).u.imm32 == i)
+    if ((int)tcc_ir_op_dest_u_imm32(ir, q) == i)
     {
       SETBIT(is_sink, i);
       have_sink = 1;
@@ -751,14 +760,14 @@ int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir)
           break; /* anchors / no fall-through */
         case TCCIR_OP_JUMP:
         {
-          int t = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+          int t = (int)tcc_ir_op_dest_u_imm32(ir, q);
           if (t >= 0 && t < n && GETBIT(can_reach, t))
             reach = 1;
           break;
         }
         case TCCIR_OP_JUMPIF:
         {
-          int t = (int)tcc_ir_op_get_dest(ir, q).u.imm32;
+          int t = (int)tcc_ir_op_dest_u_imm32(ir, q);
           if (t >= 0 && t < n && GETBIT(can_reach, t))
             reach = 1;
           if (i + 1 < n && GETBIT(can_reach, i + 1))
@@ -782,23 +791,13 @@ int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir)
   /* reach[i]: executed on some path from entry (forward BFS). */
   uint8_t *reach = tcc_mallocz((n + 7) / 8);
   int *wl = tcc_malloc(n * sizeof(int));
-  int wh = 0, wt = 0;
+  IrReachWorklist rw = {reach, wl, 0, 0, n};
   SETBIT(reach, 0);
-  wl[wt++] = 0;
-  while (wh < wt)
+  wl[rw.tail++] = 0;
+  while (rw.head < rw.tail)
   {
-    int i = wl[wh++];
+    int i = wl[rw.head++];
     IRQuadCompact *q = &ir->compact_instructions[i];
-#define PUSH(k)                                                                                                        \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    int _k = (k);                                                                                                      \
-    if (_k >= 0 && _k < n && !GETBIT(reach, _k))                                                                       \
-    {                                                                                                                  \
-      SETBIT(reach, _k);                                                                                               \
-      wl[wt++] = _k;                                                                                                   \
-    }                                                                                                                  \
-  } while (0)
     switch (q->op)
     {
     case TCCIR_OP_RETURNVALUE:
@@ -806,30 +805,28 @@ int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir)
     case TCCIR_OP_TRAP:
       break;
     case TCCIR_OP_JUMP:
-      PUSH((int)tcc_ir_op_get_dest(ir, q).u.imm32);
+      ir_opt_reach_mark(&rw, (int)tcc_ir_op_dest_u_imm32(ir, q));
       break;
     case TCCIR_OP_JUMPIF:
-      PUSH((int)tcc_ir_op_get_dest(ir, q).u.imm32);
-      PUSH(i + 1);
+      ir_opt_reach_mark(&rw, (int)tcc_ir_op_dest_u_imm32(ir, q));
+      ir_opt_reach_mark(&rw, i + 1);
       break;
     case TCCIR_OP_SWITCH_TABLE:
     {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id >= 0 && table_id < ir->num_switch_tables)
       {
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
         for (int j = 0; j < table->num_entries; j++)
-          PUSH(table->targets[j]);
-        PUSH(table->default_target);
+          ir_opt_reach_mark(&rw, table->targets[j]);
+        ir_opt_reach_mark(&rw, table->default_target);
       }
       break;
     }
     default:
-      PUSH(i + 1);
+      ir_opt_reach_mark(&rw, i + 1);
       break;
     }
-#undef PUSH
   }
 
   /* dead[i]: reachable, cannot reach an anchor, and not itself a sink. */
@@ -861,13 +858,6 @@ int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[p];
     if (q->op == TCCIR_OP_NOP)
       continue;
-#define MARKENTRY(s)                                                                                                   \
-  do                                                                                                                   \
-  {                                                                                                                    \
-    int _s = (s);                                                                                                      \
-    if (_s >= 0 && _s < n && GETBIT(dead, _s))                                                                         \
-      SETBIT(entry, _s);                                                                                               \
-  } while (0)
     switch (q->op)
     {
     case TCCIR_OP_RETURNVALUE:
@@ -875,30 +865,28 @@ int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir)
     case TCCIR_OP_TRAP:
       break;
     case TCCIR_OP_JUMP:
-      MARKENTRY((int)tcc_ir_op_get_dest(ir, q).u.imm32);
+      be_mark_entry(entry, dead, n, (int)tcc_ir_op_dest_u_imm32(ir, q));
       break;
     case TCCIR_OP_JUMPIF:
-      MARKENTRY((int)tcc_ir_op_get_dest(ir, q).u.imm32);
-      MARKENTRY(p + 1);
+      be_mark_entry(entry, dead, n, (int)tcc_ir_op_dest_u_imm32(ir, q));
+      be_mark_entry(entry, dead, n, p + 1);
       break;
     case TCCIR_OP_SWITCH_TABLE:
     {
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int table_id = (int)irop_get_imm64_ex(ir, src2);
+      int table_id = (int)tcc_ir_op_src2_imm(ir, q);
       if (table_id >= 0 && table_id < ir->num_switch_tables)
       {
         TCCIRSwitchTable *table = &ir->switch_tables[table_id];
         for (int j = 0; j < table->num_entries; j++)
-          MARKENTRY(table->targets[j]);
-        MARKENTRY(table->default_target);
+          be_mark_entry(entry, dead, n, table->targets[j]);
+        be_mark_entry(entry, dead, n, table->default_target);
       }
       break;
     }
     default:
-      MARKENTRY(p + 1);
+      be_mark_entry(entry, dead, n, p + 1);
       break;
     }
-#undef MARKENTRY
   }
 
   /* Resolve a sink for every entry up front; abort untouched if any can't reach one. */
@@ -934,16 +922,16 @@ int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir)
     IRQuadCompact *q = &ir->compact_instructions[d];
     if (q->op == TCCIR_OP_LEA)
     {
-      int32_t lea_src = irop_get_vreg(tcc_ir_op_get_src1(ir, q));
+      int32_t lea_src = tcc_ir_op_src1_vreg(ir, q);
       if (lea_src >= 0)
         cleared_vr[ncleared++] = lea_src;
     }
     if (GETBIT(entry, d))
     {
       q->op = TCCIR_OP_JUMP;
-      tcc_ir_set_dest(ir, d, irop_make_imm32(-1, entry_sink[d], IROP_BTYPE_INT32));
-      tcc_ir_set_src1(ir, d, IROP_NONE);
-      tcc_ir_set_src2(ir, d, IROP_NONE);
+      tcc_ir_set_dest_imm32(ir, d, entry_sink[d], IROP_BTYPE_INT32);
+      tcc_ir_set_src1_none(ir, d);
+      tcc_ir_set_src2_none(ir, d);
     }
     else
     {
@@ -962,7 +950,7 @@ int tcc_ir_opt_dead_before_infinite_loop(TCCIRState *ir)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op != TCCIR_OP_LEA)
         continue;
-      if (irop_get_vreg(tcc_ir_op_get_src1(ir, q)) == vr)
+      if (tcc_ir_op_src1_vreg(ir, q) == vr)
       {
         still = 1;
         break;
@@ -994,11 +982,6 @@ done:
   return changes;
 }
 
-int tcc_ir_opt_dead_before_infinite_loop_ex(IROptCtx *ctx)
-{
-  return tcc_ir_opt_dead_before_infinite_loop(ctx->ir);
-}
-
 /* Collapse a function body whose every side effect is confined to its own stack
  * frame (no caller-visible state): NOP the body and emit a single constant/void
  * return.  Handles direct local stores, stores through proven local-frame
@@ -1008,7 +991,7 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
   int n = ir->next_instruction_index;
   if (n == 0)
     return 0;
-  if (!tcc_state || tcc_state->optimize < 2)
+  if (!tcc_state || TCC_OPT(tcc_state, optimize) < 2)
     return 0;
 
 
@@ -1019,8 +1002,6 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
     return 0;
 
 #define LOCAL_ONLY_MAX_MEMMOVE_CALLS 256
-#define LOCAL_ONLY_MAX_TEMPS 8192
-
   /* Pass 0: scan for hard bails; record memmove-like calls for later first-arg check. */
   int memmove_call_ids[LOCAL_ONLY_MAX_MEMMOVE_CALLS];
   int n_memmove_calls = 0;
@@ -1087,7 +1068,7 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
     case TCCIR_OP_FUNCCALLVAL:
     case TCCIR_OP_FUNCCALLVOID:
     {
-      Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, q));
+      Sym *callee = tcc_ir_op_src1_sym(ir, q);
       if (!callee)
         return 0;
       const char *name = get_tok_str(callee->v, NULL);
@@ -1101,21 +1082,15 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
         break;
       /* memmove/memcpy/memset and va_list helpers write through their first arg only;
        * verify that arg is a local-frame pointer later. */
-      int is_memlike = strcmp(name, "__aeabi_memmove4") == 0 || strcmp(name, "__aeabi_memmove8") == 0 ||
-                       strcmp(name, "__aeabi_memmove") == 0 || strcmp(name, "__aeabi_memcpy4") == 0 ||
-                       strcmp(name, "__aeabi_memcpy8") == 0 || strcmp(name, "__aeabi_memcpy") == 0 ||
-                       strcmp(name, "__aeabi_memset") == 0 || strcmp(name, "__aeabi_memset4") == 0 ||
-                       strcmp(name, "__aeabi_memset8") == 0 || strcmp(name, "__aeabi_memclr") == 0 ||
-                       strcmp(name, "__aeabi_memclr4") == 0 || strcmp(name, "__aeabi_memclr8") == 0 ||
-                       strcmp(name, "memmove") == 0 || strcmp(name, "memcpy") == 0 ||
-                       strcmp(name, "memset") == 0 || strcmp(name, "__tcc_va_arg") == 0 ||
-                       strcmp(name, "__tcc_va_start") == 0;
+      int is_memlike = ir_opt_name_in(name, "__aeabi_memmove4\0__aeabi_memmove8\0__aeabi_memmove\0__aeabi_memcpy4\0"
+                                            "__aeabi_memcpy8\0__aeabi_memcpy\0__aeabi_memset\0__aeabi_memset4\0"
+                                            "__aeabi_memset8\0__aeabi_memclr\0__aeabi_memclr4\0__aeabi_memclr8\0"
+                                            "memmove\0memcpy\0memset\0__tcc_va_arg\0__tcc_va_start\0");
       if (!is_memlike)
         return 0;
       if (n_memmove_calls >= LOCAL_ONLY_MAX_MEMMOVE_CALLS)
         return 0;
-      IROperand call_id_op = tcc_ir_op_get_src2(ir, q);
-      int call_id = TCCIR_DECODE_CALL_ID(irop_get_imm64_ex(ir, call_id_op));
+      int call_id = TCCIR_DECODE_CALL_ID(tcc_ir_op_src2_imm(ir, q));
       memmove_call_ids[n_memmove_calls++] = call_id;
       break;
     }
@@ -1153,6 +1128,15 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
       if (ir_opt_operand_access_is_volatile(ir, op))
         return 0;
     }
+    /* A mem* call's address PARAMs are no lvalues: a struct copy into or out of
+     * a volatile object marks them volatile instead (see vstore). */
+    if (q->op == TCCIR_OP_FUNCPARAMVAL)
+    {
+      IROperand pv = tcc_ir_op_get_src1(ir, q);
+      int pidx = TCCIR_DECODE_PARAM_IDX((uint32_t)tcc_ir_op_src2_imm(ir, q));
+      if (pidx < 2 && !irop_is_immediate(pv) && tcc_ir_access_is_volatile(ir, pv))
+        return 0;
+    }
   }
 
   /* useless_function_body covers the no-call-no-store case — leave it to avoid double-counting. */
@@ -1161,8 +1145,11 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
   if (return_count > 0 && return_void_count > 0)
     return 0;
 
-  /* Pass 1: forward fixpoint marking TEMPs that hold a local-frame pointer;
-   * seed from LEA of a stack-local, propagate through ASSIGN/ADD/SUB. */
+  /* Pass 1: greatest fixpoint marking TEMPs that ALWAYS hold a local-frame
+   * pointer.  A TEMP can have several defs (phi lowering gives one per
+   * predecessor); it stays marked only if every def is a LEA of a stack-local
+   * or derived from a marked TEMP via ASSIGN/ADD/SUB-const/MLA.  Start with
+   * every defined TEMP marked and clear those with a non-qualifying def. */
   uint8_t local_ptr[(LOCAL_ONLY_MAX_TEMPS + 7) / 8] = {0};
 
 #define LP_GET(p) ((local_ptr[(p) >> 3] & (uint8_t)(1u << ((p) & 7))) != 0)
@@ -1173,23 +1160,22 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
       local_ptr[(p) >> 3] |= (uint8_t)(1u << ((p) & 7));                                                               \
   } while (0)
 
-#define IS_LOCAL_PTR_OP(sop)                                                                                           \
-  ({                                                                                                                   \
-    int _r = 0;                                                                                                        \
-    int32_t _vr = irop_get_vreg(sop);                                                                                  \
-    int _tag = irop_get_tag(sop);                                                                                      \
-    if (_tag == IROP_TAG_STACKOFF && (sop).is_local && !(sop).is_lval && !(sop).is_llocal && !(sop).is_param)          \
-      _r = 1;                                                                                                          \
-    if (_vr >= 0 && TCCIR_DECODE_VREG_TYPE(_vr) == TCCIR_VREG_TYPE_TEMP)                                               \
-    {                                                                                                                  \
-      int _p = TCCIR_DECODE_VREG_POSITION(_vr);                                                                        \
-      if (_p >= 0 && _p < LOCAL_ONLY_MAX_TEMPS && LP_GET(_p))                                                          \
-        _r = 1;                                                                                                        \
-    }                                                                                                                  \
-    _r;                                                                                                                \
-  })
+#define LP_CLR(p) (local_ptr[(p) >> 3] &= (uint8_t) ~(1u << ((p) & 7)))
 
-  for (int iter = 0; iter < 16; iter++)
+
+  for (int i = 0; i < n; i++)
+  {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_NOP || !irop_config[q->op].has_dest)
+      continue;
+    IROperand dop = tcc_ir_op_get_dest(ir, q);
+    int32_t dvr = irop_get_vreg(dop);
+    if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP || dop.is_lval)
+      continue;
+    LP_SET(TCCIR_DECODE_VREG_POSITION(dvr));
+  }
+
+  for (;;)
   {
     int changed = 0;
     for (int i = 0; i < n; i++)
@@ -1199,16 +1185,15 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
         continue;
       if (!irop_config[q->op].has_dest)
         continue;
-      IROperand dop = tcc_ir_op_get_dest(ir, q);
-      int32_t dvr = irop_get_vreg(dop);
+      int32_t dvr = tcc_ir_op_dest_vreg(ir, q);
       if (dvr < 0 || TCCIR_DECODE_VREG_TYPE(dvr) != TCCIR_VREG_TYPE_TEMP)
         continue;
-      if (dop.is_lval) /* STORE-through-TEMP form is not a def of this TEMP */
+      if (tcc_ir_op_dest_is_lval(ir, q)) /* STORE-through-TEMP form is not a def of this TEMP */
         continue;
       int dpos = TCCIR_DECODE_VREG_POSITION(dvr);
       if (dpos < 0 || dpos >= LOCAL_ONLY_MAX_TEMPS)
         continue;
-      if (LP_GET(dpos))
+      if (!LP_GET(dpos))
         continue;
 
       int set = 0;
@@ -1240,25 +1225,29 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
         /* ASSIGN, or a STORE with non-lval TEMP dest (a TEMP def after var-to-tmp
          * promotion): propagate local-pointer status from the source. */
         IROperand s = tcc_ir_op_get_src1(ir, q);
-        if (IS_LOCAL_PTR_OP(s))
+        if (lob_is_local_ptr_op(local_ptr, s))
           set = 1;
         break;
       }
       case TCCIR_OP_ADD:
       case TCCIR_OP_SUB:
       {
-        /* local-pointer ± offset stays local-pointer; one local-pointer operand suffices. */
+        /* local-pointer ± offset stays local-pointer; one local-pointer operand
+         * suffices for ADD.  SUB only as `local - const`: a difference of two
+         * pointers is an integer that need not point into the frame. */
         IROperand s1 = tcc_ir_op_get_src1(ir, q);
         IROperand s2 = tcc_ir_op_get_src2(ir, q);
-        if (IS_LOCAL_PTR_OP(s1) || IS_LOCAL_PTR_OP(s2))
-          set = 1;
+        if (q->op == TCCIR_OP_ADD)
+          set = lob_is_local_ptr_op(local_ptr, s1) || lob_is_local_ptr_op(local_ptr, s2);
+        else
+          set = lob_is_local_ptr_op(local_ptr, s1) && irop_get_tag(s2) == IROP_TAG_IMM32;
         break;
       }
       case TCCIR_OP_MLA:
       {
         /* MLA with a local-pointer accum: result is local-pointer + scaled offset. */
         IROperand accum = tcc_ir_op_get_accum(ir, q);
-        if (IS_LOCAL_PTR_OP(accum))
+        if (lob_is_local_ptr_op(local_ptr, accum))
           set = 1;
         break;
       }
@@ -1266,9 +1255,9 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
         break;
       }
 
-      if (set)
+      if (!set)
       {
-        LP_SET(dpos);
+        LP_CLR(dpos);
         changed = 1;
       }
     }
@@ -1290,7 +1279,7 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
       /* STORE with non-lval TEMP dest is a TEMP def (no memory write) — local-only. */
       if (q->op == TCCIR_OP_STORE && !dop.is_lval)
         ok = 1;
-      else if (IS_LOCAL_PTR_OP(dop))
+      else if (lob_is_local_ptr_op(local_ptr, dop))
         ok = 1;
     }
     else if (q->op == TCCIR_OP_STORE)
@@ -1328,14 +1317,13 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
       IRQuadCompact *q = &ir->compact_instructions[i];
       if (q->op != TCCIR_OP_FUNCPARAMVAL && q->op != TCCIR_OP_FUNCPARAMVOID)
         continue;
-      IROperand src2 = tcc_ir_op_get_src2(ir, q);
-      int64_t encoded = irop_get_imm64_ex(ir, src2);
+      int64_t encoded = tcc_ir_op_src2_imm(ir, q);
       if (TCCIR_DECODE_CALL_ID(encoded) != target_call_id)
         continue;
       if (TCCIR_DECODE_PARAM_IDX(encoded) != 0)
         continue;
       IROperand val = tcc_ir_op_get_src1(ir, q);
-      if (IS_LOCAL_PTR_OP(val))
+      if (lob_is_local_ptr_op(local_ptr, val))
         verified = 1;
       break;
     }
@@ -1344,8 +1332,8 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
   }
 
 #undef LP_GET
+#undef LP_CLR
 #undef LP_SET
-#undef IS_LOCAL_PTR_OP
 #undef LOCAL_ONLY_MAX_MEMMOVE_CALLS
 #undef LOCAL_ONLY_MAX_TEMPS
 
@@ -1370,5 +1358,3 @@ int tcc_ir_opt_local_only_body_elide(TCCIRState *ir)
 
   return 1;
 }
-
-int tcc_ir_opt_local_only_body_elide_ex(IROptCtx *ctx) { return tcc_ir_opt_local_only_body_elide(ctx->ir); }

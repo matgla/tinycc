@@ -1,0 +1,8 @@
+bc_clobbers_regs ok
+bc_small_clobbers_regs ok
+bc_overwrites_slot ok
+bc_small_overwrites_slot ok
+fp_mul_clobbers_regs ok
+fp_div_clobbers_regs ok
+fp_cvt_clobbers_regs ok
+fp_cvt_back_clobbers_regs ok

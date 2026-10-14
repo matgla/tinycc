@@ -36,19 +36,18 @@ static int co_resolve_base(IRSSAOptCtx *ctx, int32_t vr, int32_t *base_vr, int64
   if (tcc_ir_op_get_dest(ir, dq).is_unsigned)
     return 0;
 
-  IROperand ds1 = tcc_ir_op_get_src1(ir, dq);
   IROperand ds2 = tcc_ir_op_get_src2(ir, dq);
   int64_t k;
   int32_t bvr;
-  if (irop_get_vreg(ds1) >= 0 && !ds1.is_lval && irop_is_immediate(ds2))
+  if (tcc_ir_op_src1_vreg(ir, dq) >= 0 && !tcc_ir_op_src1_is_lval(ir, dq) && irop_is_immediate(ds2))
   {
     k = irop_get_imm64_ex(ir, ds2);
-    bvr = irop_get_vreg(ds1);
+    bvr = tcc_ir_op_src1_vreg(ir, dq);
   }
   else if (dq->op == TCCIR_OP_ADD && irop_get_vreg(ds2) >= 0 && !ds2.is_lval &&
-           irop_is_immediate(ds1))
+           tcc_ir_op_src1_is_imm(ir, dq))
   {
-    k = irop_get_imm64_ex(ir, ds1);
+    k = tcc_ir_op_src1_imm(ir, dq);
     bvr = irop_get_vreg(ds2);
   }
   else
@@ -157,11 +156,10 @@ int ssa_opt_cmp_offset_fold(IRSSAOptCtx *ctx)
     if (!is_jumpif && !is_select && !is_setif)
       continue;
 
-    IROperand src1 = tcc_ir_op_get_src1(ir, q);
     IROperand src2 = tcc_ir_op_get_src2(ir, q);
-    if (src1.is_lval || src2.is_lval)
+    if (tcc_ir_op_src1_is_lval(ir, q) || src2.is_lval)
       continue;
-    int32_t vr1 = irop_get_vreg(src1);
+    int32_t vr1 = tcc_ir_op_src1_vreg(ir, q);
     int32_t vr2 = irop_get_vreg(src2);
     if (vr1 < 0 || vr2 < 0 || vr1 == vr2)
       continue;
@@ -217,19 +215,18 @@ int ssa_opt_cmp_offset_fold(IRSSAOptCtx *ctx)
     }
     else if (is_select) /* dest = cond ? then : else */
     {
-      IROperand chosen = result ? tcc_ir_op_get_src1(ir, next)
-                                : tcc_ir_op_get_src2(ir, next);
+      IROperand chosen = tcc_ir_op_get_src1_or_2(ir, next, !result);
       q->op = TCCIR_OP_NOP;
       next->op = TCCIR_OP_ASSIGN;
       tcc_ir_set_src1(ir, i + 1, chosen);
-      tcc_ir_set_src2(ir, i + 1, IROP_NONE);
+      tcc_ir_set_src2_none(ir, i + 1);
     }
     else /* SETIF: dest = (cond) as 0/1 */
     {
       IROperand set_dest = tcc_ir_op_get_dest(ir, next);
       q->op = TCCIR_OP_NOP;
       next->op = TCCIR_OP_ASSIGN;
-      tcc_ir_set_src1(ir, i + 1, irop_make_imm32(-1, result, IROP_BTYPE_INT32));
+      tcc_ir_set_src1_imm32(ir, i + 1, result, IROP_BTYPE_INT32);
       tcc_ir_op_set_dest(ir, next, set_dest);
     }
 

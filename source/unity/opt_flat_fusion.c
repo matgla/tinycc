@@ -53,5 +53,6 @@
 #undef ZH64_S1_LO
 #undef ZH64_S2_HI
 #undef ZH64_S2_LO
+#undef ZH_ALL
 #undef ZK_HI
 #undef ZK_LO

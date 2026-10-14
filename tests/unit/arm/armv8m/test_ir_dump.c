@@ -469,15 +469,15 @@ UT_TEST(test_print_quad_returnvoid)
   return 0;
 }
 
-/* SET_CHAIN has no operands (irop_config defaults to {0,0,0}, no explicit
- * entry in the table) and gets its own explanatory-comment branch. */
+/* SET_CHAIN's one operand is the chain level (nested_chain_level), printed
+ * after its own explanatory comment. */
 UT_TEST(test_print_quad_set_chain)
 {
   TCCIRState *ir = utb_new();
-  utb_emit(ir, TCCIR_OP_SET_CHAIN, UTB_NONE, UTB_NONE, UTB_NONE);
+  utb_emit(ir, TCCIR_OP_SET_CHAIN, UTB_NONE, utb_imm(2, IROP_BTYPE_INT32), UTB_NONE);
 
   char *s = dump_quad(ir, 0);
-  UT_ASSERT_STREQ(s, "0000: SET_CHAIN /* R10 <- FP */ \n");
+  UT_ASSERT_STREQ(s, "0000: SET_CHAIN /* R10 <- chain level */ #2\n");
   libc_free(s);
 
   utb_free(ir);

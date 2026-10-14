@@ -34,7 +34,7 @@ int tcc_ir_opt_dead_init_via_call(TCCIRState *ir)
     if (call_q->op != TCCIR_OP_FUNCCALLVAL && call_q->op != TCCIR_OP_FUNCCALLVOID)
       continue;
 
-    Sym *callee = irop_get_sym_ex(ir, tcc_ir_op_get_src1(ir, call_q));
+    Sym *callee = tcc_ir_op_src1_sym(ir, call_q);
     if (!callee)
       continue;
     FuncWriteSummary *summary = fws_lookup(callee);
@@ -57,13 +57,14 @@ int tcc_ir_opt_dead_init_via_call(TCCIRState *ir)
       for (int s = call_idx - 1; s >= 0; s--)
       {
         IRQuadCompact *sq = &ir->compact_instructions[s];
+        /* Bail at any control-flow boundary or call: other block / unknown effects.
+         * A jump target is one even as a NOP, so it is tested before the skip. */
+        if (sq->is_jump_target)
+          break;
         if (sq->op == TCCIR_OP_NOP)
           continue;
-        /* Bail at any control-flow boundary or call: other block / unknown effects. */
         if (sq->op == TCCIR_OP_JUMP || sq->op == TCCIR_OP_JUMPIF || sq->op == TCCIR_OP_IJUMP ||
             sq->op == TCCIR_OP_SWITCH_TABLE || sq->op == TCCIR_OP_FUNCCALLVAL || sq->op == TCCIR_OP_FUNCCALLVOID)
-          break;
-        if (sq->is_jump_target)
           break;
         if (sq->op != TCCIR_OP_STORE)
           continue;
@@ -92,7 +93,7 @@ int tcc_ir_opt_dead_init_via_call(TCCIRState *ir)
               continue;
             if (k == 2 && !irop_config[tq->op].has_src2)
               continue;
-            IROperand op = (k == 1) ? tcc_ir_op_get_src1(ir, tq) : tcc_ir_op_get_src2(ir, tq);
+            IROperand op = tcc_ir_op_get_src1_or_2(ir, tq, k != 1);
             if (!op.is_local || irop_get_tag(op) != IROP_TAG_STACKOFF)
               continue;
             if (!op.is_lval)
