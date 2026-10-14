@@ -1018,6 +1018,32 @@ static int dl_single_entry_single_latch(IRSSAOptCtx *ctx, IRLoop *loop, int jpf_
  * direct scan rather than off the use lists, which under-report once a pass
  * has NOP'd an instruction without unlinking its uses — here that would read
  * as "nothing escapes" and delete a loop whose result is still wanted. */
+/* Every way out of the body lands on the latch's fall-through.  An exit
+ * anywhere else (`if (a[i] == x) goto found;`) fires on whichever trip its
+ * condition first holds, so dropping the back-edge would make it depend on
+ * the first element alone even when nothing the body computes is read
+ * outside. */
+static int dl_exits_only_to_fallthru(IRSSAOptCtx *ctx, IRLoop *loop, int fallthru_block)
+{
+  TCCIRState *ir = ctx->ir;
+  IRCFG *cfg = ctx->cfg;
+
+  for (int i = loop->start_idx; i <= loop->end_idx && i < ir->next_instruction_index; i++) {
+    IRQuadCompact *q = &ir->compact_instructions[i];
+    if (q->op == TCCIR_OP_IJUMP || q->op == TCCIR_OP_SWITCH_TABLE || q->op == TCCIR_OP_RETURNVOID ||
+        q->op == TCCIR_OP_RETURNVALUE)
+      return 0;
+    if (q->op != TCCIR_OP_JUMP && q->op != TCCIR_OP_JUMPIF)
+      continue;
+    int target = (int)tcc_ir_op_dest_imm(ir, q);
+    if (dl_instr_in_loop(loop, target))
+      continue;
+    if (target < 0 || target >= cfg->num_instrs || cfg->instr_to_block[target] != fallthru_block)
+      return 0;
+  }
+  return 1;
+}
+
 static int dl_collect_varying_defs(IRSSAOptCtx *ctx, IRLoop *loop,
                                    int32_t *cands, int *num_cands)
 {
@@ -1209,6 +1235,8 @@ static int try_kill_rotated_loop(IRSSAOptCtx *ctx, IRLoop *loop)
   /* Whole-IR scans last: by here the loop is known to be a pure counting one,
    * which is a handful of loops per translation unit rather than every one. */
   if (!dl_single_entry_single_latch(ctx, loop, jpf_idx))
+    return 0;
+  if (!dl_exits_only_to_fallthru(ctx, loop, fallthru_block))
     return 0;
 
   /* --- nothing the body computes may differ between iteration 1 and N ---- */

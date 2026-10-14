@@ -134,6 +134,7 @@ TEST_FILES = [
     ("90_global_array_assignment.c", 0),
     ("bug_swap.c", 0),
     ("bug_dead_loop_exit_phi_mid_body_break.c", 0),
+    ("bug_dead_loop_rotated_early_exit.c", 0),
     ("bug_dead_trail_addrvar_ptr_copy.c", 0),
     ("bug_dead_trail_volatile_access.c", 0),  # dead_trail_addrvar keeps writes that access volatile memory
     ("bug_narrow_volatile_load_dead_local.c", 0),  # a volatile load into a dead char/short local stays
