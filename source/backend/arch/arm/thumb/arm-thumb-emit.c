@@ -440,13 +440,22 @@ ST_FUNC int tcc_gen_machine_const_needs_pool(int32_t value)
 {
   return th_generic_mov_imm(0, value).size == 0;
 }
-ScratchRegAlloc th_offset_to_reg_ex(int off, int sign, uint32_t exclude_regs)
+ScratchRegAlloc th_offset_to_reg_ex(int off, int sign, int base, uint32_t exclude_regs)
 {
   /* Find a free scratch register (must not clobber excluded regs).
    * Returns ScratchRegAlloc struct so caller can manage cleanup.
-   * Caller MUST call restore_scratch_reg() when done with the register. */
+   * Caller MUST call restore_scratch_reg() when done with the register.
+   * The caller computed `off` from SP before this PUSH (if any) moved SP
+   * down 4, so an SP-relative offset grows by 4: unbiased, a far spill reload
+   * read the slot below (pr28982b's 256 KB frame with every register busy). */
   ScratchRegAlloc alloc = get_scratch_reg_with_save(exclude_regs);
   int rr = alloc.reg;
+  if (alloc.saved == 1 && base == R_SP)
+  {
+    const int adj = (sign ? -off : off) + 4;
+    sign = adj < 0;
+    off = sign ? -adj : adj;
+  }
 
   /* If mov is not possible then load from data */
   if (!ot(th_generic_mov_imm(rr, off)))
@@ -1243,7 +1252,7 @@ ST_FUNC void tcc_machine_load_spill_slot(int dest_reg, int frame_offset)
   const int abs_offset = sign ? -frame_offset : frame_offset;
   if (!load_word_from_base(dest_reg, base_reg, abs_offset, sign))
   {
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << dest_reg) | (1u << base_reg));
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, base_reg, (1u << dest_reg) | (1u << base_reg));
     int rr = rr_alloc.reg;
     ot_check(th_ldr_reg(dest_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
@@ -1284,7 +1293,7 @@ ST_FUNC void tcc_machine_store_spill_slot(int src_reg, int frame_offset)
     }
 
     ScratchRegAlloc rr_alloc =
-        th_offset_to_reg_ex(abs_offset, sign, (1u << src_reg) | (1u << base_reg) | extra_exclude);
+        th_offset_to_reg_ex(abs_offset, sign, base_reg, (1u << src_reg) | (1u << base_reg) | extra_exclude);
     int rr = rr_alloc.reg;
     ot_check(th_str_reg(src_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
@@ -1554,7 +1563,8 @@ void th_store32_imm_or_reg_ex(int src_reg, uint32_t base_reg, int abs_off, int s
     return;
   if (!ot(st))
   {
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, (1u << src_reg) | (1u << base_reg) | extra_exclude);
+    ScratchRegAlloc rr_alloc =
+        th_offset_to_reg_ex(abs_off, sign, base_reg, (1u << src_reg) | (1u << base_reg) | extra_exclude);
     int rr = rr_alloc.reg;
     ot_check(th_str_reg(src_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
@@ -1564,7 +1574,7 @@ void th_store16_imm_or_reg(int src_reg, uint32_t base_reg, int abs_off, int sign
 {
   if (!ot(th_strh_imm(src_reg, base_reg, abs_off, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
   {
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, (1u << src_reg) | (1u << base_reg));
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, base_reg, (1u << src_reg) | (1u << base_reg));
     int rr = rr_alloc.reg;
     ot_check(th_strh_reg(src_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
@@ -1574,7 +1584,7 @@ void th_store8_imm_or_reg(int src_reg, uint32_t base_reg, int abs_off, int sign)
 {
   if (!ot(th_strb_imm(src_reg, base_reg, abs_off, sign ? 4 : 6, ENFORCE_ENCODING_NONE)))
   {
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, (1u << src_reg) | (1u << base_reg));
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, base_reg, (1u << src_reg) | (1u << base_reg));
     int rr = rr_alloc.reg;
     ot_check(th_strb_reg(src_reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
@@ -2357,7 +2367,8 @@ void load_from_base(int r, int r1, int irop_btype, int is_unsigned, int fc, int 
     success = load_word_from_base(r, base_reg, fc, sign);
     if (!success)
     {
-      ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base_reg) | (1u << ir_high));
+      ScratchRegAlloc rr_alloc =
+          th_offset_to_reg_ex(fc, sign, base_reg, (1u << r) | (1u << base_reg) | (1u << ir_high));
       int rr = rr_alloc.reg;
       ot_check(th_ldr_reg(r, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       restore_scratch_reg(&rr_alloc);
@@ -2368,7 +2379,8 @@ void load_from_base(int r, int r1, int irop_btype, int is_unsigned, int fc, int 
     success = load_word_from_base(ir_high, base_reg, fc_high, sign);
     if (!success)
     {
-      ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc_high, sign, (1u << r) | (1u << base_reg) | (1u << ir_high));
+      ScratchRegAlloc rr_alloc =
+          th_offset_to_reg_ex(fc_high, sign, base_reg, (1u << r) | (1u << base_reg) | (1u << ir_high));
       int rr = rr_alloc.reg;
       ot_check(th_ldr_reg(ir_high, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       restore_scratch_reg(&rr_alloc);
@@ -2403,7 +2415,7 @@ void load_from_base(int r, int r1, int irop_btype, int is_unsigned, int fc, int 
 
   if (!success)
   {
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc, sign, (1u << r) | (1u << base));
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(fc, sign, base, (1u << r) | (1u << base));
     int rr = rr_alloc.reg;
     if (irop_btype == IROP_BTYPE_INT16)
     {

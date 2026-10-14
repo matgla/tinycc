@@ -793,7 +793,7 @@ void mach_writeback_dest(const MachineOperand *op, int reg)
     int abs_off = sign ? (int)(-off) : (int)off;
     if (!store_word_to_base(reg, base, abs_off, sign))
     {
-      ScratchRegAlloc rr = th_offset_to_reg_ex(abs_off, sign, excl | (1u << (uint32_t)base));
+      ScratchRegAlloc rr = th_offset_to_reg_ex(abs_off, sign, base, excl | (1u << (uint32_t)base));
       ot_check(th_str_reg((uint32_t)reg, (uint32_t)base, (uint32_t)rr.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       restore_scratch_reg(&rr);
     }
@@ -814,7 +814,7 @@ void mach_writeback_dest(const MachineOperand *op, int reg)
     const int sign = addend < 0 ? 1 : 0;
     if (!store_word_to_base(reg, rr.reg, abs_off, sign))
     {
-      ScratchRegAlloc rr2 = th_offset_to_reg_ex(abs_off, sign, excl | (1u << (uint32_t)rr.reg));
+      ScratchRegAlloc rr2 = th_offset_to_reg_ex(abs_off, sign, rr.reg, excl | (1u << (uint32_t)rr.reg));
       ot_check(
           th_str_reg((uint32_t)reg, (uint32_t)rr.reg, (uint32_t)rr2.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
       restore_scratch_reg(&rr2);

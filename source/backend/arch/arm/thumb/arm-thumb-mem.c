@@ -154,7 +154,7 @@ ST_FUNC void tcc_gen_machine_load_mop(MachineOperand src, MachineOperand dest, T
       int ptr_r = mach_alloc_scratch(&ctx, ((uint32_t)1u << (uint32_t)dest_reg) | ((uint32_t)1u << base));
       if (!load_word_from_base(ptr_r, (int)base, abs_off, sign))
       {
-        ScratchRegAlloc rr = th_offset_to_reg_ex(abs_off, sign, ((uint32_t)1u << ptr_r) | ((uint32_t)1u << base));
+        ScratchRegAlloc rr = th_offset_to_reg_ex(abs_off, sign, base, ((uint32_t)1u << ptr_r) | ((uint32_t)1u << base));
         ot_check(th_ldr_reg((uint32_t)ptr_r, base, (uint32_t)rr.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         restore_scratch_reg(&rr);
       }
@@ -445,7 +445,7 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
         if (!load_word_from_base(ptr_r, (int)base, adj < 0 ? -adj : adj, adj < 0 ? 1 : 0))
         {
           ScratchRegAlloc rr =
-              th_offset_to_reg_ex(adj < 0 ? -adj : adj, adj < 0 ? 1 : 0, (uint32_t)(1u << ptr_r) | (1u << base));
+              th_offset_to_reg_ex(adj < 0 ? -adj : adj, adj < 0 ? 1 : 0, base, (uint32_t)(1u << ptr_r) | (1u << base));
           ot_check(th_ldr_reg((uint32_t)ptr_r, base, (uint32_t)rr.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
           restore_scratch_reg(&rr);
         }
@@ -613,8 +613,8 @@ ST_FUNC void tcc_gen_machine_store_mop(MachineOperand dest, MachineOperand src, 
       int ptr_r = mach_alloc_scratch(&ctx, (uint32_t)1u << (uint32_t)src_reg | (1u << base));
       if (!load_word_from_base(ptr_r, (int)base, abs_off, sign))
       {
-        ScratchRegAlloc rr =
-            th_offset_to_reg_ex(abs_off, sign, (uint32_t)(1u << ptr_r) | (1u << base) | (1u << (uint32_t)src_reg));
+        ScratchRegAlloc rr = th_offset_to_reg_ex(abs_off, sign, base,
+                                                 (uint32_t)(1u << ptr_r) | (1u << base) | (1u << (uint32_t)src_reg));
         ot_check(th_ldr_reg((uint32_t)ptr_r, base, (uint32_t)rr.reg, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
         restore_scratch_reg(&rr);
       }

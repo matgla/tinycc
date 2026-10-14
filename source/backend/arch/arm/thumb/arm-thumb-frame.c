@@ -1100,7 +1100,8 @@ ST_FUNC void tcc_gen_machine_store_to_stack_ex(int reg, int offset, uint32_t ext
     /* Offset too large, use scratch register */
     /* Don't reuse the source register as offset scratch, otherwise we'd
      * clobber the value before the STR (e.g. store -offset instead of value). */
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << base_reg) | extra_exclude);
+    ScratchRegAlloc rr_alloc =
+        th_offset_to_reg_ex(abs_offset, sign, base_reg, (1u << reg) | (1u << base_reg) | extra_exclude);
     int rr = rr_alloc.reg;
     ot_check(th_str_reg(reg, base_reg, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);
@@ -1125,7 +1126,7 @@ ST_FUNC void tcc_gen_machine_store_to_sp_ex(int reg, int offset, uint32_t extra_
 
   if (!store_word_to_base(reg, R_SP, abs_offset, sign))
   {
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, (1u << reg) | (1u << R_SP) | extra_exclude);
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_offset, sign, R_SP, (1u << reg) | (1u << R_SP) | extra_exclude);
     int rr = rr_alloc.reg;
     ot_check(th_str_reg(reg, R_SP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);

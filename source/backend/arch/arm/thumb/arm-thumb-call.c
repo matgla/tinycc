@@ -4033,7 +4033,7 @@ ST_FUNC void tcc_gen_machine_restore_chain(void)
   const int abs_off = sign ? -off : off;
   if (!load_word_from_base(chain_reg, R_FP, abs_off, sign))
   {
-    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, (1u << chain_reg) | (1u << R_FP));
+    ScratchRegAlloc rr_alloc = th_offset_to_reg_ex(abs_off, sign, R_FP, (1u << chain_reg) | (1u << R_FP));
     int rr = rr_alloc.reg;
     ot_check(th_ldr_reg(chain_reg, R_FP, rr, THUMB_SHIFT_DEFAULT, ENFORCE_ENCODING_NONE));
     restore_scratch_reg(&rr_alloc);

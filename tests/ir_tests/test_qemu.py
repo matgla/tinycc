@@ -192,6 +192,9 @@ TEST_FILES = [
     # run_register_coalescing's swap handed the blocker the high half of a live
     # 64-bit pair (r2:r3); the safety scan looked at low registers only.
     ("bug_ra_register_swap_pair_high_half.c", 0),
+    # A far (>4 KB) SP-relative spill access whose offset scratch had to be
+    # PUSHed read the slot 4 bytes low (gcc pr28982b under the YasOS ABI).
+    ("bug_far_spill_scratch_push_sp_bias.c", 0),
     # ("bug_ternary_string.c", 0),  # Nested ternary with string literals
     # ("bug_return_else_string.c", 0),  # Return string from else block
     ("test_cleanup_double.c", 0),
@@ -3382,6 +3385,9 @@ PIC_TEXT_DATA_SEP_TEST_FILES = [
 
     # A call to a static function defined further down skips the R9 reload.
     ("test_r9_static_forward_call.c", 0),
+
+    # Far spill slot reached through a PUSHed offset scratch with R9 reserved.
+    ("bug_far_spill_scratch_push_sp_bias.c", 0),
 ]
 
 
